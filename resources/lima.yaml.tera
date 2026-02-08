@@ -1,0 +1,25 @@
+base:
+  - template:_images/ubuntu
+  - template:_default/mounts
+
+mounts:
+  - location: "~"
+    writable: true
+
+nestedVirtualization: true
+
+provision:
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      # Ensure kvm group exists
+      getent group kvm || groupadd kvm
+      # Add the Lima user to kvm group
+      usermod -aG kvm {% raw %}{{.User}}{% endraw %}
+
+      # Set /dev/kvm permissions so kvm group members can access it
+      echo 'KERNEL=="kvm", GROUP="kvm", MODE="0660"' > /etc/udev/rules.d/99-kvm.rules
+      udevadm control --reload-rules && udevadm trigger
+      # Also fix permissions immediately (udev rule applies on next boot)
+      [ -e /dev/kvm ] && chown root:kvm /dev/kvm && chmod 0660 /dev/kvm
