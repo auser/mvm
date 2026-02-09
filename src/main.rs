@@ -1,11 +1,9 @@
-mod bootstrap;
-mod config;
-mod firecracker;
-mod lima;
-mod microvm;
-mod network;
-mod shell;
-mod upgrade;
+mod infra;
+mod vm;
+
+// Re-export modules at crate root so internal `use crate::module` paths still work.
+pub use infra::{bootstrap, config, shell, upgrade};
+pub use vm::{firecracker, lima, microvm, network};
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
