@@ -108,6 +108,18 @@ main() {
     fi
     chmod +x "${INSTALL_DIR}/${BINARY}"
 
+    # Install resources directory if present in the archive
+    if [ -d "${extracted_dir}/resources" ]; then
+        info "Installing resources..."
+        if [ -w "$INSTALL_DIR" ]; then
+            rm -rf "${INSTALL_DIR}/resources"
+            cp -r "${extracted_dir}/resources" "${INSTALL_DIR}/resources"
+        else
+            sudo rm -rf "${INSTALL_DIR}/resources"
+            sudo cp -r "${extracted_dir}/resources" "${INSTALL_DIR}/resources"
+        fi
+    fi
+
     info "Installed ${BINARY} ${version} to ${INSTALL_DIR}/${BINARY}"
 
     # Verify

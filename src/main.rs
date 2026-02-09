@@ -5,6 +5,7 @@ mod lima;
 mod microvm;
 mod network;
 mod shell;
+mod upgrade;
 
 use anyhow::Result;
 use clap::{Parser, Subcommand};
@@ -38,6 +39,15 @@ enum Commands {
     Status,
     /// Tear down Lima VM and all resources
     Destroy,
+    /// Check for and install the latest version of mvm
+    Upgrade {
+        /// Only check for updates, don't install
+        #[arg(long)]
+        check: bool,
+        /// Force reinstall even if already up to date
+        #[arg(long)]
+        force: bool,
+    },
 }
 
 fn main() -> Result<()> {
@@ -52,6 +62,7 @@ fn main() -> Result<()> {
         Commands::Ssh => cmd_ssh(),
         Commands::Status => cmd_status(),
         Commands::Destroy => cmd_destroy(),
+        Commands::Upgrade { check, force } => cmd_upgrade(check, force),
     }
 }
 
@@ -208,6 +219,10 @@ fn cmd_status() -> Result<()> {
     }
 
     Ok(())
+}
+
+fn cmd_upgrade(check: bool, force: bool) -> Result<()> {
+    upgrade::upgrade(check, force)
 }
 
 fn cmd_destroy() -> Result<()> {

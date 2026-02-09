@@ -1,0 +1,48 @@
+#!/bin/bash
+# Pre-commit hook for mvm
+
+set -e
+
+echo "Running pre-commit checks..."
+echo ""
+
+# Check if there are any staged changes
+if git diff --cached --quiet; then
+    echo "No staged changes to commit"
+    exit 0
+fi
+
+# Auto-fix formatting and stage changes
+echo "Auto-formatting code..."
+if ! cargo fmt; then
+    echo "Formatting failed!"
+    exit 1
+fi
+
+if ! git diff --quiet --exit-code; then
+    echo "Auto-staging formatted files..."
+    git add -u
+fi
+echo "Code formatting applied and staged"
+echo ""
+
+# Run clippy (zero warnings required)
+echo "Running clippy (zero warnings required)..."
+if ! cargo clippy --all-targets -- -D warnings; then
+    echo "Clippy failed!"
+    echo "   Run 'cargo clippy --all-targets --fix --allow-dirty' to auto-fix"
+    exit 1
+fi
+echo "Clippy passed"
+echo ""
+
+# Run tests
+echo "Running tests..."
+if ! cargo test -- --color=always; then
+    echo "Tests failed!"
+    exit 1
+fi
+echo "All tests passed"
+echo ""
+
+echo "All pre-commit checks passed!"

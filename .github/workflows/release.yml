@@ -59,6 +59,7 @@ jobs:
 
           mkdir -p "staging/${ARCHIVE_NAME}"
           cp "target/${{ matrix.target }}/release/${BIN_NAME}" "staging/${ARCHIVE_NAME}/"
+          cp -r resources "staging/${ARCHIVE_NAME}/" 2>/dev/null || true
           cp README.md "staging/${ARCHIVE_NAME}/" 2>/dev/null || true
 
           cd staging

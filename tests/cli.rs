@@ -51,6 +51,7 @@ fn test_help_lists_all_subcommands() {
         "ssh",
         "status",
         "destroy",
+        "upgrade",
     ] {
         assert!(
             output.contains(cmd),
@@ -85,6 +86,15 @@ fn test_dev_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("auto-bootstrapping"));
+}
+
+#[test]
+fn test_upgrade_help() {
+    mvm()
+        .args(["upgrade", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("latest version"));
 }
 
 #[test]
