@@ -1,6 +1,6 @@
 [package]
 name = "mvm"
-version = "0.1.0"
+version = "0.0.1"
 edition = "2024"
 description = "Manage Firecracker microVMs on Apple Silicon via Lima"
 
