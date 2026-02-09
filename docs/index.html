@@ -1,0 +1,412 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>mvm - Firecracker MicroVM CLI</title>
+  <meta name="description" content="Rust CLI that manages Firecracker microVMs via Lima virtualization on macOS and Linux.">
+  <style>
+    :root {
+      --bg: #0d1117;
+      --surface: #161b22;
+      --border: #30363d;
+      --text: #e6edf3;
+      --text-muted: #8b949e;
+      --accent: #58a6ff;
+      --accent-hover: #79c0ff;
+      --green: #3fb950;
+      --orange: #d29922;
+      --code-bg: #0d1117;
+      --font-mono: 'SF Mono', 'Cascadia Code', 'Fira Code', 'JetBrains Mono', Consolas, monospace;
+      --font-sans: -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+    }
+
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+
+    body {
+      font-family: var(--font-sans);
+      background: var(--bg);
+      color: var(--text);
+      line-height: 1.6;
+    }
+
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { color: var(--accent-hover); text-decoration: underline; }
+
+    code {
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      background: var(--code-bg);
+      padding: 3px 8px;
+      border-radius: 4px;
+    }
+
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* Header */
+    header {
+      padding: 64px 0 48px;
+      text-align: center;
+    }
+
+    header h1 {
+      font-family: var(--font-mono);
+      font-size: 3rem;
+      font-weight: 700;
+      letter-spacing: -0.02em;
+      margin-bottom: 16px;
+    }
+
+    header h1 span { color: var(--accent); }
+
+    header p {
+      font-size: 1.2rem;
+      color: var(--text-muted);
+      max-width: 540px;
+      margin: 0 auto 32px;
+    }
+
+    .badges {
+      display: flex;
+      gap: 12px;
+      justify-content: center;
+      flex-wrap: wrap;
+    }
+
+    .badge {
+      display: inline-flex;
+      align-items: center;
+      gap: 6px;
+      padding: 6px 14px;
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 20px;
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+
+    .badge .dot {
+      width: 8px;
+      height: 8px;
+      border-radius: 50%;
+      display: inline-block;
+    }
+
+    .dot-rust { background: #dea584; }
+    .dot-green { background: var(--green); }
+
+    /* Stack diagram */
+    .stack {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 12px;
+      padding: 32px;
+      margin: 48px 0;
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
+      overflow-x: auto;
+    }
+
+    .stack-layer {
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      gap: 12px;
+      padding: 12px 0;
+    }
+
+    .stack-box {
+      padding: 10px 20px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      white-space: nowrap;
+    }
+
+    .stack-box.active {
+      border-color: var(--accent);
+      color: var(--accent);
+    }
+
+    .stack-arrow {
+      color: var(--text-muted);
+      font-size: 1.2rem;
+    }
+
+    /* Sections */
+    section {
+      margin-bottom: 56px;
+    }
+
+    section h2 {
+      font-size: 1.4rem;
+      font-weight: 600;
+      margin-bottom: 20px;
+      padding-bottom: 8px;
+      border-bottom: 1px solid var(--border);
+    }
+
+    /* Install */
+    .install-block {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px 24px;
+      position: relative;
+      margin-bottom: 12px;
+    }
+
+    .install-block code {
+      font-family: var(--font-mono);
+      font-size: 0.9rem;
+      color: var(--green);
+      word-break: break-all;
+    }
+
+    .install-label {
+      font-size: 0.8rem;
+      color: var(--text-muted);
+      margin-bottom: 8px;
+    }
+
+    /* Commands table */
+    .commands {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .commands th {
+      text-align: left;
+      padding: 10px 16px;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.05em;
+      color: var(--text-muted);
+      border-bottom: 1px solid var(--border);
+    }
+
+    .commands td {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+
+    .commands tr:last-child td { border-bottom: none; }
+
+    .commands code {
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      color: var(--accent);
+      background: var(--bg);
+      padding: 2px 8px;
+      border-radius: 4px;
+      white-space: nowrap;
+    }
+
+    .commands .desc { color: var(--text-muted); font-size: 0.9rem; }
+
+    /* Quick start */
+    .quickstart {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      line-height: 2;
+      overflow-x: auto;
+    }
+
+    .quickstart .comment { color: var(--text-muted); }
+    .quickstart .cmd { color: var(--green); }
+
+    /* Features */
+    .features {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+
+    @media (max-width: 600px) {
+      .features { grid-template-columns: 1fr; }
+      header h1 { font-size: 2.2rem; }
+    }
+
+    .feature {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 20px;
+    }
+
+    .feature h3 {
+      font-size: 0.95rem;
+      margin-bottom: 6px;
+    }
+
+    .feature p {
+      font-size: 0.85rem;
+      color: var(--text-muted);
+    }
+
+    /* Network diagram */
+    .network {
+      background: var(--surface);
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      padding: 24px;
+      font-family: var(--font-mono);
+      font-size: 0.85rem;
+      text-align: center;
+      line-height: 1.8;
+    }
+
+    .network .layer {
+      padding: 8px 0;
+    }
+
+    .network .pipe {
+      color: var(--text-muted);
+    }
+
+    .network .label {
+      font-size: 0.75rem;
+      color: var(--text-muted);
+    }
+
+    /* Footer */
+    footer {
+      padding: 40px 0;
+      text-align: center;
+      color: var(--text-muted);
+      font-size: 0.85rem;
+      border-top: 1px solid var(--border);
+    }
+
+    footer a { color: var(--text-muted); }
+    footer a:hover { color: var(--accent); }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+    <header>
+      <h1><span>mvm</span></h1>
+      <p>A Rust CLI that manages Firecracker microVMs via Lima virtualization on macOS and Linux.</p>
+      <div class="badges">
+        <span class="badge"><span class="dot dot-rust"></span> Rust</span>
+        <span class="badge"><span class="dot dot-green"></span> MIT License</span>
+        <a class="badge" href="https://github.com/auser/mvm">GitHub</a>
+      </div>
+    </header>
+
+    <div class="stack">
+      <div class="stack-layer">
+        <div class="stack-box active">macOS / Linux Host (this CLI)</div>
+        <div class="stack-arrow">&rarr;</div>
+        <div class="stack-box">Lima VM (Ubuntu)</div>
+        <div class="stack-arrow">&rarr;</div>
+        <div class="stack-box">Firecracker microVM</div>
+      </div>
+    </div>
+
+    <section>
+      <h2>Install</h2>
+      <div class="install-block">
+        <div class="install-label">One-liner (latest release)</div>
+        <code>curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh</code>
+      </div>
+      <div class="install-block">
+        <div class="install-label">Pin a version</div>
+        <code>MVM_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh</code>
+      </div>
+      <div class="install-block">
+        <div class="install-label">Self-update</div>
+        <code>mvm upgrade</code>
+      </div>
+    </section>
+
+    <section>
+      <h2>Quick Start</h2>
+      <div class="quickstart">
+        <span class="comment"># From zero to SSH session in one command:</span><br>
+        <span class="cmd">mvm dev</span><br>
+        <br>
+        <span class="comment"># Or step by step:</span><br>
+        <span class="cmd">mvm bootstrap</span>&nbsp;&nbsp;<span class="comment"># install Lima, create VM, download Firecracker</span><br>
+        <span class="cmd">mvm start</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="comment"># start microVM and SSH in</span><br>
+        <span class="cmd">mvm ssh</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="comment"># reconnect to running microVM</span><br>
+        <span class="cmd">mvm stop</span>&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;&nbsp;<span class="comment"># shut it down</span>
+      </div>
+    </section>
+
+    <section>
+      <h2>Commands</h2>
+      <table class="commands">
+        <thead>
+          <tr><th>Command</th><th>Description</th></tr>
+        </thead>
+        <tbody>
+          <tr><td><code>mvm bootstrap</code></td><td class="desc">Full setup from scratch &mdash; installs Lima via Homebrew, then runs all setup steps</td></tr>
+          <tr><td><code>mvm setup</code></td><td class="desc">Create Lima VM, install Firecracker, download kernel and rootfs</td></tr>
+          <tr><td><code>mvm dev</code></td><td class="desc">Smart entry point &mdash; detects state, auto-bootstraps if needed, launches microVM</td></tr>
+          <tr><td><code>mvm start</code></td><td class="desc">Start the microVM and drop into interactive SSH</td></tr>
+          <tr><td><code>mvm stop</code></td><td class="desc">Stop the running microVM and clean up</td></tr>
+          <tr><td><code>mvm ssh</code></td><td class="desc">SSH into a running microVM</td></tr>
+          <tr><td><code>mvm status</code></td><td class="desc">Show status of Lima VM and microVM</td></tr>
+          <tr><td><code>mvm destroy</code></td><td class="desc">Tear down the Lima VM and all resources</td></tr>
+          <tr><td><code>mvm upgrade</code></td><td class="desc">Check for and install the latest version</td></tr>
+        </tbody>
+      </table>
+    </section>
+
+    <section>
+      <h2>How It Works</h2>
+      <div class="features">
+        <div class="feature">
+          <h3>Three-Layer Stack</h3>
+          <p>The CLI runs on your host, Lima provides a Linux VM with /dev/kvm, and Firecracker runs microVMs inside it.</p>
+        </div>
+        <div class="feature">
+          <h3>Idempotent Setup</h3>
+          <p>Every step checks whether it's already done before acting. Safe to re-run at any time.</p>
+        </div>
+        <div class="feature">
+          <h3>Persistent VMs</h3>
+          <p>Firecracker runs as a daemon. Exit SSH and the microVM keeps running. Reconnect with <code>mvm ssh</code>.</p>
+        </div>
+        <div class="feature">
+          <h3>Self-Updating</h3>
+          <p>Run <code>mvm upgrade</code> to pull the latest release from GitHub and replace the binary in-place.</p>
+        </div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Network</h2>
+      <div class="network">
+        <div class="layer"><strong>MicroVM</strong> (172.16.0.2, eth0)</div>
+        <div class="pipe">|<br><span class="label">TAP interface</span><br>|</div>
+        <div class="layer"><strong>Lima VM</strong> (172.16.0.1, tap0) &mdash; iptables NAT &mdash; internet</div>
+        <div class="pipe">|<br><span class="label">Lima virtualization</span><br>|</div>
+        <div class="layer"><strong>Host</strong> (macOS / Linux)</div>
+      </div>
+    </section>
+
+    <section>
+      <h2>Prerequisites</h2>
+      <p>macOS or Linux host with <a href="https://brew.sh/">Homebrew</a> installed. Running <code>mvm bootstrap</code> handles the rest automatically.</p>
+      <p style="margin-top: 8px; color: var(--text-muted); font-size: 0.9rem;">Or install <a href="https://lima-vm.io/">Lima</a> manually and use <code>mvm setup</code> instead.</p>
+    </section>
+
+    <footer>
+      <a href="https://github.com/auser/mvm">GitHub</a> &middot; MIT License
+    </footer>
+  </div>
+
+</body>
+</html>
