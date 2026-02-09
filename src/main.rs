@@ -10,7 +10,11 @@ use anyhow::Result;
 use clap::{Parser, Subcommand};
 
 #[derive(Parser)]
-#[command(name = "mvm", version, about = "Manage Firecracker microVMs on Apple Silicon via Lima")]
+#[command(
+    name = "mvm",
+    version,
+    about = "Manage Firecracker microVMs on Apple Silicon via Lima"
+)]
 struct Cli {
     #[command(subcommand)]
     command: Commands,
@@ -131,7 +135,10 @@ fn cmd_dev() -> Result<()> {
 /// Core setup steps shared between cmd_setup() and cmd_bootstrap().
 fn run_setup_steps() -> Result<()> {
     let lima_yaml = config::render_lima_yaml()?;
-    println!("[mvm] Using rendered Lima config: {}", lima_yaml.path().display());
+    println!(
+        "[mvm] Using rendered Lima config: {}",
+        lima_yaml.path().display()
+    );
 
     println!("\n[mvm] Step 1/4: Setting up Lima VM...");
     lima::ensure_running(lima_yaml.path())?;
@@ -212,10 +219,8 @@ fn cmd_destroy() -> Result<()> {
     }
 
     // Stop microVM if running
-    if matches!(status, lima::LimaStatus::Running) {
-        if firecracker::is_running()? {
-            microvm::stop()?;
-        }
+    if matches!(status, lima::LimaStatus::Running) && firecracker::is_running()? {
+        microvm::stop()?;
     }
 
     // Confirm

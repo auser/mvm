@@ -7,6 +7,24 @@ macOS / Linux Host  -->  Lima VM (Ubuntu)  -->  Firecracker microVM (172.16.0.2)
       this CLI              limactl                  /dev/kvm
 ```
 
+## Install
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+```
+
+Or pin a specific version:
+
+```bash
+MVM_VERSION=v0.1.0 curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+```
+
+To install to a custom directory:
+
+```bash
+MVM_INSTALL_DIR=~/.local/bin curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+```
+
 ## Quick Start
 
 ```bash

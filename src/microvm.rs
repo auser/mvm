@@ -59,8 +59,9 @@ fn configure_microvm(state: &MvmState) -> Result<()> {
     api_put(
         "/logger",
         &format!(
-            r#"{{"log_path": "{logfile}", "level": "Debug", "show_level": true, "show_log_origin": true}}"#,
-            logfile = format!("{}/{}", "$HOME/microvm", "firecracker.log"),
+            r#"{{"log_path": "{dir}/{file}", "level": "Debug", "show_level": true, "show_log_origin": true}}"#,
+            dir = "$HOME/microvm",
+            file = "firecracker.log",
         ),
     )?;
 
@@ -68,7 +69,7 @@ fn configure_microvm(state: &MvmState) -> Result<()> {
     let rootfs_path = format!("{}/{}", "$HOME/microvm", state.rootfs);
 
     // Determine boot args
-    let kernel_boot_args = format!("keep_bootcon console=ttyS0 reboot=k panic=1");
+    let kernel_boot_args = "keep_bootcon console=ttyS0 reboot=k panic=1";
 
     println!("[mvm] Setting boot source: {}", state.kernel);
     api_put(
@@ -162,7 +163,9 @@ pub fn start() -> Result<()> {
             println!("[mvm] MicroVM is running. Connecting...");
             return ssh();
         } else {
-            anyhow::bail!("Firecracker running but microVM not reachable. Run 'mvm stop' then 'mvm start'.");
+            anyhow::bail!(
+                "Firecracker running but microVM not reachable. Run 'mvm stop' then 'mvm start'."
+            );
         }
     }
 
@@ -279,21 +282,35 @@ fn read_state_or_discover() -> Result<MvmState> {
         dir = MICROVM_DIR,
     ))?;
 
-    if let Ok(state) = serde_json::from_str::<MvmState>(&json) {
-        if !state.kernel.is_empty() && !state.rootfs.is_empty() && !state.ssh_key.is_empty() {
-            return Ok(state);
-        }
+    if let Ok(state) = serde_json::from_str::<MvmState>(&json)
+        && !state.kernel.is_empty()
+        && !state.rootfs.is_empty()
+        && !state.ssh_key.is_empty()
+    {
+        return Ok(state);
     }
 
     // Discover from files
-    let kernel = run_in_vm_stdout(&format!("cd {} && ls vmlinux-* 2>/dev/null | tail -1", MICROVM_DIR))?;
-    let rootfs = run_in_vm_stdout(&format!("cd {} && ls *.ext4 2>/dev/null | tail -1", MICROVM_DIR))?;
-    let ssh_key = run_in_vm_stdout(&format!("cd {} && ls *.id_rsa 2>/dev/null | tail -1", MICROVM_DIR))?;
+    let kernel = run_in_vm_stdout(&format!(
+        "cd {} && ls vmlinux-* 2>/dev/null | tail -1",
+        MICROVM_DIR
+    ))?;
+    let rootfs = run_in_vm_stdout(&format!(
+        "cd {} && ls *.ext4 2>/dev/null | tail -1",
+        MICROVM_DIR
+    ))?;
+    let ssh_key = run_in_vm_stdout(&format!(
+        "cd {} && ls *.id_rsa 2>/dev/null | tail -1",
+        MICROVM_DIR
+    ))?;
 
     if kernel.is_empty() || rootfs.is_empty() || ssh_key.is_empty() {
         anyhow::bail!(
             "Missing microVM assets in {}. Run 'mvm setup' first.\n  kernel={:?} rootfs={:?} ssh_key={:?}",
-            MICROVM_DIR, kernel, rootfs, ssh_key,
+            MICROVM_DIR,
+            kernel,
+            rootfs,
+            ssh_key,
         );
     }
 

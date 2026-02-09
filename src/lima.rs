@@ -12,7 +12,7 @@ pub enum LimaStatus {
 
 /// Get the current status of the Lima VM.
 pub fn get_status() -> Result<LimaStatus> {
-    let output = run_host("limactl", &["list", "--format", "{{.Status}}",  VM_NAME])?;
+    let output = run_host("limactl", &["list", "--format", "{{.Status}}", VM_NAME])?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
     if !output.status.success() || stdout.is_empty() {
@@ -60,10 +60,16 @@ pub fn require_running() -> Result<()> {
     match get_status()? {
         LimaStatus::Running => Ok(()),
         LimaStatus::Stopped => {
-            anyhow::bail!("Lima VM '{}' is stopped. Run 'mvm start' or 'mvm setup'.", VM_NAME)
+            anyhow::bail!(
+                "Lima VM '{}' is stopped. Run 'mvm start' or 'mvm setup'.",
+                VM_NAME
+            )
         }
         LimaStatus::NotFound => {
-            anyhow::bail!("Lima VM '{}' does not exist. Run 'mvm setup' first.", VM_NAME)
+            anyhow::bail!(
+                "Lima VM '{}' does not exist. Run 'mvm setup' first.",
+                VM_NAME
+            )
         }
     }
 }

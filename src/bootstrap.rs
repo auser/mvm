@@ -35,3 +35,33 @@ pub fn ensure_lima() -> Result<()> {
     println!("[mvm] Lima installed successfully.");
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_check_homebrew_error_message() {
+        // Verify the error message contains install instructions when brew is missing.
+        // We can't control whether brew is installed, so test the message format
+        // by checking what the function returns in the error case.
+        if which::which("brew").is_err() {
+            let err = check_homebrew().unwrap_err();
+            let msg = err.to_string();
+            assert!(msg.contains("Homebrew is not installed"));
+            assert!(msg.contains("curl -fsSL"));
+            assert!(msg.contains("mvm bootstrap"));
+        } else {
+            // brew is available — check_homebrew should succeed
+            assert!(check_homebrew().is_ok());
+        }
+    }
+
+    #[test]
+    fn test_ensure_lima_when_limactl_present() {
+        // If limactl is available, ensure_lima should succeed without installing
+        if which::which("limactl").is_ok() {
+            assert!(ensure_lima().is_ok());
+        }
+    }
+}

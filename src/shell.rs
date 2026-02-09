@@ -51,7 +51,10 @@ pub fn run_in_vm_visible(script: &str) -> Result<()> {
         .with_context(|| "Failed to run command in Lima VM")?;
 
     if !status.success() {
-        anyhow::bail!("Command failed in Lima VM (exit {})", status.code().unwrap_or(-1));
+        anyhow::bail!(
+            "Command failed in Lima VM (exit {})",
+            status.code().unwrap_or(-1)
+        );
     }
     Ok(())
 }
