@@ -3,275 +3,205 @@ You are a senior systems engineer and Rust infrastructure architect.
 You are working inside the existing repository:
 https://github.com/auser/mvm
 
-Your task is to integrate Nix-based, reproducible Firecracker microVM builds and multi-tenant lifecycle management into this repo, replacing the current “build image” approach entirely.
+Your task is to integrate Nix-flake-based, reproducible Firecracker microVM builds and multi-tenant lifecycle management into this repo, replacing the current “build image” approach entirely.
+
+IMPORTANT CONSTRAINT:
+❌ Docker / podman / nerdctl MUST NOT be used.
+✅ ALL builds must run inside ephemeral Firecracker microVMs managed by mvm itself.
 
 This is an implementation task. Do not explain. Make concrete code changes, add files, and refactor aggressively where needed.
 
-🎯 High-level goals (must all be satisfied)
+----------------------------------------------------------------
+HARD REQUIREMENTS
+----------------------------------------------------------------
 
-Firecracker microVMs remain the isolation boundary
+1) Firecracker microVMs are the ONLY execution primitive
+   - One tenant = one Firecracker microVM
+   - Build environments ALSO run inside Firecracker microVMs
+   - No dependency on container runtimes
 
-One tenant = one Firecracker microVM
+2) Nix flakes define all guest artifacts
+   - guest kernel
+   - guest root filesystem (immutable ext4)
+   - base Firecracker config JSON
+   - profiles (baseline/minimal/python)
+   - all pinned via flake.lock
 
-Dedicated CPU, memory, tap device, disks
+3) Builds run in *ephemeral build microVMs*
+   - Each `build` command:
+     - boots a short-lived Firecracker microVM
+     - runs `nix build`
+     - copies artifacts out
+     - shuts the microVM down
+   - Build microVMs must be stateless and disposable
+   - No shared mutable builder state
 
-Nix flakes define all build artifacts
+4) All CLI commands must exist and work end-to-end
+   - no TODOs
+   - no stubs
 
-Guest kernel
+5) Existing dev workflow must remain intact
+   - dev microVMs are mutable and fast
+   - tenant mode is additive
 
-Guest root filesystem
+----------------------------------------------------------------
+ARCHITECTURAL CONSTRAINTS
+----------------------------------------------------------------
 
-Base Firecracker config (JSON)
+- Lima remains the Linux/KVM environment
+- Firecracker runs inside Lima
+- TAP-based networking remains
+- Rust orchestrates everything
+- Deterministic, idempotent behavior
+- Tenant state persisted under /var/lib/mvm/tenants/<tenantId>
+- No hardcoded Firecracker JSON
 
-Optional data + secrets disk layouts
+----------------------------------------------------------------
+IMPLEMENTATION PLAN
+----------------------------------------------------------------
 
-All pinned and reproducible
+A) Tenant model (required)
 
-Builds run in short-lived, ephemeral containers
-
-No single long-lived “builder image”
-
-Each build command launches a fresh container
-
-Containers exit immediately after build
-
-Results are copied/symlinked into mvm runtime dirs
-
-All commands already exist
-
-No TODOs, no placeholders
-
-CLI commands must work end-to-end after implementation
-
-Dev mode must continue to work
-
-mvm dev (or equivalent) should still give a fast, mutable VM for iteration
-
-Tenant mode is additive, not destructive
-
-🧱 Architectural constraints
-
-Keep Lima as the Linux/KVM execution environment
-
-Firecracker runs inside Lima
-
-Networking is TAP-based as today
-
-Rust remains the orchestration language
-
-Prefer systemd-free, explicit process management
-
-Avoid global mutable state where possible
-
-🧩 Required refactor + additions
-1. Introduce a Tenant model
-
-Add a new module (or extend existing ones) defining:
+Add src/tenant.rs:
 
 struct TenantSpec {
-    tenant_id: String,
-    flake_ref: String,     // git URL or local path
-    profile: String,       // e.g. "baseline", "python", "gpu"
-    vcpus: u8,
-    mem_mib: u32,
+  tenant_id: String,
+  flake_ref: String,   // git URL or local path
+  profile: String,     // baseline|minimal|python
+  vcpus: u8,
+  mem_mib: u32,
 }
 
 struct TenantArtifacts {
-    kernel_path: PathBuf,
-    rootfs_path: PathBuf,
-    base_fc_config: PathBuf,
+  kernel: PathBuf,
+  rootfs: PathBuf,
+  fc_base_config: PathBuf,
 }
 
+struct TenantState {
+  spec: TenantSpec,
+  artifacts: Option<TenantArtifacts>,
+  running: bool,
+  firecracker_pid: Option<u32>,
+  revision_history: Vec<BuildRevision>,
+}
 
-Persist tenant state under:
+Persist state under:
+  /var/lib/mvm/tenants/<tenantId>/
 
-/var/lib/mvm/tenants/<tenantId>/
-  spec.json
-  state.json
-  runtime/
+----------------------------------------------------------------
 
-
-This directory is the audit root for that tenant.
-
-2. Replace the existing build image logic completely
-
-Remove or deprecate any existing “build image” or long-lived builder container logic.
-
-Instead, implement ephemeral build containers:
-
-Each build command:
-
-launches a fresh container (Docker/nerdctl/podman — pick one, document it)
-
-mounts:
-
-the mvm repo
-
-a writable output dir
-
-runs nix build inside the container
-
-exits immediately
-
-No shared builder state is allowed.
-
-3. Add a Nix flake to the repo
+B) Add Nix flake (guest + builder)
 
 Create:
-
 nix/
   flake.nix
-  tenants/
+  guests/
     baseline.nix
     profiles/
       minimal.nix
       python.nix
+  builders/
+    nix-builder.nix   # minimal NixOS that can run nix build
 
+The flake must produce:
 
-The flake must expose outputs like:
+- guest rootfs images
+- guest kernel
+- base Firecracker config
+- builder rootfs image (Nix-enabled, no secrets)
 
-packages.x86_64-linux.<tenantId>.kernel
+The builder microVM rootfs:
+- includes nix + git
+- has outbound network
+- mounts a writable build volume
+- has SSH or vsock control channel
 
-packages.x86_64-linux.<tenantId>.rootfs
+----------------------------------------------------------------
 
-packages.x86_64-linux.<tenantId>.fcBaseConfig
+C) Ephemeral *build microVM* execution
 
-The rootfs must be:
+Replace all existing build-image logic.
 
-built with NixOS modules
+Implement:
 
-immutable
+mvm build vm start --purpose nix-builder
+mvm build vm exec nix build <flake-output>
+mvm build vm fetch artifacts
+mvm build vm stop
 
-minimal (SSH, networking, nothing extra)
+Internally:
+- mvm boots a Firecracker microVM using the builder rootfs
+- mounts:
+  - repo source (read-only)
+  - build output volume (rw)
+- executes nix build inside the microVM
+- copies kernel/rootfs/config artifacts into:
+    /var/lib/mvm/tenants/<tenantId>/artifacts/
+- immediately shuts the builder microVM down
 
-4. New CLI commands (must be fully implemented)
+Builder microVMs:
+- are NOT tenants
+- never persist state
+- are uniquely named per build invocation
 
-Add the following commands to mvm:
+----------------------------------------------------------------
 
-mvm tenant create <tenantId> --flake <ref> --profile <name> \
-    --cpus <n> --mem <MiB>
+D) Firecracker config generation
 
-mvm tenant build <tenantId>
-    # launches ephemeral build container
-    # produces kernel + rootfs + base fc config
+- Nix provides base Firecracker JSON
+- Rust overlays:
+  - CPU count
+  - memory
+  - tap device
+  - MAC
+  - disk paths
+  - logging + metrics
 
-mvm tenant run <tenantId>
-    # allocates tap
-    # overlays runtime config (IP, MAC, cgroups)
-    # launches firecracker
+Final config written to:
+  /var/lib/mvm/tenants/<tenantId>/runtime/fc.json
 
-mvm tenant ssh <tenantId>
+----------------------------------------------------------------
 
-mvm tenant stop <tenantId>
+E) Networking
 
-mvm tenant destroy <tenantId>
+- Shared bridge: br-tenants
+- One tap per tenant: tap-<tenantId>
+- Deterministic MAC (hash of tenantId)
+- IP allocation stored in TenantState
+- East-west traffic denied by default
+- Egress NAT allowed
 
+----------------------------------------------------------------
 
-All commands must be idempotent.
+F) Data + secrets disks
 
-5. Networking changes
+- vdb: tenant data ext4 (persistent)
+- vdc: secrets ext4 (read-only)
+- secrets disk created per run
+- secrets mounted at /run/secrets (ro,noexec,nodev,nosuid)
 
-Extend the existing TAP logic so that:
+----------------------------------------------------------------
 
-Each tenant gets:
+G) CLI (must exist)
 
-tap-<tenantId>
+mvm tenant create <id> --flake <ref> --profile <name> --cpus N --mem MiB
+mvm tenant build <id>
+mvm tenant run <id>
+mvm tenant ssh <id>
+mvm tenant stop <id>
+mvm tenant destroy <id>
 
-a deterministic MAC
+----------------------------------------------------------------
 
-A shared br-tenants bridge exists
+H) Keep dev mode intact
 
-East-west traffic is denied by default
+Existing dev commands must continue to work unchanged.
 
-NAT egress is allowed
+----------------------------------------------------------------
 
-Use nftables or iptables, but implement it fully.
-
-6. Secrets and data disks
-
-Add support for additional block devices:
-
-/dev/vdb → tenant data (writable)
-
-/dev/vdc → tenant secrets (read-only)
-
-Secrets disk is:
-
-created per run
-
-populated by the host
-
-attached read-only
-
-mounted by the guest at /run/secrets
-
-No secrets are baked into the rootfs.
-
-7. Firecracker config generation
-
-Do not hardcode Firecracker JSON.
-
-Instead:
-
-Base config comes from the Nix flake
-
-Rust overlays:
-
-tap name
-
-MAC
-
-CPU / memory
-
-disk paths
-
-log + metrics paths
-
-Final config is written to:
-
-/var/lib/mvm/tenants/<tenantId>/runtime/fc.json
-
-8. Build containers: concrete behavior
-
-Implement a helper that runs commands like:
-
-docker run --rm \
-  -v $MVM_REPO:/src \
-  -v /var/lib/mvm/build:/out \
-  ghcr.io/nixos/nix:latest \
-  nix build /src/nix#tenant-<id>
-
-
-Container exits immediately
-
-Rust waits synchronously
-
-Output paths are captured and recorded in tenant state
-
-9. Keep dev mode intact
-
-Do not break:
-
-single-VM dev workflows
-
-mutable rootfs experiments
-
-quick iteration
-
-Tenant mode must be clearly separate.
-
-✅ Deliverables
-
-Updated Rust code
-
-New nix/ directory
-
-CLI wiring complete
-
-Old build image logic removed
-
-Commands runnable end-to-end
-
-Repo builds cleanly
-
-Do not leave stubs, TODOs, or commentary.
+IMPLEMENT NOW
+- Remove docker/container assumptions
+- Use Firecracker microVMs for builds
+- Code must compile
+- Commands must run end-to-end
