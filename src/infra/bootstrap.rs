@@ -1,6 +1,7 @@
 use anyhow::Result;
 
 use crate::shell;
+use crate::ui;
 
 /// Check if Homebrew is installed and accessible.
 pub fn check_homebrew() -> Result<()> {
@@ -12,7 +13,7 @@ pub fn check_homebrew() -> Result<()> {
              Then run 'mvm bootstrap' again."
         )
     })?;
-    println!("[mvm] Homebrew found.");
+    ui::info("Homebrew found.");
     Ok(())
 }
 
@@ -21,18 +22,18 @@ pub fn ensure_lima() -> Result<()> {
     if which::which("limactl").is_ok() {
         let output = shell::run_host("limactl", &["--version"])?;
         let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
-        println!("[mvm] Lima already installed: {}", version);
+        ui::info(&format!("Lima already installed: {}", version));
         return Ok(());
     }
 
-    println!("[mvm] Installing Lima via Homebrew...");
+    ui::info("Installing Lima via Homebrew...");
     shell::run_host_visible("brew", &["install", "lima"])?;
 
     which::which("limactl").map_err(|_| {
         anyhow::anyhow!("Lima installation completed but 'limactl' not found in PATH.")
     })?;
 
-    println!("[mvm] Lima installed successfully.");
+    ui::success("Lima installed successfully.");
     Ok(())
 }
 

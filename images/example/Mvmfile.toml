@@ -1,0 +1,83 @@
+# Mvmfile.toml — MicroVM Image Configuration
+#
+# This file defines a Firecracker microVM image built with `mvm build`.
+#
+# Usage:
+#   mvm build .                        # build from current directory
+#   mvm build /path/to/dir             # build from a specific directory
+#   mvm build example                  # build a built-in image by name
+#
+# The output is a self-contained .elf binary that can be launched with:
+#   mvm start ./my-image.aarch64.elf
+#   mvm start ./my-image.aarch64.elf --config run.toml -c 4 -m 8192
+
+# --------------------------------------------------------------------------
+# [image] — Required. Identifies the image.
+# --------------------------------------------------------------------------
+[image]
+name = "example"          # Image name (used in output filename and volume defaults)
+base = "ubuntu"           # Base OS (currently only "ubuntu" is supported)
+disk = "2G"               # Root filesystem disk size
+
+# --------------------------------------------------------------------------
+# [resources] — Optional. Default resource allocation for the microVM.
+#               Can be overridden at runtime with `mvm start -c <cpus> -m <mem>`
+# --------------------------------------------------------------------------
+[resources]
+memory = 1024             # Memory in MB (default: 2048)
+cpus = 1                  # CPU cores   (default: 2)
+
+# --------------------------------------------------------------------------
+# [packages] — Optional. System packages to install during build.
+# --------------------------------------------------------------------------
+[packages]
+apt = [
+    "curl",
+    "wget",
+    "htop",
+    "jq",
+    "git",
+    "build-essential",
+]
+
+# --------------------------------------------------------------------------
+# [[run]] — Optional, repeatable. Commands executed during build (in order).
+#           Each runs inside the chroot as root.
+# --------------------------------------------------------------------------
+[[run]]
+command = "mkdir -p /app /data"
+
+[[run]]
+command = "echo 'Hello from mvm build!' > /app/README"
+
+# --------------------------------------------------------------------------
+# [[volumes]] — Optional, repeatable. Persistent volumes mounted at runtime.
+#
+#   guest        — Mount point inside the microVM (required)
+#   size         — Disk image size, created on first run (required)
+#   default_host — Default host path for the volume (optional).
+#                  If omitted, defaults to $HOME/.<image-name>/
+#
+# Volumes are ext4 disk images created automatically on first launch.
+# Override at runtime: mvm start image.elf -v /host/path:/guest:8G
+# --------------------------------------------------------------------------
+[[volumes]]
+guest = "/data"
+size = "1G"
+default_host = "~/example-data"
+
+# --------------------------------------------------------------------------
+# [[services]] — Optional, repeatable. Systemd services enabled at boot.
+#
+#   name    — Service unit name (required)
+#   command — ExecStart command (required)
+#   after   — systemd After= dependency (optional, e.g. "network-online.target")
+#   restart — Restart policy (optional, default: "on-failure")
+#   env     — Environment variables as key-value pairs (optional)
+# --------------------------------------------------------------------------
+[[services]]
+name = "myapp"
+command = "/usr/bin/python3 -m http.server 8080 --directory /app"
+after = "network-online.target"
+restart = "on-failure"
+env = { PORT = "8080", HOME = "/root" }

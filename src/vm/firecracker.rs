@@ -2,6 +2,7 @@ use anyhow::Result;
 
 use crate::config::*;
 use crate::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
+use crate::ui;
 
 /// Check if Firecracker is installed inside the Lima VM.
 pub fn is_installed() -> Result<bool> {
@@ -13,15 +14,15 @@ pub fn is_installed() -> Result<bool> {
 pub fn install() -> Result<()> {
     if is_installed()? {
         let version = run_in_vm_stdout("firecracker --version 2>&1 | head -1")?;
-        println!("[mvm] Firecracker already installed: {}", version);
+        ui::info(&format!("Firecracker already installed: {}", version));
         return Ok(());
     }
 
-    println!("[mvm] Installing Firecracker {}...", FC_VERSION);
+    ui::info(&format!("Installing Firecracker {}...", FC_VERSION));
     run_in_vm_visible(&format!(
         r#"
         cd /tmp
-        wget -q https://github.com/firecracker-microvm/firecracker/releases/download/{fc_version}/firecracker-{fc_version}-{arch}.tgz
+        wget --progress=bar:force:noscroll https://github.com/firecracker-microvm/firecracker/releases/download/{fc_version}/firecracker-{fc_version}-{arch}.tgz
         tar -xzf firecracker-{fc_version}-{arch}.tgz
         sudo mv release-{fc_version}-{arch}/firecracker-{fc_version}-{arch} /usr/local/bin/firecracker
         sudo chmod +x /usr/local/bin/firecracker
@@ -32,13 +33,13 @@ pub fn install() -> Result<()> {
         arch = ARCH,
     ))?;
 
-    println!("[mvm] Firecracker installed.");
+    ui::success("Firecracker installed.");
     Ok(())
 }
 
 /// Download kernel and rootfs into ~/microvm/ inside the Lima VM.
 pub fn download_assets() -> Result<()> {
-    println!("[mvm] Downloading kernel and rootfs...");
+    ui::info("Downloading kernel and rootfs...");
     run_in_vm_visible(&format!(
         r#"
         set -euo pipefail
@@ -54,7 +55,7 @@ pub fn download_assets() -> Result<()> {
                 echo '[mvm] ERROR: Failed to find kernel.' >&2
                 exit 1
             fi
-            wget -q "https://s3.amazonaws.com/spec.ccfc.min/$latest_kernel_key"
+            wget --progress=bar:force:noscroll "https://s3.amazonaws.com/spec.ccfc.min/$latest_kernel_key"
             echo '[mvm] Kernel downloaded.'
         fi
 
@@ -70,7 +71,7 @@ pub fn download_assets() -> Result<()> {
                 exit 1
             fi
             ubuntu_version=$(basename $latest_ubuntu_key .squashfs | grep -oE '[0-9]+\.[0-9]+')
-            wget -q -O "ubuntu-${{ubuntu_version}}.squashfs.upstream" "https://s3.amazonaws.com/spec.ccfc.min/$latest_ubuntu_key"
+            wget --progress=bar:force:noscroll -O "ubuntu-${{ubuntu_version}}.squashfs.upstream" "https://s3.amazonaws.com/spec.ccfc.min/$latest_ubuntu_key"
             echo "[mvm] RootFS downloaded (Ubuntu ${{ubuntu_version}})."
         fi
         "#,
@@ -83,7 +84,7 @@ pub fn download_assets() -> Result<()> {
 
 /// Prepare the ext4 root filesystem from the downloaded squashfs.
 pub fn prepare_rootfs() -> Result<()> {
-    println!("[mvm] Preparing root filesystem...");
+    ui::info("Preparing root filesystem...");
     run_in_vm_visible(&format!(
         r#"
         set -euo pipefail
@@ -153,6 +154,15 @@ STATEEOF
         dir = MICROVM_DIR,
     ))?;
     Ok(())
+}
+
+/// Check whether the downloaded squashfs file is intact.
+pub fn validate_rootfs_squashfs() -> Result<bool> {
+    let output = run_in_vm(&format!(
+        "unsquashfs -l {dir}/ubuntu-*.squashfs.upstream >/dev/null 2>&1",
+        dir = MICROVM_DIR,
+    ))?;
+    Ok(output.status.success())
 }
 
 /// Check if the Firecracker process is running inside the Lima VM.
