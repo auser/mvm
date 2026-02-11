@@ -187,7 +187,7 @@ pub fn pressure_candidates(
         .filter(|i| matches!(i.status, InstanceStatus::Warm | InstanceStatus::Running))
         .collect();
 
-    candidates.sort_by(|a, b| b.idle_metrics.idle_secs.cmp(&a.idle_metrics.idle_secs));
+    candidates.sort_by_key(|b| std::cmp::Reverse(b.idle_metrics.idle_secs));
 
     Ok(candidates
         .iter()
