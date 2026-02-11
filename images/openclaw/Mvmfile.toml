@@ -1,0 +1,46 @@
+[image]
+name = "openclaw"
+base = "ubuntu"
+disk = "4G"
+
+[resources]
+memory = 2048
+cpus = 2
+
+[packages]
+apt = [
+    "curl",
+    "wget",
+    "htop",
+    "unzip",
+    "jq",
+    "iproute2",
+    "iputils-ping",
+    "net-tools",
+    "chromium-browser",
+    "python3-pil",
+    "python3-pip",
+]
+
+[[run]]
+command = "curl -fsSL https://openclaw.ai/install.sh | bash -s -- --no-onboard --no-prompt"
+
+[[run]]
+command = "mkdir -p /openclaw /scratch"
+
+[[volumes]]
+guest = "/openclaw"
+size = "2G"
+default_host = "~/.openclaw"
+
+[[volumes]]
+guest = "/scratch"
+size = "4G"
+default_host = "~/scratch"
+
+[[services]]
+name = "openclaw"
+command = "/usr/bin/openclaw gateway"
+after = "network-online.target"
+restart = "on-failure"
+env = { HOME = "/root" }

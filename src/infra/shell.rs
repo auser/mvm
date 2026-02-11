@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::process::{Command, Output, Stdio};
 
-use crate::config::VM_NAME;
+use super::config::VM_NAME;
 
 /// Run a command on the host, capturing output.
 pub fn run_host(cmd: &str, args: &[&str]) -> Result<Output> {
@@ -32,37 +32,53 @@ pub fn run_host_visible(cmd: &str, args: &[&str]) -> Result<()> {
     Ok(())
 }
 
-/// Run a bash script inside the Lima VM, capturing output.
-pub fn run_in_vm(script: &str) -> Result<Output> {
+/// Run a bash script inside a named Lima VM, capturing output.
+pub fn run_on_vm(vm_name: &str, script: &str) -> Result<Output> {
     Command::new("limactl")
-        .args(["shell", VM_NAME, "bash", "-c", script])
+        .args(["shell", vm_name, "bash", "-c", script])
         .output()
-        .with_context(|| "Failed to run command in Lima VM")
+        .with_context(|| format!("Failed to run command in Lima VM '{}'", vm_name))
 }
 
-/// Run a bash script inside the Lima VM, with output visible to user.
-pub fn run_in_vm_visible(script: &str) -> Result<()> {
+/// Run a bash script inside a named Lima VM, with output visible to user.
+pub fn run_on_vm_visible(vm_name: &str, script: &str) -> Result<()> {
     let status = Command::new("limactl")
-        .args(["shell", VM_NAME, "bash", "-c", script])
+        .args(["shell", vm_name, "bash", "-c", script])
         .stdin(Stdio::inherit())
         .stdout(Stdio::inherit())
         .stderr(Stdio::inherit())
         .status()
-        .with_context(|| "Failed to run command in Lima VM")?;
+        .with_context(|| format!("Failed to run command in Lima VM '{}'", vm_name))?;
 
     if !status.success() {
         anyhow::bail!(
-            "Command failed in Lima VM (exit {})",
+            "Command failed in Lima VM '{}' (exit {})",
+            vm_name,
             status.code().unwrap_or(-1)
         );
     }
     Ok(())
 }
 
-/// Run a bash script inside the Lima VM, returning stdout as String.
-pub fn run_in_vm_stdout(script: &str) -> Result<String> {
-    let output = run_in_vm(script)?;
+/// Run a bash script inside a named Lima VM, returning stdout as String.
+pub fn run_on_vm_stdout(vm_name: &str, script: &str) -> Result<String> {
+    let output = run_on_vm(vm_name, script)?;
     Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
+}
+
+/// Run a bash script inside the default Lima VM, capturing output.
+pub fn run_in_vm(script: &str) -> Result<Output> {
+    run_on_vm(VM_NAME, script)
+}
+
+/// Run a bash script inside the default Lima VM, with output visible to user.
+pub fn run_in_vm_visible(script: &str) -> Result<()> {
+    run_on_vm_visible(VM_NAME, script)
+}
+
+/// Run a bash script inside the default Lima VM, returning stdout as String.
+pub fn run_in_vm_stdout(script: &str) -> Result<String> {
+    run_on_vm_stdout(VM_NAME, script)
 }
 
 /// Replace the current process with an interactive command (for SSH/TTY).

@@ -1,7 +1,8 @@
 use anyhow::{Context, Result};
 
-use crate::config::VM_NAME;
-use crate::shell::{run_host, run_host_visible};
+use crate::infra::config::VM_NAME;
+use crate::infra::shell::{run_host, run_host_visible};
+use crate::infra::ui;
 
 #[derive(Debug, PartialEq)]
 pub enum LimaStatus {
@@ -10,9 +11,13 @@ pub enum LimaStatus {
     NotFound,
 }
 
-/// Get the current status of the Lima VM.
-pub fn get_status() -> Result<LimaStatus> {
-    let output = run_host("limactl", &["list", "--format", "{{.Status}}", VM_NAME])?;
+// ---------------------------------------------------------------------------
+// Parameterized functions (accept vm_name)
+// ---------------------------------------------------------------------------
+
+/// Get the current status of a named Lima VM.
+pub fn get_vm_status(vm_name: &str) -> Result<LimaStatus> {
+    let output = run_host("limactl", &["list", "--format", "{{.Status}}", vm_name])?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 
     if !output.status.success() || stdout.is_empty() {
@@ -26,38 +31,67 @@ pub fn get_status() -> Result<LimaStatus> {
     }
 }
 
-/// Create and start a new Lima VM from the given yaml config.
-pub fn create(lima_yaml: &std::path::Path) -> Result<()> {
+/// Create and start a new named Lima VM from the given yaml config.
+pub fn create_vm(vm_name: &str, lima_yaml: &std::path::Path) -> Result<()> {
     let yaml_str = lima_yaml.to_str().context("Invalid lima.yaml path")?;
-    run_host_visible("limactl", &["start", "--name", VM_NAME, yaml_str])
+    run_host_visible("limactl", &["start", "--name", vm_name, yaml_str])
 }
 
-/// Start an existing stopped Lima VM.
-pub fn start() -> Result<()> {
-    run_host_visible("limactl", &["start", VM_NAME])
+/// Start an existing stopped named Lima VM.
+pub fn start_vm(vm_name: &str) -> Result<()> {
+    run_host_visible("limactl", &["start", vm_name])
 }
 
-/// Ensure the Lima VM is running. Creates, starts, or does nothing as needed.
-pub fn ensure_running(lima_yaml: &std::path::Path) -> Result<()> {
-    match get_status()? {
+/// Ensure a named Lima VM is running. Creates, starts, or does nothing as needed.
+pub fn ensure_vm_running(vm_name: &str, lima_yaml: &std::path::Path) -> Result<()> {
+    match get_vm_status(vm_name)? {
         LimaStatus::Running => {
-            println!("[mvm] Lima VM '{}' is running.", VM_NAME);
+            ui::info(&format!("Lima VM '{}' is running.", vm_name));
             Ok(())
         }
         LimaStatus::Stopped => {
-            println!("[mvm] Starting Lima VM '{}'...", VM_NAME);
-            start()
+            ui::info(&format!("Starting Lima VM '{}'...", vm_name));
+            start_vm(vm_name)
         }
         LimaStatus::NotFound => {
-            println!("[mvm] Creating Lima VM '{}'...", VM_NAME);
-            create(lima_yaml)
+            ui::info(&format!("Creating Lima VM '{}'...", vm_name));
+            create_vm(vm_name, lima_yaml)
         }
     }
 }
 
-/// Require that the Lima VM is currently running.
+/// Delete a named Lima VM forcefully.
+pub fn destroy_vm(vm_name: &str) -> Result<()> {
+    run_host_visible("limactl", &["delete", "--force", vm_name])
+}
+
+// ---------------------------------------------------------------------------
+// Default VM_NAME wrappers (used by setup, start, stop, ssh, etc.)
+// ---------------------------------------------------------------------------
+
+/// Get the current status of the default Lima VM.
+pub fn get_status() -> Result<LimaStatus> {
+    get_vm_status(VM_NAME)
+}
+
+/// Create and start the default Lima VM from the given yaml config.
+pub fn create(lima_yaml: &std::path::Path) -> Result<()> {
+    create_vm(VM_NAME, lima_yaml)
+}
+
+/// Start the default Lima VM.
+pub fn start() -> Result<()> {
+    start_vm(VM_NAME)
+}
+
+/// Ensure the default Lima VM is running.
+pub fn ensure_running(lima_yaml: &std::path::Path) -> Result<()> {
+    ensure_vm_running(VM_NAME, lima_yaml)
+}
+
+/// Require that the default Lima VM is currently running.
 pub fn require_running() -> Result<()> {
-    match get_status()? {
+    match get_vm_status(VM_NAME)? {
         LimaStatus::Running => Ok(()),
         LimaStatus::Stopped => {
             anyhow::bail!(
@@ -74,7 +108,7 @@ pub fn require_running() -> Result<()> {
     }
 }
 
-/// Delete the Lima VM forcefully.
+/// Delete the default Lima VM forcefully.
 pub fn destroy() -> Result<()> {
-    run_host_visible("limactl", &["delete", "--force", VM_NAME])
+    destroy_vm(VM_NAME)
 }

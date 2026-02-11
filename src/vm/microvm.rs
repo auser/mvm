@@ -1,12 +1,13 @@
 use anyhow::Result;
 
-use crate::config::*;
-use crate::shell::{replace_process, run_in_vm, run_in_vm_stdout, run_in_vm_visible};
-use crate::{firecracker, lima, network};
+use super::{firecracker, lima, network};
+use crate::infra::config::*;
+use crate::infra::shell::{replace_process, run_in_vm, run_in_vm_stdout, run_in_vm_visible};
+use crate::infra::ui;
 
 /// Start the Firecracker daemon inside the Lima VM (background).
 fn start_firecracker_daemon() -> Result<()> {
-    println!("[mvm] Starting Firecracker...");
+    ui::info("Starting Firecracker...");
     run_in_vm_visible(&format!(
         r#"
         sudo rm -f {socket}
@@ -55,7 +56,7 @@ fn api_put(path: &str, data: &str) -> Result<()> {
 
 /// Configure the microVM via the Firecracker API.
 fn configure_microvm(state: &MvmState) -> Result<()> {
-    println!("[mvm] Configuring logger...");
+    ui::info("Configuring logger...");
     api_put(
         "/logger",
         &format!(
@@ -71,7 +72,7 @@ fn configure_microvm(state: &MvmState) -> Result<()> {
     // Determine boot args
     let kernel_boot_args = "keep_bootcon console=ttyS0 reboot=k panic=1";
 
-    println!("[mvm] Setting boot source: {}", state.kernel);
+    ui::info(&format!("Setting boot source: {}", state.kernel));
     api_put(
         "/boot-source",
         &format!(
@@ -81,7 +82,7 @@ fn configure_microvm(state: &MvmState) -> Result<()> {
         ),
     )?;
 
-    println!("[mvm] Setting rootfs: {}", state.rootfs);
+    ui::info(&format!("Setting rootfs: {}", state.rootfs));
     api_put(
         "/drives/rootfs",
         &format!(
@@ -90,7 +91,7 @@ fn configure_microvm(state: &MvmState) -> Result<()> {
         ),
     )?;
 
-    println!("[mvm] Setting network interface...");
+    ui::info("Setting network interface...");
     api_put(
         "/network-interfaces/net1",
         &format!(
@@ -105,7 +106,7 @@ fn configure_microvm(state: &MvmState) -> Result<()> {
 
 /// Wait for SSH to become available on the microVM.
 fn wait_for_ssh(ssh_key: &str) -> Result<()> {
-    println!("[mvm] Waiting for microVM to boot...");
+    ui::info("Waiting for microVM to boot...");
     let script = format!(
         r#"
         sleep 5
@@ -134,7 +135,7 @@ fn wait_for_ssh(ssh_key: &str) -> Result<()> {
 
 /// Configure networking inside the microVM guest.
 fn configure_guest_network(ssh_key: &str) -> Result<()> {
-    println!("[mvm] Configuring guest networking...");
+    ui::info("Configuring guest networking...");
     let ssh_opts = format!(
         "-i {dir}/{key} -o ConnectTimeout=5 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR",
         dir = MICROVM_DIR,
@@ -158,9 +159,9 @@ pub fn start() -> Result<()> {
 
     // Check if already running
     if firecracker::is_running()? {
-        println!("[mvm] Firecracker is already running.");
+        ui::info("Firecracker is already running.");
         if is_ssh_reachable()? {
-            println!("[mvm] MicroVM is running. Connecting...");
+            ui::info("MicroVM is running. Connecting...");
             return ssh();
         } else {
             anyhow::bail!(
@@ -182,7 +183,7 @@ pub fn start() -> Result<()> {
     configure_microvm(&state)?;
 
     // Start the instance
-    println!("[mvm] Starting microVM...");
+    ui::info("Starting microVM...");
     std::thread::sleep(std::time::Duration::from_millis(15));
     api_put("/actions", r#"{"action_type": "InstanceStart"}"#)?;
 
@@ -192,14 +193,12 @@ pub fn start() -> Result<()> {
     // Configure guest networking
     configure_guest_network(&state.ssh_key)?;
 
-    println!();
-    println!("=========================================");
-    println!(" MicroVM is running!");
-    println!("=========================================");
-    println!();
-    println!("  Use 'mvm ssh' to reconnect after exiting.");
-    println!("  Use 'mvm stop' to shut down the microVM.");
-    println!();
+    ui::banner(&[
+        "MicroVM is running!",
+        "",
+        "Use 'mvm ssh' to reconnect after exiting.",
+        "Use 'mvm stop' to shut down the microVM.",
+    ]);
 
     // Drop into interactive SSH
     ssh()
@@ -210,11 +209,11 @@ pub fn stop() -> Result<()> {
     lima::require_running()?;
 
     if !firecracker::is_running()? {
-        println!("[mvm] MicroVM is not running.");
+        ui::info("MicroVM is not running.");
         return Ok(());
     }
 
-    println!("[mvm] Stopping microVM...");
+    ui::info("Stopping microVM...");
 
     // Try graceful shutdown via API
     let _ = run_in_vm(&format!(
@@ -243,7 +242,7 @@ pub fn stop() -> Result<()> {
     // Tear down networking
     network::teardown()?;
 
-    println!("[mvm] MicroVM stopped.");
+    ui::success("MicroVM stopped.");
     Ok(())
 }
 

@@ -1,7 +1,9 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::shell::run_host;
+use super::http;
+use super::shell::run_host;
+use super::ui;
 
 const GITHUB_REPO: &str = "auser/mvm";
 
@@ -45,22 +47,8 @@ fn fetch_latest_version() -> Result<String> {
         GITHUB_REPO
     );
 
-    let output = run_host(
-        "curl",
-        &["-fsSL", "-H", "Accept: application/vnd.github+json", &url],
-    )?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to query GitHub releases API. Check your network connection.\n{}",
-            stderr.trim()
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).context("Failed to parse GitHub API response")?;
+    let json = http::fetch_json(&url)
+        .context("Failed to query GitHub releases API. Check your network connection.")?;
 
     let tag = json["tag_name"]
         .as_str()
@@ -83,23 +71,17 @@ fn download_release(version: &str, target: &str, tmp_dir: &Path) -> Result<()> {
     );
     let dest = tmp_dir.join(&archive_name);
 
-    println!("[mvm] Downloading {}...", download_url);
+    let sp = ui::spinner(&format!("Downloading {}...", download_url));
 
-    let output = run_host(
-        "curl",
-        &["-fsSL", "-o", dest.to_str().unwrap(), &download_url],
-    )?;
+    http::download_file(&download_url, &dest).with_context(|| {
+        format!(
+            "Download failed. Check that {} has a release for {}.",
+            version, target
+        )
+    })?;
 
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Download failed. Check that {} has a release for {}.\n{}",
-            version,
-            target,
-            stderr.trim()
-        );
-    }
-
+    sp.finish_and_clear();
+    ui::success("Download complete.");
     Ok(())
 }
 
@@ -145,9 +127,9 @@ fn extract_and_install(target: &str, tmp_dir: &Path, current_exe: &Path) -> Resu
 
     let needs_sudo = !is_writable(install_dir);
 
-    println!("[mvm] Installing to {}...", install_dir.display());
+    ui::info(&format!("Installing to {}...", install_dir.display()));
     if needs_sudo {
-        println!("[mvm] Requires elevated permissions.");
+        ui::warn("Requires elevated permissions.");
     }
 
     // --- Replace binary ---
@@ -175,7 +157,7 @@ fn extract_and_install(target: &str, tmp_dir: &Path, current_exe: &Path) -> Resu
     let new_resources = extracted_dir.join("resources");
     if new_resources.exists() {
         let dest_resources = install_dir.join("resources");
-        println!("[mvm] Updating resources...");
+        ui::info("Updating resources...");
 
         if needs_sudo {
             let _ = run_host("sudo", &["rm", "-rf", dest_resources.to_str().unwrap()]);
@@ -189,7 +171,7 @@ fn extract_and_install(target: &str, tmp_dir: &Path, current_exe: &Path) -> Resu
                 ],
             )?;
             if !output.status.success() {
-                println!("[mvm] Warning: failed to update resources directory");
+                ui::warn("Failed to update resources directory");
             }
         } else {
             let _ = std::fs::remove_dir_all(&dest_resources);
@@ -256,27 +238,28 @@ fn copy_dir_recursive(src: &Path, dst: &Path) -> Result<()> {
 /// Main entry point: check for updates and optionally install.
 pub fn upgrade(check_only: bool, force: bool) -> Result<()> {
     let current = current_version();
-    println!("[mvm] Current version: {}", current);
+    ui::info(&format!("Current version: {}", current));
 
-    println!("[mvm] Checking for updates...");
+    let sp = ui::spinner("Checking for updates...");
     let latest_tag = fetch_latest_version()?;
     let latest_version = strip_v_prefix(&latest_tag);
+    sp.finish_and_clear();
 
     if latest_version == current && !force {
-        println!("[mvm] Already up to date ({}).", current);
+        ui::success(&format!("Already up to date ({}).", current));
         return Ok(());
     }
 
     if latest_version == current {
-        println!(
-            "[mvm] Already at {} but --force specified, reinstalling.",
+        ui::info(&format!(
+            "Already at {} but --force specified, reinstalling.",
             current
-        );
+        ));
     } else {
-        println!(
-            "[mvm] New version available: {} -> {}",
+        ui::info(&format!(
+            "New version available: {} -> {}",
             current, latest_version
-        );
+        ));
     }
 
     if check_only {
@@ -284,7 +267,7 @@ pub fn upgrade(check_only: bool, force: bool) -> Result<()> {
     }
 
     let target = detect_target()?;
-    println!("[mvm] Platform: {}", target);
+    ui::info(&format!("Platform: {}", target));
 
     let current_exe =
         std::env::current_exe().context("Failed to determine path of current executable")?;
@@ -295,13 +278,13 @@ pub fn upgrade(check_only: bool, force: bool) -> Result<()> {
     download_release(&latest_tag, target, tmp_dir.path())?;
     extract_and_install(target, tmp_dir.path(), &current_exe)?;
 
-    println!("\n[mvm] Successfully upgraded to {}!", latest_tag);
+    ui::success(&format!("\nSuccessfully upgraded to {}!", latest_tag));
 
     // Verify the new binary works
     let output = run_host(current_exe.to_str().unwrap(), &["--version"])?;
     if output.status.success() {
         let version_output = String::from_utf8_lossy(&output.stdout);
-        println!("[mvm] Verified: {}", version_output.trim());
+        ui::success(&format!("Verified: {}", version_output.trim()));
     }
 
     Ok(())
