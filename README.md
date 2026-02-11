@@ -221,8 +221,9 @@ See [docs/networking.md](docs/networking.md) for details.
 ```
 src/
   main.rs                  # CLI dispatch
-  agent.rs                 # Reconcile loop + QUIC daemon
-  node.rs                  # Node identity + stats
+  bin/mvm-hostd.rs         # Privileged executor daemon binary
+  agent.rs                 # Reconcile loop + QUIC daemon + signed state verification
+  node.rs                  # Node identity + stats + attestation
   infra/                   # Host/VM infrastructure (config, shell, bootstrap, UI)
   vm/
     microvm.rs, lima.rs    # Dev mode (unchanged)
@@ -231,12 +232,30 @@ src/
     instance/              # Instance state machine, lifecycle, networking, snapshots
     bridge.rs              # Per-tenant bridge management
     naming.rs              # ID generation + validation
-  security/                # Jailer, cgroups, seccomp, audit, metadata, mTLS certs
+  security/                # Jailer, cgroups, seccomp, audit, mTLS certs, LUKS encryption
+    signing.rs             # Ed25519 signed desired state
+    snapshot_crypto.rs     # AES-256-GCM snapshot encryption
+    attestation.rs         # Node attestation provider (TPM2/SEV-SNP hook)
+  hostd/                   # Privilege separation (agentd/hostd split)
+    protocol.rs            # IPC types (HostdRequest/HostdResponse)
+    server.rs              # Privileged executor daemon
+    client.rs              # Agentd client for hostd IPC
   sleep/                   # Sleep policy + idle metrics
   worker/                  # Guest worker lifecycle hooks
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the full module map.
+
+## Security
+
+Production deployments use a split-process model for privilege separation:
+
+- **mvm-hostd** runs as root with minimal capabilities, executing only pre-defined privileged operations
+- **mvm-agentd** runs fully unprivileged, handling reconciliation and the QUIC API
+
+Additional security features: LUKS-encrypted data volumes, AES-256-GCM snapshot encryption, Ed25519 signed desired state (unsigned requests rejected in production), mTLS transport, per-tenant network isolation, jailer chroot + UID isolation, seccomp filters, cgroup resource limits, and memory hygiene (`Zeroizing` for all key material).
+
+See [docs/security.md](docs/security.md) for the full threat model and hardening details.
 
 ## Platform Support
 
@@ -258,6 +277,7 @@ cargo run -- --help
 ## Documentation
 
 - [Architecture](docs/architecture.md) -- module map, data model, design decisions
+- [Security](docs/security.md) -- threat model, privilege separation, encryption, signed state
 - [Networking](docs/networking.md) -- cluster-wide subnets, bridges, isolation
 - [CLI Reference](docs/cli.md) -- complete command reference
 - [Agent & Reconciliation](docs/agent.md) -- desired state schema, reconcile loop, QUIC API
