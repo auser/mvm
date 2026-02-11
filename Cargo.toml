@@ -16,6 +16,7 @@ path = "src/main.rs"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
 colored = "3"
 indicatif = "0.17"
 inquire = "0.7"
@@ -37,6 +38,7 @@ tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 which = "7"
+zeroize = "1"
 
 [dev-dependencies]
 assert_cmd = "2"

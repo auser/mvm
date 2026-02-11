@@ -8,6 +8,7 @@ const CGROUP_BASE: &str = "/sys/fs/cgroup/mvm";
 ///
 /// Path: /sys/fs/cgroup/mvm/<tenant_id>/<instance_id>/
 /// Sets memory.max, cpu.max (bandwidth), and pids.max limits.
+/// Verifies writes by reading back memory.max after setting.
 pub fn create_instance_cgroup(
     tenant_id: &str,
     instance_id: &str,
@@ -42,19 +43,70 @@ pub fn create_instance_cgroup(
     ))
     .with_context(|| format!("Failed to create cgroup for {}/{}", tenant_id, instance_id))?;
 
+    // Verify memory.max was actually written
+    verify_cgroup_write(&cgroup_path, "memory.max", &mem_bytes.to_string())?;
+
+    Ok(())
+}
+
+/// Verify a cgroup knob was written correctly by reading it back.
+fn verify_cgroup_write(cgroup_path: &str, knob: &str, expected: &str) -> Result<()> {
+    let actual = shell::run_in_vm_stdout(&format!(
+        "cat {}/{} 2>/dev/null || echo MISSING",
+        cgroup_path, knob
+    ))?;
+    let actual = actual.trim();
+    if actual == "MISSING" {
+        anyhow::bail!("Cgroup {} not found at {}/{}", knob, cgroup_path, knob);
+    }
+    if actual != expected {
+        anyhow::bail!(
+            "Cgroup {} verification failed: expected {}, got {}",
+            knob,
+            expected,
+            actual
+        );
+    }
+    Ok(())
+}
+
+/// Kill all processes in an instance cgroup for reliable teardown.
+/// Sends SIGKILL to all processes listed in cgroup.procs, waits briefly.
+pub fn kill_cgroup_processes(tenant_id: &str, instance_id: &str) -> Result<()> {
+    let cgroup_path = format!("{}/{}/{}", CGROUP_BASE, tenant_id, instance_id);
+    shell::run_in_vm(&format!(
+        r#"
+        if [ -f {path}/cgroup.procs ]; then
+            for pid in $(cat {path}/cgroup.procs 2>/dev/null); do
+                kill -9 "$pid" 2>/dev/null || true
+            done
+            sleep 0.5
+        fi
+        "#,
+        path = cgroup_path,
+    ))
+    .with_context(|| {
+        format!(
+            "Failed to kill cgroup processes for {}/{}",
+            tenant_id, instance_id
+        )
+    })?;
     Ok(())
 }
 
 /// Remove the cgroup for a stopped/destroyed instance.
+/// Kills remaining processes first, then removes the cgroup directory.
 pub fn remove_instance_cgroup(tenant_id: &str, instance_id: &str) -> Result<()> {
     let cgroup_path = format!("{}/{}/{}", CGROUP_BASE, tenant_id, instance_id);
 
-    // Kill any remaining processes in the cgroup before removing
+    // Kill all processes first for clean removal
+    let _ = kill_cgroup_processes(tenant_id, instance_id);
+
+    // Move any survivors to parent before removal
     let parent = format!("{}/{}", CGROUP_BASE, tenant_id);
     shell::run_in_vm(&format!(
         r#"
         if [ -d {path} ]; then
-            # Move processes to parent before removal
             cat {path}/cgroup.procs 2>/dev/null | while read pid; do
                 echo "$pid" | sudo tee {parent}/cgroup.procs > /dev/null 2>&1 || true
             done

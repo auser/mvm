@@ -1,81 +1,181 @@
-# mvm Sprint 2: Production Readiness
+# mvm Sprint 4: Security Baseline (90%)
 
-Previous sprint: [SPRINT-1-foundation.md](sprints/SPRINT-1-foundation.md) (complete, merged to main)
+Previous sprints:
+- [SPRINT-1-foundation.md](sprints/SPRINT-1-foundation.md) (complete)
+- [SPRINT-2-production-readiness.md](sprints/SPRINT-2-production-readiness.md) (complete)
+- [SPRINT-3-real-world-validation.md](sprints/SPRINT-3-real-world-validation.md) (complete)
 
-Sprint 1 delivered the full foundation: multi-tenant object model, lifecycle API, networking, security hardening, sleep/wake, reconcile loop, QUIC+mTLS daemon, and CI/CD. Sprint 2 focuses on making mvm production-ready.
+Sprints 1-3 built the full multi-tenant system with observability, CLI polish, error handling, and operational tooling. Sprint 4 implements a "90% secure" production baseline — strict runtime isolation, network isolation, secrets hardening, data-at-rest encryption (LUKS for data volumes), hardened agent API, systemd sandboxing, installer verification, and snapshot hardening. Based on [specs/plans/6-security.md](plans/6-security.md) with pragmatic scoping.
 
 ---
 
-## Phase 1: End-to-End Integration Testing
-**Status: COMPLETE**
+## Phase 1: Runtime Isolation Hardening
+**Status: NOT STARTED**
 
-Shell-mockable integration tests that validate the full workflow without a real Lima VM.
+Make jailer mandatory in production mode, enforce cgroup limits, ensure clean teardown.
 
-- [x] Shell mock infrastructure (`src/infra/shell_mock.rs`) — thread-local `RefCell<HashMap>` intercept layer
-- [x] Tenant create/list/info/destroy tests (`tests/integration_tenant.rs` via shell mock)
-- [x] Pool create/build lifecycle tests
-- [x] Instance create/start/ssh/stop/destroy lifecycle
-- [x] Sleep/wake round-trip with snapshot verification
-- [x] Agent serve + QUIC client test (send NodeInfo request, verify response)
-- [x] Bridge verify produces clean BridgeReport
+- [ ] `src/infra/config.rs` — add `PRODUCTION_MODE` env var check (`MVM_PRODUCTION=1`)
+- [ ] `src/vm/instance/lifecycle.rs` — in production mode, refuse to start without jailer available
+- [ ] `src/security/cgroups.rs` — verify cgroup writes succeed (read back `memory.max` after write)
+- [ ] `src/security/cgroups.rs` — add `kill_cgroup_processes()` helper for reliable teardown
+- [ ] `src/vm/instance/lifecycle.rs` — call `kill_cgroup_processes()` during stop before `rmdir`
+- [ ] Agent reconcile — enforce per-tenant quotas before every start/wake/create (already done, verify)
+- [ ] Tests: verify jailer refusal in production mode, cgroup teardown
 
-## Phase 2: Observability & Logging
-**Status: COMPLETE**
+## Phase 2: Secrets Hardening
+**Status: NOT STARTED**
 
-Replaced ad-hoc `eprintln!` with structured `tracing`:
+Secrets drive must be ephemeral, tmpfs-backed, and mounted with restrictive options.
 
-- [x] Add `tracing` + `tracing-subscriber` crates (with `json` + `env-filter` features)
-- [x] Instrument all lifecycle operations with `#[instrument]` spans (instance, pool, tenant)
-- [x] Structured JSON log output for agent daemon mode (`LogFormat::Json`)
-- [x] Request-level tracing in QUIC handler (request type, latency, outcome)
-- [x] Prometheus-style metrics endpoint (`src/observability/metrics.rs` — atomic counters, exposition format)
-- [x] `RUST_LOG` env filter support via `tracing-subscriber`
+- [ ] `src/vm/instance/disk.rs` — `create_secrets_disk()` use tmpfs-backed ext4 image
+- [ ] `src/vm/instance/disk.rs` — set file permissions 0600 on secrets disk
+- [ ] `src/vm/instance/fc_config.rs` — set `is_read_only: true` for secrets drive (vdc)
+- [ ] Guest mount: document `ro,noexec,nodev,nosuid` mount options for `/run/secrets`
+- [ ] `src/vm/instance/lifecycle.rs` — recreate fresh secrets disk on every start and wake
+- [ ] Audit: verify secrets paths are never included in log/audit output
+- [ ] Tests: verify secrets disk is recreated, permissions correct
 
-## Phase 3: CLI Polish & UX
-**Status: COMPLETE**
+## Phase 3: LUKS Data Volume Encryption
+**Status: NOT STARTED**
 
-- [x] `mvm instance stats` — structured display with IP, TAP, MAC, PID, revision, timestamps
-- [x] `mvm pool info` — show flake, profile, resources, desired counts, seccomp policy
-- [x] `mvm tenant info` — show quota usage, network config, net_id, bridge, created_at
-- [x] Colorized table output for list commands (`tabled` crate)
-- [x] `--output table|json|yaml` global flag for all list/info commands
-- [x] Display row structs (`src/infra/display.rs`) — TenantRow, TenantInfo, PoolRow, PoolInfo, InstanceRow, InstanceInfo
-- [x] Output format rendering (`src/infra/output.rs`) — render_list/render_one helpers
+Encrypt persistent tenant data volumes (vdb) with LUKS. No snapshot encryption yet.
 
-## Phase 4: Error Handling & Resilience
-**Status: COMPLETE**
+- [ ] `src/security/encryption.rs` — new module:
+  - `create_encrypted_volume(path, size_mib, key) -> Result<()>` — `cryptsetup luksFormat`
+  - `open_encrypted_volume(path, name, key) -> Result<String>` — `cryptsetup luksOpen`, returns `/dev/mapper/<name>`
+  - `close_encrypted_volume(name) -> Result<()>` — `cryptsetup luksClose`
+  - `is_luks_volume(path) -> Result<bool>` — check if already LUKS formatted
+- [ ] `src/security/keystore.rs` — new module:
+  - `KeyProvider` trait: `get_data_key(tenant_id) -> Result<Vec<u8>>`
+  - `EnvKeyProvider` — reads `MVM_TENANT_KEY_<TENANT_ID>` env var (dev/staging)
+  - `FileKeyProvider` — reads from `/var/lib/mvm/keys/<tenant_id>.key` (node-local provisioning)
+- [ ] `src/vm/instance/lifecycle.rs` — integrate LUKS:
+  - `instance_start` → open LUKS volume before FC launch (if data disk configured)
+  - `instance_stop` → close LUKS volume after FC shutdown
+  - `instance_destroy` → close + wipe LUKS header
+- [ ] Add `zeroize` crate for key material clearing
+- [ ] Tests: unit tests for encryption module, key provider trait
 
-- [x] Retry logic for transient failures (`src/infra/retry.rs` — exponential backoff, configurable attempts)
-- [x] Stale PID detection (`src/vm/instance/health.rs` — `detect_stale_pids()`)
-- [x] Orphan cleanup (`src/vm/instance/health.rs` — `detect_orphans()`)
-- [x] Structured error types with `StalePidResult` and `OrphanResult`
+## Phase 4: Agent API Hardening
+**Status: NOT STARTED**
 
-## Phase 5: Coordinator Client
-**Status: COMPLETE**
+Lock down the coordinator→agent API to strictly declarative operations.
 
-QUIC client side for multi-node fleet management:
+- [ ] `src/agent.rs` — add `#[serde(deny_unknown_fields)]` to `DesiredState`, `DesiredTenant`, `DesiredPool`
+- [ ] `src/agent.rs` — cap `desired_counts` values (max 100 per pool per state)
+- [ ] `src/agent.rs` — validate all IDs against `naming::validate_id()` in `validate_desired_state()`
+- [ ] `src/agent.rs` — add request type logging with explicit DENY for any future imperative requests
+- [ ] Document: API surface is strictly `Reconcile`, `NodeInfo`, `NodeStats`, `TenantList`, `InstanceList`, `WakeInstance` — nothing else
+- [ ] Verify: no code path allows arbitrary command execution via the QUIC API
 
-- [x] `mvm coordinator` CLI subcommand group
-- [x] `coordinator push --desired desired.json --node <addr>` — send desired state to agent
-- [x] `coordinator status --node <addr>` — query node info + stats
-- [x] `coordinator list-instances --node <addr> --tenant <id>` — query instances
-- [x] `coordinator wake --node <addr> --tenant <t> --pool <p> --instance <i>` — urgent wake
-- [x] Parallel push to multiple nodes (`send_multi()` via `tokio::task::JoinSet`)
-- [x] mTLS client config using shared cert infrastructure
+## Phase 5: Transport Security Defaults
+**Status: NOT STARTED**
 
-## Phase 6: Performance & Resource Optimization
-**Status: COMPLETE**
+Ensure mTLS in production, allow token mode for dev/staging.
 
-- [x] Lazy Lima VM startup (`src/vm/lima_state.rs` — `OnceLock` checked on first use)
-- [x] Parallel instance operations (`src/vm/instance/parallel.rs` — `parallel_start/stop/create` with configurable concurrency)
-- [x] Disk space management (`src/vm/disk_manager.rs` — `disk_usage_report()`, `cleanup_old_revisions()`)
+- [ ] `src/agent.rs` — in production mode, refuse to start `agent serve` without TLS certs
+- [ ] `src/agent.rs` — add `--require-mtls` flag (default true in production)
+- [ ] `src/infra/config.rs` — stable node-id: read/write `/var/lib/mvm/node_id` (already exists, verify)
+- [ ] Document staging exception: token-based auth only on private interfaces
 
-## Phase 7: Documentation & Examples
-**Status: COMPLETE**
+## Phase 6: Systemd Hardening
+**Status: NOT STARTED**
 
-- [x] User guide: writing custom Nix flakes for mvm (`docs/user-guide.md`)
-- [x] Example: web server fleet — nginx + app instances (`docs/examples/web-fleet.md`)
-- [x] Example: CI runner pool — ephemeral build workers (`docs/examples/ci-runners.md`)
-- [x] Troubleshooting guide (`docs/troubleshooting.md`)
-- [x] API reference for desired state JSON schema (`docs/desired-state-schema.md`)
-- [x] Architecture decision records — 4 ADRs (`docs/adr/001-004`)
+Systemd unit file with sandboxing directives. Agent runs as root (privilege split deferred).
+
+- [ ] `deploy/systemd/mvm-agent.service` — unit file with sandboxing
+- [ ] `scripts/install-systemd.sh` — install unit, create dirs, set permissions
+- [ ] `docs/systemd.md` — capabilities rationale, customization guide
+
+## Phase 7: Installer Hardening
+**Status: NOT STARTED**
+
+SHA256-verified binary downloads.
+
+- [ ] `scripts/mvm-install.sh` — download binary + `.sha256` checksum file
+- [ ] Verify SHA256 before installing; abort on mismatch
+- [ ] Support `--version` flag for pinned installs
+- [ ] Never `curl | bash` in production docs — document download-then-verify flow
+
+## Phase 8: Snapshot Hardening
+**Status: NOT STARTED**
+
+Secure snapshot storage without encryption (encryption deferred).
+
+- [ ] `src/vm/instance/snapshot.rs` — set per-tenant snapshot dirs to 0700 root-only
+- [ ] `src/vm/instance/snapshot.rs` — validate tenant_id in restore path (reject cross-tenant)
+- [ ] `src/vm/instance/snapshot.rs` — path canonicalization before snapshot ops
+- [ ] `src/vm/instance/snapshot.rs` — `snapshot_capabilities()` — detect FC version
+- [ ] `src/vm/disk_manager.rs` — GC: zero-fill files before unlink
+- [ ] Audit: log all snapshot create/restore/delete operations
+- [ ] Tests: cross-tenant rejection, permission enforcement
+
+## Phase 9: Network Verification Enhancement
+**Status: NOT STARTED**
+
+Strengthen `mvm net verify` checks.
+
+- [ ] `src/vm/bridge.rs` — check no TAP attached to wrong tenant's bridge
+- [ ] `src/vm/bridge.rs` — verify instance IPs are within coordinator-assigned subnets
+- [ ] `src/vm/bridge.rs` — verify nftables rules deny cross-bridge forwarding
+- [ ] `mvm net verify --deep` flag for rule content inspection
+- [ ] Tests: mock-based verify tests
+
+## Phase 10: Documentation Update
+**Status: NOT STARTED**
+
+- [ ] `docs/security.md` — security baseline overview, threat model, hardening checklist
+- [ ] Update `docs/cli.md` — document `MVM_PRODUCTION=1`, `--require-mtls`
+- [ ] Update `CLAUDE.md` — new modules (security/encryption, security/keystore)
+- [ ] Document deferred items with rationale
+
+---
+
+## Implementation Order
+
+```
+Phase 1 (Runtime Isolation) → foundational, do first
+Phase 2 (Secrets Hardening) → independent
+Phase 3 (LUKS Encryption) → independent, can overlap with Phase 2
+Phase 4 (API Hardening) → independent
+Phase 5 (Transport Security) → depends on Phase 1 (production mode flag)
+Phase 6 (Systemd) → independent
+Phase 7 (Installer) → independent
+Phase 8 (Snapshot Hardening) → independent
+Phase 9 (Net Verify) → independent
+Phase 10 (Documentation) → do last
+```
+
+## New Dependencies
+
+```toml
+zeroize = "1"      # Phase 3: secure key material clearing
+```
+
+## Explicitly Deferred
+
+| Item | Reason | Future Sprint |
+|------|--------|---------------|
+| Privilege separation (agentd/hostd split) | High complexity, requires separate binaries + Unix socket RPC | Sprint 5 |
+| Snapshot encryption | Depends on key management maturity; hardened permissions + GC covers 80% | Sprint 5 |
+| Signed desired-state updates (Ed25519) | Requires coordinator-side signing infrastructure | Sprint 5 |
+| Shared-bridge segmentation with nftables tagging | Per-tenant bridges already provide isolation by construction | Not planned |
+
+## Future Sprints
+
+### Sprint 5: Full Security (Deferred Items)
+- Privilege separation (agentd/hostd split)
+- Snapshot encryption (AES-256-GCM)
+- Signed desired-state updates
+- Full pre-flight checks module
+
+### Guest Agent & vsock
+- vsock guest agent for lifecycle signals
+- Structured health probes over vsock
+- Log streaming from guest to host
+
+### Scale & Multi-Node
+- Coordinator server
+- Node registration
+- Fleet-wide commands
+- Cross-node tenant migration

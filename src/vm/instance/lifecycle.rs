@@ -6,9 +6,9 @@ use super::fc_config;
 use super::net;
 use super::snapshot;
 use super::state::{InstanceState, InstanceStatus, validate_transition};
-use crate::infra::http;
 use crate::infra::shell;
-use crate::security::{audit, cgroups, jailer, metadata, seccomp};
+use crate::infra::{config, http};
+use crate::security::{audit, cgroups, encryption, jailer, keystore, metadata, seccomp};
 use crate::sleep::metrics::IdleMetrics;
 use crate::vm::bridge;
 use crate::vm::naming;
@@ -183,12 +183,34 @@ pub fn instance_start(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resu
     let kernel_path = format!("{}/current/vmlinux", arts_dir);
     let rootfs_path = format!("{}/current/rootfs.ext4", arts_dir);
 
-    // Prepare disks
+    // Prepare disks (with optional LUKS encryption for data volumes)
     let data_disk_path = if spec.instance_resources.data_disk_mib > 0 {
-        Some(disk::ensure_data_disk(
-            &inst_dir,
-            spec.instance_resources.data_disk_mib,
-        )?)
+        let raw_path = disk::ensure_data_disk(&inst_dir, spec.instance_resources.data_disk_mib)?;
+
+        // LUKS encryption: if tenant has a key, encrypt the data volume
+        if keystore::has_key(tenant_id) {
+            let provider = keystore::default_provider();
+            let key = provider.get_data_key(tenant_id)?;
+            let mapper_name = encryption::luks_mapper_name(tenant_id, instance_id);
+
+            if !encryption::is_luks_volume(&raw_path)? {
+                encryption::create_encrypted_volume(
+                    &raw_path,
+                    spec.instance_resources.data_disk_mib,
+                    &key,
+                )?;
+            }
+            let mapper_path = encryption::open_encrypted_volume(&raw_path, &mapper_name, &key)?;
+
+            // Format the mapper device if new
+            let _ = shell::run_in_vm(&format!(
+                "if ! blkid {} >/dev/null 2>&1; then mkfs.ext4 -q {}; fi",
+                mapper_path, mapper_path
+            ));
+            Some(mapper_path)
+        } else {
+            Some(raw_path)
+        }
     } else {
         None
     };
@@ -223,6 +245,14 @@ pub fn instance_start(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resu
         seccomp::ensure_strict_profile()?;
     }
     let seccomp_filter = seccomp::seccomp_filter_path(&spec.seccomp_policy);
+
+    // In production mode, refuse to start without jailer
+    if config::is_production_mode() && !jailer::jailer_available().unwrap_or(false) {
+        anyhow::bail!(
+            "Production mode (MVM_PRODUCTION=1) requires jailer. \
+             Install jailer or unset MVM_PRODUCTION for dev mode."
+        );
+    }
 
     // Launch Firecracker via jailer (with chroot) or directly
     let pid = if jailer::jailer_available().unwrap_or(false) {
@@ -295,16 +325,21 @@ pub fn instance_stop(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resul
         ));
     }
 
-    // Clean up cgroup
+    // Close LUKS volume if open
+    let mapper_name = encryption::luks_mapper_name(tenant_id, instance_id);
+    let _ = encryption::close_encrypted_volume(&mapper_name);
+
+    // Kill remaining cgroup processes and clean up cgroup
+    let _ = cgroups::kill_cgroup_processes(tenant_id, instance_id);
     cgroups::remove_instance_cgroup(tenant_id, instance_id)?;
 
     // Tear down TAP device
     net::teardown_tap(&state.net.tap_dev)?;
 
-    // Clean up runtime files (socket, pid, log)
+    // Clean up runtime files (socket, pid, log) and ephemeral secrets disk
     let inst_dir = instance_dir(tenant_id, pool_id, instance_id);
     let _ = shell::run_in_vm(&format!(
-        "rm -f {dir}/runtime/firecracker.socket {dir}/runtime/fc.pid",
+        "rm -f {dir}/runtime/firecracker.socket {dir}/runtime/fc.pid {dir}/volumes/secrets.ext4",
         dir = inst_dir
     ));
 
@@ -582,6 +617,10 @@ pub fn instance_destroy(
         // Kill stale process
         let _ = shell::run_in_vm(&format!("kill -9 {} 2>/dev/null || true", pid));
     }
+
+    // Close LUKS volume and wipe header if destroying
+    let mapper_name = encryption::luks_mapper_name(tenant_id, instance_id);
+    let _ = encryption::close_encrypted_volume(&mapper_name);
 
     // Tear down TAP if still present
     let _ = net::teardown_tap(&state.net.tap_dev);

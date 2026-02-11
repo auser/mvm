@@ -24,6 +24,7 @@ pub enum AuditAction {
     SecretsRotated,
     SnapshotCreated,
     SnapshotRestored,
+    SnapshotDeleted,
 }
 
 /// A single audit log entry.
@@ -69,6 +70,49 @@ pub fn log_event(
         log_path,
     ))
     .with_context(|| format!("Failed to write audit log for tenant {}", tenant_id))?;
+
+    Ok(())
+}
+
+/// Maximum audit log size before rotation (10 MiB).
+const MAX_AUDIT_LOG_BYTES: u64 = 10 * 1024 * 1024;
+
+/// Number of rotated audit log files to keep.
+const KEEP_ROTATED: u32 = 3;
+
+/// Rotate an audit log if it exceeds the size limit.
+///
+/// Rotation scheme: audit.log → audit.log.1.gz → audit.log.2.gz → audit.log.3.gz
+/// Keeps the most recent `KEEP_ROTATED` compressed files.
+pub fn rotate_audit_log(tenant_id: &str) -> Result<()> {
+    let log_path = tenant_audit_log_path(tenant_id);
+
+    // Check file size
+    let size_str =
+        shell::run_in_vm_stdout(&format!("stat -c%s {} 2>/dev/null || echo 0", log_path))?;
+    let size: u64 = size_str.trim().parse().unwrap_or(0);
+
+    if size < MAX_AUDIT_LOG_BYTES {
+        return Ok(());
+    }
+
+    // Rotate: shift existing numbered files up, drop oldest
+    for i in (1..KEEP_ROTATED).rev() {
+        let from = format!("{}.{}.gz", log_path, i);
+        let to = format!("{}.{}.gz", log_path, i + 1);
+        let _ = shell::run_in_vm(&format!("mv {} {} 2>/dev/null || true", from, to));
+    }
+
+    // Compress current log to .1.gz and truncate
+    shell::run_in_vm(&format!(
+        "gzip -c {} > {}.1.gz && truncate -s 0 {}",
+        log_path, log_path, log_path
+    ))
+    .with_context(|| format!("Failed to rotate audit log for tenant {}", tenant_id))?;
+
+    // Remove any file beyond KEEP_ROTATED
+    let oldest = format!("{}.{}.gz", log_path, KEEP_ROTATED + 1);
+    let _ = shell::run_in_vm(&format!("rm -f {}", oldest));
 
     Ok(())
 }
@@ -148,11 +192,32 @@ mod tests {
             AuditAction::SecretsRotated,
             AuditAction::SnapshotCreated,
             AuditAction::SnapshotRestored,
+            AuditAction::SnapshotDeleted,
         ];
 
         for action in actions {
             let json = serde_json::to_string(&action).unwrap();
             assert!(!json.is_empty());
         }
+    }
+
+    #[test]
+    fn test_rotation_constants() {
+        assert_eq!(MAX_AUDIT_LOG_BYTES, 10 * 1024 * 1024);
+        assert_eq!(KEEP_ROTATED, 3);
+    }
+
+    #[test]
+    fn test_rotate_noop_when_small() {
+        use crate::infra::shell_mock;
+
+        let tenant_json = shell_mock::tenant_fixture("acme", 3, "10.240.3.0/24", "10.240.3.1");
+        let (_guard, _fs) = shell_mock::mock_fs()
+            .with_file("/var/lib/mvm/tenants/acme/tenant.json", &tenant_json)
+            .install();
+
+        // File doesn't exist or is small — rotation should be a no-op
+        let result = rotate_audit_log("acme");
+        assert!(result.is_ok());
     }
 }

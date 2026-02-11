@@ -5,16 +5,21 @@ use tracing::{info, warn};
 
 use super::lima::{self, LimaStatus};
 use crate::infra::config;
+use crate::infra::platform;
 
 /// Tracks whether we have already verified (and possibly started) the Lima VM.
 static LIMA_READY: OnceLock<bool> = OnceLock::new();
 
-/// Ensure the Lima VM is running before executing VM-side operations.
+/// Ensure the execution environment is ready for VM-side operations.
 ///
-/// On the first call, checks Lima status and starts it if stopped.
+/// On native Linux: always returns Ok (no Lima needed).
+/// On macOS: checks Lima status and starts it if stopped.
 /// Subsequent calls return immediately (cached via `OnceLock`).
-/// Returns an error if Lima is not found or cannot be started.
 pub fn ensure_lima_ready() -> Result<()> {
+    if !platform::current().needs_lima() {
+        return Ok(());
+    }
+
     let ready = LIMA_READY.get_or_init(|| match check_and_start_lima() {
         Ok(()) => true,
         Err(e) => {

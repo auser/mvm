@@ -46,7 +46,7 @@ The CLI runs on the host. All Linux operations run inside the Lima VM via `limac
 - `vm/tenant/{config,lifecycle,quota,secrets}.rs` -- tenant management
 - `vm/pool/{config,lifecycle,build,artifacts}.rs` -- pool management + ephemeral FC builds
 - `vm/instance/{state,lifecycle,net,fc_config,disk,snapshot}.rs` -- instance lifecycle API
-- `security/{jailer,cgroups,seccomp,audit,metadata}.rs` -- hardening
+- `security/{jailer,cgroups,seccomp,audit,metadata,encryption,keystore}.rs` -- hardening + LUKS + key management
 - `sleep/{policy,metrics}.rs` -- sleep heuristics
 - `worker/hooks.rs` -- guest worker signals
 - `agent.rs` -- reconcile loop + QUIC daemon
@@ -115,6 +115,7 @@ macOS / Linux Host
 - `docs/networking.md` -- cluster-wide subnets, bridges, isolation
 - `docs/cli.md` -- complete command reference
 - `docs/agent.md` -- desired state schema, reconcile loop, QUIC API
+- `docs/security.md` -- threat model, hardening measures, env vars, deferred items
 - `specs/plans/` -- implementation specs and plan
 
 ## Sprint Management

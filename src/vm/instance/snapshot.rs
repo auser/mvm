@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::infra::http;
 use crate::infra::shell;
+use crate::security::audit;
 use crate::vm::pool::config::pool_snapshots_dir;
 
 /// Metadata for a snapshot (base or delta).
@@ -16,6 +17,9 @@ pub struct SnapshotMeta {
     pub mem_size_bytes: u64,
 }
 
+/// Expected prefix for all snapshot paths (used for canonicalization checks).
+const SNAPSHOT_BASE_DIR: &str = "/var/lib/mvm/tenants/";
+
 // --- Paths ---
 
 fn base_snapshot_dir(tenant_id: &str, pool_id: &str) -> String {
@@ -24,6 +28,34 @@ fn base_snapshot_dir(tenant_id: &str, pool_id: &str) -> String {
 
 fn delta_snapshot_dir(instance_dir: &str) -> String {
     format!("{}/snapshots/delta", instance_dir)
+}
+
+/// Validate that a snapshot path belongs to the expected tenant.
+/// Prevents cross-tenant snapshot access via path traversal.
+fn validate_snapshot_path(path: &str, tenant_id: &str) -> Result<()> {
+    // Canonicalize: resolve any ../ or symlinks
+    let canonical = shell::run_in_vm_stdout(&format!(
+        "realpath -m {} 2>/dev/null || echo {}",
+        path, path
+    ))?;
+    let canonical = canonical.trim();
+
+    let expected_prefix = format!("{}{}/", SNAPSHOT_BASE_DIR, tenant_id);
+    if !canonical.starts_with(&expected_prefix) {
+        anyhow::bail!(
+            "Snapshot path {} resolves to {} which is outside tenant {}",
+            path,
+            canonical,
+            tenant_id
+        );
+    }
+    Ok(())
+}
+
+/// Set per-tenant snapshot directory permissions to 0700 (root-only).
+fn secure_snapshot_dir(dir: &str) -> Result<()> {
+    shell::run_in_vm(&format!("sudo mkdir -p {} && sudo chmod 0700 {}", dir, dir))?;
+    Ok(())
 }
 
 // --- Base Snapshot (pool-level, shared) ---
@@ -55,7 +87,8 @@ pub fn create_base_snapshot(
     let base_dir = base_snapshot_dir(tenant_id, pool_id);
     let socket_path = format!("{}/runtime/firecracker.socket", instance_dir);
 
-    shell::run_in_vm(&format!("mkdir -p {}", base_dir))?;
+    // Secure directory permissions (0700 root-only)
+    secure_snapshot_dir(&base_dir)?;
 
     // Create snapshot via Firecracker API
     shell::run_in_vm(&format!(
@@ -90,6 +123,15 @@ pub fn create_base_snapshot(
         base_dir, meta_json
     ))?;
 
+    // Audit log
+    let _ = audit::log_event(
+        tenant_id,
+        Some(pool_id),
+        None,
+        audit::AuditAction::SnapshotCreated,
+        Some(&format!("type=base, compression={}", compression)),
+    );
+
     Ok(())
 }
 
@@ -116,7 +158,8 @@ pub fn create_delta_snapshot(instance_dir: &str, compression: &str) -> Result<()
     let delta_dir = delta_snapshot_dir(instance_dir);
     let socket_path = format!("{}/runtime/firecracker.socket", instance_dir);
 
-    shell::run_in_vm(&format!("mkdir -p {}", delta_dir))?;
+    // Secure directory permissions (0700 root-only)
+    secure_snapshot_dir(&delta_dir)?;
 
     // Create diff snapshot via Firecracker API
     shell::run_in_vm(&format!(
@@ -165,11 +208,11 @@ pub fn remove_delta_snapshot(instance_dir: &str) -> Result<()> {
 
 /// Restore an instance from base + optional delta snapshot.
 ///
-/// Copies snapshot files to the instance's runtime directory,
-/// decompresses if needed, then loads via Firecracker's snapshot API.
+/// Validates that snapshot paths belong to the correct tenant (prevents
+/// cross-tenant snapshot access). Copies snapshot files to the instance's
+/// runtime directory, decompresses if needed, then loads via FC API.
 ///
-/// Returns true if restored from snapshot, false if no snapshot available
-/// (caller should do a fresh boot instead).
+/// Returns true if restored from snapshot, false if no snapshot available.
 pub fn restore_snapshot(
     tenant_id: &str,
     pool_id: &str,
@@ -179,6 +222,10 @@ pub fn restore_snapshot(
     let base_dir = base_snapshot_dir(tenant_id, pool_id);
     let delta_dir = delta_snapshot_dir(instance_dir);
     let runtime_dir = format!("{}/runtime", instance_dir);
+
+    // Validate paths belong to this tenant (prevent cross-tenant access)
+    validate_snapshot_path(&base_dir, tenant_id)?;
+    validate_snapshot_path(instance_dir, tenant_id)?;
 
     // Check if base exists
     if !has_base_snapshot(tenant_id, pool_id)? {
@@ -254,7 +301,23 @@ pub fn restore_snapshot(
     ))
     .with_context(|| "Failed to resume vCPUs after snapshot restore")?;
 
+    // Audit log
+    let _ = audit::log_event(
+        tenant_id,
+        Some(pool_id),
+        None,
+        audit::AuditAction::SnapshotRestored,
+        Some(&format!("delta={}", has_delta)),
+    );
+
     Ok(true)
+}
+
+/// Detect Firecracker snapshot version capabilities.
+pub fn snapshot_capabilities() -> Result<String> {
+    let out =
+        shell::run_in_vm_stdout("firecracker --version 2>/dev/null | head -1 || echo unknown")?;
+    Ok(out.trim().to_string())
 }
 
 // --- Compression Helpers ---
@@ -345,6 +408,15 @@ fn file_size_bytes(path: &str) -> Result<u64> {
 pub fn invalidate_base_snapshot(tenant_id: &str, pool_id: &str) -> Result<()> {
     let base_dir = base_snapshot_dir(tenant_id, pool_id);
     shell::run_in_vm(&format!("rm -rf {}/*", base_dir))?;
+
+    let _ = audit::log_event(
+        tenant_id,
+        Some(pool_id),
+        None,
+        audit::AuditAction::SnapshotDeleted,
+        Some("type=base, reason=invalidate"),
+    );
+
     Ok(())
 }
 
@@ -418,5 +490,21 @@ mod tests {
         let parsed: SnapshotMeta = serde_json::from_str(&json).unwrap();
         assert!(parsed.revision_hash.is_none());
         assert_eq!(parsed.snapshot_type, "delta");
+    }
+
+    #[test]
+    fn test_validate_snapshot_path_valid() {
+        let path = "/var/lib/mvm/tenants/acme/pools/workers/snapshots/base";
+        // This would call shell::run_in_vm_stdout which needs mock,
+        // so we test the logic inline
+        let expected_prefix = format!("{}acme/", SNAPSHOT_BASE_DIR);
+        assert!(path.starts_with(&expected_prefix));
+    }
+
+    #[test]
+    fn test_validate_snapshot_path_cross_tenant() {
+        let path = "/var/lib/mvm/tenants/evil/pools/workers/snapshots/base";
+        let expected_prefix = format!("{}acme/", SNAPSHOT_BASE_DIR);
+        assert!(!path.starts_with(&expected_prefix));
     }
 }

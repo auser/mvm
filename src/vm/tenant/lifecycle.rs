@@ -29,12 +29,19 @@ pub fn tenant_create(tenant_id: &str, net: TenantNet, quotas: TenantQuota) -> Re
     Ok(config)
 }
 
-/// Load tenant config from disk.
+/// Load tenant config from disk, with validation.
 pub fn tenant_load(tenant_id: &str) -> Result<TenantConfig> {
     let path = tenant_config_path(tenant_id);
     let json = shell::run_in_vm_stdout(&format!("cat {}", path))
         .with_context(|| format!("Failed to load tenant config: {}", tenant_id))?;
-    let config: TenantConfig = serde_json::from_str(&json)?;
+    let config: TenantConfig = serde_json::from_str(&json)
+        .with_context(|| format!("Corrupt tenant config at {}", path))?;
+    if config.tenant_id.is_empty() {
+        anyhow::bail!("Tenant config has empty tenant_id at {}", path);
+    }
+    if config.net.ipv4_subnet.is_empty() {
+        anyhow::bail!("Tenant {} has empty subnet", config.tenant_id);
+    }
     Ok(config)
 }
 

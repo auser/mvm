@@ -9,8 +9,9 @@ use tracing::{debug, error, info, instrument, warn};
 use crate::infra::shell;
 use crate::node;
 use crate::observability::metrics;
-use crate::security::certs;
+use crate::security::{audit, certs};
 use crate::sleep::policy;
+use crate::vm::instance::health;
 use crate::vm::instance::lifecycle::{
     instance_create, instance_list, instance_sleep, instance_start, instance_stop, instance_wake,
     instance_warm,
@@ -25,6 +26,7 @@ use crate::vm::tenant::lifecycle::{tenant_create, tenant_destroy, tenant_exists,
 // ============================================================================
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DesiredState {
     pub schema_version: u32,
     pub node_id: String,
@@ -36,6 +38,7 @@ pub struct DesiredState {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DesiredTenant {
     pub tenant_id: String,
     pub network: DesiredTenantNetwork,
@@ -46,12 +49,17 @@ pub struct DesiredTenant {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DesiredTenantNetwork {
     pub tenant_net_id: u16,
     pub ipv4_subnet: String,
 }
 
+/// Maximum desired instances per pool per state.
+const MAX_DESIRED_PER_STATE: u32 = 100;
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DesiredPool {
     pub pool_id: String,
     pub flake_ref: String,
@@ -253,9 +261,23 @@ async fn write_frame(send: &mut quinn::SendStream, data: &[u8]) -> Result<()> {
 // ============================================================================
 
 /// Handle a single typed request and produce a response.
+///
+/// API surface is strictly: Reconcile, NodeInfo, NodeStats, TenantList,
+/// InstanceList, WakeInstance. The typed enum prevents any imperative
+/// or command-execution requests — unknown variants fail deserialization.
 fn handle_request(request: AgentRequest) -> AgentResponse {
     let m = metrics::global();
     m.requests_total.fetch_add(1, Ordering::Relaxed);
+
+    let request_type = match &request {
+        AgentRequest::Reconcile(_) => "Reconcile",
+        AgentRequest::NodeInfo => "NodeInfo",
+        AgentRequest::NodeStats => "NodeStats",
+        AgentRequest::TenantList => "TenantList",
+        AgentRequest::InstanceList { .. } => "InstanceList",
+        AgentRequest::WakeInstance { .. } => "WakeInstance",
+    };
+    debug!(request_type, "Handling agent request");
 
     match request {
         AgentRequest::Reconcile(desired) => {
@@ -427,6 +449,53 @@ pub fn reconcile(desired_path: &str, prune: bool) -> Result<()> {
 #[instrument(skip_all, fields(node_id = %desired.node_id, prune))]
 fn reconcile_desired(desired: &DesiredState, prune: bool) -> Result<ReconcileReport> {
     let mut report = ReconcileReport::default();
+
+    // Phase 0a: Detect stale PIDs and auto-transition dead instances to Stopped
+    match health::detect_stale_pids() {
+        Ok(stale) => {
+            for s in &stale {
+                warn!(
+                    tenant_id = %s.tenant_id,
+                    pool_id = %s.pool_id,
+                    instance_id = %s.instance_id,
+                    pid = s.recorded_pid,
+                    "Auto-stopping stale instance (PID dead)"
+                );
+                if let Err(e) = instance_stop(&s.tenant_id, &s.pool_id, &s.instance_id) {
+                    report.errors.push(format!(
+                        "Failed to stop stale instance {}/{}/{}: {}",
+                        s.tenant_id, s.pool_id, s.instance_id, e
+                    ));
+                } else {
+                    report.instances_stopped += 1;
+                }
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "Stale PID detection failed (non-fatal)");
+        }
+    }
+
+    // Phase 0b: Detect orphaned directories and log warnings
+    match health::detect_orphans() {
+        Ok(orphans) => {
+            for o in &orphans {
+                warn!(path = %o.path, reason = %o.reason, "Orphaned directory detected");
+            }
+        }
+        Err(e) => {
+            warn!(error = %e, "Orphan detection failed (non-fatal)");
+        }
+    }
+
+    // Phase 0c: Rotate audit logs for all known tenants
+    if let Ok(tids) = tenant_list() {
+        for tid in &tids {
+            if let Err(e) = audit::rotate_audit_log(tid) {
+                warn!(tenant_id = %tid, error = %e, "Audit log rotation failed (non-fatal)");
+            }
+        }
+    }
 
     // Phase 1: Ensure desired tenants exist
     for dt in &desired.tenants {
@@ -630,7 +699,12 @@ fn reconcile_pool_instances(
 }
 
 /// Validate a desired state document.
+///
+/// Checks: schema version, ID format (via naming::validate_id), non-zero resources,
+/// desired count caps (max 100 per pool per state).
 pub fn validate_desired_state(desired: &DesiredState) -> Vec<String> {
+    use crate::vm::naming;
+
     let mut errors = Vec::new();
 
     if desired.schema_version != 1 {
@@ -641,20 +715,45 @@ pub fn validate_desired_state(desired: &DesiredState) -> Vec<String> {
     }
 
     for tenant in &desired.tenants {
-        if tenant.tenant_id.is_empty() {
-            errors.push("Tenant ID cannot be empty".to_string());
+        if let Err(e) = naming::validate_id(&tenant.tenant_id, "Tenant") {
+            errors.push(format!("Invalid tenant ID: {}", e));
         }
         for pool in &tenant.pools {
-            if pool.pool_id.is_empty() {
+            if let Err(e) = naming::validate_id(&pool.pool_id, "Pool") {
                 errors.push(format!(
-                    "Pool ID cannot be empty in tenant {}",
-                    tenant.tenant_id
+                    "Invalid pool ID in tenant {}: {}",
+                    tenant.tenant_id, e
                 ));
             }
             if pool.instance_resources.vcpus == 0 {
                 errors.push(format!(
                     "Pool {}/{} has 0 vCPUs",
                     tenant.tenant_id, pool.pool_id
+                ));
+            }
+            // Cap desired counts to prevent resource exhaustion
+            if pool.desired_counts.running > MAX_DESIRED_PER_STATE {
+                errors.push(format!(
+                    "Pool {}/{} running count {} exceeds max {}",
+                    tenant.tenant_id,
+                    pool.pool_id,
+                    pool.desired_counts.running,
+                    MAX_DESIRED_PER_STATE
+                ));
+            }
+            if pool.desired_counts.warm > MAX_DESIRED_PER_STATE {
+                errors.push(format!(
+                    "Pool {}/{} warm count {} exceeds max {}",
+                    tenant.tenant_id, pool.pool_id, pool.desired_counts.warm, MAX_DESIRED_PER_STATE
+                ));
+            }
+            if pool.desired_counts.sleeping > MAX_DESIRED_PER_STATE {
+                errors.push(format!(
+                    "Pool {}/{} sleeping count {} exceeds max {}",
+                    tenant.tenant_id,
+                    pool.pool_id,
+                    pool.desired_counts.sleeping,
+                    MAX_DESIRED_PER_STATE
                 ));
             }
         }
@@ -678,6 +777,17 @@ pub fn serve(
     desired_path: Option<&str>,
     listen_addr: Option<&str>,
 ) -> Result<()> {
+    // In production mode, refuse to start without TLS certs
+    if crate::infra::config::is_production_mode() {
+        let cert_missing = certs::load_server_config().is_err();
+        if cert_missing {
+            anyhow::bail!(
+                "Production mode (MVM_PRODUCTION=1) requires mTLS certificates. \
+                 Run 'mvm agent certs init' or provide --tls-cert/--tls-key/--tls-ca."
+            );
+        }
+    }
+
     let addr: SocketAddr = listen_addr
         .unwrap_or(DEFAULT_LISTEN)
         .parse()

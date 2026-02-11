@@ -111,12 +111,48 @@ pub fn cleanup_old_revisions(tenant_id: &str, pool_id: &str, keep_n: usize) -> R
 
     for rev in to_remove {
         let rev_path = format!("{}/{}", artifacts_dir, rev);
+        // Zero-fill files before unlinking for secure deletion
+        let _ = secure_wipe_dir(&rev_path);
         if shell::run_in_vm(&format!("rm -rf {}", rev_path)).is_ok() {
             removed += 1;
         }
     }
 
     Ok(removed)
+}
+
+/// Zero-fill all regular files in a directory before deletion.
+/// Prevents data recovery from freed disk blocks.
+pub fn secure_wipe_dir(path: &str) -> Result<()> {
+    shell::run_in_vm(&format!(
+        r#"
+        find {path} -type f 2>/dev/null | while read f; do
+            SIZE=$(stat -c%s "$f" 2>/dev/null || echo 0)
+            if [ "$SIZE" -gt 0 ]; then
+                dd if=/dev/zero of="$f" bs=4096 count=$((SIZE / 4096 + 1)) conv=notrunc 2>/dev/null || true
+            fi
+        done
+        "#,
+        path = path,
+    ))?;
+    Ok(())
+}
+
+/// Securely wipe a single file (zero-fill then unlink).
+pub fn secure_wipe_file(path: &str) -> Result<()> {
+    shell::run_in_vm(&format!(
+        r#"
+        if [ -f {path} ]; then
+            SIZE=$(stat -c%s {path} 2>/dev/null || echo 0)
+            if [ "$SIZE" -gt 0 ]; then
+                dd if=/dev/zero of={path} bs=4096 count=$((SIZE / 4096 + 1)) conv=notrunc 2>/dev/null || true
+            fi
+            rm -f {path}
+        fi
+        "#,
+        path = path,
+    ))?;
+    Ok(())
 }
 
 #[cfg(test)]

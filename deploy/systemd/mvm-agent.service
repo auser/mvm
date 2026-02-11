@@ -1,0 +1,58 @@
+[Unit]
+Description=mvm Agent - Firecracker MicroVM Fleet Manager
+Documentation=https://github.com/auser/mvm
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mvm agent serve \
+    --desired /etc/mvm/desired.json \
+    --interval-secs 30 \
+    --listen 0.0.0.0:4433 \
+    --tls-cert /etc/mvm/certs/node.crt \
+    --tls-key /etc/mvm/certs/node.key \
+    --tls-ca /etc/mvm/certs/ca.crt
+Restart=on-failure
+RestartSec=5
+Environment=MVM_PRODUCTION=1
+Environment=RUST_LOG=info
+
+# Sandboxing: agent runs as root (needs /dev/kvm, cgroups, network admin)
+# but we restrict what it can access.
+
+# Filesystem restrictions
+ProtectHome=yes
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mvm /sys/fs/cgroup/mvm /run
+PrivateTmp=yes
+
+# Network: needs full access for bridge/TAP management
+# RestrictAddressFamilies= not set (needs AF_INET, AF_NETLINK, AF_UNIX)
+
+# Capabilities: only what's needed
+# CAP_NET_ADMIN: bridge/TAP/iptables management
+# CAP_SYS_ADMIN: cgroup management, mount operations
+# CAP_DAC_OVERRIDE: access files owned by jailer UIDs
+# CAP_KILL: send signals to Firecracker processes
+# CAP_CHOWN/CAP_FOWNER: jailer chroot setup
+AmbientCapabilities=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_KILL CAP_CHOWN CAP_FOWNER
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_DAC_OVERRIDE CAP_KILL CAP_CHOWN CAP_FOWNER CAP_SYS_CHROOT CAP_SETUID CAP_SETGID
+
+# Misc hardening
+NoNewPrivileges=no
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectControlGroups=no
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

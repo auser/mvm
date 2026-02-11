@@ -5,15 +5,21 @@ use crate::infra::config::*;
 use crate::infra::shell::{replace_process, run_in_vm, run_in_vm_stdout, run_in_vm_visible};
 use crate::infra::ui;
 
+/// Resolve MICROVM_DIR (~) to an absolute path inside the Lima VM.
+fn resolve_microvm_dir() -> Result<String> {
+    run_in_vm_stdout(&format!("echo {}", MICROVM_DIR))
+}
+
 /// Start the Firecracker daemon inside the Lima VM (background).
-fn start_firecracker_daemon() -> Result<()> {
+fn start_firecracker_daemon(abs_dir: &str) -> Result<()> {
     ui::info("Starting Firecracker...");
     run_in_vm_visible(&format!(
         r#"
+        mkdir -p {dir}
         sudo rm -f {socket}
-        touch {logfile}
+        touch {dir}/firecracker.log
         sudo bash -c 'nohup setsid firecracker --api-sock {socket} --enable-pci \
-            </dev/null >{logfile} 2>&1 &
+            </dev/null >{dir}/firecracker.log 2>&1 &
             echo $! > {dir}/.fc-pid'
 
         echo "[mvm] Waiting for API socket..."
@@ -29,8 +35,7 @@ fn start_firecracker_daemon() -> Result<()> {
         echo "[mvm] Firecracker started."
         "#,
         socket = API_SOCKET,
-        logfile = LOGFILE,
-        dir = MICROVM_DIR,
+        dir = abs_dir,
     ))
 }
 
@@ -55,19 +60,18 @@ fn api_put(path: &str, data: &str) -> Result<()> {
 }
 
 /// Configure the microVM via the Firecracker API.
-fn configure_microvm(state: &MvmState) -> Result<()> {
+fn configure_microvm(state: &MvmState, abs_dir: &str) -> Result<()> {
     ui::info("Configuring logger...");
     api_put(
         "/logger",
         &format!(
-            r#"{{"log_path": "{dir}/{file}", "level": "Debug", "show_level": true, "show_log_origin": true}}"#,
-            dir = "$HOME/microvm",
-            file = "firecracker.log",
+            r#"{{"log_path": "{dir}/firecracker.log", "level": "Debug", "show_level": true, "show_log_origin": true}}"#,
+            dir = abs_dir,
         ),
     )?;
 
-    let kernel_path = format!("{}/{}", "$HOME/microvm", state.kernel);
-    let rootfs_path = format!("{}/{}", "$HOME/microvm", state.rootfs);
+    let kernel_path = format!("{}/{}", abs_dir, state.kernel);
+    let rootfs_path = format!("{}/{}", abs_dir, state.rootfs);
 
     // Determine boot args
     let kernel_boot_args = "keep_bootcon console=ttyS0 reboot=k panic=1";
@@ -173,14 +177,17 @@ pub fn start() -> Result<()> {
     // Read state file for asset paths
     let state = read_state_or_discover()?;
 
+    // Resolve ~/microvm to absolute path so it works in both user and sudo contexts
+    let abs_dir = resolve_microvm_dir()?;
+
     // Set up networking
     network::setup()?;
 
     // Start Firecracker daemon
-    start_firecracker_daemon()?;
+    start_firecracker_daemon(&abs_dir)?;
 
     // Configure microVM
-    configure_microvm(&state)?;
+    configure_microvm(&state, &abs_dir)?;
 
     // Start the instance
     ui::info("Starting microVM...");

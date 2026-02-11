@@ -3,6 +3,7 @@ pub mod config;
 pub mod display;
 pub mod http;
 pub mod output;
+pub mod platform;
 pub mod retry;
 pub mod shell;
 #[cfg(test)]

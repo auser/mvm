@@ -1,5 +1,6 @@
 use anyhow::Result;
 
+use super::platform::{self, Platform};
 use super::shell;
 use super::ui;
 
@@ -45,9 +46,14 @@ fn check_linux_package_manager() -> Result<()> {
 
 /// Install Lima if not already installed.
 ///
-/// - macOS: installs via Homebrew
-/// - Linux: installs via the available package manager, or downloads the binary
+/// On native Linux with KVM, Lima is not required — this is a no-op.
+/// On macOS or Linux without KVM: installs Lima via package manager.
 pub fn ensure_lima() -> Result<()> {
+    if platform::current() == Platform::LinuxNative {
+        ui::info("Native Linux with KVM detected — Lima not required.");
+        return Ok(());
+    }
+
     if which::which("limactl").is_ok() {
         let output = shell::run_host("limactl", &["--version"])?;
         let version = String::from_utf8_lossy(&output.stdout).trim().to_string();
@@ -74,7 +80,6 @@ pub fn ensure_lima() -> Result<()> {
 fn install_lima_linux() -> Result<()> {
     if which::which("apt-get").is_ok() {
         ui::info("Installing Lima via apt...");
-        // Lima is available in some Ubuntu/Debian repos, or via direct .deb
         shell::run_host_visible(
             "bash",
             &["-c", "curl -fsSL https://lima-vm.io/install.sh | sudo sh"],
@@ -97,15 +102,17 @@ fn install_lima_linux() -> Result<()> {
     Ok(())
 }
 
+/// Check if the platform requires Lima.
+pub fn is_lima_required() -> bool {
+    platform::current().needs_lima()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
 
     #[test]
     fn test_check_homebrew_error_message() {
-        // Verify the error message contains install instructions when brew is missing.
-        // We can't control whether brew is installed, so test the message format
-        // by checking what the function returns in the error case.
         if which::which("brew").is_err() {
             let err = check_homebrew().unwrap_err();
             let msg = err.to_string();
@@ -113,16 +120,19 @@ mod tests {
             assert!(msg.contains("curl -fsSL"));
             assert!(msg.contains("mvm bootstrap"));
         } else {
-            // brew is available — check_homebrew should succeed
             assert!(check_homebrew().is_ok());
         }
     }
 
     #[test]
     fn test_ensure_lima_when_limactl_present() {
-        // If limactl is available, ensure_lima should succeed without installing
         if which::which("limactl").is_ok() {
             assert!(ensure_lima().is_ok());
         }
+    }
+
+    #[test]
+    fn test_is_lima_required() {
+        let _ = is_lima_required();
     }
 }

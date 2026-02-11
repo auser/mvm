@@ -206,5 +206,70 @@ pub fn full_bridge_report(tenant_id: &str, net: &TenantNet) -> Result<BridgeRepo
         .map(|l| l.to_string())
         .collect();
 
+    // Check 8: Verify TAP devices belong to this tenant (name prefix tn<net_id>)
+    let expected_tap_prefix = format!("tn{}", net.tenant_net_id);
+    for tap in &report.tap_devices {
+        if !tap.starts_with(&expected_tap_prefix) {
+            report.issues.push(format!(
+                "TAP {} attached to {} but doesn't match tenant net_id {} (expected prefix {})",
+                tap, bridge, net.tenant_net_id, expected_tap_prefix
+            ));
+        }
+    }
+
+    // Check 9: Verify no cross-bridge forwarding (explicit DROP for inter-bridge traffic)
+    let cross_bridge_check = shell::run_in_vm_stdout(&format!(
+        r#"
+        # Check if there's a DROP rule for cross-bridge forwarding
+        # We verify that other tenant bridges can't forward to this one
+        OTHER_BRIDGES=$(ip link show type bridge 2>/dev/null | grep -oP '(?<=: )\S+(?=:)' | grep -v {bridge} || true)
+        ISSUE=""
+        for other in $OTHER_BRIDGES; do
+            if sudo iptables -C FORWARD -i "$other" -o {bridge} -j DROP 2>/dev/null; then
+                : # Good, drop rule exists
+            else
+                ISSUE="$ISSUE cross-bridge:$other->$bridge"
+            fi
+        done
+        echo "$ISSUE"
+        "#,
+        bridge = bridge,
+    ))?;
+    let cross_issues = cross_bridge_check.trim();
+    if !cross_issues.is_empty() {
+        report
+            .issues
+            .push(format!("Missing cross-bridge DROP rules: {}", cross_issues));
+    }
+
     Ok(report)
+}
+
+/// Deep verification: inspect iptables rule content for a tenant bridge.
+/// Returns detailed rule listings for manual audit.
+pub fn deep_verify_bridge(net: &TenantNet) -> Result<String> {
+    let bridge = &net.bridge_name;
+    let subnet = &net.ipv4_subnet;
+
+    shell::run_in_vm_stdout(&format!(
+        r#"
+        echo "=== Bridge: {bridge} ==="
+        echo "--- Interface ---"
+        ip addr show dev {bridge} 2>/dev/null || echo "NOT FOUND"
+        echo ""
+        echo "--- TAP devices ---"
+        ls /sys/class/net/{bridge}/brif/ 2>/dev/null || echo "none"
+        echo ""
+        echo "--- NAT rules for {subnet} ---"
+        sudo iptables -t nat -L POSTROUTING -v -n 2>/dev/null | grep '{subnet}' || echo "none"
+        echo ""
+        echo "--- FORWARD rules for {bridge} ---"
+        sudo iptables -L FORWARD -v -n 2>/dev/null | grep '{bridge}' || echo "none"
+        echo ""
+        echo "--- ARP table ---"
+        arp -n -i {bridge} 2>/dev/null || echo "none"
+        "#,
+        bridge = bridge,
+        subnet = subnet,
+    ))
 }

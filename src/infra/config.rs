@@ -15,6 +15,14 @@ pub const FC_MAC: &str = "06:00:AC:10:00:02";
 pub const MICROVM_DIR: &str = "~/microvm";
 pub const LOGFILE: &str = "~/microvm/firecracker.log";
 
+/// Check if running in production mode (MVM_PRODUCTION=1).
+/// In production mode: jailer is mandatory, mTLS required, stricter validation.
+pub fn is_production_mode() -> bool {
+    std::env::var("MVM_PRODUCTION")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false)
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct MvmState {
     pub kernel: String,
@@ -156,6 +164,13 @@ mod tests {
         assert!(state.rootfs.is_empty());
         assert!(state.ssh_key.is_empty());
         assert_eq!(state.fc_pid, None);
+    }
+
+    #[test]
+    fn test_production_mode_disabled_by_default() {
+        // Without env var set, should be false
+        unsafe { std::env::remove_var("MVM_PRODUCTION") };
+        assert!(!is_production_mode());
     }
 
     #[test]

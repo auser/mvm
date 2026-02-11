@@ -1,5 +1,5 @@
 use anyhow::{Context, Result};
-use clap::{Parser, Subcommand};
+use clap::{CommandFactory, Parser, Subcommand};
 
 // Import from the library crate
 use mvm::infra::output::OutputFormat;
@@ -127,6 +127,23 @@ enum Commands {
         /// Output path for the built .elf image
         #[arg(long, short = 'o')]
         output: Option<String>,
+    },
+    /// Generate shell completions
+    Completions {
+        /// Shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+    /// Tail audit events for a tenant
+    Events {
+        /// Tenant ID
+        tenant: String,
+        /// Number of recent events to show
+        #[arg(long, short = 'n', default_value = "20")]
+        last: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -271,6 +288,14 @@ enum PoolCmd {
         /// Skip confirmation
         #[arg(long)]
         force: bool,
+    },
+    /// Clean up old build revisions for a pool
+    Gc {
+        /// Pool path: <tenant>/<pool>
+        path: String,
+        /// Number of revisions to keep
+        #[arg(long, default_value = "2")]
+        keep: usize,
     },
 }
 
@@ -472,6 +497,17 @@ enum NodeCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Show disk usage report
+    Disk {
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run garbage collection across all pools
+    Gc {
+        /// Number of revisions to keep per pool
+        #[arg(long, default_value = "2")]
+        keep: usize,
+    },
 }
 
 // ============================================================================
@@ -513,6 +549,8 @@ fn main() -> Result<()> {
         Commands::Destroy => cmd_destroy(),
         Commands::Upgrade { check, force } => cmd_upgrade(check, force),
         Commands::Build { path, output } => cmd_build(&path, output.as_deref()),
+        Commands::Completions { shell } => cmd_completions(shell),
+        Commands::Events { tenant, last, json } => cmd_events(&tenant, last, json),
 
         // --- Multi-tenant ---
         Commands::Tenant { action } => cmd_tenant(action, out_fmt),
@@ -546,6 +584,13 @@ fn cmd_bootstrap(production: bool) -> Result<()> {
 }
 
 fn cmd_setup() -> Result<()> {
+    if !bootstrap::is_lima_required() {
+        // Native Linux — just install FC directly
+        run_setup_steps()?;
+        ui::success("\nSetup complete! Run 'mvm start' to launch a microVM.");
+        return Ok(());
+    }
+
     which::which("limactl").map_err(|_| {
         anyhow::anyhow!(
             "'limactl' not found. Install Lima first: brew install lima\n\
@@ -562,24 +607,27 @@ fn cmd_setup() -> Result<()> {
 fn cmd_dev() -> Result<()> {
     ui::info("Launching development environment...\n");
 
-    if which::which("limactl").is_err() {
-        ui::info("Lima not found. Running bootstrap...\n");
-        cmd_bootstrap(false)?;
-        return microvm::start();
-    }
-
-    let lima_status = lima::get_status()?;
-    match lima_status {
-        lima::LimaStatus::NotFound => {
-            ui::info("Lima VM not found. Running setup...\n");
-            run_setup_steps()?;
+    if bootstrap::is_lima_required() {
+        // macOS or Linux without KVM — need Lima
+        if which::which("limactl").is_err() {
+            ui::info("Lima not found. Running bootstrap...\n");
+            cmd_bootstrap(false)?;
             return microvm::start();
         }
-        lima::LimaStatus::Stopped => {
-            ui::info("Lima VM is stopped. Starting...");
-            lima::start()?;
+
+        let lima_status = lima::get_status()?;
+        match lima_status {
+            lima::LimaStatus::NotFound => {
+                ui::info("Lima VM not found. Running setup...\n");
+                run_setup_steps()?;
+                return microvm::start();
+            }
+            lima::LimaStatus::Stopped => {
+                ui::info("Lima VM is stopped. Starting...");
+                lima::start()?;
+            }
+            lima::LimaStatus::Running => {}
         }
-        lima::LimaStatus::Running => {}
     }
 
     if !firecracker::is_installed()? {
@@ -605,14 +653,18 @@ fn cmd_dev() -> Result<()> {
 }
 
 fn run_setup_steps() -> Result<()> {
-    let lima_yaml = config::render_lima_yaml()?;
-    ui::info(&format!(
-        "Using rendered Lima config: {}",
-        lima_yaml.path().display()
-    ));
+    if bootstrap::is_lima_required() {
+        let lima_yaml = config::render_lima_yaml()?;
+        ui::info(&format!(
+            "Using rendered Lima config: {}",
+            lima_yaml.path().display()
+        ));
 
-    ui::step(1, 4, "Setting up Lima VM...");
-    lima::ensure_running(lima_yaml.path())?;
+        ui::step(1, 4, "Setting up Lima VM...");
+        lima::ensure_running(lima_yaml.path())?;
+    } else {
+        ui::step(1, 4, "Native Linux detected — skipping Lima VM setup.");
+    }
 
     ui::step(2, 4, "Installing Firecracker...");
     firecracker::install()?;
@@ -714,23 +766,29 @@ fn cmd_ssh() -> Result<()> {
 fn cmd_status() -> Result<()> {
     ui::status_header();
 
-    let lima_status = lima::get_status()?;
-    match lima_status {
-        lima::LimaStatus::NotFound => {
-            ui::status_line("Lima VM:", "Not created (run 'mvm setup')");
-            ui::status_line("Firecracker:", "-");
-            ui::status_line("MicroVM:", "-");
-            return Ok(());
+    ui::status_line("Platform:", &mvm::infra::platform::current().to_string());
+
+    if bootstrap::is_lima_required() {
+        let lima_status = lima::get_status()?;
+        match lima_status {
+            lima::LimaStatus::NotFound => {
+                ui::status_line("Lima VM:", "Not created (run 'mvm setup')");
+                ui::status_line("Firecracker:", "-");
+                ui::status_line("MicroVM:", "-");
+                return Ok(());
+            }
+            lima::LimaStatus::Stopped => {
+                ui::status_line("Lima VM:", "Stopped");
+                ui::status_line("Firecracker:", "-");
+                ui::status_line("MicroVM:", "-");
+                return Ok(());
+            }
+            lima::LimaStatus::Running => {
+                ui::status_line("Lima VM:", "Running");
+            }
         }
-        lima::LimaStatus::Stopped => {
-            ui::status_line("Lima VM:", "Stopped");
-            ui::status_line("Firecracker:", "-");
-            ui::status_line("MicroVM:", "-");
-            return Ok(());
-        }
-        lima::LimaStatus::Running => {
-            ui::status_line("Lima VM:", "Running");
-        }
+    } else {
+        ui::status_line("Lima VM:", "Not required (native KVM)");
     }
 
     if firecracker::is_running()? {
@@ -738,7 +796,11 @@ fn cmd_status() -> Result<()> {
             .unwrap_or_else(|_| "?".to_string());
         ui::status_line("Firecracker:", &format!("Running (PID {})", pid));
     } else {
-        ui::status_line("Firecracker:", "Not running");
+        if firecracker::is_installed()? {
+            ui::status_line("Firecracker:", "Installed, not running");
+        } else {
+            ui::status_line("Firecracker:", "Not installed");
+        }
         ui::status_line("MicroVM:", "Not running");
         return Ok(());
     }
@@ -763,6 +825,45 @@ fn cmd_build(path: &str, output: Option<&str>) -> Result<()> {
     let elf_path = image::build(path, output)?;
     ui::success(&format!("\nImage ready: {}", elf_path));
     ui::info(&format!("Run with: mvm start {}", elf_path));
+    Ok(())
+}
+
+fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
+    let mut cmd = Cli::command();
+    clap_complete::generate(shell, &mut cmd, "mvm", &mut std::io::stdout());
+    Ok(())
+}
+
+fn cmd_events(tenant_id: &str, last: usize, json: bool) -> Result<()> {
+    let entries = mvm::security::audit::read_audit_log(tenant_id, last)?;
+
+    if entries.is_empty() {
+        ui::info(&format!("No audit events for tenant '{}'.", tenant_id));
+        return Ok(());
+    }
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&entries)?);
+    } else {
+        for entry in &entries {
+            println!(
+                "{} [{}] {:?}{}{}",
+                entry.timestamp,
+                entry.tenant_id,
+                entry.action,
+                entry
+                    .pool_id
+                    .as_ref()
+                    .map(|p| format!(" pool={}", p))
+                    .unwrap_or_default(),
+                entry
+                    .instance_id
+                    .as_ref()
+                    .map(|i| format!(" instance={}", i))
+                    .unwrap_or_default(),
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1002,6 +1103,19 @@ fn cmd_pool(action: PoolCmd, out_fmt: OutputFormat) -> Result<()> {
             ui::success(&format!("Pool '{}' destroyed.", path));
             Ok(())
         }
+        PoolCmd::Gc { path, keep } => {
+            let (tenant_id, pool_id) = naming::parse_pool_path(&path)?;
+            let removed = mvm::vm::disk_manager::cleanup_old_revisions(tenant_id, pool_id, keep)?;
+            if removed > 0 {
+                ui::success(&format!(
+                    "Cleaned up {} old revisions for '{}'.",
+                    removed, path
+                ));
+            } else {
+                ui::info(&format!("No old revisions to clean up for '{}'.", path));
+            }
+            Ok(())
+        }
     }
 }
 
@@ -1239,6 +1353,47 @@ fn cmd_node(action: NodeCmd, out_fmt: OutputFormat) -> Result<()> {
     match action {
         NodeCmd::Info { json } => mvm::node::info(json),
         NodeCmd::Stats { json } => mvm::node::stats(json),
+        NodeCmd::Disk { json } => {
+            let report = mvm::vm::disk_manager::disk_usage_report()?;
+            if json {
+                println!("{}", serde_json::to_string_pretty(&report)?);
+            } else {
+                println!("Total disk usage: {} bytes", report.total_bytes);
+                for t in &report.tenants {
+                    println!("  Tenant '{}': {} bytes", t.tenant_id, t.total_bytes);
+                    for p in &t.pools {
+                        println!(
+                            "    Pool '{}': artifacts={}, instances={}, total={}",
+                            p.pool_id, p.artifacts_bytes, p.instances_bytes, p.total_bytes
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        NodeCmd::Gc { keep } => {
+            let tenant_ids = mvm::vm::tenant::lifecycle::tenant_list()?;
+            let mut total_removed = 0u32;
+            for tid in &tenant_ids {
+                if let Ok(pool_ids) = mvm::vm::pool::lifecycle::pool_list(tid) {
+                    for pid in &pool_ids {
+                        match mvm::vm::disk_manager::cleanup_old_revisions(tid, pid, keep) {
+                            Ok(n) => total_removed += n,
+                            Err(e) => ui::warn(&format!("GC failed for {}/{}: {}", tid, pid, e)),
+                        }
+                    }
+                }
+            }
+            if total_removed > 0 {
+                ui::success(&format!(
+                    "Removed {} old revisions across all pools.",
+                    total_removed
+                ));
+            } else {
+                ui::info("No old revisions to clean up.");
+            }
+            Ok(())
+        }
     }
 }
 
