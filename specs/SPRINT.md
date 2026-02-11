@@ -1,6 +1,6 @@
 # mvm Sprint 2: Production Readiness
 
-Previous sprint: [SPRINT-1-foundation.md](SPRINT-1-foundation.md) (complete, merged to main)
+Previous sprint: [SPRINT-1-foundation.md](sprints/SPRINT-1-foundation.md) (complete, merged to main)
 
 Sprint 1 delivered the full foundation: multi-tenant object model, lifecycle API, networking, security hardening, sleep/wake, reconcile loop, QUIC+mTLS daemon, and CI/CD. Sprint 2 focuses on making mvm production-ready.
 
