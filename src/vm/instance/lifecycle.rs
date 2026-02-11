@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use tracing::instrument;
 
 use super::disk;
 use super::fc_config;
@@ -60,6 +61,7 @@ fn save_instance(
 ///
 /// Allocates an IP from the tenant subnet, creates the instance directory,
 /// and writes initial InstanceState with status=Created.
+#[instrument(skip_all, fields(tenant_id, pool_id))]
 pub fn instance_create(tenant_id: &str, pool_id: &str) -> Result<String> {
     let tenant = tenant_load(tenant_id)?;
     let _spec = pool_load(tenant_id, pool_id)?;
@@ -115,6 +117,7 @@ pub fn instance_create(tenant_id: &str, pool_id: &str) -> Result<String> {
 /// 8. Generate FC config from pool artifacts + instance net
 /// 9. Launch Firecracker
 /// 10. Record PID, update status to Running
+#[instrument(skip_all, fields(tenant_id, pool_id, instance_id))]
 pub fn instance_start(tenant_id: &str, pool_id: &str, instance_id: &str) -> Result<()> {
     let mut state = load_instance(tenant_id, pool_id, instance_id)?;
     let spec = pool_load(tenant_id, pool_id)?;
@@ -279,6 +282,7 @@ pub fn instance_start(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resu
 ///
 /// Kills the Firecracker process, cleans up cgroup, updates state.
 /// TAP device is preserved for potential restart.
+#[instrument(skip_all, fields(tenant_id, pool_id, instance_id))]
 pub fn instance_stop(tenant_id: &str, pool_id: &str, instance_id: &str) -> Result<()> {
     let mut state = load_instance(tenant_id, pool_id, instance_id)?;
     validate_transition(state.status, InstanceStatus::Stopped)?;
@@ -321,6 +325,7 @@ pub fn instance_stop(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resul
 }
 
 /// Pause vCPUs (Running -> Warm).
+#[instrument(skip_all, fields(tenant_id, pool_id, instance_id))]
 pub fn instance_warm(tenant_id: &str, pool_id: &str, instance_id: &str) -> Result<()> {
     let mut state = load_instance(tenant_id, pool_id, instance_id)?;
     validate_transition(state.status, InstanceStatus::Warm)?;
@@ -361,6 +366,7 @@ pub fn instance_warm(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resul
 /// 5. Kill FC process, cleanup cgroup
 /// 6. Keep TAP device and data disk for wake
 /// 7. Update status to Sleeping
+#[instrument(skip_all, fields(tenant_id, pool_id, instance_id, force))]
 pub fn instance_sleep(
     tenant_id: &str,
     pool_id: &str,
@@ -438,6 +444,7 @@ pub fn instance_sleep(
 /// 6. Load snapshot (base + delta) via FC API
 /// 7. Resume vCPUs
 /// 8. Update status to Running
+#[instrument(skip_all, fields(tenant_id, pool_id, instance_id))]
 pub fn instance_wake(tenant_id: &str, pool_id: &str, instance_id: &str) -> Result<()> {
     let mut state = load_instance(tenant_id, pool_id, instance_id)?;
     let spec = pool_load(tenant_id, pool_id)?;
@@ -559,6 +566,7 @@ pub fn instance_ssh(tenant_id: &str, pool_id: &str, instance_id: &str) -> Result
 ///
 /// Stops the instance if running, tears down TAP, removes cgroup,
 /// then removes the instance directory.
+#[instrument(skip_all, fields(tenant_id, pool_id, instance_id, wipe_volumes))]
 pub fn instance_destroy(
     tenant_id: &str,
     pool_id: &str,
@@ -655,5 +663,101 @@ mod tests {
             instance_state_path("acme", "workers", "i-a3f7b2c1"),
             "/var/lib/mvm/tenants/acme/pools/workers/instances/i-a3f7b2c1/instance.json"
         );
+    }
+
+    #[test]
+    fn test_instance_create_with_mock() {
+        use crate::infra::shell_mock;
+
+        let tenant_json = shell_mock::tenant_fixture("acme", 3, "10.240.3.0/24", "10.240.3.1");
+        let pool_json = shell_mock::pool_fixture("acme", "workers");
+        let (_guard, fs) = shell_mock::mock_fs()
+            .with_file("/var/lib/mvm/tenants/acme/tenant.json", &tenant_json)
+            .with_file(
+                "/var/lib/mvm/tenants/acme/pools/workers/pool.json",
+                &pool_json,
+            )
+            .install();
+
+        let instance_id = instance_create("acme", "workers").unwrap();
+        assert!(instance_id.starts_with("i-"));
+
+        // Verify instance.json was written to mock fs
+        let state_path = instance_state_path("acme", "workers", &instance_id);
+        let fs_lock = fs.lock().unwrap();
+        assert!(fs_lock.contains_key(&state_path));
+
+        // Parse the written state and verify
+        let state: InstanceState = serde_json::from_str(&fs_lock[&state_path]).unwrap();
+        assert_eq!(state.instance_id, instance_id);
+        assert_eq!(state.tenant_id, "acme");
+        assert_eq!(state.pool_id, "workers");
+        assert_eq!(state.status, InstanceStatus::Created);
+        assert!(state.net.guest_ip.starts_with("10.240.3."));
+        assert_eq!(state.net.cidr, 24);
+    }
+
+    #[test]
+    fn test_instance_create_and_list() {
+        use crate::infra::shell_mock;
+
+        let tenant_json = shell_mock::tenant_fixture("acme", 3, "10.240.3.0/24", "10.240.3.1");
+        let pool_json = shell_mock::pool_fixture("acme", "workers");
+        let (_guard, _fs) = shell_mock::mock_fs()
+            .with_file("/var/lib/mvm/tenants/acme/tenant.json", &tenant_json)
+            .with_file(
+                "/var/lib/mvm/tenants/acme/pools/workers/pool.json",
+                &pool_json,
+            )
+            .install();
+
+        let id1 = instance_create("acme", "workers").unwrap();
+        let id2 = instance_create("acme", "workers").unwrap();
+        assert_ne!(id1, id2);
+
+        let instances = instance_list("acme", "workers").unwrap();
+        assert_eq!(instances.len(), 2);
+    }
+
+    #[test]
+    fn test_instance_create_assigns_unique_ips() {
+        use crate::infra::shell_mock;
+
+        let tenant_json = shell_mock::tenant_fixture("acme", 3, "10.240.3.0/24", "10.240.3.1");
+        let pool_json = shell_mock::pool_fixture("acme", "workers");
+        let (_guard, _fs) = shell_mock::mock_fs()
+            .with_file("/var/lib/mvm/tenants/acme/tenant.json", &tenant_json)
+            .with_file(
+                "/var/lib/mvm/tenants/acme/pools/workers/pool.json",
+                &pool_json,
+            )
+            .install();
+
+        let id1 = instance_create("acme", "workers").unwrap();
+        let id2 = instance_create("acme", "workers").unwrap();
+        let id3 = instance_create("acme", "workers").unwrap();
+
+        let instances = instance_list("acme", "workers").unwrap();
+        let ips: Vec<&str> = instances.iter().map(|i| i.net.guest_ip.as_str()).collect();
+
+        // All IPs should be unique
+        let mut unique_ips = ips.clone();
+        unique_ips.sort();
+        unique_ips.dedup();
+        assert_eq!(ips.len(), unique_ips.len());
+
+        // All IPs should be in 10.240.3.x range, starting from .3
+        for ip in &ips {
+            assert!(ip.starts_with("10.240.3."));
+            let offset: u8 = ip.rsplit('.').next().unwrap().parse().unwrap();
+            assert!(offset >= 3);
+        }
+
+        // Verify distinct instance IDs
+        let ids = vec![id1, id2, id3];
+        let mut unique_ids = ids.clone();
+        unique_ids.sort();
+        unique_ids.dedup();
+        assert_eq!(ids.len(), unique_ids.len());
     }
 }

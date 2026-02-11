@@ -34,6 +34,11 @@ pub fn run_host_visible(cmd: &str, args: &[&str]) -> Result<()> {
 
 /// Run a bash script inside a named Lima VM, capturing output.
 pub fn run_on_vm(vm_name: &str, script: &str) -> Result<Output> {
+    #[cfg(test)]
+    if let Some(output) = super::shell_mock::intercept(script) {
+        return Ok(output);
+    }
+
     Command::new("limactl")
         .args(["shell", vm_name, "bash", "-c", script])
         .output()

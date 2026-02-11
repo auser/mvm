@@ -1,8 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 
 // Import from the library crate
-use mvm::infra::{bootstrap, config, shell, ui, upgrade};
+use mvm::infra::output::OutputFormat;
+use mvm::infra::{bootstrap, config, output, shell, ui, upgrade};
+use mvm::observability::logging::{self, LogFormat};
 use mvm::vm::{bridge, naming, pool, tenant};
 use mvm::vm::{firecracker, image, lima, microvm};
 
@@ -13,6 +15,10 @@ use mvm::vm::{firecracker, image, lima, microvm};
     about = "Multi-tenant Firecracker microVM fleet manager"
 )]
 struct Cli {
+    /// Output format: table, json, yaml
+    #[arg(long, short = 'o', global = true, default_value = "table")]
+    output: String,
+
     #[command(subcommand)]
     command: Commands,
 }
@@ -45,6 +51,13 @@ enum Commands {
     Agent {
         #[command(subcommand)]
         action: AgentCmd,
+    },
+
+    // ---- Coordinator client ----
+    /// Coordinator client for multi-node fleet management
+    Coordinator {
+        #[command(subcommand)]
+        action: CoordinatorCmd,
     },
 
     // ---- Network ----
@@ -386,6 +399,54 @@ enum AgentCertsCmd {
     },
 }
 
+// --- Coordinator subcommands ---
+
+#[derive(Subcommand)]
+enum CoordinatorCmd {
+    /// Push desired state to a remote node
+    Push {
+        /// Path to desired state JSON file
+        #[arg(long)]
+        desired: String,
+        /// Remote node address (host:port)
+        #[arg(long)]
+        node: String,
+    },
+    /// Query node status
+    Status {
+        /// Remote node address (host:port)
+        #[arg(long)]
+        node: String,
+    },
+    /// List instances on a remote node
+    ListInstances {
+        /// Remote node address (host:port)
+        #[arg(long)]
+        node: String,
+        /// Tenant ID to filter by
+        #[arg(long)]
+        tenant: String,
+        /// Optional pool ID filter
+        #[arg(long)]
+        pool: Option<String>,
+    },
+    /// Wake a sleeping instance on a remote node
+    Wake {
+        /// Remote node address (host:port)
+        #[arg(long)]
+        node: String,
+        /// Tenant ID
+        #[arg(long)]
+        tenant: String,
+        /// Pool ID
+        #[arg(long)]
+        pool: String,
+        /// Instance ID
+        #[arg(long)]
+        instance: String,
+    },
+}
+
 // --- Network subcommands ---
 
 #[derive(Subcommand)]
@@ -420,6 +481,17 @@ enum NodeCmd {
 fn main() -> Result<()> {
     let cli = Cli::parse();
 
+    // Initialize logging: JSON for daemon mode, human-readable for CLI
+    let log_format = match &cli.command {
+        Commands::Agent {
+            action: AgentCmd::Serve { .. },
+        } => LogFormat::Json,
+        _ => LogFormat::Human,
+    };
+    logging::init(log_format);
+
+    let out_fmt = OutputFormat::from_str_arg(&cli.output);
+
     match cli.command {
         // --- Dev mode (unchanged) ---
         Commands::Bootstrap { production } => cmd_bootstrap(production),
@@ -443,12 +515,13 @@ fn main() -> Result<()> {
         Commands::Build { path, output } => cmd_build(&path, output.as_deref()),
 
         // --- Multi-tenant ---
-        Commands::Tenant { action } => cmd_tenant(action),
-        Commands::Pool { action } => cmd_pool(action),
-        Commands::Instance { action } => cmd_instance(action),
+        Commands::Tenant { action } => cmd_tenant(action, out_fmt),
+        Commands::Pool { action } => cmd_pool(action, out_fmt),
+        Commands::Instance { action } => cmd_instance(action, out_fmt),
         Commands::Agent { action } => cmd_agent(action),
-        Commands::Net { action } => cmd_net(action),
-        Commands::Node { action } => cmd_node(action),
+        Commands::Coordinator { action } => cmd_coordinator(action, out_fmt),
+        Commands::Net { action } => cmd_net(action, out_fmt),
+        Commands::Node { action } => cmd_node(action, out_fmt),
     }
 }
 
@@ -720,7 +793,8 @@ fn cmd_destroy() -> Result<()> {
 // Multi-tenant command handlers
 // ============================================================================
 
-fn cmd_tenant(action: TenantCmd) -> Result<()> {
+fn cmd_tenant(action: TenantCmd, out_fmt: OutputFormat) -> Result<()> {
+    use mvm::infra::display::{TenantInfo, TenantRow};
     use tenant::config::{TenantNet, TenantQuota};
 
     match action {
@@ -755,34 +829,53 @@ fn cmd_tenant(action: TenantCmd) -> Result<()> {
             Ok(())
         }
         TenantCmd::List { json } => {
-            let tenants = tenant::lifecycle::tenant_list()?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&tenants)?);
-            } else if tenants.is_empty() {
+            let fmt = if json { OutputFormat::Json } else { out_fmt };
+            let tenant_ids = tenant::lifecycle::tenant_list()?;
+
+            if fmt == OutputFormat::Table && tenant_ids.is_empty() {
                 ui::info("No tenants found.");
-            } else {
-                for t in &tenants {
-                    println!("  {}", t);
+                return Ok(());
+            }
+
+            let mut rows = Vec::new();
+            for tid in &tenant_ids {
+                if let Ok(config) = tenant::lifecycle::tenant_load(tid) {
+                    rows.push(TenantRow {
+                        tenant_id: config.tenant_id,
+                        subnet: config.net.ipv4_subnet,
+                        bridge: config.net.bridge_name,
+                        max_vcpus: config.quotas.max_vcpus,
+                        max_mem_mib: config.quotas.max_mem_mib,
+                    });
+                } else {
+                    rows.push(TenantRow {
+                        tenant_id: tid.clone(),
+                        subnet: "?".to_string(),
+                        bridge: "?".to_string(),
+                        max_vcpus: 0,
+                        max_mem_mib: 0,
+                    });
                 }
             }
+            output::render_list(&rows, fmt);
             Ok(())
         }
         TenantCmd::Info { id, json } => {
+            let fmt = if json { OutputFormat::Json } else { out_fmt };
             let config = tenant::lifecycle::tenant_load(&id)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&config)?);
-            } else {
-                ui::info(&format!("Tenant: {}", config.tenant_id));
-                ui::info(&format!("  Subnet: {}", config.net.ipv4_subnet));
-                ui::info(&format!("  Bridge: {}", config.net.bridge_name));
-                ui::info(&format!(
-                    "  Quotas: {} vCPUs, {} MiB, {} running, {} warm",
-                    config.quotas.max_vcpus,
-                    config.quotas.max_mem_mib,
-                    config.quotas.max_running,
-                    config.quotas.max_warm,
-                ));
-            }
+            let info = TenantInfo {
+                tenant_id: config.tenant_id,
+                subnet: config.net.ipv4_subnet,
+                gateway: config.net.gateway_ip,
+                bridge: config.net.bridge_name,
+                net_id: config.net.tenant_net_id,
+                max_vcpus: config.quotas.max_vcpus,
+                max_mem_mib: config.quotas.max_mem_mib,
+                max_running: config.quotas.max_running,
+                max_warm: config.quotas.max_warm,
+                created_at: config.created_at,
+            };
+            output::render_one(&info, fmt);
             Ok(())
         }
         TenantCmd::Destroy {
@@ -817,7 +910,9 @@ fn cmd_tenant(action: TenantCmd) -> Result<()> {
     }
 }
 
-fn cmd_pool(action: PoolCmd) -> Result<()> {
+fn cmd_pool(action: PoolCmd, out_fmt: OutputFormat) -> Result<()> {
+    use mvm::infra::display::{PoolInfo, PoolRow};
+
     match action {
         PoolCmd::Create {
             path,
@@ -842,38 +937,48 @@ fn cmd_pool(action: PoolCmd) -> Result<()> {
             Ok(())
         }
         PoolCmd::List { tenant, json } => {
-            let pools = pool::lifecycle::pool_list(&tenant)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&pools)?);
-            } else if pools.is_empty() {
+            let fmt = if json { OutputFormat::Json } else { out_fmt };
+            let pool_ids = pool::lifecycle::pool_list(&tenant)?;
+
+            if fmt == OutputFormat::Table && pool_ids.is_empty() {
                 ui::info(&format!("No pools found for tenant '{}'.", tenant));
-            } else {
-                for p in &pools {
-                    println!("  {}/{}", tenant, p);
+                return Ok(());
+            }
+
+            let mut rows = Vec::new();
+            for pid in &pool_ids {
+                if let Ok(spec) = pool::lifecycle::pool_load(&tenant, pid) {
+                    rows.push(PoolRow {
+                        pool_path: format!("{}/{}", tenant, pid),
+                        profile: spec.profile,
+                        vcpus: spec.instance_resources.vcpus,
+                        mem_mib: spec.instance_resources.mem_mib,
+                        desired_running: spec.desired_counts.running,
+                        desired_warm: spec.desired_counts.warm,
+                        desired_sleeping: spec.desired_counts.sleeping,
+                    });
                 }
             }
+            output::render_list(&rows, fmt);
             Ok(())
         }
         PoolCmd::Info { path, json } => {
+            let fmt = if json { OutputFormat::Json } else { out_fmt };
             let (tenant_id, pool_id) = naming::parse_pool_path(&path)?;
             let spec = pool::lifecycle::pool_load(tenant_id, pool_id)?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&spec)?);
-            } else {
-                ui::info(&format!("Pool: {}/{}", spec.tenant_id, spec.pool_id));
-                ui::info(&format!("  Flake: {}", spec.flake_ref));
-                ui::info(&format!("  Profile: {}", spec.profile));
-                ui::info(&format!(
-                    "  Resources: {} vCPUs, {} MiB",
-                    spec.instance_resources.vcpus, spec.instance_resources.mem_mib
-                ));
-                ui::info(&format!(
-                    "  Desired: {} running, {} warm, {} sleeping",
-                    spec.desired_counts.running,
-                    spec.desired_counts.warm,
-                    spec.desired_counts.sleeping,
-                ));
-            }
+            let info = PoolInfo {
+                pool_path: format!("{}/{}", spec.tenant_id, spec.pool_id),
+                flake_ref: spec.flake_ref,
+                profile: spec.profile,
+                vcpus: spec.instance_resources.vcpus,
+                mem_mib: spec.instance_resources.mem_mib,
+                data_disk_mib: spec.instance_resources.data_disk_mib,
+                desired_running: spec.desired_counts.running,
+                desired_warm: spec.desired_counts.warm,
+                desired_sleeping: spec.desired_counts.sleeping,
+                seccomp_policy: spec.seccomp_policy,
+            };
+            output::render_one(&info, fmt);
             Ok(())
         }
         PoolCmd::Build { path, timeout } => {
@@ -900,7 +1005,8 @@ fn cmd_pool(action: PoolCmd) -> Result<()> {
     }
 }
 
-fn cmd_instance(action: InstanceCmd) -> Result<()> {
+fn cmd_instance(action: InstanceCmd, out_fmt: OutputFormat) -> Result<()> {
+    use mvm::infra::display::{InstanceInfo, InstanceRow};
     use mvm::vm::instance::lifecycle as inst;
 
     match action {
@@ -914,6 +1020,7 @@ fn cmd_instance(action: InstanceCmd) -> Result<()> {
             Ok(())
         }
         InstanceCmd::List { tenant, pool, json } => {
+            let fmt = if json { OutputFormat::Json } else { out_fmt };
             let tenants = match &tenant {
                 Some(t) => vec![t.clone()],
                 None => tenant::lifecycle::tenant_list()?,
@@ -932,25 +1039,25 @@ fn cmd_instance(action: InstanceCmd) -> Result<()> {
                 }
             }
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&all_states)?);
-            } else if all_states.is_empty() {
+            if fmt == OutputFormat::Table && all_states.is_empty() {
                 ui::info("No instances found.");
-            } else {
-                for s in &all_states {
-                    println!(
-                        "  {}/{}/{}  status={}  ip={}  pid={}",
-                        s.tenant_id,
-                        s.pool_id,
-                        s.instance_id,
-                        s.status,
-                        s.net.guest_ip,
-                        s.firecracker_pid
-                            .map(|p| p.to_string())
-                            .unwrap_or_else(|| "-".to_string()),
-                    );
-                }
+                return Ok(());
             }
+
+            let rows: Vec<InstanceRow> = all_states
+                .iter()
+                .map(|s| InstanceRow {
+                    instance_path: format!("{}/{}/{}", s.tenant_id, s.pool_id, s.instance_id),
+                    status: s.status.to_string(),
+                    guest_ip: s.net.guest_ip.clone(),
+                    tap_dev: s.net.tap_dev.clone(),
+                    pid: s
+                        .firecracker_pid
+                        .map(|p| p.to_string())
+                        .unwrap_or_else(|| "-".to_string()),
+                })
+                .collect();
+            output::render_list(&rows, fmt);
             Ok(())
         }
         InstanceCmd::Start { path } => {
@@ -984,33 +1091,28 @@ fn cmd_instance(action: InstanceCmd) -> Result<()> {
             inst::instance_ssh(t, p, i)
         }
         InstanceCmd::Stats { path, json } => {
+            let fmt = if json { OutputFormat::Json } else { out_fmt };
             let (t, p, i) = naming::parse_instance_path(&path)?;
             let state = inst::instance_list(t, p)?
                 .into_iter()
                 .find(|s| s.instance_id == i)
                 .ok_or_else(|| anyhow::anyhow!("Instance not found: {}", path))?;
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&state)?);
-            } else {
-                ui::info(&format!("Instance: {}/{}/{}", t, p, i));
-                ui::info(&format!("  Status: {}", state.status));
-                ui::info(&format!("  IP: {}", state.net.guest_ip));
-                ui::info(&format!("  TAP: {}", state.net.tap_dev));
-                ui::info(&format!("  MAC: {}", state.net.mac));
-                if let Some(pid) = state.firecracker_pid {
-                    ui::info(&format!("  FC PID: {}", pid));
-                }
-                if let Some(ref rev) = state.revision_hash {
-                    ui::info(&format!("  Revision: {}", rev));
-                }
-                if let Some(ref ts) = state.last_started_at {
-                    ui::info(&format!("  Last started: {}", ts));
-                }
-                if let Some(ref ts) = state.last_stopped_at {
-                    ui::info(&format!("  Last stopped: {}", ts));
-                }
-            }
+            let info = InstanceInfo {
+                instance_path: format!("{}/{}/{}", t, p, i),
+                status: state.status.to_string(),
+                guest_ip: state.net.guest_ip.clone(),
+                tap_dev: state.net.tap_dev.clone(),
+                mac: state.net.mac.clone(),
+                pid: state
+                    .firecracker_pid
+                    .map(|p| p.to_string())
+                    .unwrap_or_else(|| "-".to_string()),
+                revision: state.revision_hash.unwrap_or_else(|| "-".to_string()),
+                last_started: state.last_started_at.unwrap_or_else(|| "-".to_string()),
+                last_stopped: state.last_stopped_at.unwrap_or_else(|| "-".to_string()),
+            };
+            output::render_one(&info, fmt);
             Ok(())
         }
         InstanceCmd::Destroy { path, wipe_volumes } => {
@@ -1081,9 +1183,10 @@ fn cmd_agent(action: AgentCmd) -> Result<()> {
     }
 }
 
-fn cmd_net(action: NetCmd) -> Result<()> {
+fn cmd_net(action: NetCmd, out_fmt: OutputFormat) -> Result<()> {
     match action {
         NetCmd::Verify { json } => {
+            let fmt = if json { OutputFormat::Json } else { out_fmt };
             let tenants = tenant::lifecycle::tenant_list()?;
             let mut reports = Vec::new();
             let mut all_issues = Vec::new();
@@ -1098,8 +1201,17 @@ fn cmd_net(action: NetCmd) -> Result<()> {
                 }
             }
 
-            if json {
-                println!("{}", serde_json::to_string_pretty(&reports)?);
+            if fmt != OutputFormat::Table {
+                // JSON/YAML: always output structured data
+                match fmt {
+                    OutputFormat::Json => {
+                        println!("{}", serde_json::to_string_pretty(&reports)?);
+                    }
+                    OutputFormat::Yaml => {
+                        println!("{}", serde_yaml::to_string(&reports)?);
+                    }
+                    _ => unreachable!(),
+                }
             } else if all_issues.is_empty() {
                 ui::success("All tenant networks verified.");
                 for r in &reports {
@@ -1122,10 +1234,152 @@ fn cmd_net(action: NetCmd) -> Result<()> {
     }
 }
 
-fn cmd_node(action: NodeCmd) -> Result<()> {
+fn cmd_node(action: NodeCmd, out_fmt: OutputFormat) -> Result<()> {
+    let _ = out_fmt; // node commands already handle json flag internally
     match action {
         NodeCmd::Info { json } => mvm::node::info(json),
         NodeCmd::Stats { json } => mvm::node::stats(json),
+    }
+}
+
+fn cmd_coordinator(action: CoordinatorCmd, _out_fmt: OutputFormat) -> Result<()> {
+    use mvm::agent::{AgentRequest, AgentResponse, DesiredState};
+    use mvm::coordinator::client::{CoordinatorClient, run_coordinator_command};
+
+    match action {
+        CoordinatorCmd::Push { desired, node } => {
+            let json = std::fs::read_to_string(&desired)
+                .with_context(|| format!("Failed to read desired state file: {}", desired))?;
+            let state: DesiredState = serde_json::from_str(&json)
+                .with_context(|| "Failed to parse desired state JSON")?;
+
+            let addr: std::net::SocketAddr = node
+                .parse()
+                .with_context(|| format!("Invalid node address: {}", node))?;
+
+            run_coordinator_command(async {
+                let client = CoordinatorClient::new()?;
+                let response = client.send(addr, &AgentRequest::Reconcile(state)).await?;
+                match response {
+                    AgentResponse::ReconcileResult(report) => {
+                        ui::success(&format!(
+                            "Reconcile pushed to {}. Instances: +{} started, {} errors",
+                            node,
+                            report.instances_started,
+                            report.errors.len()
+                        ));
+                        if !report.errors.is_empty() {
+                            for err in &report.errors {
+                                ui::error(&format!("  {}", err));
+                            }
+                        }
+                    }
+                    AgentResponse::Error { code, message } => {
+                        ui::error(&format!("Node error ({}): {}", code, message));
+                    }
+                    _ => {
+                        ui::warn("Unexpected response type from node.");
+                    }
+                }
+                Ok(())
+            })
+        }
+        CoordinatorCmd::Status { node } => {
+            let addr: std::net::SocketAddr = node
+                .parse()
+                .with_context(|| format!("Invalid node address: {}", node))?;
+
+            run_coordinator_command(async {
+                let client = CoordinatorClient::new()?;
+                let response = client.send(addr, &AgentRequest::NodeInfo).await?;
+                match response {
+                    AgentResponse::NodeInfo(info) => {
+                        println!("{}", serde_json::to_string_pretty(&info)?);
+                    }
+                    AgentResponse::Error { code, message } => {
+                        ui::error(&format!("Node error ({}): {}", code, message));
+                    }
+                    _ => {
+                        ui::warn("Unexpected response type from node.");
+                    }
+                }
+                Ok(())
+            })
+        }
+        CoordinatorCmd::ListInstances { node, tenant, pool } => {
+            let addr: std::net::SocketAddr = node
+                .parse()
+                .with_context(|| format!("Invalid node address: {}", node))?;
+
+            run_coordinator_command(async {
+                let client = CoordinatorClient::new()?;
+                let response = client
+                    .send(
+                        addr,
+                        &AgentRequest::InstanceList {
+                            tenant_id: tenant.clone(),
+                            pool_id: pool,
+                        },
+                    )
+                    .await?;
+                match response {
+                    AgentResponse::InstanceList(instances) => {
+                        if instances.is_empty() {
+                            ui::info(&format!("No instances found for tenant '{}'.", tenant));
+                        } else {
+                            println!("{}", serde_json::to_string_pretty(&instances)?);
+                        }
+                    }
+                    AgentResponse::Error { code, message } => {
+                        ui::error(&format!("Node error ({}): {}", code, message));
+                    }
+                    _ => {
+                        ui::warn("Unexpected response type from node.");
+                    }
+                }
+                Ok(())
+            })
+        }
+        CoordinatorCmd::Wake {
+            node,
+            tenant,
+            pool,
+            instance,
+        } => {
+            let addr: std::net::SocketAddr = node
+                .parse()
+                .with_context(|| format!("Invalid node address: {}", node))?;
+
+            run_coordinator_command(async {
+                let client = CoordinatorClient::new()?;
+                let response = client
+                    .send(
+                        addr,
+                        &AgentRequest::WakeInstance {
+                            tenant_id: tenant,
+                            pool_id: pool,
+                            instance_id: instance.clone(),
+                        },
+                    )
+                    .await?;
+                match response {
+                    AgentResponse::WakeResult { success } => {
+                        if success {
+                            ui::success(&format!("Instance '{}' woken.", instance));
+                        } else {
+                            ui::error(&format!("Failed to wake instance '{}'.", instance));
+                        }
+                    }
+                    AgentResponse::Error { code, message } => {
+                        ui::error(&format!("Node error ({}): {}", code, message));
+                    }
+                    _ => {
+                        ui::warn("Unexpected response type from node.");
+                    }
+                }
+                Ok(())
+            })
+        }
     }
 }
 

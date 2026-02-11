@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
+use tracing::instrument;
 
 use super::config::{TenantConfig, TenantNet, TenantQuota, tenant_config_path, tenant_dir};
 use crate::infra::http;
 use crate::infra::shell;
 
 /// Create a new tenant: directories, config, SSH keypair.
+#[instrument(skip_all, fields(tenant_id))]
 pub fn tenant_create(tenant_id: &str, net: TenantNet, quotas: TenantQuota) -> Result<TenantConfig> {
     let dir = tenant_dir(tenant_id);
     shell::run_in_vm(&format!("mkdir -p {dir}/pools"))?;
@@ -54,8 +56,121 @@ pub fn tenant_exists(tenant_id: &str) -> Result<bool> {
 }
 
 /// Destroy a tenant and all its resources.
+#[instrument(skip_all, fields(tenant_id))]
 pub fn tenant_destroy(tenant_id: &str, _wipe_volumes: bool) -> Result<()> {
     let dir = tenant_dir(tenant_id);
     shell::run_in_vm(&format!("rm -rf {}", dir))?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::infra::shell_mock;
+
+    #[test]
+    fn test_tenant_create_and_load() {
+        let (_guard, _fs) = shell_mock::mock_fs().install();
+
+        let net = TenantNet::new(3, "10.240.3.0/24", "10.240.3.1");
+        let config = tenant_create("acme", net, TenantQuota::default()).unwrap();
+        assert_eq!(config.tenant_id, "acme");
+        assert_eq!(config.net.tenant_net_id, 3);
+
+        let loaded = tenant_load("acme").unwrap();
+        assert_eq!(loaded.tenant_id, "acme");
+        assert_eq!(loaded.net.gateway_ip, "10.240.3.1");
+        assert_eq!(loaded.net.ipv4_subnet, "10.240.3.0/24");
+    }
+
+    #[test]
+    fn test_tenant_list_empty() {
+        let (_guard, _fs) = shell_mock::mock_fs().install();
+        let tenants = tenant_list().unwrap();
+        assert!(tenants.is_empty());
+    }
+
+    #[test]
+    fn test_tenant_create_then_list() {
+        let (_guard, _fs) = shell_mock::mock_fs().install();
+
+        tenant_create(
+            "acme",
+            TenantNet::new(3, "10.240.3.0/24", "10.240.3.1"),
+            TenantQuota::default(),
+        )
+        .unwrap();
+        tenant_create(
+            "beta",
+            TenantNet::new(4, "10.240.4.0/24", "10.240.4.1"),
+            TenantQuota::default(),
+        )
+        .unwrap();
+
+        let mut tenants = tenant_list().unwrap();
+        tenants.sort();
+        assert_eq!(tenants, vec!["acme", "beta"]);
+    }
+
+    #[test]
+    fn test_tenant_exists() {
+        let (_guard, _fs) = shell_mock::mock_fs().install();
+        assert!(!tenant_exists("acme").unwrap());
+
+        tenant_create(
+            "acme",
+            TenantNet::new(3, "10.240.3.0/24", "10.240.3.1"),
+            TenantQuota::default(),
+        )
+        .unwrap();
+        assert!(tenant_exists("acme").unwrap());
+    }
+
+    #[test]
+    fn test_tenant_create_then_destroy() {
+        let (_guard, _fs) = shell_mock::mock_fs().install();
+
+        tenant_create(
+            "acme",
+            TenantNet::new(3, "10.240.3.0/24", "10.240.3.1"),
+            TenantQuota::default(),
+        )
+        .unwrap();
+        assert!(tenant_exists("acme").unwrap());
+
+        tenant_destroy("acme", true).unwrap();
+        assert!(!tenant_exists("acme").unwrap());
+    }
+
+    #[test]
+    fn test_tenant_load_nonexistent_fails() {
+        let (_guard, _fs) = shell_mock::mock_fs().install();
+        assert!(tenant_load("nonexistent").is_err());
+    }
+
+    #[test]
+    fn test_tenant_config_preserves_quotas() {
+        let (_guard, _fs) = shell_mock::mock_fs().install();
+
+        let quotas = TenantQuota {
+            max_vcpus: 32,
+            max_mem_mib: 65536,
+            max_running: 16,
+            max_warm: 8,
+            max_pools: 10,
+            max_instances_per_pool: 32,
+            max_disk_gib: 500,
+        };
+        tenant_create(
+            "acme",
+            TenantNet::new(3, "10.240.3.0/24", "10.240.3.1"),
+            quotas,
+        )
+        .unwrap();
+
+        let loaded = tenant_load("acme").unwrap();
+        assert_eq!(loaded.quotas.max_vcpus, 32);
+        assert_eq!(loaded.quotas.max_mem_mib, 65536);
+        assert_eq!(loaded.quotas.max_running, 16);
+    }
 }

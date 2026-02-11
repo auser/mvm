@@ -2,10 +2,13 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use tokio::sync::Mutex;
+use tracing::{debug, error, info, instrument, warn};
 
 use crate::infra::shell;
 use crate::node;
+use crate::observability::metrics;
 use crate::security::certs;
 use crate::sleep::policy;
 use crate::vm::instance::lifecycle::{
@@ -251,10 +254,17 @@ async fn write_frame(send: &mut quinn::SendStream, data: &[u8]) -> Result<()> {
 
 /// Handle a single typed request and produce a response.
 fn handle_request(request: AgentRequest) -> AgentResponse {
+    let m = metrics::global();
+    m.requests_total.fetch_add(1, Ordering::Relaxed);
+
     match request {
         AgentRequest::Reconcile(desired) => {
+            m.requests_reconcile.fetch_add(1, Ordering::Relaxed);
+            info!(node_id = %desired.node_id, tenants = desired.tenants.len(), "Processing reconcile request");
+
             let validation_errors = validate_desired_state(&desired);
             if !validation_errors.is_empty() {
+                m.requests_failed.fetch_add(1, Ordering::Relaxed);
                 return AgentResponse::Error {
                     code: 400,
                     message: format!("Validation errors: {}", validation_errors.join("; ")),
@@ -263,39 +273,67 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
 
             match reconcile_desired(&desired, desired.prune_unknown_tenants) {
                 Ok(report) => AgentResponse::ReconcileResult(report),
-                Err(e) => AgentResponse::Error {
-                    code: 500,
-                    message: format!("Reconcile failed: {}", e),
-                },
+                Err(e) => {
+                    m.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    error!(error = %e, "Reconcile failed");
+                    AgentResponse::Error {
+                        code: 500,
+                        message: format!("Reconcile failed: {}", e),
+                    }
+                }
             }
         }
-        AgentRequest::NodeInfo => match node::collect_info() {
-            Ok(info) => AgentResponse::NodeInfo(info),
-            Err(e) => AgentResponse::Error {
-                code: 500,
-                message: format!("Failed to collect node info: {}", e),
-            },
-        },
-        AgentRequest::NodeStats => match node::collect_stats() {
-            Ok(stats) => AgentResponse::NodeStats(stats),
-            Err(e) => AgentResponse::Error {
-                code: 500,
-                message: format!("Failed to collect node stats: {}", e),
-            },
-        },
-        AgentRequest::TenantList => match tenant_list() {
-            Ok(tenants) => AgentResponse::TenantList(tenants),
-            Err(e) => AgentResponse::Error {
-                code: 500,
-                message: format!("Failed to list tenants: {}", e),
-            },
-        },
+        AgentRequest::NodeInfo => {
+            m.requests_node_info.fetch_add(1, Ordering::Relaxed);
+            debug!("Processing NodeInfo request");
+            match node::collect_info() {
+                Ok(info) => AgentResponse::NodeInfo(info),
+                Err(e) => {
+                    m.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    AgentResponse::Error {
+                        code: 500,
+                        message: format!("Failed to collect node info: {}", e),
+                    }
+                }
+            }
+        }
+        AgentRequest::NodeStats => {
+            m.requests_node_stats.fetch_add(1, Ordering::Relaxed);
+            debug!("Processing NodeStats request");
+            match node::collect_stats() {
+                Ok(stats) => AgentResponse::NodeStats(stats),
+                Err(e) => {
+                    m.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    AgentResponse::Error {
+                        code: 500,
+                        message: format!("Failed to collect node stats: {}", e),
+                    }
+                }
+            }
+        }
+        AgentRequest::TenantList => {
+            m.requests_tenant_list.fetch_add(1, Ordering::Relaxed);
+            debug!("Processing TenantList request");
+            match tenant_list() {
+                Ok(tenants) => AgentResponse::TenantList(tenants),
+                Err(e) => {
+                    m.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    AgentResponse::Error {
+                        code: 500,
+                        message: format!("Failed to list tenants: {}", e),
+                    }
+                }
+            }
+        }
         AgentRequest::InstanceList { tenant_id, pool_id } => {
+            m.requests_instance_list.fetch_add(1, Ordering::Relaxed);
+            debug!(tenant_id = %tenant_id, "Processing InstanceList request");
             let pools = match pool_id {
                 Some(pid) => vec![pid],
                 None => match pool_list(&tenant_id) {
                     Ok(p) => p,
                     Err(e) => {
+                        m.requests_failed.fetch_add(1, Ordering::Relaxed);
                         return AgentResponse::Error {
                             code: 500,
                             message: format!("Failed to list pools: {}", e),
@@ -316,13 +354,21 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
             tenant_id,
             pool_id,
             instance_id,
-        } => match instance_wake(&tenant_id, &pool_id, &instance_id) {
-            Ok(_) => AgentResponse::WakeResult { success: true },
-            Err(e) => AgentResponse::Error {
-                code: 500,
-                message: format!("Wake failed: {}", e),
-            },
-        },
+        } => {
+            m.requests_wake.fetch_add(1, Ordering::Relaxed);
+            info!(tenant_id = %tenant_id, pool_id = %pool_id, instance_id = %instance_id, "Processing WakeInstance request");
+            match instance_wake(&tenant_id, &pool_id, &instance_id) {
+                Ok(_) => AgentResponse::WakeResult { success: true },
+                Err(e) => {
+                    m.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    error!(error = %e, "Wake failed");
+                    AgentResponse::Error {
+                        code: 500,
+                        message: format!("Wake failed: {}", e),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -378,6 +424,7 @@ pub fn reconcile(desired_path: &str, prune: bool) -> Result<()> {
 // ============================================================================
 
 /// Core reconcile logic, returns a report of what changed.
+#[instrument(skip_all, fields(node_id = %desired.node_id, prune))]
 fn reconcile_desired(desired: &DesiredState, prune: bool) -> Result<ReconcileReport> {
     let mut report = ReconcileReport::default();
 
@@ -660,7 +707,7 @@ async fn run_daemon(
     let endpoint = quinn::Endpoint::server(server_config, addr)
         .with_context(|| format!("Failed to bind QUIC endpoint on {}", addr))?;
 
-    eprintln!("Agent listening on {}", addr);
+    info!(addr = %addr, "Agent listening");
 
     // Connection gate for global connection limits
     let conn_gate = Arc::new(Mutex::new(ConnectionGate::new(DEFAULT_MAX_CONNECTIONS)));
@@ -676,15 +723,29 @@ async fn run_daemon(
                 tokio::time::interval(tokio::time::Duration::from_secs(interval_secs));
             loop {
                 interval.tick().await;
-                eprintln!("Running periodic reconcile...");
+                info!("Running periodic reconcile");
+                let m = metrics::global();
+                m.reconcile_runs.fetch_add(1, Ordering::Relaxed);
+                let start = std::time::Instant::now();
+
                 // Reconcile is synchronous (shell commands), run on blocking thread
                 let path = path.clone();
                 let result = tokio::task::spawn_blocking(move || reconcile(&path, true)).await;
 
+                let duration_ms = start.elapsed().as_millis() as u64;
+                m.reconcile_duration_ms
+                    .store(duration_ms, Ordering::Relaxed);
+
                 match result {
-                    Ok(Ok(())) => eprintln!("Reconcile complete."),
-                    Ok(Err(e)) => eprintln!("Reconcile error: {}", e),
-                    Err(e) => eprintln!("Reconcile task panicked: {}", e),
+                    Ok(Ok(())) => info!(duration_ms, "Reconcile complete"),
+                    Ok(Err(e)) => {
+                        m.reconcile_errors.fetch_add(1, Ordering::Relaxed);
+                        error!(error = %e, duration_ms, "Reconcile error");
+                    }
+                    Err(e) => {
+                        m.reconcile_errors.fetch_add(1, Ordering::Relaxed);
+                        error!(error = %e, "Reconcile task panicked");
+                    }
                 }
             }
         });
@@ -701,13 +762,15 @@ async fn run_daemon(
                     Some(conn) => {
                         let gate = conn_gate.clone();
                         if !gate.lock().await.try_accept() {
-                            eprintln!("Connection rejected: max connections ({}) reached", DEFAULT_MAX_CONNECTIONS);
+                            let m = metrics::global();
+                            m.connections_rejected.fetch_add(1, Ordering::Relaxed);
+                            warn!(max = DEFAULT_MAX_CONNECTIONS, "Connection rejected: limit reached");
                             conn.refuse();
                             continue;
                         }
                         tokio::spawn(async move {
                             if let Err(e) = handle_connection(conn, gate.clone()).await {
-                                eprintln!("Connection error: {}", e);
+                                warn!(error = %e, "Connection error");
                             }
                             gate.lock().await.release();
                         });
@@ -716,7 +779,7 @@ async fn run_daemon(
                 }
             }
             _ = &mut shutdown => {
-                eprintln!("Received shutdown signal, stopping...");
+                info!("Received shutdown signal, stopping");
                 break;
             }
         }
@@ -727,18 +790,24 @@ async fn run_daemon(
     if let Some(handle) = reconcile_handle {
         handle.abort();
     }
-    eprintln!("Agent stopped.");
+    info!("Agent stopped");
     Ok(())
 }
 
 /// Handle a single QUIC connection (may have multiple bi-directional streams).
+#[instrument(skip_all)]
 async fn handle_connection(
     incoming: quinn::Incoming,
     _conn_gate: Arc<Mutex<ConnectionGate>>,
 ) -> Result<()> {
+    let m = metrics::global();
+    m.connections_accepted.fetch_add(1, Ordering::Relaxed);
+
     let connection = incoming
         .await
         .with_context(|| "Failed to accept connection")?;
+
+    debug!(remote = %connection.remote_address(), "Connection established");
 
     // Per-connection rate limiter
     let limiter = Arc::new(Mutex::new(RateLimiter::new(
@@ -753,7 +822,7 @@ async fn handle_connection(
                 let limiter = limiter.clone();
                 tokio::spawn(async move {
                     if let Err(e) = handle_stream(send, recv, limiter).await {
-                        eprintln!("Stream error: {}", e);
+                        warn!(error = %e, "Stream error");
                     }
                 });
             }
@@ -768,13 +837,18 @@ async fn handle_connection(
 }
 
 /// Handle a single bi-directional QUIC stream: read request, dispatch, write response.
+#[instrument(skip_all)]
 async fn handle_stream(
     mut send: quinn::SendStream,
     mut recv: quinn::RecvStream,
     limiter: Arc<Mutex<RateLimiter>>,
 ) -> Result<()> {
+    let m = metrics::global();
+
     // Check rate limit before processing
     if !limiter.lock().await.try_acquire() {
+        m.requests_rate_limited.fetch_add(1, Ordering::Relaxed);
+        warn!("Request rate-limited");
         let response = AgentResponse::Error {
             code: 429,
             message: "Rate limit exceeded".to_string(),
@@ -1130,5 +1204,128 @@ mod tests {
         assert_eq!(DEFAULT_RATE_LIMIT_RPS, 10);
         assert_eq!(DEFAULT_RATE_LIMIT_BURST, 20);
         assert_eq!(DEFAULT_MAX_CONNECTIONS, 100);
+    }
+
+    #[test]
+    fn test_reconcile_creates_tenant_and_pool() {
+        use crate::infra::shell_mock;
+
+        let (_guard, _fs) = shell_mock::mock_fs().install();
+
+        let desired = DesiredState {
+            schema_version: 1,
+            node_id: "node-1".to_string(),
+            tenants: vec![DesiredTenant {
+                tenant_id: "acme".to_string(),
+                network: DesiredTenantNetwork {
+                    tenant_net_id: 3,
+                    ipv4_subnet: "10.240.3.0/24".to_string(),
+                },
+                quotas: Default::default(),
+                secrets_hash: None,
+                pools: vec![DesiredPool {
+                    pool_id: "workers".to_string(),
+                    flake_ref: ".".to_string(),
+                    profile: "minimal".to_string(),
+                    instance_resources: InstanceResources {
+                        vcpus: 2,
+                        mem_mib: 1024,
+                        data_disk_mib: 0,
+                    },
+                    desired_counts: DesiredCounts {
+                        running: 1,
+                        warm: 0,
+                        sleeping: 0,
+                    },
+                    seccomp_policy: "baseline".to_string(),
+                    snapshot_compression: "none".to_string(),
+                }],
+            }],
+            prune_unknown_tenants: false,
+            prune_unknown_pools: false,
+        };
+
+        let report = reconcile_desired(&desired, false).unwrap();
+
+        assert_eq!(report.tenants_created, vec!["acme"]);
+        assert_eq!(report.pools_created, vec!["acme/workers"]);
+        // Instance created but start fails (pool not built — no artifacts symlink)
+        assert_eq!(report.instances_created, 1);
+        assert!(report.errors.iter().any(|e| e.contains("not been built")));
+    }
+
+    #[test]
+    fn test_reconcile_prunes_unknown_tenants() {
+        use crate::infra::shell_mock;
+
+        let tenant_json =
+            shell_mock::tenant_fixture("old-tenant", 5, "10.240.5.0/24", "10.240.5.1");
+        let (_guard, _fs) = shell_mock::mock_fs()
+            .with_file("/var/lib/mvm/tenants/old-tenant/tenant.json", &tenant_json)
+            .install();
+
+        let desired = DesiredState {
+            schema_version: 1,
+            node_id: "node-1".to_string(),
+            tenants: vec![],
+            prune_unknown_tenants: true,
+            prune_unknown_pools: false,
+        };
+
+        let report = reconcile_desired(&desired, true).unwrap();
+        assert_eq!(report.tenants_pruned, vec!["old-tenant"]);
+    }
+
+    #[test]
+    fn test_reconcile_idempotent_existing_tenant() {
+        use crate::infra::shell_mock;
+
+        let tenant_json = shell_mock::tenant_fixture("acme", 3, "10.240.3.0/24", "10.240.3.1");
+        let pool_json = shell_mock::pool_fixture("acme", "workers");
+        let (_guard, _fs) = shell_mock::mock_fs()
+            .with_file("/var/lib/mvm/tenants/acme/tenant.json", &tenant_json)
+            .with_file(
+                "/var/lib/mvm/tenants/acme/pools/workers/pool.json",
+                &pool_json,
+            )
+            .install();
+
+        let desired = DesiredState {
+            schema_version: 1,
+            node_id: "node-1".to_string(),
+            tenants: vec![DesiredTenant {
+                tenant_id: "acme".to_string(),
+                network: DesiredTenantNetwork {
+                    tenant_net_id: 3,
+                    ipv4_subnet: "10.240.3.0/24".to_string(),
+                },
+                quotas: Default::default(),
+                secrets_hash: None,
+                pools: vec![DesiredPool {
+                    pool_id: "workers".to_string(),
+                    flake_ref: ".".to_string(),
+                    profile: "minimal".to_string(),
+                    instance_resources: InstanceResources {
+                        vcpus: 2,
+                        mem_mib: 1024,
+                        data_disk_mib: 0,
+                    },
+                    desired_counts: DesiredCounts::default(),
+                    seccomp_policy: "baseline".to_string(),
+                    snapshot_compression: "none".to_string(),
+                }],
+            }],
+            prune_unknown_tenants: false,
+            prune_unknown_pools: false,
+        };
+
+        let report = reconcile_desired(&desired, false).unwrap();
+
+        // Tenant already exists, should NOT be created
+        assert!(report.tenants_created.is_empty());
+        // Pool already exists, should NOT be created
+        assert!(report.pools_created.is_empty());
+        // No instances desired (counts all 0), none created
+        assert_eq!(report.instances_created, 0);
     }
 }

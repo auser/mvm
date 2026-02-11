@@ -7,7 +7,9 @@ pub mod network;
 
 // Multi-tenant model
 pub mod bridge;
+pub mod disk_manager;
 pub mod instance;
+pub mod lima_state;
 pub mod naming;
 pub mod pool;
 pub mod tenant;

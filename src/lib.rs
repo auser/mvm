@@ -1,6 +1,8 @@
 pub mod agent;
+pub mod coordinator;
 pub mod infra;
 pub mod node;
+pub mod observability;
 pub mod security;
 pub mod sleep;
 pub mod vm;

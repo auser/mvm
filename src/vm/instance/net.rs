@@ -67,10 +67,11 @@ fn used_ip_offsets(tenant_id: &str) -> Result<HashSet<u8>> {
 
     for line in output.lines() {
         // Lines look like: "guest_ip": "10.240.3.5",
-        if let Some(ip_start) = line.find('"') {
-            let rest = &line[ip_start + 1..];
-            if let Some(ip_end) = rest.find('"') {
-                let ip = &rest[..ip_end];
+        // Extract the IP value (last quoted string in the line)
+        if let Some(last_end) = line.rfind('"') {
+            let before = &line[..last_end];
+            if let Some(last_start) = before.rfind('"') {
+                let ip = &line[last_start + 1..last_end];
                 // Extract last octet
                 if let Some(last_dot) = ip.rfind('.')
                     && let Ok(offset) = ip[last_dot + 1..].parse::<u8>()
