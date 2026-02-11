@@ -14,7 +14,11 @@
   #   --flake github:myorg/my-vm?rev=abc123 (pinned revision)
   #
   # User flakes MUST expose a microvm.nix-based NixOS configuration.
-  # The build system evaluates:
+  # The build system evaluates (with mvm-profiles.toml):
+  #
+  #   nix build <flake_ref>#packages.<system>.tenant-<role>-<profile>
+  #
+  # Legacy (without mvm-profiles.toml):
   #
   #   nix build <flake_ref>#packages.<system>.tenant-<profile>
   #
@@ -45,14 +49,16 @@
 
       # Build a guest NixOS configuration and extract Firecracker artifacts.
       # User flakes should expose the same output shape.
-      mkGuest = { system, profile, guestModules }:
+      # roleModules is optional — when provided, role-specific NixOS modules
+      # are composed with the guest profile modules.
+      mkGuest = { system, profile, guestModules, roleModules ? [] }:
         let
           guestConfig = nixpkgs.lib.nixosSystem {
             inherit system;
             modules = [
               microvm.nixosModules.microvm
               ./guests/baseline.nix
-            ] ++ guestModules;
+            ] ++ roleModules ++ guestModules;
           };
           config = guestConfig.config;
         in {
@@ -80,15 +86,63 @@
         };
 
     in {
-      # Per-profile guest packages (built-in profiles):
+      # Role-aware guest packages (with mvm-profiles.toml):
+      #
+      #   nix build .#tenant-gateway-minimal
+      #   nix build .#tenant-worker-python
+      #   nix build .#packages.aarch64-linux.tenant-gateway-minimal
+      #
+      # Legacy outputs (backward compat, no role prefix):
       #
       #   nix build .#tenant-minimal
       #   nix build .#tenant-python
-      #   nix build .#packages.aarch64-linux.tenant-minimal
-      #
-      # User flakes should follow the same naming convention:
-      #   packages.<system>.tenant-<profile>
       packages = forAllSystems (system: {
+        # --- Role-aware outputs (role+profile combinations) ---
+
+        tenant-gateway-minimal = mkGuest {
+          inherit system;
+          profile = "minimal";
+          roleModules = [ ./roles/gateway.nix ];
+          guestModules = [ ./guests/profiles/minimal.nix ];
+        };
+
+        tenant-worker-minimal = mkGuest {
+          inherit system;
+          profile = "minimal";
+          roleModules = [ ./roles/worker.nix ];
+          guestModules = [ ./guests/profiles/minimal.nix ];
+        };
+
+        tenant-builder-minimal = mkGuest {
+          inherit system;
+          profile = "minimal";
+          roleModules = [ ./roles/builder.nix ];
+          guestModules = [ ./guests/profiles/minimal.nix ];
+        };
+
+        tenant-gateway-python = mkGuest {
+          inherit system;
+          profile = "python";
+          roleModules = [ ./roles/gateway.nix ];
+          guestModules = [ ./guests/profiles/python.nix ];
+        };
+
+        tenant-worker-python = mkGuest {
+          inherit system;
+          profile = "python";
+          roleModules = [ ./roles/worker.nix ];
+          guestModules = [ ./guests/profiles/python.nix ];
+        };
+
+        tenant-builder-python = mkGuest {
+          inherit system;
+          profile = "python";
+          roleModules = [ ./roles/builder.nix ];
+          guestModules = [ ./guests/profiles/python.nix ];
+        };
+
+        # --- Legacy outputs (backward compat, no role) ---
+
         tenant-minimal = mkGuest {
           inherit system;
           profile = "minimal";
@@ -105,10 +159,14 @@
         nix-builder = mkBuilder { inherit system; };
       });
 
-      # Expose baseline and microvm module for user flakes to import
+      # Expose baseline, role, and microvm modules for user flakes to import
       nixosModules = {
         mvm-baseline = ./guests/baseline.nix;
         mvm-microvm = microvm.nixosModules.microvm;
+        mvm-role-gateway = ./roles/gateway.nix;
+        mvm-role-worker = ./roles/worker.nix;
+        mvm-role-builder = ./roles/builder.nix;
+        mvm-role-openclaw = ./roles/openclaw.nix;
       };
     };
 }

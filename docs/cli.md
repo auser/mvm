@@ -291,16 +291,16 @@ mvm instance warm acme/workers/i-a3f7b2c1
 
 ### `mvm instance sleep <t>/<p>/<i>`
 
-Snapshots the instance to disk and shuts it down. Near-zero resource usage while sleeping.
+Snapshots the instance to disk and shuts it down. Near-zero resource usage while sleeping. Before sleeping, the host requests a cooperative drain via vsock — the guest agent finishes in-flight work and ACKs. If no ACK within `drain_timeout_seconds`, sleep is forced.
 
 ```bash
 mvm instance sleep acme/workers/i-a3f7b2c1
-mvm instance sleep acme/workers/i-a3f7b2c1 --force  # skip guest ACK
+mvm instance sleep acme/workers/i-a3f7b2c1 --force  # skip vsock drain, sleep immediately
 ```
 
 ### `mvm instance wake <t>/<p>/<i>`
 
-Restores an instance from snapshot and resumes execution.
+Restores an instance from snapshot and resumes execution. After restore, the host sends a `Wake` signal via vsock so the guest agent can reinitialize connections and refresh secrets.
 
 ```bash
 mvm instance wake acme/workers/i-a3f7b2c1
@@ -412,6 +412,95 @@ mvm node stats --json
 ```
 
 Shows: per-tenant running/warm/sleeping counts, memory usage, snapshot stats.
+
+---
+
+## Deployment
+
+### `mvm new <template> <name>`
+
+Creates a deployment from a built-in template. Currently supports the `openclaw` template.
+
+```bash
+mvm new openclaw alice
+mvm new openclaw alice --flake github:openclaw/nix-openclaw
+mvm new openclaw alice --config deploy.toml
+mvm new openclaw alice --net-id 5 --subnet 10.240.5.0/24
+```
+
+**Positional args:**
+- `template` -- template name (e.g., `openclaw`)
+- `name` -- deployment name (becomes tenant ID)
+
+**Optional flags:**
+- `--config <path>` -- TOML config file with secrets and resource overrides
+- `--flake <ref>` -- override template's default flake reference
+- `--net-id <N>` -- override auto-allocated network ID
+- `--subnet <CIDR>` -- override auto-computed subnet
+
+Config file format (`deploy.toml`):
+```toml
+[secrets]
+anthropic_key = { file = "./secrets/anthropic.key" }
+telegram_token = { file = "./secrets/telegram.token" }
+
+[overrides]
+flake = "github:openclaw/nix-openclaw"
+
+[overrides.workers]
+mem_mib = 4096
+instances = 3
+```
+
+### `mvm deploy <manifest>`
+
+Deploys from a standalone manifest file. Creates tenant and pools if they don't exist, then scales to desired counts.
+
+```bash
+mvm deploy deployment.toml
+mvm deploy deployment.toml --watch
+mvm deploy deployment.toml --watch --interval 60
+```
+
+**Positional args:**
+- `manifest` -- path to deployment manifest (TOML)
+
+**Optional flags:**
+- `--watch` -- re-reconcile at interval (Ctrl+C to stop)
+- `--interval <secs>` -- watch interval in seconds (default: 30)
+
+Manifest format:
+```toml
+[tenant]
+id = "alice"
+
+[[pools]]
+id = "gateways"
+role = "gateway"
+flake = "github:openclaw/nix-openclaw"
+vcpus = 2
+mem_mib = 1024
+
+[[pools]]
+id = "workers"
+role = "capability-openclaw"
+flake = "github:openclaw/nix-openclaw"
+vcpus = 2
+mem_mib = 2048
+desired_running = 1
+
+[secrets]
+anthropic_key = { file = "./secrets/anthropic.key" }
+```
+
+### `mvm connect <name>`
+
+Shows deployment dashboard (gateway, instances, connection info).
+
+```bash
+mvm connect alice
+mvm connect alice --json
+```
 
 ---
 

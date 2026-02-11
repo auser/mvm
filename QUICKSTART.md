@@ -41,7 +41,39 @@ mvm stop      # Stop the microVM
 mvm destroy   # Tear down everything
 ```
 
-## Multi-Tenant Mode
+## Deploy an OpenClaw App (3 Commands)
+
+The fastest path from bare machine to a running deployment:
+
+### 1. Prepare the host
+
+```bash
+mvm add host
+```
+
+Bootstraps the environment, initializes mTLS certificates, and prepares the machine for fleet operation. For production, pass `--ca ca.crt --signing-key coordinator.pub`.
+
+### 2. Create a deployment
+
+```bash
+mvm new openclaw myapp
+```
+
+Creates a complete deployment end-to-end: allocates a network, creates a tenant, sets up gateway and worker pools, builds images, and scales up (1 gateway, 2 workers + 1 warm spare).
+
+### 3. View your deployment
+
+```bash
+mvm connect myapp
+```
+
+Shows the deployment dashboard: network info, pool summary, instance table, and quick-reference commands for secrets, scaling, and instance management.
+
+See [Onboarding Guide](docs/onboarding.md) for the full walkthrough.
+
+## Multi-Tenant Mode (Granular)
+
+For fine-grained control, use the individual tenant/pool/instance commands:
 
 ### 1. Create a tenant
 
@@ -128,7 +160,11 @@ Create `desired.json`:
       "quotas": {
         "max_vcpus": 16,
         "max_mem_mib": 32768,
-        "max_running_instances": 8
+        "max_running": 8,
+        "max_warm": 4,
+        "max_pools": 10,
+        "max_instances_per_pool": 32,
+        "max_disk_gib": 500
       },
       "pools": [
         {
@@ -156,7 +192,9 @@ Create `desired.json`:
 
 ## Next Steps
 
+- [Onboarding Guide](docs/onboarding.md) -- end-to-end deployment walkthrough
 - [Full CLI Reference](docs/cli.md)
 - [Architecture Guide](docs/architecture.md)
 - [Networking](docs/networking.md)
 - [Agent & Reconciliation](docs/agent.md)
+- [Security](docs/security.md)

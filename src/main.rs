@@ -145,6 +145,54 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+
+    // ---- Onboarding ----
+    /// Prepare a host to join the fleet
+    Add {
+        #[command(subcommand)]
+        action: AddCmd,
+    },
+
+    /// Create a deployment from a built-in template
+    New {
+        /// Template name (e.g., "openclaw")
+        template: String,
+        /// Deployment name (becomes tenant ID)
+        name: String,
+        /// Override auto-allocated network ID
+        #[arg(long)]
+        net_id: Option<u16>,
+        /// Override auto-computed subnet (CIDR)
+        #[arg(long)]
+        subnet: Option<String>,
+        /// Override template's default flake reference
+        #[arg(long)]
+        flake: Option<String>,
+        /// Config file with secrets and resource overrides (TOML)
+        #[arg(long)]
+        config: Option<String>,
+    },
+
+    /// Deploy from a standalone manifest file
+    Deploy {
+        /// Path to deployment manifest (TOML)
+        manifest: String,
+        /// Watch mode: re-reconcile at interval
+        #[arg(long)]
+        watch: bool,
+        /// Watch interval in seconds (default: 30)
+        #[arg(long, default_value = "30")]
+        interval: u64,
+    },
+
+    /// Show deployment dashboard (gateway, instances, connection info)
+    Connect {
+        /// Deployment name (tenant ID)
+        name: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 // --- Tenant subcommands ---
@@ -235,6 +283,9 @@ enum PoolCmd {
         /// Guest profile: minimal, baseline, python
         #[arg(long)]
         profile: String,
+        /// Instance role: gateway, worker, builder
+        #[arg(long, default_value = "worker")]
+        role: String,
         /// vCPUs per instance
         #[arg(long)]
         cpus: u8,
@@ -519,6 +570,24 @@ enum NodeCmd {
     },
 }
 
+// --- Add subcommands ---
+
+#[derive(Subcommand)]
+enum AddCmd {
+    /// Prepare this machine to join the fleet (bootstrap + certs + signing key)
+    Host {
+        /// Path to CA certificate PEM file (omit for self-signed dev CA)
+        #[arg(long)]
+        ca: Option<String>,
+        /// Path to coordinator's Ed25519 public key file
+        #[arg(long)]
+        signing_key: Option<String>,
+        /// Enable production mode checks
+        #[arg(long)]
+        production: bool,
+    },
+}
+
 // ============================================================================
 // Command dispatch
 // ============================================================================
@@ -569,6 +638,30 @@ fn main() -> Result<()> {
         Commands::Coordinator { action } => cmd_coordinator(action, out_fmt),
         Commands::Net { action } => cmd_net(action, out_fmt),
         Commands::Node { action } => cmd_node(action, out_fmt),
+
+        // --- Onboarding ---
+        Commands::Add { action } => cmd_add(action),
+        Commands::New {
+            template,
+            name,
+            net_id,
+            subnet,
+            flake,
+            config,
+        } => cmd_new(
+            &template,
+            &name,
+            net_id,
+            subnet.as_deref(),
+            flake.as_deref(),
+            config.as_deref(),
+        ),
+        Commands::Deploy {
+            manifest,
+            watch,
+            interval,
+        } => cmd_deploy(&manifest, watch, interval),
+        Commands::Connect { name, json } => cmd_connect(&name, json),
     }
 }
 
@@ -920,7 +1013,7 @@ fn cmd_tenant(action: TenantCmd, out_fmt: OutputFormat) -> Result<()> {
             naming::validate_id(&id, "Tenant")?;
 
             // Derive gateway from subnet (first usable IP)
-            let gateway = derive_gateway(&subnet)?;
+            let gateway = mvm::templates::gateway_from_subnet(&subnet)?;
             let net = TenantNet::new(net_id, &subnet, &gateway);
             let quotas = TenantQuota {
                 max_vcpus,
@@ -1028,18 +1121,26 @@ fn cmd_pool(action: PoolCmd, out_fmt: OutputFormat) -> Result<()> {
             path,
             flake,
             profile,
+            role,
             cpus,
             mem,
             data_disk,
         } => {
             let (tenant_id, pool_id) = naming::parse_pool_path(&path)?;
+            let parsed_role = parse_role(&role)?;
             let resources = pool::config::InstanceResources {
                 vcpus: cpus,
                 mem_mib: mem,
                 data_disk_mib: data_disk,
             };
-            let spec =
-                pool::lifecycle::pool_create(tenant_id, pool_id, &flake, &profile, resources)?;
+            let spec = pool::lifecycle::pool_create(
+                tenant_id,
+                pool_id,
+                &flake,
+                &profile,
+                resources,
+                parsed_role,
+            )?;
             ui::success(&format!(
                 "Pool '{}/{}' created.",
                 spec.tenant_id, spec.pool_id
@@ -1060,6 +1161,7 @@ fn cmd_pool(action: PoolCmd, out_fmt: OutputFormat) -> Result<()> {
                 if let Ok(spec) = pool::lifecycle::pool_load(&tenant, pid) {
                     rows.push(PoolRow {
                         pool_path: format!("{}/{}", tenant, pid),
+                        role: spec.role.to_string(),
                         profile: spec.profile,
                         vcpus: spec.instance_resources.vcpus,
                         mem_mib: spec.instance_resources.mem_mib,
@@ -1078,6 +1180,7 @@ fn cmd_pool(action: PoolCmd, out_fmt: OutputFormat) -> Result<()> {
             let spec = pool::lifecycle::pool_load(tenant_id, pool_id)?;
             let info = PoolInfo {
                 pool_path: format!("{}/{}", spec.tenant_id, spec.pool_id),
+                role: spec.role.to_string(),
                 flake_ref: spec.flake_ref,
                 profile: spec.profile,
                 vcpus: spec.instance_resources.vcpus,
@@ -1560,19 +1663,449 @@ fn cmd_coordinator(action: CoordinatorCmd, _out_fmt: OutputFormat) -> Result<()>
 }
 
 // ============================================================================
+// Onboarding command handlers
+// ============================================================================
+
+fn cmd_add(action: AddCmd) -> Result<()> {
+    match action {
+        AddCmd::Host {
+            ca,
+            signing_key,
+            production,
+        } => cmd_add_host(ca.as_deref(), signing_key.as_deref(), production),
+    }
+}
+
+fn cmd_add_host(
+    ca_path: Option<&str>,
+    signing_key_path: Option<&str>,
+    production: bool,
+) -> Result<()> {
+    use mvm::security::certs;
+
+    let total_steps = 2 + u32::from(signing_key_path.is_some());
+
+    // Step 1: Bootstrap
+    ui::step(1, total_steps, "Bootstrapping environment...");
+    cmd_bootstrap(production).with_context(|| "Bootstrap failed")?;
+
+    // Step 2: Initialize mTLS certificates
+    ui::step(2, total_steps, "Initializing mTLS certificates...");
+    if let Some(ca) = ca_path {
+        certs::init_ca(ca)?;
+        ui::info("  CA certificate imported.");
+    }
+    let node_id = format!("mvm-{}", &uuid::Uuid::new_v4().to_string()[..8]);
+    let paths = certs::generate_self_signed(&node_id)?;
+    ui::info(&format!("  Node certificate: {}", paths.node_cert));
+
+    // Step 3 (optional): Copy signing key
+    if let Some(key_path) = signing_key_path {
+        ui::step(3, total_steps, "Installing coordinator signing key...");
+        shell::run_in_vm("sudo mkdir -p /etc/mvm/trusted_keys")?;
+        shell::run_in_vm(&format!(
+            "sudo cp {} /etc/mvm/trusted_keys/coordinator.pub && \
+             sudo chmod 644 /etc/mvm/trusted_keys/coordinator.pub",
+            key_path
+        ))?;
+        ui::info("  Signing key installed.");
+    }
+
+    ui::success("\nHost prepared successfully!");
+    ui::info("\nNext steps:");
+    ui::info("  Start the agent daemon:");
+    ui::info("    mvm agent serve --interval-secs 30");
+    if signing_key_path.is_none() {
+        ui::info("\n  Note: no signing key provided. For production, re-run with --signing-key.");
+    }
+
+    Ok(())
+}
+
+fn cmd_new(
+    template_name: &str,
+    name: &str,
+    net_id_override: Option<u16>,
+    subnet_override: Option<&str>,
+    flake_override: Option<&str>,
+    config_path: Option<&str>,
+) -> Result<()> {
+    use mvm::templates;
+    use tenant::config::TenantNet;
+
+    naming::validate_id(name, "Deployment")?;
+
+    let template = templates::get_template(template_name).ok_or_else(|| {
+        let available = templates::list_templates().join(", ");
+        anyhow::anyhow!(
+            "Unknown template '{}'. Available: {}",
+            template_name,
+            available
+        )
+    })?;
+
+    // Load optional config file
+    let deploy_config = match config_path {
+        Some(path) => Some(templates::DeployConfig::from_file(std::path::Path::new(
+            path,
+        ))?),
+        None => None,
+    };
+
+    ui::info(&format!(
+        "Creating '{}' from template '{}'...\n",
+        name, template_name
+    ));
+
+    let pool_count = template.pools.len() as u32;
+    // Steps: allocate + create tenant + (create pool * N) + (build * N) + scale
+    let total_steps = 2 + pool_count + pool_count + 1;
+    let mut step = 0u32;
+
+    // Step 1: Allocate network
+    step += 1;
+    ui::step(step, total_steps, "Allocating network...");
+    let net_id = match net_id_override {
+        Some(id) => id,
+        None => templates::allocate_net_id()?,
+    };
+    let subnet = match subnet_override {
+        Some(s) => s.to_string(),
+        None => templates::subnet_from_net_id(net_id),
+    };
+    let gateway = templates::gateway_from_subnet(&subnet)?;
+    ui::info(&format!("  net-id: {}, subnet: {}", net_id, subnet));
+
+    // Step 2: Create tenant
+    step += 1;
+    let step_msg = format!("Creating tenant '{}'...", name);
+    ui::step(step, total_steps, &step_msg);
+    let net = TenantNet::new(net_id, &subnet, &gateway);
+    tenant::lifecycle::tenant_create(name, net, template.quotas.clone())?;
+
+    // Determine flake: CLI override > config override > template default
+    let flake_ref = flake_override
+        .map(|s| s.to_string())
+        .or_else(|| {
+            deploy_config
+                .as_ref()
+                .and_then(|c| c.overrides.flake.clone())
+        })
+        .unwrap_or_else(|| template.default_flake.to_string());
+
+    // Create pools (applying config overrides)
+    for pool_tmpl in &template.pools {
+        step += 1;
+        let step_msg = format!("Creating pool '{}/{}'...", name, pool_tmpl.pool_id);
+        ui::step(step, total_steps, &step_msg);
+
+        // Apply pool-level overrides from config
+        let (vcpus, mem_mib) = apply_pool_overrides(pool_tmpl, deploy_config.as_ref());
+
+        let resources = pool::config::InstanceResources {
+            vcpus,
+            mem_mib,
+            data_disk_mib: pool_tmpl.data_disk_mib,
+        };
+        pool::lifecycle::pool_create(
+            name,
+            pool_tmpl.pool_id,
+            &flake_ref,
+            pool_tmpl.profile,
+            resources,
+            pool_tmpl.role.clone(),
+        )?;
+    }
+
+    // Build pools
+    for pool_tmpl in &template.pools {
+        step += 1;
+        let step_msg = format!("Building '{}/{}'...", name, pool_tmpl.pool_id);
+        ui::step(step, total_steps, &step_msg);
+        pool::build::pool_build(name, pool_tmpl.pool_id, None)?;
+    }
+
+    // Scale up
+    step += 1;
+    ui::step(step, total_steps, "Scaling to running instances...");
+    for pool_tmpl in &template.pools {
+        let (running, warm) = scale_for_role(pool_tmpl, deploy_config.as_ref());
+        pool::lifecycle::pool_scale(name, pool_tmpl.pool_id, running, warm, None)?;
+    }
+
+    ui::success(&format!("\nDeployment '{}' created!", name));
+    ui::info(&format!("\n  mvm connect {}", name));
+
+    Ok(())
+}
+
+/// Apply pool overrides from a DeployConfig, matching by pool_id.
+fn apply_pool_overrides(
+    pool_tmpl: &mvm::templates::PoolTemplate,
+    config: Option<&mvm::templates::DeployConfig>,
+) -> (u8, u32) {
+    let mut vcpus = pool_tmpl.vcpus;
+    let mut mem_mib = pool_tmpl.mem_mib;
+
+    if let Some(cfg) = config {
+        let pool_override = match pool_tmpl.pool_id {
+            "gateways" => cfg.overrides.gateways.as_ref(),
+            "workers" => cfg.overrides.workers.as_ref(),
+            _ => None,
+        };
+        if let Some(ov) = pool_override {
+            if let Some(v) = ov.vcpus {
+                vcpus = v;
+            }
+            if let Some(m) = ov.mem_mib {
+                mem_mib = m;
+            }
+        }
+    }
+
+    (vcpus, mem_mib)
+}
+
+/// Determine scale counts for a pool based on role and config overrides.
+fn scale_for_role(
+    pool_tmpl: &mvm::templates::PoolTemplate,
+    config: Option<&mvm::templates::DeployConfig>,
+) -> (Option<u32>, Option<u32>) {
+    let default = match pool_tmpl.role {
+        pool::config::Role::Gateway => (1u32, 0u32),
+        _ => (2, 1),
+    };
+
+    if let Some(cfg) = config {
+        let pool_override = match pool_tmpl.pool_id {
+            "gateways" => cfg.overrides.gateways.as_ref(),
+            "workers" => cfg.overrides.workers.as_ref(),
+            _ => None,
+        };
+        if let Some(ov) = pool_override
+            && let Some(n) = ov.instances
+        {
+            return (Some(n), Some(default.1));
+        }
+    }
+
+    (
+        Some(default.0),
+        if default.1 > 0 { Some(default.1) } else { None },
+    )
+}
+
+fn cmd_deploy(manifest_path: &str, watch: bool, interval: u64) -> Result<()> {
+    use mvm::templates;
+    use tenant::config::TenantNet;
+
+    let manifest = templates::DeploymentManifest::from_file(std::path::Path::new(manifest_path))?;
+
+    naming::validate_id(&manifest.tenant.id, "Tenant")?;
+
+    ui::info(&format!("Deploying tenant '{}'...\n", manifest.tenant.id));
+
+    // Check if tenant already exists
+    let tenant_exists = tenant::lifecycle::tenant_load(&manifest.tenant.id).is_ok();
+
+    if !tenant_exists {
+        // Create tenant
+        let net_id = match manifest.tenant.net_id {
+            Some(id) => id,
+            None => templates::allocate_net_id()?,
+        };
+        let subnet = match &manifest.tenant.subnet {
+            Some(s) => s.clone(),
+            None => templates::subnet_from_net_id(net_id),
+        };
+        let gateway = templates::gateway_from_subnet(&subnet)?;
+        let net = TenantNet::new(net_id, &subnet, &gateway);
+        tenant::lifecycle::tenant_create(
+            &manifest.tenant.id,
+            net,
+            mvm::vm::tenant::config::TenantQuota::default(),
+        )?;
+        ui::info(&format!("  Created tenant '{}'", manifest.tenant.id));
+    } else {
+        ui::info(&format!("  Tenant '{}' already exists", manifest.tenant.id));
+    }
+
+    let default_flake = ".".to_string();
+
+    // Create/update pools
+    for mp in &manifest.pools {
+        naming::validate_id(&mp.id, "Pool")?;
+
+        let pool_exists = pool::lifecycle::pool_load(&manifest.tenant.id, &mp.id).is_ok();
+
+        if !pool_exists {
+            let flake_ref = mp.flake.as_deref().unwrap_or(&default_flake);
+            let resources = pool::config::InstanceResources {
+                vcpus: mp.vcpus,
+                mem_mib: mp.mem_mib,
+                data_disk_mib: mp.data_disk_mib,
+            };
+            pool::lifecycle::pool_create(
+                &manifest.tenant.id,
+                &mp.id,
+                flake_ref,
+                &mp.profile,
+                resources,
+                mp.role.clone(),
+            )?;
+            ui::info(&format!(
+                "  Created pool '{}/{}'",
+                manifest.tenant.id, mp.id
+            ));
+
+            // Build the pool
+            pool::build::pool_build(&manifest.tenant.id, &mp.id, None)?;
+            ui::info(&format!("  Built pool '{}/{}'", manifest.tenant.id, mp.id));
+        }
+
+        // Scale
+        let running = mp.desired_running.or(Some(1));
+        let warm = mp.desired_warm;
+        pool::lifecycle::pool_scale(&manifest.tenant.id, &mp.id, running, warm, None)?;
+    }
+
+    ui::success(&format!("\nDeployment '{}' ready!", manifest.tenant.id));
+
+    if watch {
+        ui::info(&format!(
+            "Watch mode: re-reconciling every {}s (Ctrl+C to stop)",
+            interval
+        ));
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(interval));
+            ui::info("Re-checking desired state...");
+            for mp in &manifest.pools {
+                let running = mp.desired_running.or(Some(1));
+                let warm = mp.desired_warm;
+                pool::lifecycle::pool_scale(&manifest.tenant.id, &mp.id, running, warm, None)?;
+            }
+        }
+    }
+
+    Ok(())
+}
+
+fn cmd_connect(name: &str, json: bool) -> Result<()> {
+    naming::validate_id(name, "Deployment")?;
+
+    let config = tenant::lifecycle::tenant_load(name)
+        .with_context(|| format!("Deployment '{}' not found", name))?;
+
+    if json {
+        let pool_ids = pool::lifecycle::pool_list(name)?;
+        let mut pools_info = Vec::new();
+        for pid in &pool_ids {
+            if let Ok(spec) = pool::lifecycle::pool_load(name, pid) {
+                pools_info.push(serde_json::json!({
+                    "pool_id": spec.pool_id,
+                    "role": spec.role.to_string(),
+                    "profile": spec.profile,
+                    "desired_running": spec.desired_counts.running,
+                    "desired_warm": spec.desired_counts.warm,
+                }));
+            }
+        }
+        let out = serde_json::json!({
+            "tenant_id": config.tenant_id,
+            "gateway_ip": config.net.gateway_ip,
+            "subnet": config.net.ipv4_subnet,
+            "bridge": config.net.bridge_name,
+            "pools": pools_info,
+        });
+        println!("{}", serde_json::to_string_pretty(&out)?);
+        return Ok(());
+    }
+
+    // Header
+    ui::info(&format!("Deployment: {}\n", config.tenant_id));
+
+    // Network
+    ui::info("Network:");
+    ui::info(&format!("  Gateway:  {}", config.net.gateway_ip));
+    ui::info(&format!("  Subnet:   {}", config.net.ipv4_subnet));
+    ui::info(&format!("  Bridge:   {}", config.net.bridge_name));
+
+    // Pools
+    let pool_ids = pool::lifecycle::pool_list(name)?;
+    if !pool_ids.is_empty() {
+        ui::info("\nPools:");
+        for pid in &pool_ids {
+            if let Ok(spec) = pool::lifecycle::pool_load(name, pid) {
+                ui::info(&format!(
+                    "  {}/{} (role: {}, {}vcpu/{}MiB, running: {}, warm: {})",
+                    name,
+                    spec.pool_id,
+                    spec.role,
+                    spec.instance_resources.vcpus,
+                    spec.instance_resources.mem_mib,
+                    spec.desired_counts.running,
+                    spec.desired_counts.warm,
+                ));
+            }
+        }
+    }
+
+    // Instances
+    let mut has_instances = false;
+    for pid in &pool_ids {
+        if let Ok(instances) = mvm::vm::instance::lifecycle::instance_list(name, pid)
+            && !instances.is_empty()
+        {
+            if !has_instances {
+                ui::info("\nInstances:");
+                has_instances = true;
+            }
+            for inst in &instances {
+                ui::info(&format!(
+                    "  {}/{}/{} {:?} ip={}",
+                    name, pid, inst.instance_id, inst.status, inst.net.guest_ip
+                ));
+            }
+        }
+    }
+
+    if !has_instances {
+        ui::info("\nNo instances yet. Pools need to be built and scaled.");
+    }
+
+    // Next steps
+    ui::info("\nQuick reference:");
+    ui::info(&format!(
+        "  Set secrets:  mvm tenant secrets set {} --from-file secrets.json",
+        name
+    ));
+    ui::info(&format!(
+        "  List instances: mvm instance list --tenant {}",
+        name
+    ));
+    ui::info(&format!(
+        "  Scale workers:  mvm pool scale {}/workers --running 4 --warm 2",
+        name
+    ));
+
+    Ok(())
+}
+
+// ============================================================================
 // Helpers
 // ============================================================================
 
-/// Derive gateway IP from a CIDR subnet (first usable IP, typically .1).
-fn derive_gateway(subnet: &str) -> Result<String> {
-    let parts: Vec<&str> = subnet.split('/').collect();
-    if parts.len() != 2 {
-        anyhow::bail!("Invalid CIDR subnet: {}", subnet);
+/// Parse a role string from the CLI into a Role enum value.
+fn parse_role(s: &str) -> Result<mvm::vm::pool::config::Role> {
+    use mvm::vm::pool::config::Role;
+    match s {
+        "gateway" => Ok(Role::Gateway),
+        "worker" => Ok(Role::Worker),
+        "builder" => Ok(Role::Builder),
+        "capability-imessage" => Ok(Role::CapabilityImessage),
+        _ => anyhow::bail!(
+            "Unknown role '{}'. Valid roles: gateway, worker, builder, capability-imessage",
+            s
+        ),
     }
-    let octets: Vec<&str> = parts[0].split('.').collect();
-    if octets.len() != 4 {
-        anyhow::bail!("Invalid IPv4 address in subnet: {}", subnet);
-    }
-    // Replace last octet with 1
-    Ok(format!("{}.{}.{}.1", octets[0], octets[1], octets[2]))
 }

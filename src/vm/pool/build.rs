@@ -72,6 +72,7 @@ pub fn pool_build(tenant_id: &str, pool_id: &str, timeout_secs: Option<u64>) -> 
         &builder_net.guest_ip,
         &tenant_ssh_key_path(tenant_id),
         &spec.flake_ref,
+        &spec.role,
         &spec.profile,
         timeout,
     );
@@ -311,22 +312,69 @@ fn boot_builder(run_dir: &str, builder_net: &InstanceNet, tenant_net: &TenantNet
     Ok(pid)
 }
 
-/// Execute `nix build` inside the builder VM via SSH.
-/// Returns the Nix output path on success.
-fn run_nix_build(
+/// Construct the nix build attribute for a pool.
+///
+/// If `<flake_ref>/mvm-profiles.toml` exists (checked inside the builder VM),
+/// uses `tenant-<role>-<profile>`. Otherwise falls back to legacy `tenant-<profile>`.
+fn resolve_build_attribute(
     builder_ip: &str,
     ssh_key_path: &str,
     flake_ref: &str,
+    role: &super::config::Role,
     profile: &str,
-    timeout_secs: u64,
-) -> Result<String> {
+) -> String {
     let system = if cfg!(target_arch = "aarch64") {
         "aarch64-linux"
     } else {
         "x86_64-linux"
     };
 
-    let build_attr = format!("{}#packages.{}.tenant-{}", flake_ref, system, profile);
+    // Try to read mvm-profiles.toml from inside the builder VM
+    let manifest_check = shell::run_in_vm_stdout(&format!(
+        "ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
+            -i {key} root@{ip} \
+            'cat {flake}/mvm-profiles.toml 2>/dev/null || echo __NOT_FOUND__'",
+        key = ssh_key_path,
+        ip = builder_ip,
+        flake = flake_ref,
+    ));
+
+    if let Ok(content) = manifest_check
+        && !content.contains("__NOT_FOUND__")
+        && let Ok(manifest) = super::nix_manifest::NixManifest::from_toml(&content)
+        && manifest.resolve(role, profile).is_ok()
+    {
+        let attr = format!(
+            "{}#packages.{}.tenant-{}-{}",
+            flake_ref, system, role, profile
+        );
+        ui::info(&format!(
+            "Manifest found, using role-aware attribute: {}",
+            attr
+        ));
+        return attr;
+    }
+
+    // Fallback: legacy attribute without role
+    let attr = format!("{}#packages.{}.tenant-{}", flake_ref, system, profile);
+    ui::info(&format!(
+        "No manifest found, using legacy attribute: {}",
+        attr
+    ));
+    attr
+}
+
+/// Execute `nix build` inside the builder VM via SSH.
+/// Returns the Nix output path on success.
+fn run_nix_build(
+    builder_ip: &str,
+    ssh_key_path: &str,
+    flake_ref: &str,
+    role: &super::config::Role,
+    profile: &str,
+    timeout_secs: u64,
+) -> Result<String> {
+    let build_attr = resolve_build_attribute(builder_ip, ssh_key_path, flake_ref, role, profile);
 
     ui::info(&format!("Running: nix build {}", build_attr));
 

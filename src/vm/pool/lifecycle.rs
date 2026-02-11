@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use tracing::instrument;
 
-use super::config::{DesiredCounts, InstanceResources, PoolSpec, pool_config_path, pool_dir};
+use super::config::{DesiredCounts, InstanceResources, PoolSpec, Role, pool_config_path, pool_dir};
 use crate::infra::shell;
 use crate::vm::naming;
 use crate::vm::tenant::lifecycle::tenant_exists;
@@ -14,6 +14,7 @@ pub fn pool_create(
     flake_ref: &str,
     profile: &str,
     resources: InstanceResources,
+    role: Role,
 ) -> Result<PoolSpec> {
     naming::validate_id(tenant_id, "Tenant")?;
     naming::validate_id(pool_id, "Pool")?;
@@ -32,7 +33,7 @@ pub fn pool_create(
         tenant_id: tenant_id.to_string(),
         flake_ref: flake_ref.to_string(),
         profile: profile.to_string(),
-        role: Default::default(),
+        role,
         instance_resources: resources,
         desired_counts: DesiredCounts::default(),
         runtime_policy: Default::default(),
@@ -41,6 +42,7 @@ pub fn pool_create(
         metadata_enabled: false,
         pinned: false,
         critical: false,
+        secret_scopes: vec![],
     };
 
     let json = serde_json::to_string_pretty(&spec)?;
@@ -157,6 +159,7 @@ pub fn pool_destroy(tenant_id: &str, pool_id: &str, force: bool) -> Result<()> {
 mod tests {
     use super::*;
     use crate::infra::shell_mock;
+    use crate::vm::pool::config::Role;
 
     #[test]
     fn test_pool_create_and_load() {
@@ -170,7 +173,15 @@ mod tests {
             mem_mib: 1024,
             data_disk_mib: 0,
         };
-        let spec = pool_create("acme", "workers", "github:org/repo", "minimal", resources).unwrap();
+        let spec = pool_create(
+            "acme",
+            "workers",
+            "github:org/repo",
+            "minimal",
+            resources,
+            Role::default(),
+        )
+        .unwrap();
         assert_eq!(spec.pool_id, "workers");
         assert_eq!(spec.tenant_id, "acme");
         assert_eq!(spec.flake_ref, "github:org/repo");
@@ -179,6 +190,26 @@ mod tests {
         assert_eq!(loaded.pool_id, "workers");
         assert_eq!(loaded.instance_resources.vcpus, 2);
         assert_eq!(loaded.instance_resources.mem_mib, 1024);
+    }
+
+    #[test]
+    fn test_pool_create_with_role() {
+        let tenant_json = shell_mock::tenant_fixture("acme", 3, "10.240.3.0/24", "10.240.3.1");
+        let (_guard, _fs) = shell_mock::mock_fs()
+            .with_file("/var/lib/mvm/tenants/acme/tenant.json", &tenant_json)
+            .install();
+
+        let resources = InstanceResources {
+            vcpus: 2,
+            mem_mib: 1024,
+            data_disk_mib: 0,
+        };
+        let spec =
+            pool_create("acme", "gateways", ".", "minimal", resources, Role::Gateway).unwrap();
+        assert_eq!(spec.role, Role::Gateway);
+
+        let loaded = pool_load("acme", "gateways").unwrap();
+        assert_eq!(loaded.role, Role::Gateway);
     }
 
     #[test]
@@ -204,8 +235,16 @@ mod tests {
             mem_mib: 1024,
             data_disk_mib: 0,
         };
-        pool_create("acme", "workers", ".", "minimal", resources.clone()).unwrap();
-        pool_create("acme", "builders", ".", "python", resources).unwrap();
+        pool_create(
+            "acme",
+            "workers",
+            ".",
+            "minimal",
+            resources.clone(),
+            Role::default(),
+        )
+        .unwrap();
+        pool_create("acme", "builders", ".", "python", resources, Role::Builder).unwrap();
 
         let mut pools = pool_list("acme").unwrap();
         pools.sort();
@@ -220,7 +259,14 @@ mod tests {
             mem_mib: 1024,
             data_disk_mib: 0,
         };
-        let result = pool_create("nonexistent", "workers", ".", "minimal", resources);
+        let result = pool_create(
+            "nonexistent",
+            "workers",
+            ".",
+            "minimal",
+            resources,
+            Role::default(),
+        );
         assert!(result.is_err());
     }
 
@@ -236,7 +282,15 @@ mod tests {
             mem_mib: 1024,
             data_disk_mib: 0,
         };
-        pool_create("acme", "workers", ".", "minimal", resources).unwrap();
+        pool_create(
+            "acme",
+            "workers",
+            ".",
+            "minimal",
+            resources,
+            Role::default(),
+        )
+        .unwrap();
 
         pool_scale("acme", "workers", Some(3), Some(1), Some(2)).unwrap();
 
@@ -258,7 +312,15 @@ mod tests {
             mem_mib: 1024,
             data_disk_mib: 0,
         };
-        pool_create("acme", "workers", ".", "minimal", resources).unwrap();
+        pool_create(
+            "acme",
+            "workers",
+            ".",
+            "minimal",
+            resources,
+            Role::default(),
+        )
+        .unwrap();
         assert!(!pool_list("acme").unwrap().is_empty());
 
         pool_destroy("acme", "workers", true).unwrap();
@@ -301,7 +363,15 @@ mod tests {
             mem_mib: 1024,
             data_disk_mib: 0,
         };
-        pool_create("acme", "workers", ".", "minimal", resources).unwrap();
+        pool_create(
+            "acme",
+            "workers",
+            ".",
+            "minimal",
+            resources,
+            Role::default(),
+        )
+        .unwrap();
 
         // Create an instance — it will be in Created status (not Running),
         // so non-force destroy should succeed

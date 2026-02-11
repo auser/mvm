@@ -78,6 +78,12 @@ pub struct DesiredPool {
     pub seccomp_policy: String,
     #[serde(default = "default_compression")]
     pub snapshot_compression: String,
+    /// Gateway routing table (only meaningful for gateway role pools).
+    #[serde(default)]
+    pub routing_table: Option<crate::vm::pool::routing::RoutingTable>,
+    /// Per-integration secret scoping.
+    #[serde(default)]
+    pub secret_scopes: Vec<crate::vm::pool::config::SecretScope>,
 }
 
 fn default_seccomp() -> String {
@@ -519,6 +525,8 @@ pub fn generate_desired(node_id: &str) -> Result<DesiredState> {
                 runtime_policy: spec.runtime_policy,
                 seccomp_policy: spec.seccomp_policy,
                 snapshot_compression: spec.snapshot_compression,
+                routing_table: None,
+                secret_scopes: vec![],
             });
         }
 
@@ -541,6 +549,22 @@ pub fn generate_desired(node_id: &str) -> Result<DesiredState> {
         prune_unknown_tenants: false,
         prune_unknown_pools: false,
     })
+}
+
+// ============================================================================
+// Role-based reconcile ordering
+// ============================================================================
+
+/// Priority for reconcile ordering: lower = reconciled first.
+/// Gateways must be up before workers can route traffic through them.
+fn role_priority(role: &crate::vm::pool::config::Role) -> u8 {
+    use crate::vm::pool::config::Role;
+    match role {
+        Role::Gateway => 0,
+        Role::Builder => 1,
+        Role::Worker => 2,
+        Role::CapabilityImessage => 3,
+    }
 }
 
 // ============================================================================
@@ -621,8 +645,10 @@ fn reconcile_desired(desired: &DesiredState, prune: bool) -> Result<ReconcileRep
             report.tenants_created.push(dt.tenant_id.clone());
         }
 
-        // Phase 2: Ensure desired pools exist
-        for dp in &dt.pools {
+        // Phase 2: Ensure desired pools exist (sorted: gateways before workers)
+        let mut sorted_pools: Vec<&DesiredPool> = dt.pools.iter().collect();
+        sorted_pools.sort_by_key(|p| role_priority(&p.role));
+        for dp in &sorted_pools {
             let pool_exists = pool_load(&dt.tenant_id, &dp.pool_id).is_ok();
             if !pool_exists {
                 if let Err(e) = pool_create(
@@ -631,6 +657,7 @@ fn reconcile_desired(desired: &DesiredState, prune: bool) -> Result<ReconcileRep
                     &dp.flake_ref,
                     &dp.profile,
                     dp.instance_resources.clone(),
+                    dp.role.clone(),
                 ) {
                     report.errors.push(format!(
                         "Failed to create pool {}/{}: {}",
@@ -699,8 +726,11 @@ fn reconcile_desired(desired: &DesiredState, prune: bool) -> Result<ReconcileRep
     }
 
     // Phase 6: Run sleep policy evaluation for each pool
+    // Reverse role order: workers sleep before gateways
     for dt in &desired.tenants {
-        for dp in &dt.pools {
+        let mut sleep_pools: Vec<&DesiredPool> = dt.pools.iter().collect();
+        sleep_pools.sort_by_key(|p| std::cmp::Reverse(role_priority(&p.role)));
+        for dp in &sleep_pools {
             if let Ok(decisions) = policy::evaluate_pool(&dt.tenant_id, &dp.pool_id) {
                 for decision in decisions {
                     // Track deferrals (decisions that would have acted but min-runtime blocked)
@@ -1146,6 +1176,8 @@ mod tests {
                     runtime_policy: Default::default(),
                     seccomp_policy: "baseline".to_string(),
                     snapshot_compression: "zstd".to_string(),
+                    routing_table: None,
+                    secret_scopes: vec![],
                 }],
             }],
             prune_unknown_tenants: true,
@@ -1186,6 +1218,8 @@ mod tests {
                     runtime_policy: Default::default(),
                     seccomp_policy: "baseline".to_string(),
                     snapshot_compression: "none".to_string(),
+                    routing_table: None,
+                    secret_scopes: vec![],
                 }],
             }],
             prune_unknown_tenants: false,
@@ -1481,6 +1515,8 @@ mod tests {
                     runtime_policy: Default::default(),
                     seccomp_policy: "baseline".to_string(),
                     snapshot_compression: "none".to_string(),
+                    routing_table: None,
+                    secret_scopes: vec![],
                 }],
             }],
             prune_unknown_tenants: false,
@@ -1557,6 +1593,8 @@ mod tests {
                     runtime_policy: Default::default(),
                     seccomp_policy: "baseline".to_string(),
                     snapshot_compression: "none".to_string(),
+                    routing_table: None,
+                    secret_scopes: vec![],
                 }],
             }],
             prune_unknown_tenants: false,
@@ -1618,5 +1656,123 @@ mod tests {
             }
             _ => panic!("Wrong variant"),
         }
+    }
+
+    #[test]
+    fn test_role_priority_ordering() {
+        use crate::vm::pool::config::Role;
+        assert!(role_priority(&Role::Gateway) < role_priority(&Role::Builder));
+        assert!(role_priority(&Role::Builder) < role_priority(&Role::Worker));
+        assert!(role_priority(&Role::Worker) < role_priority(&Role::CapabilityImessage));
+    }
+
+    #[test]
+    fn test_reconcile_sorts_pools_by_role() {
+        use crate::vm::pool::config::Role;
+        let pools = [
+            DesiredPool {
+                pool_id: "workers".to_string(),
+                flake_ref: ".".to_string(),
+                profile: "minimal".to_string(),
+                role: Role::Worker,
+                instance_resources: InstanceResources {
+                    vcpus: 1,
+                    mem_mib: 512,
+                    data_disk_mib: 0,
+                },
+                desired_counts: DesiredCounts::default(),
+                runtime_policy: Default::default(),
+                seccomp_policy: "baseline".to_string(),
+                snapshot_compression: "none".to_string(),
+                routing_table: None,
+                secret_scopes: vec![],
+            },
+            DesiredPool {
+                pool_id: "gateways".to_string(),
+                flake_ref: ".".to_string(),
+                profile: "minimal".to_string(),
+                role: Role::Gateway,
+                instance_resources: InstanceResources {
+                    vcpus: 1,
+                    mem_mib: 512,
+                    data_disk_mib: 0,
+                },
+                desired_counts: DesiredCounts::default(),
+                runtime_policy: Default::default(),
+                seccomp_policy: "baseline".to_string(),
+                snapshot_compression: "none".to_string(),
+                routing_table: None,
+                secret_scopes: vec![],
+            },
+        ];
+
+        // Sort by role priority (same as reconcile does)
+        let mut sorted: Vec<&DesiredPool> = pools.iter().collect();
+        sorted.sort_by_key(|p| role_priority(&p.role));
+        assert_eq!(sorted[0].pool_id, "gateways");
+        assert_eq!(sorted[1].pool_id, "workers");
+
+        // Reverse for sleep ordering
+        let mut sleep_sorted: Vec<&DesiredPool> = pools.iter().collect();
+        sleep_sorted.sort_by_key(|p| std::cmp::Reverse(role_priority(&p.role)));
+        assert_eq!(sleep_sorted[0].pool_id, "workers");
+        assert_eq!(sleep_sorted[1].pool_id, "gateways");
+    }
+
+    #[test]
+    fn test_quickstart_desired_json() {
+        let json = r#"{
+            "schema_version": 1,
+            "node_id": "node-1",
+            "tenants": [
+                {
+                    "tenant_id": "acme",
+                    "network": {
+                        "tenant_net_id": 3,
+                        "ipv4_subnet": "10.240.3.0/24"
+                    },
+                    "quotas": {
+                        "max_vcpus": 16,
+                        "max_mem_mib": 32768,
+                        "max_running": 8,
+                        "max_warm": 4,
+                        "max_pools": 10,
+                        "max_instances_per_pool": 32,
+                        "max_disk_gib": 500
+                    },
+                    "pools": [
+                        {
+                            "pool_id": "workers",
+                            "flake_ref": "github:org/app",
+                            "profile": "minimal",
+                            "instance_resources": {
+                                "vcpus": 2,
+                                "mem_mib": 1024,
+                                "data_disk_mib": 0
+                            },
+                            "desired_counts": {
+                                "running": 3,
+                                "warm": 1,
+                                "sleeping": 0
+                            }
+                        }
+                    ]
+                }
+            ],
+            "prune_unknown_tenants": false,
+            "prune_unknown_pools": false
+        }"#;
+        let state: DesiredState = serde_json::from_str(json).unwrap();
+        assert_eq!(state.schema_version, 1);
+        assert_eq!(state.node_id, "node-1");
+        assert_eq!(state.tenants.len(), 1);
+        assert_eq!(state.tenants[0].tenant_id, "acme");
+        assert_eq!(state.tenants[0].network.tenant_net_id, 3);
+        assert_eq!(state.tenants[0].quotas.max_running, 8);
+        assert_eq!(state.tenants[0].quotas.max_warm, 4);
+        assert_eq!(state.tenants[0].pools.len(), 1);
+        assert_eq!(state.tenants[0].pools[0].pool_id, "workers");
+        assert_eq!(state.tenants[0].pools[0].desired_counts.running, 3);
+        assert_eq!(state.tenants[0].pools[0].desired_counts.warm, 1);
     }
 }

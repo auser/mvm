@@ -46,6 +46,8 @@ pub struct TenantInfo {
 pub struct PoolRow {
     #[tabled(rename = "POOL")]
     pub pool_path: String,
+    #[tabled(rename = "ROLE")]
+    pub role: String,
     #[tabled(rename = "PROFILE")]
     pub profile: String,
     #[tabled(rename = "VCPUS")]
@@ -65,6 +67,8 @@ pub struct PoolRow {
 pub struct PoolInfo {
     #[tabled(rename = "POOL")]
     pub pool_path: String,
+    #[tabled(rename = "ROLE")]
+    pub role: String,
     #[tabled(rename = "FLAKE")]
     pub flake_ref: String,
     #[tabled(rename = "PROFILE")]

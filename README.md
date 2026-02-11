@@ -203,7 +203,9 @@ Created --> Running <--> Warm --> Sleeping
 - **Warm** -- vCPUs paused via FC API, ready to resume instantly
 - **Sleeping** -- Delta snapshot on disk, FC process killed, near-zero resource usage
 - **Stopped** -- No process, no snapshot; can be restarted fresh
-- **Destroyed** -- terminal state, all resources cleaned up
+- **Destroyed** -- Terminal state, all resources cleaned up
+
+Transitions are subject to **minimum runtime enforcement**: instances must stay Running for a configurable duration before becoming eligible for Warm, and Warm before eligible for Sleeping. See [docs/minimum-runtime.md](docs/minimum-runtime.md).
 
 ## Networking
 
@@ -240,8 +242,8 @@ src/
     protocol.rs            # IPC types (HostdRequest/HostdResponse)
     server.rs              # Privileged executor daemon
     client.rs              # Agentd client for hostd IPC
-  sleep/                   # Sleep policy + idle metrics
-  worker/                  # Guest worker lifecycle hooks
+  sleep/                   # Sleep policy + idle metrics + minimum runtime enforcement
+  worker/                  # Guest worker lifecycle hooks + vsock guest agent client
 ```
 
 See [docs/architecture.md](docs/architecture.md) for the full module map.
@@ -253,7 +255,7 @@ Production deployments use a split-process model for privilege separation:
 - **mvm-hostd** runs as root with minimal capabilities, executing only pre-defined privileged operations
 - **mvm-agentd** runs fully unprivileged, handling reconciliation and the QUIC API
 
-Additional security features: LUKS-encrypted data volumes, AES-256-GCM snapshot encryption, Ed25519 signed desired state (unsigned requests rejected in production), mTLS transport, per-tenant network isolation, jailer chroot + UID isolation, seccomp filters, cgroup resource limits, and memory hygiene (`Zeroizing` for all key material).
+Additional security features: LUKS-encrypted data volumes, AES-256-GCM snapshot encryption, Ed25519 signed desired state (unsigned requests rejected in production), mTLS transport, per-tenant network isolation, jailer chroot + UID isolation, seccomp filters, cgroup resource limits, memory hygiene (`Zeroizing` for all key material), and vsock-based guest communication (no SSH daemon in production guests).
 
 See [docs/security.md](docs/security.md) for the full threat model and hardening details.
 
@@ -281,6 +283,7 @@ cargo run -- --help
 - [Networking](docs/networking.md) -- cluster-wide subnets, bridges, isolation
 - [CLI Reference](docs/cli.md) -- complete command reference
 - [Agent & Reconciliation](docs/agent.md) -- desired state schema, reconcile loop, QUIC API
+- [Minimum Runtime](docs/minimum-runtime.md) -- runtime policy, vsock drain protocol, drive model
 
 ## License
 

@@ -36,6 +36,11 @@ pub enum GuestRequest {
     Wake,
     /// Health probe.
     Ping,
+    /// Query status of all managed integrations.
+    IntegrationStatus,
+    /// Checkpoint named integrations before sleep.
+    /// Sent before SleepPrep so integrations can persist session state.
+    CheckpointIntegrations { integrations: Vec<String> },
 }
 
 /// Response from guest vsock agent to host.
@@ -57,6 +62,98 @@ pub enum GuestResponse {
     Pong,
     /// Error from guest agent.
     Error { message: String },
+    /// Per-integration status report.
+    IntegrationStatusReport {
+        integrations: Vec<crate::worker::integrations::IntegrationStateReport>,
+    },
+    /// Result of checkpointing integrations before sleep.
+    CheckpointResult {
+        success: bool,
+        /// Names of integrations that failed to checkpoint.
+        failed: Vec<String>,
+        detail: Option<String>,
+    },
+}
+
+// ============================================================================
+// Host-bound protocol (guest → host, reverse direction)
+// ============================================================================
+
+/// Port the host listens on for host-bound requests from gateway VMs.
+pub const HOST_BOUND_PORT: u32 = 53;
+
+/// Request FROM a guest VM (gateway) TO the host agent.
+/// Used for wake-on-demand: the gateway VM asks the host to wake a worker.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HostBoundRequest {
+    /// Wake a sleeping instance.
+    WakeInstance {
+        tenant_id: String,
+        pool_id: String,
+        instance_id: String,
+    },
+    /// Query current status of an instance.
+    QueryInstanceStatus {
+        tenant_id: String,
+        pool_id: String,
+        instance_id: String,
+    },
+}
+
+/// Response from host agent to a guest VM's host-bound request.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub enum HostBoundResponse {
+    /// Result of a wake request.
+    WakeResult {
+        success: bool,
+        detail: Option<String>,
+    },
+    /// Status of queried instance.
+    InstanceStatus {
+        status: String,
+        guest_ip: Option<String>,
+    },
+    /// Error from host agent.
+    Error { message: String },
+}
+
+/// Read a single length-prefixed JSON frame from a stream.
+/// Returns the deserialized value.
+pub fn read_frame<T: serde::de::DeserializeOwned>(stream: &mut UnixStream) -> Result<T> {
+    let mut len_buf = [0u8; 4];
+    stream
+        .read_exact(&mut len_buf)
+        .with_context(|| "Failed to read frame length")?;
+    let frame_len = u32::from_be_bytes(len_buf) as usize;
+
+    if frame_len > MAX_FRAME_SIZE {
+        bail!(
+            "Frame too large: {} bytes (max {})",
+            frame_len,
+            MAX_FRAME_SIZE
+        );
+    }
+
+    let mut buf = vec![0u8; frame_len];
+    stream
+        .read_exact(&mut buf)
+        .with_context(|| "Failed to read frame body")?;
+
+    serde_json::from_slice(&buf).with_context(|| "Failed to deserialize frame")
+}
+
+/// Write a single length-prefixed JSON frame to a stream.
+pub fn write_frame<T: Serialize>(stream: &mut UnixStream, value: &T) -> Result<()> {
+    let data = serde_json::to_vec(value).with_context(|| "Failed to serialize frame")?;
+    let len = (data.len() as u32).to_be_bytes();
+    stream
+        .write_all(&len)
+        .with_context(|| "Failed to write frame length")?;
+    stream
+        .write_all(&data)
+        .with_context(|| "Failed to write frame body")?;
+    stream.flush()?;
+    Ok(())
 }
 
 // ============================================================================
@@ -198,6 +295,46 @@ pub fn ping(instance_dir: &str) -> Result<bool> {
     Ok(matches!(resp, GuestResponse::Pong))
 }
 
+/// Query integration status from the guest agent.
+pub fn query_integration_status(
+    instance_dir: &str,
+) -> Result<Vec<crate::worker::integrations::IntegrationStateReport>> {
+    let mut stream = connect(instance_dir, DEFAULT_TIMEOUT_SECS)?;
+    let resp = send_request(&mut stream, &GuestRequest::IntegrationStatus)?;
+
+    match resp {
+        GuestResponse::IntegrationStatusReport { integrations } => Ok(integrations),
+        GuestResponse::Error { message } => {
+            bail!("Guest integration status error: {}", message);
+        }
+        _ => bail!("Unexpected response to IntegrationStatus"),
+    }
+}
+
+/// Request the guest to checkpoint named integrations before sleep.
+///
+/// Returns Ok(true) if all integrations checkpointed successfully,
+/// Ok(false) if any failed.
+pub fn checkpoint_integrations(
+    instance_dir: &str,
+    integrations: Vec<String>,
+    timeout_secs: u64,
+) -> Result<bool> {
+    let mut stream = connect(instance_dir, timeout_secs)?;
+    let resp = send_request(
+        &mut stream,
+        &GuestRequest::CheckpointIntegrations { integrations },
+    )?;
+
+    match resp {
+        GuestResponse::CheckpointResult { success, .. } => Ok(success),
+        GuestResponse::Error { message } => {
+            bail!("Guest checkpoint error: {}", message);
+        }
+        _ => bail!("Unexpected response to CheckpointIntegrations"),
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -215,6 +352,10 @@ mod tests {
             },
             GuestRequest::Wake,
             GuestRequest::Ping,
+            GuestRequest::IntegrationStatus,
+            GuestRequest::CheckpointIntegrations {
+                integrations: vec!["whatsapp".to_string(), "telegram".to_string()],
+            },
         ];
 
         for req in &variants {
@@ -228,6 +369,8 @@ mod tests {
 
     #[test]
     fn test_guest_response_roundtrip() {
+        use crate::worker::integrations::{IntegrationStateReport, IntegrationStatus};
+
         let variants: Vec<GuestResponse> = vec![
             GuestResponse::WorkerStatus {
                 status: "idle".to_string(),
@@ -241,6 +384,19 @@ mod tests {
             GuestResponse::Pong,
             GuestResponse::Error {
                 message: "oops".to_string(),
+            },
+            GuestResponse::IntegrationStatusReport {
+                integrations: vec![IntegrationStateReport {
+                    name: "whatsapp".to_string(),
+                    status: IntegrationStatus::Active,
+                    last_checkpoint_at: Some("2025-06-01T12:00:00Z".to_string()),
+                    state_size_bytes: 8192,
+                }],
+            },
+            GuestResponse::CheckpointResult {
+                success: true,
+                failed: vec![],
+                detail: Some("all checkpointed".to_string()),
             },
         ];
 
@@ -290,5 +446,91 @@ mod tests {
     #[test]
     fn test_max_frame_size() {
         assert_eq!(MAX_FRAME_SIZE, 256 * 1024);
+    }
+
+    #[test]
+    fn test_checkpoint_request_serde() {
+        let req = GuestRequest::CheckpointIntegrations {
+            integrations: vec!["whatsapp".to_string(), "signal".to_string()],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        assert!(json.contains("CheckpointIntegrations"));
+        assert!(json.contains("whatsapp"));
+        assert!(json.contains("signal"));
+        let parsed: GuestRequest = serde_json::from_str(&json).unwrap();
+        let json2 = serde_json::to_string(&parsed).unwrap();
+        assert_eq!(json, json2);
+    }
+
+    #[test]
+    fn test_host_bound_request_roundtrip() {
+        let variants: Vec<HostBoundRequest> = vec![
+            HostBoundRequest::WakeInstance {
+                tenant_id: "alice".to_string(),
+                pool_id: "workers".to_string(),
+                instance_id: "i-abc123".to_string(),
+            },
+            HostBoundRequest::QueryInstanceStatus {
+                tenant_id: "alice".to_string(),
+                pool_id: "workers".to_string(),
+                instance_id: "i-abc123".to_string(),
+            },
+        ];
+
+        for req in &variants {
+            let json = serde_json::to_string(req).unwrap();
+            let parsed: HostBoundRequest = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn test_host_bound_response_roundtrip() {
+        let variants: Vec<HostBoundResponse> = vec![
+            HostBoundResponse::WakeResult {
+                success: true,
+                detail: Some("woke i-abc123".to_string()),
+            },
+            HostBoundResponse::InstanceStatus {
+                status: "Running".to_string(),
+                guest_ip: Some("10.240.1.5".to_string()),
+            },
+            HostBoundResponse::Error {
+                message: "instance not found".to_string(),
+            },
+        ];
+
+        for resp in &variants {
+            let json = serde_json::to_string(resp).unwrap();
+            let parsed: HostBoundResponse = serde_json::from_str(&json).unwrap();
+            let json2 = serde_json::to_string(&parsed).unwrap();
+            assert_eq!(json, json2);
+        }
+    }
+
+    #[test]
+    fn test_host_bound_port_constant() {
+        assert_eq!(HOST_BOUND_PORT, 53);
+    }
+
+    #[test]
+    fn test_checkpoint_result_failure() {
+        let resp = GuestResponse::CheckpointResult {
+            success: false,
+            failed: vec!["whatsapp".to_string()],
+            detail: Some("session locked".to_string()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let parsed: GuestResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            GuestResponse::CheckpointResult {
+                success, failed, ..
+            } => {
+                assert!(!success);
+                assert_eq!(failed, vec!["whatsapp"]);
+            }
+            _ => panic!("wrong variant"),
+        }
     }
 }

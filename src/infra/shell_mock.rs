@@ -257,6 +257,7 @@ pub fn pool_fixture(tenant_id: &str, pool_id: &str) -> String {
         metadata_enabled: false,
         pinned: false,
         critical: false,
+        secret_scopes: vec![],
     };
     serde_json::to_string_pretty(&spec).unwrap()
 }

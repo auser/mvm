@@ -37,6 +37,7 @@ The coordinator produces a desired state document scoped to a specific node:
           "pool_id": "workers",
           "flake_ref": "github:org/openclaw-worker?rev=abc123",
           "profile": "minimal",
+          "role": "worker",
           "instance_resources": {
             "vcpus": 2,
             "mem_mib": 1024,
@@ -46,6 +47,12 @@ The coordinator produces a desired state document scoped to a specific node:
             "running": 3,
             "warm": 1,
             "sleeping": 2
+          },
+          "runtime_policy": {
+            "min_running_seconds": 60,
+            "min_warm_seconds": 30,
+            "drain_timeout_seconds": 30,
+            "graceful_shutdown_seconds": 15
           },
           "seccomp_policy": "baseline",
           "snapshot_compression": "zstd"
@@ -187,8 +194,12 @@ The daemon also runs sleep policy evaluation alongside reconciliation:
   - idle > T1 (default 5min) -> warm
   - idle > T2 (default 15min) -> sleep
   - memory pressure -> sleep coldest instances first
+- **Minimum runtime enforcement** -- instances must stay Running for `min_running_seconds` before eligible for Warm, and Warm for `min_warm_seconds` before eligible for Sleeping. Deferred transitions are logged as `TransitionDeferred` audit events and counted in the `mvm_instances_deferred_total` Prometheus metric.
+- **Vsock drain protocol** -- before sleeping, the host requests a cooperative drain via vsock. The guest agent finishes in-flight work, flushes data, and ACKs. If no ACK within `drain_timeout_seconds`, sleep is forced.
 - **Guards** -- never sleep pinned/critical pools
 - **Worker hooks** -- guest signals at `/run/mvm/worker-{ready,idle,busy}` inform policy decisions
+
+See [minimum-runtime.md](minimum-runtime.md) for full details on the runtime policy, drain protocol, and drive model.
 
 ## Graceful Shutdown
 

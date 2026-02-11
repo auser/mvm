@@ -6,5 +6,6 @@ pub mod node;
 pub mod observability;
 pub mod security;
 pub mod sleep;
+pub mod templates;
 pub mod vm;
 pub mod worker;

@@ -35,7 +35,67 @@ mvm status             # should show microVM running
 mvm stop               # clean shutdown
 ```
 
-## 2. Tenant Lifecycle
+## 2. Add Host (Onboarding)
+
+Prepare a machine to join the fleet with a single command:
+
+```bash
+# Dev mode (self-signed certs, no signing key)
+mvm add host
+
+# Production mode (with CA and coordinator signing key)
+mvm add host --ca ca.crt --signing-key coordinator.pub --production
+```
+
+**Expected**: environment bootstrapped (Lima on macOS, Firecracker, kernel, rootfs), mTLS certificates initialized, signing key copied to `/etc/mvm/trusted_keys/` (if provided). Output shows next step: `mvm agent serve`.
+
+Verify with:
+```bash
+mvm status             # Lima + FC installed
+mvm node info          # node UUID, arch, vCPUs, memory
+```
+
+## 3. New Deployment (Onboarding)
+
+Create a full OpenClaw deployment end-to-end with a single command:
+
+```bash
+# Auto-allocate network, build, and scale
+mvm new openclaw smoke-app
+
+# With explicit network overrides
+mvm new openclaw smoke-app --net-id 99 --subnet 10.240.99.0/24
+
+# With a custom flake reference
+mvm new openclaw smoke-app --flake github:myorg/myflake
+```
+
+**Expected**: tenant `smoke-app` created with default quotas, gateway pool created (role: gateway, 2 vCPU, 1024 MiB), worker pool created (role: worker, 2 vCPU, 1024 MiB, 2048 MiB data disk), both pools built, gateway scaled to 1 running, workers scaled to 2 running + 1 warm. Output shows deployment summary and `mvm connect smoke-app` as next step.
+
+Verify with:
+```bash
+mvm tenant list                          # smoke-app appears
+mvm tenant info smoke-app                # shows quotas and network
+mvm pool list smoke-app                  # gateways + workers
+mvm pool info smoke-app/gateways         # role: gateway
+mvm pool info smoke-app/workers          # role: worker
+mvm instance list --tenant smoke-app     # instances across both pools
+```
+
+## 4. Connect Dashboard (Onboarding)
+
+View the deployment dashboard:
+
+```bash
+mvm connect smoke-app
+mvm connect smoke-app --json    # machine-readable output
+```
+
+**Expected**: shows network info (gateway IP, subnet, bridge), pool summary (roles, resources, counts), instance table (IDs, status, IPs), and quick reference commands for secrets, scaling, and instance listing.
+
+## 5. Tenant Lifecycle (Granular)
+
+Test the manual tenant workflow:
 
 ```bash
 # Create a tenant with coordinator-assigned network
@@ -54,10 +114,15 @@ mvm net verify
 
 **Expected**: tenant appears in list, info shows quotas and network config, bridge `br-tenant-99` exists.
 
-## 3. Pool Lifecycle
+## 6. Pool Lifecycle (Granular)
 
 ```bash
-# Create a pool
+# Create a pool with explicit role
+mvm pool create smoke-test/gateways \
+    --flake . --profile minimal \
+    --cpus 2 --mem 1024 --role gateway
+
+# Create a worker pool (default role)
 mvm pool create smoke-test/workers \
     --flake . --profile minimal \
     --cpus 2 --mem 1024
@@ -73,12 +138,12 @@ mvm pool build smoke-test/workers
 mvm pool scale smoke-test/workers --running 2 --warm 1 --sleeping 1
 ```
 
-**Expected**: pool appears in list, info shows flake ref / resources / desired counts. Build produces kernel + rootfs under `artifacts/revisions/`.
+**Expected**: pools appear in list, info shows flake ref / resources / role / desired counts. Build produces kernel + rootfs under `artifacts/revisions/`.
 
-## 4. Instance Lifecycle
+## 7. Instance Lifecycle
 
 ```bash
-# Create instances manually
+# List instances
 mvm instance list --tenant smoke-test --pool workers
 
 # Start an instance
@@ -100,7 +165,7 @@ mvm instance list --tenant smoke-test --pool workers   # should show Stopped
 
 **Expected**: instance transitions Created -> Running -> Stopped. SSH works, stats show PID/IP/TAP.
 
-## 5. Sleep / Wake Round-Trip
+## 8. Sleep / Wake Round-Trip
 
 ```bash
 # Start the instance again
@@ -121,7 +186,7 @@ mvm instance stats smoke-test/workers/$INSTANCE_ID
 
 **Expected**: instance transitions Running -> Sleeping -> Running. Snapshot created and restored. IP and TAP device preserved.
 
-## 6. Agent Reconcile (One-Shot)
+## 9. Agent Reconcile (One-Shot)
 
 Generate desired state from the tenants and pools you just created:
 
@@ -146,7 +211,7 @@ You can also write `desired.json` by hand or generate it from your own tooling. 
 
 **Expected**: agent creates/starts instances to match desired counts. Two instances should be Running.
 
-## 7. Agent Daemon + QUIC Round-Trip
+## 10. Agent Daemon + QUIC Round-Trip
 
 ```bash
 # Generate certificates
@@ -177,7 +242,7 @@ kill $AGENT_PID
 
 **Expected**: QUIC connection succeeds with mTLS. Status returns node info. Push accepted.
 
-## 8. Bridge Verification
+## 11. Bridge Verification
 
 ```bash
 mvm net verify
@@ -186,7 +251,7 @@ mvm net verify --json
 
 **Expected**: clean report — all tenant bridges correct, subnets match, no cross-tenant leakage.
 
-## 9. Operational Commands
+## 12. Operational Commands
 
 ```bash
 # Disk usage
@@ -205,10 +270,13 @@ mvm completions bash > /dev/null && echo "bash completions OK"
 mvm completions zsh > /dev/null && echo "zsh completions OK"
 ```
 
-## 10. Teardown
+## 13. Teardown
 
 ```bash
-# Destroy tenant (cascades to pools and instances)
+# Destroy the onboarding deployment
+mvm tenant destroy smoke-app --force
+
+# Destroy the granular smoke-test tenant
 mvm tenant destroy smoke-test --force
 
 # Verify clean state
@@ -227,6 +295,8 @@ mvm node disk                  # storage freed
 | `instance start` hangs | Check FC logs: `mvm instance logs <path>` |
 | Bridge not created | Run as root or check `CAP_NET_ADMIN` capability |
 | QUIC connection refused | Verify cert paths and that agent is listening on the correct port |
+| `mvm new` fails at build | Ensure bootstrap completed — run `mvm add host` first |
+| `mvm connect` shows no instances | Deployment may still be building — check `mvm pool info <name>/workers` |
 
 ## Notes
 
@@ -234,3 +304,4 @@ mvm node disk                  # storage freed
 - On native Linux, operations run directly. Ensure the user has appropriate capabilities (`CAP_NET_ADMIN`, access to `/dev/kvm`).
 - The smoke test is inherently stateful — run teardown between test runs.
 - Sleep/wake requires that Firecracker snapshot support is available (check FC version >= 1.0).
+- Sections 2–4 test the onboarding commands (`add host`, `new`, `connect`). Sections 5–6 test the same operations via granular CLI commands.

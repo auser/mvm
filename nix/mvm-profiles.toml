@@ -1,0 +1,36 @@
+# mvm-profiles.toml — Maps (role, profile) to NixOS module paths.
+#
+# This manifest tells the mvm build system which .nix modules to compose
+# for each role+profile combination. When present in a flake directory,
+# the build attribute becomes: tenant-<role>-<profile>
+# Without this file, the legacy tenant-<profile> attribute is used.
+
+[meta]
+version = 1
+
+[profiles.minimal]
+module = "guests/profiles/minimal.nix"
+
+[profiles.python]
+module = "guests/profiles/python.nix"
+
+[roles.gateway]
+module = "roles/gateway.nix"
+requires_config_drive = true
+requires_secrets_drive = true
+
+[roles.worker]
+module = "roles/worker.nix"
+requires_config_drive = false
+requires_secrets_drive = true
+
+[roles.builder]
+module = "roles/builder.nix"
+requires_config_drive = false
+requires_secrets_drive = false
+
+[roles.capability-imessage]
+module = "roles/capability-imessage.nix"
+requires_config_drive = false
+requires_secrets_drive = false
+

@@ -112,6 +112,20 @@ pub struct PoolSpec {
     /// If true, reconcile won't touch this pool at all.
     #[serde(default)]
     pub critical: bool,
+    /// Per-integration secret scoping. When non-empty, secrets are split
+    /// into per-integration directories on the secrets drive.
+    #[serde(default)]
+    pub secret_scopes: Vec<SecretScope>,
+}
+
+/// Scoped secret delivery: only give an integration the secrets it needs.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SecretScope {
+    /// Integration name (e.g. "whatsapp", "telegram").
+    pub integration: String,
+    /// Secret key names to include for this integration.
+    /// Empty means include all keys (no filtering).
+    pub keys: Vec<String>,
 }
 
 fn default_seccomp() -> String {
@@ -220,6 +234,7 @@ mod tests {
             metadata_enabled: false,
             pinned: false,
             critical: false,
+            secret_scopes: vec![],
         };
 
         let json = serde_json::to_string(&spec).unwrap();
@@ -289,5 +304,44 @@ mod tests {
             pool_config_data_dir("acme", "gateways"),
             "/var/lib/mvm/tenants/acme/pools/gateways/config"
         );
+    }
+
+    #[test]
+    fn test_secret_scope_serde_roundtrip() {
+        let scopes = vec![
+            SecretScope {
+                integration: "whatsapp".to_string(),
+                keys: vec![
+                    "WHATSAPP_API_KEY".to_string(),
+                    "WHATSAPP_SECRET".to_string(),
+                ],
+            },
+            SecretScope {
+                integration: "telegram".to_string(),
+                keys: vec!["TELEGRAM_BOT_TOKEN".to_string()],
+            },
+        ];
+
+        let json = serde_json::to_string(&scopes).unwrap();
+        let parsed: Vec<SecretScope> = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.len(), 2);
+        assert_eq!(parsed[0].integration, "whatsapp");
+        assert_eq!(parsed[0].keys.len(), 2);
+        assert_eq!(parsed[1].integration, "telegram");
+    }
+
+    #[test]
+    fn test_pool_spec_backward_compat_secret_scopes() {
+        // JSON without secret_scopes should parse fine (defaults to empty vec)
+        let json = r#"{
+            "pool_id": "workers",
+            "tenant_id": "acme",
+            "flake_ref": ".",
+            "profile": "minimal",
+            "instance_resources": {"vcpus": 1, "mem_mib": 512},
+            "desired_counts": {"running": 1, "warm": 0, "sleeping": 0}
+        }"#;
+        let parsed: PoolSpec = serde_json::from_str(json).unwrap();
+        assert!(parsed.secret_scopes.is_empty());
     }
 }

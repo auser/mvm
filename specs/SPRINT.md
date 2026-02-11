@@ -1,4 +1,4 @@
-# mvm Sprint 7: Role-Based NixOS Profiles & Reconcile Ordering
+# mvm Sprint 9: OpenClaw Support — Role + Wake API + Deploy Config
 
 Previous sprints:
 - [SPRINT-1-foundation.md](sprints/SPRINT-1-foundation.md) (complete)
@@ -7,78 +7,65 @@ Previous sprints:
 - Sprint 4: Security Baseline 90% (complete)
 - Sprint 5: Final Security Hardening (complete)
 - [SPRINT-6-minimum-runtime.md](sprints/SPRINT-6-minimum-runtime.md) (complete)
+- [SPRINT-7-role-profiles.md](sprints/SPRINT-7-role-profiles.md) (complete)
+- [SPRINT-8-integration-lifecycle.md](sprints/SPRINT-8-integration-lifecycle.md) (complete)
 
-Sprint 7 implements role-based NixOS microVM profiles and reconcile ordering. Based on [specs/plans/8-configuration-and-isolation.md](plans/8-configuration-and-isolation.md).
+Sprint 9 adds OpenClaw as a first-class deployment target on mvm. OpenClaw is a
+personal AI assistant gateway (Telegram/Discord -> Claude AI -> local CLI tools)
+that runs as per-user worker VMs with sleep/wake on demand.
 
-The Role enum, RuntimePolicy, instance timestamps, config drive, vsock, and sleep eligibility were implemented in Sprint 6. This sprint adds the NixOS module system, build integration, CLI support, and reconcile ordering.
+Full spec: [specs/plans/11-openclaw-support.md](plans/11-openclaw-support.md)
 
 ---
 
-## Phase 1: pool_create with Role Parameter
-**Status: NOT STARTED**
+## Phase 1: CapabilityOpenclaw Role + Template Update
+**Status: COMPLETE**
 
-Pass the role through from CLI and reconcile into pool_create().
+New `CapabilityOpenclaw` role that combines worker patterns (vsock, integration
+manager, sleep-prep) with gateway patterns (config drive, secrets drive) plus
+OpenClaw-specific services (Node.js gateway, environment assembler, wake handler).
 
-- [ ] `src/vm/pool/lifecycle.rs` — add `role: Role` parameter to `pool_create()`
-- [ ] `src/agent.rs` — pass `dp.role.clone()` to `pool_create()` in reconcile
-- [ ] Tests: pool_create with explicit role, verify persisted in pool.json
+- [x] `src/vm/pool/config.rs` — `CapabilityOpenclaw` variant in Role enum + Display + serde tests
+- [x] `src/main.rs` — `parse_role()` accepts `capability-openclaw`, updated help text
+- [x] `src/agent.rs` — `role_priority(CapabilityOpenclaw) = 3` (same as capabilities)
+- [x] `src/vm/pool/nix_manifest.rs` — SAMPLE_TOML + resolve/requirements tests for new role
+- [x] `nix/mvm-profiles.toml` — `[roles.capability-openclaw]` with config_drive + secrets_drive
+- [x] `nix/roles/openclaw.nix` — **NEW** NixOS module: config drive mount, env assembler,
+  Node.js gateway service, worker agent, integration manager, sleep-prep, wake handler,
+  TCP keepalive sysctl, openclaw system user
+- [x] `nix/flake.nix` — `tenant-capability-openclaw-{minimal,python}` outputs + `mvm-role-openclaw` module export
+- [x] `src/templates.rs` — openclaw template workers changed to `Role::CapabilityOpenclaw`, mem_mib bumped to 2048
 
-## Phase 2: CLI --role Argument
-**Status: NOT STARTED**
+## Phase 2: Vsock Wake Protocol
+**Status: COMPLETE**
 
-Add `--role` to `mvm pool create`.
+Guest-to-host communication so gateway VMs can tell the host agent to wake sleeping worker VMs.
 
-- [ ] `src/main.rs` — add `--role` arg to `PoolCmd::Create` (default: "worker")
-- [ ] `src/main.rs` — parse string to `Role` enum, pass to `pool_create()`
-- [ ] `src/infra/display.rs` — add `role` to PoolRow and PoolInfo display structs
+- [x] `src/worker/vsock.rs` — `HostBoundRequest` enum: `WakeInstance`, `QueryInstanceStatus`
+- [x] `src/worker/vsock.rs` — `HostBoundResponse` enum: `WakeResult`, `InstanceStatus`, `Error`
+- [x] `src/worker/vsock.rs` — `read_frame()` / `write_frame()` helpers for generic length-prefixed JSON
+- [x] `src/worker/vsock.rs` — `HOST_BOUND_PORT = 53` constant
+- [x] Tests: request/response serde roundtrip, port constant (3 new tests)
 
-## Phase 3: Reconcile Ordering (Gateway Before Worker)
-**Status: NOT STARTED**
+## Phase 3: Config File + Deploy Command
+**Status: COMPLETE**
 
-Ensure gateway pools are reconciled before worker pools within each tenant.
+Config file for `mvm new --config` and standalone `mvm deploy manifest.toml`.
 
-- [ ] `src/agent.rs` — `role_priority()` function: Gateway=0, Builder=1, Worker=2, CapabilityImessage=3
-- [ ] `src/agent.rs` — Phase 2-3: sort `dt.pools` by role_priority before iteration
-- [ ] `src/agent.rs` — Phase 6: reverse sort for sleep (workers sleep before gateways)
-- [ ] Tests: verify ordering with mixed-role pools
+- [x] `src/templates.rs` — `DeployConfig`, `SecretRef`, `OverrideConfig`, `PoolOverride` types
+- [x] `src/templates.rs` — `DeploymentManifest`, `ManifestTenant`, `ManifestPool` types
+- [x] `src/main.rs` — `--config <path>` flag on `Commands::New`
+- [x] `src/main.rs` — `Commands::Deploy { manifest, watch, interval }` command
+- [x] `src/main.rs` — `cmd_new()` applies config overrides (flake, vcpus, mem, instances)
+- [x] `src/main.rs` — `cmd_deploy()` creates tenant/pools from manifest, supports `--watch`
+- [x] Tests: deploy config parse, minimal config, manifest parse, manifest defaults (4 new tests)
 
-## Phase 4: NixOS Manifest Parser (mvm-profiles.toml)
-**Status: NOT STARTED**
+## Phase 4: Documentation
+**Status: COMPLETE**
 
-Config-file-driven Nix build: manifest maps (role, profile) → .nix module paths.
-
-- [ ] `src/vm/pool/nix_manifest.rs` — NixManifest, ProfileEntry, RoleEntry structs
-- [ ] `src/vm/pool/nix_manifest.rs` — load(), resolve(), role_requirements()
-- [ ] `src/vm/pool/mod.rs` — add `pub mod nix_manifest;`
-- [ ] Tests: TOML parse roundtrip, resolve valid/invalid, role_requirements
-
-## Phase 5: Build Integration
-**Status: NOT STARTED**
-
-Update nix build to use manifest-driven role+profile attribute resolution.
-
-- [ ] `src/vm/pool/build.rs` — try loading mvm-profiles.toml from flake_ref
-- [ ] `src/vm/pool/build.rs` — if found: `tenant-<role>-<profile>`, else fallback to `tenant-<profile>`
-- [ ] Tests: build attribute construction with and without manifest
-
-## Phase 6: Nix Role Modules
-**Status: NOT STARTED**
-
-Create NixOS role modules and update flake for role+profile combinations.
-
-- [ ] `nix/roles/gateway.nix` — gateway service, hostname, config drive consumption
-- [ ] `nix/roles/worker.nix` — worker agent service
-- [ ] `nix/roles/builder.nix` — builder capabilities (from existing nix-builder)
-- [ ] `nix/roles/capability-imessage.nix` — placeholder
-- [ ] `nix/mvm-profiles.toml` — reference manifest mapping roles+profiles to modules
-- [ ] `nix/flake.nix` — mkGuest with roleModules, combined tenant-role-profile outputs
-- [ ] Backward compat: keep legacy `tenant-minimal`, `tenant-python` outputs
-
-## Phase 7: Documentation
-**Status: NOT STARTED**
-
-- [ ] `docs/roles.md` — role semantics, drive model, reconcile ordering, NixOS modules
-- [ ] `specs/SPRINT.md` — update with final metrics
+- [x] `docs/roles.md` — added CapabilityOpenclaw section
+- [x] `docs/cli.md` — added `mvm new --config` and `mvm deploy` sections
+- [x] `specs/SPRINT.md` — Sprint 9 current
 
 ---
 
@@ -86,26 +73,25 @@ Create NixOS role modules and update flake for role+profile combinations.
 
 | Metric | Value |
 |--------|-------|
-| Lib tests | TBD |
-| Integration tests | TBD |
-| Total tests | TBD |
+| Lib tests | 315 (+19) |
+| Integration tests | 10 |
+| Total tests | 325 |
 | Clippy warnings | 0 |
+| New files | `nix/roles/openclaw.nix`, `specs/sprints/SPRINT-8-integration-lifecycle.md` |
 
-## Files to Create/Modify
+## Files Created/Modified
 
 | File | Changes |
 |------|---------|
-| `src/vm/pool/nix_manifest.rs` | **NEW** — TOML manifest parser |
-| `src/vm/pool/mod.rs` | Add `pub mod nix_manifest` |
-| `src/vm/pool/lifecycle.rs` | `pool_create()` gains `role` param |
-| `src/vm/pool/build.rs` | Manifest-driven build attribute |
-| `src/agent.rs` | Role ordering in reconcile, pass role to pool_create |
-| `src/main.rs` | `--role` CLI arg for pool create |
-| `src/infra/display.rs` | Role in pool display structs |
-| `nix/roles/gateway.nix` | **NEW** — gateway role module |
-| `nix/roles/worker.nix` | **NEW** — worker role module |
-| `nix/roles/builder.nix` | **NEW** — builder role module |
-| `nix/roles/capability-imessage.nix` | **NEW** — placeholder |
-| `nix/mvm-profiles.toml` | **NEW** — reference manifest |
-| `nix/flake.nix` | roleModules param, combined outputs |
-| `docs/roles.md` | **NEW** — role documentation |
+| `specs/plans/11-openclaw-support.md` | **NEW** — full OpenClaw support spec |
+| `src/vm/pool/config.rs` | `CapabilityOpenclaw` variant in Role enum |
+| `src/main.rs` | `parse_role`, `--config`, `Deploy` command, `cmd_deploy()` |
+| `src/agent.rs` | `role_priority` for CapabilityOpenclaw |
+| `src/vm/pool/nix_manifest.rs` | SAMPLE_TOML + tests for new role |
+| `src/templates.rs` | Template update + DeployConfig + DeploymentManifest types |
+| `nix/mvm-profiles.toml` | `[roles.capability-openclaw]` section |
+| `nix/roles/openclaw.nix` | **NEW** — OpenClaw NixOS role module |
+| `nix/flake.nix` | Flake outputs + nixosModules for openclaw |
+| `src/worker/vsock.rs` | HostBoundRequest/Response + frame helpers |
+| `docs/roles.md` | CapabilityOpenclaw documentation |
+| `docs/cli.md` | `mvm deploy` and `--config` docs |

@@ -154,6 +154,33 @@ All cryptographic key material is wrapped in `Zeroizing<Vec<u8>>` (from the `zer
 - `NodeInfo.attestation_provider` field reports the active attestation mechanism
 - When hardware attestation is available, implement the trait and register the provider
 
+## Guest Communication (Vsock)
+
+Production guests have no SSH daemon. All host-guest communication uses Firecracker's vsock device, exposed as a Unix domain socket at `<instance_dir>/runtime/v.sock`.
+
+- **Protocol**: CONNECT handshake, then 4-byte BE length-prefixed JSON frames (same pattern as hostd IPC)
+- **Guest agent port**: 52
+- **Operations**: `WorkerStatus` (query idle metrics), `SleepPrep` (cooperative drain before sleep), `Wake` (reinitialize after snapshot restore), `Ping`
+- **Timeouts**: Configurable per-pool via `drain_timeout_seconds` in RuntimePolicy
+- **Failure mode**: If vsock is unavailable (e.g. guest agent not running), operations proceed best-effort
+
+Module: `worker/vsock.rs`
+
+## Drive Trust Boundaries
+
+Each Firecracker instance mounts up to 4 drives with distinct trust levels:
+
+| Drive | ID | Access | Trust Level | Contents |
+|-------|----|--------|-------------|----------|
+| rootfs | `rootfs` | read-only | Immutable, shared | Kernel + base filesystem |
+| config | `config` | read-only | Non-sensitive metadata | Instance/pool/runtime policy JSON |
+| data | `data` | read-write | Persistent, optional LUKS | Application data |
+| secrets | `secrets` | read-only | Sensitive, tmpfs-backed | Tenant API keys, tokens |
+
+- **Config drive**: Recreated on every start/wake. Contains instance ID, pool ID, tenant ID, guest IP, resource limits, and runtime policy. Readable by any process in the guest. No secrets.
+- **Secrets drive**: Recreated on every start/wake. Built in `/dev/shm` (never touches persistent storage). Mounted with restrictive permissions.
+- **Separation rationale**: Config drive provides the guest agent with metadata it needs to operate. Secrets drive contains material that must be protected. Keeping them separate ensures a clear trust boundary.
+
 ## Explicitly Deferred
 
 | Item | Reason |
