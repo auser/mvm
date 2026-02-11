@@ -1,6 +1,84 @@
+use std::fmt;
+
 use serde::{Deserialize, Serialize};
 
 use crate::vm::tenant::config::tenant_pools_dir;
+
+// ============================================================================
+// Role-based VM type
+// ============================================================================
+
+/// Role for a pool's instances. Determines services, ports, drive
+/// expectations, reconcile ordering, and sleep policy.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum Role {
+    Gateway,
+    #[default]
+    Worker,
+    Builder,
+    CapabilityImessage,
+}
+
+impl fmt::Display for Role {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Gateway => write!(f, "gateway"),
+            Self::Worker => write!(f, "worker"),
+            Self::Builder => write!(f, "builder"),
+            Self::CapabilityImessage => write!(f, "capability-imessage"),
+        }
+    }
+}
+
+// ============================================================================
+// Minimum runtime policy
+// ============================================================================
+
+/// Per-pool runtime policy for minimum runtime enforcement and graceful lifecycle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct RuntimePolicy {
+    /// Minimum seconds an instance must stay Running before eligible for Warm.
+    #[serde(default = "default_min_running")]
+    pub min_running_seconds: u64,
+    /// Minimum seconds an instance must stay Warm before eligible for Sleep.
+    #[serde(default = "default_min_warm")]
+    pub min_warm_seconds: u64,
+    /// Maximum seconds to wait for guest drain ACK before forcing sleep.
+    #[serde(default = "default_drain_timeout")]
+    pub drain_timeout_seconds: u64,
+    /// Maximum seconds for graceful shutdown before SIGKILL.
+    #[serde(default = "default_graceful_shutdown")]
+    pub graceful_shutdown_seconds: u64,
+}
+
+fn default_min_running() -> u64 {
+    60
+}
+fn default_min_warm() -> u64 {
+    30
+}
+fn default_drain_timeout() -> u64 {
+    30
+}
+fn default_graceful_shutdown() -> u64 {
+    15
+}
+
+impl Default for RuntimePolicy {
+    fn default() -> Self {
+        Self {
+            min_running_seconds: default_min_running(),
+            min_warm_seconds: default_min_warm(),
+            drain_timeout_seconds: default_drain_timeout(),
+            graceful_shutdown_seconds: default_graceful_shutdown(),
+        }
+    }
+}
+
+// ============================================================================
+// Pool spec
+// ============================================================================
 
 /// A WorkerPool defines a homogeneous group of instances within a tenant.
 /// Has desired counts but NO runtime state.
@@ -11,10 +89,15 @@ pub struct PoolSpec {
     pub flake_ref: String,
     /// Guest profile name. Built-in: "minimal", "python".
     /// Users can define custom profiles in their own flake.
-    /// The build system evaluates: `nix build <flake_ref>#tenant-<profile>`
     pub profile: String,
+    /// Role for all instances in this pool.
+    #[serde(default)]
+    pub role: Role,
     pub instance_resources: InstanceResources,
     pub desired_counts: DesiredCounts,
+    /// Minimum runtime policy for this pool's instances.
+    #[serde(default)]
+    pub runtime_policy: RuntimePolicy,
     /// "baseline" | "strict"
     #[serde(default = "default_seccomp")]
     pub seccomp_policy: String,
@@ -96,6 +179,11 @@ pub fn pool_snapshots_dir(tenant_id: &str, pool_id: &str) -> String {
     format!("{}/snapshots", pool_dir(tenant_id, pool_id))
 }
 
+/// Directory for pool-level configuration data (mounted as config drive).
+pub fn pool_config_data_dir(tenant_id: &str, pool_id: &str) -> String {
+    format!("{}/config", pool_dir(tenant_id, pool_id))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -115,6 +203,7 @@ mod tests {
             tenant_id: "acme".to_string(),
             flake_ref: "github:org/repo".to_string(),
             profile: "minimal".to_string(),
+            role: Role::Worker,
             instance_resources: InstanceResources {
                 vcpus: 2,
                 mem_mib: 1024,
@@ -125,6 +214,7 @@ mod tests {
                 warm: 1,
                 sleeping: 2,
             },
+            runtime_policy: RuntimePolicy::default(),
             seccomp_policy: "baseline".to_string(),
             snapshot_compression: "zstd".to_string(),
             metadata_enabled: false,
@@ -137,5 +227,67 @@ mod tests {
         assert_eq!(parsed.pool_id, "workers");
         assert_eq!(parsed.instance_resources.vcpus, 2);
         assert_eq!(parsed.desired_counts.running, 3);
+        assert_eq!(parsed.role, Role::Worker);
+    }
+
+    #[test]
+    fn test_role_serde_roundtrip() {
+        for (role, expected) in [
+            (Role::Gateway, "\"gateway\""),
+            (Role::Worker, "\"worker\""),
+            (Role::Builder, "\"builder\""),
+            (Role::CapabilityImessage, "\"capability-imessage\""),
+        ] {
+            let json = serde_json::to_string(&role).unwrap();
+            assert_eq!(json, expected);
+            let parsed: Role = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, role);
+        }
+    }
+
+    #[test]
+    fn test_role_display() {
+        assert_eq!(Role::Gateway.to_string(), "gateway");
+        assert_eq!(Role::Worker.to_string(), "worker");
+        assert_eq!(Role::Builder.to_string(), "builder");
+        assert_eq!(Role::CapabilityImessage.to_string(), "capability-imessage");
+    }
+
+    #[test]
+    fn test_role_default_is_worker() {
+        assert_eq!(Role::default(), Role::Worker);
+    }
+
+    #[test]
+    fn test_runtime_policy_defaults() {
+        let p = RuntimePolicy::default();
+        assert_eq!(p.min_running_seconds, 60);
+        assert_eq!(p.min_warm_seconds, 30);
+        assert_eq!(p.drain_timeout_seconds, 30);
+        assert_eq!(p.graceful_shutdown_seconds, 15);
+    }
+
+    #[test]
+    fn test_pool_spec_backward_compat() {
+        // JSON without role/runtime_policy should deserialize with defaults
+        let json = r#"{
+            "pool_id": "workers",
+            "tenant_id": "acme",
+            "flake_ref": ".",
+            "profile": "minimal",
+            "instance_resources": {"vcpus": 1, "mem_mib": 512},
+            "desired_counts": {"running": 1, "warm": 0, "sleeping": 0}
+        }"#;
+        let parsed: PoolSpec = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.role, Role::Worker);
+        assert_eq!(parsed.runtime_policy.min_running_seconds, 60);
+    }
+
+    #[test]
+    fn test_pool_config_data_dir() {
+        assert_eq!(
+            pool_config_data_dir("acme", "gateways"),
+            "/var/lib/mvm/tenants/acme/pools/gateways/config"
+        );
     }
 }

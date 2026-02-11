@@ -49,8 +49,8 @@ The CLI runs on the host. All Linux operations run inside the Lima VM via `limac
 - `security/{jailer,cgroups,seccomp,audit,metadata,encryption,keystore}.rs` -- hardening + LUKS + key management
 - `security/{signing,snapshot_crypto,attestation}.rs` -- Ed25519 signed state, AES-256-GCM snapshot encryption, attestation hook
 - `hostd/{protocol,server,client}.rs` -- privilege separation: Unix socket IPC between agentd (unprivileged) and hostd (privileged)
-- `sleep/{policy,metrics}.rs` -- sleep heuristics
-- `worker/hooks.rs` -- guest worker signals
+- `sleep/{policy,metrics}.rs` -- sleep heuristics + minimum runtime enforcement
+- `worker/{hooks,vsock}.rs` -- guest worker signals + vsock guest agent client
 - `agent.rs` -- reconcile loop + QUIC daemon + signed state verification
 - `node.rs` -- node identity + stats + attestation provider
 
@@ -66,6 +66,10 @@ The CLI runs on the host. All Linux operations run inside the Lima VM via `limac
 - **Shell scripts inside run_in_vm**: complex ops are bash scripts passed to `limactl shell`. Deliberate -- they run inside the Linux VM.
 - **replace_process for SSH**: Unix process replacement for clean TTY pass-through.
 - **Idempotent setup**: every step checks if already done before acting.
+- **Vsock over SSH**: guest communication uses Firecracker vsock (UDS proxy), not SSH. No sshd in production guests.
+- **Config drive for metadata**: non-secret instance/pool metadata delivered via read-only ext4 config drive, not SSH.
+- **Minimum runtime enforcement**: host-side wall-clock timestamps prevent premature instance reclamation. Guest not involved in enforcement.
+- **No `clippy::too_many_arguments`**: never suppress this lint. Instead, refactor into smaller functions or introduce a config/params struct. Smaller functions are easier to test in isolation.
 
 ### Networking
 
@@ -118,6 +122,7 @@ macOS / Linux Host
 - `docs/cli.md` -- complete command reference
 - `docs/agent.md` -- desired state schema, reconcile loop, QUIC API
 - `docs/security.md` -- threat model, hardening measures, env vars, deferred items
+- `docs/minimum-runtime.md` -- minimum runtime policy, drain protocol, drive model
 - `specs/plans/` -- implementation specs and plan
 
 ## Sprint Management

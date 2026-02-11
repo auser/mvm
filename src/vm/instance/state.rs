@@ -2,6 +2,7 @@ use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
 use crate::sleep::metrics::IdleMetrics;
+use crate::vm::pool::config::Role;
 
 /// Instance lifecycle status. Only instances have runtime state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -53,6 +54,9 @@ pub struct InstanceState {
     pub tenant_id: String,
     pub status: InstanceStatus,
     pub net: InstanceNet,
+    /// Role inherited from pool at creation time.
+    #[serde(default)]
+    pub role: Role,
     pub revision_hash: Option<String>,
     pub firecracker_pid: Option<u32>,
     pub last_started_at: Option<String>,
@@ -62,6 +66,21 @@ pub struct InstanceState {
     pub healthy: Option<bool>,
     pub last_health_check_at: Option<String>,
     pub manual_override_until: Option<String>,
+    /// Config drive version currently mounted.
+    #[serde(default)]
+    pub config_version: Option<u64>,
+    /// Secrets epoch currently mounted.
+    #[serde(default)]
+    pub secrets_epoch: Option<u64>,
+    /// Timestamp when instance entered Running status.
+    #[serde(default)]
+    pub entered_running_at: Option<String>,
+    /// Timestamp when instance entered Warm status.
+    #[serde(default)]
+    pub entered_warm_at: Option<String>,
+    /// Timestamp of last work activity (from guest agent or metrics).
+    #[serde(default)]
+    pub last_busy_at: Option<String>,
 }
 
 /// Validate that a state transition is allowed.
@@ -168,6 +187,7 @@ mod tests {
                 gateway_ip: "10.240.3.1".to_string(),
                 cidr: 24,
             },
+            role: Role::Gateway,
             revision_hash: Some("abc123".to_string()),
             firecracker_pid: Some(12345),
             last_started_at: Some("2025-01-01T00:00:00Z".to_string()),
@@ -176,6 +196,11 @@ mod tests {
             healthy: Some(true),
             last_health_check_at: None,
             manual_override_until: None,
+            config_version: Some(3),
+            secrets_epoch: Some(1),
+            entered_running_at: Some("2025-01-01T00:00:00Z".to_string()),
+            entered_warm_at: None,
+            last_busy_at: None,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -183,6 +208,44 @@ mod tests {
         assert_eq!(parsed.instance_id, "i-a3f7b2c1");
         assert_eq!(parsed.status, InstanceStatus::Running);
         assert_eq!(parsed.net.tap_dev, "tn3i5");
+        assert_eq!(parsed.role, Role::Gateway);
+        assert_eq!(parsed.config_version, Some(3));
+        assert_eq!(
+            parsed.entered_running_at.as_deref(),
+            Some("2025-01-01T00:00:00Z")
+        );
+    }
+
+    #[test]
+    fn test_instance_state_backward_compat() {
+        // JSON without new fields should deserialize with defaults
+        let json = r#"{
+            "instance_id": "i-test",
+            "pool_id": "workers",
+            "tenant_id": "acme",
+            "status": "running",
+            "net": {
+                "tap_dev": "tn3i5",
+                "mac": "02:fc:00:03:00:05",
+                "guest_ip": "10.240.3.5",
+                "gateway_ip": "10.240.3.1",
+                "cidr": 24
+            },
+            "revision_hash": null,
+            "firecracker_pid": null,
+            "last_started_at": null,
+            "last_stopped_at": null,
+            "healthy": null,
+            "last_health_check_at": null,
+            "manual_override_until": null
+        }"#;
+        let parsed: InstanceState = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.role, Role::Worker);
+        assert_eq!(parsed.config_version, None);
+        assert_eq!(parsed.secrets_epoch, None);
+        assert_eq!(parsed.entered_running_at, None);
+        assert_eq!(parsed.entered_warm_at, None);
+        assert_eq!(parsed.last_busy_at, None);
     }
 
     #[test]

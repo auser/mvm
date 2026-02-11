@@ -25,6 +25,8 @@ pub enum AuditAction {
     SnapshotCreated,
     SnapshotRestored,
     SnapshotDeleted,
+    TransitionDeferred,
+    MinRuntimeOverridden,
 }
 
 /// A single audit log entry.
@@ -193,6 +195,8 @@ mod tests {
             AuditAction::SnapshotCreated,
             AuditAction::SnapshotRestored,
             AuditAction::SnapshotDeleted,
+            AuditAction::TransitionDeferred,
+            AuditAction::MinRuntimeOverridden,
         ];
 
         for action in actions {

@@ -41,6 +41,7 @@ Defines a homogeneous group of instances within a tenant. Has desired counts but
 Owns:
 - Nix flake reference + profile (minimal, python, etc.)
 - Instance resource template (vCPUs, memory, data disk size)
+- Runtime policy (min_running_seconds, min_warm_seconds, drain/graceful timeouts)
 - Desired counts (running, warm, sleeping)
 - Build history (revisions with artifact paths)
 - Shared artifacts (kernel, rootfs, base Firecracker config)
@@ -54,9 +55,10 @@ Owns:
 - State (Created, Ready, Running, Warm, Sleeping, Stopped)
 - Network identity (TAP device, MAC, guest IP within tenant subnet)
 - Firecracker process (PID, socket, config)
-- Data disk (persistent ext4) + secrets disk (recreated per run)
+- Data disk (persistent ext4) + secrets disk (recreated per run) + config disk (non-secret metadata)
 - Delta snapshot (instance-specific memory state)
 - Idle metrics (last work timestamp, CPU average, heartbeat)
+- Lifecycle timestamps (entered_running_at, entered_warm_at, last_busy_at)
 
 ## Instance State Machine
 
@@ -150,13 +152,20 @@ src/
         seccomp.rs               # Seccomp profile selection (baseline/strict)
         audit.rs                 # Append-only per-tenant audit log
         metadata.rs              # Tenant-scoped metadata endpoint
+        certs.rs                 # mTLS certificate generation (rcgen)
+        encryption.rs            # LUKS disk encryption
+        keystore.rs              # Key management
+        signing.rs               # Ed25519 signed state verification
+        snapshot_crypto.rs       # AES-256-GCM snapshot encryption
+        attestation.rs           # Node attestation hook
     sleep/
         mod.rs
-        policy.rs                # Sleep heuristics (idle thresholds, memory pressure)
+        policy.rs                # Sleep heuristics, minimum runtime enforcement, eligibility checks
         metrics.rs               # Per-instance idle metrics collection
     worker/
         mod.rs
         hooks.rs                 # Guest worker lifecycle signals (ready/idle/busy)
+        vsock.rs                 # Vsock guest agent client (sleep-prep drain, wake, status)
 ```
 
 ## Filesystem Layout
@@ -190,8 +199,8 @@ src/
                     instances/
                         <instance_id>/
                             instance.json  # InstanceState
-                            runtime/       # fc.json, socket, PID, logs
-                            volumes/       # data.ext4, secrets.ext4
+                            runtime/       # fc.json, socket, PID, v.sock, logs
+                            volumes/       # data.ext4, secrets.ext4, config.ext4
                             snapshots/
                                 delta/     # Instance-specific delta snapshot
                             jail/          # Jailer chroot

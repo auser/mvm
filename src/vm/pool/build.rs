@@ -246,6 +246,7 @@ fn boot_builder(run_dir: &str, builder_net: &InstanceNet, tenant_net: &TenantNet
             vcpu_count: BUILDER_VCPUS,
             mem_size_mib: BUILDER_MEM_MIB,
         },
+        vsock: None, // Ephemeral build VMs don't need vsock
     };
 
     let config_json = serde_json::to_string_pretty(&fc_config)?;

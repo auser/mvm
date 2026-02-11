@@ -32,7 +32,11 @@ fn instance_state_path(tenant_id: &str, pool_id: &str, instance_id: &str) -> Str
 }
 
 /// Load an instance's persisted state.
-fn load_instance(tenant_id: &str, pool_id: &str, instance_id: &str) -> Result<InstanceState> {
+pub(crate) fn load_instance(
+    tenant_id: &str,
+    pool_id: &str,
+    instance_id: &str,
+) -> Result<InstanceState> {
     let path = instance_state_path(tenant_id, pool_id, instance_id);
     let json = shell::run_in_vm_stdout(&format!("cat {}", path)).with_context(|| {
         format!(
@@ -64,7 +68,7 @@ fn save_instance(
 #[instrument(skip_all, fields(tenant_id, pool_id))]
 pub fn instance_create(tenant_id: &str, pool_id: &str) -> Result<String> {
     let tenant = tenant_load(tenant_id)?;
-    let _spec = pool_load(tenant_id, pool_id)?;
+    let spec = pool_load(tenant_id, pool_id)?;
 
     let instance_id = naming::generate_instance_id();
     let ip_offset = net::allocate_ip_offset(tenant_id, pool_id)?;
@@ -81,6 +85,7 @@ pub fn instance_create(tenant_id: &str, pool_id: &str) -> Result<String> {
         tenant_id: tenant_id.to_string(),
         status: InstanceStatus::Created,
         net: instance_net,
+        role: spec.role.clone(),
         revision_hash: None,
         firecracker_pid: None,
         last_started_at: None,
@@ -89,6 +94,11 @@ pub fn instance_create(tenant_id: &str, pool_id: &str) -> Result<String> {
         healthy: None,
         last_health_check_at: None,
         manual_override_until: None,
+        config_version: None,
+        secrets_epoch: None,
+        entered_running_at: None,
+        entered_warm_at: None,
+        last_busy_at: None,
     };
 
     save_instance(tenant_id, pool_id, &instance_id, &state)?;
@@ -218,14 +228,30 @@ pub fn instance_start(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resu
     let secrets_path = tenant_secrets_path(tenant_id);
     let secrets_disk_path = disk::create_secrets_disk(&inst_dir, &secrets_path)?;
 
+    // Create config drive with instance/pool metadata
+    let config_meta = serde_json::json!({
+        "instance_id": instance_id,
+        "pool_id": pool_id,
+        "tenant_id": tenant_id,
+        "guest_ip": state.net.guest_ip,
+        "vcpus": spec.instance_resources.vcpus,
+        "mem_mib": spec.instance_resources.mem_mib,
+        "min_runtime_policy": spec.runtime_policy,
+    });
+    let config_disk_path = disk::create_config_disk(&inst_dir, &config_meta.to_string())?;
+
+    let vsock_path = format!("{}/runtime/v.sock", inst_dir);
+
     // Generate FC config
     let fc_json = fc_config::generate(
         &spec.instance_resources,
         &state.net,
         &kernel_path,
         &rootfs_path,
+        Some(&config_disk_path),
         data_disk_path.as_deref(),
         Some(&secrets_disk_path),
+        Some(&vsock_path),
     )?;
 
     let runtime_dir = format!("{}/runtime", inst_dir);
@@ -292,9 +318,12 @@ pub fn instance_start(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resu
     }
 
     // Update state
+    let now = http::utc_now();
     state.status = InstanceStatus::Running;
     state.firecracker_pid = Some(pid);
-    state.last_started_at = Some(http::utc_now());
+    state.last_started_at = Some(now.clone());
+    state.entered_running_at = Some(now);
+    state.entered_warm_at = None;
     save_instance(tenant_id, pool_id, instance_id, &state)?;
 
     audit::log_event(
@@ -336,16 +365,19 @@ pub fn instance_stop(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resul
     // Tear down TAP device
     net::teardown_tap(&state.net.tap_dev)?;
 
-    // Clean up runtime files (socket, pid, log) and ephemeral secrets disk
+    // Clean up runtime files (socket, pid, log) and ephemeral disks (secrets, config)
     let inst_dir = instance_dir(tenant_id, pool_id, instance_id);
     let _ = shell::run_in_vm(&format!(
-        "rm -f {dir}/runtime/firecracker.socket {dir}/runtime/fc.pid {dir}/volumes/secrets.ext4",
+        "rm -f {dir}/runtime/firecracker.socket {dir}/runtime/fc.pid \
+         {dir}/runtime/v.sock {dir}/volumes/secrets.ext4 {dir}/volumes/config.ext4",
         dir = inst_dir
     ));
 
     state.status = InstanceStatus::Stopped;
     state.firecracker_pid = None;
     state.last_stopped_at = Some(http::utc_now());
+    state.entered_running_at = None;
+    state.entered_warm_at = None;
     save_instance(tenant_id, pool_id, instance_id, &state)?;
 
     audit::log_event(
@@ -378,6 +410,7 @@ pub fn instance_warm(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resul
     ))?;
 
     state.status = InstanceStatus::Warm;
+    state.entered_warm_at = Some(http::utc_now());
     save_instance(tenant_id, pool_id, instance_id, &state)?;
 
     audit::log_event(
@@ -414,17 +447,27 @@ pub fn instance_sleep(
 
     let inst_dir = instance_dir(tenant_id, pool_id, instance_id);
 
-    // If not forced, try to signal guest sleep-prep and wait for ACK
+    // If not forced, try to signal guest sleep-prep via vsock and wait for ACK
     if !force {
-        // Signal guest via SSH (best-effort, timeout after 10s)
-        let ssh_key = tenant_ssh_key_path(tenant_id);
-        let _ = shell::run_in_vm(&format!(
-            r#"timeout 10 ssh -o StrictHostKeyChecking=no -o ConnectTimeout=3 \
-                -i {key} root@{ip} \
-                'systemctl start mvm-sleep-prep 2>/dev/null || true' 2>/dev/null || true"#,
-            key = ssh_key,
-            ip = state.net.guest_ip,
-        ));
+        let drain_timeout = spec.runtime_policy.drain_timeout_seconds;
+        match crate::worker::vsock::request_sleep_prep(&inst_dir, drain_timeout) {
+            Ok(true) => {
+                // Guest ACKed: OpenClaw idle, data flushed
+            }
+            Ok(false) => {
+                // Drain timeout exceeded — log and force
+                let _ = audit::log_event(
+                    tenant_id,
+                    Some(pool_id),
+                    Some(instance_id),
+                    audit::AuditAction::MinRuntimeOverridden,
+                    Some("drain_timeout exceeded, forcing sleep"),
+                );
+            }
+            Err(_) => {
+                // Vsock not available (e.g. guest agent not running) — best-effort
+            }
+        }
     }
 
     // Ensure instance is paused (may already be Warm=Paused)
@@ -433,11 +476,13 @@ pub fn instance_sleep(
     // Create delta snapshot
     snapshot::create_delta_snapshot(&inst_dir, &spec.snapshot_compression)?;
 
-    // Kill Firecracker process
+    // Kill Firecracker process with graceful shutdown timeout
+    let graceful = spec.runtime_policy.graceful_shutdown_seconds;
     if let Some(pid) = state.firecracker_pid {
         let _ = shell::run_in_vm(&format!(
-            "kill {} 2>/dev/null || true; sleep 1; kill -9 {} 2>/dev/null || true",
-            pid, pid
+            "kill {pid} 2>/dev/null || true; \
+             for i in $(seq 1 {graceful}); do kill -0 {pid} 2>/dev/null || break; sleep 1; done; \
+             kill -9 {pid} 2>/dev/null || true",
         ));
     }
 
@@ -446,7 +491,7 @@ pub fn instance_sleep(
 
     // Clean up runtime files but keep socket path info
     let _ = shell::run_in_vm(&format!(
-        "rm -f {dir}/runtime/firecracker.socket {dir}/runtime/fc.pid",
+        "rm -f {dir}/runtime/firecracker.socket {dir}/runtime/fc.pid {dir}/runtime/v.sock",
         dir = inst_dir
     ));
 
@@ -455,6 +500,8 @@ pub fn instance_sleep(
     state.status = InstanceStatus::Sleeping;
     state.firecracker_pid = None;
     state.last_stopped_at = Some(http::utc_now());
+    state.entered_running_at = None;
+    state.entered_warm_at = None;
     save_instance(tenant_id, pool_id, instance_id, &state)?;
 
     audit::log_event(
@@ -507,10 +554,21 @@ pub fn instance_wake(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resul
         spec.instance_resources.mem_mib,
     )?;
 
-    // Create fresh secrets disk
+    // Create fresh secrets disk and config drive
     let inst_dir = instance_dir(tenant_id, pool_id, instance_id);
     let secrets_path = tenant_secrets_path(tenant_id);
     let _ = disk::create_secrets_disk(&inst_dir, &secrets_path)?;
+
+    let config_meta = serde_json::json!({
+        "instance_id": instance_id,
+        "pool_id": pool_id,
+        "tenant_id": tenant_id,
+        "guest_ip": state.net.guest_ip,
+        "vcpus": spec.instance_resources.vcpus,
+        "mem_mib": spec.instance_resources.mem_mib,
+        "min_runtime_policy": spec.runtime_policy,
+    });
+    let _ = disk::create_config_disk(&inst_dir, &config_meta.to_string())?;
 
     let runtime_dir = format!("{}/runtime", inst_dir);
     let socket_path = format!("{}/firecracker.socket", runtime_dir);
@@ -540,10 +598,16 @@ pub fn instance_wake(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resul
         );
     }
 
+    // Signal guest wake via vsock (best-effort: guest reinitializes connections and refreshes secrets)
+    let _ = crate::worker::vsock::signal_wake(&inst_dir);
+
     // Update state
+    let now = http::utc_now();
     state.status = InstanceStatus::Running;
     state.firecracker_pid = Some(pid);
-    state.last_started_at = Some(http::utc_now());
+    state.last_started_at = Some(now.clone());
+    state.entered_running_at = Some(now);
+    state.entered_warm_at = None;
     save_instance(tenant_id, pool_id, instance_id, &state)?;
 
     audit::log_event(

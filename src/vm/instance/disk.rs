@@ -67,3 +67,47 @@ pub fn remove_secrets_disk(instance_dir: &str) -> Result<()> {
     shell::run_in_vm(&format!("rm -f {}", path))?;
     Ok(())
 }
+
+/// Create a read-only config drive containing instance/pool metadata.
+///
+/// Unlike the secrets disk, this contains non-sensitive configuration data:
+/// instance identity, network config, pool resources, and min_runtime_policy.
+/// Created fresh on every start/wake with current config.
+/// Guest mounts as ro — the vsock agent reads config from this drive.
+pub fn create_config_disk(instance_dir: &str, config_json: &str) -> Result<String> {
+    let path = format!("{}/volumes/config.ext4", instance_dir);
+    let escaped = config_json.replace('\'', "'\\''");
+    shell::run_in_vm(&format!(
+        r#"
+        mkdir -p {dir}/volumes
+
+        # Remove any previous config disk
+        rm -f {path}
+
+        # Create a small ext4 image (4M)
+        truncate -s 4M {path}
+        mkfs.ext4 -q {path}
+
+        # Mount, populate, unmount
+        MOUNT_DIR=$(mktemp -d)
+        sudo mount {path} "$MOUNT_DIR"
+        echo '{json}' | sudo tee "$MOUNT_DIR/config.json" >/dev/null
+        sudo chmod 0444 "$MOUNT_DIR/config.json"
+        sudo umount "$MOUNT_DIR"
+        rmdir "$MOUNT_DIR"
+
+        chmod 0644 {path}
+        "#,
+        dir = instance_dir,
+        path = path,
+        json = escaped,
+    ))?;
+    Ok(path)
+}
+
+/// Remove the config disk after instance stop/destroy.
+pub fn remove_config_disk(instance_dir: &str) -> Result<()> {
+    let path = format!("{}/volumes/config.ext4", instance_dir);
+    shell::run_in_vm(&format!("rm -f {}", path))?;
+    Ok(())
+}

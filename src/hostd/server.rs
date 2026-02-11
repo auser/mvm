@@ -109,6 +109,7 @@ fn execute(request: HostdRequest) -> HostdResponse {
             pool_id,
             instance_id,
             force,
+            drain_timeout_secs: _,
         } => {
             if let Err(e) = validate_ids(&tenant_id, &pool_id, Some(&instance_id)) {
                 return HostdResponse::Error {

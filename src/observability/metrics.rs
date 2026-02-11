@@ -36,6 +36,7 @@ pub struct Metrics {
     pub instances_slept: AtomicU64,
     pub instances_woken: AtomicU64,
     pub instances_destroyed: AtomicU64,
+    pub instances_deferred: AtomicU64,
 
     // ── Connection counters ─────────────────────────────────────────
     pub connections_accepted: AtomicU64,
@@ -63,6 +64,7 @@ impl Metrics {
             instances_slept: AtomicU64::new(0),
             instances_woken: AtomicU64::new(0),
             instances_destroyed: AtomicU64::new(0),
+            instances_deferred: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
             connections_rejected: AtomicU64::new(0),
         }
@@ -89,6 +91,7 @@ impl Metrics {
             instances_slept: self.instances_slept.load(Ordering::Relaxed),
             instances_woken: self.instances_woken.load(Ordering::Relaxed),
             instances_destroyed: self.instances_destroyed.load(Ordering::Relaxed),
+            instances_deferred: self.instances_deferred.load(Ordering::Relaxed),
             connections_accepted: self.connections_accepted.load(Ordering::Relaxed),
             connections_rejected: self.connections_rejected.load(Ordering::Relaxed),
         }
@@ -209,6 +212,12 @@ impl Metrics {
         );
         write_metric(
             &mut out,
+            "mvm_instances_deferred_total",
+            s.instances_deferred,
+            "Instances deferred by min-runtime policy",
+        );
+        write_metric(
+            &mut out,
             "mvm_connections_accepted_total",
             s.connections_accepted,
             "Connections accepted",
@@ -252,6 +261,7 @@ pub struct MetricsSnapshot {
     pub instances_slept: u64,
     pub instances_woken: u64,
     pub instances_destroyed: u64,
+    pub instances_deferred: u64,
     pub connections_accepted: u64,
     pub connections_rejected: u64,
 }

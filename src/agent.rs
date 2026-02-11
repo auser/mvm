@@ -66,8 +66,14 @@ pub struct DesiredPool {
     pub pool_id: String,
     pub flake_ref: String,
     pub profile: String,
+    /// Role for this pool's instances.
+    #[serde(default)]
+    pub role: crate::vm::pool::config::Role,
     pub instance_resources: crate::vm::pool::config::InstanceResources,
     pub desired_counts: crate::vm::pool::config::DesiredCounts,
+    /// Minimum runtime policy.
+    #[serde(default)]
+    pub runtime_policy: crate::vm::pool::config::RuntimePolicy,
     #[serde(default = "default_seccomp")]
     pub seccomp_policy: String,
     #[serde(default = "default_compression")]
@@ -96,6 +102,8 @@ pub struct ReconcileReport {
     pub instances_warmed: u32,
     pub instances_slept: u32,
     pub instances_stopped: u32,
+    #[serde(default)]
+    pub instances_deferred: u32,
     pub errors: Vec<String>,
 }
 
@@ -473,6 +481,12 @@ pub fn reconcile(desired_path: &str, prune: bool) -> Result<()> {
     if report.instances_stopped > 0 {
         println!("Stopped {} instances", report.instances_stopped);
     }
+    if report.instances_deferred > 0 {
+        println!(
+            "Deferred {} instances (min-runtime not satisfied)",
+            report.instances_deferred
+        );
+    }
     if !report.errors.is_empty() {
         eprintln!("Reconcile errors:");
         for err in &report.errors {
@@ -499,8 +513,10 @@ pub fn generate_desired(node_id: &str) -> Result<DesiredState> {
                 pool_id: spec.pool_id,
                 flake_ref: spec.flake_ref,
                 profile: spec.profile,
+                role: spec.role,
                 instance_resources: spec.instance_resources,
                 desired_counts: spec.desired_counts,
+                runtime_policy: spec.runtime_policy,
                 seccomp_policy: spec.seccomp_policy,
                 snapshot_compression: spec.snapshot_compression,
             });
@@ -687,6 +703,24 @@ fn reconcile_desired(desired: &DesiredState, prune: bool) -> Result<ReconcileRep
         for dp in &dt.pools {
             if let Ok(decisions) = policy::evaluate_pool(&dt.tenant_id, &dp.pool_id) {
                 for decision in decisions {
+                    // Track deferrals (decisions that would have acted but min-runtime blocked)
+                    if decision.action == policy::SleepAction::None
+                        && decision.reason.contains("min_running_seconds")
+                        || decision.reason.contains("min_warm_seconds")
+                    {
+                        report.instances_deferred += 1;
+                        let m = metrics::global();
+                        m.instances_deferred.fetch_add(1, Ordering::Relaxed);
+                        let _ = audit::log_event(
+                            &dt.tenant_id,
+                            Some(&dp.pool_id),
+                            Some(&decision.instance_id),
+                            audit::AuditAction::TransitionDeferred,
+                            Some(&decision.reason),
+                        );
+                        continue;
+                    }
+
                     let result = match decision.action {
                         policy::SleepAction::Warm => {
                             instance_warm(&dt.tenant_id, &dp.pool_id, &decision.instance_id)
@@ -1098,6 +1132,7 @@ mod tests {
                     pool_id: "workers".to_string(),
                     flake_ref: "github:org/repo".to_string(),
                     profile: "minimal".to_string(),
+                    role: Default::default(),
                     instance_resources: InstanceResources {
                         vcpus: 2,
                         mem_mib: 1024,
@@ -1108,6 +1143,7 @@ mod tests {
                         warm: 1,
                         sleeping: 2,
                     },
+                    runtime_policy: Default::default(),
                     seccomp_policy: "baseline".to_string(),
                     snapshot_compression: "zstd".to_string(),
                 }],
@@ -1140,12 +1176,14 @@ mod tests {
                     pool_id: "workers".to_string(),
                     flake_ref: ".".to_string(),
                     profile: "minimal".to_string(),
+                    role: Default::default(),
                     instance_resources: InstanceResources {
                         vcpus: 2,
                         mem_mib: 512,
                         data_disk_mib: 0,
                     },
                     desired_counts: DesiredCounts::default(),
+                    runtime_policy: Default::default(),
                     seccomp_policy: "baseline".to_string(),
                     snapshot_compression: "none".to_string(),
                 }],
@@ -1429,6 +1467,7 @@ mod tests {
                     pool_id: "workers".to_string(),
                     flake_ref: ".".to_string(),
                     profile: "minimal".to_string(),
+                    role: Default::default(),
                     instance_resources: InstanceResources {
                         vcpus: 2,
                         mem_mib: 1024,
@@ -1439,6 +1478,7 @@ mod tests {
                         warm: 0,
                         sleeping: 0,
                     },
+                    runtime_policy: Default::default(),
                     seccomp_policy: "baseline".to_string(),
                     snapshot_compression: "none".to_string(),
                 }],
@@ -1507,12 +1547,14 @@ mod tests {
                     pool_id: "workers".to_string(),
                     flake_ref: ".".to_string(),
                     profile: "minimal".to_string(),
+                    role: Default::default(),
                     instance_resources: InstanceResources {
                         vcpus: 2,
                         mem_mib: 1024,
                         data_disk_mib: 0,
                     },
                     desired_counts: DesiredCounts::default(),
+                    runtime_policy: Default::default(),
                     seccomp_policy: "baseline".to_string(),
                     snapshot_compression: "none".to_string(),
                 }],

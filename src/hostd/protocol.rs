@@ -37,6 +37,8 @@ pub enum HostdRequest {
         pool_id: String,
         instance_id: String,
         force: bool,
+        #[serde(default)]
+        drain_timeout_secs: Option<u64>,
     },
     /// Restore an instance from snapshot.
     WakeInstance {
@@ -202,11 +204,19 @@ mod tests {
             pool_id: "workers".to_string(),
             instance_id: "i-abc123".to_string(),
             force: true,
+            drain_timeout_secs: Some(30),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: HostdRequest = serde_json::from_str(&json).unwrap();
         match parsed {
-            HostdRequest::SleepInstance { force, .. } => assert!(force),
+            HostdRequest::SleepInstance {
+                force,
+                drain_timeout_secs,
+                ..
+            } => {
+                assert!(force);
+                assert_eq!(drain_timeout_secs, Some(30));
+            }
             _ => panic!("Wrong variant"),
         }
     }
@@ -326,6 +336,7 @@ mod tests {
                 pool_id: "p".to_string(),
                 instance_id: "i".to_string(),
                 force: false,
+                drain_timeout_secs: None,
             },
             HostdRequest::WakeInstance {
                 tenant_id: "t".to_string(),

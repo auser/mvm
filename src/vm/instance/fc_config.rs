@@ -14,6 +14,16 @@ pub struct FcConfig {
     pub network_interfaces: Vec<NetworkInterface>,
     #[serde(rename = "machine-config")]
     pub machine_config: MachineConfig,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub vsock: Option<VsockDevice>,
+}
+
+/// Firecracker vsock device configuration.
+#[derive(Debug, Serialize)]
+pub struct VsockDevice {
+    pub vsock_id: String,
+    pub guest_cid: u32,
+    pub uds_path: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -47,20 +57,38 @@ pub struct MachineConfig {
 ///
 /// Boot args include kernel console settings and static IP configuration
 /// so the guest comes up with the correct network identity.
+///
+/// Drive model:
+/// - rootfs: immutable root device (read-only)
+/// - config: instance/pool metadata (read-only, refreshed on start/wake)
+/// - data: persistent writable volume (optional, may be LUKS-encrypted)
+/// - secrets: ephemeral sensitive material (read-only, tmpfs-backed)
+#[allow(clippy::too_many_arguments)]
 pub fn generate(
     resources: &InstanceResources,
     net: &InstanceNet,
     kernel_path: &str,
     rootfs_path: &str,
+    config_disk_path: Option<&str>,
     data_disk_path: Option<&str>,
     secrets_disk_path: Option<&str>,
+    vsock_uds_path: Option<&str>,
 ) -> Result<String> {
     let mut drives = vec![Drive {
         drive_id: "rootfs".to_string(),
         path_on_host: rootfs_path.to_string(),
         is_root_device: true,
-        is_read_only: false,
+        is_read_only: true,
     }];
+
+    if let Some(config_path) = config_disk_path {
+        drives.push(Drive {
+            drive_id: "config".to_string(),
+            path_on_host: config_path.to_string(),
+            is_root_device: false,
+            is_read_only: true,
+        });
+    }
 
     if let Some(data_path) = data_disk_path {
         drives.push(Drive {
@@ -79,6 +107,12 @@ pub fn generate(
             is_read_only: true,
         });
     }
+
+    let vsock = vsock_uds_path.map(|path| VsockDevice {
+        vsock_id: "vsock0".to_string(),
+        guest_cid: crate::worker::vsock::GUEST_CID,
+        uds_path: path.to_string(),
+    });
 
     // Compute subnet mask from CIDR for boot args
     let mask = cidr_to_mask(net.cidr);
@@ -102,6 +136,7 @@ pub fn generate(
             vcpu_count: resources.vcpus,
             mem_size_mib: resources.mem_mib,
         },
+        vsock,
     };
 
     Ok(serde_json::to_string_pretty(&config)?)
@@ -151,6 +186,8 @@ mod tests {
             "/path/rootfs.ext4",
             None,
             None,
+            None,
+            None,
         )
         .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
@@ -158,13 +195,17 @@ mod tests {
         assert_eq!(parsed["machine-config"]["vcpu_count"], 2);
         assert_eq!(parsed["machine-config"]["mem_size_mib"], 1024);
         assert_eq!(parsed["network-interfaces"][0]["host_dev_name"], "tn3i5");
+        assert!(parsed.get("vsock").is_none());
 
         let boot_args = parsed["boot-source"]["boot_args"].as_str().unwrap();
         assert!(boot_args.contains("ip=10.240.3.5::10.240.3.1:255.255.255.0::eth0:off"));
+
+        // rootfs should be read-only
+        assert_eq!(parsed["drives"][0]["is_read_only"], true);
     }
 
     #[test]
-    fn test_generate_with_disks() {
+    fn test_generate_with_all_drives() {
         let resources = InstanceResources {
             vcpus: 1,
             mem_mib: 512,
@@ -178,13 +219,62 @@ mod tests {
             cidr: 24,
         };
 
-        let json = generate(&resources, &net, "/k", "/r", Some("/d"), Some("/s")).unwrap();
+        let json = generate(
+            &resources,
+            &net,
+            "/k",
+            "/r",
+            Some("/c"),
+            Some("/d"),
+            Some("/s"),
+            None,
+        )
+        .unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
 
-        assert_eq!(parsed["drives"].as_array().unwrap().len(), 3);
-        assert_eq!(parsed["drives"][0]["drive_id"], "rootfs");
-        assert_eq!(parsed["drives"][1]["drive_id"], "data");
-        assert_eq!(parsed["drives"][2]["drive_id"], "secrets");
+        let drives = parsed["drives"].as_array().unwrap();
+        assert_eq!(drives.len(), 4);
+        assert_eq!(drives[0]["drive_id"], "rootfs");
+        assert_eq!(drives[0]["is_read_only"], true);
+        assert_eq!(drives[1]["drive_id"], "config");
+        assert_eq!(drives[1]["is_read_only"], true);
+        assert_eq!(drives[2]["drive_id"], "data");
+        assert_eq!(drives[2]["is_read_only"], false);
+        assert_eq!(drives[3]["drive_id"], "secrets");
+        assert_eq!(drives[3]["is_read_only"], true);
+    }
+
+    #[test]
+    fn test_generate_with_vsock() {
+        let resources = InstanceResources {
+            vcpus: 1,
+            mem_mib: 512,
+            data_disk_mib: 0,
+        };
+        let net = InstanceNet {
+            tap_dev: "tn3i5".to_string(),
+            mac: "02:fc:00:03:00:05".to_string(),
+            guest_ip: "10.240.3.5".to_string(),
+            gateway_ip: "10.240.3.1".to_string(),
+            cidr: 24,
+        };
+
+        let json = generate(
+            &resources,
+            &net,
+            "/k",
+            "/r",
+            None,
+            None,
+            None,
+            Some("/tmp/v.sock"),
+        )
+        .unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+
+        assert_eq!(parsed["vsock"]["vsock_id"], "vsock0");
+        assert_eq!(parsed["vsock"]["guest_cid"], 3);
+        assert_eq!(parsed["vsock"]["uds_path"], "/tmp/v.sock");
     }
 
     #[test]
