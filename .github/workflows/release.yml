@@ -31,7 +31,7 @@ jobs:
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@stable
+        uses: dtolnay/rust-toolchain@nightly
         with:
           targets: ${{ matrix.target }}
 
@@ -87,8 +87,4 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
-        run: |
-          gh release create "${TAG_NAME}" \
-            --title "${TAG_NAME}" \
-            --generate-notes \
-            artifacts/*.tar.gz
+        run: gh release create "${TAG_NAME}" --title "${TAG_NAME}" --generate-notes artifacts/*.tar.gz

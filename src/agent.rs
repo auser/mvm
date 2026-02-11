@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
+use std::sync::Arc;
+use tokio::sync::Mutex;
 
 use crate::infra::shell;
 use crate::node;
@@ -136,6 +138,74 @@ const DEFAULT_LISTEN: &str = "0.0.0.0:4433";
 
 /// Maximum request frame size (1 MiB).
 const MAX_FRAME_SIZE: usize = 1024 * 1024;
+
+/// Default rate limit: requests per second per connection.
+const DEFAULT_RATE_LIMIT_RPS: u32 = 10;
+
+/// Default maximum burst (token bucket capacity).
+const DEFAULT_RATE_LIMIT_BURST: u32 = 20;
+
+/// Default maximum concurrent connections.
+const DEFAULT_MAX_CONNECTIONS: u32 = 100;
+
+/// Token-bucket rate limiter for per-connection request throttling.
+struct RateLimiter {
+    tokens: f64,
+    max_tokens: f64,
+    refill_rate: f64,
+    last_refill: tokio::time::Instant,
+}
+
+impl RateLimiter {
+    fn new(rps: u32, burst: u32) -> Self {
+        Self {
+            tokens: burst as f64,
+            max_tokens: burst as f64,
+            refill_rate: rps as f64,
+            last_refill: tokio::time::Instant::now(),
+        }
+    }
+
+    /// Try to consume one token. Returns true if allowed, false if rate-limited.
+    fn try_acquire(&mut self) -> bool {
+        let now = tokio::time::Instant::now();
+        let elapsed = now.duration_since(self.last_refill).as_secs_f64();
+        self.tokens = (self.tokens + elapsed * self.refill_rate).min(self.max_tokens);
+        self.last_refill = now;
+
+        if self.tokens >= 1.0 {
+            self.tokens -= 1.0;
+            true
+        } else {
+            false
+        }
+    }
+}
+
+/// Shared connection counter for global connection limits.
+struct ConnectionGate {
+    active: u32,
+    max: u32,
+}
+
+impl ConnectionGate {
+    fn new(max: u32) -> Self {
+        Self { active: 0, max }
+    }
+
+    fn try_accept(&mut self) -> bool {
+        if self.active < self.max {
+            self.active += 1;
+            true
+        } else {
+            false
+        }
+    }
+
+    fn release(&mut self) {
+        self.active = self.active.saturating_sub(1);
+    }
+}
 
 // ============================================================================
 // Frame protocol: length-prefixed JSON over QUIC bi-directional streams
@@ -592,6 +662,9 @@ async fn run_daemon(
 
     eprintln!("Agent listening on {}", addr);
 
+    // Connection gate for global connection limits
+    let conn_gate = Arc::new(Mutex::new(ConnectionGate::new(DEFAULT_MAX_CONNECTIONS)));
+
     // Shutdown signal
     let shutdown = tokio::signal::ctrl_c();
     tokio::pin!(shutdown);
@@ -626,10 +699,17 @@ async fn run_daemon(
             incoming = endpoint.accept() => {
                 match incoming {
                     Some(conn) => {
+                        let gate = conn_gate.clone();
+                        if !gate.lock().await.try_accept() {
+                            eprintln!("Connection rejected: max connections ({}) reached", DEFAULT_MAX_CONNECTIONS);
+                            conn.refuse();
+                            continue;
+                        }
                         tokio::spawn(async move {
-                            if let Err(e) = handle_connection(conn).await {
+                            if let Err(e) = handle_connection(conn, gate.clone()).await {
                                 eprintln!("Connection error: {}", e);
                             }
+                            gate.lock().await.release();
                         });
                     }
                     None => break,
@@ -652,17 +732,27 @@ async fn run_daemon(
 }
 
 /// Handle a single QUIC connection (may have multiple bi-directional streams).
-async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
+async fn handle_connection(
+    incoming: quinn::Incoming,
+    _conn_gate: Arc<Mutex<ConnectionGate>>,
+) -> Result<()> {
     let connection = incoming
         .await
         .with_context(|| "Failed to accept connection")?;
+
+    // Per-connection rate limiter
+    let limiter = Arc::new(Mutex::new(RateLimiter::new(
+        DEFAULT_RATE_LIMIT_RPS,
+        DEFAULT_RATE_LIMIT_BURST,
+    )));
 
     loop {
         let stream = connection.accept_bi().await;
         match stream {
             Ok((send, recv)) => {
+                let limiter = limiter.clone();
                 tokio::spawn(async move {
-                    if let Err(e) = handle_stream(send, recv).await {
+                    if let Err(e) = handle_stream(send, recv, limiter).await {
                         eprintln!("Stream error: {}", e);
                     }
                 });
@@ -678,7 +768,22 @@ async fn handle_connection(incoming: quinn::Incoming) -> Result<()> {
 }
 
 /// Handle a single bi-directional QUIC stream: read request, dispatch, write response.
-async fn handle_stream(mut send: quinn::SendStream, mut recv: quinn::RecvStream) -> Result<()> {
+async fn handle_stream(
+    mut send: quinn::SendStream,
+    mut recv: quinn::RecvStream,
+    limiter: Arc<Mutex<RateLimiter>>,
+) -> Result<()> {
+    // Check rate limit before processing
+    if !limiter.lock().await.try_acquire() {
+        let response = AgentResponse::Error {
+            code: 429,
+            message: "Rate limit exceeded".to_string(),
+        };
+        let response_bytes = serde_json::to_vec(&response)?;
+        write_frame(&mut send, &response_bytes).await?;
+        return Ok(());
+    }
+
     let frame = read_frame(&mut recv).await?;
 
     let request: AgentRequest =
@@ -972,5 +1077,58 @@ mod tests {
     #[test]
     fn test_max_frame_size() {
         assert_eq!(MAX_FRAME_SIZE, 1024 * 1024);
+    }
+
+    #[test]
+    fn test_rate_limiter_allows_within_burst() {
+        let mut limiter = RateLimiter::new(10, 5);
+        // Should allow up to burst size
+        for _ in 0..5 {
+            assert!(limiter.try_acquire());
+        }
+        // Should reject after burst exhausted
+        assert!(!limiter.try_acquire());
+    }
+
+    #[test]
+    fn test_rate_limiter_refills_over_time() {
+        let mut limiter = RateLimiter::new(10, 5);
+        // Exhaust all tokens
+        for _ in 0..5 {
+            limiter.try_acquire();
+        }
+        assert!(!limiter.try_acquire());
+
+        // Simulate time passing by manipulating last_refill
+        limiter.last_refill -= tokio::time::Duration::from_secs(1);
+
+        // After 1 second at 10 rps, should have ~10 tokens (capped at burst=5)
+        assert!(limiter.try_acquire());
+    }
+
+    #[test]
+    fn test_connection_gate_accepts_within_limit() {
+        let mut gate = ConnectionGate::new(3);
+        assert!(gate.try_accept());
+        assert!(gate.try_accept());
+        assert!(gate.try_accept());
+        assert!(!gate.try_accept());
+    }
+
+    #[test]
+    fn test_connection_gate_release() {
+        let mut gate = ConnectionGate::new(2);
+        assert!(gate.try_accept());
+        assert!(gate.try_accept());
+        assert!(!gate.try_accept());
+        gate.release();
+        assert!(gate.try_accept());
+    }
+
+    #[test]
+    fn test_rate_limit_constants() {
+        assert_eq!(DEFAULT_RATE_LIMIT_RPS, 10);
+        assert_eq!(DEFAULT_RATE_LIMIT_BURST, 20);
+        assert_eq!(DEFAULT_MAX_CONNECTIONS, 100);
     }
 }
