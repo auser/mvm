@@ -1,7 +1,7 @@
 use anyhow::{Context, Result};
 use std::process::{Command, Output, Stdio};
 
-use crate::config::VM_NAME;
+use super::config::VM_NAME;
 
 /// Run a command on the host, capturing output.
 pub fn run_host(cmd: &str, args: &[&str]) -> Result<Output> {

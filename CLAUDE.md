@@ -1,86 +1,118 @@
-# mvm — Firecracker MicroVM CLI
+# mvm -- Firecracker MicroVM Fleet Manager
 
 ## Project Overview
 
-Rust CLI tool that manages Firecracker microVMs on Apple Silicon (M3+) via Lima virtualization. It orchestrates a three-layer stack:
+Rust CLI that orchestrates multi-tenant Firecracker microVM fleets on Linux (or macOS via Lima on Apple Silicon and x86_64). It provides Nix-based reproducible builds, snapshot-based sleep/wake, per-tenant network isolation, and coordinator-driven reconciliation.
 
 ```
-macOS Host (this CLI) → Lima VM ("mvm", Ubuntu) → Firecracker microVM (172.16.0.2)
+macOS / Linux Host (this CLI) -> Lima VM (Ubuntu) -> Firecracker microVMs (/dev/kvm)
 ```
+
+## Object Model
+
+```
+Tenant (security/quota/network boundary)
+  -> WorkerPool (homogeneous workload group, shared artifacts)
+       -> Instance (individual Firecracker microVM with state machine)
+```
+
+- **Tenant** -- isolation boundary. Owns quotas, network (coordinator-assigned subnet), secrets, audit log.
+- **WorkerPool** -- workload definition. Owns flake ref, profile, desired counts, shared artifacts + base snapshot.
+- **Instance** -- runtime entity. Owns state machine, TAP device, data disk, delta snapshot, PID.
 
 ## Architecture
 
-The CLI runs on the macOS host. All Linux operations happen inside the Lima VM via `limactl shell mvm bash -c "..."`. The Firecracker microVM runs inside the Lima VM using nested virtualization (/dev/kvm).
+The CLI runs on the host. All Linux operations run inside the Lima VM via `limactl shell mvm bash -c "..."`. Firecracker microVMs run inside Lima using nested virtualization (/dev/kvm).
 
 ### Module Map
 
-- `main.rs` — clap CLI dispatch with subcommands: setup, start, stop, ssh, status, destroy
-- `config.rs` — constants (VM_NAME, FC_VERSION, ARCH, network config), MvmState struct, lima.yaml locator
-- `shell.rs` — command helpers: `run_host`, `run_in_vm`, `run_in_vm_visible`, `run_in_vm_stdout`, `replace_process`
-- `lima.rs` — Lima VM lifecycle: get_status, create, start, ensure_running, require_running, destroy
-- `firecracker.rs` — Firecracker installation, asset download (kernel/rootfs from S3), rootfs preparation, state file management
-- `network.rs` — TAP device setup/teardown, IP forwarding, iptables NAT
-- `microvm.rs` — MicroVM lifecycle: start (full sequence), stop, ssh, is_ssh_reachable
+**Infrastructure (unchanged from dev mode):**
+- `infra/config.rs` -- constants (VM_NAME, FC_VERSION, ARCH, dev-mode network config), MvmState
+- `infra/shell.rs` -- command helpers: `run_host`, `run_in_vm`, `run_in_vm_stdout`, `replace_process`
+- `infra/bootstrap.rs` -- Homebrew + Lima installation
+- `infra/ui.rs` -- colored output, spinners, confirmations
+- `infra/upgrade.rs` -- self-update
+
+**Dev mode (unchanged):**
+- `vm/microvm.rs` -- single-VM lifecycle (start, stop, ssh)
+- `vm/firecracker.rs` -- FC binary install, asset download
+- `vm/network.rs` -- dev-mode TAP/NAT (172.16.0.x)
+- `vm/lima.rs` -- Lima VM lifecycle
+- `vm/image.rs` -- Mvmfile.toml build pipeline
+
+**Multi-tenant model (new):**
+- `vm/naming.rs` -- ID validation, instance_id gen, TAP naming
+- `vm/bridge.rs` -- per-tenant bridge (br-tenant-<net_id>) create/destroy/verify
+- `vm/tenant/{config,lifecycle,quota,secrets}.rs` -- tenant management
+- `vm/pool/{config,lifecycle,build,artifacts}.rs` -- pool management + ephemeral FC builds
+- `vm/instance/{state,lifecycle,net,fc_config,disk,snapshot}.rs` -- instance lifecycle API
+- `security/{jailer,cgroups,seccomp,audit,metadata}.rs` -- hardening
+- `sleep/{policy,metrics}.rs` -- sleep heuristics
+- `worker/hooks.rs` -- guest worker signals
+- `agent.rs` -- reconcile loop + QUIC daemon
+- `node.rs` -- node identity + stats
 
 ### Key Design Decisions
 
-- **Persistent microVM**: `mvm start` launches Firecracker as a daemon (nohup setsid). Exiting SSH does NOT kill the VM. Use `mvm stop` to shut down, `mvm ssh` to reconnect.
-- **Shell scripts inside run_in_vm**: Complex operations (API calls, asset discovery) are bash scripts passed to `limactl shell`. This is deliberate — the operations need to run inside the Linux VM.
-- **replace_process for SSH**: Uses Unix process replacement for clean TTY pass-through.
-- **Idempotent setup**: Every step checks if already done before acting.
+- **Firecracker-only execution**: no Docker/containers. Builds run in ephemeral FC VMs with Nix.
+- **Coordinator owns network allocation**: tenant subnets from cluster CIDR (10.240.0.0/12). Agents never derive IPs.
+- **Per-tenant bridges**: network isolation by construction (separate L2 domains).
+- **Pool-level base snapshots**: shared across instances. Instance-level delta snapshots on sleep.
+- **Single lifecycle API**: all operations go through `instance/lifecycle.rs`. No direct FC manipulation elsewhere.
+- **Dev mode isolation**: `mvm start/stop/ssh/dev` use a completely separate code path.
+- **Persistent microVM**: `mvm start` launches Firecracker as a daemon. Exiting SSH does NOT kill the VM.
+- **Shell scripts inside run_in_vm**: complex ops are bash scripts passed to `limactl shell`. Deliberate -- they run inside the Linux VM.
+- **replace_process for SSH**: Unix process replacement for clean TTY pass-through.
+- **Idempotent setup**: every step checks if already done before acting.
 
-### Dependencies on Sibling Project
+### Networking
 
-`resources/lima.yaml` is copied from `../firecracker-lima-vm/lima.yaml`. It configures:
-- Ubuntu base image
-- Writable home directory mount
-- Nested virtualization enabled
-- Provisioning script for /dev/kvm permissions (kvm group + udev rules)
+- Cluster CIDR: `10.240.0.0/12`, coordinator-assigned per-tenant /24 subnets
+- Per-tenant bridge: `br-tenant-<tenant_net_id>` with gateway at .1
+- TAP naming: `tn<net_id>i<ip_offset>` (e.g. `tn3i5`)
+- Within-tenant east/west: allowed (same bridge)
+- Cross-tenant: denied by construction (separate bridges)
+- Sleep/wake preserves network identity
 
-## Current State
+### Instance State Machine
 
-All subcommands are implemented and the project compiles cleanly. The CLI has been tested with `mvm status` against a running VM+microVM stack.
+Created -> Ready -> Running -> Warm -> Sleeping -> (wake) -> Running
+Running/Warm/Sleeping -> Stopped -> Running (fresh boot)
+Any -> Destroyed
 
-## What Needs Work
-
-### Testing and Hardening
-- Test full `mvm setup` flow from scratch (no existing VM)
-- Test `mvm start` then interactive SSH then exit then `mvm ssh` reconnect then `mvm stop`
-- Test `mvm destroy` and re-setup
-- The `api_put` helper in microvm.rs uses single quotes around data which may not work if the JSON contains single quotes — consider escaping
-- The logfile path in `configure_microvm` uses `$HOME/microvm` which needs to expand inside the VM shell, verify this works
-
-### Features to Add
-- `mvm shell` — open a Lima VM shell (not microVM), useful for accessing host-mounted files in Linux
-- Better error messages when Firecracker fails to start (parse firecracker.log)
-- `--verbose` flag for debug output
-- Consider making FC_VERSION, ARCH configurable via CLI args or config file
-- Multiple microVM support (currently hardcoded to single instance)
-
-### Code Quality
-- Add `#[cfg(test)]` unit tests for config.rs (lima.yaml finding logic)
-- The shell scripts embedded in Rust strings are hard to maintain — consider extracting to .sh files in resources/
-- Consistent error prefix ([mvm] vs no prefix)
+All transitions enforced in `instance/state.rs`. Invalid transitions fail loudly.
 
 ## Build and Run
 
 ```bash
 cargo build
 cargo run -- --help
-cargo run -- status
-cargo run -- setup    # creates Lima VM + installs everything
-cargo run -- start    # starts microVM, drops into SSH
-cargo run -- ssh      # reconnects to running microVM
-cargo run -- stop     # stops microVM
-cargo run -- destroy  # tears down Lima VM entirely
+
+# Dev mode
+cargo run -- dev         # auto-bootstrap + launch + SSH
+cargo run -- status      # check what's running
+
+# Multi-tenant
+cargo run -- tenant create acme --net-id 3 --subnet 10.240.3.0/24
+cargo run -- pool create acme/workers --flake . --profile minimal --cpus 2 --mem 1024
+cargo run -- pool build acme/workers
+cargo run -- instance list acme/workers
 ```
 
-## Network Layout
+## Dev Network Layout
 
 ```
 MicroVM (172.16.0.2, eth0)
     | TAP interface
-Lima VM (172.16.0.1, tap0) — iptables NAT — internet
+Lima VM (172.16.0.1, tap0) -- iptables NAT -- internet
     | Lima virtualization
-macOS Host
+macOS / Linux Host
 ```
+
+## Documentation
+
+- `docs/architecture.md` -- full module map, data model, filesystem layout
+- `docs/networking.md` -- cluster-wide subnets, bridges, isolation
+- `docs/cli.md` -- complete command reference
+- `docs/agent.md` -- desired state schema, reconcile loop, QUIC API
+- `specs/plans/` -- implementation specs and plan

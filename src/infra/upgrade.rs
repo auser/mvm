@@ -1,8 +1,9 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 
-use crate::shell::run_host;
-use crate::ui;
+use super::http;
+use super::shell::run_host;
+use super::ui;
 
 const GITHUB_REPO: &str = "auser/mvm";
 
@@ -46,22 +47,8 @@ fn fetch_latest_version() -> Result<String> {
         GITHUB_REPO
     );
 
-    let output = run_host(
-        "curl",
-        &["-fsSL", "-H", "Accept: application/vnd.github+json", &url],
-    )?;
-
-    if !output.status.success() {
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Failed to query GitHub releases API. Check your network connection.\n{}",
-            stderr.trim()
-        );
-    }
-
-    let stdout = String::from_utf8_lossy(&output.stdout);
-    let json: serde_json::Value =
-        serde_json::from_str(&stdout).context("Failed to parse GitHub API response")?;
+    let json = http::fetch_json(&url)
+        .context("Failed to query GitHub releases API. Check your network connection.")?;
 
     let tag = json["tag_name"]
         .as_str()
@@ -86,21 +73,12 @@ fn download_release(version: &str, target: &str, tmp_dir: &Path) -> Result<()> {
 
     let sp = ui::spinner(&format!("Downloading {}...", download_url));
 
-    let output = run_host(
-        "curl",
-        &["-fsSL", "-o", dest.to_str().unwrap(), &download_url],
-    )?;
-
-    if !output.status.success() {
-        sp.finish_and_clear();
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        anyhow::bail!(
-            "Download failed. Check that {} has a release for {}.\n{}",
-            version,
-            target,
-            stderr.trim()
-        );
-    }
+    http::download_file(&download_url, &dest).with_context(|| {
+        format!(
+            "Download failed. Check that {} has a release for {}.",
+            version, target
+        )
+    })?;
 
     sp.finish_and_clear();
     ui::success("Download complete.");

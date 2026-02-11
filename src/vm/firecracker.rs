@@ -1,8 +1,8 @@
 use anyhow::Result;
 
-use crate::config::*;
-use crate::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
-use crate::ui;
+use crate::infra::config::*;
+use crate::infra::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
+use crate::infra::ui;
 
 /// Check if Firecracker is installed inside the Lima VM.
 pub fn is_installed() -> Result<bool> {

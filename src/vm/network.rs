@@ -1,8 +1,8 @@
 use anyhow::Result;
 
-use crate::config::*;
-use crate::shell::run_in_vm_visible;
-use crate::ui;
+use crate::infra::config::*;
+use crate::infra::shell::run_in_vm_visible;
+use crate::infra::ui;
 
 /// Set up TAP networking, IP forwarding, and NAT inside the Lima VM.
 pub fn setup() -> Result<()> {

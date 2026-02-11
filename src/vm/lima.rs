@@ -1,8 +1,8 @@
 use anyhow::{Context, Result};
 
-use crate::config::VM_NAME;
-use crate::shell::{run_host, run_host_visible};
-use crate::ui;
+use crate::infra::config::VM_NAME;
+use crate::infra::shell::{run_host, run_host_visible};
+use crate::infra::ui;
 
 #[derive(Debug, PartialEq)]
 pub enum LimaStatus {

@@ -1,9 +1,9 @@
 use anyhow::Result;
 
-use crate::config::*;
-use crate::shell::{replace_process, run_in_vm, run_in_vm_stdout, run_in_vm_visible};
-use crate::ui;
-use crate::{firecracker, lima, network};
+use super::{firecracker, lima, network};
+use crate::infra::config::*;
+use crate::infra::shell::{replace_process, run_in_vm, run_in_vm_stdout, run_in_vm_visible};
+use crate::infra::ui;
 
 /// Start the Firecracker daemon inside the Lima VM (background).
 fn start_firecracker_daemon() -> Result<()> {
