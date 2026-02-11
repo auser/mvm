@@ -136,6 +136,121 @@ fn strict_profile_json() -> &'static str {
 }"#
 }
 
+/// Generate the seccomp syscall allowlist for the hostd daemon.
+///
+/// Hostd only needs: socket operations, file I/O, process management
+/// (fork/exec for shell commands), and netlink for bridge/TAP setup.
+pub fn hostd_syscall_allowlist() -> &'static [&'static str] {
+    &[
+        // Process
+        "clone",
+        "clone3",
+        "execve",
+        "exit",
+        "exit_group",
+        "wait4",
+        "kill",
+        "getpid",
+        "getppid",
+        "gettid",
+        "set_tid_address",
+        "set_robust_list",
+        // File I/O
+        "openat",
+        "close",
+        "read",
+        "write",
+        "fstat",
+        "newfstatat",
+        "lseek",
+        "fcntl",
+        "dup",
+        "dup2",
+        "dup3",
+        "pipe2",
+        "mkdir",
+        "mkdirat",
+        "unlink",
+        "unlinkat",
+        "rename",
+        "renameat",
+        "renameat2",
+        "chmod",
+        "fchmod",
+        "fchmodat",
+        "chown",
+        "fchown",
+        "fchownat",
+        "readlink",
+        "readlinkat",
+        "getcwd",
+        "access",
+        "faccessat",
+        "faccessat2",
+        "statx",
+        // Memory
+        "brk",
+        "mmap",
+        "munmap",
+        "mprotect",
+        "madvise",
+        "mremap",
+        // Socket (Unix domain socket for IPC)
+        "socket",
+        "bind",
+        "listen",
+        "accept4",
+        "connect",
+        "sendto",
+        "recvfrom",
+        "sendmsg",
+        "recvmsg",
+        "shutdown",
+        "getsockname",
+        "getpeername",
+        "setsockopt",
+        "getsockopt",
+        // Network (netlink for bridge/TAP, ioctl for network devices)
+        "ioctl",
+        // Signals
+        "rt_sigaction",
+        "rt_sigprocmask",
+        "rt_sigreturn",
+        "sigaltstack",
+        // Time
+        "clock_gettime",
+        "clock_nanosleep",
+        "nanosleep",
+        // Misc
+        "futex",
+        "getrandom",
+        "arch_prctl",
+        "prctl",
+        "rseq",
+        "epoll_create1",
+        "epoll_ctl",
+        "epoll_pwait",
+        // cgroups
+        "mount",
+        "umount2",
+        "pivot_root",
+        "chroot",
+        "chdir",
+        "fchdir",
+        // Device nodes (mknod for /dev/kvm, /dev/net/tun)
+        "mknod",
+        "mknodat",
+        // UID/GID switching (jailer)
+        "setuid",
+        "setgid",
+        "setgroups",
+        "getuid",
+        "geteuid",
+        "getgid",
+        "getegid",
+    ]
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -164,5 +279,30 @@ mod tests {
         assert!(parsed.get("Vmm").is_some());
         assert!(parsed.get("Api").is_some());
         assert!(parsed.get("Vcpu").is_some());
+    }
+
+    #[test]
+    fn test_hostd_syscall_allowlist_not_empty() {
+        let list = hostd_syscall_allowlist();
+        assert!(!list.is_empty());
+        // Must include critical syscalls for hostd operation
+        assert!(list.contains(&"socket"));
+        assert!(list.contains(&"bind"));
+        assert!(list.contains(&"accept4"));
+        assert!(list.contains(&"execve"));
+        assert!(list.contains(&"ioctl"));
+        assert!(list.contains(&"clone"));
+        assert!(list.contains(&"mknod"));
+        assert!(list.contains(&"chroot"));
+        assert!(list.contains(&"setuid"));
+    }
+
+    #[test]
+    fn test_hostd_syscall_allowlist_no_duplicates() {
+        let list = hostd_syscall_allowlist();
+        let mut seen = std::collections::HashSet::new();
+        for syscall in list {
+            assert!(seen.insert(syscall), "Duplicate syscall: {}", syscall);
+        }
     }
 }

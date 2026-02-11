@@ -1,13 +1,25 @@
 use anyhow::{Context, Result};
 use tracing::instrument;
 
-use super::config::{TenantConfig, TenantNet, TenantQuota, tenant_config_path, tenant_dir};
+use super::config::{
+    TENANT_BASE, TenantConfig, TenantNet, TenantQuota, tenant_config_path, tenant_dir,
+};
 use crate::infra::http;
 use crate::infra::shell;
+
+/// Ensure /var/lib/mvm base directory exists and is writable by the current user.
+fn ensure_base_dir() -> Result<()> {
+    shell::run_in_vm(&format!(
+        "sudo mkdir -p {base} && sudo chown $(whoami) {base}",
+        base = TENANT_BASE,
+    ))?;
+    Ok(())
+}
 
 /// Create a new tenant: directories, config, SSH keypair.
 #[instrument(skip_all, fields(tenant_id))]
 pub fn tenant_create(tenant_id: &str, net: TenantNet, quotas: TenantQuota) -> Result<TenantConfig> {
+    ensure_base_dir()?;
     let dir = tenant_dir(tenant_id);
     shell::run_in_vm(&format!("mkdir -p {dir}/pools"))?;
 

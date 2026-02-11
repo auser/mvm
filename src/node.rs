@@ -21,6 +21,13 @@ pub struct NodeInfo {
     pub firecracker_version: Option<String>,
     pub jailer_available: bool,
     pub cgroup_v2: bool,
+    /// Attestation provider type ("none", "tpm2", "sev-snp", "tdx").
+    #[serde(default = "default_attestation_provider")]
+    pub attestation_provider: String,
+}
+
+fn default_attestation_provider() -> String {
+    "none".to_string()
 }
 
 /// Aggregate node statistics across all tenants.
@@ -76,6 +83,8 @@ pub fn collect_info() -> Result<NodeInfo> {
             .map(|s| s.trim() == "yes")
             .unwrap_or(false);
 
+    let attest_provider = crate::security::attestation::default_provider();
+
     Ok(NodeInfo {
         node_id: node_id.trim().to_string(),
         hostname: hostname.trim().to_string(),
@@ -86,6 +95,7 @@ pub fn collect_info() -> Result<NodeInfo> {
         firecracker_version: fc_version,
         jailer_available: has_jailer,
         cgroup_v2,
+        attestation_provider: attest_provider.provider_name().to_string(),
     })
 }
 
@@ -190,6 +200,7 @@ mod tests {
             firecracker_version: Some("v1.6.0".to_string()),
             jailer_available: true,
             cgroup_v2: true,
+            attestation_provider: "none".to_string(),
         };
 
         let json = serde_json::to_string(&info).unwrap();

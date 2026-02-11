@@ -1,6 +1,6 @@
-# Security Baseline
+# Security Architecture
 
-mvm implements a "90% secure" production baseline. This document covers the threat model, hardening measures, and what's explicitly deferred.
+mvm implements a fully hardened production security model. This document covers the threat model, hardening measures, privilege separation, and cryptographic protections.
 
 ## Threat Model
 
@@ -98,11 +98,66 @@ mvm implements a "90% secure" production baseline. This document covers the thre
 | `/etc/mvm/certs/` | 0700 | TLS certificates |
 | `/etc/mvm/desired.json` | 0600 | Desired state configuration |
 
+## Privilege Separation (Hostd/Agentd Split)
+
+Production deployments split the agent into two processes:
+
+- **mvm-hostd** — Privileged executor daemon. Runs as root with a minimal capability bounding set. Listens on `/run/mvm/hostd.sock` (Unix domain socket, 0660, group `mvm`). Executes only pre-defined operations: start/stop/sleep/wake/destroy instances, setup/teardown network bridges.
+- **mvm-agentd** — Unprivileged reconciler. Runs as the `mvm` user with zero capabilities. Handles QUIC API, desired state validation, reconcile logic. Delegates all privileged operations to hostd via typed IPC.
+
+**IPC Protocol**: Length-prefixed JSON over Unix domain socket (4-byte BE length + JSON body). Same frame protocol as the QUIC API. Request/response types are fully typed enums (`HostdRequest`/`HostdResponse`).
+
+**Systemd Units**:
+- `deploy/systemd/mvm-hostd.service` — Root, `CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_CHOWN CAP_FOWNER CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_MKNOD CAP_DAC_OVERRIDE`
+- `deploy/systemd/mvm-agentd.service` — User `mvm`, `CapabilityBoundingSet=` (empty)
+
+**Backwards Compatibility**: The `--hostd-socket` flag is opt-in. Without it, the agent runs as a single process (current dev-mode behavior).
+
+## Snapshot Encryption (AES-256-GCM)
+
+Snapshot memory files are encrypted per-tenant using AES-256-GCM:
+
+- **Algorithm**: AES-256-GCM with random 12-byte nonce per file
+- **Format**: `[12-byte nonce][ciphertext][16-byte authentication tag]`
+- **Key source**: Per-tenant key from `KeyProvider` (env var or file-based)
+- **In-place encryption**: After snapshot capture, plaintext is encrypted to `.enc`, then the plaintext file is deleted
+- **Authentication**: GCM tag provides tamper detection — decryption fails if ciphertext is modified
+
+Module: `security/snapshot_crypto.rs`
+
+## Signed Desired State (Ed25519)
+
+Coordinator-pushed desired state can be cryptographically signed:
+
+- **Algorithm**: Ed25519 (via `ed25519-dalek` crate)
+- **Trusted keys**: Stored in `/etc/mvm/trusted_keys/*.pub` (base64-encoded 32-byte public keys)
+- **Production enforcement**: When `MVM_PRODUCTION=1`, unsigned `Reconcile` requests are rejected with HTTP 403. Only `ReconcileSigned` requests are accepted.
+- **Dev mode**: Both signed and unsigned requests are accepted (backwards compatible)
+- **Signed data covers**: The entire `DesiredState` JSON (tenant IDs, pool IDs, resource limits, desired counts, subnet allocations)
+
+Module: `security/signing.rs`
+
+## Memory Hygiene
+
+All cryptographic key material is wrapped in `Zeroizing<Vec<u8>>` (from the `zeroize` crate):
+
+- `KeyProvider::get_data_key()` returns `Zeroizing<Vec<u8>>` — keys are zeroed on drop
+- Hex-encoded key strings in `encryption.rs` are wrapped in `Zeroizing<String>`
+- Ed25519 `SigningKey` from `ed25519-dalek` already implements `Zeroize`
+- No key material appears in `tracing::info!` or `tracing::debug!` logs
+
+## Node Attestation (Extension Point)
+
+`security/attestation.rs` provides an `AttestationProvider` trait for future TPM2/SEV-SNP/TDX integration:
+
+- `NoopAttestationProvider` — default, reports `provider: "none"`
+- `NodeInfo.attestation_provider` field reports the active attestation mechanism
+- When hardware attestation is available, implement the trait and register the provider
+
 ## Explicitly Deferred
 
-| Item | Reason | Target |
-|------|--------|--------|
-| Privilege separation (agentd/hostd split) | High complexity, requires separate binaries + Unix socket RPC | Sprint 5 |
-| Snapshot encryption | Depends on key management maturity; hardened permissions + GC covers 80% | Sprint 5 |
-| Signed desired-state updates (Ed25519) | Requires coordinator-side signing infrastructure | Sprint 5 |
-| Shared-bridge segmentation with nftables tagging | Per-tenant bridges already provide isolation by construction | Not planned |
+| Item | Reason |
+|------|--------|
+| `mlock` for key memory pages | Platform-specific complexity, `Zeroizing` covers the common case |
+| Full TPM2/SEV-SNP attestation implementation | Requires hardware; trait + extension point ready |
+| Shared-bridge segmentation with nftables tagging | Per-tenant bridges already provide isolation by construction |

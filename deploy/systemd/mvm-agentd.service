@@ -1,0 +1,57 @@
+[Unit]
+Description=mvm Agentd - Unprivileged Fleet Reconciler
+Documentation=https://github.com/auser/mvm
+After=network-online.target mvm-hostd.service
+Wants=network-online.target
+Requires=mvm-hostd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mvm agent serve \
+    --desired /etc/mvm/desired.json \
+    --interval-secs 30 \
+    --listen 0.0.0.0:4433 \
+    --tls-cert /etc/mvm/certs/node.crt \
+    --tls-key /etc/mvm/certs/node.key \
+    --tls-ca /etc/mvm/certs/ca.crt \
+    --hostd-socket /run/mvm/hostd.sock
+Restart=on-failure
+RestartSec=5
+Environment=MVM_PRODUCTION=1
+Environment=RUST_LOG=info
+
+# Agentd runs fully unprivileged as the mvm user.
+# All privileged operations go through hostd via Unix socket IPC.
+User=mvm
+Group=mvm
+
+# No capabilities needed — all privileged ops delegated to hostd
+CapabilityBoundingSet=
+NoNewPrivileges=true
+
+# Filesystem restrictions
+ProtectHome=true
+ProtectSystem=strict
+ReadOnlyPaths=/etc/mvm /var/lib/mvm
+ReadWritePaths=/run/mvm
+PrivateTmp=true
+
+# Kernel hardening
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+# Network: needs QUIC listener and Unix socket
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+[Install]
+WantedBy=multi-user.target

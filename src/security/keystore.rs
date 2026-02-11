@@ -1,10 +1,12 @@
 use anyhow::{Context, Result};
+use zeroize::Zeroizing;
 
 /// Trait for providing encryption keys for tenant data volumes.
 pub trait KeyProvider: Send + Sync {
     /// Get the data encryption key for a tenant.
     /// Returns 32 bytes (256-bit key for AES-256-XTS which uses 512-bit key internally).
-    fn get_data_key(&self, tenant_id: &str) -> Result<Vec<u8>>;
+    /// Wrapped in Zeroizing to ensure key material is wiped from memory on drop.
+    fn get_data_key(&self, tenant_id: &str) -> Result<Zeroizing<Vec<u8>>>;
 }
 
 /// Reads keys from environment variables: MVM_TENANT_KEY_<TENANT_ID> (hex-encoded).
@@ -12,14 +14,15 @@ pub trait KeyProvider: Send + Sync {
 pub struct EnvKeyProvider;
 
 impl KeyProvider for EnvKeyProvider {
-    fn get_data_key(&self, tenant_id: &str) -> Result<Vec<u8>> {
+    fn get_data_key(&self, tenant_id: &str) -> Result<Zeroizing<Vec<u8>>> {
         let var_name = format!(
             "MVM_TENANT_KEY_{}",
             tenant_id.to_uppercase().replace('-', "_")
         );
         let hex = std::env::var(&var_name)
             .with_context(|| format!("Missing encryption key env var: {}", var_name))?;
-        hex_decode(&hex).with_context(|| format!("Invalid hex in {}", var_name))
+        let key = hex_decode(&hex).with_context(|| format!("Invalid hex in {}", var_name))?;
+        Ok(Zeroizing::new(key))
     }
 }
 
@@ -28,14 +31,16 @@ impl KeyProvider for EnvKeyProvider {
 pub struct FileKeyProvider;
 
 impl KeyProvider for FileKeyProvider {
-    fn get_data_key(&self, tenant_id: &str) -> Result<Vec<u8>> {
+    fn get_data_key(&self, tenant_id: &str) -> Result<Zeroizing<Vec<u8>>> {
         let path = format!("/var/lib/mvm/keys/{}.key", tenant_id);
         let output = crate::infra::shell::run_in_vm_stdout(&format!(
             "xxd -p {} 2>/dev/null | tr -d '\\n'",
             path
         ))
         .with_context(|| format!("Failed to read key file: {}", path))?;
-        hex_decode(output.trim()).with_context(|| format!("Invalid key data in {}", path))
+        let key =
+            hex_decode(output.trim()).with_context(|| format!("Invalid key data in {}", path))?;
+        Ok(Zeroizing::new(key))
     }
 }
 

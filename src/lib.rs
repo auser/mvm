@@ -1,5 +1,6 @@
 pub mod agent;
 pub mod coordinator;
+pub mod hostd;
 pub mod infra;
 pub mod node;
 pub mod observability;

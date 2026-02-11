@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use zeroize::Zeroizing;
 
 use crate::infra::shell;
 
@@ -7,7 +8,7 @@ use crate::infra::shell;
 /// Uses cryptsetup luksFormat with AES-256-XTS.
 /// The key is passed via stdin (never written to disk or logged).
 pub fn create_encrypted_volume(path: &str, size_mib: u32, key: &[u8]) -> Result<()> {
-    let hex_key = hex_encode(key);
+    let hex_key = Zeroizing::new(hex_encode(key));
     shell::run_in_vm(&format!(
         r#"
         truncate -s {size}M {path}
@@ -19,7 +20,7 @@ pub fn create_encrypted_volume(path: &str, size_mib: u32, key: &[u8]) -> Result<
         "#,
         path = path,
         size = size_mib,
-        key = hex_key,
+        key = *hex_key,
     ))
     .with_context(|| format!("Failed to create LUKS volume at {}", path))?;
     Ok(())
@@ -29,7 +30,7 @@ pub fn create_encrypted_volume(path: &str, size_mib: u32, key: &[u8]) -> Result<
 ///
 /// The key is passed via stdin to cryptsetup (never on command line).
 pub fn open_encrypted_volume(path: &str, name: &str, key: &[u8]) -> Result<String> {
-    let hex_key = hex_encode(key);
+    let hex_key = Zeroizing::new(hex_encode(key));
     let mapper_path = format!("/dev/mapper/{}", name);
     shell::run_in_vm(&format!(
         r#"
@@ -37,7 +38,7 @@ pub fn open_encrypted_volume(path: &str, name: &str, key: &[u8]) -> Result<Strin
             sudo cryptsetup luksOpen --key-file - {path} {name}
         "#,
         path = path,
-        key = hex_key,
+        key = *hex_key,
         name = name,
     ))
     .with_context(|| format!("Failed to open LUKS volume {} as {}", path, name))?;

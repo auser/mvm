@@ -400,6 +400,15 @@ enum AgentCmd {
         #[arg(long)]
         listen: Option<String>,
     },
+    /// Generate desired state JSON from existing tenants and pools
+    Desired {
+        /// Write to file instead of stdout
+        #[arg(long)]
+        file: Option<String>,
+        /// Node identifier
+        #[arg(long, default_value = "local")]
+        node_id: String,
+    },
     /// Manage mTLS certificates for agent communication
     Certs {
         #[command(subcommand)]
@@ -1249,6 +1258,18 @@ fn cmd_agent(action: AgentCmd) -> Result<()> {
 
     match action {
         AgentCmd::Reconcile { desired, prune } => mvm::agent::reconcile(&desired, prune),
+        AgentCmd::Desired { file, node_id } => {
+            let desired = mvm::agent::generate_desired(&node_id)?;
+            let json = serde_json::to_string_pretty(&desired)?;
+            match file {
+                Some(path) => {
+                    std::fs::write(&path, &json)?;
+                    ui::success(&format!("Desired state written to {}", path));
+                }
+                None => println!("{}", json),
+            }
+            Ok(())
+        }
         AgentCmd::Serve {
             interval_secs,
             desired,

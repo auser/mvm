@@ -47,10 +47,12 @@ The CLI runs on the host. All Linux operations run inside the Lima VM via `limac
 - `vm/pool/{config,lifecycle,build,artifacts}.rs` -- pool management + ephemeral FC builds
 - `vm/instance/{state,lifecycle,net,fc_config,disk,snapshot}.rs` -- instance lifecycle API
 - `security/{jailer,cgroups,seccomp,audit,metadata,encryption,keystore}.rs` -- hardening + LUKS + key management
+- `security/{signing,snapshot_crypto,attestation}.rs` -- Ed25519 signed state, AES-256-GCM snapshot encryption, attestation hook
+- `hostd/{protocol,server,client}.rs` -- privilege separation: Unix socket IPC between agentd (unprivileged) and hostd (privileged)
 - `sleep/{policy,metrics}.rs` -- sleep heuristics
 - `worker/hooks.rs` -- guest worker signals
-- `agent.rs` -- reconcile loop + QUIC daemon
-- `node.rs` -- node identity + stats
+- `agent.rs` -- reconcile loop + QUIC daemon + signed state verification
+- `node.rs` -- node identity + stats + attestation provider
 
 ### Key Design Decisions
 

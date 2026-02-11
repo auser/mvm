@@ -72,6 +72,9 @@ mvm instance wake acme/workers/i-a3f7b2c1
 ### Fleet Reconciliation
 
 ```bash
+# Generate desired state from existing tenants and pools
+mvm agent desired --file desired.json
+
 # One-shot reconcile from desired state file
 mvm agent reconcile --desired desired.json
 
@@ -80,6 +83,40 @@ mvm agent certs init
 
 # Long-running daemon with QUIC+mTLS API and periodic reconcile
 mvm agent serve --desired desired.json --interval-secs 30 --listen 0.0.0.0:4433
+```
+
+### Day-2 Operations
+
+```bash
+# Monitor the fleet
+mvm node info                  # node capabilities (CPUs, memory, KVM)
+mvm node stats                 # aggregate fleet stats across tenants
+mvm instance list              # all instances across all tenants
+
+# Inspect a specific tenant
+mvm tenant info acme --json    # full config as JSON
+mvm events acme --last 10      # recent audit events
+
+# Scale a pool up or down
+mvm pool scale acme/workers --running 5 --warm 2 --sleeping 3
+
+# Sleep idle instances for cost savings, wake on demand
+mvm instance sleep acme/workers/i-a3f7b2c1
+mvm instance wake acme/workers/i-a3f7b2c1
+
+# Rotate secrets and certificates
+mvm tenant secrets rotate acme
+mvm agent certs rotate
+
+# Garbage collection (remove old snapshots and build artifacts)
+mvm pool gc acme/workers
+mvm node gc
+
+# Verify network isolation
+mvm net verify
+
+# Teardown a tenant (cascades to all pools and instances)
+mvm tenant destroy acme --force
 ```
 
 ## Commands
@@ -141,6 +178,7 @@ mvm agent serve --desired desired.json --interval-secs 30 --listen 0.0.0.0:4433
 
 | Command | Description |
 |---------|-------------|
+| `mvm agent desired` | Generate desired state JSON from existing tenants/pools |
 | `mvm agent reconcile --desired <file>` | One-shot reconcile from desired state file |
 | `mvm agent serve` | Long-running daemon with QUIC API + periodic reconcile |
 | `mvm agent certs init` | Initialize mTLS certificates (or `--ca <path>` for external CA) |

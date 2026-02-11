@@ -7,7 +7,7 @@ Manual validation of the full mvm lifecycle. Requires a Linux host with `/dev/kv
 **macOS (via Lima):**
 ```bash
 mvm bootstrap          # installs Lima + Firecracker + kernel + rootfs
-mvm status             # verify Lima VM is running, FC installed
+mvm status             # verify Lima VM is running, FC "Installed, not running"
 ```
 
 **Linux (native):**
@@ -123,54 +123,17 @@ mvm instance stats smoke-test/workers/$INSTANCE_ID
 
 ## 6. Agent Reconcile (One-Shot)
 
-Create a desired state file:
+Generate desired state from the tenants and pools you just created:
 
 ```bash
-cat > /tmp/desired.json << 'EOF'
-{
-  "schema_version": 1,
-  "node_id": "smoke-node",
-  "tenants": [
-    {
-      "tenant_id": "smoke-test",
-      "network": {
-        "tenant_net_id": 99,
-        "ipv4_subnet": "10.240.99.0/24"
-      },
-      "quotas": {
-        "max_vcpus": 8,
-        "max_mem_mib": 8192,
-        "max_running": 4,
-        "max_warm": 2,
-        "max_pools": 3,
-        "max_instances_per_pool": 10,
-        "max_disk_gib": 100
-      },
-      "pools": [
-        {
-          "pool_id": "workers",
-          "flake_ref": ".",
-          "profile": "minimal",
-          "instance_resources": {
-            "vcpus": 2,
-            "mem_mib": 1024,
-            "data_disk_mib": 0
-          },
-          "desired_counts": {
-            "running": 2,
-            "warm": 0,
-            "sleeping": 0
-          },
-          "seccomp_policy": "baseline",
-          "snapshot_compression": "none"
-        }
-      ]
-    }
-  ],
-  "prune_unknown_tenants": false,
-  "prune_unknown_pools": false
-}
-EOF
+# Generate desired state from existing tenant/pool config
+mvm agent desired --file /tmp/desired.json
+
+# Inspect the generated file
+cat /tmp/desired.json
+
+# On macOS, copy the file into the Lima VM for the agent to read
+# limactl copy /tmp/desired.json mvm:/tmp/desired.json
 
 # Run one-shot reconcile
 mvm agent reconcile --desired /tmp/desired.json
@@ -178,6 +141,8 @@ mvm agent reconcile --desired /tmp/desired.json
 # Verify instances match desired state
 mvm instance list --tenant smoke-test --pool workers
 ```
+
+You can also write `desired.json` by hand or generate it from your own tooling. The schema is documented in [docs/agent.md](agent.md).
 
 **Expected**: agent creates/starts instances to match desired counts. Two instances should be Running.
 

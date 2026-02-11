@@ -19,7 +19,9 @@ use crate::vm::instance::lifecycle::{
 use crate::vm::instance::state::{InstanceState, InstanceStatus};
 use crate::vm::pool::lifecycle::{pool_create, pool_list, pool_load};
 use crate::vm::tenant::config::TenantNet;
-use crate::vm::tenant::lifecycle::{tenant_create, tenant_destroy, tenant_exists, tenant_list};
+use crate::vm::tenant::lifecycle::{
+    tenant_create, tenant_destroy, tenant_exists, tenant_list, tenant_load,
+};
 
 // ============================================================================
 // Desired state schema (pushed by coordinator)
@@ -104,8 +106,10 @@ pub struct ReconcileReport {
 /// Strongly typed request sent over QUIC streams.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum AgentRequest {
-    /// Push a new desired state for reconciliation.
+    /// Push a new desired state for reconciliation (unsigned, dev mode only).
     Reconcile(DesiredState),
+    /// Push a signed desired state for reconciliation (production mode).
+    ReconcileSigned(crate::security::signing::SignedPayload),
     /// Query node capabilities and identity.
     NodeInfo,
     /// Query aggregate node statistics.
@@ -276,12 +280,25 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
         AgentRequest::TenantList => "TenantList",
         AgentRequest::InstanceList { .. } => "InstanceList",
         AgentRequest::WakeInstance { .. } => "WakeInstance",
+        AgentRequest::ReconcileSigned(_) => "ReconcileSigned",
     };
     debug!(request_type, "Handling agent request");
 
     match request {
         AgentRequest::Reconcile(desired) => {
             m.requests_reconcile.fetch_add(1, Ordering::Relaxed);
+
+            // In production mode, reject unsigned reconcile requests.
+            if crate::infra::config::is_production_mode() {
+                m.requests_failed.fetch_add(1, Ordering::Relaxed);
+                warn!("Rejected unsigned Reconcile request in production mode");
+                return AgentResponse::Error {
+                    code: 403,
+                    message: "Production mode requires signed desired state (use ReconcileSigned)"
+                        .to_string(),
+                };
+            }
+
             info!(node_id = %desired.node_id, tenants = desired.tenants.len(), "Processing reconcile request");
 
             let validation_errors = validate_desired_state(&desired);
@@ -391,6 +408,31 @@ fn handle_request(request: AgentRequest) -> AgentResponse {
                 }
             }
         }
+        AgentRequest::ReconcileSigned(signed) => {
+            m.requests_reconcile.fetch_add(1, Ordering::Relaxed);
+            info!("Processing signed reconcile request");
+            match crate::security::signing::verify_and_extract::<DesiredState>(&signed) {
+                Ok(desired) => match reconcile_desired(&desired, desired.prune_unknown_tenants) {
+                    Ok(report) => AgentResponse::ReconcileResult(report),
+                    Err(e) => {
+                        m.requests_failed.fetch_add(1, Ordering::Relaxed);
+                        error!(error = %e, "Signed reconcile failed");
+                        AgentResponse::Error {
+                            code: 500,
+                            message: format!("Reconcile failed: {}", e),
+                        }
+                    }
+                },
+                Err(e) => {
+                    m.requests_failed.fetch_add(1, Ordering::Relaxed);
+                    error!(error = %e, "Signature verification failed");
+                    AgentResponse::Error {
+                        code: 403,
+                        message: format!("Signature verification failed: {}", e),
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -439,6 +481,50 @@ pub fn reconcile(desired_path: &str, prune: bool) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Generate a desired state JSON from existing tenants and pools on this node.
+pub fn generate_desired(node_id: &str) -> Result<DesiredState> {
+    let tenant_ids = tenant_list()?;
+    let mut tenants = Vec::new();
+
+    for tid in &tenant_ids {
+        let tc = tenant_load(tid)?;
+        let pool_ids = pool_list(tid)?;
+        let mut pools = Vec::new();
+
+        for pid in &pool_ids {
+            let spec = pool_load(tid, pid)?;
+            pools.push(DesiredPool {
+                pool_id: spec.pool_id,
+                flake_ref: spec.flake_ref,
+                profile: spec.profile,
+                instance_resources: spec.instance_resources,
+                desired_counts: spec.desired_counts,
+                seccomp_policy: spec.seccomp_policy,
+                snapshot_compression: spec.snapshot_compression,
+            });
+        }
+
+        tenants.push(DesiredTenant {
+            tenant_id: tc.tenant_id,
+            network: DesiredTenantNetwork {
+                tenant_net_id: tc.net.tenant_net_id,
+                ipv4_subnet: tc.net.ipv4_subnet,
+            },
+            quotas: tc.quotas,
+            secrets_hash: None,
+            pools,
+        });
+    }
+
+    Ok(DesiredState {
+        schema_version: 1,
+        node_id: node_id.to_string(),
+        tenants,
+        prune_unknown_tenants: false,
+        prune_unknown_pools: false,
+    })
 }
 
 // ============================================================================
@@ -1213,6 +1299,11 @@ mod tests {
                 pool_id: "p".to_string(),
                 instance_id: "i".to_string(),
             },
+            AgentRequest::ReconcileSigned(crate::security::signing::SignedPayload {
+                payload: b"{}".to_vec(),
+                signature: vec![0u8; 64],
+                signer_id: "test".to_string(),
+            }),
         ];
 
         for req in &variants {
@@ -1235,6 +1326,7 @@ mod tests {
                 firecracker_version: None,
                 jailer_available: false,
                 cgroup_v2: false,
+                attestation_provider: "none".to_string(),
             }),
             AgentResponse::NodeStats(node::NodeStats::default()),
             AgentResponse::TenantList(vec!["t1".to_string()]),
@@ -1437,5 +1529,52 @@ mod tests {
         assert!(report.pools_created.is_empty());
         // No instances desired (counts all 0), none created
         assert_eq!(report.instances_created, 0);
+    }
+
+    #[test]
+    fn test_production_rejects_unsigned_reconcile() {
+        // Set production mode
+        unsafe { std::env::set_var("MVM_PRODUCTION", "1") };
+
+        let state = DesiredState {
+            schema_version: 1,
+            node_id: "n".to_string(),
+            tenants: vec![],
+            prune_unknown_tenants: false,
+            prune_unknown_pools: false,
+        };
+
+        let resp = handle_request(AgentRequest::Reconcile(state));
+
+        // Clean up before asserting
+        unsafe { std::env::remove_var("MVM_PRODUCTION") };
+
+        match resp {
+            AgentResponse::Error { code, message } => {
+                assert_eq!(code, 403);
+                assert!(message.contains("signed"));
+            }
+            _ => panic!("Expected 403 error for unsigned reconcile in production mode"),
+        }
+    }
+
+    #[test]
+    fn test_reconcile_signed_roundtrip() {
+        let signed = crate::security::signing::SignedPayload {
+            payload: b"test-payload".to_vec(),
+            signature: vec![0u8; 64],
+            signer_id: "coord-1".to_string(),
+        };
+        let req = AgentRequest::ReconcileSigned(signed);
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: AgentRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            AgentRequest::ReconcileSigned(s) => {
+                assert_eq!(s.payload, b"test-payload");
+                assert_eq!(s.signature.len(), 64);
+                assert_eq!(s.signer_id, "coord-1");
+            }
+            _ => panic!("Wrong variant"),
+        }
     }
 }

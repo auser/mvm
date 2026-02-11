@@ -12,12 +12,19 @@ path = "src/lib.rs"
 name = "mvm"
 path = "src/main.rs"
 
+[[bin]]
+name = "mvm-hostd"
+path = "src/bin/mvm-hostd.rs"
+
 [dependencies]
+aes-gcm = "0.10"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+base64 = "0.22"
 colored = "3"
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
 indicatif = "0.17"
 inquire = "0.7"
 quinn = "0.11"

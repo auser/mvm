@@ -1,0 +1,59 @@
+[Unit]
+Description=mvm Hostd - Privileged MicroVM Executor
+Documentation=https://github.com/auser/mvm
+After=network-online.target
+Wants=network-online.target
+Before=mvm-agentd.service
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/mvm-hostd serve --socket /run/mvm/hostd.sock
+Restart=on-failure
+RestartSec=5
+Environment=RUST_LOG=info
+
+# Hostd runs as root but with a strict capability bounding set.
+# Only the capabilities required for privileged VM operations are allowed.
+User=root
+
+# Capability justifications:
+# CAP_NET_ADMIN     — bridge/TAP/iptables manipulation
+# CAP_SYS_ADMIN     — cgroup v2 writes, mount operations for LUKS
+# CAP_KILL           — signal Firecracker processes in cgroups
+# CAP_CHOWN          — jailer chroot setup (change ownership)
+# CAP_FOWNER         — jailer chroot setup (bypass permission checks)
+# CAP_SYS_CHROOT     — jailer enters chroot
+# CAP_SETUID         — jailer per-instance uid
+# CAP_SETGID         — jailer per-instance gid
+# CAP_MKNOD          — jailer creates /dev/kvm, /dev/net/tun nodes
+# CAP_DAC_OVERRIDE   — access files owned by jailer UIDs
+CapabilityBoundingSet=CAP_NET_ADMIN CAP_SYS_ADMIN CAP_KILL CAP_CHOWN CAP_FOWNER CAP_SYS_CHROOT CAP_SETUID CAP_SETGID CAP_MKNOD CAP_DAC_OVERRIDE
+NoNewPrivileges=true
+
+# Filesystem restrictions
+ProtectHome=true
+ProtectSystem=strict
+ReadWritePaths=/var/lib/mvm /sys/fs/cgroup/mvm /run/mvm /dev/mapper
+PrivateTmp=true
+
+# Kernel hardening
+ProtectKernelTunables=no
+ProtectKernelModules=yes
+ProtectControlGroups=no
+LockPersonality=yes
+MemoryDenyWriteExecute=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+SystemCallArchitectures=native
+
+# Resource limits
+LimitNOFILE=65536
+LimitNPROC=4096
+
+# Socket directory setup
+ExecStartPre=/bin/mkdir -p /run/mvm
+ExecStartPre=/bin/chmod 0750 /run/mvm
+ExecStartPre=/bin/chown root:mvm /run/mvm
+
+[Install]
+WantedBy=multi-user.target

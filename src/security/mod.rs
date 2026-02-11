@@ -1,3 +1,4 @@
+pub mod attestation;
 pub mod audit;
 pub mod certs;
 pub mod cgroups;
@@ -6,3 +7,5 @@ pub mod jailer;
 pub mod keystore;
 pub mod metadata;
 pub mod seccomp;
+pub mod signing;
+pub mod snapshot_crypto;
