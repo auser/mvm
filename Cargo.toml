@@ -1,3 +1,69 @@
+[workspace]
+members = [
+    "crates/mvm-core",
+    "crates/mvm-runtime",
+    "crates/mvm-build",
+    "crates/mvm-guest",
+    "crates/mvm-agent",
+    "crates/mvm-cli",
+]
+resolver = "3"
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Crypto / security
+aes-gcm = "0.10"
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
+rcgen = { version = "0.13", features = ["pem"] }
+rustls = { version = "0.23", features = ["ring"] }
+rustls-pemfile = "2"
+sha2 = "0.10"
+zeroize = "1"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+serde_yaml = "0.9"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+colored = "3"
+indicatif = "0.17"
+inquire = "0.7"
+tabled = "0.17"
+
+# QUIC
+quinn = "0.11"
+
+# HTTP
+reqwest = { version = "0.12", features = ["blocking", "json"] }
+
+# Template engine
+tera = "1"
+
+# Utilities
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+tempfile = "3"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+which = "7"
+
+# Dev dependencies
+assert_cmd = "2"
+predicates = "3"
+
+# --- Legacy mvm package (kept during workspace migration) ---
 [package]
 name = "mvm"
 version = "0.1.0"
@@ -17,36 +83,36 @@ name = "mvm-hostd"
 path = "src/bin/mvm-hostd.rs"
 
 [dependencies]
-aes-gcm = "0.10"
-anyhow = "1"
-chrono = { version = "0.4", features = ["serde"] }
-clap = { version = "4", features = ["derive"] }
-clap_complete = "4"
-base64 = "0.22"
-colored = "3"
-ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
-indicatif = "0.17"
-inquire = "0.7"
-quinn = "0.11"
-rcgen = { version = "0.13", features = ["pem"] }
-reqwest = { version = "0.12", features = ["blocking", "json"] }
-rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
-serde = { version = "1", features = ["derive"] }
-serde_json = "1"
-serde_yaml = "0.9"
-sha2 = "0.10"
-tabled = "0.17"
-tempfile = "3"
-tokio = { version = "1", features = ["full"] }
-toml = "0.8"
-tera = "1"
-tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
-uuid = { version = "1", features = ["v4"] }
-which = "7"
-zeroize = "1"
+aes-gcm.workspace = true
+anyhow.workspace = true
+chrono.workspace = true
+clap.workspace = true
+clap_complete.workspace = true
+base64.workspace = true
+colored.workspace = true
+ed25519-dalek.workspace = true
+indicatif.workspace = true
+inquire.workspace = true
+quinn.workspace = true
+rcgen.workspace = true
+reqwest.workspace = true
+rustls.workspace = true
+rustls-pemfile.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+serde_yaml.workspace = true
+sha2.workspace = true
+tabled.workspace = true
+tempfile.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tera.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+which.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
-assert_cmd = "2"
-predicates = "3"
+assert_cmd.workspace = true
+predicates.workspace = true

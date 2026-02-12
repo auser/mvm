@@ -530,6 +530,18 @@ enum CoordinatorCmd {
         #[arg(long)]
         instance: String,
     },
+    /// Run the coordinator server (TCP proxy with on-demand wake)
+    Serve {
+        /// Path to coordinator TOML config file
+        #[arg(long)]
+        config: String,
+    },
+    /// Display the routing table from a coordinator config
+    Routes {
+        /// Path to coordinator TOML config file
+        #[arg(long)]
+        config: String,
+    },
 }
 
 // --- Network subcommands ---
@@ -1658,6 +1670,41 @@ fn cmd_coordinator(action: CoordinatorCmd, _out_fmt: OutputFormat) -> Result<()>
                 }
                 Ok(())
             })
+        }
+        CoordinatorCmd::Serve { config } => {
+            use mvm::coordinator::config::CoordinatorConfig;
+
+            let config_path = std::path::Path::new(&config);
+            let coord_config = CoordinatorConfig::from_file(config_path)?;
+
+            ui::info(&format!(
+                "Starting coordinator with {} routes from {}",
+                coord_config.routes.len(),
+                config
+            ));
+
+            run_coordinator_command(async { mvm::coordinator::server::serve(coord_config).await })
+        }
+        CoordinatorCmd::Routes { config } => {
+            use mvm::coordinator::config::CoordinatorConfig;
+            use mvm::coordinator::routing::RouteTable;
+
+            let config_path = std::path::Path::new(&config);
+            let coord_config = CoordinatorConfig::from_file(config_path)?;
+            let table = RouteTable::from_config(&coord_config);
+
+            let header = "IDLE TIMEOUT";
+            println!(
+                "{:<20} {:<20} {:<15} {:<25} {}",
+                "TENANT", "POOL", "LISTEN", "NODE", header
+            );
+            for (listen, route) in table.routes() {
+                println!(
+                    "{:<20} {:<20} {:<15} {:<25} {}s",
+                    route.tenant_id, route.pool_id, listen, route.node, route.idle_timeout_secs,
+                );
+            }
+            Ok(())
         }
     }
 }

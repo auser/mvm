@@ -197,7 +197,6 @@ User flakes can import mvm modules:
 | `mvm-role-gateway` | `roles/gateway.nix` |
 | `mvm-role-worker` | `roles/worker.nix` |
 | `mvm-role-builder` | `roles/builder.nix` |
-| `mvm-role-openclaw` | `roles/openclaw.nix` |
 
 ## Extending Roles
 

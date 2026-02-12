@@ -165,7 +165,10 @@ fn ensure_builder_artifacts() -> Result<()> {
     }
 
     ui::info("Downloading builder artifacts (first time only)...");
-    shell::run_in_vm(&format!("mkdir -p {}", BUILDER_DIR))?;
+    shell::run_in_vm(&format!(
+        "sudo mkdir -p {dir} && sudo chown $(whoami) {dir}",
+        dir = BUILDER_DIR,
+    ))?;
 
     // Download kernel from Firecracker CI S3 bucket (same as dev mode)
     shell::run_in_vm_visible(&format!(

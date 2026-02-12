@@ -61,7 +61,7 @@ mvm pool build acme/workers
 mvm pool scale acme/workers --running 3 --warm 1
 
 # Interact with instances
-mvm instance list acme/workers
+mvm instance list --tenant acme --pool workers
 mvm instance ssh acme/workers/i-a3f7b2c1
 
 # Sleep/wake for cost savings
