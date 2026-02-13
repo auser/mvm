@@ -212,10 +212,10 @@ enum Commands {
         #[arg(long, default_value = "worker")]
         role: String,
         /// vCPU cores
-        #[arg(long)]
+        #[arg(long, default_value = "2")]
         cpus: Option<u32>,
         /// Memory in MiB
-        #[arg(long)]
+        #[arg(long, default_value = "1024")]
         memory: Option<u32>,
         /// Guest SSH user
         #[arg(long, default_value = "root")]
@@ -3171,8 +3171,8 @@ mod tests {
                 assert_eq!(flake, ".");
                 assert_eq!(profile, "minimal");
                 assert_eq!(role, "worker");
-                assert_eq!(cpus, 2);
-                assert_eq!(memory, 1024);
+                assert_eq!(cpus, Some(2));
+                assert_eq!(memory, Some(1024));
                 assert_eq!(user, "root");
                 assert!(!detach);
             }
