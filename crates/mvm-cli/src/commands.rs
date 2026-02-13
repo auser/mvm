@@ -119,8 +119,23 @@ enum Commands {
     Stop,
     /// SSH into a running microVM
     Ssh,
+    /// Print an SSH config entry for ~/.ssh/config
+    SshConfig,
     /// Open a shell in the Lima VM (where Firecracker and Nix are installed)
-    Shell,
+    Shell {
+        /// Project directory to cd into inside the VM (Lima maps ~ → ~)
+        #[arg(long)]
+        project: Option<String>,
+    },
+    /// Build mvm from source inside the Lima VM and install to /usr/local/bin/
+    Sync {
+        /// Build in debug mode (faster compile, slower runtime)
+        #[arg(long)]
+        debug: bool,
+        /// Skip installing build dependencies (rustup, apt packages)
+        #[arg(long)]
+        skip_deps: bool,
+    },
     /// Show status of Lima VM and microVM
     Status,
     /// Tear down Lima VM and all resources
@@ -134,7 +149,7 @@ enum Commands {
         #[arg(long)]
         force: bool,
     },
-    /// Build a microVM image from a Mvmfile.toml config
+    /// Build a microVM image from a Mvmfile.toml config or Nix flake
     Build {
         /// Image name (built-in like "openclaw") or path to directory with Mvmfile.toml
         #[arg(default_value = ".")]
@@ -142,6 +157,15 @@ enum Commands {
         /// Output path for the built .elf image
         #[arg(long, short = 'o')]
         output: Option<String>,
+        /// Nix flake reference (enables flake build mode)
+        #[arg(long)]
+        flake: Option<String>,
+        /// Guest profile (flake mode, default: minimal)
+        #[arg(long, default_value = "minimal")]
+        profile: String,
+        /// Instance role (flake mode, default: worker)
+        #[arg(long, default_value = "worker")]
+        role: String,
     },
     /// Generate shell completions
     Completions {
@@ -656,11 +680,25 @@ pub fn run() -> Result<()> {
         },
         Commands::Stop => cmd_stop(),
         Commands::Ssh => cmd_ssh(),
-        Commands::Shell => cmd_shell(),
+        Commands::SshConfig => cmd_ssh_config(),
+        Commands::Shell { project } => cmd_shell(project.as_deref()),
+        Commands::Sync { debug, skip_deps } => cmd_sync(debug, skip_deps),
         Commands::Status => cmd_status(),
         Commands::Destroy => cmd_destroy(),
         Commands::Upgrade { check, force } => cmd_upgrade(check, force),
-        Commands::Build { path, output } => cmd_build(&path, output.as_deref()),
+        Commands::Build {
+            path,
+            output,
+            flake,
+            profile,
+            role,
+        } => {
+            if let Some(flake_ref) = flake {
+                cmd_build_flake(&flake_ref, &profile, &role)
+            } else {
+                cmd_build(&path, output.as_deref())
+            }
+        }
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::Events { tenant, last, json } => cmd_events(&tenant, last, json),
 
@@ -930,9 +968,173 @@ fn cmd_ssh() -> Result<()> {
     microvm::ssh()
 }
 
-fn cmd_shell() -> Result<()> {
+fn cmd_ssh_config() -> Result<()> {
+    println!(
+        r#"# mvm dev microVM — add to ~/.ssh/config
+Host mvm
+    HostName {guest_ip}
+    User {user}
+    ProxyCommand limactl shell {vm} -- nc %h %p
+    StrictHostKeyChecking no
+    UserKnownHostsFile /dev/null
+    LogLevel ERROR"#,
+        guest_ip = config::GUEST_IP,
+        user = config::GUEST_USER,
+        vm = config::VM_NAME,
+    );
+    Ok(())
+}
+
+fn cmd_shell(project: Option<&str>) -> Result<()> {
     lima::require_running()?;
-    shell::replace_process("limactl", &["shell", config::VM_NAME])
+
+    // Print welcome banner with tool versions
+    let fc_ver =
+        shell::run_in_vm_stdout("firecracker --version 2>/dev/null | head -1").unwrap_or_default();
+    let nix_ver = shell::run_in_vm_stdout("nix --version 2>/dev/null").unwrap_or_default();
+
+    ui::info("mvm development shell");
+    ui::info(&format!(
+        "  Firecracker: {}",
+        if fc_ver.trim().is_empty() {
+            "not installed"
+        } else {
+            fc_ver.trim()
+        }
+    ));
+    ui::info(&format!(
+        "  Nix:         {}",
+        if nix_ver.trim().is_empty() {
+            "not installed"
+        } else {
+            nix_ver.trim()
+        }
+    ));
+    let mvm_in_vm = shell::run_in_vm_stdout("test -f /usr/local/bin/mvm && echo yes || echo no")
+        .unwrap_or_default();
+    if mvm_in_vm.trim() == "yes" {
+        let mvm_ver =
+            shell::run_in_vm_stdout("/usr/local/bin/mvm --version 2>/dev/null").unwrap_or_default();
+        ui::info(&format!(
+            "  mvm:         {}",
+            if mvm_ver.trim().is_empty() {
+                "installed"
+            } else {
+                mvm_ver.trim()
+            }
+        ));
+    } else {
+        ui::warn("  mvm not installed in VM. Run 'mvm sync' to build and install it.");
+    }
+
+    ui::info(&format!("  Lima VM:     {}\n", config::VM_NAME));
+
+    match project {
+        Some(path) => {
+            let cmd = format!("cd {} && exec bash -l", shell_escape(path));
+            shell::replace_process("limactl", &["shell", config::VM_NAME, "bash", "-c", &cmd])
+        }
+        None => shell::replace_process("limactl", &["shell", config::VM_NAME]),
+    }
+}
+
+fn sync_deps_script() -> String {
+    "dpkg -s build-essential pkg-config libssl-dev >/dev/null 2>&1 || \
+     (sudo apt-get update -qq && \
+      sudo apt-get install -y -qq build-essential pkg-config libssl-dev)"
+        .to_string()
+}
+
+fn sync_rustup_script() -> String {
+    "if command -v rustup >/dev/null 2>&1; then \
+       rustup update stable --no-self-update 2>/dev/null || true; \
+     else \
+       curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable; \
+     fi && \
+     . \"$HOME/.cargo/env\" && \
+     rustc --version"
+        .to_string()
+}
+
+fn sync_build_script(source_dir: &str, debug: bool, vm_arch: &str) -> String {
+    let release_flag = if debug { "" } else { " --release" };
+    let target_dir = format!("target/linux-{}", vm_arch);
+    format!(
+        ". \"$HOME/.cargo/env\" && \
+         cd '{}' && \
+         CARGO_TARGET_DIR='{}' cargo build{} --bin mvm --bin mvm-hostd",
+        source_dir.replace('\'', "'\\''"),
+        target_dir,
+        release_flag,
+    )
+}
+
+fn sync_install_script(source_dir: &str, debug: bool, vm_arch: &str) -> String {
+    let profile = if debug { "debug" } else { "release" };
+    let target_dir = format!("target/linux-{}", vm_arch);
+    format!(
+        "sudo install -m 0755 \
+         '{src}/{target}/{profile}/mvm' \
+         '{src}/{target}/{profile}/mvm-hostd' \
+         /usr/local/bin/",
+        src = source_dir.replace('\'', "'\\''"),
+        target = target_dir,
+        profile = profile,
+    )
+}
+
+fn cmd_sync(debug: bool, skip_deps: bool) -> Result<()> {
+    if !bootstrap::is_lima_required() {
+        ui::info("Native Linux detected. The host mvm binary is already Linux-native.");
+        ui::info("No sync needed — mvm is already available.");
+        return Ok(());
+    }
+
+    lima::require_running()?;
+
+    let vm_arch = shell::run_in_vm_stdout("uname -m")
+        .unwrap_or_else(|_| "unknown".to_string())
+        .trim()
+        .to_string();
+
+    let source_dir = std::env::current_dir()
+        .context("Failed to determine current directory")?
+        .to_string_lossy()
+        .to_string();
+
+    let profile_name = if debug { "debug" } else { "release" };
+    let total_steps: u32 = if skip_deps { 2 } else { 4 };
+    let mut step = 0u32;
+
+    if !skip_deps {
+        step += 1;
+        ui::step(step, total_steps, "Ensuring build dependencies (apt)...");
+        shell::run_in_vm_visible(&sync_deps_script())?;
+
+        step += 1;
+        ui::step(step, total_steps, "Ensuring Rust toolchain...");
+        shell::run_in_vm_visible(&sync_rustup_script())?;
+    }
+
+    step += 1;
+    let build_msg = format!("Building mvm ({profile_name} profile)...");
+    ui::step(step, total_steps, &build_msg);
+    shell::run_in_vm_visible(&sync_build_script(&source_dir, debug, &vm_arch))?;
+
+    step += 1;
+    ui::step(
+        step,
+        total_steps,
+        "Installing binaries to /usr/local/bin/...",
+    );
+    shell::run_in_vm_visible(&sync_install_script(&source_dir, debug, &vm_arch))?;
+
+    let version = shell::run_in_vm_stdout("/usr/local/bin/mvm --version")
+        .unwrap_or_else(|_| "unknown".to_string());
+    ui::success(&format!("Sync complete! Installed: {}", version.trim()));
+    ui::info("The mvm binary is now available inside 'mvm shell'.");
+
+    Ok(())
 }
 
 fn cmd_status() -> Result<()> {
@@ -963,13 +1165,33 @@ fn cmd_status() -> Result<()> {
         ui::status_line("Lima VM:", "Not required (native KVM)");
     }
 
+    // Show tool versions inside the VM
+    let nix_ver = shell::run_in_vm_stdout("nix --version 2>/dev/null").unwrap_or_default();
+    let nix_display = nix_ver.trim();
+    ui::status_line(
+        "Nix:",
+        if nix_display.is_empty() {
+            "Not installed"
+        } else {
+            nix_display
+        },
+    );
+
     if firecracker::is_running()? {
         let pid = shell::run_in_vm_stdout("cat ~/microvm/.fc-pid 2>/dev/null || echo '?'")
             .unwrap_or_else(|_| "?".to_string());
         ui::status_line("Firecracker:", &format!("Running (PID {})", pid));
     } else {
         if firecracker::is_installed()? {
-            ui::status_line("Firecracker:", "Installed, not running");
+            let fc_ver = shell::run_in_vm_stdout("firecracker --version 2>/dev/null | head -1")
+                .unwrap_or_default();
+            let fc_display = fc_ver.trim();
+            let status = if fc_display.is_empty() {
+                "Installed, not running".to_string()
+            } else {
+                format!("{}, not running", fc_display)
+            };
+            ui::status_line("Firecracker:", &status);
         } else {
             ui::status_line("Firecracker:", "Not installed");
         }
@@ -980,7 +1202,7 @@ fn cmd_status() -> Result<()> {
     if microvm::is_ssh_reachable()? {
         ui::status_line(
             "MicroVM:",
-            &format!("Running (SSH: root@{})", config::GUEST_IP),
+            &format!("Running (SSH: {}@{})", config::GUEST_USER, config::GUEST_IP),
         );
     } else {
         ui::status_line("MicroVM:", "Starting or unreachable");
@@ -998,6 +1220,61 @@ fn cmd_build(path: &str, output: Option<&str>) -> Result<()> {
     ui::success(&format!("\nImage ready: {}", elf_path));
     ui::info(&format!("Run with: mvm start {}", elf_path));
     Ok(())
+}
+
+fn cmd_build_flake(flake_ref: &str, profile: &str, role_str: &str) -> Result<()> {
+    if bootstrap::is_lima_required() {
+        lima::require_running()?;
+    }
+
+    let role = parse_role(role_str)?;
+    let resolved = resolve_flake_ref(flake_ref)?;
+
+    ui::step(
+        1,
+        2,
+        &format!(
+            "Building flake {} (profile={}, role={})",
+            resolved, profile, role
+        ),
+    );
+
+    let env = mvm_runtime::build_env::RuntimeBuildEnv;
+    let result = mvm_build::dev_build::dev_build(&env, &resolved, profile, &role)?;
+
+    ui::step(2, 2, "Build complete");
+
+    if result.cached {
+        ui::success(&format!("\nCache hit — revision {}", result.revision_hash));
+    } else {
+        ui::success(&format!(
+            "\nBuild complete — revision {}",
+            result.revision_hash
+        ));
+    }
+
+    ui::info(&format!("  Kernel: {}", result.vmlinux_path));
+    ui::info(&format!("  Rootfs: {}", result.rootfs_path));
+    ui::info(&format!("\nRun with: mvm run --flake {}", flake_ref));
+
+    Ok(())
+}
+
+/// Resolve a flake reference: relative/absolute paths are canonicalized,
+/// remote refs (containing `:`) pass through unchanged.
+fn resolve_flake_ref(flake_ref: &str) -> Result<String> {
+    if flake_ref.contains(':') {
+        // Remote ref like "github:user/repo" — pass through
+        return Ok(flake_ref.to_string());
+    }
+
+    // Local path — canonicalize to absolute
+    let path = std::path::Path::new(flake_ref);
+    let canonical = path
+        .canonicalize()
+        .with_context(|| format!("Flake path '{}' does not exist", flake_ref))?;
+
+    Ok(canonical.to_string_lossy().to_string())
 }
 
 fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
@@ -2268,5 +2545,203 @@ fn parse_role(s: &str) -> Result<mvm_core::pool::Role> {
             "Unknown role '{}'. Valid roles: gateway, worker, builder, capability-imessage",
             s
         ),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use clap::Parser;
+
+    #[test]
+    fn test_sync_command_parses() {
+        let cli = Cli::try_parse_from(["mvm", "sync"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Sync {
+                debug: false,
+                skip_deps: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_sync_debug_flag() {
+        let cli = Cli::try_parse_from(["mvm", "sync", "--debug"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Sync {
+                debug: true,
+                skip_deps: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_sync_skip_deps_flag() {
+        let cli = Cli::try_parse_from(["mvm", "sync", "--skip-deps"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Sync {
+                debug: false,
+                skip_deps: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_sync_both_flags() {
+        let cli = Cli::try_parse_from(["mvm", "sync", "--debug", "--skip-deps"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Sync {
+                debug: true,
+                skip_deps: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_sync_build_script_release() {
+        let script = sync_build_script("/home/user/mvm", false, "aarch64");
+        assert!(script.contains("--release"));
+        assert!(script.contains("CARGO_TARGET_DIR='target/linux-aarch64'"));
+        assert!(script.contains("--bin mvm --bin mvm-hostd"));
+        assert!(script.contains("cd '/home/user/mvm'"));
+    }
+
+    #[test]
+    fn test_sync_build_script_debug() {
+        let script = sync_build_script("/home/user/mvm", true, "aarch64");
+        assert!(!script.contains("--release"));
+        assert!(script.contains("CARGO_TARGET_DIR='target/linux-aarch64'"));
+        assert!(script.contains("--bin mvm --bin mvm-hostd"));
+    }
+
+    #[test]
+    fn test_sync_build_script_x86_64() {
+        let script = sync_build_script("/home/user/mvm", false, "x86_64");
+        assert!(script.contains("CARGO_TARGET_DIR='target/linux-x86_64'"));
+    }
+
+    #[test]
+    fn test_sync_install_script_release() {
+        let script = sync_install_script("/home/user/mvm", false, "aarch64");
+        assert!(script.contains("/target/linux-aarch64/release/mvm"));
+        assert!(script.contains("/target/linux-aarch64/release/mvm-hostd"));
+        assert!(script.contains("/usr/local/bin/"));
+        assert!(script.contains("install -m 0755"));
+    }
+
+    #[test]
+    fn test_sync_install_script_debug() {
+        let script = sync_install_script("/home/user/mvm", true, "aarch64");
+        assert!(script.contains("/target/linux-aarch64/debug/mvm"));
+        assert!(script.contains("/target/linux-aarch64/debug/mvm-hostd"));
+    }
+
+    #[test]
+    fn test_sync_deps_script_checks_before_installing() {
+        let script = sync_deps_script();
+        assert!(script.contains("dpkg -s"));
+        assert!(script.contains("apt-get install"));
+    }
+
+    #[test]
+    fn test_sync_rustup_script_idempotent() {
+        let script = sync_rustup_script();
+        assert!(script.contains("command -v rustup"));
+        assert!(script.contains("rustup update stable"));
+        assert!(script.contains("rustup.rs"));
+        assert!(script.contains("rustc --version"));
+    }
+
+    // ---- Build --flake tests ----
+
+    #[test]
+    fn test_build_flake_parses() {
+        let cli = Cli::try_parse_from([
+            "mvm",
+            "build",
+            "--flake",
+            ".",
+            "--profile",
+            "minimal",
+            "--role",
+            "worker",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Build {
+                flake,
+                profile,
+                role,
+                ..
+            } => {
+                assert_eq!(flake.as_deref(), Some("."));
+                assert_eq!(profile, "minimal");
+                assert_eq!(role, "worker");
+            }
+            _ => panic!("Expected Build command"),
+        }
+    }
+
+    #[test]
+    fn test_build_flake_defaults() {
+        let cli = Cli::try_parse_from(["mvm", "build", "--flake", "."]).unwrap();
+        match cli.command {
+            Commands::Build {
+                flake,
+                profile,
+                role,
+                ..
+            } => {
+                assert_eq!(flake.as_deref(), Some("."));
+                assert_eq!(profile, "minimal");
+                assert_eq!(role, "worker");
+            }
+            _ => panic!("Expected Build command"),
+        }
+    }
+
+    #[test]
+    fn test_build_mvmfile_mode_still_works() {
+        let cli = Cli::try_parse_from(["mvm", "build", "myimage"]).unwrap();
+        match cli.command {
+            Commands::Build { path, flake, .. } => {
+                assert_eq!(path, "myimage");
+                assert!(flake.is_none(), "Mvmfile mode should have no --flake");
+            }
+            _ => panic!("Expected Build command"),
+        }
+    }
+
+    #[test]
+    fn test_resolve_flake_ref_remote_passthrough() {
+        let resolved = resolve_flake_ref("github:user/repo").unwrap();
+        assert_eq!(resolved, "github:user/repo");
+    }
+
+    #[test]
+    fn test_resolve_flake_ref_remote_with_path() {
+        let resolved = resolve_flake_ref("github:user/repo#attr").unwrap();
+        assert_eq!(resolved, "github:user/repo#attr");
+    }
+
+    #[test]
+    fn test_resolve_flake_ref_absolute_path() {
+        let resolved = resolve_flake_ref("/tmp").unwrap();
+        // /tmp may be a symlink on macOS to /private/tmp
+        assert!(
+            resolved == "/tmp" || resolved == "/private/tmp",
+            "unexpected resolved path: {}",
+            resolved
+        );
+    }
+
+    #[test]
+    fn test_resolve_flake_ref_nonexistent_fails() {
+        let result = resolve_flake_ref("/nonexistent/path/that/does/not/exist");
+        assert!(result.is_err());
     }
 }

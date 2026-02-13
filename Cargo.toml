@@ -92,3 +92,9 @@ anyhow.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true
+
+[profile.release]
+opt-level = 3
+strip = true
+lto = true
+codegen-units = 1

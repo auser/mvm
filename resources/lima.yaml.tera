@@ -33,3 +33,24 @@ provision:
       if ! command -v nix >/dev/null 2>&1; then
         curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install --no-confirm
       fi
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+
+      # Ensure Nix profile is sourced for all login shells
+      cat > /etc/profile.d/mvm-nix.sh << 'NIXPROFILE'
+      # Source Nix profile if available
+      if [ -e /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ]; then
+        . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
+      fi
+      NIXPROFILE
+
+      # Add Firecracker to PATH for all users
+      cat > /etc/profile.d/mvm-tools.sh << 'MVMTOOLS'
+      # mvm development tools
+      if [ -x /usr/local/bin/firecracker ]; then
+        export MVM_FC_VERSION=$(firecracker --version 2>/dev/null | head -1 || echo "unknown")
+      fi
+      MVMTOOLS

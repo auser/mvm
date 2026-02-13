@@ -278,4 +278,40 @@ mod tests {
         };
         assert!(render_lima_yaml_with(&opts).is_err());
     }
+
+    #[test]
+    fn test_render_lima_yaml_includes_nix_profile() {
+        let tmp = render_lima_yaml().unwrap();
+        let mut content = String::new();
+        std::fs::File::open(tmp.path())
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert!(
+            content.contains("mvm-nix.sh"),
+            "Lima template should install Nix profile.d script"
+        );
+        assert!(
+            content.contains("nix-daemon.sh"),
+            "Lima template should source nix-daemon.sh"
+        );
+    }
+
+    #[test]
+    fn test_render_lima_yaml_includes_mvm_tools_profile() {
+        let tmp = render_lima_yaml().unwrap();
+        let mut content = String::new();
+        std::fs::File::open(tmp.path())
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert!(
+            content.contains("mvm-tools.sh"),
+            "Lima template should install mvm-tools profile.d script"
+        );
+        assert!(
+            content.contains("MVM_FC_VERSION"),
+            "Lima template should export MVM_FC_VERSION"
+        );
+    }
 }

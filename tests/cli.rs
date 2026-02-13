@@ -49,6 +49,8 @@ fn test_help_lists_all_subcommands() {
         "start",
         "stop",
         "ssh",
+        "shell",
+        "sync",
         "status",
         "destroy",
         "upgrade",
@@ -116,4 +118,73 @@ fn test_status_runs_without_lima() {
         "status should produce meaningful output, got: {}",
         combined
     );
+}
+
+#[test]
+fn test_shell_help() {
+    mvm()
+        .args(["shell", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Lima VM"))
+        .stdout(predicate::str::contains("--project"));
+}
+
+#[test]
+fn test_shell_listed_in_help() {
+    mvm()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("shell"));
+}
+
+#[test]
+fn test_sync_listed_in_help() {
+    mvm()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("sync"));
+}
+
+#[test]
+fn test_sync_help() {
+    mvm()
+        .args(["sync", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--debug"))
+        .stdout(predicate::str::contains("--skip-deps"));
+}
+
+#[test]
+fn test_build_help_shows_flake_options() {
+    mvm()
+        .args(["build", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--flake"))
+        .stdout(predicate::str::contains("--profile"))
+        .stdout(predicate::str::contains("--role"));
+}
+
+#[test]
+fn test_build_listed_in_help() {
+    mvm()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("build"));
+}
+
+#[test]
+fn test_ssh_config_prints_entry() {
+    mvm()
+        .arg("ssh-config")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Host mvm"))
+        .stdout(predicate::str::contains("ProxyCommand"))
+        .stdout(predicate::str::contains("172.16.0.2"));
 }

@@ -2,4 +2,5 @@
 // Depends on mvm-core (narrow interface via BuildEnvironment trait)
 
 pub mod build;
+pub mod dev_build;
 pub mod nix_manifest;

@@ -63,51 +63,52 @@ Sprint 11 makes mvm useful as a development tool for external projects:
 
 ## Baseline
 
-| Metric | Value |
-|--------|-------|
-| Workspace crates | 7 + root facade |
-| Lib tests | 366 |
-| Integration tests | 10 |
-| Total tests | 376 |
-| Clippy warnings | 0 |
-| Tag | v0.2.0 |
+| Metric            | Value           |
+| ----------------- | --------------- |
+| Workspace crates  | 7 + root facade |
+| Lib tests         | 366             |
+| Integration tests | 10              |
+| Total tests       | 376             |
+| Clippy warnings   | 0               |
+| Tag               | v0.2.0          |
 
 ---
 
 ## Phase 1: Dev Shell Polish
-**Status: PENDING**
+**Status: COMPLETE**
 
 Make `mvm shell` a productive development environment. Currently it drops into
 a bare Lima shell — developers must manually source Nix and know where tools
 live.
 
-- [ ] Lima provisioning: add Firecracker to PATH (symlink or profile.d script)
-- [ ] Lima provisioning: source Nix profile automatically in login shells
-- [ ] `mvm shell` prints a welcome banner with available tools + versions
-- [ ] `mvm shell --project <path>` option: cd into the project directory inside
+- [x] Lima provisioning: add Firecracker to PATH (`/etc/profile.d/mvm-tools.sh`)
+- [x] Lima provisioning: source Nix profile automatically in login shells
+  (`/etc/profile.d/mvm-nix.sh`)
+- [x] `mvm shell` prints a welcome banner with Firecracker, Nix, and Lima versions
+- [x] `mvm shell --project <path>` option: cd into the project directory inside
   the VM (Lima maps `~` → `~`)
-- [ ] `mvm status` shows Nix and Firecracker versions when Lima is running
-- [ ] Tests: shell command help, status output with tool versions
+- [x] `mvm status` shows Nix version and Firecracker version when Lima is running
+- [x] Tests: shell help (--project flag), lima template (nix profile, mvm-tools)
 
 ## Phase 2: Simplified Build Workflow
-**Status: PENDING**
+**Status: COMPLETE**
 
 A developer with a Nix flake should be able to build a microVM image without
 creating tenants or pools. Introduce `mvm build --flake <ref>` as a thin
 wrapper that handles the boilerplate.
 
-- [ ] `mvm build --flake <ref> [--profile <p>] [--role <r>]` — new CLI mode
+- [x] `mvm build --flake <ref> [--profile <p>] [--role <r>]` — new CLI mode
   alongside existing Mvmfile.toml path
-- [ ] Under the hood: creates ephemeral "dev" tenant + pool if not present,
-  runs `pool_build`, stores artifacts in a dev workspace
-  (`/var/lib/mvm/dev/builds/<hash>/`)
-- [ ] Dev build artifacts: vmlinux + rootfs.ext4 (no full pool lifecycle needed)
-- [ ] `mvm build --flake . --profile minimal` works from inside a project
+- [x] Under the hood: runs `nix build` directly in Lima VM, stores artifacts
+  in a dev workspace (`/var/lib/mvm/dev/builds/<hash>/`)
+- [x] Dev build artifacts: vmlinux + rootfs.ext4 (no full pool lifecycle needed)
+- [x] `mvm build --flake . --profile minimal` works from inside a project
   directory
-- [ ] Print the artifact path on success so it can be passed to `mvm run`
-- [ ] Idempotent: re-running the same build with same lock hash is a no-op
-  (cache hit)
-- [ ] Tests: build command parsing, dev workspace path generation, cache check
+- [x] Print the artifact path on success so it can be passed to `mvm run`
+- [x] Idempotent: re-running the same build with same Nix store hash is a
+  cache hit
+- [x] Tests: build command parsing, dev workspace path generation, cache check,
+  manifest resolution, flake ref resolution
 
 ## Phase 3: Run + Iterate
 **Status: PENDING**
