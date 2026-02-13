@@ -1226,7 +1226,7 @@ fn sync_rustup_script() -> String {
      else \
        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable; \
      fi && \
-     . \"$HOME/.cargo/env\" && \
+     if [ -f \"$HOME/.cargo/env\" ]; then . \"$HOME/.cargo/env\"; fi && \
      rustc --version"
         .to_string()
 }
