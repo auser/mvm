@@ -292,17 +292,36 @@ fn ensure_builder_artifacts(env: &dyn BuildEnvironment) -> Result<()> {
                 | grep -oP '(?<=<Key>)(firecracker-ci/{fc_short}/{arch}/ubuntu-[0-9]+\\.[0-9]+\\.squashfs)(?=</Key>)' \
                 | sort -V | tail -1)
 
+            if [ -z "$latest_ubuntu_key" ]; then
+                echo '[mvm] ERROR: Could not find builder rootfs key';
+                exit 1;
+            fi
+
             rm -f rootfs.squashfs
-            wget -q --show-progress -O rootfs.squashfs \
-                "https://s3.amazonaws.com/spec.ccfc.min/$latest_ubuntu_key"
+            for attempt in 1 2; do
+                echo "[mvm] Fetching rootfs.squashfs (attempt $attempt)..."
+                if wget -q --show-progress -O rootfs.squashfs \
+                    "https://s3.amazonaws.com/spec.ccfc.min/$latest_ubuntu_key"; then
+                    break
+                fi
+                sleep 2
+            done
+
+            if [ ! -s rootfs.squashfs ]; then
+                echo '[mvm] ERROR: Failed to download builder rootfs'
+                exit 1
+            fi
 
             echo '[mvm] Preparing builder rootfs...'
             rm -rf squashfs-root
             if ! unsquashfs -d squashfs-root rootfs.squashfs; then
-                echo '[mvm] Corrupt squashfs; re-downloading...'
+                echo '[mvm] Corrupt squashfs; retrying download...'
                 rm -f rootfs.squashfs
-                wget -q --show-progress -O rootfs.squashfs \
-                    "https://s3.amazonaws.com/spec.ccfc.min/$latest_ubuntu_key"
+                if ! wget -q --show-progress -O rootfs.squashfs \
+                    "https://s3.amazonaws.com/spec.ccfc.min/$latest_ubuntu_key"; then
+                    echo '[mvm] ERROR: Re-download failed'
+                    exit 1
+                fi
                 rm -rf squashfs-root
                 unsquashfs -d squashfs-root rootfs.squashfs
             fi

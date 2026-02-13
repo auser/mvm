@@ -88,12 +88,19 @@ else
     info "Installed: $(rustc --version)"
 fi
 
-# -----------------
-# Install pnpm
-# -----------
+# ---------------------------------------------------------------------------
+# Cargo utilities
+# ---------------------------------------------------------------------------
+cargo install cargo-watch
+
+# ---------------------------------------------------------------------------
+# Pnpm
+# ---------------------------------------------------------------------------
 if command -v curl >/dev/null 2>&1; then
+    info "Instaling pnpm..."
     curl -fsSL https://get.pnpm.io/install.sh | sh -
 else
+    info "Instaling pnpm..."
     wget -qO- https://get.pnpm.io/install.sh | sh -
 fi
 
