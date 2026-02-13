@@ -15,11 +15,21 @@ provision:
       set -eux -o pipefail
       # Ensure kvm group exists
       getent group kvm || groupadd kvm
-      # Add the Lima user to kvm group
+      # Add the Lima user and root to kvm group
       usermod -aG kvm {% raw %}{{.User}}{% endraw %}
+      usermod -aG kvm root
 
       # Set /dev/kvm permissions so kvm group members can access it
       echo 'KERNEL=="kvm", GROUP="kvm", MODE="0660"' > /etc/udev/rules.d/99-kvm.rules
       udevadm control --reload-rules && udevadm trigger
       # Also fix permissions immediately (udev rule applies on next boot)
       [ -e /dev/kvm ] && chown root:kvm /dev/kvm && chmod 0660 /dev/kvm
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      # Install Nix package manager (multi-user)
+      if ! command -v nix >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install --no-confirm
+      fi

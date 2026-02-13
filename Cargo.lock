@@ -1408,37 +1408,16 @@ dependencies = [
 name = "mvm"
 version = "0.1.0"
 dependencies = [
- "aes-gcm",
  "anyhow",
  "assert_cmd",
- "base64",
- "chrono",
- "clap",
- "clap_complete",
- "colored",
- "ed25519-dalek",
- "indicatif",
- "inquire",
+ "mvm-agent",
+ "mvm-build",
+ "mvm-cli",
+ "mvm-coordinator",
+ "mvm-core",
+ "mvm-guest",
+ "mvm-runtime",
  "predicates",
- "quinn",
- "rcgen",
- "reqwest",
- "rustls",
- "rustls-pemfile",
- "serde",
- "serde_json",
- "serde_yaml",
- "sha2",
- "tabled",
- "tempfile",
- "tera",
- "tokio",
- "toml",
- "tracing",
- "tracing-subscriber",
- "uuid",
- "which",
- "zeroize",
 ]
 
 [[package]]
@@ -1456,6 +1435,7 @@ dependencies = [
  "serde",
  "serde_json",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -1469,6 +1449,7 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2",
+ "toml",
  "tracing",
 ]
 
@@ -1485,15 +1466,37 @@ dependencies = [
  "indicatif",
  "inquire",
  "mvm-agent",
+ "mvm-build",
+ "mvm-coordinator",
  "mvm-core",
+ "mvm-runtime",
  "predicates",
+ "reqwest",
  "serde",
  "serde_json",
  "serde_yaml",
  "tabled",
+ "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
+ "uuid",
  "which",
+]
+
+[[package]]
+name = "mvm-coordinator"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "mvm-core",
+ "mvm-runtime",
+ "quinn",
+ "serde",
+ "serde_json",
+ "tokio",
+ "toml",
+ "tracing",
 ]
 
 [[package]]

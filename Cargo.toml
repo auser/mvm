@@ -5,6 +5,7 @@ members = [
     "crates/mvm-build",
     "crates/mvm-guest",
     "crates/mvm-agent",
+    "crates/mvm-coordinator",
     "crates/mvm-cli",
 ]
 resolver = "3"
@@ -63,11 +64,11 @@ which = "7"
 assert_cmd = "2"
 predicates = "3"
 
-# --- Legacy mvm package (kept during workspace migration) ---
+# Root facade crate — re-exports all workspace libraries as `mvm`
 [package]
 name = "mvm"
-version = "0.1.0"
-edition = "2024"
+version.workspace = true
+edition.workspace = true
 description = "Multi-tenant Firecracker microVM fleet manager"
 
 [lib]
@@ -78,40 +79,15 @@ path = "src/lib.rs"
 name = "mvm"
 path = "src/main.rs"
 
-[[bin]]
-name = "mvm-hostd"
-path = "src/bin/mvm-hostd.rs"
-
 [dependencies]
-aes-gcm.workspace = true
+mvm-core = { path = "crates/mvm-core" }
+mvm-runtime = { path = "crates/mvm-runtime" }
+mvm-build = { path = "crates/mvm-build" }
+mvm-guest = { path = "crates/mvm-guest" }
+mvm-agent = { path = "crates/mvm-agent" }
+mvm-coordinator = { path = "crates/mvm-coordinator" }
+mvm-cli = { path = "crates/mvm-cli" }
 anyhow.workspace = true
-chrono.workspace = true
-clap.workspace = true
-clap_complete.workspace = true
-base64.workspace = true
-colored.workspace = true
-ed25519-dalek.workspace = true
-indicatif.workspace = true
-inquire.workspace = true
-quinn.workspace = true
-rcgen.workspace = true
-reqwest.workspace = true
-rustls.workspace = true
-rustls-pemfile.workspace = true
-serde.workspace = true
-serde_json.workspace = true
-serde_yaml.workspace = true
-sha2.workspace = true
-tabled.workspace = true
-tempfile.workspace = true
-tokio.workspace = true
-toml.workspace = true
-tera.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-uuid.workspace = true
-which.workspace = true
-zeroize.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

@@ -1,0 +1,18 @@
+[package]
+name = "mvm-core"
+version.workspace = true
+edition.workspace = true
+description = "Core types, IDs, config, and utilities for mvm"
+
+[dependencies]
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+tokio = { workspace = true, features = ["io-util"] }
+toml.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true

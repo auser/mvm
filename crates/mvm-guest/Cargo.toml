@@ -1,0 +1,11 @@
+[package]
+name = "mvm-guest"
+version.workspace = true
+edition.workspace = true
+description = "vsock protocol and openclaw connector mapping for mvm"
+
+[dependencies]
+mvm-core = { path = "../mvm-core" }
+anyhow.workspace = true
+serde.workspace = true
+serde_json.workspace = true

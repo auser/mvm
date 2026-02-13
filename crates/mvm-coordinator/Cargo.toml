@@ -1,0 +1,16 @@
+[package]
+name = "mvm-coordinator"
+version.workspace = true
+edition.workspace = true
+description = "Gateway load-balancer, TCP proxy, and wake manager for mvm"
+
+[dependencies]
+mvm-core = { path = "../mvm-core" }
+mvm-runtime = { path = "../mvm-runtime" }
+anyhow.workspace = true
+quinn.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+toml.workspace = true
+tracing.workspace = true
