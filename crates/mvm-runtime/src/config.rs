@@ -92,6 +92,8 @@ pub struct LimaRenderOptions {
     pub cpus: Option<u32>,
     /// Memory in GiB for the Lima VM.
     pub memory_gib: Option<u32>,
+    /// SSH local port binding for Lima.
+    pub ssh_port: Option<u16>,
 }
 
 /// Render the Lima YAML template with config values and return a temp file.
@@ -132,6 +134,13 @@ pub fn render_lima_yaml_with(opts: &LimaRenderOptions) -> anyhow::Result<tempfil
     }
     if let Some(mem) = opts.memory_gib {
         ctx.insert("lima_memory", &mem);
+    }
+    if let Some(port) = opts.ssh_port {
+        ctx.insert("ssh_port", &port);
+    } else if let Ok(port_env) = std::env::var("MVM_SSH_PORT")
+        && let Ok(p) = port_env.parse::<u16>()
+    {
+        ctx.insert("ssh_port", &p);
     }
 
     for (key, value) in &opts.extra_context {
