@@ -70,6 +70,7 @@ enum Commands {
     },
 
     // ---- Dev cluster (local) ----
+    /// Development cluster
     DevCluster {
         #[command(subcommand)]
         action: DevClusterCmd,
@@ -307,10 +308,10 @@ enum TenantCmd {
         id: String,
         /// Coordinator-assigned network ID (0-4095, cluster-unique)
         #[arg(long)]
-        net_id: u16,
+        net_id: Option<u16>,
         /// Coordinator-assigned IPv4 subnet (CIDR), e.g. "10.240.3.0/24"
         #[arg(long)]
-        subnet: String,
+        subnet: Option<String>,
         /// Maximum vCPUs across all instances
         #[arg(long, default_value = "16")]
         max_vcpus: u32,
@@ -1705,6 +1706,16 @@ fn cmd_tenant(action: TenantCmd, out_fmt: OutputFormat) -> Result<()> {
             max_warm,
         } => {
             naming::validate_id(&id, "Tenant")?;
+
+            // Auto-allocate network if omitted
+            let net_id = match net_id {
+                Some(n) => n,
+                None => mvm_agent::templates::allocate_net_id()?,
+            };
+            let subnet = match subnet {
+                Some(s) => s,
+                None => mvm_agent::templates::subnet_from_net_id(net_id),
+            };
 
             // Derive gateway from subnet (first usable IP)
             let gateway = mvm_agent::templates::gateway_from_subnet(&subnet)?;
