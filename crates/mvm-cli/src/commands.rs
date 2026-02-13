@@ -1221,7 +1221,8 @@ fn sync_deps_script() -> String {
 }
 
 fn sync_rustup_script() -> String {
-    "if command -v rustup >/dev/null 2>&1; then \
+    "export PATH=\"$HOME/.cargo/bin:$PATH\"; \
+     if command -v rustup >/dev/null 2>&1; then \
        rustup update stable --no-self-update 2>/dev/null || true; \
      else \
        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y --default-toolchain stable; \
@@ -1235,7 +1236,8 @@ fn sync_build_script(source_dir: &str, debug: bool, vm_arch: &str) -> String {
     let release_flag = if debug { "" } else { " --release" };
     let target_dir = format!("target/linux-{}", vm_arch);
     format!(
-        ". \"$HOME/.cargo/env\" && \
+        "export PATH=\"$HOME/.cargo/bin:$PATH\" && \
+         if [ -f \"$HOME/.cargo/env\" ]; then . \"$HOME/.cargo/env\"; fi && \
          cd '{}' && \
          CARGO_TARGET_DIR='{}' cargo build{} --bin mvm --bin mvm-hostd",
         source_dir.replace('\'', "'\\''"),
@@ -1265,7 +1267,19 @@ fn cmd_sync(debug: bool, skip_deps: bool, force: bool) -> Result<()> {
         return Ok(());
     }
 
-    lima::require_running()?;
+    let limactl_available = shell::run_host("which", &["limactl"])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    if limactl_available {
+        lima::require_running()?;
+    } else if bootstrap::is_lima_required() {
+        anyhow::bail!(
+            "Lima is required but 'limactl' is not available. Install Lima or run inside the Lima VM."
+        );
+    } else {
+        ui::warn("limactl not found; assuming we're already inside Lima and proceeding.");
+    }
 
     let vm_arch = shell::run_in_vm_stdout("uname -m")
         .unwrap_or_else(|_| "unknown".to_string())
