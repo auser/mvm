@@ -1251,9 +1251,9 @@ fn sync_install_script(source_dir: &str, debug: bool, vm_arch: &str) -> String {
 }
 
 fn cmd_sync(debug: bool, skip_deps: bool, force: bool) -> Result<()> {
-    if !bootstrap::is_lima_required() {
+    if !bootstrap::is_lima_required() && !force {
         ui::info("Native Linux detected. The host mvm binary is already Linux-native.");
-        ui::info("No sync needed — mvm is already available.");
+        ui::info("No sync needed — mvm is already available. Use --force to rebuild anyway.");
         return Ok(());
     }
 
