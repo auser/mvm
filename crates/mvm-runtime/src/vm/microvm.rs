@@ -243,6 +243,7 @@ pub fn stop() -> Result<()> {
         fi
         sudo pkill -x firecracker 2>/dev/null || true
         sudo rm -f {socket}
+        rm -f {dir}/.mvm-run-info
         "#,
         dir = MICROVM_DIR,
         socket = API_SOCKET,
@@ -330,4 +331,222 @@ fn read_state_or_discover() -> Result<MvmState> {
         ssh_key,
         fc_pid: None,
     })
+}
+
+// ============================================================================
+// Flake-based run: build from Nix flake artifacts, boot FC, SSH in
+// ============================================================================
+
+/// Configuration for running a Firecracker VM from flake-built artifacts.
+pub struct FlakeRunConfig {
+    /// Absolute path to the kernel image inside the Lima VM.
+    pub vmlinux_path: String,
+    /// Absolute path to the root filesystem inside the Lima VM.
+    pub rootfs_path: String,
+    /// Nix store revision hash.
+    pub revision_hash: String,
+    /// Original flake reference (for display / status).
+    pub flake_ref: String,
+    /// Number of vCPUs.
+    pub cpus: u32,
+    /// Memory in MiB.
+    pub memory: u32,
+    /// SSH user on the guest (e.g., "root").
+    pub guest_user: String,
+    /// Boot in background without dropping into SSH.
+    pub detach: bool,
+}
+
+/// Boot a Firecracker VM from flake-built artifacts and optionally SSH in.
+pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
+    lima::require_running()?;
+
+    // Stop any existing FC instance
+    if firecracker::is_running()? {
+        ui::info("Stopping existing microVM...");
+        stop()?;
+    }
+
+    // Set up TAP/NAT network (dev-mode 172.16.0.x)
+    network::setup()?;
+
+    // Use ~/microvm/ as the working dir so stop() can find .fc-pid
+    let abs_dir = resolve_microvm_dir()?;
+
+    // Start Firecracker daemon
+    start_firecracker_daemon(&abs_dir)?;
+
+    // Configure VM via Firecracker API
+    configure_flake_microvm(config, &abs_dir)?;
+
+    // Boot the instance
+    ui::info("Starting microVM...");
+    std::thread::sleep(std::time::Duration::from_millis(15));
+    api_put("/actions", r#"{"action_type": "InstanceStart"}"#)?;
+
+    // Wait for SSH to become available
+    wait_for_ssh_flake(&config.guest_user)?;
+
+    // Persist run info for `mvm status`
+    write_run_info(config)?;
+
+    if config.detach {
+        ui::banner(&[
+            "MicroVM running in background!",
+            "",
+            &format!(
+                "  SSH: ssh {}@{} (from inside Lima VM)",
+                config.guest_user, GUEST_IP
+            ),
+            &format!("  Revision: {}", config.revision_hash),
+            "",
+            "Use 'mvm stop' to shut down the microVM.",
+        ]);
+        return Ok(());
+    }
+
+    ui::banner(&[
+        "MicroVM is running!",
+        "",
+        "Use 'mvm ssh' to reconnect after exiting.",
+        "Use 'mvm stop' to shut down the microVM.",
+    ]);
+
+    // Drop into interactive SSH
+    ssh_flake(&config.guest_user)
+}
+
+/// Configure a flake-built microVM via the Firecracker API.
+///
+/// Unlike `configure_microvm`, this uses absolute kernel/rootfs paths,
+/// kernel IP boot args (no SSH-based guest network config), and sets
+/// machine config (cpus/memory).
+fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str) -> Result<()> {
+    ui::info("Configuring logger...");
+    api_put(
+        "/logger",
+        &format!(
+            r#"{{"log_path": "{dir}/firecracker.log", "level": "Debug", "show_level": true, "show_log_origin": true}}"#,
+            dir = abs_dir,
+        ),
+    )?;
+
+    // Boot args with static IP configuration via kernel cmdline
+    let boot_args = format!(
+        "console=ttyS0 reboot=k panic=1 ip={guest}::{gateway}:255.255.255.252::eth0:off",
+        guest = GUEST_IP,
+        gateway = TAP_IP,
+    );
+
+    ui::info(&format!("Setting boot source: {}", config.vmlinux_path));
+    api_put(
+        "/boot-source",
+        &format!(
+            r#"{{"kernel_image_path": "{kernel}", "boot_args": "{args}"}}"#,
+            kernel = config.vmlinux_path,
+            args = boot_args,
+        ),
+    )?;
+
+    ui::info(&format!(
+        "Setting machine config: {} vCPUs, {} MiB",
+        config.cpus, config.memory
+    ));
+    api_put(
+        "/machine-config",
+        &format!(
+            r#"{{"vcpu_count": {cpus}, "mem_size_mib": {mem}}}"#,
+            cpus = config.cpus,
+            mem = config.memory,
+        ),
+    )?;
+
+    ui::info(&format!("Setting rootfs: {}", config.rootfs_path));
+    api_put(
+        "/drives/rootfs",
+        &format!(
+            r#"{{"drive_id": "rootfs", "path_on_host": "{rootfs}", "is_root_device": true, "is_read_only": false}}"#,
+            rootfs = config.rootfs_path,
+        ),
+    )?;
+
+    ui::info("Setting network interface...");
+    api_put(
+        "/network-interfaces/net1",
+        &format!(
+            r#"{{"iface_id": "net1", "guest_mac": "{mac}", "host_dev_name": "{tap}"}}"#,
+            mac = FC_MAC,
+            tap = TAP_DEV,
+        ),
+    )?;
+
+    Ok(())
+}
+
+/// Wait for SSH to become available using the user's default SSH keys.
+fn wait_for_ssh_flake(guest_user: &str) -> Result<()> {
+    ui::info("Waiting for microVM to boot...");
+    let script = format!(
+        r#"
+        sleep 3
+        echo "[mvm] Waiting for SSH (up to 60s)..."
+        for i in $(seq 1 60); do
+            if ssh -o BatchMode=yes -o ConnectTimeout=2 \
+                -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                -o LogLevel=ERROR {user}@{guest_ip} true 2>/dev/null; then
+                echo "[mvm] SSH is ready!"
+                exit 0
+            fi
+            printf "."
+            sleep 1
+        done
+        echo ""
+        echo "[mvm] ERROR: SSH not available after 60 seconds." >&2
+        echo "[mvm] Ensure your Nix flake image has sshd enabled and your SSH key authorized." >&2
+        exit 1
+        "#,
+        guest_ip = GUEST_IP,
+        user = guest_user,
+    );
+    run_in_vm_visible(&script)
+}
+
+/// SSH into a flake-built microVM using the user's default SSH keys.
+fn ssh_flake(guest_user: &str) -> Result<()> {
+    let ssh_cmd = format!(
+        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR -t {user}@{guest}",
+        user = guest_user,
+        guest = GUEST_IP,
+    );
+
+    replace_process("limactl", &["shell", VM_NAME, "bash", "-c", &ssh_cmd])
+}
+
+/// Persist run info so `mvm status` can distinguish run modes.
+fn write_run_info(config: &FlakeRunConfig) -> Result<()> {
+    let info = RunInfo {
+        mode: "flake".to_string(),
+        revision: Some(config.revision_hash.clone()),
+        flake_ref: Some(config.flake_ref.clone()),
+        guest_user: config.guest_user.clone(),
+        cpus: config.cpus,
+        memory: config.memory,
+    };
+    let json = serde_json::to_string(&info)?;
+    run_in_vm(&format!(
+        "echo '{}' > {dir}/.mvm-run-info",
+        json,
+        dir = MICROVM_DIR,
+    ))?;
+    Ok(())
+}
+
+/// Read persisted run info (returns None if file doesn't exist).
+pub fn read_run_info() -> Option<RunInfo> {
+    let json = run_in_vm_stdout(&format!(
+        "cat {dir}/.mvm-run-info 2>/dev/null || echo 'null'",
+        dir = MICROVM_DIR,
+    ))
+    .ok()?;
+    serde_json::from_str(&json).ok()
 }

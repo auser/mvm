@@ -17,6 +17,7 @@ base64.workspace = true
 chrono.workspace = true
 clap.workspace = true
 colored.workspace = true
+mimalloc.workspace = true
 ed25519-dalek.workspace = true
 indicatif.workspace = true
 inquire.workspace = true

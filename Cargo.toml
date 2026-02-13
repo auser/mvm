@@ -51,6 +51,9 @@ reqwest = { version = "0.12", features = ["blocking", "json"] }
 # Template engine
 tera = "1"
 
+# Allocator
+mimalloc = "0.1"
+
 # Utilities
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
@@ -88,6 +91,7 @@ mvm-agent = { path = "crates/mvm-agent" }
 mvm-coordinator = { path = "crates/mvm-coordinator" }
 mvm-cli = { path = "crates/mvm-cli" }
 anyhow.workspace = true
+mimalloc.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

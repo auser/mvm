@@ -1,0 +1,96 @@
+name: Publish to crates.io
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Git tag to publish (e.g. v0.1.0)"
+        required: true
+        type: string
+      dry_run:
+        description: "Run cargo publish --dry-run instead of actually publishing"
+        required: true
+        default: true
+        type: boolean
+
+env:
+  CARGO_TERM_COLOR: always
+
+concurrency:
+  group: publish-crates
+  cancel-in-progress: false
+
+jobs:
+  publish:
+    runs-on: ubuntu-latest
+    environment: release
+    permissions:
+      contents: read
+    env:
+      CARGO_REGISTRY_TOKEN: ${{ secrets.CRATES_IO_TOKEN }}
+      TAG_NAME: ${{ inputs.tag }}
+      DRY_RUN: ${{ inputs.dry_run }}
+    steps:
+      - name: Check token
+        run: |
+          if [ -z "${CARGO_REGISTRY_TOKEN:-}" ]; then
+            echo "Missing CRATES_IO_TOKEN secret."
+            exit 1
+          fi
+
+      - name: Checkout sources
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Ensure tag exists locally
+        run: |
+          git fetch --tags --force
+          if ! git rev-parse --verify --quiet "refs/tags/${TAG_NAME}"; then
+            echo "Tag ${TAG_NAME} not found"
+            exit 1
+          fi
+          git checkout "refs/tags/${TAG_NAME}"
+
+      - name: Install Rust toolchain (nightly)
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Publish crates in dependency order
+        shell: bash
+        run: |
+          set -euo pipefail
+
+          if [ "${DRY_RUN}" = "true" ]; then
+            echo "Running dry-run publishes (no crates will be uploaded)"
+            PUBLISH_FLAG="--dry-run"
+          else
+            PUBLISH_FLAG=""
+          fi
+
+          CRATES=(
+            mvm-core
+            mvm-guest
+            mvm-build
+            mvm-runtime
+            mvm-coordinator
+            mvm-agent
+            mvm-cli
+            mvm
+          )
+
+          for CRATE in "${CRATES[@]}"; do
+            echo "::group::Publishing ${CRATE}"
+            cargo publish -p "${CRATE}" ${PUBLISH_FLAG}
+            echo "::endgroup::"
+
+            # Give crates.io index a moment to catch up so dependents can publish.
+            if [ -z "${PUBLISH_FLAG}" ]; then
+              sleep 20
+            fi
+          done
+
+      - name: Summary
+        if: always()
+        run: |
+          echo "Published crates from tag ${TAG_NAME}."
+          echo "Dry run: ${DRY_RUN}"

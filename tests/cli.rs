@@ -54,6 +54,7 @@ fn test_help_lists_all_subcommands() {
         "status",
         "destroy",
         "upgrade",
+        "run",
     ] {
         assert!(
             output.contains(cmd),
@@ -185,6 +186,30 @@ fn test_ssh_config_prints_entry() {
         .assert()
         .success()
         .stdout(predicate::str::contains("Host mvm"))
-        .stdout(predicate::str::contains("ProxyCommand"))
-        .stdout(predicate::str::contains("172.16.0.2"));
+        .stdout(predicate::str::contains("IdentityFile"))
+        .stdout(predicate::str::contains("StrictHostKeyChecking no"));
+}
+
+#[test]
+fn test_run_listed_in_help() {
+    mvm()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("run"));
+}
+
+#[test]
+fn test_run_help_shows_flags() {
+    mvm()
+        .args(["run", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--flake"))
+        .stdout(predicate::str::contains("--profile"))
+        .stdout(predicate::str::contains("--role"))
+        .stdout(predicate::str::contains("--cpus"))
+        .stdout(predicate::str::contains("--memory"))
+        .stdout(predicate::str::contains("--user"))
+        .stdout(predicate::str::contains("--detach"));
 }

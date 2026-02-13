@@ -3,6 +3,7 @@
 
 pub mod bootstrap;
 pub mod commands;
+pub mod dev_cluster;
 pub mod display;
 pub mod http;
 pub mod logging;

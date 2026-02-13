@@ -25,6 +25,21 @@ pub struct MvmState {
     pub fc_pid: Option<u32>,
 }
 
+/// Run mode info persisted at `~/microvm/.mvm-run-info` so `status` can
+/// distinguish dev-mode VMs from flake-built VMs.
+#[derive(Debug, Serialize, Deserialize, Default)]
+pub struct RunInfo {
+    /// "dev" or "flake"
+    pub mode: String,
+    #[serde(default)]
+    pub revision: Option<String>,
+    #[serde(default)]
+    pub flake_ref: Option<String>,
+    pub guest_user: String,
+    pub cpus: u32,
+    pub memory: u32,
+}
+
 /// Find the lima.yaml.tera template file.
 /// Looks in: 1) resources/ next to the binary, 2) source tree, 3) sibling project
 pub(crate) fn find_lima_template() -> anyhow::Result<PathBuf> {
@@ -73,6 +88,10 @@ pub struct LimaRenderOptions {
     /// Extra Tera context variables injected alongside the built-in ones.
     /// These take precedence over built-in values if keys collide.
     pub extra_context: std::collections::HashMap<String, String>,
+    /// Number of vCPUs for the Lima VM.
+    pub cpus: Option<u32>,
+    /// Memory in GiB for the Lima VM.
+    pub memory_gib: Option<u32>,
 }
 
 /// Render the Lima YAML template with config values and return a temp file.
@@ -107,6 +126,13 @@ pub fn render_lima_yaml_with(opts: &LimaRenderOptions) -> anyhow::Result<tempfil
     ctx.insert("tap_ip", TAP_IP);
     ctx.insert("guest_ip", GUEST_IP);
     ctx.insert("microvm_dir", MICROVM_DIR);
+
+    if let Some(cpus) = opts.cpus {
+        ctx.insert("lima_cpus", &cpus);
+    }
+    if let Some(mem) = opts.memory_gib {
+        ctx.insert("lima_memory", &mem);
+    }
 
     for (key, value) in &opts.extra_context {
         ctx.insert(key, value);
@@ -192,6 +218,46 @@ mod tests {
         assert!(state.rootfs.is_empty());
         assert!(state.ssh_key.is_empty());
         assert_eq!(state.fc_pid, None);
+    }
+
+    #[test]
+    fn test_run_info_json_roundtrip() {
+        let info = RunInfo {
+            mode: "flake".to_string(),
+            revision: Some("abc123".to_string()),
+            flake_ref: Some("/home/user/project".to_string()),
+            guest_user: "root".to_string(),
+            cpus: 4,
+            memory: 2048,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let parsed: RunInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.mode, "flake");
+        assert_eq!(parsed.revision.as_deref(), Some("abc123"));
+        assert_eq!(parsed.flake_ref.as_deref(), Some("/home/user/project"));
+        assert_eq!(parsed.guest_user, "root");
+        assert_eq!(parsed.cpus, 4);
+        assert_eq!(parsed.memory, 2048);
+    }
+
+    #[test]
+    fn test_run_info_default() {
+        let info = RunInfo::default();
+        assert!(info.mode.is_empty());
+        assert!(info.revision.is_none());
+        assert!(info.flake_ref.is_none());
+        assert!(info.guest_user.is_empty());
+        assert_eq!(info.cpus, 0);
+        assert_eq!(info.memory, 0);
+    }
+
+    #[test]
+    fn test_run_info_minimal_json() {
+        let json = r#"{"mode":"dev","guest_user":"mvm","cpus":2,"memory":1024}"#;
+        let info: RunInfo = serde_json::from_str(json).unwrap();
+        assert_eq!(info.mode, "dev");
+        assert!(info.revision.is_none());
+        assert!(info.flake_ref.is_none());
     }
 
     #[test]
@@ -312,6 +378,49 @@ mod tests {
         assert!(
             content.contains("MVM_FC_VERSION"),
             "Lima template should export MVM_FC_VERSION"
+        );
+    }
+
+    #[test]
+    fn test_render_with_lima_resources() {
+        let opts = LimaRenderOptions {
+            cpus: Some(8),
+            memory_gib: Some(16),
+            ..Default::default()
+        };
+        let tmp = render_lima_yaml_with(&opts).unwrap();
+        let mut content = String::new();
+        std::fs::File::open(tmp.path())
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert!(
+            content.contains("cpus: 8"),
+            "Rendered YAML should contain cpus: 8, got:\n{}",
+            content
+        );
+        assert!(
+            content.contains(r#"memory: "16GiB""#),
+            "Rendered YAML should contain memory: \"16GiB\", got:\n{}",
+            content
+        );
+    }
+
+    #[test]
+    fn test_render_without_lima_resources_omits_fields() {
+        let tmp = render_lima_yaml().unwrap();
+        let mut content = String::new();
+        std::fs::File::open(tmp.path())
+            .unwrap()
+            .read_to_string(&mut content)
+            .unwrap();
+        assert!(
+            !content.contains("cpus:"),
+            "Default render should not contain cpus field"
+        );
+        assert!(
+            !content.contains("memory:"),
+            "Default render should not contain memory field"
         );
     }
 }

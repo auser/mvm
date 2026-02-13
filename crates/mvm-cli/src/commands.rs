@@ -69,6 +69,12 @@ enum Commands {
         action: CoordinatorCmd,
     },
 
+    // ---- Dev cluster (local) ----
+    DevCluster {
+        #[command(subcommand)]
+        action: DevClusterCmd,
+    },
+
     // ---- Network ----
     /// Network verification and diagnostics
     Net {
@@ -95,9 +101,22 @@ enum Commands {
         /// Delete the existing rootfs and rebuild it from scratch
         #[arg(long)]
         recreate: bool,
+        /// Number of vCPUs for the Lima VM
+        #[arg(long, default_value = "8")]
+        lima_cpus: u32,
+        /// Memory (GiB) for the Lima VM
+        #[arg(long, default_value = "16")]
+        lima_mem: u32,
     },
     /// Launch into microVM, auto-bootstrapping if needed
-    Dev,
+    Dev {
+        /// Number of vCPUs for the Lima VM
+        #[arg(long, default_value = "8")]
+        lima_cpus: u32,
+        /// Memory (GiB) for the Lima VM
+        #[arg(long, default_value = "16")]
+        lima_mem: u32,
+    },
     /// Start the microVM and drop into interactive SSH
     Start {
         /// Path to a built .elf image file (omit for default Ubuntu microVM)
@@ -126,6 +145,12 @@ enum Commands {
         /// Project directory to cd into inside the VM (Lima maps ~ → ~)
         #[arg(long)]
         project: Option<String>,
+        /// Number of vCPUs for the Lima VM
+        #[arg(long, default_value = "8")]
+        lima_cpus: u32,
+        /// Memory (GiB) for the Lima VM
+        #[arg(long, default_value = "16")]
+        lima_mem: u32,
     },
     /// Build mvm from source inside the Lima VM and install to /usr/local/bin/
     Sync {
@@ -166,6 +191,33 @@ enum Commands {
         /// Instance role (flake mode, default: worker)
         #[arg(long, default_value = "worker")]
         role: String,
+        /// Watch flake.lock and rebuild on change (flake mode)
+        #[arg(long)]
+        watch: bool,
+    },
+    /// Build from a Nix flake, boot a Firecracker VM, and drop into SSH
+    Run {
+        /// Nix flake reference (local path or remote URI)
+        #[arg(long)]
+        flake: String,
+        /// Guest profile (default: minimal)
+        #[arg(long, default_value = "minimal")]
+        profile: String,
+        /// Instance role (default: worker)
+        #[arg(long, default_value = "worker")]
+        role: String,
+        /// vCPU cores
+        #[arg(long, default_value = "2")]
+        cpus: u32,
+        /// Memory in MiB
+        #[arg(long, default_value = "1024")]
+        memory: u32,
+        /// Guest SSH user
+        #[arg(long, default_value = "root")]
+        user: String,
+        /// Boot in background, don't drop into SSH
+        #[arg(long)]
+        detach: bool,
     },
     /// Generate shell completions
     Completions {
@@ -356,6 +408,12 @@ enum PoolCmd {
         /// Build timeout in seconds
         #[arg(long)]
         timeout: Option<u64>,
+        /// Builder vCPUs
+        #[arg(long)]
+        builder_cpus: Option<u8>,
+        /// Builder memory (MiB)
+        #[arg(long)]
+        builder_mem: Option<u32>,
     },
     /// Scale pool desired counts
     Scale {
@@ -583,6 +641,18 @@ enum CoordinatorCmd {
     },
 }
 
+#[derive(Subcommand)]
+enum DevClusterCmd {
+    /// Generate dev cluster config + certs
+    Init,
+    /// Start agent + coordinator in background
+    Up,
+    /// Show status of dev cluster processes
+    Status,
+    /// Stop dev cluster processes
+    Down,
+}
+
 // --- Network subcommands ---
 
 #[derive(Subcommand)]
@@ -666,8 +736,15 @@ pub fn run() -> Result<()> {
     match cli.command {
         // --- Dev mode (unchanged) ---
         Commands::Bootstrap { production } => cmd_bootstrap(production),
-        Commands::Setup { recreate } => cmd_setup(recreate),
-        Commands::Dev => cmd_dev(),
+        Commands::Setup {
+            recreate,
+            lima_cpus,
+            lima_mem,
+        } => cmd_setup(recreate, lima_cpus, lima_mem),
+        Commands::Dev {
+            lima_cpus,
+            lima_mem,
+        } => cmd_dev(lima_cpus, lima_mem),
         Commands::Start {
             image,
             config,
@@ -681,7 +758,11 @@ pub fn run() -> Result<()> {
         Commands::Stop => cmd_stop(),
         Commands::Ssh => cmd_ssh(),
         Commands::SshConfig => cmd_ssh_config(),
-        Commands::Shell { project } => cmd_shell(project.as_deref()),
+        Commands::Shell {
+            project,
+            lima_cpus,
+            lima_mem,
+        } => cmd_shell(project.as_deref(), lima_cpus, lima_mem),
         Commands::Sync { debug, skip_deps } => cmd_sync(debug, skip_deps),
         Commands::Status => cmd_status(),
         Commands::Destroy => cmd_destroy(),
@@ -692,13 +773,23 @@ pub fn run() -> Result<()> {
             flake,
             profile,
             role,
+            watch,
         } => {
             if let Some(flake_ref) = flake {
-                cmd_build_flake(&flake_ref, &profile, &role)
+                cmd_build_flake(&flake_ref, &profile, &role, watch)
             } else {
                 cmd_build(&path, output.as_deref())
             }
         }
+        Commands::Run {
+            flake,
+            profile,
+            role,
+            cpus,
+            memory,
+            user,
+            detach,
+        } => cmd_run(&flake, &profile, &role, cpus, memory, &user, detach),
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::Events { tenant, last, json } => cmd_events(&tenant, last, json),
 
@@ -708,6 +799,7 @@ pub fn run() -> Result<()> {
         Commands::Instance { action } => cmd_instance(action, out_fmt),
         Commands::Agent { action } => cmd_agent(action),
         Commands::Coordinator { action } => cmd_coordinator(action, out_fmt),
+        Commands::DevCluster { action } => cmd_dev_cluster(action),
         Commands::Net { action } => cmd_net(action, out_fmt),
         Commands::Node { action } => cmd_node(action, out_fmt),
 
@@ -751,13 +843,14 @@ fn cmd_bootstrap(production: bool) -> Result<()> {
     ui::info("\nInstalling prerequisites...");
     bootstrap::ensure_lima()?;
 
-    run_setup_steps()?;
+    // Bootstrap uses default Lima resources (8 vCPUs, 16 GiB)
+    run_setup_steps(8, 16)?;
 
     ui::success("\nBootstrap complete! Run 'mvm start' or 'mvm dev' to launch a microVM.");
     Ok(())
 }
 
-fn cmd_setup(recreate: bool) -> Result<()> {
+fn cmd_setup(recreate: bool, lima_cpus: u32, lima_mem: u32) -> Result<()> {
     if recreate {
         recreate_rootfs()?;
         ui::success("\nRootfs recreated! Run 'mvm start' or 'mvm dev' to launch.");
@@ -766,7 +859,7 @@ fn cmd_setup(recreate: bool) -> Result<()> {
 
     if !bootstrap::is_lima_required() {
         // Native Linux — just install FC directly
-        run_setup_steps()?;
+        run_setup_steps(lima_cpus, lima_mem)?;
         ui::success("\nSetup complete! Run 'mvm start' to launch a microVM.");
         return Ok(());
     }
@@ -778,7 +871,7 @@ fn cmd_setup(recreate: bool) -> Result<()> {
         )
     })?;
 
-    run_setup_steps()?;
+    run_setup_steps(lima_cpus, lima_mem)?;
 
     ui::success("\nSetup complete! Run 'mvm start' to launch a microVM.");
     Ok(())
@@ -809,7 +902,7 @@ fn recreate_rootfs() -> Result<()> {
     Ok(())
 }
 
-fn cmd_dev() -> Result<()> {
+fn cmd_dev(lima_cpus: u32, lima_mem: u32) -> Result<()> {
     ui::info("Launching development environment...\n");
 
     if bootstrap::is_lima_required() {
@@ -824,7 +917,7 @@ fn cmd_dev() -> Result<()> {
         match lima_status {
             lima::LimaStatus::NotFound => {
                 ui::info("Lima VM not found. Running setup...\n");
-                run_setup_steps()?;
+                run_setup_steps(lima_cpus, lima_mem)?;
                 return microvm::start();
             }
             lima::LimaStatus::Stopped => {
@@ -857,9 +950,18 @@ fn cmd_dev() -> Result<()> {
     microvm::start()
 }
 
-fn run_setup_steps() -> Result<()> {
+fn run_setup_steps(lima_cpus: u32, lima_mem: u32) -> Result<()> {
     if bootstrap::is_lima_required() {
-        let lima_yaml = config::render_lima_yaml()?;
+        let opts = config::LimaRenderOptions {
+            cpus: Some(lima_cpus),
+            memory_gib: Some(lima_mem),
+            ..Default::default()
+        };
+        let lima_yaml = config::render_lima_yaml_with(&opts)?;
+        ui::info(&format!(
+            "Lima VM resources: {} vCPUs, {} GiB memory",
+            lima_cpus, lima_mem,
+        ));
         ui::info(&format!(
             "Using rendered Lima config: {}",
             lima_yaml.path().display()
@@ -969,23 +1071,63 @@ fn cmd_ssh() -> Result<()> {
 }
 
 fn cmd_ssh_config() -> Result<()> {
+    let home_dir = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
+    let lima_ssh_config = format!("{}/.lima/{}/ssh.config", home_dir, config::VM_NAME);
+
+    // Parse Lima's ssh.config for the forwarded port and identity file
+    let (hostname, port, user, identity) =
+        parse_lima_ssh_config(&lima_ssh_config).unwrap_or_else(|| {
+            (
+                "127.0.0.1".to_string(),
+                "# <port>  # run 'mvm setup' first".to_string(),
+                std::env::var("USER").unwrap_or_else(|_| "lima".to_string()),
+                format!("{}/.lima/_config/user", home_dir),
+            )
+        });
+
     println!(
-        r#"# mvm dev microVM — add to ~/.ssh/config
+        r#"# mvm Lima VM — add to ~/.ssh/config
 Host mvm
-    HostName {guest_ip}
+    HostName {hostname}
+    Port {port}
     User {user}
-    ProxyCommand limactl shell {vm} -- nc %h %p
+    IdentityFile {identity}
     StrictHostKeyChecking no
     UserKnownHostsFile /dev/null
     LogLevel ERROR"#,
-        guest_ip = config::GUEST_IP,
-        user = config::GUEST_USER,
-        vm = config::VM_NAME,
+        hostname = hostname,
+        port = port,
+        user = user,
+        identity = identity,
     );
     Ok(())
 }
 
-fn cmd_shell(project: Option<&str>) -> Result<()> {
+/// Parse Lima's generated ssh.config to extract Hostname, Port, User, IdentityFile.
+fn parse_lima_ssh_config(path: &str) -> Option<(String, String, String, String)> {
+    let content = std::fs::read_to_string(path).ok()?;
+    let mut hostname = None;
+    let mut port = None;
+    let mut user = None;
+    let mut identity = None;
+
+    for line in content.lines() {
+        let line = line.trim();
+        if let Some(val) = line.strip_prefix("Hostname ") {
+            hostname = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("Port ") {
+            port = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("User ") {
+            user = Some(val.trim().to_string());
+        } else if let Some(val) = line.strip_prefix("IdentityFile ") {
+            identity = Some(val.trim().trim_matches('"').to_string());
+        }
+    }
+
+    Some((hostname?, port?, user?, identity?))
+}
+
+fn cmd_shell(project: Option<&str>, _lima_cpus: u32, _lima_mem: u32) -> Result<()> {
     lima::require_running()?;
 
     // Print welcome banner with tool versions
@@ -1199,7 +1341,21 @@ fn cmd_status() -> Result<()> {
         return Ok(());
     }
 
-    if microvm::is_ssh_reachable()? {
+    // Check for flake run info to distinguish run modes
+    if let Some(info) = microvm::read_run_info()
+        && info.mode == "flake"
+    {
+        let rev = info.revision.as_deref().unwrap_or("unknown");
+        ui::status_line(
+            "MicroVM:",
+            &format!(
+                "Running — flake (revision {}, {}@{})",
+                rev,
+                info.guest_user,
+                config::GUEST_IP
+            ),
+        );
+    } else if microvm::is_ssh_reachable()? {
         ui::status_line(
             "MicroVM:",
             &format!("Running (SSH: {}@{})", config::GUEST_USER, config::GUEST_IP),
@@ -1222,7 +1378,7 @@ fn cmd_build(path: &str, output: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_build_flake(flake_ref: &str, profile: &str, role_str: &str) -> Result<()> {
+fn cmd_build_flake(flake_ref: &str, profile: &str, role_str: &str, watch: bool) -> Result<()> {
     if bootstrap::is_lima_required() {
         lima::require_running()?;
     }
@@ -1230,34 +1386,61 @@ fn cmd_build_flake(flake_ref: &str, profile: &str, role_str: &str) -> Result<()>
     let role = parse_role(role_str)?;
     let resolved = resolve_flake_ref(flake_ref)?;
 
-    ui::step(
-        1,
-        2,
-        &format!(
-            "Building flake {} (profile={}, role={})",
-            resolved, profile, role
-        ),
-    );
-
     let env = mvm_runtime::build_env::RuntimeBuildEnv;
-    let result = mvm_build::dev_build::dev_build(&env, &resolved, profile, &role)?;
+    let watch_enabled = watch && !resolved.contains(':');
 
-    ui::step(2, 2, "Build complete");
-
-    if result.cached {
-        ui::success(&format!("\nCache hit — revision {}", result.revision_hash));
-    } else {
-        ui::success(&format!(
-            "\nBuild complete — revision {}",
-            result.revision_hash
-        ));
+    if watch && resolved.contains(':') {
+        ui::warn("Watch mode requires a local flake; running a single build instead.");
     }
 
-    ui::info(&format!("  Kernel: {}", result.vmlinux_path));
-    ui::info(&format!("  Rootfs: {}", result.rootfs_path));
-    ui::info(&format!("\nRun with: mvm run --flake {}", flake_ref));
+    let mut last_mtime = std::fs::metadata(format!("{}/flake.lock", resolved))
+        .and_then(|m| m.modified())
+        .ok();
 
-    Ok(())
+    loop {
+        ui::step(
+            1,
+            2,
+            &format!(
+                "Building flake {} (profile={}, role={})",
+                resolved, profile, role
+            ),
+        );
+
+        let result = mvm_build::dev_build::dev_build(&env, &resolved, profile, &role)?;
+
+        ui::step(2, 2, "Build complete");
+
+        if result.cached {
+            ui::success(&format!("\nCache hit — revision {}", result.revision_hash));
+        } else {
+            ui::success(&format!(
+                "\nBuild complete — revision {}",
+                result.revision_hash
+            ));
+        }
+
+        ui::info(&format!("  Kernel: {}", result.vmlinux_path));
+        ui::info(&format!("  Rootfs: {}", result.rootfs_path));
+        ui::info(&format!("\nRun with: mvm run --flake {}", flake_ref));
+
+        if !watch_enabled {
+            return Ok(());
+        }
+
+        // Watch mode: wait for flake.lock mtime change
+        ui::info("Watching flake.lock for changes (Ctrl+C to exit)...");
+        loop {
+            std::thread::sleep(std::time::Duration::from_secs(2));
+            let new_mtime = std::fs::metadata(format!("{}/flake.lock", resolved))
+                .and_then(|m| m.modified())
+                .ok();
+            if new_mtime.is_some() && new_mtime != last_mtime {
+                last_mtime = new_mtime;
+                break;
+            }
+        }
+    }
 }
 
 /// Resolve a flake reference: relative/absolute paths are canonicalized,
@@ -1275,6 +1458,60 @@ fn resolve_flake_ref(flake_ref: &str) -> Result<String> {
         .with_context(|| format!("Flake path '{}' does not exist", flake_ref))?;
 
     Ok(canonical.to_string_lossy().to_string())
+}
+
+fn cmd_run(
+    flake_ref: &str,
+    profile: &str,
+    role_str: &str,
+    cpus: u32,
+    memory: u32,
+    guest_user: &str,
+    detach: bool,
+) -> Result<()> {
+    if bootstrap::is_lima_required() {
+        lima::require_running()?;
+    }
+
+    let role = parse_role(role_str)?;
+    let resolved = resolve_flake_ref(flake_ref)?;
+
+    ui::step(
+        1,
+        3,
+        &format!(
+            "Building flake {} (profile={}, role={})",
+            resolved, profile, role
+        ),
+    );
+
+    let env = mvm_runtime::build_env::RuntimeBuildEnv;
+    let result = mvm_build::dev_build::dev_build(&env, &resolved, profile, &role)?;
+
+    if result.cached {
+        ui::info(&format!("Cache hit — revision {}", result.revision_hash));
+    } else {
+        ui::info(&format!(
+            "Build complete — revision {}",
+            result.revision_hash
+        ));
+    }
+
+    ui::step(2, 3, "Booting Firecracker VM");
+
+    let run_config = microvm::FlakeRunConfig {
+        vmlinux_path: result.vmlinux_path,
+        rootfs_path: result.rootfs_path,
+        revision_hash: result.revision_hash,
+        flake_ref: flake_ref.to_string(),
+        cpus,
+        memory,
+        guest_user: guest_user.to_string(),
+        detach,
+    };
+
+    ui::step(3, 3, "Connecting");
+    microvm::run_from_build(&run_config)
 }
 
 fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
@@ -1542,10 +1779,20 @@ fn cmd_pool(action: PoolCmd, out_fmt: OutputFormat) -> Result<()> {
             output::render_one(&info, fmt);
             Ok(())
         }
-        PoolCmd::Build { path, timeout } => {
+        PoolCmd::Build {
+            path,
+            timeout,
+            builder_cpus,
+            builder_mem,
+        } => {
             let (tenant_id, pool_id) = naming::parse_pool_path(&path)?;
             let env = mvm_runtime::build_env::RuntimeBuildEnv;
-            mvm_build::build::pool_build(&env, tenant_id, pool_id, timeout)
+            let opts = mvm_build::build::PoolBuildOpts {
+                timeout_secs: timeout,
+                builder_vcpus: builder_cpus,
+                builder_mem_mib: builder_mem,
+            };
+            mvm_build::build::pool_build_with_opts(&env, tenant_id, pool_id, opts)
         }
         PoolCmd::Scale {
             path,
@@ -2095,6 +2342,15 @@ fn cmd_coordinator(action: CoordinatorCmd, _out_fmt: OutputFormat) -> Result<()>
             }
             Ok(())
         }
+    }
+}
+
+fn cmd_dev_cluster(action: DevClusterCmd) -> Result<()> {
+    match action {
+        DevClusterCmd::Init => crate::dev_cluster::init(),
+        DevClusterCmd::Up => crate::dev_cluster::up(),
+        DevClusterCmd::Status => crate::dev_cluster::status(),
+        DevClusterCmd::Down => crate::dev_cluster::down(),
     }
 }
 
@@ -2743,5 +2999,102 @@ mod tests {
     fn test_resolve_flake_ref_nonexistent_fails() {
         let result = resolve_flake_ref("/nonexistent/path/that/does/not/exist");
         assert!(result.is_err());
+    }
+
+    // ---- Run command tests ----
+
+    #[test]
+    fn test_run_parses_all_flags() {
+        let cli = Cli::try_parse_from([
+            "mvm",
+            "run",
+            "--flake",
+            ".",
+            "--profile",
+            "full",
+            "--role",
+            "gateway",
+            "--cpus",
+            "4",
+            "--memory",
+            "2048",
+            "--user",
+            "ubuntu",
+            "--detach",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Run {
+                flake,
+                profile,
+                role,
+                cpus,
+                memory,
+                user,
+                detach,
+            } => {
+                assert_eq!(flake, ".");
+                assert_eq!(profile, "full");
+                assert_eq!(role, "gateway");
+                assert_eq!(cpus, 4);
+                assert_eq!(memory, 2048);
+                assert_eq!(user, "ubuntu");
+                assert!(detach);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_defaults() {
+        let cli = Cli::try_parse_from(["mvm", "run", "--flake", "."]).unwrap();
+        match cli.command {
+            Commands::Run {
+                flake,
+                profile,
+                role,
+                cpus,
+                memory,
+                user,
+                detach,
+            } => {
+                assert_eq!(flake, ".");
+                assert_eq!(profile, "minimal");
+                assert_eq!(role, "worker");
+                assert_eq!(cpus, 2);
+                assert_eq!(memory, 1024);
+                assert_eq!(user, "root");
+                assert!(!detach);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_detach_flag() {
+        let cli = Cli::try_parse_from(["mvm", "run", "--flake", ".", "--detach"]).unwrap();
+        match cli.command {
+            Commands::Run { detach, .. } => {
+                assert!(detach);
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_custom_user() {
+        let cli = Cli::try_parse_from(["mvm", "run", "--flake", ".", "--user", "admin"]).unwrap();
+        match cli.command {
+            Commands::Run { user, .. } => {
+                assert_eq!(user, "admin");
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_requires_flake() {
+        let result = Cli::try_parse_from(["mvm", "run"]);
+        assert!(result.is_err(), "run should require --flake");
     }
 }

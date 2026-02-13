@@ -7,6 +7,12 @@ mounts:
     writable: true
 
 nestedVirtualization: true
+{% if lima_cpus is defined %}
+cpus: {{ lima_cpus }}
+{% endif %}
+{% if lima_memory is defined %}
+memory: "{{ lima_memory }}GiB"
+{% endif %}
 
 provision:
   - mode: system

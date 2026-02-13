@@ -23,6 +23,56 @@ const BUILDER_IP_OFFSET: u8 = 2;
 /// Default build timeout in seconds (30 minutes).
 const DEFAULT_TIMEOUT_SECS: u64 = 1800;
 
+/// Optional overrides for pool builds.
+#[derive(Default)]
+pub struct PoolBuildOpts {
+    pub timeout_secs: Option<u64>,
+    pub builder_vcpus: Option<u8>,
+    pub builder_mem_mib: Option<u32>,
+}
+
+fn maybe_skip_by_lock_hash(
+    env: &dyn BuildEnvironment,
+    tenant_id: &str,
+    pool_id: &str,
+    flake_ref: &str,
+) -> Result<bool> {
+    if flake_ref.contains(':') {
+        return Ok(false); // remote ref: don't hash
+    }
+
+    let hash = match env.shell_exec_stdout(&format!(
+        r#"if [ -f {}/flake.lock ]; then nix hash path {}/flake.lock; else echo ""; fi"#,
+        flake_ref, flake_ref
+    )) {
+        Ok(h) => h,
+        Err(_) => return Ok(false),
+    };
+    let trimmed = hash.trim();
+    if trimmed.is_empty() {
+        return Ok(false);
+    }
+
+    let artifacts_dir = pool_artifacts_dir(tenant_id, pool_id);
+    let lock_hash_path = format!("{}/last_flake_lock.hash", artifacts_dir);
+    let current_exists = env
+        .shell_exec_stdout(&format!(
+            "test -L {}/current && echo yes || echo no",
+            artifacts_dir
+        ))
+        .unwrap_or_default();
+    let existing = env
+        .shell_exec_stdout(&format!("cat {} 2>/dev/null || echo ''", lock_hash_path))
+        .unwrap_or_default();
+
+    if current_exists.trim() == "yes" && existing.trim() == trimmed {
+        env.log_success("flake.lock unchanged — skipping rebuild (cache hit)");
+        return Ok(true);
+    }
+
+    Ok(false)
+}
+
 /// Build artifacts for a pool using an ephemeral Firecracker builder microVM.
 pub fn pool_build(
     env: &dyn BuildEnvironment,
@@ -30,7 +80,22 @@ pub fn pool_build(
     pool_id: &str,
     timeout_secs: Option<u64>,
 ) -> Result<()> {
-    let timeout = timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
+    let opts = PoolBuildOpts {
+        timeout_secs,
+        builder_vcpus: None,
+        builder_mem_mib: None,
+    };
+    pool_build_with_opts(env, tenant_id, pool_id, opts)
+}
+
+/// Build artifacts for a pool with optional resource overrides.
+pub fn pool_build_with_opts(
+    env: &dyn BuildEnvironment,
+    tenant_id: &str,
+    pool_id: &str,
+    opts: PoolBuildOpts,
+) -> Result<()> {
+    let timeout = opts.timeout_secs.unwrap_or(DEFAULT_TIMEOUT_SECS);
     let spec = env.load_pool_spec(tenant_id, pool_id)?;
     let tenant = env.load_tenant_config(tenant_id)?;
 
@@ -38,6 +103,10 @@ pub fn pool_build(
         "Building {}/{} (flake: {}, profile: {})",
         tenant_id, pool_id, spec.flake_ref, spec.profile
     ));
+
+    if maybe_skip_by_lock_hash(env, tenant_id, pool_id, &spec.flake_ref)? {
+        return Ok(());
+    }
 
     // Step 1: Ensure builder artifacts exist
     ensure_builder_artifacts(env)?;
@@ -55,14 +124,39 @@ pub fn pool_build(
 
     // Step 4: Boot ephemeral builder VM
     let builder_net = builder_instance_net(&tenant.net);
-    let builder_pid = boot_builder(env, &build_run_dir, &builder_net, &tenant.net)?;
+    let builder_pid = boot_builder(
+        env,
+        &build_run_dir,
+        &builder_net,
+        &tenant.net,
+        opts.builder_vcpus.unwrap_or(BUILDER_VCPUS),
+        opts.builder_mem_mib.unwrap_or(BUILDER_MEM_MIB),
+    )?;
+
+    // Optional: sync local flake into builder if needed
+    let synced_flake = sync_local_flake_if_needed(
+        env,
+        &builder_net.guest_ip,
+        &tenant_ssh_key_path(tenant_id),
+        &spec.flake_ref,
+    );
+    let flake_ref = synced_flake.as_deref().unwrap_or(&spec.flake_ref);
+
+    let lock_hash = flake_lock_hash(
+        env,
+        &builder_net.guest_ip,
+        &tenant_ssh_key_path(tenant_id),
+        flake_ref,
+    );
+
+    ensure_nix_installed(env, &builder_net.guest_ip, &tenant_ssh_key_path(tenant_id))?;
 
     // Step 5: Wait for builder to be ready, then run the build
     let result = run_nix_build(
         env,
         &builder_net.guest_ip,
         &tenant_ssh_key_path(tenant_id),
-        &spec.flake_ref,
+        flake_ref,
         &spec.role,
         &spec.profile,
         timeout,
@@ -94,7 +188,7 @@ pub fn pool_build(
     let revision = BuildRevision {
         revision_hash: revision_hash.clone(),
         flake_ref: spec.flake_ref.clone(),
-        flake_lock_hash: revision_hash.clone(), // TODO: extract actual flake.lock hash
+        flake_lock_hash: lock_hash.clone().unwrap_or_else(|| revision_hash.clone()),
         artifact_paths: ArtifactPaths {
             vmlinux: "vmlinux".to_string(),
             rootfs: "rootfs.ext4".to_string(),
@@ -105,6 +199,17 @@ pub fn pool_build(
 
     env.record_revision(tenant_id, pool_id, &revision)?;
     record_build_history(env, tenant_id, pool_id, &revision)?;
+
+    if let Some(hash) = lock_hash {
+        let artifacts_dir = pool_artifacts_dir(tenant_id, pool_id);
+        let lock_hash_path = format!("{}/last_flake_lock.hash", artifacts_dir);
+        env.shell_exec(&format!(
+            "mkdir -p {dir} && echo '{hash}' > {path}",
+            dir = artifacts_dir,
+            hash = hash,
+            path = lock_hash_path
+        ))?;
+    }
 
     env.log_success(&format!(
         "Build complete: {}/{} revision {}",
@@ -213,6 +318,8 @@ fn boot_builder(
     run_dir: &str,
     builder_net: &InstanceNet,
     tenant_net: &TenantNet,
+    vcpus: u8,
+    mem_mib: u32,
 ) -> Result<u32> {
     env.log_info("Booting builder VM...");
 
@@ -240,8 +347,8 @@ fn boot_builder(
             "host_dev_name": builder_net.tap_dev,
         }],
         "machine-config": {
-            "vcpu_count": BUILDER_VCPUS,
-            "mem_size_mib": BUILDER_MEM_MIB,
+            "vcpu_count": vcpus,
+            "mem_size_mib": mem_mib,
         },
     });
 
@@ -305,6 +412,106 @@ fn boot_builder(
     ))?;
 
     Ok(pid)
+}
+
+/// If flake_ref is a local path, sync it into the builder VM so `nix build .` works.
+fn sync_local_flake_if_needed(
+    env: &dyn BuildEnvironment,
+    builder_ip: &str,
+    ssh_key_path: &str,
+    flake_ref: &str,
+) -> Option<String> {
+    if flake_ref.contains(':') {
+        return None; // remote ref, nothing to do
+    }
+
+    // Canonicalize inside the Lima/host environment.
+    let realpath = env
+        .shell_exec_stdout(&format!("realpath {} 2>/dev/null", flake_ref))
+        .ok()?;
+
+    if realpath.is_empty() {
+        env.log_info(&format!(
+            "Local flake '{}' not found; skipping sync",
+            flake_ref
+        ));
+        return None;
+    }
+
+    let tmp_tar = env
+        .shell_exec_stdout("mktemp /tmp/mvm-flake-XXXX.tar.gz")
+        .ok()?;
+    let script = format!(
+        r#"
+        set -euo pipefail
+        tar czf {tmp} -C {src} .
+        scp -o StrictHostKeyChecking=no -i {key} {tmp} root@{ip}:/tmp/flake.tar.gz
+        ssh -o StrictHostKeyChecking=no -i {key} root@{ip} \
+            'rm -rf /root/project && mkdir -p /root/project && tar xzf /tmp/flake.tar.gz -C /root/project'
+        rm -f {tmp}
+        "#,
+        tmp = tmp_tar,
+        src = realpath,
+        key = ssh_key_path,
+        ip = builder_ip
+    );
+
+    if env.shell_exec(&script).is_err() {
+        env.log_info("Failed to sync local flake; continuing with original ref");
+        return None;
+    }
+
+    env.log_info("Local flake synced to builder at /root/project");
+    Some("/root/project".to_string())
+}
+
+/// Compute the hash of flake.lock inside the builder VM (if present).
+fn flake_lock_hash(
+    env: &dyn BuildEnvironment,
+    builder_ip: &str,
+    ssh_key_path: &str,
+    flake_ref: &str,
+) -> Option<String> {
+    let cmd = format!(
+        r#"
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i {key} root@{ip} \
+            'if [ -f {flake}/flake.lock ]; then nix hash path {flake}/flake.lock; else echo __NOLOCK__; fi'
+        "#,
+        key = ssh_key_path,
+        ip = builder_ip,
+        flake = flake_ref
+    );
+    let hash = env.shell_exec_stdout(&cmd).ok()?;
+    if hash.contains("__NOLOCK__") || hash.trim().is_empty() {
+        None
+    } else {
+        Some(hash.trim().to_string())
+    }
+}
+
+/// Ensure Nix is available inside the builder VM (first boot installs if missing).
+fn ensure_nix_installed(
+    env: &dyn BuildEnvironment,
+    builder_ip: &str,
+    ssh_key_path: &str,
+) -> Result<()> {
+    env.log_info("Ensuring Nix is installed in builder...");
+    env.shell_exec_visible(&format!(
+        r#"
+        ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 -i {key} root@{ip} '
+            if command -v nix >/dev/null 2>&1; then
+                echo "Nix already present";
+                exit 0;
+            fi
+            echo "Installing Nix in builder (single-user)..."
+            curl -L https://nixos.org/nix/install | sh -s -- --no-daemon
+            . /root/.nix-profile/etc/profile.d/nix.sh
+        '
+        "#,
+        key = ssh_key_path,
+        ip = builder_ip
+    ))?;
+    Ok(())
 }
 
 /// Construct the nix build attribute for a pool.
@@ -372,30 +579,30 @@ fn run_nix_build(
 
     env.log_info(&format!("Running: nix build {}", build_attr));
 
-    let output = env
-        .shell_exec_stdout(&format!(
-            r#"
+    let log_path = "/tmp/mvm-nix-build.log";
+
+    env.shell_exec_visible(&format!(
+        r#"
         ssh -o StrictHostKeyChecking=no -o ConnectTimeout=5 \
             -i {key} root@{ip} \
-            'timeout {timeout} nix build {attr} --no-link --print-out-paths 2>&1'
+            'timeout {timeout} nix build {attr} --no-link --print-out-paths' \
+            | tee {log}
         "#,
-            key = ssh_key_path,
-            ip = builder_ip,
-            timeout = timeout_secs,
-            attr = build_attr,
-        ))
-        .with_context(|| format!("nix build failed for {}", build_attr))?;
+        key = ssh_key_path,
+        ip = builder_ip,
+        timeout = timeout_secs,
+        attr = build_attr,
+        log = log_path,
+    ))
+    .with_context(|| format!("nix build failed for {}", build_attr))?;
+
+    let output = env.shell_exec_stdout(&format!("cat {} 2>/dev/null", log_path))?;
 
     let out_path = output
         .lines()
         .rev()
         .find(|l| l.starts_with("/nix/store/"))
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "nix build did not produce an output path. Output:\n{}",
-                output
-            )
-        })?
+        .ok_or_else(|| anyhow::anyhow!("nix build did not produce an output path"))?
         .to_string();
 
     env.log_info(&format!("Build output: {}", out_path));
