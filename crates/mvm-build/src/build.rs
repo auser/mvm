@@ -248,7 +248,6 @@ fn builder_instance_net(tenant_net: &TenantNet) -> InstanceNet {
 fn ensure_builder_artifacts(env: &dyn BuildEnvironment) -> Result<()> {
     let kernel_path = format!("{}/vmlinux", BUILDER_DIR);
     let rootfs_path = format!("{}/rootfs.ext4", BUILDER_DIR);
-
     let exists = env.shell_exec_stdout(&format!(
         "test -f {} && test -f {} && echo yes || echo no",
         kernel_path, rootfs_path
@@ -285,26 +284,33 @@ fn ensure_builder_artifacts(env: &dyn BuildEnvironment) -> Result<()> {
                 "https://s3.amazonaws.com/spec.ccfc.min/$latest_kernel_key"
         fi
 
+        # If rootfs.ext4 is missing, (re)build it from squashfs
         if [ ! -f rootfs.ext4 ]; then
-            echo '[mvm] Downloading builder rootfs...'
-            latest_ubuntu_key=$(curl -s \
-                "http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/{fc_short}/{arch}/ubuntu-&list-type=2" \
-                | grep -oP '(?<=<Key>)(firecracker-ci/{fc_short}/{arch}/ubuntu-[0-9]+\.[0-9]+\.squashfs)(?=</Key>)' \
-                | sort -V | tail -1)
+            if [ ! -f rootfs.squashfs ]; then
+                echo '[mvm] Downloading builder rootfs...'
+                latest_ubuntu_key=$(curl -s \
+                    "http://spec.ccfc.min.s3.amazonaws.com/?prefix=firecracker-ci/{fc_short}/{arch}/ubuntu-&list-type=2" \
+                    | grep -oP '(?<=<Key>)(firecracker-ci/{fc_short}/{arch}/ubuntu-[0-9]+\.[0-9]+\.squashfs)(?=</Key>)' \
+                    | sort -V | tail -1)
 
-            wget -q --show-progress -O rootfs.squashfs \
-                "https://s3.amazonaws.com/spec.ccfc.min/$latest_ubuntu_key"
+                wget -q --show-progress -O rootfs.squashfs \
+                    "https://s3.amazonaws.com/spec.ccfc.min/$latest_ubuntu_key"
+            else
+                echo '[mvm] Using cached rootfs.squashfs'
+            fi
 
             echo '[mvm] Preparing builder rootfs...'
-            sudo unsquashfs -d squashfs-root rootfs.squashfs
+            rm -rf squashfs-root
+            unsquashfs -d squashfs-root rootfs.squashfs
 
-            sudo mkdir -p squashfs-root/root/.ssh
-            sudo mkdir -p squashfs-root/nix
+            mkdir -p squashfs-root/root/.ssh
+            mkdir -p squashfs-root/nix
 
+            rm -f rootfs.ext4
             truncate -s 4G rootfs.ext4
-            sudo mkfs.ext4 -d squashfs-root -F rootfs.ext4
+            mkfs.ext4 -d squashfs-root -F rootfs.ext4
 
-            sudo rm -rf squashfs-root rootfs.squashfs
+            rm -rf squashfs-root
             echo '[mvm] Builder rootfs prepared.'
         fi
         "#,
