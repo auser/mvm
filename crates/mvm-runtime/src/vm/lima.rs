@@ -17,6 +17,11 @@ pub enum LimaStatus {
 
 /// Get the current status of a named Lima VM.
 pub fn get_vm_status(vm_name: &str) -> Result<LimaStatus> {
+    // On native KVM hosts, Lima isn't required—skip external call to limactl.
+    if mvm_core::platform::current().has_kvm() {
+        return Ok(LimaStatus::NotFound);
+    }
+
     let output = run_host("limactl", &["list", "--format", "{{.Status}}", vm_name])?;
     let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
 

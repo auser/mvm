@@ -2927,6 +2927,7 @@ mod tests {
             Commands::Sync {
                 debug: false,
                 skip_deps: false,
+                force: false,
             }
         ));
     }
@@ -2939,6 +2940,7 @@ mod tests {
             Commands::Sync {
                 debug: true,
                 skip_deps: false,
+                force: false,
             }
         ));
     }
@@ -2951,6 +2953,7 @@ mod tests {
             Commands::Sync {
                 debug: false,
                 skip_deps: true,
+                force: false
             }
         ));
     }
@@ -2963,6 +2966,7 @@ mod tests {
             Commands::Sync {
                 debug: true,
                 skip_deps: true,
+                force: false,
             }
         ));
     }
@@ -3142,12 +3146,14 @@ mod tests {
                 memory,
                 user,
                 detach,
+                volume: _,
+                config: _,
             } => {
                 assert_eq!(flake, ".");
                 assert_eq!(profile, "full");
                 assert_eq!(role, "gateway");
-                assert_eq!(cpus, 4);
-                assert_eq!(memory, 2048);
+                assert_eq!(cpus, Some(4));
+                assert_eq!(memory, Some(2048));
                 assert_eq!(user, "ubuntu");
                 assert!(detach);
             }
@@ -3166,6 +3172,8 @@ mod tests {
                 cpus,
                 memory,
                 user,
+                config: _,
+                volume,
                 detach,
             } => {
                 assert_eq!(flake, ".");
@@ -3174,6 +3182,7 @@ mod tests {
                 assert_eq!(cpus, Some(2));
                 assert_eq!(memory, Some(1024));
                 assert_eq!(user, "root");
+                assert_eq!(volume.len(), 0);
                 assert!(!detach);
             }
             _ => panic!("Expected Run command"),
