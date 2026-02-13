@@ -7,6 +7,9 @@ mounts:
     writable: true
 
 nestedVirtualization: true
+ssh:
+  # Use a fixed SSH port so tools and editors can connect consistently.
+  localPort: 60022
 {% if lima_cpus is defined %}
 cpus: {{ lima_cpus }}
 {% endif %}
