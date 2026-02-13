@@ -1031,7 +1031,15 @@ fn cmd_start_image(
     cpus: Option<u32>,
     memory: Option<u32>,
 ) -> Result<()> {
-    lima::require_running()?;
+    // If limactl isn't available (likely already inside Lima), skip host VM check.
+    let limactl_present = shell::run_host("which", &["limactl"])
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+    if limactl_present {
+        lima::require_running()?;
+    } else {
+        ui::warn("limactl not found; assuming we're already inside the Lima VM and proceeding.");
+    }
 
     let rt_config = match config_path {
         Some(p) => image::parse_runtime_config(p)?,
