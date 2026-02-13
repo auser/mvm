@@ -160,6 +160,9 @@ enum Commands {
         /// Skip installing build dependencies (rustup, apt packages)
         #[arg(long)]
         skip_deps: bool,
+        /// Rebuild and reinstall even if versions match inside the VM
+        #[arg(long)]
+        force: bool,
     },
     /// Show status of Lima VM and microVM
     Status,
@@ -769,7 +772,11 @@ pub fn run() -> Result<()> {
             lima_cpus,
             lima_mem,
         } => cmd_shell(project.as_deref(), lima_cpus, lima_mem),
-        Commands::Sync { debug, skip_deps } => cmd_sync(debug, skip_deps),
+        Commands::Sync {
+            debug,
+            skip_deps,
+            force,
+        } => cmd_sync(debug, skip_deps, force),
         Commands::Status => cmd_status(),
         Commands::Destroy => cmd_destroy(),
         Commands::Upgrade { check, force } => cmd_upgrade(check, force),
@@ -1243,7 +1250,7 @@ fn sync_install_script(source_dir: &str, debug: bool, vm_arch: &str) -> String {
     )
 }
 
-fn cmd_sync(debug: bool, skip_deps: bool) -> Result<()> {
+fn cmd_sync(debug: bool, skip_deps: bool, force: bool) -> Result<()> {
     if !bootstrap::is_lima_required() {
         ui::info("Native Linux detected. The host mvm binary is already Linux-native.");
         ui::info("No sync needed — mvm is already available.");
@@ -1265,6 +1272,21 @@ fn cmd_sync(debug: bool, skip_deps: bool) -> Result<()> {
     let profile_name = if debug { "debug" } else { "release" };
     let total_steps: u32 = if skip_deps { 2 } else { 4 };
     let mut step = 0u32;
+
+    // Fast-path: skip if already matching version unless forced
+    if !force {
+        let desired_version = env!("CARGO_PKG_VERSION");
+        if let Ok(current) =
+            shell::run_in_vm_stdout("/usr/local/bin/mvm --version 2>/dev/null || true")
+            && current.contains(desired_version)
+        {
+            ui::success(&format!(
+                "mvm {} already installed inside Lima VM. Use --force to rebuild.",
+                desired_version
+            ));
+            return Ok(());
+        }
+    }
 
     if !skip_deps {
         step += 1;
