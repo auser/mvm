@@ -39,7 +39,7 @@ install_linux_deps() {
     info "Installing system build dependencies..."
     if command -v apt-get >/dev/null 2>&1; then
         sudo apt-get update -y
-        sudo apt-get install -y build-essential pkg-config libssl-dev lld clang curl
+        sudo apt-get install -y build-essential pkg-config libssl-dev lld clang curl nodejs npm
     elif command -v dnf >/dev/null 2>&1; then
         sudo dnf install -y gcc gcc-c++ make pkgconf-pkg-config openssl-devel lld clang curl
     elif command -v pacman >/dev/null 2>&1; then

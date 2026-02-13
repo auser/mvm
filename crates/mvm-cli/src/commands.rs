@@ -207,14 +207,20 @@ enum Commands {
         #[arg(long, default_value = "worker")]
         role: String,
         /// vCPU cores
-        #[arg(long, default_value = "2")]
-        cpus: u32,
+        #[arg(long)]
+        cpus: Option<u32>,
         /// Memory in MiB
-        #[arg(long, default_value = "1024")]
-        memory: u32,
+        #[arg(long)]
+        memory: Option<u32>,
         /// Guest SSH user
         #[arg(long, default_value = "root")]
         user: String,
+        /// Runtime config (TOML) for persistent resources/volumes
+        #[arg(long)]
+        config: Option<String>,
+        /// Volume override (format: host_path:guest_mount:size). Repeatable.
+        #[arg(long, short = 'v')]
+        volume: Vec<String>,
         /// Boot in background, don't drop into SSH
         #[arg(long)]
         detach: bool,
@@ -788,8 +794,20 @@ pub fn run() -> Result<()> {
             cpus,
             memory,
             user,
+            config,
+            volume,
             detach,
-        } => cmd_run(&flake, &profile, &role, cpus, memory, &user, detach),
+        } => cmd_run(
+            &flake,
+            &profile,
+            &role,
+            cpus,
+            memory,
+            &user,
+            config.as_deref(),
+            &volume,
+            detach,
+        ),
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::Events { tenant, last, json } => cmd_events(&tenant, last, json),
 
@@ -1460,13 +1478,16 @@ fn resolve_flake_ref(flake_ref: &str) -> Result<String> {
     Ok(canonical.to_string_lossy().to_string())
 }
 
+#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     flake_ref: &str,
     profile: &str,
     role_str: &str,
-    cpus: u32,
-    memory: u32,
+    cpus: Option<u32>,
+    memory: Option<u32>,
     guest_user: &str,
+    config_path: Option<&str>,
+    volumes: &[String],
     detach: bool,
 ) -> Result<()> {
     if bootstrap::is_lima_required() {
@@ -1499,19 +1520,55 @@ fn cmd_run(
 
     ui::step(2, 3, "Booting Firecracker VM");
 
+    let rt_config = match config_path {
+        Some(p) => image::parse_runtime_config(p)?,
+        None => image::RuntimeConfig::default(),
+    };
+
+    let volume_cfg: Vec<image::RuntimeVolume> = if !volumes.is_empty() {
+        volumes
+            .iter()
+            .map(|v| parse_runtime_volume(v))
+            .collect::<Result<_>>()?
+    } else {
+        rt_config.volumes.clone()
+    };
+
+    const DEFAULT_CPUS: u32 = 2;
+    const DEFAULT_MEM: u32 = 1024;
+
+    let final_cpus = cpus.or(rt_config.cpus).unwrap_or(DEFAULT_CPUS);
+    let final_memory = memory.or(rt_config.memory).unwrap_or(DEFAULT_MEM);
+
     let run_config = microvm::FlakeRunConfig {
         vmlinux_path: result.vmlinux_path,
         rootfs_path: result.rootfs_path,
         revision_hash: result.revision_hash,
         flake_ref: flake_ref.to_string(),
-        cpus,
-        memory,
+        cpus: final_cpus,
+        memory: final_memory,
         guest_user: guest_user.to_string(),
         detach,
+        volumes: volume_cfg,
     };
 
     ui::step(3, 3, "Connecting");
     microvm::run_from_build(&run_config)
+}
+
+fn parse_runtime_volume(spec: &str) -> Result<image::RuntimeVolume> {
+    let parts: Vec<&str> = spec.splitn(3, ':').collect();
+    if parts.len() != 3 {
+        anyhow::bail!(
+            "Invalid volume '{}'. Expected format host_path:guest_mount:size",
+            spec
+        );
+    }
+    Ok(image::RuntimeVolume {
+        host: parts[0].to_string(),
+        guest: parts[1].to_string(),
+        size: parts[2].to_string(),
+    })
 }
 
 fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {

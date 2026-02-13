@@ -123,8 +123,8 @@ combines build + start for rapid iteration.
 - [x] `mvm run --detach` — boots in background, prints connection info
 - [x] `mvm stop` works for both dev mode and `mvm run` instances
 - [x] `mvm status` distinguishes dev-mode VM from flake-built VMs
-- [ ] Support `RuntimeConfig` TOML for persistent resource/volume overrides
-  (deferred — cpus/memory flags cover the common case)
+- [x] Support `RuntimeConfig` TOML for persistent resource/volume overrides
+  (cpus/memory/volumes consumed by `mvm start --config` and `mvm run --config`)
 - [x] Tests: run command parsing, status reporting
 
 ## Phase 4: Local Coordinator Testing

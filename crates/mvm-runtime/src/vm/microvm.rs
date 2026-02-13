@@ -4,6 +4,7 @@ use super::{firecracker, lima, network};
 use crate::config::*;
 use crate::shell::{replace_process, run_in_vm, run_in_vm_stdout, run_in_vm_visible};
 use crate::ui;
+use crate::vm::image::RuntimeVolume;
 
 /// Resolve MICROVM_DIR (~) to an absolute path inside the Lima VM.
 fn resolve_microvm_dir() -> Result<String> {
@@ -355,6 +356,8 @@ pub struct FlakeRunConfig {
     pub guest_user: String,
     /// Boot in background without dropping into SSH.
     pub detach: bool,
+    /// Extra volumes to attach and mount.
+    pub volumes: Vec<RuntimeVolume>,
 }
 
 /// Boot a Firecracker VM from flake-built artifacts and optionally SSH in.
@@ -387,6 +390,11 @@ pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
     // Wait for SSH to become available
     wait_for_ssh_flake(&config.guest_user)?;
 
+    // Mount additional volumes inside guest
+    if !config.volumes.is_empty() {
+        mount_runtime_volumes(&config.volumes, &config.guest_user)?;
+    }
+
     // Persist run info for `mvm status`
     write_run_info(config)?;
 
@@ -414,6 +422,45 @@ pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
 
     // Drop into interactive SSH
     ssh_flake(&config.guest_user)
+}
+
+/// Mount runtime volumes inside the guest.
+fn mount_runtime_volumes(vols: &[RuntimeVolume], guest_user: &str) -> Result<()> {
+    if vols.is_empty() {
+        return Ok(());
+    }
+
+    ui::info("Mounting volumes inside guest...");
+    let mut script = String::from("set -e\n");
+    for (idx, vol) in vols.iter().enumerate() {
+        let dev = format!(" /dev/vd{}", (b'b' + idx as u8) as char);
+        script.push_str(&format!(
+            r#"DEV="{dev}"
+if [ -b "$DEV" ]; then
+    sudo mkdir -p {guest}
+    sudo mount "$DEV" {guest} || sudo mkfs.ext4 -q "$DEV" && sudo mount "$DEV" {guest}
+    sudo chown {user}:{user} {guest}
+    echo "[mvm] Mounted $DEV at {guest}"
+else
+    echo "[mvm] WARN: device $DEV not present for volume {guest}"
+fi
+"#,
+            dev = dev.trim(),
+            guest = vol.guest,
+            user = guest_user,
+        ));
+        script.push('\n');
+    }
+
+    let ssh_cmd = format!(
+        "ssh -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR {user}@{guest} 'bash -c \"{script}\"'",
+        user = guest_user,
+        guest = GUEST_IP,
+        script = script.replace('"', "\\\""),
+    );
+
+    run_in_vm_visible(&format!("sudo {}", ssh_cmd))?;
+    Ok(())
 }
 
 /// Configure a flake-built microVM via the Firecracker API.
@@ -469,6 +516,22 @@ fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str) -> Result<()>
             rootfs = config.rootfs_path,
         ),
     )?;
+
+    for (idx, vol) in config.volumes.iter().enumerate() {
+        let drive_id = format!("vol{}", idx);
+        ui::info(&format!(
+            "Attaching volume {} -> {} (size {})",
+            vol.host, vol.guest, vol.size
+        ));
+        api_put(
+            &format!("/drives/{}", drive_id),
+            &format!(
+                r#"{{"drive_id": "{id}", "path_on_host": "{host}", "is_root_device": false, "is_read_only": false}}"#,
+                id = drive_id,
+                host = vol.host,
+            ),
+        )?;
+    }
 
     ui::info("Setting network interface...");
     api_put(

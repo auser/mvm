@@ -117,7 +117,7 @@ pub struct RuntimeConfig {
     pub volumes: Vec<RuntimeVolume>,
 }
 
-#[derive(Debug, Deserialize)]
+#[derive(Debug, Deserialize, Clone)]
 pub struct RuntimeVolume {
     pub host: String,
     pub guest: String,
