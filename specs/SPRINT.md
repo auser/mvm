@@ -1,4 +1,4 @@
-# mvm Sprint 10: Coordinator — On-Demand Gateway + Request Routing
+# mvm Sprint 11: Dev Environment + External Project Support
 
 Previous sprints:
 - [SPRINT-1-foundation.md](sprints/SPRINT-1-foundation.md) (complete)
@@ -10,214 +10,190 @@ Previous sprints:
 - [SPRINT-7-role-profiles.md](sprints/SPRINT-7-role-profiles.md) (complete)
 - [SPRINT-8-integration-lifecycle.md](sprints/SPRINT-8-integration-lifecycle.md) (complete)
 - [SPRINT-9-openclaw-support.md](sprints/SPRINT-9-openclaw-support.md) (complete)
+- [SPRINT-10-coordinator.md](sprints/SPRINT-10-coordinator.md) (complete)
 
 ---
 
 ## Motivation
 
-A gateway is just another microVM — it responds to requests from external clients.
-Today, gateways must be running before any request arrives (reconcile ensures desired
-counts). This wastes resources when tenants are idle.
+mvm provides both a production runtime (coordinator, agents, microVMs) and a
+development environment for building Nix-backed microVM workloads. Sprint 10
+completed the coordinator. The workspace migration consolidated the codebase
+into 7 focused crates.
 
-Sprint 10 adds a coordinator that sits at the edge, accepts inbound connections, and
-wakes gateway VMs on demand from warm snapshots. Firecracker snapshot restore is
-~200ms, so the cold-start penalty is sub-second. After an idle timeout, the gateway
-goes back to warm.
+Today there are two build paths — `mvm build` (Mvmfile.toml → chroot → bake ELF)
+and `mvm pool build` (Nix flake → ephemeral FC builder → pool artifacts). Both
+require significant ceremony. An external developer has to learn the multi-tenant
+object model (tenant → pool → instance) just to build and test a microVM image.
 
-```
-Client request
-  → Coordinator (always running, lightweight)
-    → Is gateway running? → yes → forward
-    → no → wake from snapshot → buffer → forward when ready
-    → idle timeout → sleep gateway back to warm
-```
+Sprint 11 makes mvm useful as a development tool for external projects:
+- A developer points mvm at their Nix flake, builds a microVM image, and
+  iterates quickly — no tenant/pool boilerplate required
+- `mvm shell` becomes a first-class development environment with Firecracker and
+  Nix tools on PATH
+- The full coordinator → agent → instance pipeline can run locally for end-to-end
+  testing
+- The existing build pipelines become accessible through a simplified `mvm run`
+  workflow
 
-## What existed (pre-sprint)
+## What exists (pre-sprint)
 
-- `coordinator/client.rs` — QUIC client that talks to agent nodes (push desired
-  state, query status, wake instances, list instances)
-- `coordinator/mod.rs` — module declaration
-- `main.rs` — CLI subcommands: `mvm coordinator push|status|list-instances|wake`
-- Agent QUIC API — `WakeInstance`, `NodeInfo`, `InstanceList`, `Reconcile` endpoints
-- Sleep/wake lifecycle — snapshot + restore preserves network identity
-- Sleep policy engine — idle detection, minimum runtime enforcement
+**Dev mode:**
+- `mvm shell` — drops into Lima VM (Nix + FC installed, `~` mounted writable)
+- `mvm dev` — auto-bootstrap + launch single dev microVM + SSH
+- `mvm setup --recreate` — rebuild rootfs from scratch
+- Non-root `mvm` user in guest with kvm group + passwordless sudo
 
-## What was added (this sprint)
+**Mvmfile.toml build path (`mvm build`):**
+- `image.rs` — chroot-based build: apt install, run commands, inject services
+- Packages into self-contained ELF via `bake` tool
+- `mvm start <elf>` — runs built image with resource/volume overrides
+- `RuntimeConfig` TOML for runtime defaults (cpus, memory, volumes)
 
-- `coordinator/config.rs` — TOML config with validation (nodes, routes, timeouts)
-- `coordinator/routing.rs` — `RouteTable` with port-based tenant routing
-- `coordinator/wake.rs` — `WakeManager` with coalesced on-demand wake via watch channels
-- `coordinator/proxy.rs` — L4 TCP proxy via `copy_bidirectional`
-- `coordinator/idle.rs` — per-tenant connection tracking + idle detection
-- `coordinator/server.rs` — TCP accept loop + graceful shutdown + idle sweep
-- `coordinator/health.rs` — background TCP health probes + post-wake readiness
+**Nix flake build path (`mvm pool build`):**
+- `build.rs` — ephemeral FC builder VM: boots, runs `nix build`, extracts artifacts
+- `nix_manifest.rs` — `mvm-profiles.toml` resolves (role, profile) → Nix modules
+- Requires tenant + pool to exist first
+- Artifacts stored per-revision in `/var/lib/mvm/tenants/.../artifacts/revisions/`
+
+**Coordinator + Agent:**
+- `mvm coordinator serve --config <toml>` — TCP proxy with on-demand wake
+- `mvm agent serve` — reconcile loop + QUIC API
+- Full lifecycle: create → build → scale → wake/sleep
+
+## Baseline
+
+| Metric | Value |
+|--------|-------|
+| Workspace crates | 7 + root facade |
+| Lib tests | 366 |
+| Integration tests | 10 |
+| Total tests | 376 |
+| Clippy warnings | 0 |
+| Tag | v0.2.0 |
 
 ---
 
-## Phase 1: Coordinator Config + Server Skeleton
-**Status: COMPLETE**
+## Phase 1: Dev Shell Polish
+**Status: PENDING**
 
-A long-running coordinator process that listens for inbound TCP connections on
-configured ports and routes them to tenant gateways via the agent QUIC API.
+Make `mvm shell` a productive development environment. Currently it drops into
+a bare Lima shell — developers must manually source Nix and know where tools
+live.
 
-- [x] `src/coordinator/config.rs` — `CoordinatorConfig`: listen address, agent node
-  registry (list of `SocketAddr`), idle timeout, wake timeout, health check interval
-- [x] `src/coordinator/config.rs` — `from_file()` TOML loader + `parse()` from string
-- [x] `src/coordinator/server.rs` — `CoordinatorState` struct with tokio TCP listeners
-- [x] `src/coordinator/server.rs` — accept loop: for each connection, look up route,
-  hand off to wake manager + proxy
-- [x] `src/main.rs` — `mvm coordinator serve --config coordinator.toml` command
-- [x] Graceful shutdown on SIGTERM/SIGINT via `tokio::signal` + watch channel
-- [x] Tests: config parsing (minimal, full, overrides, validation), server Send+Sync
+- [ ] Lima provisioning: add Firecracker to PATH (symlink or profile.d script)
+- [ ] Lima provisioning: source Nix profile automatically in login shells
+- [ ] `mvm shell` prints a welcome banner with available tools + versions
+- [ ] `mvm shell --project <path>` option: cd into the project directory inside
+  the VM (Lima maps `~` → `~`)
+- [ ] `mvm status` shows Nix and Firecracker versions when Lima is running
+- [ ] Tests: shell command help, status output with tool versions
 
-## Phase 2: Tenant Routing Table
-**Status: COMPLETE**
+## Phase 2: Simplified Build Workflow
+**Status: PENDING**
 
-Map inbound connections to tenants. Port-based routing — each tenant gets a
-dedicated listen port.
+A developer with a Nix flake should be able to build a microVM image without
+creating tenants or pools. Introduce `mvm build --flake <ref>` as a thin
+wrapper that handles the boilerplate.
 
-- [x] `src/coordinator/routing.rs` — `ResolvedRoute`: tenant_id, pool_id,
-  node address, idle_timeout_secs
-- [x] `src/coordinator/routing.rs` — `RouteTable`: from_config, lookup by listen addr,
-  listen_addrs, len/is_empty
-- [x] Port-based routing: each tenant gets a dedicated port (simple, no TLS inspection)
-- [x] Config validation: reject empty routes, duplicate listen addresses, unknown nodes
-- [x] Tests: route lookup, missing route, per-route idle timeout override, listen addrs
+- [ ] `mvm build --flake <ref> [--profile <p>] [--role <r>]` — new CLI mode
+  alongside existing Mvmfile.toml path
+- [ ] Under the hood: creates ephemeral "dev" tenant + pool if not present,
+  runs `pool_build`, stores artifacts in a dev workspace
+  (`/var/lib/mvm/dev/builds/<hash>/`)
+- [ ] Dev build artifacts: vmlinux + rootfs.ext4 (no full pool lifecycle needed)
+- [ ] `mvm build --flake . --profile minimal` works from inside a project
+  directory
+- [ ] Print the artifact path on success so it can be passed to `mvm run`
+- [ ] Idempotent: re-running the same build with same lock hash is a no-op
+  (cache hit)
+- [ ] Tests: build command parsing, dev workspace path generation, cache check
 
-## Phase 3: On-Demand Wake
-**Status: COMPLETE**
+## Phase 3: Run + Iterate
+**Status: PENDING**
 
-When a request arrives for a tenant whose gateway is not running, the coordinator
-wakes it from a warm snapshot via the agent QUIC API and buffers the connection.
+Close the build → run → test → modify → rebuild loop. Introduce `mvm run` that
+combines build + start for rapid iteration.
 
-- [x] `src/coordinator/wake.rs` — `WakeManager` + `GatewayState` enum
-  (Running, Waking, Idle)
-- [x] On inbound connection:
-  1. Check gateway state (fast path if Running)
-  2. If Idle → transition to Waking, send `WakeInstance` to agent, poll until Running
-  3. If already Waking → subscribe to `tokio::sync::watch` broadcast
-- [x] Wake coalescing: concurrent requests share the same wake via watch channel
-- [x] Configurable wake timeout (default 10s) — bail on timeout
-- [x] `do_wake()`: query InstanceList → find Warm/Sleeping/Stopped → WakeInstance →
-  poll at 200ms until Running → return guest_ip:service_port
-- [x] Tests: default idle state, mark_running, mark_idle, fast path, timeout,
-  wake notify success, wake notify failure (7 tests)
+- [ ] `mvm run --flake <ref> [--profile <p>] [--cpus N] [--mem N]` — builds
+  (or uses cached) then boots a local Firecracker VM with the result
+- [ ] Uses the dev mode TAP/NAT network (172.16.0.x) — no tenant bridge needed
+- [ ] `mvm run` drops into SSH on the booted VM (like `mvm dev` does)
+- [ ] `mvm run --detach` — boots in background, prints connection info
+- [ ] `mvm stop` works for both dev mode and `mvm run` instances
+- [ ] `mvm status` distinguishes dev-mode VM from flake-built VMs
+- [ ] Support `RuntimeConfig` TOML for persistent resource/volume overrides
+- [ ] Tests: run command parsing, status reporting
 
-## Phase 4: Connection Proxying
-**Status: COMPLETE**
+## Phase 4: Local Coordinator Testing
+**Status: PENDING**
 
-Forward TCP connections between clients and gateway VMs. Layer 4 TCP proxy.
+Enable the full coordinator → agent → instance pipeline on a single developer
+machine for end-to-end testing.
 
-- [x] `src/coordinator/proxy.rs` — bidirectional TCP splice via
-  `tokio::io::copy_bidirectional`
-- [x] Connection logging: bytes sent/received per connection
-- [x] `max_connections_per_tenant` in config (default 1000)
-- [x] Tests: proxy bidirectional forwarding
+- [ ] `mvm dev cluster init` — generates a local coordinator config + dev CA
+  certs + desired state file
+  - Single agent node at `127.0.0.1:4433`
+  - Coordinator listening on localhost ports
+  - Dev tenant + gateway pool + worker pool
+- [ ] `mvm dev cluster up` — starts agent + coordinator in background
+  - `mvm agent serve` running as background process
+  - `mvm coordinator serve` running as background process
+  - Reconcile creates instances from desired state
+- [ ] `mvm dev cluster status` — shows agent, coordinator, instances, routes
+- [ ] `mvm dev cluster down` — graceful shutdown of all components
+- [ ] Coordinator config template with sensible dev defaults (short timeouts,
+  localhost bindings, auto-generated certs)
+- [ ] Documented workflow: init → up → test requests → iterate → down
+- [ ] Tests: config generation, cluster status parsing
 
-## Phase 5: Idle Sleep
-**Status: COMPLETE**
+## Phase 5: Build Pipeline Improvements
+**Status: PENDING**
 
-Per-tenant idle tracking for connection lifecycle management.
+Make the Nix build pipeline more robust and useful for real external projects.
 
-- [x] `src/coordinator/idle.rs` — `IdleTracker` with per-tenant activity tracking
-- [x] `connection_opened()` / `connection_closed()` increment/decrement counters
-- [x] `idle_tenants(timeout_secs)` — find tenants past idle timeout
-- [x] `active_connections()` / `total_connections()` for metrics
-- [x] Tests: open/close counting, idle detection, multi-tenant, reset
-
-## Phase 6: Health Checking + Readiness
-**Status: COMPLETE**
-
-- [x] `src/coordinator/health.rs` — background health check loop
-- [x] TCP probe: periodically connect to gateway service port, mark idle on failure
-- [x] `wait_for_readiness()` — post-wake TCP probe with configurable timeout
-- [x] Post-wake readiness: `do_wake()` polls instance status at 200ms intervals
-  until Running, then returns guest IP for proxying
-- [x] Gateway IP discovery: parsed from `InstanceList` response guest_ip field
-- [x] Configurable health check interval in config (default 30s)
-- [x] Stale state detection: if health probe fails, mark gateway idle for re-wake
-- [x] Idle sweep loop: periodically check for idle tenants and mark gateways for sleep
-- [x] Tests: health probe success/failure, readiness timeout, readiness success (4 tests)
-
-## Phase 7: CLI + Documentation
-**Status: COMPLETE**
-
-- [x] `mvm coordinator serve --config coordinator.toml` — start the coordinator
-- [x] `mvm coordinator routes --config coordinator.toml` — display routing table
-- [x] `mvm coordinator push|status|list-instances|wake` — existing CLI commands
-- [x] `docs/coordinator.md` — architecture, config format, deployment guide
+- [ ] Builder VM: install Nix during first boot (currently builder rootfs has
+  no Nix — the build expects it pre-installed or uses the host's Nix)
+- [ ] Builder VM: mount project directory from Lima via virtio-fs or 9p so
+  `nix build .` works with local flakes
+- [ ] Build progress streaming: show `nix build` output in real-time (not just
+  final result)
+- [ ] Build caching: detect when flake.lock hasn't changed and skip rebuild
+- [ ] `mvm build --watch` — watch flake.lock for changes, auto-rebuild
+- [ ] Builder resource tuning: `--builder-cpus`, `--builder-mem` flags
+- [ ] Tests: builder artifact caching, resource flag parsing
 
 ---
 
 ## Non-goals (this sprint)
 
-- **Multi-node scheduling**: coordinator talks to a fixed set of agent nodes from
-  config. Dynamic node discovery and placement decisions are future work.
-- **HTTP-aware routing**: this is L4 TCP proxying only. L7 routing (path-based,
-  header inspection, request buffering) is future work.
-- **TLS termination**: the coordinator forwards TLS passthrough. The gateway VM
-  terminates TLS. SNI routing peeks at ClientHello but doesn't decrypt.
-- **Coordinator HA**: single coordinator instance. Leader election and failover
-  are future work.
-- **Worker wake**: only gateway VMs are woken on demand in this sprint. Worker
-  wake-on-request (gateway tells coordinator to wake a specific worker) uses the
-  same primitives but is a separate feature.
+- **Multi-node deployment**: local dev only. Real multi-node clusters are
+  future work.
+- **Custom kernels**: builds use the upstream Firecracker kernel. Custom kernel
+  support is out of scope.
+- **GUI / web dashboard**: CLI-only. A web UI for the coordinator is future work.
+- **Hot-reload inside guest**: rebuilds create new VMs. In-place code updates
+  inside a running Firecracker guest are not supported.
+- **Windows/WSL support**: Lima on macOS and native Linux only.
 
 ## Architecture
 
 ```
-                    ┌──────────────────────┐
-                    │     Coordinator      │
-                    │  (TCP proxy + wake)  │
-                    │                      │
-  Client ──TCP───► │  port 8443 ──────────┼──► Agent QUIC API
-                    │       │              │       │
-                    │   route table        │    WakeInstance
-                    │   tenant → gateway   │    InstanceList
-                    │       │              │       │
-                    │   wake manager       │       ▼
-                    │   idle timer         │   Gateway VM
-                    │       │              │   (warm → running)
-                    └───────┼──────────────┘       │
-                            │                      │
-                            └────TCP proxy─────────┘
+Developer machine (macOS or Linux)
+  │
+  ├─ mvm build --flake .     ← Phase 2: simplified build
+  │    └─ Lima VM
+  │         └─ Builder FC VM (ephemeral)
+  │              └─ nix build → vmlinux + rootfs.ext4
+  │
+  ├─ mvm run --flake .       ← Phase 3: build + boot + SSH
+  │    └─ Lima VM
+  │         └─ Firecracker VM (dev network 172.16.0.x)
+  │              └─ booted from build artifacts
+  │
+  └─ mvm dev cluster up      ← Phase 4: local end-to-end
+       └─ Lima VM
+            ├─ Agent (QUIC API, reconcile loop)
+            ├─ Coordinator (TCP proxy, wake manager)
+            └─ Firecracker VMs (tenant networks 10.240.x.x)
 ```
-
-## Config Format
-
-```toml
-[coordinator]
-idle_timeout_secs = 300
-wake_timeout_secs = 10
-health_interval_secs = 30
-
-[[nodes]]
-address = "127.0.0.1:4433"
-name = "node-1"
-
-[[routes]]
-tenant_id = "alice"
-pool_id = "gateways"
-listen = "0.0.0.0:8443"
-node = "127.0.0.1:4433"
-idle_timeout_secs = 600   # override per-route
-
-[[routes]]
-tenant_id = "bob"
-pool_id = "gateways"
-listen = "0.0.0.0:8444"
-node = "127.0.0.1:4433"
-```
-
----
-
-## Summary
-
-| Metric | Value |
-|--------|-------|
-| Lib tests | 349 (+35) |
-| Integration tests | 10 |
-| Total tests | 359 |
-| Clippy warnings | 0 |
-| New files | 7 (config, routing, server, wake, proxy, idle, health) |
-| Sprint status | COMPLETE |
