@@ -2,7 +2,6 @@ use anyhow::Result;
 
 use crate::ui;
 use mvm_core::config::fc_version;
-use mvm_core::platform;
 use mvm_runtime::shell;
 
 #[derive(Debug)]
@@ -22,7 +21,7 @@ pub fn run() -> Result<()> {
     checks.push(check_cmd("limactl", "limactl --version"));
 
     // Inside VM tools (if available)
-    let in_vm = platform::current().needs_lima();
+    let in_vm = shell::inside_lima();
     if in_vm {
         checks.push(check_vm_cmd("nix", "nix --version"));
         checks.push(check_vm_cmd("firecracker", "firecracker --version"));

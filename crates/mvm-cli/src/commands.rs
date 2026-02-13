@@ -1276,12 +1276,14 @@ fn cmd_sync(debug: bool, skip_deps: bool, force: bool) -> Result<()> {
 
     if limactl_available {
         lima::require_running()?;
+    } else if shell::inside_lima() {
+        ui::info("Running inside Lima guest; skipping limactl check.");
     } else if bootstrap::is_lima_required() {
         anyhow::bail!(
             "Lima is required but 'limactl' is not available. Install Lima or run inside the Lima VM."
         );
     } else {
-        ui::warn("limactl not found; assuming we're already inside Lima and proceeding.");
+        ui::warn("limactl not found; proceeding on native host.");
     }
 
     let vm_arch = shell::run_in_vm_stdout("uname -m")

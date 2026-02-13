@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use std::path::Path;
 use std::process::{Command, Output, Stdio};
 
 use crate::config::VM_NAME;
@@ -108,6 +109,14 @@ pub fn run_in_vm_visible(script: &str) -> Result<()> {
 /// Run a bash script in the default execution environment, returning stdout as String.
 pub fn run_in_vm_stdout(script: &str) -> Result<String> {
     run_on_vm_stdout(VM_NAME, script)
+}
+
+/// Heuristic: are we currently executing inside a Lima guest VM?
+/// Checks common Lima environment markers.
+pub fn inside_lima() -> bool {
+    std::env::var("LIMA_INSTANCE").is_ok()
+        || Path::new("/etc/lima-boot.conf").exists()
+        || Path::new("/run/lima-guestagent.sock").exists()
 }
 
 /// Replace the current process with an interactive command (for SSH/TTY).

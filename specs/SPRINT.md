@@ -33,10 +33,10 @@ We hardened dev workflows in Sprint 11 but saw recurring friction around sync/bo
 ---
 
 ## Phase 1: Sync/Bootstrap Hardening
-**Status: IN PROGRESS**
+**Status: COMPLETE**
 
-- [ ] Detect Lima presence/absence more robustly; avoid `limactl` calls inside guest
-- [ ] Make rustup/cargo pathing resilient (no `.cargo/env` required); add self-check
+- [x] Detect Lima presence/absence more robustly; avoid `limactl` calls inside guest
+- [x] Make rustup/cargo pathing resilient (no `.cargo/env` required); add self-check
 - [x] Add `mvm sync doctor` that reports deps (rustup, cargo, nix, firecracker, limactl)
 - [ ] Add regression tests for sync on macOS host + Lima guest + native Linux
 
