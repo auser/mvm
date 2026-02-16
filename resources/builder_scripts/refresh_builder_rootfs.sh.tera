@@ -34,7 +34,7 @@ sudo ln -sf "{{agent_service}}" "$TMP_MOUNT/etc/systemd/system/multi-user.target
 if [ "{{inject_ssh}}" = "yes" ] && grep -q '^ubuntu:' "$TMP_MOUNT/etc/passwd"; then
     sudo mkdir -p "$TMP_MOUNT/home/ubuntu/.ssh"
     printf '%s\n' '{{auth_keys}}' | sudo tee "$TMP_MOUNT/home/ubuntu/.ssh/authorized_keys" >/dev/null
-    UB_IDS=$(awk -F: '/^ubuntu:/{print $3\":\"$4}' "$TMP_MOUNT/etc/passwd" | head -1)
+    UB_IDS=$(awk -F: '/^ubuntu:/{print $3 ":" $4}' "$TMP_MOUNT/etc/passwd" | head -1)
     if [ -n "$UB_IDS" ]; then
         sudo chown -R "$UB_IDS" "$TMP_MOUNT/home/ubuntu/.ssh"
     fi
