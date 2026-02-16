@@ -17,6 +17,9 @@ pub enum BuilderRequest {
     Ping,
 }
 
+/// Vsock port used by the builder agent.
+pub const BUILDER_AGENT_PORT: u32 = 21470;
+
 /// Outgoing responses/log frames from the builder agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BuilderResponse {

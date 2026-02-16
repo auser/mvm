@@ -134,50 +134,51 @@ pub(crate) fn ensure_builder_artifacts(
     let agent_bin = resolve_builder_agent_binary(env)?;
     env.log_info(&format!("Using builder agent binary: {}", agent_bin));
 
-    let builder_pub = fs::read_to_string(&pub_path)
-        .unwrap_or_default()
-        .trim()
-        .to_string();
-    let mut extra_keys = Vec::new();
-    if let Ok(home) = env::var("HOME") {
-        for name in ["id_ed25519.pub", "id_rsa.pub"] {
-            let p = format!("{home}/.ssh/{name}");
-            if let Ok(k) = fs::read_to_string(&p) {
-                let t = k.trim();
-                if !t.is_empty() {
-                    extra_keys.push(t.to_string());
+    // In vsock-only mode we deliberately avoid SSH injection/probing.
+    let (inject_ssh, auth_keys_escaped) = if !require_ssh_keys {
+        (false, String::new())
+    } else {
+        let builder_pub = fs::read_to_string(&pub_path)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        let mut extra_keys = Vec::new();
+        if let Ok(home) = env::var("HOME") {
+            for name in ["id_ed25519.pub", "id_rsa.pub"] {
+                let p = format!("{home}/.ssh/{name}");
+                if let Ok(k) = fs::read_to_string(&p) {
+                    let t = k.trim();
+                    if !t.is_empty() {
+                        extra_keys.push(t.to_string());
+                    }
                 }
             }
         }
-    }
-    if let Ok(k) = env::var("MVM_BUILDER_AUTHORIZED_KEY") {
-        let t = k.trim();
-        if !t.is_empty() {
-            extra_keys.push(t.to_string());
+        if let Ok(k) = env::var("MVM_BUILDER_AUTHORIZED_KEY") {
+            let t = k.trim();
+            if !t.is_empty() {
+                extra_keys.push(t.to_string());
+            }
         }
-    }
-    let mut all_keys = Vec::new();
-    if !builder_pub.is_empty() {
-        all_keys.push(builder_pub);
-    }
-    all_keys.extend(extra_keys);
+        let mut all_keys = Vec::new();
+        if !builder_pub.is_empty() {
+            all_keys.push(builder_pub);
+        }
+        all_keys.extend(extra_keys);
 
-    let inject_ssh = !all_keys.is_empty();
-    if !inject_ssh {
-        if require_ssh_keys {
+        let inject_ssh = !all_keys.is_empty();
+        if !inject_ssh {
             return Err(anyhow::anyhow!(
                 "No SSH pubkeys found for builder (set MVM_BUILDER_AUTHORIZED_KEY or ensure ~/.ssh/id_ed25519.pub exists)"
             ));
         }
-        env.log_warn("No SSH pubkeys found for builder; continuing in vsock-only mode");
-    } else {
         env.log_info(&format!(
             "Injecting {} SSH key(s) into builder rootfs",
             all_keys.len()
         ));
-    }
-    let auth_keys = all_keys.join("\n");
-    let auth_keys_escaped = auth_keys.replace('\'', "'\\''");
+        let auth_keys = all_keys.join("\n");
+        (true, auth_keys.replace('\'', "'\\''"))
+    };
 
     if exists.trim() == "yes" {
         env.log_info("Builder artifacts found (refreshing SSH keys)...");

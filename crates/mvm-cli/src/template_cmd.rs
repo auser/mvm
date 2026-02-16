@@ -170,6 +170,18 @@ pub fn build(name: &str, force: bool, config: Option<&str>) -> Result<()> {
     }
 }
 
+pub fn push(name: &str, revision: Option<&str>) -> Result<()> {
+    tmpl::template_push(name, revision)
+}
+
+pub fn pull(name: &str, revision: Option<&str>) -> Result<()> {
+    tmpl::template_pull(name, revision)
+}
+
+pub fn verify(name: &str, revision: Option<&str>) -> Result<()> {
+    tmpl::template_verify(name, revision)
+}
+
 fn load_config(path: &str) -> Result<TemplateConfig> {
     let data = fs::read_to_string(Path::new(path))
         .map_err(|e| anyhow::anyhow!("Failed to read template config {}: {}", path, e))?;

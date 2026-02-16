@@ -11,7 +11,7 @@ use crate::build::{
     BUILDER_OUTPUT_DISK_MIB, BUILDER_VCPUS, PoolBuildOpts, create_builder_input_disk,
     create_builder_output_disk,
 };
-use crate::firecracker::{boot_builder_vsock, teardown_builder};
+use crate::firecracker::{boot_builder_vsock, teardown_builder_for_retry};
 use crate::vsock_builder::build_via_vsock;
 
 pub(crate) struct VsockBackend<'a> {
@@ -122,10 +122,10 @@ impl BuilderBackend for VsockBackend<'_> {
     }
 
     fn teardown(&mut self, env: &dyn BuildEnvironment) -> Result<()> {
-        if let Some(pid) = self.builder_pid {
-            teardown_builder(env, pid, self.builder_net, self.build_run_dir)?;
-            self.builder_pid = None;
-        }
+        // Important: during `auto` mode we may fall back to another backend using the same run dir.
+        // Avoid deleting the run dir here; orchestrator handles final cleanup.
+        let _ = self.builder_pid.take();
+        teardown_builder_for_retry(env, self.builder_net, self.build_run_dir)?;
         Ok(())
     }
 }

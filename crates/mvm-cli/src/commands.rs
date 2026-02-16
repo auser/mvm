@@ -347,6 +347,27 @@ enum TemplateCmd {
         #[arg(long)]
         config: Option<String>,
     },
+    /// Push a built template revision to the object storage registry
+    Push {
+        name: String,
+        /// Revision hash to push (defaults to current)
+        #[arg(long)]
+        revision: Option<String>,
+    },
+    /// Pull a template revision from the object storage registry
+    Pull {
+        name: String,
+        /// Revision hash to pull (defaults to registry current)
+        #[arg(long)]
+        revision: Option<String>,
+    },
+    /// Verify a locally installed template revision against checksums.json
+    Verify {
+        name: String,
+        /// Revision hash to verify (defaults to current)
+        #[arg(long)]
+        revision: Option<String>,
+    },
     /// List templates
     List {
         #[arg(long)]
@@ -2470,6 +2491,9 @@ fn cmd_template(action: TemplateCmd, _out_fmt: OutputFormat) -> Result<()> {
             force,
             config,
         } => template_cmd::build(&name, force, config.as_deref()),
+        TemplateCmd::Push { name, revision } => template_cmd::push(&name, revision.as_deref()),
+        TemplateCmd::Pull { name, revision } => template_cmd::pull(&name, revision.as_deref()),
+        TemplateCmd::Verify { name, revision } => template_cmd::verify(&name, revision.as_deref()),
         TemplateCmd::List { json } => template_cmd::list(json),
         TemplateCmd::Info { name, json } => template_cmd::info(&name, json),
         TemplateCmd::Delete { name, force } => template_cmd::delete(&name, force),

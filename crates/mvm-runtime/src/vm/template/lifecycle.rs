@@ -12,6 +12,8 @@ use mvm_core::template::{TemplateRevision, template_current_symlink, template_re
 use mvm_core::tenant::{TenantNet, TenantQuota};
 use mvm_core::time::utc_now;
 
+use super::registry::TemplateRegistry;
+
 pub fn template_create(spec: &TemplateSpec) -> Result<()> {
     let dir = template_dir(&spec.template_id);
     shell::run_in_vm(&format!("mkdir -p {dir}"))?;
@@ -155,6 +157,218 @@ pub fn template_build(id: &str, force: bool) -> Result<()> {
     shell::run_in_vm(&format!(
         "cat > {rev_meta_path} << 'MVMEOF'\n{rev_json}\nMVMEOF"
     ))?;
+
+    Ok(())
+}
+
+#[derive(Debug, serde::Serialize, serde::Deserialize)]
+struct Checksums {
+    template_id: String,
+    revision_hash: String,
+    files: std::collections::BTreeMap<String, String>,
+}
+
+fn require_local_template_fs() -> Result<()> {
+    // Registry push/pull needs direct file access to /var/lib/mvm/templates.
+    // On macOS, templates live inside Lima; run these commands inside the VM.
+    if mvm_core::platform::current().needs_lima() && !crate::shell::inside_lima() {
+        anyhow::bail!(
+            "template push/pull/verify must be run inside the Linux VM (try `mvm shell`, then rerun)"
+        );
+    }
+    Ok(())
+}
+
+fn current_revision_id(template_id: &str) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let link = template_current_symlink(template_id);
+    let target = std::fs::read_link(&link)
+        .with_context(|| format!("Template has no current revision: {}", template_id))?;
+    let raw = target.as_os_str().as_bytes();
+    let raw = std::str::from_utf8(raw)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    let rev = raw.strip_prefix("revisions/").unwrap_or(&raw).to_string();
+    if rev.is_empty() {
+        anyhow::bail!("Template current symlink is empty: {}", link);
+    }
+    Ok(rev)
+}
+
+fn sha256_hex(path: &std::path::Path) -> Result<String> {
+    use sha2::Digest;
+
+    let bytes =
+        std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+    let mut hasher = sha2::Sha256::new();
+    hasher.update(&bytes);
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+pub fn template_push(id: &str, revision: Option<&str>) -> Result<()> {
+    require_local_template_fs()?;
+    let registry = TemplateRegistry::from_env()?.context("Template registry not configured")?;
+    registry.require_configured()?;
+
+    let rev = match revision {
+        Some(r) => r.to_string(),
+        None => current_revision_id(id)?,
+    };
+
+    let template_dir = template_dir(id);
+    let rev_dir = std::path::PathBuf::from(template_revision_dir(id, &rev));
+
+    let files = [
+        (
+            "template.json",
+            std::path::PathBuf::from(format!("{}/template.json", template_dir)),
+        ),
+        ("revision.json", rev_dir.join("revision.json")),
+        ("vmlinux", rev_dir.join("vmlinux")),
+        ("rootfs.ext4", rev_dir.join("rootfs.ext4")),
+        ("fc-base.json", rev_dir.join("fc-base.json")),
+    ];
+
+    // Compute checksums for integrity.
+    let mut sums = std::collections::BTreeMap::new();
+    for (name, path) in &files {
+        let hex = sha256_hex(path)?;
+        sums.insert(name.to_string(), hex);
+    }
+    let checksums = Checksums {
+        template_id: id.to_string(),
+        revision_hash: rev.clone(),
+        files: sums,
+    };
+    let checksums_json = serde_json::to_vec_pretty(&checksums)?;
+    // Store checksums locally alongside the revision so `template verify` works offline.
+    std::fs::write(rev_dir.join("checksums.json"), &checksums_json).with_context(|| {
+        format!(
+            "Failed to write checksums.json for template {} revision {}",
+            id, rev
+        )
+    })?;
+
+    // Upload revision objects first, then current pointer.
+    for (name, path) in &files {
+        let key = registry.key_revision_file(id, &rev, name);
+        let data =
+            std::fs::read(path).with_context(|| format!("Failed to read {}", path.display()))?;
+        registry.put_bytes(&key, data)?;
+    }
+    registry.put_bytes(
+        &registry.key_revision_file(id, &rev, "checksums.json"),
+        checksums_json,
+    )?;
+    registry.put_text(&registry.key_current(id), &format!("{}\n", rev))?;
+
+    tracing::info!(template = %id, revision = %rev, "Pushed template revision to registry");
+    Ok(())
+}
+
+pub fn template_pull(id: &str, revision: Option<&str>) -> Result<()> {
+    require_local_template_fs()?;
+    let registry = TemplateRegistry::from_env()?.context("Template registry not configured")?;
+    registry.require_configured()?;
+
+    let rev = match revision {
+        Some(r) => r.to_string(),
+        None => registry
+            .get_text(&registry.key_current(id))?
+            .trim()
+            .to_string(),
+    };
+    if rev.is_empty() {
+        anyhow::bail!("Registry current revision is empty for template {}", id);
+    }
+
+    // Download checksums first.
+    let sums_key = registry.key_revision_file(id, &rev, "checksums.json");
+    let sums_bytes = registry.get_bytes(&sums_key)?;
+    let checksums: Checksums = serde_json::from_slice(&sums_bytes)
+        .with_context(|| format!("Invalid checksums.json for {}/{}", id, rev))?;
+
+    let base_dir = std::path::PathBuf::from(template_dir(id));
+    std::fs::create_dir_all(&base_dir)?;
+    let tmp_dir = base_dir.join(format!("tmp-pull-{}", rev));
+    if tmp_dir.exists() {
+        std::fs::remove_dir_all(&tmp_dir).ok();
+    }
+    std::fs::create_dir_all(&tmp_dir)?;
+
+    let rev_dir = std::path::PathBuf::from(template_revision_dir(id, &rev));
+    std::fs::create_dir_all(rev_dir.parent().unwrap_or(&base_dir))?;
+
+    // Download required files into tmp and verify.
+    for (name, expected_hex) in &checksums.files {
+        let key = registry.key_revision_file(id, &rev, name);
+        let data = registry.get_bytes(&key)?;
+        let tmp_path = tmp_dir.join(name);
+        std::fs::write(&tmp_path, &data)?;
+        let got = sha256_hex(&tmp_path)?;
+        if &got != expected_hex {
+            std::fs::remove_dir_all(&tmp_dir).ok();
+            anyhow::bail!(
+                "checksum mismatch for {} (expected {}, got {})",
+                name,
+                expected_hex,
+                got
+            );
+        }
+    }
+    // Keep checksums.json in the installed revision so `template verify` can run locally.
+    std::fs::write(tmp_dir.join("checksums.json"), &sums_bytes)?;
+
+    // Install into final revision dir.
+    if rev_dir.exists() {
+        std::fs::remove_dir_all(&rev_dir).ok();
+    }
+    std::fs::create_dir_all(&rev_dir)?;
+    for name in checksums.files.keys() {
+        std::fs::rename(tmp_dir.join(name), rev_dir.join(name))?;
+    }
+    std::fs::rename(
+        tmp_dir.join("checksums.json"),
+        rev_dir.join("checksums.json"),
+    )?;
+    std::fs::remove_dir_all(&tmp_dir).ok();
+
+    // Update current symlink (keep existing "revisions/<rev>" convention).
+    let link = template_current_symlink(id);
+    let _ = std::fs::remove_file(&link);
+    std::os::unix::fs::symlink(format!("revisions/{}", rev), &link)?;
+
+    tracing::info!(template = %id, revision = %rev, "Pulled template revision from registry");
+    Ok(())
+}
+
+pub fn template_verify(id: &str, revision: Option<&str>) -> Result<()> {
+    require_local_template_fs()?;
+
+    let rev = match revision {
+        Some(r) => r.to_string(),
+        None => current_revision_id(id)?,
+    };
+    let rev_dir = std::path::PathBuf::from(template_revision_dir(id, &rev));
+    let sums_path = rev_dir.join("checksums.json");
+    let sums_bytes =
+        std::fs::read(&sums_path).with_context(|| format!("Missing {}", sums_path.display()))?;
+    let checksums: Checksums = serde_json::from_slice(&sums_bytes)?;
+
+    for (name, expected_hex) in &checksums.files {
+        let p = rev_dir.join(name);
+        let got = sha256_hex(&p)?;
+        if &got != expected_hex {
+            anyhow::bail!(
+                "checksum mismatch for {} (expected {}, got {})",
+                name,
+                expected_hex,
+                got
+            );
+        }
+    }
 
     Ok(())
 }

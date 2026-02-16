@@ -8,6 +8,23 @@ use mvm_core::tenant::TenantNet;
 use crate::build::{BUILDER_DIR, BUILDER_OUTPUT_DISK_MIB, BUILDER_SSH_USER, builder_ssh_key_path};
 use crate::scripts::render_script;
 
+fn kill_builder_pid_from_file_best_effort(env: &dyn BuildEnvironment, run_dir: &str) {
+    let pid_path = format!("{}/fc.pid", run_dir);
+    let _ = env.shell_exec(&format!(
+        r#"
+        if [ -f "{pid}" ]; then
+            PID="$(cat "{pid}" 2>/dev/null || true)"
+            if [ -n "$PID" ]; then
+                kill "$PID" 2>/dev/null || true
+                sleep 1
+                kill -9 "$PID" 2>/dev/null || true
+            fi
+        fi
+        "#,
+        pid = pid_path
+    ));
+}
+
 /// Boot an ephemeral Firecracker builder VM for SSH-driven builds. Returns the FC process PID.
 pub(crate) fn boot_builder(
     env: &dyn BuildEnvironment,
@@ -67,7 +84,13 @@ pub(crate) fn boot_builder(
     launch_ctx.insert("config", config_path.clone());
     launch_ctx.insert("log", log_path.clone());
     launch_ctx.insert("pid", pid_path.clone());
-    env.shell_exec(&render_script("launch_firecracker_ssh", &launch_ctx)?)?;
+    if let Err(e) = env.shell_exec(&render_script("launch_firecracker_ssh", &launch_ctx)?) {
+        // If Firecracker failed during boot, it may have left the TAP device behind (we create it
+        // before launching FC). Also attempt to kill any partially-started FC process via pid file.
+        kill_builder_pid_from_file_best_effort(env, run_dir);
+        let _ = env.teardown_tap(&builder_net.tap_dev);
+        return Err(e);
+    }
 
     // Read the PID
     let pid_str = env.shell_exec_stdout(&format!("cat {}", pid_path))?;
@@ -205,7 +228,11 @@ pub(crate) fn boot_builder_vsock(
     launch_ctx.insert("config", config_path.clone());
     launch_ctx.insert("log", log_path.clone());
     launch_ctx.insert("pid", pid_path.clone());
-    env.shell_exec(&render_script("launch_firecracker_vsock", &launch_ctx)?)?;
+    if let Err(e) = env.shell_exec(&render_script("launch_firecracker_vsock", &launch_ctx)?) {
+        kill_builder_pid_from_file_best_effort(env, run_dir);
+        let _ = env.teardown_tap(&builder_net.tap_dev);
+        return Err(e);
+    }
 
     let pid_str = env.shell_exec_stdout(&format!("cat {}", pid_path))?;
     let pid: u32 = pid_str.trim().parse()?;
@@ -213,23 +240,14 @@ pub(crate) fn boot_builder_vsock(
     Ok(pid)
 }
 
-/// Tear down the builder VM.
-pub(crate) fn teardown_builder(
+/// Best-effort teardown that avoids removing the run dir (useful when retrying or falling back).
+pub(crate) fn teardown_builder_for_retry(
     env: &dyn BuildEnvironment,
-    pid: u32,
     builder_net: &InstanceNet,
     run_dir: &str,
 ) -> Result<()> {
-    env.log_info("Tearing down builder VM...");
-
-    let _ = env.shell_exec(&format!(
-        "kill {} 2>/dev/null || true; sleep 1; kill -9 {} 2>/dev/null || true",
-        pid, pid
-    ));
-
+    env.log_info("Tearing down builder VM (retry)...");
+    kill_builder_pid_from_file_best_effort(env, run_dir);
     let _ = env.teardown_tap(&builder_net.tap_dev);
-
-    let _ = env.shell_exec(&format!("rm -rf {}", run_dir));
-
     Ok(())
 }

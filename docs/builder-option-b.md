@@ -43,7 +43,7 @@ Goal: eliminate sshd/authorized_keys inside the builder VM. Use a small in-guest
 ### Incremental steps
 - Add a small Rust agent binary to `mvm-guest` implementing the build + copy
 - Add a host vsock client helper in `mvm-build`
-- Keep current SSH path behind a feature flag until stable
+- Keep current SSH path as a fallback until stable (`MVM_BUILDER_MODE=auto`)
 - Add HMAC on request payload (host shares secret with agent baked into image)
 - Bake agent + Nix into an immutable builder rootfs and stop mutating it at runtime
 

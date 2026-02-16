@@ -10,7 +10,7 @@ use crate::build::{
     PoolBuildOpts, builder_ssh_key_path, ensure_nix_installed, extract_artifacts, flake_lock_hash,
     run_nix_build, sync_local_flake_if_needed,
 };
-use crate::firecracker::{boot_builder, teardown_builder};
+use crate::firecracker::{boot_builder, teardown_builder_for_retry};
 
 pub(crate) struct SshBackend<'a> {
     pub(crate) build_run_dir: &'a str,
@@ -121,10 +121,10 @@ impl BuilderBackend for SshBackend<'_> {
     }
 
     fn teardown(&mut self, env: &dyn BuildEnvironment) -> Result<()> {
-        if let Some(pid) = self.builder_pid {
-            teardown_builder(env, pid, self.builder_net, self.build_run_dir)?;
-            self.builder_pid = None;
-        }
+        // Important: during `auto` mode we may fall back to another backend using the same run dir.
+        // Avoid deleting the run dir here; orchestrator handles final cleanup.
+        let _ = self.builder_pid.take();
+        teardown_builder_for_retry(env, self.builder_net, self.build_run_dir)?;
         Ok(())
     }
 }

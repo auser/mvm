@@ -5,6 +5,13 @@ use std::time::{Duration, Instant};
 use anyhow::{Context, Result, anyhow};
 use mvm_guest::builder_agent::{BuilderRequest, BuilderResponse};
 
+fn builder_agent_port() -> u32 {
+    std::env::var("MVM_BUILDER_AGENT_PORT")
+        .ok()
+        .and_then(|s| s.parse::<u32>().ok())
+        .unwrap_or(mvm_guest::builder_agent::BUILDER_AGENT_PORT)
+}
+
 pub fn build_via_vsock(
     vsock_uds: &str,
     flake_ref: &str,
@@ -21,7 +28,7 @@ pub fn build_via_vsock(
     stream.set_write_timeout(Some(Duration::from_secs(5))).ok();
 
     // Firecracker UDS CONNECT handshake.
-    writeln!(stream, "CONNECT {}", mvm_guest::vsock::GUEST_AGENT_PORT)?;
+    writeln!(stream, "CONNECT {}", builder_agent_port())?;
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);
@@ -92,7 +99,7 @@ fn ping_once(vsock_uds: &str) -> Result<()> {
         .with_context(|| format!("failed to connect vsock UDS {}", vsock_uds))?;
     stream.set_read_timeout(Some(Duration::from_secs(2))).ok();
     stream.set_write_timeout(Some(Duration::from_secs(2))).ok();
-    writeln!(stream, "CONNECT {}", mvm_guest::vsock::GUEST_AGENT_PORT)?;
+    writeln!(stream, "CONNECT {}", builder_agent_port())?;
     stream.flush()?;
 
     let mut reader = BufReader::new(stream);

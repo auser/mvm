@@ -287,6 +287,27 @@ data_disk_mib = 2048
 
 Standard management commands for templates.
 
+### `mvm template push | pull | verify`
+
+For multi-node dev (1-2 nodes), templates can be shared via an S3-compatible registry (e.g. MinIO).
+
+Commands:
+
+```bash
+mvm template push openclaw-worker
+mvm template pull openclaw-worker
+mvm template verify openclaw-worker
+```
+
+Registry configuration (env vars):
+- `MVM_TEMPLATE_REGISTRY_ENDPOINT` (e.g. `http://127.0.0.1:9000`)
+- `MVM_TEMPLATE_REGISTRY_BUCKET` (e.g. `mvm`)
+- `MVM_TEMPLATE_REGISTRY_PREFIX` (default `mvm`)
+- `MVM_TEMPLATE_REGISTRY_REGION` (default `us-east-1`)
+- `MVM_TEMPLATE_REGISTRY_ACCESS_KEY_ID`
+- `MVM_TEMPLATE_REGISTRY_SECRET_ACCESS_KEY`
+- `MVM_TEMPLATE_REGISTRY_INSECURE=true` (required if endpoint is `http://...`)
+
 ### `mvm template migrate-from-pool --from <tenant/pool> --to <template>`
 
 Creates a template from an existing pool, rebuilds it, and repoints the pool to the new template. Use `--force` to overwrite an existing template.

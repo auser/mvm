@@ -1,13 +1,14 @@
 use std::io::{BufRead, BufReader, Write};
 use std::mem::size_of;
 use std::os::fd::{FromRawFd, RawFd};
+use std::process::{Command, Stdio};
 
-use mvm_guest::builder_agent::{BuilderRequest, BuilderResponse, handle_request};
+use mvm_guest::builder_agent::{BuilderRequest, BuilderResponse};
 
 const AF_VSOCK: i32 = 40;
 const SOCK_STREAM: i32 = 1;
 const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
-const PORT: u32 = mvm_guest::vsock::GUEST_AGENT_PORT;
+const PORT: u32 = mvm_guest::builder_agent::BUILDER_AGENT_PORT;
 
 #[repr(C)]
 struct SockAddrVm {
@@ -41,29 +42,153 @@ fn handle_client(fd: RawFd) {
                 if line_trim.is_empty() {
                     continue;
                 }
-                let resp = match serde_json::from_str::<BuilderRequest>(line_trim) {
-                    Ok(req) => match handle_request(req) {
-                        Ok(resp) => resp,
-                        Err(e) => BuilderResponse::Err {
-                            message: format!("agent error: {}", e),
-                        },
-                    },
-                    Err(e) => BuilderResponse::Err {
-                        message: format!("parse error: {}", e),
-                    },
+                let req = match serde_json::from_str::<BuilderRequest>(line_trim) {
+                    Ok(req) => req,
+                    Err(e) => {
+                        write_resp(
+                            &mut reader,
+                            BuilderResponse::Err {
+                                message: format!("parse error: {}", e),
+                            },
+                        );
+                        continue;
+                    }
                 };
-                let writer = reader.get_mut();
-                let _ = writeln!(
-                    writer,
-                    "{}",
-                    serde_json::to_string(&resp)
-                        .unwrap_or_else(|_| "{\"Err\":{\"message\":\"encode error\"}}".to_string())
-                );
-                let _ = writer.flush();
+
+                match req {
+                    BuilderRequest::Ping => {
+                        write_resp(&mut reader, BuilderResponse::Pong);
+                    }
+                    BuilderRequest::Build {
+                        flake_ref,
+                        attr,
+                        timeout_secs,
+                    } => {
+                        let timeout = timeout_secs.unwrap_or(1800);
+                        if let Err(e) = run_build(&mut reader, &flake_ref, &attr, timeout) {
+                            write_resp(
+                                &mut reader,
+                                BuilderResponse::Err {
+                                    message: format!("agent error: {}", e),
+                                },
+                            );
+                        }
+                    }
+                }
             }
             Err(_) => break,
         }
     }
+}
+
+fn write_resp(reader: &mut BufReader<std::fs::File>, resp: BuilderResponse) {
+    let writer = reader.get_mut();
+    let _ = writeln!(
+        writer,
+        "{}",
+        serde_json::to_string(&resp)
+            .unwrap_or_else(|_| "{\"Err\":{\"message\":\"encode error\"}}".to_string())
+    );
+    let _ = writer.flush();
+}
+
+fn ensure_mount(dev: &str, mountpoint: &str) {
+    let _ = Command::new("sh")
+        .arg("-c")
+        .arg(format!(
+            "mountpoint -q {mp} || (mkdir -p {mp} && mount {dev} {mp})",
+            mp = mountpoint,
+            dev = dev
+        ))
+        .status();
+}
+
+fn run_build(
+    reader: &mut BufReader<std::fs::File>,
+    flake_ref: &str,
+    attr: &str,
+    timeout: u64,
+) -> anyhow::Result<()> {
+    // Disks are attached by the host as:
+    // - /dev/vdb -> /build-out (rw)
+    // - /dev/vdc -> /build-in (ro, optional local flake)
+    ensure_mount("/dev/vdb", "/build-out");
+    if flake_ref == "/build-in" {
+        ensure_mount("/dev/vdc", "/build-in");
+    }
+
+    let build_cmd = format!(
+        "set -euo pipefail; timeout {t} nix build {flake}#{attr} --no-link --print-out-paths 2>&1",
+        t = timeout,
+        flake = flake_ref,
+        attr = attr
+    );
+
+    let mut child = Command::new("sh")
+        .arg("-c")
+        .arg(&build_cmd)
+        .stdout(Stdio::piped())
+        .spawn()?;
+
+    let stdout = child
+        .stdout
+        .take()
+        .ok_or_else(|| anyhow::anyhow!("failed to capture nix build stdout"))?;
+    let mut out_reader = BufReader::new(stdout);
+    let mut buf = String::new();
+    let mut last_store_path: Option<String> = None;
+    let mut log_lines: Vec<String> = Vec::new();
+
+    loop {
+        buf.clear();
+        let n = out_reader.read_line(&mut buf)?;
+        if n == 0 {
+            break;
+        }
+        let line = buf.trim_end().to_string();
+        if let Some(p) = line.strip_prefix("/nix/store/") {
+            let _ = p; // marker only
+            last_store_path = Some(line.clone());
+        }
+        log_lines.push(line.clone());
+        write_resp(reader, BuilderResponse::Log { line });
+    }
+
+    let status = child.wait()?;
+    if !status.success() {
+        // Best-effort persist log in /build-out for host-side inspection.
+        let _ = std::fs::write("/build-out/build.log", log_lines.join("\n"));
+        return Err(anyhow::anyhow!(
+            "nix build failed (exit {}): {}",
+            status,
+            build_cmd
+        ));
+    }
+
+    let out_path = last_store_path
+        .ok_or_else(|| anyhow::anyhow!("nix build produced no store path"))?
+        .to_string();
+
+    let copy_cmd = format!(
+        "set -euo pipefail; \
+         cp {p}/kernel /build-out/vmlinux 2>/dev/null || cp {p}/vmlinux /build-out/vmlinux; \
+         cp {p}/rootfs /build-out/rootfs.ext4 2>/dev/null || cp {p}/rootfs.ext4 /build-out/rootfs.ext4; \
+         echo '{{\"note\":\"Base fc config placeholder\"}}' > /build-out/fc-base.json",
+        p = out_path
+    );
+    let status = Command::new("sh").arg("-c").arg(&copy_cmd).status()?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "failed to copy artifacts (exit {}): {}",
+            status,
+            copy_cmd
+        ));
+    }
+
+    // Persist build log after success as well.
+    let _ = std::fs::write("/build-out/build.log", log_lines.join("\n"));
+    write_resp(reader, BuilderResponse::Ok { out_path });
+    Ok(())
 }
 
 fn main() {
