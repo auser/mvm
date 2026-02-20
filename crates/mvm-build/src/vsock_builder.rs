@@ -51,6 +51,10 @@ pub fn build_via_vsock(
     }
 
     let mut resp_line = String::new();
+    // Collect recent log lines so we can surface them on build failure.
+    let mut recent_logs: Vec<String> = Vec::new();
+    const MAX_LOG_LINES: usize = 50;
+
     loop {
         resp_line.clear();
         if reader.read_line(&mut resp_line)? == 0 {
@@ -66,10 +70,25 @@ pub fn build_via_vsock(
             BuilderResponse::Log { line } => {
                 if !line.is_empty() {
                     eprintln!("[mvm][builder-agent] {}", line);
+                    if recent_logs.len() >= MAX_LOG_LINES {
+                        recent_logs.remove(0);
+                    }
+                    recent_logs.push(line);
                 }
             }
             BuilderResponse::Ok { out_path } => return Ok(out_path),
-            BuilderResponse::Err { message } => return Err(anyhow!(message)),
+            BuilderResponse::Err { message } => {
+                if recent_logs.is_empty() {
+                    return Err(anyhow!("nix build failed: {}", message));
+                }
+                let log_tail = recent_logs.join("\n");
+                return Err(anyhow!(
+                    "nix build failed: {}. Builder output (last {} lines):\n{}",
+                    message,
+                    recent_logs.len(),
+                    log_tail
+                ));
+            }
             BuilderResponse::Pong => continue,
         }
     }

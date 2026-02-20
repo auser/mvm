@@ -25,14 +25,21 @@ use super::routing::ResolvedRoute;
 /// Binds TCP listeners for each route, accepts connections, and dispatches
 /// them through the wake manager and proxy pipeline. Also runs background
 /// health check and idle sweep tasks.
-use super::state::{MemStateStore, StateStore};
-
-// ...
+use super::state::{EtcdStateStore, MemStateStore, StateStore};
 
 pub async fn serve(config: CoordinatorConfig) -> Result<()> {
-    // Default to in-memory store for now.
-    // TODO: Add config support for EtcdStateStore.
-    let store: Arc<dyn StateStore> = Arc::new(MemStateStore::new());
+    let store: Arc<dyn StateStore> = match &config.coordinator.etcd_endpoints {
+        Some(endpoints) if !endpoints.is_empty() => {
+            let prefix = config
+                .coordinator
+                .etcd_prefix
+                .as_deref()
+                .unwrap_or("/mvm/coordinator");
+            info!(endpoints = ?endpoints, prefix = %prefix, "Connecting to Etcd state store");
+            Arc::new(EtcdStateStore::connect(endpoints, prefix).await?)
+        }
+        _ => Arc::new(MemStateStore::new()),
+    };
 
     // Bootstrap routes from config into the store
     for route in &config.routes {

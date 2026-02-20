@@ -29,6 +29,13 @@ pub struct CoordinatorGlobal {
     /// Max concurrent connections per tenant.
     #[serde(default = "default_max_connections")]
     pub max_connections_per_tenant: u32,
+    /// Etcd endpoints for distributed state (e.g. `["http://127.0.0.1:2379"]`).
+    /// When absent, in-memory state is used.
+    #[serde(default)]
+    pub etcd_endpoints: Option<Vec<String>>,
+    /// Key prefix for Etcd keys (default: `/mvm/coordinator`).
+    #[serde(default = "default_etcd_prefix")]
+    pub etcd_prefix: Option<String>,
 }
 
 /// An agent node the coordinator can talk to.
@@ -65,6 +72,9 @@ fn default_health_interval() -> u64 {
 }
 fn default_max_connections() -> u32 {
     1000
+}
+fn default_etcd_prefix() -> Option<String> {
+    Some("/mvm/coordinator".to_string())
 }
 
 impl CoordinatorConfig {
@@ -292,5 +302,47 @@ node = "127.0.0.1:4433"
         assert_eq!(default_wake_timeout(), 10);
         assert_eq!(default_health_interval(), 30);
         assert_eq!(default_max_connections(), 1000);
+    }
+
+    #[test]
+    fn test_parse_etcd_config() {
+        let toml = r#"
+[coordinator]
+etcd_endpoints = ["http://127.0.0.1:2379", "http://127.0.0.2:2379"]
+etcd_prefix = "/custom/prefix"
+
+[[routes]]
+tenant_id = "alice"
+pool_id = "gateways"
+listen = "0.0.0.0:8443"
+node = "127.0.0.1:4433"
+"#;
+        let config = CoordinatorConfig::parse(toml).unwrap();
+        let endpoints = config.coordinator.etcd_endpoints.as_ref().unwrap();
+        assert_eq!(endpoints.len(), 2);
+        assert_eq!(endpoints[0], "http://127.0.0.1:2379");
+        assert_eq!(
+            config.coordinator.etcd_prefix.as_deref(),
+            Some("/custom/prefix")
+        );
+    }
+
+    #[test]
+    fn test_etcd_config_absent_defaults_to_none() {
+        let toml = r#"
+[coordinator]
+
+[[routes]]
+tenant_id = "alice"
+pool_id = "gateways"
+listen = "0.0.0.0:8443"
+node = "127.0.0.1:4433"
+"#;
+        let config = CoordinatorConfig::parse(toml).unwrap();
+        assert!(config.coordinator.etcd_endpoints.is_none());
+        assert_eq!(
+            config.coordinator.etcd_prefix.as_deref(),
+            Some("/mvm/coordinator")
+        );
     }
 }

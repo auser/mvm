@@ -41,13 +41,30 @@ pub(crate) fn reuse_template_artifacts(
     let meta_json = env.shell_exec_stdout(&format!("cat {}/revision.json", src))?;
     let rev_meta: TemplateRevision = serde_json::from_str(&meta_json)?;
     let spec = env.load_pool_spec(tenant_id, pool_id)?;
-    if rev_meta.profile != spec.profile
-        || rev_meta.role != spec.role.to_string()
-        || rev_meta.vcpus != spec.instance_resources.vcpus
+
+    // Build-identity check: profile + role + flake.lock must match (via composite cache key).
+    // Build a pool-side "expected" cache key from the pool spec and the template's flake_lock_hash.
+    let pool_cache_key = {
+        use sha2::Digest;
+        let mut h = sha2::Sha256::new();
+        h.update(rev_meta.flake_lock_hash.as_bytes());
+        h.update(b":");
+        h.update(spec.profile.as_bytes());
+        h.update(b":");
+        h.update(spec.role.to_string().as_bytes());
+        format!("{:x}", h.finalize())
+    };
+    if rev_meta.cache_key() != pool_cache_key {
+        env.log_warn("Template cache key mismatch (profile/role/flake.lock); skipping reuse");
+        return Ok(false);
+    }
+
+    // Resource compatibility: pool may request different vCPU/mem sizing than the template.
+    if rev_meta.vcpus != spec.instance_resources.vcpus
         || rev_meta.mem_mib != spec.instance_resources.mem_mib
         || rev_meta.data_disk_mib != spec.instance_resources.data_disk_mib
     {
-        env.log_warn("Template revision incompatible with pool (profile/role/resources mismatch)");
+        env.log_warn("Template revision resource mismatch (vcpus/mem/disk); skipping reuse");
         return Ok(false);
     }
     if !spec.flake_ref.is_empty() && spec.flake_ref != rev_meta.flake_ref {

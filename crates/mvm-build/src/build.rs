@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::Result;
 use std::collections::BTreeMap;
 
 use crate::nix_manifest::NixManifest;
@@ -335,8 +335,20 @@ pub(crate) fn run_nix_build(
     ctx.insert("timeout", timeout_secs.to_string());
     ctx.insert("attr", build_attr.clone());
     ctx.insert("log", log_path.to_string());
-    env.shell_exec_visible(&render_script("run_nix_build_ssh", &ctx)?)
-        .with_context(|| format!("nix build failed for {}", build_attr))?;
+    if let Err(build_err) = env.shell_exec_visible(&render_script("run_nix_build_ssh", &ctx)?) {
+        // Surface the builder's nix output so users can see what went wrong.
+        let log_tail = env
+            .shell_exec_stdout(&format!("tail -50 {} 2>/dev/null || true", log_path))
+            .unwrap_or_default();
+        let log_tail = log_tail.trim();
+        if log_tail.is_empty() {
+            return Err(build_err.context(format!("nix build failed for {}", build_attr)));
+        }
+        return Err(build_err.context(format!(
+            "nix build failed for {}. Builder output (last 50 lines):\n{}",
+            build_attr, log_tail
+        )));
+    }
 
     let output = env.shell_exec_stdout(&format!("cat {} 2>/dev/null", log_path))?;
 

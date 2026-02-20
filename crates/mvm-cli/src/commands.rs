@@ -25,6 +25,10 @@ struct Cli {
     #[arg(long, short = 'o', global = true, default_value = "table")]
     output: String,
 
+    /// Log format: human (default) or json (structured)
+    #[arg(long, global = true)]
+    log_format: Option<String>,
+
     /// Override Firecracker version (e.g., v1.14.0)
     #[arg(long, global = true)]
     fc_version: Option<String>,
@@ -877,12 +881,23 @@ pub fn run() -> Result<()> {
         unsafe { std::env::set_var("MVM_FC_VERSION", version) };
     }
 
-    // Initialize logging: JSON for daemon mode, human-readable for CLI
-    let log_format = match &cli.command {
-        Commands::Agent {
-            action: AgentCmd::Serve { .. },
-        } => LogFormat::Json,
-        _ => LogFormat::Human,
+    // Initialize logging: explicit flag > auto-detect (JSON for daemon mode, human for CLI)
+    let log_format = match cli.log_format.as_deref() {
+        Some("json") => LogFormat::Json,
+        Some("human") => LogFormat::Human,
+        Some(other) => {
+            eprintln!(
+                "Unknown --log-format '{}', using 'human'. Valid: human, json",
+                other
+            );
+            LogFormat::Human
+        }
+        None => match &cli.command {
+            Commands::Agent {
+                action: AgentCmd::Serve { .. },
+            } => LogFormat::Json,
+            _ => LogFormat::Human,
+        },
     };
     logging::init(log_format);
 

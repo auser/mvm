@@ -102,3 +102,86 @@ fn check_vm_cmd(name: &'static str, cmd: &'static str) -> Check {
         },
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_struct_reports_ok() {
+        let c = Check {
+            name: "test-tool",
+            cmd: "test-tool --version",
+            ok: true,
+            info: "1.0.0".to_string(),
+        };
+        assert!(c.ok);
+        assert_eq!(c.name, "test-tool");
+    }
+
+    #[test]
+    fn check_struct_reports_missing() {
+        let c = Check {
+            name: "missing-tool",
+            cmd: "missing-tool --version",
+            ok: false,
+            info: "not found".to_string(),
+        };
+        assert!(!c.ok);
+    }
+
+    #[test]
+    fn inside_lima_is_false_on_host() {
+        // On the macOS host (CI or dev machine), LIMA_INSTANCE is not set and
+        // Lima-specific files don't exist — so this should return false.
+        // This validates that the detection logic doesn't false-positive.
+        if std::env::var("LIMA_INSTANCE").is_err()
+            && !std::path::Path::new("/etc/lima-boot.conf").exists()
+        {
+            assert!(!shell::inside_lima());
+        }
+    }
+
+    #[test]
+    fn check_cmd_rustup_on_host() {
+        // rustup should be present on any dev machine / CI running cargo test
+        let c = check_cmd("rustup", "rustup --version");
+        assert!(c.ok, "rustup should be available: {}", c.info);
+        assert!(
+            c.info.contains("rustup"),
+            "expected version string, got: {}",
+            c.info
+        );
+    }
+
+    #[test]
+    fn check_cmd_cargo_on_host() {
+        let c = check_cmd("cargo", "cargo --version");
+        assert!(c.ok, "cargo should be available: {}", c.info);
+        assert!(
+            c.info.contains("cargo"),
+            "expected version string, got: {}",
+            c.info
+        );
+    }
+
+    #[test]
+    fn check_cmd_missing_tool() {
+        let c = check_cmd(
+            "nonexistent-mvm-tool-xyz",
+            "nonexistent-mvm-tool-xyz --version",
+        );
+        assert!(!c.ok, "nonexistent tool should fail");
+    }
+
+    #[test]
+    fn fc_target_version_is_nonempty() {
+        let v = mvm_core::config::fc_version();
+        assert!(!v.is_empty(), "FC version should be configured");
+        assert!(
+            v.starts_with('v'),
+            "FC version should start with 'v': {}",
+            v
+        );
+    }
+}

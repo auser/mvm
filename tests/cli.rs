@@ -213,3 +213,123 @@ fn test_run_help_shows_flags() {
         .stdout(predicate::str::contains("--user"))
         .stdout(predicate::str::contains("--detach"));
 }
+
+// ---------------------------------------------------------------------------
+// Tenant / Pool / Instance command structure
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_tenant_pool_instance_commands() {
+    // Top-level help lists tenant, pool, instance subcommands
+    let help = mvm().arg("--help").assert().success();
+    let out = String::from_utf8(help.get_output().stdout.clone()).unwrap();
+    for cmd in ["tenant", "pool", "instance"] {
+        assert!(out.contains(cmd), "Help should list '{}' subcommand", cmd);
+    }
+
+    // Tenant help shows CRUD subcommands
+    mvm()
+        .args(["tenant", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("create"))
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("info"))
+        .stdout(predicate::str::contains("destroy"));
+
+    // Tenant create without required args fails
+    mvm()
+        .args(["tenant", "create"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required"));
+
+    // Pool help shows lifecycle subcommands
+    mvm()
+        .args(["pool", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("create"))
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("info"))
+        .stdout(predicate::str::contains("build"))
+        .stdout(predicate::str::contains("scale"))
+        .stdout(predicate::str::contains("destroy"));
+
+    // Pool create without required args fails
+    mvm()
+        .args(["pool", "create"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required"));
+
+    // Instance help shows lifecycle subcommands
+    mvm()
+        .args(["instance", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("create"))
+        .stdout(predicate::str::contains("start"))
+        .stdout(predicate::str::contains("stop"))
+        .stdout(predicate::str::contains("warm"))
+        .stdout(predicate::str::contains("sleep"))
+        .stdout(predicate::str::contains("wake"))
+        .stdout(predicate::str::contains("destroy"));
+}
+
+// ---------------------------------------------------------------------------
+// Template command structure
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_template_lifecycle_commands() {
+    // Top-level help lists template subcommand
+    mvm()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("template"));
+
+    // Template help shows lifecycle subcommands
+    mvm()
+        .args(["template", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("create"))
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("info"))
+        .stdout(predicate::str::contains("build"))
+        .stdout(predicate::str::contains("delete"))
+        .stdout(predicate::str::contains("push"))
+        .stdout(predicate::str::contains("pull"))
+        .stdout(predicate::str::contains("verify"));
+
+    // Template create without required args fails
+    mvm()
+        .args(["template", "create"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required"));
+
+    // Template build requires a name argument
+    mvm()
+        .args(["template", "build"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required"));
+
+    // Template info requires a name argument
+    mvm()
+        .args(["template", "info"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required"));
+
+    // Template delete requires a name argument
+    mvm()
+        .args(["template", "delete"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required"));
+}

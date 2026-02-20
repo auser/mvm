@@ -1,3 +1,5 @@
+use sha2::Digest;
+
 use serde::{Deserialize, Serialize};
 
 /// Complete template configuration that can define multiple variants/roles.
@@ -82,4 +84,71 @@ pub struct TemplateRevision {
     pub vcpus: u8,
     pub mem_mib: u32,
     pub data_disk_mib: u32,
+}
+
+impl TemplateRevision {
+    /// Composite cache key from the three dimensions that define a unique build
+    /// output: flake.lock content, Nix profile, and workload role.
+    pub fn cache_key(&self) -> String {
+        let mut hasher = sha2::Sha256::new();
+        hasher.update(self.flake_lock_hash.as_bytes());
+        hasher.update(b":");
+        hasher.update(self.profile.as_bytes());
+        hasher.update(b":");
+        hasher.update(self.role.as_bytes());
+        format!("{:x}", hasher.finalize())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::pool::ArtifactPaths;
+
+    fn make_revision(flake_lock_hash: &str, profile: &str, role: &str) -> TemplateRevision {
+        TemplateRevision {
+            revision_hash: "abc123".to_string(),
+            flake_ref: ".".to_string(),
+            flake_lock_hash: flake_lock_hash.to_string(),
+            artifact_paths: ArtifactPaths {
+                vmlinux: "vmlinux".to_string(),
+                rootfs: "rootfs.ext4".to_string(),
+                fc_base_config: "fc-base.json".to_string(),
+            },
+            built_at: "2025-01-01T00:00:00Z".to_string(),
+            profile: profile.to_string(),
+            role: role.to_string(),
+            vcpus: 2,
+            mem_mib: 1024,
+            data_disk_mib: 0,
+        }
+    }
+
+    #[test]
+    fn same_inputs_same_cache_key() {
+        let a = make_revision("lock1", "minimal", "worker");
+        let b = make_revision("lock1", "minimal", "worker");
+        assert_eq!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn different_profile_different_cache_key() {
+        let a = make_revision("lock1", "minimal", "worker");
+        let b = make_revision("lock1", "full", "worker");
+        assert_ne!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn different_role_different_cache_key() {
+        let a = make_revision("lock1", "minimal", "worker");
+        let b = make_revision("lock1", "minimal", "gateway");
+        assert_ne!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn different_flake_different_cache_key() {
+        let a = make_revision("lock1", "minimal", "worker");
+        let b = make_revision("lock2", "minimal", "worker");
+        assert_ne!(a.cache_key(), b.cache_key());
+    }
 }
