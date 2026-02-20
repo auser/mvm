@@ -13,9 +13,9 @@ name = "mvm-hostd"
 path = "src/bin/mvm-hostd.rs"
 
 [dependencies]
-mvm-core = { path = "../mvm-core", version = "0.1.0" }
-mvm-guest = { path = "../mvm-guest", version = "0.1.0" }
-mvm-build = { path = "../mvm-build", version = "0.1.0" }
+mvm-core = { path = "../mvm-core", version = "0.3.0" }
+mvm-guest = { path = "../mvm-guest", version = "0.3.0" }
+mvm-build = { path = "../mvm-build", version = "0.3.0" }
 aes-gcm.workspace = true
 anyhow.workspace = true
 base64.workspace = true

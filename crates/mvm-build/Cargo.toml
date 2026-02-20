@@ -9,8 +9,8 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
-mvm-core = { path = "../mvm-core", version = "0.1.0" }
-mvm-guest = { path = "../mvm-guest", version = "0.1.0" }
+mvm-core = { path = "../mvm-core", version = "0.3.0" }
+mvm-guest = { path = "../mvm-guest", version = "0.3.0" }
 anyhow.workspace = true
 chrono.workspace = true
 serde.workspace = true

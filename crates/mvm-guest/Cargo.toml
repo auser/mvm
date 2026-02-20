@@ -13,7 +13,7 @@ name = "mvm-builder-agent"
 path = "src/bin/mvm-builder-agent.rs"
 
 [dependencies]
-mvm-core = { path = "../mvm-core", version = "0.1.0" }
+mvm-core = { path = "../mvm-core", version = "0.3.0" }
 anyhow.workspace = true
 serde.workspace = true
 serde_json.workspace = true
