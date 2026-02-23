@@ -15,6 +15,169 @@ Multi-node:     Coordinator → QUIC → N × agent nodes → Firecracker microV
 - **macOS (dev only)**: Apple Silicon or x86_64, Homebrew, Lima
 - **Nix**: Required on builder VMs for image builds (installed automatically)
 
+## Development Mode (macOS / Local Testing)
+
+Dev mode runs a single Firecracker microVM inside a Lima VM. It auto-bootstraps everything on first run — no manual setup needed.
+
+### Quick Start
+
+```bash
+# One command does everything: installs Lima, Firecracker, downloads
+# kernel + rootfs, boots a microVM, and drops you into SSH
+mvm dev
+
+# Inside the microVM:
+uname -a          # confirm you're in the guest
+exit              # exit SSH — VM keeps running as a daemon
+
+# Check what's running
+mvm status
+
+# SSH back in
+mvm ssh
+
+# Stop the microVM
+mvm stop
+
+# Tear down everything (Lima VM + all resources)
+mvm destroy
+```
+
+`mvm dev` is idempotent: if the environment is already set up, it connects directly. If the Lima VM is stopped, it restarts it. If Firecracker isn't installed, it installs it.
+
+### Step-by-Step Setup
+
+If you prefer manual control over each stage:
+
+```bash
+# 1. Install Homebrew + Lima (macOS only)
+mvm bootstrap
+
+# 2. Create Lima VM + install Firecracker + download assets
+mvm setup
+
+# 3. Start microVM and SSH in
+mvm start
+
+# 4. Open a shell in the Lima VM itself (not the microVM)
+mvm shell
+
+# 5. Build mvm from source inside the Lima VM
+mvm sync              # release build, installs to /usr/local/bin inside VM
+mvm sync --debug      # faster compile, slower runtime
+mvm sync --force      # rebuild even if versions match
+mvm sync --skip-deps  # skip installing rustup/apt packages
+```
+
+### Lima VM Resources
+
+The Lima VM defaults to 8 vCPUs and 16 GiB memory. Override with:
+
+```bash
+mvm dev --lima-cpus 4 --lima-mem 8
+mvm setup --lima-cpus 4 --lima-mem 8
+```
+
+### Dev Cluster (Agent + Coordinator Locally)
+
+For testing the multi-tenant reconciliation stack without remote nodes:
+
+```bash
+# Initialize: generates self-signed certs, default desired state,
+# coordinator config — all stored in ~/.mvm/dev-cluster/
+mvm dev-cluster init
+
+# Start agent + coordinator as background processes
+mvm dev-cluster up
+
+# Check status (PIDs, ports, log paths)
+mvm dev-cluster status
+
+# Stop everything
+mvm dev-cluster down
+```
+
+Files created in `~/.mvm/dev-cluster/`:
+
+| File | Purpose |
+|------|---------|
+| `desired.json` | Default desired state (dev tenant, gateway + worker pools) |
+| `coordinator.toml` | Local coordinator config pointing at `127.0.0.1:4433` |
+| `agent.pid` / `coordinator.pid` | PID files for background processes |
+| `agent.log` / `coordinator.log` | Log output |
+
+### Testing the Multi-Tenant Stack
+
+With the Lima VM running, exercise the full lifecycle locally:
+
+```bash
+# Create a tenant with network isolation
+mvm tenant create dev-test --net-id 99 --subnet 10.240.99.0/24 \
+  --max-vcpus 8 --max-mem 8192
+
+# Create and build a pool
+mvm pool create dev-test/workers --flake . --profile minimal \
+  --cpus 2 --mem 1024
+mvm pool build dev-test/workers
+
+# Scale instances via desired counts
+mvm pool scale dev-test/workers --running 2 --warm 1
+
+# Or reconcile from a desired state file
+mvm agent desired --file /tmp/desired.json
+mvm agent reconcile --desired /tmp/desired.json
+
+# Inspect instance states
+mvm instance list --tenant dev-test
+
+# Test sleep/wake round-trip
+mvm instance sleep dev-test/workers/<instance-id>
+mvm instance wake dev-test/workers/<instance-id>
+
+# Test the template workflow
+mvm template create mytemplate --flake . --profile minimal \
+  --role worker --cpus 2 --mem 1024
+mvm template build mytemplate
+mvm template info mytemplate
+
+# Verify network state
+mvm net verify
+
+# Clean up
+mvm tenant destroy dev-test --force
+```
+
+### Debugging Dev Mode
+
+```bash
+# Verbose logging
+RUST_LOG=debug mvm dev
+
+# Check Lima VM state directly
+limactl list
+
+# Shell into the Lima VM (bypassing mvm)
+limactl shell mvm
+
+# Inspect Firecracker state inside Lima
+limactl shell mvm bash -c "ls /opt/mvm/"
+
+# Run system health checks
+mvm doctor
+```
+
+### SSH Config
+
+Add mvm to your SSH config for easy access:
+
+```bash
+mvm ssh-config >> ~/.ssh/config
+# Then:
+ssh mvm
+```
+
+---
+
 ## Installation
 
 ### Quick Install
