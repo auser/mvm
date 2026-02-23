@@ -147,6 +147,140 @@ mvm net verify
 mvm tenant destroy dev-test --force
 ```
 
+### Example: OpenClaw Deployment
+
+OpenClaw is a messaging integration platform. mvm ships a built-in template that creates the full stack — gateway + workers — with a single command.
+
+#### One-Command Deploy
+
+```bash
+# Creates tenant, gateway pool, worker pool, builds both, scales up
+mvm new openclaw myapp
+```
+
+This runs 7 steps automatically:
+
+1. Allocates a network ID and /24 subnet (e.g., `10.240.1.0/24`)
+2. Creates tenant `myapp` with default quotas (32 vCPUs, 64 GiB memory)
+3. Creates pool `myapp/gateways` (role: gateway, 2 vCPU, 1024 MiB, no data disk)
+4. Creates pool `myapp/workers` (role: worker, 2 vCPU, 2048 MiB, 2048 MiB data disk)
+5. Builds both pools (Nix inside ephemeral Firecracker VMs)
+6. Scales gateway to 1 running, workers to 2 running + 1 warm
+
+Gateways start first (role priority) so routing is ready before workers come up.
+
+#### Inspect the Deployment
+
+```bash
+# Dashboard view
+mvm connect myapp
+
+# Detailed inspection
+mvm tenant info myapp              # quotas, network, audit
+mvm pool info myapp/gateways       # role: gateway, artifacts, desired counts
+mvm pool info myapp/workers        # role: worker, data disk, desired counts
+mvm instance list --tenant myapp   # all instances across both pools
+```
+
+#### Configure Secrets
+
+Workers receive secrets via a tmpfs-backed read-only disk at `/run/secrets`:
+
+```bash
+# Set tenant secrets from a JSON file
+mvm tenant secrets set myapp --from-file secrets.json
+```
+
+With secret scoping, each integration receives only its own keys. See [integrations.md](integrations.md).
+
+#### Scale the Fleet
+
+```bash
+# Scale workers up
+mvm pool scale myapp/workers --running 4 --warm 2 --sleeping 10
+
+# Scale gateway (usually 1 is enough)
+mvm pool scale myapp/gateways --running 1 --warm 1
+```
+
+Warm instances restore from snapshot in ~200ms on demand. Sleeping instances are fully snapshotted to disk and consume no CPU/memory.
+
+#### Customizing the Template
+
+Override the flake, network, or resources:
+
+```bash
+# Custom flake
+mvm new openclaw myapp --flake github:myorg/my-openclaw-fork
+
+# Explicit network
+mvm new openclaw myapp --net-id 42 --subnet 10.240.42.0/24
+
+# Resource overrides via config file
+mvm new openclaw myapp --config deploy.toml
+```
+
+The config file (`deploy.toml`) supports per-pool overrides:
+
+```toml
+[overrides]
+flake = "github:myorg/my-openclaw-fork"
+
+[overrides.workers]
+vcpus = 4
+mem_mib = 4096
+instances = 8
+
+[overrides.gateways]
+vcpus = 2
+mem_mib = 2048
+
+[secrets]
+[secrets.api_keys]
+file = "./secrets/api-keys.json"
+```
+
+#### Update Images
+
+When the flake changes (new integration, dependency update):
+
+```bash
+# Rebuild worker pool (uses cache if flake.lock unchanged)
+mvm pool build myapp/workers
+
+# Force rebuild (ignores cache)
+mvm pool build myapp/workers --force
+
+# Rolling update: new instances use new artifacts, old instances
+# are replaced on next sleep/wake cycle or reconcile
+```
+
+#### Production: Agent-Driven Reconciliation
+
+Instead of manual CLI commands, run the agent daemon:
+
+```bash
+# Generate desired state from current config
+mvm agent desired --file /etc/mvm/desired.json
+
+# Start the agent (continuously reconciles)
+mvm agent serve --desired /etc/mvm/desired.json --interval-secs 30
+```
+
+Or push desired state from a coordinator:
+
+```bash
+# On the coordinator host
+mvm coordinator push --desired myapp.json --node 10.0.1.1:4433
+```
+
+#### Tear Down
+
+```bash
+# Destroy the entire deployment (tenant + all pools + all instances)
+mvm tenant destroy myapp --force
+```
+
 ### Debugging Dev Mode
 
 ```bash
