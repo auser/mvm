@@ -182,8 +182,7 @@ SSHD
     cat > "squashfs-root{{agent_service}}" <<'AGENTEOF'
 [Unit]
 Description=MVM Builder Agent
-After=network-online.target
-Wants=network-online.target
+After=basic.target
 
 [Service]
 Type=simple

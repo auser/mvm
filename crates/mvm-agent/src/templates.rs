@@ -77,8 +77,13 @@ fn openclaw_template() -> DeploymentTemplate {
     }
 }
 
+/// Maximum user-allocatable net_id. Net IDs 4095+ are reserved for internal
+/// use (e.g., the ephemeral "templates" tenant used during builds).
+const MAX_USER_NET_ID: u16 = 4094;
+
 /// Auto-allocate a net_id by scanning existing tenants.
-/// Returns max(existing_net_ids) + 1, or 1 if no tenants exist.
+/// Skips internal/reserved net_ids (>= 4095). Returns the lowest unused
+/// net_id in [1, 4094], or an error if the range is exhausted.
 pub fn allocate_net_id() -> Result<u16> {
     let tenant_ids =
         tenant_list().with_context(|| "Failed to list tenants for net-id allocation")?;
@@ -86,18 +91,33 @@ pub fn allocate_net_id() -> Result<u16> {
     let mut max_net_id: u16 = 0;
     for tid in &tenant_ids {
         if let Ok(config) = tenant_load(tid)
+            && config.net.tenant_net_id <= MAX_USER_NET_ID
             && config.net.tenant_net_id > max_net_id
         {
             max_net_id = config.net.tenant_net_id;
         }
     }
 
-    Ok(max_net_id + 1)
+    let next = max_net_id + 1;
+    if next > MAX_USER_NET_ID {
+        anyhow::bail!(
+            "No available net_ids (all {} user slots in use)",
+            MAX_USER_NET_ID
+        );
+    }
+    Ok(next)
 }
 
 /// Compute a /24 subnet from a net_id within the 10.240.0.0/12 cluster CIDR.
+///
+/// The /12 prefix covers 10.240.0.0 – 10.255.255.255, giving 4096 possible
+/// /24 subnets. The net_id is encoded across octets 2–3:
+///   octet2 = 240 + (net_id >> 8)    // 240–255
+///   octet3 = net_id & 0xFF          // 0–255
 pub fn subnet_from_net_id(net_id: u16) -> String {
-    format!("10.240.{}.0/24", net_id)
+    let octet2 = 240 + (net_id >> 8);
+    let octet3 = net_id & 0xFF;
+    format!("10.{}.{}.0/24", octet2, octet3)
 }
 
 /// Derive gateway IP (first usable) from a /24 subnet CIDR.
@@ -280,10 +300,36 @@ mod tests {
     }
 
     #[test]
+    fn test_allocate_net_id_skips_reserved() {
+        let (_guard, _fs) = mvm_runtime::shell_mock::mock_fs().install();
+
+        // Create a user tenant and an internal "templates" tenant (net_id 4095)
+        mvm_runtime::vm::tenant::lifecycle::tenant_create(
+            "real",
+            mvm_core::tenant::TenantNet::new(5, "10.240.5.0/24", "10.240.5.1"),
+            TenantQuota::default(),
+        )
+        .unwrap();
+        mvm_runtime::vm::tenant::lifecycle::tenant_create(
+            "templates",
+            mvm_core::tenant::TenantNet::new(4095, "10.255.255.0/24", "10.255.255.1"),
+            TenantQuota::default(),
+        )
+        .unwrap();
+
+        // Should skip 4095 and return max(5) + 1 = 6
+        let id = allocate_net_id().unwrap();
+        assert_eq!(id, 6);
+    }
+
+    #[test]
     fn test_subnet_from_net_id() {
         assert_eq!(subnet_from_net_id(1), "10.240.1.0/24");
         assert_eq!(subnet_from_net_id(42), "10.240.42.0/24");
         assert_eq!(subnet_from_net_id(255), "10.240.255.0/24");
+        // net_id > 255 encodes across octets 2-3
+        assert_eq!(subnet_from_net_id(256), "10.241.0.0/24");
+        assert_eq!(subnet_from_net_id(4094), "10.255.254.0/24");
     }
 
     #[test]

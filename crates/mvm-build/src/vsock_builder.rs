@@ -18,7 +18,7 @@ pub fn build_via_vsock(
     attr: &str,
     timeout_secs: u64,
 ) -> Result<String> {
-    wait_for_agent_ready(vsock_uds, timeout_secs.clamp(5, 30))?;
+    wait_for_agent_ready(vsock_uds, timeout_secs.clamp(10, 60))?;
 
     let mut stream = UnixStream::connect(vsock_uds)
         .with_context(|| format!("failed to connect vsock UDS {}", vsock_uds))?;
@@ -96,10 +96,28 @@ pub fn build_via_vsock(
 
 fn wait_for_agent_ready(vsock_uds: &str, max_wait_secs: u64) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(max_wait_secs);
+    let mut attempts = 0u32;
     loop {
+        attempts += 1;
         match ping_once(vsock_uds) {
-            Ok(()) => return Ok(()),
+            Ok(()) => {
+                let elapsed =
+                    Instant::now().duration_since(deadline - Duration::from_secs(max_wait_secs));
+                eprintln!(
+                    "[mvm] Builder agent ready after {:.1}s ({} attempts)",
+                    elapsed.as_secs_f64(),
+                    attempts
+                );
+                return Ok(());
+            }
             Err(_) if Instant::now() < deadline => {
+                if attempts.is_multiple_of(5) {
+                    let remaining = deadline.duration_since(Instant::now());
+                    eprintln!(
+                        "[mvm] Waiting for builder agent... ({:.0}s remaining)",
+                        remaining.as_secs_f64()
+                    );
+                }
                 std::thread::sleep(Duration::from_millis(400));
             }
             Err(e) => {

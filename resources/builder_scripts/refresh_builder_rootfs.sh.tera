@@ -17,8 +17,7 @@ sudo mkdir -p "$TMP_MOUNT$(dirname {{agent_service}})"
 sudo sh -c 'cat > "$TMP_MOUNT{{agent_service}}" <<\"EOF\"
 [Unit]
 Description=MVM Builder Agent
-After=network-online.target
-Wants=network-online.target
+After=basic.target
 
 [Service]
 Type=simple
