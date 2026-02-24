@@ -198,6 +198,35 @@ AGENTEOF
 
     mkdir -p squashfs-root/nix
 
+    # Install Nix into the rootfs via chroot so the builder agent can run
+    # `nix build` without runtime installation.
+    echo '[mvm] Installing Nix into builder rootfs...'
+    if command -v nix >/dev/null 2>&1; then
+        # Copy the host Nix installation into the rootfs.
+        NIX_STORE_CLOSURE=$(nix path-info --recursive /nix/var/nix/profiles/default 2>/dev/null || true)
+        if [ -n "$NIX_STORE_CLOSURE" ]; then
+            echo "[mvm]   Copying Nix store closure into rootfs..."
+            for p in $NIX_STORE_CLOSURE; do
+                dir="squashfs-root$(dirname "$p")"
+                mkdir -p "$dir"
+                cp -a "$p" "squashfs-root$p" 2>/dev/null || true
+            done
+            # Copy Nix profile links
+            mkdir -p squashfs-root/nix/var/nix/profiles
+            cp -a /nix/var/nix/profiles/default squashfs-root/nix/var/nix/profiles/ 2>/dev/null || true
+            mkdir -p squashfs-root/nix/var/nix/db
+            cp /nix/var/nix/db/db.sqlite squashfs-root/nix/var/nix/db/ 2>/dev/null || true
+            # Add nix to PATH for all users
+            mkdir -p squashfs-root/etc/profile.d
+            echo 'export PATH="/nix/var/nix/profiles/default/bin:$PATH"' > squashfs-root/etc/profile.d/nix.sh
+            echo '[mvm]   Nix store copied into rootfs.'
+        else
+            echo '[mvm]   WARNING: Could not determine Nix store closure. Nix will be installed at runtime.'
+        fi
+    else
+        echo '[mvm]   WARNING: Nix not found on host. Nix will be installed at runtime.'
+    fi
+
     rm -f rootfs.ext4
     truncate -s 4G rootfs.ext4
     sudo mkfs.ext4 -d squashfs-root -F rootfs.ext4

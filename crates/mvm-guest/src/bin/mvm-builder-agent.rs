@@ -103,6 +103,44 @@ fn ensure_mount(dev: &str, mountpoint: &str) {
         .status();
 }
 
+fn ensure_nix(reader: &mut BufReader<std::fs::File>) -> anyhow::Result<()> {
+    // Check if nix is already on PATH.
+    if Command::new("sh")
+        .arg("-c")
+        .arg("command -v nix >/dev/null 2>&1")
+        .status()
+        .is_ok_and(|s| s.success())
+    {
+        return Ok(());
+    }
+
+    write_resp(
+        reader,
+        BuilderResponse::Log {
+            line: "Nix not found, installing (single-user)...".to_string(),
+        },
+    );
+
+    let status = Command::new("sh")
+        .arg("-c")
+        .arg("curl --retry 3 --retry-delay 2 -L https://nixos.org/nix/install | sh -s -- --no-daemon 2>&1")
+        .status()?;
+    if !status.success() {
+        return Err(anyhow::anyhow!(
+            "Failed to install Nix (exit {}). Builder rootfs needs Nix pre-installed or network access.",
+            status
+        ));
+    }
+
+    write_resp(
+        reader,
+        BuilderResponse::Log {
+            line: "Nix installed successfully.".to_string(),
+        },
+    );
+    Ok(())
+}
+
 fn run_build(
     reader: &mut BufReader<std::fs::File>,
     flake_ref: &str,
@@ -117,8 +155,15 @@ fn run_build(
         ensure_mount("/dev/vdc", "/build-in");
     }
 
+    // Ensure Nix is available before attempting the build.
+    ensure_nix(reader)?;
+
+    // Source nix profile in case it was just installed.
     let build_cmd = format!(
-        "set -euo pipefail; timeout {t} nix build {flake}#{attr} --no-link --print-out-paths 2>&1",
+        "set -euo pipefail; \
+         [ -f /root/.nix-profile/etc/profile.d/nix.sh ] && . /root/.nix-profile/etc/profile.d/nix.sh; \
+         [ -f /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh ] && . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh; \
+         timeout {t} nix build {flake}#{attr} --no-link --print-out-paths 2>&1",
         t = timeout,
         flake = flake_ref,
         attr = attr
