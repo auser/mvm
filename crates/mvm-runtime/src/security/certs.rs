@@ -37,11 +37,22 @@ pub struct CertStatus {
     pub last_rotated: Option<String>,
 }
 
-/// Ensure the certificate directory exists.
+/// Ensure the certificate directory exists (owned by current user).
 fn ensure_cert_dir() -> Result<()> {
-    shell::run_in_vm(&format!("mkdir -p {}", CERT_DIR))
-        .with_context(|| "Failed to create cert directory")
-        .map(|_| ())
+    let output = shell::run_in_vm(&format!(
+        "sudo mkdir -p {} && sudo chown $(id -u):$(id -g) {}",
+        CERT_DIR, CERT_DIR
+    ))
+    .with_context(|| "Failed to create cert directory")?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to create cert directory {}: {}",
+            CERT_DIR,
+            stderr.trim()
+        );
+    }
+    Ok(())
 }
 
 /// Initialize CA certificate from an external file.
@@ -52,11 +63,21 @@ pub fn init_ca(ca_cert_source: &str) -> Result<()> {
     ensure_cert_dir()?;
     let paths = CertPaths::default_paths();
 
-    shell::run_in_vm(&format!("cp {} {}", ca_cert_source, paths.ca_cert))
-        .with_context(|| format!("Failed to copy CA cert from {}", ca_cert_source))
-        .map(|_| ())?;
+    let output = shell::run_in_vm(&format!("cp {} {}", ca_cert_source, paths.ca_cert))
+        .with_context(|| format!("Failed to copy CA cert from {}", ca_cert_source))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!(
+            "Failed to copy CA cert from {}: {}",
+            ca_cert_source,
+            stderr.trim()
+        );
+    }
 
-    shell::run_in_vm(&format!("chmod 644 {}", paths.ca_cert)).map(|_| ())?;
+    let output = shell::run_in_vm(&format!("chmod 644 {}", paths.ca_cert))?;
+    if !output.status.success() {
+        anyhow::bail!("Failed to set permissions on {}", paths.ca_cert);
+    }
     Ok(())
 }
 
@@ -101,7 +122,10 @@ pub fn generate_self_signed(node_id: &str) -> Result<CertPaths> {
     write_pem_file(&paths.node_key, &node_key_pem)?;
 
     // Restrict key file permissions
-    shell::run_in_vm(&format!("chmod 600 {}", paths.node_key)).map(|_| ())?;
+    let output = shell::run_in_vm(&format!("chmod 600 {}", paths.node_key))?;
+    if !output.status.success() {
+        anyhow::bail!("Failed to set permissions on {}", paths.node_key);
+    }
 
     Ok(paths)
 }
@@ -109,9 +133,13 @@ pub fn generate_self_signed(node_id: &str) -> Result<CertPaths> {
 /// Write a PEM string to a file inside the VM.
 fn write_pem_file(path: &str, content: &str) -> Result<()> {
     // Use heredoc to safely write multi-line PEM content
-    shell::run_in_vm(&format!("cat > {} << 'ENDPEM'\n{}\nENDPEM", path, content,))
-        .with_context(|| format!("Failed to write PEM file: {}", path))
-        .map(|_| ())
+    let output = shell::run_in_vm(&format!("cat > {} << 'ENDPEM'\n{}\nENDPEM", path, content))
+        .with_context(|| format!("Failed to write PEM file: {}", path))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        anyhow::bail!("Failed to write PEM file {}: {}", path, stderr.trim());
+    }
+    Ok(())
 }
 
 /// Read a PEM file from the VM and return its contents.

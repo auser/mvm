@@ -1798,6 +1798,7 @@ dependencies = [
  "mvm-runtime",
  "predicates",
  "reqwest",
+ "rustls",
  "serde",
  "serde_json",
  "serde_yaml",

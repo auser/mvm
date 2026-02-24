@@ -873,6 +873,11 @@ enum AddCmd {
 // ============================================================================
 
 pub fn run() -> Result<()> {
+    // Install ring as the default TLS crypto provider. Both ring and aws-lc-rs
+    // features are enabled transitively, so rustls can't auto-detect — we must
+    // pick one explicitly before any TLS operation.
+    let _ = rustls::crypto::ring::default_provider().install_default();
+
     let cli = Cli::parse();
 
     // Apply FC version override before anything reads it.
