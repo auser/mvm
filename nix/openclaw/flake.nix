@@ -4,21 +4,18 @@
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
     flake-utils.url = "github:numtide/flake-utils";
-    microvm = {
-      url = "github:astro/microvm.nix";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
-  outputs = { nixpkgs, flake-utils, microvm, ... }:
+  outputs = { nixpkgs, flake-utils, ... }:
     flake-utils.lib.eachSystem [ "x86_64-linux" "aarch64-linux" ] (system:
       let
         pkgs = import nixpkgs { inherit system; };
 
-        # Build a NixOS guest and package kernel + rootfs for Firecracker.
+        # Build a NixOS guest and package kernel + initrd + rootfs for Firecracker.
         #
         # The output derivation contains:
         #   $out/vmlinux     — uncompressed kernel for Firecracker
+        #   $out/initrd      — initial ramdisk (NixOS stage-1 → activation → systemd)
         #   $out/rootfs.ext4 — ext4 root filesystem image
         #
         # At runtime, mvm mounts per-tenant config and secrets as additional
@@ -29,14 +26,12 @@
             eval = nixpkgs.lib.nixosSystem {
               inherit system;
               modules = [
-                microvm.nixosModules.microvm
                 ./guests/baseline.nix
               ] ++ modules;
             };
             cfg = eval.config;
 
-            # microvm.nix provides a minimal kernel suited for VM guests.
-            kernel = cfg.microvm.declaredRunner.passthru.kernel or cfg.boot.kernelPackages.kernel;
+            kernel = cfg.boot.kernelPackages.kernel;
 
             # Build an ext4 rootfs from the full NixOS system closure.
             rootfs = pkgs.callPackage (nixpkgs + "/nixos/lib/make-ext4-fs.nix") {
@@ -47,6 +42,12 @@
                 ln -s ${cfg.system.build.toplevel} ./files/etc/system-toplevel
                 mkdir -p ./files/sbin
                 ln -s ${cfg.system.build.toplevel}/init ./files/sbin/init
+
+                # NixOS stage-1 (initrd) expects stage-2 init at /init.
+                # Use a relative symlink so the initrd can verify the file exists
+                # before switch_root (absolute symlinks can't be followed from
+                # the initrd because the rootfs is mounted at /mnt-root/).
+                ln -s .${cfg.system.build.toplevel}/init ./files/init
               '';
             };
           in
@@ -68,6 +69,10 @@
               ls -la "${kernel}/" >&2
               exit 1
             fi
+
+            # Initrd — NixOS stage-1 handles activation and systemd setup.
+            # Without this, systemd starts but can't find default.target.
+            cp "${cfg.system.build.initialRamdisk}/initrd" "$out/initrd"
 
             # Rootfs — ext4 image for Firecracker
             cp "${rootfs}" "$out/rootfs.ext4"

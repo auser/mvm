@@ -75,17 +75,24 @@ pub fn template_build(id: &str, force: bool) -> Result<()> {
     let rev_dst = template_revision_dir(id, rev);
     shell::run_in_vm(&format!("mkdir -p {rev_dst}"))?;
     shell::run_in_vm(&format!("cp -a {} {rev_dst}/vmlinux", result.vmlinux_path))?;
+    if let Some(initrd) = &result.initrd_path {
+        shell::run_in_vm(&format!("cp -a {} {rev_dst}/initrd", initrd))?;
+    }
     shell::run_in_vm(&format!(
         "cp -a {} {rev_dst}/rootfs.ext4",
         result.rootfs_path
     ))?;
 
     // Generate a minimal fc-base.json config for reference
+    let mut boot_source = serde_json::json!({
+        "kernel_image_path": "vmlinux",
+        "boot_args": "console=ttyS0 reboot=k panic=1 net.ifnames=0"
+    });
+    if result.initrd_path.is_some() {
+        boot_source["initrd_path"] = serde_json::json!("initrd");
+    }
     let fc_config = serde_json::json!({
-        "boot-source": {
-            "kernel_image_path": "vmlinux",
-            "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
-        },
+        "boot-source": boot_source,
         "drives": [{
             "drive_id": "rootfs",
             "path_on_host": "rootfs.ext4",

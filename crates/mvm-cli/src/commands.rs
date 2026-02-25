@@ -75,8 +75,14 @@ enum Commands {
         #[arg(long, short = 'm')]
         memory: Option<u32>,
     },
-    /// Stop the running microVM and clean up
-    Stop,
+    /// Stop a running microVM (by name) or all VMs (--all)
+    Stop {
+        /// Name of the VM to stop
+        name: Option<String>,
+        /// Stop all running VMs
+        #[arg(long)]
+        all: bool,
+    },
     /// Open a shell in the Lima VM (alias for 'mvm shell')
     Ssh,
     /// Print an SSH config entry for the Lima VM
@@ -152,6 +158,9 @@ enum Commands {
         /// Nix flake reference (local path or remote URI)
         #[arg(long)]
         flake: String,
+        /// VM name (auto-generated if omitted)
+        #[arg(long)]
+        name: Option<String>,
         /// Flake package variant (e.g. worker, gateway). Omit to use flake default.
         #[arg(long)]
         profile: Option<String>,
@@ -324,7 +333,7 @@ pub fn run() -> Result<()> {
             Some(ref elf) => cmd_start_image(elf, config.as_deref(), &volume, cpus, memory),
             None => cmd_start(),
         },
-        Commands::Stop => cmd_stop(),
+        Commands::Stop { name, all } => cmd_stop(name.as_deref(), all),
         Commands::Ssh => cmd_ssh(),
         Commands::SshConfig => cmd_ssh_config(),
         Commands::Shell {
@@ -356,6 +365,7 @@ pub fn run() -> Result<()> {
         }
         Commands::Run {
             flake,
+            name,
             profile,
             cpus,
             memory,
@@ -363,6 +373,7 @@ pub fn run() -> Result<()> {
             volume,
         } => cmd_run(
             &flake,
+            name.as_deref(),
             profile.as_deref(),
             cpus,
             memory,
@@ -604,8 +615,20 @@ fn shell_escape(s: &str) -> String {
     }
 }
 
-fn cmd_stop() -> Result<()> {
-    microvm::stop()
+fn cmd_stop(name: Option<&str>, all: bool) -> Result<()> {
+    match (name, all) {
+        (Some(n), _) => microvm::stop_vm(n),
+        (None, true) => microvm::stop_all_vms(),
+        (None, false) => {
+            // Default: stop all VMs (both named and legacy)
+            let vms = microvm::list_vms().unwrap_or_default();
+            if !vms.is_empty() {
+                microvm::stop_all_vms()
+            } else {
+                microvm::stop()
+            }
+        }
+    }
 }
 
 fn cmd_ssh() -> Result<()> {
@@ -915,18 +938,39 @@ fn cmd_status() -> Result<()> {
         return Ok(());
     }
 
-    // Check for flake run info to distinguish run modes
-    if let Some(info) = microvm::read_run_info()
+    // Show running named VMs (multi-VM mode)
+    let vms = microvm::list_vms().unwrap_or_default();
+    if !vms.is_empty() {
+        ui::status_line("MicroVMs:", &format!("{} running", vms.len()));
+        println!();
+        println!(
+            "  {:<16} {:<10} {:<16} {:<14} STATUS",
+            "NAME", "PROFILE", "GUEST IP", "REVISION"
+        );
+        println!("  {}", "-".repeat(70));
+        for vm in &vms {
+            let name = vm.name.as_deref().unwrap_or("?");
+            let profile = vm.profile.as_deref().unwrap_or("default");
+            let ip = vm.guest_ip.as_deref().unwrap_or("?");
+            let rev = vm
+                .revision
+                .as_deref()
+                .map(|r| if r.len() > 10 { &r[..10] } else { r })
+                .unwrap_or("?");
+            println!(
+                "  {:<16} {:<10} {:<16} {:<14} Running",
+                name, profile, ip, rev
+            );
+        }
+    } else if let Some(info) = microvm::read_run_info()
         && info.mode == "flake"
     {
+        // Legacy single-VM run info
         let rev = info.revision.as_deref().unwrap_or("unknown");
+        let ip = info.guest_ip.as_deref().unwrap_or(config::GUEST_IP);
         ui::status_line(
             "MicroVM:",
-            &format!(
-                "Running — flake (revision {}, guest IP {})",
-                rev,
-                config::GUEST_IP
-            ),
+            &format!("Running — flake (revision {}, guest IP {})", rev, ip),
         );
     } else {
         ui::status_line(
@@ -1034,6 +1078,7 @@ fn resolve_flake_ref(flake_ref: &str) -> Result<String> {
 
 fn cmd_run(
     flake_ref: &str,
+    name: Option<&str>,
     profile: Option<&str>,
     cpus: Option<u32>,
     memory: Option<u32>,
@@ -1047,10 +1092,22 @@ fn cmd_run(
     let resolved = resolve_flake_ref(flake_ref)?;
     let profile_display = profile.unwrap_or("default");
 
+    // Generate a VM name if not provided
+    let vm_name = match name {
+        Some(n) => n.to_string(),
+        None => {
+            let mut generator = names::Generator::default();
+            generator.next().unwrap_or_else(|| "vm-0".to_string())
+        }
+    };
+
     ui::step(
         1,
         2,
-        &format!("Building flake {} (profile={})", resolved, profile_display),
+        &format!(
+            "Building flake {} (profile={}, name={})",
+            resolved, profile_display, vm_name
+        ),
     );
 
     let env = mvm_runtime::build_env::RuntimeBuildEnv;
@@ -1065,7 +1122,7 @@ fn cmd_run(
         ));
     }
 
-    ui::step(2, 2, "Booting Firecracker VM");
+    ui::step(2, 2, &format!("Booting Firecracker VM '{}'", vm_name));
 
     let rt_config = match config_path {
         Some(p) => image::parse_runtime_config(p)?,
@@ -1087,11 +1144,18 @@ fn cmd_run(
     let final_cpus = cpus.or(rt_config.cpus).unwrap_or(DEFAULT_CPUS);
     let final_memory = memory.or(rt_config.memory).unwrap_or(DEFAULT_MEM);
 
+    // Allocate a network slot for this VM
+    let slot = microvm::allocate_slot(&vm_name)?;
+
     let run_config = microvm::FlakeRunConfig {
+        name: vm_name,
+        slot,
         vmlinux_path: result.vmlinux_path,
+        initrd_path: result.initrd_path,
         rootfs_path: result.rootfs_path,
         revision_hash: result.revision_hash,
         flake_ref: flake_ref.to_string(),
+        profile: profile.map(|s| s.to_string()),
         cpus: final_cpus,
         memory: final_memory,
         volumes: volume_cfg,
@@ -1399,6 +1463,7 @@ mod tests {
                 profile,
                 cpus,
                 memory,
+                name: _,
                 volume: _,
                 config: _,
             } => {
@@ -1417,6 +1482,7 @@ mod tests {
         match cli.command {
             Commands::Run {
                 flake,
+                name,
                 profile,
                 cpus,
                 memory,
@@ -1424,6 +1490,7 @@ mod tests {
                 volume,
             } => {
                 assert_eq!(flake, ".");
+                assert!(name.is_none(), "name should be None when omitted");
                 assert!(profile.is_none(), "profile should be None when omitted");
                 assert_eq!(cpus, Some(2));
                 assert_eq!(memory, Some(1024));

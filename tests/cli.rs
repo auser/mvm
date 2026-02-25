@@ -206,9 +206,20 @@ fn test_run_help_shows_flags() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--flake"))
+        .stdout(predicate::str::contains("--name"))
         .stdout(predicate::str::contains("--profile"))
         .stdout(predicate::str::contains("--cpus"))
         .stdout(predicate::str::contains("--memory"));
+}
+
+#[test]
+fn test_stop_help_shows_flags() {
+    mvm()
+        .args(["stop", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--all"))
+        .stdout(predicate::str::contains("name"));
 }
 
 // ---------------------------------------------------------------------------

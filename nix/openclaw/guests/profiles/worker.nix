@@ -6,8 +6,7 @@
 { ... }:
 {
   networking.hostName = "openclaw-worker";
-  networking.firewall.enable = true;
-  networking.firewall.allowedTCPPorts = [ 18790 ];
+  networking.firewall.enable = false;
 
   # Role-specific workspace (tmpfs, not persisted across reboots).
   # Persistent data should use /mnt/data (mvm data drive).

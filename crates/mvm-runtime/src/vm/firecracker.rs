@@ -164,3 +164,12 @@ pub fn is_running() -> Result<bool> {
     let output = run_in_vm("pgrep -x firecracker >/dev/null 2>&1")?;
     Ok(output.status.success())
 }
+
+/// Check if a specific VM's Firecracker process is alive (by PID file path).
+pub fn is_vm_running(pid_file: &str) -> Result<bool> {
+    let result = run_in_vm_stdout(&format!(
+        "[ -f {pid} ] && kill -0 $(cat {pid}) 2>/dev/null && echo yes || echo no",
+        pid = pid_file,
+    ))?;
+    Ok(result.trim() == "yes")
+}

@@ -20,33 +20,8 @@ I have a `template.toml` in that directory `/Users/auser/work/tinylabs/aibutler/
 
 ---
 
-Also when I build the flake, I get this error. Can we update the actual `nix` files so they actually produce a clean build:
+Part of the goal is to have a secure and safe openclaw. I have a few possible resources to investgate how we can safely provide openclaw 
 
-cargo run -- build --flake ./nix/openclaw/ --role worker
-   Compiling mvm-runtime v0.3.0 (/Users/auser/work/personal/microvm/kv/mvm/crates/mvm-runtime)
-   Compiling mvm-cli v0.3.0 (/Users/auser/work/personal/microvm/kv/mvm/crates/mvm-cli)
-   Compiling mvm v0.3.0 (/Users/auser/work/personal/microvm/kv/mvm)
-    Finished `dev` profile [unoptimized + debuginfo] target(s) in 5.42s
-     Running `target/debug/mvm build --flake ./nix/openclaw/ --role worker`
-
-[mvm] Step 1/2: Building flake /Users/auser/work/personal/microvm/kv/mvm/nix/openclaw (profile=minimal, role=worker)
-[mvm] No manifest found, using legacy attribute: /Users/auser/work/personal/microvm/kv/mvm/nix/openclaw#packages.aarch64-linux.tenant-minimal
-[mvm] Building: nix build /Users/auser/work/personal/microvm/kv/mvm/nix/openclaw#packages.aarch64-linux.tenant-minimal
-warning: creating lock file "/Users/auser/work/personal/microvm/kv/mvm/nix/openclaw/flake.lock":
-• Added input 'flake-utils':
-    'github:numtide/flake-utils/11707dc' (2024-11-13)
-• Added input 'flake-utils/systems':
-    'github:nix-systems/default/da67096' (2023-04-09)
-• Added input 'microvm':
-    'github:astro/microvm.nix/b67e3d8' (2026-02-22)
-• Added input 'microvm/nixpkgs':
-    follows 'nixpkgs'
-• Added input 'microvm/spectrum':
-    'git+https://spectrum-os.org/git/spectrum?ref=refs/heads/main&rev=c5d5786d3dc938af0b279c542d1e43bce381b4b9' (2025-10-03)
-• Added input 'nixpkgs':
-    'github:NixOS/nixpkgs/50ab793' (2025-06-30)
-error: flake 'git+file:///Users/auser/work/personal/microvm/kv/mvm?dir=nix/openclaw' does not provide attribute 'packages.aarch64-linux.packages.aarch64-linux.tenant-minimal', 'legacyPackages.aarch64-linux.packages.aarch64-linux.tenant-minimal' or 'packages.aarch64-linux.tenant-minimal'
-Error: nix build failed for /Users/auser/work/personal/microvm/kv/mvm/nix/openclaw#packages.aarch64-linux.tenant-minimal
-
-Caused by:
-    Command failed (exit 1)
+https://safeclaw.io/
+@docs/The-OpenClaw-Field-Manual.pdf 
+ 

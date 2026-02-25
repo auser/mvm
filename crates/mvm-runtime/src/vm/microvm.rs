@@ -22,6 +22,11 @@ fn resolve_microvm_dir() -> Result<String> {
     run_in_vm_stdout(&format!("echo {}", MICROVM_DIR))
 }
 
+/// Resolve a per-VM directory path (~ expansion) inside the Lima VM.
+fn resolve_vm_dir(slot: &VmSlot) -> Result<String> {
+    run_in_vm_stdout(&format!("echo {}", slot.vm_dir))
+}
+
 /// Start the Firecracker daemon inside the Lima VM (background).
 fn start_firecracker_daemon(abs_dir: &str) -> Result<()> {
     ui::info("Starting Firecracker...");
@@ -51,8 +56,42 @@ fn start_firecracker_daemon(abs_dir: &str) -> Result<()> {
     ))
 }
 
-/// Send API PUT request to Firecracker (run inside the VM).
+/// Start a Firecracker daemon in a per-VM directory with its own socket.
+fn start_vm_firecracker(abs_dir: &str, abs_socket: &str) -> Result<()> {
+    ui::info("Starting Firecracker...");
+    run_in_vm_visible(&format!(
+        r#"
+        mkdir -p {dir}
+        sudo rm -f {socket}
+        touch {dir}/firecracker.log
+        sudo bash -c 'nohup setsid firecracker --api-sock {socket} --enable-pci \
+            </dev/null >{dir}/firecracker.log 2>&1 &
+            echo $! > {dir}/fc.pid'
+
+        echo "[mvm] Waiting for API socket..."
+        for i in $(seq 1 30); do
+            [ -S {socket} ] && break
+            sleep 0.1
+        done
+
+        if [ ! -S {socket} ]; then
+            echo "[mvm] ERROR: API socket did not appear." >&2
+            exit 1
+        fi
+        echo "[mvm] Firecracker started."
+        "#,
+        socket = abs_socket,
+        dir = abs_dir,
+    ))
+}
+
+/// Send API PUT request to Firecracker via its Unix socket.
 fn api_put(path: &str, data: &str) -> Result<()> {
+    api_put_socket(API_SOCKET, path, data)
+}
+
+/// Send API PUT request to a specific Firecracker socket.
+fn api_put_socket(socket: &str, path: &str, data: &str) -> Result<()> {
     let script = format!(
         r#"
         response=$(sudo curl -s -w "\n%{{http_code}}" -X PUT --unix-socket {socket} \
@@ -64,14 +103,14 @@ fn api_put(path: &str, data: &str) -> Result<()> {
             exit 1
         fi
         "#,
-        socket = API_SOCKET,
+        socket = socket,
         path = path,
         data = data,
     );
     run_in_vm_visible(&script)
 }
 
-/// Configure the microVM via the Firecracker API.
+/// Configure the microVM via the Firecracker API (dev-mode, legacy).
 fn configure_microvm(state: &MvmState, abs_dir: &str) -> Result<()> {
     ui::info("Configuring logger...");
     api_put(
@@ -85,9 +124,10 @@ fn configure_microvm(state: &MvmState, abs_dir: &str) -> Result<()> {
     let kernel_path = format!("{}/{}", abs_dir, state.kernel);
     let rootfs_path = format!("{}/{}", abs_dir, state.rootfs);
 
-    // Use kernel cmdline IP params (no SSH-based guest network config)
+    // Use kernel cmdline IP params (no SSH-based guest network config).
+    // net.ifnames=0 forces classic eth0 naming when PCI is enabled.
     let kernel_boot_args = format!(
-        "console=ttyS0 reboot=k panic=1 ip={guest}::{gateway}:255.255.255.252::eth0:off",
+        "console=ttyS0 reboot=k panic=1 net.ifnames=0 ip={guest}::{gateway}:255.255.255.252::eth0:off",
         guest = GUEST_IP,
         gateway = TAP_IP,
     );
@@ -171,7 +211,7 @@ pub fn start() -> Result<()> {
     Ok(())
 }
 
-/// Stop the microVM: kill Firecracker, clean up networking.
+/// Stop the microVM: kill Firecracker, clean up networking (legacy dev-mode).
 pub fn stop() -> Result<()> {
     require_linux_env()?;
 
@@ -262,19 +302,27 @@ fn read_state_or_discover() -> Result<MvmState> {
 }
 
 // ============================================================================
-// Flake-based run: build from Nix flake artifacts, boot headless FC VM
+// Flake-based run: multi-VM with bridge networking
 // ============================================================================
 
 /// Configuration for running a Firecracker VM from flake-built artifacts.
 pub struct FlakeRunConfig {
+    /// VM name (user-provided or auto-generated).
+    pub name: String,
+    /// Network slot for this VM.
+    pub slot: VmSlot,
     /// Absolute path to the kernel image inside the Lima VM.
     pub vmlinux_path: String,
+    /// Absolute path to the initial ramdisk (NixOS stage-1), if present.
+    pub initrd_path: Option<String>,
     /// Absolute path to the root filesystem inside the Lima VM.
     pub rootfs_path: String,
     /// Nix store revision hash.
     pub revision_hash: String,
     /// Original flake reference (for display / status).
     pub flake_ref: String,
+    /// Flake profile name (e.g. "worker", "gateway"), if specified.
+    pub profile: Option<String>,
     /// Number of vCPUs.
     pub cpus: u32,
     /// Memory in MiB.
@@ -285,55 +333,208 @@ pub struct FlakeRunConfig {
 
 /// Boot a Firecracker VM from flake-built artifacts (headless).
 ///
-/// MicroVMs never have SSH enabled. They run as headless workloads and
-/// communicate via vsock. Use `mvm shell` to access the Lima VM environment.
+/// Each VM gets its own directory under ~/microvm/vms/<name>/ with a
+/// separate Firecracker socket, PID file, and log.  The bridge network
+/// is shared, but each VM has its own TAP device and guest IP.
 pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
     require_linux_env()?;
 
-    // Stop any existing FC instance
-    if firecracker::is_running()? {
-        ui::info("Stopping existing microVM...");
-        stop()?;
+    let slot = &config.slot;
+
+    // Check if this VM name is already running
+    let abs_dir = resolve_vm_dir(slot)?;
+    let abs_socket = format!("{}/fc.socket", abs_dir);
+    let pid_file = format!("{}/fc.pid", abs_dir);
+
+    if firecracker::is_vm_running(&pid_file)? {
+        ui::info(&format!("VM '{}' is already running.", slot.name));
+        ui::info("Use 'mvm stop <name>' to shut it down first.");
+        return Ok(());
     }
 
-    // Set up TAP/NAT network (dev-mode 172.16.0.x)
-    network::setup()?;
+    // Ensure bridge network exists (idempotent)
+    network::bridge_ensure()?;
 
-    // Use ~/microvm/ as the working dir so stop() can find .fc-pid
-    let abs_dir = resolve_microvm_dir()?;
+    // Create TAP device for this VM
+    network::tap_create(slot)?;
 
-    // Start Firecracker daemon
-    start_firecracker_daemon(&abs_dir)?;
+    // Start Firecracker daemon in per-VM directory
+    start_vm_firecracker(&abs_dir, &abs_socket)?;
 
     // Configure VM via Firecracker API
-    configure_flake_microvm(config, &abs_dir)?;
+    configure_flake_microvm(config, &abs_dir, &abs_socket)?;
 
     // Boot the instance
     ui::info("Starting microVM...");
     std::thread::sleep(std::time::Duration::from_millis(15));
-    api_put("/actions", r#"{"action_type": "InstanceStart"}"#)?;
+    api_put_socket(
+        &abs_socket,
+        "/actions",
+        r#"{"action_type": "InstanceStart"}"#,
+    )?;
 
     // Persist run info for `mvm status`
-    write_run_info(config)?;
+    write_vm_run_info(config, &abs_dir)?;
 
     ui::banner(&[
-        "MicroVM is running!",
+        &format!("MicroVM '{}' is running!", config.name),
         "",
-        &format!("  Guest IP: {}", GUEST_IP),
+        &format!("  Guest IP: {}", slot.guest_ip),
         &format!("  Revision: {}", config.revision_hash),
         "",
-        "Use 'mvm status' to check the microVM.",
-        "Use 'mvm stop' to shut down the microVM.",
-        "Use 'mvm shell' to access the Lima VM environment.",
+        &format!("Use 'mvm stop {}' to shut down this VM.", config.name),
+        "Use 'mvm status' to list all running VMs.",
     ]);
 
     Ok(())
 }
 
-/// Configure a flake-built microVM via the Firecracker API.
-fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str) -> Result<()> {
+/// Stop a specific named VM.
+pub fn stop_vm(name: &str) -> Result<()> {
+    require_linux_env()?;
+
+    let abs_vms = run_in_vm_stdout(&format!("echo {}", VMS_DIR))?;
+    let abs_dir = format!("{}/{}", abs_vms, name);
+    let pid_file = format!("{}/fc.pid", abs_dir);
+    let socket = format!("{}/fc.socket", abs_dir);
+
+    if !firecracker::is_vm_running(&pid_file)? {
+        ui::info(&format!("VM '{}' is not running.", name));
+        return Ok(());
+    }
+
+    ui::info(&format!("Stopping VM '{}'...", name));
+
+    // Try graceful shutdown
+    let _ = run_in_vm(&format!(
+        r#"sudo curl -s -X PUT --unix-socket {socket} \
+            --data '{{"action_type": "SendCtrlAltDel"}}' \
+            "http://localhost/actions" 2>/dev/null || true"#,
+        socket = socket,
+    ));
+
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    // Force kill and clean up
+    run_in_vm(&format!(
+        r#"
+        if [ -f {pid} ]; then
+            sudo kill $(cat {pid}) 2>/dev/null || true
+        fi
+        sudo rm -f {socket}
+        "#,
+        pid = pid_file,
+        socket = socket,
+    ))?;
+
+    // Read run info to find the TAP device to destroy
+    if let Some(info) = read_vm_run_info_from(&abs_dir)
+        && let Some(ref vm_name) = info.name
+    {
+        // Reconstruct slot to find TAP name — scan for the index
+        if let Some(idx) = read_slot_index(&abs_dir) {
+            let slot = VmSlot::new(vm_name, idx);
+            let _ = network::tap_destroy(&slot);
+        }
+    }
+
+    // Remove the VM directory
+    let _ = run_in_vm(&format!("rm -rf {}", abs_dir));
+
+    ui::success(&format!("VM '{}' stopped.", name));
+    Ok(())
+}
+
+/// Stop all running VMs.
+pub fn stop_all_vms() -> Result<()> {
+    require_linux_env()?;
+
+    let vms = list_vms()?;
+    if vms.is_empty() {
+        ui::info("No VMs are running.");
+        return Ok(());
+    }
+
+    for info in &vms {
+        if let Some(ref name) = info.name {
+            stop_vm(name)?;
+        }
+    }
+
+    // Clean up bridge if no VMs left
+    let remaining = list_vms()?;
+    if remaining.is_empty() {
+        network::bridge_teardown()?;
+    }
+
+    Ok(())
+}
+
+/// List all running VMs by scanning ~/microvm/vms/*/run-info.json.
+pub fn list_vms() -> Result<Vec<RunInfo>> {
+    let output = run_in_vm_stdout(&format!(
+        "for f in {dir}/*/run-info.json; do [ -f \"$f\" ] && cat \"$f\"; done 2>/dev/null || true",
+        dir = VMS_DIR,
+    ))?;
+
+    let mut vms = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(info) = serde_json::from_str::<RunInfo>(line) {
+            // Verify the VM is actually running
+            if let Some(ref name) = info.name {
+                let abs_vms = run_in_vm_stdout(&format!("echo {}", VMS_DIR))?;
+                let pid_file = format!("{}/{}/fc.pid", abs_vms, name);
+                if firecracker::is_vm_running(&pid_file).unwrap_or(false) {
+                    vms.push(info);
+                }
+            }
+        }
+    }
+
+    Ok(vms)
+}
+
+/// Allocate the next free slot index by scanning existing VMs.
+pub fn allocate_slot(name: &str) -> Result<VmSlot> {
+    let output = run_in_vm_stdout(&format!(
+        r#"for f in {dir}/*/run-info.json; do [ -f "$f" ] && cat "$f"; done 2>/dev/null || true"#,
+        dir = VMS_DIR,
+    ))?;
+
+    let mut used_indices: Vec<u8> = Vec::new();
+    for line in output.lines() {
+        let line = line.trim();
+        if line.is_empty() {
+            continue;
+        }
+        if let Ok(info) = serde_json::from_str::<serde_json::Value>(line)
+            && let Some(idx) = info.get("slot_index").and_then(|v| v.as_u64())
+        {
+            used_indices.push(idx as u8);
+        }
+    }
+
+    // Find first free index (0..253, since IP = index + 2, max 255)
+    for i in 0..253u8 {
+        if !used_indices.contains(&i) {
+            return Ok(VmSlot::new(name, i));
+        }
+    }
+
+    anyhow::bail!("No free VM slots available (max 253 VMs)")
+}
+
+/// Configure a flake-built microVM via the Firecracker API (multi-VM).
+fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str, socket: &str) -> Result<()> {
+    let slot = &config.slot;
+
     ui::info("Configuring logger...");
-    api_put(
+    api_put_socket(
+        socket,
         "/logger",
         &format!(
             r#"{{"log_path": "{dir}/firecracker.log", "level": "Debug", "show_level": true, "show_log_origin": true}}"#,
@@ -341,28 +542,42 @@ fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str) -> Result<()>
         ),
     )?;
 
-    // Boot args with static IP configuration via kernel cmdline
+    // Boot args: pass guest IP and gateway via kernel cmdline so the
+    // NixOS guest (systemd-networkd + mvm-network-config service) can
+    // configure eth0 without DHCP.
     let boot_args = format!(
-        "console=ttyS0 reboot=k panic=1 ip={guest}::{gateway}:255.255.255.252::eth0:off",
-        guest = GUEST_IP,
-        gateway = TAP_IP,
+        "console=ttyS0 reboot=k panic=1 net.ifnames=0 mvm.ip={ip}/24 mvm.gw={gw}",
+        ip = slot.guest_ip,
+        gw = BRIDGE_IP,
     );
 
     ui::info(&format!("Setting boot source: {}", config.vmlinux_path));
-    api_put(
-        "/boot-source",
-        &format!(
-            r#"{{"kernel_image_path": "{kernel}", "boot_args": "{args}"}}"#,
-            kernel = config.vmlinux_path,
-            args = boot_args,
-        ),
-    )?;
+    let boot_source = match &config.initrd_path {
+        Some(initrd) => {
+            ui::info(&format!("Using initrd: {}", initrd));
+            format!(
+                r#"{{"kernel_image_path": "{kernel}", "boot_args": "{args}", "initrd_path": "{initrd}"}}"#,
+                kernel = config.vmlinux_path,
+                args = boot_args,
+                initrd = initrd,
+            )
+        }
+        None => {
+            format!(
+                r#"{{"kernel_image_path": "{kernel}", "boot_args": "{args}"}}"#,
+                kernel = config.vmlinux_path,
+                args = boot_args,
+            )
+        }
+    };
+    api_put_socket(socket, "/boot-source", &boot_source)?;
 
     ui::info(&format!(
         "Setting machine config: {} vCPUs, {} MiB",
         config.cpus, config.memory
     ));
-    api_put(
+    api_put_socket(
+        socket,
         "/machine-config",
         &format!(
             r#"{{"vcpu_count": {cpus}, "mem_size_mib": {mem}}}"#,
@@ -372,7 +587,8 @@ fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str) -> Result<()>
     )?;
 
     ui::info(&format!("Setting rootfs: {}", config.rootfs_path));
-    api_put(
+    api_put_socket(
+        socket,
         "/drives/rootfs",
         &format!(
             r#"{{"drive_id": "rootfs", "path_on_host": "{rootfs}", "is_root_device": true, "is_read_only": false}}"#,
@@ -386,7 +602,8 @@ fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str) -> Result<()>
             "Attaching volume {} -> {} (size {})",
             vol.host, vol.guest, vol.size
         ));
-        api_put(
+        api_put_socket(
+            socket,
             &format!("/drives/{}", drive_id),
             &format!(
                 r#"{{"drive_id": "{id}", "path_on_host": "{host}", "is_root_device": false, "is_read_only": false}}"#,
@@ -396,36 +613,74 @@ fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str) -> Result<()>
         )?;
     }
 
-    ui::info("Setting network interface...");
-    api_put(
+    ui::info(&format!(
+        "Setting network interface: {} (MAC {})",
+        slot.tap_dev, slot.mac
+    ));
+    api_put_socket(
+        socket,
         "/network-interfaces/net1",
         &format!(
             r#"{{"iface_id": "net1", "guest_mac": "{mac}", "host_dev_name": "{tap}"}}"#,
-            mac = FC_MAC,
-            tap = TAP_DEV,
+            mac = slot.mac,
+            tap = slot.tap_dev,
         ),
     )?;
 
     Ok(())
 }
 
-/// Persist run info so `mvm status` can distinguish run modes.
-fn write_run_info(config: &FlakeRunConfig) -> Result<()> {
+/// Persist run info for a named VM.
+fn write_vm_run_info(config: &FlakeRunConfig, abs_dir: &str) -> Result<()> {
     let info = RunInfo {
         mode: "flake".to_string(),
+        name: Some(config.name.clone()),
         revision: Some(config.revision_hash.clone()),
         flake_ref: Some(config.flake_ref.clone()),
+        guest_ip: Some(config.slot.guest_ip.clone()),
+        profile: config.profile.clone(),
         guest_user: String::new(),
         cpus: config.cpus,
         memory: config.memory,
     };
-    let json = serde_json::to_string(&info)?;
+
+    // Also store slot_index for allocation tracking
+    let mut json_value = serde_json::to_value(&info)?;
+    if let Some(obj) = json_value.as_object_mut() {
+        obj.insert(
+            "slot_index".to_string(),
+            serde_json::Value::Number(config.slot.index.into()),
+        );
+    }
+
+    let json = serde_json::to_string(&json_value)?;
     run_in_vm(&format!(
-        "echo '{}' > {dir}/.mvm-run-info",
+        "echo '{}' > {dir}/run-info.json",
         json,
-        dir = MICROVM_DIR,
+        dir = abs_dir,
     ))?;
     Ok(())
+}
+
+/// Read run info from a specific VM directory.
+fn read_vm_run_info_from(abs_dir: &str) -> Option<RunInfo> {
+    let json = run_in_vm_stdout(&format!(
+        "cat {dir}/run-info.json 2>/dev/null || echo 'null'",
+        dir = abs_dir,
+    ))
+    .ok()?;
+    serde_json::from_str(&json).ok()
+}
+
+/// Read the slot_index from a VM's run-info.json.
+fn read_slot_index(abs_dir: &str) -> Option<u8> {
+    let json = run_in_vm_stdout(&format!(
+        "cat {dir}/run-info.json 2>/dev/null || echo 'null'",
+        dir = abs_dir,
+    ))
+    .ok()?;
+    let value: serde_json::Value = serde_json::from_str(&json).ok()?;
+    value.get("slot_index")?.as_u64().map(|v| v as u8)
 }
 
 /// Read persisted run info (returns None if file doesn't exist).

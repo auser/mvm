@@ -14,6 +14,7 @@ mvm-runtime = { path = "../mvm-runtime", version = "0.3.0" }
 mvm-build = { path = "../mvm-build", version = "0.3.0" }
 anyhow.workspace = true
 chrono.workspace = true
+names.workspace = true
 clap.workspace = true
 reqwest.workspace = true
 clap_complete.workspace = true

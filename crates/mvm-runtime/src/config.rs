@@ -14,6 +14,42 @@ pub const FC_MAC: &str = "06:00:AC:10:00:02";
 pub const MICROVM_DIR: &str = "~/microvm";
 pub const LOGFILE: &str = "~/microvm/firecracker.log";
 
+// --- Multi-VM bridge networking ---
+pub const BRIDGE_DEV: &str = "br-mvm";
+pub const BRIDGE_IP: &str = "172.16.0.1";
+pub const BRIDGE_CIDR: &str = "172.16.0.1/24";
+/// Directory holding per-VM state: ~/microvm/vms/<name>/
+pub const VMS_DIR: &str = "~/microvm/vms";
+
+/// Per-VM network + filesystem identity, derived from a slot index.
+#[derive(Debug, Clone)]
+pub struct VmSlot {
+    pub name: String,
+    pub index: u8,
+    pub tap_dev: String,
+    pub mac: String,
+    pub guest_ip: String,
+    pub vm_dir: String,
+    pub api_socket: String,
+}
+
+impl VmSlot {
+    /// Create a slot from a name and 0-based index.
+    /// Index N → guest IP 172.16.0.{N+2}, TAP tap{N}.
+    pub fn new(name: &str, index: u8) -> Self {
+        let ip_octet = index + 2;
+        Self {
+            name: name.to_string(),
+            index,
+            tap_dev: format!("tap{}", index),
+            mac: format!("06:00:AC:10:00:{:02x}", ip_octet),
+            guest_ip: format!("172.16.0.{}", ip_octet),
+            vm_dir: format!("{}/{}", VMS_DIR, name),
+            api_socket: format!("{}/{}/fc.socket", VMS_DIR, name),
+        }
+    }
+}
+
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct MvmState {
     pub kernel: String,
@@ -30,9 +66,15 @@ pub struct RunInfo {
     /// "dev" or "flake"
     pub mode: String,
     #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
     pub revision: Option<String>,
     #[serde(default)]
     pub flake_ref: Option<String>,
+    #[serde(default)]
+    pub guest_ip: Option<String>,
+    #[serde(default)]
+    pub profile: Option<String>,
     pub guest_user: String,
     pub cpus: u32,
     pub memory: u32,
@@ -176,6 +218,39 @@ mod tests {
         assert!(!TAP_IP.is_empty());
         assert!(!GUEST_IP.is_empty());
         assert!(!FC_MAC.is_empty());
+        assert!(!BRIDGE_DEV.is_empty());
+        assert!(!BRIDGE_IP.is_empty());
+        assert!(!BRIDGE_CIDR.is_empty());
+        assert!(!VMS_DIR.is_empty());
+    }
+
+    #[test]
+    fn test_vm_slot_new_index_0() {
+        let slot = VmSlot::new("gw", 0);
+        assert_eq!(slot.name, "gw");
+        assert_eq!(slot.index, 0);
+        assert_eq!(slot.tap_dev, "tap0");
+        assert_eq!(slot.mac, "06:00:AC:10:00:02");
+        assert_eq!(slot.guest_ip, "172.16.0.2");
+        assert!(slot.vm_dir.ends_with("/vms/gw"));
+        assert!(slot.api_socket.ends_with("/vms/gw/fc.socket"));
+    }
+
+    #[test]
+    fn test_vm_slot_new_index_1() {
+        let slot = VmSlot::new("w1", 1);
+        assert_eq!(slot.index, 1);
+        assert_eq!(slot.tap_dev, "tap1");
+        assert_eq!(slot.mac, "06:00:AC:10:00:03");
+        assert_eq!(slot.guest_ip, "172.16.0.3");
+    }
+
+    #[test]
+    fn test_vm_slot_new_index_10() {
+        let slot = VmSlot::new("worker-10", 10);
+        assert_eq!(slot.tap_dev, "tap10");
+        assert_eq!(slot.mac, "06:00:AC:10:00:0c");
+        assert_eq!(slot.guest_ip, "172.16.0.12");
     }
 
     #[test]
@@ -231,8 +306,11 @@ mod tests {
     fn test_run_info_json_roundtrip() {
         let info = RunInfo {
             mode: "flake".to_string(),
+            name: Some("gw".to_string()),
             revision: Some("abc123".to_string()),
             flake_ref: Some("/home/user/project".to_string()),
+            guest_ip: Some("172.16.0.2".to_string()),
+            profile: Some("gateway".to_string()),
             guest_user: "root".to_string(),
             cpus: 4,
             memory: 2048,
@@ -240,8 +318,11 @@ mod tests {
         let json = serde_json::to_string(&info).unwrap();
         let parsed: RunInfo = serde_json::from_str(&json).unwrap();
         assert_eq!(parsed.mode, "flake");
+        assert_eq!(parsed.name.as_deref(), Some("gw"));
         assert_eq!(parsed.revision.as_deref(), Some("abc123"));
         assert_eq!(parsed.flake_ref.as_deref(), Some("/home/user/project"));
+        assert_eq!(parsed.guest_ip.as_deref(), Some("172.16.0.2"));
+        assert_eq!(parsed.profile.as_deref(), Some("gateway"));
         assert_eq!(parsed.guest_user, "root");
         assert_eq!(parsed.cpus, 4);
         assert_eq!(parsed.memory, 2048);
@@ -251,8 +332,11 @@ mod tests {
     fn test_run_info_default() {
         let info = RunInfo::default();
         assert!(info.mode.is_empty());
+        assert!(info.name.is_none());
         assert!(info.revision.is_none());
         assert!(info.flake_ref.is_none());
+        assert!(info.guest_ip.is_none());
+        assert!(info.profile.is_none());
         assert!(info.guest_user.is_empty());
         assert_eq!(info.cpus, 0);
         assert_eq!(info.memory, 0);

@@ -12,6 +12,8 @@ pub struct DevBuildResult {
     pub build_dir: String,
     /// Path to the kernel image.
     pub vmlinux_path: String,
+    /// Path to the initial ramdisk (NixOS stage-1), if present.
+    pub initrd_path: Option<String>,
     /// Path to the root filesystem.
     pub rootfs_path: String,
     /// Nix store hash used as the revision identifier.
@@ -67,8 +69,10 @@ pub fn dev_build(
     // Step 4: Check cache — skip copy if artifacts already exist
     if check_cache(env, &revision_hash)? {
         env.log_success(&format!("Cache hit: {}", build_dir));
+        let initrd_path = detect_initrd(env, &build_dir);
         return Ok(DevBuildResult {
             vmlinux_path: format!("{}/vmlinux", build_dir),
+            initrd_path,
             rootfs_path: format!("{}/rootfs.ext4", build_dir),
             build_dir,
             revision_hash,
@@ -81,8 +85,10 @@ pub fn dev_build(
 
     env.log_success(&format!("Artifacts stored at {}", build_dir));
 
+    let initrd_path = detect_initrd(env, &build_dir);
     Ok(DevBuildResult {
         vmlinux_path: format!("{}/vmlinux", build_dir),
+        initrd_path,
         rootfs_path: format!("{}/rootfs.ext4", build_dir),
         build_dir,
         revision_hash,
@@ -139,7 +145,7 @@ fn check_cache(env: &dyn ShellEnvironment, revision_hash: &str) -> Result<bool> 
     Ok(result.trim() == "yes")
 }
 
-/// Copy kernel and rootfs from a Nix store output to the dev build directory.
+/// Copy kernel, initrd, and rootfs from a Nix store output to the dev build directory.
 fn copy_dev_artifacts(
     env: &dyn ShellEnvironment,
     nix_output_path: &str,
@@ -162,6 +168,11 @@ fn copy_dev_artifacts(
             exit 1
         fi
 
+        # Copy initrd if present (NixOS stage-1 for proper activation)
+        if [ -e {out}/initrd ]; then
+            cp -L {out}/initrd {dir}/initrd
+        fi
+
         # Copy rootfs (try 'rootfs' then 'rootfs.ext4')
         if [ -e {out}/rootfs ]; then
             cp -L {out}/rootfs {dir}/rootfs.ext4
@@ -180,6 +191,19 @@ fn copy_dev_artifacts(
         dir = build_dir,
     ))
     .with_context(|| format!("Failed to copy artifacts to {}", build_dir))
+}
+
+/// Check whether an initrd exists in the build directory.
+fn detect_initrd(env: &dyn ShellEnvironment, build_dir: &str) -> Option<String> {
+    let path = format!("{}/initrd", build_dir);
+    let result = env
+        .shell_exec_stdout(&format!("test -f {} && echo yes || echo no", path))
+        .ok()?;
+    if result.trim() == "yes" {
+        Some(path)
+    } else {
+        None
+    }
 }
 
 /// Return the Nix system identifier for the current architecture.
@@ -398,6 +422,7 @@ mod tests {
         let result = DevBuildResult {
             build_dir: "/var/lib/mvm/dev/builds/hash123".to_string(),
             vmlinux_path: "/var/lib/mvm/dev/builds/hash123/vmlinux".to_string(),
+            initrd_path: Some("/var/lib/mvm/dev/builds/hash123/initrd".to_string()),
             rootfs_path: "/var/lib/mvm/dev/builds/hash123/rootfs.ext4".to_string(),
             revision_hash: "hash123".to_string(),
             cached: false,
@@ -405,5 +430,12 @@ mod tests {
 
         assert!(result.vmlinux_path.starts_with(&result.build_dir));
         assert!(result.rootfs_path.starts_with(&result.build_dir));
+        assert!(
+            result
+                .initrd_path
+                .as_ref()
+                .unwrap()
+                .starts_with(&result.build_dir)
+        );
     }
 }

@@ -30,8 +30,7 @@
   systemd.services.openclaw-worker = {
     description = "OpenClaw Worker";
     after = [ "network-online.target" "mnt-config.mount" "mnt-secrets.mount" ];
-    wants = [ "network-online.target" ];
-    requires = [ "mnt-config.mount" "mnt-secrets.mount" ];
+    wants = [ "network-online.target" "mnt-config.mount" "mnt-secrets.mount" ];
     wantedBy = [ "multi-user.target" ];
 
     serviceConfig = {
