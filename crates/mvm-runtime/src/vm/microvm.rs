@@ -1,10 +1,21 @@
 use anyhow::Result;
+use mvm_core::platform;
 
 use super::{firecracker, lima, network};
 use crate::config::*;
 use crate::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
 use crate::ui;
 use crate::vm::image::RuntimeVolume;
+
+/// Ensure we have a Linux execution environment.
+/// On macOS: checks that the Lima VM is running.
+/// On native Linux (including inside Lima): no-op.
+fn require_linux_env() -> Result<()> {
+    if platform::current().needs_lima() {
+        lima::require_running()?;
+    }
+    Ok(())
+}
 
 /// Resolve MICROVM_DIR (~) to an absolute path inside the Lima VM.
 fn resolve_microvm_dir() -> Result<String> {
@@ -118,7 +129,7 @@ fn configure_microvm(state: &MvmState, abs_dir: &str) -> Result<()> {
 /// MicroVMs never have SSH enabled. They run as headless workloads and
 /// communicate via vsock. Use `mvm shell` to access the Lima VM environment.
 pub fn start() -> Result<()> {
-    lima::require_running()?;
+    require_linux_env()?;
 
     // Check if already running
     if firecracker::is_running()? {
@@ -162,7 +173,7 @@ pub fn start() -> Result<()> {
 
 /// Stop the microVM: kill Firecracker, clean up networking.
 pub fn stop() -> Result<()> {
-    lima::require_running()?;
+    require_linux_env()?;
 
     if !firecracker::is_running()? {
         ui::info("MicroVM is not running.");
@@ -277,7 +288,7 @@ pub struct FlakeRunConfig {
 /// MicroVMs never have SSH enabled. They run as headless workloads and
 /// communicate via vsock. Use `mvm shell` to access the Lima VM environment.
 pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
-    lima::require_running()?;
+    require_linux_env()?;
 
     // Stop any existing FC instance
     if firecracker::is_running()? {
