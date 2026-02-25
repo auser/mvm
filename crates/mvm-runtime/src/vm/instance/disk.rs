@@ -10,7 +10,7 @@ pub fn ensure_data_disk(instance_dir: &str, size_mib: u32) -> Result<String> {
         mkdir -p {dir}/volumes
         if [ ! -f {path} ]; then
             truncate -s {size}M {path}
-            mkfs.ext4 -q {path}
+            mkfs.ext4 -q -L mvm-data {path}
         fi
         "#,
         dir = instance_dir,
@@ -39,7 +39,7 @@ pub fn create_secrets_disk(instance_dir: &str, secrets_json_path: &str) -> Resul
         # Create tmpfs-backed secrets image (16M, never persisted to real disk)
         TMPFS_DIR=$(mktemp -d -p /dev/shm mvm-secrets-XXXXXX)
         truncate -s 16M "$TMPFS_DIR/secrets.ext4"
-        mkfs.ext4 -q "$TMPFS_DIR/secrets.ext4"
+        mkfs.ext4 -q -L mvm-secrets "$TMPFS_DIR/secrets.ext4"
 
         # Mount, populate, unmount
         MOUNT_DIR=$(mktemp -d)
@@ -86,7 +86,7 @@ pub fn create_config_disk(instance_dir: &str, config_json: &str) -> Result<Strin
 
         # Create a small ext4 image (4M)
         truncate -s 4M {path}
-        mkfs.ext4 -q {path}
+        mkfs.ext4 -q -L mvm-config {path}
 
         # Mount, populate, unmount
         MOUNT_DIR=$(mktemp -d)

@@ -1,6 +1,6 @@
 use anyhow::{Context, Result};
 
-use mvm_core::build_env::BuildEnvironment;
+use mvm_core::build_env::ShellEnvironment;
 use mvm_core::pool::Role;
 
 use crate::nix_manifest::NixManifest;
@@ -29,7 +29,7 @@ pub struct DevBuildResult {
 /// kernel and rootfs to a dev build directory keyed by Nix store hash.
 /// Re-running the same build is a near-instant cache hit.
 pub fn dev_build(
-    env: &dyn BuildEnvironment,
+    env: &dyn ShellEnvironment,
     flake_ref: &str,
     profile: &str,
     role: &Role,
@@ -97,7 +97,7 @@ pub fn dev_build(
 /// uses the role-aware attribute `<flake>#packages.<system>.tenant-<role>-<profile>`.
 /// Otherwise falls back to `<flake>#packages.<system>.tenant-<profile>`.
 fn resolve_dev_build_attribute(
-    env: &dyn BuildEnvironment,
+    env: &dyn ShellEnvironment,
     flake_ref: &str,
     role: &Role,
     profile: &str,
@@ -150,7 +150,7 @@ fn dev_build_dir(revision_hash: &str) -> String {
 }
 
 /// Check whether cached artifacts exist for a revision hash.
-fn check_cache(env: &dyn BuildEnvironment, revision_hash: &str) -> Result<bool> {
+fn check_cache(env: &dyn ShellEnvironment, revision_hash: &str) -> Result<bool> {
     let build_dir = dev_build_dir(revision_hash);
     let result = env.shell_exec_stdout(&format!(
         "test -f {dir}/vmlinux && test -f {dir}/rootfs.ext4 && echo yes || echo no",
@@ -161,7 +161,7 @@ fn check_cache(env: &dyn BuildEnvironment, revision_hash: &str) -> Result<bool> 
 
 /// Copy kernel and rootfs from a Nix store output to the dev build directory.
 fn copy_dev_artifacts(
-    env: &dyn BuildEnvironment,
+    env: &dyn ShellEnvironment,
     nix_output_path: &str,
     build_dir: &str,
 ) -> Result<()> {
@@ -217,7 +217,7 @@ mod tests {
     use std::collections::HashMap;
     use std::sync::Mutex;
 
-    /// Mock BuildEnvironment for testing dev_build logic without a real VM.
+    /// Mock ShellEnvironment for testing dev_build logic without a real VM.
     struct TestEnv {
         stdout_responses: Mutex<HashMap<String, String>>,
         exec_log: Mutex<Vec<String>>,
@@ -241,7 +241,7 @@ mod tests {
         }
     }
 
-    impl BuildEnvironment for TestEnv {
+    impl ShellEnvironment for TestEnv {
         fn shell_exec(&self, script: &str) -> Result<()> {
             self.exec_log.lock().unwrap().push(script.to_string());
             Ok(())
@@ -261,43 +261,6 @@ mod tests {
         fn shell_exec_visible(&self, script: &str) -> Result<()> {
             self.exec_log.lock().unwrap().push(script.to_string());
             Ok(())
-        }
-
-        fn load_pool_spec(
-            &self,
-            _tenant_id: &str,
-            _pool_id: &str,
-        ) -> Result<mvm_core::pool::PoolSpec> {
-            unimplemented!("not needed for dev_build tests")
-        }
-
-        fn load_tenant_config(&self, _tenant_id: &str) -> Result<mvm_core::tenant::TenantConfig> {
-            unimplemented!("not needed for dev_build tests")
-        }
-
-        fn ensure_bridge(&self, _net: &mvm_core::tenant::TenantNet) -> Result<()> {
-            unimplemented!("not needed for dev_build tests")
-        }
-
-        fn setup_tap(
-            &self,
-            _net: &mvm_core::instance::InstanceNet,
-            _bridge_name: &str,
-        ) -> Result<()> {
-            unimplemented!("not needed for dev_build tests")
-        }
-
-        fn teardown_tap(&self, _tap_dev: &str) -> Result<()> {
-            unimplemented!("not needed for dev_build tests")
-        }
-
-        fn record_revision(
-            &self,
-            _tenant_id: &str,
-            _pool_id: &str,
-            _revision: &mvm_core::pool::BuildRevision,
-        ) -> Result<()> {
-            unimplemented!("not needed for dev_build tests")
         }
 
         fn log_info(&self, msg: &str) {

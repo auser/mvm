@@ -8,7 +8,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 
 use anyhow::Result;
-use mvm_core::build_env::BuildEnvironment;
+use mvm_core::build_env::{BuildEnvironment, ShellEnvironment};
 use mvm_core::instance::InstanceNet;
 use mvm_core::pool::{
     ArtifactPaths, BuildRevision, DesiredCounts, InstanceResources, PoolSpec, Role,
@@ -52,7 +52,7 @@ impl TestBuildEnv {
     }
 }
 
-impl BuildEnvironment for TestBuildEnv {
+impl ShellEnvironment for TestBuildEnv {
     fn shell_exec(&self, script: &str) -> Result<()> {
         self.shell_cmds.lock().unwrap().push(script.to_string());
         Ok(())
@@ -68,30 +68,6 @@ impl BuildEnvironment for TestBuildEnv {
 
     fn shell_exec_visible(&self, script: &str) -> Result<()> {
         self.shell_cmds.lock().unwrap().push(script.to_string());
-        Ok(())
-    }
-
-    fn load_pool_spec(&self, _t: &str, _p: &str) -> Result<PoolSpec> {
-        Ok(self.pool_spec.clone())
-    }
-
-    fn load_tenant_config(&self, _t: &str) -> Result<TenantConfig> {
-        Ok(self.tenant_config.clone())
-    }
-
-    fn ensure_bridge(&self, _net: &TenantNet) -> Result<()> {
-        Ok(())
-    }
-
-    fn setup_tap(&self, _net: &InstanceNet, _bridge: &str) -> Result<()> {
-        Ok(())
-    }
-
-    fn teardown_tap(&self, _tap: &str) -> Result<()> {
-        Ok(())
-    }
-
-    fn record_revision(&self, _t: &str, _p: &str, _rev: &BuildRevision) -> Result<()> {
         Ok(())
     }
 
@@ -114,6 +90,32 @@ impl BuildEnvironment for TestBuildEnv {
             .lock()
             .unwrap()
             .push(("warn".into(), msg.to_string()));
+    }
+}
+
+impl BuildEnvironment for TestBuildEnv {
+    fn load_pool_spec(&self, _t: &str, _p: &str) -> Result<PoolSpec> {
+        Ok(self.pool_spec.clone())
+    }
+
+    fn load_tenant_config(&self, _t: &str) -> Result<TenantConfig> {
+        Ok(self.tenant_config.clone())
+    }
+
+    fn ensure_bridge(&self, _net: &TenantNet) -> Result<()> {
+        Ok(())
+    }
+
+    fn setup_tap(&self, _net: &InstanceNet, _bridge: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn teardown_tap(&self, _tap: &str) -> Result<()> {
+        Ok(())
+    }
+
+    fn record_revision(&self, _t: &str, _p: &str, _rev: &BuildRevision) -> Result<()> {
+        Ok(())
     }
 }
 

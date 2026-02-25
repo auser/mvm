@@ -220,33 +220,40 @@ See [docs/networking.md](docs/networking.md) for details.
 
 ## Architecture
 
-```
-src/
-  main.rs                  # CLI dispatch
-  bin/mvm-hostd.rs         # Privileged executor daemon binary
-  agent.rs                 # Reconcile loop + QUIC daemon + signed state verification
-  node.rs                  # Node identity + stats + attestation
-  infra/                   # Host/VM infrastructure (config, shell, bootstrap, UI)
-  vm/
-    microvm.rs, lima.rs    # Dev mode (unchanged)
-    tenant/                # Tenant config, lifecycle, quotas, secrets
-    pool/                  # Pool config, build, artifacts, scaling
-    instance/              # Instance state machine, lifecycle, networking, snapshots
-    bridge.rs              # Per-tenant bridge management
-    naming.rs              # ID generation + validation
-  security/                # Jailer, cgroups, seccomp, audit, mTLS certs, LUKS encryption
-    signing.rs             # Ed25519 signed desired state
-    snapshot_crypto.rs     # AES-256-GCM snapshot encryption
-    attestation.rs         # Node attestation provider (TPM2/SEV-SNP hook)
-  hostd/                   # Privilege separation (agentd/hostd split)
-    protocol.rs            # IPC types (HostdRequest/HostdResponse)
-    server.rs              # Privileged executor daemon
-    client.rs              # Agentd client for hostd IPC
-  sleep/                   # Sleep policy + idle metrics + minimum runtime enforcement
-  worker/                  # Guest worker lifecycle hooks + vsock guest agent client
+mvm is a Cargo workspace with 7 specialized crates:
+
+| Crate | Purpose |
+|-------|---------|
+| **mvm-core** | Pure types, IDs, config, protocol (no runtime deps) |
+| **mvm-guest** | Vsock protocol, OpenClaw integration state |
+| **mvm-build** | Nix builder pipeline, artifact management |
+| **mvm-runtime** | Shell execution, VM lifecycle, security ops |
+| **mvm-agent** | Reconcile engine, coordinator client, templates |
+| **mvm-coordinator** | Gateway load-balancer, TCP proxy, wake manager |
+| **mvm-cli** | Clap CLI, UI, bootstrap (depends on all) |
+
+Root facade: `src/lib.rs` re-exports all crates; `src/main.rs` delegates to `mvm_cli::run()`. Binaries: `mvm` (CLI), `mvm-hostd` (privileged daemon), `mvm-builder-agent` (guest).
+
+See [docs/architecture.md](docs/architecture.md) for the full workspace structure and module details.
+
+## Multi-Tenant Model
+
+The key insight: **a single image serves many tenants**. Tenants don't rebuild images — they reuse shared templates and get customized instances via mounted volumes.
+
+- **Secrets drive** (tmpfs) -- tenant credentials, API keys
+- **Config drive** (ext4, read-only) -- routing tables, integration manifest, identity
+- **Data disk** (ext4, optional LUKS) -- persistent tenant state
+
+Multi-pool templates like OpenClaw create gateway + worker pools automatically:
+
+```bash
+mvm new openclaw myapp
+# Creates: myapp/gateways (routes traffic) + myapp/workers (executes integrations)
 ```
 
-See [docs/architecture.md](docs/architecture.md) for the full module map.
+Sleep/wake optimization: sleeping instances consume no CPU/memory. The coordinator wakes gateways on demand (~200ms restore), which in turn wake workers as needed. Users see no downtime; the platform optimizes resource usage transparently.
+
+See [docs/onboarding.md](docs/onboarding.md) for the end-to-end workflow.
 
 ## Security
 
@@ -278,12 +285,14 @@ cargo run -- --help
 
 ## Documentation
 
-- [Architecture](docs/architecture.md) -- module map, data model, design decisions
+- [Architecture](docs/architecture.md) -- workspace structure, multi-tenant template model, design decisions
 - [Security](docs/security.md) -- threat model, privilege separation, encryption, signed state
 - [Networking](docs/networking.md) -- cluster-wide subnets, bridges, isolation
 - [CLI Reference](docs/cli.md) -- complete command reference
 - [Agent & Reconciliation](docs/agent.md) -- desired state schema, reconcile loop, QUIC API
 - [Minimum Runtime](docs/minimum-runtime.md) -- runtime policy, vsock drain protocol, drive model
+- [Onboarding](docs/onboarding.md) -- end-to-end deployment guide
+- [Development](docs/development.md) -- contributor guide, testing, CI/CD
 
 ## License
 

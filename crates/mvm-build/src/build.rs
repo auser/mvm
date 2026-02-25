@@ -4,6 +4,8 @@ use std::collections::BTreeMap;
 use crate::nix_manifest::NixManifest;
 use crate::scripts::render_script;
 use mvm_core::build_env::BuildEnvironment;
+#[cfg(test)]
+use mvm_core::build_env::ShellEnvironment;
 use mvm_core::instance::InstanceNet;
 use mvm_core::naming;
 use mvm_core::pool::{BuildRevision, pool_artifacts_dir};
@@ -291,18 +293,13 @@ fn resolve_build_attribute(
         && let Ok(manifest) = NixManifest::from_toml(&content)
         && manifest.resolve(role, profile).is_ok()
     {
-        let attr = format!(
-            "{}#packages.{}.tenant-{}-{}",
-            flake_ref, system, role, profile
-        );
-        env.log_info(&format!(
-            "Manifest found, using role-aware attribute: {}",
-            attr
-        ));
+        // Primary pattern: tenant-<role> (e.g., tenant-gateway, tenant-worker).
+        let attr = format!("{}#packages.{}.tenant-{}", flake_ref, system, role);
+        env.log_info(&format!("Manifest found, using attribute: {}", attr));
         return attr;
     }
 
-    // Fallback: legacy attribute without role
+    // Fallback without manifest: try tenant-<profile> (legacy convention).
     let attr = format!("{}#packages.{}.tenant-{}", flake_ref, system, profile);
     env.log_info(&format!(
         "No manifest found, using legacy attribute: {}",
@@ -490,7 +487,7 @@ mod tests {
         }
     }
 
-    impl BuildEnvironment for FakeEnv {
+    impl ShellEnvironment for FakeEnv {
         fn shell_exec(&self, script: &str) -> Result<()> {
             self.cmds.lock().unwrap().push(script.to_string());
             Ok(())
@@ -507,6 +504,14 @@ mod tests {
             Ok(())
         }
 
+        fn log_info(&self, _msg: &str) {}
+
+        fn log_success(&self, _msg: &str) {}
+
+        fn log_warn(&self, _msg: &str) {}
+    }
+
+    impl BuildEnvironment for FakeEnv {
         fn load_pool_spec(&self, _tenant_id: &str, _pool_id: &str) -> Result<PoolSpec> {
             unreachable!()
         }
@@ -535,12 +540,6 @@ mod tests {
         ) -> Result<()> {
             unreachable!()
         }
-
-        fn log_info(&self, _msg: &str) {}
-
-        fn log_success(&self, _msg: &str) {}
-
-        fn log_warn(&self, _msg: &str) {}
     }
 
     #[test]

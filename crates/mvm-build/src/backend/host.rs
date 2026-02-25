@@ -62,17 +62,15 @@ fn resolve_build_attribute_host(
         && let Ok(manifest) = NixManifest::from_toml(&content)
         && manifest.resolve(role, profile).is_ok()
     {
-        let attr = format!(
-            "{}#packages.{}.tenant-{}-{}",
-            flake_ref, system, role, profile
-        );
-        env.log_info(&format!(
-            "Manifest found, using role-aware attribute: {}",
-            attr
-        ));
+        // Primary pattern: tenant-<role> (e.g., tenant-gateway, tenant-worker).
+        // The flake exposes one build output per role; profile selects NixOS
+        // modules within the flake but doesn't change the output attribute.
+        let attr = format!("{}#packages.{}.tenant-{}", flake_ref, system, role);
+        env.log_info(&format!("Manifest found, using attribute: {}", attr));
         return attr;
     }
 
+    // Fallback without manifest: try tenant-<profile> (legacy convention).
     let attr = format!("{}#packages.{}.tenant-{}", flake_ref, system, profile);
     env.log_info(&format!(
         "No manifest found, using legacy attribute: {}",

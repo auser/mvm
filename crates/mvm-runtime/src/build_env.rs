@@ -1,6 +1,6 @@
 use anyhow::{Result, anyhow};
 
-use mvm_core::build_env::BuildEnvironment;
+use mvm_core::build_env::{BuildEnvironment, ShellEnvironment};
 use mvm_core::instance::InstanceNet;
 use mvm_core::pool::{BuildRevision, PoolSpec};
 use mvm_core::tenant::{TenantConfig, TenantNet};
@@ -15,7 +15,7 @@ use crate::{shell, ui};
 /// Used by the CLI and agent when invoking `mvm_build::build::pool_build`.
 pub struct RuntimeBuildEnv;
 
-impl BuildEnvironment for RuntimeBuildEnv {
+impl ShellEnvironment for RuntimeBuildEnv {
     fn shell_exec(&self, script: &str) -> Result<()> {
         let out = shell::run_in_vm(script)?;
         if out.status.success() {
@@ -45,6 +45,20 @@ impl BuildEnvironment for RuntimeBuildEnv {
         shell::run_in_vm_visible(script)
     }
 
+    fn log_info(&self, msg: &str) {
+        ui::info(msg);
+    }
+
+    fn log_success(&self, msg: &str) {
+        ui::success(msg);
+    }
+
+    fn log_warn(&self, msg: &str) {
+        ui::warn(msg);
+    }
+}
+
+impl BuildEnvironment for RuntimeBuildEnv {
     fn load_pool_spec(&self, tenant_id: &str, pool_id: &str) -> Result<PoolSpec> {
         crate::vm::pool::lifecycle::pool_load(tenant_id, pool_id)
     }
@@ -72,17 +86,5 @@ impl BuildEnvironment for RuntimeBuildEnv {
         revision: &BuildRevision,
     ) -> Result<()> {
         artifacts::record_revision(tenant_id, pool_id, revision)
-    }
-
-    fn log_info(&self, msg: &str) {
-        ui::info(msg);
-    }
-
-    fn log_success(&self, msg: &str) {
-        ui::success(msg);
-    }
-
-    fn log_warn(&self, msg: &str) {
-        ui::warn(msg);
     }
 }

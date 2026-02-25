@@ -24,35 +24,48 @@ Tenant (security/quota/network boundary)
 
 The CLI runs on the host. All Linux operations run inside the Lima VM via `limactl shell mvm bash -c "..."`. Firecracker microVMs run inside Lima using nested virtualization (/dev/kvm).
 
-### Module Map
+### Workspace Structure
 
-**Infrastructure (unchanged from dev mode):**
-- `infra/config.rs` -- constants (VM_NAME, FC_VERSION, ARCH, dev-mode network config), MvmState
-- `infra/shell.rs` -- command helpers: `run_host`, `run_in_vm`, `run_in_vm_stdout`, `replace_process`
-- `infra/bootstrap.rs` -- Homebrew + Lima installation
-- `infra/ui.rs` -- colored output, spinners, confirmations
-- `infra/upgrade.rs` -- self-update
+7-crate Cargo workspace with root facade:
 
-**Dev mode (unchanged):**
-- `vm/microvm.rs` -- single-VM lifecycle (start, stop, ssh)
-- `vm/firecracker.rs` -- FC binary install, asset download
-- `vm/network.rs` -- dev-mode TAP/NAT (172.16.0.x)
-- `vm/lima.rs` -- Lima VM lifecycle
-- `vm/image.rs` -- Mvmfile.toml build pipeline
+- `mvm-core` -- pure types, IDs, config, protocol, signing, routing (NO runtime deps)
+- `mvm-guest` -- vsock protocol, integration manifest/state (OpenClaw)
+- `mvm-build` -- Nix builder pipeline (depends on mvm-core via BuildEnvironment trait)
+- `mvm-runtime` -- shell execution, security ops, VM lifecycle, bridge, pool/tenant/instance management
+- `mvm-agent` -- reconcile engine, coordinator client, sleep policy, templates
+- `mvm-coordinator` -- gateway load-balancer, TCP proxy, wake manager, idle tracker
+- `mvm-cli` -- Clap CLI, UI, bootstrap, upgrade (depends on all other crates)
 
-**Multi-tenant model (new):**
-- `vm/naming.rs` -- ID validation, instance_id gen, TAP naming
-- `vm/bridge.rs` -- per-tenant bridge (br-tenant-<net_id>) create/destroy/verify
-- `vm/tenant/{config,lifecycle,quota,secrets}.rs` -- tenant management
-- `vm/pool/{config,lifecycle,build,artifacts}.rs` -- pool management + ephemeral FC builds
-- `vm/instance/{state,lifecycle,net,fc_config,disk,snapshot}.rs` -- instance lifecycle API
-- `security/{jailer,cgroups,seccomp,audit,metadata,encryption,keystore}.rs` -- hardening + LUKS + key management
-- `security/{signing,snapshot_crypto,attestation}.rs` -- Ed25519 signed state, AES-256-GCM snapshot encryption, attestation hook
-- `hostd/{protocol,server,client}.rs` -- privilege separation: Unix socket IPC between agentd (unprivileged) and hostd (privileged)
-- `sleep/{policy,metrics}.rs` -- sleep heuristics + minimum runtime enforcement
-- `worker/{hooks,vsock}.rs` -- guest worker signals + vsock guest agent client
-- `agent.rs` -- reconcile loop + QUIC daemon + signed state verification
-- `node.rs` -- node identity + stats + attestation provider
+Root package: `src/lib.rs` (facade re-exports) + `src/main.rs` (thin CLI entry → `mvm_cli::run()`)
+
+Binaries: `mvm` (from root, delegates to mvm-cli), `mvm-hostd` (from mvm-runtime), `mvm-builder-agent` (from mvm-guest)
+
+**Dependency graph:**
+```
+mvm-core (foundation, no mvm deps)
+├── mvm-guest (core)
+├── mvm-build (core, guest)
+├── mvm-runtime (core, guest, build)
+├── mvm-agent (core, runtime, build, guest)
+├── mvm-coordinator (core, runtime)
+└── mvm-cli (core, agent, runtime, coordinator, build)
+```
+
+**Key module locations (within crates):**
+
+mvm-core: `tenant.rs`, `pool.rs`, `instance.rs`, `agent.rs`, `protocol.rs`, `build_env.rs`, `signing.rs`, `routing.rs`, `naming.rs`, `template.rs`
+
+mvm-runtime: `shell.rs`, `vm/lima.rs`, `vm/firecracker.rs`, `vm/microvm.rs` (dev mode), `vm/bridge.rs`, `vm/tenant/`, `vm/pool/`, `vm/instance/`, `vm/template/`, `security/`, `hostd/`, `sleep/`, `worker/`, `build_env.rs`
+
+mvm-build: `build.rs`, `orchestrator.rs`, `vsock_builder.rs`, `scripts.rs`, `cache.rs`, `template_reuse.rs`
+
+mvm-guest: `vsock.rs`, `integrations.rs`, `builder_agent.rs`
+
+mvm-agent: `agent.rs` (reconcile + QUIC), `hostd.rs`, `node.rs`, `sleep/policy.rs`, `templates.rs`
+
+mvm-coordinator: `server.rs`, `proxy.rs`, `routing.rs`, `wake.rs`, `idle.rs`, `state.rs`
+
+mvm-cli: `commands.rs`, `bootstrap.rs`, `template_cmd.rs`, `dev_cluster.rs`, `doctor.rs`, `display.rs`, `upgrade.rs`
 
 ### Key Design Decisions
 
@@ -69,6 +82,8 @@ The CLI runs on the host. All Linux operations run inside the Lima VM via `limac
 - **Vsock over SSH**: guest communication uses Firecracker vsock (UDS proxy), not SSH. No sshd in production guests.
 - **Config drive for metadata**: non-secret instance/pool metadata delivered via read-only ext4 config drive, not SSH.
 - **Minimum runtime enforcement**: host-side wall-clock timestamps prevent premature instance reclamation. Guest not involved in enforcement.
+- **Reusable templates**: build once, share across tenants. Tenant customization via runtime volumes (secrets drive, config drive, data disk), not image rebuilds.
+- **Multi-pool templates**: some workloads (e.g., OpenClaw) need gateway + worker pools. `mvm new openclaw myapp` creates both.
 - **No `clippy::too_many_arguments`**: never suppress this lint. Instead, refactor into smaller functions or introduce a config/params struct. Smaller functions are easier to test in isolation.
 
 ### Networking
@@ -117,12 +132,15 @@ macOS / Linux Host
 
 ## Documentation
 
-- `docs/architecture.md` -- full module map, data model, filesystem layout
+- `docs/architecture.md` -- workspace structure, multi-tenant template model, design decisions
 - `docs/networking.md` -- cluster-wide subnets, bridges, isolation
 - `docs/cli.md` -- complete command reference
 - `docs/agent.md` -- desired state schema, reconcile loop, QUIC API
 - `docs/security.md` -- threat model, hardening measures, env vars, deferred items
 - `docs/minimum-runtime.md` -- minimum runtime policy, drain protocol, drive model
+- `docs/development.md` -- contributor guide, testing, CI/CD
+- `docs/onboarding.md` -- end-to-end deployment guide
+- `docs/deployment.md` -- single/multi-node deployment, systemd, env vars
 - `specs/plans/` -- implementation specs and plan
 
 ## Sprint Management

@@ -91,10 +91,7 @@ impl BuilderBackend for VsockBackend<'_> {
         } else {
             "x86_64-linux"
         };
-        let attr = format!(
-            "packages.{system}.tenant-{}-{}",
-            self.spec.role, self.spec.profile
-        );
+        let attr = format!("packages.{system}.tenant-{}", self.spec.role);
         let flake_ref = if self.in_disk.is_some() {
             "/build-in"
         } else {

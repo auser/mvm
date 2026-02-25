@@ -100,73 +100,115 @@ Valid transitions (enforced in `instance/state.rs`):
 
 Invalid transitions fail loudly with an error message.
 
-## Module Map
+## Workspace Structure
+
+mvm is organized as a Cargo workspace with 7 specialized crates plus a root facade:
 
 ```
-src/
-    main.rs                      # CLI dispatch (clap subcommands)
-    agent.rs                     # Reconcile loop + QUIC daemon (tokio)
-    node.rs                      # Node identity, info, stats
-    infra/                       # Host/VM infrastructure (UNCHANGED from dev mode)
-        mod.rs
-        config.rs                # Constants (VM_NAME, FC_VERSION, ARCH, network)
-        shell.rs                 # run_host, run_in_vm, run_in_vm_stdout, replace_process
-        bootstrap.rs             # Homebrew, Lima installation
-        upgrade.rs               # Self-update
-        ui.rs                    # Colored output, spinners, confirmations
-    vm/
-        mod.rs
-        # Dev mode (UNCHANGED)
-        microvm.rs               # Single-VM lifecycle (start, stop, ssh)
-        firecracker.rs           # FC binary install, asset download
-        network.rs               # Dev-mode TAP/NAT (172.16.0.x)
-        lima.rs                  # Lima VM lifecycle
-        image.rs                 # Mvmfile.toml build pipeline
-        # Multi-tenant model
-        naming.rs                # ID validation, instance_id generation, TAP naming
-        bridge.rs                # Per-tenant bridge create/destroy/verify
-        tenant/
-            mod.rs
-            config.rs            # TenantConfig, TenantQuota, TenantNet
-            lifecycle.rs         # tenant_create, tenant_destroy, tenant_list, tenant_info
-            quota.rs             # compute_tenant_usage, check_quota
-            secrets.rs           # secrets_set, secrets_rotate
-        pool/
-            mod.rs
-            config.rs            # PoolSpec, DesiredCounts, BuildRevision, InstanceResources
-            lifecycle.rs         # pool_create, pool_destroy, pool_scale, pool_update
-            build.rs             # Ephemeral builder microVM (Nix build inside FC)
-            artifacts.rs         # Revision management, symlinks, rollback
-        instance/
-            mod.rs
-            state.rs             # InstanceStatus enum, InstanceState, validate_transition
-            lifecycle.rs         # Unified lifecycle API (the single entry point)
-            net.rs               # Per-instance TAP setup/teardown within tenant bridge
-            fc_config.rs         # Generate Firecracker config JSON
-            disk.rs              # Data disk + secrets disk management
-            snapshot.rs          # Base (pool-level) + delta (instance-level) snapshots
-    security/
-        mod.rs
-        jailer.rs                # Firecracker jailer integration + fallback
-        cgroups.rs               # cgroup v2 per-instance + per-tenant aggregate
-        seccomp.rs               # Seccomp profile selection (baseline/strict)
-        audit.rs                 # Append-only per-tenant audit log
-        metadata.rs              # Tenant-scoped metadata endpoint
-        certs.rs                 # mTLS certificate generation (rcgen)
-        encryption.rs            # LUKS disk encryption
-        keystore.rs              # Key management
-        signing.rs               # Ed25519 signed state verification
-        snapshot_crypto.rs       # AES-256-GCM snapshot encryption
-        attestation.rs           # Node attestation hook
-    sleep/
-        mod.rs
-        policy.rs                # Sleep heuristics, minimum runtime enforcement, eligibility checks
-        metrics.rs               # Per-instance idle metrics collection
-    worker/
-        mod.rs
-        hooks.rs                 # Guest worker lifecycle signals (ready/idle/busy)
-        vsock.rs                 # Vsock guest agent client (sleep-prep drain, wake, status)
+mvm/
+├── src/
+│   ├── lib.rs          # Facade: re-exports all workspace crates
+│   └── main.rs         # Binary entry: calls mvm_cli::run()
+├── crates/
+│   ├── mvm-core/       # Pure types, IDs, config, protocol, signing (no runtime deps)
+│   ├── mvm-guest/      # Vsock protocol, integration manifest
+│   ├── mvm-build/      # Nix builder pipeline
+│   ├── mvm-runtime/    # Shell execution, security, VM lifecycle, bridge, pool/tenant/instance
+│   ├── mvm-agent/      # Reconcile engine, coordinator client, sleep policy
+│   ├── mvm-coordinator/# Gateway load-balancer, TCP proxy, wake manager
+│   └── mvm-cli/        # Clap CLI, UI, bootstrap, upgrade
+├── resources/          # Lima template, builder scripts (Tera templates)
+├── deploy/systemd/     # Service files (mvm-agent, mvm-agentd, mvm-hostd)
+└── nix/openclaw/       # OpenClaw template (flake, roles, profiles)
 ```
+
+### Dependency Graph
+
+```
+mvm-core (foundation, no mvm deps)
+├── mvm-guest (core)
+├── mvm-build (core, guest)
+├── mvm-runtime (core, guest, build)
+├── mvm-agent (core, runtime, build, guest)
+├── mvm-coordinator (core, runtime)
+└── mvm-cli (core, agent, runtime, coordinator, build)
+```
+
+Changes to `mvm-core` ripple across all crates. Changes to `mvm-cli` affect nothing else.
+
+### Binaries
+
+| Binary | Source | Purpose |
+|--------|--------|---------|
+| `mvm` | Root package (`src/main.rs`) | CLI, delegates to `mvm_cli::run()` |
+| `mvm-hostd` | `mvm-runtime` | Privileged daemon for instance operations |
+| `mvm-builder-agent` | `mvm-guest` | Guest-side agent in builder VMs |
+
+### Crate Details
+
+**mvm-core** — Pure types and protocol definitions. No runtime dependencies.
+- `tenant.rs` — TenantConfig, TenantQuota, TenantNet, filesystem paths
+- `pool.rs` — Role, PoolSpec, DesiredCounts, InstanceResources, RuntimePolicy, BuildRevision
+- `instance.rs` — InstanceStatus, InstanceState, InstanceNet, validate_transition()
+- `agent.rs` — Desired state schema, reconcile protocol, QUIC frame types
+- `protocol.rs` — Hostd IPC types (Unix socket frames)
+- `build_env.rs` — BuildEnvironment trait (abstraction for build pipeline)
+- `signing.rs` — Ed25519 signed payload types
+- `routing.rs` — Gateway routing table logic
+- `naming.rs` — ID validation and naming conventions
+- `template.rs` — Template metadata types
+
+**mvm-runtime** — All runtime operations: shell execution, VM lifecycle, security.
+- `shell.rs` — `run_in_vm()`, `run_host()`, `replace_process()`
+- `vm/lima.rs`, `vm/firecracker.rs`, `vm/microvm.rs` — Dev mode lifecycle
+- `vm/bridge.rs` — Per-tenant bridge create/destroy/verify
+- `vm/tenant/` — Tenant lifecycle, quotas, secrets
+- `vm/pool/` — Pool lifecycle, artifact management
+- `vm/instance/` — Instance lifecycle, networking, FC config, disks, snapshots, health
+- `vm/template/` — Template registry and lifecycle
+- `security/` — Jailer, cgroups, seccomp, audit, LUKS, certs, signing, snapshot crypto, attestation
+- `hostd/` — Privilege separation server (protocol, server, client)
+- `sleep/` — Sleep metrics
+- `worker/` — Guest worker hooks, vsock client
+- `build_env.rs` — RuntimeBuildEnv (implements BuildEnvironment trait)
+
+**mvm-build** — Nix builder pipeline for reproducible guest images.
+- `build.rs` — Main pool build API (`pool_build`, `pool_build_with_opts`)
+- `orchestrator.rs` — Build orchestration (backend selection, artifact extraction)
+- `vsock_builder.rs` — Vsock-based builder communication
+- `scripts.rs` — Tera script rendering for builder VMs
+- `cache.rs` — Build artifact caching
+- `template_reuse.rs` — Template-based base image reuse
+
+**mvm-guest** — Vsock protocol and guest-side integration definitions.
+- `vsock.rs` — GuestRequest/GuestResponse types, frame protocol
+- `integrations.rs` — OpenClaw integration manifest and state model
+- `builder_agent.rs` — Guest-side builder agent logic
+
+**mvm-agent** — Reconciliation engine and fleet coordination.
+- `agent.rs` — Reconcile loop, QUIC server, rate limiting
+- `hostd.rs` — Hostd client wrapper
+- `node.rs` — Node identity and stats collection
+- `sleep/policy.rs` — Sleep policy evaluation
+- `templates.rs` — Built-in deployment templates (e.g., "openclaw")
+
+**mvm-coordinator** — Gateway load-balancer and wake orchestration.
+- `server.rs` — Coordinator QUIC server
+- `proxy.rs` — TCP proxy implementation
+- `routing.rs` — Route resolution
+- `wake.rs` — Wake request handling
+- `idle.rs` — Idle instance tracking
+- `state.rs` — State management (in-memory or Etcd)
+- `health.rs` — Health check system
+
+**mvm-cli** — User-facing CLI and environment setup.
+- `commands.rs` — Main entry point and Clap command routing
+- `bootstrap.rs` — Homebrew + Lima installation
+- `template_cmd.rs` — Template management commands
+- `dev_cluster.rs` — Local dev cluster operations
+- `doctor.rs` — System diagnostics
+- `display.rs` — Formatted output rendering
+- `upgrade.rs` — Self-update
 
 ## Filesystem Layout
 
@@ -222,18 +264,125 @@ src/
 
 7. **Dev mode isolation** -- dev commands (`mvm start/stop/ssh/dev`) use a completely separate code path and never interact with tenant state.
 
+8. **Templates are reusable** -- build once, share across tenants. Tenant customization happens at runtime via mounted volumes, not at build time.
+
+## Multi-Tenant Template Model
+
+The core concept: **a single template image serves many tenants**. Tenants don't rebuild images — they reuse shared templates and get customized instances via runtime-mounted volumes.
+
+### How It Works
+
+A **template** is a pre-built base image (kernel + rootfs + FC config) produced by a Nix flake. Once built, it can be assigned to any tenant's pool without rebuilding:
+
+```
+Template (build once)          Tenant Pools (reuse many times)
+┌─────────────────┐      ┌─ acme/workers    (mounts acme secrets/config)
+│ openclaw-worker │──────┤─ beta/workers    (mounts beta secrets/config)
+│ kernel + rootfs │      └─ gamma/workers   (mounts gamma secrets/config)
+└─────────────────┘
+```
+
+What makes each tenant's instance unique is NOT the image — it's the volumes mounted at boot:
+
+| Volume | Mount | Contents | Trust Boundary |
+|--------|-------|----------|----------------|
+| **Secrets drive** | `/run/secrets` | API keys, credentials, tokens | Encrypted tmpfs, recreated per run |
+| **Config drive** | `/etc/mvm-config` | Routing tables, integration manifest, identity | Read-only ext4 |
+| **Data disk** | `/data` | Persistent tenant state, integration data | Optional LUKS encryption |
+
+This enables fast tenant onboarding (no build required), resource efficiency (shared images), and consistent deployments (all tenants run identical base images).
+
+### Multi-Pool Templates
+
+Some workloads need multiple microVM types working together. For example, **OpenClaw** requires:
+
+| Pool | Role | Purpose |
+|------|------|---------|
+| `gateways` | gateway | Routes inbound traffic, wakes sleeping workers |
+| `workers` | worker | Executes integrations (WhatsApp, Telegram, etc.) |
+
+The `mvm new openclaw myapp` command creates both pools for a tenant automatically.
+
+### Request Flow (Sleep/Wake)
+
+When a request arrives for a sleeping tenant:
+
+```
+Client request
+  → Coordinator (always running, routes by port)
+    → Wakes gateway instance (~200ms snapshot restore)
+      → Gateway reads routing table from config drive
+        → Wakes worker instances as needed
+          → Request processed, response returned
+```
+
+From the user's perspective, their setup never changed. The platform optimizes resource usage by sleeping idle tenants and waking them on demand.
+
+### Template Lifecycle
+
+```
+1. Create template definition (Nix flake + roles + profiles)
+2. Build artifacts: mvm template build openclaw-worker
+3. Push to registry (optional, multi-node): mvm template push openclaw-worker
+4. Create tenant pools referencing template: mvm pool create acme/workers --template openclaw-worker
+5. Instances boot from shared artifacts, mount tenant-specific volumes
+```
+
+Templates vs Pools vs Instances:
+
+| Concept | Scope | Tied to Tenant? | What It Owns |
+|---------|-------|-----------------|--------------|
+| **Template** | Global | No | Reusable base image (kernel + rootfs) |
+| **Pool** | Tenant | Yes | Desired counts, resource limits, runtime policy |
+| **Instance** | Pool | Yes | State machine, network identity, volumes, PID |
+
+See [roles.md](roles.md) for role-specific VM profiles and [integrations.md](integrations.md) for the OpenClaw integration lifecycle.
+
 ## Build Pipeline
 
-Guest images are built reproducibly using Nix flakes inside ephemeral Firecracker VMs:
+Guest images are built reproducibly using Nix flakes. Three build backends are supported:
+
+1. **Host mode** (default) -- Nix build runs directly on the host/Lima VM
+2. **Vsock mode** -- Nix build runs inside an ephemeral Firecracker VM, artifacts extracted via vsock
+3. **SSH mode** -- Legacy; Nix build inside FC VM, artifacts copied via SSH
 
 ```
 mvm pool build acme/workers
   1. Load pool spec (flake ref + profile)
-  2. Boot ephemeral builder microVM (Nix + git, on tenant's bridge)
-  3. Execute `nix build` inside builder
-  4. Copy artifacts (kernel, rootfs, fc-base.json) to pool artifacts dir
-  5. Shut down builder, clean up
-  6. Record BuildRevision in build_history.json
+  2. Select build backend (host, vsock, or ssh)
+  3. Execute `nix build` (produces kernel, rootfs, fc-base.json)
+  4. Extract artifacts to pool artifacts dir
+  5. Record BuildRevision with content-hash
+  6. Symlink artifacts/current → revisions/<hash>/
 ```
 
-Builder microVMs are stateless, disposable, and uniquely named per build invocation.
+Builder VMs (vsock/ssh modes) are stateless, disposable, and uniquely named per build invocation. Builder specs: 4 vCPUs, 4 GiB RAM, 8 GiB output disk, 30-minute timeout.
+
+When a pool references a template, the build step is skipped — artifacts are reused directly from the template cache.
+
+## Coordinator & Gateway
+
+The coordinator is a long-running service that handles traffic routing and instance lifecycle for multi-tenant deployments:
+
+- **Port-based routing** -- each tenant/pool maps to a port range on the coordinator
+- **TCP proxy** -- transparent proxy from coordinator port to instance guest IP
+- **On-demand wake** -- incoming connection to a sleeping tenant triggers snapshot restore
+- **Idle tracking** -- instances with no traffic for a configurable period become sleep-eligible
+- **Wake coalescing** -- multiple wake requests for the same instance are batched
+
+See [coordinator.md](coordinator.md) for configuration and API details.
+
+## Guest Communication
+
+Production guests have **no SSH daemon**. All host-guest communication uses Firecracker vsock:
+
+| Port | Direction | Protocol |
+|------|-----------|----------|
+| 52 | Host → Guest | Guest agent (status, sleep-prep, wake, integration queries) |
+| 53 | Guest → Host | Host-bound requests (wake requests from guest) |
+
+Frame protocol: 4-byte big-endian length prefix + JSON body, over Firecracker's vsock UDS proxy.
+
+Non-secret metadata (pool identity, routing tables, integration manifest) is delivered via a read-only ext4 **config drive** mounted at boot — no runtime network call needed.
+
+See [agent.md](agent.md) for the QUIC API and reconcile loop, and [minimum-runtime.md](minimum-runtime.md) for the vsock drain protocol.

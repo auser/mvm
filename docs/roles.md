@@ -202,8 +202,8 @@ User flakes can import mvm modules:
 
 To add a new role:
 
-1. Add variant to `Role` enum in `src/vm/pool/config.rs`
-2. Update `Display` impl, `parse_role()` in `main.rs`, `role_priority()` in `agent.rs`
+1. Add variant to `Role` enum in `crates/mvm-core/src/pool.rs`
+2. Update `Display` impl, `parse_role()` in `crates/mvm-cli/src/commands.rs`, `role_priority()` in `crates/mvm-agent/src/agent.rs`
 3. Create `nix/roles/<role>.nix` with role-specific NixOS configuration
 4. Add `[roles.<role>]` entry to `nix/mvm-profiles.toml`
 5. Add role+profile outputs to `nix/flake.nix`

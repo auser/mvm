@@ -25,7 +25,6 @@ concurrency:
 jobs:
   publish:
     runs-on: ubuntu-latest
-    environment: release
     permissions:
       contents: read
     env:

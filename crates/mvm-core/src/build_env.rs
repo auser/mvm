@@ -4,11 +4,11 @@ use crate::instance::InstanceNet;
 use crate::pool::{BuildRevision, PoolSpec};
 use crate::tenant::{TenantConfig, TenantNet};
 
-/// Abstraction over runtime operations needed by the build pipeline.
+/// Minimal shell execution abstraction used by dev-mode builds.
 ///
-/// mvm-build depends on mvm-core only. At runtime, mvm-agent provides
-/// a concrete implementation that delegates to mvm-runtime.
-pub trait BuildEnvironment: Send + Sync {
+/// This trait provides just shell execution and logging — enough for
+/// `dev_build()` which runs `nix build` directly in the Lima VM.
+pub trait ShellEnvironment: Send + Sync {
     /// Execute a shell script in the VM.
     fn shell_exec(&self, script: &str) -> Result<()>;
 
@@ -18,6 +18,25 @@ pub trait BuildEnvironment: Send + Sync {
     /// Execute a shell script with visible output.
     fn shell_exec_visible(&self, script: &str) -> Result<()>;
 
+    /// Log an informational message.
+    fn log_info(&self, msg: &str);
+
+    /// Log a success message.
+    fn log_success(&self, msg: &str);
+
+    /// Log a warning (optional; default no-op for test fakes).
+    fn log_warn(&self, _msg: &str) {
+        // default implementation: no-op
+    }
+}
+
+/// Full build environment for orchestrated pool builds.
+///
+/// Extends [`ShellEnvironment`] with tenant/pool/network operations needed
+/// by the pool build pipeline (ephemeral FC builder VMs, artifact recording).
+/// mvm-build depends on mvm-core only. At runtime, the orchestrator provides
+/// a concrete implementation that delegates to the runtime modules.
+pub trait BuildEnvironment: ShellEnvironment {
     /// Load a pool spec from the filesystem.
     fn load_pool_spec(&self, tenant_id: &str, pool_id: &str) -> Result<PoolSpec>;
 
@@ -40,15 +59,4 @@ pub trait BuildEnvironment: Send + Sync {
         pool_id: &str,
         revision: &BuildRevision,
     ) -> Result<()>;
-
-    /// Log an informational message.
-    fn log_info(&self, msg: &str);
-
-    /// Log a success message.
-    fn log_success(&self, msg: &str);
-
-    /// Log a warning (optional; default no-op for test fakes).
-    fn log_warn(&self, _msg: &str) {
-        // default implementation: no-op
-    }
 }
