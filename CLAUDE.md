@@ -1,44 +1,30 @@
-# mvm -- Firecracker MicroVM Fleet Manager
+# mvm -- Firecracker MicroVM Development Tool
 
 ## Project Overview
 
-Rust CLI that orchestrates multi-tenant Firecracker microVM fleets on Linux (or macOS via Lima on Apple Silicon and x86_64). It provides Nix-based reproducible builds, snapshot-based sleep/wake, per-tenant network isolation, and coordinator-driven reconciliation.
+Rust CLI for building and running Firecracker microVMs on macOS (via Lima) and Linux. Handles the full dev lifecycle: bootstrapping, Nix-based image builds, single-VM management, and reusable template creation.
+
+Multi-tenant fleet orchestration (tenants, pools, instances, agents, coordinators) lives in the separate [mvmd](https://github.com/auser/mvmd) repository.
 
 ```
-macOS / Linux Host (this CLI) -> Lima VM (Ubuntu) -> Firecracker microVMs (/dev/kvm)
+macOS / Linux Host (this CLI) -> Lima VM (Ubuntu) -> Firecracker microVM (/dev/kvm)
 ```
-
-## Object Model
-
-```
-Tenant (security/quota/network boundary)
-  -> WorkerPool (homogeneous workload group, shared artifacts)
-       -> Instance (individual Firecracker microVM with state machine)
-```
-
-- **Tenant** -- isolation boundary. Owns quotas, network (coordinator-assigned subnet), secrets, audit log.
-- **WorkerPool** -- workload definition. Owns flake ref, profile, desired counts, shared artifacts + base snapshot.
-- **Instance** -- runtime entity. Owns state machine, TAP device, data disk, delta snapshot, PID.
 
 ## Architecture
 
-The CLI runs on the host. All Linux operations run inside the Lima VM via `limactl shell mvm bash -c "..."`. Firecracker microVMs run inside Lima using nested virtualization (/dev/kvm).
-
 ### Workspace Structure
 
-7-crate Cargo workspace with root facade:
+5-crate Cargo workspace with root facade:
 
 - `mvm-core` -- pure types, IDs, config, protocol, signing, routing (NO runtime deps)
 - `mvm-guest` -- vsock protocol, integration manifest/state (OpenClaw)
-- `mvm-build` -- Nix builder pipeline (depends on mvm-core via BuildEnvironment trait)
-- `mvm-runtime` -- shell execution, security ops, VM lifecycle, bridge, pool/tenant/instance management
-- `mvm-agent` -- reconcile engine, coordinator client, sleep policy, templates
-- `mvm-coordinator` -- gateway load-balancer, TCP proxy, wake manager, idle tracker
-- `mvm-cli` -- Clap CLI, UI, bootstrap, upgrade (depends on all other crates)
+- `mvm-build` -- Nix builder pipeline (dev_build uses `ShellEnvironment` trait, pool_build uses `BuildEnvironment`)
+- `mvm-runtime` -- shell execution, Lima/Firecracker VM lifecycle, UI, template management
+- `mvm-cli` -- Clap CLI, bootstrap, upgrade, doctor, template commands
 
-Root package: `src/lib.rs` (facade re-exports) + `src/main.rs` (thin CLI entry → `mvm_cli::run()`)
+Root package: `src/lib.rs` (facade re-exports `mvm::core`, `mvm::runtime`, `mvm::build`, `mvm::guest`) + `src/main.rs` (thin CLI entry -> `mvm_cli::run()`)
 
-Binaries: `mvm` (from root, delegates to mvm-cli), `mvm-hostd` (from mvm-runtime), `mvm-builder-agent` (from mvm-guest)
+Binary: `mvm` (from root, delegates to mvm-cli)
 
 **Dependency graph:**
 ```
@@ -46,62 +32,53 @@ mvm-core (foundation, no mvm deps)
 ├── mvm-guest (core)
 ├── mvm-build (core, guest)
 ├── mvm-runtime (core, guest, build)
-├── mvm-agent (core, runtime, build, guest)
-├── mvm-coordinator (core, runtime)
-└── mvm-cli (core, agent, runtime, coordinator, build)
+└── mvm-cli (core, runtime, build)
 ```
 
-**Key module locations (within crates):**
+**Key module locations:**
 
-mvm-core: `tenant.rs`, `pool.rs`, `instance.rs`, `agent.rs`, `protocol.rs`, `build_env.rs`, `signing.rs`, `routing.rs`, `naming.rs`, `template.rs`
+mvm-core: `build_env.rs` (ShellEnvironment + BuildEnvironment traits), `pool.rs`, `instance.rs`, `tenant.rs`, `template.rs`, `naming.rs`, `signing.rs`, `routing.rs`, `protocol.rs`, `agent.rs`
 
-mvm-runtime: `shell.rs`, `vm/lima.rs`, `vm/firecracker.rs`, `vm/microvm.rs` (dev mode), `vm/bridge.rs`, `vm/tenant/`, `vm/pool/`, `vm/instance/`, `vm/template/`, `security/`, `hostd/`, `sleep/`, `worker/`, `build_env.rs`
+mvm-runtime: `shell.rs`, `config.rs`, `ui.rs`, `build_env.rs` (DevShellEnv impl), `vm/lima.rs`, `vm/firecracker.rs`, `vm/microvm.rs`, `vm/network.rs`, `vm/image.rs`, `vm/template/`
 
-mvm-build: `build.rs`, `orchestrator.rs`, `vsock_builder.rs`, `scripts.rs`, `cache.rs`, `template_reuse.rs`
+mvm-build: `dev_build.rs` (local Nix builds via ShellEnvironment), `build.rs` (orchestrated builds via BuildEnvironment), `nix_manifest.rs`, `scripts.rs`
 
 mvm-guest: `vsock.rs`, `integrations.rs`, `builder_agent.rs`
 
-mvm-agent: `agent.rs` (reconcile + QUIC), `hostd.rs`, `node.rs`, `sleep/policy.rs`, `templates.rs`
+mvm-cli: `commands.rs`, `bootstrap.rs`, `template_cmd.rs`, `doctor.rs`, `upgrade.rs`, `http.rs`, `logging.rs`, `ui.rs`
 
-mvm-coordinator: `server.rs`, `proxy.rs`, `routing.rs`, `wake.rs`, `idle.rs`, `state.rs`
+### Trait Architecture
 
-mvm-cli: `commands.rs`, `bootstrap.rs`, `template_cmd.rs`, `dev_cluster.rs`, `doctor.rs`, `display.rs`, `upgrade.rs`
+`BuildEnvironment` is split into two traits in `mvm-core/src/build_env.rs`:
+
+```
+ShellEnvironment (base)
+  shell_exec(), shell_exec_stdout(), shell_exec_visible()
+  log_info(), log_success(), log_warn()
+
+BuildEnvironment : ShellEnvironment (extends)
+  load_pool_spec(), load_tenant_config()
+  ensure_bridge(), setup_tap(), teardown_tap()
+  record_revision()
+```
+
+- **Dev mode** (`mvm build`, `mvm template build`): uses `dev_build()` with `&dyn ShellEnvironment`
+- **Fleet mode** (in mvmd): uses `pool_build()` with `&dyn BuildEnvironment`
+
+The `RuntimeBuildEnv` in mvm-runtime implements only `ShellEnvironment`. The full `BuildEnvironment` impl lives in mvmd-runtime.
 
 ### Key Design Decisions
 
-- **Firecracker-only execution**: no Docker/containers. Builds run in ephemeral FC VMs with Nix.
-- **Coordinator owns network allocation**: tenant subnets from cluster CIDR (10.240.0.0/12). Agents never derive IPs.
-- **Per-tenant bridges**: network isolation by construction (separate L2 domains).
-- **Pool-level base snapshots**: shared across instances. Instance-level delta snapshots on sleep.
-- **Single lifecycle API**: all operations go through `instance/lifecycle.rs`. No direct FC manipulation elsewhere.
-- **Dev mode isolation**: `mvm start/stop/ssh/dev` use a completely separate code path.
-- **Persistent microVM**: `mvm start` launches Firecracker as a daemon. Exiting SSH does NOT kill the VM.
+- **Firecracker-only**: no Docker/containers. Builds run Nix inside the Lima VM.
+- **No SSH in microVMs, ever**: microVMs are headless workloads. No sshd, no SSH keys, no SSH users in any rootfs. Guest communication uses Firecracker vsock only. The dev environment is the Lima VM (`mvm dev` / `mvm shell`), not the microVM.
+- **Dev mode = Lima shell**: `mvm dev` auto-bootstraps then drops into the Lima VM shell. It does NOT start or SSH into a Firecracker microVM.
+- **Headless microVMs**: `mvm start` and `mvm run` boot Firecracker as a daemon. No interactive access to the microVM.
+- **Dev mode isolation**: `mvm start/stop/dev` use a completely separate code path from orchestration.
 - **Shell scripts inside run_in_vm**: complex ops are bash scripts passed to `limactl shell`. Deliberate -- they run inside the Linux VM.
-- **replace_process for SSH**: Unix process replacement for clean TTY pass-through.
 - **Idempotent setup**: every step checks if already done before acting.
-- **Vsock over SSH**: guest communication uses Firecracker vsock (UDS proxy), not SSH. No sshd in production guests.
-- **Config drive for metadata**: non-secret instance/pool metadata delivered via read-only ext4 config drive, not SSH.
-- **Minimum runtime enforcement**: host-side wall-clock timestamps prevent premature instance reclamation. Guest not involved in enforcement.
-- **Reusable templates**: build once, share across tenants. Tenant customization via runtime volumes (secrets drive, config drive, data disk), not image rebuilds.
-- **Multi-pool templates**: some workloads (e.g., OpenClaw) need gateway + worker pools. `mvm new openclaw myapp` creates both.
-- **No `clippy::too_many_arguments`**: never suppress this lint. Instead, refactor into smaller functions or introduce a config/params struct. Smaller functions are easier to test in isolation.
-
-### Networking
-
-- Cluster CIDR: `10.240.0.0/12`, coordinator-assigned per-tenant /24 subnets
-- Per-tenant bridge: `br-tenant-<tenant_net_id>` with gateway at .1
-- TAP naming: `tn<net_id>i<ip_offset>` (e.g. `tn3i5`)
-- Within-tenant east/west: allowed (same bridge)
-- Cross-tenant: denied by construction (separate bridges)
-- Sleep/wake preserves network identity
-
-### Instance State Machine
-
-Created -> Ready -> Running -> Warm -> Sleeping -> (wake) -> Running
-Running/Warm/Sleeping -> Stopped -> Running (fresh boot)
-Any -> Destroyed
-
-All transitions enforced in `instance/state.rs`. Invalid transitions fail loudly.
+- **Templates use dev_build path**: `mvm template build` runs `nix build` locally in the Lima VM (no ephemeral FC builder VMs).
+- **mvm-core stays whole**: orchestration types (tenant, pool, instance, agent, protocol) remain in mvm-core even though they're only used by mvmd. This avoids a third shared-types crate and keeps the facade dependency simple.
+- **No `clippy::too_many_arguments`**: never suppress this lint. Refactor into smaller functions or a config/params struct.
 
 ## Build and Run
 
@@ -110,14 +87,17 @@ cargo build
 cargo run -- --help
 
 # Dev mode
-cargo run -- dev         # auto-bootstrap + launch + SSH
+cargo run -- dev         # auto-bootstrap + drop into Lima shell
 cargo run -- status      # check what's running
 
-# Multi-tenant
-cargo run -- tenant create acme --net-id 3 --subnet 10.240.3.0/24
-cargo run -- pool create acme/workers --flake . --profile minimal --cpus 2 --mem 1024
-cargo run -- pool build acme/workers
-cargo run -- instance list acme/workers
+# Build from Nix flake
+cargo run -- build --flake . --profile minimal --role worker
+cargo run -- run --flake . --profile minimal --cpus 2 --memory 1024
+
+# Templates
+cargo run -- template create base --flake . --profile minimal --role worker --cpus 2 --mem 1024
+cargo run -- template build base
+cargo run -- template list
 ```
 
 ## Dev Network Layout
@@ -132,16 +112,12 @@ macOS / Linux Host
 
 ## Documentation
 
-- `docs/architecture.md` -- workspace structure, multi-tenant template model, design decisions
-- `docs/networking.md` -- cluster-wide subnets, bridges, isolation
-- `docs/cli.md` -- complete command reference
-- `docs/agent.md` -- desired state schema, reconcile loop, QUIC API
-- `docs/security.md` -- threat model, hardening measures, env vars, deferred items
-- `docs/minimum-runtime.md` -- minimum runtime policy, drain protocol, drive model
 - `docs/development.md` -- contributor guide, testing, CI/CD
-- `docs/onboarding.md` -- end-to-end deployment guide
-- `docs/deployment.md` -- single/multi-node deployment, systemd, env vars
-- `specs/plans/` -- implementation specs and plan
+- `docs/user-guide.md` -- writing Nix flakes for microVM images
+- `docs/SMOKE_TEST.md` -- smoke testing the dev workflow
+- `docs/troubleshooting.md` -- common issues and fixes
+- `docs/adr/001-firecracker-only.md` -- ADR: Firecracker-only execution
+- `specs/plans/` -- implementation specs and plans
 
 ## Sprint Management
 

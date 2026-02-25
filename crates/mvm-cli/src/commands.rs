@@ -2,29 +2,18 @@ use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
 
 use crate::bootstrap;
-use crate::display;
 use crate::logging::{self, LogFormat};
-use crate::output::{self, OutputFormat};
 use crate::template_cmd;
 use crate::ui;
 use crate::upgrade;
 
-use mvm_core::naming;
 use mvm_runtime::config;
 use mvm_runtime::shell;
-use mvm_runtime::vm::{bridge, firecracker, image, lima, microvm, pool, tenant};
+use mvm_runtime::vm::{firecracker, image, lima, microvm};
 
 #[derive(Parser)]
-#[command(
-    name = "mvm",
-    version,
-    about = "Multi-tenant Firecracker microVM fleet manager"
-)]
+#[command(name = "mvm", version, about = "Firecracker microVM development tool")]
 struct Cli {
-    /// Output format: table, json, yaml
-    #[arg(long, short = 'o', global = true, default_value = "table")]
-    output: String,
-
     /// Log format: human (default) or json (structured)
     #[arg(long, global = true)]
     log_format: Option<String>,
@@ -39,62 +28,6 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Commands {
-    // ---- Tenant management ----
-    /// Manage tenants (security/quota/network boundaries)
-    Tenant {
-        #[command(subcommand)]
-        action: TenantCmd,
-    },
-
-    // ---- Pool management ----
-    /// Manage worker pools within tenants
-    Pool {
-        #[command(subcommand)]
-        action: PoolCmd,
-    },
-
-    // ---- Instance operations ----
-    /// Manage individual microVM instances
-    Instance {
-        #[command(subcommand)]
-        action: InstanceCmd,
-    },
-
-    // ---- Agent ----
-    /// Agent reconcile loop and daemon
-    Agent {
-        #[command(subcommand)]
-        action: AgentCmd,
-    },
-
-    // ---- Coordinator client ----
-    /// Coordinator client for multi-node fleet management
-    Coordinator {
-        #[command(subcommand)]
-        action: CoordinatorCmd,
-    },
-    // ---- Dev cluster (local) ----
-    /// Development cluster
-    DevCluster {
-        #[command(subcommand)]
-        action: DevClusterCmd,
-    },
-
-    // ---- Network ----
-    /// Network verification and diagnostics
-    Net {
-        #[command(subcommand)]
-        action: NetCmd,
-    },
-
-    // ---- Node ----
-    /// Node information and statistics
-    Node {
-        #[command(subcommand)]
-        action: NodeCmd,
-    },
-
-    // ---- Dev mode (UNCHANGED) ----
     /// Full environment setup from scratch
     Bootstrap {
         /// Production mode (skip Homebrew, assume Linux with apt)
@@ -113,7 +46,7 @@ enum Commands {
         #[arg(long, default_value = "16")]
         lima_mem: u32,
     },
-    /// Launch into microVM, auto-bootstrapping if needed
+    /// Launch the Lima development environment, auto-bootstrapping if needed
     Dev {
         /// Number of vCPUs for the Lima VM
         #[arg(long, default_value = "8")]
@@ -121,8 +54,11 @@ enum Commands {
         /// Memory (GiB) for the Lima VM
         #[arg(long, default_value = "16")]
         lima_mem: u32,
+        /// Project directory to cd into inside the VM
+        #[arg(long)]
+        project: Option<String>,
     },
-    /// Start the microVM and drop into interactive SSH
+    /// Start a Firecracker microVM (headless, no SSH)
     Start {
         /// Path to a built .elf image file (omit for default Ubuntu microVM)
         image: Option<String>,
@@ -141,9 +77,9 @@ enum Commands {
     },
     /// Stop the running microVM and clean up
     Stop,
-    /// SSH into a running microVM
+    /// Open a shell in the Lima VM (alias for 'mvm shell')
     Ssh,
-    /// Print an SSH config entry for ~/.ssh/config
+    /// Print an SSH config entry for the Lima VM
     SshConfig,
     /// Open a shell in the Lima VM (where Firecracker and Nix are installed)
     Shell {
@@ -172,7 +108,11 @@ enum Commands {
     /// Show status of Lima VM and microVM
     Status,
     /// Tear down Lima VM and all resources
-    Destroy,
+    Destroy {
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+    },
     /// Check for and install the latest version of mvm
     Upgrade {
         /// Only check for updates, don't install
@@ -210,7 +150,7 @@ enum Commands {
         #[arg(long)]
         watch: bool,
     },
-    /// Build from a Nix flake, boot a Firecracker VM, and drop into SSH
+    /// Build from a Nix flake and boot a headless Firecracker VM
     Run {
         /// Nix flake reference (local path or remote URI)
         #[arg(long)]
@@ -227,83 +167,18 @@ enum Commands {
         /// Memory in MiB
         #[arg(long, default_value = "1024")]
         memory: Option<u32>,
-        /// Guest SSH user
-        #[arg(long, default_value = "root")]
-        user: String,
         /// Runtime config (TOML) for persistent resources/volumes
         #[arg(long)]
         config: Option<String>,
         /// Volume override (format: host_path:guest_mount:size). Repeatable.
         #[arg(long, short = 'v')]
         volume: Vec<String>,
-        /// Boot in background, don't drop into SSH
-        #[arg(long)]
-        detach: bool,
     },
     /// Generate shell completions
     Completions {
         /// Shell to generate completions for
         #[arg(value_enum)]
         shell: clap_complete::Shell,
-    },
-    /// Tail audit events for a tenant
-    Events {
-        /// Tenant ID
-        tenant: String,
-        /// Number of recent events to show
-        #[arg(long, short = 'n', default_value = "20")]
-        last: usize,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-
-    // ---- Onboarding ----
-    /// Prepare a host to join the fleet
-    Add {
-        #[command(subcommand)]
-        action: AddCmd,
-    },
-
-    /// Create a deployment from a built-in template
-    New {
-        /// Template name (e.g., "openclaw")
-        template: String,
-        /// Deployment name (becomes tenant ID)
-        name: String,
-        /// Override auto-allocated network ID
-        #[arg(long)]
-        net_id: Option<u16>,
-        /// Override auto-computed subnet (CIDR)
-        #[arg(long)]
-        subnet: Option<String>,
-        /// Override template's default flake reference
-        #[arg(long)]
-        flake: Option<String>,
-        /// Config file with secrets and resource overrides (TOML)
-        #[arg(long)]
-        config: Option<String>,
-    },
-
-    /// Deploy from a standalone manifest file
-    Deploy {
-        /// Path to deployment manifest (TOML)
-        manifest: String,
-        /// Watch mode: re-reconcile at interval
-        #[arg(long)]
-        watch: bool,
-        /// Watch interval in seconds (default: 30)
-        #[arg(long, default_value = "30")]
-        interval: u64,
-    },
-
-    /// Show deployment dashboard (gateway, instances, connection info)
-    Connect {
-        /// Deployment name (tenant ID)
-        name: String,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
     },
 }
 
@@ -389,16 +264,6 @@ enum TemplateCmd {
         #[arg(long)]
         force: bool,
     },
-    /// Migrate an existing pool into a template and point the pool to it
-    MigrateFromPool {
-        /// Pool path: <tenant>/<pool>
-        from: String,
-        /// New template name
-        to: String,
-        /// Overwrite template if it exists
-        #[arg(long)]
-        force: bool,
-    },
     /// Initialize on-disk template layout (idempotent)
     Init {
         /// Template ID
@@ -415,469 +280,11 @@ enum TemplateCmd {
     },
 }
 
-/// Parse a pool path, allowing either `<tenant>/<pool>` or `<pool>` when `tenant` is provided.
-fn parse_pool_path_with_optional_tenant(
-    path: &str,
-    tenant_override: Option<&str>,
-) -> anyhow::Result<(String, String)> {
-    if path.contains('/') {
-        let (t, p) = naming::parse_pool_path(path)?;
-        Ok((t.to_string(), p.to_string()))
-    } else if let Some(t) = tenant_override {
-        Ok((t.to_string(), path.to_string()))
-    } else {
-        anyhow::bail!("Pool path must be <tenant>/<pool> or supply --tenant when using just <pool>")
-    }
-}
-
-// --- Tenant subcommands ---
-
-#[derive(Subcommand)]
-enum TenantCmd {
-    /// Create a new tenant
-    Create {
-        /// Tenant ID (lowercase alphanumeric + hyphens)
-        id: String,
-        /// Coordinator-assigned network ID (0-4095, cluster-unique)
-        #[arg(long)]
-        net_id: Option<u16>,
-        /// Coordinator-assigned IPv4 subnet (CIDR), e.g. "10.240.3.0/24"
-        #[arg(long)]
-        subnet: Option<String>,
-        /// Maximum vCPUs across all instances
-        #[arg(long, default_value = "16")]
-        max_vcpus: u32,
-        /// Maximum memory in MiB across all instances
-        #[arg(long, default_value = "32768")]
-        max_mem: u64,
-        /// Maximum concurrently running instances
-        #[arg(long, default_value = "8")]
-        max_running: u32,
-        /// Maximum warm instances
-        #[arg(long, default_value = "4")]
-        max_warm: u32,
-    },
-    /// List all tenants on this node
-    List {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show tenant details
-    Info {
-        /// Tenant ID
-        id: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Destroy a tenant and all its resources
-    Destroy {
-        /// Tenant ID
-        id: String,
-        /// Skip confirmation
-        #[arg(long)]
-        force: bool,
-        /// Also wipe persistent volumes
-        #[arg(long)]
-        wipe_volumes: bool,
-    },
-    /// Set tenant secrets from a file
-    Secrets {
-        #[command(subcommand)]
-        action: TenantSecretsCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum TenantSecretsCmd {
-    /// Set secrets from a JSON file
-    Set {
-        /// Tenant ID
-        id: String,
-        /// Path to secrets JSON file
-        #[arg(long)]
-        from_file: String,
-    },
-    /// Rotate secrets (bump epoch)
-    Rotate {
-        /// Tenant ID
-        id: String,
-    },
-}
-
-// --- Pool subcommands ---
-
-#[derive(Subcommand)]
-enum PoolCmd {
-    /// Create a new pool within a tenant
-    Create {
-        /// Pool path: <tenant>/<pool>
-        path: String,
-        /// Tenant ID if path is just <pool>
-        #[arg(long)]
-        tenant: Option<String>,
-        /// Template ID to use (required)
-        #[arg(long)]
-        template: String,
-        /// vCPUs per instance
-        #[arg(long)]
-        cpus: u8,
-        /// Memory per instance (MiB)
-        #[arg(long)]
-        mem: u32,
-        /// Data disk per instance (MiB)
-        #[arg(long, default_value = "0")]
-        data_disk: u32,
-    },
-    /// List pools in a tenant
-    List {
-        /// Tenant ID
-        tenant: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show pool details
-    Info {
-        /// Pool path: <tenant>/<pool>
-        path: String,
-        /// Tenant ID if path is just <pool>
-        #[arg(long)]
-        tenant: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Build pool artifacts (ephemeral Firecracker builder VM)
-    Build {
-        /// Pool path: <tenant>/<pool>
-        path: String,
-        /// Tenant ID if path is just <pool>
-        #[arg(long)]
-        tenant: Option<String>,
-        /// Build timeout in seconds
-        #[arg(long)]
-        timeout: Option<u64>,
-        /// Builder vCPUs
-        #[arg(long)]
-        builder_cpus: Option<u8>,
-        /// Builder memory (MiB)
-        #[arg(long)]
-        builder_mem: Option<u32>,
-        /// Force rebuild even if flake.lock unchanged
-        #[arg(long)]
-        force: bool,
-    },
-    /// Scale pool desired counts
-    Scale {
-        /// Pool path: <tenant>/<pool>
-        path: String,
-        /// Tenant ID if path is just <pool>
-        #[arg(long)]
-        tenant: Option<String>,
-        /// Desired running instances
-        #[arg(long)]
-        running: Option<u32>,
-        /// Desired warm instances
-        #[arg(long)]
-        warm: Option<u32>,
-        /// Desired sleeping instances
-        #[arg(long)]
-        sleeping: Option<u32>,
-    },
-    /// Destroy a pool and all its instances
-    Destroy {
-        /// Pool path: <tenant>/<pool>
-        path: String,
-        /// Tenant ID if path is just <pool>
-        #[arg(long)]
-        tenant: Option<String>,
-        /// Skip confirmation
-        #[arg(long)]
-        force: bool,
-    },
-    /// Clean up old build revisions for a pool
-    Gc {
-        /// Pool path: <tenant>/<pool>
-        path: String,
-        /// Tenant ID if path is just <pool>
-        #[arg(long)]
-        tenant: Option<String>,
-        /// Number of revisions to keep
-        #[arg(long, default_value = "2")]
-        keep: usize,
-    },
-}
-
-// --- Instance subcommands ---
-
-#[derive(Subcommand)]
-enum InstanceCmd {
-    /// Create a new instance in a pool
-    Create {
-        /// Pool path: <tenant>/<pool>
-        path: String,
-    },
-    /// List instances
-    List {
-        /// Filter by tenant
-        #[arg(long)]
-        tenant: Option<String>,
-        /// Filter by pool (requires --tenant)
-        #[arg(long)]
-        pool: Option<String>,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Start an instance
-    Start {
-        /// Instance path: <tenant>/<pool>/<instance>
-        path: String,
-    },
-    /// Stop an instance
-    Stop {
-        /// Instance path: <tenant>/<pool>/<instance>
-        path: String,
-    },
-    /// Pause vCPUs (Running → Warm)
-    Warm {
-        /// Instance path: <tenant>/<pool>/<instance>
-        path: String,
-    },
-    /// Snapshot and shutdown (Warm → Sleeping)
-    Sleep {
-        /// Instance path: <tenant>/<pool>/<instance>
-        path: String,
-        /// Skip guest prep ACK, force snapshot
-        #[arg(long)]
-        force: bool,
-    },
-    /// Restore from snapshot (Sleeping → Running)
-    Wake {
-        /// Instance path: <tenant>/<pool>/<instance>
-        path: String,
-    },
-    /// SSH into a running instance
-    #[command(name = "ssh")]
-    Ssh {
-        /// Instance path: <tenant>/<pool>/<instance>
-        path: String,
-    },
-    /// Show instance stats
-    Stats {
-        /// Instance path: <tenant>/<pool>/<instance>
-        path: String,
-        #[arg(long)]
-        json: bool,
-    },
-    /// Destroy an instance
-    Destroy {
-        /// Instance path: <tenant>/<pool>/<instance>
-        path: String,
-        /// Also wipe persistent volumes
-        #[arg(long)]
-        wipe_volumes: bool,
-    },
-    /// View instance logs
-    Logs {
-        /// Instance path: <tenant>/<pool>/<instance>
-        path: String,
-    },
-}
-
-// --- Agent subcommands ---
-
-#[derive(Subcommand)]
-enum AgentCmd {
-    /// Run a single reconcile pass against a desired state file
-    Reconcile {
-        /// Path to desired state JSON
-        #[arg(long)]
-        desired: String,
-        /// Destroy tenants/pools not in desired state
-        #[arg(long)]
-        prune: bool,
-    },
-    /// Start the agent daemon (reconcile loop + QUIC API)
-    Serve {
-        /// Reconcile interval in seconds
-        #[arg(long, default_value = "30")]
-        interval_secs: u64,
-        /// Path to desired state file (alternative to QUIC push)
-        #[arg(long)]
-        desired: Option<String>,
-        /// Listen address for QUIC API
-        #[arg(long)]
-        listen: Option<String>,
-    },
-    /// Generate desired state JSON from existing tenants and pools
-    Desired {
-        /// Write to file instead of stdout
-        #[arg(long)]
-        file: Option<String>,
-        /// Node identifier
-        #[arg(long, default_value = "local")]
-        node_id: String,
-    },
-    /// Manage mTLS certificates for agent communication
-    Certs {
-        #[command(subcommand)]
-        action: AgentCertsCmd,
-    },
-}
-
-#[derive(Subcommand)]
-enum AgentCertsCmd {
-    /// Initialize with a CA certificate
-    Init {
-        /// Path to CA certificate PEM file (omit for self-signed dev CA)
-        #[arg(long)]
-        ca: Option<String>,
-    },
-    /// Rotate the node certificate
-    Rotate,
-    /// Show certificate status
-    Status {
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-// --- Coordinator subcommands ---
-
-#[derive(Subcommand)]
-enum CoordinatorCmd {
-    /// Push desired state to a remote node
-    Push {
-        /// Path to desired state JSON file
-        #[arg(long)]
-        desired: String,
-        /// Remote node address (host:port)
-        #[arg(long)]
-        node: String,
-    },
-    /// Query node status
-    Status {
-        /// Remote node address (host:port)
-        #[arg(long)]
-        node: String,
-    },
-    /// List instances on a remote node
-    ListInstances {
-        /// Remote node address (host:port)
-        #[arg(long)]
-        node: String,
-        /// Tenant ID to filter by
-        #[arg(long)]
-        tenant: String,
-        /// Optional pool ID filter
-        #[arg(long)]
-        pool: Option<String>,
-    },
-    /// Wake a sleeping instance on a remote node
-    Wake {
-        /// Remote node address (host:port)
-        #[arg(long)]
-        node: String,
-        /// Tenant ID
-        #[arg(long)]
-        tenant: String,
-        /// Pool ID
-        #[arg(long)]
-        pool: String,
-        /// Instance ID
-        #[arg(long)]
-        instance: String,
-    },
-    /// Run the coordinator server (TCP proxy with on-demand wake)
-    Serve {
-        /// Path to coordinator TOML config file
-        #[arg(long)]
-        config: String,
-    },
-    /// Display the routing table from a coordinator config
-    Routes {
-        /// Path to coordinator TOML config file
-        #[arg(long)]
-        config: String,
-    },
-}
-
-#[derive(Subcommand)]
-enum DevClusterCmd {
-    /// Generate dev cluster config + certs
-    Init,
-    /// Start agent + coordinator in background
-    Up,
-    /// Show status of dev cluster processes
-    Status,
-    /// Stop dev cluster processes
-    Down,
-}
-
-// --- Network subcommands ---
-
-#[derive(Subcommand)]
-enum NetCmd {
-    /// Verify network configuration for all tenants
-    Verify {
-        #[arg(long)]
-        json: bool,
-    },
-}
-
-// --- Node subcommands ---
-
-#[derive(Subcommand)]
-enum NodeCmd {
-    /// Show node information
-    Info {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show aggregate node statistics
-    Stats {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Show disk usage report
-    Disk {
-        #[arg(long)]
-        json: bool,
-    },
-    /// Run garbage collection across all pools
-    Gc {
-        /// Number of revisions to keep per pool
-        #[arg(long, default_value = "2")]
-        keep: usize,
-    },
-}
-
-// --- Add subcommands ---
-
-#[derive(Subcommand)]
-enum AddCmd {
-    /// Prepare this machine to join the fleet (bootstrap + certs + signing key)
-    Host {
-        /// Path to CA certificate PEM file (omit for self-signed dev CA)
-        #[arg(long)]
-        ca: Option<String>,
-        /// Path to coordinator's Ed25519 public key file
-        #[arg(long)]
-        signing_key: Option<String>,
-        /// Enable production mode checks
-        #[arg(long)]
-        production: bool,
-    },
-}
-
 // ============================================================================
-// Command dispatch
+// Entry point
 // ============================================================================
 
 pub fn run() -> Result<()> {
-    // Install ring as the default TLS crypto provider. Both ring and aws-lc-rs
-    // features are enabled transitively, so rustls can't auto-detect — we must
-    // pick one explicitly before any TLS operation.
-    let _ = rustls::crypto::ring::default_provider().install_default();
-
     let cli = Cli::parse();
 
     // Apply FC version override before anything reads it.
@@ -886,7 +293,7 @@ pub fn run() -> Result<()> {
         unsafe { std::env::set_var("MVM_FC_VERSION", version) };
     }
 
-    // Initialize logging: explicit flag > auto-detect (JSON for daemon mode, human for CLI)
+    // Initialize logging
     let log_format = match cli.log_format.as_deref() {
         Some("json") => LogFormat::Json,
         Some("human") => LogFormat::Human,
@@ -897,19 +304,11 @@ pub fn run() -> Result<()> {
             );
             LogFormat::Human
         }
-        None => match &cli.command {
-            Commands::Agent {
-                action: AgentCmd::Serve { .. },
-            } => LogFormat::Json,
-            _ => LogFormat::Human,
-        },
+        None => LogFormat::Human,
     };
     logging::init(log_format);
 
-    let out_fmt = OutputFormat::from_str_arg(&cli.output);
-
     match cli.command {
-        // --- Dev mode (unchanged) ---
         Commands::Bootstrap { production } => cmd_bootstrap(production),
         Commands::Setup {
             recreate,
@@ -919,7 +318,8 @@ pub fn run() -> Result<()> {
         Commands::Dev {
             lima_cpus,
             lima_mem,
-        } => cmd_dev(lima_cpus, lima_mem),
+            project,
+        } => cmd_dev(lima_cpus, lima_mem, project.as_deref()),
         Commands::Start {
             image,
             config,
@@ -944,7 +344,7 @@ pub fn run() -> Result<()> {
             force,
         } => cmd_sync(debug, skip_deps, force),
         Commands::Status => cmd_status(),
-        Commands::Destroy => cmd_destroy(),
+        Commands::Destroy { yes } => cmd_destroy(yes),
         Commands::Upgrade { check, force } => cmd_upgrade(check, force),
         Commands::Doctor => cmd_doctor(),
         Commands::Build {
@@ -967,63 +367,24 @@ pub fn run() -> Result<()> {
             role,
             cpus,
             memory,
-            user,
             config,
             volume,
-            detach,
         } => cmd_run(
             &flake,
             &profile,
             &role,
             cpus,
             memory,
-            &user,
             config.as_deref(),
             &volume,
-            detach,
         ),
         Commands::Completions { shell } => cmd_completions(shell),
-        Commands::Events { tenant, last, json } => cmd_events(&tenant, last, json),
-
-        // --- Multi-tenant ---
-        Commands::Tenant { action } => cmd_tenant(action, out_fmt),
-        Commands::Pool { action } => cmd_pool(action, out_fmt),
-        Commands::Instance { action } => cmd_instance(action, out_fmt),
-        Commands::Agent { action } => cmd_agent(action),
-        Commands::Coordinator { action } => cmd_coordinator(action, out_fmt),
-        Commands::Template { action } => cmd_template(action, out_fmt),
-        Commands::DevCluster { action } => cmd_dev_cluster(action),
-        Commands::Net { action } => cmd_net(action, out_fmt),
-        Commands::Node { action } => cmd_node(action, out_fmt),
-
-        // --- Onboarding ---
-        Commands::Add { action } => cmd_add(action),
-        Commands::New {
-            template,
-            name,
-            net_id,
-            subnet,
-            flake,
-            config,
-        } => cmd_new(
-            &template,
-            &name,
-            net_id,
-            subnet.as_deref(),
-            flake.as_deref(),
-            config.as_deref(),
-        ),
-        Commands::Deploy {
-            manifest,
-            watch,
-            interval,
-        } => cmd_deploy(&manifest, watch, interval),
-        Commands::Connect { name, json } => cmd_connect(&name, json),
+        Commands::Template { action } => cmd_template(action),
     }
 }
 
 // ============================================================================
-// Dev mode handlers (unchanged except bootstrap)
+// Dev mode handlers
 // ============================================================================
 
 fn cmd_bootstrap(production: bool) -> Result<()> {
@@ -1039,7 +400,7 @@ fn cmd_bootstrap(production: bool) -> Result<()> {
     // Bootstrap uses default Lima resources (8 vCPUs, 16 GiB)
     run_setup_steps(8, 16)?;
 
-    ui::success("\nBootstrap complete! Run 'mvm start' or 'mvm dev' to launch a microVM.");
+    ui::success("\nBootstrap complete! Run 'mvm dev' to enter the development environment.");
     Ok(())
 }
 
@@ -1095,7 +456,7 @@ fn recreate_rootfs() -> Result<()> {
     Ok(())
 }
 
-fn cmd_dev(lima_cpus: u32, lima_mem: u32) -> Result<()> {
+fn cmd_dev(lima_cpus: u32, lima_mem: u32, project: Option<&str>) -> Result<()> {
     ui::info("Launching development environment...\n");
 
     if bootstrap::is_lima_required() {
@@ -1103,44 +464,33 @@ fn cmd_dev(lima_cpus: u32, lima_mem: u32) -> Result<()> {
         if which::which("limactl").is_err() {
             ui::info("Lima not found. Running bootstrap...\n");
             cmd_bootstrap(false)?;
-            return microvm::start();
-        }
-
-        let lima_status = lima::get_status()?;
-        match lima_status {
-            lima::LimaStatus::NotFound => {
-                ui::info("Lima VM not found. Running setup...\n");
-                run_setup_steps(lima_cpus, lima_mem)?;
-                return microvm::start();
+        } else {
+            let lima_status = lima::get_status()?;
+            match lima_status {
+                lima::LimaStatus::NotFound => {
+                    ui::info("Lima VM not found. Running setup...\n");
+                    run_setup_steps(lima_cpus, lima_mem)?;
+                }
+                lima::LimaStatus::Stopped => {
+                    ui::info("Lima VM is stopped. Starting...");
+                    lima::start()?;
+                }
+                lima::LimaStatus::Running => {}
             }
-            lima::LimaStatus::Stopped => {
-                ui::info("Lima VM is stopped. Starting...");
-                lima::start()?;
-            }
-            lima::LimaStatus::Running => {}
         }
     }
 
+    // Install Firecracker if not present (so it's ready for `mvm start` inside Lima)
     if !firecracker::is_installed()? {
         ui::info("Firecracker not installed. Running setup steps...\n");
         firecracker::install()?;
         firecracker::download_assets()?;
         firecracker::prepare_rootfs()?;
         firecracker::write_state()?;
-        return microvm::start();
     }
 
-    if firecracker::is_running()? {
-        if microvm::is_ssh_reachable()? {
-            ui::info("MicroVM is already running. Connecting...\n");
-            return microvm::ssh();
-        }
-        ui::warn("Firecracker running but microVM not reachable.");
-        ui::info("Stopping and restarting...");
-        microvm::stop()?;
-    }
-
-    microvm::start()
+    // Drop into the Lima VM shell (the development environment)
+    cmd_shell(project, lima_cpus, lima_mem)
 }
 
 fn run_setup_steps(lima_cpus: u32, lima_mem: u32) -> Result<()> {
@@ -1268,7 +618,9 @@ fn cmd_stop() -> Result<()> {
 }
 
 fn cmd_ssh() -> Result<()> {
-    microvm::ssh()
+    // `mvm ssh` is now an alias for `mvm shell` — drops into the Lima VM.
+    // MicroVMs never have SSH enabled; use vsock for guest communication.
+    cmd_shell(None, 8, 16)
 }
 
 fn cmd_ssh_config() -> Result<()> {
@@ -1382,9 +734,9 @@ fn cmd_shell(project: Option<&str>, _lima_cpus: u32, _lima_mem: u32) -> Result<(
 }
 
 fn sync_deps_script() -> String {
-    "dpkg -s build-essential pkg-config libssl-dev >/dev/null 2>&1 || \
+    "dpkg -s build-essential binutils lld pkg-config libssl-dev >/dev/null 2>&1 || \
      (sudo apt-get update -qq && \
-      sudo apt-get install -y -qq build-essential pkg-config libssl-dev)"
+      sudo apt-get install -y -qq build-essential binutils lld pkg-config libssl-dev)"
         .to_string()
 }
 
@@ -1407,7 +759,7 @@ fn sync_build_script(source_dir: &str, debug: bool, vm_arch: &str) -> String {
         "export PATH=\"$HOME/.cargo/bin:$PATH\" && \
          if [ -f \"$HOME/.cargo/env\" ]; then . \"$HOME/.cargo/env\"; fi && \
          cd '{}' && \
-         CARGO_TARGET_DIR='{}' cargo build{} --bin mvm --bin mvm-hostd",
+         CARGO_TARGET_DIR='{}' cargo build{} --bin mvm",
         source_dir.replace('\'', "'\\''"),
         target_dir,
         release_flag,
@@ -1420,7 +772,6 @@ fn sync_install_script(source_dir: &str, debug: bool, vm_arch: &str) -> String {
     format!(
         "sudo install -m 0755 \
          '{src}/{target}/{profile}/mvm' \
-         '{src}/{target}/{profile}/mvm-hostd' \
          /usr/local/bin/",
         src = source_dir.replace('\'', "'\\''"),
         target = target_dir,
@@ -1581,19 +932,16 @@ fn cmd_status() -> Result<()> {
         ui::status_line(
             "MicroVM:",
             &format!(
-                "Running — flake (revision {}, {}@{})",
+                "Running — flake (revision {}, guest IP {})",
                 rev,
-                info.guest_user,
                 config::GUEST_IP
             ),
         );
-    } else if microvm::is_ssh_reachable()? {
+    } else {
         ui::status_line(
             "MicroVM:",
-            &format!("Running (SSH: {}@{})", config::GUEST_USER, config::GUEST_IP),
+            &format!("Running (guest IP {})", config::GUEST_IP),
         );
-    } else {
-        ui::status_line("MicroVM:", "Starting or unreachable");
     }
 
     Ok(())
@@ -1696,17 +1044,14 @@ fn resolve_flake_ref(flake_ref: &str) -> Result<String> {
     Ok(canonical.to_string_lossy().to_string())
 }
 
-#[allow(clippy::too_many_arguments)]
 fn cmd_run(
     flake_ref: &str,
     profile: &str,
     role_str: &str,
     cpus: Option<u32>,
     memory: Option<u32>,
-    guest_user: &str,
     config_path: Option<&str>,
     volumes: &[String],
-    detach: bool,
 ) -> Result<()> {
     if bootstrap::is_lima_required() {
         lima::require_running()?;
@@ -1717,7 +1062,7 @@ fn cmd_run(
 
     ui::step(
         1,
-        3,
+        2,
         &format!(
             "Building flake {} (profile={}, role={})",
             resolved, profile, role
@@ -1736,7 +1081,7 @@ fn cmd_run(
         ));
     }
 
-    ui::step(2, 3, "Booting Firecracker VM");
+    ui::step(2, 2, "Booting Firecracker VM");
 
     let rt_config = match config_path {
         Some(p) => image::parse_runtime_config(p)?,
@@ -1765,12 +1110,9 @@ fn cmd_run(
         flake_ref: flake_ref.to_string(),
         cpus: final_cpus,
         memory: final_memory,
-        guest_user: guest_user.to_string(),
-        detach,
         volumes: volume_cfg,
     };
 
-    ui::step(3, 3, "Connecting");
     microvm::run_from_build(&run_config)
 }
 
@@ -1795,40 +1137,7 @@ fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
     Ok(())
 }
 
-fn cmd_events(tenant_id: &str, last: usize, json: bool) -> Result<()> {
-    let entries = mvm_runtime::security::audit::read_audit_log(tenant_id, last)?;
-
-    if entries.is_empty() {
-        ui::info(&format!("No audit events for tenant '{}'.", tenant_id));
-        return Ok(());
-    }
-
-    if json {
-        println!("{}", serde_json::to_string_pretty(&entries)?);
-    } else {
-        for entry in &entries {
-            println!(
-                "{} [{}] {:?}{}{}",
-                entry.timestamp,
-                entry.tenant_id,
-                entry.action,
-                entry
-                    .pool_id
-                    .as_ref()
-                    .map(|p| format!(" pool={}", p))
-                    .unwrap_or_default(),
-                entry
-                    .instance_id
-                    .as_ref()
-                    .map(|i| format!(" instance={}", i))
-                    .unwrap_or_default(),
-            );
-        }
-    }
-    Ok(())
-}
-
-fn cmd_destroy() -> Result<()> {
+fn cmd_destroy(yes: bool) -> Result<()> {
     let status = lima::get_status()?;
 
     if matches!(status, lima::LimaStatus::NotFound) {
@@ -1840,7 +1149,7 @@ fn cmd_destroy() -> Result<()> {
         microvm::stop()?;
     }
 
-    if !ui::confirm("This will delete the Lima VM and all microVM data. Continue?") {
+    if !yes && !ui::confirm("This will delete the Lima VM and all microVM data. Continue?") {
         ui::info("Cancelled.");
         return Ok(());
     }
@@ -1852,634 +1161,10 @@ fn cmd_destroy() -> Result<()> {
 }
 
 // ============================================================================
-// Multi-tenant command handlers
+// Template commands
 // ============================================================================
 
-fn cmd_tenant(action: TenantCmd, out_fmt: OutputFormat) -> Result<()> {
-    use display::{TenantInfo, TenantRow};
-    use mvm_core::tenant::{TenantNet, TenantQuota};
-
-    match action {
-        TenantCmd::Create {
-            id,
-            net_id,
-            subnet,
-            max_vcpus,
-            max_mem,
-            max_running,
-            max_warm,
-        } => {
-            naming::validate_id(&id, "Tenant")?;
-
-            // Auto-allocate network if omitted
-            let net_id = match net_id {
-                Some(n) => n,
-                None => mvm_agent::templates::allocate_net_id()?,
-            };
-            let subnet = match subnet {
-                Some(s) => s,
-                None => mvm_agent::templates::subnet_from_net_id(net_id),
-            };
-
-            // Derive gateway from subnet (first usable IP)
-            let gateway = mvm_agent::templates::gateway_from_subnet(&subnet)?;
-            let net = TenantNet::new(net_id, &subnet, &gateway);
-            let quotas = TenantQuota {
-                max_vcpus,
-                max_mem_mib: max_mem,
-                max_running,
-                max_warm,
-                ..TenantQuota::default()
-            };
-
-            let config = tenant::lifecycle::tenant_create(&id, net, quotas)?;
-            ui::success(&format!("Tenant '{}' created.", config.tenant_id));
-            ui::info(&format!(
-                "  Network: {} (bridge: {})",
-                config.net.ipv4_subnet, config.net.bridge_name
-            ));
-            Ok(())
-        }
-        TenantCmd::List { json } => {
-            let fmt = if json { OutputFormat::Json } else { out_fmt };
-            let tenant_ids = tenant::lifecycle::tenant_list()?;
-
-            if fmt == OutputFormat::Table && tenant_ids.is_empty() {
-                ui::info("No tenants found.");
-                return Ok(());
-            }
-
-            let mut rows = Vec::new();
-            for tid in &tenant_ids {
-                if let Ok(config) = tenant::lifecycle::tenant_load(tid) {
-                    rows.push(TenantRow {
-                        tenant_id: config.tenant_id,
-                        subnet: config.net.ipv4_subnet,
-                        bridge: config.net.bridge_name,
-                        max_vcpus: config.quotas.max_vcpus,
-                        max_mem_mib: config.quotas.max_mem_mib,
-                    });
-                } else {
-                    rows.push(TenantRow {
-                        tenant_id: tid.clone(),
-                        subnet: "?".to_string(),
-                        bridge: "?".to_string(),
-                        max_vcpus: 0,
-                        max_mem_mib: 0,
-                    });
-                }
-            }
-            output::render_list(&rows, fmt);
-            Ok(())
-        }
-        TenantCmd::Info { id, json } => {
-            let fmt = if json { OutputFormat::Json } else { out_fmt };
-            let config = tenant::lifecycle::tenant_load(&id)?;
-            let info = TenantInfo {
-                tenant_id: config.tenant_id,
-                subnet: config.net.ipv4_subnet,
-                gateway: config.net.gateway_ip,
-                bridge: config.net.bridge_name,
-                net_id: config.net.tenant_net_id,
-                max_vcpus: config.quotas.max_vcpus,
-                max_mem_mib: config.quotas.max_mem_mib,
-                max_running: config.quotas.max_running,
-                max_warm: config.quotas.max_warm,
-                created_at: config.created_at,
-            };
-            output::render_one(&info, fmt);
-            Ok(())
-        }
-        TenantCmd::Destroy {
-            id,
-            force,
-            wipe_volumes,
-        } => {
-            if !force && !ui::confirm(&format!("Destroy tenant '{}' and all its resources?", id)) {
-                ui::info("Cancelled.");
-                return Ok(());
-            }
-            // Tear down bridge before destroying tenant
-            if let Ok(config) = tenant::lifecycle::tenant_load(&id) {
-                let _ = bridge::destroy_tenant_bridge(&config.net);
-            }
-            tenant::lifecycle::tenant_destroy(&id, wipe_volumes)?;
-            ui::success(&format!("Tenant '{}' destroyed.", id));
-            Ok(())
-        }
-        TenantCmd::Secrets { action } => match action {
-            TenantSecretsCmd::Set { id, from_file } => {
-                tenant::secrets::secrets_set(&id, &from_file)?;
-                ui::success(&format!("Secrets set for tenant '{}'.", id));
-                Ok(())
-            }
-            TenantSecretsCmd::Rotate { id } => {
-                tenant::secrets::secrets_rotate(&id)?;
-                ui::success(&format!("Secrets rotated for tenant '{}'.", id));
-                Ok(())
-            }
-        },
-    }
-}
-
-fn cmd_pool(action: PoolCmd, out_fmt: OutputFormat) -> Result<()> {
-    use display::{PoolInfo, PoolRow};
-    use mvm_core::pool::InstanceResources;
-
-    match action {
-        PoolCmd::Create {
-            path,
-            tenant,
-            template,
-            cpus,
-            mem,
-            data_disk,
-        } => {
-            let (tenant_id, pool_id) =
-                parse_pool_path_with_optional_tenant(&path, tenant.as_deref())?;
-            let parsed_role = parse_role("worker")?;
-            let resources = InstanceResources {
-                vcpus: cpus,
-                mem_mib: mem,
-                data_disk_mib: data_disk,
-            };
-            let spec = pool::lifecycle::pool_create(
-                &tenant_id,
-                &pool_id,
-                &format!("template:{}", template),
-                "minimal",
-                resources,
-                parsed_role,
-                &template,
-            )?;
-            ui::success(&format!(
-                "Pool '{}/{}' created.",
-                spec.tenant_id, spec.pool_id
-            ));
-            Ok(())
-        }
-        PoolCmd::List { tenant, json } => {
-            let fmt = if json { OutputFormat::Json } else { out_fmt };
-            let pool_ids = pool::lifecycle::pool_list(&tenant)?;
-
-            if fmt == OutputFormat::Table && pool_ids.is_empty() {
-                ui::info(&format!("No pools found for tenant '{}'.", tenant));
-                return Ok(());
-            }
-
-            let mut rows = Vec::new();
-            for pid in &pool_ids {
-                if let Ok(spec) = pool::lifecycle::pool_load(&tenant, pid) {
-                    rows.push(PoolRow {
-                        pool_path: format!("{}/{}", tenant, pid),
-                        role: spec.role.to_string(),
-                        profile: spec.profile,
-                        vcpus: spec.instance_resources.vcpus,
-                        mem_mib: spec.instance_resources.mem_mib,
-                        desired_running: spec.desired_counts.running,
-                        desired_warm: spec.desired_counts.warm,
-                        desired_sleeping: spec.desired_counts.sleeping,
-                    });
-                }
-            }
-            output::render_list(&rows, fmt);
-            Ok(())
-        }
-        PoolCmd::Info { path, tenant, json } => {
-            let fmt = if json { OutputFormat::Json } else { out_fmt };
-            let (tenant_id, pool_id) =
-                parse_pool_path_with_optional_tenant(&path, tenant.as_deref())?;
-            let spec = pool::lifecycle::pool_load(&tenant_id, &pool_id)?;
-            let info = PoolInfo {
-                pool_path: format!("{}/{}", spec.tenant_id, spec.pool_id),
-                role: spec.role.to_string(),
-                flake_ref: spec.flake_ref,
-                profile: spec.profile,
-                vcpus: spec.instance_resources.vcpus,
-                mem_mib: spec.instance_resources.mem_mib,
-                data_disk_mib: spec.instance_resources.data_disk_mib,
-                desired_running: spec.desired_counts.running,
-                desired_warm: spec.desired_counts.warm,
-                desired_sleeping: spec.desired_counts.sleeping,
-                seccomp_policy: spec.seccomp_policy,
-            };
-            output::render_one(&info, fmt);
-            Ok(())
-        }
-        PoolCmd::Build {
-            path,
-            tenant,
-            timeout,
-            builder_cpus,
-            builder_mem,
-            force,
-        } => {
-            let (tenant_id, pool_id) =
-                parse_pool_path_with_optional_tenant(&path, tenant.as_deref())?;
-            // If pool is template-backed and --force was requested, rebuild the template first.
-            if force
-                && let Ok(spec) = pool::lifecycle::pool_load(&tenant_id, &pool_id)
-                && !spec.template_id.is_empty()
-            {
-                ui::info(&format!(
-                    "Force rebuild requested; rebuilding template '{}' first...",
-                    spec.template_id
-                ));
-                template_cmd::build(&spec.template_id, true, None)?;
-            }
-            let env = mvm_runtime::build_env::RuntimeBuildEnv;
-            let opts = mvm_build::build::PoolBuildOpts {
-                timeout_secs: timeout,
-                builder_vcpus: builder_cpus,
-                builder_mem_mib: builder_mem,
-                force_rebuild: force,
-            };
-            mvm_build::build::pool_build_with_opts(&env, &tenant_id, &pool_id, opts)
-        }
-        PoolCmd::Scale {
-            path,
-            tenant,
-            running,
-            warm,
-            sleeping,
-        } => {
-            let (tenant_id, pool_id) =
-                parse_pool_path_with_optional_tenant(&path, tenant.as_deref())?;
-            pool::lifecycle::pool_scale(&tenant_id, &pool_id, running, warm, sleeping)?;
-            ui::success(&format!("Pool '{}' scaled.", path));
-            Ok(())
-        }
-        PoolCmd::Destroy {
-            path,
-            tenant,
-            force,
-        } => {
-            let (tenant_id, pool_id) =
-                parse_pool_path_with_optional_tenant(&path, tenant.as_deref())?;
-            pool::lifecycle::pool_destroy(&tenant_id, &pool_id, force)?;
-            ui::success(&format!("Pool '{}' destroyed.", path));
-            Ok(())
-        }
-        PoolCmd::Gc { path, tenant, keep } => {
-            let (tenant_id, pool_id) =
-                parse_pool_path_with_optional_tenant(&path, tenant.as_deref())?;
-            let removed =
-                mvm_runtime::vm::disk_manager::cleanup_old_revisions(&tenant_id, &pool_id, keep)?;
-            if removed > 0 {
-                ui::success(&format!(
-                    "Cleaned up {} old revisions for '{}'.",
-                    removed, path
-                ));
-            } else {
-                ui::info(&format!("No old revisions to clean up for '{}'.", path));
-            }
-            Ok(())
-        }
-    }
-}
-
-fn cmd_instance(action: InstanceCmd, out_fmt: OutputFormat) -> Result<()> {
-    use display::{InstanceInfo, InstanceRow};
-    use mvm_runtime::vm::instance::lifecycle as inst;
-
-    match action {
-        InstanceCmd::Create { path } => {
-            let (t, p) = naming::parse_pool_path(&path)?;
-            let instance_id = inst::instance_create(t, p)?;
-            ui::success(&format!(
-                "Instance '{}' created in {}/{}.",
-                instance_id, t, p
-            ));
-            Ok(())
-        }
-        InstanceCmd::List { tenant, pool, json } => {
-            let fmt = if json { OutputFormat::Json } else { out_fmt };
-            let tenants = match &tenant {
-                Some(t) => vec![t.clone()],
-                None => tenant::lifecycle::tenant_list()?,
-            };
-
-            let mut all_states = Vec::new();
-            for tid in &tenants {
-                let pools = match &pool {
-                    Some(p) => vec![p.clone()],
-                    None => pool::lifecycle::pool_list(tid)?,
-                };
-                for pid in &pools {
-                    if let Ok(states) = inst::instance_list(tid, pid) {
-                        all_states.extend(states);
-                    }
-                }
-            }
-
-            if fmt == OutputFormat::Table && all_states.is_empty() {
-                ui::info("No instances found.");
-                return Ok(());
-            }
-
-            let rows: Vec<InstanceRow> = all_states
-                .iter()
-                .map(|s| InstanceRow {
-                    instance_path: format!("{}/{}/{}", s.tenant_id, s.pool_id, s.instance_id),
-                    status: s.status.to_string(),
-                    guest_ip: s.net.guest_ip.clone(),
-                    tap_dev: s.net.tap_dev.clone(),
-                    pid: s
-                        .firecracker_pid
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "-".to_string()),
-                })
-                .collect();
-            output::render_list(&rows, fmt);
-            Ok(())
-        }
-        InstanceCmd::Start { path } => {
-            let (t, p, i) = naming::parse_instance_path(&path)?;
-            inst::instance_start(t, p, i)?;
-            ui::success(&format!("Instance '{}' started.", path));
-            Ok(())
-        }
-        InstanceCmd::Stop { path } => {
-            let (t, p, i) = naming::parse_instance_path(&path)?;
-            inst::instance_stop(t, p, i)?;
-            ui::success(&format!("Instance '{}' stopped.", path));
-            Ok(())
-        }
-        InstanceCmd::Warm { path } => {
-            let (t, p, i) = naming::parse_instance_path(&path)?;
-            inst::instance_warm(t, p, i)?;
-            ui::success(&format!("Instance '{}' paused (warm).", path));
-            Ok(())
-        }
-        InstanceCmd::Sleep { path, force } => {
-            let (t, p, i) = naming::parse_instance_path(&path)?;
-            inst::instance_sleep(t, p, i, force)
-        }
-        InstanceCmd::Wake { path } => {
-            let (t, p, i) = naming::parse_instance_path(&path)?;
-            inst::instance_wake(t, p, i)
-        }
-        InstanceCmd::Ssh { path } => {
-            let (t, p, i) = naming::parse_instance_path(&path)?;
-            inst::instance_ssh(t, p, i)
-        }
-        InstanceCmd::Stats { path, json } => {
-            let fmt = if json { OutputFormat::Json } else { out_fmt };
-            let (t, p, i) = naming::parse_instance_path(&path)?;
-            let state = inst::instance_list(t, p)?
-                .into_iter()
-                .find(|s| s.instance_id == i)
-                .ok_or_else(|| anyhow::anyhow!("Instance not found: {}", path))?;
-
-            let info = InstanceInfo {
-                instance_path: format!("{}/{}/{}", t, p, i),
-                status: state.status.to_string(),
-                guest_ip: state.net.guest_ip.clone(),
-                tap_dev: state.net.tap_dev.clone(),
-                mac: state.net.mac.clone(),
-                pid: state
-                    .firecracker_pid
-                    .map(|p| p.to_string())
-                    .unwrap_or_else(|| "-".to_string()),
-                revision: state.revision_hash.unwrap_or_else(|| "-".to_string()),
-                last_started: state.last_started_at.unwrap_or_else(|| "-".to_string()),
-                last_stopped: state.last_stopped_at.unwrap_or_else(|| "-".to_string()),
-            };
-            output::render_one(&info, fmt);
-            Ok(())
-        }
-        InstanceCmd::Destroy { path, wipe_volumes } => {
-            let (t, p, i) = naming::parse_instance_path(&path)?;
-            inst::instance_destroy(t, p, i, wipe_volumes)?;
-            ui::success(&format!("Instance '{}' destroyed.", path));
-            Ok(())
-        }
-        InstanceCmd::Logs { path } => {
-            let (t, p, i) = naming::parse_instance_path(&path)?;
-            let logs = inst::instance_logs(t, p, i)?;
-            println!("{}", logs);
-            Ok(())
-        }
-    }
-}
-
-fn cmd_agent(action: AgentCmd) -> Result<()> {
-    use mvm_runtime::security::certs;
-
-    match action {
-        AgentCmd::Reconcile { desired, prune } => mvm_agent::agent::reconcile(&desired, prune),
-        AgentCmd::Desired { file, node_id } => {
-            let desired = mvm_agent::agent::generate_desired(&node_id)?;
-            let json = serde_json::to_string_pretty(&desired)?;
-            match file {
-                Some(path) => {
-                    std::fs::write(&path, &json)?;
-                    ui::success(&format!("Desired state written to {}", path));
-                }
-                None => println!("{}", json),
-            }
-            Ok(())
-        }
-        AgentCmd::Serve {
-            interval_secs,
-            desired,
-            listen,
-        } => mvm_agent::agent::serve(interval_secs, desired.as_deref(), listen.as_deref()),
-        AgentCmd::Certs { action } => match action {
-            AgentCertsCmd::Init { ca } => {
-                match ca {
-                    Some(ca_path) => {
-                        certs::init_ca(&ca_path)?;
-                        ui::success("CA certificate initialized.");
-                    }
-                    None => {
-                        // Generate self-signed dev CA + node cert
-                        let node_id = format!(
-                            "mvm-{}",
-                            uuid::Uuid::new_v4()
-                                .to_string()
-                                .split('-')
-                                .next()
-                                .unwrap_or("dev")
-                        );
-                        let paths = certs::generate_self_signed(&node_id)?;
-                        ui::success(&format!(
-                            "Self-signed certificates generated for '{}'.",
-                            node_id
-                        ));
-                        ui::info(&format!("  CA:   {}", paths.ca_cert));
-                        ui::info(&format!("  Cert: {}", paths.node_cert));
-                        ui::info(&format!("  Key:  {}", paths.node_key));
-                    }
-                }
-                Ok(())
-            }
-            AgentCertsCmd::Rotate => {
-                let node_id =
-                    shell::run_in_vm_stdout("cat /var/lib/mvm/node_id 2>/dev/null || echo mvm-dev")
-                        .unwrap_or_else(|_| "mvm-dev".to_string());
-                let paths = certs::rotate_certs(node_id.trim())?;
-                ui::success("Certificates rotated.");
-                ui::info(&format!("  Cert: {}", paths.node_cert));
-                Ok(())
-            }
-            AgentCertsCmd::Status { json } => certs::show_status(json),
-        },
-    }
-}
-
-fn cmd_net(action: NetCmd, out_fmt: OutputFormat) -> Result<()> {
-    match action {
-        NetCmd::Verify { json } => {
-            let fmt = if json { OutputFormat::Json } else { out_fmt };
-            let tenants = tenant::lifecycle::tenant_list()?;
-            let mut reports = Vec::new();
-            let mut all_issues = Vec::new();
-
-            for tid in &tenants {
-                if let Ok(config) = tenant::lifecycle::tenant_load(tid) {
-                    let report = bridge::full_bridge_report(tid, &config.net)?;
-                    for issue in &report.issues {
-                        all_issues.push(format!("{}: {}", tid, issue));
-                    }
-                    reports.push(report);
-                }
-            }
-
-            if fmt != OutputFormat::Table {
-                // JSON/YAML: always output structured data
-                match fmt {
-                    OutputFormat::Json => {
-                        println!("{}", serde_json::to_string_pretty(&reports)?);
-                    }
-                    OutputFormat::Yaml => {
-                        println!("{}", serde_yaml::to_string(&reports)?);
-                    }
-                    _ => unreachable!(),
-                }
-            } else if all_issues.is_empty() {
-                ui::success("All tenant networks verified.");
-                for r in &reports {
-                    ui::info(&format!(
-                        "  {} ({}) — bridge: {}, TAPs: {}",
-                        r.tenant_id,
-                        r.subnet,
-                        if r.bridge_up { "UP" } else { "DOWN" },
-                        r.tap_devices.len(),
-                    ));
-                }
-            } else {
-                ui::warn("Network issues found:");
-                for issue in &all_issues {
-                    ui::error(&format!("  {}", issue));
-                }
-            }
-            Ok(())
-        }
-    }
-}
-
-fn cmd_node(action: NodeCmd, out_fmt: OutputFormat) -> Result<()> {
-    let _ = out_fmt; // node commands already handle json flag internally
-    match action {
-        NodeCmd::Info { json } => {
-            let info =
-                mvm_agent::node::collect_info().with_context(|| "Failed to collect node info")?;
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&info)?);
-            } else {
-                println!("Node ID:       {}", info.node_id);
-                println!("Hostname:      {}", info.hostname);
-                println!("Architecture:  {}", info.arch);
-                println!("vCPUs:         {}", info.total_vcpus);
-                println!("Memory:        {} MiB", info.total_mem_mib);
-                println!(
-                    "Lima:          {}",
-                    info.lima_status.as_deref().unwrap_or("unknown")
-                );
-                println!(
-                    "Firecracker:   {}",
-                    info.firecracker_version.as_deref().unwrap_or("not found")
-                );
-                println!(
-                    "Jailer:        {}",
-                    if info.jailer_available {
-                        "available"
-                    } else {
-                        "not found"
-                    }
-                );
-                println!(
-                    "cgroup v2:     {}",
-                    if info.cgroup_v2 { "yes" } else { "no" }
-                );
-            }
-
-            Ok(())
-        }
-        NodeCmd::Stats { json } => {
-            let stats =
-                mvm_agent::node::collect_stats().with_context(|| "Failed to collect node stats")?;
-
-            if json {
-                println!("{}", serde_json::to_string_pretty(&stats)?);
-            } else {
-                println!("Tenants:    {}", stats.tenant_count);
-                println!("Pools:      {}", stats.pool_count);
-                println!("Running:    {}", stats.running_instances);
-                println!("Warm:       {}", stats.warm_instances);
-                println!("Sleeping:   {}", stats.sleeping_instances);
-                println!("Stopped:    {}", stats.stopped_instances);
-            }
-
-            Ok(())
-        }
-        NodeCmd::Disk { json } => {
-            let report = mvm_runtime::vm::disk_manager::disk_usage_report()?;
-            if json {
-                println!("{}", serde_json::to_string_pretty(&report)?);
-            } else {
-                println!("Total disk usage: {} bytes", report.total_bytes);
-                for t in &report.tenants {
-                    println!("  Tenant '{}': {} bytes", t.tenant_id, t.total_bytes);
-                    for p in &t.pools {
-                        println!(
-                            "    Pool '{}': artifacts={}, instances={}, total={}",
-                            p.pool_id, p.artifacts_bytes, p.instances_bytes, p.total_bytes
-                        );
-                    }
-                }
-            }
-            Ok(())
-        }
-        NodeCmd::Gc { keep } => {
-            let tenant_ids = tenant::lifecycle::tenant_list()?;
-            let mut total_removed = 0u32;
-            for tid in &tenant_ids {
-                if let Ok(pool_ids) = pool::lifecycle::pool_list(tid) {
-                    for pid in &pool_ids {
-                        match mvm_runtime::vm::disk_manager::cleanup_old_revisions(tid, pid, keep) {
-                            Ok(n) => total_removed += n,
-                            Err(e) => ui::warn(&format!("GC failed for {}/{}: {}", tid, pid, e)),
-                        }
-                    }
-                }
-            }
-            if total_removed > 0 {
-                ui::success(&format!(
-                    "Removed {} old revisions across all pools.",
-                    total_removed
-                ));
-            } else {
-                ui::info("No old revisions to clean up.");
-            }
-            Ok(())
-        }
-    }
-}
-
-fn cmd_template(action: TemplateCmd, _out_fmt: OutputFormat) -> Result<()> {
+fn cmd_template(action: TemplateCmd) -> Result<()> {
     match action {
         TemplateCmd::Create {
             name,
@@ -2499,12 +1184,8 @@ fn cmd_template(action: TemplateCmd, _out_fmt: OutputFormat) -> Result<()> {
             mem,
             data_disk,
         } => {
-            let roles_vec: Vec<String> = roles
-                .split(',')
-                .map(|s| s.trim().to_string())
-                .filter(|s| !s.is_empty())
-                .collect();
-            template_cmd::create_multi(&base, &flake, &profile, &roles_vec, cpus, mem, data_disk)
+            let role_list: Vec<String> = roles.split(',').map(|s| s.trim().to_string()).collect();
+            template_cmd::create_multi(&base, &flake, &profile, &role_list, cpus, mem, data_disk)
         }
         TemplateCmd::Build {
             name,
@@ -2517,647 +1198,22 @@ fn cmd_template(action: TemplateCmd, _out_fmt: OutputFormat) -> Result<()> {
         TemplateCmd::List { json } => template_cmd::list(json),
         TemplateCmd::Info { name, json } => template_cmd::info(&name, json),
         TemplateCmd::Delete { name, force } => template_cmd::delete(&name, force),
-        TemplateCmd::MigrateFromPool { from, to, force } => {
-            template_cmd::migrate_from_pool(&from, &to, force)
-        }
         TemplateCmd::Init {
             name,
             local,
             vm,
             dir,
         } => {
-            if local && vm {
-                anyhow::bail!("Specify only one of --local or --vm");
-            }
-            let use_local = if vm { false } else { local };
+            let use_local = local && !vm;
             template_cmd::init(&name, use_local, &dir)
         }
     }
 }
 
-fn cmd_coordinator(action: CoordinatorCmd, _out_fmt: OutputFormat) -> Result<()> {
-    use mvm_coordinator::client::{CoordinatorClient, run_coordinator_command};
-    use mvm_core::agent::{AgentRequest, AgentResponse, DesiredState};
-
-    match action {
-        CoordinatorCmd::Push { desired, node } => {
-            let json = std::fs::read_to_string(&desired)
-                .with_context(|| format!("Failed to read desired state file: {}", desired))?;
-            let state: DesiredState = serde_json::from_str(&json)
-                .with_context(|| "Failed to parse desired state JSON")?;
-
-            let addr: std::net::SocketAddr = node
-                .parse()
-                .with_context(|| format!("Invalid node address: {}", node))?;
-
-            run_coordinator_command(async {
-                let client = CoordinatorClient::new()?;
-                let response = client.send(addr, &AgentRequest::Reconcile(state)).await?;
-                match response {
-                    AgentResponse::ReconcileResult(report) => {
-                        ui::success(&format!(
-                            "Reconcile pushed to {}. Instances: +{} started, {} errors",
-                            node,
-                            report.instances_started,
-                            report.errors.len()
-                        ));
-                        if !report.errors.is_empty() {
-                            for err in &report.errors {
-                                ui::error(&format!("  {}", err));
-                            }
-                        }
-                    }
-                    AgentResponse::Error { code, message } => {
-                        ui::error(&format!("Node error ({}): {}", code, message));
-                    }
-                    _ => {
-                        ui::warn("Unexpected response type from node.");
-                    }
-                }
-                Ok(())
-            })
-        }
-        CoordinatorCmd::Status { node } => {
-            let addr: std::net::SocketAddr = node
-                .parse()
-                .with_context(|| format!("Invalid node address: {}", node))?;
-
-            run_coordinator_command(async {
-                let client = CoordinatorClient::new()?;
-                let response = client.send(addr, &AgentRequest::NodeInfo).await?;
-                match response {
-                    AgentResponse::NodeInfo(info) => {
-                        println!("{}", serde_json::to_string_pretty(&info)?);
-                    }
-                    AgentResponse::Error { code, message } => {
-                        ui::error(&format!("Node error ({}): {}", code, message));
-                    }
-                    _ => {
-                        ui::warn("Unexpected response type from node.");
-                    }
-                }
-                Ok(())
-            })
-        }
-        CoordinatorCmd::ListInstances { node, tenant, pool } => {
-            let addr: std::net::SocketAddr = node
-                .parse()
-                .with_context(|| format!("Invalid node address: {}", node))?;
-
-            run_coordinator_command(async {
-                let client = CoordinatorClient::new()?;
-                let response = client
-                    .send(
-                        addr,
-                        &AgentRequest::InstanceList {
-                            tenant_id: tenant.clone(),
-                            pool_id: pool,
-                        },
-                    )
-                    .await?;
-                match response {
-                    AgentResponse::InstanceList(instances) => {
-                        if instances.is_empty() {
-                            ui::info(&format!("No instances found for tenant '{}'.", tenant));
-                        } else {
-                            println!("{}", serde_json::to_string_pretty(&instances)?);
-                        }
-                    }
-                    AgentResponse::Error { code, message } => {
-                        ui::error(&format!("Node error ({}): {}", code, message));
-                    }
-                    _ => {
-                        ui::warn("Unexpected response type from node.");
-                    }
-                }
-                Ok(())
-            })
-        }
-        CoordinatorCmd::Wake {
-            node,
-            tenant,
-            pool,
-            instance,
-        } => {
-            let addr: std::net::SocketAddr = node
-                .parse()
-                .with_context(|| format!("Invalid node address: {}", node))?;
-
-            run_coordinator_command(async {
-                let client = CoordinatorClient::new()?;
-                let response = client
-                    .send(
-                        addr,
-                        &AgentRequest::WakeInstance {
-                            tenant_id: tenant,
-                            pool_id: pool,
-                            instance_id: instance.clone(),
-                        },
-                    )
-                    .await?;
-                match response {
-                    AgentResponse::WakeResult { success } => {
-                        if success {
-                            ui::success(&format!("Instance '{}' woken.", instance));
-                        } else {
-                            ui::error(&format!("Failed to wake instance '{}'.", instance));
-                        }
-                    }
-                    AgentResponse::Error { code, message } => {
-                        ui::error(&format!("Node error ({}): {}", code, message));
-                    }
-                    _ => {
-                        ui::warn("Unexpected response type from node.");
-                    }
-                }
-                Ok(())
-            })
-        }
-        CoordinatorCmd::Serve { config } => {
-            use mvm_coordinator::config::CoordinatorConfig;
-
-            let config_path = std::path::Path::new(&config);
-            let coord_config = CoordinatorConfig::from_file(config_path)?;
-
-            ui::info(&format!(
-                "Starting coordinator with {} routes from {}",
-                coord_config.routes.len(),
-                config
-            ));
-
-            run_coordinator_command(async { mvm_coordinator::server::serve(coord_config).await })
-        }
-        CoordinatorCmd::Routes { config } => {
-            use mvm_coordinator::config::CoordinatorConfig;
-
-            let config_path = std::path::Path::new(&config);
-            let coord_config = CoordinatorConfig::from_file(config_path)?;
-            let header = "IDLE TIMEOUT";
-            println!(
-                "{:<20} {:<20} {:<15} {:<25} {}",
-                "TENANT", "POOL", "LISTEN", "NODE", header
-            );
-            for route in &coord_config.routes {
-                let listen = route.listen;
-                let idle = route.idle_timeout(&coord_config.coordinator);
-                let node = route.node;
-                println!(
-                    "{:<20} {:<20} {:<15} {:<25} {}s",
-                    route.tenant_id, route.pool_id, listen, node, idle,
-                );
-            }
-            Ok(())
-        }
-    }
-}
-
-fn cmd_dev_cluster(action: DevClusterCmd) -> Result<()> {
-    match action {
-        DevClusterCmd::Init => crate::dev_cluster::init(),
-        DevClusterCmd::Up => crate::dev_cluster::up(),
-        DevClusterCmd::Status => crate::dev_cluster::status(),
-        DevClusterCmd::Down => crate::dev_cluster::down(),
-    }
-}
-
 // ============================================================================
-// Onboarding command handlers
+// Utilities
 // ============================================================================
 
-fn cmd_add(action: AddCmd) -> Result<()> {
-    match action {
-        AddCmd::Host {
-            ca,
-            signing_key,
-            production,
-        } => cmd_add_host(ca.as_deref(), signing_key.as_deref(), production),
-    }
-}
-
-fn cmd_add_host(
-    ca_path: Option<&str>,
-    signing_key_path: Option<&str>,
-    production: bool,
-) -> Result<()> {
-    use mvm_runtime::security::certs;
-
-    let total_steps = 2 + u32::from(signing_key_path.is_some());
-
-    // Step 1: Bootstrap
-    ui::step(1, total_steps, "Bootstrapping environment...");
-    cmd_bootstrap(production).with_context(|| "Bootstrap failed")?;
-
-    // Step 2: Initialize mTLS certificates
-    ui::step(2, total_steps, "Initializing mTLS certificates...");
-    if let Some(ca) = ca_path {
-        certs::init_ca(ca)?;
-        ui::info("  CA certificate imported.");
-    }
-    let node_id = format!("mvm-{}", &uuid::Uuid::new_v4().to_string()[..8]);
-    let paths = certs::generate_self_signed(&node_id)?;
-    ui::info(&format!("  Node certificate: {}", paths.node_cert));
-
-    // Step 3 (optional): Copy signing key
-    if let Some(key_path) = signing_key_path {
-        ui::step(3, total_steps, "Installing coordinator signing key...");
-        shell::run_in_vm("sudo mkdir -p /etc/mvm/trusted_keys")?;
-        shell::run_in_vm(&format!(
-            "sudo cp {} /etc/mvm/trusted_keys/coordinator.pub && \
-             sudo chmod 644 /etc/mvm/trusted_keys/coordinator.pub",
-            key_path
-        ))?;
-        ui::info("  Signing key installed.");
-    }
-
-    ui::success("\nHost prepared successfully!");
-    ui::info("\nNext steps:");
-    ui::info("  Start the agent daemon:");
-    ui::info("    mvm agent serve --interval-secs 30");
-    if signing_key_path.is_none() {
-        ui::info("\n  Note: no signing key provided. For production, re-run with --signing-key.");
-    }
-
-    Ok(())
-}
-
-fn cmd_new(
-    template_name: &str,
-    name: &str,
-    net_id_override: Option<u16>,
-    subnet_override: Option<&str>,
-    flake_override: Option<&str>,
-    config_path: Option<&str>,
-) -> Result<()> {
-    use mvm_agent::templates;
-    use mvm_core::tenant::TenantNet;
-
-    naming::validate_id(name, "Deployment")?;
-
-    let template = templates::get_template(template_name).ok_or_else(|| {
-        let available = templates::list_templates().join(", ");
-        anyhow::anyhow!(
-            "Unknown template '{}'. Available: {}",
-            template_name,
-            available
-        )
-    })?;
-
-    // Load optional config file
-    let deploy_config = match config_path {
-        Some(path) => Some(templates::DeployConfig::from_file(std::path::Path::new(
-            path,
-        ))?),
-        None => None,
-    };
-
-    ui::info(&format!(
-        "Creating '{}' from template '{}'...\n",
-        name, template_name
-    ));
-
-    let pool_count = template.pools.len() as u32;
-    // Steps: allocate + create tenant + (create pool * N) + (build * N) + scale
-    let total_steps = 2 + pool_count + pool_count + 1;
-    let mut step = 0u32;
-
-    // Step 1: Allocate network
-    step += 1;
-    ui::step(step, total_steps, "Allocating network...");
-    let net_id = match net_id_override {
-        Some(id) => id,
-        None => templates::allocate_net_id()?,
-    };
-    let subnet = match subnet_override {
-        Some(s) => s.to_string(),
-        None => templates::subnet_from_net_id(net_id),
-    };
-    let gateway = templates::gateway_from_subnet(&subnet)?;
-    ui::info(&format!("  net-id: {}, subnet: {}", net_id, subnet));
-
-    // Step 2: Create tenant
-    step += 1;
-    let step_msg = format!("Creating tenant '{}'...", name);
-    ui::step(step, total_steps, &step_msg);
-    let net = TenantNet::new(net_id, &subnet, &gateway);
-    tenant::lifecycle::tenant_create(name, net, template.quotas.clone())?;
-
-    // Determine flake: CLI override > config override > template default
-    let flake_ref = flake_override
-        .map(|s| s.to_string())
-        .or_else(|| {
-            deploy_config
-                .as_ref()
-                .and_then(|c| c.overrides.flake.clone())
-        })
-        .unwrap_or_else(|| template.default_flake.to_string());
-
-    // Create pools (applying config overrides)
-    for pool_tmpl in &template.pools {
-        step += 1;
-        let step_msg = format!("Creating pool '{}/{}'...", name, pool_tmpl.pool_id);
-        ui::step(step, total_steps, &step_msg);
-
-        // Apply pool-level overrides from config
-        let (vcpus, mem_mib) = apply_pool_overrides(pool_tmpl, deploy_config.as_ref());
-
-        let resources = mvm_core::pool::InstanceResources {
-            vcpus,
-            mem_mib,
-            data_disk_mib: pool_tmpl.data_disk_mib,
-        };
-        pool::lifecycle::pool_create(
-            name,
-            pool_tmpl.pool_id,
-            &flake_ref,
-            pool_tmpl.profile,
-            resources,
-            pool_tmpl.role.clone(),
-            template.name,
-        )?;
-    }
-
-    // Build pools
-    for pool_tmpl in &template.pools {
-        step += 1;
-        let step_msg = format!("Building '{}/{}'...", name, pool_tmpl.pool_id);
-        ui::step(step, total_steps, &step_msg);
-        let env = mvm_runtime::build_env::RuntimeBuildEnv;
-        mvm_build::build::pool_build(&env, name, pool_tmpl.pool_id, None)?;
-    }
-
-    // Scale up
-    step += 1;
-    ui::step(step, total_steps, "Scaling to running instances...");
-    for pool_tmpl in &template.pools {
-        let (running, warm) = scale_for_role(pool_tmpl, deploy_config.as_ref());
-        pool::lifecycle::pool_scale(name, pool_tmpl.pool_id, running, warm, None)?;
-    }
-
-    ui::success(&format!("\nDeployment '{}' created!", name));
-    ui::info(&format!("\n  mvm connect {}", name));
-
-    Ok(())
-}
-
-/// Apply pool overrides from a DeployConfig, matching by pool_id.
-fn apply_pool_overrides(
-    pool_tmpl: &mvm_agent::templates::PoolTemplate,
-    config: Option<&mvm_agent::templates::DeployConfig>,
-) -> (u8, u32) {
-    let mut vcpus = pool_tmpl.vcpus;
-    let mut mem_mib = pool_tmpl.mem_mib;
-
-    if let Some(cfg) = config {
-        let pool_override = match pool_tmpl.pool_id {
-            "gateways" => cfg.overrides.gateways.as_ref(),
-            "workers" => cfg.overrides.workers.as_ref(),
-            _ => None,
-        };
-        if let Some(ov) = pool_override {
-            if let Some(v) = ov.vcpus {
-                vcpus = v;
-            }
-            if let Some(m) = ov.mem_mib {
-                mem_mib = m;
-            }
-        }
-    }
-
-    (vcpus, mem_mib)
-}
-
-/// Determine scale counts for a pool based on role and config overrides.
-fn scale_for_role(
-    pool_tmpl: &mvm_agent::templates::PoolTemplate,
-    config: Option<&mvm_agent::templates::DeployConfig>,
-) -> (Option<u32>, Option<u32>) {
-    let default = match pool_tmpl.role {
-        mvm_core::pool::Role::Gateway => (1u32, 0u32),
-        _ => (2, 1),
-    };
-
-    if let Some(cfg) = config {
-        let pool_override = match pool_tmpl.pool_id {
-            "gateways" => cfg.overrides.gateways.as_ref(),
-            "workers" => cfg.overrides.workers.as_ref(),
-            _ => None,
-        };
-        if let Some(ov) = pool_override
-            && let Some(n) = ov.instances
-        {
-            return (Some(n), Some(default.1));
-        }
-    }
-
-    (
-        Some(default.0),
-        if default.1 > 0 { Some(default.1) } else { None },
-    )
-}
-
-fn cmd_deploy(manifest_path: &str, watch: bool, interval: u64) -> Result<()> {
-    use mvm_agent::templates;
-    use mvm_core::tenant::TenantNet;
-
-    let manifest = templates::DeploymentManifest::from_file(std::path::Path::new(manifest_path))?;
-
-    naming::validate_id(&manifest.tenant.id, "Tenant")?;
-
-    ui::info(&format!("Deploying tenant '{}'...\n", manifest.tenant.id));
-
-    // Check if tenant already exists
-    let tenant_exists = tenant::lifecycle::tenant_load(&manifest.tenant.id).is_ok();
-
-    if !tenant_exists {
-        // Create tenant
-        let net_id = match manifest.tenant.net_id {
-            Some(id) => id,
-            None => templates::allocate_net_id()?,
-        };
-        let subnet = match &manifest.tenant.subnet {
-            Some(s) => s.clone(),
-            None => templates::subnet_from_net_id(net_id),
-        };
-        let gateway = templates::gateway_from_subnet(&subnet)?;
-        let net = TenantNet::new(net_id, &subnet, &gateway);
-        tenant::lifecycle::tenant_create(
-            &manifest.tenant.id,
-            net,
-            mvm_core::tenant::TenantQuota::default(),
-        )?;
-        ui::info(&format!("  Created tenant '{}'", manifest.tenant.id));
-    } else {
-        ui::info(&format!("  Tenant '{}' already exists", manifest.tenant.id));
-    }
-
-    let default_flake = ".".to_string();
-
-    // Create/update pools
-    for mp in &manifest.pools {
-        naming::validate_id(&mp.id, "Pool")?;
-
-        let pool_exists = pool::lifecycle::pool_load(&manifest.tenant.id, &mp.id).is_ok();
-
-        if !pool_exists {
-            let flake_ref = mp.flake.as_deref().unwrap_or(&default_flake);
-            let resources = mvm_core::pool::InstanceResources {
-                vcpus: mp.vcpus,
-                mem_mib: mp.mem_mib,
-                data_disk_mib: mp.data_disk_mib,
-            };
-            pool::lifecycle::pool_create(
-                &manifest.tenant.id,
-                &mp.id,
-                flake_ref,
-                &mp.profile,
-                resources,
-                mp.role.clone(),
-                "",
-            )?;
-            ui::info(&format!(
-                "  Created pool '{}/{}'",
-                manifest.tenant.id, mp.id
-            ));
-
-            // Build the pool
-            let env = mvm_runtime::build_env::RuntimeBuildEnv;
-            mvm_build::build::pool_build(&env, &manifest.tenant.id, &mp.id, None)?;
-            ui::info(&format!("  Built pool '{}/{}'", manifest.tenant.id, mp.id));
-        }
-
-        // Scale
-        let running = mp.desired_running.or(Some(1));
-        let warm = mp.desired_warm;
-        pool::lifecycle::pool_scale(&manifest.tenant.id, &mp.id, running, warm, None)?;
-    }
-
-    ui::success(&format!("\nDeployment '{}' ready!", manifest.tenant.id));
-
-    if watch {
-        ui::info(&format!(
-            "Watch mode: re-reconciling every {}s (Ctrl+C to stop)",
-            interval
-        ));
-        loop {
-            std::thread::sleep(std::time::Duration::from_secs(interval));
-            ui::info("Re-checking desired state...");
-            for mp in &manifest.pools {
-                let running = mp.desired_running.or(Some(1));
-                let warm = mp.desired_warm;
-                pool::lifecycle::pool_scale(&manifest.tenant.id, &mp.id, running, warm, None)?;
-            }
-        }
-    }
-
-    Ok(())
-}
-
-fn cmd_connect(name: &str, json: bool) -> Result<()> {
-    naming::validate_id(name, "Deployment")?;
-
-    let config = tenant::lifecycle::tenant_load(name)
-        .with_context(|| format!("Deployment '{}' not found", name))?;
-
-    if json {
-        let pool_ids = pool::lifecycle::pool_list(name)?;
-        let mut pools_info = Vec::new();
-        for pid in &pool_ids {
-            if let Ok(spec) = pool::lifecycle::pool_load(name, pid) {
-                pools_info.push(serde_json::json!({
-                    "pool_id": spec.pool_id,
-                    "role": spec.role.to_string(),
-                    "profile": spec.profile,
-                    "desired_running": spec.desired_counts.running,
-                    "desired_warm": spec.desired_counts.warm,
-                }));
-            }
-        }
-        let out = serde_json::json!({
-            "tenant_id": config.tenant_id,
-            "gateway_ip": config.net.gateway_ip,
-            "subnet": config.net.ipv4_subnet,
-            "bridge": config.net.bridge_name,
-            "pools": pools_info,
-        });
-        println!("{}", serde_json::to_string_pretty(&out)?);
-        return Ok(());
-    }
-
-    // Header
-    ui::info(&format!("Deployment: {}\n", config.tenant_id));
-
-    // Network
-    ui::info("Network:");
-    ui::info(&format!("  Gateway:  {}", config.net.gateway_ip));
-    ui::info(&format!("  Subnet:   {}", config.net.ipv4_subnet));
-    ui::info(&format!("  Bridge:   {}", config.net.bridge_name));
-
-    // Pools
-    let pool_ids = pool::lifecycle::pool_list(name)?;
-    if !pool_ids.is_empty() {
-        ui::info("\nPools:");
-        for pid in &pool_ids {
-            if let Ok(spec) = pool::lifecycle::pool_load(name, pid) {
-                ui::info(&format!(
-                    "  {}/{} (role: {}, {}vcpu/{}MiB, running: {}, warm: {})",
-                    name,
-                    spec.pool_id,
-                    spec.role,
-                    spec.instance_resources.vcpus,
-                    spec.instance_resources.mem_mib,
-                    spec.desired_counts.running,
-                    spec.desired_counts.warm,
-                ));
-            }
-        }
-    }
-
-    // Instances
-    let mut has_instances = false;
-    for pid in &pool_ids {
-        if let Ok(instances) = mvm_runtime::vm::instance::lifecycle::instance_list(name, pid)
-            && !instances.is_empty()
-        {
-            if !has_instances {
-                ui::info("\nInstances:");
-                has_instances = true;
-            }
-            for inst in &instances {
-                ui::info(&format!(
-                    "  {}/{}/{} {:?} ip={}",
-                    name, pid, inst.instance_id, inst.status, inst.net.guest_ip
-                ));
-            }
-        }
-    }
-
-    if !has_instances {
-        ui::info("\nNo instances yet. Pools need to be built and scaled.");
-    }
-
-    // Next steps
-    ui::info("\nQuick reference:");
-    ui::info(&format!(
-        "  Set secrets:  mvm tenant secrets set {} --from-file secrets.json",
-        name
-    ));
-    ui::info(&format!(
-        "  List instances: mvm instance list --tenant {}",
-        name
-    ));
-    ui::info(&format!(
-        "  Scale workers:  mvm pool scale {}/workers --running 4 --warm 2",
-        name
-    ));
-
-    Ok(())
-}
-
-// ============================================================================
-// Helpers
-// ============================================================================
-
-/// Parse a role string from the CLI into a Role enum value.
 fn parse_role(s: &str) -> Result<mvm_core::pool::Role> {
     use mvm_core::pool::Role;
     match s {
@@ -3234,7 +1290,7 @@ mod tests {
         let script = sync_build_script("/home/user/mvm", false, "aarch64");
         assert!(script.contains("--release"));
         assert!(script.contains("CARGO_TARGET_DIR='target/linux-aarch64'"));
-        assert!(script.contains("--bin mvm --bin mvm-hostd"));
+        assert!(script.contains("--bin mvm"));
         assert!(script.contains("cd '/home/user/mvm'"));
     }
 
@@ -3243,7 +1299,7 @@ mod tests {
         let script = sync_build_script("/home/user/mvm", true, "aarch64");
         assert!(!script.contains("--release"));
         assert!(script.contains("CARGO_TARGET_DIR='target/linux-aarch64'"));
-        assert!(script.contains("--bin mvm --bin mvm-hostd"));
+        assert!(script.contains("--bin mvm"));
     }
 
     #[test]
@@ -3256,7 +1312,6 @@ mod tests {
     fn test_sync_install_script_release() {
         let script = sync_install_script("/home/user/mvm", false, "aarch64");
         assert!(script.contains("/target/linux-aarch64/release/mvm"));
-        assert!(script.contains("/target/linux-aarch64/release/mvm-hostd"));
         assert!(script.contains("/usr/local/bin/"));
         assert!(script.contains("install -m 0755"));
     }
@@ -3265,7 +1320,6 @@ mod tests {
     fn test_sync_install_script_debug() {
         let script = sync_install_script("/home/user/mvm", true, "aarch64");
         assert!(script.contains("/target/linux-aarch64/debug/mvm"));
-        assert!(script.contains("/target/linux-aarch64/debug/mvm-hostd"));
     }
 
     #[test]
@@ -3390,9 +1444,6 @@ mod tests {
             "4",
             "--memory",
             "2048",
-            "--user",
-            "ubuntu",
-            "--detach",
         ])
         .unwrap();
         match cli.command {
@@ -3402,8 +1453,6 @@ mod tests {
                 role,
                 cpus,
                 memory,
-                user,
-                detach,
                 volume: _,
                 config: _,
             } => {
@@ -3412,8 +1461,6 @@ mod tests {
                 assert_eq!(role, "gateway");
                 assert_eq!(cpus, Some(4));
                 assert_eq!(memory, Some(2048));
-                assert_eq!(user, "ubuntu");
-                assert!(detach);
             }
             _ => panic!("Expected Run command"),
         }
@@ -3429,41 +1476,15 @@ mod tests {
                 role,
                 cpus,
                 memory,
-                user,
                 config: _,
                 volume,
-                detach,
             } => {
                 assert_eq!(flake, ".");
                 assert_eq!(profile, "minimal");
                 assert_eq!(role, "worker");
                 assert_eq!(cpus, Some(2));
                 assert_eq!(memory, Some(1024));
-                assert_eq!(user, "root");
                 assert_eq!(volume.len(), 0);
-                assert!(!detach);
-            }
-            _ => panic!("Expected Run command"),
-        }
-    }
-
-    #[test]
-    fn test_run_detach_flag() {
-        let cli = Cli::try_parse_from(["mvm", "run", "--flake", ".", "--detach"]).unwrap();
-        match cli.command {
-            Commands::Run { detach, .. } => {
-                assert!(detach);
-            }
-            _ => panic!("Expected Run command"),
-        }
-    }
-
-    #[test]
-    fn test_run_custom_user() {
-        let cli = Cli::try_parse_from(["mvm", "run", "--flake", ".", "--user", "admin"]).unwrap();
-        match cli.command {
-            Commands::Run { user, .. } => {
-                assert_eq!(user, "admin");
             }
             _ => panic!("Expected Run command"),
         }

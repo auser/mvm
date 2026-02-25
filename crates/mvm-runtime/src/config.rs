@@ -10,8 +10,6 @@ pub const TAP_IP: &str = "172.16.0.1";
 pub const MASK_SHORT: &str = "/30";
 pub const GUEST_IP: &str = "172.16.0.2";
 pub const FC_MAC: &str = "06:00:AC:10:00:02";
-/// Non-root user inside the Firecracker guest VM (dev mode).
-pub const GUEST_USER: &str = "mvm";
 /// Path inside the Lima VM (~ expands to the VM user's home)
 pub const MICROVM_DIR: &str = "~/microvm";
 pub const LOGFILE: &str = "~/microvm/firecracker.log";

@@ -1,18 +1,13 @@
 use anyhow::{Result, anyhow};
 
-use mvm_core::build_env::{BuildEnvironment, ShellEnvironment};
-use mvm_core::instance::InstanceNet;
-use mvm_core::pool::{BuildRevision, PoolSpec};
-use mvm_core::tenant::{TenantConfig, TenantNet};
+use mvm_core::build_env::ShellEnvironment;
 
-use crate::vm::pool::artifacts;
-use crate::vm::{bridge, instance::net};
 use crate::{shell, ui};
 
-/// Concrete implementation of [`BuildEnvironment`] that delegates to
-/// mvm-runtime shell, bridge, and pool modules.
+/// Shell environment implementation that delegates to the Lima VM.
 ///
-/// Used by the CLI and agent when invoking `mvm_build::build::pool_build`.
+/// Used by the CLI for dev-mode builds (`mvm build --flake`, `mvm run`,
+/// `mvm template build`).
 pub struct RuntimeBuildEnv;
 
 impl ShellEnvironment for RuntimeBuildEnv {
@@ -55,36 +50,5 @@ impl ShellEnvironment for RuntimeBuildEnv {
 
     fn log_warn(&self, msg: &str) {
         ui::warn(msg);
-    }
-}
-
-impl BuildEnvironment for RuntimeBuildEnv {
-    fn load_pool_spec(&self, tenant_id: &str, pool_id: &str) -> Result<PoolSpec> {
-        crate::vm::pool::lifecycle::pool_load(tenant_id, pool_id)
-    }
-
-    fn load_tenant_config(&self, tenant_id: &str) -> Result<TenantConfig> {
-        crate::vm::tenant::lifecycle::tenant_load(tenant_id)
-    }
-
-    fn ensure_bridge(&self, tenant_net: &TenantNet) -> Result<()> {
-        bridge::ensure_tenant_bridge(tenant_net)
-    }
-
-    fn setup_tap(&self, instance_net: &InstanceNet, bridge_name: &str) -> Result<()> {
-        net::setup_tap(instance_net, bridge_name)
-    }
-
-    fn teardown_tap(&self, tap_dev: &str) -> Result<()> {
-        net::teardown_tap(tap_dev)
-    }
-
-    fn record_revision(
-        &self,
-        tenant_id: &str,
-        pool_id: &str,
-        revision: &BuildRevision,
-    ) -> Result<()> {
-        artifacts::record_revision(tenant_id, pool_id, revision)
     }
 }

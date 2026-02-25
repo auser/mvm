@@ -4,8 +4,6 @@ members = [
     "crates/mvm-runtime",
     "crates/mvm-build",
     "crates/mvm-guest",
-    "crates/mvm-agent",
-    "crates/mvm-coordinator",
     "crates/mvm-cli",
 ]
 resolver = "3"
@@ -22,20 +20,13 @@ authors = ["mvm contributors"]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# Crypto / security
-aes-gcm = "0.10"
+# Crypto
 base64 = "0.22"
-ed25519-dalek = { version = "2", features = ["rand_core", "pkcs8"] }
-rcgen = { version = "0.13", features = ["pem"] }
-rustls = { version = "0.23", features = ["ring"] }
-rustls-pemfile = "2"
 sha2 = "0.10"
-zeroize = "1"
 
 # Serialization
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
-serde_yaml = "0.9"
 toml = "0.8"
 
 # CLI
@@ -44,13 +35,6 @@ clap_complete = "4"
 colored = "3"
 indicatif = "0.17"
 inquire = "0.7"
-tabled = "0.17"
-
-# QUIC
-quinn = "0.11"
-
-# HTTP
-reqwest = { version = "0.12", features = ["blocking", "json"] }
 
 # Template engine
 tera = "1"
@@ -60,6 +44,9 @@ opendal = { version = "0.50", features = ["services-s3"] }
 
 # Allocator
 mimalloc = "0.1"
+
+# HTTP client (for CLI upgrade)
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
 
 # Utilities
 anyhow = "1"
@@ -79,7 +66,7 @@ predicates = "3"
 name = "mvm"
 version.workspace = true
 edition.workspace = true
-description = "Multi-tenant Firecracker microVM fleet manager"
+description = "Firecracker microVM development tool"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -98,8 +85,6 @@ mvm-core = { path = "crates/mvm-core", version = "0.3.0" }
 mvm-runtime = { path = "crates/mvm-runtime", version = "0.3.0" }
 mvm-build = { path = "crates/mvm-build", version = "0.3.0" }
 mvm-guest = { path = "crates/mvm-guest", version = "0.3.0" }
-mvm-agent = { path = "crates/mvm-agent", version = "0.3.0" }
-mvm-coordinator = { path = "crates/mvm-coordinator", version = "0.3.0" }
 mvm-cli = { path = "crates/mvm-cli", version = "0.3.0" }
 anyhow.workspace = true
 mimalloc.workspace = true

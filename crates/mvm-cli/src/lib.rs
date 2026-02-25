@@ -1,14 +1,11 @@
 // mvm-cli: Clap commands, UI, bootstrap
-// Depends on mvm-core, mvm-agent, mvm-runtime, mvm-coordinator, mvm-build
+// Depends on mvm-core, mvm-runtime, mvm-build
 
 pub mod bootstrap;
 pub mod commands;
-pub mod dev_cluster;
-pub mod display;
 pub mod doctor;
 pub mod http;
 pub mod logging;
-pub mod output;
 pub mod template_cmd;
 pub mod ui;
 pub mod upgrade;

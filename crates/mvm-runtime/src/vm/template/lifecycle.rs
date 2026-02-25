@@ -3,13 +3,8 @@ use mvm_core::template::{TemplateSpec, template_dir, template_spec_path};
 
 use crate::build_env::RuntimeBuildEnv;
 use crate::shell;
-use crate::vm::pool::artifacts as pool_artifacts;
-use crate::vm::pool::lifecycle as pool_lifecycle;
-use crate::vm::tenant::lifecycle as tenant_lifecycle;
-use mvm_build::build::{PoolBuildOpts, pool_build_with_opts};
-use mvm_core::pool::{InstanceResources, Role, pool_artifacts_dir};
+use mvm_core::pool::{ArtifactPaths, Role};
 use mvm_core::template::{TemplateRevision, template_current_symlink, template_revision_dir};
-use mvm_core::tenant::{TenantNet, TenantQuota};
 use mvm_core::time::utc_now;
 
 use super::registry::TemplateRegistry;
@@ -68,79 +63,65 @@ fn parse_role(role: &str) -> Role {
     }
 }
 
-/// Build a template by reusing the existing pool build pipeline under a special internal tenant.
-/// Artifacts are copied into /var/lib/mvm/templates/<id>/artifacts and the current symlink is updated.
+/// Build a template using the dev build pipeline (local Nix in Lima).
+/// Artifacts are stored in /var/lib/mvm/templates/<id>/artifacts and the current symlink is updated.
 pub fn template_build(id: &str, force: bool) -> Result<()> {
     let spec = template_load(id)?;
-
-    // Ensure internal tenant exists (isolated, no real users)
-    // Internal tenant used for building templates; must satisfy naming rules.
-    const TEMPLATE_TENANT: &str = "templates";
-    if !tenant_lifecycle::tenant_exists(TEMPLATE_TENANT)? {
-        let net = TenantNet::new(4095, "10.254.0.0/24", "10.254.0.1");
-        tenant_lifecycle::tenant_create(TEMPLATE_TENANT, net, TenantQuota::default())?;
-    }
-
-    // Ensure pool spec is present under the internal tenant
-    let resources = InstanceResources {
-        vcpus: spec.vcpus,
-        mem_mib: spec.mem_mib,
-        data_disk_mib: spec.data_disk_mib,
-    };
-    // Overwrite/create the pool spec each build to keep in sync
-    let _ = pool_lifecycle::pool_create(
-        TEMPLATE_TENANT,
-        &spec.template_id,
-        &spec.flake_ref,
-        &spec.profile,
-        resources,
-        parse_role(&spec.role),
-        id,
-    )?;
-
-    // Build via existing pipeline
     let env = RuntimeBuildEnv;
-    let opts = PoolBuildOpts {
-        force_rebuild: force,
-        ..Default::default()
+    let role = parse_role(&spec.role);
+
+    // Use dev_build to produce artifacts via Nix in Lima
+    let result = if force {
+        // Force: remove any cached artifacts to trigger a fresh build
+        let cache_dir = format!("/var/lib/mvm/dev-builds/{}", spec.flake_ref);
+        let _ = shell::run_in_vm(&format!("rm -rf {cache_dir}"));
+        mvm_build::dev_build::dev_build(&env, &spec.flake_ref, &spec.profile, &role)?
+    } else {
+        mvm_build::dev_build::dev_build(&env, &spec.flake_ref, &spec.profile, &role)?
     };
-    pool_build_with_opts(&env, TEMPLATE_TENANT, &spec.template_id, opts)?;
 
-    // Resolve current revision hash from the internal pool
-    let current_rev = pool_artifacts::current_revision(TEMPLATE_TENANT, &spec.template_id)?
-        .context("Template build produced no revision")?;
-    let pool_artifacts = pool_artifacts_dir(TEMPLATE_TENANT, &spec.template_id);
-
-    // Copy artifacts into template path
-    let rev_dst = template_revision_dir(id, &current_rev);
-    let rev_src = format!("{}/revisions/{}", pool_artifacts, current_rev);
+    // Store artifacts in template revision directory
+    let rev = &result.revision_hash;
+    let rev_dst = template_revision_dir(id, rev);
+    shell::run_in_vm(&format!("mkdir -p {rev_dst}"))?;
+    shell::run_in_vm(&format!("cp -a {} {rev_dst}/vmlinux", result.vmlinux_path))?;
     shell::run_in_vm(&format!(
-        "mkdir -p {} && cp -a {}/* {}",
-        rev_dst, rev_src, rev_dst
+        "cp -a {} {rev_dst}/rootfs.ext4",
+        result.rootfs_path
+    ))?;
+
+    // Generate a minimal fc-base.json config for reference
+    let fc_config = serde_json::json!({
+        "boot-source": {
+            "kernel_image_path": "vmlinux",
+            "boot_args": "console=ttyS0 reboot=k panic=1 pci=off"
+        },
+        "drives": [{
+            "drive_id": "rootfs",
+            "path_on_host": "rootfs.ext4",
+            "is_root_device": true,
+            "is_read_only": false
+        }],
+        "machine-config": {
+            "vcpu_count": spec.vcpus,
+            "mem_size_mib": spec.mem_mib
+        }
+    });
+    let fc_json = serde_json::to_string_pretty(&fc_config)?;
+    shell::run_in_vm(&format!(
+        "cat > {rev_dst}/fc-base.json << 'MVMEOF'\n{fc_json}\nMVMEOF"
     ))?;
 
     // Update template current symlink
     let current_link = template_current_symlink(id);
-    shell::run_in_vm(&format!(
-        "ln -snf revisions/{} {}",
-        current_rev, current_link
-    ))?;
+    shell::run_in_vm(&format!("ln -snf revisions/{rev} {current_link}"))?;
 
     // Record template revision metadata
-    let lock_hash = shell::run_in_vm_stdout(&format!(
-        "cat {}/last_flake_lock.hash 2>/dev/null || echo ''",
-        pool_artifacts
-    ))?;
-    let flake_lock_hash = lock_hash.trim();
     let revision = TemplateRevision {
-        revision_hash: current_rev.clone(),
+        revision_hash: rev.clone(),
         flake_ref: spec.flake_ref.clone(),
-        flake_lock_hash: if flake_lock_hash.is_empty() {
-            current_rev.clone()
-        } else {
-            flake_lock_hash.to_string()
-        },
-        artifact_paths: mvm_core::pool::ArtifactPaths {
+        flake_lock_hash: rev.clone(),
+        artifact_paths: ArtifactPaths {
             vmlinux: "vmlinux".to_string(),
             rootfs: "rootfs.ext4".to_string(),
             fc_base_config: "fc-base.json".to_string(),
@@ -153,7 +134,7 @@ pub fn template_build(id: &str, force: bool) -> Result<()> {
         data_disk_mib: spec.data_disk_mib,
     };
     let rev_json = serde_json::to_string_pretty(&revision)?;
-    let rev_meta_path = format!("{}/revision.json", rev_dst);
+    let rev_meta_path = format!("{rev_dst}/revision.json");
     shell::run_in_vm(&format!(
         "cat > {rev_meta_path} << 'MVMEOF'\n{rev_json}\nMVMEOF"
     ))?;

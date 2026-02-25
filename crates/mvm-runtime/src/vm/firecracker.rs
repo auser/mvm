@@ -87,6 +87,9 @@ pub fn download_assets() -> Result<()> {
 }
 
 /// Prepare the ext4 root filesystem from the downloaded squashfs.
+///
+/// No SSH is configured in the rootfs. MicroVMs run headless and
+/// communicate via vsock only.
 pub fn prepare_rootfs() -> Result<()> {
     ui::info("Preparing root filesystem...");
     run_in_vm_visible(&format!(
@@ -108,35 +111,6 @@ pub fn prepare_rootfs() -> Result<()> {
             sudo rm -rf squashfs-root
             sudo unsquashfs $squashfs_file
 
-            echo '[mvm] Generating SSH keys...'
-            rm -f id_rsa id_rsa.pub
-            ssh-keygen -f id_rsa -N '' -q
-
-            echo '[mvm] Configuring SSH access...'
-            sudo mkdir -p squashfs-root/root/.ssh
-            sudo cp id_rsa.pub squashfs-root/root/.ssh/authorized_keys
-
-            echo '[mvm] Creating non-root user {user}...'
-            # Create user with home directory in the rootfs
-            sudo chroot squashfs-root useradd -m -s /bin/bash -G sudo {user} 2>/dev/null || true
-            # Ensure kvm group exists and add user to it
-            sudo chroot squashfs-root bash -c 'getent group kvm || groupadd kvm' 2>/dev/null || true
-            sudo chroot squashfs-root usermod -aG kvm {user} 2>/dev/null || true
-            # Configure passwordless sudo
-            sudo mkdir -p squashfs-root/etc/sudoers.d
-            echo '{user} ALL=(ALL) NOPASSWD: ALL' | sudo tee squashfs-root/etc/sudoers.d/99-{user} >/dev/null
-            sudo chmod 0440 squashfs-root/etc/sudoers.d/99-{user}
-            # Set up SSH key for the non-root user
-            sudo mkdir -p squashfs-root/home/{user}/.ssh
-            sudo cp id_rsa.pub squashfs-root/home/{user}/.ssh/authorized_keys
-            sudo chroot squashfs-root chown -R {user}:{user} /home/{user}/.ssh
-            sudo chmod 700 squashfs-root/home/{user}/.ssh
-            sudo chmod 600 squashfs-root/home/{user}/.ssh/authorized_keys
-
-            mv id_rsa "./ubuntu-${{ubuntu_version}}.id_rsa"
-            rm -f id_rsa.pub
-            sudo chown -R root:root squashfs-root/root
-
             echo '[mvm] Creating ext4 filesystem (1GB)...'
             truncate -s 1G "ubuntu-${{ubuntu_version}}.ext4"
             sudo mkfs.ext4 -d squashfs-root -F "ubuntu-${{ubuntu_version}}.ext4"
@@ -151,11 +125,8 @@ pub fn prepare_rootfs() -> Result<()> {
         [ -f "$KERNEL" ] && echo "  Kernel:  $KERNEL" || echo "  ERROR: Kernel not found"
         ROOTFS=$(ls *.ext4 2>/dev/null | tail -1)
         [ -f "$ROOTFS" ] && echo "  Rootfs:  $ROOTFS" || echo "  ERROR: Rootfs not found"
-        KEY=$(ls *.id_rsa 2>/dev/null | tail -1)
-        [ -f "$KEY" ] && echo "  SSH Key: $KEY" || echo "  ERROR: SSH key not found"
         "#,
         dir = MICROVM_DIR,
-        user = GUEST_USER,
     ))?;
 
     Ok(())

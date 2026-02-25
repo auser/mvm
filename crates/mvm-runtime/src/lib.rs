@@ -1,4 +1,4 @@
-// mvm-runtime: Shell execution, security ops, VM lifecycle
+// mvm-runtime: Shell execution and VM lifecycle
 // Depends on mvm-core and mvm-guest
 
 pub mod build_env;
@@ -7,8 +7,4 @@ pub mod shell;
 pub mod shell_mock;
 pub mod ui;
 
-pub mod hostd;
-pub mod security;
-pub mod sleep;
 pub mod vm;
-pub mod worker;

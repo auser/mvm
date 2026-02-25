@@ -10,30 +10,22 @@ authors.workspace = true
 
 [dependencies]
 mvm-core = { path = "../mvm-core", version = "0.3.0" }
-mvm-agent = { path = "../mvm-agent", version = "0.3.0" }
 mvm-runtime = { path = "../mvm-runtime", version = "0.3.0" }
-mvm-coordinator = { path = "../mvm-coordinator", version = "0.3.0" }
 mvm-build = { path = "../mvm-build", version = "0.3.0" }
 anyhow.workspace = true
 chrono.workspace = true
 clap.workspace = true
+reqwest.workspace = true
 clap_complete.workspace = true
 colored.workspace = true
 indicatif.workspace = true
 inquire.workspace = true
-reqwest.workspace = true
-rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-serde_yaml.workspace = true
-tabled.workspace = true
 tempfile.workspace = true
-tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
-uuid.workspace = true
-which.workspace = true
 toml.workspace = true
+tracing-subscriber.workspace = true
+which.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true

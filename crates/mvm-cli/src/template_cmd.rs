@@ -336,39 +336,3 @@ fn scaffold_template_config(dir: &Path, name: &str) -> Result<()> {
         .replace("{{name}}", name);
     write_file(&cfg_path, &content)
 }
-
-/// Migrate an existing pool into a template and point the pool at it.
-pub fn migrate_from_pool(pool_path: &str, new_template: &str, force: bool) -> Result<()> {
-    let (tenant, pool) = mvm_core::naming::parse_pool_path(pool_path)?;
-    let spec = mvm_runtime::vm::pool::lifecycle::pool_load(tenant, pool)?;
-
-    if !force {
-        // Avoid overwriting existing template
-        if tmpl::template_load(new_template).is_ok() {
-            anyhow::bail!(
-                "Template '{}' already exists. Re-run with --force to overwrite.",
-                new_template
-            );
-        }
-    } else if tmpl::template_load(new_template).is_ok() {
-        tmpl::template_delete(new_template, true)?;
-    }
-
-    let ts = now_iso();
-    let t_spec = TemplateSpec {
-        template_id: new_template.to_string(),
-        flake_ref: spec.flake_ref.clone(),
-        profile: spec.profile.clone(),
-        role: spec.role.to_string(),
-        vcpus: spec.instance_resources.vcpus,
-        mem_mib: spec.instance_resources.mem_mib,
-        data_disk_mib: spec.instance_resources.data_disk_mib,
-        created_at: ts.clone(),
-        updated_at: ts,
-    };
-    tmpl::template_create(&t_spec)?;
-    tmpl::template_build(new_template, true)?;
-    // Point pool at new template
-    mvm_runtime::vm::pool::lifecycle::pool_set_template(tenant, pool, new_template)?;
-    Ok(())
-}

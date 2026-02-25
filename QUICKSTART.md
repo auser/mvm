@@ -5,7 +5,7 @@ Get a Firecracker microVM running in under 5 minutes.
 ## Prerequisites
 
 - macOS (Apple Silicon or Intel) or Linux with KVM
-- [Homebrew](https://brew.sh/) (macOS only)
+- [Homebrew](https://brew.sh/) (macOS only -- mvm will install it if missing)
 
 ## Install
 
@@ -22,187 +22,189 @@ cargo build --release
 cp target/release/mvm ~/.local/bin/
 ```
 
-> Note: If `MVM_FC_VERSION` is set (e.g., via `firecracker --version` output), mvm normalizes it automatically to `vMAJOR.MINOR[.PATCH]`, so you don't need to tweak it manually. If your network blocks the default S3 bucket for builder artifacts, set `MVM_FC_ASSET_BASE` to a reachable S3-compatible endpoint (optionally `MVM_FC_ASSET_ROOTFS` / `MVM_FC_ASSET_KERNEL` to force filenames).
-
-> Templates: Build a base image once and reuse it across tenants/pools. Create (`mvm template create ...`) or from a config (`mvm template build --config docs/examples/template.toml` for multiple roles), build it, then point pools at it (`mvm pool create tenant/pool --template <id> ...`). Pool builds reuse template artifacts; `mvm pool build --force` rebuilds the template first.
->
-> Builder transport: by default `MVM_BUILDER_MODE=auto` (try vsock, then fall back to SSH). For a no-SSH build pipeline use `MVM_BUILDER_MODE=vsock`.
->
-> Multi-node dev: configure an S3-compatible template registry (e.g. MinIO) and use `mvm template push|pull|verify` to share templates across nodes.
-
-## Dev Mode (Single VM)
-
-Bootstrap everything (Lima, Firecracker, kernel, rootfs) and launch a microVM:
+## 1. Launch the Dev Environment
 
 ```bash
 mvm dev
 ```
 
-That's it. You'll be dropped into an SSH session inside the microVM. Exit with `exit` -- the VM keeps running.
+This single command handles everything:
+1. Installs Lima (macOS) if not present
+2. Creates and starts a Lima VM with nested virtualization
+3. Installs Firecracker inside the Lima VM
+4. Drops you into the Lima VM shell
 
-Other dev commands:
+Inside the Lima shell, your home directory (`~`) is mounted read/write -- your project files are right there. Nix, Firecracker, and `/dev/kvm` are all available.
+
+Exit the shell with `exit` or `Ctrl+D` -- the Lima VM keeps running in the background.
+
+**Note**: On the first run, `mvm dev` downloads ~500MB of assets (Lima VM image). Subsequent runs start in seconds.
+
+## 2. Day-to-Day Commands
 
 ```bash
-mvm status    # Check what's running
-mvm ssh       # Reconnect to the running VM
-mvm stop      # Stop the microVM
-mvm destroy   # Tear down everything
+mvm status     # Check what's running (Lima VM, Firecracker, microVM)
+mvm shell      # Open a shell in the Lima VM
+mvm stop       # Stop the microVM (Lima VM stays running)
+mvm destroy    # Tear down everything (Lima VM + all data)
 ```
 
-## Deploy an OpenClaw App (3 Commands)
+## 3. Understanding the Layers
 
-The fastest path from bare machine to a running deployment:
+mvm runs a three-layer stack:
 
-### 1. Prepare the host
-
-```bash
-mvm add host
+```
+Your macOS/Linux Host
+  └── Lima VM (Ubuntu, has /dev/kvm)
+        └── Firecracker microVM (your workload)
 ```
 
-Bootstraps the environment, initializes mTLS certificates, and prepares the machine for fleet operation. For production, pass `--ca ca.crt --signing-key coordinator.pub`.
+| Layer | Access command | Has your project files? |
+|-------|---------------|------------------------|
+| Host | Your normal terminal | Yes |
+| Lima VM | `mvm dev` or `mvm shell` | Yes (~ mounted read/write) |
+| Firecracker microVM | (headless, no SSH) | No (isolated filesystem) |
 
-### 2. Create a deployment
+Firecracker microVMs are headless workloads with no SSH access -- they communicate via vsock only. The dev environment is the Lima VM. Use `mvm dev` or `mvm shell` to access it. Your home directory is mounted read/write, so your project files are right there.
+
+## 4. Build from a Nix Flake
+
+Build a microVM image and run it in one command:
 
 ```bash
-mvm new openclaw myapp
+mvm run --flake github:org/app --profile minimal --cpus 2 --memory 1024
 ```
 
-Creates a complete deployment end-to-end: allocates a network, creates a tenant, sets up gateway and worker pools, builds images, and scales up (1 gateway, 2 workers + 1 warm spare).
-
-### 3. View your deployment
+Or build separately:
 
 ```bash
-mvm connect myapp
+mvm build --flake . --profile minimal --role worker
+mvm start
 ```
 
-Shows the deployment dashboard: network info, pool summary, instance table, and quick-reference commands for secrets, scaling, and instance management.
+The `--profile` selects a NixOS configuration profile and `--role` selects the VM role (worker, gateway, builder). These map to Nix flake attributes.
 
-See [Onboarding Guide](docs/onboarding.md) for the full walkthrough.
+## 5. Build from Mvmfile.toml
 
-## Multi-Tenant Mode (Granular)
+Create an `Mvmfile.toml`:
 
-For fine-grained control, use the individual tenant/pool/instance commands:
+```toml
+[image]
+name = "my-app"
+base = "ubuntu"
 
-### 1. Create a tenant
-
-```bash
-mvm tenant create acme \
-    --net-id 3 \
-    --subnet 10.240.3.0/24 \
-    --max-vcpus 16 \
-    --max-mem 32768 \
-    --max-running 8
+[runtime]
+cpus = 2
+memory_mb = 1024
 ```
 
-### 2. Create a worker pool
+Then:
 
 ```bash
-mvm pool create acme/workers \
+mvm build .
+mvm start
+```
+
+## 6. Templates (Reusable Base Images)
+
+Build a base image once and share it across machines:
+
+```bash
+# Create a template
+mvm template create base-worker \
     --flake github:org/app \
     --profile minimal \
-    --cpus 2 \
-    --mem 1024
+    --role worker \
+    --cpus 2 --mem 1024
+
+# Build it (runs nix build inside Lima)
+mvm template build base-worker
+
+# Share via S3-compatible registry
+mvm template push base-worker
+mvm template pull base-worker    # On another machine
+mvm template verify base-worker  # Verify checksums
 ```
 
-### 3. Build pool artifacts
+List and inspect templates:
 
 ```bash
-mvm pool build acme/workers
+mvm template list
+mvm template info base-worker
 ```
 
-### 4. Scale up
+## 7. Lima Shell (Development Access)
+
+Access the Lima VM directly -- useful for debugging, running Nix commands, or inspecting Firecracker state:
 
 ```bash
-mvm pool scale acme/workers --running 3 --warm 1
+mvm shell                          # Open a bash shell in the Lima VM
+mvm shell --project ~/myproject    # Open shell and cd into project
 ```
 
-### 5. Interact
+Inside the Lima shell, you have:
+- Full access to your home directory (same files as your host)
+- Nix package manager
+- Firecracker binary
+- `/dev/kvm` for virtualization
+
+## 8. Sync (Install mvm Inside Lima)
+
+Build and install the mvm binary inside the Lima VM from your local source:
 
 ```bash
-mvm instance list acme/workers
-mvm instance ssh acme/workers/i-a3f7b2c1
+mvm sync                # Release build, install to /usr/local/bin/
+mvm sync --debug        # Debug build (faster compile)
+mvm sync --skip-deps    # Skip apt/rustup checks
 ```
 
-### 6. Sleep/wake for cost savings
+The installed binary is available when you `mvm shell` into Lima, useful for running mvm commands that need a Linux environment.
+
+## 9. Run with Volumes
+
+Pass host directories into the Firecracker microVM:
 
 ```bash
-mvm instance sleep acme/workers/i-a3f7b2c1   # Snapshot + stop
-mvm instance wake acme/workers/i-a3f7b2c1    # Restore from snapshot
+mvm run --flake . --profile minimal \
+    --volume ./data:/data:1024 \
+    --cpus 2 --memory 1024
 ```
 
-## Fleet Mode (Agent)
+Volume format: `host_path:guest_mount:size_mb`
 
-### Initialize mTLS certificates
+## Environment Variables
+
+| Variable | Description |
+|----------|-------------|
+| `MVM_FC_VERSION` | Override Firecracker version (auto-normalized) |
+| `MVM_BUILDER_MODE` | Builder transport: `auto` (default), `vsock`, or `ssh` |
+| `MVM_TEMPLATE_REGISTRY` | S3 endpoint for template push/pull |
+| `MVM_SSH_PORT` | Lima SSH local port (default: 60022) |
+
+## Diagnostics
 
 ```bash
-mvm agent certs init
+mvm doctor    # Check system dependencies and configuration
 ```
 
-### Run the agent daemon
+## Troubleshooting
 
-```bash
-mvm agent serve --desired desired.json --interval-secs 30 --listen 0.0.0.0:4433
-```
+**`Lima VM 'mvm' does not exist`**: Run `mvm setup` or `mvm dev` (which auto-bootstraps).
 
-### One-shot reconcile
+**`limactl not found`**: Run `mvm bootstrap` to install Lima via Homebrew, or install manually with `brew install lima`.
 
-```bash
-mvm agent reconcile --desired desired.json
-```
+**Firecracker not installed**: Run `mvm setup` to install Firecracker inside the Lima VM.
 
-## Desired State File
+**Can't access project files inside microVM**: The Firecracker microVM has an isolated filesystem. Use `mvm shell` to access the Lima VM where your home directory is mounted, or pass volumes with `--volume`.
 
-Create `desired.json`:
+**Lima VM is slow**: Adjust resources: `mvm destroy && mvm dev --lima-cpus 8 --lima-mem 16`.
 
-```json
-{
-  "schema_version": 1,
-  "node_id": "node-1",
-  "tenants": [
-    {
-      "tenant_id": "acme",
-      "network": {
-        "tenant_net_id": 3,
-        "ipv4_subnet": "10.240.3.0/24"
-      },
-      "quotas": {
-        "max_vcpus": 16,
-        "max_mem_mib": 32768,
-        "max_running": 8,
-        "max_warm": 4,
-        "max_pools": 10,
-        "max_instances_per_pool": 32,
-        "max_disk_gib": 500
-      },
-      "pools": [
-        {
-          "pool_id": "workers",
-          "flake_ref": "github:org/app",
-          "profile": "minimal",
-          "instance_resources": {
-            "vcpus": 2,
-            "mem_mib": 1024,
-            "data_disk_mib": 0
-          },
-          "desired_counts": {
-            "running": 3,
-            "warm": 1,
-            "sleeping": 0
-          }
-        }
-      ]
-    }
-  ],
-  "prune_unknown_tenants": false,
-  "prune_unknown_pools": false
-}
-```
+**Rootfs corrupted**: Rebuild without destroying the Lima VM: `mvm setup --recreate`.
 
 ## Next Steps
 
-- [Onboarding Guide](docs/onboarding.md) -- end-to-end deployment walkthrough
-- [Full CLI Reference](docs/cli.md)
-- [Architecture Guide](docs/architecture.md)
-- [Networking](docs/networking.md)
-- [Agent & Reconciliation](docs/agent.md)
-- [Security](docs/security.md)
+- [README.md](README.md) -- full command reference and architecture
+- [User Guide](docs/user-guide.md) -- writing Nix flakes for microVM images
+- [Development](docs/development.md) -- contributing to mvm
+- [Troubleshooting](docs/troubleshooting.md) -- common issues
+- For multi-tenant fleet management, see [mvmd](https://github.com/auser/mvmd)

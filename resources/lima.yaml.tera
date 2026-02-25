@@ -38,6 +38,24 @@ provision:
     script: |
       #!/bin/bash
       set -eux -o pipefail
+      # Install build toolchain (cc linker for Rust, plus common utilities)
+      export DEBIAN_FRONTEND=noninteractive
+      apt-get update -qq
+      apt-get install -y -qq build-essential binutils lld pkg-config libssl-dev curl wget
+
+  - mode: user
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
+      # Install Rust via rustup (user-level, non-interactive)
+      if ! command -v cargo >/dev/null 2>&1; then
+        curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
+      fi
+
+  - mode: system
+    script: |
+      #!/bin/bash
+      set -eux -o pipefail
       # Install Nix package manager (multi-user)
       if ! command -v nix >/dev/null 2>&1; then
         curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install --no-confirm
@@ -55,6 +73,13 @@ provision:
         . /nix/var/nix/profiles/default/etc/profile.d/nix-daemon.sh
       fi
       NIXPROFILE
+
+      # Source Rust/Cargo if available
+      cat > /etc/profile.d/mvm-rust.sh << 'RUSTPROFILE'
+      if [ -f "$HOME/.cargo/env" ]; then
+        . "$HOME/.cargo/env"
+      fi
+      RUSTPROFILE
 
       # Add Firecracker to PATH for all users
       cat > /etc/profile.d/mvm-tools.sh << 'MVMTOOLS'
