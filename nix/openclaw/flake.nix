@@ -55,15 +55,18 @@
           } ''
             mkdir -p $out
 
-            # Kernel — Firecracker needs uncompressed vmlinux
+            # Kernel — Firecracker needs an uncompressed kernel image.
+            # On x86_64 it's typically vmlinux; on aarch64 it's Image.
             if [ -f "${kernel}/vmlinux" ]; then
               cp "${kernel}/vmlinux" "$out/vmlinux"
+            elif [ -f "${kernel}/Image" ]; then
+              cp "${kernel}/Image" "$out/vmlinux"
             elif [ -f "${kernel}/bzImage" ]; then
-              # Fallback: extract vmlinux from bzImage if available
               cp "${kernel}/bzImage" "$out/kernel"
             else
-              cp "${kernel}" "$out/vmlinux" 2>/dev/null || \
-                (echo "ERROR: cannot find kernel image" >&2; exit 1)
+              echo "ERROR: cannot find kernel image in ${kernel}:" >&2
+              ls -la "${kernel}/" >&2
+              exit 1
             fi
 
             # Rootfs — ext4 image for Firecracker

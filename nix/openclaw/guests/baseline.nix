@@ -79,6 +79,9 @@
   ];
 
   # --- Security hardening ---
+  # microVMs are headless workloads — no SSH, no interactive login.
+  # Communication is via Firecracker vsock only.
   security.sudo.enable = false;
   users.mutableUsers = false;
+  users.allowNoPasswordLogin = true;
 }
