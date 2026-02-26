@@ -59,6 +59,19 @@ We hardened dev workflows in Sprint 11 but saw recurring friction around sync/bo
 - [ ] Migration helper `template migrate-from-pool <tenant>/<old_pool> <template>` to convert existing pools
 - [ ] Doc polish (CLI reference / examples)
 
+## Phase 2c: Vsock CLI & Guest Agent
+**Status: IN PROGRESS**
+
+- [x] Add `mvm vm ping <name>` and `mvm vm status <name> [--json]` CLI commands
+- [x] Enable vsock device (`PUT /vsock`) in dev-mode Firecracker configuration
+- [x] Add VSOCK column to `mvm status` multi-VM table
+- [x] Lima delegation for vsock commands (macOS → Lima VM re-invocation)
+- [x] Fix vsock socket permissions after VM start (`chmod 0666`)
+- [x] Create `mvm-guest-agent` binary with real system monitoring (load sampling, idle/busy detection)
+- [x] Guest agent handles: Ping, WorkerStatus, SleepPrep (sync + drop caches), Wake
+- [ ] Install guest agent into microVM rootfs (Nix flake / cloud-init)
+- [ ] End-to-end test: `mvm vm ping` → guest agent → Pong
+
 ## Phase 3: Installer/Setup UX
 **Status: PENDING**
 

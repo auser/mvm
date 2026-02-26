@@ -195,12 +195,15 @@ enum Commands {
         name: Option<String>,
         /// Path to fleet config (default: auto-discover mvm.toml)
         #[arg(long, short = 'f')]
-        file: Option<String>,
+        config: Option<String>,
     },
     /// Stop VMs defined in mvm.toml
     Down {
         /// Stop only this VM
         name: Option<String>,
+        /// Path to fleet config (default: auto-discover mvm.toml)
+        #[arg(long, short = 'f')]
+        config: Option<String>,
     },
     /// Interact with a running microVM via vsock
     Vm {
@@ -432,8 +435,8 @@ pub fn run() -> Result<()> {
             config.as_deref(),
             &volume,
         ),
-        Commands::Up { name, file } => cmd_up(name.as_deref(), file.as_deref()),
-        Commands::Down { name } => cmd_down(name.as_deref()),
+        Commands::Up { name, config } => cmd_up(name.as_deref(), config.as_deref()),
+        Commands::Down { name, config } => cmd_down(name.as_deref(), config.as_deref()),
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::Template { action } => cmd_template(action),
         Commands::Vm { action } => cmd_vm(action),
@@ -1390,12 +1393,22 @@ fn cmd_up(name: Option<&str>, file: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_down(name: Option<&str>) -> Result<()> {
+fn cmd_down(name: Option<&str>, config_path: Option<&str>) -> Result<()> {
     match name {
         Some(n) => microvm::stop_vm(n),
         None => {
-            // If mvm.toml exists, stop only fleet VMs
-            if let Ok(Some((fleet_config, _))) = fleet::find_fleet_config() {
+            // Load fleet config from explicit path or auto-discover
+            let found = match config_path {
+                Some(path) => {
+                    let content = std::fs::read_to_string(path)
+                        .with_context(|| format!("Failed to read {}", path))?;
+                    let config: fleet::FleetConfig = toml::from_str(&content)
+                        .with_context(|| format!("Failed to parse {}", path))?;
+                    Some(config)
+                }
+                None => fleet::find_fleet_config()?.map(|(c, _)| c),
+            };
+            if let Some(fleet_config) = found {
                 let mut stopped = 0;
                 for vm_name in fleet_config.vms.keys() {
                     if microvm::stop_vm(vm_name).is_ok() {
@@ -1920,9 +1933,9 @@ mod tests {
     fn test_up_parses_no_args() {
         let cli = Cli::try_parse_from(["mvm", "up"]).unwrap();
         match cli.command {
-            Commands::Up { name, file } => {
+            Commands::Up { name, config } => {
                 assert!(name.is_none());
-                assert!(file.is_none());
+                assert!(config.is_none());
             }
             _ => panic!("Expected Up command"),
         }
@@ -1932,33 +1945,33 @@ mod tests {
     fn test_up_parses_with_name() {
         let cli = Cli::try_parse_from(["mvm", "up", "gw"]).unwrap();
         match cli.command {
-            Commands::Up { name, file } => {
+            Commands::Up { name, config } => {
                 assert_eq!(name.as_deref(), Some("gw"));
-                assert!(file.is_none());
+                assert!(config.is_none());
             }
             _ => panic!("Expected Up command"),
         }
     }
 
     #[test]
-    fn test_up_parses_with_file() {
+    fn test_up_parses_with_config() {
         let cli = Cli::try_parse_from(["mvm", "up", "-f", "fleet.toml"]).unwrap();
         match cli.command {
-            Commands::Up { name, file } => {
+            Commands::Up { name, config } => {
                 assert!(name.is_none());
-                assert_eq!(file.as_deref(), Some("fleet.toml"));
+                assert_eq!(config.as_deref(), Some("fleet.toml"));
             }
             _ => panic!("Expected Up command"),
         }
     }
 
     #[test]
-    fn test_up_parses_name_and_file() {
+    fn test_up_parses_name_and_config() {
         let cli = Cli::try_parse_from(["mvm", "up", "gw", "-f", "fleet.toml"]).unwrap();
         match cli.command {
-            Commands::Up { name, file } => {
+            Commands::Up { name, config } => {
                 assert_eq!(name.as_deref(), Some("gw"));
-                assert_eq!(file.as_deref(), Some("fleet.toml"));
+                assert_eq!(config.as_deref(), Some("fleet.toml"));
             }
             _ => panic!("Expected Up command"),
         }
@@ -1968,8 +1981,9 @@ mod tests {
     fn test_down_parses_no_args() {
         let cli = Cli::try_parse_from(["mvm", "down"]).unwrap();
         match cli.command {
-            Commands::Down { name } => {
+            Commands::Down { name, config } => {
                 assert!(name.is_none());
+                assert!(config.is_none());
             }
             _ => panic!("Expected Down command"),
         }
@@ -1979,8 +1993,21 @@ mod tests {
     fn test_down_parses_with_name() {
         let cli = Cli::try_parse_from(["mvm", "down", "gw"]).unwrap();
         match cli.command {
-            Commands::Down { name } => {
+            Commands::Down { name, config } => {
                 assert_eq!(name.as_deref(), Some("gw"));
+                assert!(config.is_none());
+            }
+            _ => panic!("Expected Down command"),
+        }
+    }
+
+    #[test]
+    fn test_down_parses_with_config() {
+        let cli = Cli::try_parse_from(["mvm", "down", "-f", "my-fleet.toml"]).unwrap();
+        match cli.command {
+            Commands::Down { name, config } => {
+                assert!(name.is_none());
+                assert_eq!(config.as_deref(), Some("my-fleet.toml"));
             }
             _ => panic!("Expected Down command"),
         }

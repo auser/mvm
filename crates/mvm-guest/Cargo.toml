@@ -12,6 +12,10 @@ authors.workspace = true
 name = "mvm-builder-agent"
 path = "src/bin/mvm-builder-agent.rs"
 
+[[bin]]
+name = "mvm-guest-agent"
+path = "src/bin/mvm-guest-agent.rs"
+
 [dependencies]
 mvm-core = { path = "../mvm-core", version = "0.3.0" }
 anyhow.workspace = true
