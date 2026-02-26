@@ -69,8 +69,12 @@ We hardened dev workflows in Sprint 11 but saw recurring friction around sync/bo
 - [x] Fix vsock socket permissions after VM start (`chmod 0666`)
 - [x] Create `mvm-guest-agent` binary with real system monitoring (load sampling, idle/busy detection)
 - [x] Guest agent handles: Ping, WorkerStatus, SleepPrep (sync + drop caches), Wake
-- [ ] Install guest agent into microVM rootfs (Nix flake / cloud-init)
-- [ ] End-to-end test: `mvm vm ping` → guest agent → Pong
+- [x] Guest agent accepts config file (`/etc/mvm/agent.json`) and CLI flags (`--port`, `--busy-threshold`, `--sample-interval`)
+- [x] Shared NixOS module (`nix/modules/guest-agent.nix`) and package (`nix/modules/guest-agent-pkg.nix`)
+- [x] OpenClaw flake imports guest agent module; agent starts automatically on boot
+- [x] Template scaffold emits guest agent module files on `mvm template create`
+- [x] CLI integration tests for `mvm vm` subcommands (help, parsing, graceful errors)
+- [ ] Rebuild images with guest agent and validate `mvm vm ping` end-to-end
 
 ## Phase 3: Installer/Setup UX
 **Status: PENDING**

@@ -304,6 +304,24 @@ fn scaffold_template_files(dir: &Path, name: &str) -> Result<()> {
         )?;
     }
 
+    // modules/guest-agent.nix (shared mvm guest agent NixOS module)
+    let agent_module = dir.join("modules").join("guest-agent.nix");
+    if !agent_module.exists() {
+        write_file(
+            &agent_module,
+            include_str!("../../../nix/modules/guest-agent.nix"),
+        )?;
+    }
+
+    // modules/guest-agent-pkg.nix (builds the agent from the workspace)
+    let agent_pkg = dir.join("modules").join("guest-agent-pkg.nix");
+    if !agent_pkg.exists() {
+        write_file(
+            &agent_pkg,
+            include_str!("../../../nix/modules/guest-agent-pkg.nix"),
+        )?;
+    }
+
     // README
     let readme_path = dir.join("README.md");
     if !readme_path.exists() {

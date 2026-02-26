@@ -18,11 +18,17 @@
       let
         pkgs = import nixpkgs { inherit system; };
 
+        # mvm guest agent — vsock management agent for host-to-guest communication.
+        # To build from mvm workspace source, set mvmSrc to the workspace root.
+        # For standalone templates, point mvmSrc at a local checkout or fetched source.
+        mvm-guest-agent = import ./modules/guest-agent-pkg.nix { inherit pkgs; mvmSrc = ../../.; };
+
         mkGuest = modules:
           let
             guestConfig = nixpkgs.lib.nixosSystem {
               inherit system;
-              modules = [ microvm.nixosModules.microvm ./guests/baseline.nix ] ++ modules;
+              specialArgs = { inherit mvm-guest-agent; };
+              modules = [ microvm.nixosModules.microvm ./modules/guest-agent.nix ./guests/baseline.nix ] ++ modules;
             };
             cfg = guestConfig.config;
           in {

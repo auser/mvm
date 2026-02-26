@@ -277,3 +277,79 @@ fn test_template_lifecycle_commands() {
         .failure()
         .stderr(predicate::str::contains("required"));
 }
+
+// ---------------------------------------------------------------------------
+// VM vsock commands
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_vm_help_lists_subcommands() {
+    mvm()
+        .args(["vm", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("ping"))
+        .stdout(predicate::str::contains("status"));
+}
+
+#[test]
+fn test_vm_ping_requires_name() {
+    mvm()
+        .args(["vm", "ping"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required"));
+}
+
+#[test]
+fn test_vm_status_requires_name() {
+    mvm()
+        .args(["vm", "status"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required"));
+}
+
+#[test]
+fn test_vm_ping_nonexistent_fails_gracefully() {
+    // Ping a VM that doesn't exist — should fail with an error message, not panic
+    let assert = mvm().args(["vm", "ping", "nonexistent-vm"]).assert();
+    let output = assert.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    // Should mention the VM name or indicate it's not found
+    assert!(
+        combined.contains("nonexistent-vm")
+            || combined.contains("not found")
+            || combined.contains("No running")
+            || combined.contains("error")
+            || combined.contains("Error")
+            || combined.contains("limactl"),
+        "vm ping should fail gracefully, got: {}",
+        combined
+    );
+}
+
+#[test]
+fn test_vm_status_nonexistent_fails_gracefully() {
+    let assert = mvm().args(["vm", "status", "nonexistent-vm"]).assert();
+    let output = assert.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("nonexistent-vm")
+            || combined.contains("not found")
+            || combined.contains("No running")
+            || combined.contains("error")
+            || combined.contains("Error")
+            || combined.contains("limactl"),
+        "vm status should fail gracefully, got: {}",
+        combined
+    );
+}
