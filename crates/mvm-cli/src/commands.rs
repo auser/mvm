@@ -40,6 +40,9 @@ enum Commands {
         /// Delete the existing rootfs and rebuild it from scratch
         #[arg(long)]
         recreate: bool,
+        /// Re-run all setup steps even if already complete
+        #[arg(long)]
+        force: bool,
         /// Number of vCPUs for the Lima VM
         #[arg(long, default_value = "8")]
         lima_cpus: u32,
@@ -141,7 +144,11 @@ enum Commands {
         force: bool,
     },
     /// System diagnostics and dependency checks
-    Doctor,
+    Doctor {
+        /// Output results as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Pre-release checks (deploy guard + cargo publish dry-run)
     Release {
         /// Run cargo publish --dry-run for all crates
@@ -382,13 +389,14 @@ pub fn run() -> Result<()> {
     };
     logging::init(log_format);
 
-    match cli.command {
+    let result = match cli.command {
         Commands::Bootstrap { production } => cmd_bootstrap(production),
         Commands::Setup {
             recreate,
+            force,
             lima_cpus,
             lima_mem,
-        } => cmd_setup(recreate, lima_cpus, lima_mem),
+        } => cmd_setup(recreate, force, lima_cpus, lima_mem),
         Commands::Dev {
             lima_cpus,
             lima_mem,
@@ -425,7 +433,7 @@ pub fn run() -> Result<()> {
         Commands::Status => cmd_status(),
         Commands::Destroy { yes } => cmd_destroy(yes),
         Commands::Upgrade { check, force } => cmd_upgrade(check, force),
-        Commands::Doctor => cmd_doctor(),
+        Commands::Doctor { json } => cmd_doctor(json),
         Commands::Release {
             dry_run,
             guard_only,
@@ -479,7 +487,9 @@ pub fn run() -> Result<()> {
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::Template { action } => cmd_template(action),
         Commands::Vm { action } => cmd_vm(action),
-    }
+    };
+
+    with_hints(result)
 }
 
 // ============================================================================
@@ -496,14 +506,14 @@ fn cmd_bootstrap(production: bool) -> Result<()> {
     ui::info("\nInstalling prerequisites...");
     bootstrap::ensure_lima()?;
 
-    // Bootstrap uses default Lima resources (8 vCPUs, 16 GiB)
-    run_setup_steps(8, 16)?;
+    // Bootstrap uses default Lima resources (8 vCPUs, 16 GiB), never forces
+    run_setup_steps(false, 8, 16)?;
 
     ui::success("\nBootstrap complete! Run 'mvm dev' to enter the development environment.");
     Ok(())
 }
 
-fn cmd_setup(recreate: bool, lima_cpus: u32, lima_mem: u32) -> Result<()> {
+fn cmd_setup(recreate: bool, force: bool, lima_cpus: u32, lima_mem: u32) -> Result<()> {
     if recreate {
         recreate_rootfs()?;
         ui::success("\nRootfs recreated! Run 'mvm start' or 'mvm dev' to launch.");
@@ -512,7 +522,7 @@ fn cmd_setup(recreate: bool, lima_cpus: u32, lima_mem: u32) -> Result<()> {
 
     if !bootstrap::is_lima_required() {
         // Native Linux — just install FC directly
-        run_setup_steps(lima_cpus, lima_mem)?;
+        run_setup_steps(force, lima_cpus, lima_mem)?;
         ui::success("\nSetup complete! Run 'mvm start' to launch a microVM.");
         return Ok(());
     }
@@ -524,7 +534,7 @@ fn cmd_setup(recreate: bool, lima_cpus: u32, lima_mem: u32) -> Result<()> {
         )
     })?;
 
-    run_setup_steps(lima_cpus, lima_mem)?;
+    run_setup_steps(force, lima_cpus, lima_mem)?;
 
     ui::success("\nSetup complete! Run 'mvm start' to launch a microVM.");
     Ok(())
@@ -568,7 +578,7 @@ fn cmd_dev(lima_cpus: u32, lima_mem: u32, project: Option<&str>) -> Result<()> {
             match lima_status {
                 lima::LimaStatus::NotFound => {
                     ui::info("Lima VM not found. Running setup...\n");
-                    run_setup_steps(lima_cpus, lima_mem)?;
+                    run_setup_steps(false, lima_cpus, lima_mem)?;
                 }
                 lima::LimaStatus::Stopped => {
                     ui::info("Lima VM is stopped. Starting...");
@@ -592,32 +602,39 @@ fn cmd_dev(lima_cpus: u32, lima_mem: u32, project: Option<&str>) -> Result<()> {
     cmd_shell(project, lima_cpus, lima_mem)
 }
 
-fn run_setup_steps(lima_cpus: u32, lima_mem: u32) -> Result<()> {
+fn run_setup_steps(force: bool, lima_cpus: u32, lima_mem: u32) -> Result<()> {
+    // Step 1: Lima VM
     if bootstrap::is_lima_required() {
-        let opts = config::LimaRenderOptions {
-            cpus: Some(lima_cpus),
-            memory_gib: Some(lima_mem),
-            ..Default::default()
-        };
-        let lima_yaml = config::render_lima_yaml_with(&opts)?;
-        ui::info(&format!(
-            "Lima VM resources: {} vCPUs, {} GiB memory",
-            lima_cpus, lima_mem,
-        ));
-        ui::info(&format!(
-            "Using rendered Lima config: {}",
-            lima_yaml.path().display()
-        ));
-
-        ui::step(1, 4, "Setting up Lima VM...");
-        lima::ensure_running(lima_yaml.path())?;
+        let lima_status = lima::get_status()?;
+        if !force && matches!(lima_status, lima::LimaStatus::Running) {
+            ui::step(1, 4, "Lima VM already running — skipping.");
+        } else {
+            let opts = config::LimaRenderOptions {
+                cpus: Some(lima_cpus),
+                memory_gib: Some(lima_mem),
+                ..Default::default()
+            };
+            let lima_yaml = config::render_lima_yaml_with(&opts)?;
+            ui::info(&format!(
+                "Lima VM resources: {} vCPUs, {} GiB memory",
+                lima_cpus, lima_mem,
+            ));
+            ui::step(1, 4, "Setting up Lima VM...");
+            lima::ensure_running(lima_yaml.path())?;
+        }
     } else {
         ui::step(1, 4, "Native Linux detected — skipping Lima VM setup.");
     }
 
-    ui::step(2, 4, "Installing Firecracker...");
-    firecracker::install()?;
+    // Step 2: Firecracker
+    if !force && firecracker::is_installed()? {
+        ui::step(2, 4, "Firecracker already installed — skipping.");
+    } else {
+        ui::step(2, 4, "Installing Firecracker...");
+        firecracker::install()?;
+    }
 
+    // Step 3: Assets
     ui::step(3, 4, "Downloading kernel and rootfs...");
     firecracker::download_assets()?;
 
@@ -630,6 +647,7 @@ fn run_setup_steps(lima_cpus: u32, lima_mem: u32) -> Result<()> {
         firecracker::download_assets()?;
     }
 
+    // Step 4: Rootfs
     ui::step(4, 4, "Preparing root filesystem...");
     firecracker::prepare_rootfs()?;
 
@@ -1102,8 +1120,36 @@ fn cmd_upgrade(check: bool, force: bool) -> Result<()> {
     upgrade::upgrade(check, force)
 }
 
-fn cmd_doctor() -> Result<()> {
-    crate::doctor::run()
+fn cmd_doctor(json: bool) -> Result<()> {
+    crate::doctor::run(json)
+}
+
+// ============================================================================
+// Error hints
+// ============================================================================
+
+/// Wrap a command result with actionable hints for common errors.
+fn with_hints(result: Result<()>) -> Result<()> {
+    if let Err(ref e) = result {
+        let msg = format!("{:#}", e);
+        if msg.contains("limactl: command not found") || msg.contains("limactl: not found") {
+            ui::warn("Hint: Install Lima with 'brew install lima' or run 'mvm bootstrap'.");
+        } else if msg.contains("firecracker: command not found")
+            || msg.contains("firecracker: not found")
+        {
+            ui::warn("Hint: Run 'mvm setup' to install Firecracker.");
+        } else if msg.contains("/dev/kvm") {
+            ui::warn(
+                "Hint: Enable KVM/virtualization in your BIOS or VM settings.\n      \
+                 On macOS, KVM is available inside the Lima VM.",
+            );
+        } else if msg.contains("Permission denied") && msg.contains("/var/lib/mvm") {
+            ui::warn("Hint: Check directory permissions on /var/lib/mvm or run with sudo.");
+        } else if msg.contains("nix: command not found") || msg.contains("nix: not found") {
+            ui::warn("Hint: Nix is installed inside the Lima VM. Run 'mvm shell' first.");
+        }
+    }
+    result
 }
 
 // ============================================================================

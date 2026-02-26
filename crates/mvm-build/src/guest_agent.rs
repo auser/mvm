@@ -14,12 +14,17 @@ pub fn build_guest_agent(env: &dyn ShellEnvironment) -> Result<String> {
 
     env.log_info("Building mvm-guest-agent...");
 
+    // First build with visible output so the user sees progress/errors.
+    env.shell_exec_visible(&format!("nix build 'path:{}' --no-link", flake_path))
+        .with_context(|| "Failed to build mvm-guest-agent via nix")?;
+
+    // Then capture the output path (instant, uses Nix cache).
     let output = env
         .shell_exec_stdout(&format!(
-            "nix build 'path:{}' --no-link --print-out-paths 2>/dev/null",
+            "nix build 'path:{}' --no-link --print-out-paths",
             flake_path
         ))
-        .with_context(|| "Failed to build mvm-guest-agent via nix")?;
+        .with_context(|| "Failed to get mvm-guest-agent output path")?;
 
     let store_path = output
         .lines()

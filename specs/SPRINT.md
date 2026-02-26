@@ -80,19 +80,20 @@ We hardened dev workflows in Sprint 11 but saw recurring friction around sync/bo
 - [x] Rebuild images with guest agent and validate `mvm vm ping` end-to-end
 
 ## Phase 3: Installer/Setup UX
-**Status: PENDING**
+**Status: COMPLETE**
 
-- [ ] Make `mvm setup`/`bootstrap` idempotent with clear re-run messaging
-- [ ] Preflight check for KVM, virtualization, network bridges; actionable guidance
-- [ ] Improve error surfaces (hint to use `--force`, show missing tool and install cmd)
-- [ ] Update docs/QUICKSTART with known-good host matrix and fallback paths
+- [x] Make `mvm setup`/`bootstrap` idempotent with clear re-run messaging and `--force` flag
+- [x] Preflight check for KVM, virtualization, disk space, Lima status; actionable guidance via expanded `mvm doctor`
+- [x] Improve error surfaces (`with_hints` wrapper for common failures: missing tools, KVM, permissions, Nix)
+- [x] `mvm doctor --json` for machine-readable diagnostics
+- [x] Create `docs/quickstart.md` with known-good host matrix, install steps, and troubleshooting
 
 ## Phase 4: Observability & Logs
 **Status: PENDING**
 
 - [ ] Structured logs for sync/build (timestamps, phases) with `--json` flag
 - [ ] Capture and surface builder VM logs when nix build fails
-- [ ] Add `mvm doctor` summary (reuses sync doctor) to show overall health
+- [x] Add `mvm doctor` summary (reuses sync doctor) to show overall health (done in Phase 3)
 
 ## Phase 5: QA & Documentation
 **Status: PENDING**
