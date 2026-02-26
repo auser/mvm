@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, anyhow};
 use mvm_core::template::{TemplateSpec, template_dir, template_spec_path};
 
 use crate::build_env::RuntimeBuildEnv;
@@ -9,26 +9,66 @@ use mvm_core::time::utc_now;
 
 use super::registry::TemplateRegistry;
 
+/// Run a shell command in the VM and check its exit code.
+/// Returns an error with stderr context if the command fails.
+fn vm_exec(script: &str) -> Result<()> {
+    let out = shell::run_in_vm(script)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let first_line = script.lines().next().unwrap_or(script);
+        return Err(anyhow!(
+            "Command failed (exit {}): {}\n  command: {}",
+            out.status.code().unwrap_or(-1),
+            stderr,
+            first_line,
+        ));
+    }
+    Ok(())
+}
+
+/// Run a shell command in the VM, check exit code, and return stdout.
+fn vm_exec_stdout(script: &str) -> Result<String> {
+    let out = shell::run_in_vm(script)?;
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        let first_line = script.lines().next().unwrap_or(script);
+        return Err(anyhow!(
+            "Command failed (exit {}): {}\n  command: {}",
+            out.status.code().unwrap_or(-1),
+            stderr,
+            first_line,
+        ));
+    }
+    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
+}
+
 pub fn template_create(spec: &TemplateSpec) -> Result<()> {
     let dir = template_dir(&spec.template_id);
-    shell::run_in_vm(&format!("mkdir -p {dir}"))?;
+    vm_exec(&format!("mkdir -p {dir}"))
+        .with_context(|| format!("Failed to create template directory {}", dir))?;
     let path = template_spec_path(&spec.template_id);
     let json = serde_json::to_string_pretty(spec)?;
-    shell::run_in_vm(&format!("cat > {path} << 'MVMEOF'\n{json}\nMVMEOF"))?;
+    vm_exec(&format!("cat > {path} << 'MVMEOF'\n{json}\nMVMEOF"))
+        .with_context(|| format!("Failed to write template spec {}", path))?;
     Ok(())
 }
 
 pub fn template_load(id: &str) -> Result<TemplateSpec> {
     let path = template_spec_path(id);
-    let data = shell::run_in_vm_stdout(&format!("cat {path}"))
-        .with_context(|| format!("Failed to load template {}", id))?;
+    let data = vm_exec_stdout(&format!("cat {path}")).with_context(|| {
+        format!(
+            "Failed to load template {} (does it exist? try `mvm template list`)",
+            id
+        )
+    })?;
     let spec: TemplateSpec =
         serde_json::from_str(&data).with_context(|| format!("Corrupt template {}", id))?;
     Ok(spec)
 }
 
 pub fn template_list() -> Result<Vec<String>> {
-    let out = shell::run_in_vm_stdout("ls -1 /var/lib/mvm/templates 2>/dev/null || true")?
+    let base = mvm_core::template::templates_base_dir();
+    let out = shell::run_in_vm_stdout(&format!("ls -1 {base} 2>/dev/null || true"))?
         .trim()
         .to_string();
     Ok(out
@@ -41,7 +81,8 @@ pub fn template_list() -> Result<Vec<String>> {
 pub fn template_delete(id: &str, force: bool) -> Result<()> {
     let dir = template_dir(id);
     let flag = if force { "-rf" } else { "-r" };
-    shell::run_in_vm(&format!("rm {flag} {dir}"))?;
+    vm_exec(&format!("rm {flag} {dir}"))
+        .with_context(|| format!("Failed to delete template {}", id))?;
     Ok(())
 }
 
@@ -50,12 +91,13 @@ pub fn template_delete(id: &str, force: bool) -> Result<()> {
 pub fn template_init(id: &str) -> Result<()> {
     let dir = template_dir(id);
     let artifacts = format!("{}/artifacts/revisions", dir);
-    shell::run_in_vm(&format!("mkdir -p {dir} {artifacts}"))?;
+    vm_exec(&format!("mkdir -p {dir} {artifacts}"))
+        .with_context(|| format!("Failed to initialize template directory {}", dir))?;
     Ok(())
 }
 
 /// Build a template using the dev build pipeline (local Nix in Lima).
-/// Artifacts are stored in /var/lib/mvm/templates/<id>/artifacts and the current symlink is updated.
+/// Artifacts are stored in ~/.mvm/templates/<id>/artifacts and the current symlink is updated.
 pub fn template_build(id: &str, force: bool) -> Result<()> {
     let spec = template_load(id)?;
     let env = RuntimeBuildEnv;
@@ -63,7 +105,8 @@ pub fn template_build(id: &str, force: bool) -> Result<()> {
     // Use dev_build to produce artifacts via Nix in Lima
     let result = if force {
         // Force: remove any cached artifacts to trigger a fresh build
-        let cache_dir = format!("/var/lib/mvm/dev-builds/{}", spec.flake_ref);
+        let data_dir = mvm_core::config::mvm_data_dir();
+        let cache_dir = format!("{}/dev/builds/{}", data_dir, spec.flake_ref);
         let _ = shell::run_in_vm(&format!("rm -rf {cache_dir}"));
         mvm_build::dev_build::dev_build(&env, &spec.flake_ref, Some(&spec.profile))?
     } else {
@@ -164,7 +207,7 @@ struct Checksums {
 }
 
 fn require_local_template_fs() -> Result<()> {
-    // Registry push/pull needs direct file access to /var/lib/mvm/templates.
+    // Registry push/pull needs direct file access to ~/.mvm/templates.
     // On macOS, templates live inside Lima; run these commands inside the VM.
     if mvm_core::platform::current().needs_lima() && !crate::shell::inside_lima() {
         anyhow::bail!(

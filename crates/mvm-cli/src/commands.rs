@@ -254,15 +254,15 @@ enum TemplateCmd {
     /// Create a new template (single role/profile)
     Create {
         name: String,
-        #[arg(long)]
+        #[arg(long, default_value = ".")]
         flake: String,
-        #[arg(long)]
+        #[arg(long, default_value = "default")]
         profile: String,
         #[arg(long, default_value = "worker")]
         role: String,
-        #[arg(long)]
+        #[arg(long, default_value = "2")]
         cpus: u8,
-        #[arg(long)]
+        #[arg(long, default_value = "1024")]
         mem: u32,
         #[arg(long, default_value = "0")]
         data_disk: u32,
@@ -270,16 +270,16 @@ enum TemplateCmd {
     /// Create multiple role-specific templates (name-role)
     CreateMulti {
         base: String,
-        #[arg(long)]
+        #[arg(long, default_value = ".")]
         flake: String,
-        #[arg(long)]
+        #[arg(long, default_value = "default")]
         profile: String,
         /// Comma-separated roles, e.g. gateway,agent
         #[arg(long)]
         roles: String,
-        #[arg(long)]
+        #[arg(long, default_value = "2")]
         cpus: u8,
-        #[arg(long)]
+        #[arg(long, default_value = "1024")]
         mem: u32,
         #[arg(long, default_value = "0")]
         data_disk: u32,
@@ -335,7 +335,7 @@ enum TemplateCmd {
     Init {
         /// Template ID
         name: String,
-        /// Create locally instead of inside the VM (/var/lib/mvm/templates)
+        /// Create locally instead of in ~/.mvm/templates
         #[arg(long)]
         local: bool,
         /// Force VM location (overrides --local)
@@ -1147,8 +1147,8 @@ fn with_hints(result: Result<()>) -> Result<()> {
                 "Hint: Enable KVM/virtualization in your BIOS or VM settings.\n      \
                  On macOS, KVM is available inside the Lima VM.",
             );
-        } else if msg.contains("Permission denied") && msg.contains("/var/lib/mvm") {
-            ui::warn("Hint: Check directory permissions on /var/lib/mvm or run with sudo.");
+        } else if msg.contains("Permission denied") && msg.contains(".mvm") {
+            ui::warn("Hint: Check directory permissions on ~/.mvm (set MVM_DATA_DIR to override).");
         } else if msg.contains("nix: command not found") || msg.contains("nix: not found") {
             ui::warn("Hint: Nix is installed inside the Lima VM. Run 'mvm shell' first.");
         }

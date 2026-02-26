@@ -2,13 +2,15 @@ use anyhow::{Context, Result};
 
 use mvm_core::build_env::ShellEnvironment;
 
-/// Base directory for dev build artifacts.
-const DEV_BUILDS_DIR: &str = "/var/lib/mvm/dev/builds";
+/// Base directory for dev build artifacts ($HOME/.mvm/dev/builds).
+fn dev_builds_dir() -> String {
+    format!("{}/dev/builds", mvm_core::config::mvm_data_dir())
+}
 
 /// Result of a dev build via `nix build` in the Lima VM.
 #[derive(Debug, Clone)]
 pub struct DevBuildResult {
-    /// Directory containing artifacts: /var/lib/mvm/dev/builds/<hash>/
+    /// Directory containing artifacts: ~/.mvm/dev/builds/<hash>/
     pub build_dir: String,
     /// Path to the kernel image.
     pub vmlinux_path: String,
@@ -106,15 +108,14 @@ fn resolve_dev_build_attribute(
     profile: Option<&str>,
 ) -> String {
     match profile {
-        Some(p) => {
+        Some(p) if p != "default" => {
             let system = nix_system();
             let attr = format!("{}#packages.{}.tenant-{}", flake_ref, system, p);
             env.log_info(&format!("Build attribute: {}", attr));
             attr
         }
-        None => {
-            // No profile: build the flake's default package.
-            // mvm flake convention: `default = worker`.
+        _ => {
+            // No profile or "default": build the flake's default package.
             env.log_info(&format!("Build attribute: {} (default)", flake_ref));
             flake_ref.to_string()
         }
@@ -132,7 +133,7 @@ fn extract_revision_hash(nix_output_path: &str) -> String {
 
 /// Return the dev build directory for a given revision hash.
 fn dev_build_dir(revision_hash: &str) -> String {
-    format!("{}/{}", DEV_BUILDS_DIR, revision_hash)
+    format!("{}/{}", dev_builds_dir(), revision_hash)
 }
 
 /// Check whether cached artifacts exist for a revision hash.
@@ -154,8 +155,7 @@ fn copy_dev_artifacts(
     env.shell_exec(&format!(
         r#"
         set -euo pipefail
-        sudo mkdir -p {dir}
-        sudo chown $(whoami) {dir}
+        mkdir -p {dir}
 
         # Copy kernel (try 'kernel' then 'vmlinux')
         if [ -e {out}/kernel ]; then
@@ -466,13 +466,17 @@ mod tests {
     #[test]
     fn test_dev_build_dir() {
         let dir = dev_build_dir("abc123");
-        assert_eq!(dir, "/var/lib/mvm/dev/builds/abc123");
+        assert!(dir.ends_with("/dev/builds/abc123"), "got: {}", dir);
     }
 
     #[test]
     fn test_dev_build_dir_preserves_full_hash() {
         let dir = dev_build_dir("abc123def456ghi789");
-        assert_eq!(dir, "/var/lib/mvm/dev/builds/abc123def456ghi789");
+        assert!(
+            dir.ends_with("/dev/builds/abc123def456ghi789"),
+            "got: {}",
+            dir
+        );
     }
 
     #[test]
@@ -555,15 +559,10 @@ mod tests {
 
         assert!(result.cached);
         assert_eq!(result.revision_hash, "abc123");
-        assert_eq!(result.build_dir, "/var/lib/mvm/dev/builds/abc123");
-        assert_eq!(
-            result.vmlinux_path,
-            "/var/lib/mvm/dev/builds/abc123/vmlinux"
-        );
-        assert_eq!(
-            result.rootfs_path,
-            "/var/lib/mvm/dev/builds/abc123/rootfs.ext4"
-        );
+        let expected_dir = dev_build_dir("abc123");
+        assert_eq!(result.build_dir, expected_dir);
+        assert_eq!(result.vmlinux_path, format!("{expected_dir}/vmlinux"));
+        assert_eq!(result.rootfs_path, format!("{expected_dir}/rootfs.ext4"));
     }
 
     #[test]
@@ -578,7 +577,7 @@ mod tests {
 
         assert!(!result.cached);
         assert_eq!(result.revision_hash, "xyz789");
-        assert_eq!(result.build_dir, "/var/lib/mvm/dev/builds/xyz789");
+        assert_eq!(result.build_dir, dev_build_dir("xyz789"));
 
         // Verify a copy script was executed
         let exec_log = env.exec_log.lock().unwrap();
@@ -588,11 +587,12 @@ mod tests {
 
     #[test]
     fn test_dev_build_result_paths_consistent() {
+        let dir = dev_build_dir("hash123");
         let result = DevBuildResult {
-            build_dir: "/var/lib/mvm/dev/builds/hash123".to_string(),
-            vmlinux_path: "/var/lib/mvm/dev/builds/hash123/vmlinux".to_string(),
-            initrd_path: Some("/var/lib/mvm/dev/builds/hash123/initrd".to_string()),
-            rootfs_path: "/var/lib/mvm/dev/builds/hash123/rootfs.ext4".to_string(),
+            build_dir: dir.clone(),
+            vmlinux_path: format!("{dir}/vmlinux"),
+            initrd_path: Some(format!("{dir}/initrd")),
+            rootfs_path: format!("{dir}/rootfs.ext4"),
             revision_hash: "hash123".to_string(),
             cached: false,
         };

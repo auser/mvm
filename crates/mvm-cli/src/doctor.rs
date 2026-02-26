@@ -256,11 +256,11 @@ fn lima_status_check() -> Check {
 
 fn disk_space_check(in_vm: bool) -> Check {
     let result = if in_vm {
-        parse_disk_space("df -BG /var/lib/mvm 2>/dev/null || df -BG / 2>/dev/null")
+        parse_disk_space("df -BG ~/.mvm 2>/dev/null || df -BG / 2>/dev/null")
     } else if cfg!(target_os = "macos") {
         parse_disk_space("df -g ~ 2>/dev/null")
     } else {
-        parse_disk_space("df -BG /var/lib/mvm 2>/dev/null || df -BG / 2>/dev/null")
+        parse_disk_space("df -BG ~/.mvm 2>/dev/null || df -BG / 2>/dev/null")
     };
 
     match result {

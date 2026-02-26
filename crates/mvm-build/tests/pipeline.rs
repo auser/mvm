@@ -325,7 +325,10 @@ fn test_build_revision_recorded() {
 
     let cmds = env.shell_cmds();
     let pool_artifacts = "/var/lib/mvm/tenants/acme/pools/workers/artifacts";
-    let tpl_src = "/var/lib/mvm/templates/base-tpl/artifacts/rev123";
+    let tpl_src = format!(
+        "{}/templates/base-tpl/artifacts/rev123",
+        mvm_core::config::mvm_data_dir()
+    );
 
     // Revisions directory was created
     assert!(
@@ -338,7 +341,7 @@ fn test_build_revision_recorded() {
     // Artifacts copied from template revision
     assert!(
         cmds.iter()
-            .any(|c| c.contains("cp -a") && c.contains(tpl_src)),
+            .any(|c| c.contains("cp -a") && c.contains(&tpl_src)),
         "Should copy from template: {:?}",
         cmds
     );

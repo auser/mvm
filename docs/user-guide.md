@@ -149,7 +149,7 @@ This updates the `current` symlink without rebuilding.
 
 ## Templates
 
-Templates are global, tenant-agnostic base images stored under `/var/lib/mvm/templates/`. They let you build once and share artifacts across multiple pools.
+Templates are global, tenant-agnostic base images stored under `~/.mvm/templates/` (override with `MVM_DATA_DIR`). They let you build once and share artifacts across multiple pools.
 
 ### Scaffold a Template Project
 

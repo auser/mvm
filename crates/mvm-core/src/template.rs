@@ -49,8 +49,12 @@ pub struct TemplateSpec {
 }
 
 /// Path helpers
+pub fn templates_base_dir() -> String {
+    format!("{}/templates", crate::config::mvm_data_dir())
+}
+
 pub fn template_dir(template_id: &str) -> String {
-    format!("/var/lib/mvm/templates/{}", template_id)
+    format!("{}/{}", templates_base_dir(), template_id)
 }
 
 pub fn template_spec_path(template_id: &str) -> String {

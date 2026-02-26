@@ -44,6 +44,25 @@ pub fn fc_version_short() -> String {
     }
 }
 
+/// Root data directory for mvm dev-tool state.
+///
+/// Resolution order:
+///   1. `MVM_DATA_DIR` env var (explicit override)
+///   2. `$HOME/.mvm`
+///
+/// This is a user-owned directory — no sudo required.
+/// Fleet orchestration state (tenants, pools, instances) uses `/var/lib/mvm/`
+/// and is managed by mvmd with appropriate permissions.
+pub fn mvm_data_dir() -> String {
+    if let Ok(d) = std::env::var("MVM_DATA_DIR")
+        && !d.is_empty()
+    {
+        return d;
+    }
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".to_string());
+    format!("{}/.mvm", home)
+}
+
 /// Check if running in production mode (MVM_PRODUCTION=1).
 pub fn is_production_mode() -> bool {
     std::env::var("MVM_PRODUCTION")

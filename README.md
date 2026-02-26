@@ -180,24 +180,92 @@ mvm start path/to/image.elf --cpus 4 --memory 2048 --volume ./data:/data:512
 
 ## Templates
 
-Templates are pre-built base images that can be shared across machines via an S3-compatible registry.
+Templates are reusable microVM images built from Nix flakes. You scaffold a template locally, customize the NixOS configuration, build it, and then run it -- or share it via an S3-compatible registry.
 
-### Create
+### End-to-End Workflow
 
 ```bash
-# Single template
-mvm template create base-worker \
-    --flake github:org/app \
-    --profile minimal \
-    --role worker \
-    --cpus 2 --mem 1024
+# 1. Scaffold a new template in the current directory
+mvm template init my-service --local
+
+# 2. Edit the generated flake.nix to add your workload
+#    (see "What Gets Scaffolded" below)
+cd my-service
+$EDITOR flake.nix
+
+# 3. Register the template with mvm (defaults: flake=., profile=default, 2 cpus, 1024 MiB)
+mvm template create my-service
+
+# 4. Build the image (runs nix build inside the Lima VM)
+mvm template build my-service
+
+# 5. Run a microVM from the built template
+mvm run --flake .
+```
+
+### What Gets Scaffolded
+
+`mvm template init my-service --local` creates:
+
+```
+my-service/
+├── flake.nix       # Nix flake that builds kernel + rootfs via mkGuest
+├── baseline.nix    # NixOS guest config (console, drives, networking)
+├── .gitignore      # Ignores result symlinks and build artifacts
+└── README.md       # Quick-reference for the template workflow
+```
+
+**`flake.nix`** pulls in the mvm source as a flake input, which provides:
+- The **guest agent** binary (auto-included in every image for health checks and vsock communication)
+- The **guest-agent.nix** NixOS module (systemd service for the agent)
+- The **guest-integrations.nix** module (register workload health checks)
+
+**`baseline.nix`** configures the guest OS for Firecracker: minimal kernel, serial console, virtio drivers, static networking via kernel cmdline, and mount points for config/secrets/data drives.
+
+### Adding a Workload
+
+To add your own service to the template, create a role module (e.g. `roles/worker.nix`):
+
+```nix
+{ pkgs, ... }:
+{
+  # Import the integration health module so the guest agent
+  # monitors your service and reports status via `mvm vm status`.
+  imports = [ ../../../nix/modules/guest-integrations.nix ];
+
+  services.mvm-integrations = {
+    enable = true;
+    integrations.my-worker = {
+      healthCmd = "${pkgs.systemd}/bin/systemctl is-active my-worker.service";
+      healthIntervalSecs = 10;
+      healthTimeoutSecs = 5;
+    };
+  };
+
+  systemd.services.my-worker = {
+    # ... your systemd service definition
+  };
+}
+```
+
+Then add it to `flake.nix` in the `mkGuest` call:
+
+```nix
+packages.${system} = {
+  default = mkGuest "default" [ ./roles/worker.nix ];
+};
+```
+
+### Create (Without Scaffold)
+
+If you already have a Nix flake, register it directly:
+
+```bash
+# Single template (override defaults as needed)
+mvm template create base-worker --flake github:org/app --role worker
 
 # Multiple role variants at once (creates base-worker, base-gateway)
-mvm template create-multi base \
-    --flake github:org/app \
-    --profile minimal \
-    --roles worker,gateway \
-    --cpus 2 --mem 1024
+mvm template create-multi base --flake github:org/app --roles worker,gateway
 ```
 
 ### Build
@@ -207,7 +275,7 @@ mvm template build base-worker
 mvm template build base-worker --force    # Rebuild even if cached
 ```
 
-Builds run `nix build` inside the Lima VM (Layer 2) to produce kernel + rootfs artifacts. This is the **dev build** path -- no ephemeral Firecracker VMs are used for template builds.
+Builds run `nix build` inside the Lima VM (Layer 2) to produce kernel + rootfs artifacts. The **mvm guest agent** is automatically injected into the rootfs after every build, so you don't need to include it manually.
 
 For repeatable multi-role builds, use a TOML config:
 
@@ -323,7 +391,7 @@ Then connect with `ssh mvm` from any terminal.
 | `mvm template list` | List all templates |
 | `mvm template info <name>` | Show template details and revisions |
 | `mvm template delete <name>` | Delete a template |
-| `mvm template init <name>` | Initialize on-disk template layout |
+| `mvm template init <name>` | Initialize on-disk template layout (`--local` for scaffold in cwd) |
 
 ### Utilities
 
@@ -335,6 +403,7 @@ Then connect with `ssh mvm` from any terminal.
 
 | Variable | Description | Default |
 |----------|-------------|---------|
+| `MVM_DATA_DIR` | Root data directory for templates and builds | `~/.mvm` |
 | `MVM_FC_VERSION` | Firecracker version (auto-normalized to `vMAJOR.MINOR`) | Latest stable |
 | `MVM_FC_ASSET_BASE` | S3 base URL for Firecracker assets | AWS default |
 | `MVM_FC_ASSET_ROOTFS` | Override rootfs filename | Auto-detected |
@@ -361,7 +430,7 @@ mvm is a Cargo workspace with 5 crates:
 | Crate | Purpose |
 |-------|---------|
 | **mvm-core** | Pure types, IDs, config, protocol, signing, routing (no runtime deps) |
-| **mvm-guest** | Vsock protocol, integration manifest (OpenClaw) |
+| **mvm-guest** | Vsock protocol, integration health checks, guest agent binary |
 | **mvm-build** | Nix builder pipeline (dev_build for local, pool_build for fleet) |
 | **mvm-runtime** | Shell execution, Lima/Firecracker VM lifecycle, UI, template management |
 | **mvm-cli** | Clap CLI, bootstrap, upgrade, doctor, template commands |

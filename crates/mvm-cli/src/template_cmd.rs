@@ -1,6 +1,6 @@
 use anyhow::Result;
 use chrono::Utc;
-use mvm_core::template::{TemplateConfig, TemplateSpec, template_dir};
+use mvm_core::template::{TemplateConfig, TemplateSpec, template_dir, templates_base_dir};
 use mvm_runtime::vm::template::lifecycle as tmpl;
 use std::fs;
 use std::fs::read_dir;
@@ -64,16 +64,18 @@ pub fn list(json: bool) -> Result<()> {
     let vm_items = tmpl::template_list()?;
     let local_items = local_templates(Path::new("."))?;
 
+    let base = templates_base_dir();
+
     if json {
         #[derive(serde::Serialize)]
         struct Out {
-            vm_base: &'static str,
+            vm_base: String,
             vm: Vec<String>,
             local_base: String,
             local: Vec<String>,
         }
         let out = Out {
-            vm_base: "/var/lib/mvm/templates",
+            vm_base: base,
             vm: vm_items,
             local_base: std::env::current_dir()
                 .unwrap_or_else(|_| Path::new(".").to_path_buf())
@@ -85,7 +87,7 @@ pub fn list(json: bool) -> Result<()> {
         return Ok(());
     }
 
-    println!("VM templates (default: /var/lib/mvm/templates):");
+    println!("Templates ({base}):");
     if vm_items.is_empty() {
         println!("  (none)");
     } else {
