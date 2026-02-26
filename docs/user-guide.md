@@ -144,3 +144,138 @@ mvm pool rollback acme/workers --revision <hash>
 ```
 
 This updates the `current` symlink without rebuilding.
+
+---
+
+## Templates
+
+Templates are global, tenant-agnostic base images stored under `/var/lib/mvm/templates/`. They let you build once and share artifacts across multiple pools.
+
+### Scaffold a Template Project
+
+```bash
+mvm template init my-app --local
+```
+
+Creates a directory with a Nix flake, guest profiles, role configs, and a guest agent module:
+
+```
+my-app/
+  flake.nix
+  mvm-profiles.toml
+  template.toml
+  guests/baseline.nix
+  guests/profiles/gateway.nix
+  guests/profiles/worker.nix
+  roles/worker.nix
+  roles/gateway.nix
+  modules/guest-agent.nix
+  modules/guest-agent-pkg.nix
+```
+
+### Create and Build
+
+Register a single template:
+
+```bash
+mvm template create my-worker --flake ./my-app --profile minimal --role worker --cpus 2 --mem 1024
+mvm template build my-worker
+```
+
+Or create multiple role variants at once:
+
+```bash
+mvm template create-multi my-app --flake ./my-app --profile minimal --roles gateway,worker --cpus 2 --mem 1024
+mvm template build my-app-gateway
+mvm template build my-app-worker
+```
+
+### Config-Driven Multi-Variant Builds
+
+Define all variants in a `template.toml`:
+
+```toml
+[template]
+template_id = "my-app"
+flake_ref = "."
+profile = "minimal"
+
+[[variants]]
+name = "my-app-gateway"
+role = "gateway"
+profile = "gateway"
+vcpus = 4
+mem_mib = 2048
+data_disk_mib = 0
+
+[[variants]]
+name = "my-app-worker"
+role = "worker"
+profile = "minimal"
+vcpus = 2
+mem_mib = 1024
+data_disk_mib = 512
+```
+
+Build all variants:
+
+```bash
+mvm template build my-app --config template.toml
+```
+
+### Inspect Templates
+
+```bash
+mvm template list              # show all templates (VM + local)
+mvm template list --json       # JSON output
+mvm template info my-worker    # show template details
+mvm template info my-worker --json
+```
+
+### Delete
+
+```bash
+mvm template delete my-worker
+mvm template delete my-worker --force   # skip confirmation
+```
+
+### Template Registry (Push / Pull / Verify)
+
+Templates can be shared via S3-compatible object storage (AWS S3 or MinIO).
+
+Configure the registry with environment variables:
+
+```bash
+export MVM_TEMPLATE_REGISTRY_ENDPOINT="https://s3.amazonaws.com"
+export MVM_TEMPLATE_REGISTRY_BUCKET="mvm-templates"
+export MVM_TEMPLATE_REGISTRY_ACCESS_KEY_ID="..."
+export MVM_TEMPLATE_REGISTRY_SECRET_ACCESS_KEY="..."
+export MVM_TEMPLATE_REGISTRY_REGION="us-east-1"          # default
+export MVM_TEMPLATE_REGISTRY_PREFIX="mvm"                 # default
+export MVM_TEMPLATE_REGISTRY_INSECURE="false"             # allow http://
+```
+
+Push, pull, and verify:
+
+```bash
+mvm template push my-worker                  # push current revision
+mvm template push my-worker --revision abc123 # push specific revision
+mvm template pull my-worker                  # pull latest from registry
+mvm template verify my-worker                # verify local checksums
+```
+
+Push/pull/verify must run inside the Linux VM on macOS (`mvm shell`, then rerun).
+
+### Cache Keys
+
+Each template revision records a composite cache key: `SHA256(flake.lock hash + profile + role)`. When a pool references a template, the pool build checks this cache key. If it matches, artifacts are reused without rebuilding.
+
+### Pool Integration
+
+When creating a pool, set `--template` to link it to a template:
+
+```bash
+mvm pool create acme/workers --template my-worker --flake . --profile minimal --cpus 2 --mem 1024
+```
+
+On `mvm pool build acme/workers`, if the template's cache key matches (same flake.lock, profile, and role), artifacts are copied from the template -- no per-tenant rebuild needed. Use `--force` to bypass the cache.

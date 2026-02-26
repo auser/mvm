@@ -151,4 +151,14 @@ mod tests {
         let b = make_revision("lock2", "minimal", "worker");
         assert_ne!(a.cache_key(), b.cache_key());
     }
+
+    #[test]
+    fn cache_key_depends_on_flake_lock_not_revision_hash() {
+        let mut a = make_revision("same-lock", "minimal", "worker");
+        a.revision_hash = "rev-aaa".to_string();
+        let mut b = make_revision("same-lock", "minimal", "worker");
+        b.revision_hash = "rev-zzz".to_string();
+        // Different revision hashes but same flake_lock/profile/role → same cache key
+        assert_eq!(a.cache_key(), b.cache_key());
+    }
 }

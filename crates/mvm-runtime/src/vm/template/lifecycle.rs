@@ -113,11 +113,27 @@ pub fn template_build(id: &str, force: bool) -> Result<()> {
     let current_link = template_current_symlink(id);
     shell::run_in_vm(&format!("ln -snf revisions/{rev} {current_link}"))?;
 
+    // Compute actual flake.lock hash for accurate cache keys.
+    // Pool builds do this via the backend; template builds use dev_build directly,
+    // so we compute it here. Falls back to revision hash for remote flakes.
+    let flake_lock_hash = shell::run_in_vm_stdout(&format!(
+        "if [ -f {flake}/flake.lock ]; then nix hash path {flake}/flake.lock; else echo ''; fi",
+        flake = spec.flake_ref
+    ))
+    .unwrap_or_default()
+    .trim()
+    .to_string();
+    let flake_lock_hash = if flake_lock_hash.is_empty() {
+        rev.clone()
+    } else {
+        flake_lock_hash
+    };
+
     // Record template revision metadata
     let revision = TemplateRevision {
         revision_hash: rev.clone(),
         flake_ref: spec.flake_ref.clone(),
-        flake_lock_hash: rev.clone(),
+        flake_lock_hash,
         artifact_paths: ArtifactPaths {
             vmlinux: "vmlinux".to_string(),
             rootfs: "rootfs.ext4".to_string(),
