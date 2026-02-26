@@ -125,6 +125,9 @@ enum Commands {
         /// Number of lines to show (default 50)
         #[arg(long, short = 'n', default_value = "50")]
         lines: u32,
+        /// Show Firecracker hypervisor logs instead of guest console output
+        #[arg(long)]
+        hypervisor: bool,
     },
     /// Show status of Lima VM and microVM
     Status,
@@ -429,7 +432,8 @@ pub fn run() -> Result<()> {
             name,
             follow,
             lines,
-        } => cmd_logs(&name, follow, lines),
+            hypervisor,
+        } => cmd_logs(&name, follow, lines, hypervisor),
         Commands::Status => cmd_status(),
         Commands::Destroy { yes } => cmd_destroy(yes),
         Commands::Upgrade { check, force } => cmd_upgrade(check, force),
@@ -991,8 +995,8 @@ fn cmd_sync(debug: bool, skip_deps: bool, force: bool) -> Result<()> {
     Ok(())
 }
 
-fn cmd_logs(name: &str, follow: bool, lines: u32) -> Result<()> {
-    microvm::logs(name, follow, lines)
+fn cmd_logs(name: &str, follow: bool, lines: u32, hypervisor: bool) -> Result<()> {
+    microvm::logs(name, follow, lines, hypervisor)
 }
 
 fn cmd_status() -> Result<()> {

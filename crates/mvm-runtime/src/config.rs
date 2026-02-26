@@ -12,7 +12,6 @@ pub const GUEST_IP: &str = "172.16.0.2";
 pub const FC_MAC: &str = "06:00:AC:10:00:02";
 /// Path inside the Lima VM (~ expands to the VM user's home)
 pub const MICROVM_DIR: &str = "~/microvm";
-pub const LOGFILE: &str = "~/microvm/firecracker.log";
 
 // --- Multi-VM bridge networking ---
 pub const BRIDGE_DEV: &str = "br-mvm";

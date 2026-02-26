@@ -34,9 +34,9 @@ fn start_firecracker_daemon(abs_dir: &str) -> Result<()> {
         r#"
         mkdir -p {dir}
         sudo rm -f {socket}
-        touch {dir}/firecracker.log
+        touch {dir}/console.log {dir}/firecracker.log
         sudo bash -c 'nohup setsid firecracker --api-sock {socket} --enable-pci \
-            </dev/null >{dir}/firecracker.log 2>&1 &
+            </dev/null >{dir}/console.log 2>{dir}/firecracker.log &
             echo $! > {dir}/.fc-pid'
 
         echo "[mvm] Waiting for API socket..."
@@ -63,9 +63,9 @@ fn start_vm_firecracker(abs_dir: &str, abs_socket: &str) -> Result<()> {
         r#"
         mkdir -p {dir}
         sudo rm -f {socket}
-        touch {dir}/firecracker.log
+        touch {dir}/console.log {dir}/firecracker.log
         sudo bash -c 'nohup setsid firecracker --api-sock {socket} --enable-pci \
-            </dev/null >{dir}/firecracker.log 2>&1 &
+            </dev/null >{dir}/console.log 2>{dir}/firecracker.log &
             echo $! > {dir}/fc.pid'
 
         echo "[mvm] Waiting for API socket..."
@@ -487,27 +487,50 @@ pub fn stop_all_vms() -> Result<()> {
     Ok(())
 }
 
-/// Show console logs from a named VM's firecracker.log.
-pub fn logs(name: &str, follow: bool, lines: u32) -> Result<()> {
+/// Show logs from a named VM.
+///
+/// By default shows the guest serial console (`console.log`).
+/// With `hypervisor=true`, shows Firecracker hypervisor logs (`firecracker.log`).
+pub fn logs(name: &str, follow: bool, lines: u32, hypervisor: bool) -> Result<()> {
     require_linux_env()?;
 
     let abs_vms = run_in_vm_stdout(&format!("echo {}", VMS_DIR))?;
-    let log_file = format!("{}/{}/firecracker.log", abs_vms, name);
+    let filename = if hypervisor {
+        "firecracker.log"
+    } else {
+        "console.log"
+    };
+    let log_file = format!("{}/{}/{}", abs_vms, name, filename);
 
-    // Check the log file exists
+    // Check the log file exists; fall back to firecracker.log for VMs started before
+    // the console.log split.
     let exists = run_in_vm_stdout(&format!("[ -f {} ] && echo yes || echo no", log_file))?;
     if exists.trim() != "yes" {
+        if !hypervisor {
+            // Try legacy location (pre-split VMs wrote everything to firecracker.log)
+            let fallback = format!("{}/{}/firecracker.log", abs_vms, name);
+            let fb_exists =
+                run_in_vm_stdout(&format!("[ -f {} ] && echo yes || echo no", fallback))?;
+            if fb_exists.trim() == "yes" {
+                ui::warn(
+                    "console.log not found; showing firecracker.log (VM started before log split)",
+                );
+                return show_log_file(&fallback, follow, lines);
+            }
+        }
         anyhow::bail!("No logs found for VM '{}' (is the name correct?)", name);
     }
 
+    show_log_file(&log_file, follow, lines)
+}
+
+fn show_log_file(log_file: &str, follow: bool, lines: u32) -> Result<()> {
     if follow {
-        // tail -f needs to stream to the user's terminal
         run_in_vm_visible(&format!("tail -f {}", log_file))?;
     } else {
         let output = run_in_vm_stdout(&format!("tail -n {} {}", lines, log_file))?;
         print!("{}", output);
     }
-
     Ok(())
 }
 
