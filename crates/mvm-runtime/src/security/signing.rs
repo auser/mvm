@@ -1,5 +1,7 @@
 use anyhow::{Context, Result};
+use base64::Engine;
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
+use rand::rngs::OsRng;
 
 pub use mvm_core::signing::SignedPayload;
 
@@ -66,7 +68,8 @@ pub fn load_trusted_keys() -> Result<Vec<VerifyingKey>> {
             continue;
         }
 
-        let bytes = base64::Engine::decode(&base64::engine::general_purpose::STANDARD, trimmed)
+        let bytes = base64::engine::general_purpose::STANDARD
+            .decode(trimmed)
             .with_context(|| format!("Invalid base64 in key file: {}", line))?;
 
         if bytes.len() != 32 {
@@ -116,13 +119,87 @@ pub fn verify_and_extract_with_keys<T: serde::de::DeserializeOwned>(
 ///
 /// Returns (signing_key, verifying_key_base64) for dev/testing use.
 pub fn generate_keypair() -> (SigningKey, String) {
-    let signing_key = SigningKey::generate(&mut aes_gcm::aead::OsRng);
+    let mut rng = OsRng;
+    let signing_key = SigningKey::generate(&mut rng);
     let verifying_key = signing_key.verifying_key();
-    let pub_b64 = base64::Engine::encode(
-        &base64::engine::general_purpose::STANDARD,
-        verifying_key.as_bytes(),
-    );
+    let pub_b64 = base64::engine::general_purpose::STANDARD.encode(verifying_key.as_bytes());
     (signing_key, pub_b64)
+}
+
+/// Generate a per-session Ed25519 keypair for vsock authentication.
+///
+/// Returns the signing key and the base64-encoded public key. The caller
+/// is responsible for writing the keys to the secrets drive before VM boot.
+pub fn generate_session_keypair() -> (SigningKey, String) {
+    generate_keypair()
+}
+
+/// Provision vsock session keys to the secrets drive path.
+///
+/// Writes the guest signing key (base64-encoded secret) and host public key
+/// to the given directory, which should be mounted read-only inside the VM
+/// at `/mnt/secrets/vsock/`.
+pub fn provision_session_keys(
+    secrets_dir: &str,
+    guest_signing_key: &SigningKey,
+    host_pubkey: &VerifyingKey,
+) -> Result<()> {
+    let guest_secret_b64 =
+        base64::engine::general_purpose::STANDARD.encode(guest_signing_key.to_bytes());
+    let host_pub_b64 = base64::engine::general_purpose::STANDARD.encode(host_pubkey.as_bytes());
+
+    std::fs::create_dir_all(secrets_dir)
+        .with_context(|| format!("Failed to create secrets dir: {}", secrets_dir))?;
+
+    let key_path = format!("{}/session_key.pem", secrets_dir);
+    std::fs::write(&key_path, &guest_secret_b64)
+        .with_context(|| format!("Failed to write session key to {}", key_path))?;
+
+    let pub_path = format!("{}/host_pubkey.pem", secrets_dir);
+    std::fs::write(&pub_path, &host_pub_b64)
+        .with_context(|| format!("Failed to write host pubkey to {}", pub_path))?;
+
+    Ok(())
+}
+
+/// Load a session signing key from base64-encoded bytes.
+pub fn load_session_key(b64_secret: &str) -> Result<SigningKey> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64_secret.trim())
+        .with_context(|| "Invalid base64 in session key")?;
+
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "Session key has wrong size: {} bytes (expected 32)",
+            bytes.len()
+        );
+    }
+
+    let key_bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Key conversion failed"))?;
+
+    Ok(SigningKey::from_bytes(&key_bytes))
+}
+
+/// Load a verifying key from base64-encoded bytes.
+pub fn load_verifying_key(b64_pubkey: &str) -> Result<VerifyingKey> {
+    let bytes = base64::engine::general_purpose::STANDARD
+        .decode(b64_pubkey.trim())
+        .with_context(|| "Invalid base64 in public key")?;
+
+    if bytes.len() != 32 {
+        anyhow::bail!(
+            "Public key has wrong size: {} bytes (expected 32)",
+            bytes.len()
+        );
+    }
+
+    let key_bytes: [u8; 32] = bytes
+        .try_into()
+        .map_err(|_| anyhow::anyhow!("Key conversion failed"))?;
+
+    VerifyingKey::from_bytes(&key_bytes).with_context(|| "Invalid Ed25519 public key")
 }
 
 #[cfg(test)]
@@ -202,14 +279,77 @@ mod tests {
         let (signing_key, pub_b64) = generate_keypair();
 
         // Public key should be base64-encoded 32 bytes
-        let decoded =
-            base64::Engine::decode(&base64::engine::general_purpose::STANDARD, &pub_b64).unwrap();
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&pub_b64)
+            .unwrap();
         assert_eq!(decoded.len(), 32);
 
         // Should be able to sign and verify with the generated key
         let payload = b"test";
         let signed = sign_payload(payload, &signing_key, "gen-test");
         assert!(verify_signed_payload(&signed, &[signing_key.verifying_key()]).is_ok());
+    }
+
+    #[test]
+    fn test_session_keypair_generation() {
+        let (key, pub_b64) = generate_session_keypair();
+
+        // Should produce a valid keypair
+        let payload = b"session test data";
+        let signed = sign_payload(payload, &key, "session");
+        assert!(verify_signed_payload(&signed, &[key.verifying_key()]).is_ok());
+
+        // Public key should be decodable
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(&pub_b64)
+            .unwrap();
+        assert_eq!(decoded.len(), 32);
+    }
+
+    #[test]
+    fn test_provision_and_load_session_keys() {
+        let dir = tempfile::tempdir().unwrap();
+        let secrets_dir = dir.path().to_str().unwrap();
+
+        let (guest_key, _) = generate_session_keypair();
+        let (host_key, _) = generate_session_keypair();
+        let host_pubkey = host_key.verifying_key();
+
+        // Provision keys to disk
+        provision_session_keys(secrets_dir, &guest_key, &host_pubkey).unwrap();
+
+        // Load them back
+        let key_content =
+            std::fs::read_to_string(format!("{}/session_key.pem", secrets_dir)).unwrap();
+        let loaded_key = load_session_key(&key_content).unwrap();
+        assert_eq!(loaded_key.to_bytes(), guest_key.to_bytes());
+
+        let pub_content =
+            std::fs::read_to_string(format!("{}/host_pubkey.pem", secrets_dir)).unwrap();
+        let loaded_pub = load_verifying_key(&pub_content).unwrap();
+        assert_eq!(loaded_pub.as_bytes(), host_pubkey.as_bytes());
+    }
+
+    #[test]
+    fn test_load_session_key_invalid_base64() {
+        let result = load_session_key("not valid base64!!!");
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_load_session_key_wrong_length() {
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
+        let result = load_session_key(&short);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("32"));
+    }
+
+    #[test]
+    fn test_load_verifying_key_wrong_length() {
+        let short = base64::engine::general_purpose::STANDARD.encode([0u8; 16]);
+        let result = load_verifying_key(&short);
+        assert!(result.is_err());
+        assert!(result.unwrap_err().to_string().contains("32"));
     }
 
     #[test]

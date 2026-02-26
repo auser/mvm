@@ -80,6 +80,21 @@ The `RuntimeBuildEnv` in mvm-runtime implements only `ShellEnvironment`. The ful
 - **mvm-core stays whole**: orchestration types (tenant, pool, instance, agent, protocol) remain in mvm-core even though they're only used by mvmd. This avoids a third shared-types crate and keeps the facade dependency simple.
 - **No `clippy::too_many_arguments`**: never suppress this lint. Refactor into smaller functions or a config/params struct.
 
+## Testing
+
+No task is done without tests. Before marking any feature complete:
+
+```bash
+cargo test --workspace              # all tests must pass
+cargo clippy --workspace -- -D warnings  # zero warnings
+```
+
+Every new module, type, or function needs test coverage:
+- Types: serde roundtrip, default values
+- Protocol/wire code: mock I/O roundtrip, tampered data rejection, error paths
+- CLI: integration tests in `tests/cli.rs` for help text and argument parsing
+- Security: positive path, negative path (wrong key, tampered, replay), edge cases
+
 ## Build and Run
 
 ```bash

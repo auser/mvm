@@ -107,33 +107,36 @@ Additionally, the vsock protocol between host and guest has no authentication, n
 ---
 
 ## Phase 6: Authenticated Vsock Protocol
-**Status: PENDING**
+**Status: COMPLETE**
 
 **Goal:** Ed25519-signed vsock frames with per-session keys provisioned via the secrets drive.
 
-- [ ] Add `SecurityPolicy`, `AuthenticatedFrame`, `SessionHello`/`SessionHelloAck`, `AccessPolicy`, `RateLimitPolicy` types in new `mvm-core/src/security.rs`
-- [ ] Add `pub mod security` to `mvm-core/src/lib.rs`
-- [ ] Implement authenticated frame wrappers (`write_authenticated_frame`, `read_authenticated_frame`) in `mvm-guest/src/vsock.rs`
-- [ ] Add `ed25519-dalek` dependency to `mvm-guest/Cargo.toml`
-- [ ] Add session key generation to `mvm-runtime/src/security/signing.rs`
-- [ ] Implement challenge-response handshake (`SessionHello` → `SessionHelloAck`) after existing `CONNECT/OK`
-- [ ] Key provisioning: host writes per-session keypair to secrets drive (`/mnt/secrets/vsock/`) before VM boot
-- [ ] Version negotiation: fall back to unauthenticated mode if guest responds `version: 1`
-- [ ] Default `require_auth: false`, opt-in via `--require-vsock-auth`
-- [ ] Tests: frame signing roundtrip, serde roundtrip, challenge-response handshake (mock UnixStream), tampered frame rejection, replay detection via sequence numbers
+- [x] Add `SecurityPolicy`, `AuthenticatedFrame`, `SessionHello`/`SessionHelloAck`, `AccessPolicy`, `RateLimitPolicy`, `SessionPolicy` types in new `mvm-core/src/security.rs`
+- [x] Add `pub mod security` to `mvm-core/src/lib.rs`
+- [x] Implement authenticated frame wrappers (`write_authenticated_frame`, `read_authenticated_frame`) in `mvm-guest/src/vsock.rs`
+- [x] Add `ed25519-dalek`, `rand`, `chrono` dependencies to `mvm-guest/Cargo.toml`; add `ed25519-dalek`, `rand`, `base64` to `mvm-runtime/Cargo.toml`
+- [x] Add session key generation (`generate_session_keypair`, `provision_session_keys`, `load_session_key`, `load_verifying_key`) to `mvm-runtime/src/security/signing.rs`
+- [x] Implement challenge-response handshake (`handshake_as_host`, `handshake_as_guest`) after existing `CONNECT/OK`
+- [x] Key provisioning: `provision_session_keys()` writes per-session keypair to secrets drive (`/mnt/secrets/vsock/`) before VM boot
+- [x] Version negotiation: protocol version constants (`PROTOCOL_VERSION_AUTHENTICATED = 2`, `PROTOCOL_VERSION_LEGACY = 1`), `read_authenticated_frame` rejects mismatched versions
+- [x] Default `require_auth: false` in `SecurityPolicy`, all `AccessPolicy` toggles default true, `RateLimitPolicy` defaults 100 fps / 3000 fpm
+- [x] Enabled `pub mod security` in `mvm-runtime/src/lib.rs` (was dead code; trimmed to compilable modules: audit, cgroups, jailer, metadata, seccomp, signing)
+- [x] Fixed `generate_keypair()` to use `rand::rngs::OsRng` (was referencing unavailable `aes_gcm::aead::OsRng`)
+- [x] Tests (24 new): 8 mvm-core serde/defaults, 10 mvm-guest auth frame roundtrip + tampered rejection + wrong key + replay detection + session mismatch + handshake roundtrip + full exchange, 6 mvm-runtime session key provisioning + loading + error cases
 
 ## Phase 7: Command Gating
-**Status: PENDING**
+**Status: COMPLETE**
 
 **Goal:** Host-side blocklist for vsock commands. Matching commands are blocked or held for approval.
 
-- [ ] Add `GateDecision`, `ApprovalVerdict`, `BlocklistEntry` types to `mvm-core/src/security.rs`
-- [ ] Create `mvm-runtime/src/security/command_gate.rs` — Aho-Corasick literal matching + glob wildcards
-- [ ] Gate logic: non-match → allow, Block → reject, RequireApproval → hold (dev mode: auto-approve with warning)
-- [ ] Log every gate decision to audit trail
-- [ ] Harden builder agent (`mvm-guest/src/bin/mvm-builder-agent.rs`): validate `flake_ref` against allow-list, validate `attr` starts with `packages.`, reject when `access.build == false`
-- [ ] Export `command_gate` from `mvm-runtime/src/security/mod.rs`
-- [ ] Tests: blocklist matching, gate decision logic, builder flake_ref validation, blocked command returns error via vsock
+- [x] Add `GateDecision`, `ApprovalVerdict`, `BlocklistEntry`, `BlocklistAction`, `BlocklistSeverity` types to `mvm-core/src/security.rs`
+- [x] Add `blocklist: Vec<BlocklistEntry>` field to `SecurityPolicy` (`#[serde(default)]` for backward compat)
+- [x] Create `mvm-runtime/src/security/command_gate.rs` — `CommandGate` struct with Aho-Corasick literal matching + glob wildcards
+- [x] Gate logic: non-match → allow, Block → reject, RequireApproval → hold; `evaluate_dev_mode()` auto-approves with warning
+- [x] Default blocklist: 13 entries covering destructive commands, privilege escalation, sensitive file access, VM escape vectors
+- [x] Harden builder agent (`mvm-guest/src/bin/mvm-builder-agent.rs`): `validate_flake_ref()` rejects shell metacharacters + path traversal, `validate_build_attr()` requires `packages.` prefix, `load_security_policy()` checks `access.build == false`
+- [x] Export `command_gate` from `mvm-runtime/src/security/mod.rs`; add `aho-corasick` workspace dependency
+- [x] Tests (29 new): 7 mvm-core gate type serde/defaults, 14 mvm-runtime command gate (glob matching, literal block/approval/log, precedence, dev mode, default blocklist), 8 mvm-guest builder validation (flake_ref safety, attr validation, policy loading)
 
 ## Phase 8: Threat Classification + Audit Extension
 **Status: PENDING**

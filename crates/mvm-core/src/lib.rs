@@ -15,6 +15,7 @@ pub mod pool;
 pub mod protocol;
 pub mod retry;
 pub mod routing;
+pub mod security;
 pub mod signing;
 pub mod template;
 pub mod tenant;

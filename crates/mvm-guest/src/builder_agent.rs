@@ -33,6 +33,73 @@ pub enum BuilderResponse {
     Pong,
 }
 
+/// Path where SecurityPolicy is provisioned on the config drive.
+pub const SECURITY_POLICY_PATH: &str = "/mnt/config/security-policy.json";
+
+/// Shell metacharacters that must not appear in builder inputs.
+const DANGEROUS_CHARS: &[char] = &[';', '|', '&', '$', '`', '(', ')', '{', '}', '<', '>'];
+
+/// Validate a flake reference for safety.
+///
+/// Rejects references containing shell metacharacters or path traversal.
+/// Allowed patterns: `.`, `/build-in`, `github:owner/repo`, `git+https://...`,
+/// `path:...`, or similar Nix flake ref formats.
+pub fn validate_flake_ref(flake_ref: &str) -> Result<(), String> {
+    if flake_ref.is_empty() {
+        return Err("flake_ref is empty".to_string());
+    }
+
+    // Reject shell metacharacters
+    for ch in DANGEROUS_CHARS {
+        if flake_ref.contains(*ch) {
+            return Err(format!("flake_ref contains dangerous character: '{}'", ch));
+        }
+    }
+
+    // Reject path traversal
+    if flake_ref.contains("..") {
+        return Err("flake_ref contains path traversal (..)".to_string());
+    }
+
+    Ok(())
+}
+
+/// Validate a build attribute for safety.
+///
+/// Must start with `packages.` to prevent arbitrary Nix evaluation.
+/// Rejects shell metacharacters.
+pub fn validate_build_attr(attr: &str) -> Result<(), String> {
+    if !attr.starts_with("packages.") {
+        return Err(format!(
+            "build attr must start with 'packages.', got: '{}'",
+            attr
+        ));
+    }
+
+    for ch in DANGEROUS_CHARS {
+        if attr.contains(*ch) {
+            return Err(format!("build attr contains dangerous character: '{}'", ch));
+        }
+    }
+
+    Ok(())
+}
+
+/// Load `SecurityPolicy` from the config drive.
+///
+/// Returns `Ok(None)` if the file does not exist (policy not provisioned).
+pub fn load_security_policy() -> Result<Option<mvm_core::security::SecurityPolicy>> {
+    let path = Path::new(SECURITY_POLICY_PATH);
+    if !path.exists() {
+        return Ok(None);
+    }
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read {}", SECURITY_POLICY_PATH))?;
+    let policy: mvm_core::security::SecurityPolicy = serde_json::from_str(&contents)
+        .with_context(|| format!("failed to parse {}", SECURITY_POLICY_PATH))?;
+    Ok(Some(policy))
+}
+
 fn log_frame(line: &str) -> BuilderResponse {
     BuilderResponse::Log {
         line: line.to_string(),
@@ -143,5 +210,72 @@ mod tests {
         let json = serde_json::to_string(&req).unwrap();
         let back: BuilderRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(req, back);
+    }
+
+    // -- validate_flake_ref tests --
+
+    #[test]
+    fn test_validate_flake_ref_safe_patterns() {
+        assert!(validate_flake_ref(".").is_ok());
+        assert!(validate_flake_ref("/build-in").is_ok());
+        assert!(validate_flake_ref("github:auser/mvm").is_ok());
+        assert!(validate_flake_ref("git+https://github.com/auser/mvm").is_ok());
+        assert!(validate_flake_ref("path:/some/local/path").is_ok());
+    }
+
+    #[test]
+    fn test_validate_flake_ref_empty() {
+        assert!(validate_flake_ref("").is_err());
+    }
+
+    #[test]
+    fn test_validate_flake_ref_rejects_shell_metacharacters() {
+        assert!(validate_flake_ref(". ; rm -rf /").is_err());
+        assert!(validate_flake_ref("$(evil)").is_err());
+        assert!(validate_flake_ref("`evil`").is_err());
+        assert!(validate_flake_ref("foo | bar").is_err());
+        assert!(validate_flake_ref("foo & bar").is_err());
+        assert!(validate_flake_ref("foo > /dev/sda").is_err());
+        assert!(validate_flake_ref("foo < /etc/passwd").is_err());
+    }
+
+    #[test]
+    fn test_validate_flake_ref_rejects_path_traversal() {
+        assert!(validate_flake_ref("../../etc/passwd").is_err());
+        assert!(validate_flake_ref("/build-in/../../../etc").is_err());
+    }
+
+    // -- validate_build_attr tests --
+
+    #[test]
+    fn test_validate_build_attr_valid() {
+        assert!(validate_build_attr("packages.aarch64-linux.tenant-worker").is_ok());
+        assert!(validate_build_attr("packages.x86_64-linux.default").is_ok());
+        assert!(validate_build_attr("packages.aarch64-linux.minimal").is_ok());
+    }
+
+    #[test]
+    fn test_validate_build_attr_rejects_non_packages() {
+        assert!(validate_build_attr("devShells.x86_64-linux.default").is_err());
+        assert!(validate_build_attr("nixosConfigurations.default").is_err());
+        assert!(validate_build_attr("").is_err());
+        assert!(validate_build_attr("arbitrary-attr").is_err());
+    }
+
+    #[test]
+    fn test_validate_build_attr_rejects_metacharacters() {
+        assert!(validate_build_attr("packages.x86_64-linux.default; rm -rf /").is_err());
+        assert!(validate_build_attr("packages.$(evil)").is_err());
+        assert!(validate_build_attr("packages.`whoami`").is_err());
+    }
+
+    // -- load_security_policy tests --
+
+    #[test]
+    fn test_load_security_policy_missing_file() {
+        // Config file doesn't exist — should return Ok(None)
+        let result = load_security_policy();
+        assert!(result.is_ok());
+        assert!(result.unwrap().is_none());
     }
 }

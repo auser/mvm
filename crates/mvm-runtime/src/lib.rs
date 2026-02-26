@@ -3,6 +3,7 @@
 
 pub mod build_env;
 pub mod config;
+pub mod security;
 pub mod shell;
 pub mod shell_mock;
 pub mod ui;

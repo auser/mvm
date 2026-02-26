@@ -3,7 +3,9 @@ use std::mem::size_of;
 use std::os::fd::{FromRawFd, RawFd};
 use std::process::{Command, Stdio};
 
-use mvm_guest::builder_agent::{BuilderRequest, BuilderResponse};
+use mvm_guest::builder_agent::{
+    BuilderRequest, BuilderResponse, load_security_policy, validate_build_attr, validate_flake_ref,
+};
 
 const AF_VSOCK: i32 = 40;
 const SOCK_STREAM: i32 = 1;
@@ -64,6 +66,41 @@ fn handle_client(fd: RawFd) {
                         attr,
                         timeout_secs,
                     } => {
+                        // Check access.build policy from config drive
+                        if let Ok(Some(policy)) = load_security_policy()
+                            && !policy.access.build
+                        {
+                            write_resp(
+                                &mut reader,
+                                BuilderResponse::Err {
+                                    message: "build rejected: access.build is disabled by security policy".to_string(),
+                                },
+                            );
+                            continue;
+                        }
+
+                        // Validate flake_ref for safety
+                        if let Err(e) = validate_flake_ref(&flake_ref) {
+                            write_resp(
+                                &mut reader,
+                                BuilderResponse::Err {
+                                    message: format!("invalid flake_ref: {}", e),
+                                },
+                            );
+                            continue;
+                        }
+
+                        // Validate build attr
+                        if let Err(e) = validate_build_attr(&attr) {
+                            write_resp(
+                                &mut reader,
+                                BuilderResponse::Err {
+                                    message: format!("invalid build attr: {}", e),
+                                },
+                            );
+                            continue;
+                        }
+
                         let timeout = timeout_secs.unwrap_or(1800);
                         if let Err(e) = run_build(&mut reader, &flake_ref, &attr, timeout) {
                             write_resp(

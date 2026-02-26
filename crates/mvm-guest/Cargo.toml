@@ -19,5 +19,8 @@ path = "src/bin/mvm-guest-agent.rs"
 [dependencies]
 mvm-core.workspace = true
 anyhow.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+rand.workspace = true
 serde.workspace = true
 serde_json.workspace = true

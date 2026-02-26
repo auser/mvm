@@ -20,8 +20,13 @@ authors = ["mvm contributors"]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# Pattern matching
+aho-corasick = "1"
+
 # Crypto
 base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+rand = "0.8"
 sha2 = "0.10"
 
 # Serialization
