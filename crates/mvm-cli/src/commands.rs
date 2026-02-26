@@ -330,15 +330,15 @@ enum TemplateCmd {
 
 #[derive(Subcommand)]
 enum VmCmd {
-    /// Health-check a running microVM via vsock
+    /// Health-check running microVMs via vsock (all if no name given)
     Ping {
-        /// Name of the VM
-        name: String,
+        /// Name of the VM (omit to ping all running VMs)
+        name: Option<String>,
     },
-    /// Query worker status (idle/busy) from a running microVM
+    /// Query worker status from running microVMs (all if no name given)
     Status {
-        /// Name of the VM
-        name: String,
+        /// Name of the VM (omit to query all running VMs)
+        name: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
@@ -1617,8 +1617,13 @@ fn cmd_template(action: TemplateCmd) -> Result<()> {
 
 fn cmd_vm(action: VmCmd) -> Result<()> {
     match action {
-        VmCmd::Ping { name } => cmd_vm_ping(&name),
-        VmCmd::Status { name, json } => cmd_vm_status(&name, json),
+        VmCmd::Ping { name: Some(name) } => cmd_vm_ping(&name),
+        VmCmd::Ping { name: None } => cmd_vm_ping_all(),
+        VmCmd::Status {
+            name: Some(name),
+            json,
+        } => cmd_vm_status(&name, json),
+        VmCmd::Status { name: None, json } => cmd_vm_status_all(json),
     }
 }
 
@@ -1722,6 +1727,142 @@ fn cmd_vm_status(name: &str, json: bool) -> Result<()> {
             anyhow::bail!("Guest agent error: {}", message)
         }
         _ => anyhow::bail!("Unexpected response from guest agent"),
+    }
+}
+
+/// List all running VMs and return their names.
+fn list_running_vm_names() -> Result<Vec<String>> {
+    if bootstrap::is_lima_required() {
+        lima::require_running()?;
+    }
+    let vms = microvm::list_vms().unwrap_or_default();
+    Ok(vms.into_iter().filter_map(|vm| vm.name).collect())
+}
+
+fn cmd_vm_ping_all() -> Result<()> {
+    // Delegate to Lima on macOS — run as single command
+    if bootstrap::is_lima_required() {
+        lima::require_running()?;
+        shell::run_in_vm_visible("/usr/local/bin/mvm vm ping")?;
+        return Ok(());
+    }
+
+    let names = list_running_vm_names()?;
+    if names.is_empty() {
+        ui::info("No running VMs found.");
+        return Ok(());
+    }
+
+    let mut any_failed = false;
+    for name in &names {
+        let abs_dir = format!(
+            "{}/{}",
+            shell::run_in_vm_stdout(&format!("echo {}", config::VMS_DIR))?,
+            name
+        );
+        let vsock_path = format!("{}/v.sock", abs_dir);
+        match mvm_guest::vsock::ping_at(&vsock_path) {
+            Ok(true) => ui::success(&format!("VM '{}' is alive (pong received)", name)),
+            Ok(false) => {
+                ui::error(&format!("VM '{}' did not respond to ping", name));
+                any_failed = true;
+            }
+            Err(e) => {
+                ui::error(&format!("VM '{}': {}", name, e));
+                any_failed = true;
+            }
+        }
+    }
+    if any_failed {
+        anyhow::bail!("Some VMs did not respond to ping");
+    }
+    Ok(())
+}
+
+fn cmd_vm_status_all(json: bool) -> Result<()> {
+    // Delegate to Lima on macOS
+    if bootstrap::is_lima_required() {
+        lima::require_running()?;
+        let json_flag = if json { " --json" } else { "" };
+        shell::run_in_vm_visible(&format!("/usr/local/bin/mvm vm status{}", json_flag))?;
+        return Ok(());
+    }
+
+    let names = list_running_vm_names()?;
+    if names.is_empty() {
+        if json {
+            println!("[]");
+        } else {
+            ui::info("No running VMs found.");
+        }
+        return Ok(());
+    }
+
+    if json {
+        let mut results = Vec::new();
+        for name in &names {
+            match cmd_vm_status_json(name) {
+                Ok(obj) => results.push(obj),
+                Err(e) => results.push(serde_json::json!({
+                    "name": name,
+                    "error": e.to_string(),
+                })),
+            }
+        }
+        println!("{}", serde_json::to_string_pretty(&results)?);
+    } else {
+        println!("  {:<16} {:<10} {:<24}", "NAME", "STATUS", "LAST BUSY");
+        println!("  {}", "-".repeat(50));
+        for name in &names {
+            match cmd_vm_status_row(name) {
+                Ok((status, last_busy)) => {
+                    let busy = last_busy.as_deref().unwrap_or("never");
+                    println!("  {:<16} {:<10} {:<24}", name, status, busy);
+                }
+                Err(e) => {
+                    println!("  {:<16} {:<10} {}", name, "error", e);
+                }
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Query a single VM's status and return the JSON value.
+fn cmd_vm_status_json(name: &str) -> Result<serde_json::Value> {
+    let abs_dir = resolve_running_vm(name)?;
+    let vsock_path = format!("{}/v.sock", abs_dir);
+    let resp = mvm_guest::vsock::query_worker_status_at(&vsock_path)?;
+    match resp {
+        mvm_guest::vsock::GuestResponse::WorkerStatus {
+            status,
+            last_busy_at,
+        } => Ok(serde_json::json!({
+            "name": name,
+            "worker_status": status,
+            "last_busy_at": last_busy_at,
+        })),
+        mvm_guest::vsock::GuestResponse::Error { message } => {
+            anyhow::bail!("Guest agent error: {}", message)
+        }
+        _ => anyhow::bail!("Unexpected response"),
+    }
+}
+
+/// Query a single VM's status and return (status, last_busy_at).
+fn cmd_vm_status_row(name: &str) -> Result<(String, Option<String>)> {
+    let abs_dir = resolve_running_vm(name)?;
+    let vsock_path = format!("{}/v.sock", abs_dir);
+    let resp = mvm_guest::vsock::query_worker_status_at(&vsock_path)?;
+    match resp {
+        mvm_guest::vsock::GuestResponse::WorkerStatus {
+            status,
+            last_busy_at,
+        } => Ok((status, last_busy_at)),
+        mvm_guest::vsock::GuestResponse::Error { message } => {
+            anyhow::bail!("Guest agent error: {}", message)
+        }
+        _ => anyhow::bail!("Unexpected response"),
     }
 }
 
@@ -1982,7 +2123,20 @@ mod tests {
             Commands::Vm {
                 action: VmCmd::Ping { name },
             } => {
-                assert_eq!(name, "happy-panda");
+                assert_eq!(name.as_deref(), Some("happy-panda"));
+            }
+            _ => panic!("Expected Vm Ping command"),
+        }
+    }
+
+    #[test]
+    fn test_vm_ping_no_name_targets_all() {
+        let cli = Cli::try_parse_from(["mvm", "vm", "ping"]).unwrap();
+        match cli.command {
+            Commands::Vm {
+                action: VmCmd::Ping { name },
+            } => {
+                assert!(name.is_none(), "no name means ping all");
             }
             _ => panic!("Expected Vm Ping command"),
         }
@@ -1995,7 +2149,21 @@ mod tests {
             Commands::Vm {
                 action: VmCmd::Status { name, json },
             } => {
-                assert_eq!(name, "my-vm");
+                assert_eq!(name.as_deref(), Some("my-vm"));
+                assert!(!json);
+            }
+            _ => panic!("Expected Vm Status command"),
+        }
+    }
+
+    #[test]
+    fn test_vm_status_no_name_targets_all() {
+        let cli = Cli::try_parse_from(["mvm", "vm", "status"]).unwrap();
+        match cli.command {
+            Commands::Vm {
+                action: VmCmd::Status { name, json },
+            } => {
+                assert!(name.is_none(), "no name means status all");
                 assert!(!json);
             }
             _ => panic!("Expected Vm Status command"),
@@ -2009,7 +2177,7 @@ mod tests {
             Commands::Vm {
                 action: VmCmd::Status { name, json },
             } => {
-                assert_eq!(name, "my-vm");
+                assert_eq!(name.as_deref(), Some("my-vm"));
                 assert!(json);
             }
             _ => panic!("Expected Vm Status command"),
@@ -2020,12 +2188,6 @@ mod tests {
     fn test_vm_requires_subcommand() {
         let result = Cli::try_parse_from(["mvm", "vm"]);
         assert!(result.is_err(), "vm should require a subcommand");
-    }
-
-    #[test]
-    fn test_vm_ping_requires_name() {
-        let result = Cli::try_parse_from(["mvm", "vm", "ping"]);
-        assert!(result.is_err(), "vm ping should require a name");
     }
 
     // ---- Up/Down command tests ----
