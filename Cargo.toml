@@ -9,7 +9,7 @@ members = [
 resolver = "3"
 
 [workspace.package]
-version = "0.3.1"
+version = "0.3.2"
 edition = "2024"
 license = "Apache-2.0"
 repository = "https://github.com/auser/mvm"
@@ -61,11 +61,11 @@ uuid = { version = "1", features = ["v4"] }
 which = "7"
 
 # Internal crates
-mvm-core = { path = "crates/mvm-core", version = "0.3.1" }
-mvm-guest = { path = "crates/mvm-guest", version = "0.3.1" }
-mvm-build = { path = "crates/mvm-build", version = "0.3.1" }
-mvm-runtime = { path = "crates/mvm-runtime", version = "0.3.1" }
-mvm-cli = { path = "crates/mvm-cli", version = "0.3.1" }
+mvm-core = { path = "crates/mvm-core", version = "0.3.2" }
+mvm-guest = { path = "crates/mvm-guest", version = "0.3.2" }
+mvm-build = { path = "crates/mvm-build", version = "0.3.2" }
+mvm-runtime = { path = "crates/mvm-runtime", version = "0.3.2" }
+mvm-cli = { path = "crates/mvm-cli", version = "0.3.2" }
 
 # Dev dependencies
 assert_cmd = "2"
@@ -81,6 +81,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+publish = false
 
 [lib]
 name = "mvm"

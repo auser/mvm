@@ -74,13 +74,13 @@ jobs:
             PUBLISH_FLAG=""
           fi
 
+          # Root `mvm` crate is publish = false (name taken on crates.io).
           CRATES=(
             mvm-core
             mvm-guest
             mvm-build
             mvm-runtime
             mvm-cli
-            mvm
           )
 
           for CRATE in "${CRATES[@]}"; do
