@@ -37,18 +37,31 @@
     # otherwise assign predictable names (enp0s2) which are harder to
     # configure statically.
     "net.ifnames=0"
+    # Only initialize 1 UART (Firecracker only has 1 serial)
+    "8250.nr_uarts=1"
+    # Reduce kernel log verbosity during boot
+    "quiet"
+    "loglevel=4"
   ];
 
-  # Ensure virtio drivers are loaded in the initrd so the network
-  # interface exists by the time stage-2 systemd starts.
-  boot.initrd.availableKernelModules = [ "virtio_pci" "virtio_blk" ];
-  boot.initrd.kernelModules = [ "virtio_net" ];
+  # Only include the virtio drivers we actually need.
+  # Setting includeDefaultModules = false prevents NixOS from pulling in
+  # hundreds of modules (dm_mod, ata, usb, etc.) that don't exist in FC.
+  boot.initrd.includeDefaultModules = false;
+  boot.initrd.availableKernelModules = [ "virtio_pci" "virtio_blk" "virtio_net" ];
+  boot.initrd.kernelModules = [ "virtio_pci" "virtio_blk" "virtio_net" ];
 
   # --- Minimize boot time ---
   documentation.enable = false;
   boot.tmp.useTmpfs = true;
+  boot.swraid.enable = false;
   services.timesyncd.enable = false;
   security.audit.enable = false;
+  systemd.tpm2.enable = false;
+  system.switch.enable = false;
+
+  # Skip fsck — these are ephemeral VMs, rootfs is rebuilt on every deploy
+  boot.initrd.checkJournalingFS = false;
 
   # --- Root filesystem ---
   # The rootfs ext4 image (built by make-ext4-fs.nix) is presented as /dev/vda.
@@ -56,7 +69,7 @@
   fileSystems."/" = {
     device = "/dev/vda";
     fsType = "ext4";
-    autoResize = true;
+    options = [ "noatime" ];
   };
 
   # --- Console ---
@@ -80,10 +93,16 @@
     serviceConfig = {
       Type = "oneshot";
       RemainAfterExit = true;
+      # Pure shell — no grep dependency, much faster than grep -oP
       ExecStart = pkgs.writeShellScript "mvm-network-config" ''
         CMDLINE=$(cat /proc/cmdline)
-        IP=$(echo "$CMDLINE" | ${pkgs.gnugrep}/bin/grep -oP 'mvm\.ip=\K[^ ]+')
-        GW=$(echo "$CMDLINE" | ${pkgs.gnugrep}/bin/grep -oP 'mvm\.gw=\K[^ ]+')
+        IP= GW=
+        for arg in $CMDLINE; do
+          case "$arg" in
+            mvm.ip=*) IP="''${arg#mvm.ip=}" ;;
+            mvm.gw=*) GW="''${arg#mvm.gw=}" ;;
+          esac
+        done
         if [ -n "$IP" ] && [ -n "$GW" ]; then
           mkdir -p /run/systemd/network
           cat > /run/systemd/network/10-eth0.network << EOF

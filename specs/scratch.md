@@ -25,3 +25,8 @@ Part of the goal is to have a secure and safe openclaw. I have a few possible re
 https://safeclaw.io/
 @docs/The-OpenClaw-Field-Manual.pdf 
  
+ ---
+
+ Is there any way we can use better patterns than regex? It seems like we could use rust best practices to avoid writing a bunch of regex. 
+
+ Are we modifying both `mvm` and `mvmd`?

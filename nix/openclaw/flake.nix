@@ -48,6 +48,12 @@
                 # before switch_root (absolute symlinks can't be followed from
                 # the initrd because the rootfs is mounted at /mnt-root/).
                 ln -s .${cfg.system.build.toplevel}/init ./files/init
+
+                # Markers for the systemd-based initrd.
+                # initrd-find-nixos-closure reads NIXOS_CLOSURE as a plain text
+                # path (avoiding absolute symlink resolution issues from /sysroot).
+                echo "${cfg.system.build.toplevel}" > ./files/etc/NIXOS_CLOSURE
+                touch ./files/etc/NIXOS
               '';
             };
           in
