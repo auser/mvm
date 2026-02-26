@@ -111,6 +111,39 @@ pub fn run_in_vm_stdout(script: &str) -> Result<String> {
     run_on_vm_stdout(VM_NAME, script)
 }
 
+/// Run a bash script in the Linux execution environment, capturing stdout and stderr
+/// into an `Output` struct (piped, not inherited).
+///
+/// Unlike `run_on_vm_visible`, the output is **not** shown to the user in real time.
+/// Use this when you need to capture error messages (e.g., nix build failures) for
+/// structured reporting.
+pub fn run_on_vm_capture(vm_name: &str, script: &str) -> Result<Output> {
+    if let Some(output) = crate::shell_mock::intercept(script) {
+        return Ok(output);
+    }
+
+    if platform::current().needs_lima() {
+        Command::new("limactl")
+            .args(["shell", vm_name, "bash", "-c", script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| format!("Failed to run command in Lima VM '{}'", vm_name))
+    } else {
+        Command::new("bash")
+            .args(["-c", script])
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .output()
+            .with_context(|| "Failed to run command on host")
+    }
+}
+
+/// Run a bash script in the default execution environment, capturing stdout and stderr.
+pub fn run_in_vm_capture(script: &str) -> Result<Output> {
+    run_on_vm_capture(VM_NAME, script)
+}
+
 /// Heuristic: are we currently executing inside a Lima guest VM?
 /// Checks common Lima environment markers.
 pub fn inside_lima() -> bool {

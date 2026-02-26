@@ -51,4 +51,18 @@ impl ShellEnvironment for RuntimeBuildEnv {
     fn log_warn(&self, msg: &str) {
         ui::warn(msg);
     }
+
+    fn shell_exec_capture(&self, script: &str) -> Result<(String, String)> {
+        let out = shell::run_in_vm_capture(script)?;
+        let stdout = String::from_utf8_lossy(&out.stdout).trim().to_string();
+        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
+        if !out.status.success() {
+            return Err(anyhow!(
+                "Command failed (exit {}): {}",
+                out.status.code().unwrap_or(-1),
+                stderr
+            ));
+        }
+        Ok((stdout, stderr))
+    }
 }

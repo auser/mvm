@@ -122,5 +122,5 @@ macOS / Linux Host
 ## Sprint Management
 
 - Active sprint spec: `specs/SPRINT.md`
-- Completed sprints archived to: `specs/sprints/` (e.g. `specs/sprints/SPRINT-1-foundation.md`)
-- When a sprint is completed, rename `specs/SPRINT.md` to `specs/sprints/SPRINT-<N>-<name>.md` and create a new `specs/SPRINT.md` for the next sprint
+- Completed sprints archived to: `specs/sprints/` (e.g. `specs/sprints/01-foundation.md`)
+- When a sprint is completed, rename `specs/SPRINT.md` to `specs/sprints/<NN>-<name>.md` and create a new `specs/SPRINT.md` for the next sprint

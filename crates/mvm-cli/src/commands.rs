@@ -1,5 +1,6 @@
 use anyhow::{Context, Result};
 use clap::{CommandFactory, Parser, Subcommand};
+use serde::Serialize;
 
 use crate::bootstrap;
 use crate::fleet;
@@ -114,6 +115,9 @@ enum Commands {
         /// Rebuild and reinstall even if versions match inside the VM
         #[arg(long)]
         force: bool,
+        /// Output structured JSON events instead of human-readable output
+        #[arg(long)]
+        json: bool,
     },
     /// Show console logs from a running microVM
     Logs {
@@ -183,6 +187,9 @@ enum Commands {
         /// Watch flake.lock and rebuild on change (flake mode)
         #[arg(long)]
         watch: bool,
+        /// Output structured JSON events instead of human-readable output
+        #[arg(long)]
+        json: bool,
     },
     /// Build from a Nix flake and boot a headless Firecracker VM
     Run {
@@ -365,6 +372,52 @@ enum VmCmd {
 }
 
 // ============================================================================
+// Structured JSON event output for --json mode
+// ============================================================================
+
+/// Structured event emitted during sync/build operations in --json mode.
+#[derive(Debug, Serialize)]
+struct PhaseEvent {
+    timestamp: String,
+    command: &'static str,
+    phase: String,
+    status: &'static str,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    message: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    error: Option<String>,
+}
+
+impl PhaseEvent {
+    fn new(command: &'static str, phase: &str, status: &'static str) -> Self {
+        Self {
+            timestamp: chrono::Utc::now().to_rfc3339(),
+            command,
+            phase: phase.to_string(),
+            status,
+            message: None,
+            error: None,
+        }
+    }
+
+    fn with_message(mut self, msg: &str) -> Self {
+        self.message = Some(msg.to_string());
+        self
+    }
+
+    fn with_error(mut self, err: &str) -> Self {
+        self.error = Some(err.to_string());
+        self
+    }
+
+    fn emit(&self) {
+        if let Ok(json) = serde_json::to_string(self) {
+            println!("{}", json);
+        }
+    }
+}
+
+// ============================================================================
 // Entry point
 // ============================================================================
 
@@ -427,7 +480,8 @@ pub fn run() -> Result<()> {
             debug,
             skip_deps,
             force,
-        } => cmd_sync(debug, skip_deps, force),
+            json,
+        } => cmd_sync(debug, skip_deps, force, json),
         Commands::Logs {
             name,
             follow,
@@ -448,9 +502,10 @@ pub fn run() -> Result<()> {
             flake,
             profile,
             watch,
+            json,
         } => {
             if let Some(flake_ref) = flake {
-                cmd_build_flake(&flake_ref, profile.as_deref(), watch)
+                cmd_build_flake(&flake_ref, profile.as_deref(), watch, json)
             } else {
                 cmd_build(&path, output.as_deref())
             }
@@ -912,10 +967,16 @@ fn sync_install_script(source_dir: &str, debug: bool, vm_arch: &str) -> String {
     )
 }
 
-fn cmd_sync(debug: bool, skip_deps: bool, force: bool) -> Result<()> {
+fn cmd_sync(debug: bool, skip_deps: bool, force: bool, json: bool) -> Result<()> {
     if !bootstrap::is_lima_required() && !force {
-        ui::info("Native Linux detected. The host mvm binary is already Linux-native.");
-        ui::info("No sync needed — mvm is already available. Use --force to rebuild anyway.");
+        if json {
+            PhaseEvent::new("sync", "check", "skipped")
+                .with_message("Native Linux detected, no sync needed")
+                .emit();
+        } else {
+            ui::info("Native Linux detected. The host mvm binary is already Linux-native.");
+            ui::info("No sync needed — mvm is already available. Use --force to rebuild anyway.");
+        }
         return Ok(());
     }
 
@@ -926,12 +987,14 @@ fn cmd_sync(debug: bool, skip_deps: bool, force: bool) -> Result<()> {
     if limactl_available {
         lima::require_running()?;
     } else if shell::inside_lima() {
-        ui::info("Running inside Lima guest; skipping limactl check.");
+        if !json {
+            ui::info("Running inside Lima guest; skipping limactl check.");
+        }
     } else if bootstrap::is_lima_required() {
         anyhow::bail!(
             "Lima is required but 'limactl' is not available. Install Lima or run inside the Lima VM."
         );
-    } else {
+    } else if !json {
         ui::warn("limactl not found; proceeding on native host.");
     }
 
@@ -956,43 +1019,102 @@ fn cmd_sync(debug: bool, skip_deps: bool, force: bool) -> Result<()> {
             shell::run_in_vm_stdout("/usr/local/bin/mvm --version 2>/dev/null || true")
             && current.contains(desired_version)
         {
-            ui::success(&format!(
-                "mvm {} already installed inside Lima VM. Use --force to rebuild.",
-                desired_version
-            ));
+            if json {
+                PhaseEvent::new("sync", "check", "skipped")
+                    .with_message(&format!("mvm {} already installed", desired_version))
+                    .emit();
+            } else {
+                ui::success(&format!(
+                    "mvm {} already installed inside Lima VM. Use --force to rebuild.",
+                    desired_version
+                ));
+            }
             return Ok(());
         }
     }
 
     if !skip_deps {
         step += 1;
-        ui::step(step, total_steps, "Ensuring build dependencies (apt)...");
-        shell::run_in_vm_visible(&sync_deps_script())?;
+        sync_phase(
+            json,
+            step,
+            total_steps,
+            "deps",
+            "Ensuring build dependencies (apt)...",
+            || shell::run_in_vm_visible(&sync_deps_script()),
+        )?;
 
         step += 1;
-        ui::step(step, total_steps, "Ensuring Rust toolchain...");
-        shell::run_in_vm_visible(&sync_rustup_script())?;
+        sync_phase(
+            json,
+            step,
+            total_steps,
+            "rustup",
+            "Ensuring Rust toolchain...",
+            || shell::run_in_vm_visible(&sync_rustup_script()),
+        )?;
     }
 
     step += 1;
     let build_msg = format!("Building mvm ({profile_name} profile)...");
-    ui::step(step, total_steps, &build_msg);
-    shell::run_in_vm_visible(&sync_build_script(&source_dir, debug, &vm_arch))?;
+    sync_phase(json, step, total_steps, "build", &build_msg, || {
+        shell::run_in_vm_visible(&sync_build_script(&source_dir, debug, &vm_arch))
+    })?;
 
     step += 1;
-    ui::step(
+    sync_phase(
+        json,
         step,
         total_steps,
+        "install",
         "Installing binaries to /usr/local/bin/...",
-    );
-    shell::run_in_vm_visible(&sync_install_script(&source_dir, debug, &vm_arch))?;
+        || shell::run_in_vm_visible(&sync_install_script(&source_dir, debug, &vm_arch)),
+    )?;
 
     let version = shell::run_in_vm_stdout("/usr/local/bin/mvm --version")
         .unwrap_or_else(|_| "unknown".to_string());
-    ui::success(&format!("Sync complete! Installed: {}", version.trim()));
-    ui::info("The mvm binary is now available inside 'mvm shell'.");
+    if json {
+        PhaseEvent::new("sync", "complete", "completed")
+            .with_message(&format!("Installed: {}", version.trim()))
+            .emit();
+    } else {
+        ui::success(&format!("Sync complete! Installed: {}", version.trim()));
+        ui::info("The mvm binary is now available inside 'mvm shell'.");
+    }
 
     Ok(())
+}
+
+/// Run a sync phase, emitting JSON events or human-readable output.
+fn sync_phase(
+    json: bool,
+    step: u32,
+    total: u32,
+    phase: &str,
+    msg: &str,
+    f: impl FnOnce() -> Result<()>,
+) -> Result<()> {
+    if json {
+        PhaseEvent::new("sync", phase, "started").emit();
+    } else {
+        ui::step(step, total, msg);
+    }
+    match f() {
+        Ok(()) => {
+            if json {
+                PhaseEvent::new("sync", phase, "completed").emit();
+            }
+            Ok(())
+        }
+        Err(e) => {
+            if json {
+                PhaseEvent::new("sync", phase, "failed")
+                    .with_error(&e.to_string())
+                    .emit();
+            }
+            Err(e)
+        }
+    }
 }
 
 fn cmd_logs(name: &str, follow: bool, lines: u32, hypervisor: bool) -> Result<()> {
@@ -1402,7 +1524,7 @@ fn cmd_build(path: &str, output: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn cmd_build_flake(flake_ref: &str, profile: Option<&str>, watch: bool) -> Result<()> {
+fn cmd_build_flake(flake_ref: &str, profile: Option<&str>, watch: bool, json: bool) -> Result<()> {
     if bootstrap::is_lima_required() {
         lima::require_running()?;
     }
@@ -1412,7 +1534,7 @@ fn cmd_build_flake(flake_ref: &str, profile: Option<&str>, watch: bool) -> Resul
     let env = mvm_runtime::build_env::RuntimeBuildEnv;
     let watch_enabled = watch && !resolved.contains(':');
 
-    if watch && resolved.contains(':') {
+    if watch && resolved.contains(':') && !json {
         ui::warn("Watch mode requires a local flake; running a single build instead.");
     }
 
@@ -1422,36 +1544,82 @@ fn cmd_build_flake(flake_ref: &str, profile: Option<&str>, watch: bool) -> Resul
 
     loop {
         let profile_display = profile.unwrap_or("default");
-        ui::step(
-            1,
-            2,
-            &format!("Building flake {} (profile={})", resolved, profile_display),
-        );
 
-        let result = mvm_build::dev_build::dev_build(&env, &resolved, profile)?;
-        mvm_build::dev_build::ensure_guest_agent_if_needed(&env, &result)?;
-
-        ui::step(2, 2, "Build complete");
-
-        if result.cached {
-            ui::success(&format!("\nCache hit — revision {}", result.revision_hash));
+        if json {
+            PhaseEvent::new("build", "nix-build", "started")
+                .with_message(&format!("flake={} profile={}", resolved, profile_display))
+                .emit();
         } else {
-            ui::success(&format!(
-                "\nBuild complete — revision {}",
-                result.revision_hash
-            ));
+            ui::step(
+                1,
+                2,
+                &format!("Building flake {} (profile={})", resolved, profile_display),
+            );
         }
 
-        ui::info(&format!("  Kernel: {}", result.vmlinux_path));
-        ui::info(&format!("  Rootfs: {}", result.rootfs_path));
-        ui::info(&format!("\nRun with: mvm run --flake {}", flake_ref));
+        let result = match mvm_build::dev_build::dev_build(&env, &resolved, profile) {
+            Ok(r) => r,
+            Err(e) => {
+                if json {
+                    PhaseEvent::new("build", "nix-build", "failed")
+                        .with_error(&format!("{:#}", e))
+                        .emit();
+                }
+                return Err(e);
+            }
+        };
+        mvm_build::dev_build::ensure_guest_agent_if_needed(&env, &result)?;
+
+        if json {
+            #[derive(Serialize)]
+            struct BuildResult {
+                timestamp: String,
+                command: &'static str,
+                phase: &'static str,
+                status: &'static str,
+                revision: String,
+                cached: bool,
+                kernel: String,
+                rootfs: String,
+            }
+            let event = BuildResult {
+                timestamp: chrono::Utc::now().to_rfc3339(),
+                command: "build",
+                phase: "nix-build",
+                status: "completed",
+                revision: result.revision_hash.clone(),
+                cached: result.cached,
+                kernel: result.vmlinux_path.clone(),
+                rootfs: result.rootfs_path.clone(),
+            };
+            if let Ok(j) = serde_json::to_string(&event) {
+                println!("{}", j);
+            }
+        } else {
+            ui::step(2, 2, "Build complete");
+
+            if result.cached {
+                ui::success(&format!("\nCache hit — revision {}", result.revision_hash));
+            } else {
+                ui::success(&format!(
+                    "\nBuild complete — revision {}",
+                    result.revision_hash
+                ));
+            }
+
+            ui::info(&format!("  Kernel: {}", result.vmlinux_path));
+            ui::info(&format!("  Rootfs: {}", result.rootfs_path));
+            ui::info(&format!("\nRun with: mvm run --flake {}", flake_ref));
+        }
 
         if !watch_enabled {
             return Ok(());
         }
 
         // Watch mode: wait for flake.lock mtime change
-        ui::info("Watching flake.lock for changes (Ctrl+C to exit)...");
+        if !json {
+            ui::info("Watching flake.lock for changes (Ctrl+C to exit)...");
+        }
         loop {
             std::thread::sleep(std::time::Duration::from_secs(2));
             let new_mtime = std::fs::metadata(format!("{}/flake.lock", resolved))
@@ -2259,6 +2427,7 @@ mod tests {
                 debug: false,
                 skip_deps: false,
                 force: false,
+                ..
             }
         ));
     }
@@ -2272,6 +2441,7 @@ mod tests {
                 debug: true,
                 skip_deps: false,
                 force: false,
+                ..
             }
         ));
     }
@@ -2284,7 +2454,8 @@ mod tests {
             Commands::Sync {
                 debug: false,
                 skip_deps: true,
-                force: false
+                force: false,
+                ..
             }
         ));
     }
@@ -2298,6 +2469,7 @@ mod tests {
                 debug: true,
                 skip_deps: true,
                 force: false,
+                ..
             }
         ));
     }

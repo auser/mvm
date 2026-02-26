@@ -28,6 +28,18 @@ pub trait ShellEnvironment: Send + Sync {
     fn log_warn(&self, _msg: &str) {
         // default implementation: no-op
     }
+
+    /// Execute a shell script, capturing both stdout and stderr.
+    ///
+    /// Returns `(stdout, stderr)` on success. On failure, returns the exit code and
+    /// captured stderr in the error. Used by the build pipeline to capture nix build
+    /// errors for structured reporting.
+    ///
+    /// Default: falls back to `shell_exec_stdout` (stderr not captured).
+    fn shell_exec_capture(&self, script: &str) -> Result<(String, String)> {
+        let stdout = self.shell_exec_stdout(script)?;
+        Ok((stdout, String::new()))
+    }
 }
 
 /// Full build environment for orchestrated pool builds.
