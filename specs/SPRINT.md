@@ -23,12 +23,12 @@ We hardened dev workflows in Sprint 11 but saw recurring friction around sync/bo
 
 | Metric            | Value           |
 | ----------------- | --------------- |
-| Workspace crates  | 7 + root facade |
+| Workspace crates  | 5 + root facade |
 | Lib tests         | 366             |
 | Integration tests | 10              |
 | Total tests       | 376             |
 | Clippy warnings   | 0               |
-| Tag               | v0.2.0          |
+| Tag               | v0.3.0          |
 
 ---
 
@@ -41,12 +41,14 @@ We hardened dev workflows in Sprint 11 but saw recurring friction around sync/bo
 - [ ] Add regression tests for sync on macOS host + Lima guest + native Linux
 
 ## Phase 2: Release + Publish Reliability
-**Status: PENDING**
+**Status: COMPLETE**
 
-- [ ] Dry-run and live crates.io publish via GH Actions (publish-crates workflow) with docs
-- [ ] Version bump tool/guard: refuse publish if workspace versions not updated/tagged
-- [ ] Release artifacts: checksums + optional SBOM + signature (gitsign or cosign)
-- [ ] Add a `mvm release --dry-run` command that exercises the GH workflow locally
+- [x] Dry-run and live crates.io publish via GH Actions (publish-crates workflow) — removed stale mvm-agent/mvm-coordinator from pipeline
+- [x] Version bump tool/guard: `deploy-guard.sh` verifies workspace version, git tag, no hardcoded versions, inter-crate dep consistency, clippy
+- [x] Release artifacts: SHA256 checksums generated per-platform and combined into `checksums-sha256.txt`; installer verifies checksums
+- [x] Add a `mvm release --dry-run` command that exercises publish checks locally (also `--guard-only` for fast pre-publish verification)
+- [x] Removed mvm-agent and mvm-coordinator crates (belong in mvmd repo, not dev CLI)
+- [x] Fixed `mvm-install.sh` to match release archive format (tar.gz + target triples)
 
 ## Phase 2b: Global Templates (shared images, tenant-scoped pools)
 **Status: IN PROGRESS**

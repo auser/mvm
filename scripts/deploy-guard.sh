@@ -1,41 +1,51 @@
 #!/bin/bash
 set -euo pipefail
 
+# Deploy guard — verifies release integrity before publishing to crates.io.
+#
+# Checks:
+#   1. Workspace version exists
+#   2. Current commit is tagged with v{version}
+#   3. All crates use version.workspace = true (no hardcoded versions)
+#   4. Inter-crate dependency versions match workspace version
+#   5. Workspace builds and passes clippy
+
 # Check if we're in the workspace root
 if [ ! -f "Cargo.toml" ]; then
     echo "Error: Must run from workspace root"
     exit 1
 fi
 
+FOUND_ERROR=0
+
 # 1. Get workspace version
-WORKSPACE_VERSION=$(grep -m 1 "^version = " Cargo.toml | cut -d '"' -f 2)
+WORKSPACE_VERSION=$(grep -A 5 '^\[workspace\.package\]' Cargo.toml | grep '^version' | head -1 | cut -d '"' -f 2)
+if [ -z "$WORKSPACE_VERSION" ]; then
+    echo "Error: Could not extract workspace version from Cargo.toml"
+    exit 1
+fi
 echo "Workspace version: ${WORKSPACE_VERSION}"
 
 # 2. Check if current commit is tagged with this version
 TAG_NAME="v${WORKSPACE_VERSION}"
-CURRENT_TAG=$(git tag --points-at HEAD)
+CURRENT_TAG=$(git tag --points-at HEAD 2>/dev/null || true)
 
 if [[ ! " ${CURRENT_TAG} " =~ " ${TAG_NAME} " ]]; then
     echo "Error: Current commit is not tagged with ${TAG_NAME}"
-    echo "Tags at HEAD: ${CURRENT_TAG}"
+    echo "Tags at HEAD: ${CURRENT_TAG:-<none>}"
+    echo "  Fix: git tag ${TAG_NAME} && git push origin ${TAG_NAME}"
     exit 1
 fi
 
 echo "Verified: HEAD is tagged with ${TAG_NAME}"
 
 # 3. Check all crates inherit version from workspace
-# We use `cargo metadata` to check versions, but a simple grep check might be enough if we enforce `version.workspace = true`
-# Let's check if any Cargo.toml in crates/ has a hardcoded version instead of workspace
-echo "Checking for hardcoded versions in crates..."
-
-# Check if crates directory exists
 if [ ! -d "crates" ]; then
     echo "Error: crates directory not found"
     exit 1
 fi
 
 echo "Checking for hardcoded versions in crates..."
-FOUND_ERROR=0
 
 for cargo_toml in crates/*/Cargo.toml; do
     if [ -f "$cargo_toml" ]; then
@@ -54,4 +64,41 @@ fi
 
 echo "Verified: All crates use workspace version"
 
+# 4. Check inter-crate dependency versions match workspace version
+echo "Checking inter-crate dependency versions..."
+
+for cargo_toml in Cargo.toml crates/*/Cargo.toml; do
+    if [ ! -f "$cargo_toml" ]; then
+        continue
+    fi
+    # Find lines like: mvm-core = { path = "...", version = "X.Y.Z" }
+    # and verify the version matches workspace version
+    while IFS= read -r line; do
+        # Extract the version from the dependency line (portable, no -P flag)
+        dep_version=$(echo "$line" | sed -n 's/.*version *= *"\([^"]*\)".*/\1/p')
+        if [ -n "$dep_version" ] && [ "$dep_version" != "$WORKSPACE_VERSION" ]; then
+            echo "Error: Version mismatch in $cargo_toml"
+            echo "  Found: $line"
+            echo "  Expected version: ${WORKSPACE_VERSION}"
+            FOUND_ERROR=1
+        fi
+    done < <(grep -E '^mvm-[a-z]+ *= *\{.*version' "$cargo_toml" || true)
+done
+
+if [ $FOUND_ERROR -ne 0 ]; then
+    echo "Inter-crate dependency versions must match workspace version ${WORKSPACE_VERSION}"
+    exit 1
+fi
+
+echo "Verified: All inter-crate dependencies use version ${WORKSPACE_VERSION}"
+
+# 5. Verify workspace compiles and passes clippy
+echo "Running cargo clippy..."
+if ! cargo clippy --workspace -- -D warnings 2>&1; then
+    echo "Error: Clippy check failed"
+    exit 1
+fi
+echo "Verified: Clippy passes"
+
+echo ""
 echo "Deploy guard passed!"

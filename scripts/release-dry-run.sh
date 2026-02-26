@@ -1,5 +1,5 @@
 #!/bin/bash
-set -u pipefail
+set -uo pipefail
 
 # Check if we're in the workspace root
 if [ ! -f "Cargo.toml" ]; then
@@ -17,8 +17,6 @@ CRATES=(
     mvm-guest
     mvm-build
     mvm-runtime
-    mvm-coordinator
-    mvm-agent
     mvm-cli
     mvm
 )
@@ -27,9 +25,9 @@ for CRATE in "${CRATES[@]}"; do
     echo "----------------------------------------------------------------"
     echo "Checking ${CRATE}..."
     if cargo publish -p "${CRATE}" --dry-run --allow-dirty --no-verify; then
-        echo "✅ ${CRATE} passed dry-run"
+        echo "${CRATE} passed dry-run"
     else
-        echo "⚠️ ${CRATE} failed dry-run (likely due to unpublished dependencies)"
+        echo "${CRATE} failed dry-run (likely due to unpublished dependencies)"
         FAILED_CRATES+=("${CRATE}")
     fi
 done
@@ -43,4 +41,5 @@ else
         echo " - ${FAILED}"
     done
     echo "Note: Failures are expected if dependencies are only local."
+    exit 1
 fi

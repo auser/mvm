@@ -142,6 +142,15 @@ enum Commands {
     },
     /// System diagnostics and dependency checks
     Doctor,
+    /// Pre-release checks (deploy guard + cargo publish dry-run)
+    Release {
+        /// Run cargo publish --dry-run for all crates
+        #[arg(long)]
+        dry_run: bool,
+        /// Run deploy guard checks only (version, tag, inter-crate deps)
+        #[arg(long)]
+        guard_only: bool,
+    },
     /// Manage global templates (shared base images)
     Template {
         #[command(subcommand)]
@@ -417,6 +426,10 @@ pub fn run() -> Result<()> {
         Commands::Destroy { yes } => cmd_destroy(yes),
         Commands::Upgrade { check, force } => cmd_upgrade(check, force),
         Commands::Doctor => cmd_doctor(),
+        Commands::Release {
+            dry_run,
+            guard_only,
+        } => cmd_release(dry_run, guard_only),
         Commands::Build {
             path,
             output,
@@ -1091,6 +1104,245 @@ fn cmd_upgrade(check: bool, force: bool) -> Result<()> {
 
 fn cmd_doctor() -> Result<()> {
     crate::doctor::run()
+}
+
+// ============================================================================
+// Release commands
+// ============================================================================
+
+/// Crates to publish in dependency order.
+const PUBLISH_CRATES: &[&str] = &[
+    "mvm-core",
+    "mvm-guest",
+    "mvm-build",
+    "mvm-runtime",
+    "mvm-cli",
+    "mvm",
+];
+
+fn cmd_release(dry_run: bool, guard_only: bool) -> Result<()> {
+    let workspace_root = find_workspace_root()?;
+
+    ui::info("Running deploy guard checks...\n");
+
+    // 1. Extract workspace version
+    let cargo_toml_path = workspace_root.join("Cargo.toml");
+    let cargo_toml =
+        std::fs::read_to_string(&cargo_toml_path).context("Failed to read workspace Cargo.toml")?;
+
+    let workspace_version = extract_workspace_version(&cargo_toml)?;
+    ui::status_line("Workspace version:", &workspace_version);
+
+    // 2. Check all crates use workspace version (no hardcoded versions)
+    let crates_dir = workspace_root.join("crates");
+    check_no_hardcoded_versions(&crates_dir)?;
+    ui::success("All crates use version.workspace = true");
+
+    // 3. Check inter-crate dependency versions match
+    check_inter_crate_versions(&workspace_root, &workspace_version)?;
+    ui::success(&format!(
+        "All inter-crate dependencies use version {}",
+        workspace_version
+    ));
+
+    // 4. Check git tag
+    let tag_name = format!("v{}", workspace_version);
+    match check_git_tag(&tag_name) {
+        Ok(()) => ui::success(&format!("HEAD is tagged with {}", tag_name)),
+        Err(e) => ui::warn(&format!("Tag check: {} (ok for pre-release)", e)),
+    }
+
+    if guard_only {
+        ui::success("\nDeploy guard checks passed.");
+        return Ok(());
+    }
+
+    if !dry_run {
+        anyhow::bail!(
+            "Live publish not supported from CLI. Use --dry-run for local validation,\n\
+             or trigger the publish-crates GitHub Action for real releases."
+        );
+    }
+
+    // 5. Run cargo publish --dry-run for each crate
+    ui::info("\nRunning cargo publish --dry-run for all crates...\n");
+
+    let mut failed = Vec::new();
+    for (idx, crate_name) in PUBLISH_CRATES.iter().enumerate() {
+        ui::step(
+            (idx + 1) as u32,
+            PUBLISH_CRATES.len() as u32,
+            &format!("Checking {}", crate_name),
+        );
+
+        let output = std::process::Command::new("cargo")
+            .args([
+                "publish",
+                "-p",
+                crate_name,
+                "--dry-run",
+                "--allow-dirty",
+                "--no-verify",
+            ])
+            .current_dir(&workspace_root)
+            .output()
+            .with_context(|| format!("Failed to run cargo publish for {}", crate_name))?;
+
+        if output.status.success() {
+            ui::success(&format!("  {} passed", crate_name));
+        } else {
+            let stderr = String::from_utf8_lossy(&output.stderr);
+            ui::warn(&format!("  {} failed: {}", crate_name, stderr.trim()));
+            failed.push(*crate_name);
+        }
+    }
+
+    println!();
+    if failed.is_empty() {
+        ui::success("All crates passed dry-run! Ready to publish.");
+    } else {
+        ui::warn(&format!(
+            "{} crate(s) failed dry-run (expected if deps not yet on crates.io):",
+            failed.len()
+        ));
+        for name in &failed {
+            ui::warn(&format!("  - {}", name));
+        }
+    }
+
+    Ok(())
+}
+
+/// Find the workspace root by walking up from cwd looking for Cargo.toml with [workspace].
+fn find_workspace_root() -> Result<std::path::PathBuf> {
+    let mut dir = std::env::current_dir()?;
+    loop {
+        let candidate = dir.join("Cargo.toml");
+        if candidate.is_file() {
+            let content = std::fs::read_to_string(&candidate)?;
+            if content.contains("[workspace]") {
+                return Ok(dir);
+            }
+        }
+        if !dir.pop() {
+            anyhow::bail!("Could not find workspace root (no Cargo.toml with [workspace])");
+        }
+    }
+}
+
+/// Extract workspace version from Cargo.toml content.
+fn extract_workspace_version(cargo_toml: &str) -> Result<String> {
+    let mut in_workspace_package = false;
+    for line in cargo_toml.lines() {
+        let trimmed = line.trim();
+        if trimmed == "[workspace.package]" {
+            in_workspace_package = true;
+            continue;
+        }
+        if trimmed.starts_with('[') {
+            in_workspace_package = false;
+            continue;
+        }
+        if in_workspace_package
+            && trimmed.starts_with("version")
+            && let Some(version) = trimmed.split('"').nth(1)
+        {
+            return Ok(version.to_string());
+        }
+    }
+    anyhow::bail!("Could not find version in [workspace.package]")
+}
+
+/// Verify no crate has a hardcoded version (all must use version.workspace = true).
+fn check_no_hardcoded_versions(crates_dir: &std::path::Path) -> Result<()> {
+    for entry in std::fs::read_dir(crates_dir)? {
+        let entry = entry?;
+        let cargo_toml = entry.path().join("Cargo.toml");
+        if !cargo_toml.is_file() {
+            continue;
+        }
+        let content = std::fs::read_to_string(&cargo_toml)?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            // Match "version = " at the start of a line (not inside a dependency spec)
+            if trimmed.starts_with("version = \"") {
+                let crate_name = entry.file_name().to_string_lossy().to_string();
+                anyhow::bail!(
+                    "Hardcoded version in {}: {}\nUse 'version.workspace = true' instead.",
+                    crate_name,
+                    trimmed
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Verify inter-crate dependency versions match the workspace version.
+fn check_inter_crate_versions(workspace_root: &std::path::Path, expected: &str) -> Result<()> {
+    let mut files_to_check = vec![workspace_root.join("Cargo.toml")];
+    let crates_dir = workspace_root.join("crates");
+    if crates_dir.is_dir() {
+        for entry in std::fs::read_dir(&crates_dir)? {
+            let entry = entry?;
+            let cargo_toml = entry.path().join("Cargo.toml");
+            if cargo_toml.is_file() {
+                files_to_check.push(cargo_toml);
+            }
+        }
+    }
+
+    for path in &files_to_check {
+        let content = std::fs::read_to_string(path)?;
+        for line in content.lines() {
+            let trimmed = line.trim();
+            // Match: mvm-<name> = { path = "...", version = "X.Y.Z" }
+            if trimmed.starts_with("mvm-")
+                && trimmed.contains("version = \"")
+                && let Some(version) = trimmed
+                    .split("version = \"")
+                    .nth(1)
+                    .and_then(|s| s.split('"').next())
+                && version != expected
+            {
+                let file_name = path.file_name().unwrap_or_default().to_string_lossy();
+                anyhow::bail!(
+                    "Version mismatch in {}: found '{}', expected '{}'\n  Line: {}",
+                    file_name,
+                    version,
+                    expected,
+                    trimmed
+                );
+            }
+        }
+    }
+    Ok(())
+}
+
+/// Check if HEAD is tagged with the expected tag name.
+fn check_git_tag(expected_tag: &str) -> Result<()> {
+    let output = std::process::Command::new("git")
+        .args(["tag", "--points-at", "HEAD"])
+        .output()
+        .context("Failed to run git tag")?;
+
+    let tags = String::from_utf8_lossy(&output.stdout);
+    let tag_list: Vec<&str> = tags.lines().collect();
+
+    if tag_list.contains(&expected_tag) {
+        Ok(())
+    } else {
+        let current = if tag_list.is_empty() {
+            "<none>".to_string()
+        } else {
+            tag_list.join(", ")
+        };
+        anyhow::bail!(
+            "HEAD is not tagged with {}. Current tags: {}",
+            expected_tag,
+            current
+        )
+    }
 }
 
 fn cmd_build(path: &str, output: Option<&str>) -> Result<()> {
@@ -2299,5 +2551,80 @@ mod tests {
             }
             _ => panic!("Expected Down command"),
         }
+    }
+
+    // ---- Release command tests ----
+
+    #[test]
+    fn test_release_dry_run_parses() {
+        let cli = Cli::try_parse_from(["mvm", "release", "--dry-run"]).unwrap();
+        match cli.command {
+            Commands::Release {
+                dry_run,
+                guard_only,
+            } => {
+                assert!(dry_run);
+                assert!(!guard_only);
+            }
+            _ => panic!("Expected Release command"),
+        }
+    }
+
+    #[test]
+    fn test_release_guard_only_parses() {
+        let cli = Cli::try_parse_from(["mvm", "release", "--guard-only"]).unwrap();
+        match cli.command {
+            Commands::Release {
+                dry_run,
+                guard_only,
+            } => {
+                assert!(!dry_run);
+                assert!(guard_only);
+            }
+            _ => panic!("Expected Release command"),
+        }
+    }
+
+    #[test]
+    fn test_release_no_flags_parses() {
+        let cli = Cli::try_parse_from(["mvm", "release"]).unwrap();
+        match cli.command {
+            Commands::Release {
+                dry_run,
+                guard_only,
+            } => {
+                assert!(!dry_run);
+                assert!(!guard_only);
+            }
+            _ => panic!("Expected Release command"),
+        }
+    }
+
+    #[test]
+    fn test_extract_workspace_version() {
+        let toml = r#"
+[workspace]
+members = ["crates/mvm-core"]
+
+[workspace.package]
+version = "1.2.3"
+edition = "2024"
+"#;
+        let version = extract_workspace_version(toml).unwrap();
+        assert_eq!(version, "1.2.3");
+    }
+
+    #[test]
+    fn test_extract_workspace_version_missing() {
+        let toml = "[workspace]\nmembers = []";
+        let result = extract_workspace_version(toml);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_publish_crates_order() {
+        // Foundation crate must come first, facade last
+        assert_eq!(PUBLISH_CRATES[0], "mvm-core");
+        assert_eq!(*PUBLISH_CRATES.last().unwrap(), "mvm");
     }
 }

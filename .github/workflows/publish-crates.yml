@@ -79,8 +79,6 @@ jobs:
             mvm-guest
             mvm-build
             mvm-runtime
-            mvm-coordinator
-            mvm-agent
             mvm-cli
             mvm
           )

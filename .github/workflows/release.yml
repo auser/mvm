@@ -51,7 +51,7 @@ jobs:
       - name: Build release binary
         run: cargo build --release --target ${{ matrix.target }}
 
-      - name: Package binary
+      - name: Package binary and generate checksums
         shell: bash
         run: |
           BIN_NAME="mvm"
@@ -65,11 +65,16 @@ jobs:
           cd staging
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
 
+          # Generate SHA256 checksum for the tarball
+          shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+
       - name: Upload artifact
         uses: actions/upload-artifact@v4
         with:
           name: mvm-${{ matrix.target }}
-          path: staging/*.tar.gz
+          path: |
+            staging/*.tar.gz
+            staging/*.sha256
 
   release:
     needs: build
@@ -83,8 +88,22 @@ jobs:
           path: artifacts
           merge-multiple: true
 
+      - name: Generate combined checksum file
+        shell: bash
+        run: |
+          cd artifacts
+          # Combine per-platform checksums into one file
+          cat *.sha256 > checksums-sha256.txt
+          echo "Combined checksums:"
+          cat checksums-sha256.txt
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
-        run: gh release create "${TAG_NAME}" --title "${TAG_NAME}" --generate-notes artifacts/*.tar.gz
+        run: |
+          gh release create "${TAG_NAME}" \
+            --title "${TAG_NAME}" \
+            --generate-notes \
+            artifacts/*.tar.gz \
+            artifacts/checksums-sha256.txt
