@@ -4,6 +4,7 @@
 pub mod bootstrap;
 pub mod commands;
 pub mod doctor;
+pub mod fleet;
 pub mod http;
 pub mod logging;
 pub mod template_cmd;
