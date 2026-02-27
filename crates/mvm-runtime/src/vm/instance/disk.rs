@@ -1,6 +1,23 @@
 use anyhow::Result;
 
 use crate::shell;
+use crate::vm::microvm::DriveFile;
+
+/// Generate shell commands to inject `DriveFile`s into a mounted drive.
+fn drive_file_inject_commands(files: &[DriveFile]) -> String {
+    let mut cmds = String::new();
+    for f in files {
+        let escaped = f.content.replace('\'', "'\\''");
+        let mode = format!("{:04o}", f.mode);
+        cmds.push_str(&format!(
+            "echo '{content}' | sudo tee \"$MOUNT_DIR/{name}\" >/dev/null\nsudo chmod {mode} \"$MOUNT_DIR/{name}\"\n",
+            content = escaped,
+            name = f.name,
+            mode = mode,
+        ));
+    }
+    cmds
+}
 
 /// Ensure a per-instance data disk exists (created once, persisted across restarts).
 pub fn ensure_data_disk(instance_dir: &str, size_mib: u32) -> Result<String> {
@@ -27,8 +44,13 @@ pub fn ensure_data_disk(instance_dir: &str, size_mib: u32) -> Result<String> {
 /// - File permissions 0600 (root-only read/write)
 /// - Mount with ro,noexec,nodev,nosuid inside guest
 /// - Recreated on every start and wake (never reused)
-pub fn create_secrets_disk(instance_dir: &str, secrets_json_path: &str) -> Result<String> {
+pub fn create_secrets_disk(
+    instance_dir: &str,
+    secrets_json_path: &str,
+    extra_files: &[DriveFile],
+) -> Result<String> {
     let path = format!("{}/volumes/secrets.ext4", instance_dir);
+    let extra_cmds = drive_file_inject_commands(extra_files);
     shell::run_in_vm(&format!(
         r#"
         mkdir -p {dir}/volumes
@@ -46,6 +68,7 @@ pub fn create_secrets_disk(instance_dir: &str, secrets_json_path: &str) -> Resul
         sudo mount "$TMPFS_DIR/secrets.ext4" "$MOUNT_DIR"
         sudo cp {secrets} "$MOUNT_DIR/secrets.json" 2>/dev/null || true
         sudo chmod 0400 "$MOUNT_DIR/secrets.json" 2>/dev/null || true
+        {extra}
         sudo umount "$MOUNT_DIR"
         rmdir "$MOUNT_DIR"
 
@@ -57,6 +80,7 @@ pub fn create_secrets_disk(instance_dir: &str, secrets_json_path: &str) -> Resul
         dir = instance_dir,
         path = path,
         secrets = secrets_json_path,
+        extra = extra_cmds,
     ))?;
     Ok(path)
 }
@@ -74,9 +98,14 @@ pub fn remove_secrets_disk(instance_dir: &str) -> Result<()> {
 /// instance identity, network config, pool resources, and min_runtime_policy.
 /// Created fresh on every start/wake with current config.
 /// Guest mounts as ro — the vsock agent reads config from this drive.
-pub fn create_config_disk(instance_dir: &str, config_json: &str) -> Result<String> {
+pub fn create_config_disk(
+    instance_dir: &str,
+    config_json: &str,
+    extra_files: &[DriveFile],
+) -> Result<String> {
     let path = format!("{}/volumes/config.ext4", instance_dir);
     let escaped = config_json.replace('\'', "'\\''");
+    let extra_cmds = drive_file_inject_commands(extra_files);
     shell::run_in_vm(&format!(
         r#"
         mkdir -p {dir}/volumes
@@ -93,6 +122,7 @@ pub fn create_config_disk(instance_dir: &str, config_json: &str) -> Result<Strin
         sudo mount {path} "$MOUNT_DIR"
         echo '{json}' | sudo tee "$MOUNT_DIR/config.json" >/dev/null
         sudo chmod 0444 "$MOUNT_DIR/config.json"
+        {extra}
         sudo umount "$MOUNT_DIR"
         rmdir "$MOUNT_DIR"
 
@@ -101,6 +131,7 @@ pub fn create_config_disk(instance_dir: &str, config_json: &str) -> Result<Strin
         dir = instance_dir,
         path = path,
         json = escaped,
+        extra = extra_cmds,
     ))?;
     Ok(path)
 }

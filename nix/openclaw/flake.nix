@@ -3,22 +3,22 @@
 
   inputs = {
     mvm.url = "path:../../";
-    # Unstable required — the nix-openclaw overlay uses fetchPnpmDeps.
+    # Unstable required — pnpm_10.fetchDeps is only in nixpkgs-unstable.
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    nix-openclaw.url = "github:openclaw/nix-openclaw";
   };
 
-  outputs = { mvm, nixpkgs, nix-openclaw, ... }:
+  outputs = { mvm, nixpkgs, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       eachSystem = f: builtins.listToAttrs (map (system:
         { name = system; value = f system; }
       ) systems);
 
-      openclawFor = system: (import nixpkgs {
-        inherit system;
-        overlays = [ nix-openclaw.overlays.default ];
-      }).openclaw;
+      # Build the gateway locally instead of using the nix-openclaw overlay,
+      # which bundles ML tools (whisper/torch/triton) that fail on aarch64.
+      openclawFor = system:
+        let pkgs = import nixpkgs { inherit system; };
+        in pkgs.callPackage ./pkgs/openclaw.nix {};
     in {
       packages = eachSystem (system: {
         default = mvm.lib.${system}.mkGuest {

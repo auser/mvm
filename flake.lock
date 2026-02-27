@@ -21,7 +21,6 @@
     "microvm": {
       "inputs": {
         "nixpkgs": [
-          "mvm",
           "nixpkgs"
         ],
         "spectrum": "spectrum"
@@ -40,23 +39,6 @@
         "type": "github"
       }
     },
-    "mvm": {
-      "inputs": {
-        "flake-utils": "flake-utils",
-        "microvm": "microvm",
-        "nixpkgs": "nixpkgs",
-        "rust-overlay": "rust-overlay"
-      },
-      "locked": {
-        "path": "../../",
-        "type": "path"
-      },
-      "original": {
-        "path": "../../",
-        "type": "path"
-      },
-      "parent": []
-    },
     "nixpkgs": {
       "locked": {
         "lastModified": 1751274312,
@@ -73,32 +55,17 @@
         "type": "github"
       }
     },
-    "nixpkgs_2": {
-      "locked": {
-        "lastModified": 1772082373,
-        "narHash": "sha256-wySf8a6hvuqgFdwvvzPPTARBCMLDz7WFAufGkllD1M4=",
-        "owner": "NixOS",
-        "repo": "nixpkgs",
-        "rev": "26eaeac4e409d7b5a6bf6f90a2a2dc223c78d915",
-        "type": "github"
-      },
-      "original": {
-        "owner": "NixOS",
-        "ref": "nixpkgs-unstable",
-        "repo": "nixpkgs",
-        "type": "github"
-      }
-    },
     "root": {
       "inputs": {
-        "mvm": "mvm",
-        "nixpkgs": "nixpkgs_2"
+        "flake-utils": "flake-utils",
+        "microvm": "microvm",
+        "nixpkgs": "nixpkgs",
+        "rust-overlay": "rust-overlay"
       }
     },
     "rust-overlay": {
       "inputs": {
         "nixpkgs": [
-          "mvm",
           "nixpkgs"
         ]
       },

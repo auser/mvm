@@ -29,6 +29,52 @@ pub struct DevBuildResult {
     pub runner_dir: Option<String>,
 }
 
+/// Result of dev-build cache cleanup.
+#[derive(Debug, Clone)]
+pub struct DevBuildCleanupReport {
+    /// Number of revision directories removed.
+    pub removed_count: usize,
+    /// Absolute paths of removed revision directories.
+    pub removed_paths: Vec<String>,
+}
+
+/// Remove old cached dev builds, keeping the newest `keep` revisions.
+///
+/// Returns a report with the number of removed revisions and removed paths.
+pub fn cleanup_old_dev_builds(
+    env: &dyn ShellEnvironment,
+    keep: usize,
+) -> Result<DevBuildCleanupReport> {
+    let builds_dir = dev_builds_dir();
+    let list_script = format!(
+        "if [ -d {dir} ]; then ls -1dt {dir}/* 2>/dev/null || true; fi",
+        dir = shell_quote(&builds_dir),
+    );
+    let output = env.shell_exec_stdout(&list_script)?;
+    let builds: Vec<&str> = output
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .collect();
+
+    if builds.len() <= keep {
+        return Ok(DevBuildCleanupReport {
+            removed_count: 0,
+            removed_paths: vec![],
+        });
+    }
+
+    let mut removed_paths = Vec::new();
+    for path in builds.iter().skip(keep) {
+        env.shell_exec(&format!("rm -rf {}", shell_quote(path)))?;
+        removed_paths.push((*path).to_string());
+    }
+
+    Ok(DevBuildCleanupReport {
+        removed_count: removed_paths.len(),
+        removed_paths,
+    })
+}
+
 /// Build a microVM image from a Nix flake directly in the Lima VM.
 ///
 /// Runs `nix build` with visible output, then copies the resulting
@@ -144,6 +190,10 @@ fn extract_revision_hash(nix_output_path: &str) -> String {
 /// Return the dev build directory for a given revision hash.
 fn dev_build_dir(revision_hash: &str) -> String {
     format!("{}/{}", dev_builds_dir(), revision_hash)
+}
+
+fn shell_quote(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\\''"))
 }
 
 /// Check whether cached artifacts exist for a revision hash.
@@ -520,6 +570,51 @@ mod tests {
             system == "aarch64-linux" || system == "x86_64-linux",
             "unexpected system: {}",
             system
+        );
+    }
+
+    #[test]
+    fn test_cleanup_old_dev_builds_no_directory() {
+        let env = TestEnv::new();
+        env.stub_stdout("ls -1dt", "");
+
+        let report = cleanup_old_dev_builds(&env, 2).unwrap();
+        assert_eq!(report.removed_count, 0);
+        assert!(report.removed_paths.is_empty());
+    }
+
+    #[test]
+    fn test_cleanup_old_dev_builds_keeps_newest() {
+        let env = TestEnv::new();
+        env.stub_stdout(
+            "ls -1dt",
+            concat!(
+                "/home/test/.mvm/dev/builds/newest\n",
+                "/home/test/.mvm/dev/builds/middle\n",
+                "/home/test/.mvm/dev/builds/oldest\n"
+            ),
+        );
+
+        let report = cleanup_old_dev_builds(&env, 1).unwrap();
+        assert_eq!(report.removed_count, 2);
+        assert_eq!(
+            report.removed_paths,
+            vec![
+                "/home/test/.mvm/dev/builds/middle".to_string(),
+                "/home/test/.mvm/dev/builds/oldest".to_string()
+            ]
+        );
+
+        let exec_log = env.exec_log.lock().unwrap();
+        assert!(
+            exec_log
+                .iter()
+                .any(|cmd| cmd.contains("rm -rf '/home/test/.mvm/dev/builds/middle'"))
+        );
+        assert!(
+            exec_log
+                .iter()
+                .any(|cmd| cmd.contains("rm -rf '/home/test/.mvm/dev/builds/oldest'"))
         );
     }
 

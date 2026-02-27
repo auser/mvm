@@ -101,6 +101,7 @@ Additionally, the vsock protocol between host and guest has no authentication, n
 **Status: COMPLETE**
 
 - [x] CLI help/examples refreshed for new flags (force, builder resources, doctor, --json)
+- [x] Add `mvm cleanup` command to prune old Nix dev-build cache revisions (`~/.mvm/dev/builds`), with `--verbose` path output
 - [x] Update CHANGELOG section for v0.3.2 release notes
 - [x] Add end-to-end integration test covering: sync → build --flake → run flag chain parsing
 

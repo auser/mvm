@@ -126,6 +126,18 @@ enum Commands {
         #[arg(long)]
         json: bool,
     },
+    /// Remove old Nix dev-build artifacts from ~/.mvm/dev/builds
+    Cleanup {
+        /// Number of newest build revisions to keep
+        #[arg(long)]
+        keep: Option<usize>,
+        /// Remove all cached build revisions
+        #[arg(long)]
+        all: bool,
+        /// Print each cached build path that gets removed
+        #[arg(long)]
+        verbose: bool,
+    },
     /// Show console logs from a running microVM
     Logs {
         /// Name of the VM
@@ -233,6 +245,12 @@ enum Commands {
         /// Hypervisor backend (firecracker, qemu). Default: firecracker.
         #[arg(long, default_value = "firecracker")]
         hypervisor: String,
+        /// Directory of files to add to the config drive
+        #[arg(long)]
+        config_dir: Option<String>,
+        /// Directory of files to add to the secrets drive
+        #[arg(long)]
+        secrets_dir: Option<String>,
     },
     /// Launch microVMs (from mvm.toml or CLI flags)
     Up {
@@ -435,6 +453,14 @@ enum VmCmd {
         #[arg(long, default_value = "30")]
         timeout: u64,
     },
+    /// Run layered diagnostics on a VM (works even when vsock is broken)
+    Diagnose {
+        /// Name of the VM to diagnose
+        name: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -558,6 +584,7 @@ pub fn run() -> Result<()> {
             force,
             json,
         } => cmd_sync(debug, skip_deps, force, json),
+        Commands::Cleanup { keep, all, verbose } => cmd_cleanup(keep, all, verbose),
         Commands::Logs {
             name,
             follow,
@@ -597,6 +624,8 @@ pub fn run() -> Result<()> {
             config,
             volume,
             hypervisor,
+            config_dir,
+            secrets_dir,
         } => cmd_run(RunParams {
             flake_ref: flake.as_deref(),
             template_name: template.as_deref(),
@@ -607,6 +636,8 @@ pub fn run() -> Result<()> {
             config_path: config.as_deref(),
             volumes: &volume,
             hypervisor: &hypervisor,
+            config_dir: config_dir.as_deref(),
+            secrets_dir: secrets_dir.as_deref(),
         }),
         Commands::Up {
             name,
@@ -1224,6 +1255,42 @@ fn cmd_sync(debug: bool, skip_deps: bool, force: bool, json: bool) -> Result<()>
     Ok(())
 }
 
+fn cmd_cleanup(keep: Option<usize>, all: bool, verbose: bool) -> Result<()> {
+    let keep_count = if all { 0 } else { keep.unwrap_or(5) };
+
+    if !all && keep_count == 0 {
+        anyhow::bail!("--keep must be greater than 0 (or use --all)");
+    }
+
+    let env = mvm_runtime::build_env::RuntimeBuildEnv;
+    let report = mvm_build::dev_build::cleanup_old_dev_builds(&env, keep_count)?;
+
+    if verbose {
+        if report.removed_paths.is_empty() {
+            ui::info("No cached build paths removed.");
+        } else {
+            ui::info("Removed cached build paths:");
+            for path in &report.removed_paths {
+                println!("  {}", path);
+            }
+        }
+    }
+
+    if all {
+        ui::success(&format!(
+            "Cleanup complete — removed {} cached build(s).",
+            report.removed_count
+        ));
+    } else {
+        ui::success(&format!(
+            "Cleanup complete — removed {} cached build(s), kept newest {}.",
+            report.removed_count, keep_count
+        ));
+    }
+
+    Ok(())
+}
+
 /// Run a sync phase, emitting JSON events or human-readable output.
 fn sync_phase(
     json: bool,
@@ -1806,6 +1873,8 @@ struct RunParams<'a> {
     config_path: Option<&'a str>,
     volumes: &'a [String],
     hypervisor: &'a str,
+    config_dir: Option<&'a str>,
+    secrets_dir: Option<&'a str>,
 }
 
 fn cmd_run(params: RunParams<'_>) -> Result<()> {
@@ -1819,6 +1888,8 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
         config_path,
         volumes,
         hypervisor,
+        config_dir,
+        secrets_dir,
     } = params;
     if bootstrap::is_lima_required() {
         lima::require_running()?;
@@ -1928,6 +1999,17 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
     // Allocate a network slot for this VM
     let slot = microvm::allocate_slot(&vm_name)?;
 
+    let config_files = match config_dir {
+        Some(dir) => read_dir_to_drive_files(dir, 0o444)
+            .with_context(|| format!("reading config-dir '{}'", dir))?,
+        None => Vec::new(),
+    };
+    let secret_files = match secrets_dir {
+        Some(dir) => read_dir_to_drive_files(dir, 0o400)
+            .with_context(|| format!("reading secrets-dir '{}'", dir))?,
+        None => Vec::new(),
+    };
+
     let run_config = microvm::FlakeRunConfig {
         name: vm_name,
         slot,
@@ -1940,11 +2022,29 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
         cpus: final_cpus,
         memory: final_memory,
         volumes: volume_cfg,
+        config_files,
+        secret_files,
     };
 
     let backend = AnyBackend::from_hypervisor(hypervisor);
     backend.start_firecracker(&FirecrackerConfig { run_config })?;
     Ok(())
+}
+
+/// Read all regular files from a directory into `DriveFile` entries.
+fn read_dir_to_drive_files(dir: &str, default_mode: u32) -> Result<Vec<microvm::DriveFile>> {
+    let mut files = Vec::new();
+    for entry in std::fs::read_dir(dir)? {
+        let entry = entry?;
+        if entry.file_type()?.is_file() {
+            files.push(microvm::DriveFile {
+                name: entry.file_name().to_string_lossy().to_string(),
+                content: std::fs::read_to_string(entry.path())?,
+                mode: default_mode,
+            });
+        }
+    }
+    Ok(files)
 }
 
 fn parse_runtime_volume(spec: &str) -> Result<image::RuntimeVolume> {
@@ -2077,6 +2177,8 @@ fn cmd_up(
                     cpus: resolved.cpus,
                     memory: resolved.memory,
                     volumes,
+                    config_files: vec![],
+                    secret_files: vec![],
                 };
 
                 let backend = AnyBackend::from_hypervisor(hypervisor);
@@ -2120,6 +2222,8 @@ fn cmd_up(
                 cpus: cpus.unwrap_or(DEFAULT_CPUS),
                 memory: memory.unwrap_or(DEFAULT_MEM),
                 volumes: vec![],
+                config_files: vec![],
+                secret_files: vec![],
             };
 
             let backend = AnyBackend::from_hypervisor(hypervisor);
@@ -2317,6 +2421,7 @@ fn cmd_vm(action: VmCmd) -> Result<()> {
             command,
             timeout,
         } => cmd_vm_exec(&name, &command, timeout),
+        VmCmd::Diagnose { name, json } => cmd_vm_diagnose(&name, json),
     }
 }
 
@@ -2600,7 +2705,19 @@ fn cmd_vm_status_all(json: bool) -> Result<()> {
                     );
                 }
                 Err(e) => {
-                    println!("  {:<16} {:<10} {}", name, "error", e);
+                    let err_msg = e.to_string();
+                    let health = if err_msg.contains("did not respond within")
+                        || err_msg.contains("Failed to connect to guest agent")
+                    {
+                        "agent unreachable"
+                    } else if err_msg.contains("not found at") {
+                        "vsock missing"
+                    } else if err_msg.contains("not a socket") {
+                        "vsock invalid"
+                    } else {
+                        "unknown error"
+                    };
+                    println!("  {:<16} {:<10} {:<24} {}", name, "error", "-", health);
                 }
             }
         }
@@ -2683,8 +2800,23 @@ fn cmd_vm_status_row(name: &str) -> Result<(String, Option<String>, String)> {
 
             let summary = if total == 0 {
                 "-".to_string()
-            } else {
+            } else if healthy == total {
                 format!("{}/{} ok", healthy, total)
+            } else {
+                // Show names of failing checks
+                let failing: Vec<&str> = integrations
+                    .iter()
+                    .filter(|ig| !ig.health.as_ref().is_some_and(|h| h.healthy))
+                    .map(|ig| ig.name.as_str())
+                    .chain(
+                        probes
+                            .iter()
+                            .filter(|p| !p.healthy)
+                            .map(|p| p.name.as_str()),
+                    )
+                    .collect();
+                let names = failing.join(", ");
+                format!("{}/{} ok ({})", healthy, total, names)
             };
             Ok((status, last_busy_at, summary))
         }
@@ -2796,6 +2928,177 @@ fn cmd_vm_exec(name: &str, command: &[String], timeout: u64) -> Result<()> {
         }
         _ => anyhow::bail!("Unexpected response from guest agent"),
     }
+}
+
+// ============================================================================
+// VM diagnose command
+// ============================================================================
+
+fn cmd_vm_diagnose(name: &str, json: bool) -> Result<()> {
+    // Delegate to Lima on macOS
+    if bootstrap::is_lima_required() {
+        lima::require_running()?;
+        let mvm_installed =
+            shell::run_in_vm_stdout("test -f /usr/local/bin/mvmctl && echo yes || echo no")?;
+        if mvm_installed.trim() != "yes" {
+            anyhow::bail!("mvmctl is not installed inside the Lima VM. Run 'mvmctl sync' first.");
+        }
+        let json_flag = if json { " --json" } else { "" };
+        shell::run_in_vm_visible(&format!(
+            "/usr/local/bin/mvmctl vm diagnose {}{}",
+            name, json_flag
+        ))?;
+        return Ok(());
+    }
+
+    let result = microvm::diagnose_vm(name)?;
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&result)?);
+        return Ok(());
+    }
+
+    // Human-readable output
+    println!("Diagnosing VM '{}'...", name);
+    println!();
+
+    // FC process
+    let fc_status = if result.fc_alive {
+        match result.fc_pid {
+            Some(pid) => format!("ALIVE (pid {})", pid),
+            None => "ALIVE".to_string(),
+        }
+    } else {
+        match result.fc_pid {
+            Some(pid) => format!("DEAD (stale pid {})", pid),
+            None => "DEAD (no pid file)".to_string(),
+        }
+    };
+    print_diag_line("FC process:", &fc_status, result.fc_alive);
+
+    // FC API
+    let api_status = if result.fc_api_responsive {
+        if let Some(ref config) = result.fc_machine_config {
+            let vcpus = config.get("vcpu_count").and_then(|v| v.as_u64());
+            let mem = config.get("mem_size_mib").and_then(|v| v.as_u64());
+            match (vcpus, mem) {
+                (Some(v), Some(m)) => format!("OK ({} vCPUs, {} MiB)", v, m),
+                _ => "OK".to_string(),
+            }
+        } else {
+            "OK".to_string()
+        }
+    } else if result.fc_alive {
+        "NOT RESPONDING".to_string()
+    } else {
+        "-".to_string()
+    };
+    print_diag_line(
+        "FC API:",
+        &api_status,
+        result.fc_api_responsive || !result.fc_alive,
+    );
+
+    // Vsock socket
+    let vsock_status = if result.vsock_exists {
+        "EXISTS"
+    } else {
+        "MISSING"
+    };
+    print_diag_line("Vsock socket:", vsock_status, result.vsock_exists);
+
+    // Console log
+    if result.console_warnings.is_empty() {
+        print_diag_line("Console log:", "OK", true);
+    } else {
+        let first_warning = &result.console_warnings[0];
+        let truncated = if first_warning.len() > 60 {
+            format!("{}...", &first_warning[..60])
+        } else {
+            first_warning.clone()
+        };
+        let msg = format!(
+            "WARNING ({} issue{}) — \"{}\"",
+            result.console_warnings.len(),
+            if result.console_warnings.len() == 1 {
+                ""
+            } else {
+                "s"
+            },
+            truncated,
+        );
+        print_diag_line("Console log:", &msg, false);
+    }
+
+    // FC log
+    if result.fc_log_errors.is_empty() {
+        print_diag_line("FC log:", "OK", true);
+    } else {
+        let msg = format!(
+            "{} error{}",
+            result.fc_log_errors.len(),
+            if result.fc_log_errors.len() == 1 {
+                ""
+            } else {
+                "s"
+            }
+        );
+        print_diag_line("FC log:", &msg, false);
+    }
+
+    // Guest agent
+    if result.agent_reachable {
+        let status = result.worker_status.as_deref().unwrap_or("unknown");
+        print_diag_line("Guest agent:", &format!("OK ({})", status), true);
+    } else if let Some(ref err) = result.agent_error {
+        let short_err = if err.contains("did not respond within") {
+            "timeout"
+        } else if err.contains("Ping returned false") {
+            "ping failed"
+        } else {
+            "unreachable"
+        };
+        print_diag_line(
+            "Guest agent:",
+            &format!("UNREACHABLE ({})", short_err),
+            false,
+        );
+    } else if !result.vsock_exists {
+        print_diag_line("Guest agent:", "- (no vsock socket)", true);
+    } else {
+        print_diag_line("Guest agent:", "NOT TESTED", true);
+    }
+
+    // Health checks
+    if result.agent_reachable {
+        let total = result.integration_results.len() + result.probe_results.len();
+        if total > 0 {
+            let healthy = result
+                .integration_results
+                .iter()
+                .filter(|ig| ig.health.as_ref().is_some_and(|h| h.healthy))
+                .count()
+                + result.probe_results.iter().filter(|p| p.healthy).count();
+            let msg = format!("{}/{} ok", healthy, total);
+            print_diag_line("Health checks:", &msg, healthy == total);
+        }
+    }
+
+    // Suggestions
+    if !result.suggestions.is_empty() {
+        println!();
+        ui::status_line("Suggested:", &result.suggestions[0]);
+        for suggestion in &result.suggestions[1..] {
+            ui::status_line("", suggestion);
+        }
+    }
+
+    Ok(())
+}
+
+fn print_diag_line(label: &str, value: &str, ok: bool) {
+    let indicator = if ok { " " } else { "!" };
+    println!(" {} {:<16} {}", indicator, label, value);
 }
 
 fn render_inspect_json(
@@ -2974,6 +3277,58 @@ mod tests {
                 ..
             }
         ));
+    }
+
+    #[test]
+    fn test_cleanup_defaults() {
+        let cli = Cli::try_parse_from(["mvmctl", "cleanup"]).unwrap();
+        match cli.command {
+            Commands::Cleanup { keep, all, verbose } => {
+                assert_eq!(keep, None);
+                assert!(!all);
+                assert!(!verbose);
+            }
+            _ => panic!("Expected Cleanup command"),
+        }
+    }
+
+    #[test]
+    fn test_cleanup_keep_flag() {
+        let cli = Cli::try_parse_from(["mvmctl", "cleanup", "--keep", "9"]).unwrap();
+        match cli.command {
+            Commands::Cleanup { keep, all, verbose } => {
+                assert_eq!(keep, Some(9));
+                assert!(!all);
+                assert!(!verbose);
+            }
+            _ => panic!("Expected Cleanup command"),
+        }
+    }
+
+    #[test]
+    fn test_cleanup_all_flag() {
+        let cli = Cli::try_parse_from(["mvmctl", "cleanup", "--all"]).unwrap();
+        match cli.command {
+            Commands::Cleanup { keep, all, verbose } => {
+                assert_eq!(keep, None);
+                assert!(all);
+                assert!(!verbose);
+            }
+            _ => panic!("Expected Cleanup command"),
+        }
+    }
+
+    #[test]
+    fn test_cleanup_verbose_flag() {
+        let cli = Cli::try_parse_from(["mvmctl", "cleanup", "--verbose"]).unwrap();
+        match cli.command {
+            Commands::Cleanup { keep, all, verbose } => {
+                assert_eq!(keep, None);
+                assert!(!all);
+                assert!(verbose);
+            }
+            _ => panic!("Expected Cleanup command"),
+        }
     }
 
     #[test]
@@ -3189,6 +3544,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_run_config_dir_and_secrets_dir() {
+        let cli = Cli::try_parse_from([
+            "mvmctl",
+            "run",
+            "--flake",
+            ".",
+            "--config-dir",
+            "/tmp/config",
+            "--secrets-dir",
+            "/tmp/secrets",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Run {
+                config_dir,
+                secrets_dir,
+                ..
+            } => {
+                assert_eq!(config_dir.as_deref(), Some("/tmp/config"));
+                assert_eq!(secrets_dir.as_deref(), Some("/tmp/secrets"));
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
+    #[test]
+    fn test_run_config_dir_defaults_none() {
+        let cli = Cli::try_parse_from(["mvmctl", "run", "--flake", "."]).unwrap();
+        match cli.command {
+            Commands::Run {
+                config_dir,
+                secrets_dir,
+                ..
+            } => {
+                assert!(config_dir.is_none());
+                assert!(secrets_dir.is_none());
+            }
+            _ => panic!("Expected Run command"),
+        }
+    }
+
     // ---- VM subcommand tests ----
 
     #[test]
@@ -3347,6 +3744,42 @@ mod tests {
     fn test_vm_exec_requires_name_and_command() {
         let result = Cli::try_parse_from(["mvmctl", "vm", "exec"]);
         assert!(result.is_err(), "exec should require a name");
+    }
+
+    // ---- VM diagnose ----
+
+    #[test]
+    fn test_vm_diagnose_parses_name() {
+        let cli = Cli::try_parse_from(["mvmctl", "vm", "diagnose", "my-vm"]).unwrap();
+        match cli.command {
+            Commands::Vm {
+                action: VmCmd::Diagnose { name, json },
+            } => {
+                assert_eq!(name, "my-vm");
+                assert!(!json);
+            }
+            _ => panic!("Expected Vm Diagnose command"),
+        }
+    }
+
+    #[test]
+    fn test_vm_diagnose_parses_json_flag() {
+        let cli = Cli::try_parse_from(["mvmctl", "vm", "diagnose", "my-vm", "--json"]).unwrap();
+        match cli.command {
+            Commands::Vm {
+                action: VmCmd::Diagnose { name, json },
+            } => {
+                assert_eq!(name, "my-vm");
+                assert!(json);
+            }
+            _ => panic!("Expected Vm Diagnose command"),
+        }
+    }
+
+    #[test]
+    fn test_vm_diagnose_requires_name() {
+        let result = Cli::try_parse_from(["mvmctl", "vm", "diagnose"]);
+        assert!(result.is_err(), "diagnose should require a name");
     }
 
     // ---- Up/Down command tests ----
@@ -3559,5 +3992,50 @@ edition = "2024"
                 action: SecurityCmd::Status { json: true }
             }
         ));
+    }
+
+    // ---- read_dir_to_drive_files tests ----
+
+    #[test]
+    fn test_read_dir_to_drive_files_reads_files() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), "hello").unwrap();
+        std::fs::write(dir.path().join("b.env"), "KEY=val").unwrap();
+
+        let files = read_dir_to_drive_files(dir.path().to_str().unwrap(), 0o444).unwrap();
+        assert_eq!(files.len(), 2);
+
+        let names: Vec<&str> = files.iter().map(|f| f.name.as_str()).collect();
+        assert!(names.contains(&"a.txt"));
+        assert!(names.contains(&"b.env"));
+
+        for f in &files {
+            assert_eq!(f.mode, 0o444);
+        }
+    }
+
+    #[test]
+    fn test_read_dir_to_drive_files_skips_directories() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("file.txt"), "content").unwrap();
+        std::fs::create_dir(dir.path().join("subdir")).unwrap();
+
+        let files = read_dir_to_drive_files(dir.path().to_str().unwrap(), 0o400).unwrap();
+        assert_eq!(files.len(), 1);
+        assert_eq!(files[0].name, "file.txt");
+        assert_eq!(files[0].mode, 0o400);
+    }
+
+    #[test]
+    fn test_read_dir_to_drive_files_empty_dir() {
+        let dir = tempfile::tempdir().unwrap();
+        let files = read_dir_to_drive_files(dir.path().to_str().unwrap(), 0o444).unwrap();
+        assert!(files.is_empty());
+    }
+
+    #[test]
+    fn test_read_dir_to_drive_files_nonexistent_dir() {
+        let result = read_dir_to_drive_files("/nonexistent/path/abc123", 0o444);
+        assert!(result.is_err());
     }
 }

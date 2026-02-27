@@ -1,4 +1,5 @@
 use std::io::{BufRead, BufReader, Read, Write};
+use std::os::unix::fs::FileTypeExt;
 use std::os::unix::net::UnixStream;
 use std::time::Duration;
 
@@ -425,6 +426,19 @@ fn is_timeout_error(err: &std::io::Error) -> bool {
 fn try_connect_once(uds_path: &str, timeout_secs: u64) -> Result<UnixStream> {
     let timeout = Duration::from_secs(timeout_secs);
 
+    // Pre-flight: verify the socket file exists and is actually a socket.
+    match std::fs::symlink_metadata(uds_path) {
+        Err(e) => bail!("Vsock socket not found at {}: {}", uds_path, e),
+        Ok(m) if !m.file_type().is_socket() => {
+            bail!(
+                "Path {} exists but is not a socket (type: {:?})",
+                uds_path,
+                m.file_type()
+            )
+        }
+        Ok(_) => {}
+    }
+
     let stream = UnixStream::connect(uds_path)
         .with_context(|| format!("Failed to connect to vsock UDS at {}", uds_path))?;
     stream.set_read_timeout(Some(timeout))?;
@@ -493,7 +507,12 @@ fn connect_to(uds_path: &str, timeout_secs: u64) -> Result<UnixStream> {
         }
     }
 
-    Err(last_err.unwrap_or_else(|| anyhow::anyhow!("Failed to connect to vsock")))
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "Failed to connect to guest agent after {} attempts",
+            CONNECT_RETRIES
+        )
+    }))
 }
 
 /// Connect to the guest vsock agent via the fleet-mode instance directory convention.
@@ -964,7 +983,7 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(
-            err_msg.contains("Failed to connect to vsock UDS"),
+            err_msg.contains("Vsock socket not found at"),
             "Error was: {}",
             err_msg
         );

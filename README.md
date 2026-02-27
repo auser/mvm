@@ -63,6 +63,7 @@ Layer 3: Firecracker microVM
   - Communicates via vsock only
   - Network: 172.16.0.2 (NAT via Lima)
   - Runs as a background daemon process
+  - Drives: /dev/vda (rootfs), /dev/vdb (config, ro), /dev/vdc (secrets, ro), /dev/vdd (data, rw)
   - Dev builds support `mvmctl vm exec` for debugging (see below)
 ```
 
@@ -143,10 +144,35 @@ mvmctl build --flake . --profile minimal --watch
 mvmctl run --flake . --profile minimal --role worker \
     --cpus 4 --memory 2048 \
     --volume ./data:/data:1024 \
-    --config runtime.toml
+    --config runtime.toml \
+    --config-dir ./my-config \
+    --secrets-dir ./my-secrets
 ```
 
 MicroVMs are always headless (no SSH). Volumes are specified as `host_path:guest_mount:size_mb`. A runtime config TOML can provide defaults for cpus, memory, and volumes.
+
+#### Config and Secrets Injection
+
+Inject custom files onto the guest's config and secrets drives at boot time using `--config-dir` and `--secrets-dir`. Every file in the directory is written to the corresponding drive image before the VM starts.
+
+```bash
+# Prepare directories with your application config and secrets
+mkdir -p /tmp/my-config /tmp/my-secrets
+
+echo '{"gateway": {"port": 8080}}' > /tmp/my-config/app.json
+echo 'API_KEY=sk-...' > /tmp/my-secrets/app.env
+
+# Run with injected files
+mvmctl run --template my-app \
+    --config-dir /tmp/my-config \
+    --secrets-dir /tmp/my-secrets
+```
+
+Inside the guest:
+- Config files appear at `/mnt/config/` (read-only, mode 0444)
+- Secret files appear at `/mnt/secrets/` (read-only, mode 0400)
+
+The same API is available programmatically via `FlakeRunConfig.config_files` and `FlakeRunConfig.secret_files` for library consumers like [mvmd](https://github.com/auser/mvmd).
 
 ### From an Mvmfile
 
@@ -396,6 +422,8 @@ Then connect with `ssh mvm` from any terminal.
 | `mvmctl build --flake <ref>` | Build from a Nix flake (local or remote) |
 | `mvmctl build --flake <ref> --watch` | Build and rebuild on flake.lock changes |
 | `mvmctl run --flake <ref>` | Build from flake and boot a headless Firecracker VM |
+| `mvmctl run --template <name> --config-dir <path>` | Run with custom config files injected onto the config drive |
+| `mvmctl run --template <name> --secrets-dir <path>` | Run with secret files injected onto the secrets drive |
 
 ### Templates
 
@@ -486,7 +514,8 @@ Host (macOS/Linux)
 **Filesystem access**:
 - Lima VM mounts your home directory (`~`) read/write -- your project files are accessible
 - Firecracker microVM has an isolated filesystem -- no host mounts by default
-- Use `--volume` flags to pass directories to the microVM
+- Use `--volume` flags to pass data directories to the microVM
+- Use `--config-dir` / `--secrets-dir` to inject files onto the config and secrets drives at boot
 
 **Build pipeline**: `mvmctl build` and `mvmctl template build` run `nix build` inside the Linux environment, producing kernel (`vmlinux`) and rootfs (`rootfs.ext4`) artifacts.
 

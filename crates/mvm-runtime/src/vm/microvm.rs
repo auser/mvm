@@ -319,6 +319,27 @@ fn read_state_or_discover() -> Result<MvmState> {
 // Flake-based run: multi-VM with bridge networking
 // ============================================================================
 
+/// A file to inject onto a config or secrets drive before boot.
+#[derive(Debug, Clone)]
+pub struct DriveFile {
+    /// Destination filename inside the drive (e.g., "openclaw.json").
+    pub name: String,
+    /// File contents (inline).
+    pub content: String,
+    /// Unix permissions (octal). Config files: 0o444, secrets: 0o400.
+    pub mode: u32,
+}
+
+impl Default for DriveFile {
+    fn default() -> Self {
+        Self {
+            name: String::new(),
+            content: String::new(),
+            mode: 0o444,
+        }
+    }
+}
+
 /// Configuration for running a Firecracker VM from flake-built artifacts.
 pub struct FlakeRunConfig {
     /// VM name (user-provided or auto-generated).
@@ -343,6 +364,10 @@ pub struct FlakeRunConfig {
     pub memory: u32,
     /// Extra volumes to attach (mounted via config drive, not SSH).
     pub volumes: Vec<RuntimeVolume>,
+    /// Extra files to write onto the config drive.
+    pub config_files: Vec<DriveFile>,
+    /// Extra files to write onto the secrets drive.
+    pub secret_files: Vec<DriveFile>,
 }
 
 /// Boot a Firecracker VM from flake-built artifacts (headless).
@@ -534,6 +559,234 @@ fn show_log_file(log_file: &str, follow: bool, lines: u32) -> Result<()> {
     Ok(())
 }
 
+// ============================================================================
+// VM diagnostics
+// ============================================================================
+
+/// Result of layered VM diagnostics. Each field represents one diagnostic
+/// check that works independently of vsock connectivity.
+#[derive(Debug, serde::Serialize)]
+pub struct DiagnoseResult {
+    pub fc_alive: bool,
+    pub fc_pid: Option<u32>,
+    pub fc_api_responsive: bool,
+    pub fc_machine_config: Option<serde_json::Value>,
+    pub vsock_exists: bool,
+    pub console_warnings: Vec<String>,
+    pub fc_log_errors: Vec<String>,
+    pub agent_reachable: bool,
+    pub agent_error: Option<String>,
+    pub worker_status: Option<String>,
+    pub last_busy_at: Option<String>,
+    pub probe_results: Vec<mvm_guest::probes::ProbeResult>,
+    pub integration_results: Vec<mvm_guest::integrations::IntegrationStateReport>,
+    pub suggestions: Vec<String>,
+}
+
+/// Known-bad patterns in console log output.
+const CONSOLE_WARNING_PATTERNS: &[&str] = &[
+    "Kernel panic",
+    "Out of memory",
+    "Killed process",
+    "BUG:",
+    "Call Trace:",
+    "oom-kill:",
+    "invoked oom-killer",
+];
+
+/// Run layered diagnostics on a named VM.
+///
+/// Checks each layer independently so that useful information is returned
+/// even when vsock is broken (e.g. guest agent crashed, OOM, kernel panic).
+pub fn diagnose_vm(name: &str) -> Result<DiagnoseResult> {
+    require_linux_env()?;
+
+    let abs_vms = run_in_vm_stdout(&format!("echo {}", VMS_DIR))?;
+    let abs_dir = format!("{}/{}", abs_vms, name);
+
+    // Check VM directory exists
+    let dir_exists = run_in_vm_stdout(&format!("[ -d '{}' ] && echo yes || echo no", abs_dir))?;
+    if dir_exists.trim() != "yes" {
+        anyhow::bail!(
+            "VM directory not found: {}. The VM '{}' may not exist.",
+            abs_dir,
+            name
+        );
+    }
+
+    let mut result = DiagnoseResult {
+        fc_alive: false,
+        fc_pid: None,
+        fc_api_responsive: false,
+        fc_machine_config: None,
+        vsock_exists: false,
+        console_warnings: Vec::new(),
+        fc_log_errors: Vec::new(),
+        agent_reachable: false,
+        agent_error: None,
+        worker_status: None,
+        last_busy_at: None,
+        probe_results: Vec::new(),
+        integration_results: Vec::new(),
+        suggestions: Vec::new(),
+    };
+
+    // Layer 1: FC process alive?
+    let pid_check = run_in_vm_stdout(&format!(
+        r#"if [ -f '{dir}/fc.pid' ]; then
+            pid=$(cat '{dir}/fc.pid')
+            if [ -f "/proc/$pid/comm" ] && [ "$(cat /proc/$pid/comm)" = "firecracker" ]; then
+                echo "alive:$pid"
+            else
+                echo "dead:$pid"
+            fi
+        else
+            echo "nopid"
+        fi"#,
+        dir = abs_dir,
+    ))?;
+    let pid_check = pid_check.trim();
+    if let Some(pid_str) = pid_check.strip_prefix("alive:") {
+        result.fc_alive = true;
+        result.fc_pid = pid_str.parse().ok();
+    } else if let Some(pid_str) = pid_check.strip_prefix("dead:") {
+        result.fc_pid = pid_str.parse().ok();
+        result.suggestions.push(format!(
+            "Firecracker process (pid {}) is dead. Run: mvmctl stop {}",
+            pid_str, name,
+        ));
+    } else {
+        result
+            .suggestions
+            .push(format!("No fc.pid file found. Run: mvmctl stop {}", name));
+    }
+
+    // Layer 2: FC API responsive?
+    if result.fc_alive {
+        let api_output = run_in_vm_stdout(&format!(
+            "sudo curl -sf --unix-socket '{dir}/fc.socket' 'http://localhost/machine-config' 2>/dev/null || echo FAIL",
+            dir = abs_dir,
+        ))?;
+        let api_output = api_output.trim();
+        if api_output != "FAIL" {
+            result.fc_api_responsive = true;
+            result.fc_machine_config = serde_json::from_str(api_output).ok();
+        }
+    }
+
+    // Layer 3: Vsock socket exists?
+    let sock_check = run_in_vm_stdout(&format!(
+        "[ -S '{dir}/v.sock' ] && echo yes || echo no",
+        dir = abs_dir,
+    ))?;
+    result.vsock_exists = sock_check.trim() == "yes";
+    if !result.vsock_exists && result.fc_alive {
+        result.suggestions.push(
+            "Vsock socket missing despite FC running — vsock device may not be configured.".into(),
+        );
+    }
+
+    // Layer 4: Console log warnings
+    let console_tail = run_in_vm_stdout(&format!(
+        "tail -n 200 '{dir}/console.log' 2>/dev/null || true",
+        dir = abs_dir,
+    ))?;
+    for line in console_tail.lines() {
+        for pattern in CONSOLE_WARNING_PATTERNS {
+            if line.contains(pattern) {
+                result.console_warnings.push(line.trim().to_string());
+                break;
+            }
+        }
+    }
+    if !result.console_warnings.is_empty() {
+        result.suggestions.push(format!(
+            "Console log contains warnings. Run: mvmctl logs {} -n 200",
+            name,
+        ));
+    }
+
+    // Layer 5: FC log errors
+    let fc_log_tail = run_in_vm_stdout(&format!(
+        "tail -n 100 '{dir}/firecracker.log' 2>/dev/null || true",
+        dir = abs_dir,
+    ))?;
+    for line in fc_log_tail.lines() {
+        if line.contains("ERROR") {
+            result.fc_log_errors.push(line.trim().to_string());
+        }
+    }
+
+    // Layer 6: Guest agent reachable? (short timeout)
+    if result.vsock_exists {
+        let vsock_path = format!("{}/v.sock", abs_dir);
+        match mvm_guest::vsock::ping_at(&vsock_path) {
+            Ok(true) => {
+                result.agent_reachable = true;
+            }
+            Ok(false) => {
+                result.agent_error = Some("Ping returned false".into());
+                result
+                    .suggestions
+                    .push("Guest agent not responding to ping.".into());
+            }
+            Err(e) => {
+                result.agent_error = Some(e.to_string());
+                if !result.fc_alive {
+                    result
+                        .suggestions
+                        .push("Firecracker process is dead — guest agent cannot respond.".into());
+                } else {
+                    result.suggestions.push(
+                        "Guest agent unreachable. Check if mvm-guest-agent service is running inside the guest.".into(),
+                    );
+                }
+            }
+        }
+    }
+
+    // Layer 7: If agent reachable, get detailed status
+    if result.agent_reachable {
+        let vsock_path = format!("{}/v.sock", abs_dir);
+        if let Ok(mvm_guest::vsock::GuestResponse::WorkerStatus {
+            status,
+            last_busy_at,
+        }) = mvm_guest::vsock::query_worker_status_at(&vsock_path)
+        {
+            result.worker_status = Some(status);
+            result.last_busy_at = last_busy_at;
+        }
+        result.integration_results =
+            mvm_guest::vsock::query_integration_status_at(&vsock_path).unwrap_or_default();
+        result.probe_results =
+            mvm_guest::vsock::query_probe_status_at(&vsock_path).unwrap_or_default();
+
+        // Check for failing health checks
+        let failing: Vec<&str> = result
+            .integration_results
+            .iter()
+            .filter(|ig| !ig.health.as_ref().is_some_and(|h| h.healthy))
+            .map(|ig| ig.name.as_str())
+            .chain(
+                result
+                    .probe_results
+                    .iter()
+                    .filter(|p| !p.healthy)
+                    .map(|p| p.name.as_str()),
+            )
+            .collect();
+        if !failing.is_empty() {
+            result.suggestions.push(format!(
+                "Failing health checks: {}. Run: mvmctl vm inspect {}",
+                failing.join(", "),
+                name,
+            ));
+        }
+    }
+
+    Ok(result)
+}
+
 /// List all running VMs by scanning ~/microvm/vms/*/run-info.json.
 pub fn list_vms() -> Result<Vec<RunInfo>> {
     let output = run_in_vm_stdout(&format!(
@@ -592,6 +845,26 @@ pub fn allocate_slot(name: &str) -> Result<VmSlot> {
     anyhow::bail!("No free VM slots available (max 253 VMs)")
 }
 
+/// Generate shell commands to inject `DriveFile`s into a mounted drive.
+///
+/// Each file is written via `sudo tee` with shell-escaped content, then
+/// `chmod`'d to the requested permission mode. The caller must have the
+/// drive mounted at `$MOUNT_DIR` before these commands run.
+fn drive_file_inject_commands(files: &[DriveFile]) -> String {
+    let mut cmds = String::new();
+    for f in files {
+        let escaped = f.content.replace('\'', "'\\''");
+        let mode = format!("{:04o}", f.mode);
+        cmds.push_str(&format!(
+            "echo '{content}' | sudo tee \"$MOUNT_DIR/{name}\" >/dev/null\nsudo chmod {mode} \"$MOUNT_DIR/{name}\"\n",
+            content = escaped,
+            name = f.name,
+            mode = mode,
+        ));
+    }
+    cmds
+}
+
 /// Create a config drive (mvm-config label) with config.json and role-specific toml.
 fn create_dev_config_drive(abs_dir: &str, config: &FlakeRunConfig) -> Result<String> {
     let path = format!("{}/config.ext4", abs_dir);
@@ -613,6 +886,9 @@ fn create_dev_config_drive(abs_dir: &str, config: &FlakeRunConfig) -> Result<Str
     // Dev-mode security policy enables debug_exec for vsock exec support
     let security_policy = r#"{"access":{"debug_exec":true}}"#;
 
+    // Build injection commands for custom config files
+    let extra_cmds = drive_file_inject_commands(&config.config_files);
+
     run_in_vm(&format!(
         r#"
         rm -f {path}
@@ -625,6 +901,7 @@ fn create_dev_config_drive(abs_dir: &str, config: &FlakeRunConfig) -> Result<Str
         echo '{toml}' | sudo tee "$MOUNT_DIR/{toml_name}" >/dev/null
         echo '{security_policy}' | sudo tee "$MOUNT_DIR/security-policy.json" >/dev/null
         sudo chmod 0444 "$MOUNT_DIR/config.json" "$MOUNT_DIR/{toml_name}" "$MOUNT_DIR/security-policy.json"
+        {extra}
         sudo umount "$MOUNT_DIR"
         rmdir "$MOUNT_DIR"
         chmod 0644 {path}
@@ -634,13 +911,17 @@ fn create_dev_config_drive(abs_dir: &str, config: &FlakeRunConfig) -> Result<Str
         toml = escaped_toml,
         toml_name = toml_name,
         security_policy = security_policy,
+        extra = extra_cmds,
     ))?;
     Ok(path)
 }
 
-/// Create a secrets drive (mvm-secrets label) with a stub secrets.json.
-fn create_dev_secrets_drive(abs_dir: &str) -> Result<String> {
+/// Create a secrets drive (mvm-secrets label) with a stub secrets.json plus extra files.
+fn create_dev_secrets_drive(abs_dir: &str, secret_files: &[DriveFile]) -> Result<String> {
     let path = format!("{}/secrets.ext4", abs_dir);
+
+    let extra_cmds = drive_file_inject_commands(secret_files);
+
     run_in_vm(&format!(
         r#"
         rm -f {path}
@@ -651,11 +932,13 @@ fn create_dev_secrets_drive(abs_dir: &str) -> Result<String> {
         sudo mount {path} "$MOUNT_DIR"
         echo '{{}}' | sudo tee "$MOUNT_DIR/secrets.json" >/dev/null
         sudo chmod 0400 "$MOUNT_DIR/secrets.json"
+        {extra}
         sudo umount "$MOUNT_DIR"
         rmdir "$MOUNT_DIR"
         chmod 0600 {path}
         "#,
         path = path,
+        extra = extra_cmds,
     ))?;
     Ok(path)
 }
@@ -740,9 +1023,9 @@ fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str, socket: &str)
         ),
     )?;
 
-    // Create and attach mvm-secrets drive (stub secrets.json)
+    // Create and attach mvm-secrets drive (stub secrets.json + extra secret files)
     ui::info("Creating secrets drive...");
-    let secrets_drive = create_dev_secrets_drive(abs_dir)?;
+    let secrets_drive = create_dev_secrets_drive(abs_dir, &config.secret_files)?;
     api_put_socket(
         socket,
         "/drives/secrets",
@@ -858,4 +1141,151 @@ pub fn read_run_info() -> Option<RunInfo> {
     ))
     .ok()?;
     serde_json::from_str(&json).ok()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drive_file_default() {
+        let f = DriveFile::default();
+        assert!(f.name.is_empty());
+        assert!(f.content.is_empty());
+        assert_eq!(f.mode, 0o444);
+    }
+
+    #[test]
+    fn drive_file_construction() {
+        let f = DriveFile {
+            name: "openclaw.json".into(),
+            content: r#"{"gateway":{"port":18789}}"#.into(),
+            mode: 0o444,
+        };
+        assert_eq!(f.name, "openclaw.json");
+        assert!(f.content.contains("gateway"));
+        assert_eq!(f.mode, 0o444);
+    }
+
+    #[test]
+    fn drive_file_inject_commands_empty() {
+        let cmds = drive_file_inject_commands(&[]);
+        assert!(cmds.is_empty());
+    }
+
+    #[test]
+    fn drive_file_inject_commands_single_file() {
+        let files = vec![DriveFile {
+            name: "test.txt".into(),
+            content: "hello world".into(),
+            mode: 0o444,
+        }];
+        let cmds = drive_file_inject_commands(&files);
+        assert!(cmds.contains("hello world"));
+        assert!(cmds.contains("test.txt"));
+        assert!(cmds.contains("0444"));
+    }
+
+    #[test]
+    fn drive_file_inject_commands_escapes_quotes() {
+        let files = vec![DriveFile {
+            name: "config.json".into(),
+            content: "it's a test".into(),
+            mode: 0o400,
+        }];
+        let cmds = drive_file_inject_commands(&files);
+        // Single quotes in content should be escaped for shell safety
+        assert!(cmds.contains(r"'\''"));
+        assert!(cmds.contains("0400"));
+    }
+
+    #[test]
+    fn drive_file_inject_commands_multiple_files() {
+        let files = vec![
+            DriveFile {
+                name: "a.txt".into(),
+                content: "aaa".into(),
+                mode: 0o444,
+            },
+            DriveFile {
+                name: "b.env".into(),
+                content: "KEY=val".into(),
+                mode: 0o400,
+            },
+        ];
+        let cmds = drive_file_inject_commands(&files);
+        assert!(cmds.contains("a.txt"));
+        assert!(cmds.contains("b.env"));
+        assert!(cmds.contains("KEY=val"));
+    }
+
+    #[test]
+    fn console_warning_patterns_detect_kernel_panic() {
+        let lines = "Booting Linux\nKernel panic - not syncing: VFS\ndone";
+        let mut warnings = Vec::new();
+        for line in lines.lines() {
+            for pattern in CONSOLE_WARNING_PATTERNS {
+                if line.contains(pattern) {
+                    warnings.push(line.to_string());
+                    break;
+                }
+            }
+        }
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Kernel panic"));
+    }
+
+    #[test]
+    fn console_warning_patterns_detect_oom() {
+        let lines = "init done\nOut of memory: Killed process 123\nnormal line";
+        let mut warnings = Vec::new();
+        for line in lines.lines() {
+            for pattern in CONSOLE_WARNING_PATTERNS {
+                if line.contains(pattern) {
+                    warnings.push(line.to_string());
+                    break;
+                }
+            }
+        }
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains("Out of memory"));
+    }
+
+    #[test]
+    fn console_warning_patterns_skip_clean_log() {
+        let lines = "Booting Linux\nStarting services\nAll services ready";
+        let mut warnings = Vec::new();
+        for line in lines.lines() {
+            for pattern in CONSOLE_WARNING_PATTERNS {
+                if line.contains(pattern) {
+                    warnings.push(line.to_string());
+                    break;
+                }
+            }
+        }
+        assert!(warnings.is_empty());
+    }
+
+    #[test]
+    fn diagnose_result_serializes_to_json() {
+        let result = DiagnoseResult {
+            fc_alive: true,
+            fc_pid: Some(12345),
+            fc_api_responsive: true,
+            fc_machine_config: Some(serde_json::json!({"vcpu_count": 2})),
+            vsock_exists: true,
+            console_warnings: vec![],
+            fc_log_errors: vec![],
+            agent_reachable: true,
+            agent_error: None,
+            worker_status: Some("idle".into()),
+            last_busy_at: None,
+            probe_results: vec![],
+            integration_results: vec![],
+            suggestions: vec![],
+        };
+        let json = serde_json::to_string(&result).unwrap();
+        assert!(json.contains("\"fc_alive\":true"));
+        assert!(json.contains("\"fc_pid\":12345"));
+    }
 }

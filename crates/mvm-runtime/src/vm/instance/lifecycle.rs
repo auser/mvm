@@ -227,7 +227,7 @@ pub fn instance_start(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resu
     };
 
     let secrets_path = tenant_secrets_path(tenant_id);
-    let secrets_disk_path = disk::create_secrets_disk(&inst_dir, &secrets_path)?;
+    let secrets_disk_path = disk::create_secrets_disk(&inst_dir, &secrets_path, &[])?;
 
     // Create config drive with instance/pool metadata
     let config_meta = serde_json::json!({
@@ -239,7 +239,7 @@ pub fn instance_start(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resu
         "mem_mib": spec.instance_resources.mem_mib,
         "min_runtime_policy": spec.runtime_policy,
     });
-    let config_disk_path = disk::create_config_disk(&inst_dir, &config_meta.to_string())?;
+    let config_disk_path = disk::create_config_disk(&inst_dir, &config_meta.to_string(), &[])?;
 
     let vsock_path = format!("{}/runtime/v.sock", inst_dir);
 
@@ -558,7 +558,7 @@ pub fn instance_wake(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resul
     // Create fresh secrets disk and config drive
     let inst_dir = instance_dir(tenant_id, pool_id, instance_id);
     let secrets_path = tenant_secrets_path(tenant_id);
-    let _ = disk::create_secrets_disk(&inst_dir, &secrets_path)?;
+    let _ = disk::create_secrets_disk(&inst_dir, &secrets_path, &[])?;
 
     let config_meta = serde_json::json!({
         "instance_id": instance_id,
@@ -569,7 +569,7 @@ pub fn instance_wake(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resul
         "mem_mib": spec.instance_resources.mem_mib,
         "min_runtime_policy": spec.runtime_policy,
     });
-    let _ = disk::create_config_disk(&inst_dir, &config_meta.to_string())?;
+    let _ = disk::create_config_disk(&inst_dir, &config_meta.to_string(), &[])?;
 
     let runtime_dir = format!("{}/runtime", inst_dir);
     let socket_path = format!("{}/firecracker.socket", runtime_dir);

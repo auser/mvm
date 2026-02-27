@@ -51,6 +51,7 @@ fn test_help_lists_all_subcommands() {
         "ssh",
         "shell",
         "sync",
+        "cleanup",
         "status",
         "destroy",
         "upgrade",
@@ -160,6 +161,27 @@ fn test_sync_help() {
         .stdout(predicate::str::contains("--skip-deps"))
         .stdout(predicate::str::contains("--force"))
         .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn test_cleanup_listed_in_help() {
+    mvm()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("cleanup"));
+}
+
+#[test]
+fn test_cleanup_help() {
+    mvm()
+        .args(["cleanup", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--keep"))
+        .stdout(predicate::str::contains("--all"))
+        .stdout(predicate::str::contains("--verbose"))
+        .stdout(predicate::str::contains("dev-build"));
 }
 
 #[test]
@@ -489,6 +511,41 @@ fn test_vm_inspect_nonexistent_fails_gracefully() {
             || combined.contains("Error")
             || combined.contains("limactl"),
         "vm inspect should fail gracefully, got: {}",
+        combined
+    );
+}
+
+// ---------------------------------------------------------------------------
+// VM diagnose
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_vm_diagnose_help() {
+    mvm()
+        .args(["vm", "diagnose", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--json"))
+        .stdout(predicate::str::contains("diagnostics"));
+}
+
+#[test]
+fn test_vm_diagnose_nonexistent_fails_gracefully() {
+    let assert = mvm().args(["vm", "diagnose", "nonexistent-vm"]).assert();
+    let output = assert.get_output();
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    assert!(
+        combined.contains("nonexistent-vm")
+            || combined.contains("not found")
+            || combined.contains("No running")
+            || combined.contains("error")
+            || combined.contains("Error")
+            || combined.contains("limactl"),
+        "vm diagnose should fail gracefully, got: {}",
         combined
     );
 }
