@@ -41,3 +41,7 @@ No task is complete without tests. Every feature, bug fix, or refactor must incl
 - New CLI flags/commands: integration tests in `tests/cli.rs` verifying help text and argument parsing.
 - Security code: positive path (valid data accepted), negative path (tampered/invalid data rejected), and edge cases (replay, wrong key, expired session).
 - If a function can fail, test that it fails correctly (returns `Err`, not panic).
+
+## Screenshots
+
+**NEVER** save screenshots to the project root or any directory within the repository. Always save screenshots to `/tmp/` (e.g. `/tmp/screenshot.png`). This prevents binary files from polluting the git history.

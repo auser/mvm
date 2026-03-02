@@ -3,8 +3,8 @@ import { Button } from "../ui/button";
 export function CTABanner() {
   const base = import.meta.env.BASE_URL;
   return (
-    <section className="px-6 py-28 sm:px-8">
-      <div className="mx-auto flex max-w-2xl flex-col items-center gap-8 text-center">
+    <section className="w-full px-6 py-28 sm:px-8 lg:py-36">
+      <div className="mx-auto flex max-w-2xl flex-col items-center gap-10 text-center">
         <h2 className="text-2xl font-semibold text-heading sm:text-3xl">
           Ready to build your first microVM?
         </h2>

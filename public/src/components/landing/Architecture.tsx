@@ -7,12 +7,12 @@ export function Architecture() {
   ];
 
   return (
-    <section className="px-6 py-24 sm:px-8">
-      <div className="mx-auto max-w-4xl">
-        <h2 className="mb-12 text-center text-2xl font-semibold text-heading sm:text-3xl">
+    <section className="w-full px-6 py-28 sm:px-8 lg:py-36">
+      <div className="mx-auto max-w-5xl">
+        <h2 className="mb-14 text-center text-2xl font-semibold text-heading sm:text-3xl lg:mb-16">
           Architecture
         </h2>
-        <div className="overflow-x-auto rounded-xl border border-border bg-surface p-8 font-mono text-sm sm:p-10">
+        <div className="overflow-x-auto rounded-xl border border-border bg-surface p-8 font-mono text-sm shadow-lg shadow-black/10 sm:p-12 lg:p-14">
           {/* Stack layers */}
           <div className="flex flex-col items-center gap-4">
             <div className="flex flex-wrap items-center justify-center gap-4">

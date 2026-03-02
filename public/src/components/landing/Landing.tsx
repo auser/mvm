@@ -6,7 +6,7 @@ import { CTABanner } from "./CTABanner";
 
 export function Landing() {
   return (
-    <div className="min-h-screen bg-page">
+    <div className="min-h-screen w-full bg-page">
       <Hero />
       <Features />
       <Architecture />

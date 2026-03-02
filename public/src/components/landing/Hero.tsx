@@ -14,7 +14,7 @@ export function Hero() {
   }
 
   return (
-    <section className="mx-auto flex max-w-4xl flex-col items-center gap-10 px-6 py-28 text-center sm:px-8 lg:py-36">
+    <section className="mx-auto flex max-w-5xl flex-col items-center gap-12 px-6 pt-32 pb-28 text-center sm:px-8 lg:pt-44 lg:pb-36">
       <div className="flex flex-wrap justify-center gap-3">
         <Badge>
           <span className="inline-block h-2 w-2 rounded-full bg-rust" />
@@ -41,7 +41,7 @@ export function Hero() {
       </p>
 
       <div
-        className="flex w-full max-w-xl cursor-pointer items-center gap-3 rounded-lg border border-border bg-surface px-5 py-3.5"
+        className="flex w-full max-w-xl cursor-pointer items-center gap-3 rounded-lg border border-border/60 bg-surface px-6 py-4 ring-1 ring-accent/10 transition-all hover:border-accent/30 hover:ring-accent/20"
         onClick={copyInstall}
         title="Click to copy"
       >

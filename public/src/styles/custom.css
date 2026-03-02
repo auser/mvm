@@ -1,3 +1,6 @@
+/* Load JetBrains Mono for crisp monospace rendering */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+
 /* Force dark mode globally — override Starlight's default palette */
 :root {
   --sl-color-accent-low: #0c2d6b;
@@ -19,8 +22,8 @@
   --sl-color-gray-5: #484f58;
   --sl-color-gray-6: #30363d;
   --sl-color-black: #0d1117;
-  --sl-font-system-mono: "SF Mono", "Cascadia Code", "Fira Code",
-    "JetBrains Mono", Consolas, monospace;
+  --sl-font-system-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", "Fira Code",
+    Consolas, monospace;
   color-scheme: dark;
 }
 
@@ -156,7 +159,14 @@ nav[aria-label="Main"] [role="group"] > :first-child {
   display: none;
 }
 
-/* Center the landing page content sections (Tailwind mx-auto fallback) */
+/* Center landing page content containers
+   Tailwind's @layer utilities has lower precedence than Starlight's layers,
+   so mx-auto gets overridden. Unlayered CSS fixes this. */
 [data-has-hero] main section {
   margin-inline: auto;
 }
+
+[data-has-hero] main section > div {
+  margin-inline: auto;
+}
+

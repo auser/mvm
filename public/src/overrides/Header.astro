@@ -3,8 +3,6 @@
 // On the splash page, render a clean landing-page header.
 // On all other pages, render the default Starlight Header.
 import Default from "@astrojs/starlight/components/Header.astro";
-import logoDark from "../assets/logo-dark.svg";
-import logoLight from "../assets/logo-light.svg";
 
 const route = Astro.locals.starlightRoute;
 const isSplash = route?.entry?.data?.template === "splash";
@@ -22,8 +20,7 @@ const navLinks = [
   <header class="landing-header">
     <div class="landing-header-inner">
       <a href={`${base}/`} class="landing-logo">
-        <img class="light:sl-hidden" src={logoDark.src} alt="mvm" width="88" height="24" />
-        <img class="dark:sl-hidden" src={logoLight.src} alt="mvm" width="88" height="24" />
+        <span class="landing-logo-text">mvm</span>
       </a>
       <nav class="landing-nav">
         {navLinks.map(link => (
@@ -60,7 +57,7 @@ const navLinks = [
     justify-content: space-between;
     max-width: 72rem;
     margin: 0 auto;
-    padding: 0.75rem 1.5rem;
+    padding: 1rem 1.5rem;
   }
 
   .landing-logo {
@@ -70,9 +67,16 @@ const navLinks = [
     flex-shrink: 0;
   }
 
-  .landing-logo img {
-    height: 24px;
-    width: auto;
+  .landing-logo-text {
+    font-family: "JetBrains Mono", "SF Mono", "Cascadia Code", "Fira Code", Consolas, monospace;
+    font-size: 1.5rem;
+    font-weight: 700;
+    letter-spacing: -0.02em;
+    line-height: 1;
+    background: linear-gradient(135deg, #58a6ff 0%, #79c0ff 100%);
+    -webkit-background-clip: text;
+    -webkit-text-fill-color: transparent;
+    background-clip: text;
   }
 
   .landing-nav {

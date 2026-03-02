@@ -1,4 +1,5 @@
 import { Tabs, TabsList, TabsTrigger, TabsContent } from "../ui/tabs";
+import { CodeBlock } from "../ui/code-block";
 
 const quickStart = `# Bootstrap everything
 mvmctl dev
@@ -55,9 +56,9 @@ mvmctl template warm my-service
 
 export function CodeExample() {
   return (
-    <section className="px-6 py-24 sm:px-8">
-      <div className="mx-auto max-w-4xl">
-        <h2 className="mb-12 text-center text-2xl font-semibold text-heading sm:text-3xl">
+    <section className="w-full border-y border-border/50 bg-surface px-6 py-28 sm:px-8 lg:py-36">
+      <div className="mx-auto max-w-5xl">
+        <h2 className="mb-14 text-center text-2xl font-semibold text-heading sm:text-3xl lg:mb-16">
           Get Running in Minutes
         </h2>
         <Tabs defaultValue="quickstart">
@@ -67,19 +68,13 @@ export function CodeExample() {
             <TabsTrigger value="template">Templates</TabsTrigger>
           </TabsList>
           <TabsContent value="quickstart">
-            <pre className="overflow-x-auto rounded-xl border border-border bg-page p-6 font-mono text-sm leading-relaxed text-heading sm:p-8">
-              <code>{quickStart}</code>
-            </pre>
+            <CodeBlock language="bash" code={quickStart} />
           </TabsContent>
           <TabsContent value="flake">
-            <pre className="overflow-x-auto rounded-xl border border-border bg-page p-6 font-mono text-sm leading-relaxed text-heading sm:p-8">
-              <code>{nixFlake}</code>
-            </pre>
+            <CodeBlock language="nix" code={nixFlake} />
           </TabsContent>
           <TabsContent value="template">
-            <pre className="overflow-x-auto rounded-xl border border-border bg-page p-6 font-mono text-sm leading-relaxed text-heading sm:p-8">
-              <code>{template}</code>
-            </pre>
+            <CodeBlock language="bash" code={template} />
           </TabsContent>
         </Tabs>
       </div>
