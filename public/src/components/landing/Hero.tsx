@@ -3,6 +3,7 @@ import { Badge } from "../ui/badge";
 import { Button } from "../ui/button";
 
 export function Hero() {
+  const base = import.meta.env.BASE_URL;
   const [copied, setCopied] = useState(false);
   const installCmd = "curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh";
 
@@ -53,7 +54,7 @@ export function Hero() {
       </div>
 
       <div className="flex flex-wrap justify-center gap-4">
-        <a href="/getting-started/installation/">
+        <a href={`${base}/getting-started/installation/`}>
           <Button size="lg">Get Started</Button>
         </a>
         <a href="https://github.com/auser/mvm" target="_blank" rel="noopener">

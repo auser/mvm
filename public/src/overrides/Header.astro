@@ -9,18 +9,19 @@ import logoLight from "../assets/logo-light.svg";
 const route = Astro.locals.starlightRoute;
 const isSplash = route?.entry?.data?.template === "splash";
 
+const base = import.meta.env.BASE_URL;
 const navLinks = [
-  { label: "Docs", href: "/getting-started/installation/" },
-  { label: "Quick Start", href: "/getting-started/quickstart/" },
-  { label: "Guides", href: "/guides/nix-flakes/" },
-  { label: "Reference", href: "/reference/cli-commands/" },
+  { label: "Docs", href: `${base}/getting-started/installation/` },
+  { label: "Quick Start", href: `${base}/getting-started/quickstart/` },
+  { label: "Guides", href: `${base}/guides/nix-flakes/` },
+  { label: "Reference", href: `${base}/reference/cli-commands/` },
 ];
 ---
 
 {isSplash ? (
   <header class="landing-header">
     <div class="landing-header-inner">
-      <a href="/" class="landing-logo">
+      <a href={`${base}/`} class="landing-logo">
         <img class="light:sl-hidden" src={logoDark.src} alt="mvm" width="88" height="24" />
         <img class="dark:sl-hidden" src={logoLight.src} alt="mvm" width="88" height="24" />
       </a>

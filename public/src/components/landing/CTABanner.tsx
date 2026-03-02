@@ -1,6 +1,7 @@
 import { Button } from "../ui/button";
 
 export function CTABanner() {
+  const base = import.meta.env.BASE_URL;
   return (
     <section className="px-6 py-28 sm:px-8">
       <div className="mx-auto flex max-w-2xl flex-col items-center gap-8 text-center">
@@ -12,7 +13,7 @@ export function CTABanner() {
           template management — so you can focus on your workload.
         </p>
         <div className="flex flex-wrap justify-center gap-4">
-          <a href="/getting-started/quickstart/">
+          <a href={`${base}/getting-started/quickstart/`}>
             <Button size="lg">Quick Start Guide</Button>
           </a>
           <a href="https://github.com/auser/mvm" target="_blank" rel="noopener">
