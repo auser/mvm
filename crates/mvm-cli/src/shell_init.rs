@@ -183,8 +183,8 @@ mod tests {
     #[test]
     fn test_generate_block_contains_aliases() {
         let block = generate_block("/work/kv");
-        assert!(block.contains("alias cr="));
-        assert!(block.contains("alias crd="));
+        assert!(block.contains("alias mvmctl="));
+        assert!(block.contains("alias mvmd="));
         assert!(block.contains(r#"KV_ROOT="/work/kv""#));
         assert!(block.contains("$KV_ROOT/mvm/Cargo.toml"));
         assert!(block.contains("$KV_ROOT/mvmd/Cargo.toml"));
