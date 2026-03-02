@@ -20,28 +20,34 @@
         let pkgs = import nixpkgs { inherit system; };
         in pkgs.callPackage ./pkgs/openclaw.nix {};
 
+      # Replace @var@ placeholders in a script file and make it executable.
+      replaceVarsScript = pkgs: name: src: vars:
+        pkgs.writeShellScript name (
+          builtins.replaceStrings
+            (map (k: "@${k}@") (builtins.attrNames vars))
+            (map toString (builtins.attrValues vars))
+            (builtins.readFile src)
+        );
+
       # Build a guest image for a given OpenClaw role.
       #
       # Uses mkGuest (busybox init, no systemd) for fast boot and small
       # images.  Shell scripts live in ./scripts/ and get variable
-      # substitution via pkgs.substituteAll at build time.
+      # substitution via replaceVarsScript at build time.
       mkRole = system: { role, tmpfsSizeMib ? 1024 }:
         let
           pkgs = import nixpkgs { inherit system; };
           openclaw = openclawFor system;
           serviceName = "openclaw-${role}";
 
-          setupScript = pkgs.substituteAll {
-            src = ./scripts/setup.sh;
-            isExecutable = true;
-            socat = "${pkgs.socat}";
+          setupScript = replaceVarsScript pkgs "openclaw-setup" ./scripts/setup.sh {
+            socat = pkgs.socat;
             tmpfsSize = toString tmpfsSizeMib;
+            inherit openclaw;
           };
 
-          commandScript = pkgs.substituteAll {
-            src = ./scripts/start.sh;
-            isExecutable = true;
-            openclaw = "${openclaw}";
+          commandScript = replaceVarsScript pkgs "${serviceName}-start" ./scripts/start.sh {
+            openclaw = openclaw;
             inherit role;
           };
         in
@@ -61,7 +67,8 @@
           };
 
           healthChecks.${serviceName} = {
-            healthCmd = "nc -z 127.0.0.1 3000";
+            # Use busybox wget instead of nc -z (busybox nc may lack -z flag).
+            healthCmd = "wget -q -O /dev/null http://127.0.0.1:3000/ 2>/dev/null";
             healthIntervalSecs = 10;
             healthTimeoutSecs = 5;
           };

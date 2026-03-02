@@ -183,6 +183,7 @@ fn template_revision_json(profile: &str, role: &str) -> String {
         vcpus: 2,
         mem_mib: 1024,
         data_disk_mib: 0,
+        snapshot: None,
     };
     serde_json::to_string(&rev).unwrap()
 }

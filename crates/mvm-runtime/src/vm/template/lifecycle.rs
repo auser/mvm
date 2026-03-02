@@ -1,10 +1,16 @@
+use std::time::{Duration, Instant};
+
 use anyhow::{Context, Result, anyhow};
-use mvm_core::template::{TemplateSpec, template_dir, template_spec_path};
+use mvm_core::template::{
+    SnapshotInfo, TemplateSpec, template_dir, template_revision_dir, template_snapshot_dir,
+    template_spec_path,
+};
 
 use crate::build_env::RuntimeBuildEnv;
 use crate::shell;
+use crate::ui;
 use mvm_core::pool::ArtifactPaths;
-use mvm_core::template::{TemplateRevision, template_current_symlink, template_revision_dir};
+use mvm_core::template::{TemplateRevision, template_current_symlink};
 use mvm_core::time::utc_now;
 
 use super::registry::TemplateRegistry;
@@ -213,6 +219,7 @@ pub fn template_build(id: &str, force: bool) -> Result<()> {
         vcpus: spec.vcpus,
         mem_mib: spec.mem_mib,
         data_disk_mib: spec.data_disk_mib,
+        snapshot: None,
     };
     let rev_json = serde_json::to_string_pretty(&revision)?;
     let rev_meta_path = format!("{rev_dst}/revision.json");
@@ -226,6 +233,254 @@ pub fn template_build(id: &str, force: bool) -> Result<()> {
         &rev[..rev.len().min(12)]
     ));
     Ok(())
+}
+
+/// Check if the current revision of a template has a snapshot.
+pub fn template_has_snapshot(id: &str) -> Result<bool> {
+    let rev = current_revision_id(id)?;
+    let snap_dir = template_snapshot_dir(id, &rev);
+    let out = shell::run_in_vm_stdout(&format!(
+        "test -f {dir}/vmstate.bin && test -f {dir}/mem.bin && echo yes || echo no",
+        dir = snap_dir,
+    ))?;
+    Ok(out.trim() == "yes")
+}
+
+/// Load the snapshot metadata for a template revision.
+pub fn template_snapshot_info(id: &str) -> Result<Option<SnapshotInfo>> {
+    let rev = current_revision_id(id)?;
+    let rev_dir = template_revision_dir(id, &rev);
+    let meta_path = format!("{}/revision.json", rev_dir);
+    let data = vm_exec_stdout(&format!("cat {}", meta_path))?;
+    let revision: TemplateRevision = serde_json::from_str(&data)
+        .with_context(|| format!("Corrupt revision.json for template {}", id))?;
+    Ok(revision.snapshot)
+}
+
+/// Poll the guest agent via vsock until it responds, or timeout.
+pub fn wait_for_healthy(vsock_uds_path: &str, timeout_secs: u64, interval_ms: u64) -> Result<()> {
+    let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+    let mut attempts = 0u32;
+    loop {
+        if mvm_guest::vsock::ping_at(vsock_uds_path).unwrap_or(false) {
+            ui::success(&format!(
+                "Guest agent healthy after {} attempts",
+                attempts + 1
+            ));
+            return Ok(());
+        }
+        attempts += 1;
+        if attempts.is_multiple_of(10) {
+            ui::info(&format!(
+                "Waiting for guest agent... ({} attempts, {}s remaining)",
+                attempts,
+                deadline.saturating_duration_since(Instant::now()).as_secs()
+            ));
+        }
+        if Instant::now() >= deadline {
+            anyhow::bail!(
+                "VM did not become healthy within {}s ({} attempts)",
+                timeout_secs,
+                attempts
+            );
+        }
+        std::thread::sleep(Duration::from_millis(interval_ms));
+    }
+}
+
+/// Build a template and then create a Firecracker snapshot for instant starts.
+///
+/// 1. Runs `template_build()` to produce artifacts
+/// 2. Boots a temporary Firecracker VM from those artifacts
+/// 3. Waits for the guest agent to become healthy (vsock ping)
+/// 4. Pauses vCPUs and creates a full snapshot
+/// 5. Stores snapshot files in the template revision directory
+/// 6. Cleans up the temporary VM
+pub fn template_build_with_snapshot(id: &str, force: bool) -> Result<()> {
+    use crate::config::BRIDGE_IP;
+    use crate::vm::{microvm, network};
+
+    // Step 1: Build artifacts (reuses existing template_build)
+    template_build(id, force)?;
+
+    let spec = template_load(id)?;
+    let rev = current_revision_id(id)?;
+    let rev_dir = template_revision_dir(id, &rev);
+    let snap_dir = template_snapshot_dir(id, &rev);
+
+    ui::info("Creating snapshot: booting temporary VM...");
+
+    // Allocate a temporary network slot for the snapshot build
+    let snapshot_vm_name = format!("__snapshot-{}", id);
+    let slot = microvm::allocate_slot(&snapshot_vm_name)?;
+    let abs_dir = microvm::resolve_vm_dir(&slot)?;
+    let abs_socket = format!("{}/fc.socket", abs_dir);
+
+    // Build boot args matching what run_from_build would use (minimal guest)
+    let boot_args = format!(
+        "root=/dev/vda rw rootwait init=/init console=ttyS0 reboot=k panic=1 net.ifnames=0 mvm.ip={ip}/24 mvm.gw={gw}",
+        ip = slot.guest_ip,
+        gw = BRIDGE_IP,
+    );
+
+    // Build a FlakeRunConfig for the temporary VM
+    let run_config = microvm::FlakeRunConfig {
+        name: snapshot_vm_name.clone(),
+        slot: slot.clone(),
+        vmlinux_path: format!("{}/vmlinux", rev_dir),
+        initrd_path: None,
+        rootfs_path: format!("{}/rootfs.ext4", rev_dir),
+        revision_hash: rev.clone(),
+        flake_ref: spec.flake_ref.clone(),
+        profile: Some(spec.profile.clone()),
+        cpus: spec.vcpus as u32,
+        memory: spec.mem_mib,
+        volumes: vec![],
+        config_files: vec![],
+        secret_files: vec![],
+        ports: vec![],
+    };
+
+    // Ensure bridge + TAP
+    network::bridge_ensure()?;
+    network::tap_create(&slot)?;
+
+    // Start Firecracker
+    let start_result = microvm::start_vm_firecracker(&abs_dir, &abs_socket);
+    if let Err(e) = start_result {
+        let _ = network::tap_destroy(&slot);
+        return Err(e.context("Failed to start snapshot VM"));
+    }
+
+    // Configure and boot
+    if let Err(e) = microvm::configure_flake_microvm(&run_config, &abs_dir, &abs_socket) {
+        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
+        return Err(e.context("Failed to configure snapshot VM"));
+    }
+
+    ui::info("Booting snapshot VM...");
+    std::thread::sleep(Duration::from_millis(15));
+    if let Err(e) = microvm::api_put_socket(
+        &abs_socket,
+        "/actions",
+        r#"{"action_type": "InstanceStart"}"#,
+    ) {
+        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
+        return Err(e.context("Failed to boot snapshot VM"));
+    }
+
+    // Make vsock accessible
+    let _ = shell::run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir));
+
+    // Wait for guest agent to become healthy
+    let vsock_path = format!("{}/v.sock", abs_dir);
+    ui::info("Waiting for guest agent to become healthy...");
+    let health_result = wait_for_healthy(&vsock_path, 120, 2000);
+
+    if let Err(e) = health_result {
+        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
+        return Err(e.context("Snapshot VM did not become healthy"));
+    }
+
+    // Pause vCPUs
+    ui::info("Pausing VM for snapshot...");
+    let pause_result = microvm::api_patch_socket(&abs_socket, "/vm", r#"{"state": "Paused"}"#);
+    if let Err(e) = pause_result {
+        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
+        return Err(e.context("Failed to pause VM for snapshot"));
+    }
+
+    // Create snapshot directory in template
+    shell::run_in_vm(&format!("mkdir -p {}", snap_dir))?;
+
+    // Create snapshot via Firecracker API
+    ui::info("Creating Firecracker snapshot...");
+    let snapshot_result = shell::run_in_vm(&format!(
+        r#"sudo curl -s --unix-socket {socket} -X PUT \
+            -H 'Content-Type: application/json' \
+            -d '{{"snapshot_type": "Full", "snapshot_path": "{snap}/vmstate.bin", "mem_file_path": "{snap}/mem.bin"}}' \
+            'http://localhost/snapshot/create'"#,
+        socket = abs_socket,
+        snap = snap_dir,
+    ));
+
+    if let Err(e) = snapshot_result {
+        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
+        return Err(e.context("Failed to create Firecracker snapshot"));
+    }
+
+    // Get snapshot file sizes
+    let vmstate_size: u64 = shell::run_in_vm_stdout(&format!(
+        "stat -c%s {}/vmstate.bin 2>/dev/null || echo 0",
+        snap_dir
+    ))?
+    .trim()
+    .parse()
+    .unwrap_or(0);
+    let mem_size: u64 = shell::run_in_vm_stdout(&format!(
+        "stat -c%s {}/mem.bin 2>/dev/null || echo 0",
+        snap_dir
+    ))?
+    .trim()
+    .parse()
+    .unwrap_or(0);
+
+    // Update revision.json with snapshot metadata
+    let snapshot_info = SnapshotInfo {
+        created_at: utc_now(),
+        vmstate_size_bytes: vmstate_size,
+        mem_size_bytes: mem_size,
+        boot_args: boot_args.clone(),
+        vcpus: spec.vcpus,
+        mem_mib: spec.mem_mib,
+    };
+
+    let rev_meta_path = format!("{}/revision.json", rev_dir);
+    let rev_data = vm_exec_stdout(&format!("cat {}", rev_meta_path))?;
+    let mut revision: TemplateRevision = serde_json::from_str(&rev_data)
+        .with_context(|| "Failed to parse revision.json for snapshot update")?;
+    revision.snapshot = Some(snapshot_info);
+
+    let updated_json = serde_json::to_string_pretty(&revision)?;
+    shell::run_in_vm(&format!(
+        "cat > {} << 'MVMEOF'\n{}\nMVMEOF",
+        rev_meta_path, updated_json
+    ))?;
+
+    // Clean up temporary VM
+    cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
+
+    let total_mb = (vmstate_size + mem_size) / (1024 * 1024);
+    ui::success(&format!(
+        "Snapshot created for template '{}' ({}MB total)",
+        id, total_mb
+    ));
+    ui::info("Use 'mvmctl run --template' for instant starts from this snapshot.");
+
+    Ok(())
+}
+
+/// Clean up a temporary snapshot VM (best-effort).
+fn cleanup_snapshot_vm(abs_dir: &str, abs_socket: &str, slot: &crate::config::VmSlot) {
+    use crate::vm::network;
+
+    // Kill Firecracker process
+    let _ = shell::run_in_vm(&format!(
+        r#"
+        if [ -f {dir}/fc.pid ]; then
+            sudo kill $(cat {dir}/fc.pid) 2>/dev/null || true
+        fi
+        sudo rm -f {socket}
+        "#,
+        dir = abs_dir,
+        socket = abs_socket,
+    ));
+
+    // Destroy TAP
+    let _ = network::tap_destroy(slot);
+
+    // Remove temp VM directory
+    let _ = shell::run_in_vm(&format!("rm -rf {}", abs_dir));
 }
 
 #[derive(Debug, serde::Serialize, serde::Deserialize)]

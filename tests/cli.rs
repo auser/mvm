@@ -289,6 +289,7 @@ fn test_template_build_help_shows_force() {
         .assert()
         .success()
         .stdout(predicate::str::contains("--force"))
+        .stdout(predicate::str::contains("--snapshot"))
         .stdout(predicate::str::contains("--config"));
 }
 

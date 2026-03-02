@@ -151,7 +151,7 @@ pub fn delete(name: &str, force: bool) -> Result<()> {
     tmpl::template_delete(name, force)
 }
 
-pub fn build(name: &str, force: bool, config: Option<&str>) -> Result<()> {
+pub fn build(name: &str, force: bool, snapshot: bool, config: Option<&str>) -> Result<()> {
     if let Some(cfg_path) = config {
         let cfg = load_config(cfg_path)?;
         for variant in &cfg.variants {
@@ -183,9 +183,15 @@ pub fn build(name: &str, force: bool, config: Option<&str>) -> Result<()> {
                 updated_at: ts,
             };
             tmpl::template_create(&spec)?;
-            tmpl::template_build(&template_name, force)?;
+            if snapshot {
+                tmpl::template_build_with_snapshot(&template_name, force)?;
+            } else {
+                tmpl::template_build(&template_name, force)?;
+            }
         }
         Ok(())
+    } else if snapshot {
+        tmpl::template_build_with_snapshot(name, force)
     } else {
         tmpl::template_build(name, force)
     }

@@ -5,6 +5,11 @@
 # /opt/openclaw.  This derivation copies those files, creates a Node.js
 # wrapper, and strips build-time artifacts to shrink the rootfs closure.
 #
+# NOTE: We do NOT use esbuild to re-bundle the Vite output. OpenClaw's
+# build produces ~784 code-split chunks with circular inter-chunk imports
+# that esbuild cannot resolve. Instead, setup.sh pre-warms the Linux page
+# cache at boot so all chunks are served from RAM, not slow virtio-block.
+#
 # Requires --impure (added automatically by dev_build when pre-build.sh exists).
 
 { lib
@@ -29,9 +34,6 @@ stdenv.mkDerivation {
 
   nativeBuildInputs = [ nodejs_22 makeWrapper ];
 
-  # No build step — the installer provides pre-built files.
-  dontBuild = true;
-
   installPhase = ''
     runHook preInstall
 
@@ -54,11 +56,11 @@ stdenv.mkDerivation {
         -name 'Makefile' -o -name 'CMakeLists.txt' \
       \) -delete 2>/dev/null || true
 
-      # Remove TypeScript source and declaration files.
-      find $out/lib/openclaw/node_modules -name '*.ts' ! -name '*.d.ts' -delete 2>/dev/null || true
-      find $out/lib/openclaw/node_modules -name '*.d.ts' -delete 2>/dev/null || true
+      # Remove source maps (large, debug-only).
       find $out/lib/openclaw/node_modules -name '*.ts.map' -delete 2>/dev/null || true
       find $out/lib/openclaw/node_modules -name '*.js.map' -delete 2>/dev/null || true
+      # NOTE: Do NOT delete .ts files — some packages and extensions ship
+      # TypeScript that gets transpiled at runtime by jiti/tsx.
 
       # Remove documentation, examples, tests.
       find $out/lib/openclaw/node_modules -type d \( \
@@ -85,11 +87,15 @@ stdenv.mkDerivation {
       patchShebangs $out/lib/openclaw/node_modules/.bin/ 2>/dev/null || true
     fi
 
-    # Choose entry point (the npm package may have dist/entry.js or openclaw.mjs).
+    # ── Entry point wrapper ──────────────────────────────────────────
+    # Find the Vite-built entry point and create a Node.js wrapper.
+    # We run the Vite output directly (no re-bundling) — the setup.sh
+    # script pre-warms the page cache at boot for fast module loading.
+    ENTRY_SRC=""
     if [ -f $out/lib/openclaw/dist/entry.js ]; then
-      ENTRY="$out/lib/openclaw/dist/entry.js"
+      ENTRY_SRC="$out/lib/openclaw/dist/entry.js"
     elif [ -f $out/lib/openclaw/openclaw.mjs ]; then
-      ENTRY="$out/lib/openclaw/openclaw.mjs"
+      ENTRY_SRC="$out/lib/openclaw/openclaw.mjs"
     else
       echo "ERROR: no entry point found in OpenClaw package" >&2
       ls -la $out/lib/openclaw/ >&2
@@ -97,7 +103,7 @@ stdenv.mkDerivation {
     fi
 
     makeWrapper ${nodejs_22}/bin/node $out/bin/openclaw \
-      --add-flags "$ENTRY" \
+      --add-flags "$ENTRY_SRC" \
       --set NODE_PATH "$out/lib/openclaw/node_modules"
 
     runHook postInstall

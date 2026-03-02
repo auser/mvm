@@ -76,6 +76,29 @@ pub fn template_current_symlink(template_id: &str) -> String {
     format!("{}/current", template_dir(template_id))
 }
 
+/// Snapshot directory within a template revision.
+pub fn template_snapshot_dir(template_id: &str, revision: &str) -> String {
+    format!("{}/snapshot", template_revision_dir(template_id, revision))
+}
+
+/// Metadata about a template's pre-built Firecracker snapshot.
+///
+/// Created by `template build --snapshot` after booting the VM and
+/// waiting for the service to become healthy. Used by `run --template`
+/// to restore the VM instantly instead of cold-booting.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SnapshotInfo {
+    pub created_at: String,
+    pub vmstate_size_bytes: u64,
+    pub mem_size_bytes: u64,
+    /// Boot args used when the snapshot was created (must match on restore).
+    pub boot_args: String,
+    /// vCPU count at snapshot time (must match on restore).
+    pub vcpus: u8,
+    /// Memory MiB at snapshot time (must match on restore).
+    pub mem_mib: u32,
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateRevision {
     pub revision_hash: String,
@@ -88,6 +111,8 @@ pub struct TemplateRevision {
     pub vcpus: u8,
     pub mem_mib: u32,
     pub data_disk_mib: u32,
+    #[serde(default)]
+    pub snapshot: Option<SnapshotInfo>,
 }
 
 impl TemplateRevision {
@@ -126,6 +151,7 @@ mod tests {
             vcpus: 2,
             mem_mib: 1024,
             data_disk_mib: 0,
+            snapshot: None,
         }
     }
 
@@ -165,5 +191,68 @@ mod tests {
         b.revision_hash = "rev-zzz".to_string();
         // Different revision hashes but same flake_lock/profile/role → same cache key
         assert_eq!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn snapshot_info_serde_roundtrip() {
+        let info = SnapshotInfo {
+            created_at: "2025-03-01T00:00:00Z".to_string(),
+            vmstate_size_bytes: 1024,
+            mem_size_bytes: 1048576,
+            boot_args: "root=/dev/vda rw init=/init console=ttyS0".to_string(),
+            vcpus: 2,
+            mem_mib: 1024,
+        };
+        let json = serde_json::to_string(&info).unwrap();
+        let back: SnapshotInfo = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.vcpus, 2);
+        assert_eq!(back.mem_mib, 1024);
+        assert_eq!(back.vmstate_size_bytes, 1024);
+    }
+
+    #[test]
+    fn revision_without_snapshot_deserializes() {
+        let json = r#"{
+            "revision_hash": "abc",
+            "flake_ref": ".",
+            "flake_lock_hash": "lock1",
+            "artifact_paths": {
+                "vmlinux": "vmlinux",
+                "rootfs": "rootfs.ext4",
+                "fc_base_config": "fc-base.json"
+            },
+            "built_at": "2025-01-01T00:00:00Z",
+            "profile": "minimal",
+            "role": "worker",
+            "vcpus": 2,
+            "mem_mib": 1024,
+            "data_disk_mib": 0
+        }"#;
+        let rev: TemplateRevision = serde_json::from_str(json).unwrap();
+        assert!(rev.snapshot.is_none());
+    }
+
+    #[test]
+    fn revision_with_snapshot_deserializes() {
+        let rev = make_revision("lock1", "minimal", "worker");
+        let mut rev = rev;
+        rev.snapshot = Some(SnapshotInfo {
+            created_at: "2025-03-01T00:00:00Z".to_string(),
+            vmstate_size_bytes: 512,
+            mem_size_bytes: 2048,
+            boot_args: "console=ttyS0".to_string(),
+            vcpus: 2,
+            mem_mib: 1024,
+        });
+        let json = serde_json::to_string(&rev).unwrap();
+        let back: TemplateRevision = serde_json::from_str(&json).unwrap();
+        assert!(back.snapshot.is_some());
+        assert_eq!(back.snapshot.unwrap().mem_size_bytes, 2048);
+    }
+
+    #[test]
+    fn template_snapshot_dir_format() {
+        let dir = template_snapshot_dir("my-tmpl", "abc123");
+        assert!(dir.ends_with("/templates/my-tmpl/artifacts/abc123/snapshot"));
     }
 }

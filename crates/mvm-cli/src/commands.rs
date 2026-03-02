@@ -373,6 +373,9 @@ enum TemplateCmd {
         /// Rebuild even if a cached revision exists
         #[arg(long)]
         force: bool,
+        /// After build, boot VM, wait for healthy, and create a snapshot for instant starts
+        #[arg(long)]
+        snapshot: bool,
         /// Optional template config TOML to build multiple variants
         #[arg(long)]
         config: Option<String>,
@@ -2167,6 +2170,7 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
         source_profile,
         tmpl_cpus,
         tmpl_mem,
+        snapshot_info,
     ) = if let Some(tmpl) = template_name {
         ui::step(
             1,
@@ -2176,6 +2180,13 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
         let (spec, vmlinux, initrd, rootfs, rev) =
             mvm_runtime::vm::template::lifecycle::template_artifacts(tmpl)?;
         ui::info(&format!("Using revision {}", rev));
+
+        // Check for pre-built snapshot
+        let snap_info = mvm_runtime::vm::template::lifecycle::template_snapshot_info(tmpl)?;
+        if snap_info.is_some() {
+            ui::info("Snapshot available — will restore instantly");
+        }
+
         (
             vmlinux,
             initrd,
@@ -2185,6 +2196,7 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
             Some(spec.profile.clone()),
             Some(spec.vcpus as u32),
             Some(spec.mem_mib),
+            snap_info,
         )
     } else {
         let flake = flake_ref.expect("--flake or --template required");
@@ -2218,6 +2230,7 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
             profile.map(|s| s.to_string()),
             None,
             None,
+            None, // No snapshot for flake builds
         )
     };
 
@@ -2294,8 +2307,22 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
     let vm_name_owned = run_config.name.clone();
     let has_ports = !run_config.ports.is_empty();
 
-    let backend = AnyBackend::from_hypervisor(hypervisor);
-    backend.start_firecracker(&FirecrackerConfig { run_config })?;
+    // If a template snapshot exists, restore from it instead of cold-booting.
+    if let Some(ref snap_info) = snapshot_info
+        && let Some(tmpl) = template_name
+    {
+        let rev = mvm_runtime::vm::template::lifecycle::current_revision_id(tmpl)?;
+        let snap_dir = mvm_core::template::template_snapshot_dir(tmpl, &rev);
+        ui::step(
+            2,
+            2,
+            &format!("Restoring VM '{}' from snapshot", vm_name_owned),
+        );
+        microvm::restore_from_template_snapshot(&run_config, &snap_dir, snap_info)?;
+    } else {
+        let backend = AnyBackend::from_hypervisor(hypervisor);
+        backend.start_firecracker(&FirecrackerConfig { run_config })?;
+    }
 
     if forward {
         if has_ports {
@@ -2671,8 +2698,9 @@ fn cmd_template(action: TemplateCmd) -> Result<()> {
         TemplateCmd::Build {
             name,
             force,
+            snapshot,
             config,
-        } => template_cmd::build(&name, force, config.as_deref()),
+        } => template_cmd::build(&name, force, snapshot, config.as_deref()),
         TemplateCmd::Push { name, revision } => template_cmd::push(&name, revision.as_deref()),
         TemplateCmd::Pull { name, revision } => template_cmd::pull(&name, revision.as_deref()),
         TemplateCmd::Verify { name, revision } => template_cmd::verify(&name, revision.as_deref()),

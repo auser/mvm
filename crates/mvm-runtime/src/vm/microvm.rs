@@ -23,7 +23,7 @@ fn resolve_microvm_dir() -> Result<String> {
 }
 
 /// Resolve a per-VM directory path (~ expansion) inside the Lima VM.
-fn resolve_vm_dir(slot: &VmSlot) -> Result<String> {
+pub fn resolve_vm_dir(slot: &VmSlot) -> Result<String> {
     run_in_vm_stdout(&format!("echo {}", slot.vm_dir))
 }
 
@@ -57,7 +57,7 @@ fn start_firecracker_daemon(abs_dir: &str) -> Result<()> {
 }
 
 /// Start a Firecracker daemon in a per-VM directory with its own socket.
-fn start_vm_firecracker(abs_dir: &str, abs_socket: &str) -> Result<()> {
+pub fn start_vm_firecracker(abs_dir: &str, abs_socket: &str) -> Result<()> {
     ui::info("Starting Firecracker...");
     run_in_vm_visible(&format!(
         r#"
@@ -91,7 +91,7 @@ fn api_put(path: &str, data: &str) -> Result<()> {
 }
 
 /// Send API PUT request to a specific Firecracker socket.
-fn api_put_socket(socket: &str, path: &str, data: &str) -> Result<()> {
+pub fn api_put_socket(socket: &str, path: &str, data: &str) -> Result<()> {
     let script = format!(
         r#"
         response=$(sudo curl -s -w "\n%{{http_code}}" -X PUT --unix-socket {socket} \
@@ -100,6 +100,27 @@ fn api_put_socket(socket: &str, path: &str, data: &str) -> Result<()> {
         body=$(echo "$response" | sed '$d')
         if [ "$code" -ge 400 ]; then
             echo "[mvm] ERROR: PUT {path} returned $code: $body" >&2
+            exit 1
+        fi
+        "#,
+        socket = socket,
+        path = path,
+        data = data,
+    );
+    run_in_vm_visible(&script)
+}
+
+/// Send API PATCH request to a specific Firecracker socket.
+pub fn api_patch_socket(socket: &str, path: &str, data: &str) -> Result<()> {
+    let script = format!(
+        r#"
+        response=$(sudo curl -s -w "\n%{{http_code}}" -X PATCH --unix-socket {socket} \
+            -H 'Content-Type: application/json' \
+            --data '{data}' "http://localhost{path}")
+        code=$(echo "$response" | tail -1)
+        body=$(echo "$response" | sed '$d')
+        if [ "$code" -ge 400 ]; then
+            echo "[mvm] ERROR: PATCH {path} returned $code: $body" >&2
             exit 1
         fi
         "#,
@@ -422,6 +443,181 @@ pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
 
     ui::banner(&[
         &format!("MicroVM '{}' is running!", config.name),
+        "",
+        &format!("  Guest IP: {}", slot.guest_ip),
+        &format!("  Revision: {}", config.revision_hash),
+        "",
+        &format!("Use 'mvm stop {}' to shut down this VM.", config.name),
+        "Use 'mvm status' to list all running VMs.",
+    ]);
+
+    Ok(())
+}
+
+/// Restore a Firecracker VM from a template snapshot (instant start).
+///
+/// Instead of cold-booting, this loads a pre-captured snapshot where the
+/// VM was already healthy. Config and secrets drives are created fresh
+/// with the caller's runtime files and patched into the VM before resume.
+///
+/// The VM configuration (vCPUs, memory, drive IDs, network) must match
+/// what was used when the snapshot was created.
+pub fn restore_from_template_snapshot(
+    config: &FlakeRunConfig,
+    snapshot_dir: &str,
+    snapshot_info: &mvm_core::template::SnapshotInfo,
+) -> Result<()> {
+    require_linux_env()?;
+
+    let slot = &config.slot;
+
+    // Check if this VM name is already running
+    let abs_dir = resolve_vm_dir(slot)?;
+    let abs_socket = format!("{}/fc.socket", abs_dir);
+    let pid_file = format!("{}/fc.pid", abs_dir);
+
+    if firecracker::is_vm_running(&pid_file)? {
+        ui::info(&format!("VM '{}' is already running.", slot.name));
+        ui::info("Use 'mvm stop <name>' to shut it down first.");
+        return Ok(());
+    }
+
+    // Ensure bridge network exists (idempotent)
+    network::bridge_ensure()?;
+
+    // Create TAP device for this VM
+    network::tap_create(slot)?;
+
+    // Copy rootfs to per-VM directory (snapshot restore requires it at same relative location)
+    run_in_vm(&format!(
+        "mkdir -p {dir} && cp {src} {dir}/rootfs.ext4 && chmod u+w {dir}/rootfs.ext4",
+        dir = abs_dir,
+        src = config.rootfs_path,
+    ))?;
+
+    // Copy snapshot files to per-VM directory
+    run_in_vm(&format!(
+        "cp {snap}/vmstate.bin {dir}/vmstate.bin && cp {snap}/mem.bin {dir}/mem.bin",
+        snap = snapshot_dir,
+        dir = abs_dir,
+    ))?;
+
+    // Start Firecracker daemon in per-VM directory
+    start_vm_firecracker(&abs_dir, &abs_socket)?;
+
+    // Configure VM with identical settings to snapshot time.
+    // FC requires boot-source, machine-config, rootfs, network, and vsock
+    // to be configured before snapshot/load.
+    let rootfs_in_dir = format!("{}/rootfs.ext4", abs_dir);
+    let boot_args = format!(
+        "root=/dev/vda rw rootwait init=/init console=ttyS0 reboot=k panic=1 net.ifnames=0 mvm.ip={ip}/24 mvm.gw={gw}",
+        ip = slot.guest_ip,
+        gw = crate::config::BRIDGE_IP,
+    );
+
+    // Boot source (must match snapshot)
+    api_put_socket(
+        &abs_socket,
+        "/boot-source",
+        &format!(
+            r#"{{"kernel_image_path": "{kernel}", "boot_args": "{args}"}}"#,
+            kernel = config.vmlinux_path,
+            args = boot_args,
+        ),
+    )?;
+
+    // Machine config (must match snapshot vCPUs and memory)
+    api_put_socket(
+        &abs_socket,
+        "/machine-config",
+        &format!(
+            r#"{{"vcpu_count": {cpus}, "mem_size_mib": {mem}}}"#,
+            cpus = snapshot_info.vcpus,
+            mem = snapshot_info.mem_mib,
+        ),
+    )?;
+
+    // Rootfs drive
+    api_put_socket(
+        &abs_socket,
+        "/drives/rootfs",
+        &format!(
+            r#"{{"drive_id": "rootfs", "path_on_host": "{rootfs}", "is_root_device": true, "is_read_only": false}}"#,
+            rootfs = rootfs_in_dir,
+        ),
+    )?;
+
+    // Create fresh config and secrets drives with caller's runtime files
+    ui::info("Creating config drive...");
+    let config_drive = create_dev_config_drive(&abs_dir, config)?;
+    api_put_socket(
+        &abs_socket,
+        "/drives/config",
+        &format!(
+            r#"{{"drive_id": "config", "path_on_host": "{path}", "is_root_device": false, "is_read_only": true}}"#,
+            path = config_drive,
+        ),
+    )?;
+
+    ui::info("Creating secrets drive...");
+    let secrets_drive = create_dev_secrets_drive(&abs_dir, &config.secret_files)?;
+    api_put_socket(
+        &abs_socket,
+        "/drives/secrets",
+        &format!(
+            r#"{{"drive_id": "secrets", "path_on_host": "{path}", "is_root_device": false, "is_read_only": true}}"#,
+            path = secrets_drive,
+        ),
+    )?;
+
+    // Network interface
+    api_put_socket(
+        &abs_socket,
+        "/network-interfaces/net1",
+        &format!(
+            r#"{{"iface_id": "net1", "guest_mac": "{mac}", "host_dev_name": "{tap}"}}"#,
+            mac = slot.mac,
+            tap = slot.tap_dev,
+        ),
+    )?;
+
+    // Vsock
+    api_put_socket(
+        &abs_socket,
+        "/vsock",
+        &format!(
+            r#"{{"vsock_id": "vsock0", "guest_cid": {cid}, "uds_path": "{dir}/v.sock"}}"#,
+            cid = mvm_guest::vsock::GUEST_CID,
+            dir = abs_dir,
+        ),
+    )?;
+
+    // Load snapshot
+    ui::info("Loading snapshot...");
+    let vmstate_path = format!("{}/vmstate.bin", abs_dir);
+    let mem_path = format!("{}/mem.bin", abs_dir);
+    api_put_socket(
+        &abs_socket,
+        "/snapshot/load",
+        &format!(
+            r#"{{"snapshot_path": "{vmstate}", "mem_backend": {{"backend_type": "File", "backend_path": "{mem}"}}, "enable_diff_snapshots": false}}"#,
+            vmstate = vmstate_path,
+            mem = mem_path,
+        ),
+    )?;
+
+    // Resume vCPUs
+    ui::info("Resuming VM from snapshot...");
+    api_patch_socket(&abs_socket, "/vm", r#"{"state": "Resumed"}"#)?;
+
+    // Make vsock socket accessible
+    let _ = run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir));
+
+    // Persist run info
+    write_vm_run_info(config, &abs_dir)?;
+
+    ui::banner(&[
+        &format!("MicroVM '{}' restored from snapshot!", config.name),
         "",
         &format!("  Guest IP: {}", slot.guest_ip),
         &format!("  Revision: {}", config.revision_hash),
@@ -868,7 +1064,7 @@ fn drive_file_inject_commands(files: &[DriveFile]) -> String {
 }
 
 /// Create a config drive (mvm-config label) with config.json and role-specific toml.
-fn create_dev_config_drive(abs_dir: &str, config: &FlakeRunConfig) -> Result<String> {
+pub fn create_dev_config_drive(abs_dir: &str, config: &FlakeRunConfig) -> Result<String> {
     let path = format!("{}/config.ext4", abs_dir);
     let slot = &config.slot;
 
@@ -919,7 +1115,7 @@ fn create_dev_config_drive(abs_dir: &str, config: &FlakeRunConfig) -> Result<Str
 }
 
 /// Create a secrets drive (mvm-secrets label) with a stub secrets.json plus extra files.
-fn create_dev_secrets_drive(abs_dir: &str, secret_files: &[DriveFile]) -> Result<String> {
+pub fn create_dev_secrets_drive(abs_dir: &str, secret_files: &[DriveFile]) -> Result<String> {
     let path = format!("{}/secrets.ext4", abs_dir);
 
     let extra_cmds = drive_file_inject_commands(secret_files);
@@ -946,7 +1142,7 @@ fn create_dev_secrets_drive(abs_dir: &str, secret_files: &[DriveFile]) -> Result
 }
 
 /// Configure a flake-built microVM via the Firecracker API (multi-VM).
-fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str, socket: &str) -> Result<()> {
+pub fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str, socket: &str) -> Result<()> {
     let slot = &config.slot;
 
     ui::info("Configuring logger...");
@@ -1088,7 +1284,7 @@ fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str, socket: &str)
 }
 
 /// Persist run info for a named VM.
-fn write_vm_run_info(config: &FlakeRunConfig, abs_dir: &str) -> Result<()> {
+pub fn write_vm_run_info(config: &FlakeRunConfig, abs_dir: &str) -> Result<()> {
     let info = RunInfo {
         mode: "flake".to_string(),
         name: Some(config.name.clone()),
