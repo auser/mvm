@@ -194,9 +194,23 @@ get_latest_version() {
     local url="https://api.github.com/repos/${REPO}/releases/latest"
     local response
     if require curl; then
-        response="$(curl -fsSL "$url")"
+        response="$(curl -fsSL "$url" 2>&1)" || {
+            if echo "$response" | grep -q "403"; then
+                warn "GitHub API rate limit reached."
+                warn "Retry with: MVM_VERSION=v0.3.4 bash -s -- ..."
+                die "Or wait ~1 hour for rate limit reset"
+            fi
+            die "Failed to fetch latest release: $response"
+        }
     elif require wget; then
-        response="$(wget -qO- "$url")"
+        response="$(wget -qO- "$url" 2>&1)" || {
+            if echo "$response" | grep -q "403"; then
+                warn "GitHub API rate limit reached."
+                warn "Retry with: MVM_VERSION=v0.3.4 bash -s -- ..."
+                die "Or wait ~1 hour for rate limit reset"
+            fi
+            die "Failed to fetch latest release: $response"
+        }
     else
         die "curl or wget is required"
     fi
