@@ -45,16 +45,10 @@ else
     /var/lib/openclaw/sessions
 fi
 
-# ── Page cache pre-warming ───────────────────────────────────────────
-# OpenClaw's Vite build produces ~784 code-split JS chunks.  Loading
-# them on-demand from virtio-block is extremely slow (minutes).  Read
-# all JS/JSON files in one sequential pass so the Linux page cache
-# serves subsequent imports from RAM instead of disk.
-echo "[setup] pre-warming page cache for OpenClaw files..." >&2
-find @openclaw@/lib/openclaw -type f \( \
-  -name '*.js' -o -name '*.mjs' -o -name '*.cjs' -o -name '*.json' \
-\) -exec cat {} + > /dev/null 2>&1 || true
-echo "[setup] page cache warm-up complete" >&2
+# ── Page cache warming ──────────────────────────────────────────────
+# Pre-read the esbuild bundle into the Linux page cache so V8
+# doesn't wait on virtio-block I/O during module compilation.
+cat @openclaw@/lib/openclaw/dist/openclaw-bundle.mjs > /dev/null 2>/dev/null || true
 
 # ── Socat forwarding ─────────────────────────────────────────────────
 # OpenClaw binds to 127.0.0.1 only — use socat to forward incoming TAP

@@ -4,21 +4,18 @@
   inputs = {
     mvm.url = "path:../../";
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
+    nix-openclaw = {
+      url = "github:openclaw/nix-openclaw";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
   };
 
-  outputs = { mvm, nixpkgs, ... }:
+  outputs = { mvm, nixpkgs, nix-openclaw, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       eachSystem = f: builtins.listToAttrs (map (system:
         { name = system; value = f system; }
       ) systems);
-
-      # Wrap the pre-installed OpenClaw package. The pre-build.sh hook
-      # installs OpenClaw via the official installer script before nix build
-      # runs, placing it at /opt/openclaw. This derivation wraps those files.
-      openclawFor = system:
-        let pkgs = import nixpkgs { inherit system; };
-        in pkgs.callPackage ./pkgs/openclaw.nix {};
 
       # Replace @var@ placeholders in a script file and make it executable.
       replaceVarsScript = pkgs: name: src: vars:
@@ -36,8 +33,13 @@
       # substitution via replaceVarsScript at build time.
       mkRole = system: { role, tmpfsSizeMib ? 1024 }:
         let
-          pkgs = import nixpkgs { inherit system; };
-          openclaw = openclawFor system;
+          pkgs = import nixpkgs {
+            inherit system;
+            overlays = [ nix-openclaw.overlays.default ];
+          };
+          # Wrap nix-openclaw's gateway with esbuild bundling for fast
+          # startup on Firecracker's virtio-block storage.
+          openclaw = pkgs.callPackage ./pkgs/openclaw-bundled.nix {};
           serviceName = "openclaw-${role}";
 
           setupScript = replaceVarsScript pkgs "openclaw-setup" ./scripts/setup.sh {
