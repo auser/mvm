@@ -1,0 +1,13 @@
+{
+  "gateway": {
+    "mode": "local",
+    "port": 3000,
+    "host": "127.0.0.1"
+  },
+  "logging": {
+    "level": "info"
+  },
+  "instance": {
+    "name": "${OPENCLAW_INSTANCE_NAME:-openclaw}"
+  }
+}

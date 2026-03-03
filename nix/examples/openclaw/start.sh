@@ -1,37 +1,37 @@
 #!/usr/bin/env bash
-# OpenClaw MicroVM - Production Configuration
-# Optimized settings: 4 CPUs, 4GB RAM, port forwarding
+# OpenClaw MicroVM - Native npx installer
+# First run downloads OpenClaw via npx (5-10 min)
 
 set -euo pipefail
 
-# Change to mvm project root (3 levels up from nix/examples/openclaw)
 cd "$(dirname "$0")/../../.."
 
-# Configuration
-VM_NAME="${1:-oc-prod}"
-INSTANCE_NAME="${2:-openclaw-1}"
-PORT="${3:-3000}"
+VM_NAME="${1:-openclaw}"
+PORT="${2:-3000}"
 
 echo "Starting OpenClaw MicroVM: $VM_NAME"
-echo "  Instance: $INSTANCE_NAME"
 echo "  Port: $PORT"
+echo ""
+echo "Note: First run downloads OpenClaw via npx (~5-10 min)"
 echo ""
 
 # Stop existing VM if running
-if cargo run --quiet -- status 2>/dev/null | grep -q "$VM_NAME"; then
+if cargo run --quiet -- status 2>/dev/null | grep -q "^  $VM_NAME"; then
     echo "Stopping existing VM '$VM_NAME'..."
     cargo run --quiet -- stop "$VM_NAME"
     sleep 2
 fi
 
-# Start with optimal settings
+# Run with native npx installer (no complex bundling)
+# Pass config and secrets from host directories
 cargo run -- run \
-    --template openclaw-prod \
+    --flake ./nix/examples/openclaw \
     --name "$VM_NAME" \
-    --env "OPENCLAW_INSTANCE_NAME=$INSTANCE_NAME" \
     --cpus 4 \
     --memory 4096 \
     -p "$PORT:3000" \
+    --config-dir ./nix/examples/openclaw/config \
+    --secrets-dir ./nix/examples/openclaw/secrets \
     --forward
 
 echo ""

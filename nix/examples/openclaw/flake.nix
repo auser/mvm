@@ -1,90 +1,93 @@
 {
-  description = "OpenClaw microVM template for mvm";
+  description = "OpenClaw microVM - simple native install";
 
   inputs = {
     mvm.url = "path:../../";
     nixpkgs.url = "github:NixOS/nixpkgs/nixpkgs-unstable";
-    nix-openclaw = {
-      url = "github:openclaw/nix-openclaw";
-      inputs.nixpkgs.follows = "nixpkgs";
-    };
   };
 
-  outputs = { mvm, nixpkgs, nix-openclaw, ... }:
+  outputs = { mvm, nixpkgs, ... }:
     let
       systems = [ "x86_64-linux" "aarch64-linux" ];
       eachSystem = f: builtins.listToAttrs (map (system:
         { name = system; value = f system; }
       ) systems);
-
-      # Replace @var@ placeholders in a script file and make it executable.
-      replaceVarsScript = pkgs: name: src: vars:
-        pkgs.writeShellScript name (
-          builtins.replaceStrings
-            (map (k: "@${k}@") (builtins.attrNames vars))
-            (map toString (builtins.attrValues vars))
-            (builtins.readFile src)
-        );
-
-      # Build a guest image for a given OpenClaw role.
-      #
-      # Uses mkGuest (busybox init, no systemd) for fast boot and small
-      # images.  Shell scripts live in ./scripts/ and get variable
-      # substitution via replaceVarsScript at build time.
-      mkRole = system: { role, tmpfsSizeMib ? 1024 }:
-        let
-          pkgs = import nixpkgs {
-            inherit system;
-            overlays = [ nix-openclaw.overlays.default ];
-          };
-          # Wrap nix-openclaw's gateway with esbuild bundling for fast
-          # startup on Firecracker's virtio-block storage.
-          openclaw = pkgs.callPackage ./pkgs/openclaw-bundled.nix {};
-          serviceName = "openclaw-${role}";
-
-          setupScript = replaceVarsScript pkgs "openclaw-setup" ./scripts/setup.sh {
-            socat = pkgs.socat;
-            tmpfsSize = toString tmpfsSizeMib;
-            inherit openclaw;
-          };
-
-          commandScript = replaceVarsScript pkgs "${serviceName}-start" ./scripts/start.sh {
-            openclaw = openclaw;
-            inherit role;
-          };
-        in
-        mvm.lib.${system}.mkGuest {
-          name = "openclaw";
-          hostname = "openclaw";
-          packages = [ openclaw ];
-
-          users.openclaw = {
-            home = "/var/lib/openclaw";
-          };
-
-          services.${serviceName} = {
-            preStart = "${setupScript}";
-            command = "${commandScript}";
-            user = "openclaw";
-          };
-
-          healthChecks.${serviceName} = {
-            # Use busybox wget instead of nc -z (busybox nc may lack -z flag).
-            healthCmd = "wget -q -O /dev/null http://127.0.0.1:3000/ 2>/dev/null";
-            healthIntervalSecs = 10;
-            healthTimeoutSecs = 5;
-          };
-        };
     in {
-      packages = eachSystem (system: {
-        # Gateway variant — lightweight MCP proxy, no persistent data disk.
-        tenant-gateway = mkRole system { role = "gateway"; tmpfsSizeMib = 1024; };
+      packages = eachSystem (system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in {
+          default = mvm.lib.${system}.mkGuest {
+            name = "openclaw";
+            hostname = "openclaw";
 
-        # Worker variant — agent execution, uses persistent data disk.
-        tenant-worker = mkRole system { role = "worker"; tmpfsSizeMib = 2048; };
+            # Just Node.js 22 - OpenClaw will install itself
+            packages = [ pkgs.nodejs_22 ];
 
-        # Default = gateway (backward compatible, lower resource requirement).
-        default = mkRole system { role = "gateway"; tmpfsSizeMib = 1024; };
-      });
+            users.openclaw = {
+              home = "/var/lib/openclaw";
+            };
+
+            services.openclaw = {
+              preStart = pkgs.writeShellScript "openclaw-setup" ''
+                # Create working directory on tmpfs
+                mount -t tmpfs -o mode=0755,size=2048m tmpfs /var/lib/openclaw
+                chown openclaw:openclaw /var/lib/openclaw
+
+                # Create subdirectories
+                install -d -o openclaw -g openclaw /var/lib/openclaw/{.npm,.cache,workspace,data}
+
+                # Copy config from mounted config drive (if provided)
+                if [ -f /mnt/config/openclaw.json ]; then
+                  echo "[setup] Using config from /mnt/config/openclaw.json" >&2
+                  # Substitute environment variables in config
+                  ${pkgs.envsubst}/bin/envsubst < /mnt/config/openclaw.json > /var/lib/openclaw/config.json
+                  chown openclaw:openclaw /var/lib/openclaw/config.json
+                else
+                  # Fallback: write minimal default config
+                  echo "[setup] No config found, using defaults" >&2
+                  cat > /var/lib/openclaw/config.json <<'CONFIG'
+{
+  "gateway": {
+    "mode": "local",
+    "port": 3000
+  }
+}
+CONFIG
+                  chown openclaw:openclaw /var/lib/openclaw/config.json
+                fi
+              '';
+
+              command = pkgs.writeShellScript "openclaw-start" ''
+                set -eu
+                cd /var/lib/openclaw
+
+                # Source environment variables from mounted drives (optional)
+                [ -f /mnt/config/env.sh ] && . /mnt/config/env.sh || true
+                [ -f /mnt/secrets/api-keys.env ] && . /mnt/secrets/api-keys.env || true
+
+                # Set npm config for this user
+                export npm_config_cache=/var/lib/openclaw/.npm
+                export npm_config_userconfig=/var/lib/openclaw/.npmrc
+
+                # Run OpenClaw via npx (downloads and caches on first run)
+                echo "[openclaw] starting via npx (first run may take 5-10 min to download)" >&2
+                echo "[openclaw] config: /var/lib/openclaw/config.json" >&2
+                exec ${pkgs.nodejs_22}/bin/npx --yes openclaw@latest gateway \
+                  --port 3000 \
+                  --config /var/lib/openclaw/config.json \
+                  --allow-unconfigured
+              '';
+
+              user = "openclaw";
+            };
+
+            healthChecks.openclaw = {
+              healthCmd = "wget -q -O /dev/null http://127.0.0.1:3000/ 2>/dev/null";
+              healthIntervalSecs = 10;
+              healthTimeoutSecs = 5;
+            };
+          };
+        });
     };
 }

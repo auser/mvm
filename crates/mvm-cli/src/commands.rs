@@ -2316,7 +2316,7 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
         None => Vec::new(),
     };
     let secret_files = match secrets_dir {
-        Some(dir) => read_dir_to_drive_files(dir, 0o400)
+        Some(dir) => read_dir_to_drive_files(dir, 0o444)
             .with_context(|| format!("reading secrets-dir '{}'", dir))?,
         None => Vec::new(),
     };
