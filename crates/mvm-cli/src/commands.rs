@@ -418,6 +418,29 @@ enum TemplateCmd {
         #[arg(long)]
         json: bool,
     },
+    /// Edit an existing template's configuration
+    Edit {
+        /// Template name to edit
+        name: String,
+        /// Update Nix flake reference
+        #[arg(long)]
+        flake: Option<String>,
+        /// Update flake package variant
+        #[arg(long)]
+        profile: Option<String>,
+        /// Update VM role
+        #[arg(long)]
+        role: Option<String>,
+        /// Update vCPU count
+        #[arg(long)]
+        cpus: Option<u8>,
+        /// Update memory in MiB
+        #[arg(long)]
+        mem: Option<u32>,
+        /// Update data disk size in MiB
+        #[arg(long)]
+        data_disk: Option<u32>,
+    },
     /// Delete a template and its artifacts
     Delete {
         /// Template name to delete
@@ -2318,7 +2341,7 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
             2,
             &format!("Restoring VM '{}' from snapshot", vm_name_owned),
         );
-        microvm::restore_from_template_snapshot(&run_config, &snap_dir, snap_info)?;
+        microvm::restore_from_template_snapshot(tmpl, &run_config, &snap_dir, snap_info)?;
     } else {
         let backend = AnyBackend::from_hypervisor(hypervisor);
         backend.start_firecracker(&FirecrackerConfig { run_config })?;
@@ -2706,6 +2729,23 @@ fn cmd_template(action: TemplateCmd) -> Result<()> {
         TemplateCmd::Verify { name, revision } => template_cmd::verify(&name, revision.as_deref()),
         TemplateCmd::List { json } => template_cmd::list(json),
         TemplateCmd::Info { name, json } => template_cmd::info(&name, json),
+        TemplateCmd::Edit {
+            name,
+            flake,
+            profile,
+            role,
+            cpus,
+            mem,
+            data_disk,
+        } => template_cmd::edit(
+            &name,
+            flake.as_deref(),
+            profile.as_deref(),
+            role.as_deref(),
+            cpus,
+            mem,
+            data_disk,
+        ),
         TemplateCmd::Delete { name, force } => template_cmd::delete(&name, force),
         TemplateCmd::Init {
             name,

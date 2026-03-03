@@ -209,6 +209,56 @@ pub fn verify(name: &str, revision: Option<&str>) -> Result<()> {
     tmpl::template_verify(name, revision)
 }
 
+pub fn edit(
+    name: &str,
+    flake: Option<&str>,
+    profile: Option<&str>,
+    role: Option<&str>,
+    cpus: Option<u8>,
+    mem: Option<u32>,
+    data_disk: Option<u32>,
+) -> Result<()> {
+    // Load existing template spec
+    let mut spec = tmpl::template_load(name)?;
+
+    // Update fields if provided
+    if let Some(f) = flake {
+        spec.flake_ref = resolve_flake_ref(f);
+    }
+    if let Some(p) = profile {
+        spec.profile = p.to_string();
+    }
+    if let Some(r) = role {
+        spec.role = r.to_string();
+    }
+    if let Some(c) = cpus {
+        spec.vcpus = c;
+    }
+    if let Some(m) = mem {
+        spec.mem_mib = m;
+    }
+    if let Some(d) = data_disk {
+        spec.data_disk_mib = d;
+    }
+
+    // Update timestamp
+    spec.updated_at = now_iso();
+
+    // Save updated spec
+    tmpl::template_create(&spec)?;
+
+    println!("Updated template '{}'", name);
+    println!(" vCPUs:   {}", spec.vcpus);
+    println!(" MemMiB:  {}", spec.mem_mib);
+    println!(" DataMiB: {}", spec.data_disk_mib);
+    println!(
+        "\nRun 'mvmctl template build {} --force' to rebuild with new settings",
+        name
+    );
+
+    Ok(())
+}
+
 fn load_config(path: &str) -> Result<TemplateConfig> {
     let data = fs::read_to_string(Path::new(path))
         .map_err(|e| anyhow::anyhow!("Failed to read template config {}: {}", path, e))?;

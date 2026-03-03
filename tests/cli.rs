@@ -314,6 +314,7 @@ fn test_template_lifecycle_commands() {
         .stdout(predicate::str::contains("create"))
         .stdout(predicate::str::contains("list"))
         .stdout(predicate::str::contains("info"))
+        .stdout(predicate::str::contains("edit"))
         .stdout(predicate::str::contains("build"))
         .stdout(predicate::str::contains("delete"))
         .stdout(predicate::str::contains("push"))
@@ -341,12 +342,41 @@ fn test_template_lifecycle_commands() {
         .failure()
         .stderr(predicate::str::contains("required"));
 
+    // Template edit requires a name argument
+    mvm()
+        .args(["template", "edit"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("required"));
+
     // Template delete requires a name argument
     mvm()
         .args(["template", "delete"])
         .assert()
         .failure()
         .stderr(predicate::str::contains("required"));
+}
+
+#[test]
+fn test_template_edit_help_and_flags() {
+    // Template edit help shows all available options
+    mvm()
+        .args(["template", "edit", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--flake"))
+        .stdout(predicate::str::contains("--profile"))
+        .stdout(predicate::str::contains("--role"))
+        .stdout(predicate::str::contains("--cpus"))
+        .stdout(predicate::str::contains("--mem"))
+        .stdout(predicate::str::contains("--data-disk"));
+
+    // Template edit with only name (no flags) should work but do nothing
+    // This will fail in practice because template doesn't exist, but validates argument parsing
+    mvm()
+        .args(["template", "edit", "nonexistent"])
+        .assert()
+        .failure(); // Fails because template doesn't exist, not because of argument parsing
 }
 
 // ---------------------------------------------------------------------------

@@ -66,6 +66,7 @@ description: Complete command reference for mvmctl.
 | `mvmctl template verify <name>` | Verify template checksums |
 | `mvmctl template list` | List all templates |
 | `mvmctl template info <name>` | Show template details and revisions |
+| `mvmctl template edit <name>` | Edit template configuration (--cpus, --mem, --flake, etc.) |
 | `mvmctl template delete <name>` | Delete a template |
 
 ## MicroVM Diagnostics

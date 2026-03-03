@@ -458,14 +458,16 @@ pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
 ///
 /// Instead of cold-booting, this loads a pre-captured snapshot where the
 /// VM was already healthy. Config and secrets drives are created fresh
-/// with the caller's runtime files and patched into the VM before resume.
+/// with the caller's runtime files and must be placed at the paths the
+/// snapshot expects (matching the temporary VM used during snapshot creation).
 ///
 /// The VM configuration (vCPUs, memory, drive IDs, network) must match
 /// what was used when the snapshot was created.
 pub fn restore_from_template_snapshot(
+    template_id: &str,
     config: &FlakeRunConfig,
     snapshot_dir: &str,
-    snapshot_info: &mvm_core::template::SnapshotInfo,
+    _snapshot_info: &mvm_core::template::SnapshotInfo,
 ) -> Result<()> {
     require_linux_env()?;
 
@@ -488,123 +490,78 @@ pub fn restore_from_template_snapshot(
     // Create TAP device for this VM
     network::tap_create(slot)?;
 
-    // Copy rootfs to per-VM directory (snapshot restore requires it at same relative location)
-    run_in_vm(&format!(
-        "mkdir -p {dir} && cp {src} {dir}/rootfs.ext4 && chmod u+w {dir}/rootfs.ext4",
-        dir = abs_dir,
-        src = config.rootfs_path,
-    ))?;
-
     // Copy snapshot files to per-VM directory
     run_in_vm(&format!(
-        "cp {snap}/vmstate.bin {dir}/vmstate.bin && cp {snap}/mem.bin {dir}/mem.bin",
+        "mkdir -p {dir} && cp {snap}/vmstate.bin {dir}/vmstate.bin && cp {snap}/mem.bin {dir}/mem.bin",
         snap = snapshot_dir,
         dir = abs_dir,
     ))?;
 
-    // Start Firecracker daemon in per-VM directory
-    start_vm_firecracker(&abs_dir, &abs_socket)?;
-
-    // Configure VM with identical settings to snapshot time.
-    // FC requires boot-source, machine-config, rootfs, network, and vsock
-    // to be configured before snapshot/load.
-    let rootfs_in_dir = format!("{}/rootfs.ext4", abs_dir);
-    let boot_args = format!(
-        "root=/dev/vda rw rootwait init=/init console=ttyS0 reboot=k panic=1 net.ifnames=0 mvm.ip={ip}/24 mvm.gw={gw}",
-        ip = slot.guest_ip,
-        gw = crate::config::BRIDGE_IP,
-    );
-
-    // Boot source (must match snapshot)
-    api_put_socket(
-        &abs_socket,
-        "/boot-source",
-        &format!(
-            r#"{{"kernel_image_path": "{kernel}", "boot_args": "{args}"}}"#,
-            kernel = config.vmlinux_path,
-            args = boot_args,
-        ),
-    )?;
-
-    // Machine config (must match snapshot vCPUs and memory)
-    api_put_socket(
-        &abs_socket,
-        "/machine-config",
-        &format!(
-            r#"{{"vcpu_count": {cpus}, "mem_size_mib": {mem}}}"#,
-            cpus = snapshot_info.vcpus,
-            mem = snapshot_info.mem_mib,
-        ),
-    )?;
-
-    // Rootfs drive
-    api_put_socket(
-        &abs_socket,
-        "/drives/rootfs",
-        &format!(
-            r#"{{"drive_id": "rootfs", "path_on_host": "{rootfs}", "is_root_device": true, "is_read_only": false}}"#,
-            rootfs = rootfs_in_dir,
-        ),
-    )?;
-
-    // Create fresh config and secrets drives with caller's runtime files
+    // Create config and secrets drives in the new VM directory with fresh runtime data
     ui::info("Creating config drive...");
     let config_drive = create_dev_config_drive(&abs_dir, config)?;
-    api_put_socket(
-        &abs_socket,
-        "/drives/config",
-        &format!(
-            r#"{{"drive_id": "config", "path_on_host": "{path}", "is_root_device": false, "is_read_only": true}}"#,
-            path = config_drive,
-        ),
-    )?;
-
     ui::info("Creating secrets drive...");
     let secrets_drive = create_dev_secrets_drive(&abs_dir, &config.secret_files)?;
-    api_put_socket(
-        &abs_socket,
-        "/drives/secrets",
-        &format!(
-            r#"{{"drive_id": "secrets", "path_on_host": "{path}", "is_root_device": false, "is_read_only": true}}"#,
-            path = secrets_drive,
-        ),
-    )?;
 
-    // Network interface
-    api_put_socket(
-        &abs_socket,
-        "/network-interfaces/net1",
-        &format!(
-            r#"{{"iface_id": "net1", "guest_mac": "{mac}", "host_dev_name": "{tap}"}}"#,
-            mac = slot.mac,
-            tap = slot.tap_dev,
-        ),
-    )?;
+    // The snapshot expects drives at the template runtime directory.
+    // Create per-instance symlinks from template runtime paths to the instance drives.
+    // This allows multiple concurrent instances from the same template, each with
+    // their own config/secrets, while the snapshot finds drives at expected paths.
+    //
+    // Use flock to serialize symlink creation + snapshot load to prevent race conditions
+    // when multiple instances start simultaneously.
+    let template_runtime_dir = format!(
+        "{}/templates/{}/runtime",
+        mvm_core::config::mvm_data_dir(),
+        template_id
+    );
+    let lock_file = format!("{}.lock", template_runtime_dir);
 
-    // Vsock
-    api_put_socket(
-        &abs_socket,
-        "/vsock",
-        &format!(
-            r#"{{"vsock_id": "vsock0", "guest_cid": {cid}, "uds_path": "{dir}/v.sock"}}"#,
-            cid = mvm_guest::vsock::GUEST_CID,
-            dir = abs_dir,
-        ),
-    )?;
+    // Start Firecracker daemon in per-VM directory (before acquiring lock)
+    start_vm_firecracker(&abs_dir, &abs_socket)?;
 
-    // Load snapshot
+    // Atomic operation: create symlinks + load snapshot (serialized by flock)
     ui::info("Loading snapshot...");
     let vmstate_path = format!("{}/vmstate.bin", abs_dir);
     let mem_path = format!("{}/mem.bin", abs_dir);
-    api_put_socket(
-        &abs_socket,
-        "/snapshot/load",
-        &format!(
-            r#"{{"snapshot_path": "{vmstate}", "mem_backend": {{"backend_type": "File", "backend_path": "{mem}"}}, "enable_diff_snapshots": false}}"#,
-            vmstate = vmstate_path,
-            mem = mem_path,
-        ),
-    )?;
+    run_in_vm(&format!(
+        r#"
+        # Create lock directory
+        mkdir -p {runtime_dir}
+
+        # Use flock to serialize symlink creation and snapshot load
+        (
+            flock -x 200 || exit 1
+
+            # Remove old symlinks (from previous instance that finished loading)
+            rm -f {runtime_dir}/config.ext4 {runtime_dir}/secrets.ext4 {runtime_dir}/v.sock
+
+            # Create symlinks to this instance's drives and vsock socket location
+            ln -s {config} {runtime_dir}/config.ext4
+            ln -s {secrets} {runtime_dir}/secrets.ext4
+            ln -s {abs_dir}/v.sock {runtime_dir}/v.sock
+
+            # Load snapshot (Firecracker opens the drives via symlinks)
+            response=$(sudo curl -s -w "\n%{{http_code}}" --unix-socket {socket} -X PUT \
+                -H 'Content-Type: application/json' \
+                -d '{{"snapshot_path": "{vmstate}", "mem_backend": {{"backend_type": "File", "backend_path": "{mem}"}}, "enable_diff_snapshots": false}}' \
+                'http://localhost/snapshot/load')
+            code=$(echo "$response" | tail -1)
+            body=$(echo "$response" | sed '$d')
+            if [ "$code" -ge 400 ]; then
+                echo "[mvm] ERROR: PUT /snapshot/load returned $code: $body" >&2
+                exit 1
+            fi
+        ) 200>{lock_file}
+        "#,
+        runtime_dir = template_runtime_dir,
+        lock_file = lock_file,
+        config = config_drive,
+        secrets = secrets_drive,
+        socket = abs_socket,
+        vmstate = vmstate_path,
+        mem = mem_path,
+    ))?;
 
     // Resume vCPUs
     ui::info("Resuming VM from snapshot...");
@@ -1143,6 +1100,18 @@ pub fn create_dev_secrets_drive(abs_dir: &str, secret_files: &[DriveFile]) -> Re
 
 /// Configure a flake-built microVM via the Firecracker API (multi-VM).
 pub fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str, socket: &str) -> Result<()> {
+    configure_flake_microvm_with_drives_dir(config, abs_dir, socket, abs_dir)
+}
+
+/// Configure a flake-built microVM with custom config/secrets drive location.
+/// This allows template snapshots to use template-relative drive paths.
+/// The vsock socket is also placed in drives_dir for snapshot portability.
+pub fn configure_flake_microvm_with_drives_dir(
+    config: &FlakeRunConfig,
+    abs_dir: &str,
+    socket: &str,
+    drives_dir: &str,
+) -> Result<()> {
     let slot = &config.slot;
 
     ui::info("Configuring logger...");
@@ -1216,7 +1185,7 @@ pub fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str, socket: &
 
     // Create and attach mvm-config drive (config.json + role.toml)
     ui::info("Creating config drive...");
-    let config_drive = create_dev_config_drive(abs_dir, config)?;
+    let config_drive = create_dev_config_drive(drives_dir, config)?;
     api_put_socket(
         socket,
         "/drives/config",
@@ -1228,7 +1197,7 @@ pub fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str, socket: &
 
     // Create and attach mvm-secrets drive (stub secrets.json + extra secret files)
     ui::info("Creating secrets drive...");
-    let secrets_drive = create_dev_secrets_drive(abs_dir, &config.secret_files)?;
+    let secrets_drive = create_dev_secrets_drive(drives_dir, &config.secret_files)?;
     api_put_socket(
         socket,
         "/drives/secrets",
@@ -1276,7 +1245,7 @@ pub fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str, socket: &
         &format!(
             r#"{{"vsock_id": "vsock0", "guest_cid": {cid}, "uds_path": "{dir}/v.sock"}}"#,
             cid = mvm_guest::vsock::GUEST_CID,
-            dir = abs_dir,
+            dir = drives_dir,
         ),
     )?;
 

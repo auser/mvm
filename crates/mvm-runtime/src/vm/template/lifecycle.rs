@@ -323,7 +323,14 @@ pub fn template_build_with_snapshot(id: &str, force: bool) -> Result<()> {
         gw = BRIDGE_IP,
     );
 
-    // Build a FlakeRunConfig for the temporary VM
+    // Create a runtime directory in the template for shared snapshot drives.
+    // Using template-relative paths ensures all instances can use symlinks
+    // to their own config/secrets without path conflicts.
+    let template_runtime_dir = format!("{}/runtime", template_dir(id));
+    shell::run_in_vm(&format!("mkdir -p {}", template_runtime_dir))?;
+
+    // Build a FlakeRunConfig for the temporary VM, using template runtime dir
+    // for config/secrets so the snapshot has stable paths.
     let run_config = microvm::FlakeRunConfig {
         name: snapshot_vm_name.clone(),
         slot: slot.clone(),
@@ -352,8 +359,13 @@ pub fn template_build_with_snapshot(id: &str, force: bool) -> Result<()> {
         return Err(e.context("Failed to start snapshot VM"));
     }
 
-    // Configure and boot
-    if let Err(e) = microvm::configure_flake_microvm(&run_config, &abs_dir, &abs_socket) {
+    // Configure and boot, using template runtime dir for config/secrets drives
+    if let Err(e) = microvm::configure_flake_microvm_with_drives_dir(
+        &run_config,
+        &abs_dir,
+        &abs_socket,
+        &template_runtime_dir,
+    ) {
         cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
         return Err(e.context("Failed to configure snapshot VM"));
     }

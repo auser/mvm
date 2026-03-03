@@ -82,10 +82,40 @@ mvmctl template build my-app-gateway
 mvmctl template build my-app-worker
 ```
 
+## Edit
+
+Update an existing template's configuration:
+
+```bash
+# Increase memory for an existing template
+mvmctl template edit openclaw --mem 2048
+
+# Update multiple settings at once
+mvmctl template edit my-service --cpus 4 --mem 4096
+
+# Change the flake reference
+mvmctl template edit my-service --flake /new/path
+```
+
+After editing, rebuild the template for changes to take effect:
+
+```bash
+mvmctl template build my-service --force
+```
+
+Available edit options:
+- `--flake` - Update the Nix flake reference
+- `--profile` - Change the flake package variant
+- `--role` - Update the VM role (worker, gateway)
+- `--cpus` - Change vCPU count
+- `--mem` - Update memory in MiB
+- `--data-disk` - Change data disk size in MiB
+
 ## Manage
 
 ```bash
 mvmctl template list                   # List all templates
 mvmctl template info my-service        # Show details + revisions
+mvmctl template edit my-service --mem 2048  # Edit template settings
 mvmctl template delete my-service      # Remove a template
 ```
