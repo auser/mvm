@@ -41,7 +41,7 @@ provision:
       # Install build toolchain (cc linker for Rust, plus common utilities)
       export DEBIAN_FRONTEND=noninteractive
       apt-get update -qq
-      apt-get install -y -qq build-essential binutils lld pkg-config libssl-dev curl wget
+      apt-get install -y -qq build-essential binutils lld pkg-config libssl-dev curl wget jq
 
   - mode: user
     script: |

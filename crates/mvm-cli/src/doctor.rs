@@ -24,9 +24,11 @@ struct DoctorReport {
 pub fn run(json: bool) -> Result<()> {
     let mut checks = Vec::new();
 
-    // ── Tools ──────────────────────────────────────────────────────
-    checks.push(check_cmd("rustup", "tools", "rustup --version"));
-    checks.push(check_cmd("cargo", "tools", "cargo --version"));
+    // ── Prerequisites (user must install before bootstrap) ───────
+    checks.push(check_cmd("rustup", "prerequisites", "rustup --version"));
+    checks.push(check_cmd("cargo", "prerequisites", "cargo --version"));
+
+    // ── Managed Tools (installed by bootstrap) ────────────────────
 
     let in_vm = shell::inside_lima();
     if in_vm {
@@ -89,6 +91,18 @@ pub fn run(json: bool) -> Result<()> {
         for m in &missing {
             ui::info(&format!("  {} — {}", m.name, m.info));
         }
+
+        // Provide category-specific guidance
+        let has_prerequisites = missing.iter().any(|c| c.category == "prerequisites");
+        let has_managed = missing.iter().any(|c| c.category == "tools");
+
+        if has_prerequisites {
+            ui::info("\nPrerequisites missing: Install Rust from https://rustup.rs");
+        }
+        if has_managed {
+            ui::info("\nManaged tools missing: Run 'mvmctl bootstrap' to install");
+        }
+
         anyhow::bail!("doctor found issues");
     }
 
@@ -102,6 +116,7 @@ fn render_text(report: &DoctorReport) {
         if c.category != current_category {
             current_category = c.category;
             let title = match current_category {
+                "prerequisites" => "Prerequisites",
                 "tools" => "Tools",
                 "platform" => "Platform",
                 _ => current_category,

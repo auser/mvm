@@ -279,13 +279,9 @@ pub fn upgrade(check_only: bool, force: bool) -> Result<()> {
     extract_and_install(target, tmp_dir.path(), &current_exe)?;
 
     ui::success(&format!("\nSuccessfully upgraded to {}!", latest_tag));
-
-    // Verify the new binary works
-    let output = run_host(current_exe.to_str().unwrap(), &["--version"])?;
-    if output.status.success() {
-        let version_output = String::from_utf8_lossy(&output.stdout);
-        ui::success(&format!("Verified: {}", version_output.trim()));
-    }
+    ui::info("The binary has been replaced on disk.");
+    ui::info("To verify: Open a new shell and run 'mvmctl --version'");
+    ui::info("Or run: hash -r  (to clear your shell's command cache)");
 
     Ok(())
 }
