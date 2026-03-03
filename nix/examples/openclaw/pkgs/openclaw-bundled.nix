@@ -36,9 +36,10 @@ stdenv.mkDerivation {
     BUNDLE="$out/lib/openclaw/dist/openclaw-bundle.mjs"
 
     # Create a full ESM bundle that inlines all dependencies for fast loading
-    # on Firecracker's slow virtio-block storage. Native .node modules are
-    # automatically kept external by esbuild. This eliminates the 800+ code-split
-    # chunks and thousands of module resolution calls that cause slow startup.
+    # on Firecracker's slow virtio-block storage. Native .node modules and
+    # platform-specific packages are kept external. This eliminates the 800+
+    # code-split chunks and thousands of module resolution calls that cause
+    # slow startup.
     echo "Bundling $ENTRY with esbuild..."
     esbuild "$ENTRY" \
       --bundle \
@@ -46,6 +47,12 @@ stdenv.mkDerivation {
       --target=node22 \
       --format=esm \
       --outfile="$BUNDLE" \
+      --external:*.node \
+      --external:@smithy/* \
+      --external:chromium-bidi \
+      --external:@node-llama-cpp/* \
+      --external:@lancedb/* \
+      --external:playwright-core \
       --log-level=warning 2>&1 || {
         echo "WARNING: esbuild bundle failed, falling back to unbundled entry"
         BUNDLE="$ENTRY"
