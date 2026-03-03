@@ -10,6 +10,7 @@ use crate::template_cmd;
 use crate::ui;
 use crate::upgrade;
 
+use mvm_core::util::parse_human_size;
 use mvm_core::vm_backend::VmId;
 use mvm_runtime::config;
 use mvm_runtime::shell;
@@ -83,9 +84,9 @@ enum Commands {
         /// CPU cores
         #[arg(long, short = 'c')]
         cpus: Option<u32>,
-        /// Memory in MB
+        /// Memory (supports human-readable sizes: 512M, 4G, 1024K, or plain MB)
         #[arg(long, short = 'm')]
-        memory: Option<u32>,
+        memory: Option<String>,
     },
     /// Stop a running microVM (by name) or all VMs (--all)
     Stop {
@@ -244,9 +245,9 @@ enum Commands {
         /// vCPU cores
         #[arg(long)]
         cpus: Option<u32>,
-        /// Memory in MiB
+        /// Memory (supports human-readable sizes: 512M, 4G, 1024K, or plain MB)
         #[arg(long)]
-        memory: Option<u32>,
+        memory: Option<String>,
         /// Runtime config (TOML) for persistent resources/volumes
         #[arg(long)]
         config: Option<String>,
@@ -288,9 +289,9 @@ enum Commands {
         /// vCPU cores (overrides config file)
         #[arg(long)]
         cpus: Option<u32>,
-        /// Memory in MiB (overrides config file)
+        /// Memory (supports human-readable sizes: 512M, 4G, 1024K, or plain MB)
         #[arg(long)]
-        memory: Option<u32>,
+        memory: Option<String>,
         /// Hypervisor backend (firecracker, qemu). Default: firecracker.
         #[arg(long, default_value = "firecracker")]
         hypervisor: String,
@@ -336,12 +337,12 @@ enum TemplateCmd {
         /// Default vCPU count for VMs using this template
         #[arg(long, default_value = "2")]
         cpus: u8,
-        /// Default memory in MiB for VMs using this template
+        /// Default memory (supports human-readable sizes: 512M, 4G, or plain MB)
         #[arg(long, default_value = "1024")]
-        mem: u32,
-        /// Data disk size in MiB (0 = no data disk)
+        mem: String,
+        /// Data disk size (supports human-readable sizes: 10G, 512M, or plain MB; 0 = no disk)
         #[arg(long, default_value = "0")]
-        data_disk: u32,
+        data_disk: String,
     },
     /// Create multiple role-specific templates (name-role)
     CreateMulti {
@@ -359,12 +360,12 @@ enum TemplateCmd {
         /// Default vCPU count for VMs using this template
         #[arg(long, default_value = "2")]
         cpus: u8,
-        /// Default memory in MiB for VMs using this template
+        /// Default memory (supports human-readable sizes: 512M, 4G, or plain MB)
         #[arg(long, default_value = "1024")]
-        mem: u32,
-        /// Data disk size in MiB (0 = no data disk)
+        mem: String,
+        /// Data disk size (supports human-readable sizes: 10G, 512M, or plain MB; 0 = no disk)
         #[arg(long, default_value = "0")]
-        data_disk: u32,
+        data_disk: String,
     },
     /// Build a template (shared image via nix build)
     Build {
@@ -434,12 +435,12 @@ enum TemplateCmd {
         /// Update vCPU count
         #[arg(long)]
         cpus: Option<u8>,
-        /// Update memory in MiB
+        /// Update memory (supports human-readable sizes: 512M, 4G, or plain MB)
         #[arg(long)]
-        mem: Option<u32>,
-        /// Update data disk size in MiB
+        mem: Option<String>,
+        /// Update data disk size (supports human-readable sizes: 10G, 512M, or plain MB)
         #[arg(long)]
-        data_disk: Option<u32>,
+        data_disk: Option<String>,
     },
     /// Delete a template and its artifacts
     Delete {
@@ -612,10 +613,17 @@ pub fn run() -> Result<()> {
             volume,
             cpus,
             memory,
-        } => match image {
-            Some(ref elf) => cmd_start_image(elf, config.as_deref(), &volume, cpus, memory),
-            None => cmd_start(),
-        },
+        } => {
+            let memory_mb = memory
+                .as_ref()
+                .map(|s| parse_human_size(s))
+                .transpose()
+                .context("Invalid memory size")?;
+            match image {
+                Some(ref elf) => cmd_start_image(elf, config.as_deref(), &volume, cpus, memory_mb),
+                None => cmd_start(),
+            }
+        }
         Commands::Stop { name, all } => cmd_stop(name.as_deref(), all),
         Commands::Ssh => cmd_ssh(),
         Commands::SshConfig => cmd_ssh_config(),
@@ -681,22 +689,29 @@ pub fn run() -> Result<()> {
             port,
             env,
             forward,
-        } => cmd_run(RunParams {
-            flake_ref: flake.as_deref(),
-            template_name: template.as_deref(),
-            name: name.as_deref(),
-            profile: profile.as_deref(),
-            cpus,
-            memory,
-            config_path: config.as_deref(),
-            volumes: &volume,
-            hypervisor: &hypervisor,
-            config_dir: config_dir.as_deref(),
-            secrets_dir: secrets_dir.as_deref(),
-            ports: &port,
-            env_vars: &env,
-            forward,
-        }),
+        } => {
+            let memory_mb = memory
+                .as_ref()
+                .map(|s| parse_human_size(s))
+                .transpose()
+                .context("Invalid memory size")?;
+            cmd_run(RunParams {
+                flake_ref: flake.as_deref(),
+                template_name: template.as_deref(),
+                name: name.as_deref(),
+                profile: profile.as_deref(),
+                cpus,
+                memory: memory_mb,
+                config_path: config.as_deref(),
+                volumes: &volume,
+                hypervisor: &hypervisor,
+                config_dir: config_dir.as_deref(),
+                secrets_dir: secrets_dir.as_deref(),
+                ports: &port,
+                env_vars: &env,
+                forward,
+            })
+        }
         Commands::Up {
             name,
             config,
@@ -705,15 +720,22 @@ pub fn run() -> Result<()> {
             cpus,
             memory,
             hypervisor,
-        } => cmd_up(
-            name.as_deref(),
-            config.as_deref(),
-            flake.as_deref(),
-            profile.as_deref(),
-            cpus,
-            memory,
-            &hypervisor,
-        ),
+        } => {
+            let memory_mb = memory
+                .as_ref()
+                .map(|s| parse_human_size(s))
+                .transpose()
+                .context("Invalid memory size")?;
+            cmd_up(
+                name.as_deref(),
+                config.as_deref(),
+                flake.as_deref(),
+                profile.as_deref(),
+                cpus,
+                memory_mb,
+                &hypervisor,
+            )
+        }
         Commands::Down { name, config } => cmd_down(name.as_deref(), config.as_deref()),
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::ShellInit => shell_init::print_shell_init(),
@@ -2705,7 +2727,11 @@ fn cmd_template(action: TemplateCmd) -> Result<()> {
             cpus,
             mem,
             data_disk,
-        } => template_cmd::create_single(&name, &flake, &profile, &role, cpus, mem, data_disk),
+        } => {
+            let mem_mb = parse_human_size(&mem).context("Invalid memory size")?;
+            let data_disk_mb = parse_human_size(&data_disk).context("Invalid data disk size")?;
+            template_cmd::create_single(&name, &flake, &profile, &role, cpus, mem_mb, data_disk_mb)
+        }
         TemplateCmd::CreateMulti {
             base,
             flake,
@@ -2715,8 +2741,18 @@ fn cmd_template(action: TemplateCmd) -> Result<()> {
             mem,
             data_disk,
         } => {
+            let mem_mb = parse_human_size(&mem).context("Invalid memory size")?;
+            let data_disk_mb = parse_human_size(&data_disk).context("Invalid data disk size")?;
             let role_list: Vec<String> = roles.split(',').map(|s| s.trim().to_string()).collect();
-            template_cmd::create_multi(&base, &flake, &profile, &role_list, cpus, mem, data_disk)
+            template_cmd::create_multi(
+                &base,
+                &flake,
+                &profile,
+                &role_list,
+                cpus,
+                mem_mb,
+                data_disk_mb,
+            )
         }
         TemplateCmd::Build {
             name,
@@ -2737,15 +2773,27 @@ fn cmd_template(action: TemplateCmd) -> Result<()> {
             cpus,
             mem,
             data_disk,
-        } => template_cmd::edit(
-            &name,
-            flake.as_deref(),
-            profile.as_deref(),
-            role.as_deref(),
-            cpus,
-            mem,
-            data_disk,
-        ),
+        } => {
+            let mem_mb = mem
+                .as_ref()
+                .map(|s| parse_human_size(s))
+                .transpose()
+                .context("Invalid memory size")?;
+            let data_disk_mb = data_disk
+                .as_ref()
+                .map(|s| parse_human_size(s))
+                .transpose()
+                .context("Invalid data disk size")?;
+            template_cmd::edit(
+                &name,
+                flake.as_deref(),
+                profile.as_deref(),
+                role.as_deref(),
+                cpus,
+                mem_mb,
+                data_disk_mb,
+            )
+        }
         TemplateCmd::Delete { name, force } => template_cmd::delete(&name, force),
         TemplateCmd::Init {
             name,
@@ -3908,7 +3956,7 @@ mod tests {
                 assert_eq!(flake, Some(".".to_string()));
                 assert_eq!(profile.as_deref(), Some("full"));
                 assert_eq!(cpus, Some(4));
-                assert_eq!(memory, Some(2048));
+                assert_eq!(memory, Some("2048".to_string()));
             }
             _ => panic!("Expected Run command"),
         }
@@ -4411,7 +4459,7 @@ mod tests {
                 assert_eq!(flake.as_deref(), Some("."));
                 assert_eq!(profile.as_deref(), Some("gateway"));
                 assert_eq!(cpus, Some(4));
-                assert_eq!(memory, Some(2048));
+                assert_eq!(memory, Some("2048".to_string()));
                 assert_eq!(hypervisor, "firecracker");
             }
             _ => panic!("Expected Up command"),

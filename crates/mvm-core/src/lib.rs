@@ -21,4 +21,5 @@ pub mod signing;
 pub mod template;
 pub mod tenant;
 pub mod time;
+pub mod util;
 pub mod vm_backend;
