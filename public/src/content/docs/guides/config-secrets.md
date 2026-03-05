@@ -109,7 +109,7 @@ The OpenClaw service's `preStart` script checks for `/mnt/config/openclaw.json` 
 
 ### Using snapshots for fast startup
 
-Build the template with `--snapshot` to capture a running VM state. Subsequent runs restore from the snapshot instead of cold-booting, reducing startup time significantly:
+Build the template with `--snapshot` to capture a running VM state. Subsequent runs restore from the snapshot instead of cold-booting, reducing startup time from minutes to **1-2 seconds**:
 
 ```bash
 mvmctl template build openclaw --snapshot
@@ -120,6 +120,37 @@ mvmctl run --template openclaw --name oc \
 ```
 
 When restoring from a snapshot with `-v` mounts, the guest agent automatically remounts config/secrets drives and restarts services with the fresh data.
+
+#### Snapshots + Dynamic Mounts = Instant Boots with Flexible Config
+
+**Key insight:** The snapshot stores the OS and application state (memory, running processes, compiled code caches), but **config and secrets drives are created fresh at runtime** from your host directories. This means:
+
+- ✅ **Same snapshot** can serve multiple instances with different configs
+- ✅ **Update configs without rebuilding** — just change the files in your host directory
+- ✅ **Instant boot + dynamic configuration** — get both benefits simultaneously
+
+Example: Run three OpenClaw instances from one snapshot with different API keys:
+
+```bash
+# Production gateway with prod Anthropic key
+mvmctl run --template openclaw --name oc-prod \
+    -v ./prod/config:/mnt/config \
+    -v ./prod/secrets:/mnt/secrets \
+    -p 3000:3000
+
+# Staging gateway with test key
+mvmctl run --template openclaw --name oc-staging \
+    -v ./staging/config:/mnt/config \
+    -v ./staging/secrets:/mnt/secrets \
+    -p 3001:3000
+
+# Dev gateway with no key (localhost-only testing)
+mvmctl run --template openclaw --name oc-dev \
+    -v ./dev/config:/mnt/config \
+    -p 3002:3000
+```
+
+All three VMs restore from the same snapshot (1-2 second boot) but get different configs and secrets at runtime.
 
 ### Running commands inside the VM
 

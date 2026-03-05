@@ -42,7 +42,7 @@ Builds run `nix build` inside the Lima VM to produce kernel + rootfs artifacts.
 
 ## Snapshots
 
-Build with `--snapshot` to capture a fully booted, healthy VM state. Subsequent runs restore from this snapshot instead of cold-booting — sub-second startup instead of minutes.
+Build with `--snapshot` to capture a fully booted, healthy VM state. Subsequent runs restore from this snapshot instead of cold-booting — **1-2 second startup instead of minutes**.
 
 ```bash
 # Build + snapshot (one-time, waits for all services to be healthy)
@@ -61,6 +61,51 @@ The snapshot process:
 6. Stores the snapshot alongside the template revision
 
 No flags are needed on `run` — snapshot detection is automatic. If a template has a snapshot, it's used; otherwise the VM cold-boots.
+
+### Dynamic Configuration with Snapshots
+
+**Key insight:** Snapshots preserve the OS and application state, but **config and secrets drives are created fresh at runtime** from your host directories. This means you get instant boots **and** flexible per-instance configuration.
+
+**What's stored in the snapshot:**
+- OS and kernel state
+- Installed packages and applications
+- Memory contents (running services, compiled code caches)
+- Network stack configuration
+
+**What's NOT stored (created fresh each run):**
+- Config drive (`/mnt/config`) — built from your `--volume` or `--config-dir`
+- Secrets drive (`/mnt/secrets`) — built from your `--volume` or `--secrets-dir`
+- Data volumes — built from your `--volume host:guest:size`
+
+#### Multiple Instances from One Snapshot
+
+Run production, staging, and dev instances from the **same template snapshot** with **different configurations**:
+
+```bash
+# Production: real API keys, strict config
+mvmctl run --template my-app --name prod \
+    -v ./prod/config:/mnt/config \
+    -v ./prod/secrets:/mnt/secrets
+
+# Staging: test API keys, relaxed config
+mvmctl run --template my-app --name staging \
+    -v ./staging/config:/mnt/config \
+    -v ./staging/secrets:/mnt/secrets
+
+# Dev: no API keys, debug logging enabled
+mvmctl run --template my-app --name dev \
+    -v ./dev/config:/mnt/config
+```
+
+All three VMs restore from the **same snapshot** (1-2 second boot) but get **different configs/secrets** at runtime. The guest agent automatically remounts config/secrets drives after restore and restarts services with the fresh data.
+
+**Benefits:**
+
+✅ **Instant boots** — 1-2 seconds from snapshot instead of minutes cold-booting
+✅ **Consistent base** — all instances run identical OS/app versions
+✅ **Flexible configuration** — each instance gets its own runtime config
+✅ **No config baked into image** — same template works for prod, staging, dev, testing
+✅ **Easy testing** — spin up throwaway instances with test configs in seconds
 
 ## Share via Registry
 

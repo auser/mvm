@@ -71,23 +71,6 @@ enum Commands {
         #[arg(long)]
         project: Option<String>,
     },
-    /// Start a Firecracker microVM (headless, no SSH)
-    Start {
-        /// Path to a built .elf image file (omit for default Ubuntu microVM)
-        image: Option<String>,
-        /// Runtime config file (TOML) with defaults for resources and volumes
-        #[arg(long)]
-        config: Option<String>,
-        /// Volume override (format: host_path:guest_mount:size). Repeatable.
-        #[arg(long, short = 'v')]
-        volume: Vec<String>,
-        /// CPU cores
-        #[arg(long, short = 'c')]
-        cpus: Option<u32>,
-        /// Memory (supports human-readable sizes: 512M, 4G, 1024K, or plain MB)
-        #[arg(long, short = 'm')]
-        memory: Option<String>,
-    },
     /// Stop a running microVM (by name) or all VMs (--all)
     Stop {
         /// Name of the VM to stop
@@ -228,7 +211,7 @@ enum Commands {
         json: bool,
     },
     /// Build from a Nix flake and boot a headless Firecracker VM
-    #[command(group(clap::ArgGroup::new("source").required(true)))]
+    #[command(alias = "start", group(clap::ArgGroup::new("source").required(true)))]
     Run {
         /// Nix flake reference (local path or remote URI)
         #[arg(long, group = "source")]
@@ -601,23 +584,6 @@ pub fn run() -> Result<()> {
             lima_mem,
             project,
         } => cmd_dev(lima_cpus, lima_mem, project.as_deref()),
-        Commands::Start {
-            image,
-            config,
-            volume,
-            cpus,
-            memory,
-        } => {
-            let memory_mb = memory
-                .as_ref()
-                .map(|s| parse_human_size(s))
-                .transpose()
-                .context("Invalid memory size")?;
-            match image {
-                Some(ref elf) => cmd_start_image(elf, config.as_deref(), &volume, cpus, memory_mb),
-                None => cmd_start(),
-            }
-        }
         Commands::Stop { name, all } => cmd_stop(name.as_deref(), all),
         Commands::Ssh => cmd_ssh(),
         Commands::SshConfig => cmd_ssh_config(),
@@ -943,73 +909,6 @@ fn setup_security_baseline() -> Result<()> {
     }
 
     Ok(())
-}
-
-fn cmd_start() -> Result<()> {
-    microvm::start()
-}
-
-fn cmd_start_image(
-    elf_path: &str,
-    config_path: Option<&str>,
-    volumes: &[String],
-    cpus: Option<u32>,
-    memory: Option<u32>,
-) -> Result<()> {
-    // If limactl isn't available (likely already inside Lima), skip host VM check.
-    let limactl_present = shell::run_host("which", &["limactl"])
-        .map(|o| o.status.success())
-        .unwrap_or(false);
-    if limactl_present {
-        lima::require_running()?;
-    } else {
-        ui::warn("limactl not found; assuming we're already inside the Lima VM and proceeding.");
-    }
-
-    let rt_config = match config_path {
-        Some(p) => image::parse_runtime_config(p)?,
-        None => image::RuntimeConfig::default(),
-    };
-
-    let mut elf_args = Vec::new();
-
-    let final_cpus = cpus.or(rt_config.cpus);
-    let final_memory = memory.or(rt_config.memory);
-    if let Some(c) = final_cpus {
-        elf_args.push("--cpus".to_string());
-        elf_args.push(c.to_string());
-    }
-    if let Some(m) = final_memory {
-        elf_args.push("--memory".to_string());
-        elf_args.push(m.to_string());
-    }
-
-    if !volumes.is_empty() {
-        for v in volumes {
-            elf_args.push("--volume".to_string());
-            elf_args.push(v.clone());
-        }
-    } else {
-        for v in &rt_config.volumes {
-            elf_args.push("--volume".to_string());
-            elf_args.push(format!("{}:{}:{}", v.host, v.guest, v.size));
-        }
-    }
-
-    let args_str = elf_args
-        .iter()
-        .map(|a| shell_escape(a))
-        .collect::<Vec<_>>()
-        .join(" ");
-
-    let cmd = if args_str.is_empty() {
-        elf_path.to_string()
-    } else {
-        format!("{} {}", elf_path, args_str)
-    };
-
-    ui::info(&format!("Starting image: {}", elf_path));
-    shell::replace_process("limactl", &["shell", config::VM_NAME, "bash", "-c", &cmd])
 }
 
 fn shell_escape(s: &str) -> String {

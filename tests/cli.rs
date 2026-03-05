@@ -46,7 +46,6 @@ fn test_help_lists_all_subcommands() {
         "bootstrap",
         "setup",
         "dev",
-        "start",
         "stop",
         "ssh",
         "shell",

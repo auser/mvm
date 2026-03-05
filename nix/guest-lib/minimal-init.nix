@@ -79,8 +79,11 @@ let
         echo "[init] preStart for ${name}..." > /dev/console
         ${preStart}
       '';
+      # Service env defaults: only set if not already defined (e.g. by
+      # --env flags sourced globally from mvm-env.env).  This lets
+      # `mvmctl run --env PORT=9000` override `env.PORT = "3100"`.
       envLines = lib.concatStringsSep "\n" (
-        lib.mapAttrsToList (k: v: "export ${k}='${v}'") (svc.env or {})
+        lib.mapAttrsToList (k: v: ": \${${k}:='${v}'} ; export ${k}") (svc.env or {})
       );
       # Log redirection: logFile or /dev/console.
       redirect = if (svc ? logFile) then
@@ -257,20 +260,29 @@ pkgs.writeScript "mvm-minimal-init" ''
   mount -t ext4 -o noexec,nosuid,nodev /dev/vdd /mnt/data 2>/dev/null && \
     echo "[init] mounted data drive (vdd)" > /dev/console || true
 
-  # ── 6. Write health check integration configs ───────────────────
+  # ── 6. Source global environment variables from config drive ─────
+  # Variables injected via `mvmctl run -e KEY=VALUE` are written to
+  # mvm-env.env on the config drive.  Source them here so every
+  # service inherits them automatically.
+  if [ -f /mnt/config/mvm-env.env ]; then
+    echo "[init] loading environment from mvm-env.env" > /dev/console
+    . /mnt/config/mvm-env.env
+  fi
+
+  # ── 7. Write health check integration configs ───────────────────
   ${healthCheckBlocks}
 
-  # ── 7. Start services (respawn loops) ───────────────────────────
+  # ── 8. Start services (respawn loops) ───────────────────────────
   SERVICE_PIDS=""
   ${serviceBlocks}
 
-  # ── 8. Start guest agent ────────────────────────────────────────
+  # ── 9. Start guest agent ────────────────────────────────────────
   AGENT_PID=""
   ${guestAgentBlock}
 
   echo "[init] all services started" > /dev/console
 
-  # ── 9. Post-restore handler (SIGUSR1) ──────────────────────────
+  # ── 10. Post-restore handler (SIGUSR1) ─────────────────────────
   # After snapshot restore, the host sends SIGUSR1 via the guest agent.
   # This remounts config/secrets drives (which now have fresh data from
   # -v mounts) and kills service processes so the respawn loops restart
@@ -298,11 +310,15 @@ pkgs.writeScript "mvm-minimal-init" ''
       umount /mnt/secrets
       mount --bind /run/mvm-secrets /mnt/secrets
     } || true
+    # Re-source environment variables (may have changed).
+    if [ -f /mnt/config/mvm-env.env ]; then
+      . /mnt/config/mvm-env.env
+    fi
     echo "[init] post-restore complete, services restarting" > /dev/console
   }
   trap post_restore USR1
 
-  # ── 10. Graceful shutdown handler ────────────────────────────────
+  # ── 11. Graceful shutdown handler ───────────────────────────────
   shutdown() {
     echo "[init] shutting down..." > /dev/console
     # Signal all service subshells to stop respawning.
@@ -322,7 +338,7 @@ pkgs.writeScript "mvm-minimal-init" ''
 
   trap shutdown TERM INT
 
-  # ── 11. PID 1 reaper: wait for children, re-enter on signal ────
+  # ── 12. PID 1 reaper: wait for children, re-enter on signal ────
   while true; do
     wait
   done

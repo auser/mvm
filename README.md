@@ -372,7 +372,7 @@ mvmctl template build base-worker --config templates.toml
 
 ### Snapshots
 
-Add `--snapshot` to capture a fully booted, healthy VM state at build time. Subsequent `run` commands restore from this snapshot instead of cold-booting -- sub-second startup instead of minutes:
+Add `--snapshot` to capture a fully booted, healthy VM state at build time. Subsequent `run` commands restore from this snapshot instead of cold-booting -- **1-2 second startup instead of minutes**:
 
 ```bash
 # Build + snapshot (one-time)
@@ -383,6 +383,45 @@ mvmctl run --template openclaw --name oc
 ```
 
 The snapshot process builds the image, boots a temporary VM, waits for all services to be healthy, then captures a full Firecracker snapshot (`vmstate.bin` + `mem.bin`). Use `--force --snapshot` to rebuild and re-snapshot.
+
+#### Dynamic Mounts + Snapshots = Best of Both Worlds
+
+**What's stored in the snapshot:**
+- OS and kernel state
+- Installed packages and applications
+- Memory contents (running services, caches)
+- Network stack configuration
+
+**What's NOT stored (created fresh at runtime):**
+- Config drive (`/mnt/config`) — built from `--volume` or `--config-dir`
+- Secrets drive (`/mnt/secrets`) — built from `--volume` or `--secrets-dir`
+- Data volumes — built from `--volume host:guest:size`
+
+This means **multiple VMs can run from the same template snapshot with different configurations**:
+
+```bash
+# Production instance with prod config and API keys
+mvmctl run --template openclaw --name oc-prod \
+    -v ./prod/config:/mnt/config \
+    -v ./prod/secrets:/mnt/secrets
+
+# Staging instance with staging config and test API keys
+mvmctl run --template openclaw --name oc-staging \
+    -v ./staging/config:/mnt/config \
+    -v ./staging/secrets:/mnt/secrets
+
+# Dev instance with local config and no API keys
+mvmctl run --template openclaw --name oc-dev \
+    -v ./dev/config:/mnt/config
+```
+
+All three VMs restore from the **same snapshot** (1-2 second boot) but get **different configs and secrets** at runtime. The guest agent automatically remounts config/secrets drives after restore and restarts services with the fresh data.
+
+**Benefits:**
+- ✅ **Instant boots** — 1-2 seconds from snapshot instead of minutes cold-booting
+- ✅ **Consistent base** — all instances run identical OS/app versions
+- ✅ **Flexible configuration** — each instance gets its own runtime config
+- ✅ **No config baked into image** — same template works for prod, staging, dev, testing
 
 ### Share via Registry
 

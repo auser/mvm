@@ -458,6 +458,11 @@ pub fn template_build_with_snapshot(id: &str, force: bool) -> Result<()> {
     network::bridge_ensure()?;
     network::tap_create(&slot)?;
 
+    // Clean up stale vsock socket from a previous template build.
+    // start_vm_firecracker only cleans abs_dir/v.sock, but the vsock device
+    // binds to template_runtime_dir/v.sock (a different path).
+    let _ = shell::run_in_vm(&format!("rm -f {}/v.sock", template_runtime_dir));
+
     // Start Firecracker
     let start_result = microvm::start_vm_firecracker(&abs_dir, &abs_socket);
     if let Err(e) = start_result {

@@ -26,7 +26,8 @@ if ! cargo run --quiet -- template list 2>/dev/null | grep -q "paperclip"; then
     cargo run --quiet -- template build paperclip
 fi
 
-# Run from template with config and secrets from host
+# Run from template with config and secrets from host.
+# Environment variables can be injected with --env (set globally in the VM).
 echo "Starting VM..."
 cargo run -- run \
     --template paperclip \

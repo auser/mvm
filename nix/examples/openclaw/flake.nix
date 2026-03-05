@@ -80,6 +80,8 @@
               cp $TMPDIR/openclaw-bundle.mjs $out/lib/openclaw/openclaw.mjs
               cp $OC/package.json $out/lib/openclaw/package.json
               cp -r $OC/dist/control-ui $out/lib/openclaw/dist/control-ui
+              mkdir -p $out/lib/openclaw/docs/reference
+              cp -r $OC/docs/reference/templates $out/lib/openclaw/docs/reference/templates
             '';
 
             installPhase = "true";
@@ -111,6 +113,13 @@
                 mountpoint -q /var/lib/openclaw || mount -t tmpfs -o mode=0755,size=512m tmpfs /var/lib/openclaw
                 chown openclaw:openclaw /var/lib/openclaw
                 install -d -o openclaw -g openclaw /var/lib/openclaw/{workspace,data}
+
+                # Copy custom workspace templates from config drive (AGENTS.md, SOUL.md, etc.)
+                if [ -d /mnt/config/templates ]; then
+                  echo "[setup] Copying custom templates from /mnt/config/templates" >&2
+                  cp -r /mnt/config/templates/* /var/lib/openclaw/workspace/
+                  chown -R openclaw:openclaw /var/lib/openclaw/workspace/
+                fi
 
                 # Enable exec access for mvmctl vm exec (if not already on config drive).
                 if [ ! -f /mnt/config/security-policy.json ]; then
@@ -182,6 +191,10 @@ CONFIG
                 while ! grep -q ':0BB9 ' /proc/net/tcp 2>/dev/null; do
                   sleep 1
                 done
+                # Stabilization delay: the gateway's runGatewayLoop fires a second
+                # concurrent startGatewayServer() that takes ~5s (lock timeout) and
+                # briefly probes port 3001. Wait for that to settle before proxying.
+                sleep 8
                 echo "[proxy] gateway ready, proxying 0.0.0.0:3000 -> 127.0.0.1:3001" >&2
                 exec ${pkgs.nodejs_22}/bin/node -e '
                   const net = require("net");

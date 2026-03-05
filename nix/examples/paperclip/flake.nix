@@ -20,43 +20,77 @@
           version = "2026.3.4";
           rev = "c7c96feef77e20bee60be39ad17a664a14a0c3f1";
 
-          # Phase 1: Clone repo + pnpm install (fixed-output derivation).
+          # Source: Nix fetchGit is deterministic — same rev always produces
+          # the same hash, so this never breaks after garbage collection.
+          paperclip-git = builtins.fetchGit {
+            url = "https://github.com/paperclipai/paperclip.git";
+            inherit rev;
+            allRefs = true;
+          };
+
+          # Phase 1: pnpm install (fixed-output derivation).
           # FOD can access the network; output verified by content hash.
-          # To update: change rev, set outputHash = "", build to get new hash.
+          # Uses npm instead of pnpm for deterministic node_modules output.
+          # To update: change rev above, set outputHash = "", build to get new hash.
           paperclip-src = pkgs.stdenv.mkDerivation {
             pname = "paperclip-src";
             inherit version;
+            src = paperclip-git;
 
-            dontUnpack = true;
             dontFixup = true;
 
             outputHashMode = "recursive";
-            outputHash = "";  # Build once to get the correct hash
+            outputHashAlgo = "sha256";
+            outputHash = "sha256-z4IgLVwena+f9FXcX3N0ccy19ixfTi5xYQyczgv8lB4=";
 
-            nativeBuildInputs = [ pkgs.nodejs_22 pkgs.cacert pkgs.git ];
+            nativeBuildInputs = [ pkgs.nodejs_22 pkgs.cacert ];
 
             SSL_CERT_FILE = "${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt";
 
             buildPhase = ''
               export HOME=$TMPDIR
-              export COREPACK_ENABLE_STRICT=0
+              export npm_config_cache=$TMPDIR/.npm
 
-              # Enable pnpm via corepack
-              corepack enable --install-directory=$TMPDIR/bin
-              export PATH=$TMPDIR/bin:$PATH
-              corepack prepare pnpm@9.15.4 --activate
+              cp -r $src $out
+              chmod -R u+w $out
+              cd $out
 
-              # Clone at pinned commit
-              git clone https://github.com/paperclipai/paperclip.git $TMPDIR/paperclip
-              cd $TMPDIR/paperclip
-              git checkout ${rev}
-
-              # Install dependencies
-              pnpm install --frozen-lockfile --ignore-scripts
-
-              # Copy to output (without .git to save space)
-              cp -r $TMPDIR/paperclip $out
-              rm -rf $out/.git
+              # npm install is more deterministic than pnpm for FODs.
+              # The pnpm content-addressable store uses hardlinks whose
+              # ordering varies between runs, breaking the fixed hash.
+              # Upstream uses pnpm-workspace.yaml + workspace:* protocol.
+              # npm needs a "workspaces" field and doesn't support workspace:*.
+              # Patch all package.json files to be npm-compatible.
+              node -e "
+                const fs = require('fs');
+                const path = require('path');
+                // Add workspaces to root package.json
+                const rootPkg = JSON.parse(fs.readFileSync('package.json','utf8'));
+                rootPkg.workspaces = ['packages/*','packages/adapters/*','server','ui','cli'];
+                // Force modern @types/node (npm resolves to 12.x otherwise)
+                // Pin better-auth to match pnpm lock (1.5.x moved drizzle adapter)
+                rootPkg.overrides = rootPkg.overrides || {};
+                rootPkg.overrides['@types/node'] = '>=20';
+                rootPkg.overrides['better-auth'] = '1.4.18';
+                fs.writeFileSync('package.json', JSON.stringify(rootPkg, null, 2) + '\n');
+                // Replace workspace:* with * in all package.json files
+                function walk(dir) {
+                  for (const f of fs.readdirSync(dir, {withFileTypes:true})) {
+                    if (f.name === 'node_modules') continue;
+                    const p = path.join(dir, f.name);
+                    if (f.isDirectory()) walk(p);
+                    else if (f.name === 'package.json') {
+                      let txt = fs.readFileSync(p,'utf8');
+                      if (txt.includes('workspace:')) {
+                        txt = txt.replace(/\"workspace:\*\"/g, '\"*\"').replace(/\"workspace:\^[^\"]*\"/g, '\"*\"');
+                        fs.writeFileSync(p, txt);
+                      }
+                    }
+                  }
+                }
+                walk('.');
+              "
+              npm install --ignore-scripts --no-bin-links --legacy-peer-deps
             '';
 
             installPhase = "true";
@@ -76,6 +110,8 @@
           };
 
           # Phase 3: Build TypeScript (compile server + UI).
+          # npm flat layout means @types/* are hoisted to root node_modules
+          # so tsc resolution works without the pnpm symlink workaround.
           paperclip-built = pkgs.stdenv.mkDerivation {
             pname = "paperclip-built";
             inherit version;
@@ -85,21 +121,56 @@
 
             buildPhase = ''
               export HOME=$TMPDIR
-              export COREPACK_ENABLE_STRICT=0
-
-              corepack enable --install-directory=$TMPDIR/bin
-              export PATH=$TMPDIR/bin:$PATH
-              corepack prepare pnpm@9.15.4 --activate
 
               # Build in a writable copy
               cp -r $src $TMPDIR/build
               chmod -R u+w $TMPDIR/build
               cd $TMPDIR/build
 
-              pnpm --filter @paperclipai/shared build
-              pnpm --filter @paperclipai/db build
-              pnpm --filter @paperclipai/ui build
-              pnpm --filter @paperclipai/server build
+              ROOT=$TMPDIR/build
+              TSC="$ROOT/node_modules/typescript/bin/tsc"
+              VITE="$ROOT/node_modules/vite/bin/vite.js"
+
+              # Upstream is missing @types/ws — add a minimal type shim so tsc
+              # can compile server/src/realtime/live-events-ws.ts.
+              cat > server/src/types/ws.d.ts << 'WS_TYPES'
+              declare module "ws" {
+                import { EventEmitter } from "events";
+                import { IncomingMessage, Server as HttpServer } from "http";
+                import { Duplex } from "stream";
+                class WebSocket extends EventEmitter {
+                  static readonly OPEN: number;
+                  static readonly CLOSED: number;
+                  readyState: number;
+                  send(data: any, cb?: (err?: Error) => void): void;
+                  close(code?: number, reason?: string): void;
+                  on(event: string, listener: (...args: any[]) => void): this;
+                  terminate(): void;
+                  ping(data?: any, mask?: boolean, cb?: (err: Error) => void): void;
+                }
+                class WebSocketServer extends EventEmitter {
+                  clients: Set<WebSocket>;
+                  constructor(options?: { noServer?: boolean; server?: HttpServer });
+                  on(event: "connection", listener: (socket: WebSocket, request: IncomingMessage) => void): this;
+                  on(event: string, listener: (...args: any[]) => void): this;
+                  handleUpgrade(request: IncomingMessage, socket: Duplex, head: Buffer, callback: (ws: WebSocket) => void): void;
+                  emit(event: string, ...args: any[]): boolean;
+                }
+                export { WebSocket, WebSocketServer };
+              }
+              WS_TYPES
+
+              echo "Building @paperclipai/shared..."
+              (cd packages/shared && node "$TSC")
+
+              echo "Building @paperclipai/db..."
+              (cd packages/db && node "$TSC" && cp -r src/migrations dist/migrations)
+
+              echo "Building UI..."
+              (cd ui && node "$VITE" build)
+
+              echo "Building server..."
+              (cd server && node "$TSC")
 
               mkdir -p $out
               cp -r $TMPDIR/build/* $out/
@@ -112,39 +183,101 @@
           default = mvm.lib.${system}.mkGuest {
             name = "paperclip";
             hostname = "paperclip";
-            packages = [ pkgs.nodejs_22 pkgs.git paperclip-built ];
+            packages = [ pkgs.nodejs_22 pkgs.git pkgs.postgresql_16 paperclip-built ];
 
             users.paperclip = {
               home = "/var/lib/paperclip";
+            };
+
+            users.postgres = {
+              home = "/var/lib/postgresql";
+            };
+
+            # PostgreSQL service — runs before paperclip.
+            # The embedded-postgres npm module ships platform binaries that
+            # don't survive Nix patching in the microVM, so we use Nix's
+            # own PostgreSQL and expose it via DATABASE_URL.
+            services.postgres = {
+              preStart = pkgs.writeShellScript "postgres-setup" ''
+                mount -t tmpfs -o mode=0755,size=512m tmpfs /var/lib/postgresql
+                chown postgres:postgres /var/lib/postgresql
+                install -d -o postgres -g postgres /var/lib/postgresql/data
+              '';
+
+              command = pkgs.writeShellScript "postgres-start" ''
+                set -eu
+                export PGDATA=/var/lib/postgresql/data
+
+                if [ ! -f "$PGDATA/PG_VERSION" ]; then
+                  echo "[postgres] initializing database" >&2
+                  ${pkgs.postgresql_16}/bin/initdb -D "$PGDATA" --no-locale --encoding=UTF8
+                  # Allow local connections without password
+                  echo "host all all 127.0.0.1/32 trust" >> "$PGDATA/pg_hba.conf"
+                  echo "local all all trust" >> "$PGDATA/pg_hba.conf"
+                fi
+
+                echo "[postgres] starting on port 5432" >&2
+                exec ${pkgs.postgresql_16}/bin/postgres \
+                  -D "$PGDATA" \
+                  -k /tmp \
+                  -h 127.0.0.1 \
+                  -p 5432
+              '';
+
+              user = "postgres";
             };
 
             services.paperclip = {
               preStart = pkgs.writeShellScript "paperclip-setup" ''
                 mount -t tmpfs -o mode=0755,size=1g tmpfs /var/lib/paperclip
                 chown paperclip:paperclip /var/lib/paperclip
-                install -d -o paperclip -g paperclip /var/lib/paperclip/{instances,data}
+                install -d -o paperclip -g paperclip /var/lib/paperclip/instances/default/{logs,data/storage,secrets}
+
+                # Copy config.json from config drive mount if provided via
+                # mvmctl run -v path/to/config:/mnt/config
+                if [ -f /mnt/config/paperclip.json ]; then
+                  cp /mnt/config/paperclip.json /var/lib/paperclip/instances/default/config.json
+                  chown paperclip:paperclip /var/lib/paperclip/instances/default/config.json
+                fi
+
+                # Wait for postgres to be ready
+                for i in $(seq 1 30); do
+                  if ${pkgs.postgresql_16}/bin/pg_isready -h 127.0.0.1 -p 5432 -q 2>/dev/null; then
+                    break
+                  fi
+                  sleep 1
+                done
+
+                # Create the paperclip database
+                ${pkgs.postgresql_16}/bin/psql -h 127.0.0.1 -p 5432 -U postgres \
+                  -tc "SELECT 1 FROM pg_database WHERE datname='paperclip'" | grep -q 1 || \
+                  ${pkgs.postgresql_16}/bin/createdb -h 127.0.0.1 -p 5432 -U postgres paperclip
               '';
+
+              # Default env vars for paperclip.  These can be overridden at
+              # launch with: mvmctl run --env DATABASE_URL=... --env PORT=...
+              # (--env values are sourced globally by the init before services
+              # start, so they take precedence over these defaults).
+              env = {
+                HOME = "/var/lib/paperclip";
+                NODE_ENV = "production";
+                PAPERCLIP_HOME = "/var/lib/paperclip";
+                PAPERCLIP_INSTANCE_ID = "default";
+                HOST = "0.0.0.0";
+                PORT = "3100";
+                SERVE_UI = "true";
+                PAPERCLIP_DEPLOYMENT_MODE = "local_trusted";
+                PAPERCLIP_DEPLOYMENT_EXPOSURE = "private";
+                DATABASE_URL = "postgresql://postgres@127.0.0.1:5432/paperclip";
+              };
 
               command = pkgs.writeShellScript "paperclip-start" ''
                 set -eu
-                cd /var/lib/paperclip
-
-                [ -f /mnt/config/env.sh ] && . /mnt/config/env.sh || true
-                [ -f /mnt/secrets/api-keys.env ] && . /mnt/secrets/api-keys.env || true
-
-                export HOME=/var/lib/paperclip
-                export NODE_ENV=production
-                export PAPERCLIP_HOME=/var/lib/paperclip
-                export PAPERCLIP_INSTANCE_ID=''${PAPERCLIP_INSTANCE_ID:-default}
-                export HOST=0.0.0.0
-                export PORT=''${PORT:-3100}
-                export SERVE_UI=true
-                export PAPERCLIP_DEPLOYMENT_MODE=''${PAPERCLIP_DEPLOYMENT_MODE:-local_trusted}
-                export PAPERCLIP_DEPLOYMENT_EXPOSURE=''${PAPERCLIP_DEPLOYMENT_EXPOSURE:-private}
+                cd "$PAPERCLIP_HOME"
 
                 echo "[paperclip] starting server on port $PORT" >&2
                 exec ${pkgs.nodejs_22}/bin/node \
-                  --import ${paperclip-built}/server/node_modules/tsx/dist/loader.mjs \
+                  --import ${paperclip-built}/node_modules/tsx/dist/loader.mjs \
                   ${paperclip-built}/server/dist/index.js
               '';
 
