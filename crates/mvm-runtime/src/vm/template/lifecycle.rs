@@ -680,11 +680,12 @@ fn cleanup_snapshot_vm(abs_dir: &str, abs_socket: &str, slot: &crate::config::Vm
     let _ = shell::run_in_vm(&format!("rm -rf {}", abs_dir));
 }
 
+/// Artifact integrity manifest used by template push/pull.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
-struct Checksums {
-    template_id: String,
-    revision_hash: String,
-    files: std::collections::BTreeMap<String, String>,
+pub struct Checksums {
+    pub template_id: String,
+    pub revision_hash: String,
+    pub files: std::collections::BTreeMap<String, String>,
 }
 
 fn require_local_template_fs() -> Result<()> {
@@ -759,7 +760,8 @@ pub fn current_revision_id(template_id: &str) -> Result<String> {
     Ok(rev)
 }
 
-fn sha256_hex(path: &std::path::Path) -> Result<String> {
+/// Compute the SHA-256 hex digest of a file.
+pub fn sha256_hex(path: &std::path::Path) -> Result<String> {
     use sha2::Digest;
 
     let bytes =
@@ -767,6 +769,72 @@ fn sha256_hex(path: &std::path::Path) -> Result<String> {
     let mut hasher = sha2::Sha256::new();
     hasher.update(&bytes);
     Ok(format!("{:x}", hasher.finalize()))
+}
+
+/// Download a template revision's artifacts from the registry to a local directory.
+///
+/// Downloads all artifact files listed in `checksums.json`, verifies SHA-256
+/// integrity, and writes them to `output_dir`. The directory must already exist.
+///
+/// This is the core download logic shared by [`template_pull()`] (writes to
+/// template dir) and fleet agents (write to pool artifacts dir).
+///
+/// Returns the revision hash and the list of downloaded file names.
+pub fn registry_download_revision(
+    registry: &TemplateRegistry,
+    template_id: &str,
+    revision: Option<&str>,
+    output_dir: &std::path::Path,
+) -> Result<(String, Vec<String>)> {
+    // Resolve revision from registry "current" pointer if not specified.
+    let rev = match revision {
+        Some(r) => r.to_string(),
+        None => {
+            let current = registry
+                .get_text(&registry.key_current(template_id))?
+                .trim()
+                .to_string();
+            if current.is_empty() {
+                anyhow::bail!(
+                    "Registry current revision is empty for template {}",
+                    template_id
+                );
+            }
+            current
+        }
+    };
+
+    // Download checksums manifest.
+    let sums_key = registry.key_revision_file(template_id, &rev, "checksums.json");
+    let sums_bytes = registry.get_bytes(&sums_key)?;
+    let checksums: Checksums = serde_json::from_slice(&sums_bytes)
+        .with_context(|| format!("Invalid checksums.json for {}/{}", template_id, rev))?;
+
+    // Download each file and verify SHA-256.
+    let mut downloaded_files = Vec::new();
+    for (name, expected_hex) in &checksums.files {
+        let key = registry.key_revision_file(template_id, &rev, name);
+        let data = registry.get_bytes(&key)?;
+        let file_path = output_dir.join(name);
+        std::fs::write(&file_path, &data)
+            .with_context(|| format!("Failed to write {}", file_path.display()))?;
+        let got = sha256_hex(&file_path)?;
+        if &got != expected_hex {
+            anyhow::bail!(
+                "checksum mismatch for {} (expected {}, got {})",
+                name,
+                expected_hex,
+                got
+            );
+        }
+        downloaded_files.push(name.clone());
+    }
+
+    // Write checksums.json alongside the artifacts for offline verification.
+    std::fs::write(output_dir.join("checksums.json"), &sums_bytes)
+        .context("Failed to write checksums.json")?;
+
+    Ok((rev, downloaded_files))
 }
 
 pub fn template_push(id: &str, revision: Option<&str>) -> Result<()> {
@@ -835,69 +903,40 @@ pub fn template_pull(id: &str, revision: Option<&str>) -> Result<()> {
     let registry = TemplateRegistry::from_env()?.context("Template registry not configured")?;
     registry.require_configured()?;
 
-    let rev = match revision {
-        Some(r) => r.to_string(),
-        None => registry
-            .get_text(&registry.key_current(id))?
-            .trim()
-            .to_string(),
-    };
-    if rev.is_empty() {
-        anyhow::bail!("Registry current revision is empty for template {}", id);
-    }
-
-    // Download checksums first.
-    let sums_key = registry.key_revision_file(id, &rev, "checksums.json");
-    let sums_bytes = registry.get_bytes(&sums_key)?;
-    let checksums: Checksums = serde_json::from_slice(&sums_bytes)
-        .with_context(|| format!("Invalid checksums.json for {}/{}", id, rev))?;
-
     let base_dir = std::path::PathBuf::from(template_dir(id));
     std::fs::create_dir_all(&base_dir)?;
-    let tmp_dir = base_dir.join(format!("tmp-pull-{}", rev));
+
+    // Download to a temp dir, then move into place.
+    let tmp_label = revision.unwrap_or("latest");
+    let tmp_dir = base_dir.join(format!("tmp-pull-{}", tmp_label));
     if tmp_dir.exists() {
         std::fs::remove_dir_all(&tmp_dir).ok();
     }
     std::fs::create_dir_all(&tmp_dir)?;
 
-    let rev_dir = std::path::PathBuf::from(template_revision_dir(id, &rev));
-    std::fs::create_dir_all(rev_dir.parent().unwrap_or(&base_dir))?;
-
-    // Download required files into tmp and verify.
-    for (name, expected_hex) in &checksums.files {
-        let key = registry.key_revision_file(id, &rev, name);
-        let data = registry.get_bytes(&key)?;
-        let tmp_path = tmp_dir.join(name);
-        std::fs::write(&tmp_path, &data)?;
-        let got = sha256_hex(&tmp_path)?;
-        if &got != expected_hex {
+    let (rev, _files) = match registry_download_revision(&registry, id, revision, &tmp_dir) {
+        Ok(result) => result,
+        Err(e) => {
             std::fs::remove_dir_all(&tmp_dir).ok();
-            anyhow::bail!(
-                "checksum mismatch for {} (expected {}, got {})",
-                name,
-                expected_hex,
-                got
-            );
+            return Err(e);
         }
-    }
-    // Keep checksums.json in the installed revision so `template verify` can run locally.
-    std::fs::write(tmp_dir.join("checksums.json"), &sums_bytes)?;
+    };
 
     // Install into final revision dir.
+    let rev_dir = std::path::PathBuf::from(template_revision_dir(id, &rev));
+    std::fs::create_dir_all(rev_dir.parent().unwrap_or(&base_dir))?;
     if rev_dir.exists() {
         std::fs::remove_dir_all(&rev_dir).ok();
     }
-    std::fs::create_dir_all(&rev_dir)?;
-    for name in checksums.files.keys() {
-        std::fs::rename(tmp_dir.join(name), rev_dir.join(name))?;
-    }
-    std::fs::rename(
-        tmp_dir.join("checksums.json"),
-        rev_dir.join("checksums.json"),
-    )?;
-    std::fs::remove_dir_all(&tmp_dir).ok();
+    std::fs::rename(&tmp_dir, &rev_dir).with_context(|| {
+        format!(
+            "Failed to move {} to {}",
+            tmp_dir.display(),
+            rev_dir.display()
+        )
+    })?;
 
-    // Update current symlink (keep existing "revisions/<rev>" convention).
+    // Update current symlink.
     let link = template_current_symlink(id);
     let _ = std::fs::remove_file(&link);
     std::os::unix::fs::symlink(format!("revisions/{}", rev), &link)?;

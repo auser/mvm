@@ -234,6 +234,23 @@ fn default_success_threshold() -> f64 {
 }
 
 // ============================================================================
+// Registry artifact reference
+// ============================================================================
+
+/// Reference to pre-built artifacts in an S3-compatible registry.
+/// When present on a DesiredPool, the agent pulls artifacts from the registry
+/// instead of running a local Nix build.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RegistryArtifact {
+    /// Template ID in the registry (matches `mvmctl template` name).
+    pub template_id: String,
+    /// Specific revision hash to pull. When None, the registry's "current"
+    /// pointer is resolved at pull time.
+    #[serde(default)]
+    pub revision: Option<String>,
+}
+
+// ============================================================================
 // Pool spec
 // ============================================================================
 
@@ -574,5 +591,37 @@ mod tests {
         let canary = UpdateStrategy::Canary(CanaryStrategy::default());
         let json = serde_json::to_string(&canary).unwrap();
         assert!(json.contains(r#""type":"canary""#));
+    }
+
+    #[test]
+    fn test_registry_artifact_serde_roundtrip() {
+        let ra = RegistryArtifact {
+            template_id: "hello".to_string(),
+            revision: Some("abc123def".to_string()),
+        };
+        let json = serde_json::to_string(&ra).unwrap();
+        let parsed: RegistryArtifact = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.template_id, "hello");
+        assert_eq!(parsed.revision.as_deref(), Some("abc123def"));
+    }
+
+    #[test]
+    fn test_registry_artifact_no_revision() {
+        let json = r#"{"template_id": "openclaw"}"#;
+        let parsed: RegistryArtifact = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.template_id, "openclaw");
+        assert!(parsed.revision.is_none());
+    }
+
+    #[test]
+    fn test_registry_artifact_default_revision() {
+        let ra = RegistryArtifact {
+            template_id: "hello".to_string(),
+            revision: None,
+        };
+        let json = serde_json::to_string(&ra).unwrap();
+        // revision: None should be omitted or null
+        let parsed: RegistryArtifact = serde_json::from_str(&json).unwrap();
+        assert!(parsed.revision.is_none());
     }
 }

@@ -3,8 +3,8 @@ use serde::{Deserialize, Serialize};
 use crate::instance::InstanceState;
 use crate::node::{NodeInfo, NodeStats};
 use crate::pool::{
-    DesiredCounts, InstanceResources, Role, RuntimePolicy, SecretScope, SleepPolicyConfig,
-    UpdateStrategy,
+    DesiredCounts, InstanceResources, RegistryArtifact, Role, RuntimePolicy, SecretScope,
+    SleepPolicyConfig, UpdateStrategy,
 };
 use crate::routing::RoutingTable;
 use crate::signing::SignedPayload;
@@ -77,6 +77,11 @@ pub struct DesiredPool {
     /// When set, the agent uses this instead of the deploy config default.
     #[serde(default)]
     pub default_update_strategy: Option<UpdateStrategy>,
+    /// Pre-built artifacts to pull from the template registry.
+    /// When set, the agent downloads artifacts from S3 instead of running
+    /// a local Nix build. Falls back to local build if the pull fails.
+    #[serde(default)]
+    pub registry_artifact: Option<RegistryArtifact>,
 }
 
 fn default_seccomp() -> String {
@@ -474,6 +479,7 @@ mod tests {
                 max_surge: 2,
                 health_check_timeout_secs: 90,
             })),
+            registry_artifact: None,
         };
         let json = serde_json::to_string(&pool).unwrap();
         let parsed: DesiredPool = serde_json::from_str(&json).unwrap();
@@ -533,5 +539,94 @@ mod tests {
         assert_eq!(parsed.preferred_regions.len(), 2);
         assert_eq!(parsed.preferred_regions[0], "us-west-2");
         assert_eq!(parsed.preferred_regions[1], "ap-southeast-1");
+    }
+
+    #[test]
+    fn test_desired_pool_backward_compat_no_registry_artifact() {
+        // Old JSON without registry_artifact should still parse
+        let json = r#"{
+            "pool_id": "gateways",
+            "flake_ref": "github:org/repo",
+            "profile": "minimal",
+            "instance_resources": {"vcpus": 2, "mem_mib": 1024},
+            "desired_counts": {"running": 3, "warm": 1, "sleeping": 0}
+        }"#;
+        let parsed: DesiredPool = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.pool_id, "gateways");
+        assert!(parsed.registry_artifact.is_none());
+    }
+
+    #[test]
+    fn test_desired_pool_with_registry_artifact() {
+        use crate::pool::RegistryArtifact;
+
+        let json = r#"{
+            "pool_id": "gateways",
+            "flake_ref": ".",
+            "profile": "minimal",
+            "instance_resources": {"vcpus": 1, "mem_mib": 512},
+            "desired_counts": {"running": 1, "warm": 0, "sleeping": 0},
+            "registry_artifact": {"template_id": "hello", "revision": "abc123"}
+        }"#;
+        let parsed: DesiredPool = serde_json::from_str(json).unwrap();
+        let ra = parsed.registry_artifact.unwrap();
+        assert_eq!(ra.template_id, "hello");
+        assert_eq!(ra.revision.as_deref(), Some("abc123"));
+    }
+
+    #[test]
+    fn test_desired_pool_registry_artifact_no_revision() {
+        let json = r#"{
+            "pool_id": "gateways",
+            "flake_ref": ".",
+            "profile": "minimal",
+            "instance_resources": {"vcpus": 1, "mem_mib": 512},
+            "desired_counts": {"running": 1, "warm": 0, "sleeping": 0},
+            "registry_artifact": {"template_id": "openclaw"}
+        }"#;
+        let parsed: DesiredPool = serde_json::from_str(json).unwrap();
+        let ra = parsed.registry_artifact.unwrap();
+        assert_eq!(ra.template_id, "openclaw");
+        assert!(ra.revision.is_none());
+    }
+
+    #[test]
+    fn test_desired_pool_registry_artifact_roundtrip() {
+        use crate::pool::{RegistryArtifact, RollingUpdateStrategy, UpdateStrategy};
+
+        let pool = DesiredPool {
+            pool_id: "workers".to_string(),
+            flake_ref: ".".to_string(),
+            profile: "minimal".to_string(),
+            role: Role::Worker,
+            instance_resources: InstanceResources {
+                vcpus: 1,
+                mem_mib: 512,
+                data_disk_mib: 0,
+            },
+            desired_counts: DesiredCounts {
+                running: 1,
+                warm: 0,
+                sleeping: 0,
+            },
+            runtime_policy: RuntimePolicy::default(),
+            seccomp_policy: "baseline".to_string(),
+            snapshot_compression: "none".to_string(),
+            routing_table: None,
+            secret_scopes: vec![],
+            sleep_policy: None,
+            default_update_strategy: Some(
+                UpdateStrategy::Rolling(RollingUpdateStrategy::default()),
+            ),
+            registry_artifact: Some(RegistryArtifact {
+                template_id: "hello".to_string(),
+                revision: Some("rev-abc123".to_string()),
+            }),
+        };
+        let json = serde_json::to_string(&pool).unwrap();
+        let parsed: DesiredPool = serde_json::from_str(&json).unwrap();
+        let ra = parsed.registry_artifact.unwrap();
+        assert_eq!(ra.template_id, "hello");
+        assert_eq!(ra.revision.as_deref(), Some("rev-abc123"));
     }
 }
