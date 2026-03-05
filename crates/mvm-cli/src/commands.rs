@@ -357,6 +357,9 @@ enum TemplateCmd {
         /// Optional template config TOML to build multiple variants
         #[arg(long)]
         config: Option<String>,
+        /// Recompute the Nix fixed-output derivation hash (use after version bump)
+        #[arg(long)]
+        update_hash: bool,
     },
     /// Push a built template revision to the object storage registry
     Push {
@@ -2687,7 +2690,8 @@ fn cmd_template(action: TemplateCmd) -> Result<()> {
             force,
             snapshot,
             config,
-        } => template_cmd::build(&name, force, snapshot, config.as_deref()),
+            update_hash,
+        } => template_cmd::build(&name, force, snapshot, config.as_deref(), update_hash),
         TemplateCmd::Push { name, revision } => template_cmd::push(&name, revision.as_deref()),
         TemplateCmd::Pull { name, revision } => template_cmd::pull(&name, revision.as_deref()),
         TemplateCmd::Verify { name, revision } => template_cmd::verify(&name, revision.as_deref()),

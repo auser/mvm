@@ -28,7 +28,7 @@
             dontFixup = true;
 
             outputHashMode = "recursive";
-            outputHash = "sha256-BKuT9/JTkeWstrvsh2jMi/QRjye17lSXPT+22hI9/U8=";
+            outputHash = "";
 
             nativeBuildInputs = [ pkgs.nodejs_22 pkgs.cacert pkgs.git ];
 

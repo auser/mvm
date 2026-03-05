@@ -147,6 +147,93 @@ impl Default for SleepPolicyConfig {
 }
 
 // ============================================================================
+// Update strategy (shared with mvmd for rollout orchestration)
+// ============================================================================
+
+/// Strategy for rolling out artifact updates to a pool's instances.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum UpdateStrategy {
+    /// Replace instances one at a time (or in small batches).
+    Rolling(RollingUpdateStrategy),
+    /// Deploy a small number of canary instances first, then proceed.
+    Canary(CanaryStrategy),
+}
+
+impl Default for UpdateStrategy {
+    fn default() -> Self {
+        Self::Rolling(RollingUpdateStrategy::default())
+    }
+}
+
+/// Configuration for a rolling update.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RollingUpdateStrategy {
+    /// Max instances being updated simultaneously.
+    #[serde(default = "default_max_unavailable")]
+    pub max_unavailable: u32,
+    /// Max extra instances during rollout (surge capacity).
+    #[serde(default = "default_max_surge")]
+    pub max_surge: u32,
+    /// Seconds to wait for health check after each instance starts.
+    #[serde(default = "default_health_check_timeout")]
+    pub health_check_timeout_secs: u64,
+}
+
+impl Default for RollingUpdateStrategy {
+    fn default() -> Self {
+        Self {
+            max_unavailable: default_max_unavailable(),
+            max_surge: default_max_surge(),
+            health_check_timeout_secs: default_health_check_timeout(),
+        }
+    }
+}
+
+/// Configuration for a canary deployment.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct CanaryStrategy {
+    /// Number of canary instances to deploy.
+    #[serde(default = "default_canary_count")]
+    pub canary_count: u32,
+    /// Observation window in seconds before deciding to proceed.
+    #[serde(default = "default_canary_duration")]
+    pub canary_duration_secs: u64,
+    /// Minimum health success rate to proceed (0.0–1.0).
+    #[serde(default = "default_success_threshold")]
+    pub success_threshold: f64,
+}
+
+impl Default for CanaryStrategy {
+    fn default() -> Self {
+        Self {
+            canary_count: default_canary_count(),
+            canary_duration_secs: default_canary_duration(),
+            success_threshold: default_success_threshold(),
+        }
+    }
+}
+
+fn default_max_unavailable() -> u32 {
+    1
+}
+fn default_max_surge() -> u32 {
+    1
+}
+fn default_health_check_timeout() -> u64 {
+    60
+}
+fn default_canary_count() -> u32 {
+    1
+}
+fn default_canary_duration() -> u64 {
+    300
+}
+fn default_success_threshold() -> f64 {
+    0.95
+}
+
+// ============================================================================
 // Pool spec
 // ============================================================================
 
@@ -424,5 +511,68 @@ mod tests {
         }"#;
         let parsed: PoolSpec = serde_json::from_str(json).unwrap();
         assert!(parsed.secret_scopes.is_empty());
+    }
+
+    #[test]
+    fn test_update_strategy_default_is_rolling() {
+        let strategy = UpdateStrategy::default();
+        assert!(matches!(strategy, UpdateStrategy::Rolling(_)));
+        if let UpdateStrategy::Rolling(r) = strategy {
+            assert_eq!(r.max_unavailable, 1);
+            assert_eq!(r.max_surge, 1);
+            assert_eq!(r.health_check_timeout_secs, 60);
+        }
+    }
+
+    #[test]
+    fn test_update_strategy_rolling_serde_roundtrip() {
+        let strategy = UpdateStrategy::Rolling(RollingUpdateStrategy {
+            max_unavailable: 2,
+            max_surge: 3,
+            health_check_timeout_secs: 120,
+        });
+        let json = serde_json::to_string(&strategy).unwrap();
+        let parsed: UpdateStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(strategy, parsed);
+    }
+
+    #[test]
+    fn test_update_strategy_canary_serde_roundtrip() {
+        let strategy = UpdateStrategy::Canary(CanaryStrategy {
+            canary_count: 3,
+            canary_duration_secs: 600,
+            success_threshold: 0.99,
+        });
+        let json = serde_json::to_string(&strategy).unwrap();
+        let parsed: UpdateStrategy = serde_json::from_str(&json).unwrap();
+        assert_eq!(strategy, parsed);
+    }
+
+    #[test]
+    fn test_canary_strategy_defaults() {
+        let c = CanaryStrategy::default();
+        assert_eq!(c.canary_count, 1);
+        assert_eq!(c.canary_duration_secs, 300);
+        assert!((c.success_threshold - 0.95).abs() < 0.001);
+    }
+
+    #[test]
+    fn test_rolling_strategy_defaults() {
+        let r = RollingUpdateStrategy::default();
+        assert_eq!(r.max_unavailable, 1);
+        assert_eq!(r.max_surge, 1);
+        assert_eq!(r.health_check_timeout_secs, 60);
+    }
+
+    #[test]
+    fn test_update_strategy_tagged_json_format() {
+        // Verify the tagged enum uses "type" field
+        let rolling = UpdateStrategy::Rolling(RollingUpdateStrategy::default());
+        let json = serde_json::to_string(&rolling).unwrap();
+        assert!(json.contains(r#""type":"rolling""#));
+
+        let canary = UpdateStrategy::Canary(CanaryStrategy::default());
+        let json = serde_json::to_string(&canary).unwrap();
+        assert!(json.contains(r#""type":"canary""#));
     }
 }

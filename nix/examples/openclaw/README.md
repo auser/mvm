@@ -151,10 +151,18 @@ Host (macOS/Linux)
 
 ## Updating OpenClaw
 
-To update the OpenClaw version:
+Edit `version` in the `openclaw-src` derivation in `flake.nix`, then build with `--update-hash`:
 
-1. Edit `version` in `openclaw-src` derivation in `flake.nix`
-2. Set `outputHash = "";` (empty string)
-3. Build — Nix will fail and print the correct hash
-4. Set `outputHash` to the printed hash
-5. Rebuild
+```bash
+mvmctl template build openclaw --update-hash --snapshot
+```
+
+The `--update-hash` flag automatically recomputes the Nix fixed-output derivation
+hash. It blanks the hash, runs `nix build` to compute the correct value from npm,
+and writes it back to `flake.nix` before proceeding with the full build.
+
+Also works without a version change (e.g., after npm republishes a package):
+
+```bash
+mvmctl template build openclaw --update-hash
+```

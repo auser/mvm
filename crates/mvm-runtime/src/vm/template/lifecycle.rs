@@ -102,9 +102,62 @@ pub fn template_init(id: &str) -> Result<()> {
     Ok(())
 }
 
+/// Recompute the Nix fixed-output derivation hash in a flake's `flake.nix`.
+///
+/// Blanks the `outputHash` field, runs `nix build` to trigger hash computation,
+/// extracts the correct hash from the error output, and writes it back.
+/// On failure, the original hash is restored.
+fn update_fod_hash(flake_ref: &str) -> Result<()> {
+    ui::info("Recomputing fixed-output derivation hash...");
+
+    // Save original hash for recovery.
+    let orig_hash = shell::run_in_vm_stdout(&format!(
+        r#"sed -n 's/.*outputHash = "\([^"]*\)".*/\1/p' {flake}/flake.nix"#,
+        flake = flake_ref
+    ))?
+    .trim()
+    .to_string();
+
+    // Blank the hash to trigger TOFU computation.
+    shell::run_in_vm(&format!(
+        r#"sed -i.bak 's|outputHash = "[^"]*"|outputHash = ""|' {flake}/flake.nix && rm -f {flake}/flake.nix.bak"#,
+        flake = flake_ref
+    ))?;
+
+    // Run nix build — it will fail with hash mismatch, printing the correct hash.
+    // Phase 2/3 never execute; only the FOD download runs.
+    let output = shell::run_in_vm_stdout(&format!(
+        r#"cd {flake} && nix build .# --no-link 2>&1 | grep -oE 'got:[[:space:]]+sha256-[A-Za-z0-9+/]+={{0,2}}' | sed 's/got:[[:space:]]*//' || true"#,
+        flake = flake_ref
+    ))?;
+    let new_hash = output.trim();
+
+    if new_hash.is_empty() {
+        // Restore original hash on failure.
+        let _ = shell::run_in_vm(&format!(
+            r#"sed -i.bak 's|outputHash = "[^"]*"|outputHash = "{orig}"|' {flake}/flake.nix && rm -f {flake}/flake.nix.bak"#,
+            orig = orig_hash,
+            flake = flake_ref
+        ));
+        return Err(anyhow!(
+            "Could not compute FOD hash. Check network connectivity and nix build output."
+        ));
+    }
+
+    // Write the correct hash.
+    shell::run_in_vm(&format!(
+        r#"sed -i.bak 's|outputHash = "[^"]*"|outputHash = "{hash}"|' {flake}/flake.nix && rm -f {flake}/flake.nix.bak"#,
+        hash = new_hash,
+        flake = flake_ref
+    ))?;
+
+    ui::success(&format!("Updated outputHash: {}", new_hash));
+    Ok(())
+}
+
 /// Build a template using the dev build pipeline (local Nix in Lima).
 /// Artifacts are stored in ~/.mvm/templates/<id>/artifacts and the current symlink is updated.
-pub fn template_build(id: &str, force: bool) -> Result<()> {
+pub fn template_build(id: &str, force: bool, update_hash: bool) -> Result<()> {
     use crate::ui;
 
     let spec = template_load(id)?;
@@ -114,6 +167,11 @@ pub fn template_build(id: &str, force: bool) -> Result<()> {
         "Building template '{}' (flake: {}, profile: {})",
         id, spec.flake_ref, spec.profile
     ));
+
+    // Recompute fixed-output derivation hash if requested (e.g. after version bump).
+    if update_hash {
+        update_fod_hash(&spec.flake_ref)?;
+    }
 
     // Use dev_build to produce artifacts via Nix in Lima.
     // The dev build cache is keyed by Nix store hash at ~/.mvm/dev/builds/<hash>/,
@@ -402,12 +460,12 @@ pub fn wait_for_integrations_healthy(
 /// 5. Pauses vCPUs and creates a full snapshot
 /// 6. Stores snapshot files in the template revision directory
 /// 7. Cleans up the temporary VM
-pub fn template_build_with_snapshot(id: &str, force: bool) -> Result<()> {
+pub fn template_build_with_snapshot(id: &str, force: bool, update_hash: bool) -> Result<()> {
     use crate::config::BRIDGE_IP;
     use crate::vm::{microvm, network};
 
     // Step 1: Build artifacts (reuses existing template_build)
-    template_build(id, force)?;
+    template_build(id, force, update_hash)?;
 
     let spec = template_load(id)?;
     let rev = current_revision_id(id)?;

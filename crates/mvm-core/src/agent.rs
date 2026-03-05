@@ -4,6 +4,7 @@ use crate::instance::InstanceState;
 use crate::node::{NodeInfo, NodeStats};
 use crate::pool::{
     DesiredCounts, InstanceResources, Role, RuntimePolicy, SecretScope, SleepPolicyConfig,
+    UpdateStrategy,
 };
 use crate::routing::RoutingTable;
 use crate::signing::SignedPayload;
@@ -34,6 +35,10 @@ pub struct DesiredTenant {
     #[serde(default)]
     pub secrets_hash: Option<String>,
     pub pools: Vec<DesiredPool>,
+    /// Preferred regions for scheduling this tenant's instances.
+    /// The scheduler scores nodes in these regions higher during placement.
+    #[serde(default)]
+    pub preferred_regions: Vec<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -68,6 +73,10 @@ pub struct DesiredPool {
     pub secret_scopes: Vec<SecretScope>,
     #[serde(default)]
     pub sleep_policy: Option<SleepPolicyConfig>,
+    /// Default update strategy for rollouts (rolling or canary).
+    /// When set, the agent uses this instead of the deploy config default.
+    #[serde(default)]
+    pub default_update_strategy: Option<UpdateStrategy>,
 }
 
 fn default_seccomp() -> String {
@@ -393,5 +402,136 @@ mod tests {
             }
             _ => panic!("Expected InstanceActionResult variant"),
         }
+    }
+
+    #[test]
+    fn test_desired_pool_backward_compat_no_new_fields() {
+        // Old JSON without default_update_strategy should still parse
+        let json = r#"{
+            "pool_id": "gateways",
+            "flake_ref": "github:org/repo",
+            "profile": "minimal",
+            "instance_resources": {"vcpus": 2, "mem_mib": 1024},
+            "desired_counts": {"running": 3, "warm": 1, "sleeping": 0}
+        }"#;
+        let parsed: DesiredPool = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.pool_id, "gateways");
+        assert!(parsed.default_update_strategy.is_none());
+        assert!(parsed.sleep_policy.is_none());
+    }
+
+    #[test]
+    fn test_desired_pool_with_update_strategy() {
+        use crate::pool::UpdateStrategy;
+
+        let json = r#"{
+            "pool_id": "gateways",
+            "flake_ref": ".",
+            "profile": "minimal",
+            "instance_resources": {"vcpus": 1, "mem_mib": 512},
+            "desired_counts": {"running": 1, "warm": 0, "sleeping": 0},
+            "default_update_strategy": {"type": "canary", "canary_count": 2, "canary_duration_secs": 600, "success_threshold": 0.99}
+        }"#;
+        let parsed: DesiredPool = serde_json::from_str(json).unwrap();
+        let strategy = parsed.default_update_strategy.unwrap();
+        match strategy {
+            UpdateStrategy::Canary(c) => {
+                assert_eq!(c.canary_count, 2);
+                assert_eq!(c.canary_duration_secs, 600);
+                assert!((c.success_threshold - 0.99).abs() < 0.001);
+            }
+            _ => panic!("Expected Canary strategy"),
+        }
+    }
+
+    #[test]
+    fn test_desired_pool_update_strategy_roundtrip() {
+        use crate::pool::{RollingUpdateStrategy, UpdateStrategy};
+
+        let pool = DesiredPool {
+            pool_id: "workers".to_string(),
+            flake_ref: ".".to_string(),
+            profile: "minimal".to_string(),
+            role: Role::Worker,
+            instance_resources: InstanceResources {
+                vcpus: 1,
+                mem_mib: 512,
+                data_disk_mib: 0,
+            },
+            desired_counts: DesiredCounts {
+                running: 1,
+                warm: 0,
+                sleeping: 0,
+            },
+            runtime_policy: RuntimePolicy::default(),
+            seccomp_policy: "baseline".to_string(),
+            snapshot_compression: "none".to_string(),
+            routing_table: None,
+            secret_scopes: vec![],
+            sleep_policy: None,
+            default_update_strategy: Some(UpdateStrategy::Rolling(RollingUpdateStrategy {
+                max_unavailable: 3,
+                max_surge: 2,
+                health_check_timeout_secs: 90,
+            })),
+        };
+        let json = serde_json::to_string(&pool).unwrap();
+        let parsed: DesiredPool = serde_json::from_str(&json).unwrap();
+        let strategy = parsed.default_update_strategy.unwrap();
+        match strategy {
+            UpdateStrategy::Rolling(r) => {
+                assert_eq!(r.max_unavailable, 3);
+                assert_eq!(r.max_surge, 2);
+                assert_eq!(r.health_check_timeout_secs, 90);
+            }
+            _ => panic!("Expected Rolling strategy"),
+        }
+    }
+
+    #[test]
+    fn test_desired_tenant_backward_compat_no_preferred_regions() {
+        // Old JSON without preferred_regions should still parse
+        let json = r#"{
+            "tenant_id": "acme",
+            "network": {"tenant_net_id": 1, "ipv4_subnet": "10.240.1.0/24"},
+            "quotas": {"max_vcpus": 16, "max_mem_mib": 32768, "max_running": 8, "max_warm": 4, "max_pools": 4, "max_instances_per_pool": 16, "max_disk_gib": 100},
+            "pools": []
+        }"#;
+        let parsed: DesiredTenant = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.tenant_id, "acme");
+        assert!(parsed.preferred_regions.is_empty());
+    }
+
+    #[test]
+    fn test_desired_tenant_with_preferred_regions() {
+        let json = r#"{
+            "tenant_id": "acme",
+            "network": {"tenant_net_id": 1, "ipv4_subnet": "10.240.1.0/24"},
+            "quotas": {"max_vcpus": 16, "max_mem_mib": 32768, "max_running": 8, "max_warm": 4, "max_pools": 4, "max_instances_per_pool": 16, "max_disk_gib": 100},
+            "pools": [],
+            "preferred_regions": ["us-east-1", "eu-west-1"]
+        }"#;
+        let parsed: DesiredTenant = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.preferred_regions, vec!["us-east-1", "eu-west-1"]);
+    }
+
+    #[test]
+    fn test_desired_tenant_preferred_regions_roundtrip() {
+        let tenant = DesiredTenant {
+            tenant_id: "acme".to_string(),
+            network: DesiredTenantNetwork {
+                tenant_net_id: 5,
+                ipv4_subnet: "10.240.5.0/24".to_string(),
+            },
+            quotas: TenantQuota::default(),
+            secrets_hash: None,
+            pools: vec![],
+            preferred_regions: vec!["us-west-2".to_string(), "ap-southeast-1".to_string()],
+        };
+        let json = serde_json::to_string(&tenant).unwrap();
+        let parsed: DesiredTenant = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.preferred_regions.len(), 2);
+        assert_eq!(parsed.preferred_regions[0], "us-west-2");
+        assert_eq!(parsed.preferred_regions[1], "ap-southeast-1");
     }
 }
