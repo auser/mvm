@@ -1,6 +1,25 @@
 # Changelog
 
 
+## [0.3.7] — 2026-03-05
+
+### Added
+- feat(docs): add mobile hamburger menu to landing page header
+- chore(docs): update license year, fix broken links, correct env vars and binary name
+- feat(core): add RegistryArtifact type and extract registry_download_revision
+- feat(core): add UpdateStrategy types and new DesiredState fields for mvmd integration
+- chore: archive sprints 14-15, move mvm to maintenance mode
+- feat: remove legacy start command, improve paperclip/openclaw examples, update docs
+- fix(docs): fix double-slash in header navigation links
+- Added paperclip example
+- chore(docs): add CNAME for gomicrovm.com and update site URL
+- feat(guest): snapshot post-restore, OpenClaw loopback proxy, Nix restructure
+
+### Changed
+
+### Fixed
+
+
 ## [0.3.6] — 2026-03-03
 
 ### Added
