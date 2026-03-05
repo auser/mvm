@@ -8,18 +8,19 @@ const route = Astro.locals.starlightRoute;
 const isSplash = route?.entry?.data?.template === "splash";
 
 const base = import.meta.env.BASE_URL;
+const b = base.endsWith("/") ? base : `${base}/`;
 const navLinks = [
-  { label: "Docs", href: `${base}/getting-started/installation/` },
-  { label: "Quick Start", href: `${base}/getting-started/quickstart/` },
-  { label: "Guides", href: `${base}/guides/nix-flakes/` },
-  { label: "Reference", href: `${base}/reference/cli-commands/` },
+  { label: "Docs", href: `${b}getting-started/installation/` },
+  { label: "Quick Start", href: `${b}getting-started/quickstart/` },
+  { label: "Guides", href: `${b}guides/nix-flakes/` },
+  { label: "Reference", href: `${b}reference/cli-commands/` },
 ];
 ---
 
 {isSplash ? (
   <header class="landing-header">
     <div class="landing-header-inner">
-      <a href={`${base}/`} class="landing-logo">
+      <a href={b} class="landing-logo">
         <span class="landing-logo-text">mvm</span>
       </a>
       <nav class="landing-nav">
