@@ -1,5 +1,15 @@
 # Changelog
 
+All notable changes to mvm are documented in this file.
+
+## [0.3.10] — 2026-03-07
+
+### Fixed
+- Sync internal crate versions to 0.4.0
+- **release**: Strip 'v' prefix from git-cliff version output
+
+# Changelog
+
 
 ## [0.3.9] — 2026-03-06
 
