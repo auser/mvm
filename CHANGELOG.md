@@ -2,6 +2,11 @@
 
 All notable changes to mvm are documented in this file.
 
+## [0.4.1] — 2026-03-07
+
+### Fixed
+- **ci**: Fix cross-compilation for aarch64-unknown-linux-gnu
+
 ## [0.4.0] — 2026-03-07
 
 ### Added
