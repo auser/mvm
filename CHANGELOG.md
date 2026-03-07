@@ -2,6 +2,11 @@
 
 All notable changes to mvm are documented in this file.
 
+## [0.4.0] — 2026-03-07
+
+### Added
+- Expose all public interfaces through root crate
+
 ## [0.3.10] — 2026-03-07
 
 ### Fixed
