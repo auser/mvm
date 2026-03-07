@@ -84,7 +84,7 @@ release-auto:
     cargo clippy --workspace --all-targets -- -D warnings
     cargo nextest run --workspace
     # 2. Determine next version from conventional commits
-    NEXT_VERSION=$(git cliff --bumped-version)
+    NEXT_VERSION=$(git cliff --bumped-version | sed 's/^v//')
     echo "==> Auto-detected next version: $NEXT_VERSION"
     # 3. Update version in Cargo.toml (workspace.package.version and internal crate versions)
     sed -i.bak -e "s/^version = \".*\"/version = \"$NEXT_VERSION\"/" \
