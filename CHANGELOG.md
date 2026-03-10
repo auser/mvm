@@ -131,8 +131,7 @@ All notable changes to mvm are documented in this file.
 - `--log-format <human|json>` global CLI flag for structured logging
 - Doctor regression tests for Lima detection and cargo path resilience
 - 20 essential-path integration tests across all crates (instance lifecycle, agent reconcile, build pipeline, coordinator routing, CLI commands)
-- Deployment guide (`docs/deployment.md`)
-- Operations runbook (`docs/runbook.md`)
+- Deployment and operations documentation (see `public/src/content/docs/`)
 
 ### Fixed
 - Template reuse now compares cache keys instead of individual fields, preventing stale artifact reuse across profiles

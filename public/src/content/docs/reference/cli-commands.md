@@ -21,15 +21,24 @@ description: Complete command reference for mvmctl.
 
 | Command | Description |
 |---------|-------------|
-| `mvmctl start` | Start the default microVM (headless) |
-| `mvmctl start <image>` | Start a custom image with optional --cpus, --memory, --volume |
-| `mvmctl stop` | Stop the running microVM and clean up |
-| `mvmctl stop --snapshot` | Create a snapshot before stopping (for instant restart) |
+| `mvmctl run --flake <ref>` | Build from flake and boot a headless Firecracker VM |
+| `mvmctl run --template <name>` | Run from a pre-built template (skip build) |
+| `mvmctl run -p HOST:GUEST` | Forward a port mapping into the VM (repeatable) |
+| `mvmctl run -e KEY=VALUE` | Inject an environment variable (repeatable) |
+| `mvmctl run -v host:guest:size` | Mount a volume into the microVM (repeatable) |
+| `mvmctl run --forward` | Auto-forward declared ports after boot (blocks until Ctrl-C) |
+| `mvmctl run --hypervisor <backend>` | Hypervisor backend: `firecracker` (default) or `qemu` |
+| `mvmctl stop [name]` | Stop a running microVM by name |
+| `mvmctl stop --all` | Stop all running VMs |
+| `mvmctl up [name]` | Launch microVMs from `mvm.toml` or CLI flags |
+| `mvmctl down [name]` | Stop microVMs from `mvm.toml`, by name, or all |
+| `mvmctl forward <name> -p PORT` | Forward a port from a running microVM to localhost |
 | `mvmctl shell` | Open a shell in the Lima VM |
 | `mvmctl shell --project ~/dir` | Open shell and cd into a project directory |
+| `mvmctl ssh` | Open a shell in the Lima VM (alias for `mvmctl shell`) |
+| `mvmctl ssh-config` | Print an SSH config entry for the Lima VM |
 | `mvmctl sync` | Build mvmctl from source inside Lima and install to `/usr/local/bin/` |
 | `mvmctl sync --debug` | Debug build (faster compile, slower runtime) |
-| `mvmctl ssh-config` | Print an SSH config entry for the Lima VM |
 
 ## Building
 
@@ -38,18 +47,10 @@ description: Complete command reference for mvmctl.
 | `mvmctl build <path>` | Build from Mvmfile.toml in the given directory |
 | `mvmctl build --flake <ref>` | Build from a Nix flake (local or remote) |
 | `mvmctl build --flake <ref> --watch` | Build and rebuild on flake.lock changes |
-| `mvmctl run --flake <ref>` | Build from flake and boot a headless Firecracker VM |
-| `mvmctl run --template <name>` | Run from a pre-built template |
-| `mvmctl run --config-dir <path>` | Inject config files onto the config drive |
-| `mvmctl run --secrets-dir <path>` | Inject secret files onto the secrets drive |
-| `mvmctl run --volume host:guest:size` | Mount a volume into the microVM |
-
-## Snapshots
-
-| Command | Description |
-|---------|-------------|
-| `mvmctl snapshot create <name>` | Snapshot a running VM (pause → snapshot → resume) |
-| `mvmctl snapshot delete <name>` | Remove snapshot files for a VM |
+| `mvmctl build --json` | Output structured JSON events instead of human-readable output |
+| `mvmctl cleanup` | Remove old dev-build artifacts and run Nix garbage collection |
+| `mvmctl cleanup --all` | Remove all cached build revisions |
+| `mvmctl cleanup --keep <N>` | Keep the N newest build revisions |
 
 ## Templates
 
@@ -57,28 +58,29 @@ description: Complete command reference for mvmctl.
 |---------|-------------|
 | `mvmctl template init <name> --local` | Scaffold a new template directory with flake.nix |
 | `mvmctl template create <name>` | Create a single template definition |
-| `mvmctl template create-multi <base>` | Create templates for multiple roles |
+| `mvmctl template create-multi <base>` | Create templates for multiple roles (`--roles worker,gateway`) |
 | `mvmctl template build <name>` | Build a template (runs nix build in Lima) |
 | `mvmctl template build <name> --force` | Rebuild even if cached |
-| `mvmctl template warm <name>` | Auto-warm: boot → health wait → snapshot → store |
+| `mvmctl template build <name> --snapshot` | Build, boot, wait for healthy, and capture a Firecracker snapshot |
+| `mvmctl template build <name> --update-hash` | Recompute the Nix fixed-output derivation hash |
 | `mvmctl template push <name>` | Push to S3-compatible registry |
 | `mvmctl template pull <name>` | Pull from registry |
 | `mvmctl template verify <name>` | Verify template checksums |
-| `mvmctl template list` | List all templates |
-| `mvmctl template info <name>` | Show template details and revisions |
+| `mvmctl template list` | List all templates (`--json` for JSON) |
+| `mvmctl template info <name>` | Show template details and revisions (`--json` for JSON) |
 | `mvmctl template edit <name>` | Edit template configuration (--cpus, --mem, --flake, etc.) |
-| `mvmctl template delete <name>` | Delete a template |
+| `mvmctl template delete <name>` | Delete a template (`--force` to skip confirmation) |
 
 ## MicroVM Diagnostics
 
 | Command | Description |
 |---------|-------------|
-| `mvmctl vm ping [name]` | Health-check running microVMs via vsock |
+| `mvmctl vm ping [name]` | Health-check running microVMs via vsock (all if no name given) |
 | `mvmctl vm status [name]` | Query worker status (`--json` for JSON) |
 | `mvmctl vm inspect <name>` | Deep-dive inspection (probes, integrations, worker status) |
 | `mvmctl vm exec <name> -- <cmd>` | Run a command inside a running microVM (dev-only) |
-| `mvmctl vm diagnose <name>` | Run layered diagnostics on a VM |
-| `mvmctl logs <name>` | View guest console logs |
+| `mvmctl vm diagnose <name>` | Run layered diagnostics on a VM (works even when vsock is broken) |
+| `mvmctl logs <name>` | View guest console logs (`-f` to follow, `-n` for line count) |
 | `mvmctl logs <name> --hypervisor` | View Firecracker hypervisor logs |
 
 ## Security
@@ -91,7 +93,19 @@ description: Complete command reference for mvmctl.
 
 | Command | Description |
 |---------|-------------|
-| `mvmctl completions <shell>` | Generate shell completions (bash, zsh, fish) |
+| `mvmctl completions <shell>` | Generate shell completions (bash, zsh, fish, powershell) |
+| `mvmctl shell-init` | Print shell configuration (completions + dev aliases) to stdout |
+| `mvmctl release` | Pre-release checks (deploy guard + cargo publish dry-run) |
+| `mvmctl release --guard-only` | Run deploy guard checks only (version, tag, inter-crate deps) |
+
+## Global Options
+
+All commands accept these global options:
+
+| Option | Description |
+|--------|-------------|
+| `--log-format <human\|json>` | Log format: human (default) or json (structured) |
+| `--fc-version <VERSION>` | Override Firecracker version (e.g., v1.14.0) |
 
 ## Environment Variables
 

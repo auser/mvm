@@ -127,11 +127,11 @@ macOS / Linux Host
 
 ## Documentation
 
-- `docs/development.md` -- contributor guide, testing, CI/CD
-- `docs/user-guide.md` -- writing Nix flakes for microVM images
-- `docs/SMOKE_TEST.md` -- smoke testing the dev workflow
-- `docs/troubleshooting.md` -- common issues and fixes
-- `docs/adr/001-firecracker-only.md` -- ADR: Firecracker-only execution
+- `public/src/content/docs/contributing/development.md` -- contributor guide, testing, CI/CD
+- `public/src/content/docs/guides/nix-flakes.md` -- writing Nix flakes for microVM images (mkGuest API)
+- `public/src/content/docs/guides/troubleshooting.md` -- common issues and fixes
+- `public/src/content/docs/contributing/adr/001-firecracker-only.md` -- ADR: Firecracker-only execution
+- `public/src/content/docs/reference/cli-commands.md` -- complete CLI command reference
 - `specs/plans/` -- implementation specs and plans
 
 ## Sprint Management

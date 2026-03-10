@@ -20,7 +20,7 @@ Active development has moved to [mvmd](https://github.com/auser/mvmd) (fleet orc
 - [14-guest-library-and-examples.md](sprints/14-guest-library-and-examples.md)
 - [15-real-world-apps.md](sprints/15-real-world-apps.md)
 
-## Current Status (v0.3.6)
+## Current Status (v0.4.1)
 
 | Metric           | Value                    |
 | ---------------- | ------------------------ |

@@ -463,17 +463,17 @@ Stop, rebuild, and relaunch a microVM from a template in one shot:
 
 ```bash
 # Generic (no volumes)
-(TEMPLATE=hello; NAME=demo; cr cleanup --all; cr stop $NAME; cr template build $TEMPLATE --force --snapshot; cr run --template $TEMPLATE --name $NAME; cr logs -f $NAME;)
+(TEMPLATE=hello; NAME=demo; mvmctl cleanup --all; mvmctl stop $NAME; mvmctl template build $TEMPLATE --force --snapshot; mvmctl run --template $TEMPLATE --name $NAME; mvmctl logs -f $NAME;)
 
 # With config/secrets volumes and port forwarding (e.g., OpenClaw)
-(TEMPLATE=openclaw; NAME=oc; cr cleanup --all; \
-    cr stop $NAME; \
-    cr template build $TEMPLATE --force --snapshot; \
-    cr run  --template $TEMPLATE \
+(TEMPLATE=openclaw; NAME=oc; mvmctl cleanup --all; \
+    mvmctl stop $NAME; \
+    mvmctl template build $TEMPLATE --force --snapshot; \
+    mvmctl run  --template $TEMPLATE \
             --name $NAME \
             -v nix/examples/openclaw/config:/mnt/config \
             -v nix/examples/openclaw/secrets:/mnt/secrets \
-            -p 3000:3000; cr forward $NAME & cr logs -f $NAME;)
+            -p 3000:3000; mvmctl forward $NAME & mvmctl logs -f $NAME;)
 ```
 
 Drop `--snapshot` if you don't need instant restore on subsequent runs.

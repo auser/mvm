@@ -148,7 +148,7 @@ Inside the Lima shell, you have:
 - Firecracker binary
 - `/dev/kvm` for virtualization
 
-## 8. Sync (Install mvm Inside Lima)
+## 8. Sync (Install mvmctl Inside Lima)
 
 Build and install the mvm binary inside the Lima VM from your local source:
 
