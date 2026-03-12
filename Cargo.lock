@@ -1580,6 +1580,7 @@ dependencies = [
  "mvm-runtime",
  "mvm-security",
  "predicates",
+ "serde_json",
 ]
 
 [[package]]

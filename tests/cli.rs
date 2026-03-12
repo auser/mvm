@@ -623,3 +623,47 @@ fn test_shell_init_prints_block() {
         "shell-init should include mvmd alias"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Metrics
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_metrics_help() {
+    mvm()
+        .args(["metrics", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Prometheus"))
+        .stdout(predicate::str::contains("--json"));
+}
+
+#[test]
+fn test_metrics_prometheus_output() {
+    let assert = mvm().arg("metrics").assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    assert!(
+        stdout.contains("mvm_requests_total"),
+        "metrics output should contain mvm_requests_total"
+    );
+    assert!(
+        stdout.contains("# HELP"),
+        "metrics output should contain Prometheus HELP lines"
+    );
+}
+
+#[test]
+fn test_metrics_json_output() {
+    let assert = mvm().args(["metrics", "--json"]).assert().success();
+    let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
+    let val: serde_json::Value =
+        serde_json::from_str(&stdout).expect("metrics --json must be valid JSON");
+    assert!(
+        val.get("requests_total").is_some(),
+        "JSON must have requests_total"
+    );
+    assert!(
+        val.get("instances_created").is_some(),
+        "JSON must have instances_created"
+    );
+}

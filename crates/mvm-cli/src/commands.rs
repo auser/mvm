@@ -306,6 +306,12 @@ enum Commands {
     },
     /// Print shell configuration (completions + dev aliases) to stdout
     ShellInit,
+    /// Show runtime metrics (Prometheus text format by default)
+    Metrics {
+        /// Output as JSON instead of Prometheus exposition format
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -728,6 +734,7 @@ pub fn run() -> Result<()> {
         Commands::Down { name, config } => cmd_down(name.as_deref(), config.as_deref()),
         Commands::Completions { shell } => cmd_completions(shell),
         Commands::ShellInit => shell_init::print_shell_init(),
+        Commands::Metrics { json } => cmd_metrics(json),
         Commands::Template { action } => cmd_template(action),
         Commands::Vm { action } => cmd_vm(action),
     };
@@ -2667,6 +2674,17 @@ fn cmd_down(name: Option<&str>, config_path: Option<&str>) -> Result<()> {
             }
         }
     }
+}
+
+fn cmd_metrics(json: bool) -> Result<()> {
+    let metrics = mvm_core::observability::metrics::global();
+    if json {
+        let snap = metrics.snapshot();
+        println!("{}", serde_json::to_string_pretty(&snap)?);
+    } else {
+        print!("{}", metrics.prometheus_exposition());
+    }
+    Ok(())
 }
 
 fn cmd_completions(shell: clap_complete::Shell) -> Result<()> {
@@ -4806,5 +4824,38 @@ edition = "2024"
     fn test_start_alias_for_run() {
         // 'start' is already an alias on Run — verify it still works
         assert!(Cli::try_parse_from(["mvmctl", "start", "--flake", "."]).is_ok());
+    }
+
+    // -------------------------------------------------------------------------
+    // Metrics tests (Phase 1)
+    // -------------------------------------------------------------------------
+
+    #[test]
+    fn test_metrics_command_parses() {
+        let cli = Cli::try_parse_from(["mvmctl", "metrics"]).unwrap();
+        assert!(matches!(cli.command, Commands::Metrics { json: false }));
+    }
+
+    #[test]
+    fn test_metrics_json_flag_parses() {
+        let cli = Cli::try_parse_from(["mvmctl", "metrics", "--json"]).unwrap();
+        assert!(matches!(cli.command, Commands::Metrics { json: true }));
+    }
+
+    #[test]
+    fn test_metrics_snapshot_serializes_to_json() {
+        let snap = mvm_core::observability::metrics::global().snapshot();
+        let json = serde_json::to_string(&snap).expect("snapshot must serialize");
+        assert!(json.contains("requests_total"));
+        assert!(json.contains("instances_created"));
+    }
+
+    #[test]
+    fn test_prometheus_exposition_has_expected_metrics() {
+        let prom = mvm_core::observability::metrics::global().prometheus_exposition();
+        assert!(prom.contains("mvm_requests_total"));
+        assert!(prom.contains("mvm_instances_created_total"));
+        assert!(prom.contains("# HELP"));
+        assert!(prom.contains("# TYPE"));
     }
 }

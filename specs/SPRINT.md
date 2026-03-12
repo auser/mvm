@@ -50,24 +50,24 @@
 
 ---
 
-## Phase 1: `mvmctl metrics` Command **Status: PLANNED**
+## Phase 1: `mvmctl metrics` Command **Status: COMPLETE**
 
 The `mvm_core::observability::metrics::Metrics` struct (global singleton) exposes `prometheus_exposition()` and `snapshot()` today. Nothing surfaces these to the CLI.
 
 ### 1.1 New `metrics` subcommand
 
-- [ ] Add `Commands::Metrics { json: bool }` to the `Commands` enum in `commands.rs`
-- [ ] `cmd_metrics(json)`:
+- [x] Add `Commands::Metrics { json: bool }` to the `Commands` enum in `commands.rs`
+- [x] `cmd_metrics(json)`:
   - JSON mode: serialize `global().snapshot()` (which is already `Serialize`) and print
   - Text mode: print `global().prometheus_exposition()` directly (already formatted)
-- [ ] Dispatch arm in `run()`
+- [x] Dispatch arm in `run()`
 
 ### 1.2 Tests
 
-- [ ] Unit test: `mvmctl metrics` parses without error (CLI integration test in `tests/cli.rs`)
-- [ ] Unit test: `mvmctl metrics --json` parses without error
-- [ ] Unit test: `cmd_metrics` in `commands::tests` — snapshot serializes to valid JSON
-- [ ] Unit test: prometheus exposition contains expected metric names (`mvm_requests_total`, etc.)
+- [x] Integration test: `mvmctl metrics --help` shows Prometheus/--json in `tests/cli.rs`
+- [x] Integration test: `mvmctl metrics` outputs valid Prometheus text with `mvm_requests_total`
+- [x] Integration test: `mvmctl metrics --json` outputs valid JSON with expected fields
+- [x] Unit tests: snapshot serialization, prometheus exposition metric names
 
 ---
 
