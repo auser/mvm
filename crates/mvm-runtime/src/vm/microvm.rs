@@ -312,6 +312,9 @@ pub fn start() -> Result<()> {
     // Set up networking
     network::setup()?;
 
+    let _vm_span = tracing::info_span!("vm_start").entered();
+    let vm_start = std::time::Instant::now();
+
     // Start Firecracker daemon
     start_firecracker_daemon(&abs_dir)?;
     let mut fc_guard = FirecrackerGuard::new(&abs_dir);
@@ -323,6 +326,13 @@ pub fn start() -> Result<()> {
     ui::info("Starting microVM...");
     std::thread::sleep(std::time::Duration::from_millis(15));
     api_put("/actions", r#"{"action_type": "InstanceStart"}"#)?;
+
+    mvm_core::observability::metrics::global()
+        .vm_start_duration_ms
+        .store(
+            vm_start.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
     // Make vsock socket accessible to the current user
     if let Err(e) = run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir)) {

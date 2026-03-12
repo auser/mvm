@@ -1,8 +1,8 @@
-# Sprint 21 — Binary Signing, Attestation & Upgrade Safety
+# Sprint 22 — Observability Deep Dive
 
-**Goal:** Make release artifacts cryptographically verifiable using Sigstore/cosign keyless signing, and add upgrade safety guardrails: a pre-install signature check in the `update` command and a rollback mechanism if the new binary fails a basic smoke test.
+**Goal:** Make the runtime inspectable without adding a monitoring sidecar. Add timing metrics for the critical paths (`build_image`, `vm_start`, `vsock_handshake`), instrument those paths with `tracing` spans, and expose an opt-in HTTP `/metrics` endpoint for long-running commands.
 
-**Branch:** `feat/sprint-21`
+**Branch:** `feat/sprint-22`
 
 **Roadmap:** See [specs/plans/19-post-hardening-roadmap.md](plans/19-post-hardening-roadmap.md) for full post-hardening priorities.
 
@@ -11,7 +11,7 @@
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 6 + root facade          |
-| Total tests      | 739                      |
+| Total tests      | 744                      |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | MSRV             | 1.85                     |
@@ -39,87 +39,109 @@
 - [18-developer-experience.md](sprints/18-developer-experience.md)
 - [19-observability-security.md](sprints/19-observability-security.md)
 - [20-production-hardening-validation.md](sprints/20-production-hardening-validation.md)
+- [21-binary-signing-attestation.md](sprints/21-binary-signing-attestation.md)
 
 ---
 
 ## Rationale
 
-**Why binary signing and upgrade safety?**
+The existing `mvmctl metrics` command already exposes Prometheus-format counters for requests and instance lifecycle events. What's missing:
 
-Sprint 20 added SHA256 checksum verification to the `update` command, which protects against accidental corruption. But a compromised GitHub Releases page could serve a binary *with a matching checksum* if the attacker controls the release. Sigstore cosign keyless signing ties the binary's provenance to the GitHub Actions OIDC token used at release time — verification requires the artifact to have been signed by *this specific workflow* on *this specific commit*. That closes the remaining supply-chain gap.
+1. **Timing data** — operators can't see how long builds or VM starts take. Adding `build_image_duration_ms`, `vm_start_duration_ms`, and `vsock_handshake_rtt_ms` gauges closes that gap.
+2. **Tracing spans** — `tracing::info_span!` on critical paths lets structured log consumers (e.g. `RUST_LOG=mvm=trace`) correlate timing with context without code changes.
+3. **HTTP scrape endpoint** — `mvmctl metrics` is point-in-time and requires shell access. An opt-in `--metrics-port` flag on long-running commands (`run`, `dev`) lets Prometheus scrape metrics without interrupting the workflow.
 
-The upgrade safety guardrail (smoke test + rollback) prevents a defective release from bricking an installation. Currently, if the new binary fails to start (e.g., a broken dependency), the old binary has already been replaced. Adding a pre-swap smoke test keeps the existing binary alive until the new one proves it can run.
+The HTTP server uses only `std::net::TcpListener` (no new deps) to keep the dependency footprint minimal.
 
 ---
 
-## Phase 1: Cosign Signing in `release.yml` **Status: COMPLETE**
+## Phase 1: Timing Gauges in `mvm-core` **Status: COMPLETE**
 
-### 1.1 Sign each release binary
+### 1.1 Add timing fields to `Metrics`
 
-- [x] Add `cosign` install step to the `release` job in `release.yml`
-- [x] After all binaries are built and staged, run for each tarball:
-  ```bash
-  cosign sign-blob \
-    --bundle "${ARCHIVE_NAME}.tar.gz.bundle" \
-    "${ARCHIVE_NAME}.tar.gz"
+- [x] Add to `crates/mvm-core/src/observability/metrics.rs`:
+  ```rust
+  // ── Timing gauges (last observed, milliseconds) ─────────────────
+  pub build_image_duration_ms: AtomicU64,  // last build_image() duration
+  pub vm_start_duration_ms: AtomicU64,     // last vm_start / run_from_snapshot() duration
+  pub vsock_handshake_rtt_ms: AtomicU64,   // last vsock auth handshake RTT
   ```
-  Uses keyless signing with GitHub Actions OIDC — no secret key needed.
-- [x] Upload `.bundle` files as release assets alongside tarballs
-- [x] 1 CI check: `cosign` exits 0 on the signing step
+- [x] Initialize all three to `0` in `Metrics::new()`
+- [x] Add to `MetricsSnapshot` and `prometheus_exposition()`:
+  - `mvm_build_image_duration_milliseconds` (gauge)
+  - `mvm_vm_start_duration_milliseconds` (gauge)
+  - `mvm_vsock_handshake_rtt_milliseconds` (gauge)
+  - Use `# TYPE ... gauge` (not counter) in Prometheus output
+- [x] 3 unit tests: each new field stores correctly; prometheus output contains `gauge` type lines
 
-### 1.2 Sign the SBOM
+### 1.2 Instrument `build_image` in `mvm-build`
 
-- [x] After generating `sbom.cdx.json`, sign it:
-  ```bash
-  cosign sign-blob --bundle sbom.cdx.json.bundle sbom.cdx.json
+- [x] In `crates/mvm-build/src/dev_build.rs`, wrap the nix build with `std::time::Instant` and record to `build_image_duration_ms`
+- [x] Add `tracing::info_span!("build_image", flake = %flake_ref)` around the build
+
+### 1.3 Instrument `vm_start` in `mvm-runtime`
+
+- [x] In `crates/mvm-runtime/src/vm/microvm.rs`, time the `start()` call and record to `vm_start_duration_ms`
+- [x] Add `tracing::info_span!("vm_start")` around the start sequence
+
+### 1.4 Instrument vsock handshake in `mvm-guest`
+
+- [x] In `crates/mvm-guest/src/vsock.rs`, time the auth handshake and record to `vsock_handshake_rtt_ms`
+- [x] Add `tracing::info_span!("vsock_handshake")` around the handshake sequence
+
+---
+
+## Phase 2: HTTP Metrics Endpoint **Status: COMPLETE**
+
+### 2.1 `MetricsServer` in `mvm-cli`
+
+- [ ] Create `crates/mvm-cli/src/metrics_server.rs`:
+  ```rust
+  pub struct MetricsServer { port: u16, handle: Option<std::thread::JoinHandle<()>> }
+
+  impl MetricsServer {
+      /// Bind to 127.0.0.1:<port> and serve GET /metrics in a background thread.
+      pub fn start(port: u16) -> Result<Self>
+      /// Stop the background thread gracefully.
+      pub fn stop(self)
+  }
   ```
-- [x] Upload `sbom.cdx.json.bundle` as a release asset
+- [ ] Implementation: `TcpListener::bind("127.0.0.1:<port>")`, accept loop in background thread
+- [ ] On each connection: read first line of request (ignore rest), respond with:
+  - Status `200 OK`, `Content-Type: text/plain; version=0.0.4`
+  - Body: `metrics::global().prometheus_exposition()`
+- [x] Set non-blocking accept so shutdown flag is checked promptly
+- [x] 2 unit tests: server binds successfully; `GET /metrics` response body contains `mvm_requests_total`
 
-### 1.3 Document verification for users
+### 2.2 Wire `--metrics-port` into long-running commands
 
-- [x] Add `docs/guides/verify-release.md` explaining:
-  - Install cosign: `brew install cosign` / `apt install cosign`
-  - Verify a release binary:
-    ```bash
-    cosign verify-blob \
-      --bundle mvmctl-aarch64-apple-darwin.tar.gz.bundle \
-      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-      --certificate-identity-regexp 'https://github.com/auser/mvm/.github/workflows/release.yml.*' \
-      mvmctl-aarch64-apple-darwin.tar.gz
-    ```
-  - Verification proves: built by GitHub Actions, from the official repo, at a specific tag
-
----
-
-## Phase 2: Pre-swap Smoke Test in `update.rs` **Status: COMPLETE**
-
-Currently `update.rs` extracts the archive and replaces the binary. If the new binary is broken (segfaults, missing libs, etc.), the installation is left in a broken state.
-
-### 2.1 `smoke_test_binary(path: &Path) -> Result<()>`
-
-- [x] Add `fn smoke_test_binary(new_bin: &Path) -> Result<()>` to `update.rs`
-- [x] Runs `new_bin --version` — if exit code != 0 or output doesn't contain the version, bail with a clear error
-- [x] Called *before* replacing the current binary (after extracting from archive)
-- [x] 2 unit tests: current binary passes smoke test, a non-executable path fails
-
-### 2.2 Rollback on post-swap failure
-
-- [x] After copying the new binary, verify it again with `smoke_test_binary` on the installed path
-- [x] If post-swap smoke test fails: restore the backup automatically
-- [x] Emit a clear error: `"New binary failed smoke test; restored previous version."`
-- [x] 1 unit test: smoke test error message matches expected string
+- [x] Add `--metrics-port <PORT>` flag to `Commands::Run` and `Commands::Dev`:
+  ```
+  /// Bind a Prometheus metrics endpoint on this port (0 = disabled)
+  #[arg(long, default_value = "0")]
+  metrics_port: u16,
+  ```
+- [x] In `cmd_run` and `cmd_dev`: if `metrics_port > 0`, call `MetricsServer::start(metrics_port)?`; stop on exit
+- [x] Log: `tracing::info!("Metrics available at http://127.0.0.1:{port}/metrics")`
+- [x] 2 unit tests: `--metrics-port 0` parses as 0; `--metrics-port 9090` parses as 9090
 
 ---
 
-## Phase 3: Optional Signature Verification in `update.rs` **Status: COMPLETE**
+## Phase 3: Tracing Span Instrumentation in `mvm-cli` **Status: COMPLETE**
 
-### 3.1 `verify_signature(archive_path, version, archive_name) -> Result<()>`
+### 3.1 Add spans to `cmd_run` and `cmd_stop`
 
-- [x] Check if `cosign` is installed (via `which::which("cosign")`)
-- [x] If available: download `<archive_name>.bundle` from the GitHub release and run `cosign verify-blob`
-- [x] If `cosign` not installed: emit a `tracing::warn!` but continue (non-fatal — checksum still verified)
-- [x] Add `--skip-verify` flag to `mvmctl update` to bypass signature check
-- [x] 2 unit tests: when cosign is not found, verify returns Ok with warning; skip-verify flag respected
+- [x] In `crates/mvm-cli/src/commands.rs`:
+  ```rust
+  fn cmd_run(...) -> Result<()> {
+      let _span = tracing::info_span!("cmd_run", name = ?name, cpus = ?cpus, memory_mib = ?memory).entered();
+      // ...
+  }
+  fn cmd_stop(name: ...) -> Result<()> {
+      let _span = tracing::info_span!("cmd_stop", name = ?name, all).entered();
+      // ...
+  }
+  ```
 
 ---
 
@@ -135,16 +157,6 @@ cargo check --workspace
 ---
 
 ## Future Sprints (Planned, Not Yet Implemented)
-
-### Sprint 22: Observability Deep Dive
-
-**Goal:** Make the runtime inspectable in production without adding a monitoring sidecar.
-
-- [ ] Add `tracing::Span` instrumentation to `cmd_run`, `cmd_stop`, `build_image` critical paths
-- [ ] Add timing histograms for: `build_image` duration, `vm_start` duration, `vsock_handshake` RTT
-- [ ] Expose `GET /metrics` HTTP endpoint (bind to `127.0.0.1:9090` by default) using `tiny_http`
-- [ ] Add `--metrics-port` flag to `mvmctl run` and `mvmctl up`
-- [ ] 4 unit tests: histogram buckets, metric name format, HTTP response body is valid Prometheus text
 
 ### Sprint 23: Global Config File
 

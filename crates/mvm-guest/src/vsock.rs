@@ -308,6 +308,8 @@ pub fn handshake_as_host(
     session_id: &str,
     host_signing_key: &SigningKey,
 ) -> Result<VerifyingKey> {
+    let _span = tracing::info_span!("vsock_handshake").entered();
+    let t = std::time::Instant::now();
     let challenge: Vec<u8> = (0..32).map(|_| rand::random::<u8>()).collect();
     let host_pubkey = host_signing_key.verifying_key().to_bytes().to_vec();
 
@@ -364,6 +366,13 @@ pub fn handshake_as_host(
     guest_verifying_key
         .verify(&challenge, &sig)
         .map_err(|e| anyhow::anyhow!("Challenge verification failed: {}", e))?;
+
+    mvm_core::observability::metrics::global()
+        .vsock_handshake_rtt_ms
+        .store(
+            t.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
     Ok(guest_verifying_key)
 }

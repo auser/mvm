@@ -41,6 +41,11 @@ pub struct Metrics {
     // ── Connection counters ─────────────────────────────────────────
     pub connections_accepted: AtomicU64,
     pub connections_rejected: AtomicU64,
+
+    // ── Timing gauges (last observed, milliseconds) ─────────────────
+    pub build_image_duration_ms: AtomicU64,
+    pub vm_start_duration_ms: AtomicU64,
+    pub vsock_handshake_rtt_ms: AtomicU64,
 }
 
 impl Metrics {
@@ -67,6 +72,9 @@ impl Metrics {
             instances_deferred: AtomicU64::new(0),
             connections_accepted: AtomicU64::new(0),
             connections_rejected: AtomicU64::new(0),
+            build_image_duration_ms: AtomicU64::new(0),
+            vm_start_duration_ms: AtomicU64::new(0),
+            vsock_handshake_rtt_ms: AtomicU64::new(0),
         }
     }
 
@@ -94,6 +102,9 @@ impl Metrics {
             instances_deferred: self.instances_deferred.load(Ordering::Relaxed),
             connections_accepted: self.connections_accepted.load(Ordering::Relaxed),
             connections_rejected: self.connections_rejected.load(Ordering::Relaxed),
+            build_image_duration_ms: self.build_image_duration_ms.load(Ordering::Relaxed),
+            vm_start_duration_ms: self.vm_start_duration_ms.load(Ordering::Relaxed),
+            vsock_handshake_rtt_ms: self.vsock_handshake_rtt_ms.load(Ordering::Relaxed),
         }
     }
 
@@ -228,6 +239,24 @@ impl Metrics {
             s.connections_rejected,
             "Connections rejected",
         );
+        write_gauge(
+            &mut out,
+            "mvm_build_image_duration_milliseconds",
+            s.build_image_duration_ms,
+            "Last build_image() duration in milliseconds",
+        );
+        write_gauge(
+            &mut out,
+            "mvm_vm_start_duration_milliseconds",
+            s.vm_start_duration_ms,
+            "Last VM start duration in milliseconds",
+        );
+        write_gauge(
+            &mut out,
+            "mvm_vsock_handshake_rtt_milliseconds",
+            s.vsock_handshake_rtt_ms,
+            "Last vsock auth handshake RTT in milliseconds",
+        );
 
         out
     }
@@ -237,6 +266,13 @@ fn write_metric(out: &mut String, name: &str, value: u64, help: &str) {
     use std::fmt::Write;
     let _ = writeln!(out, "# HELP {} {}", name, help);
     let _ = writeln!(out, "# TYPE {} counter", name);
+    let _ = writeln!(out, "{} {}", name, value);
+}
+
+fn write_gauge(out: &mut String, name: &str, value: u64, help: &str) {
+    use std::fmt::Write;
+    let _ = writeln!(out, "# HELP {} {}", name, help);
+    let _ = writeln!(out, "# TYPE {} gauge", name);
     let _ = writeln!(out, "{} {}", name, value);
 }
 
@@ -264,6 +300,9 @@ pub struct MetricsSnapshot {
     pub instances_deferred: u64,
     pub connections_accepted: u64,
     pub connections_rejected: u64,
+    pub build_image_duration_ms: u64,
+    pub vm_start_duration_ms: u64,
+    pub vsock_handshake_rtt_ms: u64,
 }
 
 #[cfg(test)]
@@ -311,5 +350,36 @@ mod tests {
         assert!(prom.contains("# TYPE mvm_requests_total counter"));
         assert!(prom.contains("mvm_requests_total 42"));
         assert!(prom.contains("mvm_connections_accepted_total 7"));
+    }
+
+    #[test]
+    fn test_timing_gauges_store_and_snapshot() {
+        let m = Metrics::new();
+        m.build_image_duration_ms.store(1234, Ordering::Relaxed);
+        m.vm_start_duration_ms.store(567, Ordering::Relaxed);
+        m.vsock_handshake_rtt_ms.store(89, Ordering::Relaxed);
+
+        let snap = m.snapshot();
+        assert_eq!(snap.build_image_duration_ms, 1234);
+        assert_eq!(snap.vm_start_duration_ms, 567);
+        assert_eq!(snap.vsock_handshake_rtt_ms, 89);
+    }
+
+    #[test]
+    fn test_timing_gauges_prometheus_type_is_gauge() {
+        let m = Metrics::new();
+        m.build_image_duration_ms.store(100, Ordering::Relaxed);
+        let prom = m.prometheus_exposition();
+        assert!(prom.contains("# TYPE mvm_build_image_duration_milliseconds gauge"));
+        assert!(prom.contains("# TYPE mvm_vm_start_duration_milliseconds gauge"));
+        assert!(prom.contains("# TYPE mvm_vsock_handshake_rtt_milliseconds gauge"));
+    }
+
+    #[test]
+    fn test_timing_gauges_prometheus_values() {
+        let m = Metrics::new();
+        m.vm_start_duration_ms.store(42, Ordering::Relaxed);
+        let prom = m.prometheus_exposition();
+        assert!(prom.contains("mvm_vm_start_duration_milliseconds 42"));
     }
 }

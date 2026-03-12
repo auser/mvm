@@ -101,8 +101,16 @@ pub fn dev_build(
     // Step 1: Run nix build with visible output so the user sees progress
     env.log_info(&format!("Building: nix build {}", attr));
     let build_cmd = format!("nix build {} --no-link{}", attr, impure_flag);
+    let _build_span = tracing::info_span!("build_image", flake = %flake_ref).entered();
+    let build_start = std::time::Instant::now();
     env.shell_exec_visible(&build_cmd)
         .with_context(|| format!("nix build failed for {}", attr))?;
+    mvm_core::observability::metrics::global()
+        .build_image_duration_ms
+        .store(
+            build_start.elapsed().as_millis() as u64,
+            std::sync::atomic::Ordering::Relaxed,
+        );
 
     // Step 2: Capture the output path (instant, uses Nix cache)
     let output = env

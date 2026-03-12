@@ -76,6 +76,9 @@ enum Commands {
         /// Project directory to cd into inside the VM
         #[arg(long)]
         project: Option<String>,
+        /// Bind a Prometheus metrics endpoint on this port (0 = disabled)
+        #[arg(long, default_value = "0")]
+        metrics_port: u16,
     },
     /// Stop a running microVM (by name) or all VMs (--all)
     Stop {
@@ -265,6 +268,9 @@ enum Commands {
         /// Auto-forward declared ports after boot (blocks until Ctrl-C)
         #[arg(long)]
         forward: bool,
+        /// Bind a Prometheus metrics endpoint on this port (0 = disabled)
+        #[arg(long, default_value = "0")]
+        metrics_port: u16,
     },
     /// Launch microVMs (from mvm.toml or CLI flags)
     Up {
@@ -631,7 +637,8 @@ pub fn run() -> Result<()> {
             lima_cpus,
             lima_mem,
             project,
-        } => cmd_dev(lima_cpus, lima_mem, project.as_deref()),
+            metrics_port,
+        } => cmd_dev(lima_cpus, lima_mem, project.as_deref(), metrics_port),
         Commands::Stop { name, all } => cmd_stop(name.as_deref(), all),
         Commands::Ssh => cmd_ssh(),
         Commands::SshConfig => cmd_ssh_config(),
@@ -700,6 +707,7 @@ pub fn run() -> Result<()> {
             port,
             env,
             forward,
+            metrics_port,
         } => {
             let memory_mb = memory
                 .as_ref()
@@ -719,6 +727,7 @@ pub fn run() -> Result<()> {
                 ports: &port,
                 env_vars: &env,
                 forward,
+                metrics_port,
             })
         }
         Commands::Up {
@@ -830,7 +839,12 @@ fn recreate_rootfs() -> Result<()> {
     Ok(())
 }
 
-fn cmd_dev(lima_cpus: u32, lima_mem: u32, project: Option<&str>) -> Result<()> {
+fn cmd_dev(lima_cpus: u32, lima_mem: u32, project: Option<&str>, metrics_port: u16) -> Result<()> {
+    let _metrics_server = if metrics_port > 0 {
+        Some(crate::metrics_server::MetricsServer::start(metrics_port)?)
+    } else {
+        None
+    };
     ui::info("Launching development environment...\n");
 
     if bootstrap::is_lima_required() {
@@ -975,6 +989,7 @@ fn shell_escape(s: &str) -> String {
 }
 
 fn cmd_stop(name: Option<&str>, all: bool) -> Result<()> {
+    let _span = tracing::info_span!("cmd_stop", name = ?name, all).entered();
     if let Some(n) = name {
         validate_vm_name(n).with_context(|| format!("Invalid VM name: {:?}", n))?;
     }
@@ -2146,6 +2161,7 @@ struct RunParams<'a> {
     ports: &'a [String],
     env_vars: &'a [String],
     forward: bool,
+    metrics_port: u16,
 }
 
 fn cmd_run(params: RunParams<'_>) -> Result<()> {
@@ -2162,7 +2178,10 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
         ports,
         env_vars,
         forward,
+        metrics_port,
     } = params;
+    let _span =
+        tracing::info_span!("cmd_run", name = ?name, cpus = ?cpus, memory_mib = ?memory).entered();
     if let Some(n) = name {
         validate_vm_name(n).with_context(|| format!("Invalid VM name: {:?}", n))?;
     }
@@ -2175,6 +2194,11 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
     if bootstrap::is_lima_required() {
         lima::require_running()?;
     }
+    let _metrics_server = if metrics_port > 0 {
+        Some(crate::metrics_server::MetricsServer::start(metrics_port)?)
+    } else {
+        None
+    };
 
     // Generate a VM name if not provided
     let vm_name = match name {

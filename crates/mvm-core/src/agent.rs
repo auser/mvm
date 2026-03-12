@@ -1342,6 +1342,9 @@ mod tests {
             instances_deferred: 3,
             connections_accepted: 50,
             connections_rejected: 1,
+            build_image_duration_ms: 0,
+            vm_start_duration_ms: 0,
+            vsock_handshake_rtt_ms: 0,
         };
         let resp = AgentResponse::Metrics(snapshot);
         let json = serde_json::to_string(&resp).unwrap();

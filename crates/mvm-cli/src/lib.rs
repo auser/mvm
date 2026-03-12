@@ -7,6 +7,7 @@ pub mod doctor;
 pub mod fleet;
 pub mod http;
 pub mod logging;
+pub mod metrics_server;
 pub mod security_cmd;
 pub mod shell_init;
 pub mod template_cmd;
