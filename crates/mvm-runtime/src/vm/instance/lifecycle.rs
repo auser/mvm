@@ -153,7 +153,7 @@ pub fn instance_start(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resu
             save_instance(tenant_id, pool_id, instance_id, &state)?;
         } else {
             anyhow::bail!(
-                "Pool {}/{} has not been built yet. Run 'mvm pool build {}/{}'",
+                "Pool {}/{} has not been built yet. Run 'mvmctl pool build {}/{}'",
                 tenant_id,
                 pool_id,
                 tenant_id,

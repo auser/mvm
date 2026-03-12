@@ -1032,7 +1032,7 @@ fn cmd_shell(project: Option<&str>, _lima_cpus: u32, _lima_mem: u32) -> Result<(
         shell::run_in_vm_stdout("firecracker --version 2>/dev/null | head -1").unwrap_or_default();
     let nix_ver = shell::run_in_vm_stdout("nix --version 2>/dev/null").unwrap_or_default();
 
-    ui::info("mvm development shell");
+    ui::info("mvmctl development shell");
     ui::info(&format!(
         "  Firecracker: {}",
         if fc_ver.trim().is_empty() {
@@ -2042,7 +2042,7 @@ fn cmd_build_flake(flake_ref: &str, profile: Option<&str>, watch: bool, json: bo
 
             ui::info(&format!("  Kernel: {}", result.vmlinux_path));
             ui::info(&format!("  Rootfs: {}", result.rootfs_path));
-            ui::info(&format!("\nRun with: mvm run --flake {}", flake_ref));
+            ui::info(&format!("\nRun with: mvmctl run --flake {}", flake_ref));
         }
 
         if !watch_enabled {
@@ -2560,7 +2560,7 @@ fn cmd_up(
         (None, None) => {
             anyhow::bail!(
                 "No mvm.toml found and no --flake specified.\n\
-                 Use 'mvm up --flake <path>' or create an mvm.toml."
+                 Use 'mvmctl up --flake <path>' or create an mvm.toml."
             );
         }
     }

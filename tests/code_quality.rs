@@ -92,6 +92,103 @@ fn no_unwrap_in_production_code() {
     }
 }
 
+/// Ensure no user-facing strings reference the old binary name `mvm` as a CLI command.
+///
+/// Internal identifiers are fine: Lima VM name `mvm`, bridge `br-mvm`, paths `/var/lib/mvm/`,
+/// crate names `mvm-core`, log prefixes `[mvm]`, RUST_LOG filter `mvm=info`, etc.
+/// Only CLI command suggestions like "Run 'mvm setup'" should use `mvmctl`.
+#[test]
+fn no_stale_binary_name_in_user_facing_strings() {
+    let crates_dir = Path::new(env!("CARGO_MANIFEST_DIR")).join("crates");
+
+    // Patterns that indicate user-facing CLI command references using old name.
+    // These are strings where 'mvm' is used as a command the user should type.
+    let patterns = [
+        r"Run 'mvm ",
+        r"Use 'mvm ",
+        r#""mvm run"#,
+        r#""mvm stop"#,
+        r#""mvm start"#,
+        r#""mvm setup"#,
+        r#""mvm dev"#,
+        r#""mvm shell"#,
+        r#""mvm status"#,
+        r#""mvm bootstrap"#,
+        r#""mvm up"#,
+        r#""mvm pool "#,
+        r#""mvm agent "#,
+        r"Run with: mvm ",
+    ];
+
+    let output = Command::new("grep")
+        .args(["-rn", "--include=*.rs", "--exclude-dir=tests"])
+        .arg(
+            patterns
+                .iter()
+                .map(|p| format!("-e{}", p))
+                .collect::<Vec<_>>()
+                .first()
+                .expect("at least one pattern"),
+        )
+        .args(
+            patterns
+                .iter()
+                .skip(1)
+                .flat_map(|p| ["-e", p])
+                .collect::<Vec<&str>>(),
+        )
+        .arg(crates_dir.to_str().expect("crates dir must be UTF-8"))
+        .output()
+        .expect("grep must be available");
+
+    let stdout = String::from_utf8_lossy(&output.stdout);
+
+    let violations: Vec<&str> = stdout
+        .lines()
+        .filter(|line| {
+            // Skip test code and comments
+            if line.contains("/tests/") || line.contains("shell_mock.rs") {
+                return false;
+            }
+            let parts: Vec<&str> = line.splitn(3, ':').collect();
+            if parts.len() >= 3 {
+                let content = parts[2].trim();
+                if content.starts_with("///") || content.starts_with("//") {
+                    return false;
+                }
+            }
+
+            // Skip test blocks
+            if parts.len() >= 2 {
+                let file_path = parts[0];
+                let line_num: usize = match parts[1].parse() {
+                    Ok(n) => n,
+                    Err(_) => return false,
+                };
+                if let Some(start) = find_cfg_test_line(file_path) {
+                    if line_num >= start {
+                        return false;
+                    }
+                }
+            }
+            true
+        })
+        .collect();
+
+    if !violations.is_empty() {
+        let mut msg = String::from(
+            "Found stale 'mvm' binary name in user-facing strings (should be 'mvmctl'):\n\n",
+        );
+        for v in &violations {
+            msg.push_str("  ");
+            msg.push_str(v);
+            msg.push('\n');
+        }
+        msg.push_str("\nReplace 'mvm <command>' with 'mvmctl <command>' in user-facing messages.");
+        panic!("{}", msg);
+    }
+}
+
 /// Find the line number of `#[cfg(test)]` in a file, if present.
 fn find_cfg_test_line(path: &str) -> Option<usize> {
     let content = std::fs::read_to_string(path).ok()?;

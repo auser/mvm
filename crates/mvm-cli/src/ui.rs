@@ -67,8 +67,8 @@ pub fn banner(lines: &[&str]) {
 
 /// Print the status header.
 pub fn status_header() {
-    println!("{}", "mvm status".bold());
-    println!("{}", "----------".dimmed());
+    println!("{}", "mvmctl status".bold());
+    println!("{}", "-------------".dimmed());
 }
 
 /// Print a status line with a bold label and a colored value.

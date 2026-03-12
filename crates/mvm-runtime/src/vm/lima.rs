@@ -100,13 +100,13 @@ pub fn require_running() -> Result<()> {
         LimaStatus::Running => Ok(()),
         LimaStatus::Stopped => {
             anyhow::bail!(
-                "Lima VM '{}' is stopped. Run 'mvm start' or 'mvm setup'.",
+                "Lima VM '{}' is stopped. Run 'mvmctl dev' or 'mvmctl setup'.",
                 VM_NAME
             )
         }
         LimaStatus::NotFound => {
             anyhow::bail!(
-                "Lima VM '{}' does not exist. Run 'mvm setup' first.",
+                "Lima VM '{}' does not exist. Run 'mvmctl setup' first.",
                 VM_NAME
             )
         }

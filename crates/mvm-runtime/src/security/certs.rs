@@ -326,7 +326,7 @@ pub fn rotate_certs(node_id: &str) -> Result<CertPaths> {
             == "yes";
 
     if !ca_present {
-        anyhow::bail!("CA certificate not found. Run 'mvm agent certs init' first.");
+        anyhow::bail!("CA certificate not found. Run 'mvmctl agent certs init' first.");
     }
 
     // For now, regenerate self-signed. In production, would CSR to coordinator.

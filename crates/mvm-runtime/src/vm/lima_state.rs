@@ -32,7 +32,7 @@ pub fn ensure_lima_ready() -> Result<()> {
         Ok(())
     } else {
         anyhow::bail!(
-            "Lima VM '{}' is not available. Run 'mvm setup' or 'mvm bootstrap' first.",
+            "Lima VM '{}' is not available. Run 'mvmctl setup' or 'mvmctl bootstrap' first.",
             config::VM_NAME
         )
     }
@@ -53,7 +53,7 @@ fn check_and_start_lima() -> Result<()> {
             Ok(())
         }
         LimaStatus::NotFound => {
-            anyhow::bail!("Lima VM not found. Run 'mvm setup' first.")
+            anyhow::bail!("Lima VM not found. Run 'mvmctl setup' first.")
         }
     }
 }

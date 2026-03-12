@@ -291,7 +291,7 @@ fn configure_microvm(state: &MvmState, abs_dir: &str) -> Result<()> {
 /// Full start sequence: network, firecracker, configure, boot (headless).
 ///
 /// MicroVMs never have SSH enabled. They run as headless workloads and
-/// communicate via vsock. Use `mvm shell` to access the Lima VM environment.
+/// communicate via vsock. Use `mvmctl shell` to access the Lima VM environment.
 #[instrument(skip_all)]
 pub fn start() -> Result<()> {
     require_linux_env()?;
@@ -299,7 +299,7 @@ pub fn start() -> Result<()> {
     // Check if already running
     if firecracker::is_running()? {
         ui::info("Firecracker is already running.");
-        ui::info("Use 'mvm stop' to shut down, then 'mvm start' to restart.");
+        ui::info("Use 'mvmctl stop' to shut down, then 'mvmctl start' to restart.");
         return Ok(());
     }
 
@@ -337,9 +337,9 @@ pub fn start() -> Result<()> {
         "",
         &format!("  Guest IP: {}", GUEST_IP),
         "",
-        "Use 'mvm status' to check the microVM.",
-        "Use 'mvm stop' to shut down the microVM.",
-        "Use 'mvm shell' to access the Lima VM environment.",
+        "Use 'mvmctl status' to check the microVM.",
+        "Use 'mvmctl stop' to shut down the microVM.",
+        "Use 'mvmctl shell' to access the Lima VM environment.",
     ]);
 
     Ok(())
@@ -423,7 +423,7 @@ fn read_state_or_discover() -> Result<MvmState> {
 
     if kernel.is_empty() || rootfs.is_empty() || ssh_key.is_empty() {
         anyhow::bail!(
-            "Missing microVM assets in {}. Run 'mvm setup' first.\n  kernel={:?} rootfs={:?} ssh_key={:?}",
+            "Missing microVM assets in {}. Run 'mvmctl setup' first.\n  kernel={:?} rootfs={:?} ssh_key={:?}",
             MICROVM_DIR,
             kernel,
             rootfs,
@@ -540,7 +540,7 @@ pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
 
     if firecracker::is_vm_running(&pid_file)? {
         ui::info(&format!("VM '{}' is already running.", slot.name));
-        ui::info("Use 'mvm stop <name>' to shut it down first.");
+        ui::info("Use 'mvmctl stop <name>' to shut it down first.");
         return Ok(());
     }
 
@@ -585,8 +585,8 @@ pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
         &format!("  Guest IP: {}", slot.guest_ip),
         &format!("  Revision: {}", config.revision_hash),
         "",
-        &format!("Use 'mvm stop {}' to shut down this VM.", config.name),
-        "Use 'mvm status' to list all running VMs.",
+        &format!("Use 'mvmctl stop {}' to shut down this VM.", config.name),
+        "Use 'mvmctl status' to list all running VMs.",
     ]);
 
     Ok(())
@@ -620,7 +620,7 @@ pub fn restore_from_template_snapshot(
 
     if firecracker::is_vm_running(&pid_file)? {
         ui::info(&format!("VM '{}' is already running.", slot.name));
-        ui::info("Use 'mvm stop <name>' to shut it down first.");
+        ui::info("Use 'mvmctl stop <name>' to shut it down first.");
         return Ok(());
     }
 
@@ -757,8 +757,8 @@ pub fn restore_from_template_snapshot(
         &format!("  Guest IP: {}", slot.guest_ip),
         &format!("  Revision: {}", config.revision_hash),
         "",
-        &format!("Use 'mvm stop {}' to shut down this VM.", config.name),
-        "Use 'mvm status' to list all running VMs.",
+        &format!("Use 'mvmctl stop {}' to shut down this VM.", config.name),
+        "Use 'mvmctl status' to list all running VMs.",
     ]);
 
     Ok(())

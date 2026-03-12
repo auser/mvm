@@ -235,7 +235,7 @@ fn kvm_check(plat: Platform, in_vm: bool) -> Check {
             name: "kvm",
             category: "platform",
             ok: false,
-            info: "Lima VM not running or /dev/kvm unavailable. Run 'mvm setup'.".to_string(),
+            info: "Lima VM not running or /dev/kvm unavailable. Run 'mvmctl setup'.".to_string(),
         },
     }
 }
@@ -252,13 +252,13 @@ fn lima_status_check() -> Check {
             name: "lima vm",
             category: "platform",
             ok: false,
-            info: "stopped. Run 'mvm dev' or 'limactl start mvm'.".to_string(),
+            info: "stopped. Run 'mvmctl dev' or 'limactl start mvm'.".to_string(),
         },
         Ok(lima::LimaStatus::NotFound) => Check {
             name: "lima vm",
             category: "platform",
             ok: false,
-            info: "not found. Run 'mvm setup' or 'mvm bootstrap'.".to_string(),
+            info: "not found. Run 'mvmctl setup' or 'mvmctl bootstrap'.".to_string(),
         },
         Err(e) => Check {
             name: "lima vm",

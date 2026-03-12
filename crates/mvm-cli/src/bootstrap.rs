@@ -23,7 +23,7 @@ pub fn check_homebrew() -> Result<()> {
             "Homebrew is not installed.\n\
              Install it first:\n\n  \
              /bin/bash -c \"$(curl -fsSL https://raw.githubusercontent.com/Homebrew/install/HEAD/install.sh)\"\n\n\
-             Then run 'mvm bootstrap' again."
+             Then run 'mvmctl bootstrap' again."
         )
     })?;
     ui::info("Homebrew found.");
@@ -129,7 +129,7 @@ mod tests {
             let msg = err.to_string();
             assert!(msg.contains("Homebrew is not installed"));
             assert!(msg.contains("curl -fsSL"));
-            assert!(msg.contains("mvm bootstrap"));
+            assert!(msg.contains("mvmctl bootstrap"));
         } else {
             assert!(check_homebrew().is_ok());
         }

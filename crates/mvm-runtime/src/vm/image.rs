@@ -544,7 +544,7 @@ fi
 # Extract base rootfs
 SQUASHFS=$(ls $HOME/microvm/ubuntu-*.squashfs.upstream 2>/dev/null | tail -1)
 if [ -z "$SQUASHFS" ]; then
-    echo "[mvm] ERROR: No base rootfs found. Run 'mvm setup' first." >&2
+    echo "[mvm] ERROR: No base rootfs found. Run 'mvmctl setup' first." >&2
     exit 1
 fi
 echo "[mvm] Extracting base rootfs..."

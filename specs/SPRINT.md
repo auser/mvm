@@ -9,7 +9,7 @@
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 6 + root facade          |
-| Total tests      | 679                      |
+| Total tests      | 680                      |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | MSRV             | 1.85                     |
@@ -37,31 +37,34 @@
 
 ---
 
-## Phase 1: Fix Stale Binary Name References **Status: PLANNED**
+## Phase 1: Fix Stale Binary Name References **Status: COMPLETE**
 
-The binary was renamed from `mvm` to `mvmctl` but 11+ user-facing messages still reference `mvm`. Internal identifiers (Lima VM name `mvm`, bridge `br-mvm`, paths `/var/lib/mvm/`) stay unchanged — only CLI-facing strings need updating.
+The binary was renamed from `mvm` to `mvmctl` but 20+ user-facing messages still referenced `mvm`. Internal identifiers (Lima VM name `mvm`, bridge `br-mvm`, paths `/var/lib/mvm/`) stay unchanged — only CLI-facing strings were updated.
 
 ### 1.1 User-facing error/info messages
 
-- [ ] `crates/mvm-cli/src/commands.rs:2045` — "Run with: mvm run" → "mvmctl run"
-- [ ] `crates/mvm-runtime/src/vm/lima.rs:103` — "Run 'mvm start' or 'mvm setup'" → "mvmctl"
-- [ ] `crates/mvm-runtime/src/vm/lima.rs:109` — "Run 'mvm setup'" → "mvmctl setup"
-- [ ] `crates/mvm-runtime/src/vm/microvm.rs:302` — "Use 'mvm stop' ... 'mvm start'" → "mvmctl"
-- [ ] `crates/mvm-runtime/src/vm/microvm.rs:341` — "Use 'mvm stop'" → "mvmctl stop"
-- [ ] `crates/mvm-runtime/src/vm/microvm.rs:543` — "Use 'mvm stop'" → "mvmctl stop"
-- [ ] `crates/mvm-runtime/src/vm/microvm.rs:588` — "Use 'mvm stop'" → "mvmctl stop"
-- [ ] `crates/mvm-runtime/src/vm/microvm.rs:623` — "Use 'mvm stop'" → "mvmctl stop"
-- [ ] `crates/mvm-runtime/src/vm/microvm.rs:760` — "Use 'mvm stop'" → "mvmctl stop"
-- [ ] `crates/mvm-cli/src/commands.rs:1035` — "mvm development shell" → "mvmctl"
+- [x] `crates/mvm-cli/src/commands.rs` — "Run with: mvm run" → "mvmctl run"
+- [x] `crates/mvm-cli/src/commands.rs` — "mvm development shell" → "mvmctl"
+- [x] `crates/mvm-cli/src/commands.rs` — "mvm up --flake" → "mvmctl up --flake"
+- [x] `crates/mvm-cli/src/bootstrap.rs` — "mvm bootstrap" → "mvmctl bootstrap"
+- [x] `crates/mvm-cli/src/ui.rs` — "mvm status" header → "mvmctl status"
+- [x] `crates/mvm-runtime/src/ui.rs` — "mvm status" header → "mvmctl status"
+- [x] `crates/mvm-runtime/src/vm/lima.rs` — "Run 'mvm start' or 'mvm setup'" → "mvmctl"
+- [x] `crates/mvm-runtime/src/vm/lima_state.rs` — "Run 'mvm setup' or 'mvm bootstrap'" → "mvmctl"
+- [x] `crates/mvm-runtime/src/vm/microvm.rs` — All "Use 'mvm stop/start/status/shell'" → "mvmctl" (8 instances)
+- [x] `crates/mvm-runtime/src/vm/image.rs` — "Run 'mvm setup'" → "mvmctl setup"
+- [x] `crates/mvm-runtime/src/vm/instance/lifecycle.rs` — "Run 'mvm pool build'" → "mvmctl pool build"
+- [x] `crates/mvm-runtime/src/security/certs.rs` — "Run 'mvm agent certs init'" → "mvmctl"
 
 ### 1.2 Doctor messages
 
-- [ ] `crates/mvm-cli/src/doctor.rs:256` — "Run 'mvm setup'" → "mvmctl setup"
-- [ ] `crates/mvm-cli/src/doctor.rs:260` — "Run 'mvm setup' or 'mvm bootstrap'" → "mvmctl"
+- [x] `crates/mvm-cli/src/doctor.rs` — "Run 'mvm dev'" → "mvmctl dev"
+- [x] `crates/mvm-cli/src/doctor.rs` — "Run 'mvm setup' or 'mvm bootstrap'" → "mvmctl"
+- [x] `crates/mvm-cli/src/doctor.rs` — "Run 'mvm setup'" (KVM check) → "mvmctl setup"
 
 ### 1.3 Code quality test
 
-- [ ] Add grep-based test to `tests/code_quality.rs` that catches user-facing `'mvm ` strings referencing the old binary name (exclude internal identifiers like VM name, bridge name, crate names)
+- [x] Added `no_stale_binary_name_in_user_facing_strings` test to `tests/code_quality.rs` — greps for patterns like `Run 'mvm `, `Use 'mvm ` in production code and fails if any are found
 
 ---
 
