@@ -45,6 +45,19 @@ No task is complete without tests. Every feature, bug fix, or refactor must incl
 - Security code: positive path (valid data accepted), negative path (tampered/invalid data rejected), and edge cases (replay, wrong key, expired session).
 - If a function can fail, test that it fails correctly (returns `Err`, not panic).
 
+## Privacy & Security
+
+Privacy and security are **critical priorities** for this project and must be considered in every decision. All code changes, architecture decisions, and feature additions must be evaluated through a security lens:
+
+- **Never log, store, or expose sensitive data** (secrets, tokens, keys, credentials, user data) in plaintext — in code, logs, config files, or error messages.
+- **Validate and sanitize all inputs** at system boundaries (CLI args, config files, network data, vsock messages).
+- **Apply least privilege** — processes, microVMs, and agents should have only the minimum permissions they need.
+- **Default to secure configurations** — encryption on, auth required, restrictive permissions. Users opt out of security, never opt in.
+- **Guard secrets in transit and at rest** — use signing, encryption, and secure channels (vsock, not plaintext TCP) for sensitive communication.
+- **No hardcoded secrets** — tokens, keys, and credentials must come from environment variables, secure config, or runtime injection. Never commit secrets to the repository.
+- **Consider attack surface** in every feature — new network listeners, file permissions, IPC channels, and CLI commands are all potential vectors.
+- **Security tests are mandatory** — every security-relevant code path must have tests for both the positive path (valid data accepted) and negative path (tampered, expired, unauthorized data rejected).
+
 ## No `unwrap()` in Production Code
 
 **NEVER** use `.unwrap()` in production code. Always use `.expect("descriptive message")` instead, so that if a panic occurs, the error message explains what went wrong and where. `.unwrap()` is only acceptable in test code (`#[cfg(test)]` modules and `tests/` directories).

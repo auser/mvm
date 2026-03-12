@@ -9,7 +9,7 @@
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 6 + root facade          |
-| Total tests      | 680                      |
+| Total tests      | 688                      |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | MSRV             | 1.85                     |
@@ -68,28 +68,27 @@ The binary was renamed from `mvm` to `mvmctl` but 20+ user-facing messages still
 
 ---
 
-## Phase 2: Doctor Enhancements **Status: PLANNED**
+## Phase 2: Doctor Enhancements **Status: COMPLETE**
 
 ### 2.1 Nix version validation
 
-Currently `mvmctl doctor` only checks that `nix` exists — it doesn't verify the version is recent enough for flake support.
-
-- [ ] Parse `nix --version` output to extract semver (e.g., "nix (Nix) 2.18.1" → 2.18.1)
-- [ ] Warn if Nix version < 2.4 (minimum for `nix build` with flakes)
-- [ ] Recommend Nix >= 2.13 for best flake support
-- [ ] Add `nix.conf` check: verify `experimental-features = nix-command flakes` is set
-- [ ] Tests: version parsing, threshold checks, missing config handling
+- [x] `nix_version_check()` parses `nix --version` output (e.g., "nix (Nix) 2.18.1" → 2.18.1)
+- [x] Fails if Nix version < 2.4 (minimum for `nix build` with flakes)
+- [x] Warns if Nix version < 2.13 (recommended for best flake support)
+- [x] `nix_flakes_check()` verifies `experimental-features` includes `nix-command` and `flakes`
+- [x] 7 tests: version parsing (standard, suffix, old, garbage, empty), threshold checks
 
 ### 2.2 Lima VM health check
 
-- [ ] Check Lima VM disk usage (warn if Lima VM disk > 80% full)
-- [ ] Check Lima VM memory allocation vs host available memory
-- [ ] Verify Lima VM can execute commands (not just "running" status)
+- [x] `lima_disk_check()` reports Lima VM disk usage, warns at 80%+, fails at 90%+
+- Lima VM memory check deferred (requires parsing Lima config YAML — low value for effort)
+- Lima VM command execution already covered by existing `check_vm_cmd` checks
 
 ### 2.3 Nix store health
 
-- [ ] Check Nix store is accessible (`nix store ping`)
-- [ ] Report Nix store size for awareness
+- [x] `nix_store_check()` runs `nix store ping` to verify store accessibility
+- [x] Reports store URL (e.g., "Store URL: daemon") on success
+- Nix store size reporting deferred (requires `nix store info` which may not be available on all versions)
 
 ---
 
