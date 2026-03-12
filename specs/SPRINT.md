@@ -1,6 +1,6 @@
-# Sprint 17 — Resource Safety & Release v0.5.0
+# Sprint 18 — Developer Experience & Polish
 
-**Goal:** Add RAII cleanup for VM resources to prevent leaks, specify MSRV, and cut a v0.5.0 release packaging all hardening work from Sprint 16.
+**Goal:** Fix stale binary name references, enhance `mvmctl doctor` with smarter checks, improve watch mode, and add quality-of-life CLI improvements.
 
 **Roadmap:** See [specs/plans/19-post-hardening-roadmap.md](plans/19-post-hardening-roadmap.md) for full post-hardening priorities.
 
@@ -37,68 +37,91 @@
 
 ---
 
-## Phase 1: Drop Impls for VM Resources **Status: COMPLETE**
+## Phase 1: Fix Stale Binary Name References **Status: PLANNED**
 
-### 1.1 Audit resource ownership
+The binary was renamed from `mvm` to `mvmctl` but 11+ user-facing messages still reference `mvm`. Internal identifiers (Lima VM name `mvm`, bridge `br-mvm`, paths `/var/lib/mvm/`) stay unchanged — only CLI-facing strings need updating.
 
-- [x] Full audit of all OS resource handles across workspace (Firecracker PIDs, TAP interfaces, vsock sockets, temp dirs, cgroups, socat children, file locks)
-- [x] Mapped each resource to existing cleanup function
-- [x] Identified medium-risk targets: Firecracker process (dev+flake), TAP interfaces
+### 1.1 User-facing error/info messages
 
-### 1.2 Firecracker process guard
+- [ ] `crates/mvm-cli/src/commands.rs:2045` — "Run with: mvm run" → "mvmctl run"
+- [ ] `crates/mvm-runtime/src/vm/lima.rs:103` — "Run 'mvm start' or 'mvm setup'" → "mvmctl"
+- [ ] `crates/mvm-runtime/src/vm/lima.rs:109` — "Run 'mvm setup'" → "mvmctl setup"
+- [ ] `crates/mvm-runtime/src/vm/microvm.rs:302` — "Use 'mvm stop' ... 'mvm start'" → "mvmctl"
+- [ ] `crates/mvm-runtime/src/vm/microvm.rs:341` — "Use 'mvm stop'" → "mvmctl stop"
+- [ ] `crates/mvm-runtime/src/vm/microvm.rs:543` — "Use 'mvm stop'" → "mvmctl stop"
+- [ ] `crates/mvm-runtime/src/vm/microvm.rs:588` — "Use 'mvm stop'" → "mvmctl stop"
+- [ ] `crates/mvm-runtime/src/vm/microvm.rs:623` — "Use 'mvm stop'" → "mvmctl stop"
+- [ ] `crates/mvm-runtime/src/vm/microvm.rs:760` — "Use 'mvm stop'" → "mvmctl stop"
+- [ ] `crates/mvm-cli/src/commands.rs:1035` — "mvm development shell" → "mvmctl"
 
-- [x] `FirecrackerGuard` struct in `microvm.rs`: wraps VM directory path, kills FC process on drop via PID file
-- [x] `defuse()` method prevents cleanup after successful launch (ownership transfers to `stop_vm()`)
-- [x] Handles both `fc.pid` (multi-VM) and `.fc-pid` (legacy) PID file locations
-- [x] Wired into `run_from_build()`, `restore_from_template_snapshot()`, and legacy `start()`
-- [x] 3 tests: defuse prevents cleanup, drop runs cleanup with correct script, tolerates cleanup failure
+### 1.2 Doctor messages
 
-### 1.3 TAP interface guard
+- [ ] `crates/mvm-cli/src/doctor.rs:256` — "Run 'mvm setup'" → "mvmctl setup"
+- [ ] `crates/mvm-cli/src/doctor.rs:260` — "Run 'mvm setup' or 'mvm bootstrap'" → "mvmctl"
 
-- [x] `TapGuard` struct in `microvm.rs`: wraps `VmSlot`, calls `network::tap_destroy()` on drop
-- [x] `defuse()` method prevents cleanup after successful launch
-- [x] Wired into `run_from_build()` and `restore_from_template_snapshot()`
-- [x] 2 tests: defuse prevents cleanup, drop runs cleanup with TAP destroy command
+### 1.3 Code quality test
 
-### 1.4 Shell mock fix for `run_visible`
-
-- [x] Added `shell_mock::intercept()` to `LimaEnv::run_visible()` and `NativeEnv::run_visible()` — previously mock was not checked for visible shell commands, making Drop impls untestable
-
-### 1.5 Build temp directory cleanup (deferred)
-
-- Build temp dirs are created inside bash scripts (`mktemp -d`) with inline cleanup
-- Already low-risk: scripts use `set -e` and cleanup runs at script end
-- `tempfile::TempDir` not applicable (dirs created in Lima VM, not host)
+- [ ] Add grep-based test to `tests/code_quality.rs` that catches user-facing `'mvm ` strings referencing the old binary name (exclude internal identifiers like VM name, bridge name, crate names)
 
 ---
 
-## Phase 2: MSRV Specification **Status: COMPLETE**
+## Phase 2: Doctor Enhancements **Status: PLANNED**
 
-- [x] Add `rust-version = "1.85"` to workspace `Cargo.toml`
-- [x] Add `rust-version.workspace = true` to root package
-- [x] Verified via `cargo check --workspace` (Edition 2024 requires 1.85+)
+### 2.1 Nix version validation
+
+Currently `mvmctl doctor` only checks that `nix` exists — it doesn't verify the version is recent enough for flake support.
+
+- [ ] Parse `nix --version` output to extract semver (e.g., "nix (Nix) 2.18.1" → 2.18.1)
+- [ ] Warn if Nix version < 2.4 (minimum for `nix build` with flakes)
+- [ ] Recommend Nix >= 2.13 for best flake support
+- [ ] Add `nix.conf` check: verify `experimental-features = nix-command flakes` is set
+- [ ] Tests: version parsing, threshold checks, missing config handling
+
+### 2.2 Lima VM health check
+
+- [ ] Check Lima VM disk usage (warn if Lima VM disk > 80% full)
+- [ ] Check Lima VM memory allocation vs host available memory
+- [ ] Verify Lima VM can execute commands (not just "running" status)
+
+### 2.3 Nix store health
+
+- [ ] Check Nix store is accessible (`nix store ping`)
+- [ ] Report Nix store size for awareness
 
 ---
 
-## Phase 3: Release v0.5.0 **Status: COMPLETE**
+## Phase 3: Watch Mode Improvements **Status: PLANNED**
 
-### 3.1 Version bump
+Current `mvmctl build --watch` only polls `flake.lock` every 2 seconds. This misses source file changes and is polling-based.
 
-- [x] Update version in all workspace `Cargo.toml` files (root + 6 crates via `workspace.package`)
-- [x] Update `Cargo.lock`
+### 3.1 Watch source files
 
-### 3.2 Changelog
+- [ ] Use `notify` crate for filesystem events (replaces 2s polling)
+- [ ] Watch `flake.nix`, `flake.lock`, and Nix source files (`.nix` in flake directory)
+- [ ] Debounce rapid changes (500ms window) to avoid redundant builds
+- [ ] Add `--watch-path` flag to specify additional paths to watch
 
-- [x] Updated CHANGELOG.md with v0.5.0 section
-- [x] Highlighted Sprint 16 hardening: error handling, test coverage, observability, state safety, security defaults
-- [x] Highlighted Sprint 17: resource safety, MSRV
+### 3.2 Watch UX
 
-### 3.3 Release prep
+- [ ] Clear terminal on rebuild (opt-in `--clear` flag)
+- [ ] Show "watching for changes..." status with timestamp of last build
+- [ ] Show which file triggered the rebuild
 
-- [x] `cargo test --workspace` — 679 tests pass
-- [x] `cargo clippy --workspace -- -D warnings` — zero warnings
-- [x] Tag `v0.5.0`
-- [x] Archive Sprint 17 to `specs/sprints/17-resource-safety-release.md`
+---
+
+## Phase 4: CLI Quality of Life **Status: PLANNED**
+
+### 4.1 Better error messages with suggestions
+
+- [ ] When `mvmctl run` fails because Lima VM is not running, suggest `mvmctl dev` or `mvmctl setup`
+- [ ] When `mvmctl build` fails with Nix error, extract the relevant error lines and suggest common fixes
+- [ ] When `mvmctl template build` fails, suggest `--force` if template already exists
+
+### 4.2 Command aliases
+
+- [ ] `mvmctl ps` as alias for `mvmctl status` (familiar to Docker users)
+- [ ] `mvmctl logs <vm>` to tail Firecracker logs for a running VM
+- [ ] `mvmctl rm <vm>` as alias for `mvmctl vm stop --cleanup`
 
 ---
 
