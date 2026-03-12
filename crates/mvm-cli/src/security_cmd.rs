@@ -278,8 +278,14 @@ mod tests {
     }
 
     #[test]
-    fn test_vsock_auth_check_dev_default() {
+    fn test_vsock_auth_default_requires_auth() {
         let policy = SecurityPolicy::default();
+        assert!(policy.require_auth);
+    }
+
+    #[test]
+    fn test_vsock_auth_dev_defaults_permissive() {
+        let policy = SecurityPolicy::dev_defaults();
         assert!(!policy.require_auth);
     }
 

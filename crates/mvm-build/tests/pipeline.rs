@@ -168,6 +168,7 @@ fn make_tenant() -> TenantConfig {
 /// Create a TemplateRevision JSON string with the given profile and role.
 fn template_revision_json(profile: &str, role: &str) -> String {
     let rev = TemplateRevision {
+        schema_version: mvm_core::template::CURRENT_SCHEMA_VERSION,
         revision_hash: "rev123".to_string(),
         flake_ref: ".".to_string(),
         flake_lock_hash: "lockhash1".to_string(),

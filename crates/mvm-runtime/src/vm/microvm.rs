@@ -407,6 +407,31 @@ pub struct FlakeRunConfig {
     pub ports: Vec<crate::config::PortMapping>,
 }
 
+impl FlakeRunConfig {
+    /// Validate resource bounds and required fields.
+    pub fn validate(&self) -> Result<()> {
+        if self.cpus == 0 || self.cpus > 32 {
+            anyhow::bail!("cpus must be between 1 and 32 (got {})", self.cpus);
+        }
+        if self.memory < 128 || self.memory > 65536 {
+            anyhow::bail!(
+                "memory must be between 128 and 65536 MiB (got {})",
+                self.memory
+            );
+        }
+        if self.name.is_empty() {
+            anyhow::bail!("VM name must not be empty");
+        }
+        if self.vmlinux_path.is_empty() {
+            anyhow::bail!("vmlinux_path must not be empty");
+        }
+        if self.rootfs_path.is_empty() {
+            anyhow::bail!("rootfs_path must not be empty");
+        }
+        Ok(())
+    }
+}
+
 /// Boot a Firecracker VM from flake-built artifacts (headless).
 ///
 /// Each VM gets its own directory under ~/microvm/vms/<name>/ with a
@@ -414,6 +439,7 @@ pub struct FlakeRunConfig {
 /// is shared, but each VM has its own TAP device and guest IP.
 #[instrument(skip_all, fields(name = %config.name))]
 pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
+    config.validate()?;
     require_linux_env()?;
 
     let slot = &config.slot;
@@ -487,6 +513,7 @@ pub fn restore_from_template_snapshot(
     snapshot_dir: &str,
     _snapshot_info: &mvm_core::template::SnapshotInfo,
 ) -> Result<()> {
+    config.validate()?;
     require_linux_env()?;
 
     let slot = &config.slot;
@@ -1326,6 +1353,7 @@ pub fn configure_flake_microvm_with_drives_dir(
 #[instrument(skip_all, fields(name = %config.name))]
 pub fn write_vm_run_info(config: &FlakeRunConfig, abs_dir: &str) -> Result<()> {
     let info = RunInfo {
+        schema_version: 1,
         mode: "flake".to_string(),
         name: Some(config.name.clone()),
         revision: Some(config.revision_hash.clone()),

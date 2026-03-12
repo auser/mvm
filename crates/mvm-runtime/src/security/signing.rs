@@ -151,13 +151,20 @@ pub fn provision_session_keys(
     std::fs::create_dir_all(secrets_dir)
         .with_context(|| format!("Failed to create secrets dir: {}", secrets_dir))?;
 
-    let key_path = format!("{}/session_key.pem", secrets_dir);
-    std::fs::write(&key_path, &guest_secret_b64)
-        .with_context(|| format!("Failed to write session key to {}", key_path))?;
+    let key_path = std::path::PathBuf::from(format!("{}/session_key.pem", secrets_dir));
+    mvm_core::atomic_io::atomic_write(&key_path, guest_secret_b64.as_bytes())
+        .with_context(|| format!("Failed to write session key to {}", key_path.display()))?;
+    // Restrict key file to owner-only read/write (0600)
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(&key_path, std::fs::Permissions::from_mode(0o600))
+            .with_context(|| format!("Failed to set permissions on {}", key_path.display()))?;
+    }
 
-    let pub_path = format!("{}/host_pubkey.pem", secrets_dir);
-    std::fs::write(&pub_path, &host_pub_b64)
-        .with_context(|| format!("Failed to write host pubkey to {}", pub_path))?;
+    let pub_path = std::path::PathBuf::from(format!("{}/host_pubkey.pem", secrets_dir));
+    mvm_core::atomic_io::atomic_write(&pub_path, host_pub_b64.as_bytes())
+        .with_context(|| format!("Failed to write host pubkey to {}", pub_path.display()))?;
 
     Ok(())
 }

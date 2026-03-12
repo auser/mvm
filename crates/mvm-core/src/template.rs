@@ -2,6 +2,13 @@ use sha2::Digest;
 
 use serde::{Deserialize, Serialize};
 
+/// Current schema version for persisted state files.
+pub const CURRENT_SCHEMA_VERSION: u32 = 1;
+
+fn default_schema_version() -> u32 {
+    CURRENT_SCHEMA_VERSION
+}
+
 /// Complete template configuration that can define multiple variants/roles.
 /// Typically loaded from a TOML file.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -37,6 +44,9 @@ fn default_profile() -> String {
 /// Global template definition (tenant-agnostic base image).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateSpec {
+    /// Schema version for forward-compatible migrations. Current: 1.
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub template_id: String,
     pub flake_ref: String,
     pub profile: String,
@@ -101,6 +111,8 @@ pub struct SnapshotInfo {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct TemplateRevision {
+    #[serde(default = "default_schema_version")]
+    pub schema_version: u32,
     pub revision_hash: String,
     pub flake_ref: String,
     pub flake_lock_hash: String,
@@ -136,6 +148,7 @@ mod tests {
 
     fn make_revision(flake_lock_hash: &str, profile: &str, role: &str) -> TemplateRevision {
         TemplateRevision {
+            schema_version: CURRENT_SCHEMA_VERSION,
             revision_hash: "abc123".to_string(),
             flake_ref: ".".to_string(),
             flake_lock_hash: flake_lock_hash.to_string(),

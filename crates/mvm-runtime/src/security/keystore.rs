@@ -33,6 +33,20 @@ pub struct FileKeyProvider;
 impl KeyProvider for FileKeyProvider {
     fn get_data_key(&self, tenant_id: &str) -> Result<Zeroizing<Vec<u8>>> {
         let path = format!("/var/lib/mvm/keys/{}.key", tenant_id);
+        // Warn if key file has overly permissive permissions
+        if let Ok(perms) = crate::shell::run_in_vm_stdout(&format!(
+            "stat -c '%a' {} 2>/dev/null || stat -f '%Lp' {} 2>/dev/null",
+            path, path
+        )) {
+            let mode = perms.trim();
+            if !mode.is_empty() && mode != "600" && mode != "400" {
+                tracing::warn!(
+                    path = %path,
+                    mode = %mode,
+                    "key file has permissive permissions (expected 600 or 400)"
+                );
+            }
+        }
         let output =
             crate::shell::run_in_vm_stdout(&format!("xxd -p {} 2>/dev/null | tr -d '\\n'", path))
                 .with_context(|| format!("Failed to read key file: {}", path))?;

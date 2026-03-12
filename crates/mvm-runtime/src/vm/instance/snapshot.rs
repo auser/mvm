@@ -9,6 +9,8 @@ use mvm_core::time;
 /// Metadata for a snapshot (base or delta).
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SnapshotMeta {
+    #[serde(default)]
+    pub schema_version: u32,
     pub snapshot_type: String,
     pub revision_hash: Option<String>,
     pub compression: String,
@@ -109,6 +111,7 @@ pub fn create_base_snapshot(
     let mem_size = file_size_bytes(&format!("{}/mem.bin", base_dir))?;
 
     let meta = SnapshotMeta {
+        schema_version: 1,
         snapshot_type: "base".to_string(),
         revision_hash: revision_hash.map(|s| s.to_string()),
         compression: compression.to_string(),
@@ -180,6 +183,7 @@ pub fn create_delta_snapshot(instance_dir: &str, compression: &str) -> Result<()
     let mem_size = file_size_bytes(&format!("{}/mem.delta.bin", delta_dir))?;
 
     let meta = SnapshotMeta {
+        schema_version: 1,
         snapshot_type: "delta".to_string(),
         revision_hash: None,
         compression: compression.to_string(),
@@ -462,6 +466,7 @@ mod tests {
     #[test]
     fn test_snapshot_meta_roundtrip() {
         let meta = SnapshotMeta {
+            schema_version: 1,
             snapshot_type: "base".to_string(),
             revision_hash: Some("abc123".to_string()),
             compression: "zstd".to_string(),
@@ -479,6 +484,7 @@ mod tests {
     #[test]
     fn test_snapshot_meta_delta_no_revision() {
         let meta = SnapshotMeta {
+            schema_version: 1,
             snapshot_type: "delta".to_string(),
             revision_hash: None,
             compression: "none".to_string(),

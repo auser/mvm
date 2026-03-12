@@ -293,6 +293,7 @@ pub fn template_build(id: &str, force: bool, update_hash: bool) -> Result<()> {
 
     // Record template revision metadata
     let revision = TemplateRevision {
+        schema_version: mvm_core::template::CURRENT_SCHEMA_VERSION,
         revision_hash: rev.clone(),
         flake_ref: spec.flake_ref.clone(),
         flake_lock_hash,
@@ -729,6 +730,8 @@ fn cleanup_snapshot_vm(abs_dir: &str, abs_socket: &str, slot: &crate::config::Vm
 /// Artifact integrity manifest used by template push/pull.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Checksums {
+    #[serde(default)]
+    pub schema_version: u32,
     pub template_id: String,
     pub revision_hash: String,
     pub files: std::collections::BTreeMap<String, String>,
@@ -865,7 +868,7 @@ pub fn registry_download_revision(
         let key = registry.key_revision_file(template_id, &rev, name);
         let data = registry.get_bytes(&key)?;
         let file_path = output_dir.join(name);
-        std::fs::write(&file_path, &data)
+        mvm_core::atomic_io::atomic_write(&file_path, &data)
             .with_context(|| format!("Failed to write {}", file_path.display()))?;
         let got = sha256_hex(&file_path)?;
         if &got != expected_hex {
@@ -880,7 +883,7 @@ pub fn registry_download_revision(
     }
 
     // Write checksums.json alongside the artifacts for offline verification.
-    std::fs::write(output_dir.join("checksums.json"), &sums_bytes)
+    mvm_core::atomic_io::atomic_write(&output_dir.join("checksums.json"), &sums_bytes)
         .context("Failed to write checksums.json")?;
 
     Ok((rev, downloaded_files))
@@ -918,18 +921,20 @@ pub fn template_push(id: &str, revision: Option<&str>) -> Result<()> {
         sums.insert(name.to_string(), hex);
     }
     let checksums = Checksums {
+        schema_version: 1,
         template_id: id.to_string(),
         revision_hash: rev.clone(),
         files: sums,
     };
     let checksums_json = serde_json::to_vec_pretty(&checksums)?;
     // Store checksums locally alongside the revision so `template verify` works offline.
-    std::fs::write(rev_dir.join("checksums.json"), &checksums_json).with_context(|| {
-        format!(
-            "Failed to write checksums.json for template {} revision {}",
-            id, rev
-        )
-    })?;
+    mvm_core::atomic_io::atomic_write(&rev_dir.join("checksums.json"), &checksums_json)
+        .with_context(|| {
+            format!(
+                "Failed to write checksums.json for template {} revision {}",
+                id, rev
+            )
+        })?;
 
     // Upload revision objects first, then current pointer.
     for (name, path) in &files {
@@ -1163,6 +1168,7 @@ mod tests {
         files.insert("vmlinux".to_string(), "abc123".to_string());
         files.insert("rootfs.squashfs".to_string(), "def456".to_string());
         let checksums = Checksums {
+            schema_version: 1,
             template_id: "gateway".to_string(),
             revision_hash: "rev-abc".to_string(),
             files,
@@ -1178,6 +1184,7 @@ mod tests {
     #[test]
     fn test_checksums_empty_files() {
         let checksums = Checksums {
+            schema_version: 1,
             template_id: "empty".to_string(),
             revision_hash: "rev-000".to_string(),
             files: std::collections::BTreeMap::new(),
@@ -1194,6 +1201,7 @@ mod tests {
         files.insert("a-file".to_string(), "aaa".to_string());
         files.insert("m-file".to_string(), "mmm".to_string());
         let checksums = Checksums {
+            schema_version: 1,
             template_id: "t".to_string(),
             revision_hash: "r".to_string(),
             files,

@@ -71,6 +71,9 @@ pub struct PortMapping {
 /// distinguish dev-mode VMs from flake-built VMs.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct RunInfo {
+    /// Schema version for forward-compatible migrations.
+    #[serde(default)]
+    pub schema_version: u32,
     /// "dev" or "flake"
     pub mode: String,
     #[serde(default)]
@@ -335,6 +338,7 @@ mod tests {
     #[test]
     fn test_run_info_json_roundtrip() {
         let info = RunInfo {
+            schema_version: 1,
             mode: "flake".to_string(),
             name: Some("gw".to_string()),
             revision: Some("abc123".to_string()),

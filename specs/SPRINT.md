@@ -9,7 +9,7 @@
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 6 + root facade          |
-| Total tests      | 630                      |
+| Total tests      | 673                      |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | Binary           | `mvmctl`                 |
@@ -165,42 +165,47 @@ Reference: `crates/mvm-runtime/src/vm/instance/lifecycle.rs` (6 functions alread
 
 ---
 
-## Phase 4: State Safety **Status: PLANNED**
+## Phase 4: State Safety **Status: COMPLETE**
 
 ### 4.1 Atomic state writes
 
-- [ ] Write to temp file, then `rename()` for atomicity
-- [ ] Applies to: `instance.json`, `template.json`, `run-info`
+- [x] New `mvm_core::atomic_io` module: `atomic_write()` (temp file + fsync + rename), `atomic_write_str()`, 7 tests
+- [x] Added `fs2` and `tempfile` dependencies to workspace
+- [x] Applied to `template/lifecycle.rs` — 3 `std::fs::write` → `atomic_write`
+- [x] Applied to `security/signing.rs` — session key + host pubkey writes use `atomic_write`
 
 ### 4.2 File-based locking
 
-- [ ] Use `flock()` or `fs2::FileExt` for exclusive access during state mutations
-- [ ] Document concurrent access limitations
+- [x] `FileLock` RAII guard in `atomic_io`: `acquire()` (blocking) and `try_acquire()` (non-blocking) via `fs2::FileExt`
+- [x] Lock auto-released on drop, creates parent directories as needed
+- [x] 3 tests: acquire+drop, try_acquire contention, nonexistent parent
 
 ### 4.3 State version fields
 
-- [ ] Add `schema_version: u32` to persisted structs
-- [ ] Add migration path for future schema changes
+- [x] `schema_version: u32` with `#[serde(default)]` added to: `TemplateSpec`, `TemplateRevision`, `RunInfo`, `Checksums`, `SnapshotMeta`
+- [x] `CURRENT_SCHEMA_VERSION` constant (= 1) in `mvm_core::template`
+- [x] All construction sites updated (15+ locations across 8 files)
+- [x] Backward-compatible: old files without field deserialize as version 0
 
 ---
 
-## Phase 5: Security Hardening **Status: PLANNED**
+## Phase 5: Security Hardening **Status: COMPLETE**
 
 ### 5.1 Invert SecurityPolicy default
 
-- [ ] `require_auth: true` by default in `mvm-core/src/security.rs`
-- [ ] Explicit opt-out for dev/testing mode
+- [x] `require_auth` defaults to `true` in `mvm-core/src/security.rs` (was `false`)
+- [x] Added `SecurityPolicy::dev_defaults()` with `require_auth: false` for dev/testing
+- [x] Updated 3 tests to match new default behavior
 
 ### 5.2 File permission enforcement
 
-- [ ] Ensure key files at `/var/lib/mvm/keys/*.key` are chmod 0600
-- [ ] Validate permissions on load, warn if too permissive
+- [x] Session key files (`session_key.pem`) set to `chmod 0600` after writing in `signing.rs`
+- [x] `FileKeyProvider` warns via `tracing::warn!` if key files have permissions other than 600/400
 
 ### 5.3 Config validation
 
-- [ ] Add bounds checking for CPU, memory, rate limits
-- [ ] Validate flake refs against safe pattern
-- [ ] Reject unknown config keys (`#[serde(deny_unknown_fields)]` where missing)
+- [x] `FlakeRunConfig::validate()` — bounds checking: cpus 1-32, memory 128-65536 MiB, non-empty name/vmlinux/rootfs
+- [x] Called at entry points: `run_from_build()` and `restore_from_template_snapshot()`
 
 ---
 

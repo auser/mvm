@@ -22,6 +22,7 @@ pub fn create_single(
     let flake_ref = resolve_flake_ref(flake);
     let ts = now_iso();
     let spec = TemplateSpec {
+        schema_version: mvm_core::template::CURRENT_SCHEMA_VERSION,
         template_id: name.to_string(),
         flake_ref,
         profile: profile.to_string(),
@@ -174,6 +175,7 @@ pub fn build(
 
             let ts = now_iso();
             let spec = TemplateSpec {
+                schema_version: mvm_core::template::CURRENT_SCHEMA_VERSION,
                 template_id: template_name.clone(),
                 flake_ref: resolve_flake_ref(&cfg.flake_ref),
                 profile: if variant.profile.is_empty() {
