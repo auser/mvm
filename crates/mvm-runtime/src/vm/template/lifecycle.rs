@@ -6,6 +6,8 @@ use mvm_core::template::{
     template_spec_path,
 };
 
+use tracing::{instrument, warn};
+
 use crate::build_env::RuntimeBuildEnv;
 use crate::shell;
 use crate::ui;
@@ -48,6 +50,7 @@ fn vm_exec_stdout(script: &str) -> Result<String> {
     Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
 }
 
+#[instrument(skip_all, fields(template_id = %spec.template_id))]
 pub fn template_create(spec: &TemplateSpec) -> Result<()> {
     let dir = template_dir(&spec.template_id);
     vm_exec(&format!("mkdir -p {dir}"))
@@ -59,6 +62,7 @@ pub fn template_create(spec: &TemplateSpec) -> Result<()> {
     Ok(())
 }
 
+#[instrument(skip_all, fields(template_id = id))]
 pub fn template_load(id: &str) -> Result<TemplateSpec> {
     let path = template_spec_path(id);
     let data = vm_exec_stdout(&format!("cat {path}")).with_context(|| {
@@ -72,6 +76,7 @@ pub fn template_load(id: &str) -> Result<TemplateSpec> {
     Ok(spec)
 }
 
+#[instrument(skip_all)]
 pub fn template_list() -> Result<Vec<String>> {
     let base = mvm_core::template::templates_base_dir();
     let out = shell::run_in_vm_stdout(&format!("ls -1 {base} 2>/dev/null || true"))?
@@ -84,6 +89,7 @@ pub fn template_list() -> Result<Vec<String>> {
         .collect())
 }
 
+#[instrument(skip_all, fields(template_id = id, force))]
 pub fn template_delete(id: &str, force: bool) -> Result<()> {
     let dir = template_dir(id);
     let flag = if force { "-rf" } else { "-r" };
@@ -94,6 +100,7 @@ pub fn template_delete(id: &str, force: bool) -> Result<()> {
 
 /// Initialize an on-disk template directory layout (empty artifacts, no spec).
 /// Safe to call multiple times; existing contents are preserved.
+#[instrument(skip_all, fields(template_id = id))]
 pub fn template_init(id: &str) -> Result<()> {
     let dir = template_dir(id);
     let artifacts = format!("{}/artifacts/revisions", dir);
@@ -107,6 +114,7 @@ pub fn template_init(id: &str) -> Result<()> {
 /// Blanks the `outputHash` field, runs `nix build` to trigger hash computation,
 /// extracts the correct hash from the error output, and writes it back.
 /// On failure, the original hash is restored.
+#[instrument(skip_all, fields(flake_ref))]
 fn update_fod_hash(flake_ref: &str) -> Result<()> {
     ui::info("Recomputing fixed-output derivation hash...");
 
@@ -154,11 +162,13 @@ fn update_fod_hash(flake_ref: &str) -> Result<()> {
             }
         }
         // Restore original hash.
-        let _ = shell::run_in_vm(&format!(
+        if let Err(e) = shell::run_in_vm(&format!(
             r#"sed -i.bak 's|outputHash = "[^"]*"|outputHash = "{orig}"|' {flake}/flake.nix && rm -f {flake}/flake.nix.bak"#,
             orig = orig_hash,
             flake = flake_ref
-        ));
+        )) {
+            warn!("failed to restore original FOD hash: {e}");
+        }
         return Err(anyhow!("Could not extract FOD hash from nix build output."));
     }
 
@@ -175,6 +185,7 @@ fn update_fod_hash(flake_ref: &str) -> Result<()> {
 
 /// Build a template using the dev build pipeline (local Nix in Lima).
 /// Artifacts are stored in ~/.mvm/templates/<id>/artifacts and the current symlink is updated.
+#[instrument(skip_all, fields(template_id = id, force, update_hash))]
 pub fn template_build(id: &str, force: bool, update_hash: bool) -> Result<()> {
     use crate::ui;
 
@@ -197,7 +208,9 @@ pub fn template_build(id: &str, force: bool, update_hash: bool) -> Result<()> {
     if force {
         ui::info("Force build: clearing dev build cache");
         let builds_dir = format!("{}/dev/builds", mvm_core::config::mvm_data_dir());
-        let _ = shell::run_in_vm(&format!("rm -rf {builds_dir}"));
+        if let Err(e) = shell::run_in_vm(&format!("rm -rf {builds_dir}")) {
+            warn!("failed to clear dev build cache: {e}");
+        }
     }
     let result = mvm_build::dev_build::dev_build(&env, &spec.flake_ref, Some(&spec.profile))?;
     // Best-effort: inject guest agent if not already present.
@@ -280,6 +293,7 @@ pub fn template_build(id: &str, force: bool, update_hash: bool) -> Result<()> {
 
     // Record template revision metadata
     let revision = TemplateRevision {
+        schema_version: mvm_core::template::CURRENT_SCHEMA_VERSION,
         revision_hash: rev.clone(),
         flake_ref: spec.flake_ref.clone(),
         flake_lock_hash,
@@ -334,6 +348,7 @@ pub fn template_snapshot_info(id: &str) -> Result<Option<SnapshotInfo>> {
 }
 
 /// Poll the guest agent via vsock until it responds, or timeout.
+#[instrument(skip_all, fields(timeout_secs, interval_ms))]
 pub fn wait_for_healthy(vsock_uds_path: &str, timeout_secs: u64, interval_ms: u64) -> Result<()> {
     let deadline = Instant::now() + Duration::from_secs(timeout_secs);
     let mut attempts = 0u32;
@@ -392,6 +407,7 @@ fn check_integration_health(
 ///
 /// If there are no integrations or none have `health_cmd` configured, returns
 /// immediately (no-op).
+#[instrument(skip_all, fields(timeout_secs, interval_ms))]
 pub fn wait_for_integrations_healthy(
     vsock_uds_path: &str,
     timeout_secs: u64,
@@ -478,6 +494,7 @@ pub fn wait_for_integrations_healthy(
 /// 5. Pauses vCPUs and creates a full snapshot
 /// 6. Stores snapshot files in the template revision directory
 /// 7. Cleans up the temporary VM
+#[instrument(skip_all, fields(template_id = id, force, update_hash))]
 pub fn template_build_with_snapshot(id: &str, force: bool, update_hash: bool) -> Result<()> {
     use crate::config::BRIDGE_IP;
     use crate::vm::{microvm, network};
@@ -537,12 +554,16 @@ pub fn template_build_with_snapshot(id: &str, force: bool, update_hash: bool) ->
     // Clean up stale vsock socket from a previous template build.
     // start_vm_firecracker only cleans abs_dir/v.sock, but the vsock device
     // binds to template_runtime_dir/v.sock (a different path).
-    let _ = shell::run_in_vm(&format!("rm -f {}/v.sock", template_runtime_dir));
+    if let Err(e) = shell::run_in_vm(&format!("rm -f {}/v.sock", template_runtime_dir)) {
+        warn!("failed to remove stale vsock socket: {e}");
+    }
 
     // Start Firecracker
     let start_result = microvm::start_vm_firecracker(&abs_dir, &abs_socket);
     if let Err(e) = start_result {
-        let _ = network::tap_destroy(&slot);
+        if let Err(e) = network::tap_destroy(&slot) {
+            warn!("failed to destroy TAP device on error: {e}");
+        }
         return Err(e.context("Failed to start snapshot VM"));
     }
 
@@ -569,7 +590,9 @@ pub fn template_build_with_snapshot(id: &str, force: bool, update_hash: bool) ->
     }
 
     // Make vsock accessible
-    let _ = shell::run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir));
+    if let Err(e) = shell::run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir)) {
+        warn!("failed to chmod vsock socket: {e}");
+    }
 
     // Wait for guest agent to become healthy
     // Note: First boot can take 10-15 minutes on nested virtualization (macOS)
@@ -680,7 +703,7 @@ fn cleanup_snapshot_vm(abs_dir: &str, abs_socket: &str, slot: &crate::config::Vm
     use crate::vm::network;
 
     // Kill Firecracker process
-    let _ = shell::run_in_vm(&format!(
+    if let Err(e) = shell::run_in_vm(&format!(
         r#"
         if [ -f {dir}/fc.pid ]; then
             sudo kill $(cat {dir}/fc.pid) 2>/dev/null || true
@@ -689,18 +712,26 @@ fn cleanup_snapshot_vm(abs_dir: &str, abs_socket: &str, slot: &crate::config::Vm
         "#,
         dir = abs_dir,
         socket = abs_socket,
-    ));
+    )) {
+        warn!("failed to kill snapshot firecracker process: {e}");
+    }
 
     // Destroy TAP
-    let _ = network::tap_destroy(slot);
+    if let Err(e) = network::tap_destroy(slot) {
+        warn!("failed to destroy snapshot TAP device: {e}");
+    }
 
     // Remove temp VM directory
-    let _ = shell::run_in_vm(&format!("rm -rf {}", abs_dir));
+    if let Err(e) = shell::run_in_vm(&format!("rm -rf {}", abs_dir)) {
+        warn!("failed to remove snapshot temp directory: {e}");
+    }
 }
 
 /// Artifact integrity manifest used by template push/pull.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Checksums {
+    #[serde(default)]
+    pub schema_version: u32,
     pub template_id: String,
     pub revision_hash: String,
     pub files: std::collections::BTreeMap<String, String>,
@@ -721,6 +752,7 @@ fn require_local_template_fs() -> Result<()> {
 ///
 /// Returns `(spec, vmlinux, initrd, rootfs, revision_hash)`.
 /// The artifact paths are absolute and valid inside the Lima VM.
+#[instrument(skip_all, fields(template_id = id))]
 pub fn template_artifacts(
     id: &str,
 ) -> Result<(TemplateSpec, String, Option<String>, String, String)> {
@@ -760,6 +792,7 @@ pub fn template_artifacts(
     ))
 }
 
+#[instrument(skip_all, fields(template_id))]
 pub fn current_revision_id(template_id: &str) -> Result<String> {
     use std::os::unix::ffi::OsStrExt;
 
@@ -798,6 +831,7 @@ pub fn sha256_hex(path: &std::path::Path) -> Result<String> {
 /// template dir) and fleet agents (write to pool artifacts dir).
 ///
 /// Returns the revision hash and the list of downloaded file names.
+#[instrument(skip_all, fields(template_id))]
 pub fn registry_download_revision(
     registry: &TemplateRegistry,
     template_id: &str,
@@ -834,7 +868,7 @@ pub fn registry_download_revision(
         let key = registry.key_revision_file(template_id, &rev, name);
         let data = registry.get_bytes(&key)?;
         let file_path = output_dir.join(name);
-        std::fs::write(&file_path, &data)
+        mvm_core::atomic_io::atomic_write(&file_path, &data)
             .with_context(|| format!("Failed to write {}", file_path.display()))?;
         let got = sha256_hex(&file_path)?;
         if &got != expected_hex {
@@ -849,12 +883,13 @@ pub fn registry_download_revision(
     }
 
     // Write checksums.json alongside the artifacts for offline verification.
-    std::fs::write(output_dir.join("checksums.json"), &sums_bytes)
+    mvm_core::atomic_io::atomic_write(&output_dir.join("checksums.json"), &sums_bytes)
         .context("Failed to write checksums.json")?;
 
     Ok((rev, downloaded_files))
 }
 
+#[instrument(skip_all, fields(template_id = id))]
 pub fn template_push(id: &str, revision: Option<&str>) -> Result<()> {
     require_local_template_fs()?;
     let registry = TemplateRegistry::from_env()?.context("Template registry not configured")?;
@@ -886,18 +921,20 @@ pub fn template_push(id: &str, revision: Option<&str>) -> Result<()> {
         sums.insert(name.to_string(), hex);
     }
     let checksums = Checksums {
+        schema_version: 1,
         template_id: id.to_string(),
         revision_hash: rev.clone(),
         files: sums,
     };
     let checksums_json = serde_json::to_vec_pretty(&checksums)?;
     // Store checksums locally alongside the revision so `template verify` works offline.
-    std::fs::write(rev_dir.join("checksums.json"), &checksums_json).with_context(|| {
-        format!(
-            "Failed to write checksums.json for template {} revision {}",
-            id, rev
-        )
-    })?;
+    mvm_core::atomic_io::atomic_write(&rev_dir.join("checksums.json"), &checksums_json)
+        .with_context(|| {
+            format!(
+                "Failed to write checksums.json for template {} revision {}",
+                id, rev
+            )
+        })?;
 
     // Upload revision objects first, then current pointer.
     for (name, path) in &files {
@@ -916,6 +953,7 @@ pub fn template_push(id: &str, revision: Option<&str>) -> Result<()> {
     Ok(())
 }
 
+#[instrument(skip_all, fields(template_id = id))]
 pub fn template_pull(id: &str, revision: Option<&str>) -> Result<()> {
     require_local_template_fs()?;
     let registry = TemplateRegistry::from_env()?.context("Template registry not configured")?;
@@ -956,13 +994,16 @@ pub fn template_pull(id: &str, revision: Option<&str>) -> Result<()> {
 
     // Update current symlink.
     let link = template_current_symlink(id);
-    let _ = std::fs::remove_file(&link);
+    if let Err(e) = std::fs::remove_file(&link) {
+        warn!("failed to remove old current symlink: {e}");
+    }
     std::os::unix::fs::symlink(format!("revisions/{}", rev), &link)?;
 
     tracing::info!(template = %id, revision = %rev, "Pulled template revision from registry");
     Ok(())
 }
 
+#[instrument(skip_all, fields(template_id = id))]
 pub fn template_verify(id: &str, revision: Option<&str>) -> Result<()> {
     require_local_template_fs()?;
 
@@ -1119,5 +1160,59 @@ mod tests {
         let (all_healthy, unhealthy) = check_integration_health(&integrations);
         assert!(all_healthy);
         assert!(unhealthy.is_empty());
+    }
+
+    #[test]
+    fn test_checksums_serde_roundtrip() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("vmlinux".to_string(), "abc123".to_string());
+        files.insert("rootfs.squashfs".to_string(), "def456".to_string());
+        let checksums = Checksums {
+            schema_version: 1,
+            template_id: "gateway".to_string(),
+            revision_hash: "rev-abc".to_string(),
+            files,
+        };
+        let json = serde_json::to_string(&checksums).unwrap();
+        let parsed: Checksums = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed.template_id, "gateway");
+        assert_eq!(parsed.revision_hash, "rev-abc");
+        assert_eq!(parsed.files.len(), 2);
+        assert_eq!(parsed.files["vmlinux"], "abc123");
+    }
+
+    #[test]
+    fn test_checksums_empty_files() {
+        let checksums = Checksums {
+            schema_version: 1,
+            template_id: "empty".to_string(),
+            revision_hash: "rev-000".to_string(),
+            files: std::collections::BTreeMap::new(),
+        };
+        let json = serde_json::to_string(&checksums).unwrap();
+        let parsed: Checksums = serde_json::from_str(&json).unwrap();
+        assert!(parsed.files.is_empty());
+    }
+
+    #[test]
+    fn test_checksums_files_sorted() {
+        let mut files = std::collections::BTreeMap::new();
+        files.insert("z-file".to_string(), "zzz".to_string());
+        files.insert("a-file".to_string(), "aaa".to_string());
+        files.insert("m-file".to_string(), "mmm".to_string());
+        let checksums = Checksums {
+            schema_version: 1,
+            template_id: "t".to_string(),
+            revision_hash: "r".to_string(),
+            files,
+        };
+        let json = serde_json::to_string(&checksums).unwrap();
+        // BTreeMap serializes in sorted order
+        let keys: Vec<&str> = checksums.files.keys().map(|s| s.as_str()).collect();
+        assert_eq!(keys, vec!["a-file", "m-file", "z-file"]);
+        // Roundtrip preserves order
+        let parsed: Checksums = serde_json::from_str(&json).unwrap();
+        let parsed_keys: Vec<&str> = parsed.files.keys().map(|s| s.as_str()).collect();
+        assert_eq!(parsed_keys, vec!["a-file", "m-file", "z-file"]);
     }
 }

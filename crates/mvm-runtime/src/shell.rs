@@ -1,12 +1,14 @@
 use anyhow::{Context, Result};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
+use tracing::instrument;
 
 use crate::config::VM_NAME;
 use crate::linux_env;
 use mvm_core::platform;
 
 /// Run a command on the host, capturing output.
+#[instrument(skip_all, fields(cmd, args_count = args.len()))]
 pub fn run_host(cmd: &str, args: &[&str]) -> Result<Output> {
     Command::new(cmd)
         .args(args)
@@ -15,6 +17,7 @@ pub fn run_host(cmd: &str, args: &[&str]) -> Result<Output> {
 }
 
 /// Run a command on the host, inheriting stdio (visible to user).
+#[instrument(skip_all, fields(cmd, args_count = args.len()))]
 pub fn run_host_visible(cmd: &str, args: &[&str]) -> Result<()> {
     let status = Command::new(cmd)
         .args(args)
@@ -43,6 +46,7 @@ pub fn run_host_visible(cmd: &str, args: &[&str]) -> Result<()> {
 /// When `vm_name` matches the default VM name, this delegates to the
 /// [`LinuxEnv`](mvm_core::linux_env::LinuxEnv) abstraction. For custom
 /// VM names, it uses the platform-specific command directly.
+#[instrument(skip_all, fields(vm_name))]
 pub fn run_on_vm(vm_name: &str, script: &str) -> Result<Output> {
     if vm_name == VM_NAME {
         return linux_env::default_env().run(script);
@@ -67,6 +71,7 @@ pub fn run_on_vm(vm_name: &str, script: &str) -> Result<Output> {
 }
 
 /// Run a bash script in the Linux environment, with output visible to user.
+#[instrument(skip_all, fields(vm_name))]
 pub fn run_on_vm_visible(vm_name: &str, script: &str) -> Result<()> {
     if vm_name == VM_NAME {
         return linux_env::default_env().run_visible(script);
@@ -105,6 +110,7 @@ pub fn run_on_vm_visible(vm_name: &str, script: &str) -> Result<()> {
 }
 
 /// Run a bash script in the Linux environment, returning stdout as String.
+#[instrument(skip_all, fields(vm_name))]
 pub fn run_on_vm_stdout(vm_name: &str, script: &str) -> Result<String> {
     if vm_name == VM_NAME {
         return linux_env::default_env().run_stdout(script);
@@ -114,16 +120,19 @@ pub fn run_on_vm_stdout(vm_name: &str, script: &str) -> Result<String> {
 }
 
 /// Run a bash script in the default Linux environment, capturing output.
+#[instrument(skip_all)]
 pub fn run_in_vm(script: &str) -> Result<Output> {
     linux_env::default_env().run(script)
 }
 
 /// Run a bash script in the default Linux environment, with output visible to user.
+#[instrument(skip_all)]
 pub fn run_in_vm_visible(script: &str) -> Result<()> {
     linux_env::default_env().run_visible(script)
 }
 
 /// Run a bash script in the default Linux environment, returning stdout as String.
+#[instrument(skip_all)]
 pub fn run_in_vm_stdout(script: &str) -> Result<String> {
     linux_env::default_env().run_stdout(script)
 }
@@ -134,6 +143,7 @@ pub fn run_in_vm_stdout(script: &str) -> Result<String> {
 /// Unlike `run_on_vm_visible`, the output is **not** shown to the user in real time.
 /// Use this when you need to capture error messages (e.g., nix build failures) for
 /// structured reporting.
+#[instrument(skip_all, fields(vm_name))]
 pub fn run_on_vm_capture(vm_name: &str, script: &str) -> Result<Output> {
     if vm_name == VM_NAME {
         return linux_env::default_env().run_capture(script);
@@ -161,6 +171,7 @@ pub fn run_on_vm_capture(vm_name: &str, script: &str) -> Result<Output> {
 }
 
 /// Run a bash script in the default Linux environment, capturing stdout and stderr.
+#[instrument(skip_all)]
 pub fn run_in_vm_capture(script: &str) -> Result<Output> {
     linux_env::default_env().run_capture(script)
 }
@@ -207,5 +218,58 @@ pub fn replace_process_in_vm(cmd: &str, args: &[&str]) -> Result<()> {
         replace_process("limactl", &lima_args)
     } else {
         replace_process(cmd, args)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_inside_lima_false_on_host() {
+        // In CI/dev environments, we should NOT be inside Lima.
+        // If LIMA_INSTANCE is not set and the marker files don't exist,
+        // inside_lima() should return false.
+        unsafe { std::env::remove_var("LIMA_INSTANCE") };
+        // On a non-Lima machine, neither marker file exists.
+        if !Path::new("/etc/lima-boot.conf").exists()
+            && !Path::new("/run/lima-guestagent.sock").exists()
+        {
+            assert!(!inside_lima());
+        }
+    }
+
+    #[test]
+    fn test_run_host_echo() {
+        let output = run_host("echo", &["hello"]).unwrap();
+        assert!(output.status.success());
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        assert_eq!(stdout.trim(), "hello");
+    }
+
+    #[test]
+    fn test_run_host_failure() {
+        let output = run_host("false", &[]).unwrap();
+        assert!(!output.status.success());
+    }
+
+    #[test]
+    fn test_run_host_nonexistent_command() {
+        let result = run_host("definitely-not-a-real-command-12345", &[]);
+        assert!(result.is_err());
+    }
+
+    #[test]
+    fn test_run_host_visible_success() {
+        let result = run_host_visible("true", &[]);
+        assert!(result.is_ok());
+    }
+
+    #[test]
+    fn test_run_host_visible_failure() {
+        let result = run_host_visible("false", &[]);
+        assert!(result.is_err());
+        let err_msg = result.unwrap_err().to_string();
+        assert!(err_msg.contains("Command failed"));
     }
 }

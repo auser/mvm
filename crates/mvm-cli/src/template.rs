@@ -19,6 +19,7 @@ pub fn make_spec(
 ) -> TemplateSpec {
     let ts = now_iso();
     TemplateSpec {
+        schema_version: mvm_core::template::CURRENT_SCHEMA_VERSION,
         template_id: name.to_string(),
         flake_ref: flake.to_string(),
         profile: profile.to_string(),

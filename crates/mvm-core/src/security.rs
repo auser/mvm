@@ -69,11 +69,14 @@ pub struct SessionHelloAck {
 ///
 /// Controls authentication requirements, access permissions, rate limiting,
 /// and session lifecycle. Immutable after VM boot.
-#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+///
+/// **Default: `require_auth = true`** — authentication is required unless
+/// explicitly opted out for dev/testing via `SecurityPolicy::dev_defaults()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct SecurityPolicy {
-    /// Require authenticated vsock frames. When false, falls back to legacy
-    /// unauthenticated mode if the guest doesn't support v2.
-    #[serde(default)]
+    /// Require authenticated vsock frames. Default: true.
+    /// Set to false only for dev/testing environments.
+    #[serde(default = "default_true")]
     pub require_auth: bool,
 
     /// Access control toggles.
@@ -91,6 +94,29 @@ pub struct SecurityPolicy {
     /// Command blocklist entries for the gate.
     #[serde(default)]
     pub blocklist: Vec<BlocklistEntry>,
+}
+
+impl Default for SecurityPolicy {
+    fn default() -> Self {
+        Self {
+            require_auth: true,
+            access: AccessPolicy::default(),
+            rate_limits: RateLimitPolicy::default(),
+            session: SessionPolicy::default(),
+            blocklist: Vec::new(),
+        }
+    }
+}
+
+impl SecurityPolicy {
+    /// Permissive defaults for development and testing environments.
+    /// Authentication is disabled to simplify the local dev loop.
+    pub fn dev_defaults() -> Self {
+        Self {
+            require_auth: false,
+            ..Self::default()
+        }
+    }
 }
 
 /// Access control toggles for guest operations.
@@ -435,7 +461,7 @@ mod tests {
     fn test_security_policy_defaults() {
         let policy = SecurityPolicy::default();
 
-        assert!(!policy.require_auth);
+        assert!(policy.require_auth);
         assert!(policy.access.filesystem);
         assert!(policy.access.network);
         assert!(policy.access.build);
@@ -453,7 +479,7 @@ mod tests {
         let json = "{}";
         let policy: SecurityPolicy = serde_json::from_str(json).unwrap();
 
-        assert!(!policy.require_auth);
+        assert!(policy.require_auth);
         assert!(policy.access.filesystem);
         assert_eq!(policy.rate_limits.frames_per_second, 100);
     }

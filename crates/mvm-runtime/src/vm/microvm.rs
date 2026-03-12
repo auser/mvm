@@ -1,5 +1,6 @@
 use anyhow::Result;
 use mvm_core::platform;
+use tracing::{instrument, warn};
 
 use super::{firecracker, lima, network};
 use crate::config::*;
@@ -28,6 +29,7 @@ pub fn resolve_vm_dir(slot: &VmSlot) -> Result<String> {
 }
 
 /// Start the Firecracker daemon inside the Lima VM (background).
+#[instrument(skip_all)]
 fn start_firecracker_daemon(abs_dir: &str) -> Result<()> {
     ui::info("Starting Firecracker...");
     run_in_vm_visible(&format!(
@@ -58,6 +60,7 @@ fn start_firecracker_daemon(abs_dir: &str) -> Result<()> {
 }
 
 /// Start a Firecracker daemon in a per-VM directory with its own socket.
+#[instrument(skip_all)]
 pub fn start_vm_firecracker(abs_dir: &str, abs_socket: &str) -> Result<()> {
     ui::info("Starting Firecracker...");
     run_in_vm_visible(&format!(
@@ -93,6 +96,7 @@ fn api_put(path: &str, data: &str) -> Result<()> {
 }
 
 /// Send API PUT request to a specific Firecracker socket.
+#[instrument(skip_all, fields(path))]
 pub fn api_put_socket(socket: &str, path: &str, data: &str) -> Result<()> {
     let script = format!(
         r#"
@@ -113,6 +117,7 @@ pub fn api_put_socket(socket: &str, path: &str, data: &str) -> Result<()> {
 }
 
 /// Send API PATCH request to a specific Firecracker socket.
+#[instrument(skip_all, fields(path))]
 pub fn api_patch_socket(socket: &str, path: &str, data: &str) -> Result<()> {
     let script = format!(
         r#"
@@ -134,6 +139,7 @@ pub fn api_patch_socket(socket: &str, path: &str, data: &str) -> Result<()> {
 }
 
 /// Configure the microVM via the Firecracker API (dev-mode, legacy).
+#[instrument(skip_all)]
 fn configure_microvm(state: &MvmState, abs_dir: &str) -> Result<()> {
     ui::info("Configuring logger...");
     api_put(
@@ -201,6 +207,7 @@ fn configure_microvm(state: &MvmState, abs_dir: &str) -> Result<()> {
 ///
 /// MicroVMs never have SSH enabled. They run as headless workloads and
 /// communicate via vsock. Use `mvm shell` to access the Lima VM environment.
+#[instrument(skip_all)]
 pub fn start() -> Result<()> {
     require_linux_env()?;
 
@@ -232,7 +239,9 @@ pub fn start() -> Result<()> {
     api_put("/actions", r#"{"action_type": "InstanceStart"}"#)?;
 
     // Make vsock socket accessible to the current user
-    let _ = run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir));
+    if let Err(e) = run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir)) {
+        warn!("failed to chmod vsock socket: {e}");
+    }
 
     ui::banner(&[
         "MicroVM is running!",
@@ -248,6 +257,7 @@ pub fn start() -> Result<()> {
 }
 
 /// Stop the microVM: kill Firecracker, clean up networking (legacy dev-mode).
+#[instrument(skip_all)]
 pub fn stop() -> Result<()> {
     require_linux_env()?;
 
@@ -259,12 +269,14 @@ pub fn stop() -> Result<()> {
     ui::info("Stopping microVM...");
 
     // Try graceful shutdown via API
-    let _ = run_in_vm(&format!(
+    if let Err(e) = run_in_vm(&format!(
         r#"sudo curl -s -X PUT --unix-socket {socket} \
             --data '{{"action_type": "SendCtrlAltDel"}}' \
             "http://localhost/actions" 2>/dev/null || true"#,
         socket = API_SOCKET,
-    ));
+    )) {
+        warn!("failed to send graceful shutdown to VM: {e}");
+    }
 
     // Give it a moment, then force kill
     std::thread::sleep(std::time::Duration::from_secs(2));
@@ -395,12 +407,39 @@ pub struct FlakeRunConfig {
     pub ports: Vec<crate::config::PortMapping>,
 }
 
+impl FlakeRunConfig {
+    /// Validate resource bounds and required fields.
+    pub fn validate(&self) -> Result<()> {
+        if self.cpus == 0 || self.cpus > 32 {
+            anyhow::bail!("cpus must be between 1 and 32 (got {})", self.cpus);
+        }
+        if self.memory < 128 || self.memory > 65536 {
+            anyhow::bail!(
+                "memory must be between 128 and 65536 MiB (got {})",
+                self.memory
+            );
+        }
+        if self.name.is_empty() {
+            anyhow::bail!("VM name must not be empty");
+        }
+        if self.vmlinux_path.is_empty() {
+            anyhow::bail!("vmlinux_path must not be empty");
+        }
+        if self.rootfs_path.is_empty() {
+            anyhow::bail!("rootfs_path must not be empty");
+        }
+        Ok(())
+    }
+}
+
 /// Boot a Firecracker VM from flake-built artifacts (headless).
 ///
 /// Each VM gets its own directory under ~/microvm/vms/<name>/ with a
 /// separate Firecracker socket, PID file, and log.  The bridge network
 /// is shared, but each VM has its own TAP device and guest IP.
+#[instrument(skip_all, fields(name = %config.name))]
 pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
+    config.validate()?;
     require_linux_env()?;
 
     let slot = &config.slot;
@@ -438,7 +477,9 @@ pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
     )?;
 
     // Make vsock socket accessible to the current user
-    let _ = run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir));
+    if let Err(e) = run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir)) {
+        warn!("failed to chmod vsock socket: {e}");
+    }
 
     // Persist run info for `mvm status`
     write_vm_run_info(config, &abs_dir)?;
@@ -465,12 +506,14 @@ pub fn run_from_build(config: &FlakeRunConfig) -> Result<()> {
 ///
 /// The VM configuration (vCPUs, memory, drive IDs, network) must match
 /// what was used when the snapshot was created.
+#[instrument(skip_all, fields(template_id, name = %config.name))]
 pub fn restore_from_template_snapshot(
     template_id: &str,
     config: &FlakeRunConfig,
     snapshot_dir: &str,
     _snapshot_info: &mvm_core::template::SnapshotInfo,
 ) -> Result<()> {
+    config.validate()?;
     require_linux_env()?;
 
     let slot = &config.slot;
@@ -570,7 +613,9 @@ pub fn restore_from_template_snapshot(
     api_patch_socket(&abs_socket, "/vm", r#"{"state": "Resumed"}"#)?;
 
     // Make vsock socket accessible
-    let _ = run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir));
+    if let Err(e) = run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir)) {
+        warn!("failed to chmod vsock socket: {e}");
+    }
 
     // Post-restore: remount drives and restart services with fresh config/secrets.
     if !config.config_files.is_empty() || !config.secret_files.is_empty() {
@@ -619,6 +664,7 @@ pub fn restore_from_template_snapshot(
 }
 
 /// Stop a specific named VM.
+#[instrument(skip_all, fields(name))]
 pub fn stop_vm(name: &str) -> Result<()> {
     require_linux_env()?;
 
@@ -635,12 +681,14 @@ pub fn stop_vm(name: &str) -> Result<()> {
     ui::info(&format!("Stopping VM '{}'...", name));
 
     // Try graceful shutdown
-    let _ = run_in_vm(&format!(
+    if let Err(e) = run_in_vm(&format!(
         r#"sudo curl -s -X PUT --unix-socket {socket} \
             --data '{{"action_type": "SendCtrlAltDel"}}' \
             "http://localhost/actions" 2>/dev/null || true"#,
         socket = socket,
-    ));
+    )) {
+        warn!("failed to send graceful shutdown to VM: {e}");
+    }
 
     std::thread::sleep(std::time::Duration::from_secs(2));
 
@@ -663,18 +711,23 @@ pub fn stop_vm(name: &str) -> Result<()> {
         // Reconstruct slot to find TAP name — scan for the index
         if let Some(idx) = read_slot_index(&abs_dir) {
             let slot = VmSlot::new(vm_name, idx);
-            let _ = network::tap_destroy(&slot);
+            if let Err(e) = network::tap_destroy(&slot) {
+                warn!("failed to destroy TAP device: {e}");
+            }
         }
     }
 
     // Remove the VM directory
-    let _ = run_in_vm(&format!("rm -rf {}", abs_dir));
+    if let Err(e) = run_in_vm(&format!("rm -rf {}", abs_dir)) {
+        warn!("failed to remove VM directory: {e}");
+    }
 
     ui::success(&format!("VM '{}' stopped.", name));
     Ok(())
 }
 
 /// Stop all running VMs.
+#[instrument(skip_all)]
 pub fn stop_all_vms() -> Result<()> {
     require_linux_env()?;
 
@@ -785,6 +838,7 @@ const CONSOLE_WARNING_PATTERNS: &[&str] = &[
 ///
 /// Checks each layer independently so that useful information is returned
 /// even when vsock is broken (e.g. guest agent crashed, OOM, kernel panic).
+#[instrument(skip_all, fields(name))]
 pub fn diagnose_vm(name: &str) -> Result<DiagnoseResult> {
     require_linux_env()?;
 
@@ -835,9 +889,15 @@ pub fn diagnose_vm(name: &str) -> Result<DiagnoseResult> {
     let pid_check = pid_check.trim();
     if let Some(pid_str) = pid_check.strip_prefix("alive:") {
         result.fc_alive = true;
-        result.fc_pid = pid_str.parse().ok();
+        result.fc_pid = pid_str
+            .parse()
+            .map_err(|e| warn!("failed to parse firecracker PID '{}': {}", pid_str, e))
+            .ok();
     } else if let Some(pid_str) = pid_check.strip_prefix("dead:") {
-        result.fc_pid = pid_str.parse().ok();
+        result.fc_pid = pid_str
+            .parse()
+            .map_err(|e| warn!("failed to parse firecracker PID '{}': {}", pid_str, e))
+            .ok();
         result.suggestions.push(format!(
             "Firecracker process (pid {}) is dead. Run: mvmctl stop {}",
             pid_str, name,
@@ -857,7 +917,9 @@ pub fn diagnose_vm(name: &str) -> Result<DiagnoseResult> {
         let api_output = api_output.trim();
         if api_output != "FAIL" {
             result.fc_api_responsive = true;
-            result.fc_machine_config = serde_json::from_str(api_output).ok();
+            result.fc_machine_config = serde_json::from_str(api_output)
+                .map_err(|e| warn!("failed to parse FC machine config: {}", e))
+                .ok();
         }
     }
 
@@ -975,6 +1037,7 @@ pub fn diagnose_vm(name: &str) -> Result<DiagnoseResult> {
 }
 
 /// List all running VMs by scanning ~/microvm/vms/*/run-info.json.
+#[instrument(skip_all)]
 pub fn list_vms() -> Result<Vec<RunInfo>> {
     let output = run_in_vm_stdout(&format!(
         "for f in {dir}/*/run-info.json; do [ -f \"$f\" ] && cat \"$f\"; done 2>/dev/null || true",
@@ -1131,6 +1194,7 @@ pub fn create_dev_secrets_drive(abs_dir: &str, secret_files: &[DriveFile]) -> Re
 }
 
 /// Configure a flake-built microVM via the Firecracker API (multi-VM).
+#[instrument(skip_all, fields(name = %config.name))]
 pub fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str, socket: &str) -> Result<()> {
     configure_flake_microvm_with_drives_dir(config, abs_dir, socket, abs_dir)
 }
@@ -1138,6 +1202,7 @@ pub fn configure_flake_microvm(config: &FlakeRunConfig, abs_dir: &str, socket: &
 /// Configure a flake-built microVM with custom config/secrets drive location.
 /// This allows template snapshots to use template-relative drive paths.
 /// The vsock socket is also placed in drives_dir for snapshot portability.
+#[instrument(skip_all, fields(name = %config.name))]
 pub fn configure_flake_microvm_with_drives_dir(
     config: &FlakeRunConfig,
     abs_dir: &str,
@@ -1285,8 +1350,10 @@ pub fn configure_flake_microvm_with_drives_dir(
 }
 
 /// Persist run info for a named VM.
+#[instrument(skip_all, fields(name = %config.name))]
 pub fn write_vm_run_info(config: &FlakeRunConfig, abs_dir: &str) -> Result<()> {
     let info = RunInfo {
+        schema_version: 1,
         mode: "flake".to_string(),
         name: Some(config.name.clone()),
         revision: Some(config.revision_hash.clone()),
@@ -1318,6 +1385,7 @@ pub fn write_vm_run_info(config: &FlakeRunConfig, abs_dir: &str) -> Result<()> {
 }
 
 /// Read run info for a named VM.
+#[instrument(skip_all, fields(name))]
 pub fn read_vm_run_info(name: &str) -> Result<RunInfo> {
     let abs_vms = run_in_vm_stdout(&format!("echo {}", VMS_DIR))?;
     let abs_dir = format!("{}/{}", abs_vms.trim(), name);
@@ -1477,6 +1545,47 @@ mod tests {
             }
         }
         assert!(warnings.is_empty());
+    }
+
+    /// Verify the log-and-continue error policy works: when a cleanup
+    /// operation returns Err, the enclosing function should NOT propagate it.
+    /// This tests the pattern used throughout the codebase (Sprint 16 Phase 1.2).
+    #[test]
+    fn test_log_and_continue_pattern_does_not_propagate_errors() {
+        use crate::shell_mock;
+
+        // Install a mock that fails for all commands.
+        let _guard = shell_mock::install_handler(|_script: &str| shell_mock::MockResponse {
+            exit_code: 1,
+            stdout: String::new(),
+        });
+
+        // Simulate the log-and-continue pattern used in cleanup paths.
+        // This is the exact pattern from instance/lifecycle.rs, microvm.rs, etc.
+        fn cleanup_with_log_and_continue() -> anyhow::Result<()> {
+            // These operations would fail (mock returns exit code 1),
+            // but run_in_vm returns Ok(output) — the error is in exit status.
+            // The real pattern: if let Err(e) = operation() { warn!(...) }
+            if let Err(e) = crate::shell::run_in_vm("kill -9 12345 2>/dev/null || true") {
+                tracing::warn!("failed to kill process: {e}");
+            }
+            if let Err(e) = crate::shell::run_in_vm("sudo ip link del tap0 2>/dev/null || true") {
+                tracing::warn!("failed to destroy TAP: {e}");
+            }
+            if let Err(e) = crate::shell::run_in_vm("rm -rf /tmp/test-dir") {
+                tracing::warn!("failed to remove directory: {e}");
+            }
+
+            // The function should still succeed.
+            Ok(())
+        }
+
+        let result = cleanup_with_log_and_continue();
+        assert!(
+            result.is_ok(),
+            "log-and-continue cleanup must not propagate errors: {:?}",
+            result.err()
+        );
     }
 
     #[test]

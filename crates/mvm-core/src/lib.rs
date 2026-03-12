@@ -2,6 +2,7 @@
 // No internal mvm dependencies — this is the foundation crate.
 
 pub mod agent;
+pub mod atomic_io;
 pub mod audit;
 pub mod build_env;
 pub mod config;

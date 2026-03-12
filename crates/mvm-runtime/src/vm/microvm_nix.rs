@@ -175,6 +175,7 @@ impl VmBackend for MicrovmNixBackend {
 /// Persist run info for a microvm.nix-started VM.
 fn write_run_info(config: &MicrovmNixConfig, abs_dir: &str) -> Result<()> {
     let info = crate::config::RunInfo {
+        schema_version: 1,
         mode: "microvm-nix".to_string(),
         name: Some(config.name.clone()),
         revision: Some(config.revision_hash.clone()),

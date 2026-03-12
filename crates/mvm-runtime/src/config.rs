@@ -71,6 +71,9 @@ pub struct PortMapping {
 /// distinguish dev-mode VMs from flake-built VMs.
 #[derive(Debug, Serialize, Deserialize, Default)]
 pub struct RunInfo {
+    /// Schema version for forward-compatible migrations.
+    #[serde(default)]
+    pub schema_version: u32,
     /// "dev" or "flake"
     pub mode: String,
     #[serde(default)]
@@ -95,7 +98,10 @@ pub struct RunInfo {
 /// Find the lima.yaml.tera template file.
 /// Looks in: 1) resources/ next to the binary, 2) source tree, 3) sibling project
 pub(crate) fn find_lima_template() -> anyhow::Result<PathBuf> {
-    let exe_dir = std::env::current_exe()?.parent().unwrap().to_path_buf();
+    let exe_dir = std::env::current_exe()?
+        .parent()
+        .expect("executable path must have a parent directory")
+        .to_path_buf();
 
     // Check next to binary
     let candidate = exe_dir.join("resources").join("lima.yaml.tera");
@@ -111,7 +117,11 @@ pub(crate) fn find_lima_template() -> anyhow::Result<PathBuf> {
     }
 
     // Check workspace root (crate is at crates/mvm-runtime/)
-    let workspace_root = manifest_dir.parent().unwrap().parent().unwrap();
+    let workspace_root = manifest_dir
+        .parent()
+        .expect("manifest dir must have parent")
+        .parent()
+        .expect("crates dir must have parent");
     let candidate = workspace_root.join("resources").join("lima.yaml.tera");
     if candidate.exists() {
         return Ok(candidate);
@@ -120,7 +130,7 @@ pub(crate) fn find_lima_template() -> anyhow::Result<PathBuf> {
     // Check sibling project (plain yaml fallback)
     let candidate = workspace_root
         .parent()
-        .unwrap()
+        .expect("workspace root must have parent")
         .join("firecracker-lima-vm")
         .join("lima.yaml");
     if candidate.exists() {
@@ -328,6 +338,7 @@ mod tests {
     #[test]
     fn test_run_info_json_roundtrip() {
         let info = RunInfo {
+            schema_version: 1,
             mode: "flake".to_string(),
             name: Some("gw".to_string()),
             revision: Some("abc123".to_string()),
