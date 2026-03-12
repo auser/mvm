@@ -1,17 +1,17 @@
-# Sprint 20 — Production Hardening: Validation, Safety & Release Pipeline
+# Sprint 21 — Binary Signing, Attestation & Upgrade Safety
 
-**Goal:** Close the most impactful production-readiness gaps identified in the Sprint 19 gap analysis: input validation on user-facing identifiers, update checksum verification, stale-PID cleanup, and a hardened release pipeline with SBOM + smoke tests. Phases 21+ are fully planned for future sprints.
+**Goal:** Make release artifacts cryptographically verifiable using Sigstore/cosign keyless signing, and add upgrade safety guardrails: a pre-install signature check in the `update` command and a rollback mechanism if the new binary fails a basic smoke test.
 
-**Branch:** `feat/sprint-20`
+**Branch:** `feat/sprint-21`
 
 **Roadmap:** See [specs/plans/19-post-hardening-roadmap.md](plans/19-post-hardening-roadmap.md) for full post-hardening priorities.
 
-## Current Status (v0.5.0)
+## Current Status (v0.6.0)
 
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 6 + root facade          |
-| Total tests      | 700+                     |
+| Total tests      | 739                      |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | MSRV             | 1.85                     |
@@ -38,110 +38,88 @@
 - [17-resource-safety-release.md](sprints/17-resource-safety-release.md)
 - [18-developer-experience.md](sprints/18-developer-experience.md)
 - [19-observability-security.md](sprints/19-observability-security.md)
+- [20-production-hardening-validation.md](sprints/20-production-hardening-validation.md)
 
 ---
 
 ## Rationale
 
-**Why these four themes?**
+**Why binary signing and upgrade safety?**
 
-1. **Input validation**: VM names, template names, and flake refs pass directly into shell commands and filesystem paths. There is no sanitisation today — a name like `my-vm; rm -rf /` would be passed verbatim. The `validate_shell_id` function added in Sprint 19 covers tenant IDs inside the runtime; this sprint extends the same protection to every CLI entry point that accepts a name.
+Sprint 20 added SHA256 checksum verification to the `update` command, which protects against accidental corruption. But a compromised GitHub Releases page could serve a binary *with a matching checksum* if the attacker controls the release. Sigstore cosign keyless signing ties the binary's provenance to the GitHub Actions OIDC token used at release time — verification requires the artifact to have been signed by *this specific workflow* on *this specific commit*. That closes the remaining supply-chain gap.
 
-2. **Update checksum verification**: `update.rs` downloads a binary and installs it without verifying the SHA256 digest against the published checksum file. A compromised CDN or MITM could deliver a tampered binary silently. Adding checksum verification is a one-function change that eliminates the risk.
-
-3. **Stale PID cleanup**: `RunInfo` stores the Firecracker PID in a JSON file. If the process crashes without writing a tombstone, `mvmctl status` reports a "running" VM that no longer exists. A `check_stale_pid()` helper and a `mvmctl cleanup-orphans` subcommand let operators recover without manual filesystem surgery.
-
-4. **Release pipeline hardening**: The current `release.yml` produces binaries with SHA256 checksums but no SBOM, no binary signing, and no smoke test. Adding `cargo-cyclonedx` for SBOM generation, a minimal smoke test (binary boots + `--help` exits 0), and bumping to v0.6.0 makes the release artifact trustworthy for enterprise adoption.
+The upgrade safety guardrail (smoke test + rollback) prevents a defective release from bricking an installation. Currently, if the new binary fails to start (e.g., a broken dependency), the old binary has already been replaced. Adding a pre-swap smoke test keeps the existing binary alive until the new one proves it can run.
 
 ---
 
-## Phase 1: Input Validation at CLI Entry Points **Status: COMPLETE**
+## Phase 1: Cosign Signing in `release.yml` **Status: TODO**
 
-All user-supplied identifiers that flow into shell commands or filesystem paths must be validated before use.
+### 1.1 Sign each release binary
 
-### 1.1 `validate_vm_name(name: &str) -> Result<()>` in `mvm-core`
-
-- [x] Add `pub fn validate_vm_name(name: &str) -> Result<()>` to `mvm-core/src/naming.rs`
-- [x] Accepts `[a-z0-9][a-z0-9-]*` up to 63 chars (RFC 1123 hostname-compatible)
-- [x] Rejects empty, leading hyphen, uppercase, special chars, too-long names
-- [x] 8 unit tests: valid names, empty, leading hyphen, uppercase, special chars, 64-char name
-
-### 1.2 `validate_template_name(name: &str) -> Result<()>` in `mvm-core`
-
-- [x] Add `pub fn validate_template_name(name: &str) -> Result<()>` to `mvm-core/src/naming.rs`
-- [x] Accepts `[a-z0-9][a-z0-9-_]*` up to 63 chars
-- [x] 6 unit tests: valid names, empty, leading hyphen, special chars, too-long
-
-### 1.3 `validate_flake_ref(s: &str) -> Result<()>` in `mvm-core`
-
-- [x] Add `pub fn validate_flake_ref(s: &str) -> Result<()>` to `mvm-core/src/naming.rs`
-- [x] Rejects empty; rejects shell metacharacters (`; | & $ ( ) \` ! < > \n`)
-- [x] Accepts `.` (current dir), local paths, `github:org/repo`, `git+https://...`
-- [x] 8 unit tests: dot, local path, github ref, git+https, empty, semicolon injection, pipe injection, newline injection
-
-### 1.4 Wire guards into CLI dispatch in `commands.rs`
-
-- [x] `cmd_run()` — validate `name` (if provided) and `flake` / `template` before dispatch
-- [x] `cmd_stop()` — validate `name` (if provided)
-- [x] `cmd_logs()` — validate `name`
-- [x] `cmd_forward()` — validate `name`
-- [x] `template build/start/stop/delete` — validate template name
-- [x] `Build { flake }` — validate flake ref
-
----
-
-## Phase 2: Update Checksum Verification **Status: COMPLETE**
-
-### 2.1 `verify_checksum()` in `update.rs`
-
-- [x] After downloading the binary archive, fetch `<asset_url>.sha256` (or the release's `.sha256sums` file)
-- [x] Compute SHA256 of the downloaded bytes using `sha2` crate
-- [x] Compare digest; bail with actionable error on mismatch
-- [x] `sha2` added to `mvm-cli/Cargo.toml`
-- [x] 3 unit tests: correct digest passes, tampered bytes fail, hex format parse
-
----
-
-## Phase 3: Stale PID Detection & Cleanup **Status: COMPLETE**
-
-### 3.1 `check_stale_pid()` in `microvm.rs`
-
-- [x] After loading `RunInfo`, check if `run_info.pid` is actually alive via `/proc/<pid>/status` (Linux) or `kill -0` (fallback)
-- [x] If process is gone: log warning, return `VmState::Stopped` instead of `VmState::Running`
-- [x] 2 unit tests: pid=1 (init, always alive) passes, pid=999999999 (impossible) detected as stale
-
-### 3.2 `Commands::CleanupOrphans` in `commands.rs`
-
-- [x] Add `CleanupOrphans { dry_run: bool }` subcommand
-- [x] Scans `~/.mvm/vms/*/run_info.json` for entries where PID no longer exists
-- [x] In dry-run mode: list orphaned entries; in normal mode: delete the `run_info.json` and log each removal
-- [x] Integration test: `mvmctl cleanup-orphans --help` output
-
----
-
-## Phase 4: Release Pipeline Hardening **Status: COMPLETE**
-
-### 4.1 SBOM generation in `release.yml`
-
-- [x] Add `cargo install cargo-cyclonedx` step to the release workflow
-- [x] Run `cargo cyclonedx --format json --all` to produce `sbom.cdx.json`
-- [x] Upload `sbom.cdx.json` as a release asset alongside the binaries
-- [x] No new runtime dependencies
-
-### 4.2 Smoke test in `release.yml`
-
-- [x] After building the Linux x86_64 binary, run:
+- [ ] Add `cosign` install step to the `release` job in `release.yml`
+- [ ] After all binaries are built and staged, run for each tarball:
   ```bash
-  ./mvmctl --version
-  ./mvmctl --help
-  ./mvmctl metrics --json
+  cosign sign-blob \
+    --bundle "${ARCHIVE_NAME}.tar.gz.bundle" \
+    "${ARCHIVE_NAME}.tar.gz"
   ```
-- [x] Gate the release upload on smoke-test success
+  Uses keyless signing with GitHub Actions OIDC — no secret key needed.
+- [ ] Upload `.bundle` files as release assets alongside tarballs
+- [ ] 1 CI check: `cosign` exits 0 on the signing step
 
-### 4.3 Version bump to v0.6.0
+### 1.2 Sign the SBOM
 
-- [x] Bump version in `Cargo.toml` (workspace) to `0.6.0`
-- [x] `cargo check --workspace` passes with new version
+- [ ] After generating `sbom.cdx.json`, sign it:
+  ```bash
+  cosign sign-blob --bundle sbom.cdx.json.bundle sbom.cdx.json
+  ```
+- [ ] Upload `sbom.cdx.json.bundle` as a release asset
+
+### 1.3 Document verification for users
+
+- [ ] Add `docs/guides/verify-release.md` explaining:
+  - Install cosign: `brew install cosign` / `apt install cosign`
+  - Verify a release binary:
+    ```bash
+    cosign verify-blob \
+      --bundle mvmctl-aarch64-apple-darwin.tar.gz.bundle \
+      --certificate-oidc-issuer https://token.actions.githubusercontent.com \
+      --certificate-identity-regexp 'https://github.com/auser/mvm/.github/workflows/release.yml.*' \
+      mvmctl-aarch64-apple-darwin.tar.gz
+    ```
+  - Verification proves: built by GitHub Actions, from the official repo, at a specific tag
+
+---
+
+## Phase 2: Pre-swap Smoke Test in `update.rs` **Status: TODO**
+
+Currently `update.rs` extracts the archive and replaces the binary. If the new binary is broken (segfaults, missing libs, etc.), the installation is left in a broken state.
+
+### 2.1 `smoke_test_binary(path: &Path) -> Result<()>`
+
+- [ ] Add `fn smoke_test_binary(new_bin: &Path) -> Result<()>` to `update.rs`
+- [ ] Runs `new_bin --version` via `run_host` — if exit code != 0 or output doesn't contain the version, bail with a clear error
+- [ ] Called *before* replacing the current binary (after extracting from archive)
+- [ ] 2 unit tests: current binary passes smoke test, a non-executable path fails
+
+### 2.2 Rollback on post-swap failure
+
+- [ ] After copying the new binary, verify it again with `smoke_test_binary` on the installed path
+- [ ] If post-swap smoke test fails: restore the backup automatically
+- [ ] Emit a clear error: `"New binary failed smoke test; restored previous version."`
+- [ ] 1 unit test: smoke test error message matches expected string
+
+---
+
+## Phase 3: Optional Signature Verification in `update.rs` **Status: TODO**
+
+### 3.1 `verify_signature(archive_path, version, archive_name) -> Result<()>`
+
+- [ ] Check if `cosign` is installed (via `which::which("cosign")`)
+- [ ] If available: download `<archive_name>.bundle` from the GitHub release and run `cosign verify-blob`
+- [ ] If `cosign` not installed: emit a `tracing::warn!` but continue (non-fatal — checksum still verified)
+- [ ] Add `--skip-verify` flag to `mvmctl update` to bypass signature check
+- [ ] 2 unit tests: when cosign is not found, verify returns Ok with warning; skip-verify flag respected
 
 ---
 
@@ -157,16 +135,6 @@ cargo check --workspace
 ---
 
 ## Future Sprints (Planned, Not Yet Implemented)
-
-### Sprint 21: Binary Signing & Attestation
-
-**Goal:** Sign release binaries with `cosign` so users can verify provenance.
-
-- [ ] Add Sigstore/cosign signing step to `release.yml` (keyless OIDC signing via GitHub Actions OIDC token)
-- [ ] Publish `.sig` and `.pem` files as release assets
-- [ ] Update install script to verify signature before executing binary
-- [ ] Document `cosign verify` command in `docs/guides/install.md`
-- [ ] 1 CI test: verify that the signature verification command succeeds on the built artifact
 
 ### Sprint 22: Observability Deep Dive
 

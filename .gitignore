@@ -2,3 +2,4 @@
 .playwright-mcp/
 .claude/
 **/node_modules
+specs/scratch.md
