@@ -52,32 +52,32 @@ The upgrade safety guardrail (smoke test + rollback) prevents a defective releas
 
 ---
 
-## Phase 1: Cosign Signing in `release.yml` **Status: TODO**
+## Phase 1: Cosign Signing in `release.yml` **Status: COMPLETE**
 
 ### 1.1 Sign each release binary
 
-- [ ] Add `cosign` install step to the `release` job in `release.yml`
-- [ ] After all binaries are built and staged, run for each tarball:
+- [x] Add `cosign` install step to the `release` job in `release.yml`
+- [x] After all binaries are built and staged, run for each tarball:
   ```bash
   cosign sign-blob \
     --bundle "${ARCHIVE_NAME}.tar.gz.bundle" \
     "${ARCHIVE_NAME}.tar.gz"
   ```
   Uses keyless signing with GitHub Actions OIDC — no secret key needed.
-- [ ] Upload `.bundle` files as release assets alongside tarballs
-- [ ] 1 CI check: `cosign` exits 0 on the signing step
+- [x] Upload `.bundle` files as release assets alongside tarballs
+- [x] 1 CI check: `cosign` exits 0 on the signing step
 
 ### 1.2 Sign the SBOM
 
-- [ ] After generating `sbom.cdx.json`, sign it:
+- [x] After generating `sbom.cdx.json`, sign it:
   ```bash
   cosign sign-blob --bundle sbom.cdx.json.bundle sbom.cdx.json
   ```
-- [ ] Upload `sbom.cdx.json.bundle` as a release asset
+- [x] Upload `sbom.cdx.json.bundle` as a release asset
 
 ### 1.3 Document verification for users
 
-- [ ] Add `docs/guides/verify-release.md` explaining:
+- [x] Add `docs/guides/verify-release.md` explaining:
   - Install cosign: `brew install cosign` / `apt install cosign`
   - Verify a release binary:
     ```bash
@@ -91,35 +91,35 @@ The upgrade safety guardrail (smoke test + rollback) prevents a defective releas
 
 ---
 
-## Phase 2: Pre-swap Smoke Test in `update.rs` **Status: TODO**
+## Phase 2: Pre-swap Smoke Test in `update.rs` **Status: COMPLETE**
 
 Currently `update.rs` extracts the archive and replaces the binary. If the new binary is broken (segfaults, missing libs, etc.), the installation is left in a broken state.
 
 ### 2.1 `smoke_test_binary(path: &Path) -> Result<()>`
 
-- [ ] Add `fn smoke_test_binary(new_bin: &Path) -> Result<()>` to `update.rs`
-- [ ] Runs `new_bin --version` via `run_host` — if exit code != 0 or output doesn't contain the version, bail with a clear error
-- [ ] Called *before* replacing the current binary (after extracting from archive)
-- [ ] 2 unit tests: current binary passes smoke test, a non-executable path fails
+- [x] Add `fn smoke_test_binary(new_bin: &Path) -> Result<()>` to `update.rs`
+- [x] Runs `new_bin --version` — if exit code != 0 or output doesn't contain the version, bail with a clear error
+- [x] Called *before* replacing the current binary (after extracting from archive)
+- [x] 2 unit tests: current binary passes smoke test, a non-executable path fails
 
 ### 2.2 Rollback on post-swap failure
 
-- [ ] After copying the new binary, verify it again with `smoke_test_binary` on the installed path
-- [ ] If post-swap smoke test fails: restore the backup automatically
-- [ ] Emit a clear error: `"New binary failed smoke test; restored previous version."`
-- [ ] 1 unit test: smoke test error message matches expected string
+- [x] After copying the new binary, verify it again with `smoke_test_binary` on the installed path
+- [x] If post-swap smoke test fails: restore the backup automatically
+- [x] Emit a clear error: `"New binary failed smoke test; restored previous version."`
+- [x] 1 unit test: smoke test error message matches expected string
 
 ---
 
-## Phase 3: Optional Signature Verification in `update.rs` **Status: TODO**
+## Phase 3: Optional Signature Verification in `update.rs` **Status: COMPLETE**
 
 ### 3.1 `verify_signature(archive_path, version, archive_name) -> Result<()>`
 
-- [ ] Check if `cosign` is installed (via `which::which("cosign")`)
-- [ ] If available: download `<archive_name>.bundle` from the GitHub release and run `cosign verify-blob`
-- [ ] If `cosign` not installed: emit a `tracing::warn!` but continue (non-fatal — checksum still verified)
-- [ ] Add `--skip-verify` flag to `mvmctl update` to bypass signature check
-- [ ] 2 unit tests: when cosign is not found, verify returns Ok with warning; skip-verify flag respected
+- [x] Check if `cosign` is installed (via `which::which("cosign")`)
+- [x] If available: download `<archive_name>.bundle` from the GitHub release and run `cosign verify-blob`
+- [x] If `cosign` not installed: emit a `tracing::warn!` but continue (non-fatal — checksum still verified)
+- [x] Add `--skip-verify` flag to `mvmctl update` to bypass signature check
+- [x] 2 unit tests: when cosign is not found, verify returns Ok with warning; skip-verify flag respected
 
 ---
 

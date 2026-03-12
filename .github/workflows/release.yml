@@ -7,6 +7,7 @@ on:
 
 permissions:
   contents: write
+  id-token: write  # Required for cosign keyless signing via OIDC
 
 env:
   CARGO_TERM_COLOR: always
@@ -116,6 +117,9 @@ jobs:
       - name: Generate SBOM
         run: cargo cyclonedx --format json --all --output-cdx sbom.cdx.json
 
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
       - name: Download all artifacts
         uses: actions/download-artifact@v4
         with:
@@ -131,6 +135,26 @@ jobs:
           echo "Combined checksums:"
           cat checksums-sha256.txt
 
+      - name: Sign release tarballs and SBOM
+        shell: bash
+        run: |
+          # Sign each tarball — keyless OIDC, no secret key needed.
+          # Produces a .bundle file per tarball containing signature + certificate chain.
+          for tarball in artifacts/*.tar.gz; do
+            cosign sign-blob \
+              --yes \
+              --bundle "${tarball}.bundle" \
+              "${tarball}"
+            echo "Signed: ${tarball}"
+          done
+
+          # Sign the SBOM
+          cosign sign-blob \
+            --yes \
+            --bundle sbom.cdx.json.bundle \
+            sbom.cdx.json
+          echo "Signed: sbom.cdx.json"
+
       - name: Create GitHub Release
         env:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -140,5 +164,7 @@ jobs:
             --title "${TAG_NAME}" \
             --generate-notes \
             artifacts/*.tar.gz \
+            artifacts/*.tar.gz.bundle \
             artifacts/checksums-sha256.txt \
-            sbom.cdx.json
+            sbom.cdx.json \
+            sbom.cdx.json.bundle
