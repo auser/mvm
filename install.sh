@@ -299,6 +299,20 @@ install_binary() {
         fi
     fi
 
+    # Install man pages if present in archive
+    if ls "${extracted_dir}/man/"*.1 >/dev/null 2>&1; then
+        local mandir="${MAN_DIR:-/usr/local/share/man/man1}"
+        info "Installing man pages to ${mandir}..."
+        if [[ -w "$(dirname "$mandir")" ]] || [[ -w "$mandir" ]]; then
+            mkdir -p "$mandir"
+            install -m 0644 "${extracted_dir}/man/"*.1 "$mandir/"
+        else
+            sudo mkdir -p "$mandir"
+            sudo install -m 0644 "${extracted_dir}/man/"*.1 "$mandir/"
+        fi
+        command -v mandb >/dev/null 2>&1 && mandb 2>/dev/null || true
+    fi
+
     # Cleanup
     rm -rf "$tmpdir"
 

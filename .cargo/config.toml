@@ -1,3 +1,6 @@
+[alias]
+xtask = "run --package xtask --"
+
 # Using lld as the linker greatly improves compilation time.
 # Since Rust 1.90 lld is the default linker on x86_64-unknown-linux-gnu
 [target.x86_64-unknown-linux-musl]

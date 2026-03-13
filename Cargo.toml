@@ -6,6 +6,7 @@ members = [
     "crates/mvm-build",
     "crates/mvm-guest",
     "crates/mvm-cli",
+    "xtask",
 ]
 resolver = "3"
 
@@ -40,6 +41,7 @@ toml = "0.8"
 # CLI
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
+clap_mangen = "0.2"
 colored = "3"
 indicatif = "0.17"
 inquire = "0.7"

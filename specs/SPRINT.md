@@ -1,15 +1,15 @@
-# Sprint 23 — Global Config File
+# Sprint 24 — Man Pages & Shell Completions
 
-**Goal:** Replace scattered hardcoded defaults with a persistent operator config at `~/.mvm/config.toml`. CLI flags override config values; `mvmctl config show` and `mvmctl config set` provide read/write access.
+**Goal:** Make `mvmctl` feel like a first-class Unix citizen by shipping man pages (via `clap_mangen`) generated at release time. Shell completions (`mvmctl completions <shell>`) already exist; this sprint adds man page generation and delivery.
 
-**Branch:** `feat/sprint-23`
+**Branch:** `feat/sprint-24`
 
 ## Current Status (v0.6.0)
 
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 6 + root facade          |
-| Total tests      | 757                      |
+| Total tests      | 760+                     |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | MSRV             | 1.85                     |
@@ -39,72 +39,60 @@
 - [20-production-hardening-validation.md](sprints/20-production-hardening-validation.md)
 - [21-binary-signing-attestation.md](sprints/21-binary-signing-attestation.md)
 - [22-observability-deep-dive.md](sprints/22-observability-deep-dive.md)
+- [23-global-config-file.md](sprints/23-global-config-file.md)
 
 ---
 
 ## Rationale
 
-Several flags repeat the same defaults on every invocation (`--lima-cpus 8`, `--lima-mem 16`, `--cpus`, `--memory`). Users who customise these must type them every time. A single config file lets operators set-and-forget their environment preferences while preserving full CLI override capability.
+`mvmctl` is now a full-featured CLI tool. Users expect `man mvmctl` to work. Man pages
+are also required for distribution via package managers (Homebrew, apt). The `clap_mangen`
+crate generates groff-format man pages directly from Clap command metadata, so there is
+no manual authoring required.
 
-The config also provides a natural home for future settings (`metrics_port`, `log_format`, `hypervisor`), avoiding further flag sprawl. `mvmd` uses a separate config; `MvmConfig` is `mvmctl`-specific and lives in `mvm-core` so any future shared tooling can also load it.
-
----
-
-## Phase 1: `MvmConfig` struct and load/save in `mvm-core` **Status: COMPLETE**
-
-### 1.1 Define `MvmConfig`
-
-- [x] Create `crates/mvm-core/src/user_config.rs` (separate from existing `config.rs` which holds runtime constants):
-  ```rust
-  #[derive(Debug, Clone, Serialize, Deserialize)]
-  pub struct MvmConfig {
-      pub lima_cpus: u32,          // default: 8
-      pub lima_mem_gib: u32,       // default: 16
-      pub default_cpus: u32,       // default: 2  (for mvmctl run)
-      pub default_memory_mib: u32, // default: 512
-      pub log_format: Option<String>,  // default: None (human)
-      pub metrics_port: Option<u16>,   // default: None (disabled)
-  }
-  ```
-- [x] `impl Default for MvmConfig` with values matching existing CLI `default_value` annotations
-- [x] Expose from `mvm_core` root: `pub mod user_config;`
-- [x] 2 unit tests: `MvmConfig::default()` has expected values; TOML roundtrip preserves all fields
-
-### 1.2 `load()` and `save()`
-
-- [x] `pub fn load(override_dir: Option<&Path>) -> MvmConfig` — reads `~/.mvm/config.toml`; creates with defaults if absent; warns on parse error and returns defaults
-- [x] `pub fn save(cfg: &MvmConfig, override_dir: Option<&Path>) -> Result<()>` — writes `~/.mvm/config.toml`, creates `~/.mvm/` dir if needed
-- [x] Both functions accept an optional override dir (`Option<&Path>`) for testability — production code passes `None` to use `~/.mvm/`
-- [x] 2 unit tests: `load()` from empty temp dir returns defaults and creates the file; `save()` + `load()` roundtrip
-
-### 1.3 `set_key` helper
-
-- [x] `pub fn set_key(cfg: &mut MvmConfig, key: &str, value: &str) -> Result<()>`
-- [x] Matches known field names; parses value to correct type; returns `Err` with message listing valid keys for unknown keys
-- [x] 3 unit tests: known key updates; unknown key error; invalid value (non-numeric for u32) error
+Shell completions are already delivered via `mvmctl completions <shell>` and `mvmctl shell-init`.
+This sprint adds the final missing piece: man page generation and distribution.
 
 ---
 
-## Phase 2: Wire config into CLI defaults **Status: COMPLETE**
+## Phase 1: `xtask` crate with man page generation **Status: COMPLETE**
 
-### 2.1 Load config at dispatch time
+### 1.1 Add `xtask` to the workspace
 
-- [x] In `run()` in `commands.rs`, call `mvm_core::user_config::load(None)` once before dispatch
-- [x] Use config values as fallback when CLI flags are absent:
-  - `--lima-cpus` / `--lima-mem`: if the flag matches its Clap default exactly, substitute from config
-  - `--cpus` / `--memory` in `RunParams`: if `None`, substitute `cfg.default_cpus` / `cfg.default_memory_mib`
+- [x] Create `xtask/` directory with `xtask/Cargo.toml`
+- [x] Add `"xtask"` to `[workspace].members` in root `Cargo.toml`
+- [x] Add `clap_mangen = "0.2"` to `[workspace.dependencies]`
+- [x] Add `[alias] xtask = "run --package xtask --"` to `.cargo/config.toml`
 
-### 2.2 `mvmctl config show`
+### 1.2 Implement `xtask gen-man`
 
-- [x] Add `Commands::Config { action: ConfigAction }` with `ConfigAction::Show`
-- [x] `cmd_config_show()` — loads config, prints as TOML to stdout
-- [x] 1 unit test: `config show` output contains `lima_cpus`
+- [x] `xtask/src/main.rs`: parses `cargo xtask gen-man [--output-dir DIR]`
+- [x] Generates `mvmctl.1` plus `mvmctl-<sub>.1` for each top-level subcommand
+- [x] 2 unit tests: `gen_man_creates_main_page`, `gen_man_creates_subcommand_pages`
 
-### 2.3 `mvmctl config set <key> <value>`
+### 1.3 Share `Cli` definition for xtask
 
-- [x] Add `ConfigAction::Set { key: String, value: String }`
-- [x] `cmd_config_set(key, value)` — loads, calls `set_key`, saves, prints `"Set <key> = <value>"`
-- [x] 2 unit tests: `set lima_cpus 4` persists; unknown key exits non-zero with helpful error
+- [x] Expose `pub fn cli_command() -> clap::Command` in `mvm-cli/src/commands.rs`
+- [x] xtask depends on `mvm-cli` workspace dep and calls `mvm_cli::commands::cli_command()`
+
+### 1.4 Add `man/` directory skeleton and `.gitignore` entry
+
+- [x] Add `man/.gitkeep` so the directory exists in the repo
+- [x] Add `man/*.1` to `.gitignore`
+
+---
+
+## Phase 2: Release integration **Status: COMPLETE**
+
+### 2.1 Generate man pages in release CI
+
+- [x] Add `cargo xtask gen-man --output-dir man/` step in `.github/workflows/release.yml`
+- [x] Include `man/` directory in the release tarball alongside the binary
+
+### 2.2 Update install script
+
+- [x] `install.sh` installs man pages to `${MAN_DIR:-/usr/local/share/man/man1}/` when present in archive
+- [x] Uses `sudo` when needed; runs `mandb` to update man index if available
 
 ---
 
@@ -115,22 +103,13 @@ After each phase:
 cargo test --workspace
 cargo clippy --workspace -- -D warnings
 cargo check --workspace
+cargo xtask gen-man
+man man/mvmctl.1  # should display the man page
 ```
 
 ---
 
 ## Future Sprints (Planned, Not Yet Implemented)
-
-### Sprint 24: Man Pages & Shell Completions
-
-**Goal:** Make `mvmctl` feel like a first-class Unix citizen.
-
-- [ ] Add `clap_mangen` to `mvm-cli/Cargo.toml`
-- [ ] Add `xtask` crate (or build.rs) that generates `man/mvmctl.1` and one page per subcommand
-- [ ] Add `mvmctl completions <shell>` subcommand (bash, zsh, fish) via `clap_complete`
-- [ ] Ship man pages and completions in the release tarball
-- [ ] Update install script to copy man pages to `/usr/local/share/man/man1/`
-- [ ] CI check: man page generation does not fail on clean build
 
 ### Sprint 25: E2E Test Framework & `mvmctl uninstall`
 
