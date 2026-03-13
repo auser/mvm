@@ -222,6 +222,64 @@
               echo "Building server..."
               (cd server && node "$TSC")
 
+              # Phase 2: Prune dev-only packages from node_modules before copying
+              # to $out.  These are only needed at build time (compile, lint, test)
+              # and add tens of MB to the rootfs closure for no runtime benefit.
+              echo "Pruning dev-only packages from node_modules..."
+              cd $TMPDIR/build
+
+              # Remove dev-only top-level packages by name.
+              for pkg in \
+                typescript \
+                vite \
+                @vitejs \
+                vitest \
+                "@vitest" \
+                eslint \
+                "@eslint" \
+                tsx \
+                esbuild \
+                "drizzle-kit" \
+                "@biomejs" \
+                "@tanstack/react-query-devtools" \
+                "rollup" \
+                "postcss" \
+                "tailwindcss" \
+                "autoprefixer" \
+                "prettier" \
+              ; do
+                rm -rf "node_modules/$pkg"
+              done
+
+              # Remove @types/* — not needed at runtime (type declarations only).
+              rm -rf node_modules/@types
+
+              # Remove .d.ts files that live outside dist/ directories — these are
+              # source-level type declarations, not runtime artifacts.
+              find node_modules -name '*.d.ts' -not -path '*/dist/*' -delete 2>/dev/null || true
+
+              # Strip devDependencies from workspace package.json files so that any
+              # post-install tooling doesn't try to re-fetch them.
+              node -e "
+                const fs = require('fs');
+                const path = require('path');
+                function strip(dir) {
+                  const pkgPath = path.join(dir, 'package.json');
+                  if (!fs.existsSync(pkgPath)) return;
+                  const p = JSON.parse(fs.readFileSync(pkgPath, 'utf8'));
+                  if (p.devDependencies) {
+                    delete p.devDependencies;
+                    fs.writeFileSync(pkgPath, JSON.stringify(p, null, 2) + '\n');
+                  }
+                }
+                const dirs = ['packages/shared','packages/db','packages/adapter-utils',
+                  'packages/adapters/claude-local','packages/adapters/codex-local',
+                  'packages/adapters/openclaw','server','ui','cli','.'];
+                dirs.forEach(strip);
+              "
+
+              echo "Prune complete."
+
               mkdir -p $out
               cp -r $TMPDIR/build/* $out/
             '';

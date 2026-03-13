@@ -121,7 +121,7 @@ the npm install — this prevents them from being installed at all.
 
 **Expected result:** ~30–50% rootfs size reduction.
 
-- [ ] Add a `prunePhase` after `buildPhase` in `paperclip-built`
+- [x] Add a pruning step after all builds in `paperclip-built` buildPhase
 - [ ] Measure rootfs size before and after
 - [ ] Ensure server still starts correctly after pruning
 
