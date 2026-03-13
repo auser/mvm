@@ -1,14 +1,14 @@
-# Sprint 24 — Man Pages & Shell Completions
+# Sprint 25 — E2E Test Framework & `mvmctl uninstall`
 
-**Goal:** Make `mvmctl` feel like a first-class Unix citizen by shipping man pages (via `clap_mangen`) generated at release time. Shell completions (`mvmctl completions <shell>`) already exist; this sprint adds man page generation and delivery.
+**Goal:** Catch regressions before they reach users with a real subprocess-based E2E test harness, and give users a clean uninstall path.
 
-**Branch:** `feat/sprint-24`
+**Branch:** `feat/sprint-25`
 
 ## Current Status (v0.6.0)
 
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
-| Workspace crates | 6 + root facade          |
+| Workspace crates | 6 + root facade + xtask  |
 | Total tests      | 760+                     |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
@@ -40,88 +40,91 @@
 - [21-binary-signing-attestation.md](sprints/21-binary-signing-attestation.md)
 - [22-observability-deep-dive.md](sprints/22-observability-deep-dive.md)
 - [23-global-config-file.md](sprints/23-global-config-file.md)
+- [24-man-pages.md](sprints/24-man-pages.md)
 
 ---
 
 ## Rationale
 
-`mvmctl` is now a full-featured CLI tool. Users expect `man mvmctl` to work. Man pages
-are also required for distribution via package managers (Homebrew, apt). The `clap_mangen`
-crate generates groff-format man pages directly from Clap command metadata, so there is
-no manual authoring required.
+`mvmctl` has 760+ unit/integration tests but no test suite that runs the actual binary
+end-to-end. Regressions in argument parsing, exit codes, or output format slip through.
+A subprocess-based harness using `assert_cmd` (already in workspace deps) fills this gap
+with no new dependencies.
 
-Shell completions are already delivered via `mvmctl completions <shell>` and `mvmctl shell-init`.
-This sprint adds the final missing piece: man page generation and distribution.
-
----
-
-## Phase 1: `xtask` crate with man page generation **Status: COMPLETE**
-
-### 1.1 Add `xtask` to the workspace
-
-- [x] Create `xtask/` directory with `xtask/Cargo.toml`
-- [x] Add `"xtask"` to `[workspace].members` in root `Cargo.toml`
-- [x] Add `clap_mangen = "0.2"` to `[workspace.dependencies]`
-- [x] Add `[alias] xtask = "run --package xtask --"` to `.cargo/config.toml`
-
-### 1.2 Implement `xtask gen-man`
-
-- [x] `xtask/src/main.rs`: parses `cargo xtask gen-man [--output-dir DIR]`
-- [x] Generates `mvmctl.1` plus `mvmctl-<sub>.1` for each top-level subcommand
-- [x] 2 unit tests: `gen_man_creates_main_page`, `gen_man_creates_subcommand_pages`
-
-### 1.3 Share `Cli` definition for xtask
-
-- [x] Expose `pub fn cli_command() -> clap::Command` in `mvm-cli/src/commands.rs`
-- [x] xtask depends on `mvm-cli` workspace dep and calls `mvm_cli::commands::cli_command()`
-
-### 1.4 Add `man/` directory skeleton and `.gitignore` entry
-
-- [x] Add `man/.gitkeep` so the directory exists in the repo
-- [x] Add `man/*.1` to `.gitignore`
+`mvmctl uninstall` is the natural counterpart to `mvmctl bootstrap`. Users want a clean
+way to remove everything: Lima VM, Firecracker binary, `/var/lib/mvm/` state, and
+optionally `~/.mvm/` config. Today they must do this manually.
 
 ---
 
-## Phase 2: Release integration **Status: COMPLETE**
+## Phase 1: `mvmctl uninstall` command **Status: COMPLETE**
 
-### 2.1 Generate man pages in release CI
+### 1.1 Add `Uninstall` variant to `Commands` enum
 
-- [x] Add `cargo xtask gen-man --output-dir man/` step in `.github/workflows/release.yml`
-- [x] Include `man/` directory in the release tarball alongside the binary
+- [x] `Commands::Uninstall` with flags:
+  - `--yes` / `-y` — skip confirmation
+  - `--all` — also remove `~/.mvm/` (config, keys) and `/usr/local/bin/mvmctl`
+  - `--dry-run` — print what would be removed without doing it
 
-### 2.2 Update install script
+### 1.2 Implement `cmd_uninstall`
 
-- [x] `install.sh` installs man pages to `${MAN_DIR:-/usr/local/share/man/man1}/` when present in archive
-- [x] Uses `sudo` when needed; runs `mandb` to update man index if available
+- [x] Stop any running microVMs first (best-effort, log-and-continue on error)
+- [x] Destroy Lima VM if it exists (`lima::destroy()`)
+- [x] Remove `/var/lib/mvm/` state directory (with `sudo` if needed)
+- [x] With `--all`: remove `~/.mvm/` config dir and `/usr/local/bin/mvmctl` binary
+- [x] `--dry-run` prints each action without executing it
+- [x] Confirmation prompt unless `--yes` (lists what will be removed)
+
+### 1.3 Tests
+
+- [x] `test_uninstall_help` — flags present in help output
+- [x] `test_uninstall_listed_in_help` — top-level help includes "uninstall"
+- [x] `test_uninstall_dry_run_no_side_effects` — `--dry-run --yes` exits 0, prints plan
+
+---
+
+## Phase 2: E2E test harness **Status: COMPLETE**
+
+### 2.1 Create `tests/e2e/` directory
+
+- [x] `tests/e2e/harness.rs` — shared helpers: `mvmctl()` → `Command`, `assert_parse_ok()`
+- [x] `tests/e2e/mod.rs` — declare submodules
+
+### 2.2 E2E test cases
+
+- [x] `tests/e2e/help.rs` — `bootstrap --help`, `status --help`, `cleanup-orphans --help`
+- [x] `tests/e2e/status.rs` — `status` on clean system: exits 0 or 1, no panic, meaningful output
+- [x] `tests/e2e/cleanup_orphans.rs` — `cleanup-orphans --dry-run` on empty dir: exits 0
+- [x] `tests/e2e/uninstall.rs` — `uninstall --dry-run --yes` exits 0, output contains expected paths
+
+### 2.3 Wire into test binary
+
+- [x] Add `tests/e2e.rs` as the integration test entry point that includes `mod e2e`
+
+---
+
+## Phase 3: CI integration **Status: COMPLETE**
+
+### 3.1 Add `e2e` job to `.github/workflows/ci.yml`
+
+- [x] Runs after `build-linux` job (depends on it)
+- [x] Uses `ubuntu-latest`
+- [x] Step: `cargo test --test e2e`
 
 ---
 
 ## Verification
 
-After each phase:
 ```bash
 cargo test --workspace
+cargo test --test e2e
 cargo clippy --workspace -- -D warnings
 cargo check --workspace
-cargo xtask gen-man
-man man/mvmctl.1  # should display the man page
 ```
 
 ---
 
 ## Future Sprints (Planned, Not Yet Implemented)
-
-### Sprint 25: E2E Test Framework & `mvmctl uninstall`
-
-**Goal:** Catch regressions before they reach users.
-
-- [ ] Create `tests/e2e/` directory with a test harness that:
-  - Spawns a `mvmctl` subprocess for each test case
-  - Captures stdout/stderr, checks exit codes
-  - Runs against the actual binary (not library functions)
-- [ ] Implement `mvmctl uninstall` — removes Lima VM, Firecracker binary, `/var/lib/mvm/` (with `--all` flag for aggressive cleanup)
-- [ ] E2E tests for: `bootstrap --help`, `status` on clean system, `cleanup-orphans` on empty dir
-- [ ] Add `e2e` CI job that runs after `build-linux` in `ci.yml`
 
 ### Sprint 26: Audit Logging
 
