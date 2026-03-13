@@ -864,6 +864,37 @@ fn test_vm_help_lists_list_subcommand() {
 }
 
 // ============================================================================
+// Sprint 34: mvmctl flake check
+// ============================================================================
+
+#[test]
+fn test_flake_check_help_exits_ok() {
+    mvm()
+        .args(["flake", "check", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("flake"));
+}
+
+#[test]
+fn test_flake_top_level_help_lists_check() {
+    mvm()
+        .args(["flake", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("check"));
+}
+
+#[test]
+fn test_flake_help_lists_in_top_level() {
+    mvm()
+        .args(["--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("flake"));
+}
+
+// ============================================================================
 // Sprint 33: template init --preset
 // ============================================================================
 
