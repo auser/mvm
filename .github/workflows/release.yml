@@ -75,6 +75,10 @@ jobs:
           print('smoke test passed')
           "
 
+      - name: Generate man pages
+        shell: bash
+        run: cargo xtask gen-man --output-dir man/
+
       - name: Package binary and generate checksums
         env:
           TARGET: ${{ matrix.target }}
@@ -87,6 +91,10 @@ jobs:
           cp "target/${TARGET}/release/${BIN_NAME}" "staging/${ARCHIVE_NAME}/"
           cp -r resources "staging/${ARCHIVE_NAME}/" 2>/dev/null || true
           cp README.md "staging/${ARCHIVE_NAME}/" 2>/dev/null || true
+          # Include generated man pages
+          if [ -d man ] && ls man/*.1 2>/dev/null; then
+            cp -r man "staging/${ARCHIVE_NAME}/"
+          fi
 
           cd staging
           tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"

@@ -602,6 +602,15 @@ impl PhaseEvent {
 // Entry point
 // ============================================================================
 
+/// Return the Clap `Command` tree for `mvmctl`.
+///
+/// Used by the `xtask` crate to generate man pages without duplicating the
+/// command definition.
+pub fn cli_command() -> clap::Command {
+    use clap::CommandFactory;
+    Cli::command()
+}
+
 pub fn run() -> Result<()> {
     let cli = Cli::parse();
 
