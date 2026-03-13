@@ -333,6 +333,18 @@ enum Commands {
         #[command(subcommand)]
         action: ConfigAction,
     },
+    /// Remove Lima VM, Firecracker binary, and all mvm state (clean uninstall)
+    Uninstall {
+        /// Skip confirmation prompt
+        #[arg(long, short = 'y')]
+        yes: bool,
+        /// Also remove ~/.mvm/ config dir and /usr/local/bin/mvmctl binary
+        #[arg(long)]
+        all: bool,
+        /// Print what would be removed without actually removing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -821,6 +833,7 @@ pub fn run() -> Result<()> {
         Commands::Template { action } => cmd_template(action),
         Commands::Vm { action } => cmd_vm(action),
         Commands::Config { action } => cmd_config(action),
+        Commands::Uninstall { yes, all, dry_run } => cmd_uninstall(yes, all, dry_run),
     };
 
     with_hints(result)
@@ -2832,6 +2845,107 @@ fn cmd_destroy(yes: bool) -> Result<()> {
     ui::info("Destroying Lima VM...");
     lima::destroy()?;
     ui::success("Destroyed.");
+    Ok(())
+}
+
+fn cmd_uninstall(yes: bool, all: bool, dry_run: bool) -> Result<()> {
+    // Build list of what will be removed.
+    let mut actions: Vec<String> = Vec::new();
+
+    let lima_status = lima::get_status().unwrap_or(lima::LimaStatus::NotFound);
+    if !matches!(lima_status, lima::LimaStatus::NotFound) {
+        actions.push("Destroy Lima VM 'mvm'".to_string());
+    }
+
+    actions.push("Remove /var/lib/mvm/ (VM state, volumes, run-info)".to_string());
+
+    if all {
+        actions.push("Remove ~/.mvm/ (config, signing keys)".to_string());
+        actions.push("Remove /usr/local/bin/mvmctl (binary)".to_string());
+    }
+
+    if actions.is_empty() {
+        ui::info("Nothing to uninstall.");
+        return Ok(());
+    }
+
+    if dry_run {
+        ui::info("Dry run — the following would be removed:");
+        for a in &actions {
+            println!("  • {a}");
+        }
+        return Ok(());
+    }
+
+    // Confirmation prompt.
+    if !yes {
+        ui::info("The following will be removed:");
+        for a in &actions {
+            println!("  • {a}");
+        }
+        if !ui::confirm("Proceed with uninstall?") {
+            ui::info("Cancelled.");
+            return Ok(());
+        }
+    }
+
+    // Stop running microVMs first (best-effort).
+    if matches!(lima_status, lima::LimaStatus::Running)
+        && let Err(e) = microvm::stop()
+    {
+        tracing::warn!("failed to stop microVMs before uninstall: {e}");
+    }
+
+    // Destroy Lima VM.
+    if !matches!(lima_status, lima::LimaStatus::NotFound) {
+        ui::info("Destroying Lima VM...");
+        if let Err(e) = lima::destroy() {
+            tracing::warn!("failed to destroy Lima VM: {e}");
+        }
+    }
+
+    // Remove /var/lib/mvm/.
+    let state_dir = std::path::Path::new("/var/lib/mvm");
+    if state_dir.exists() {
+        ui::info("Removing /var/lib/mvm/...");
+        let status = std::process::Command::new("sudo")
+            .args(["rm", "-rf", "/var/lib/mvm"])
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => tracing::warn!("sudo rm /var/lib/mvm exited with status {s}"),
+            Err(e) => tracing::warn!("failed to remove /var/lib/mvm: {e}"),
+        }
+    }
+
+    if all {
+        // Remove ~/.mvm/.
+        if let Ok(home) = std::env::var("HOME") {
+            let config_dir = std::path::PathBuf::from(home).join(".mvm");
+            if config_dir.exists() {
+                ui::info("Removing ~/.mvm/...");
+                if let Err(e) = std::fs::remove_dir_all(&config_dir) {
+                    tracing::warn!("failed to remove ~/.mvm/: {e}");
+                }
+            }
+        }
+
+        // Remove /usr/local/bin/mvmctl.
+        let bin = std::path::Path::new("/usr/local/bin/mvmctl");
+        if bin.exists() {
+            ui::info("Removing /usr/local/bin/mvmctl...");
+            let status = std::process::Command::new("sudo")
+                .args(["rm", "-f", "/usr/local/bin/mvmctl"])
+                .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => tracing::warn!("sudo rm mvmctl exited with status {s}"),
+                Err(e) => tracing::warn!("failed to remove /usr/local/bin/mvmctl: {e}"),
+            }
+        }
+    }
+
+    ui::success("Uninstall complete.");
     Ok(())
 }
 
@@ -5096,5 +5210,46 @@ edition = "2024"
         let mut cfg = mvm_core::user_config::MvmConfig::default();
         let err = mvm_core::user_config::set_key(&mut cfg, "nonexistent_key", "5").unwrap_err();
         assert!(err.to_string().contains("Unknown config key"));
+    }
+
+    // ---- Uninstall command tests ----
+
+    #[test]
+    fn test_uninstall_parses_defaults() {
+        let cli = Cli::try_parse_from(["mvmctl", "uninstall", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Uninstall {
+                yes: true,
+                all: false,
+                dry_run: false,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_uninstall_dry_run_parses() {
+        let cli = Cli::try_parse_from(["mvmctl", "uninstall", "--dry-run", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Uninstall {
+                yes: true,
+                all: false,
+                dry_run: true,
+            }
+        ));
+    }
+
+    #[test]
+    fn test_uninstall_all_flag_parses() {
+        let cli = Cli::try_parse_from(["mvmctl", "uninstall", "--all", "--yes"]).unwrap();
+        assert!(matches!(
+            cli.command,
+            Commands::Uninstall {
+                yes: true,
+                all: true,
+                dry_run: false,
+            }
+        ));
     }
 }

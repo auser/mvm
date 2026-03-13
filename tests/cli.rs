@@ -53,6 +53,7 @@ fn test_help_lists_all_subcommands() {
         "cleanup",
         "status",
         "destroy",
+        "uninstall",
         "update",
         "run",
         "forward",
@@ -676,4 +677,34 @@ fn test_cleanup_orphans_help() {
         .success()
         .stdout(predicate::str::contains("dry-run"))
         .stdout(predicate::str::contains("orphan"));
+}
+
+#[test]
+fn test_uninstall_listed_in_help() {
+    mvm()
+        .arg("--help")
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("uninstall"));
+}
+
+#[test]
+fn test_uninstall_help() {
+    mvm()
+        .args(["uninstall", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--yes"))
+        .stdout(predicate::str::contains("--all"))
+        .stdout(predicate::str::contains("--dry-run"));
+}
+
+#[test]
+fn test_uninstall_dry_run_no_side_effects() {
+    // --dry-run --yes should exit 0 and print the plan without touching the system.
+    mvm()
+        .args(["uninstall", "--dry-run", "--yes"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("/var/lib/mvm"));
 }
