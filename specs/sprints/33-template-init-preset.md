@@ -1,17 +1,17 @@
-# Sprint 34 — `mvmctl flake check`
+# Sprint 33 — `mvmctl template init --preset`
 
-**Goal:** Add `mvmctl flake check [--flake <path>]` to validate a Nix flake
-before committing to a full `nix build`, giving users fast feedback on syntax
-and evaluation errors.
+**Goal:** Add a `--preset` flag to `mvmctl template init` so users can start
+from a meaningful scaffold instead of a blank/minimal template.  Four presets
+are supported: `minimal` (default), `http`, `postgres`, and `worker`.
 
-**Branch:** `feat/sprint-34`
+**Branch:** `feat/sprint-33`
 
 ## Current Status (v0.6.0)
 
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 6 + root facade + xtask  |
-| Total tests      | 870+                     |
+| Total tests      | 855+                     |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | MSRV             | 1.85                     |
@@ -51,38 +51,48 @@ and evaluation errors.
 - [30-config-edit.md](sprints/30-config-edit.md)
 - [31-vm-resource-defaults.md](sprints/31-vm-resource-defaults.md)
 - [32-vm-list.md](sprints/32-vm-list.md)
-- [33-template-init-preset.md](sprints/33-template-init-preset.md)
 
 ---
 
 ## Rationale
 
-`nix build` on an invalid flake can take 30+ seconds before failing.
-`mvmctl flake check` runs `nix flake check` inside the Lima VM (where Nix
-lives) and streams its output immediately, giving fast syntax/evaluation
-feedback without kicking off the full build pipeline.
+`mvmctl template init` currently writes one minimal `flake.nix` that shows a
+Python HTTP server.  New users need to edit the whole file to get started with
+a real workload.  Adding named presets lets users pick a starting point that
+already has the right packages, services, and health checks wired up.
 
 ---
 
-## Phase 1: Add `Commands::Flake` **Status: COMPLETE**
+## Phase 1: Scaffold Preset Files **Status: COMPLETE**
 
-- [x] Add `Commands::Flake { action: FlakeCmd }` top-level subcommand
-- [x] Add `enum FlakeCmd { Check { flake: Option<String>, json: bool } }`
-- [x] Add `cmd_flake_check(flake: Option<&str>, json: bool) -> Result<()>`
-  - Defaults flake path to `"."` when not given
-  - Resolves to absolute path via `resolve_flake_ref`
-  - Runs `nix flake check <path>` inside Lima via visible shell exec
-  - On success prints `Flake is valid.` (or `{"valid":true}` in JSON mode)
-  - On failure prints error output (or `{"valid":false,"error":"..."}`)
-- [x] `cmd_flake` dispatch function
+- [x] Update `crates/mvm-cli/resources/template_scaffold/flake.nix` → truly
+  minimal preset (packages only, no services, comments guide the user)
+- [x] Add `crates/mvm-cli/resources/template_scaffold/flake-http.nix` — Python
+  HTTP server with curl health check
+- [x] Add `crates/mvm-cli/resources/template_scaffold/flake-postgres.nix` —
+  PostgreSQL service with `pg_isready` health check
+- [x] Add `crates/mvm-cli/resources/template_scaffold/flake-worker.nix` —
+  long-running background worker with no ports
 
 ---
 
-## Phase 2: Tests **Status: COMPLETE**
+## Phase 2: CLI & Logic **Status: COMPLETE**
 
-- [x] `test_flake_check_help_exits_ok` — `mvmctl flake check --help` exits 0
-- [x] `test_flake_top_level_help_lists_check` — `mvmctl flake --help` mentions `check`
-- [x] `test_flake_help_lists_in_top_level` — `mvmctl --help` mentions `flake`
+- [x] Add `--preset <minimal|http|postgres|worker>` arg to `TemplateCmd::Init`
+  (default: `minimal`)
+- [x] Update `template_cmd::init` signature to accept `preset: &str`
+- [x] Update `scaffold_template_files` to select flake content by preset;
+  return `Err` for unknown preset name
+- [x] Pass `preset` through in `cmd_template` dispatch
+
+---
+
+## Phase 3: Tests **Status: COMPLETE**
+
+- [x] `test_template_init_help_shows_preset_flag`
+- [x] `test_template_init_preset_minimal_exits_ok`
+- [x] `test_template_init_preset_http_exits_ok`
+- [x] `test_template_init_preset_unknown_shows_error`
 
 ---
 
@@ -97,5 +107,7 @@ cargo check --workspace
 ---
 
 ## Future Sprints (Planned, Not Yet Implemented)
+
+### Sprint 34: `mvmctl flake check` — validate a flake before building
 
 ### Sprint 35: `mvmctl run --watch` — edit→rebuild→reboot loop

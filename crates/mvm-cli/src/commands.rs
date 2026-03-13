@@ -360,6 +360,11 @@ enum Commands {
         #[command(subcommand)]
         action: AuditCmd,
     },
+    /// Validate a Nix flake before building
+    Flake {
+        #[command(subcommand)]
+        action: FlakeCmd,
+    },
 }
 
 #[derive(Subcommand)]
@@ -372,6 +377,19 @@ enum AuditCmd {
         /// Follow log output (poll every 500 ms until Ctrl-C)
         #[arg(long, short = 'f')]
         follow: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum FlakeCmd {
+    /// Run `nix flake check` to validate a flake before building
+    Check {
+        /// Flake path or reference (default: current directory)
+        #[arg(long, default_value = ".")]
+        flake: String,
+        /// Output structured JSON instead of human-readable output
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -886,6 +904,7 @@ pub fn run() -> Result<()> {
         Commands::Config { action } => cmd_config(action),
         Commands::Uninstall { yes, all, dry_run } => cmd_uninstall(yes, all, dry_run),
         Commands::Audit { action } => cmd_audit(action),
+        Commands::Flake { action } => cmd_flake(action),
     };
 
     with_hints(result)
@@ -3135,6 +3154,62 @@ fn cmd_uninstall(yes: bool, all: bool, dry_run: bool) -> Result<()> {
 fn cmd_audit(action: AuditCmd) -> Result<()> {
     match action {
         AuditCmd::Tail { lines, follow } => cmd_audit_tail(lines, follow),
+    }
+}
+
+// ============================================================================
+// Flake commands
+// ============================================================================
+
+fn cmd_flake(action: FlakeCmd) -> Result<()> {
+    match action {
+        FlakeCmd::Check { flake, json } => cmd_flake_check(&flake, json),
+    }
+}
+
+fn cmd_flake_check(flake: &str, json: bool) -> Result<()> {
+    let resolved = resolve_flake_ref(flake)?;
+
+    if bootstrap::is_lima_required() {
+        lima::require_running()?;
+    }
+
+    let script = format!("nix flake check {resolved}");
+
+    if json {
+        // Capture combined stdout+stderr so we can embed it in JSON.
+        let output = shell::run_in_vm_capture(&script);
+        match output {
+            Ok(out) => {
+                let combined = format!(
+                    "{}{}",
+                    String::from_utf8_lossy(&out.stdout),
+                    String::from_utf8_lossy(&out.stderr)
+                );
+                if out.status.success() {
+                    println!("{{\"valid\":true}}");
+                } else {
+                    let msg = combined.trim().replace('"', "'");
+                    println!("{{\"valid\":false,\"error\":\"{msg}\"}}");
+                    std::process::exit(1);
+                }
+                Ok(())
+            }
+            Err(e) => {
+                let msg = e.to_string().replace('"', "'");
+                println!("{{\"valid\":false,\"error\":\"{msg}\"}}");
+                std::process::exit(1);
+            }
+        }
+    } else {
+        // Stream output directly so the user sees nix progress in real time.
+        match shell::run_in_vm_visible(&script) {
+            Ok(()) => {
+                ui::success("Flake is valid.");
+                Ok(())
+            }
+            Err(e) => Err(e.context("Flake check failed")),
+        }
     }
 }
 
