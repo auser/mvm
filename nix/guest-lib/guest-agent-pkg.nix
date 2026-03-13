@@ -21,6 +21,7 @@ rustPlatform.buildRustPackage {
       (mvmSrc + "/Cargo.lock")
       (mvmSrc + "/src")
       (mvmSrc + "/crates")
+      (mvmSrc + "/xtask")
     ];
   };
 

@@ -41,7 +41,7 @@
 
             outputHashMode = "recursive";
             outputHashAlgo = "sha256";
-            outputHash = "sha256-z4IgLVwena+f9FXcX3N0ccy19ixfTi5xYQyczgv8lB4=";
+            outputHash = "sha256-h5jP1tuywwblhFDhMOrKC3frkB3dE0SqAIWStBfsrvg=";
 
             nativeBuildInputs = [ pkgs.nodejs_22 pkgs.cacert ];
 
@@ -231,7 +231,9 @@
               preStart = pkgs.writeShellScript "paperclip-setup" ''
                 mount -t tmpfs -o mode=0755,size=1g tmpfs /var/lib/paperclip
                 chown paperclip:paperclip /var/lib/paperclip
-                install -d -o paperclip -g paperclip /var/lib/paperclip/instances/default/{logs,data/storage,secrets}
+                install -d -o paperclip -g paperclip /var/lib/paperclip/instances/default/logs
+                install -d -o paperclip -g paperclip /var/lib/paperclip/instances/default/data/storage
+                install -d -o paperclip -g paperclip /var/lib/paperclip/instances/default/secrets
 
                 # Copy config.json from config drive mount if provided via
                 # mvmctl run -v path/to/config:/mnt/config
@@ -266,7 +268,7 @@
                 HOST = "0.0.0.0";
                 PORT = "3100";
                 SERVE_UI = "true";
-                PAPERCLIP_DEPLOYMENT_MODE = "local_trusted";
+                PAPERCLIP_DEPLOYMENT_MODE = "authenticated";
                 PAPERCLIP_DEPLOYMENT_EXPOSURE = "private";
                 DATABASE_URL = "postgresql://postgres@127.0.0.1:5432/paperclip";
               };

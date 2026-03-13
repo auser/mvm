@@ -4,9 +4,9 @@
     "mode": "postgres",
     "connectionString": "postgresql://postgres@127.0.0.1:5432/paperclip"
   },
-  "logging": { "mode": "file", "logDir": "/var/lib/paperclip/instances/default/logs" },
+  "logging": { "mode": "console" },
   "server": {
-    "deploymentMode": "local_trusted",
+    "deploymentMode": "authenticated",
     "exposure": "private",
     "host": "0.0.0.0",
     "port": 3100,
