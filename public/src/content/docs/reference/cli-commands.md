@@ -85,7 +85,7 @@ description: Complete command reference for mvmctl.
 |---------|-------------|
 | `mvmctl template init <name> --local` | Scaffold a new template directory with flake.nix |
 | `mvmctl template init <name> --vm` | Scaffold inside the Lima VM (overrides --local) |
-| `mvmctl template init <name> --preset <preset>` | Scaffold preset: minimal, http, postgres, worker (default: minimal) |
+| `mvmctl template init <name> --preset <preset>` | Scaffold preset: minimal, http, postgres, worker, python (default: minimal) |
 | `mvmctl template init <name> --dir <path>` | Base directory for local init (default: current dir) |
 | `mvmctl template create <name>` | Create a single template definition |
 | `mvmctl template create <name> --data-disk SIZE` | Create template with a data disk (10G, 512M, or plain MB; 0 = none) |
@@ -102,7 +102,7 @@ description: Complete command reference for mvmctl.
 | `mvmctl template verify <name>` | Verify template checksums |
 | `mvmctl template verify <name> --revision <hash>` | Verify a specific revision |
 | `mvmctl template list` | List all templates (`--json` for JSON) |
-| `mvmctl template info <name>` | Show template details and revisions (`--json` for JSON) |
+| `mvmctl template info <name>` | Show template details, current revision, artifact sizes, and snapshot status (`--json` for JSON) |
 | `mvmctl template edit <name>` | Edit template configuration (--cpus, --mem, --flake, --profile, --role, --data-disk) |
 | `mvmctl template delete <name>` | Delete a template (`--force` to skip confirmation) |
 

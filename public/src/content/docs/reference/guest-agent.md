@@ -41,6 +41,32 @@ Health checks defined in `mkGuest`'s `healthChecks` parameter are automatically 
 
 The agent picks them up on boot and begins periodic checks immediately.
 
+### Startup Grace Period
+
+Services that take time to initialize (e.g., running database migrations) can specify a grace period. During the grace period, health check failures are suppressed and the service reports `Starting` status instead of `Error`:
+
+```json
+{
+  "name": "my-service",
+  "health_cmd": "curl -sf http://localhost:8080/health",
+  "health_interval_secs": 10,
+  "health_timeout_secs": 5,
+  "startup_grace_secs": 120
+}
+```
+
+In a Nix flake, set the grace period via `startupGraceSecs`:
+
+```nix
+healthChecks.my-app = {
+  healthCmd = "curl -sf http://localhost:8080/health";
+  healthIntervalSecs = 10;
+  startupGraceSecs = 120;  # suppress failures for 2 minutes after boot
+};
+```
+
+After the grace period expires, normal health reporting resumes.
+
 ## Querying from the Host
 
 ```bash

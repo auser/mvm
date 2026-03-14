@@ -9,27 +9,27 @@ const features = [
   {
     title: "Nix-Based Builds",
     description:
-      "Reproducible microVM images from Nix flakes. Cached builds — rebuilds are near-instant.",
+      "Reproducible microVM images from Nix flakes. Cached builds — rebuilds are near-instant. Artifact sizes reported on every build.",
+  },
+  {
+    title: "Service Builders",
+    description:
+      "mkPythonService, mkNodeService, and mkStaticSite — high-level helpers that return { package, service, healthCheck } for easy composition.",
   },
   {
     title: "Headless MicroVMs",
     description:
-      "No SSH, ever. MicroVMs communicate via Firecracker vsock. The guest agent handles lifecycle.",
+      "No SSH, ever. MicroVMs communicate via Firecracker vsock. The guest agent handles lifecycle with startup grace periods.",
   },
   {
-    title: "Integration Health",
+    title: "Templates & Snapshots",
     description:
-      "Workloads register health checks via drop-in JSON. The guest agent polls and reports status.",
+      "Build reusable images with size tracking. Snapshot for 1-2s boot. Inspect sizes and status with template info.",
   },
   {
-    title: "Templates & Registry",
+    title: "Developer Experience",
     description:
-      "Build reusable base images, version them, share via S3-compatible registry.",
-  },
-  {
-    title: "Security Posture",
-    description:
-      "Evaluate jailer isolation, seccomp filters, network isolation, and audit logging.",
+      "Scaffold presets (Python, Node, HTTP, Postgres), actionable error hints, and system diagnostics via doctor.",
   },
 ];
 

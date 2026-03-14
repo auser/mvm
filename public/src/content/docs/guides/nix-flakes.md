@@ -157,6 +157,77 @@ mvm.lib.${system}.mkGuest {
 
 Squashfs images are read-only — the init system mounts tmpfs overlays on `/etc` and `/var` automatically.
 
+## Service Builder Helpers
+
+The guest library provides high-level helpers that return a `{ package, service, healthCheck }` set. Compose them with `mkGuest`:
+
+### mkPythonService
+
+Build a Python HTTP service using `python3.withPackages` (nixpkgs packages only):
+
+```nix
+let
+  pythonApp = mvm.lib.${system}.mkPythonService {
+    name = "my-api";
+    src = ./.;
+    pythonPackages = ps: [ ps.flask ];
+    entrypoint = "app/main.py";
+    port = 8080;
+    env = { WORKERS = "2"; };
+  };
+in
+  mvm.lib.${system}.mkGuest {
+    name = "my-api";
+    packages = [ pythonApp.package ];
+    services.app = pythonApp.service;
+    healthChecks.app = pythonApp.healthCheck;
+  };
+```
+
+### mkStaticSite
+
+Serve static files with busybox httpd (zero extra packages):
+
+```nix
+let
+  site = mvm.lib.${system}.mkStaticSite {
+    name = "docs";
+    src = ./public;
+    port = 8080;
+  };
+in
+  mvm.lib.${system}.mkGuest {
+    name = "docs";
+    packages = [ site.package ];
+    services.www = site.service;
+    healthChecks.www = site.healthCheck;
+  };
+```
+
+### mkNodeService
+
+Build a Node.js service with npm install + tsc:
+
+```nix
+let
+  app = mvm.lib.${system}.mkNodeService {
+    name = "my-app";
+    src = fetchGit { url = "..."; rev = "..."; };
+    npmHash = "sha256-...";
+    entrypoint = "dist/index.js";
+    port = 3000;
+  };
+in
+  mvm.lib.${system}.mkGuest {
+    name = "my-app";
+    packages = [ app.package ];
+    services.app = app.service;
+    healthChecks.app = app.healthCheck;
+  };
+```
+
+All three helpers return the same shape: `{ package, service, healthCheck }`. This makes it easy to swap between runtimes or compose multiple services in a single guest.
+
 ## Build Process
 
 When you run `mvmctl build --flake .`:

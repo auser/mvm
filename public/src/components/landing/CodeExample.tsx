@@ -40,19 +40,21 @@ const nixFlake = `{
     };
 }`;
 
-const template = `# Scaffold a new template
-mvmctl template init my-service --local
+const template = `# Scaffold from a preset (minimal, python, http, postgres, worker)
+mvmctl template init my-service --local --preset python
 
-# Register and build
+# Register and build (sizes reported on success)
 mvmctl template create my-service
 mvmctl template build my-service
+
+# Inspect artifact sizes and snapshot status
+mvmctl template info my-service
 
 # Run from template
 mvmctl run --template my-service
 
-# Warm snapshot for instant restart
-mvmctl template warm my-service
-# Subsequent runs: <1s startup`;
+# Build with snapshot for instant restart (<2s boot)
+mvmctl template build my-service --snapshot`;
 
 export function CodeExample() {
   return (

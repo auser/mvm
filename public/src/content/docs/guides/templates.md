@@ -20,6 +20,18 @@ my-service/
 └── README.md
 ```
 
+### Scaffold Presets
+
+Use `--preset` to start from a language-specific template:
+
+```bash
+mvmctl template init my-api --local --preset python   # Python HTTP service
+mvmctl template init my-web --local --preset http      # HTTP server
+mvmctl template init my-db --local --preset postgres   # PostgreSQL
+mvmctl template init my-job --local --preset worker    # Background worker
+mvmctl template init my-vm --local --preset minimal    # Bare minimum (default)
+```
+
 ## From an Existing Flake
 
 If you already have a Nix flake, register it directly:
@@ -38,7 +50,11 @@ mvmctl template build my-service
 mvmctl template build my-service --force    # Rebuild even if cached
 ```
 
-Builds run `nix build` inside the Lima VM to produce kernel + rootfs artifacts.
+Builds run `nix build` inside the Lima VM to produce kernel + rootfs artifacts. On success, artifact sizes are reported:
+
+```
+Template 'my-service' built successfully (revision: abc123, rootfs: 45.2 MiB, kernel: 12.1 MiB)
+```
 
 ## Snapshots
 
@@ -165,11 +181,36 @@ Available edit options:
 - `--mem` - Update memory in MiB
 - `--data-disk` - Change data disk size in MiB
 
+## Inspect
+
+`template info` shows the full picture — spec, current revision, artifact sizes, and snapshot status:
+
+```bash
+mvmctl template info my-service
+```
+
+```
+Template: my-service
+  Flake:   /path/to/flake
+  Profile: minimal
+  Role:    worker
+  vCPUs:   2
+  Memory:  1024 MiB
+
+Current Revision: abc123
+  Built:   2026-03-14T12:00:00Z
+  Kernel:  12.1 MiB
+  Rootfs:  45.2 MiB
+  Snapshot: present (vmstate: 1.5 MiB, mem: 1024.0 MiB)
+```
+
+Use `--json` for machine-readable output (includes full revision data).
+
 ## Manage
 
 ```bash
 mvmctl template list                   # List all templates
-mvmctl template info my-service        # Show details + revisions
+mvmctl template info my-service        # Show details, sizes, snapshot status
 mvmctl template edit my-service --mem 2048  # Edit template settings
 mvmctl template delete my-service      # Remove a template
 ```

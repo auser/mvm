@@ -85,6 +85,73 @@ nix flake check
 
 If builds are slow despite no code changes, check that `flake.lock` hasn't changed. Any change to `flake.lock` invalidates the cache.
 
+### Stale flake.lock
+
+```
+error: flake does not provide attribute ...
+```
+
+**Cause**: Your `flake.lock` references an old nixpkgs or guest-lib version that doesn't have the expected outputs.
+
+**Fix**:
+```bash
+nix flake update
+mvmctl build --flake .
+```
+
+### Disk full
+
+```
+error: No space left on device
+```
+
+**Cause**: The Nix store or Lima disk is full.
+
+**Fix**:
+```bash
+# Run garbage collection
+nix-collect-garbage -d
+
+# Check Nix store size (mvmctl doctor warns if >20 GiB)
+mvmctl doctor
+```
+
+### Hash mismatch (fixed-output derivation)
+
+```
+error: hash mismatch in fixed-output derivation
+  got: sha256-XXXX...
+```
+
+**Cause**: The `npmHash` or `outputHash` in your flake doesn't match the fetched content (e.g., upstream package changed).
+
+**Fix**: Update the hash to the value shown after `got:` in the error message, or use `--update-hash`:
+
+```bash
+mvmctl template build my-service --update-hash
+```
+
+### Template not found
+
+```
+error: Template 'foo' not found
+```
+
+**Fix**: Check available templates:
+```bash
+mvmctl template list
+```
+
+### Timeout / Connection errors
+
+```
+error: timed out waiting for ...
+```
+
+**Cause**: Network connectivity issue or a service failed to start within the expected time.
+
+**Fix**: Check that the Lima VM has internet access and that your service binds to the correct port. Use `mvmctl logs <name>` to inspect guest output.
+
 ## Network Issues
 
 ### MicroVM has no internet
