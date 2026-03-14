@@ -27,6 +27,12 @@ impl ConfigWatcher {
     /// Start watching `path`.  Returns immediately; the debouncer runs on a
     /// background thread managed by `notify`.
     pub fn start(path: &Path) -> Result<Self> {
+        Self::start_with_debounce(path, Duration::from_millis(500))
+    }
+
+    /// Like [`start`] but with a configurable debounce duration.  Useful in
+    /// tests where a shorter debounce keeps suites fast.
+    pub fn start_with_debounce(path: &Path, debounce: Duration) -> Result<Self> {
         // Canonicalize so that event.path comparisons work reliably.
         let watch_file = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         // Watch the parent directory — notify is most reliable when watching dirs.
@@ -38,7 +44,7 @@ impl ConfigWatcher {
         let (event_tx, event_rx) = mpsc::channel::<ConfigReloadEvent>();
 
         let (raw_tx, raw_rx) = mpsc::channel();
-        let mut debouncer = new_debouncer(Duration::from_millis(500), raw_tx)?;
+        let mut debouncer = new_debouncer(debounce, raw_tx)?;
         debouncer
             .watcher()
             .watch(&watch_dir, notify::RecursiveMode::NonRecursive)?;
@@ -126,10 +132,11 @@ mod tests {
         let config_path = dir.path().join("config.toml");
 
         write_config(&config_path, &MvmConfig::default());
-        let watcher = ConfigWatcher::start(&config_path).unwrap();
+        let watcher =
+            ConfigWatcher::start_with_debounce(&config_path, Duration::from_millis(50)).unwrap();
 
         // Give the watcher time to register before writing.
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(50));
 
         let updated = MvmConfig {
             lima_cpus: 4,
@@ -137,8 +144,8 @@ mod tests {
         };
         write_config(&config_path, &updated);
 
-        // Wait up to 3 s for the reload event.
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        // Wait up to 2 s for the reload event.
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut received = false;
         while std::time::Instant::now() < deadline {
             match watcher.receiver.try_recv() {
@@ -157,7 +164,7 @@ mod tests {
         }
         assert!(
             received,
-            "No ConfigReloadEvent::Reloaded received within 3 s"
+            "No ConfigReloadEvent::Reloaded received within 2 s"
         );
     }
 
@@ -167,14 +174,15 @@ mod tests {
         let config_path = dir.path().join("config.toml");
 
         write_config(&config_path, &MvmConfig::default());
-        let watcher = ConfigWatcher::start(&config_path).unwrap();
+        let watcher =
+            ConfigWatcher::start_with_debounce(&config_path, Duration::from_millis(50)).unwrap();
 
-        std::thread::sleep(Duration::from_millis(200));
+        std::thread::sleep(Duration::from_millis(50));
 
         // Overwrite with invalid TOML.
         std::fs::write(&config_path, b"this is [[ not valid toml").unwrap();
 
-        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let deadline = std::time::Instant::now() + Duration::from_secs(2);
         let mut received = false;
         while std::time::Instant::now() < deadline {
             match watcher.receiver.try_recv() {
@@ -192,7 +200,7 @@ mod tests {
         }
         assert!(
             received,
-            "No ConfigReloadEvent::ParseError received within 3 s"
+            "No ConfigReloadEvent::ParseError received within 2 s"
         );
     }
 
