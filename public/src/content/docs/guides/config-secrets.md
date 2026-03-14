@@ -29,7 +29,7 @@ Every file in the host directory is written to the corresponding drive image. Fo
 
 ## Library API
 
-The same functionality is available programmatically for library consumers like [mvmd](https://github.com/auser/mvmd):
+The same functionality is available programmatically for library consumers:
 
 ```rust
 use mvm_runtime::vm::microvm::{DriveFile, FlakeRunConfig};

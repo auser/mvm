@@ -42,10 +42,6 @@ MicroVMs are accessible from the Lima VM at `172.16.0.2`. To expose a service to
 1. The microVM listens on its eth0 address (172.16.0.2)
 2. Lima's networking makes the VM accessible from the host
 
-## Cross-Tenant Isolation
-
-In fleet mode ([mvmd](https://github.com/auser/mvmd)), tenants are isolated at L2 with separate bridges. Cross-tenant traffic is blocked by design. If you need cross-tenant communication, route through the host.
-
 ## DNS
 
 The guest's `/etc/resolv.conf` is configured at build time to use Lima's DNS resolver. Internet access works out of the box through the NAT chain.

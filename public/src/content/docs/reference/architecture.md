@@ -65,8 +65,6 @@ Extends `ShellEnvironment` for fleet orchestration:
 - `ensure_bridge()`, `setup_tap()`, `teardown_tap()`
 - `record_revision()`
 
-Used by `pool_build()` in [mvmd](https://github.com/auser/mvmd).
-
 ### VmBackend
 
 VM lifecycle abstraction:

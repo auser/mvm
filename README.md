@@ -8,9 +8,6 @@ macOS / Linux Host  -->  Lima VM (Ubuntu)  -->  Firecracker microVM
 ```
 
 mvm handles the full dev lifecycle: bootstrapping Lima, installing Firecracker, building reproducible VM images from Nix flakes, launching microVMs, and managing reusable templates.
-
-> Looking for multi-tenant fleet orchestration (tenants, pools, agents, coordinators)? See [mvmd](https://github.com/auser/mvmd).
-
 ## Install
 
 ```bash
@@ -190,8 +187,6 @@ mvmctl run --template my-app \
 Inside the guest:
 - Config files appear at `/mnt/config/` (read-only, mode 0444)
 - Secret files appear at `/mnt/secrets/` (read-only, mode 0440 `root:<serviceGroup>`)
-
-The same API is available programmatically via `FlakeRunConfig.config_files` and `FlakeRunConfig.secret_files` for library consumers like [mvmd](https://github.com/auser/mvmd).
 
 ### From an Mvmfile
 
@@ -650,7 +645,7 @@ Key abstractions in `mvm-core`:
 - **`BuildEnvironment`** (extends `ShellEnvironment`): Fleet build orchestration -- `load_pool_spec()`, `load_tenant_config()`, `ensure_bridge()`, `setup_tap()`, `teardown_tap()`, `record_revision()`
 - **`VmBackend`**: VM lifecycle abstraction -- `start()`, `stop()`, `status()`, `capabilities()`. Current implementation: `FirecrackerBackend`.
 
-mvm uses `LinuxEnv` for all command execution and `ShellEnvironment` for dev builds (via `dev_build()`). The full `BuildEnvironment` and `VmBackend` dispatch are used by [mvmd](https://github.com/auser/mvmd) for fleet orchestration.
+mvm uses `LinuxEnv` for all command execution and `ShellEnvironment` for dev builds (via `dev_build()`).
 
 ## Network Layout (Dev Mode)
 
@@ -690,10 +685,6 @@ cargo clippy --workspace -- -D warnings  # Lint (0 warnings required)
 - [Templates](public/src/content/docs/guides/templates.md) -- reusable base images
 - [Troubleshooting](public/src/content/docs/guides/troubleshooting.md) -- common issues and fixes
 - [Development](public/src/content/docs/contributing/development.md) -- contributor guide
-
-## Related Projects
-
-- [mvmd](https://github.com/auser/mvmd) -- Multi-tenant Firecracker fleet orchestration daemon (tenants, pools, instances, agents, coordinators, security hardening)
 
 ## License
 
