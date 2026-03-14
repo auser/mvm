@@ -166,9 +166,11 @@ mod tests {
 
     #[test]
     fn test_toml_roundtrip() {
-        let mut cfg = MvmConfig::default();
-        cfg.lima_cpus = 4;
-        cfg.metrics_port = Some(9091);
+        let cfg = MvmConfig {
+            lima_cpus: 4,
+            metrics_port: Some(9091),
+            ..MvmConfig::default()
+        };
 
         let text = toml::to_string_pretty(&cfg).unwrap();
         let parsed: MvmConfig = toml::from_str(&text).unwrap();
@@ -189,9 +191,11 @@ mod tests {
     #[test]
     fn test_save_and_load_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
-        let mut cfg = MvmConfig::default();
-        cfg.lima_cpus = 6;
-        cfg.default_memory_mib = 1024;
+        let cfg = MvmConfig {
+            lima_cpus: 6,
+            default_memory_mib: 1024,
+            ..MvmConfig::default()
+        };
         save(&cfg, Some(tmp.path())).unwrap();
 
         let loaded = load(Some(tmp.path()));

@@ -5885,8 +5885,10 @@ edition = "2024"
     #[test]
     fn test_run_uses_config_default_cpus() {
         // When --cpus is omitted, the config default should be applied.
-        let mut cfg = mvm_core::user_config::MvmConfig::default();
-        cfg.default_cpus = 4;
+        let cfg = mvm_core::user_config::MvmConfig {
+            default_cpus: 4,
+            ..mvm_core::user_config::MvmConfig::default()
+        };
 
         // Simulate the resolution logic from the Commands::Run dispatch.
         let cli_cpus: Option<u32> = None;
@@ -5897,8 +5899,10 @@ edition = "2024"
     #[test]
     fn test_run_cli_flag_overrides_config_cpus() {
         // When --cpus is provided, it takes precedence over config.
-        let mut cfg = mvm_core::user_config::MvmConfig::default();
-        cfg.default_cpus = 4;
+        let cfg = mvm_core::user_config::MvmConfig {
+            default_cpus: 4,
+            ..mvm_core::user_config::MvmConfig::default()
+        };
 
         let cli_cpus: Option<u32> = Some(8);
         let effective = cli_cpus.or(Some(cfg.default_cpus));
@@ -5907,8 +5911,10 @@ edition = "2024"
 
     #[test]
     fn test_run_uses_config_default_memory() {
-        let mut cfg = mvm_core::user_config::MvmConfig::default();
-        cfg.default_memory_mib = 2048;
+        let cfg = mvm_core::user_config::MvmConfig {
+            default_memory_mib: 2048,
+            ..mvm_core::user_config::MvmConfig::default()
+        };
 
         let cli_memory: Option<u32> = None;
         let effective = cli_memory.or(Some(cfg.default_memory_mib));
@@ -5917,8 +5923,10 @@ edition = "2024"
 
     #[test]
     fn test_run_cli_flag_overrides_config_memory() {
-        let mut cfg = mvm_core::user_config::MvmConfig::default();
-        cfg.default_memory_mib = 2048;
+        let cfg = mvm_core::user_config::MvmConfig {
+            default_memory_mib: 2048,
+            ..mvm_core::user_config::MvmConfig::default()
+        };
 
         let cli_memory: Option<u32> = Some(512);
         let effective = cli_memory.or(Some(cfg.default_memory_mib));

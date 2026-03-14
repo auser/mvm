@@ -131,8 +131,10 @@ mod tests {
         // Give the watcher time to register before writing.
         std::thread::sleep(Duration::from_millis(200));
 
-        let mut updated = MvmConfig::default();
-        updated.lima_cpus = 4;
+        let updated = MvmConfig {
+            lima_cpus: 4,
+            ..MvmConfig::default()
+        };
         write_config(&config_path, &updated);
 
         // Wait up to 3 s for the reload event.
@@ -199,8 +201,10 @@ mod tests {
         let (tx, rx) = mpsc::channel();
         let mut cfg = MvmConfig::default();
 
-        let mut new_cfg = MvmConfig::default();
-        new_cfg.lima_cpus = 12;
+        let new_cfg = MvmConfig {
+            lima_cpus: 12,
+            ..MvmConfig::default()
+        };
         tx.send(ConfigReloadEvent::Reloaded(new_cfg)).unwrap();
 
         cfg = apply_pending_reloads(cfg, &rx);
@@ -210,8 +214,10 @@ mod tests {
     #[test]
     fn test_apply_pending_reloads_keeps_cfg_on_error() {
         let (tx, rx) = mpsc::channel();
-        let mut cfg = MvmConfig::default();
-        cfg.lima_cpus = 6;
+        let mut cfg = MvmConfig {
+            lima_cpus: 6,
+            ..MvmConfig::default()
+        };
 
         tx.send(ConfigReloadEvent::ParseError("bad toml".to_string()))
             .unwrap();
