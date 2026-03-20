@@ -151,6 +151,9 @@ enum Commands {
         /// Reload ~/.mvm/config.toml automatically when it changes
         #[arg(long)]
         watch_config: bool,
+        /// Force Lima backend even on macOS 26+ (where Apple Container is default)
+        #[arg(long)]
+        lima: bool,
     },
     /// Stop a running microVM (by name) or all VMs (--all)
     Stop {
@@ -827,6 +830,7 @@ pub fn run() -> Result<()> {
             project,
             metrics_port,
             watch_config,
+            lima,
         } => {
             let effective_cpus = if lima_cpus == 8 {
                 cfg.lima_cpus
@@ -838,6 +842,16 @@ pub fn run() -> Result<()> {
             } else {
                 lima_mem
             };
+
+            // On macOS 26+ without --lima, inform about Apple Container dev mode
+            if !lima && mvm_core::platform::current().has_apple_containers() {
+                ui::info(
+                    "Apple Containers available. Dev shell via Apple Container \
+                     is not yet implemented.\n\
+                     Falling back to Lima. Use '--lima' to suppress this message.",
+                );
+            }
+
             cmd_dev(
                 effective_cpus,
                 effective_mem,
@@ -2715,10 +2729,12 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
     let vm_name_owned = vm_name.clone();
     let has_ports = !port_mappings.is_empty();
 
-    // If a template snapshot exists, restore from it instead of cold-booting.
-    // Snapshot restore requires Firecracker-specific FlakeRunConfig directly.
+    // If a template snapshot exists AND the backend supports snapshots,
+    // restore from it instead of cold-booting.
+    let backend = AnyBackend::from_hypervisor(hypervisor);
     if let Some(ref snap_info) = snapshot_info
         && let Some(tmpl) = template_name
+        && backend.capabilities().snapshots
     {
         let slot = microvm::allocate_slot(&vm_name)?;
         let run_config = microvm::FlakeRunConfig {
@@ -2762,7 +2778,6 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
             port_mappings: &port_mappings,
         }
         .into_start_config();
-        let backend = AnyBackend::from_hypervisor(hypervisor);
         backend.start(&start_config)?;
     }
 

@@ -255,7 +255,19 @@ pub fn build(
         }
         Ok(())
     } else if snapshot {
-        tmpl::template_build_with_snapshot(name, force, update_hash)
+        // Check if the current backend supports snapshots.
+        // Snapshots are Firecracker-specific; Apple Container and Docker
+        // backends only support image-only templates.
+        let backend = mvm_runtime::vm::backend::AnyBackend::auto_select();
+        if backend.capabilities().snapshots {
+            tmpl::template_build_with_snapshot(name, force, update_hash)
+        } else {
+            crate::ui::warn(&format!(
+                "Backend '{}' does not support snapshots. Building image-only template.",
+                backend.name()
+            ));
+            tmpl::template_build(name, force, update_hash)
+        }
     } else {
         tmpl::template_build(name, force, update_hash)
     }

@@ -96,6 +96,15 @@ fn test_dev_help() {
 }
 
 #[test]
+fn test_dev_help_shows_lima_flag() {
+    mvm()
+        .args(["dev", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--lima"));
+}
+
+#[test]
 fn test_update_help() {
     mvm()
         .args(["update", "--help"])
@@ -248,7 +257,8 @@ fn test_run_help_shows_flags() {
         .stdout(predicate::str::contains("--name"))
         .stdout(predicate::str::contains("--profile"))
         .stdout(predicate::str::contains("--cpus"))
-        .stdout(predicate::str::contains("--memory"));
+        .stdout(predicate::str::contains("--memory"))
+        .stdout(predicate::str::contains("apple-container"));
 }
 
 #[test]
