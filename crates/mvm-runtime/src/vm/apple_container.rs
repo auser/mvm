@@ -42,7 +42,15 @@ pub struct AppleContainerBackend;
 impl AppleContainerBackend {
     /// Check whether the Apple Containerization framework is available
     /// at runtime (macOS 26+ on Apple Silicon).
+    ///
+    /// Uses the Swift FFI bridge when available, falls back to platform
+    /// detection otherwise.
     pub fn is_platform_available() -> bool {
+        // Try the Swift bridge first (most accurate — checks actual framework)
+        if mvm_apple_container::is_available() {
+            return true;
+        }
+        // Fall back to platform detection (works without Swift bridge)
         mvm_core::platform::current().has_apple_containers()
     }
 }
@@ -69,43 +77,72 @@ impl VmBackend for AppleContainerBackend {
             );
         }
 
-        // TODO: Wire to swift-bridge FFI when mvm-apple-container crate is ready.
-        // The flow will be:
-        //   1. ContainerManager::new(kernel, network)
-        //   2. manager.create(id, rootfs, cpus, memory)
-        //   3. container.create()
-        //   4. container.start()
+        let kernel_path = config.kernel_path.as_deref().unwrap_or_default();
+        if kernel_path.is_empty() {
+            anyhow::bail!(
+                "Apple Container backend requires a kernel path.\n\
+                 Build with 'mvmctl build --flake .' first."
+            );
+        }
+
         ui::info(&format!(
             "Starting Apple Container '{}' (cpus={}, mem={}MiB)...",
             config.name, config.cpus, config.memory_mib
         ));
 
-        anyhow::bail!(
-            "Apple Container backend is not yet connected to the Swift FFI bridge.\n\
-             The Rust-side architecture is complete — the swift-bridge integration\n\
-             will be added when macOS 26 and Xcode 26 are available.\n\
-             Use '--hypervisor firecracker' for now."
+        mvm_apple_container::start(
+            &config.name,
+            kernel_path,
+            &config.rootfs_path,
+            config.cpus,
+            config.memory_mib as u64,
         )
+        .map_err(|e| anyhow::anyhow!("Apple Container start failed: {e}"))?;
+
+        ui::success(&format!("Apple Container '{}' started.", config.name));
+        Ok(VmId(config.name.clone()))
     }
 
     fn stop(&self, id: &VmId) -> Result<()> {
-        anyhow::bail!("Apple Container stop not yet implemented for VM '{}'", id.0)
+        mvm_apple_container::stop(&id.0)
+            .map_err(|e| anyhow::anyhow!("Apple Container stop failed: {e}"))
     }
 
     fn stop_all(&self) -> Result<()> {
-        // No containers to stop if we can't start any yet
+        let ids = mvm_apple_container::list_ids();
+        for id in &ids {
+            if let Err(e) = mvm_apple_container::stop(id) {
+                tracing::warn!("Failed to stop container '{id}': {e}");
+            }
+        }
         Ok(())
     }
 
     fn status(&self, id: &VmId) -> Result<VmStatus> {
-        // No running containers in stub mode
-        let _ = id;
-        Ok(VmStatus::Stopped)
+        let ids = mvm_apple_container::list_ids();
+        if ids.contains(&id.0) {
+            Ok(VmStatus::Running)
+        } else {
+            Ok(VmStatus::Stopped)
+        }
     }
 
     fn list(&self) -> Result<Vec<VmInfo>> {
-        // No running containers in stub mode
-        Ok(vec![])
+        let ids = mvm_apple_container::list_ids();
+        Ok(ids
+            .into_iter()
+            .map(|id| VmInfo {
+                id: VmId(id.clone()),
+                name: id,
+                status: VmStatus::Running,
+                guest_ip: None,
+                cpus: 0,
+                memory_mib: 0,
+                profile: None,
+                revision: None,
+                flake_ref: None,
+            })
+            .collect())
     }
 
     fn logs(&self, id: &VmId, _lines: u32, _hypervisor: bool) -> Result<String> {

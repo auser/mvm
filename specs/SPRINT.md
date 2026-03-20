@@ -13,7 +13,7 @@ production backend on Linux.
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 6 + root facade + xtask  |
-| Total tests      | 878+                     |
+| Total tests      | 880+                     |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | MSRV             | 1.85                     |
@@ -147,12 +147,16 @@ cargo clippy --workspace -- -D warnings  # 0 warnings
 - [x] `--hypervisor apple-container` flag in `run` and `up` commands
 - [x] `mvmctl doctor` Apple Container availability check
 
-### 1d. Swift FFI bridge (deferred)
+### 1d. Swift FFI bridge ✓
 
-- [ ] `mvm-apple-container` Swift package + `swift-bridge` crate
-- [ ] FFI: `create_container()`, `start_container()`, `stop_container()`
-- [ ] Boot test: validate Nix ext4 rootfs via Apple Containerization framework
-- [ ] Requires macOS 26 + Xcode 26 (not yet GA)
+- [x] `mvm-apple-container` crate with C FFI (`@_cdecl`) to Swift static library
+- [x] Swift package wrapping Apple Containerization framework
+- [x] `build.rs`: auto-builds Swift, links static lib + system frameworks + rpath
+- [x] `#[cfg(apple_container_stub)]` — no-op on non-macOS platforms
+- [x] FFI lifecycle: `start()`, `stop()`, `list_ids()` wired end-to-end
+- [x] `AppleContainerBackend::start/stop/list/status` use live FFI
+- [x] Swift bridge: `ContainerManager` + `VmnetNetwork` + local ext4 `Mount.block()`
+- [ ] Boot test: validate Nix ext4 rootfs in Apple Container (needs built kernel + rootfs)
 
 ### Verification ✓
 

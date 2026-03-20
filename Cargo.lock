@@ -1459,6 +1459,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-apple-container"
+version = "0.6.0"
+dependencies = [
+ "anyhow",
+ "cc",
+ "serde_json",
+ "tracing",
+]
+
+[[package]]
 name = "mvm-build"
 version = "0.6.0"
 dependencies = [
@@ -1553,6 +1563,7 @@ dependencies = [
  "ed25519-dalek",
  "indicatif",
  "inquire",
+ "mvm-apple-container",
  "mvm-build",
  "mvm-core",
  "mvm-guest",

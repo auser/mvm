@@ -24,6 +24,7 @@ fn no_unwrap_in_production_code() {
             r"\.unwrap()",
             "--include=*.rs",
             "--exclude-dir=tests",
+            "--exclude-dir=.build",
         ])
         .arg(crates_dir.to_str().expect("crates dir must be UTF-8"))
         .output()
@@ -121,7 +122,12 @@ fn no_stale_binary_name_in_user_facing_strings() {
     ];
 
     let output = Command::new("grep")
-        .args(["-rn", "--include=*.rs", "--exclude-dir=tests"])
+        .args([
+            "-rn",
+            "--include=*.rs",
+            "--exclude-dir=tests",
+            "--exclude-dir=.build",
+        ])
         .arg(
             patterns
                 .iter()

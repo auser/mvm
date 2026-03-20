@@ -1,0 +1,16 @@
+[package]
+name = "mvm-apple-container"
+version = "0.6.0"
+edition = "2024"
+description = "Apple Containerization framework bridge for mvm"
+license = "Apache-2.0"
+# Only builds on macOS with Apple Silicon
+# On other platforms, this crate compiles as a no-op stub
+
+[dependencies]
+anyhow = "1"
+serde_json = "1"
+tracing = "0.1"
+
+[build-dependencies]
+cc = "1"
