@@ -3477,10 +3477,13 @@ fn cmd_flake_check(flake: &str, json: bool) -> Result<()> {
 }
 
 fn cmd_audit_tail(lines: usize, follow: bool) -> Result<()> {
-    let path = std::path::Path::new(mvm_core::audit::DEFAULT_AUDIT_LOG);
+    let log_path = mvm_core::audit::default_audit_log();
+    let path = std::path::Path::new(&log_path);
 
     if !path.exists() {
-        ui::info("No audit log found. Events are recorded at /var/log/mvm/audit.jsonl.");
+        ui::info(&format!(
+            "No audit log found. Events are recorded at {log_path}."
+        ));
         return Ok(());
     }
 
