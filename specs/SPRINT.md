@@ -13,7 +13,7 @@ production backend on Linux.
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 6 + root facade + xtask  |
-| Total tests      | 866+                     |
+| Total tests      | 877+                     |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | MSRV             | 1.85                     |
@@ -124,27 +124,44 @@ cargo clippy --workspace -- -D warnings  # 0 warnings
 
 ## Phase 1: Apple Container Backend
 
-### 1a. `mvm-apple-container` crate
+### 1a. Platform detection ✓
 
-- [ ] Swift package importing Containerization framework
-- [ ] `swift-bridge` build integration
-- [ ] FFI: `is_available()`, `create_container()`, `start_container()`, `stop_container()`, `exec_shell()`
-- [ ] `#[cfg(target_os = "macos")]` conditional compilation
-- [ ] Boot test: validate Nix ext4 rootfs in Apple Container via `cctl`
+- [x] `has_apple_containers()` in `platform.rs` (macOS 26+ on Apple Silicon)
+- [x] `is_macos_26_or_later()` via `sw_vers` runtime check
+- [x] Tests for platform detection on all platforms
 
-### 1b. `AppleContainerBackend`
+### 1b. `AppleContainerBackend` ✓
 
-- [ ] Implements `VmBackend` with capabilities (vsock=true, snapshots=false)
-- [ ] Direct ext4 mount via `VZDiskImageStorageDeviceAttachment`
-- [ ] `guest_channel()` → vsock to guest agent
-- [ ] `network_info()` → vmnet subnet
+- [x] `apple_container.rs` in mvm-runtime with full `VmBackend` impl
+- [x] Capabilities: vsock=true, snapshots=false, pause_resume=false
+- [x] Stub lifecycle methods with clear error messages
+- [x] `network_info()` and `guest_channel_info()` stubs (vsock:1024 for vminitd)
+- [x] Tests for backend name, capabilities, list, stop_all, status
 
-### 1c. Wire into CLI
+### 1c. Wire into CLI ✓
 
-- [ ] `AppleContainer` variant in `AnyBackend`
-- [ ] `--hypervisor apple-container` flag
-- [ ] Platform detection: `has_apple_containers()` in `platform.rs`
-- [ ] Auto-select on macOS 26+
+- [x] `AppleContainer` variant in `AnyBackend` enum
+- [x] `AnyBackend::inner()` dispatch helper (eliminates per-method match repetition)
+- [x] `from_hypervisor("apple-container")` selection
+- [x] `auto_select()` — prefers Apple Container on macOS 26+
+- [x] `--hypervisor apple-container` flag in `run` and `up` commands
+- [x] `mvmctl doctor` Apple Container availability check
+
+### 1d. Swift FFI bridge (deferred)
+
+- [ ] `mvm-apple-container` Swift package + `swift-bridge` crate
+- [ ] FFI: `create_container()`, `start_container()`, `stop_container()`
+- [ ] Boot test: validate Nix ext4 rootfs via Apple Containerization framework
+- [ ] Requires macOS 26 + Xcode 26 (not yet GA)
+
+### Verification ✓
+
+```bash
+cargo test --workspace   # 877 tests, 0 failures
+cargo clippy --workspace -- -D warnings  # 0 warnings
+mvmctl run --hypervisor apple-container  # recognizes flag, returns clear "not yet connected" error
+mvmctl doctor  # shows Apple Container availability status
+```
 
 ---
 

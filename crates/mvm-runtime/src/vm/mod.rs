@@ -1,4 +1,5 @@
 // Dev mode
+pub mod apple_container;
 pub mod backend;
 pub mod firecracker;
 pub mod image;

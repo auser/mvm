@@ -34,6 +34,53 @@ impl Platform {
     pub fn supports_native_runner(self) -> bool {
         matches!(self, Platform::LinuxNative)
     }
+
+    /// Whether Apple Containers are available on this platform.
+    ///
+    /// Requires macOS 26+ on Apple Silicon. Returns `false` on all
+    /// other platforms. Detection checks:
+    /// 1. Running on macOS (compile-time)
+    /// 2. Apple Silicon (ARM64 architecture, compile-time)
+    /// 3. macOS 26+ (runtime version check)
+    pub fn has_apple_containers(self) -> bool {
+        if !matches!(self, Platform::MacOS) {
+            return false;
+        }
+        is_macos_26_or_later()
+    }
+}
+
+/// Check whether the current macOS version is 26.0 or later.
+///
+/// On non-macOS platforms this always returns `false`.
+fn is_macos_26_or_later() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // Apple Silicon check (compile-time)
+        if cfg!(not(target_arch = "aarch64")) {
+            return false;
+        }
+        // Runtime version check via sysctl
+        macos_major_version() >= 26
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Read the macOS major version number via sysctl.
+#[cfg(target_os = "macos")]
+fn macos_major_version() -> u32 {
+    use std::process::Command;
+    Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|v| v.trim().split('.').next().map(String::from))
+        .and_then(|major| major.parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 impl std::fmt::Display for Platform {
@@ -115,5 +162,21 @@ mod tests {
         let _ = p.needs_lima();
         let _ = p.has_kvm();
         let _ = p.supports_native_runner();
+        let _ = p.has_apple_containers();
+    }
+
+    #[test]
+    fn test_has_apple_containers_linux() {
+        // Linux platforms never have Apple Containers
+        assert!(!Platform::LinuxNative.has_apple_containers());
+        assert!(!Platform::LinuxNoKvm.has_apple_containers());
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn test_macos_major_version_is_reasonable() {
+        let version = macos_major_version();
+        // macOS versions: 10.x, 11-15, 26+ (Apple's new numbering)
+        assert!(version >= 10, "macOS version {version} seems too low");
     }
 }

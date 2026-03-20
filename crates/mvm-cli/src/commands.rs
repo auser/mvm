@@ -332,7 +332,7 @@ enum Commands {
         /// Volume (host_dir:/guest/path or host:/guest/path:size). Repeatable.
         #[arg(long, short = 'v', value_parser = clap_volume_spec)]
         volume: Vec<String>,
-        /// Hypervisor backend (firecracker, qemu). Default: firecracker.
+        /// Hypervisor backend (firecracker, qemu, apple-container). Default: firecracker.
         #[arg(long, default_value = "firecracker")]
         hypervisor: String,
         /// Port mapping (format: HOST:GUEST or PORT). Repeatable.
@@ -373,7 +373,7 @@ enum Commands {
         /// Memory (supports human-readable sizes: 512M, 4G, 1024K, or plain MB)
         #[arg(long)]
         memory: Option<String>,
-        /// Hypervisor backend (firecracker, qemu). Default: firecracker.
+        /// Hypervisor backend (firecracker, qemu, apple-container). Default: firecracker.
         #[arg(long, default_value = "firecracker")]
         hypervisor: String,
     },
