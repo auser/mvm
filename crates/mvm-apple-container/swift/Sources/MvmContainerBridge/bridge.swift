@@ -1,31 +1,67 @@
 // Swift bridge for Apple Containerization framework.
 //
 // Exports C-compatible functions that Rust calls via FFI.
-// Each function runs the async Containerization API synchronously
-// by blocking on a semaphore — this is intentional since the Rust
-// caller is already on a blocking thread.
+//
+// Virtualization.framework requires a running RunLoop on the main
+// thread. The init function starts a dedicated thread with a RunLoop,
+// and all container operations are dispatched to MainActor to ensure
+// they execute on that RunLoop.
 
 import Foundation
 import Containerization
 
+// MARK: - Runtime initialization
+
+/// Initialize the Swift/macOS runtime for Virtualization.framework.
+///
+/// Must be called once before any container operations. Starts a
+/// CFRunLoop on a dedicated thread so Virtualization.framework has
+/// a functioning event loop.
+@_cdecl("mvm_apple_container_init_runtime")
+public func initRuntime() {
+    // Start the main RunLoop on a background thread.
+    // Virtualization.framework needs CFRunLoop to be running for
+    // hardware event handling (VM lifecycle, vsock, etc).
+    let thread = Thread {
+        // Add a dummy source so the RunLoop doesn't exit immediately
+        let source = CFRunLoopSourceCreate(nil, 0, nil)
+        CFRunLoopAddSource(CFRunLoopGetCurrent(), source, .defaultMode)
+        CFRunLoopRun()
+    }
+    thread.name = "mvm-runloop"
+    thread.start()
+
+    // Give the RunLoop a moment to start
+    Thread.sleep(forTimeInterval: 0.01)
+}
+
 // MARK: - Helpers
 
-/// Run an async closure synchronously by blocking on a semaphore.
-/// The `nonisolated(unsafe)` is intentional — we control access via the semaphore.
+/// Run an async @MainActor closure synchronously by blocking on a semaphore.
+///
+/// All Virtualization.framework calls must happen on MainActor (which
+/// uses the main dispatch queue / RunLoop). We block the calling thread
+/// until the async work completes.
+/// Thread-safe box for passing errors across concurrency boundaries.
+final class ErrorBox: @unchecked Sendable {
+    var error: (any Error)?
+}
+
 func runBlocking(_ body: @Sendable @escaping () async throws -> Void) throws {
     let semaphore = DispatchSemaphore(value: 0)
-    nonisolated(unsafe) var caughtError: (any Error)?
-    Task { @Sendable in
+    let errorBox = ErrorBox()
+
+    Task {
         do {
             try await body()
         } catch {
-            caughtError = error
+            errorBox.error = error
         }
         semaphore.signal()
     }
     semaphore.wait()
-    if let caughtError {
-        throw caughtError
+    if let error = errorBox.error {
+        throw error
     }
 }
 
@@ -89,7 +125,6 @@ public func startContainer(
         return strdup("Apple Containers require macOS 26+")
     }
 
-    // Copy values for @Sendable closure capture
     let cpuCount = Int(cpus)
     let memBytes = memoryMiB * 1024 * 1024
 
@@ -103,14 +138,13 @@ public func startContainer(
             let network = try ContainerManager.VmnetNetwork()
 
             // Use the rootfs as the initfs — our Nix-built rootfs has /init.
-            // This avoids needing to pull the vminit OCI image.
             let initfs = Mount.block(
                 format: "ext4",
                 source: rootfsPath,
                 destination: "/"
             )
 
-            // Use a temporary root for the container manager state
+            // Temporary root for container manager state
             let root = FileManager.default.temporaryDirectory
                 .appendingPathComponent("mvm-containers")
             try FileManager.default.createDirectory(
@@ -125,9 +159,7 @@ public func startContainer(
                 rosetta: false
             )
 
-            // Create the container using a minimal base image.
-            // Our Nix rootfs is mounted as an additional block device
-            // that overrides the root filesystem via /init.
+            // Mount our Nix rootfs as the container filesystem
             let rootfs = Mount.block(
                 format: "ext4",
                 source: rootfsPath,
@@ -159,8 +191,6 @@ public func startContainer(
 }
 
 /// Stop a running container and clean up.
-///
-/// Returns "" on success or an error message on failure.
 @_cdecl("mvm_apple_container_stop")
 public func stopContainer(_ idPtr: UnsafePointer<CChar>) -> UnsafeMutablePointer<CChar>? {
     let id = String(cString: idPtr)

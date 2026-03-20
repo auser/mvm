@@ -147,16 +147,15 @@ cargo clippy --workspace -- -D warnings  # 0 warnings
 - [x] `--hypervisor apple-container` flag in `run` and `up` commands
 - [x] `mvmctl doctor` Apple Container availability check
 
-### 1d. Swift FFI bridge ✓
+### 1d. Apple Container via XPC ✓
 
-- [x] `mvm-apple-container` crate with C FFI (`@_cdecl`) to Swift static library
-- [x] Swift package wrapping Apple Containerization framework
-- [x] `build.rs`: auto-builds Swift, links static lib + system frameworks + rpath
-- [x] `#[cfg(apple_container_stub)]` — no-op on non-macOS platforms
-- [x] FFI lifecycle: `start()`, `stop()`, `list_ids()` wired end-to-end
-- [x] `AppleContainerBackend::start/stop/list/status` use live FFI
-- [x] Swift bridge: `ContainerManager` + `VmnetNetwork` + local ext4 `Mount.block()`
-- [x] Boot test: FFI chain validated end-to-end (vmnet returns permission error as expected — needs entitlement for full boot)
+- [x] Replaced custom Swift FFI bridge with `apple-container` crate (pure Rust, XPC)
+- [x] XPC client talks directly to `com.apple.container.apiserver` daemon
+- [x] No Swift compilation, no entitlement issues, no RunLoop problems
+- [x] `start()` → create ContainerConfiguration + get_default_kernel + bootstrap
+- [x] `stop()`, `list_ids()` via XPC
+- [x] `#[cfg(target_os = "macos")]` — compiles as no-op on non-macOS
+- [x] Boot test: XPC connection works, daemon responds (needs kernel pull for full boot)
 
 ### Verification ✓
 
