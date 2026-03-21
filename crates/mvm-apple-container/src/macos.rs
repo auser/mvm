@@ -75,6 +75,58 @@ fn read_persisted_vm_ids() -> Vec<String> {
     ids
 }
 
+/// Ensure the running binary has the virtualization entitlement.
+/// If not, sign it ad-hoc and re-exec the process.
+pub fn ensure_signed() {
+    let exe = match std::env::current_exe() {
+        Ok(e) => e,
+        Err(_) => return,
+    };
+    let exe_str = exe.to_str().unwrap_or("");
+
+    // Check if already signed with the required entitlement
+    if let Ok(output) = std::process::Command::new("codesign")
+        .args(["-d", "--entitlements", "-", "--xml", exe_str])
+        .output()
+        && output.status.success()
+        && String::from_utf8_lossy(&output.stdout).contains("com.apple.security.virtualization")
+    {
+        return;
+    }
+
+    tracing::info!("Signing binary with virtualization entitlement...");
+    let ent = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+        <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+        \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+        <plist version=\"1.0\"><dict>\n\
+        <key>com.apple.security.virtualization</key><true/>\n\
+        </dict></plist>";
+
+    let ent_path = std::env::temp_dir().join("mvm-entitlements.plist");
+    if std::fs::write(&ent_path, ent).is_err() {
+        return;
+    }
+
+    let ok = std::process::Command::new("codesign")
+        .args(["--sign", "-", "--force", "--entitlements"])
+        .arg(&ent_path)
+        .arg(exe_str)
+        .output()
+        .map(|o| o.status.success())
+        .unwrap_or(false);
+
+    let _ = std::fs::remove_file(&ent_path);
+
+    if ok {
+        use std::os::unix::process::CommandExt;
+        let err = std::process::Command::new(&exe)
+            .args(std::env::args_os().skip(1))
+            .exec();
+        tracing::error!("Re-exec after signing failed: {err}");
+        std::process::exit(1);
+    }
+}
+
 fn nsurl(path: &str) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(path))
 }
@@ -86,6 +138,8 @@ pub fn start_vm(
     cpus: u32,
     memory_mib: u64,
 ) -> Result<(), String> {
+    ensure_signed();
+
     if !Path::new(kernel_path).exists() {
         return Err(format!("Kernel not found: {kernel_path}"));
     }
