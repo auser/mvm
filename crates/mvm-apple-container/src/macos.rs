@@ -78,6 +78,11 @@ fn read_persisted_vm_ids() -> Vec<String> {
 /// Ensure the running binary has the virtualization entitlement.
 /// If not, sign it ad-hoc and re-exec the process.
 pub fn ensure_signed() {
+    // Skip if already verified (e.g., spawned daemon child)
+    if std::env::var("MVM_SIGNED").as_deref() == Ok("1") {
+        return;
+    }
+
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return,
@@ -121,6 +126,7 @@ pub fn ensure_signed() {
         use std::os::unix::process::CommandExt;
         let err = std::process::Command::new(&exe)
             .args(std::env::args_os().skip(1))
+            .env("MVM_SIGNED", "1")
             .exec();
         tracing::error!("Re-exec after signing failed: {err}");
         std::process::exit(1);
