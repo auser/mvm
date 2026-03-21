@@ -386,11 +386,8 @@
 
             cacertPaths = pkgs.lib.optionals (cacert != null) [ cacert ];
 
-            rootfs = pkgs.callPackage
-              (nixpkgs + "/nixos/lib/make-ext4-fs.nix") {
-              storePaths = [ initScript mvm-guest-agent ] ++ cacertPaths ++ packages;
-              volumeLabel = "mvm";
-              populateImageCommands = ''
+            # Shared populate commands for both ext4 and OCI rootfs.
+            populateCommands = ''
                 mkdir -p ./files/dev ./files/proc ./files/sys
                 mkdir -p ./files/bin ./files/sbin
                 mkdir -p ./files/etc/mvm/integrations.d
@@ -407,12 +404,48 @@
                 ln -s ${cacert}/etc/ssl/certs/ca-bundle.crt ./files/etc/ssl/certs/ca-certificates.crt
                 ln -s ${cacert}/etc/ssl/certs/ca-bundle.crt ./files/etc/pki/tls/certs/ca-bundle.crt
               '';
+
+            # ext4 rootfs for Firecracker (production).
+            rootfs = pkgs.callPackage
+              (nixpkgs + "/nixos/lib/make-ext4-fs.nix") {
+              storePaths = [ initScript mvm-guest-agent ] ++ cacertPaths ++ packages;
+              volumeLabel = "mvm";
+              populateImageCommands = populateCommands;
+            };
+
+            # OCI image for Apple Container (dev on macOS 26+).
+            # Same Nix closure, different packaging format.
+            # Uses streamLayeredImage (no runAsRoot, no KVM needed).
+            ociImage = pkgs.dockerTools.streamLayeredImage {
+              inherit name;
+              tag = "latest";
+              contents = [ mvm-guest-agent busybox ] ++ cacertPaths ++ packages;
+              fakeRootCommands = ''
+                mkdir -p ./dev ./proc ./sys ./tmp ./run
+                mkdir -p ./var/lib ./var/run ./var/log
+                mkdir -p ./bin ./sbin ./root ./home
+                mkdir -p ./etc/mvm/integrations.d
+                mkdir -p ./mnt/config ./mnt/secrets ./mnt/data
+                ln -sf ${initScript} ./init
+                ln -sf /init ./sbin/vminitd
+                ln -sf ${busybox}/bin/sh ./bin/sh
+              '' + pkgs.lib.optionalString (cacert != null) ''
+                mkdir -p ./etc/ssl/certs ./etc/pki/tls/certs
+                ln -sf ${cacert}/etc/ssl/certs/ca-bundle.crt ./etc/ssl/certs/ca-bundle.crt
+                ln -sf ${cacert}/etc/ssl/certs/ca-bundle.crt ./etc/ssl/certs/ca-certificates.crt
+                ln -sf ${cacert}/etc/ssl/certs/ca-bundle.crt ./etc/pki/tls/certs/ca-bundle.crt
+              '';
+              config = {
+                Cmd = [ "/init" ];
+                WorkingDir = "/";
+              };
             };
           in
           pkgs.runCommand "mvm-${name}" {} ''
             mkdir -p $out
             ${copyKernel firecrackerKernel}
             cp "${rootfs}" "$out/rootfs.ext4"
+            ${ociImage} > "$out/image.tar.gz"
           '';
 
         packages.mvm-guest-agent = mvm-guest-agent;
