@@ -86,7 +86,8 @@ pub fn start(
                 .await
                 .map_err(|e| format!("create: {e}"))?;
 
-            // Bootstrap (start) the container with /dev/null for stdio
+            // Bootstrap (start) the container with /dev/null for stdio.
+            // The container runs as a background VM — init stays as PID 1.
             let devnull = std::fs::File::open("/dev/null").map_err(|e| e.to_string())?;
             use std::os::fd::AsRawFd;
             let fd = devnull.as_raw_fd();
@@ -94,6 +95,19 @@ pub fn start(
                 .bootstrap(id, fd, fd, fd)
                 .await
                 .map_err(|e| format!("bootstrap: {e}"))?;
+
+            // Brief wait for the daemon to register the container as running
+            tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+
+            // Verify the container is actually running
+            match client.get(id).await {
+                Ok(snapshot) => {
+                    tracing::info!("Container '{}' status: {:?}", id, snapshot.status);
+                }
+                Err(e) => {
+                    tracing::warn!("Container '{}' not found after bootstrap: {e}", id);
+                }
+            }
 
             Ok(())
         })
