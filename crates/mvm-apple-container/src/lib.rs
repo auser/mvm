@@ -53,13 +53,16 @@ pub fn start(
             }))
             .map_err(|e| format!("kernel json: {e}"))?;
 
-            // Build container configuration
+            // Build container configuration.
+            //
+            // Apple Container's framework hardcodes `init=/sbin/vminitd`
+            // in the kernel command line. Our Nix rootfs includes a
+            // symlink `/sbin/vminitd → /init` so the kernel boots
+            // directly into our init script — no OCI image, no vminitd,
+            // sub-second startup, same as Firecracker.
             let config = ContainerConfiguration {
                 id: id.to_string(),
-                image: ImageDescription {
-                    reference: "docker.io/library/alpine:3.16".to_string(),
-                    ..Default::default()
-                },
+                image: ImageDescription::default(),
                 mounts: vec![Filesystem {
                     source: rootfs_path.to_string(),
                     destination: "/".to_string(),
@@ -68,7 +71,7 @@ pub fn start(
                 published_ports: vec![],
                 labels: Default::default(),
                 init_process: ProcessConfiguration {
-                    executable: "/init".to_string(),
+                    executable: "/sbin/vminitd".to_string(),
                     arguments: vec![],
                     environment: vec![],
                     working_directory: "/".to_string(),

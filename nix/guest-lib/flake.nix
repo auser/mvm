@@ -398,6 +398,7 @@
                 mkdir -p ./files/root ./files/home
                 mkdir -p ./files/mnt/config ./files/mnt/secrets ./files/mnt/data
                 ln -s ${initScript} ./files/init
+                ln -s /init ./files/sbin/vminitd
                 ln -s ${busybox}/bin/sh ./files/bin/sh
               '' + pkgs.lib.optionalString (cacert != null) ''
                 mkdir -p ./files/etc/ssl/certs
