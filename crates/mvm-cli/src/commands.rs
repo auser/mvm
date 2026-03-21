@@ -2117,6 +2117,33 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
     // Apple Virtualization VMs live in-process — the process must stay alive.
     if effective_hypervisor == "apple-container" && !detach {
+        // Discover guest IP and set up port forwarding
+        if has_ports {
+            ui::info("Waiting for guest network (DHCP)...");
+            if let Some(guest_ip) = mvm_apple_container::discover_guest_ip(15) {
+                ui::success(&format!("Guest IP: {guest_ip}"));
+                // Save guest IP to state dir
+                let ip_file = format!(
+                    "{}/.mvm/vms/{}/guest_ip",
+                    std::env::var("HOME").unwrap_or_default(),
+                    vm_name_owned
+                );
+                let _ = std::fs::write(&ip_file, &guest_ip);
+
+                // Start TCP proxy for each declared port
+                let pm_list = parse_port_specs(ports).unwrap_or_default();
+                for pm in &pm_list {
+                    mvm_apple_container::start_port_proxy(pm.host, &guest_ip, pm.guest);
+                    ui::info(&format!(
+                        "Forwarding localhost:{} → {}:{}",
+                        pm.host, guest_ip, pm.guest
+                    ));
+                }
+            } else {
+                ui::warn("Could not discover guest IP — port forwarding unavailable.");
+            }
+        }
+
         ui::info(&format!(
             "VM '{}' running. Press Ctrl+C to stop.",
             vm_name_owned

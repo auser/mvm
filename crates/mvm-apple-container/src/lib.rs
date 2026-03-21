@@ -74,6 +74,31 @@ pub fn install_launchd_direct(
     }
 }
 
+/// Discover the guest's IP address via ARP scanning.
+pub fn discover_guest_ip(timeout_secs: u64) -> Option<String> {
+    #[cfg(target_os = "macos")]
+    {
+        macos::discover_guest_ip(std::time::Duration::from_secs(timeout_secs))
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = timeout_secs;
+        None
+    }
+}
+
+/// Start a TCP proxy from localhost:host_port to guest_ip:guest_port.
+pub fn start_port_proxy(host_port: u16, guest_ip: &str, guest_port: u16) {
+    #[cfg(target_os = "macos")]
+    {
+        macos::start_port_proxy(host_port, guest_ip, guest_port);
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        let _ = (host_port, guest_ip, guest_port);
+    }
+}
+
 /// List running VM IDs.
 pub fn list_ids() -> Vec<String> {
     #[cfg(target_os = "macos")]

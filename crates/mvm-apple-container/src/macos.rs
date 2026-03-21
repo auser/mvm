@@ -242,6 +242,88 @@ pub fn ensure_signed() {
     }
 }
 
+/// Discover the guest's IP by scanning ARP for recent entries on bridge interfaces.
+/// Waits up to `timeout` for a new IP to appear.
+pub fn discover_guest_ip(timeout: Duration) -> Option<String> {
+    let deadline = Instant::now() + timeout;
+    while Instant::now() < deadline {
+        if let Ok(output) = std::process::Command::new("arp").arg("-a").output() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            for line in stdout.lines() {
+                // Look for non-permanent, non-incomplete entries on bridge interfaces
+                if line.contains("bridge")
+                    && !line.contains("permanent")
+                    && !line.contains("incomplete")
+                    && !line.contains("ff:ff:ff:ff")
+                {
+                    // Extract IP: "? (192.168.64.9) at ba:b3:..."
+                    if let Some(start) = line.find('(')
+                        && let Some(end) = line.find(')')
+                    {
+                        let ip = &line[start + 1..end];
+                        // Skip bridge gateway IPs (end in .0 or .1)
+                        if !ip.ends_with(".0") && !ip.ends_with(".1") {
+                            return Some(ip.to_string());
+                        }
+                    }
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+    None
+}
+
+/// Start a TCP proxy that forwards localhost:host_port to guest_ip:guest_port.
+/// Runs in a background thread. Returns immediately.
+pub fn start_port_proxy(host_port: u16, guest_ip: &str, guest_port: u16) {
+    use std::net::{TcpListener, TcpStream};
+
+    let target = format!("{guest_ip}:{guest_port}");
+    let bind = format!("127.0.0.1:{host_port}");
+
+    let listener = match TcpListener::bind(&bind) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("Port proxy bind {bind} failed: {e}");
+            return;
+        }
+    };
+    tracing::info!("Port forwarding: localhost:{host_port} → {target}");
+
+    std::thread::Builder::new()
+        .name(format!("proxy-{host_port}"))
+        .spawn(move || {
+            for stream in listener.incoming().flatten() {
+                let target = target.clone();
+                std::thread::spawn(move || {
+                    let Ok(upstream) = TcpStream::connect(&target) else {
+                        return;
+                    };
+                    let downstream = stream;
+                    let Ok(mut up_read) = upstream.try_clone() else {
+                        return;
+                    };
+                    let Ok(mut down_write) = downstream.try_clone() else {
+                        return;
+                    };
+                    let mut up_write = upstream;
+                    let mut down_read = downstream;
+
+                    let h1 = std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut down_read, &mut up_write);
+                    });
+                    let h2 = std::thread::spawn(move || {
+                        let _ = std::io::copy(&mut up_read, &mut down_write);
+                    });
+                    let _ = h1.join();
+                    let _ = h2.join();
+                });
+            }
+        })
+        .ok();
+}
+
 fn nsurl(path: &str) -> Retained<NSURL> {
     NSURL::fileURLWithPath(&NSString::from_str(path))
 }
