@@ -3,7 +3,7 @@ title: Templates
 description: Build reusable microVM images and share them via a registry.
 ---
 
-Templates are reusable microVM images built from Nix flakes. Build once, run anywhere. Share via an S3-compatible registry.
+Templates are reusable microVM images built from Nix flakes. Build once, run anywhere. Share via an S3-compatible registry. Template snapshots (`--snapshot`) are available on the Firecracker backend only.
 
 ## Scaffold a Template
 
@@ -65,7 +65,7 @@ Build with `--snapshot` to capture a fully booted, healthy VM state. Subsequent 
 mvmctl template build my-service --snapshot
 
 # Every subsequent run auto-detects the snapshot and restores instantly:
-mvmctl run --template my-service --name svc
+mvmctl up --template my-service --name svc
 ```
 
 The snapshot process:
@@ -99,17 +99,17 @@ Run production, staging, and dev instances from the **same template snapshot** w
 
 ```bash
 # Production: real API keys, strict config
-mvmctl run --template my-app --name prod \
+mvmctl up --template my-app --name prod \
     -v ./prod/config:/mnt/config \
     -v ./prod/secrets:/mnt/secrets
 
 # Staging: test API keys, relaxed config
-mvmctl run --template my-app --name staging \
+mvmctl up --template my-app --name staging \
     -v ./staging/config:/mnt/config \
     -v ./staging/secrets:/mnt/secrets
 
 # Dev: no API keys, debug logging enabled
-mvmctl run --template my-app --name dev \
+mvmctl up --template my-app --name dev \
     -v ./dev/config:/mnt/config
 ```
 

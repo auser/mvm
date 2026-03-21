@@ -33,7 +33,7 @@ limactl start mvm
 
 If that fails:
 ```bash
-mvmctl destroy
+mvmctl uninstall
 mvmctl bootstrap
 ```
 
@@ -64,8 +64,8 @@ Snapshot may be corrupted after a Firecracker version change.
 
 **Fix**: Delete the snapshot and cold boot:
 ```bash
-mvmctl snapshot delete <name>
-mvmctl run --template <template> --name <name>
+mvmctl template build <template> --force
+mvmctl up --template <template> --name <name>
 ```
 
 ## Build Issues
@@ -174,8 +174,17 @@ The Firecracker microVM has an **isolated filesystem**. Use `mvmctl shell` to ac
 
 Adjust resources:
 ```bash
-mvmctl destroy
+mvmctl uninstall
 mvmctl dev --lima-cpus 8 --lima-mem 16
+```
+
+### Wrong backend selected
+
+Force a specific backend:
+```bash
+mvmctl up --flake . --hypervisor firecracker
+mvmctl up --flake . --hypervisor apple-container
+mvmctl doctor   # check available backends
 ```
 
 ### Rootfs corrupted

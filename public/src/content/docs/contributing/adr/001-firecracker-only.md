@@ -1,36 +1,46 @@
 ---
-title: "ADR-001: Firecracker-Only Execution"
-description: Architecture Decision Record for using Firecracker as the sole execution engine.
+title: "ADR-001: Multi-Backend VM Execution"
+description: Architecture Decision Record for supporting multiple VM backends with Firecracker as primary.
 ---
 
 ## Status
 
-Accepted
+Accepted (updated Sprint 38 -- expanded from Firecracker-only to multi-backend)
 
 ## Context
 
-mvm needs a VM engine for running isolated workloads. Options considered:
+mvmctl needs VM backends for running isolated workloads across different platforms. Options considered:
 
-1. **Docker/OCI containers** — Widely adopted, large ecosystem
-2. **QEMU/KVM** — Full hardware virtualization, maximum compatibility
-3. **Firecracker** — Purpose-built microVM monitor, minimal attack surface
-4. **Cloud Hypervisor** — Similar to Firecracker, more features
+1. **Docker/OCI containers** -- Widely adopted, large ecosystem
+2. **QEMU/KVM** -- Full hardware virtualization, maximum compatibility
+3. **Firecracker** -- Purpose-built microVM monitor, minimal attack surface
+4. **Apple Virtualization.framework** -- Native macOS 26+ virtualization, sub-second startup
+5. **Cloud Hypervisor** -- Similar to Firecracker, more features
 
 ## Decision
 
-Use Firecracker as the sole engine. No container runtime.
+Use Firecracker as the primary production backend. Add Apple Virtualization.framework as a native macOS development backend. Auto-select the best backend based on platform capabilities (KVM first, then Apple Container, then Lima + Firecracker). No container runtime.
 
 ## Rationale
 
-- **Security**: Firecracker's minimalist design (no BIOS, no USB, no PCI) reduces attack surface to <50K LOC
-- **Performance**: ~125ms cold boot, ~5ms snapshot restore, minimal memory overhead
-- **Snapshot support**: Built-in VM snapshotting enables the sleep/wake lifecycle
-- **Predictable resources**: Each microVM gets dedicated vCPUs and memory, no noisy-neighbor
-- **Multi-tenancy**: Hardware-level isolation via KVM, not namespace isolation
+- **Firecracker**: Minimalist design (<50K LOC), ~125ms cold boot, snapshot support, hardware isolation via KVM
+- **Apple Container**: Sub-second startup on macOS 26+, no Lima overhead, native vsock -- ideal for dev workflows
+- **Auto-selection**: Developers get the best experience on their platform without manual configuration
+- **Same rootfs**: All backends consume the same Nix-built ext4 image -- only the runtime differs
+
+## Backend Selection Order
+
+1. **KVM available** (Linux with `/dev/kvm`) -- Firecracker directly
+2. **macOS 26+** (Apple Silicon) -- Apple Virtualization.framework
+3. **Fallback** (macOS <26, Linux without KVM) -- Lima VM + Firecracker
+
+Override with `--hypervisor firecracker` or `--hypervisor apple-container`.
 
 ## Consequences
 
-- Requires Linux with `/dev/kvm` (macOS uses Lima VM for nested virtualization)
+- Requires Linux with `/dev/kvm` for Firecracker, or macOS 26+ for Apple Container
+- Lima is only needed as a fallback (macOS <26 or Linux without KVM)
 - Guests must use a Linux kernel (no Windows/macOS guests)
-- No OCI image compatibility — uses Nix flakes for image building instead
-- Limited device model — no GPU passthrough, limited disk types
+- No OCI image compatibility -- uses Nix flakes for image building instead
+- Snapshots only available on Firecracker backend
+- Limited device model -- no GPU passthrough, limited disk types

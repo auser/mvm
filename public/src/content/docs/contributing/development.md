@@ -78,22 +78,27 @@ just lint         # Both format check + clippy
 
 ## Architecture Principles
 
+### Multi-Backend
+
+mvmctl supports three backends (Firecracker, Apple Container, Lima + Firecracker). The `VmBackend` trait in `mvm-core` abstracts the lifecycle; `AnyBackend` in `mvm-runtime` dispatches at runtime. Backend auto-selection: KVM first, then Apple Container, then Lima.
+
 ### Host vs. VM
 
-All Linux operations (networking, Firecracker, cgroups) run inside the Lima VM on macOS:
+All Linux operations (networking, Firecracker, cgroups) run inside the Lima VM on macOS <26:
 
 ```rust
-// This runs a bash script inside the Lima VM
+// This runs a bash script inside the Lima VM (or natively on Linux with KVM)
 mvm_runtime::shell::run_in_vm("ip link add br-tenant-1 type bridge")?;
 ```
 
-On native Linux, `run_in_vm` runs directly without Lima.
+On native Linux, `run_in_vm` runs directly without Lima. On macOS 26+, the Apple Container backend handles VM lifecycle natively.
 
 ### Key Patterns
 
 - **Idempotent operations**: every setup step checks if already done before acting
 - **Config drive for metadata**: instance metadata delivered via read-only ext4 disk
-- **Vsock over SSH**: guest communication uses Firecracker vsock, not sshd
+- **Vsock over SSH**: guest communication uses vsock, not sshd (all backends)
+- **Same rootfs everywhere**: Nix-built ext4 images work on all backends
 
 ### Adding New Types
 

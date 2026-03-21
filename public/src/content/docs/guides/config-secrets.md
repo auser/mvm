@@ -13,7 +13,7 @@ mkdir -p /tmp/my-config /tmp/my-secrets
 echo '{"gateway": {"port": 8080}}' > /tmp/my-config/app.json
 echo 'API_KEY=sk-...' > /tmp/my-secrets/app.env
 
-mvmctl run --template my-app \
+mvmctl up --template my-app \
     --volume /tmp/my-config:/mnt/config \
     --volume /tmp/my-secrets:/mnt/secrets
 ```
@@ -65,7 +65,7 @@ The [OpenClaw example](/nix/examples/openclaw/) demonstrates all of these featur
 
 ```bash
 mvmctl template build openclaw
-mvmctl run --template openclaw --name oc \
+mvmctl up --template openclaw --name oc \
     -v nix/examples/openclaw/config:/mnt/config \
     -v nix/examples/openclaw/secrets:/mnt/secrets \
     -p 3000:3000
@@ -99,7 +99,7 @@ cat > /tmp/oc-secrets/api-keys.env << 'EOF'
 ANTHROPIC_API_KEY=sk-ant-...
 EOF
 
-mvmctl run --template openclaw --name oc \
+mvmctl up --template openclaw --name oc \
     -v /tmp/oc-config:/mnt/config \
     -v /tmp/oc-secrets:/mnt/secrets \
     -p 3000:3000
@@ -113,7 +113,7 @@ Build the template with `--snapshot` to capture a running VM state. Subsequent r
 
 ```bash
 mvmctl template build openclaw --snapshot
-mvmctl run --template openclaw --name oc \
+mvmctl up --template openclaw --name oc \
     -v nix/examples/openclaw/config:/mnt/config \
     -v nix/examples/openclaw/secrets:/mnt/secrets \
     -p 3000:3000
@@ -133,19 +133,19 @@ Example: Run three OpenClaw instances from one snapshot with different API keys:
 
 ```bash
 # Production gateway with prod Anthropic key
-mvmctl run --template openclaw --name oc-prod \
+mvmctl up --template openclaw --name oc-prod \
     -v ./prod/config:/mnt/config \
     -v ./prod/secrets:/mnt/secrets \
     -p 3000:3000
 
 # Staging gateway with test key
-mvmctl run --template openclaw --name oc-staging \
+mvmctl up --template openclaw --name oc-staging \
     -v ./staging/config:/mnt/config \
     -v ./staging/secrets:/mnt/secrets \
     -p 3001:3000
 
 # Dev gateway with no key (localhost-only testing)
-mvmctl run --template openclaw --name oc-dev \
+mvmctl up --template openclaw --name oc-dev \
     -v ./dev/config:/mnt/config \
     -p 3002:3000
 ```

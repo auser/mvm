@@ -3,7 +3,7 @@ title: Writing Nix Flakes
 description: Create custom Nix flakes that build microVM images for mvm.
 ---
 
-mvm uses Nix flakes to produce reproducible microVM images. Each build runs `nix build` inside the Lima VM, producing a kernel and rootfs.
+mvmctl uses Nix flakes to produce reproducible microVM images. Each build runs `nix build` inside the Linux environment (Lima VM on macOS, native on Linux), producing a kernel and rootfs. The same rootfs works on all backends (Firecracker, Apple Container).
 
 ## Minimal Flake
 

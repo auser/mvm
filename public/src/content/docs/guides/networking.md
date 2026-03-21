@@ -1,9 +1,19 @@
 ---
 title: Networking
-description: Network layout and connectivity in mvm microVMs.
+description: Network layout and connectivity in mvmctl microVMs.
 ---
 
-## Dev Network Layout
+## Network by Backend
+
+Networking differs by backend:
+
+| Backend | Network Type | Guest IP | Host Access |
+|---------|-------------|----------|-------------|
+| Firecracker (Linux) | TAP device | 172.16.0.2/30 | Direct via TAP |
+| Firecracker (Lima) | TAP in Lima VM | 172.16.0.2/30 | Via Lima NAT |
+| Apple Container | vmnet | DHCP-assigned | Via vmnet bridge |
+
+## Firecracker Network Layout
 
 ```
 Firecracker microVM (172.16.0.2/30, eth0)
@@ -13,17 +23,29 @@ Lima VM (172.16.0.1/30, tap0)  --  iptables NAT  --  internet
 Host (macOS / Linux)
 ```
 
-The microVM has internet access via NAT through the Lima VM. The TAP device connects the microVM to Lima's network namespace.
+The microVM has internet access via NAT through the Lima VM (or directly on native Linux). The TAP device connects the microVM to the host network namespace.
+
+## Port Forwarding
+
+Forward guest ports to the host with `-p`:
+
+```bash
+mvmctl up --flake . -p 8080:8080
+mvmctl up --flake . -p 3000:3000 -p 8080:8080   # multiple ports
+
+# Or forward after boot
+mvmctl forward my-vm -p 3000:3000
+```
 
 ## vsock Communication
 
-MicroVMs don't use networking for host communication — they use Firecracker's **vsock** interface:
+MicroVMs don't use networking for host communication -- they use **vsock**:
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 52 | Length-prefixed JSON | Guest agent (health checks, status, exec, snapshot lifecycle) |
+| 52 | Length-prefixed JSON | Guest agent (health checks, status, snapshot lifecycle) |
 
-The host connects by writing `CONNECT 52\n` to the Firecracker vsock UDS socket and reading `OK 52\n`. All requests are request/response pairs.
+The host connects by writing `CONNECT 52\n` to the vsock socket and reading `OK 52\n`. All requests are request/response pairs. vsock is supported on all backends (Firecracker and Apple Container).
 
 ## No SSH
 
@@ -35,13 +57,6 @@ MicroVMs have **no SSH access** by design. Communication is exclusively via vsoc
 
 For debugging dev builds, use `mvmctl vm exec <name> -- <command>` which routes through the vsock agent.
 
-## Port Forwarding
-
-MicroVMs are accessible from the Lima VM at `172.16.0.2`. To expose a service to the host:
-
-1. The microVM listens on its eth0 address (172.16.0.2)
-2. Lima's networking makes the VM accessible from the host
-
 ## DNS
 
-The guest's `/etc/resolv.conf` is configured at build time to use Lima's DNS resolver. Internet access works out of the box through the NAT chain.
+The guest's `/etc/resolv.conf` is configured at build time to use the host's DNS resolver. Internet access works out of the box through the NAT chain (Firecracker) or vmnet (Apple Container).

@@ -1,6 +1,6 @@
 ---
 title: Installation
-description: Install mvm on macOS or Linux.
+description: Install mvmctl on macOS or Linux.
 ---
 
 ## One-Liner
@@ -12,7 +12,7 @@ curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
 ## Pin a Version
 
 ```bash
-MVM_VERSION=v0.3.6 curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+MVM_VERSION=v0.6.0 curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
 ```
 
 ## From Source
@@ -39,16 +39,26 @@ mvmctl update
 ## Prerequisites
 
 - **macOS** (Apple Silicon or Intel) or **Linux** (x86_64 or aarch64)
-- [Homebrew](https://brew.sh/) (macOS only — mvm will install it if missing)
+- [Homebrew](https://brew.sh/) (macOS only -- mvmctl will install it if missing)
 
-### Platform Detection
+### Backend Auto-Detection
 
-mvm automatically detects your platform at startup and adapts its setup:
+mvmctl automatically detects your platform at startup and selects the best VM backend:
 
-| Platform | What happens |
-|----------|-------------|
-| **macOS** | Lima VM is installed to provide `/dev/kvm`. All builds and Firecracker run inside Lima. |
-| **Linux with `/dev/kvm`** | Lima is skipped entirely. Builds and Firecracker run natively on the host. |
-| **Linux without `/dev/kvm`** | Lima VM is installed as a fallback (same as macOS). Useful for WSL2 or cloud VMs without nested virtualization. |
+| Platform | Backend | What happens |
+|----------|---------|-------------|
+| **Linux with `/dev/kvm`** | Firecracker | Runs directly on KVM. No Lima needed. |
+| **macOS 26+** (Apple Silicon) | Apple Container | Uses Virtualization.framework. No Lima needed. |
+| **macOS <26** | Lima + Firecracker | Lima VM provides `/dev/kvm`. Builds and Firecracker run inside Lima. |
+| **Linux without `/dev/kvm`** | Lima + Firecracker | Lima VM as fallback (same as macOS <26). |
 
-Running `mvmctl bootstrap` or `mvmctl dev` handles everything automatically — it detects your platform, installs Lima only if needed, and sets up Nix and Firecracker in the right environment.
+Running `mvmctl dev` or `mvmctl bootstrap` handles everything automatically -- it detects your platform, selects the backend, installs Lima only if needed, and sets up Nix and Firecracker in the right environment.
+
+You can force a specific backend with `--hypervisor`:
+
+```bash
+mvmctl up --flake . --hypervisor apple-container
+mvmctl up --flake . --hypervisor firecracker
+```
+
+Use `mvmctl doctor` to check which backends are available on your system.

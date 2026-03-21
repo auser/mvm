@@ -18,7 +18,7 @@ Every microVM built with `mkGuest` includes **mvm-guest-agent**, a lightweight R
 
 ## Protocol
 
-The agent communicates using **length-prefixed JSON frames** over Firecracker's vsock UDS socket:
+The agent communicates using **length-prefixed JSON frames** over vsock (supported on all backends -- Firecracker and Apple Container):
 
 1. Host writes `CONNECT 52\n` to the socket
 2. Agent responds with `OK 52\n`

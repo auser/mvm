@@ -3,6 +3,34 @@ title: CLI Commands
 description: Complete command reference for mvmctl.
 ---
 
+## VM Lifecycle
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl up --flake <ref>` | Build and run a VM from a Nix flake (aliases: `run`, `start`) |
+| `mvmctl up --template <name>` | Run from a pre-built template (skip build) |
+| `mvmctl up --name <name>` | Specify VM name (auto-generated if omitted) |
+| `mvmctl up --profile <variant>` | Flake package variant (e.g. worker, gateway) |
+| `mvmctl up --cpus N --memory SIZE` | Override vCPU count and memory (supports 512M, 4G, etc.) |
+| `mvmctl up -p HOST:GUEST` | Forward a port mapping into the VM (repeatable) |
+| `mvmctl up -e KEY=VALUE` | Inject an environment variable (repeatable) |
+| `mvmctl up -v host:guest:size` | Mount a volume into the VM (repeatable) |
+| `mvmctl up -d` | Run in background (detached mode, via launchd) |
+| `mvmctl up --forward` | Auto-forward declared ports after boot (blocks until Ctrl-C) |
+| `mvmctl up --hypervisor <backend>` | Force backend: `firecracker` or `apple-container` |
+| `mvmctl up --config <path>` | Runtime config (TOML) for persistent resources/volumes |
+| `mvmctl up --metrics-port PORT` | Bind a Prometheus metrics endpoint (0 = disabled) |
+| `mvmctl up --watch-config` | Reload ~/.mvm/config.toml automatically when it changes |
+| `mvmctl up --watch` | Watch flake for changes and auto-rebuild + reboot |
+| `mvmctl down [name]` | Stop VMs by name, or all if omitted |
+| `mvmctl down -f <config>` | Stop only VMs defined in specified config |
+| `mvmctl ls` | List running VMs (aliases: `ps`, `status`) |
+| `mvmctl ls -a` | Show all VMs including stopped |
+| `mvmctl ls --json` | Output as JSON |
+| `mvmctl forward <name> -p PORT` | Forward a port from a running VM to localhost |
+| `mvmctl logs <name>` | View guest console logs (`-f` to follow, `-n` for line count) |
+| `mvmctl logs <name> --hypervisor` | View Firecracker hypervisor logs |
+
 ## Environment Management
 
 | Command | Description |
@@ -17,52 +45,15 @@ description: Complete command reference for mvmctl.
 | `mvmctl dev --project ~/dir` | Auto-bootstrap then cd into a project directory |
 | `mvmctl dev --metrics-port PORT` | Bind a Prometheus metrics endpoint (0 = disabled) |
 | `mvmctl dev --watch-config` | Reload ~/.mvm/config.toml automatically when it changes |
-| `mvmctl status` | Show platform, Lima VM, Firecracker, and microVM status |
-| `mvmctl destroy` | Tear down Lima VM and all resources (confirmation required) |
-| `mvmctl destroy -y` | Tear down without confirmation prompt |
+| `mvmctl dev --lima` | Force Lima backend even on macOS 26+ |
+| `mvmctl shell` | Open a shell in the Lima VM |
+| `mvmctl shell --project ~/dir` | Open shell and cd into a project directory |
 | `mvmctl doctor` | Run system diagnostics and dependency checks |
 | `mvmctl doctor --json` | Output diagnostics as JSON |
 | `mvmctl update` | Check for and install mvmctl updates |
 | `mvmctl update --check` | Only check for updates, don't install |
 | `mvmctl update --force` | Force reinstall even if already up to date |
 | `mvmctl update --skip-verify` | Skip cosign signature verification |
-
-## MicroVM Lifecycle
-
-| Command | Description |
-|---------|-------------|
-| `mvmctl run --flake <ref>` | Build from flake and boot a headless Firecracker VM |
-| `mvmctl run --template <name>` | Run from a pre-built template (skip build) |
-| `mvmctl run --name <name>` | Specify VM name (auto-generated if omitted) |
-| `mvmctl run --profile <variant>` | Flake package variant (e.g. worker, gateway) |
-| `mvmctl run --cpus N --memory SIZE` | Override vCPU count and memory (supports 512M, 4G, etc.) |
-| `mvmctl run -p HOST:GUEST` | Forward a port mapping into the VM (repeatable) |
-| `mvmctl run -e KEY=VALUE` | Inject an environment variable (repeatable) |
-| `mvmctl run -v host:guest:size` | Mount a volume into the microVM (repeatable) |
-| `mvmctl run --forward` | Auto-forward declared ports after boot (blocks until Ctrl-C) |
-| `mvmctl run --hypervisor <backend>` | Hypervisor backend: `firecracker` (default) or `qemu` |
-| `mvmctl run --config <path>` | Runtime config (TOML) for persistent resources/volumes |
-| `mvmctl run --metrics-port PORT` | Bind a Prometheus metrics endpoint (0 = disabled) |
-| `mvmctl run --watch-config` | Reload ~/.mvm/config.toml automatically when it changes |
-| `mvmctl run --watch` | Watch flake for changes and auto-rebuild + reboot |
-| `mvmctl stop [name]` | Stop a running microVM by name |
-| `mvmctl stop --all` | Stop all running VMs |
-| `mvmctl remove <name>` | Stop and remove a named microVM (alias: `rm`) |
-| `mvmctl up [name]` | Launch microVMs from `mvm.toml` or CLI flags |
-| `mvmctl up --flake <ref>` | Launch a single VM without config file |
-| `mvmctl up -f <config>` | Path to fleet config (default: auto-discover mvm.toml) |
-| `mvmctl down [name]` | Stop microVMs from `mvm.toml`, by name, or all |
-| `mvmctl down -f <config>` | Stop only VMs defined in specified config |
-| `mvmctl forward <name> -p PORT` | Forward a port from a running microVM to localhost |
-| `mvmctl shell` | Open a shell in the Lima VM |
-| `mvmctl shell --project ~/dir` | Open shell and cd into a project directory |
-| `mvmctl ssh` | Open a shell in the Lima VM (alias for `mvmctl shell`) |
-| `mvmctl ssh-config` | Print an SSH config entry for the Lima VM |
-| `mvmctl sync` | Build mvmctl from source inside Lima and install to `/usr/local/bin/` |
-| `mvmctl sync --debug` | Debug build (faster compile, slower runtime) |
-| `mvmctl sync --force` | Rebuild and reinstall even if versions match |
-| `mvmctl sync --json` | Output structured JSON events |
-| `mvmctl sync --skip-deps` | Skip installing build dependencies |
 
 ## Building
 
@@ -106,26 +97,6 @@ description: Complete command reference for mvmctl.
 | `mvmctl template edit <name>` | Edit template configuration (--cpus, --mem, --flake, --profile, --role, --data-disk) |
 | `mvmctl template delete <name>` | Delete a template (`--force` to skip confirmation) |
 
-## MicroVM Diagnostics
-
-| Command | Description |
-|---------|-------------|
-| `mvmctl vm ping [name]` | Health-check running microVMs via vsock (all if no name given) |
-| `mvmctl vm status [name]` | Query worker status (`--json` for JSON) |
-| `mvmctl vm inspect <name>` | Deep-dive inspection (probes, integrations, worker status) (`--json` for JSON) |
-| `mvmctl vm exec <name> -- <cmd>` | Run a command inside a running microVM (dev-only) |
-| `mvmctl vm exec <name> --timeout <secs>` | Set exec timeout (default: 30s) |
-| `mvmctl vm diagnose <name>` | Run layered diagnostics on a VM (works even when vsock is broken) (`--json` for JSON) |
-| `mvmctl vm list` | List all running microVMs (`--json` for JSON) |
-| `mvmctl logs <name>` | View guest console logs (`-f` to follow, `-n` for line count) |
-| `mvmctl logs <name> --hypervisor` | View Firecracker hypervisor logs |
-
-## Security
-
-| Command | Description |
-|---------|-------------|
-| `mvmctl security status` | Show security posture score (`--json` for JSON) |
-
 ## Configuration
 
 | Command | Description |
@@ -158,15 +129,10 @@ description: Complete command reference for mvmctl.
 | `mvmctl shell-init` | Print shell configuration (completions + dev aliases) to stdout |
 | `mvmctl metrics` | Show runtime metrics (Prometheus text format) |
 | `mvmctl metrics --json` | Show runtime metrics as JSON |
-| `mvmctl cleanup-orphans` | Remove orphaned VM state files (dead PIDs) |
-| `mvmctl cleanup-orphans --dry-run` | List orphans without deleting |
 | `mvmctl uninstall` | Remove Lima VM, Firecracker, and all mvm state (confirmation required) |
 | `mvmctl uninstall -y` | Uninstall without confirmation |
 | `mvmctl uninstall --all` | Also remove ~/.mvm/ config dir and /usr/local/bin/mvmctl binary |
 | `mvmctl uninstall --dry-run` | Print what would be removed without removing |
-| `mvmctl release` | Pre-release checks (deploy guard + cargo publish dry-run) |
-| `mvmctl release --dry-run` | Run cargo publish --dry-run for all crates |
-| `mvmctl release --guard-only` | Run deploy guard checks only (version, tag, inter-crate deps) |
 
 ## Global Options
 
