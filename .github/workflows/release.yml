@@ -77,7 +77,7 @@ jobs:
 
       - name: Generate man pages
         shell: bash
-        run: cargo xtask gen-man --output-dir man/
+        run: cargo run --package xtask -- gen-man --output-dir man/
 
       - name: Package binary and generate checksums
         env:
