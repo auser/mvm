@@ -394,7 +394,12 @@
                 mkdir -p ./files/tmp ./files/run ./files/var/lib ./files/var/run ./files/var/log
                 mkdir -p ./files/root ./files/home
                 mkdir -p ./files/mnt/config ./files/mnt/secrets ./files/mnt/data
-                ln -s ${initScript} ./files/init
+                # Create a wrapper init with #!/bin/sh shebang.
+                # The Nix store init script has a long shebang path that can fail
+                # on some hypervisors (VZ). This wrapper uses /bin/sh (which is
+                # symlinked to busybox) and execs the real init.
+                printf '#!/bin/sh\nexport PATH="${busybox}/bin:/bin:/sbin:$PATH"\nexec ${busybox}/bin/sh ${initScript}\n' > ./files/init
+                chmod +x ./files/init
                 ln -s /init ./files/sbin/vminitd
                 ln -s ${busybox}/bin/sh ./files/bin/sh
               '' + pkgs.lib.optionalString (cacert != null) ''

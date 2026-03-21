@@ -290,7 +290,7 @@ pub fn start_vm(
         let boot_loader =
             VZLinuxBootLoader::initWithKernelURL(VZLinuxBootLoader::alloc(), &nsurl(kernel_path));
         boot_loader.setCommandLine(&NSString::from_str(
-            "console=hvc0 root=/dev/vda rw init=/init quiet",
+            "console=hvc0 root=/dev/vda rw init=/sbin/vminitd",
         ));
 
         let config = VZVirtualMachineConfiguration::new();
@@ -325,6 +325,29 @@ pub fn start_vm(
         )]));
         config.setMemoryBalloonDevices(&NSArray::from_retained_slice(&[Retained::into_super(
             VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new(),
+        )]));
+
+        // Serial console — write kernel and init output to log file
+        let console_log = vm_dir.join("console.log");
+        let console_file =
+            std::fs::File::create(&console_log).map_err(|e| format!("create console log: {e}"))?;
+        use std::os::fd::IntoRawFd;
+        let log_fd = console_file.into_raw_fd();
+        let write_handle = NSFileHandle::initWithFileDescriptor(NSFileHandle::alloc(), log_fd);
+        let read_handle = {
+            let devnull = std::fs::File::open("/dev/null").map_err(|e| e.to_string())?;
+            NSFileHandle::initWithFileDescriptor(NSFileHandle::alloc(), devnull.into_raw_fd())
+        };
+        let serial = VZVirtioConsoleDeviceSerialPortConfiguration::new();
+        let attachment =
+            VZFileHandleSerialPortAttachment::initWithFileHandleForReading_fileHandleForWriting(
+                VZFileHandleSerialPortAttachment::alloc(),
+                Some(&read_handle),
+                Some(&write_handle),
+            );
+        serial.setAttachment(Some(&attachment));
+        config.setSerialPorts(&NSArray::from_retained_slice(&[Retained::into_super(
+            serial,
         )]));
 
         // Dispatch VM creation AND start to the main queue.
