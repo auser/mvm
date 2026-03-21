@@ -28,7 +28,11 @@ Here's the end result — don't worry about understanding it yet:
         packages = [ pkgs.python3 pkgs.curl ];
 
         services.hello = {
-          command = "${pkgs.python3}/bin/python3 -m http.server 8080";
+          preStart = ''
+            mkdir -p /tmp/www
+            echo '<h1>Hello from mvm!</h1>' > /tmp/www/index.html
+          '';
+          command = "${pkgs.python3}/bin/python3 -m http.server 8080 --directory /tmp/www";
         };
 
         healthChecks.hello = {
@@ -180,9 +184,14 @@ Search for packages at [search.nixos.org/packages](https://search.nixos.org/pack
 
 ```bash
 # Inside the dev shell (mvmctl dev)
-nix search nixpkgs python
-nix search nixpkgs "node.*22"
+# Use 2>/dev/null to hide nixpkgs deprecation warnings
+nix search nixpkgs python 2>/dev/null
+nix search nixpkgs "node.*22" 2>/dev/null
 ```
+
+:::tip[Noisy warnings?]
+`nix search` prints deprecation warnings from nixpkgs (renamed vim plugins, etc.). These are harmless — they come from nixpkgs, not your flake. Pipe stderr to `/dev/null` to suppress them.
+:::
 
 :::note[Why `pkgs.python3` instead of just `python3`?]
 Nix stores every package in `/nix/store/hash-name/`. There's no global `PATH`. Using `pkgs.python3` tells Nix exactly which package to include — this is what makes builds reproducible. The same flake always produces the same image, on any machine.
@@ -198,14 +207,20 @@ mvm.lib.${system}.mkGuest {
   packages = [ pkgs.python3 pkgs.curl ];
 
   services.hello = {
-    command = "${pkgs.python3}/bin/python3 -m http.server 8080";
+    preStart = ''
+      mkdir -p /tmp/www
+      echo '<h1>Hello from mvm!</h1>' > /tmp/www/index.html
+    '';
+    command = "${pkgs.python3}/bin/python3 -m http.server 8080 --directory /tmp/www";
   };
 };
 ```
 
 `services.hello` declares a long-running process. mvm's init system starts it at boot and restarts it if it crashes.
 
-**`"${pkgs.python3}/bin/python3"`** — this is how Nix references a binary. The `${pkgs.python3}` part resolves to the full `/nix/store/...` path at build time. You never hardcode paths — Nix handles it.
+- **`preStart`** creates a directory and writes an HTML file before the service starts.
+- **`command`** is the long-running process. It serves the HTML on port 8080.
+- **`"${pkgs.python3}/bin/python3"`** — Nix resolves this to the full `/nix/store/...` path at build time. You never hardcode paths — Nix handles it.
 
 ## Step 7: Add a health check
 
@@ -220,22 +235,35 @@ healthChecks.hello = {
 
 The guest agent runs this command every 5 seconds. Exit code 0 means healthy. The name (`hello`) should match your service name.
 
-## Step 8: Build and run
+## Step 8: Build, run, and verify
 
-You now have a complete flake. Put it all together and build:
+You now have a complete flake. Build and boot it with port forwarding so you can access the service from your browser:
 
 ```bash
 # Build the VM image
 mvmctl build --flake .
 
-# Boot it
-mvmctl up --flake . --cpus 2 --memory 1024
+# Boot with port forwarding — map host port 8080 to guest port 8080
+mvmctl up --flake . --cpus 2 --memory 1024 -p 8080:8080
+```
 
+The `-p 8080:8080` flag forwards port 8080 on your host to port 8080 inside the microVM. Without it, the service runs but isn't accessible from outside the VM.
+
+Once it's running, open your browser to [http://localhost:8080](http://localhost:8080). You should see:
+
+> **Hello from mvm!**
+
+Your microVM is serving traffic from inside a Firecracker VM (or whichever backend mvm auto-selected for your platform).
+
+```bash
 # Check it's running
 mvmctl ls
 
 # View logs (including health check output)
 mvmctl logs hello -f
+
+# Forward additional ports from a running VM
+mvmctl forward hello -p 9090:9090
 
 # Stop it
 mvmctl down hello
@@ -243,7 +271,64 @@ mvmctl down hello
 
 The first build downloads dependencies and takes a few minutes. Subsequent builds with the same `flake.lock` are near-instant thanks to Nix caching.
 
-## Step 9: Add environment variables and setup scripts
+:::tip[Run in the background]
+Add `-d` to run detached (like `docker run -d`):
+```bash
+mvmctl up --flake . -d -p 8080:8080
+```
+:::
+
+## Step 9: Mount volumes
+
+Volumes let you pass files from your host into the microVM at boot — config files, secrets, or persistent data:
+
+```bash "-v"
+# Mount host directories into the VM
+mvmctl up --flake . -p 8080:8080 \
+    -v ./config:/mnt/config \
+    -v ./secrets:/mnt/secrets \
+    -v ./data:/mnt/data:1024
+```
+
+Inside the guest, the files appear at the mount paths:
+
+| Mount | Access | Use case |
+|-------|--------|----------|
+| `./config:/mnt/config` | Read-only | App configuration |
+| `./secrets:/mnt/secrets` | Read-only | API keys, tokens |
+| `./data:/mnt/data:1024` | **Read-write** | Database files, logs, uploads |
+
+Config and secrets are read-only by design — you don't want your app accidentally overwriting its own API keys. For data your service needs to write to (databases, logs, user uploads), use a **sized volume** with the three-part format `host:guest:sizeMB`:
+
+```bash
+# Read-only config + read-write 1GB data volume
+mvmctl up --flake . -p 8080:8080 \
+    -v ./config:/mnt/config \
+    -v ./data:/mnt/data:1024
+```
+
+Your service can read config and write data at runtime — no rebuild needed:
+
+```nix
+services.my-api = {
+  preStart = ''
+    # Data dir is read-write — create subdirs as needed
+    mkdir -p /mnt/data/logs
+  '';
+  command = "${pkgs.python3}/bin/python3 /app/server.py";
+  env = {
+    # Read config directly from the mounted volume
+    CONFIG_PATH = "/mnt/config/app.json";
+    LOG_DIR = "/mnt/data/logs";
+  };
+};
+```
+
+This is the mvm pattern for separating **what runs** (baked into the image) from **how it's configured** (mounted at boot). The same image works across environments — only the mounted files change. Data volumes persist across restarts.
+
+See [Config & Secrets](/guides/config-secrets/) and [Filesystem & Drives](/reference/filesystem/) for the full guide.
+
+## Step 10: Add environment variables and setup scripts
 
 Real services often need configuration. Use `env` and `preStart`:
 
@@ -266,6 +351,28 @@ services.my-api = {
 - **`env`** — key-value pairs injected as environment variables into the service process.
 - **`preStart`** — runs once as root before the service starts. Use it for directory setup, file permissions, etc.
 - **`''...''`** — multi-line strings in Nix use two single quotes, not backticks or double quotes.
+
+:::note[Can I use a `.env` file?]
+The `env` block above is for values you're comfortable baking into the image. For secrets or per-environment config, mount a `.env` file at boot instead:
+
+```bash
+mvmctl up --flake . -v ./secrets:/mnt/secrets
+```
+
+Then source it in `preStart`:
+
+```nix
+preStart = ''
+  if [ -f /mnt/secrets/.env ]; then
+    set -a
+    . /mnt/secrets/.env
+    set +a
+  fi
+'';
+```
+
+This way the same image works across dev/staging/prod — only the mounted files change. See [Config & Secrets](/guides/config-secrets/) for more.
+:::
 
 ## Common recipes
 
@@ -299,6 +406,8 @@ services.www = {
 ```
 
 ### Multiple services in one VM
+
+A single `mkGuest` call can define multiple services — they all run inside the same VM, supervised by the init system. This is useful for co-locating a service with its dependencies (e.g., an API server + Redis):
 
 ```nix "mkGuest"
 mvm.lib.${system}.mkGuest {

@@ -197,3 +197,48 @@ h2.text-title {
   margin-bottom: 1.5rem;
 }
 
+/* ── Terminal dots — red/yellow/green (docs pages only) ── */
+[data-has-sidebar] .expressive-code .frame.is-terminal .header::before {
+  background-color: transparent !important;
+  -webkit-mask-image: none !important;
+  mask-image: none !important;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 60 16' preserveAspectRatio='xMidYMid meet'%3E%3Ccircle cx='8' cy='8' r='8' fill='%23ff5f57'/%3E%3Ccircle cx='30' cy='8' r='8' fill='%23febc2e'/%3E%3Ccircle cx='52' cy='8' r='8' fill='%2328c840'/%3E%3C/svg%3E") !important;
+  background-repeat: no-repeat !important;
+  opacity: 0.85 !important;
+}
+
+/* ── Expressive Code text markers — amber breathing glow (docs pages only) ── */
+[data-has-sidebar] .expressive-code {
+  --ec-tm-markBg: rgba(210, 153, 34, 0.14);
+  --ec-tm-markBrdCol: rgba(210, 153, 34, 0.50);
+}
+
+[data-has-sidebar] .expressive-code .ec-line mark {
+  animation: marker-breathe 3s ease-in-out infinite !important;
+  transform-origin: center center;
+}
+
+[data-has-sidebar] .expressive-code .ec-line mark::before {
+  animation: marker-border-breathe 3s ease-in-out infinite !important;
+}
+
+@keyframes marker-breathe {
+  0%, 100% {
+    background: rgba(210, 153, 34, 0.10);
+    box-shadow: 0 0 0 rgba(210, 153, 34, 0);
+  }
+  50% {
+    background: rgba(210, 153, 34, 0.24);
+    box-shadow: 0 0 10px rgba(210, 153, 34, 0.18);
+  }
+}
+
+@keyframes marker-border-breathe {
+  0%, 100% {
+    border-color: rgba(210, 153, 34, 0.30);
+  }
+  50% {
+    border-color: rgba(210, 153, 34, 0.65);
+  }
+}
+
