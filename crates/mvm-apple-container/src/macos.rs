@@ -72,6 +72,7 @@ pub fn install_launchd_direct(
     rootfs_path: &str,
     cpus: u32,
     memory_mib: u64,
+    ports: &[String],
 ) -> Result<(), String> {
     let exe = std::env::current_exe().map_err(|e| format!("current_exe: {e}"))?;
     let label = launchd_label(id);
@@ -114,6 +115,8 @@ pub fn install_launchd_direct(
         <string>{kernel_path}</string>
         <key>MVM_ROOTFS_PATH</key>
         <string>{rootfs_path}</string>
+        <key>MVM_PORTS</key>
+        <string>{ports}</string>
     </dict>
     <key>RunAtLoad</key>
     <true/>
@@ -127,6 +130,7 @@ pub fn install_launchd_direct(
 </plist>"#,
         exe = exe.display(),
         log_dir = log_dir.display(),
+        ports = ports.join(","),
     );
 
     let agents_dir = plist_path.parent().expect("plist path must have parent");

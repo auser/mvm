@@ -1870,6 +1870,24 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
         let backend = AnyBackend::from_hypervisor(effective_hypervisor);
         backend.start(&start_config)?;
 
+        // Set up port forwarding from MVM_PORTS env var
+        if let Ok(ports_str) = std::env::var("MVM_PORTS")
+            && !ports_str.is_empty()
+        {
+            ui::info("Waiting for guest network (DHCP)...");
+            if let Some(guest_ip) = mvm_apple_container::discover_guest_ip(15) {
+                ui::success(&format!("Guest IP: {guest_ip}"));
+                for spec in ports_str.split(',') {
+                    if let Some((host, guest)) = spec.split_once(':')
+                        && let (Ok(h), Ok(g)) = (host.parse::<u16>(), guest.parse::<u16>())
+                    {
+                        mvm_apple_container::start_port_proxy(h, &guest_ip, g);
+                        ui::info(&format!("Forwarding localhost:{h} → {guest_ip}:{g}"));
+                    }
+                }
+            }
+        }
+
         ui::info(&format!("VM '{}' running. Press Ctrl+C to stop.", vm_name));
 
         // Block until signaled
@@ -2094,12 +2112,20 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
         if detach && effective_hypervisor == "apple-container" {
             // Build is already done — install launchd agent with the
             // resolved kernel/rootfs paths (no rebuild in the daemon).
+            // Serialize port mappings for the daemon
+            let port_specs: Vec<String> = parse_port_specs(ports)
+                .unwrap_or_default()
+                .iter()
+                .map(|p| format!("{}:{}", p.host, p.guest))
+                .collect();
+
             mvm_apple_container::install_launchd_direct(
                 &start_config.name,
                 start_config.kernel_path.as_deref().unwrap_or(""),
                 &start_config.rootfs_path,
                 start_config.cpus,
                 start_config.memory_mib as u64,
+                &port_specs,
             )
             .map_err(|e| anyhow::anyhow!("{e}"))?;
             println!("{vm_name_owned}");

@@ -62,14 +62,15 @@ pub fn install_launchd_direct(
     rootfs_path: &str,
     cpus: u32,
     memory_mib: u64,
+    ports: &[String],
 ) -> Result<(), String> {
     #[cfg(target_os = "macos")]
     {
-        macos::install_launchd_direct(id, kernel_path, rootfs_path, cpus, memory_mib)
+        macos::install_launchd_direct(id, kernel_path, rootfs_path, cpus, memory_mib, ports)
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (id, kernel_path, rootfs_path, cpus, memory_mib);
+        let _ = (id, kernel_path, rootfs_path, cpus, memory_mib, ports);
         Err("launchd not available on this platform".to_string())
     }
 }
