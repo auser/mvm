@@ -70,7 +70,7 @@ export default defineConfig({
           label: "Contributing",
           items: [
             { label: "Development Guide", slug: "contributing/development" },
-            { label: "ADR-001: Firecracker Only", slug: "contributing/adr/001-firecracker-only" },
+            { label: "ADR-001: Multi-Backend VMs", slug: "contributing/adr/001-multi-backend" },
           ],
         },
       ],

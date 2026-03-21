@@ -3,7 +3,7 @@ title: Templates
 description: Build reusable microVM images and share them via a registry.
 ---
 
-Templates are reusable microVM images built from Nix flakes. Build once, run anywhere. Share via an S3-compatible registry. Template snapshots (`--snapshot`) are available on the Firecracker backend only.
+Templates are reusable microVM images built from Nix flakes. Build once, run anywhere. Share via an S3-compatible registry. Template snapshots (`--snapshot`) are available on the Firecracker backend only — Apple Virtualization, microvm.nix, and Docker do not support snapshots.
 
 ## Scaffold a Template
 

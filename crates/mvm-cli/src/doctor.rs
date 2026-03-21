@@ -69,6 +69,7 @@ pub fn run(json: bool) -> Result<()> {
 
     checks.push(kvm_check(plat, in_vm));
     checks.push(apple_container_check(plat));
+    checks.push(docker_check(plat));
 
     if plat.needs_lima() {
         checks.push(lima_status_check());
@@ -198,15 +199,27 @@ fn check_vm_cmd(name: &'static str, category: &'static str, cmd: &'static str) -
 
 fn platform_description(plat: Platform) -> String {
     match plat {
-        Platform::MacOS => "macOS (Lima required)".to_string(),
+        Platform::MacOS => "macOS".to_string(),
         Platform::LinuxNative => "Linux with KVM".to_string(),
-        Platform::LinuxNoKvm => "Linux without KVM (Lima required)".to_string(),
+        Platform::LinuxNoKvm => "Linux without KVM".to_string(),
+        Platform::Wsl2 => {
+            if plat.has_kvm() {
+                "WSL2 (KVM available)".to_string()
+            } else {
+                "WSL2 (no KVM)".to_string()
+            }
+        }
+        Platform::Windows => "Windows".to_string(),
     }
 }
 
 fn kvm_check(plat: Platform, in_vm: bool) -> Check {
     // Inside Lima VM or native Linux: check /dev/kvm locally
-    if in_vm || plat == Platform::LinuxNative || plat == Platform::LinuxNoKvm {
+    if in_vm
+        || plat == Platform::LinuxNative
+        || plat == Platform::LinuxNoKvm
+        || plat == Platform::Wsl2
+    {
         // Use test -c (character device exists) rather than test -r (readable),
         // because KVM access may be via group membership which doesn't imply -r.
         return match shell::run_host("bash", &["-c", "test -c /dev/kvm && echo ok"]) {
@@ -277,6 +290,24 @@ fn apple_container_check(plat: Platform) -> Check {
             category: "platform",
             ok: true, // Not a failure — just unavailable
             info: "not available (requires macOS 26+ on Apple Silicon)".to_string(),
+        }
+    }
+}
+
+fn docker_check(plat: Platform) -> Check {
+    if plat.has_docker() {
+        Check {
+            name: "docker",
+            category: "platform",
+            ok: true,
+            info: "available".to_string(),
+        }
+    } else {
+        Check {
+            name: "docker",
+            category: "platform",
+            ok: true, // Not a failure — just unavailable
+            info: "not available (install Docker Desktop or Docker Engine)".to_string(),
         }
     }
 }

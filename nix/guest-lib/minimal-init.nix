@@ -180,20 +180,30 @@ pkgs.writeScript "mvm-minimal-init" ''
   export SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
 
   # ── 1. Mount virtual filesystems ─────────────────────────────────
-  # Mount devtmpfs first so /dev/console is available for logging.
-  mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
-  mount -t proc proc /proc
-  mount -t sysfs sys /sys
+  # Detect container environment (Docker) — skip kernel-level mounts
+  MVM_CONTAINER=0
+  if [ -f /.dockerenv ] || grep -q docker /proc/1/cgroup 2>/dev/null; then
+    MVM_CONTAINER=1
+  fi
+
+  if [ "$MVM_CONTAINER" = "0" ]; then
+    mount -t devtmpfs devtmpfs /dev 2>/dev/null || true
+    mount -t proc proc /proc
+    mount -t sysfs sys /sys
+  fi
 
   echo "[init] mvm minimal init starting..." > /dev/console
+  [ "$MVM_CONTAINER" = "1" ] && echo "[init] container mode detected" > /dev/console
 
   # Allow non-root services to write to /dev/console for logging.
   chmod 666 /dev/console 2>/dev/null || true
 
-  mkdir -p /dev/pts
-  mount -t devpts devpts /dev/pts 2>/dev/null || true
-  mount -t tmpfs tmpfs /tmp
-  mount -t tmpfs tmpfs /run
+  if [ "$MVM_CONTAINER" = "0" ]; then
+    mkdir -p /dev/pts
+    mount -t devpts devpts /dev/pts 2>/dev/null || true
+  fi
+  mount -t tmpfs tmpfs /tmp 2>/dev/null || true
+  mount -t tmpfs tmpfs /run 2>/dev/null || true
 
   # ── 2. Minimal /etc ──────────────────────────────────────────────
   mkdir -p /etc/mvm/integrations.d

@@ -283,7 +283,7 @@ enum Commands {
         /// Volume (host_dir:/guest/path or host:/guest/path:size). Repeatable.
         #[arg(long, short = 'v', value_parser = clap_volume_spec)]
         volume: Vec<String>,
-        /// Hypervisor backend (firecracker, qemu, apple-container). Default: firecracker.
+        /// Hypervisor backend (firecracker, qemu, apple-container, docker). Default: auto-detect.
         #[arg(long, default_value = "firecracker")]
         hypervisor: String,
         /// Port mapping (format: HOST:GUEST or PORT). Repeatable.
@@ -1447,9 +1447,15 @@ fn cmd_ls(_all: bool, json: bool) -> Result<()> {
 
     let mut all_vms: Vec<VmInfo> = Vec::new();
 
-    // Collect from Apple Container backend (XPC)
+    // Collect from Apple Container backend
     let ac_backend = AnyBackend::from_hypervisor("apple-container");
     if let Ok(vms) = ac_backend.list() {
+        all_vms.extend(vms);
+    }
+
+    // Collect from Docker backend
+    let docker_backend = AnyBackend::from_hypervisor("docker");
+    if let Ok(vms) = docker_backend.list() {
         all_vms.extend(vms);
     }
 
@@ -1795,8 +1801,10 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
             "firecracker" // native KVM — best option
         } else if plat.has_apple_containers() {
             "apple-container" // macOS 26+ — no Lima
+        } else if plat.has_docker() {
+            "docker" // universal fallback
         } else {
-            "firecracker" // macOS <26 — via Lima
+            "firecracker" // Lima fallback
         }
     } else {
         hypervisor
@@ -1804,7 +1812,9 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
     // Apple Container doesn't need Lima — skip the upfront check entirely.
     // For Firecracker on macOS, Lima is required for both build and runtime.
-    let needs_lima = effective_hypervisor != "apple-container" && bootstrap::is_lima_required();
+    let needs_lima = effective_hypervisor != "apple-container"
+        && effective_hypervisor != "docker"
+        && bootstrap::is_lima_required();
     if needs_lima {
         lima::require_running()?;
     }

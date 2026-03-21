@@ -2,6 +2,7 @@ use anyhow::Result;
 use mvm_core::vm_backend::{VmBackend, VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus};
 
 use super::apple_container::AppleContainerBackend;
+use super::docker::DockerBackend;
 use super::{firecracker, microvm, microvm_nix};
 use crate::config::{PortMapping, VMS_DIR};
 use crate::shell::run_in_vm_stdout;
@@ -170,6 +171,7 @@ pub enum AnyBackend {
     Firecracker(FirecrackerBackend),
     MicrovmNix(MicrovmNixBackend),
     AppleContainer(AppleContainerBackend),
+    Docker(DockerBackend),
 }
 
 impl AnyBackend {
@@ -195,6 +197,7 @@ impl AnyBackend {
     pub fn from_hypervisor(name: &str) -> Self {
         match name {
             "apple-container" => Self::AppleContainer(AppleContainerBackend),
+            "docker" => Self::Docker(DockerBackend),
             "qemu" => Self::MicrovmNix(MicrovmNixBackend),
             _ => Self::Firecracker(FirecrackerBackend),
         }
@@ -209,17 +212,22 @@ impl AnyBackend {
     pub fn auto_select() -> Self {
         let plat = mvm_core::platform::current();
 
-        // KVM available → Firecracker directly (fastest, works in dev and prod)
+        // 1. KVM available → Firecracker directly (fastest — dev & production)
         if plat.has_kvm() {
             return Self::Firecracker(FirecrackerBackend);
         }
 
-        // macOS 26+ → Apple Container (no Lima needed)
+        // 2. macOS 26+ → Apple Virtualization.framework (sub-second dev)
         if plat.has_apple_containers() {
             return Self::AppleContainer(AppleContainerBackend);
         }
 
-        // Fallback: Firecracker via Lima
+        // 3. Docker available → universal fallback (works on all platforms)
+        if plat.has_docker() {
+            return Self::Docker(DockerBackend);
+        }
+
+        // 4. Firecracker via Lima (legacy macOS fallback)
         Self::Firecracker(FirecrackerBackend)
     }
 
@@ -229,6 +237,7 @@ impl AnyBackend {
             Self::Firecracker(b) => b,
             Self::MicrovmNix(b) => b,
             Self::AppleContainer(b) => b,
+            Self::Docker(b) => b,
         }
     }
 
@@ -402,12 +411,27 @@ mod tests {
     }
 
     #[test]
+    fn test_any_backend_from_hypervisor_docker() {
+        let backend = AnyBackend::from_hypervisor("docker");
+        assert_eq!(backend.name(), "docker");
+    }
+
+    #[test]
+    fn test_docker_via_any_backend_capabilities() {
+        let backend = AnyBackend::from_hypervisor("docker");
+        let caps = backend.capabilities();
+        assert!(caps.pause_resume);
+        assert!(!caps.snapshots);
+        assert!(!caps.vsock);
+        assert!(!caps.tap_networking);
+    }
+
+    #[test]
     fn test_auto_select_returns_valid_backend() {
         let backend = AnyBackend::auto_select();
-        // On any platform, auto_select should return a usable backend
         let name = backend.name();
         assert!(
-            name == "firecracker" || name == "apple-container",
+            name == "firecracker" || name == "apple-container" || name == "docker",
             "auto_select returned unexpected backend: {name}"
         );
     }

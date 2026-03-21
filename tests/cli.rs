@@ -221,7 +221,8 @@ fn test_run_help_shows_flags() {
         .stdout(predicate::str::contains("--profile"))
         .stdout(predicate::str::contains("--cpus"))
         .stdout(predicate::str::contains("--memory"))
-        .stdout(predicate::str::contains("apple-container"));
+        .stdout(predicate::str::contains("apple-container"))
+        .stdout(predicate::str::contains("docker"));
 }
 
 #[test]
