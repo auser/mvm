@@ -11,7 +11,12 @@ use crate::security::{GateDecision, ThreatFinding};
 // ============================================================================
 
 /// Default path for the local audit log.
-pub const DEFAULT_AUDIT_LOG: &str = "/var/log/mvm/audit.jsonl";
+///
+/// Uses the user-writable mvm data directory (`~/.mvm/log/`) instead of
+/// `/var/log/mvm/` which requires root.
+pub fn default_audit_log() -> String {
+    format!("{}/log/audit.jsonl", crate::config::mvm_data_dir())
+}
 
 /// Rotate when the audit log exceeds this size.
 const ROTATE_THRESHOLD_BYTES: u64 = 10 * 1024 * 1024; // 10 MiB
@@ -107,7 +112,7 @@ impl LocalAuditLog {
 /// failures must not block the operation being logged.
 pub fn emit(kind: LocalAuditKind, vm_name: Option<&str>, detail: Option<&str>) {
     let event = LocalAuditEvent::now(kind, vm_name.map(str::to_owned), detail.map(str::to_owned));
-    let path = PathBuf::from(DEFAULT_AUDIT_LOG);
+    let path = PathBuf::from(default_audit_log());
     match LocalAuditLog::open(&path).and_then(|log| log.append(&event)) {
         Ok(()) => {}
         Err(e) => tracing::warn!("audit log write failed: {e}"),

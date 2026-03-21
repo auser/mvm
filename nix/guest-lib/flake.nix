@@ -386,18 +386,21 @@
 
             cacertPaths = pkgs.lib.optionals (cacert != null) [ cacert ];
 
-            rootfs = pkgs.callPackage
-              (nixpkgs + "/nixos/lib/make-ext4-fs.nix") {
-              storePaths = [ initScript mvm-guest-agent ] ++ cacertPaths ++ packages;
-              volumeLabel = "mvm";
-              populateImageCommands = ''
+            # Shared populate commands for both ext4 and OCI rootfs.
+            populateCommands = ''
                 mkdir -p ./files/dev ./files/proc ./files/sys
                 mkdir -p ./files/bin ./files/sbin
                 mkdir -p ./files/etc/mvm/integrations.d
                 mkdir -p ./files/tmp ./files/run ./files/var/lib ./files/var/run ./files/var/log
                 mkdir -p ./files/root ./files/home
                 mkdir -p ./files/mnt/config ./files/mnt/secrets ./files/mnt/data
-                ln -s ${initScript} ./files/init
+                # Create a wrapper init with #!/bin/sh shebang.
+                # The Nix store init script has a long shebang path that can fail
+                # on some hypervisors (VZ). This wrapper uses /bin/sh (which is
+                # symlinked to busybox) and execs the real init.
+                printf '#!/bin/sh\nexport PATH="${busybox}/bin:/bin:/sbin:$PATH"\nexec ${busybox}/bin/sh ${initScript}\n' > ./files/init
+                chmod +x ./files/init
+                ln -s /init ./files/sbin/vminitd
                 ln -s ${busybox}/bin/sh ./files/bin/sh
               '' + pkgs.lib.optionalString (cacert != null) ''
                 mkdir -p ./files/etc/ssl/certs
@@ -406,12 +409,48 @@
                 ln -s ${cacert}/etc/ssl/certs/ca-bundle.crt ./files/etc/ssl/certs/ca-certificates.crt
                 ln -s ${cacert}/etc/ssl/certs/ca-bundle.crt ./files/etc/pki/tls/certs/ca-bundle.crt
               '';
+
+            # ext4 rootfs for Firecracker (production).
+            rootfs = pkgs.callPackage
+              (nixpkgs + "/nixos/lib/make-ext4-fs.nix") {
+              storePaths = [ initScript mvm-guest-agent ] ++ cacertPaths ++ packages;
+              volumeLabel = "mvm";
+              populateImageCommands = populateCommands;
+            };
+
+            # OCI image for Apple Container (dev on macOS 26+).
+            # Same Nix closure, different packaging format.
+            # Uses streamLayeredImage (no runAsRoot, no KVM needed).
+            ociImage = pkgs.dockerTools.streamLayeredImage {
+              inherit name;
+              tag = "latest";
+              contents = [ mvm-guest-agent busybox ] ++ cacertPaths ++ packages;
+              fakeRootCommands = ''
+                mkdir -p ./dev ./proc ./sys ./tmp ./run
+                mkdir -p ./var/lib ./var/run ./var/log
+                mkdir -p ./bin ./sbin ./root ./home
+                mkdir -p ./etc/mvm/integrations.d
+                mkdir -p ./mnt/config ./mnt/secrets ./mnt/data
+                ln -sf ${initScript} ./init
+                ln -sf /init ./sbin/vminitd
+                ln -sf ${busybox}/bin/sh ./bin/sh
+              '' + pkgs.lib.optionalString (cacert != null) ''
+                mkdir -p ./etc/ssl/certs ./etc/pki/tls/certs
+                ln -sf ${cacert}/etc/ssl/certs/ca-bundle.crt ./etc/ssl/certs/ca-bundle.crt
+                ln -sf ${cacert}/etc/ssl/certs/ca-bundle.crt ./etc/ssl/certs/ca-certificates.crt
+                ln -sf ${cacert}/etc/ssl/certs/ca-bundle.crt ./etc/pki/tls/certs/ca-bundle.crt
+              '';
+              config = {
+                Cmd = [ "/init" ];
+                WorkingDir = "/";
+              };
             };
           in
           pkgs.runCommand "mvm-${name}" {} ''
             mkdir -p $out
             ${copyKernel firecrackerKernel}
             cp "${rootfs}" "$out/rootfs.ext4"
+            ${ociImage} > "$out/image.tar.gz"
           '';
 
         packages.mvm-guest-agent = mvm-guest-agent;

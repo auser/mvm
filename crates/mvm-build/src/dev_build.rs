@@ -306,6 +306,11 @@ fn copy_dev_artifacts(
             chmod +x {dir}/bin/*
         fi
 
+        # Copy OCI image if present (for Apple Container dev mode)
+        if [ -e {out}/image.tar.gz ]; then
+            cp -L {out}/image.tar.gz {dir}/image.tar.gz
+        fi
+
         echo "Artifacts:"
         ls -lh {dir}/
         "#,

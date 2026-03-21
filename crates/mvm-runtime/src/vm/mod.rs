@@ -1,4 +1,5 @@
 // Dev mode
+pub mod apple_container;
 pub mod backend;
 pub mod firecracker;
 pub mod image;
@@ -8,3 +9,4 @@ pub mod microvm;
 pub mod microvm_nix;
 pub mod network;
 pub mod template;
+pub mod vminitd_client;

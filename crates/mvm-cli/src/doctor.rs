@@ -68,6 +68,7 @@ pub fn run(json: bool) -> Result<()> {
     });
 
     checks.push(kvm_check(plat, in_vm));
+    checks.push(apple_container_check(plat));
 
     if plat.needs_lima() {
         checks.push(lima_status_check());
@@ -250,6 +251,33 @@ fn kvm_check(plat: Platform, in_vm: bool) -> Check {
             ok: false,
             info: "Lima VM not running or /dev/kvm unavailable. Run 'mvmctl setup'.".to_string(),
         },
+    }
+}
+
+fn apple_container_check(plat: Platform) -> Check {
+    if plat != Platform::MacOS {
+        return Check {
+            name: "apple containers",
+            category: "platform",
+            ok: true,
+            info: "n/a (not macOS)".to_string(),
+        };
+    }
+
+    if plat.has_apple_containers() {
+        Check {
+            name: "apple containers",
+            category: "platform",
+            ok: true,
+            info: "available (macOS 26+ on Apple Silicon)".to_string(),
+        }
+    } else {
+        Check {
+            name: "apple containers",
+            category: "platform",
+            ok: true, // Not a failure — just unavailable
+            info: "not available (requires macOS 26+ on Apple Silicon)".to_string(),
+        }
     }
 }
 

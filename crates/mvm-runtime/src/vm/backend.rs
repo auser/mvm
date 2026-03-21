@@ -1,9 +1,12 @@
 use anyhow::Result;
-use mvm_core::vm_backend::{VmBackend, VmCapabilities, VmId, VmInfo, VmStatus};
+use mvm_core::vm_backend::{VmBackend, VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus};
 
+use super::apple_container::AppleContainerBackend;
 use super::{firecracker, microvm, microvm_nix};
-use crate::config::VMS_DIR;
+use crate::config::{PortMapping, VMS_DIR};
 use crate::shell::run_in_vm_stdout;
+use crate::vm::image::RuntimeVolume;
+use crate::vm::microvm::{DriveFile, FlakeRunConfig};
 
 pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
 
@@ -15,6 +18,62 @@ pub struct FirecrackerConfig {
     pub run_config: microvm::FlakeRunConfig,
 }
 
+impl FirecrackerConfig {
+    /// Convert a backend-agnostic `VmStartConfig` into a Firecracker-specific
+    /// `FlakeRunConfig`, allocating a network slot automatically.
+    pub fn from_start_config(config: &VmStartConfig) -> Result<Self> {
+        let slot = microvm::allocate_slot(&config.name)?;
+        let run_config = FlakeRunConfig {
+            name: config.name.clone(),
+            slot,
+            vmlinux_path: config.kernel_path.clone().unwrap_or_default(),
+            initrd_path: config.initrd_path.clone(),
+            rootfs_path: config.rootfs_path.clone(),
+            revision_hash: config.revision_hash.clone(),
+            flake_ref: config.flake_ref.clone(),
+            profile: config.profile.clone(),
+            cpus: config.cpus,
+            memory: config.memory_mib,
+            volumes: config
+                .volumes
+                .iter()
+                .map(|v| RuntimeVolume {
+                    host: v.host.clone(),
+                    guest: v.guest.clone(),
+                    size: v.size.clone(),
+                })
+                .collect(),
+            config_files: config
+                .config_files
+                .iter()
+                .map(|f| DriveFile {
+                    name: f.name.clone(),
+                    content: f.content.clone(),
+                    mode: f.mode,
+                })
+                .collect(),
+            secret_files: config
+                .secret_files
+                .iter()
+                .map(|f| DriveFile {
+                    name: f.name.clone(),
+                    content: f.content.clone(),
+                    mode: f.mode,
+                })
+                .collect(),
+            ports: config
+                .ports
+                .iter()
+                .map(|p| PortMapping {
+                    host: p.host,
+                    guest: p.guest,
+                })
+                .collect(),
+        };
+        Ok(Self { run_config })
+    }
+}
+
 /// Firecracker backend implementation.
 ///
 /// Wraps the existing free functions in [`microvm`] and [`firecracker`]
@@ -23,8 +82,6 @@ pub struct FirecrackerConfig {
 pub struct FirecrackerBackend;
 
 impl VmBackend for FirecrackerBackend {
-    type Config = FirecrackerConfig;
-
     fn name(&self) -> &str {
         "firecracker"
     }
@@ -38,9 +95,10 @@ impl VmBackend for FirecrackerBackend {
         }
     }
 
-    fn start(&self, config: &Self::Config) -> Result<VmId> {
-        microvm::run_from_build(&config.run_config)?;
-        Ok(VmId(config.run_config.name.clone()))
+    fn start(&self, config: &VmStartConfig) -> Result<VmId> {
+        let fc_config = FirecrackerConfig::from_start_config(config)?;
+        microvm::run_from_build(&fc_config.run_config)?;
+        Ok(VmId(fc_config.run_config.name.clone()))
     }
 
     fn stop(&self, id: &VmId) -> Result<()> {
@@ -111,6 +169,7 @@ impl VmBackend for FirecrackerBackend {
 pub enum AnyBackend {
     Firecracker(FirecrackerBackend),
     MicrovmNix(MicrovmNixBackend),
+    AppleContainer(AppleContainerBackend),
 }
 
 impl AnyBackend {
@@ -131,96 +190,111 @@ impl AnyBackend {
 
     /// Select backend by hypervisor name.
     ///
-    /// Currently supported: `"firecracker"` (default), `"qemu"` (via
-    /// microvm.nix runner). Unknown names fall back to Firecracker.
+    /// Supported: `"firecracker"` (default), `"qemu"` (via microvm.nix),
+    /// `"apple-container"` (macOS 26+). Unknown names fall back to Firecracker.
     pub fn from_hypervisor(name: &str) -> Self {
         match name {
+            "apple-container" => Self::AppleContainer(AppleContainerBackend),
             "qemu" => Self::MicrovmNix(MicrovmNixBackend),
             _ => Self::Firecracker(FirecrackerBackend),
         }
     }
 
-    pub fn name(&self) -> &str {
-        match self {
-            Self::Firecracker(b) => b.name(),
-            Self::MicrovmNix(b) => b.name(),
+    /// Select the best backend for the current platform.
+    ///
+    /// Priority:
+    /// 1. Firecracker (if /dev/kvm available — fastest, production-grade)
+    /// 2. Apple Container (macOS 26+ — sub-second dev startup)
+    /// 3. Firecracker via Lima (macOS fallback)
+    pub fn auto_select() -> Self {
+        let plat = mvm_core::platform::current();
+
+        // KVM available → Firecracker directly (fastest, works in dev and prod)
+        if plat.has_kvm() {
+            return Self::Firecracker(FirecrackerBackend);
         }
+
+        // macOS 26+ → Apple Container (no Lima needed)
+        if plat.has_apple_containers() {
+            return Self::AppleContainer(AppleContainerBackend);
+        }
+
+        // Fallback: Firecracker via Lima
+        Self::Firecracker(FirecrackerBackend)
+    }
+
+    /// Dispatch helper — returns a `&dyn VmBackend` for the inner backend.
+    fn inner(&self) -> &dyn VmBackend {
+        match self {
+            Self::Firecracker(b) => b,
+            Self::MicrovmNix(b) => b,
+            Self::AppleContainer(b) => b,
+        }
+    }
+
+    pub fn name(&self) -> &str {
+        self.inner().name()
     }
 
     pub fn capabilities(&self) -> VmCapabilities {
-        match self {
-            Self::Firecracker(b) => b.capabilities(),
-            Self::MicrovmNix(b) => b.capabilities(),
-        }
+        self.inner().capabilities()
     }
 
-    /// Start a VM using the Firecracker backend (manual API calls).
+    /// Start a VM using the backend-agnostic config.
+    ///
+    /// Each backend converts `VmStartConfig` into its own internal
+    /// configuration (e.g., Firecracker allocates a VmSlot and builds
+    /// a `FlakeRunConfig`; Apple Container creates a LinuxContainer).
+    pub fn start(&self, config: &VmStartConfig) -> Result<VmId> {
+        self.inner().start(config)
+    }
+
+    /// Start a VM using a pre-built `FirecrackerConfig`.
+    ///
+    /// This is a convenience method for callers that already have a
+    /// `FlakeRunConfig` (e.g., template snapshot restore). Prefer
+    /// [`start`](Self::start) for new VMs.
     pub fn start_firecracker(&self, config: &FirecrackerConfig) -> Result<VmId> {
         match self {
-            Self::Firecracker(b) => b.start(config),
-            Self::MicrovmNix(_) => {
-                anyhow::bail!("Cannot start Firecracker config with microvm.nix backend")
-            }
-        }
-    }
-
-    /// Start a VM using the microvm.nix runner backend.
-    pub fn start_microvm_nix(&self, config: &MicrovmNixConfig) -> Result<VmId> {
-        match self {
-            Self::MicrovmNix(b) => b.start(config),
             Self::Firecracker(_) => {
-                anyhow::bail!("Cannot start microvm.nix config with Firecracker backend")
+                microvm::run_from_build(&config.run_config)?;
+                Ok(VmId(config.run_config.name.clone()))
+            }
+            _ => {
+                anyhow::bail!(
+                    "Cannot start Firecracker config with {} backend",
+                    self.name()
+                )
             }
         }
     }
 
     pub fn stop(&self, id: &VmId) -> Result<()> {
-        match self {
-            Self::Firecracker(b) => b.stop(id),
-            Self::MicrovmNix(b) => b.stop(id),
-        }
+        self.inner().stop(id)
     }
 
     pub fn stop_all(&self) -> Result<()> {
-        match self {
-            Self::Firecracker(b) => b.stop_all(),
-            Self::MicrovmNix(b) => b.stop_all(),
-        }
+        self.inner().stop_all()
     }
 
     pub fn status(&self, id: &VmId) -> Result<VmStatus> {
-        match self {
-            Self::Firecracker(b) => b.status(id),
-            Self::MicrovmNix(b) => b.status(id),
-        }
+        self.inner().status(id)
     }
 
     pub fn list(&self) -> Result<Vec<VmInfo>> {
-        match self {
-            Self::Firecracker(b) => b.list(),
-            Self::MicrovmNix(b) => b.list(),
-        }
+        self.inner().list()
     }
 
     pub fn logs(&self, id: &VmId, lines: u32, hypervisor: bool) -> Result<String> {
-        match self {
-            Self::Firecracker(b) => b.logs(id, lines, hypervisor),
-            Self::MicrovmNix(b) => b.logs(id, lines, hypervisor),
-        }
+        self.inner().logs(id, lines, hypervisor)
     }
 
     pub fn is_available(&self) -> Result<bool> {
-        match self {
-            Self::Firecracker(b) => b.is_available(),
-            Self::MicrovmNix(b) => b.is_available(),
-        }
+        self.inner().is_available()
     }
 
     pub fn install(&self) -> Result<()> {
-        match self {
-            Self::Firecracker(b) => b.install(),
-            Self::MicrovmNix(b) => b.install(),
-        }
+        self.inner().install()
     }
 }
 
@@ -302,5 +376,39 @@ mod tests {
         let caps = backend.capabilities();
         assert!(caps.vsock);
         assert!(caps.tap_networking);
+    }
+
+    #[test]
+    fn test_any_backend_from_hypervisor_apple_container() {
+        let backend = AnyBackend::from_hypervisor("apple-container");
+        assert_eq!(backend.name(), "apple-container");
+    }
+
+    #[test]
+    fn test_apple_container_via_any_backend_capabilities() {
+        let backend = AnyBackend::from_hypervisor("apple-container");
+        let caps = backend.capabilities();
+        assert!(caps.vsock);
+        assert!(!caps.snapshots);
+        assert!(!caps.tap_networking);
+        assert!(!caps.pause_resume);
+    }
+
+    #[test]
+    fn test_apple_container_via_any_backend_list_empty() {
+        let backend = AnyBackend::from_hypervisor("apple-container");
+        let vms = backend.list().unwrap();
+        assert!(vms.is_empty());
+    }
+
+    #[test]
+    fn test_auto_select_returns_valid_backend() {
+        let backend = AnyBackend::auto_select();
+        // On any platform, auto_select should return a usable backend
+        let name = backend.name();
+        assert!(
+            name == "firecracker" || name == "apple-container",
+            "auto_select returned unexpected backend: {name}"
+        );
     }
 }

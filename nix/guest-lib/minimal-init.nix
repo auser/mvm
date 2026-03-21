@@ -201,10 +201,7 @@ pkgs.writeScript "mvm-minimal-init" ''
   echo 'root:x:0:' > /etc/group
   echo '${hostname}' > /etc/hostname
   hostname '${hostname}'
-  cat > /etc/hosts <<'HOSTS'
-  127.0.0.1 localhost
-  ::1       localhost
-  HOSTS
+  printf '127.0.0.1 localhost\n::1 localhost\n' > /etc/hosts
   echo 'hosts: files dns' > /etc/nsswitch.conf
 
   # ── 2b. Create default service user and custom users ──────────
@@ -230,13 +227,54 @@ pkgs.writeScript "mvm-minimal-init" ''
   # ── 4. Configure networking ─────────────────────────────────────
   ip link set lo up
   if [ -n "$MVM_IP" ] && [ -n "$MVM_GW" ]; then
+    # Static IP (Firecracker with TAP networking)
     echo "[init] network: eth0 $MVM_IP gw $MVM_GW" > /dev/console
     ip link set eth0 up
     ip addr add "$MVM_IP" dev eth0
     ip route add default via "$MVM_GW"
     echo "nameserver 8.8.8.8" > /etc/resolv.conf
   else
-    echo "[init] WARNING: no mvm.ip/mvm.gw on cmdline, skipping network" > /dev/console
+    # DHCP fallback (Apple Container with VZ NAT, or any NAT environment).
+    # Detect the first non-loopback interface (eth0, enp0s1, etc.)
+    NET_IF=""
+    for iface in eth0 enp0s1 enp0s2 ens1 ens2; do
+      if ip link show "$iface" >/dev/null 2>&1; then
+        NET_IF="$iface"
+        break
+      fi
+    done
+    if [ -z "$NET_IF" ]; then
+      # Fallback: pick the first non-lo interface
+      NET_IF=$(ip -o link show | grep -v "lo:" | head -1 | sed 's/^[0-9]*: \([^:@]*\).*/\1/')
+    fi
+
+    if [ -n "$NET_IF" ]; then
+      echo "[init] DHCP on $NET_IF..." > /dev/console
+      ip link set "$NET_IF" up 2>/dev/null || true
+
+      # udhcpc script to configure the interface
+      cat > /tmp/udhcpc.sh << 'DHCPEOF'
+#!/bin/sh
+case "$1" in
+  bound|renew)
+    ip addr flush dev "$interface" 2>/dev/null
+    ip addr add "$ip/$mask" dev "$interface" 2>/dev/null
+    [ -n "$router" ] && ip route add default via "$router" 2>/dev/null
+    [ -n "$dns" ] && echo "nameserver $dns" > /etc/resolv.conf
+    ;;
+esac
+DHCPEOF
+      chmod +x /tmp/udhcpc.sh
+
+      if udhcpc -i "$NET_IF" -s /tmp/udhcpc.sh -q -t 10 -n 2>/dev/null; then
+        DHCP_IP=$(ip -4 addr show "$NET_IF" 2>/dev/null | grep -o 'inet [^ ]*' | head -1)
+        echo "[init] DHCP: $DHCP_IP on $NET_IF" > /dev/console
+      else
+        echo "[init] DHCP failed on $NET_IF" > /dev/console
+      fi
+    else
+      echo "[init] WARNING: no network interface found" > /dev/console
+    fi
   fi
 
   # ── 5. Mount optional drives (best-effort) ──────────────────────

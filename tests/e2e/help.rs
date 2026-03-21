@@ -13,20 +13,10 @@ fn bootstrap_help_exits_successfully() {
 #[test]
 fn status_help_exits_successfully() {
     mvmctl()
-        .args(["status", "--help"])
+        .args(["ls", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("status").or(predicate::str::contains("Lima")));
-}
-
-#[test]
-fn cleanup_orphans_help_exits_successfully() {
-    mvmctl()
-        .args(["cleanup-orphans", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("orphan"))
-        .stdout(predicate::str::contains("--dry-run"));
+        .stdout(predicate::str::contains("List"));
 }
 
 #[test]

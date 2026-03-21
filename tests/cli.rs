@@ -46,17 +46,14 @@ fn test_help_lists_all_subcommands() {
         "bootstrap",
         "setup",
         "dev",
-        "stop",
-        "ssh",
         "shell",
-        "sync",
         "cleanup",
-        "status",
-        "destroy",
+        "ls",
         "uninstall",
         "audit",
         "update",
-        "run",
+        "up",
+        "down",
         "forward",
         "shell-init",
     ] {
@@ -96,6 +93,15 @@ fn test_dev_help() {
 }
 
 #[test]
+fn test_dev_help_shows_lima_flag() {
+    mvm()
+        .args(["dev", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("--lima"));
+}
+
+#[test]
 fn test_update_help() {
     mvm()
         .args(["update", "--help"])
@@ -105,11 +111,9 @@ fn test_update_help() {
 }
 
 #[test]
-fn test_status_runs_without_lima() {
-    // status should work even without Lima — it reports "Not created"
-    let assert = mvm().arg("status").assert();
-    // It either succeeds (showing status) or fails because limactl is missing,
-    // but it should never panic
+fn test_ls_runs_without_lima() {
+    // ls should work even without Lima — lists VMs or shows empty
+    let assert = mvm().arg("ls").assert();
     let output = assert.get_output();
     let combined = format!(
         "{}{}",
@@ -117,9 +121,9 @@ fn test_status_runs_without_lima() {
         String::from_utf8_lossy(&output.stderr)
     );
     assert!(
-        combined.contains("status")
-            || combined.contains("limactl")
-            || combined.contains("Not created"),
+        combined.contains("NAME")
+            || combined.contains("No running")
+            || combined.contains("limactl"),
         "status should produce meaningful output, got: {}",
         combined
     );
@@ -142,27 +146,6 @@ fn test_shell_listed_in_help() {
         .assert()
         .success()
         .stdout(predicate::str::contains("shell"));
-}
-
-#[test]
-fn test_sync_listed_in_help() {
-    mvm()
-        .arg("--help")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("sync"));
-}
-
-#[test]
-fn test_sync_help() {
-    mvm()
-        .args(["sync", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--debug"))
-        .stdout(predicate::str::contains("--skip-deps"))
-        .stdout(predicate::str::contains("--force"))
-        .stdout(predicate::str::contains("--json"));
 }
 
 #[test]
@@ -219,23 +202,12 @@ fn test_build_listed_in_help() {
 }
 
 #[test]
-fn test_ssh_config_prints_entry() {
-    mvm()
-        .arg("ssh-config")
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("Host mvm"))
-        .stdout(predicate::str::contains("IdentityFile"))
-        .stdout(predicate::str::contains("StrictHostKeyChecking no"));
-}
-
-#[test]
-fn test_run_listed_in_help() {
+fn test_up_listed_in_help() {
     mvm()
         .arg("--help")
         .assert()
         .success()
-        .stdout(predicate::str::contains("run"));
+        .stdout(predicate::str::contains("up"));
 }
 
 #[test]
@@ -248,17 +220,8 @@ fn test_run_help_shows_flags() {
         .stdout(predicate::str::contains("--name"))
         .stdout(predicate::str::contains("--profile"))
         .stdout(predicate::str::contains("--cpus"))
-        .stdout(predicate::str::contains("--memory"));
-}
-
-#[test]
-fn test_stop_help_shows_flags() {
-    mvm()
-        .args(["stop", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--all"))
-        .stdout(predicate::str::contains("name"));
+        .stdout(predicate::str::contains("--memory"))
+        .stdout(predicate::str::contains("apple-container"));
 }
 
 #[test]
@@ -381,7 +344,7 @@ fn test_template_edit_help_and_flags() {
 }
 
 // ---------------------------------------------------------------------------
-// End-to-end CLI flow: sync → build → run flag chain
+// End-to-end CLI flow: build → run flag chain
 // ---------------------------------------------------------------------------
 
 /// Verifies the full dev workflow CLI flags exist and don't conflict.
@@ -389,20 +352,6 @@ fn test_template_edit_help_and_flags() {
 /// (avoids Lima connectivity, Nix builds, etc. which can take minutes).
 #[test]
 fn test_e2e_cli_flow_flags_parse() {
-    // sync: verify all expected flags are present in help output
-    let out = mvm()
-        .args(["sync", "--help"])
-        .assert()
-        .success()
-        .get_output()
-        .stdout
-        .clone();
-    let help = String::from_utf8_lossy(&out);
-    assert!(help.contains("--debug"), "sync missing --debug");
-    assert!(help.contains("--skip-deps"), "sync missing --skip-deps");
-    assert!(help.contains("--force"), "sync missing --force");
-    assert!(help.contains("--json"), "sync missing --json");
-
     // build: verify flake/profile/json flags
     let out = mvm()
         .args(["build", "--help"])
@@ -430,169 +379,6 @@ fn test_e2e_cli_flow_flags_parse() {
     assert!(help.contains("--cpus"), "run missing --cpus");
     assert!(help.contains("--memory"), "run missing --memory");
     assert!(help.contains("--name"), "run missing --name");
-}
-
-// ---------------------------------------------------------------------------
-// VM vsock commands
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_vm_help_lists_subcommands() {
-    mvm()
-        .args(["vm", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("ping"))
-        .stdout(predicate::str::contains("status"))
-        .stdout(predicate::str::contains("inspect"))
-        .stdout(predicate::str::contains("exec"));
-}
-
-#[test]
-fn test_vm_exec_help() {
-    mvm()
-        .args(["vm", "exec", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("dev-only"))
-        .stdout(predicate::str::contains("--timeout"));
-}
-
-#[test]
-fn test_vm_ping_no_name_does_not_fail_parsing() {
-    // `mvm vm ping` without a name should pass arg parsing (targets all running VMs).
-    // On macOS it delegates to a Lima binary which may be stale — that's a runtime error, not parsing.
-    let assert = mvm().args(["vm", "ping"]).assert();
-    let code = assert.get_output().status.code().unwrap_or(-1);
-    // clap parse failures exit with code 2. Code 1 or other = runtime error (acceptable).
-    // On macOS with Lima delegation, the Lima binary may return code 2 (stale binary).
-    // Verify our arg parsing works via the unit tests (test_vm_ping_no_name_targets_all).
-    assert!(
-        code != 2 || cfg!(target_os = "macos"),
-        "vm ping should accept optional name (exit code {})",
-        code
-    );
-}
-
-#[test]
-fn test_vm_status_no_name_does_not_fail_parsing() {
-    let assert = mvm().args(["vm", "status"]).assert();
-    let code = assert.get_output().status.code().unwrap_or(-1);
-    assert!(
-        code != 2 || cfg!(target_os = "macos"),
-        "vm status should accept optional name (exit code {})",
-        code
-    );
-}
-
-#[test]
-fn test_vm_ping_nonexistent_fails_gracefully() {
-    // Ping a VM that doesn't exist — should fail with an error message, not panic
-    let assert = mvm().args(["vm", "ping", "nonexistent-vm"]).assert();
-    let output = assert.get_output();
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    // Should mention the VM name or indicate it's not found
-    assert!(
-        combined.contains("nonexistent-vm")
-            || combined.contains("not found")
-            || combined.contains("No running")
-            || combined.contains("error")
-            || combined.contains("Error")
-            || combined.contains("limactl"),
-        "vm ping should fail gracefully, got: {}",
-        combined
-    );
-}
-
-#[test]
-fn test_vm_status_nonexistent_fails_gracefully() {
-    let assert = mvm().args(["vm", "status", "nonexistent-vm"]).assert();
-    let output = assert.get_output();
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("nonexistent-vm")
-            || combined.contains("not found")
-            || combined.contains("No running")
-            || combined.contains("error")
-            || combined.contains("Error")
-            || combined.contains("limactl"),
-        "vm status should fail gracefully, got: {}",
-        combined
-    );
-}
-
-#[test]
-fn test_vm_inspect_help() {
-    mvm()
-        .args(["vm", "inspect", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--json"))
-        .stdout(predicate::str::contains("inspection"));
-}
-
-#[test]
-fn test_vm_inspect_nonexistent_fails_gracefully() {
-    let assert = mvm().args(["vm", "inspect", "nonexistent-vm"]).assert();
-    let output = assert.get_output();
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("nonexistent-vm")
-            || combined.contains("not found")
-            || combined.contains("No running")
-            || combined.contains("error")
-            || combined.contains("Error")
-            || combined.contains("limactl"),
-        "vm inspect should fail gracefully, got: {}",
-        combined
-    );
-}
-
-// ---------------------------------------------------------------------------
-// VM diagnose
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_vm_diagnose_help() {
-    mvm()
-        .args(["vm", "diagnose", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("--json"))
-        .stdout(predicate::str::contains("diagnostics"));
-}
-
-#[test]
-fn test_vm_diagnose_nonexistent_fails_gracefully() {
-    let assert = mvm().args(["vm", "diagnose", "nonexistent-vm"]).assert();
-    let output = assert.get_output();
-    let combined = format!(
-        "{}{}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    assert!(
-        combined.contains("nonexistent-vm")
-            || combined.contains("not found")
-            || combined.contains("No running")
-            || combined.contains("error")
-            || combined.contains("Error")
-            || combined.contains("limactl"),
-        "vm diagnose should fail gracefully, got: {}",
-        combined
-    );
 }
 
 // ---------------------------------------------------------------------------
@@ -672,16 +458,6 @@ fn test_metrics_json_output() {
 }
 
 #[test]
-fn test_cleanup_orphans_help() {
-    mvm()
-        .args(["cleanup-orphans", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("dry-run"))
-        .stdout(predicate::str::contains("orphan"));
-}
-
-#[test]
 fn test_uninstall_listed_in_help() {
     mvm()
         .arg("--help")
@@ -732,7 +508,7 @@ fn test_audit_tail_help() {
 
 #[test]
 fn test_audit_tail_no_log_exits_ok() {
-    // On a fresh system /var/log/mvm/audit.jsonl doesn't exist — should exit 0.
+    // On a fresh system ~/.mvm/log/audit.jsonl doesn't exist — should exit 0.
     mvm().args(["audit", "tail"]).assert().success();
 }
 
@@ -823,45 +599,6 @@ fn test_config_edit_with_true_editor() {
         .env("EDITOR", "true")
         .assert()
         .success();
-}
-
-#[test]
-fn test_vm_list_help_exits_ok() {
-    mvm().args(["vm", "list", "--help"]).assert().success();
-}
-
-#[test]
-fn test_vm_list_exits_ok_on_clean_system() {
-    // On a system without a Lima VM, `vm list` should exit 0 or 1 but never
-    // crash (exit code 2 would indicate a parse failure, which we reject).
-    let code = mvm()
-        .args(["vm", "list"])
-        .output()
-        .expect("failed to run mvmctl")
-        .status
-        .code()
-        .unwrap_or(1);
-    assert_ne!(code, 2, "vm list must not fail at argument parsing");
-}
-
-#[test]
-fn test_vm_list_json_exits_ok() {
-    // On a clean system with no Lima VM, --json should print [] and exit 0 or 1.
-    let output = mvm()
-        .args(["vm", "list", "--json"])
-        .output()
-        .expect("failed to run mvmctl");
-    let code = output.status.code().unwrap_or(1);
-    assert_ne!(code, 2, "vm list --json must not fail at argument parsing");
-}
-
-#[test]
-fn test_vm_help_lists_list_subcommand() {
-    mvm()
-        .args(["vm", "--help"])
-        .assert()
-        .success()
-        .stdout(predicate::str::contains("list"));
 }
 
 // ============================================================================
