@@ -200,7 +200,14 @@ fn read_persisted_vm_ids() -> Vec<String> {
 
 /// Ensure the running binary has the virtualization entitlement.
 /// If not, sign it ad-hoc and re-exec the process.
+///
+/// The re-exec'd process (and launchd agents) set `MVM_SIGNED=1`
+/// to skip the check entirely.
 pub fn ensure_signed() {
+    if std::env::var("MVM_SIGNED").as_deref() == Ok("1") {
+        return;
+    }
+
     let exe = match std::env::current_exe() {
         Ok(e) => e,
         Err(_) => return,
