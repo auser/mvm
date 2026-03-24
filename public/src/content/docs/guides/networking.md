@@ -59,6 +59,53 @@ MicroVMs have **no SSH access** by design. Communication is exclusively via vsoc
 
 For debugging dev builds, use `mvmctl logs <name>` to view guest console output, or `mvmctl logs <name> -f` to follow in real time.
 
+## Network Policies
+
+By default, microVMs have unrestricted internet access via NAT. Use `--network-preset` or `--network-allow` to restrict outbound traffic:
+
+```bash
+# Built-in presets
+mvmctl up --flake . --network-preset dev          # GitHub, npm, PyPI, crates.io, OpenAI, Anthropic
+mvmctl up --flake . --network-preset registries    # Package registries only
+mvmctl up --flake . --network-preset none          # No outbound (DNS only)
+
+# Explicit allowlist
+mvmctl up --flake . \
+    --network-allow github.com:443 \
+    --network-allow api.openai.com:443
+```
+
+Network policies are enforced via iptables FORWARD rules on the bridge interface inside the Lima VM. DNS (port 53) is always allowed so domain resolution works. Rules are automatically cleaned up when the VM stops.
+
+**Built-in presets:**
+
+| Preset | Allowed Domains |
+|--------|----------------|
+| `unrestricted` | All traffic (default) |
+| `dev` | github.com, api.github.com, registry.npmjs.org, crates.io, static.crates.io, index.crates.io, pypi.org, files.pythonhosted.org, api.openai.com, api.anthropic.com |
+| `registries` | registry.npmjs.org, crates.io, static.crates.io, index.crates.io, pypi.org, files.pythonhosted.org |
+| `none` | No outbound traffic (DNS only) |
+
+## Seccomp Profiles
+
+Restrict the syscalls available inside the microVM with `--seccomp`:
+
+```bash
+mvmctl up --flake . --seccomp standard    # File ops + process control (no sockets)
+mvmctl up --flake . --seccomp network     # Standard + socket syscalls
+mvmctl up --flake . --seccomp minimal     # Signals, pipes, timers only
+```
+
+The seccomp manifest is written to the config drive as `seccomp.json` for the guest init to apply via `prctl(PR_SET_SECCOMP)`. Tiers are cumulative — each includes all syscalls from lower tiers.
+
+| Tier | Syscalls | Use Case |
+|------|----------|----------|
+| `essential` | ~40 | Process bootstrap only (linker, glibc init) |
+| `minimal` | ~110 | + signals, pipes, timers, process control |
+| `standard` | ~140 | + file manipulation, fs operations |
+| `network` | ~160 | + sockets, connect, bind (for networked agents) |
+| `unrestricted` | all | No restrictions (default) |
+
 ## DNS
 
 The guest's `/etc/resolv.conf` is configured at build time to use the host's DNS resolver. Internet access works out of the box through the NAT chain (Firecracker), vmnet (Apple Container), or Docker bridge networking (Docker).

@@ -22,6 +22,10 @@ description: Complete command reference for mvmctl.
 | `mvmctl up --metrics-port PORT` | Bind a Prometheus metrics endpoint (0 = disabled) |
 | `mvmctl up --watch-config` | Reload ~/.mvm/config.toml automatically when it changes |
 | `mvmctl up --watch` | Watch flake for changes and auto-rebuild + reboot |
+| `mvmctl up --network-preset <preset>` | Network egress policy: `unrestricted` (default), `none`, `registries`, `dev` |
+| `mvmctl up --network-allow host:port` | Allow egress to specific host:port (repeatable, mutually exclusive with preset) |
+| `mvmctl up --seccomp <tier>` | Seccomp profile: `essential`, `minimal`, `standard`, `network`, `unrestricted` (default) |
+| `mvmctl up --secret KEY:host` | Bind a secret to a domain (repeatable; see [Config & Secrets](/guides/config-secrets/)) |
 | `mvmctl down [name]` | Stop VMs by name, or all if omitted |
 | `mvmctl down -f <config>` | Stop only VMs defined in specified config |
 | `mvmctl ls` | List running VMs (aliases: `ps`, `status`) |
@@ -30,6 +34,8 @@ description: Complete command reference for mvmctl.
 | `mvmctl forward <name> -p PORT` | Forward a port from a running VM to localhost |
 | `mvmctl logs <name>` | View guest console logs (`-f` to follow, `-n` for line count) |
 | `mvmctl logs <name> --hypervisor` | View Firecracker hypervisor logs |
+| `mvmctl diff <name>` | Show filesystem changes in a running VM (created/modified/deleted since boot) |
+| `mvmctl diff <name> --json` | Output filesystem diff as JSON |
 
 ## Environment Management
 

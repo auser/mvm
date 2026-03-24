@@ -13,7 +13,7 @@ production backend on Linux.
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 7 + root facade + xtask  |
-| Total tests      | 882+                     |
+| Total tests      | 900+                     |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | MSRV             | 1.85                     |

@@ -14,6 +14,7 @@ Every microVM built with `mkGuest` includes **mvm-guest-agent**, a lightweight R
 | **Snapshot lifecycle** | Coordinates sleep/wake: flushes data, drops page cache before snapshot, signals restore |
 | **Integration management** | Loads service definitions from `/etc/mvm/integrations.d/*.json` |
 | **Probes** | Loads read-only system checks from `/etc/mvm/probes.d/*.json` (disk usage, custom metrics) |
+| **Filesystem diff** | Walks the overlay upper dir to report files created, modified, or deleted since boot |
 | **Remote command** | Dev-only: execute commands inside the guest via vsock |
 
 ## Protocol
@@ -106,3 +107,20 @@ Before creating a snapshot, the host sends a `sleep-prep` request. The agent:
 4. Responds with "ready"
 
 On wake (snapshot restore), the host sends a `wake` request and the agent runs restore commands for each integration.
+
+## Filesystem Diff
+
+The agent can report all filesystem changes since boot by walking the overlay upper directory. When the rootfs is mounted read-only with an overlay (`readOnlyRoot = true` in mkGuest), all writes go to the upper dir. The agent detects:
+
+- **Created** files: present in the overlay upper dir
+- **Deleted** files: overlay whiteout files (`.wh.*`)
+- **Modified** files: existing files overwritten in the upper dir
+
+Query the diff from the host:
+
+```bash
+mvmctl diff my-vm         # human-readable output
+mvmctl diff my-vm --json  # JSON array of {path, kind, size}
+```
+
+This is useful for auditing what an AI agent modified during execution.
