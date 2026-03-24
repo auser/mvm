@@ -2,6 +2,24 @@
 
 All notable changes to mvm are documented in this file.
 
+## [0.8.0] — 2026-03-24
+
+### Added
+- Add agent sandbox patterns (network policy, seccomp, fs diff, secrets)
+
+### Changed
+- Trim unused deps from mvm-apple-container
+
+### Documentation
+- Explain ${system} early in Nix tutorial
+- Highlight system explanation with admonition box
+- Move system callout after the definitions list
+- Document network policies, seccomp, fs diff, and secret bindings
+
+### Fixed
+- Handle missing limactl in dev status/down gracefully
+- Unblock Apple Container backend (init path + vsock device)
+
 ## [0.7.1] — 2026-03-21
 
 ### Changed
