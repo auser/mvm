@@ -67,6 +67,24 @@ impl Platform {
         })
     }
 
+    /// Whether Nix is available on the host and can build Linux targets.
+    ///
+    /// On macOS this requires nix-daemon with a linux-builder configured.
+    /// On native Linux this is always true if `nix` is on PATH.
+    /// When true, `nix build` can run on the host without Lima.
+    pub fn has_host_nix(self) -> bool {
+        static HOST_NIX: OnceLock<bool> = OnceLock::new();
+        *HOST_NIX.get_or_init(|| {
+            std::process::Command::new("nix")
+                .args(["--version"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+        })
+    }
+
     /// Whether this platform is WSL2.
     pub fn is_wsl(self) -> bool {
         matches!(self, Platform::Wsl2)

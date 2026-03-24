@@ -1466,6 +1466,38 @@ fn human_bytes(bytes: u64) -> String {
     }
 }
 
+/// Wait for the guest agent to respond to a Ping over vsock.
+/// Returns true if the agent is reachable within `timeout_secs`.
+fn wait_for_guest_agent(vm_id: &str, timeout_secs: u64) -> bool {
+    use std::io::{Read, Write};
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
+    let ping = serde_json::to_vec(&mvm_guest::vsock::GuestRequest::Ping).unwrap_or_default();
+    let len_bytes = (ping.len() as u32).to_be_bytes();
+
+    while std::time::Instant::now() < deadline {
+        if let Ok(mut s) =
+            mvm_apple_container::vsock_connect(vm_id, mvm_guest::vsock::GUEST_AGENT_PORT)
+            && s.write_all(&len_bytes).is_ok()
+            && s.write_all(&ping).is_ok()
+            && s.flush().is_ok()
+        {
+            let mut resp_len = [0u8; 4];
+            if s.read_exact(&mut resp_len).is_ok() {
+                return true;
+            }
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+    false
+}
+
+/// Tell the guest agent to start a vsock→TCP forwarder for the given port.
+fn request_port_forward(vm_id: &str, guest_port: u16) -> Result<u32> {
+    let mut stream = mvm_apple_container::vsock_connect(vm_id, mvm_guest::vsock::GUEST_AGENT_PORT)
+        .map_err(|e| anyhow::anyhow!("{e}"))?;
+    mvm_guest::vsock::start_port_forward_on(&mut stream, guest_port)
+}
+
 /// Forward a port from a running microVM to localhost.
 ///
 /// On macOS this tunnels through Lima's SSH connection; on native Linux
@@ -1815,13 +1847,17 @@ fn cmd_build(path: &str, output: Option<&str>) -> Result<()> {
 fn cmd_build_flake(flake_ref: &str, profile: Option<&str>, watch: bool, json: bool) -> Result<()> {
     validate_flake_ref(flake_ref)
         .with_context(|| format!("Invalid flake reference: {:?}", flake_ref))?;
-    if bootstrap::is_lima_required() {
+
+    let build_env = mvm_runtime::build_env::default_build_env();
+    let env = build_env.as_ref();
+
+    // Skip Lima when Nix is available on the host (macOS with linux-builder).
+    let using_host_nix = mvm_core::platform::current().has_host_nix();
+    if !using_host_nix && bootstrap::is_lima_required() {
         lima::require_running()?;
     }
 
     let resolved = resolve_flake_ref(flake_ref)?;
-
-    let env = mvm_runtime::build_env::RuntimeBuildEnv;
     let watch_enabled = watch && !resolved.contains(':');
 
     if watch && resolved.contains(':') && !json {
@@ -1843,7 +1879,7 @@ fn cmd_build_flake(flake_ref: &str, profile: Option<&str>, watch: bool, json: bo
             );
         }
 
-        let result = match mvm_build::dev_build::dev_build(&env, &resolved, profile) {
+        let result = match mvm_build::dev_build::dev_build(env, &resolved, profile) {
             Ok(r) => r,
             Err(e) => {
                 if json {
@@ -1854,7 +1890,12 @@ fn cmd_build_flake(flake_ref: &str, profile: Option<&str>, watch: bool, json: bo
                 return Err(e);
             }
         };
-        mvm_build::dev_build::ensure_guest_agent_if_needed(&env, &result)?;
+        if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(env, &result) {
+            ui::warn(&format!(
+                "Could not verify guest agent ({}). If built with mkGuest, the agent is already included.",
+                e
+            ));
+        }
 
         if json {
             #[derive(Serialize)]
@@ -2080,13 +2121,15 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
         None
     };
 
-    // Generate a VM name if not provided
+    // Generate a VM name if not provided.
+    // After codesign re-exec (macOS), the env var preserves the originally
+    // generated name so we don't produce a second random name.
     let vm_name = match name {
         Some(n) => n.to_string(),
-        None => {
+        None => std::env::var("MVM_REEXEC_NAME").unwrap_or_else(|_| {
             let mut generator = names::Generator::default();
             generator.next().unwrap_or_else(|| "vm-0".to_string())
-        }
+        }),
     };
 
     // Direct boot mode: launchd agent passes kernel/rootfs via env vars.
@@ -2109,21 +2152,23 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
         let backend = AnyBackend::from_hypervisor(effective_hypervisor);
         backend.start(&start_config)?;
 
-        // Set up port forwarding from MVM_PORTS env var
+        // Set up port forwarding from MVM_PORTS env var (via vsock)
         if let Ok(ports_str) = std::env::var("MVM_PORTS")
             && !ports_str.is_empty()
         {
-            ui::info("Waiting for guest network (DHCP)...");
-            if let Some(guest_ip) = mvm_apple_container::discover_guest_ip(15) {
-                ui::success(&format!("Guest IP: {guest_ip}"));
+            ui::info("Waiting for guest agent...");
+            if wait_for_guest_agent(&vm_name, 30) {
                 for spec in ports_str.split(',') {
                     if let Some((host, guest)) = spec.split_once(':')
                         && let (Ok(h), Ok(g)) = (host.parse::<u16>(), guest.parse::<u16>())
                     {
-                        mvm_apple_container::start_port_proxy(h, &guest_ip, g);
-                        ui::info(&format!("Forwarding localhost:{h} → {guest_ip}:{g}"));
+                        let _ = request_port_forward(&vm_name, g);
+                        mvm_apple_container::start_port_proxy(&vm_name, h, g);
+                        ui::info(&format!("Forwarding localhost:{h} → guest tcp/{g} (vsock)"));
                     }
                 }
+            } else {
+                ui::warn("Guest agent not reachable — port forwarding unavailable.");
             }
         }
 
@@ -2199,9 +2244,15 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 resolved, profile_display, vm_name
             ),
         );
-        let env = mvm_runtime::build_env::RuntimeBuildEnv;
-        let result = mvm_build::dev_build::dev_build(&env, &resolved, profile)?;
-        mvm_build::dev_build::ensure_guest_agent_if_needed(&env, &result)?;
+        let run_build_env = mvm_runtime::build_env::default_build_env();
+        let env = run_build_env.as_ref();
+        let result = mvm_build::dev_build::dev_build(env, &resolved, profile)?;
+        if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(env, &result) {
+            ui::warn(&format!(
+                "Could not verify guest agent ({}). If built with mkGuest, the agent is already included.",
+                e
+            ));
+        }
         if result.cached {
             ui::info(&format!("Cache hit — revision {}", result.revision_hash));
         } else {
@@ -2350,6 +2401,12 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
     let vm_name_owned = vm_name.clone();
     let has_ports = !port_mappings.is_empty();
 
+    // Stash the generated VM name so that if the Apple Container backend
+    // re-execs after codesigning, the new process reuses the same name.
+    // SAFETY: called early in single-threaded CLI startup before spawning
+    // worker threads; no other threads are reading env vars concurrently.
+    unsafe { std::env::set_var("MVM_REEXEC_NAME", &vm_name) };
+
     // If a template snapshot exists AND the backend supports snapshots,
     // restore from it instead of cold-booting.
     let backend = AnyBackend::from_hypervisor(effective_hypervisor);
@@ -2438,30 +2495,44 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
     // Apple Virtualization VMs live in-process — the process must stay alive.
     if effective_hypervisor == "apple-container" && !detach {
-        // Discover guest IP and set up port forwarding
+        // Set up port forwarding via vsock (no guest IP needed).
+        // 1. Wait for guest agent to be ready on vsock port 52
+        // 2. Tell the agent to start vsock→TCP forwarders for each port
+        // 3. Start host-side TCP→vsock proxies
         if has_ports {
-            ui::info("Waiting for guest network (DHCP)...");
-            if let Some(guest_ip) = mvm_apple_container::discover_guest_ip(15) {
-                ui::success(&format!("Guest IP: {guest_ip}"));
-                // Save guest IP to state dir
-                let ip_file = format!(
-                    "{}/.mvm/vms/{}/guest_ip",
-                    std::env::var("HOME").unwrap_or_default(),
-                    vm_name_owned
-                );
-                let _ = std::fs::write(&ip_file, &guest_ip);
+            let pm_list = parse_port_specs(ports).unwrap_or_default();
 
-                // Start TCP proxy for each declared port
-                let pm_list = parse_port_specs(ports).unwrap_or_default();
+            ui::info("Waiting for guest agent...");
+            let agent_ready = wait_for_guest_agent(&vm_name_owned, 30);
+            if !agent_ready {
+                ui::warn("Guest agent not reachable — port forwarding unavailable.");
+            } else {
+                // Tell guest agent to start vsock forwarders
                 for pm in &pm_list {
-                    mvm_apple_container::start_port_proxy(pm.host, &guest_ip, pm.guest);
+                    match request_port_forward(&vm_name_owned, pm.guest) {
+                        Ok(vsock_port) => {
+                            ui::info(&format!(
+                                "Guest forwarding vsock:{vsock_port} → tcp/{}",
+                                pm.guest
+                            ));
+                        }
+                        Err(e) => {
+                            ui::warn(&format!(
+                                "Failed to set up guest forwarder for port {}: {e}",
+                                pm.guest
+                            ));
+                        }
+                    }
+                }
+
+                // Start host-side proxies
+                for pm in &pm_list {
+                    mvm_apple_container::start_port_proxy(&vm_name_owned, pm.host, pm.guest);
                     ui::info(&format!(
-                        "Forwarding localhost:{} → {}:{}",
-                        pm.host, guest_ip, pm.guest
+                        "Forwarding localhost:{} → guest tcp/{} (vsock)",
+                        pm.host, pm.guest
                     ));
                 }
-            } else {
-                ui::warn("Could not discover guest IP — port forwarding unavailable.");
             }
         }
 

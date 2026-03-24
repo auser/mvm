@@ -8,7 +8,6 @@ use mvm_core::template::{
 
 use tracing::{instrument, warn};
 
-use crate::build_env::RuntimeBuildEnv;
 use crate::shell;
 use crate::ui;
 use mvm_core::pool::ArtifactPaths;
@@ -192,7 +191,8 @@ pub fn template_build(id: &str, force: bool, update_hash: bool) -> Result<()> {
     use crate::ui;
 
     let spec = template_load(id)?;
-    let env = RuntimeBuildEnv;
+    let build_env = crate::build_env::default_build_env();
+    let env = build_env.as_ref();
 
     ui::info(&format!(
         "Building template '{}' (flake: {}, profile: {})",
@@ -210,15 +210,17 @@ pub fn template_build(id: &str, force: bool, update_hash: bool) -> Result<()> {
     if force {
         ui::info("Force build: clearing dev build cache");
         let builds_dir = format!("{}/dev/builds", mvm_core::config::mvm_data_dir());
-        if let Err(e) = shell::run_in_vm(&format!("rm -rf {builds_dir}")) {
+        if let Err(e) = env.shell_exec(&format!("rm -rf {builds_dir}")) {
             warn!("failed to clear dev build cache: {e}");
         }
     }
-    let result = mvm_build::dev_build::dev_build(&env, &spec.flake_ref, Some(&spec.profile))?;
+    let result = mvm_build::dev_build::dev_build(env, &spec.flake_ref, Some(&spec.profile))?;
     // Best-effort: inject guest agent if not already present.
     // Non-fatal because flakes built with mvm's mkGuest already include
     // guest-agent.nix, and the loop-mount check can fail on virtiofs.
-    if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(&env, &result) {
+    // On host builds (macOS without Lima), the ext4 mount will fail
+    // gracefully — flakes using mkGuest already include the agent.
+    if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(env, &result) {
         ui::warn(&format!(
             "Could not verify guest agent ({}). If built with mvm's mkGuest, the agent is already included.",
             e

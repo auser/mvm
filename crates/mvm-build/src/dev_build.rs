@@ -440,7 +440,7 @@ pub fn ensure_guest_agent_if_needed(
 /// Ensure the guest agent is present in the built rootfs.
 ///
 /// Checks whether `mvm-guest-agent` exists in the rootfs. If not, builds it
-/// from the mvm workspace and injects it (binary + systemd service + drop-in dir)
+/// from the mvm workspace and injects it (binary, systemd service, drop-in dir)
 /// into the ext4 image. This guarantees every mvm-built image has the guest agent
 /// regardless of whether the user's flake explicitly includes it.
 fn ensure_guest_agent(

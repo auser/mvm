@@ -17,6 +17,10 @@ pub const GUEST_CID: u32 = 3;
 /// Port the guest vsock agent listens on.
 pub const GUEST_AGENT_PORT: u32 = 52;
 
+/// Base vsock port for TCP port forwarding.
+/// The forwarded vsock port = `PORT_FORWARD_BASE + guest_tcp_port`.
+pub const PORT_FORWARD_BASE: u32 = 10000;
+
 /// Default connect/read timeout in seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
@@ -65,6 +69,10 @@ pub enum GuestRequest {
     PostRestore,
     /// Request filesystem diff (changes since boot, from overlay or snapshot).
     FsDiff,
+    /// Start a vsock→TCP port forwarder for the given guest port.
+    /// The agent binds vsock port `PORT_FORWARD_BASE + guest_port` and
+    /// forwards each connection to `localhost:guest_port`.
+    StartPortForward { guest_port: u16 },
 }
 
 /// Response from guest vsock agent to host.
@@ -114,6 +122,8 @@ pub enum GuestResponse {
     },
     /// Filesystem diff result.
     FsDiffResult { changes: Vec<FsChange> },
+    /// Port forward started successfully.
+    PortForwardStarted { guest_port: u16, vsock_port: u32 },
 }
 
 /// A single filesystem change detected since boot.
@@ -829,6 +839,21 @@ pub fn query_fs_diff_at(vsock_uds_path: &str) -> Result<Vec<FsChange>> {
     }
 }
 
+/// Send a `StartPortForward` request on an already-connected stream.
+///
+/// Used by the Apple Container backend where the vsock connection is
+/// established via `VZVirtioSocketDevice` rather than a UDS path.
+pub fn start_port_forward_on(stream: &mut UnixStream, guest_port: u16) -> Result<u32> {
+    let resp = send_request(stream, &GuestRequest::StartPortForward { guest_port })?;
+    match resp {
+        GuestResponse::PortForwardStarted { vsock_port, .. } => Ok(vsock_port),
+        GuestResponse::Error { message } => {
+            bail!("Guest port-forward error: {}", message);
+        }
+        _ => bail!("Unexpected response to StartPortForward"),
+    }
+}
+
 // ============================================================================
 // Tests
 // ============================================================================
@@ -858,6 +883,7 @@ mod tests {
             },
             GuestRequest::PostRestore,
             GuestRequest::FsDiff,
+            GuestRequest::StartPortForward { guest_port: 8080 },
         ];
 
         for req in &variants {
@@ -937,6 +963,10 @@ mod tests {
                         size: 0,
                     },
                 ],
+            },
+            GuestResponse::PortForwardStarted {
+                guest_port: 8080,
+                vsock_port: 18080,
             },
         ];
 

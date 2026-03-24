@@ -283,14 +283,13 @@ pub fn discover_guest_ip(timeout: Duration) -> Option<String> {
     None
 }
 
-/// Start a TCP proxy that forwards localhost:host_port to guest_ip:guest_port.
-/// Runs in a background thread. Returns immediately.
-pub fn start_port_proxy(host_port: u16, guest_ip: &str, guest_port: u16) {
-    use std::net::{TcpListener, TcpStream};
+/// Start a port proxy that forwards localhost:host_port to the guest's
+/// tcp_port via vsock. The guest agent runs a vsock→TCP forwarder on
+/// `PORT_FORWARD_BASE + guest_port`. Runs in a background thread.
+pub fn start_port_proxy(vm_id: &str, host_port: u16, guest_port: u16) {
+    use std::net::TcpListener;
 
-    let target = format!("{guest_ip}:{guest_port}");
     let bind = format!("127.0.0.1:{host_port}");
-
     let listener = match TcpListener::bind(&bind) {
         Ok(l) => l,
         Err(e) => {
@@ -298,22 +297,36 @@ pub fn start_port_proxy(host_port: u16, guest_ip: &str, guest_port: u16) {
             return;
         }
     };
-    tracing::info!("Port forwarding: localhost:{host_port} → {target}");
 
+    // Must match mvm_guest::vsock::PORT_FORWARD_BASE
+    let vsock_port = 10000u32 + guest_port as u32;
+    tracing::info!(
+        "Port forwarding: localhost:{host_port} → vsock:{vsock_port} → guest tcp/{guest_port}"
+    );
+
+    let vm_id = vm_id.to_string();
     std::thread::Builder::new()
         .name(format!("proxy-{host_port}"))
         .spawn(move || {
             for stream in listener.incoming().flatten() {
-                let target = target.clone();
+                let vm_id = vm_id.clone();
                 std::thread::spawn(move || {
-                    let Ok(upstream) = TcpStream::connect(&target) else {
-                        return;
+                    let upstream = match vsock_connect(&vm_id, vsock_port) {
+                        Ok(s) => s,
+                        Err(e) => {
+                            tracing::warn!(
+                                "Port proxy: vsock connect to {vm_id} port {vsock_port} failed: {e}"
+                            );
+                            return;
+                        }
                     };
                     let downstream = stream;
                     let Ok(mut up_read) = upstream.try_clone() else {
+                        tracing::warn!("Port proxy: upstream clone failed");
                         return;
                     };
                     let Ok(mut down_write) = downstream.try_clone() else {
+                        tracing::warn!("Port proxy: downstream clone failed");
                         return;
                     };
                     let mut up_write = upstream;

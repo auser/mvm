@@ -88,15 +88,15 @@ pub fn discover_guest_ip(timeout_secs: u64) -> Option<String> {
     }
 }
 
-/// Start a TCP proxy from localhost:host_port to guest_ip:guest_port.
-pub fn start_port_proxy(host_port: u16, guest_ip: &str, guest_port: u16) {
+/// Start a port proxy from localhost:host_port to guest tcp/guest_port via vsock.
+pub fn start_port_proxy(vm_id: &str, host_port: u16, guest_port: u16) {
     #[cfg(target_os = "macos")]
     {
-        macos::start_port_proxy(host_port, guest_ip, guest_port);
+        macos::start_port_proxy(vm_id, host_port, guest_port);
     }
     #[cfg(not(target_os = "macos"))]
     {
-        let _ = (host_port, guest_ip, guest_port);
+        let _ = (vm_id, host_port, guest_port);
     }
 }
 

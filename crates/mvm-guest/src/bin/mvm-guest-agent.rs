@@ -939,9 +939,106 @@ fn handle_client(
             let changes = collect_fs_diff();
             GuestResponse::FsDiffResult { changes }
         }
+
+        GuestRequest::StartPortForward { guest_port } => {
+            let vsock_port = mvm_guest::vsock::PORT_FORWARD_BASE + guest_port as u32;
+            eprintln!("port-fwd: starting vsock:{vsock_port} → tcp://localhost:{guest_port}");
+            std::thread::spawn(move || {
+                run_port_forwarder(vsock_port, guest_port);
+            });
+            GuestResponse::PortForwardStarted {
+                guest_port,
+                vsock_port,
+            }
+        }
     };
 
     write_response(&mut file, &resp);
+}
+
+// ============================================================================
+// Vsock → TCP port forwarders
+// ============================================================================
+
+/// Bind a vsock listener and forward each connection to a local TCP port.
+fn run_port_forwarder(vsock_port: u32, tcp_port: u16) {
+    // SAFETY: libc call with constant arguments.
+    let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
+    if fd < 0 {
+        eprintln!("port-fwd: failed to create vsock socket for port {tcp_port}");
+        return;
+    }
+
+    let addr = SockAddrVm {
+        svm_family: AF_VSOCK as u16,
+        svm_reserved1: 0,
+        svm_port: vsock_port,
+        svm_cid: VMADDR_CID_ANY,
+        svm_zero: [0; 4],
+    };
+
+    // SAFETY: valid pointer and size.
+    let rc = unsafe {
+        bind(
+            fd,
+            &addr as *const SockAddrVm as *const core::ffi::c_void,
+            size_of::<SockAddrVm>() as u32,
+        )
+    };
+    if rc != 0 {
+        eprintln!("port-fwd: failed to bind vsock port {vsock_port} for tcp/{tcp_port}");
+        unsafe {
+            close(fd);
+        }
+        return;
+    }
+
+    // SAFETY: fd is valid.
+    if unsafe { listen(fd, 8) } != 0 {
+        eprintln!("port-fwd: failed to listen on vsock port {vsock_port}");
+        unsafe {
+            close(fd);
+        }
+        return;
+    }
+
+    eprintln!("port-fwd: vsock:{vsock_port} → tcp://localhost:{tcp_port}");
+
+    loop {
+        // SAFETY: null addr pointers are fine when we don't need peer info.
+        let cfd = unsafe { accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if cfd < 0 {
+            continue;
+        }
+
+        std::thread::spawn(move || {
+            use std::os::unix::net::UnixStream;
+            // SAFETY: cfd is a valid fd from accept(). UnixStream is a
+            // thin wrapper around an fd — works fine for vsock sockets.
+            let vsock_stream = unsafe { UnixStream::from_raw_fd(cfd as RawFd) };
+            let Ok(tcp_stream) = std::net::TcpStream::connect(("127.0.0.1", tcp_port)) else {
+                eprintln!("port-fwd: connect to localhost:{tcp_port} failed");
+                return;
+            };
+            let Ok(mut tcp_read) = tcp_stream.try_clone() else {
+                return;
+            };
+            let Ok(mut vsock_write) = vsock_stream.try_clone() else {
+                return;
+            };
+            let mut vsock_read = vsock_stream;
+            let mut tcp_write = tcp_stream;
+
+            let h1 = std::thread::spawn(move || {
+                let _ = std::io::copy(&mut vsock_read, &mut tcp_write);
+            });
+            let h2 = std::thread::spawn(move || {
+                let _ = std::io::copy(&mut tcp_read, &mut vsock_write);
+            });
+            let _ = h1.join();
+            let _ = h2.join();
+        });
+    }
 }
 
 // ============================================================================
@@ -1039,6 +1136,9 @@ fn main() {
         let health_probe_state = Arc::clone(&probe_state);
         std::thread::spawn(move || probe_health_loop(health_probe_state));
     }
+
+    // Port forwarders are started on-demand via StartPortForward requests
+    // from the host (works with all backends, no config drive needed).
 
     eprintln!(
         "mvm-guest-agent: listening on vsock port {} ({} integrations, {} probes)",
