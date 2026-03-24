@@ -131,16 +131,21 @@ impl VmBackend for AppleContainerBackend {
         let ids = mvm_apple_container::list_ids();
         Ok(ids
             .into_iter()
-            .map(|id| VmInfo {
-                id: VmId(id.clone()),
-                name: id,
-                status: VmStatus::Running,
-                guest_ip: None,
-                cpus: 0,
-                memory_mib: 0,
-                profile: None,
-                revision: None,
-                flake_ref: None,
+            .map(|id| {
+                // Read persisted port mappings if available
+                let ports = read_vm_ports(&id);
+                VmInfo {
+                    id: VmId(id.clone()),
+                    name: id,
+                    status: VmStatus::Running,
+                    guest_ip: None,
+                    cpus: 0,
+                    memory_mib: 0,
+                    profile: None,
+                    revision: None,
+                    flake_ref: None,
+                    ports,
+                }
             })
             .collect())
     }
@@ -178,6 +183,25 @@ impl VmBackend for AppleContainerBackend {
             port: mvm_apple_container::GUEST_AGENT_PORT,
         })
     }
+}
+
+/// Read persisted port mappings from the VM state directory.
+fn read_vm_ports(vm_name: &str) -> Vec<mvm_core::vm_backend::VmPortMapping> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let path = format!("{home}/.mvm/vms/{vm_name}/ports");
+    let Ok(content) = std::fs::read_to_string(&path) else {
+        return Vec::new();
+    };
+    content
+        .split(',')
+        .filter_map(|spec| {
+            let (host, guest) = spec.split_once(':')?;
+            Some(mvm_core::vm_backend::VmPortMapping {
+                host: host.parse().ok()?,
+                guest: guest.parse().ok()?,
+            })
+        })
+        .collect()
 }
 
 #[cfg(test)]

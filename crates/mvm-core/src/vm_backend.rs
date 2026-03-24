@@ -216,6 +216,9 @@ pub struct VmInfo {
     /// Original flake reference.
     #[serde(default)]
     pub flake_ref: Option<String>,
+    /// Active port forwardings (host:guest).
+    #[serde(default)]
+    pub ports: Vec<VmPortMapping>,
 }
 
 /// Backend-agnostic VM lifecycle trait.
@@ -360,6 +363,10 @@ mod tests {
             profile: Some("worker".to_string()),
             revision: Some("abc123".to_string()),
             flake_ref: Some("/home/user/project".to_string()),
+            ports: vec![VmPortMapping {
+                host: 8888,
+                guest: 8080,
+            }],
         };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: VmInfo = serde_json::from_str(&json).unwrap();

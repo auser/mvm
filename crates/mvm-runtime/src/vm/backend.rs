@@ -135,6 +135,7 @@ impl VmBackend for FirecrackerBackend {
                     profile: info.profile,
                     revision: info.revision,
                     flake_ref: info.flake_ref,
+                    ports: Vec::new(),
                 })
             })
             .collect())

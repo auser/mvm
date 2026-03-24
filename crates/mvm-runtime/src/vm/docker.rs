@@ -293,6 +293,7 @@ impl VmBackend for DockerBackend {
                     .get(4)
                     .filter(|s| !s.is_empty())
                     .map(|s| s.to_string()),
+                ports: Vec::new(),
             });
         }
         Ok(vms)

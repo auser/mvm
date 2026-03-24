@@ -175,8 +175,8 @@ enum Commands {
         ports: Vec<String>,
     },
     /// List running VMs
-    #[command(alias = "ps", alias = "status")]
-    Ls {
+    #[command(alias = "ls", alias = "status")]
+    Ps {
         /// Show all VMs (including stopped)
         #[arg(long, short = 'a')]
         all: bool,
@@ -767,7 +767,7 @@ pub fn run() -> Result<()> {
             cmd_forward(&name, &all_ports)
         }
 
-        Commands::Ls { all, json } => cmd_ls(all, json),
+        Commands::Ps { all, json } => cmd_ls(all, json),
         Commands::Update {
             check,
             force,
@@ -1714,10 +1714,9 @@ fn cmd_ls(_all: bool, json: bool) -> Result<()> {
     }
 
     // Docker-style table output
-    let image_header = "IMAGE";
     println!(
-        "{:<20} {:<18} {:<10} {:<8} {:<10} {}",
-        "NAME", "BACKEND", "STATUS", "CPUS", "MEMORY", image_header
+        "{:<20} {:<18} {:<10} {:<8} {:<10} {:<20} IMAGE",
+        "NAME", "BACKEND", "STATUS", "CPUS", "MEMORY", "PORTS"
     );
     for vm in &all_vms {
         let backend_name = if vm.flake_ref.as_deref().is_some() {
@@ -1741,8 +1740,17 @@ fn cmd_ls(_all: bool, json: bool) -> Result<()> {
             .as_deref()
             .or(vm.profile.as_deref())
             .unwrap_or("-");
+        let ports = if vm.ports.is_empty() {
+            "-".to_string()
+        } else {
+            vm.ports
+                .iter()
+                .map(|p| format!("{}→{}", p.host, p.guest))
+                .collect::<Vec<_>>()
+                .join(", ")
+        };
         println!(
-            "{:<20} {:<18} {:<10} {:<8} {:<10} {}",
+            "{:<20} {:<18} {:<10} {:<8} {:<10} {:<20} {}",
             vm.name,
             backend_name,
             status,
@@ -1752,6 +1760,7 @@ fn cmd_ls(_all: bool, json: bool) -> Result<()> {
                 "-".to_string()
             },
             mem,
+            ports,
             image,
         );
     }
@@ -2533,6 +2542,18 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
                         pm.host, pm.guest
                     ));
                 }
+
+                // Persist port mappings so `ps` can display them
+                let ports_str: Vec<String> = pm_list
+                    .iter()
+                    .map(|p| format!("{}:{}", p.host, p.guest))
+                    .collect();
+                let ports_file = format!(
+                    "{}/.mvm/vms/{}/ports",
+                    std::env::var("HOME").unwrap_or_default(),
+                    vm_name_owned
+                );
+                let _ = std::fs::write(&ports_file, ports_str.join(","));
             }
         }
 
@@ -3890,9 +3911,15 @@ mod tests {
     // -------------------------------------------------------------------------
 
     #[test]
-    fn test_ps_alias_for_status() {
+    fn test_ls_alias_for_ps() {
+        let cli = Cli::try_parse_from(["mvmctl", "ls"]).unwrap();
+        assert!(matches!(cli.command, Commands::Ps { .. }));
+    }
+
+    #[test]
+    fn test_ps_command() {
         let cli = Cli::try_parse_from(["mvmctl", "ps"]).unwrap();
-        assert!(matches!(cli.command, Commands::Ls { .. }));
+        assert!(matches!(cli.command, Commands::Ps { .. }));
     }
 
     #[test]

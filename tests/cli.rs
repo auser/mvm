@@ -47,7 +47,7 @@ fn test_help_lists_all_subcommands() {
         "setup",
         "dev",
         "cleanup",
-        "ls",
+        "ps",
         "uninstall",
         "audit",
         "update",
