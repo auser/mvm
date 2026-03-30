@@ -2,6 +2,19 @@
 
 All notable changes to mvm are documented in this file.
 
+## [0.9.1] — 2026-03-30
+
+### Added
+- Sprint 40 — Apple Container dev environment
+- Shared directory support for Apple Container dev VMs
+- CI builds pre-built dev image for Apple Container
+
+### Fixed
+- Detect Nix at common install paths when not on PATH
+- Dev image flake works from macOS, detect Nix at install paths
+- Auto-configure Nix Linux builder for macOS dev image builds
+- Fallback to downloading pre-built dev image when Nix can't cross-compile
+
 ## [0.9.0] — 2026-03-30
 
 ### Added
