@@ -12,10 +12,15 @@ use crate::security::{GateDecision, ThreatFinding};
 
 /// Default path for the local audit log.
 ///
-/// Uses the user-writable mvm data directory (`~/.mvm/log/`) instead of
-/// `/var/log/mvm/` which requires root.
+/// Prefers XDG state directory (`~/.local/state/mvm/log/`). Falls back to
+/// legacy `~/.mvm/log/` if an audit log already exists there.
 pub fn default_audit_log() -> String {
-    format!("{}/log/audit.jsonl", crate::config::mvm_data_dir())
+    // Check legacy location for backward compat
+    let legacy = format!("{}/log/audit.jsonl", crate::config::mvm_data_dir());
+    if std::path::Path::new(&legacy).exists() {
+        return legacy;
+    }
+    format!("{}/log/audit.jsonl", crate::config::mvm_state_dir())
 }
 
 /// Rotate when the audit log exceeds this size.
@@ -32,6 +37,16 @@ pub enum LocalAuditKind {
     VolumeOpen,
     UpdateInstall,
     Uninstall,
+    // --- DX features (Phase 2) ---
+    NetworkCreate,
+    NetworkRemove,
+    ImageFetch,
+    TemplateBuild,
+    TemplatePush,
+    TemplatePull,
+    ConfigChange,
+    ConsoleSessionStart,
+    ConsoleSessionEnd,
 }
 
 /// A single local audit log entry.
@@ -336,6 +351,15 @@ mod tests {
             LocalAuditKind::VolumeOpen,
             LocalAuditKind::UpdateInstall,
             LocalAuditKind::Uninstall,
+            LocalAuditKind::NetworkCreate,
+            LocalAuditKind::NetworkRemove,
+            LocalAuditKind::ImageFetch,
+            LocalAuditKind::TemplateBuild,
+            LocalAuditKind::TemplatePush,
+            LocalAuditKind::TemplatePull,
+            LocalAuditKind::ConfigChange,
+            LocalAuditKind::ConsoleSessionStart,
+            LocalAuditKind::ConsoleSessionEnd,
         ];
         for kind in kinds {
             let json = serde_json::to_string(&kind).unwrap();

@@ -2,6 +2,7 @@
 // Depends on mvm-core
 
 pub mod builder_agent;
+pub mod console;
 pub mod integrations;
 pub mod probes;
 pub mod vsock;

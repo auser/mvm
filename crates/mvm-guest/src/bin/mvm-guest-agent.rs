@@ -951,6 +951,75 @@ fn handle_client(
                 vsock_port,
             }
         }
+
+        GuestRequest::ConsoleOpen { cols, rows } => {
+            // Check security policy — console requires access.console = true
+            let console_allowed = mvm_guest::builder_agent::load_security_policy()
+                .ok()
+                .flatten()
+                .is_some_and(|p| p.access.console);
+            if !console_allowed {
+                return write_response(
+                    &mut file,
+                    &GuestResponse::Error {
+                        message: "console rejected: access.console not enabled in security policy"
+                            .to_string(),
+                    },
+                );
+            }
+            match mvm_guest::console::open_session(cols, rows) {
+                Ok(session) => {
+                    let session_id = session.session_id;
+                    let data_port = session.data_port;
+                    eprintln!("console: opened session {session_id}, data port {data_port}");
+
+                    // Run the relay in a background thread
+                    std::thread::spawn(move || {
+                        let exit_code = mvm_guest::console::run_console_relay(&session);
+                        eprintln!("console: session {session_id} ended, exit code {exit_code}");
+                    });
+
+                    GuestResponse::ConsoleOpened {
+                        session_id,
+                        data_port,
+                    }
+                }
+                Err(e) => GuestResponse::Error {
+                    message: format!("console open failed: {e}"),
+                },
+            }
+        }
+
+        GuestRequest::ConsoleClose { session_id: _ } => {
+            // Console sessions end when the shell exits or the host disconnects.
+            // Explicit close is a no-op if already closed.
+            if mvm_guest::console::is_active() {
+                GuestResponse::Error {
+                    message: "explicit close not yet supported — disconnect to end session"
+                        .to_string(),
+                }
+            } else {
+                GuestResponse::ConsoleExited {
+                    session_id: 0,
+                    exit_code: 0,
+                }
+            }
+        }
+
+        GuestRequest::ConsoleResize {
+            session_id,
+            cols,
+            rows,
+        } => {
+            if mvm_guest::console::resize_active_session(cols, rows) {
+                eprintln!("console: resized to {cols}x{rows}");
+                GuestResponse::ConsoleResized { session_id }
+            } else {
+                GuestResponse::Error {
+                    message: "no active console session to resize".to_string(),
+                }
+            }
+        }
     };
 
     write_response(&mut file, &resp);

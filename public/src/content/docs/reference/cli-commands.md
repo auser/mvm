@@ -26,6 +26,7 @@ description: Complete command reference for mvmctl.
 | `mvmctl up --network-allow host:port` | Allow egress to specific host:port (repeatable, mutually exclusive with preset) |
 | `mvmctl up --seccomp <tier>` | Seccomp profile: `essential`, `minimal`, `standard`, `network`, `unrestricted` (default) |
 | `mvmctl up --secret KEY:host` | Bind a secret to a domain (repeatable; see [Config & Secrets](/guides/config-secrets/)) |
+| `mvmctl up --network <name>` | Named dev network to attach VM to (default: "default") |
 | `mvmctl down [name]` | Stop VMs by name, or all if omitted |
 | `mvmctl down -f <config>` | Stop only VMs defined in specified config |
 | `mvmctl ls` | List running VMs (aliases: `ps`, `status`) |
@@ -128,6 +129,54 @@ description: Complete command reference for mvmctl.
 | `mvmctl flake check` | Validate a Nix flake before building (current directory) |
 | `mvmctl flake check --flake <ref>` | Validate a specific flake path or reference |
 | `mvmctl flake check --json` | Output structured JSON instead of human-readable output |
+
+## Networks
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl network create <name>` | Create a named dev network with its own bridge and subnet |
+| `mvmctl network list` | List all dev networks (alias: `ls`) |
+| `mvmctl network inspect <name>` | Show details of a named network (JSON) |
+| `mvmctl network remove <name>` | Remove a named network (alias: `rm`) |
+
+## Image Catalog
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl image list` | List available images in the bundled catalog (alias: `ls`) |
+| `mvmctl image search <query>` | Search images by name, description, or tag |
+| `mvmctl image fetch <name>` | Build an image from the catalog (creates template + runs Nix build) |
+| `mvmctl image info <name>` | Show catalog entry details (JSON) |
+
+## Console
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl console <name>` | Interactive PTY shell into a running VM (vsock, no SSH) |
+| `mvmctl console <name> --command <cmd>` | Run a one-shot command in the VM |
+
+## Cache
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl cache info` | Show cache directory path and disk usage |
+| `mvmctl cache prune` | Remove stale temp files from the cache |
+| `mvmctl cache prune --dry-run` | Show what would be removed without deleting |
+
+## Security
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl security status` | Show security posture evaluation (vsock auth, seccomp, no-SSH, etc.) |
+| `mvmctl security status --json` | Output posture report as JSON |
+
+## Setup
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl init` | First-time setup wizard (deps, Lima VM, default network, XDG dirs) |
+| `mvmctl init --non-interactive` | Run setup with defaults, no prompts |
+| `mvmctl init --lima-cpus N --lima-mem N` | Configure Lima VM resources |
 
 ## Utilities
 

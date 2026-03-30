@@ -21,6 +21,8 @@ pub struct MvmConfig {
     pub log_format: Option<String>,
     /// Port for the Prometheus metrics endpoint. None means disabled.
     pub metrics_port: Option<u16>,
+    /// URL for remote image catalog. None means use bundled catalog only.
+    pub catalog_url: Option<String>,
 }
 
 impl Default for MvmConfig {
@@ -32,17 +34,35 @@ impl Default for MvmConfig {
             default_memory_mib: 512,
             log_format: None,
             metrics_port: None,
+            catalog_url: None,
         }
     }
 }
 
-/// Resolve the config directory: `~/.mvm/` by default, or an override for tests.
+/// Resolve the config directory.
+///
+/// Uses `mvm_config_dir()` (XDG-compliant) by default, or `override_dir` for tests.
+/// Falls back to `~/.mvm/` if an existing config lives there (migration compat).
 fn config_dir(override_dir: Option<&Path>) -> PathBuf {
     if let Some(d) = override_dir {
         return d.to_path_buf();
     }
+
+    // Check XDG location first
+    let xdg_dir = PathBuf::from(crate::config::mvm_config_dir());
+    if xdg_dir.join("config.toml").exists() {
+        return xdg_dir;
+    }
+
+    // Fall back to legacy ~/.mvm/ if config exists there
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-    PathBuf::from(home).join(".mvm")
+    let legacy_dir = PathBuf::from(&home).join(".mvm");
+    if legacy_dir.join("config.toml").exists() {
+        return legacy_dir;
+    }
+
+    // New installs use XDG
+    xdg_dir
 }
 
 fn config_path(dir: &Path) -> PathBuf {
@@ -138,10 +158,17 @@ pub fn set_key(cfg: &mut MvmConfig, key: &str, value: &str) -> Result<()> {
                 })?)
             };
         }
+        "catalog_url" => {
+            cfg.catalog_url = if value == "none" || value.is_empty() {
+                None
+            } else {
+                Some(value.to_string())
+            };
+        }
         other => {
             anyhow::bail!(
                 "Unknown config key {:?}. Valid keys: lima_cpus, lima_mem_gib, \
-                 default_cpus, default_memory_mib, log_format, metrics_port",
+                 default_cpus, default_memory_mib, log_format, metrics_port, catalog_url",
                 other
             );
         }
@@ -216,6 +243,32 @@ mod tests {
         let err = set_key(&mut cfg, "not_a_key", "5").unwrap_err();
         assert!(err.to_string().contains("Unknown config key"));
         assert!(err.to_string().contains("lima_cpus"));
+    }
+
+    #[test]
+    fn test_set_key_catalog_url() {
+        let mut cfg = MvmConfig::default();
+        set_key(&mut cfg, "catalog_url", "https://example.com/catalog.json").unwrap();
+        assert_eq!(
+            cfg.catalog_url.as_deref(),
+            Some("https://example.com/catalog.json")
+        );
+    }
+
+    #[test]
+    fn test_set_key_catalog_url_none() {
+        let mut cfg = MvmConfig {
+            catalog_url: Some("https://example.com".to_string()),
+            ..MvmConfig::default()
+        };
+        set_key(&mut cfg, "catalog_url", "none").unwrap();
+        assert!(cfg.catalog_url.is_none());
+    }
+
+    #[test]
+    fn test_catalog_url_default_none() {
+        let cfg = MvmConfig::default();
+        assert!(cfg.catalog_url.is_none());
     }
 
     #[test]

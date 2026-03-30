@@ -1,19 +1,20 @@
-# Sprint 38 — Multi-Backend VM Abstraction
+# Sprint 39 — Developer Experience & DX Features
 
-**Goal:** Unify the VM backend interface and add Apple Container support for
-sub-second dev startup on macOS 26+, while keeping Firecracker as the
-production backend on Linux.
+**Goal:** Borrow the best DX patterns from AlanD20/mvmctl — XDG-compliant
+directories, named network management, Nix-based image catalog, enhanced audit
+logging, and PTY-over-vsock console — while keeping Nix, vsock-only security,
+and Rust.
 
-**Branch:** `feat/multi-backend`
+**Branch:** `main`
 
-**Plan:** [specs/plans/20-multi-backend-abstraction.md](plans/20-multi-backend-abstraction.md)
+**Plan:** [cuddly-enchanting-lollipop.md](~/.claude/plans/cuddly-enchanting-lollipop.md)
 
-## Current Status (v0.6.0)
+## Current Status (v0.8.0)
 
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 7 + root facade + xtask  |
-| Total tests      | 900+                     |
+| Total tests      | 956                      |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | MSRV             | 1.85                     |
@@ -58,176 +59,215 @@ production backend on Linux.
 - [35-run-watch.md](sprints/35-run-watch.md)
 - [36-fast-boot-minimal-images.md](sprints/36-fast-boot-minimal-images.md)
 - [37-image-insights-dx-guest-lib.md](sprints/37-image-insights-dx-guest-lib.md)
+- [38-multi-backend-abstraction.md](sprints/38-multi-backend-abstraction.md)
 
 ---
 
 ## Rationale
 
-mvm currently requires Lima + Firecracker (KVM) for all VM operations on macOS.
-This adds startup latency (2-5s for Lima boot) and complexity. Apple's new
-Containerization framework (macOS 26+) provides lightweight VMs with sub-second
-startup and native vsock support — architecturally identical to Firecracker
-microVMs but without needing KVM.
-
-The `VmBackend` trait already exists but the interface is leaky: callers must use
-backend-specific `start_firecracker()` / `start_microvm_nix()` methods. Adding
-new backends (Apple Container, Docker) requires a unified `VmStartConfig` first.
-
-This sprint delivers:
-1. **Phase 0**: Unified backend interface (`VmStartConfig`, `GuestChannel`, `VmNetworkInfo`)
-2. **Phase 1**: Apple Container backend via `swift-bridge` Rust↔Swift FFI
-3. **Phase 2**: Guest agent integration, dev mode awareness, template tiering
-
-Docker backend for Windows dev is deferred to a follow-up sprint.
+AlanD20/mvmctl (Python) proves a Firecracker CLI can feel as approachable as
+Docker. Our Rust project is more powerful (Nix images, vsock-only, fleet
+orchestration) but has a steeper onboarding curve. This sprint borrows the best
+DX ideas while keeping our architecture.
 
 ---
 
-## Phase 0: Unify Backend Interface
+## Phase 1: Foundation Types & XDG Directories ✓
 
-### 0a. `VmStartConfig` in mvm-core ✓
+### 1a. XDG-compliant directory functions ✓
 
-- [x] `VmStartConfig` struct (name, rootfs_path, kernel_path, cpus, memory, ports, volumes, config/secret files)
-- [x] `VmPortMapping`, `VmVolume`, `VmFile` types with serde + tests
-- [x] Replace `VmBackend::type Config` with `VmStartConfig`
-- [x] `FirecrackerConfig::from_start_config()` and `MicrovmNixConfig::from_start_config()`
-- [x] Unified `AnyBackend::start(&VmStartConfig)` — all 4 CLI call sites migrated
-- [x] `start_firecracker()` retained only for snapshot restore path
-- [x] `VmStartParams` struct in commands.rs (avoids clippy::too_many_arguments)
+- [x] `mvm_cache_dir()` → `$XDG_CACHE_HOME/mvm` or `~/.cache/mvm`
+- [x] `mvm_config_dir()` → `$XDG_CONFIG_HOME/mvm` or `~/.config/mvm`
+- [x] `mvm_state_dir()` → `$XDG_STATE_HOME/mvm` or `~/.local/state/mvm`
+- [x] `mvm_share_dir()` → `$XDG_DATA_HOME/mvm` or `~/.local/share/mvm`
+- [x] Env overrides: `MVM_CACHE_DIR`, `MVM_CONFIG_DIR`, `MVM_STATE_DIR`, `MVM_SHARE_DIR`
+- [x] `user_config.rs` updated to prefer XDG with legacy `~/.mvm/` fallback
+- [x] `audit.rs` updated to prefer `mvm_state_dir()` with legacy fallback
+- [x] Tests for all XDG resolution paths (env override, XDG var, default)
 
-### 0b. `GuestChannelInfo` enum ✓
+### 1b. DevNetwork type ✓
 
-- [x] `GuestChannelInfo` enum (`Vsock { cid, port }`, `UnixSocket { path }`) in mvm-core
-- [x] `guest_channel_info()` default method on `VmBackend` trait
-- [x] Serde roundtrip tests for both variants
+- [x] `DevNetwork` struct in `mvm-core/src/dev_network.rs` (name, bridge_name, subnet, gateway, created_at)
+- [x] `DevNetwork::default_network()` matches legacy hardcoded `br-mvm`
+- [x] `DevNetwork::new(name, slot)` with auto-assigned 172.16.X.0/24 subnets
+- [x] `gateway_cidr()` helper
+- [x] `validate_network_name()` reusing `validate_id()`
+- [x] `networks_dir()` and `network_path()` helpers using `mvm_share_dir()`
+- [x] Serde roundtrip tests
 
-### 0c. `VmNetworkInfo` ✓
+### 1c. VM Name Registry ✓
 
-- [x] `VmNetworkInfo` struct (guest_ip, gateway_ip, subnet_cidr)
-- [x] `network_info()` default method on `VmBackend` trait
-- [x] Serde roundtrip test
+- [x] `VmNameRegistry` in `mvm-runtime/src/vm/name_registry.rs`
+- [x] `VmRegistration` struct (vm_dir, network, guest_ip, slot_index, registered_at)
+- [x] `register()`, `deregister()`, `lookup()`, `names()` operations
+- [x] Atomic save via `mvm_core::atomic_io::atomic_write()`
+- [x] `registry_path()` using `mvm_share_dir()`
+- [x] `generate_vm_name()` for auto-generated VM names
+- [x] Load/save roundtrip tests
 
-### 0d. `TemplateKind` ✓
+---
 
-- [x] `TemplateKind::Image` and `TemplateKind::Snapshot(SnapshotInfo)` enum
-- [x] `PartialEq + Eq` on `SnapshotInfo` for equality checks
-- [x] Serde roundtrip tests for both variants
+## Phase 2: Image Catalog & Audit Extensions ✓
 
-### Verification ✓
+### 2a. Nix-based Image Catalog ✓
 
-```bash
-cargo test --workspace   # 866 tests, 0 failures
-cargo clippy --workspace -- -D warnings  # 0 warnings
-# All existing tests pass, backend.start(&config) works for both backends
+- [x] `CatalogEntry` and `Catalog` types in `mvm-core/src/catalog.rs`
+- [x] `Catalog::search()` — case-insensitive search by name, description, tags
+- [x] `Catalog::find()` — exact name lookup
+- [x] Bundled catalog with 5 presets: minimal, http, postgres, worker, python
+- [x] CLI: `mvmctl image list`, `mvmctl image search <q>`, `mvmctl image fetch <name>`, `mvmctl image info <name>`
+- [x] `image fetch` designed as sugar for template create + build (not yet wired)
+- [x] Serde roundtrip, search, and schema version default tests
+
+### 2b. Audit Logging Extensions ✓
+
+- [x] 9 new `LocalAuditKind` variants: NetworkCreate, NetworkRemove, ImageFetch, TemplateBuild, TemplatePush, TemplatePull, ConfigChange, ConsoleSessionStart, ConsoleSessionEnd
+- [x] `audit::emit()` calls in network create/remove and image fetch commands
+- [x] Updated test to cover all variants
+
+---
+
+## Phase 3: PTY-over-Vsock Console Protocol ✓
+
+### 3a. Protocol extensions ✓
+
+- [x] `GuestRequest::ConsoleOpen { cols, rows }` — open interactive PTY session
+- [x] `GuestRequest::ConsoleClose { session_id }` — close PTY session
+- [x] `GuestRequest::ConsoleResize { session_id, cols, rows }` — resize PTY window
+- [x] `GuestResponse::ConsoleOpened { session_id, data_port }` — session opened, connect to data port
+- [x] `GuestResponse::ConsoleExited { session_id, exit_code }` — shell exited
+- [x] `GuestResponse::ConsoleResized { session_id }` — resize acknowledged
+- [x] `CONSOLE_PORT_BASE = 20000` constant for data channel vsock ports
+- [x] Guest agent stub handler (returns "not yet implemented" error)
+- [x] Serde roundtrip tests for all new variants
+
+### 3b. CLI command ✓
+
+- [x] `mvmctl console <name>` — interactive PTY session (stub, prints not-yet-implemented)
+- [x] `mvmctl console <name> --command <cmd>` — one-shot command execution (wired to existing Exec path)
+- [x] CLI integration tests
+
+### 3c. Guest agent PTY implementation ✓
+
+- [x] `console.rs` module in mvm-guest — PTY allocation, shell fork, vsock data relay
+- [x] `open_session(cols, rows)` — openpty + fork + exec /bin/sh
+- [x] `run_console_relay(session)` — bind vsock data port, accept connection, bidirectional relay
+- [x] `close_session(session)` — kill shell, wait, cleanup
+- [x] `resize_pty(master_fd, cols, rows)` — TIOCSWINSZ ioctl
+- [x] Single-session enforcement via atomic flag
+- [x] Guest agent wired: ConsoleOpen spawns relay thread, ConsoleClose/Resize handled
+- [x] Supports both Firecracker and Apple Container backends
+
+### 3d. Host CLI interactive console ✓
+
+- [x] `console_interactive(name)` — full interactive PTY flow
+- [x] Backend detection: Apple Container (direct vsock) or Firecracker (UDS)
+- [x] `enter_raw_mode()` / `restore_terminal()` — termios raw mode via libc
+- [x] `get_terminal_size()` — TIOCGWINSZ ioctl
+- [x] `run_console_relay()` — bidirectional stdin/stdout ↔ vsock relay
+- [x] Audit events: ConsoleSessionStart / ConsoleSessionEnd
+- [x] Made `connect_to()` and `send_request()` public in vsock.rs
+
+### 3e. Console polish ✓
+
+- [x] SIGWINCH handler on host — polls atomic flag, sends ConsoleResize via control channel
+- [x] Global `CONSOLE_MASTER_FD` atomic in guest for resize ioctl dispatch
+- [x] `resize_active_session(cols, rows)` in console.rs, wired into guest agent
+- [x] `AccessPolicy.console` field (default false, enabled in `dev_defaults()`)
+- [x] Guest agent checks `access.console` before opening PTY session
+- [x] 15-minute idle timeout via `set_read_timeout()` on vsock data channel
+
+---
+
+## Phase 4: Init Wizard & Security DX ✓
+
+### 4a. Init Wizard ✓
+
+- [x] `mvmctl init` — unified first-time setup wizard
+- [x] Platform detection with human-readable label
+- [x] Apple Container detection (macOS 26+)
+- [x] Dependency check (package manager, Lima)
+- [x] Lima VM creation via `run_setup_steps()`
+- [x] Auto-create default network if missing
+- [x] Create XDG data directories
+- [x] Show available catalog images
+- [x] Print next-steps guidance
+- [x] `--non-interactive` flag for scripted use
+- [x] `--lima-cpus` and `--lima-mem` flags
+
+### 4b. Security Status ✓
+
+- [x] `mvmctl security status` — security posture evaluation
+- [x] Checks: audit log, XDG dirs, default network, seccomp, vsock auth, no-SSH, Nix builds
+- [x] Human-readable summary with score (passed/total)
+- [x] `--json` flag for machine-readable output
+- [x] Shows uncovered security layers
+
+---
+
+## Phase 5: Gap Closing & Polish ✓
+
+### 5a. Image catalog wiring ✓
+
+- [x] `image fetch` calls `template_cmd::create_single()` + `template_cmd::build()`
+- [x] Full pipeline: catalog entry → template creation → Nix build
+
+### 5b. VM name registry wiring ✓
+
+- [x] `mvmctl up` registers VM name in `vm-names.json` via `VmNameRegistry`
+- [x] `mvmctl down <name>` deregisters VM name from registry
+- [x] Stale entries cleared on re-registration
+
+### 5c. Network flag ✓
+
+- [x] `--network <name>` flag on `Up` command (default: "default")
+- [x] Network name threaded through `RunParams` → `VmNameRegistry`
+
+### 5d. Console Apple Container support ✓
+
+- [x] `console --command` detects backend (Apple Container vs Firecracker)
+- [x] Apple Container uses `vsock_connect` + `send_request` directly
+- [x] Firecracker falls back to UDS-based `exec_at`
+
+### 5e. Config extensions ✓
+
+- [x] `catalog_url: Option<String>` in `MvmConfig`
+- [x] `mvmctl config set catalog_url <url>` support
+- [x] Backward-compatible serde (defaults to None)
+
+### 5f. Cache management ✓
+
+- [x] `mvmctl cache info` — show cache path and disk usage
+- [x] `mvmctl cache prune` — remove stale temp files
+- [x] `--dry-run` flag for safe preview
+
+### 5g. Documentation ✓
+
+- [x] CLI reference updated: network, image, console, cache, security, init commands
+- [x] `--network` flag documented on Up command
+- [x] CLAUDE.md updated: new module locations, new commands, console access note
+
+---
+
+## CLI Command Summary (New)
+
 ```
-
----
-
-## Phase 1: Apple Container Backend
-
-### 1a. Platform detection ✓
-
-- [x] `has_apple_containers()` in `platform.rs` (macOS 26+ on Apple Silicon)
-- [x] `is_macos_26_or_later()` via `sw_vers` runtime check
-- [x] Tests for platform detection on all platforms
-
-### 1b. `AppleContainerBackend` ✓
-
-- [x] `apple_container.rs` in mvm-runtime with full `VmBackend` impl
-- [x] Capabilities: vsock=true, snapshots=false, pause_resume=false
-- [x] Stub lifecycle methods with clear error messages
-- [x] `network_info()` and `guest_channel_info()` stubs (vsock:1024 for vminitd)
-- [x] Tests for backend name, capabilities, list, stop_all, status
-
-### 1c. Wire into CLI ✓
-
-- [x] `AppleContainer` variant in `AnyBackend` enum
-- [x] `AnyBackend::inner()` dispatch helper (eliminates per-method match repetition)
-- [x] `from_hypervisor("apple-container")` selection
-- [x] `auto_select()` — prefers Apple Container on macOS 26+
-- [x] `--hypervisor apple-container` flag in `run` and `up` commands
-- [x] `mvmctl doctor` Apple Container availability check
-
-### 1d. Apple Container via XPC ✓
-
-- [x] Replaced custom Swift FFI bridge with `apple-container` crate (pure Rust, XPC)
-- [x] XPC client talks directly to `com.apple.container.apiserver` daemon
-- [x] No Swift compilation, no entitlement issues, no RunLoop problems
-- [x] `start()` → create ContainerConfiguration + get_default_kernel + bootstrap
-- [x] `stop()`, `list_ids()` via XPC
-- [x] `#[cfg(target_os = "macos")]` — compiles as no-op on non-macOS
-- [x] Boot test: XPC connection works, daemon responds (needs kernel pull for full boot)
-
-### Verification ✓
-
-```bash
-cargo test --workspace   # 886 tests, 0 failures
-cargo clippy --workspace -- -D warnings  # 0 warnings
-cargo test -p mvm-apple-container -- --ignored boot_test  # FFI chain works, vmnet needs entitlement
-mvmctl run --hypervisor apple-container  # flag accepted
-mvmctl doctor  # shows Apple Container availability status
+mvmctl init                                      # First-time setup wizard
+mvmctl network create <name>                      # Create named dev network
+mvmctl network list                               # List all networks
+mvmctl network inspect <name>                     # Show network details
+mvmctl network remove <name>                      # Remove a network
+mvmctl image list                                 # Browse catalog
+mvmctl image search <query>                       # Search by name/tag
+mvmctl image fetch <name>                         # Build image from catalog
+mvmctl image info <name>                          # Show image details
+mvmctl console <name>                             # Interactive PTY shell
+mvmctl console <name> --command <cmd>             # One-shot exec
+mvmctl cache info                                 # Cache disk usage
+mvmctl cache prune [--dry-run]                    # Clean stale files
+mvmctl security status [--json]                   # Security posture
+mvmctl up --network <name>                        # Attach VM to named network
 ```
-
----
-
-## Phase 2: Guest Agent + Dev Mode + Templates
-
-### 2a. Guest agent on Apple Container ✓
-
-- [x] `vminitd_client.rs` — typed Rust client for vminitd gRPC API
-- [x] `ProcessConfig` struct for launching processes via CreateProcess
-- [x] `VminitdClient::launch_guest_agent()`, `write_file()`, `kill()` stubs
-- [x] `SandboxContext.proto` copied to `proto/` for reference
-- [x] Constants: `VMINITD_VSOCK_PORT=1024`, `GUEST_AGENT_VSOCK_PORT=52`
-- [x] Fix init path: `init=/sbin/vminitd` → `init=/init` (our rootfs has `/init`, not vminitd)
-- [x] Add `VZVirtioSocketDeviceConfiguration` to VM config (vsock device)
-- [x] Store VM references in `VMS` map (was `mem::forget`) for socket device access
-- [x] `vsock_connect(id, port)` → connects to guest agent, returns `UnixStream`
-- [x] `guest_channel_info()` returns `GuestChannelInfo::Vsock { cid: 3, port: 52 }`
-- [ ] End-to-end test on macOS 26 + Apple Silicon (needs hardware)
-
-### 2b. Backend-aware dev mode ✓
-
-- [x] `mvmctl dev --lima` flag for explicit Lima fallback
-- [x] On macOS 26+: informs user Apple Container dev is coming, falls back to Lima
-- [x] CLI test for `--lima` flag visibility in help
-
-### 2c. Networking ✓
-
-- [x] `VmNetworkInfo` struct and `network_info()` on VmBackend trait (Phase 0)
-- [x] Hardcoded IPs are internal to Firecracker backend (no leakage into CLI)
-- [x] Apple Container backend will return vmnet subnet via `network_info()`
-
-### 2d. Template tiering ✓
-
-- [x] `template build --snapshot` checks `backend.capabilities().snapshots`
-- [x] Non-snapshot backends (Apple Container, Docker) auto-fall back to image-only
-- [x] `run --template` only restores from snapshot if backend supports it
-- [x] Cold-boot from image works for all backends
-
-### Verification ✓
-
-```bash
-cargo test --workspace   # 878 tests, 0 failures
-cargo clippy --workspace -- -D warnings  # 0 warnings
-mvmctl run --hypervisor apple-container  # flag accepted
-mvmctl dev --lima          # explicit Lima fallback
-# template build --snapshot on non-FC backend → warns, builds image-only
-```
-
----
-
-## Phase 3: Dev CLI Subcommands ✓
-
-**Plan:** [specs/plans/21-dev-subcommands.md](plans/21-dev-subcommands.md)
-
-- [x] `DevCmd` enum with `Up`, `Down`, `Shell`, `Status` subcommands
-- [x] Bare `mvmctl dev` defaults to `dev up` (backward compatible)
-- [x] `dev down` — graceful Lima VM stop via `lima::stop()`
-- [x] `dev status` — shows Lima status + Firecracker/Nix/mvmctl versions
-- [x] `dev shell` — replaces top-level `shell` command
-- [x] Removed top-level `Shell` command
-- [x] Updated CLI integration tests
-- [x] Updated README, CLAUDE.md, site docs
 
 ---
 
@@ -235,77 +275,25 @@ mvmctl dev --lima          # explicit Lima fallback
 
 | File | Changes |
 |------|---------|
-| `crates/mvm-core/src/vm_backend.rs` | `VmStartConfig`, `GuestChannel`, `VmNetworkInfo`, trait refactor |
-| `crates/mvm-core/src/template.rs` | `TemplateKind` enum |
-| `crates/mvm-core/src/platform.rs` | `has_apple_containers()` |
-| `crates/mvm-apple-container/` | New crate: Swift wrapper + swift-bridge |
-| `crates/mvm-runtime/src/vm/backend.rs` | `AppleContainer` variant, unified `start()` |
-| `crates/mvm-runtime/src/vm/apple_container.rs` | `AppleContainerBackend` impl |
-| `crates/mvm-runtime/src/vm/vminitd_client.rs` | gRPC client for vminitd |
-| `crates/mvm-runtime/src/vm/network.rs` | Parameterize subnet |
-| `crates/mvm-cli/src/commands.rs` | Unified start, `--hypervisor`, dev mode |
-| `crates/mvm-cli/src/doctor.rs` | Apple Container availability check |
-| `crates/mvm-guest/src/vsock.rs` | `GuestChannel` trait impl |
+| `crates/mvm-core/src/config.rs` | XDG directory functions (cache, config, state, share) |
+| `crates/mvm-core/src/dev_network.rs` | New: `DevNetwork` type for named networks |
+| `crates/mvm-core/src/catalog.rs` | New: `CatalogEntry` and `Catalog` types |
+| `crates/mvm-core/src/audit.rs` | Extended `LocalAuditKind` with 9 new variants |
+| `crates/mvm-core/src/user_config.rs` | XDG config dir with legacy fallback, `catalog_url` |
+| `crates/mvm-core/src/security.rs` | `AccessPolicy.console` field |
+| `crates/mvm-runtime/src/vm/name_registry.rs` | New: `VmNameRegistry` for name-based VM lookups |
+| `crates/mvm-guest/src/vsock.rs` | Console protocol variants, `connect_to()` + `send_request()` public |
+| `crates/mvm-guest/src/console.rs` | New: PTY allocation, shell fork, vsock data relay |
+| `crates/mvm-guest/src/bin/mvm-guest-agent.rs` | Console session handler with `access.console` policy check |
+| `crates/mvm-cli/src/commands.rs` | Network, Image, Console, Cache, Init, Security CLI subcommands |
+| `public/src/content/docs/reference/cli-commands.md` | All new commands documented |
+| `CLAUDE.md` | New module locations, command examples, console access note |
 
 ---
 
-## Next: Sprint 39 — Agent Sandbox Patterns
+## Verification ✓
 
-**Plan:** [specs/plans/22-agent-sandbox-patterns.md](plans/22-agent-sandbox-patterns.md)
-
-**Goal:** Harden mvm as an AI agent execution platform with network isolation, seccomp
-defense-in-depth, filesystem audit trails, and secret management — informed by competitive
-research across 8 Rust crates (arcbox-vm, agentkernel, mino, ai-jail, sandbox-runtime,
-sandbox-rs, agent-sandbox, wasm-sandbox).
-
-### Phase 1: Domain-Based Network Allowlists ✓
-
-- [x] `NetworkPolicy` enum in mvm-core (Unrestricted | Preset | AllowList)
-- [x] `HostPort` type with serde + validation + FromStr
-- [x] Built-in presets: `dev`, `registries`, `none`, `unrestricted`
-- [x] `apply_network_policy(slot, policy)` in `network.rs` (iptables FORWARD rules)
-- [x] `cleanup_network_policy(slot)` on VM stop (flush guest IP rules)
-- [x] `--network-allow` and `--network-preset` CLI flags (mutually exclusive)
-- [x] `network_policy` field on `FlakeRunConfig` (threaded through all 3 construction sites)
-- [x] Applied in both `run_from_build` and `restore_from_template_snapshot`
-- [x] Tests: 25 unit tests (network_policy) + 6 CLI resolver tests + integration test
-- [x] 0 clippy warnings
-
-### Phase 2: Tiered Seccomp Profiles ✓
-
-- [x] `SeccompTier` enum (Essential, Minimal, Standard, Network, Unrestricted) in mvm-security
-- [x] Syscall lists for each tier (cumulative, each is superset of previous)
-- [x] `SeccompManifest` JSON generation (guest init applies via prctl, no host-side BPF needed)
-- [x] Named security bundles (`SecurityProfile`: Strict, Moderate, Permissive) + `ProfileLimits`
-- [x] `--seccomp` CLI flag (default: unrestricted for backward compat)
-- [x] Config drive delivery: `seccomp.json` manifest injected into config drive
-- [x] `SeccompAction` enum (KillProcess, Trap, Errno, Log) for configurable enforcement
-- [x] Tests: 19 unit tests (tier ordering, cumulative subset, serde roundtrip, manifest, profiles)
-- [x] 0 clippy warnings
-
-### Phase 3: Filesystem Diff Tracking ✓
-
-- [x] `FsDiff` request + `FsDiffResult` response in vsock protocol
-- [x] `FsChange` and `FsChangeKind` types (Created, Modified, Deleted) with serde
-- [x] Guest agent walks overlay upper dir (`/overlay/upper`) for changes since boot
-- [x] Overlay whiteout files (`.wh.*`) detected as deletions
-- [x] `query_fs_diff()` and `query_fs_diff_at()` host-side query functions
-- [x] `mvmctl diff <name>` CLI subcommand (human-readable + `--json`)
-- [x] `resolve_running_vm_dir()` helper in microvm.rs
-- [x] Protocol roundtrip tests updated (GuestRequest + GuestResponse)
-- [x] CLI integration test for `diff --help`
-- [x] 0 clippy warnings
-
-### Phase 4: Secret Binding & Injection ✓
-
-- [x] `SecretBinding` type in mvm-core (env_var, target_host, header, value)
-- [x] `ResolvedSecrets` with env resolution + secret file + manifest generation
-- [x] CLI `--secret KEY:host` / `--secret KEY:host:header` / `--secret KEY=val:host`
-- [x] Secrets written to secrets drive (mode 0600, JSON with full metadata)
-- [x] `secrets-manifest.json` on config drive (metadata only, no secret values)
-- [x] Placeholder env vars (`mvm-managed:KEY`) on config drive for tool preflight checks
-- [x] Audit log of bound secrets at VM start (env var + host, not values)
-- [x] Combined with Phase 1 network allowlists for domain-scoped exfiltration prevention
-- [x] Tests: 18 unit tests (parsing, serde, resolution, files, manifest, placeholders)
-- [x] 0 clippy warnings
-- [ ] Future: MITM HTTPS proxy for true network-layer injection (proxy never exposes secrets to guest disk)
+```bash
+cargo test --workspace   # 964 tests, 0 failures
+cargo clippy --workspace -- -D warnings  # 0 warnings
+```

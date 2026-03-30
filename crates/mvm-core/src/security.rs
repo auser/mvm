@@ -110,10 +110,15 @@ impl Default for SecurityPolicy {
 
 impl SecurityPolicy {
     /// Permissive defaults for development and testing environments.
-    /// Authentication is disabled to simplify the local dev loop.
+    /// Authentication is disabled and console access is enabled.
     pub fn dev_defaults() -> Self {
         Self {
             require_auth: false,
+            access: AccessPolicy {
+                console: true,
+                debug_exec: true,
+                ..AccessPolicy::default()
+            },
             ..Self::default()
         }
     }
@@ -141,6 +146,10 @@ pub struct AccessPolicy {
     /// Allow debug command execution via vsock (dev-only, disabled by default).
     #[serde(default)]
     pub debug_exec: bool,
+
+    /// Allow interactive PTY console sessions (dev-only, disabled by default).
+    #[serde(default)]
+    pub console: bool,
 }
 
 impl Default for AccessPolicy {
@@ -151,6 +160,7 @@ impl Default for AccessPolicy {
             build: true,
             host_communication: true,
             debug_exec: false,
+            console: false,
         }
     }
 }
@@ -511,6 +521,7 @@ mod tests {
                 build: false,
                 host_communication: true,
                 debug_exec: true,
+                console: false,
             },
             rate_limits: RateLimitPolicy {
                 frames_per_second: 200,

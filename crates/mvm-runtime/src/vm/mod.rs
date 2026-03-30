@@ -8,6 +8,7 @@ pub mod lima;
 pub mod lima_state;
 pub mod microvm;
 pub mod microvm_nix;
+pub mod name_registry;
 pub mod network;
 pub mod template;
 pub mod vminitd_client;

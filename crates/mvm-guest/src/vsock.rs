@@ -21,6 +21,9 @@ pub const GUEST_AGENT_PORT: u32 = 52;
 /// The forwarded vsock port = `PORT_FORWARD_BASE + guest_tcp_port`.
 pub const PORT_FORWARD_BASE: u32 = 10000;
 
+/// Base vsock port for interactive console PTY sessions.
+pub const CONSOLE_PORT_BASE: u32 = 20000;
+
 /// Default connect/read timeout in seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
@@ -73,6 +76,18 @@ pub enum GuestRequest {
     /// The agent binds vsock port `PORT_FORWARD_BASE + guest_port` and
     /// forwards each connection to `localhost:guest_port`.
     StartPortForward { guest_port: u16 },
+    /// Open an interactive PTY console session (dev-mode only).
+    /// The guest allocates a PTY, spawns a shell, and listens on a
+    /// dedicated vsock data port for raw byte streaming.
+    ConsoleOpen { cols: u16, rows: u16 },
+    /// Close an active console session.
+    ConsoleClose { session_id: u32 },
+    /// Resize the PTY window for an active console session.
+    ConsoleResize {
+        session_id: u32,
+        cols: u16,
+        rows: u16,
+    },
 }
 
 /// Response from guest vsock agent to host.
@@ -124,6 +139,12 @@ pub enum GuestResponse {
     FsDiffResult { changes: Vec<FsChange> },
     /// Port forward started successfully.
     PortForwardStarted { guest_port: u16, vsock_port: u32 },
+    /// Console PTY session opened. Connect to `data_port` for raw I/O.
+    ConsoleOpened { session_id: u32, data_port: u32 },
+    /// Console PTY session ended (shell exited).
+    ConsoleExited { session_id: u32, exit_code: i32 },
+    /// Console resize acknowledged.
+    ConsoleResized { session_id: u32 },
 }
 
 /// A single filesystem change detected since boot.
@@ -534,7 +555,7 @@ fn try_connect_once(uds_path: &str, timeout_secs: u64) -> Result<UnixStream> {
 ///
 /// Retries up to [`CONNECT_RETRIES`] times on timeout errors, skipping retries
 /// for definitive failures (connection refused, socket not found).
-fn connect_to(uds_path: &str, timeout_secs: u64) -> Result<UnixStream> {
+pub fn connect_to(uds_path: &str, timeout_secs: u64) -> Result<UnixStream> {
     let mut last_err = None;
 
     for attempt in 1..=CONNECT_RETRIES {
@@ -575,7 +596,7 @@ fn connect(instance_dir: &str, timeout_secs: u64) -> Result<UnixStream> {
 /// Send a request and receive a response over a vsock connection.
 ///
 /// Uses 4-byte big-endian length prefix + JSON body (same pattern as hostd).
-fn send_request(stream: &mut UnixStream, req: &GuestRequest) -> Result<GuestResponse> {
+pub fn send_request(stream: &mut UnixStream, req: &GuestRequest) -> Result<GuestResponse> {
     let data = serde_json::to_vec(req).with_context(|| "Failed to serialize request")?;
 
     // Write length-prefixed frame
@@ -884,6 +905,16 @@ mod tests {
             GuestRequest::PostRestore,
             GuestRequest::FsDiff,
             GuestRequest::StartPortForward { guest_port: 8080 },
+            GuestRequest::ConsoleOpen {
+                cols: 120,
+                rows: 40,
+            },
+            GuestRequest::ConsoleClose { session_id: 1 },
+            GuestRequest::ConsoleResize {
+                session_id: 1,
+                cols: 80,
+                rows: 24,
+            },
         ];
 
         for req in &variants {
@@ -968,6 +999,15 @@ mod tests {
                 guest_port: 8080,
                 vsock_port: 18080,
             },
+            GuestResponse::ConsoleOpened {
+                session_id: 1,
+                data_port: 20001,
+            },
+            GuestResponse::ConsoleExited {
+                session_id: 1,
+                exit_code: 0,
+            },
+            GuestResponse::ConsoleResized { session_id: 1 },
         ];
 
         for resp in &variants {

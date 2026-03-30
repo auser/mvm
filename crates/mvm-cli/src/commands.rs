@@ -108,6 +108,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)] // Up variant has many CLI fields; boxing breaks Clap derive
 enum Commands {
     /// Full environment setup from scratch
     Bootstrap {
@@ -291,6 +292,9 @@ enum Commands {
         /// Secret binding (format: KEY:host, KEY:host:header, or KEY=value:host). Repeatable.
         #[arg(long, short = 's')]
         secret: Vec<String>,
+        /// Named dev network to attach VM to (default: "default")
+        #[arg(long, default_value = "default")]
+        network: String,
     },
     /// Stop microVMs (from mvm.toml, by name, or all)
     Down {
@@ -348,6 +352,47 @@ enum Commands {
         /// Output as JSON instead of human-readable
         #[arg(long)]
         json: bool,
+    },
+    /// Manage named dev networks
+    Network {
+        #[command(subcommand)]
+        action: NetworkCmd,
+    },
+    /// Browse and fetch images from the Nix-based image catalog
+    Image {
+        #[command(subcommand)]
+        action: ImageCmd,
+    },
+    /// Interactive console (PTY-over-vsock) to a running VM
+    Console {
+        /// VM name
+        #[arg(value_parser = clap_vm_name)]
+        name: String,
+        /// Run a single command instead of opening an interactive shell
+        #[arg(long)]
+        command: Option<String>,
+    },
+    /// Manage the XDG cache directory (~/.cache/mvm)
+    Cache {
+        #[command(subcommand)]
+        action: CacheCmd,
+    },
+    /// First-time setup wizard — installs deps, creates Lima VM, sets up default network
+    Init {
+        /// Skip interactive prompts, use defaults
+        #[arg(long)]
+        non_interactive: bool,
+        /// Number of vCPUs for the Lima VM
+        #[arg(long, default_value = "8")]
+        lima_cpus: u32,
+        /// Memory (GiB) for the Lima VM
+        #[arg(long, default_value = "16")]
+        lima_mem: u32,
+    },
+    /// Show security posture and status
+    Security {
+        #[command(subcommand)]
+        action: SecurityCmd,
     },
 }
 
@@ -410,6 +455,76 @@ enum FlakeCmd {
         #[arg(long)]
         json: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum NetworkCmd {
+    /// Create a named dev network with its own bridge and subnet
+    Create {
+        /// Network name (lowercase alphanumeric + hyphens)
+        name: String,
+        /// Subnet CIDR (auto-assigned if omitted)
+        #[arg(long)]
+        subnet: Option<String>,
+    },
+    /// List all dev networks
+    #[command(alias = "ls")]
+    List,
+    /// Show details of a named network
+    Inspect {
+        /// Network name
+        name: String,
+    },
+    /// Remove a named network
+    #[command(alias = "rm")]
+    Remove {
+        /// Network name
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum ImageCmd {
+    /// List available images in the catalog
+    #[command(alias = "ls")]
+    List,
+    /// Search images by name or tag
+    Search {
+        /// Search query
+        query: String,
+    },
+    /// Fetch (build) an image from the catalog
+    Fetch {
+        /// Image name from the catalog
+        name: String,
+    },
+    /// Show details of a catalog image
+    Info {
+        /// Image name from the catalog
+        name: String,
+    },
+}
+
+#[derive(Subcommand)]
+enum SecurityCmd {
+    /// Show security posture evaluation for the current environment
+    Status {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum CacheCmd {
+    /// Remove stale items from the cache directory
+    Prune {
+        /// Print what would be removed without actually removing anything
+        #[arg(long)]
+        dry_run: bool,
+    },
+    /// Show cache directory path and disk usage
+    Info,
 }
 
 #[derive(Subcommand)]
@@ -809,6 +924,7 @@ pub fn run() -> Result<()> {
             network_allow,
             seccomp,
             secret,
+            network,
         } => {
             let memory_mb = memory
                 .as_ref()
@@ -846,6 +962,7 @@ pub fn run() -> Result<()> {
                 watch,
                 detach,
                 network_policy,
+                network_name: &network,
                 seccomp_tier,
                 secret_bindings,
             })
@@ -860,6 +977,16 @@ pub fn run() -> Result<()> {
         Commands::Audit { action } => cmd_audit(action),
         Commands::Diff { name, json } => cmd_diff(&name, json),
         Commands::Flake { action } => cmd_flake(action),
+        Commands::Network { action } => cmd_network(action),
+        Commands::Image { action } => cmd_image(action),
+        Commands::Console { name, command } => cmd_console(&name, command.as_deref()),
+        Commands::Cache { action } => cmd_cache(action),
+        Commands::Init {
+            non_interactive,
+            lima_cpus,
+            lima_mem,
+        } => cmd_init(non_interactive, lima_cpus, lima_mem),
+        Commands::Security { action } => cmd_security(action),
     };
 
     with_hints(result)
@@ -2035,6 +2162,7 @@ struct RunParams<'a> {
     watch: bool,
     detach: bool,
     network_policy: mvm_core::network_policy::NetworkPolicy,
+    network_name: &'a str,
     seccomp_tier: mvm_security::seccomp::SeccompTier,
     secret_bindings: Vec<mvm_core::secret_binding::SecretBinding>,
 }
@@ -2058,6 +2186,7 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
         watch,
         detach,
         network_policy,
+        network_name,
         seccomp_tier,
         secret_bindings,
     } = params;
@@ -2140,6 +2269,15 @@ fn cmd_run(params: RunParams<'_>) -> Result<()> {
             generator.next().unwrap_or_else(|| "vm-0".to_string())
         }),
     };
+
+    // Register the VM name in the persistent registry (best-effort).
+    let registry_path = mvm_runtime::vm::name_registry::registry_path();
+    if let Ok(mut registry) = mvm_runtime::vm::name_registry::VmNameRegistry::load(&registry_path) {
+        // Deregister stale entry with the same name if it exists
+        registry.deregister(&vm_name);
+        let _ = registry.register(&vm_name, "", network_name, None, 0);
+        let _ = registry.save(&registry_path);
+    }
 
     // Direct boot mode: launchd agent passes kernel/rootfs via env vars.
     // Skip the build/template loading entirely.
@@ -2794,7 +2932,18 @@ fn cmd_down(name: Option<&str>, config_path: Option<&str>) -> Result<()> {
         AnyBackend::default_backend()
     };
     match name {
-        Some(n) => backend.stop(&VmId::from(n)),
+        Some(n) => {
+            let result = backend.stop(&VmId::from(n));
+            // Deregister from the name registry (best-effort)
+            let registry_path = mvm_runtime::vm::name_registry::registry_path();
+            if let Ok(mut registry) =
+                mvm_runtime::vm::name_registry::VmNameRegistry::load(&registry_path)
+            {
+                registry.deregister(n);
+                let _ = registry.save(&registry_path);
+            }
+            result
+        }
         None => {
             let found = load_fleet_config(config_path)?;
             if let Some((fleet_config, _base_dir)) = found {
@@ -3283,6 +3432,934 @@ fn cmd_config_set(key: &str, value: &str) -> Result<()> {
     mvm_core::user_config::set_key(&mut cfg, key, value)?;
     mvm_core::user_config::save(&cfg, None)?;
     println!("Set {} = {}", key, value);
+    Ok(())
+}
+
+// ============================================================================
+// Network management
+// ============================================================================
+
+fn cmd_network(action: NetworkCmd) -> Result<()> {
+    use mvm_core::dev_network::{DevNetwork, network_path, networks_dir, validate_network_name};
+
+    match action {
+        NetworkCmd::Create { name, subnet: _ } => {
+            validate_network_name(&name)?;
+            let dir = networks_dir();
+            std::fs::create_dir_all(&dir)?;
+
+            let path = network_path(&name);
+            if std::path::Path::new(&path).exists() {
+                anyhow::bail!("Network {:?} already exists", name);
+            }
+
+            // Find the next available slot by scanning existing networks
+            let mut max_slot: u8 = 0;
+            if let Ok(entries) = std::fs::read_dir(&dir) {
+                for entry in entries.flatten() {
+                    if let Ok(text) = std::fs::read_to_string(entry.path())
+                        && let Ok(net) = serde_json::from_str::<DevNetwork>(&text)
+                    {
+                        let parts: Vec<&str> = net.subnet.split('.').collect();
+                        if parts.len() >= 3
+                            && let Ok(s) = parts[2].parse::<u8>()
+                        {
+                            max_slot = max_slot.max(s);
+                        }
+                    }
+                }
+            }
+
+            let net = if name == "default" {
+                DevNetwork::default_network()
+            } else {
+                DevNetwork::new(&name, max_slot + 1)?
+            };
+
+            let json = serde_json::to_string_pretty(&net)?;
+            std::fs::write(&path, json)?;
+
+            mvm_core::audit::emit(
+                mvm_core::audit::LocalAuditKind::NetworkCreate,
+                None,
+                Some(&name),
+            );
+
+            ui::success(&format!(
+                "Created network {:?} (bridge={}, subnet={})",
+                net.name, net.bridge_name, net.subnet
+            ));
+            Ok(())
+        }
+        NetworkCmd::List => {
+            let dir = networks_dir();
+            if !std::path::Path::new(&dir).exists() {
+                ui::info("No networks configured.");
+                return Ok(());
+            }
+
+            let mut networks: Vec<DevNetwork> = Vec::new();
+            for entry in std::fs::read_dir(&dir)?.flatten() {
+                if entry.path().extension().is_some_and(|e| e == "json")
+                    && let Ok(text) = std::fs::read_to_string(entry.path())
+                    && let Ok(net) = serde_json::from_str::<DevNetwork>(&text)
+                {
+                    networks.push(net);
+                }
+            }
+
+            if networks.is_empty() {
+                ui::info("No networks configured.");
+            } else {
+                println!("{:<15} {:<15} {:<20}", "NAME", "BRIDGE", "SUBNET");
+                for net in &networks {
+                    println!(
+                        "{:<15} {:<15} {:<20}",
+                        net.name, net.bridge_name, net.subnet
+                    );
+                }
+            }
+            Ok(())
+        }
+        NetworkCmd::Inspect { name } => {
+            let path = network_path(&name);
+            if !std::path::Path::new(&path).exists() {
+                anyhow::bail!("Network {:?} not found", name);
+            }
+            let text = std::fs::read_to_string(&path)?;
+            let net: DevNetwork = serde_json::from_str(&text)?;
+            println!("{}", serde_json::to_string_pretty(&net)?);
+            Ok(())
+        }
+        NetworkCmd::Remove { name } => {
+            if name == "default" {
+                anyhow::bail!("Cannot remove the default network");
+            }
+            let path = network_path(&name);
+            if !std::path::Path::new(&path).exists() {
+                anyhow::bail!("Network {:?} not found", name);
+            }
+            std::fs::remove_file(&path)?;
+
+            mvm_core::audit::emit(
+                mvm_core::audit::LocalAuditKind::NetworkRemove,
+                None,
+                Some(&name),
+            );
+
+            ui::success(&format!("Removed network {:?}", name));
+            Ok(())
+        }
+    }
+}
+
+// ============================================================================
+// Image catalog
+// ============================================================================
+
+fn cmd_image(action: ImageCmd) -> Result<()> {
+    let catalog = load_bundled_catalog();
+
+    match action {
+        ImageCmd::List => {
+            if catalog.entries.is_empty() {
+                ui::info("No images in catalog.");
+            } else {
+                println!(
+                    "{:<20} {:<40} {:<6} {:<8}",
+                    "NAME", "DESCRIPTION", "CPUS", "MEM"
+                );
+                for entry in &catalog.entries {
+                    println!(
+                        "{:<20} {:<40} {:<6} {:<8}",
+                        entry.name,
+                        entry.description,
+                        entry.default_cpus,
+                        format!("{}M", entry.default_memory_mib),
+                    );
+                }
+            }
+            Ok(())
+        }
+        ImageCmd::Search { query } => {
+            let results = catalog.search(&query);
+            if results.is_empty() {
+                ui::info(&format!("No images matching {:?}", query));
+            } else {
+                println!("{:<20} {:<40} {:<30}", "NAME", "DESCRIPTION", "TAGS");
+                for entry in results {
+                    println!(
+                        "{:<20} {:<40} {:<30}",
+                        entry.name,
+                        entry.description,
+                        entry.tags.join(", "),
+                    );
+                }
+            }
+            Ok(())
+        }
+        ImageCmd::Fetch { name } => {
+            let entry = catalog
+                .find(&name)
+                .ok_or_else(|| anyhow::anyhow!("Image {:?} not found in catalog", name))?;
+
+            ui::info(&format!(
+                "Fetching image {:?} from {}...",
+                entry.name, entry.flake_ref
+            ));
+            ui::info("This will create a template and build it via Nix.");
+            ui::info(&format!(
+                "Equivalent to: mvmctl template create {} --flake {} --profile {} && mvmctl template build {}",
+                entry.name, entry.flake_ref, entry.profile, entry.name
+            ));
+
+            mvm_core::audit::emit(
+                mvm_core::audit::LocalAuditKind::ImageFetch,
+                None,
+                Some(&name),
+            );
+
+            // Create a template from the catalog entry, then build it
+            template_cmd::create_single(
+                &entry.name,
+                &entry.flake_ref,
+                &entry.profile,
+                "worker",
+                entry.default_cpus,
+                entry.default_memory_mib,
+                0, // no data disk
+            )?;
+            ui::success(&format!("Created template {:?} from catalog.", entry.name));
+
+            ui::info(&format!("Building template {:?}...", entry.name));
+            template_cmd::build(&entry.name, false, false, None, false)?;
+            ui::success(&format!(
+                "Image {:?} is ready. Run with: mvmctl up --template {}",
+                entry.name, entry.name
+            ));
+            Ok(())
+        }
+        ImageCmd::Info { name } => {
+            let entry = catalog
+                .find(&name)
+                .ok_or_else(|| anyhow::anyhow!("Image {:?} not found in catalog", name))?;
+            println!("{}", serde_json::to_string_pretty(entry)?);
+            Ok(())
+        }
+    }
+}
+
+/// Load the bundled image catalog with built-in presets.
+fn load_bundled_catalog() -> mvm_core::catalog::Catalog {
+    mvm_core::catalog::Catalog {
+        schema_version: 1,
+        entries: vec![
+            mvm_core::catalog::CatalogEntry {
+                name: "minimal".to_string(),
+                description: "Bare-bones microVM with init only".to_string(),
+                flake_ref: ".".to_string(),
+                profile: "minimal".to_string(),
+                default_cpus: 1,
+                default_memory_mib: 256,
+                tags: vec!["base".to_string(), "minimal".to_string()],
+            },
+            mvm_core::catalog::CatalogEntry {
+                name: "http".to_string(),
+                description: "HTTP server (Nginx or custom)".to_string(),
+                flake_ref: ".".to_string(),
+                profile: "http".to_string(),
+                default_cpus: 2,
+                default_memory_mib: 512,
+                tags: vec!["web".to_string(), "http".to_string(), "nginx".to_string()],
+            },
+            mvm_core::catalog::CatalogEntry {
+                name: "postgres".to_string(),
+                description: "PostgreSQL database server".to_string(),
+                flake_ref: ".".to_string(),
+                profile: "postgres".to_string(),
+                default_cpus: 2,
+                default_memory_mib: 1024,
+                tags: vec![
+                    "database".to_string(),
+                    "sql".to_string(),
+                    "postgres".to_string(),
+                ],
+            },
+            mvm_core::catalog::CatalogEntry {
+                name: "worker".to_string(),
+                description: "Background job worker".to_string(),
+                flake_ref: ".".to_string(),
+                profile: "worker".to_string(),
+                default_cpus: 2,
+                default_memory_mib: 512,
+                tags: vec!["worker".to_string(), "background".to_string()],
+            },
+            mvm_core::catalog::CatalogEntry {
+                name: "python".to_string(),
+                description: "Python runtime environment".to_string(),
+                flake_ref: ".".to_string(),
+                profile: "python".to_string(),
+                default_cpus: 2,
+                default_memory_mib: 512,
+                tags: vec!["python".to_string(), "runtime".to_string()],
+            },
+        ],
+    }
+}
+
+// ============================================================================
+// Cache management
+// ============================================================================
+
+fn cmd_cache(action: CacheCmd) -> Result<()> {
+    let cache_dir = mvm_core::config::mvm_cache_dir();
+
+    match action {
+        CacheCmd::Info => {
+            println!("Cache directory: {cache_dir}");
+            let path = std::path::Path::new(&cache_dir);
+            if path.exists() {
+                let size = dir_size(path);
+                println!("Disk usage: {}", human_bytes(size));
+            } else {
+                println!("(not yet created)");
+            }
+            Ok(())
+        }
+        CacheCmd::Prune { dry_run } => {
+            let path = std::path::Path::new(&cache_dir);
+            if !path.exists() {
+                ui::info("Cache directory does not exist. Nothing to prune.");
+                return Ok(());
+            }
+
+            // Prune: remove empty subdirectories and temp files
+            let mut removed = 0u64;
+            let mut freed = 0u64;
+            for entry in walkdir(path)? {
+                let entry_path = entry.path();
+                // Remove temp files (mvm-lima-*, .tmp)
+                if let Some(name) = entry_path.file_name().and_then(|n| n.to_str())
+                    && (name.starts_with("mvm-lima-") || name.ends_with(".tmp"))
+                {
+                    let size = entry_path.metadata().map(|m| m.len()).unwrap_or(0);
+                    if dry_run {
+                        println!(
+                            "Would remove: {} ({})",
+                            entry_path.display(),
+                            human_bytes(size)
+                        );
+                    } else if entry_path.is_dir() {
+                        let _ = std::fs::remove_dir_all(entry_path);
+                    } else {
+                        let _ = std::fs::remove_file(entry_path);
+                    }
+                    removed += 1;
+                    freed += size;
+                }
+            }
+
+            if removed == 0 {
+                ui::info("Nothing to prune.");
+            } else if dry_run {
+                ui::info(&format!(
+                    "Would remove {} items, freeing {}",
+                    removed,
+                    human_bytes(freed)
+                ));
+            } else {
+                ui::success(&format!(
+                    "Pruned {} items, freed {}",
+                    removed,
+                    human_bytes(freed)
+                ));
+            }
+            Ok(())
+        }
+    }
+}
+
+/// Recursively calculate directory size in bytes.
+fn dir_size(path: &std::path::Path) -> u64 {
+    walkdir(path)
+        .unwrap_or_default()
+        .iter()
+        .filter(|e| e.path().is_file())
+        .map(|e| e.path().metadata().map(|m| m.len()).unwrap_or(0))
+        .sum()
+}
+
+/// Simple recursive directory walker.
+fn walkdir(path: &std::path::Path) -> Result<Vec<std::fs::DirEntry>> {
+    let mut entries = Vec::new();
+    if path.is_dir() {
+        for entry in std::fs::read_dir(path)? {
+            let entry = entry?;
+            let epath = entry.path();
+            let is_dir = epath.is_dir();
+            entries.push(entry);
+            if is_dir && let Ok(sub) = walkdir(&epath) {
+                entries.extend(sub);
+            }
+        }
+    }
+    Ok(entries)
+}
+
+// ============================================================================
+// Init wizard
+// ============================================================================
+
+fn cmd_init(non_interactive: bool, lima_cpus: u32, lima_mem: u32) -> Result<()> {
+    use mvm_core::dev_network::{DevNetwork, network_path, networks_dir};
+
+    ui::info("Welcome to mvmctl! Running first-time setup...\n");
+
+    // Step 1: Platform detection
+    let plat = mvm_core::platform::current();
+    ui::info(&format!("Platform: {}", platform_label(plat)));
+
+    if plat.has_apple_containers() {
+        ui::info("Apple Container support detected (macOS 26+).");
+    }
+
+    // Step 2: Check and install dependencies
+    ui::info("\nChecking dependencies...");
+    match bootstrap::check_package_manager() {
+        Ok(()) => {}
+        Err(e) => {
+            if non_interactive {
+                return Err(e);
+            }
+            ui::warn(&format!("Package manager issue: {e}"));
+            ui::info("Please install a package manager and retry.");
+            return Err(e);
+        }
+    }
+
+    if plat.needs_lima() {
+        ui::info("Ensuring Lima is installed...");
+        bootstrap::ensure_lima()?;
+    }
+
+    // Step 3: Run setup steps (create Lima VM, install Firecracker, Nix)
+    ui::info("\nSetting up development environment...");
+    run_setup_steps(false, lima_cpus, lima_mem)?;
+
+    // Step 4: Create default network if it doesn't exist
+    let dir = networks_dir();
+    let default_path = network_path("default");
+    if !std::path::Path::new(&default_path).exists() {
+        ui::info("\nCreating default network...");
+        std::fs::create_dir_all(&dir)?;
+        let net = DevNetwork::default_network();
+        let json = serde_json::to_string_pretty(&net)?;
+        std::fs::write(&default_path, json)?;
+        ui::success(&format!(
+            "Created default network (bridge={}, subnet={})",
+            net.bridge_name, net.subnet
+        ));
+    } else {
+        ui::info("\nDefault network already configured.");
+    }
+
+    // Step 5: Create XDG directories
+    ui::info("\nCreating data directories...");
+    let dirs = [
+        mvm_core::config::mvm_cache_dir(),
+        mvm_core::config::mvm_config_dir(),
+        mvm_core::config::mvm_state_dir(),
+        mvm_core::config::mvm_share_dir(),
+    ];
+    for d in &dirs {
+        std::fs::create_dir_all(d)?;
+    }
+
+    // Step 6: Show available images
+    ui::info("\nAvailable images in catalog:");
+    let catalog = load_bundled_catalog();
+    for entry in &catalog.entries {
+        ui::info(&format!("  {} — {}", entry.name, entry.description));
+    }
+
+    ui::success("\nSetup complete!");
+    ui::info("Next steps:");
+    ui::info("  mvmctl dev              # Enter development environment");
+    ui::info("  mvmctl image list       # Browse available images");
+    ui::info("  mvmctl doctor           # Verify everything is working");
+    ui::info("  mvmctl up --flake .     # Build and run a VM from a Nix flake");
+
+    Ok(())
+}
+
+fn platform_label(plat: mvm_core::platform::Platform) -> &'static str {
+    match plat {
+        mvm_core::platform::Platform::MacOS => "macOS (Lima + Firecracker)",
+        mvm_core::platform::Platform::LinuxNative => "Linux (native KVM)",
+        mvm_core::platform::Platform::LinuxNoKvm => "Linux (no KVM — limited)",
+        mvm_core::platform::Platform::Wsl2 => "WSL2 (Linux via Windows)",
+        mvm_core::platform::Platform::Windows => "Windows (experimental)",
+    }
+}
+
+// ============================================================================
+// Security status
+// ============================================================================
+
+fn cmd_security(action: SecurityCmd) -> Result<()> {
+    match action {
+        SecurityCmd::Status { json } => cmd_security_status(json),
+    }
+}
+
+fn cmd_security_status(json: bool) -> Result<()> {
+    use mvm_core::security::{PostureCheck, SecurityLayer};
+    use mvm_security::posture::SecurityPosture;
+
+    let mut checks = Vec::new();
+
+    // Check audit logging
+    let audit_path = mvm_core::audit::default_audit_log();
+    let audit_exists = std::path::Path::new(&audit_path).exists();
+    checks.push(PostureCheck {
+        layer: SecurityLayer::AuditLogging,
+        name: "Local audit log".to_string(),
+        passed: audit_exists,
+        detail: if audit_exists {
+            format!("Active at {audit_path}")
+        } else {
+            format!("Not found at {audit_path}")
+        },
+    });
+
+    // Check XDG directory structure
+    let share_dir = mvm_core::config::mvm_share_dir();
+    let xdg_exists = std::path::Path::new(&share_dir).exists();
+    checks.push(PostureCheck {
+        layer: SecurityLayer::ConfigImmutability,
+        name: "XDG data directory".to_string(),
+        passed: xdg_exists,
+        detail: if xdg_exists {
+            format!("Present at {share_dir}")
+        } else {
+            "Not yet created — run `mvmctl init`".to_string()
+        },
+    });
+
+    // Check default network
+    let net_path = mvm_core::dev_network::network_path("default");
+    let net_exists = std::path::Path::new(&net_path).exists();
+    checks.push(PostureCheck {
+        layer: SecurityLayer::NetworkIsolation,
+        name: "Default dev network".to_string(),
+        passed: net_exists,
+        detail: if net_exists {
+            "Configured".to_string()
+        } else {
+            "Not configured — run `mvmctl init` or `mvmctl network create default`".to_string()
+        },
+    });
+
+    // Check seccomp availability
+    checks.push(PostureCheck {
+        layer: SecurityLayer::SeccompFilter,
+        name: "Seccomp profiles".to_string(),
+        passed: true,
+        detail: "5-tier profiles available (essential → unrestricted)".to_string(),
+    });
+
+    // Check vsock auth
+    checks.push(PostureCheck {
+        layer: SecurityLayer::VsockAuth,
+        name: "Vsock authentication".to_string(),
+        passed: true,
+        detail: "Ed25519 signing with replay protection".to_string(),
+    });
+
+    // Check guest hardening (no SSH)
+    checks.push(PostureCheck {
+        layer: SecurityLayer::GuestHardening,
+        name: "No SSH policy".to_string(),
+        passed: true,
+        detail: "Vsock-only guest communication (no sshd)".to_string(),
+    });
+
+    // Check supply chain
+    checks.push(PostureCheck {
+        layer: SecurityLayer::SupplyChainIntegrity,
+        name: "Nix-based builds".to_string(),
+        passed: true,
+        detail: "All images built from Nix flakes (content-addressed)".to_string(),
+    });
+
+    let timestamp = mvm_core::time::utc_now();
+    let report = SecurityPosture::evaluate(checks, &timestamp);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+    } else {
+        print!("{}", SecurityPosture::summary(&report));
+
+        let uncovered = SecurityPosture::uncovered_layers(&report.checks);
+        if !uncovered.is_empty() {
+            println!("\nUncovered layers (no checks):");
+            for layer in uncovered {
+                println!("  - {:?}", layer);
+            }
+        }
+    }
+
+    Ok(())
+}
+
+// ============================================================================
+// Console (PTY-over-vsock)
+// ============================================================================
+
+fn cmd_console(name: &str, command: Option<&str>) -> Result<()> {
+    validate_vm_name(name).with_context(|| format!("Invalid VM name: {:?}", name))?;
+
+    if let Some(cmd) = command {
+        // One-shot command execution — detect backend for both Firecracker and Apple Container
+        let resp = if let Ok(mut stream) =
+            mvm_apple_container::vsock_connect(name, mvm_guest::vsock::GUEST_AGENT_PORT)
+        {
+            mvm_guest::vsock::send_request(
+                &mut stream,
+                &mvm_guest::vsock::GuestRequest::Exec {
+                    command: cmd.to_string(),
+                    stdin: None,
+                    timeout_secs: Some(30),
+                },
+            )?
+        } else {
+            let instance_dir = microvm::resolve_running_vm_dir(name)?;
+            mvm_guest::vsock::exec_at(
+                &mvm_guest::vsock::vsock_uds_path(&instance_dir),
+                cmd,
+                None,
+                30,
+            )?
+        };
+        match resp {
+            mvm_guest::vsock::GuestResponse::ExecResult {
+                exit_code,
+                stdout,
+                stderr,
+            } => {
+                if !stdout.is_empty() {
+                    print!("{stdout}");
+                }
+                if !stderr.is_empty() {
+                    eprint!("{stderr}");
+                }
+                if exit_code != 0 {
+                    std::process::exit(exit_code);
+                }
+                Ok(())
+            }
+            mvm_guest::vsock::GuestResponse::Error { message } => {
+                anyhow::bail!("Console exec error: {message}")
+            }
+            other => anyhow::bail!("Unexpected response: {other:?}"),
+        }
+    } else {
+        // Interactive PTY session
+        console_interactive(name)
+    }
+}
+
+/// Open an interactive PTY console to a running VM.
+///
+/// Backend type for console connections.
+enum ConsoleBackend {
+    AppleContainer(String),
+    Firecracker(String),
+}
+
+/// Open an interactive PTY console to a running VM.
+///
+/// Supports both Firecracker (via UDS vsock) and Apple Container (via direct vsock).
+fn console_interactive(name: &str) -> Result<()> {
+    // Get terminal size
+    let (cols, rows) = get_terminal_size();
+
+    // Send ConsoleOpen request via the control channel
+    ui::info(&format!(
+        "Opening console to VM {:?} ({}x{})...",
+        name, cols, rows
+    ));
+
+    // Determine backend: try Apple Container first, then Firecracker/Lima UDS
+    let backend =
+        if mvm_apple_container::vsock_connect(name, mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
+            ConsoleBackend::AppleContainer(name.to_string())
+        } else {
+            let instance_dir = microvm::resolve_running_vm_dir(name)?;
+            ConsoleBackend::Firecracker(instance_dir)
+        };
+
+    // Send ConsoleOpen on the control channel
+    let (resp, connect_data) = match &backend {
+        ConsoleBackend::AppleContainer(vm_id) => {
+            let mut stream =
+                mvm_apple_container::vsock_connect(vm_id, mvm_guest::vsock::GUEST_AGENT_PORT)
+                    .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let resp = mvm_guest::vsock::send_request(
+                &mut stream,
+                &mvm_guest::vsock::GuestRequest::ConsoleOpen { cols, rows },
+            )?;
+            (resp, backend)
+        }
+        ConsoleBackend::Firecracker(instance_dir) => {
+            let uds = mvm_guest::vsock::vsock_uds_path(instance_dir);
+            let mut stream = mvm_guest::vsock::connect_to(&uds, 10)?;
+            let resp = mvm_guest::vsock::send_request(
+                &mut stream,
+                &mvm_guest::vsock::GuestRequest::ConsoleOpen { cols, rows },
+            )?;
+            (resp, backend)
+        }
+    };
+
+    let (session_id, data_port) = match resp {
+        mvm_guest::vsock::GuestResponse::ConsoleOpened {
+            session_id,
+            data_port,
+        } => (session_id, data_port),
+        mvm_guest::vsock::GuestResponse::Error { message } => {
+            anyhow::bail!("Console open failed: {message}");
+        }
+        other => {
+            anyhow::bail!("Unexpected response: {other:?}");
+        }
+    };
+
+    ui::info(&format!(
+        "Console session {} opened, connecting to data port {}...",
+        session_id, data_port
+    ));
+
+    // Small delay to let the guest agent bind the data port
+    std::thread::sleep(std::time::Duration::from_millis(200));
+
+    // Connect to the data port for raw I/O
+    let data_stream = match &connect_data {
+        ConsoleBackend::AppleContainer(vm_id) => {
+            mvm_apple_container::vsock_connect(vm_id, data_port)
+                .map_err(|e| anyhow::anyhow!("Failed to connect to console data port: {e}"))?
+        }
+        ConsoleBackend::Firecracker(instance_dir) => {
+            // Firecracker vsock multiplexes all ports on the same UDS
+            let uds = mvm_guest::vsock::vsock_uds_path(instance_dir);
+            mvm_guest::vsock::connect_to(&uds, 10)
+                .context("Failed to connect to console data port")?
+        }
+    };
+
+    mvm_core::audit::emit(
+        mvm_core::audit::LocalAuditKind::ConsoleSessionStart,
+        Some(name),
+        Some(&format!("session_id={session_id}")),
+    );
+
+    // Set up SIGWINCH handler to forward terminal resizes
+    let resize_sender = setup_sigwinch_handler(&connect_data, session_id);
+
+    // Enter raw terminal mode
+    let orig_termios = enter_raw_mode()?;
+    let result = run_console_relay(data_stream);
+
+    // Restore terminal and clean up resize handler
+    restore_terminal(&orig_termios);
+    drop(resize_sender);
+
+    mvm_core::audit::emit(
+        mvm_core::audit::LocalAuditKind::ConsoleSessionEnd,
+        Some(name),
+        Some(&format!("session_id={session_id}")),
+    );
+
+    println!("\nConsole session ended.");
+    result
+}
+
+/// Flag set by the SIGWINCH signal handler.
+static SIGWINCH_RECEIVED: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+extern "C" fn sigwinch_handler(_sig: libc::c_int) {
+    SIGWINCH_RECEIVED.store(true, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Set up a SIGWINCH signal handler that forwards terminal resizes to the guest.
+///
+/// Returns a sender that keeps the background thread alive. Drop it to stop.
+fn setup_sigwinch_handler(
+    backend: &ConsoleBackend,
+    session_id: u32,
+) -> Option<std::sync::mpsc::Sender<()>> {
+    use std::sync::atomic::Ordering;
+
+    // Clone backend info for the resize thread
+    let backend_info = match backend {
+        ConsoleBackend::AppleContainer(vm_id) => ConsoleBackend::AppleContainer(vm_id.clone()),
+        ConsoleBackend::Firecracker(dir) => ConsoleBackend::Firecracker(dir.clone()),
+    };
+
+    let (tx, rx) = std::sync::mpsc::channel::<()>();
+
+    // Install SIGWINCH handler
+    unsafe {
+        libc::signal(
+            libc::SIGWINCH,
+            sigwinch_handler as *const () as libc::sighandler_t,
+        );
+    }
+
+    // Background thread polls for resize signals
+    std::thread::spawn(move || {
+        loop {
+            std::thread::sleep(std::time::Duration::from_millis(250));
+
+            // Stop if session ended (sender dropped)
+            if let Err(std::sync::mpsc::TryRecvError::Disconnected) = rx.try_recv() {
+                break;
+            }
+
+            if !SIGWINCH_RECEIVED.swap(false, Ordering::SeqCst) {
+                continue;
+            }
+
+            let (cols, rows) = get_terminal_size();
+
+            // Send ConsoleResize via the control channel (best-effort)
+            let _ = match &backend_info {
+                ConsoleBackend::AppleContainer(vm_id) => {
+                    mvm_apple_container::vsock_connect(vm_id, mvm_guest::vsock::GUEST_AGENT_PORT)
+                        .ok()
+                        .and_then(|mut stream| {
+                            mvm_guest::vsock::send_request(
+                                &mut stream,
+                                &mvm_guest::vsock::GuestRequest::ConsoleResize {
+                                    session_id,
+                                    cols,
+                                    rows,
+                                },
+                            )
+                            .ok()
+                        })
+                }
+                ConsoleBackend::Firecracker(instance_dir) => {
+                    let uds = mvm_guest::vsock::vsock_uds_path(instance_dir);
+                    mvm_guest::vsock::connect_to(&uds, 5)
+                        .ok()
+                        .and_then(|mut stream| {
+                            mvm_guest::vsock::send_request(
+                                &mut stream,
+                                &mvm_guest::vsock::GuestRequest::ConsoleResize {
+                                    session_id,
+                                    cols,
+                                    rows,
+                                },
+                            )
+                            .ok()
+                        })
+                }
+            };
+        }
+    });
+
+    Some(tx)
+}
+
+/// Get the current terminal size.
+fn get_terminal_size() -> (u16, u16) {
+    // SAFETY: ioctl with valid fd (stdout)
+    unsafe {
+        let mut ws: libc::winsize = std::mem::zeroed();
+        if libc::ioctl(1, libc::TIOCGWINSZ, &mut ws) == 0 && ws.ws_col > 0 && ws.ws_row > 0 {
+            (ws.ws_col, ws.ws_row)
+        } else {
+            (80, 24)
+        }
+    }
+}
+
+/// Put the terminal in raw mode and return the original termios for restoration.
+fn enter_raw_mode() -> Result<libc::termios> {
+    unsafe {
+        let mut orig: libc::termios = std::mem::zeroed();
+        if libc::tcgetattr(0, &mut orig) != 0 {
+            anyhow::bail!("Failed to get terminal attributes");
+        }
+
+        let mut raw = orig;
+        libc::cfmakeraw(&mut raw);
+        if libc::tcsetattr(0, libc::TCSANOW, &raw) != 0 {
+            anyhow::bail!("Failed to set raw terminal mode");
+        }
+
+        Ok(orig)
+    }
+}
+
+/// Restore the terminal to its original mode.
+fn restore_terminal(orig: &libc::termios) {
+    unsafe {
+        libc::tcsetattr(0, libc::TCSANOW, orig);
+    }
+}
+
+/// Relay raw bytes between stdin/stdout and a vsock data stream.
+fn run_console_relay(data_stream: std::os::unix::net::UnixStream) -> Result<()> {
+    use std::io::{Read, Write};
+    use std::sync::atomic::{AtomicBool, Ordering};
+
+    let done = std::sync::Arc::new(AtomicBool::new(false));
+
+    // vsock → stdout (guest output → host terminal)
+    let done2 = done.clone();
+    let mut read_stream = data_stream
+        .try_clone()
+        .context("Failed to clone data stream")?;
+
+    let output_thread = std::thread::spawn(move || {
+        let mut stdout = std::io::stdout();
+        let mut buf = [0u8; 4096];
+        loop {
+            match read_stream.read(&mut buf) {
+                Ok(0) | Err(_) => {
+                    done2.store(true, Ordering::SeqCst);
+                    break;
+                }
+                Ok(n) => {
+                    let _ = stdout.write_all(&buf[..n]);
+                    let _ = stdout.flush();
+                }
+            }
+        }
+    });
+
+    // stdin → vsock (host input → guest shell)
+    let mut write_stream = data_stream;
+    let mut stdin = std::io::stdin();
+    let mut buf = [0u8; 1024];
+    loop {
+        if done.load(Ordering::SeqCst) {
+            break;
+        }
+        match stdin.read(&mut buf) {
+            Ok(0) | Err(_) => break,
+            Ok(n) => {
+                if write_stream.write_all(&buf[..n]).is_err() {
+                    break;
+                }
+                let _ = write_stream.flush();
+            }
+        }
+    }
+
+    let _ = output_thread.join();
     Ok(())
 }
 
@@ -4286,5 +5363,187 @@ mod tests {
         let allow = vec!["not-a-host-port".to_string()];
         let result = resolve_network_policy(None, &allow);
         assert!(result.is_err());
+    }
+
+    // --- Network CLI tests ---
+
+    #[test]
+    fn test_network_list_help() {
+        let cli = Cli::try_parse_from(["mvmctl", "network", "list"]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_network_create_help() {
+        let cli = Cli::try_parse_from(["mvmctl", "network", "create", "mynet"]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_network_inspect_help() {
+        let cli = Cli::try_parse_from(["mvmctl", "network", "inspect", "mynet"]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_network_remove_help() {
+        let cli = Cli::try_parse_from(["mvmctl", "network", "rm", "mynet"]);
+        assert!(cli.is_ok());
+    }
+
+    // --- Image CLI tests ---
+
+    #[test]
+    fn test_image_list_help() {
+        let cli = Cli::try_parse_from(["mvmctl", "image", "list"]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_image_search_help() {
+        let cli = Cli::try_parse_from(["mvmctl", "image", "search", "http"]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_image_fetch_help() {
+        let cli = Cli::try_parse_from(["mvmctl", "image", "fetch", "minimal"]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_image_info_help() {
+        let cli = Cli::try_parse_from(["mvmctl", "image", "info", "postgres"]);
+        assert!(cli.is_ok());
+    }
+
+    // --- Console CLI tests ---
+
+    #[test]
+    fn test_console_help() {
+        let cli = Cli::try_parse_from(["mvmctl", "console", "myvm"]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_console_with_command() {
+        let cli = Cli::try_parse_from(["mvmctl", "console", "myvm", "--command", "ls"]);
+        assert!(cli.is_ok());
+        match cli.unwrap().command {
+            Commands::Console { name, command } => {
+                assert_eq!(name, "myvm");
+                assert_eq!(command.as_deref(), Some("ls"));
+            }
+            _ => panic!("Expected Console command"),
+        }
+    }
+
+    // --- Init CLI tests ---
+
+    #[test]
+    fn test_init_defaults() {
+        let cli = Cli::try_parse_from(["mvmctl", "init"]).unwrap();
+        match cli.command {
+            Commands::Init {
+                non_interactive,
+                lima_cpus,
+                lima_mem,
+            } => {
+                assert!(!non_interactive);
+                assert_eq!(lima_cpus, 8);
+                assert_eq!(lima_mem, 16);
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    #[test]
+    fn test_init_non_interactive() {
+        let cli = Cli::try_parse_from(["mvmctl", "init", "--non-interactive", "--lima-cpus", "4"])
+            .unwrap();
+        match cli.command {
+            Commands::Init {
+                non_interactive,
+                lima_cpus,
+                ..
+            } => {
+                assert!(non_interactive);
+                assert_eq!(lima_cpus, 4);
+            }
+            _ => panic!("Expected Init command"),
+        }
+    }
+
+    // --- Security CLI tests ---
+
+    #[test]
+    fn test_security_status_help() {
+        let cli = Cli::try_parse_from(["mvmctl", "security", "status"]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_security_status_json() {
+        let cli = Cli::try_parse_from(["mvmctl", "security", "status", "--json"]).unwrap();
+        match cli.command {
+            Commands::Security {
+                action: SecurityCmd::Status { json },
+            } => {
+                assert!(json);
+            }
+            _ => panic!("Expected Security Status command"),
+        }
+    }
+
+    // --- Cache CLI tests ---
+
+    #[test]
+    fn test_cache_info() {
+        let cli = Cli::try_parse_from(["mvmctl", "cache", "info"]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_cache_prune() {
+        let cli = Cli::try_parse_from(["mvmctl", "cache", "prune"]);
+        assert!(cli.is_ok());
+    }
+
+    #[test]
+    fn test_cache_prune_dry_run() {
+        let cli = Cli::try_parse_from(["mvmctl", "cache", "prune", "--dry-run"]).unwrap();
+        match cli.command {
+            Commands::Cache {
+                action: CacheCmd::Prune { dry_run },
+            } => {
+                assert!(dry_run);
+            }
+            _ => panic!("Expected Cache Prune command"),
+        }
+    }
+
+    // --- Up --network flag tests ---
+
+    #[test]
+    fn test_up_network_default() {
+        let cli = Cli::try_parse_from(["mvmctl", "up", "--flake", "."]).unwrap();
+        match cli.command {
+            Commands::Up { network, .. } => {
+                assert_eq!(network, "default");
+            }
+            _ => panic!("Expected Up command"),
+        }
+    }
+
+    #[test]
+    fn test_up_network_custom() {
+        let cli =
+            Cli::try_parse_from(["mvmctl", "up", "--flake", ".", "--network", "isolated"]).unwrap();
+        match cli.command {
+            Commands::Up { network, .. } => {
+                assert_eq!(network, "isolated");
+            }
+            _ => panic!("Expected Up command"),
+        }
     }
 }

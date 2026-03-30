@@ -37,15 +37,15 @@ mvm-core (foundation, no mvm deps)
 
 **Key module locations:**
 
-mvm-core: `build_env.rs` (ShellEnvironment + BuildEnvironment traits), `pool.rs`, `instance.rs`, `tenant.rs`, `template.rs`, `naming.rs`, `signing.rs`, `routing.rs`, `protocol.rs`, `agent.rs`
+mvm-core: `build_env.rs` (ShellEnvironment + BuildEnvironment traits), `pool.rs`, `instance.rs`, `tenant.rs`, `template.rs`, `naming.rs`, `signing.rs`, `routing.rs`, `protocol.rs`, `agent.rs`, `catalog.rs` (image catalog), `dev_network.rs` (named networks), `config.rs` (XDG directory functions)
 
 mvm-runtime: `shell.rs`, `config.rs`, `ui.rs`, `build_env.rs` (DevShellEnv impl), `vm/lima.rs`, `vm/firecracker.rs`, `vm/microvm.rs`, `vm/network.rs`, `vm/image.rs`, `vm/template/`
 
 mvm-build: `dev_build.rs` (local Nix builds via ShellEnvironment), `build.rs` (orchestrated builds via BuildEnvironment), `nix_manifest.rs`, `scripts.rs`
 
-mvm-guest: `vsock.rs`, `integrations.rs`, `builder_agent.rs`
+mvm-guest: `vsock.rs`, `console.rs` (PTY-over-vsock), `integrations.rs`, `builder_agent.rs`
 
-mvm-cli: `commands.rs`, `bootstrap.rs`, `template_cmd.rs`, `doctor.rs`, `update.rs`, `http.rs`, `logging.rs`, `ui.rs`
+mvm-cli: `commands.rs` (network, image, console, cache, init, security commands), `bootstrap.rs`, `template_cmd.rs`, `doctor.rs`, `update.rs`, `http.rs`, `logging.rs`, `ui.rs`
 
 ### Trait Architecture
 
@@ -72,7 +72,7 @@ The `RuntimeBuildEnv` in mvm-runtime implements only `ShellEnvironment`. The ful
 - **Firecracker-only**: no Docker/containers. Builds run Nix inside the Lima VM.
 - **No SSH in microVMs, ever**: microVMs are headless workloads. No sshd, no SSH keys, no SSH users in any rootfs. Guest communication uses Firecracker vsock only. The dev environment is the Lima VM (`mvmctl dev` / `mvmctl dev shell`), not the microVM.
 - **Dev mode = Lima shell**: `mvmctl dev` (or `mvmctl dev up`) auto-bootstraps then drops into the Lima VM shell. `mvmctl dev down` stops it. `mvmctl dev shell` opens a shell without bootstrap. `mvmctl dev status` shows environment info. It does NOT start or SSH into a Firecracker microVM.
-- **Headless microVMs**: `mvmctl start` and `mvmctl run` boot Firecracker as a daemon. No interactive access to the microVM.
+- **Headless microVMs**: `mvmctl start` and `mvmctl run` boot Firecracker as a daemon. Interactive access via `mvmctl console` (PTY-over-vsock, dev-mode only).
 - **Dev mode isolation**: `mvmctl start/stop/dev` use a completely separate code path from orchestration.
 - **Shell scripts inside run_in_vm**: complex ops are bash scripts passed to `limactl shell`. Deliberate -- they run inside the Linux VM.
 - **Idempotent setup**: every step checks if already done before acting.
@@ -116,6 +116,26 @@ cargo run -- run --flake . --profile minimal --cpus 2 --memory 1024
 cargo run -- template create base --flake . --profile minimal --role worker --cpus 2 --mem 1024
 cargo run -- template build base
 cargo run -- template list
+
+# Image catalog
+cargo run -- image list              # browse bundled catalog
+cargo run -- image search http       # search by name/tag
+cargo run -- image fetch minimal     # build from catalog entry
+
+# Networks
+cargo run -- network create isolated # create named network
+cargo run -- network list            # list all networks
+cargo run -- network remove isolated # remove a network
+
+# Console (interactive PTY, dev-mode only)
+cargo run -- console myvm            # interactive shell
+cargo run -- console myvm --command "uname -a"  # one-shot exec
+
+# Setup & diagnostics
+cargo run -- init                    # first-time setup wizard
+cargo run -- security status         # security posture evaluation
+cargo run -- cache info              # cache directory info
+cargo run -- cache prune             # clean stale temp files
 ```
 
 ## Dev Network Layout
