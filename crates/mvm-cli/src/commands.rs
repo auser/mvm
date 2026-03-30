@@ -1451,24 +1451,66 @@ fn ensure_dev_image() -> Result<(String, String)> {
 
     // Build the combined image (produces vmlinux + rootfs.ext4 in one derivation)
     let nix_bin = find_nix_binary();
+    let build_args = [
+        "build",
+        &format!("{flake_dir}#default"),
+        "--no-link",
+        "--print-out-paths",
+    ];
+
     let build_output = std::process::Command::new(&nix_bin)
-        .args([
-            "build",
-            &format!("{flake_dir}#default"),
-            "--no-link",
-            "--print-out-paths",
-        ])
+        .args(build_args)
         .output()
         .context("Failed to run nix build for dev image")?;
+
+    // If the build failed because of missing Linux builder on macOS,
+    // set one up automatically and retry.
     if !build_output.status.success() {
         let stderr = String::from_utf8_lossy(&build_output.stderr);
+        if stderr.contains("Required system: 'aarch64-linux'")
+            || stderr.contains("required system or feature not available")
+        {
+            ui::info(
+                "macOS cannot build Linux images natively. \
+                 Setting up Nix Linux builder (one-time)...",
+            );
+            ensure_nix_linux_builder(&nix_bin)?;
+
+            // Retry the build with fresh args (previous ones were consumed)
+            ui::info("Retrying dev image build with Linux builder...");
+            let retry = std::process::Command::new(&nix_bin)
+                .args([
+                    "build",
+                    &format!("{flake_dir}#default"),
+                    "--no-link",
+                    "--print-out-paths",
+                ])
+                .output()
+                .context("Failed to run nix build (retry)")?;
+            if !retry.status.success() {
+                let retry_err = String::from_utf8_lossy(&retry.stderr);
+                anyhow::bail!(
+                    "Dev image build failed after setting up Linux builder:\n{retry_err}"
+                );
+            }
+            // Use the retry output
+            let store_path = String::from_utf8_lossy(&retry.stdout).trim().to_string();
+            return finish_dev_image_copy(&store_path, &kernel_path, &rootfs_path);
+        }
         anyhow::bail!("Dev image build failed:\n{stderr}");
     }
     let store_path = String::from_utf8_lossy(&build_output.stdout)
         .trim()
         .to_string();
+    finish_dev_image_copy(&store_path, &kernel_path, &rootfs_path)
+}
 
-    // Copy kernel and rootfs from the Nix store to the cache
+/// Copy kernel and rootfs from Nix store to the cache directory.
+fn finish_dev_image_copy(
+    store_path: &str,
+    kernel_path: &str,
+    rootfs_path: &str,
+) -> Result<(String, String)> {
     let kernel_src = format!("{store_path}/vmlinux");
     let rootfs_src = format!("{store_path}/rootfs.ext4");
 
@@ -1479,13 +1521,95 @@ fn ensure_dev_image() -> Result<(String, String)> {
         anyhow::bail!("Nix build succeeded but rootfs.ext4 not found at {rootfs_src}");
     }
 
-    std::fs::copy(&kernel_src, &kernel_path)
+    std::fs::copy(&kernel_src, kernel_path)
         .with_context(|| format!("Failed to copy kernel from {kernel_src}"))?;
-    std::fs::copy(&rootfs_src, &rootfs_path)
+    std::fs::copy(&rootfs_src, rootfs_path)
         .with_context(|| format!("Failed to copy rootfs from {rootfs_src}"))?;
 
     ui::success("Dev image built and cached.");
-    Ok((kernel_path, rootfs_path))
+    Ok((kernel_path.to_string(), rootfs_path.to_string()))
+}
+
+/// Ensure a Nix Linux builder is configured on macOS.
+///
+/// On macOS, Nix cannot build Linux derivations natively. This sets up
+/// the `linux-builder` which runs a lightweight Linux VM in the background
+/// that Nix delegates Linux builds to.
+fn ensure_nix_linux_builder(nix_bin: &str) -> Result<()> {
+    // Check if builders are already configured
+    let check = std::process::Command::new(nix_bin)
+        .args(["show-config", "--json"])
+        .output()
+        .context("Failed to query Nix config")?;
+
+    if check.status.success() {
+        let config_str = String::from_utf8_lossy(&check.stdout);
+        if config_str.contains("aarch64-linux") && config_str.contains("builders") {
+            ui::info("Linux builder already configured.");
+            return Ok(());
+        }
+    }
+
+    // Add linux-builder to nix.custom.conf
+    let custom_conf = "/etc/nix/nix.custom.conf";
+    let builder_line = "extra-platforms = aarch64-linux\nsystem-features = nixos-test benchmark big-parallel kvm\n";
+
+    // Check if already configured
+    if let Ok(content) = std::fs::read_to_string(custom_conf)
+        && content.contains("aarch64-linux")
+    {
+        ui::info("Linux builder already configured in nix.custom.conf.");
+        return Ok(());
+    }
+
+    ui::info("Adding aarch64-linux platform support to Nix config...");
+    ui::info("This requires sudo to write to /etc/nix/nix.custom.conf");
+
+    let status = std::process::Command::new("sudo")
+        .args([
+            "sh",
+            "-c",
+            &format!("echo '{}' >> {}", builder_line, custom_conf),
+        ])
+        .stdin(std::process::Stdio::inherit())
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit())
+        .status()
+        .context("Failed to configure Nix Linux builder")?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "Failed to configure Nix Linux builder.\n\
+             You can configure it manually by adding to /etc/nix/nix.custom.conf:\n\
+             extra-platforms = aarch64-linux"
+        );
+    }
+
+    // Restart nix-daemon to pick up the new config
+    ui::info("Restarting Nix daemon...");
+    let _ = std::process::Command::new("sudo")
+        .args([
+            "launchctl",
+            "kickstart",
+            "-k",
+            "system/org.nixos.nix-daemon",
+        ])
+        .status();
+    // Determinate Nix uses a different service name
+    let _ = std::process::Command::new("sudo")
+        .args([
+            "launchctl",
+            "kickstart",
+            "-k",
+            "system/systems.determinate.nix-daemon",
+        ])
+        .status();
+
+    // Give the daemon a moment to restart
+    std::thread::sleep(std::time::Duration::from_secs(2));
+
+    ui::success("Nix Linux builder configured.");
+    Ok(())
 }
 
 /// Find the `nix` binary, checking PATH and common install locations.
