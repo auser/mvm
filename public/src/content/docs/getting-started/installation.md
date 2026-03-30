@@ -53,7 +53,17 @@ mvmctl automatically detects your platform at startup and selects the best VM ba
 | **macOS <26** | Lima + Firecracker | Lima VM provides `/dev/kvm`. Builds and Firecracker run inside Lima. |
 | **Linux without `/dev/kvm`** | Lima + Firecracker | Lima VM as fallback (same as macOS <26). |
 
-Running `mvmctl dev` or `mvmctl bootstrap` handles everything automatically -- it detects your platform, selects the backend, installs Lima only if needed, and sets up Nix and Firecracker in the right environment.
+### First-Time Setup
+
+After installation, run the setup wizard:
+
+```bash
+mvmctl init
+```
+
+This walks through platform detection, dependency installation, Lima VM creation (if needed), default network setup, and XDG directory creation. Use `--non-interactive` for scripted environments.
+
+Running `mvmctl dev` or `mvmctl bootstrap` also handles setup automatically -- they detect your platform, select the backend, install Lima only if needed, and set up Nix and Firecracker in the right environment.
 
 You can force a specific backend with `--hypervisor`:
 

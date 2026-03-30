@@ -45,6 +45,7 @@ mvmctl ls         # List running VMs (aliases: ps, status)
 mvmctl dev shell  # Open a shell in the Lima VM
 mvmctl down       # Stop all running VMs
 mvmctl doctor     # Check system dependencies and configuration
+mvmctl console vm # Interactive shell into a running VM (PTY-over-vsock)
 ```
 
 ## 3. Build and Run
@@ -83,11 +84,42 @@ mvmctl template build base-worker
 mvmctl up --template base-worker
 ```
 
-## 5. Diagnostics
+## 5. Image Catalog
+
+Browse and build images without writing Nix flakes yourself:
 
 ```bash
-mvmctl doctor    # Check system dependencies, available backends
-mvmctl logs vm1  # View guest console logs
+mvmctl image list           # Browse available images
+mvmctl image fetch minimal  # Build from catalog (creates template + Nix build)
+mvmctl up --template minimal
+```
+
+## 6. Interactive Console
+
+Access a running VM without SSH -- uses PTY-over-vsock:
+
+```bash
+mvmctl console myvm                    # Interactive shell
+mvmctl console myvm --command "ls -la" # One-shot command
+```
+
+## 7. Named Networks
+
+Create isolated networks for different projects:
+
+```bash
+mvmctl network create myproject
+mvmctl up --flake . --network myproject
+mvmctl network list
+```
+
+## 8. Diagnostics & Security
+
+```bash
+mvmctl doctor           # Check system dependencies, available backends
+mvmctl logs vm1         # View guest console logs
+mvmctl security status  # Security posture evaluation
+mvmctl cache info       # Cache directory disk usage
 ```
 
 ## Next Steps
