@@ -913,10 +913,11 @@ fn handle_client(
             timeout_secs,
         } => {
             eprintln!("[audit] exec request: {:?}", command);
-            let allowed = mvm_guest::builder_agent::load_security_policy()
+            let policy = mvm_guest::builder_agent::load_security_policy()
                 .ok()
                 .flatten()
-                .is_some_and(|p| p.access.debug_exec);
+                .unwrap_or_else(mvm_core::security::SecurityPolicy::dev_defaults);
+            let allowed = policy.access.debug_exec;
             if !allowed {
                 GuestResponse::Error {
                     message: "exec rejected: access.debug_exec not enabled in security policy"
@@ -953,11 +954,13 @@ fn handle_client(
         }
 
         GuestRequest::ConsoleOpen { cols, rows } => {
-            // Check security policy — console requires access.console = true
-            let console_allowed = mvm_guest::builder_agent::load_security_policy()
+            // Check security policy — console requires access.console = true.
+            // When no policy file is provisioned (dev mode), use permissive defaults.
+            let policy = mvm_guest::builder_agent::load_security_policy()
                 .ok()
                 .flatten()
-                .is_some_and(|p| p.access.console);
+                .unwrap_or_else(mvm_core::security::SecurityPolicy::dev_defaults);
+            let console_allowed = policy.access.console;
             if !console_allowed {
                 return write_response(
                     &mut file,

@@ -92,6 +92,10 @@ impl VmStartParams<'_> {
 static CHILD_PIDS: std::sync::LazyLock<Arc<Mutex<Vec<u32>>>> =
     std::sync::LazyLock::new(|| Arc::new(Mutex::new(Vec::new())));
 
+/// When true, the Ctrl-C handler does nothing — console mode forwards
+/// raw bytes to the guest instead.
+static IN_CONSOLE_MODE: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
 #[derive(Parser)]
 #[command(name = "mvmctl", version, about = "Lightweight VM development tool")]
 struct Cli {
@@ -411,7 +415,7 @@ enum AuditCmd {
 
 #[derive(Subcommand)]
 enum DevCmd {
-    /// Bootstrap and start the dev environment, then drop into a shell
+    /// Bootstrap and start the dev environment
     Up {
         /// Number of vCPUs for the Lima VM
         #[arg(long, default_value = "8")]
@@ -431,6 +435,9 @@ enum DevCmd {
         /// Force Lima backend even on macOS 26+ (where Apple Container is default)
         #[arg(long)]
         lima: bool,
+        /// Open an interactive shell after starting
+        #[arg(long, short = 's')]
+        shell: bool,
     },
     /// Stop the Lima development VM
     Down,
@@ -442,6 +449,21 @@ enum DevCmd {
     },
     /// Show dev environment status (Lima VM, Firecracker, Nix)
     Status,
+    /// Rebuild the dev environment (down + clear cache + up)
+    Rebuild {
+        /// Number of vCPUs for the Lima VM
+        #[arg(long, default_value = "8")]
+        lima_cpus: u32,
+        /// Memory (GiB) for the Lima VM
+        #[arg(long, default_value = "16")]
+        lima_mem: u32,
+        /// Force Lima backend even on macOS 26+
+        #[arg(long)]
+        lima: bool,
+        /// Open an interactive shell after rebuilding
+        #[arg(long, short = 's')]
+        shell: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -460,6 +482,7 @@ enum FlakeCmd {
 #[derive(Subcommand)]
 enum NetworkCmd {
     /// Create a named dev network with its own bridge and subnet
+    #[command(alias = "new")]
     Create {
         /// Network name (lowercase alphanumeric + hyphens)
         name: String,
@@ -530,6 +553,7 @@ enum CacheCmd {
 #[derive(Subcommand)]
 enum TemplateCmd {
     /// Create a new template (single role/profile)
+    #[command(alias = "new")]
     Create {
         /// Template name (e.g. "base", "openclaw")
         name: String,
@@ -781,6 +805,10 @@ pub fn run() -> Result<()> {
     // Install Ctrl-C / SIGTERM handler for graceful shutdown.
     let pids = Arc::clone(&CHILD_PIDS);
     if let Err(e) = ctrlc::set_handler(move || {
+        // In console mode, Ctrl-C is forwarded as a raw byte to the guest.
+        if IN_CONSOLE_MODE.load(std::sync::atomic::Ordering::SeqCst) {
+            return;
+        }
         eprintln!("\nInterrupted, cleaning up...");
         // Kill any tracked child processes (e.g., socat port-forwarders).
         if let Ok(pids) = pids.lock() {
@@ -826,6 +854,7 @@ pub fn run() -> Result<()> {
                 metrics_port: 0,
                 watch_config: false,
                 lima: false,
+                shell: false,
             });
             match action {
                 DevCmd::Up {
@@ -835,6 +864,7 @@ pub fn run() -> Result<()> {
                     metrics_port,
                     watch_config,
                     lima,
+                    shell,
                 } => {
                     let effective_cpus = if lima_cpus == 8 {
                         cfg.lima_cpus
@@ -851,7 +881,7 @@ pub fn run() -> Result<()> {
                         !lima && mvm_core::platform::current().has_apple_containers();
 
                     if use_apple_container {
-                        cmd_dev_apple_container(effective_cpus, effective_mem)
+                        cmd_dev_apple_container(effective_cpus, effective_mem, shell)
                     } else {
                         cmd_dev(
                             effective_cpus,
@@ -883,6 +913,42 @@ pub fn run() -> Result<()> {
                         cmd_dev_apple_container_status()
                     } else {
                         cmd_dev_status()
+                    }
+                }
+                DevCmd::Rebuild {
+                    lima_cpus,
+                    lima_mem,
+                    lima,
+                    shell,
+                } => {
+                    // Down
+                    if mvm_core::platform::current().has_apple_containers() {
+                        let _ = cmd_dev_apple_container_down();
+                    } else {
+                        let _ = cmd_dev_down();
+                    }
+
+                    // Clear cached dev image
+                    let cache_dir = format!("{}/dev", mvm_core::config::mvm_cache_dir());
+                    let _ = std::fs::remove_dir_all(&cache_dir);
+
+                    // Up
+                    let effective_cpus = if lima_cpus == 8 {
+                        cfg.lima_cpus
+                    } else {
+                        lima_cpus
+                    };
+                    let effective_mem = if lima_mem == 16 {
+                        cfg.lima_mem_gib
+                    } else {
+                        lima_mem
+                    };
+                    let use_apple_container =
+                        !lima && mvm_core::platform::current().has_apple_containers();
+                    if use_apple_container {
+                        cmd_dev_apple_container(effective_cpus, effective_mem, shell)
+                    } else {
+                        cmd_dev(effective_cpus, effective_mem, None, 0, false)
                     }
                 }
             }
@@ -1324,14 +1390,33 @@ fn is_apple_container_dev_running() -> bool {
         .any(|id| id == DEV_VM_NAME)
 }
 
-/// Boot the Apple Container dev VM and open an interactive console.
-fn cmd_dev_apple_container(cpus: u32, memory_gib: u32) -> Result<()> {
+/// Boot the Apple Container dev VM, optionally opening an interactive console.
+fn cmd_dev_apple_container(cpus: u32, memory_gib: u32, open_shell: bool) -> Result<()> {
     ui::info("Starting dev environment via Apple Container...\n");
 
     if is_apple_container_dev_running() {
-        ui::info("Dev VM already running. Opening console...");
-        return console_interactive(DEV_VM_NAME);
+        // The VM is tracked in another process. Try to connect — if we
+        // can reach the guest agent, open a console. Otherwise the old
+        // process is alive but the VM is unreachable from here, so stop
+        // it and start fresh.
+        if mvm_apple_container::vsock_connect(DEV_VM_NAME, mvm_guest::vsock::GUEST_AGENT_PORT)
+            .is_ok()
+        {
+            if open_shell {
+                ui::info("Dev VM already running. Opening shell...");
+                return console_interactive(DEV_VM_NAME);
+            }
+            ui::info("Dev VM already running.");
+            return Ok(());
+        }
+
+        // Can't connect — kill the old owner process and clean up.
+        ui::info("Dev VM running in another process but unreachable. Restarting...");
+        stop_dev_vm_owner();
     }
+
+    // Clean up stale state from a previous process that died.
+    cleanup_stale_dev_vm();
 
     // Ensure dev image exists
     let (kernel, rootfs) = ensure_dev_image()?;
@@ -1353,21 +1438,90 @@ fn cmd_dev_apple_container(cpus: u32, memory_gib: u32) -> Result<()> {
         );
     }
 
-    ui::success("Dev VM ready. Opening console (Ctrl-D to exit)...\n");
-    console_interactive(DEV_VM_NAME)
+    if open_shell {
+        ui::success("Dev VM ready. Opening shell (exit or Ctrl+D to detach)...\n");
+        let _ = console_interactive(DEV_VM_NAME);
+        ui::info("\nDetached from dev VM. VM still running.");
+        ui::info("  Reconnect:  mvmctl dev shell");
+        ui::info("  Stop VM:    mvmctl dev down");
+    } else {
+        ui::success("Dev VM ready.");
+        ui::info("  Shell:      mvmctl dev shell");
+        ui::info("  Stop VM:    mvmctl dev down");
+    }
+
+    Ok(())
+}
+
+/// Kill the process that owns the dev VM and clean up its state.
+fn stop_dev_vm_owner() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let vm_dir = std::path::PathBuf::from(format!("{home}/.mvm/vms/{DEV_VM_NAME}"));
+    let pid_file = vm_dir.join("pid");
+
+    if let Ok(pid_str) = std::fs::read_to_string(&pid_file)
+        && let Ok(pid) = pid_str.trim().parse::<i32>()
+    {
+        // Don't kill ourselves
+        if pid as u32 != std::process::id() {
+            unsafe {
+                libc::kill(pid, libc::SIGTERM);
+            }
+            // Wait briefly for it to exit
+            for _ in 0..20 {
+                if unsafe { libc::kill(pid, 0) } != 0 {
+                    break;
+                }
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+    }
+
+    let _ = std::fs::remove_dir_all(&vm_dir);
+}
+
+/// Clean up stale persisted state from a dead dev VM process.
+fn cleanup_stale_dev_vm() {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let vm_dir = std::path::PathBuf::from(format!("{home}/.mvm/vms/{DEV_VM_NAME}"));
+    let pid_file = vm_dir.join("pid");
+
+    if !pid_file.exists() {
+        return;
+    }
+
+    let pid_str = match std::fs::read_to_string(&pid_file) {
+        Ok(s) => s.trim().to_string(),
+        Err(_) => return,
+    };
+    let pid: i32 = match pid_str.parse() {
+        Ok(p) => p,
+        Err(_) => return,
+    };
+
+    // Check if the process is still alive (signal 0 = existence check)
+    let alive = unsafe { libc::kill(pid, 0) } == 0;
+    if alive {
+        return; // process still running, not stale
+    }
+
+    ui::info("Cleaning up stale dev VM state from a previous session...");
+    let _ = std::fs::remove_dir_all(&vm_dir);
 }
 
 /// Stop the Apple Container dev VM.
 fn cmd_dev_apple_container_down() -> Result<()> {
-    if !is_apple_container_dev_running() {
-        ui::info("Dev VM is not running.");
+    if is_apple_container_dev_running() {
+        ui::info("Stopping Apple Container dev VM...");
+        mvm_apple_container::stop(DEV_VM_NAME)
+            .map_err(|e| anyhow::anyhow!("Failed to stop dev VM: {e}"))?;
+        ui::success("Dev VM stopped.");
         return Ok(());
     }
 
-    ui::info("Stopping Apple Container dev VM...");
-    mvm_apple_container::stop(DEV_VM_NAME)
-        .map_err(|e| anyhow::anyhow!("Failed to stop dev VM: {e}"))?;
-    ui::success("Dev VM stopped.");
+    // Also clean up stale state from a dead process
+    cleanup_stale_dev_vm();
+    ui::info("Dev VM is not running.");
     Ok(())
 }
 
@@ -1419,47 +1573,255 @@ fn cmd_dev_apple_container_status() -> Result<()> {
     Ok(())
 }
 
-/// Extra `nix build` arguments needed to cross-compile Linux on macOS.
+/// Ensure the Nix linux-builder VM is running, SSH is configured, and
+/// nix-daemon knows about it.
 ///
-/// Checks (in order):
-///   1. `/etc/nix/machines` — nix-daemon already knows about a linux builder
-///   2. Standard linux-builder SSH key exists — builder was set up but machines
-///      file may be missing (common with `nix run 'nixpkgs#darwin.linux-builder'`)
-///   3. Otherwise returns empty vec (native Linux or no builder found)
-fn nix_linux_builder_args() -> Vec<String> {
+/// `nix run 'nixpkgs#darwin.linux-builder'` starts a QEMU VM on port 31022
+/// and writes `/etc/nix/builder_ed25519`, but does NOT create the SSH config
+/// that maps `linux-builder` → `localhost:31022`. It also does not add the
+/// `builders` line to nix.conf. This function handles all three pieces:
+/// 1. Start the builder VM in the background if not already running
+/// 2. Write the SSH host alias so nix-daemon can connect
+/// 3. Add the `builders` line to nix.custom.conf
+///
+/// Returns `true` if the builder appears reachable after any fixup.
+fn ensure_linux_builder_ssh_config() -> bool {
     #[cfg(not(target_os = "macos"))]
     {
-        return Vec::new();
+        return false;
     }
 
     #[cfg(target_os = "macos")]
     {
-        // 1. If /etc/nix/machines lists a linux builder, nix-daemon handles it
-        if let Ok(contents) = std::fs::read_to_string("/etc/nix/machines")
-            && contents.lines().any(|l| {
-                let l = l.trim();
-                !l.is_empty() && !l.starts_with('#') && l.contains("aarch64-linux")
-            })
-        {
-            return Vec::new(); // daemon already configured
-        }
+        use std::io::Write;
+        use std::net::TcpStream;
+        use std::time::Duration;
 
-        // 2. Check for the well-known linux-builder SSH key (created by
-        //    `nix run 'nixpkgs#darwin.linux-builder'` or the nix-darwin module)
         let key_path = "/etc/nix/builder_ed25519";
-        if std::path::Path::new(key_path).exists() {
-            let builder_spec =
-                format!("ssh-ng://linux-builder aarch64-linux {key_path} 4 1 kvm,big-parallel - -");
-            return vec![
-                "--builders".to_string(),
-                builder_spec,
-                "--option".to_string(),
-                "builders-use-substitutes".to_string(),
-                "true".to_string(),
-            ];
+        let builder_port: u16 = 31022;
+
+        let builder_listening = || {
+            TcpStream::connect_timeout(
+                &format!("127.0.0.1:{builder_port}")
+                    .parse()
+                    .expect("valid socket address literal"),
+                Duration::from_secs(2),
+            )
+            .is_ok()
+        };
+
+        // If builder is not listening, try to start it automatically
+        if !builder_listening() {
+            let nix_bin = find_nix_binary();
+            ui::info("  Starting Nix linux-builder VM in the background...");
+
+            // Launch as a background process. The builder writes
+            // /etc/nix/builder_ed25519 on first run (needs sudo).
+            // Redirect output to a log file so it doesn't clutter the terminal.
+            let log_path = format!("{}/linux-builder.log", mvm_core::config::mvm_cache_dir());
+            let log_file = std::fs::File::create(&log_path)
+                .or_else(|_| std::fs::File::create("/dev/null"))
+                .expect("failed to open /dev/null");
+            let stderr_file = log_file
+                .try_clone()
+                .or_else(|_| std::fs::File::create("/dev/null"))
+                .expect("failed to open /dev/null");
+
+            let child = std::process::Command::new(&nix_bin)
+                .args(["run", "nixpkgs#darwin.linux-builder"])
+                .stdout(log_file)
+                .stderr(stderr_file)
+                .stdin(std::process::Stdio::null())
+                .spawn();
+
+            if child.is_err() {
+                return false;
+            }
+
+            // Wait for the builder to become ready (port 31022 + key file).
+            // First boot can take a while as it downloads the builder VM.
+            ui::info(
+                "  Waiting for linux-builder to become ready (this may take a minute on first run)...",
+            );
+            let deadline = std::time::Instant::now() + Duration::from_secs(120);
+            loop {
+                if std::time::Instant::now() > deadline {
+                    ui::warn("  Timed out waiting for linux-builder to start.");
+                    return false;
+                }
+                if std::path::Path::new(key_path).exists() && builder_listening() {
+                    break;
+                }
+                std::thread::sleep(Duration::from_secs(2));
+            }
         }
 
-        Vec::new()
+        // Key must exist (created by the linux-builder on first run)
+        if !std::path::Path::new(key_path).exists() {
+            return false;
+        }
+
+        // --- SSH config ---
+        // Check that the SSH config exists AND uses the correct user ("builder",
+        // not "root"). Older versions wrote "User root" which doesn't work.
+        let ssh_config_dir = std::path::Path::new("/etc/ssh/ssh_config.d");
+        let config_path = ssh_config_dir.join("200-linux-builder.conf");
+
+        let expected_config = format!(
+            "Host linux-builder\n\
+             \x20 HostName localhost\n\
+             \x20 Port {builder_port}\n\
+             \x20 User builder\n\
+             \x20 IdentityFile {key_path}\n\
+             \x20 IdentitiesOnly yes\n\
+             \x20 StrictHostKeyChecking no\n\
+             \x20 UserKnownHostsFile /dev/null\n\
+             \x20 LogLevel ERROR\n"
+        );
+
+        let ssh_needs_write = if config_path.exists() {
+            // Re-write if the existing config has wrong user
+            std::fs::read_to_string(&config_path)
+                .map(|c| !c.contains("User builder"))
+                .unwrap_or(true)
+        } else {
+            // Also check via ssh -G whether some other config provides
+            // a correct mapping (e.g. user's own ~/.ssh/config)
+            let ssh_check = std::process::Command::new("ssh")
+                .args(["-G", "linux-builder"])
+                .output();
+            if let Ok(out) = ssh_check {
+                let cfg = String::from_utf8_lossy(&out.stdout);
+                let has_host = cfg.lines().any(|l| {
+                    l.strip_prefix("hostname ")
+                        .is_some_and(|h| h.trim() != "linux-builder")
+                });
+                let has_user = cfg.lines().any(|l| {
+                    l.strip_prefix("user ")
+                        .is_some_and(|u| u.trim() == "builder")
+                });
+                !has_host || !has_user
+            } else {
+                true
+            }
+        };
+
+        let mut ssh_ok = !ssh_needs_write;
+        if ssh_needs_write {
+            let tmp_path = "/tmp/mvm-linux-builder-ssh.conf";
+            if let Ok(mut f) = std::fs::File::create(tmp_path)
+                && f.write_all(expected_config.as_bytes()).is_ok()
+            {
+                let status = std::process::Command::new("sudo")
+                    .args(["cp", tmp_path, config_path.to_str().unwrap_or_default()])
+                    .status();
+                let _ = std::fs::remove_file(tmp_path);
+                ssh_ok = matches!(status, Ok(s) if s.success());
+            }
+        }
+
+        if !ssh_ok {
+            return false;
+        }
+
+        // --- nix.conf builders line ---
+        // nix-daemon needs a `builders` entry pointing at the linux-builder.
+        // Determinate Nix uses nix.custom.conf (included from nix.conf).
+        // Also fix stale configs that used the wrong SSH user.
+        let builders_line = format!(
+            "builders = ssh-ng://builder@linux-builder aarch64-linux {key_path} 4 1 kvm,big-parallel - -"
+        );
+
+        let nix_custom = std::path::Path::new("/etc/nix/nix.custom.conf");
+        let nix_conf = std::path::Path::new("/etc/nix/nix.conf");
+
+        let nix_needs_write = {
+            let has_correct = [nix_custom, nix_conf].iter().any(|path| {
+                std::fs::read_to_string(path)
+                    .map(|c| {
+                        c.lines().any(|l| {
+                            l.trim_start().starts_with("builders")
+                                && l.contains("builder@linux-builder")
+                        })
+                    })
+                    .unwrap_or(false)
+            });
+            !has_correct
+        };
+
+        if nix_needs_write {
+            ui::info("  Configuring nix-daemon to use the linux-builder...");
+
+            // Read existing content, strip any old mvmctl builder block, append fresh one
+            let existing = std::fs::read_to_string(nix_custom).unwrap_or_default();
+            let cleaned: String = {
+                let mut skip = false;
+                let mut lines = Vec::new();
+                for line in existing.lines() {
+                    if line.contains("Added by mvmctl for darwin.linux-builder") {
+                        skip = true;
+                        continue;
+                    }
+                    if skip {
+                        // Skip the builders and builders-use-substitutes lines
+                        if line.trim_start().starts_with("builders") {
+                            continue;
+                        }
+                        // Blank line after the block — skip it too, then stop skipping
+                        if line.trim().is_empty() {
+                            skip = false;
+                            continue;
+                        }
+                        skip = false;
+                    }
+                    lines.push(line);
+                }
+                lines.join("\n")
+            };
+
+            let new_content = format!(
+                "{cleaned}\n\
+                 # Added by mvmctl for darwin.linux-builder\n\
+                 {builders_line}\n\
+                 builders-use-substitutes = true\n"
+            );
+
+            let tmp_path = "/tmp/mvm-nix-custom-append.conf";
+            if let Ok(mut f) = std::fs::File::create(tmp_path)
+                && f.write_all(new_content.as_bytes()).is_ok()
+            {
+                let status = std::process::Command::new("sudo")
+                    .args(["cp", tmp_path, nix_custom.to_str().unwrap_or_default()])
+                    .status();
+                let _ = std::fs::remove_file(tmp_path);
+                if !matches!(status, Ok(s) if s.success()) {
+                    return false;
+                }
+
+                // Restart nix-daemon so it picks up the new config.
+                let restarted = std::process::Command::new("sudo")
+                    .args([
+                        "launchctl",
+                        "kickstart",
+                        "-k",
+                        "system/systems.determinate.nix-daemon",
+                    ])
+                    .status()
+                    .is_ok_and(|s| s.success());
+                if !restarted {
+                    let _ = std::process::Command::new("sudo")
+                        .args([
+                            "launchctl",
+                            "kickstart",
+                            "-k",
+                            "system/org.nixos.nix-daemon",
+                        ])
+                        .status();
+                }
+            }
+        }
+
+        true
     }
 }
 
@@ -1485,22 +1847,42 @@ fn ensure_dev_image() -> Result<(String, String)> {
     {
         ui::info("Building dev image via Nix (first time only)...");
         let nix_bin = find_nix_binary();
-        let builder_args = nix_linux_builder_args();
-        if !builder_args.is_empty() {
-            ui::info("  Using detected Linux builder for cross-compilation...");
-        }
-        let mut cmd = std::process::Command::new(&nix_bin);
-        cmd.args([
-            "build",
-            &format!("{flake_dir}#default"),
-            "--no-link",
-            "--print-out-paths",
-        ]);
-        cmd.args(&builder_args);
-        let output = cmd.output().context("Failed to run nix build")?;
 
-        if output.status.success() {
-            let store_path = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        // On macOS, ensure the linux-builder SSH config exists so nix-daemon
+        // can reach the builder VM on localhost:31022.
+        if cfg!(target_os = "macos") && ensure_linux_builder_ssh_config() {
+            ui::info("  Linux builder detected and SSH configured.");
+        }
+
+        // Stream stderr to the terminal so the user sees build progress,
+        // while capturing stdout (which contains the store path).
+        let mut child = std::process::Command::new(&nix_bin)
+            .args([
+                "build",
+                &format!(
+                    "{flake_dir}#packages.{}.default",
+                    mvm_build::dev_build::linux_system()
+                ),
+                "--no-link",
+                "--print-out-paths",
+            ])
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::inherit())
+            .spawn()
+            .context("Failed to run nix build")?;
+
+        let stdout = {
+            let mut buf = String::new();
+            if let Some(mut out) = child.stdout.take() {
+                use std::io::Read;
+                let _ = out.read_to_string(&mut buf);
+            }
+            buf
+        };
+        let status = child.wait().context("nix build process failed")?;
+
+        if status.success() {
+            let store_path = stdout.trim().to_string();
             let ks = format!("{store_path}/vmlinux");
             let rs = format!("{store_path}/rootfs.ext4");
             if std::path::Path::new(&ks).exists() && std::path::Path::new(&rs).exists() {
@@ -1511,7 +1893,24 @@ fn ensure_dev_image() -> Result<(String, String)> {
             }
         }
 
-        let stderr = String::from_utf8_lossy(&output.stderr);
+        // nix build failed. Re-run with captured stderr to detect the error type
+        // (the first run streamed stderr to the terminal for user visibility).
+        let diag = std::process::Command::new(&nix_bin)
+            .args([
+                "build",
+                &format!(
+                    "{flake_dir}#packages.{}.default",
+                    mvm_build::dev_build::linux_system()
+                ),
+                "--no-link",
+                "--dry-run",
+            ])
+            .output()
+            .ok();
+        let stderr = diag
+            .as_ref()
+            .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
+            .unwrap_or_default();
         if stderr.contains("required system or feature not available") {
             ui::warn(
                 "Nix cannot cross-compile Linux images on this Mac.\n\
@@ -1519,7 +1918,7 @@ fn ensure_dev_image() -> Result<(String, String)> {
                  \x20 1. Run in another terminal (keeps running):\n\
                  \x20    nix run 'nixpkgs#darwin.linux-builder'\n\n\
                  \x20 2. Or add to /etc/nix/nix.conf (permanent):\n\
-                 \x20    builders = ssh-ng://linux-builder aarch64-linux /etc/nix/builder_ed25519 4 1 kvm,big-parallel - -\n\
+                 \x20    builders = ssh-ng://builder@linux-builder aarch64-linux /etc/nix/builder_ed25519 4 1 kvm,big-parallel - -\n\
                  \x20    builders-use-substitutes = true\n\n\
                  Falling back to downloading a pre-built dev image...",
             );
@@ -1585,7 +1984,7 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
              \x20   nix run 'nixpkgs#darwin.linux-builder'\n\
              \n\
              \x20 Option 2 — Permanent (add to /etc/nix/nix.conf):\n\
-             \x20   builders = ssh-ng://linux-builder aarch64-linux /etc/nix/builder_ed25519 4 1 kvm,big-parallel - -\n\
+             \x20   builders = ssh-ng://builder@linux-builder aarch64-linux /etc/nix/builder_ed25519 4 1 kvm,big-parallel - -\n\
              \x20   builders-use-substitutes = true\n\
              \n\
              Then re-run: mvmctl dev up",
@@ -4510,12 +4909,16 @@ fn console_interactive(name: &str) -> Result<()> {
     // Set up SIGWINCH handler to forward terminal resizes
     let resize_sender = setup_sigwinch_handler(&connect_data, session_id);
 
-    // Enter raw terminal mode
+    // Enter raw terminal mode and suppress the Ctrl-C handler so that
+    // Ctrl+C is forwarded as a raw byte (\x03) to the guest shell
+    // instead of killing mvmctl.
+    IN_CONSOLE_MODE.store(true, std::sync::atomic::Ordering::SeqCst);
     let orig_termios = enter_raw_mode()?;
     let result = run_console_relay(data_stream);
 
-    // Restore terminal and clean up resize handler
+    // Restore terminal and clean up
     restore_terminal(&orig_termios);
+    IN_CONSOLE_MODE.store(false, std::sync::atomic::Ordering::SeqCst);
     drop(resize_sender);
 
     mvm_core::audit::emit(
@@ -4525,7 +4928,7 @@ fn console_interactive(name: &str) -> Result<()> {
     );
 
     println!("\nConsole session ended.");
-    result
+    result.map(|_| ())
 }
 
 /// Flag set by the SIGWINCH signal handler.
@@ -4655,55 +5058,94 @@ fn restore_terminal(orig: &libc::termios) {
 }
 
 /// Relay raw bytes between stdin/stdout and a vsock data stream.
+///
+/// Exits when the guest closes the connection (e.g. `exit` or Ctrl+D
+/// in the shell) or when the user types the `~.` escape sequence
+/// (Enter, then `~.`, same as SSH).
+///
 fn run_console_relay(data_stream: std::os::unix::net::UnixStream) -> Result<()> {
     use std::io::{Read, Write};
-    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::os::unix::io::AsRawFd;
 
-    let done = std::sync::Arc::new(AtomicBool::new(false));
-
-    // vsock → stdout (guest output → host terminal)
-    let done2 = done.clone();
-    let mut read_stream = data_stream
+    let read_stream = data_stream
         .try_clone()
         .context("Failed to clone data stream")?;
+    let write_stream = data_stream;
+    let stdin_fd = std::io::stdin().as_raw_fd();
+    let vsock_fd = read_stream.as_raw_fd();
 
-    let output_thread = std::thread::spawn(move || {
-        let mut stdout = std::io::stdout();
-        let mut buf = [0u8; 4096];
-        loop {
-            match read_stream.read(&mut buf) {
-                Ok(0) | Err(_) => {
-                    done2.store(true, Ordering::SeqCst);
-                    break;
-                }
+    // Save original flags so we can restore stdin after the relay exits.
+    let orig_stdin_flags = unsafe { libc::fcntl(stdin_fd, libc::F_GETFL) };
+    unsafe {
+        libc::fcntl(stdin_fd, libc::F_SETFL, orig_stdin_flags | libc::O_NONBLOCK);
+        libc::fcntl(vsock_fd, libc::F_SETFL, libc::O_NONBLOCK);
+    }
+
+    let mut stdout = std::io::stdout();
+    let mut writer = write_stream;
+    let mut buf = [0u8; 4096];
+
+    loop {
+        let mut fds = [
+            libc::pollfd {
+                fd: stdin_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+            libc::pollfd {
+                fd: vsock_fd,
+                events: libc::POLLIN,
+                revents: 0,
+            },
+        ];
+        let ret = unsafe { libc::poll(fds.as_mut_ptr(), 2, 500) };
+        if ret < 0 {
+            if std::io::Error::last_os_error().kind() == std::io::ErrorKind::Interrupted {
+                continue;
+            }
+            break;
+        }
+
+        // vsock → stdout (guest output)
+        if fds[1].revents & libc::POLLIN != 0 {
+            match (&read_stream).read(&mut buf) {
+                Ok(0) => break,
                 Ok(n) => {
                     let _ = stdout.write_all(&buf[..n]);
                     let _ = stdout.flush();
                 }
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => break,
             }
         }
-    });
-
-    // stdin → vsock (host input → guest shell)
-    let mut write_stream = data_stream;
-    let mut stdin = std::io::stdin();
-    let mut buf = [0u8; 1024];
-    loop {
-        if done.load(Ordering::SeqCst) {
+        if fds[1].revents & (libc::POLLHUP | libc::POLLERR) != 0
+            && fds[1].revents & libc::POLLIN == 0
+        {
             break;
         }
-        match stdin.read(&mut buf) {
-            Ok(0) | Err(_) => break,
-            Ok(n) => {
-                if write_stream.write_all(&buf[..n]).is_err() {
-                    break;
+
+        // stdin → vsock (host input)
+        if fds[0].revents & (libc::POLLIN | libc::POLLHUP) != 0 {
+            let mut inbuf = [0u8; 1024];
+            match std::io::stdin().read(&mut inbuf) {
+                Ok(0) => break,
+                Ok(n) => {
+                    if writer.write_all(&inbuf[..n]).is_err() {
+                        break;
+                    }
+                    let _ = writer.flush();
                 }
-                let _ = write_stream.flush();
+                Err(e) if e.kind() == std::io::ErrorKind::WouldBlock => {}
+                Err(_) => break,
             }
         }
     }
 
-    let _ = output_thread.join();
+    // Restore stdin to its original blocking mode
+    unsafe {
+        libc::fcntl(stdin_fd, libc::F_SETFL, orig_stdin_flags);
+    }
+
     Ok(())
 }
 

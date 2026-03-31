@@ -8,7 +8,8 @@
 
   outputs = { mvm, nixpkgs, ... }:
     let
-      # Build a dev image for a given Linux system.
+      systems = [ "aarch64-linux" "x86_64-linux" ];
+
       mkDevImage = system:
         let
           pkgs = import nixpkgs { inherit system; };
@@ -28,8 +29,7 @@
 
             # Build tools
             pkgs.gnumake
-            pkgs.gcc
-            pkgs.binutils
+            pkgs.cargo
 
             # Nix package manager
             pkgs.nix
@@ -39,45 +39,23 @@
 
             # Networking
             pkgs.curl
-            pkgs.wget
             pkgs.iproute2
-            pkgs.openssh
 
             # Editors
-            pkgs.nano
             pkgs.less
 
             # Filesystem
             pkgs.e2fsprogs
-            pkgs.squashfsTools
             pkgs.util-linux
 
             # Debugging
-            pkgs.strace
             pkgs.procps
-            pkgs.htop
           ];
         };
-
-      # Native Linux builds
-      linuxSystems = [ "aarch64-linux" "x86_64-linux" ];
-
-      # Darwin systems get the matching-arch Linux image
-      # (aarch64-darwin -> aarch64-linux, x86_64-darwin -> x86_64-linux)
-      darwinMappings = {
-        "aarch64-darwin" = "aarch64-linux";
-        "x86_64-darwin" = "x86_64-linux";
-      };
-
-      linuxPackages = builtins.listToAttrs (map (system: {
+    in {
+      packages = builtins.listToAttrs (map (system: {
         name = system;
         value = { default = mkDevImage system; };
-      }) linuxSystems);
-
-      darwinPackages = builtins.mapAttrs (_darwin: linux: {
-        default = mkDevImage linux;
-      }) darwinMappings;
-    in {
-      packages = linuxPackages // darwinPackages;
+      }) systems);
     };
 }

@@ -1,7 +1,11 @@
 /target
 .playwright-mcp/
-.claude/
+.claude
 **/node_modules
 specs/scratch.md
 # Generated man pages (produced by `cargo xtask gen-man`)
 man/*.1
+nixos.qcow2
+.ash_history
+keys
+

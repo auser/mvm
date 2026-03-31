@@ -52,11 +52,11 @@ fn vm_exec_stdout(script: &str) -> Result<String> {
 #[instrument(skip_all, fields(template_id = %spec.template_id))]
 pub fn template_create(spec: &TemplateSpec) -> Result<()> {
     let dir = template_dir(&spec.template_id);
-    vm_exec(&format!("mkdir -p {dir}"))
+    std::fs::create_dir_all(&dir)
         .with_context(|| format!("Failed to create template directory {}", dir))?;
     let path = template_spec_path(&spec.template_id);
     let json = serde_json::to_string_pretty(spec)?;
-    vm_exec(&format!("cat > {path} << 'MVMEOF'\n{json}\nMVMEOF"))
+    std::fs::write(&path, json)
         .with_context(|| format!("Failed to write template spec {}", path))?;
     Ok(())
 }

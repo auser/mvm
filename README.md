@@ -240,6 +240,35 @@ mvmctl template delete my-app
 | `mvmctl completions <shell>` | Generate shell completions |
 | `mvmctl shell-init` | Print shell config (completions + aliases) |
 
+## Dev Image
+
+`mvmctl dev up` boots a Linux VM with Nix, GCC, Cargo, Git, and other build tools. The image is defined in [`nix/dev-image/flake.nix`](nix/dev-image/flake.nix) using the same `mkGuest` builder that produces microVM images.
+
+**Add packages** by editing the `packages` list in the flake:
+
+```nix
+packages = [
+  # ... existing tools ...
+  pkgs.jq
+  pkgs.ripgrep
+];
+```
+
+**Rebuild** after changes:
+
+```bash
+# Clear cached image, then rebuild on next launch
+rm -rf ~/.cache/mvm/dev/
+mvmctl dev up
+
+# Or build directly with Nix
+nix build ./nix/dev-image
+```
+
+On macOS, Nix needs a Linux builder to cross-compile. Run `nix run 'nixpkgs#darwin.linux-builder'` in a separate terminal, or configure a permanent builder in `/etc/nix/nix.conf`. If no builder is available, the CLI downloads a pre-built image from the matching GitHub release.
+
+See the [Dev Image guide](public/src/content/docs/guides/dev-image.md) for full details on customization, CI builds, and the Nix flake structure.
+
 ## Dev Setup
 
 ```bash
@@ -256,6 +285,7 @@ See [Development Guide](public/src/content/docs/contributing/development.md) for
 - [Documentation Site](https://gomicrovm.com)
 - [Writing Nix Flakes](public/src/content/docs/guides/nix-flakes.md) -- mkGuest API
 - [Templates](public/src/content/docs/guides/templates.md) -- reusable base images
+- [Dev Image](public/src/content/docs/guides/dev-image.md) -- customizing the dev environment image
 - [Troubleshooting](public/src/content/docs/guides/troubleshooting.md) -- common issues
 - [Contributing](public/src/content/docs/contributing/development.md) -- contributor guide
 

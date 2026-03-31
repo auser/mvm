@@ -451,14 +451,16 @@ pub fn start_vm(
             vsock,
         )]));
 
-        // Shared directory — mount host home directory inside the VM.
-        // Uses VirtioFS (tag "home") so the guest can `mount -t virtiofs home /home`.
-        // This gives the dev VM access to project files on the host, like Lima does.
-        let home_dir = std::env::var("HOME").unwrap_or_else(|_| "/Users".to_string());
-        if Path::new(&home_dir).is_dir() {
+        // Shared directory — mount the current working directory inside the VM.
+        // Uses VirtioFS (tag "workdir") so the guest can mount it at /root/work.
+        let cwd = std::env::current_dir()
+            .unwrap_or_else(|_| std::path::PathBuf::from("."))
+            .to_string_lossy()
+            .to_string();
+        if Path::new(&cwd).is_dir() {
             let shared_dir = VZSharedDirectory::initWithURL_readOnly(
                 VZSharedDirectory::alloc(),
-                &nsurl(&home_dir),
+                &nsurl(&cwd),
                 false,
             );
             let share = VZSingleDirectoryShare::initWithDirectory(
@@ -467,7 +469,7 @@ pub fn start_vm(
             );
             let fs_config = VZVirtioFileSystemDeviceConfiguration::initWithTag(
                 VZVirtioFileSystemDeviceConfiguration::alloc(),
-                &NSString::from_str("home"),
+                &NSString::from_str("workdir"),
             );
             fs_config.setShare(Some(&share));
             config.setDirectorySharingDevices(&NSArray::from_retained_slice(&[

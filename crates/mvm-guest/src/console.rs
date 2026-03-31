@@ -168,9 +168,14 @@ pub fn open_session(cols: u16, rows: u16) -> Result<ConsoleSession, ConsoleError
                 close(slave_fd);
             }
 
-            // Set TERM environment variable
+            // Set environment variables
             let term = b"TERM=xterm-256color\0";
             libc_putenv(term.as_ptr());
+            let home = b"HOME=/root\0";
+            libc_putenv(home.as_ptr());
+
+            // Start in $HOME
+            let _ = chdir(c"/root".as_ptr().cast());
 
             // Exec /bin/sh
             let shell = b"/bin/sh\0";
@@ -392,8 +397,12 @@ pub fn run_console_relay(session: &ConsoleSession) -> i32 {
         }
     });
 
-    // Wait for either direction to finish
-    let _ = h2.join(); // PTY output ends when shell exits
+    // Wait for PTY output to end (shell exited), then shut down the vsock
+    // so the host sees EOF and h1 stops waiting for input.
+    let _ = h2.join();
+    unsafe {
+        shutdown(conn_fd, SHUT_RDWR);
+    }
     let _ = h1.join();
 
     // Wait for child and get exit code
@@ -420,10 +429,14 @@ pub fn is_active() -> bool {
     CONSOLE_ACTIVE.load(Ordering::SeqCst)
 }
 
-// FFI for putenv
+// FFI for putenv / chdir / shutdown
 unsafe extern "C" {
     fn putenv(string: *const u8) -> i32;
+    fn chdir(path: *const u8) -> i32;
+    fn shutdown(sockfd: i32, how: i32) -> i32;
 }
+
+const SHUT_RDWR: i32 = 2;
 
 unsafe fn libc_putenv(s: *const u8) {
     unsafe { putenv(s) };

@@ -226,9 +226,12 @@ fn resolve_dev_build_attribute(
             attr
         }
         _ => {
-            // No profile or "default": build the flake's default package.
-            env.log_info(&format!("Build attribute: {} (default)", flake_ref));
-            flake_ref.to_string()
+            // Build the flake's default package for the target Linux system
+            // (not the host, which may be macOS).
+            let system = nix_system();
+            let attr = format!("{}#packages.{}.default", flake_ref, system);
+            env.log_info(&format!("Build attribute: {} (default)", attr));
+            attr
         }
     }
 }
@@ -379,7 +382,11 @@ fn detect_runner(env: &dyn ShellEnvironment, build_dir: &str) -> Option<String> 
     }
 }
 
-/// Return the Nix system identifier for the current architecture.
+/// Return the Nix Linux system identifier for the current architecture.
+pub fn linux_system() -> &'static str {
+    nix_system()
+}
+
 fn nix_system() -> &'static str {
     if cfg!(target_arch = "aarch64") {
         "aarch64-linux"
@@ -739,8 +746,9 @@ mod tests {
         let env = TestEnv::new();
 
         let attr = resolve_dev_build_attribute(&env, "/tmp/flake", None);
+        let system = linux_system();
 
-        assert_eq!(attr, "/tmp/flake");
+        assert_eq!(attr, format!("/tmp/flake#packages.{system}.default"));
     }
 
     #[test]

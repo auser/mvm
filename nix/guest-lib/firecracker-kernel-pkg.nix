@@ -26,6 +26,13 @@ let
     CONFIG_VIRTIO_PCI_LEGACY=y
     PCI_OPTS
 
+    # Enable VirtioFS — Apple Container dev environment shares the host
+    # home directory via VirtioFS. Requires FUSE as a dependency.
+    sed -i 's/# CONFIG_FUSE_FS is not set/CONFIG_FUSE_FS=y/' $out
+    cat >> $out <<'VIRTIOFS_OPTS'
+    CONFIG_VIRTIO_FS=y
+    VIRTIOFS_OPTS
+
     # Enable crypto user API — systemd needs AF_ALG for hashing.
     sed -i 's/# CONFIG_CRYPTO_USER is not set/CONFIG_CRYPTO_USER=y/' $out
     sed -i 's/# CONFIG_CRYPTO_USER_API_HASH is not set/CONFIG_CRYPTO_USER_API_HASH=y/' $out
