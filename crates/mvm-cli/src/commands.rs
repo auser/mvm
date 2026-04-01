@@ -900,10 +900,21 @@ pub fn run() -> Result<()> {
                     }
                 }
                 DevCmd::Shell { project } => {
-                    if mvm_core::platform::current().has_apple_containers()
-                        && is_apple_container_dev_running()
-                    {
-                        console_interactive("mvm-dev")
+                    if mvm_core::platform::current().has_apple_containers() {
+                        if !is_apple_container_dev_running() {
+                            anyhow::bail!("Dev VM is not running. Start it with: mvmctl dev up");
+                        }
+                        // Try connecting — the VM may be in another process
+                        match console_interactive("mvm-dev") {
+                            Ok(()) => Ok(()),
+                            Err(_) => {
+                                anyhow::bail!(
+                                    "Dev VM is running but owned by another process.\n\
+                                     Use the terminal where you ran 'mvmctl dev up',\n\
+                                     or restart with: mvmctl dev down && mvmctl dev up --shell"
+                                )
+                            }
+                        }
                     } else {
                         cmd_shell(project.as_deref())
                     }
@@ -1392,65 +1403,169 @@ fn is_apple_container_dev_running() -> bool {
 
 /// Boot the Apple Container dev VM, optionally opening an interactive console.
 fn cmd_dev_apple_container(cpus: u32, memory_gib: u32, open_shell: bool) -> Result<()> {
+    let is_daemon = std::env::var("MVM_DEV_DAEMON").as_deref() == Ok("1");
+
+    // When running as the daemon process, do the actual VM boot.
+    if is_daemon {
+        return cmd_dev_apple_container_daemon(cpus, memory_gib);
+    }
+
     ui::info("Starting dev environment via Apple Container...\n");
 
     if is_apple_container_dev_running() {
-        // The VM is tracked in another process. Try to connect — if we
-        // can reach the guest agent, open a console. Otherwise the old
-        // process is alive but the VM is unreachable from here, so stop
-        // it and start fresh.
-        if mvm_apple_container::vsock_connect(DEV_VM_NAME, mvm_guest::vsock::GUEST_AGENT_PORT)
-            .is_ok()
-        {
-            if open_shell {
-                ui::info("Dev VM already running. Opening shell...");
-                return console_interactive(DEV_VM_NAME);
-            }
-            ui::info("Dev VM already running.");
-            return Ok(());
+        if open_shell {
+            ui::info("Dev VM already running. Opening shell...");
+            return console_interactive(DEV_VM_NAME);
         }
-
-        // Can't connect — kill the old owner process and clean up.
-        ui::info("Dev VM running in another process but unreachable. Restarting...");
-        stop_dev_vm_owner();
+        ui::info("Dev VM already running.");
+        return Ok(());
     }
 
     // Clean up stale state from a previous process that died.
     cleanup_stale_dev_vm();
 
-    // Ensure dev image exists
+    // Ensure dev image exists (build if needed — this runs in the CLI process)
     let (kernel, rootfs) = ensure_dev_image()?;
+
+    // Launch a background daemon process that keeps the VM alive.
+    let exe = std::env::current_exe().context("cannot find current executable")?;
+    let log_dir = format!("{}/dev", mvm_core::config::mvm_cache_dir());
+    std::fs::create_dir_all(&log_dir)?;
+    let stdout_log = std::fs::File::create(format!("{log_dir}/daemon-stdout.log"))
+        .context("create stdout log")?;
+    let stderr_log = std::fs::File::create(format!("{log_dir}/daemon-stderr.log"))
+        .context("create stderr log")?;
 
     ui::info(&format!(
         "Booting dev VM ({} vCPUs, {} GiB memory)...",
         cpus, memory_gib
     ));
 
+    let child = std::process::Command::new(&exe)
+        .args(["dev", "up"])
+        .env("MVM_DEV_DAEMON", "1")
+        .env("MVM_DEV_KERNEL", &kernel)
+        .env("MVM_DEV_ROOTFS", &rootfs)
+        .env("MVM_DEV_CPUS", cpus.to_string())
+        .env("MVM_DEV_MEM_GIB", memory_gib.to_string())
+        .stdout(stdout_log)
+        .stderr(stderr_log)
+        .stdin(std::process::Stdio::null())
+        .spawn()
+        .context("Failed to spawn dev VM daemon")?;
+
+    // Wait for the VM to become ready (vsock proxy socket + guest agent reachable)
+    let proxy_path = dev_vsock_proxy_path();
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(60);
+    loop {
+        if std::time::Instant::now() > deadline {
+            anyhow::bail!(
+                "Dev VM did not start within 60 seconds.\n\
+                           Check logs: {log_dir}/daemon-stderr.log"
+            );
+        }
+        // Try connecting through the daemon's vsock proxy
+        if std::path::Path::new(&proxy_path).exists()
+            && vsock_proxy_connect(&proxy_path, mvm_guest::vsock::GUEST_AGENT_PORT).is_ok()
+        {
+            break;
+        }
+        std::thread::sleep(std::time::Duration::from_millis(500));
+    }
+
+    drop(child); // detach — don't wait for the daemon
+
+    ui::success("Dev VM ready.");
+    ui::info("  Shell:      mvmctl dev shell");
+    ui::info("  Stop VM:    mvmctl dev down");
+
+    if open_shell {
+        ui::info("");
+        let _ = console_interactive(DEV_VM_NAME);
+    }
+
+    Ok(())
+}
+
+/// Path for the vsock proxy Unix socket.
+fn dev_vsock_proxy_path() -> String {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    format!("{home}/.mvm/vms/{DEV_VM_NAME}/vsock.sock")
+}
+
+/// Daemon mode: boot the VM, expose a vsock proxy socket, and block forever.
+fn cmd_dev_apple_container_daemon(cpus: u32, memory_gib: u32) -> Result<()> {
+    let kernel = std::env::var("MVM_DEV_KERNEL")
+        .unwrap_or_else(|_| format!("{}/dev/vmlinux", mvm_core::config::mvm_cache_dir()));
+    let rootfs = std::env::var("MVM_DEV_ROOTFS")
+        .unwrap_or_else(|_| format!("{}/dev/rootfs.ext4", mvm_core::config::mvm_cache_dir()));
+
     let memory_mib = (memory_gib as u64) * 1024;
     mvm_apple_container::start(DEV_VM_NAME, &kernel, &rootfs, cpus, memory_mib)
         .map_err(|e| anyhow::anyhow!("Failed to start dev VM: {e}"))?;
 
-    ui::info("Waiting for guest agent...");
-    if !wait_for_guest_agent(DEV_VM_NAME, 30) {
-        anyhow::bail!(
-            "Guest agent did not respond within 30 seconds.\n\
-             Check: mvmctl logs {DEV_VM_NAME}"
-        );
-    }
+    // Start a vsock proxy: listen on a Unix socket and proxy each
+    // connection to the guest agent's vsock port. This lets `dev shell`
+    // from another process connect to the VM.
+    let proxy_path = dev_vsock_proxy_path();
+    let _ = std::fs::remove_file(&proxy_path);
+    start_vsock_proxy(&proxy_path);
 
-    if open_shell {
-        ui::success("Dev VM ready. Opening shell (exit or Ctrl+D to detach)...\n");
-        let _ = console_interactive(DEV_VM_NAME);
-        ui::info("\nDetached from dev VM. VM still running.");
-        ui::info("  Reconnect:  mvmctl dev shell");
-        ui::info("  Stop VM:    mvmctl dev down");
-    } else {
-        ui::success("Dev VM ready.");
-        ui::info("  Shell:      mvmctl dev shell");
-        ui::info("  Stop VM:    mvmctl dev down");
+    // Block forever — the VM lives in this process.
+    loop {
+        std::thread::park();
     }
+}
 
-    Ok(())
+/// Listen on a Unix socket and proxy each connection to the VM's vsock.
+fn start_vsock_proxy(socket_path: &str) {
+    use std::os::unix::net::UnixListener;
+
+    let listener = match UnixListener::bind(socket_path) {
+        Ok(l) => l,
+        Err(e) => {
+            tracing::warn!("Failed to start vsock proxy: {e}");
+            return;
+        }
+    };
+
+    std::thread::spawn(move || {
+        for stream in listener.incoming().flatten() {
+            // Each connection: read the target vsock port from the first 4 bytes,
+            // then proxy bidirectionally to that vsock port.
+            std::thread::spawn(move || {
+                use std::io::Read;
+                let mut client = stream;
+                let mut port_buf = [0u8; 4];
+                if client.read_exact(&mut port_buf).is_err() {
+                    return;
+                }
+                let port = u32::from_le_bytes(port_buf);
+
+                let vsock = match mvm_apple_container::vsock_connect(DEV_VM_NAME, port) {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+
+                // Bidirectional proxy
+                let mut vsock_read = match vsock.try_clone() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+                let mut client_write = match client.try_clone() {
+                    Ok(s) => s,
+                    Err(_) => return,
+                };
+
+                let h = std::thread::spawn(move || {
+                    let _ = std::io::copy(&mut vsock_read, &mut client_write);
+                });
+                let mut vsock_write = vsock;
+                let _ = std::io::copy(&mut client, &mut vsock_write);
+                let _ = h.join();
+            });
+        }
+    });
 }
 
 /// Kill the process that owns the dev VM and clean up its state.
@@ -1513,13 +1628,14 @@ fn cleanup_stale_dev_vm() {
 fn cmd_dev_apple_container_down() -> Result<()> {
     if is_apple_container_dev_running() {
         ui::info("Stopping Apple Container dev VM...");
-        mvm_apple_container::stop(DEV_VM_NAME)
-            .map_err(|e| anyhow::anyhow!("Failed to stop dev VM: {e}"))?;
+        // Kill the daemon process (which owns the VM in-process)
+        stop_dev_vm_owner();
+        // Clean up the vsock proxy socket
+        let _ = std::fs::remove_file(dev_vsock_proxy_path());
         ui::success("Dev VM stopped.");
         return Ok(());
     }
 
-    // Also clean up stale state from a dead process
     cleanup_stale_dev_vm();
     ui::info("Dev VM is not running.");
     Ok(())
@@ -4817,12 +4933,24 @@ fn cmd_console(name: &str, command: Option<&str>) -> Result<()> {
 /// Backend type for console connections.
 enum ConsoleBackend {
     AppleContainer(String),
+    /// Connect via the daemon's vsock proxy Unix socket.
+    VsockProxy(String),
     Firecracker(String),
+}
+
+/// Connect to a vsock port via the daemon's Unix socket proxy.
+fn vsock_proxy_connect(proxy_path: &str, port: u32) -> Result<std::os::unix::net::UnixStream> {
+    use std::io::Write;
+    let mut stream = std::os::unix::net::UnixStream::connect(proxy_path)
+        .with_context(|| format!("Failed to connect to vsock proxy at {proxy_path}"))?;
+    stream.write_all(&port.to_le_bytes())?;
+    Ok(stream)
 }
 
 /// Open an interactive PTY console to a running VM.
 ///
-/// Supports both Firecracker (via UDS vsock) and Apple Container (via direct vsock).
+/// Supports Firecracker (via UDS vsock), Apple Container (via direct vsock),
+/// and vsock proxy (via daemon Unix socket for cross-process access).
 fn console_interactive(name: &str) -> Result<()> {
     // Get terminal size
     let (cols, rows) = get_terminal_size();
@@ -4833,10 +4961,12 @@ fn console_interactive(name: &str) -> Result<()> {
         name, cols, rows
     ));
 
-    // Determine backend: try Apple Container first, then Firecracker/Lima UDS
+    // Determine backend: try in-process Apple Container, then vsock proxy, then Firecracker UDS
     let backend =
         if mvm_apple_container::vsock_connect(name, mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
             ConsoleBackend::AppleContainer(name.to_string())
+        } else if std::path::Path::new(&dev_vsock_proxy_path()).exists() {
+            ConsoleBackend::VsockProxy(dev_vsock_proxy_path())
         } else {
             let instance_dir = microvm::resolve_running_vm_dir(name)?;
             ConsoleBackend::Firecracker(instance_dir)
@@ -4848,6 +4978,14 @@ fn console_interactive(name: &str) -> Result<()> {
             let mut stream =
                 mvm_apple_container::vsock_connect(vm_id, mvm_guest::vsock::GUEST_AGENT_PORT)
                     .map_err(|e| anyhow::anyhow!("{e}"))?;
+            let resp = mvm_guest::vsock::send_request(
+                &mut stream,
+                &mvm_guest::vsock::GuestRequest::ConsoleOpen { cols, rows },
+            )?;
+            (resp, backend)
+        }
+        ConsoleBackend::VsockProxy(proxy_path) => {
+            let mut stream = vsock_proxy_connect(proxy_path, mvm_guest::vsock::GUEST_AGENT_PORT)?;
             let resp = mvm_guest::vsock::send_request(
                 &mut stream,
                 &mvm_guest::vsock::GuestRequest::ConsoleOpen { cols, rows },
@@ -4892,6 +5030,7 @@ fn console_interactive(name: &str) -> Result<()> {
             mvm_apple_container::vsock_connect(vm_id, data_port)
                 .map_err(|e| anyhow::anyhow!("Failed to connect to console data port: {e}"))?
         }
+        ConsoleBackend::VsockProxy(proxy_path) => vsock_proxy_connect(proxy_path, data_port)?,
         ConsoleBackend::Firecracker(instance_dir) => {
             // Firecracker vsock multiplexes all ports on the same UDS
             let uds = mvm_guest::vsock::vsock_uds_path(instance_dir);
@@ -4950,6 +5089,7 @@ fn setup_sigwinch_handler(
     // Clone backend info for the resize thread
     let backend_info = match backend {
         ConsoleBackend::AppleContainer(vm_id) => ConsoleBackend::AppleContainer(vm_id.clone()),
+        ConsoleBackend::VsockProxy(path) => ConsoleBackend::VsockProxy(path.clone()),
         ConsoleBackend::Firecracker(dir) => ConsoleBackend::Firecracker(dir.clone()),
     };
 
@@ -4983,6 +5123,21 @@ fn setup_sigwinch_handler(
             let _ = match &backend_info {
                 ConsoleBackend::AppleContainer(vm_id) => {
                     mvm_apple_container::vsock_connect(vm_id, mvm_guest::vsock::GUEST_AGENT_PORT)
+                        .ok()
+                        .and_then(|mut stream| {
+                            mvm_guest::vsock::send_request(
+                                &mut stream,
+                                &mvm_guest::vsock::GuestRequest::ConsoleResize {
+                                    session_id,
+                                    cols,
+                                    rows,
+                                },
+                            )
+                            .ok()
+                        })
+                }
+                ConsoleBackend::VsockProxy(proxy_path) => {
+                    vsock_proxy_connect(proxy_path, mvm_guest::vsock::GUEST_AGENT_PORT)
                         .ok()
                         .and_then(|mut stream| {
                             mvm_guest::vsock::send_request(
