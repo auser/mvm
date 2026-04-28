@@ -2,6 +2,11 @@
 
 All notable changes to mvm are documented in this file.
 
+## [0.11.0] — 2026-04-28
+
+### Added
+- **template**: Add --prompt flag for natural-language scaffolding
+
 ## [0.10.1] — 2026-04-01
 
 ### Fixed
