@@ -109,10 +109,13 @@ jobs:
           # True if exact version is already published — makes this loop
           # idempotent so a partial run (mvm-runtime onwards left to do) can
           # be resumed by re-dispatching without "already exists" failures.
+          # crates.io rejects empty User-Agent with 403, so set one explicitly.
           crate_already_published() {
             local crate="$1" wanted="$2"
             local response
-            response=$(curl -fsSL "https://crates.io/api/v1/crates/${crate}/${wanted}" 2>/dev/null || true)
+            response=$(curl -fsSL \
+              -A "mvm-publish-crates (https://github.com/${GITHUB_REPOSITORY:-tinylabscom/mvm})" \
+              "https://crates.io/api/v1/crates/${crate}/${wanted}" 2>/dev/null || true)
             [ -n "$response" ] && echo "$response" | grep -q "\"num\":\"${wanted}\""
           }
 
