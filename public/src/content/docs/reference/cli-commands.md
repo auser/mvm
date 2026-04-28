@@ -86,6 +86,7 @@ description: Complete command reference for mvmctl.
 | `mvmctl template init <name> --local` | Scaffold a new template directory with flake.nix |
 | `mvmctl template init <name> --vm` | Scaffold inside the Lima VM (overrides --local) |
 | `mvmctl template init <name> --preset <preset>` | Scaffold preset: minimal, http, postgres, worker, python (default: minimal) |
+| `mvmctl template init <name> --prompt "<text>" --local` | Generate a local scaffold from a natural-language prompt. Supports `openai`, `local`, or `heuristic` planning via `MVM_TEMPLATE_PROVIDER` |
 | `mvmctl template init <name> --dir <path>` | Base directory for local init (default: current dir) |
 | `mvmctl template create <name>` | Create a single template definition |
 | `mvmctl template create <name> --data-disk SIZE` | Create template with a data disk (10G, 512M, or plain MB; 0 = none) |
@@ -217,5 +218,12 @@ All commands accept these global options:
 | `MVM_TEMPLATE_REGISTRY_PREFIX` | Key prefix inside the bucket | `mvm` |
 | `MVM_TEMPLATE_REGISTRY_REGION` | S3 region | `us-east-1` |
 | `MVM_SSH_PORT` | Lima SSH local port | `60022` |
+| `OPENAI_API_KEY` | Enables LLM-backed template planning for `template init --prompt` | None |
+| `MVM_TEMPLATE_PROVIDER` | Prompt planning provider: `auto`, `openai`, `local`, or `heuristic` | `auto` |
+| `MVM_TEMPLATE_OPENAI_MODEL` | OpenAI model used for prompt planning | `gpt-5.2` |
+| `MVM_TEMPLATE_OPENAI_BASE_URL` | Override OpenAI API base URL for prompt planning | `https://api.openai.com` |
+| `MVM_TEMPLATE_LOCAL_MODEL` | Local AI model name sent to an OpenAI-compatible local endpoint | `qwen2.5-coder-7b-instruct` |
+| `MVM_TEMPLATE_LOCAL_BASE_URL` | Base URL for an OpenAI-compatible local AI endpoint such as LocalAI or `llama.cpp` server | None |
+| `MVM_TEMPLATE_LOCAL_API_KEY` | Optional API key for the local AI endpoint | None |
 | `MVM_PRODUCTION` | Enable production mode checks | `false` |
 | `RUST_LOG` | Logging level (e.g., `debug`, `mvm=trace`) | `info` |

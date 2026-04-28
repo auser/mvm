@@ -699,8 +699,11 @@ enum TemplateCmd {
         #[arg(long, default_value = ".")]
         dir: String,
         /// Scaffold preset: minimal, http, postgres, worker, python (default: minimal)
-        #[arg(long, default_value = "minimal")]
-        preset: String,
+        #[arg(long)]
+        preset: Option<String>,
+        /// Natural-language prompt used to generate a local scaffold and metadata (uses OpenAI when OPENAI_API_KEY is set)
+        #[arg(long)]
+        prompt: Option<String>,
     },
 }
 
@@ -1801,7 +1804,7 @@ fn cmd_dev_apple_container_status() -> Result<()> {
 fn ensure_linux_builder_ssh_config() -> bool {
     #[cfg(not(target_os = "macos"))]
     {
-        return false;
+        false
     }
 
     #[cfg(target_os = "macos")]
@@ -4316,11 +4319,12 @@ fn cmd_template(action: TemplateCmd) -> Result<()> {
             vm,
             dir,
             preset,
+            prompt,
         } => {
             validate_template_name(&name)
                 .with_context(|| format!("Invalid template name: {:?}", name))?;
             let use_local = local && !vm;
-            template_cmd::init(&name, use_local, &dir, &preset)
+            template_cmd::init(&name, use_local, &dir, preset.as_deref(), prompt.as_deref())
         }
     }
 }
@@ -6582,6 +6586,43 @@ mod tests {
                 assert_eq!(network, "isolated");
             }
             _ => panic!("Expected Up command"),
+        }
+    }
+
+    #[test]
+    fn test_template_init_defaults_to_no_preset_or_prompt() {
+        let cli = Cli::try_parse_from(["mvmctl", "template", "init", "demo", "--local"]).unwrap();
+        match cli.command {
+            Commands::Template {
+                action: TemplateCmd::Init { preset, prompt, .. },
+            } => {
+                assert!(preset.is_none(), "preset should be None when omitted");
+                assert!(prompt.is_none(), "prompt should be None when omitted");
+            }
+            _ => panic!("Expected Template Init command"),
+        }
+    }
+
+    #[test]
+    fn test_template_init_parses_prompt_flag() {
+        let cli = Cli::try_parse_from([
+            "mvmctl",
+            "template",
+            "init",
+            "demo",
+            "--local",
+            "--prompt",
+            "python worker that polls an API",
+        ])
+        .unwrap();
+        match cli.command {
+            Commands::Template {
+                action: TemplateCmd::Init { prompt, preset, .. },
+            } => {
+                assert_eq!(prompt.as_deref(), Some("python worker that polls an API"));
+                assert!(preset.is_none(), "preset should remain None when omitted");
+            }
+            _ => panic!("Expected Template Init command"),
         }
     }
 

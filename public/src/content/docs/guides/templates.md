@@ -17,6 +17,7 @@ Creates a minimal directory:
 my-service/
 ├── flake.nix       # Nix flake via mkGuest
 ├── .gitignore
+├── baseline.nix    # Baseline guest config scaffold
 └── README.md
 ```
 
@@ -31,6 +32,34 @@ mvmctl template init my-db --local --preset postgres   # PostgreSQL
 mvmctl template init my-job --local --preset worker    # Background worker
 mvmctl template init my-vm --local --preset minimal    # Bare minimum (default)
 ```
+
+### Prompt-Driven Scaffolds
+
+Use `--prompt` when you want `mvmctl` to generate a starting scaffold from a short workload description:
+
+```bash
+mvmctl template init analytics-worker \
+  --local \
+  --prompt "python worker that polls an API and writes parquet files"
+```
+
+`mvmctl` supports three prompt planning modes:
+
+- `MVM_TEMPLATE_PROVIDER=auto` tries OpenAI first when `OPENAI_API_KEY` is set, then a local OpenAI-compatible endpoint when `MVM_TEMPLATE_LOCAL_BASE_URL` is set, then the built-in planner
+- `MVM_TEMPLATE_PROVIDER=openai` forces the hosted OpenAI path
+- `MVM_TEMPLATE_PROVIDER=local` forces a local OpenAI-compatible endpoint such as LocalAI or `llama.cpp` server
+- `MVM_TEMPLATE_PROVIDER=heuristic` disables LLM usage entirely
+
+The hosted and local AI paths both use the same strict JSON schema and validation step before rendering files.
+
+The prompt flow writes the same on-disk outputs either way:
+
+- `mvmctl` chooses a primary preset (`python`, `worker`, `http`, `postgres`, or `minimal`)
+- it can merge compatible features from the prompt into one generated `flake.nix` such as `python` plus `postgres`
+- for Python workloads it scaffolds an `app/` entrypoint stub that matches the planned port and health path
+- it writes `mvm-template-prompt.json` with the original prompt, generation mode, selected model metadata, primary preset, and inferred features
+
+That metadata is intended for later tooling such as `mvmd`, but the generated flake remains the source of truth for builds and reconciliation.
 
 ## From an Existing Flake
 

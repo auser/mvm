@@ -13,6 +13,7 @@ pub fn normalize_fc_version(raw: &str) -> String {
     let candidate = re
         .captures_iter(raw)
         .last()
+        .or_else(|| re.captures_iter(FC_VERSION_DEFAULT).last())
         .map(|c| {
             c.get(0)
                 .expect("regex capture group 0 must exist")
@@ -217,7 +218,10 @@ mod tests {
     #[test]
     fn normalize_garbage_falls_back() {
         let raw = "nonsense";
-        assert_eq!(normalize_fc_version(raw), FC_VERSION_DEFAULT);
+        assert_eq!(
+            normalize_fc_version(raw),
+            normalize_fc_version(FC_VERSION_DEFAULT)
+        );
     }
 
     // Helper to test short derivation with a temp env override.

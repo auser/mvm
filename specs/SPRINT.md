@@ -14,7 +14,7 @@ is unaffected.
 | Metric           | Value                    |
 | ---------------- | ------------------------ |
 | Workspace crates | 7 + root facade + xtask  |
-| Total tests      | 970                      |
+| Total tests      | 987                      |
 | Clippy warnings  | 0                        |
 | Edition          | 2024 (Rust 1.85+)        |
 | MSRV             | 1.85                     |
@@ -156,6 +156,9 @@ and doesn't compile on Linux. Production always uses Firecracker + KVM.
 - [x] `CLAUDE.md` updated with Apple Container dev mode description
 - [x] CLI reference updated: `dev` command notes Apple Container on macOS 26+
 - [x] Development guide already documents dev workflow commands
+- [x] Template guide updated: `template init --prompt` generates a local flake + prompt metadata
+- [x] CLI reference updated: `template init --prompt "<text>" --local`
+- [x] CLI and scaffold tests cover prompt parsing, merged prompt-derived scaffold generation, hosted/local provider planning, and `--local` requirement
 
 ---
 

@@ -1,5 +1,6 @@
 use super::harness::mvmctl;
 use predicates::prelude::*;
+use std::time::Duration;
 
 /// `uninstall --dry-run --yes` should exit 0 and print what would be removed.
 #[test]
@@ -43,6 +44,7 @@ fn uninstall_all_dry_run_mentions_config_and_binary() {
 #[test]
 fn uninstall_no_yes_parses_ok() {
     let code = mvmctl()
+        .timeout(Duration::from_secs(2))
         .args(["uninstall"])
         .assert()
         .get_output()

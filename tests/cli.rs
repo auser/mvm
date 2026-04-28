@@ -1,9 +1,40 @@
 use assert_cmd::Command;
 use predicates::prelude::*;
+use std::io::{Read, Write};
+use std::net::TcpListener;
+use std::sync::{Arc, Mutex};
+use std::thread;
 
 fn mvm() -> Command {
     #[allow(deprecated)]
     Command::cargo_bin("mvmctl").unwrap()
+}
+
+fn spawn_fake_openai_response_server(response_body: &'static str) -> (String, Arc<Mutex<String>>) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("bind fake server");
+    let address = format!("http://{}", listener.local_addr().expect("local addr"));
+    let request_capture = Arc::new(Mutex::new(String::new()));
+    let request_capture_thread = Arc::clone(&request_capture);
+
+    thread::spawn(move || {
+        let (mut stream, _) = listener.accept().expect("accept");
+        let mut buffer = [0_u8; 16384];
+        let bytes_read = stream.read(&mut buffer).expect("read request");
+        *request_capture_thread.lock().expect("request lock") =
+            String::from_utf8_lossy(&buffer[..bytes_read]).to_string();
+
+        let response = format!(
+            "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response_body.len(),
+            response_body
+        );
+        stream
+            .write_all(response.as_bytes())
+            .expect("write response");
+        stream.flush().expect("flush response");
+    });
+
+    (address, request_capture)
 }
 
 #[test]
@@ -730,7 +761,8 @@ fn test_template_init_help_shows_preset_flag() {
         .args(["template", "init", "--help"])
         .assert()
         .success()
-        .stdout(predicate::str::contains("preset"));
+        .stdout(predicate::str::contains("preset"))
+        .stdout(predicate::str::contains("prompt"));
 }
 
 #[test]
@@ -822,4 +854,156 @@ fn test_template_init_preset_unknown_shows_error() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Unknown preset"));
+}
+
+#[test]
+fn test_template_init_prompt_generates_metadata_and_infers_preset() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    mvm()
+        .args([
+            "template",
+            "init",
+            "test-prompt",
+            "--local",
+            "--prompt",
+            "python service exposing an HTTP API with postgres",
+            "--dir",
+            dir.path().to_str().expect("utf8"),
+        ])
+        .assert()
+        .success();
+    let template_dir = dir.path().join("test-prompt");
+    let flake = template_dir.join("flake.nix");
+    let metadata = template_dir.join("mvm-template-prompt.json");
+    assert!(flake.exists(), "flake.nix not scaffolded");
+    assert!(metadata.exists(), "prompt metadata not scaffolded");
+    let flake_content = std::fs::read_to_string(&flake).expect("read flake");
+    assert!(
+        flake_content.contains("services.app"),
+        "prompt should generate a python app service"
+    );
+    assert!(
+        flake_content.contains("services.postgres"),
+        "prompt should merge postgres into the generated scaffold"
+    );
+    let metadata_content = std::fs::read_to_string(&metadata).expect("read metadata");
+    assert!(
+        metadata_content.contains("\"primary_preset\": \"python\""),
+        "metadata should capture the primary preset"
+    );
+    assert!(
+        metadata_content.contains("\"postgres\""),
+        "metadata should capture merged features"
+    );
+}
+
+#[test]
+fn test_template_init_prompt_uses_openai_when_configured() {
+    let response_body = r#"{
+        "output": [{
+            "content": [{
+                "type": "output_text",
+                "text": "{\"schema_version\":1,\"summary\":\"Python API with custom health path\",\"primary_preset\":\"python\",\"features\":[\"python\",\"postgres\"],\"http_port\":9000,\"health_path\":\"/healthz\",\"worker_interval_secs\":null,\"python_entrypoint\":\"service.py\",\"notes\":[\"Use the generated python stub as a starting point\"]}"
+            }]
+        }]
+    }"#;
+    let (base_url, request_capture) = spawn_fake_openai_response_server(response_body);
+    let dir = tempfile::tempdir().expect("temp dir");
+    mvm()
+        .env("OPENAI_API_KEY", "test-key")
+        .env("MVM_TEMPLATE_OPENAI_BASE_URL", base_url)
+        .args([
+            "template",
+            "init",
+            "llm-template",
+            "--local",
+            "--prompt",
+            "python api with postgres and healthz endpoint",
+            "--dir",
+            dir.path().to_str().expect("utf8"),
+        ])
+        .assert()
+        .success();
+
+    let template_dir = dir.path().join("llm-template");
+    let flake = std::fs::read_to_string(template_dir.join("flake.nix")).expect("read flake");
+    let metadata =
+        std::fs::read_to_string(template_dir.join("mvm-template-prompt.json")).expect("metadata");
+    let app = std::fs::read_to_string(template_dir.join("app").join("service.py")).expect("app");
+    let captured_request = request_capture.lock().expect("capture lock").clone();
+    let captured_request_lower = captured_request.to_ascii_lowercase();
+
+    assert!(captured_request.contains("POST /v1/responses"));
+    assert!(captured_request_lower.contains("authorization: bearer test-key"));
+    assert!(captured_request.contains("python api with postgres and healthz endpoint"));
+    assert!(flake.contains("localhost:9000/healthz"));
+    assert!(flake.contains("${appSrc}/service.py"));
+    assert!(metadata.contains("\"generation_mode\": \"llm\""));
+    assert!(metadata.contains("\"provider\": \"openai\""));
+    assert!(metadata.contains("\"model\": \"gpt-5.2\""));
+    assert!(app.contains("HEALTH_PATH = \"/healthz\""));
+}
+
+#[test]
+fn test_template_init_prompt_uses_local_provider_when_configured() {
+    let response_body = r#"{
+        "output": [{
+            "content": [{
+                "type": "output_text",
+                "text": "{\"schema_version\":1,\"summary\":\"Worker planned by local AI\",\"primary_preset\":\"worker\",\"features\":[\"worker\"],\"http_port\":null,\"health_path\":null,\"worker_interval_secs\":30,\"python_entrypoint\":null,\"notes\":[\"Local provider selected\"]}"
+            }]
+        }]
+    }"#;
+    let (base_url, request_capture) = spawn_fake_openai_response_server(response_body);
+    let dir = tempfile::tempdir().expect("temp dir");
+    mvm()
+        .env_remove("OPENAI_API_KEY")
+        .env("MVM_TEMPLATE_PROVIDER", "local")
+        .env("MVM_TEMPLATE_LOCAL_BASE_URL", base_url)
+        .env("MVM_TEMPLATE_LOCAL_MODEL", "llama.cpp/qwen2.5")
+        .args([
+            "template",
+            "init",
+            "local-template",
+            "--local",
+            "--prompt",
+            "background worker that polls an API every 30 seconds",
+            "--dir",
+            dir.path().to_str().expect("utf8"),
+        ])
+        .assert()
+        .success();
+
+    let template_dir = dir.path().join("local-template");
+    let flake = std::fs::read_to_string(template_dir.join("flake.nix")).expect("read flake");
+    let metadata =
+        std::fs::read_to_string(template_dir.join("mvm-template-prompt.json")).expect("metadata");
+    let captured_request = request_capture.lock().expect("capture lock").clone();
+    let captured_request_lower = captured_request.to_ascii_lowercase();
+
+    assert!(captured_request.contains("POST /v1/responses"));
+    assert!(
+        !captured_request_lower.contains("authorization: bearer"),
+        "local provider should not require a bearer token by default"
+    );
+    assert!(flake.contains("sleep 30"));
+    assert!(metadata.contains("\"provider\": \"local\""));
+    assert!(metadata.contains("\"model\": \"llama.cpp/qwen2.5\""));
+}
+
+#[test]
+fn test_template_init_prompt_requires_local() {
+    mvm()
+        .args([
+            "template",
+            "init",
+            "test-prompt-vm",
+            "--prompt",
+            "python worker",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(
+            "--prompt currently requires --local",
+        ));
 }

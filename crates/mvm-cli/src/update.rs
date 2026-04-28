@@ -546,15 +546,18 @@ mod tests {
         use std::os::unix::fs::PermissionsExt;
 
         // Write a tiny shell script that prints a version-like string and exits 0.
-        let mut tmp = tempfile::NamedTempFile::new().unwrap();
-        writeln!(tmp, "#!/bin/sh\necho 'mvmctl 1.0.0'").unwrap();
-        tmp.flush().unwrap();
-        let path = tmp.path();
-        let mut perms = std::fs::metadata(path).unwrap().permissions();
+        let dir = tempfile::tempdir_in("/var/tmp").unwrap();
+        let path = dir.path().join("mvm-smoke-test.sh");
+        {
+            let mut file = std::fs::File::create(&path).unwrap();
+            writeln!(file, "#!/bin/sh\necho 'mvmctl 1.0.0'").unwrap();
+            file.flush().unwrap();
+        }
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
         perms.set_mode(0o755);
-        std::fs::set_permissions(path, perms).unwrap();
+        std::fs::set_permissions(&path, perms).unwrap();
 
-        assert!(smoke_test_binary(path).is_ok());
+        assert!(smoke_test_binary(&path).is_ok());
     }
 
     #[test]
