@@ -2,6 +2,12 @@
 
 All notable changes to mvm are documented in this file.
 
+## [0.10.2] — 2026-04-28
+
+### Fixed
+- **release**: copyKernel now always emits kernel as `vmlinux`, fixing the x86_64 dev-image build in CI
+- **ci**: Chain publish-crates from the release workflow so crates.io stays in sync with GitHub releases
+
 ## [0.10.1] — 2026-04-01
 
 ### Fixed
