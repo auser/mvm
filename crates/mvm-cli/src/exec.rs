@@ -13,22 +13,43 @@ use anyhow::{Context, Result};
 use mvm_core::vm_backend::{VmId, VmStartConfig, VmVolume};
 use mvm_runtime::vm::backend::AnyBackend;
 use mvm_runtime::vm::microvm;
+use serde::Deserialize;
+use std::collections::BTreeMap;
+use std::path::Path;
 
 use crate::ui;
 
 /// Where to source the command that runs inside the transient microVM.
 ///
-/// Marked `non_exhaustive` so future variants (mvmforge launch plan,
-/// baked-in template entrypoint) can be added without breaking match arms
-/// in callers outside this crate.
+/// Marked `non_exhaustive` so future variants (e.g. baked-in template
+/// entrypoint) can be added without breaking match arms in callers outside
+/// this crate.
 #[derive(Debug, Clone)]
 #[non_exhaustive]
 pub enum ExecTarget {
     /// Argv supplied directly on the CLI.
     Inline { argv: Vec<String> },
+    /// Entrypoint sourced from an mvmforge `launch.json` workload IR.
+    ///
+    /// v1 supports single-app workloads only. Multi-app workloads require
+    /// orchestration that's out of scope for `mvmctl exec`.
+    LaunchPlan { entrypoint: LaunchEntrypoint },
     // Future variants (do not implement until needed):
-    // LaunchPlan { path: PathBuf },     // mvmforge launch.json
     // TemplateEntrypoint,               // entrypoint baked into template metadata
+}
+
+/// Resolved entrypoint extracted from an mvmforge `launch.json`.
+///
+/// Mirrors the subset of the v0 IR that `mvmctl exec` needs:
+///   - `command` — argv to exec inside the guest.
+///   - `working_dir` — optional `cd` target before exec.
+///   - `env` — merged from `apps[].env` (lower precedence) and
+///     `apps[].entrypoint.env` (higher precedence), per mvmforge semantics.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LaunchEntrypoint {
+    pub command: Vec<String>,
+    pub working_dir: Option<String>,
+    pub env: BTreeMap<String, String>,
 }
 
 /// One `--add-dir host:guest` mapping.
@@ -108,16 +129,105 @@ pub struct ExecRequest {
 
 impl ExecRequest {
     /// Convert the target into a single shell command string suitable for
-    /// `GuestRequest::Exec`. Inline argv is shell-quoted with `exec` so the
-    /// process inherits the wrapper's stdio.
+    /// `GuestRequest::Exec`. Argv is shell-quoted and prefixed with `exec`
+    /// so the process inherits the wrapper's stdio.
     pub fn target_command(&self) -> String {
         match &self.target {
-            ExecTarget::Inline { argv } => {
-                let quoted: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
-                format!("exec {}", quoted.join(" "))
-            }
+            ExecTarget::Inline { argv } => quote_argv_for_exec(argv),
+            ExecTarget::LaunchPlan { entrypoint } => quote_argv_for_exec(&entrypoint.command),
         }
     }
+}
+
+fn quote_argv_for_exec(argv: &[String]) -> String {
+    let quoted: Vec<String> = argv.iter().map(|a| shell_quote(a)).collect();
+    format!("exec {}", quoted.join(" "))
+}
+
+// ---------------------------------------------------------------------------
+// mvmforge launch.json parser
+// ---------------------------------------------------------------------------
+
+/// Permissive deserialization shapes for the subset of mvmforge's v0
+/// Workload IR that `mvmctl exec` consumes.
+///
+/// `deny_unknown_fields` is intentionally NOT set so newer mvmforge
+/// releases that add optional fields don't break parsing. We *do* require
+/// `apps[].entrypoint.command` because without it there is nothing to run.
+#[derive(Debug, Deserialize)]
+struct RawLaunchPlan {
+    #[serde(default)]
+    apps: Vec<RawLaunchApp>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLaunchApp {
+    #[serde(default)]
+    name: Option<String>,
+    entrypoint: RawLaunchEntrypoint,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct RawLaunchEntrypoint {
+    #[serde(default)]
+    command: Vec<String>,
+    #[serde(default)]
+    working_dir: Option<String>,
+    #[serde(default)]
+    env: BTreeMap<String, String>,
+}
+
+/// Read and parse an mvmforge `launch.json` from disk.
+///
+/// v1 contract:
+///   - file must exist and be readable
+///   - JSON must contain at least one app with a non-empty entrypoint command
+///   - if multiple apps are declared, return an error (v1 doesn't orchestrate
+///     multi-service workloads — that's mvmd's job)
+pub fn load_launch_plan(path: &Path) -> Result<LaunchEntrypoint> {
+    let bytes =
+        std::fs::read(path).with_context(|| format!("reading launch plan '{}'", path.display()))?;
+    let raw: RawLaunchPlan = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing launch plan '{}' as JSON", path.display()))?;
+    parse_launch_plan(raw, &path.display().to_string())
+}
+
+fn parse_launch_plan(raw: RawLaunchPlan, source: &str) -> Result<LaunchEntrypoint> {
+    if raw.apps.is_empty() {
+        anyhow::bail!("launch plan '{source}' has no `apps[]` entries");
+    }
+    if raw.apps.len() > 1 {
+        let names: Vec<&str> = raw
+            .apps
+            .iter()
+            .map(|a| a.name.as_deref().unwrap_or("<unnamed>"))
+            .collect();
+        anyhow::bail!(
+            "launch plan '{source}' has {} apps ({}); `mvmctl exec` v1 supports single-app workloads only",
+            raw.apps.len(),
+            names.join(", "),
+        );
+    }
+    let RawLaunchApp {
+        name: _,
+        entrypoint,
+        env: app_env,
+    } = raw.apps.into_iter().next().expect("len == 1 above");
+    if entrypoint.command.is_empty() {
+        anyhow::bail!("launch plan '{source}': entrypoint.command must be non-empty");
+    }
+    // mvmforge: app.env is merged under (overridden by) entrypoint.env.
+    let mut merged = app_env;
+    for (k, v) in entrypoint.env {
+        merged.insert(k, v);
+    }
+    Ok(LaunchEntrypoint {
+        command: entrypoint.command,
+        working_dir: entrypoint.working_dir,
+        env: merged,
+    })
 }
 
 /// Quote a single argument for inclusion in a shell command line.
@@ -140,11 +250,17 @@ pub fn shell_quote(arg: &str) -> String {
 
 /// Build the wrapper script that runs inside the guest:
 ///   1. mounts each `--add-dir` ext4 image read-only by label
-///   2. exports each `--env` variable
-///   3. execs the user's command
+///   2. exports launch-plan-derived env vars (when target is LaunchPlan)
+///   3. exports CLI `--env` vars (CLI overrides launch-plan)
+///   4. cds into `working_dir` (when target is LaunchPlan and it's set)
+///   5. execs the resolved command
 ///
 /// `add_dir_labels` is the parallel list of ext4 labels assigned to each
 /// `AddDir` (in the same order as `req.add_dirs`).
+///
+/// Env precedence (lowest → highest): launch-plan app.env → launch-plan
+/// entrypoint.env → CLI `--env`. The first two are merged in
+/// `parse_launch_plan`; CLI wins by being emitted last.
 pub fn build_guest_wrapper(req: &ExecRequest, add_dir_labels: &[String]) -> String {
     let mut script = String::from("set -e\n");
     for (dir, label) in req.add_dirs.iter().zip(add_dir_labels.iter()) {
@@ -154,8 +270,18 @@ pub fn build_guest_wrapper(req: &ExecRequest, add_dir_labels: &[String]) -> Stri
             "mkdir -p {mount_point}\nmount LABEL={label_q} {mount_point} -o ro\n",
         ));
     }
+    if let ExecTarget::LaunchPlan { entrypoint } = &req.target {
+        for (k, v) in &entrypoint.env {
+            script.push_str(&format!("export {k}={}\n", shell_quote(v)));
+        }
+    }
     for (k, v) in &req.env {
         script.push_str(&format!("export {k}={}\n", shell_quote(v)));
+    }
+    if let ExecTarget::LaunchPlan { entrypoint } = &req.target
+        && let Some(wd) = &entrypoint.working_dir
+    {
+        script.push_str(&format!("cd {}\n", shell_quote(wd)));
     }
     script.push_str(&req.target_command());
     script.push('\n');
@@ -494,5 +620,209 @@ mod tests {
         assert!(n.len() > "exec-".len());
         assert!(!n.contains(' '));
         assert!(!n.contains('/'));
+    }
+
+    // -- launch.json parser --
+
+    fn parse_str(json: &str) -> Result<LaunchEntrypoint> {
+        let raw: RawLaunchPlan = serde_json::from_str(json).expect("valid json");
+        parse_launch_plan(raw, "test")
+    }
+
+    #[test]
+    fn launch_plan_minimal_app() {
+        let plan = r#"{
+            "apps": [
+                { "entrypoint": { "command": ["python", "-m", "hello"] } }
+            ]
+        }"#;
+        let ep = parse_str(plan).unwrap();
+        assert_eq!(ep.command, vec!["python", "-m", "hello"]);
+        assert!(ep.working_dir.is_none());
+        assert!(ep.env.is_empty());
+    }
+
+    #[test]
+    fn launch_plan_with_working_dir_and_env() {
+        let plan = r#"{
+            "apps": [
+                {
+                    "name": "hello",
+                    "entrypoint": {
+                        "command": ["python", "main.py"],
+                        "working_dir": "/app",
+                        "env": { "PORT": "8080" }
+                    },
+                    "env": { "LOG_LEVEL": "info" }
+                }
+            ]
+        }"#;
+        let ep = parse_str(plan).unwrap();
+        assert_eq!(ep.command, vec!["python", "main.py"]);
+        assert_eq!(ep.working_dir.as_deref(), Some("/app"));
+        assert_eq!(ep.env.get("PORT").map(String::as_str), Some("8080"));
+        // app.env merged in (under entrypoint.env precedence, but no conflict here).
+        assert_eq!(ep.env.get("LOG_LEVEL").map(String::as_str), Some("info"));
+    }
+
+    #[test]
+    fn launch_plan_entrypoint_env_overrides_app_env() {
+        let plan = r#"{
+            "apps": [
+                {
+                    "entrypoint": {
+                        "command": ["true"],
+                        "env": { "X": "from-entrypoint" }
+                    },
+                    "env": { "X": "from-app", "Y": "y" }
+                }
+            ]
+        }"#;
+        let ep = parse_str(plan).unwrap();
+        assert_eq!(ep.env.get("X").map(String::as_str), Some("from-entrypoint"));
+        assert_eq!(ep.env.get("Y").map(String::as_str), Some("y"));
+    }
+
+    #[test]
+    fn launch_plan_ignores_unknown_top_level_fields() {
+        // mvmforge ships `version`, `workload.id`, etc. — we don't care about them.
+        let plan = r#"{
+            "version": "v0",
+            "workload": { "id": "hello" },
+            "apps": [ { "entrypoint": { "command": ["true"] } } ],
+            "future_field": 42
+        }"#;
+        assert!(parse_str(plan).is_ok());
+    }
+
+    #[test]
+    fn launch_plan_rejects_no_apps() {
+        let err = parse_str(r#"{ "apps": [] }"#).unwrap_err();
+        assert!(err.to_string().contains("no `apps[]`"));
+    }
+
+    #[test]
+    fn launch_plan_rejects_multi_app() {
+        let plan = r#"{
+            "apps": [
+                { "name": "a", "entrypoint": { "command": ["x"] } },
+                { "name": "b", "entrypoint": { "command": ["y"] } }
+            ]
+        }"#;
+        let err = parse_str(plan).unwrap_err();
+        let msg = err.to_string();
+        assert!(msg.contains("single-app"), "got: {msg}");
+        assert!(msg.contains("a, b"), "names should appear: {msg}");
+    }
+
+    #[test]
+    fn launch_plan_rejects_empty_command() {
+        let plan = r#"{
+            "apps": [ { "entrypoint": { "command": [] } } ]
+        }"#;
+        let err = parse_str(plan).unwrap_err();
+        assert!(err.to_string().contains("non-empty"));
+    }
+
+    #[test]
+    fn load_launch_plan_reads_file() {
+        let dir = std::env::temp_dir().join(format!("mvm-launch-plan-test-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("launch.json");
+        std::fs::write(
+            &path,
+            r#"{ "apps": [ { "entrypoint": { "command": ["echo", "hi"] } } ] }"#,
+        )
+        .unwrap();
+        let ep = load_launch_plan(&path).unwrap();
+        assert_eq!(ep.command, vec!["echo", "hi"]);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn load_launch_plan_reports_missing_file() {
+        let err = load_launch_plan(Path::new("/nonexistent/launch.json")).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("reading launch plan"));
+    }
+
+    #[test]
+    fn target_command_launch_plan_quotes_argv() {
+        let req = ExecRequest {
+            image: ImageSource::Template("t".into()),
+            cpus: 1,
+            memory_mib: 256,
+            add_dirs: Vec::new(),
+            env: Vec::new(),
+            target: ExecTarget::LaunchPlan {
+                entrypoint: LaunchEntrypoint {
+                    command: vec!["python".into(), "-m".into(), "x".into()],
+                    working_dir: None,
+                    env: BTreeMap::new(),
+                },
+            },
+            timeout_secs: 30,
+        };
+        assert_eq!(req.target_command(), "exec 'python' '-m' 'x'");
+    }
+
+    #[test]
+    fn build_guest_wrapper_launch_plan_emits_cd_and_env() {
+        let mut env = BTreeMap::new();
+        env.insert("PORT".to_string(), "8080".to_string());
+        env.insert("LOG".to_string(), "info".to_string());
+        let req = ExecRequest {
+            image: ImageSource::Template("t".into()),
+            cpus: 1,
+            memory_mib: 256,
+            add_dirs: Vec::new(),
+            env: vec![("CLI_OVER".to_string(), "wins".to_string())],
+            target: ExecTarget::LaunchPlan {
+                entrypoint: LaunchEntrypoint {
+                    command: vec!["python".into(), "main.py".into()],
+                    working_dir: Some("/app".into()),
+                    env,
+                },
+            },
+            timeout_secs: 30,
+        };
+        let script = build_guest_wrapper(&req, &[]);
+        // Env from entrypoint exported.
+        assert!(script.contains("export PORT='8080'"));
+        assert!(script.contains("export LOG='info'"));
+        // CLI env exported AFTER entrypoint env, so it wins on conflict.
+        let cli_pos = script
+            .find("export CLI_OVER='wins'")
+            .expect("CLI env exported");
+        let port_pos = script.find("export PORT='8080'").expect("port exported");
+        assert!(
+            cli_pos > port_pos,
+            "CLI env must appear after launch-plan env"
+        );
+        // cd into working_dir before exec.
+        assert!(script.contains("cd '/app'"));
+        let cd_pos = script.find("cd '/app'").unwrap();
+        let exec_pos = script.find("exec 'python' 'main.py'").unwrap();
+        assert!(cd_pos < exec_pos, "cd must precede the final exec");
+    }
+
+    #[test]
+    fn build_guest_wrapper_inline_target_unchanged() {
+        // Sanity: inline target wrapper still does not emit cd or extra env blocks.
+        let req = ExecRequest {
+            image: ImageSource::Template("t".into()),
+            cpus: 1,
+            memory_mib: 256,
+            add_dirs: Vec::new(),
+            env: Vec::new(),
+            target: ExecTarget::Inline {
+                argv: vec!["true".into()],
+            },
+            timeout_secs: 30,
+        };
+        let script = build_guest_wrapper(&req, &[]);
+        assert!(!script.contains("cd "));
+        assert!(!script.contains("export "));
+        assert!(script.contains("exec 'true'"));
     }
 }

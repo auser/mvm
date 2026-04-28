@@ -408,11 +408,13 @@ enum Commands {
     /// Inspired by cco — same one-command UX, but with a Firecracker microVM
     /// as the sandbox. Use `--add-dir host:guest` to share a host directory
     /// (read-only). Use `--` to separate the argv from `mvmctl exec` flags.
+    /// Alternatively, pass `--launch-plan ./launch.json` to invoke an
+    /// mvmforge-emitted entrypoint instead of an inline argv.
     Exec {
         /// Pre-built template to boot. If omitted, the bundled
-        /// `nix/exec-default/` image is used (built via Nix on first use,
-        /// cached at `~/.cache/mvm/exec-default/`). Each invocation boots a
-        /// fresh transient microVM — never the long-running `mvmctl dev` VM.
+        /// `nix/default-microvm/` image is used (built via Nix on first use,
+        /// cached at `~/.cache/mvm/default-microvm/`). Each invocation boots
+        /// a fresh transient microVM — never the long-running `mvmctl dev` VM.
         #[arg(long)]
         template: Option<String>,
         /// vCPU cores (default: 2).
@@ -426,14 +428,21 @@ enum Commands {
         /// discarded on teardown.
         #[arg(long = "add-dir", short = 'd')]
         add_dir: Vec<String>,
-        /// Environment variable to inject (KEY=VALUE). Repeatable.
+        /// Environment variable to inject (KEY=VALUE). Repeatable. Overrides
+        /// any env vars carried by `--launch-plan`.
         #[arg(long, short = 'e')]
         env: Vec<String>,
         /// Per-command timeout in seconds (default: 60).
         #[arg(long, default_value = "60")]
         timeout: u64,
-        /// Argv to run inside the guest (use `--` to separate).
-        #[arg(trailing_var_arg = true, required = true)]
+        /// Path to an mvmforge `launch.json`. The first app's `entrypoint`
+        /// (command, working_dir, env) is invoked instead of a trailing argv.
+        /// Mutually exclusive with the trailing `<ARGV>...`.
+        #[arg(long = "launch-plan", value_name = "PATH", conflicts_with = "argv")]
+        launch_plan: Option<String>,
+        /// Argv to run inside the guest (use `--` to separate). Required
+        /// unless `--launch-plan` is supplied.
+        #[arg(trailing_var_arg = true, required_unless_present = "launch_plan")]
         argv: Vec<String>,
     },
 }
@@ -1130,8 +1139,18 @@ pub fn run() -> Result<()> {
             add_dir,
             env,
             timeout,
+            launch_plan,
             argv,
-        } => run_oneshot(template, cpus, &memory, &add_dir, &env, timeout, argv),
+        } => run_oneshot(OneshotParams {
+            template,
+            cpus,
+            memory: &memory,
+            add_dir: &add_dir,
+            env: &env,
+            timeout,
+            launch_plan,
+            argv,
+        }),
     };
 
     with_hints(result)
@@ -5141,18 +5160,41 @@ fn cmd_security_status(json: bool) -> Result<()> {
 // One-shot exec (boot transient microVM, run argv, tear down)
 // ============================================================================
 
-fn run_oneshot(
+struct OneshotParams<'a> {
     template: Option<String>,
     cpus: u32,
-    memory: &str,
-    add_dir: &[String],
-    env: &[String],
+    memory: &'a str,
+    add_dir: &'a [String],
+    env: &'a [String],
     timeout: u64,
+    launch_plan: Option<String>,
     argv: Vec<String>,
-) -> Result<()> {
-    if argv.is_empty() {
-        anyhow::bail!("`mvmctl exec` requires a command (after `--`)");
-    }
+}
+
+fn run_oneshot(p: OneshotParams<'_>) -> Result<()> {
+    let OneshotParams {
+        template,
+        cpus,
+        memory,
+        add_dir,
+        env,
+        timeout,
+        launch_plan,
+        argv,
+    } = p;
+    let target = match (launch_plan.as_ref(), argv.is_empty()) {
+        (Some(_), false) => {
+            anyhow::bail!("--launch-plan and a trailing argv are mutually exclusive");
+        }
+        (Some(path), true) => {
+            let entrypoint = crate::exec::load_launch_plan(std::path::Path::new(path))?;
+            crate::exec::ExecTarget::LaunchPlan { entrypoint }
+        }
+        (None, true) => {
+            anyhow::bail!("`mvmctl exec` requires a command (after `--`) or `--launch-plan <PATH>`")
+        }
+        (None, false) => crate::exec::ExecTarget::Inline { argv },
+    };
     let memory_mib = parse_human_size(memory).context("Invalid --memory")?;
     let mut add_dirs = Vec::with_capacity(add_dir.len());
     for spec in add_dir {
@@ -5192,7 +5234,7 @@ fn run_oneshot(
         memory_mib,
         add_dirs,
         env: env_pairs,
-        target: crate::exec::ExecTarget::Inline { argv },
+        target,
         timeout_secs: timeout,
     };
     let exit_code = crate::exec::run(req)?;
@@ -6734,6 +6776,7 @@ mod tests {
                 add_dir,
                 env,
                 timeout,
+                launch_plan,
                 argv,
             } => {
                 assert!(template.is_none(), "template should default to None");
@@ -6742,10 +6785,43 @@ mod tests {
                 assert!(add_dir.is_empty());
                 assert!(env.is_empty());
                 assert_eq!(timeout, 60);
+                assert!(launch_plan.is_none(), "launch_plan should default to None");
                 assert_eq!(argv, vec!["uname".to_string(), "-a".to_string()]);
             }
             _ => panic!("Expected Exec command"),
         }
+    }
+
+    #[test]
+    fn exec_with_launch_plan_no_argv() {
+        let cli =
+            Cli::try_parse_from(["mvmctl", "exec", "--launch-plan", "./plan.json"]).expect("parse");
+        match cli.command {
+            Commands::Exec {
+                launch_plan, argv, ..
+            } => {
+                assert_eq!(launch_plan.as_deref(), Some("./plan.json"));
+                assert!(argv.is_empty());
+            }
+            _ => panic!("Expected Exec command"),
+        }
+    }
+
+    #[test]
+    fn exec_launch_plan_conflicts_with_argv() {
+        let cli = Cli::try_parse_from([
+            "mvmctl",
+            "exec",
+            "--launch-plan",
+            "./plan.json",
+            "--",
+            "echo",
+            "hi",
+        ]);
+        assert!(
+            cli.is_err(),
+            "--launch-plan and trailing argv must be mutually exclusive"
+        );
     }
 
     #[test]

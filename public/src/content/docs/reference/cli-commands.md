@@ -166,8 +166,9 @@ as the sandbox. **Dev-mode only**, gated by `policy.access.debug_exec`.
 |---------|-------------|
 | `mvmctl exec -- <cmd>...` | Boot the bundled default microVM image, run `<cmd>`, exit |
 | `mvmctl exec --template <name> -- <cmd>...` | Boot a registered template instead of the default |
+| `mvmctl exec --launch-plan <path> ` | Run the entrypoint from an [mvmforge](https://github.com/tinylabscom/decorationer) `launch.json`. Mutually exclusive with trailing argv |
 | `mvmctl exec --add-dir HOST:GUEST -- <cmd>` | Mount a host directory read-only inside the guest. Repeatable. Writes are discarded on teardown |
-| `mvmctl exec --env KEY=VAL -- <cmd>` | Inject an environment variable. Repeatable |
+| `mvmctl exec --env KEY=VAL -- <cmd>` | Inject an environment variable. Repeatable. Overrides any env vars carried by `--launch-plan` |
 | `mvmctl exec --cpus <n>` / `--memory <size>` | Resize the transient VM (defaults: 2 vCPUs, 512 MiB) |
 | `mvmctl exec --timeout <secs>` | Per-command timeout (default: 60s) |
 
@@ -178,7 +179,34 @@ mvmctl exec -- uname -a                                # default image
 mvmctl exec --template minimal -- /bin/true            # named template
 mvmctl exec --add-dir .:/work -- ls /work              # share current dir, RO
 mvmctl exec -e DEBUG=1 -- env | grep DEBUG             # env var injection
+mvmctl exec --launch-plan ./launch.json                # mvmforge entrypoint
 ```
+
+### Launch-plan shape
+
+When `--launch-plan` is given, `mvmctl exec` reads a single-app subset of
+mvmforge's v0 Workload IR. Only the entrypoint is consumed (image
+selection still comes from `--template` or the bundled default in v1):
+
+```json
+{
+  "apps": [
+    {
+      "name": "hello",
+      "entrypoint": {
+        "command": ["python", "main.py"],
+        "working_dir": "/app",
+        "env": { "PORT": "8080" }
+      },
+      "env": { "LOG_LEVEL": "info" }
+    }
+  ]
+}
+```
+
+Multi-app workloads are rejected — that's an orchestration concern that
+belongs in `mvmd`, not in `mvmctl exec`. Env precedence (lowest →
+highest): `apps[].env` → `apps[].entrypoint.env` → CLI `--env`.
 
 ## Default microVM Image
 
