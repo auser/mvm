@@ -75,8 +75,11 @@ jobs:
           fi
 
           # Publish in dependency order: leaf crates first, root facade last.
+          # mvm-apple-container is versioned independently — list it before
+          # mvm-runtime, which depends on it.
           CRATES=(
             mvm-core
+            mvm-apple-container
             mvm-guest
             mvm-security
             mvm-build
@@ -85,8 +88,42 @@ jobs:
             mvmctl
           )
 
+          # Read [package].version from a crate's Cargo.toml. Falls back to the
+          # workspace version (for crates that use version.workspace = true).
+          crate_target_version() {
+            local crate="$1"
+            local cargo_toml="crates/${crate}/Cargo.toml"
+            if [ "$crate" = "mvmctl" ]; then
+              cargo_toml="Cargo.toml"
+            fi
+            local pkg_version
+            pkg_version=$(awk '/^\[package\]/{p=1; next} /^\[/{p=0} p && /^version *= */{
+              gsub(/^version *= *"|".*$/, ""); print; exit }' "$cargo_toml")
+            if [ -n "$pkg_version" ]; then
+              echo "$pkg_version"
+              return
+            fi
+            grep -A 5 '^\[workspace\.package\]' Cargo.toml | grep '^version' | head -1 | cut -d '"' -f 2
+          }
+
+          # True if exact version is already published — makes this loop
+          # idempotent so a partial run (mvm-runtime onwards left to do) can
+          # be resumed by re-dispatching without "already exists" failures.
+          crate_already_published() {
+            local crate="$1" wanted="$2"
+            local response
+            response=$(curl -fsSL "https://crates.io/api/v1/crates/${crate}/${wanted}" 2>/dev/null || true)
+            [ -n "$response" ] && echo "$response" | grep -q "\"num\":\"${wanted}\""
+          }
+
           for CRATE in "${CRATES[@]}"; do
             echo "::group::Publishing ${CRATE}"
+            TARGET_VERSION=$(crate_target_version "$CRATE")
+            if [ -z "${PUBLISH_FLAG}" ] && crate_already_published "$CRATE" "$TARGET_VERSION"; then
+              echo "${CRATE} ${TARGET_VERSION} already on crates.io — skipping"
+              echo "::endgroup::"
+              continue
+            fi
             cargo publish -p "${CRATE}" ${PUBLISH_FLAG}
             echo "::endgroup::"
 
