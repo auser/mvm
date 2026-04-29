@@ -2,6 +2,19 @@
 
 All notable changes to mvm are documented in this file.
 
+## [0.13.0] — 2026-04-29
+
+### Added
+- **exec**: Writable --add-dir HOST:GUEST:rw
+- **release**: Publish prebuilt default-microvm kernel + rootfs
+
+### Documentation
+- **exec**: Add guide page + quickstart section + snapshot-restore note
+- **adr**: Writable --add-dir design (closes part of #6)
+
+### Performance
+- **exec**: Snapshot restore for `mvmctl exec` (no --add-dir, template image)
+
 ## [0.12.0] — 2026-04-28
 
 ### Added
