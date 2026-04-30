@@ -63,7 +63,7 @@ pub(in crate::commands) enum Commands {
     /// Build and run a VM from a Nix flake, a template, or the bundled default image.
     ///
     /// If neither `--flake` nor `--template` is supplied, the bundled
-    /// `nix/default-microvm/` image is used (built via Nix on first use,
+    /// `nix/images/default-tenant/` image is used (built via Nix on first use,
     /// cached at `~/.cache/mvm/default-microvm/`).
     #[command(alias = "start", alias = "run")]
     Up(vm::up::Args),

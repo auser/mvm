@@ -13,7 +13,7 @@ use crate::ui;
 #[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct Args {
     /// Pre-built template to boot. If omitted, the bundled
-    /// `nix/default-microvm/` image is used (built via Nix on first use,
+    /// `nix/images/default-tenant/` image is used (built via Nix on first use,
     /// cached at `~/.cache/mvm/default-microvm/`). Each invocation boots a
     /// fresh transient microVM — never the long-running `mvmctl dev` VM.
     #[arg(long)]

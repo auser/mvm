@@ -18,6 +18,7 @@ pub const PROTOCOL_VERSION_LEGACY: u8 = 1;
 /// every frame becomes an `AuthenticatedFrame` containing the Ed25519-signed
 /// inner payload (the original `GuestRequest` or `GuestResponse` JSON).
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct AuthenticatedFrame {
     /// Protocol version (2 = authenticated, 1 = legacy/unauthenticated).
     pub version: u8,
@@ -37,6 +38,7 @@ pub struct AuthenticatedFrame {
 
 /// Host → Guest: initiate authenticated session after CONNECT/OK.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionHello {
     /// Protocol version the host supports.
     pub version: u8,
@@ -50,6 +52,7 @@ pub struct SessionHello {
 
 /// Guest → Host: acknowledge session and prove key possession.
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SessionHelloAck {
     /// Protocol version the guest supports.
     pub version: u8,

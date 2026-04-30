@@ -36,6 +36,14 @@ pub struct VmStartConfig {
     pub kernel_path: Option<String>,
     /// Absolute path to the initial ramdisk (NixOS stage-1), if present.
     pub initrd_path: Option<String>,
+    /// Absolute path to the dm-verity Merkle hash sidecar.
+    /// Present when the flake was built with `verifiedBoot = true`
+    /// (the production default per ADR-002 §W3). Must be paired with
+    /// `roothash`. Backends without verity support may ignore both.
+    pub verity_path: Option<String>,
+    /// 64-char lowercase-hex root hash from `rootfs.roothash`. Baked
+    /// into the kernel cmdline as `dm-mod.create=`. ADR-002 §W3.2.
+    pub roothash: Option<String>,
     /// Nix store revision hash.
     pub revision_hash: String,
     /// Original flake reference (for display / status).

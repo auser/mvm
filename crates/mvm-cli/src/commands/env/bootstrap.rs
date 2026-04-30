@@ -33,6 +33,7 @@ pub(super) fn run_steps(production: bool) -> Result<()> {
 
     ui::info("\nInstalling prerequisites...");
     bootstrap::ensure_lima()?;
+    bootstrap::warn_if_legacy_lima_vm()?;
 
     // Bootstrap uses default Lima resources (8 vCPUs, 16 GiB), never forces
     run_setup_steps(false, 8, 16)?;

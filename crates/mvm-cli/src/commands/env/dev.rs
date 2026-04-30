@@ -52,7 +52,12 @@ pub(in crate::commands) enum DevAction {
         shell: bool,
     },
     /// Stop the Lima development VM
-    Down,
+    Down {
+        /// Also delete the cached dev image (vmlinux + rootfs.ext4) so the
+        /// next `dev up` rebuilds from local source.
+        #[arg(long)]
+        reset: bool,
+    },
     /// Open a shell in the running Lima VM
     Shell {
         /// Project directory to cd into inside the VM (Lima maps ~ → ~)
@@ -124,12 +129,49 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                 )
             }
         }
-        DevAction::Down => {
-            if mvm_core::platform::current().has_apple_containers() {
+        DevAction::Down { reset } => {
+            let result = if mvm_core::platform::current().has_apple_containers() {
                 apple_container::cmd_dev_apple_container_down()
             } else {
                 dev_down()
+            };
+            // Always drop the dev-image GC root on `down`. It exists to
+            // pin the rootfs/kernel store paths *while the VM is using
+            // them*; once the VM is stopped, holding the root just
+            // blocks `nix-collect-garbage` from reclaiming superseded
+            // images. The next `dev up` re-resolves the path via
+            // `nix build --out-link`, which is a no-op against a fresh
+            // closure (cache hit) and a re-realise against a changed
+            // closure — either way, the symlink is recreated cleanly.
+            let gc_root = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
+            if let Err(e) = std::fs::remove_file(&gc_root)
+                && e.kind() != std::io::ErrorKind::NotFound
+            {
+                ui::warn(&format!("Could not remove {gc_root}: {e}"));
             }
+
+            if reset {
+                // `--reset` additionally drops the host-backed Nix
+                // store overlay disk. Useful for "make `dev up` start
+                // from a truly empty store" — e.g. after a corrupting
+                // crash, or to reproduce a first-boot scenario.
+                // Without this flag, the build cache survives `down`,
+                // which is the right default (rebuilds are cheap, the
+                // closure isn't).
+                let nix_disk = format!("{}/dev/nix-store.img", mvm_core::config::mvm_data_dir());
+                match std::fs::remove_file(&nix_disk) {
+                    Ok(()) => {
+                        ui::info(
+                            "Cleared host-backed Nix store; next `dev up` will mkfs a fresh one.",
+                        );
+                    }
+                    Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                    Err(e) => {
+                        ui::warn(&format!("Could not remove {nix_disk}: {e}"));
+                    }
+                }
+            }
+            result
         }
         DevAction::Shell { project } => {
             if mvm_core::platform::current().has_apple_containers() {
@@ -241,6 +283,10 @@ fn dev_up(
             ui::info("Lima not found. Running bootstrap...\n");
             bootstrap_steps(false)?;
         } else {
+            // W7.2: warn if there's a legacy `mvm` Lima VM from before the
+            // builder VM rename. We don't auto-migrate (limactl can't
+            // rename in-place and the user may have running tenant work).
+            bootstrap::warn_if_legacy_lima_vm()?;
             let lima_status = lima::get_status()?;
             match lima_status {
                 lima::LimaStatus::NotFound => {

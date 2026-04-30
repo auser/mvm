@@ -27,14 +27,14 @@
   # remain prod-only.
 
   inputs = {
-    # Placeholder. mvmctl ALWAYS overrides this via `--override-input
-    # mvm/mvm` so the local checkout is used. The placeholder only has
-    # to be a syntactically valid flake URL — its content is never read
-    # by the dev-build path. Direct standalone `nix build path:nix/dev`
-    # without the override fetches the published mvm repo, which would
-    # produce a working but stale dev image; that's a documented
-    # non-supported path.
-    mvm.url = "github:auser/mvm?dir=nix";
+    # mvmctl ALWAYS overrides this via `--override-input mvm/mvm` so the
+    # local checkout is used at build time. The default `path:..` makes
+    # standalone `nix flake lock` / `nix build` of this sibling work
+    # against the parent flake right next to it on disk — much friendlier
+    # than the previous `github:auser/mvm?dir=nix` stub, which couldn't
+    # lock cleanly because the published tree has the parent flake at a
+    # different path.
+    mvm.url = "path:..";
   };
 
   outputs = { self, mvm, ... }: {
@@ -45,6 +45,12 @@
     lib = builtins.mapAttrs (system: systemLib: systemLib // {
       mkGuest = args: systemLib.mkGuest (args // {
         guestAgent = mvm.packages.${system}.mvm-guest-agent-dev;
+        # Tag the rootfs as the dev variant. mkGuest asserts that a
+        # "dev" variant is paired with a guest agent that has the
+        # dev-shell Cargo feature compiled in (above), so the rootfs
+        # marker and the agent's `do_exec` symbol presence can never
+        # disagree.
+        variant = "dev";
       });
     }) mvm.lib;
 

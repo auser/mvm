@@ -78,6 +78,70 @@ fn dev_builds_dir() -> String {
     format!("{}/dev/builds", mvm_core::config::mvm_data_dir())
 }
 
+/// Path the CLI writes when `dev up` notices the host-backed Nix
+/// store has grown past the GC threshold. Lives under the data dir
+/// because the data dir is the only path the dev VM and the host
+/// agree on (via the `datadir` VirtioFS share mounted at the same
+/// absolute path in both).
+fn gc_sentinel_path() -> String {
+    format!(
+        "{}/dev/nix-store-needs-gc",
+        mvm_core::config::mvm_data_dir()
+    )
+}
+
+/// Consume the GC sentinel: if it exists, run `nix-collect-garbage
+/// --delete-older-than 14d` inside the VM (the only place the in-VM
+/// nix daemon's locks are honoured), then remove the sentinel
+/// regardless of whether GC succeeded — leaving it in place would
+/// make every subsequent build re-trigger the GC, defeating the
+/// purpose of the threshold check.
+fn run_gc_if_requested(env: &dyn ShellEnvironment) {
+    let sentinel = gc_sentinel_path();
+    let quoted = shell_quote(&sentinel);
+    let exists_check = format!("test -e {quoted} && echo yes || echo no");
+    let exists = env
+        .shell_exec_stdout(&exists_check)
+        .map(|s| s.trim() == "yes")
+        .unwrap_or(false);
+    if !exists {
+        return;
+    }
+    env.log_info("Host-backed Nix store passed GC threshold; running nix-collect-garbage --delete-older-than 14d");
+    if let Err(e) = env.shell_exec_visible("nix-collect-garbage --delete-older-than 14d") {
+        env.log_warn(&format!("nix-collect-garbage failed (continuing): {e}"));
+    }
+
+    // The artifact dirs at $HOME/.mvm/dev/builds/<hash>/ are
+    // host-side caches keyed on a Nix store path. Once that store
+    // path has been GC'd (no longer registered with `nix-store
+    // --query --hash`), the cache entry is stale: its files were
+    // hardlinked from store paths that have been removed, so they're
+    // either missing or about to dangle. Reaping these entries
+    // alongside the store keeps the host's data dir bounded without
+    // requiring the user to know about a separate cleanup ritual.
+    let builds_dir = dev_builds_dir();
+    let prune_script = format!(
+        "for d in {builds}/*; do \
+           [ -d \"$d\" ] || continue; \
+           rev=$(basename \"$d\"); \
+           if ! nix-store --query --hash \"/nix/store/$rev\"-* >/dev/null 2>&1; then \
+             rm -rf \"$d\"; \
+             echo \"  pruned stale build artifacts: $rev\"; \
+           fi; \
+         done",
+        builds = shell_quote(&builds_dir),
+    );
+    if let Err(e) = env.shell_exec_visible(&prune_script) {
+        env.log_warn(&format!("Could not prune stale build artifacts: {e}"));
+    }
+
+    let cleanup = format!("rm -f {quoted}");
+    if let Err(e) = env.shell_exec(&cleanup) {
+        env.log_warn(&format!("Could not remove GC sentinel {sentinel}: {e}"));
+    }
+}
+
 /// Result of a dev build via `nix build` in the Lima VM.
 #[derive(Debug, Clone)]
 pub struct DevBuildResult {
@@ -163,6 +227,18 @@ pub fn dev_build(
     flake_ref: &str,
     profile: Option<&str>,
 ) -> Result<DevBuildResult> {
+    // Honour the host-side GC sentinel before any new build work
+    // touches the store. The CLI's `dev up` writes
+    // `~/.mvm/dev/nix-store-needs-gc` (mounted at the same path
+    // inside the VM via the datadir share) when the upper layer's
+    // allocated bytes cross threshold; we collect garbage exactly
+    // once, then remove the sentinel. Doing it here — inside the VM,
+    // before we hold any new gcroots — means the daemon owns the
+    // store locks and only unreferenced paths get reaped. Failure is
+    // a warning, not a build failure: a missing or unreachable nix
+    // binary should never block the user's work.
+    run_gc_if_requested(env);
+
     let attr = resolve_dev_build_attribute(env, flake_ref, profile);
 
     // Run optional pre-build hook if the flake provides one.
@@ -567,7 +643,7 @@ fn ensure_guest_agent(
 
     // Step 2: Build the guest-agent from the mvm workspace
     let build_cmd = format!(
-        "nix-build --no-out-link {}/nix/guest-agent-pkg.nix \
+        "nix-build --no-out-link {}/nix/packages/mvm-guest-agent.nix \
          --arg pkgs 'import <nixpkgs> {{}}' \
          --arg mvmSrc {} \
          --arg rustPlatform '(import <nixpkgs> {{}}).rustPlatform'",

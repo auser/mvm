@@ -478,11 +478,20 @@ pub fn run(req: ExecRequest) -> Result<i32> {
         backend.capabilities().snapshots,
     );
 
+    // Probe for the verity sidecar alongside the rootfs. ADR-002 §W3.2:
+    // production microVMs ship `rootfs.verity` + `rootfs.roothash` next
+    // to `rootfs.ext4`. Their absence is the dev-VM exemption from §W3.4.
+    // Files live inside the Lima VM, so we can't `Path::exists()` them
+    // from the host — shell out into the VM instead.
+    let (verity_path, roothash) = mvm_runtime::vm::microvm::probe_verity_sidecar(&rootfs);
+
     let start_config = VmStartConfig {
         name: vm_name.clone(),
         rootfs_path: rootfs.clone(),
         kernel_path: Some(vmlinux.clone()),
         initrd_path: initrd.clone(),
+        verity_path,
+        roothash,
         revision_hash: revision.clone(),
         flake_ref: flake_ref.clone(),
         profile: profile.clone(),
@@ -597,6 +606,8 @@ fn restore_via_snapshot(
         vmlinux_path: start_config.kernel_path.clone().unwrap_or_default(),
         initrd_path: start_config.initrd_path.clone(),
         rootfs_path: start_config.rootfs_path.clone(),
+        verity_path: start_config.verity_path.clone(),
+        roothash: start_config.roothash.clone(),
         revision_hash: start_config.revision_hash.clone(),
         flake_ref: start_config.flake_ref.clone(),
         profile: start_config.profile.clone(),

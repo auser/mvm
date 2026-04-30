@@ -11,6 +11,12 @@ pub struct VmStartParams<'a> {
     pub rootfs_path: String,
     pub vmlinux_path: String,
     pub initrd_path: Option<String>,
+    /// Optional dm-verity sidecar (Merkle tree). Production microVMs
+    /// built with `verifiedBoot = true` ship this alongside the rootfs;
+    /// dev VMs leave it None. ADR-002 §W3.
+    pub verity_path: Option<String>,
+    /// Lowercase-hex root hash; required when `verity_path` is Some.
+    pub roothash: Option<String>,
     pub revision_hash: String,
     pub flake_ref: String,
     pub profile: Option<String>,
@@ -29,6 +35,8 @@ impl VmStartParams<'_> {
             rootfs_path: self.rootfs_path,
             kernel_path: Some(self.vmlinux_path),
             initrd_path: self.initrd_path,
+            verity_path: self.verity_path,
+            roothash: self.roothash,
             revision_hash: self.revision_hash,
             flake_ref: self.flake_ref,
             profile: self.profile,

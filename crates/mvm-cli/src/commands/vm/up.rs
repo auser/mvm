@@ -79,8 +79,12 @@ pub(in crate::commands) struct Args {
     /// Network allowlist entry (format: HOST:PORT). Repeatable
     #[arg(long)]
     pub network_allow: Vec<String>,
-    /// Seccomp profile tier (essential, minimal, standard, network, unrestricted)
-    #[arg(long, default_value = "unrestricted")]
+    /// Seccomp profile tier (essential, minimal, standard, network, unrestricted).
+    ///
+    /// Default: `standard`. `unrestricted` is opt-in only — see ADR-002
+    /// (`specs/adrs/002-microvm-security-posture.md`); the project's
+    /// posture is "defaults must be safe."
+    #[arg(long, default_value = "standard")]
     pub seccomp: String,
     /// Secret binding (format: KEY:host, KEY:host:header, or KEY=value:host). Repeatable
     #[arg(short, long)]
@@ -574,12 +578,18 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         && backend.capabilities().snapshots
     {
         let slot = microvm::allocate_slot(&vm_name)?;
+        // Probe for the verity sidecar alongside the rootfs so the
+        // restored VM boots through dm-verity when the template was
+        // built with `verifiedBoot = true`. ADR-002 §W3.2.
+        let (verity_path, roothash) = microvm::probe_verity_sidecar(&rootfs_path);
         let run_config = microvm::FlakeRunConfig {
             name: vm_name,
             slot,
             vmlinux_path,
             initrd_path,
             rootfs_path,
+            verity_path,
+            roothash,
             revision_hash,
             flake_ref: source_flake,
             profile: source_profile,
@@ -600,11 +610,14 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         );
         microvm::restore_from_template_snapshot(tmpl, &run_config, &snap_dir, snap_info)?;
     } else {
+        let (verity_path, roothash) = microvm::probe_verity_sidecar(&rootfs_path);
         let start_config = VmStartParams {
             name: vm_name,
             rootfs_path,
             vmlinux_path,
             initrd_path,
+            verity_path,
+            roothash,
             revision_hash,
             flake_ref: source_flake,
             profile: source_profile,
@@ -835,11 +848,14 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             if let Some(f) = env_vars_to_drive_file(env_vars) {
                 w_config_files.push(f);
             }
+            let (w_verity_path, w_roothash) = microvm::probe_verity_sidecar(&result.rootfs_path);
             let w_start_config = VmStartParams {
                 name: vm_name_owned.clone(),
                 rootfs_path: result.rootfs_path,
                 vmlinux_path: result.vmlinux_path,
                 initrd_path: result.initrd_path,
+                verity_path: w_verity_path,
+                roothash: w_roothash,
                 revision_hash: result.revision_hash,
                 flake_ref: flake.to_string(),
                 profile: profile.map(|s| s.to_string()),
