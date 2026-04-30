@@ -259,21 +259,75 @@ W1 is shipped. W2–W6 are independent and can land in any order; W3
   the hypervisor, GC roots, and private build keys.
 - Multi-tenant guests. One guest = one workload.
 - TPM/SEV/hardware attestation. Out of scope for v1.
-- Hypervisor-level egress policy enforcement (beyond NAT/tap choice).
-  *Scoped for the next sprint as plan 32 / Proposal D —
-  [`plans/32-mcp-agent-adoption.md`](plans/32-mcp-agent-adoption.md).
-  Remains a non-goal for Sprint 42.*
+- Hypervisor-level egress policy enforcement L7 / DNS-pinning. The
+  L3 tier shipped via plan 32 / Proposal D + `NetworkPreset::Agent`
+  (PR #20). The L7 tier (mitmdump-based HTTPS proxy + DNS-answer
+  pinning) is scoped in
+  [`plans/34-egress-l7-proxy.md`](plans/34-egress-l7-proxy.md);
+  PR #23 ships the foundation (`EgressMode::L3PlusL7`,
+  `EgressProxy` trait, `StubEgressProxy`). Runtime backing remains
+  a non-goal for Sprint 42.
 
-## Up next (Sprint 43 preview)
+## Sprint 43 — Nix-agent ecosystem adoption (in flight)
 
-[`plans/32-mcp-agent-adoption.md`](plans/32-mcp-agent-adoption.md) is
-the approved master plan for the next sprint:
+Master plan: [`plans/32-mcp-agent-adoption.md`](plans/32-mcp-agent-adoption.md).
+Five proposals (A, A.2, B, C, D) plus cross-repo handoff plan 33.
 
-- **A** — `mvmctl mcp` server (single-tool MCP surface, ADR-003).
-- **A.2** — MCP session semantics (snapshot-resumed VMs).
-- **B** — `nix/images/examples/llm-agent/` showcase flake.
-- **C** — local-LLM-default flip for `mvmctl template init --prompt`.
-- **D** — hypervisor egress policy with domain-pinning (ADR-004).
+### Shipped (PRs open, awaiting review)
+
+- **PR #20** [`feat/mcp-agent-adoption`](https://github.com/tinylabscom/mvm/pull/20) ←
+  `main` — plan 32 base. New `mvm-mcp` crate (protocol-only +
+  stdio), A v1 stdio MCP server, B `nix/images/examples/llm-agent/`
+  showcase flake, C local-LLM probe defaults, D v1
+  `NetworkPreset::Agent` (L3-only). New ADRs 003 / 004; new plans
+  32 / 33.
+- **PR #21** [`feat/mcp-session-semantics`](https://github.com/tinylabscom/mvm/pull/21) ← #20 —
+  A.2 v1 (session bookkeeping). `SessionMap` + `Reaper` trait +
+  audit kinds + 30 s-tick reaper thread + Drop drain.
+- **PR #22** [`feat/mcp-session-warm-vm`](https://github.com/tinylabscom/mvm/pull/22) ← #21 —
+  A.2 v2 (warm-VM materialisation). `boot_session_vm` /
+  `dispatch_in_session` / `tear_down_session_vm` exec primitives;
+  per-session `Arc<Mutex<SessionVm>>` map; boot-race handling;
+  reaper actually tears VMs down.
+- **PR #23** [`feat/egress-l7-proxy`](https://github.com/tinylabscom/mvm/pull/23) ← #22 —
+  L7 egress foundation. `EgressMode` enum (`Open` / `L3Only` /
+  `L3PlusL7`), `EgressProxy` trait + `StubEgressProxy`, plan 34
+  scoped.
+
+All four PRs: `cargo build --workspace` clean, `cargo test --workspace`
+green (mvm-mcp 31 tests including session lifecycle, mvm-core +6
+EgressMode tests + 3 agent-preset tests, mvm-cli +2 probe tests),
+`cargo clippy --workspace --all-targets -- -D warnings` clean,
+`cargo build -p mvm-mcp --no-default-features --features
+protocol-only` clean (mvmd-ready per plan 33).
+
+### Deferred — concrete follow-ups
+
+| Item | Plan | Why deferred | Estimated size |
+|---|---|---|---|
+| **L7 egress runtime backing** (mitmdump supervisor + CA cert tooling + optional DNS-pinning + `apply_network_policy` wire-up + `mvmctl egress init-ca` + `mvmctl cache prune` orphan handling + llm-agent README update) | [`plans/34-egress-l7-proxy.md`](plans/34-egress-l7-proxy.md) — 7 tiers fully specified | Heavyweight runtime dep (mitmdump pulls Python + cryptography, ~80 MiB closure); CA cert generation has corner cases (rotation, expiry, per-host vs per-VM); DNS pinning needs IPv6 + CNAME-chain handling. Live-KVM integration testing is mandatory. | ~1 sprint |
+| **A.2 v2 live-KVM smoke** (cold-boot vs warm-VM latency comparison on `claude-code-vm`; race-condition test for parallel first-calls in same session; snapshot-resume against the Anthropic-allowlisted agent VM) | Plan 32 §"Proposal A.2" | Hardware not available in the dev environment; needs a Linux/KVM host with a real Firecracker stack. | ~1 day |
+| **Hosted MCP transport (HTTP/SSE)** | [`plans/33-hosted-mcp-transport.md`](plans/33-hosted-mcp-transport.md) | Cross-repo: implementation lives in [mvmd](https://github.com/auser/mvmd). mvm-mcp's `protocol-only` feature is already shipped (PR #20) so mvmd can consume the wire schema unchanged. | mvmd owns sizing |
+| **Per-template `default_network_policy`** | ADR-004 §"Decisions" 6 (named as ergonomic follow-up) | Requires `TemplateSpec` schema bump + migration; orthogonal to the L7 work. Lets `claude-code-vm` ship with the agent preset baked in instead of needing `--network-preset agent` per `mvmctl up`. | ~1 day |
+| **CI lane `mcp-server-smoke`** (real JSON-RPC roundtrip via `scripts/test-mcp-roundtrip.sh`) | Plan 32 §"Proposal A — CI gate" | The unit tests cover protocol shape; the missing piece is a CI lane that spawns `mvmctl mcp stdio` and asserts a real `tools/list` response. Small, can land any time. | ~½ day |
+
+### Sprint 43 success criteria
+
+By sprint close, the project should be able to claim:
+
+1. *LLM clients drive mvmctl as an MCP sandbox* (PR #20 — shipped).
+2. *Sessions persist warm VMs across calls with idle/max reaping* (PRs #21 + #22 — shipped, live-KVM smoke deferred).
+3. *Hardened LLM-agent VM exists as a worked example* (PR #20 / Proposal B — shipped).
+4. *Local-LLM-first scaffolding* (PR #20 / Proposal C — shipped).
+5. *L3 hypervisor egress allowlist with an `agent` preset* (PR #20 / Proposal D — shipped).
+6. *L7 HTTPS proxy + SNI/Host enforcement* (foundation in PR #23, runtime in plan 34 — deferred).
+7. *mvmd-ready protocol crate* (PR #20's `protocol-only` feature — shipped; mvmd consumption is plan 33's job).
+
+5 of 7 are fully shipped on `feat/egress-l7-proxy`; 1 has its
+foundation in place; 1 is cross-repo work. The sprint can close on
+review approval of PRs #20–#23 — claim 6 is honestly stated as
+"foundation shipped; runtime in plan 34" and that's the right
+boundary given the runtime dep weight.
 
 Cross-repo handoff for hosted MCP transport (HTTP/SSE) is documented
 in [`plans/33-hosted-mcp-transport.md`](plans/33-hosted-mcp-transport.md);

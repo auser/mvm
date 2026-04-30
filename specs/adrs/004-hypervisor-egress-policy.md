@@ -1,8 +1,8 @@
 ---
 title: "ADR-004: hypervisor-level egress policy with domain-pinning"
-status: Proposed (v1 = L3 only; L7 + DNS-pinning deferred)
+status: Proposed (v1 = L3 shipped; L7 + DNS-pinning scoped in plan 34)
 date: 2026-04-30
-related: ADR-002 (microVM security posture); ADR-003 (local MCP server); plan 32 (MCP + LLM-agent adoption); plan 25 (microVM hardening)
+related: ADR-002 (microVM security posture); ADR-003 (local MCP server); plan 32 (MCP + LLM-agent adoption); plan 34 (L7 egress proxy follow-up); plan 25 (microVM hardening)
 ---
 
 ## Status
