@@ -120,6 +120,66 @@ impl fmt::Display for NetworkPreset {
     }
 }
 
+/// Egress enforcement layer (plan 32 / Proposal D / ADR-004).
+///
+/// The three-layer model lives in ADR-004; this enum lets callers
+/// pick which layers apply. v1 (D shipped) wires only L3; v2
+/// (plan 34, deferred) adds the L7 SNI/Host proxy + DNS pinning.
+///
+/// `Open` is the implicit mode for any `NetworkPolicy` that resolves
+/// to an unrestricted preset. `L3Only` and `L3PlusL7` apply when
+/// the policy resolves to a non-empty allowlist.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum EgressMode {
+    /// No filtering — guest gets full outbound. Implied by an
+    /// unrestricted policy.
+    #[default]
+    Open,
+    /// L3 only: iptables `FORWARD` allowlist on the bridge. Catches
+    /// raw-IP exfil; doesn't catch DNS rotation or SNI/Host abuse
+    /// over a permitted destination.
+    L3Only,
+    /// L3 + L7 stack: iptables allowlist plus an HTTPS proxy on the
+    /// host that enforces SNI for HTTPS (CONNECT) and Host header
+    /// for HTTP. Plan 34 / ADR-004 §"L7" covers the runtime impl;
+    /// today this variant returns "egress proxy not implemented" at
+    /// `tap_create` time so callers see a clear error rather than a
+    /// silent downgrade.
+    L3PlusL7,
+}
+
+impl EgressMode {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Open => "open",
+            Self::L3Only => "l3-only",
+            Self::L3PlusL7 => "l3-plus-l7",
+        }
+    }
+}
+
+impl FromStr for EgressMode {
+    type Err = anyhow::Error;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        match s {
+            "open" => Ok(Self::Open),
+            "l3-only" | "l3" => Ok(Self::L3Only),
+            "l3-plus-l7" | "l3+l7" | "l7" => Ok(Self::L3PlusL7),
+            other => anyhow::bail!(
+                "unknown egress mode {:?} (expected: open, l3-only, l3-plus-l7)",
+                other
+            ),
+        }
+    }
+}
+
+impl fmt::Display for EgressMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
 /// Network policy for a microVM, controlling outbound traffic.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "lowercase")]
@@ -421,6 +481,50 @@ mod tests {
         assert!(!hosts.contains(&"registry.npmjs.org"));
         assert!(!hosts.contains(&"crates.io"));
         assert!(!hosts.contains(&"pypi.org"));
+    }
+
+    #[test]
+    fn egress_mode_default_is_open() {
+        assert_eq!(EgressMode::default(), EgressMode::Open);
+    }
+
+    #[test]
+    fn egress_mode_parse_canonical() {
+        assert_eq!("open".parse::<EgressMode>().unwrap(), EgressMode::Open);
+        assert_eq!("l3-only".parse::<EgressMode>().unwrap(), EgressMode::L3Only);
+        assert_eq!(
+            "l3-plus-l7".parse::<EgressMode>().unwrap(),
+            EgressMode::L3PlusL7
+        );
+    }
+
+    #[test]
+    fn egress_mode_parse_aliases() {
+        assert_eq!("l3".parse::<EgressMode>().unwrap(), EgressMode::L3Only);
+        assert_eq!("l7".parse::<EgressMode>().unwrap(), EgressMode::L3PlusL7);
+        assert_eq!("l3+l7".parse::<EgressMode>().unwrap(), EgressMode::L3PlusL7);
+    }
+
+    #[test]
+    fn egress_mode_parse_unknown_errors() {
+        assert!("bogus".parse::<EgressMode>().is_err());
+    }
+
+    #[test]
+    fn egress_mode_display_roundtrip() {
+        for mode in [EgressMode::Open, EgressMode::L3Only, EgressMode::L3PlusL7] {
+            let s = mode.to_string();
+            assert_eq!(s.parse::<EgressMode>().unwrap(), mode);
+        }
+    }
+
+    #[test]
+    fn egress_mode_serde_roundtrip() {
+        for mode in [EgressMode::Open, EgressMode::L3Only, EgressMode::L3PlusL7] {
+            let json = serde_json::to_string(&mode).unwrap();
+            let parsed: EgressMode = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, mode);
+        }
     }
 
     #[test]
