@@ -36,10 +36,15 @@ env:
 
 jobs:
   # ── Lane 1: Supply chain ──────────────────────────────────────────
-  # Maps to ADR-002 §W5.2 — advisories, license allowlist, multi-
-  # version bans, and registry source allowlist. Cheap (<2 min).
-  cargo-deny:
-    name: Supply chain — cargo-deny (ADR-002 §W5.2)
+  # Both cargo-deny (advisories + licenses + bans + sources) and
+  # cargo-audit (RustSec advisories) share the same Rust toolchain
+  # setup and run in <2 min apiece. Combined into one job so a PR
+  # only spawns one supply-chain runner instead of two. Each step's
+  # failure surfaces in the job log under its own step name; both
+  # tools' --ignore lists must stay in lockstep with deny.toml.
+  # ADR-002 §W5.2.
+  supply-chain:
+    name: Supply chain — cargo-deny + cargo-audit (ADR-002 §W5.2)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -47,20 +52,13 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Install cargo-deny
-        run: cargo install --locked cargo-deny
+      - name: Install cargo-deny + cargo-audit
+        run: |
+          cargo install --locked cargo-deny
+          cargo install --locked cargo-audit
 
       - name: cargo deny check
         run: cargo deny check
-
-  cargo-audit:
-    name: Supply chain — cargo-audit (ADR-002 §W5.2)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install cargo-audit
-        run: cargo install --locked cargo-audit
 
       - name: cargo audit
         # Ignored advisories must mirror deny.toml's `[advisories].ignore`.
@@ -68,13 +66,19 @@ jobs:
         # discoverable way to keep the two tools in sync.
         run: cargo audit --ignore RUSTSEC-2025-0057 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2026-0009
 
-  # ── Lane 2: Production-agent symbol gate ──────────────────────────
-  # ADR-002 §W4.3 — production builds of mvm-guest-agent must not
-  # contain mvm_guest_agent::do_exec. Catches accidental re-enable
-  # of the dev-shell feature. Anchors on the binary's crate name to
-  # skip stdlib's identically-named symbol.
-  prod-agent-no-exec:
-    name: Guest agent — no dev-shell symbols (ADR-002 §W4.3)
+  # ── Lane 2: Rust-side fast security checks ────────────────────────
+  # Two short cargo invocations that share toolchain + cache:
+  #   - ADR-002 §W4.3 prod-agent symbol gate (no dev-shell symbols
+  #     in the production guest agent build).
+  #   - ADR-002 §W5.1 hash-verify regression (mvm-cli unit tests
+  #     for the download-and-verify code path; run in isolation
+  #     here so a regression is visible in this workflow even when
+  #     the broader test job in ci.yml is skipped).
+  # Combined into one job so a PR only spawns one fast-checks
+  # runner instead of two. Each step's failure surfaces under its
+  # own step name in the job log.
+  rust-fast-checks:
+    name: Rust fast security checks (ADR-002 §W4.3 + §W5.1)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -89,11 +93,14 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: cargo-prodagent-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: cargo-prodagent-
+          key: cargo-rust-fast-checks-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-rust-fast-checks-
 
-      - name: Build prod agent and check for do_exec
+      - name: Prod guest agent has no dev-shell symbols (§W4.3)
         run: ./scripts/check-prod-agent-no-exec.sh
+
+      - name: Hash-verify regression (§W5.1)
+        run: cargo test -p mvm-cli --lib hash_verify_tests
 
   # ── Lane 3: Reproducibility ────────────────────────────────────────
   # ADR-002 §W5.3 — two clean builds must produce byte-identical
@@ -193,23 +200,6 @@ jobs:
           path: |
             crates/mvm-guest/fuzz/corpus/
             crates/mvm-guest/fuzz/artifacts/
-
-  # ── Lane 5: Hash-verify regression ─────────────────────────────────
-  # ADR-002 §W5.1 — the unit tests that exercise the
-  # download-and-verify code path live in mvm-cli. Run them in
-  # isolation so a regression is visible in this workflow even when
-  # the broader test job in ci.yml is skipped.
-  hash-verify-tests:
-    name: Hash-verify regression (ADR-002 §W5.1)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Run hash-verify tests
-        run: cargo test -p mvm-cli --lib hash_verify_tests
 
   # ── Lane 6: Verified boot artifact gate ────────────────────────────
   # ADR-002 §W3.4 — production microVM Nix builds must emit
