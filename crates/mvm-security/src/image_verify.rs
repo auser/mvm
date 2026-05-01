@@ -390,6 +390,61 @@ mod tests {
         format!("{:x}", h.finalize())
     }
 
+    /// Contract test pinning the on-wire shape produced by
+    /// `scripts/generate-image-manifest.sh`. If either side drifts —
+    /// the script reorders keys, drops a field, or this struct gains
+    /// a required field — this test fires. Keep both producer and
+    /// consumer in lock-step.
+    #[test]
+    fn parses_release_pipeline_manifest_shape() {
+        // Verbatim sample of what scripts/generate-image-manifest.sh
+        // emits for ARCH=aarch64 VARIANT=dev ROOTFS_EXT=ext4 with
+        // fake artifact bytes. Re-generate with:
+        //   ARCH=aarch64 VARIANT=dev ROOTFS_EXT=ext4 \
+        //     STORE_PATH=/nix/store/abc123def456-mvm-mvm-dev-dev \
+        //     STAGING_DIR=$d VERSION=0.13.0 \
+        //     SOURCE_GIT_SHA=deadbeef0123456789 \
+        //     bash scripts/generate-image-manifest.sh
+        let json = r#"{
+          "schema_version": 1,
+          "version": "0.14.0",
+          "arch": "aarch64",
+          "variant": "dev",
+          "rootfs_format": "ext4",
+          "artifacts": [
+            {"name": "dev-vmlinux-aarch64",
+             "sha256": "b29be84bdecbb915f70659e08ba51472d05746b011b8acf965f49e94ff22d5b5"},
+            {"name": "dev-rootfs-aarch64.ext4",
+             "sha256": "a6a24f174bd25221b00bb2bb4888eb04e5ef3d20033c38188e44b902f23564bc"}
+          ],
+          "nix_store_hash": "abc123def456",
+          "source_git_sha": "deadbeef0123456789",
+          "flake_locks": {
+            "nix/flake.lock": "sha256:d235bed6112b0fff283680a0fd3a718437db27ce3782aa554f2912f042e4026a",
+            "nix/images/builder/flake.lock": "sha256:4c72ffe504f50c461b314ff86bf0394c15ffa04e457d07624c9280f04e152600"
+          },
+          "addressed_advisories": [],
+          "built_at": "2026-05-01T00:26:37Z",
+          "not_after":  "2026-07-30T00:26:37Z"
+        }"#;
+        let m = parse_manifest(json.as_bytes()).expect("release-pipeline JSON must parse");
+        assert_eq!(m.schema_version, SCHEMA_VERSION);
+        assert_eq!(m.version, "0.14.0");
+        assert_eq!(m.arch, "aarch64");
+        assert_eq!(m.variant, "dev");
+        assert_eq!(m.rootfs_format, "ext4");
+        assert_eq!(m.artifacts.len(), 2);
+        assert!(m.artifact("dev-vmlinux-aarch64").is_some());
+        assert_eq!(
+            m.artifact("dev-rootfs-aarch64.ext4").unwrap().sha256,
+            "a6a24f174bd25221b00bb2bb4888eb04e5ef3d20033c38188e44b902f23564bc"
+        );
+        assert_eq!(m.nix_store_hash, "abc123def456");
+        assert_eq!(m.flake_locks.len(), 2);
+        assert!(m.flake_locks.contains_key("nix/flake.lock"));
+        assert!(m.addressed_advisories.is_empty());
+    }
+
     #[test]
     fn manifest_roundtrips_via_json() {
         let m = sample_manifest();
