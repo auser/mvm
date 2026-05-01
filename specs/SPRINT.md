@@ -339,6 +339,86 @@ Cross-repo handoff for hosted MCP transport (HTTP/SSE) is documented
 in [`plans/33-hosted-mcp-transport.md`](plans/33-hosted-mcp-transport.md);
 implementation lives in mvmd, not this repo.
 
+## Sprint 44 — manifest-driven template DX (in flight)
+
+Master plan:
+[`plans/38-manifest-driven-template-dx.md`](plans/38-manifest-driven-template-dx.md).
+
+**Branch:** `feat/manifest-driven-template-dx` (worktree at
+`../mvm-manifest` per AGENTS.md "Worktree Workflow for Features").
+
+**Goal:** collapse the three-step `template init NAME → template create
+NAME → template build NAME` flow into a single manifest file
+(`mvm.toml` or `Mvmfile.toml`) discovered by path. Registry slot keys
+become `sha256(canonical_manifest_path)` instead of user-invented
+names. Drops `role` and `[network]` from the manifest (fleet/runtime
+concerns; mvmd's territory). Preserves `template init --prompt`
+(LLM-assisted scaffolding) and extends it to populate `mvm.toml`
+resource defaults.
+
+### Why this sprint
+
+`template create` does no build work — it just stashes CLI args as
+JSON. The flake is the actual source of truth; resource defaults +
+policy are bookkeeping the user has to retype. The user-invented
+`name` exists only as a registry path key and conflicts with the
+goal of co-located, version-controlled, mvmforge-emittable manifest
+files. Folding `create` into `build`, keying the registry by manifest
+path hash, and trimming the schema to build-inputs-plus-dev-sizing
+makes the DX one step (`template init && template build`) and gives
+mvmforge a clean shape to emit.
+
+### Cross-repo coordination tickets (file separately)
+
+- mvmforge `compile` learns to emit `mvm.toml`; stops emitting
+  `launch.json` as a peer artifact.
+- mvmforge `up` translates IR → `mvmctl up --cmd … --env …` flags.
+- Extract `mvmforge-ir` as a published crate consumable by mvm
+  (`dev-dependency`) and mvmd (`runtime-dependency`).
+
+### Follow-ups deferred to later sprints
+
+- Deprecate the existing `crates/mvm-runtime/src/vm/exec.rs`
+  `launch.json`-reading accommodations once mvmforge stops emitting
+  it. Cross-references the already-shipped follow-up
+  [#5](https://github.com/tinylabscom/mvm/issues/5).
+- Optional `[dev]` runtime-deps block on the manifest (e.g.
+  `before_start = [...]`). File only if user demand surfaces.
+- Reading defaults from a flake `passthru.mvm` attribute (extending
+  `mkGuest` + `nix eval --json` in `mvm-build`).
+- Bundle-level signing for pushed channels (cross-references
+  [`plans/36-sealed-signed-builder-image.md`](plans/36-sealed-signed-builder-image.md)).
+
+### ADR supersedences (noted inline in plan 38)
+
+- ADR-004 Decision 6 ("per-template default network policy")
+  superseded by user-global `~/.mvm/config.toml` + mvmd tenant
+  config.
+- The implicit "template name as registry key" decision superseded
+  by canonical-manifest-path-as-key.
+
+### Sprint 44 success criteria
+
+By sprint close, the project should be able to claim:
+
+1. *Manifest is the user-facing primitive.* `mvmctl template build`
+   discovers `mvm.toml` from cwd or `--mvm-config <path>`; no
+   positional name argument anywhere on the template surface.
+2. *Registry is keyed by manifest path hash.* Slot at
+   `~/.mvm/templates/<sha256(canonical_manifest_path)>/manifest.json`.
+3. *`template create` and `create-multi` are gone.* Removed with a
+   one-shot migration message pointing at `template init`.
+4. *`Mvmfile.toml` and `mvm.toml` use the same parser.* Existing
+   image-build flow on `mvmctl build` migrates to the new schema.
+5. *`template init --prompt` keeps working.* Heuristic + Ollama probe
+   + OpenAI fallback all preserved; planner extended to populate
+   `mvm.toml` resource defaults from inferred preset/features.
+6. *Migration path for existing `~/.mvm/templates/<name>/` slots.*
+   `template list --legacy` + `template prune --legacy` + one-time
+   banner.
+7. *Drift refusal.* `flake`/`profile` mismatches between manifest and
+   persisted slot record abort with `--force` escape.
+
 ## Completed Sprints
 
 - [01-foundation.md](sprints/01-foundation.md)
