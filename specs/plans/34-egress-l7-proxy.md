@@ -195,7 +195,7 @@ in §"Sequence" assumes they're folded.
   the host user can read it. Decision: bind the key to `mvmctl egress
   init-ca` only; mitmdump is handed *per-VM signed leaf certs* with
   X.509 `nameConstraints permitted` set to that VM's allowlist.
-  Documented as ADR-005-pending. Keeps the local-user-trusts-the-host
+  Documented as ADR-006 (PR #33). Keeps the local-user-trusts-the-host
   model (consistent with ADR-002 §"out of scope: malicious host")
   while eliminating the "any local malware exfils through the trusted
   CA" path.
@@ -309,13 +309,13 @@ in §"Sequence" assumes they're folded.
 | `crates/mvm-cli/src/commands/ops/cache.rs` | orphan-cleanup pass + macOS watchdog fallback |
 | `nix/lib/minimal-init/lib/04-etc-and-users.sh.in` | install per-VM leaf cert (mode 0400, service uid) at `/run/secrets/mvm-egress.crt` and host CA bundle at `/etc/ssl/certs/mvm-egress-ca.crt` |
 | `nix/images/examples/llm-agent/README.md` | recommend `--egress-mode l3-plus-l7` + 90-day rotation routine |
-| `specs/adrs/005-name-constrained-egress-ca.md` | new ADR — CA private-key handling + per-VM Name-Constrained leaf certs |
+| `specs/adrs/006-name-constrained-egress-ca.md` | new ADR (PR #33) — CA private-key handling + per-VM Name-Constrained leaf certs |
 
 ## Sequence
 
 Roughly 1.5 sprints once the considerations are folded:
 
-- Day 1: ADR-005 (Name-Constrained CA design) — locks the
+- Day 1: ADR-006 (Name-Constrained CA design — PR #33) — locks the
   cryptographic story before code starts.
 - Day 2-3: port allocator (bind-then-commit) + mitmdump supervisor +
   filter-script generation + PDEATHSIG/watchdog. Unit tests for the
