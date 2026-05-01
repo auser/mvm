@@ -928,6 +928,25 @@ fn prune_old_prebuilts(prebuilt_root: &str, current_version: &str) {
 ///     the manifest body but still parse and use it. Only for
 ///     emergency Sigstore-side rotation; SHA-256 still applies.
 fn download_dev_image(kernel_path: &str, rootfs_path: &str) -> Result<(String, String)> {
+    // Wrap the verification pipeline so every exit path — success or
+    // failure — emits the verify_duration gauge and bumps the
+    // appropriate outcome counter. Plan 36 §Layer 4 step 11.
+    let verify_start = std::time::Instant::now();
+    let result = download_dev_image_inner(kernel_path, rootfs_path);
+    let elapsed_ms = verify_start.elapsed().as_millis() as u64;
+    let metrics = mvm_core::observability::metrics::global();
+    metrics
+        .dev_image_verify_duration_ms
+        .store(elapsed_ms, std::sync::atomic::Ordering::Relaxed);
+    if result.is_ok() {
+        metrics
+            .dev_image_verify_ok
+            .fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+    result
+}
+
+fn download_dev_image_inner(kernel_path: &str, rootfs_path: &str) -> Result<(String, String)> {
     let version = env!("CARGO_PKG_VERSION");
     let base_url = format!("https://github.com/auser/mvm/releases/download/v{version}");
     // Detect host arch to download the right image.
@@ -975,8 +994,10 @@ fn download_dev_image(kernel_path: &str, rootfs_path: &str) -> Result<(String, S
     };
 
     ui::info("  Fetching kernel...");
-    download_file(&kernel_url, kernel_path)
-        .with_context(|| format!("Failed to download kernel from {kernel_url}"))?;
+    download_file(&kernel_url, kernel_path).map_err(|e| {
+        bump_verify_outcome("network");
+        e.context(format!("Failed to download kernel from {kernel_url}"))
+    })?;
     verify_artifact_hash(
         kernel_path,
         &kernel_name,
@@ -984,8 +1005,10 @@ fn download_dev_image(kernel_path: &str, rootfs_path: &str) -> Result<(String, S
     )?;
 
     ui::info("  Fetching rootfs...");
-    download_file(&rootfs_url, rootfs_path)
-        .with_context(|| format!("Failed to download rootfs from {rootfs_url}"))?;
+    download_file(&rootfs_url, rootfs_path).map_err(|e| {
+        bump_verify_outcome("network");
+        e.context(format!("Failed to download rootfs from {rootfs_url}"))
+    })?;
     verify_artifact_hash(
         rootfs_path,
         &rootfs_name,
@@ -1031,14 +1054,19 @@ fn try_fetch_signed_manifest(
     let manifest_path = manifest_tmp.path().to_string_lossy().into_owned();
     let bundle_path = bundle_tmp.path().to_string_lossy().into_owned();
 
-    download_file(&manifest_url, &manifest_path)
-        .with_context(|| format!("Failed to download signed manifest from {manifest_url}"))?;
-    download_file(&bundle_url, &bundle_path).with_context(|| {
-        format!(
+    download_file(&manifest_url, &manifest_path).map_err(|e| {
+        bump_verify_outcome("network");
+        e.context(format!(
+            "Failed to download signed manifest from {manifest_url}"
+        ))
+    })?;
+    download_file(&bundle_url, &bundle_path).map_err(|e| {
+        bump_verify_outcome("network");
+        e.context(format!(
             "Failed to download cosign bundle from {bundle_url}. Plan 36 \
              requires a manifest's signature to be present alongside the \
              manifest body — refusing to trust an unsigned manifest."
-        )
+        ))
     })?;
 
     let manifest_bytes =
@@ -1066,6 +1094,7 @@ fn try_fetch_signed_manifest(
             expected_issuer,
         )
         .map_err(|e| {
+            bump_verify_outcome("sig_invalid");
             anyhow::anyhow!(
                 "Cosign verification failed for {manifest_name}: {e}\n\
                  \n\
@@ -1085,13 +1114,16 @@ fn try_fetch_signed_manifest(
     // Pin the manifest's claimed version to mvmctl's own version. A
     // mismatch means someone is feeding us a different release's
     // manifest — refuse.
-    image_verify::check_version_pin(&manifest, version)
-        .map_err(|e| anyhow::anyhow!("manifest version pin failed: {e}"))?;
+    image_verify::check_version_pin(&manifest, version).map_err(|e| {
+        bump_verify_outcome("version_skew");
+        anyhow::anyhow!("manifest version pin failed: {e}")
+    })?;
 
     // Enforce max-age (default 90d). mvmctl warns and proceeds; mvmd
     // refuses (different risk tolerance — handled in mvmd plan 23).
     let now = chrono::Utc::now();
     if let Err(e) = image_verify::check_not_after(&manifest, now) {
+        bump_verify_outcome("expired");
         ui::warn(&format!(
             "Dev image manifest is past its max-age ({e}). Consider upgrading \
              mvmctl — older signed images are still cryptographically valid but \
@@ -1105,6 +1137,7 @@ fn try_fetch_signed_manifest(
     // primary mechanism for "we know this build is bad."
     if let Some(revocations) = try_fetch_revocation_list()? {
         image_verify::check_revocation(&manifest, &revocations).map_err(|e| {
+            bump_verify_outcome("revoked");
             anyhow::anyhow!(
                 "Dev image manifest is on the project's revocation list: {e}\n\
                  \n\
@@ -1262,6 +1295,31 @@ fn try_fetch_revocation_list() -> Result<Option<mvm_security::image_verify::Revo
     Ok(Some(list))
 }
 
+/// Bump the dev_image_verify_<outcome> counter. Plan 36 §Layer 4 step 11.
+///
+/// Caller passes the outcome name; centralising the lookup keeps the
+/// counter set discoverable in one place. mvmd plan 23's
+/// reconciliation loop will alert on attack-shaped spikes
+/// (sig_invalid, digest_mismatch, revoked).
+fn bump_verify_outcome(outcome: &str) {
+    let m = mvm_core::observability::metrics::global();
+    let counter = match outcome {
+        "sig_invalid" => &m.dev_image_verify_sig_invalid,
+        "digest_mismatch" => &m.dev_image_verify_digest_mismatch,
+        "version_skew" => &m.dev_image_verify_version_skew,
+        "revoked" => &m.dev_image_verify_revoked,
+        "expired" => &m.dev_image_verify_expired,
+        "network" => &m.dev_image_verify_network,
+        // Defensive: an unknown outcome is itself a bug worth surfacing
+        // — log a warning rather than silently swallowing the metric.
+        _ => {
+            tracing::warn!("bump_verify_outcome: unknown outcome '{outcome}'");
+            return;
+        }
+    };
+    counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
 /// HEAD-probe a URL. Returns Ok(true) when the resource is reachable
 /// (HTTP 2xx), Ok(false) on 404, Err for transient failures.
 fn url_exists(url: &str) -> Result<bool> {
@@ -1371,6 +1429,7 @@ fn verify_artifact_hash(path: &str, name: &str, expected: Option<&String>) -> Re
 
     if actual != *expected {
         let _ = std::fs::remove_file(path);
+        bump_verify_outcome("digest_mismatch");
         anyhow::bail!(
             "Integrity check failed for {name}.\n\
              expected sha256: {expected}\n\
