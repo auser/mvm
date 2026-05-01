@@ -2,7 +2,11 @@
 
 ## Lima VM Requirement
 
-All Nix builds, Firecracker operations, `mvmctl` commands, test execution, clippy checks, and Linux-specific commands MUST be run inside the Lima VM. Use `limactl shell mvm-builder -- <command>` to execute commands inside the VM. The Lima VM name is `mvm-builder` (renamed from `mvm` in W7.2).
+All Nix builds, Firecracker operations, `mvmctl` runtime commands (anything that boots, talks to, or manages microVMs), and Linux-specific syscalls MUST be run inside the Lima VM. Use `limactl shell mvm-builder -- <command>` to execute commands inside the VM. The Lima VM name is `mvm-builder` (renamed from `mvm` in W7.2).
+
+**Run cargo on the macOS host wherever it compiles cleanly.** `cargo test`, `cargo check`, and `cargo build` should default to the host so worktrees don't deadlock on the single shared Lima VM (cargo target-dir contention, registry locks, and `.git/index` cross-mount races are real and have caused us to lose work). Tests that genuinely need Linux — vsock, jailer/seccomp, dm-verity, network namespaces, anything that pokes at `/dev/kvm` or `/proc/net` — should be gated with `#[cfg(target_os = "linux")]` and only those sub-targets are run inside Lima. Workspace-wide `cargo clippy --workspace --all-targets -- -D warnings` is still expected to pass inside Lima before merge, since clippy needs to see the Linux-gated code paths.
+
+**git always runs on the macOS host, never inside Lima.** The repo is shared with the Lima VM via 9p/virtiofs and the two sides do not share git's lock semantics — running `git` from inside Lima while another worktree is also doing git work on the host produces "unable to write new index file" deadlocks. Only cargo/nix/firecracker/mvmctl operations cross into the VM.
 
 If the Lima VM is not running, boot it with:
 
@@ -28,7 +32,7 @@ Examples:
 - `limactl shell mvm-builder -- cargo clippy --workspace -- -D warnings`
 - `limactl shell mvm-builder -- cargo check --workspace`
 
-**Important:** `mvmctl` (via `cargo run`) commands like `template build`, `run`, `stop`, `logs`, and `status` must be run inside the Lima VM — they talk to Firecracker which only runs inside Linux. `cargo test`, `cargo clippy`, and `cargo check` must also run inside the Lima VM to ensure correct Linux-target compilation and test execution. The `cargo run -- dev` bootstrap command is the only one that runs on the macOS host directly.
+**Important:** `mvmctl` (via `cargo run`) commands like `template build`, `run`, `stop`, `logs`, and `status` must be run inside the Lima VM — they talk to Firecracker which only runs inside Linux. `cargo test` / `cargo check` / `cargo build` should run on the macOS host by default (see "Run cargo on the macOS host" above); only `cargo clippy --workspace --all-targets` and tests gated on `target_os = "linux"` need Lima. `cargo run -- dev` always runs on the macOS host directly.
 
 ## Worktree Workflow for Features
 
