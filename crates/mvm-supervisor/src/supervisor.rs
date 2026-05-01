@@ -13,10 +13,11 @@
 //! The supervisor is sync today but the slot trait methods are async
 //! (real impls drive HTTP / vsock); `launch` and `stop` are async.
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
+use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
-use mvm_plan::{PlanId, SignedExecutionPlan};
+use mvm_plan::{NonceStore, PlanId, PlanValidityError, SignedExecutionPlan, check_window};
 use thiserror::Error;
 use tracing::warn;
 
@@ -28,10 +29,32 @@ use crate::keystore::{KeystoreReleaser, NoopKeystoreReleaser};
 use crate::state::{PlanState, PlanStateMachine, StateTransitionError};
 use crate::tool_gate::{NoopToolGate, ToolGate};
 
+/// Clock abstraction. The supervisor reads the wall clock through
+/// this trait so tests can drive time deterministically; production
+/// uses [`SystemClock`]. Plan 37 Addendum G4 enforcement.
+pub trait Clock: Send + Sync {
+    fn now(&self) -> DateTime<Utc>;
+}
+
+/// Production clock — `chrono::Utc::now()`.
+pub struct SystemClock;
+
+impl Clock for SystemClock {
+    fn now(&self) -> DateTime<Utc> {
+        Utc::now()
+    }
+}
+
 #[derive(Debug, Error)]
 pub enum SupervisorError {
     #[error("plan signature/parse failed: {0}")]
     PlanVerify(String),
+
+    /// Plan 37 Addendum G4: the plan's validity window doesn't cover
+    /// `now`, or its nonce was already seen for the signer that
+    /// authored it.
+    #[error("plan validity check failed: {0}")]
+    Validity(#[from] PlanValidityError),
 
     #[error("plan state transition failed: {0}")]
     State(#[from] StateTransitionError),
@@ -63,6 +86,15 @@ pub struct Supervisor {
     pub artifact: Arc<dyn ArtifactCollector>,
     pub backend: Arc<dyn BackendLauncher>,
     pub state: PlanStateMachine,
+    /// Clock used for plan-validity-window checks. Defaults to
+    /// `SystemClock`; tests inject a fixed clock.
+    pub clock: Arc<dyn Clock>,
+    /// Per-signer nonce ledger for replay protection. Plan 37
+    /// Addendum G4. Held behind a `Mutex` because `launch` takes
+    /// `&mut self` but the store may eventually be shared across
+    /// concurrent admission paths. `std::sync::Mutex` is sufficient:
+    /// no `await` inside the locked region.
+    pub nonce_store: Arc<Mutex<NonceStore>>,
 }
 
 impl Default for Supervisor {
@@ -79,6 +111,8 @@ impl Default for Supervisor {
             artifact: Arc::new(NoopArtifactCollector),
             backend: Arc::new(NoopBackendLauncher),
             state: PlanStateMachine::new(),
+            clock: Arc::new(SystemClock),
+            nonce_store: Arc::new(Mutex::new(NonceStore::new())),
         }
     }
 }
@@ -113,7 +147,10 @@ impl Supervisor {
         signed: &SignedExecutionPlan,
         trusted_keys: &[(&str, &VerifyingKey)],
     ) -> Result<(), SupervisorError> {
-        // Step 1: signature + schema + version pin.
+        // Step 1: signature + schema + version pin. Done first
+        // because nothing in the payload is trusted until the
+        // signature checks out; the validity-window field below
+        // is part of that payload.
         let plan = match mvm_plan::verify_plan(signed, trusted_keys) {
             Ok(p) => p,
             Err(e) => {
@@ -122,6 +159,32 @@ impl Supervisor {
                 return Err(err);
             }
         };
+
+        // Step 1.5 (Plan 37 Addendum G4): time-window + nonce-replay
+        // check. Without this, a captured signed plan is replayable
+        // indefinitely. Both checks must pass before the backend is
+        // asked to do any work, so a replayed plan never reaches the
+        // resource-allocating path.
+        if let Err(e) = check_window(&plan, self.clock.now()) {
+            self.transition_or_warn(PlanState::Failed);
+            return Err(SupervisorError::from(e));
+        }
+        // The signer_id is taken from the envelope after a successful
+        // signature check above, which means it matches the trusted
+        // key that validated this plan. Replay protection is
+        // per-signer keyspace.
+        let signer_id = signed.0.signer_id.clone();
+        {
+            let mut store = self
+                .nonce_store
+                .lock()
+                .expect("nonce store mutex poisoned");
+            if let Err(e) = store.check_and_insert(&signer_id, &plan) {
+                drop(store);
+                self.transition_or_warn(PlanState::Failed);
+                return Err(SupervisorError::from(e));
+            }
+        }
 
         // Step 2: Pending → Verified.
         self.state.transition(PlanState::Verified).map_err(|e| {
@@ -300,9 +363,32 @@ mod tests {
         (signed, sk, vk)
     }
 
+    /// Test clock — returns a fixed `DateTime<Utc>`. Lets the
+    /// validity-window tests run deterministically regardless of
+    /// wall-clock time.
+    struct FixedClock(DateTime<Utc>);
+
+    impl Clock for FixedClock {
+        fn now(&self) -> DateTime<Utc> {
+            self.0
+        }
+    }
+
+    /// Wall clock fixed at 2026-05-01 00:30:00 UTC, which is inside
+    /// the [`sample_plan`] validity window
+    /// (2026-05-01 00:00:00 .. 2026-05-01 01:00:00).
+    fn fixed_clock_inside_window() -> Arc<dyn Clock> {
+        Arc::new(FixedClock(
+            Utc.with_ymd_and_hms(2026, 5, 1, 0, 30, 0).unwrap(),
+        ))
+    }
+
     fn make_supervisor_with_backend(b: Arc<MockBackend>) -> Supervisor {
         let mut s = Supervisor::new();
         s.backend = b;
+        // Default to a clock inside the sample plan's window so
+        // happy-path tests don't depend on the wall clock.
+        s.clock = fixed_clock_inside_window();
         s
     }
 
@@ -394,6 +480,10 @@ mod tests {
         let (signed, _sk, vk) = sign_sample(&plan);
         let mut s = Supervisor::new();
         // No backend swap — Default's NoopBackendLauncher fails closed.
+        // Pin the clock inside the plan window so validity passes and
+        // the test exercises the backend-fails-closed path it's
+        // supposed to.
+        s.clock = fixed_clock_inside_window();
 
         let result = s.launch(&signed, &[("test", &vk)]).await;
         assert!(matches!(result, Err(SupervisorError::Backend(_))));
@@ -404,5 +494,133 @@ mod tests {
     fn default_supervisor_starts_in_pending() {
         let s = Supervisor::default();
         assert_eq!(s.state.current(), PlanState::Pending);
+    }
+
+    // ----- Plan 37 Addendum G4 enforcement -----
+
+    #[tokio::test]
+    async fn launch_rejects_expired_plan() {
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let mut s = make_supervisor_with_backend(backend.clone());
+        // Clock past valid_until.
+        s.clock = Arc::new(FixedClock(
+            Utc.with_ymd_and_hms(2026, 5, 1, 2, 0, 0).unwrap(),
+        ));
+
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+        assert!(matches!(result, Err(SupervisorError::Validity(_))));
+        assert!(matches!(
+            result,
+            Err(SupervisorError::Validity(PlanValidityError::Expired { .. }))
+        ));
+        assert_eq!(s.state.current(), PlanState::Failed);
+        // Backend never called — replayed/expired plan never
+        // reaches the resource-allocating path.
+        assert!(backend.launches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_rejects_not_yet_valid_plan() {
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let mut s = make_supervisor_with_backend(backend.clone());
+        // Clock before valid_from.
+        s.clock = Arc::new(FixedClock(
+            Utc.with_ymd_and_hms(2026, 4, 30, 23, 0, 0).unwrap(),
+        ));
+
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+        assert!(matches!(
+            result,
+            Err(SupervisorError::Validity(PlanValidityError::NotYetValid {
+                ..
+            }))
+        ));
+        assert_eq!(s.state.current(), PlanState::Failed);
+        assert!(backend.launches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn launch_rejects_replayed_nonce() {
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let mut s = make_supervisor_with_backend(backend.clone());
+
+        // First launch succeeds.
+        s.launch(&signed, &[("test", &vk)]).await.unwrap();
+        assert_eq!(s.state.current(), PlanState::Running);
+
+        // Second launch of the *same* signed plan must be refused
+        // as a replay. Even though the state machine is now in
+        // Running rather than Pending, the nonce check fires
+        // before any state transition, so the right error surfaces.
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+        assert!(matches!(
+            result,
+            Err(SupervisorError::Validity(PlanValidityError::NonceReplay {
+                ..
+            }))
+        ));
+        // Backend was called exactly once (the original launch).
+        assert_eq!(backend.launches(), vec![plan.plan_id.clone()]);
+    }
+
+    #[tokio::test]
+    async fn validity_check_runs_after_signature_check() {
+        // Tampered signatures are reported as PlanVerify, not
+        // Validity, even when the validity window would also fail.
+        // This pins the order: signature → window → nonce, so a
+        // forged plan never gets its window/nonce examined.
+        let mut plan = sample_plan();
+        plan.valid_until = Utc.with_ymd_and_hms(2020, 1, 1, 0, 0, 0).unwrap(); // very expired
+        plan.valid_from = Utc.with_ymd_and_hms(2019, 1, 1, 0, 0, 0).unwrap();
+        let (mut signed, _sk, vk) = sign_sample(&plan);
+        signed.0.payload[0] ^= 0x01; // tamper
+        let backend = Arc::new(MockBackend::new());
+        let mut s = make_supervisor_with_backend(backend.clone());
+
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+        // Signature check fires first.
+        assert!(matches!(result, Err(SupervisorError::PlanVerify(_))));
+        assert_eq!(s.state.current(), PlanState::Failed);
+    }
+
+    #[tokio::test]
+    async fn nonce_replay_protection_is_per_signer() {
+        // Same plan signed by two different keys with two different
+        // signer ids: both launches should succeed because the nonce
+        // ledger keys on signer_id, not just nonce.
+        let plan = sample_plan();
+
+        let sk_a = SigningKey::generate(&mut OsRng);
+        let vk_a = sk_a.verifying_key();
+        let signed_a = sign_plan(&plan, &sk_a, "alice");
+
+        let sk_b = SigningKey::generate(&mut OsRng);
+        let vk_b = sk_b.verifying_key();
+        let signed_b = sign_plan(&plan, &sk_b, "bob");
+
+        let backend = Arc::new(MockBackend::new());
+        let mut s = make_supervisor_with_backend(backend.clone());
+
+        s.launch(&signed_a, &[("alice", &vk_a), ("bob", &vk_b)])
+            .await
+            .unwrap();
+
+        // Reset state to Pending so the state machine doesn't
+        // reject the second launch on its own. We're testing
+        // nonce-store semantics, not the state machine, so a
+        // fresh supervisor is the cleaner harness.
+        let mut s2 = make_supervisor_with_backend(backend.clone());
+        s2.nonce_store = s.nonce_store.clone();
+        s2.launch(&signed_b, &[("alice", &vk_a), ("bob", &vk_b)])
+            .await
+            .unwrap();
+
+        assert_eq!(backend.launches().len(), 2);
     }
 }
