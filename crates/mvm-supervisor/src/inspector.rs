@@ -29,16 +29,21 @@ use std::fmt;
 use async_trait::async_trait;
 
 /// Mutable inspection context threaded through the chain. Wave 2.1
-/// carries only the bare-minimum fields (host + port + path) that
-/// `DestinationPolicy` needs. Later waves extend with `headers`,
-/// `body_chunks`, `payload_classification`, etc. — the chain
-/// continues to short-circuit on the first deny regardless of what
-/// fields are populated.
+/// carries host/port/path; Wave 2.2 adds `body` so `SecretsScanner`
+/// can scan outbound payloads. Later waves extend with `headers`,
+/// `payload_classification`, etc. — the chain continues to
+/// short-circuit on the first deny regardless of what fields are
+/// populated. `body` is `Vec<u8>` (not `&[u8]`) so `Transform`
+/// inspectors (e.g., PiiRedactor in 2.5) can mutate it in place.
 #[derive(Debug, Clone)]
 pub struct RequestCtx {
     pub host: String,
     pub port: u16,
     pub path: String,
+    /// Outbound body bytes. Empty for GET/HEAD/DELETE; populated for
+    /// methods that carry payloads. Bytes (not `String`) because
+    /// bodies may be binary (protobuf, multipart, etc.).
+    pub body: Vec<u8>,
 }
 
 impl RequestCtx {
@@ -47,7 +52,15 @@ impl RequestCtx {
             host: host.into(),
             port,
             path: path.into(),
+            body: Vec::new(),
         }
+    }
+
+    /// Builder-style: attach a body to a context. Useful in tests and
+    /// at the proxy callsite when the body is read upfront.
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = body.into();
+        self
     }
 }
 
