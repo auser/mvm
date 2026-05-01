@@ -151,6 +151,13 @@ impl Supervisor {
         // because nothing in the payload is trusted until the
         // signature checks out; the validity-window field below
         // is part of that payload.
+        //
+        // No audit emit on signature failure: we have no parsed
+        // plan to bind to (`AuditEntry` is keyed on plan_id, which
+        // we do not know without trusting the payload). Wave 2 may
+        // add a separate `EnvelopeRejected` audit type that carries
+        // only the envelope's signer_id and a rejection reason; for
+        // now this path is logged via `tracing` only.
         let plan = match mvm_plan::verify_plan(signed, trusted_keys) {
             Ok(p) => p,
             Err(e) => {
@@ -166,24 +173,43 @@ impl Supervisor {
         // asked to do any work, so a replayed plan never reaches the
         // resource-allocating path.
         if let Err(e) = check_window(&plan, self.clock.now()) {
-            self.transition_or_warn(PlanState::Failed);
+            self.emit_audit_then_fail(&plan, "plan.rejected.validity_window", &e.to_string())
+                .await?;
             return Err(SupervisorError::from(e));
         }
         // The signer_id is taken from the envelope after a successful
         // signature check above, which means it matches the trusted
         // key that validated this plan. Replay protection is
         // per-signer keyspace.
+        //
+        // The nonce check is performed in a tight block so the
+        // `MutexGuard` is released before any subsequent `.await`
+        // (clippy::await_holding_lock).
         let signer_id = signed.0.signer_id.clone();
-        {
+        let nonce_check = {
             let mut store = self
                 .nonce_store
                 .lock()
                 .expect("nonce store mutex poisoned");
-            if let Err(e) = store.check_and_insert(&signer_id, &plan) {
-                drop(store);
-                self.transition_or_warn(PlanState::Failed);
-                return Err(SupervisorError::from(e));
-            }
+            store.check_and_insert(&signer_id, &plan)
+        };
+        if let Err(e) = nonce_check {
+            self.emit_audit_then_fail(&plan, "plan.rejected.nonce_replay", &e.to_string())
+                .await?;
+            return Err(SupervisorError::from(e));
+        }
+
+        // Plan is fully admitted at this point — signature, window,
+        // and nonce all check out. Emit the success audit before any
+        // resource-allocating work so the trail is preserved even
+        // if the backend fails next. Audit failure here fails the
+        // launch fail-closed (§22 / B17: audit emits before forward).
+        if let Err(e) = self
+            .emit_admission_audit(&plan, "plan.admitted", "")
+            .await
+        {
+            self.transition_or_warn(PlanState::Failed);
+            return Err(e);
         }
 
         // Step 2: Pending → Verified.
@@ -194,7 +220,8 @@ impl Supervisor {
 
         // Step 3: backend dispatch.
         if let Err(e) = self.backend.launch(&plan).await {
-            self.transition_or_warn(PlanState::Failed);
+            self.emit_audit_then_fail(&plan, "plan.rejected.backend", &e.to_string())
+                .await?;
             return Err(SupervisorError::from(e));
         }
 
@@ -211,7 +238,63 @@ impl Supervisor {
             SupervisorError::from(e)
         })?;
 
+        if let Err(e) = self.emit_admission_audit(&plan, "plan.running", "").await {
+            self.transition_or_warn(PlanState::Failed);
+            return Err(e);
+        }
+
         Ok(())
+    }
+
+    /// Emit a rejection audit entry and then transition the state
+    /// machine to `Failed`. If the audit emit itself fails, the
+    /// state still transitions before we return the audit error —
+    /// any rejection path must end in `Failed` regardless of audit
+    /// outcome, otherwise a stuck supervisor wedges in `Pending`.
+    async fn emit_audit_then_fail(
+        &mut self,
+        plan: &mvm_plan::ExecutionPlan,
+        event: &str,
+        reason: &str,
+    ) -> Result<(), SupervisorError> {
+        let audit_result = self.emit_admission_audit(plan, event, reason).await;
+        self.transition_or_warn(PlanState::Failed);
+        audit_result
+    }
+
+    /// Emit one admission-audit entry for `plan` with the given
+    /// event name and an optional reason string in `extras["reason"]`.
+    /// Plan 37 Addendum B19. Every state-changing decision the
+    /// supervisor makes about a plan should produce an audit entry —
+    /// no unaudited control-plane mutation (whitepaper §6 invariant).
+    ///
+    /// Non-fatal NotWired handling: if the supervisor's audit slot is
+    /// `NoopAuditSigner` (the fail-closed default), we log a tracing
+    /// warning and continue. The launch itself is gated on a real
+    /// AuditSigner being wired *in production*; tests use
+    /// `CapturingAuditSigner`. Any other audit error (Io, etc.)
+    /// propagates as `SupervisorError::Audit` and fails the launch
+    /// per the §22 / B17 invariant "audit emits before forward".
+    async fn emit_admission_audit(
+        &self,
+        plan: &mvm_plan::ExecutionPlan,
+        event: &str,
+        reason: &str,
+    ) -> Result<(), SupervisorError> {
+        let extras = if reason.is_empty() {
+            vec![]
+        } else {
+            vec![("reason".to_string(), reason.to_string())]
+        };
+        let entry = crate::audit::AuditEntry::for_plan(plan, None, event, extras);
+        match self.audit.sign_and_emit(&entry).await {
+            Ok(()) => Ok(()),
+            Err(crate::audit::AuditError::NotWired) => {
+                warn!(event, "audit signer not wired (Noop) — admission audit dropped");
+                Ok(())
+            }
+            Err(e) => Err(SupervisorError::Audit(e.to_string())),
+        }
     }
 
     /// Drive a workload's teardown lifecycle: Running → Stopping →
@@ -389,7 +472,24 @@ mod tests {
         // Default to a clock inside the sample plan's window so
         // happy-path tests don't depend on the wall clock.
         s.clock = fixed_clock_inside_window();
+        // Capture audit entries by default so tests can assert
+        // admission audit (B19) without each test re-wiring the slot.
+        s.audit = Arc::new(crate::audit::CapturingAuditSigner::new());
         s
+    }
+
+    /// Like `make_supervisor_with_backend` but exposes the
+    /// `CapturingAuditSigner` so the test can read back the entries
+    /// the supervisor emitted.
+    fn make_supervisor_with_audit(
+        b: Arc<MockBackend>,
+    ) -> (Supervisor, Arc<crate::audit::CapturingAuditSigner>) {
+        let audit = Arc::new(crate::audit::CapturingAuditSigner::new());
+        let mut s = Supervisor::new();
+        s.backend = b;
+        s.clock = fixed_clock_inside_window();
+        s.audit = audit.clone();
+        (s, audit)
     }
 
     #[tokio::test]
@@ -622,5 +722,160 @@ mod tests {
             .unwrap();
 
         assert_eq!(backend.launches().len(), 2);
+    }
+
+    // ----- Plan 37 Addendum B19 — admission audit -----
+
+    /// Convenience: collect just the `event` strings from captured
+    /// audit entries, in emit order. Test assertions are clearer
+    /// against this projection than against the full struct.
+    fn audit_events(audit: &crate::audit::CapturingAuditSigner) -> Vec<String> {
+        audit.entries().into_iter().map(|e| e.event).collect()
+    }
+
+    #[tokio::test]
+    async fn admitted_plan_emits_admitted_then_running() {
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let (mut s, audit) = make_supervisor_with_audit(backend.clone());
+
+        s.launch(&signed, &[("test", &vk)]).await.unwrap();
+
+        assert_eq!(audit_events(&audit), vec!["plan.admitted", "plan.running"]);
+        // Each entry is bound to the plan id and image — §22 binding.
+        for entry in audit.entries() {
+            assert_eq!(entry.plan_id, plan.plan_id);
+            assert_eq!(entry.plan_version, plan.plan_version);
+            assert_eq!(entry.image_name, plan.image.name);
+        }
+    }
+
+    #[tokio::test]
+    async fn expired_plan_emits_validity_window_audit() {
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let (mut s, audit) = make_supervisor_with_audit(backend.clone());
+        s.clock = Arc::new(FixedClock(
+            Utc.with_ymd_and_hms(2026, 5, 1, 2, 0, 0).unwrap(),
+        ));
+
+        let _ = s.launch(&signed, &[("test", &vk)]).await;
+
+        assert_eq!(audit_events(&audit), vec!["plan.rejected.validity_window"]);
+        let entry = &audit.entries()[0];
+        assert!(
+            entry.labels.get("reason").unwrap().contains("expired"),
+            "labels: {:?}",
+            entry.labels
+        );
+    }
+
+    #[tokio::test]
+    async fn replayed_plan_emits_nonce_replay_audit_on_second_attempt() {
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let (mut s, audit) = make_supervisor_with_audit(backend.clone());
+
+        s.launch(&signed, &[("test", &vk)]).await.unwrap();
+        let _ = s.launch(&signed, &[("test", &vk)]).await;
+
+        // First launch: admitted + running. Second: nonce_replay.
+        assert_eq!(
+            audit_events(&audit),
+            vec![
+                "plan.admitted",
+                "plan.running",
+                "plan.rejected.nonce_replay",
+            ]
+        );
+    }
+
+    #[tokio::test]
+    async fn backend_failure_emits_backend_rejection_audit() {
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let mut backend = MockBackend::new();
+        backend.launch_should_fail = true;
+        let backend = Arc::new(backend);
+        let (mut s, audit) = make_supervisor_with_audit(backend.clone());
+
+        let _ = s.launch(&signed, &[("test", &vk)]).await;
+
+        // Admitted fires first (signature + window + nonce all
+        // passed); then the backend rejection.
+        assert_eq!(
+            audit_events(&audit),
+            vec!["plan.admitted", "plan.rejected.backend"]
+        );
+    }
+
+    #[tokio::test]
+    async fn signature_failure_emits_no_audit() {
+        // Signature failures arrive before the plan is parsed, so
+        // there's no plan_id to bind an audit entry to. Documented
+        // behaviour: no admission audit on this path; tracing logs
+        // the rejection. Wave 2 may add an envelope-rejection audit
+        // type that carries only the signer_id.
+        let plan = sample_plan();
+        let (mut signed, _sk, vk) = sign_sample(&plan);
+        signed.0.payload[0] ^= 0x01;
+        let backend = Arc::new(MockBackend::new());
+        let (mut s, audit) = make_supervisor_with_audit(backend.clone());
+
+        let _ = s.launch(&signed, &[("test", &vk)]).await;
+
+        assert_eq!(audit_events(&audit), Vec::<String>::new());
+    }
+
+    #[tokio::test]
+    async fn admission_audit_inherits_plan_audit_labels() {
+        // The plan's `audit_labels` should be copied into every
+        // admission audit entry verbatim (§22 — the "what was the
+        // contract" record).
+        let mut plan = sample_plan();
+        plan.audit_labels.insert("workflow".to_string(), "etl-9".to_string());
+        plan.audit_labels.insert("env".to_string(), "prod".to_string());
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let (mut s, audit) = make_supervisor_with_audit(backend.clone());
+
+        s.launch(&signed, &[("test", &vk)]).await.unwrap();
+
+        for entry in audit.entries() {
+            assert_eq!(entry.labels.get("workflow"), Some(&"etl-9".to_string()));
+            assert_eq!(entry.labels.get("env"), Some(&"prod".to_string()));
+        }
+    }
+
+    #[tokio::test]
+    async fn audit_signer_io_failure_fails_the_launch() {
+        // A real audit signer reporting an Io error fails the
+        // launch — §22 / B17 invariant: audit emits before forward.
+        // No audit means no launch.
+        struct FailingAudit;
+        #[async_trait]
+        impl crate::audit::AuditSigner for FailingAudit {
+            async fn sign_and_emit(
+                &self,
+                _entry: &crate::audit::AuditEntry,
+            ) -> Result<(), crate::audit::AuditError> {
+                Err(crate::audit::AuditError::Io("disk full".into()))
+            }
+        }
+
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let mut s = make_supervisor_with_backend(backend.clone());
+        s.audit = Arc::new(FailingAudit);
+
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+        assert!(matches!(result, Err(SupervisorError::Audit(_))));
+        assert_eq!(s.state.current(), PlanState::Failed);
+        // Backend was never called — admission failed.
+        assert!(backend.launches().is_empty());
     }
 }
