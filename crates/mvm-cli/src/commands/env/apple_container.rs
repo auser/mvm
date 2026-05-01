@@ -902,6 +902,31 @@ fn prune_old_prebuilts(prebuilt_root: &str, current_version: &str) {
 }
 
 /// Download a pre-built dev image (kernel + rootfs) from GitHub releases.
+///
+/// Plan 36 / ADR 005 trust chain:
+///
+/// 1. Try the cosign-keyless-signed manifest first
+///    (`dev-image-{arch}.manifest.json` + `.bundle`). If present,
+///    `mvm-security::image_verify::verify_manifest` validates the
+///    Sigstore bundle against the project's release-workflow OIDC
+///    identity, parses the manifest, and we use *its* artifact
+///    digests as the source of truth.
+///
+/// 2. If the manifest is 404 (older release predating plan 36) or
+///    its companion bundle is missing, fall back to the W5.1
+///    unsigned-checksum path with a loud deprecation warning. This
+///    keeps mvmctl pointing at older releases working through the
+///    rollout, and the deprecation banner sets the stage for making
+///    the manifest mandatory in a future major version.
+///
+/// 3. Either way, every downloaded artifact gets streaming SHA-256
+///    verification (W5.1) against the expected digest.
+///
+/// Escape hatches (both print loud warnings):
+///   - `MVM_SKIP_HASH_VERIFY=1` — skip SHA-256 step (existing W5.1).
+///   - `MVM_SKIP_COSIGN_VERIFY=1` — skip cosign signature check on
+///     the manifest body but still parse and use it. Only for
+///     emergency Sigstore-side rotation; SHA-256 still applies.
 fn download_dev_image(kernel_path: &str, rootfs_path: &str) -> Result<(String, String)> {
     let version = env!("CARGO_PKG_VERSION");
     let base_url = format!("https://github.com/auser/mvm/releases/download/v{version}");
@@ -915,14 +940,39 @@ fn download_dev_image(kernel_path: &str, rootfs_path: &str) -> Result<(String, S
     };
     let kernel_name = format!("dev-vmlinux-{arch}");
     let rootfs_name = format!("dev-rootfs-{arch}.ext4");
-    let checksums_name = format!("dev-image-{arch}-checksums-sha256.txt");
     let kernel_url = format!("{base_url}/{kernel_name}");
     let rootfs_url = format!("{base_url}/{rootfs_name}");
-    let checksums_url = format!("{base_url}/{checksums_name}");
 
     ui::info(&format!("Downloading dev image (v{version})..."));
 
-    let expected = fetch_expected_hashes(&checksums_url, &[&kernel_name, &rootfs_name])?;
+    // Plan 36 PR-C.2: prefer the cosign-signed manifest. Falls back
+    // to the W5.1 unsigned checksum file when the manifest is 404
+    // (older release).
+    let expected = match try_fetch_signed_manifest(&base_url, version, arch, "dev")? {
+        Some(manifest) => {
+            ui::success(&format!(
+                "  ✓ cosign-verified manifest for v{} (built {} UTC, valid until {} UTC)",
+                manifest.version,
+                manifest.built_at.format("%Y-%m-%d"),
+                manifest.not_after.format("%Y-%m-%d"),
+            ));
+            manifest
+                .artifacts
+                .iter()
+                .map(|a| (a.name.clone(), a.sha256.to_ascii_lowercase()))
+                .collect::<std::collections::HashMap<_, _>>()
+        }
+        None => {
+            ui::warn(&format!(
+                "No cosign-signed manifest found for v{version}. Falling back to \
+                 unsigned checksum file (legacy path predating plan 36 / ADR 005). \
+                 Future releases will require the signed manifest."
+            ));
+            let checksums_name = format!("dev-image-{arch}-checksums-sha256.txt");
+            let checksums_url = format!("{base_url}/{checksums_name}");
+            fetch_expected_hashes(&checksums_url, &[&kernel_name, &rootfs_name])?
+        }
+    };
 
     ui::info("  Fetching kernel...");
     download_file(&kernel_url, kernel_path)
@@ -944,6 +994,135 @@ fn download_dev_image(kernel_path: &str, rootfs_path: &str) -> Result<(String, S
 
     ui::success("Dev image downloaded, hash-verified, and cached.");
     Ok((kernel_path.to_string(), rootfs_path.to_string()))
+}
+
+/// Probe for and verify the cosign-signed manifest at
+/// `{base_url}/{variant}-image-{arch}.manifest.json{,.bundle}`.
+///
+/// Returns:
+/// - `Ok(Some(manifest))` — manifest + bundle present, signature verified,
+///   version pinned to runtime, max-age window not yet exceeded.
+/// - `Ok(None)` — manifest URL 404. This is the legacy fallback for
+///   older releases that predate plan 36; caller can fall back to the
+///   W5.1 unsigned-checksum path with a deprecation warning.
+/// - `Err(_)` — manifest fetched but verification or parsing failed.
+///   Hard error; never silently fall through. `MVM_SKIP_COSIGN_VERIFY=1`
+///   downgrades signature failures to a parse-only path.
+fn try_fetch_signed_manifest(
+    base_url: &str,
+    version: &str,
+    arch: &str,
+    variant: &str,
+) -> Result<Option<mvm_security::image_verify::SignedManifest>> {
+    use mvm_security::image_verify;
+
+    let manifest_name = format!("{variant}-image-{arch}.manifest.json");
+    let manifest_url = format!("{base_url}/{manifest_name}");
+    let bundle_url = format!("{manifest_url}.bundle");
+
+    // HEAD-probe the manifest URL. If absent (older release without
+    // plan-36 signing), fall back gracefully.
+    if !url_exists(&manifest_url)? {
+        return Ok(None);
+    }
+
+    let manifest_tmp = tempfile::NamedTempFile::new().context("creating manifest tempfile")?;
+    let bundle_tmp = tempfile::NamedTempFile::new().context("creating bundle tempfile")?;
+    let manifest_path = manifest_tmp.path().to_string_lossy().into_owned();
+    let bundle_path = bundle_tmp.path().to_string_lossy().into_owned();
+
+    download_file(&manifest_url, &manifest_path)
+        .with_context(|| format!("Failed to download signed manifest from {manifest_url}"))?;
+    download_file(&bundle_url, &bundle_path).with_context(|| {
+        format!(
+            "Failed to download cosign bundle from {bundle_url}. Plan 36 \
+             requires a manifest's signature to be present alongside the \
+             manifest body — refusing to trust an unsigned manifest."
+        )
+    })?;
+
+    let manifest_bytes =
+        std::fs::read(&manifest_path).context("reading downloaded manifest body")?;
+    let bundle_bytes = std::fs::read(&bundle_path).context("reading downloaded cosign bundle")?;
+
+    // GitHub Actions keyless OIDC: the SAN encodes the workflow URL
+    // bound to the tag, and the issuer is GitHub's token endpoint.
+    let expected_identity =
+        format!("https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/v{version}");
+    let expected_issuer = "https://token.actions.githubusercontent.com";
+
+    let manifest = if std::env::var_os("MVM_SKIP_COSIGN_VERIFY").is_some() {
+        tracing::warn!(
+            "MVM_SKIP_COSIGN_VERIFY set — accepting unverified manifest body. \
+             Plan 36 documents this as an emergency-rotation escape hatch only."
+        );
+        image_verify::parse_manifest(&manifest_bytes)
+            .map_err(|e| anyhow::anyhow!("manifest parse failed: {e}"))?
+    } else {
+        image_verify::verify_manifest(
+            &manifest_bytes,
+            &bundle_bytes,
+            &expected_identity,
+            expected_issuer,
+        )
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "Cosign verification failed for {manifest_name}: {e}\n\
+                 \n\
+                 Plan 36 / ADR 005 requires every dev image manifest to be cosign-keyless\n\
+                 signed against the release workflow's OIDC identity. Refusing to use this\n\
+                 image. Possible causes:\n\
+                 - account/CDN compromise (open a security issue);\n\
+                 - the release was published without going through the signing job;\n\
+                 - clock skew (manifest expired); check `date -u`.\n\
+                 \n\
+                 Emergency rotation: set MVM_SKIP_COSIGN_VERIFY=1 to bypass the signature\n\
+                 check while keeping SHA-256 verification active."
+            )
+        })?
+    };
+
+    // Pin the manifest's claimed version to mvmctl's own version. A
+    // mismatch means someone is feeding us a different release's
+    // manifest — refuse.
+    image_verify::check_version_pin(&manifest, version)
+        .map_err(|e| anyhow::anyhow!("manifest version pin failed: {e}"))?;
+
+    // Enforce max-age (default 90d). mvmctl warns and proceeds; mvmd
+    // refuses (different risk tolerance — handled in mvmd plan 23).
+    let now = chrono::Utc::now();
+    if let Err(e) = image_verify::check_not_after(&manifest, now) {
+        ui::warn(&format!(
+            "Dev image manifest is past its max-age ({e}). Consider upgrading \
+             mvmctl — older signed images are still cryptographically valid but \
+             may carry unpatched vulnerabilities."
+        ));
+    }
+
+    Ok(Some(manifest))
+}
+
+/// HEAD-probe a URL. Returns Ok(true) when the resource is reachable
+/// (HTTP 2xx), Ok(false) on 404, Err for transient failures.
+fn url_exists(url: &str) -> Result<bool> {
+    let output = std::process::Command::new("curl")
+        .args(["-fSI", "-o", "/dev/null", "-w", "%{http_code}", url])
+        .output()
+        .context("Failed to run curl HEAD probe")?;
+    let code = String::from_utf8_lossy(&output.stdout).trim().to_string();
+    match code.as_str() {
+        "200" | "302" => Ok(true),
+        "404" => Ok(false),
+        _ => {
+            // Other status (5xx, network error, redirect chain failure)
+            // — don't silently fall through to the unsigned path.
+            anyhow::bail!(
+                "HEAD probe of {url} returned status {code}; refusing to guess \
+                 whether the signed manifest is missing or transiently unavailable. \
+                 Retry, or investigate."
+            )
+        }
+    }
 }
 
 /// Download the per-release `sha256sum`-format checksum file and parse it
