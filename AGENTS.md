@@ -87,7 +87,12 @@ CARGO_HOME="$PWD/.mvm-test/cargo"  \
 - `CARGO_TARGET_DIR` gives the worktree its own `target/` so two worktrees compiling at once don't fight over output paths or rustc invocation locks.
 - `CARGO_HOME` gives the worktree its own cargo registry/cache and (most importantly) its own `.package-cache` lock — without this, two concurrent `cargo test` invocations across worktrees serialize on `~/.cargo/registry/.package-cache` and one will block until the other finishes downloading or resolving.
 
-A `bin/dev` wrapper, `scripts/dev-env.sh`, and `just dev-*` recipes that bake all three in are planned but not yet committed — until they land, set the env vars explicitly in worktrees, or `direnv allow` an `.envrc` that exports them.
+Three things are committed to make this convenient:
+
+- **`scripts/dev-env.sh`** exports all three vars (resolved relative to the worktree root, so it works from any subdir). Source it once at the top of a shell: `source scripts/dev-env.sh`.
+- **`bin/dev`** is a wrapper that sources `scripts/dev-env.sh` and execs `cargo run --quiet -- "$@"`. Use it for any one-off `mvmctl` call: `bin/dev template build`, `bin/dev exec ...`.
+- **`just dev-test` / `just dev-clippy` / `just dev-check`** invoke cargo with the env sourced.
+- **`.envrc.example`** sources `scripts/dev-env.sh` for direnv users (`cp .envrc.example .envrc && direnv allow`).
 
 ### What still collides between worktrees
 
@@ -114,7 +119,7 @@ cp .envrc.example .envrc
 direnv allow
 ```
 
-This is a convenience, not a requirement. Once the `bin/dev` / `just dev-*` wrappers land, those will be the default; until then, set `MVM_DATA_DIR` inline as shown above.
+This is a convenience for users who already have direnv installed; the `bin/dev` / `just dev-*` wrappers work without it.
 
 ### Cleaning up
 
