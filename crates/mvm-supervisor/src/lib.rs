@@ -33,6 +33,7 @@
 
 pub mod artifact;
 pub mod audit;
+pub mod audit_dedup;
 pub mod backend;
 pub mod egress;
 pub mod keystore;
@@ -42,6 +43,7 @@ pub mod tool_gate;
 
 pub use artifact::{ArtifactCollector, ArtifactError, NoopArtifactCollector};
 pub use audit::{AuditEntry, AuditError, AuditSigner, CapturingAuditSigner, NoopAuditSigner};
+pub use audit_dedup::{Decision, DedupKey, RetryStormSummary, RetryStormSuppressor};
 pub use backend::{BackendError, BackendLauncher, NoopBackendLauncher};
 pub use egress::{EgressDecision, EgressError, EgressProxy, NoopEgressProxy};
 pub use keystore::{KeystoreError, KeystoreReleaser, NoopKeystoreReleaser, SecretGrant};
