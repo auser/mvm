@@ -207,6 +207,15 @@
           assert pkgs.lib.assertMsg
             ((variant == "prod") -> !(guestAgent.passthru.devShell or false))
             "mkGuest: variant=\"prod\" requires a guest agent built without the dev-shell feature";
+          # ADR-002 §W3.4 / plan 36: the dev variant's overlay-on-/nix
+          # mutates the lower layer at runtime, which can't compose with
+          # dm-verity (the lower hash would change on every write). Refuse
+          # the combination at evaluation time so a dev override applied
+          # to a sealed builder output (or any future flake) fails loudly
+          # instead of producing a runtime kernel panic at boot.
+          assert pkgs.lib.assertMsg
+            ((variant == "dev") -> !verifiedBoot)
+            "mkGuest: variant=\"dev\" cannot compose with verifiedBoot=true; the dev VM's writable /nix overlay conflicts with dm-verity (ADR-002 §W3.4 / plan 36)";
           let
             # Compose `<pkg>/bin` for every caller-supplied package so
             # PID 1's PATH can find them. Without this, packages live in
