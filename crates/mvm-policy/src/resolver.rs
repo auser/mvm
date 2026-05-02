@@ -157,6 +157,10 @@ mod tests {
             },
             egress: EgressPolicy {
                 mode: Some("base-egress".to_string()),
+                allow_list: vec![],
+                allow_plain_http: false,
+                body_cap_bytes: 0,
+                disabled_inspectors: vec![],
             },
             pii: PiiPolicy {
                 mode: Some("detect".to_string()),

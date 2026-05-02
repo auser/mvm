@@ -21,11 +21,22 @@ use mvm_plan::{NonceStore, PlanId, PlanValidityError, SignedExecutionPlan, check
 use thiserror::Error;
 use tracing::warn;
 
+use mvm_plan::Variant;
+use mvm_policy::{DEFAULT_BODY_CAP_BYTES, EgressPolicy, ToolPolicy};
+
 use crate::artifact::{ArtifactCollector, NoopArtifactCollector};
 use crate::audit::{AuditSigner, NoopAuditSigner};
 use crate::backend::{BackendError, BackendLauncher, NoopBackendLauncher};
+use crate::destination::DestinationPolicy;
 use crate::egress::{EgressProxy, NoopEgressProxy};
+use crate::injection_guard::InjectionGuard;
+use crate::inspector::{Inspector, InspectorChain};
 use crate::keystore::{KeystoreReleaser, NoopKeystoreReleaser};
+use crate::l7_proxy::{DnsResolver, EgressAuditSink, L7EgressProxy};
+use crate::pii_redactor::PiiRedactor;
+use crate::policy_tool_gate::PolicyToolGate;
+use crate::secrets_scanner::SecretsScanner;
+use crate::ssrf_guard::SsrfGuard;
 use crate::state::{PlanState, PlanStateMachine, StateTransitionError};
 use crate::tool_gate::{NoopToolGate, ToolGate};
 
@@ -76,6 +87,9 @@ pub enum SupervisorError {
 
     #[error("artifact error: {0}")]
     Artifact(String),
+
+    #[error("policy violation: {0}")]
+    PolicyViolation(String),
 }
 
 pub struct Supervisor {
@@ -323,6 +337,112 @@ impl Supervisor {
             warn!(?e, ?to, "state transition during error handling failed");
         }
     }
+
+    /// Wire the L7 egress proxy slot from a workload's
+    /// [`EgressPolicy`] + variant. Wave 2.6 differentiator:
+    ///
+    /// - Builds the inspector chain from `policy.allow_list` and the
+    ///   curated default rulesets, in Plan 37 §15's recommended order
+    ///   (DestinationPolicy → SsrfGuard → SecretsScanner →
+    ///   InjectionGuard → PiiRedactor).
+    /// - **Refuses `Variant::Prod` ⊕ `policy.allow_plain_http = true`**
+    ///   with a [`SupervisorError::PolicyViolation`]. This makes the
+    ///   secure default louder than a comment: a production policy
+    ///   bundle that opts into plain HTTP fails policy load, not
+    ///   silently accepts unencrypted egress.
+    /// - Honours `policy.disabled_inspectors` for opt-out by name.
+    ///   Operators can disable a specific inspector (e.g.,
+    ///   `pii_redactor` for an analytics workload) without rewriting
+    ///   the chain order.
+    /// - Honours `policy.body_cap_bytes` (defaults to
+    ///   [`DEFAULT_BODY_CAP_BYTES`] when the field is 0).
+    pub fn with_l7_egress(
+        mut self,
+        policy: &EgressPolicy,
+        variant: Variant,
+        resolver: Arc<dyn DnsResolver>,
+        audit_sink: Arc<dyn EgressAuditSink>,
+    ) -> Result<Self, SupervisorError> {
+        // Variant gate — production workloads must not honour an
+        // `allow_plain_http = true` field, even if a policy bundle
+        // somehow ends up carrying one.
+        if variant.is_prod() && policy.allow_plain_http {
+            return Err(SupervisorError::PolicyViolation(
+                "EgressPolicy.allow_plain_http=true forbidden for Variant::Prod".to_string(),
+            ));
+        }
+
+        let chain = build_inspector_chain(policy);
+        let body_cap = if policy.body_cap_bytes == 0 {
+            DEFAULT_BODY_CAP_BYTES
+        } else {
+            policy.body_cap_bytes
+        };
+        // u64 → usize: clamp at usize::MAX on 32-bit platforms.
+        // 16 MiB fits in usize on all platforms we target, so this
+        // is purely defensive against a malicious policy bundle.
+        let body_cap = usize::try_from(body_cap).unwrap_or(usize::MAX);
+
+        let proxy = L7EgressProxy::new(
+            Arc::new(chain),
+            resolver,
+            audit_sink,
+            body_cap,
+            policy.allow_plain_http,
+        );
+        self.egress = Arc::new(proxy);
+        Ok(self)
+    }
+
+    /// Wire the tool gate slot from a workload's [`ToolPolicy`].
+    /// Wave 2.7 / Phase 1 — pure policy decision (allowlist
+    /// lookup); the vsock RPC layer that drives `check()` calls
+    /// from the workload lands in Wave 2.7b.
+    ///
+    /// An empty `ToolPolicy.allowed` is **not** treated as
+    /// "anything goes" — it's a deliberate fail-closed deny-all
+    /// configuration. Operators who genuinely want the workload to
+    /// have no tool restrictions must wire a different gate
+    /// implementation.
+    pub fn with_tool_gate(mut self, policy: &ToolPolicy) -> Self {
+        self.tool_gate = Arc::new(PolicyToolGate::from_policy(policy));
+        self
+    }
+}
+
+/// Build an [`InspectorChain`] from the workload's [`EgressPolicy`].
+/// Order matches Plan 37 §15: cheap/most-precise checks first, body
+/// inspectors last (so a destination-denied request never pays the
+/// cost of body scanning).
+///
+/// `policy.disabled_inspectors` filters out by name — empty == every
+/// inspector enabled. The named inspectors must match
+/// `Inspector::name()` strings exactly.
+fn build_inspector_chain(policy: &EgressPolicy) -> InspectorChain {
+    let disabled = |name: &'static str| policy.disabled_inspectors.iter().any(|d| d == name);
+    let mut chain = InspectorChain::new();
+    if !disabled("destination_policy") {
+        let dp = DestinationPolicy::new(
+            policy
+                .allow_list
+                .iter()
+                .map(|(host, port)| (host.as_str(), *port)),
+        );
+        chain.push(Box::new(dp) as Box<dyn Inspector>);
+    }
+    if !disabled("ssrf_guard") {
+        chain.push(Box::new(SsrfGuard::new()));
+    }
+    if !disabled("secrets_scanner") {
+        chain.push(Box::new(SecretsScanner::with_default_rules()));
+    }
+    if !disabled("injection_guard") {
+        chain.push(Box::new(InjectionGuard::with_default_rules()));
+    }
+    if !disabled("pii_redactor") {
+        chain.push(Box::new(PiiRedactor::with_default_rules()));
+    }
+    chain
 }
 
 #[cfg(test)]
@@ -876,5 +996,171 @@ mod tests {
         assert_eq!(s.state.current(), PlanState::Failed);
         // Backend was never called — admission failed.
         assert!(backend.launches().is_empty());
+    }
+
+    // ---- Wave 2.6: with_l7_egress builder + Variant::Prod gate ----
+
+    use crate::l7_proxy::{
+        CapturingEgressAuditSink, DnsResolver, EgressAuditSink, NoopEgressAuditSink,
+    };
+    use std::net::IpAddr;
+
+    /// Mock resolver that always returns the configured IP. Reused
+    /// from l7_proxy tests via a duplicate definition here — tests
+    /// don't share #[cfg(test)] fns across modules without lots of
+    /// pub(crate) churn, and the type is two lines.
+    struct WiringResolver(IpAddr);
+    #[async_trait]
+    impl DnsResolver for WiringResolver {
+        async fn resolve_one(&self, _h: &str, _p: u16) -> Result<IpAddr, crate::EgressError> {
+            Ok(self.0)
+        }
+    }
+
+    fn dev_egress_policy(allow_plain_http: bool) -> EgressPolicy {
+        EgressPolicy {
+            mode: Some("l3_plus_l7".to_string()),
+            allow_list: vec![("api.openai.com".to_string(), 443)],
+            allow_plain_http,
+            body_cap_bytes: 0,
+            disabled_inspectors: vec![],
+        }
+    }
+
+    #[test]
+    fn with_l7_egress_dev_with_plain_http_succeeds() {
+        let policy = dev_egress_policy(true);
+        let s = Supervisor::default()
+            .with_l7_egress(
+                &policy,
+                Variant::Dev,
+                Arc::new(WiringResolver(IpAddr::from([8, 8, 8, 8]))),
+                Arc::new(NoopEgressAuditSink),
+            )
+            .expect("dev variant accepts plain http");
+        // The egress slot is now the L7 proxy (downcast not needed —
+        // confirming non-default behaviour by checking that its type
+        // accepted the build is enough).
+        assert_eq!(s.state.current(), PlanState::Pending);
+    }
+
+    #[test]
+    fn with_l7_egress_prod_with_plain_http_rejects() {
+        let policy = dev_egress_policy(true); // plain http on
+        let result = Supervisor::default().with_l7_egress(
+            &policy,
+            Variant::Prod,
+            Arc::new(WiringResolver(IpAddr::from([8, 8, 8, 8]))),
+            Arc::new(NoopEgressAuditSink),
+        );
+        match result {
+            Err(SupervisorError::PolicyViolation(msg)) => {
+                assert!(msg.contains("allow_plain_http"));
+                assert!(msg.contains("Prod"));
+            }
+            Err(other) => panic!("expected PolicyViolation, got error {other:?}"),
+            Ok(_) => panic!("expected PolicyViolation, got Ok"),
+        }
+    }
+
+    #[test]
+    fn with_l7_egress_prod_without_plain_http_succeeds() {
+        let policy = dev_egress_policy(false);
+        let s = Supervisor::default()
+            .with_l7_egress(
+                &policy,
+                Variant::Prod,
+                Arc::new(WiringResolver(IpAddr::from([8, 8, 8, 8]))),
+                Arc::new(NoopEgressAuditSink),
+            )
+            .expect("prod variant accepts plain-http=false");
+        assert_eq!(s.state.current(), PlanState::Pending);
+    }
+
+    #[tokio::test]
+    async fn wired_supervisor_routes_through_inspector_chain() {
+        // End-to-end: build a Supervisor with the L7 proxy wired,
+        // ask the egress slot to inspect a request that the chain
+        // would deny, confirm the policy violation propagates.
+        let policy = dev_egress_policy(false);
+        let resolver = Arc::new(WiringResolver(IpAddr::from([104, 18, 32, 10])));
+        let audit = Arc::new(CapturingEgressAuditSink::new());
+        let s = Supervisor::default()
+            .with_l7_egress(
+                &policy,
+                Variant::Dev,
+                resolver,
+                audit.clone() as Arc<dyn EgressAuditSink>,
+            )
+            .expect("wire ok");
+
+        // Disallowed destination → DestinationPolicy denies via the
+        // legacy `inspect(host, path)` trait method (host-only
+        // signature; doesn't trigger audit emission since that
+        // happens in serve_connection, not evaluate).
+        let dec = s.egress.inspect("evil.com", "/").await.expect("inspect ok");
+        match dec {
+            crate::EgressDecision::Deny { reason } => {
+                assert!(reason.contains("evil.com") || reason.contains("not in policy"));
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_inspector_chain_honours_disabled_inspectors() {
+        let mut policy = dev_egress_policy(false);
+        policy.disabled_inspectors =
+            vec!["secrets_scanner".to_string(), "pii_redactor".to_string()];
+        let chain = build_inspector_chain(&policy);
+        // 5 default inspectors minus 2 disabled = 3.
+        assert_eq!(chain.len(), 3);
+    }
+
+    #[test]
+    fn build_inspector_chain_full_default() {
+        let policy = dev_egress_policy(false);
+        let chain = build_inspector_chain(&policy);
+        // All 5 inspectors present.
+        assert_eq!(chain.len(), 5);
+    }
+
+    // ---- Wave 2.7: with_tool_gate builder ----
+
+    #[tokio::test]
+    async fn with_tool_gate_allows_listed_tool() {
+        let policy = ToolPolicy {
+            allowed: vec!["read_file".to_string(), "list_dir".to_string()],
+        };
+        let s = Supervisor::default().with_tool_gate(&policy);
+        let v = s.tool_gate.check("read_file").await.expect("ok");
+        assert_eq!(v, crate::ToolDecision::Allow);
+    }
+
+    #[tokio::test]
+    async fn with_tool_gate_denies_unlisted_tool() {
+        let policy = ToolPolicy {
+            allowed: vec!["read_file".to_string()],
+        };
+        let s = Supervisor::default().with_tool_gate(&policy);
+        let v = s.tool_gate.check("rm_rf").await.expect("ok");
+        match v {
+            crate::ToolDecision::Deny { reason } => {
+                assert!(reason.contains("rm_rf"));
+                assert!(reason.contains("read_file"));
+            }
+            other => panic!("expected Deny, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_tool_gate_empty_policy_is_deny_all() {
+        // Fail-closed: empty allowlist denies every call.
+        let policy = ToolPolicy { allowed: vec![] };
+        let s = Supervisor::default().with_tool_gate(&policy);
+        for name in ["read_file", "list_dir", "anything"] {
+            let v = s.tool_gate.check(name).await.expect("ok");
+            assert!(matches!(v, crate::ToolDecision::Deny { .. }));
+        }
     }
 }

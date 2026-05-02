@@ -30,21 +30,54 @@ pub struct NetworkPolicy {
     pub preset: Option<String>,
 }
 
-/// L7 egress policy. Plan 37 §15 differentiator. Wave 2 fills:
-///   - inspector chain (SecretsScanner, SsrfGuard, InjectionGuard,
-///     DestinationPolicy)
-///   - AiProviderRouter
-///   - allowed destinations / SNI pin set
+/// L7 egress policy. Plan 37 §15 differentiator. Wave 2.6 fills the
+/// fields the `L7EgressProxy` actually consumes:
+/// - `allow_list` is the (host, port) destination policy.
+/// - `allow_plain_http` opens the plain-HTTP code path; **the
+///   supervisor refuses to honour `true` for `Variant::Prod`** so
+///   production workloads can never accidentally egress unencrypted.
+/// - `body_cap_bytes` bounds the body read for plain-HTTP. `0` means
+///   "use default" ([`DEFAULT_BODY_CAP_BYTES`], 16 MiB) — matches
+///   AI-provider request sizes (long contexts + image uploads).
+/// - `disabled_inspectors` lets operators turn off specific
+///   inspectors by name (e.g., disable `pii_redactor` for an
+///   analytics workload that scrubs upstream).
 ///
-/// Today: a stub flag indicating whether the egress proxy is on at
-/// all. The proxy itself is plan 32 / PR #23 (foundation only).
+/// `mode` is retained for compatibility with Wave 1's stub; the
+/// supervisor honours `mode = Some("open")` as a kill-switch that
+/// skips the proxy entirely. New fields are `#[serde(default)]` so
+/// older bundles continue to parse.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct EgressPolicy {
-    /// `open` — no proxy. `l3` — drop-on-deny IP allowlist (plan 32).
-    /// `l3_plus_l7` — Wave 2 differentiator. Stub today.
+    /// `open` — no proxy. Anything else routes through the L7 chain.
     pub mode: Option<String>,
+    /// (host, port) allowlist consumed by `DestinationPolicy`.
+    /// `port = 0` is the explicit "any port for this host" wildcard.
+    #[serde(default)]
+    pub allow_list: Vec<(String, u16)>,
+    /// Whether plain HTTP (not just CONNECT/HTTPS) is permitted.
+    /// **Forbidden for `Variant::Prod`** — the supervisor's
+    /// `with_l7_egress` builder rejects this combination at policy
+    /// load.
+    #[serde(default)]
+    pub allow_plain_http: bool,
+    /// Body read cap for plain-HTTP (bytes). `0` means "use default"
+    /// ([`DEFAULT_BODY_CAP_BYTES`]).
+    #[serde(default)]
+    pub body_cap_bytes: u64,
+    /// Per-name inspector opt-out. Empty == every inspector enabled.
+    /// Names match `Inspector::name()` strings: `destination_policy`,
+    /// `ssrf_guard`, `secrets_scanner`, `injection_guard`,
+    /// `pii_redactor`.
+    #[serde(default)]
+    pub disabled_inspectors: Vec<String>,
 }
+
+/// Default body cap when `EgressPolicy::body_cap_bytes` is 0.
+/// 16 MiB — matches AI-provider request sizes (long contexts +
+/// image uploads). Configurable per workload via the policy field.
+pub const DEFAULT_BODY_CAP_BYTES: u64 = 16 * 1024 * 1024;
 
 /// PII redaction policy. Plan 37 §15.1.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]

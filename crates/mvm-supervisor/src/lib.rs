@@ -40,7 +40,9 @@ pub mod egress;
 pub mod injection_guard;
 pub mod inspector;
 pub mod keystore;
+pub mod l7_proxy;
 pub mod pii_redactor;
+pub mod policy_tool_gate;
 pub mod secrets_scanner;
 pub mod ssrf_guard;
 pub mod state;
@@ -56,7 +58,16 @@ pub use egress::{EgressDecision, EgressError, EgressProxy, NoopEgressProxy};
 pub use injection_guard::{InjectionGuard, InjectionRule, RuleFamily};
 pub use inspector::{Inspector, InspectorChain, InspectorVerdict, RequestCtx};
 pub use keystore::{KeystoreError, KeystoreReleaser, NoopKeystoreReleaser, SecretGrant};
+pub use l7_proxy::{
+    AuditFields, CapturingEgressAuditSink, ConnectParseError, ConnectRequest, DnsResolver,
+    EgressAuditSink, EgressOutcome, EvaluationResult, L7EgressProxy, NoopEgressAuditSink,
+    TokioDnsResolver, parse_connect,
+};
 pub use pii_redactor::{PiiRedactor, PiiRule, PiiValidator};
+pub use policy_tool_gate::{
+    CapturingToolAuditSink, NoopToolAuditSink, PolicyToolGate, ToolAuditError, ToolAuditFields,
+    ToolAuditSink, ToolOutcome,
+};
 pub use secrets_scanner::{DEFAULT_RULES, SecretRule, SecretsScanner};
 pub use ssrf_guard::SsrfGuard;
 pub use state::{PlanState, PlanStateMachine, StateTransitionError};

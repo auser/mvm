@@ -99,6 +99,7 @@ mod tests {
             },
             egress: EgressPolicy {
                 mode: Some("l3_plus_l7".to_string()),
+                ..EgressPolicy::default()
             },
             pii: PiiPolicy {
                 mode: Some("redact".to_string()),
