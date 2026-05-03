@@ -1,98 +1,69 @@
 #!/bin/bash
-# Pre-commit hook for mvm
+# Pre-commit hook for mvm — light, host-runnable.
+#
+# Per AGENTS.md: this hook fires once per commit at the main checkout
+# (because git always runs from there), and it must stay fast and host-
+# friendly so it doesn't block worktree workflows. Heavy checks
+# (workspace clippy, full test suite, supply-chain gates) live in CI,
+# not here.
+#
+# What this hook does:
+#   1. Skip entirely if the staged set is empty.
+#   2. Run cargo fmt --all if any Rust files are staged (auto-fixes,
+#      re-stages). Cargo fmt works on the macOS host.
+#   3. Run nix fmt --check on the nix/ dir if any *.nix files are
+#      staged AND the nix CLI is available. Otherwise skip.
+#
+# What this hook deliberately does NOT do:
+#   - cargo check / cargo build / cargo clippy / cargo test — the
+#     workspace targets Linux-specific deps and these don't compile
+#     cleanly on the macOS host. Run them via Lima or rely on CI.
+#   - cargo-deny / cargo-audit — supply-chain gates run in CI
+#     (.github/workflows/security.yml).
+#
+# To run the heavier checks locally before pushing:
+#   limactl shell mvm-builder -- cargo clippy --workspace --all-targets -- -D warnings
+#   limactl shell mvm-builder -- cargo nextest run --workspace
+#   limactl shell mvm-builder -- cargo deny check
+#   just ci
 
 set -e
 
-echo "Running pre-commit checks..."
-echo ""
-
-# Check if there are any staged changes
+# Bail out early if nothing is staged.
 if git diff --cached --quiet; then
-    echo "No staged changes to commit"
     exit 0
 fi
 
-# Auto-fix formatting and stage changes
-echo "Auto-formatting code..."
-if ! cargo fmt; then
-    echo "Formatting failed!"
-    exit 1
-fi
+# Detect what kinds of files changed.
+staged="$(git diff --cached --name-only --diff-filter=ACMR)"
 
-if ! git diff --quiet --exit-code; then
-    echo "Auto-staging formatted files..."
-    git add -u
-fi
-echo "Code formatting applied and staged"
-echo ""
+has_rust=0
+has_nix=0
+while IFS= read -r f; do
+    case "$f" in
+        *.rs) has_rust=1 ;;
+        *.nix) has_nix=1 ;;
+    esac
+done <<< "$staged"
 
-# Run clippy (zero warnings required)
-echo "Running clippy (zero warnings required)..."
-if ! cargo clippy --all-targets -- -D warnings; then
-    echo "Clippy failed!"
-    echo "   Run 'cargo clippy --all-targets --fix --allow-dirty' to auto-fix"
-    exit 1
-fi
-echo "Clippy passed"
-echo ""
-
-# Run tests
-echo "Running tests..."
-if ! cargo test -- --color=always; then
-    echo "Tests failed!"
-    exit 1
-fi
-echo "All tests passed"
-echo ""
-
-# Supply-chain gate — ADR-002 §W5.2. cargo-deny is the load-bearing
-# tool (advisories + licenses + bans + sources); cargo-audit is a
-# narrower second opinion against the same advisory DB. Both run if
-# installed; missing tools log a notice but don't block the commit
-# (CI is the enforcement point).
-if command -v cargo-deny >/dev/null 2>&1; then
-    echo "Running cargo-deny (supply chain)..."
-    if ! cargo deny check; then
-        echo "cargo-deny failed!"
-        echo "   See deny.toml for ignore/skip syntax."
+if [ "$has_rust" -eq 1 ]; then
+    echo "pre-commit: cargo fmt --all"
+    if ! cargo fmt --all; then
+        echo "  cargo fmt failed."
         exit 1
     fi
-    echo "cargo-deny passed"
-    echo ""
-else
-    echo "(cargo-deny not installed — install with 'cargo install cargo-deny' to gate locally)"
-    echo ""
-fi
-
-if command -v cargo-audit >/dev/null 2>&1; then
-    echo "Running cargo-audit..."
-    if ! cargo audit; then
-        echo "cargo-audit failed!"
-        exit 1
+    if ! git diff --quiet --exit-code; then
+        echo "pre-commit: re-staging formatted files"
+        git add -u
     fi
-    echo "cargo-audit passed"
-    echo ""
-else
-    echo "(cargo-audit not installed — install with 'cargo install cargo-audit' to gate locally)"
-    echo ""
 fi
 
-# Nix formatter (W7.4). `nix fmt --check` runs the formatter from
-# `nix/flake.nix#formatter.${system}` (nixfmt-rfc-style) and exits
-# non-zero on drift. Skipped when nix isn't on PATH (matches cargo-deny
-# / cargo-audit gates above — CI is the enforcement point).
-if command -v nix >/dev/null 2>&1; then
-    echo "Running nix fmt --check..."
+if [ "$has_nix" -eq 1 ] && command -v nix >/dev/null 2>&1; then
+    echo "pre-commit: nix fmt --check ./nix"
     if ! nix --extra-experimental-features 'nix-command flakes' fmt -- --check ./nix; then
-        echo "nix fmt detected drift!"
-        echo "   Run 'nix fmt ./nix' to auto-format."
+        echo "  nix fmt detected drift. Run 'nix fmt ./nix' to auto-format."
         exit 1
     fi
-    echo "nix fmt clean"
-    echo ""
-else
-    echo "(nix not installed — install Nix to gate formatting locally)"
-    echo ""
 fi
 
-echo "All pre-commit checks passed!"
+exit 0

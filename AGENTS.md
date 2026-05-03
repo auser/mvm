@@ -2,7 +2,11 @@
 
 ## Lima VM Requirement
 
-All Nix builds, Firecracker operations, `mvmctl` commands, test execution, clippy checks, and Linux-specific commands MUST be run inside the Lima VM. Use `limactl shell mvm-builder -- <command>` to execute commands inside the VM. The Lima VM name is `mvm-builder` (renamed from `mvm` in W7.2).
+All Nix builds, Firecracker operations, `mvmctl` runtime commands (anything that boots, talks to, or manages microVMs), and Linux-specific syscalls MUST be run inside the Lima VM. Use `limactl shell mvm-builder -- <command>` to execute commands inside the VM. The Lima VM name is `mvm-builder` (renamed from `mvm` in W7.2).
+
+**Run cargo on the macOS host wherever it compiles cleanly.** `cargo test`, `cargo check`, and `cargo build` should default to the host so worktrees don't deadlock on the single shared Lima VM (cargo target-dir contention, registry locks, and `.git/index` cross-mount races are real and have caused us to lose work). Tests that genuinely need Linux — vsock, jailer/seccomp, dm-verity, network namespaces, anything that pokes at `/dev/kvm` or `/proc/net` — should be gated with `#[cfg(target_os = "linux")]` and only those sub-targets are run inside Lima. Workspace-wide `cargo clippy --workspace --all-targets -- -D warnings` is still expected to pass inside Lima before merge, since clippy needs to see the Linux-gated code paths.
+
+**git only runs from the main `mvm/` checkout, never from inside a worktree directory and never from inside Lima.** The main checkout is the single git operator for the whole repo. To act on a worktree's branch, use `git -C /path/to/mvm-<slug> <cmd>` from the main checkout — that drives the worktree's index/HEAD/refs while keeping the running git process anchored at the main checkout. Reasons: (1) only one git process at a time touches `.git/objects`, `.git/packed-refs`, and the shared `.git/hooks/` invocation context, eliminating the cross-worktree contention that has caused us to lose work; (2) the 9p/virtiofs share with Lima does not share git's lock semantics, so git from inside Lima deadlocks against host-side git. Cargo/nix/firecracker/mvmctl commands still run from each worktree's own directory — only `git` is centralized.
 
 If the Lima VM is not running, boot it with:
 
@@ -28,38 +32,97 @@ Examples:
 - `limactl shell mvm-builder -- cargo clippy --workspace -- -D warnings`
 - `limactl shell mvm-builder -- cargo check --workspace`
 
-**Important:** `mvmctl` (via `cargo run`) commands like `template build`, `run`, `stop`, `logs`, and `status` must be run inside the Lima VM — they talk to Firecracker which only runs inside Linux. `cargo test`, `cargo clippy`, and `cargo check` must also run inside the Lima VM to ensure correct Linux-target compilation and test execution. The `cargo run -- dev` bootstrap command is the only one that runs on the macOS host directly.
+**Important:** `mvmctl` (via `cargo run`) commands like `template build`, `run`, `stop`, `logs`, and `status` must be run inside the Lima VM — they talk to Firecracker which only runs inside Linux. `cargo test` / `cargo check` / `cargo build` should run on the macOS host by default (see "Run cargo on the macOS host" above); only `cargo clippy --workspace --all-targets` and tests gated on `target_os = "linux"` need Lima. `cargo run -- dev` always runs on the macOS host directly.
 
 ## Worktree Workflow for Features
 
-Every feature, refactor, or non-trivial bug fix MUST be developed in a git worktree, never on the main checkout. This isolates in-flight work from the main checkout's `~/.mvm` registry, build cache, and dev VM state.
+Every feature, refactor, or non-trivial bug fix is developed in a git worktree — code edits and cargo invocations happen inside the worktree directory. Git operations (status, add, commit, stash, rebase, push, fetch, pull, hook execution) happen from the main `mvm/` checkout, with `-C` pointing at the worktree when needed. The main checkout is the single git operator; worktree directories are code+build sandboxes only.
+
+### Never commit directly to `main`
+
+`main` is updated only via merged pull requests — never by `git commit` against the local `main` branch, even from the main checkout, even for docs-only changes, even with `--no-verify`. Reasons:
+
+- **Safety against parallel agents.** Multiple agents share `.git/`. Any agent that pulls/rebases/`reset --hard origin/main` (a routine recovery move) silently discards local-only commits on main. Branches that exist on `origin` cannot be wiped this way.
+- **CI gating.** The full clippy + nextest + supply-chain + flake-check matrix only runs on PRs. A direct commit ships untested.
+- **Audit trail.** PR descriptions, CI status, review comments, and merge events form the project's history. A local commit pushed to main loses all of it.
+
+If you have changes intended for `main`, push them to a branch and open a PR — even a one-line typo fix. The repo's GitHub settings are not branch-protected, so the convention is the only thing keeping main clean.
+
+The only `git` commands that should ever target `main` directly are read-only (`git log main`, `git show main:path`) or routine sync (`git fetch origin`, `git pull --ff-only origin main`).
 
 ### Creating the worktree
 
+From the main `mvm/` checkout:
+
 ```bash
+cd /Users/auser/work/personal/microvm/kv/mvm
 git worktree add ../mvm-<feature-slug> -b feat/<feature-slug>
+```
+
+Then switch terminals/agents into the worktree directory for code work:
+
+```bash
 cd ../mvm-<feature-slug>
+# edit code, run cargo, run mvmctl from here
 ```
 
 Branch names follow the existing pattern (`feat/<slug>`, `fix/<slug>`, `chore/<slug>`).
 
-### Isolating mutable state
+### Doing git work for a worktree
 
-Worktrees share `~/.mvm`, `~/.cache/mvm`, the Lima VM, and any pushed registries with the main checkout. Use the `bin/dev` wrapper or the `just dev-*` recipes for any `mvmctl` invocation in a worktree — they source `scripts/dev-env.sh`, which redirects `mvmctl`'s data dir into the worktree (`MVM_DATA_DIR="$PWD/.mvm-test"`) and silences the legacy-banner.
-
-Examples:
+Always from the main `mvm/` checkout, with `-C` pointing at the worktree:
 
 ```bash
-bin/dev template build              # equivalent to: cargo run --quiet -- template build
-just dev-test                       # cargo test --workspace with the dev env
-just dev-clippy                     # cargo clippy with the dev env
+cd /Users/auser/work/personal/microvm/kv/mvm
+git -C ../mvm-<feature-slug> status
+git -C ../mvm-<feature-slug> add path/to/file
+git -C ../mvm-<feature-slug> commit -m "..."
+git -C ../mvm-<feature-slug> push -u origin feat/<feature-slug>
 ```
 
-The dev env files are committed; new contributors get the right behaviour with no setup.
+This serializes all git activity through one process and keeps `.git/objects`, `.git/packed-refs`, and the hooks dir from being touched by multiple agents at once. The pre-commit hook fires once per commit, in the main checkout — no concurrent-hook fan-out.
+
+Agents working inside a worktree directory should not invoke `git` directly. If you need git state, ask the operator at the main checkout, or run a read-only `git -C <main-checkout> status` if you must.
+
+### Isolating mutable state
+
+Worktrees share `~/.mvm`, `~/.cache/mvm`, `~/.cargo`, `~/.rustup`, the Lima VM, the Nix store, and any pushed registries with the main checkout. Per-worktree isolation is achieved by overriding three env vars for the duration of a command:
+
+```bash
+MVM_DATA_DIR="$PWD/.mvm-test"      \
+CARGO_TARGET_DIR="$PWD/.mvm-test/target" \
+CARGO_HOME="$PWD/.mvm-test/cargo"  \
+  cargo test --workspace
+```
+
+- `MVM_DATA_DIR` redirects mvmctl's templates, sockets, microVM registry, snapshots, and signing keys away from `~/.mvm`.
+- `CARGO_TARGET_DIR` gives the worktree its own `target/` so two worktrees compiling at once don't fight over output paths or rustc invocation locks.
+- `CARGO_HOME` gives the worktree its own cargo registry/cache and (most importantly) its own `.package-cache` lock — without this, two concurrent `cargo test` invocations across worktrees serialize on `~/.cargo/registry/.package-cache` and one will block until the other finishes downloading or resolving.
+
+Four things are committed to make this convenient:
+
+- **`scripts/dev-env.sh`** exports all three vars (resolved relative to the worktree root, so it works from any subdir). Source it once at the top of a shell: `source scripts/dev-env.sh`.
+- **`bin/dev`** is a wrapper that sources `scripts/dev-env.sh` and execs `cargo run --quiet -- "$@"`. Use it for any one-off `mvmctl` call: `bin/dev template build`, `bin/dev exec ...`.
+- **`just dev-test` / `just dev-clippy` / `just dev-check`** invoke cargo with the env sourced.
+- **`.envrc.example`** sources `scripts/dev-env.sh` for direnv users (`cp .envrc.example .envrc && direnv allow`).
+
+One-time per clone: run `just install-hooks` from the main checkout to point `core.hooksPath` at `.githooks/`. The committed pre-commit hook (`.githooks/pre-commit`) is intentionally light — it formats Rust code and checks Nix formatting, nothing else — so it doesn't block worktree workflows. Heavy gates (workspace clippy, full tests, supply-chain checks) run in CI.
+
+### What still collides between worktrees
+
+Even with per-worktree isolation, a few resources are shared and can cause concurrent commands to interfere:
+
+- **`.git/objects/`, `.git/packed-refs`, and the shared hooks dir.** Each `git worktree add` directory has its own index, HEAD, and refs (in `.git/worktrees/<name>/`), but the object store, packed refs, and hooks dir are one set. The "git only runs from the main checkout" rule (see the top of this doc) is what keeps these from colliding — never bypass it. Even with that rule, the pre-commit hook still gets invoked on every commit, so keep it limited to formatting + fast checks; don't run a full `cargo test --workspace` from inside a hook.
+- **The Lima VM's `/var/lib/mvm/`, `br-mvm` bridge, and TAP devices.** Vary microVM and TAP names between worktrees if you need two microVMs running at the same time.
+- **The Nix store inside Lima.** This is shared by design (warm cache) and Nix's own locking handles it.
 
 ### Lima VM sharing
 
-The Lima VM (`mvm-builder`) is shared across worktrees by design — it's expensive to boot and Nix builds benefit from a warm store. The data-dir override above keeps `mvmctl`'s per-feature state isolated; Nix store reuse is intentional.
+The Lima VM (`mvm-builder`) is shared across worktrees by design — **never fork it per worktree**. It is expensive to boot, and the Nix store inside it is the warm cache that makes builds fast; a per-worktree VM would duplicate tens of GB of store, re-download the kernel/rootfs, and multiply boot time with no isolation benefit. There is also no second VM name baked into the codebase: `mvmctl`, the `Justfile`, CI, and AGENTS.md examples all hard-code `mvm-builder`, and `RuntimeBuildEnv` / `run_on_vm` route through `mvm_runtime::config::VM_NAME`.
+
+The `MVM_DATA_DIR` override is what isolates per-feature state — templates, sockets, the microVM registry, snapshots, signing keys. Anything that would otherwise land in `~/.mvm` ends up under the worktree.
+
+State that *does* live inside the shared Lima VM (`/var/lib/mvm/`, the `br-mvm` bridge, TAP devices, in-flight microVMs) is the only collision surface between worktrees. If two worktrees need to run microVMs concurrently, give them distinct microVM and TAP names — do not spin up a second Lima VM.
 
 ### Optional: direnv
 
@@ -70,7 +133,7 @@ cp .envrc.example .envrc
 direnv allow
 ```
 
-This is a convenience, not a requirement. The wrapper script path (`bin/dev` / `just dev-*`) works for everyone with no additional tools.
+This is a convenience for users who already have direnv installed; the `bin/dev` / `just dev-*` wrappers work without it.
 
 ### Cleaning up
 
