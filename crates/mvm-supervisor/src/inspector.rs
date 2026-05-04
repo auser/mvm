@@ -25,20 +25,35 @@
 //!     `NoopEgressProxy` default)
 
 use std::fmt;
+use std::net::IpAddr;
 
 use async_trait::async_trait;
 
 /// Mutable inspection context threaded through the chain. Wave 2.1
-/// carries only the bare-minimum fields (host + port + path) that
-/// `DestinationPolicy` needs. Later waves extend with `headers`,
-/// `body_chunks`, `payload_classification`, etc. — the chain
-/// continues to short-circuit on the first deny regardless of what
-/// fields are populated.
+/// carries host/port/path; Wave 2.2 adds `body` so `SecretsScanner`
+/// can scan outbound payloads. Later waves extend with `headers`,
+/// `payload_classification`, etc. — the chain continues to
+/// short-circuit on the first deny regardless of what fields are
+/// populated. `body` is `Vec<u8>` (not `&[u8]`) so `Transform`
+/// inspectors (e.g., PiiRedactor in 2.5) can mutate it in place.
 #[derive(Debug, Clone)]
 pub struct RequestCtx {
     pub host: String,
     pub port: u16,
     pub path: String,
+    /// Outbound body bytes. Empty for GET/HEAD/DELETE; populated for
+    /// methods that carry payloads. Bytes (not `String`) because
+    /// bodies may be binary (protobuf, multipart, etc.).
+    pub body: Vec<u8>,
+    /// Resolved destination IP, populated by the proxy after DNS
+    /// lookup but before opening the connection. `SsrfGuard` (Wave
+    /// 2.3) inspects this to refuse private/internal/metadata IPs.
+    /// `None` when the host is an IP literal (the proxy uses
+    /// `host` directly) or before the proxy has resolved DNS — the
+    /// guard handles both cases. The proxy must pin the IP it
+    /// resolves here for the actual connect() call to defend
+    /// against DNS rebinding.
+    pub resolved_ip: Option<IpAddr>,
 }
 
 impl RequestCtx {
@@ -47,7 +62,24 @@ impl RequestCtx {
             host: host.into(),
             port,
             path: path.into(),
+            body: Vec::new(),
+            resolved_ip: None,
         }
+    }
+
+    /// Builder-style: attach a body to a context. Useful in tests and
+    /// at the proxy callsite when the body is read upfront.
+    pub fn with_body(mut self, body: impl Into<Vec<u8>>) -> Self {
+        self.body = body.into();
+        self
+    }
+
+    /// Builder-style: pin the resolved IP. The proxy calls this once
+    /// DNS resolution succeeds; tests use it to drive `SsrfGuard`
+    /// directly.
+    pub fn with_resolved_ip(mut self, ip: IpAddr) -> Self {
+        self.resolved_ip = Some(ip);
+        self
     }
 }
 
