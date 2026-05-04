@@ -257,7 +257,7 @@ let
       '';
       # Service env defaults: only set if not already defined (e.g. by
       # --env flags sourced globally from mvm-env.env). This lets
-      # `mvmctl run --env PORT=9000` override `env.PORT = "3100"`.
+      # `mvmctl up --env PORT=9000` override `env.PORT = "3100"`.
       envLines = lib.concatStringsSep "\n" (
         lib.mapAttrsToList (k: v: ": \${${k}:='${v}'} ; export ${k}") (svc.env or {})
       );

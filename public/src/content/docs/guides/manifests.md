@@ -143,7 +143,6 @@ For running VMs (separate concern), continue to use `mvmctl ls` / `mvmctl down <
 ```bash
 mvmctl up                            # boot from slot keyed by manifest at cwd
 mvmctl up /path/to/project           # explicit
-mvmctl run /path/to/project          # similar to up; boots transient VM
 mvmctl exec /path/to/project -- uname -a   # ephemeral one-shot
 ```
 

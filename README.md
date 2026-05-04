@@ -225,8 +225,9 @@ mvmctl template delete my-app
 | `mvmctl dev down` | Stop the Lima development VM |
 | `mvmctl dev shell` | Open a shell in the running Lima VM |
 | `mvmctl dev status` | Show dev environment status |
-| `mvmctl doctor` | System diagnostics and dependency checks |
+| `mvmctl doctor` | Diagnostics + dependency checks + security posture |
 | `mvmctl config show/edit/set` | Manage global config (~/.mvm/config.toml) |
+| `mvmctl catalog list/info/search` | Browse the bundled image catalog |
 
 ### Utilities
 
@@ -235,10 +236,10 @@ mvmctl template delete my-app
 | `mvmctl update` | Self-update (`--check` for dry run) |
 | `mvmctl uninstall` | Clean uninstall |
 | `mvmctl audit tail` | View audit log |
-| `mvmctl flake check` | Validate a Nix flake |
+| `mvmctl validate` | Validate a Nix flake |
 | `mvmctl metrics` | Runtime metrics (Prometheus or JSON) |
-| `mvmctl completions <shell>` | Generate shell completions |
 | `mvmctl shell-init` | Print shell config (completions + aliases) |
+| `mvmctl shell-init --emit-completions <shell>` | Emit just the completion script |
 
 ## Dev Image
 
