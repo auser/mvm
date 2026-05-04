@@ -33,8 +33,32 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
                 registry.deregister(n);
                 let _ = registry.save(&registry_path);
             }
+            // B21: state-changing CLI verb emits an audit entry. The
+            // matching VmStart emit lives in `vm/up.rs`; without this
+            // VmStop there is no audit trail of the stop happening.
+            // Best-effort — the underlying op already succeeded or
+            // failed by the time we reach here.
+            mvm_core::audit::emit(
+                mvm_core::audit::LocalAuditKind::VmStop,
+                Some(n),
+                Some(if result.is_ok() { "ok" } else { "stop_failed" }),
+            );
             result
         }
-        None => backend.stop_all(),
+        None => {
+            // Plan-38 §"Boundary statement": fleet/multi-VM is mvmd's job.
+            // `mvmctl down` (no args) just stops every running VM.
+            let result = backend.stop_all();
+            mvm_core::audit::emit(
+                mvm_core::audit::LocalAuditKind::VmStop,
+                None,
+                Some(if result.is_ok() {
+                    "stop_all_ok"
+                } else {
+                    "stop_all_failed"
+                }),
+            );
+            result
+        }
     }
 }

@@ -229,8 +229,8 @@ Scope summary (each phase is independently mergeable):
 
 Status:
 
-- [x] **W7.1 (Phase 1)** — In-place rootfs/flake fixes — landed 2026-04-30. `nix flake check` passes on all 9 flakes; `cargo test --workspace` 1067 pass; `nix eval` confirms `variant="prod"` on default-microvm and `variant="dev"` on dev-image. Outstanding: `git rm` of `nix/examples/{paperclip,openclaw}` (sandbox blocked twice, needs manual removal or permission grant).
-- [x] **W7.2 (Phase 1.5)** — Lima VM rename `mvm` → `mvm-builder` — landed 2026-04-30. New constants `VM_NAME` / `LEGACY_VM_NAME` in `mvm-runtime::config`, six hardcoded literals in `doctor.rs` migrated to the constant, new `bootstrap::warn_if_legacy_lima_vm` detects legacy VM and prints a one-line manual migration command (no auto-rename), wired into both `mvmctl bootstrap` and `mvmctl dev up`. Docs (`AGENTS.md`, `specs/01-project.md`, `specs/runbooks/w3-verified-boot.md`, `public/.../{architecture,troubleshooting}.md`, `crates/mvm-runtime/README.md`) updated. 1067 tests pass.
+- [x] **W7.1 (Phase 1)** — In-place rootfs/flake fixes — landed 2026-04-30; **builder-VM-side validation done 2026-05-01** inside `mvm-builder` against `nix/images/default-tenant#packages.aarch64-linux.default` (`mvm-default-microvm-prod`): `debugfs` confirms `/etc/mvm/{integrations.d,probes.d}` mode `0750`, `/etc/mvm/variant` content `prod\n` mode `0644`, `/tmp/udhcpc.sh` absent from rootfs (resolved to `/nix/store/*-mvm-udhcpc-action` script). `nix flake check` passes on all 9 flakes; `cargo test --workspace` 1067 pass; `nix eval` confirms `variant="prod"` on default-microvm and `variant="dev"` on dev-image.
+- [x] **W7.2 (Phase 1.5)** — Lima VM rename `mvm` → `mvm-builder` — landed 2026-04-30; **migration verified done on dev box 2026-05-01** (`limactl list` shows only `mvm-builder`; legacy `mvm` removed). New constants `VM_NAME` / `LEGACY_VM_NAME` in `mvm-runtime::config`, six hardcoded literals in `doctor.rs` migrated to the constant, new `bootstrap::warn_if_legacy_lima_vm` detects legacy VM and prints a one-line manual migration command (no auto-rename), wired into both `mvmctl bootstrap` and `mvmctl dev up`. Docs (`AGENTS.md`, `specs/01-project.md`, `specs/runbooks/w3-verified-boot.md`, `public/.../{architecture,troubleshooting}.md`, `crates/mvm-runtime/README.md`) updated. 1067 tests pass.
 - [x] **W7.3 (Phase 2)** — Repo layout move — landed 2026-04-30. `nix/{guest-agent-pkg,firecracker-kernel-pkg}.nix` → `nix/packages/{mvm-guest-agent,firecracker-kernel}.nix`; `nix/{minimal-init,rootfs-templates,kernel-configs}` → `nix/lib/`; `nix/dev-image/` → `nix/images/builder/`; `nix/default-microvm/` → `nix/images/default-tenant/`; `nix/examples/*` → `nix/images/examples/*` (paperclip + openclaw deletions staged from earlier `git rm`). Internal `import` paths in `nix/flake.nix` updated, sibling-flake `mvm.url` arithmetic fixed, mvmctl Rust path strings (`apple_container.rs`, `commands/{mod,vm/exec}.rs`, `mvm-build/dev_build.rs`, `fleet.rs`) updated, CI workflow paths in `release.yml` updated, all 7 flake.locks regenerated. `nix flake check --no-build` clean on every flake; `cargo test --workspace` 1067/1067; clippy clean.
 - [x] **W7.4 (Phase 3)** — New flake outputs — landed 2026-04-30. New `packages.<sys>.{mvm,default,xtask}` (mvmctl Rust CLI + xtask runner via fileset-filtered `rustPlatform.buildRustPackage`). New `apps.<sys>.{mvm,default,xtask}` for `nix run`. New `devShells.<sys>.{host,default}` (everywhere) and `devShells.<sys>.builder` (Linux only). New `formatter.<sys> = pkgs.nixfmt-rfc-style` plus `treefmt.toml` covering nix/rust/shell/markdown. New `checks.<sys>.mvm-eval`. `passthru.role = "tenant" | "builder"` plumbed through `mkGuest`; `nix/images/builder/flake.nix` sets `role = "builder"`. Pre-commit hook runs `nix fmt --check` when `nix` is on PATH. **Deferred** (TODO comment in `nix/flake.nix:340-353`): `mkNodeService` 3-stage FOD-then-patch → `pkgs.buildNpmPackage` swap — needs Linux builder validation against hello-node before flipping (output layout changes from `$out/dist/...` to `$out/lib/node_modules/<pname>/dist/...`).
 - [x] **W7.5 (Phase 4)** — `aarch64-darwin` + `x86_64-darwin` coverage — landed 2026-04-30. `flake-utils.lib.eachSystem` extended with both Darwin systems. `lib.mkGuest` exposed everywhere (function-only, no eager call). `packages.<sys>.{mvm,default,xtask}` cross-compile to native target. `packages.<sys>.{mvm-guest-agent,mvm-guest-agent-dev}` and `devShells.<sys>.builder` gated by `pkgs.lib.optionalAttrs pkgs.stdenv.isLinux`. Per-system attrs verified: `packages.aarch64-darwin = [default, mvm, xtask]`, `packages.x86_64-linux = [default, mvm, mvm-guest-agent, mvm-guest-agent-dev, xtask]`, `devShells.aarch64-darwin = [default, host]`. Reverted `mvmSrc = builtins.path` (incompatible with `lib.fileset.toSource`); per-package fileset already restricts closure.
@@ -311,7 +311,7 @@ protocol-only` clean (mvmd-ready per plan 33).
 
 | Item | Plan | Why deferred | Estimated size |
 |---|---|---|---|
-| **L7 egress runtime backing** (mitmdump supervisor + CA cert tooling + optional DNS-pinning + `apply_network_policy` wire-up + `mvmctl egress init-ca` + `mvmctl cache prune` orphan handling + llm-agent README update) | [`plans/34-egress-l7-proxy.md`](plans/34-egress-l7-proxy.md) — 7 tiers fully specified | Heavyweight runtime dep (mitmdump pulls Python + cryptography, ~80 MiB closure); CA cert generation has corner cases (rotation, expiry, per-host vs per-VM); DNS pinning needs IPv6 + CNAME-chain handling. Live-KVM integration testing is mandatory. | ~1 sprint |
+| **L7 egress runtime backing** (7 tiers + 12 cross-cutting considerations folded — see plan 34 §"Cross-cutting considerations") | [`plans/34-egress-l7-proxy.md`](plans/34-egress-l7-proxy.md) | Heavyweight runtime dep (mitmdump pulls Python + cryptography, ~80 MiB closure); CA cert generation has corner cases (Name-Constrained per-VM leaves, rotation, expiry); DNS pinning needs IPv6 + CNAME-chain handling. Live-KVM integration testing is mandatory. New ADR-006 (PR #33) locks the cryptographic story before code starts. | ~1.5 sprints |
 | **A.2 v2 live-KVM smoke** (cold-boot vs warm-VM latency comparison on `claude-code-vm`; race-condition test for parallel first-calls in same session; snapshot-resume against the Anthropic-allowlisted agent VM) | Plan 32 §"Proposal A.2" | Hardware not available in the dev environment; needs a Linux/KVM host with a real Firecracker stack. | ~1 day |
 | **Hosted MCP transport (HTTP/SSE)** | [`plans/33-hosted-mcp-transport.md`](plans/33-hosted-mcp-transport.md) | Cross-repo: implementation lives in [mvmd](https://github.com/auser/mvmd). mvm-mcp's `protocol-only` feature is already shipped (PR #20) so mvmd can consume the wire schema unchanged. | mvmd owns sizing |
 | **Per-template `default_network_policy`** ✅ shipped (PR `feat/template-default-network-policy`) | ADR-004 §"Decisions" 6 | `TemplateSpec` gains `Option<NetworkPolicy>` (back-compat via `#[serde(default)]` + `skip_serializing_if`). `mvmctl template create --network-preset agent` bakes it; `mvmctl up` consults it as fallback when no CLI flags supplied; `mvmctl template info` prints it. `llm-agent` README updated to use the baked default. | ~1 day |
@@ -339,85 +339,140 @@ Cross-repo handoff for hosted MCP transport (HTTP/SSE) is documented
 in [`plans/33-hosted-mcp-transport.md`](plans/33-hosted-mcp-transport.md);
 implementation lives in mvmd, not this repo.
 
-## Sprint 44 — manifest-driven template DX (in flight)
+## Sprint 44 — Whitepaper alignment (proposed)
 
-Master plan:
-[`plans/38-manifest-driven-template-dx.md`](plans/38-manifest-driven-template-dx.md).
-
-**Branch:** `feat/manifest-driven-template-dx` (worktree at
-`../mvm-manifest` per AGENTS.md "Worktree Workflow for Features").
-
-**Goal:** collapse the three-step `template init NAME → template create
-NAME → template build NAME` flow into a single manifest file
-(`mvm.toml` or `Mvmfile.toml`) discovered by path. Registry slot keys
-become `sha256(canonical_manifest_path)` instead of user-invented
-names. Drops `role` and `[network]` from the manifest (fleet/runtime
-concerns; mvmd's territory). Preserves `template init --prompt`
-(LLM-assisted scaffolding) and extends it to populate `mvm.toml`
-resource defaults.
+Master plan: [`plans/37-whitepaper-alignment.md`](plans/37-whitepaper-alignment.md).
+Walks the V2 whitepaper (`specs/docs/whitepaper.md`) section by section,
+identifies what `mvm` (the runtime/CLI half — not `mvmd`) is missing
+relative to its claims, and sequences the work into six waves. Includes
+ADR-004 (PII redaction lives in `mvm`, not `mvmd`) staged for creation
+at `specs/adrs/004-pii-redaction-in-mvm.md` when implementation begins.
 
 ### Why this sprint
 
-`template create` does no build work — it just stashes CLI args as
-JSON. The flake is the actual source of truth; resource defaults +
-policy are bookkeeping the user has to retype. The user-invented
-`name` exists only as a registry path key and conflicts with the
-goal of co-located, version-controlled, mvmforge-emittable manifest
-files. Folding `create` into `build`, keying the registry by manifest
-path hash, and trimming the schema to build-inputs-plus-dev-sizing
-makes the DX one step (`template init && template build`) and gives
-mvmforge a clean shape to emit.
+The whitepaper's load-bearing AI-native claims — signed `ExecutionPlan`
+contract, Zone B runtime supervisor, L7 egress + PII redaction,
+tool-call mediation, attestation-gated key release, signed policy
+bundles, runtime artifact capture, audit binding to plan version — have
+no code path on `mvm` today. Sprint 42 closed the local-isolation
+substrate (W1–W6); Sprint 43 shipped MCP + L3 egress + the L7 proxy
+foundation (PR #23). Sprint 44 builds the rest of the whitepaper's
+runtime contract on top of that substrate.
 
-### Cross-repo coordination tickets (file separately)
+### Wave breakdown
 
-- mvmforge `compile` learns to emit `mvm.toml`; stops emitting
-  `launch.json` as a peer artifact.
-- mvmforge `up` translates IR → `mvmctl up --cmd … --env …` flags.
-- Extract `mvmforge-ir` as a published crate consumable by mvm
-  (`dev-dependency`) and mvmd (`runtime-dependency`).
+Effort labels: **XS** ≤ ½ day · **S** 1–2 days · **M** 3–5 days · **L** > 1 sprint.
 
-### Follow-ups deferred to later sprints
+- **Wave 0 — Whitepaper truth fixes (XS, prereq).** Soften §3.1 backend
+  list, §14 hardware claims, §15.1 PII as design intent until built.
+  Update CLAUDE.md / MEMORY.md: W3 dm-verity is **shipped**.
+- **Wave 1 — Foundation (S+M).** New crates `mvm-plan`, `mvm-policy`,
+  `mvm-supervisor` (lifted from `mvm-hostd`). `Supervisor::launch(plan)`
+  happy path. Audit binds to plan/policy/image. Plus B6 (kill switch),
+  B8 (cosign verify cache), B15 (zeroize lint), B16 (local registry),
+  B19 (admission audit), B21 (config-change audit), C1 (supervisor
+  self-attest), C3 (anti-debug), C4 (supervisor death = fail-closed),
+  E2 (policy precedence), G4 (plan replay protection — latent bug fix).
+- **Wave 2 — Differentiator (M).** L7 egress proxy in supervisor (plan
+  34 expanded); inspector chain (SecretsScanner, SsrfGuard,
+  InjectionGuard, DestinationPolicy); AiProviderRouter + PiiRedactor
+  (detect-only first); tool-call vsock RPC + ToolGate wired. Plus B17
+  (egress audit completeness with audit-emits-before-forward CI gate),
+  B18 (tool audit), E1 (false-positive circuit breaker — ship-blocker),
+  G1 (streaming session audit), G2 (retry-storm dedup).
+- **Wave 3 — Identity & artifact closure (M).** Attestation key-release
+  gate with TPM2 provider; per-run secret grants + revoke-on-stop;
+  audit chain signing + per-tenant streams + export; artifact capture
+  path (virtiofs `/artifacts` + ArtifactCollector). Plus B7 (audit
+  buffering during mvmd outage), B9 (workload identity JWT), B10
+  (memory scrub on stop), B11 (host-published trusted time), B12 (crash
+  dump capture), B14 (snapshot integrity + plan-id binding), B20
+  (secret-grant pairing CI), B22 (audit-write health metrics), C2
+  (channel rekey), D1 (webhook inspection), D2 (RAG/retrieved-content
+  inspection), D3 (file-upload inspection), E3 (attestation clock
+  skew), E4 (disk-full audit), F1 (cost telemetry), F2 (stuck-workload
+  detection), F4 (tenant-visible audit projection), G3 (cross-plan
+  request stitching).
+- **Wave 4 — Multi-tenant + release (M).** Per-tenant netns,
+  per-tenant DEK, ReleasePin admission + two-slot policy rollback,
+  DataClass admission gate.
+- **Wave 5 — Surface & ergonomics (S+M).** Local HTTP API on supervisor
+  Unix socket, `mvm-sdk` crate, cross-backend CI matrix on §3.3 fixture
+  plan, threat-control matrix CI generator. Plus F3 (reproducible plan
+  execution).
+- **Wave 6 — Confidential & adapters (L, optional).** SEV-SNP / TDX
+  provider real impls; Lima/Incus/containerd adapters; Vault / AWS SM /
+  GCP SM secret providers.
 
-- Deprecate the existing `crates/mvm-runtime/src/vm/exec.rs`
-  `launch.json`-reading accommodations once mvmforge stops emitting
-  it. Cross-references the already-shipped follow-up
-  [#5](https://github.com/tinylabscom/mvm/issues/5).
-- Optional `[dev]` runtime-deps block on the manifest (e.g.
-  `before_start = [...]`). File only if user demand surfaces.
-- Reading defaults from a flake `passthru.mvm` attribute (extending
-  `mkGuest` + `nix eval --json` in `mvm-build`).
-- Bundle-level signing for pushed channels (cross-references
-  [`plans/36-sealed-signed-builder-image.md`](plans/36-sealed-signed-builder-image.md)).
+### Cornerstones
 
-### ADR supersedences (noted inline in plan 38)
+Two pieces unblock everything else and should land first:
 
-- ADR-004 Decision 6 ("per-template default network policy")
-  superseded by user-global `~/.mvm/config.toml` + mvmd tenant
-  config.
-- The implicit "template name as registry key" decision superseded
-  by canonical-manifest-path-as-key.
+1. **`mvm_core::ExecutionPlan`** (§3.3, Wave 1) — typed, signed plan
+   replacing scattered `RunParams` / `FlakeRunConfig`. Every
+   "signed/audited/policy-pinned" claim hangs off this. Including
+   `valid_from` / `valid_until` / `nonce` (G4) closes the latent
+   replay bug.
+2. **`mvm-supervisor` daemon** (§7B, Wave 1) — packages the existing
+   `mvm-hostd` skeleton plus EgressProxy, ToolGate, KeystoreReleaser,
+   AuditSigner, ArtifactCollector behind a single trusted process.
+   Owns the data path so tenant code can't bypass policy.
+
+### Differentiator
+
+L7 egress + AI-provider PII redaction (§15 + §15.1, Wave 2). The
+single most important AI-native claim in the whitepaper and currently
+zero code. Ships as **detect-only** first to safely measure detector
+quality on real traffic before transforms are enabled. **Fail-closed**
+on detector error — any inspection failure blocks the request, never
+forwards raw.
+
+### Trust boundary decision (ADR-004)
+
+PII redaction stays in `mvm`, not `mvmd`. The host running the microVM
+is the only point at which a request body is in plaintext on
+infrastructure we trust. Putting redaction in `mvmd` would collapse §8
+plane separation, expand §13 control-plane blast radius (an `mvmd`
+compromise would expose every prompt), break §19 residency, and add a
+network round-trip per AI call. `mvmd` owns policy authoring,
+signing, distribution, and fleet-aggregated reporting; `mvm` owns the
+engine on the data path. ADR-004 staged in plan 37 Addendum A.
 
 ### Sprint 44 success criteria
 
 By sprint close, the project should be able to claim:
 
-1. *Manifest is the user-facing primitive.* `mvmctl template build`
-   discovers `mvm.toml` from cwd or `--mvm-config <path>`; no
-   positional name argument anywhere on the template surface.
-2. *Registry is keyed by manifest path hash.* Slot at
-   `~/.mvm/templates/<sha256(canonical_manifest_path)>/manifest.json`.
-3. *`template create` and `create-multi` are gone.* Removed with a
-   one-shot migration message pointing at `template init`.
-4. *`Mvmfile.toml` and `mvm.toml` use the same parser.* Existing
-   image-build flow on `mvmctl build` migrates to the new schema.
-5. *`template init --prompt` keeps working.* Heuristic + Ollama probe
-   + OpenAI fallback all preserved; planner extended to populate
-   `mvm.toml` resource defaults from inferred preset/features.
-6. *Migration path for existing `~/.mvm/templates/<name>/` slots.*
-   `template list --legacy` + `template prune --legacy` + one-time
-   banner.
-7. *Drift refusal.* `flake`/`profile` mismatches between manifest and
-   persisted slot record abort with `--force` escape.
+1. *Workloads run from typed, signed `ExecutionPlan`s with replay
+   protection.* (Wave 1)
+2. *A trusted supervisor process owns the data path; tenant code
+   cannot bypass policy.* (Wave 1)
+3. *Every outbound egress event produces a signed, plan-bound audit
+   entry.* (Wave 2)
+4. *AI-provider requests pass through PII inspection; detector errors
+   fail closed.* (Wave 2)
+5. *Tool calls are mediated by the supervisor's `ToolGate` and
+   audited.* (Wave 2)
+6. *Attestation gates secret release; TPM2 implementation exists.*
+   (Wave 3)
+7. *Workload outputs are captured under `ArtifactPolicy` retention,
+   not destroyed on exit.* (Wave 3)
+
+Waves 4–6 are post-44 follow-ups; the sprint can close on Waves 0–3.
+
+### Non-goals (named explicitly)
+
+- **mvmd-side concerns:** fleet placement, releases / canary / rollout,
+  host registration, cross-host wake/sleep, policy distribution,
+  control-layer key rotation. Wire types live in
+  `mvm_core::mvmd_iface` so mvmd can land later without reshaping
+  `mvm`.
+- **Hardware-attested vendor trust roots beyond TPM2 in the first pass.**
+  SEV-SNP / TDX providers ship as `unimplemented!()` scaffolds.
+- **Vendor-specific PII detector beyond regex/dictionary v0.**
+  `Detector` trait is open for later additions.
+- **Workflow-engine specific SDKs beyond the generic `mvm-sdk`.**
+- **Model selection, prompt engineering, cost optimization, federated
+  learning** (plan 37 Addendum H — application concerns, not runtime).
 
 ## Completed Sprints
 

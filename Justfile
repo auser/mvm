@@ -12,6 +12,14 @@ default:
 
 # ── Development ──────────────────────────────────────────────────────────
 
+# Wire core.hooksPath at .githooks/ (one-time per clone)
+install-hooks:
+    # Without this, git falls back to .git/hooks/pre-commit, which may
+    # be a stale local copy or the legacy heavy hook. .githooks/pre-commit
+    # is intentionally light (cargo fmt + nix fmt --check).
+    git config core.hooksPath .githooks
+    @echo "core.hooksPath -> .githooks/"
+
 # Build all crates (debug)
 build:
     cargo build --workspace

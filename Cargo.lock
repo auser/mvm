@@ -2390,6 +2390,33 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-plan"
+version = "0.13.0"
+dependencies = [
+ "chrono",
+ "ed25519-dalek",
+ "mvm-core",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
+name = "mvm-policy"
+version = "0.13.0"
+dependencies = [
+ "chrono",
+ "ed25519-dalek",
+ "mvm-core",
+ "mvm-plan",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
+ "thiserror 1.0.69",
+]
+
+[[package]]
 name = "mvm-runtime"
 version = "0.13.0"
 dependencies = [
@@ -2430,6 +2457,24 @@ dependencies = [
  "sha2",
  "sigstore",
  "tempfile",
+ "thiserror 1.0.69",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
+name = "mvm-supervisor"
+version = "0.13.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "ed25519-dalek",
+ "mvm-core",
+ "mvm-plan",
+ "mvm-policy",
+ "rand 0.8.6",
+ "serde",
+ "serde_json",
  "thiserror 1.0.69",
  "tokio",
  "tracing",
