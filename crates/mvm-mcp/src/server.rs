@@ -120,10 +120,10 @@ fn initialize_response() -> Value {
 }
 
 fn instructions_text() -> &'static str {
-    "Run code in an mvm microVM. Use the `run` tool with `env` (which template) and `code` \
-     (the program text). Discover envs via `mvmctl template list` on the host. The default \
-     curated env after Proposal B lands is `claude-code-vm`; users can build their own via \
-     `mvmctl template create … && mvmctl template build <name>`."
+    "Run code in an mvm microVM. Use the `run` tool with `env` (built-in preset like `shell` / \
+     `python` / `node`, OR an absolute path to a project directory whose `mvm.toml` has been \
+     built) and `code` (the program text). Discover available envs via `mvmctl manifest ls` on \
+     the host. Users build their own via `mvmctl init <DIR> && mvmctl build <DIR>`."
 }
 
 fn tools_list_response() -> Value {

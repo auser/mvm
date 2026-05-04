@@ -20,9 +20,16 @@ use serde::{Deserialize, Serialize};
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RunParams {
-    /// Name of a pre-built `mvmctl template`. Validated against the
-    /// installed template registry; an unknown name returns an error
-    /// with the list of valid envs.
+    /// Name of a pre-built sandbox environment. Two forms accepted:
+    ///
+    /// - **Built-in preset name** — `shell`, `bash`, `python`, `node`.
+    /// - **Manifest path** — an absolute path to a project directory
+    ///   containing `mvm.toml`/`Mvmfile.toml`, or to the manifest file
+    ///   itself. The slot for that manifest must already be built
+    ///   (via `mvmctl build <PATH>`).
+    ///
+    /// An unknown value returns an error listing the valid built-ins
+    /// and the user's currently-built slots.
     pub env: String,
     /// Program text. For `env=shell`/`env=bash`, evaluated via
     /// `bash -c <code>`. For `env=python`/`env=node`, written to a
@@ -61,7 +68,7 @@ pub fn run_input_schema() -> serde_json::Value {
         "properties": {
             "env": {
                 "type": "string",
-                "description": "Pre-built microVM template to execute in. Use 'shell' for filesystem/CLI work, 'python' for numeric/data work, 'node' for JS, or any user-defined template such as 'claude-code-vm'."
+                "description": "Pre-built microVM environment to execute in. Use 'shell' / 'bash' for filesystem/CLI work, 'python' for numeric/data work, 'node' for JS, or pass an absolute path to a project directory containing `mvm.toml` (the slot must have been built first via `mvmctl build <PATH>`). Run `mvmctl manifest ls` on the host to list available manifest-keyed slots."
             },
             "code": {
                 "type": "string",
@@ -100,7 +107,7 @@ pub fn all_tools() -> Vec<ToolSchema> {
     vec![ToolSchema {
         name: "run".to_string(),
         description:
-            "Run code inside a fresh mvm microVM. Single tool; the `env` parameter selects which pre-built template to boot. Output is captured (stdout, stderr, exit_code). Each call boots and tears down a transient VM (session reuse is reserved). Use `mvmctl template list` on the host to discover available envs."
+            "Run code inside a fresh mvm microVM. Single tool; the `env` parameter selects which pre-built environment to boot — either a built-in preset (`shell`, `bash`, `python`, `node`) or a path to a project directory whose `mvm.toml` has been built via `mvmctl build`. Output is captured (stdout, stderr, exit_code). Each call boots and tears down a transient VM (session reuse is reserved). Use `mvmctl manifest ls` on the host to discover available manifest-keyed environments."
                 .to_string(),
         input_schema: run_input_schema(),
     }]
