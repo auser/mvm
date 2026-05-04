@@ -461,13 +461,17 @@ fn test_env_vars_to_drive_file_empty() {
 
 // ---- Up/Down command tests ----
 
+// Plan 38 §"Boundary statement" (fleet removal follow-up to slice 7c):
+// the `mvmctl down -f <fleet-config>` flag was removed along with
+// fleet.rs — multi-VM orchestration is mvmd's job. `down::Args` now
+// has only `name`.
+
 #[test]
 fn test_down_parses_no_args() {
     let cli = Cli::try_parse_from(["mvmctl", "down"]).unwrap();
     match cli.command {
-        Commands::Down(down::Args { name, config }) => {
+        Commands::Down(down::Args { name }) => {
             assert!(name.is_none());
-            assert!(config.is_none());
         }
         _ => panic!("Expected Down command"),
     }
@@ -477,21 +481,8 @@ fn test_down_parses_no_args() {
 fn test_down_parses_with_name() {
     let cli = Cli::try_parse_from(["mvmctl", "down", "gw"]).unwrap();
     match cli.command {
-        Commands::Down(down::Args { name, config }) => {
+        Commands::Down(down::Args { name }) => {
             assert_eq!(name.as_deref(), Some("gw"));
-            assert!(config.is_none());
-        }
-        _ => panic!("Expected Down command"),
-    }
-}
-
-#[test]
-fn test_down_parses_with_config() {
-    let cli = Cli::try_parse_from(["mvmctl", "down", "-f", "my-fleet.toml"]).unwrap();
-    match cli.command {
-        Commands::Down(down::Args { name, config }) => {
-            assert!(name.is_none());
-            assert_eq!(config.as_deref(), Some("my-fleet.toml"));
         }
         _ => panic!("Expected Down command"),
     }
