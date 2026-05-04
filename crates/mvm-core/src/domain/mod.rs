@@ -2,6 +2,7 @@
 
 pub mod agent;
 pub mod instance;
+pub mod manifest;
 pub mod node;
 pub mod pool;
 pub mod template;

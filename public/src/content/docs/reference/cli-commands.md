@@ -7,8 +7,8 @@ description: Complete command reference for mvmctl.
 
 | Command | Description |
 |---------|-------------|
-| `mvmctl up --flake <ref>` | Build and run a VM from a Nix flake (aliases: `run`, `start`) |
-| `mvmctl up --template <name>` | Run from a pre-built template (skip build) |
+| `mvmctl up --flake <ref>` | Build and run a VM from a Nix flake |
+| `mvmctl up --manifest <path>` | Boot a pre-built manifest (path to `mvm.toml`, its directory, or a legacy slot name; mutually exclusive with `--flake`). Short form: `-m <path>` |
 | `mvmctl up --name <name>` | Specify VM name (auto-generated if omitted) |
 | `mvmctl up --profile <variant>` | Flake package variant (e.g. worker, gateway) |
 | `mvmctl up --cpus N --memory SIZE` | Override vCPU count and memory (supports 512M, 4G, etc.) |
@@ -28,7 +28,6 @@ description: Complete command reference for mvmctl.
 | `mvmctl up --secret KEY:host` | Bind a secret to a domain (repeatable; see [Config & Secrets](/guides/config-secrets/)) |
 | `mvmctl up --network <name>` | Named dev network to attach VM to (default: "default") |
 | `mvmctl down [name]` | Stop VMs by name, or all if omitted |
-| `mvmctl down -f <config>` | Stop only VMs defined in specified config |
 | `mvmctl ls` | List running VMs (aliases: `ps`, `status`) |
 | `mvmctl ls -a` | Show all VMs including stopped |
 | `mvmctl ls --json` | Output as JSON |
@@ -42,12 +41,8 @@ description: Complete command reference for mvmctl.
 
 | Command | Description |
 |---------|-------------|
-| `mvmctl bootstrap` | Full setup from scratch: Homebrew deps (macOS), Lima, Firecracker, kernel, rootfs |
+| `mvmctl bootstrap` | Full setup from scratch: Homebrew deps (macOS), Lima, Firecracker, kernel, rootfs (idempotent — safe to re-run) |
 | `mvmctl bootstrap --production` | Production mode (skip Homebrew, assume Linux with apt) |
-| `mvmctl setup` | Create Lima VM and install Firecracker assets (requires limactl) |
-| `mvmctl setup --recreate` | Stop microVM, rebuild rootfs from upstream squashfs |
-| `mvmctl setup --force` | Re-run all setup steps even if already complete |
-| `mvmctl setup --lima-cpus N --lima-mem N` | Configure Lima VM resources (defaults: 8 CPUs, 16 GiB) |
 | `mvmctl dev [up]` | Auto-bootstrap if needed, start dev VM, drop into shell. Uses Apple Container on macOS 26+, Lima otherwise. |
 | `mvmctl dev up --project ~/dir` | Auto-bootstrap then cd into a project directory |
 | `mvmctl dev up --metrics-port PORT` | Bind a Prometheus metrics endpoint (0 = disabled) |
@@ -62,7 +57,7 @@ description: Complete command reference for mvmctl.
 | `mvmctl dev rebuild` | Stop, clear cache, and rebuild + restart the dev VM |
 | `mvmctl dev rebuild --shell` (or `-s`) | Open an interactive shell after rebuilding |
 | `mvmctl dev import-image <path>` | Side-load a pre-built dev image artifact into the cache (air-gapped install path; from plan 36 sealed builder image) |
-| `mvmctl doctor` | Run system diagnostics and dependency checks |
+| `mvmctl doctor` | Run diagnostics + dependency checks + security posture (folded in from the dropped `mvmctl security` verb) |
 | `mvmctl doctor --json` | Output diagnostics as JSON |
 | `mvmctl update` | Check for and install mvmctl updates |
 | `mvmctl update --check` | Only check for updates, don't install |
@@ -84,33 +79,48 @@ description: Complete command reference for mvmctl.
 | `mvmctl cleanup --keep <N>` | Keep the N newest build revisions |
 | `mvmctl cleanup --verbose` | Print each cached build path that gets removed |
 
-## Templates
+## Manifests
+
+> **Status:** the `mvmctl init/build/manifest *` surface below is the **plan-38 model**, shipped on `feat/manifest-driven-template-dx-claude`. The user-facing primitive is an `mvm.toml` file alongside your `flake.nix`. See the [Manifests guide](/guides/manifests/) for the conceptual model. The old `mvmctl template <verb>` namespace was removed; clap returns "unrecognized subcommand" for old invocations. `mvmctl manifest push` / `pull` are planned in [plan 39](https://github.com/tinylabscom/mvm/blob/main/specs/plans/39-manifest-push-pull.md) but not yet implemented.
+
+### Scaffolding (top-level)
 
 | Command | Description |
 |---------|-------------|
-| `mvmctl template init <name> --local` | Scaffold a new template directory with flake.nix |
-| `mvmctl template init <name> --vm` | Scaffold inside the Lima VM (overrides --local) |
-| `mvmctl template init <name> --preset <preset>` | Scaffold preset: minimal, http, postgres, worker, python (default: minimal) |
-| `mvmctl template init <name> --prompt "<text>" --local` | Generate a local scaffold from a natural-language prompt. In `auto` mode (default) probes for a local OpenAI-compatible endpoint on loopback (Ollama @ `:11434`, LocalAI @ `:8080`) before falling through to OpenAI. Override the order with `MVM_TEMPLATE_PROVIDER=openai\|local\|heuristic`; skip the probe with `MVM_TEMPLATE_NO_LOCAL_PROBE=1`. The probe issues a brief loopback TCP connect on each invocation, visible to local processes via `netstat` |
-| `mvmctl template init <name> --dir <path>` | Base directory for local init (default: current dir) |
-| `mvmctl template create <name>` | Create a single template definition |
-| `mvmctl template create <name> --data-disk SIZE` | Create template with a data disk (10G, 512M, or plain MB; 0 = none) |
-| `mvmctl template create-multi <base>` | Create templates for multiple roles (`--roles worker,gateway`) |
-| `mvmctl template build <name>` | Build a template (runs nix build in Lima) |
-| `mvmctl template build <name> --force` | Rebuild even if cached |
-| `mvmctl template build <name> --snapshot` | Build, boot, wait for healthy, and capture a Firecracker snapshot |
-| `mvmctl template build <name> --update-hash` | Recompute the Nix fixed-output derivation hash |
-| `mvmctl template build <name> --config <toml>` | Build multiple variants from a template config TOML |
-| `mvmctl template push <name>` | Push to S3-compatible registry |
-| `mvmctl template push <name> --revision <hash>` | Push a specific revision |
-| `mvmctl template pull <name>` | Pull from registry |
-| `mvmctl template pull <name> --revision <hash>` | Pull a specific revision |
-| `mvmctl template verify <name>` | Verify template checksums |
-| `mvmctl template verify <name> --revision <hash>` | Verify a specific revision |
-| `mvmctl template list` | List all templates (`--json` for JSON) |
-| `mvmctl template info <name>` | Show template details, current revision, artifact sizes, and snapshot status (`--json` for JSON) |
-| `mvmctl template edit <name>` | Edit template configuration (--cpus, --mem, --flake, --profile, --role, --data-disk) |
-| `mvmctl template delete <name>` | Delete a template (`--force` to skip confirmation) |
+| `mvmctl init <DIR>` | Scaffold `mvm.toml` + `flake.nix` (+ NixOS config) in `DIR` (required) |
+| `mvmctl init <DIR> --preset <preset>` | Preset: `minimal`, `http`, `postgres`, `worker`, `python` (default: `minimal`) |
+| `mvmctl init <DIR> --catalog <name>` | Scaffold from a bundled catalog entry (run `mvmctl catalog list` to browse). Mutually exclusive with `--preset`/`--prompt` |
+| `mvmctl init <DIR> --prompt "<text>"` | Generate scaffold from a natural-language prompt. In `auto` mode (default) probes for a local OpenAI-compatible endpoint on loopback (Ollama @ `:11434`, LocalAI @ `:8080`) before falling through to OpenAI. Override with `MVM_TEMPLATE_PROVIDER=openai\|local\|heuristic`; skip probe with `MVM_TEMPLATE_NO_LOCAL_PROBE=1` |
+
+### Building (top-level)
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl build [PATH]` | Build the manifest at `PATH` (file or directory; default: cwd walk-up). Persists artifacts to a slot keyed by `sha256(canonical_manifest_path)`. Subsumes today's `mvmctl build --flake .` and the legacy `Mvmfile.toml` flow into one verb |
+| `mvmctl build [PATH] --force` | Rebuild even if the cache hits |
+| `mvmctl build [PATH] --snapshot` | After build, boot, wait for healthy, and capture a Firecracker snapshot (Firecracker backend only) |
+| `mvmctl build [PATH] --update-hash` | Recompute the Nix fixed-output derivation hash |
+| `mvmctl build [PATH] --vcpus N --mem SIZE --data-disk SIZE` | CLI overrides for resource sizing; persisted to the slot record |
+| `mvmctl build [PATH] --json` | Stream structured build events |
+
+### Running (top-level — already manifest-aware)
+
+`mvmctl up [PATH]` and `mvmctl exec [PATH] -- <cmd>` accept a manifest path or its directory and look up the manifest-keyed slot. If no current revision exists, they error with a hint to run `mvmctl build`. See the [VM Lifecycle](#vm-lifecycle) and [One-shot Exec](#one-shot-exec) sections for full flag lists. (Plan 40 dropped the `start` and `run` aliases on `up`.)
+
+### Inspection / registry (`mvmctl manifest *`)
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl manifest ls [--json]` | List built slots — manifest path, last-built timestamp, optional `name` |
+| `mvmctl manifest ls --orphans` | Slots whose source manifest file is missing on disk |
+| `mvmctl manifest info [PATH] [--json]` | Print manifest, slot path, current revision, snapshot info, provenance |
+| `mvmctl manifest rm [PATH] [--force]` | Remove the slot from the registry |
+| `mvmctl manifest rm [PATH] --manifest-file` | Also delete the source `mvm.toml` (off by default) |
+| `mvmctl manifest verify [PATH] [--revision <hash>]` | Verify checksums for a built slot |
+| `mvmctl manifest verify --check-signature` | Reserved for plan 36 (sealed-signed-builder-image); errors today with "not yet wired" |
+| `mvmctl manifest prune --orphans` | Remove builds whose source manifest is gone |
+| `mvmctl manifest prune --orphans --dry-run` | Preview what would be removed |
+| `mvmctl manifest push` / `mvmctl manifest pull` | **Planned, not yet implemented.** Tracked in [plan 39](https://github.com/tinylabscom/mvm/blob/main/specs/plans/39-manifest-push-pull.md). |
 
 ## Configuration
 
@@ -132,9 +142,11 @@ description: Complete command reference for mvmctl.
 
 | Command | Description |
 |---------|-------------|
-| `mvmctl flake check` | Validate a Nix flake before building (current directory) |
-| `mvmctl flake check --flake <ref>` | Validate a specific flake path or reference |
-| `mvmctl flake check --json` | Output structured JSON instead of human-readable output |
+| `mvmctl validate` | Validate a Nix flake before building (current directory) |
+| `mvmctl validate --flake <ref>` | Validate a specific flake path or reference |
+| `mvmctl validate --json` | Output structured JSON instead of human-readable output |
+
+> Plan 40 renamed this verb from `mvmctl flake check` to `mvmctl validate`.
 
 ## Networks
 
@@ -147,12 +159,14 @@ description: Complete command reference for mvmctl.
 
 ## Image Catalog
 
+> Plan 40 renamed the `mvmctl image *` namespace to `mvmctl catalog *` (a metadata-only browser) and folded "build from catalog" into `mvmctl init <DIR> --catalog <name>`.
+
 | Command | Description |
 |---------|-------------|
-| `mvmctl image list` | List available images in the bundled catalog (alias: `ls`) |
-| `mvmctl image search <query>` | Search images by name, description, or tag |
-| `mvmctl image fetch <name>` | Build an image from the catalog (creates template + runs Nix build) |
-| `mvmctl image info <name>` | Show catalog entry details (JSON) |
+| `mvmctl catalog list` | List bundled catalog entries |
+| `mvmctl catalog search <query>` | Search entries by name, description, or tag |
+| `mvmctl catalog info <name>` | Show catalog entry details (JSON) |
+| `mvmctl init <DIR> --catalog <name>` | Scaffold a project from a catalog entry |
 
 ## Console
 
@@ -172,7 +186,7 @@ the feature, so the handler is not present in the binary at all.
 | Command | Description |
 |---------|-------------|
 | `mvmctl exec -- <cmd>...` | Boot the bundled default microVM image, run `<cmd>`, exit |
-| `mvmctl exec --template <name> -- <cmd>...` | Boot a registered template instead of the default |
+| `mvmctl exec --manifest <name> -- <cmd>...` | Boot a registered template instead of the default |
 | `mvmctl exec --launch-plan <path> ` | Run the entrypoint from an [mvmforge](https://github.com/tinylabscom/decorationer) document — either the `launch.json` artifact (top-level `entrypoint`) or the Workload IR manifest (top-level `apps[]`). Mutually exclusive with trailing argv |
 | `mvmctl exec --add-dir HOST:GUEST[:MODE] -- <cmd>` | Mount a host directory inside the guest. `MODE` is `ro` (default — writes discarded) or `rw` (writes rsynced back to the host after the command exits — see [ADR-002](/contributing/adr/002-writable-add-dir/)). Repeatable |
 | `mvmctl exec --env KEY=VAL -- <cmd>` | Inject an environment variable. Repeatable. Overrides any env vars carried by `--launch-plan` |
@@ -183,7 +197,7 @@ Examples:
 
 ```bash
 mvmctl exec -- uname -a                                # default image
-mvmctl exec --template minimal -- /bin/true            # named template
+mvmctl exec --manifest minimal -- /bin/true            # named template
 mvmctl exec --add-dir .:/work -- ls /work              # share current dir, RO
 mvmctl exec --add-dir .:/work:rw -- touch /work/x      # writable, rsynced back
 mvmctl exec -e DEBUG=1 -- env | grep DEBUG             # env var injection
@@ -194,7 +208,7 @@ mvmctl exec --launch-plan ./launch.json                # mvmforge entrypoint
 
 `--launch-plan` accepts either of mvmforge's two JSON documents — the
 shape is auto-detected. Only the entrypoint is consumed (image selection
-still comes from `--template` or the bundled default in v1).
+still comes from `--manifest` or the bundled default in v1).
 
 **LaunchPlan artifact** (`mvmforge compile`'s `launch.json`, top-level
 `entrypoint`):
@@ -236,7 +250,7 @@ highest): top-level/app `env` → `entrypoint.env` → CLI `--env`.
 
 ### Snapshot restore
 
-When the request boots a registered template (`--template <name>`) and
+When the request boots a registered template (`--manifest <name>`) and
 that template has a captured snapshot, `mvmctl exec` restores from the
 snapshot instead of cold-booting — typically sub-second on Linux/KVM.
 
@@ -255,18 +269,17 @@ the full background.
 
 ## Default microVM Image
 
-When an image-taking command is invoked without `--flake` or `--template`,
+When an image-taking command is invoked without `--flake` or `--manifest`,
 `mvmctl` falls back to a bundled minimal image (busybox + the guest agent).
 This applies to:
 
 - `mvmctl exec -- <cmd>` — boots a fresh transient microVM and runs `<cmd>`
-- `mvmctl up` / `mvmctl run` / `mvmctl start` — boots a long-running microVM
-  with the same image
+- `mvmctl up` — boots a long-running microVM with the same image
 
 The image is built from `nix/images/default-tenant/` on first use and cached at
 `~/.cache/mvm/default-microvm/` (kernel + rootfs; cache directory name
 unchanged for backward compat). Nix is required to build
-it; pass `--template` or `--flake` if Nix isn't available on your host.
+it; pass `--manifest` or `--flake` if Nix isn't available on your host.
 
 ## Cache
 
@@ -275,28 +288,18 @@ it; pass `--template` or `--flake` if Nix isn't available on your host.
 | `mvmctl cache info` | Show cache directory path and disk usage |
 | `mvmctl cache prune` | Remove stale temp files from the cache |
 | `mvmctl cache prune --dry-run` | Show what would be removed without deleting |
+| `mvmctl cache prune --orphan-builds` | Also sweep orphaned builds — built artifacts whose source `mvm.toml` is gone (equivalent to `mvmctl manifest prune --orphans`) |
 
 ## Security
 
-| Command | Description |
-|---------|-------------|
-| `mvmctl security status` | Show security posture evaluation (vsock auth, seccomp, no-SSH, etc.) |
-| `mvmctl security status --json` | Output posture report as JSON |
-
-## Setup
-
-| Command | Description |
-|---------|-------------|
-| `mvmctl init` | First-time setup wizard (deps, Lima VM, default network, XDG dirs) |
-| `mvmctl init --non-interactive` | Run setup with defaults, no prompts |
-| `mvmctl init --lima-cpus N --lima-mem N` | Configure Lima VM resources |
+> Plan 40 dropped the standalone `mvmctl security status` verb. Posture checks now live inside `mvmctl doctor`.
 
 ## Utilities
 
 | Command | Description |
 |---------|-------------|
-| `mvmctl completions <shell>` | Generate shell completions (bash, zsh, fish, powershell) |
 | `mvmctl shell-init` | Print shell configuration (completions + dev aliases) to stdout |
+| `mvmctl shell-init --emit-completions <shell>` | Emit just the shell-completion script (replaces the dropped `mvmctl completions <shell>`) |
 | `mvmctl metrics` | Show runtime metrics (Prometheus text format) |
 | `mvmctl metrics --json` | Show runtime metrics as JSON |
 | `mvmctl uninstall` | Remove Lima VM, Firecracker, and all mvm state (confirmation required) |

@@ -130,8 +130,9 @@ Out of scope (named in ADR-002):
 - Multi-tenant guests. One guest = one workload.
 - Hardware-backed key attestation.
 
-`mvmctl security status` reports the live posture on the running
-host. Architecture detail in
+`mvmctl doctor` reports the live posture on the running host
+(plan 40 folded the standalone `security` verb into doctor's
+unified diagnostics report). Architecture detail in
 `specs/adrs/002-microvm-security-posture.md`. Implementation
 sequence in `specs/plans/25-microvm-hardening.md`.
 

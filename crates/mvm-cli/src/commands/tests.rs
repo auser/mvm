@@ -7,17 +7,17 @@ use clap::Parser;
 
 // Group module aliases — give tests short names (`cleanup`, `up`, etc.) that
 // follow the dispatcher's naming, regardless of which group they live in.
-use super::build::{build, template};
+use super::build::build;
+use super::catalog;
 use super::env::{cleanup, dev, init, uninstall};
-use super::ops::{audit, cache, config, metrics, security};
+use super::ops::{audit, cache, config, metrics};
 use super::vm::{console, down, exec, forward, up};
 
 use audit::AuditAction;
 use cache::CacheAction;
+use catalog::CatalogAction;
 use config::ConfigAction;
 use dev::DevAction;
-use security::SecurityAction;
-use template::TemplateAction;
 use up::RunParams;
 
 use super::shared::{
@@ -152,7 +152,7 @@ fn test_resolve_flake_ref_nonexistent_fails() {
 fn test_run_parses_all_flags() {
     let cli = Cli::try_parse_from([
         "mvmctl",
-        "run",
+        "up",
         "--flake",
         ".",
         "--profile",
@@ -182,11 +182,11 @@ fn test_run_parses_all_flags() {
 
 #[test]
 fn test_run_defaults() {
-    let cli = Cli::try_parse_from(["mvmctl", "run", "--flake", "."]).unwrap();
+    let cli = Cli::try_parse_from(["mvmctl", "up", "--flake", "."]).unwrap();
     match cli.command {
         Commands::Up(up::Args {
             flake,
-            template,
+            manifest,
             name,
             profile,
             cpus,
@@ -196,7 +196,7 @@ fn test_run_defaults() {
             ..
         }) => {
             assert_eq!(flake, Some(".".to_string()));
-            assert!(template.is_none(), "template should be None when omitted");
+            assert!(manifest.is_none(), "manifest should be None when omitted");
             assert!(name.is_none(), "name should be None when omitted");
             assert!(profile.is_none(), "profile should be None when omitted");
             assert!(cpus.is_none(), "cpus should be None when omitted");
@@ -204,47 +204,58 @@ fn test_run_defaults() {
             assert_eq!(volume.len(), 0);
             assert_eq!(hypervisor, "firecracker");
         }
-        _ => panic!("Expected Run command"),
+        _ => panic!("Expected Up command"),
     }
 }
 
 #[test]
-fn test_run_without_source_uses_default_microvm() {
-    // No --flake / --template: the dispatcher falls back to the bundled
+fn test_up_without_source_uses_default_microvm() {
+    // No --flake / --manifest: the dispatcher falls back to the bundled
     // default microVM image. Clap should accept the bare invocation; the
     // dispatcher then resolves the image at runtime.
-    let cli = Cli::try_parse_from(["mvmctl", "run"]).expect("parse");
+    let cli = Cli::try_parse_from(["mvmctl", "up"]).expect("parse");
     match cli.command {
         Commands::Up(up::Args {
-            flake, template, ..
+            flake, manifest, ..
         }) => {
             assert!(flake.is_none(), "no --flake should be parsed");
-            assert!(template.is_none(), "no --template should be parsed");
+            assert!(manifest.is_none(), "no --manifest should be parsed");
         }
-        _ => panic!("Expected Run command"),
+        _ => panic!("Expected Up command"),
     }
 }
 
 #[test]
-fn test_run_template_flag() {
-    let cli = Cli::try_parse_from(["mvmctl", "run", "--template", "openclaw"]).unwrap();
+fn test_up_manifest_flag() {
+    let cli = Cli::try_parse_from(["mvmctl", "up", "--manifest", "openclaw"]).unwrap();
     match cli.command {
         Commands::Up(up::Args {
-            flake, template, ..
+            flake, manifest, ..
         }) => {
             assert!(flake.is_none());
-            assert_eq!(template, Some("openclaw".to_string()));
+            assert_eq!(manifest, Some("openclaw".to_string()));
         }
-        _ => panic!("Expected Run command"),
+        _ => panic!("Expected Up command"),
     }
 }
 
 #[test]
-fn test_run_flake_and_template_conflict() {
-    let result = Cli::try_parse_from(["mvmctl", "run", "--flake", ".", "--template", "openclaw"]);
+fn test_up_manifest_short_flag() {
+    let cli = Cli::try_parse_from(["mvmctl", "up", "-m", "openclaw"]).unwrap();
+    match cli.command {
+        Commands::Up(up::Args { manifest, .. }) => {
+            assert_eq!(manifest, Some("openclaw".to_string()));
+        }
+        _ => panic!("Expected Up command"),
+    }
+}
+
+#[test]
+fn test_up_flake_and_manifest_conflict() {
+    let result = Cli::try_parse_from(["mvmctl", "up", "--flake", ".", "--manifest", "openclaw"]);
     assert!(
         result.is_err(),
-        "--flake and --template should be mutually exclusive"
+        "--flake and --manifest should be mutually exclusive"
     );
 }
 
@@ -252,7 +263,7 @@ fn test_run_flake_and_template_conflict() {
 fn test_run_volume_dir_inject() {
     let cli = Cli::try_parse_from([
         "mvmctl",
-        "run",
+        "up",
         "--flake",
         ".",
         "-v",
@@ -274,7 +285,7 @@ fn test_run_volume_dir_inject() {
 #[test]
 fn test_run_volume_persistent() {
     let cli =
-        Cli::try_parse_from(["mvmctl", "run", "--flake", ".", "-v", "/data:/mnt/data:4G"]).unwrap();
+        Cli::try_parse_from(["mvmctl", "up", "--flake", ".", "-v", "/data:/mnt/data:4G"]).unwrap();
     match cli.command {
         Commands::Up(up::Args { volume, .. }) => {
             assert_eq!(volume.len(), 1);
@@ -334,7 +345,7 @@ fn test_parse_volume_spec_unsupported_mount() {
 fn test_run_port_and_env_flags() {
     let cli = Cli::try_parse_from([
         "mvmctl",
-        "run",
+        "up",
         "--flake",
         ".",
         "-p",
@@ -358,7 +369,7 @@ fn test_run_port_and_env_flags() {
 
 #[test]
 fn test_run_port_and_env_default_empty() {
-    let cli = Cli::try_parse_from(["mvmctl", "run", "--flake", "."]).unwrap();
+    let cli = Cli::try_parse_from(["mvmctl", "up", "--flake", "."]).unwrap();
     match cli.command {
         Commands::Up(up::Args { port, env, .. }) => {
             assert!(port.is_empty());
@@ -372,7 +383,7 @@ fn test_run_port_and_env_default_empty() {
 fn test_run_forward_flag() {
     let cli = Cli::try_parse_from([
         "mvmctl",
-        "run",
+        "up",
         "--flake",
         ".",
         "-p",
@@ -391,7 +402,7 @@ fn test_run_forward_flag() {
 
 #[test]
 fn test_run_forward_default_false() {
-    let cli = Cli::try_parse_from(["mvmctl", "run", "--flake", "."]).unwrap();
+    let cli = Cli::try_parse_from(["mvmctl", "up", "--flake", "."]).unwrap();
     match cli.command {
         Commands::Up(up::Args { forward, .. }) => {
             assert!(!forward);
@@ -462,13 +473,17 @@ fn test_env_vars_to_drive_file_empty() {
 
 // ---- Up/Down command tests ----
 
+// Plan 38 §"Boundary statement" (fleet removal follow-up to slice 7c):
+// the `mvmctl down -f <fleet-config>` flag was removed along with
+// fleet.rs — multi-VM orchestration is mvmd's job. `down::Args` now
+// has only `name`.
+
 #[test]
 fn test_down_parses_no_args() {
     let cli = Cli::try_parse_from(["mvmctl", "down"]).unwrap();
     match cli.command {
-        Commands::Down(down::Args { name, config }) => {
+        Commands::Down(down::Args { name }) => {
             assert!(name.is_none());
-            assert!(config.is_none());
         }
         _ => panic!("Expected Down command"),
     }
@@ -478,21 +493,8 @@ fn test_down_parses_no_args() {
 fn test_down_parses_with_name() {
     let cli = Cli::try_parse_from(["mvmctl", "down", "gw"]).unwrap();
     match cli.command {
-        Commands::Down(down::Args { name, config }) => {
+        Commands::Down(down::Args { name }) => {
             assert_eq!(name.as_deref(), Some("gw"));
-            assert!(config.is_none());
-        }
-        _ => panic!("Expected Down command"),
-    }
-}
-
-#[test]
-fn test_down_parses_with_config() {
-    let cli = Cli::try_parse_from(["mvmctl", "down", "-f", "my-fleet.toml"]).unwrap();
-    match cli.command {
-        Commands::Down(down::Args { name, config }) => {
-            assert!(name.is_none());
-            assert_eq!(config.as_deref(), Some("my-fleet.toml"));
         }
         _ => panic!("Expected Down command"),
     }
@@ -650,25 +652,66 @@ fn test_parse_port_spec_invalid() {
 }
 
 // -------------------------------------------------------------------------
-// Alias tests (Phase 4)
+// Top-level verb tests (plan 40 dropped `ps`, `start`, `run`, `flake`,
+// `image`, `setup`, `completions`, `security` — `ls`/`up`/`validate`/
+// `catalog`/`doctor` cover the cleaned surface)
 // -------------------------------------------------------------------------
 
 #[test]
-fn test_ls_alias_for_ps() {
+fn test_ls_command() {
     let cli = Cli::try_parse_from(["mvmctl", "ls"]).unwrap();
-    assert!(matches!(cli.command, Commands::Ps(_)));
+    assert!(matches!(cli.command, Commands::Ls(_)));
 }
 
 #[test]
-fn test_ps_command() {
-    let cli = Cli::try_parse_from(["mvmctl", "ps"]).unwrap();
-    assert!(matches!(cli.command, Commands::Ps(_)));
+fn test_ps_verb_is_unrecognized() {
+    let result = Cli::try_parse_from(["mvmctl", "ps"]);
+    assert!(result.is_err(), "`ps` was dropped in plan 40");
 }
 
 #[test]
-fn test_start_alias_for_run() {
-    // 'start' is already an alias on Run — verify it still works
-    assert!(Cli::try_parse_from(["mvmctl", "start", "--flake", "."]).is_ok());
+fn test_start_verb_is_unrecognized() {
+    let result = Cli::try_parse_from(["mvmctl", "start", "--flake", "."]);
+    assert!(result.is_err(), "`start` alias was dropped in plan 40");
+}
+
+#[test]
+fn test_run_verb_is_unrecognized() {
+    let result = Cli::try_parse_from(["mvmctl", "run", "--flake", "."]);
+    assert!(result.is_err(), "`run` alias was dropped in plan 40");
+}
+
+#[test]
+fn test_setup_verb_is_unrecognized() {
+    let result = Cli::try_parse_from(["mvmctl", "setup"]);
+    assert!(result.is_err(), "`setup` was folded into `bootstrap`");
+}
+
+#[test]
+fn test_completions_verb_is_unrecognized() {
+    let result = Cli::try_parse_from(["mvmctl", "completions", "bash"]);
+    assert!(
+        result.is_err(),
+        "`completions` was folded into `shell-init`"
+    );
+}
+
+#[test]
+fn test_flake_verb_is_unrecognized() {
+    let result = Cli::try_parse_from(["mvmctl", "flake", "check"]);
+    assert!(result.is_err(), "`flake` was renamed to `validate`");
+}
+
+#[test]
+fn test_security_verb_is_unrecognized() {
+    let result = Cli::try_parse_from(["mvmctl", "security", "status"]);
+    assert!(result.is_err(), "`security` was folded into `doctor`");
+}
+
+#[test]
+fn test_image_verb_is_unrecognized() {
+    let result = Cli::try_parse_from(["mvmctl", "image", "list"]);
+    assert!(result.is_err(), "`image` was folded into `catalog`");
 }
 
 // -------------------------------------------------------------------------
@@ -912,7 +955,7 @@ fn test_clap_flake_ref_invalid() {
 #[test]
 fn test_run_rejects_invalid_vm_name_at_parse_time() {
     // Clap should reject bad --name values before any command runs.
-    let result = Cli::try_parse_from(["mvmctl", "run", "--flake", ".", "--name", "INVALID"]);
+    let result = Cli::try_parse_from(["mvmctl", "up", "--flake", ".", "--name", "INVALID"]);
     assert!(
         result.is_err(),
         "uppercase VM name should fail at parse time"
@@ -921,7 +964,7 @@ fn test_run_rejects_invalid_vm_name_at_parse_time() {
 
 #[test]
 fn test_run_rejects_invalid_flake_at_parse_time() {
-    let result = Cli::try_parse_from(["mvmctl", "run", "--flake", ". ; rm -rf /", "--name", "vm1"]);
+    let result = Cli::try_parse_from(["mvmctl", "up", "--flake", ". ; rm -rf /", "--name", "vm1"]);
     assert!(
         result.is_err(),
         "shell-injection flake ref should fail at parse time"
@@ -930,7 +973,7 @@ fn test_run_rejects_invalid_flake_at_parse_time() {
 
 #[test]
 fn test_run_rejects_invalid_port_at_parse_time() {
-    let result = Cli::try_parse_from(["mvmctl", "run", "--flake", ".", "--port", "notaport"]);
+    let result = Cli::try_parse_from(["mvmctl", "up", "--flake", ".", "--port", "notaport"]);
     assert!(result.is_err(), "invalid port should fail at parse time");
 }
 
@@ -1058,30 +1101,34 @@ fn test_network_remove_help() {
     assert!(cli.is_ok());
 }
 
-// --- Image CLI tests ---
+// --- Catalog CLI tests (plan 40 replaced `mvmctl image *`) ---
 
 #[test]
-fn test_image_list_help() {
-    let cli = Cli::try_parse_from(["mvmctl", "image", "list"]);
+fn test_catalog_list_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "catalog", "list"]);
     assert!(cli.is_ok());
 }
 
 #[test]
-fn test_image_search_help() {
-    let cli = Cli::try_parse_from(["mvmctl", "image", "search", "http"]);
-    assert!(cli.is_ok());
+fn test_catalog_search_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "catalog", "search", "http"]).unwrap();
+    match cli.command {
+        Commands::Catalog(catalog::Args {
+            action: CatalogAction::Search { query },
+        }) => assert_eq!(query, "http"),
+        _ => panic!("Expected Catalog Search command"),
+    }
 }
 
 #[test]
-fn test_image_fetch_help() {
-    let cli = Cli::try_parse_from(["mvmctl", "image", "fetch", "minimal"]);
-    assert!(cli.is_ok());
-}
-
-#[test]
-fn test_image_info_help() {
-    let cli = Cli::try_parse_from(["mvmctl", "image", "info", "postgres"]);
-    assert!(cli.is_ok());
+fn test_catalog_info_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "catalog", "info", "postgres"]).unwrap();
+    match cli.command {
+        Commands::Catalog(catalog::Args {
+            action: CatalogAction::Info { name },
+        }) => assert_eq!(name, "postgres"),
+        _ => panic!("Expected Catalog Info command"),
+    }
 }
 
 // --- Console CLI tests ---
@@ -1108,11 +1155,11 @@ fn test_console_with_command() {
 // --- Exec CLI tests ---
 
 #[test]
-fn exec_default_template_argv_only() {
+fn exec_default_manifest_argv_only() {
     let cli = Cli::try_parse_from(["mvmctl", "exec", "--", "uname", "-a"]).expect("parse");
     match cli.command {
         Commands::Exec(exec::Args {
-            template,
+            manifest,
             cpus,
             memory,
             add_dir,
@@ -1121,7 +1168,7 @@ fn exec_default_template_argv_only() {
             launch_plan,
             argv,
         }) => {
-            assert!(template.is_none(), "template should default to None");
+            assert!(manifest.is_none(), "manifest should default to None");
             assert_eq!(cpus, 2);
             assert_eq!(memory, "512M");
             assert!(add_dir.is_empty());
@@ -1167,11 +1214,11 @@ fn exec_launch_plan_conflicts_with_argv() {
 }
 
 #[test]
-fn exec_with_template_and_resources() {
+fn exec_with_manifest_and_resources() {
     let cli = Cli::try_parse_from([
         "mvmctl",
         "exec",
-        "--template",
+        "--manifest",
         "my-tpl",
         "--cpus",
         "4",
@@ -1183,13 +1230,13 @@ fn exec_with_template_and_resources() {
     .expect("parse");
     match cli.command {
         Commands::Exec(exec::Args {
-            template,
+            manifest,
             cpus,
             memory,
             argv,
             ..
         }) => {
-            assert_eq!(template.as_deref(), Some("my-tpl"));
+            assert_eq!(manifest.as_deref(), Some("my-tpl"));
             assert_eq!(cpus, 4);
             assert_eq!(memory, "1G");
             assert_eq!(argv, vec!["/bin/true".to_string()]);
@@ -1238,61 +1285,51 @@ fn exec_requires_argv() {
     assert!(cli.is_err());
 }
 
-// --- Init CLI tests ---
+// --- Init CLI tests (plan 40: pure project-scaffold; DIR is required) ---
 
 #[test]
-fn test_init_defaults() {
-    let cli = Cli::try_parse_from(["mvmctl", "init"]).unwrap();
+fn test_init_requires_dir() {
+    let result = Cli::try_parse_from(["mvmctl", "init"]);
+    assert!(
+        result.is_err(),
+        "bare `mvmctl init` should error (DIR required)"
+    );
+}
+
+#[test]
+fn test_init_with_catalog_flag() {
+    let cli = Cli::try_parse_from(["mvmctl", "init", "demo", "--catalog", "postgres"]).unwrap();
     match cli.command {
         Commands::Init(init::Args {
-            non_interactive,
-            lima_cpus,
-            lima_mem,
+            dir,
+            preset,
+            prompt,
+            catalog,
         }) => {
-            assert!(!non_interactive);
-            assert_eq!(lima_cpus, 8);
-            assert_eq!(lima_mem, 16);
+            assert_eq!(dir, "demo");
+            assert!(preset.is_none());
+            assert!(prompt.is_none());
+            assert_eq!(catalog.as_deref(), Some("postgres"));
         }
         _ => panic!("Expected Init command"),
     }
 }
 
 #[test]
-fn test_init_non_interactive() {
-    let cli =
-        Cli::try_parse_from(["mvmctl", "init", "--non-interactive", "--lima-cpus", "4"]).unwrap();
-    match cli.command {
-        Commands::Init(init::Args {
-            non_interactive,
-            lima_cpus,
-            ..
-        }) => {
-            assert!(non_interactive);
-            assert_eq!(lima_cpus, 4);
-        }
-        _ => panic!("Expected Init command"),
-    }
-}
-
-// --- Security CLI tests ---
-
-#[test]
-fn test_security_status_help() {
-    let cli = Cli::try_parse_from(["mvmctl", "security", "status"]);
-    assert!(cli.is_ok());
-}
-
-#[test]
-fn test_security_status_json() {
-    let cli = Cli::try_parse_from(["mvmctl", "security", "status", "--json"]).unwrap();
-    match cli.command {
-        Commands::Security(security::Args {
-            action: SecurityAction::Status { json },
-        }) => {
-            assert!(json);
-        }
-        _ => panic!("Expected Security Status command"),
-    }
+fn test_init_catalog_conflicts_with_preset() {
+    let result = Cli::try_parse_from([
+        "mvmctl",
+        "init",
+        "demo",
+        "--catalog",
+        "http",
+        "--preset",
+        "minimal",
+    ]);
+    assert!(
+        result.is_err(),
+        "--catalog and --preset are mutually exclusive"
+    );
 }
 
 // --- Cache CLI tests ---
@@ -1314,9 +1351,32 @@ fn test_cache_prune_dry_run() {
     let cli = Cli::try_parse_from(["mvmctl", "cache", "prune", "--dry-run"]).unwrap();
     match cli.command {
         Commands::Cache(cache::Args {
-            action: CacheAction::Prune { dry_run },
+            action:
+                CacheAction::Prune {
+                    dry_run,
+                    orphan_builds,
+                },
         }) => {
             assert!(dry_run);
+            assert!(!orphan_builds);
+        }
+        _ => panic!("Expected Cache Prune command"),
+    }
+}
+
+#[test]
+fn test_cache_prune_orphan_builds_flag() {
+    let cli = Cli::try_parse_from(["mvmctl", "cache", "prune", "--orphan-builds"]).unwrap();
+    match cli.command {
+        Commands::Cache(cache::Args {
+            action:
+                CacheAction::Prune {
+                    dry_run,
+                    orphan_builds,
+                },
+        }) => {
+            assert!(!dry_run);
+            assert!(orphan_builds);
         }
         _ => panic!("Expected Cache Prune command"),
     }
@@ -1347,40 +1407,54 @@ fn test_up_network_custom() {
     }
 }
 
+// Plan 38 §4 (slice 7b): the `mvmctl template *` namespace was removed
+// outright. The two tests previously here covered `template init …`
+// preset/prompt parsing — equivalent coverage now lives on
+// `mvmctl init <DIR> --preset/--prompt` (smart-dispatch in
+// `commands/env/init.rs`). See `test_init_*` below.
+
 #[test]
-fn test_template_init_defaults_to_no_preset_or_prompt() {
-    let cli = Cli::try_parse_from(["mvmctl", "template", "init", "demo", "--local"]).unwrap();
+fn test_init_scaffold_dir() {
+    let cli = Cli::try_parse_from(["mvmctl", "init", "demo"]).unwrap();
     match cli.command {
-        Commands::Template(template::Args {
-            action: TemplateAction::Init { preset, prompt, .. },
+        Commands::Init(init::Args {
+            dir,
+            preset,
+            prompt,
+            catalog,
         }) => {
-            assert!(preset.is_none(), "preset should be None when omitted");
-            assert!(prompt.is_none(), "prompt should be None when omitted");
+            assert_eq!(dir, "demo");
+            assert!(preset.is_none());
+            assert!(prompt.is_none());
+            assert!(catalog.is_none());
         }
-        _ => panic!("Expected Template Init command"),
+        _ => panic!("Expected Init command"),
     }
 }
 
 #[test]
-fn test_template_init_parses_prompt_flag() {
+fn test_init_scaffold_with_prompt_flag() {
     let cli = Cli::try_parse_from([
         "mvmctl",
-        "template",
         "init",
         "demo",
-        "--local",
         "--prompt",
         "python worker that polls an API",
     ])
     .unwrap();
     match cli.command {
-        Commands::Template(template::Args {
-            action: TemplateAction::Init { prompt, preset, .. },
+        Commands::Init(init::Args {
+            dir,
+            prompt,
+            preset,
+            catalog,
         }) => {
+            assert_eq!(dir, "demo");
             assert_eq!(prompt.as_deref(), Some("python worker that polls an API"));
-            assert!(preset.is_none(), "preset should remain None when omitted");
+            assert!(preset.is_none());
+            assert!(catalog.is_none());
         }
-        _ => panic!("Expected Template Init command"),
+        _ => panic!("Expected Init command"),
     }
 }
 

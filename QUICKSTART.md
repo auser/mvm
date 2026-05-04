@@ -72,14 +72,14 @@ Firecracker microVMs are headless workloads with no SSH access -- they communica
 Build a microVM image and run it in one command:
 
 ```bash
-mvmctl run --flake github:org/app --profile minimal --cpus 2 --memory 1024
+mvmctl up --flake github:org/app --profile minimal --cpus 2 --memory 1024
 ```
 
 Or build separately:
 
 ```bash
 mvmctl build --flake . --profile minimal --role worker
-mvmctl start
+mvmctl up
 ```
 
 The `--profile` selects a NixOS configuration profile and `--role` selects the VM role (worker, gateway, builder). These map to Nix flake attributes.
@@ -102,36 +102,48 @@ Then:
 
 ```bash
 mvmctl build .
-mvmctl start
+mvmctl up
 ```
 
-## 6. Templates (Reusable Base Images)
+## 6. Manifests (Reusable Base Images)
 
-Build a base image once and share it across machines:
+> The `mvmctl init` / `mvmctl build` / `mvmctl manifest *` surface below is the **plan-38 model** (rolling out across slices 5-7). The old `mvmctl template <verb>` namespace is removed outright when slices 5-7 land — no deprecation alias. See [Manifests](public/src/content/docs/guides/manifests.md) for the full guide.
+
+Scaffold a project, edit its `mvm.toml`, build, share:
 
 ```bash
-# Create a template
-mvmctl template create base-worker \
-    --flake github:org/app \
-    --profile minimal \
-    --role worker \
-    --cpus 2 --mem 1024
+# Scaffold mvm.toml + flake.nix
+mvmctl init base-worker
+$EDITOR base-worker/mvm.toml      # set flake, profile, vcpus, mem
 
-# Build it (runs nix build inside Lima)
-mvmctl template build base-worker
+# Build (runs nix build, persists artifacts)
+mvmctl build base-worker
 
 # Share via S3-compatible registry
-mvmctl template push base-worker
-mvmctl template pull base-worker    # On another machine
-mvmctl template verify base-worker  # Verify checksums
+mvmctl manifest push base-worker
+mvmctl manifest pull base-worker    # on another machine
+mvmctl manifest verify base-worker  # checksums + signatures
 ```
 
-List and inspect templates:
+List and inspect built projects:
 
 ```bash
-mvmctl template list
-mvmctl template info base-worker
+mvmctl manifest ls
+mvmctl manifest info base-worker
 ```
+
+A minimal `mvm.toml`:
+
+```toml
+flake = "."
+profile = "default"
+vcpus = 2
+mem = "1024M"
+data_disk = "0"
+name = "base-worker"   # optional; display + S3 channel hint
+```
+
+That's the entire schema — build inputs (flake/profile) plus dev sizing (vcpus/mem/data_disk). What's *inside* the microVM (services, packages, NixOS config) lives in `flake.nix`. Multi-VM topology and runtime networking are `mvmd`'s job, not the manifest's.
 
 ## 7. Lima Shell (Development Access)
 
@@ -165,7 +177,7 @@ The installed binary is available when you `mvmctl shell` into Lima, useful for 
 Pass host directories into the Firecracker microVM:
 
 ```bash
-mvmctl run --flake . --profile minimal \
+mvmctl up --flake . --profile minimal \
     --volume ./data:/data:1024 \
     --cpus 2 --memory 1024
 ```
@@ -189,17 +201,17 @@ mvmctl doctor    # Check system dependencies and configuration
 
 ## Troubleshooting
 
-**`Lima VM 'mvm' does not exist`**: Run `mvmctl setup` or `mvmctl dev` (which auto-bootstraps).
+**`Lima VM 'mvm' does not exist`**: Run `mvmctl bootstrap` or `mvmctl dev` (which auto-bootstraps).
 
 **`limactl not found`**: Run `mvmctl bootstrap` to install Lima via Homebrew, or install manually with `brew install lima`.
 
-**Firecracker not installed**: Run `mvmctl setup` to install Firecracker inside the Lima VM.
+**Firecracker not installed**: Run `mvmctl bootstrap` to install Firecracker inside the Lima VM.
 
 **Can't access project files inside microVM**: The Firecracker microVM has an isolated filesystem. Use `mvmctl shell` to access the Lima VM where your home directory is mounted, or pass volumes with `--volume`.
 
 **Lima VM is slow**: Adjust resources: `mvmctl destroy && mvmctl dev --lima-cpus 8 --lima-mem 16`.
 
-**Rootfs corrupted**: Rebuild without destroying the Lima VM: `mvmctl setup --recreate`.
+**Rootfs corrupted**: Re-run `mvmctl bootstrap` (idempotent — repaves any corrupted rootfs).
 
 ## Next Steps
 

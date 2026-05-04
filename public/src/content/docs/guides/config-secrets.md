@@ -13,7 +13,7 @@ mkdir -p /tmp/my-config /tmp/my-secrets
 echo '{"gateway": {"port": 8080}}' > /tmp/my-config/app.json
 echo 'API_KEY=sk-...' > /tmp/my-secrets/app.env
 
-mvmctl up --template my-app \
+mvmctl up --manifest my-app \
     --volume /tmp/my-config:/mnt/config \
     --volume /tmp/my-secrets:/mnt/secrets
 ```
@@ -96,10 +96,10 @@ for concrete flakes (`hello`, `hello-node`, `hello-python`, `llm-agent`).
 ### Running with host-mounted config and secrets
 
 ```bash
-mvmctl template build my-template
-mvmctl up --template my-template --name my-vm \
-    -v ./config:/mnt/config \
-    -v ./secrets:/mnt/secrets \
+mvmctl template build openclaw
+mvmctl up --manifest openclaw --name oc \
+    -v nix/examples/openclaw/config:/mnt/config \
+    -v nix/examples/openclaw/secrets:/mnt/secrets \
     -p 3000:3000
 mvmctl forward my-vm 3000:3000
 ```
@@ -125,9 +125,9 @@ cat > /tmp/my-secrets/api-keys.env << 'EOF'
 ANTHROPIC_API_KEY=sk-ant-...
 EOF
 
-mvmctl up --template my-template --name my-vm \
-    -v /tmp/my-config:/mnt/config \
-    -v /tmp/my-secrets:/mnt/secrets \
+mvmctl up --manifest openclaw --name oc \
+    -v /tmp/oc-config:/mnt/config \
+    -v /tmp/oc-secrets:/mnt/secrets \
     -p 3000:3000
 ```
 
@@ -143,10 +143,10 @@ Subsequent runs restore from the snapshot instead of cold-booting,
 reducing startup time from minutes to **1-2 seconds**:
 
 ```bash
-mvmctl template build my-template --snapshot
-mvmctl up --template my-template --name my-vm \
-    -v ./config:/mnt/config \
-    -v ./secrets:/mnt/secrets \
+mvmctl template build openclaw --snapshot
+mvmctl up --manifest openclaw --name oc \
+    -v nix/examples/openclaw/config:/mnt/config \
+    -v nix/examples/openclaw/secrets:/mnt/secrets \
     -p 3000:3000
 ```
 
@@ -172,17 +172,20 @@ Example: run three instances from one snapshot with different API
 keys:
 
 ```bash
-mvmctl up --template my-template --name my-vm-prod \
+# Production gateway with prod Anthropic key
+mvmctl up --manifest openclaw --name oc-prod \
     -v ./prod/config:/mnt/config \
     -v ./prod/secrets:/mnt/secrets \
     -p 3000:3000
 
-mvmctl up --template my-template --name my-vm-staging \
+# Staging gateway with test key
+mvmctl up --manifest openclaw --name oc-staging \
     -v ./staging/config:/mnt/config \
     -v ./staging/secrets:/mnt/secrets \
     -p 3001:3000
 
-mvmctl up --template my-template --name my-vm-dev \
+# Dev gateway with no key (localhost-only testing)
+mvmctl up --manifest openclaw --name oc-dev \
     -v ./dev/config:/mnt/config \
     -p 3002:3000
 ```

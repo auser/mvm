@@ -8,10 +8,10 @@ description: Common issues and their solutions.
 ### "Lima VM not found"
 
 ```
-Error: Lima VM 'mvm-builder' is not available. Run 'mvmctl setup' or 'mvmctl bootstrap' first.
+Error: Lima VM 'mvm-builder' is not available. Run 'mvmctl bootstrap' first.
 ```
 
-**Fix**: Run `mvmctl bootstrap` (macOS) or `mvmctl setup` (Linux with Lima installed).
+**Fix**: Run `mvmctl bootstrap` (idempotent — installs Lima/Firecracker if missing, no-ops otherwise).
 
 ### "Failed to run command in Lima VM"
 
@@ -65,7 +65,7 @@ Snapshot may be corrupted after a Firecracker version change.
 **Fix**: Delete the snapshot and cold boot:
 ```bash
 mvmctl template build <template> --force
-mvmctl up --template <template> --name <name>
+mvmctl up --manifest <template> --name <name>
 ```
 
 ## Build Issues
@@ -191,9 +191,9 @@ mvmctl doctor   # check available backends
 
 ### Rootfs corrupted
 
-Rebuild without destroying the Lima VM:
+Re-run `mvmctl bootstrap` — it's idempotent and repaves any corrupted rootfs from the upstream squashfs without destroying the Lima VM:
 ```bash
-mvmctl setup --recreate
+mvmctl bootstrap
 ```
 
 ## Logging

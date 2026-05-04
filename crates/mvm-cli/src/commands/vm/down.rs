@@ -1,10 +1,7 @@
 //! `mvmctl down` — stop one or more running VMs.
 
-use anyhow::{Context, Result};
+use anyhow::Result;
 use clap::Args as ClapArgs;
-
-use crate::fleet;
-use crate::ui;
 
 use mvm_core::user_config::MvmConfig;
 use mvm_core::vm_backend::VmId;
@@ -16,9 +13,6 @@ use super::Cli;
 pub(in crate::commands) struct Args {
     /// VM name to stop (or all VMs if omitted)
     pub name: Option<String>,
-    /// Path to fleet config (stops only VMs defined in config)
-    #[arg(short = 'f', long)]
-    pub config: Option<String>,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
@@ -52,63 +46,19 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             result
         }
         None => {
-            let found = load_fleet_config(args.config.as_deref())?;
-            if let Some((fleet_config, _base_dir)) = found {
-                let mut stopped = 0;
-                for vm_name in fleet_config.vms.keys() {
-                    if backend.stop(&VmId::from(vm_name.as_str())).is_ok() {
-                        stopped += 1;
-                        mvm_core::audit::emit(
-                            mvm_core::audit::LocalAuditKind::VmStop,
-                            Some(vm_name.as_str()),
-                            Some("ok"),
-                        );
-                    }
-                }
-
-                // Clean up bridge if no VMs remain
-                let remaining = backend.list().unwrap_or_default();
-                if remaining.is_empty() {
-                    let _ = mvm_runtime::vm::network::bridge_teardown();
-                }
-
-                ui::success(&format!("Stopped {} VMs", stopped));
-                Ok(())
-            } else {
-                let result = backend.stop_all();
-                // Audit the broad-effect "stop everything" command so a
-                // tenant can reconstruct who turned the lights off.
-                mvm_core::audit::emit(
-                    mvm_core::audit::LocalAuditKind::VmStop,
-                    None,
-                    Some(if result.is_ok() {
-                        "stop_all_ok"
-                    } else {
-                        "stop_all_failed"
-                    }),
-                );
-                result
-            }
+            // Plan-38 §"Boundary statement": fleet/multi-VM is mvmd's job.
+            // `mvmctl down` (no args) just stops every running VM.
+            let result = backend.stop_all();
+            mvm_core::audit::emit(
+                mvm_core::audit::LocalAuditKind::VmStop,
+                None,
+                Some(if result.is_ok() {
+                    "stop_all_ok"
+                } else {
+                    "stop_all_failed"
+                }),
+            );
+            result
         }
-    }
-}
-
-/// Load fleet config from an explicit path or auto-discover mvm.toml.
-pub(super) fn load_fleet_config(
-    config_path: Option<&str>,
-) -> Result<Option<(fleet::FleetConfig, std::path::PathBuf)>> {
-    match config_path {
-        Some(path) => {
-            let content = std::fs::read_to_string(path)
-                .with_context(|| format!("Failed to read {}", path))?;
-            let config: fleet::FleetConfig =
-                toml::from_str(&content).with_context(|| format!("Failed to parse {}", path))?;
-            let dir = std::path::Path::new(path)
-                .parent()
-                .unwrap_or(std::path::Path::new("."))
-                .to_path_buf();
-            Ok(Some((config, dir)))
-        }
-        None => fleet::find_fleet_config(),
     }
 }

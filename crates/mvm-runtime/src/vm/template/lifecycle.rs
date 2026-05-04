@@ -118,6 +118,605 @@ pub fn template_init(id: &str) -> Result<()> {
     Ok(())
 }
 
+// ---------------------------------------------------------------------------
+// Plan 38 slice 4: manifest-keyed slot primitives.
+//
+// These coexist with the legacy name-keyed primitives above. They operate on
+// `~/.mvm/templates/<sha256(canonical_manifest_path)>/manifest.json` —
+// `PersistedManifest` is the slot-resident JSON record from slice 2. Callers
+// migrate slice-by-slice; nothing in the legacy path changes here.
+// ---------------------------------------------------------------------------
+
+use mvm_core::manifest::{
+    PersistedManifest, Provenance, is_slot_hash_dirname, slot_current_symlink, slot_dir,
+    slot_dir_for_manifest_path, slot_revision_dir,
+};
+
+/// One row produced by [`template_list_slots`]. Contains just the
+/// fields a UI/MCP caller needs without re-loading every slot's
+/// `manifest.json` per query.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SlotEntry {
+    pub slot_hash: String,
+    pub manifest_path: String,
+    pub name: Option<String>,
+    pub updated_at: String,
+}
+
+/// Persist a [`PersistedManifest`] to its registry slot. The slot
+/// directory is derived from the record's `manifest_hash`. Atomic
+/// (write-temp-then-rename via [`PersistedManifest::write_to_slot`]).
+#[instrument(skip_all, fields(slot_hash = %persisted.manifest_hash))]
+pub fn template_persist_slot(persisted: &PersistedManifest) -> Result<()> {
+    let dir = slot_dir(&persisted.manifest_hash);
+    persisted.write_to_slot(std::path::Path::new(&dir))
+}
+
+/// Load the slot record for a given `slot_hash`. Returns the
+/// deserialised [`PersistedManifest`] from
+/// `~/.mvm/templates/<slot_hash>/manifest.json`.
+#[instrument(skip_all, fields(slot_hash = slot_hash))]
+pub fn template_load_slot(slot_hash: &str) -> Result<PersistedManifest> {
+    let dir = slot_dir(slot_hash);
+    PersistedManifest::read_from_slot(std::path::Path::new(&dir))
+}
+
+/// Convenience: load the slot record for a given manifest filesystem
+/// path. Computes `sha256(canonical_path)` then delegates to
+/// [`template_load_slot`].
+#[instrument(skip_all, fields(manifest_path = %path.display()))]
+pub fn template_load_slot_for_manifest_path(path: &std::path::Path) -> Result<PersistedManifest> {
+    let dir = slot_dir_for_manifest_path(path)?;
+    PersistedManifest::read_from_slot(std::path::Path::new(&dir))
+}
+
+/// Remove a slot directory by hash. With `force = true`, a missing
+/// slot is not an error (idempotent cleanup). Mirrors today's
+/// [`template_delete`] behaviour for the slot-keyed world.
+#[instrument(skip_all, fields(slot_hash = slot_hash, force))]
+pub fn template_delete_slot(slot_hash: &str, force: bool) -> Result<()> {
+    let dir = slot_dir(slot_hash);
+    let path = std::path::Path::new(&dir);
+    match std::fs::remove_dir_all(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound && force => Ok(()),
+        Err(e) => Err(e).with_context(|| format!("Failed to delete slot {}", slot_hash)),
+    }
+}
+
+/// Pure helper: split a list of directory entries from
+/// `~/.mvm/templates/` into modern hash-keyed and legacy name-keyed
+/// buckets. Independent of the filesystem so it is straightforwardly
+/// unit-testable.
+fn classify_template_dir_entries<I>(entries: I) -> (Vec<String>, Vec<String>)
+where
+    I: IntoIterator<Item = String>,
+{
+    let mut hashes = Vec::new();
+    let mut legacy = Vec::new();
+    for name in entries {
+        if is_slot_hash_dirname(&name) {
+            hashes.push(name);
+        } else {
+            legacy.push(name);
+        }
+    }
+    hashes.sort();
+    legacy.sort();
+    (hashes, legacy)
+}
+
+/// Read the immediate child directory names under
+/// `~/.mvm/templates/`. Returns an empty vec when the base dir
+/// doesn't exist yet (fresh install).
+fn read_templates_base_subdir_names() -> Result<Vec<String>> {
+    let base = mvm_core::template::templates_base_dir();
+    let entries = match std::fs::read_dir(&base) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+        Err(e) => {
+            return Err(e).with_context(|| format!("Failed to list templates dir {}", base));
+        }
+    };
+    let names: Vec<String> = entries
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_type().map(|t| t.is_dir()).unwrap_or(false))
+        .filter_map(|e| e.file_name().into_string().ok())
+        .collect();
+    Ok(names)
+}
+
+/// List modern hash-keyed slot directory names. Use
+/// [`template_list_slots`] when you also need each slot's metadata.
+#[instrument(skip_all)]
+pub fn template_list_slot_hashes() -> Result<Vec<String>> {
+    let names = read_templates_base_subdir_names()?;
+    let (hashes, _) = classify_template_dir_entries(names);
+    Ok(hashes)
+}
+
+/// List legacy name-keyed template directory names — anything in
+/// `~/.mvm/templates/` whose dirname isn't a 64-char lowercase-hex
+/// slot hash. Powers the §8a migration banner / `template list
+/// --legacy` (slice 8).
+#[instrument(skip_all)]
+pub fn template_list_legacy_names() -> Result<Vec<String>> {
+    let names = read_templates_base_subdir_names()?;
+    let (_, legacy) = classify_template_dir_entries(names);
+    Ok(legacy)
+}
+
+/// Read a slot's `current` symlink and return the revision hash it
+/// points at. Mirrors [`current_revision_id`] for the slot-keyed world.
+#[instrument(skip_all, fields(slot_hash = slot_hash))]
+pub fn current_revision_id_for_slot(slot_hash: &str) -> Result<String> {
+    use std::os::unix::ffi::OsStrExt;
+
+    let link = slot_current_symlink(slot_hash);
+    let target = std::fs::read_link(&link)
+        .with_context(|| format!("Slot has no current revision: {}", link))?;
+    let raw = target.as_os_str().as_bytes();
+    let raw = std::str::from_utf8(raw)
+        .unwrap_or_default()
+        .trim()
+        .to_string();
+    // Symlink target is relative `artifacts/revisions/<rev>`; strip the
+    // prefix to recover the bare revision hash.
+    let rev = raw
+        .strip_prefix("artifacts/revisions/")
+        .unwrap_or(&raw)
+        .to_string();
+    if rev.is_empty() {
+        anyhow::bail!("Slot current symlink is empty: {}", link);
+    }
+    Ok(rev)
+}
+
+/// Resolve a slot to its current artifact paths. Mirrors
+/// [`template_artifacts`] but keyed by slot hash; returns the
+/// [`PersistedManifest`] in place of [`TemplateSpec`].
+///
+/// Returns `(persisted_manifest, vmlinux, initrd, rootfs, revision_hash)`.
+#[instrument(skip_all, fields(slot_hash = slot_hash))]
+pub fn template_artifacts_for_slot(
+    slot_hash: &str,
+) -> Result<(PersistedManifest, String, Option<String>, String, String)> {
+    let persisted = template_load_slot(slot_hash)?;
+    let rev = current_revision_id_for_slot(slot_hash)?;
+    let rev_dir = slot_revision_dir(slot_hash, &rev);
+
+    let vmlinux = format!("{rev_dir}/vmlinux");
+    let rootfs = format!("{rev_dir}/rootfs.ext4");
+    let initrd_candidate = format!("{rev_dir}/initrd");
+
+    if !std::path::Path::new(&vmlinux).exists() {
+        anyhow::bail!(
+            "Slot '{}' has no vmlinux (run `mvmctl build {}`)",
+            slot_hash,
+            persisted.manifest_path
+        );
+    }
+    if !std::path::Path::new(&rootfs).exists() {
+        anyhow::bail!(
+            "Slot '{}' has no rootfs (run `mvmctl build {}`)",
+            slot_hash,
+            persisted.manifest_path
+        );
+    }
+
+    let has_initrd = std::path::Path::new(&initrd_candidate).exists();
+    let initrd_path = if has_initrd {
+        Some(initrd_candidate)
+    } else {
+        None
+    };
+
+    Ok((persisted, vmlinux, initrd_path, rootfs, rev))
+}
+
+/// Whether the slot's current revision has a Firecracker snapshot.
+pub fn template_has_snapshot_for_slot(slot_hash: &str) -> Result<bool> {
+    let rev = current_revision_id_for_slot(slot_hash)?;
+    let snap_dir = mvm_core::manifest::slot_snapshot_dir(slot_hash, &rev);
+    let vmstate = std::path::Path::new(&snap_dir).join("vmstate.bin");
+    let mem = std::path::Path::new(&snap_dir).join("mem.bin");
+    Ok(vmstate.exists() && mem.exists())
+}
+
+/// Load snapshot metadata for the slot's current revision.
+pub fn template_snapshot_info_for_slot(slot_hash: &str) -> Result<Option<SnapshotInfo>> {
+    let rev = current_revision_id_for_slot(slot_hash)?;
+    let rev_dir = slot_revision_dir(slot_hash, &rev);
+    let meta_path = format!("{}/revision.json", rev_dir);
+    let data = std::fs::read_to_string(&meta_path)
+        .with_context(|| format!("Failed to read revision.json for slot {}", slot_hash))?;
+    let revision: TemplateRevision = serde_json::from_str(&data)
+        .with_context(|| format!("Corrupt revision.json for slot {}", slot_hash))?;
+    Ok(revision.snapshot)
+}
+
+/// Synthesize a [`TemplateSpec`] from a [`PersistedManifest`] so the
+/// dispatched functions below can return a single shape regardless of
+/// whether the caller passed a name or a slot hash.
+///
+/// `template_id` is set to the manifest hash; `role` is empty (manifest
+/// schema doesn't carry a role); `default_network_policy` is `None`
+/// (the manifest schema doesn't carry network policy either —
+/// runtime policy comes from CLI flags / `~/.mvm/config.toml` / mvmd
+/// per plan 38).
+fn persisted_to_synthetic_spec(p: &PersistedManifest) -> TemplateSpec {
+    TemplateSpec {
+        schema_version: p.schema_version,
+        template_id: p.manifest_hash.clone(),
+        flake_ref: p.flake_ref.clone(),
+        profile: p.profile.clone(),
+        role: String::new(),
+        vcpus: p.vcpus,
+        mem_mib: p.mem_mib,
+        data_disk_mib: p.data_disk_mib,
+        created_at: p.created_at.clone(),
+        updated_at: p.updated_at.clone(),
+        default_network_policy: None,
+    }
+}
+
+/// Unified entry point that dispatches to the slot-keyed function when
+/// `id_or_slot` looks like a 64-char lowercase-hex slot hash, or to
+/// the legacy name-keyed function otherwise.
+///
+/// Used by `mvmctl up` / `mvmctl exec` so the CLI can resolve a
+/// `--manifest <PATH>` argument to a slot hash and pass it through
+/// unchanged. Returns the same shape as [`template_artifacts`].
+#[instrument(skip_all, fields(id_or_slot = id_or_slot))]
+pub fn template_artifacts_dispatched(
+    id_or_slot: &str,
+) -> Result<(TemplateSpec, String, Option<String>, String, String)> {
+    if is_slot_hash_dirname(id_or_slot) {
+        let (persisted, vmlinux, initrd, rootfs, rev) = template_artifacts_for_slot(id_or_slot)?;
+        Ok((
+            persisted_to_synthetic_spec(&persisted),
+            vmlinux,
+            initrd,
+            rootfs,
+            rev,
+        ))
+    } else {
+        template_artifacts(id_or_slot)
+    }
+}
+
+/// Dispatched variant of [`template_load`] / [`template_load_slot`].
+/// Returns a [`TemplateSpec`] regardless of which key shape was used.
+pub fn template_load_dispatched(id_or_slot: &str) -> Result<TemplateSpec> {
+    if is_slot_hash_dirname(id_or_slot) {
+        let persisted = template_load_slot(id_or_slot)?;
+        Ok(persisted_to_synthetic_spec(&persisted))
+    } else {
+        template_load(id_or_slot)
+    }
+}
+
+/// Dispatched variant of [`template_snapshot_info`] /
+/// [`template_snapshot_info_for_slot`].
+pub fn template_snapshot_info_dispatched(id_or_slot: &str) -> Result<Option<SnapshotInfo>> {
+    if is_slot_hash_dirname(id_or_slot) {
+        template_snapshot_info_for_slot(id_or_slot)
+    } else {
+        template_snapshot_info(id_or_slot)
+    }
+}
+
+/// Dispatched variant of [`template_has_snapshot`] /
+/// [`template_has_snapshot_for_slot`].
+pub fn template_has_snapshot_dispatched(id_or_slot: &str) -> Result<bool> {
+    if is_slot_hash_dirname(id_or_slot) {
+        template_has_snapshot_for_slot(id_or_slot)
+    } else {
+        template_has_snapshot(id_or_slot)
+    }
+}
+
+/// Verify a slot's artifacts against its `checksums.json`. Returns
+/// `Ok(())` if every recorded file matches; an error otherwise listing
+/// which file mismatched. The checksums file is written by
+/// `template_push_slot` (slice 8b) and is also produced inline by
+/// `template_build_from_manifest` once push lands; until then a slot
+/// without a `checksums.json` errors with a hint.
+///
+/// `revision` selects a specific revision; `None` resolves the slot's
+/// `current` symlink.
+#[instrument(skip_all, fields(slot_hash = slot_hash, revision = ?revision))]
+pub fn template_verify_slot(slot_hash: &str, revision: Option<&str>) -> Result<()> {
+    let rev = match revision {
+        Some(r) => r.to_string(),
+        None => current_revision_id_for_slot(slot_hash)?,
+    };
+    let rev_dir = std::path::PathBuf::from(slot_revision_dir(slot_hash, &rev));
+    let sums_path = rev_dir.join("checksums.json");
+    let sums_bytes = std::fs::read(&sums_path).with_context(|| {
+        format!(
+            "Missing {} — checksums are written by `mvmctl manifest push` (slice 8b not yet shipped). Run `mvmctl build --force` to repopulate the slot, then verify will work after push lands.",
+            sums_path.display()
+        )
+    })?;
+    let checksums: Checksums = serde_json::from_slice(&sums_bytes)
+        .with_context(|| format!("Corrupt {}", sums_path.display()))?;
+
+    let mut mismatches = Vec::new();
+    for (name, expected_hex) in &checksums.files {
+        let path = rev_dir.join(name);
+        if !path.exists() {
+            mismatches.push(format!("{}: missing", name));
+            continue;
+        }
+        let actual = sha256_hex(&path)?;
+        if &actual != expected_hex {
+            mismatches.push(format!(
+                "{}: expected {}, got {}",
+                name,
+                &expected_hex[..expected_hex.len().min(12)],
+                &actual[..actual.len().min(12)]
+            ));
+        }
+    }
+
+    if !mismatches.is_empty() {
+        anyhow::bail!(
+            "Slot {} revision {} failed verification:\n  - {}",
+            slot_hash,
+            rev,
+            mismatches.join("\n  - ")
+        );
+    }
+    Ok(())
+}
+
+/// Cleanup pass — remove slots whose source manifest file is missing
+/// on disk (e.g. the user `rm`'d their project directory or moved it
+/// elsewhere, leaving the slot dangling under `~/.mvm/templates/`).
+///
+/// Returns `(removed_count, slots_removed)`. Errors on individual
+/// slot deletes are logged at warn but don't abort the sweep — a
+/// single corrupted slot shouldn't block cleaning up the rest.
+///
+/// Slots whose `manifest.json` is missing or unparseable are also
+/// considered orphaned (we can't cross-reference them, so we treat
+/// them as garbage to clean up).
+#[instrument(skip_all)]
+pub fn template_prune_orphan_slots() -> Result<(usize, Vec<String>)> {
+    let mut removed = Vec::new();
+    for slot_hash in template_list_slot_hashes()? {
+        let persisted = match template_load_slot(&slot_hash) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!(slot = %slot_hash, error = %e, "removing slot with unreadable manifest.json");
+                if let Err(rm_err) = template_delete_slot(&slot_hash, true) {
+                    tracing::warn!(slot = %slot_hash, error = %rm_err, "failed to remove unreadable slot");
+                    continue;
+                }
+                removed.push(slot_hash);
+                continue;
+            }
+        };
+
+        if !std::path::Path::new(&persisted.manifest_path).exists() {
+            tracing::info!(
+                slot = %slot_hash,
+                manifest_path = %persisted.manifest_path,
+                "removing orphaned slot (manifest file gone)"
+            );
+            if let Err(e) = template_delete_slot(&slot_hash, true) {
+                tracing::warn!(slot = %slot_hash, error = %e, "failed to remove orphaned slot");
+                continue;
+            }
+            removed.push(slot_hash);
+        }
+    }
+    let count = removed.len();
+    Ok((count, removed))
+}
+
+/// List modern slots with their metadata (manifest path, optional
+/// display name, last-updated timestamp). Slots whose
+/// `manifest.json` is missing or unparseable are skipped with a
+/// warn log — listing should never fail end-to-end on a single
+/// corrupt slot.
+#[instrument(skip_all)]
+pub fn template_list_slots() -> Result<Vec<SlotEntry>> {
+    let mut out = Vec::new();
+    for slot_hash in template_list_slot_hashes()? {
+        match template_load_slot(&slot_hash) {
+            Ok(persisted) => out.push(SlotEntry {
+                slot_hash,
+                manifest_path: persisted.manifest_path,
+                name: persisted.name,
+                updated_at: persisted.updated_at,
+            }),
+            Err(e) => {
+                tracing::warn!(slot = %slot_hash, error = %e, "skipping unreadable slot");
+            }
+        }
+    }
+    out.sort_by(|a, b| a.slot_hash.cmp(&b.slot_hash));
+    Ok(out)
+}
+
+/// Build a manifest-keyed slot using the dev build pipeline (local Nix in
+/// Lima or host). Mirrors [`template_build`] but operates on a
+/// [`PersistedManifest`] from slice 2 instead of looking up by name.
+///
+/// On success, the slot's `current` symlink points at
+/// `artifacts/revisions/<revision_hash>/`, the persisted manifest record
+/// is refreshed (`updated_at` + `provenance`), and a `revision.json` is
+/// written next to the artifacts. Returns the [`TemplateRevision`] for
+/// display / further use.
+///
+/// `force` clears the dev build cache (`~/.mvm/dev/builds/`) so the
+/// underlying Nix build runs from scratch. `update_hash` recomputes the
+/// FOD hash in the flake first (rare; used after package version bumps).
+#[instrument(skip_all, fields(slot_hash = %persisted.manifest_hash, force, update_hash))]
+pub fn template_build_from_manifest(
+    persisted: &PersistedManifest,
+    force: bool,
+    update_hash: bool,
+) -> Result<TemplateRevision> {
+    use crate::ui;
+
+    let build_env = crate::build_env::default_build_env();
+    let env = build_env.as_ref();
+
+    ui::info(&format!(
+        "Building manifest at '{}' (flake: {}, profile: {})",
+        persisted.manifest_path, persisted.flake_ref, persisted.profile
+    ));
+
+    if update_hash {
+        update_fod_hash(&persisted.flake_ref)?;
+    }
+
+    if force {
+        ui::info("Force build: clearing dev build cache");
+        let builds_dir = format!("{}/dev/builds", mvm_core::config::mvm_data_dir());
+        if let Err(e) = env.shell_exec(&format!("rm -rf {builds_dir}")) {
+            warn!("failed to clear dev build cache: {e}");
+        }
+    }
+
+    let result =
+        mvm_build::dev_build::dev_build(env, &persisted.flake_ref, Some(&persisted.profile))?;
+
+    if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(env, &result) {
+        ui::warn(&format!(
+            "Could not verify guest agent ({}). If built with mvm's mkGuest, the agent is already included.",
+            e
+        ));
+    }
+
+    // Store artifacts under the slot's revision directory.
+    let slot_hash = &persisted.manifest_hash;
+    let rev = &result.revision_hash;
+    let rev_dst = slot_revision_dir(slot_hash, rev);
+    ui::info("Storing artifacts in slot revision directory...");
+    shell::run_in_vm(&format!("mkdir -p {rev_dst}"))?;
+    shell::run_in_vm(&format!("cp -a {} {rev_dst}/vmlinux", result.vmlinux_path))?;
+    if let Some(initrd) = &result.initrd_path {
+        shell::run_in_vm(&format!("cp -a {} {rev_dst}/initrd", initrd))?;
+    }
+    shell::run_in_vm(&format!(
+        "cp -a {} {rev_dst}/rootfs.ext4 && chmod u+w {rev_dst}/rootfs.ext4",
+        result.rootfs_path
+    ))?;
+
+    // Generate a minimal fc-base.json for reference. Same logic as
+    // template_build: minimal guests (no initrd) need root= and init=
+    // on the kernel cmdline; initrd-bearing guests rely on the initrd's
+    // /init.
+    let boot_args = if result.initrd_path.is_some() {
+        "console=ttyS0 reboot=k panic=1 net.ifnames=0".to_string()
+    } else {
+        "root=/dev/vda rw rootwait init=/init console=ttyS0 reboot=k panic=1 net.ifnames=0"
+            .to_string()
+    };
+    let mut boot_source = serde_json::json!({
+        "kernel_image_path": "vmlinux",
+        "boot_args": boot_args
+    });
+    if result.initrd_path.is_some() {
+        boot_source["initrd_path"] = serde_json::json!("initrd");
+    }
+    let fc_config = serde_json::json!({
+        "boot-source": boot_source,
+        "drives": [{
+            "drive_id": "rootfs",
+            "path_on_host": "rootfs.ext4",
+            "is_root_device": true,
+            "is_read_only": false
+        }],
+        "machine-config": {
+            "vcpu_count": persisted.vcpus,
+            "mem_size_mib": persisted.mem_mib
+        }
+    });
+    let fc_json = serde_json::to_string_pretty(&fc_config)?;
+    shell::run_in_vm(&format!(
+        "cat > {rev_dst}/fc-base.json << 'MVMEOF'\n{fc_json}\nMVMEOF"
+    ))?;
+
+    // Update the slot's `current` symlink (relative target so the slot
+    // is portable across host filesystems).
+    let current_link = slot_current_symlink(slot_hash);
+    shell::run_in_vm(&format!("ln -snf artifacts/revisions/{rev} {current_link}"))?;
+
+    // Compute the actual flake.lock hash for accurate cache keys.
+    // Pool builds delegate this; dev/manifest builds compute it inline.
+    // Falls back to revision hash for remote flakes (no flake.lock on disk).
+    let flake_lock_hash = shell::run_in_vm_stdout(&format!(
+        "if [ -f {flake}/flake.lock ]; then nix hash path {flake}/flake.lock; else echo ''; fi",
+        flake = persisted.flake_ref
+    ))
+    .unwrap_or_default()
+    .trim()
+    .to_string();
+    let flake_lock_hash = if flake_lock_hash.is_empty() {
+        rev.clone()
+    } else {
+        flake_lock_hash
+    };
+
+    let sizes = result.artifact_sizes.clone();
+    let revision = TemplateRevision {
+        schema_version: mvm_core::template::CURRENT_SCHEMA_VERSION,
+        revision_hash: rev.clone(),
+        flake_ref: persisted.flake_ref.clone(),
+        flake_lock_hash,
+        artifact_paths: ArtifactPaths {
+            vmlinux: "vmlinux".to_string(),
+            rootfs: "rootfs.ext4".to_string(),
+            fc_base_config: "fc-base.json".to_string(),
+            initrd: if result.initrd_path.is_some() {
+                Some("initrd".to_string())
+            } else {
+                None
+            },
+            sizes: Some(sizes.clone()),
+        },
+        built_at: utc_now(),
+        profile: persisted.profile.clone(),
+        // role is preserved on the on-disk struct for backward
+        // compatibility with old revision.json files; manifest-built
+        // slots emit an empty string. Plan 38 §3: cache_key drops
+        // role (slice 3); this field is informational only.
+        role: String::new(),
+        vcpus: persisted.vcpus,
+        mem_mib: persisted.mem_mib,
+        data_disk_mib: persisted.data_disk_mib,
+        snapshot: None,
+    };
+    let rev_json = serde_json::to_string_pretty(&revision)?;
+    let rev_meta_path = format!("{rev_dst}/revision.json");
+    shell::run_in_vm(&format!(
+        "cat > {rev_meta_path} << 'MVMEOF'\n{rev_json}\nMVMEOF"
+    ))?;
+
+    // Refresh the slot's persisted manifest record with the new
+    // updated_at + provenance. Caller can pre-supply provenance via
+    // the `persisted` arg's `provenance` field; on rebuild we touch
+    // it to reflect the current build.
+    let refreshed = persisted.clone().touch(Provenance::current());
+    template_persist_slot(&refreshed)?;
+
+    use mvm_core::pool::format_bytes;
+    ui::success(&format!(
+        "Manifest at '{}' built successfully (revision: {}, rootfs: {}, kernel: {})",
+        persisted.manifest_path,
+        &rev[..rev.len().min(12)],
+        format_bytes(sizes.rootfs_bytes),
+        format_bytes(sizes.vmlinux_bytes),
+    ));
+
+    Ok(revision)
+}
+
 /// Recompute the Nix fixed-output derivation hash in a flake's `flake.nix`.
 ///
 /// Blanks the `outputHash` field, runs `nix build` to trigger hash computation,
@@ -753,7 +1352,7 @@ pub fn template_build_with_snapshot(id: &str, force: bool, update_hash: bool) ->
         "Snapshot created for template '{}' ({}MB total)",
         id, total_mb
     ));
-    ui::info("Use 'mvmctl run --template' for instant starts from this snapshot.");
+    ui::info("Use 'mvmctl up --manifest' for instant starts from this snapshot.");
 
     Ok(())
 }
@@ -1276,5 +1875,107 @@ mod tests {
         let parsed: Checksums = serde_json::from_str(&json).unwrap();
         let parsed_keys: Vec<&str> = parsed.files.keys().map(|s| s.as_str()).collect();
         assert_eq!(parsed_keys, vec!["a-file", "m-file", "z-file"]);
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 38 slice 4: classify_template_dir_entries (pure helper).
+    //
+    // Filesystem-independent unit tests. The slot-keyed
+    // persist/load/delete/list_* wrappers are thin delegations to
+    // mvm_core::manifest primitives that already have full coverage in
+    // slice 2 (26 tests against tempdir-backed scenarios), so we
+    // intentionally don't re-test the env-driven path resolution here:
+    // doing so would force MVM_DATA_DIR mutation and serialise tests.
+    // -----------------------------------------------------------------
+
+    fn hex_dirname() -> String {
+        "0123456789abcdef".repeat(4)
+    }
+
+    #[test]
+    fn classify_separates_hashes_from_legacy_names() {
+        let h = hex_dirname();
+        let entries = vec![
+            "openclaw".to_string(),
+            h.clone(),
+            "agent-foo".to_string(),
+            "claude-code-vm".to_string(),
+        ];
+        let (hashes, legacy) = classify_template_dir_entries(entries);
+        assert_eq!(hashes, vec![h]);
+        assert_eq!(
+            legacy,
+            vec![
+                "agent-foo".to_string(),
+                "claude-code-vm".to_string(),
+                "openclaw".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn classify_returns_sorted_within_each_bucket() {
+        let h1 = "f".repeat(64);
+        let h2 = "0".repeat(64);
+        let entries = vec![
+            h1.clone(),
+            "z-tpl".to_string(),
+            h2.clone(),
+            "a-tpl".to_string(),
+        ];
+        let (hashes, legacy) = classify_template_dir_entries(entries);
+        assert_eq!(hashes, vec![h2, h1]);
+        assert_eq!(legacy, vec!["a-tpl".to_string(), "z-tpl".to_string()]);
+    }
+
+    #[test]
+    fn classify_handles_empty_input() {
+        let (hashes, legacy) = classify_template_dir_entries(Vec::<String>::new());
+        assert!(hashes.is_empty());
+        assert!(legacy.is_empty());
+    }
+
+    #[test]
+    fn classify_treats_64_char_non_hex_as_legacy() {
+        // 64 chars but contains non-hex characters → not a slot hash.
+        let almost = "G".repeat(64);
+        let (hashes, legacy) = classify_template_dir_entries(vec![almost.clone()]);
+        assert!(hashes.is_empty());
+        assert_eq!(legacy, vec![almost]);
+    }
+
+    #[test]
+    fn classify_treats_uppercase_hex_as_legacy() {
+        // is_slot_hash_dirname requires LOWERCASE hex; uppercase rejects.
+        let upper = "ABCDEF0123456789".repeat(4);
+        assert_eq!(upper.len(), 64);
+        let (hashes, legacy) = classify_template_dir_entries(vec![upper.clone()]);
+        assert!(hashes.is_empty());
+        assert_eq!(legacy, vec![upper]);
+    }
+
+    #[test]
+    fn classify_rejects_short_or_long_dirnames() {
+        let short = "a".repeat(63);
+        let long = "a".repeat(65);
+        let (hashes, legacy) = classify_template_dir_entries(vec![short.clone(), long.clone()]);
+        assert!(hashes.is_empty());
+        let mut expected = vec![short, long];
+        expected.sort();
+        assert_eq!(legacy, expected);
+    }
+
+    #[test]
+    fn slot_entry_clone_and_eq() {
+        // Sanity: SlotEntry derives Clone/PartialEq for callers that
+        // need to dedupe/compare in template list output.
+        let a = SlotEntry {
+            slot_hash: "abc".to_string(),
+            manifest_path: "/abs/mvm.toml".to_string(),
+            name: Some("openclaw".to_string()),
+            updated_at: "2026-05-01T00:00:00Z".to_string(),
+        };
+        let b = a.clone();
+        assert_eq!(a, b);
     }
 }

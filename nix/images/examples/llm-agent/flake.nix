@@ -10,13 +10,12 @@
   # enters the Nix store.
   #
   # Build:
-  #   mvmctl template create claude-code-vm \
-  #     --flake ./nix/images/examples/llm-agent \
-  #     --profile minimal --role agent --cpus 2 --mem 1024
-  #   mvmctl template build claude-code-vm
+  #   # Optional: scaffold an mvm.toml in this directory. Already shipped.
+  #   #   mvmctl init nix/images/examples/llm-agent
+  #   mvmctl build nix/images/examples/llm-agent
   #
   # Run with the project mounted at /workspace and the API key injected:
-  #   mvmctl up --template claude-code-vm \
+  #   mvmctl up nix/images/examples/llm-agent \
   #     --add-dir "$PWD:/workspace:rw" \
   #     --secret-file "$HOME/.config/mvm/secrets/anthropic:claude-code/anthropic-api-key"
   #

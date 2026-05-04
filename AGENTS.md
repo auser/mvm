@@ -21,18 +21,17 @@ limactl shell mvm-builder
 ```
 
 Examples:
-
-- `limactl shell mvm-builder -- cargo run --quiet -- template build openclaw --force`
-- `limactl shell mvm-builder -- cargo run --quiet -- run --template openclaw --name oc`
+- `limactl shell mvm-builder -- cargo run --quiet -- build openclaw --force`
+- `limactl shell mvm-builder -- cargo run --quiet -- up --manifest openclaw --name oc`
 - `limactl shell mvm-builder -- cargo run --quiet -- logs oc`
-- `limactl shell mvm-builder -- cargo run --quiet -- stop oc`
+- `limactl shell mvm-builder -- cargo run --quiet -- down oc`
 - `limactl shell mvm-builder -- nix build .#packages.aarch64-linux.default`
 - `limactl shell mvm-builder -- nix path-info -rsh /nix/store/<hash>`
 - `limactl shell mvm-builder -- cargo test --workspace`
 - `limactl shell mvm-builder -- cargo clippy --workspace -- -D warnings`
 - `limactl shell mvm-builder -- cargo check --workspace`
 
-**Important:** `mvmctl` (via `cargo run`) commands like `template build`, `run`, `stop`, `logs`, and `status` must be run inside the Lima VM — they talk to Firecracker which only runs inside Linux. `cargo test` / `cargo check` / `cargo build` should run on the macOS host by default (see "Run cargo on the macOS host" above); only `cargo clippy --workspace --all-targets` and tests gated on `target_os = "linux"` need Lima. `cargo run -- dev` always runs on the macOS host directly.
+**Important:** `mvmctl` (via `cargo run`) commands like `build`, `up`, `down`, `logs`, and `ls` must be run inside the Lima VM — they talk to Firecracker which only runs inside Linux. `cargo test` / `cargo check` / `cargo build` should run on the macOS host by default (see "Run cargo on the macOS host" above); only `cargo clippy --workspace --all-targets` and tests gated on `target_os = "linux"` need Lima. `cargo run -- dev` always runs on the macOS host directly.
 
 ## Worktree Workflow for Features
 
@@ -102,7 +101,7 @@ CARGO_HOME="$PWD/.mvm-test/cargo"  \
 Four things are committed to make this convenient:
 
 - **`scripts/dev-env.sh`** exports all three vars (resolved relative to the worktree root, so it works from any subdir). Source it once at the top of a shell: `source scripts/dev-env.sh`.
-- **`bin/dev`** is a wrapper that sources `scripts/dev-env.sh` and execs `cargo run --quiet -- "$@"`. Use it for any one-off `mvmctl` call: `bin/dev template build`, `bin/dev exec ...`.
+- **`bin/dev`** is a wrapper that sources `scripts/dev-env.sh` and execs `cargo run --quiet -- "$@"`. Use it for any one-off `mvmctl` call: `bin/dev build`, `bin/dev exec ...`.
 - **`just dev-test` / `just dev-clippy` / `just dev-check`** invoke cargo with the env sourced.
 - **`.envrc.example`** sources `scripts/dev-env.sh` for direnv users (`cp .envrc.example .envrc && direnv allow`).
 
@@ -204,7 +203,7 @@ Documentation is a **first-class deliverable**. Every code change that touches u
 - **Adding/removing environment variables** → update the Environment Variables table in `reference/cli-commands.md`
 - **Adding/changing config options** → update `guides/config-secrets.md`
 - **Changing network layout or vsock behavior** → update `guides/networking.md`
-- **Changing template workflow** → update `guides/templates.md`
+- **Changing the manifest / build / registry workflow** → update `guides/manifests.md`
 - **Changing Nix flake API (mkGuest)** → update `guides/nix-flakes.md`
 - **Changing build/install steps** → update `getting-started/installation.md` and `contributing/development.md`
 

@@ -28,7 +28,7 @@ pub mod util;
 // continue to resolve.
 // ----------------------------------------------------------------------------
 
-pub use domain::{agent, instance, node, pool, template, tenant};
+pub use domain::{agent, instance, manifest, node, pool, template, tenant};
 pub use platform::linux_env;
 pub use policy::{audit, network_policy, secret_binding, security};
 pub use protocol::{routing, signing, vm_backend};

@@ -29,6 +29,83 @@ pub fn resolve_running_vm(name: &str) -> Result<String> {
     Ok(abs_dir)
 }
 
+/// One of two ways to refer to a built manifest: a legacy name (looked
+/// up in the name-keyed registry) or a manifest path that resolves to
+/// a slot hash.
+///
+/// `mvmctl up` / `mvmctl exec` accept either form via their
+/// `--manifest` flag. The `Slot` variant is the post-plan-38 path;
+/// `Name` is kept only to resolve any pre-existing name-keyed slots.
+///
+/// Callers that need the persisted manifest re-read it via
+/// `mvm_runtime::vm::template::lifecycle::template_load_slot(slot_hash)`
+/// — keeping the enum lean here avoids the `clippy::large_enum_variant`
+/// warning (`PersistedManifest` is ~350 bytes).
+#[derive(Debug, Clone)]
+pub enum ManifestArgRef {
+    /// Legacy name-keyed slot (resolves through `template_load`,
+    /// `template_artifacts`, etc.).
+    Name(String),
+    /// Manifest-keyed slot.
+    Slot { slot_hash: String },
+}
+
+/// Decide whether a `--manifest` argument refers to a manifest path
+/// (file or directory containing one) or a legacy slot name.
+///
+/// Detection rule: if the argument resolves to an existing file or
+/// directory on disk, treat it as a manifest path; otherwise it's a
+/// name. Both `mvmctl up --manifest ./my-app` and
+/// `mvmctl up --manifest openclaw` work as long as the referenced
+/// thing actually exists.
+///
+/// Returns `Err` only on validation/IO failures; missing-name is
+/// handled by the caller's downstream `template_load` lookup.
+pub fn resolve_manifest_arg(arg: &str) -> Result<ManifestArgRef> {
+    use mvm_core::manifest::{canonical_key_for_path, resolve_manifest_config_path};
+
+    let path = std::path::Path::new(arg);
+    let looks_like_path = arg.contains('/')
+        || arg.starts_with('.')
+        || arg.ends_with(".toml")
+        || path.is_file()
+        || path.is_dir();
+    if !looks_like_path {
+        return Ok(ManifestArgRef::Name(arg.to_string()));
+    }
+
+    if !path.exists() {
+        anyhow::bail!(
+            "Manifest path '{}' does not exist (expected a manifest file or its directory)",
+            arg
+        );
+    }
+
+    let manifest_path = resolve_manifest_config_path(path)
+        .with_context(|| format!("Resolving --manifest {arg:?}"))?;
+    let canonical = std::fs::canonicalize(&manifest_path).with_context(|| {
+        format!(
+            "Failed to canonicalize manifest path {}",
+            manifest_path.display()
+        )
+    })?;
+    let slot_hash = canonical_key_for_path(&canonical)?;
+
+    // Verify the slot exists; surface a clear error otherwise so
+    // `mvmctl up` doesn't proceed against a manifest that's never
+    // been built. The slot's persisted record is dropped here —
+    // callers that need it re-read via `template_load_slot`.
+    mvm_runtime::vm::template::lifecycle::template_load_slot(&slot_hash).with_context(|| {
+        format!(
+            "Manifest at {} has no built slot — run `mvmctl build {}` first",
+            canonical.display(),
+            canonical.display()
+        )
+    })?;
+
+    Ok(ManifestArgRef::Slot { slot_hash })
+}
+
 /// Resolve a flake reference: relative/absolute paths are canonicalized,
 /// remote refs (containing `:`) pass through unchanged.
 pub fn resolve_flake_ref(flake_ref: &str) -> Result<String> {
@@ -73,17 +150,11 @@ pub fn resolve_network_policy(
     }
 }
 
-/// Resolve CLI network flags into an `Option<NetworkPolicy>`. Returns
-/// `None` when both flags are absent — used by `mvmctl template
-/// create` so a missing flag means "no default baked into the spec"
-/// rather than "explicit unrestricted default." Plan 32 §D
-/// ergonomic follow-up.
-pub fn resolve_optional_network_policy(
-    preset: Option<&str>,
-    allow: &[String],
-) -> Result<Option<mvm_core::network_policy::NetworkPolicy>> {
-    if preset.is_none() && allow.is_empty() {
-        return Ok(None);
-    }
-    resolve_network_policy(preset, allow).map(Some)
-}
+// Plan 38 §4 (slice 7b): `resolve_optional_network_policy` was used
+// by `mvmctl template create --network-preset` to bake a default
+// policy into the TemplateSpec. With the `template *` namespace
+// gone and `[network]` removed from `mvm.toml` (plan 38 §3),
+// runtime policy now lives entirely in `mvmctl up` flags / the
+// user-global config / mvmd tenant config. Function deleted; the
+// `resolve_network_policy` form (always returns Some) is the only
+// remaining helper.

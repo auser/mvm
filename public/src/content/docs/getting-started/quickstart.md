@@ -81,17 +81,18 @@ mvmctl template create base-worker \
     --cpus 2 --mem 1024
 
 mvmctl template build base-worker
-mvmctl up --template base-worker
+mvmctl up --manifest base-worker
 ```
 
 ## 5. Image Catalog
 
-Browse and build images without writing Nix flakes yourself:
+Browse the bundled catalog and scaffold from a curated entry:
 
 ```bash
-mvmctl image list           # Browse available images
-mvmctl image fetch minimal  # Build from catalog (creates template + Nix build)
-mvmctl up --template minimal
+mvmctl catalog list                       # Browse available entries
+mvmctl init my-app --catalog minimal      # Scaffold from a catalog entry
+mvmctl build my-app                       # Build the manifest
+mvmctl up my-app                          # Boot the VM
 ```
 
 ## 6. Interactive Console
@@ -107,14 +108,14 @@ mvmctl console myvm --command "ls -la" # One-shot command
 
 `mvmctl exec` boots a fresh transient microVM, runs a single command, and tears
 it down on exit -- like `docker run --rm`, but with a Firecracker microVM as
-the sandbox. No `--flake` or `--template` needed; the bundled default image
+the sandbox. No `--flake` or `--manifest` needed; the bundled default image
 boots automatically the first time.
 
 ```bash
 mvmctl exec -- uname -a                            # bundled default image
 mvmctl exec --add-dir .:/work -- ls /work          # share host dir, read-only
 mvmctl exec --env DEBUG=1 -- env | grep DEBUG      # inject env vars
-mvmctl exec --template my-tpl -- /bin/true         # registered template
+mvmctl exec --manifest my-tpl -- /bin/true         # registered template
 ```
 
 When you reuse a registered template that has a captured snapshot, exec
@@ -134,9 +135,8 @@ mvmctl network list
 ## 9. Diagnostics & Security
 
 ```bash
-mvmctl doctor           # Check system dependencies, available backends
+mvmctl doctor           # Deps, available backends, and security posture (one report)
 mvmctl logs vm1         # View guest console logs
-mvmctl security status  # Security posture evaluation
 mvmctl cache info       # Cache directory disk usage
 ```
 
@@ -145,5 +145,5 @@ mvmctl cache info       # Cache directory disk usage
 - [Your First MicroVM](/getting-started/first-microvm/) -- write a Nix flake and boot it
 - [Sandboxed Exec](/guides/exec/) -- run a single command in a fresh microVM
 - [CLI Commands](/reference/cli-commands/) -- full command reference
-- [Templates](/guides/templates/) -- reusable base images
+- [Manifests](/guides/manifests/) -- reusable base images via `mvm.toml`
 - [Troubleshooting](/guides/troubleshooting/) -- common issues
