@@ -261,6 +261,38 @@ pub fn slot_manifest_path(slot_hash: &str) -> String {
     format!("{}/manifest.json", slot_dir(slot_hash))
 }
 
+/// Per-slot artifacts root: `<slot>/artifacts`. Holds all revision
+/// directories under `revisions/<revision_hash>/`.
+pub fn slot_artifacts_dir(slot_hash: &str) -> String {
+    format!("{}/artifacts", slot_dir(slot_hash))
+}
+
+/// Container directory for revision subdirs:
+/// `<slot>/artifacts/revisions`.
+pub fn slot_revisions_dir(slot_hash: &str) -> String {
+    format!("{}/revisions", slot_artifacts_dir(slot_hash))
+}
+
+/// Specific revision directory:
+/// `<slot>/artifacts/revisions/<revision_hash>`. The kernel,
+/// rootfs, fc-base.json, and revision.json live here.
+pub fn slot_revision_dir(slot_hash: &str, revision_hash: &str) -> String {
+    format!("{}/{}", slot_revisions_dir(slot_hash), revision_hash)
+}
+
+/// Symlink at the slot root pointing at the active revision.
+/// Targets a relative path (`artifacts/revisions/<revision_hash>`)
+/// so the symlink is portable across host filesystems.
+pub fn slot_current_symlink(slot_hash: &str) -> String {
+    format!("{}/current", slot_dir(slot_hash))
+}
+
+/// Snapshot directory inside a revision:
+/// `<slot>/artifacts/revisions/<revision_hash>/snapshot`.
+pub fn slot_snapshot_dir(slot_hash: &str, revision_hash: &str) -> String {
+    format!("{}/snapshot", slot_revision_dir(slot_hash, revision_hash))
+}
+
 /// Combined helper: canonicalise `path`, hash it, return the slot
 /// directory path. Errors if `path` can't be canonicalised.
 pub fn slot_dir_for_manifest_path(path: &Path) -> Result<String> {
@@ -765,6 +797,34 @@ mod tests {
     fn slot_manifest_path_is_under_slot_dir() {
         let p = slot_manifest_path("abcd1234");
         assert!(p.ends_with("/abcd1234/manifest.json"), "got {p}");
+    }
+
+    #[test]
+    fn slot_artifact_paths_have_expected_layout() {
+        let h = "abcd1234";
+        let r = "rev789";
+        assert!(slot_artifacts_dir(h).ends_with("/abcd1234/artifacts"));
+        assert!(slot_revisions_dir(h).ends_with("/abcd1234/artifacts/revisions"));
+        assert!(
+            slot_revision_dir(h, r).ends_with("/abcd1234/artifacts/revisions/rev789"),
+            "got {}",
+            slot_revision_dir(h, r)
+        );
+        assert!(slot_current_symlink(h).ends_with("/abcd1234/current"));
+        assert!(
+            slot_snapshot_dir(h, r).ends_with("/abcd1234/artifacts/revisions/rev789/snapshot"),
+            "got {}",
+            slot_snapshot_dir(h, r)
+        );
+    }
+
+    #[test]
+    fn slot_revision_dir_is_inside_slot_revisions_dir() {
+        let h = "deadbeef";
+        let r = "abc123";
+        let revs = slot_revisions_dir(h);
+        let one = slot_revision_dir(h, r);
+        assert!(one.starts_with(&revs));
     }
 
     #[test]
