@@ -19,8 +19,13 @@ regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror = "1"
+# Wave 2.6: L7EgressProxy uses tokio::net::lookup_host for the
+# production DnsResolver impl. Tests use only `macros + rt`, the
+# proxy needs `net` for lookup. `rt-multi-thread` lands when the
+# TCP listener loop ships in 2.6 chunk (c).
+tokio = { workspace = true, features = ["net", "rt"] }
 tracing.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time"] }

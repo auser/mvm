@@ -81,6 +81,33 @@ pub struct PolicyRef(pub String);
 #[serde(transparent)]
 pub struct FsPolicyRef(pub String);
 
+/// Workload variant — `Dev` is the development sandbox (carries the
+/// dev guest agent's RCE-by-design Exec handler, accepts looser
+/// policies), `Prod` is the production posture (no dev primitives,
+/// strict policy gates). Wave 2.6's `L7EgressProxy` consults this
+/// at construction time to refuse plain-HTTP egress for `Prod`.
+///
+/// Mirrors `passthru.variant` from Nix-side `mkGuest`. The supervisor
+/// resolves it from the workload's `SignedImageRef.name` suffix or
+/// from the policy bundle's bound variant — Wave 1 already has
+/// `audit::AuditEntry::variant` recording this for every entry, so
+/// the value flows through the audit chain unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Variant {
+    Dev,
+    Prod,
+}
+
+impl Variant {
+    /// True iff this variant carries production-strict policy
+    /// requirements (no dev RCE primitives, no plain-HTTP egress,
+    /// verity-required rootfs, etc.).
+    pub fn is_prod(self) -> bool {
+        matches!(self, Variant::Prod)
+    }
+}
+
 /// A secret binding from a name (visible inside the guest) to its
 /// source (resolved by the supervisor's `KeystoreReleaser` per Wave 3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

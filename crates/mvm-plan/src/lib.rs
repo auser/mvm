@@ -37,6 +37,6 @@ pub use signing::{PlanVerifyError, SignedExecutionPlan, sign_plan, verify_plan};
 pub use types::{
     ArtifactPolicy, AttestationMode, AttestationRequirement, FsPolicyRef, KeyRotationSpec, Nonce,
     NonceParseError, PlanId, PolicyRef, PostRunLifecycle, ReleasePin, Resources, RuntimeProfileRef,
-    SecretBinding, SecretSource, SignedImageRef, TenantId, TimeoutSpec, WorkloadId,
+    SecretBinding, SecretSource, SignedImageRef, TenantId, TimeoutSpec, Variant, WorkloadId,
 };
 pub use validity::{NonceStore, PlanValidityError, check_window};
