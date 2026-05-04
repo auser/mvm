@@ -107,7 +107,7 @@ mvmctl start
 
 ## 6. Manifests (Reusable Base Images)
 
-> The `mvmctl init` / `mvmctl build` / `mvmctl manifest *` surface below is the **plan-38 model** (rolling out across slices 5-7). The legacy `mvmctl template <verb>` commands continue to work as a hidden alias for one release. See [Manifests](public/src/content/docs/guides/manifests.md) for the full guide.
+> The `mvmctl init` / `mvmctl build` / `mvmctl manifest *` surface below is the **plan-38 model** (rolling out across slices 5-7). The old `mvmctl template <verb>` namespace is removed outright when slices 5-7 land — no deprecation alias. See [Manifests](public/src/content/docs/guides/manifests.md) for the full guide.
 
 Scaffold a project, edit its `mvm.toml`, build, share:
 

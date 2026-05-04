@@ -126,23 +126,29 @@ The existing top-level `mvmctl ls` / `mvmctl down <vm>` / `mvmctl logs <vm>` etc
 
 | Command | Behaviour |
 |---|---|
-| `mvmctl manifest ls [--json] [--orphans] [--legacy]` | List built slots — `manifest_path`, last-built timestamp, optional `name`. `--orphans` flag shows slots whose manifest is missing on disk; `--legacy` shows pre-refactor name-keyed slots. |
+| `mvmctl manifest ls [--json] [--orphans]` | List built slots — `manifest_path`, last-built timestamp, optional `name`. `--orphans` flag shows slots whose manifest is missing on disk. (Pre-refactor name-keyed slots are silently ignored — see §8a.) |
 | `mvmctl manifest info [PATH]` | Print manifest, slot path, current revision, snapshot, provenance. |
 | `mvmctl manifest rm [PATH] [--force] [--manifest-file]` | Remove the slot from the registry. `--manifest-file` also deletes the source `mvm.toml` on disk (off by default). |
 | `mvmctl manifest push [PATH] [--revision <hash>]` | Publish a slot's artifacts + signed bundle to the configured remote (S3/OCI). S3 channel key derived from `name` if set, otherwise the manifest hash. |
 | `mvmctl manifest pull <NAME-OR-HASH>` | Fetch a slot from the remote. Resolves to an existing slot if the manifest hash matches; otherwise creates a new slot keyed by the pulled manifest's canonical path. |
 | `mvmctl manifest verify [PATH] [--check-signature]` | Verify checksums (today) and cosign signatures (post plan 36). |
-| `mvmctl manifest prune [--orphans] [--legacy]` | Cleanup. `--orphans` removes slots whose manifest file is gone. `--legacy` removes pre-refactor name-keyed directories surfaced by §8a's banner. |
+| `mvmctl manifest prune [--orphans]` | Cleanup. `--orphans` removes slots whose manifest file is gone. |
 
-#### Removed (gone in plan 38; one-shot migration message points at the new flow)
+#### Removed (gone in plan 38)
+
+The entire `mvmctl template *` namespace is removed outright — no alias, no deprecation period. mvmctl is pre-v1 dev tooling; we don't ship back-compat shims. Users with existing scripts/CI invocations of `mvmctl template …` get a clear "command not found" error from clap; the docs point at the new verbs.
 
 | Today | Replacement |
 |---|---|
-| `mvmctl template create [--flake …]` | `mvmctl init` → edit `mvm.toml` → `mvmctl build` |
+| `mvmctl template init NAME` | `mvmctl init [DIR]` |
+| `mvmctl template create NAME --flake …` | `mvmctl init` → edit `mvm.toml` → `mvmctl build` |
 | `mvmctl template create-multi` | One manifest per directory; multiple directories for multi-variant builds |
-| `mvmctl template edit` | Open `mvm.toml` in `$EDITOR` directly; `mvmctl build` re-reads on next run |
-| `mvmctl template build --config <toml>` | The TOML *is* `mvm.toml`; `--config` flag retired |
-| `mvmctl template *` (the namespace itself) | Hidden alias for one release that prints a deprecation hint pointing at the new top-level / `registry` verb; removed next sprint |
+| `mvmctl template build NAME` | `mvmctl build [PATH]` |
+| `mvmctl template build NAME --config <toml>` | The TOML *is* `mvm.toml`; `--config` flag retired |
+| `mvmctl template edit NAME` | Open `mvm.toml` in `$EDITOR` directly |
+| `mvmctl template list` / `info` / `delete` | `mvmctl manifest ls` / `info` / `rm` |
+| `mvmctl template push` / `pull` / `verify` | `mvmctl manifest push` / `pull` / `verify` |
+| `mvmctl up --template NAME` etc. | `mvmctl up [PATH]` |
 
 #### Unchanged
 
@@ -183,7 +189,7 @@ LLM clients learn from these:
 - `crates/mvm-cli/resources/template_scaffold/README.md:6` and `resources/template_scaffold/README.md:6`
 - `QUICKSTART.md:114`
 
-Rewrite to: `mvmctl init && $EDITOR mvm.toml && mvmctl build && mvmctl up`. Plus a one-line note that the old `mvmctl template *` namespace is deprecated for one release and removed next sprint.
+Rewrite to: `mvmctl init && $EDITOR mvm.toml && mvmctl build && mvmctl up`. The old `mvmctl template *` namespace is removed outright; LLM clients learn the new flow from these strings (no deprecation alias to fall back to).
 
 ### 7b. Edge cases and robustness
 
@@ -267,18 +273,17 @@ LLM mode can refine these per-prompt. No new providers, no new dependencies.
 
 **Considered but rejected: nixai.** The discourse-recommended `nix-ai-help` (CLI `nixai`) was evaluated as an alternative LLM backend. It's archived as of 2025-08-23, written in Go (subprocess-only integration), targets full NixOS system configs (not microVM flakes / no `mkGuest`-shaped output), and does not validate generated Nix before returning. Integrating it would replace a working in-process planner with a dead Go subprocess for a worse target shape. Skip.
 
-### 8a. Migration strategy for existing user data
+### 8a. Existing user data: just delete
 
-Users on this branch have populated `~/.mvm/templates/openclaw/`, `~/.mvm/templates/agent-foo/`, etc. — old name-keyed slots that won't match any manifest after the refactor. Strategy:
+mvmctl is pre-v1 dev tooling; we don't ship a migration step. Users with `~/.mvm/templates/<name>/` directories from before the refactor see them ignored by all new commands (the slot path-hash logic doesn't recognise them). Templates are cheap to rebuild from source.
 
-- **First-run detection:** on any `mvmctl template *` command, scan `~/.mvm/templates/` for entries whose directory name is NOT a 64-char hex string (i.e. legacy name-keyed slots). If any exist, print a one-time banner:
+Recommended cleanup, surfaced once in the README and the `manifests.md` guide:
 
-  > Detected N legacy template slots from a previous mvmctl version. They will not be used by the new manifest-driven flow. Inspect with `mvmctl template list --legacy`. Remove with `mvmctl template prune --legacy`. Or migrate one with `mvmctl template migrate <name> --mvm-config <path>` (writes a manifest at `<path>` and re-keys the slot).
+```bash
+rm -rf ~/.mvm/templates    # nuke all old + new state; rebuild what you need
+```
 
-- **`mvmctl template list --legacy`** shows the old name-keyed slots; **`--orphans`** is reserved for hash-keyed slots whose manifest file is missing.
-- **`mvmctl template prune --legacy`** is the explicit cleanup verb (safe; doesn't touch hash-keyed slots).
-- **`mvmctl template migrate <name> --mvm-config <path>`** writes a `mvm.toml` from the legacy `template.json`'s fields, re-keys the slot under the new hash, drops the legacy entry. Best-effort; documented as one-shot.
-- Plan ships with the banner + `list --legacy` + `prune --legacy`. The `migrate` verb is "nice to have" — file as a follow-up if time-boxed; the banner alone gives users a clear next step.
+The `is_slot_hash_dirname` helper from slice 2 is still useful (it lets `mvmctl manifest ls` skip non-hash directories cleanly without erroring on legacy entries), but we don't add `--legacy` flags or `prune --legacy` verbs for them. They'll be invisible to the user.
 
 ### 9. mvmforge integration contract (no code changes here)
 
@@ -439,7 +444,7 @@ This plan is currently at `/Users/auser/.claude/plans/dazzling-meandering-garden
 |---|---|
 | `crates/mvm-core/src/domain/template.rs` | New `Manifest` struct + parser + `discover_from_cwd_or_path` + `canonical_key`; `TemplateSpec` renamed/repurposed to `PersistedManifest` (slot-resident JSON), gains `manifest_path`, `manifest_hash`, optional `name`. Reuse `parse_human_size` from `mvm-core/src/util.rs`. Drop `template_id` field. |
 | `crates/mvm-core/src/domain/template.rs` (paths) | `template_dir(slot_hash: &str)` replaces `template_dir(name: &str)`. New `slot_dir_for_manifest_path(path: &Path)` helper. |
-| `crates/mvm-cli/src/commands/build/template.rs` | Demote to a hidden alias module: each `template <verb>` subcommand prints a deprecation hint and delegates to the new top-level / `registry` verb. Removed entirely next sprint. |
+| `crates/mvm-cli/src/commands/build/template.rs` | **Deleted.** No alias / no deprecation period. Clap will return "command not found" if a user tries `mvmctl template …`. |
 | `crates/mvm-cli/src/commands/init.rs` (new) | New top-level `Init` action — moved from `template init`, takes optional `dir` positional, `--preset`, `--prompt` flags. Same scaffolding logic. |
 | `crates/mvm-cli/src/commands/build/build.rs` | Existing `mvmctl build` becomes the manifest-aware build verb. Accepts optional `[PATH]` (file or dir; defaults to cwd walk-up). Manifest discovery + spec merge + slot persist + `dev_build` invocation all live here. The legacy `--flake` flag-flake mode and `Mvmfile.toml` path collapse into the one parser. |
 | `crates/mvm-cli/src/commands/manifest/mod.rs` (new) | New `Manifest` subcommand group with `Ls`, `Info`, `Rm`, `Push`, `Pull`, `Verify`, `Prune` actions. Single namespace for all slot-registry / object-storage operations. |
@@ -455,7 +460,7 @@ This plan is currently at `/Users/auser/.claude/plans/dazzling-meandering-garden
 | `crates/mvm-cli/src/commands/ops/up.rs` (or wherever `up` lives) | Drop the `--template <NAME>` lookup. Take optional `[PATH]` positional that resolves through `Manifest::discover_from_cwd_or_path` then `slot_dir_for_manifest_path`. Same change in `run.rs` and `exec.rs`; share a manifest-resolution helper. |
 | `crates/mvm-cli/src/commands/ops/cache.rs` | New `--orphan-slots` flag on `cache prune`; delegates to `mvmctl registry prune --orphans` for ergonomics. |
 | `crates/mvm-mcp/src/server.rs`, `crates/mvm-mcp/src/env.rs`, `crates/mvm-cli/src/commands/ops/mcp.rs` | Update MCP **tool input schemas** (not just hint strings) — any tool that took a template name takes a manifest path; `list_templates` returns `manifest_path` + `name`; `template_build`, `up`, `run`, `exec` all switch keys. |
-| `public/src/content/docs/guides/templates.md` | Rewrite quickstart around `init` → edit `mvm.toml` → `build`. |
+| `public/src/content/docs/guides/manifests.md` (new — replaces `templates.md`, which is deleted) | Full guide to the `mvm.toml` model: schema, discovery, `init`/`build`/`up` flow, drift detection, `manifest *` namespace. |
 | `public/src/content/docs/reference/cli-commands.md:91-93` | Update template command reference. |
 | `crates/mvm-mcp/src/server.rs:126`, `crates/mvm-mcp/src/env.rs:27`, `crates/mvm-cli/src/commands/ops/mcp.rs:517` | (See MCP row above for tool-schema work.) Hint-string copy here — replace name-based recipe text with manifest-based. |
 | `crates/mvm-cli/resources/template_scaffold/README.md` (L6-7) and `resources/template_scaffold/README.md` (mirror) | Both copies hard-code `mvm template create {{name}}` / `mvm template build {{name}}`. Rewrite to `mvmctl init && $EDITOR mvm.toml && mvmctl build`. |

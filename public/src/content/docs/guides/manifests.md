@@ -3,7 +3,7 @@ title: Manifests
 description: How mvmctl turns a flake + an mvm.toml into a running microVM.
 ---
 
-> **Status:** this guide describes the **plan-38 manifest model**, currently being rolled out across slices 1-9 on `feat/manifest-driven-template-dx-claude`. Slices 1-4 (typed primitives + slot-keyed runtime) are committed; the CLI surface (slices 5-7) is in flight. Until the new verbs land, the old `mvmctl template *` commands still work and behave as documented in [`templates.md`](./templates.md).
+> **Status:** this guide describes the **plan-38 manifest model**, rolling out across slices 1-9 on `feat/manifest-driven-template-dx-claude`. Slices 1-4 (typed primitives + slot-keyed runtime) are committed; the CLI surface (slices 5-7) is in flight. Once landed, the old `mvmctl template *` namespace is removed outright — there is no deprecation alias.
 
 A manifest (`mvm.toml` or `Mvmfile.toml`) is the user-facing primitive for "what to build and how to size it". One manifest sits next to a `flake.nix` in your project; together they describe one microVM.
 
@@ -187,37 +187,6 @@ schema_version = 2   # bumped manifest
 ```
 
 A manifest declaring `schema_version` higher than the running mvmctl supports errors with `"this manifest declares schema_version=N; this mvmctl supports M; upgrade mvmctl"`.
-
-## Migration from the old `template` flow
-
-Pre-plan-38 you had:
-
-```bash
-mvmctl template init my-tpl --local
-mvmctl template create my-tpl --flake . --profile worker --cpus 4 --mem 2G
-mvmctl template build my-tpl
-mvmctl up --template my-tpl
-```
-
-New equivalent:
-
-```bash
-mvmctl init my-tpl
-$EDITOR my-tpl/mvm.toml          # set profile = "worker", vcpus = 4, mem = "2G"
-mvmctl build my-tpl
-mvmctl up my-tpl
-```
-
-For one release, `mvmctl template <verb>` continues to work as a hidden alias and prints a deprecation hint. Removed next sprint.
-
-If you have existing `~/.mvm/templates/<name>/` slots from before the refactor:
-
-```bash
-mvmctl manifest ls --legacy                # surface them
-mvmctl manifest prune --legacy             # remove them safely (artifacts deleted; nothing modern affected)
-```
-
-Or recreate each one with a fresh `mvmctl init` + `build` once you've ported its config to a `mvm.toml`.
 
 ## What's NOT in the manifest
 

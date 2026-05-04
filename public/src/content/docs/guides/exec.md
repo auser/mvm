@@ -256,6 +256,6 @@ highest):
 ## See also
 
 - [CLI reference: One-shot Exec](/reference/cli-commands/#one-shot-exec)
-- [Templates guide](/guides/templates/) -- build a reusable base image
-  to point `mvmctl exec --template` at
+- [Manifests guide](/guides/manifests/) -- build a reusable base image
+  via `mvm.toml`; `mvmctl exec [PATH]` accepts the manifest path directly
 - [Quick Start](/getting-started/quickstart/#7-sandboxed-one-shot-commands)

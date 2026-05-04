@@ -145,5 +145,5 @@ mvmctl cache info       # Cache directory disk usage
 - [Your First MicroVM](/getting-started/first-microvm/) -- write a Nix flake and boot it
 - [Sandboxed Exec](/guides/exec/) -- run a single command in a fresh microVM
 - [CLI Commands](/reference/cli-commands/) -- full command reference
-- [Templates](/guides/templates/) -- reusable base images
+- [Manifests](/guides/manifests/) -- reusable base images via `mvm.toml`
 - [Troubleshooting](/guides/troubleshooting/) -- common issues

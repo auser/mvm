@@ -81,7 +81,7 @@ description: Complete command reference for mvmctl.
 
 ## Manifests
 
-> **Status:** the `mvmctl init/build/manifest *` surface below is the **plan-38 model** (currently rolling out across slices 5-7 on `feat/manifest-driven-template-dx-claude`). The user-facing primitive is now an `mvm.toml` file alongside your `flake.nix`. See the [Manifests guide](/guides/manifests/) for the conceptual model. The legacy `mvmctl template <verb>` commands continue to work as a hidden alias for one release; they're listed [in their own section below](#templates-legacy-deprecated).
+> **Status:** the `mvmctl init/build/manifest *` surface below is the **plan-38 model** (currently rolling out across slices 5-7 on `feat/manifest-driven-template-dx-claude`). The user-facing primitive is now an `mvm.toml` file alongside your `flake.nix`. See the [Manifests guide](/guides/manifests/) for the conceptual model. Once landed, the old `mvmctl template <verb>` namespace is removed outright — there is no deprecation alias. mvmctl is pre-v1; we don't ship back-compat shims.
 
 ### Scaffolding (top-level)
 
@@ -112,7 +112,6 @@ description: Complete command reference for mvmctl.
 |---------|-------------|
 | `mvmctl manifest ls [--json]` | List built slots — manifest path, last-built timestamp, optional `name` |
 | `mvmctl manifest ls --orphans` | Slots whose source manifest file is missing on disk |
-| `mvmctl manifest ls --legacy` | Pre-refactor name-keyed slots (migration aid) |
 | `mvmctl manifest info [PATH] [--json]` | Print manifest, slot path, current revision, snapshot info, provenance |
 | `mvmctl manifest rm [PATH] [--force]` | Remove the slot from the registry |
 | `mvmctl manifest rm [PATH] --manifest-file` | Also delete the source `mvm.toml` (off by default) |
@@ -120,24 +119,6 @@ description: Complete command reference for mvmctl.
 | `mvmctl manifest pull <NAME-OR-HASH>` | Fetch a slot from the remote |
 | `mvmctl manifest verify [PATH] [--check-signature]` | Verify checksums and (post plan 36) cosign signatures |
 | `mvmctl manifest prune --orphans` | Remove slots whose source manifest is missing |
-| `mvmctl manifest prune --legacy` | Remove pre-refactor name-keyed slots |
-
-### Templates (legacy, deprecated)
-
-> **Deprecated.** These commands continue to work for one release as a hidden alias, then they're removed. New code should use the `init` / `build` / `manifest *` surface above. See the [migration section of the Manifests guide](/guides/manifests/#migration-from-the-old-template-flow).
-
-| Command | Description |
-|---------|-------------|
-| `mvmctl template init <name>` → `mvmctl init <name>` | Scaffold |
-| `mvmctl template create <name> --flake … --cpus N --mem SIZE` | **Removed.** Use `mvmctl init` then edit `mvm.toml` |
-| `mvmctl template create-multi <base> --roles a,b` | **Removed.** One manifest per directory; multiple directories for variants |
-| `mvmctl template build <name>` → `mvmctl build <PATH>` | Build |
-| `mvmctl template build <name> --config <toml>` | **Removed.** The TOML *is* `mvm.toml` |
-| `mvmctl template list` → `mvmctl manifest ls` | List |
-| `mvmctl template info <name>` → `mvmctl manifest info <PATH>` | Info |
-| `mvmctl template edit <name>` | **Removed.** Open `mvm.toml` in `$EDITOR` directly |
-| `mvmctl template delete <name>` → `mvmctl manifest rm <PATH>` | Remove |
-| `mvmctl template push/pull/verify <name>` → `mvmctl manifest push/pull/verify <PATH>` | Registry ops |
 
 ## Configuration
 

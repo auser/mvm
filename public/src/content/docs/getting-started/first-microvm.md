@@ -137,5 +137,4 @@ mvmctl down hello
 
 - [Writing Nix Flakes](/guides/nix-flakes/) -- the full `mkGuest` API
 - [Manifests](/guides/manifests/) -- the `mvm.toml` user model (init → build → up)
-- [Templates (legacy)](/guides/templates/) -- the older name-keyed flow, still supported for one release
 - [Config & Secrets](/guides/config-secrets/) -- inject files at boot

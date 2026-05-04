@@ -138,7 +138,7 @@ Documentation is a **first-class deliverable**. Every code change that touches u
 - **Adding/removing environment variables** → update the Environment Variables table in `reference/cli-commands.md`
 - **Adding/changing config options** → update `guides/config-secrets.md`
 - **Changing network layout or vsock behavior** → update `guides/networking.md`
-- **Changing template workflow** → update `guides/templates.md`
+- **Changing the manifest / build / registry workflow** → update `guides/manifests.md`
 - **Changing Nix flake API (mkGuest)** → update `guides/nix-flakes.md`
 - **Changing build/install steps** → update `getting-started/installation.md` and `contributing/development.md`
 
