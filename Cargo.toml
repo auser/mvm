@@ -43,6 +43,7 @@ regex = "1"
 # Crypto
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
+hmac = "0.12"
 rand = "0.8"
 sha2 = "0.10"
 
