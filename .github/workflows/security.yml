@@ -220,6 +220,17 @@ jobs:
           RUSTUP_TOOLCHAIN: nightly
         run: cargo fuzz run fuzz_authenticated_frame -- -max_total_time="$DURATION"
 
+      - name: Fuzz authed path (signed-side)
+        working-directory: crates/mvm-guest
+        env:
+          DURATION: ${{ steps.duration.outputs.secs }}
+          RUSTUP_TOOLCHAIN: nightly
+        # Drives `verify_authenticated_frame` past sig check, asserting
+        # tampered frames never reach the inner deserializer. Catches
+        # regressions where a refactor reorders the verify/deserialize
+        # steps in vsock.rs.
+        run: cargo fuzz run fuzz_authed_path -- -max_total_time="$DURATION"
+
       - name: Upload corpus on failure
         if: failure()
         uses: actions/upload-artifact@v7

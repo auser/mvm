@@ -451,8 +451,32 @@ pub fn read_authenticated_frame<T: serde::de::DeserializeOwned>(
     expected_min_sequence: u64,
 ) -> Result<(T, u64)> {
     let frame: AuthenticatedFrame = read_frame(stream)?;
+    verify_authenticated_frame(
+        &frame,
+        verifying_key,
+        expected_session_id,
+        expected_min_sequence,
+    )
+}
 
-    // Verify protocol version
+/// Verify an already-deserialized `AuthenticatedFrame` and extract its
+/// inner payload.
+///
+/// Same checks as [`read_authenticated_frame`] minus the wire read:
+/// version → session ID → sequence (replay) → 64-byte signature length
+/// → Ed25519 signature over `signed.payload` → deserialize as `T`.
+/// Each step short-circuits with `Err`; the inner deserializer is
+/// reached only after the signature check passes, which is the
+/// load-bearing property the fuzz harness exercises.
+///
+/// Public so `crates/mvm-guest/fuzz/fuzz_targets/fuzz_authed_path.rs`
+/// can drive the verification path without a real `UnixStream`.
+pub fn verify_authenticated_frame<T: serde::de::DeserializeOwned>(
+    frame: &AuthenticatedFrame,
+    verifying_key: &VerifyingKey,
+    expected_session_id: &str,
+    expected_min_sequence: u64,
+) -> Result<(T, u64)> {
     if frame.version != PROTOCOL_VERSION_AUTHENTICATED {
         bail!(
             "Unexpected protocol version: {} (expected {})",
@@ -461,7 +485,6 @@ pub fn read_authenticated_frame<T: serde::de::DeserializeOwned>(
         );
     }
 
-    // Verify session ID
     if frame.session_id != expected_session_id {
         bail!(
             "Session ID mismatch: got '{}', expected '{}'",
@@ -470,7 +493,6 @@ pub fn read_authenticated_frame<T: serde::de::DeserializeOwned>(
         );
     }
 
-    // Replay detection: sequence must be >= expected minimum
     if frame.sequence < expected_min_sequence {
         bail!(
             "Replay detected: sequence {} < expected minimum {}",
@@ -479,7 +501,6 @@ pub fn read_authenticated_frame<T: serde::de::DeserializeOwned>(
         );
     }
 
-    // Verify Ed25519 signature
     let signed = &frame.signed;
     if signed.signature.len() != 64 {
         bail!(
@@ -499,7 +520,6 @@ pub fn read_authenticated_frame<T: serde::de::DeserializeOwned>(
         .verify(&signed.payload, &signature)
         .map_err(|e| anyhow::anyhow!("Signature verification failed: {}", e))?;
 
-    // Deserialize the verified inner payload
     let value: T = serde_json::from_slice(&signed.payload)
         .with_context(|| "Failed to deserialize verified payload")?;
 
