@@ -921,6 +921,18 @@ fn handle_client(
             message: "exec not available: guest agent built without dev-shell feature".to_string(),
         },
 
+        // W1 wire-protocol scaffold. The handler lands in W2; for now,
+        // returning a terminal `Error` event keeps the host's read loop
+        // honest (`is_terminal()` is true) and matches the wire shape
+        // ADR-007 / plan 41 specifies.
+        GuestRequest::RunEntrypoint { .. } => {
+            use mvm_guest::vsock::{EntrypointEvent, RunEntrypointError};
+            GuestResponse::EntrypointEvent(EntrypointEvent::Error {
+                kind: RunEntrypointError::InternalError,
+                message: "RunEntrypoint handler not implemented yet (plan 41 W2)".to_string(),
+            })
+        }
+
         GuestRequest::FsDiff => {
             // Walk the overlay upper dir to find changes since boot.
             // The overlay upper dir is typically at /overlay/upper when
