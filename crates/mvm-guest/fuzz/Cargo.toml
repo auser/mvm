@@ -21,6 +21,7 @@ cargo-fuzz = true
 [dependencies]
 libfuzzer-sys = "0.4"
 serde_json = "1"
+ed25519-dalek = "2"
 
 [dependencies.mvm-guest]
 path = ".."
@@ -47,6 +48,13 @@ bench = false
 [[bin]]
 name = "fuzz_entrypoint_event"
 path = "fuzz_targets/fuzz_entrypoint_event.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "fuzz_authed_path"
+path = "fuzz_targets/fuzz_authed_path.rs"
 test = false
 doc = false
 bench = false
