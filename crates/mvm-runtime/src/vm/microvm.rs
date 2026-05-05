@@ -640,6 +640,14 @@ pub fn restore_from_template_snapshot(
     config.validate()?;
     require_linux_env()?;
 
+    // ADR-007 / plan 41 W4 / M9: verify the integrity sidecar
+    // *before* doing anything else. A tampered snapshot must not cause
+    // bridge ensure / TAP create / Firecracker spawn — none of those
+    // should happen if we're going to refuse the bytes anyway. A
+    // missing sidecar is a non-fatal warning unless
+    // `MVM_SNAPSHOT_HMAC_STRICT=1`.
+    crate::vm::template::lifecycle::verify_snapshot_artifacts(snapshot_dir)?;
+
     let slot = &config.slot;
 
     // Check if this VM name is already running

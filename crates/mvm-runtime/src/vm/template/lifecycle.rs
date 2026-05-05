@@ -1322,6 +1322,19 @@ pub fn template_build_with_snapshot(id: &str, force: bool, update_hash: bool) ->
     .parse()
     .unwrap_or(0);
 
+    // ADR-007 / plan 41 W4 / M9: seal the snapshot with an HMAC
+    // sidecar so a tampered file (or a swap with attacker-controlled
+    // bytes) is detected at restore time. dm-verity (W3) covers
+    // rootfs disk reads but not memory images; this seals the gap.
+    if let Err(e) = seal_snapshot_artifacts(&snap_dir) {
+        // Snapshot files exist but couldn't be sealed — they are
+        // unusable under the strict policy. Tear down so we don't
+        // leave a half-protected artifact on disk.
+        let _ = shell::run_in_vm(&format!("sudo rm -rf {}", snap_dir));
+        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
+        return Err(e.context("Failed to seal snapshot integrity sidecar"));
+    }
+
     // Update revision.json with snapshot metadata
     let snapshot_info = SnapshotInfo {
         created_at: utc_now(),
@@ -1692,6 +1705,86 @@ pub fn template_verify(id: &str, revision: Option<&str>) -> Result<()> {
     }
 
     Ok(())
+}
+
+/// Seal a freshly-created snapshot with an HMAC-SHA256 sidecar.
+/// ADR-007 / plan 41 W4 / M9.
+///
+/// Reads the host-local key (creating it on first run), computes a
+/// tag over the snapshot files plus the current `mvmctl` version,
+/// and writes `integrity.json` next to `vmstate.bin` / `mem.bin`.
+/// Restore verifies the sidecar before handing bytes to Firecracker.
+pub fn seal_snapshot_artifacts(snap_dir: &str) -> Result<()> {
+    use std::path::Path;
+    let snap_path = Path::new(snap_dir);
+    let key_path =
+        mvm_security::snapshot_hmac::default_key_path(Path::new(&mvm_core::config::mvm_data_dir()));
+    let key = mvm_security::snapshot_hmac::load_or_init_key(&key_path)
+        .with_context(|| format!("loading snapshot HMAC key {}", key_path.display()))?;
+    let files = mvm_security::snapshot_hmac::files_in(snap_path);
+    let mvmctl_version = env!("CARGO_PKG_VERSION");
+    let _sidecar = mvm_security::snapshot_hmac::seal(snap_path, &files, mvmctl_version, &key)
+        .with_context(|| format!("sealing snapshot at {snap_dir}"))?;
+    Ok(())
+}
+
+/// Verify the integrity sidecar for a snapshot before resume.
+/// ADR-007 / plan 41 W4 / M9.
+///
+/// Returns `Ok(())` on a clean match. Honours `MVM_ALLOW_STALE_SNAPSHOT=1`
+/// for the version-mismatch case (e.g. a snapshot sealed by an earlier
+/// `mvmctl` build that the operator wants to resume anyway). The
+/// `MVM_SNAPSHOT_HMAC_STRICT=1` env var flips a missing sidecar from a
+/// non-fatal warning (default — preserves restorability of pre-W4
+/// snapshots) into a hard error.
+pub fn verify_snapshot_artifacts(snap_dir: &str) -> Result<()> {
+    use mvm_security::snapshot_hmac::VerifyError;
+    use std::path::Path;
+
+    let snap_path = Path::new(snap_dir);
+    let sidecar_path = snap_path.join(mvm_security::snapshot_hmac::SIDECAR_FILENAME);
+    if !sidecar_path.exists() {
+        if std::env::var("MVM_SNAPSHOT_HMAC_STRICT").as_deref() == Ok("1") {
+            anyhow::bail!(
+                "snapshot at {snap_dir} has no integrity sidecar and \
+                 MVM_SNAPSHOT_HMAC_STRICT=1 forbids resume"
+            );
+        }
+        ui::warn(&format!(
+            "snapshot at {snap_dir} has no integrity sidecar \
+             (created before plan 41 W4); resuming without HMAC verification. \
+             Re-build the template to seal it."
+        ));
+        return Ok(());
+    }
+
+    let key_path =
+        mvm_security::snapshot_hmac::default_key_path(Path::new(&mvm_core::config::mvm_data_dir()));
+    let key = mvm_security::snapshot_hmac::load_or_init_key(&key_path)
+        .with_context(|| format!("loading snapshot HMAC key {}", key_path.display()))?;
+    let files = mvm_security::snapshot_hmac::files_in(snap_path);
+    let mvmctl_version = env!("CARGO_PKG_VERSION");
+    let allow_stale = std::env::var("MVM_ALLOW_STALE_SNAPSHOT").as_deref() == Ok("1");
+
+    match mvm_security::snapshot_hmac::verify(snap_path, &files, mvmctl_version, &key, allow_stale)
+    {
+        Ok(_) => Ok(()),
+        Err(VerifyError::VersionMismatch { sealed, current }) => {
+            // Without --allow-stale-snapshot we hard-refuse; with the
+            // env var we already accepted above.
+            anyhow::bail!(
+                "snapshot at {snap_dir} was sealed by mvmctl '{sealed}' but \
+                 current is '{current}'. Set MVM_ALLOW_STALE_SNAPSHOT=1 to override."
+            )
+        }
+        Err(VerifyError::TagMismatch) => anyhow::bail!(
+            "snapshot at {snap_dir} failed HMAC verification — files have been \
+             tampered or the host key changed. Refusing to resume."
+        ),
+        Err(other) => Err(anyhow::anyhow!(
+            "snapshot at {snap_dir} integrity check failed: {other}"
+        )),
+    }
 }
 
 #[cfg(test)]
