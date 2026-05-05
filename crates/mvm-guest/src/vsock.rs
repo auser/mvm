@@ -76,6 +76,32 @@ pub enum GuestRequest {
         stdin: Option<String>,
         timeout_secs: Option<u64>,
     },
+    /// Run the image's baked entrypoint program with the given stdin
+    /// piped in and stdout/stderr captured. ADR-007 / plan 41 W1.
+    ///
+    /// This is the production-safe call surface. The agent reads the
+    /// entrypoint path from `/etc/mvm/entrypoint` at boot, validates
+    /// it (verity-partition, mode, ownership), and that resolved
+    /// path is the only program `RunEntrypoint` will spawn. There is
+    /// no argv override, no shell, no env injection beyond what the
+    /// wrapper template defines at image build time.
+    ///
+    /// The response is a stream of `EntrypointEvent` frames
+    /// terminated by `EntrypointEvent::Exit` or
+    /// `EntrypointEvent::Error`. v1 emits one `Stdout` chunk + one
+    /// `Stderr` chunk + a terminal event (buffered up to caps); v2
+    /// may chunk progressively without changing the wire shape.
+    ///
+    /// Caps and timeouts are enforced agent-side (W2). The wire
+    /// frame size is bounded by `MAX_FRAME_SIZE`.
+    RunEntrypoint {
+        /// Bytes piped to the wrapper's stdin.
+        stdin: Vec<u8>,
+        /// Wall-clock timeout for the call, in seconds. The agent
+        /// kills the wrapper on overrun and emits
+        /// `EntrypointEvent::Error { kind: Timeout }`.
+        timeout_secs: u64,
+    },
     /// Signal post-restore: remount drives and restart services.
     PostRestore,
     /// Request filesystem diff (changes since boot, from overlay or snapshot).
@@ -143,6 +169,14 @@ pub enum GuestResponse {
         stdout: String,
         stderr: String,
     },
+    /// One event in the response stream of a `RunEntrypoint` call.
+    /// ADR-007 / plan 41 W1.
+    ///
+    /// The agent emits a sequence of these in response to a single
+    /// `RunEntrypoint` request, terminated by an `EntrypointEvent`
+    /// whose `is_terminal` returns true (`Exit` or `Error`). The
+    /// host reads frames in a loop until terminal.
+    EntrypointEvent(EntrypointEvent),
     /// Post-restore acknowledgement.
     PostRestoreAck {
         success: bool,
@@ -179,6 +213,78 @@ pub enum FsChangeKind {
     Created,
     Modified,
     Deleted,
+}
+
+/// One event in the streaming response of a `RunEntrypoint` call.
+/// ADR-007 / plan 41 W1.
+///
+/// `Stdout` / `Stderr` carry bytes from the wrapper's respective
+/// streams. `Exit` and `Error` are terminal — they end the response
+/// stream for one call. The agent emits exactly one terminal event
+/// per call.
+///
+/// v1 buffers each stream fully before sending one `Stdout` and one
+/// `Stderr` event (sizes bounded by agent caps). v2 may chunk
+/// progressively without changing the type or the protocol shape:
+/// the host already reads frames in a loop until terminal.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum EntrypointEvent {
+    /// Bytes from the wrapper's stdout.
+    Stdout { chunk: Vec<u8> },
+    /// Bytes from the wrapper's stderr.
+    Stderr { chunk: Vec<u8> },
+    /// Wrapper exited with the given code. Terminal.
+    Exit { code: i32 },
+    /// Agent-side condition that prevented or interrupted the
+    /// call (cap breach, timeout, busy session, missing entrypoint,
+    /// crashed wrapper, internal failure). Terminal.
+    Error {
+        kind: RunEntrypointError,
+        message: String,
+    },
+}
+
+impl EntrypointEvent {
+    /// Returns true if this event terminates the response stream
+    /// for one `RunEntrypoint` call.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            EntrypointEvent::Exit { .. } | EntrypointEvent::Error { .. }
+        )
+    }
+}
+
+/// Kind of agent-side error reported via `EntrypointEvent::Error`.
+/// ADR-007 / plan 41 W1.
+///
+/// The variants are deliberately coarse — the host correlates by
+/// `kind` and surfaces the human-readable `message` to the operator.
+/// Adding a variant is a wire change; renaming or removing is a
+/// breaking change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum RunEntrypointError {
+    /// Inbound stdin or buffered stdout/stderr exceeded the cap
+    /// configured for the call.
+    PayloadCap,
+    /// The wrapper exceeded `timeout_secs`. Agent killed the
+    /// process group.
+    Timeout,
+    /// Another `RunEntrypoint` is in flight on this VM. M12: agents
+    /// serialize per-VM; concurrency comes from pool growth.
+    Busy,
+    /// The wrapper process died unexpectedly (signal, OOM, etc.).
+    WrapperCrashed,
+    /// `/etc/mvm/entrypoint` is missing, fails validation
+    /// (symlink crossing FS, wrong perms, off the verity
+    /// partition), or otherwise can't be loaded. Reported per-call
+    /// even though the validation runs at agent boot.
+    EntrypointInvalid,
+    /// Other agent-internal failure — file I/O, vsock framing,
+    /// inter-process plumbing. Look at `message` for detail.
+    InternalError,
 }
 
 // ============================================================================
@@ -1102,6 +1208,238 @@ mod tests {
         let json = r#"{"path":"/x","kind":"created","size":0,"hidden":42}"#;
         let err = serde_json::from_str::<FsChange>(json).unwrap_err();
         assert!(err.to_string().contains("unknown field"));
+    }
+
+    // -------------------------------------------------------------------
+    // ADR-007 / plan 41 W1 — RunEntrypoint wire protocol
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_run_entrypoint_request_roundtrip() {
+        let req = GuestRequest::RunEntrypoint {
+            stdin: vec![1, 2, 3, 4, 5],
+            timeout_secs: 30,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let decoded: GuestRequest = serde_json::from_str(&json).expect("deserialize");
+        match decoded {
+            GuestRequest::RunEntrypoint {
+                stdin,
+                timeout_secs,
+            } => {
+                assert_eq!(stdin, vec![1, 2, 3, 4, 5]);
+                assert_eq!(timeout_secs, 30);
+            }
+            other => panic!("expected RunEntrypoint, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_entrypoint_request_empty_stdin_roundtrip() {
+        let req = GuestRequest::RunEntrypoint {
+            stdin: vec![],
+            timeout_secs: 5,
+        };
+        let json = serde_json::to_string(&req).expect("serialize");
+        let decoded: GuestRequest = serde_json::from_str(&json).expect("deserialize");
+        assert!(matches!(
+            decoded,
+            GuestRequest::RunEntrypoint {
+                stdin,
+                timeout_secs: 5,
+            } if stdin.is_empty()
+        ));
+    }
+
+    #[test]
+    fn test_run_entrypoint_request_rejects_unknown_field() {
+        // Unknown fields inside the request must not slip past the
+        // deserializer (ADR-002 §W4.1).
+        let json = r#"{"RunEntrypoint":{"stdin":[1,2,3],"timeout_secs":10,"smuggled":"x"}}"#;
+        let err = serde_json::from_str::<GuestRequest>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field") && err.to_string().contains("smuggled"),
+            "expected 'unknown field `smuggled`', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_entrypoint_event_stdout_roundtrip() {
+        let evt = EntrypointEvent::Stdout {
+            chunk: b"hello".to_vec(),
+        };
+        let json = serde_json::to_string(&evt).expect("serialize");
+        let decoded: EntrypointEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, evt);
+        assert!(!decoded.is_terminal());
+    }
+
+    #[test]
+    fn test_entrypoint_event_stderr_roundtrip() {
+        let evt = EntrypointEvent::Stderr {
+            chunk: b"warn".to_vec(),
+        };
+        let json = serde_json::to_string(&evt).expect("serialize");
+        let decoded: EntrypointEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, evt);
+        assert!(!decoded.is_terminal());
+    }
+
+    #[test]
+    fn test_entrypoint_event_exit_is_terminal() {
+        let evt = EntrypointEvent::Exit { code: 0 };
+        assert!(evt.is_terminal());
+        let json = serde_json::to_string(&evt).expect("serialize");
+        let decoded: EntrypointEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, evt);
+
+        let nonzero = EntrypointEvent::Exit { code: 42 };
+        assert!(nonzero.is_terminal());
+    }
+
+    #[test]
+    fn test_entrypoint_event_error_is_terminal() {
+        let evt = EntrypointEvent::Error {
+            kind: RunEntrypointError::Timeout,
+            message: "killed after 30s".into(),
+        };
+        assert!(evt.is_terminal());
+        let json = serde_json::to_string(&evt).expect("serialize");
+        let decoded: EntrypointEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, evt);
+    }
+
+    #[test]
+    fn test_entrypoint_event_rejects_unknown_field() {
+        let json = r#"{"Stdout":{"chunk":[1,2,3],"length":3}}"#;
+        let err = serde_json::from_str::<EntrypointEvent>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field") && err.to_string().contains("length"),
+            "expected 'unknown field `length`', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_entrypoint_event_rejects_unknown_variant() {
+        let json = r#"{"Aborted":{"reason":"x"}}"#;
+        let err = serde_json::from_str::<EntrypointEvent>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "expected 'unknown variant', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_entrypoint_error_all_variants_roundtrip() {
+        // Every error variant must serialize and deserialize back
+        // to itself. Adding a variant without updating this list is
+        // intentional friction.
+        let variants = [
+            RunEntrypointError::PayloadCap,
+            RunEntrypointError::Timeout,
+            RunEntrypointError::Busy,
+            RunEntrypointError::WrapperCrashed,
+            RunEntrypointError::EntrypointInvalid,
+            RunEntrypointError::InternalError,
+        ];
+        for v in variants {
+            let json = serde_json::to_string(&v).expect("serialize");
+            let decoded: RunEntrypointError = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(decoded, v, "variant {v:?} did not roundtrip");
+        }
+    }
+
+    #[test]
+    fn test_run_entrypoint_error_rejects_unknown_variant() {
+        let json = r#""SomeNewError""#;
+        let err = serde_json::from_str::<RunEntrypointError>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown variant"),
+            "expected 'unknown variant', got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_guest_response_entrypoint_event_roundtrip() {
+        // Wrap an EntrypointEvent in GuestResponse and roundtrip
+        // through the same JSON discipline as every other variant.
+        let resp = GuestResponse::EntrypointEvent(EntrypointEvent::Exit { code: 0 });
+        let json = serde_json::to_string(&resp).expect("serialize");
+        let decoded: GuestResponse = serde_json::from_str(&json).expect("deserialize");
+        match decoded {
+            GuestResponse::EntrypointEvent(EntrypointEvent::Exit { code }) => {
+                assert_eq!(code, 0);
+            }
+            other => panic!("expected EntrypointEvent(Exit), got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_run_entrypoint_response_stream_terminates_on_exit() {
+        // Simulate a v1 response stream and assert the host's read
+        // loop discipline: read events until is_terminal returns
+        // true. This is the contract W2's agent handler must
+        // satisfy and W3's CLI consumes.
+        let stream = vec![
+            EntrypointEvent::Stdout {
+                chunk: b"out".to_vec(),
+            },
+            EntrypointEvent::Stderr {
+                chunk: b"err".to_vec(),
+            },
+            EntrypointEvent::Exit { code: 0 },
+        ];
+
+        let mut seen = 0;
+        for evt in &stream {
+            seen += 1;
+            if evt.is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(seen, 3);
+        assert!(stream[2].is_terminal());
+    }
+
+    #[test]
+    fn test_run_entrypoint_response_stream_terminates_on_error() {
+        // Same shape as the Exit case but with Error as the
+        // terminal event — the host loop must stop equally cleanly
+        // either way.
+        let stream = vec![
+            EntrypointEvent::Stdout {
+                chunk: b"partial".to_vec(),
+            },
+            EntrypointEvent::Error {
+                kind: RunEntrypointError::Timeout,
+                message: "killed after 30s".into(),
+            },
+        ];
+
+        let mut seen = 0;
+        for evt in &stream {
+            seen += 1;
+            if evt.is_terminal() {
+                break;
+            }
+        }
+        assert_eq!(seen, 2);
+        assert!(stream[1].is_terminal());
+    }
+
+    #[test]
+    fn test_run_entrypoint_request_well_formed_accepted() {
+        // Sanity: the W1 wire types must continue to parse cleanly
+        // with `deny_unknown_fields` applied.
+        let json = r#"{"RunEntrypoint":{"stdin":[],"timeout_secs":15}}"#;
+        let req: GuestRequest = serde_json::from_str(json).expect("deserialize");
+        assert!(matches!(
+            req,
+            GuestRequest::RunEntrypoint {
+                stdin,
+                timeout_secs: 15,
+            } if stdin.is_empty()
+        ));
     }
 
     /// Sanity check: the well-formed frames the same tests cover above must
