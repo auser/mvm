@@ -1,17 +1,27 @@
 #!/usr/bin/env bash
-# ADR-002 §W4.3 — production guest agent binary must not contain the dev-only
-# Exec command path. The `dev-shell` Cargo feature gates `do_exec` and the
-# `GuestRequest::Exec` handler; any production-targeted build must omit the
-# feature, and the symbol must therefore be absent from the resulting binary.
+# Combined production-agent symbol contract (ADR-002 §W4.3 + ADR-007 §W5).
 #
-# This gate builds the agent without `--features dev-shell` and asserts the
-# `do_exec` symbol is not present in the output. A failure means either
-# (a) someone re-enabled the feature in a default-features path, or
-# (b) `do_exec` was moved out from behind the feature gate.
+# The production guest agent binary has TWO load-bearing symbol-level
+# invariants that must hold against the *same* binary that ships:
+#
+#   1. The dev-only `mvm_guest_agent::do_exec` symbol must be ABSENT.
+#      This is the W4.3 invariant — `do_exec` is the dev-shell-gated
+#      arbitrary-shell handler. A prod build must omit `--features
+#      dev-shell` and therefore must not contain the symbol.
+#
+#   2. The W2 `mvm_guest_agent::handle_run_entrypoint` symbol must be
+#      PRESENT. This is the constrained `RunEntrypoint` handler —
+#      ADR-007's production-safe call surface. A prod build that lacks
+#      it can't actually serve `mvmctl invoke`, which means the
+#      shipping artifact is broken.
+#
+# Asserting both on the same binary in one CI step prevents
+# feature-flag drift from regressing half the contract silently
+# (ADR-007 / plan 41 W5).
 #
 # Usage: scripts/check-prod-agent-no-exec.sh
 #
-# Exit codes: 0 = clean, 1 = forbidden symbol present, 2 = build failed.
+# Exit codes: 0 = clean, 1 = symbol contract violated, 2 = build failed.
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
@@ -66,6 +76,24 @@ if "${NM_CMD[@]}" "$BIN" 2>/dev/null | grep -F "$PATTERN" >/dev/null; then
 fi
 
 echo "==> ok: no do_exec symbol in $BIN"
+
+# ─── Positive: handle_run_entrypoint must be PRESENT (ADR-007 §W5) ─────
+# The W2 handler is feature-independent (no `dev-shell` gate) — every
+# prod build must contain it. Absence means either the function was
+# accidentally removed, gated behind a feature, or renamed without
+# updating this gate. Either way, the prod artifact can't serve
+# `mvmctl invoke` and is broken.
+RUNENTRY_PATTERN='mvm_guest_agent::handle_run_entrypoint'
+if ! "${NM_CMD[@]}" "$BIN" 2>/dev/null | grep -F "$RUNENTRY_PATTERN" >/dev/null; then
+    echo "error: required symbol '$RUNENTRY_PATTERN' missing from production guest agent" >&2
+    echo "       this means the W2 RunEntrypoint handler is not compiled in," >&2
+    echo "       and the shipping artifact cannot serve 'mvmctl invoke'." >&2
+    echo "       See ADR-007 §W5 and the handler in" >&2
+    echo "       crates/mvm-guest/src/bin/mvm-guest-agent.rs::handle_run_entrypoint." >&2
+    exit 1
+fi
+
+echo "==> ok: handle_run_entrypoint symbol present in $BIN"
 
 # ─── Variant ↔ feature pairing (W7.1) ────────────────────────────────────
 # `mkGuest` (in nix/flake.nix) asserts at build time that:

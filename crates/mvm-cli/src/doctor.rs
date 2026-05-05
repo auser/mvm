@@ -94,6 +94,8 @@ pub fn run(json: bool) -> Result<()> {
     checks.push(security_dev_image_check());
     checks.push(security_deny_config_check());
     checks.push(security_default_network_check());
+    checks.push(security_snapshot_key_check());
+    checks.push(security_snapshot_dirs_check());
 
     // ── Render ────────────────────────────────────────────────────
     let all_ok = checks.iter().all(|c| c.ok);
@@ -832,6 +834,142 @@ fn security_default_network_check() -> Check {
             "configured".to_string()
         } else {
             "not configured — run `mvmctl network create default`".to_string()
+        },
+    }
+}
+
+/// `~/.mvm/snapshot.key` should be mode 0600 (ADR-007 §W4 / M9).
+///
+/// Absence is informational — the file is created lazily on first
+/// snapshot seal. Existence with looser perms is a security finding:
+/// any local user could read the key and forge sidecars.
+fn security_snapshot_key_check() -> Check {
+    let path = mvm_security::snapshot_hmac::default_key_path(std::path::Path::new(
+        &mvm_core::config::mvm_data_dir(),
+    ));
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return Check {
+            name: "snapshot HMAC key",
+            category: "security",
+            ok: true,
+            info: format!(
+                "not yet created at {} (lazy — created on first snapshot seal)",
+                path.display()
+            ),
+        };
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        let expected = 0o600;
+        let len_ok = meta.len() == mvm_security::snapshot_hmac::HMAC_KEY_BYTES as u64;
+        Check {
+            name: "snapshot HMAC key",
+            category: "security",
+            ok: mode == expected && len_ok,
+            info: if mode != expected {
+                format!(
+                    "expected mode 0{expected:o}, got 0{mode:o} at {} — \
+                     a local-user-readable HMAC key can be used to forge sidecars",
+                    path.display()
+                )
+            } else if !len_ok {
+                format!(
+                    "key file at {} is {} bytes (expected {}) — corrupt; rotate by deleting the file",
+                    path.display(),
+                    meta.len(),
+                    mvm_security::snapshot_hmac::HMAC_KEY_BYTES
+                )
+            } else {
+                format!("0{mode:o} at {}", path.display())
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        Check {
+            name: "snapshot HMAC key",
+            category: "security",
+            ok: true,
+            info: "non-Unix host; mode check skipped".to_string(),
+        }
+    }
+}
+
+/// All template snapshot directories should be mode 0700 (ADR-007
+/// §W4 / M9). Walks `~/.mvm/templates/*/artifacts/*/snapshot/`,
+/// reports the first looser-perm directory found (or "all OK" /
+/// "none built yet" otherwise).
+fn security_snapshot_dirs_check() -> Check {
+    let templates_dir = mvm_core::domain::template::templates_base_dir();
+    let templates_path = std::path::Path::new(&templates_dir);
+    if !templates_path.exists() {
+        return Check {
+            name: "snapshot dir mode",
+            category: "security",
+            ok: true,
+            info: format!("no templates directory at {templates_dir}"),
+        };
+    }
+
+    let mut total = 0u32;
+    let mut bad: Option<(std::path::PathBuf, u32)> = None;
+    if let Ok(entries) = std::fs::read_dir(templates_path) {
+        for tpl in entries.flatten() {
+            let artifacts = tpl.path().join("artifacts");
+            let Ok(rev_entries) = std::fs::read_dir(&artifacts) else {
+                continue;
+            };
+            for rev in rev_entries.flatten() {
+                let snap = rev.path().join("snapshot");
+                if !snap.is_dir() {
+                    continue;
+                }
+                total += 1;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::symlink_metadata(&snap) {
+                        let mode = meta.permissions().mode() & 0o777;
+                        if mode != 0o700 && bad.is_none() {
+                            bad = Some((snap, mode));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if total == 0 {
+        return Check {
+            name: "snapshot dir mode",
+            category: "security",
+            ok: true,
+            info: format!("no snapshots built yet under {templates_dir}"),
+        };
+    }
+    match bad {
+        Some((path, mode)) => Check {
+            name: "snapshot dir mode",
+            category: "security",
+            ok: false,
+            info: format!(
+                "expected 0700, got 0{mode:o} at {} (1 of {total} snapshot dir{}; \
+                 looser perms let local users tamper with snapshots)",
+                path.display(),
+                if total == 1 { "" } else { "s" }
+            ),
+        },
+        None => Check {
+            name: "snapshot dir mode",
+            category: "security",
+            ok: true,
+            info: format!(
+                "0700 across {total} snapshot dir{}",
+                if total == 1 { "" } else { "s" }
+            ),
         },
     }
 }

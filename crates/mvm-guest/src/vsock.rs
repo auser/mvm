@@ -122,6 +122,11 @@ pub enum GuestRequest {
         cols: u16,
         rows: u16,
     },
+    /// Query whether the agent's boot-time entrypoint validation
+    /// succeeded. Used by `mvmctl doctor` to confirm a running guest
+    /// can actually serve `RunEntrypoint`. ADR-007 / plan 41 W5.
+    /// Prod-safe — reveals no secrets, takes no inputs.
+    EntrypointStatus,
 }
 
 /// Response from guest vsock agent to host.
@@ -192,6 +197,18 @@ pub enum GuestResponse {
     ConsoleExited { session_id: u32, exit_code: i32 },
     /// Console resize acknowledged.
     ConsoleResized { session_id: u32 },
+    /// Result of an `EntrypointStatus` query. ADR-007 / plan 41 W5.
+    ///
+    /// `ok = true` means the agent successfully validated
+    /// `/etc/mvm/entrypoint` at boot and will serve `RunEntrypoint`.
+    /// `ok = false` means validation failed — `path` carries the
+    /// resolved path attempt (or the marker contents if resolution
+    /// itself failed) and `detail` carries a human-readable reason.
+    EntrypointStatusReport {
+        ok: bool,
+        path: Option<String>,
+        detail: Option<String>,
+    },
 }
 
 /// A single filesystem change detected since boot.
@@ -1482,6 +1499,68 @@ mod tests {
                 timeout_secs: 15,
             } if stdin.is_empty()
         ));
+    }
+
+    // -------------------------------------------------------------------
+    // ADR-007 / plan 41 W5 — EntrypointStatus query
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn test_entrypoint_status_request_roundtrip() {
+        let req = GuestRequest::EntrypointStatus;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#""EntrypointStatus""#);
+        let decoded: GuestRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(decoded, GuestRequest::EntrypointStatus));
+    }
+
+    #[test]
+    fn test_entrypoint_status_report_ok_roundtrip() {
+        let resp = GuestResponse::EntrypointStatusReport {
+            ok: true,
+            path: Some("/usr/lib/mvm/wrappers/python-runner".into()),
+            detail: None,
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: GuestResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            GuestResponse::EntrypointStatusReport { ok, path, detail } => {
+                assert!(ok);
+                assert_eq!(path.as_deref(), Some("/usr/lib/mvm/wrappers/python-runner"));
+                assert!(detail.is_none());
+            }
+            other => panic!("expected EntrypointStatusReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_entrypoint_status_report_failed_roundtrip() {
+        let resp = GuestResponse::EntrypointStatusReport {
+            ok: false,
+            path: None,
+            detail: Some("entrypoint validation never ran".into()),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        let decoded: GuestResponse = serde_json::from_str(&json).unwrap();
+        match decoded {
+            GuestResponse::EntrypointStatusReport { ok, path, detail } => {
+                assert!(!ok);
+                assert!(path.is_none());
+                assert!(detail.unwrap().contains("never ran"));
+            }
+            other => panic!("expected EntrypointStatusReport, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_entrypoint_status_report_rejects_unknown_field() {
+        let json =
+            r#"{"EntrypointStatusReport":{"ok":true,"path":null,"detail":null,"smuggled":1}}"#;
+        let err = serde_json::from_str::<GuestResponse>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field") && err.to_string().contains("smuggled"),
+            "expected 'unknown field smuggled', got: {err}"
+        );
     }
 
     /// Sanity check: the well-formed frames the same tests cover above must
