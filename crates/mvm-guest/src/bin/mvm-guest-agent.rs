@@ -1222,6 +1222,28 @@ fn handle_client(
                 }
             }
         }
+
+        // ADR-007 / plan 41 W5 — report whether boot-time entrypoint
+        // validation succeeded. Used by `mvmctl doctor` against a
+        // running guest. Prod-safe — no inputs, no secrets in the
+        // response (just a path + reason string).
+        GuestRequest::EntrypointStatus => match VALIDATED_ENTRYPOINT.get() {
+            Some(Ok(v)) => GuestResponse::EntrypointStatusReport {
+                ok: true,
+                path: Some(v.resolved.display().to_string()),
+                detail: None,
+            },
+            Some(Err(msg)) => GuestResponse::EntrypointStatusReport {
+                ok: false,
+                path: None,
+                detail: Some(msg.clone()),
+            },
+            None => GuestResponse::EntrypointStatusReport {
+                ok: false,
+                path: None,
+                detail: Some("entrypoint validation never ran".to_string()),
+            },
+        },
     };
 
     write_response(&mut file, &resp);

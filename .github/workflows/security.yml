@@ -68,13 +68,16 @@ jobs:
         # discoverable way to keep the two tools in sync.
         run: cargo audit --ignore RUSTSEC-2025-0057 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2026-0009
 
-  # ── Lane 2: Production-agent symbol gate ──────────────────────────
-  # ADR-002 §W4.3 — production builds of mvm-guest-agent must not
-  # contain mvm_guest_agent::do_exec. Catches accidental re-enable
-  # of the dev-shell feature. Anchors on the binary's crate name to
-  # skip stdlib's identically-named symbol.
-  prod-agent-no-exec:
-    name: Guest agent — no dev-shell symbols (ADR-002 §W4.3)
+  # ── Lane 2: Production-agent symbol contract ─────────────────────
+  # ADR-002 §W4.3 + ADR-007 §W5 — combined contract on the production
+  # guest agent binary. ONE build, ONE step, BOTH assertions:
+  #   • mvm_guest_agent::do_exec is ABSENT (W4.3 — no dev-shell leak)
+  #   • mvm_guest_agent::handle_run_entrypoint is PRESENT (W5 — the
+  #     constrained RunEntrypoint handler ships).
+  # Asserting both on the *same* binary in a single step prevents
+  # feature-flag drift from regressing half the contract silently.
+  prod-agent-runentry-contract:
+    name: Guest agent — symbol contract (ADR-002 §W4.3 + ADR-007 §W5)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -92,7 +95,7 @@ jobs:
           key: cargo-prodagent-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: cargo-prodagent-
 
-      - name: Build prod agent and check for do_exec
+      - name: Build prod agent and assert symbol contract
         run: ./scripts/check-prod-agent-no-exec.sh
 
   # ── Lane 3: Reproducibility ────────────────────────────────────────
