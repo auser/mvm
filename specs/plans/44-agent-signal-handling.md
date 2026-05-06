@@ -1,13 +1,13 @@
 # Plan 44 — Guest agent signal handling
 
-Status: backlog. Sized for a future contributor / agent to pick up
-without re-doing the discovery work.
+Status: **W1 + W2 shipped.** W3 (SIGHUP config reload) remains backlog —
+not load-bearing until config reload becomes a real feature.
 
 ## Background
 
-The guest agent (`crates/mvm-guest/src/bin/mvm-guest-agent.rs`) has
-no signal handlers. SIGTERM, SIGINT, SIGHUP all hit the default
-disposition — the process dies abruptly without giving any subsystem
+Until plan 44 W1 shipped, the guest agent had no signal handlers.
+SIGTERM, SIGINT, SIGHUP all hit the default
+disposition — the process died abruptly without giving any subsystem
 a chance to drain or release resources. Today this is fine because:
 
 - The dominant teardown path is **VM destruction**, not agent

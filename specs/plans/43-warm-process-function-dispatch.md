@@ -388,13 +388,12 @@ path is unaffected. We can land this substrate safely and test it via
   back requires rebuilding. A defense-in-depth runtime override
   (kernel cmdline or `agent.json` toggle that suppresses warm even
   when configured) is out of scope for v0.2 — file as v0.3.
-- No SIGTERM handler. The agent has no signal-handling infrastructure
-  today; on VM teardown all processes die abruptly. `WorkerPool::shutdown()`
-  exists for tests / future use, but no handler invokes it. The fallback
-  is the kernel's own teardown — workers receive SIGPIPE on the agent's
-  FD-table tear-down and PID 1 reaps them. Captured as a follow-up in
-  [`44-agent-signal-handling.md`](44-agent-signal-handling.md), which
-  also covers SIGHUP config reload if that becomes relevant.
+- ~~No SIGTERM handler.~~ **Resolved by [plan 44](44-agent-signal-handling.md)
+  W1 + W2** — SIGTERM/SIGINT flip an atomic flag, the accept loop polls
+  it, and `WorkerPool::shutdown` drains workers before exit. Cold-tier
+  images get the same orderly accept-loop exit (the drain is a no-op
+  when no pool is active). SIGHUP config reload (plan 44 W3) remains
+  backlog until config reload is wanted.
 
 ## Files to touch
 
