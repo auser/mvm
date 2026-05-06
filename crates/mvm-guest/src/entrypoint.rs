@@ -164,6 +164,20 @@ pub struct ValidatedEntrypoint {
     pub file: File,
 }
 
+impl ValidatedEntrypoint {
+    /// Clone by `dup`-ing the held file descriptor. The new
+    /// `ValidatedEntrypoint` owns an independent FD pointing at the
+    /// same inode — useful for handing the same validated wrapper to
+    /// a long-lived owner (e.g., `worker_pool::WorkerPool`) without
+    /// reaching into a shared static.
+    pub fn try_clone(&self) -> std::io::Result<Self> {
+        Ok(Self {
+            resolved: self.resolved.clone(),
+            file: self.file.try_clone()?,
+        })
+    }
+}
+
 /// Reasons validation can fail. The agent surfaces these to the host
 /// as `RunEntrypointError::EntrypointInvalid` with a short message.
 #[derive(Debug)]
@@ -479,7 +493,7 @@ pub fn execute(
 /// Set `RLIMIT_CORE = 0` on the calling process. Children inherit this
 /// rlimit at fork+exec, so a wrapper crash doesn't dump core. Best-effort:
 /// we log but don't fail the call if the syscall is denied.
-fn set_no_core_dumps() {
+pub(crate) fn set_no_core_dumps() {
     unsafe {
         let zero = libc::rlimit {
             rlim_cur: 0,
@@ -500,7 +514,7 @@ fn set_no_core_dumps() {
 /// platforms (macOS dev/test), fall back to the canonicalized path —
 /// production guests are always Linux so the fallback is for unit
 /// tests only.
-fn spawn_path(entrypoint: &ValidatedEntrypoint) -> PathBuf {
+pub(crate) fn spawn_path(entrypoint: &ValidatedEntrypoint) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
         use std::os::fd::AsRawFd;
@@ -550,7 +564,7 @@ fn poll_for_exit(
     }
 }
 
-fn kill_and_reap(child: &mut Child, grace: Duration) {
+pub(crate) fn kill_and_reap(child: &mut Child, grace: Duration) {
     // Negate the pid to address the entire process group — the child
     // is its own process group leader (see `.process_group(0)` above),
     // so `kill(-pgid, ...)` reaches the wrapper plus any descendants

@@ -6,4 +6,7 @@ pub mod console;
 pub mod entrypoint;
 pub mod integrations;
 pub mod probes;
+pub mod runtime_config;
 pub mod vsock;
+pub mod worker_pool;
+pub mod worker_protocol;

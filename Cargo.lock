@@ -2366,6 +2366,7 @@ name = "mvm-guest"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
  "libc",

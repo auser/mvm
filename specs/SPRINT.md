@@ -595,6 +595,26 @@ Six workstreams, each independently shippable.
   skipping TAP allocation. **Open** — needs the mvmforge IR
   emit + an mvm-side regression test that asserts a `mode =
   "none"` workload truly has no TAP.
+- **W7 — Warm-process function dispatch (ADR-0011 tier 2).**  🟡
+  in progress  [`plans/43-warm-process-function-dispatch.md`](plans/43-warm-process-function-dispatch.md).
+  Adds an opt-in worker pool inside the guest agent so
+  function-entrypoint calls can reuse a long-running wrapper
+  process across invokes instead of cold-spawning per
+  `mvmctl invoke`. Driven by a new mvmforge-owned
+  `/etc/mvm/runtime.json` carrying a `concurrency.kind =
+  "warm_process"` field (`max_calls_per_worker`, `max_rss_mb`,
+  `pool_size`, `in_process`, `max_queue_depth`). When the field
+  is absent, the cold path (W2) stays bit-identical. Host wire
+  (`RunEntrypoint` + `EntrypointEvent`) is unchanged; the agent
+  synthesizes the existing event stream from a single buffered
+  framed response per worker call. M12 (one in-flight call per
+  VM) is bypassed under warm-process — the new invariant is "one
+  in-flight call per worker, ≤ `pool_size` concurrent." The
+  `prod-agent-no-exec` symbol gate keeps passing; the plan adds a
+  positive-evidence assertion for the new
+  `mvm_guest::worker_pool` module. mvm-side only — mvmforge ships
+  the IR + factory + runner-wrapper changes in a coordinated
+  follow-up (cross-repo ADR-0011).
 
 ### Substrate validation (live smoke)
 
@@ -699,6 +719,7 @@ Cross-repo (decorationer):
 | **Session pool management** | follow-up plan (none yet) | Pre-baked invariant: *single-tenant for VM lifetime*. v1 reuses `boot_session_vm` / `dispatch_in_session` / `tear_down_session_vm` primitives directly. Sizing / eviction / per-tenant isolation / idle reaper are real but separable from the substrate. | ~1 sprint |
 | **Streaming chunked output** | follow-up plan (none yet) | v1 wire is streaming-shaped but buffered up to 1 MiB per stream. Lifting the cap means real chunked emission from the agent and a streaming consumer in `send_run_entrypoint`. | ~1 week |
 | **Schema-bound payloads (v2 of W3)** | decorationer plan 0003 | Derive JSON Schema from type hints (Python `pydantic` / TS `zod`). Wrapper validates inbound bytes before user code runs. | ~1 week |
+| **Guest agent signal handling** | [`plans/44-agent-signal-handling.md`](plans/44-agent-signal-handling.md) | The agent has no SIGTERM/SIGINT/SIGHUP handlers. VM teardown is abrupt today, so graceful drain is cosmetic. Plan 43 (warm-process) made `WorkerPool::shutdown` exist but didn't wire a handler to call it. Becomes load-bearing if mvm grows hot-reload, in-place agent updates, operator-driven SIGTERM, config reload, or non-microVM execution. | ~½ day |
 
 ### Stack-merge artifacts
 

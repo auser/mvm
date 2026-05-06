@@ -1,0 +1,576 @@
+//! Warm-process worker pool — plan 43 / mvmforge ADR-0011 tier 2.
+//!
+//! When `/etc/mvm/runtime.json` carries `concurrency.kind =
+//! "warm_process"`, the agent stands up a fixed-size pool of
+//! long-running wrapper processes at boot. Each `mvmctl invoke`
+//! is dispatched to a free worker over its stdin/stdout pipes via
+//! length-prefixed JSON frames (see [`crate::worker_protocol`]).
+//!
+//! Compared to the cold path:
+//! - The wrapper's interpreter cold-start happens once per worker,
+//!   not once per invoke. Per-call latency drops by hundreds of ms
+//!   (Python especially).
+//! - The M12 single-call invariant is bypassed: up to `pool_size`
+//!   calls can be in flight in the same VM. Backpressure is a FIFO
+//!   queue, capped at `max_queue_depth` (default `2 * pool_size`).
+//! - Workers are recycled on call-count, RSS, or wrapper crash.
+//! - Cross-call wrapper state is the user's responsibility (ADR-0011);
+//!   the agent does not scrub state between calls.
+//!
+//! The host wire (vsock `RunEntrypoint` → `EntrypointEvent` stream)
+//! is bit-identical to the cold path. The agent synthesizes the
+//! existing event stream from the worker's single buffered response
+//! frame.
+
+use std::io::{self, BufReader};
+use std::os::unix::process::CommandExt;
+use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Condvar, Mutex};
+use std::thread;
+use std::time::{Duration, Instant};
+
+use crate::entrypoint::{self, ValidatedEntrypoint};
+use crate::runtime_config::WarmProcessConfig;
+use crate::worker_protocol::{
+    WorkerCallRequest, WorkerCallResponse, WorkerOutcome, read_pipe_frame, write_pipe_frame,
+};
+
+/// Grace period between SIGTERM and SIGKILL when recycling or
+/// shutting a worker. Mirrors the cold-path
+/// `CallCaps::v1().kill_grace_period`.
+pub const DEFAULT_KILL_GRACE: Duration = Duration::from_secs(2);
+
+/// One worker process plus the per-worker bookkeeping the dispatcher
+/// needs between calls.
+pub(crate) struct WorkerHandle {
+    pid: u32,
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    /// stderr drains in the background to avoid blocking the worker
+    /// when its stderr pipe fills up. We don't surface the bytes —
+    /// they go straight to the agent's own stderr (inherited as
+    /// "mvm-guest-agent: worker N: …"). Held so Drop joins the thread.
+    _stderr_drain: thread::JoinHandle<()>,
+    call_count: u64,
+    last_rss_bytes: u64,
+}
+
+impl Drop for WorkerHandle {
+    fn drop(&mut self) {
+        // Best-effort cleanup. The watchdog and recycle paths
+        // typically race ahead of Drop; this is the catch-all when
+        // the pool itself is being torn down or the handle is
+        // dropped due to a panic.
+        entrypoint::kill_and_reap(&mut self.child, DEFAULT_KILL_GRACE);
+    }
+}
+
+/// One slot in the pool. Slots are indexed by position; the index is
+/// stable across replacements so debug logs can refer to "worker 3".
+enum WorkerSlot {
+    Idle(WorkerHandle),
+    Busy,
+    /// Slot's worker died and respawn has not yet succeeded. The
+    /// recovery thread retries periodically.
+    Dead,
+}
+
+struct PoolState {
+    slots: Vec<WorkerSlot>,
+    pending_waiters: usize,
+}
+
+/// Errors returned by [`WorkerPool::dispatch`] before the call ever
+/// reaches a worker. Successful runs return [`DispatchOutcome`] even
+/// for user-code failures.
+#[derive(Debug)]
+pub enum DispatchError {
+    /// All workers busy and the queue is at `max_queue_depth`.
+    /// Maps to `EntrypointEvent::Error { kind: Busy }` host-side.
+    QueueFull,
+    /// Pool is shutting down. New calls refuse fast-fail.
+    ShuttingDown,
+    /// Every slot is `Dead` and respawn is failing. Surfaces as
+    /// `EntrypointEvent::Error { kind: InternalError }`.
+    NoLiveWorkers,
+}
+
+impl std::fmt::Display for DispatchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DispatchError::QueueFull => write!(f, "worker pool queue full"),
+            DispatchError::ShuttingDown => write!(f, "worker pool is shutting down"),
+            DispatchError::NoLiveWorkers => write!(f, "worker pool has no live workers"),
+        }
+    }
+}
+
+impl std::error::Error for DispatchError {}
+
+/// Result of a single dispatched call. The agent maps this onto
+/// the host-facing `EntrypointEvent` stream.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DispatchOutcome {
+    pub stdout: Vec<u8>,
+    pub stderr: Vec<u8>,
+    pub outcome: WorkerOutcome,
+}
+
+impl DispatchOutcome {
+    /// Synthesize a transport-error response — used when the worker
+    /// crashes mid-call or fails to produce a frame.
+    fn transport_error(kind: &str, message: String) -> Self {
+        Self {
+            stdout: Vec::new(),
+            stderr: Vec::new(),
+            outcome: WorkerOutcome::Error {
+                kind: kind.to_string(),
+                message,
+            },
+        }
+    }
+}
+
+/// Pool of long-running wrapper workers.
+pub struct WorkerPool {
+    state: Mutex<PoolState>,
+    cv: Condvar,
+    cfg: WarmProcessConfig,
+    entrypoint: Arc<ValidatedEntrypoint>,
+    /// Env vars forwarded into each spawned worker. The pool always
+    /// `env_clear()`s before applying these — production wrappers
+    /// should not rely on host-inherited env. The list is populated
+    /// by the agent at boot from a curated set (e.g., `PATH`,
+    /// `LANG`); tests use it to drive test-fixture behavior.
+    worker_env: Vec<(String, String)>,
+    shutdown: AtomicBool,
+}
+
+impl WorkerPool {
+    /// Boot the pool: spawn `cfg.pool_size` workers, each from the
+    /// validated wrapper FD. Fails fast on the first spawn error —
+    /// caller (the agent main) should exit non-zero so misconfigured
+    /// images don't appear to start successfully.
+    ///
+    /// `worker_env` is the set of env vars set on each worker at
+    /// spawn time. The pool's spawn path always calls
+    /// `Command::env_clear()` first, then applies these — workers
+    /// cannot inherit anything else.
+    pub fn start(
+        cfg: WarmProcessConfig,
+        entrypoint: Arc<ValidatedEntrypoint>,
+        worker_env: Vec<(String, String)>,
+    ) -> io::Result<Arc<Self>> {
+        // Set RLIMIT_CORE=0 on the agent so all child workers
+        // inherit it. Mirrors the cold-path one-shot in
+        // `entrypoint::execute`.
+        entrypoint::set_no_core_dumps();
+
+        let mut slots = Vec::with_capacity(cfg.pool_size);
+        for i in 0..cfg.pool_size {
+            let handle = spawn_worker(&entrypoint, &worker_env)
+                .map_err(|e| io::Error::other(format!("spawn worker {i}: {e}")))?;
+            eprintln!(
+                "mvm-guest-agent: warm-process worker {i} spawned pid={}",
+                handle.pid
+            );
+            slots.push(WorkerSlot::Idle(handle));
+        }
+
+        eprintln!(
+            "mvm-guest-agent: warm-process pool active (pool_size={}, max_calls_per_worker={}, \
+             max_rss_mb={}, queue_depth={}); cross-call wrapper state is the user's responsibility \
+             — the agent does not scrub between calls (ADR-0011 §state)",
+            cfg.pool_size,
+            cfg.max_calls_per_worker,
+            cfg.max_rss_mb,
+            cfg.effective_queue_depth(),
+        );
+
+        Ok(Arc::new(Self {
+            state: Mutex::new(PoolState {
+                slots,
+                pending_waiters: 0,
+            }),
+            cv: Condvar::new(),
+            cfg,
+            entrypoint,
+            worker_env,
+            shutdown: AtomicBool::new(false),
+        }))
+    }
+
+    /// Dispatch one call to a free worker. Blocks (FIFO via Condvar)
+    /// if all workers are busy, up to `max_queue_depth` total
+    /// waiters; the `(pool_size + 1)`th waiter gets `QueueFull`.
+    ///
+    /// `timeout_secs` is forwarded to the worker (informational) and
+    /// enforced by an agent-side watchdog that SIGKILLs the worker's
+    /// process group on expiry. The worker can be killed mid-call;
+    /// the read-frame returns `UnexpectedEof` and we surface
+    /// `Outcome::Error { kind: "wrapper_crash" }`.
+    pub fn dispatch(
+        self: &Arc<Self>,
+        stdin: Vec<u8>,
+        timeout_secs: u64,
+    ) -> Result<DispatchOutcome, DispatchError> {
+        let (idx, mut handle) = self.acquire()?;
+        let pgid = handle.pid as i32;
+
+        // Watchdog: SIGKILLs the worker group at deadline. Cancelled
+        // on response by setting the atomic. Joined regardless.
+        let cancelled = Arc::new(AtomicBool::new(false));
+        let watchdog = spawn_watchdog(pgid, timeout_secs, Arc::clone(&cancelled));
+
+        let result = run_one_call(&mut handle, stdin, timeout_secs);
+        cancelled.store(true, Ordering::Release);
+        let _ = watchdog.join();
+
+        let recycle = self.should_recycle(&mut handle, &result);
+        self.release(idx, handle, recycle);
+
+        Ok(match result {
+            Ok(resp) => DispatchOutcome {
+                stdout: resp.stdout,
+                stderr: resp.stderr,
+                outcome: resp.outcome,
+            },
+            Err(WorkerCallError::Crash(message)) => {
+                DispatchOutcome::transport_error("wrapper_crash", message)
+            }
+            Err(WorkerCallError::Protocol(message)) => {
+                DispatchOutcome::transport_error("wrapper_crash", message)
+            }
+        })
+    }
+
+    /// Initiate shutdown. New `dispatch` calls return
+    /// `ShuttingDown`. Idle workers are SIGTERM/SIGKILL'd via Drop.
+    /// Busy workers run to completion (Drop fires on release). The
+    /// caller may sleep `grace` to let in-flight calls drain.
+    pub fn shutdown(&self, grace: Duration) {
+        self.shutdown.store(true, Ordering::Release);
+        self.cv.notify_all();
+        // Drain idle workers right away. Busy workers tear down
+        // on release.
+        let mut st = self.state.lock().expect("worker pool state mutex poisoned");
+        for slot in st.slots.iter_mut() {
+            if let WorkerSlot::Idle(_) = slot {
+                // Replace with Dead — Drop on the moved handle kills
+                // the worker.
+                *slot = WorkerSlot::Dead;
+            }
+        }
+        drop(st);
+        // Give callers a chance to observe in-flight completions.
+        thread::sleep(grace.min(Duration::from_secs(30)));
+    }
+
+    /// Snapshot of slot states for observability / tests.
+    pub fn snapshot(&self) -> Vec<SlotSnapshot> {
+        let st = self.state.lock().expect("worker pool state mutex poisoned");
+        st.slots
+            .iter()
+            .map(|slot| match slot {
+                WorkerSlot::Idle(h) => SlotSnapshot::Idle {
+                    pid: h.pid,
+                    call_count: h.call_count,
+                    last_rss_bytes: h.last_rss_bytes,
+                },
+                WorkerSlot::Busy => SlotSnapshot::Busy,
+                WorkerSlot::Dead => SlotSnapshot::Dead,
+            })
+            .collect()
+    }
+
+    fn acquire(self: &Arc<Self>) -> Result<(usize, WorkerHandle), DispatchError> {
+        let mut st = self.state.lock().expect("worker pool state mutex poisoned");
+        loop {
+            if self.shutdown.load(Ordering::Acquire) {
+                return Err(DispatchError::ShuttingDown);
+            }
+            if let Some(idx) = st
+                .slots
+                .iter()
+                .position(|s| matches!(s, WorkerSlot::Idle(_)))
+            {
+                let slot = std::mem::replace(&mut st.slots[idx], WorkerSlot::Busy);
+                let WorkerSlot::Idle(handle) = slot else {
+                    unreachable!("position() guarantees Idle");
+                };
+                return Ok((idx, handle));
+            }
+            // No idle. If every slot is Dead, fail fast — there's no
+            // hope of waking up unless a recovery thread succeeds,
+            // which we don't model in v0.2.
+            if st.slots.iter().all(|s| matches!(s, WorkerSlot::Dead)) {
+                return Err(DispatchError::NoLiveWorkers);
+            }
+            // Some are Busy; wait for one to be released.
+            if st.pending_waiters >= self.cfg.effective_queue_depth() {
+                return Err(DispatchError::QueueFull);
+            }
+            st.pending_waiters += 1;
+            st = self.cv.wait(st).expect("worker pool condvar wait poisoned");
+            st.pending_waiters -= 1;
+        }
+    }
+
+    fn release(self: &Arc<Self>, idx: usize, handle: WorkerHandle, recycle: bool) {
+        let mut st = self.state.lock().expect("worker pool state mutex poisoned");
+        if recycle {
+            // Drop the handle inside this scope so the old worker is
+            // killed before we attempt to spawn a replacement (their
+            // resource caps may overlap during overshoot).
+            drop(handle);
+            match spawn_worker(&self.entrypoint, &self.worker_env) {
+                Ok(new_handle) => {
+                    eprintln!(
+                        "mvm-guest-agent: warm-process worker {idx} replaced pid={}",
+                        new_handle.pid
+                    );
+                    st.slots[idx] = WorkerSlot::Idle(new_handle);
+                }
+                Err(e) => {
+                    eprintln!(
+                        "mvm-guest-agent: warm-process worker {idx} respawn failed: {e}; \
+                         marking slot dead"
+                    );
+                    st.slots[idx] = WorkerSlot::Dead;
+                }
+            }
+        } else {
+            st.slots[idx] = WorkerSlot::Idle(handle);
+        }
+        self.cv.notify_one();
+    }
+
+    fn should_recycle(
+        self: &Arc<Self>,
+        handle: &mut WorkerHandle,
+        result: &Result<WorkerCallResponse, WorkerCallError>,
+    ) -> bool {
+        // Wrapper-level transport failure → always recycle.
+        if result.is_err() {
+            return true;
+        }
+        // User code may legitimately exit non-zero on its own
+        // (e.g. a Python wrapper translates an unhandled exception
+        // to a sanitized envelope and exit 1). Don't recycle on that
+        // — only on wrapper-side failures.
+        handle.call_count = handle.call_count.saturating_add(1);
+        if handle.call_count >= self.cfg.max_calls_per_worker {
+            eprintln!(
+                "mvm-guest-agent: warm-process worker pid={} recycle (call_count {} >= {})",
+                handle.pid, handle.call_count, self.cfg.max_calls_per_worker
+            );
+            return true;
+        }
+        if let Some(rss) = sample_rss_bytes(handle.pid) {
+            handle.last_rss_bytes = rss;
+            let cap = self.cfg.max_rss_mb.saturating_mul(1024 * 1024);
+            if rss > cap {
+                eprintln!(
+                    "mvm-guest-agent: warm-process worker pid={} recycle (rss {} > {})",
+                    handle.pid, rss, cap
+                );
+                return true;
+            }
+        }
+        false
+    }
+}
+
+/// Public projection of slot state (for tests and observability).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SlotSnapshot {
+    Idle {
+        pid: u32,
+        call_count: u64,
+        last_rss_bytes: u64,
+    },
+    Busy,
+    Dead,
+}
+
+#[derive(Debug)]
+enum WorkerCallError {
+    /// The worker died (EOF / non-zero exit / killed by watchdog).
+    Crash(String),
+    /// The worker stayed up but produced an unparseable frame —
+    /// equally fatal to the call, equally a recycle trigger.
+    Protocol(String),
+}
+
+impl std::fmt::Display for WorkerCallError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            WorkerCallError::Crash(s) => write!(f, "worker crash: {s}"),
+            WorkerCallError::Protocol(s) => write!(f, "worker protocol error: {s}"),
+        }
+    }
+}
+
+fn run_one_call(
+    handle: &mut WorkerHandle,
+    stdin: Vec<u8>,
+    timeout_secs: u64,
+) -> Result<WorkerCallResponse, WorkerCallError> {
+    let req = WorkerCallRequest {
+        stdin,
+        timeout_secs,
+    };
+    write_pipe_frame(&mut handle.stdin, &req)
+        .map_err(|e| WorkerCallError::Crash(format!("write request frame: {e}")))?;
+    read_pipe_frame::<_, WorkerCallResponse>(&mut handle.stdout).map_err(|e| match e.kind() {
+        io::ErrorKind::UnexpectedEof => WorkerCallError::Crash(format!("EOF on stdout: {e}")),
+        io::ErrorKind::InvalidData => WorkerCallError::Protocol(e.to_string()),
+        _ => WorkerCallError::Protocol(e.to_string()),
+    })
+}
+
+fn spawn_worker(
+    entrypoint: &Arc<ValidatedEntrypoint>,
+    worker_env: &[(String, String)],
+) -> io::Result<WorkerHandle> {
+    let program = entrypoint::spawn_path(entrypoint);
+
+    // Same envelope as `entrypoint::execute` minus the per-call
+    // tmpdir (workers are shared across calls so a per-worker tmpdir
+    // would leak per-call state — the wrapper takes responsibility
+    // for per-call hygiene, ADR-0011 §state). env_clear first, then
+    // apply the curated `worker_env` set, then own pgrp, RLIMIT_CORE
+    // inheritance from set_no_core_dumps in start().
+    let mut cmd = Command::new(&program);
+    cmd.env_clear();
+    for (k, v) in worker_env {
+        cmd.env(k, v);
+    }
+    cmd.process_group(0)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+
+    let mut child = cmd.spawn()?;
+    let pid = child.id();
+    let stdin = child
+        .stdin
+        .take()
+        .ok_or_else(|| io::Error::other("stdin pipe missing"))?;
+    let stdout = BufReader::new(
+        child
+            .stdout
+            .take()
+            .ok_or_else(|| io::Error::other("stdout pipe missing"))?,
+    );
+    let stderr = child
+        .stderr
+        .take()
+        .ok_or_else(|| io::Error::other("stderr pipe missing"))?;
+
+    let stderr_drain = thread::spawn(move || {
+        // Mirror worker stderr to the agent's stderr line by line so
+        // ops can see panics / sanitized envelopes. Bounded by the
+        // pipe buffer; we don't accumulate.
+        use std::io::{BufRead, BufReader};
+        let reader = BufReader::new(stderr);
+        for line in reader.lines().map_while(Result::ok) {
+            eprintln!("mvm-guest-agent: worker pid={pid}: {line}");
+        }
+    });
+
+    Ok(WorkerHandle {
+        pid,
+        child,
+        stdin,
+        stdout,
+        _stderr_drain: stderr_drain,
+        call_count: 0,
+        last_rss_bytes: 0,
+    })
+}
+
+fn spawn_watchdog(
+    pgid: i32,
+    timeout_secs: u64,
+    cancelled: Arc<AtomicBool>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(timeout_secs);
+        // Poll with a short interval so cancellation is fast.
+        while Instant::now() < deadline {
+            if cancelled.load(Ordering::Acquire) {
+                return;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+        if cancelled.load(Ordering::Acquire) {
+            return;
+        }
+        // SAFETY: kill is async-signal-safe.
+        unsafe {
+            libc::kill(-pgid, libc::SIGKILL);
+        }
+    })
+}
+
+/// Read RSS in bytes from `/proc/<pid>/statm`. Field 1 (0-indexed)
+/// is `resident` in pages. Returns `None` if the file can't be read
+/// or parsed — the caller treats absent samples as "no recycle
+/// triggered by RSS" rather than failing the call.
+fn sample_rss_bytes(pid: u32) -> Option<u64> {
+    let path = format!("/proc/{pid}/statm");
+    let raw = std::fs::read_to_string(path).ok()?;
+    let pages: u64 = raw.split_whitespace().nth(1)?.parse().ok()?;
+    let pagesize = unsafe { libc::sysconf(libc::_SC_PAGESIZE) };
+    if pagesize <= 0 {
+        return None;
+    }
+    Some(pages.saturating_mul(pagesize as u64))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime_config::InProcessMode;
+
+    #[test]
+    fn dispatch_error_display_strings() {
+        assert!(format!("{}", DispatchError::QueueFull).contains("queue full"));
+        assert!(format!("{}", DispatchError::ShuttingDown).contains("shutting down"));
+        assert!(format!("{}", DispatchError::NoLiveWorkers).contains("no live workers"));
+    }
+
+    #[test]
+    fn transport_error_constructor_shape() {
+        let o = DispatchOutcome::transport_error("wrapper_crash", "EOF".into());
+        assert_eq!(o.stdout, Vec::<u8>::new());
+        assert!(matches!(o.outcome, WorkerOutcome::Error { .. }));
+    }
+
+    #[test]
+    fn slot_snapshot_variants_round_trip() {
+        let s = SlotSnapshot::Idle {
+            pid: 42,
+            call_count: 7,
+            last_rss_bytes: 1024,
+        };
+        let s2 = s.clone();
+        assert_eq!(s, s2);
+    }
+
+    /// Sanity check that the queue-depth helper plumbs through.
+    #[test]
+    fn queue_depth_default_doubles_pool_size() {
+        let cfg = WarmProcessConfig {
+            max_calls_per_worker: 1,
+            max_rss_mb: 1,
+            pool_size: 3,
+            in_process: InProcessMode::Serial,
+            max_queue_depth: None,
+        };
+        assert_eq!(cfg.effective_queue_depth(), 6);
+    }
+}
