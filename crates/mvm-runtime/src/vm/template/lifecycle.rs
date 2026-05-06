@@ -1723,8 +1723,18 @@ pub fn seal_snapshot_artifacts(snap_dir: &str) -> Result<()> {
         .with_context(|| format!("loading snapshot HMAC key {}", key_path.display()))?;
     let files = mvm_security::snapshot_hmac::files_in(snap_path);
     let mvmctl_version = env!("CARGO_PKG_VERSION");
-    let _sidecar = mvm_security::snapshot_hmac::seal(snap_path, &files, mvmctl_version, &key)
-        .with_context(|| format!("sealing snapshot at {snap_dir}"))?;
+    // Bump the per-resource epoch counter so a future `verify` call
+    // can detect a captured-and-replayed older envelope (G5 of the
+    // e2b parity plan). Counter lives next to the snapshot files
+    // so re-creating the dir with `mvmctl template build --force`
+    // resumes from the previous high-water mark.
+    let epoch_store = mvm_security::snapshot_hmac::EpochStore::new(snap_path.join(".epoch"));
+    let next_epoch = epoch_store
+        .next()
+        .with_context(|| format!("advancing epoch counter for {snap_dir}"))?;
+    let _sidecar =
+        mvm_security::snapshot_hmac::seal(snap_path, &files, next_epoch, mvmctl_version, &key)
+            .with_context(|| format!("sealing snapshot at {snap_dir}"))?;
     Ok(())
 }
 
@@ -1765,9 +1775,19 @@ pub fn verify_snapshot_artifacts(snap_dir: &str) -> Result<()> {
     let files = mvm_security::snapshot_hmac::files_in(snap_path);
     let mvmctl_version = env!("CARGO_PKG_VERSION");
     let allow_stale = std::env::var("MVM_ALLOW_STALE_SNAPSHOT").as_deref() == Ok("1");
+    // Read the per-resource high-water mark; the verifier rejects
+    // any envelope whose epoch is below it (G5 replay defence).
+    let epoch_store = mvm_security::snapshot_hmac::EpochStore::new(snap_path.join(".epoch"));
+    let min_epoch = epoch_store.load();
 
-    match mvm_security::snapshot_hmac::verify(snap_path, &files, mvmctl_version, &key, allow_stale)
-    {
+    match mvm_security::snapshot_hmac::verify(
+        snap_path,
+        &files,
+        min_epoch,
+        mvmctl_version,
+        &key,
+        allow_stale,
+    ) {
         Ok(_) => Ok(()),
         Err(VerifyError::VersionMismatch { sealed, current }) => {
             audit_snapshot_integrity_failure(

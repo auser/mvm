@@ -6,4 +6,5 @@ pub mod manifest;
 pub mod node;
 pub mod pool;
 pub mod template;
+pub mod template_tags;
 pub mod tenant;

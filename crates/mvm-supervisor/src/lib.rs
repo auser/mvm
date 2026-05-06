@@ -41,10 +41,12 @@ pub mod destination;
 pub mod egress;
 pub mod injection_guard;
 pub mod inspector;
+pub mod instance_sampler;
 pub mod keystore;
 pub mod l7_proxy;
 pub mod pii_redactor;
 pub mod policy_tool_gate;
+pub mod reaper;
 pub mod secrets_scanner;
 pub mod ssrf_guard;
 pub mod state;
@@ -64,6 +66,7 @@ pub use destination::DestinationPolicy;
 pub use egress::{EgressDecision, EgressError, EgressProxy, NoopEgressProxy};
 pub use injection_guard::{InjectionGuard, InjectionRule, RuleFamily};
 pub use inspector::{Inspector, InspectorChain, InspectorVerdict, RequestCtx};
+pub use instance_sampler::{OsSources, Sample, SampleTarget, Sources, sample_once};
 pub use keystore::{KeystoreError, KeystoreReleaser, NoopKeystoreReleaser, SecretGrant};
 pub use l7_proxy::{
     AuditFields, CapturingEgressAuditSink, ConnectParseError, ConnectRequest, DnsResolver,
@@ -74,6 +77,10 @@ pub use pii_redactor::{PiiRedactor, PiiRule, PiiValidator};
 pub use policy_tool_gate::{
     CapturingToolAuditSink, NoopToolAuditSink, PolicyToolGate, ToolAuditError, ToolAuditFields,
     ToolAuditSink, ToolOutcome,
+};
+pub use reaper::{
+    DEFAULT_INTERVAL as REAPER_DEFAULT_INTERVAL, DEFAULT_JITTER as REAPER_DEFAULT_JITTER,
+    ReapOutcome, Reaper, TeardownFn, deregister_only_teardown, jittered_interval,
 };
 pub use secrets_scanner::{DEFAULT_RULES, SecretRule, SecretsScanner};
 pub use ssrf_guard::SsrfGuard;

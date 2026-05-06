@@ -723,7 +723,10 @@ fn test_metrics_command_parses() {
     let cli = Cli::try_parse_from(["mvmctl", "metrics"]).unwrap();
     assert!(matches!(
         cli.command,
-        Commands::Metrics(metrics::Args { json: false })
+        Commands::Metrics(metrics::Args {
+            json: false,
+            instance: None,
+        })
     ));
 }
 
@@ -732,8 +735,22 @@ fn test_metrics_json_flag_parses() {
     let cli = Cli::try_parse_from(["mvmctl", "metrics", "--json"]).unwrap();
     assert!(matches!(
         cli.command,
-        Commands::Metrics(metrics::Args { json: true })
+        Commands::Metrics(metrics::Args {
+            json: true,
+            instance: None,
+        })
     ));
+}
+
+#[test]
+fn test_metrics_instance_flag_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "metrics", "--instance", "i-abc"]).unwrap();
+    match cli.command {
+        Commands::Metrics(metrics::Args { instance, .. }) => {
+            assert_eq!(instance.as_deref(), Some("i-abc"));
+        }
+        _ => panic!("expected Metrics command"),
+    }
 }
 
 #[test]

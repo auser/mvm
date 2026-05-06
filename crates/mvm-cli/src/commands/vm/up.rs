@@ -93,6 +93,19 @@ pub(in crate::commands) struct Args {
     /// Named dev network to attach VM to (default: "default")
     #[arg(long, default_value = "default")]
     pub network: String,
+    /// Sandbox tag in `KEY=VALUE` form. Repeatable. Validated against
+    /// `mvm_security::policy::InputValidator` charset/length rules.
+    #[arg(long = "tag", value_name = "KEY=VALUE")]
+    pub tags: Vec<String>,
+    /// Sandbox time-to-live (e.g. `30s`, `5m`, `2h`, `7d`). After
+    /// expiry the supervisor reaper tears the VM down. Omit for no
+    /// TTL.
+    #[arg(long)]
+    pub ttl: Option<String>,
+    /// Disable auto-resume when a caller connects to a sleeping VM.
+    /// Default behaviour resumes on connect.
+    #[arg(long)]
+    pub no_auto_resume: bool,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
@@ -148,6 +161,27 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         .collect::<Result<Vec<_>>>()
         .context("Invalid --secret value")?;
 
+    // Sandbox metadata (W1 of the e2b parity plan). Tag charset/length
+    // validation happens in the security crate so audit-event emission
+    // and webhook bodies see only validated input. TTL parsing rejects
+    // out-of-range values (< 1s, > 30d) up front.
+    let mut sandbox_tags: std::collections::BTreeMap<String, String> =
+        std::collections::BTreeMap::new();
+    for raw in &args.tags {
+        let (k, v) = mvm_security::policy::InputValidator::parse_tag_arg(raw)
+            .with_context(|| format!("Invalid --tag value: {:?}", raw))?;
+        sandbox_tags.insert(k, v);
+    }
+    mvm_security::policy::InputValidator::validate_tag_map(&sandbox_tags)
+        .context("Tag map exceeds aggregate caps")?;
+    let sandbox_ttl = args
+        .ttl
+        .as_deref()
+        .map(mvm_security::policy::parse_ttl)
+        .transpose()
+        .context("Invalid --ttl value")?;
+    let auto_resume = !args.no_auto_resume;
+
     cmd_run(RunParams {
         flake_ref: args.flake.as_deref(),
         template_name: resolved_template_arg.as_deref(),
@@ -169,6 +203,9 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         network_name: &args.network,
         seccomp_tier,
         secret_bindings,
+        sandbox_tags,
+        sandbox_ttl,
+        auto_resume,
     })
 }
 
@@ -193,6 +230,12 @@ pub(in crate::commands) struct RunParams<'a> {
     pub(super) network_name: &'a str,
     pub(super) seccomp_tier: mvm_security::seccomp::SeccompTier,
     pub(super) secret_bindings: Vec<mvm_core::secret_binding::SecretBinding>,
+    /// Validated sandbox tags from `--tag k=v`.
+    pub(super) sandbox_tags: std::collections::BTreeMap<String, String>,
+    /// Parsed `--ttl` duration; reaper tears VM down after this elapses.
+    pub(super) sandbox_ttl: Option<std::time::Duration>,
+    /// `false` when `--no-auto-resume` is set.
+    pub(super) auto_resume: bool,
 }
 
 pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
@@ -217,6 +260,9 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         network_name,
         seccomp_tier,
         secret_bindings,
+        sandbox_tags,
+        sandbox_ttl,
+        auto_resume,
     } = params;
     let _span =
         tracing::info_span!("cmd_run", name = ?name, cpus = ?cpus, memory_mib = ?memory).entered();
@@ -307,7 +353,17 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
     if let Ok(mut registry) = mvm_runtime::vm::name_registry::VmNameRegistry::load(&registry_path) {
         // Deregister stale entry with the same name if it exists
         registry.deregister(&vm_name);
-        let _ = registry.register(&vm_name, "", network_name, None, 0);
+        let expires_at = sandbox_ttl.map(mvm_core::util::time::utc_plus_duration);
+        let _ = registry.register_with_metadata(mvm_runtime::vm::name_registry::RegisterParams {
+            name: &vm_name,
+            vm_dir: "",
+            network: network_name,
+            guest_ip: None,
+            slot_index: 0,
+            tags: sandbox_tags.clone(),
+            expires_at,
+            auto_resume,
+        });
         let _ = registry.save(&registry_path);
     }
 

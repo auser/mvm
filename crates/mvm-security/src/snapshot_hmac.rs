@@ -65,7 +65,15 @@ pub const SIDECAR_FILENAME: &str = "integrity.json";
 
 /// Schema version of the sidecar JSON. Bump on any breaking change to
 /// the structure or HMAC computation.
-pub const SIDECAR_SCHEMA_VERSION: u32 = 1;
+///
+/// Schema 2 (W1 / A4 of the e2b parity plan): added `epoch: u64`
+/// inside the HMAC envelope. The epoch advances monotonically per
+/// resource (per-template for template snapshots, per-instance for
+/// instance snapshots). Replay defence per G5 of the parity plan —
+/// without it, a host-compromise scenario could swap a current
+/// snapshot for a captured earlier one of the same resource and
+/// roll back state.
+pub const SIDECAR_SCHEMA_VERSION: u32 = 2;
 
 /// Files that get HMAC'd into a single snapshot integrity record.
 /// Length-prefixing in the HMAC computation prevents a chosen-prefix
@@ -79,9 +87,9 @@ pub struct SnapshotFiles {
 }
 
 /// Sidecar `integrity.json` written next to the snapshot files. The
-/// `tag_hex` is the HMAC over `(version, vmstate_len, vmstate_bytes,
-/// mem_len, mem_bytes, mvmctl_version)` with explicit length prefixes
-/// — see [`compute_tag`].
+/// `tag_hex` is the HMAC over `(schema_version, epoch, vmstate_len,
+/// vmstate_bytes, mem_len, mem_bytes, mvmctl_version)` with
+/// explicit length prefixes — see [`compute_tag`].
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct IntegritySidecar {
@@ -89,6 +97,12 @@ pub struct IntegritySidecar {
     pub algorithm: String,
     pub vmstate_len: u64,
     pub mem_len: u64,
+    /// Monotonic counter scoped to the resource that owns this
+    /// snapshot. Advances on every reseal; verifiers refuse to
+    /// resume an envelope whose epoch is below the persisted high-
+    /// water mark for the resource. See `EpochStore` for the disk
+    /// format. Schema-2 addition (G5 — replay defence).
+    pub epoch: u64,
     pub mvmctl_version: String,
     /// HMAC-SHA256 tag, hex-encoded (lowercase, 64 chars).
     pub tag_hex: String,
@@ -129,6 +143,11 @@ pub enum VerifyError {
     Io(String),
     #[error("HMAC tag in sidecar is not valid hex of expected length")]
     BadTagEncoding,
+    #[error(
+        "snapshot epoch {got} is below the persisted high-water mark {expected} \
+         (replay attempt or stale snapshot — set MVM_ALLOW_STALE_SNAPSHOT=1 to force)"
+    )]
+    EpochRollback { got: u64, expected: u64 },
 }
 
 // ============================================================================
@@ -191,24 +210,29 @@ pub fn load_or_init_key(path: &Path) -> Result<[u8; HMAC_KEY_BYTES]> {
 // ============================================================================
 
 /// Compute the snapshot integrity tag over the two snapshot files
-/// plus the mvmctl version. The HMAC input is laid out as:
+/// plus the mvmctl version + epoch. The HMAC input is laid out as:
 ///
 /// ```text
 /// be_u32(SIDECAR_SCHEMA_VERSION)
+/// be_u64(epoch)
 /// be_u64(vmstate_len) || vmstate_bytes
 /// be_u64(mem_len)     || mem_bytes
 /// be_u32(version_str_len) || version_str
 /// ```
 ///
 /// Length prefixes prevent a chosen-prefix splice that moves bytes
-/// between `vmstate` and `mem` without detection.
+/// between `vmstate` and `mem` without detection. The epoch is
+/// inside the HMAC so an attacker can't fabricate a fresh-looking
+/// envelope by editing only the JSON sidecar.
 pub fn compute_tag(
     files: &SnapshotFiles,
+    epoch: u64,
     mvmctl_version: &str,
     key: &[u8; HMAC_KEY_BYTES],
 ) -> Result<(IntegritySidecar, [u8; 32])> {
     let mut mac = HmacSha256::new_from_slice(key).expect("HMAC accepts any key length");
     mac.update(&SIDECAR_SCHEMA_VERSION.to_be_bytes());
+    mac.update(&epoch.to_be_bytes());
 
     let vmstate_len = stream_into_mac(&mut mac, &files.vmstate)
         .with_context(|| format!("hashing {}", files.vmstate.display()))?;
@@ -232,6 +256,7 @@ pub fn compute_tag(
         algorithm: IntegritySidecar::algorithm_label().to_string(),
         vmstate_len,
         mem_len,
+        epoch,
         mvmctl_version: mvmctl_version.to_string(),
         tag_hex: hex_encode(&tag_arr),
     };
@@ -276,10 +301,11 @@ fn stream_into_mac(mac: &mut HmacSha256, path: &Path) -> Result<u64> {
 pub fn seal(
     snap_dir: &Path,
     files: &SnapshotFiles,
+    epoch: u64,
     mvmctl_version: &str,
     key: &[u8; HMAC_KEY_BYTES],
 ) -> Result<IntegritySidecar> {
-    let (sidecar, _tag) = compute_tag(files, mvmctl_version, key)?;
+    let (sidecar, _tag) = compute_tag(files, epoch, mvmctl_version, key)?;
     let json = serde_json::to_vec_pretty(&sidecar).context("serialize sidecar")?;
 
     let final_path = snap_dir.join(SIDECAR_FILENAME);
@@ -309,9 +335,15 @@ pub fn seal(
 /// on a clean match. Errors are surfaced as [`VerifyError`] so the
 /// caller can map to the operator-facing message (and decide whether
 /// to refuse boot or honour `--allow-stale-snapshot`).
+///
+/// `min_epoch` is the persisted high-water mark for this resource —
+/// the verifier refuses any envelope whose epoch is below it (G5
+/// replay defence). Pass `0` when no high-water mark is yet known
+/// (first verify).
 pub fn verify(
     snap_dir: &Path,
     files: &SnapshotFiles,
+    min_epoch: u64,
     mvmctl_version: &str,
     key: &[u8; HMAC_KEY_BYTES],
     allow_stale: bool,
@@ -371,7 +403,14 @@ pub fn verify(
         });
     }
 
-    let (recomputed, tag_bytes) = compute_tag(files, &sidecar.mvmctl_version, key)
+    if !allow_stale && sidecar.epoch < min_epoch {
+        return Err(VerifyError::EpochRollback {
+            got: sidecar.epoch,
+            expected: min_epoch,
+        });
+    }
+
+    let (recomputed, tag_bytes) = compute_tag(files, sidecar.epoch, &sidecar.mvmctl_version, key)
         .map_err(|e| VerifyError::Io(e.to_string()))?;
     let _ = recomputed; // we return the original sidecar for the caller's audit
 
@@ -381,6 +420,91 @@ pub fn verify(
     }
 
     Ok(sidecar)
+}
+
+// ============================================================================
+// Epoch high-water-mark store (G5 — snapshot replay defence)
+// ============================================================================
+
+/// Persistent monotonic epoch counter for a single resource (a
+/// template, an instance, etc.). The seal path increments and
+/// records; the verify path reads to compute `min_epoch`.
+///
+/// Disk format: a single ASCII unsigned-decimal integer in a file
+/// next to the resource's snapshot directory. Atomic writes via
+/// `<file>.tmp` + fsync + rename so a crash mid-update never leaves
+/// a malformed counter.
+pub struct EpochStore {
+    path: PathBuf,
+}
+
+impl EpochStore {
+    /// Construct an `EpochStore` whose backing file lives at
+    /// `path`. The file is created on first write; reads of a
+    /// missing file return `0`.
+    pub fn new(path: PathBuf) -> Self {
+        Self { path }
+    }
+
+    /// Read the current high-water mark. Returns `0` for a missing
+    /// or unreadable file (treated as "no prior seal recorded").
+    pub fn load(&self) -> u64 {
+        let raw = match std::fs::read_to_string(&self.path) {
+            Ok(s) => s,
+            Err(_) => return 0,
+        };
+        raw.trim().parse::<u64>().unwrap_or(0)
+    }
+
+    /// Atomically advance the stored mark to `new_epoch`. Refuses
+    /// to go backwards — callers always pass a value ≥ `load()`.
+    pub fn advance(&self, new_epoch: u64) -> Result<()> {
+        let current = self.load();
+        if new_epoch < current {
+            bail!(
+                "epoch advance refused: {new_epoch} < persisted {current} \
+                 (file: {})",
+                self.path.display()
+            );
+        }
+        if let Some(parent) = self.path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent of {}", self.path.display()))?;
+        }
+        let tmp_path = self.path.with_extension("tmp");
+        {
+            let mut f = std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .mode(0o600)
+                .open(&tmp_path)
+                .with_context(|| format!("open {} for write", tmp_path.display()))?;
+            f.write_all(new_epoch.to_string().as_bytes())
+                .with_context(|| format!("write {}", tmp_path.display()))?;
+            f.sync_all()
+                .with_context(|| format!("fsync {}", tmp_path.display()))?;
+        }
+        std::fs::rename(&tmp_path, &self.path)
+            .with_context(|| format!("rename {} → {}", tmp_path.display(), self.path.display()))?;
+        Ok(())
+    }
+
+    /// Increment by one, persist, and return the new value. Convenience
+    /// for the seal path which always advances.
+    pub fn next(&self) -> Result<u64> {
+        let current = self.load();
+        let next = current
+            .checked_add(1)
+            .context("epoch counter overflowed u64 — implausible without manual edit")?;
+        self.advance(next)?;
+        Ok(next)
+    }
+
+    /// Backing file path. Useful for mode/perm checks in tests.
+    pub fn path(&self) -> &Path {
+        &self.path
+    }
 }
 
 // ============================================================================
@@ -505,9 +629,10 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        let sealed = seal(tmp.path(), &files, "1.2.3", &key).unwrap();
-        let verified = verify(tmp.path(), &files, "1.2.3", &key, false).unwrap();
+        let sealed = seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
+        let verified = verify(tmp.path(), &files, 1, "1.2.3", &key, false).unwrap();
         assert_eq!(sealed, verified);
+        assert_eq!(verified.epoch, 1);
     }
 
     #[test]
@@ -517,13 +642,13 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        seal(tmp.path(), &files, "1.2.3", &key).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
         // Tamper: replace one byte but keep the same length.
         let mut bytes = std::fs::read(&files.vmstate).unwrap();
         bytes[0] ^= 0xff;
         std::fs::write(&files.vmstate, &bytes).unwrap();
 
-        let err = verify(tmp.path(), &files, "1.2.3", &key, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 1, "1.2.3", &key, false).unwrap_err();
         assert!(matches!(err, VerifyError::TagMismatch));
     }
 
@@ -534,12 +659,12 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        seal(tmp.path(), &files, "1.2.3", &key).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
         let mut bytes = std::fs::read(&files.mem).unwrap();
         bytes[0] ^= 0xff;
         std::fs::write(&files.mem, &bytes).unwrap();
 
-        let err = verify(tmp.path(), &files, "1.2.3", &key, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 1, "1.2.3", &key, false).unwrap_err();
         assert!(matches!(err, VerifyError::TagMismatch));
     }
 
@@ -550,12 +675,12 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        seal(tmp.path(), &files, "1.2.3", &key).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
         // Truncate vmstate — caught by the fast-fail size check
         // before we stream the file.
         std::fs::write(&files.vmstate, b"shorter").unwrap();
 
-        let err = verify(tmp.path(), &files, "1.2.3", &key, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 1, "1.2.3", &key, false).unwrap_err();
         match err {
             VerifyError::SizeMismatch { file, .. } => {
                 assert_eq!(file, "vmstate.bin");
@@ -571,14 +696,14 @@ mod tests {
 
         let key_path = tmp.path().join("snapshot.key");
         let key1 = load_or_init_key(&key_path).unwrap();
-        seal(tmp.path(), &files, "1.2.3", &key1).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", &key1).unwrap();
 
         // Replace the key on disk to simulate a fresh host or rotation.
         std::fs::remove_file(&key_path).unwrap();
         let key2 = load_or_init_key(&key_path).unwrap();
         assert_ne!(key1, key2);
 
-        let err = verify(tmp.path(), &files, "1.2.3", &key2, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 1, "1.2.3", &key2, false).unwrap_err();
         assert!(matches!(err, VerifyError::TagMismatch));
     }
 
@@ -589,8 +714,8 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        seal(tmp.path(), &files, "1.2.3", &key).unwrap();
-        let err = verify(tmp.path(), &files, "1.2.4", &key, false).unwrap_err();
+        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
+        let err = verify(tmp.path(), &files, 1, "1.2.4", &key, false).unwrap_err();
         match err {
             VerifyError::VersionMismatch { sealed, current } => {
                 assert_eq!(sealed, "1.2.3");
@@ -607,11 +732,8 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        seal(tmp.path(), &files, "1.2.3", &key).unwrap();
-        // allow_stale=true must still recompute against the sealed
-        // mvmctl_version (so the tag matches), even though the
-        // current binary advertises something different.
-        verify(tmp.path(), &files, "9.9.9", &key, true).expect("should accept");
+        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
+        verify(tmp.path(), &files, 1, "9.9.9", &key, true).expect("should accept");
     }
 
     #[test]
@@ -620,8 +742,7 @@ mod tests {
         let files = make_snap(tmp.path());
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
-        // No seal — sidecar is absent.
-        let err = verify(tmp.path(), &files, "1.2.3", &key, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 0, "1.2.3", &key, false).unwrap_err();
         assert!(matches!(err, VerifyError::SidecarMissing { .. }));
     }
 
@@ -631,14 +752,13 @@ mod tests {
         let files = make_snap(tmp.path());
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
-        seal(tmp.path(), &files, "1.2.3", &key).unwrap();
-        // Re-write the sidecar with an extra field.
+        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
         let path = tmp.path().join(SIDECAR_FILENAME);
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         value["extra_field"] = serde_json::Value::Bool(true);
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        let err = verify(tmp.path(), &files, "1.2.3", &key, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 1, "1.2.3", &key, false).unwrap_err();
         assert!(matches!(err, VerifyError::SidecarParse { .. }));
     }
 
@@ -648,7 +768,7 @@ mod tests {
         let files = make_snap(tmp.path());
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
-        seal(tmp.path(), &files, "1.2.3", &key).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
         let mode = std::fs::metadata(tmp.path().join(SIDECAR_FILENAME))
             .unwrap()
             .permissions()
@@ -659,23 +779,17 @@ mod tests {
 
     #[test]
     fn test_seal_atomic_no_partial_sidecar_on_disk() {
-        // The sealing path writes <SIDECAR>.tmp then renames. After
-        // a successful seal the .tmp file must not exist; only the
-        // final sidecar.
         let tmp = tempfile::tempdir().unwrap();
         let files = make_snap(tmp.path());
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
-        seal(tmp.path(), &files, "1.2.3", &key).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
         assert!(!tmp.path().join(format!("{SIDECAR_FILENAME}.tmp")).exists());
         assert!(tmp.path().join(SIDECAR_FILENAME).exists());
     }
 
     #[test]
     fn test_compute_tag_length_prefixing_prevents_splice() {
-        // Two snapshots with the same total bytes but different
-        // boundary between vmstate and mem must produce different
-        // tags. Without length-prefixing they'd be indistinguishable.
         let tmp1 = tempfile::tempdir().unwrap();
         let tmp2 = tempfile::tempdir().unwrap();
         std::fs::write(tmp1.path().join("vmstate.bin"), b"AAA").unwrap();
@@ -693,9 +807,118 @@ mod tests {
         };
 
         let key = [0u8; HMAC_KEY_BYTES];
-        let (_, tag1) = compute_tag(&files1, "1", &key).unwrap();
-        let (_, tag2) = compute_tag(&files2, "1", &key).unwrap();
+        let (_, tag1) = compute_tag(&files1, 1, "1", &key).unwrap();
+        let (_, tag2) = compute_tag(&files2, 1, "1", &key).unwrap();
         assert_ne!(tag1, tag2, "splice across vmstate/mem must change the tag");
+    }
+
+    #[test]
+    fn test_compute_tag_epoch_changes_tag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = make_snap(tmp.path());
+        let key = [0u8; HMAC_KEY_BYTES];
+        let (_, tag1) = compute_tag(&files, 1, "1", &key).unwrap();
+        let (_, tag2) = compute_tag(&files, 2, "1", &key).unwrap();
+        assert_ne!(tag1, tag2, "epoch must be inside the HMAC envelope");
+    }
+
+    #[test]
+    fn test_verify_rejects_replayed_older_epoch() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = make_snap(tmp.path());
+        let key_path = tmp.path().join("snapshot.key");
+        let key = load_or_init_key(&key_path).unwrap();
+
+        // Seal at epoch 3, then ask the verifier for "current
+        // high-water mark = 5". The verifier must refuse.
+        seal(tmp.path(), &files, 3, "1.2.3", &key).unwrap();
+        let err = verify(tmp.path(), &files, 5, "1.2.3", &key, false).unwrap_err();
+        match err {
+            VerifyError::EpochRollback { got, expected } => {
+                assert_eq!(got, 3);
+                assert_eq!(expected, 5);
+            }
+            other => panic!("expected EpochRollback, got {other}"),
+        }
+    }
+
+    #[test]
+    fn test_verify_replay_allowed_with_stale_flag() {
+        let tmp = tempfile::tempdir().unwrap();
+        let files = make_snap(tmp.path());
+        let key_path = tmp.path().join("snapshot.key");
+        let key = load_or_init_key(&key_path).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
+        verify(tmp.path(), &files, 99, "1.2.3", &key, true).expect("stale flag bypasses epoch");
+    }
+
+    #[test]
+    fn test_verify_accepts_equal_epoch() {
+        // Equal epoch is fine — the high-water mark is "below this is
+        // a rollback"; equal means "this is the latest sealed envelope."
+        let tmp = tempfile::tempdir().unwrap();
+        let files = make_snap(tmp.path());
+        let key_path = tmp.path().join("snapshot.key");
+        let key = load_or_init_key(&key_path).unwrap();
+        seal(tmp.path(), &files, 7, "1.2.3", &key).unwrap();
+        verify(tmp.path(), &files, 7, "1.2.3", &key, false).expect("equal epoch verifies");
+    }
+
+    #[test]
+    fn test_epoch_store_starts_at_zero_when_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EpochStore::new(tmp.path().join("epoch"));
+        assert_eq!(store.load(), 0);
+    }
+
+    #[test]
+    fn test_epoch_store_advances_monotonically() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EpochStore::new(tmp.path().join("epoch"));
+        assert_eq!(store.next().unwrap(), 1);
+        assert_eq!(store.next().unwrap(), 2);
+        assert_eq!(store.next().unwrap(), 3);
+        assert_eq!(store.load(), 3);
+    }
+
+    #[test]
+    fn test_epoch_store_refuses_to_go_backwards() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = EpochStore::new(tmp.path().join("epoch"));
+        store.advance(10).unwrap();
+        let err = store.advance(5).unwrap_err();
+        assert!(err.to_string().contains("epoch advance refused"));
+        assert_eq!(store.load(), 10);
+    }
+
+    #[test]
+    fn test_epoch_store_persists_across_instances() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("epoch");
+        let s1 = EpochStore::new(path.clone());
+        s1.advance(42).unwrap();
+        let s2 = EpochStore::new(path);
+        assert_eq!(s2.load(), 42);
+    }
+
+    #[test]
+    fn test_epoch_store_handles_corrupt_file() {
+        // Garbage in the file → load() returns 0, doesn't panic.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("epoch");
+        std::fs::write(&path, b"not a number").unwrap();
+        let store = EpochStore::new(path);
+        assert_eq!(store.load(), 0);
+    }
+
+    #[test]
+    fn test_epoch_store_writes_mode_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("epoch");
+        let store = EpochStore::new(path.clone());
+        store.next().unwrap();
+        let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600);
     }
 
     #[test]

@@ -499,13 +499,21 @@ fn test_metrics_json_output() {
     let stdout = String::from_utf8(assert.get_output().stdout.clone()).unwrap();
     let val: serde_json::Value =
         serde_json::from_str(&stdout).expect("metrics --json must be valid JSON");
+    // A3 reshaped the output: top-level is `{global: {...}, instances: [...]}`
+    // so the global counters live one nesting level down. The
+    // per-VM array is empty when no sampler has run.
+    let global = val.get("global").expect("JSON must have global object");
     assert!(
-        val.get("requests_total").is_some(),
-        "JSON must have requests_total"
+        global.get("requests_total").is_some(),
+        "global.requests_total must exist"
     );
     assert!(
-        val.get("instances_created").is_some(),
-        "JSON must have instances_created"
+        global.get("instances_created").is_some(),
+        "global.instances_created must exist"
+    );
+    assert!(
+        val.get("instances").map(|v| v.is_array()).unwrap_or(false),
+        "instances must be an array"
     );
 }
 

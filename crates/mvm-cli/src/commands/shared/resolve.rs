@@ -64,6 +64,36 @@ pub enum ManifestArgRef {
 pub fn resolve_manifest_arg(arg: &str) -> Result<ManifestArgRef> {
     use mvm_core::manifest::{canonical_key_for_path, resolve_manifest_config_path};
 
+    // `<template>@<alias>` form (W1 / A6). Aliases live in the
+    // template-tags catalog; we resolve them up front so a typo
+    // surfaces as "alias not found" rather than booting the
+    // current revision silently. Today we validate the alias and
+    // log the revision_hash; piping the resolved hash through to
+    // skip `current` and boot the aliased revision is a follow-up
+    // chunk that needs lifecycle.rs plumbing.
+    if let Some((template_id, alias)) = mvm_core::domain::template_tags::split_aliased_ref(arg) {
+        match mvm_core::domain::template_tags::resolve_alias(template_id, alias) {
+            Some(revision_hash) => {
+                tracing::info!(
+                    template = template_id,
+                    alias,
+                    revision_hash,
+                    "manifest alias resolved",
+                );
+                // Boot path still loads `current`; pinning to
+                // `revision_hash` is a follow-up. Treat as Name
+                // so the existing flow proceeds.
+                return Ok(ManifestArgRef::Name(template_id.to_string()));
+            }
+            None => {
+                anyhow::bail!(
+                    "manifest alias {alias:?} for template {template_id:?} not found \
+                     (run `mvmctl manifest alias ls {template_id}` to see available aliases)"
+                );
+            }
+        }
+    }
+
     let path = std::path::Path::new(arg);
     let looks_like_path = arg.contains('/')
         || arg.starts_with('.')
