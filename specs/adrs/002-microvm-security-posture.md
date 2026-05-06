@@ -77,7 +77,7 @@ Each is addressed in the corresponding workstream of plan 25.
 | VirtioFS workdir share | Writable, scoped to project dir | Unchanged shape, but per-service uid means no service can write there without explicit user grant (W2.1) |
 | VirtioFS datadir share | Writable, scoped to `~/.mvm` | Same; mode-locked containment via uid + `nosuid,nodev` mount opts (W2.3) |
 | Host-side proxy socket | Mode inherits umask (typ. 0755) | Mode `0700` post-bind (W1.2) |
-| Vsock proxy port-forward | Any port allowed | Allowlist: 52 + `PORT_FORWARD_BASE..+65535` (W1.3) |
+| Vsock proxy port-forward | Any port allowed | Allowlist: `GUEST_AGENT_PORT` (5252) + `PORT_FORWARD_BASE..+65535` (W1.3) |
 | Console log + daemon log | Mode inherits umask | Mode `0600` (W1.4) |
 | Block device passthrough | `nix-store.img` attached as `/dev/vdb`; host doesn't mount it | Documented invariant: host shall never `mount` this file. Static-check in code review. |
 

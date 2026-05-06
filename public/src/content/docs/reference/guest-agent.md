@@ -3,7 +3,7 @@ title: Guest Agent
 description: The mvm guest agent provides host visibility and control over microVMs via vsock.
 ---
 
-Every microVM built with `mkGuest` includes **mvm-guest-agent**, a lightweight Rust daemon that runs inside the guest on vsock port 52.
+Every microVM built with `mkGuest` includes **mvm-guest-agent**, a lightweight Rust daemon that runs inside the guest on vsock port 5252.
 
 ## Capabilities
 
@@ -21,8 +21,8 @@ Every microVM built with `mkGuest` includes **mvm-guest-agent**, a lightweight R
 
 The agent communicates using **length-prefixed JSON frames** over vsock (Firecracker, Apple Container, microvm.nix) or a unix socket (Docker):
 
-1. Host writes `CONNECT 52\n` to the socket
-2. Agent responds with `OK 52\n`
+1. Host writes `CONNECT 5252\n` to the socket
+2. Agent responds with `OK 5252\n`
 3. All subsequent communication is request/response pairs
 
 Request types: `ping`, `status`, `sleep-prep`, `wake`, and more.

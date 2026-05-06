@@ -160,7 +160,9 @@ mod tests {
         // factory contract has a regression net even on hosts where
         // `tempfile` + UDS listeners would be flaky in CI.
         let t = VsockProxyTransport::new("/tmp/mvm-proxy-does-not-exist.sock");
-        let err = t.connect(52).expect_err("should fail to connect");
+        let err = t
+            .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
+            .expect_err("should fail to connect");
         assert!(
             err.to_string().contains("vsock proxy"),
             "error didn't mention proxy: {err}"
@@ -172,7 +174,9 @@ mod tests {
         let t = FirecrackerTransport::new("/tmp/no-such-instance", 1);
         // No real socket → error mentions the UDS path so callers
         // can tell which backend is being attempted.
-        let err = t.connect(52).expect_err("should fail to connect");
+        let err = t
+            .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
+            .expect_err("should fail to connect");
         let msg = err.to_string();
         assert!(
             msg.contains("/tmp/no-such-instance"),

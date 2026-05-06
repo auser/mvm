@@ -717,7 +717,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
     // Apple Virtualization VMs live in-process — the process must stay alive.
     if effective_hypervisor == "apple-container" && !detach {
         // Set up port forwarding via vsock (no guest IP needed).
-        // 1. Wait for guest agent to be ready on vsock port 52
+        // 1. Wait for guest agent to be ready on `GUEST_AGENT_PORT` (5252)
         // 2. Tell the agent to start vsock→TCP forwarders for each port
         // 3. Start host-side TCP→vsock proxies
         if has_ports {

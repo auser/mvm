@@ -15,7 +15,30 @@ use serde::{Deserialize, Serialize};
 pub const GUEST_CID: u32 = 3;
 
 /// Port the guest vsock agent listens on.
-pub const GUEST_AGENT_PORT: u32 = 52;
+///
+/// **Why 5252 (and why not <1024).** Linux gates `bind(2)` on AF_VSOCK
+/// ports ≤ 1023 behind `CAP_NET_BIND_SERVICE` — the same way it gates
+/// AF_INET. The agent runs as uid 901 with `--bounding-set=-all`
+/// (ADR-002 §W4.5), so it has no caps to spend on a privileged port.
+/// Any port < 1024 would force us to either grant the agent
+/// `CAP_NET_BIND_SERVICE` (weakening W4.5 to work around port choice)
+/// or bind in init and pass the fd in (extra surface for no
+/// architectural benefit). Port 52 was picked when the agent ran as
+/// root and the codebase incorrectly assumed vsock binds were
+/// unprivileged on Linux — see the corrected comment in
+/// `nix/lib/minimal-init/default.nix::guestAgentBlock`.
+///
+/// 5252 sits clearly above 1023 and below the port-forward range
+/// (`PORT_FORWARD_BASE` = 10_000) and the console-data range
+/// (`CONSOLE_PORT_BASE` = 20_000), so the host-side proxy allowlist
+/// (ADR-002 §W1.3) keeps its disjoint-union shape. The "52" tail is a
+/// callback to the historical port for grep-ability.
+///
+/// **Single source of truth.** `mvm-apple-container` and
+/// `mvm-runtime::vm::vminitd_client` re-declare this value because
+/// they cannot depend on `mvm-guest`. If you change this, update those
+/// duplicates in the same commit; the workspace tests catch drift.
+pub const GUEST_AGENT_PORT: u32 = 5252;
 
 /// Base vsock port for TCP port forwarding.
 /// The forwarded vsock port = `PORT_FORWARD_BASE + guest_tcp_port`.
@@ -1643,7 +1666,11 @@ mod tests {
     #[test]
     fn test_constants() {
         assert_eq!(GUEST_CID, 3);
-        assert_eq!(GUEST_AGENT_PORT, 52);
+        // Must stay > 1023 — vsock binds <= 1023 require
+        // CAP_NET_BIND_SERVICE, which the agent (uid 901) doesn't have
+        // (ADR-002 §W4.5). See the doc comment on GUEST_AGENT_PORT.
+        const _: () = assert!(GUEST_AGENT_PORT > 1023);
+        assert_eq!(GUEST_AGENT_PORT, 5252);
         assert_eq!(DEFAULT_TIMEOUT_SECS, 10);
     }
 

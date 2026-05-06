@@ -110,16 +110,17 @@ fn start_vsock_proxy_listener(id: &str) -> Result<(), String> {
 /// happens to have listening — not just the guest agent. We restrict
 /// to the three ranges mvmctl actually uses:
 ///
-/// * `52` — guest agent control channel.
+/// * `5252` — guest agent control channel (`GUEST_AGENT_PORT`,
+///   formerly 52; moved out of the privileged-port range so the agent
+///   can bind it as uid 901 — see `mvm_guest::vsock::GUEST_AGENT_PORT`).
 /// * `PORT_FORWARD_BASE..=BASE+65535` — traffic forwarders set up by
 ///   `start_port_proxy` (BASE = 10000).
 /// * `CONSOLE_PORT_BASE..=BASE+65535` — `ConsoleOpen` data ports
 ///   (BASE = 20000).
 fn proxy_port_is_allowed(port: u32) -> bool {
-    const GUEST_AGENT: u32 = 52;
     const PORT_FORWARD_BASE: u32 = 10_000;
     const CONSOLE_PORT_BASE: u32 = 20_000;
-    port == GUEST_AGENT
+    port == crate::GUEST_AGENT_PORT
         || (PORT_FORWARD_BASE..=PORT_FORWARD_BASE + 65_535).contains(&port)
         || (CONSOLE_PORT_BASE..=CONSOLE_PORT_BASE + 65_535).contains(&port)
 }
@@ -698,8 +699,9 @@ pub fn start_vm(
             VZVirtioTraditionalMemoryBalloonDeviceConfiguration::new(),
         )]));
 
-        // Vsock device — enables host↔guest communication on port 52
-        // (same protocol as Firecracker vsock, used by the guest agent)
+        // Vsock device — enables host↔guest communication on
+        // GUEST_AGENT_PORT (5252; same protocol as Firecracker vsock,
+        // used by the guest agent).
         let vsock = VZVirtioSocketDeviceConfiguration::new();
         config.setSocketDevices(&NSArray::from_retained_slice(&[Retained::into_super(
             vsock,
@@ -918,7 +920,7 @@ pub fn proxy_socket_path(id: &str) -> std::path::PathBuf {
 ///
 /// Uses the stored VZVirtualMachine reference to access the socket device,
 /// then calls `connectToPort:completionHandler:` to establish a vsock
-/// connection to the guest agent on port 52.
+/// connection to the guest agent on `GUEST_AGENT_PORT` (5252).
 ///
 /// Returns an `std::os::unix::net::UnixStream` wrapping the connection's
 /// file descriptor.
@@ -1075,7 +1077,9 @@ mod tests {
             // will hand off to vsock_connect, which fails (no in-process
             // VM), but the protocol read on this side must succeed.
             let mut client = UnixStream::connect(&path).expect("connect to proxy");
-            client.write_all(&52u32.to_le_bytes()).expect("write port");
+            client
+                .write_all(&crate::GUEST_AGENT_PORT.to_le_bytes())
+                .expect("write port");
 
             // Read should return EOF (0 bytes) once the worker thread gives
             // up on vsock_connect — that's the contract.
@@ -1122,17 +1126,21 @@ mod tests {
     /// Pure logic — no daemon needed; just the predicate.
     ///
     /// Ranges:
-    ///   guest_agent:  {52}
+    ///   guest_agent:  {GUEST_AGENT_PORT} (= 5252)
     ///   port_forward: 10_000..=75_535  (BASE 10_000 + 0..=65_535)
     ///   console_data: 20_000..=85_535  (BASE 20_000 + 0..=65_535)
     ///
     /// The port_forward and console_data ranges legitimately overlap;
     /// any port in the union is fine. Only the gaps below 10_000
-    /// (excluding 52) and above 85_535 are forbidden.
+    /// (excluding GUEST_AGENT_PORT) and above 85_535 are forbidden.
     #[test]
     fn test_proxy_port_allowlist() {
         // Allowed: guest agent control channel.
-        assert!(proxy_port_is_allowed(52));
+        assert!(proxy_port_is_allowed(crate::GUEST_AGENT_PORT));
+        // Specifically, 52 — the historical privileged-port choice —
+        // must be rejected now: it's outside the agent port and outside
+        // both forwarder ranges. ADR-002 §W4.5.
+        assert!(!proxy_port_is_allowed(52));
 
         // Allowed: port-forward range edges + interior.
         assert!(proxy_port_is_allowed(10_000));
@@ -1145,12 +1153,18 @@ mod tests {
         assert!(proxy_port_is_allowed(20_001));
         assert!(proxy_port_is_allowed(85_535));
 
-        // Rejected: low ports outside the agent slot.
+        // Rejected: low ports outside the agent slot. Includes the old
+        // pre-5252 historical port (52) — anyone still pointing at it
+        // is using stale config and we'd rather fail loudly.
         assert!(!proxy_port_is_allowed(0));
         assert!(!proxy_port_is_allowed(1));
         assert!(!proxy_port_is_allowed(22));
         assert!(!proxy_port_is_allowed(51));
         assert!(!proxy_port_is_allowed(53));
+
+        // Rejected: agent-slot boundary (only the exact port is allowed).
+        assert!(!proxy_port_is_allowed(crate::GUEST_AGENT_PORT - 1));
+        assert!(!proxy_port_is_allowed(crate::GUEST_AGENT_PORT + 1));
 
         // Rejected: gap between agent slot and port-forward range.
         assert!(!proxy_port_is_allowed(100));
