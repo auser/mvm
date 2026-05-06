@@ -42,6 +42,17 @@ path = "src/bin/mvm-verity-init.rs"
 name = "syscall-probe"
 path = "src/bin/syscall-probe.rs"
 
+# Test fixture for the warm-process worker pool (plan 43). Speaks the
+# `worker_protocol` framed multi-call loop on stdin/stdout. Behavior
+# selectable via `MVM_FAKE_RUNNER_BEHAVIOR` env var so tests can
+# exercise crash, recycle, slow, and malformed-frame paths against a
+# real child process. Not selected by the production guest closure.
+[[bin]]
+name = "fake-runner"
+path = "tests/bin/fake_runner.rs"
+test = false
+doctest = false
+
 [features]
 dev-shell = []
 
@@ -49,6 +60,7 @@ dev-shell = []
 mvm-core.workspace = true
 mvm-security.workspace = true
 anyhow.workspace = true
+base64.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
 libc.workspace = true

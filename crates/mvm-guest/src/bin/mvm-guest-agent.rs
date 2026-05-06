@@ -31,10 +31,13 @@ use mvm_guest::integrations::{
     self, IntegrationEntry, IntegrationHealthResult, IntegrationStateReport, IntegrationStatus,
 };
 use mvm_guest::probes::{self, ProbeEntry, ProbeOutputFormat, ProbeResult};
+use mvm_guest::runtime_config::{self, ConcurrencyConfig};
 use mvm_guest::vsock::{
     EntrypointEvent, FsChange, FsChangeKind, GUEST_AGENT_PORT, GuestRequest, GuestResponse,
     RunEntrypointError,
 };
+use mvm_guest::worker_pool::{DispatchError, DispatchOutcome, WorkerPool};
+use mvm_guest::worker_protocol::WorkerOutcome;
 use serde::Deserialize;
 
 // ============================================================================
@@ -779,10 +782,21 @@ fn do_exec(command: &str, stdin_data: Option<&str>, _timeout_secs: u64) -> Guest
 /// any TOCTOU between validation and spawn.
 static VALIDATED_ENTRYPOINT: OnceLock<Result<ValidatedEntrypoint, String>> = OnceLock::new();
 
-/// One in-flight `RunEntrypoint` per VM (M12). Concurrent callers get
-/// `EntrypointEvent::Error { kind: Busy }` immediately; pool growth is the
-/// host-side concurrency lever.
+/// One in-flight `RunEntrypoint` per VM (M12) — applies to the cold
+/// path only. When `WARM_POOL.is_some()`, this lock is bypassed; the
+/// new invariant is "one in-flight call per worker, ≤ `pool_size`
+/// concurrent" (plan 43). Concurrent callers under cold-tier still
+/// get `EntrypointEvent::Error { kind: Busy }` immediately; warm-tier
+/// callers queue FIFO up to `max_queue_depth` and get `Busy` on
+/// overflow.
 static RUN_ENTRYPOINT_LOCK: Mutex<()> = Mutex::new(());
+
+/// Warm-process worker pool, populated at boot from
+/// `/etc/mvm/runtime.json` (plan 43). `None` means cold-tier
+/// behavior — the existing M12 single-call path. `Some(_)` activates
+/// the warm-process branch in `handle_run_entrypoint` and the
+/// thread-per-connection accept-loop.
+static WARM_POOL: OnceLock<Option<Arc<WorkerPool>>> = OnceLock::new();
 
 /// Validate `/etc/mvm/entrypoint` at agent boot. The result is stashed in
 /// `VALIDATED_ENTRYPOINT`. On failure, log a single line — the agent stays
@@ -802,6 +816,56 @@ fn init_entrypoint_validation() {
         ),
     }
     let _ = VALIDATED_ENTRYPOINT.set(result);
+}
+
+/// Read `/etc/mvm/runtime.json` and, if it carries `concurrency.kind
+/// = "warm_process"`, stand up the worker pool. Plan 43.
+///
+/// Failure modes are deliberately fail-loud — mvmforge owns
+/// `runtime.json`, so a malformed file or rejected `in_process` mode
+/// is a build bug, not a runtime fallback. The agent exits non-zero
+/// rather than silently dropping to cold tier and confusing
+/// observers about which tier is active.
+///
+/// Missing `runtime.json` or absent `concurrency` → `Ok(None)`, the
+/// cold path stays in charge.
+fn init_warm_pool() {
+    let result: Option<Arc<WorkerPool>> = match runtime_config::load() {
+        Ok(None) => None,
+        Ok(Some(rc)) => match rc.concurrency {
+            None => None,
+            Some(ConcurrencyConfig::WarmProcess(wp)) => match VALIDATED_ENTRYPOINT.get() {
+                Some(Ok(entry)) => match entry.try_clone() {
+                    Ok(cloned) => match WorkerPool::start(wp, Arc::new(cloned), Vec::new()) {
+                        Ok(pool) => Some(pool),
+                        Err(e) => {
+                            eprintln!(
+                                "mvm-guest-agent: warm-process pool start failed: {e}; refusing to boot"
+                            );
+                            std::process::exit(1);
+                        }
+                    },
+                    Err(e) => {
+                        eprintln!(
+                            "mvm-guest-agent: warm-process configured but entrypoint clone failed: {e}; refusing to boot"
+                        );
+                        std::process::exit(1);
+                    }
+                },
+                _ => {
+                    eprintln!(
+                        "mvm-guest-agent: warm-process configured but entrypoint validation failed; refusing to boot"
+                    );
+                    std::process::exit(1);
+                }
+            },
+        },
+        Err(e) => {
+            eprintln!("mvm-guest-agent: invalid /etc/mvm/runtime.json: {e}; refusing to boot");
+            std::process::exit(1);
+        }
+    };
+    let _ = WARM_POOL.set(result);
 }
 
 /// Generate a per-call TMPDIR path under /tmp. The mutex guarantees only
@@ -867,6 +931,14 @@ fn handle_run_entrypoint(
     stdin: Vec<u8>,
     timeout_secs: u64,
 ) -> GuestResponse {
+    // Plan 43: when a warm-process pool is active, route through it
+    // instead of the cold-respawn path. The host wire is identical;
+    // the pool's `dispatch` synthesizes the same `EntrypointEvent`
+    // stream (Stdout / Stderr / Exit | Error) we'd produce below.
+    if let Some(Some(pool)) = WARM_POOL.get() {
+        return dispatch_via_warm_pool(file, pool, stdin, timeout_secs);
+    }
+
     let _guard = match RUN_ENTRYPOINT_LOCK.try_lock() {
         Ok(g) => g,
         Err(_) => {
@@ -964,6 +1036,66 @@ fn handle_run_entrypoint(
                 message: format!("wrapper exited via signal {signal}"),
             })
         }
+    }
+}
+
+/// Plan 43: route a `RunEntrypoint` request through the warm-process
+/// worker pool. The pool's `dispatch` returns a single
+/// `DispatchOutcome` per call (one buffered frame), which we
+/// translate back into the existing host-facing `EntrypointEvent`
+/// stream — same wire shape as the cold path so `mvmctl invoke` is
+/// unaffected.
+///
+/// `#[inline(never)]` is load-bearing for the W7 symbol-contract
+/// gate (mirrors the `handle_run_entrypoint` symbol invariant from
+/// W5). The CI gate at `scripts/check-prod-agent-no-exec.sh`
+/// requires this symbol to be present on the same binary that
+/// ships, as positive evidence the warm-process substrate is
+/// wired in. Without `inline(never)` LTO would erase it from the
+/// `nm` output.
+#[inline(never)]
+fn dispatch_via_warm_pool(
+    file: &mut std::fs::File,
+    pool: &Arc<WorkerPool>,
+    stdin: Vec<u8>,
+    timeout_secs: u64,
+) -> GuestResponse {
+    match pool.dispatch(stdin, timeout_secs) {
+        Ok(DispatchOutcome {
+            stdout,
+            stderr,
+            outcome,
+        }) => {
+            write_response(file, &evt(EntrypointEvent::Stdout { chunk: stdout }));
+            write_response(file, &evt(EntrypointEvent::Stderr { chunk: stderr }));
+            match outcome {
+                WorkerOutcome::Exit { code } => evt(EntrypointEvent::Exit { code }),
+                WorkerOutcome::Error { kind, message } => evt(EntrypointEvent::Error {
+                    kind: map_worker_error_kind(&kind),
+                    message,
+                }),
+            }
+        }
+        Err(DispatchError::QueueFull) => evt(EntrypointEvent::Error {
+            kind: RunEntrypointError::Busy,
+            message: "warm-process pool queue is full".into(),
+        }),
+        Err(DispatchError::ShuttingDown) => evt(EntrypointEvent::Error {
+            kind: RunEntrypointError::InternalError,
+            message: "warm-process pool is shutting down".into(),
+        }),
+        Err(DispatchError::NoLiveWorkers) => evt(EntrypointEvent::Error {
+            kind: RunEntrypointError::InternalError,
+            message: "warm-process pool has no live workers".into(),
+        }),
+    }
+}
+
+fn map_worker_error_kind(kind: &str) -> RunEntrypointError {
+    match kind {
+        "wrapper_crash" => RunEntrypointError::WrapperCrashed,
+        "timeout" => RunEntrypointError::Timeout,
+        _ => RunEntrypointError::InternalError,
     }
 }
 
@@ -1371,6 +1503,12 @@ fn main() {
     // Failures are non-fatal — only `RunEntrypoint` requests degrade.
     init_entrypoint_validation();
 
+    // Plan 43: stand up the warm-process worker pool if mvmforge's
+    // /etc/mvm/runtime.json opts in. Must run AFTER
+    // `init_entrypoint_validation` since the pool spawns workers
+    // from the validated FD. Fail-loud on a misconfigured runtime.json.
+    init_warm_pool();
+
     // SAFETY: libc call, arguments are constant values.
     let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
     if fd < 0 {
@@ -1463,13 +1601,31 @@ fn main() {
         cfg.port, integration_count, probe_count
     );
 
+    // Plan 43: when warm-process is active, real concurrency from
+    // multiple host invokes lands in parallel — spawn a thread per
+    // accepted connection so they reach distinct workers. Cold-tier
+    // images keep the single-threaded accept loop unchanged for
+    // bit-identical behavior. `handle_client` already takes shared
+    // state through `Arc<Mutex<…>>`, so per-connection threading
+    // is a safe addition; the new pool itself does its own slot
+    // mutex / condvar bookkeeping.
+    let warm_active = matches!(WARM_POOL.get(), Some(Some(_)));
     loop {
         // SAFETY: null addr pointers are allowed for accept when peer addr is not needed.
         let cfd = unsafe { accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
         if cfd < 0 {
             continue;
         }
-        handle_client(cfd, &state, &integration_state, &probe_state, boot_at);
+        if warm_active {
+            let state = Arc::clone(&state);
+            let integration_state = Arc::clone(&integration_state);
+            let probe_state = Arc::clone(&probe_state);
+            std::thread::spawn(move || {
+                handle_client(cfd, &state, &integration_state, &probe_state, boot_at);
+            });
+        } else {
+            handle_client(cfd, &state, &integration_state, &probe_state, boot_at);
+        }
     }
 }
 

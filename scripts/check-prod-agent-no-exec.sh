@@ -106,6 +106,32 @@ fi
 
 echo "==> ok: handle_run_entrypoint symbol present in $BIN"
 
+# ─── Positive: dispatch_via_warm_pool must be PRESENT (plan 43) ────────
+# Plan 43 (warm-process function dispatch, mvmforge ADR-0011 tier 2)
+# adds a worker-pool path that runs alongside the cold-tier handler.
+# The substrate is always linked into the prod binary (the path is
+# opt-in at runtime via `/etc/mvm/runtime.json`, not at build time).
+# Asserting its presence as positive evidence catches:
+#   - someone gating `dispatch_via_warm_pool` behind a feature flag
+#   - LTO inlining erasing the symbol (fixed by `#[inline(never)]`
+#     on the function, but the gate is the safety net)
+#   - the worker-pool module being accidentally unlinked
+# A prod build without this symbol cannot serve warm-tier images,
+# even though the cold tier still works — partial substrate is
+# worse than honest absence.
+WARM_PATTERN='mvm_guest_agent::dispatch_via_warm_pool'
+if ! "${NM_CMD[@]}" "$BIN" 2>/dev/null | grep -F "$WARM_PATTERN" >/dev/null; then
+    echo "error: required symbol '$WARM_PATTERN' missing from production guest agent" >&2
+    echo "       this means the warm-process worker-pool dispatch path is" >&2
+    echo "       not compiled in, and warm-tier images will fall through to" >&2
+    echo "       the cold path silently." >&2
+    echo "       See plan 43 / mvmforge ADR-0011 and the helper in" >&2
+    echo "       crates/mvm-guest/src/bin/mvm-guest-agent.rs::dispatch_via_warm_pool." >&2
+    exit 1
+fi
+
+echo "==> ok: dispatch_via_warm_pool symbol present in $BIN"
+
 # ─── Variant ↔ feature pairing (W7.1) ────────────────────────────────────
 # `mkGuest` (in nix/flake.nix) asserts at build time that:
 #   variant="prod" ↔ guestAgent.passthru.devShell == false
