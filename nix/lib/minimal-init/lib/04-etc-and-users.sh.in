@@ -43,8 +43,10 @@ chown 900:900 /home/@serviceGroup@
 # RPC endpoint and must not run as root — see ADR-002 §W4.5. It is
 # enrolled in @serviceGroup@ (gid 900) so it can read shared
 # integration drop-in configs at /etc/mvm/integrations.d/ and the
-# legacy shared-secret bucket. Vsock binds are unprivileged on Linux,
-# so port 52 + the host-bound port can be opened without CAP_NET_*.
+# legacy shared-secret bucket. The agent's vsock listen port
+# (GUEST_AGENT_PORT, 5252) sits above 1023, so bind(2) succeeds
+# without CAP_NET_BIND_SERVICE — vsock applies the same priv-port
+# gate as AF_INET (LAST_RESERVED_PORT = 1023 in the kernel).
 echo "mvm-agent:x:901:" >> /run/mvm-etc/group
 echo "mvm-agent:x:901:901:mvm-agent:/var/empty:@busybox@/bin/sh" >> /run/mvm-etc/passwd
 sed -i 's/^@serviceGroup@:x:900:.*$/&,mvm-agent/' /run/mvm-etc/group

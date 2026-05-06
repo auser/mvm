@@ -1,4 +1,5 @@
-//! Guest vsock agent — runs inside the microVM, listens on vsock port 52.
+//! Guest vsock agent — runs inside the microVM, listens on
+//! `GUEST_AGENT_PORT` (5252).
 //!
 //! Handles host-to-guest requests (Ping, WorkerStatus, SleepPrep, Wake, etc.)
 //! and reports real system metrics via a background monitoring thread.
@@ -10,7 +11,7 @@
 //!
 //! Options:
 //!   --config <path>            JSON config file (default: /etc/mvm/agent.json)
-//!   --port <port>              Vsock port to listen on (default: 52)
+//!   --port <port>              Vsock port to listen on (default: 5252)
 //!   --busy-threshold <float>   Load average threshold for busy (default: 0.1)
 //!   --sample-interval <secs>   Monitoring sample interval (default: 5)
 //!   --help, -h                 Print usage

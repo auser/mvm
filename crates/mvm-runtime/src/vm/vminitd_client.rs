@@ -39,7 +39,13 @@ use anyhow::Result;
 pub const VMINITD_VSOCK_PORT: u32 = 1024;
 
 /// Port that the mvm guest agent listens on (same as Firecracker).
-pub const GUEST_AGENT_VSOCK_PORT: u32 = 52;
+///
+/// Must stay in lockstep with `mvm_guest::vsock::GUEST_AGENT_PORT`.
+/// Duplicated here to avoid pulling `mvm-guest` into this client's
+/// dependency surface. See the canonical doc comment for why this
+/// lives at 5252 (>1023, so the agent can bind it under W4.5's
+/// reduced capability set).
+pub const GUEST_AGENT_VSOCK_PORT: u32 = 5252;
 
 /// Configuration for launching a process inside an Apple Container via vminitd.
 #[derive(Debug, Clone)]
@@ -77,8 +83,8 @@ impl VminitdClient {
     /// Launch the mvm guest agent inside the container.
     ///
     /// Uses CreateProcess + StartProcess to start the guest agent binary,
-    /// which then listens on vsock port 52 for health checks and
-    /// integration probes (same protocol as Firecracker).
+    /// which then listens on `GUEST_AGENT_VSOCK_PORT` (5252) for health
+    /// checks and integration probes (same protocol as Firecracker).
     pub fn launch_guest_agent(&self) -> Result<()> {
         let _config = ProcessConfig {
             id: format!("{}-guest-agent", self.container_id),
@@ -133,11 +139,12 @@ mod tests {
 
     #[test]
     fn test_process_config() {
+        let port = GUEST_AGENT_VSOCK_PORT.to_string();
         let config = ProcessConfig {
             id: "agent-1".to_string(),
             path: "/usr/local/bin/mvm-guest-agent".to_string(),
-            args: vec!["--port".to_string(), "52".to_string()],
-            env: vec!["MVM_VSOCK_PORT=52".to_string()],
+            args: vec!["--port".to_string(), port.clone()],
+            env: vec![format!("MVM_VSOCK_PORT={port}")],
             cwd: "/".to_string(),
         };
         assert_eq!(config.id, "agent-1");
@@ -147,6 +154,9 @@ mod tests {
     #[test]
     fn test_vsock_port_constants() {
         assert_eq!(VMINITD_VSOCK_PORT, 1024);
-        assert_eq!(GUEST_AGENT_VSOCK_PORT, 52);
+        assert_eq!(GUEST_AGENT_VSOCK_PORT, 5252);
+        // Sanity: must stay above the privileged-port gate so the
+        // agent (uid 901, no caps) can bind. ADR-002 §W4.5.
+        const _: () = assert!(GUEST_AGENT_VSOCK_PORT > 1023);
     }
 }

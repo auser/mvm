@@ -209,7 +209,13 @@ pub fn vsock_connect_any(id: &str, port: u32) -> Result<std::os::unix::net::Unix
 }
 
 /// Guest agent vsock port.
-pub const GUEST_AGENT_PORT: u32 = 52;
+///
+/// Must stay in lockstep with `mvm_guest::vsock::GUEST_AGENT_PORT`.
+/// Duplicated here because `mvm-apple-container` is a leaf crate that
+/// can't depend on `mvm-guest`. See the doc comment on the canonical
+/// definition for why this lives at 5252 (>1023, so `bind(2)` succeeds
+/// under W4.5's reduced agent capability set).
+pub const GUEST_AGENT_PORT: u32 = 5252;
 
 /// List running VM IDs.
 pub fn list_ids() -> Vec<String> {

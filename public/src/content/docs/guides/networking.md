@@ -45,9 +45,9 @@ MicroVMs don't use networking for host communication -- they use **vsock**:
 
 | Port | Protocol | Purpose |
 |------|----------|---------|
-| 52 | Length-prefixed JSON | Guest agent (health checks, status, snapshot lifecycle) |
+| 5252 | Length-prefixed JSON | Guest agent (health checks, status, snapshot lifecycle) |
 
-The host connects by writing `CONNECT 52\n` to the vsock socket and reading `OK 52\n`. All requests are request/response pairs. vsock is supported on Firecracker, Apple Container, and microvm.nix backends. Docker uses a unix socket instead.
+The host connects by writing `CONNECT 5252\n` to the vsock socket and reading `OK 5252\n`. All requests are request/response pairs. vsock is supported on Firecracker, Apple Container, and microvm.nix backends. Docker uses a unix socket instead.
 
 ## No SSH
 

@@ -452,12 +452,15 @@ mod tests {
 
     #[test]
     fn test_guest_channel_info_vsock_serde_roundtrip() {
-        let info = GuestChannelInfo::Vsock { cid: 3, port: 52 };
+        // Arbitrary cid/port — this test exercises serde, not the
+        // agent port choice. The agent's actual port lives in
+        // `mvm_guest::vsock::GUEST_AGENT_PORT`.
+        let info = GuestChannelInfo::Vsock { cid: 3, port: 4242 };
         let json = serde_json::to_string(&info).unwrap();
         let parsed: GuestChannelInfo = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            GuestChannelInfo::Vsock { cid: 3, port: 52 }
+            GuestChannelInfo::Vsock { cid: 3, port: 4242 }
         ));
     }
 

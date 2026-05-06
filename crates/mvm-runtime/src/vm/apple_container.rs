@@ -177,7 +177,8 @@ impl VmBackend for AppleContainerBackend {
 
     fn guest_channel_info(&self, _id: &VmId) -> Result<GuestChannelInfo> {
         // Apple VZ backend uses vsock directly (VZVirtioSocketDevice).
-        // The guest agent listens on port 52, same as Firecracker.
+        // The guest agent listens on `GUEST_AGENT_PORT` (5252), same as
+        // Firecracker.
         Ok(GuestChannelInfo::Vsock {
             cid: 3, // standard guest CID
             port: mvm_apple_container::GUEST_AGENT_PORT,
