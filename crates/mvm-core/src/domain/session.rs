@@ -31,6 +31,19 @@ use serde::{Deserialize, Serialize};
 /// Default idle timeout for newly-created sessions (5 minutes).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 
+/// Env var to opt into the strict-creator-PID gate. When set to
+/// "1", `mvmctl session attach` / `exec` / `run-code` / `console`
+/// refuse calls whose PID isn't an ancestor or sibling of the
+/// session's `creator_pid`. Off by default — file perms (0600) are
+/// the real access boundary; this is a foot-gun guard for users
+/// who want a second check.
+pub const STRICT_CREATOR_PID_ENV: &str = "MVMCTL_STRICT_CREATOR_PID";
+
+/// True iff the strict-creator gate is enabled.
+pub fn strict_creator_pid_enabled() -> bool {
+    std::env::var(STRICT_CREATOR_PID_ENV).is_ok_and(|v| v == "1")
+}
+
 /// Hard ceiling on idle timeout — 24 hours.
 ///
 /// A session held open longer than this is almost certainly a forgotten
@@ -166,6 +179,26 @@ pub struct SessionRecord {
     pub invoke_count: u64,
     /// Current lifecycle state.
     pub state: SessionState,
+    /// PID of the process that created this session, captured at
+    /// `register` time. Used by the optional strict-creator-PID gate
+    /// to refuse `attach` / `exec` / `run-code` / `console` from a
+    /// different process tree (`MVMCTL_STRICT_CREATOR_PID=1`).
+    ///
+    /// **Limitations** — this is a foot-gun guard, not a security
+    /// boundary. PIDs are reused: once the creating process exits,
+    /// the next process to receive its PID looks like a legitimate
+    /// owner. Process-group lookups would tighten the check but
+    /// break the common SDK pattern of attaching from a sibling
+    /// shell. The 0700 file perms on the session table are still
+    /// the actual access boundary; this field exists so an operator
+    /// who *wants* an extra "did the same shell that started this
+    /// session also do the attach?" check can opt in.
+    ///
+    /// `#[serde(default)]` keeps records written before this field
+    /// existed parseable; a `creator_pid: 0` indicates "unknown,
+    /// gate is implicitly disabled for this record."
+    #[serde(default)]
+    pub creator_pid: u32,
 }
 
 /// Whether the session's wrapper is allowed to run ad-hoc code (dev)
@@ -189,6 +222,9 @@ impl std::fmt::Display for SessionMode {
 
 impl SessionRecord {
     /// Construct a fresh `SessionRecord` for a newly-booted VM.
+    /// Captures the calling process's PID into `creator_pid` so the
+    /// optional strict-creator gate (`MVMCTL_STRICT_CREATOR_PID=1`)
+    /// has a baseline to compare against.
     pub fn new_running(
         vm_name: impl Into<String>,
         workload_id: impl Into<String>,
@@ -204,6 +240,7 @@ impl SessionRecord {
             last_invoke_at: None,
             invoke_count: 0,
             state: SessionState::Running,
+            creator_pid: std::process::id(),
         }
     }
 }

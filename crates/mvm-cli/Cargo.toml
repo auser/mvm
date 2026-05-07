@@ -21,6 +21,7 @@ chrono.workspace = true
 names.workspace = true
 clap.workspace = true
 flate2.workspace = true
+fs2.workspace = true
 reqwest.workspace = true
 clap_complete.workspace = true
 colored.workspace = true

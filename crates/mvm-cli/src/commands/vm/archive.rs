@@ -30,6 +30,17 @@ pub const DEFAULT_INFLATED_CAP_BYTES: u64 = 1024 * 1024 * 1024;
 /// Env var to override the inflated-size cap.
 pub const INFLATED_CAP_ENV: &str = "MVMCTL_MAX_ARCHIVE_INFLATED_BYTES";
 
+/// Default cumulative cap across all concurrent extractions (4 GiB).
+/// Bounds disk-pressure when several `mvmctl up` calls run in parallel
+/// — each individual extraction is capped by `INFLATED_CAP_ENV`, but
+/// without a cumulative ceiling N concurrent extractions could still
+/// occupy N × per-call. Configurable via
+/// `MVMCTL_MAX_TOTAL_INFLATED_BYTES`.
+pub const DEFAULT_TOTAL_INFLATED_CAP_BYTES: u64 = 4 * 1024 * 1024 * 1024;
+
+/// Env var for the cumulative cap.
+pub const TOTAL_INFLATED_CAP_ENV: &str = "MVMCTL_MAX_TOTAL_INFLATED_BYTES";
+
 /// Classified `--flake` input. Owns the tempdir guard for the archive
 /// case so the caller can keep the extracted tree alive for the
 /// duration of the boot pipeline by holding the value.
@@ -79,6 +90,16 @@ pub enum ArchiveError {
     PathTraversal { entry: String },
     /// Inflated size exceeded the configured cap.
     TooLarge { actual: u64, cap: u64 },
+    /// Reserving this extraction would push the cumulative in-flight
+    /// inflation past the host-wide ceiling
+    /// (`MVMCTL_MAX_TOTAL_INFLATED_BYTES`). Refused before any bytes
+    /// are decompressed. Bounds the disk-pressure window across many
+    /// concurrent `mvmctl up` calls.
+    QuotaExceeded {
+        in_flight: u64,
+        reservation: u64,
+        cap: u64,
+    },
     /// Extracted tree is missing a required top-level entry.
     LayoutInvalid { missing: &'static str },
     /// IO error during extraction.
@@ -104,6 +125,17 @@ impl std::fmt::Display for ArchiveError {
                 "E_ARCHIVE_TOO_LARGE: inflated size {} bytes exceeds cap {} bytes \
                  (override with {})",
                 actual, cap, INFLATED_CAP_ENV
+            ),
+            ArchiveError::QuotaExceeded {
+                in_flight,
+                reservation,
+                cap,
+            } => write!(
+                f,
+                "E_ARCHIVE_QUOTA_EXCEEDED: cumulative inflation cap of {} bytes \
+                 would be exceeded by reserving {} more bytes \
+                 ({} already in-flight; override with {})",
+                cap, reservation, in_flight, TOTAL_INFLATED_CAP_ENV
             ),
             ArchiveError::LayoutInvalid { missing } => write!(
                 f,
@@ -170,6 +202,14 @@ fn is_tarball_path(s: &str) -> bool {
 pub fn extract_archive(path: &Path) -> Result<TempDir, ArchiveError> {
     let cap = inflated_cap();
 
+    // Reserve up to `cap` bytes against the cumulative quota before
+    // we touch the gzip stream. If the reservation can't fit, fail
+    // fast with `E_ARCHIVE_QUOTA_EXCEEDED` — cheaper than starting
+    // decompression and tearing down. The guard releases the
+    // reservation on drop (success or failure) by subtracting the
+    // amount we actually consumed from the in-flight counter.
+    let _quota_guard = QuotaReservation::acquire(cap)?;
+
     let temp = tempfile::Builder::new().prefix("mvmctl-up-").tempdir()?;
 
     #[cfg(unix)]
@@ -217,6 +257,115 @@ fn inflated_cap() -> u64 {
         .ok()
         .and_then(|s| s.parse::<u64>().ok())
         .unwrap_or(DEFAULT_INFLATED_CAP_BYTES)
+}
+
+fn total_inflated_cap() -> u64 {
+    std::env::var(TOTAL_INFLATED_CAP_ENV)
+        .ok()
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(DEFAULT_TOTAL_INFLATED_CAP_BYTES)
+}
+
+/// Filesystem location of the cumulative-quota counter. Lives under
+/// the runtime dir alongside the session table so we don't pollute
+/// other state directories. The counter file holds a single ASCII
+/// integer (in-flight bytes); concurrent updates are serialized by
+/// `fs2`-flavored exclusive locking on the file itself.
+fn quota_counter_path() -> PathBuf {
+    PathBuf::from(mvm_core::config::mvm_runtime_dir()).join("archive_quota.bytes")
+}
+
+/// RAII guard for a cumulative-quota reservation. Created via
+/// `QuotaReservation::acquire(cap)`; bumps the in-flight counter by
+/// `cap` and releases it on drop.
+///
+/// **Limitations of the reserve-and-release model**: we reserve the
+/// per-call cap up front rather than the actual extracted size,
+/// because the extraction's true bytes-on-disk aren't knowable until
+/// the gzip stream is parsed. This is conservative: a small archive
+/// holds a 1 GiB-worth slot in the quota for the duration of its
+/// extraction, even though only a few KiB land on disk. In exchange,
+/// the quota check is cheap (one read-modify-write per call) and
+/// the worst-case disk-pressure is bounded predictably by
+/// `total_inflated_cap()`.
+///
+/// The guard is **best-effort across processes**: a `kill -9` of an
+/// in-flight `mvmctl up` leaves the counter elevated. Operators
+/// recover by running `mvmctl session reap` (which sweeps the same
+/// runtime dir; we co-opt that as the natural reset point) or by
+/// `rm $XDG_RUNTIME_DIR/mvm/archive_quota.bytes` manually. Cheap to
+/// recover; not a security boundary.
+struct QuotaReservation {
+    reservation: u64,
+}
+
+impl QuotaReservation {
+    fn acquire(reservation: u64) -> Result<Self, ArchiveError> {
+        let cap = total_inflated_cap();
+        Self::with_counter(|in_flight| {
+            // `saturating_add` keeps a malformed counter from
+            // panicking; the next branch refuses oversized reservations.
+            let after = in_flight.saturating_add(reservation);
+            if after > cap {
+                return Err(ArchiveError::QuotaExceeded {
+                    in_flight,
+                    reservation,
+                    cap,
+                });
+            }
+            Ok(after)
+        })?;
+        Ok(Self { reservation })
+    }
+
+    /// Read-modify-write the counter under an exclusive flock. The
+    /// closure returns the *new* value to write; if it returns Err,
+    /// the counter is left unchanged and the error is propagated.
+    fn with_counter<F>(update: F) -> Result<(), ArchiveError>
+    where
+        F: FnOnce(u64) -> Result<u64, ArchiveError>,
+    {
+        use fs2::FileExt;
+        use std::io::{Read, Seek, SeekFrom, Write};
+
+        let path = quota_counter_path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let mut file = std::fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(&path)?;
+        file.lock_exclusive()?;
+
+        // Read current value (empty file → 0; malformed → 0).
+        let mut buf = String::new();
+        file.read_to_string(&mut buf)?;
+        let current: u64 = buf.trim().parse().unwrap_or(0);
+
+        let new_value = update(current)?;
+        let serialized = new_value.to_string();
+        file.set_len(0)?;
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(serialized.as_bytes())?;
+        file.flush()?;
+        // Lock releases on drop.
+        Ok(())
+    }
+}
+
+impl Drop for QuotaReservation {
+    fn drop(&mut self) {
+        let r = self.reservation;
+        // Best-effort: if the counter file is gone or we can't
+        // re-lock, log and move on. The next session-reap or manual
+        // cleanup recovers.
+        if let Err(e) = Self::with_counter(|in_flight| Ok(in_flight.saturating_sub(r))) {
+            tracing::warn!(err = %e, "archive quota: release failed");
+        }
+    }
 }
 
 fn validate_entry_path(p: &Path) -> Result<(), ArchiveError> {
@@ -355,6 +504,7 @@ mod tests {
 
     #[test]
     fn happy_path_extracts_to_0700_tempdir_with_required_layout() {
+        let _lock = lock_archive_env();
         let bytes = build_valid_tarball();
         let archive = write_tarball(&bytes);
         let arg = archive.path().to_str().unwrap();
@@ -388,6 +538,7 @@ mod tests {
 
     #[test]
     fn path_traversal_dotdot_is_refused() {
+        let _lock = lock_archive_env();
         let mut tar_bytes = Vec::new();
         {
             let gz = GzEncoder::new(&mut tar_bytes, Compression::default());
@@ -418,6 +569,7 @@ mod tests {
 
     #[test]
     fn absolute_path_entry_is_refused() {
+        let _lock = lock_archive_env();
         let mut tar_bytes = Vec::new();
         {
             let gz = GzEncoder::new(&mut tar_bytes, Compression::default());
@@ -442,8 +594,117 @@ mod tests {
         );
     }
 
+    /// Serializes archive-extraction tests within this module so
+    /// `INFLATED_CAP_ENV` / `TOTAL_INFLATED_CAP_ENV` / `MVM_RUNTIME_DIR`
+    /// don't race across cargo's parallel test threads. Tests that
+    /// don't trigger extraction (directory passthrough, remote ref,
+    /// extension detection, etc.) don't need the lock; the helper
+    /// `lock_archive_env()` returns a guard the extracting tests
+    /// hold for their duration.
+    static QUOTA_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn lock_archive_env() -> std::sync::MutexGuard<'static, ()> {
+        QUOTA_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner())
+    }
+
+    /// RAII helper: holds the ENV_LOCK and pins the runtime + total
+    /// cap env vars; restores prior values on drop.
+    struct QuotaEnvGuard {
+        _lock: std::sync::MutexGuard<'static, ()>,
+        _runtime: tempfile::TempDir,
+        prev_runtime: Option<String>,
+        prev_total: Option<String>,
+    }
+
+    impl Drop for QuotaEnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev_runtime.take() {
+                    Some(v) => std::env::set_var("MVM_RUNTIME_DIR", v),
+                    None => std::env::remove_var("MVM_RUNTIME_DIR"),
+                }
+                match self.prev_total.take() {
+                    Some(v) => std::env::set_var(TOTAL_INFLATED_CAP_ENV, v),
+                    None => std::env::remove_var(TOTAL_INFLATED_CAP_ENV),
+                }
+            }
+        }
+    }
+
+    fn pin_quota_env(total_cap_bytes: u64) -> QuotaEnvGuard {
+        let lock = QUOTA_ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        let runtime = tempfile::tempdir().expect("tempdir");
+        let prev_runtime = std::env::var("MVM_RUNTIME_DIR").ok();
+        let prev_total = std::env::var(TOTAL_INFLATED_CAP_ENV).ok();
+        unsafe {
+            std::env::set_var("MVM_RUNTIME_DIR", runtime.path());
+            std::env::set_var(TOTAL_INFLATED_CAP_ENV, total_cap_bytes.to_string());
+        }
+        QuotaEnvGuard {
+            _lock: lock,
+            _runtime: runtime,
+            prev_runtime,
+            prev_total,
+        }
+    }
+
+    #[test]
+    fn over_total_quota_is_refused() {
+        // Pre-populate the cumulative counter with 1.5 GiB, set the
+        // total cap at 2 GiB, attempt a 1 GiB-reservation extraction.
+        // 1.5 + 1 = 2.5 > 2 → E_ARCHIVE_QUOTA_EXCEEDED.
+        let guard = pin_quota_env(2 * 1024 * 1024 * 1024);
+        let runtime_path = std::path::PathBuf::from(std::env::var("MVM_RUNTIME_DIR").unwrap());
+        let counter_path = runtime_path.join("archive_quota.bytes");
+        std::fs::create_dir_all(counter_path.parent().unwrap()).unwrap();
+        std::fs::write(&counter_path, "1610612736").unwrap(); // 1.5 GiB
+
+        let bytes = build_valid_tarball();
+        let archive = write_tarball(&bytes);
+        let err = classify_flake_input(archive.path().to_str().unwrap()).unwrap_err();
+        drop(guard);
+
+        assert!(
+            err.to_string().starts_with("E_ARCHIVE_QUOTA_EXCEEDED"),
+            "expected E_ARCHIVE_QUOTA_EXCEEDED, got {err}"
+        );
+    }
+
+    #[test]
+    fn quota_reservation_releases_on_drop() {
+        // 1 GiB cap holds one in-flight extraction at the default
+        // 1 GiB per-call reservation. Two simultaneous would
+        // exceed; two sequential must each succeed because the
+        // first releases on drop.
+        let guard = pin_quota_env(1024 * 1024 * 1024);
+        let runtime_path = std::path::PathBuf::from(std::env::var("MVM_RUNTIME_DIR").unwrap());
+        let counter_path = runtime_path.join("archive_quota.bytes");
+
+        let bytes = build_valid_tarball();
+        let archive = write_tarball(&bytes);
+        let arg = archive.path().to_str().unwrap();
+
+        // First extraction: acquires + releases on drop.
+        {
+            let _input = classify_flake_input(arg).expect("first extraction");
+        }
+        let after_first = std::fs::read_to_string(&counter_path)
+            .unwrap()
+            .trim()
+            .parse::<u64>()
+            .unwrap();
+        assert_eq!(after_first, 0, "reservation must release on drop");
+
+        // Second extraction succeeds because the first released.
+        {
+            let _input = classify_flake_input(arg).expect("second extraction");
+        }
+        drop(guard);
+    }
+
     #[test]
     fn over_cap_is_refused() {
+        let _lock = lock_archive_env();
         // Build a tarball whose declared content bytes exceed a small
         // cap. We don't need the file to actually be on disk —
         // extraction tracks the header-declared size before reading.
@@ -489,6 +750,7 @@ mod tests {
 
     #[test]
     fn missing_layout_is_refused() {
+        let _lock = lock_archive_env();
         // Tarball with flake.nix but no launch.json or source/.
         let mut tar_bytes = Vec::new();
         {
@@ -512,6 +774,7 @@ mod tests {
 
     #[test]
     fn symlink_entry_is_refused() {
+        let _lock = lock_archive_env();
         let mut tar_bytes = Vec::new();
         {
             let gz = GzEncoder::new(&mut tar_bytes, Compression::default());

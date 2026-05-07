@@ -30,7 +30,9 @@ use anyhow::{Context, Result, bail};
 use clap::{Args as ClapArgs, Subcommand};
 
 use mvm_core::audit::{LocalAuditKind, emit as audit_emit};
-use mvm_core::session::{self, MAX_IDLE_TIMEOUT_SECS, SessionId, SessionState};
+use mvm_core::session::{
+    self, MAX_IDLE_TIMEOUT_SECS, SessionId, SessionState, strict_creator_pid_enabled,
+};
 use mvm_core::user_config::MvmConfig;
 
 use super::Cli;
@@ -562,7 +564,44 @@ fn require_running_session(raw_id: &str) -> Result<(SessionId, mvm_core::session
             record.state
         );
     }
+    enforce_creator_pid_gate(&id, &record)?;
     Ok((id, record))
+}
+
+/// Strict-creator-PID gate. Skips silently unless
+/// `MVMCTL_STRICT_CREATOR_PID=1` AND the session record has a
+/// non-zero `creator_pid` (records from before the field existed
+/// have 0 here and aren't gated). Refuses calls from a different
+/// PID with a stable, scriptable error message.
+///
+/// **Documented limitation**: PIDs are reused. Once the creator
+/// process exits and the kernel recycles its PID, an unrelated
+/// process can pick up that PID and look like a legitimate caller.
+/// File perms (0600) on the session record remain the actual access
+/// boundary; this gate is a foot-gun guard for users who want a
+/// belt-and-suspenders check that "the same shell that started this
+/// session is the one attaching to it."
+fn enforce_creator_pid_gate(
+    id: &SessionId,
+    record: &mvm_core::session::SessionRecord,
+) -> Result<()> {
+    if !strict_creator_pid_enabled() {
+        return Ok(());
+    }
+    if record.creator_pid == 0 {
+        return Ok(());
+    }
+    let caller = std::process::id();
+    if caller != record.creator_pid {
+        bail!(
+            "session {id} was created by pid {} but caller pid is {} \
+             (MVMCTL_STRICT_CREATOR_PID=1). Either unset the env var \
+             or call from the same process that created the session.",
+            record.creator_pid,
+            caller
+        );
+    }
+    Ok(())
 }
 
 fn cmd_attach(args: AttachArgs) -> Result<()> {
@@ -974,6 +1013,94 @@ mod tests {
         let id = SessionId::parse(&id_str).unwrap();
         let reread = session::read_session(&id).unwrap().unwrap();
         assert_eq!(reread.idle_timeout_secs, 999);
+    }
+
+    #[test]
+    fn creator_pid_gate_off_by_default() {
+        // Without the env var, attach should not check creator_pid
+        // even when it differs from the caller's. We construct a
+        // record whose creator_pid is intentionally bogus.
+        let _guard = isolated_runtime_dir();
+        let mut rec = session::SessionRecord::new_running("vm-1", "wl", session::SessionMode::Prod);
+        rec.creator_pid = 99999; // not us
+        let id = rec.id.clone();
+        session::write_session(&rec).unwrap();
+        // Default env: gate is off, so the check passes.
+        enforce_creator_pid_gate(&id, &rec).expect("gate should be off by default");
+    }
+
+    #[test]
+    fn creator_pid_gate_pid_zero_records_pass_through() {
+        // Records written before the field existed have
+        // creator_pid=0; the gate is implicitly disabled for them
+        // even when the env var is set, so old records keep working.
+        let _guard = isolated_runtime_dir();
+        let mut rec = session::SessionRecord::new_running("vm-1", "wl", session::SessionMode::Prod);
+        rec.creator_pid = 0;
+        let id = rec.id.clone();
+
+        let prev = std::env::var(session::STRICT_CREATOR_PID_ENV).ok();
+        unsafe {
+            std::env::set_var(session::STRICT_CREATOR_PID_ENV, "1");
+        }
+        let result = enforce_creator_pid_gate(&id, &rec);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(session::STRICT_CREATOR_PID_ENV, v),
+                None => std::env::remove_var(session::STRICT_CREATOR_PID_ENV),
+            }
+        }
+        result.expect("creator_pid=0 records bypass the gate");
+    }
+
+    #[test]
+    fn creator_pid_gate_rejects_different_pid_when_enabled() {
+        // With the env var on AND a non-zero creator_pid that
+        // differs from the caller's, the gate must refuse.
+        let _guard = isolated_runtime_dir();
+        let mut rec = session::SessionRecord::new_running("vm-1", "wl", session::SessionMode::Prod);
+        rec.creator_pid = std::process::id().wrapping_add(1); // definitely not us
+        let id = rec.id.clone();
+
+        let prev = std::env::var(session::STRICT_CREATOR_PID_ENV).ok();
+        unsafe {
+            std::env::set_var(session::STRICT_CREATOR_PID_ENV, "1");
+        }
+        let result = enforce_creator_pid_gate(&id, &rec);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(session::STRICT_CREATOR_PID_ENV, v),
+                None => std::env::remove_var(session::STRICT_CREATOR_PID_ENV),
+            }
+        }
+        let err = result.expect_err("different PID should be refused");
+        assert!(
+            err.to_string().contains("created by pid"),
+            "expected creator-pid error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn creator_pid_gate_accepts_same_pid_when_enabled() {
+        // The common case: caller IS the creator. Gate accepts.
+        let _guard = isolated_runtime_dir();
+        let rec = session::SessionRecord::new_running("vm-1", "wl", session::SessionMode::Prod);
+        // `new_running` captures std::process::id() into creator_pid,
+        // so the caller (this test) is by construction the creator.
+        let id = rec.id.clone();
+
+        let prev = std::env::var(session::STRICT_CREATOR_PID_ENV).ok();
+        unsafe {
+            std::env::set_var(session::STRICT_CREATOR_PID_ENV, "1");
+        }
+        let result = enforce_creator_pid_gate(&id, &rec);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var(session::STRICT_CREATOR_PID_ENV, v),
+                None => std::env::remove_var(session::STRICT_CREATOR_PID_ENV),
+            }
+        }
+        result.expect("same-pid call should pass the gate");
     }
 
     #[test]
