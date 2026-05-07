@@ -40,8 +40,12 @@ on:
       - "Cargo.toml"
       - "Cargo.lock"
       - ".github/workflows/windows.yml"
+  # Release-tag pushes keep the Windows lane running as a final
+  # pre-publish backstop. `push: branches: [main]` was dropped in the
+  # ecosystem-wide CI cost reduction.
   push:
-    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
