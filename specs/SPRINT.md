@@ -623,9 +623,10 @@ PR #73 adds the substrate-validation infrastructure:
 - `mkGuest` `extraFiles` parameter — bakes arbitrary files into
   the rootfs at build time, owned root, with declared octal mode.
   `extraFiles ? {}` default keeps backward compat for every
-  existing caller. The eventual mvmforge `mkPythonFunctionService`
-  / `mkNodeFunctionService` factories will use this to bake
-  `/etc/mvm/entrypoint` plus the wrapper.
+  existing caller. (Update post-ADR-0010 §3 Option A flip: the
+  `mk{Python,Node,Wasm}FunctionService` factories now live in
+  this repo at `nix/lib/factories/` and use this to bake
+  `/etc/mvm/entrypoint` plus the wrapper.)
 - `nix/images/examples/echo-fn/` — minimal `mkGuest` invocation
   baking a wrapper at `/usr/lib/mvm/wrappers/echo` (`#!/bin/sh\nexec cat\n`)
   plus the marker. No language runtime; just exercises the
@@ -656,7 +657,10 @@ Two pieces unblock everything else:
 mvmforge (decorationer) plan 0003 ships in parallel — language SDKs
 (Python + TS), Nix factories (`mkPythonFunctionService`,
 `mkNodeFunctionService`), hardened wrapper templates. mvm exposes the
-`RunEntrypoint` substrate; mvmforge consumes it. The cutover is
+`RunEntrypoint` substrate; mvmforge consumes it. (Update: ADR-0010
+§3 was later amended back to Option A — the factories themselves
+landed in this repo at `nix/lib/factories/`; mvmforge consumes them
+via `mvm.lib.<system>`.) The cutover is
 coordinated: when mvm's W6 lands the deny-default flip, mvmforge's
 factories must already emit the new IR shape. mvmforge owns the
 language-specific seccomp tiers (`standard-python`, `standard-node`);
@@ -715,7 +719,7 @@ Cross-repo (decorationer):
 | **W6 mvm-side TAP-skip** | Plan 41 W6 + decorationer plan 0004 | mvmforge needs to ship the IR change first (decorationer plan 0003 phase 1 is in, but phase 2–4 SDK + Nix factory work hasn't started). Once the IR carries `entrypoint.kind = "function"` with the deny-default network mode, mvm honours it by skipping TAP allocation. | ~1 day after mvmforge ships |
 | **Decorationer plan 0003 phase 2 — Python SDK** | decorationer plan 0003 | Decorator preserves function body in bundled source; emitter writes new IR; bundler ships function source; host call site shells out to `mvmctl invoke`. Blocks live-KVM smoke against a real Python wrapper. | ~2 days |
 | **Decorationer plan 0003 phase 3 — TypeScript SDK** | decorationer plan 0003 | Mirror Phase 2 surface. | ~2 days |
-| **Decorationer plan 0003 phase 4 — Nix factories** | decorationer plan 0003 | `mkPythonFunctionService` / `mkNodeFunctionService` emitting hardened wrappers (mode=prod with sanitized error envelope, `PR_SET_DUMPABLE=0`, no payload logging) at `/etc/mvm/entrypoint` via mvm's `extraFiles` (already in mvm #73). | ~3 days |
+| **Decorationer plan 0003 phase 4 — Nix factories** *(landed in mvm post-Option-A flip; see `nix/lib/factories/`)* | decorationer plan 0003 | `mkPythonFunctionService` / `mkNodeFunctionService` emitting hardened wrappers (mode=prod with sanitized error envelope, `PR_SET_DUMPABLE=0`, no payload logging) at `/etc/mvm/entrypoint` via mvm's `extraFiles` (already in mvm #73). | ~3 days |
 | **Session pool management** | follow-up plan (none yet) | Pre-baked invariant: *single-tenant for VM lifetime*. v1 reuses `boot_session_vm` / `dispatch_in_session` / `tear_down_session_vm` primitives directly. Sizing / eviction / per-tenant isolation / idle reaper are real but separable from the substrate. | ~1 sprint |
 | **Streaming chunked output** | follow-up plan (none yet) | v1 wire is streaming-shaped but buffered up to 1 MiB per stream. Lifting the cap means real chunked emission from the agent and a streaming consumer in `send_run_entrypoint`. | ~1 week |
 | **Schema-bound payloads (v2 of W3)** | decorationer plan 0003 | Derive JSON Schema from type hints (Python `pydantic` / TS `zod`). Wrapper validates inbound bytes before user code runs. | ~1 week |

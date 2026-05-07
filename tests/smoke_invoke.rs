@@ -6,7 +6,7 @@
 //! The fixture's wrapper at `/usr/lib/mvm/wrappers/echo` is just
 //! `exec cat` — proves the substrate (W1 wire + W2 handler + W3
 //! invoke CLI) works end-to-end, without depending on any
-//! per-language wrapper from mvmforge's forthcoming Nix factories.
+//! per-language wrapper from `nix/lib/factories/`.
 //!
 //! ## Why this is gated
 //!

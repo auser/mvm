@@ -234,10 +234,10 @@
               # (ADR-007 / plan 41) to bake
               # `/etc/mvm/entrypoint` plus the wrapper binary
               # under `/usr/lib/mvm/wrappers/` without a
-              # separate boot-time service. mvmforge's
-              # forthcoming `mkPythonFunctionService` /
-              # `mkNodeFunctionService` factories will set
-              # this from the IR.
+              # separate boot-time service. The
+              # `mk{Python,Node,Wasm}FunctionService` factories
+              # at `./lib/factories/` set this from the IR
+              # (ADR-0010 §3 Option A — factories live in mvm).
               extraFiles ? { },
             }:
             assert pkgs.lib.assertOneOf "variant" variant [
