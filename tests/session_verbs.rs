@@ -203,3 +203,68 @@ fn session_kill_non_running_session_is_refused() {
         .failure()
         .stderr(predicate::str::contains("not running"));
 }
+
+// --- Phase 5a/5b: attach / exec / run-code ----------------------------------
+
+#[test]
+fn session_attach_unknown_id_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    mvm_with_runtime_dir(temp.path())
+        .args(["session", "attach", "aaaaaaaaaaaaaaaaaaaaaaaaaa"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no session with id"));
+}
+
+#[test]
+fn session_attach_killed_session_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let mut rec = SessionRecord::new_running("vm-1", "wl", SessionMode::Prod);
+    rec.state = SessionState::Killed;
+    let id = rec.id.to_string();
+    let _lock = populate_record(temp.path(), &rec);
+
+    mvm_with_runtime_dir(temp.path())
+        .args(["session", "attach", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not running"));
+}
+
+#[test]
+fn session_exec_on_prod_session_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let rec = SessionRecord::new_running("vm-1", "wl", SessionMode::Prod);
+    let id = rec.id.to_string();
+    let _lock = populate_record(temp.path(), &rec);
+
+    mvm_with_runtime_dir(temp.path())
+        .args(["session", "exec", &id, "--", "ls"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("dev-only"));
+}
+
+#[test]
+fn session_run_code_on_prod_session_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let rec = SessionRecord::new_running("vm-1", "wl", SessionMode::Prod);
+    let id = rec.id.to_string();
+    let _lock = populate_record(temp.path(), &rec);
+
+    mvm_with_runtime_dir(temp.path())
+        .args(["session", "run-code", &id, "print(1)"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("dev-only"));
+}
+
+#[test]
+fn session_exec_unknown_id_errors_before_mode_check() {
+    let temp = tempfile::tempdir().unwrap();
+    mvm_with_runtime_dir(temp.path())
+        .args(["session", "exec", "aaaaaaaaaaaaaaaaaaaaaaaaaa", "--", "ls"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no session with id"));
+}
