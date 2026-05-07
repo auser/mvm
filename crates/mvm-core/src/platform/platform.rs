@@ -53,6 +53,24 @@ impl Platform {
         is_macos_26_or_later()
     }
 
+    /// Whether libkrun is installed on this host.
+    ///
+    /// libkrun (plan 53 §"Plan E") is a library-style VMM that runs on
+    /// Linux KVM and macOS Hypervisor.framework — including macOS Intel
+    /// where Apple Container is unavailable. Detection is a filesystem
+    /// probe of standard install paths (Homebrew on macOS, distro
+    /// packages on Linux); it does *not* guarantee the library will
+    /// load cleanly or that we have the macOS hypervisor entitlement.
+    /// The Sprint 48 spike phase wires up the actual VM lifecycle on
+    /// top of this detection.
+    pub fn has_libkrun(self) -> bool {
+        // Windows is unsupported regardless of any library being present.
+        if matches!(self, Platform::Windows) {
+            return false;
+        }
+        mvm_libkrun::is_available()
+    }
+
     /// Whether Docker is available on this platform.
     ///
     /// Runtime check — calls `docker version` to verify the daemon is running.
@@ -256,6 +274,23 @@ mod tests {
         assert!(!Platform::LinuxNoKvm.has_apple_containers());
         assert!(!Platform::Wsl2.has_apple_containers());
         assert!(!Platform::Windows.has_apple_containers());
+    }
+
+    #[test]
+    fn test_has_libkrun_returns_false_on_windows_regardless_of_filesystem() {
+        // Windows: libkrun has no Windows port. Always false irrespective
+        // of what `mvm_libkrun::is_available()` would say.
+        assert!(!Platform::Windows.has_libkrun());
+    }
+
+    #[test]
+    fn test_has_libkrun_consistent_with_libkrun_crate() {
+        // On non-Windows platforms, has_libkrun() agrees with the
+        // libkrun crate's authoritative is_available() probe.
+        let plat = current();
+        if !matches!(plat, Platform::Windows) {
+            assert_eq!(plat.has_libkrun(), mvm_libkrun::is_available());
+        }
     }
 
     #[test]

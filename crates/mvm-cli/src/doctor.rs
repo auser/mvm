@@ -96,6 +96,7 @@ pub fn run(json: bool) -> Result<()> {
 
     checks.push(kvm_check(plat, in_vm));
     checks.push(apple_container_check(plat));
+    checks.push(libkrun_check(plat));
     checks.push(docker_check(plat));
 
     if plat.needs_lima() {
@@ -456,6 +457,37 @@ fn docker_check(plat: Platform) -> Check {
             category: "platform",
             ok: true, // Not a failure — just unavailable
             info: "not available (install Docker Desktop or Docker Engine)".to_string(),
+        }
+    }
+}
+
+/// libkrun availability — plan 53 §"Plan E". Probes the host for the
+/// libkrun shared library at the standard install paths. `ok: true`
+/// regardless of presence (libkrun is optional); the `info` field
+/// surfaces the install hint when missing so users see exactly what
+/// to run.
+fn libkrun_check(plat: Platform) -> Check {
+    if plat.is_windows() {
+        return Check {
+            name: "libkrun",
+            category: "platform",
+            ok: true,
+            info: "n/a (no Windows port — use WSL2)".to_string(),
+        };
+    }
+    if plat.has_libkrun() {
+        Check {
+            name: "libkrun",
+            category: "platform",
+            ok: true,
+            info: "available".to_string(),
+        }
+    } else {
+        Check {
+            name: "libkrun",
+            category: "platform",
+            ok: true, // Optional; not a failure.
+            info: format!("not available ({})", mvm_libkrun::install_hint()),
         }
     }
 }

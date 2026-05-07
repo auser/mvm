@@ -7,6 +7,7 @@ pub mod egress_proxy;
 pub mod firecracker;
 pub mod image;
 pub mod instance_snapshot;
+pub mod libkrun;
 pub mod lima;
 pub mod lima_state;
 pub mod microvm;
