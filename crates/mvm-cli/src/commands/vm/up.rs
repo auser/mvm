@@ -106,6 +106,24 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
     let effective_cpus = args.cpus.or(Some(cfg.default_cpus));
     let effective_memory = memory_mb.or(Some(cfg.default_memory_mib));
 
+    // Phase 2: classify --flake input. Directory and remote refs pass
+    // through; `.tar.gz` / `.tgz` files are extracted to a 0700 tempdir
+    // per `specs/contracts/mvm-archive-input.md`. Holding `flake_input`
+    // through the rest of `run` keeps any extracted tempdir alive for
+    // the build pipeline; it drops at end of scope, cleaning up on
+    // success or failure.
+    let flake_input: Option<super::archive::FlakeInput> = match args.flake.as_deref() {
+        Some(arg) => Some(super::archive::classify_flake_input(arg)?),
+        None => None,
+    };
+    if args.watch && flake_input.as_ref().is_some_and(|i| i.is_archive()) {
+        anyhow::bail!(
+            "--watch is not supported with archive (.tar.gz) flake inputs \
+             (the artifact is immutable; rebuild from source instead)"
+        );
+    }
+    let resolved_flake: Option<String> = flake_input.as_ref().map(|i| i.resolved());
+
     // Plan 38 §4: `--manifest <PATH>` accepts a manifest path or its
     // directory in addition to legacy names. Resolve the arg up front
     // and substitute the slot hash for downstream lookups; the
@@ -148,8 +166,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         .collect::<Result<Vec<_>>>()
         .context("Invalid --secret value")?;
 
-    cmd_run(RunParams {
-        flake_ref: args.flake.as_deref(),
+    let result = cmd_run(RunParams {
+        flake_ref: resolved_flake.as_deref(),
         template_name: resolved_template_arg.as_deref(),
         name: args.name.as_deref(),
         profile: args.profile.as_deref(),
@@ -169,7 +187,13 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         network_name: &args.network,
         seccomp_tier,
         secret_bindings,
-    })
+    });
+    // Holding `flake_input` until here keeps any extracted archive
+    // tempdir alive across `cmd_run`. Drop is now explicit so
+    // `cargo clippy` doesn't warn about the binding being held only
+    // for its `Drop`.
+    drop(flake_input);
+    result
 }
 
 pub(in crate::commands) struct RunParams<'a> {

@@ -91,7 +91,9 @@ notify-debouncer-mini = "0.5"
 # Utilities
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
+flate2 = "1"
 fs2 = "0.4"
+tar = "0.4"
 tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
@@ -150,8 +152,10 @@ objc2-foundation = { version = "0.3", features = ["NSRunLoop", "NSDate", "NSAuto
 
 [dev-dependencies]
 assert_cmd.workspace = true
+flate2.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
+tar.workspace = true
 tempfile.workspace = true
 
 [profile.release]
