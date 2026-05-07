@@ -1108,14 +1108,21 @@ fn handle_run_entrypoint(
             code,
             stdout,
             stderr,
+            controls,
         } => {
             write_response(file, &evt(EntrypointEvent::Stdout { chunk: stdout }));
             write_response(file, &evt(EntrypointEvent::Stderr { chunk: stderr }));
+            emit_controls(file, controls);
             evt(EntrypointEvent::Exit { code })
         }
-        CallOutcome::Timeout { stdout, stderr } => {
+        CallOutcome::Timeout {
+            stdout,
+            stderr,
+            controls,
+        } => {
             write_response(file, &evt(EntrypointEvent::Stdout { chunk: stdout }));
             write_response(file, &evt(EntrypointEvent::Stderr { chunk: stderr }));
+            emit_controls(file, controls);
             evt(EntrypointEvent::Error {
                 kind: RunEntrypointError::Timeout,
                 message: format!("wrapper exceeded {timeout_secs}s timeout"),
@@ -1125,9 +1132,11 @@ fn handle_run_entrypoint(
             stream,
             stdout,
             stderr,
+            controls,
         } => {
             write_response(file, &evt(EntrypointEvent::Stdout { chunk: stdout }));
             write_response(file, &evt(EntrypointEvent::Stderr { chunk: stderr }));
+            emit_controls(file, controls);
             let stream_name = match stream {
                 PayloadCapStream::Stdin => "stdin",
                 PayloadCapStream::Stdout => "stdout",
@@ -1146,14 +1155,33 @@ fn handle_run_entrypoint(
             signal,
             stdout,
             stderr,
+            controls,
         } => {
             write_response(file, &evt(EntrypointEvent::Stdout { chunk: stdout }));
             write_response(file, &evt(EntrypointEvent::Stderr { chunk: stderr }));
+            emit_controls(file, controls);
             evt(EntrypointEvent::Error {
                 kind: RunEntrypointError::WrapperCrashed,
                 message: format!("wrapper exited via signal {signal}"),
             })
         }
+    }
+}
+
+/// Emit each fd-3 control record as one `EntrypointEvent::Control`
+/// frame on the response stream. Phase 4b — the cold-path counterpart
+/// to phase 4c's wrapper updates. v1 emits all records after stdout
+/// and stderr; the host already accepts non-terminal events in any
+/// order before the terminal `Exit` / `Error`.
+fn emit_controls(file: &mut std::fs::File, records: Vec<mvm_guest::entrypoint::ControlRecord>) {
+    for r in records {
+        write_response(
+            file,
+            &evt(EntrypointEvent::Control {
+                header_json: r.header_json,
+                payload: r.payload,
+            }),
+        );
     }
 }
 
