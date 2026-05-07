@@ -280,6 +280,7 @@
                   services
                   healthChecks
                   busybox
+                  variant
                   ;
                 guestAgentPkg = guestAgent;
                 extraPathDirs = packageBinDirs;
