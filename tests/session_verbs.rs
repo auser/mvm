@@ -260,6 +260,30 @@ fn session_run_code_on_prod_session_is_refused() {
 }
 
 #[test]
+fn session_console_unknown_id_errors() {
+    let temp = tempfile::tempdir().unwrap();
+    mvm_with_runtime_dir(temp.path())
+        .args(["session", "console", "aaaaaaaaaaaaaaaaaaaaaaaaaa"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no session with id"));
+}
+
+#[test]
+fn session_console_on_prod_is_refused() {
+    let temp = tempfile::tempdir().unwrap();
+    let rec = SessionRecord::new_running("vm-1", "wl", SessionMode::Prod);
+    let id = rec.id.to_string();
+    let _lock = populate_record(temp.path(), &rec);
+
+    mvm_with_runtime_dir(temp.path())
+        .args(["session", "console", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("dev-only"));
+}
+
+#[test]
 fn session_exec_unknown_id_errors_before_mode_check() {
     let temp = tempfile::tempdir().unwrap();
     mvm_with_runtime_dir(temp.path())
