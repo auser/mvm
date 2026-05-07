@@ -30,7 +30,7 @@ use std::sync::{Arc, Condvar, Mutex};
 use std::thread;
 use std::time::{Duration, Instant};
 
-use crate::entrypoint::{self, ValidatedEntrypoint};
+use crate::entrypoint::{self, ControlRecord, ValidatedEntrypoint};
 use crate::runtime_config::WarmProcessConfig;
 use crate::worker_protocol::{
     WorkerCallRequest, WorkerCallResponse, WorkerOutcome, read_pipe_frame, write_pipe_frame,
@@ -115,6 +115,10 @@ impl std::error::Error for DispatchError {}
 pub struct DispatchOutcome {
     pub stdout: Vec<u8>,
     pub stderr: Vec<u8>,
+    /// Per-call control-channel records the wrapper emitted via the
+    /// new structured-envelope path (Phase 4c). The agent forwards
+    /// each as one `EntrypointEvent::Control` frame.
+    pub controls: Vec<ControlRecord>,
     pub outcome: WorkerOutcome,
 }
 
@@ -125,6 +129,7 @@ impl DispatchOutcome {
         Self {
             stdout: Vec::new(),
             stderr: Vec::new(),
+            controls: Vec::new(),
             outcome: WorkerOutcome::Error {
                 kind: kind.to_string(),
                 message,
@@ -235,6 +240,18 @@ impl WorkerPool {
             Ok(resp) => DispatchOutcome {
                 stdout: resp.stdout,
                 stderr: resp.stderr,
+                // Phase 4c: forward the worker-emitted control records
+                // through to the agent as `ControlRecord`s. The shape
+                // matches `entrypoint::ControlRecord` modulo base64
+                // encoding on the warm-worker JSON wire.
+                controls: resp
+                    .controls
+                    .into_iter()
+                    .map(|r| ControlRecord {
+                        header_json: r.header_json,
+                        payload: r.payload,
+                    })
+                    .collect(),
                 outcome: resp.outcome,
             },
             Err(WorkerCallError::Crash(message)) => {

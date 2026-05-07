@@ -32,7 +32,8 @@ use std::io::{self, Write};
 use std::process::ExitCode;
 
 use mvm_guest::worker_protocol::{
-    WorkerCallRequest, WorkerCallResponse, WorkerOutcome, read_pipe_frame, write_pipe_frame,
+    WorkerCallRequest, WorkerCallResponse, WorkerControlRecord, WorkerOutcome, read_pipe_frame,
+    write_pipe_frame,
 };
 
 #[derive(Debug, Clone)]
@@ -44,6 +45,10 @@ enum Behavior {
     MalformedFrameOnN(u64),
     Leak50MibPerCall,
     SlowSecs(u64),
+    /// Emit one envelope-style control record per call alongside the
+    /// response. Phase 4c — exercises the new `controls` channel
+    /// end-to-end through the warm-process pool.
+    EmitControl,
 }
 
 impl Behavior {
@@ -70,6 +75,9 @@ impl Behavior {
         }
         if let Some(n) = raw.strip_prefix("slow_secs=") {
             return Behavior::SlowSecs(n.parse().expect("slow_secs value"));
+        }
+        if raw == "emit_control" {
+            return Behavior::EmitControl;
         }
         panic!("unknown MVM_FAKE_RUNNER_BEHAVIOR={raw}");
     }
@@ -102,6 +110,7 @@ fn main() -> ExitCode {
                 let resp = WorkerCallResponse {
                     stdout: req.stdin.clone(),
                     stderr: format!("fake_runner: call {call_no}\n").into_bytes(),
+                    controls: Vec::new(),
                     outcome: WorkerOutcome::Exit { code },
                 };
                 if let Err(e) = write_pipe_frame(&mut stdout, &resp) {
@@ -118,6 +127,7 @@ fn main() -> ExitCode {
                 let resp = WorkerCallResponse {
                     stdout: req.stdin.clone(),
                     stderr: Vec::new(),
+                    controls: Vec::new(),
                     outcome: WorkerOutcome::Exit { code: 0 },
                 };
                 if write_pipe_frame(&mut stdout, &resp).is_err() {
@@ -139,6 +149,7 @@ fn main() -> ExitCode {
                 let resp = WorkerCallResponse {
                     stdout: req.stdin.clone(),
                     stderr: Vec::new(),
+                    controls: Vec::new(),
                     outcome: WorkerOutcome::Exit { code: 0 },
                 };
                 if write_pipe_frame(&mut stdout, &resp).is_err() {
@@ -160,6 +171,7 @@ fn main() -> ExitCode {
                 let resp = WorkerCallResponse {
                     stdout: req.stdin.clone(),
                     stderr: Vec::new(),
+                    controls: Vec::new(),
                     outcome: WorkerOutcome::Exit { code: 0 },
                 };
                 if write_pipe_frame(&mut stdout, &resp).is_err() {
@@ -177,6 +189,7 @@ fn main() -> ExitCode {
                 let resp = WorkerCallResponse {
                     stdout: req.stdin.clone(),
                     stderr: Vec::new(),
+                    controls: Vec::new(),
                     outcome: WorkerOutcome::Exit { code: 0 },
                 };
                 if write_pipe_frame(&mut stdout, &resp).is_err() {
@@ -188,6 +201,25 @@ fn main() -> ExitCode {
                 let resp = WorkerCallResponse {
                     stdout: req.stdin.clone(),
                     stderr: Vec::new(),
+                    controls: Vec::new(),
+                    outcome: WorkerOutcome::Exit { code: 0 },
+                };
+                if write_pipe_frame(&mut stdout, &resp).is_err() {
+                    return ExitCode::from(2);
+                }
+            }
+            Behavior::EmitControl => {
+                let resp = WorkerCallResponse {
+                    stdout: req.stdin.clone(),
+                    // stderr stays as opaque user output — proves the
+                    // host can't be tricked into reparsing stderr as
+                    // an envelope (the spoof gadget Phase 4c
+                    // eliminates).
+                    stderr: b"MVMFORGE_ENVELOPE: this-must-not-be-parsed\n".to_vec(),
+                    controls: vec![WorkerControlRecord {
+                        header_json: format!(r#"{{"kind":"envelope","call":{call_no}}}"#),
+                        payload: Vec::new(),
+                    }],
                     outcome: WorkerOutcome::Exit { code: 0 },
                 };
                 if write_pipe_frame(&mut stdout, &resp).is_err() {

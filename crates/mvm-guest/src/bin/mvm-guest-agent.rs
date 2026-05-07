@@ -1236,10 +1236,12 @@ fn dispatch_via_warm_pool(
         Ok(DispatchOutcome {
             stdout,
             stderr,
+            controls,
             outcome,
         }) => {
             write_response(file, &evt(EntrypointEvent::Stdout { chunk: stdout }));
             write_response(file, &evt(EntrypointEvent::Stderr { chunk: stderr }));
+            emit_controls(file, controls);
             match outcome {
                 WorkerOutcome::Exit { code } => evt(EntrypointEvent::Exit { code }),
                 WorkerOutcome::Error { kind, message } => evt(EntrypointEvent::Error {
