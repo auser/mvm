@@ -146,6 +146,23 @@ pub enum LocalAuditKind {
     /// `mvmctl cache prune --orphan-builds`. The detail field carries
     /// the count and (for small sweeps) the truncated slot hashes.
     SlotPrune,
+    // --- mvmctl session verbs (plan 51) ---
+    /// `mvmctl session start <workload>` created a new session record
+    /// at `~/.mvm/sessions/<id>.json`. Detail carries `session_id`
+    /// and `workload_id`.
+    SessionStart,
+    /// `mvmctl session stop <id>` removed a session record. Detail
+    /// carries `session_id`. Idempotent — emitted even if the record
+    /// didn't exist (so the audit trail records the *attempt*).
+    SessionStop,
+    /// `mvmctl session set-timeout <secs> <id>` changed the
+    /// `idle_timeout_secs` of a session. Detail carries the old +
+    /// new values clamped to `[1, 86400]`.
+    SessionSetTimeout,
+    /// `mvmctl session kill <id>` flipped a session's status to
+    /// `Killed`. Inflight invokes against the session resolve as
+    /// failures with `kind = "session-killed"`.
+    SessionKill,
 }
 
 /// A single local audit log entry.

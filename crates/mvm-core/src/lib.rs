@@ -8,6 +8,7 @@ pub mod dev_network;
 pub mod migration;
 pub mod naming;
 pub mod observability;
+pub mod session;
 pub mod user_config;
 
 pub mod domain;
