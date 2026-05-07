@@ -144,8 +144,10 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         anyhow::bail!("guest agent did not become reachable within 30s");
     }
 
-    // Run the call.
-    let dispatch_result = dispatch(&vm.vm_name, stdin_bytes, args.timeout);
+    // Run the call. Pass the session id so a transport drop coincident
+    // with `mvmctl session kill` is attributed as `SessionKilled`
+    // rather than a generic I/O error.
+    let dispatch_result = dispatch(&vm.vm_name, stdin_bytes, args.timeout, session_id.as_ref());
 
     // Tear down lifecycle:
     //   - default: kill the VM and drop the session record (matches
@@ -258,12 +260,40 @@ pub(in crate::commands) fn read_stdin_payload(spec: Option<&str>) -> Result<Vec<
 /// the wrapper's exit code, or a non-zero placeholder on agent-side
 /// errors. The placeholders reuse standard Unix conventions:
 /// `124` for timeout (matching `timeout(1)`), `137` for SIGKILL
-/// (8+9), `1` for everything else.
+/// (8+9), `142` for session-killed, `1` for everything else.
+///
+/// `session_id` (when present) is consulted on transport-level
+/// errors: if the session record now reads `state = Killed`, the
+/// transport drop is attributed to the kill and `dispatch` returns
+/// the SessionKilled exit code (142) instead of propagating the raw
+/// I/O error. This is host-side synthesis — the agent itself can't
+/// emit `SessionKilled` because by the time the kill takes effect
+/// it's already going down.
 pub(in crate::commands) fn dispatch(
     vm_name: &str,
     stdin: Vec<u8>,
     timeout_secs: u64,
+    session_id: Option<&mvm_core::session::SessionId>,
 ) -> Result<i32> {
+    match dispatch_inner(vm_name, stdin, timeout_secs) {
+        Ok(code) => Ok(code),
+        Err(err) => {
+            if let Some(id) = session_id
+                && let Ok(Some(rec)) = mvm_core::session::read_session(id)
+                && rec.state == mvm_core::session::SessionState::Killed
+            {
+                let event = mvm_guest::vsock::EntrypointEvent::Error {
+                    kind: mvm_guest::vsock::RunEntrypointError::SessionKilled,
+                    message: format!("session {id} killed externally"),
+                };
+                return Ok(exit_code_for(&event));
+            }
+            Err(err)
+        }
+    }
+}
+
+fn dispatch_inner(vm_name: &str, stdin: Vec<u8>, timeout_secs: u64) -> Result<i32> {
     let transport = mvm_runtime::vsock_transport::for_vm(vm_name)
         .with_context(|| format!("Picking transport for guest agent on '{vm_name}'"))?;
     let mut stream = transport
@@ -328,6 +358,11 @@ fn exit_code_for(event: &mvm_guest::vsock::EntrypointEvent) -> i32 {
                 RunEntrypointError::PayloadCap => (1, "payload cap exceeded"),
                 RunEntrypointError::WrapperCrashed => (137, "wrapper crashed"),
                 RunEntrypointError::EntrypointInvalid => (1, "entrypoint invalid"),
+                // 142 = 128 + SIGALRM (14). The signal-style mapping
+                // matches `WrapperCrashed`'s 137 = 128 + SIGKILL (9)
+                // pattern; SIGALRM is repurposed here as a stable
+                // "your session was reaped" signal SDKs can match on.
+                RunEntrypointError::SessionKilled => (142, "session killed"),
                 RunEntrypointError::InternalError => (1, "internal error"),
             };
             ui::warn(&format!("invoke: {label}: {message}"));
@@ -378,6 +413,18 @@ mod tests {
     }
 
     #[test]
+    fn test_exit_code_session_killed_maps_to_142() {
+        // 142 = 128 + SIGALRM (14) — stable signal-style exit code
+        // SDKs match on to distinguish "session killed externally"
+        // from "wrapper crashed" (137 = 128 + SIGKILL).
+        let evt = mvm_guest::vsock::EntrypointEvent::Error {
+            kind: mvm_guest::vsock::RunEntrypointError::SessionKilled,
+            message: "killed".into(),
+        };
+        assert_eq!(exit_code_for(&evt), 142);
+    }
+
+    #[test]
     fn test_exit_code_busy_payload_invalid_internal_all_map_to_1() {
         use mvm_guest::vsock::RunEntrypointError as E;
         for kind in [
@@ -386,6 +433,7 @@ mod tests {
             E::EntrypointInvalid,
             E::InternalError,
         ] {
+            // SessionKilled is excluded — has its own dedicated exit code.
             let evt = mvm_guest::vsock::EntrypointEvent::Error {
                 kind,
                 message: "x".into(),
