@@ -11,6 +11,7 @@ pub(super) mod logs;
 pub(super) mod pause;
 pub(super) mod proc;
 pub(super) mod ps;
+pub(super) mod session;
 pub(super) mod set_ttl;
 pub(super) mod up;
 pub(super) mod volume;
