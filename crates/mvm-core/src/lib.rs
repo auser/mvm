@@ -5,6 +5,7 @@ pub mod build_env;
 pub mod catalog;
 pub mod config;
 pub mod dev_network;
+pub mod metering;
 pub mod migration;
 pub mod naming;
 pub mod observability;
