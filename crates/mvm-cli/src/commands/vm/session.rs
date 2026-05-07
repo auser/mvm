@@ -29,7 +29,8 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args as ClapArgs, Subcommand};
 
-use mvm_core::session::{self, SessionId, SessionState};
+use mvm_core::audit::{LocalAuditKind, emit as audit_emit};
+use mvm_core::session::{self, MAX_IDLE_TIMEOUT_SECS, SessionId, SessionState};
 use mvm_core::user_config::MvmConfig;
 
 use super::Cli;
@@ -248,6 +249,14 @@ pub(in crate::commands) fn reap_expired_sessions(verbose: bool) -> Vec<SessionId
             tracing::warn!(session = %id, err = %e, "reap: failed to mark Reaped");
             continue;
         }
+        audit_emit(
+            LocalAuditKind::SessionReap,
+            Some(&record.vm_name),
+            Some(&format!(
+                "session={id},idle_timeout_secs={}",
+                record.idle_timeout_secs
+            )),
+        );
         if verbose {
             println!("{id}");
         }
@@ -324,6 +333,11 @@ fn cmd_kill(args: KillArgs) -> Result<()> {
         vm_name: record.vm_name.clone(),
     });
 
+    audit_emit(
+        LocalAuditKind::SessionKill,
+        Some(&record.vm_name),
+        Some(&format!("session={id}")),
+    );
     ui::info(&format!("Killed session {id} (vm {})", record.vm_name));
     Ok(())
 }
@@ -331,6 +345,16 @@ fn cmd_kill(args: KillArgs) -> Result<()> {
 fn cmd_set_timeout(args: SetTimeoutArgs) -> Result<()> {
     if args.seconds == 0 {
         bail!("--seconds must be > 0");
+    }
+    if args.seconds > MAX_IDLE_TIMEOUT_SECS {
+        bail!(
+            "--seconds {} exceeds the {}s hard ceiling (24h). \
+             Long-running sessions are a foot-gun: extend periodically with \
+             repeated `mvmctl session set-timeout` calls, or split work \
+             across shorter-lived sessions.",
+            args.seconds,
+            MAX_IDLE_TIMEOUT_SECS
+        );
     }
     let id = SessionId::parse(&args.session_id)
         .with_context(|| format!("Invalid session id: {:?}", args.session_id))?;
@@ -425,6 +449,11 @@ fn cmd_attach(args: AttachArgs) -> Result<()> {
         "attach: dispatching into session {id} (vm {})",
         record.vm_name
     ));
+    audit_emit(
+        LocalAuditKind::SessionAttach,
+        Some(&record.vm_name),
+        Some(&format!("session={id}")),
+    );
     let exit_code = super::invoke::dispatch(&record.vm_name, stdin_bytes, args.timeout, Some(&id))
         .with_context(|| format!("dispatching into session {id}"))?;
 
@@ -451,6 +480,16 @@ fn cmd_exec(args: ExecArgs) -> Result<()> {
     if args.argv.is_empty() {
         bail!("exec requires at least one argv element after `--`");
     }
+    // Audit-log the dispatch BEFORE we run user-supplied argv so the
+    // log line lands even if the call hangs / panics. We deliberately
+    // don't include the argv content in `detail` — it can carry user-
+    // typed secrets (auth tokens, env-shaped flags). The `vm_name`
+    // + `session=<id>` correlation is enough to attribute access.
+    audit_emit(
+        LocalAuditKind::SessionExec,
+        Some(&record.vm_name),
+        Some(&format!("session={id}")),
+    );
     // Rebuild the shell command from argv. Shell-quote each element so
     // an embedded space or quote in user-provided args doesn't get
     // re-tokenized by bash.
@@ -467,6 +506,13 @@ fn cmd_run_code(args: RunCodeArgs) -> Result<()> {
     let (id, record) = require_running_session(&args.session_id)?;
     require_dev_mode(&id, &record, "run-code")?;
 
+    // Audit BEFORE dispatch — same rationale as cmd_exec. Code body
+    // is omitted from `detail` for the same secrecy reason.
+    audit_emit(
+        LocalAuditKind::SessionRunCode,
+        Some(&record.vm_name),
+        Some(&format!("session={id}")),
+    );
     // v1: dispatch as a shell command. v2 (deferred) will route
     // `run-code` through a dedicated wrapper-runtime verb so the code
     // executes in the wrapper's interpreter (Python, Node, etc.) with
@@ -562,6 +608,19 @@ fn rfc3339_now() -> String {
 fn cmd_start(args: StartArgs) -> Result<()> {
     use mvm_core::session::{SessionMode, SessionRecord};
 
+    if args.idle_timeout == 0 {
+        bail!("--idle-timeout must be > 0");
+    }
+    if args.idle_timeout > MAX_IDLE_TIMEOUT_SECS {
+        bail!(
+            "--idle-timeout {} exceeds the {}s hard ceiling (24h). \
+             Use `mvmctl session set-timeout` to extend periodically \
+             instead of opting in to an unbounded keepalive.",
+            args.idle_timeout,
+            MAX_IDLE_TIMEOUT_SECS
+        );
+    }
+
     // Resolve the manifest argument the same way `mvmctl invoke` does.
     let template_id = match super::shared::resolve_manifest_arg(&args.manifest)? {
         super::shared::ManifestArgRef::Name(n) => n,
@@ -607,6 +666,14 @@ fn cmd_start(args: StartArgs) -> Result<()> {
         "session ready: id={id} vm={} mode={mode} idle_timeout={}s",
         vm.vm_name, args.idle_timeout
     ));
+    audit_emit(
+        LocalAuditKind::SessionStart,
+        Some(&vm.vm_name),
+        Some(&format!(
+            "session={id},template={template_id},mode={mode},idle_timeout_secs={}",
+            args.idle_timeout
+        )),
+    );
     // Session id on stdout (separate stream from the human-readable
     // ui::info) so SDK callers can capture it cleanly.
     println!("{id}");
@@ -640,6 +707,17 @@ fn cmd_console(args: ConsoleArgs) -> Result<()> {
         "session console: attaching to session {id} (vm {})",
         record.vm_name
     ));
+    audit_emit(
+        LocalAuditKind::SessionConsoleOpen,
+        Some(&record.vm_name),
+        Some(&format!("session={id}")),
+    );
+    // The underlying `console_interactive` already emits
+    // `ConsoleSessionStart` / `ConsoleSessionEnd` audit events for the
+    // PTY lifecycle — this `SessionConsoleOpen` event is the
+    // session-id correlation: the PTY events alone don't tell a
+    // forensics consumer which `mvmctl session` invocation opened
+    // them, but `vm_name` is shared so a join recovers the chain.
     super::console::console_interactive(&record.vm_name)
         .with_context(|| format!("opening console for session {id}"))
 }
@@ -708,6 +786,40 @@ mod tests {
             err.to_string().contains("must be > 0"),
             "expected zero-seconds error, got: {err}"
         );
+    }
+
+    #[test]
+    fn set_timeout_above_ceiling_is_rejected() {
+        let _guard = isolated_runtime_dir();
+        let id = SessionId::new().to_string();
+        let err = cmd_set_timeout(SetTimeoutArgs {
+            session_id: id,
+            seconds: MAX_IDLE_TIMEOUT_SECS + 1,
+        })
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("ceiling"),
+            "expected ceiling error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn set_timeout_at_exactly_ceiling_is_accepted() {
+        let _guard = isolated_runtime_dir();
+        let rec = session::SessionRecord::new_running("vm-1", "wl", session::SessionMode::Prod);
+        let id = rec.id.to_string();
+        session::write_session(&rec).unwrap();
+        // The dispatch-to-vsock part will warn (no real VM) but the
+        // record update happens first and shouldn't fail at the
+        // ceiling boundary.
+        cmd_set_timeout(SetTimeoutArgs {
+            session_id: id.clone(),
+            seconds: MAX_IDLE_TIMEOUT_SECS,
+        })
+        .unwrap();
+        let parsed = SessionId::parse(&id).unwrap();
+        let reread = session::read_session(&parsed).unwrap().unwrap();
+        assert_eq!(reread.idle_timeout_secs, MAX_IDLE_TIMEOUT_SECS);
     }
 
     #[test]

@@ -31,6 +31,16 @@ use serde::{Deserialize, Serialize};
 /// Default idle timeout for newly-created sessions (5 minutes).
 pub const DEFAULT_IDLE_TIMEOUT_SECS: u64 = 300;
 
+/// Hard ceiling on idle timeout — 24 hours.
+///
+/// A session held open longer than this is almost certainly a forgotten
+/// `--keep-alive` rather than an intentional long-running workload.
+/// Refusing values past the ceiling is a foot-gun guard, not a hard
+/// security boundary — operators with a legitimate need can call
+/// `mvmctl session set-timeout` periodically to extend, or use
+/// `mvmctl session reap` selectively.
+pub const MAX_IDLE_TIMEOUT_SECS: u64 = 86_400;
+
 /// Opaque session identifier — base32-encoded random bytes.
 ///
 /// Construction goes through [`SessionId::new`] which uses 16 random

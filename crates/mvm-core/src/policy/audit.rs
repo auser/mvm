@@ -146,6 +146,40 @@ pub enum LocalAuditKind {
     /// `mvmctl cache prune --orphan-builds`. The detail field carries
     /// the count and (for small sweeps) the truncated slot hashes.
     SlotPrune,
+    // --- Phase 5 session lifecycle (post-fd-3-fix audit posture) ---
+    //
+    // Dev sessions hold a long-lived microVM with PTY / shell-exec
+    // surface available behind the session id. The session id IS the
+    // capability: anyone with read access to
+    // `$XDG_RUNTIME_DIR/mvm/sessions/<id>.json` can attach. Every
+    // dev-shell entry point therefore lands in the audit log so a
+    // forensics pass can reconstruct who-attached-when even after
+    // the session record is reaped.
+    /// `mvmctl session start <template>` registered a new session.
+    /// Detail: `mode=prod|dev,template=<id>,session=<id>`.
+    SessionStart,
+    /// `mvmctl session attach <id>` dispatched a `RunEntrypoint`
+    /// call into an existing session. Detail: `session=<id>`.
+    SessionAttach,
+    /// `mvmctl session exec <id> -- <argv>` ran an ad-hoc shell
+    /// command in a dev session. Detail: `session=<id>` (argv is
+    /// **not** logged — could contain user-typed secrets).
+    SessionExec,
+    /// `mvmctl session run-code <id> <code>` ran user-supplied code
+    /// in a dev session. Detail: `session=<id>` (code is **not**
+    /// logged — same secrecy concern as exec argv).
+    SessionRunCode,
+    /// `mvmctl session console <id>` opened an interactive PTY into
+    /// a dev session. Pair with `ConsoleSessionEnd` (already
+    /// emitted) for the close edge. Detail: `session=<id>`.
+    SessionConsoleOpen,
+    /// `mvmctl session kill <id>` terminated a session. Detail:
+    /// `session=<id>`.
+    SessionKill,
+    /// `mvmctl session reap` (or the lazy host-side reaper running
+    /// inside another session verb) tore down an idle session.
+    /// Detail: `session=<id>,idle_timeout_secs=<n>`.
+    SessionReap,
 }
 
 /// A single local audit log entry.
@@ -541,6 +575,14 @@ mod tests {
             LocalAuditKind::CachePrune,
             LocalAuditKind::SlotRemove,
             LocalAuditKind::SlotPrune,
+            // Phase 5 session lifecycle.
+            LocalAuditKind::SessionStart,
+            LocalAuditKind::SessionAttach,
+            LocalAuditKind::SessionExec,
+            LocalAuditKind::SessionRunCode,
+            LocalAuditKind::SessionConsoleOpen,
+            LocalAuditKind::SessionKill,
+            LocalAuditKind::SessionReap,
         ];
         for kind in kinds {
             let json = serde_json::to_string(&kind).unwrap();
@@ -563,6 +605,13 @@ mod tests {
             (LocalAuditKind::CachePrune, "cache_prune"),
             (LocalAuditKind::SlotRemove, "slot_remove"),
             (LocalAuditKind::SlotPrune, "slot_prune"),
+            (LocalAuditKind::SessionStart, "session_start"),
+            (LocalAuditKind::SessionAttach, "session_attach"),
+            (LocalAuditKind::SessionExec, "session_exec"),
+            (LocalAuditKind::SessionRunCode, "session_run_code"),
+            (LocalAuditKind::SessionConsoleOpen, "session_console_open"),
+            (LocalAuditKind::SessionKill, "session_kill"),
+            (LocalAuditKind::SessionReap, "session_reap"),
         ];
         for (kind, expected) in kinds_and_strings {
             let json = serde_json::to_string(&kind).unwrap();
