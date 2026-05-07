@@ -60,6 +60,19 @@ export default defineConfig({
           ],
         },
         {
+          label: "Security",
+          items: [
+            { label: "Matryoshka Model", slug: "security/matryoshka" },
+          ],
+        },
+        {
+          label: "Deploy",
+          items: [
+            { label: "AWS EC2", slug: "deploy/aws" },
+            { label: "Ubicloud", slug: "deploy/ubicloud" },
+          ],
+        },
+        {
           label: "Reference",
           items: [
             { label: "CLI Commands", slug: "reference/cli-commands" },

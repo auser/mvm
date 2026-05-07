@@ -189,6 +189,28 @@ mvmctl up --flake . --hypervisor qemu    # microvm.nix
 mvmctl doctor   # check available backends
 ```
 
+### No `/dev/kvm` available (cloud VMs without nested virt)
+
+Hitting `KVM not available` on a cloud instance? Three options, in order of recommendation.
+
+**Option 1 — Switch to a nested-virt instance type.** Most cloud providers added nested KVM in 2025–2026. After moving to one of these, Firecracker runs natively and you get full Tier 1 isolation:
+
+| Provider | Nested-virt instance families |
+|---|---|
+| AWS | C8i / M8i / R8i (Feb 2026 onward) — e.g. `c8i.4xlarge` |
+| GCE | n2 with `--enable-nested-virtualization` |
+| Azure | Dasv5 / Easv5 |
+
+**Option 2 — Use the Tier 3 Docker fallback.** Works in any environment with Docker Engine. **Reduced security tier** — see the [Matryoshka model](/security/matryoshka). The L1–L3 layers collapse to the host kernel, so claims 1, 2, and 3 do not hold. Use only for non-security-sensitive workloads (CI scratch, local experiments).
+
+```bash
+mvmctl up --flake . --hypervisor docker
+# Suppress the per-run banner once you've acknowledged the tier:
+export MVM_ACK_DOCKER_TIER=1
+```
+
+**Option 3 — PVM (advanced, external).** [SlicerVM's PVM mode](https://docs.slicervm.com/tasks/pvm/) runs real microVMs without `/dev/kvm` via a patched Firecracker plus a `kvm_pvm` host kernel module. mvm doesn't ship this — the maintenance cost (kernel patch + custom guest images, x86_64 only) is outside mvm's scope. If you need real microVM isolation on a non-nested-virt cloud VM and Option 1 isn't available, SlicerVM is the working answer in the ecosystem today.
+
 ### Rootfs corrupted
 
 Re-run `mvmctl bootstrap` — it's idempotent and repaves any corrupted rootfs from the upstream squashfs without destroying the Lima VM:
