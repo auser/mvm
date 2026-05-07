@@ -341,6 +341,20 @@ pub enum GuestRequest {
     /// caller passes `force = true` to demand a lazy detach.
     /// (Replaces the former `UnmountShare` per plan 45 §D5.)
     UnmountVolume { guest_path: String, force: bool },
+
+    /// Update the warm-process pool's idle-recycle timeout. Workers
+    /// that have been idle (no in-flight call) longer than
+    /// `secs` are recycled at the next sweep. `secs == 0` disables
+    /// idle-based recycling — only `max_calls_per_worker` and
+    /// `max_rss_mb` triggers remain.
+    ///
+    /// This is the substrate-side mirror of `mvmctl session
+    /// set-timeout <id> <secs>`: the host writes the new value into
+    /// the session record, then dispatches this verb so the agent's
+    /// pool sees the same value. A best-effort dispatch — if the
+    /// agent is unreachable the host record still wins on the next
+    /// `mvmctl session reap`.
+    UpdateIdleTimeout { secs: u64 },
 }
 
 /// Helper for `#[serde(default = "...")]` on `bool` fields where
@@ -451,6 +465,15 @@ pub enum GuestResponse {
     /// surface; closed sub-enum carries the per-verb shape.
     /// (Renamed from `ShareResult` per plan 45 §D5.)
     VolumeMountResult(VolumeMountResult),
+
+    /// Acknowledgement for `UpdateIdleTimeout`. `applied_secs` is the
+    /// value the agent is now enforcing — `0` means the warm-process
+    /// pool isn't active on this guest (cold-path-only build), so
+    /// the host reaper is the only enforcement.
+    UpdateIdleTimeoutAck {
+        previous_secs: u64,
+        applied_secs: u64,
+    },
 }
 
 /// Result of a virtio-fs volume mount operation.
@@ -1862,6 +1885,8 @@ mod tests {
                 guest_path: "/data/foo".to_string(),
                 force: false,
             },
+            GuestRequest::UpdateIdleTimeout { secs: 600 },
+            GuestRequest::UpdateIdleTimeout { secs: 0 },
         ];
 
         for req in &variants {
@@ -2021,6 +2046,14 @@ mod tests {
                 kind: VolumeMountErrorKind::Busy,
                 message: "target busy; pass force=true".to_string(),
             }),
+            GuestResponse::UpdateIdleTimeoutAck {
+                previous_secs: 300,
+                applied_secs: 600,
+            },
+            GuestResponse::UpdateIdleTimeoutAck {
+                previous_secs: 0,
+                applied_secs: 0,
+            },
         ];
 
         for resp in &variants {
