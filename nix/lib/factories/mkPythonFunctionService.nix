@@ -65,6 +65,10 @@ let
     # 1 MiB v1 cap (mvm ADR-007 §M1). The agent enforces a hard cap
     # upstream; this is wrapper-side defense in depth.
     max_input_bytes = 1048576;
+    # Read by the agent's `RunCode` vsock verb to pick the right
+    # interpreter (`python3 -c`). Stable identifier — mvmforge's
+    # SDK and downstream tools may match on it.
+    language = "python";
   };
 
   # Substitute the canonical wrapper's `#!/usr/bin/env python3`

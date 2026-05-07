@@ -163,6 +163,27 @@ pub enum GuestRequest {
     /// agent is unreachable the host record still wins on the next
     /// `mvmctl session reap`.
     UpdateIdleTimeout { secs: u64 },
+    /// Run user-supplied source code in the wrapper's native
+    /// interpreter. Dev-only — gated behind the agent's `dev-shell`
+    /// feature flag, same fence as `Exec`. The host
+    /// (`mvmctl session run-code`) provides additional gating: the
+    /// session must be `mode=Dev`.
+    ///
+    /// The interpreter is selected by reading `/etc/mvm/wrapper.json`
+    /// at dispatch time:
+    ///   - `language = "python"` → `python3 -c <code>`
+    ///   - `language = "node"`   → `node -e <code>`
+    ///
+    /// Other values, or a missing/unparseable wrapper.json, refuse
+    /// with a wire-stable error message.
+    ///
+    /// **v1 is stateless** — each call spawns a fresh interpreter
+    /// process, so `from foo import bar` in call 1 isn't visible in
+    /// call 2. A future v2 (Plan-0010 §run-code Choice A) routes
+    /// through the warm-process pool's wrapper for stateful eval
+    /// across calls; the wire shape stays identical, the dispatch
+    /// flips inside the agent.
+    RunCode { code: String, timeout_secs: u64 },
 }
 
 /// Response from guest vsock agent to host.
@@ -1242,6 +1263,10 @@ mod tests {
             },
             GuestRequest::UpdateIdleTimeout { secs: 600 },
             GuestRequest::UpdateIdleTimeout { secs: 0 },
+            GuestRequest::RunCode {
+                code: "print('hello')".into(),
+                timeout_secs: 30,
+            },
         ];
 
         for req in &variants {

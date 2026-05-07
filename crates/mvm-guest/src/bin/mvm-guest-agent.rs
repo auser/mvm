@@ -761,6 +761,87 @@ fn do_exec(command: &str, stdin_data: Option<&str>, _timeout_secs: u64) -> Guest
     }
 }
 
+/// Read the wrapper's language from `/etc/mvm/wrapper.json`. Returns
+/// `None` if the file is missing, unparseable, or the field is
+/// absent — caller treats that as "language unknown, refuse the
+/// `RunCode` call rather than guess".
+#[cfg(feature = "dev-shell")]
+fn read_wrapper_language() -> Option<String> {
+    let raw = std::fs::read_to_string("/etc/mvm/wrapper.json").ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("language")?.as_str().map(str::to_owned)
+}
+
+/// Stateless run-code v1: dispatch a fresh interpreter subprocess
+/// with the user-supplied source on its `-c` / `-e` arg. Refuses
+/// unknown languages with a wire-stable error string. Reuses the
+/// same `/bin/sh -c` mechanics as `do_exec` for capture + truncation.
+///
+/// Plan-0010 Choice A v2 will route through the warm-process pool
+/// instead, providing stateful eval across calls. Wire shape stays
+/// identical — the dispatch flips inside this function.
+#[cfg(feature = "dev-shell")]
+fn do_run_code(code: &str, timeout_secs: u64) -> GuestResponse {
+    let lang = match read_wrapper_language() {
+        Some(l) => l,
+        None => {
+            return GuestResponse::ExecResult {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: "run-code refused: /etc/mvm/wrapper.json missing or has no \
+                         language field"
+                    .into(),
+            };
+        }
+    };
+    let interpreter = match lang.as_str() {
+        "python" => "python3",
+        "node" => "node",
+        other => {
+            return GuestResponse::ExecResult {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: format!(
+                    "run-code refused: unsupported language {:?} \
+                     (supported: python, node)",
+                    other
+                ),
+            };
+        }
+    };
+    // Build the shell command. Single-quote the code so the shell
+    // doesn't expand `$VAR` / backticks inside it; embedded single
+    // quotes get the close-quote-escape-reopen treatment.
+    let interp_flag = if interpreter == "node" { "-e" } else { "-c" };
+    let shell_command = format!(
+        "{} {} {}",
+        interpreter,
+        interp_flag,
+        shell_quote_for_sh(code)
+    );
+    do_exec(&shell_command, None, timeout_secs)
+}
+
+/// Single-quote `s` for `/bin/sh` consumption: doubles up embedded
+/// `'` as `'\''` (close-quote, escaped-quote, re-open). Mirrors
+/// `mvm_cli::commands::vm::session::shell_quote` — duplicated here
+/// rather than depending on mvm-cli to keep the agent's dependency
+/// surface lean.
+#[cfg(feature = "dev-shell")]
+fn shell_quote_for_sh(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 // ============================================================================
 // RunEntrypoint handler — ADR-007 / plan 41 W2.
 //
@@ -1417,6 +1498,27 @@ fn handle_client(
         #[cfg(not(feature = "dev-shell"))]
         GuestRequest::Exec { .. } => GuestResponse::Error {
             message: "exec not available: guest agent built without dev-shell feature".to_string(),
+        },
+
+        #[cfg(feature = "dev-shell")]
+        GuestRequest::RunCode { code, timeout_secs } => {
+            // Stateless v1: read /etc/mvm/wrapper.json to learn the
+            // wrapper's language, then dispatch a fresh interpreter
+            // subprocess. v2 (Plan-0010 Choice A) will route through
+            // the warm-process pool's persistent wrapper for stateful
+            // eval; wire shape stays identical.
+            //
+            // Code body is NOT logged (matches `mvmctl session
+            // run-code`'s host-side audit posture — argv / code can
+            // carry user-typed secrets).
+            eprintln!("[audit] run-code request");
+            do_run_code(&code, timeout_secs)
+        }
+
+        #[cfg(not(feature = "dev-shell"))]
+        GuestRequest::RunCode { .. } => GuestResponse::Error {
+            message: "run-code not available: guest agent built without dev-shell feature"
+                .to_string(),
         },
 
         GuestRequest::RunEntrypoint {
