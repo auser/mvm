@@ -1739,20 +1739,22 @@ fn handle_client(
             }
         }
 
-        // virtio-fs share mount/unmount (W1 / D). Production-safe;
-        // every host-supplied path runs through
+        // virtio-fs volume mount/unmount (plan 45 — renamed from
+        // share-mount per Path C). Production-safe; every
+        // host-supplied path runs through
         // `mvm_security::policy::MountPathPolicy` before any
-        // mount(2) syscall. Real handler lives in
-        // `mvm_guest::share`.
-        GuestRequest::MountShare {
-            tag,
+        // mount(2) syscall. Real handler lives in `mvm_guest::volume`.
+        GuestRequest::MountVolume {
+            volume_name,
             guest_path,
             read_only,
-        } => {
-            GuestResponse::ShareResult(mvm_guest::share::handle_mount(&tag, &guest_path, read_only))
-        }
-        GuestRequest::UnmountShare { guest_path, force } => {
-            GuestResponse::ShareResult(mvm_guest::share::handle_unmount(&guest_path, force))
+        } => GuestResponse::VolumeMountResult(mvm_guest::volume::handle_mount(
+            &volume_name,
+            &guest_path,
+            read_only,
+        )),
+        GuestRequest::UnmountVolume { guest_path, force } => {
+            GuestResponse::VolumeMountResult(mvm_guest::volume::handle_unmount(&guest_path, force))
         }
     };
 

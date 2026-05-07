@@ -14,9 +14,9 @@ pub mod microvm;
 pub mod microvm_nix;
 pub mod name_registry;
 pub mod network;
-pub mod share_registry;
 pub mod template;
 pub mod vminitd_client;
+pub mod volume_registry;
 
 /// Crate-wide test serialization for tests that mutate
 /// `MVM_DATA_DIR` (and thus rely on a process-global env var).

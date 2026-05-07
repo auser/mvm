@@ -239,6 +239,22 @@
               # `mkNodeFunctionService` factories will set
               # this from the IR.
               extraFiles ? { },
+              # Plan 45 §"Nix semantics alignment" — declarative
+              # volume mount declarations. Each entry is
+              # `"<absolute-guest-path>" = { volume :: str; readOnly ? false; }`.
+              # Surfaced as `passthru.volumeMounts` (a list of
+              # `{ guestPath, volumeName, readOnly }`) so the host
+              # (mvmctl / mvmd) can `nix eval` the derivation and
+              # arrange virtio-fs mounts at boot via the
+              # `MountVolume` vsock verb.
+              #
+              # Validation:
+              # - guest_path must be absolute and not under /nix*.
+              # - volume must be a non-empty string ≤32 chars.
+              # The host-side `mvm_security::policy::MountPathPolicy`
+              # re-validates at runtime (defence-in-depth) — these
+              # eval-time checks fail fast for bad flake input.
+              volumeMounts ? { },
             }:
             assert pkgs.lib.assertOneOf "variant" variant [
               "prod"
@@ -262,6 +278,27 @@
             # instead of producing a runtime kernel panic at boot.
             assert pkgs.lib.assertMsg ((variant == "dev") -> !verifiedBoot)
               "mkGuest: variant=\"dev\" cannot compose with verifiedBoot=true; the dev VM's writable /nix overlay conflicts with dm-verity (ADR-002 §W3.4 / plan 36)";
+            # Plan 45 — validate volumeMounts attrset shape. Eval-time
+            # checks here catch malformed flake input; the host's
+            # MountPathPolicy runs the full deny-list (Nix paths,
+            # /etc, /usr, ...) at boot.
+            assert pkgs.lib.assertMsg (
+              builtins.all (
+                gp:
+                pkgs.lib.hasPrefix "/" gp
+                && !pkgs.lib.hasPrefix "/nix" gp
+                && !pkgs.lib.hasPrefix "/run/booted-system" gp
+                && !pkgs.lib.hasPrefix "/run/current-system" gp
+              ) (builtins.attrNames volumeMounts)
+            ) "mkGuest.volumeMounts: every guest path must be absolute and outside /nix*, /run/booted-system, /run/current-system (plan 45 §\"Nix semantics alignment\")";
+            assert pkgs.lib.assertMsg (
+              builtins.all (
+                v:
+                builtins.isString (v.volume or null)
+                && builtins.stringLength (v.volume or "") > 0
+                && builtins.stringLength (v.volume or "") <= 32
+              ) (builtins.attrValues volumeMounts)
+            ) "mkGuest.volumeMounts: every entry must have `volume` :: non-empty string ≤32 chars (plan 45 §\"Nix semantics alignment\")";
             let
               # Compose `<pkg>/bin` for every caller-supplied package so
               # PID 1's PATH can find them. Without this, packages live in
@@ -437,7 +474,19 @@
             in
             pkgs.runCommand "mvm-${name}-${variant}"
               {
-                passthru = { inherit variant role; };
+                passthru = {
+                  inherit variant role;
+                  # Plan 45 §"Nix semantics alignment": expose
+                  # declared volume mounts as a stable list so
+                  # `nix eval .#mvm-<name>.passthru.volumeMounts`
+                  # gives the host a machine-readable mount
+                  # manifest. Empty list when none declared.
+                  volumeMounts = pkgs.lib.mapAttrsToList (guestPath: spec: {
+                    inherit guestPath;
+                    volumeName = spec.volume;
+                    readOnly = spec.readOnly or false;
+                  }) volumeMounts;
+                };
               }
               (
                 ''

@@ -35,6 +35,11 @@ pub const DEFAULT_MOUNT_ALLOW_ROOTS: &[&str] = &["/mnt", "/data", "/work"];
 /// a separate check in `validate` — `Path::starts_with("/")` is
 /// trivially true for every absolute path, so listing `/` here
 /// would block everything.
+///
+/// **Nix-immutable paths** (`/nix`, `/run/booted-system`,
+/// `/run/current-system`) are denied per plan 45 §"Nix semantics
+/// alignment" — the Nix store is content-addressed and
+/// reproducibility-critical; volumes must never overlay it.
 pub const DEFAULT_MOUNT_DENY_PREFIXES: &[&str] = &[
     "/etc",
     "/usr",
@@ -49,6 +54,10 @@ pub const DEFAULT_MOUNT_DENY_PREFIXES: &[&str] = &[
     "/dev",
     "/run/mvm-secrets",
     "/run/mvm-etc",
+    // Nix-immutable paths (plan 45 §"Nix semantics alignment").
+    "/nix",
+    "/run/booted-system",
+    "/run/current-system",
 ];
 
 /// Reasons the mount-path policy rejects a candidate path.
@@ -297,6 +306,12 @@ mod tests {
             "/dev/null",
             "/run/mvm-secrets/foo",
             "/run/mvm-etc/passwd",
+            // Nix-immutable paths (plan 45 §"Nix semantics alignment").
+            "/nix",
+            "/nix/store/abc123-pkg",
+            "/nix/var/log",
+            "/run/booted-system/sw/bin/sh",
+            "/run/current-system/etc/profile",
         ] {
             let err = validate_mount_path(path).unwrap_err();
             assert!(
@@ -304,6 +319,17 @@ mod tests {
                 "expected Denied for {path:?}, got {err:?}",
             );
         }
+    }
+
+    #[test]
+    fn nix_paths_denied_segment_aware() {
+        // `/nixos` is not a child of `/nix` — the deny match must
+        // honour path-segment boundaries.
+        let err = validate_mount_path("/nixos").unwrap_err();
+        assert!(
+            matches!(err, MountPathError::OutsideAllowRoots { .. }),
+            "expected OutsideAllowRoots for /nixos (not a /nix child), got {err:?}",
+        );
     }
 
     #[test]

@@ -807,6 +807,51 @@ suspicious.
 - Native-Windows microVMs via Cloud Hypervisor + WHPX (depends on Plan F).
 - Eliminating Lima from the macOS *build* path (libkrun solves runtime only; build-on-host is future work).
 
+## Sprint 49 — Filesystem Volumes for e2b parity (in flight)
+
+Branch: [`feat/sprint-46-filesystem-volumes`](https://github.com/tinylabscom/mvm/tree/feat/sprint-46-filesystem-volumes) — branch name preserved for PR continuity; the sprint itself was relabeled from 46 to 49 during merge to disambiguate from Sprint 46 (cross-platform foundation, already merged via #97).
+Plan: [`plans/45-filesystem-volumes-e2b-parity.md`](plans/45-filesystem-volumes-e2b-parity.md).
+mvmd companion: [`mvmd/specs/plans/29-filesystem-volumes-e2b-parity.md`](../../mvmd/specs/plans/29-filesystem-volumes-e2b-parity.md).
+
+### Why this sprint
+
+mvm's in-flight share registry (untracked on `feat/sandbox-sdk-foundation`) does not match e2b's documented Volume primitive shape: e2b volumes are **named, multi-attach, filesystem-semantics**. We replace the share registry with a `Volume` primitive that ships in mvm-core (wire types) plus a new `mvm-storage` crate (trait + impls for `LocalBackend` + `ObjectStoreBackend` via `opendal`, with mandatory `EncryptedBackend<B>` decorator). mvmd consumes `mvm-storage` via the `mvmctl` git facade and reconciles with its existing `StorageBucket` primitive (see Plan 45 §"Discoveries during implementation" D1).
+
+### Workstream breakdown (mvm-side, post-D5 / Path C)
+
+- **W-Volume — local volume primitive** (Phase 1, 5, 6, 8): `mvm-core` wire types + `mvm-storage` minimal crate (trait + `LocalBackend` only) + `volume_registry.rs` + `mvmctl volume create/ls/rm` (local) + `MountPathPolicy` extension for Nix paths.
+- **W-Mount-API — declarative mount at boot** (Phase 7, 10): `mvmctl up --volume <name>:<path>` + `MountVolume`/`UnmountVolume` vsock verbs + `mkGuest.volumeMounts` Nix attrset.
+- **W-RemoteClient — `--remote` proxy to mvmd** (new, replaces the dropped W-DataPlane): small `mvmctl::mvmd_client` module (~50–100 LoC, uses workspace `reqwest`). Supports `volume create|ls|rm|cp|read|write|attach|detach|snapshot create|snapshot ls|snapshot restore` against mvmd REST. `~/.mvm/config.toml` `[remote]` section: `endpoint`, `api_key_ref`, `default_org`, `default_workspace`. All optional.
+- **W-Doctor — FDE check** (Phase 9): `mvmctl doctor` reports FileVault/LUKS state. **Warns** on dev box (no enforcement); mvmd enforces hard-block on workers.
+- **Out-of-scope on mvm side (per D5, moved to mvmd Sprint 137 W2)**: `ObjectStoreBackend` impl, `EncryptedBackend<B>` decorator, AES-256-GCM / AES-SIV / HKDF crypto code, `opendal` dep — all live in mvmd.
+
+### Cross-repo dependency
+
+mvmd Sprint 29 (`mvmd/specs/plans/29-filesystem-volumes-e2b-parity.md`) follows mvm Plan 45 phases 1-3 landing on `main`. mvmd consumes `mvmctl::storage` via the existing git workspace dep. Decision blocker on the mvmd side: extend `StorageBucket` (recommended) vs. add parallel `FilesystemVolume` — see Plan 45 §D1.
+
+### Sprint 49 success criteria (post-D5 / Path C)
+
+- mvm `volume` CLI replaces `share` CLI with no compat shim (greenfield rename, in-flight share files deleted).
+- `mvmctl volume create scratch` (local) round-trips: VM boot with `--volume scratch:/mnt/scratch`; write file from guest; tear down VM; reboot; reattach; file persists. Plus multi-attach proof (two local VMs see same file).
+- `mvmctl volume create fixtures --remote --backend s3 --url s3://...` proxies through mvmd REST and returns 200; data plane via `--remote` round-trips against MinIO (mvmd-side integration test, not mvm-side — covered in mvmd Sprint 137 W2).
+- `mvmctl doctor` reports FDE state (warns on non-FDE; mvmd-side hard-block tested separately).
+- Path safety: `volume cp ../etc/passwd …` rejected; `/nix*` mount denied by `MountPathPolicy`.
+- `cargo test --workspace` and `cargo clippy --workspace -- -D warnings` clean.
+- All `prod-agent-no-exec`, `cargo deny`, `cargo audit`, fuzz-corpus CI gates green.
+- `mvm-storage` crate has minimal deps: `tokio`, `bytes`, `async-trait`, `mvm-core`, `mvm-security`. **No `opendal`, no AEAD crates** — those land in mvmd Sprint 137 W2.
+
+### Phasing
+
+Phases 1-10 in Plan 45's "Implementation order" map to mvm-side work and are all shipped (mvm-core types, `mvm-storage` crate, runtime registry, CLI subcommand, guest vsock verbs, security policy, doctor FDE check, mkGuest extension). Phases 13-18 are mvmd-side (covered in mvmd Sprint 137). Phase 11 (live KVM smoke) is deferred to [Plan 58](plans/58-filesystem-volumes-live-kvm-smoke.md) because it requires real KVM hardware — the deferral is documented so the work isn't lost when Sprint 49 closes.
+
+### Non-goals (named explicitly, see Plan 45 §"Out of scope (v1)")
+
+B1–B18 in Plan 45 §"Out of scope (v1)" — buckets-as-separate-primitive, cross-host backends (NFS/CephFs), mountable provider-backed volumes, hot attach/detach, cross-workspace ACL grants, volume export/import, tags/labels, soft-delete, read cache, webhooks, `data_disk` (plan 38), scheduler volume-affinity, per-volume LUKS, strong-consistency snapshots, HSM/KMS-backed master keys, compression/dedup, usage analytics. Each is preserved in Plan 45 with what/why/trigger so they can be picked up in future sprints.
+
+### Live-KVM smoke (Phase 11 → [Plan 58](plans/58-filesystem-volumes-live-kvm-smoke.md))
+
+Plan 45 Phase 11 (live KVM smoke fixture) deferred to its own plan 58 — needs a KVM-capable host that no longer fits in a software-only PR. Plan 58 captures the six scenarios (single-VM round-trip, persistence, multi-attach, RO enforcement, scope isolation, Nix-path denial) so the work isn't lost when Sprint 49 closes. (Numbered 58 because plan 46 was already taken by the metering-API work merged in #89.)
+
 ## Completed Sprints
 
 - [01-foundation.md](sprints/01-foundation.md)

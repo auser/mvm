@@ -55,6 +55,42 @@ mvmctl uses Nix flakes to produce reproducible microVM images. Each build runs `
 | `healthChecks.<name>.healthCmd` | Health check command (exit 0 = healthy) |
 | `healthChecks.<name>.healthIntervalSecs` | How often to run the check (default: 30) |
 | `healthChecks.<name>.healthTimeoutSecs` | Timeout for each check (default: 10) |
+| `volumeMounts."<guest-path>"` | Plan 45 — declarative virtio-fs volume mount declarations. See "Volume Mounts" below. |
+
+## Volume Mounts
+
+`volumeMounts` declares which virtio-fs volumes the guest expects at boot. Each entry maps an absolute guest path to a volume name and read-only flag:
+
+```nix
+mkGuest {
+  name = "worker";
+  packages = with pkgs; [ python311 ];
+  volumeMounts = {
+    "/mnt/work"   = { volume = "workspace"; readOnly = false; };
+    "/mnt/inputs" = { volume = "fixtures"; readOnly = true; };
+  };
+}
+```
+
+The host (`mvmctl up` or mvmd) reads these declarations via `passthru.volumeMounts`:
+
+```sh
+nix eval .#mvm-worker.passthru.volumeMounts --json
+# → [
+#     {"guestPath":"/mnt/inputs","volumeName":"fixtures","readOnly":true},
+#     {"guestPath":"/mnt/work","volumeName":"workspace","readOnly":false}
+#   ]
+```
+
+At boot the host attaches a virtio-fs device per declaration and the guest agent runs the matching `MountVolume` vsock verb. Validation:
+
+- **Guest paths** must be absolute and **outside** `/nix*`, `/run/booted-system`, `/run/current-system` — Nix-immutable paths are off-limits per plan 45 §"Nix semantics alignment".
+- **Volume names** must be non-empty strings ≤32 chars (used as the virtio-fs tag).
+- The host's `mvm_security::policy::MountPathPolicy` re-validates at runtime (defence-in-depth) — the eval-time checks fail fast for malformed flakes.
+
+**Reproducibility boundary:** volume *contents* do not influence the image hash. The flake hash captures the *declaration* of the mounts, not the data behind them. Volumes are the explicit mutable layer; the rootfs stays immutable + verity-protected.
+
+`volumeMounts` is optional; the default is `{}`.
 
 ## What mkGuest Provides
 

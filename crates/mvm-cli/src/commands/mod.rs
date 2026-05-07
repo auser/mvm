@@ -143,11 +143,13 @@ pub(in crate::commands) enum Commands {
     Resume(vm::pause::ResumeArgs),
     /// Manage sealed instance snapshots (`ls`, `rm`).
     Snapshot(vm::pause::SnapshotArgs),
-    /// Manage virtio-fs shares attached to a VM (`add`, `ls`, `rm`).
+    /// Manage virtio-fs volume mounts on a VM (`mount`, `ls`,
+    /// `unmount`). Plan 45 §D5 (Path C) — renamed from `share`.
     /// Mount paths are validated by
     /// `mvm_security::policy::MountPathPolicy` so a host can't
-    /// shadow verity-protected files.
-    Share(vm::share::Args),
+    /// shadow verity-protected files. `--remote` proxies through
+    /// mvmd's REST API for provider-backed buckets.
+    Volume(vm::volume::Args),
 }
 
 // ============================================================================
@@ -258,7 +260,7 @@ pub fn run() -> Result<()> {
         Commands::Pause(a) => vm::pause::run_pause(&cli, a, &cfg),
         Commands::Resume(a) => vm::pause::run_resume(&cli, a, &cfg),
         Commands::Snapshot(a) => vm::pause::run_snapshot(&cli, a, &cfg),
-        Commands::Share(a) => vm::share::run(&cli, a, &cfg),
+        Commands::Volume(a) => vm::volume::run(&cli, a, &cfg),
     };
 
     with_hints(result)

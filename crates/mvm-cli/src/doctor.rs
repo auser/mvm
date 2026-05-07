@@ -116,6 +116,7 @@ pub fn run(json: bool) -> Result<()> {
 
     // ── Security posture (plan 40 folded `mvmctl security` here) ──
     checks.push(security_audit_log_check());
+    checks.push(security_host_fde_check());
     checks.push(security_data_dir_mode_check());
     checks.push(security_proxy_socket_mode_check());
     checks.push(security_dev_image_check());
@@ -861,6 +862,96 @@ fn security_audit_log_check() -> Check {
         } else {
             format!("not yet created at {path}")
         },
+    }
+}
+
+/// Host full-disk-encryption check — plan 45 §"Encryption at rest".
+///
+/// `LocalBackend` volumes rely on host FDE for at-rest protection (we
+/// deliberately don't roll our own per-volume crypto on dev boxes).
+/// On a dev host this check is **informational/warning-only** — the
+/// `ok` flag stays `true` so a non-FDE laptop can still run mvmctl,
+/// but the report surfaces the gap so users can enable FileVault /
+/// LUKS before relying on local volumes for sensitive data.
+///
+/// On mvmd workers the analogous check is **enforced** (refuses
+/// `LocalVirtiofs` bucket creation when FDE is absent). That lives
+/// in mvmd Sprint 137 W6.
+fn security_host_fde_check() -> Check {
+    let detection = detect_host_fde();
+    Check {
+        name: "host FDE (volumes at-rest)",
+        category: "security",
+        ok: true, // warn-only on dev box per plan 45 §D5
+        info: detection,
+    }
+}
+
+/// Best-effort detection of host full-disk encryption.
+///
+/// macOS: `fdesetup status` returns "FileVault is On." when enabled.
+/// Linux: `lsblk -no TYPE / 2>&1 | grep crypt` succeeds when the root
+/// FS sits on a dm-crypt mapping. Both checks fail closed (return
+/// "unknown") if the underlying tool is missing.
+fn detect_host_fde() -> String {
+    let plat = platform::current();
+    if matches!(plat, Platform::MacOS) {
+        match std::process::Command::new("fdesetup")
+            .arg("status")
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if stdout.contains("FileVault is On") {
+                    "FileVault enabled (recommended for LocalBackend volumes)".to_string()
+                } else {
+                    format!(
+                        "FileVault appears OFF — run `sudo fdesetup enable` before storing \
+                         sensitive data in LocalBackend volumes ({})",
+                        stdout.trim()
+                    )
+                }
+            }
+            Ok(_) | Err(_) => {
+                "could not determine FileVault state (fdesetup unavailable)".to_string()
+            }
+        }
+    } else if matches!(plat, Platform::LinuxNative | Platform::LinuxNoKvm) {
+        // `lsblk -no TYPE -P` listing for root mountpoint. Cheap;
+        // `findmnt -no SOURCE /` resolves the device, then `lsblk -no
+        // TYPE` gives the device type chain. We accept either route.
+        match std::process::Command::new("findmnt")
+            .args(["-no", "SOURCE", "/"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                match std::process::Command::new("lsblk")
+                    .args(["-no", "TYPE", &dev])
+                    .output()
+                {
+                    Ok(types) if types.status.success() => {
+                        let s = String::from_utf8_lossy(&types.stdout);
+                        if s.lines().any(|l| l.trim() == "crypt") {
+                            format!(
+                                "root device {dev} sits on a dm-crypt mapping (LUKS \
+                                 enabled — recommended for LocalBackend volumes)"
+                            )
+                        } else {
+                            format!(
+                                "root device {dev} does NOT appear to be encrypted — \
+                                 enable LUKS on root before storing sensitive data in \
+                                 LocalBackend volumes"
+                            )
+                        }
+                    }
+                    _ => format!("could not inspect type chain for {dev}"),
+                }
+            }
+            _ => "could not determine root device (findmnt unavailable)".to_string(),
+        }
+    } else {
+        "unsupported platform for FDE detection".to_string()
     }
 }
 
