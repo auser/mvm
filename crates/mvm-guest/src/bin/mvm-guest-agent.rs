@@ -21,6 +21,7 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -798,6 +799,123 @@ static RUN_ENTRYPOINT_LOCK: Mutex<()> = Mutex::new(());
 /// thread-per-connection accept-loop.
 static WARM_POOL: OnceLock<Option<Arc<WorkerPool>>> = OnceLock::new();
 
+// ============================================================================
+// Signal handling — plan 44.
+//
+// On SIGTERM / SIGINT, the agent flips `SHUTDOWN_REQUESTED` (atomic
+// store, async-signal-safe). The accept loop polls the flag at
+// each iteration and after every `accept()` return (signals deliver
+// `EINTR` to the syscall, which already triggers the loop's
+// continue path). Once the flag flips, the loop breaks and
+// `shutdown_subsystems` runs:
+//   1. Sets the warm-process pool's shutdown atomic so new
+//      dispatches refuse fast-fail.
+//   2. SIGTERMs/SIGKILLs idle workers via `WorkerPool::shutdown`.
+//   3. Sleeps a configurable grace so in-flight calls drain.
+//
+// A second SIGTERM/SIGINT during drain calls `_exit(128 + signo)`
+// directly so a wedged drain doesn't strand operators. `_exit` is
+// async-signal-safe; nothing else in the handler needs to be
+// (the pool drain happens after the loop, in a normal Rust
+// context).
+//
+// The handler itself does only atomic stores and (on second signal)
+// `_exit`. It does not allocate, lock, or call any non-async-
+// signal-safe libc routine — see `man 7 signal-safety`.
+// ============================================================================
+
+/// Set on first SIGTERM/SIGINT. The accept loop polls this and
+/// breaks when it flips.
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Counts shutdown signals delivered. ≥2 means the operator has
+/// asked twice — escalate to `_exit` and skip the drain.
+static SHUTDOWN_SIGNAL_COUNT: AtomicU8 = AtomicU8::new(0);
+
+/// Default grace period for `shutdown_subsystems` to wait between
+/// "shut down requested" and forcing exit. Mirrors the cold-path
+/// `CallCaps::v1().kill_grace_period * 2 + slack` so a typical
+/// in-flight call has time to finish + the worker pool can SIGTERM
+/// → grace → SIGKILL idle workers cleanly.
+const DEFAULT_SHUTDOWN_GRACE: Duration = Duration::from_secs(5);
+
+/// SIGTERM/SIGINT handler. Async-signal-safe — only atomic stores
+/// and (on repeat-signal) `_exit`. Never allocates, never locks.
+///
+/// First signal: flip `SHUTDOWN_REQUESTED`. The accept loop in
+/// `main` observes the flag and runs `shutdown_subsystems`.
+///
+/// Second signal: `_exit(128 + signo)`. POSIX convention for
+/// signal-killed processes; matches what bash sees as the process
+/// exit code.
+unsafe extern "C" fn on_shutdown_signal(sig: libc::c_int) {
+    let prior = SHUTDOWN_SIGNAL_COUNT.fetch_add(1, Ordering::AcqRel);
+    if prior >= 1 {
+        // Operator's second SIGTERM/SIGINT — bail out without
+        // waiting for any drain. `_exit` is async-signal-safe.
+        // SAFETY: libc call with a valid status integer.
+        unsafe {
+            libc::_exit(128 + sig);
+        }
+    }
+    SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+}
+
+/// Install handlers for SIGTERM and SIGINT. Best-effort: if
+/// `sigaction` fails for any reason, the agent logs and continues
+/// — graceful drain is a nice-to-have, not load-bearing (see
+/// `specs/plans/44-agent-signal-handling.md` §"Why deferring is
+/// safe"). On a microVM lifecycle the handler usually never fires
+/// anyway because the kernel teardown is abrupt; the handler
+/// matters when an operator manually `kill -TERM`s the agent or
+/// when in-place updates land later.
+///
+/// `#[inline(never)]` is load-bearing for the symbol-contract
+/// gate (`scripts/check-prod-agent-no-exec.sh`) which asserts
+/// this symbol is present as positive evidence the handlers are
+/// wired in. Mirrors the W5 / plan 43 W7 pattern on
+/// `handle_run_entrypoint` and `dispatch_via_warm_pool`.
+#[inline(never)]
+fn install_signal_handlers() {
+    // SAFETY: zeroed sigaction is the documented "use defaults"
+    // sentinel. We populate sa_sigaction (handler), sa_mask (no
+    // signals blocked during handler), and leave sa_flags = 0
+    // (default disposition: restart syscalls handled by libc, but
+    // we deliberately want EINTR on accept).
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = on_shutdown_signal as *const () as usize;
+        libc::sigemptyset(&mut sa.sa_mask);
+        // sa_flags = 0: do NOT set SA_RESTART. The accept syscall
+        // returns EINTR when a signal lands, which is exactly how
+        // we want the loop to wake up.
+        let term_rc = libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut());
+        let int_rc = libc::sigaction(libc::SIGINT, &sa, std::ptr::null_mut());
+        if term_rc != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("mvm-guest-agent: sigaction(SIGTERM) failed: {err}");
+        }
+        if int_rc != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("mvm-guest-agent: sigaction(SIGINT) failed: {err}");
+        }
+    }
+}
+
+/// Drain all subsystems before exiting. Currently the only one
+/// that benefits from a graceful shutdown is the warm-process
+/// pool (cold-tier `RunEntrypoint` calls hold no long-lived
+/// resources). Adding more drains here is the natural extension
+/// point if future plan additions (snapshot finalization,
+/// integration teardown) want orderly exit.
+fn shutdown_subsystems(grace: Duration) {
+    eprintln!("mvm-guest-agent: shutdown requested; draining for up to {grace:?}");
+    if let Some(Some(pool)) = WARM_POOL.get() {
+        pool.shutdown(grace);
+    }
+    eprintln!("mvm-guest-agent: drain complete; exiting");
+}
+
 /// Validate `/etc/mvm/entrypoint` at agent boot. The result is stashed in
 /// `VALIDATED_ENTRYPOINT`. On failure, log a single line — the agent stays
 /// up; only `RunEntrypoint` requests fail with `EntrypointInvalid`.
@@ -1509,6 +1627,14 @@ fn main() {
     // from the validated FD. Fail-loud on a misconfigured runtime.json.
     init_warm_pool();
 
+    // Plan 44: wire SIGTERM/SIGINT handlers so a manual `kill -TERM`
+    // (or future hot-reload / operator-driven shutdown) drains the
+    // warm-process pool cleanly before the process exits. On a
+    // typical microVM teardown the kernel goes away faster than
+    // userspace can run handlers; this matters mostly when an
+    // operator targets the agent specifically.
+    install_signal_handlers();
+
     // SAFETY: libc call, arguments are constant values.
     let fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
     if fd < 0 {
@@ -1609,11 +1735,27 @@ fn main() {
     // state through `Arc<Mutex<…>>`, so per-connection threading
     // is a safe addition; the new pool itself does its own slot
     // mutex / condvar bookkeeping.
+    //
+    // Plan 44: poll `SHUTDOWN_REQUESTED` between accepts and after
+    // each `accept()` return (signals deliver `EINTR` so accept
+    // returns < 0, which already triggers the bottom-of-loop check).
+    // Once the flag flips, break out and drain via
+    // `shutdown_subsystems`.
     let warm_active = matches!(WARM_POOL.get(), Some(Some(_)));
     loop {
+        if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+            break;
+        }
         // SAFETY: null addr pointers are allowed for accept when peer addr is not needed.
         let cfd = unsafe { accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
         if cfd < 0 {
+            // Most common reason: EINTR from a signal. Re-check the
+            // flag immediately so a SIGTERM that landed mid-accept
+            // breaks the loop without waiting for the next accept
+            // to start.
+            if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
+                break;
+            }
             continue;
         }
         if warm_active {
@@ -1627,12 +1769,98 @@ fn main() {
             handle_client(cfd, &state, &integration_state, &probe_state, boot_at);
         }
     }
+
+    // Close the listening socket so any in-flight accept on a
+    // peer thread (warm-process accept-thread-per-conn mode) wakes.
+    // SAFETY: fd was created by socket() and is owned by us.
+    unsafe {
+        close(fd);
+    }
+    shutdown_subsystems(DEFAULT_SHUTDOWN_GRACE);
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use mvm_guest::integrations::{IntegrationEntry, IntegrationHealthResult, IntegrationStatus};
+
+    // ─── Plan 44: signal handling unit tests ───────────────────────────
+    //
+    // These exercise the handler in isolation by calling the
+    // `extern "C"` function directly with a synthetic signo. We
+    // deliberately do NOT raise real signals against the test
+    // process — Cargo runs tests in a single shared binary and
+    // a real SIGTERM would terminate every concurrent test.
+    //
+    // The tests share global statics with the rest of the binary,
+    // so each test resets `SHUTDOWN_REQUESTED` and
+    // `SHUTDOWN_SIGNAL_COUNT` at the start. Using a Mutex around
+    // the reset+invoke serializes signal-handler tests so they
+    // don't observe each other's state mutations.
+
+    static SIGNAL_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    fn reset_shutdown_state() {
+        SHUTDOWN_REQUESTED.store(false, Ordering::Release);
+        SHUTDOWN_SIGNAL_COUNT.store(0, Ordering::Release);
+    }
+
+    #[test]
+    fn signal_handler_flips_shutdown_flag_on_first_signal() {
+        let _g = SIGNAL_TEST_LOCK
+            .lock()
+            .expect("signal-test mutex not poisoned");
+        reset_shutdown_state();
+        assert!(!SHUTDOWN_REQUESTED.load(Ordering::Acquire));
+        // SAFETY: the handler is async-signal-safe and only stores
+        // an atomic on first invocation; SIGTERM signo is a valid
+        // libc constant.
+        unsafe {
+            on_shutdown_signal(libc::SIGTERM);
+        }
+        assert!(SHUTDOWN_REQUESTED.load(Ordering::Acquire));
+        assert_eq!(SHUTDOWN_SIGNAL_COUNT.load(Ordering::Acquire), 1);
+    }
+
+    #[test]
+    fn signal_handler_increments_count_idempotent_first_call() {
+        // Calling once must leave count==1, flag==true. Calling
+        // again would `_exit` per the second-signal escalation,
+        // so we never invoke the handler twice in tests.
+        let _g = SIGNAL_TEST_LOCK
+            .lock()
+            .expect("signal-test mutex not poisoned");
+        reset_shutdown_state();
+        unsafe {
+            on_shutdown_signal(libc::SIGINT);
+        }
+        assert_eq!(SHUTDOWN_SIGNAL_COUNT.load(Ordering::Acquire), 1);
+        assert!(SHUTDOWN_REQUESTED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn install_signal_handlers_does_not_panic() {
+        // Installing twice should be safe; sigaction overwrites.
+        // We don't assert the prior disposition is preserved
+        // because the test runner may have its own handlers.
+        install_signal_handlers();
+        install_signal_handlers();
+    }
+
+    #[test]
+    fn shutdown_subsystems_no_pool_runs_quickly() {
+        // With no warm pool active (the default for cold-tier
+        // tests), shutdown_subsystems should return promptly —
+        // it has nothing to drain.
+        let start = std::time::Instant::now();
+        shutdown_subsystems(Duration::from_millis(50));
+        // No warm pool → no drain sleep → must return in well
+        // under the grace.
+        assert!(
+            start.elapsed() < Duration::from_secs(1),
+            "shutdown_subsystems with no pool should return quickly"
+        );
+    }
 
     fn make_state(
         entries: Vec<(IntegrationEntry, Option<IntegrationHealthResult>)>,

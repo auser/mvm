@@ -132,6 +132,28 @@ fi
 
 echo "==> ok: dispatch_via_warm_pool symbol present in $BIN"
 
+# ─── Positive: install_signal_handlers must be PRESENT (plan 44) ───────
+# Plan 44 (guest agent signal handling) wires SIGTERM/SIGINT
+# handlers that call `WorkerPool::shutdown` so warm-process workers
+# drain cleanly before the agent exits. The handler installation is
+# a one-shot at boot; absence means a manually-killed agent
+# strands in-flight calls and leaves workers reparented to PID 1
+# without orderly drain. Asserting presence catches:
+#   - someone removing the install call from `main()`
+#   - LTO erasing the symbol despite `#[inline(never)]`
+#   - the function being feature-gated unintentionally
+SIGNAL_PATTERN='mvm_guest_agent::install_signal_handlers'
+if ! "${NM_CMD[@]}" "$BIN" 2>/dev/null | grep -F "$SIGNAL_PATTERN" >/dev/null; then
+    echo "error: required symbol '$SIGNAL_PATTERN' missing from production guest agent" >&2
+    echo "       this means the signal-handler installation is not compiled in," >&2
+    echo "       and SIGTERM/SIGINT will not drain the warm-process pool." >&2
+    echo "       See plan 44 and the install in" >&2
+    echo "       crates/mvm-guest/src/bin/mvm-guest-agent.rs::install_signal_handlers." >&2
+    exit 1
+fi
+
+echo "==> ok: install_signal_handlers symbol present in $BIN"
+
 # ─── Variant ↔ feature pairing (W7.1) ────────────────────────────────────
 # `mkGuest` (in nix/flake.nix) asserts at build time that:
 #   variant="prod" ↔ guestAgent.passthru.devShell == false
