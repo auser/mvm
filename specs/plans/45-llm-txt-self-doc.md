@@ -50,23 +50,18 @@ time substitutions:
 
 ### Override semantics
 
-Callers can override the default by supplying their own
-`/.mvm/llm.txt` entry in `extraFiles`. Implement via Nix attrset
-merge with caller-wins:
-
-```nix
-extraFilesEffective = defaultExtraFiles // extraFiles;
-```
-
-where `defaultExtraFiles` contains the `/.mvm/llm.txt` entry. The
-existing `extraFiles` arg is the caller's; `defaultExtraFiles` is
-new and library-internal.
+Workload flakes that supply their own `/.mvm/llm.txt` entry in
+`extraFiles` override mvmd's default. The merge happens inside
+mvmd's per-workload helper (caller-wins: workload `extraFiles`
+override mvmd defaults), and the merged map is passed verbatim to
+upstream `mkGuest`. The substrate `mkGuest` does not perform any
+default-vs-caller merge of its own.
 
 ### Test
 
-Extend `mvm/tests/smoke_invoke.rs:76-150` (the live-KVM smoke test
-that already builds and boots `nix/images/examples/echo-fn/`) to
-assert:
+mvmd-side: an integration test that exercises the per-workload
+helper end-to-end (build a guest rootfs, mount/inspect it) and
+asserts:
 
 - `/.mvm/llm.txt` exists on the rootfs.
 - File mode is `0644`.
@@ -74,31 +69,32 @@ assert:
   `"# mvm guest"`).
 - Content contains the agent version string.
 
-The smoke test runs under `MVM_LIVE_SMOKE=1`. A unit-level Nix-eval
-test (no boot required) is also viable: `nix eval` on a `mkGuest`
-output and assert the rootfs derivation references the file by path.
+mvm-side: nothing to test here — the `mkGuest` `extraFiles` plumbing
+is exercised by existing fixtures (e.g. `nix/images/examples/echo-fn`
+already bakes a wrapper through `extraFiles`).
 
-## Critical files
+## Critical files (mvmd-side)
 
-- Modified: `mvm/nix/flake.nix` — `mkGuest` body around line 241
-  (extraFiles arg) and 346–360 (populate-block renderer).
-- Possibly new: `mvm/nix/lib/llm-txt.nix` — a function that renders
-  the llm.txt content from build-time vars. Inline in flake.nix is
-  also fine for v1.
-- Modified: `mvm/tests/smoke_invoke.rs` — add assertion block.
+- New (in mvmd): a per-workload helper that renders the `llm.txt`
+  content from agent context (workload id, agent version, variant)
+  and threads it into the `mkGuest` call as
+  `extraFiles."/.mvm/llm.txt"`.
+- mvm-side: nothing changes. The `mkGuest` `extraFiles` arg already
+  accepts the map; the substrate stays workload-agnostic.
 - Reference precedent: `mvm/nix/images/examples/echo-fn/flake.nix:70-79`
-  (uses `extraFiles` to bake a wrapper + marker into a rootfs).
+  shows the `extraFiles` shape (used today to bake a wrapper + marker).
 
 ## Verification
 
-- Build any guest fixture (`nix/images/examples/echo-fn/` is
-  smallest); inspect the derivation output to confirm
+- mvmd integration test that drives a function-workload through to a
+  rootfs build, then inspects the derivation output to confirm
   `files/.mvm/llm.txt` is present with mode 0644.
-- Run smoke test: `MVM_LIVE_SMOKE=1 cargo test --workspace
-  smoke_invoke -- --nocapture`.
-- Override test: a fixture flake that supplies its own `/.mvm/llm.txt`
-  in `extraFiles` overrides the default — content matches caller's,
-  not the library's.
+- Plain `mvmctl build` of a non-agent fixture (e.g.
+  `nix/images/examples/hello-node/`) produces a rootfs with **no**
+  `/.mvm/llm.txt` — substrate stays clean.
+- Override test: a workload flake that supplies its own
+  `/.mvm/llm.txt` in `extraFiles` wins over mvmd's default —
+  content matches the caller's, not mvmd's.
 
 ## Effort
 
