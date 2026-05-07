@@ -73,6 +73,23 @@ pub(in crate::commands) struct Args {
     /// plan.
     #[arg(long)]
     pub reset: bool,
+
+    /// Keep the substrate VM alive after the call finishes, leaving
+    /// a persistent session that subsequent `mvmctl session attach
+    /// <id>` calls can dispatch into. The session id is printed on
+    /// stderr (`Session kept alive: <id>`) for easy capture. Without
+    /// this flag, the VM is torn down immediately after the call —
+    /// the default behaviour. Phase 5c.
+    #[arg(long)]
+    pub keep_alive: bool,
+
+    /// Mark the kept-alive session as `mode=dev` so subsequent
+    /// `mvmctl session exec` / `run-code` calls are allowed. Has no
+    /// effect without `--keep-alive`. Refused on prod-only
+    /// substrates by the wrapper itself if dev capabilities aren't
+    /// compiled in.
+    #[arg(long, requires = "keep_alive")]
+    pub keep_alive_dev: bool,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
@@ -93,11 +110,29 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
 
     let stdin_bytes = read_stdin_payload(args.stdin.as_deref())?;
 
+    let lifecycle_label = if args.keep_alive {
+        "warm session"
+    } else {
+        "transient VM"
+    };
     ui::info(&format!(
-        "invoke: booting transient VM for template '{template_id}'"
+        "invoke: booting {lifecycle_label} for template '{template_id}'"
     ));
     let vm = crate::exec::boot_session_vm(&template_id, "invoke", args.cpus, args.memory_mib)
         .context("Booting VM for invoke")?;
+
+    // Phase 3 + 5c: register a session record so `mvmctl session ls`
+    // sees the call (whether transient or warm). With `--keep-alive`
+    // the record outlives the dispatch and `--keep-alive-dev` flips
+    // its `mode` so subsequent `session exec` / `run-code` are
+    // permitted. Errors registering are logged but don't block the
+    // call.
+    let mode = if args.keep_alive_dev {
+        mvm_core::session::SessionMode::Dev
+    } else {
+        mvm_core::session::SessionMode::Prod
+    };
+    let session_id = register_invoke_session(&vm.vm_name, &template_id, mode);
 
     if !crate::exec::wait_for_agent(&vm.vm_name, 30) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
@@ -105,19 +140,41 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
                 vm_name: vm.vm_name.clone(),
             })
         }));
+        deregister_invoke_session(session_id.as_ref());
         anyhow::bail!("guest agent did not become reachable within 30s");
     }
 
-    // Run the call. We always tear down the VM after, even if dispatch
-    // fails — match `mvmctl exec` lifecycle so transient resources
-    // (TAPs, sockets, snapshot dirs) don't leak.
-    let dispatch_result = dispatch(&vm.vm_name, stdin_bytes, args.timeout);
+    // Run the call. Pass the session id so a transport drop coincident
+    // with `mvmctl session kill` is attributed as `SessionKilled`
+    // rather than a generic I/O error.
+    let dispatch_result = dispatch(&vm.vm_name, stdin_bytes, args.timeout, session_id.as_ref());
 
-    // Tear down. Errors here are warned but not propagated — the
-    // call's exit code is what the caller cares about.
-    crate::exec::tear_down_session_vm(crate::exec::SessionVm {
-        vm_name: vm.vm_name.clone(),
-    });
+    // Tear down lifecycle:
+    //   - default: kill the VM and drop the session record (matches
+    //     `mvmctl exec` semantics, no leaked transient resources).
+    //   - `--keep-alive`: leave the VM running and bump the session
+    //     record's invoke counter; the user reuses via `mvmctl session
+    //     attach` and reaps via `mvmctl session kill` when done.
+    if args.keep_alive {
+        if let Some(id) = session_id.as_ref() {
+            if let Err(e) = mvm_core::session::update_session(id, |r| {
+                r.invoke_count = r.invoke_count.saturating_add(1);
+                r.last_invoke_at = Some(rfc3339_now());
+                Ok(())
+            }) {
+                tracing::warn!(err = %e, "failed to bump session invoke counter");
+            }
+            // Print the session id where the user / SDK will look for
+            // it. Stderr keeps stdout clean for the function's actual
+            // output bytes.
+            eprintln!("Session kept alive: {id}");
+        }
+    } else {
+        crate::exec::tear_down_session_vm(crate::exec::SessionVm {
+            vm_name: vm.vm_name.clone(),
+        });
+        deregister_invoke_session(session_id.as_ref());
+    }
 
     match dispatch_result {
         Ok(exit_code) => {
@@ -130,12 +187,62 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     }
 }
 
+fn rfc3339_now() -> String {
+    use chrono::SecondsFormat;
+    chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
+}
+
+/// Register a fresh session record for an `mvmctl invoke` call.
+/// Returns the id on success, or `None` if registration failed (e.g.
+/// no writable runtime dir). Logs warnings on failure but does not
+/// abort the invoke — the call should still succeed if the session
+/// machinery is unavailable. `mode` selects whether subsequent
+/// `mvmctl session exec` / `run-code` calls against this session
+/// will be allowed (`Dev`) or refused (`Prod`).
+fn register_invoke_session(
+    vm_name: &str,
+    workload_id: &str,
+    mode: mvm_core::session::SessionMode,
+) -> Option<mvm_core::session::SessionId> {
+    let record = mvm_core::session::SessionRecord::new_running(vm_name, workload_id, mode);
+    let id = record.id.clone();
+    match mvm_core::session::write_session(&record) {
+        Ok(()) => Some(id),
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to register invoke session");
+            None
+        }
+    }
+}
+
+/// Remove the session record for an in-flight `mvmctl invoke`. If the
+/// session was already killed externally (state = Killed / Reaped),
+/// keep the record so an observer can see the lifecycle terminated.
+fn deregister_invoke_session(id: Option<&mvm_core::session::SessionId>) {
+    let Some(id) = id else { return };
+    // Read current state — if external code marked it Killed, leave
+    // the record in place; otherwise remove it.
+    match mvm_core::session::read_session(id) {
+        Ok(Some(rec)) if rec.state == mvm_core::session::SessionState::Running => {
+            if let Err(e) = mvm_core::session::remove_session(id) {
+                tracing::warn!(err = %e, "failed to remove invoke session record");
+            }
+        }
+        Ok(_) => {
+            // Either not present or in a non-Running state — leave as-is.
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to read invoke session record");
+        }
+    }
+}
+
 /// Read the stdin payload for the call.
 ///
 /// - `None`: empty payload.
 /// - `Some("-")`: read everything from mvmctl's own stdin.
 /// - `Some(path)`: read the file at `path`.
-fn read_stdin_payload(spec: Option<&str>) -> Result<Vec<u8>> {
+pub(in crate::commands) fn read_stdin_payload(spec: Option<&str>) -> Result<Vec<u8>> {
     match spec {
         None => Ok(Vec::new()),
         Some("-") => {
@@ -153,8 +260,40 @@ fn read_stdin_payload(spec: Option<&str>) -> Result<Vec<u8>> {
 /// the wrapper's exit code, or a non-zero placeholder on agent-side
 /// errors. The placeholders reuse standard Unix conventions:
 /// `124` for timeout (matching `timeout(1)`), `137` for SIGKILL
-/// (8+9), `1` for everything else.
-fn dispatch(vm_name: &str, stdin: Vec<u8>, timeout_secs: u64) -> Result<i32> {
+/// (8+9), `142` for session-killed, `1` for everything else.
+///
+/// `session_id` (when present) is consulted on transport-level
+/// errors: if the session record now reads `state = Killed`, the
+/// transport drop is attributed to the kill and `dispatch` returns
+/// the SessionKilled exit code (142) instead of propagating the raw
+/// I/O error. This is host-side synthesis — the agent itself can't
+/// emit `SessionKilled` because by the time the kill takes effect
+/// it's already going down.
+pub(in crate::commands) fn dispatch(
+    vm_name: &str,
+    stdin: Vec<u8>,
+    timeout_secs: u64,
+    session_id: Option<&mvm_core::session::SessionId>,
+) -> Result<i32> {
+    match dispatch_inner(vm_name, stdin, timeout_secs) {
+        Ok(code) => Ok(code),
+        Err(err) => {
+            if let Some(id) = session_id
+                && let Ok(Some(rec)) = mvm_core::session::read_session(id)
+                && rec.state == mvm_core::session::SessionState::Killed
+            {
+                let event = mvm_guest::vsock::EntrypointEvent::Error {
+                    kind: mvm_guest::vsock::RunEntrypointError::SessionKilled,
+                    message: format!("session {id} killed externally"),
+                };
+                return Ok(exit_code_for(&event));
+            }
+            Err(err)
+        }
+    }
+}
+
+fn dispatch_inner(vm_name: &str, stdin: Vec<u8>, timeout_secs: u64) -> Result<i32> {
     let transport = mvm_runtime::vsock_transport::for_vm(vm_name)
         .with_context(|| format!("Picking transport for guest agent on '{vm_name}'"))?;
     let mut stream = transport
@@ -172,8 +311,30 @@ fn dispatch(vm_name: &str, stdin: Vec<u8>, timeout_secs: u64) -> Result<i32> {
             mvm_guest::vsock::EntrypointEvent::Stderr { chunk } => {
                 let _ = std::io::stderr().write_all(chunk);
             }
-            // Terminal events are returned by send_run_entrypoint; the
-            // handler is only invoked for streaming chunks.
+            mvm_guest::vsock::EntrypointEvent::Control {
+                header_json,
+                payload,
+            } => {
+                // Phase 4a skeleton: surface fd-3 control records to
+                // the operator with a clearly-labelled prefix the
+                // user's stderr can't spoof (these come from mvmctl,
+                // not the wrapper). A future slice (4d) adds an
+                // SDK-facing `--envelope-fd <n>` flag that writes
+                // raw frames out for structured consumption; until
+                // then this human-readable form is the default.
+                if payload.is_empty() {
+                    let _ = writeln!(std::io::stderr(), "[mvmctl-control] {header_json}");
+                } else {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[mvmctl-control] {header_json} (+{} payload bytes)",
+                        payload.len()
+                    );
+                }
+            }
+            // Terminal events (Exit / Error) are returned by
+            // send_run_entrypoint; the handler is only invoked for
+            // streaming chunks above.
             _ => {}
         },
     )
@@ -197,6 +358,11 @@ fn exit_code_for(event: &mvm_guest::vsock::EntrypointEvent) -> i32 {
                 RunEntrypointError::PayloadCap => (1, "payload cap exceeded"),
                 RunEntrypointError::WrapperCrashed => (137, "wrapper crashed"),
                 RunEntrypointError::EntrypointInvalid => (1, "entrypoint invalid"),
+                // 142 = 128 + SIGALRM (14). The signal-style mapping
+                // matches `WrapperCrashed`'s 137 = 128 + SIGKILL (9)
+                // pattern; SIGALRM is repurposed here as a stable
+                // "your session was reaped" signal SDKs can match on.
+                RunEntrypointError::SessionKilled => (142, "session killed"),
                 RunEntrypointError::InternalError => (1, "internal error"),
             };
             ui::warn(&format!("invoke: {label}: {message}"));
@@ -247,6 +413,18 @@ mod tests {
     }
 
     #[test]
+    fn test_exit_code_session_killed_maps_to_142() {
+        // 142 = 128 + SIGALRM (14) — stable signal-style exit code
+        // SDKs match on to distinguish "session killed externally"
+        // from "wrapper crashed" (137 = 128 + SIGKILL).
+        let evt = mvm_guest::vsock::EntrypointEvent::Error {
+            kind: mvm_guest::vsock::RunEntrypointError::SessionKilled,
+            message: "killed".into(),
+        };
+        assert_eq!(exit_code_for(&evt), 142);
+    }
+
+    #[test]
     fn test_exit_code_busy_payload_invalid_internal_all_map_to_1() {
         use mvm_guest::vsock::RunEntrypointError as E;
         for kind in [
@@ -255,6 +433,7 @@ mod tests {
             E::EntrypointInvalid,
             E::InternalError,
         ] {
+            // SessionKilled is excluded — has its own dedicated exit code.
             let evt = mvm_guest::vsock::EntrypointEvent::Error {
                 kind,
                 message: "x".into(),

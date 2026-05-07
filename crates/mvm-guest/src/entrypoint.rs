@@ -324,6 +324,12 @@ pub struct CallCaps {
     pub stdout_max: usize,
     /// Maximum bytes captured from the wrapper's stderr.
     pub stderr_max: usize,
+    /// Maximum bytes captured from the wrapper's fd-3 control channel
+    /// (Plan-0010 §B4 / phase 4b). Excess bytes are silently dropped
+    /// — control-channel overflow does not kill the wrapper, since
+    /// the channel is for structured records the host correlates by
+    /// kind, not for unbounded user output.
+    pub fd3_max: usize,
     /// Grace period between SIGTERM and SIGKILL on timeout / cap breach.
     pub kill_grace_period: Duration,
     /// Polling interval while waiting for exit.
@@ -337,10 +343,20 @@ impl CallCaps {
             stdin_max: 1024 * 1024,
             stdout_max: 1024 * 1024,
             stderr_max: 1024 * 1024,
+            fd3_max: 1024 * 1024,
             kill_grace_period: Duration::from_secs(2),
             poll_interval: Duration::from_millis(50),
         }
     }
+}
+
+/// One control-channel record parsed from the wrapper's fd-3 stream.
+/// Wire format (length-prefixed JSON header + length-prefixed payload)
+/// is documented at `mvm_guest::vsock::EntrypointEvent::Control`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ControlRecord {
+    pub header_json: String,
+    pub payload: Vec<u8>,
 }
 
 /// Outcome of running the wrapper. The caller maps this to the
@@ -352,14 +368,20 @@ pub enum CallOutcome {
         code: i32,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+        controls: Vec<ControlRecord>,
     },
     /// Wrapper exceeded the wall-clock timeout. Killed.
-    Timeout { stdout: Vec<u8>, stderr: Vec<u8> },
+    Timeout {
+        stdout: Vec<u8>,
+        stderr: Vec<u8>,
+        controls: Vec<ControlRecord>,
+    },
     /// One of the streams exceeded its cap. Killed.
     PayloadCap {
         stream: PayloadCapStream,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+        controls: Vec<ControlRecord>,
     },
     /// `Command::spawn` itself failed.
     SpawnFailed { message: String },
@@ -368,6 +390,7 @@ pub enum CallOutcome {
         signal: i32,
         stdout: Vec<u8>,
         stderr: Vec<u8>,
+        controls: Vec<ControlRecord>,
     },
 }
 
@@ -396,6 +419,7 @@ pub fn execute(
             stream: PayloadCapStream::Stdin,
             stdout: Vec::new(),
             stderr: Vec::new(),
+            controls: Vec::new(),
         };
     }
 
@@ -406,9 +430,22 @@ pub fn execute(
     // to disk. ADR-007 / plan 41 M11.
     set_no_core_dumps();
 
+    // Phase 4b: open a pipe for the fd-3 control channel. The child
+    // gets the write end at fd 3 (via `pre_exec` + `dup2`); the parent
+    // reads the read end on a drain thread and parses the framed
+    // record stream into `ControlRecord`s.
+    let (fd3_read, fd3_write_for_child) = match make_fd3_pipe() {
+        Ok(pair) => pair,
+        Err(e) => {
+            return CallOutcome::SpawnFailed {
+                message: format!("create fd-3 pipe: {e}"),
+            };
+        }
+    };
+
     use std::os::unix::process::CommandExt;
-    let mut child = match Command::new(&program)
-        .current_dir(cwd)
+    let mut cmd = Command::new(&program);
+    cmd.current_dir(cwd)
         .env_clear()
         // Put the wrapper into its own process group so a kill-signal
         // can be delivered to every process the wrapper might fork
@@ -418,16 +455,36 @@ pub fn execute(
         .process_group(0)
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-    {
+        .stderr(Stdio::piped());
+
+    // Move `fd3_write_for_child` into the closure so the child inherits
+    // a known raw fd, then `dup2` it onto fd 3 and clear FD_CLOEXEC so
+    // it survives `execve(2)`. Both raw fds are then closed in the
+    // child's address space; the parent retains its own copies.
+    use std::os::fd::AsRawFd;
+    let write_raw = fd3_write_for_child.as_raw_fd();
+    // SAFETY: closure runs in the post-fork pre-exec child. Only async-
+    // signal-safe libc calls are used (dup2, fcntl, close). No Rust
+    // allocator calls.
+    unsafe {
+        cmd.pre_exec(move || install_fd3_in_child(write_raw));
+    }
+
+    let mut child = match cmd.spawn() {
         Ok(c) => c,
         Err(e) => {
+            // pipe fds are closed via Drop on the OwnedFd values.
             return CallOutcome::SpawnFailed {
                 message: format!("spawn {}: {}", program.display(), e),
             };
         }
     };
+
+    // Drop the parent's copy of the write end so the child is the
+    // only writer. Without this, reading the read end blocks
+    // forever because the kernel sees a writer (us) still has it
+    // open.
+    drop(fd3_write_for_child);
 
     // Pipe stdin and close. A write error here means the wrapper
     // already died or closed its stdin; treat as soft failure and
@@ -451,12 +508,14 @@ pub fn execute(
         Arc::clone(&breach_flag),
         PayloadCapStream::Stderr,
     );
+    let fd3_handle = drain_fd3(fd3_read, caps.fd3_max);
 
     let deadline = Instant::now() + timeout;
     let outcome = poll_for_exit(&mut child, deadline, &caps, &breach_flag);
 
     let (stdout, stdout_breach) = stdout_handle.join().unwrap_or_else(|_| (Vec::new(), None));
     let (stderr, stderr_breach) = stderr_handle.join().unwrap_or_else(|_| (Vec::new(), None));
+    let controls = fd3_handle.join().unwrap_or_default();
     // Stream attribution: prefer whichever drain reported the breach.
     // If both did (rare), surface stdout — picked because runaway
     // stdout is the more common shape. The flag the poll loop watched
@@ -471,6 +530,7 @@ pub fn execute(
                     code,
                     stdout,
                     stderr,
+                    controls,
                 }
             } else {
                 let signal = signal_of(&status);
@@ -478,16 +538,101 @@ pub fn execute(
                     signal,
                     stdout,
                     stderr,
+                    controls,
                 }
             }
         }
-        ChildOutcome::Timeout => CallOutcome::Timeout { stdout, stderr },
+        ChildOutcome::Timeout => CallOutcome::Timeout {
+            stdout,
+            stderr,
+            controls,
+        },
         ChildOutcome::PayloadCap => CallOutcome::PayloadCap {
             stream: breached_stream.unwrap_or(PayloadCapStream::Stdout),
             stdout,
             stderr,
+            controls,
         },
     }
+}
+
+/// Create an `O_CLOEXEC` pipe and return `(read_end, write_end)` as
+/// `OwnedFd`s. The write end is what the child inherits at fd 3; the
+/// read end stays in the parent. Both are CLOEXEC by default — the
+/// child's fd 3 has CLOEXEC cleared in `install_fd3_in_child`.
+///
+/// Linux gets the atomic `pipe2(O_CLOEXEC)`; macOS (dev hosts only —
+/// production guests are Linux) falls back to `pipe(2)` + `fcntl
+/// FD_CLOEXEC`. The non-atomic fallback is acceptable for tests; it
+/// would race with a concurrent fork in production, but production
+/// runs the Linux branch.
+fn make_fd3_pipe() -> std::io::Result<(std::os::fd::OwnedFd, std::os::fd::OwnedFd)> {
+    use std::os::fd::FromRawFd;
+    let mut fds: [libc::c_int; 2] = [-1, -1];
+
+    #[cfg(target_os = "linux")]
+    let rc = {
+        // SAFETY: pipe2 is a syscall, not stateful. Returns 0 on success.
+        unsafe { libc::pipe2(fds.as_mut_ptr(), libc::O_CLOEXEC) }
+    };
+    #[cfg(not(target_os = "linux"))]
+    let rc = {
+        // SAFETY: same — pipe(2) writes two fds and returns 0.
+        unsafe { libc::pipe(fds.as_mut_ptr()) }
+    };
+
+    if rc != 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+
+    // On non-Linux, set FD_CLOEXEC on both ends now (a brief window
+    // between pipe(2) and fcntl is non-atomic — see doc-comment above).
+    #[cfg(not(target_os = "linux"))]
+    unsafe {
+        for fd in fds {
+            let flags = libc::fcntl(fd, libc::F_GETFD);
+            if flags >= 0 {
+                let _ = libc::fcntl(fd, libc::F_SETFD, flags | libc::FD_CLOEXEC);
+            }
+        }
+    }
+
+    // SAFETY: pipe returned success; both fds are valid and ours to own.
+    let read = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[0]) };
+    let write = unsafe { std::os::fd::OwnedFd::from_raw_fd(fds[1]) };
+    Ok((read, write))
+}
+
+/// Post-fork, pre-exec: place the child's write-end at fd 3 and clear
+/// `FD_CLOEXEC` on it so the wrapper inherits an open fd 3 across
+/// `execve`. Async-signal-safe.
+fn install_fd3_in_child(write_raw: libc::c_int) -> std::io::Result<()> {
+    // SAFETY: this runs in the post-fork pre-exec child. Only async-
+    // signal-safe calls are used.
+    unsafe {
+        if write_raw != 3 {
+            // dup2 does an atomic close-and-rename; safe even if fd 3
+            // happened to already be open (it won't, in this code path
+            // — Command's piped stdio uses fds 0/1/2).
+            if libc::dup2(write_raw, 3) < 0 {
+                return Err(std::io::Error::last_os_error());
+            }
+            // Close the original raw fd; the child only needs fd 3
+            // going forward.
+            libc::close(write_raw);
+        }
+        // Clear FD_CLOEXEC on fd 3 so the inherited fd survives the
+        // `execve` syscall. pipe2(O_CLOEXEC) sets CLOEXEC on both
+        // ends; we explicitly clear it here.
+        let flags = libc::fcntl(3, libc::F_GETFD);
+        if flags < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+        if libc::fcntl(3, libc::F_SETFD, flags & !libc::FD_CLOEXEC) < 0 {
+            return Err(std::io::Error::last_os_error());
+        }
+    }
+    Ok(())
 }
 
 /// Set `RLIMIT_CORE = 0` on the calling process. Children inherit this
@@ -596,6 +741,91 @@ fn signal_of(status: &std::process::ExitStatus) -> i32 {
 #[cfg(not(unix))]
 fn signal_of(_status: &std::process::ExitStatus) -> i32 {
     0
+}
+
+/// Drain the parent end of the fd-3 pipe and parse framed control
+/// records. Frame layout (Plan-0010 §B4):
+///
+/// ```text
+///   header_len:  u32 LE   (4 bytes; max 64 KiB)
+///   header_json: bytes    (header_len bytes; UTF-8 JSON)
+///   payload_len: u32 LE   (4 bytes)
+///   payload:     bytes    (payload_len bytes)
+/// ```
+///
+/// Reads until EOF (child closes its fd 3) or `total_max` bytes have
+/// been consumed — whichever comes first. Once the cap is hit we
+/// stop reading and return whatever records we've fully parsed; the
+/// channel is for structured records the host correlates by kind, so
+/// dropping further records on overflow is preferable to killing the
+/// wrapper. Header sizes >64 KiB are refused (frame-corruption signal).
+///
+/// Records that are partially received at EOF / cap are silently
+/// dropped — the host already accepts a streaming response that can
+/// terminate at any point.
+fn drain_fd3(read_fd: std::os::fd::OwnedFd, total_max: usize) -> JoinHandle<Vec<ControlRecord>> {
+    /// Per-frame header limit (defense in depth — the wrapper writes
+    /// short envelope JSON, not arbitrary blobs in the header).
+    const HEADER_MAX: usize = 64 * 1024;
+
+    std::thread::spawn(move || {
+        let file = std::fs::File::from(read_fd);
+        let mut reader = std::io::BufReader::new(file);
+        let mut records: Vec<ControlRecord> = Vec::new();
+        let mut consumed: usize = 0;
+
+        // Parse loop: each frame is `header_len:u32 LE` + header bytes
+        // + `payload_len:u32 LE` + payload bytes. Any read that returns
+        // EOF (Ok(0)) on the first read of a frame ends the loop
+        // cleanly; an EOF mid-frame discards the partial frame.
+        loop {
+            // header length
+            let mut len_buf = [0u8; 4];
+            match reader.read_exact(&mut len_buf) {
+                Ok(()) => {}
+                Err(_) => break, // EOF or transient I/O error
+            }
+            let header_len = u32::from_le_bytes(len_buf) as usize;
+            if header_len > HEADER_MAX {
+                break; // refuse oversized header — likely corrupt
+            }
+            consumed = consumed.saturating_add(4 + header_len);
+            if consumed > total_max {
+                break;
+            }
+
+            let mut header_bytes = vec![0u8; header_len];
+            if reader.read_exact(&mut header_bytes).is_err() {
+                break; // partial header → drop this and any later
+            }
+            let header_json = match String::from_utf8(header_bytes) {
+                Ok(s) => s,
+                Err(_) => break, // non-UTF-8 header → corrupt; stop
+            };
+
+            // payload length
+            if reader.read_exact(&mut len_buf).is_err() {
+                break;
+            }
+            let payload_len = u32::from_le_bytes(len_buf) as usize;
+            consumed = consumed.saturating_add(4 + payload_len);
+            if consumed > total_max {
+                break;
+            }
+
+            let mut payload = vec![0u8; payload_len];
+            if reader.read_exact(&mut payload).is_err() {
+                break;
+            }
+
+            records.push(ControlRecord {
+                header_json,
+                payload,
+            });
+        }
+
+        records
+    })
 }
 
 fn drain_capped<R: Read + Send + 'static>(
@@ -831,6 +1061,7 @@ mod tests {
             stdin_max: 1024 * 1024,
             stdout_max,
             stderr_max,
+            fd3_max: 1024 * 1024,
             kill_grace_period: Duration::from_millis(500),
             poll_interval: Duration::from_millis(20),
         }
@@ -852,6 +1083,7 @@ mod tests {
                 code,
                 stdout,
                 stderr,
+                ..
             } => {
                 assert_eq!(code, 0);
                 assert_eq!(stdout, b"hello-out\n");
@@ -897,6 +1129,111 @@ mod tests {
     }
 
     #[test]
+    fn test_execute_captures_fd3_control_record() {
+        // Wrapper writes one framed record to fd 3 — header `{"kind":"ok"}`
+        // (13 bytes) + empty payload — then exits 0. Asserts the record
+        // arrives back as a `ControlRecord` and is independent of stderr.
+        let script = "#!/bin/sh\n\
+                      printf '\\015\\0\\0\\0' >&3\n\
+                      printf '{\"kind\":\"ok\"}' >&3\n\
+                      printf '\\0\\0\\0\\0' >&3\n\
+                      echo hello-stderr 1>&2\n\
+                      exit 0\n";
+        let (tmp, entry) = make_wrapper_script(script);
+        let outcome = execute(
+            &entry,
+            tmp.path(),
+            b"",
+            Duration::from_secs(5),
+            caps_with_timeout(1024, 1024),
+        );
+        match outcome {
+            CallOutcome::Exited {
+                code,
+                stderr,
+                controls,
+                ..
+            } => {
+                assert_eq!(code, 0);
+                // stderr is unchanged user output (no envelope mixed in).
+                assert_eq!(stderr, b"hello-stderr\n");
+                assert_eq!(controls.len(), 1, "expected one control record");
+                assert_eq!(controls[0].header_json, "{\"kind\":\"ok\"}");
+                assert!(controls[0].payload.is_empty());
+            }
+            other => panic!("expected Exited(0) with control record, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_fd3_emits_no_records_when_wrapper_silent() {
+        // Wrapper that doesn't touch fd 3 should produce zero control
+        // records — the drain reads to EOF and returns an empty Vec.
+        let (tmp, entry) = make_wrapper_script("#!/bin/sh\necho hi\nexit 0\n");
+        let outcome = execute(
+            &entry,
+            tmp.path(),
+            b"",
+            Duration::from_secs(5),
+            caps_with_timeout(1024, 1024),
+        );
+        match outcome {
+            CallOutcome::Exited { controls, .. } => {
+                assert!(
+                    controls.is_empty(),
+                    "expected zero control records, got {controls:?}"
+                );
+            }
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_fd3_partial_frame_at_eof_is_dropped() {
+        // Wrapper writes a 4-byte length prefix then exits before
+        // emitting the rest of the header. Drain should see the
+        // partial frame, fail to read the body, and return zero
+        // records (rather than crashing or returning garbage).
+        let script = "#!/bin/sh\n\
+                      printf '\\012\\0\\0\\0' >&3\n\
+                      exit 0\n";
+        let (tmp, entry) = make_wrapper_script(script);
+        let outcome = execute(
+            &entry,
+            tmp.path(),
+            b"",
+            Duration::from_secs(5),
+            caps_with_timeout(1024, 1024),
+        );
+        match outcome {
+            CallOutcome::Exited { controls, .. } => assert!(controls.is_empty()),
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_execute_fd3_oversized_header_is_refused() {
+        // Wrapper writes a length prefix > 64 KiB. Drain should refuse
+        // and stop reading; subsequent valid frames are dropped too
+        // (because the corruption invalidates the stream offset).
+        let script = "#!/bin/sh\n\
+                      printf '\\0\\0\\002\\0' >&3\n\
+                      exit 0\n";
+        let (tmp, entry) = make_wrapper_script(script);
+        let outcome = execute(
+            &entry,
+            tmp.path(),
+            b"",
+            Duration::from_secs(5),
+            caps_with_timeout(1024, 1024),
+        );
+        match outcome {
+            CallOutcome::Exited { controls, .. } => assert!(controls.is_empty()),
+            other => panic!("expected Exited, got {other:?}"),
+        }
+    }
+
+    #[test]
     fn test_execute_timeout_kills_wrapper() {
         let (tmp, entry) = make_wrapper_script("#!/bin/sh\nsleep 10\n");
         let started = Instant::now();
@@ -934,6 +1271,7 @@ mod tests {
                 stream: PayloadCapStream::Stdin,
                 stdout,
                 stderr,
+                ..
             } => {
                 assert!(stdout.is_empty());
                 assert!(stderr.is_empty());

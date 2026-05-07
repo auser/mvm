@@ -341,6 +341,41 @@ pub enum GuestRequest {
     /// caller passes `force = true` to demand a lazy detach.
     /// (Replaces the former `UnmountShare` per plan 45 §D5.)
     UnmountVolume { guest_path: String, force: bool },
+
+    /// Update the warm-process pool's idle-recycle timeout. Workers
+    /// that have been idle (no in-flight call) longer than
+    /// `secs` are recycled at the next sweep. `secs == 0` disables
+    /// idle-based recycling — only `max_calls_per_worker` and
+    /// `max_rss_mb` triggers remain.
+    ///
+    /// This is the substrate-side mirror of `mvmctl session
+    /// set-timeout <id> <secs>`: the host writes the new value into
+    /// the session record, then dispatches this verb so the agent's
+    /// pool sees the same value. A best-effort dispatch — if the
+    /// agent is unreachable the host record still wins on the next
+    /// `mvmctl session reap`.
+    UpdateIdleTimeout { secs: u64 },
+    /// Run user-supplied source code in the wrapper's native
+    /// interpreter. Dev-only — gated behind the agent's `dev-shell`
+    /// feature flag, same fence as `Exec`. The host
+    /// (`mvmctl session run-code`) provides additional gating: the
+    /// session must be `mode=Dev`.
+    ///
+    /// The interpreter is selected by reading `/etc/mvm/wrapper.json`
+    /// at dispatch time:
+    ///   - `language = "python"` → `python3 -c <code>`
+    ///   - `language = "node"`   → `node -e <code>`
+    ///
+    /// Other values, or a missing/unparseable wrapper.json, refuse
+    /// with a wire-stable error message.
+    ///
+    /// **v1 is stateless** — each call spawns a fresh interpreter
+    /// process, so `from foo import bar` in call 1 isn't visible in
+    /// call 2. A future v2 (Plan-0010 §run-code Choice A) routes
+    /// through the warm-process pool's wrapper for stateful eval
+    /// across calls; the wire shape stays identical, the dispatch
+    /// flips inside the agent.
+    RunCode { code: String, timeout_secs: u64 },
 }
 
 /// Helper for `#[serde(default = "...")]` on `bool` fields where
@@ -451,6 +486,15 @@ pub enum GuestResponse {
     /// surface; closed sub-enum carries the per-verb shape.
     /// (Renamed from `ShareResult` per plan 45 §D5.)
     VolumeMountResult(VolumeMountResult),
+
+    /// Acknowledgement for `UpdateIdleTimeout`. `applied_secs` is the
+    /// value the agent is now enforcing — `0` means the warm-process
+    /// pool isn't active on this guest (cold-path-only build), so
+    /// the host reaper is the only enforcement.
+    UpdateIdleTimeoutAck {
+        previous_secs: u64,
+        applied_secs: u64,
+    },
 }
 
 /// Result of a virtio-fs volume mount operation.
@@ -766,6 +810,47 @@ pub enum EntrypointEvent {
     Stdout { chunk: Vec<u8> },
     /// Bytes from the wrapper's stderr.
     Stderr { chunk: Vec<u8> },
+    /// One control-channel record from the wrapper's fd-3 (Plan-0010
+    /// §B4 / phase 4 of the upstream-mvm coordination work in
+    /// `specs/upstream-mvm-prompt.md`).
+    ///
+    /// fd-3 is a separate stream the wrapper writes structured
+    /// records to — error envelopes, captured logs when capture is
+    /// on, etc. — that user code cannot spoof by writing to stderr.
+    /// stdout / stderr keep streaming user-visible bytes verbatim.
+    ///
+    /// The on-the-fd-3-wire frame format is:
+    ///
+    /// ```text
+    ///   header_len:  u32 LE   (4 bytes; max 64 KiB)
+    ///   header_json: bytes    (header_len bytes; UTF-8 JSON object)
+    ///   payload_len: u32 LE   (4 bytes; max bounded by call caps)
+    ///   payload:     bytes    (payload_len bytes; opaque)
+    /// ```
+    ///
+    /// `header_json` is a JSON object with at minimum `{"kind": "<str>"}`.
+    /// The agent re-emits the header as `header_json: String` and the
+    /// payload bytes as `payload: Vec<u8>` — no agent-side parsing
+    /// beyond the framing. The host (`mvmctl invoke` and downstream
+    /// SDKs) decides what to do with each record kind.
+    ///
+    /// **Wiring status (phase 4a):** the variant ships ahead of any
+    /// emitter. Agents at this version do not yet open fd-3 in the
+    /// child or emit `Control` events; phase 4b lands fd-3 wiring in
+    /// the cold path (`execute()`), phase 4c in the warm-process
+    /// pool, and the wrapper templates flip from stderr-envelope to
+    /// fd-3-envelope at the same time. Hosts that see a `Control`
+    /// event must already know how to consume it, so this variant is
+    /// added eagerly to keep host/guest deserializers in lockstep.
+    Control {
+        /// JSON-encoded record header (deserialized by the host into a
+        /// kind-specific struct). Agent does not parse beyond UTF-8
+        /// validation.
+        header_json: String,
+        /// Opaque per-record payload. Empty for envelope-style records;
+        /// used for raw bytes on log-style records.
+        payload: Vec<u8>,
+    },
     /// Wrapper exited with the given code. Terminal.
     Exit { code: i32 },
     /// Agent-side condition that prevented or interrupted the
@@ -814,6 +899,14 @@ pub enum RunEntrypointError {
     /// partition), or otherwise can't be loaded. Reported per-call
     /// even though the validation runs at agent boot.
     EntrypointInvalid,
+    /// The session backing this call was killed externally (host
+    /// invoked `mvmctl session kill <id>`) while the call was in
+    /// flight. Synthesized host-side by `mvmctl invoke` /
+    /// `session attach` after detecting a transport-level connection
+    /// drop coincident with a session record marked `Killed`. The
+    /// agent itself does not emit this — it would be torn down with
+    /// the VM before it could.
+    SessionKilled,
     /// Other agent-internal failure — file I/O, vsock framing,
     /// inter-process plumbing. Look at `message` for detail.
     InternalError,
@@ -1813,6 +1906,12 @@ mod tests {
                 guest_path: "/data/foo".to_string(),
                 force: false,
             },
+            GuestRequest::UpdateIdleTimeout { secs: 600 },
+            GuestRequest::UpdateIdleTimeout { secs: 0 },
+            GuestRequest::RunCode {
+                code: "print('hello')".into(),
+                timeout_secs: 30,
+            },
         ];
 
         for req in &variants {
@@ -1972,6 +2071,14 @@ mod tests {
                 kind: VolumeMountErrorKind::Busy,
                 message: "target busy; pass force=true".to_string(),
             }),
+            GuestResponse::UpdateIdleTimeoutAck {
+                previous_secs: 300,
+                applied_secs: 600,
+            },
+            GuestResponse::UpdateIdleTimeoutAck {
+                previous_secs: 0,
+                applied_secs: 0,
+            },
         ];
 
         for resp in &variants {
@@ -2375,6 +2482,34 @@ mod tests {
     }
 
     #[test]
+    fn test_entrypoint_event_control_roundtrip() {
+        // Control events are non-terminal — the host streams them
+        // through alongside Stdout/Stderr until a terminal Exit/Error
+        // arrives. Phase 4a wire-shape lock-in.
+        let evt = EntrypointEvent::Control {
+            header_json: r#"{"kind":"envelope","envelope_kind":"ValueError","error_id":"abc","message":"negative input"}"#.into(),
+            payload: b"".to_vec(),
+        };
+        let json = serde_json::to_string(&evt).expect("serialize");
+        let decoded: EntrypointEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, evt);
+        assert!(!decoded.is_terminal());
+    }
+
+    #[test]
+    fn test_entrypoint_event_control_with_payload_roundtrip() {
+        // Log-style records carry raw bytes alongside a header.
+        let evt = EntrypointEvent::Control {
+            header_json: r#"{"kind":"log","stream":"stderr","ts_ms":12345}"#.into(),
+            payload: b"DEBUG: warmup complete\n".to_vec(),
+        };
+        let json = serde_json::to_string(&evt).expect("serialize");
+        let decoded: EntrypointEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, evt);
+        assert!(!decoded.is_terminal());
+    }
+
+    #[test]
     fn test_entrypoint_event_exit_is_terminal() {
         let evt = EntrypointEvent::Exit { code: 0 };
         assert!(evt.is_terminal());
@@ -2429,6 +2564,7 @@ mod tests {
             RunEntrypointError::Busy,
             RunEntrypointError::WrapperCrashed,
             RunEntrypointError::EntrypointInvalid,
+            RunEntrypointError::SessionKilled,
             RunEntrypointError::InternalError,
         ];
         for v in variants {

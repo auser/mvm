@@ -787,6 +787,87 @@ fn do_exec(command: &str, stdin_data: Option<&str>, _timeout_secs: u64) -> Guest
     }
 }
 
+/// Read the wrapper's language from `/etc/mvm/wrapper.json`. Returns
+/// `None` if the file is missing, unparseable, or the field is
+/// absent — caller treats that as "language unknown, refuse the
+/// `RunCode` call rather than guess".
+#[cfg(feature = "dev-shell")]
+fn read_wrapper_language() -> Option<String> {
+    let raw = std::fs::read_to_string("/etc/mvm/wrapper.json").ok()?;
+    let v: serde_json::Value = serde_json::from_str(&raw).ok()?;
+    v.get("language")?.as_str().map(str::to_owned)
+}
+
+/// Stateless run-code v1: dispatch a fresh interpreter subprocess
+/// with the user-supplied source on its `-c` / `-e` arg. Refuses
+/// unknown languages with a wire-stable error string. Reuses the
+/// same `/bin/sh -c` mechanics as `do_exec` for capture + truncation.
+///
+/// Plan-0010 Choice A v2 will route through the warm-process pool
+/// instead, providing stateful eval across calls. Wire shape stays
+/// identical — the dispatch flips inside this function.
+#[cfg(feature = "dev-shell")]
+fn do_run_code(code: &str, timeout_secs: u64) -> GuestResponse {
+    let lang = match read_wrapper_language() {
+        Some(l) => l,
+        None => {
+            return GuestResponse::ExecResult {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: "run-code refused: /etc/mvm/wrapper.json missing or has no \
+                         language field"
+                    .into(),
+            };
+        }
+    };
+    let interpreter = match lang.as_str() {
+        "python" => "python3",
+        "node" => "node",
+        other => {
+            return GuestResponse::ExecResult {
+                exit_code: -1,
+                stdout: String::new(),
+                stderr: format!(
+                    "run-code refused: unsupported language {:?} \
+                     (supported: python, node)",
+                    other
+                ),
+            };
+        }
+    };
+    // Build the shell command. Single-quote the code so the shell
+    // doesn't expand `$VAR` / backticks inside it; embedded single
+    // quotes get the close-quote-escape-reopen treatment.
+    let interp_flag = if interpreter == "node" { "-e" } else { "-c" };
+    let shell_command = format!(
+        "{} {} {}",
+        interpreter,
+        interp_flag,
+        shell_quote_for_sh(code)
+    );
+    do_exec(&shell_command, None, timeout_secs)
+}
+
+/// Single-quote `s` for `/bin/sh` consumption: doubles up embedded
+/// `'` as `'\''` (close-quote, escaped-quote, re-open). Mirrors
+/// `mvm_cli::commands::vm::session::shell_quote` — duplicated here
+/// rather than depending on mvm-cli to keep the agent's dependency
+/// surface lean.
+#[cfg(feature = "dev-shell")]
+fn shell_quote_for_sh(s: &str) -> String {
+    let mut out = String::with_capacity(s.len() + 2);
+    out.push('\'');
+    for c in s.chars() {
+        if c == '\'' {
+            out.push_str("'\\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 // ============================================================================
 // RunEntrypoint handler — ADR-007 / plan 41 W2.
 //
@@ -1134,14 +1215,21 @@ fn handle_run_entrypoint(
             code,
             stdout,
             stderr,
+            controls,
         } => {
             write_response(file, &evt(EntrypointEvent::Stdout { chunk: stdout }));
             write_response(file, &evt(EntrypointEvent::Stderr { chunk: stderr }));
+            emit_controls(file, controls);
             evt(EntrypointEvent::Exit { code })
         }
-        CallOutcome::Timeout { stdout, stderr } => {
+        CallOutcome::Timeout {
+            stdout,
+            stderr,
+            controls,
+        } => {
             write_response(file, &evt(EntrypointEvent::Stdout { chunk: stdout }));
             write_response(file, &evt(EntrypointEvent::Stderr { chunk: stderr }));
+            emit_controls(file, controls);
             evt(EntrypointEvent::Error {
                 kind: RunEntrypointError::Timeout,
                 message: format!("wrapper exceeded {timeout_secs}s timeout"),
@@ -1151,9 +1239,11 @@ fn handle_run_entrypoint(
             stream,
             stdout,
             stderr,
+            controls,
         } => {
             write_response(file, &evt(EntrypointEvent::Stdout { chunk: stdout }));
             write_response(file, &evt(EntrypointEvent::Stderr { chunk: stderr }));
+            emit_controls(file, controls);
             let stream_name = match stream {
                 PayloadCapStream::Stdin => "stdin",
                 PayloadCapStream::Stdout => "stdout",
@@ -1172,14 +1262,33 @@ fn handle_run_entrypoint(
             signal,
             stdout,
             stderr,
+            controls,
         } => {
             write_response(file, &evt(EntrypointEvent::Stdout { chunk: stdout }));
             write_response(file, &evt(EntrypointEvent::Stderr { chunk: stderr }));
+            emit_controls(file, controls);
             evt(EntrypointEvent::Error {
                 kind: RunEntrypointError::WrapperCrashed,
                 message: format!("wrapper exited via signal {signal}"),
             })
         }
+    }
+}
+
+/// Emit each fd-3 control record as one `EntrypointEvent::Control`
+/// frame on the response stream. Phase 4b — the cold-path counterpart
+/// to phase 4c's wrapper updates. v1 emits all records after stdout
+/// and stderr; the host already accepts non-terminal events in any
+/// order before the terminal `Exit` / `Error`.
+fn emit_controls(file: &mut std::fs::File, records: Vec<mvm_guest::entrypoint::ControlRecord>) {
+    for r in records {
+        write_response(
+            file,
+            &evt(EntrypointEvent::Control {
+                header_json: r.header_json,
+                payload: r.payload,
+            }),
+        );
     }
 }
 
@@ -1208,10 +1317,12 @@ fn dispatch_via_warm_pool(
         Ok(DispatchOutcome {
             stdout,
             stderr,
+            controls,
             outcome,
         }) => {
             write_response(file, &evt(EntrypointEvent::Stdout { chunk: stdout }));
             write_response(file, &evt(EntrypointEvent::Stderr { chunk: stderr }));
+            emit_controls(file, controls);
             match outcome {
                 WorkerOutcome::Exit { code } => evt(EntrypointEvent::Exit { code }),
                 WorkerOutcome::Error { kind, message } => evt(EntrypointEvent::Error {
@@ -1413,6 +1524,27 @@ fn handle_client(
         #[cfg(not(feature = "dev-shell"))]
         GuestRequest::Exec { .. } => GuestResponse::Error {
             message: "exec not available: guest agent built without dev-shell feature".to_string(),
+        },
+
+        #[cfg(feature = "dev-shell")]
+        GuestRequest::RunCode { code, timeout_secs } => {
+            // Stateless v1: read /etc/mvm/wrapper.json to learn the
+            // wrapper's language, then dispatch a fresh interpreter
+            // subprocess. v2 (Plan-0010 Choice A) will route through
+            // the warm-process pool's persistent wrapper for stateful
+            // eval; wire shape stays identical.
+            //
+            // Code body is NOT logged (matches `mvmctl session
+            // run-code`'s host-side audit posture — argv / code can
+            // carry user-typed secrets).
+            eprintln!("[audit] run-code request");
+            do_run_code(&code, timeout_secs)
+        }
+
+        #[cfg(not(feature = "dev-shell"))]
+        GuestRequest::RunCode { .. } => GuestResponse::Error {
+            message: "run-code not available: guest agent built without dev-shell feature"
+                .to_string(),
         },
 
         GuestRequest::RunEntrypoint {
@@ -1756,6 +1888,28 @@ fn handle_client(
         GuestRequest::UnmountVolume { guest_path, force } => {
             GuestResponse::VolumeMountResult(mvm_guest::volume::handle_unmount(&guest_path, force))
         }
+
+        // Substrate-side mirror of `mvmctl session set-timeout`. If
+        // the warm-process pool is active (plan 43 / tier-2 dispatch),
+        // the agent updates its idle-recycle threshold and a recycler
+        // thread reaps individual workers idle past the new
+        // timeout — keeping the VM up while pruning waste. If no pool
+        // is active, the verb is a no-op acknowledged with
+        // `applied_secs = 0`; the host-side reaper remains the only
+        // enforcement on cold-path-only builds.
+        GuestRequest::UpdateIdleTimeout { secs } => match WARM_POOL.get() {
+            Some(Some(pool)) => {
+                let previous = pool.set_idle_timeout(secs);
+                GuestResponse::UpdateIdleTimeoutAck {
+                    previous_secs: previous,
+                    applied_secs: secs,
+                }
+            }
+            _ => GuestResponse::UpdateIdleTimeoutAck {
+                previous_secs: 0,
+                applied_secs: 0,
+            },
+        },
     };
 
     write_response(&mut file, &resp);

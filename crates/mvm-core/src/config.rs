@@ -164,6 +164,41 @@ pub fn mvm_config_dir() -> String {
     format!("{}/.config/mvm", home_dir())
 }
 
+/// Runtime directory for ephemeral per-session / per-call state.
+///
+/// Resolution order:
+///   1. `MVM_RUNTIME_DIR` env var
+///   2. `$XDG_RUNTIME_DIR/mvm`
+///   3. `$HOME/.cache/mvm/runtime` (fallback when no XDG runtime dir;
+///      not as good — survives reboots, slightly looser perms — but
+///      works on macOS where systemd-style `XDG_RUNTIME_DIR` is rare)
+///
+/// Holds short-lived state like the session table at
+/// `<runtime>/sessions/<id>.json`. By contract per ADR-002 §W1.5 the
+/// dir is mode 0700; entries within it are 0600 unless the writer
+/// explicitly relaxes them.
+pub fn mvm_runtime_dir() -> String {
+    if let Ok(d) = std::env::var("MVM_RUNTIME_DIR")
+        && !d.is_empty()
+    {
+        return d;
+    }
+    if let Ok(xdg) = std::env::var("XDG_RUNTIME_DIR")
+        && !xdg.is_empty()
+    {
+        return format!("{xdg}/mvm");
+    }
+    format!("{}/.cache/mvm/runtime", home_dir())
+}
+
+/// Create the runtime dir 0700 and return its path. Idempotent.
+#[cfg(unix)]
+pub fn ensure_runtime_dir() -> std::io::Result<String> {
+    let dir = mvm_runtime_dir();
+    ensure_private_dir(&dir)?;
+    Ok(dir)
+}
+
 /// State directory for logs and audit trails.
 ///
 /// Resolution order:

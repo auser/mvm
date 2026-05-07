@@ -225,19 +225,22 @@
               # `"absolute/guest/path" = { content :: str;
               # mode :: str (octal, e.g. "0755"); }`.
               # Parent directories are created automatically.
-              # Files land owned uid 0 / gid 0 (mkfs.ext4 -d
-              # under fakeroot preserves the populate-phase
-              # ownership, which we set explicitly via
-              # `chown 0:0`).
+              # Mode is honored verbatim. Ownership is left at
+              # the populate-phase build user — the Nix sandbox
+              # has no uid 0 mapping, so we cannot chown to root
+              # at build time (see populate.sh.in for the
+              # matching chgrp constraint). Callers that need
+              # specific uid/gid on the live filesystem should
+              # do it from a service preStart in the guest.
               #
               # Used by the function-entrypoint substrate
               # (ADR-007 / plan 41) to bake
               # `/etc/mvm/entrypoint` plus the wrapper binary
               # under `/usr/lib/mvm/wrappers/` without a
-              # separate boot-time service. mvmforge's
-              # forthcoming `mkPythonFunctionService` /
-              # `mkNodeFunctionService` factories will set
-              # this from the IR.
+              # separate boot-time service. The
+              # `mk{Python,Node,Wasm}FunctionService` factories
+              # at `./lib/factories/` set this from the IR
+              # (ADR-0010 §3 Option A — factories live in mvm).
               extraFiles ? { },
               # Plan 45 §"Nix semantics alignment" — declarative
               # volume mount declarations. Each entry is
@@ -378,9 +381,16 @@
               # Render the optional `extraFiles` map into a populate
               # block. Each entry stages content via `pkgs.writeText`
               # (so binary-safe) and copies it into the populate
-              # directory tree, then chowns root + chmods the declared
-              # mode. Order is alphabetical for byte-identical output
-              # across evaluations.
+              # directory tree, then chmods the declared mode. We
+              # deliberately do NOT chown here: the Nix sandbox runs
+              # as a single-uid build user with no namespace mapping
+              # to uid 0, so `chown 0:0` returns EINVAL — see the
+              # parallel note in `populate.sh.in` for the matching
+              # constraint on `chgrp`. mkfs.ext4 -d preserves the
+              # populate-phase owner (build user); init renders the
+              # actual passwd/group entries on boot, so any baked
+              # uid here would be moot anyway. Order is alphabetical
+              # for byte-identical output across evaluations.
               extraFilesBlock = pkgs.lib.concatStringsSep "\n" (
                 pkgs.lib.mapAttrsToList (
                   path: spec:
@@ -392,7 +402,6 @@
                     mkdir -p "./files$(dirname ${path})"
                     install -m 0644 ${contentPath} "./files${path}"
                     chmod ${modeOctal} "./files${path}"
-                    chown 0:0 "./files${path}"
                   ''
                 ) extraFiles
               );
@@ -841,6 +850,29 @@
           # runs when a sibling flake calls it (and those flakes target
           # Linux systems explicitly).
           lib.mkGuest = mkGuestFn;
+
+          # ── Per-language function-service factories (ADR-010 / plan 48) ─
+          #
+          # Bake a function-call workload into a `mkGuest`-compatible
+          # `{ extraFiles, servicePackages, service }` triple. mvmforge
+          # generates flake.nix files that consume these factories when
+          # the IR declares `Entrypoint::Function` (mvmforge ADR-0009).
+          #
+          # The factory functions accept `pkgs` as their first attr, so
+          # mvmforge's generated flake.rs passes the local pkgs alongside
+          # the per-workload args (workloadId, module, function, format,
+          # appPkg, optional sourcePath). See
+          # `nix/lib/factories/README.md` and the binding contract at
+          # `mvmforge/specs/contracts/mvm-mkfunctionservice.md`.
+          #
+          # Wrapper hardening lives inline in each factory's `runnerScript`
+          # today; a follow-up PR will swap for the audited Rust
+          # `mvmforge-runtime` binary baked at
+          # `/usr/lib/mvm/wrappers/runner` and reading config from
+          # `/etc/mvm/wrapper.json` (see `nix/wrappers/`).
+          lib.mkPythonFunctionService = import ./lib/factories/mkPythonFunctionService.nix;
+          lib.mkNodeFunctionService = import ./lib/factories/mkNodeFunctionService.nix;
+          lib.mkWasmFunctionService = import ./lib/factories/mkWasmFunctionService.nix;
 
           # ── packages ──────────────────────────────────────────────────
           packages = {

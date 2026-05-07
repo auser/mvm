@@ -6,7 +6,7 @@
 //! The fixture's wrapper at `/usr/lib/mvm/wrappers/echo` is just
 //! `exec cat` — proves the substrate (W1 wire + W2 handler + W3
 //! invoke CLI) works end-to-end, without depending on any
-//! per-language wrapper from mvmforge's forthcoming Nix factories.
+//! per-language wrapper from `nix/lib/factories/`.
 //!
 //! ## Why this is gated
 //!
@@ -173,5 +173,86 @@ fn invoke_echo_fixture_zero_stdin_exits_zero() {
         output.stdout.is_empty(),
         "with no stdin the wrapper has nothing to echo: stdout={:?}",
         String::from_utf8_lossy(&output.stdout),
+    );
+}
+
+/// Phase-4d spoof regression: a wrapper that writes the legacy
+/// `MVMFORGE_ENVELOPE: {...}` marker to stderr must NOT be
+/// misinterpreted as a structured envelope by the host. Live-KVM
+/// validation of the unit/integration coverage already in place at
+/// `crates/mvm-guest/src/entrypoint.rs::test_execute_captures_fd3_control_record`
+/// and `tests/worker_pool_warm.rs::warm_process_emits_control_records_through_pool`.
+///
+/// Builds the `nix/images/examples/spoof-stderr-fn/` fixture, boots
+/// it via `mvmctl invoke`, asserts:
+///   1. exit code 0 (the spoof line did NOT trigger a `WrapperCrashed`
+///      / `Error` exit code attribution),
+///   2. the literal spoof line appears verbatim in mvmctl's own
+///      stderr (delivered as opaque bytes, not swallowed/parsed).
+#[test]
+fn spoof_stderr_envelope_passes_through_verbatim() {
+    if skip_if_disabled("spoof_stderr_envelope_passes_through_verbatim") {
+        return;
+    }
+
+    let root = repo_root();
+    let fixture_flake = root.join("nix/images/examples/spoof-stderr-fn");
+    assert!(
+        fixture_flake.join("flake.nix").exists(),
+        "fixture flake missing at {}",
+        fixture_flake.display()
+    );
+
+    let build_status = Command::new(env!("CARGO_BIN_EXE_mvmctl"))
+        .arg("template")
+        .arg("build")
+        .arg("--flake")
+        .arg(fixture_flake.as_os_str())
+        .arg("--name")
+        .arg("smoke-spoof-stderr-fn")
+        .status()
+        .expect("spawn mvmctl template build");
+    assert!(
+        build_status.success(),
+        "mvmctl template build failed: {build_status:?}"
+    );
+
+    let output = Command::new(env!("CARGO_BIN_EXE_mvmctl"))
+        .arg("invoke")
+        .arg("smoke-spoof-stderr-fn")
+        .arg("--timeout")
+        .arg("60")
+        .output()
+        .expect("spawn mvmctl invoke (spoof fixture)");
+
+    // (1) Exit code must be 0 — the spoof line on stderr should NOT
+    // be reattributed as a wrapper-crashed / fault outcome. If the
+    // host re-parsed `MVMFORGE_ENVELOPE:` as a structured envelope
+    // pre-fix, this would have been a non-zero exit (`kind=FakeError`
+    // mapped to exit 1).
+    assert!(
+        output.status.success(),
+        "mvmctl invoke against the spoof fixture should exit 0; \
+         got status={:?}\nstdout={}\nstderr={}",
+        output.status,
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+
+    // (2) The literal spoof line should appear in mvmctl's stderr as
+    // raw user output. Pre-fix the host would have swallowed it
+    // into the structured envelope channel; post-fix it passes
+    // through verbatim.
+    let stderr_text = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr_text.contains("MVMFORGE_ENVELOPE:"),
+        "expected spoof token in stderr verbatim; got stderr={:?}",
+        stderr_text
+    );
+    assert!(
+        stderr_text.contains("FakeError"),
+        "expected the fake envelope kind to pass through as opaque \
+         bytes (not extracted into a structured field); got stderr={:?}",
+        stderr_text
     );
 }
