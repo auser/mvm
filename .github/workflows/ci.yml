@@ -1,15 +1,19 @@
 name: CI
 
 on:
-  # `pull_request` covers feature-branch work; `push` to main covers
-  # post-merge gating + the after-merge-by-other-mechanism case. The
-  # earlier `feat/*` push trigger duplicated every check on PRs (the
-  # same SHA fired both a push event and a pull_request event with
-  # different `github.ref` values, defeating the concurrency group).
-  push:
-    branches: [main]
+  # PR-time gates against main, plus release-tag gates for the final
+  # pre-publish verification. `push: branches: [main]` was removed in
+  # the ecosystem-wide CI cost reduction: post-merge runs were a
+  # near-duplicate of the PR-time run on the same SHA, doubling cost
+  # without catching new regressions. The release-tag run keeps a
+  # backstop before any artifact ships. Manual dispatch is the
+  # operator escape hatch when investigating something on main
+  # without cutting a tag.
   pull_request:
     branches: [main]
+  push:
+    tags: ["v*"]
+  workflow_dispatch:
 
 # Cancel a previous run when a new commit lands on the same branch.
 # Without this, the PR check panel accumulates stale failed runs from
