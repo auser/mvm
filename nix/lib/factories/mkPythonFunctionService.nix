@@ -88,6 +88,9 @@ let
     SOURCE_PATH = ${builtins.toJSON sourcePath}
 
 
+    import struct as _struct
+
+
     def _envelope(kind: str, message: str) -> str:
         # Short opaque correlation token. ms-resolution clock + addr
         # entropy. Operators correlate on the operator-log channel.
@@ -95,11 +98,30 @@ let
         return json.dumps({"kind": kind, "error_id": token, "message": message})
 
 
+    def _try_fd3(envelope_json: str) -> bool:
+        # Phase 4d: write the envelope to fd 3 if open (the substrate's
+        # fd-3 control channel — see EntrypointEvent::Control on the
+        # mvm side). Frame: header_len:u32 LE + JSON + payload_len:u32
+        # LE + payload (empty for envelopes). Returns False if fd 3
+        # isn't available; caller falls back to the legacy stderr path.
+        try:
+            data = envelope_json.encode("utf-8")
+            os.write(3, _struct.pack("<I", len(data)) + data + _struct.pack("<I", 0))
+            return True
+        except OSError:
+            return False
+
+
     def _fail(kind: str, message: str) -> None:
-        # Single JSON line on stderr, exit non-zero. Never emit payload
-        # bytes, path strings, or local var values.
-        sys.stderr.write(_envelope(kind, message) + "\n")
-        sys.stderr.flush()
+        # Phase 4d: prefer the structured fd-3 channel; fall back to
+        # the legacy stderr path. The host parses envelopes only from
+        # fd 3, so a wrapper that writes to stderr (or a user fn that
+        # writes the marker text to stderr) can no longer spoof the
+        # envelope in the new substrate.
+        env_json = _envelope(kind, message)
+        if not _try_fd3(env_json):
+            sys.stderr.write(env_json + "\n")
+            sys.stderr.flush()
         raise SystemExit(1)
 
 

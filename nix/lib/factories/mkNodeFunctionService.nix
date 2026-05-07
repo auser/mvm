@@ -55,10 +55,38 @@ let
       return JSON.stringify({ kind, error_id: token, message });
     }
 
+    // Phase 4d: lazy fs handle for fd-3 framed writes. `node:fs`
+    // writeSync throws EBADF if fd 3 isn't open, which the caller
+    // turns into "fall back to stderr".
+    let _fs;
+    function nodeFs() {
+      if (_fs !== undefined) return _fs;
+      _fs = require('node:fs');
+      return _fs;
+    }
+
+    function tryEmitFd3(envelopeJson) {
+      try {
+        const fs = nodeFs();
+        const headerBytes = Buffer.from(envelopeJson, 'utf-8');
+        const headerLen = Buffer.alloc(4);
+        headerLen.writeUInt32LE(headerBytes.length, 0);
+        const payloadLen = Buffer.alloc(4);
+        payloadLen.writeUInt32LE(0, 0);
+        fs.writeSync(3, Buffer.concat([headerLen, headerBytes, payloadLen]));
+        return true;
+      } catch (_e) {
+        return false;
+      }
+    }
+
     function fail(kind, message) {
-      // Single JSON line on stderr, exit non-zero. Never emit payload
-      // bytes, paths, or stack frames.
-      process.stderr.write(envelope(kind, message) + "\n");
+      // Phase 4d: prefer the structured fd-3 channel; fall back to
+      // stderr if fd 3 isn't open (older substrate / non-mvm host).
+      const env = envelope(kind, message);
+      if (!tryEmitFd3(env)) {
+        process.stderr.write(env + "\n");
+      }
       process.exit(1);
     }
 
