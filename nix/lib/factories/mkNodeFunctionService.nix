@@ -36,6 +36,10 @@ let
     inherit module function format mode;
     working_dir = sourcePath;
     max_input_bytes = 1048576;
+    # Read by the agent's `RunCode` vsock verb to pick the right
+    # interpreter (`node -e`). Stable identifier — mvmforge's SDK
+    # and downstream tools may match on it.
+    language = "node";
   };
 
   rawRunner = pkgs.lib.fileContents ../../wrappers/node-runner.mjs;

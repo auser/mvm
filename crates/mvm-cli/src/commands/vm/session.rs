@@ -676,12 +676,73 @@ fn cmd_run_code(args: RunCodeArgs) -> Result<()> {
         Some(&record.vm_name),
         Some(&format!("session={id}")),
     );
-    // v1: dispatch as a shell command. v2 (deferred) will route
-    // `run-code` through a dedicated wrapper-runtime verb so the code
-    // executes in the wrapper's interpreter (Python, Node, etc.) with
-    // access to its imported modules. For now, the user can
-    // `bash -c 'python3 -c "..."'` themselves through `exec`.
-    run_in_session(&id, &record, args.code, args.timeout)
+    // Dispatch via the dev-only `RunCode` vsock verb. The agent
+    // reads `/etc/mvm/wrapper.json` to learn the wrapper's language
+    // and spawns the matching interpreter (`python3 -c` /
+    // `node -e`).
+    //
+    // v1 is stateless — each call gets a fresh interpreter, so
+    // `from foo import bar` in call 1 isn't visible in call 2. v2
+    // (Plan-0010 Choice A) routes through the warm-process pool's
+    // wrapper for stateful eval; the wire shape stays identical.
+    dispatch_run_code(&id, &record, args.code, args.timeout)
+}
+
+/// Send a `RunCode` request to the session's guest agent and stream
+/// the result. Mirrors `run_in_session`'s I/O shape but goes through
+/// the structured `RunCode` verb rather than a shell-quote of the
+/// code body. The agent's `/etc/mvm/wrapper.json`-based dispatch
+/// picks the right interpreter; if the wrapper's language is
+/// unknown or the agent was built without `dev-shell`, the response
+/// surfaces the refusal directly.
+fn dispatch_run_code(
+    id: &SessionId,
+    record: &mvm_core::session::SessionRecord,
+    code: String,
+    timeout_secs: u64,
+) -> Result<()> {
+    use std::io::Write;
+
+    if !crate::exec::wait_for_agent(&record.vm_name, 30) {
+        bail!("guest agent did not become reachable within 30s");
+    }
+
+    let transport = mvm_runtime::vsock_transport::for_vm(&record.vm_name)
+        .with_context(|| format!("Picking transport for guest agent on {:?}", record.vm_name))?;
+    let mut stream = transport
+        .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
+        .with_context(|| format!("Connecting to guest agent on {:?}", record.vm_name))?;
+    let resp = mvm_guest::vsock::send_request(
+        &mut stream,
+        &mvm_guest::vsock::GuestRequest::RunCode { code, timeout_secs },
+    )?;
+    let (exit_code, stdout, stderr) = match resp {
+        mvm_guest::vsock::GuestResponse::ExecResult {
+            exit_code,
+            stdout,
+            stderr,
+        } => (exit_code, stdout, stderr),
+        mvm_guest::vsock::GuestResponse::Error { message } => {
+            bail!("guest run-code error: {message}")
+        }
+        other => bail!("unexpected response to RunCode: {other:?}"),
+    };
+
+    let _ = std::io::stdout().write_all(stdout.as_bytes());
+    let _ = std::io::stderr().write_all(stderr.as_bytes());
+
+    if let Err(e) = session::update_session(id, |r| {
+        r.invoke_count = r.invoke_count.saturating_add(1);
+        r.last_invoke_at = Some(rfc3339_now());
+        Ok(())
+    }) {
+        tracing::warn!(err = %e, "failed to bump session invoke counter");
+    }
+
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
 }
 
 fn require_dev_mode(
