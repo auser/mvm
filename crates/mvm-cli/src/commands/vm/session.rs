@@ -51,6 +51,11 @@ pub(in crate::commands) enum Cmd {
     Kill(KillArgs),
     /// Update the substrate-side idle timeout for a session.
     SetTimeout(SetTimeoutArgs),
+    /// Boot a microVM and register a session without dispatching
+    /// anything into it. The session id is printed on stdout for
+    /// capture by SDK callers; subsequent `session attach`/`exec`/
+    /// `run-code`/`console` calls use that id. Phase 5d.
+    Start(StartArgs),
     /// Re-attach to an existing session and dispatch a `RunEntrypoint`
     /// call into its VM. Phase 5 (`Session.attach()` from mvmforge SDK).
     Attach(AttachArgs),
@@ -60,6 +65,11 @@ pub(in crate::commands) enum Cmd {
     /// Run user code (interpreted by the wrapper's runtime) against a
     /// dev-mode session. Refused on prod-mode sessions.
     RunCode(RunCodeArgs),
+    /// Open an interactive PTY shell into a dev-mode session. State
+    /// (cwd, env, history) persists across the lifetime of the
+    /// console — the underlying microVM is held warm by the session.
+    /// Refused on prod-mode sessions.
+    Console(ConsoleArgs),
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -129,15 +139,48 @@ pub(in crate::commands) struct RunCodeArgs {
     pub timeout: u64,
 }
 
+#[derive(ClapArgs, Debug, Clone)]
+pub(in crate::commands) struct StartArgs {
+    /// Template (or pre-built manifest) to boot. Same resolution
+    /// rules as `mvmctl invoke`'s `<MANIFEST>` argument.
+    pub manifest: String,
+    /// Start the session in dev mode. Required for subsequent
+    /// `session exec` / `run-code` / `console` calls — those verbs
+    /// refuse prod-mode sessions. Default: prod (matches the
+    /// substrate's safe-default discipline).
+    #[arg(long)]
+    pub dev: bool,
+    /// vCPU count for the booted VM. Default 2.
+    #[arg(long, default_value = "2")]
+    pub cpus: u32,
+    /// Memory for the booted VM (MiB). Default 512.
+    #[arg(long, default_value = "512")]
+    pub memory_mib: u32,
+    /// Idle timeout (seconds) baked into the session record. Reapers
+    /// (when implemented) consult this value; a follow-up
+    /// `session set-timeout` call can update it. Default 300 (5
+    /// minutes).
+    #[arg(long, default_value_t = mvm_core::session::DEFAULT_IDLE_TIMEOUT_SECS)]
+    pub idle_timeout: u64,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
+pub(in crate::commands) struct ConsoleArgs {
+    /// Session id to drop into.
+    pub session_id: String,
+}
+
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
     match args.command {
         Cmd::Ls(a) => cmd_ls(a),
         Cmd::Info(a) => cmd_info(a),
         Cmd::Kill(a) => cmd_kill(a),
         Cmd::SetTimeout(a) => cmd_set_timeout(a),
+        Cmd::Start(a) => cmd_start(a),
         Cmd::Attach(a) => cmd_attach(a),
         Cmd::Exec(a) => cmd_exec(a),
         Cmd::RunCode(a) => cmd_run_code(a),
+        Cmd::Console(a) => cmd_console(a),
     }
 }
 
@@ -381,6 +424,92 @@ fn rfc3339_now() -> String {
     chrono::Utc::now().to_rfc3339_opts(SecondsFormat::Secs, true)
 }
 
+/// Boot a session VM and register a session record, but **don't**
+/// dispatch anything into it. The session id is printed on stdout for
+/// SDK / shell capture; subsequent `session attach` / `exec` /
+/// `run-code` / `console` calls operate on it.
+///
+/// Phase 5d. Mirrors mvmforge's `Session(env=<template>)` constructor
+/// — creates the session lifecycle, no work yet.
+fn cmd_start(args: StartArgs) -> Result<()> {
+    use mvm_core::session::{SessionMode, SessionRecord};
+
+    // Resolve the manifest argument the same way `mvmctl invoke` does.
+    let template_id = match super::shared::resolve_manifest_arg(&args.manifest)? {
+        super::shared::ManifestArgRef::Name(n) => n,
+        super::shared::ManifestArgRef::Slot { slot_hash } => slot_hash,
+    };
+
+    let mode = if args.dev {
+        SessionMode::Dev
+    } else {
+        SessionMode::Prod
+    };
+
+    ui::info(&format!(
+        "session start: booting {mode} session for template '{template_id}'"
+    ));
+    let vm = crate::exec::boot_session_vm(&template_id, "session", args.cpus, args.memory_mib)
+        .context("Booting session VM")?;
+
+    if !crate::exec::wait_for_agent(&vm.vm_name, 30) {
+        // Roll back the boot — the agent never came up, so the VM is
+        // unusable. Don't leave dead state in the session table.
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            crate::exec::tear_down_session_vm(crate::exec::SessionVm {
+                vm_name: vm.vm_name.clone(),
+            })
+        }));
+        anyhow::bail!("guest agent did not become reachable within 30s");
+    }
+
+    let mut record = SessionRecord::new_running(&vm.vm_name, &template_id, mode);
+    record.idle_timeout_secs = args.idle_timeout;
+    let id = record.id.clone();
+    if let Err(e) = mvm_core::session::write_session(&record) {
+        // Boot succeeded but we can't persist the record. Tear down
+        // so the user doesn't have a phantom VM with no handle.
+        crate::exec::tear_down_session_vm(crate::exec::SessionVm {
+            vm_name: vm.vm_name.clone(),
+        });
+        return Err(anyhow::anyhow!("registering session: {e}"));
+    }
+
+    ui::info(&format!(
+        "session ready: id={id} vm={} mode={mode} idle_timeout={}s",
+        vm.vm_name, args.idle_timeout
+    ));
+    // Session id on stdout (separate stream from the human-readable
+    // ui::info) so SDK callers can capture it cleanly.
+    println!("{id}");
+    Ok(())
+}
+
+/// Open an interactive PTY shell into a dev-mode session. Refused on
+/// prod sessions. Phase 5d.
+fn cmd_console(args: ConsoleArgs) -> Result<()> {
+    let (id, record) = require_running_session(&args.session_id)?;
+    require_dev_mode(&id, &record, "console")?;
+
+    // Bump last_invoke_at so observers see the activity. Done before
+    // we hand off to the PTY relay because the relay blocks until the
+    // user exits — we don't want the session to look idle while the
+    // user is actively shelling around in it.
+    if let Err(e) = session::update_session(&id, |r| {
+        r.last_invoke_at = Some(rfc3339_now());
+        Ok(())
+    }) {
+        tracing::warn!(err = %e, "failed to update session last_invoke_at");
+    }
+
+    ui::info(&format!(
+        "session console: attaching to session {id} (vm {})",
+        record.vm_name
+    ));
+    super::console::console_interactive(&record.vm_name)
+        .with_context(|| format!("opening console for session {id}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -585,6 +714,44 @@ mod tests {
         assert!(
             err.to_string().contains("dev-only"),
             "expected dev-only error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn console_unknown_id_errors_before_pty_attach() {
+        let _guard = isolated_runtime_dir();
+        let id = SessionId::new().to_string();
+        let err = cmd_console(ConsoleArgs { session_id: id }).unwrap_err();
+        assert!(
+            err.to_string().contains("no session with id"),
+            "expected missing-id error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn console_on_prod_session_is_rejected() {
+        let _guard = isolated_runtime_dir();
+        let rec = session::SessionRecord::new_running("vm-1", "wl", session::SessionMode::Prod);
+        let id = rec.id.to_string();
+        session::write_session(&rec).unwrap();
+        let err = cmd_console(ConsoleArgs { session_id: id }).unwrap_err();
+        assert!(
+            err.to_string().contains("dev-only"),
+            "expected dev-only error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn console_on_killed_session_is_rejected() {
+        let _guard = isolated_runtime_dir();
+        let mut rec = session::SessionRecord::new_running("vm-1", "wl", session::SessionMode::Dev);
+        rec.state = session::SessionState::Killed;
+        let id = rec.id.to_string();
+        session::write_session(&rec).unwrap();
+        let err = cmd_console(ConsoleArgs { session_id: id }).unwrap_err();
+        assert!(
+            err.to_string().contains("not running"),
+            "expected not-running error, got: {err}"
         );
     }
 }
