@@ -274,6 +274,47 @@ pub enum EntrypointEvent {
     Stdout { chunk: Vec<u8> },
     /// Bytes from the wrapper's stderr.
     Stderr { chunk: Vec<u8> },
+    /// One control-channel record from the wrapper's fd-3 (Plan-0010
+    /// §B4 / phase 4 of the upstream-mvm coordination work in
+    /// `specs/upstream-mvm-prompt.md`).
+    ///
+    /// fd-3 is a separate stream the wrapper writes structured
+    /// records to — error envelopes, captured logs when capture is
+    /// on, etc. — that user code cannot spoof by writing to stderr.
+    /// stdout / stderr keep streaming user-visible bytes verbatim.
+    ///
+    /// The on-the-fd-3-wire frame format is:
+    ///
+    /// ```text
+    ///   header_len:  u32 LE   (4 bytes; max 64 KiB)
+    ///   header_json: bytes    (header_len bytes; UTF-8 JSON object)
+    ///   payload_len: u32 LE   (4 bytes; max bounded by call caps)
+    ///   payload:     bytes    (payload_len bytes; opaque)
+    /// ```
+    ///
+    /// `header_json` is a JSON object with at minimum `{"kind": "<str>"}`.
+    /// The agent re-emits the header as `header_json: String` and the
+    /// payload bytes as `payload: Vec<u8>` — no agent-side parsing
+    /// beyond the framing. The host (`mvmctl invoke` and downstream
+    /// SDKs) decides what to do with each record kind.
+    ///
+    /// **Wiring status (phase 4a):** the variant ships ahead of any
+    /// emitter. Agents at this version do not yet open fd-3 in the
+    /// child or emit `Control` events; phase 4b lands fd-3 wiring in
+    /// the cold path (`execute()`), phase 4c in the warm-process
+    /// pool, and the wrapper templates flip from stderr-envelope to
+    /// fd-3-envelope at the same time. Hosts that see a `Control`
+    /// event must already know how to consume it, so this variant is
+    /// added eagerly to keep host/guest deserializers in lockstep.
+    Control {
+        /// JSON-encoded record header (deserialized by the host into a
+        /// kind-specific struct). Agent does not parse beyond UTF-8
+        /// validation.
+        header_json: String,
+        /// Opaque per-record payload. Empty for envelope-style records;
+        /// used for raw bytes on log-style records.
+        payload: Vec<u8>,
+    },
     /// Wrapper exited with the given code. Terminal.
     Exit { code: i32 },
     /// Agent-side condition that prevented or interrupted the
@@ -1395,6 +1436,34 @@ mod tests {
     fn test_entrypoint_event_stderr_roundtrip() {
         let evt = EntrypointEvent::Stderr {
             chunk: b"warn".to_vec(),
+        };
+        let json = serde_json::to_string(&evt).expect("serialize");
+        let decoded: EntrypointEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, evt);
+        assert!(!decoded.is_terminal());
+    }
+
+    #[test]
+    fn test_entrypoint_event_control_roundtrip() {
+        // Control events are non-terminal — the host streams them
+        // through alongside Stdout/Stderr until a terminal Exit/Error
+        // arrives. Phase 4a wire-shape lock-in.
+        let evt = EntrypointEvent::Control {
+            header_json: r#"{"kind":"envelope","envelope_kind":"ValueError","error_id":"abc","message":"negative input"}"#.into(),
+            payload: b"".to_vec(),
+        };
+        let json = serde_json::to_string(&evt).expect("serialize");
+        let decoded: EntrypointEvent = serde_json::from_str(&json).expect("deserialize");
+        assert_eq!(decoded, evt);
+        assert!(!decoded.is_terminal());
+    }
+
+    #[test]
+    fn test_entrypoint_event_control_with_payload_roundtrip() {
+        // Log-style records carry raw bytes alongside a header.
+        let evt = EntrypointEvent::Control {
+            header_json: r#"{"kind":"log","stream":"stderr","ts_ms":12345}"#.into(),
+            payload: b"DEBUG: warmup complete\n".to_vec(),
         };
         let json = serde_json::to_string(&evt).expect("serialize");
         let decoded: EntrypointEvent = serde_json::from_str(&json).expect("deserialize");

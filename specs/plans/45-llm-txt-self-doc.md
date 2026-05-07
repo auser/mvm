@@ -1,6 +1,13 @@
 # Plan 45 — `/.mvm/llm.txt` self-doc convention
 
-Status: **Proposed.**
+Status: **Relocated to mvmd.** The substrate (this repo) intentionally
+does not bake agent-orientation files into every rootfs — `mvm` builds
+generic Firecracker microVMs, and the self-doc convention is an
+agent-workload concern that belongs one layer up. The `mkGuest`
+`extraFiles` seam is still the mechanical injection point, but the
+*decision to inject* the file (and the templated content) lives in
+mvmd's tenant/agent setup path. The original design notes below are
+preserved as a starting reference for the mvmd-side implementation.
 
 ## Background
 
@@ -10,25 +17,26 @@ agent can self-orient when dropped into the box: discover checkpoint
 semantics, mount layout, RPC entry points, and substrate identity
 without needing host-side context.
 
-mvm/mvmd is explicitly aimed at agent workloads (function-call
-entrypoints per ADR-007, `RunEntrypoint`, plan 41). Cheap to ship
-the equivalent now while the API shape is still wet; hard to
-retrofit later because every existing template would need rebuild.
+mvmd is the layer that knows about tenants, agents, and workload
+intent (function-call entrypoints per ADR-007, `RunEntrypoint`, plan
+41). Cheap to ship the equivalent now while the API shape is still
+wet; hard to retrofit later because every existing template would
+need rebuild.
 
 ## Goal
 
-Bake `/.mvm/llm.txt` into every guest rootfs by default. Verity-sealed,
-owned `root:root`, mode `0644`. Caller-supplied `extraFiles` overrides
-via attrset merge.
+Bake `/.mvm/llm.txt` into agent-workload guest rootfs by default,
+driven from mvmd. Verity-sealed, mode `0644`. Caller-supplied
+`extraFiles` overrides via attrset merge.
 
 ## Implementation
 
 ### Where it lands
 
-`mvm/nix/flake.nix` — `mkGuest`'s `extraFiles` argument is the seam.
-Around line 241 it accepts a caller map; around line 346–360 it
-renders the populate-block. Add a default entry to the merged
-`extraFiles` so every built rootfs gets `/.mvm/llm.txt` for free.
+mvmd's per-workload rootfs construction passes a `/.mvm/llm.txt`
+entry through `mkGuest`'s `extraFiles` argument (the upstream
+`mkGuest` API in this repo accepts the map verbatim). Plain `mvmctl`
+builds — no agent context — get nothing baked in.
 
 ### Content
 
