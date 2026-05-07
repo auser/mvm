@@ -378,75 +378,6 @@
                 }
               );
 
-              # Plan 59: every guest gets a self-doc file at
-              # `/.mvm/llm.txt` so an in-VM LLM agent can self-orient
-              # without needing host-side context. Templated with
-              # build-time vars exposed via mkGuest's args. Caller can
-              # override by providing their own `/.mvm/llm.txt` entry
-              # in `extraFiles` (caller-wins via attrset merge below).
-              mvmGuestLlmTxt = ''
-                # mvm guest
-
-                This filesystem is a microVM rootfs built with mvm's `mkGuest`.
-                See https://github.com/tinylabscom/mvm for the substrate source.
-
-                ## Identity
-
-                - agent_version: ${guestAgent.version or "unknown"}
-                - variant: ${variant}
-                - verified_boot: ${if verifiedBoot then "true" else "false"}
-                - hostname: ${hostname}
-                - role: ${role}
-
-                ## RPC entry points (vsock CID 3)
-
-                - guest agent on port 52
-                - protocol: JSON-framed `GuestRequest` envelopes
-                - verb families: fs (read/write/list/stat/mkdir/remove/move),
-                  proc (dev-only), share (mount/unmount virtio-fs)
-                - frame size cap: 256 KiB per record
-
-                ## Function-call entrypoints (ADR-007)
-
-                - wrapper at `/etc/mvm/entrypoint` reads `[args, kwargs]` from
-                  stdin, dispatches the IR-declared `module:function`, writes
-                  the encoded return on stdout
-                - per-call hygiene: fresh subprocess per call, env baseline,
-                  FD reset, per-call TMPDIR, cleanup
-                - max stdin: 16 MiB
-                - format enum: `json` or `msgpack` (closed; code-executing
-                  serializers forbidden)
-
-                ## Checkpoint semantics
-
-                - `mvmctl pause <vm>` captures vmstate.bin + mem.bin under
-                  the host's `~/.mvm/instances/<vm>/snapshot/`, sealed via
-                  HMAC with epoch-bound replay defense
-                - `mvmctl resume <vm>` verifies the sidecar, loads the
-                  Firecracker snapshot, and re-invokes `PostRestore` to
-                  remount drives
-                - on dm-thin-backed instances (ADR-008), snapshots are
-                  chained CoW thin volumes (cheap incremental state)
-
-                ## Where to find more
-
-                - `/etc/mvm/variant` - prod or dev marker
-                - ADR-002: microVM security posture
-                - ADR-007: function-call entrypoints
-              '';
-
-              # Library defaults. Caller-supplied `extraFiles` wins on
-              # path collision (Nix's `//` is shallow merge — right
-              # operand overrides matching keys on the left).
-              defaultExtraFiles = {
-                "/.mvm/llm.txt" = {
-                  content = mvmGuestLlmTxt;
-                  mode = "0644";
-                };
-              };
-
-              extraFilesEffective = defaultExtraFiles // extraFiles;
-
               # Render the optional `extraFiles` map into a populate
               # block. Each entry stages content via `pkgs.writeText`
               # (so binary-safe) and copies it into the populate
@@ -472,7 +403,7 @@
                     install -m 0644 ${contentPath} "./files${path}"
                     chmod ${modeOctal} "./files${path}"
                   ''
-                ) extraFilesEffective
+                ) extraFiles
               );
 
               populateCommands = renderTemplate ./lib/rootfs-templates/populate.sh.in {

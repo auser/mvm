@@ -172,8 +172,30 @@ fn dispatch(vm_name: &str, stdin: Vec<u8>, timeout_secs: u64) -> Result<i32> {
             mvm_guest::vsock::EntrypointEvent::Stderr { chunk } => {
                 let _ = std::io::stderr().write_all(chunk);
             }
-            // Terminal events are returned by send_run_entrypoint; the
-            // handler is only invoked for streaming chunks.
+            mvm_guest::vsock::EntrypointEvent::Control {
+                header_json,
+                payload,
+            } => {
+                // Phase 4a skeleton: surface fd-3 control records to
+                // the operator with a clearly-labelled prefix the
+                // user's stderr can't spoof (these come from mvmctl,
+                // not the wrapper). A future slice (4d) adds an
+                // SDK-facing `--envelope-fd <n>` flag that writes
+                // raw frames out for structured consumption; until
+                // then this human-readable form is the default.
+                if payload.is_empty() {
+                    let _ = writeln!(std::io::stderr(), "[mvmctl-control] {header_json}");
+                } else {
+                    let _ = writeln!(
+                        std::io::stderr(),
+                        "[mvmctl-control] {header_json} (+{} payload bytes)",
+                        payload.len()
+                    );
+                }
+            }
+            // Terminal events (Exit / Error) are returned by
+            // send_run_entrypoint; the handler is only invoked for
+            // streaming chunks above.
             _ => {}
         },
     )
