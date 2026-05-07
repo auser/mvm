@@ -83,6 +83,23 @@ pub(in crate::commands) struct LsArgs {
     /// Emit JSON array on stdout. Default: tab-separated table.
     #[arg(long)]
     pub json: bool,
+    /// After listing, emit advisory warnings on stderr for sessions
+    /// that look stale or long-lived. Two flagged conditions:
+    ///
+    /// - **Stale** (defensive): a session in `Running` state whose
+    ///   `last_invoke_at` is past `idle_timeout_secs`. The lazy
+    ///   reaper that runs at the start of every `session` verb
+    ///   should have caught this — if it didn't, the substrate
+    ///   teardown failed silently and the record diverged from the
+    ///   actual VM state. Worth investigating.
+    /// - **Long-lived dev** (advisory): a `Running` `mode=dev`
+    ///   session older than 1 hour. Within its idle timeout, but
+    ///   old enough that the user may have forgotten about
+    ///   `--keep-alive-dev`. Dev sessions expose `session
+    ///   exec`/`run-code`/`console`, so leaving them open is more
+    ///   surface than a forgotten prod session.
+    #[arg(long)]
+    pub warn_stale: bool,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -268,6 +285,14 @@ pub(in crate::commands) fn reap_expired_sessions(verbose: bool) -> Vec<SessionId
 fn cmd_ls(args: LsArgs) -> Result<()> {
     let sessions = session::list_sessions().context("listing sessions")?;
     if args.json {
+        // JSON mode is for machine consumers; warning text on stderr
+        // is fine to keep but no per-record `stale` field is wired
+        // yet — keeps the schema stable. If a consumer wants
+        // structured stale info, they can derive it from the
+        // existing fields the same way we do below.
+        if args.warn_stale {
+            emit_stale_warnings(&sessions);
+        }
         println!("{}", serde_json::to_string(&sessions)?);
         return Ok(());
     }
@@ -276,7 +301,7 @@ fn cmd_ls(args: LsArgs) -> Result<()> {
         return Ok(());
     }
     println!("ID\tWORKLOAD\tVM\tMODE\tSTATE\tINVOKES\tIDLE_TIMEOUT\tSTARTED_AT");
-    for s in sessions {
+    for s in &sessions {
         println!(
             "{}\t{}\t{}\t{}\t{}\t{}\t{}\t{}",
             s.id,
@@ -289,7 +314,106 @@ fn cmd_ls(args: LsArgs) -> Result<()> {
             s.started_at,
         );
     }
+    if args.warn_stale {
+        emit_stale_warnings(&sessions);
+    }
     Ok(())
+}
+
+/// Threshold beyond which a Running dev session is considered
+/// "long-lived" and worth flagging — within its idle timeout, but
+/// old enough to have been forgotten. One hour is a compromise
+/// between "noise on every modest debugging session" and "actually
+/// catches the forgot-about-it case".
+const LONG_LIVED_DEV_THRESHOLD_SECS: i64 = 3600;
+
+/// Inspect `sessions` for staleness signals and emit advisory
+/// warnings on stderr. Two conditions:
+///
+/// - **Stale Running**: state == Running but `last_invoke_at`
+///   (falling back to `started_at`) is past `idle_timeout_secs`.
+///   The lazy reaper at the start of every session verb should
+///   have caught this; if it didn't, the substrate teardown failed
+///   silently. Defensive — usually no hits.
+/// - **Long-lived dev**: state == Running, mode == Dev,
+///   `now - started_at > LONG_LIVED_DEV_THRESHOLD_SECS`. Within
+///   timeout but worth a reminder. Dev sessions expose shell /
+///   exec / run-code surface.
+///
+/// Best-effort throughout: records with unparseable timestamps are
+/// skipped silently. The classification is read-only — no record
+/// mutation, no VM teardown.
+fn emit_stale_warnings(sessions: &[mvm_core::session::SessionRecord]) {
+    let now = chrono::Utc::now();
+    let mut stale_running: Vec<&mvm_core::session::SessionRecord> = Vec::new();
+    let mut long_lived_dev: Vec<&mvm_core::session::SessionRecord> = Vec::new();
+
+    for record in sessions {
+        if record.state != SessionState::Running {
+            continue;
+        }
+        let last_str = record
+            .last_invoke_at
+            .as_deref()
+            .unwrap_or(&record.started_at);
+        let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(last_str) else {
+            continue;
+        };
+        let elapsed_since_used = now
+            .signed_duration_since(last_dt.with_timezone(&chrono::Utc))
+            .num_seconds();
+        if elapsed_since_used > 0 && (elapsed_since_used as u64) > record.idle_timeout_secs {
+            stale_running.push(record);
+            // A session can be both stale-Running AND long-lived-dev,
+            // but reporting it once (under the more urgent stale
+            // category) is enough.
+            continue;
+        }
+
+        if record.mode == mvm_core::session::SessionMode::Dev {
+            let Ok(started_dt) = chrono::DateTime::parse_from_rfc3339(&record.started_at) else {
+                continue;
+            };
+            let age = now
+                .signed_duration_since(started_dt.with_timezone(&chrono::Utc))
+                .num_seconds();
+            if age > LONG_LIVED_DEV_THRESHOLD_SECS {
+                long_lived_dev.push(record);
+            }
+        }
+    }
+
+    // Warnings go to stderr (not stdout) so they don't corrupt
+    // `--json` machine output. `ui::warn` itself writes to stdout
+    // (matches the rest of mvm's CLI feedback discipline) — for the
+    // ls advisory we want stderr specifically. Format mirrors the
+    // `[mvm]` prefix style for visual continuity.
+    if !stale_running.is_empty() {
+        eprintln!(
+            "[mvm] WARN: {} stale Running session(s) past idle_timeout — \
+             reaper teardown may have failed:",
+            stale_running.len()
+        );
+        for r in stale_running {
+            eprintln!(
+                "[mvm] WARN:   {} (vm {}, idle_timeout={}s, started_at={})",
+                r.id, r.vm_name, r.idle_timeout_secs, r.started_at
+            );
+        }
+    }
+    if !long_lived_dev.is_empty() {
+        eprintln!(
+            "[mvm] WARN: {} long-lived dev session(s) older than 1 hour — \
+             check `mvmctl session info <id>` and consider `mvmctl session kill`:",
+            long_lived_dev.len()
+        );
+        for r in long_lived_dev {
+            eprintln!(
+                "[mvm] WARN:   {} (vm {}, started_at={})",
+                r.id, r.vm_name, r.started_at
+            );
+        }
+    }
 }
 
 fn cmd_info(args: InfoArgs) -> Result<()> {
