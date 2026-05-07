@@ -13,6 +13,8 @@ members = [
     "crates/mvm-mcp",
     "crates/mvm-apple-container",
     "crates/mvm-libkrun",
+    "crates/mvm-mesh-dns",
+    "crates/mvm-mesh-vsock-bridge",
     "xtask",
 ]
 # cargo-fuzz crates have to be excluded from the main workspace because
