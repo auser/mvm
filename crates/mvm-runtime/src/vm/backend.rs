@@ -1,5 +1,8 @@
 use anyhow::Result;
-use mvm_core::vm_backend::{VmBackend, VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus};
+use mvm_core::vm_backend::{
+    BackendSecurityProfile, ClaimStatus, LayerCoverage, VmBackend, VmCapabilities, VmId, VmInfo,
+    VmStartConfig, VmStatus,
+};
 
 use super::apple_container::AppleContainerBackend;
 use super::docker::DockerBackend;
@@ -166,6 +169,21 @@ impl VmBackend for FirecrackerBackend {
     fn install(&self) -> Result<()> {
         firecracker::install()
     }
+
+    fn security_profile(&self) -> BackendSecurityProfile {
+        // Tier 1: full ADR-002. All seven CI-enforced claims hold.
+        // Hardware isolation via KVM; verified boot via dm-verity (W3,
+        // shipped 2026-04-30).
+        BackendSecurityProfile {
+            claims: [ClaimStatus::Holds; 7],
+            layer_coverage: LayerCoverage::all_layers(),
+            tier: "Tier 1",
+            notes: &[
+                "Full ADR-002 — all seven CI-enforced claims hold.",
+                "Hardware isolation via KVM. Verified boot via dm-verity (W3).",
+            ],
+        }
+    }
 }
 
 /// Backend-agnostic dispatch enum.
@@ -310,6 +328,10 @@ impl AnyBackend {
     pub fn install(&self) -> Result<()> {
         self.inner().install()
     }
+
+    pub fn security_profile(&self) -> BackendSecurityProfile {
+        self.inner().security_profile()
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +355,22 @@ mod tests {
     }
 
     #[test]
+    fn test_firecracker_security_profile_tier_1_holds_all_claims() {
+        let backend = FirecrackerBackend;
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 1");
+        assert!(profile.layer_coverage.is_microvm());
+        assert!(profile.dropped_claims().is_empty());
+        assert!(profile.na_claims().is_empty());
+        assert!(
+            profile
+                .claims
+                .iter()
+                .all(|s| matches!(s, ClaimStatus::Holds))
+        );
+    }
+
+    #[test]
     fn test_microvm_nix_backend_name() {
         let backend = MicrovmNixBackend;
         assert_eq!(backend.name(), "microvm-nix");
@@ -346,6 +384,30 @@ mod tests {
         assert!(!caps.snapshots);
         assert!(caps.vsock);
         assert!(caps.tap_networking);
+    }
+
+    #[test]
+    fn test_microvm_nix_security_profile_tier_2_partial_claim_3() {
+        let backend = MicrovmNixBackend;
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 2");
+        assert!(profile.layer_coverage.is_microvm());
+        assert_eq!(profile.dropped_claims(), vec![3]);
+    }
+
+    #[test]
+    fn test_any_backend_dispatches_security_profile_for_firecracker() {
+        let backend = AnyBackend::from_hypervisor("firecracker");
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 1");
+    }
+
+    #[test]
+    fn test_any_backend_dispatches_security_profile_for_docker() {
+        let backend = AnyBackend::from_hypervisor("docker");
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 3");
+        assert!(!profile.layer_coverage.is_microvm());
     }
 
     #[test]

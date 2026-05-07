@@ -10,8 +10,8 @@
 
 use anyhow::Result;
 use mvm_core::vm_backend::{
-    GuestChannelInfo, VmBackend, VmCapabilities, VmId, VmInfo, VmNetworkInfo, VmStartConfig,
-    VmStatus,
+    BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, VmBackend,
+    VmCapabilities, VmId, VmInfo, VmNetworkInfo, VmStartConfig, VmStatus,
 };
 
 use crate::ui;
@@ -348,6 +348,38 @@ impl VmBackend for DockerBackend {
             path: std::path::PathBuf::from(format!("{home}/.mvm/vms/{}/agent/agent.sock", id.0)),
         })
     }
+
+    fn security_profile(&self) -> BackendSecurityProfile {
+        // Tier 3: container isolation, not a microVM. L1-L3 collapse to
+        // the host kernel. Claims 1, 2, 3 do NOT hold. Claims 4, 6, 7
+        // still hold (guest agent has no do_exec; image hash is verified;
+        // cargo deps are audited). Claim 5 (vsock framing) does not apply
+        // — this backend uses a unix socket, not vsock.
+        BackendSecurityProfile {
+            claims: [
+                ClaimStatus::DoesNotHold, // 1 — shared host kernel; no FS isolation guarantee
+                ClaimStatus::DoesNotHold, // 2 — container escapes to uid 0 are real (Leaky Vessels et al.)
+                ClaimStatus::DoesNotHold, // 3 — no microVM rootfs, no dm-verity
+                ClaimStatus::Holds,       // 4 — guest agent built without do_exec for prod
+                ClaimStatus::DoesNotApply, // 5 — unix socket transport, not vsock
+                ClaimStatus::Holds,       // 6 — image hash verified
+                ClaimStatus::Holds,       // 7 — cargo deps audited
+            ],
+            layer_coverage: LayerCoverage {
+                l1_host_hypervisor: false, // shared host kernel, no hypervisor
+                l2_vmm: false,             // container runtime is L2 = host kernel
+                l3_guest_kernel: false,    // shared with host
+                l4_guest_agent: true,
+                l5_workload: true,
+            },
+            tier: "Tier 3",
+            notes: &[
+                "Container isolation, not hardware-isolated microVM.",
+                "L1-L3 collapse to the host kernel.",
+                "Use only for non-security-sensitive workloads. See ADR-002 §\"Per-backend tier matrix\".",
+            ],
+        }
+    }
 }
 
 #[cfg(test)]
@@ -378,5 +410,22 @@ mod tests {
     #[test]
     fn test_image_tag() {
         assert_eq!(image_tag("hello"), "mvm-hello:latest");
+    }
+
+    #[test]
+    fn test_docker_security_profile_tier_3_drops_l1_through_l3() {
+        let backend = DockerBackend;
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 3");
+        assert!(!profile.layer_coverage.is_microvm());
+        assert!(!profile.layer_coverage.l1_host_hypervisor);
+        assert!(!profile.layer_coverage.l2_vmm);
+        assert!(!profile.layer_coverage.l3_guest_kernel);
+        assert!(profile.layer_coverage.l4_guest_agent);
+        assert!(profile.layer_coverage.l5_workload);
+        // Claims 1, 2, 3 do not hold; claim 5 (vsock fuzzing) does not apply
+        // (Docker uses a unix socket); claims 4, 6, 7 hold.
+        assert_eq!(profile.dropped_claims(), vec![1, 2, 3]);
+        assert_eq!(profile.na_claims(), vec![5]);
     }
 }

@@ -26,8 +26,8 @@
 
 use anyhow::Result;
 use mvm_core::vm_backend::{
-    GuestChannelInfo, VmBackend, VmCapabilities, VmId, VmInfo, VmNetworkInfo, VmStartConfig,
-    VmStatus,
+    BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, VmBackend,
+    VmCapabilities, VmId, VmInfo, VmNetworkInfo, VmStartConfig, VmStatus,
 };
 
 use crate::ui;
@@ -184,6 +184,30 @@ impl VmBackend for AppleContainerBackend {
             port: mvm_apple_container::GUEST_AGENT_PORT,
         })
     }
+
+    fn security_profile(&self) -> BackendSecurityProfile {
+        // Tier 2: hardware isolation via Apple VZ (Hypervisor.framework).
+        // Claim 3 (verified boot via dm-verity) is partial — the W3
+        // pipeline currently targets Firecracker; the VZ-backed rootfs
+        // still boots without the dm-verity initramfs.
+        BackendSecurityProfile {
+            claims: [
+                ClaimStatus::Holds,       // 1 — host-fs isolation via VZ
+                ClaimStatus::Holds,       // 2 — uid-0 protections same as FC
+                ClaimStatus::DoesNotHold, // 3 — verified boot for VZ rootfs not yet wired
+                ClaimStatus::Holds,       // 4 — guest agent has no do_exec in prod
+                ClaimStatus::Holds,       // 5 — vsock framing is fuzzed
+                ClaimStatus::Holds,       // 6 — image hash verification
+                ClaimStatus::Holds,       // 7 — cargo deps audited
+            ],
+            layer_coverage: LayerCoverage::all_layers(),
+            tier: "Tier 2",
+            notes: &[
+                "Hardware isolation via Apple VZ (Containerization.framework).",
+                "Claim 3 (verified boot) is partial — dm-verity for VZ-backed rootfs not yet wired.",
+            ],
+        }
+    }
 }
 
 /// Read persisted port mappings from the VM state directory.
@@ -223,6 +247,18 @@ mod tests {
         assert!(!caps.snapshots);
         assert!(caps.vsock);
         assert!(!caps.tap_networking);
+    }
+
+    #[test]
+    fn test_apple_container_security_profile_tier_2_partial_claim_3() {
+        let backend = AppleContainerBackend;
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 2");
+        // L1-L5 all enforced (VZ provides hardware isolation).
+        assert!(profile.layer_coverage.is_microvm());
+        // Only claim 3 (verified boot) does not hold yet.
+        assert_eq!(profile.dropped_claims(), vec![3]);
+        assert!(profile.na_claims().is_empty());
     }
 
     #[test]

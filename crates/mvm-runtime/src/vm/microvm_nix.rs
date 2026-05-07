@@ -1,5 +1,8 @@
 use anyhow::Result;
-use mvm_core::vm_backend::{VmBackend, VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus};
+use mvm_core::vm_backend::{
+    BackendSecurityProfile, ClaimStatus, LayerCoverage, VmBackend, VmCapabilities, VmId, VmInfo,
+    VmStartConfig, VmStatus,
+};
 
 use crate::config::VMS_DIR;
 use crate::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
@@ -141,6 +144,31 @@ impl VmBackend for MicrovmNixBackend {
         // Nix must already be installed; runner scripts are built via nix build
         ui::info("microvm.nix backends require Nix. Use 'mvmctl setup' to install.");
         Ok(())
+    }
+
+    fn security_profile(&self) -> BackendSecurityProfile {
+        // Tier 2: QEMU-based, KVM-backed. The QEMU device model is much
+        // larger than Firecracker's, so the L2 audit cost is higher.
+        // Claim 3 (verified boot) is partial — the W3 dm-verity pipeline
+        // currently targets Firecracker only.
+        BackendSecurityProfile {
+            claims: [
+                ClaimStatus::Holds,       // 1
+                ClaimStatus::Holds,       // 2
+                ClaimStatus::DoesNotHold, // 3 — W3 pipeline targets Firecracker
+                ClaimStatus::Holds,       // 4
+                ClaimStatus::Holds,       // 5
+                ClaimStatus::Holds,       // 6
+                ClaimStatus::Holds,       // 7
+            ],
+            layer_coverage: LayerCoverage::all_layers(),
+            tier: "Tier 2",
+            notes: &[
+                "QEMU-based via microvm.nix; KVM-backed.",
+                "L2 audit cost higher than Firecracker due to QEMU's larger device model.",
+                "Claim 3 (verified boot) is partial — W3 pipeline targets Firecracker today.",
+            ],
+        }
     }
 }
 

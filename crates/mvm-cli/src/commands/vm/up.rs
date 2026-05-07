@@ -296,6 +296,12 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         hypervisor
     };
 
+    // ADR-002 / plan 53: emit a loud, suppressible banner when the
+    // active backend is not a hardware-isolated microVM. Today this
+    // only fires for the Docker tier; future non-microVM backends
+    // would inherit the same banner via their `security_profile()`.
+    emit_security_banner_if_needed(effective_hypervisor);
+
     // Apple Container doesn't need Lima — skip the upfront check entirely.
     // For Firecracker on macOS, Lima is required for both build and runtime.
     let needs_lima = effective_hypervisor != "apple-container"
@@ -985,4 +991,89 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
     }
 
     Ok(())
+}
+
+// ── Security posture banner (ADR-002 / plan 53) ──────────────────────
+
+/// Print a loud warning banner whenever the active backend is not a
+/// hardware-isolated microVM tier (today: Docker only). Suppressible
+/// via `MVM_ACK_DOCKER_TIER=1` or `[security] ack_docker_tier = true`
+/// in `~/.mvm/config.toml`.
+///
+/// Idempotent and side-effect-only (the actual posture data lives in
+/// `mvmctl doctor`); the banner is intentionally noisy because the
+/// security tier change is the most important fact about the run.
+pub(super) fn emit_security_banner_if_needed(hypervisor: &str) {
+    if security_banner_acknowledged() {
+        return;
+    }
+    let backend = AnyBackend::from_hypervisor(hypervisor);
+    let profile = backend.security_profile();
+    if profile.layer_coverage.is_microvm() {
+        return;
+    }
+    let dropped = profile.dropped_claims();
+    let dropped_str = dropped
+        .iter()
+        .map(u8::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    ui::warn(&format!(
+        "⚠ SECURITY POSTURE: {tier} — reduced isolation\n   \
+        Active backend '{name}' is not a hardware-isolated microVM.\n   \
+        Layer L1-L3 collapse to the host kernel; ADR-002 claims [{dropped_str}] do NOT hold.\n   \
+        Recent container-escape CVEs (2024-2025): CVE-2024-21626, CVE-2024-1753,\n   \
+        CVE-2025-9074, CVE-2025-23266, CVE-2025-31133, CVE-2025-52565.\n   \
+        Suppress this banner with MVM_ACK_DOCKER_TIER=1 or\n   \
+        [security] ack_docker_tier = true in ~/.mvm/config.toml.",
+        tier = profile.tier,
+        name = backend.name(),
+    ));
+}
+
+fn security_banner_acknowledged() -> bool {
+    if matches!(
+        std::env::var("MVM_ACK_DOCKER_TIER").as_deref(),
+        Ok("1") | Ok("true") | Ok("TRUE") | Ok("yes")
+    ) {
+        return true;
+    }
+    mvm_core::user_config::load(None).security.ack_docker_tier
+}
+
+#[cfg(test)]
+mod security_banner_tests {
+    use super::*;
+
+    #[test]
+    fn microvm_tier_does_not_trigger_banner_logic() {
+        // Firecracker is a microVM tier — `security_banner_acknowledged`'s
+        // result shouldn't matter because is_microvm() short-circuits.
+        let backend = AnyBackend::from_hypervisor("firecracker");
+        assert!(backend.security_profile().layer_coverage.is_microvm());
+    }
+
+    #[test]
+    fn docker_tier_is_detected_as_non_microvm() {
+        let backend = AnyBackend::from_hypervisor("docker");
+        assert!(!backend.security_profile().layer_coverage.is_microvm());
+    }
+
+    #[test]
+    fn ack_env_var_suppresses_banner() {
+        // SAFETY: tests run single-threaded with --test-threads=1 in CI;
+        // the env var is restored before the function returns.
+        // We use a unique value so concurrent tests don't collide.
+        let prev = std::env::var("MVM_ACK_DOCKER_TIER").ok();
+        unsafe {
+            std::env::set_var("MVM_ACK_DOCKER_TIER", "1");
+        }
+        assert!(security_banner_acknowledged());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("MVM_ACK_DOCKER_TIER", v),
+                None => std::env::remove_var("MVM_ACK_DOCKER_TIER"),
+            }
+        }
+    }
 }

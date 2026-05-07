@@ -201,6 +201,117 @@ pub struct VmCapabilities {
     pub tap_networking: bool,
 }
 
+// ---------------------------------------------------------------------------
+// BackendSecurityProfile — per-backend ADR-002 claim coverage
+// ---------------------------------------------------------------------------
+
+/// Status of a single ADR-002 security claim for a backend.
+///
+/// See ADR-002 §"The seven CI-enforced claims" for the claim definitions.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ClaimStatus {
+    /// The claim holds for this backend; the CI gate enforces it.
+    Holds,
+    /// The claim does not apply to this backend (e.g. vsock-framing
+    /// fuzzing for a backend that uses unix sockets instead of vsock).
+    DoesNotApply,
+    /// The claim does **not** hold for this backend — the security tier
+    /// is reduced and `mvmctl doctor` flags it.
+    DoesNotHold,
+}
+
+/// Coverage of the five Matryoshka trust layers (ADR-002 §"Trust layers").
+///
+/// `true` means the layer is enforced by hardware/software isolation under
+/// this backend; `false` means the layer collapses into the host kernel
+/// or another preceding layer (e.g. Docker has L1–L3 = false because it
+/// shares the host kernel with the workload).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+pub struct LayerCoverage {
+    /// L1 — Host + hypervisor (KVM, VZ, HVF).
+    pub l1_host_hypervisor: bool,
+    /// L2 — VMM (Firecracker, Containerization, libkrun).
+    pub l2_vmm: bool,
+    /// L3 — Guest kernel (ephemeral, isolated).
+    pub l3_guest_kernel: bool,
+    /// L4 — Guest agent (uid 901 setpriv, no_new_privs).
+    pub l4_guest_agent: bool,
+    /// L5 — Workload (per-service uid, bounding-set drop, seccomp).
+    pub l5_workload: bool,
+}
+
+impl LayerCoverage {
+    /// All five layers enforced — the Tier 1 / Tier 2 shape.
+    pub const fn all_layers() -> Self {
+        Self {
+            l1_host_hypervisor: true,
+            l2_vmm: true,
+            l3_guest_kernel: true,
+            l4_guest_agent: true,
+            l5_workload: true,
+        }
+    }
+
+    /// Whether this backend provides hardware-isolated microVM execution
+    /// (L1+L2+L3 all enforced). When `false`, the backend is a Tier 3
+    /// shared-kernel container — `mvmctl run` emits a loud banner.
+    pub const fn is_microvm(self) -> bool {
+        self.l1_host_hypervisor && self.l2_vmm && self.l3_guest_kernel
+    }
+}
+
+/// Per-backend declaration of ADR-002 security-claim coverage.
+///
+/// `mvmctl doctor` and `mvmctl run` consume this to render the active
+/// backend's security posture. The seven claims are stored at indices
+/// `0..7` (claim 1 = `claims[0]`):
+///
+/// 1. No host-fs access from a guest beyond explicit shares
+/// 2. No guest binary can elevate to uid 0
+/// 3. A tampered rootfs ext4 fails to boot
+/// 4. The guest agent does not contain `do_exec` in production builds
+/// 5. Vsock framing is fuzzed
+/// 6. Pre-built dev image is hash-verified
+/// 7. Cargo deps are audited on every PR
+///
+/// `notes` provides per-backend rationale shown in doctor output and is
+/// where backends explain partial claims (e.g. "claim 3 partial — verified
+/// boot for VZ-backed rootfs not yet wired up").
+#[derive(Debug, Clone)]
+pub struct BackendSecurityProfile {
+    /// Status of claims 1..=7 (indexed 0..7).
+    pub claims: [ClaimStatus; 7],
+    /// Layer coverage in the Matryoshka model.
+    pub layer_coverage: LayerCoverage,
+    /// Human-readable security tier: `"Tier 1"`, `"Tier 2"`, `"Tier 3"`.
+    pub tier: &'static str,
+    /// Backend-specific rationale shown in doctor output.
+    pub notes: &'static [&'static str],
+}
+
+impl BackendSecurityProfile {
+    /// 1-indexed claim numbers (1..=7) that do not hold for this backend.
+    pub fn dropped_claims(&self) -> Vec<u8> {
+        self.claims
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| matches!(s, ClaimStatus::DoesNotHold))
+            .map(|(i, _)| (i + 1) as u8)
+            .collect()
+    }
+
+    /// 1-indexed claim numbers that don't apply to this backend (e.g.
+    /// vsock-framing fuzzing for a unix-socket backend).
+    pub fn na_claims(&self) -> Vec<u8> {
+        self.claims
+            .iter()
+            .enumerate()
+            .filter(|(_, s)| matches!(s, ClaimStatus::DoesNotApply))
+            .map(|(i, _)| (i + 1) as u8)
+            .collect()
+    }
+}
+
 /// Summary info for a managed VM, returned by [`VmBackend::list`].
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct VmInfo {
@@ -301,6 +412,28 @@ pub trait VmBackend: Send + Sync {
     /// Backends that don't support guest communication may return an error.
     fn guest_channel_info(&self, _id: &VmId) -> Result<GuestChannelInfo> {
         anyhow::bail!("{} does not provide guest channel info", self.name())
+    }
+
+    /// Return the ADR-002 security profile for this backend.
+    ///
+    /// Each backend declares which of the seven CI-enforced claims hold,
+    /// which Matryoshka layers it covers, and a tier label. `mvmctl doctor`
+    /// renders this; `mvmctl run` uses it to emit a loud, suppressible
+    /// banner whenever the active backend is not a microVM tier.
+    ///
+    /// The default impl returns a conservative "claims unknown" profile
+    /// (all `DoesNotHold`, no layer coverage). All in-tree backends
+    /// override this with an explicit declaration.
+    fn security_profile(&self) -> BackendSecurityProfile {
+        BackendSecurityProfile {
+            claims: [ClaimStatus::DoesNotHold; 7],
+            layer_coverage: LayerCoverage::default(),
+            tier: "Unknown",
+            notes: &[
+                "Backend has not declared its security profile.",
+                "Treat as untrusted until profile is explicit.",
+            ],
+        }
     }
 }
 
@@ -477,5 +610,80 @@ mod tests {
             }
             _ => panic!("Expected UnixSocket variant"),
         }
+    }
+
+    #[test]
+    fn test_layer_coverage_all_layers_is_microvm() {
+        let cov = LayerCoverage::all_layers();
+        assert!(cov.is_microvm());
+        assert!(cov.l1_host_hypervisor);
+        assert!(cov.l2_vmm);
+        assert!(cov.l3_guest_kernel);
+        assert!(cov.l4_guest_agent);
+        assert!(cov.l5_workload);
+    }
+
+    #[test]
+    fn test_layer_coverage_default_is_not_microvm() {
+        let cov = LayerCoverage::default();
+        assert!(!cov.is_microvm());
+    }
+
+    #[test]
+    fn test_layer_coverage_docker_shape_is_not_microvm() {
+        let cov = LayerCoverage {
+            l1_host_hypervisor: false,
+            l2_vmm: false,
+            l3_guest_kernel: false,
+            l4_guest_agent: true,
+            l5_workload: true,
+        };
+        assert!(!cov.is_microvm());
+    }
+
+    #[test]
+    fn test_claim_status_serde_roundtrip() {
+        let statuses = [
+            ClaimStatus::Holds,
+            ClaimStatus::DoesNotApply,
+            ClaimStatus::DoesNotHold,
+        ];
+        for s in statuses {
+            let json = serde_json::to_string(&s).unwrap();
+            let parsed: ClaimStatus = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, s);
+        }
+    }
+
+    #[test]
+    fn test_backend_security_profile_dropped_claims() {
+        let profile = BackendSecurityProfile {
+            claims: [
+                ClaimStatus::DoesNotHold,  // 1
+                ClaimStatus::DoesNotHold,  // 2
+                ClaimStatus::DoesNotHold,  // 3
+                ClaimStatus::Holds,        // 4
+                ClaimStatus::DoesNotApply, // 5
+                ClaimStatus::Holds,        // 6
+                ClaimStatus::Holds,        // 7
+            ],
+            layer_coverage: LayerCoverage::default(),
+            tier: "Tier 3",
+            notes: &[],
+        };
+        assert_eq!(profile.dropped_claims(), vec![1, 2, 3]);
+        assert_eq!(profile.na_claims(), vec![5]);
+    }
+
+    #[test]
+    fn test_backend_security_profile_tier_1_drops_nothing() {
+        let profile = BackendSecurityProfile {
+            claims: [ClaimStatus::Holds; 7],
+            layer_coverage: LayerCoverage::all_layers(),
+            tier: "Tier 1",
+            notes: &[],
+        };
+        assert!(profile.dropped_claims().is_empty());
+        assert!(profile.na_claims().is_empty());
     }
 }
