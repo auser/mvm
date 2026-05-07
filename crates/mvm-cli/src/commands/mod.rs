@@ -108,6 +108,13 @@ pub(in crate::commands) enum Commands {
     /// from `--stdin <PATH>` (or `-` for mvmctl's own stdin); stdout/stderr stream back
     /// to mvmctl's own streams. ADR-007 / plan 41.
     Invoke(vm::invoke::Args),
+    /// Manage the lifecycle of a long-running session — list, inspect, kill, set idle timeout.
+    ///
+    /// A session is one microVM the substrate keeps warm across multiple
+    /// `mvmctl invoke` calls. Phase 3 of the upstream-mvm coordination
+    /// (`specs/upstream-mvm-prompt.md` deliverable D); the SDK-facing
+    /// surface for `mvmforge`'s `Session` class.
+    Session(vm::session::Args),
     /// Speak Model Context Protocol — exposes mvmctl as a sandbox surface for LLM clients.
     ///
     /// Single parameterized `run` tool whose `env` parameter selects from `mvmctl template list`.
@@ -218,6 +225,7 @@ pub fn run() -> Result<()> {
         Commands::Init(a) => env::init::run(&cli, a, &cfg),
         Commands::Exec(a) => vm::exec::run(&cli, a, &cfg),
         Commands::Invoke(a) => vm::invoke::run(&cli, a, &cfg),
+        Commands::Session(a) => vm::session::run(&cli, a, &cfg),
         Commands::Mcp(a) => ops::mcp::run(&cli, a, &cfg),
     };
 

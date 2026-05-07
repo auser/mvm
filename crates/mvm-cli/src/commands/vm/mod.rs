@@ -9,6 +9,7 @@ pub(super) mod forward;
 pub(super) mod invoke;
 pub(super) mod logs;
 pub(super) mod ps;
+pub(super) mod session;
 pub(super) mod up;
 
 pub(super) use super::{Cli, shared};

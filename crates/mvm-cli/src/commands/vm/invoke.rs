@@ -99,12 +99,20 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     let vm = crate::exec::boot_session_vm(&template_id, "invoke", args.cpus, args.memory_mib)
         .context("Booting VM for invoke")?;
 
+    // Phase 3: register a session record so `mvmctl session ls`
+    // sees the in-flight call. v1 sessions are 1:1 with an
+    // `mvmctl invoke` lifetime; warm-pool reuse (Phase 5) makes them
+    // outlive the call. Errors registering are logged but don't
+    // block the call.
+    let session_id = register_invoke_session(&vm.vm_name, &template_id);
+
     if !crate::exec::wait_for_agent(&vm.vm_name, 30) {
         let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             crate::exec::tear_down_session_vm(crate::exec::SessionVm {
                 vm_name: vm.vm_name.clone(),
             })
         }));
+        deregister_invoke_session(session_id.as_ref());
         anyhow::bail!("guest agent did not become reachable within 30s");
     }
 
@@ -118,6 +126,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     crate::exec::tear_down_session_vm(crate::exec::SessionVm {
         vm_name: vm.vm_name.clone(),
     });
+    deregister_invoke_session(session_id.as_ref());
 
     match dispatch_result {
         Ok(exit_code) => {
@@ -127,6 +136,52 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             Ok(())
         }
         Err(e) => Err(e),
+    }
+}
+
+/// Register a fresh session record for an `mvmctl invoke` call.
+/// Returns the id on success, or `None` if registration failed (e.g.
+/// no writable runtime dir). Logs warnings on failure but does not
+/// abort the invoke — the call should still succeed if the session
+/// machinery is unavailable.
+fn register_invoke_session(
+    vm_name: &str,
+    workload_id: &str,
+) -> Option<mvm_core::session::SessionId> {
+    let record = mvm_core::session::SessionRecord::new_running(
+        vm_name,
+        workload_id,
+        mvm_core::session::SessionMode::Prod,
+    );
+    let id = record.id.clone();
+    match mvm_core::session::write_session(&record) {
+        Ok(()) => Some(id),
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to register invoke session");
+            None
+        }
+    }
+}
+
+/// Remove the session record for an in-flight `mvmctl invoke`. If the
+/// session was already killed externally (state = Killed / Reaped),
+/// keep the record so an observer can see the lifecycle terminated.
+fn deregister_invoke_session(id: Option<&mvm_core::session::SessionId>) {
+    let Some(id) = id else { return };
+    // Read current state — if external code marked it Killed, leave
+    // the record in place; otherwise remove it.
+    match mvm_core::session::read_session(id) {
+        Ok(Some(rec)) if rec.state == mvm_core::session::SessionState::Running => {
+            if let Err(e) = mvm_core::session::remove_session(id) {
+                tracing::warn!(err = %e, "failed to remove invoke session record");
+            }
+        }
+        Ok(_) => {
+            // Either not present or in a non-Running state — leave as-is.
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, "failed to read invoke session record");
+        }
     }
 }
 
