@@ -4,6 +4,7 @@ mod env;
 mod manifest;
 mod ops;
 mod shared;
+mod storage;
 mod vm;
 
 #[cfg(test)]
@@ -57,6 +58,8 @@ pub(in crate::commands) enum Commands {
     Doctor(env::doctor::Args),
     /// Manage built manifest slots (list, info, remove). Plan 38 §4.
     Manifest(manifest::Args),
+    /// Inspect the dm-thin storage pool (info, gc). Plan 47 / ADR-008.
+    Storage(storage::Args),
     /// Build a microVM image from a Mvmfile.toml config or Nix flake
     Build(build::build::Args),
     /// Build and run a VM from a Nix flake, a manifest path, or the bundled default image.
@@ -230,6 +233,7 @@ pub fn run() -> Result<()> {
         Commands::Update(a) => env::update::run(&cli, a, &cfg),
         Commands::Doctor(a) => env::doctor::run(&cli, a, &cfg),
         Commands::Manifest(a) => manifest::run(&cli, a, &cfg),
+        Commands::Storage(a) => storage::run(&cli, a, &cfg),
         Commands::Build(a) => build::build::run(&cli, a, &cfg),
         Commands::Up(a) => vm::up::run(&cli, a, &cfg),
         Commands::Down(a) => vm::down::run(&cli, a, &cfg),
