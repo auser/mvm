@@ -1,4 +1,4 @@
-# Plan 45 — `/.mvm/llm.txt` self-doc convention
+# Plan 59 — `/.mvm/llm.txt` self-doc convention
 
 Status: **Proposed.**
 

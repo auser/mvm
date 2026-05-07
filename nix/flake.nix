@@ -378,7 +378,7 @@
                 }
               );
 
-              # Plan 45: every guest gets a self-doc file at
+              # Plan 59: every guest gets a self-doc file at
               # `/.mvm/llm.txt` so an in-VM LLM agent can self-orient
               # without needing host-side context. Templated with
               # build-time vars exposed via mkGuest's args. Caller can
