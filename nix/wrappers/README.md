@@ -30,12 +30,13 @@ in the caller's language.
 
 ## Build-time configuration
 
-The current `mvm.lib.<system>.mkPythonFunctionService` /
-`mkNodeFunctionService` factories at `nix/lib/factories/` embed the
-runner script inline (see those files plus the README there). A
-follow-up plan refactors the factories to consume these
-file-based wrappers and read config from `/etc/mvm/wrapper.json` at
-runtime, eliminating the inline duplication. The future shape:
+`mvm.lib.<system>.mkPythonFunctionService` /
+`mkNodeFunctionService` (at `nix/lib/factories/`) consume the
+canonical runner files in this directory via `pkgs.lib.fileContents`
+and substitute `#!/usr/bin/env <runtime>` with the Nix-store path
+of the runtime baked into `servicePackages`. Per-workload
+configuration goes through `/etc/mvm/wrapper.json`, which the
+runner reads at startup:
 
 ```json
 {
@@ -89,10 +90,9 @@ Astro+Starlight docs site).
 
 ## When this gets used
 
-The mvm-side factories at `nix/lib/factories/` currently embed their
-runner inline; they don't yet consume these file-based templates. A
-follow-up plan refactors the factories to drop the inline code and
-read these wrappers + a `/etc/mvm/wrapper.json` config from disk,
-eliminating the duplication. Until then, **changes to the inline
-runners in `nix/lib/factories/mk*FunctionService.nix` must be
-mirrored here** so the canonical templates stay accurate.
+The mvm-side factories at `nix/lib/factories/` consume these
+canonical templates directly via `pkgs.lib.fileContents` and write
+per-workload configuration to `/etc/mvm/wrapper.json` (post-Item-6
+cleanup). Editing a wrapper here changes what every workload built
+through `mk{Python,Node}FunctionService` runs — there is no parallel
+inline copy to keep in sync.
