@@ -786,7 +786,7 @@ suspicious.
 
 - **Sprint 46 — Foundation (~5 days, narrative + UX, zero arch risk).** Plans A (Matryoshka ADR rewrite), B (Doctor security-claims-by-tier output), C (PVM FAQ entry), J (AWS deployment guide), K (Ubicloud deployment guide), plus deferred-backlog placeholder files for Plans F/G/H.
 - **Sprint 47 — macOS parity + Windows foundation (~1 sprint).** Plan D (APFS CoW for Apple Container templates) + Plan I.1 (Windows CI lane) + Plan I.2 (Windows install docs, WSL2-first).
-- **Sprint 48 — libkrun + Windows installer (~1.5 sprints).** Plan E (libkrun backend — Intel Mac + macOS-no-Lima) + Plan I.3 (winget manifest) + Plan I.4 (WSL2 bootstrap automation).
+- **Sprint 48 — libkrun + Windows installer (~1.5 sprints).** Plan E (libkrun backend — Intel Mac + macOS-no-Lima) + Plan I.3 (winget manifest) + Plan I.4 (WSL2 bootstrap automation). Sprint 48 ships **scaffolding** for libkrun (final API, dispatch, doctor, install hints); the spike phase that lands real C bindings + boot validation is tracked separately in [`plans/57-libkrun-spike.md`](plans/57-libkrun-spike.md).
 
 **Deferred backlog (rationale captured in plan 53):**
 

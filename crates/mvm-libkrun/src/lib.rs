@@ -16,12 +16,12 @@
 //! This crate ships **scaffolding** with the final public API shape:
 //! [`KrunContext`] for construction, [`start`] / [`stop`] for lifecycle,
 //! [`is_available`] for runtime detection. The implementation is gated
-//! on a real libkrun install — the spike phase of Plan E (boot a Nix-built
-//! ext4 rootfs in libkrun + verify vsock + verify codesigning entitlement)
-//! lands in a follow-up before lifecycle methods do real work.
+//! on a real libkrun install — see `specs/plans/57-libkrun-spike.md`
+//! for the work that lands the bindings, codesigning, and end-to-end
+//! boot validation.
 //!
 //! Until then, [`start`] / [`stop`] return [`Error::NotYetWired`] with a
-//! pointer to the open issue, and [`is_available`] checks the host for a
+//! pointer to plan 57, and [`is_available`] checks the host for a
 //! libkrun shared library at standard install locations (Homebrew on
 //! macOS, distro packages on Linux).
 //!
@@ -81,9 +81,10 @@ impl std::error::Error for Error {}
 ///
 /// **Not the same as "is functional"** — even if `is_available()`
 /// returns `true`, the [`start`] call may still fail with
-/// [`Error::NotYetWired`] until the Plan E spike phase lands the
-/// real bindings. Treat this as a precondition probe: if it returns
-/// `false`, point the user at [`install_hint`].
+/// [`Error::NotYetWired`] until the libkrun spike (specs/plans/
+/// 57-libkrun-spike.md) lands the real bindings. Treat this as a
+/// precondition probe: if it returns `false`, point the user at
+/// [`install_hint`].
 pub fn is_available() -> bool {
     install_paths().iter().any(|p| Path::new(p).exists())
 }
@@ -202,7 +203,7 @@ pub fn start(ctx: &KrunContext) -> Result<(), Error> {
     }
     let _ = ctx; // silence unused-arg until bindings land
     Err(Error::NotYetWired {
-        tracking: "plan 53 §\"Plan E\" / Sprint 48 spike phase",
+        tracking: "specs/plans/57-libkrun-spike.md",
     })
 }
 
@@ -216,7 +217,7 @@ pub fn stop(name: &str) -> Result<(), Error> {
     }
     let _ = name;
     Err(Error::NotYetWired {
-        tracking: "plan 53 §\"Plan E\" / Sprint 48 spike phase",
+        tracking: "specs/plans/57-libkrun-spike.md",
     })
 }
 
