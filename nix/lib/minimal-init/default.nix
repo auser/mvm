@@ -64,6 +64,21 @@
   # clear the inheritable cap set, and set `no_new_privs` before
   # handing off to the user's command. ADR-002 §W2.3.
   utilLinux ? pkgs.util-linux,
+  # `variant` mirrors the same parameter on `mkGuest` (see ../../flake.nix
+  # ~line 213). The init only needs it to gate the W4.5 setpriv wrapper
+  # around the guest agent: in `prod` images the agent must run as uid
+  # 901, but in `dev` images the agent's `dev-shell`-feature `do_exec`
+  # handler must spawn `nix build` children that can write to the
+  # overlayed /nix tree. Since /nix's lower layer is owned root:root
+  # (baked by the rootfs build), uid 901 can't write to copy-up'd
+  # directories. The simplest correct fix is to skip setpriv for dev —
+  # the agent runs as root, child Exec processes inherit root, and Nix
+  # writes succeed. This is not a security regression: in dev the
+  # `do_exec` handler already exposes arbitrary command execution to
+  # any caller on the vsock, so the setpriv-to-901 boundary inside the
+  # dev VM was already trivially bypassable. Production images
+  # (variant="prod") keep the setpriv wrap exactly as before.
+  variant ? "prod",
 }:
 
 let
@@ -440,6 +455,24 @@ let
   # would otherwise need the agent's own syscall surface enumerated.
   # The standard tier is applied to every service the agent supervises;
   # the agent's own surface is reduced via setpriv only.
+  # Production images wrap the agent in setpriv to drop it to uid 901
+  # (W4.5). Dev images run the agent as root so the `dev-shell` feature's
+  # `do_exec` handler can spawn `nix build` children that write to /nix —
+  # see the variant-parameter comment at the top of this file.
+  agentLaunchLine =
+    if variant == "dev" then
+      "${guestAgentPkg}/bin/mvm-guest-agent > /dev/console 2>&1 &"
+    else
+      ''${utilLinux}/bin/setpriv \
+        --reuid=901 --regid=901 --groups=901,900 \
+        --bounding-set=-all --no-new-privs --inh-caps=-all \
+        -- ${guestAgentPkg}/bin/mvm-guest-agent > /dev/console 2>&1 &'';
+  agentLaunchLog =
+    if variant == "dev" then
+      "[init] starting mvm-guest-agent (uid 0, dev variant — see ../../flake.nix mkGuest comment for variant=dev posture)..."
+    else
+      "[init] starting mvm-guest-agent (uid 901, mvm-agent)...";
+
   guestAgentBlock = lib.optionalString (guestAgentPkg != null) ''
     # --- mvm-guest-agent ---
     # /etc/mvm/{integrations.d,probes.d} are pre-created at rootfs build
@@ -452,15 +485,15 @@ let
       RUNNING=1
       trap 'RUNNING=0; kill "$CMD_PID" 2>/dev/null' TERM
       while [ "$RUNNING" = "1" ]; do
-        echo "[init] starting mvm-guest-agent (uid 901, mvm-agent)..." > /dev/console
-        # `--groups=901,900` already replaces the supplementary group
-        # set; combining with `--clear-groups` is rejected by setpriv
-        # as mutually exclusive (regressed the agent on every W3
-        # verity boot). ADR-002 §W4.5.
-        ${utilLinux}/bin/setpriv \
-          --reuid=901 --regid=901 --groups=901,900 \
-          --bounding-set=-all --no-new-privs --inh-caps=-all \
-          -- ${guestAgentPkg}/bin/mvm-guest-agent > /dev/console 2>&1 &
+        echo "${agentLaunchLog}" > /dev/console
+        # variant="prod": `--groups=901,900` already replaces the
+        # supplementary group set; combining with `--clear-groups` is
+        # rejected by setpriv as mutually exclusive (regressed the
+        # agent on every W3 verity boot). ADR-002 §W4.5.
+        # variant="dev": the agent runs as root so `do_exec` children
+        # can write to /nix's overlay (see the comment at the top of
+        # this file).
+        ${agentLaunchLine}
         CMD_PID=$!
         wait "$CMD_PID"
         RC=$?

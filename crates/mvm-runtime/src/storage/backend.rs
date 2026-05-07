@@ -235,13 +235,17 @@ impl MockBackend {
     }
 
     pub fn log(&self) -> Vec<String> {
-        self.state.lock().unwrap().log.clone()
+        self.state
+            .lock()
+            .expect("MockBackend state mutex poisoned")
+            .log
+            .clone()
     }
 
     /// Set the `used_bytes` field on a volume. Tests use this to
     /// drive pool-full + per-volume scenarios.
     pub fn set_used_bytes(&self, pool_name: &str, volume_name: &str, used: u64) {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().expect("MockBackend state mutex poisoned");
         if let Some(p) = s.pools.get_mut(pool_name)
             && let Some(v) = p.volumes.get_mut(volume_name)
         {
@@ -258,7 +262,7 @@ impl Default for MockBackend {
 
 impl Backend for MockBackend {
     fn create_pool(&self, name: &str, size_bytes: u64, block_size: u32) -> Result<()> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().expect("MockBackend state mutex poisoned");
         s.log.push(format!(
             "create_pool({name}, size={size_bytes}, block={block_size})"
         ));
@@ -271,7 +275,7 @@ impl Backend for MockBackend {
     }
 
     fn destroy_pool(&self, name: &str) -> Result<()> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().expect("MockBackend state mutex poisoned");
         s.log.push(format!("destroy_pool({name})"));
         s.pools.remove(name);
         Ok(())
@@ -284,7 +288,7 @@ impl Backend for MockBackend {
         _device_id: u32,
         virtual_size_bytes: u64,
     ) -> Result<PathBuf> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().expect("MockBackend state mutex poisoned");
         s.log.push(format!(
             "create_thin_volume({pool_name}, {volume_name}, size={virtual_size_bytes})"
         ));
@@ -314,7 +318,7 @@ impl Backend for MockBackend {
         snapshot_name: &str,
         _device_id: u32,
     ) -> Result<PathBuf> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().expect("MockBackend state mutex poisoned");
         s.log.push(format!(
             "snapshot_volume({pool_name}, origin={origin_volume}, snap={snapshot_name})"
         ));
@@ -344,7 +348,7 @@ impl Backend for MockBackend {
     }
 
     fn remove_volume(&self, pool_name: &str, volume_name: &str) -> Result<()> {
-        let mut s = self.state.lock().unwrap();
+        let mut s = self.state.lock().expect("MockBackend state mutex poisoned");
         s.log
             .push(format!("remove_volume({pool_name}, {volume_name})"));
         let pool = s
@@ -356,7 +360,7 @@ impl Backend for MockBackend {
     }
 
     fn pool_stats(&self, pool_name: &str) -> Result<BackendPoolStats> {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock().expect("MockBackend state mutex poisoned");
         let pool = s
             .pools
             .get(pool_name)
@@ -370,7 +374,7 @@ impl Backend for MockBackend {
     }
 
     fn volume_stats(&self, pool_name: &str, volume_name: &str) -> Result<BackendVolumeStats> {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock().expect("MockBackend state mutex poisoned");
         let pool = s
             .pools
             .get(pool_name)
@@ -386,7 +390,7 @@ impl Backend for MockBackend {
     }
 
     fn list_volumes(&self, pool_name: &str) -> Result<Vec<String>> {
-        let s = self.state.lock().unwrap();
+        let s = self.state.lock().expect("MockBackend state mutex poisoned");
         let pool = s
             .pools
             .get(pool_name)
