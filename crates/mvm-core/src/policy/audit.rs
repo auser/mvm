@@ -188,6 +188,15 @@ pub enum LocalAuditKind {
     /// trusting the per-tenant JSONL rollup file (which the audit
     /// chain authenticates by sealing each bucket here).
     MeteringEpoch,
+    // --- Plan 47: dm-thin storage pool ops ---
+    /// `mvmctl storage gc` removed one or more orphaned thin volumes
+    /// from the pool. Detail carries the removed volume names (or a
+    /// truncated count for large sweeps).
+    StorageGc,
+    /// Pool-full event surfaced from a clone/snapshot attempt. Detail
+    /// carries used + capacity bytes. Operators correlate with their
+    /// disk-pressure alerts.
+    StoragePoolFull,
 }
 
 /// A single local audit log entry.
