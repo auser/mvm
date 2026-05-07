@@ -221,6 +221,20 @@ ENVELOPE_MARKER = "MVMFORGE_ENVELOPE: "
 
 
 def _emit_envelope(mode: str, exc: BaseException) -> None:
+    """Emit a structured failure envelope to the substrate.
+
+    Phase 4d (mvm `specs/upstream-mvm-prompt.md` deliverable E.1):
+    when fd 3 is open (the substrate's fd-3 control channel), the
+    envelope goes there as a length-prefixed framed record so user
+    code can't spoof it by writing `MVMFORGE_ENVELOPE:` to stderr.
+    Stderr keeps its existing role: opaque user output (in dev mode)
+    or empty (in prod mode after scrubbing).
+
+    Backward-compat fallback: if fd 3 isn't open (older substrate, or
+    a non-mvm host running this wrapper for testing), the envelope
+    falls through to the legacy `MVMFORGE_ENVELOPE:` stderr line so
+    pre-4d hosts still parse it.
+    """
     error_id = secrets.token_hex(8)
     if mode == "dev":
         import traceback
@@ -232,12 +246,46 @@ def _emit_envelope(mode: str, exc: BaseException) -> None:
         "error_id": error_id,
         "message": str(exc) if mode == "dev" else _scrub(str(exc)),
     }
-    # Marker prefix lets the host SDK find the envelope unambiguously
-    # even if other lines get written to stderr before/after. The host
-    # parser scans for this prefix; the JSON body is the rest of the line.
+    envelope_bytes = json.dumps(envelope, ensure_ascii=False).encode("utf-8")
+
+    if _try_emit_to_fd3(envelope_bytes):
+        return
+
+    # Legacy fallback path. The host SDK scans stderr for this marker;
+    # safe because pre-4d substrates didn't open fd 3 in the child.
     sys.stderr.write(ENVELOPE_MARKER)
-    sys.stderr.write(json.dumps(envelope, ensure_ascii=False))
+    sys.stderr.write(envelope_bytes.decode("utf-8"))
     sys.stderr.write("\n")
+
+
+def _try_emit_to_fd3(envelope_bytes: bytes) -> bool:
+    """Frame and write `envelope_bytes` to fd 3 if open. Returns True
+    on success, False if fd 3 isn't available (the wrapper falls back
+    to the legacy stderr-marker path).
+
+    Frame format (matches `mvm_guest::vsock::EntrypointEvent::Control`
+    on-the-fd-3-wire shape):
+
+        header_len:  u32 LE   (4 bytes)
+        header_json: bytes    (header_len bytes; UTF-8 JSON)
+        payload_len: u32 LE   (4 bytes)
+        payload:     bytes    (payload_len bytes; empty for envelopes)
+    """
+    try:
+        # `os.write(3, ...)` raises OSError(EBADF) if fd 3 isn't open.
+        # We probe with a 0-byte write to detect availability without
+        # corrupting an unrelated fd 3 (e.g., if a user spawned this
+        # wrapper with their own pipe at fd 3, we still match the
+        # framing convention — the substrate is the only documented
+        # consumer).
+        import struct
+
+        header_len = struct.pack("<I", len(envelope_bytes))
+        payload_len = struct.pack("<I", 0)
+        os.write(3, header_len + envelope_bytes + payload_len)
+        return True
+    except (OSError, ImportError):
+        return False
 
 
 def _scrub(message: str) -> str:

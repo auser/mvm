@@ -30,7 +30,7 @@
 //     See scripts/wrapper_forbidden_check.py for the enforced list.
 //     mvmforge-allow: this is the comment that documents the gate.
 
-import { readFileSync } from "node:fs";
+import { readFileSync, writeSync } from "node:fs";
 import { chdir } from "node:process";
 import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -205,9 +205,43 @@ function emitEnvelope(mode, err) {
     error_id: errorId,
     message: mode === "dev" ? String(err && err.message) : scrub(String(err && err.message)),
   };
-  // Marker prefix: host SDK scans stderr for this token to recover the
-  // envelope unambiguously regardless of other log output before/after.
-  process.stderr.write(ENVELOPE_MARKER + JSON.stringify(envelope) + "\n");
+  const envelopeJson = JSON.stringify(envelope);
+
+  // Phase 4d (mvm `specs/upstream-mvm-prompt.md` deliverable E.1):
+  // when fd 3 is open (the substrate's fd-3 control channel),
+  // frame the envelope and write it there. User code can't spoof
+  // the channel by writing `MVMFORGE_ENVELOPE:` to stderr because
+  // the host parses envelopes only from fd 3.
+  //
+  // Fallback to the legacy stderr-marker path if fd 3 isn't open
+  // (older substrate / non-mvm host).
+  if (!tryEmitToFd3(envelopeJson)) {
+    process.stderr.write(ENVELOPE_MARKER + envelopeJson + "\n");
+  }
+}
+
+/// Frame and write `envelopeJson` to fd 3 if open. Returns true on
+/// success, false if the write fails (fd 3 unavailable). Frame format
+/// matches `mvm_guest::vsock::EntrypointEvent::Control` on-the-wire:
+///   header_len:  u32 LE   (4 bytes)
+///   header_json: bytes    (header_len bytes; UTF-8 JSON)
+///   payload_len: u32 LE   (4 bytes)
+///   payload:     bytes    (payload_len bytes; empty for envelopes)
+function tryEmitToFd3(envelopeJson) {
+  try {
+    const headerBytes = Buffer.from(envelopeJson, "utf-8");
+    const headerLen = Buffer.alloc(4);
+    headerLen.writeUInt32LE(headerBytes.length, 0);
+    const payloadLen = Buffer.alloc(4);
+    payloadLen.writeUInt32LE(0, 0);
+    const frame = Buffer.concat([headerLen, headerBytes, payloadLen]);
+    // Synchronous write so the envelope lands before exit. writeSync
+    // throws EBADF if fd 3 isn't open.
+    writeSync(3, frame);
+    return true;
+  } catch (_e) {
+    return false;
+  }
 }
 
 function scrub(message) {
