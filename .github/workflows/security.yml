@@ -5,14 +5,18 @@ name: Security
 # specs/plans/25-microvm-hardening.md and the seven claims in
 # CLAUDE.md::Security model. Failure on any lane blocks merge.
 #
-# Triggers: PRs against main, pushes to main, plus a nightly cron
-# so that advisory-DB additions get caught even on quiet branches.
+# Triggers: PRs against main, release-tag pushes (final pre-publish
+# gate), plus a nightly cron so advisory-DB additions get caught even
+# on quiet branches. `push: branches: [main]` was dropped in the
+# ecosystem-wide CI cost reduction — the nightly cron covers the
+# post-merge "did a new advisory land overnight" case at zero
+# per-merge cost, so the duplicate post-merge run was pure waste.
 
 on:
   pull_request:
     branches: [main]
   push:
-    branches: [main]
+    tags: ["v*"]
   schedule:
     # 04:17 UTC daily — picks up new RUSTSEC advisories that landed
     # in the advisory-db without anyone touching the repo.
@@ -353,9 +357,9 @@ jobs:
   # compressed layers, embedded host paths, builder-host nonces) that
   # would silently break the cosign-signed manifest's nix_store_hash
   # field. Heavy (~10 min for the double build), so PR-skipped — runs
-  # on push to main, schedule, and workflow_dispatch only. The mvmctl
-  # binary's reproducibility lane (above) covers PR feedback for the
-  # cheap case.
+  # on release-tag pushes, the nightly schedule, and workflow_dispatch
+  # only. The mvmctl binary's reproducibility lane (above) covers PR
+  # feedback for the cheap case.
   builder-image-reproducibility:
     name: Builder image reproducibility (plan 36 §Layer 0)
     if: github.event_name != 'pull_request'
