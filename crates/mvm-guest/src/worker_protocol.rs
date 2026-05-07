@@ -46,11 +46,40 @@ pub struct WorkerCallResponse {
     /// Buffered stdout from the call.
     #[serde(with = "base64_bytes")]
     pub stdout: Vec<u8>,
-    /// Buffered stderr from the call. Wrapper must sanitize this in
-    /// production mode (ADR-007 §sanitized error envelope).
+    /// Buffered stderr from the call. Stays as user output verbatim
+    /// — the wrapper does **not** mix structured envelope JSON into
+    /// stderr (that gadget is what `controls` exists to replace).
     #[serde(with = "base64_bytes")]
     pub stderr: Vec<u8>,
+    /// Per-call control-channel records. Replaces the old `stderr`
+    /// envelope-mixing pattern: wrappers emit structured envelopes
+    /// through this field, leaving stderr as opaque user output the
+    /// host streams to its caller verbatim. Phase 4c — see
+    /// `mvm_guest::vsock::EntrypointEvent::Control` for the wire
+    /// shape.
+    ///
+    /// `#[serde(default)]` makes this backward-compatible: a worker
+    /// built before Phase 4c that doesn't know about the field will
+    /// produce a response without it, and that still deserializes
+    /// to an empty Vec. Today's in-tree Python and Node wrappers
+    /// haven't been flipped yet (Phase 4d will), so this field is
+    /// almost always empty in real boots.
+    #[serde(default)]
+    pub controls: Vec<WorkerControlRecord>,
     pub outcome: WorkerOutcome,
+}
+
+/// One control record on the warm-worker → agent wire. Mirrors
+/// `mvm_guest::entrypoint::ControlRecord` but with base64-encoded
+/// payload bytes (since the worker frame is JSON).
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct WorkerControlRecord {
+    /// JSON-encoded record header.
+    pub header_json: String,
+    /// Opaque per-record payload, base64-encoded over JSON.
+    #[serde(with = "base64_bytes")]
+    pub payload: Vec<u8>,
 }
 
 /// Terminal disposition of a single call. The agent maps this onto
@@ -156,6 +185,7 @@ mod tests {
         let resp = WorkerCallResponse {
             stdout: b"output bytes".to_vec(),
             stderr: vec![],
+            controls: Vec::new(),
             outcome: WorkerOutcome::Exit { code: 0 },
         };
         let mut buf = Vec::new();
@@ -170,6 +200,7 @@ mod tests {
         let resp = WorkerCallResponse {
             stdout: vec![],
             stderr: b"sanitized envelope".to_vec(),
+            controls: Vec::new(),
             outcome: WorkerOutcome::Error {
                 kind: "wrapper_crash".into(),
                 message: "panic in user code".into(),

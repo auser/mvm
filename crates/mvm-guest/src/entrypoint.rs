@@ -353,7 +353,7 @@ impl CallCaps {
 /// One control-channel record parsed from the wrapper's fd-3 stream.
 /// Wire format (length-prefixed JSON header + length-prefixed payload)
 /// is documented at `mvm_guest::vsock::EntrypointEvent::Control`.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ControlRecord {
     pub header_json: String,
     pub payload: Vec<u8>,

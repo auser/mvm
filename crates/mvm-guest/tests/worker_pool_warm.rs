@@ -104,6 +104,36 @@ fn warm_process_round_trip_pid_stable() {
 }
 
 #[test]
+fn warm_process_emits_control_records_through_pool() {
+    // Phase 4c: a wrapper that emits one envelope-style control
+    // record per call should round-trip through the pool intact.
+    // Stderr stays as opaque user output (containing the literal
+    // `MVMFORGE_ENVELOPE:` token the fake runner writes there) —
+    // proving the host can no longer be tricked into reparsing
+    // stderr as a structured envelope, since envelopes now arrive
+    // through the dedicated `controls` channel.
+    let pool = start_pool_with_behavior(cfg(1, 100, 1024), Some("emit_control"));
+
+    let out = dispatch(&pool, b"payload");
+    assert!(matches!(out.outcome, WorkerOutcome::Exit { code: 0 }));
+    assert_eq!(out.controls.len(), 1, "expected one control record");
+    assert!(
+        out.controls[0].header_json.contains(r#""kind":"envelope""#),
+        "control header was {:?}",
+        out.controls[0].header_json
+    );
+    assert!(out.controls[0].payload.is_empty());
+    // Stderr passthrough: the literal `MVMFORGE_ENVELOPE:` is
+    // delivered as bytes, not parsed as an envelope by the host.
+    assert!(
+        out.stderr
+            .starts_with(b"MVMFORGE_ENVELOPE: this-must-not-be-parsed"),
+        "stderr should pass through verbatim, got {:?}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn user_code_fault_does_not_recycle() {
     // The fake runner returns Exit { code: 1 } on every call; the
     // pool must NOT recycle on user-code-level failure.
