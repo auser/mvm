@@ -29,6 +29,24 @@ fn mvm_with_runtime_dir(runtime_dir: &std::path::Path) -> Command {
     cmd
 }
 
+/// Spawn `mvmctl` with runtime + state + data dirs all pinned to
+/// temps. Use when the test needs to inspect the audit log: the
+/// audit framework's `default_audit_log()` first checks a legacy
+/// path under `MVM_DATA_DIR` for backward compat, so we have to
+/// pin **both** state and data dirs to ensure the log lands under
+/// `<state_dir>/log/audit.jsonl` and not in the user's real home.
+fn mvm_with_isolated_dirs(runtime_dir: &std::path::Path, state_dir: &std::path::Path) -> Command {
+    #[allow(deprecated)]
+    let mut cmd = Command::cargo_bin("mvmctl").unwrap();
+    cmd.env("MVM_RUNTIME_DIR", runtime_dir);
+    cmd.env("MVM_STATE_DIR", state_dir);
+    // Point MVM_DATA_DIR somewhere that doesn't have a legacy
+    // audit.jsonl — using the runtime_dir is convenient since it's
+    // already a fresh temp.
+    cmd.env("MVM_DATA_DIR", runtime_dir);
+    cmd
+}
+
 /// Helper: pre-populate the on-disk session table at `runtime_dir`
 /// while holding the env-lock so concurrent tests don't observe a
 /// transient `MVM_RUNTIME_DIR` value. Returns the id of the written
@@ -143,6 +161,23 @@ fn session_set_timeout_invalid_id_is_rejected() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("Invalid session id"));
+}
+
+#[test]
+fn session_set_timeout_above_ceiling_is_rejected() {
+    let temp = tempfile::tempdir().unwrap();
+    // 86401 = 24h + 1s, just past the ceiling. The ceiling check
+    // fires before id resolution so any id (even bogus) hits it.
+    mvm_with_runtime_dir(temp.path())
+        .args([
+            "session",
+            "set-timeout",
+            "aaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "86401",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("ceiling"));
 }
 
 #[test]
@@ -301,4 +336,40 @@ fn session_exec_unknown_id_errors_before_mode_check() {
         .assert()
         .failure()
         .stderr(predicate::str::contains("no session with id"));
+}
+
+#[test]
+fn session_reap_emits_audit_line_per_reaped_session() {
+    // Pre-populate one expired session, then run `mvmctl session reap`
+    // with a pinned state dir. Assert the audit log at
+    // `<state>/log/audit.jsonl` picks up a `session_reap` line.
+    // Tear-down of the (non-existent) backend VM is best-effort and
+    // doesn't block the audit emit — `tear_down_session_vm` swallows
+    // backend errors via `tracing::warn`.
+    let runtime = tempfile::tempdir().unwrap();
+    let state = tempfile::tempdir().unwrap();
+
+    let mut rec = SessionRecord::new_running("vm-stale", "wl", SessionMode::Prod);
+    let stale_ts = chrono::Utc::now() - chrono::Duration::seconds(900);
+    rec.idle_timeout_secs = 60;
+    rec.started_at = stale_ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+    let session_id = rec.id.to_string();
+    let _lock = populate_record(runtime.path(), &rec);
+
+    mvm_with_isolated_dirs(runtime.path(), state.path())
+        .args(["session", "reap"])
+        .assert()
+        .success();
+
+    let log_path = state.path().join("log").join("audit.jsonl");
+    let log = std::fs::read_to_string(&log_path)
+        .unwrap_or_else(|e| panic!("expected audit log at {log_path:?}: {e}"));
+    assert!(
+        log.contains("\"session_reap\""),
+        "expected a session_reap kind in the audit log, got:\n{log}"
+    );
+    assert!(
+        log.contains(&session_id),
+        "expected the reaped session id {session_id} in audit detail, got:\n{log}"
+    );
 }
