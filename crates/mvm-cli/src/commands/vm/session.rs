@@ -339,11 +339,65 @@ fn cmd_set_timeout(args: SetTimeoutArgs) -> Result<()> {
         Ok(())
     })
     .context("updating session timeout")?;
+
+    // Best-effort: tell the substrate so its warm-process pool's
+    // recycler enforces the same value. If the agent is unreachable
+    // (VM down, vsock proxy missing, agent crashed), the host record
+    // still wins on the next `mvmctl session reap` — the substrate
+    // dispatch is an optimization, not load-bearing for correctness.
+    match dispatch_update_idle_timeout(&updated.vm_name, args.seconds) {
+        Ok((prev, 0)) => {
+            tracing::debug!(
+                session = %id,
+                prev_secs = prev,
+                "set-timeout: agent acknowledged but no warm-process pool active"
+            );
+        }
+        Ok((prev, applied)) => {
+            ui::info(&format!("substrate idle timeout: {prev}s → {applied}s"));
+        }
+        Err(e) => {
+            tracing::warn!(
+                session = %id,
+                err = %e,
+                "set-timeout: agent dispatch failed; host reaper still enforces"
+            );
+        }
+    }
+
     ui::info(&format!(
         "Updated session {id} idle_timeout_secs={}",
         updated.idle_timeout_secs
     ));
     Ok(())
+}
+
+/// Send `UpdateIdleTimeout` to the substrate's guest agent. Returns
+/// `(previous_secs, applied_secs)` from the ACK. `applied_secs == 0`
+/// means the agent received the verb but no warm-process pool is
+/// active (cold-path-only build) — the host reaper remains the only
+/// enforcement. Errors propagate the underlying transport failure;
+/// the caller treats them as best-effort.
+fn dispatch_update_idle_timeout(vm_name: &str, secs: u64) -> Result<(u64, u64)> {
+    let transport = mvm_runtime::vsock_transport::for_vm(vm_name)
+        .with_context(|| format!("Picking transport for guest agent on {vm_name:?}"))?;
+    let mut stream = transport
+        .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
+        .with_context(|| format!("Connecting to guest agent on {vm_name:?}"))?;
+    let resp = mvm_guest::vsock::send_request(
+        &mut stream,
+        &mvm_guest::vsock::GuestRequest::UpdateIdleTimeout { secs },
+    )?;
+    match resp {
+        mvm_guest::vsock::GuestResponse::UpdateIdleTimeoutAck {
+            previous_secs,
+            applied_secs,
+        } => Ok((previous_secs, applied_secs)),
+        mvm_guest::vsock::GuestResponse::Error { message } => {
+            anyhow::bail!("guest agent error: {message}")
+        }
+        other => anyhow::bail!("unexpected response to UpdateIdleTimeout: {other:?}"),
+    }
 }
 
 /// Look up a Running session by id, returning `(id, record)`. Common

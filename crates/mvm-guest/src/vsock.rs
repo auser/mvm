@@ -150,6 +150,19 @@ pub enum GuestRequest {
     /// can actually serve `RunEntrypoint`. ADR-007 / plan 41 W5.
     /// Prod-safe — reveals no secrets, takes no inputs.
     EntrypointStatus,
+    /// Update the warm-process pool's idle-recycle timeout. Workers
+    /// that have been idle (no in-flight call) longer than
+    /// `secs` are recycled at the next sweep. `secs == 0` disables
+    /// idle-based recycling — only `max_calls_per_worker` and
+    /// `max_rss_mb` triggers remain.
+    ///
+    /// This is the substrate-side mirror of `mvmctl session
+    /// set-timeout <id> <secs>`: the host writes the new value into
+    /// the session record, then dispatches this verb so the agent's
+    /// pool sees the same value. A best-effort dispatch — if the
+    /// agent is unreachable the host record still wins on the next
+    /// `mvmctl session reap`.
+    UpdateIdleTimeout { secs: u64 },
 }
 
 /// Response from guest vsock agent to host.
@@ -231,6 +244,14 @@ pub enum GuestResponse {
         ok: bool,
         path: Option<String>,
         detail: Option<String>,
+    },
+    /// Acknowledgement for `UpdateIdleTimeout`. `applied_secs` is the
+    /// value the agent is now enforcing — `0` means the warm-process
+    /// pool isn't active on this guest (cold-path-only build), so
+    /// the host reaper is the only enforcement.
+    UpdateIdleTimeoutAck {
+        previous_secs: u64,
+        applied_secs: u64,
     },
 }
 
@@ -1219,6 +1240,8 @@ mod tests {
                 cols: 80,
                 rows: 24,
             },
+            GuestRequest::UpdateIdleTimeout { secs: 600 },
+            GuestRequest::UpdateIdleTimeout { secs: 0 },
         ];
 
         for req in &variants {
@@ -1312,6 +1335,14 @@ mod tests {
                 exit_code: 0,
             },
             GuestResponse::ConsoleResized { session_id: 1 },
+            GuestResponse::UpdateIdleTimeoutAck {
+                previous_secs: 300,
+                applied_secs: 600,
+            },
+            GuestResponse::UpdateIdleTimeoutAck {
+                previous_secs: 0,
+                applied_secs: 0,
+            },
         ];
 
         for resp in &variants {

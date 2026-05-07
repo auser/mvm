@@ -134,6 +134,82 @@ fn warm_process_emits_control_records_through_pool() {
 }
 
 #[test]
+fn set_idle_timeout_returns_previous_value() {
+    let pool = start_pool(cfg(1, 100, 1024));
+    // Initial value is 0 (disabled). First swap: previous=0, new=60.
+    assert_eq!(pool.set_idle_timeout(60), 0);
+    assert_eq!(pool.idle_timeout_secs(), 60);
+    // Second swap returns the prior value we just set.
+    assert_eq!(pool.set_idle_timeout(120), 60);
+    assert_eq!(pool.idle_timeout_secs(), 120);
+    // Disabling returns the prior value too.
+    assert_eq!(pool.set_idle_timeout(0), 120);
+    assert_eq!(pool.idle_timeout_secs(), 0);
+}
+
+#[test]
+fn idle_timeout_zero_disables_recycle() {
+    // With timeout=0, even if the worker has been "idle" for a while,
+    // sweep should not touch it. PID remains stable.
+    let pool = start_pool(cfg(1, 100, 1024));
+    let pid_before = idle_pid(&pool);
+    assert_eq!(pool.set_idle_timeout(0), 0);
+    std::thread::sleep(Duration::from_millis(100));
+    pool.sweep_idle();
+    assert_eq!(idle_pid(&pool), pid_before, "no recycle when timeout=0");
+}
+
+#[test]
+fn idle_timeout_recycles_idle_workers_past_threshold() {
+    // 1-second idle timeout. A freshly-spawned worker, given 1.5
+    // seconds of nothing-to-do, should be recycled by an explicit
+    // sweep — `sweep_idle` is the deterministic test hook for what
+    // the background recycler thread does on its 10s tick.
+    let pool = start_pool(cfg(1, 100, 1024));
+    let pid_before = idle_pid(&pool);
+    pool.set_idle_timeout(1);
+    std::thread::sleep(Duration::from_millis(1500));
+    pool.sweep_idle();
+    let pid_after = idle_pid(&pool);
+    assert_ne!(
+        pid_after, pid_before,
+        "expected idle-recycle to replace the worker"
+    );
+}
+
+#[test]
+fn idle_timeout_skips_busy_workers() {
+    // While a worker is mid-call (Busy state), the sweep must skip
+    // it — recycling a busy worker would yank the call's pipe and
+    // surface as a transport error to the caller.
+    let pool = start_pool_with_behavior(cfg(1, 100, 1024), Some("slow_secs=2"));
+    pool.set_idle_timeout(1);
+
+    // Dispatch a 2s call on a background thread; it'll be Busy
+    // mid-call when we sweep.
+    let pool_clone = Arc::clone(&pool);
+    let dispatch_handle =
+        std::thread::spawn(move || pool_clone.dispatch(b"x".to_vec(), 5).expect("dispatch"));
+
+    // Give the worker time to enter Busy state (acquire flips the
+    // slot) and pass the 1s idle threshold from spawn.
+    std::thread::sleep(Duration::from_millis(1200));
+    pool.sweep_idle();
+
+    // Slot should still be Busy (the call is in-flight). If the
+    // sweep had recycled, the slot would be Idle with a fresh PID.
+    let snap = pool.snapshot();
+    assert!(
+        snap.iter().any(|s| matches!(s, SlotSnapshot::Busy)),
+        "busy worker must not be recycled mid-call, got snap={snap:?}"
+    );
+
+    // Let the call finish; verify it succeeded (no transport error).
+    let out = dispatch_handle.join().expect("dispatch thread joined");
+    assert!(matches!(out.outcome, WorkerOutcome::Exit { code: 0 }));
+}
+
+#[test]
 fn user_code_fault_does_not_recycle() {
     // The fake runner returns Exit { code: 1 } on every call; the
     // pool must NOT recycle on user-code-level failure.

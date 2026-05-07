@@ -1536,6 +1536,28 @@ fn handle_client(
                 detail: Some("entrypoint validation never ran".to_string()),
             },
         },
+
+        // Substrate-side mirror of `mvmctl session set-timeout`. If
+        // the warm-process pool is active (plan 43 / tier-2 dispatch),
+        // the agent updates its idle-recycle threshold and a recycler
+        // thread reaps individual workers idle past the new
+        // timeout — keeping the VM up while pruning waste. If no pool
+        // is active, the verb is a no-op acknowledged with
+        // `applied_secs = 0`; the host-side reaper remains the only
+        // enforcement on cold-path-only builds.
+        GuestRequest::UpdateIdleTimeout { secs } => match WARM_POOL.get() {
+            Some(Some(pool)) => {
+                let previous = pool.set_idle_timeout(secs);
+                GuestResponse::UpdateIdleTimeoutAck {
+                    previous_secs: previous,
+                    applied_secs: secs,
+                }
+            }
+            _ => GuestResponse::UpdateIdleTimeoutAck {
+                previous_secs: 0,
+                applied_secs: 0,
+            },
+        },
     };
 
     write_response(&mut file, &resp);
