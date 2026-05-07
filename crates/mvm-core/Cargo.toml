@@ -16,6 +16,7 @@ mvm-libkrun.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+thiserror = "1"
 tokio = { workspace = true, features = ["io-util"] }
 toml.workspace = true
 tracing.workspace = true

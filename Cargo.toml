@@ -2,6 +2,7 @@
 members = [
     "crates/mvm-core",
     "crates/mvm-security",
+    "crates/mvm-storage",
     "crates/mvm-plan",
     "crates/mvm-policy",
     "crates/mvm-supervisor",
@@ -105,6 +106,7 @@ mvm-guest = { path = "crates/mvm-guest", version = "0.13.0" }
 mvm-build = { path = "crates/mvm-build", version = "0.13.0" }
 mvm-runtime = { path = "crates/mvm-runtime", version = "0.13.0" }
 mvm-security = { path = "crates/mvm-security", version = "0.13.0" }
+mvm-storage = { path = "crates/mvm-storage", version = "0.13.0" }
 mvm-plan = { path = "crates/mvm-plan", version = "0.13.0" }
 mvm-policy = { path = "crates/mvm-policy", version = "0.13.0" }
 mvm-supervisor = { path = "crates/mvm-supervisor", version = "0.13.0" }

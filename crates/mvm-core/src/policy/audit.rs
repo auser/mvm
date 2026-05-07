@@ -175,10 +175,12 @@ pub enum LocalAuditKind {
     /// `mvmctl vm set-ttl` — changes the TTL deadline on a running
     /// VM. The reaper picks up the new deadline on its next tick.
     VmTtlSet,
-    /// `mvmctl vm share add` / `share remove` — mounts or unmounts
-    /// a host directory into a running guest.
-    VmShareAdd,
-    VmShareRemove,
+    /// `mvmctl vm volume add` / `volume remove` — mounts or unmounts
+    /// a virtio-fs volume into a running guest. (Plan 45 — rename of
+    /// the prior `VmShareAdd` / `VmShareRemove` per Path C; no compat
+    /// shim, no behavioural change.)
+    VmVolumeAdd,
+    VmVolumeRemove,
     // --- Plan 46: metering API ---
     /// One per-minute metering bucket sealed and chained into the
     /// audit log. Plan 46 — auditing-grade resource attribution. The

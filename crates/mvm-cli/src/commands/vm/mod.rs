@@ -12,7 +12,7 @@ pub(super) mod pause;
 pub(super) mod proc;
 pub(super) mod ps;
 pub(super) mod set_ttl;
-pub(super) mod share;
 pub(super) mod up;
+pub(super) mod volume;
 
 pub(super) use super::{Cli, shared};

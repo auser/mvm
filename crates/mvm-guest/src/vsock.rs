@@ -325,21 +325,22 @@ pub enum GuestRequest {
     // under `/etc`, `/usr`, `/proc`, etc.) so a host can't shadow
     // verity-protected files post-boot. Production-safe.
     // ========================================================================
-    /// Mount a virtio-fs share inside the guest. The host has
+    /// Mount a virtio-fs volume inside the guest. The host has
     /// already attached the device and the agent only needs to
-    /// run the in-guest mount(2) call. `tag` is the virtio-fs
-    /// tag string the device was created with.
-    MountShare {
-        tag: String,
+    /// run the in-guest mount(2) call. `volume_name` is the
+    /// virtio-fs tag string the device was created with — named
+    /// per plan 45 to align with the `Volume` wire type.
+    /// (Replaces the former `MountShare` per plan 45 §D5.)
+    MountVolume {
+        volume_name: String,
         guest_path: String,
         read_only: bool,
     },
-    /// Unmount a previously-mounted share. `force = false`
+    /// Unmount a previously-mounted volume. `force = false`
     /// returns `EBUSY` when the kernel reports active fds; the
-    /// caller passes `force = true` to demand a lazy detach
-    /// (G4 of the parity plan — forced detach is opt-in and
-    /// emits a typed audit event).
-    UnmountShare { guest_path: String, force: bool },
+    /// caller passes `force = true` to demand a lazy detach.
+    /// (Replaces the former `UnmountShare` per plan 45 §D5.)
+    UnmountVolume { guest_path: String, force: bool },
 }
 
 /// Helper for `#[serde(default = "...")]` on `bool` fields where
@@ -446,43 +447,45 @@ pub enum GuestResponse {
     /// `TimedOut` / `Error`.
     ProcWaitEvent(ProcWaitEvent),
 
-    /// Result of a `MountShare` / `UnmountShare` call. Single-frame
+    /// Result of a `MountVolume` / `UnmountVolume` call. Single-frame
     /// surface; closed sub-enum carries the per-verb shape.
-    /// W1 / D.
-    ShareResult(ShareResult),
+    /// (Renamed from `ShareResult` per plan 45 §D5.)
+    VolumeMountResult(VolumeMountResult),
 }
 
-/// Result of a virtio-fs share operation.
+/// Result of a virtio-fs volume mount operation.
+/// (Renamed from `ShareResult` per plan 45 §D5.)
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
-pub enum ShareResult {
-    /// `MountShare` succeeded. `canonical_path` is the
+pub enum VolumeMountResult {
+    /// `MountVolume` succeeded. `canonical_path` is the
     /// post-validation path the agent actually mounted at — same
     /// shape as input but with trailing slashes normalised.
     Mounted { canonical_path: String },
-    /// `UnmountShare` succeeded.
+    /// `UnmountVolume` succeeded.
     Unmounted,
     /// Verb-specific error.
     Error {
-        kind: ShareErrorKind,
+        kind: VolumeMountErrorKind,
         message: String,
     },
 }
 
-/// Class of error returned in `ShareResult::Error`. Closed enum so
-/// the host can branch on `kind` without parsing message text.
+/// Class of error returned in `VolumeMountResult::Error`. Closed enum
+/// so the host can branch on `kind` without parsing message text.
+/// (Renamed from `ShareErrorKind` per plan 45 §D5.)
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub enum ShareErrorKind {
+pub enum VolumeMountErrorKind {
     /// `guest_path` is empty / not absolute / contains `..` /
     /// embedded NUL.
     BadPath,
     /// `guest_path` resolved to a deny-prefix or fell outside the
     /// allow-roots configured for this image.
     PolicyDenied,
-    /// `tag` is empty, too long, or contains characters virtio-fs
-    /// won't accept.
-    BadTag,
+    /// `volume_name` is empty, too long, or contains characters
+    /// virtio-fs won't accept as a tag.
+    BadVolumeName,
     /// `mount(2)` returned a non-EBUSY error (no virtiofsd, kernel
     /// missing virtio_fs module, etc.).
     MountFailed,
@@ -1801,12 +1804,12 @@ mod tests {
             GuestRequest::ProcKill {
                 pid_token: "tok-abc".to_string(),
             },
-            GuestRequest::MountShare {
-                tag: "data-tag".to_string(),
+            GuestRequest::MountVolume {
+                volume_name: "data-volume".to_string(),
                 guest_path: "/data/foo".to_string(),
                 read_only: true,
             },
-            GuestRequest::UnmountShare {
+            GuestRequest::UnmountVolume {
                 guest_path: "/data/foo".to_string(),
                 force: false,
             },
@@ -1957,16 +1960,16 @@ mod tests {
                 kind: ProcErrorKind::UnsupportedInProduction,
                 message: "stripped from prod".to_string(),
             }),
-            GuestResponse::ShareResult(ShareResult::Mounted {
+            GuestResponse::VolumeMountResult(VolumeMountResult::Mounted {
                 canonical_path: "/data/foo".to_string(),
             }),
-            GuestResponse::ShareResult(ShareResult::Unmounted),
-            GuestResponse::ShareResult(ShareResult::Error {
-                kind: ShareErrorKind::PolicyDenied,
+            GuestResponse::VolumeMountResult(VolumeMountResult::Unmounted),
+            GuestResponse::VolumeMountResult(VolumeMountResult::Error {
+                kind: VolumeMountErrorKind::PolicyDenied,
                 message: "/etc/x is on the deny list".to_string(),
             }),
-            GuestResponse::ShareResult(ShareResult::Error {
-                kind: ShareErrorKind::Busy,
+            GuestResponse::VolumeMountResult(VolumeMountResult::Error {
+                kind: VolumeMountErrorKind::Busy,
                 message: "target busy; pass force=true".to_string(),
             }),
         ];
@@ -2107,14 +2110,14 @@ mod tests {
         );
     }
 
-    /// W4.1 + D regression: every new Share variant rejects unknown
+    /// W4.1 + D regression: every new Volume variant rejects unknown
     /// fields. Mirrors the FS / Proc deny-unknown-fields tests for
-    /// the virtio-fs share surface.
+    /// the virtio-fs volume surface.
     #[test]
-    fn test_share_request_variants_reject_unknown_fields() {
+    fn test_volume_request_variants_reject_unknown_fields() {
         let cases = [
-            r#"{"MountShare":{"tag":"t","guest_path":"/data/x","read_only":true,"smuggled":1}}"#,
-            r#"{"UnmountShare":{"guest_path":"/data/x","force":false,"smuggled":1}}"#,
+            r#"{"MountVolume":{"volume_name":"v","guest_path":"/data/x","read_only":true,"smuggled":1}}"#,
+            r#"{"UnmountVolume":{"guest_path":"/data/x","force":false,"smuggled":1}}"#,
         ];
         for json in cases {
             let err = serde_json::from_str::<GuestRequest>(json).unwrap_err();
@@ -2125,14 +2128,14 @@ mod tests {
         }
     }
 
-    /// `ShareResult` sub-variants reachable through `GuestResponse`
-    /// also need deny-unknown-fields, since they land on the
-    /// host's deserializer.
+    /// `VolumeMountResult` sub-variants reachable through
+    /// `GuestResponse` also need deny-unknown-fields, since they land
+    /// on the host's deserializer.
     #[test]
-    fn test_share_response_subtypes_reject_unknown_fields() {
+    fn test_volume_response_subtypes_reject_unknown_fields() {
         let cases = [
-            r#"{"ShareResult":{"Mounted":{"canonical_path":"/data/x","smuggled":1}}}"#,
-            r#"{"ShareResult":{"Error":{"kind":"PolicyDenied","message":"x","smuggled":1}}}"#,
+            r#"{"VolumeMountResult":{"Mounted":{"canonical_path":"/data/x","smuggled":1}}}"#,
+            r#"{"VolumeMountResult":{"Error":{"kind":"PolicyDenied","message":"x","smuggled":1}}}"#,
         ];
         for json in cases {
             let err = serde_json::from_str::<GuestResponse>(json).unwrap_err();
@@ -2143,17 +2146,17 @@ mod tests {
         }
     }
 
-    /// `ShareResult::Unmounted` is a unit variant; verify the wire
-    /// shape is just the variant name.
+    /// `VolumeMountResult::Unmounted` is a unit variant; verify the
+    /// wire shape is just the variant name.
     #[test]
-    fn test_share_unmounted_unit_variant_roundtrip() {
-        let resp = GuestResponse::ShareResult(ShareResult::Unmounted);
+    fn test_volume_unmounted_unit_variant_roundtrip() {
+        let resp = GuestResponse::VolumeMountResult(VolumeMountResult::Unmounted);
         let json = serde_json::to_string(&resp).unwrap();
-        assert!(json.contains(r#""ShareResult":"Unmounted""#));
+        assert!(json.contains(r#""VolumeMountResult":"Unmounted""#));
         let parsed: GuestResponse = serde_json::from_str(&json).unwrap();
         assert!(matches!(
             parsed,
-            GuestResponse::ShareResult(ShareResult::Unmounted)
+            GuestResponse::VolumeMountResult(VolumeMountResult::Unmounted)
         ));
     }
 

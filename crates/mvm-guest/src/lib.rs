@@ -8,7 +8,7 @@ pub mod fs_rpc;
 pub mod integrations;
 pub mod probes;
 pub mod runtime_config;
-pub mod share;
+pub mod volume;
 pub mod vsock;
 pub mod worker_pool;
 pub mod worker_protocol;
