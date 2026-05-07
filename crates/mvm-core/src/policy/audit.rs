@@ -163,6 +163,23 @@ pub enum LocalAuditKind {
     /// `Killed`. Inflight invokes against the session resolve as
     /// failures with `kind = "session-killed"`.
     SessionKill,
+    /// `mvmctl session attach <id>` re-attached a fresh client to an
+    /// existing session. Detail carries `session_id`. Auditable even
+    /// for read-only attaches because attach is a session-state
+    /// observation worth correlating with the calling client.
+    SessionAttach,
+    /// `mvmctl session exec <id> -- <argv>` ran an ad-hoc command
+    /// against a dev-mode session. Refused on prod sessions at the
+    /// substrate layer — never gated on client-side checks alone.
+    /// Detail carries `session_id` and the argv (truncated for
+    /// long invocations).
+    SessionExec,
+    /// `mvmctl session run-code <id> <code>` ran an ad-hoc code
+    /// snippet against a dev-mode session. Refused on prod sessions
+    /// at the substrate layer. Detail carries `session_id` and a
+    /// SHA-256 of the code (not the code itself — code may carry
+    /// arbitrary user content, including secrets).
+    SessionRunCode,
 }
 
 /// A single local audit log entry.

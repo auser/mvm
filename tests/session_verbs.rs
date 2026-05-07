@@ -224,3 +224,123 @@ fn session_start_with_dev_mode_persists_mode() {
     .unwrap();
     assert_eq!(json["mode"], "dev");
 }
+
+// ── Plan 52 phase 3+4: attach / exec / run-code ─────────────────────
+
+fn start_session(tmp: &TempDir, mode: &str) -> String {
+    String::from_utf8(
+        mvm_with_data_dir(tmp.path())
+            .args(["session", "start", "wl", "--mode", mode])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap()
+    .trim()
+    .to_string()
+}
+
+#[test]
+fn session_attach_increments_invoke_count() {
+    let tmp = TempDir::new().unwrap();
+    let id = start_session(&tmp, "prod");
+
+    mvm_with_data_dir(tmp.path())
+        .args(["session", "attach", &id])
+        .assert()
+        .success();
+    mvm_with_data_dir(tmp.path())
+        .args(["session", "attach", &id])
+        .assert()
+        .success();
+
+    let json: Value = serde_json::from_slice(
+        &mvm_with_data_dir(tmp.path())
+            .args(["session", "info", &id])
+            .output()
+            .unwrap()
+            .stdout,
+    )
+    .unwrap();
+    assert_eq!(json["invoke_count"], 2);
+    assert_eq!(json["status"], "running");
+    assert!(
+        json.get("last_invoke_at")
+            .and_then(|v| v.as_str())
+            .is_some(),
+        "attach should set last_invoke_at"
+    );
+}
+
+#[test]
+fn session_attach_refuses_killed_session() {
+    let tmp = TempDir::new().unwrap();
+    let id = start_session(&tmp, "prod");
+    mvm_with_data_dir(tmp.path())
+        .args(["session", "kill", &id])
+        .assert()
+        .success();
+
+    mvm_with_data_dir(tmp.path())
+        .args(["session", "attach", &id])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("killed"));
+}
+
+#[test]
+fn session_exec_refuses_prod_session() {
+    let tmp = TempDir::new().unwrap();
+    let id = start_session(&tmp, "prod");
+
+    mvm_with_data_dir(tmp.path())
+        .args(["session", "exec", &id, "--", "ls", "/"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("dev-only"));
+}
+
+#[test]
+fn session_exec_succeeds_on_dev_session() {
+    let tmp = TempDir::new().unwrap();
+    let id = start_session(&tmp, "dev");
+
+    mvm_with_data_dir(tmp.path())
+        .args(["session", "exec", &id, "--", "ls", "/"])
+        .assert()
+        .success();
+}
+
+#[test]
+fn session_run_code_refuses_prod_session() {
+    let tmp = TempDir::new().unwrap();
+    let id = start_session(&tmp, "prod");
+
+    mvm_with_data_dir(tmp.path())
+        .args(["session", "run-code", &id, "print(1)"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("dev-only"));
+}
+
+#[test]
+fn session_run_code_succeeds_on_dev_session() {
+    let tmp = TempDir::new().unwrap();
+    let id = start_session(&tmp, "dev");
+
+    mvm_with_data_dir(tmp.path())
+        .args(["session", "run-code", &id, "print(1)"])
+        .assert()
+        .success()
+        .stderr(predicate::str::contains("code_sha256="));
+}
+
+#[test]
+fn session_attach_on_missing_errors() {
+    let tmp = TempDir::new().unwrap();
+    mvm_with_data_dir(tmp.path())
+        .args(["session", "attach", "ses-nonexistent"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("session not found"));
+}
