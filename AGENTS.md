@@ -6,7 +6,7 @@ All Nix builds, Firecracker operations, `mvmctl` runtime commands (anything that
 
 **Run cargo on the macOS host wherever it compiles cleanly.** `cargo test`, `cargo check`, and `cargo build` should default to the host so worktrees don't deadlock on the single shared Lima VM (cargo target-dir contention, registry locks, and `.git/index` cross-mount races are real and have caused us to lose work). Tests that genuinely need Linux — vsock, jailer/seccomp, dm-verity, network namespaces, anything that pokes at `/dev/kvm` or `/proc/net` — should be gated with `#[cfg(target_os = "linux")]` and only those sub-targets are run inside Lima. Workspace-wide `cargo clippy --workspace --all-targets -- -D warnings` is still expected to pass inside Lima before merge, since clippy needs to see the Linux-gated code paths.
 
-**git only runs from the main `mvm/` checkout, never from inside a worktree directory and never from inside Lima.** The main checkout is the single git operator for the whole repo. To act on a worktree's branch, use `git -C /path/to/mvm-<slug> <cmd>` from the main checkout — that drives the worktree's index/HEAD/refs while keeping the running git process anchored at the main checkout. Reasons: (1) only one git process at a time touches `.git/objects`, `.git/packed-refs`, and the shared `.git/hooks/` invocation context, eliminating the cross-worktree contention that has caused us to lose work; (2) the 9p/virtiofs share with Lima does not share git's lock semantics, so git from inside Lima deadlocks against host-side git. Cargo/nix/firecracker/mvmctl commands still run from each worktree's own directory — only `git` is centralized.
+**git only runs from the main `mvm/` checkout, never from inside a worktree directory and never from inside Lima.** The main checkout is the single git operator for the whole repo. To act on a worktree's branch, use `git -C /path/to/.worktrees/mvm-<slug> <cmd>` from the main checkout — that drives the worktree's index/HEAD/refs while keeping the running git process anchored at the main checkout. Reasons: (1) only one git process at a time touches `.git/objects`, `.git/packed-refs`, and the shared `.git/hooks/` invocation context, eliminating the cross-worktree contention that has caused us to lose work; (2) the 9p/virtiofs share with Lima does not share git's lock semantics, so git from inside Lima deadlocks against host-side git. Cargo/nix/firecracker/mvmctl commands still run from each worktree's own directory — only `git` is centralized.
 
 If the Lima VM is not running, boot it with:
 
@@ -51,17 +51,20 @@ The only `git` commands that should ever target `main` directly are read-only (`
 
 ### Creating the worktree
 
+All worktrees live in a `.worktrees/` directory that sits as a sibling of the main checkout — never directly next to the main checkout. This keeps the parent directory (which holds the rest of the ecosystem repos) free of feature-branch clutter and makes it obvious at a glance which directories are real repos vs. transient sandboxes.
+
 From the main `mvm/` checkout:
 
 ```bash
 cd /Users/auser/work/personal/microvm/kv/mvm
-git worktree add ../mvm-<feature-slug> -b feat/<feature-slug>
+mkdir -p ../.worktrees                # one-time, if it doesn't already exist
+git worktree add ../.worktrees/mvm-<feature-slug> -b feat/<feature-slug>
 ```
 
 Then switch terminals/agents into the worktree directory for code work:
 
 ```bash
-cd ../mvm-<feature-slug>
+cd ../.worktrees/mvm-<feature-slug>
 # edit code, run cargo, run mvmctl from here
 ```
 
@@ -73,10 +76,10 @@ Always from the main `mvm/` checkout, with `-C` pointing at the worktree:
 
 ```bash
 cd /Users/auser/work/personal/microvm/kv/mvm
-git -C ../mvm-<feature-slug> status
-git -C ../mvm-<feature-slug> add path/to/file
-git -C ../mvm-<feature-slug> commit -m "..."
-git -C ../mvm-<feature-slug> push -u origin feat/<feature-slug>
+git -C ../.worktrees/mvm-<feature-slug> status
+git -C ../.worktrees/mvm-<feature-slug> add path/to/file
+git -C ../.worktrees/mvm-<feature-slug> commit -m "..."
+git -C ../.worktrees/mvm-<feature-slug> push -u origin feat/<feature-slug>
 ```
 
 This serializes all git activity through one process and keeps `.git/objects`, `.git/packed-refs`, and the hooks dir from being touched by multiple agents at once. The pre-commit hook fires once per commit, in the main checkout — no concurrent-hook fan-out.
@@ -139,7 +142,7 @@ This is a convenience for users who already have direnv installed; the `bin/dev`
 After the feature merges:
 
 ```bash
-git worktree remove ../mvm-<feature-slug>
+git worktree remove ../.worktrees/mvm-<feature-slug>
 ```
 
 ### When NOT to use a worktree
