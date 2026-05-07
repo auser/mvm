@@ -24,7 +24,7 @@
 //!               └── vminitd (PID 1, gRPC over vsock:1024)
 //! ```
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mvm_core::vm_backend::{
     BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, VmBackend,
     VmCapabilities, VmId, VmInfo, VmNetworkInfo, VmStartConfig, VmStatus,
@@ -85,6 +85,14 @@ impl VmBackend for AppleContainerBackend {
             );
         }
 
+        // Plan 53 Plan D: clone the rootfs to a per-instance path so
+        // each running VM owns its disk image. Apple VZ refuses to
+        // attach the same writable disk to two VMs concurrently; the
+        // clone also keeps templates pristine across multiple instances.
+        // APFS Copy-on-Write makes this O(1) regardless of rootfs size
+        // when source and destination live on the same volume.
+        let effective_rootfs = prepare_instance_rootfs(&config.name, &config.rootfs_path)?;
+
         ui::info(&format!(
             "Starting Apple Container '{}' (cpus={}, mem={}MiB)...",
             config.name, config.cpus, config.memory_mib
@@ -93,7 +101,9 @@ impl VmBackend for AppleContainerBackend {
         mvm_apple_container::start(
             &config.name,
             kernel_path,
-            &config.rootfs_path,
+            effective_rootfs
+                .to_str()
+                .ok_or_else(|| anyhow::anyhow!("instance rootfs path is not valid UTF-8"))?,
             config.cpus,
             config.memory_mib as u64,
         )
@@ -104,8 +114,22 @@ impl VmBackend for AppleContainerBackend {
     }
 
     fn stop(&self, id: &VmId) -> Result<()> {
-        mvm_apple_container::stop(&id.0)
-            .map_err(|e| anyhow::anyhow!("Apple Container stop failed: {e}"))
+        let stop_result = mvm_apple_container::stop(&id.0)
+            .map_err(|e| anyhow::anyhow!("Apple Container stop failed: {e}"));
+        // Best-effort: remove the per-instance rootfs clone (Plan D).
+        // A missing file means stop already cleaned up or the VM never
+        // reached the clone step.
+        if let Ok(path) = instance_rootfs_path(&id.0)
+            && path.exists()
+            && let Err(e) = std::fs::remove_file(&path)
+        {
+            tracing::warn!(
+                path = %path.display(),
+                error = %e,
+                "failed to remove per-instance rootfs clone"
+            );
+        }
+        stop_result
     }
 
     fn stop_all(&self) -> Result<()> {
@@ -210,6 +234,73 @@ impl VmBackend for AppleContainerBackend {
     }
 }
 
+/// Per-instance rootfs path inside `~/.mvm/vms/<vm_name>/`.
+///
+/// Plan 53 Plan D: the rootfs clone (CoW on APFS, byte copy elsewhere)
+/// lives here. Each running Apple Container VM owns its own copy so VZ
+/// can attach it writable without conflicting with sibling instances.
+fn instance_rootfs_path(vm_name: &str) -> Result<std::path::PathBuf> {
+    let home = std::env::var("HOME").unwrap_or_default();
+    if home.is_empty() {
+        anyhow::bail!("HOME is not set; cannot resolve instance rootfs path");
+    }
+    Ok(instance_rootfs_path_at(
+        std::path::Path::new(&home),
+        vm_name,
+    ))
+}
+
+fn instance_rootfs_path_at(base: &std::path::Path, vm_name: &str) -> std::path::PathBuf {
+    base.join(".mvm")
+        .join("vms")
+        .join(vm_name)
+        .join("rootfs.ext4")
+}
+
+/// Materialize the per-instance rootfs for an Apple Container VM and
+/// return its absolute path.
+///
+/// If the source path is already the per-instance path (rare, but
+/// possible for a re-start), this is a no-op. Otherwise, it removes
+/// any stale per-instance file from a prior failed run, then clones
+/// the source into the per-instance location via [`reflink_or_copy`].
+/// The strategy used (Reflink vs Copied) is logged so users can see
+/// when the fast path applied.
+fn prepare_instance_rootfs(vm_name: &str, source_rootfs: &str) -> Result<std::path::PathBuf> {
+    let instance_path = instance_rootfs_path(vm_name)?;
+    prepare_instance_rootfs_inner(&instance_path, source_rootfs)
+}
+
+/// Inner implementation that doesn't read `HOME`. Tests pass a tempdir
+/// here directly so they don't have to mutate process-global env vars.
+fn prepare_instance_rootfs_inner(
+    instance_path: &std::path::Path,
+    source_rootfs: &str,
+) -> Result<std::path::PathBuf> {
+    let source_path = std::path::Path::new(source_rootfs);
+    if source_path == instance_path {
+        // Already the per-instance copy — nothing to clone.
+        return Ok(instance_path.to_path_buf());
+    }
+    if instance_path.exists() {
+        std::fs::remove_file(instance_path).with_context(|| {
+            format!(
+                "removing stale per-instance rootfs at {}",
+                instance_path.display()
+            )
+        })?;
+    }
+    let strategy =
+        crate::vm::template::lifecycle::clone_rootfs_for_instance(source_path, instance_path)?;
+    tracing::info!(
+        ?strategy,
+        source = %source_path.display(),
+        instance = %instance_path.display(),
+        "prepared per-instance rootfs",
+    );
+    Ok(instance_path.to_path_buf())
+}
+
 /// Read persisted port mappings from the VM state directory.
 fn read_vm_ports(vm_name: &str) -> Vec<mvm_core::vm_backend::VmPortMapping> {
     let home = std::env::var("HOME").unwrap_or_default();
@@ -259,6 +350,48 @@ mod tests {
         // Only claim 3 (verified boot) does not hold yet.
         assert_eq!(profile.dropped_claims(), vec![3]);
         assert!(profile.na_claims().is_empty());
+    }
+
+    #[test]
+    fn instance_rootfs_path_at_layout() {
+        let p = instance_rootfs_path_at(std::path::Path::new("/var/home/user"), "vm-1");
+        assert_eq!(
+            p,
+            std::path::PathBuf::from("/var/home/user/.mvm/vms/vm-1/rootfs.ext4")
+        );
+    }
+
+    #[test]
+    fn prepare_instance_rootfs_inner_clones_into_per_instance_path() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let src = temp.path().join("template.ext4");
+        std::fs::write(&src, b"template payload").expect("write src");
+
+        let instance = temp.path().join(".mvm/vms/test-vm/rootfs.ext4");
+        let path = prepare_instance_rootfs_inner(&instance, src.to_str().unwrap()).expect("clone");
+
+        assert_eq!(path, instance);
+        assert_eq!(std::fs::read(&path).unwrap(), b"template payload");
+
+        // Idempotent stale-cleanup: a second call after writes to the
+        // clone should produce a fresh per-instance copy from the source.
+        std::fs::write(&path, b"prior failed run").expect("write stale");
+        let second_path =
+            prepare_instance_rootfs_inner(&instance, src.to_str().unwrap()).expect("re-clone");
+        assert_eq!(std::fs::read(&second_path).unwrap(), b"template payload");
+    }
+
+    #[test]
+    fn prepare_instance_rootfs_inner_is_noop_when_source_matches_destination() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let instance = temp.path().join(".mvm/vms/restart/rootfs.ext4");
+        std::fs::create_dir_all(instance.parent().unwrap()).expect("mkdir");
+        std::fs::write(&instance, b"already-instance").expect("seed");
+
+        let p = prepare_instance_rootfs_inner(&instance, instance.to_str().unwrap()).expect("noop");
+        assert_eq!(p, instance);
+        // Source content preserved — no clone, no stale-cleanup.
+        assert_eq!(std::fs::read(&instance).unwrap(), b"already-instance");
     }
 
     #[test]

@@ -1,6 +1,7 @@
 // Dev mode
 pub mod apple_container;
 pub mod backend;
+pub mod cow;
 pub mod docker;
 pub mod egress_proxy;
 pub mod firecracker;
