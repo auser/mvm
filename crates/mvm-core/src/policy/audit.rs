@@ -179,6 +179,15 @@ pub enum LocalAuditKind {
     /// a host directory into a running guest.
     VmShareAdd,
     VmShareRemove,
+    // --- Plan 46: metering API ---
+    /// One per-minute metering bucket sealed and chained into the
+    /// audit log. Plan 46 — auditing-grade resource attribution. The
+    /// `detail` field carries a JSON-encoded `MeteringBucket`
+    /// (`mvm_core::metering::MeteringBucket`) so a forensic pass can
+    /// reconstruct per-tenant resource consumption end-to-end without
+    /// trusting the per-tenant JSONL rollup file (which the audit
+    /// chain authenticates by sealing each bucket here).
+    MeteringEpoch,
 }
 
 /// A single local audit log entry.
