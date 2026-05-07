@@ -50,8 +50,9 @@
             # Smoke wrapper for plan 41 W3 — exec cat so the
             # RunEntrypoint stdin payload comes back unchanged on
             # stdout. No language runtime, no heavy deps. Real
-            # workloads use a per-language wrapper from mvmforge's
-            # forthcoming Nix factories.
+            # workloads use a per-language wrapper from
+            # `mvm.lib.<system>.mk{Python,Node,Wasm}FunctionService`
+            # (see `nix/lib/factories/`).
             exec cat
           '';
           markerContent = "/usr/lib/mvm/wrappers/echo\n";
