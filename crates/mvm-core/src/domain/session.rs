@@ -327,6 +327,43 @@ where
     Ok(record)
 }
 
+/// Return the IDs of `Running` sessions whose idle timeout has elapsed
+/// as of `now`. Pure: does not perform any teardown — the caller in
+/// `mvm-cli` translates each id into `tear_down_session_vm` + a
+/// `state = Reaped` update.
+///
+/// Idle is measured against `last_invoke_at` if the session has
+/// handled at least one call, else against `started_at`. Records whose
+/// timestamps fail to parse are skipped (warn-and-continue rather than
+/// erroring out — a corrupt record shouldn't block reaping the rest).
+pub fn list_expired_session_ids(now: chrono::DateTime<chrono::Utc>) -> Result<Vec<SessionId>> {
+    let mut expired = Vec::new();
+    for record in list_sessions()? {
+        if record.state != SessionState::Running {
+            continue;
+        }
+        let last_str = record
+            .last_invoke_at
+            .as_deref()
+            .unwrap_or(&record.started_at);
+        let Ok(last_dt) = chrono::DateTime::parse_from_rfc3339(last_str) else {
+            tracing::warn!(
+                session = %record.id,
+                ts = %last_str,
+                "skip expiry check: unparseable timestamp"
+            );
+            continue;
+        };
+        let elapsed = now
+            .signed_duration_since(last_dt.with_timezone(&chrono::Utc))
+            .num_seconds();
+        if elapsed > 0 && (elapsed as u64) > record.idle_timeout_secs {
+            expired.push(record.id);
+        }
+    }
+    Ok(expired)
+}
+
 // ---------------------------------------------------------------------------
 // Base32 helpers — RFC 4648, no padding, lowercase.
 // ---------------------------------------------------------------------------
@@ -627,6 +664,67 @@ mod tests {
         let dir = ensure_sessions_dir().unwrap();
         let mode = std::fs::metadata(&dir).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o700);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_expired_session_ids_picks_only_idle_running_records() {
+        let _guard = isolated_runtime_dir();
+        let now = chrono::Utc::now();
+        let stale = now - chrono::Duration::seconds(900);
+        let recent = now - chrono::Duration::seconds(60);
+
+        // Idle, running, past timeout → reapable.
+        let mut a = SessionRecord::new_running("vm-a", "x", SessionMode::Prod);
+        a.idle_timeout_secs = 300;
+        a.started_at = stale.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        a.last_invoke_at = Some(stale.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+
+        // Idle but recent — within timeout, not reapable.
+        let mut b = SessionRecord::new_running("vm-b", "x", SessionMode::Prod);
+        b.idle_timeout_secs = 300;
+        b.last_invoke_at = Some(recent.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+
+        // Idle and stale, but already Killed — skip.
+        let mut c = SessionRecord::new_running("vm-c", "x", SessionMode::Prod);
+        c.state = SessionState::Killed;
+        c.idle_timeout_secs = 300;
+        c.last_invoke_at = Some(stale.to_rfc3339_opts(chrono::SecondsFormat::Secs, true));
+
+        // Stale but never invoked — falls back to started_at.
+        let mut d = SessionRecord::new_running("vm-d", "x", SessionMode::Prod);
+        d.idle_timeout_secs = 300;
+        d.started_at = stale.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        d.last_invoke_at = None;
+
+        for r in [&a, &b, &c, &d] {
+            write_session(r).unwrap();
+        }
+
+        let expired = list_expired_session_ids(now).unwrap();
+        let expired_vms: std::collections::HashSet<String> = expired
+            .iter()
+            .map(|id| read_session(id).unwrap().unwrap().vm_name)
+            .collect();
+        assert!(expired_vms.contains("vm-a"));
+        assert!(expired_vms.contains("vm-d"));
+        assert!(!expired_vms.contains("vm-b"));
+        assert!(!expired_vms.contains("vm-c"));
+        assert_eq!(expired_vms.len(), 2);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn list_expired_skips_unparseable_timestamps() {
+        let _guard = isolated_runtime_dir();
+        let now = chrono::Utc::now();
+        let mut a = SessionRecord::new_running("vm-a", "x", SessionMode::Prod);
+        a.idle_timeout_secs = 0;
+        a.started_at = "not-an-rfc3339-date".into();
+        write_session(&a).unwrap();
+        // Should not panic, and shouldn't include the unparseable record.
+        let expired = list_expired_session_ids(now).unwrap();
+        assert!(expired.is_empty());
     }
 
     #[cfg(unix)]

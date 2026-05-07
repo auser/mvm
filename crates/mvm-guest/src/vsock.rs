@@ -363,6 +363,14 @@ pub enum RunEntrypointError {
     /// partition), or otherwise can't be loaded. Reported per-call
     /// even though the validation runs at agent boot.
     EntrypointInvalid,
+    /// The session backing this call was killed externally (host
+    /// invoked `mvmctl session kill <id>`) while the call was in
+    /// flight. Synthesized host-side by `mvmctl invoke` /
+    /// `session attach` after detecting a transport-level connection
+    /// drop coincident with a session record marked `Killed`. The
+    /// agent itself does not emit this — it would be torn down with
+    /// the VM before it could.
+    SessionKilled,
     /// Other agent-internal failure — file I/O, vsock framing,
     /// inter-process plumbing. Look at `message` for detail.
     InternalError,
@@ -1526,6 +1534,7 @@ mod tests {
             RunEntrypointError::Busy,
             RunEntrypointError::WrapperCrashed,
             RunEntrypointError::EntrypointInvalid,
+            RunEntrypointError::SessionKilled,
             RunEntrypointError::InternalError,
         ];
         for v in variants {

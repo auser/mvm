@@ -70,6 +70,11 @@ pub(in crate::commands) enum Cmd {
     /// console — the underlying microVM is held warm by the session.
     /// Refused on prod-mode sessions.
     Console(ConsoleArgs),
+    /// Reap idle sessions: tear down the VM and mark each record
+    /// `state = Reaped`. Most session verbs already do an opportunistic
+    /// reap before their own work; this verb is for cron / explicit
+    /// cleanup. Idempotent.
+    Reap(ReapArgs),
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -170,7 +175,22 @@ pub(in crate::commands) struct ConsoleArgs {
     pub session_id: String,
 }
 
+#[derive(ClapArgs, Debug, Clone)]
+pub(in crate::commands) struct ReapArgs {
+    /// Print the IDs of reaped sessions on stdout (one per line).
+    #[arg(long)]
+    pub verbose: bool,
+}
+
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
+    // Opportunistic lazy reap: every session verb sweeps idle records
+    // before its own work. Failures are logged, not propagated —
+    // reaping is best-effort cleanup, not load-bearing for the verb.
+    // Skipped on `Reap` itself (which does the same work explicitly)
+    // to avoid double-counting.
+    if !matches!(args.command, Cmd::Reap(_)) {
+        reap_expired_sessions(false);
+    }
     match args.command {
         Cmd::Ls(a) => cmd_ls(a),
         Cmd::Info(a) => cmd_info(a),
@@ -181,7 +201,59 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         Cmd::Exec(a) => cmd_exec(a),
         Cmd::RunCode(a) => cmd_run_code(a),
         Cmd::Console(a) => cmd_console(a),
+        Cmd::Reap(a) => cmd_reap(a),
     }
+}
+
+/// Iterate the session table, tear down VMs whose `idle_timeout_secs`
+/// has elapsed, and mark each record `state = Reaped`. Returns the
+/// list of reaped session ids.
+///
+/// Best-effort throughout: per-session failures are warned but never
+/// stop the sweep. The double-read pattern (`list_expired_session_ids`
+/// then `read_session` again before tearing down) tolerates a race
+/// where the record changes state between when we listed it and when
+/// we got around to reaping it (e.g. an in-flight `attach` bumped
+/// `last_invoke_at`, or another process killed it first).
+pub(in crate::commands) fn reap_expired_sessions(verbose: bool) -> Vec<SessionId> {
+    let now = chrono::Utc::now();
+    let candidates = match session::list_expired_session_ids(now) {
+        Ok(ids) => ids,
+        Err(e) => {
+            tracing::warn!(err = %e, "reap: failed to list candidates");
+            return Vec::new();
+        }
+    };
+
+    let mut reaped = Vec::new();
+    for id in candidates {
+        // Re-read: if the record changed state since the list call,
+        // skip it. The race is benign — we'd just defer the reap to
+        // the next sweep.
+        let record = match session::read_session(&id) {
+            Ok(Some(r)) if r.state == SessionState::Running => r,
+            Ok(_) => continue,
+            Err(e) => {
+                tracing::warn!(session = %id, err = %e, "reap: skip unreadable record");
+                continue;
+            }
+        };
+        crate::exec::tear_down_session_vm(crate::exec::SessionVm {
+            vm_name: record.vm_name.clone(),
+        });
+        if let Err(e) = session::update_session(&id, |r| {
+            r.state = SessionState::Reaped;
+            Ok(())
+        }) {
+            tracing::warn!(session = %id, err = %e, "reap: failed to mark Reaped");
+            continue;
+        }
+        if verbose {
+            println!("{id}");
+        }
+        reaped.push(id);
+    }
+    reaped
 }
 
 fn cmd_ls(args: LsArgs) -> Result<()> {
@@ -234,21 +306,23 @@ fn cmd_kill(args: KillArgs) -> Result<()> {
         );
     }
 
-    // Tear down the substrate VM. Backend-level errors are warned but
-    // don't prevent us from updating the session record — the user
-    // expects the session to be marked dead either way.
-    crate::exec::tear_down_session_vm(crate::exec::SessionVm {
-        vm_name: record.vm_name.clone(),
-    });
-
-    // Update the on-disk record to reflect the kill. The substrate may
-    // still emit a few in-flight events as the VM tears down; an SDK
-    // observing `state = Killed` knows to attribute those to a kill.
+    // Order is load-bearing: mark Killed BEFORE tearing down the VM.
+    // Inflight `mvmctl invoke` / `session attach` calls observe the
+    // VM's connection drop and re-read the record; if state is Killed
+    // they synthesize `RunEntrypointError::SessionKilled` instead of
+    // surfacing a generic transport error. Tearing down first would
+    // race — the dispatch could see the connection drop and re-read
+    // the record while it still says Running, missing the kill
+    // attribution entirely.
     session::update_session(&id, |r| {
         r.state = SessionState::Killed;
         Ok(())
     })
-    .context("updating session record after kill")?;
+    .context("updating session record before kill")?;
+
+    crate::exec::tear_down_session_vm(crate::exec::SessionVm {
+        vm_name: record.vm_name.clone(),
+    });
 
     ui::info(&format!("Killed session {id} (vm {})", record.vm_name));
     Ok(())
@@ -297,7 +371,7 @@ fn cmd_attach(args: AttachArgs) -> Result<()> {
         "attach: dispatching into session {id} (vm {})",
         record.vm_name
     ));
-    let exit_code = super::invoke::dispatch(&record.vm_name, stdin_bytes, args.timeout)
+    let exit_code = super::invoke::dispatch(&record.vm_name, stdin_bytes, args.timeout, Some(&id))
         .with_context(|| format!("dispatching into session {id}"))?;
 
     // Bump the session's invoke counter / last-used timestamp so
@@ -482,6 +556,12 @@ fn cmd_start(args: StartArgs) -> Result<()> {
     // Session id on stdout (separate stream from the human-readable
     // ui::info) so SDK callers can capture it cleanly.
     println!("{id}");
+    Ok(())
+}
+
+fn cmd_reap(args: ReapArgs) -> Result<()> {
+    let reaped = reap_expired_sessions(args.verbose);
+    ui::info(&format!("Reaped {} idle session(s).", reaped.len()));
     Ok(())
 }
 
@@ -753,5 +833,60 @@ mod tests {
             err.to_string().contains("not running"),
             "expected not-running error, got: {err}"
         );
+    }
+
+    #[test]
+    fn reap_marks_idle_sessions_as_reaped() {
+        let _guard = isolated_runtime_dir();
+        // Stale: started_at well past idle_timeout — should be reaped.
+        let mut stale =
+            session::SessionRecord::new_running("vm-stale", "wl", session::SessionMode::Prod);
+        let stale_ts = chrono::Utc::now() - chrono::Duration::seconds(900);
+        stale.idle_timeout_secs = 60;
+        stale.started_at = stale_ts.to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        let stale_id = stale.id.clone();
+        session::write_session(&stale).unwrap();
+
+        // Fresh: still within idle window — should remain Running.
+        let fresh =
+            session::SessionRecord::new_running("vm-fresh", "wl", session::SessionMode::Prod);
+        let fresh_id = fresh.id.clone();
+        session::write_session(&fresh).unwrap();
+
+        let reaped = reap_expired_sessions(false);
+        assert_eq!(reaped.len(), 1);
+        assert_eq!(reaped[0], stale_id);
+
+        let reread = session::read_session(&stale_id).unwrap().unwrap();
+        assert_eq!(reread.state, session::SessionState::Reaped);
+        let fresh_after = session::read_session(&fresh_id).unwrap().unwrap();
+        assert_eq!(fresh_after.state, session::SessionState::Running);
+    }
+
+    #[test]
+    fn reap_skips_already_killed_sessions() {
+        let _guard = isolated_runtime_dir();
+        let mut rec = session::SessionRecord::new_running("vm-1", "wl", session::SessionMode::Prod);
+        rec.state = session::SessionState::Killed;
+        rec.idle_timeout_secs = 60;
+        rec.started_at = (chrono::Utc::now() - chrono::Duration::seconds(900))
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true);
+        session::write_session(&rec).unwrap();
+
+        let reaped = reap_expired_sessions(false);
+        assert!(
+            reaped.is_empty(),
+            "killed sessions are skipped, got {reaped:?}"
+        );
+    }
+
+    #[test]
+    fn reap_is_idempotent_on_already_reaped() {
+        let _guard = isolated_runtime_dir();
+        let mut rec = session::SessionRecord::new_running("vm-1", "wl", session::SessionMode::Prod);
+        rec.state = session::SessionState::Reaped;
+        session::write_session(&rec).unwrap();
+        let reaped = reap_expired_sessions(false);
+        assert!(reaped.is_empty());
     }
 }

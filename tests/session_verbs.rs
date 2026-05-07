@@ -270,6 +270,16 @@ fn session_console_unknown_id_errors() {
 }
 
 #[test]
+fn session_reap_emits_count_message() {
+    let temp = tempfile::tempdir().unwrap();
+    mvm_with_runtime_dir(temp.path())
+        .args(["session", "reap"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("Reaped 0 idle session(s)"));
+}
+
+#[test]
 fn session_console_on_prod_is_refused() {
     let temp = tempfile::tempdir().unwrap();
     let rec = SessionRecord::new_running("vm-1", "wl", SessionMode::Prod);
