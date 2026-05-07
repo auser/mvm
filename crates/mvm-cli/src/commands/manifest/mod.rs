@@ -13,10 +13,12 @@ use mvm_core::user_config::MvmConfig;
 
 use super::Cli;
 
+mod alias;
 mod info;
 mod ls;
 mod prune;
 mod rm;
+mod tag;
 mod verify;
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -41,6 +43,12 @@ pub(in crate::commands) enum ManifestAction {
     /// Verify a slot's artifacts against its checksums (and, post plan
     /// 36, cosign signatures)
     Verify(verify::Args),
+    /// Manage free-form tags on a template (`add`, `rm`, `ls`).
+    /// Tags filter `mvmctl manifest ls` and surface in catalogs.
+    Tag(tag::Args),
+    /// Manage movable `alias → revision_hash` pointers (`set`, `rm`, `ls`).
+    /// `mvmctl up --manifest <template>@<alias>` resolves through here.
+    Alias(alias::Args),
 }
 
 pub(in crate::commands) fn run(cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
@@ -50,5 +58,7 @@ pub(in crate::commands) fn run(cli: &Cli, args: Args, cfg: &MvmConfig) -> Result
         ManifestAction::Rm(a) => rm::run(cli, a, cfg),
         ManifestAction::Prune(a) => prune::run(cli, a, cfg),
         ManifestAction::Verify(a) => verify::run(cli, a, cfg),
+        ManifestAction::Tag(a) => tag::run(cli, a, cfg),
+        ManifestAction::Alias(a) => alias::run(cli, a, cfg),
     }
 }

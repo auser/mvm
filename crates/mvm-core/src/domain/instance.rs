@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::{Result, bail};
 use serde::{Deserialize, Serialize};
 
@@ -81,6 +83,25 @@ pub struct InstanceState {
     /// Timestamp of last work activity (from guest agent or metrics).
     #[serde(default)]
     pub last_busy_at: Option<String>,
+    /// Caller-supplied metadata. Tenant-controlled; validated via
+    /// `mvm_security::policy::InputValidator`. Echoed in audit events
+    /// and webhook bodies, so charset/length constraints are
+    /// load-bearing.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub tags: BTreeMap<String, String>,
+    /// RFC 3339 wall-clock time after which the supervisor reaper will
+    /// tear this instance down. `None` = no TTL.
+    #[serde(default)]
+    pub expires_at: Option<String>,
+    /// When `true` (the default), connecting to a `Sleeping` instance
+    /// auto-resumes it. When `false`, callers must `mvmctl resume`
+    /// explicitly.
+    #[serde(default = "default_auto_resume")]
+    pub auto_resume: bool,
+}
+
+fn default_auto_resume() -> bool {
+    true
 }
 
 /// Validate that a state transition is allowed.
@@ -201,6 +222,13 @@ mod tests {
             entered_running_at: Some("2025-01-01T00:00:00Z".to_string()),
             entered_warm_at: None,
             last_busy_at: None,
+            tags: {
+                let mut m = BTreeMap::new();
+                m.insert("job".to_string(), "etl".to_string());
+                m
+            },
+            expires_at: Some("2025-01-02T00:00:00Z".to_string()),
+            auto_resume: false,
         };
 
         let json = serde_json::to_string_pretty(&state).unwrap();
@@ -214,6 +242,9 @@ mod tests {
             parsed.entered_running_at.as_deref(),
             Some("2025-01-01T00:00:00Z")
         );
+        assert_eq!(parsed.tags.get("job").map(String::as_str), Some("etl"));
+        assert_eq!(parsed.expires_at.as_deref(), Some("2025-01-02T00:00:00Z"));
+        assert!(!parsed.auto_resume);
     }
 
     #[test]
@@ -246,6 +277,12 @@ mod tests {
         assert_eq!(parsed.entered_running_at, None);
         assert_eq!(parsed.entered_warm_at, None);
         assert_eq!(parsed.last_busy_at, None);
+        // The new sandbox-SDK fields default cleanly on legacy records:
+        // tags is empty, no TTL, auto_resume defaults to true so existing
+        // callers see the documented "connect wakes a sleeper" semantic.
+        assert!(parsed.tags.is_empty());
+        assert_eq!(parsed.expires_at, None);
+        assert!(parsed.auto_resume);
     }
 
     #[test]

@@ -146,6 +146,39 @@ pub enum LocalAuditKind {
     /// `mvmctl cache prune --orphan-builds`. The detail field carries
     /// the count and (for small sweeps) the truncated slot hashes.
     SlotPrune,
+    // --- Sandbox SDK foundation (fs/proc/share/pause/TTL/tags) ---
+    // The verbs below are state-changing CLI surfaces added by the
+    // sandbox-SDK foundation work. Each kind names a single mutation
+    // class; the per-call detail is carried in the audit event's
+    // `target` and `detail` fields.
+    /// `mvmctl manifest alias set` / unset — registry-level alias
+    /// mutation that retargets a friendly name to a different slot.
+    ManifestAliasSet,
+    ManifestAliasRemove,
+    /// `mvmctl manifest tag add` / `tag remove` — adds or removes a
+    /// label on a manifest entry.
+    ManifestTagAdd,
+    ManifestTagRemove,
+    /// `mvmctl vm fs <write|delete|mkdir|chmod|chown|...>` — any
+    /// guest-filesystem mutation through the FsRpc surface. The
+    /// `detail` field carries the operation kind and target path.
+    VmFsMutate,
+    /// `mvmctl vm snapshot delete` — removes a saved snapshot from
+    /// the host's snapshot store.
+    SnapshotDelete,
+    /// `mvmctl vm proc start` / `vm proc signal <pid> <sig>` /
+    /// `vm proc stdin <pid>` — process control RPC mutations on a
+    /// running guest.
+    VmProcStart,
+    VmProcSignal,
+    VmProcStdin,
+    /// `mvmctl vm set-ttl` — changes the TTL deadline on a running
+    /// VM. The reaper picks up the new deadline on its next tick.
+    VmTtlSet,
+    /// `mvmctl vm share add` / `share remove` — mounts or unmounts
+    /// a host directory into a running guest.
+    VmShareAdd,
+    VmShareRemove,
 }
 
 /// A single local audit log entry.

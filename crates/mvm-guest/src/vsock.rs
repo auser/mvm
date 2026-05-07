@@ -150,6 +150,203 @@ pub enum GuestRequest {
     /// can actually serve `RunEntrypoint`. ADR-007 / plan 41 W5.
     /// Prod-safe — reveals no secrets, takes no inputs.
     EntrypointStatus,
+
+    // ========================================================================
+    // Filesystem RPC (W1 / A1 of the e2b parity plan).
+    //
+    // Production-safe (unlike `Exec`): every verb is constrained by
+    // the agent's uid 901 + W2 read-only bind mounts + the
+    // `mvm-security::policy::path` deny-list. Extending the
+    // `prod-agent-runentry-contract` CI lane to assert handler
+    // symbols PRESENT in prod builds is part of the per-verb landing.
+    // ========================================================================
+    /// Read up to `length` bytes from `path`, optionally starting at
+    /// `offset`. The agent enforces `length` ≤ a hard cap (default
+    /// 16 MiB); callers wanting larger reads must use the streaming
+    /// surface (lands in W2).
+    FsRead {
+        path: String,
+        offset: Option<u64>,
+        length: u64,
+        /// `true` to follow symlinks during canonicalization. Default
+        /// `true` for read; the host CLI may toggle to `false` for
+        /// TOCTOU-resistant audits.
+        #[serde(default = "default_true")]
+        follow_symlinks: bool,
+    },
+    /// Write `content` to `path`. Small-content path; large writes
+    /// must use the streaming surface (W2).
+    FsWrite {
+        path: String,
+        content: Vec<u8>,
+        /// File mode for newly-created files (e.g. `0o644`). Ignored
+        /// when overwriting an existing file (existing perms kept).
+        mode: u32,
+        /// Create parent directories if missing.
+        #[serde(default)]
+        create_parents: bool,
+        /// Defaults to `false` for write — TOCTOU-safe default since
+        /// a malicious symlink could redirect the write.
+        #[serde(default)]
+        follow_symlinks: bool,
+    },
+    /// List entries in `path`. Cap: 4096 entries; truncated flag set
+    /// in the response when exceeded.
+    FsList {
+        path: String,
+        #[serde(default = "default_true")]
+        follow_symlinks: bool,
+    },
+    /// Stat `path`. `follow_symlinks=false` returns metadata about
+    /// the symlink itself (`lstat`).
+    FsStat {
+        path: String,
+        #[serde(default = "default_true")]
+        follow_symlinks: bool,
+    },
+    /// Create directory at `path`. With `parents=true` the call
+    /// behaves like `mkdir -p`.
+    FsMkdir {
+        path: String,
+        mode: u32,
+        #[serde(default)]
+        parents: bool,
+    },
+    /// Remove `path`. With `recursive=true` the call walks subtrees;
+    /// the agent caps the walked-entry count to bound work.
+    FsRemove {
+        path: String,
+        #[serde(default)]
+        recursive: bool,
+        /// Defaults to `false` for remove; symlink-following on
+        /// remove is a known footgun.
+        #[serde(default)]
+        follow_symlinks: bool,
+    },
+    /// Rename `from` to `to`. Refuses to cross filesystem boundaries
+    /// (returns `Errno::XDEV` rather than copy-then-delete).
+    FsMove {
+        from: String,
+        to: String,
+        #[serde(default)]
+        follow_symlinks: bool,
+    },
+
+    // ========================================================================
+    // Process control RPC (W1 / A2 of the e2b parity plan).
+    //
+    // **Dev-only.** These verbs are the closest analog to e2b's
+    // `commands.start/list/signal/sendInput/wait/kill` API; they
+    // exist for development and agent-driven workflows where the
+    // user wants to launch arbitrary processes interactively.
+    //
+    // The wire types are compiled into every `mvm-guest` build so a
+    // host caller against a prod agent gets a typed
+    // `ProcErrorKind::UnsupportedInProduction` rather than a
+    // transport error. The agent-side **handler** lives in
+    // `crate::process_rpc`, gated behind the `dev-shell` feature —
+    // which means the function symbols are absent from prod builds.
+    // The combined `prod-agent-runentry-contract` CI gate asserts
+    // this symbol contract per ADR-002 §W4.3 + ADR-007 §W5.
+    //
+    // Distinct from `Exec` (single-shot, blocking) and from
+    // `RunEntrypoint` (production-safe baked program). Process
+    // verbs offer e2b-shaped fan-out: spawn many, list them, send
+    // signals, stream output, send more stdin.
+    // ========================================================================
+    /// Spawn a new process. Returns a `pid_token` string the host
+    /// uses to refer to the process for the rest of its lifetime —
+    /// the token is opaque to the host so a buggy or malicious
+    /// caller can never address a process it didn't start.
+    ///
+    /// Children spawned this way inherit the agent's bounding-set
+    /// (`--bounding-set=-all --no-new-privs` per ADR-002 §W4.5);
+    /// the handler additionally `process_group(0)`s and sets
+    /// `RLIMIT_CORE=0` to avoid coredump exfil. argv is validated
+    /// against an allowlist before exec.
+    ProcStart {
+        /// Argument vector. `argv[0]` is the executable to spawn.
+        argv: Vec<String>,
+        /// Environment variables. Replaces (does not extend) the
+        /// agent's environment.
+        #[serde(default)]
+        env: std::collections::BTreeMap<String, String>,
+        /// Working directory inside the guest. `None` = process
+        /// inherits the agent's cwd.
+        #[serde(default)]
+        cwd: Option<String>,
+        /// Initial stdin bytes. Further input goes via
+        /// `ProcSendInput`.
+        #[serde(default)]
+        stdin: Vec<u8>,
+        /// Optional wall-clock kill on overrun. `None` = no agent-
+        /// imposed timeout; the caller can still send SIGTERM via
+        /// `ProcSignal` or `ProcKill`.
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    /// List processes currently tracked by the agent's PID-token
+    /// map. Includes still-running and recently-exited entries
+    /// until the agent reaps them (default: keep for 60 s after
+    /// exit).
+    ProcList,
+    /// Send `signum` to the process named by `pid_token`. Common
+    /// signals are 15 (SIGTERM) and 2 (SIGINT); for SIGKILL use
+    /// the dedicated `ProcKill` verb so the audit chain captures
+    /// the explicit-force semantics.
+    ProcSignal { pid_token: String, signum: i32 },
+    /// Append `bytes` to the process's stdin. Capped per call by
+    /// the agent (default 1 MiB) and per process (default 16 MiB
+    /// ring buffer); `ProcResult::InputAccepted` reports actual
+    /// bytes written.
+    ProcSendInput { pid_token: String, bytes: Vec<u8> },
+    /// Wait for the process named by `pid_token` to exit, with an
+    /// optional timeout. Response is a stream of `ProcWaitEvent`
+    /// frames (stdout/stderr chunks) terminated by an `Exit`,
+    /// `Killed`, `TimedOut`, or `Error` event.
+    ProcWait {
+        pid_token: String,
+        #[serde(default)]
+        timeout_secs: Option<u64>,
+    },
+    /// Send SIGKILL to the process named by `pid_token`. Distinct
+    /// from `ProcSignal { signum: 9 }` so the audit emit can be
+    /// typed `ProcKilled` instead of a generic signal event.
+    ProcKill { pid_token: String },
+
+    // ========================================================================
+    // virtio-fs share mount control (W1 / D of the e2b parity plan).
+    //
+    // The host launches a `virtiofsd` process exposing a host
+    // directory under a virtio-fs `tag`; the agent then runs the
+    // in-guest `mount -t virtiofs <tag> <guest_path>`. Mount paths
+    // are validated against `mvm_security::policy::MountPathPolicy`
+    // (default allow-roots `/mnt`, `/data`, `/work`; deny anything
+    // under `/etc`, `/usr`, `/proc`, etc.) so a host can't shadow
+    // verity-protected files post-boot. Production-safe.
+    // ========================================================================
+    /// Mount a virtio-fs share inside the guest. The host has
+    /// already attached the device and the agent only needs to
+    /// run the in-guest mount(2) call. `tag` is the virtio-fs
+    /// tag string the device was created with.
+    MountShare {
+        tag: String,
+        guest_path: String,
+        read_only: bool,
+    },
+    /// Unmount a previously-mounted share. `force = false`
+    /// returns `EBUSY` when the kernel reports active fds; the
+    /// caller passes `force = true` to demand a lazy detach
+    /// (G4 of the parity plan — forced detach is opt-in and
+    /// emits a typed audit event).
+    UnmountShare { guest_path: String, force: bool },
+}
+
+/// Helper for `#[serde(default = "...")]` on `bool` fields where
+/// `true` is the desired default (serde's `Default` trait yields
+/// `false`).
+fn default_true() -> bool {
+    true
 }
 
 /// Response from guest vsock agent to host.
@@ -232,6 +429,298 @@ pub enum GuestResponse {
         path: Option<String>,
         detail: Option<String>,
     },
+
+    /// Result of a filesystem RPC call. The single top-level variant
+    /// keeps `GuestResponse` from sprawling — the `FsResult` sub-enum
+    /// carries the per-verb shapes. W1 / A1.
+    FsResult(FsResult),
+
+    /// Result of a non-streaming process-control verb (`ProcStart`,
+    /// `ProcList`, `ProcSignal`, `ProcSendInput`, `ProcKill`). W1 / A2.
+    ProcResult(ProcResult),
+
+    /// One event in the streaming response of a `ProcWait` call.
+    /// Mirrors the `EntrypointEvent` shape — the agent emits
+    /// `Stdout`/`Stderr` chunks (capped per chunk by the wire frame
+    /// limit) terminated by exactly one of `Exit` / `Killed` /
+    /// `TimedOut` / `Error`.
+    ProcWaitEvent(ProcWaitEvent),
+
+    /// Result of a `MountShare` / `UnmountShare` call. Single-frame
+    /// surface; closed sub-enum carries the per-verb shape.
+    /// W1 / D.
+    ShareResult(ShareResult),
+}
+
+/// Result of a virtio-fs share operation.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum ShareResult {
+    /// `MountShare` succeeded. `canonical_path` is the
+    /// post-validation path the agent actually mounted at — same
+    /// shape as input but with trailing slashes normalised.
+    Mounted { canonical_path: String },
+    /// `UnmountShare` succeeded.
+    Unmounted,
+    /// Verb-specific error.
+    Error {
+        kind: ShareErrorKind,
+        message: String,
+    },
+}
+
+/// Class of error returned in `ShareResult::Error`. Closed enum so
+/// the host can branch on `kind` without parsing message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ShareErrorKind {
+    /// `guest_path` is empty / not absolute / contains `..` /
+    /// embedded NUL.
+    BadPath,
+    /// `guest_path` resolved to a deny-prefix or fell outside the
+    /// allow-roots configured for this image.
+    PolicyDenied,
+    /// `tag` is empty, too long, or contains characters virtio-fs
+    /// won't accept.
+    BadTag,
+    /// `mount(2)` returned a non-EBUSY error (no virtiofsd, kernel
+    /// missing virtio_fs module, etc.).
+    MountFailed,
+    /// `umount(2)` returned EBUSY and `force = false` — caller
+    /// must retry with `force = true` to lazy-detach.
+    Busy,
+    /// Underlying I/O error not mapped above.
+    IoError,
+    /// Any other unclassified failure.
+    Other,
+}
+
+/// Result of a non-streaming process-control verb. Closed enum with
+/// `deny_unknown_fields` so a compromised agent can't smuggle extra
+/// fields past the host's deserializer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum ProcResult {
+    /// `ProcStart` succeeded — `pid_token` is the opaque handle the
+    /// host uses for the rest of the process's lifetime.
+    Started { pid_token: String },
+    /// `ProcList` snapshot. Order is agent-defined (typically by
+    /// `started_at`).
+    List { processes: Vec<ProcInfo> },
+    /// `ProcSignal` delivered.
+    Signaled,
+    /// `ProcSendInput` accepted some/all of the bytes.
+    /// `bytes_accepted` may be less than the request's `bytes.len()`
+    /// if the per-process input ring buffer would overflow.
+    InputAccepted { bytes_accepted: u64 },
+    /// `ProcKill` issued SIGKILL.
+    Killed,
+    /// Verb-specific error. Distinct from `GuestResponse::Error`,
+    /// which is reserved for transport-layer failures.
+    Error {
+        kind: ProcErrorKind,
+        message: String,
+    },
+}
+
+/// Per-process metadata returned by `ProcList`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ProcInfo {
+    pub pid_token: String,
+    /// RFC 3339 timestamp.
+    pub started_at: String,
+    /// argv\[0\] for display only — the agent does not expose the
+    /// full argv over the wire (it could echo secrets the caller
+    /// passed in via env / stdin).
+    pub argv0: String,
+    pub state: ProcState,
+}
+
+/// Lifecycle state of a tracked process.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum ProcState {
+    Running,
+    Exited(i32),
+    /// Process was killed by signal `i32`.
+    Killed(i32),
+    /// Process exceeded its `timeout_secs`; agent killed the pgroup.
+    TimedOut,
+}
+
+/// Class of error returned in `ProcResult::Error` and
+/// `ProcWaitEvent::Error`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum ProcErrorKind {
+    /// `pid_token` doesn't match any known process. Either the
+    /// host fabricated it or the agent reaped the process record.
+    UnknownToken,
+    /// The agent failed to spawn the child (executable missing,
+    /// EACCES, ENOMEM, etc.).
+    SpawnFailed,
+    /// Per-child seccomp / setpriv envelope failed to apply.
+    /// Agent refuses to spawn an un-confined child.
+    SecurityEnvelopeFailed,
+    /// argv was empty, argv\[0\] was empty / not absolute / on a
+    /// disallowed path.
+    InvalidArgv,
+    /// One or more env keys / values failed validation (charset,
+    /// length).
+    InvalidEnv,
+    /// `cwd` failed canonicalization or hit the deny-list.
+    BadCwd,
+    /// Per-VM concurrent-process cap or per-call byte cap
+    /// exceeded.
+    CapExceeded,
+    /// Returned by prod builds whose handler module was stripped
+    /// per ADR-002 §W4.3. Lets SDK callers branch on capability.
+    UnsupportedInProduction,
+    /// Other / unclassified.
+    Other,
+}
+
+/// One event in the streaming response of a `ProcWait` call.
+/// Terminal events end the stream — the host loops on
+/// `is_terminal()` just like for `EntrypointEvent`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum ProcWaitEvent {
+    /// Bytes from the process's stdout.
+    Stdout { chunk: Vec<u8> },
+    /// Bytes from the process's stderr.
+    Stderr { chunk: Vec<u8> },
+    /// Process exited with the given code. Terminal.
+    Exit { code: i32 },
+    /// Process was killed by signal. Terminal.
+    Killed { signal: i32 },
+    /// `timeout_secs` elapsed; agent killed the process group.
+    /// Terminal.
+    TimedOut,
+    /// Agent-side condition prevented the wait (unknown token,
+    /// internal failure, prod-stripped). Terminal.
+    Error {
+        kind: ProcErrorKind,
+        message: String,
+    },
+}
+
+impl ProcWaitEvent {
+    /// Returns true if this event terminates the response stream
+    /// for one `ProcWait` call.
+    pub fn is_terminal(&self) -> bool {
+        matches!(
+            self,
+            ProcWaitEvent::Exit { .. }
+                | ProcWaitEvent::Killed { .. }
+                | ProcWaitEvent::TimedOut
+                | ProcWaitEvent::Error { .. }
+        )
+    }
+}
+
+/// Result of a filesystem RPC call. Closed enum with
+/// `deny_unknown_fields` so a compromised agent can't smuggle extra
+/// data past the host's deserializer.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub enum FsResult {
+    /// Bytes read. `total_size` is the on-disk size at read time so
+    /// callers can detect short reads even when `content.len() <
+    /// requested length`.
+    Read { content: Vec<u8>, total_size: u64 },
+    /// Bytes successfully written.
+    Write { bytes_written: u64 },
+    /// Directory listing. `truncated` is `true` when the entry count
+    /// exceeded the agent's per-call cap.
+    List {
+        entries: Vec<FsEntry>,
+        truncated: bool,
+    },
+    /// File / directory metadata.
+    Stat(FsStat),
+    /// Directory created (no payload).
+    Mkdir,
+    /// Removed `entries_removed` filesystem entries (1 for a single
+    /// file/dir, more under `recursive=true`).
+    Remove { entries_removed: u64 },
+    /// Move / rename completed.
+    Move,
+    /// Verb-specific error. Distinct from `GuestResponse::Error`,
+    /// which is reserved for transport-layer failures the agent
+    /// can't attribute to a specific verb.
+    Error { kind: FsErrorKind, message: String },
+}
+
+/// One entry in an `FsList` response.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FsEntry {
+    /// Bare entry name (no leading directory component).
+    pub name: String,
+    /// File type. `Other` covers sockets, FIFOs, devices.
+    pub kind: FsEntryKind,
+    /// Size in bytes, or `0` for non-files.
+    pub size: u64,
+}
+
+/// Type of a filesystem entry returned by `FsList` / `FsStat`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FsEntryKind {
+    File,
+    Dir,
+    Symlink,
+    Other,
+}
+
+/// Stat metadata for a single filesystem entry.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct FsStat {
+    /// Canonical (post-`realpath`) path the agent operated on. Lets
+    /// the host detect when a symlink resolution surprised it.
+    pub canonical_path: String,
+    pub kind: FsEntryKind,
+    pub size: u64,
+    /// Unix mode bits (e.g. `0o100644`). Always present; on backends
+    /// without a unix mode the agent reports a best-effort
+    /// equivalent.
+    pub mode: u32,
+    /// Modification timestamp as RFC 3339, or `None` if the
+    /// underlying fs doesn't expose mtime.
+    pub mtime: Option<String>,
+}
+
+/// Class of error returned in `FsResult::Error`. Closed enum so the
+/// host can branch on `kind` without parsing message text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub enum FsErrorKind {
+    /// Path was rejected by the agent's policy (deny-list,
+    /// canonicalization failed, symlink crossed the deny-list).
+    PolicyDenied,
+    /// Path doesn't exist.
+    NotFound,
+    /// Caller does not have permission for this op (uid 901 EPERM).
+    PermissionDenied,
+    /// Target already exists where the verb required absence.
+    AlreadyExists,
+    /// Size / count cap exceeded (e.g. `length > 16 MiB`,
+    /// `recursive` walk would exceed cap).
+    CapExceeded,
+    /// Tried to rename across filesystems (`EXDEV`).
+    CrossDevice,
+    /// `recursive=false` on a non-empty directory.
+    DirectoryNotEmpty,
+    /// Underlying I/O error (look at `message` for detail).
+    IoError,
+    /// Path canonicalization succeeded but produced a path the agent
+    /// refuses to operate on (e.g. `/proc/self`).
+    BadPath,
+    /// Other / unclassified.
+    Other,
 }
 
 /// A single filesystem change detected since boot.
@@ -1115,6 +1604,85 @@ pub fn query_fs_diff_at(vsock_uds_path: &str) -> Result<Vec<FsChange>> {
     }
 }
 
+/// Dispatch a non-streaming process-control request to a running
+/// VM and return the `ProcResult`. Single-frame surface — the
+/// streaming `ProcWait` verb has its own helper below.
+pub fn send_proc_request(instance_dir: &str, req: GuestRequest) -> Result<ProcResult> {
+    debug_assert!(matches!(
+        req,
+        GuestRequest::ProcStart { .. }
+            | GuestRequest::ProcList
+            | GuestRequest::ProcSignal { .. }
+            | GuestRequest::ProcSendInput { .. }
+            | GuestRequest::ProcKill { .. }
+    ));
+    let mut stream = connect(instance_dir, DEFAULT_TIMEOUT_SECS)?;
+    let resp = send_request(&mut stream, &req)?;
+    match resp {
+        GuestResponse::ProcResult(r) => Ok(r),
+        GuestResponse::Error { message } => {
+            bail!("Guest proc-control transport error: {}", message)
+        }
+        _ => bail!("Unexpected response to proc-control verb"),
+    }
+}
+
+/// Stream `ProcWait` events for `pid_token`. Calls `on_event` for
+/// every non-terminal frame and returns the terminal event. Mirrors
+/// the host shape of `send_run_entrypoint`.
+pub fn send_proc_wait<F: FnMut(&ProcWaitEvent)>(
+    instance_dir: &str,
+    pid_token: &str,
+    timeout_secs: Option<u64>,
+    mut on_event: F,
+) -> Result<ProcWaitEvent> {
+    let mut stream = connect(instance_dir, DEFAULT_TIMEOUT_SECS)?;
+    let req = GuestRequest::ProcWait {
+        pid_token: pid_token.to_string(),
+        timeout_secs,
+    };
+    write_frame(&mut stream, &req)?;
+    loop {
+        let resp: GuestResponse = read_frame(&mut stream)?;
+        match resp {
+            GuestResponse::ProcWaitEvent(ev) => {
+                if ev.is_terminal() {
+                    return Ok(ev);
+                }
+                on_event(&ev);
+            }
+            GuestResponse::Error { message } => {
+                bail!("Guest proc-wait transport error: {}", message)
+            }
+            _ => bail!("Unexpected response in proc-wait stream"),
+        }
+    }
+}
+
+/// Dispatch a single FS RPC request to a running VM and return the
+/// `FsResult`. Wraps `connect` + `send_request` for `mvmctl fs *`
+/// callers — the host CLI doesn't need to thread a `UnixStream`
+/// around.
+pub fn send_fs_request(instance_dir: &str, req: GuestRequest) -> Result<FsResult> {
+    debug_assert!(matches!(
+        req,
+        GuestRequest::FsRead { .. }
+            | GuestRequest::FsWrite { .. }
+            | GuestRequest::FsList { .. }
+            | GuestRequest::FsStat { .. }
+            | GuestRequest::FsMkdir { .. }
+            | GuestRequest::FsRemove { .. }
+            | GuestRequest::FsMove { .. }
+    ));
+    let mut stream = connect(instance_dir, DEFAULT_TIMEOUT_SECS)?;
+    let resp = send_request(&mut stream, &req)?;
+    match resp {
+        GuestResponse::FsResult(r) => Ok(r),
+        GuestResponse::Error { message } => bail!("Guest FS RPC transport error: {}", message),
+        _ => bail!("Unexpected response to FS RPC verb"),
+    }
+}
+
 /// Send a `StartPortForward` request on an already-connected stream.
 ///
 /// Used by the Apple Container backend where the vsock connection is
@@ -1169,6 +1737,78 @@ mod tests {
                 session_id: 1,
                 cols: 80,
                 rows: 24,
+            },
+            GuestRequest::FsRead {
+                path: "/data/file.txt".to_string(),
+                offset: Some(1024),
+                length: 4096,
+                follow_symlinks: true,
+            },
+            GuestRequest::FsWrite {
+                path: "/tmp/out.bin".to_string(),
+                content: vec![0xde, 0xad, 0xbe, 0xef],
+                mode: 0o644,
+                create_parents: true,
+                follow_symlinks: false,
+            },
+            GuestRequest::FsList {
+                path: "/work".to_string(),
+                follow_symlinks: true,
+            },
+            GuestRequest::FsStat {
+                path: "/etc/hostname".to_string(),
+                follow_symlinks: false,
+            },
+            GuestRequest::FsMkdir {
+                path: "/work/new".to_string(),
+                mode: 0o755,
+                parents: true,
+            },
+            GuestRequest::FsRemove {
+                path: "/tmp/scratch".to_string(),
+                recursive: true,
+                follow_symlinks: false,
+            },
+            GuestRequest::FsMove {
+                from: "/tmp/a".to_string(),
+                to: "/tmp/b".to_string(),
+                follow_symlinks: false,
+            },
+            GuestRequest::ProcStart {
+                argv: vec!["/usr/bin/echo".to_string(), "hello".to_string()],
+                env: {
+                    let mut m = std::collections::BTreeMap::new();
+                    m.insert("LANG".to_string(), "C".to_string());
+                    m
+                },
+                cwd: Some("/tmp".to_string()),
+                stdin: vec![],
+                timeout_secs: Some(30),
+            },
+            GuestRequest::ProcList,
+            GuestRequest::ProcSignal {
+                pid_token: "tok-abc".to_string(),
+                signum: 15,
+            },
+            GuestRequest::ProcSendInput {
+                pid_token: "tok-abc".to_string(),
+                bytes: vec![1, 2, 3],
+            },
+            GuestRequest::ProcWait {
+                pid_token: "tok-abc".to_string(),
+                timeout_secs: Some(60),
+            },
+            GuestRequest::ProcKill {
+                pid_token: "tok-abc".to_string(),
+            },
+            GuestRequest::MountShare {
+                tag: "data-tag".to_string(),
+                guest_path: "/data/foo".to_string(),
+                read_only: true,
+            },
+            GuestRequest::UnmountShare {
+                guest_path: "/data/foo".to_string(),
+                force: false,
             },
         ];
 
@@ -1263,6 +1903,72 @@ mod tests {
                 exit_code: 0,
             },
             GuestResponse::ConsoleResized { session_id: 1 },
+            GuestResponse::FsResult(FsResult::Read {
+                content: vec![1, 2, 3],
+                total_size: 3,
+            }),
+            GuestResponse::FsResult(FsResult::Write { bytes_written: 4 }),
+            GuestResponse::FsResult(FsResult::List {
+                entries: vec![FsEntry {
+                    name: "data.csv".to_string(),
+                    kind: FsEntryKind::File,
+                    size: 1024,
+                }],
+                truncated: false,
+            }),
+            GuestResponse::FsResult(FsResult::Stat(FsStat {
+                canonical_path: "/data/data.csv".to_string(),
+                kind: FsEntryKind::File,
+                size: 1024,
+                mode: 0o100644,
+                mtime: Some("2026-05-05T10:00:00Z".to_string()),
+            })),
+            GuestResponse::FsResult(FsResult::Mkdir),
+            GuestResponse::FsResult(FsResult::Remove { entries_removed: 7 }),
+            GuestResponse::FsResult(FsResult::Move),
+            GuestResponse::FsResult(FsResult::Error {
+                kind: FsErrorKind::PolicyDenied,
+                message: "path under /etc/mvm/* is denied".to_string(),
+            }),
+            GuestResponse::ProcResult(ProcResult::Started {
+                pid_token: "tok-1".to_string(),
+            }),
+            GuestResponse::ProcResult(ProcResult::List {
+                processes: vec![ProcInfo {
+                    pid_token: "tok-1".to_string(),
+                    started_at: "2026-05-05T10:00:00Z".to_string(),
+                    argv0: "/usr/bin/sleep".to_string(),
+                    state: ProcState::Running,
+                }],
+            }),
+            GuestResponse::ProcResult(ProcResult::Signaled),
+            GuestResponse::ProcResult(ProcResult::InputAccepted { bytes_accepted: 3 }),
+            GuestResponse::ProcResult(ProcResult::Killed),
+            GuestResponse::ProcResult(ProcResult::Error {
+                kind: ProcErrorKind::UnknownToken,
+                message: "no such pid_token".to_string(),
+            }),
+            GuestResponse::ProcWaitEvent(ProcWaitEvent::Stdout { chunk: vec![1, 2] }),
+            GuestResponse::ProcWaitEvent(ProcWaitEvent::Stderr { chunk: vec![3, 4] }),
+            GuestResponse::ProcWaitEvent(ProcWaitEvent::Exit { code: 0 }),
+            GuestResponse::ProcWaitEvent(ProcWaitEvent::Killed { signal: 15 }),
+            GuestResponse::ProcWaitEvent(ProcWaitEvent::TimedOut),
+            GuestResponse::ProcWaitEvent(ProcWaitEvent::Error {
+                kind: ProcErrorKind::UnsupportedInProduction,
+                message: "stripped from prod".to_string(),
+            }),
+            GuestResponse::ShareResult(ShareResult::Mounted {
+                canonical_path: "/data/foo".to_string(),
+            }),
+            GuestResponse::ShareResult(ShareResult::Unmounted),
+            GuestResponse::ShareResult(ShareResult::Error {
+                kind: ShareErrorKind::PolicyDenied,
+                message: "/etc/x is on the deny list".to_string(),
+            }),
+            GuestResponse::ShareResult(ShareResult::Error {
+                kind: ShareErrorKind::Busy,
+                message: "target busy; pass force=true".to_string(),
+            }),
         ];
 
         for resp in &variants {
@@ -1270,6 +1976,269 @@ mod tests {
             let parsed: GuestResponse = serde_json::from_str(&json).unwrap();
             let json2 = serde_json::to_string(&parsed).unwrap();
             assert_eq!(json, json2);
+        }
+    }
+
+    /// W4.1 + A1 regression: every new FS variant rejects unknown
+    /// fields. Repeats the smuggling discipline from
+    /// `test_guest_request_rejects_unknown_field_inside_variant` for
+    /// each verb so a reviewer adding an FS field without the
+    /// `#[serde(...)]` attributes can't ship a regression.
+    #[test]
+    fn test_fs_request_variants_reject_unknown_fields() {
+        let cases = [
+            r#"{"FsRead":{"path":"/x","length":1,"follow_symlinks":true,"smuggled":1}}"#,
+            r#"{"FsWrite":{"path":"/x","content":[],"mode":420,"create_parents":false,"follow_symlinks":false,"smuggled":1}}"#,
+            r#"{"FsList":{"path":"/x","follow_symlinks":true,"smuggled":1}}"#,
+            r#"{"FsStat":{"path":"/x","follow_symlinks":true,"smuggled":1}}"#,
+            r#"{"FsMkdir":{"path":"/x","mode":493,"parents":true,"smuggled":1}}"#,
+            r#"{"FsRemove":{"path":"/x","recursive":false,"follow_symlinks":false,"smuggled":1}}"#,
+            r#"{"FsMove":{"from":"/x","to":"/y","follow_symlinks":false,"smuggled":1}}"#,
+        ];
+        for json in cases {
+            let err = serde_json::from_str::<GuestRequest>(json).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field"),
+                "expected unknown-field rejection for {json}, got: {err}"
+            );
+        }
+    }
+
+    /// FS sub-types that don't live inside `GuestRequest` directly
+    /// (`FsResult`, `FsEntry`, `FsStat`, `FsErrorKind`, `FsEntryKind`)
+    /// also need the deny-unknown-fields discipline because they
+    /// surface through `GuestResponse::FsResult(...)` on the host's
+    /// deserializer. Cover each in turn.
+    #[test]
+    fn test_fs_response_subtypes_reject_unknown_fields() {
+        let cases = [
+            // FsResult variant smuggling.
+            r#"{"FsResult":{"Read":{"content":[],"total_size":0,"smuggled":1}}}"#,
+            r#"{"FsResult":{"Write":{"bytes_written":0,"smuggled":1}}}"#,
+            r#"{"FsResult":{"List":{"entries":[],"truncated":false,"smuggled":1}}}"#,
+            r#"{"FsResult":{"Remove":{"entries_removed":0,"smuggled":1}}}"#,
+            r#"{"FsResult":{"Error":{"kind":"NotFound","message":"x","smuggled":1}}}"#,
+            // FsStat field smuggling (transports inside FsResult::Stat).
+            r#"{"FsResult":{"Stat":{"canonical_path":"/x","kind":"file","size":0,"mode":0,"mtime":null,"smuggled":1}}}"#,
+            // FsEntry field smuggling (transports inside FsResult::List).
+            r#"{"FsResult":{"List":{"entries":[{"name":"x","kind":"file","size":0,"smuggled":1}],"truncated":false}}}"#,
+        ];
+        for json in cases {
+            let err = serde_json::from_str::<GuestResponse>(json).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field"),
+                "expected unknown-field rejection for {json}, got: {err}"
+            );
+        }
+    }
+
+    /// W4.1 + A2 regression: every new Proc variant rejects unknown
+    /// fields. Mirrors `test_fs_request_variants_reject_unknown_fields`
+    /// for the dev-only process surface.
+    #[test]
+    fn test_proc_request_variants_reject_unknown_fields() {
+        let cases = [
+            r#"{"ProcStart":{"argv":["/x"],"env":{},"cwd":null,"stdin":[],"timeout_secs":null,"smuggled":1}}"#,
+            r#"{"ProcSignal":{"pid_token":"t","signum":15,"smuggled":1}}"#,
+            r#"{"ProcSendInput":{"pid_token":"t","bytes":[],"smuggled":1}}"#,
+            r#"{"ProcWait":{"pid_token":"t","timeout_secs":null,"smuggled":1}}"#,
+            r#"{"ProcKill":{"pid_token":"t","smuggled":1}}"#,
+        ];
+        for json in cases {
+            let err = serde_json::from_str::<GuestRequest>(json).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field"),
+                "expected unknown-field rejection for {json}, got: {err}"
+            );
+        }
+    }
+
+    /// `ProcList` is a unit variant in the wire enum. JSON encoding
+    /// is just the variant name as a string. Verify roundtrip.
+    #[test]
+    fn test_proc_list_unit_variant_roundtrip() {
+        let req = GuestRequest::ProcList;
+        let json = serde_json::to_string(&req).unwrap();
+        assert_eq!(json, r#""ProcList""#);
+        let parsed: GuestRequest = serde_json::from_str(&json).unwrap();
+        assert!(matches!(parsed, GuestRequest::ProcList));
+    }
+
+    /// FS-style: sub-types reachable through `ProcResult` and
+    /// `ProcWaitEvent` also need deny-unknown-fields, since they
+    /// land in `GuestResponse` on the *host's* deserializer.
+    #[test]
+    fn test_proc_response_subtypes_reject_unknown_fields() {
+        let cases = [
+            r#"{"ProcResult":{"Started":{"pid_token":"t","smuggled":1}}}"#,
+            r#"{"ProcResult":{"List":{"processes":[{"pid_token":"t","started_at":"now","argv0":"/x","state":"running","smuggled":1}]}}}"#,
+            r#"{"ProcResult":{"InputAccepted":{"bytes_accepted":0,"smuggled":1}}}"#,
+            r#"{"ProcResult":{"Error":{"kind":"UnknownToken","message":"x","smuggled":1}}}"#,
+            r#"{"ProcWaitEvent":{"Stdout":{"chunk":[],"smuggled":1}}}"#,
+            r#"{"ProcWaitEvent":{"Exit":{"code":0,"smuggled":1}}}"#,
+            r#"{"ProcWaitEvent":{"Killed":{"signal":15,"smuggled":1}}}"#,
+            r#"{"ProcWaitEvent":{"Error":{"kind":"Other","message":"x","smuggled":1}}}"#,
+        ];
+        for json in cases {
+            let err = serde_json::from_str::<GuestResponse>(json).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field"),
+                "expected unknown-field rejection for {json}, got: {err}"
+            );
+        }
+    }
+
+    /// `ProcWaitEvent::is_terminal` is load-bearing for the host
+    /// streaming loop. Make sure every terminal variant says
+    /// terminal and no non-terminal one does.
+    #[test]
+    fn test_proc_wait_event_terminal_classification() {
+        assert!(!ProcWaitEvent::Stdout { chunk: vec![] }.is_terminal());
+        assert!(!ProcWaitEvent::Stderr { chunk: vec![] }.is_terminal());
+        assert!(ProcWaitEvent::Exit { code: 0 }.is_terminal());
+        assert!(ProcWaitEvent::Killed { signal: 9 }.is_terminal());
+        assert!(ProcWaitEvent::TimedOut.is_terminal());
+        assert!(
+            ProcWaitEvent::Error {
+                kind: ProcErrorKind::Other,
+                message: String::new(),
+            }
+            .is_terminal()
+        );
+    }
+
+    /// W4.1 + D regression: every new Share variant rejects unknown
+    /// fields. Mirrors the FS / Proc deny-unknown-fields tests for
+    /// the virtio-fs share surface.
+    #[test]
+    fn test_share_request_variants_reject_unknown_fields() {
+        let cases = [
+            r#"{"MountShare":{"tag":"t","guest_path":"/data/x","read_only":true,"smuggled":1}}"#,
+            r#"{"UnmountShare":{"guest_path":"/data/x","force":false,"smuggled":1}}"#,
+        ];
+        for json in cases {
+            let err = serde_json::from_str::<GuestRequest>(json).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field"),
+                "expected unknown-field rejection for {json}, got: {err}"
+            );
+        }
+    }
+
+    /// `ShareResult` sub-variants reachable through `GuestResponse`
+    /// also need deny-unknown-fields, since they land on the
+    /// host's deserializer.
+    #[test]
+    fn test_share_response_subtypes_reject_unknown_fields() {
+        let cases = [
+            r#"{"ShareResult":{"Mounted":{"canonical_path":"/data/x","smuggled":1}}}"#,
+            r#"{"ShareResult":{"Error":{"kind":"PolicyDenied","message":"x","smuggled":1}}}"#,
+        ];
+        for json in cases {
+            let err = serde_json::from_str::<GuestResponse>(json).unwrap_err();
+            assert!(
+                err.to_string().contains("unknown field"),
+                "expected unknown-field rejection for {json}, got: {err}"
+            );
+        }
+    }
+
+    /// `ShareResult::Unmounted` is a unit variant; verify the wire
+    /// shape is just the variant name.
+    #[test]
+    fn test_share_unmounted_unit_variant_roundtrip() {
+        let resp = GuestResponse::ShareResult(ShareResult::Unmounted);
+        let json = serde_json::to_string(&resp).unwrap();
+        assert!(json.contains(r#""ShareResult":"Unmounted""#));
+        let parsed: GuestResponse = serde_json::from_str(&json).unwrap();
+        assert!(matches!(
+            parsed,
+            GuestResponse::ShareResult(ShareResult::Unmounted)
+        ));
+    }
+
+    /// Every committed fuzz seed must deserialize cleanly under the
+    /// production `GuestRequest` schema. Without this guard, a typo
+    /// in a seed (or a future field rename) could silently exclude
+    /// the seed from the fuzz coverage and the corpus would shrink
+    /// without anyone noticing.
+    #[test]
+    fn test_fuzz_corpus_seeds_parse() {
+        let seeds = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .join("fuzz/corpus/fuzz_guest_request");
+        if !seeds.is_dir() {
+            // The fuzz crate is excluded from some sparse checkouts;
+            // skip silently rather than failing in those.
+            return;
+        }
+        let mut count = 0usize;
+        for entry in std::fs::read_dir(&seeds).expect("read corpus dir") {
+            let entry = entry.expect("read corpus entry");
+            if !entry.file_type().expect("file type").is_file() {
+                continue;
+            }
+            let path = entry.path();
+            let bytes = std::fs::read(&path).expect("read seed");
+            // Tolerate an optional trailing newline editors add.
+            let trimmed = bytes.trim_ascii_end().to_vec();
+            serde_json::from_slice::<GuestRequest>(&trimmed)
+                .unwrap_or_else(|e| panic!("seed {} failed to parse: {e}", path.display()));
+            count += 1;
+        }
+        // 5 baseline (ping, port-fwd, run-entrypoint, sleep-prep,
+        // worker-status) + 7 fs-* (A1) + 6 proc-* (A2) + 2 share-*
+        // (D) = 20.
+        assert!(count >= 20, "expected ≥20 corpus seeds, got {count}");
+    }
+
+    /// `follow_symlinks` defaults to `true` for read-shaped verbs and
+    /// `false` for mutation verbs. The asymmetric default is
+    /// load-bearing for TOCTOU resistance — if a future reviewer
+    /// flips a default, this test catches it.
+    #[test]
+    fn test_fs_follow_symlinks_defaults() {
+        let read =
+            serde_json::from_str::<GuestRequest>(r#"{"FsRead":{"path":"/x","length":1}}"#).unwrap();
+        match read {
+            GuestRequest::FsRead {
+                follow_symlinks, ..
+            } => assert!(follow_symlinks, "FsRead should follow symlinks by default"),
+            _ => panic!("expected FsRead"),
+        }
+
+        let write = serde_json::from_str::<GuestRequest>(
+            r#"{"FsWrite":{"path":"/x","content":[],"mode":420}}"#,
+        )
+        .unwrap();
+        match write {
+            GuestRequest::FsWrite {
+                follow_symlinks,
+                create_parents,
+                ..
+            } => {
+                assert!(
+                    !follow_symlinks,
+                    "FsWrite must NOT follow symlinks by default"
+                );
+                assert!(!create_parents, "create_parents defaults to false");
+            }
+            _ => panic!("expected FsWrite"),
+        }
+
+        let remove = serde_json::from_str::<GuestRequest>(r#"{"FsRemove":{"path":"/x"}}"#).unwrap();
+        match remove {
+            GuestRequest::FsRemove {
+                follow_symlinks,
+                recursive,
+                ..
+            } => {
+                assert!(
+                    !follow_symlinks,
+                    "FsRemove must NOT follow symlinks by default"
+                );
+                assert!(!recursive, "recursive defaults to false");
+            }
+            _ => panic!("expected FsRemove"),
         }
     }
 

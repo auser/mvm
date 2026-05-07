@@ -88,6 +88,28 @@ fi
 
 echo "==> ok: no do_exec symbol in $BIN"
 
+# ─── Negative: mvm_guest::process_rpc must be ABSENT (W1 / A2) ──────────
+# The process-control RPC handler module is gated behind the
+# `dev-shell` feature in `crates/mvm-guest/src/lib.rs`. A prod build
+# (no `dev-shell`) compiles the module out entirely; the agent
+# dispatch arms route to `UnsupportedInProduction` typed errors
+# without referencing `mvm_guest::process_rpc::*`. Any symbol in
+# that path appearing here means dev-shell leaked into prod and the
+# arbitrary-process surface is reachable. Same posture as W4.3 for
+# `do_exec` — fail-closed.
+PROC_RPC_PATTERN='mvm_guest::process_rpc'
+if "${NM_CMD[@]}" "$BIN" 2>/dev/null | grep -F "$PROC_RPC_PATTERN" >/dev/null; then
+    echo "error: forbidden module '$PROC_RPC_PATTERN' present in production guest agent" >&2
+    echo "       this means the dev-shell feature is enabled on a path it" >&2
+    echo "       should not be. process_rpc carries the dev-only" >&2
+    echo "       arbitrary-process surface (ProcStart / ProcWait / ...);" >&2
+    echo "       see crates/mvm-guest/src/process_rpc.rs and lib.rs." >&2
+    "${NM_CMD[@]}" "$BIN" 2>/dev/null | grep -F "$PROC_RPC_PATTERN" | head -5 >&2 || true
+    exit 1
+fi
+
+echo "==> ok: no mvm_guest::process_rpc symbols in $BIN"
+
 # ─── Positive: handle_run_entrypoint must be PRESENT (ADR-007 §W5) ─────
 # The W2 handler is feature-independent (no `dev-shell` gate) — every
 # prod build must contain it. Absence means either the function was

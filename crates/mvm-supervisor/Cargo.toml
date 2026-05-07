@@ -12,10 +12,19 @@ authors.workspace = true
 mvm-core.workspace = true
 mvm-plan.workspace = true
 mvm-policy.workspace = true
+# `mvm-runtime` provides the `VmNameRegistry` the TTL reaper walks.
+# Heavy dep, but the supervisor's eventual job is to drive runtime
+# operations anyway, so we'd be importing it shortly regardless.
+mvm-runtime.workspace = true
 async-trait = "0.1"
 base64.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
+# `rand` in main deps (not dev-only): the TTL reaper (G6 of the parity
+# plan, "TTL reaper precision as side channel") applies ±10 s jitter
+# to its tick interval via a `Rng` so observers can't use TTL expiry
+# as a precise timing oracle.
+rand.workspace = true
 regex.workspace = true
 serde.workspace = true
 serde_json.workspace = true
@@ -28,7 +37,13 @@ thiserror = "1"
 tokio = { workspace = true, features = ["net", "rt"] }
 tracing.workspace = true
 
+# Sampler (A3) reads `/proc/<pid>/stat` and uses `sysconf(_SC_CLK_TCK)` /
+# `_SC_PAGESIZE` to convert jiffies → microseconds and pages → bytes.
+# Linux-only; the non-Linux source readers compile to empty stubs that
+# don't reference libc, so the dep is gated.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
-rand.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time"] }

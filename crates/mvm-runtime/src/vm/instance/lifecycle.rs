@@ -100,6 +100,9 @@ pub fn instance_create(tenant_id: &str, pool_id: &str) -> Result<String> {
         entered_running_at: None,
         entered_warm_at: None,
         last_busy_at: None,
+        tags: std::collections::BTreeMap::new(),
+        expires_at: None,
+        auto_resume: true,
     };
 
     save_instance(tenant_id, pool_id, &instance_id, &state)?;

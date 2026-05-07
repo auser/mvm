@@ -116,6 +116,35 @@ pub(in crate::commands) enum Commands {
     /// against a production guest the call returns "exec not available" gracefully. ADR-003
     /// documents the threat model and design.
     Mcp(ops::mcp::Args),
+    /// Set or clear a sandbox's TTL. The supervisor reaper tears down
+    /// VMs whose `expires_at` has elapsed.
+    #[command(name = "set-ttl")]
+    SetTtl(vm::set_ttl::Args),
+    /// Filesystem RPC against a running VM (read/write/ls/stat/mkdir/rm/mv).
+    /// Production-safe — every path runs through the agent's
+    /// `mvm_security::policy::PathPolicy` deny-list and per-call
+    /// resource caps.
+    Fs(vm::fs::Args),
+    /// Process control RPC against a running VM (start/ls/signal/kill/stdin/wait).
+    /// Dev-only — production guest agents strip the handler module
+    /// per ADR-002 §W4.3, returning `UnsupportedInProduction` for
+    /// every verb.
+    Proc(vm::proc::Args),
+    /// Quiesce a running VM, seal its memory image to
+    /// `~/.mvm/instances/<vm>/snapshot/`, and stop the VM.
+    /// Production-safe; HMAC + monotonic-epoch envelope refuses
+    /// replayed older state.
+    Pause(vm::pause::PauseArgs),
+    /// Verify a sealed snapshot and resume the VM. Refuses to
+    /// load a tampered or replayed snapshot.
+    Resume(vm::pause::ResumeArgs),
+    /// Manage sealed instance snapshots (`ls`, `rm`).
+    Snapshot(vm::pause::SnapshotArgs),
+    /// Manage virtio-fs shares attached to a VM (`add`, `ls`, `rm`).
+    /// Mount paths are validated by
+    /// `mvm_security::policy::MountPathPolicy` so a host can't
+    /// shadow verity-protected files.
+    Share(vm::share::Args),
 }
 
 // ============================================================================
@@ -219,6 +248,13 @@ pub fn run() -> Result<()> {
         Commands::Exec(a) => vm::exec::run(&cli, a, &cfg),
         Commands::Invoke(a) => vm::invoke::run(&cli, a, &cfg),
         Commands::Mcp(a) => ops::mcp::run(&cli, a, &cfg),
+        Commands::SetTtl(a) => vm::set_ttl::run(&cli, a, &cfg),
+        Commands::Fs(a) => vm::fs::run(&cli, a, &cfg),
+        Commands::Proc(a) => vm::proc::run(&cli, a, &cfg),
+        Commands::Pause(a) => vm::pause::run_pause(&cli, a, &cfg),
+        Commands::Resume(a) => vm::pause::run_resume(&cli, a, &cfg),
+        Commands::Snapshot(a) => vm::pause::run_snapshot(&cli, a, &cfg),
+        Commands::Share(a) => vm::share::run(&cli, a, &cfg),
     };
 
     with_hints(result)

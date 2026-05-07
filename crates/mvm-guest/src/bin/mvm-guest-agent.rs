@@ -694,6 +694,33 @@ fn do_sleep_prep() -> (bool, String) {
     }
 }
 
+/// Process registry singleton — shared across all `ProcStart` /
+/// `ProcWait` / etc. dispatches inside one agent process. Dev-only
+/// (gated alongside `process_rpc`); the symbol is absent from prod
+/// builds.
+#[cfg(feature = "dev-shell")]
+fn proc_registry() -> &'static mvm_guest::process_rpc::Registry {
+    use std::sync::OnceLock;
+    static REGISTRY: OnceLock<mvm_guest::process_rpc::Registry> = OnceLock::new();
+    REGISTRY.get_or_init(mvm_guest::process_rpc::Registry::new)
+}
+
+/// `ProcWait` streaming arm — writes intermediate Stdout/Stderr
+/// frames to the connection and returns the terminal event for the
+/// dispatch loop to write last. Mirrors `handle_run_entrypoint`.
+#[cfg(feature = "dev-shell")]
+fn handle_proc_wait_streaming(
+    file: &mut std::fs::File,
+    pid_token: &str,
+    timeout_secs: Option<u64>,
+) -> mvm_guest::vsock::ProcWaitEvent {
+    let caps = mvm_guest::process_rpc::Caps::production();
+    let registry = proc_registry();
+    mvm_guest::process_rpc::handle_proc_wait(registry, &caps, pid_token, timeout_secs, |ev| {
+        write_response(file, &GuestResponse::ProcWaitEvent(ev));
+    })
+}
+
 /// Maximum output size per stream (1 MiB) to prevent OOM from unbounded output.
 #[cfg(feature = "dev-shell")]
 const MAX_EXEC_OUTPUT: usize = 1024 * 1024;
@@ -725,12 +752,11 @@ fn do_exec(command: &str, stdin_data: Option<&str>, _timeout_secs: u64) -> Guest
         }
     };
 
-    if let Some(data) = stdin_data {
-        if let Some(ref mut pipe) = child.stdin {
-            if let Err(e) = pipe.write_all(data.as_bytes()) {
-                eprintln!("failed to write to pipe: {e}");
-            }
-        }
+    if let Some(data) = stdin_data
+        && let Some(ref mut pipe) = child.stdin
+        && let Err(e) = pipe.write_all(data.as_bytes())
+    {
+        eprintln!("failed to write to pipe: {e}");
     }
     drop(child.stdin.take());
 
@@ -1506,6 +1532,228 @@ fn handle_client(
                 detail: Some("entrypoint validation never ran".to_string()),
             },
         },
+
+        // FS RPC verbs (W1 / A1). Production-safe surface backed
+        // by `mvm_guest::fs_rpc::handle_with_defaults`: every path
+        // routes through `mvm_security::policy::PathPolicy` (deny
+        // list + canonicalization), per-call caps gate read/write
+        // sizes, and `FsResult::Error` carries a typed `kind` so
+        // the host can branch without parsing message text.
+        GuestRequest::FsRead {
+            path,
+            offset,
+            length,
+            ..
+        } => GuestResponse::FsResult(mvm_guest::fs_rpc::handle_with_defaults(
+            mvm_guest::fs_rpc::FsRequest::Read {
+                path: &path,
+                offset,
+                length,
+            },
+        )),
+        GuestRequest::FsWrite {
+            path,
+            content,
+            mode,
+            create_parents,
+            ..
+        } => GuestResponse::FsResult(mvm_guest::fs_rpc::handle_with_defaults(
+            mvm_guest::fs_rpc::FsRequest::Write {
+                path: &path,
+                content: &content,
+                mode,
+                create_parents,
+            },
+        )),
+        GuestRequest::FsList { path, .. } => {
+            GuestResponse::FsResult(mvm_guest::fs_rpc::handle_with_defaults(
+                mvm_guest::fs_rpc::FsRequest::List { path: &path },
+            ))
+        }
+        GuestRequest::FsStat {
+            path,
+            follow_symlinks,
+        } => GuestResponse::FsResult(mvm_guest::fs_rpc::handle_with_defaults(
+            mvm_guest::fs_rpc::FsRequest::Stat {
+                path: &path,
+                follow_symlinks,
+            },
+        )),
+        GuestRequest::FsMkdir {
+            path,
+            mode,
+            parents,
+        } => GuestResponse::FsResult(mvm_guest::fs_rpc::handle_with_defaults(
+            mvm_guest::fs_rpc::FsRequest::Mkdir {
+                path: &path,
+                mode,
+                parents,
+            },
+        )),
+        GuestRequest::FsRemove {
+            path, recursive, ..
+        } => GuestResponse::FsResult(mvm_guest::fs_rpc::handle_with_defaults(
+            mvm_guest::fs_rpc::FsRequest::Remove {
+                path: &path,
+                recursive,
+            },
+        )),
+        GuestRequest::FsMove { from, to, .. } => GuestResponse::FsResult(
+            mvm_guest::fs_rpc::handle_with_defaults(mvm_guest::fs_rpc::FsRequest::Move {
+                from: &from,
+                to: &to,
+            }),
+        ),
+
+        // Process control verbs (W1 / A2). Dev-only — the handler
+        // lives behind `#[cfg(feature = "dev-shell")]` so its
+        // symbols are stripped from prod builds (ADR-002 §W4.3 +
+        // ADR-007 §W5; the combined `prod-agent-runentry-contract`
+        // CI gate enforces it). Prod builds return a typed
+        // `UnsupportedInProduction` error so SDK callers can branch
+        // on capability without parsing message text.
+        GuestRequest::ProcStart {
+            argv,
+            env,
+            cwd,
+            stdin,
+            timeout_secs: _, // applied during ProcWait
+        } => {
+            #[cfg(feature = "dev-shell")]
+            {
+                let caps = mvm_guest::process_rpc::Caps::production();
+                GuestResponse::ProcResult(mvm_guest::process_rpc::handle_proc_start(
+                    proc_registry(),
+                    &caps,
+                    &argv,
+                    &env,
+                    cwd.as_deref(),
+                    &stdin,
+                ))
+            }
+            #[cfg(not(feature = "dev-shell"))]
+            {
+                let _ = (argv, env, cwd, stdin);
+                GuestResponse::ProcResult(mvm_guest::vsock::ProcResult::Error {
+                    kind: mvm_guest::vsock::ProcErrorKind::UnsupportedInProduction,
+                    message:
+                        "process control not available: guest agent built without dev-shell feature"
+                            .to_string(),
+                })
+            }
+        }
+        GuestRequest::ProcList => {
+            #[cfg(feature = "dev-shell")]
+            {
+                GuestResponse::ProcResult(mvm_guest::process_rpc::handle_proc_list(proc_registry()))
+            }
+            #[cfg(not(feature = "dev-shell"))]
+            {
+                GuestResponse::ProcResult(mvm_guest::vsock::ProcResult::Error {
+                    kind: mvm_guest::vsock::ProcErrorKind::UnsupportedInProduction,
+                    message:
+                        "process control not available: guest agent built without dev-shell feature"
+                            .to_string(),
+                })
+            }
+        }
+        GuestRequest::ProcSignal { pid_token, signum } => {
+            #[cfg(feature = "dev-shell")]
+            {
+                GuestResponse::ProcResult(mvm_guest::process_rpc::handle_proc_signal(
+                    proc_registry(),
+                    &pid_token,
+                    signum,
+                ))
+            }
+            #[cfg(not(feature = "dev-shell"))]
+            {
+                let _ = (pid_token, signum);
+                GuestResponse::ProcResult(mvm_guest::vsock::ProcResult::Error {
+                    kind: mvm_guest::vsock::ProcErrorKind::UnsupportedInProduction,
+                    message:
+                        "process control not available: guest agent built without dev-shell feature"
+                            .to_string(),
+                })
+            }
+        }
+        GuestRequest::ProcSendInput { pid_token, bytes } => {
+            #[cfg(feature = "dev-shell")]
+            {
+                let caps = mvm_guest::process_rpc::Caps::production();
+                GuestResponse::ProcResult(mvm_guest::process_rpc::handle_proc_send_input(
+                    proc_registry(),
+                    &caps,
+                    &pid_token,
+                    &bytes,
+                ))
+            }
+            #[cfg(not(feature = "dev-shell"))]
+            {
+                let _ = (pid_token, bytes);
+                GuestResponse::ProcResult(mvm_guest::vsock::ProcResult::Error {
+                    kind: mvm_guest::vsock::ProcErrorKind::UnsupportedInProduction,
+                    message:
+                        "process control not available: guest agent built without dev-shell feature"
+                            .to_string(),
+                })
+            }
+        }
+        GuestRequest::ProcKill { pid_token } => {
+            #[cfg(feature = "dev-shell")]
+            {
+                GuestResponse::ProcResult(mvm_guest::process_rpc::handle_proc_kill(
+                    proc_registry(),
+                    &pid_token,
+                ))
+            }
+            #[cfg(not(feature = "dev-shell"))]
+            {
+                let _ = pid_token;
+                GuestResponse::ProcResult(mvm_guest::vsock::ProcResult::Error {
+                    kind: mvm_guest::vsock::ProcErrorKind::UnsupportedInProduction,
+                    message:
+                        "process control not available: guest agent built without dev-shell feature"
+                            .to_string(),
+                })
+            }
+        }
+        GuestRequest::ProcWait {
+            pid_token,
+            timeout_secs,
+        } => {
+            #[cfg(feature = "dev-shell")]
+            {
+                let terminal = handle_proc_wait_streaming(&mut file, &pid_token, timeout_secs);
+                GuestResponse::ProcWaitEvent(terminal)
+            }
+            #[cfg(not(feature = "dev-shell"))]
+            {
+                let _ = (pid_token, timeout_secs);
+                GuestResponse::ProcWaitEvent(mvm_guest::vsock::ProcWaitEvent::Error {
+                    kind: mvm_guest::vsock::ProcErrorKind::UnsupportedInProduction,
+                    message:
+                        "process control not available: guest agent built without dev-shell feature"
+                            .to_string(),
+                })
+            }
+        }
+
+        // virtio-fs share mount/unmount (W1 / D). Production-safe;
+        // every host-supplied path runs through
+        // `mvm_security::policy::MountPathPolicy` before any
+        // mount(2) syscall. Real handler lives in
+        // `mvm_guest::share`.
+        GuestRequest::MountShare {
+            tag,
+            guest_path,
+            read_only,
+        } => {
+            GuestResponse::ShareResult(mvm_guest::share::handle_mount(&tag, &guest_path, read_only))
+        }
+        GuestRequest::UnmountShare { guest_path, force } => {
+            GuestResponse::ShareResult(mvm_guest::share::handle_unmount(&guest_path, force))
+        }
     };
 
     write_response(&mut file, &resp);
