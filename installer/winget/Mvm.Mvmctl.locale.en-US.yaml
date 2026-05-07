@@ -1,0 +1,27 @@
+PackageIdentifier: Mvm.Mvmctl
+PackageVersion: 0.13.0
+PackageLocale: en-US
+Publisher: Tinylabs
+PublisherUrl: https://github.com/auser/mvm
+PublisherSupportUrl: https://github.com/auser/mvm/issues
+PackageName: mvmctl
+PackageUrl: https://github.com/auser/mvm
+License: Apache-2.0
+LicenseUrl: https://github.com/auser/mvm/blob/main/LICENSE
+ShortDescription: Build and run Firecracker microVMs from Nix flakes — Linux, macOS, and WSL2.
+Description: |-
+  mvmctl is a Rust CLI for building and running hardware-isolated microVMs
+  via Firecracker (Linux + KVM), Apple Container (macOS 26+ Apple Silicon),
+  or libkrun (Linux KVM / macOS HVF). On Windows, the supported path is
+  WSL2 — see https://github.com/auser/mvm/blob/main/public/src/content/docs/install/windows.md
+  for the WSL2 quickstart.
+Tags:
+  - microvm
+  - firecracker
+  - rust
+  - virtualization
+  - sandbox
+  - vmm
+ReleaseNotesUrl: https://github.com/auser/mvm/releases/tag/v0.13.0
+ManifestType: defaultLocale
+ManifestVersion: 1.6.0

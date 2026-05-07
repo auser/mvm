@@ -49,6 +49,12 @@ export default defineConfig({
           ],
         },
         {
+          label: "Install",
+          items: [
+            { label: "Windows (WSL2)", slug: "install/windows" },
+          ],
+        },
+        {
           label: "Guides",
           items: [
             { label: "Writing Nix Flakes", slug: "guides/nix-flakes" },
@@ -57,6 +63,21 @@ export default defineConfig({
             { label: "Config & Secrets", slug: "guides/config-secrets" },
             { label: "Networking", slug: "guides/networking" },
             { label: "Troubleshooting", slug: "guides/troubleshooting" },
+            { label: "Windows: WSL2 walkthrough", slug: "guides/windows-wsl2" },
+            { label: "Windows: troubleshooting", slug: "guides/windows-troubleshooting" },
+          ],
+        },
+        {
+          label: "Security",
+          items: [
+            { label: "Matryoshka Model", slug: "security/matryoshka" },
+          ],
+        },
+        {
+          label: "Deploy",
+          items: [
+            { label: "AWS EC2", slug: "deploy/aws" },
+            { label: "Ubicloud", slug: "deploy/ubicloud" },
           ],
         },
         {

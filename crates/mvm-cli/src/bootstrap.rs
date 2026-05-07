@@ -9,12 +9,72 @@ use mvm_runtime::shell;
 ///
 /// - macOS: requires Homebrew
 /// - Linux: requires apt, dnf, or pacman
+/// - Windows: requires WSL2 (delegates to [`bootstrap_wsl2`])
 pub fn check_package_manager() -> Result<()> {
     if cfg!(target_os = "macos") {
         check_homebrew()
+    } else if cfg!(target_os = "windows") {
+        bootstrap_wsl2()
     } else {
         check_linux_package_manager()
     }
+}
+
+/// WSL2 bootstrap path (plan 53 §"Plan I.4"). On Windows, mvm runs
+/// inside a WSL2 distro — the Windows-side `mvmctl.exe` is a launcher
+/// that ensures WSL2 is configured and the Linux-side `mvmctl` is
+/// installed inside the chosen distro.
+///
+/// The current implementation detects WSL2 readiness and surfaces an
+/// install hint; full automation (running `wsl --install` + provisioning
+/// the distro) happens in a follow-up once we've validated the user
+/// flow on a real Windows host. See
+/// `public/.../guides/windows-wsl2.md` for the manual walkthrough
+/// users follow today.
+#[cfg(target_os = "windows")]
+pub fn bootstrap_wsl2() -> Result<()> {
+    use std::process::Command;
+
+    if which::which("wsl").is_err() {
+        anyhow::bail!(
+            "WSL is not installed on this Windows host.\n\
+             Install it from an elevated PowerShell:\n  \
+                 wsl --install\n\
+             Then reboot and re-run `mvmctl bootstrap`. See\n  \
+                 https://github.com/auser/mvm/blob/main/public/src/content/docs/install/windows.md"
+        );
+    }
+
+    // `wsl --status` returns 0 if WSL2 is configured and at least one
+    // distro is registered. We don't parse the output — exit code is
+    // sufficient signal for the bootstrap path.
+    let status = Command::new("wsl")
+        .arg("--status")
+        .status()
+        .map_err(|e| anyhow::anyhow!("could not invoke wsl: {e}"))?;
+    if !status.success() {
+        anyhow::bail!(
+            "WSL2 is not configured.\n\
+             From an elevated PowerShell:\n  \
+                 wsl --install\n  \
+                 wsl --update\n\
+             Then re-run `mvmctl bootstrap`."
+        );
+    }
+
+    ui::info(
+        "WSL2 detected. Install mvmctl inside your WSL2 distro and run\n  \
+            wsl -d Ubuntu -- mvmctl bootstrap\n\
+         to complete setup. See guides/windows-wsl2 for the full walkthrough.",
+    );
+    Ok(())
+}
+
+/// On non-Windows hosts, `bootstrap_wsl2` is a no-op so callers don't
+/// have to cfg-gate at every call site.
+#[cfg(not(target_os = "windows"))]
+pub fn bootstrap_wsl2() -> Result<()> {
+    Ok(())
 }
 
 /// Check if Homebrew is installed and accessible (macOS only).
@@ -117,6 +177,39 @@ echo "Lima ${LIMA_VERSION} installed successfully"
 /// Check if the platform requires Lima.
 pub fn is_lima_required() -> bool {
     platform::current().needs_lima()
+}
+
+/// Print an informational hint about libkrun availability (plan 53
+/// §"Plan E"). libkrun is optional — when it's available, `mvmctl run`
+/// can use it as a Tier 2 backend on macOS Intel and macOS <26 (where
+/// Apple Container is unavailable) without going through Lima. This
+/// function does *not* attempt to install libkrun automatically since
+/// it lives in the host's package manager (Homebrew on macOS, distro
+/// packages on Linux).
+///
+/// Idempotent and safe to call from any bootstrap path.
+pub fn hint_libkrun_if_useful() {
+    let plat = platform::current();
+    // Skip on Linux+KVM (Firecracker is the right backend) and on
+    // Windows (libkrun has no Windows port).
+    if plat.has_kvm() || plat.is_windows() {
+        return;
+    }
+    if mvm_libkrun::is_available() {
+        ui::info(
+            "Detected libkrun on this host; you can opt in with `mvmctl run --hypervisor libkrun`.",
+        );
+        return;
+    }
+    // Only suggest the install on platforms where libkrun would
+    // materially improve the user experience — i.e. macOS without
+    // Apple Container, where today the only path is Lima.
+    if matches!(plat, Platform::MacOS) && !plat.has_apple_containers() {
+        ui::info(&format!(
+            "Tip: install libkrun for a no-Lima Tier 2 microVM path on this Mac.\n  {}",
+            mvm_libkrun::install_hint()
+        ));
+    }
 }
 
 /// Detect a legacy `mvm` Lima VM left over from before W7.2 renamed the

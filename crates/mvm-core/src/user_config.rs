@@ -2,6 +2,21 @@ use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 use std::path::{Path, PathBuf};
 
+/// Security-related operator preferences.
+///
+/// Lives under `[security]` in `~/.mvm/config.toml`. Used by Plan B (the
+/// Docker-tier acknowledgment banner) and is the seam where future
+/// posture knobs land.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(default)]
+pub struct SecurityConfig {
+    /// Acknowledge that the active backend is the Tier 3 Docker fallback
+    /// (no microVM isolation). When `true`, `mvmctl run` does not print
+    /// the per-run security warning banner. Equivalent to setting the
+    /// `MVM_ACK_DOCKER_TIER=1` environment variable.
+    pub ack_docker_tier: bool,
+}
+
 /// Persistent operator configuration stored at `~/.mvm/config.toml`.
 ///
 /// CLI flags always take precedence over these values. This config is
@@ -23,6 +38,8 @@ pub struct MvmConfig {
     pub metrics_port: Option<u16>,
     /// URL for remote image catalog. None means use bundled catalog only.
     pub catalog_url: Option<String>,
+    /// Security-related operator preferences (`[security]` section).
+    pub security: SecurityConfig,
 }
 
 impl Default for MvmConfig {
@@ -35,6 +52,7 @@ impl Default for MvmConfig {
             log_format: None,
             metrics_port: None,
             catalog_url: None,
+            security: SecurityConfig::default(),
         }
     }
 }
@@ -189,6 +207,37 @@ mod tests {
         assert_eq!(cfg.default_memory_mib, 512);
         assert!(cfg.log_format.is_none());
         assert!(cfg.metrics_port.is_none());
+        // Security defaults: ack_docker_tier off — banner emits unless suppressed.
+        assert!(!cfg.security.ack_docker_tier);
+    }
+
+    #[test]
+    fn test_security_section_roundtrip() {
+        let cfg = MvmConfig {
+            security: SecurityConfig {
+                ack_docker_tier: true,
+            },
+            ..MvmConfig::default()
+        };
+        let text = toml::to_string_pretty(&cfg).unwrap();
+        let parsed: MvmConfig = toml::from_str(&text).unwrap();
+        assert!(parsed.security.ack_docker_tier);
+    }
+
+    #[test]
+    fn test_legacy_config_without_security_section_still_loads() {
+        // Older config files written before the [security] section was
+        // added must continue to deserialize cleanly with default security
+        // values. Serde's `#[serde(default)]` on the struct gives us this.
+        let legacy = r#"
+            lima_cpus = 4
+            lima_mem_gib = 8
+            default_cpus = 2
+            default_memory_mib = 512
+        "#;
+        let cfg: MvmConfig = toml::from_str(legacy).unwrap();
+        assert_eq!(cfg.lima_cpus, 4);
+        assert!(!cfg.security.ack_docker_tier);
     }
 
     #[test]

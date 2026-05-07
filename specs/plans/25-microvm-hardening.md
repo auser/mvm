@@ -39,6 +39,23 @@ We protect against three adversaries, in order of priority:
 Out of scope for this plan: a fully malicious *host* (mvmctl trusts the
 host completely; the host runs the hypervisor, holds private keys, etc.).
 
+## Layer mapping (added 2026-05-07)
+
+ADR-002's 2026-05-07 revision frames the seven CI-enforced claims
+around a five-layer trust model (the "Matryoshka model"). This plan's
+W1–W6 workstreams map onto layers as follows; see
+`specs/adrs/002-microvm-security-posture.md` §"Trust layers" for the
+full diagram and per-backend tier matrix.
+
+| Workstream | Primary layer(s) defended | Claims |
+|---|---|---|
+| W1 — Cheap defaults | L2 (proxy socket, port allowlist), cross-cutting | 1 (W1.1), supports 5 |
+| W2 — Defense in depth inside the VM | L4, L5 | 1 (W2.1, W2.3, W2.4), 2 (W2.2, W2.3) |
+| W3 — Verified boot | L3 | 3 |
+| W4 — Guest agent attack surface | L4 | 4 (W4.3), 5 (W4.1, W4.2) |
+| W5 — Supply chain | cross-cutting | 6 (W5.1), 7 (W5.2, W5.3) |
+| W6 — Documentation and CI gates | meta — gates the other layers | enforces 1–7 |
+
 ## Workstreams
 
 Each item is independently shippable. Numbering is execution order.

@@ -776,6 +776,37 @@ suspicious.
   mode 0700 (W1.2) gates to local user; cross-host authn is
   mvmd's problem.
 
+## Sprint 46+ — Cross-platform expansion (proposed)  [`plans/53-cross-platform-roadmap.md`](plans/53-cross-platform-roadmap.md)
+
+**Goal:** turn cross-platform support into a coherent multi-platform release without forking the security narrative. Decision recorded in plan 53 as **Option B — Pragmatic**: Firecracker stays the security baseline, Apple Container is the macOS exception, **libkrun** is the only new backend (Intel Mac + macOS-no-Lima), Docker stays as Tier 3 with loud warnings, Windows is first-class via WSL2 with bootstrap automation.
+
+**Why this sprint, why now:** today mvm fully supports Linux + KVM (Firecracker) and macOS 26+ Apple Silicon (Apple Container, plan 23). Older macOS, Intel Macs, and Windows hosts are second-class. The 2026 microVM ecosystem (SlicerVM, libkrun, AWS nested-virt EC2) makes a coherent multi-platform release tractable; we want to land it before the gap widens.
+
+**Three sequential sprint slots:**
+
+- **Sprint 46 — Foundation (~5 days, narrative + UX, zero arch risk).** Plans A (Matryoshka ADR rewrite), B (Doctor security-claims-by-tier output), C (PVM FAQ entry), J (AWS deployment guide), K (Ubicloud deployment guide), plus deferred-backlog placeholder files for Plans F/G/H.
+- **Sprint 47 — macOS parity + Windows foundation (~1 sprint).** Plan D (APFS CoW for Apple Container templates) + Plan I.1 (Windows CI lane) + Plan I.2 (Windows install docs, WSL2-first).
+- **Sprint 48 — libkrun + Windows installer (~1.5 sprints).** Plan E (libkrun backend — Intel Mac + macOS-no-Lima) + Plan I.3 (winget manifest) + Plan I.4 (WSL2 bootstrap automation). Sprint 48 ships **scaffolding** for libkrun (final API, dispatch, doctor, install hints); the spike phase that lands real C bindings + boot validation is tracked separately in [`plans/57-libkrun-spike.md`](plans/57-libkrun-spike.md).
+
+**Deferred backlog (rationale captured in plan 53):**
+
+- **Plan F — Cloud Hypervisor backend.** *Rejected* for security-posture reasons. Every advantage CH ships (nested KVM in guests, GPU passthrough, larger device model, Windows-guest support) is exactly what Firecracker excluded for attack surface. Adding CH would fork the security narrative. Trigger conditions to revisit are documented in plan 53 §Plan F.
+- **Plan G — crosvm backend.** *Deferred.* Niche for our user base; libkrun (Plan E) covers the embeddable cross-platform niche. Trigger: real Chrome OS / Android demand.
+- **Plan H — rust-vmm internalization.** *Rejected for now.* Composing rust-vmm crates into a working VMM is *building a VMM*; that's Firecracker's and libkrun's job. Trigger: custom-VMM-required feature.
+
+**Sprint 46+ success criteria (per slot):**
+
+- After Sprint 46: ADR-002 displays the layer model + per-backend tier matrix; `mvmctl doctor` and `mvmctl run` emit the Docker-tier warning banner; AWS + Ubicloud deployment guides published; deferred plans 54/55/56 placeholder files committed.
+- After Sprint 47: macOS Apple Container template instantiation <1s via APFS CoW; `cargo build --workspace` green on Windows; Windows install docs (WSL2-first) published.
+- After Sprint 48: libkrun runs on Linux + KVM, macOS Apple Silicon (no Lima), and macOS Intel; `winget install mvm` works on Windows; `mvmctl bootstrap` on Windows configures WSL2 + Ubuntu + mvm automatically.
+
+**Non-goals (named explicitly):**
+
+- Cloud Hypervisor backend (Plan F, rejected).
+- Promoting Docker to a first-class Windows path via pre-built rootfs distribution (would conflict with the security posture).
+- Native-Windows microVMs via Cloud Hypervisor + WHPX (depends on Plan F).
+- Eliminating Lima from the macOS *build* path (libkrun solves runtime only; build-on-host is future work).
+
 ## Completed Sprints
 
 - [01-foundation.md](sprints/01-foundation.md)

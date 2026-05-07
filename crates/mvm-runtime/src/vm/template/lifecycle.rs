@@ -1,3 +1,4 @@
+use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -10,11 +11,41 @@ use tracing::{instrument, warn};
 
 use crate::shell;
 use crate::ui;
+use crate::vm::cow::{CloneStrategy, reflink_or_copy};
 use mvm_core::pool::ArtifactPaths;
 use mvm_core::template::{TemplateRevision, template_current_symlink};
 use mvm_core::time::utc_now;
 
 use super::registry::TemplateRegistry;
+
+/// Reflink-clone a rootfs file for per-instance use.
+///
+/// Plan 53 Plan D: when starting a VM from a template (or any time
+/// concurrent instances need their own writable rootfs), call this
+/// instead of pointing the hypervisor at the source directly. The
+/// clone shares blocks with the source until either side writes, so
+/// on APFS / btrfs / xfs the operation is O(1) wall-clock regardless
+/// of rootfs size. On filesystems without reflink support (ext4 in
+/// the default Lima VM, NTFS, etc.) it falls back to a byte copy.
+///
+/// `src` must exist; `dst` must not. The destination's parent
+/// directory is created if it doesn't already exist.
+///
+/// Apple VZ and Firecracker each expect a running VM to own its disk
+/// image — sharing a rootfs path between two concurrent VMs makes
+/// the second start fail. This helper is the seam where that
+/// per-instance ownership is created.
+#[instrument(skip_all, fields(src = %src.display(), dst = %dst.display()))]
+pub fn clone_rootfs_for_instance(src: &Path, dst: &Path) -> Result<CloneStrategy> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory for {}", dst.display()))?;
+    }
+    let strategy = reflink_or_copy(src, dst)
+        .with_context(|| format!("cloning rootfs {} -> {}", src.display(), dst.display()))?;
+    tracing::debug!(?strategy, "rootfs clone complete");
+    Ok(strategy)
+}
 
 /// Run a shell command in the VM and check its exit code.
 /// Returns an error with stderr context if the command fails.
@@ -2113,5 +2144,37 @@ mod tests {
         };
         let b = a.clone();
         assert_eq!(a, b);
+    }
+
+    #[test]
+    fn clone_rootfs_creates_independent_per_instance_copy() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("template.ext4");
+        let dst = dir.path().join("vms/instance-1/rootfs.ext4");
+        std::fs::write(&src, b"template payload").expect("write src");
+
+        // Parent of dst doesn't exist yet — helper must create it.
+        let strategy = clone_rootfs_for_instance(&src, &dst).expect("clone");
+        assert!(matches!(
+            strategy,
+            CloneStrategy::Reflink | CloneStrategy::Copied
+        ));
+        assert_eq!(std::fs::read(&dst).unwrap(), b"template payload");
+
+        // Writing to the per-instance copy must not mutate the template.
+        std::fs::write(&dst, b"instance-only writes").expect("write dst");
+        assert_eq!(std::fs::read(&src).unwrap(), b"template payload");
+    }
+
+    #[test]
+    fn clone_rootfs_refuses_to_overwrite_existing_destination() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let src = dir.path().join("template.ext4");
+        let dst = dir.path().join("instance.ext4");
+        std::fs::write(&src, b"src").expect("write src");
+        std::fs::write(&dst, b"existing").expect("write dst");
+        // Existing destination must error — reflink_or_copy refuses
+        // to overwrite to keep template/instance state honest.
+        assert!(clone_rootfs_for_instance(&src, &dst).is_err());
     }
 }

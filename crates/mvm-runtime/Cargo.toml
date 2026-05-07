@@ -30,4 +30,5 @@ tera.workspace = true
 toml.workspace = true
 tracing.workspace = true
 mvm-apple-container.workspace = true
+mvm-libkrun.workspace = true
 libc.workspace = true

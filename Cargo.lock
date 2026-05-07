@@ -2322,6 +2322,7 @@ dependencies = [
  "mvm-build",
  "mvm-core",
  "mvm-guest",
+ "mvm-libkrun",
  "mvm-mcp",
  "mvm-runtime",
  "mvm-security",
@@ -2349,6 +2350,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "fs2",
+ "mvm-libkrun",
  "regex",
  "serde",
  "serde_json",
@@ -2377,6 +2379,14 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
+ "tracing",
+]
+
+[[package]]
+name = "mvm-libkrun"
+version = "0.1.0"
+dependencies = [
+ "libc",
  "tracing",
 ]
 
@@ -2433,6 +2443,7 @@ dependencies = [
  "mvm-build",
  "mvm-core",
  "mvm-guest",
+ "mvm-libkrun",
  "mvm-security",
  "opendal",
  "rand 0.8.6",

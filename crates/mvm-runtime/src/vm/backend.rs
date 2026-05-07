@@ -1,8 +1,12 @@
 use anyhow::Result;
-use mvm_core::vm_backend::{VmBackend, VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus};
+use mvm_core::vm_backend::{
+    BackendSecurityProfile, ClaimStatus, LayerCoverage, VmBackend, VmCapabilities, VmId, VmInfo,
+    VmStartConfig, VmStatus,
+};
 
 use super::apple_container::AppleContainerBackend;
 use super::docker::DockerBackend;
+use super::libkrun::LibkrunBackend;
 use super::{firecracker, microvm, microvm_nix};
 use crate::config::{PortMapping, VMS_DIR};
 use crate::shell::run_in_vm_stdout;
@@ -166,6 +170,21 @@ impl VmBackend for FirecrackerBackend {
     fn install(&self) -> Result<()> {
         firecracker::install()
     }
+
+    fn security_profile(&self) -> BackendSecurityProfile {
+        // Tier 1: full ADR-002. All seven CI-enforced claims hold.
+        // Hardware isolation via KVM; verified boot via dm-verity (W3,
+        // shipped 2026-04-30).
+        BackendSecurityProfile {
+            claims: [ClaimStatus::Holds; 7],
+            layer_coverage: LayerCoverage::all_layers(),
+            tier: "Tier 1",
+            notes: &[
+                "Full ADR-002 — all seven CI-enforced claims hold.",
+                "Hardware isolation via KVM. Verified boot via dm-verity (W3).",
+            ],
+        }
+    }
 }
 
 /// Backend-agnostic dispatch enum.
@@ -177,6 +196,9 @@ pub enum AnyBackend {
     MicrovmNix(MicrovmNixBackend),
     AppleContainer(AppleContainerBackend),
     Docker(DockerBackend),
+    /// libkrun (plan 53 §"Plan E") — Linux KVM / macOS HVF, including
+    /// macOS Intel where Apple Container is unavailable.
+    Libkrun(LibkrunBackend),
 }
 
 impl AnyBackend {
@@ -198,11 +220,14 @@ impl AnyBackend {
     /// Select backend by hypervisor name.
     ///
     /// Supported: `"firecracker"` (default), `"qemu"` (via microvm.nix),
-    /// `"apple-container"` (macOS 26+). Unknown names fall back to Firecracker.
+    /// `"apple-container"` (macOS 26+), `"libkrun"` (Linux KVM / macOS
+    /// HVF), `"docker"` (Tier 3 fallback). Unknown names fall back to
+    /// Firecracker.
     pub fn from_hypervisor(name: &str) -> Self {
         match name {
             "apple-container" => Self::AppleContainer(AppleContainerBackend),
             "docker" => Self::Docker(DockerBackend),
+            "libkrun" | "krun" => Self::Libkrun(LibkrunBackend),
             "qemu" => Self::MicrovmNix(MicrovmNixBackend),
             _ => Self::Firecracker(FirecrackerBackend),
         }
@@ -211,9 +236,11 @@ impl AnyBackend {
     /// Select the best backend for the current platform.
     ///
     /// Priority:
-    /// 1. Firecracker (if /dev/kvm available — fastest, production-grade)
-    /// 2. Apple Container (macOS 26+ — sub-second dev startup)
-    /// 3. Firecracker via Lima (macOS fallback)
+    /// 1. Firecracker (if /dev/kvm available — fastest, production-grade Tier 1)
+    /// 2. Apple Container (macOS 26+ — sub-second dev startup, Tier 2)
+    /// 3. libkrun (Linux KVM / macOS HVF — Intel Mac path, Tier 2)
+    /// 4. Docker (Tier 3 fallback — banner emitted; not promoted)
+    /// 5. Firecracker via Lima (legacy macOS fallback)
     pub fn auto_select() -> Self {
         let plat = mvm_core::platform::current();
 
@@ -227,12 +254,22 @@ impl AnyBackend {
             return Self::AppleContainer(AppleContainerBackend);
         }
 
-        // 3. Docker available → universal fallback (works on all platforms)
+        // 3. libkrun installed → use it. Critical for macOS Intel and
+        //    macOS <26 where Apple Container is unavailable. Same Tier 2
+        //    posture as Apple Container, but no Lima dependency.
+        if plat.has_libkrun() {
+            return Self::Libkrun(LibkrunBackend);
+        }
+
+        // 4. Docker available → universal Tier 3 fallback. The CLI emits
+        //    a loud, suppressible banner when this path is taken (plan 53
+        //    Plan B). Not preferred; only chosen when no microVM tier is
+        //    available on this host.
         if plat.has_docker() {
             return Self::Docker(DockerBackend);
         }
 
-        // 4. Firecracker via Lima (legacy macOS fallback)
+        // 5. Firecracker via Lima (legacy macOS fallback)
         Self::Firecracker(FirecrackerBackend)
     }
 
@@ -243,6 +280,7 @@ impl AnyBackend {
             Self::MicrovmNix(b) => b,
             Self::AppleContainer(b) => b,
             Self::Docker(b) => b,
+            Self::Libkrun(b) => b,
         }
     }
 
@@ -310,6 +348,10 @@ impl AnyBackend {
     pub fn install(&self) -> Result<()> {
         self.inner().install()
     }
+
+    pub fn security_profile(&self) -> BackendSecurityProfile {
+        self.inner().security_profile()
+    }
 }
 
 #[cfg(test)]
@@ -333,6 +375,22 @@ mod tests {
     }
 
     #[test]
+    fn test_firecracker_security_profile_tier_1_holds_all_claims() {
+        let backend = FirecrackerBackend;
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 1");
+        assert!(profile.layer_coverage.is_microvm());
+        assert!(profile.dropped_claims().is_empty());
+        assert!(profile.na_claims().is_empty());
+        assert!(
+            profile
+                .claims
+                .iter()
+                .all(|s| matches!(s, ClaimStatus::Holds))
+        );
+    }
+
+    #[test]
     fn test_microvm_nix_backend_name() {
         let backend = MicrovmNixBackend;
         assert_eq!(backend.name(), "microvm-nix");
@@ -346,6 +404,50 @@ mod tests {
         assert!(!caps.snapshots);
         assert!(caps.vsock);
         assert!(caps.tap_networking);
+    }
+
+    #[test]
+    fn test_microvm_nix_security_profile_tier_2_partial_claim_3() {
+        let backend = MicrovmNixBackend;
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 2");
+        assert!(profile.layer_coverage.is_microvm());
+        assert_eq!(profile.dropped_claims(), vec![3]);
+    }
+
+    #[test]
+    fn test_any_backend_dispatches_security_profile_for_firecracker() {
+        let backend = AnyBackend::from_hypervisor("firecracker");
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 1");
+    }
+
+    #[test]
+    fn test_any_backend_dispatches_security_profile_for_docker() {
+        let backend = AnyBackend::from_hypervisor("docker");
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 3");
+        assert!(!profile.layer_coverage.is_microvm());
+    }
+
+    #[test]
+    fn test_any_backend_from_hypervisor_libkrun() {
+        // Both `libkrun` and `krun` aliases route to the same backend
+        // — `krun` is the libkrun project's preferred short name and
+        // appears in some user docs.
+        for name in ["libkrun", "krun"] {
+            let backend = AnyBackend::from_hypervisor(name);
+            assert_eq!(backend.name(), "libkrun");
+        }
+    }
+
+    #[test]
+    fn test_any_backend_libkrun_is_tier_2() {
+        let backend = AnyBackend::from_hypervisor("libkrun");
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 2");
+        assert!(profile.layer_coverage.is_microvm());
+        assert_eq!(profile.dropped_claims(), vec![3]);
     }
 
     #[test]

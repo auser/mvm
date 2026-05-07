@@ -1,0 +1,22 @@
+[package]
+name = "mvm-libkrun"
+version = "0.1.0"
+edition = "2024"
+description = "libkrun (Red Hat) backend bindings for mvm — Linux KVM and macOS Hypervisor.framework"
+license = "Apache-2.0"
+# Plan 53 / Sprint 48 / Plan E.
+# Status: scaffolding. The public API surface is final but lifecycle
+# methods return "not yet wired" until the spike phase confirms the
+# bindings shape against a real libkrun.h. See plan 53 §"Plan E".
+#
+# When a host has libkrun installed (Homebrew on macOS, distro package
+# on Linux), is_available() returns true; otherwise the API errors with
+# a hint pointing the user at install instructions.
+
+[dependencies]
+tracing = "0.1"
+
+# `libc` provides ENOENT, etc. for error classification and is already
+# a workspace dep on every platform we ship.
+[dependencies.libc]
+version = "0.2"
