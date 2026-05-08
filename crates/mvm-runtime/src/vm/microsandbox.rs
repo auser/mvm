@@ -520,15 +520,14 @@ mod tests {
         // — we guard against panic only.
         let result = MicrosandboxBackend
             .status(&VmId("__mvm_test_definitely_does_not_exist__".to_string()));
-        match result {
-            Ok(s) => assert_eq!(
+        if let Ok(s) = result {
+            assert_eq!(
                 s,
                 VmStatus::Stopped,
                 "unknown sandbox must report Stopped, got: {s:?}"
-            ),
-            // DB-init failure is acceptable on a fresh CI machine.
-            Err(_) => {}
+            );
         }
+        // DB-init failure (Err) is acceptable on a fresh CI machine.
     }
 
     #[test]
