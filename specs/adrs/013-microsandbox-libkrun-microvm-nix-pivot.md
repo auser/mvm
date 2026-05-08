@@ -48,6 +48,38 @@ The new direction:
 **Neutral**:
 - mvmd's facade contract (`mvmctl::core`, `mvmctl::runtime::shell`, etc.) is unaffected — this is a backend swap, not a contract change.
 
+## Non-goal: OCI / container images
+
+**mvm is microVMs, not containers.** Even though microsandbox's API
+exposes both — `RootfsSource::Oci(reference)` for OCI image pulls and
+`RootfsSource::DiskImage { path, format, fstype }` for raw disk
+images — we deliberately use **only the `DiskImage` path**.
+
+Why this is a stated invariant, not a default:
+
+1. **Architectural commitment.** The project's value prop is microVM
+   isolation backed by Nix-built rootfs images. OCI brings registry
+   pulls, layered images, image index resolution, and a different
+   trust model — none of which we want in the trust boundary.
+2. **Reproducibility.** Nix-built rootfs images are byte-reproducible
+   given the same flake inputs (we gate this in CI). OCI images
+   resolve through a registry, can be re-tagged, and don't carry the
+   same guarantees by construction.
+3. **Trust boundary minimalism.** Pulling from an OCI registry adds
+   an external network dependency to the boot path. The microVM
+   path is offline-by-default once the rootfs is built.
+4. **Runtime path consistency.** The bridge between our `.ext4`
+   rootfs files and microsandbox's `.disk()` builder (a sibling
+   `.raw` hard-link with explicit `fstype("ext4")`) keeps the disk
+   path entirely host-local. No registry, no auth, no pull cache.
+
+**What this means for code review:** any PR that introduces
+`RootfsSource::Oci`, `microsandbox::RegistryAuth`, OCI image
+references, or related types is reviewed against this invariant.
+The exception is the future `mvm-cve` crate (plan 60 §"Roadmap
+support") which may parse OCI artifact metadata as input to the
+CVE roller — that's a metadata path, not a runtime path.
+
 ## Alternatives considered
 
 - **Keep Lima as a fallback**: rejected. Maintains a code path that doesn't get exercised in the pivot's primary use case. Either Lima is good enough to be the macOS path (it isn't, per UX measurements) or it's dead code.

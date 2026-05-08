@@ -260,6 +260,8 @@ Risk: microvm.nix is a third-party project. We pin a specific commit in `flake.l
 
 **Fallback (named explicitly):** if a microvm.nix audit surfaces a security regression we can't accept, fall back to the previous iteration's hand-rolled NixOS modules under `../mvm/nix/`. ADR-013 names this as a ready-to-execute escape hatch, not a vague intention. The cost: ~5K LOC of NixOS-module maintenance returns to our scope. The benefit: smaller trust boundary. We choose microvm.nix as the default *because* its trust boundary is acceptable today; if that changes, we revert.
 
+**Explicit non-goal: OCI images.** mvm is microVMs, not containers. Microsandbox's API exposes both `RootfsSource::Oci(reference)` and `RootfsSource::DiskImage { path, format, fstype }`; we use **only** the `DiskImage` path. The runtime never pulls from an OCI registry; the bridge from our Nix-built `.ext4` rootfs to microsandbox is a host-local `.raw` hard-link plus `fstype("ext4")`. ADR-013 §"Non-goal: OCI / container images" carries the full rationale (reproducibility, trust boundary, offline-by-default boot). Code review gate: any PR introducing `RootfsSource::Oci`, `RegistryAuth`, or OCI image references is reviewed against this invariant.
+
 ## L4 + L7 egress proxy (default-deny + policy-gated)
 
 Two proxies, both running in `mvm-supervisor`:
