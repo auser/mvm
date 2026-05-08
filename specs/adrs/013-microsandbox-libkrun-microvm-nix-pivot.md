@@ -81,6 +81,24 @@ The previous iteration shipped this exact strategy and was approaching the upstr
 
 CI perf gate: `xtask perf --backend <name> --p50-ms 300 --runs 100` (Phase 9). The smoke at `tests/smoke_e2e_boot.rs` (Phase 1 W6) runs a single boot and asserts the floor on every PR that touches the boot path.
 
+## Guest agent supervision
+
+`/init` (PID 1) forks **two** processes after staging the filesystem:
+
+1. The **guest agent** in the background, under `setpriv` to uid 990. The agent listens on vsock for host-mediated tool RPCs (web_search, code_eval, file transfer, etc.), reports system metrics, and handles lifecycle events (sleep/wake, stop). Without it the host can boot the VM but can't talk to it for anything beyond hypervisor-level control.
+
+2. The **entrypoint** in the foreground, under `setpriv` to the resolved entrypoint uid (root in dev, 1000 in prod by default).
+
+PID 1 stays uid 0 (kernel mandate) but exec's nothing as root after the supervision fork.
+
+**Implementation status (Phase 1 W6.1.1 — partial):**
+- The supervision pattern is in place: `/init` forks the agent in the background under uid 990 before setpriv-exec'ing the entrypoint.
+- The agent **binary** at `/usr/local/bin/mvm-guest-agent` is currently a **placeholder stub** — a sh script that logs its startup uid to `/dev/console` and sleeps in a loop. It demonstrates the supervision shape but doesn't implement the vsock RPC surface.
+- Every `mkGuest`-built derivation surfaces `passthru.mvm.agentBinary = "stub"` so consumers can detect this. Production deployments will refuse to boot a `"stub"` image once the policy lint lands.
+- W6.1.2 swaps in the real Rust binary (`crates/mvm-guest/src/bin/mvm-guest-agent.rs` — ~2400 LOC of vsock RPC). That swap needs cross-compile infrastructure (a Linux builder) and is its own focused wave.
+
+The supervision wiring matters even with the stub because: (a) the dev/prod uid split is real today, (b) `/etc/passwd` + `/etc/group` are baked correctly today, (c) the host-side `mvmctl status` cross-check against `/proc/<pid>/status` works today, and (d) swapping the binary path in the rootfs population step is a one-line change.
+
 ## Privilege model — rootless workloads on busybox PID 1
 
 PID 1 must be uid 0 (Linux kernel requirement; user-namespace tricks bring their own risk surface and are out of scope). `setpriv` drops privileges before exec'ing the workload, so the user-visible process tree is non-root by default in production.

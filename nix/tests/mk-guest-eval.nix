@@ -150,4 +150,16 @@ in
     in
     (meta g).uids.agent == 5000
     && (meta g).uids.entrypoint == 1000;  # default unaffected
+
+  # ── Agent supervision invariants (W6.1.1) ────────────────────
+  #
+  # Every mkGuest output advertises whether the bundled
+  # mvm-guest-agent is the stub (W6.1.1) or the real binary
+  # (W6.1.2+). Production deployments should refuse to boot a
+  # "stub" image once the lint lands; for now the metadata is
+  # the contract.
+
+  agent_binary_starts_as_stub = (meta shellGuest).agentBinary == "stub"
+    && (meta commandGuest).agentBinary == "stub"
+    && (meta servicesGuest).agentBinary == "stub";
 }

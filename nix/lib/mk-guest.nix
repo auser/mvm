@@ -157,6 +157,15 @@ let
   # /init — our PID 1. Pure POSIX shell; busybox provides every
   # utility used here. Boot-time-critical path so kept terse and
   # readable. No bashisms, no externalities beyond busybox applets.
+  #
+  # Supervision pattern (W6.1):
+  #   1. Stage filesystem (proc/sys/dev + tmpfs).
+  #   2. Fork the guest agent in background under setpriv→agent uid.
+  #   3. Re-attach stdio (dev variant).
+  #   4. setpriv→entrypoint uid + exec the workload.
+  #
+  # PID 1 stays uid 0 (kernel mandate); both children run rootless
+  # by default in production (see uids resolution above).
   initScript = pkgs.writeScript "mvm-init" ''
     #!/bin/sh
     # mvm /init — busybox PID 1 (plan 60 / ADR-013).
@@ -172,6 +181,20 @@ let
     # mountpoints instead.
     /bin/busybox mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
     /bin/busybox mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+
+    # Stage 2.5 — guest agent supervisor. Fork the agent into
+    # the background under its own uid before we drop to the
+    # entrypoint. The agent is responsible for vsock RPC (host
+    # tool calls, lifecycle hooks); without it, the host can boot
+    # us but can't talk to us. We never block on it — if the agent
+    # fails to start, the entrypoint still runs and the lack of
+    # agent shows up in `mvmctl status`.
+    if [ -x /usr/local/bin/mvm-guest-agent ]; then
+      /bin/busybox setsid /bin/busybox setpriv \
+        --reuid=${toString agentUid} --regid=${toString agentUid} \
+        --clear-groups --no-new-privs \
+        -- /usr/local/bin/mvm-guest-agent &
+    fi
 
     # Stage 3 — hostname + console. /dev/console is what the
     # hypervisor wires our virtio-console to; in dev mode we keep
@@ -215,6 +238,36 @@ let
   );
 
   nameFile = pkgs.writeText "mvm-name" "${name}\n";
+
+  # ── mvm-guest-agent — placeholder stub (W6.1.2 swaps for real Rust binary)
+  #
+  # Real binary lives at `crates/mvm-guest/src/bin/mvm-guest-agent.rs`
+  # (~2400 LOC of vsock RPC + system metrics + tool dispatch).
+  # Cross-compiling it from a macOS dev host needs a Linux builder
+  # (nix-darwin's linux-builder, or a remote nix-daemon). To unblock
+  # the supervision-pattern work without taking on that dep, this
+  # wave ships a sh stub that:
+  #
+  #   - exists at /usr/local/bin/mvm-guest-agent (so /init's exec
+  #     check finds it)
+  #   - logs its startup line to /dev/console so the supervision
+  #     shape is observable from the host
+  #   - sleeps in a loop indefinitely (the real agent's vsock
+  #     listener is also a long-running event loop)
+  #
+  # Swap-out for the real binary is a single attribute swap in the
+  # rootfsTree population step below. W6.1.2 lands the Nix
+  # derivation that builds the Rust binary as a target-Linux
+  # artifact and references it instead of this stub.
+  agentBinary = pkgs.writeShellScript "mvm-guest-agent-stub" ''
+    #!/bin/sh
+    # mvm-guest-agent (PLACEHOLDER STUB — W6.1.2 ships the real binary).
+    echo "mvm-guest-agent: stub started; uid=$(/bin/busybox id -u)" \
+      > /dev/console 2>&1 || true
+    while true; do
+      /bin/busybox sleep 3600
+    done
+  '';
 
   # extraFiles — { "absolute/path" = { content; mode?; }; }
   extraFilePopulation = lib.concatMapStringsSep "\n"
@@ -310,6 +363,13 @@ let
     fi
     chmod 0644 "$out/etc/group"
 
+    # mvm-guest-agent — installed under /usr/local/bin so /init can
+    # exec it. Mode 0555 so the agent can't rewrite itself; ownership
+    # is the build-time user (Nix sandbox has no root) — Phase 6 W2.2
+    # binds /etc + /usr read-only at boot to make this load-bearing.
+    cp ${agentBinary} "$out/usr/local/bin/mvm-guest-agent"
+    chmod 0555 "$out/usr/local/bin/mvm-guest-agent"
+
     # Extra user-supplied files.
     ${extraFilePopulation}
 
@@ -361,6 +421,11 @@ let
       entrypoint = entrypointUid;
     };
     rootlessEntrypoint = entrypointUid != 0;
+    # Agent binary kind: "stub" for the placeholder shipped in W6.1.1,
+    # "real" once W6.1.2 swaps in the cross-compiled Rust binary.
+    # `mvmctl status` reads this; production deployments should
+    # require "real" (the stub doesn't speak vsock RPC).
+    agentBinary = "stub";
   };
 in
 rootfsImage.overrideAttrs (old: {
