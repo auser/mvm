@@ -32,8 +32,9 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use mvm_core::vm_backend::{
     BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, VmBackend,
-    VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus,
+    VmCapabilities, VmExitStatus, VmId, VmInfo, VmStartConfig, VmStatus,
 };
+use mvm_core::vm_backend::StartMode;
 
 /// microsandbox backend (libkrun-backed; cross-platform Linux/macOS/Windows).
 ///
@@ -41,6 +42,49 @@ use mvm_core::vm_backend::{
 /// Hypervisor.framework (macOS), or WHvPlatform (Windows, when supported
 /// by the upstream microsandbox crate).
 pub struct MicrosandboxBackend;
+
+/// Record the caller's `StartMode` intent for a sandbox name.
+///
+/// Written to `~/.mvm/vms/<name>/mode.json` so subsequent
+/// `mvmctl status` / `mvmctl wait` / `mvmctl detach` calls know
+/// whether the caller expected attached or detached semantics.
+/// The microsandbox-side process is always detached (see
+/// `start_with_mode`); this metadata gates the host-side signal
+/// forwarding that lands in W7.
+///
+/// Failure to write the registry is a soft warning — start()
+/// proceeds. The contract is "best-effort metadata," not
+/// load-bearing for VM lifecycle.
+fn record_start_mode(name: &str, mode: StartMode) -> Result<()> {
+    let dir = home_dir()
+        .ok_or_else(|| anyhow::anyhow!("$HOME unset; cannot locate ~/.mvm/vms/<name>/"))?
+        .join(".mvm")
+        .join("vms")
+        .join(name);
+    if let Err(e) = std::fs::create_dir_all(&dir) {
+        tracing::warn!(error = %e, sandbox = %name, "microsandbox: mode registry mkdir failed");
+        return Ok(());
+    }
+    let path = dir.join("mode.json");
+    let body = match mode {
+        StartMode::Attached => "{\"mode\":\"attached\"}\n",
+        StartMode::Detached => "{\"mode\":\"detached\"}\n",
+    };
+    if let Err(e) = std::fs::write(&path, body) {
+        tracing::warn!(error = %e, sandbox = %name, ?mode, "microsandbox: mode registry write failed");
+    }
+    Ok(())
+}
+
+#[cfg(unix)]
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME").map(std::path::PathBuf::from)
+}
+
+#[cfg(not(unix))]
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
+}
 
 /// Bridge our Nix-built `rootfs.ext4` into a path microsandbox accepts.
 ///
@@ -119,7 +163,11 @@ impl VmBackend for MicrosandboxBackend {
         }
     }
 
-    fn start(&self, config: &VmStartConfig) -> Result<VmId> {
+    fn start_with_mode(
+        &self,
+        config: &VmStartConfig,
+        mode: StartMode,
+    ) -> Result<VmId> {
         // 1. Bridge the rootfs path. Microsandbox's `.disk()` builder
         //    only accepts .raw/.qcow2/.vmdk extensions; our build
         //    pipeline produces .ext4. The hard-link alias keeps disk
@@ -140,10 +188,23 @@ impl VmBackend for MicrosandboxBackend {
         //    255 max — anything above that is a misconfiguration.
         let cpus = u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX);
 
-        // 3. Spawn detached so microsandbox manages the sandbox
-        //    lifecycle independently of this process — same shape as
-        //    Firecracker's daemon-mode boot. The caller can later
-        //    re-attach via `Sandbox::start(&name)` if needed.
+        // 3. Both Attached and Detached spawn modes call
+        //    `create_detached()` underneath — the microsandbox
+        //    Sandbox handle requires keeping a !Send future across
+        //    the sync VmBackend boundary, which would force an
+        //    internal Mutex<HashMap<VmId, Sandbox>> (added in a
+        //    follow-up wave when we wire the host-side signal
+        //    layer).
+        //
+        //    For now, `mode` is *intent metadata* — recorded in
+        //    `~/.mvm/vms/<name>/mode.json` so subsequent
+        //    `wait()`/`detach()` calls know whether the caller
+        //    expected attached semantics. The microsandbox-side
+        //    behavior is identical regardless; the host-side
+        //    Ctrl-C signal forwarding is the W7 follow-up that
+        //    closes the loop.
+        record_start_mode(&config.name, mode)?;
+
         let name = config.name.clone();
         block_on(async {
             microsandbox::Sandbox::builder(&name)
@@ -156,13 +217,55 @@ impl VmBackend for MicrosandboxBackend {
         .map_err(|e| anyhow::anyhow!(e))
         .with_context(|| {
             format!(
-                "microsandbox create_detached for '{}' (rootfs {})",
+                "microsandbox create_detached for '{}' (mode={mode:?}, rootfs {})",
                 config.name,
                 disk_path.display()
             )
         })?;
 
+        tracing::info!(
+            sandbox = %config.name,
+            ?mode,
+            "microsandbox: sandbox created"
+        );
         Ok(VmId(config.name.clone()))
+    }
+
+    fn wait(&self, id: &VmId) -> Result<VmExitStatus> {
+        // microsandbox's `Sandbox::wait()` requires the caller to
+        // own the lifecycle handle, which we don't keep across
+        // sync boundary calls. As a pragmatic substitute, poll
+        // `Sandbox::list()` until the named sandbox disappears —
+        // O(seconds) granularity, fine for "block until exit"
+        // semantics. The W7 follow-up swaps this for a real
+        // signal-aware wait once the handle registry lands.
+        const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
+        loop {
+            let handles = block_on(async { microsandbox::Sandbox::list().await })
+                .map_err(|e| anyhow::anyhow!(e))
+                .with_context(|| format!("microsandbox list (during wait for {})", id.0))?;
+            if !handles.iter().any(|h| h.name() == id.0) {
+                // Sandbox no longer present — exited cleanly OR
+                // was killed externally. We can't disambiguate
+                // without the lifecycle handle, so report success
+                // by convention. mvmd's audit chain captures the
+                // distinction at the policy layer.
+                return Ok(VmExitStatus::SUCCESS);
+            }
+            std::thread::sleep(POLL_INTERVAL);
+        }
+    }
+
+    fn detach(&self, id: &VmId) -> Result<()> {
+        // microsandbox sandboxes are already detached at the OS-
+        // process level (we always call `create_detached()`).
+        // Mark the intent change in our local registry so a
+        // subsequent `mvmctl status` reports the right mode, but
+        // there's no hypervisor-side action to take.
+        record_start_mode(&id.0, StartMode::Detached)
+            .with_context(|| format!("microsandbox detach: writing mode for {}", id.0))?;
+        tracing::info!(sandbox = %id.0, "microsandbox: detached");
+        Ok(())
     }
 
     fn stop(&self, id: &VmId) -> Result<()> {
@@ -536,6 +639,80 @@ mod tests {
         // microsandbox's storage isn't initialized. The test asserts
         // the call doesn't panic — same shape as stop_all().
         let _ = MicrosandboxBackend.list();
+    }
+
+    /// Serialize tests that mutate `$HOME` so they don't race each
+    /// other. Reuses the workspace-wide `DATA_DIR_TEST_LOCK` from
+    /// `vm/mod.rs` because env-var races are the same shape as
+    /// `MVM_DATA_DIR` races.
+    fn with_home_temp<F>(f: F)
+    where
+        F: FnOnce(&std::path::Path),
+    {
+        let _guard = crate::vm::DATA_DIR_TEST_LOCK
+            .lock()
+            .expect("DATA_DIR_TEST_LOCK poisoned");
+        let temp = tempfile::tempdir().expect("tempdir");
+        let saved = std::env::var_os("HOME");
+        // SAFETY: serialized via DATA_DIR_TEST_LOCK above.
+        unsafe { std::env::set_var("HOME", temp.path()); }
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            f(temp.path());
+        }));
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+        if let Err(p) = result {
+            std::panic::resume_unwind(p);
+        }
+    }
+
+    #[test]
+    fn microsandbox_record_start_mode_writes_attached_then_detached() {
+        with_home_temp(|home| {
+            let name = format!("rec-mode-{}", std::process::id());
+
+            record_start_mode(&name, StartMode::Attached).expect("first write");
+            let mode_path = home.join(".mvm").join("vms").join(&name).join("mode.json");
+            let attached = std::fs::read_to_string(&mode_path).expect("mode.json present");
+            assert!(attached.contains("attached"), "expected attached, got: {attached}");
+
+            record_start_mode(&name, StartMode::Detached).expect("second write overrides");
+            let detached = std::fs::read_to_string(&mode_path).expect("mode.json still present");
+            assert!(detached.contains("detached"), "second write didn't override: {detached}");
+            assert!(!detached.contains("attached"), "old marker not cleared");
+        });
+    }
+
+    #[test]
+    fn microsandbox_detach_records_detached_intent() {
+        with_home_temp(|home| {
+            let name = format!("detach-test-{}", std::process::id());
+            let id = VmId(name.clone());
+
+            // Pre-seed Attached so detach has something to flip.
+            record_start_mode(&name, StartMode::Attached).expect("seed");
+
+            MicrosandboxBackend.detach(&id).expect("detach is infallible after seed");
+
+            let mode_path = home.join(".mvm").join("vms").join(&name).join("mode.json");
+            let body = std::fs::read_to_string(&mode_path).expect("mode.json present");
+            assert!(body.contains("detached"), "detach didn't flip intent, got: {body}");
+        });
+    }
+
+    #[test]
+    fn vm_exit_status_success_sentinel_round_trips() {
+        // Sanity: the SUCCESS const is what the polling wait()
+        // returns when the sandbox has disappeared. Asserting its
+        // shape so a future refactor can't silently change the
+        // semantics.
+        let s = VmExitStatus::SUCCESS;
+        assert_eq!(s.code, Some(0));
+        assert!(s.success);
     }
 
     #[test]

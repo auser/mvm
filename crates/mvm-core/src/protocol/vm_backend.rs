@@ -185,6 +185,78 @@ pub enum VmStatus {
     Failed { reason: String },
 }
 
+/// How the lifecycle of a freshly-started VM is bound to the caller.
+///
+/// Modeled after microsandbox's `SpawnMode` (`Attached` vs `Detached`).
+/// The two are orthogonal to *what* the VM runs — they control *how
+/// long* it lives relative to the process that started it.
+///
+/// ## `Attached` (interactive default)
+///
+/// The VM lifecycle is bound to the calling process. If the caller
+/// exits without explicitly detaching, the VM is sent SIGTERM. Use
+/// for:
+///
+///   - `mvmctl run` followed by `mvmctl exec` in the same shell.
+///   - `mvmctl dev` interactive sessions where the user expects the
+///     VM to disappear when they Ctrl-C.
+///   - Test harnesses that want deterministic teardown.
+///
+/// Pair with [`VmBackend::wait`] to block until the VM exits, and
+/// [`VmBackend::detach`] to convert an attached VM into a detached
+/// one without restarting it.
+///
+/// ## `Detached` (production / daemon default)
+///
+/// The VM survives the calling process. Use for:
+///
+///   - `mvmctl up` (background "up + run" model — the CLI returns,
+///     the VM keeps running).
+///   - Production agents (mvmd) that boot VMs and immediately move on.
+///   - CI fixtures that boot once and run several phases against the
+///     same long-lived VM.
+///
+/// Once detached, only `mvmctl down` (or the equivalent
+/// [`VmBackend::stop`] call) terminates the VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum StartMode {
+    /// VM lifecycle bound to the calling process; SIGTERM on caller exit.
+    Attached,
+    /// VM survives caller exit; explicit stop required to terminate.
+    Detached,
+}
+
+impl Default for StartMode {
+    /// `Detached` is the safer default — the worst failure of a
+    /// detached VM is "you have to clean it up later"; the worst
+    /// failure of an attached VM is "your CI run abandoned a VM
+    /// because the runner crashed before sending SIGTERM."
+    fn default() -> Self {
+        StartMode::Detached
+    }
+}
+
+/// Result of a VM exiting (returned by [`VmBackend::wait`]).
+///
+/// Mirrors [`std::process::ExitStatus`] semantically but is
+/// serializable + dyn-trait-friendly for the host-side IPC path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct VmExitStatus {
+    /// Numeric exit code, when one was reported. None if the VM was
+    /// terminated by signal or didn't expose a status.
+    pub code: Option<i32>,
+    /// True if the VM exited normally (i.e. through its entrypoint
+    /// returning, not via signal or crash). Always `true` if
+    /// `code == Some(_)`.
+    pub success: bool,
+}
+
+impl VmExitStatus {
+    /// A successful zero-exit-code status — used by backends that
+    /// don't expose a real wait surface but want a sentinel value.
+    pub const SUCCESS: Self = VmExitStatus { code: Some(0), success: true };
+}
+
 /// Capabilities that a backend may or may not support.
 ///
 /// Used by consumers to check what operations are available before
@@ -374,7 +446,65 @@ pub trait VmBackend: Send + Sync {
     /// Start a new VM from the given configuration.
     ///
     /// Returns the [`VmId`] assigned to the running VM.
-    fn start(&self, config: &VmStartConfig) -> Result<VmId>;
+    /// Equivalent to [`start_with_mode`](Self::start_with_mode) with
+    /// [`StartMode::Detached`] — preserved for back-compat with
+    /// existing consumers + because Detached is the right default
+    /// for the most common path (`mvmctl up`).
+    fn start(&self, config: &VmStartConfig) -> Result<VmId> {
+        self.start_with_mode(config, StartMode::Detached)
+    }
+
+    /// Start a VM with explicit attach/detach semantics.
+    ///
+    /// See [`StartMode`] for the contract. The default impl bails —
+    /// backends MUST override either this or [`start`](Self::start);
+    /// the other gets the default-trampoline. Most production
+    /// backends override this method (the more general one) and let
+    /// `start` delegate.
+    fn start_with_mode(
+        &self,
+        _config: &VmStartConfig,
+        _mode: StartMode,
+    ) -> Result<VmId> {
+        anyhow::bail!(
+            "{}: start_with_mode is not implemented for this backend",
+            self.name()
+        )
+    }
+
+    /// Block until a VM exits and return its exit status.
+    ///
+    /// Only meaningful for VMs started with [`StartMode::Attached`]
+    /// (or freshly attached via [`reattach`](Self::reattach), if/when
+    /// that gets implemented). Backends that lack a wait surface
+    /// (e.g., a detached daemon with no PID handle) return an error
+    /// pointing at the limitation; the default impl bails with a
+    /// reasonable message so consumers get a clear failure mode.
+    fn wait(&self, _id: &VmId) -> Result<VmExitStatus> {
+        anyhow::bail!(
+            "{}: wait is not supported for this backend (or this VM is detached)",
+            self.name()
+        )
+    }
+
+    /// Convert an attached VM into a detached one without restarting it.
+    ///
+    /// Mirrors microsandbox's `Sandbox::detach(self)` — disarms the
+    /// SIGTERM safety net so the caller can exit without taking the
+    /// VM down with it. After `detach`, `wait` is no longer
+    /// meaningful (you'd have to re-attach via `start_with_mode`
+    /// against an existing name).
+    ///
+    /// Backends that always run detached (Firecracker, libkrun in
+    /// daemon mode) treat this as a no-op and return Ok. Backends
+    /// that don't support it bail with a clear error.
+    ///
+    /// The default impl is a no-op + Ok — appropriate for backends
+    /// that don't have an attached/detached split, since for them
+    /// "detach" is the steady state.
+    fn detach(&self, _id: &VmId) -> Result<()> {
+        Ok(())
+    }
 
     /// Stop a running VM.
     fn stop(&self, id: &VmId) -> Result<()>;
