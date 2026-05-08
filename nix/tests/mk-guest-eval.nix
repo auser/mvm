@@ -81,15 +81,14 @@ in
   # because it's "easier") fails this gate before merge.
   init_system_is_busybox = (meta shellGuest).initSystem == "busybox";
 
-  # The expected boot budget is per-backend. Firecracker = 200ms;
-  # microsandbox/libkrun = 500ms; everything else falls back to 1s.
-  # The numbers are advisory metadata (Phase 9's `xtask perf`
-  # enforces them in CI); guarding them here prevents accidental
-  # regression of the *budget* itself.
-  boot_budget_firecracker_is_200ms =
-    (meta shellGuest).expectedBootMs == 200;
+  # ADR-013 floor: every backend ≤ 300 ms cold p50. The metadata
+  # surfaces the budget on every derivation; CI's xtask perf
+  # enforces. Guarding it here so a future PR can't silently
+  # regress the floor.
+  boot_budget_firecracker_is_300ms =
+    (meta shellGuest).expectedBootMs == 300;
 
-  microsandbox_boot_budget_is_500ms =
+  microsandbox_boot_budget_is_300ms =
     let
       msbGuest = mkGuest {
         name = "msb-budget";
@@ -97,5 +96,5 @@ in
         hypervisor = "microsandbox";
       };
     in
-    (meta msbGuest).expectedBootMs == 500;
+    (meta msbGuest).expectedBootMs == 300;
 }

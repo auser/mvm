@@ -69,14 +69,17 @@ The previous iteration shipped this exact strategy and was approaching the upstr
 
 ### Per-backend boot budgets (CI gate, Phase 9)
 
+**Floor: every backend must boot in ≤ 300 ms cold p50.** The number is intentionally aggressive — busybox-as-PID-1 + a trimmed kernel + direct-`vmlinux` boot all exist precisely so we can hit it. A backend that can't reach the floor is a backend we don't ship.
+
 | Backend | Cold p50 | Snapshot-cloned p50 | Notes |
 |---|---|---|---|
-| Firecracker (Linux/KVM) | ≤ 200 ms | ≤ 30 ms | Snapshot pool warm; cold path measured from `firecracker --no-api` start to entrypoint exec. |
-| microsandbox / libkrun (Linux+macOS) | ≤ 500 ms | ≤ 60 ms | libkrunfw bundles kernel; HVF on macOS typically adds ~100ms vs KVM. |
-| Apple Virtualization framework | ≤ 1 s | ≤ 200 ms | Apple's hypervisor overhead; pending upstream profiling. |
-| Cloud Hypervisor (post-Phase-10) | ≤ 250 ms | ≤ 50 ms | Slightly heavier device model than Firecracker. |
+| Firecracker (Linux/KVM) | ≤ 300 ms | ≤ 30 ms | Trivially achievable with custom init; aim for ~150 ms in practice. |
+| microsandbox / libkrun (Linux/KVM) | ≤ 300 ms | ≤ 30 ms | libkrunfw bundles kernel; matches Firecracker on Linux. |
+| microsandbox / libkrun (macOS HVF) | ≤ 300 ms | ≤ 60 ms | HVF init overhead is real; reaching the floor needs the kernel + initramfs trim from §"Boot-time budget" to be tight. |
+| Apple Virtualization framework | ≤ 300 ms | ≤ 200 ms | Apple's hypervisor overhead. If we can't hit 300 ms here we drop the backend (see ADR-031 — macOS path is microsandbox-direct anyway). |
+| Cloud Hypervisor (post-Phase-10) | ≤ 300 ms | ≤ 50 ms | Same target; slightly heavier device model. |
 
-Reproducible builds + CI perf gate: `xtask perf --backend firecracker --p50-ms 200 --runs 100`.
+CI perf gate: `xtask perf --backend <name> --p50-ms 300 --runs 100` (Phase 9). The smoke at `tests/smoke_e2e_boot.rs` (Phase 1 W6) runs a single boot and asserts the floor on every PR that touches the boot path.
 
 ## Non-goal: OCI / container images
 

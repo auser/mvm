@@ -274,10 +274,11 @@ let
     sealed = isSealed;
     entrypointKind = entrypointKind;
     initSystem = "busybox";
-    expectedBootMs =
-      if hypervisor == "firecracker" then 200
-      else if hypervisor == "microsandbox" || hypervisor == "libkrun" then 500
-      else 1000;
+    # ADR-013 §"Per-backend boot budgets" — single 300ms floor across
+    # every backend. Custom /init + trimmed kernel + direct vmlinux
+    # boot are the levers that keep us under it. A backend that can't
+    # hit the floor is a backend we drop.
+    expectedBootMs = 300;
   };
 in
 rootfsImage.overrideAttrs (old: {
