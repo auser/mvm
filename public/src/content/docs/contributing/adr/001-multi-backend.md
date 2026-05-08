@@ -1,0 +1,49 @@
+---
+title: "ADR-001: Multi-Backend VM Execution"
+description: Architecture Decision Record for supporting multiple VM backends with Firecracker as primary.
+---
+
+## Status
+
+Accepted (updated Sprint 38 -- expanded from Firecracker-only to multi-backend)
+
+## Context
+
+mvmctl needs VM backends for running isolated workloads across different platforms. Options considered:
+
+1. **Docker/OCI containers** -- Widely adopted, large ecosystem
+2. **QEMU/KVM** -- Full hardware virtualization, maximum compatibility
+3. **Firecracker** -- Purpose-built microVM monitor, minimal attack surface
+4. **Apple Virtualization.framework** -- Native macOS 26+ virtualization, sub-second startup
+5. **Cloud Hypervisor** -- Similar to Firecracker, more features
+
+## Decision
+
+Use Firecracker as the primary production backend. Support multiple backends: Apple Virtualization.framework for native macOS dev, microvm.nix for NixOS-native QEMU, and Docker as a universal fallback. Auto-select the best backend based on platform capabilities.
+
+## Rationale
+
+- **Firecracker**: Minimalist design (<50K LOC), ~125ms cold boot, snapshot support, hardware isolation via KVM
+- **Apple Container**: Sub-second startup on macOS 26+, no Lima overhead, native vsock -- ideal for dev workflows
+- **Auto-selection**: Developers get the best experience on their platform without manual configuration
+- **Docker**: Universal fallback when no hypervisor is available -- pause/resume via container lifecycle, unix socket guest channel
+- **microvm.nix**: NixOS-native QEMU runner with vsock and TAP networking support
+- **Same rootfs**: All backends consume the same Nix-built ext4 image -- only the runtime differs
+
+## Backend Selection Order
+
+1. **KVM available** (Linux with `/dev/kvm`) -- Firecracker directly
+2. **macOS 26+** (Apple Silicon) -- Apple Virtualization.framework
+3. **Docker running** -- Docker as container-based fallback
+4. **Other** (macOS <26, Linux without KVM) -- Lima VM + Firecracker
+
+Override with `--hypervisor firecracker`, `--hypervisor apple-container`, `--hypervisor qemu`, or `--hypervisor docker`.
+
+## Consequences
+
+- Requires Linux with `/dev/kvm` for native Firecracker, or macOS 26+ for Apple Container
+- Lima is only needed as a fallback (macOS <26 or Linux without KVM, and Docker not available)
+- Guests must use a Linux kernel (no Windows/macOS guests)
+- No OCI image compatibility -- uses Nix flakes for image building instead
+- Snapshots only available on Firecracker backend
+- Limited device model -- no GPU passthrough, limited disk types

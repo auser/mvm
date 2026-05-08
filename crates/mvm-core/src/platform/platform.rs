@@ -71,6 +71,21 @@ impl Platform {
         mvm_libkrun::is_available()
     }
 
+    /// Whether the bundled microsandbox runtime is usable on this
+    /// platform. microsandbox 0.4.5 vendors libkrunfw, so unlike
+    /// [`has_libkrun`](Self::has_libkrun) we don't need a separate
+    /// host-side install — every platform with hardware virtualization
+    /// support (KVM on Linux, Hypervisor.framework on macOS) can run
+    /// microsandbox out of the box. ADR-013 names microsandbox as the
+    /// preferred non-KVM cross-platform default.
+    ///
+    /// Windows is excluded for now — upstream microsandbox doesn't yet
+    /// ship a WHvPlatform path; ADR-031 documents the Tauri-only
+    /// stance for Windows users.
+    pub fn has_microsandbox(self) -> bool {
+        !matches!(self, Platform::Windows)
+    }
+
     /// Whether Docker is available on this platform.
     ///
     /// Runtime check — calls `docker version` to verify the daemon is running.
@@ -291,6 +306,26 @@ mod tests {
         if !matches!(plat, Platform::Windows) {
             assert_eq!(plat.has_libkrun(), mvm_libkrun::is_available());
         }
+    }
+
+    #[test]
+    fn test_has_microsandbox_excludes_windows() {
+        // Per ADR-031 + ADR-013, Windows is Tauri-only and
+        // microsandbox doesn't yet ship a WHvPlatform path. The
+        // detection must surface that explicitly so auto_select
+        // doesn't pick microsandbox on a Windows host.
+        assert!(!Platform::Windows.has_microsandbox());
+    }
+
+    #[test]
+    fn test_has_microsandbox_true_on_unix_class_platforms() {
+        // microsandbox vendors libkrunfw, so unlike has_libkrun() we
+        // don't depend on a host-side install. Every Unix-class
+        // platform is supported.
+        assert!(Platform::MacOS.has_microsandbox());
+        assert!(Platform::LinuxNative.has_microsandbox());
+        assert!(Platform::LinuxNoKvm.has_microsandbox());
+        assert!(Platform::Wsl2.has_microsandbox());
     }
 
     #[test]

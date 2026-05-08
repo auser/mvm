@@ -1,0 +1,254 @@
+/* Load JetBrains Mono for crisp monospace rendering */
+@import url('https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;700&display=swap');
+
+/*  Bind Starlight's --sl-color-* surface to our role tokens.
+ *
+ *  All values are tokens (var(--color-…)) — no hardcoded hex codes
+ *  here. Light/dark switching is handled in tailwind.css by overriding
+ *  the base palette under [data-theme="light"] (and via
+ *  prefers-color-scheme: light when no explicit theme is set). The
+ *  bindings below are scheme-invariant; they just route Starlight's
+ *  internal color names through our tokens.
+ */
+:root {
+  --sl-color-accent-low: var(--color-accent-low);
+  --sl-color-accent: var(--color-accent);
+  --sl-color-accent-high: var(--color-accent-high);
+  --sl-color-bg-nav: var(--color-page);
+  --sl-color-bg-sidebar: var(--color-page);
+  --sl-color-bg: var(--color-page);
+  --sl-color-bg-inline-code: var(--color-surface);
+  --sl-color-hairline-light: var(--color-border);
+  --sl-color-hairline: var(--color-border);
+  --sl-color-text: var(--color-heading);
+  --sl-color-text-accent: var(--color-accent);
+  --sl-color-white: var(--color-heading);
+  --sl-color-gray-1: var(--color-gray-1);
+  --sl-color-gray-2: var(--color-gray-2);
+  --sl-color-gray-3: var(--color-muted);
+  --sl-color-gray-4: var(--color-gray-4);
+  --sl-color-gray-5: var(--color-dim);
+  --sl-color-gray-6: var(--color-border);
+  --sl-color-black: var(--color-page);
+
+  /* Aside/admonition tints — Starlight ships its own per-scheme
+     defaults for these (blue/purple/orange/red/green low/mid/high).
+     We deliberately don't pin them: the Starlight defaults already
+     work in both light and dark mode. The previous iteration locked
+     them to dark-only values to compensate for forcing dark globally;
+     no longer needed here. */
+
+  --sl-font-system-mono: "JetBrains Mono", "SF Mono", "Cascadia Code", "Fira Code",
+    Consolas, monospace;
+}
+
+/*  Tell the browser the supported schemes so native form controls,
+ *  scrollbars, and the focus ring follow the active palette.
+ *  Starlight's theme picker writes data-theme="light"|"dark"|"auto";
+ *  the "auto" case lets `light dark` here delegate to the OS via
+ *  prefers-color-scheme. Without this, native UI never picks up the
+ *  user's chosen palette.
+ */
+:root { color-scheme: light dark; }
+[data-theme="light"] { color-scheme: light; }
+[data-theme="dark"] { color-scheme: dark; }
+
+/* Ensure page always has an opaque background */
+html,
+body {
+  background-color: var(--sl-color-bg);
+}
+
+/* ── Typography — slightly larger base ── */
+html {
+  font-size: 17px;
+}
+
+/* Docs content headings */
+[data-has-sidebar] main h1 {
+  font-size: 2.25rem;
+  margin-block-end: 1.5rem;
+}
+
+[data-has-sidebar] main h2 {
+  font-size: 1.6rem;
+  margin-block-start: 2.5rem;
+  margin-block-end: 1rem;
+}
+
+[data-has-sidebar] main h3 {
+  font-size: 1.25rem;
+  margin-block-start: 2rem;
+  margin-block-end: 0.75rem;
+}
+
+/* Docs content — improved padding and spacing */
+[data-has-sidebar] main {
+  padding-block: 2.5rem;
+  padding-inline: 2rem;
+}
+
+@media (min-width: 50em) {
+  [data-has-sidebar] main {
+    padding-block: 3rem;
+    padding-inline: 2.5rem;
+  }
+}
+
+@media (min-width: 72em) {
+  [data-has-sidebar] main {
+    padding-block: 3.5rem;
+    padding-inline: 3rem;
+  }
+}
+
+/* Docs paragraphs — more breathing room */
+[data-has-sidebar] main p {
+  line-height: 1.8;
+  margin-block-end: 1.25rem;
+}
+
+/* Docs lists */
+[data-has-sidebar] main ul,
+[data-has-sidebar] main ol {
+  margin-block-end: 1.25rem;
+}
+
+[data-has-sidebar] main li {
+  margin-block-end: 0.5rem;
+  line-height: 1.7;
+}
+
+/* Code blocks — more padding + force dark theme */
+[data-has-sidebar] main .expressive-code {
+  margin-block: 1.5rem;
+}
+
+.expressive-code,
+.expressive-code .frame {
+  --ec-codeBg: var(--color-surface) !important;
+  --ec-frm-edBg: var(--color-surface) !important;
+  --ec-frm-termBg: var(--color-surface) !important;
+  --ec-frm-tooltipBg: var(--color-tooltip) !important;
+  --ec-codeFg: var(--color-heading) !important;
+  --ec-frm-edTabBg: var(--color-surface) !important;
+  --ec-frm-edActTabBg: var(--color-page) !important;
+  --ec-frm-edTabBarBg: var(--color-surface) !important;
+  --ec-frm-edTabBarBrdBtm: var(--color-border) !important;
+  --ec-frm-termTitlebarBg: var(--color-surface) !important;
+  --ec-frm-termTitlebarBrdBtm: var(--color-border) !important;
+  --ec-frm-termTitlebarDotsFg: var(--color-dim) !important;
+  --ec-brdCol: var(--color-border) !important;
+}
+
+/* Sidebar — increased spacing between items */
+nav[aria-label="Main"] a {
+  padding-block: 0.4rem;
+}
+
+nav[aria-label="Main"] summary,
+nav[aria-label="Main"] [role="group"] > :first-child {
+  padding-block: 0.5rem;
+}
+
+/* ── Splash / Landing page — full-width, no Starlight chrome ── */
+[data-has-hero] .main-frame {
+  padding: 0;
+}
+
+[data-has-hero] .content-panel {
+  max-width: none;
+  padding: 0;
+}
+
+[data-has-hero] .sl-container {
+  max-width: none;
+  padding: 0;
+}
+
+[data-has-hero] .main-pane {
+  padding: 0;
+}
+
+/* Hide Starlight's default splash-page padding/wrapper */
+[data-has-hero] main {
+  padding: 0;
+}
+
+/* Remove the pagination footer on the splash page */
+[data-has-hero] .pagination-links {
+  display: none;
+}
+
+/* Remove empty footer space on splash */
+[data-has-hero] footer {
+  display: none;
+}
+
+/* Center landing page content containers
+   Tailwind's @layer utilities has lower precedence than Starlight's layers,
+   so mx-auto gets overridden. Unlayered CSS fixes this. */
+[data-has-hero] main section {
+  margin-inline: auto;
+}
+
+[data-has-hero] main section > div {
+  margin-inline: auto;
+}
+
+
+h2.text-title {
+  margin-bottom: 1.5rem;
+}
+
+/* ── Terminal dots — red/yellow/green (docs pages only) ── */
+[data-has-sidebar] .expressive-code .frame.is-terminal .header::before {
+  background-color: transparent !important;
+  -webkit-mask-image: none !important;
+  mask-image: none !important;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 60 16' preserveAspectRatio='xMidYMid meet'%3E%3Ccircle cx='8' cy='8' r='8' fill='%23ff5f57'/%3E%3Ccircle cx='30' cy='8' r='8' fill='%23febc2e'/%3E%3Ccircle cx='52' cy='8' r='8' fill='%2328c840'/%3E%3C/svg%3E") !important;
+  background-repeat: no-repeat !important;
+  opacity: 0.85 !important;
+}
+
+/* ── Expressive Code text markers — amber breathing glow (docs pages only) ──
+ *
+ *  All alpha-tinted amber values route through the --color-amber token
+ *  via color-mix(), so the breathing-glow tracks the active palette.
+ *  In light mode the amber shifts darker (#9a6700) and the glow gets
+ *  a darker base hue without code changes here.
+ */
+[data-has-sidebar] .expressive-code {
+  --ec-tm-markBg: color-mix(in srgb, var(--color-amber) 14%, transparent);
+  --ec-tm-markBrdCol: color-mix(in srgb, var(--color-amber) 50%, transparent);
+}
+
+[data-has-sidebar] .expressive-code .ec-line mark {
+  animation: marker-breathe 3s ease-in-out infinite !important;
+  transform-origin: center center;
+}
+
+[data-has-sidebar] .expressive-code .ec-line mark::before {
+  animation: marker-border-breathe 3s ease-in-out infinite !important;
+}
+
+@keyframes marker-breathe {
+  0%, 100% {
+    background: color-mix(in srgb, var(--color-amber) 10%, transparent);
+    box-shadow: 0 0 0 color-mix(in srgb, var(--color-amber) 0%, transparent);
+  }
+  50% {
+    background: color-mix(in srgb, var(--color-amber) 24%, transparent);
+    box-shadow: 0 0 10px color-mix(in srgb, var(--color-amber) 18%, transparent);
+  }
+}
+
+@keyframes marker-border-breathe {
+  0%, 100% {
+    border-color: color-mix(in srgb, var(--color-amber) 30%, transparent);
+  }
+  50% {
+    border-color: color-mix(in srgb, var(--color-amber) 65%, transparent);
+  }
+}
+

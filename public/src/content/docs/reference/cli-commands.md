@@ -1,0 +1,363 @@
+---
+title: CLI Commands
+description: Complete command reference for mvmctl.
+---
+
+## VM Lifecycle
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl up --flake <ref>` | Build and run a VM from a Nix flake |
+| `mvmctl up --manifest <path>` | Boot a pre-built manifest (path to `mvm.toml`, its directory, or a legacy slot name; mutually exclusive with `--flake`). Short form: `-m <path>` |
+| `mvmctl up --name <name>` | Specify VM name (auto-generated if omitted) |
+| `mvmctl up --profile <variant>` | Flake package variant (e.g. worker, gateway) |
+| `mvmctl up --cpus N --memory SIZE` | Override vCPU count and memory (supports 512M, 4G, etc.) |
+| `mvmctl up -p HOST:GUEST` | Forward a port mapping into the VM (repeatable) |
+| `mvmctl up -e KEY=VALUE` | Inject an environment variable (repeatable) |
+| `mvmctl up -v host:guest:size` | Mount a volume into the VM (repeatable) |
+| `mvmctl up -d` | Run in background (detached mode, via launchd) |
+| `mvmctl up --forward` | Auto-forward declared ports after boot (blocks until Ctrl-C) |
+| `mvmctl up --hypervisor <backend>` | Backend: `firecracker` (default), `apple-container`, `docker`, or `qemu` |
+| `mvmctl up --config <path>` | Runtime config (TOML) for persistent resources/volumes |
+| `mvmctl up --metrics-port PORT` | Bind a Prometheus metrics endpoint (0 = disabled) |
+| `mvmctl up --watch-config` | Reload ~/.mvm/config.toml automatically when it changes |
+| `mvmctl up --watch` | Watch flake for changes and auto-rebuild + reboot |
+| `mvmctl up --network-preset <preset>` | Network egress policy: `unrestricted` (default), `none`, `registries`, `dev`, `agent` (LLM-inference + GitHub bundle — see [ADR-004](https://github.com/auser/mvm/blob/main/specs/adrs/004-hypervisor-egress-policy.md)) |
+| `mvmctl up --network-allow host:port` | Allow egress to specific host:port (repeatable, mutually exclusive with preset) |
+| `mvmctl up --seccomp <tier>` | Seccomp profile: `essential`, `minimal`, `standard` (default), `network`, `unrestricted`. Default flipped from `unrestricted` → `standard` per ADR-002 §W1.1. |
+| `mvmctl up --secret KEY:host` | Bind a secret to a domain (repeatable; see [Config & Secrets](/guides/config-secrets/)) |
+| `mvmctl up --network <name>` | Named dev network to attach VM to (default: "default") |
+| `mvmctl down [name]` | Stop VMs by name, or all if omitted |
+| `mvmctl ls` | List running VMs (aliases: `ps`, `status`) |
+| `mvmctl ls -a` | Show all VMs including stopped |
+| `mvmctl ls --json` | Output as JSON |
+| `mvmctl forward <name> -p PORT` | Forward a port from a running VM to localhost |
+| `mvmctl logs <name>` | View guest console logs (`-f` to follow, `-n` for line count) |
+| `mvmctl logs <name> --hypervisor` | View Firecracker hypervisor logs |
+| `mvmctl diff <name>` | Show filesystem changes in a running VM (created/modified/deleted since boot) |
+| `mvmctl diff <name> --json` | Output filesystem diff as JSON |
+
+## Environment Management
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl bootstrap` | Full setup from scratch: Homebrew deps (macOS), Lima, Firecracker, kernel, rootfs (idempotent — safe to re-run) |
+| `mvmctl bootstrap --production` | Production mode (skip Homebrew, assume Linux with apt) |
+| `mvmctl dev [up]` | Auto-bootstrap if needed, start dev VM, drop into shell. Uses Apple Container on macOS 26+, Lima otherwise. |
+| `mvmctl dev up --project ~/dir` | Auto-bootstrap then cd into a project directory |
+| `mvmctl dev up --metrics-port PORT` | Bind a Prometheus metrics endpoint (0 = disabled) |
+| `mvmctl dev up --watch-config` | Reload ~/.mvm/config.toml automatically when it changes |
+| `mvmctl dev up --lima` | Force Lima backend even on macOS 26+ |
+| `mvmctl dev up --shell` (or `-s`) | Open an interactive shell after starting |
+| `mvmctl dev down` | Stop the Lima development VM |
+| `mvmctl dev down --reset` | Also delete the cached dev image so the next `dev up` rebuilds from local source |
+| `mvmctl dev shell` | Open a shell in the running Lima VM |
+| `mvmctl dev shell --project ~/dir` | Open shell and cd into a project directory |
+| `mvmctl dev status` | Show dev environment status (Lima VM, Firecracker, Nix versions) |
+| `mvmctl dev rebuild` | Stop, clear cache, and rebuild + restart the dev VM |
+| `mvmctl dev rebuild --shell` (or `-s`) | Open an interactive shell after rebuilding |
+| `mvmctl dev import-image <path>` | Side-load a pre-built dev image artifact into the cache (air-gapped install path; from plan 36 sealed builder image) |
+| `mvmctl doctor` | Run diagnostics + dependency checks + security posture (folded in from the dropped `mvmctl security` verb) |
+| `mvmctl doctor --json` | Output diagnostics as JSON |
+| `mvmctl update` | Check for and install mvmctl updates |
+| `mvmctl update --check` | Only check for updates, don't install |
+| `mvmctl update --force` | Force reinstall even if already up to date |
+| `mvmctl update --skip-verify` | Skip cosign signature verification |
+
+## Building
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl build <path>` | Build from Mvmfile.toml in the given directory |
+| `mvmctl build --flake <ref>` | Build from a Nix flake (local or remote) |
+| `mvmctl build --flake <ref> --profile <variant>` | Build a specific flake package variant |
+| `mvmctl build --flake <ref> --watch` | Build and rebuild on flake.lock changes |
+| `mvmctl build --json` | Output structured JSON events instead of human-readable output |
+| `mvmctl build -o <path>` | Output path for the built .elf image |
+| `mvmctl cleanup` | Remove old dev-build artifacts and run Nix garbage collection |
+| `mvmctl cleanup --all` | Remove all cached build revisions |
+| `mvmctl cleanup --keep <N>` | Keep the N newest build revisions |
+| `mvmctl cleanup --verbose` | Print each cached build path that gets removed |
+
+## Manifests
+
+> **Status:** the `mvmctl init/build/manifest *` surface below is the **plan-38 model**, shipped on `feat/manifest-driven-template-dx-claude`. The user-facing primitive is an `mvm.toml` file alongside your `flake.nix`. See the [Manifests guide](/guides/manifests/) for the conceptual model. The old `mvmctl template <verb>` namespace was removed; clap returns "unrecognized subcommand" for old invocations. `mvmctl manifest push` / `pull` are planned in [plan 39](https://github.com/tinylabscom/mvm/blob/main/specs/plans/39-manifest-push-pull.md) but not yet implemented.
+
+### Scaffolding (top-level)
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl init <DIR>` | Scaffold `mvm.toml` + `flake.nix` (+ NixOS config) in `DIR` (required) |
+| `mvmctl init <DIR> --preset <preset>` | Preset: `minimal`, `http`, `postgres`, `worker`, `python` (default: `minimal`) |
+| `mvmctl init <DIR> --catalog <name>` | Scaffold from a bundled catalog entry (run `mvmctl catalog list` to browse). Mutually exclusive with `--preset`/`--prompt` |
+| `mvmctl init <DIR> --prompt "<text>"` | Generate scaffold from a natural-language prompt. In `auto` mode (default) probes for a local OpenAI-compatible endpoint on loopback (Ollama @ `:11434`, LocalAI @ `:8080`) before falling through to OpenAI. Override with `MVM_TEMPLATE_PROVIDER=openai\|local\|heuristic`; skip probe with `MVM_TEMPLATE_NO_LOCAL_PROBE=1` |
+
+### Building (top-level)
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl build [PATH]` | Build the manifest at `PATH` (file or directory; default: cwd walk-up). Persists artifacts to a slot keyed by `sha256(canonical_manifest_path)`. Subsumes today's `mvmctl build --flake .` and the legacy `Mvmfile.toml` flow into one verb |
+| `mvmctl build [PATH] --force` | Rebuild even if the cache hits |
+| `mvmctl build [PATH] --snapshot` | After build, boot, wait for healthy, and capture a Firecracker snapshot (Firecracker backend only) |
+| `mvmctl build [PATH] --update-hash` | Recompute the Nix fixed-output derivation hash |
+| `mvmctl build [PATH] --vcpus N --mem SIZE --data-disk SIZE` | CLI overrides for resource sizing; persisted to the slot record |
+| `mvmctl build [PATH] --json` | Stream structured build events |
+
+### Running (top-level — already manifest-aware)
+
+`mvmctl up [PATH]` and `mvmctl exec [PATH] -- <cmd>` accept a manifest path or its directory and look up the manifest-keyed slot. If no current revision exists, they error with a hint to run `mvmctl build`. See the [VM Lifecycle](#vm-lifecycle) and [One-shot Exec](#one-shot-exec) sections for full flag lists. (Plan 40 dropped the `start` and `run` aliases on `up`.)
+
+### Inspection / registry (`mvmctl manifest *`)
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl manifest ls [--json]` | List built slots — manifest path, last-built timestamp, optional `name` |
+| `mvmctl manifest ls --orphans` | Slots whose source manifest file is missing on disk |
+| `mvmctl manifest info [PATH] [--json]` | Print manifest, slot path, current revision, snapshot info, provenance |
+| `mvmctl manifest rm [PATH] [--force]` | Remove the slot from the registry |
+| `mvmctl manifest rm [PATH] --manifest-file` | Also delete the source `mvm.toml` (off by default) |
+| `mvmctl manifest verify [PATH] [--revision <hash>]` | Verify checksums for a built slot |
+| `mvmctl manifest verify --check-signature` | Reserved for plan 36 (sealed-signed-builder-image); errors today with "not yet wired" |
+| `mvmctl manifest prune --orphans` | Remove builds whose source manifest is gone |
+| `mvmctl manifest prune --orphans --dry-run` | Preview what would be removed |
+| `mvmctl manifest push` / `mvmctl manifest pull` | **Planned, not yet implemented.** Tracked in [plan 39](https://github.com/tinylabscom/mvm/blob/main/specs/plans/39-manifest-push-pull.md). |
+
+## Configuration
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl config show` | Print current config as TOML |
+| `mvmctl config edit` | Open the config file in $EDITOR (falls back to nano) |
+| `mvmctl config set <key> <value>` | Set a single config key (e.g. `mvmctl config set lima_cpus 4`) |
+
+## Audit
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl audit tail` | Show the last 20 audit events from /var/log/mvm/audit.jsonl |
+| `mvmctl audit tail -n <N>` | Show the last N audit events |
+| `mvmctl audit tail -f` | Follow audit log output (poll until Ctrl-C) |
+
+## Flake Validation
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl validate` | Validate a Nix flake before building (current directory) |
+| `mvmctl validate --flake <ref>` | Validate a specific flake path or reference |
+| `mvmctl validate --json` | Output structured JSON instead of human-readable output |
+
+> Plan 40 renamed this verb from `mvmctl flake check` to `mvmctl validate`.
+
+## Networks
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl network create <name>` | Create a named dev network with its own bridge and subnet |
+| `mvmctl network list` | List all dev networks (alias: `ls`) |
+| `mvmctl network inspect <name>` | Show details of a named network (JSON) |
+| `mvmctl network remove <name>` | Remove a named network (alias: `rm`) |
+
+## Image Catalog
+
+> Plan 40 renamed the `mvmctl image *` namespace to `mvmctl catalog *` (a metadata-only browser) and folded "build from catalog" into `mvmctl init <DIR> --catalog <name>`.
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl catalog list` | List bundled catalog entries |
+| `mvmctl catalog search <query>` | Search entries by name, description, or tag |
+| `mvmctl catalog info <name>` | Show catalog entry details (JSON) |
+| `mvmctl init <DIR> --catalog <name>` | Scaffold a project from a catalog entry |
+
+## Console
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl console <name>` | Interactive PTY shell into a running VM (vsock, no SSH) |
+| `mvmctl console <name> --command <cmd>` | Run a one-shot command in the VM |
+
+## One-shot Exec
+
+`mvmctl exec` boots a fresh transient microVM, runs a single command, and tears it
+down on exit — like `cco` or `docker run --rm`, but with a Firecracker microVM
+as the sandbox. **Dev-mode only**: the guest agent's Exec handler is compiled in
+only when the `dev-shell` Cargo feature is enabled. Production guest builds omit
+the feature, so the handler is not present in the binary at all.
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl exec -- <cmd>...` | Boot the bundled default microVM image, run `<cmd>`, exit |
+| `mvmctl exec --manifest <name> -- <cmd>...` | Boot a registered template instead of the default |
+| `mvmctl exec --launch-plan <path> ` | Run the entrypoint from an [mvmforge](https://github.com/tinylabscom/decorationer) document — either the `launch.json` artifact (top-level `entrypoint`) or the Workload IR manifest (top-level `apps[]`). Mutually exclusive with trailing argv |
+| `mvmctl exec --add-dir HOST:GUEST[:MODE] -- <cmd>` | Mount a host directory inside the guest. `MODE` is `ro` (default — writes discarded) or `rw` (writes rsynced back to the host after the command exits — see [ADR-002](/contributing/adr/002-writable-add-dir/)). Repeatable |
+| `mvmctl exec --env KEY=VAL -- <cmd>` | Inject an environment variable. Repeatable. Overrides any env vars carried by `--launch-plan` |
+| `mvmctl exec --cpus <n>` / `--memory <size>` | Resize the transient VM (defaults: 2 vCPUs, 512 MiB) |
+| `mvmctl exec --timeout <secs>` | Per-command timeout (default: 60s) |
+
+Examples:
+
+```bash
+mvmctl exec -- uname -a                                # default image
+mvmctl exec --manifest minimal -- /bin/true            # named template
+mvmctl exec --add-dir .:/work -- ls /work              # share current dir, RO
+mvmctl exec --add-dir .:/work:rw -- touch /work/x      # writable, rsynced back
+mvmctl exec -e DEBUG=1 -- env | grep DEBUG             # env var injection
+mvmctl exec --launch-plan ./launch.json                # mvmforge entrypoint
+```
+
+### Launch-plan shape
+
+`--launch-plan` accepts either of mvmforge's two JSON documents — the
+shape is auto-detected. Only the entrypoint is consumed (image selection
+still comes from `--manifest` or the bundled default in v1).
+
+**LaunchPlan artifact** (`mvmforge compile`'s `launch.json`, top-level
+`entrypoint`):
+
+```json
+{
+  "artifact_format_version": "1.0",
+  "workload_id": "hello",
+  "entrypoint": {
+    "command": ["python", "main.py"],
+    "working_dir": "/app",
+    "env": { "PORT": "8080" }
+  },
+  "env": { "LOG_LEVEL": "info" }
+}
+```
+
+**Workload IR manifest** (`mvmforge emit` stdout, top-level `apps[]`):
+
+```json
+{
+  "apps": [
+    {
+      "name": "hello",
+      "entrypoint": {
+        "command": ["python", "main.py"],
+        "working_dir": "/app",
+        "env": { "PORT": "8080" }
+      },
+      "env": { "LOG_LEVEL": "info" }
+    }
+  ]
+}
+```
+
+Multi-app IR manifests are rejected — that's an orchestration concern
+that belongs in `mvmd`, not in `mvmctl exec`. Env precedence (lowest →
+highest): top-level/app `env` → `entrypoint.env` → CLI `--env`.
+
+### Snapshot restore
+
+When the request boots a registered template (`--manifest <name>`) and
+that template has a captured snapshot, `mvmctl exec` restores from the
+snapshot instead of cold-booting — typically sub-second on Linux/KVM.
+
+The snapshot path activates only when *all* of the following hold:
+
+- the image source is a **registered template** (the bundled default
+  image has no template snapshot to restore from);
+- there are **no** `--add-dir` extras (extra drives would mismatch the
+  snapshot's recorded drive layout);
+- the active backend reports snapshot support.
+
+On macOS / Lima QEMU, vsock snapshots return `os error 95` (EOPNOTSUPP);
+restore failures fall back to cold boot with a warning rather than
+aborting the exec. See the [Sandboxed Exec](/guides/exec/) guide for
+the full background.
+
+## Default microVM Image
+
+When an image-taking command is invoked without `--flake` or `--manifest`,
+`mvmctl` falls back to a bundled minimal image (busybox + the guest agent).
+This applies to:
+
+- `mvmctl exec -- <cmd>` — boots a fresh transient microVM and runs `<cmd>`
+- `mvmctl up` — boots a long-running microVM with the same image
+
+The image is built from `nix/images/default-tenant/` on first use and cached at
+`~/.cache/mvm/default-microvm/` (kernel + rootfs; cache directory name
+unchanged for backward compat). Nix is required to build
+it; pass `--manifest` or `--flake` if Nix isn't available on your host.
+
+## Cache
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl cache info` | Show cache directory path and disk usage |
+| `mvmctl cache prune` | Remove stale temp files from the cache |
+| `mvmctl cache prune --dry-run` | Show what would be removed without deleting |
+| `mvmctl cache prune --orphan-builds` | Also sweep orphaned builds — built artifacts whose source `mvm.toml` is gone (equivalent to `mvmctl manifest prune --orphans`) |
+
+## Security
+
+> Plan 40 dropped the standalone `mvmctl security status` verb. Posture checks now live inside `mvmctl doctor`.
+
+## Utilities
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl shell-init` | Print shell configuration (completions + dev aliases) to stdout |
+| `mvmctl shell-init --emit-completions <shell>` | Emit just the shell-completion script (replaces the dropped `mvmctl completions <shell>`) |
+| `mvmctl metrics` | Show runtime metrics (Prometheus text format) |
+| `mvmctl metrics --json` | Show runtime metrics as JSON |
+| `mvmctl uninstall` | Remove Lima VM, Firecracker, and all mvm state (confirmation required) |
+| `mvmctl uninstall -y` | Uninstall without confirmation |
+| `mvmctl uninstall --all` | Also remove ~/.mvm/ config dir and /usr/local/bin/mvmctl binary |
+| `mvmctl uninstall --dry-run` | Print what would be removed without removing |
+
+## Global Options
+
+All commands accept these global options:
+
+| Option | Description |
+|--------|-------------|
+| `--log-format <human\|json>` | Log format: human (default) or json (structured) |
+| `--fc-version <VERSION>` | Override Firecracker version (e.g., v1.14.0) |
+| `--verbose` (alias `--debug`) | Show verbose `[mvm]` progress messages. Implied when `RUST_LOG` is set. |
+
+## Environment Variables
+
+| Variable | Description | Default |
+|----------|-------------|---------|
+| `MVM_DATA_DIR` | Root data directory for templates and builds | `~/.mvm` |
+| `MVM_FC_VERSION` | Firecracker version (auto-normalized to `vMAJOR.MINOR`) | Latest stable |
+| `MVM_FC_ASSET_BASE` | S3 base URL for Firecracker assets | AWS default |
+| `MVM_FC_ASSET_ROOTFS` | Override rootfs filename | Auto-detected |
+| `MVM_FC_ASSET_KERNEL` | Override kernel filename | Auto-detected |
+| `MVM_BUILDER_MODE` | Builder transport: `auto`, `vsock`, or `ssh` | `auto` |
+| `MVM_TEMPLATE_REGISTRY_ENDPOINT` | S3-compatible endpoint URL for template push/pull | None |
+| `MVM_TEMPLATE_REGISTRY_BUCKET` | S3 bucket name for templates | None |
+| `MVM_TEMPLATE_REGISTRY_ACCESS_KEY_ID` | S3 access key ID | None |
+| `MVM_TEMPLATE_REGISTRY_SECRET_ACCESS_KEY` | S3 secret access key | None |
+| `MVM_TEMPLATE_REGISTRY_PREFIX` | Key prefix inside the bucket | `mvm` |
+| `MVM_TEMPLATE_REGISTRY_REGION` | S3 region | `us-east-1` |
+| `MVM_SSH_PORT` | Lima SSH local port | `60022` |
+| `OPENAI_API_KEY` | Enables LLM-backed template planning for `template init --prompt` | None |
+| `MVM_TEMPLATE_PROVIDER` | Prompt planning provider: `auto`, `openai`, `local`, or `heuristic` | `auto` |
+| `MVM_TEMPLATE_OPENAI_MODEL` | OpenAI model used for prompt planning | `gpt-5.2` |
+| `MVM_TEMPLATE_OPENAI_BASE_URL` | Override OpenAI API base URL for prompt planning | `https://api.openai.com` |
+| `MVM_TEMPLATE_LOCAL_MODEL` | Local AI model name sent to an OpenAI-compatible local endpoint | `qwen2.5-coder-7b-instruct` |
+| `MVM_TEMPLATE_LOCAL_BASE_URL` | Base URL for an OpenAI-compatible local AI endpoint such as LocalAI or `llama.cpp` server | None |
+| `MVM_TEMPLATE_LOCAL_API_KEY` | Optional API key for the local AI endpoint | None |
+| `MVM_TEMPLATE_LOCAL_PROBE_TARGETS` | Comma-separated base URLs to probe for a local OpenAI-compatible endpoint in `auto` mode (overrides defaults `http://127.0.0.1:11434` and `http://127.0.0.1:8080`) | Defaults |
+| `MVM_TEMPLATE_NO_LOCAL_PROBE` | Set to `1` to skip the local-endpoint probe in `auto` mode (CI / sandboxed environments where loopback connects can hang) | Unset |
+| `MVM_PRODUCTION` | Enable production mode checks | `false` |
+| `RUST_LOG` | Logging level (e.g., `debug`, `mvm=trace`) | `info` |
+| `MVM_CACHE_DIR` | Override cache directory | `~/.cache/mvm` |
+| `MVM_CONFIG_DIR` | Override config directory | XDG default |
+| `MVM_STATE_DIR` | Override state directory | XDG default |
+| `MVM_SHARE_DIR` | Override share directory | XDG default |
+| `MVM_DEV_FLAKE_URL` | Escape hatch for the dev-build's chained `--override-input mvm` target. Suppresses the chained `mvm/mvm` override when set. | Unset (resolves to local `nix/dev/`) |
+| `MVM_SRC` | Override the source repo path passed to `nix build` during dev builds | Workspace root |
+| `MVM_BUILDER_AGENT_BIN` | Override the path to the builder-agent binary baked into the builder VM image | Auto-detected from build closure |
+| `MVM_BUILDER_AGENT_PORT` | Vsock port the builder agent listens on | `54_321` |
+| `MVM_BUILDER_AUTHORIZED_KEY` | SSH public key authorized to drive the builder VM via SSH transport (vs vsock) | Unset |
+| `MVM_MCP_SESSION_IDLE` | MCP session idle timeout in seconds | `300` |
+| `MVM_MCP_SESSION_MAX` | MCP session maximum lifetime in seconds | `1800` |
+| `MVM_MCP_MAX_INFLIGHT` | Max concurrent in-flight `tools/call run` invocations | `8` |
+| `MVM_MCP_MEM_CEILING_MIB` | Per-call memory ceiling enforced before dispatching to a microVM | `8192` |
+| `MVM_TENANT_KEY_<ID>` | Per-tenant encryption key for the keystore (one var per tenant ID) | None |
+| `MVM_SKIP_COSIGN_VERIFY` | Set to `1` to bypass cosign signature verification on prebuilt-image downloads. Documented escape hatch only; never set in CI or production. | Unset |
+| `MVM_SKIP_HASH_VERIFY` | Set to `1` to bypass SHA-256 verification on prebuilt-image downloads. Documented escape hatch only; never set in CI or production. | Unset |

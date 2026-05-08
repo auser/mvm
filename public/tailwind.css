@@ -1,0 +1,127 @@
+@import "tailwindcss";
+@source "./src/**/*.{astro,tsx,ts,jsx,js}";
+
+/*  Token system — light + dark mode without hardcoded colors in components.
+ *
+ *  Two layers:
+ *    1. Base palette tokens (--color-page, --color-surface, --color-border,
+ *       --color-heading, --color-muted, --color-accent, …) — these are the
+ *       only tokens that take different values per scheme.
+ *    2. Role tokens (--color-title, --color-body, --color-link,
+ *       --color-canvas, --color-raised, --color-edge, …) — semantic,
+ *       scheme-invariant. They reference base palette tokens via
+ *       `var(--color-foo)`. Components and Starlight overrides only
+ *       consume role tokens.
+ *
+ *  Scheme switching:
+ *    - Default (`:root`) is the dark palette.
+ *    - `[data-theme="light"]` overrides the base palette with light values.
+ *      Starlight's theme picker writes this attribute on the <html> element.
+ *    - `[data-theme="auto"]` + `prefers-color-scheme: light` falls through
+ *      via the `@media` block.
+ *
+ *  No component or page-level CSS should hardcode a hex value. The
+ *  exception is the terminal-dot row (`--color-dot-*`), which intentionally
+ *  uses macOS Aqua reds/yellows/greens regardless of theme — those are
+ *  product-affordance colors, not theme colors.
+ */
+
+@theme {
+  /* ── Base palette (dark, default) ─────────────────────────────── */
+  --color-page: #0d1117;
+  --color-surface: #161b22;
+  --color-border: #30363d;
+  --color-heading: #e6edf3;
+  --color-muted: #8b949e;
+  --color-accent: #58a6ff;
+  --color-accent-hover: #79c0ff;
+  --color-accent-low: #0c2d6b;
+  --color-accent-high: #c8e1ff;
+  --color-green: #3fb950;
+  --color-amber: #d29922;
+  --color-rust: #dea584;
+  --color-nix: #7ebae4;
+  --color-tooltip: #1c2128;
+  --color-dim: #484f58;
+  --color-gray-1: #c9d1d9;
+  --color-gray-2: #b1bac4;
+  --color-gray-4: #6e7681;
+}
+
+@theme inline {
+  /* ── Role tokens (scheme-invariant) ───────────────────────────── */
+  --color-title: var(--color-heading);
+  --color-body: var(--color-muted);
+  --color-label: var(--color-muted);
+  --color-emphasis: var(--color-heading);
+  --color-code-inline: var(--color-green);
+  --color-link: var(--color-accent);
+
+  --color-action: var(--color-accent);
+  --color-action-hover: var(--color-accent-hover);
+
+  --color-canvas: var(--color-page);
+  --color-raised: var(--color-surface);
+  --color-edge: var(--color-border);
+
+  /* Terminal window dots — product affordance, theme-independent. */
+  --color-dot-close: #ff5f57;
+  --color-dot-minimize: #febc2e;
+  --color-dot-expand: #28c840;
+}
+
+/* ── Light palette ────────────────────────────────────────────────
+ *
+ *  Values cribbed from GitHub Primer (light) for parity with the dark
+ *  palette's GitHub-dark heritage. Overrides only the base palette;
+ *  role tokens above pick the new values up automatically through
+ *  their var() chains.
+ */
+@layer base {
+  [data-theme="light"] {
+    --color-page: #ffffff;
+    --color-surface: #f6f8fa;
+    --color-border: #d0d7de;
+    --color-heading: #1f2328;
+    --color-muted: #656d76;
+    --color-accent: #0969da;
+    --color-accent-hover: #0550ae;
+    --color-accent-low: #ddf4ff;
+    --color-accent-high: #0a3069;
+    --color-green: #1a7f37;
+    --color-amber: #9a6700;
+    --color-rust: #b36000;
+    --color-nix: #1f6feb;
+    --color-tooltip: #f6f8fa;
+    --color-dim: #afb8c1;
+    --color-gray-1: #1f2328;
+    --color-gray-2: #424a53;
+    --color-gray-4: #6e7681;
+  }
+
+  /* Auto mode + OS prefers light → use the light palette. The
+     `:not([data-theme="dark"])` guard keeps an explicit Dark choice
+     winning regardless of OS preference. */
+  @media (prefers-color-scheme: light) {
+    :root:not([data-theme="dark"]) {
+      --color-page: #ffffff;
+      --color-surface: #f6f8fa;
+      --color-border: #d0d7de;
+      --color-heading: #1f2328;
+      --color-muted: #656d76;
+      --color-accent: #0969da;
+      --color-accent-hover: #0550ae;
+      --color-accent-low: #ddf4ff;
+      --color-accent-high: #0a3069;
+      --color-green: #1a7f37;
+      --color-amber: #9a6700;
+      --color-rust: #b36000;
+      --color-nix: #1f6feb;
+      --color-tooltip: #f6f8fa;
+      --color-dim: #afb8c1;
+      --color-gray-1: #1f2328;
+      --color-gray-2: #424a53;
+      --color-gray-4: #6e7681;
+    }
+  }
+}

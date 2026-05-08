@@ -1,0 +1,77 @@
+---
+title: Installation
+description: Install mvmctl on macOS or Linux.
+---
+
+## One-Liner
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+```
+
+## Pin a Version
+
+```bash
+MVM_VERSION=v0.7.0 curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+```
+
+## From Source
+
+```bash
+git clone https://github.com/auser/mvm.git
+cd mvm
+cargo build --release
+cp target/release/mvmctl ~/.local/bin/
+```
+
+## Cargo Install
+
+```bash
+cargo install mvmctl
+```
+
+## Self-Update
+
+```bash
+mvmctl update
+```
+
+## Prerequisites
+
+- **macOS** (Apple Silicon or Intel) or **Linux** (x86_64 or aarch64)
+- [Homebrew](https://brew.sh/) (macOS only -- mvmctl will install it if missing)
+
+### Backend Auto-Detection
+
+mvmctl automatically detects your platform at startup and selects the best VM backend:
+
+| Platform | Backend | What happens |
+|----------|---------|-------------|
+| **Linux with `/dev/kvm`** | Firecracker | Runs directly on KVM. No Lima needed. |
+| **macOS 26+** (Apple Silicon) | Apple Container | Uses Virtualization.framework. No Lima needed. |
+| **Docker available** | Docker | Container-based fallback. Runs anywhere Docker does. |
+| **macOS <26** | Lima + Firecracker | Lima VM provides `/dev/kvm`. Builds and Firecracker run inside Lima. |
+| **Linux without `/dev/kvm`** | Lima + Firecracker | Lima VM as fallback (same as macOS <26). |
+
+### First-Time Setup
+
+After installation, run the setup wizard:
+
+```bash
+mvmctl init
+```
+
+This walks through platform detection, dependency installation, Lima VM creation (if needed), default network setup, and XDG directory creation. Use `--non-interactive` for scripted environments.
+
+Running `mvmctl dev` or `mvmctl bootstrap` also handles setup automatically -- they detect your platform, select the backend, install Lima only if needed, and set up Nix and Firecracker in the right environment.
+
+You can force a specific backend with `--hypervisor`:
+
+```bash
+mvmctl up --flake . --hypervisor apple-container
+mvmctl up --flake . --hypervisor firecracker
+mvmctl up --flake . --hypervisor docker
+mvmctl up --flake . --hypervisor qemu    # microvm.nix
+```
+
+Use `mvmctl doctor` to check which backends are available on your system.
