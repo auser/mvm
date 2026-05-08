@@ -856,9 +856,11 @@ B1–B18 in Plan 45 §"Out of scope (v1)" — buckets-as-separate-primitive, cro
 
 Plan 45 Phase 11 (live KVM smoke fixture) deferred to its own plan 58 — needs a KVM-capable host that no longer fits in a software-only PR. Plan 58 captures the six scenarios (single-VM round-trip, persistence, multi-attach, RO enforcement, scope isolation, Nix-path denial) so the work isn't lost when Sprint 49 closes. (Numbered 58 because plan 46 was already taken by the metering-API work merged in #89.)
 
-## Sprint 50 — mvm migration: Phase 0 (foundation + facade preservation) — IN FLIGHT  [`plans/60-mvm-microsandbox-migration.md`](plans/60-mvm-microsandbox-migration.md)
+## Sprint 50 — mvm migration: Phase 0 + Phase 1 (foundation, facade, microsandbox backend) — IN FLIGHT  [`plans/60-mvm-microsandbox-migration.md`](plans/60-mvm-microsandbox-migration.md)
 
-**Status (2026-05-07):** Phase 0 of a 12-16 week migration that pivots `mvm-runtime` to microsandbox + libkrun + microvm.nix while keeping mvmd's `mvmctl` facade contract intact. Full plan in [`plans/60-mvm-microsandbox-migration.md`](plans/60-mvm-microsandbox-migration.md). The plan is checkpointed into 11 phases (0, 1, 2, 3, 4, 5, 6, 7, 7a, 7b, 8, 9, 10) — each with explicit exit tests, ADR coverage, sprint rotation, and a demo gate.
+**Status (2026-05-08):** Phase 0 ✅ shipped; Phase 1 W1–W4 ✅ shipped on `feat/micro` (12 commits). The MicrosandboxBackend is fully wired against upstream microsandbox 0.4.5; `auto_select()` picks it as the cross-platform default (macOS arm64/x86_64 + Linux without KVM); the `nix/` flake using microvm.nix is up and `nix flake check --no-build` is clean; the docs site is migrated and refactored to a token-based light+dark mode system; mvmd's contract gate is green against `../mvm-runtime` via the local `.cargo/config.toml` patch.
+
+Full plan in [`plans/60-mvm-microsandbox-migration.md`](plans/60-mvm-microsandbox-migration.md). The plan is checkpointed into 11 phases (0, 1, 2, 3, 4, 5, 6, 7, 7a, 7b, 8, 9, 10) — each with explicit exit tests, ADR coverage, sprint rotation, and a demo gate.
 
 **Branch:** `feat/micro` (moves to `feat/migrate-to-mvm` once Phase 0 settles).
 
@@ -882,10 +884,27 @@ The current `mvm-runtime` is a 5-crate, ~520-LOC skeleton; the previous iteratio
 
 ### Wave plan (each wave is a checkpoint)
 
-- **W0.1** — metadata + ADR stubs + compliance stubs (this PR; doc-only) ⏳ in-flight
-- **W0.2** — workspace reshape + crate copies (preserve facade)
-- **W0.3** — CI matrix expansion + ADR-coverage lint
-- **W0.4** — mvmd contract gate verification
+**Phase 0 — foundation + facade preservation:**
+
+- **W0.1** ✅ — metadata + 7 Phase-0 ADR stubs + 4 compliance stubs (`343abfa`)
+- **W0.1.1** ✅ — CI execution policy (push → ci.yml; release → rest) + githooks tracked + ADR-038 (`5318567`)
+- **W0.2** ✅ — workspace reshape: 13 crates from `../mvm` verbatim + facade preserved + mvmd contract gate green (`1c3e00c`)
+
+**Phase 1 — first tracer bullet (microsandbox backend):**
+
+- **W1.1** ✅ — MicrosandboxBackend variant in `AnyBackend` + dispatch + 11 unit tests (`8c7211d`)
+- **W1.2** ✅ — `microsandbox = "0.4.5"` workspace dep wired; 4 of 6 lifecycle methods real (`is_available` / `list` / `status` / `stop` / `stop_all`); resources/ imported; 244/244 lib tests green (`4072484`)
+- **W1.3** ✅ — `start()` and `logs()` real; `.ext4 → .raw` hard-link bridge via `ensure_microsandbox_rootfs_alias()`; 2 new alias unit tests (`a8cb2e7`)
+- **W1.3.1** ✅ — no-OCI invariant codified in ADR-013 + plan 60 (`c1d5b01`)
+- **W2** ✅ — `auto_select()` priority slots Microsandbox at #2 (cross-platform default per ADR-013); `Platform::has_microsandbox()`; docs site migrated; `tailwind.css` + `custom.css` refactored to token-based light+dark mode (no hardcoded colors except the macOS-Aqua terminal-dot trio); ADR-013 docs page (`3438a24`, `6261bc4`)
+- **W3** ✅ — `tests/smoke_microsandbox.rs` with `MVM_LIVE_SMOKE=1` gate; live test exercises start/stop/alias bridge against a real `mkfs.ext4` fixture; sanity test always runs (`0668c60`)
+- **W4** ✅ — `nix/flake.nix` imports microvm.nix; `nix/profiles/minimal.nix`; `nix flake check --no-build` clean; 3 structural tests guard the flake's shape; "Building MicroVM Images" docs page (`5a9b765`)
+
+**Up next:**
+
+- **W5** — guest-agent service unit + entrypoint supervisor in the minimal profile (port from `../mvm/crates/mvm-guest`)
+- **W6** — first end-to-end boot smoke (gated by Linux+KVM): `nix build .#minimal-runner` → `mvmctl run --hypervisor microsandbox` → guest agent answers over vsock
+- **Phase 1 close-out** — demo run + checkpoint review
 
 ### Cornerstones
 
