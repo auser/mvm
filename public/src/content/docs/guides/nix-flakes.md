@@ -279,35 +279,53 @@ These map to `packages.${system}.<profile>` in the flake.
 
 ## Running an LLM agent inside a microVM
 
-[`nix/images/examples/llm-agent/`](https://github.com/auser/mvm/tree/main/nix/images/examples/llm-agent)
-is a worked example that boots `claude-code` inside a Firecracker
-microVM. It pulls the agent binary from
-[`numtide/llm-agents.nix`](https://github.com/numtide/llm-agents.nix)
-(binary cache at `cache.numtide.com`), runs it as a per-service uid
-under `setpriv` with seccomp tier `network`, and reads the Anthropic
-API key from `/run/mvm-secrets/claude-code/anthropic-api-key` so the
-secret never enters the rootfs.
+A worked example: a microVM that boots `claude-code` (or any other agent binary) and reads its API key from a host-injected secret. You write this in **your project's** flake — mvm doesn't ship a starter image to fork; you compose `mkGuest` yourself per [Building MicroVM Images](/guides/building-microvm-images).
+
+```nix
+# my-claude-code-vm/flake.nix
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    mvm.url     = "github:auser/mvm";
+    # Or from numtide/llm-agents.nix for the agent binary.
+  };
+
+  outputs = { self, nixpkgs, mvm, ... }:
+    let
+      system = "x86_64-linux";
+      pkgs   = import nixpkgs { inherit system; };
+    in
+    {
+      packages.${system}.default = mvm.lib.${system}.mkGuest {
+        name = "claude-code";
+
+        entrypoint.command = [ "${pkgs.claude-code}/bin/claude" "code" ];
+
+        # Anthropic API key delivered via secrets — never enters the
+        # rootfs at build time. Phase 6 wires the secret-injection
+        # path; today the field is metadata that mvmctl reads.
+        # secrets.anthropic-api-key = "/run/mvm-secrets/claude-code/api-key";
+
+        # Defense in depth: the workload is rootless by default in
+        # prod (uid 1000); per-service seccomp tier lands in Phase 6.
+        # See /guides/building-microvm-images#rootless-workloads.
+      };
+    };
+}
+```
 
 ```bash
 mkdir -p ~/.config/mvm/secrets
 printf '%s\n' 'sk-ant-…' > ~/.config/mvm/secrets/anthropic
 chmod 0400 ~/.config/mvm/secrets/anthropic
 
-mvmctl init claude-code-vm --preset minimal
-$EDITOR claude-code-vm/mvm.toml      # set flake = "../nix/images/examples/llm-agent"
-mvmctl build claude-code-vm
-
-mvmctl up --manifest claude-code-vm \
+cd my-claude-code-vm
+mvmctl build
+mvmctl up \
   --add-dir "$PWD:/workspace:rw" \
   --secret-file "$HOME/.config/mvm/secrets/anthropic:claude-code/anthropic-api-key"
 ```
 
-Why a microVM and not a process sandbox: process sandboxes share the
-host kernel and trust it. A microVM gives the agent its own kernel,
-so a kernel exploit can't pivot to the host.
+Why a microVM and not a process sandbox: process sandboxes share the host kernel and trust it. A microVM gives the agent its own kernel, so a kernel exploit can't pivot to the host.
 
-The example's full security composition (per-service uid, seccomp,
-secrets mode, verified boot) is documented in the
-[example README](https://github.com/auser/mvm/tree/main/nix/images/examples/llm-agent#readme)
-and threat-modelled in
-[ADR-002](https://github.com/auser/mvm/blob/main/specs/adrs/002-microvm-security-posture.md).
+Full security composition (per-service uid, seccomp tier, secrets mode, verified boot) is documented in [ADR-002](https://github.com/auser/mvm/blob/main/specs/adrs/002-microvm-security-posture.md) and the [Rootless workloads section](/guides/building-microvm-images#rootless-workloads).

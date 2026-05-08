@@ -89,9 +89,10 @@ The `DriveFile` type is content-agnostic — it's just `{name, content, mode}`. 
 ## Example: generic flake with config + secrets mounts
 
 The pattern below works with any `mkGuest` flake that reads
-`/mnt/config/` and/or `/mnt/secrets/` at boot. See
-[`nix/images/examples/`](https://github.com/auser/mvm/tree/main/nix/images/examples)
-for concrete flakes (`hello`, `hello-node`, `hello-python`, `llm-agent`).
+`/mnt/config/` and/or `/mnt/secrets/` at boot. Write your own — see
+[Building MicroVM Images](/guides/building-microvm-images) for the
+`mkGuest` API surface, or [Nix Flakes](/guides/nix-flakes) for a
+worked LLM-agent example showing the pattern end-to-end.
 
 ### Running with host-mounted config and secrets
 

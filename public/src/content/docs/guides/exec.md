@@ -40,9 +40,13 @@ mvmctl exec --launch-plan ./launch.json
 If you don't pass `--manifest` or `--flake`, `mvmctl exec` boots the
 bundled default image:
 
-- Defined by [`nix/images/default-tenant/`](https://github.com/auser/mvm/tree/main/nix/images/default-tenant)
-  in the repo: a minimal `mkGuest` rootfs with busybox and the auto-included
-  guest agent. No extra packages.
+- A minimal `mkGuest` rootfs (busybox-as-PID-1 + the supervised guest
+  agent) shipped with mvm itself. Internally it lives at
+  `nix/profiles/minimal.nix` in the workspace, but you should treat
+  it as opaque infrastructure — to customize the image you write
+  your own flake using `mvm.lib.<system>.mkGuest` (see
+  [Building MicroVM Images](/guides/building-microvm-images) +
+  [Dev Image](/guides/dev-image)) instead of editing mvm internals.
 - Built via Nix on first use, cached at `~/.cache/mvm/default-microvm/`
   (kernel + rootfs).
 - Identical for every invocation that doesn't pass `--manifest`.

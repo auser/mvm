@@ -276,10 +276,13 @@ This applies to:
 - `mvmctl exec -- <cmd>` — boots a fresh transient microVM and runs `<cmd>`
 - `mvmctl up` — boots a long-running microVM with the same image
 
-The image is built from `nix/images/default-tenant/` on first use and cached at
-`~/.cache/mvm/default-microvm/` (kernel + rootfs; cache directory name
-unchanged for backward compat). Nix is required to build
-it; pass `--manifest` or `--flake` if Nix isn't available on your host.
+The image is the bundled default — a minimal `mkGuest` rootfs shipped
+with mvm. Built via Nix on first use, cached at
+`~/.cache/mvm/default-microvm/` (kernel + rootfs). To customize, pass
+`--manifest` or `--flake` pointing at your own project's `mkGuest`
+output (see [Building MicroVM Images](/guides/building-microvm-images)).
+Nix is required to build the default; without a Linux builder on
+macOS, pass an already-built `--manifest` or fail with a clear error.
 
 ## Cache
 
@@ -349,7 +352,7 @@ All commands accept these global options:
 | `MVM_CONFIG_DIR` | Override config directory | XDG default |
 | `MVM_STATE_DIR` | Override state directory | XDG default |
 | `MVM_SHARE_DIR` | Override share directory | XDG default |
-| `MVM_DEV_FLAKE_URL` | Escape hatch for the dev-build's chained `--override-input mvm` target. Suppresses the chained `mvm/mvm` override when set. | Unset (resolves to local `nix/dev/`) |
+| `MVM_DEV_FLAKE_URL` | Escape hatch for the dev-build's chained `--override-input mvm` target. When set, suppresses the default chained override. (Legacy from the previous iteration's dual-flake layout; today's same-flake-for-both-modes design rarely needs it.) | Unset |
 | `MVM_SRC` | Override the source repo path passed to `nix build` during dev builds | Workspace root |
 | `MVM_BUILDER_AGENT_BIN` | Override the path to the builder-agent binary baked into the builder VM image | Auto-detected from build closure |
 | `MVM_BUILDER_AGENT_PORT` | Vsock port the builder agent listens on | `54_321` |
