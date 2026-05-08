@@ -1,0 +1,106 @@
+---
+title: "Install mvm on Linux"
+description: "mvm on Linux is the Tier 1 production target — Firecracker + KVM, no virtualization wrapper, sub-200ms cold boot."
+---
+
+Linux is mvm's Tier 1 target. The full security posture (verified boot, jailer, seccomp tier "strict") and the project's tightest boot-time budget (≤ 200ms cold on Firecracker; ≤ 30ms snapshot-cloned) hold here. Other platforms get the same API surface via [ADR-013](/contributing/adr/013-microsandbox-pivot/), but Linux is where mvm runs at full pace.
+
+## Prerequisites
+
+You'll need:
+
+- A CPU + kernel with **KVM** enabled. Most modern x86_64 / aarch64 hosts qualify; verify with:
+
+  ```bash
+  test -w /dev/kvm && echo "KVM accessible" || echo "KVM not accessible"
+  ```
+
+  If `/dev/kvm` exists but is `root`-only, add yourself to the `kvm` group: `sudo usermod -aG kvm "$USER"` (re-login required).
+- **Nix** (single-user or multi-user; either works).
+- **Rust 1.85+** if you build `mvmctl` from source.
+
+## Install Nix
+
+[Determinate Nix](https://determinate.systems/posts/determinate-nix-installer) is the easiest path:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
+```
+
+The upstream NixOS installer is also fine:
+
+```bash
+sh <(curl -L https://nixos.org/nix/install) --daemon
+```
+
+After install, open a fresh shell and verify:
+
+```bash
+nix --version
+```
+
+## Install mvmctl
+
+### One-liner
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+```
+
+### Pin a version
+
+```bash
+MVM_VERSION=v0.13.0 curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+```
+
+### From source
+
+```bash
+git clone https://github.com/auser/mvm.git
+cd mvm
+cargo build --release
+install -m 0755 target/release/mvmctl ~/.local/bin/mvmctl
+```
+
+### From crates.io
+
+```bash
+cargo install mvmctl
+```
+
+## Verify
+
+```bash
+mvmctl doctor
+```
+
+`doctor` checks for `/dev/kvm` access, Nix availability, the cache directory permissions, and the active backend. On a healthy Linux + KVM host you'll see Firecracker selected as the auto-default.
+
+## First microVM
+
+```bash
+mkdir my-app && cd my-app
+mvmctl init
+mvmctl run
+```
+
+`mvmctl init` scaffolds an `mvm.toml` + `flake.nix` in your project. `mvmctl run` reads `mvm.toml`, builds the rootfs via Nix (using your flake's `mvm.lib.x86_64-linux.mkGuest` call), and boots it on Firecracker. Expected cold boot: ≤ 200ms.
+
+See [Building MicroVM Images](/guides/building-microvm-images) for the user-facing flake API.
+
+## Troubleshooting
+
+**"`/dev/kvm`: permission denied"** — your user isn't in the `kvm` group. `sudo usermod -aG kvm "$USER"` and start a new shell.
+
+**"`mvmctl run` falls back to microsandbox even though I have KVM"** — check `mvmctl doctor` output. The auto-select ladder picks Firecracker only when `/dev/kvm` is writable; if it's `root`-only, microsandbox wins as the cross-platform fallback. Same fix as above.
+
+**Nix build is slow** — first builds pull from `cache.nixos.org` and `cache.flakehub.com`. Subsequent builds hit the local store. The persistent builder microVM (Phase 1+) keeps `/nix/store` warm across builds; until that wave lands, the first run pays the cold-cache cost.
+
+**Firecracker errors with "TooManyOpenFiles"** — bump the open-files ulimit: `ulimit -n 4096`. mvm sets a sensible default but very-high-density runs need headroom.
+
+## Distro-specific notes
+
+- **Ubuntu/Debian** — `apt install qemu-utils e2fsprogs` if you need `mkfs.ext4` for the [smoke test](https://github.com/auser/mvm/blob/main/tests/smoke_microsandbox.rs).
+- **Fedora/RHEL** — `dnf install e2fsprogs qemu-img`. Make sure SELinux isn't blocking `/dev/kvm` access (it usually isn't, but `audit2why` is your friend if it does).
+- **Arch** — `pacman -S e2fsprogs qemu-img`. Already lean.
+- **NixOS** — easiest path: `nix profile install github:auser/mvm`. KVM is enabled by default; `kvm` group membership is the only thing to verify.

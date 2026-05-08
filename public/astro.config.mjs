@@ -50,6 +50,8 @@ export default defineConfig({
         {
           label: "Install",
           items: [
+            { label: "Linux", slug: "install/linux" },
+            { label: "macOS", slug: "install/macos" },
             { label: "Windows (WSL2)", slug: "install/windows" },
           ],
         },
