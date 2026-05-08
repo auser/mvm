@@ -15,11 +15,22 @@
 //!
 //! - `MVM_LIVE_SMOKE != "1"` → skip (operator's fence).
 //! - `MVM_TEST_ROOTFS` env var unset → skip (we need a pre-built
-//!   rootfs path; macOS dev hosts can't `nix build` Linux derivations
-//!   without a linux-builder, so we expect CI runners to provide one).
-//! - `cfg(not(target_os = "linux"))` → skip the boot path; macOS
-//!   smoke shape lands in W6.1 once microsandbox+HVF measurement
-//!   harness is up.
+//!   rootfs path; macOS dev hosts that don't have a `nix-darwin`
+//!   linux-builder can't produce one locally, but CI runners can
+//!   build it and pass the path).
+//!
+//! ## Cross-platform reach
+//!
+//! Microsandbox boots on **both Linux/KVM and macOS/HVF** (per
+//! ADR-013), so this smoke runs on both. The previous iteration of
+//! this file gated to Linux only — that was overcautious; the test
+//! takes a pre-built rootfs from outside, so the only host-side
+//! requirement is "microsandbox can boot here," which is satisfied
+//! anywhere libkrun runs.
+//!
+//! Windows is excluded only because microsandbox's Windows path
+//! isn't yet wired (ADR-031); the smoke `cfg(any())`-skips on
+//! `target_os = "windows"`.
 //!
 //! ## What it does NOT cover (yet)
 //!
@@ -45,9 +56,11 @@ const ROOTFS_VAR: &str = "MVM_TEST_ROOTFS";
 /// The strict statistical gate is `xtask perf` (Phase 9).
 const SMOKE_BOOT_TRIPWIRE: Duration = Duration::from_millis(600);
 
-// Linux-only helper module — keeps the gate-handling and
-// imports out of the macOS-host warning surface.
-#[cfg(target_os = "linux")]
+// Helper module gated to non-Windows. Microsandbox boots on both
+// Linux/KVM and macOS/HVF, so the live test runs on both. Windows
+// is excluded because microsandbox's Windows path isn't wired
+// (ADR-031 — Tauri-only Windows posture).
+#[cfg(not(target_os = "windows"))]
 mod live {
     use super::SMOKE_GATE;
 
@@ -61,7 +74,7 @@ mod live {
 }
 
 #[test]
-#[cfg(target_os = "linux")]
+#[cfg(not(target_os = "windows"))]
 fn boots_real_rootfs_within_tripwire_then_tears_down_clean() {
     use mvmctl::core::vm_backend::{VmBackend, VmStartConfig};
     use std::time::Instant;
@@ -69,7 +82,7 @@ fn boots_real_rootfs_within_tripwire_then_tears_down_clean() {
     if !live::smoke_enabled() {
         eprintln!(
             "[smoke_e2e_boot] skipped — set {SMOKE_GATE}=1 + {ROOTFS_VAR}=/path/to/rootfs.ext4 \
-             on a Linux+KVM host to run."
+             to run. Works on Linux/KVM and macOS/HVF."
         );
         return;
     }
