@@ -25,12 +25,30 @@
 # `passthru.runner.config.microvm.rootfs` and bridges it to the
 # active backend (Firecracker / microsandbox / Cloud Hypervisor).
 #
-# Implementation note: this builds on microvm.nix's NixOS module
-# (ADR-013) — services become systemd units, entrypoint.shell maps
-# to a getty on /dev/hvc0 (a vsock-backed virtio-console). The
-# previous iteration used a hand-rolled busybox init for sub-100ms
-# boot; we revisit boot perf in Phase 9 once the security port +
-# template surface land.
+# ── Boot-perf reality (ADR-013 §"Boot-time budget") ───────────────
+#
+# This file's CURRENT implementation builds on microvm.nix's NixOS
+# module (NixOS + systemd). That path is convenient but *too slow*
+# for the project's stated 200ms boot target — NixOS+systemd boots
+# in 1-3 s on Firecracker even after aggressive trimming.
+#
+# The Phase 1 W5.1 rewrite replaces the NixOS path with a hand-rolled
+# busybox-as-PID-1 implementation matching the previous iteration's
+# approach (which approached the upstream Firecracker reference of
+# ~125ms). Until that wave lands, calling `mkGuest` produces a working
+# but slow image. The user-facing surface (`name`, `entrypoint`,
+# `services`, `dev`) does NOT change in W5.1 — the speedup is purely
+# implementation-side.
+#
+# The ADR-amended target is:
+#   - Firecracker (Linux/KVM):                    <= 200 ms cold
+#   - microsandbox / libkrun (Linux + macOS HVF): <= 500 ms cold
+#   - Apple Virtualization framework:             <= 1 s cold
+#
+# Phase 9 closes the perf gates in CI. Until then, cold boot p50 is
+# measured but not enforced. Users who hit the slow path can opt into
+# the busybox path manually once W5.1 lands by passing `init = "busybox"`
+# (default once the rewrite ships).
 
 { nixpkgs, microvm }:
 { system }:

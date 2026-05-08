@@ -118,6 +118,8 @@ The same flake source is consumed in **both** dev and production builds — ther
 
 The `mkGuest` library composes microvm.nix's `microvm` NixOS module with mvm's security overlay (per-service uids, seccomp tier, dm-verity, read-only `/etc`). You don't see those layers in your flake — they're applied automatically.
 
+> **Boot-time note.** The current `mkGuest` implementation produces a NixOS+systemd rootfs and boots in 1-3 seconds on Firecracker. That misses the project's sub-200ms target by an order of magnitude. The Phase 1 W5.1 rewrite replaces the NixOS path with busybox-as-PID-1 — same user-facing surface, sub-200ms cold boot. See [ADR-013 §"Boot-time budget"](https://github.com/auser/mvm/blob/main/specs/adrs/013-microsandbox-libkrun-microvm-nix-pivot.md) for the per-backend targets.
+
 ## What's inside the mvm repository (and why you don't touch it)
 
 The repository's `nix/` directory contains:

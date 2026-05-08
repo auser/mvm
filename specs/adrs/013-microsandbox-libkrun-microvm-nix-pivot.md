@@ -48,6 +48,36 @@ The new direction:
 **Neutral**:
 - mvmd's facade contract (`mvmctl::core`, `mvmctl::runtime::shell`, etc.) is unaffected — this is a backend swap, not a contract change.
 
+## Boot-time budget — busybox-as-PID-1, NOT NixOS+systemd
+
+The project's value prop includes "as fast as possible" boot — concretely **sub-200ms to userspace on Firecracker / libkrun**, sub-1s on Apple Virtualization framework. Neither NixOS+systemd nor Alpine+OpenRC reaches that:
+
+| init system | Firecracker p50 | Why |
+|---|---|---|
+| NixOS + systemd | 1–3 s | systemd unit graph, generators, dbus, locale-loader |
+| Alpine + OpenRC | 300–500 ms | OpenRC runlevel + service supervision |
+| **busybox-as-PID-1** (custom init) | **~50–150 ms** | One static binary, one script, exec the entrypoint |
+
+microvm.nix's NixOS module is a convenient way to *describe* a microVM, but it produces a NixOS-systemd rootfs that's structurally too heavy for our boot budget. We therefore:
+
+1. **Use microvm.nix only for the hypervisor abstractions** it exposes (runner-script generation, hypervisor-specific config knobs). Pinning microvm.nix as a flake input is still an ADR-013 commitment.
+2. **Build the rootfs ourselves** as busybox-as-PID-1, the way the previous iteration did. The mkGuest implementation (`nix/lib/mk-guest.nix`) emits an ext4 image whose `/init` is a tiny script that mounts `/proc`, `/sys`, `/dev`, sets up vsock, and execs the user's entrypoint.
+3. **No initrd in the default path** — kernel modules required at root mount (virtio-blk, virtio-vsock, ext4) are built into the kernel image, so `init=/init` runs without a stage-1 initramfs detour. Saves ~30-50ms vs the microvm.nix initramfs path.
+4. **NixOS+systemd remains available as an opt-in** for users who explicitly want it (`init = "nixos"` parameter on mkGuest). Boot will be ~1-3s; we surface that warning in mkGuest's module docs.
+
+The previous iteration shipped this exact strategy and was approaching the upstream Firecracker reference (~125ms). We replicate that, then tighten further per Phase 9's perf gate (`tests/perf.rs::cold_boot_p50_within_budget`).
+
+### Per-backend boot budgets (CI gate, Phase 9)
+
+| Backend | Cold p50 | Snapshot-cloned p50 | Notes |
+|---|---|---|---|
+| Firecracker (Linux/KVM) | ≤ 200 ms | ≤ 30 ms | Snapshot pool warm; cold path measured from `firecracker --no-api` start to entrypoint exec. |
+| microsandbox / libkrun (Linux+macOS) | ≤ 500 ms | ≤ 60 ms | libkrunfw bundles kernel; HVF on macOS typically adds ~100ms vs KVM. |
+| Apple Virtualization framework | ≤ 1 s | ≤ 200 ms | Apple's hypervisor overhead; pending upstream profiling. |
+| Cloud Hypervisor (post-Phase-10) | ≤ 250 ms | ≤ 50 ms | Slightly heavier device model than Firecracker. |
+
+Reproducible builds + CI perf gate: `xtask perf --backend firecracker --p50-ms 200 --runs 100`.
+
 ## Non-goal: OCI / container images
 
 **mvm is microVMs, not containers.** Even though microsandbox's API
