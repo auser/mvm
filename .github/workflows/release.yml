@@ -1,0 +1,399 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - "v*"
+
+permissions:
+  contents: write
+  id-token: write   # Required for cosign keyless signing via OIDC
+  actions: write    # Required to dispatch publish-crates workflow
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  build:
+    strategy:
+      matrix:
+        include:
+          - target: aarch64-apple-darwin
+            os: macos-latest
+          - target: x86_64-apple-darwin
+            os: macos-latest
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-latest
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-latest
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install cross-compilation tools (Linux aarch64)
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y gcc-aarch64-linux-gnu
+
+      - name: Set linker for aarch64-unknown-linux-gnu
+        if: matrix.target == 'aarch64-unknown-linux-gnu'
+        run: |
+          mkdir -p .cargo
+          cat > .cargo/config.toml << 'EOF'
+          [target.aarch64-unknown-linux-gnu]
+          linker = "aarch64-linux-gnu-gcc"
+          EOF
+
+      - name: Build release binary
+        env:
+          TARGET: ${{ matrix.target }}
+          # Use vendored OpenSSL for cross-compilation to avoid linking issues
+          OPENSSL_STATIC: 1
+          OPENSSL_VENDORED: 1
+        run: cargo build --release --target "${TARGET}"
+
+      - name: Smoke test binary (native targets only)
+        if: matrix.target == 'x86_64-unknown-linux-gnu' || matrix.target == 'aarch64-apple-darwin' || matrix.target == 'x86_64-apple-darwin'
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          BIN="target/${TARGET}/release/mvmctl"
+          "$BIN" --version
+          "$BIN" --help > /dev/null
+          "$BIN" metrics --json | python3 -c "
+          import sys, json
+          d = json.load(sys.stdin)
+          assert 'requests_total' in d, 'metrics JSON missing requests_total'
+          print('smoke test passed')
+          "
+
+      - name: Generate man pages
+        shell: bash
+        run: cargo run --package xtask -- gen-man --output-dir man/
+
+      - name: Package binary and generate checksums
+        env:
+          TARGET: ${{ matrix.target }}
+        shell: bash
+        run: |
+          BIN_NAME="mvmctl"
+          ARCHIVE_NAME="mvmctl-${TARGET}"
+
+          mkdir -p "staging/${ARCHIVE_NAME}"
+          cp "target/${TARGET}/release/${BIN_NAME}" "staging/${ARCHIVE_NAME}/"
+          cp -r resources "staging/${ARCHIVE_NAME}/" 2>/dev/null || true
+          cp README.md "staging/${ARCHIVE_NAME}/" 2>/dev/null || true
+          # Include generated man pages
+          if [ -d man ] && ls man/*.1 2>/dev/null; then
+            cp -r man "staging/${ARCHIVE_NAME}/"
+          fi
+
+          cd staging
+          tar czf "${ARCHIVE_NAME}.tar.gz" "${ARCHIVE_NAME}"
+
+          # Generate SHA256 checksum for the tarball
+          shasum -a 256 "${ARCHIVE_NAME}.tar.gz" > "${ARCHIVE_NAME}.tar.gz.sha256"
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: mvmctl-${{ matrix.target }}
+          path: |
+            staging/*.tar.gz
+            staging/*.sha256
+
+  dev-image:
+    # Build on ARM runner for native aarch64-linux (Apple Container target).
+    # Also build x86_64 for Linux dev environments.
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build dev image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          SYSTEM="${ARCH}-linux"
+          nix build "./nix/images/builder#packages.${SYSTEM}.default" \
+            --no-link --print-out-paths > /tmp/store-path.txt
+          STORE_PATH=$(head -1 /tmp/store-path.txt)
+          echo "${STORE_PATH}" > /tmp/dev-store-path.txt
+          mkdir -p staging
+          cp "$STORE_PATH/vmlinux" "staging/dev-vmlinux-${ARCH}"
+          cp "$STORE_PATH/rootfs.ext4" "staging/dev-rootfs-${ARCH}.ext4"
+          cd staging
+          sha256sum "dev-vmlinux-${ARCH}" "dev-rootfs-${ARCH}.ext4" > "dev-image-${ARCH}-checksums-sha256.txt"
+
+      # Plan 36: emit the cosign-signable SignedManifest JSON. The
+      # script lives at scripts/generate-image-manifest.sh and pins
+      # the schema that mvm-security::image_verify consumes.
+      - name: Generate signed-image manifest (plan 36)
+        env:
+          ARCH: ${{ matrix.arch }}
+          VARIANT: dev
+          ROOTFS_EXT: ext4
+          STAGING_DIR: ${{ github.workspace }}/staging
+        run: |
+          STORE_PATH=$(cat /tmp/dev-store-path.txt)
+          export STORE_PATH
+          bash scripts/generate-image-manifest.sh
+
+      - name: Upload dev image artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dev-image-${{ matrix.arch }}
+          path: |
+            staging/dev-vmlinux-${{ matrix.arch }}
+            staging/dev-rootfs-${{ matrix.arch }}.ext4
+            staging/dev-image-${{ matrix.arch }}-checksums-sha256.txt
+            staging/dev-image-${{ matrix.arch }}.manifest.json
+
+  # Plan 36 / ADR 005: the sealed builder image consumed by mvmd's
+  # pool-build pipeline. Same package set as the dev variant but
+  # sourced from the parent flake (no Exec handler, verifiedBoot=true,
+  # dm-verity sidecar emitted). Built without mvmctl's dev override —
+  # the `builder` output of nix/images/builder/flake.nix is wired to
+  # mvm-prod (the parent), so the prod guest agent lands in the
+  # rootfs regardless of any caller's --override-input.
+  builder-image:
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build sealed builder image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          SYSTEM="${ARCH}-linux"
+          nix build "./nix/images/builder#packages.${SYSTEM}.builder" \
+            --no-link --print-out-paths > /tmp/store-path.txt
+          STORE_PATH=$(head -1 /tmp/store-path.txt)
+          echo "${STORE_PATH}" > /tmp/builder-store-path.txt
+          mkdir -p staging
+          cp "$STORE_PATH/vmlinux" "staging/builder-vmlinux-${ARCH}"
+          cp "$STORE_PATH/rootfs.ext4" "staging/builder-rootfs-${ARCH}.ext4"
+          # The builder variant ships dm-verity sidecars; mvmd-agent
+          # verifies them on every boot.
+          cp "$STORE_PATH/rootfs.verity" "staging/builder-rootfs-${ARCH}.verity"
+          cp "$STORE_PATH/rootfs.roothash" "staging/builder-rootfs-${ARCH}.roothash"
+          cp "$STORE_PATH/rootfs.initrd" "staging/builder-initrd-${ARCH}"
+          cd staging
+          sha256sum "builder-vmlinux-${ARCH}" \
+                    "builder-rootfs-${ARCH}.ext4" \
+                    "builder-rootfs-${ARCH}.verity" \
+                    "builder-rootfs-${ARCH}.roothash" \
+                    "builder-initrd-${ARCH}" \
+            > "builder-image-${ARCH}-checksums-sha256.txt"
+
+      - name: Generate signed-image manifest (plan 36)
+        env:
+          ARCH: ${{ matrix.arch }}
+          VARIANT: builder
+          ROOTFS_EXT: ext4
+          STAGING_DIR: ${{ github.workspace }}/staging
+        run: |
+          STORE_PATH=$(cat /tmp/builder-store-path.txt)
+          export STORE_PATH
+          bash scripts/generate-image-manifest.sh
+
+      - name: Upload builder image artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: builder-image-${{ matrix.arch }}
+          path: |
+            staging/builder-vmlinux-${{ matrix.arch }}
+            staging/builder-rootfs-${{ matrix.arch }}.ext4
+            staging/builder-rootfs-${{ matrix.arch }}.verity
+            staging/builder-rootfs-${{ matrix.arch }}.roothash
+            staging/builder-initrd-${{ matrix.arch }}
+            staging/builder-image-${{ matrix.arch }}-checksums-sha256.txt
+            staging/builder-image-${{ matrix.arch }}.manifest.json
+
+  default-microvm:
+    # Build the bundled default microVM image used by `mvmctl exec` /
+    # `mvmctl up` when no --flake or --template was given. Mirrors the
+    # dev-image job: native per-arch builds, unsigned artifacts.
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build default microVM image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          SYSTEM="${ARCH}-linux"
+          nix build "./nix/images/default-tenant#packages.${SYSTEM}.default" \
+            --no-link --print-out-paths > /tmp/store-path.txt
+          STORE_PATH=$(head -1 /tmp/store-path.txt)
+          mkdir -p staging
+          cp "$STORE_PATH/vmlinux" "staging/default-microvm-vmlinux-${ARCH}"
+          cp "$STORE_PATH/rootfs.ext4" "staging/default-microvm-rootfs-${ARCH}.ext4"
+          cd staging
+          sha256sum "default-microvm-vmlinux-${ARCH}" "default-microvm-rootfs-${ARCH}.ext4" \
+            > "default-microvm-${ARCH}-checksums-sha256.txt"
+
+      - name: Upload default microVM image artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: default-microvm-${{ matrix.arch }}
+          path: |
+            staging/default-microvm-vmlinux-${{ matrix.arch }}
+            staging/default-microvm-rootfs-${{ matrix.arch }}.ext4
+            staging/default-microvm-${{ matrix.arch }}-checksums-sha256.txt
+
+  release:
+    needs: [build, dev-image, builder-image, default-microvm]
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cargo-cyclonedx
+        run: cargo install cargo-cyclonedx --locked
+
+      - name: Generate SBOM
+        run: cargo cyclonedx --format json --all --override-filename sbom.cdx
+
+      - name: Install cosign
+        uses: sigstore/cosign-installer@v3
+
+      - name: Download all artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      - name: Generate combined checksum file
+        shell: bash
+        run: |
+          cd artifacts
+          # Combine per-platform checksums into one file
+          cat *.sha256 > checksums-sha256.txt
+          echo "Combined checksums:"
+          cat checksums-sha256.txt
+
+      - name: Sign release tarballs and SBOM
+        shell: bash
+        run: |
+          # Sign each tarball — keyless OIDC, no secret key needed.
+          # Produces a .bundle file per tarball containing signature + certificate chain.
+          for tarball in artifacts/*.tar.gz; do
+            cosign sign-blob \
+              --yes \
+              --bundle "${tarball}.bundle" \
+              "${tarball}"
+            echo "Signed: ${tarball}"
+          done
+
+          # Sign the SBOM
+          cosign sign-blob \
+            --yes \
+            --bundle sbom.cdx.json.bundle \
+            sbom.cdx.json
+          echo "Signed: sbom.cdx.json"
+
+      # Plan 36 / ADR 005: cosign-keyless-sign each per-(arch, variant)
+      # SignedManifest JSON. The bundle (.bundle) carries the signature,
+      # the Fulcio short-lived cert, and the Rekor inclusion proof —
+      # mvm-security::image_verify consumes exactly this format.
+      - name: Sign image manifests (plan 36)
+        shell: bash
+        run: |
+          set -euo pipefail
+          shopt -s nullglob
+          manifests=(artifacts/*-image-*.manifest.json)
+          if [ "${#manifests[@]}" -eq 0 ]; then
+            echo "::error::no image manifests found in artifacts/" >&2
+            ls -la artifacts/ >&2 || true
+            exit 1
+          fi
+          for manifest in "${manifests[@]}"; do
+            cosign sign-blob \
+              --yes \
+              --bundle "${manifest}.bundle" \
+              "${manifest}"
+            echo "Signed: ${manifest}"
+          done
+
+      - name: Create GitHub Release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh release create "${TAG_NAME}" \
+            --title "${TAG_NAME}" \
+            --generate-notes \
+            artifacts/*.tar.gz \
+            artifacts/*.tar.gz.bundle \
+            artifacts/checksums-sha256.txt \
+            artifacts/dev-vmlinux-* \
+            artifacts/dev-rootfs-* \
+            artifacts/dev-image-*-checksums-sha256.txt \
+            artifacts/dev-image-*.manifest.json \
+            artifacts/dev-image-*.manifest.json.bundle \
+            artifacts/builder-vmlinux-* \
+            artifacts/builder-rootfs-* \
+            artifacts/builder-initrd-* \
+            artifacts/builder-image-*-checksums-sha256.txt \
+            artifacts/builder-image-*.manifest.json \
+            artifacts/builder-image-*.manifest.json.bundle \
+            artifacts/default-microvm-vmlinux-* \
+            artifacts/default-microvm-rootfs-* \
+            artifacts/default-microvm-*-checksums-sha256.txt \
+            sbom.cdx.json \
+            sbom.cdx.json.bundle
+
+      # The "release: published" event fired by `gh release create` runs under
+      # GITHUB_TOKEN, which by design does not trigger downstream workflows.
+      # workflow_dispatch is exempt from that rule, so chain publish-crates
+      # explicitly here. This keeps crates.io in sync with GitHub releases.
+      - name: Trigger crates.io publish workflow
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAG_NAME: ${{ github.ref_name }}
+        run: |
+          gh workflow run publish-crates.yml \
+            --ref "${TAG_NAME}" \
+            -f tag="${TAG_NAME}" \
+            -f dry_run=false

@@ -870,7 +870,7 @@ The current `mvm-runtime` is a 5-crate, ~520-LOC skeleton; the previous iteratio
 
 - [ ] Plan saved to `specs/plans/60-mvm-microsandbox-migration.md`
 - [ ] Sprint 50 documented here in SPRINT.md (this section)
-- [ ] Phase-0 ADRs stubbed: 013 (microsandbox pivot), 014 (VmBackend trait), 027 (iroh encryption layering), 031 (cross-platform strategy), 032 (hosted-cloud invariants), 033 (code-quality enforcement), 035 (feature flag taxonomy)
+- [ ] Phase-0 ADRs stubbed: 013 (microsandbox pivot, with microvm.nix fallback), 014 (VmBackend trait), 027 (iroh encryption layering), 031 (cross-platform strategy), 032 (hosted-cloud invariants), 033 (code-quality enforcement), 035 (feature flag taxonomy), 038 (CI execution policy)
 - [ ] Compliance doc stubs: `specs/compliance/{soc2-controls,pci-scope,hipaa-mapping,gdpr-mapping}.md`
 - [ ] Root `Cargo.toml` workspace block rewritten with full crate list + feature flags + workspace lints (`too_many_arguments = "deny"`)
 - [ ] `mvm-core`, `mvm-storage`, `mvm-plan`, `mvm-policy`, `mvm-security` copied verbatim from `../mvm/crates/`

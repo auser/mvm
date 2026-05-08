@@ -20,7 +20,7 @@ The new direction:
 
 - **microsandbox** (Apache-2.0, libkrun-backed) becomes the **builder** and the macOS/Windows execution path. libkrun gives us native Hypervisor.framework on macOS and KVM on Linux without a wrapping Lima VM.
 - **Firecracker** stays as the preferred Linux production execution path because of its smaller attack surface, faster cold boot, and existing security work (jailer, dm-verity, seccomp tier).
-- **microvm.nix** (MIT) becomes the Nix-flake foundation for microVM image generation. It abstracts Firecracker / Cloud Hypervisor / QEMU / crosvm / kvmtool / stratovirt as a NixOS module — adding a new backend later is a config change, not a kernel rewrite.
+- **microvm.nix** (MIT) becomes the Nix-flake foundation for microVM image generation. It abstracts Firecracker / Cloud Hypervisor / QEMU / crosvm / kvmtool / stratovirt as a NixOS module — adding a new backend later is a config change, not a kernel rewrite. **Fallback path**: if the per-bump audit (`xtask audit-flake`) of microvm.nix surfaces a security regression we can't accept, we fall back to the previous iteration's hand-rolled NixOS modules in `../mvm/nix/`. The fallback is a **named, ready-to-execute escape hatch**, not just an ADR sentence.
 - **Lima is dropped entirely.** The macOS path is microsandbox-direct; no intermediate Linux VM.
 
 ## Decision

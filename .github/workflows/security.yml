@@ -1,0 +1,413 @@
+name: Security
+
+# ADR-002 §W6.3 — single workflow that hosts every CI-side security
+# gate. Lanes correspond to the workstreams in
+# specs/plans/25-microvm-hardening.md and the seven claims in
+# CLAUDE.md::Security model. Failure on any lane blocks merge.
+#
+# Triggers: PRs against main, release-tag pushes (final pre-publish
+# gate), plus a nightly cron so advisory-DB additions get caught even
+# on quiet branches. `push: branches: [main]` was dropped in the
+# ecosystem-wide CI cost reduction — the nightly cron covers the
+# post-merge "did a new advisory land overnight" case at zero
+# per-merge cost, so the duplicate post-merge run was pure waste.
+
+on:
+  # Per ADR-038: heavy security gates run at release time + nightly
+  # cron only. Day-to-day per-push CI feedback comes from ci.yml; the
+  # nightly cron picks up new RUSTSEC advisories that landed in the
+  # advisory-db without anyone touching the repo.
+  push:
+    tags: ["v*"]
+  schedule:
+    - cron: "17 4 * * *"
+  workflow_dispatch:
+
+# Cancel a previous run when a new commit lands on the same branch.
+# Same rationale as ci.yml — keep the PR check panel free of stale
+# failed runs from superseded SHAs. `main` pushes and the nightly
+# cron are never cancelled (different ref → different group).
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUSTFLAGS: "-D warnings"
+
+jobs:
+  # ── Lane 1: Supply chain ──────────────────────────────────────────
+  # Maps to ADR-002 §W5.2 — advisories, license allowlist, multi-
+  # version bans, and registry source allowlist. Cheap (<2 min).
+  cargo-deny:
+    name: Supply chain — cargo-deny (ADR-002 §W5.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-deny
+        run: cargo install --locked cargo-deny
+
+      - name: cargo deny check
+        run: cargo deny check
+
+  cargo-audit:
+    name: Supply chain — cargo-audit (ADR-002 §W5.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install cargo-audit
+        run: cargo install --locked cargo-audit
+
+      - name: cargo audit
+        # Ignored advisories must mirror deny.toml's `[advisories].ignore`.
+        # cargo-audit doesn't read deny.toml; CLI flags are the
+        # discoverable way to keep the two tools in sync.
+        run: cargo audit --ignore RUSTSEC-2025-0057 --ignore RUSTSEC-2024-0384 --ignore RUSTSEC-2025-0119 --ignore RUSTSEC-2023-0071 --ignore RUSTSEC-2024-0370 --ignore RUSTSEC-2026-0009
+
+  # ── Lane 2: Production-agent symbol contract ─────────────────────
+  # ADR-002 §W4.3 + ADR-007 §W5 — combined contract on the production
+  # guest agent binary. ONE build, ONE step, BOTH assertions:
+  #   • mvm_guest_agent::do_exec is ABSENT (W4.3 — no dev-shell leak)
+  #   • mvm_guest_agent::handle_run_entrypoint is PRESENT (W5 — the
+  #     constrained RunEntrypoint handler ships).
+  # Asserting both on the *same* binary in a single step prevents
+  # feature-flag drift from regressing half the contract silently.
+  prod-agent-runentry-contract:
+    name: Guest agent — symbol contract (ADR-002 §W4.3 + ADR-007 §W5)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-prodagent-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-prodagent-
+
+      - name: Build prod agent and assert symbol contract
+        run: ./scripts/check-prod-agent-no-exec.sh
+
+  # ── Lane 2b: Seccomp tier functional denial (ADR-002 §W2.4) ───────
+  # Tier-structure unit tests in `mvm-security` cover cumulative-subset
+  # and serde shapes; they don't exercise the BPF program at runtime.
+  # This lane spawns `mvm-seccomp-apply <tier> -- syscall-probe` on
+  # Linux and asserts:
+  #   • unrestricted / network → socket(AF_INET) succeeds
+  #   • standard               → socket(AF_INET) returns EPERM
+  # Catches regressions where a syscall list passes structural tests
+  # but fails to translate to a working seccomp filter (e.g., wrong
+  # syscall number, missing arch coverage, NNP not set).
+  seccomp-functional:
+    name: Seccomp tier functional denial (ADR-002 §W2.4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: cargo-seccomp-fn-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: cargo-seccomp-fn-
+
+      - name: Run seccomp functional tests
+        run: cargo test -p mvm-guest --test seccomp_apply
+
+  # ── Lane 3: Reproducibility ────────────────────────────────────────
+  # ADR-002 §W5.3 — two clean builds must produce byte-identical
+  # binaries. Catches build-time non-determinism that could mask
+  # supply-chain injection.
+  reproducibility:
+    name: Reproducibility (ADR-002 §W5.3)
+    runs-on: ubuntu-latest
+    env:
+      SOURCE_DATE_EPOCH: "1700000000"
+      CARGO_INCREMENTAL: "0"
+      RUSTFLAGS: "-D warnings --remap-path-prefix=/home/runner/work=."
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Build A
+        run: cargo build --release --locked --bin mvmctl
+
+      - name: Hash A
+        run: sha256sum target/release/mvmctl | tee /tmp/hash-a.txt
+
+      - name: Clean
+        run: cargo clean
+
+      - name: Build B
+        run: cargo build --release --locked --bin mvmctl
+
+      - name: Hash B
+        run: sha256sum target/release/mvmctl | tee /tmp/hash-b.txt
+
+      - name: Compare hashes
+        run: |
+          set -euo pipefail
+          a=$(awk '{print $1}' /tmp/hash-a.txt)
+          b=$(awk '{print $1}' /tmp/hash-b.txt)
+          if [ "$a" != "$b" ]; then
+            echo "::error::Reproducibility mismatch: $a != $b" >&2
+            echo "Two builds of the same source produced different binaries." >&2
+            echo "Investigate before merging — non-determinism can mask supply-chain injection." >&2
+            exit 1
+          fi
+          echo "ok: matching sha256 across two clean builds: $a"
+
+  # ── Lane 4: Frame-parser fuzzing (best-effort, time-boxed) ─────────
+  # ADR-002 §W4.2 — cargo-fuzz harnesses for GuestRequest and the
+  # authenticated-frame envelope. Run for 5 minutes per PR; the
+  # nightly cron extends to 30 minutes.
+  fuzz:
+    name: Fuzz — vsock frame parser (ADR-002 §W4.2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        run: cargo install --locked cargo-fuzz
+
+      - name: Determine fuzz duration
+        id: duration
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          if [ "$EVENT_NAME" = "schedule" ]; then
+            echo "secs=1800" >> "$GITHUB_OUTPUT"
+          else
+            echo "secs=300" >> "$GITHUB_OUTPUT"
+          fi
+
+      - name: Fuzz GuestRequest
+        working-directory: crates/mvm-guest
+        env:
+          DURATION: ${{ steps.duration.outputs.secs }}
+          # `cargo fuzz` requires nightly (-Z sanitizer flags). The
+          # repo-root `rust-toolchain.toml` pins stable, and rustup walks
+          # up from this `working-directory` so it would otherwise win.
+          # RUSTUP_TOOLCHAIN bypasses the toolchain-file lookup entirely.
+          RUSTUP_TOOLCHAIN: nightly
+        run: cargo fuzz run fuzz_guest_request -- -max_total_time="$DURATION"
+
+      - name: Fuzz AuthenticatedFrame
+        working-directory: crates/mvm-guest
+        env:
+          DURATION: ${{ steps.duration.outputs.secs }}
+          RUSTUP_TOOLCHAIN: nightly
+        run: cargo fuzz run fuzz_authenticated_frame -- -max_total_time="$DURATION"
+
+      - name: Fuzz authed path (signed-side)
+        working-directory: crates/mvm-guest
+        env:
+          DURATION: ${{ steps.duration.outputs.secs }}
+          RUSTUP_TOOLCHAIN: nightly
+        # Drives `verify_authenticated_frame` past sig check, asserting
+        # tampered frames never reach the inner deserializer. Catches
+        # regressions where a refactor reorders the verify/deserialize
+        # steps in vsock.rs.
+        run: cargo fuzz run fuzz_authed_path -- -max_total_time="$DURATION"
+
+      - name: Upload corpus on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: fuzz-corpus-${{ github.run_id }}
+          path: |
+            crates/mvm-guest/fuzz/corpus/
+            crates/mvm-guest/fuzz/artifacts/
+
+  # ── Lane 5: Hash-verify regression ─────────────────────────────────
+  # ADR-002 §W5.1 — the unit tests that exercise the
+  # download-and-verify code path live in mvm-cli. Run them in
+  # isolation so a regression is visible in this workflow even when
+  # the broader test job in ci.yml is skipped.
+  hash-verify-tests:
+    name: Hash-verify regression (ADR-002 §W5.1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Run hash-verify tests
+        run: cargo test -p mvm-cli --lib hash_verify_tests
+
+  # ── Lane 6: Verified boot artifact gate ────────────────────────────
+  # ADR-002 §W3.4 — production microVM Nix builds must emit
+  # `rootfs.verity` + `rootfs.roothash` alongside `rootfs.ext4`. If a
+  # refactor flips `verifiedBoot = false` for a production path, this
+  # gate fails the merge before the verity claim breaks silently.
+  verified-boot-artifacts:
+    name: Verified boot artifacts (ADR-002 §W3.4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build default-microvm and assert verity output
+        run: |
+          set -euo pipefail
+          nix build "./nix/images/default-tenant#packages.x86_64-linux.default" \
+            --no-link --print-out-paths > /tmp/store-path.txt
+          out=$(head -1 /tmp/store-path.txt)
+          for f in rootfs.ext4 rootfs.verity rootfs.roothash vmlinux; do
+            if [ ! -f "$out/$f" ]; then
+              echo "::error::missing $f in $out" >&2
+              echo "ADR-002 §W3.4 requires production microVM builds to emit" >&2
+              echo "rootfs.{ext4,verity,roothash} alongside the kernel. The" >&2
+              echo "default-microvm output is missing one of these files," >&2
+              echo "which usually means verifiedBoot was flipped off on the" >&2
+              echo "production path. Either re-enable it or update ADR-002." >&2
+              exit 1
+            fi
+          done
+          # Sanity: roothash must be a 64-char hex string.
+          hash=$(tr -d '\n' < "$out/rootfs.roothash")
+          if [[ ! "$hash" =~ ^[0-9a-f]{64}$ ]]; then
+            echo "::error::roothash is not a 64-char lowercase hex string: ${hash}" >&2
+            exit 1
+          fi
+          echo "ok: rootfs.{ext4,verity,roothash} present, roothash=${hash:0:12}…"
+
+  # ── Lane 7: Flake lockfile cleanliness (plan 36 §Layer 0) ──────────
+  # Every flake.lock in the repo must be committed and in sync with
+  # its flake.nix. A stale lock means the input closure recorded in a
+  # signed manifest doesn't match what nix would actually use on
+  # rebuild — the trust chain breaks silently. Cheap (eval-only).
+  flake-locks-clean:
+    name: Flake locks — committed + in sync (plan 36 §Layer 0)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Assert every flake.lock is committed and in sync
+        run: |
+          set -euo pipefail
+          fail=0
+          while IFS= read -r flake; do
+            d=$(dirname "$flake")
+            echo "::group::$d"
+            if [ ! -f "$d/flake.lock" ]; then
+              echo "::error::missing $d/flake.lock — every flake must commit its lockfile (plan 36 §Layer 0)" >&2
+              fail=1
+              echo "::endgroup::"
+              continue
+            fi
+            # `nix flake lock` updates the lockfile if it diverges from
+            # flake.nix. If `git diff --quiet` reports nothing changed,
+            # the committed lock is authoritative for the current
+            # flake.nix inputs.
+            cp "$d/flake.lock" "$d/flake.lock.original"
+            nix flake lock "$d" 2>&1 || true
+            if ! diff -q "$d/flake.lock" "$d/flake.lock.original" > /dev/null; then
+              echo "::error::$d/flake.lock is out of sync with $d/flake.nix" >&2
+              echo "Run \`nix flake lock $d\` locally and commit the updated lockfile." >&2
+              diff -u "$d/flake.lock.original" "$d/flake.lock" | head -40 >&2 || true
+              fail=1
+            else
+              echo "ok"
+            fi
+            mv "$d/flake.lock.original" "$d/flake.lock"
+            echo "::endgroup::"
+          done < <(find . -name flake.nix \
+            -not -path './target/*' \
+            -not -path './.git/*' \
+            -not -path './node_modules/*' \
+            -not -path './*/resources/template_scaffold/*' \
+            -not -path './resources/template_scaffold/*')
+          exit "$fail"
+
+  # ── Lane 8: Builder image reproducibility (plan 36 §Layer 0) ───────
+  # Build the new mvm-builder-prod sealed image twice and assert the
+  # outputs are byte-identical. Catches non-determinism (timestamps in
+  # compressed layers, embedded host paths, builder-host nonces) that
+  # would silently break the cosign-signed manifest's nix_store_hash
+  # field. Heavy (~10 min for the double build), so PR-skipped — runs
+  # on release-tag pushes, the nightly schedule, and workflow_dispatch
+  # only. The mvmctl binary's reproducibility lane (above) covers PR
+  # feedback for the cheap case.
+  builder-image-reproducibility:
+    name: Builder image reproducibility (plan 36 §Layer 0)
+    if: github.event_name != 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build A
+        run: |
+          set -euo pipefail
+          nix build "./nix/images/builder#packages.x86_64-linux.builder" \
+            --no-link --print-out-paths > /tmp/path-a.txt
+          out=$(head -1 /tmp/path-a.txt)
+          # Hash the contents under stable relative names so the
+          # store path component (which encodes input-hash, not output)
+          # doesn't pollute the comparison.
+          ( cd "$out" && sha256sum rootfs.ext4 rootfs.verity rootfs.roothash vmlinux ) > /tmp/hash-a.txt
+          cat /tmp/hash-a.txt
+
+      - name: Build B (force rebuild)
+        run: |
+          set -euo pipefail
+          nix build "./nix/images/builder#packages.x86_64-linux.builder" \
+            --rebuild --no-link --print-out-paths > /tmp/path-b.txt
+          out=$(head -1 /tmp/path-b.txt)
+          ( cd "$out" && sha256sum rootfs.ext4 rootfs.verity rootfs.roothash vmlinux ) > /tmp/hash-b.txt
+          cat /tmp/hash-b.txt
+
+      - name: Compare hashes
+        run: |
+          set -euo pipefail
+          if ! diff -q /tmp/hash-a.txt /tmp/hash-b.txt > /dev/null; then
+            echo "::error::Builder image is non-deterministic — two clean builds produced different artifacts" >&2
+            echo "Plan 36 §Layer 0 requires the sealed builder image to reproduce byte-for-byte so the" >&2
+            echo "cosign-signed manifest's nix_store_hash and per-artifact sha256 fields are stable." >&2
+            echo >&2
+            echo "Build A:" >&2
+            cat /tmp/hash-a.txt >&2
+            echo >&2
+            echo "Build B:" >&2
+            cat /tmp/hash-b.txt >&2
+            echo >&2
+            echo "Diff:" >&2
+            diff -u /tmp/hash-a.txt /tmp/hash-b.txt >&2 || true
+            exit 1
+          fi
+          echo "ok: builder image reproduces byte-identically across two clean builds"
+          cat /tmp/hash-a.txt

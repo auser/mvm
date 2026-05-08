@@ -258,6 +258,8 @@ This gives us hypervisor portability (microvm.nix already abstracts Firecracker 
 
 Risk: microvm.nix is a third-party project. We pin a specific commit in `flake.lock`, audit it before pinning, and re-audit on every bump. Listed as an explicit supply-chain concern in the security section.
 
+**Fallback (named explicitly):** if a microvm.nix audit surfaces a security regression we can't accept, fall back to the previous iteration's hand-rolled NixOS modules under `../mvm/nix/`. ADR-013 names this as a ready-to-execute escape hatch, not a vague intention. The cost: ~5K LOC of NixOS-module maintenance returns to our scope. The benefit: smaller trust boundary. We choose microvm.nix as the default *because* its trust boundary is acceptable today; if that changes, we revert.
+
 ## L4 + L7 egress proxy (default-deny + policy-gated)
 
 Two proxies, both running in `mvm-supervisor`:
