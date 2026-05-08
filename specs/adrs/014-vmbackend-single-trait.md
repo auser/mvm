@@ -46,7 +46,7 @@ Neither is acceptable.
 - New backends are a file + an `impl VmBackend`, not a new trait + bridge.
 
 **Negative**:
-- We inherit `VmBackend`'s current shape, which carries some Lima-era assumptions in argument names. We accept this for facade stability; ADR-014.1 (future) can rename if needed.
+- We inherit `VmBackend`'s current shape, which still carries a few argument names from the previous iteration's pre-pivot layout (when Lima was in scope). We accept this for facade stability; a follow-up ADR can rename if a specific name proves load-bearing-confusing.
 - The trait isn't `dyn`-safe today (uses `async fn` in trait via `async-trait`). Plug-in registration via `inventory` works but precludes some advanced compositions; acceptable trade-off.
 
 **Neutral**:

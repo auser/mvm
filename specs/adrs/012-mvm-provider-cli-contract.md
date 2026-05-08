@@ -135,13 +135,17 @@ Future provider names may include:
 
 ```text
 firecracker
-lima
+microsandbox
 apple-vz
 libkrun
+cloud-hypervisor
 containerd
 incus
 remote
 ```
+
+(`lima` was named here in an earlier draft as a candidate provider;
+removed per ADR-013, which drops Lima from mvm entirely.)
 
 ## Capability Model
 
@@ -213,7 +217,7 @@ or:
 mvm vm create --provider linux --image ./guest.img
 ```
 
-The CLI must not expose backend-specific assumptions unless explicitly requested. For example, a user should not need to know whether the Linux provider is backed by Apple Virtualization.framework, Firecracker, Lima, libkrun, Incus, or another runtime unless they ask for implementation details.
+The CLI must not expose backend-specific assumptions unless explicitly requested. For example, a user should not need to know whether the Linux provider is backed by Apple Virtualization.framework, Firecracker, microsandbox, libkrun, Incus, or another runtime unless they ask for implementation details.
 
 ## MLX Provider Contract
 

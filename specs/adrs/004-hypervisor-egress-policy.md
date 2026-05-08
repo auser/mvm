@@ -135,11 +135,13 @@ is small but the IP-pin/iptables-update plumbing has corner cases
    destinations; doing L7 without DNS pinning leaves SNI-equal-IP
    gaps. Land them together.
 
-5. **Cross-platform discipline (cross-cutting "D: iptables/proxy
-   dispatch lives in Lima on macOS").** L3 already follows this:
+5. **Cross-platform discipline (cross-cutting: "iptables/proxy
+   dispatch runs on the Linux host or inside the guest, never on
+   the macOS host").** L3 already follows this:
    `apply_network_policy` calls `run_in_vm_visible` which dispatches
-   through `shell::run_in_vm` on macOS and runs natively on Linux.
-   L7 + DNS-pinning when added must follow the same pattern.
+   through `shell::run_in_vm` on macOS (executing inside the
+   microsandbox-managed guest per ADR-013) and runs natively on
+   Linux. L7 + DNS-pinning when added must follow the same pattern.
 
 6. **Per-template default policy is an ergonomic follow-up.**
    Today policies are passed per-invocation. Baking a default into
