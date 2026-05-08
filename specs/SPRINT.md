@@ -856,6 +856,51 @@ B1–B18 in Plan 45 §"Out of scope (v1)" — buckets-as-separate-primitive, cro
 
 Plan 45 Phase 11 (live KVM smoke fixture) deferred to its own plan 58 — needs a KVM-capable host that no longer fits in a software-only PR. Plan 58 captures the six scenarios (single-VM round-trip, persistence, multi-attach, RO enforcement, scope isolation, Nix-path denial) so the work isn't lost when Sprint 49 closes. (Numbered 58 because plan 46 was already taken by the metering-API work merged in #89.)
 
+## Sprint 50 — mvm migration: Phase 0 (foundation + facade preservation) — IN FLIGHT  [`plans/60-mvm-microsandbox-migration.md`](plans/60-mvm-microsandbox-migration.md)
+
+**Status (2026-05-07):** Phase 0 of a 12-16 week migration that pivots `mvm-runtime` to microsandbox + libkrun + microvm.nix while keeping mvmd's `mvmctl` facade contract intact. Full plan in [`plans/60-mvm-microsandbox-migration.md`](plans/60-mvm-microsandbox-migration.md). The plan is checkpointed into 11 phases (0, 1, 2, 3, 4, 5, 6, 7, 7a, 7b, 8, 9, 10) — each with explicit exit tests, ADR coverage, sprint rotation, and a demo gate.
+
+**Branch:** `feat/micro` (moves to `feat/migrate-to-mvm` once Phase 0 settles).
+
+### Why this sprint, why now
+
+The current `mvm-runtime` is a 5-crate, ~520-LOC skeleton; the previous iteration at `../mvm` is a mature 13-crate stack. The user wants a clean cut to a microsandbox-first build/exec model with feature parity, multi-language SDKs (Rust + Python + TypeScript), encryption-everywhere, attestation-everywhere, audit-everywhere, and a hosted-cloud-ready posture. mvmd depends on the `mvmctl` facade, which we cannot break — Phase 0 protects that contract before any other work.
+
+### Phase 0 exit criteria
+
+- [ ] Plan saved to `specs/plans/60-mvm-microsandbox-migration.md`
+- [ ] Sprint 50 documented here in SPRINT.md (this section)
+- [ ] Phase-0 ADRs stubbed: 013 (microsandbox pivot), 014 (VmBackend trait), 027 (iroh encryption layering), 031 (cross-platform strategy), 032 (hosted-cloud invariants), 033 (code-quality enforcement), 035 (feature flag taxonomy)
+- [ ] Compliance doc stubs: `specs/compliance/{soc2-controls,pci-scope,hipaa-mapping,gdpr-mapping}.md`
+- [ ] Root `Cargo.toml` workspace block rewritten with full crate list + feature flags + workspace lints (`too_many_arguments = "deny"`)
+- [ ] `mvm-core`, `mvm-storage`, `mvm-plan`, `mvm-policy`, `mvm-security` copied verbatim from `../mvm/crates/`
+- [ ] `src/lib.rs` mirrors `../mvm/src/lib.rs` (the facade re-exports)
+- [ ] `mvm-backend/`, `mvm-builder/`, `mvm-providers/` skeletons removed
+- [ ] CI matrix expanded to Linux/macOS/Windows runners
+- [ ] `xtask check-adr-coverage` wired into CI
+- [ ] **mvmd contract gate**: `cd ../mvmd && cargo build --workspace` is green against the new mvm
+
+### Wave plan (each wave is a checkpoint)
+
+- **W0.1** — metadata + ADR stubs + compliance stubs (this PR; doc-only) ⏳ in-flight
+- **W0.2** — workspace reshape + crate copies (preserve facade)
+- **W0.3** — CI matrix expansion + ADR-coverage lint
+- **W0.4** — mvmd contract gate verification
+
+### Cornerstones
+
+- Facade preservation is the single load-bearing constraint of Phase 0
+- ADR coverage is enforced in CI from the start (no architectural drift without an ADR)
+- Cross-platform CI matrix (Linux + macOS + Windows) lands now so Phase 7b's TypeScript SDK + computer-use don't surprise us
+
+### Non-goals (explicit)
+
+- Microsandbox integration (Phase 1)
+- Encryption + key rotation (Phase 2)
+- Network isolation (Phase 3)
+- Any user-facing CLI surface beyond `--help`/`--version` (Phase 1+)
+- mvm-studio (Tauri) wiring (Phase 5)
+
 ## Completed Sprints
 
 - [01-foundation.md](sprints/01-foundation.md)
