@@ -65,15 +65,58 @@ nix build .#default
 
 | Field | Type | Purpose |
 |---|---|---|
-| `name` | `string` | A human-readable identifier for the image. |
-| `services` | `attrs` | Map of service name → `{ command, restart?, env? }`. Each service runs at boot under its own uid + seccomp tier. |
-| `packages` | `[pkg]` | Extra Nix packages to add to the rootfs closure. |
-| `hypervisor` | `string` (optional) | Override the default hypervisor (`firecracker` on Linux, `microsandbox` elsewhere). |
-| `extraFiles` | `attrs` (optional) | Map of in-guest path → host source path or contents. |
+| `name` | `string` | Human-readable identifier; baked into the rootfs at `/etc/mvm/name`. |
+| `entrypoint` | `attrs` | The boot-time workload. Exactly one of three forms (see below). |
+| `services` | `attrs` (optional) | Auxiliary supervised services. Same shape as `entrypoint.services`. |
+| `packages` | `[pkg]` (optional) | Extra Nix packages added to the rootfs closure. |
+| `hypervisor` | `string` (optional) | Override the default (`firecracker`). |
+| `vcpus`, `memory_mib` | `int` (optional) | Resource defaults; `mvm.toml` overrides at run time. |
+| `dev` | `bool` (optional) | Explicit accessible-vs-sealed override. Inferred from entrypoint by default. |
+| `extraFiles` | `attrs` (optional) | `{ "/abs/path" = { content; mode?; }; }` baked into the rootfs at build time. |
+
+## Entrypoint forms
+
+`entrypoint` declares **exactly one** of:
+
+```nix
+# Form 1 — interactive PTY shell (accessible image, dev-friendly)
+entrypoint.shell = "/bin/bash";
+
+# Form 2 — single sealed program (production default)
+entrypoint.command = [ "/usr/local/bin/serve" "--port" "8080" ];
+
+# Form 3 — supervised multi-service
+entrypoint.services = {
+  web    = { command = [ "/bin/web" ]; };
+  worker = { command = [ "/bin/worker" ]; restart = "always"; };
+};
+```
+
+## Sealed vs accessible — the same flake works for both
+
+The mvm builder transparently determines whether the resulting image is **sealed** (production — no console attach) or **accessible** (dev — `mvmctl console <vm>` opens an interactive PTY over vsock). The decision is encoded in `passthru.mvm.{accessible, sealed, entrypointKind}` on the resulting derivation, and `mvmctl` reads that metadata to gate the `console` subcommand.
+
+The default inference:
+
+| Entrypoint form | Default mode |
+|---|---|
+| `entrypoint.shell = …` | **accessible** (`dev = true`) |
+| `entrypoint.command = …` | **sealed** (`dev = false`) |
+| `entrypoint.services = …` | **sealed** (`dev = false`) |
+
+Override either way with the explicit `dev` field:
+
+```nix
+# A shell entrypoint that's still sealed (no console attach allowed)
+mkGuest { entrypoint.shell = "/bin/bash"; dev = false; ... }
+
+# A command entrypoint that's accessible for debugging
+mkGuest { entrypoint.command = [ "..." ]; dev = true; ... }
+```
+
+The same flake source is consumed in **both** dev and production builds — there's no separate "dev flake" the user has to maintain. The difference is purely in the resulting image's metadata + the host-side `console` gate.
 
 The `mkGuest` library composes microvm.nix's `microvm` NixOS module with mvm's security overlay (per-service uids, seccomp tier, dm-verity, read-only `/etc`). You don't see those layers in your flake — they're applied automatically.
-
-> **Note (Phase 1):** the `mkGuest` library is being ported from the previous iteration of mvm in Phase 1 W5+. Until that wave lands, calling `mkGuest` emits a clear error message pointing you at the microvm.nix module directly. The user-facing flake shape above is final and won't change when the implementation fills in.
 
 ## What's inside the mvm repository (and why you don't touch it)
 

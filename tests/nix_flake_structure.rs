@@ -109,6 +109,79 @@ fn minimal_profile_exists_and_has_required_settings() {
     );
 }
 
+/// Optional: shell out to `nix eval` against `nix/tests/mk-guest-eval.nix`
+/// and assert every check returns true. Skipped silently when `nix`
+/// isn't on PATH (most macOS dev hosts) so this test stays cheap on
+/// every PR; CI runners with Nix exercise the real eval.
+///
+/// This is the strongest guard we have on the user-facing
+/// `lib.<system>.mkGuest` surface — it actually invokes the function
+/// with each of the three entrypoint shapes (`shell` / `command` /
+/// `services`) plus the explicit `dev` overrides, and asserts the
+/// `passthru.mvm.{accessible, sealed, entrypointKind}` metadata is
+/// inferred correctly.
+#[test]
+fn mk_guest_eval_assertions_all_pass_when_nix_available() {
+    use std::process::Command;
+
+    // Skip when nix isn't on PATH. Cheap precondition — a single
+    // process spawn per skipped test.
+    let nix_check = Command::new("nix").arg("--version").output();
+    if nix_check.is_err() {
+        eprintln!(
+            "[nix_flake_structure::mk_guest_eval] skipped — `nix` not on PATH"
+        );
+        return;
+    }
+
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .expect("CARGO_MANIFEST_DIR is set by cargo for integration tests");
+    let eval_file = std::path::PathBuf::from(&manifest)
+        .join("nix")
+        .join("tests")
+        .join("mk-guest-eval.nix");
+
+    let out = Command::new("nix")
+        .arg("--extra-experimental-features")
+        .arg("nix-command flakes")
+        .arg("eval")
+        .arg("--json")
+        .arg("--file")
+        .arg(&eval_file)
+        .output()
+        .expect("nix eval invocation");
+
+    assert!(
+        out.status.success(),
+        "nix eval failed:\nstdout: {}\nstderr: {}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // The eval file returns an attribute set of named boolean
+    // assertions. Parse the JSON and verify every value is `true`.
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let json: serde_json::Value = serde_json::from_str(&stdout)
+        .unwrap_or_else(|e| panic!("nix eval output isn't JSON: {e}\nstdout: {stdout}"));
+    let obj = json
+        .as_object()
+        .expect("mk-guest-eval.nix must return an attribute set");
+
+    let mut failures: Vec<String> = Vec::new();
+    for (name, value) in obj {
+        match value.as_bool() {
+            Some(true) => { /* ok */ }
+            Some(false) => failures.push(format!("{name} = false")),
+            None => failures.push(format!("{name} not a bool")),
+        }
+    }
+    assert!(
+        failures.is_empty(),
+        "mkGuest eval assertions failed: {}\nFull output: {stdout}",
+        failures.join(", ")
+    );
+}
+
 #[test]
 fn flake_lock_pins_microvm_input_by_hash() {
     // The flake.lock must exist and pin the microvm.nix input by

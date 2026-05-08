@@ -1,0 +1,76 @@
+# Pure-Nix evaluation tests for mkGuest. Run via:
+#
+#   cd nix && nix --extra-experimental-features 'nix-command flakes' \
+#     eval --file tests/mk-guest-eval.nix
+#
+# Validates the user-facing surface of `lib.<system>.mkGuest` without
+# actually building anything (no kernel compile, no rootfs). Fast
+# enough to run on every PR; the corresponding Rust test in
+# `tests/nix_flake_structure.rs` shells out to this file when nix is
+# on PATH (gated; skipped otherwise).
+
+let
+  flake = builtins.getFlake (toString ./..);
+  system = "x86_64-linux";
+  mkGuest = flake.lib.${system}.mkGuest;
+
+  # ── 1. shell entrypoint → accessible mode inferred ────────────
+  shellGuest = mkGuest {
+    name = "shell-test";
+    entrypoint.shell = "/bin/bash";
+  };
+
+  # ── 2. command entrypoint → sealed mode inferred ──────────────
+  commandGuest = mkGuest {
+    name = "command-test";
+    entrypoint.command = [ "/usr/local/bin/serve" ];
+  };
+
+  # ── 3. services entrypoint → sealed mode inferred ─────────────
+  servicesGuest = mkGuest {
+    name = "services-test";
+    entrypoint.services = {
+      web = { command = [ "/bin/web" ]; };
+      worker = { command = [ "/bin/worker" ]; };
+    };
+  };
+
+  # ── 4. shell + dev=false → user override sealed ───────────────
+  shellSealedGuest = mkGuest {
+    name = "shell-sealed-test";
+    entrypoint.shell = "/bin/bash";
+    dev = false;
+  };
+
+  # ── 5. command + dev=true → user override accessible ──────────
+  commandAccessibleGuest = mkGuest {
+    name = "command-accessible-test";
+    entrypoint.command = [ "/bin/x" ];
+    dev = true;
+  };
+
+  meta = drv: drv.passthru.mvm;
+in
+{
+  shell_default_accessible = (meta shellGuest).accessible == true
+    && (meta shellGuest).sealed == false
+    && (meta shellGuest).entrypointKind == "shell";
+
+  command_default_sealed = (meta commandGuest).accessible == false
+    && (meta commandGuest).sealed == true
+    && (meta commandGuest).entrypointKind == "command";
+
+  services_default_sealed = (meta servicesGuest).accessible == false
+    && (meta servicesGuest).sealed == true
+    && (meta servicesGuest).entrypointKind == "services";
+
+  shell_with_dev_false_is_sealed = (meta shellSealedGuest).accessible == false
+    && (meta shellSealedGuest).sealed == true;
+
+  command_with_dev_true_is_accessible = (meta commandAccessibleGuest).accessible == true
+    && (meta commandAccessibleGuest).sealed == false;
+
+  # Name + hypervisor metadata propagation
+  metadata_propagates = (meta shellGuest).name == "shell-test"
+    && (meta shellGuest).hypervisor == "firecracker";
+}

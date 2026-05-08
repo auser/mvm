@@ -899,11 +899,12 @@ The current `mvm-runtime` is a 5-crate, ~520-LOC skeleton; the previous iteratio
 - **W2** ✅ — `auto_select()` priority slots Microsandbox at #2 (cross-platform default per ADR-013); `Platform::has_microsandbox()`; docs site migrated; `tailwind.css` + `custom.css` refactored to token-based light+dark mode (no hardcoded colors except the macOS-Aqua terminal-dot trio); ADR-013 docs page (`3438a24`, `6261bc4`)
 - **W3** ✅ — `tests/smoke_microsandbox.rs` with `MVM_LIVE_SMOKE=1` gate; live test exercises start/stop/alias bridge against a real `mkfs.ext4` fixture; sanity test always runs (`0668c60`)
 - **W4** ✅ — `nix/flake.nix` imports microvm.nix; `nix/profiles/minimal.nix`; `nix flake check --no-build` clean; 3 structural tests guard the flake's shape; "Building MicroVM Images" docs page (`5a9b765`)
+- **W4-fix** ✅ — reframe: flake is a library, users keep their own `flake.nix` + `mvm.toml`; `lib.<system>.mkGuest` placeholder; internal fixtures renamed `internal-minimal-*`; docs rewritten user-flake-centric (`c323140`)
+- **W5** ✅ — real `mkGuest` in `nix/lib/mk-guest.nix` + `nix/lib/default.nix`. Three entrypoint forms (`shell` / `command` / `services`) with sealed-vs-accessible auto-inferred from form (or explicit `dev` override). Same flake works for both modes — the builder writes `passthru.mvm.{accessible, sealed, entrypointKind}` and `/etc/mvm/variant` so `mvmctl console` can gate. `nix/tests/mk-guest-eval.nix` validates the inference (6 assertions, all true via `nix eval`). Rust shell-out test runs the eval when nix is on PATH; skips silently otherwise.
 
 **Up next:**
 
-- **W5** — guest-agent service unit + entrypoint supervisor in the minimal profile (port from `../mvm/crates/mvm-guest`)
-- **W6** — first end-to-end boot smoke (gated by Linux+KVM): `nix build .#minimal-runner` → `mvmctl run --hypervisor microsandbox` → guest agent answers over vsock
+- **W6** — first end-to-end boot smoke (gated by Linux+KVM): user-side flake calling `mvm.lib.x86_64-linux.mkGuest` → `nix build` → `mvmctl run` → guest agent answers over vsock; `mvmctl console` attaches when accessible
 - **Phase 1 close-out** — demo run + checkpoint review
 
 ### Cornerstones

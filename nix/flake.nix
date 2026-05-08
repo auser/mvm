@@ -98,54 +98,10 @@
 
       # ── Library output (USER-FACING) ─────────────────────────────
       #
-      # This is what user flakes consume. Right now it exposes one
-      # symbol — `mkGuest` — as a placeholder pointing at where the
-      # full library port from the previous iteration will land
-      # (Phase 1 W5+). User flakes can already import the surface
-      # so their flake.nix's don't need to change when the
-      # implementation fills in.
-      mkLib = system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-        in
-        {
-          # mkGuest { name, services?, packages?, hypervisor?, … }
-          #   → a derivation producing a microVM rootfs + runner.
-          #
-          # Phase 1 W5+ ports the real implementation from
-          # `../mvm/nix/flake.nix::mkGuestFn`. Until then, calling
-          # mkGuest emits a clear error pointing users at the
-          # microvm.nix path so they aren't blocked.
-          mkGuest = _args:
-            throw ''
-              mvm.lib.${system}.mkGuest is not yet implemented in this
-              iteration of mvm. Until Phase 1 W5 lands the port from
-              the previous iteration's nix/lib/factories/, write your
-              flake using the microvm.nix NixOS module directly:
-
-                {
-                  inputs.microvm.url = "github:microvm-nix/microvm.nix";
-                  outputs = { self, nixpkgs, microvm, ... }: {
-                    nixosConfigurations.my-app = nixpkgs.lib.nixosSystem {
-                      system = "${system}";
-                      modules = [
-                        microvm.nixosModules.microvm
-                        ({
-                          microvm.hypervisor = "firecracker";
-                          # … your config …
-                        })
-                      ];
-                    };
-                  };
-                }
-
-              `mvmctl build` reads your project's `mvm.toml` to find
-              the flake reference and runs `nix build` against it.
-              See: https://gomicrovm.com/guides/building-microvm-images/
-
-              Tracked in plan 60 / specs/SPRINT.md Sprint 50 W5.
-            '';
-        };
+      # User flakes consume this as `inputs.mvm.lib.<system>.mkGuest`
+      # to declare a microVM image. Implementation lives under
+      # `./lib/`; the entry point is `./lib/default.nix`.
+      libFor = import ./lib { inherit nixpkgs microvm; };
     in
     {
       # ── User-facing: lib.<system>.mkGuest ────────────────────────
@@ -153,7 +109,7 @@
       # User flakes import this as `inputs.mvm.lib.<system>.mkGuest`
       # to declare a microVM image. The shape is intentionally stable
       # so user flakes don't churn when the implementation evolves.
-      lib = forAllSystems mkLib;
+      lib = forAllSystems (system: libFor { inherit system; });
 
       # ── Internal: nixosConfigurations.minimal ────────────────────
       #
