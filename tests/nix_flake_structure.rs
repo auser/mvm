@@ -46,16 +46,30 @@ fn flake_nix_exists_and_imports_microvm_nix() {
     assert!(
         content.contains("nixosConfigurations"),
         "nix/flake.nix must declare nixosConfigurations to expose the \
-         microvm.nix-built profiles"
+         microvm.nix-built test fixtures"
     );
 
-    // microvm.declaredRunner is the top-level runner the docs point
-    // users at. Its presence is a documentation contract (see
-    // `public/src/content/docs/guides/building-microvm-images.md`).
+    // The user-facing library output. User flakes consume
+    // `mvm.lib.<system>.mkGuest`; if that path stops being exposed,
+    // every user project breaks at next nix evaluation. Guarding it
+    // here means a refactor of the flake can't accidentally drop
+    // the user contract.
     assert!(
-        content.contains("declaredRunner"),
-        "nix/flake.nix must expose microvm.declaredRunner so the docs' \
-         build command works as documented"
+        content.contains("lib") && content.contains("mkGuest"),
+        "nix/flake.nix must expose lib.<system>.mkGuest as the \
+         user-facing API (per ADR-013 + plan 60). Got: ...{}",
+        &content[..content.len().min(200)]
+    );
+
+    // Internal-prefix convention: test fixtures live under
+    // `internal-*` so the boundary between user-facing and mvm-
+    // internal is mechanical. A regression that exposes a fixture
+    // under a bare name (without the prefix) is a UX-leak waiting
+    // to happen.
+    assert!(
+        content.contains("internal-minimal"),
+        "nix/flake.nix must expose internal fixtures under the \
+         internal-* namespace; bare names suggest user-facing API"
     );
 }
 

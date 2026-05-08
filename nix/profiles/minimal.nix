@@ -1,10 +1,16 @@
-# Minimal profile — the smallest viable microVM image (plan 60 W4).
+# Internal test fixture — NOT a user-facing template.
 #
-# Goal: a rootfs that boots, has a working init + shell, and exposes
-# nothing else. This is the baseline for the smoke test (Phase 1 W3
-# upgrades to use this image once it's buildable on the test host) and
-# the foundation every other profile (`worker`, `ai-sandbox`,
-# `safe-openclaw`, `computer-use`, `repl`) builds on.
+# This profile exists so mvm's own smoke tests can boot something
+# (`tests/smoke_microsandbox.rs`, `tests/nix_flake_structure.rs`).
+# It is **not** a starter for user projects. User flakes use
+# `mvm.lib.<system>.mkGuest { … }` to declare a microVM image —
+# see `public/src/content/docs/guides/building-microvm-images.md`
+# for the user-facing surface.
+#
+# The flake exposes this configuration under
+# `nixosConfigurations.internal-minimal-<system>` so the namespace
+# encodes the boundary: anything prefixed `internal-` is mvm-private
+# tooling, not part of the public API.
 #
 # Security overlay placeholders documented inline — they land in
 # Phase 6 as the security port from `../mvm/crates/mvm-security` /
