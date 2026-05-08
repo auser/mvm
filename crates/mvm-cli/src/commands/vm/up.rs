@@ -404,7 +404,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                         && let (Ok(h), Ok(g)) = (host.parse::<u16>(), guest.parse::<u16>())
                     {
                         let _ = request_port_forward(&vm_name, g);
-                        mvm_apple_container::start_port_proxy(&vm_name, h, g);
+                        mvm_providers::apple_container::start_port_proxy(&vm_name, h, g);
                         ui::info(&format!("Forwarding localhost:{h} → guest tcp/{g} (vsock)"));
                     }
                 }
@@ -743,7 +743,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         if detach && effective_hypervisor == "apple-container" {
             // Sign the binary before installing the launchd agent so the
             // daemon process launches with the entitlement already in place.
-            mvm_apple_container::ensure_signed();
+            mvm_providers::apple_container::ensure_signed();
 
             // Build is already done — install launchd agent with the
             // resolved kernel/rootfs paths (no rebuild in the daemon).
@@ -754,7 +754,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 .map(|p| format!("{}:{}", p.host, p.guest))
                 .collect();
 
-            mvm_apple_container::install_launchd_direct(
+            mvm_providers::apple_container::install_launchd_direct(
                 &start_config.name,
                 start_config.kernel_path.as_deref().unwrap_or(""),
                 &start_config.rootfs_path,
@@ -810,7 +810,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
                 // Start host-side proxies
                 for pm in &pm_list {
-                    mvm_apple_container::start_port_proxy(&vm_name_owned, pm.host, pm.guest);
+                    mvm_providers::apple_container::start_port_proxy(&vm_name_owned, pm.host, pm.guest);
                     ui::info(&format!(
                         "Forwarding localhost:{} → guest tcp/{} (vsock)",
                         pm.host, pm.guest

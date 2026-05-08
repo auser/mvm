@@ -565,3 +565,32 @@ Keep `0047-provider-architecture.md` in `mvmd` as the canonical provider runtime
 `mvm` speaks to providers.
 
 `mvmd` owns providers.
+
+## Disambiguation: two layers, both called "providers"
+
+The mvm tree has *two* concerns that share the word "provider":
+
+1. **Public Provider** (this ADR) — user-facing identity selectable from
+   the CLI: `linux`, `mlx`, eventually `firecracker`, `apple-vz`, etc.
+   Owned by `mvmd` (per the canonical ADR `0047-provider-architecture.md`
+   in mvmd). `mvm` only speaks the contract.
+
+2. **Internal `mvm-providers` crate** — the FFI / SDK shim layer that
+   wraps low-level virtualization frameworks. Today it contains:
+   - `mvm_providers::libkrun`        — Red Hat libkrun C library bindings
+   - `mvm_providers::apple_container` — Apple Virtualization.framework
+     via objc2 + Swift bridge
+
+   Future modules: `cloud_hypervisor`, `windows_wfp`, etc. This crate
+   is consumed by `mvm-backend` (the `VmBackend` impls), which is
+   consumed by `mvm-runtime` (lifecycle orchestration).
+
+The two share a name but address different layers. Public Providers
+are what end users select; the internal `mvm-providers` crate is
+how mvm-backend reaches the underlying VMM. A user typing
+`mvm run --provider linux` resolves to whichever internal backend
+the host can run; the FFI shim layer is an implementation detail.
+
+This ADR's body remains unchanged — it is still the contract for the
+public Provider concept. The internal crate's purpose is documented
+in its own README + lib.rs module docs.

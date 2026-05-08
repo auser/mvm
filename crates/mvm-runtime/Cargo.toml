@@ -31,6 +31,5 @@ toml.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 microsandbox.workspace = true
-mvm-apple-container.workspace = true
-mvm-libkrun.workspace = true
+mvm-providers.workspace = true
 libc.workspace = true

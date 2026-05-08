@@ -46,10 +46,10 @@ impl VmBackend for LibkrunBackend {
     }
 
     fn start(&self, config: &VmStartConfig) -> Result<VmId> {
-        if !mvm_libkrun::is_available() {
+        if !mvm_providers::libkrun::is_available() {
             anyhow::bail!(
                 "libkrun is not installed on this host.\n  {}",
-                mvm_libkrun::install_hint()
+                mvm_providers::libkrun::install_hint()
             );
         }
 
@@ -58,7 +58,7 @@ impl VmBackend for LibkrunBackend {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("libkrun backend requires a kernel path"))?;
 
-        let ctx = mvm_libkrun::KrunContext::new(&config.name, kernel, &config.rootfs_path)
+        let ctx = mvm_providers::libkrun::KrunContext::new(&config.name, kernel, &config.rootfs_path)
             .with_resources(
                 u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX),
                 config.memory_mib,
@@ -70,13 +70,13 @@ impl VmBackend for LibkrunBackend {
             config.name, ctx.vcpus, ctx.ram_mib
         ));
 
-        mvm_libkrun::start(&ctx).map_err(|e| anyhow::anyhow!("libkrun start: {e}"))?;
+        mvm_providers::libkrun::start(&ctx).map_err(|e| anyhow::anyhow!("libkrun start: {e}"))?;
         ui::success(&format!("libkrun VM '{}' started.", config.name));
         Ok(VmId(config.name.clone()))
     }
 
     fn stop(&self, id: &VmId) -> Result<()> {
-        mvm_libkrun::stop(&id.0).map_err(|e| anyhow::anyhow!("libkrun stop: {e}"))
+        mvm_providers::libkrun::stop(&id.0).map_err(|e| anyhow::anyhow!("libkrun stop: {e}"))
     }
 
     fn stop_all(&self) -> Result<()> {
@@ -101,13 +101,13 @@ impl VmBackend for LibkrunBackend {
     }
 
     fn is_available(&self) -> Result<bool> {
-        Ok(mvm_libkrun::is_available())
+        Ok(mvm_providers::libkrun::is_available())
     }
 
     fn install(&self) -> Result<()> {
         ui::info(&format!(
             "libkrun must be installed via the host's package manager.\n  {}",
-            mvm_libkrun::install_hint()
+            mvm_providers::libkrun::install_hint()
         ));
         Ok(())
     }
@@ -186,9 +186,9 @@ mod tests {
         // The install() method is informational on every host — it shells
         // out to ui::info instead of attempting to install. The check is
         // just that we can call it without panicking; the actual hint
-        // copy lives in mvm_libkrun::install_hint().
+        // copy lives in mvm_providers::libkrun::install_hint().
         LibkrunBackend.install().expect("install hint never errors");
-        let hint = mvm_libkrun::install_hint();
+        let hint = mvm_providers::libkrun::install_hint();
         assert!(!hint.is_empty());
     }
 

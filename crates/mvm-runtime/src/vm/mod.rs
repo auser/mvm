@@ -1,4 +1,9 @@
-// Dev mode
+// Backend impls — the concrete `VmBackend` implementations live
+// here for now; plan-60 W6 schedules the move into mvm-backend
+// once the config/shell/ui dependency-cycle is unwound. The
+// `mvm-backend` crate exists today as a thin re-export facade so
+// new consumers can use the stable path.
+
 pub mod apple_container;
 pub mod backend;
 pub mod cow;

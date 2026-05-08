@@ -3746,17 +3746,11 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
-name = "mvm-apple-container"
-version = "0.7.1"
+name = "mvm-backend"
+version = "0.13.0"
 dependencies = [
- "block2",
- "dispatch2",
- "libc",
- "objc2",
- "objc2-foundation",
- "objc2-virtualization",
+ "mvm-runtime",
  "tempfile",
- "tracing",
 ]
 
 [[package]]
@@ -3789,12 +3783,12 @@ dependencies = [
  "indicatif",
  "inquire",
  "libc",
- "mvm-apple-container",
+ "mvm-backend",
  "mvm-build",
  "mvm-core",
  "mvm-guest",
- "mvm-libkrun",
  "mvm-mcp",
+ "mvm-providers",
  "mvm-runtime",
  "mvm-security",
  "names",
@@ -3821,7 +3815,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "fs2",
- "mvm-libkrun",
+ "mvm-providers",
  "regex",
  "serde",
  "serde_json",
@@ -3851,14 +3845,6 @@ dependencies = [
  "serde",
  "serde_json",
  "tempfile",
- "tracing",
-]
-
-[[package]]
-name = "mvm-libkrun"
-version = "0.1.0"
-dependencies = [
- "libc",
  "tracing",
 ]
 
@@ -3901,6 +3887,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-providers"
+version = "0.13.0"
+dependencies = [
+ "block2",
+ "dispatch2",
+ "libc",
+ "objc2",
+ "objc2-foundation",
+ "objc2-virtualization",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "mvm-runtime"
 version = "0.13.0"
 dependencies = [
@@ -3912,11 +3912,10 @@ dependencies = [
  "inquire",
  "libc",
  "microsandbox",
- "mvm-apple-container",
  "mvm-build",
  "mvm-core",
  "mvm-guest",
- "mvm-libkrun",
+ "mvm-providers",
  "mvm-security",
  "opendal",
  "rand 0.8.6",

@@ -1,21 +1,35 @@
 [package]
-name = "mvm-apple-container"
-version = "0.7.1"
-edition = "2024"
-description = "Apple Virtualization.framework backend for mvm"
-license = "Apache-2.0"
-# Only builds on macOS with Apple Silicon
-# On other platforms, this crate compiles as a no-op stub
+name = "mvm-providers"
+version.workspace = true
+edition.workspace = true
+description = "Virtualization-framework primitives for mvm — libkrun bindings, Apple VZ FFI"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+# ── What this crate is ─────────────────────────────────────────────
+#
+# The internal FFI / SDK shim layer between mvm-backend (which
+# implements `VmBackend`) and the underlying virtualization frameworks.
+# Each module wraps one framework:
+#
+#   libkrun         — Red Hat libkrun C library (Linux KVM + macOS HVF)
+#   apple_container — Apple Virtualization.framework via objc2 + Swift
+#
+# Future modules: cloud_hypervisor (FFI shim), windows_wfp, etc.
+#
+# This is NOT the user-facing "Provider" concept from ADR-012 — that
+# concept (linux/mlx as user-selectable execution targets) lives in
+# mvmd. The two share a name but address different layers; ADR-012
+# carries the disambiguation note.
 
 [dependencies]
 tracing = "0.1"
+libc.workspace = true
 
-[dependencies.libc]
-version = "0.2"
-
-[dev-dependencies]
-tempfile = "3"
-
+# Apple VZ (macOS only) — objc2 bindings + Swift bridge.
 [target.'cfg(target_os = "macos")'.dependencies]
 block2 = "0.6"
 dispatch2 = "0.3"
@@ -48,9 +62,7 @@ objc2-virtualization = { version = "0.3", features = [
     "VZVirtioSocketDevice",
     "VZVirtioSocketDeviceConfiguration",
     "VZVirtioSocketConnection",
-    "VZDirectorySharingDeviceConfiguration",
-    "VZVirtioFileSystemDeviceConfiguration",
-    "VZDirectoryShare",
-    "VZSingleDirectoryShare",
-    "VZSharedDirectory",
 ] }
+
+[dev-dependencies]
+tempfile = "3"

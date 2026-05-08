@@ -1,0 +1,29 @@
+[package]
+name = "mvm-backend"
+version.workspace = true
+edition.workspace = true
+description = "VmBackend implementations for mvm — Firecracker, microsandbox, libkrun, Apple Container, Docker"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+# ── What this crate owns ───────────────────────────────────────────
+#
+# Every concrete `VmBackend` impl. The trait + types live in
+# `mvm-core::vm_backend`; concrete implementations + the
+# `AnyBackend` dispatch enum live here.
+#
+# Backends call into `mvm-providers` for FFI primitives (libkrun
+# bindings, Apple VZ glue) — that's the layer below us.
+# `mvm-runtime` consumes us through `AnyBackend` for VM lifecycle
+# orchestration.
+
+# Today this crate is a thin re-export of the dispatch types.
+# Full extraction (the impls themselves) lands in plan-60 W6 once
+# the config/shell/ui dependency-cycle is unwound.
+[dependencies]
+mvm-runtime.workspace = true
+
+[dev-dependencies]
+tempfile.workspace = true

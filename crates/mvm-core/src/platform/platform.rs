@@ -68,7 +68,7 @@ impl Platform {
         if matches!(self, Platform::Windows) {
             return false;
         }
-        mvm_libkrun::is_available()
+        mvm_providers::libkrun::is_available()
     }
 
     /// Whether the bundled microsandbox runtime is usable on this
@@ -294,7 +294,7 @@ mod tests {
     #[test]
     fn test_has_libkrun_returns_false_on_windows_regardless_of_filesystem() {
         // Windows: libkrun has no Windows port. Always false irrespective
-        // of what `mvm_libkrun::is_available()` would say.
+        // of what `mvm_providers::libkrun::is_available()` would say.
         assert!(!Platform::Windows.has_libkrun());
     }
 
@@ -304,7 +304,7 @@ mod tests {
         // libkrun crate's authoritative is_available() probe.
         let plat = current();
         if !matches!(plat, Platform::Windows) {
-            assert_eq!(plat.has_libkrun(), mvm_libkrun::is_available());
+            assert_eq!(plat.has_libkrun(), mvm_providers::libkrun::is_available());
         }
     }
 

@@ -6,13 +6,13 @@ members = [
     "crates/mvm-plan",
     "crates/mvm-policy",
     "crates/mvm-supervisor",
+    "crates/mvm-providers",
+    "crates/mvm-backend",
     "crates/mvm-runtime",
     "crates/mvm-build",
     "crates/mvm-guest",
     "crates/mvm-cli",
     "crates/mvm-mcp",
-    "crates/mvm-apple-container",
-    "crates/mvm-libkrun",
     "xtask",
 ]
 # cargo-fuzz crates have to be excluded from the main workspace because
@@ -118,8 +118,8 @@ mvm-policy = { path = "crates/mvm-policy", version = "0.13.0" }
 mvm-supervisor = { path = "crates/mvm-supervisor", version = "0.13.0" }
 mvm-cli = { path = "crates/mvm-cli", version = "0.13.0" }
 mvm-mcp = { path = "crates/mvm-mcp", version = "0.13.0" }
-mvm-apple-container = { path = "crates/mvm-apple-container", version = "0.7.0" }
-mvm-libkrun = { path = "crates/mvm-libkrun", version = "0.1.0" }
+mvm-providers = { path = "crates/mvm-providers", version = "0.13.0" }
+mvm-backend = { path = "crates/mvm-backend", version = "0.13.0" }
 
 # Dev dependencies
 assert_cmd = "2"
