@@ -1,10 +1,27 @@
 [workspace]
 members = [
-  "crates/mvm-builder",
-  "crates/mvm-cli",
-  "crates/mvm-core",
-  "crates/mvm-backend",
-  "crates/mvm-providers",
+    "crates/mvm-core",
+    "crates/mvm-security",
+    "crates/mvm-storage",
+    "crates/mvm-plan",
+    "crates/mvm-policy",
+    "crates/mvm-supervisor",
+    "crates/mvm-runtime",
+    "crates/mvm-build",
+    "crates/mvm-guest",
+    "crates/mvm-cli",
+    "crates/mvm-mcp",
+    "crates/mvm-apple-container",
+    "crates/mvm-libkrun",
+    "xtask",
+]
+# cargo-fuzz crates have to be excluded from the main workspace because
+# they depend on libfuzzer-sys, which only builds under cargo-fuzz's
+# wrapper (it injects the right linker flags + sanitizer toolchain).
+# Plain `cargo build --workspace` would otherwise fail with linker
+# errors. ADR-002 §W4.2.
+exclude = [
+    "crates/mvm-guest/fuzz",
 ]
 resolver = "3"
 
@@ -16,35 +33,93 @@ license = "Apache-2.0"
 repository = "https://github.com/auser/mvm"
 homepage = "https://github.com/auser/mvm"
 authors = ["mvm contributors"]
-build = "build.rs"
 
 [workspace.dependencies]
-mvm-builder = { path = "crates/mvm-builder" }
-mvm-core = { path = "crates/mvm-core" }
-mvm-backend = { path = "crates/mvm-backend" }
-mvm-cli = { path = "crates/mvm-cli" }
-mvm-providers = { path = "crates/mvm-providers" }
+# Async runtime
+tokio = { version = "1", features = ["full"] }
 
+# Pattern matching
+aho-corasick = "1"
+regex = "1"
 
-anyhow = "1.0.102"
-clap = { version = "4.6.1", features = ["env", "derive"] }
-lazy_static = "1.5.0"
-nix = "0.31.2"
-serde = { version = "1.0.228", features = ["derive"] }
-shadow-rs = { version = "2.0.0", features = ["metadata"] }
-tempfile = "3.27.0"
-thiserror = "2.0.18"
-tokio = { version = "1.42", features = ["full"] }
-tokio-util = { version = "0.7", features = ["io"] }
+# Crypto
+base64 = "0.22"
+ed25519-dalek = { version = "2", features = ["rand_core"] }
+hmac = "0.12"
+rand = "0.8"
+sha2 = "0.10"
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+toml = "0.8"
+
+# CLI
+clap = { version = "4", features = ["derive"] }
+clap_complete = "4"
+clap_mangen = "0.2"
+colored = "3"
+indicatif = "0.17"
+inquire = "0.7"
+
+# Template engine
+tera = "1"
+
+# Object storage abstraction (used for dev template registry)
+opendal = { version = "0.50", features = ["services-s3"] }
+
+# Allocator
+mimalloc = "0.1"
+
+# HTTP client (for CLI upgrade)
+reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
+
+# Name generation
+names = { version = "0.14", default-features = false }
+
+# Signal handling
+ctrlc = "3.4"
+libc = "0.2"
+
+# Seccomp BPF compilation (W2.4 — per-service syscall filtering inside
+# guests, applied via the `mvm-seccomp-apply` shim before execve into
+# the service binary).
+seccompiler = "0.5"
+
+# File watching
+notify = "7"
+notify-debouncer-mini = "0.5"
+
+# Utilities
+anyhow = "1"
+chrono = { version = "0.4", features = ["serde"] }
+fs2 = "0.4"
+tempfile = "3"
 tracing = "0.1"
-tracing-subscriber = { version = "0.3", features = ["env-filter"] }
-microsandbox = "0.4.5"
-libc = "0.2.186"
-rand = "0.10.1"
-async-trait = "0.1.89"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+uuid = { version = "1", features = ["v4"] }
+which = "7"
 
+# Internal crates
+mvm-core = { path = "crates/mvm-core", version = "0.13.0" }
+mvm-guest = { path = "crates/mvm-guest", version = "0.13.0" }
+mvm-build = { path = "crates/mvm-build", version = "0.13.0" }
+mvm-runtime = { path = "crates/mvm-runtime", version = "0.13.0" }
+mvm-security = { path = "crates/mvm-security", version = "0.13.0" }
+mvm-storage = { path = "crates/mvm-storage", version = "0.13.0" }
+mvm-plan = { path = "crates/mvm-plan", version = "0.13.0" }
+mvm-policy = { path = "crates/mvm-policy", version = "0.13.0" }
+mvm-supervisor = { path = "crates/mvm-supervisor", version = "0.13.0" }
+mvm-cli = { path = "crates/mvm-cli", version = "0.13.0" }
+mvm-mcp = { path = "crates/mvm-mcp", version = "0.13.0" }
+mvm-apple-container = { path = "crates/mvm-apple-container", version = "0.7.0" }
+mvm-libkrun = { path = "crates/mvm-libkrun", version = "0.1.0" }
 
-# Package
+# Dev dependencies
+assert_cmd = "2"
+predicates = "3"
+
+# Root facade crate — re-exports all workspace libraries and provides the `mvmctl` binary
 [package]
 name = "mvmctl"
 version.workspace = true
@@ -60,38 +135,29 @@ authors.workspace = true
 name = "mvmctl"
 path = "src/lib.rs"
 
-# We'll see if we want to keep this
 [[bin]]
 name = "mvmctl"
 path = "src/main.rs"
 
-[[bin]]
-name = "mvm-builder"
-path = "crates/mvm-builder/bin/main.rs"
-
 [dependencies]
-anyhow = { workspace = true }
 mvm-core.workspace = true
-mvm-builder.workspace = true
+mvm-security.workspace = true
+mvm-runtime.workspace = true
+mvm-build.workspace = true
+mvm-guest.workspace = true
+mvm-cli.workspace = true
+anyhow.workspace = true
+mimalloc.workspace = true
 
-# [target.'cfg(target_os = "macos")'.dependencies]
-# keyring = { version = "3.6.3", features = ["apple-native"], optional = true }
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3", features = ["NSRunLoop", "NSDate", "NSAutoreleasePool"] }
 
-# [target.'cfg(target_os = "windows")'.dependencies]
-# keyring = { version = "3.6.3", features = ["windows-native"], optional = true }
-
-# [target.'cfg(target_os = "linux")'.dependencies]
-# # Transitive dep via keyring's Secret Service backend; declared here only to force the `vendored` feature
-# # so libdbus is built from source and statically linked (avoids needing libdbus-1-dev at build time).
-# dbus = { version = "0.9.10", features = ["vendored"], optional = true }
-# keyring = { version = "3.6.3", features = [
-#     "crypto-rust",
-#     "linux-native-sync-persistent",
-# ], optional = true }
-
-
-[build-dependencies]
-shadow-rs = { version = "2.0.0", features = ["no_std"] }
+[dev-dependencies]
+assert_cmd.workspace = true
+chrono.workspace = true
+predicates.workspace = true
+serde_json.workspace = true
+tempfile.workspace = true
 
 [profile.release]
 opt-level = 3

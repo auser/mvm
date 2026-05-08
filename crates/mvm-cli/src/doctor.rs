@@ -1,0 +1,1411 @@
+use anyhow::Result;
+use serde::Serialize;
+
+use crate::ui;
+use mvm_core::config::fc_version;
+use mvm_core::platform::{self, Platform};
+use mvm_core::vm_backend::ClaimStatus;
+use mvm_runtime::config::VM_NAME;
+use mvm_runtime::shell;
+use mvm_runtime::vm::backend::AnyBackend;
+use mvm_runtime::vm::lima;
+
+#[derive(Debug, Serialize)]
+struct Check {
+    name: &'static str,
+    category: &'static str,
+    ok: bool,
+    info: String,
+}
+
+/// JSON-serializable view of a backend's ADR-002 security profile,
+/// surfaced under `security_posture` in `mvmctl doctor --json`.
+#[derive(Debug, Serialize)]
+struct SecurityPostureReport {
+    /// Backend name (e.g. "firecracker", "docker").
+    backend: String,
+    /// Tier label: "Tier 1", "Tier 2", "Tier 3".
+    tier: &'static str,
+    /// Layer coverage flags (L1..L5).
+    layers: [bool; 5],
+    /// Whether L1+L2+L3 are all enforced — i.e. this is a real microVM tier.
+    is_microvm: bool,
+    /// Per-claim status strings (1..7), one of "Holds", "DoesNotApply",
+    /// "DoesNotHold".
+    claims: [&'static str; 7],
+    /// 1-indexed claim numbers that do not hold for this backend.
+    dropped_claims: Vec<u8>,
+    /// 1-indexed claim numbers that don't apply to this backend.
+    na_claims: Vec<u8>,
+    /// Per-backend rationale (`notes` field of `BackendSecurityProfile`).
+    notes: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct DoctorReport {
+    checks: Vec<Check>,
+    security_posture: SecurityPostureReport,
+    all_ok: bool,
+}
+
+pub fn run(json: bool) -> Result<()> {
+    let mut checks = Vec::new();
+
+    // ── Prerequisites (user must install before bootstrap) ───────
+    checks.push(check_cmd("rustup", "prerequisites", "rustup --version"));
+    checks.push(check_cmd("cargo", "prerequisites", "cargo --version"));
+
+    // ── Managed Tools (installed by bootstrap) ────────────────────
+
+    let in_vm = shell::inside_lima();
+    if in_vm {
+        // Inside Lima VM: limactl is not needed, nix and firecracker are local
+        checks.push(nix_version_check(None));
+        checks.push(check_cmd("firecracker", "tools", "firecracker --version"));
+    } else {
+        // On host: limactl needed for macOS, firecracker checked via Lima
+        if platform::current().needs_lima() {
+            checks.push(check_cmd("limactl", "tools", "limactl --version"));
+        }
+        checks.push(nix_version_check(Some(VM_NAME)));
+        checks.push(check_vm_cmd(
+            "firecracker",
+            "tools",
+            "firecracker --version",
+        ));
+    }
+
+    checks.push(Check {
+        name: "fc target",
+        category: "tools",
+        ok: true,
+        info: fc_version(),
+    });
+
+    // Nix flake support check
+    checks.push(nix_flakes_check(in_vm));
+
+    // ── Platform ──────────────────────────────────────────────────
+    let plat = platform::current();
+    checks.push(Check {
+        name: "platform",
+        category: "platform",
+        ok: true,
+        info: platform_description(plat),
+    });
+
+    checks.push(kvm_check(plat, in_vm));
+    checks.push(apple_container_check(plat));
+    checks.push(libkrun_check(plat));
+    checks.push(docker_check(plat));
+
+    if plat.needs_lima() {
+        checks.push(lima_status_check());
+    }
+
+    checks.push(disk_space_check(in_vm));
+
+    // Lima VM disk usage (only when Lima is running on macOS)
+    if plat.needs_lima() {
+        checks.push(lima_disk_check());
+    }
+
+    // Nix store health
+    checks.push(nix_store_check(in_vm));
+    checks.push(nix_store_size_check(in_vm));
+
+    // ── Security posture (plan 40 folded `mvmctl security` here) ──
+    checks.push(security_audit_log_check());
+    checks.push(security_host_fde_check());
+    checks.push(security_data_dir_mode_check());
+    checks.push(security_proxy_socket_mode_check());
+    checks.push(security_dev_image_check());
+    checks.push(security_deny_config_check());
+    checks.push(security_default_network_check());
+    checks.push(security_snapshot_key_check());
+    checks.push(security_snapshot_dirs_check());
+
+    // ── Active backend security posture (ADR-002 / plan 53) ──────
+    let security_posture = collect_security_posture();
+
+    // ── Render ────────────────────────────────────────────────────
+    let all_ok = checks.iter().all(|c| c.ok);
+    let report = DoctorReport {
+        checks,
+        security_posture,
+        all_ok,
+    };
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report)?);
+        if !report.all_ok {
+            anyhow::bail!("doctor found issues");
+        }
+        return Ok(());
+    }
+
+    render_text(&report);
+
+    if !report.all_ok {
+        let missing: Vec<&Check> = report.checks.iter().filter(|c| !c.ok).collect();
+        ui::warn("\nIssues found:");
+        for m in &missing {
+            ui::info(&format!("  {} — {}", m.name, m.info));
+        }
+
+        // Provide category-specific guidance
+        let has_prerequisites = missing.iter().any(|c| c.category == "prerequisites");
+        let has_managed = missing.iter().any(|c| c.category == "tools");
+
+        if has_prerequisites {
+            ui::info("\nPrerequisites missing: Install Rust from https://rustup.rs");
+        }
+        if has_managed {
+            ui::info("\nManaged tools missing: Run 'mvmctl bootstrap' to install");
+        }
+
+        anyhow::bail!("doctor found issues");
+    }
+
+    ui::success("\nAll checks passed.");
+    Ok(())
+}
+
+fn render_text(report: &DoctorReport) {
+    let mut current_category = "";
+    for c in &report.checks {
+        if c.category != current_category {
+            current_category = c.category;
+            let title = match current_category {
+                "prerequisites" => "Prerequisites",
+                "tools" => "Tools",
+                "platform" => "Platform",
+                "security" => "Security posture",
+                _ => current_category,
+            };
+            println!("\n{}", title);
+            println!("{}", "-".repeat(title.len()));
+        }
+        let status = if c.ok { "OK" } else { "MISSING" };
+        ui::status_line(
+            &format!("  {}:", c.name),
+            &format!("{} ({})", status, c.info),
+        );
+    }
+    render_security_posture(&report.security_posture);
+}
+
+// ── Active backend security posture (ADR-002 / plan 53) ──────
+
+/// Build the [`SecurityPostureReport`] for the backend that `mvmctl run`
+/// would auto-select on this host. Pure data — no I/O beyond reading
+/// the platform detection (which is already cached).
+fn collect_security_posture() -> SecurityPostureReport {
+    let backend = AnyBackend::auto_select();
+    let profile = backend.security_profile();
+    let layers = [
+        profile.layer_coverage.l1_host_hypervisor,
+        profile.layer_coverage.l2_vmm,
+        profile.layer_coverage.l3_guest_kernel,
+        profile.layer_coverage.l4_guest_agent,
+        profile.layer_coverage.l5_workload,
+    ];
+    let claims = [
+        claim_status_label(profile.claims[0]),
+        claim_status_label(profile.claims[1]),
+        claim_status_label(profile.claims[2]),
+        claim_status_label(profile.claims[3]),
+        claim_status_label(profile.claims[4]),
+        claim_status_label(profile.claims[5]),
+        claim_status_label(profile.claims[6]),
+    ];
+    SecurityPostureReport {
+        backend: backend.name().to_string(),
+        tier: profile.tier,
+        layers,
+        is_microvm: profile.layer_coverage.is_microvm(),
+        claims,
+        dropped_claims: profile.dropped_claims(),
+        na_claims: profile.na_claims(),
+        notes: profile.notes.to_vec(),
+    }
+}
+
+const fn claim_status_label(s: ClaimStatus) -> &'static str {
+    match s {
+        ClaimStatus::Holds => "Holds",
+        ClaimStatus::DoesNotApply => "DoesNotApply",
+        ClaimStatus::DoesNotHold => "DoesNotHold",
+    }
+}
+
+/// Render the per-backend security posture in `mvmctl doctor` text mode.
+///
+/// Always prints the active backend, tier, layer coverage, and per-claim
+/// status. When the backend is not a microVM tier (Docker today), prints
+/// a loud warning banner with the recent container-escape CVEs.
+fn render_security_posture(p: &SecurityPostureReport) {
+    let title = "Security posture (active backend)";
+    println!("\n{}", title);
+    println!("{}", "-".repeat(title.len()));
+    println!("  Active backend: {}", p.backend);
+    println!("  Tier: {}", p.tier);
+
+    let layer_marks: String = p
+        .layers
+        .iter()
+        .enumerate()
+        .map(|(i, ok)| format!("L{}{}", i + 1, if *ok { " ✓" } else { " ✗" }))
+        .collect::<Vec<_>>()
+        .join("  ");
+    println!("  Layer coverage: {layer_marks}");
+
+    if !p.dropped_claims.is_empty() {
+        let list = p
+            .dropped_claims
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  Claims that do NOT hold: {list}");
+    } else {
+        println!("  Claims: all seven hold ✓");
+    }
+    if !p.na_claims.is_empty() {
+        let list = p
+            .na_claims
+            .iter()
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  Claims that do not apply: {list}");
+    }
+    for note in &p.notes {
+        println!("  · {note}");
+    }
+
+    if !p.is_microvm {
+        ui::warn(
+            "\n  ⚠ This backend is not a hardware-isolated microVM. The L1-L3\n   \
+             layers collapse to the host kernel; ADR-002 claims 1, 2, 3 do NOT\n   \
+             hold. Recent container-escape CVEs (2024-2025): CVE-2024-21626,\n   \
+             CVE-2024-1753, CVE-2025-9074, CVE-2025-23266, CVE-2025-31133,\n   \
+             CVE-2025-52565. Set MVM_ACK_DOCKER_TIER=1 (or [security]\n   \
+             ack_docker_tier = true in ~/.mvm/config.toml) to suppress the\n   \
+             per-run banner. See https://docs.mvm.dev/security/matryoshka.",
+        );
+    }
+}
+
+// ── Tool checks ───────────────────────────────────────────────────────────
+
+fn check_cmd(name: &'static str, category: &'static str, cmd: &'static str) -> Check {
+    match shell::run_host("bash", &["-lc", cmd]) {
+        Ok(out) if out.status.success() => Check {
+            name,
+            category,
+            ok: true,
+            info: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        },
+        Ok(out) => Check {
+            name,
+            category,
+            ok: false,
+            info: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        },
+        Err(e) => Check {
+            name,
+            category,
+            ok: false,
+            info: e.to_string(),
+        },
+    }
+}
+
+fn check_vm_cmd(name: &'static str, category: &'static str, cmd: &'static str) -> Check {
+    match shell::run_on_vm(VM_NAME, cmd) {
+        Ok(out) if out.status.success() => Check {
+            name,
+            category,
+            ok: true,
+            info: String::from_utf8_lossy(&out.stdout).trim().to_string(),
+        },
+        Ok(out) => Check {
+            name,
+            category,
+            ok: false,
+            info: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        },
+        Err(e) => Check {
+            name,
+            category,
+            ok: false,
+            info: e.to_string(),
+        },
+    }
+}
+
+// ── Platform checks ───────────────────────────────────────────────────────
+
+fn platform_description(plat: Platform) -> String {
+    match plat {
+        Platform::MacOS => "macOS".to_string(),
+        Platform::LinuxNative => "Linux with KVM".to_string(),
+        Platform::LinuxNoKvm => "Linux without KVM".to_string(),
+        Platform::Wsl2 => {
+            if plat.has_kvm() {
+                "WSL2 (KVM available)".to_string()
+            } else {
+                "WSL2 (no KVM)".to_string()
+            }
+        }
+        Platform::Windows => "Windows".to_string(),
+    }
+}
+
+fn kvm_check(plat: Platform, in_vm: bool) -> Check {
+    // Inside Lima VM or native Linux: check /dev/kvm locally
+    if in_vm
+        || plat == Platform::LinuxNative
+        || plat == Platform::LinuxNoKvm
+        || plat == Platform::Wsl2
+    {
+        // Use test -c (character device exists) rather than test -r (readable),
+        // because KVM access may be via group membership which doesn't imply -r.
+        return match shell::run_host("bash", &["-c", "test -c /dev/kvm && echo ok"]) {
+            Ok(out) if out.status.success() => {
+                let context = if in_vm {
+                    "available (inside Lima VM)"
+                } else {
+                    "available"
+                };
+                Check {
+                    name: "kvm",
+                    category: "platform",
+                    ok: true,
+                    info: context.to_string(),
+                }
+            }
+            _ => Check {
+                name: "kvm",
+                category: "platform",
+                ok: false,
+                info: if in_vm {
+                    "/dev/kvm not accessible inside Lima VM".to_string()
+                } else {
+                    "not available. Enable virtualization in BIOS or check permissions on /dev/kvm."
+                        .to_string()
+                },
+            },
+        };
+    }
+
+    // macOS host: check /dev/kvm inside the Lima VM
+    match shell::run_in_vm("test -c /dev/kvm && echo ok") {
+        Ok(out) if out.status.success() => Check {
+            name: "kvm",
+            category: "platform",
+            ok: true,
+            info: "available (via Lima VM)".to_string(),
+        },
+        _ => Check {
+            name: "kvm",
+            category: "platform",
+            ok: false,
+            info: "Lima VM not running or /dev/kvm unavailable. Run 'mvmctl setup'.".to_string(),
+        },
+    }
+}
+
+fn apple_container_check(plat: Platform) -> Check {
+    if plat != Platform::MacOS {
+        return Check {
+            name: "apple containers",
+            category: "platform",
+            ok: true,
+            info: "n/a (not macOS)".to_string(),
+        };
+    }
+
+    if plat.has_apple_containers() {
+        Check {
+            name: "apple containers",
+            category: "platform",
+            ok: true,
+            info: "available (macOS 26+ on Apple Silicon)".to_string(),
+        }
+    } else {
+        Check {
+            name: "apple containers",
+            category: "platform",
+            ok: true, // Not a failure — just unavailable
+            info: "not available (requires macOS 26+ on Apple Silicon)".to_string(),
+        }
+    }
+}
+
+fn docker_check(plat: Platform) -> Check {
+    if plat.has_docker() {
+        Check {
+            name: "docker",
+            category: "platform",
+            ok: true,
+            info: "available".to_string(),
+        }
+    } else {
+        Check {
+            name: "docker",
+            category: "platform",
+            ok: true, // Not a failure — just unavailable
+            info: "not available (install Docker Desktop or Docker Engine)".to_string(),
+        }
+    }
+}
+
+/// libkrun availability — plan 53 §"Plan E". Probes the host for the
+/// libkrun shared library at the standard install paths. `ok: true`
+/// regardless of presence (libkrun is optional); the `info` field
+/// surfaces the install hint when missing so users see exactly what
+/// to run.
+fn libkrun_check(plat: Platform) -> Check {
+    if plat.is_windows() {
+        return Check {
+            name: "libkrun",
+            category: "platform",
+            ok: true,
+            info: "n/a (no Windows port — use WSL2)".to_string(),
+        };
+    }
+    if plat.has_libkrun() {
+        Check {
+            name: "libkrun",
+            category: "platform",
+            ok: true,
+            info: "available".to_string(),
+        }
+    } else {
+        Check {
+            name: "libkrun",
+            category: "platform",
+            ok: true, // Optional; not a failure.
+            info: format!("not available ({})", mvm_libkrun::install_hint()),
+        }
+    }
+}
+
+fn lima_status_check() -> Check {
+    match lima::get_status() {
+        Ok(lima::LimaStatus::Running) => Check {
+            name: "lima vm",
+            category: "platform",
+            ok: true,
+            info: "running".to_string(),
+        },
+        Ok(lima::LimaStatus::Stopped) => Check {
+            name: "lima vm",
+            category: "platform",
+            ok: false,
+            info: "stopped. Run 'mvmctl dev' or 'limactl start mvm'.".to_string(),
+        },
+        Ok(lima::LimaStatus::NotFound) => Check {
+            name: "lima vm",
+            category: "platform",
+            ok: false,
+            info: "not found. Run 'mvmctl setup' or 'mvmctl bootstrap'.".to_string(),
+        },
+        Err(e) => Check {
+            name: "lima vm",
+            category: "platform",
+            ok: false,
+            info: format!("check failed: {}", e),
+        },
+    }
+}
+
+fn disk_space_check(in_vm: bool) -> Check {
+    let result = if in_vm {
+        parse_disk_space("df -BG ~/.mvm 2>/dev/null || df -BG / 2>/dev/null")
+    } else if cfg!(target_os = "macos") {
+        parse_disk_space("df -g ~ 2>/dev/null")
+    } else {
+        parse_disk_space("df -BG ~/.mvm 2>/dev/null || df -BG / 2>/dev/null")
+    };
+
+    match result {
+        Some(gib) if gib >= 10 => Check {
+            name: "disk space",
+            category: "platform",
+            ok: true,
+            info: format!("{} GiB free", gib),
+        },
+        Some(gib) => Check {
+            name: "disk space",
+            category: "platform",
+            ok: false,
+            info: format!("only {} GiB free (10 GiB recommended)", gib),
+        },
+        None => Check {
+            name: "disk space",
+            category: "platform",
+            ok: true,
+            info: "unable to determine (skipped)".to_string(),
+        },
+    }
+}
+
+/// Parse free disk space in GiB from `df` output.
+/// Expects the 4th column of the 2nd line to be the available space with a G suffix.
+fn parse_disk_space(cmd: &str) -> Option<u64> {
+    let output = shell::run_host("bash", &["-c", cmd]).ok()?;
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let line = stdout.lines().nth(1)?;
+    let avail = line.split_whitespace().nth(3)?;
+    let num_str = avail.trim_end_matches('G').trim_end_matches('i');
+    num_str.parse().ok()
+}
+
+// ── Nix checks ────────────────────────────────────────────────────────────
+
+/// Minimum Nix version for flake support (nix build with flakes).
+const NIX_MIN_VERSION: (u64, u64) = (2, 4);
+/// Recommended Nix version for best flake support.
+const NIX_RECOMMENDED_VERSION: (u64, u64) = (2, 13);
+
+/// Check Nix version and validate it meets minimum requirements.
+/// `vm_name`: if Some, run `nix --version` inside the Lima VM; if None, run locally.
+fn nix_version_check(vm_name: Option<&str>) -> Check {
+    let output_result = match vm_name {
+        Some(vm) => shell::run_on_vm(vm, "nix --version"),
+        None => shell::run_host("bash", &["-lc", "nix --version"]),
+    };
+
+    match output_result {
+        Ok(out) if out.status.success() => {
+            let version_str = String::from_utf8_lossy(&out.stdout).trim().to_string();
+            match parse_nix_version(&version_str) {
+                Some((major, minor, patch)) => {
+                    if (major, minor) < NIX_MIN_VERSION {
+                        Check {
+                            name: "nix",
+                            category: "tools",
+                            ok: false,
+                            info: format!(
+                                "{}.{}.{} (requires >= {}.{}+ for flakes)",
+                                major, minor, patch, NIX_MIN_VERSION.0, NIX_MIN_VERSION.1
+                            ),
+                        }
+                    } else if (major, minor) < NIX_RECOMMENDED_VERSION {
+                        Check {
+                            name: "nix",
+                            category: "tools",
+                            ok: true,
+                            info: format!(
+                                "{}.{}.{} (OK, but >= {}.{} recommended)",
+                                major,
+                                minor,
+                                patch,
+                                NIX_RECOMMENDED_VERSION.0,
+                                NIX_RECOMMENDED_VERSION.1
+                            ),
+                        }
+                    } else {
+                        Check {
+                            name: "nix",
+                            category: "tools",
+                            ok: true,
+                            info: format!("{}.{}.{}", major, minor, patch),
+                        }
+                    }
+                }
+                None => Check {
+                    name: "nix",
+                    category: "tools",
+                    ok: true,
+                    info: format!("{} (version not parsed)", version_str),
+                },
+            }
+        }
+        Ok(out) => Check {
+            name: "nix",
+            category: "tools",
+            ok: false,
+            info: String::from_utf8_lossy(&out.stderr).trim().to_string(),
+        },
+        Err(e) => Check {
+            name: "nix",
+            category: "tools",
+            ok: false,
+            info: e.to_string(),
+        },
+    }
+}
+
+/// Parse "nix (Nix) 2.18.1" or "nix (Nix) 2.24.12 pre-20241211_dirty" into (major, minor, patch).
+fn parse_nix_version(output: &str) -> Option<(u64, u64, u64)> {
+    // Find the version number after "Nix) " or just the last space-separated token
+    let version_part = output
+        .split_whitespace()
+        .find(|s| s.chars().next().is_some_and(|c| c.is_ascii_digit()))?;
+
+    let mut parts = version_part.split('.');
+    let major = parts.next()?.parse().ok()?;
+    let minor = parts.next()?.parse().ok()?;
+    // Patch may have suffix like "12pre-20241211_dirty"
+    let patch_str = parts.next().unwrap_or("0");
+    let patch = patch_str
+        .chars()
+        .take_while(|c| c.is_ascii_digit())
+        .collect::<String>()
+        .parse()
+        .unwrap_or(0);
+    Some((major, minor, patch))
+}
+
+/// Check that Nix flake support is enabled (experimental-features includes nix-command and flakes).
+fn nix_flakes_check(in_vm: bool) -> Check {
+    let cmd = "nix show-config 2>/dev/null | grep -i experimental-features || echo 'not found'";
+    let output_result = if in_vm {
+        shell::run_host("bash", &["-lc", cmd])
+    } else {
+        shell::run_on_vm(VM_NAME, cmd)
+    };
+
+    match output_result {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let has_flakes = stdout.contains("flakes");
+            let has_nix_command = stdout.contains("nix-command");
+            if has_flakes && has_nix_command {
+                Check {
+                    name: "nix flakes",
+                    category: "tools",
+                    ok: true,
+                    info: "enabled".to_string(),
+                }
+            } else {
+                let mut missing = Vec::new();
+                if !has_nix_command {
+                    missing.push("nix-command");
+                }
+                if !has_flakes {
+                    missing.push("flakes");
+                }
+                Check {
+                    name: "nix flakes",
+                    category: "tools",
+                    ok: false,
+                    info: format!(
+                        "missing experimental-features: {}. Add to ~/.config/nix/nix.conf",
+                        missing.join(", ")
+                    ),
+                }
+            }
+        }
+        _ => Check {
+            name: "nix flakes",
+            category: "tools",
+            ok: true,
+            info: "unable to check (skipped)".to_string(),
+        },
+    }
+}
+
+// ── Lima VM health ────────────────────────────────────────────────────────
+
+/// Check Lima VM disk usage — warn if > 80% full.
+fn lima_disk_check() -> Check {
+    match shell::run_on_vm(VM_NAME, "df -h / 2>/dev/null") {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // Parse "Use%" column from df output (5th column of 2nd line)
+            if let Some(pct) = stdout
+                .lines()
+                .nth(1)
+                .and_then(|line| line.split_whitespace().nth(4))
+                .and_then(|s| s.trim_end_matches('%').parse::<u64>().ok())
+            {
+                return if pct >= 90 {
+                    Check {
+                        name: "lima disk",
+                        category: "platform",
+                        ok: false,
+                        info: format!("{}% used (critically low space)", pct),
+                    }
+                } else if pct >= 80 {
+                    Check {
+                        name: "lima disk",
+                        category: "platform",
+                        ok: true,
+                        info: format!("{}% used (consider freeing space)", pct),
+                    }
+                } else {
+                    Check {
+                        name: "lima disk",
+                        category: "platform",
+                        ok: true,
+                        info: format!("{}% used", pct),
+                    }
+                };
+            }
+            Check {
+                name: "lima disk",
+                category: "platform",
+                ok: true,
+                info: "unable to parse (skipped)".to_string(),
+            }
+        }
+        _ => Check {
+            name: "lima disk",
+            category: "platform",
+            ok: true,
+            info: "VM not accessible (skipped)".to_string(),
+        },
+    }
+}
+
+// ── Nix store health ──────────────────────────────────────────────────────
+
+/// Check Nix store accessibility via `nix store ping`.
+fn nix_store_check(in_vm: bool) -> Check {
+    let cmd = "nix store ping 2>&1";
+    let output_result = if in_vm {
+        shell::run_host("bash", &["-lc", cmd])
+    } else {
+        shell::run_on_vm(VM_NAME, cmd)
+    };
+
+    match output_result {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            // nix store ping outputs "Store URL: daemon" or similar
+            let store_url = stdout
+                .lines()
+                .find(|l| l.contains("Store URL"))
+                .map(|l| l.trim().to_string())
+                .unwrap_or_else(|| "accessible".to_string());
+            Check {
+                name: "nix store",
+                category: "tools",
+                ok: true,
+                info: store_url,
+            }
+        }
+        Ok(_) => Check {
+            name: "nix store",
+            category: "tools",
+            ok: false,
+            info: "Nix store not accessible. Is the Nix daemon running?".to_string(),
+        },
+        _ => Check {
+            name: "nix store",
+            category: "tools",
+            ok: true,
+            info: "unable to check (skipped)".to_string(),
+        },
+    }
+}
+
+/// Check Nix store size and warn if it exceeds 20 GiB.
+fn nix_store_size_check(in_vm: bool) -> Check {
+    let cmd = "du -sb /nix/store 2>/dev/null | awk '{print $1}'";
+    let output_result = if in_vm {
+        shell::run_host("bash", &["-lc", cmd])
+    } else {
+        shell::run_on_vm(VM_NAME, cmd)
+    };
+
+    match output_result {
+        Ok(out) if out.status.success() => {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let bytes: u64 = stdout.trim().parse().unwrap_or(0);
+            let threshold: u64 = 20 * 1024 * 1024 * 1024; // 20 GiB
+            let human = mvm_core::pool::format_bytes(bytes);
+            if bytes > threshold {
+                Check {
+                    name: "nix store size",
+                    category: "disk",
+                    ok: false,
+                    info: format!(
+                        "{} — exceeds 20 GiB. Run 'nix-collect-garbage -d' to reclaim space.",
+                        human
+                    ),
+                }
+            } else {
+                Check {
+                    name: "nix store size",
+                    category: "disk",
+                    ok: true,
+                    info: human,
+                }
+            }
+        }
+        _ => Check {
+            name: "nix store size",
+            category: "disk",
+            ok: true,
+            info: "unable to check (skipped)".to_string(),
+        },
+    }
+}
+
+// ── Security posture (folded in from `mvmctl security` per plan 40) ─────
+
+fn security_audit_log_check() -> Check {
+    let path = mvm_core::audit::default_audit_log();
+    let exists = std::path::Path::new(&path).exists();
+    Check {
+        name: "audit log",
+        category: "security",
+        ok: true, // informational
+        info: if exists {
+            format!("present at {path}")
+        } else {
+            format!("not yet created at {path}")
+        },
+    }
+}
+
+/// Host full-disk-encryption check — plan 45 §"Encryption at rest".
+///
+/// `LocalBackend` volumes rely on host FDE for at-rest protection (we
+/// deliberately don't roll our own per-volume crypto on dev boxes).
+/// On a dev host this check is **informational/warning-only** — the
+/// `ok` flag stays `true` so a non-FDE laptop can still run mvmctl,
+/// but the report surfaces the gap so users can enable FileVault /
+/// LUKS before relying on local volumes for sensitive data.
+///
+/// On mvmd workers the analogous check is **enforced** (refuses
+/// `LocalVirtiofs` bucket creation when FDE is absent). That lives
+/// in mvmd Sprint 137 W6.
+fn security_host_fde_check() -> Check {
+    let detection = detect_host_fde();
+    Check {
+        name: "host FDE (volumes at-rest)",
+        category: "security",
+        ok: true, // warn-only on dev box per plan 45 §D5
+        info: detection,
+    }
+}
+
+/// Best-effort detection of host full-disk encryption.
+///
+/// macOS: `fdesetup status` returns "FileVault is On." when enabled.
+/// Linux: `lsblk -no TYPE / 2>&1 | grep crypt` succeeds when the root
+/// FS sits on a dm-crypt mapping. Both checks fail closed (return
+/// "unknown") if the underlying tool is missing.
+fn detect_host_fde() -> String {
+    let plat = platform::current();
+    if matches!(plat, Platform::MacOS) {
+        match std::process::Command::new("fdesetup")
+            .arg("status")
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                if stdout.contains("FileVault is On") {
+                    "FileVault enabled (recommended for LocalBackend volumes)".to_string()
+                } else {
+                    format!(
+                        "FileVault appears OFF — run `sudo fdesetup enable` before storing \
+                         sensitive data in LocalBackend volumes ({})",
+                        stdout.trim()
+                    )
+                }
+            }
+            Ok(_) | Err(_) => {
+                "could not determine FileVault state (fdesetup unavailable)".to_string()
+            }
+        }
+    } else if matches!(plat, Platform::LinuxNative | Platform::LinuxNoKvm) {
+        // `lsblk -no TYPE -P` listing for root mountpoint. Cheap;
+        // `findmnt -no SOURCE /` resolves the device, then `lsblk -no
+        // TYPE` gives the device type chain. We accept either route.
+        match std::process::Command::new("findmnt")
+            .args(["-no", "SOURCE", "/"])
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                match std::process::Command::new("lsblk")
+                    .args(["-no", "TYPE", &dev])
+                    .output()
+                {
+                    Ok(types) if types.status.success() => {
+                        let s = String::from_utf8_lossy(&types.stdout);
+                        if s.lines().any(|l| l.trim() == "crypt") {
+                            format!(
+                                "root device {dev} sits on a dm-crypt mapping (LUKS \
+                                 enabled — recommended for LocalBackend volumes)"
+                            )
+                        } else {
+                            format!(
+                                "root device {dev} does NOT appear to be encrypted — \
+                                 enable LUKS on root before storing sensitive data in \
+                                 LocalBackend volumes"
+                            )
+                        }
+                    }
+                    _ => format!("could not inspect type chain for {dev}"),
+                }
+            }
+            _ => "could not determine root device (findmnt unavailable)".to_string(),
+        }
+    } else {
+        "unsupported platform for FDE detection".to_string()
+    }
+}
+
+/// `~/.mvm` should be mode 0700 (ADR-002 §W1.5).
+fn security_data_dir_mode_check() -> Check {
+    let dir = mvm_core::config::mvm_share_dir();
+    let Ok(meta) = std::fs::symlink_metadata(&dir) else {
+        return Check {
+            name: "data dir mode",
+            category: "security",
+            ok: false,
+            info: format!("not present at {dir} — run `mvmctl bootstrap`"),
+        };
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        let expected = 0o700;
+        Check {
+            name: "data dir mode",
+            category: "security",
+            ok: mode == expected,
+            info: if mode == expected {
+                format!("0{mode:o} at {dir}")
+            } else {
+                format!("expected 0{expected:o}, got 0{mode:o} at {dir}")
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        Check {
+            name: "data dir mode",
+            category: "security",
+            ok: true,
+            info: "non-Unix host; mode check skipped".to_string(),
+        }
+    }
+}
+
+/// Dev VM vsock proxy socket should be mode 0700 (ADR-002 §W1.2).
+fn security_proxy_socket_mode_check() -> Check {
+    let path = format!(
+        "{}/vms/mvm-dev/vsock.sock",
+        mvm_core::config::mvm_share_dir()
+    );
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return Check {
+            name: "vsock socket mode",
+            category: "security",
+            ok: true,
+            info: format!("dev VM not running (no socket at {path})"),
+        };
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        let expected = 0o700;
+        Check {
+            name: "vsock socket mode",
+            category: "security",
+            ok: mode == expected,
+            info: if mode == expected {
+                format!("0{mode:o}")
+            } else {
+                format!(
+                    "expected 0{expected:o}, got 0{mode:o} — same-host other users may have access"
+                )
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        Check {
+            name: "vsock socket mode",
+            category: "security",
+            ok: true,
+            info: "non-Unix host; mode check skipped".to_string(),
+        }
+    }
+}
+
+/// Cached pre-built dev image presence (informational; absence triggers
+/// hash-verified download per ADR-002 §W5.1).
+fn security_dev_image_check() -> Check {
+    let version = env!("CARGO_PKG_VERSION");
+    let prebuilt_dir = format!("{}/prebuilt/v{version}", mvm_core::config::mvm_share_dir());
+    let kernel = format!("{prebuilt_dir}/vmlinux");
+    let rootfs = format!("{prebuilt_dir}/rootfs.ext4");
+    let cached = std::path::Path::new(&kernel).exists() && std::path::Path::new(&rootfs).exists();
+    Check {
+        name: "pre-built dev image",
+        category: "security",
+        ok: true,
+        info: if cached {
+            format!("cached at {prebuilt_dir}")
+        } else {
+            "not cached; next `mvmctl dev up` will download + hash-verify".to_string()
+        },
+    }
+}
+
+/// `deny.toml` at the workspace root (ADR-002 §W5.2 supply-chain policy).
+fn security_deny_config_check() -> Check {
+    let cwd = std::env::current_dir().ok();
+    let found = cwd.as_deref().and_then(|start| {
+        let mut cur: Option<&std::path::Path> = Some(start);
+        while let Some(p) = cur {
+            if p.join("deny.toml").exists() && p.join("Cargo.toml").exists() {
+                return Some(p.to_path_buf());
+            }
+            cur = p.parent();
+        }
+        None
+    });
+    Check {
+        name: "cargo-deny policy",
+        category: "security",
+        ok: true,
+        info: match found {
+            Some(p) => format!("deny.toml at {}", p.display()),
+            None => "deny.toml not found from cwd (expected only in source checkouts)".to_string(),
+        },
+    }
+}
+
+fn security_default_network_check() -> Check {
+    let path = mvm_core::dev_network::network_path("default");
+    let exists = std::path::Path::new(&path).exists();
+    Check {
+        name: "default dev network",
+        category: "security",
+        ok: true,
+        info: if exists {
+            "configured".to_string()
+        } else {
+            "not configured — run `mvmctl network create default`".to_string()
+        },
+    }
+}
+
+/// `~/.mvm/snapshot.key` should be mode 0600 (ADR-007 §W4 / M9).
+///
+/// Absence is informational — the file is created lazily on first
+/// snapshot seal. Existence with looser perms is a security finding:
+/// any local user could read the key and forge sidecars.
+fn security_snapshot_key_check() -> Check {
+    let path = mvm_security::snapshot_hmac::default_key_path(std::path::Path::new(
+        &mvm_core::config::mvm_data_dir(),
+    ));
+    let Ok(meta) = std::fs::symlink_metadata(&path) else {
+        return Check {
+            name: "snapshot HMAC key",
+            category: "security",
+            ok: true,
+            info: format!(
+                "not yet created at {} (lazy — created on first snapshot seal)",
+                path.display()
+            ),
+        };
+    };
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let mode = meta.permissions().mode() & 0o777;
+        let expected = 0o600;
+        let len_ok = meta.len() == mvm_security::snapshot_hmac::HMAC_KEY_BYTES as u64;
+        Check {
+            name: "snapshot HMAC key",
+            category: "security",
+            ok: mode == expected && len_ok,
+            info: if mode != expected {
+                format!(
+                    "expected mode 0{expected:o}, got 0{mode:o} at {} — \
+                     a local-user-readable HMAC key can be used to forge sidecars",
+                    path.display()
+                )
+            } else if !len_ok {
+                format!(
+                    "key file at {} is {} bytes (expected {}) — corrupt; rotate by deleting the file",
+                    path.display(),
+                    meta.len(),
+                    mvm_security::snapshot_hmac::HMAC_KEY_BYTES
+                )
+            } else {
+                format!("0{mode:o} at {}", path.display())
+            },
+        }
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = meta;
+        Check {
+            name: "snapshot HMAC key",
+            category: "security",
+            ok: true,
+            info: "non-Unix host; mode check skipped".to_string(),
+        }
+    }
+}
+
+/// All template snapshot directories should be mode 0700 (ADR-007
+/// §W4 / M9). Walks `~/.mvm/templates/*/artifacts/*/snapshot/`,
+/// reports the first looser-perm directory found (or "all OK" /
+/// "none built yet" otherwise).
+fn security_snapshot_dirs_check() -> Check {
+    let templates_dir = mvm_core::domain::template::templates_base_dir();
+    let templates_path = std::path::Path::new(&templates_dir);
+    if !templates_path.exists() {
+        return Check {
+            name: "snapshot dir mode",
+            category: "security",
+            ok: true,
+            info: format!("no templates directory at {templates_dir}"),
+        };
+    }
+
+    let mut total = 0u32;
+    let mut bad: Option<(std::path::PathBuf, u32)> = None;
+    if let Ok(entries) = std::fs::read_dir(templates_path) {
+        for tpl in entries.flatten() {
+            let artifacts = tpl.path().join("artifacts");
+            let Ok(rev_entries) = std::fs::read_dir(&artifacts) else {
+                continue;
+            };
+            for rev in rev_entries.flatten() {
+                let snap = rev.path().join("snapshot");
+                if !snap.is_dir() {
+                    continue;
+                }
+                total += 1;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt;
+                    if let Ok(meta) = std::fs::symlink_metadata(&snap) {
+                        let mode = meta.permissions().mode() & 0o777;
+                        if mode != 0o700 && bad.is_none() {
+                            bad = Some((snap, mode));
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    if total == 0 {
+        return Check {
+            name: "snapshot dir mode",
+            category: "security",
+            ok: true,
+            info: format!("no snapshots built yet under {templates_dir}"),
+        };
+    }
+    match bad {
+        Some((path, mode)) => Check {
+            name: "snapshot dir mode",
+            category: "security",
+            ok: false,
+            info: format!(
+                "expected 0700, got 0{mode:o} at {} (1 of {total} snapshot dir{}; \
+                 looser perms let local users tamper with snapshots)",
+                path.display(),
+                if total == 1 { "" } else { "s" }
+            ),
+        },
+        None => Check {
+            name: "snapshot dir mode",
+            category: "security",
+            ok: true,
+            info: format!(
+                "0700 across {total} snapshot dir{}",
+                if total == 1 { "" } else { "s" }
+            ),
+        },
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn check_struct_reports_ok() {
+        let c = Check {
+            name: "test-tool",
+            category: "tools",
+            ok: true,
+            info: "1.0.0".to_string(),
+        };
+        assert!(c.ok);
+        assert_eq!(c.name, "test-tool");
+    }
+
+    #[test]
+    fn check_struct_reports_missing() {
+        let c = Check {
+            name: "missing-tool",
+            category: "tools",
+            ok: false,
+            info: "not found".to_string(),
+        };
+        assert!(!c.ok);
+    }
+
+    #[test]
+    fn inside_lima_is_false_on_host() {
+        if std::env::var("LIMA_INSTANCE").is_err()
+            && !std::path::Path::new("/etc/lima-boot.conf").exists()
+        {
+            assert!(!shell::inside_lima());
+        }
+    }
+
+    #[test]
+    fn check_cmd_rustup_on_host() {
+        let c = check_cmd("rustup", "tools", "rustup --version");
+        assert!(c.ok, "rustup should be available: {}", c.info);
+        assert!(
+            c.info.contains("rustup"),
+            "expected version string, got: {}",
+            c.info
+        );
+    }
+
+    #[test]
+    fn check_cmd_cargo_on_host() {
+        let c = check_cmd("cargo", "tools", "cargo --version");
+        assert!(c.ok, "cargo should be available: {}", c.info);
+        assert!(
+            c.info.contains("cargo"),
+            "expected version string, got: {}",
+            c.info
+        );
+    }
+
+    #[test]
+    fn check_cmd_missing_tool() {
+        let c = check_cmd(
+            "nonexistent-mvm-tool-xyz",
+            "tools",
+            "nonexistent-mvm-tool-xyz --version",
+        );
+        assert!(!c.ok, "nonexistent tool should fail");
+    }
+
+    #[test]
+    fn fc_target_version_is_nonempty() {
+        let v = mvm_core::config::fc_version();
+        assert!(!v.is_empty(), "FC version should be configured");
+        assert!(
+            v.starts_with('v'),
+            "FC version should start with 'v': {}",
+            v
+        );
+    }
+
+    #[test]
+    fn platform_description_covers_all_variants() {
+        assert!(platform_description(Platform::MacOS).contains("macOS"));
+        assert!(platform_description(Platform::LinuxNative).contains("KVM"));
+        assert!(platform_description(Platform::LinuxNoKvm).contains("without KVM"));
+    }
+
+    #[test]
+    fn parse_disk_space_typical_output() {
+        let result = parse_disk_space(
+            "printf 'Filesystem     1G-blocks  Used Available Use%% Mounted on\n/dev/sda1           100G   55G       45G  55%% /\n'",
+        );
+        assert_eq!(result, Some(45));
+    }
+
+    #[test]
+    fn parse_nix_version_standard() {
+        assert_eq!(parse_nix_version("nix (Nix) 2.18.1"), Some((2, 18, 1)));
+    }
+
+    #[test]
+    fn parse_nix_version_with_suffix() {
+        assert_eq!(
+            parse_nix_version("nix (Nix) 2.24.12pre-20241211_dirty"),
+            Some((2, 24, 12))
+        );
+    }
+
+    #[test]
+    fn parse_nix_version_old() {
+        assert_eq!(parse_nix_version("nix (Nix) 2.3.16"), Some((2, 3, 16)));
+    }
+
+    #[test]
+    fn parse_nix_version_garbage() {
+        assert_eq!(parse_nix_version("not a version"), None);
+    }
+
+    #[test]
+    fn parse_nix_version_empty() {
+        assert_eq!(parse_nix_version(""), None);
+    }
+
+    #[test]
+    fn nix_version_too_old_is_not_ok() {
+        // Version 2.3.x is below minimum 2.4
+        let (major, minor, _patch) = (2, 3, 16);
+        assert!((major, minor) < NIX_MIN_VERSION);
+        // Verify the logic matches what nix_version_check would produce
+        assert!(
+            (major, minor) < NIX_MIN_VERSION,
+            "2.3 should be below minimum"
+        );
+    }
+
+    #[test]
+    fn nix_version_at_minimum_is_ok() {
+        let (major, minor) = (2, 4);
+        assert!((major, minor) >= NIX_MIN_VERSION);
+    }
+
+    #[test]
+    fn nix_version_at_recommended_is_ok() {
+        let (major, minor) = (2, 13);
+        assert!((major, minor) >= NIX_RECOMMENDED_VERSION);
+    }
+
+    #[test]
+    fn doctor_report_serializes_to_json() {
+        let report = DoctorReport {
+            checks: vec![Check {
+                name: "test",
+                category: "tools",
+                ok: true,
+                info: "v1.0".to_string(),
+            }],
+            security_posture: collect_security_posture(),
+            all_ok: true,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("\"name\":\"test\""));
+        assert!(json.contains("\"all_ok\":true"));
+        assert!(json.contains("\"security_posture\""));
+        assert!(json.contains("\"tier\""));
+    }
+
+    #[test]
+    fn collect_security_posture_returns_a_real_tier() {
+        let posture = collect_security_posture();
+        assert!(
+            posture.tier == "Tier 1" || posture.tier == "Tier 2" || posture.tier == "Tier 3",
+            "unexpected tier: {}",
+            posture.tier
+        );
+        assert_eq!(posture.claims.len(), 7);
+    }
+}

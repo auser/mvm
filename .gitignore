@@ -1,2 +1,29 @@
 /target
-todo-delete-backup/
+.playwright-mcp/
+.claude
+**/node_modules
+specs/scratch.md
+# Generated man pages (produced by `cargo xtask gen-man`)
+man/*.1
+nixos.qcow2
+.ash_history
+keys
+
+# Override the user's global gitignore for this specific path. The CLI
+# crate has a `build/` subdirectory that hosts the `mvmctl build`
+# subcommand (`build.rs` + `flake.rs` + `image.rs` + `template.rs`).
+# Many global gitignores blanket-ignore `build/`; the negation here
+# re-includes only this in-repo path.
+!crates/mvm-cli/src/commands/build/
+!crates/mvm-cli/src/commands/build/**
+
+# Same workaround for the `env/` directory holding `mvmctl env *`-style
+# subcommands. Some global gitignores blanket-ignore `env/`; this
+# negation re-includes the in-repo path so contributors don't have to
+# pass `git add -f` every time they touch a file under it.
+!crates/mvm-cli/src/commands/env/
+!crates/mvm-cli/src/commands/env/**
+
+# Worktree-local dev env (use .envrc.example as template)
+/.envrc
+/.mvm-test/

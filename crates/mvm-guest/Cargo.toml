@@ -1,0 +1,79 @@
+[package]
+name = "mvm-guest"
+version.workspace = true
+edition.workspace = true
+description = "vsock protocol and openclaw connector mapping for mvm"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mvm-builder-agent"
+path = "src/bin/mvm-builder-agent.rs"
+
+[[bin]]
+name = "mvm-guest-agent"
+path = "src/bin/mvm-guest-agent.rs"
+
+# Exec-shim that compiles a syscall allowlist into a BPF program via
+# seccompiler, applies it via prctl, and execve's into the wrapped
+# command. mkServiceBlock wraps every guest service launch with this
+# shim so per-service seccomp filters are the default. ADR-002 §W2.4.
+[[bin]]
+name = "mvm-seccomp-apply"
+path = "src/bin/mvm-seccomp-apply.rs"
+
+# Early-userspace init (PID 1) that runs from the verity initramfs
+# baked by `mkGuest` when `verifiedBoot = true`. Reads the roothash
+# from /proc/cmdline, constructs the dm-verity device-mapper target
+# via raw ioctls, mounts it, and switch_roots to the real /init.
+# Bypasses Firecracker's auto-appended `root=/dev/vda` by owning the
+# boot pivot in userspace. ADR-002 §W3.
+[[bin]]
+name = "mvm-verity-init"
+path = "src/bin/mvm-verity-init.rs"
+
+# Test-only probe used by `tests/seccomp_apply.rs` to verify that
+# tier allowlists actually deny what they claim (ADR-002 §W2.4). Not
+# selected by `nix/packages/mvm-guest-agent.nix`, so it never ships
+# in the guest closure.
+[[bin]]
+name = "syscall-probe"
+path = "src/bin/syscall-probe.rs"
+
+# Test fixture for the warm-process worker pool (plan 43). Speaks the
+# `worker_protocol` framed multi-call loop on stdin/stdout. Behavior
+# selectable via `MVM_FAKE_RUNNER_BEHAVIOR` env var so tests can
+# exercise crash, recycle, slow, and malformed-frame paths against a
+# real child process. Not selected by the production guest closure.
+[[bin]]
+name = "fake-runner"
+path = "tests/bin/fake_runner.rs"
+test = false
+doctest = false
+
+[features]
+dev-shell = []
+
+[dependencies]
+mvm-core.workspace = true
+mvm-security.workspace = true
+anyhow.workspace = true
+base64.workspace = true
+chrono.workspace = true
+ed25519-dalek.workspace = true
+libc.workspace = true
+rand.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+
+# seccompiler builds Linux-only — guests are always Linux microVMs,
+# but the workspace also compiles on macOS for CLI development. Gate
+# the dep so `cargo check` on a Mac doesn't try to build it.
+[target.'cfg(target_os = "linux")'.dependencies]
+seccompiler = { workspace = true }
+
+[dev-dependencies]
+tempfile.workspace = true

@@ -1,0 +1,24 @@
+[package]
+name = "mvm-storage"
+version.workspace = true
+edition.workspace = true
+description = "Volume backend trait + LocalBackend impl for mvm. ObjectStoreBackend + EncryptedBackend live in mvmd per plan 45 §D5 (Path C)."
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+async-trait = "0.1"
+bytes = "1"
+chrono.workspace = true
+mvm-core.workspace = true
+serde.workspace = true
+tokio = { workspace = true, features = ["fs", "io-util", "rt", "macros"] }
+tracing.workspace = true
+
+[dev-dependencies]
+serde_json.workspace = true
+tempfile.workspace = true
+tokio = { workspace = true, features = ["full"] }
