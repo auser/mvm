@@ -1,6 +1,6 @@
 # Plan 58 — Filesystem-volumes live KVM smoke fixture
 
-> **Status:** deferred — needs real KVM-capable hardware to execute. Companion to [Plan 45 §"Verification" Phase 11](./45-filesystem-volumes-e2b-parity.md).
+> **Status:** deferred — needs real KVM-capable hardware to execute. Companion to [Plan 45 §"Verification" Phase 11](./45-filesystem-volumes.md).
 > **Why a separate plan:** Phases 1–10 of Plan 45 (workspace + mvm-side foundation) are complete and merged-able as a self-contained unit. Phase 11 (live KVM smoke) needs hardware that no longer fits in a software-only PR — capturing here so the work isn't lost in the Plan 45 §"Out of scope" backlog.
 
 ## Context
@@ -57,7 +57,7 @@ Lima VM on macOS provides a Linux + KVM environment, but spinning up nested Fire
    - Boot a *second* VM mounting `smoke-scratch` at `/mnt/scratch` while the first is still running.
    - Both VMs see the same file.
    - One VM writes; the other VM (after a brief cache-flush wait) sees the update.
-   - Note: virtiofs cache coherence is the real determining factor here; the test asserts the *eventual* shape, not strict-ordering, to match e2b's documented "best-effort consistency" stance.
+   - Note: virtiofs cache coherence is the real determining factor here; the test asserts the *eventual* shape, not strict-ordering, to match the established sandbox-runtime "best-effort consistency" stance.
 
 4. **Read-only enforcement**:
    - Boot VM with `--volume smoke-inputs:/mnt/inputs:ro`.

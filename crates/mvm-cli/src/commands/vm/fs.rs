@@ -1,5 +1,5 @@
 //! `mvmctl fs <verb> <vm> <args>` — filesystem RPC against a
-//! running microVM. W1 / A1 of the e2b parity plan.
+//! running microVM. W1 / A1 of the filesystem-volumes plan.
 //!
 //! Production-safe surface: every call routes through the agent's
 //! `mvm_security::policy::PathPolicy` (deny-list +

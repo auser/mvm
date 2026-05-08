@@ -66,7 +66,7 @@ pub const SIDECAR_FILENAME: &str = "integrity.json";
 /// Schema version of the sidecar JSON. Bump on any breaking change to
 /// the structure or HMAC computation.
 ///
-/// Schema 2 (W1 / A4 of the e2b parity plan): added `epoch: u64`
+/// Schema 2 (W1 / A4 of the filesystem-volumes plan): added `epoch: u64`
 /// inside the HMAC envelope. The epoch advances monotonically per
 /// resource (per-template for template snapshots, per-instance for
 /// instance snapshots). Replay defence per G5 of the parity plan —

@@ -1,4 +1,4 @@
-//! Instance-snapshot store — A4 of the e2b parity plan.
+//! Instance-snapshot store — A4 of the filesystem-volumes plan.
 //!
 //! `mvmctl pause <vm>` quiesces the running VM, asks Firecracker
 //! for a snapshot, seals the bytes with the W4 HMAC envelope (now

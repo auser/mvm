@@ -1756,7 +1756,7 @@ pub fn seal_snapshot_artifacts(snap_dir: &str) -> Result<()> {
     let mvmctl_version = env!("CARGO_PKG_VERSION");
     // Bump the per-resource epoch counter so a future `verify` call
     // can detect a captured-and-replayed older envelope (G5 of the
-    // e2b parity plan). Counter lives next to the snapshot files
+    // filesystem-volumes plan). Counter lives next to the snapshot files
     // so re-creating the dir with `mvmctl template build --force`
     // resumes from the previous high-water mark.
     let epoch_store = mvm_security::snapshot_hmac::EpochStore::new(snap_path.join(".epoch"));

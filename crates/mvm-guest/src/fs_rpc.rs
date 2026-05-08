@@ -1,4 +1,4 @@
-//! Filesystem RPC handler — A1 of the e2b parity plan.
+//! Filesystem RPC handler — A1 of the filesystem-volumes plan.
 //!
 //! Translates a `GuestRequest` FS verb into an `FsResult`. Routes
 //! every host-supplied path through `mvm_security::policy::PathPolicy`

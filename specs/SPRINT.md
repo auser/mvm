@@ -811,15 +811,15 @@ suspicious.
 - Native-Windows microVMs via Cloud Hypervisor + WHPX (depends on Plan F).
 - Eliminating Lima from the macOS *build* path (libkrun solves runtime only; build-on-host is future work).
 
-## Sprint 49 — Filesystem Volumes for e2b parity (in flight)
+## Sprint 49 — Filesystem Volumes (sandbox-runtime parity, in flight)
 
 Branch: [`feat/sprint-46-filesystem-volumes`](https://github.com/tinylabscom/mvm/tree/feat/sprint-46-filesystem-volumes) — branch name preserved for PR continuity; the sprint itself was relabeled from 46 to 49 during merge to disambiguate from Sprint 46 (cross-platform foundation, already merged via #97).
-Plan: [`plans/45-filesystem-volumes-e2b-parity.md`](plans/45-filesystem-volumes-e2b-parity.md).
-mvmd companion: [`mvmd/specs/plans/29-filesystem-volumes-e2b-parity.md`](../../mvmd/specs/plans/29-filesystem-volumes-e2b-parity.md).
+Plan: [`plans/45-filesystem-volumes.md`](plans/45-filesystem-volumes.md).
+mvmd companion: [`mvmd/specs/plans/29-filesystem-volumes.md`](../../mvmd/specs/plans/29-filesystem-volumes.md) (sister repo — needs corresponding rename).
 
 ### Why this sprint
 
-mvm's in-flight share registry (untracked on `feat/sandbox-sdk-foundation`) does not match e2b's documented Volume primitive shape: e2b volumes are **named, multi-attach, filesystem-semantics**. We replace the share registry with a `Volume` primitive that ships in mvm-core (wire types) plus a new `mvm-storage` crate (trait + impls for `LocalBackend` + `ObjectStoreBackend` via `opendal`, with mandatory `EncryptedBackend<B>` decorator). mvmd consumes `mvm-storage` via the `mvmctl` git facade and reconciles with its existing `StorageBucket` primitive (see Plan 45 §"Discoveries during implementation" D1).
+mvm's in-flight share registry (untracked on `feat/sandbox-sdk-foundation`) does not match the established sandbox-runtime Volume primitive shape: those volumes are **named, multi-attach, filesystem-semantics**. We replace the share registry with a `Volume` primitive that ships in mvm-core (wire types) plus a new `mvm-storage` crate (trait + impls for `LocalBackend` + `ObjectStoreBackend` via `opendal`, with mandatory `EncryptedBackend<B>` decorator). mvmd consumes `mvm-storage` via the `mvmctl` git facade and reconciles with its existing `StorageBucket` primitive (see Plan 45 §"Discoveries during implementation" D1).
 
 ### Workstream breakdown (mvm-side, post-D5 / Path C)
 
@@ -831,7 +831,7 @@ mvm's in-flight share registry (untracked on `feat/sandbox-sdk-foundation`) does
 
 ### Cross-repo dependency
 
-mvmd Sprint 29 (`mvmd/specs/plans/29-filesystem-volumes-e2b-parity.md`) follows mvm Plan 45 phases 1-3 landing on `main`. mvmd consumes `mvmctl::storage` via the existing git workspace dep. Decision blocker on the mvmd side: extend `StorageBucket` (recommended) vs. add parallel `FilesystemVolume` — see Plan 45 §D1.
+mvmd Sprint 29 (`mvmd/specs/plans/29-filesystem-volumes.md` — sister repo file needs corresponding rename) follows mvm Plan 45 phases 1-3 landing on `main`. mvmd consumes `mvmctl::storage` via the existing git workspace dep. Decision blocker on the mvmd side: extend `StorageBucket` (recommended) vs. add parallel `FilesystemVolume` — see Plan 45 §D1.
 
 ### Sprint 49 success criteria (post-D5 / Path C)
 
@@ -918,6 +918,22 @@ The current `mvm-runtime` is a 5-crate, ~520-LOC skeleton; the previous iteratio
 - **W6.2** — wire `mvmctl console` against the accessible/sealed gate (passthru.mvm.accessible read; vsock attach when permitted).
 - **W7** — finish the backend extraction: move `config`/`shell`/`ui`/`vm::microvm`/`vm::image` modules from `mvm-runtime` down to a shared crate; then physically relocate the backend impls into `mvm-backend` (today they live in `mvm-runtime/src/vm/` and the `mvm-backend` crate is a thin re-export). Also lands the internal handle registry that gives `StartMode::Attached` real SIGTERM-on-Ctrl-C semantics (today it's intent-only).
 - **Phase 1 close-out** — demo run + checkpoint review
+
+### Sprint 49 ↔ Sprint 50 convergence (volumes / mvm-storage)
+
+Sprint 49 (plan 45 — filesystem volumes) is shipping in parallel on `feat/sprint-46-filesystem-volumes`. Its mvm-side deliverables overlap Phase 2 of this migration:
+
+- New crate `mvm-storage` with `VolumeBackend` trait + `LocalBackend` impl + generic contract test suite
+- `mvm-core::volume` wire types (`OrgId`, `WorkspaceId`, `Volume`, `VolumeName`, `VolumeBackendConfig`, `ObjectStoreSpec`, `WrappedKey`)
+- `mvm-runtime::vm::volume_registry` (replaces `share_registry`; spawns virtiofsd)
+- vsock `MountVolume` / `UnmountVolume` verbs replacing `MountShare` / `UnmountShare`
+- `mvmctl volume create|ls|rm` + `mvmctl up --volume <name>:<path>`
+- `mvm-security::policy::VolumeNamePolicy` + `MountPathPolicy` `/nix*` deny extension
+- `mkGuest.volumeMounts` Nix attrset surfacing into the boot manifest
+
+**Convergence rule:** when Sprint 49 lands on `main`, the migration plan's Phase 2 (encryption everywhere + volumes) absorbs plan 45's mvm-side artifacts as-is — we do **not** re-derive `mvm-storage` or volume types from `../mvm/crates/`. The migration's Phase 2 work then becomes additive: AEAD-encrypted snapshots layer on top of `VolumeBackend`; key rotation reuses plan 45's `WrappedKey` shape; FDE doctor check folds into Phase 9.
+
+Backend tier matrix gap closed simultaneously: ADR-002 now lists Cloud Hypervisor (Tier 1 peer of Firecracker — wider device model, VFIO/GPU/virtio-fs) and microsandbox / libkrun (Tier 2, cross-platform default per ADR-013). Plan 45's `LocalBackend` mounts via virtiofsd; CH's wider device model is what makes virtio-fs natively viable on the Tier 1 path.
 
 ### Cornerstones
 

@@ -1,6 +1,6 @@
 //! Volume wire types — shared between mvm and mvmd.
 //!
-//! See [`specs/plans/45-filesystem-volumes-e2b-parity.md`] for the design.
+//! See [`specs/plans/45-filesystem-volumes.md`] for the design.
 //! All types here are pure data; behaviour (the `VolumeBackend` trait and
 //! its impls) lives in the `mvm-storage` crate.
 //!

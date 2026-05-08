@@ -161,7 +161,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         .collect::<Result<Vec<_>>>()
         .context("Invalid --secret value")?;
 
-    // Sandbox metadata (W1 of the e2b parity plan). Tag charset/length
+    // Sandbox metadata (W1 of the filesystem-volumes plan). Tag charset/length
     // validation happens in the security crate so audit-event emission
     // and webhook bodies see only validated input. TTL parsing rejects
     // out-of-range values (< 1s, > 30d) up front.

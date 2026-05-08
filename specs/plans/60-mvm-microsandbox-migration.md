@@ -8,7 +8,7 @@ The pivot in this iteration: **microsandbox (libkrun-backed) becomes the builder
 
 ### Product positioning — the workloads we must serve
 
-mvm is a **safe execution environment for AI agents and developer code**, in the same product class as smolmachines.com, E2B, Modal sandboxes, and OpenAI Code Interpreter. The five workloads we must serve well:
+mvm is a **safe execution environment for AI agents and developer code**, in the same product class as smolmachines.com, Modal sandboxes, and OpenAI Code Interpreter. The five workloads we must serve well:
 
 1. **Claude-Code-in-dangerous-mode**: a developer runs Claude Code (or another agent) inside a microVM where they don't have to approve every action — the VM itself is the security boundary. The host stays safe even when the agent does anything within the VM.
 2. **One-click "safe OpenClaw"** deployment template — hardened defaults, audit log, restricted egress.
@@ -46,7 +46,7 @@ The current hand-written skeleton (`mvm-backend::Backend<Sb,Ctx>`, `mvm-builder:
                   ▼                                       ▼
    ┌──────────────────────────┐         ┌──────────────────────────┐
    │  Modal-style decorators   │         │      mvm CLI (mvmctl)    │
-   │  + e2b-style runtime API  │         │  init, build, up, exec,  │
+   │  + sandbox-runtime API    │         │  init, build, up, exec,  │
    │       (mvm-sdk)           │         │  install, session, …     │
    └──────────────────────────┘         └──────────────────────────┘
                   │                                       │
@@ -140,7 +140,7 @@ mvm/                              (renamed from mvm-runtime/ at the end)
 │   ├── mvm/
 │   │   ├── __init__.py           (re-exports: Sandbox, App, Image, Secret, Volume, …)
 │   │   ├── _native/              (pyo3-built native extension for hot paths)
-│   │   ├── runtime.py            (Sandbox / AsyncSandbox — e2b-shaped)
+│   │   ├── runtime.py            (Sandbox / AsyncSandbox — sandbox-runtime-shaped)
 │   │   ├── declarative.py        (App, Image, Secret, Volume, decorators)
 │   │   ├── _types.pyi            (auto-generated from mvm-core)
 │   │   └── tests/
@@ -150,7 +150,7 @@ mvm/                              (renamed from mvm-runtime/ at the end)
 │   ├── tsconfig.json
 │   ├── src/
 │   │   ├── index.ts              (re-exports)
-│   │   ├── runtime.ts            (Sandbox — e2b-shaped, Promise-based)
+│   │   ├── runtime.ts            (Sandbox — sandbox-runtime-shaped, Promise-based)
 │   │   ├── declarative.ts        (App, Image, Secret, Volume, TC39 decorators)
 │   │   ├── types.d.ts            (auto-generated via ts-rs from mvm-core)
 │   │   └── _native/              (napi-rs binding for hot paths)
@@ -414,7 +414,7 @@ mvmctl snapshot export <id> > snap.bin       # signed portable bundle (for backu
 mvmctl snapshot import < snap.bin            # imports if signature verifies + tenant matches
 ```
 
-### SDK surface (runtime, e2b-style)
+### SDK surface (runtime, sandbox-runtime-style)
 ```rust
 let snap = sb.snapshot()
     .name("pre-untrusted")
@@ -567,17 +567,17 @@ These live in `mvm-supervisor/src/tools/`. The MCP server (Phase 7) exposes the 
 
 ## SDK DX design — Rust + Python + TypeScript, three first-class SDKs
 
-Three SDKs, all first-class, all targeting **e2b-/microsandbox-style runtime** + **Modal-style decorators**. Common Rust core protocol; language-specific surface idiomatic to each ecosystem.
+Three SDKs, all first-class, all targeting **microsandbox-style runtime + sandbox-runtime API surface** + **Modal-style decorators**. Common Rust core protocol; language-specific surface idiomatic to each ecosystem.
 
 ### Architecture
 ```
                 ┌──────────────────────────────────────┐
                 │        Python SDK (PyPI: mvm)         │
-                │  e2b-style runtime + Modal decorators │
+                │  sandbox runtime + Modal decorators   │
                 └──────────────────────────────────────┘
                 ┌──────────────────────────────────────┐
                 │      TypeScript SDK (npm: @mvm/sdk)   │
-                │  e2b-style runtime + TC39 decorators  │
+                │  sandbox runtime + TC39 decorators    │
                 └──────────────────────────────────────┘
                 ┌──────────────────────────────────────┐
                 │    Rust SDK (crates.io: mvm-sdk)      │
@@ -611,17 +611,17 @@ This guarantees the three SDKs report the same shapes for the same protocol stru
 
 ---
 
-### Style 1 — Runtime SDK (faithful to e2b interface)
+### Style 1 — Runtime SDK (faithful to the established sandbox-runtime interface)
 
-The runtime SDK matches **e2b's documented API** (https://e2b.dev/docs/sandbox) method-for-method, so anyone who has used e2b can use mvm without re-learning. mvm-specific extensions (snapshots with our richer model, secrets, attestation, computer_use, network policy) are clearly additive — they layer on top, never displace e2b's primitives.
+The runtime SDK matches the **established sandbox-runtime documented API** method-for-method, so anyone who has used the established sandbox-runtime category APIs can use mvm without re-learning. mvm-specific extensions (snapshots with our richer model, secrets, attestation, computer_use, network policy) are clearly additive — they layer on top, never displace the category's primitives.
 
-#### Core lifecycle (mirrors e2b 1:1)
+#### Core lifecycle (mirrors the established sandbox-runtime API 1:1)
 
 **Python**:
 ```python
 from mvm import Sandbox
 
-# Create — mirrors e2b's signature exactly
+# Create — mirrors the established sandbox-runtime signature exactly
 sbx = Sandbox(timeout=300, metadata={"job": "agent-run-42"})
 # or with explicit template
 sbx = Sandbox(template="ai-sandbox", timeout_ms=300_000, metadata={...})
@@ -684,7 +684,7 @@ sbx.resume().await?;
 sbx.kill().await?;
 ```
 
-#### Commands (mirrors e2b — foreground + background under one namespace)
+#### Commands (mirrors the sandbox-runtime convention — foreground + background under one namespace)
 
 **Python**:
 ```python
@@ -722,7 +722,7 @@ while let Some(line) = stdout.next().await { println!("{line}"); }
 proc.kill().await?;
 ```
 
-#### Files (mirrors e2b primitives — read, write, list, remove, rename, make_dir, exists, watch_dir)
+#### Files (mirrors sandbox-runtime primitives — read, write, list, remove, rename, make_dir, exists, watch_dir)
 
 **Python**:
 ```python
@@ -774,7 +774,7 @@ while let Some(event) = watcher.next().await {
 watcher.stop().await?;
 ```
 
-#### PTY (terminal sessions — mirrors e2b)
+#### PTY (terminal sessions — mirrors the sandbox-runtime convention)
 
 **Python**:
 ```python
@@ -803,9 +803,9 @@ term.resize(30, 120).await?;
 term.kill().await?;
 ```
 
-#### Code interpreter (sub-package, mirrors `@e2b/code-interpreter`)
+#### Code interpreter (sub-package — established sandbox-runtime convention)
 
-The `run_code` / `runCode` API lives in a separate package, exactly as e2b organizes it:
+The `run_code` / `runCode` API lives in a separate package, mirroring how the established sandbox-runtime category organizes its code-interpreter SDK:
 
 **Python** — `pip install mvm[code-interpreter]` (or `pip install mvm-code-interpreter`):
 ```python
@@ -868,11 +868,11 @@ These are thin wrappers over the core `Sandbox` with the matching template + REP
 - **TypeScript**: all methods return `Promise`; `await using` (TC39 explicit-resource-management) supported for auto-cleanup.
 - **Rust**: tokio-based; `Drop` impl issues a best-effort kill if not explicitly closed.
 
-#### mvm extensions (additive — not in e2b)
+#### mvm extensions (additive — beyond the established sandbox-runtime surface)
 
-These layer on top of the e2b-compatible surface. None of them rename or remove an e2b primitive.
+These layer on top of the category-compatible surface. None of them rename or remove a sandbox-runtime primitive.
 
-- `sbx.snapshot.save / restore / list / fork / delete / diff / export / import` — full snapshot model from earlier section. (e2b has only `pause`/`resume`; we keep those AND add this.)
+- `sbx.snapshot.save / restore / list / fork / delete / diff / export / import` — full snapshot model from earlier section. (The established sandbox-runtime surface has only `pause`/`resume`; we keep those AND add this.)
 - `sbx.secrets.put / get / list / rotate` — per-tenant secret access bound to the VM
 - `sbx.network.allow / deny / show` — runtime egress adjustments (subject to tenant policy ceiling — cannot exceed the policy)
 - `sbx.computer_use.{screenshot, input, windows, clipboard, process_list}` — present only when the sandbox is built from a `computer-use` template
@@ -880,7 +880,7 @@ These layer on top of the e2b-compatible surface. None of them rename or remove 
 - `sbx.metrics()` — current per-VM resource counters (CPU sec, memory, disk bytes, egress bytes)
 - `sbx.logs()` — structured JSON tail of the guest's logs
 
-These are namespaced under sub-objects so the core surface stays exactly e2b-shaped.
+These are namespaced under sub-objects so the core surface stays exactly sandbox-runtime-shaped.
 
 #### Surface parity guaranteed across all three SDKs
 Every method present on one is present on the others with semantically-identical behaviour. CI test `tests/sdk_compat/` runs the same scenario fixtures (create → write → run → snapshot → reconnect → kill, etc.) against all three and diffs the output.
@@ -1050,11 +1050,11 @@ The `mvm-tree-sitter` crate (Phase 5) ships grammars for *all three* declarative
 - **Phase 9**: All three SDKs go beta with full surface parity tests in `tests/sdk_compat/`
 
 ### ADR
-- ADR-017 (already in catalog) extended: "Modal-style decorators + e2b-style runtime DX, **across Rust + Python + TypeScript**, with shared wire protocol and CI-enforced parity tests."
+- ADR-017 (already in catalog) extended: "Modal-style decorators + sandbox-runtime DX, **across Rust + Python + TypeScript**, with shared wire protocol and CI-enforced parity tests."
 
 ---
 
-## (Legacy) SDK DX design — Modal-style decorators + e2b-style runtime
+## (Legacy) SDK DX design — Modal-style decorators + sandbox-runtime API surface
 
 ### Definition-time DX (Modal-like, decorator-driven, tree-sitter-friendly)
 
@@ -1087,9 +1087,9 @@ Each macro emits both runtime metadata (consumed by `mvmctl build`) and a stable
 
 **Tree-sitter integration** (Phase 5+): `mvm-tree-sitter` crate ships grammars for `mvm.toml`, our subset of Nix, and source files using the `mvm-sdk` macros. The future AI safety scanner walks these trees, flags risky configs (overly broad `egress_allow`, unencrypted volumes carrying PII tags, missing seccomp tier), and proposes patches.
 
-### Runtime DX (microsandbox/e2b-like, imperative)
+### Runtime DX (microsandbox-style, imperative)
 
-When users want to spin up sandboxes from running code (think: an LLM agent invoking code execution), the SDK gives them an e2b/microsandbox-shaped API:
+When users want to spin up sandboxes from running code (think: an LLM agent invoking code execution), the SDK gives them a microsandbox-shaped API in line with the established sandbox-runtime category:
 
 ```rust
 use mvm_sdk::runtime::Sandbox;
@@ -1443,7 +1443,7 @@ Every architecturally-significant decision in this plan **must** be reflected in
 | 019 | Audit-everything coverage matrix | Phase 4 | NEW |
 | 020 | PII redaction tokenization scheme | Phase 6 | NEW |
 | 021 | Addons composability model | Phase 5 + 7b | NEW |
-| 022 | Modal-style decorators + e2b-style runtime DX (multi-language: Rust + Python + TypeScript) | Phase 5 + 7b + 9 | NEW |
+| 022 | Modal-style decorators + sandbox-runtime DX (multi-language: Rust + Python + TypeScript) | Phase 5 + 7b + 9 | NEW |
 | 023 | Long-running session model (tmux-backed) | Phase 7 | NEW |
 | 024 | Computer-use RPC surface | Phase 7b | NEW |
 | 025 | Transparent install/rebuild flow | Phase 7a | NEW |
@@ -1761,7 +1761,7 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 
 **Action**:
 - Port `mvm-sdk` from `/Users/auser/work/tinylabs/mvmco/mvmforge/crates/mvmforge-sdk/` (single `lib.rs` today; small port). Split into `mvm-sdk-macros` (proc macros for `#[mvm::function]`, `#[mvm::image]`, `#[mvm::secret]`, `#[mvm::volume]`, `#[mvm::addon]`) + `mvm-sdk` (runtime + types) + `mvm-sdk-addon` (addon trait + registry).
-- Wire the e2b/microsandbox-style runtime API: `Sandbox::builder().image(…).build()`, `.run_code()`, `.commands().run()`, `.files().read/write`, `.process().spawn()`, `.snapshot().save()`, `.kill()`.
+- Wire the microsandbox-style sandbox-runtime API: `Sandbox::builder().image(…).build()`, `.run_code()`, `.commands().run()`, `.files().read/write`, `.process().spawn()`, `.snapshot().save()`, `.kill()`.
 - **Stand up Python SDK** (`python/mvm`): runtime (`Sandbox`, `AsyncSandbox`) + declarative (`App`, `Image`, `Secret`, `Volume`, `@app.function`, `@app.cls`, `@mvm.enter`, `@mvm.method`, `@app.web_endpoint`, `Cron`, `f.local()`/`f.remote()`). pyo3-built native extension for hot-path JSON-RPC; pure-Python for the rest. Wheels for Linux/macOS/Windows on Python 3.10+.
 - Type stubs: `cargo xtask gen-stubs` emits `python/mvm/_types.pyi` (Pydantic-derived) and `typescript/src/types.d.ts` (`ts-rs`-derived). CI fails if hand-edited stubs drift from generated.
 - Auth: SDK reads `MVM_TOKEN` env or `~/.mvm/token` for hosted-cloud auth; local dev uses Unix socket with no token.

@@ -1,4 +1,4 @@
-//! TTL reaper — Wave 1, Control 5 of the e2b parity plan.
+//! TTL reaper — Wave 1, Control 5 of the filesystem-volumes plan.
 //!
 //! Walks the persistent VM name registry on a tick, finds records
 //! whose `expires_at` has elapsed, fires a teardown callback, and

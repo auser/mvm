@@ -1,4 +1,4 @@
-//! Path policy — Control 1 of the e2b parity plan.
+//! Path policy — Control 1 of the filesystem-volumes plan.
 //!
 //! Single chokepoint for *every* host-supplied path that reaches the
 //! guest filesystem. New FS verbs (`FsRead`, `FsWrite`, …) and the
@@ -115,7 +115,7 @@ impl CanonicalPath {
 /// Path policy with deny-prefixes and optional allow-roots.
 ///
 /// `default()` ships the conservative deny-list called for in the
-/// e2b parity plan §"Phase A1 — FS RPC". Callers can layer
+/// filesystem-volumes plan §"Phase A1 — FS RPC". Callers can layer
 /// additional deny-prefixes via `with_extra_deny`.
 pub struct PathPolicy {
     deny_prefixes: Vec<PathBuf>,

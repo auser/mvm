@@ -96,7 +96,7 @@ still enforces its own contract.
 The "matryoshka" framing comes from the 2026 microVM ecosystem
 discourse (notably <https://emirb.github.io/blog/microvm-2026/>).
 It is the same pattern used by Fly.io Sprites, AWS Lambda's
-SnapStart, E2B, Vercel Sandbox, and Kata Containers. The mvm
+SnapStart, Vercel Sandbox, and Kata Containers. The mvm
 adaptation is that L5 is enforced *inside* the guest by uid/seccomp
 (plan 26), so even a guest-kernel compromise (L3 fall) doesn't grant
 arbitrary access to other in-guest services.
@@ -218,8 +218,9 @@ falls below Tier 1).
 | Backend | L1 | L2 | L3 | L4 | L5 | Notes |
 |---|---|---|---|---|---|---|
 | Firecracker (Linux + KVM) | ✅ | ✅ | ✅ | ✅ | ✅ | **Tier 1** — full ADR-002. All seven claims hold. |
+| Cloud Hypervisor (Linux + KVM) | ✅ | ✅ | ⚠️ in flight | ✅ | ✅ | **Tier 1 peer** of Firecracker — same VMM-TCB shape (rust-vmm), wider device model (VFIO, virtio-fs, larger guests). Claim 3 (verified boot) lands alongside Firecracker via the shared `mvm-verity-init` initramfs path; the CH JSON-API spawn dance is the only delta. Selected over Firecracker when a workload needs VFIO/GPU passthrough or virtio-fs. |
 | Apple Container (macOS 26+ Apple Silicon) | ✅ VZ | ✅ Containerization | ⚠️ no verified boot yet | ✅ | ✅ | Tier 2 — claim 3 partial; claims 1, 2, 4, 5, 6, 7 hold. |
-| libkrun (Linux KVM, macOS HVF) | ✅ | ✅ | ⚠️ no verified boot yet | ✅ | ✅ | Tier 2 — claim 3 partial; comparable VMM TCB to Firecracker. |
+| microsandbox / libkrun (Linux KVM, macOS HVF) | ✅ | ✅ | ⚠️ no verified boot yet | ✅ | ✅ | Tier 2 — claim 3 partial; comparable VMM TCB to Firecracker; shipped as the cross-platform default per ADR-013. macOS arm64/x86_64 + Linux-without-KVM hosts land here. |
 | Docker | ❌ shared host kernel | ❌ container runtime is L2=host kernel | ❌ shared with host | ✅ | ✅ | **Tier 3** — claims 1, 2, 3 do *not* hold; 4, 6, 7 hold; 5 N/A (unix socket). |
 | microvm.nix (QEMU) | ✅ KVM | ⚠️ QEMU TCB much larger | ⚠️ partial verified boot | ✅ | ✅ | Tier 2 — claims 3 partial; QEMU's larger device model raises L2 audit cost. |
 
@@ -298,4 +299,4 @@ uid because of a use case we didn't foresee):
 - The "matryoshka" framing draws on the 2026 microVM ecosystem
   discourse (e.g. <https://emirb.github.io/blog/microvm-2026/>);
   the same defense-in-depth pattern is used by Fly.io Sprites,
-  AWS Lambda SnapStart, E2B, Vercel Sandbox, and Kata Containers.
+  AWS Lambda SnapStart, Vercel Sandbox, and Kata Containers.

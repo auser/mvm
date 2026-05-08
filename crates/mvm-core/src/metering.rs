@@ -17,8 +17,9 @@
 //!
 //! # Three-axis decomposition
 //!
-//! Sprites.dev and e2b.dev both decompose their metering on three
-//! axes — CPU, memory, and storage. Plan 46 mirrors that, with a
+//! Established sandbox-runtime platforms typically decompose their
+//! metering on three axes — CPU, memory, and storage. Plan 46
+//! mirrors that, with a
 //! cold/hot storage split that aligns with the dm-thin pool layout
 //! from Plan 47:
 //!

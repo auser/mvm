@@ -1,5 +1,5 @@
 //! `mvmctl proc <verb> <vm> <args>` — process control RPC against
-//! a running microVM. W1 / A2 of the e2b parity plan.
+//! a running microVM. W1 / A2 of the filesystem-volumes plan.
 //!
 //! **Dev-only.** Production guest agents strip the handler module
 //! per ADR-002 §W4.3 + ADR-007 §W5; calls against a prod agent

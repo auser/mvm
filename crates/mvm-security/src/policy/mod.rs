@@ -1,4 +1,4 @@
-//! Policy enforcement primitives — Control 1 of the e2b parity plan.
+//! Policy enforcement primitives — Control 1 of the filesystem-volumes plan.
 //!
 //! Single source of truth for input validation, path canonicalization,
 //! resource caps, and quota metering. Every new agent / supervisor /

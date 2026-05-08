@@ -152,7 +152,7 @@ pub enum GuestRequest {
     EntrypointStatus,
 
     // ========================================================================
-    // Filesystem RPC (W1 / A1 of the e2b parity plan).
+    // Filesystem RPC (W1 / A1 of the filesystem-volumes plan).
     //
     // Production-safe (unlike `Exec`): every verb is constrained by
     // the agent's uid 901 + W2 read-only bind mounts + the
@@ -233,9 +233,10 @@ pub enum GuestRequest {
     },
 
     // ========================================================================
-    // Process control RPC (W1 / A2 of the e2b parity plan).
+    // Process control RPC (W1 / A2 of the filesystem-volumes plan).
     //
-    // **Dev-only.** These verbs are the closest analog to e2b's
+    // **Dev-only.** These verbs are the closest analog to the
+    // established sandbox-runtime
     // `commands.start/list/signal/sendInput/wait/kill` API; they
     // exist for development and agent-driven workflows where the
     // user wants to launch arbitrary processes interactively.
@@ -251,7 +252,7 @@ pub enum GuestRequest {
     //
     // Distinct from `Exec` (single-shot, blocking) and from
     // `RunEntrypoint` (production-safe baked program). Process
-    // verbs offer e2b-shaped fan-out: spawn many, list them, send
+    // verbs offer sandbox-runtime-shaped fan-out: spawn many, list them, send
     // signals, stream output, send more stdin.
     // ========================================================================
     /// Spawn a new process. Returns a `pid_token` string the host
@@ -315,7 +316,7 @@ pub enum GuestRequest {
     ProcKill { pid_token: String },
 
     // ========================================================================
-    // virtio-fs share mount control (W1 / D of the e2b parity plan).
+    // virtio-fs share mount control (W1 / D of the filesystem-volumes plan).
     //
     // The host launches a `virtiofsd` process exposing a host
     // directory under a virtio-fs `tag`; the agent then runs the

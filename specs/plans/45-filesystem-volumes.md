@@ -1,7 +1,7 @@
-# Plan 45 — Filesystem Volumes for e2b parity (mvm + mvmd)
+# Plan 45 — Filesystem Volumes (sandbox-runtime parity, mvm + mvmd)
 
-> **Status**: design approved 2026-05-06; implementation starting on `worktree-filesystem-volumes-e2b-parity`.
-> **Companion spec**: `mvmd/specs/plans/29-filesystem-volumes-e2b-parity.md` (sister repo).
+> **Status**: design approved 2026-05-06; implementation starting on `worktree-filesystem-volumes`.
+> **Companion spec**: `mvmd/specs/plans/29-filesystem-volumes.md` (sister repo — needs corresponding rename).
 
 ## Discoveries during implementation (read before starting any phase)
 
@@ -14,13 +14,13 @@ These were uncovered after the design conversation but before code landed. They 
 - `BucketProvider` enum (S3, GCS, R2, …) — exactly the `ObjectStoreBackend` use-case.
 - Sealed credentials via `bucket_crypto::seal_credentials` — already encrypted at rest.
 - `bucket_mount_policy::validate_mount_path` — analog of our planned `MountPathPolicy`.
-- `read_only` flag with explicit comment "to match e2b's bucket-write semantics".
+- `read_only` flag with explicit comment "to match the sandbox-runtime bucket-write semantics".
 - Persisted in SQLite `storage_buckets` + `bucket_attachments` tables.
 
 **Implication**: the mvmd-side `FilesystemVolume` type proposed in this plan is largely a *generalisation* of `StorageBucket` to support `LocalBackend` mounts in addition to remote object storage. Three reconciliation paths to evaluate during Phase 13:
 
 1. **Extend `StorageBucket`**: add `BucketProvider::LocalVirtiofs { root }` and adapt the data plane to dispatch via the new `VolumeBackend` trait. Keep the existing tables, REST routes, and CLI verbs. Most code reuse, least disruption to mvmd consumers.
-2. **Rename `StorageBucket` → `Volume` (breaking)**: align mvmd with e2b/mvm naming. Schema migration + REST URL migration. Cleanest naming, biggest blast radius.
+2. **Rename `StorageBucket` → `Volume` (breaking)**: align mvmd with the sandbox-runtime/mvm naming convention. Schema migration + REST URL migration. Cleanest naming, biggest blast radius.
 3. **Coexist** (the original plan assumption): `StorageBucket` stays for object-storage-only use cases; new `FilesystemVolume` covers the broader trait-pluggable surface. Two parallel concepts; risk of confusion.
 
 **Recommendation**: evaluate path 1 first. If it composes cleanly (the trait dispatch fits the existing handler shape), take it — minimal churn, no schema migration. The mvm-side wire types stay named `Volume` regardless; they just deserialise into `StorageBucket` on the mvmd side. Surface this as the first decision (Phase 13.0) before any mvmd code changes.
@@ -78,10 +78,10 @@ The trait abstraction is preserved — both sides implement `VolumeBackend` for 
 
 ## Context
 
-Goal: close the gap between e2b's sandbox storage primitives and mvm/mvmd. Driving question was "where do buckets and volumes belong?" — but reading [e2b's volumes docs](https://www.e2b.dev/docs/volumes) sharpened it:
+Goal: close the gap between established sandbox-runtime storage primitives and mvm/mvmd. Driving question was "where do buckets and volumes belong?" — but the established sandbox-runtime category's volume design sharpened it:
 
-- **e2b has no buckets.** Drop the bucket workstream entirely. Object storage / artifact capture is non-parity work — revisit independently if ever needed.
-- **e2b's Volume is filesystem-semantics + multi-attach + named.** Neither mvm's in-flight share registry nor mvmd's Sprint 39 `VolumeRecord` (exclusive-attach block) match this shape.
+- **The category has no buckets.** Drop the bucket workstream entirely. Object storage / artifact capture is non-parity work — revisit independently if ever needed.
+- **The sandbox-runtime Volume is filesystem-semantics + multi-attach + named.** Neither mvm's in-flight share registry nor mvmd's Sprint 39 `VolumeRecord` (exclusive-attach block) match this shape.
 
 The work: introduce a named, virtio-fs-backed, multi-attach `Volume` primitive in mvm, mirrored as `FilesystemVolume` in mvmd, with both a mount path and an out-of-band data plane.
 
@@ -90,25 +90,25 @@ The work: introduce a named, virtio-fs-backed, multi-attach `Volume` primitive i
 | Shape | Backing | Attach | Format | Example |
 |---|---|---|---|---|
 | Block volume | virtio-blk | Exclusive (one writer) | Raw bytes; guest formats | mvmd's existing `VolumeRecord` |
-| **Filesystem volume** | **virtio-fs** | **Multi-attach** | **Host owns filesystem; guest mounts a dir** | **e2b Volume — what we're building** |
+| **Filesystem volume** | **virtio-fs** | **Multi-attach** | **Host owns filesystem; guest mounts a dir** | **Sandbox-runtime Volume — what we're building** |
 
 The existing block `VolumeRecord` in mvmd stays — useful for EBS-style workloads. The new `FilesystemVolume` is parallel, not a replacement.
 
-## What e2b documents (verbatim where possible)
+## What established sandbox runtimes document (paraphrased)
 
 - "Volumes provide persistent storage that exists independently of sandbox lifecycles."
 - "Data written to a volume persists even after a sandbox is shut down."
 - "one volume shared across multiple sandboxes" — multi-attach explicit.
 - Mounted at sandbox creation: `Sandbox.create({ volumeMounts: { '/mnt/my-data': volume } })`.
 - Created by name: `Volume.create('my-volume')`.
-- "SDK methods are meant to be used when the volume is not mounted to any sandbox" → standalone data plane (`upload`/`download`/`read`/`write`).
-- Currently in private beta — match the documented surface, don't over-engineer.
+- SDK methods are meant to be used when the volume is not mounted to any sandbox → standalone data plane (`upload`/`download`/`read`/`write`).
+- Often in private beta in the established category — match the documented surface, don't over-engineer.
 
 ## Locked-in decisions (from grilling)
 
-1. **No buckets** in either repo for this plan. e2b doesn't have them.
+1. **No buckets** in either repo for this plan. The established sandbox-runtime category doesn't have them.
 2. **Vsock verb rename, no compat shim.** `MountShare`/`UnmountShare` → `MountVolume`/`UnmountVolume`. The in-flight share registry on this branch is untracked, so nothing to deprecate — fold it directly into the volume primitive. **No `share` CLI command. No `ShareEntry` type. Volume is the only concept.**
-3. **mvmd is in scope** as part of this plan. Wire format defined in `mvm-core`, consumed by both repos. A companion spec file gets written to `/Users/auser/work/tinylabs/mvmco/mvmd/specs/plans/24-filesystem-volumes-e2b-parity.md`.
+3. **mvmd is in scope** as part of this plan. Wire format defined in `mvm-core`, consumed by both repos. A companion spec file gets written to `/Users/auser/work/tinylabs/mvmco/mvmd/specs/plans/24-filesystem-volumes.md`.
 4. **`data_disk` (plan 38) stays separate.** Different shape (single-VM exclusive virtio-blk persistent disk). Don't fold in.
 5. **No backward compatibility.** Greenfield rename of in-flight surfaces is fine.
 6. **Backends are trait-pluggable, not enum-switched.** A `VolumeBackend` trait is the contract; each backing (Local, ObjectStore, future NFS/CephFs) is an impl. Mountability is a method on the trait, not a separate dimension. New backend = implement trait + register constructor.
@@ -267,7 +267,7 @@ pub struct ObjectStoreSpec {
 - Reuses workspace `reqwest`. No new crate. Auth via Bearer token resolved through existing secret store.
 
 **W-Mount-API — declarative mount at boot.**
-- `mvmctl up` / `mvmctl run` gain repeatable `--volume <name>:<guest_path>[:ro]` (matches e2b's `volumeMounts`).
+- `mvmctl up` / `mvmctl run` gain repeatable `--volume <name>:<guest_path>[:ro]` (matches the sandbox-runtime `volumeMounts` convention).
 - Boot path: resolve name → fetch backend via `make_backend(config)` → check `backend.local_export_path()`. If `Some(path)` → spawn `virtiofsd` on that path → boot Firecracker with virtio-fs device → guest agent runs `MountVolume { volume_name, guest_path, read_only }`. If `None` → return clear error (`"volume '<name>' has backend kind=ObjectStore which is data-plane-only and cannot be mounted; use `mvmctl volume cp` instead"`).
 - Cap: 16 mounts/VM.
 
@@ -307,7 +307,7 @@ pub struct ObjectStoreSpec {
 
 ### Companion spec file in mvmd
 
-Write `/Users/auser/work/tinylabs/mvmco/mvmd/specs/plans/24-filesystem-volumes-e2b-parity.md` with the mvmd-side workstream broken into phases (matches mvmd's existing plan format — see `16-dns-volumes-floating-ip.md` for shape: Context, Baseline, MiniMax-style gap table, phase breakdown, exit criteria).
+Write `/Users/auser/work/tinylabs/mvmco/mvmd/specs/plans/24-filesystem-volumes.md` with the mvmd-side workstream broken into phases (matches mvmd's existing plan format — see `16-dns-volumes-floating-ip.md` for shape: Context, Baseline, MiniMax-style gap table, phase breakdown, exit criteria).
 
 ## Provider-backed volumes across the ecosystem
 
@@ -693,7 +693,7 @@ Each item is a real follow-up candidate, not a "rejected" list. Captured here wi
 
 ### B1 — Buckets as a separate primitive
 - **What**: First-class `Bucket` resource (object storage exposed as its own API, distinct from `Volume`). PUT/GET/LIST/DELETE without filesystem semantics.
-- **Why deferred**: e2b doesn't have it; we'd be inventing a new concept just to wrap S3 when `ObjectStoreBackend` already covers the underlying use case. mvmd Sprint 129 plans a "Managed Storage" track that's the natural home.
+- **Why deferred**: established sandbox runtimes don't have it; we'd be inventing a new concept just to wrap S3 when `ObjectStoreBackend` already covers the underlying use case. mvmd Sprint 129 plans a "Managed Storage" track that's the natural home.
 - **Trigger**: customer/use-case demand for object-storage-as-product (multi-tenant artifact stores, output capture systems) where treating it as a Volume is awkward.
 
 ### B2 — Cross-host multi-attach (NFS, CephFs backends)
@@ -713,7 +713,7 @@ Each item is a real follow-up candidate, not a "rejected" list. Captured here wi
 
 ### B5 — Hot attach/detach to running instances
 - **What**: `mvmctl volume attach <name> --to-running <vm>` mounts a volume to an already-booted VM. Likewise detach without VM teardown.
-- **Why deferred**: e2b mounts at sandbox-create only; not a parity item. Firecracker has limited hot-plug support for virtio-fs (varies by kernel).
+- **Why deferred**: established sandbox runtimes mount at sandbox-create only; not a parity item. Firecracker has limited hot-plug support for virtio-fs (varies by kernel).
 - **Trigger**: workflow needs a long-lived sandbox to gain/lose volumes without restart.
 
 ### B6 — Cross-workspace ACL grants
@@ -832,7 +832,7 @@ These are committed via PR #87 (commit `c022a74`) on `feat/sprites-and-upstream-
 - `crates/mvmd-coordinator/src/auth.rs` (or wherever existing auth lives) — extend permission catalog with `fs_volume:*` verbs and role mappings.
 
 **mvmd — create:**
-- `specs/plans/24-filesystem-volumes-e2b-parity.md` — companion plan spec.
+- `specs/plans/24-filesystem-volumes.md` — companion plan spec.
 
 ## Verification
 

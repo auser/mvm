@@ -1,4 +1,4 @@
-//! Per-VM metrics sampler — A3 of the e2b parity plan.
+//! Per-VM metrics sampler — A3 of the filesystem-volumes plan.
 //!
 //! Pulls CPU, memory, disk, and network counters for one VM and
 //! pushes them into `mvm_core::observability::instance_metrics`.

@@ -1,4 +1,4 @@
-//! Template tags + aliases — A6 of the e2b parity plan.
+//! Template tags + aliases — A6 of the filesystem-volumes plan.
 //!
 //! Tags and aliases are persisted alongside a template's revision
 //! catalog rather than embedded in `TemplateRevision` so the

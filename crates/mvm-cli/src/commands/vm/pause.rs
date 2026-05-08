@@ -1,5 +1,5 @@
 //! `mvmctl pause <vm>` / `mvmctl resume <vm>` — instance snapshot
-//! lifecycle. W1 / A4 of the e2b parity plan.
+//! lifecycle. W1 / A4 of the filesystem-volumes plan.
 //!
 //! `pause` quiesces the running VM, asks Firecracker to write
 //! `vmstate.bin` + `mem.bin` to `~/.mvm/instances/<vm>/snapshot/`,

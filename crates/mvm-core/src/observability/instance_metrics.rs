@@ -1,7 +1,7 @@
-//! Per-VM metrics — A3 of the e2b parity plan.
+//! Per-VM metrics — A3 of the filesystem-volumes plan.
 //!
 //! Today's `metrics::Metrics` is a single global counter set
-//! describing the host process as a whole. e2b-style sandbox SDKs
+//! describing the host process as a whole. Sandbox-runtime SDKs
 //! need per-VM cardinality (CPU/mem/disk/net for a single
 //! sandbox), labelled by `instance_id`, `tenant`, and `template`,
 //! with mvmd able to scrape one VM's slice without touching others.

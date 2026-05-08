@@ -1,4 +1,4 @@
-//! Process control RPC handler — A2 of the e2b parity plan.
+//! Process control RPC handler — A2 of the filesystem-volumes plan.
 //!
 //! **Dev-only.** The whole module is gated behind
 //! `#[cfg(feature = "dev-shell")]` in `lib.rs`, so its symbols are

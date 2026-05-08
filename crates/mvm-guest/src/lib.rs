@@ -13,7 +13,7 @@ pub mod vsock;
 pub mod worker_pool;
 pub mod worker_protocol;
 
-/// Process control RPC handler — A2 of the e2b parity plan.
+/// Process control RPC handler — A2 of the filesystem-volumes plan.
 /// Dev-only: gated behind `dev-shell` so symbols are stripped from
 /// production guest agents (ADR-002 §W4.3 + ADR-007 §W5).
 #[cfg(feature = "dev-shell")]

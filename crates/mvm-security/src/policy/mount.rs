@@ -1,4 +1,4 @@
-//! Mount-path policy — D of the e2b parity plan.
+//! Mount-path policy — D of the filesystem-volumes plan.
 //!
 //! Restricts where a host-supplied virtio-fs share can land inside
 //! the guest. Shares cross the verity boundary (they're not part
