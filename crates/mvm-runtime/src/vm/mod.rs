@@ -10,6 +10,7 @@ pub mod instance_snapshot;
 pub mod libkrun;
 pub mod lima;
 pub mod lima_state;
+pub mod microsandbox;
 pub mod microvm;
 pub mod microvm_nix;
 pub mod name_registry;

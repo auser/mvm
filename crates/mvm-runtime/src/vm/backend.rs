@@ -7,6 +7,7 @@ use mvm_core::vm_backend::{
 use super::apple_container::AppleContainerBackend;
 use super::docker::DockerBackend;
 use super::libkrun::LibkrunBackend;
+use super::microsandbox::MicrosandboxBackend;
 use super::{firecracker, microvm, microvm_nix};
 use crate::config::{PortMapping, VMS_DIR};
 use crate::shell::run_in_vm_stdout;
@@ -199,6 +200,10 @@ pub enum AnyBackend {
     /// libkrun (plan 53 §"Plan E") — Linux KVM / macOS HVF, including
     /// macOS Intel where Apple Container is unavailable.
     Libkrun(LibkrunBackend),
+    /// microsandbox (plan 60 — ADR-013) — higher-level libkrun wrapper;
+    /// the cross-platform Phase 1 default for macOS/Windows. Linux still
+    /// prefers Firecracker when KVM is available.
+    Microsandbox(MicrosandboxBackend),
 }
 
 impl AnyBackend {
@@ -228,6 +233,7 @@ impl AnyBackend {
             "apple-container" => Self::AppleContainer(AppleContainerBackend),
             "docker" => Self::Docker(DockerBackend),
             "libkrun" | "krun" => Self::Libkrun(LibkrunBackend),
+            "microsandbox" | "msb" => Self::Microsandbox(MicrosandboxBackend),
             "qemu" => Self::MicrovmNix(MicrovmNixBackend),
             _ => Self::Firecracker(FirecrackerBackend),
         }
@@ -281,6 +287,7 @@ impl AnyBackend {
             Self::AppleContainer(b) => b,
             Self::Docker(b) => b,
             Self::Libkrun(b) => b,
+            Self::Microsandbox(b) => b,
         }
     }
 
@@ -484,6 +491,29 @@ mod tests {
     fn test_any_backend_from_hypervisor_unknown_defaults() {
         let backend = AnyBackend::from_hypervisor("unknown");
         assert_eq!(backend.name(), "firecracker");
+    }
+
+    #[test]
+    fn test_any_backend_from_hypervisor_microsandbox() {
+        // Plan 60 ADR-013 — explicit "microsandbox" routing. Both the
+        // long form and the short alias resolve to the same backend so
+        // CLI users can type either.
+        let long = AnyBackend::from_hypervisor("microsandbox");
+        let short = AnyBackend::from_hypervisor("msb");
+        assert_eq!(long.name(), "microsandbox");
+        assert_eq!(short.name(), "microsandbox");
+    }
+
+    #[test]
+    fn test_microsandbox_via_any_backend_security_profile_tier_2() {
+        // The dispatch must surface the inner backend's full security
+        // profile — regression-guard against AnyBackend silently dropping
+        // a variant from `inner()` (the most common bug shape when adding
+        // a new arm to the enum).
+        let backend = AnyBackend::from_hypervisor("microsandbox");
+        let profile = backend.security_profile();
+        assert_eq!(profile.tier, "Tier 2");
+        assert!(profile.layer_coverage.is_microvm());
     }
 
     #[test]
