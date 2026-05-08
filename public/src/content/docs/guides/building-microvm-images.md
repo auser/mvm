@@ -152,13 +152,13 @@ The `mkGuest` library produces a **busybox-as-PID-1** rootfs (no NixOS, no syste
 
 **Floor: ≤ 300 ms cold p50 on every backend.** A backend that can't hit it is a backend we drop.
 
-| Backend | Cold p50 | Snapshot-cloned p50 |
-|---|---|---|
-| Firecracker (Linux/KVM) | ≤ 300 ms | ≤ 30 ms |
-| microsandbox / libkrun (Linux/KVM) | ≤ 300 ms | ≤ 30 ms |
-| microsandbox / libkrun (macOS HVF) | ≤ 300 ms | ≤ 60 ms |
-| Apple Virtualization framework | ≤ 300 ms | ≤ 200 ms |
-| Cloud Hypervisor (post-Phase-10) | ≤ 300 ms | ≤ 50 ms |
+| Backend | Cold p50 | Snapshot-cloned p50 | Notes |
+|---|---|---|---|
+| Firecracker (Linux/KVM) | ≤ 300 ms | ≤ 30 ms | Default for typical workloads. |
+| Cloud Hypervisor (Linux/KVM) | ≤ 300 ms | ≤ 50 ms | Tier-1 peer of FC. Adds VFIO/GPU, virtio-gpu, virtio-fs, larger guests. Opt-in via `--hypervisor cloud-hypervisor`. |
+| microsandbox / libkrun (Linux/KVM) | ≤ 300 ms | ≤ 30 ms | Cross-platform default; libkrun-backed. |
+| microsandbox / libkrun (macOS HVF) | ≤ 300 ms | ≤ 60 ms | macOS path; HVF adds ~100ms over KVM. |
+| Apple Virtualization framework | ≤ 300 ms | ≤ 200 ms | Legacy ladder; superseded by microsandbox per ADR-013. |
 
 The numbers are surfaced on every `mkGuest` derivation as `passthru.mvm.expectedBootMs` so you can `nix eval .#default.passthru.mvm.expectedBootMs` to confirm. Phase 9 enforces with `xtask perf --backend <name> --p50-ms 300 --runs 100`. See [ADR-013 §"Boot-time budget"](https://github.com/auser/mvm/blob/main/specs/adrs/013-microsandbox-libkrun-microvm-nix-pivot.md) for rationale.
 

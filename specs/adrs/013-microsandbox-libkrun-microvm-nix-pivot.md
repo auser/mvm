@@ -73,11 +73,11 @@ The previous iteration shipped this exact strategy and was approaching the upstr
 
 | Backend | Cold p50 | Snapshot-cloned p50 | Notes |
 |---|---|---|---|
-| Firecracker (Linux/KVM) | ≤ 300 ms | ≤ 30 ms | Trivially achievable with custom init; aim for ~150 ms in practice. |
+| Firecracker (Linux/KVM) | ≤ 300 ms | ≤ 30 ms | Default for typical mvm workloads. Smallest attack surface; the security work (jailer, dm-verity, seccomp tier) targets it. |
+| **Cloud Hypervisor (Linux/KVM)** | ≤ 300 ms | ≤ 50 ms | Tier-1 peer of Firecracker; rust-vmm-based; passes the §"fork test." Picks up where FC stops: VFIO passthrough, virtio-gpu, virtio-fs, larger guests. Opt-in via `--hypervisor cloud-hypervisor`. |
 | microsandbox / libkrun (Linux/KVM) | ≤ 300 ms | ≤ 30 ms | libkrunfw bundles kernel; matches Firecracker on Linux. |
 | microsandbox / libkrun (macOS HVF) | ≤ 300 ms | ≤ 60 ms | HVF init overhead is real; reaching the floor needs the kernel + initramfs trim from §"Boot-time budget" to be tight. |
 | Apple Virtualization framework | ≤ 300 ms | ≤ 200 ms | Apple's hypervisor overhead. If we can't hit 300 ms here we drop the backend (see ADR-031 — macOS path is microsandbox-direct anyway). |
-| Cloud Hypervisor (post-Phase-10) | ≤ 300 ms | ≤ 50 ms | Same target; slightly heavier device model. |
 
 CI perf gate: `xtask perf --backend <name> --p50-ms 300 --runs 100` (Phase 9). The smoke at `tests/smoke_e2e_boot.rs` (Phase 1 W6) runs a single boot and asserts the floor on every PR that touches the boot path.
 
@@ -98,6 +98,33 @@ PID 1 stays uid 0 (kernel mandate) but exec's nothing as root after the supervis
 - W6.1.2 swaps in the real Rust binary (`crates/mvm-guest/src/bin/mvm-guest-agent.rs` — ~2400 LOC of vsock RPC). That swap needs cross-compile infrastructure (a Linux builder) and is its own focused wave.
 
 The supervision wiring matters even with the stub because: (a) the dev/prod uid split is real today, (b) `/etc/passwd` + `/etc/group` are baked correctly today, (c) the host-side `mvmctl status` cross-check against `/proc/<pid>/status` works today, and (d) swapping the binary path in the rootfs population step is a one-line change.
+
+## Cloud Hypervisor as a Tier 1 peer of Firecracker
+
+Firecracker is the default for typical mvm workloads — smallest attack surface, fastest boot, and the existing security overlay (jailer, dm-verity, seccomp tier) targets it. But Firecracker is intentionally minimal: it deliberately excludes VFIO passthrough, virtio-gpu, virtio-fs (in any rich form), and tops out at modest guest sizes. **Cloud Hypervisor (CH)** picks up where Firecracker stops:
+
+- **VFIO passthrough** — pass a PCI device (NVIDIA GPU, NIC, custom accelerator) directly into the guest. Required for compute-GPU workloads (CUDA, ROCm). FC will not implement this; CH does today.
+- **virtio-gpu** — accelerated graphics for in-VM rendering. Required for `computer-use`-style templates that need a real display.
+- **virtio-fs** — high-throughput shared filesystem between host and guest. FC supports a more limited path; CH's is closer to native.
+- **Larger guests** — CH's device model handles more vCPUs and devices than FC's deliberately minimal one.
+
+**Tier classification:** CH is rust-vmm-based and passes the plan-53 §"fork test" (rust-vmm origin, ~80K LOC core, no Firecracker-excluded features in the boot path; the richer device set is opt-in per VM, not always-on). Same Tier 1 posture as Firecracker; the choice between them is workload-shape, not security-shape.
+
+**Selection model:**
+- `auto_select()` keeps Firecracker as the KVM default (no behavioral change for typical workloads).
+- CH is opt-in via `mvmctl run --hypervisor cloud-hypervisor` or the `mkGuest { hypervisor = "cloud-hypervisor"; }` argument.
+- Aliases: `cloud-hypervisor`, `cloud_hypervisor`, `ch`, `clh` (matching upstream's own docs).
+
+**Status:** Phase 1 ships the stub backend (final `VmBackend` shape; lifecycle returns "not yet wired"). Same shape as the `LibkrunBackend` stub before plan-57's libkrun spike landed real lifecycle. CH bring-up is a focused near-term wave (no longer post-Phase-10 — moved up because users want backend flexibility for GPU + larger-guest workloads). The lifecycle implementation needs:
+
+- `cloud-hypervisor` binary detected on PATH (`Platform::has_cloud_hypervisor()` already shipped)
+- A small JSON-API client (CH exposes a REST API on a Unix socket)
+- Drives, vsock, network device assembly per `VmStartConfig`
+- Process supervision (PID file in `~/.mvm/vms/<name>/ch.pid`)
+
+Once shipped, the per-backend boot budget table holds for CH the same way it does for FC; the smoke + perf gates apply uniformly.
+
+**Why move CH up the schedule:** the user explicitly asked for backend flexibility — the same flake should be runnable across FC, CH, microsandbox depending on what the workload needs. CH was scheduled post-Phase-10 because the original justification was GPU passthrough; the broader argument ("flexibility on what runs and where") makes it a near-term concern.
 
 ## Linux builder via microsandbox (no Lima)
 

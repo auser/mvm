@@ -86,6 +86,29 @@ impl Platform {
         !matches!(self, Platform::Windows)
     }
 
+    /// Whether Cloud Hypervisor is installed on this host.
+    ///
+    /// CH is a peer of Firecracker at the Tier 1 microVM layer; it
+    /// adds VFIO passthrough, virtio-gpu, virtio-fs, and larger
+    /// guests beyond what FC supports. Detection is a PATH probe
+    /// — `cloud-hypervisor --version` succeeding is sufficient.
+    /// Linux/KVM is the supported host; macOS/HVF support exists
+    /// upstream (CH 35+) but isn't yet exercised here.
+    pub fn has_cloud_hypervisor(self) -> bool {
+        // Windows has no CH path.
+        if matches!(self, Platform::Windows) {
+            return false;
+        }
+        static CH_AVAILABLE: OnceLock<bool> = OnceLock::new();
+        *CH_AVAILABLE.get_or_init(|| {
+            std::process::Command::new("cloud-hypervisor")
+                .arg("--version")
+                .output()
+                .map(|o| o.status.success())
+                .unwrap_or(false)
+        })
+    }
+
     /// Whether Docker is available on this platform.
     ///
     /// Runtime check — calls `docker version` to verify the daemon is running.

@@ -6,6 +6,7 @@
 
 pub mod apple_container;
 pub mod backend;
+pub mod cloud_hypervisor;
 pub mod cow;
 pub mod docker;
 pub mod egress_proxy;

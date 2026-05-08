@@ -5,6 +5,7 @@ use mvm_core::vm_backend::{
 };
 
 use super::apple_container::AppleContainerBackend;
+use super::cloud_hypervisor::CloudHypervisorBackend;
 use super::docker::DockerBackend;
 use super::libkrun::LibkrunBackend;
 use super::microsandbox::MicrosandboxBackend;
@@ -204,6 +205,11 @@ pub enum AnyBackend {
     /// the cross-platform Phase 1 default for macOS/Windows. Linux still
     /// prefers Firecracker when KVM is available.
     Microsandbox(MicrosandboxBackend),
+    /// Cloud Hypervisor — rust-vmm peer of Firecracker at Tier 1. Adds
+    /// VFIO passthrough, virtio-gpu, virtio-fs, and larger guests
+    /// beyond what FC supports. Opt-in via `--hypervisor cloud-hypervisor`;
+    /// auto_select keeps Firecracker as the KVM default.
+    CloudHypervisor(CloudHypervisorBackend),
 }
 
 impl AnyBackend {
@@ -234,6 +240,8 @@ impl AnyBackend {
             "docker" => Self::Docker(DockerBackend),
             "libkrun" | "krun" => Self::Libkrun(LibkrunBackend),
             "microsandbox" | "msb" => Self::Microsandbox(MicrosandboxBackend),
+            "cloud-hypervisor" | "cloud_hypervisor" | "ch" | "clh" =>
+                Self::CloudHypervisor(CloudHypervisorBackend),
             "qemu" => Self::MicrovmNix(MicrovmNixBackend),
             _ => Self::Firecracker(FirecrackerBackend),
         }
@@ -318,6 +326,7 @@ impl AnyBackend {
             Self::Docker(b) => b,
             Self::Libkrun(b) => b,
             Self::Microsandbox(b) => b,
+            Self::CloudHypervisor(b) => b,
         }
     }
 
@@ -521,6 +530,32 @@ mod tests {
     fn test_any_backend_from_hypervisor_unknown_defaults() {
         let backend = AnyBackend::from_hypervisor("unknown");
         assert_eq!(backend.name(), "firecracker");
+    }
+
+    #[test]
+    fn test_any_backend_from_hypervisor_cloud_hypervisor() {
+        // CH is selectable under multiple aliases — full name, the
+        // snake-case form some tooling emits, and two short aliases
+        // (ch / clh) common in cloud-hypervisor's own docs.
+        for alias in ["cloud-hypervisor", "cloud_hypervisor", "ch", "clh"] {
+            let backend = AnyBackend::from_hypervisor(alias);
+            assert_eq!(
+                backend.name(),
+                "cloud-hypervisor",
+                "alias `{alias}` must resolve to cloud-hypervisor"
+            );
+        }
+    }
+
+    #[test]
+    fn test_cloud_hypervisor_via_any_backend_security_profile_tier_1() {
+        // Same Tier-1 posture as Firecracker (rust-vmm; passes the
+        // fork test). Regression-guard against AnyBackend silently
+        // dropping the variant from inner().
+        let backend = AnyBackend::from_hypervisor("cloud-hypervisor");
+        let p = backend.security_profile();
+        assert_eq!(p.tier, "Tier 1");
+        assert!(p.layer_coverage.is_microvm());
     }
 
     #[test]
