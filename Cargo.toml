@@ -38,6 +38,12 @@ authors = ["mvm contributors"]
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
+# microsandbox (plan 60 ADR-013) — libkrun-backed, cross-platform
+# (Linux KVM, macOS Hypervisor.framework, Windows pending) sandbox
+# runtime. Phase 1 W2 wires it into the MicrosandboxBackend's
+# start/stop/exec lifecycle.
+microsandbox = "0.4.5"
+
 # Pattern matching
 aho-corasick = "1"
 regex = "1"
