@@ -54,13 +54,14 @@ export default defineConfig({
           ],
         },
         {
-          // Note: removed slugs without content (templates / exec /
-          // config-secrets) — they were inherited from the previous
-          // iteration's sidebar but never had pages. They'll be
-          // re-added once Phase 5 (DX layer) ships their content.
+          // `guides/templates` removed — its page wasn't ported over
+          // from the previous iteration. Re-add when Phase 5 (DX
+          // layer) ships the templates guide content.
           label: "Guides",
           items: [
             { label: "Writing Nix Flakes", slug: "guides/nix-flakes" },
+            { label: "Sandboxed Exec", slug: "guides/exec" },
+            { label: "Config & Secrets", slug: "guides/config-secrets" },
             { label: "Manifests", slug: "guides/manifests" },
             { label: "Networking", slug: "guides/networking" },
             { label: "Dev Image", slug: "guides/dev-image" },
