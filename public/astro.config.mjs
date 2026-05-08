@@ -60,6 +60,7 @@ export default defineConfig({
           label: "Guides",
           items: [
             { label: "Writing Nix Flakes", slug: "guides/nix-flakes" },
+            { label: "Building MicroVM Images", slug: "guides/building-microvm-images" },
             { label: "Sandboxed Exec", slug: "guides/exec" },
             { label: "Config & Secrets", slug: "guides/config-secrets" },
             { label: "Manifests", slug: "guides/manifests" },
