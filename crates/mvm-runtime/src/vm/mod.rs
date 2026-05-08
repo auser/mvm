@@ -13,8 +13,11 @@ pub mod firecracker;
 pub mod image;
 pub mod instance_snapshot;
 pub mod libkrun;
+// Deprecated no-op shim — ADR-013 dropped Lima. The module exists
+// only to keep mvm-cli's existing imports compiling; its functions
+// all return "not running" / "no-op" / "NotFound." Cleanup wave
+// removes the call sites + this module.
 pub mod lima;
-pub mod lima_state;
 pub mod microsandbox;
 pub mod microvm;
 pub mod microvm_nix;

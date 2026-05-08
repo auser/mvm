@@ -99,6 +99,31 @@ PID 1 stays uid 0 (kernel mandate) but exec's nothing as root after the supervis
 
 The supervision wiring matters even with the stub because: (a) the dev/prod uid split is real today, (b) `/etc/passwd` + `/etc/group` are baked correctly today, (c) the host-side `mvmctl status` cross-check against `/proc/<pid>/status` works today, and (d) swapping the binary path in the rootfs population step is a one-line change.
 
+## Linux builder via microsandbox (no Lima)
+
+macOS hosts can't `nix build` Linux derivations natively — `nix build` emits a "no Linux builder available" error and stops. The previous iteration solved this by running a Lima VM as a Linux builder; this iteration drops Lima entirely (per the body of this ADR), so the question becomes: how does a macOS user `mvmctl build .` without configuring host-side Nix infrastructure?
+
+**Design: bootstrap a Linux builder inside microsandbox itself.**
+
+Microsandbox supports OCI images, and Nix-bearing OCI images are widely available (`nixos/nix`, `nixpkgs/nix-flakes`, our own pinned image). On a macOS host without a Linux builder configured, `mvmctl build` can:
+
+1. Detect the gap — `Platform::has_host_nix()` returns true but the Nix instance can't build Linux derivations (`nix-store --eval` against a Linux derivation fails, or `nix.conf` lacks a configured builder).
+2. Pull a small, pinned Nix-bearing OCI image — once, cached in `~/.cache/mvm/builder-image/`.
+3. Spawn a microsandbox sandbox from that image with the user's flake source bind-mounted as `/work`, the host's Nix store mount-shared as `/nix`, and a sane PATH.
+4. Run `nix build .#default` inside the sandbox.
+5. Extract the resulting rootfs (the runtime artifact) back to the host.
+6. Hand the rootfs off to the runtime path (which uses microsandbox + `RootfsSource::DiskImage` per the OCI non-goal — the runtime never pulls OCI).
+
+**Why this is consistent with the OCI non-goal.** The non-goal banned OCI from the **runtime/boot path** — the place where user workloads run, where reproducibility + offline-by-default + no-registry-trust matter. The **builder** lives in a different trust zone: it has to fetch from caches, talk to the network, run arbitrary `nix build` derivations. Builder VMs and runtime VMs are governed by different policies; using OCI for the builder doesn't compromise the runtime's invariants.
+
+**Cache reuse.** The Nix store on the macOS host is bind-mounted into the builder sandbox as `/nix`. Builds populate the host store; subsequent builds (Linux or otherwise) reuse the same cached derivations. This is the same trick `nix-darwin`'s `linux-builder` uses — the difference is mvm doesn't require the user to have configured `nix-darwin`.
+
+**Fallbacks.** If the user has already configured a host-side Linux builder (`nix-darwin`'s `linux-builder`, or a remote `nix-daemon` URL), mvm uses that — the microsandbox-builder path is the *zero-config* default, not a forced override. Detection: probe `nix-store --add-fixed sha256 /dev/null --realize` against a Linux derivation; success → the host can build; failure → fall through to the microsandbox builder.
+
+**Implementation status.** Phase 1 W6.x ships the design as documented; the actual builder bootstrap is its own focused wave (needs the OCI image pinned + cached, the bind-mount semantics worked through, the artifact extraction path written). Tracked in Sprint 50 as a follow-up.
+
+**This replaces every previous reference to "configure `nix-darwin`'s `linux-builder`" in the docs.** Users with an existing builder keep using it; everyone else gets the microsandbox-bootstrapped path with no host-side configuration.
+
 ## Privilege model — rootless workloads on busybox PID 1
 
 PID 1 must be uid 0 (Linux kernel requirement; user-namespace tricks bring their own risk surface and are out of scope). `setpriv` drops privileges before exec'ing the workload, so the user-visible process tree is non-root by default in production.

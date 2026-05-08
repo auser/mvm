@@ -241,13 +241,24 @@ impl AnyBackend {
 
     /// Select the best backend for the current platform.
     ///
-    /// Priority (plan 60 / ADR-013 — microsandbox-first cross-platform default):
-    /// 1. Firecracker (if /dev/kvm available — fastest, production-grade Tier 1)
-    /// 2. microsandbox (cross-platform Tier 2 — macOS arm64/x86_64 + Linux no-KVM)
+    /// Firecracker is the production target — it always wins when KVM
+    /// is available. When KVM isn't available (macOS host, Linux without
+    /// KVM, etc.), microsandbox is the cross-platform default per
+    /// ADR-013; the legacy fallbacks below it exist for the narrow
+    /// case where microsandbox itself is feature-gated out.
+    ///
+    /// Priority:
+    /// 1. **Firecracker** (if `/dev/kvm` available — production Tier 1)
+    /// 2. **microsandbox** (cross-platform Tier 2 — macOS + Linux no-KVM)
     /// 3. Apple Container (macOS 26+ — kept for now; plan 60 schedules removal)
     /// 4. raw libkrun (legacy ladder — eventual drop)
     /// 5. Docker (Tier 3 fallback — banner emitted; not promoted)
-    /// 6. Firecracker via Lima (legacy macOS fallback)
+    ///
+    /// If none of the above match, the function returns Firecracker as
+    /// the default — `start()` will then surface the host-side
+    /// "Firecracker not available" error pointed at the production path,
+    /// which is a clearer failure mode than picking a backend the
+    /// caller didn't ask for.
     pub fn auto_select() -> Self {
         let plat = mvm_core::platform::current();
 
@@ -290,7 +301,11 @@ impl AnyBackend {
             return Self::Docker(DockerBackend);
         }
 
-        // 6. Firecracker via Lima (legacy macOS fallback)
+        // Final default. Reachable only when has_microsandbox is
+        // feature-gated off AND no other tier is available; the
+        // start() call then fails with the production-path error
+        // message rather than silently picking a backend the
+        // caller didn't ask for.
         Self::Firecracker(FirecrackerBackend)
     }
 

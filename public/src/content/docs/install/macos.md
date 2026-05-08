@@ -58,24 +58,11 @@ cargo install mvmctl
 
 `mvmctl` is a regular Mach-O binary on macOS — no codesigning surprises in the typical install path. Hypervisor.framework requires the host process to hold the `com.apple.security.hypervisor` entitlement; the install script handles ad-hoc signing automatically. If you build from source via `cargo`, the same entitlement is added by the build script.
 
-## Configure a Linux builder (optional but recommended)
+## Linux builds on macOS — zero-config by default
 
-To build microVM rootfs images on the macOS host (rather than pulling pre-built images), you need a Linux Nix builder. The cleanest path on macOS is **`nix-darwin`'s `linux-builder`**:
+macOS Nix can't build Linux derivations natively. mvm handles this **without requiring host-side configuration**: on first `mvmctl build`, mvm pulls a small Nix-bearing OCI image, spawns a microsandbox sandbox from it, bind-mounts your project + the host's Nix store, runs `nix build` inside, and extracts the resulting rootfs back to the host. See [ADR-013 §"Linux builder via microsandbox"](/contributing/adr/013-microsandbox-pivot/) for the design.
 
-```nix
-# in your nix-darwin configuration
-{
-  nix.linux-builder.enable = true;
-  nix.linux-builder.ephemeral = true;     # rebuild on every boot; cheaper for occasional use
-  nix.linux-builder.maxJobs = 4;
-  nix.linux-builder.config = {
-    virtualisation.darwin-builder.diskSize = 40 * 1024;   # MB
-    virtualisation.darwin-builder.memorySize = 8 * 1024;  # MB
-  };
-}
-```
-
-Without `nix-darwin`, the [`nix-system-features = aarch64-linux x86_64-linux`](https://nix.dev/manual/nix/2.18/command-ref/conf-file#conf-system-features) flag plus a remote builder also works — see the Nix manual.
+If you already have a host-side Linux builder (e.g., [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary), or a remote `nix-daemon` URL), mvm uses it instead — the microsandbox-bootstrapped path is the zero-config *default*, not a forced override. The Nix store on your macOS host is bind-mounted into either path, so cached derivations are reused across both modes.
 
 ## Verify
 

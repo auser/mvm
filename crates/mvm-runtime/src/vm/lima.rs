@@ -1,129 +1,65 @@
-use anyhow::{Context, Result};
+//! Lima compatibility shim — DEPRECATED.
+//!
+//! ADR-013 dropped Lima entirely. This module exists as a thin shim
+//! exposing the symbol shape of the previous `lima.rs` so that
+//! callers in mvm-cli (and elsewhere) keep compiling while their
+//! Lima-dependent branches are pruned in follow-up cleanup. Every
+//! function here is a permanent no-op:
+//!
+//!   - `get_status()`   → returns `LimaStatus::NotFound`
+//!   - `require_running()` → succeeds; no-op
+//!   - `LimaStatus`     → kept as an enum (callers `match`/`Ok(…)` it)
+//!
+//! The macOS path is microsandbox+libkrun direct (ADR-013); the
+//! `if needs_lima() { … }` branches across the codebase short-circuit
+//! to `false` (see `Platform::needs_lima`) and the dead branches will
+//! be deleted in a follow-up wave.
 
-use crate::config::VM_NAME;
-use crate::shell::{run_host, run_host_visible};
-use crate::ui;
+use anyhow::Result;
 
-#[derive(Debug, PartialEq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum LimaStatus {
     Running,
     Stopped,
     NotFound,
 }
 
-// ---------------------------------------------------------------------------
-// Parameterized functions (accept vm_name)
-// ---------------------------------------------------------------------------
-
-/// Get the current status of a named Lima VM.
-pub fn get_vm_status(vm_name: &str) -> Result<LimaStatus> {
-    // On native KVM hosts, Lima isn't required—skip external call to limactl.
-    if mvm_core::platform::current().has_kvm() {
-        return Ok(LimaStatus::NotFound);
-    }
-
-    let output = run_host("limactl", &["list", "--format", "{{.Status}}", vm_name])?;
-    let stdout = String::from_utf8_lossy(&output.stdout).trim().to_string();
-
-    if !output.status.success() || stdout.is_empty() {
-        return Ok(LimaStatus::NotFound);
-    }
-
-    match stdout.as_str() {
-        "Running" => Ok(LimaStatus::Running),
-        "Stopped" => Ok(LimaStatus::Stopped),
-        _ => Ok(LimaStatus::NotFound),
-    }
-}
-
-/// Create and start a new named Lima VM from the given yaml config.
-pub fn create_vm(vm_name: &str, lima_yaml: &std::path::Path) -> Result<()> {
-    let yaml_str = lima_yaml.to_str().context("Invalid lima.yaml path")?;
-    run_host_visible("limactl", &["start", "--name", vm_name, yaml_str])
-}
-
-/// Start an existing stopped named Lima VM.
-pub fn start_vm(vm_name: &str) -> Result<()> {
-    run_host_visible("limactl", &["start", vm_name])
-}
-
-/// Ensure a named Lima VM is running. Creates, starts, or does nothing as needed.
-pub fn ensure_vm_running(vm_name: &str, lima_yaml: &std::path::Path) -> Result<()> {
-    match get_vm_status(vm_name)? {
-        LimaStatus::Running => {
-            ui::info(&format!("Lima VM '{}' is running.", vm_name));
-            Ok(())
-        }
-        LimaStatus::Stopped => {
-            ui::info(&format!("Starting Lima VM '{}'...", vm_name));
-            start_vm(vm_name)
-        }
-        LimaStatus::NotFound => {
-            ui::info(&format!("Creating Lima VM '{}'...", vm_name));
-            create_vm(vm_name, lima_yaml)
-        }
-    }
-}
-
-/// Stop a named Lima VM.
-pub fn stop_vm(vm_name: &str) -> Result<()> {
-    run_host_visible("limactl", &["stop", vm_name])
-}
-
-/// Delete a named Lima VM forcefully.
-pub fn destroy_vm(vm_name: &str) -> Result<()> {
-    run_host_visible("limactl", &["delete", "--force", vm_name])
-}
-
-// ---------------------------------------------------------------------------
-// Default VM_NAME wrappers (used by setup, start, stop, ssh, etc.)
-// ---------------------------------------------------------------------------
-
-/// Get the current status of the default Lima VM.
+/// Always returns `NotFound`. Lima is no longer used.
 pub fn get_status() -> Result<LimaStatus> {
-    get_vm_status(VM_NAME)
+    Ok(LimaStatus::NotFound)
 }
 
-/// Create and start the default Lima VM from the given yaml config.
-pub fn create(lima_yaml: &std::path::Path) -> Result<()> {
-    create_vm(VM_NAME, lima_yaml)
+/// Always returns `NotFound` for any name. Lima is no longer used.
+pub fn get_vm_status(_vm_name: &str) -> Result<LimaStatus> {
+    Ok(LimaStatus::NotFound)
 }
 
-/// Start the default Lima VM.
-pub fn start() -> Result<()> {
-    start_vm(VM_NAME)
-}
-
-/// Ensure the default Lima VM is running.
-pub fn ensure_running(lima_yaml: &std::path::Path) -> Result<()> {
-    ensure_vm_running(VM_NAME, lima_yaml)
-}
-
-/// Require that the default Lima VM is currently running.
+/// No-op: succeeds without touching anything. The previous
+/// implementation verified the Lima VM was running and started it
+/// if not; today the macOS path is microsandbox-direct so there's
+/// no Lima VM to verify.
 pub fn require_running() -> Result<()> {
-    match get_vm_status(VM_NAME)? {
-        LimaStatus::Running => Ok(()),
-        LimaStatus::Stopped => {
-            anyhow::bail!(
-                "Lima VM '{}' is stopped. Run 'mvmctl dev up' or 'mvmctl setup'.",
-                VM_NAME
-            )
-        }
-        LimaStatus::NotFound => {
-            anyhow::bail!(
-                "Lima VM '{}' does not exist. Run 'mvmctl setup' first.",
-                VM_NAME
-            )
-        }
-    }
+    Ok(())
 }
 
-/// Stop the default Lima VM.
+/// No-op start. Existed to launch the Lima VM; now a stub.
+pub fn start() -> Result<()> {
+    Ok(())
+}
+
+/// No-op stop. Existed to shut down the Lima VM; now a stub.
 pub fn stop() -> Result<()> {
-    stop_vm(VM_NAME)
+    Ok(())
 }
 
-/// Delete the default Lima VM forcefully.
+/// No-op destroy. Existed to delete the Lima VM; now a stub.
 pub fn destroy() -> Result<()> {
-    destroy_vm(VM_NAME)
+    Ok(())
+}
+
+/// No-op ensure_running. Existed to bring the Lima VM up against a
+/// generated lima.yaml; now a stub. The argument is accepted for
+/// signature compatibility but ignored.
+pub fn ensure_running<P: AsRef<std::path::Path>>(_lima_yaml: P) -> Result<()> {
+    Ok(())
 }

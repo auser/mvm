@@ -4,29 +4,29 @@ use std::sync::OnceLock;
 /// The execution environment for running workloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
-    /// macOS — Apple Virtualization.framework on 26+, Lima fallback on older
+    /// macOS — microsandbox (libkrun on Hypervisor.framework) per ADR-013
     MacOS,
     /// Native Linux with /dev/kvm available — run Firecracker directly
     LinuxNative,
-    /// Linux without /dev/kvm (not WSL) — requires Lima or Docker
+    /// Linux without /dev/kvm (not WSL) — microsandbox via libkrun, or Docker fallback
     LinuxNoKvm,
-    /// WSL2 — may have KVM (Hyper-V nested virt), prefers Docker as fallback
+    /// WSL2 — may have KVM (Hyper-V nested virt), prefers Firecracker when available
     Wsl2,
-    /// Native Windows — Docker only (no Linux kernel)
+    /// Native Windows — microsandbox/WSL2 via mvm-studio Tauri shell (ADR-031)
     Windows,
 }
 
 impl Platform {
-    /// Whether this platform needs Lima to run Firecracker.
-    /// Returns false for platforms that have better alternatives (Apple VZ, Docker, native KVM).
+    /// Whether this platform needs Lima to run microVMs.
+    ///
+    /// **Deprecated:** Always returns `false`. ADR-013 dropped Lima
+    /// from mvm's dependency surface; the macOS/no-KVM-Linux path now
+    /// uses microsandbox+libkrun directly. Kept as a stub returning
+    /// `false` so existing callers (`if needs_lima() { … }` branches)
+    /// remain well-formed while their dead branches get pruned in
+    /// follow-up cleanup. Remove once no callers remain.
     pub fn needs_lima(self) -> bool {
-        match self {
-            Platform::MacOS => !self.has_apple_containers(),
-            Platform::LinuxNoKvm => true,
-            Platform::LinuxNative => false,
-            Platform::Wsl2 => !self.has_kvm() && !self.has_docker(),
-            Platform::Windows => false, // Lima doesn't run on Windows
-        }
+        false
     }
 
     /// Whether this platform can run Firecracker directly via /dev/kvm.
@@ -38,7 +38,7 @@ impl Platform {
         }
     }
 
-    /// Whether the microvm.nix runner can execute natively (without Lima).
+    /// Whether the microvm.nix runner can execute natively on this host.
     pub fn supports_native_runner(self) -> bool {
         matches!(self, Platform::LinuxNative) || (matches!(self, Platform::Wsl2) && self.has_kvm())
     }
@@ -104,7 +104,9 @@ impl Platform {
     ///
     /// On macOS this requires nix-daemon with a linux-builder configured.
     /// On native Linux this is always true if `nix` is on PATH.
-    /// When true, `nix build` can run on the host without Lima.
+    /// When true, `nix build` can run on the host directly. When false
+    /// on macOS, the microsandbox-as-Linux-builder fallback (ADR-013
+    /// §"Linux builder via microsandbox") handles cross-builds.
     pub fn has_host_nix(self) -> bool {
         static HOST_NIX: OnceLock<bool> = OnceLock::new();
         *HOST_NIX.get_or_init(|| {
@@ -251,20 +253,6 @@ mod tests {
         assert_eq!(Platform::LinuxNative.to_string(), "Linux (native KVM)");
         assert_eq!(Platform::LinuxNoKvm.to_string(), "Linux (no KVM)");
         assert_eq!(Platform::Windows.to_string(), "Windows");
-    }
-
-    #[test]
-    fn test_needs_lima() {
-        // macOS: needs Lima only if Apple Containers are NOT available
-        let macos_needs = Platform::MacOS.needs_lima();
-        if Platform::MacOS.has_apple_containers() {
-            assert!(!macos_needs, "macOS 26+ should not need Lima");
-        } else {
-            assert!(macos_needs, "macOS <26 should need Lima");
-        }
-        assert!(!Platform::LinuxNative.needs_lima());
-        assert!(Platform::LinuxNoKvm.needs_lima());
-        assert!(!Platform::Windows.needs_lima());
     }
 
     #[test]
