@@ -10,12 +10,15 @@
 //! # Status
 //!
 //! Phase 1 W1.1: trait shape only.
-//! Phase 1 W1.2 (this file): `microsandbox = "0.4.5"` dep wired.
-//! `is_available()` and `list()` make real calls into the upstream
-//! crate via a sync→async bridge ([`block_on`]). `start()` remains
-//! a stub because it requires translating our Nix-built rootfs into
-//! a microsandbox-consumable image — a non-trivial design problem
-//! tracked under Phase 1 W1.3 (rootfs→OCI image bridge).
+//! Phase 1 W1.2: `microsandbox = "0.4.5"` dep wired; `is_available`,
+//! `list`, `status`, `stop`, `stop_all` real.
+//! Phase 1 W1.3 (this file): `start()` and `logs()` real. The bridge
+//! between our Nix-built ext4 rootfs and microsandbox's `RootfsSource`
+//! API is a hard-link alias — microsandbox's `.disk()` builder accepts
+//! only `.raw`/`.qcow2`/`.vmdk` extensions, but the underlying file
+//! is just a raw block device; a sibling `.raw` hard-link plus an
+//! explicit `fstype("ext4")` lets microsandbox attach via virtio-blk
+//! without us copying the rootfs.
 //!
 //! Why a separate variant from [`LibkrunBackend`](super::libkrun::LibkrunBackend):
 //! microsandbox is a higher-level abstraction (sandboxes, images, network
@@ -23,6 +26,8 @@
 //! the difference between "raw libkrun" (manual VM lifecycle) and
 //! "microsandbox" (managed sandbox lifecycle). Both are Tier 2; both are
 //! KVM/HVF-backed; the choice between them is API-shape preference.
+
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use mvm_core::vm_backend::{
@@ -37,11 +42,40 @@ use mvm_core::vm_backend::{
 /// by the upstream microsandbox crate).
 pub struct MicrosandboxBackend;
 
-/// Sentinel error message — keeps the "rootfs→image not yet bridged"
-/// copy in one place so when Phase 1 W1.3 lands, deletion is a single
-/// `grep`.
-const ROOTFS_BRIDGE_PENDING: &str = "microsandbox start() requires a rootfs→OCI image bridge \
-(Phase 1 W1.3 of plan 60 — translates Nix-built rootfs to microsandbox image refs)";
+/// Bridge our Nix-built `rootfs.ext4` into a path microsandbox accepts.
+///
+/// `microsandbox::ImageBuilder::disk()` recognises only `.raw`,
+/// `.qcow2`, and `.vmdk` extensions, but our rootfs is a plain ext4
+/// block image with no file-format wrapper — i.e. semantically a raw
+/// disk. Rather than copy the (potentially large) rootfs, we make a
+/// `.raw` hard-link sibling and pass that to microsandbox along with
+/// an explicit `fstype("ext4")`.
+///
+/// The alias is created lazily on first start; subsequent calls reuse
+/// it. If the input path already has a recognised extension we
+/// short-circuit and return it unchanged — relevant once we add a
+/// qcow2 backend behind the same trait.
+///
+/// Returns the path microsandbox should consume + a flag indicating
+/// whether the alias was newly created (used by tests).
+fn ensure_microsandbox_rootfs_alias(rootfs: &Path) -> Result<(PathBuf, bool)> {
+    let ext = rootfs.extension().and_then(|e| e.to_str()).unwrap_or("");
+    if matches!(ext, "raw" | "qcow2" | "vmdk") {
+        return Ok((rootfs.to_path_buf(), false));
+    }
+    let alias = rootfs.with_extension("raw");
+    if alias.exists() {
+        return Ok((alias, false));
+    }
+    std::fs::hard_link(rootfs, &alias).with_context(|| {
+        format!(
+            "creating microsandbox-compatible .raw alias: hard_link {} -> {}",
+            rootfs.display(),
+            alias.display()
+        )
+    })?;
+    Ok((alias, true))
+}
 
 /// Bridge sync `VmBackend` calls into microsandbox's async API.
 ///
@@ -85,12 +119,50 @@ impl VmBackend for MicrosandboxBackend {
         }
     }
 
-    fn start(&self, _config: &VmStartConfig) -> Result<VmId> {
-        // The upstream `Sandbox::builder(name).image(...).create_detached().await`
-        // is the eventual call; W1.3 wires it once we've defined how
-        // `VmStartConfig.rootfs_path` (a Nix-built ext4) translates to
-        // an OCI image reference microsandbox can pull or load.
-        anyhow::bail!(ROOTFS_BRIDGE_PENDING)
+    fn start(&self, config: &VmStartConfig) -> Result<VmId> {
+        // 1. Bridge the rootfs path. Microsandbox's `.disk()` builder
+        //    only accepts .raw/.qcow2/.vmdk extensions; our build
+        //    pipeline produces .ext4. The hard-link alias keeps disk
+        //    usage flat (no copy) and lets microsandbox attach via
+        //    virtio-blk with an explicit fstype hint.
+        let rootfs = Path::new(&config.rootfs_path);
+        if !rootfs.exists() {
+            anyhow::bail!(
+                "microsandbox start: rootfs path does not exist: {}",
+                rootfs.display()
+            );
+        }
+        let (disk_path, _new_alias) = ensure_microsandbox_rootfs_alias(rootfs)?;
+
+        // 2. Resource clamps. microsandbox's `.cpus()` takes u8; our
+        //    config carries u32 (theoretical headroom for hypervisors
+        //    that handle larger guests, e.g., bare KVM). One vcpu min,
+        //    255 max — anything above that is a misconfiguration.
+        let cpus = u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX);
+
+        // 3. Spawn detached so microsandbox manages the sandbox
+        //    lifecycle independently of this process — same shape as
+        //    Firecracker's daemon-mode boot. The caller can later
+        //    re-attach via `Sandbox::start(&name)` if needed.
+        let name = config.name.clone();
+        block_on(async {
+            microsandbox::Sandbox::builder(&name)
+                .image_with(|i| i.disk(&disk_path).fstype("ext4"))
+                .cpus(cpus)
+                .memory(config.memory_mib)
+                .create_detached()
+                .await
+        })
+        .map_err(|e| anyhow::anyhow!(e))
+        .with_context(|| {
+            format!(
+                "microsandbox create_detached for '{}' (rootfs {})",
+                config.name,
+                disk_path.display()
+            )
+        })?;
+
+        Ok(VmId(config.name.clone()))
     }
 
     fn stop(&self, id: &VmId) -> Result<()> {
@@ -188,11 +260,47 @@ impl VmBackend for MicrosandboxBackend {
             .collect())
     }
 
-    fn logs(&self, _id: &VmId, _lines: u32, _hypervisor: bool) -> Result<String> {
-        // `Sandbox::get(name)` then `.logs(&LogOptions::default())`
-        // returns Vec<LogEntry>. W1.3 plumbs the formatting and tail/follow
-        // semantics; for now logs() is the last stub.
-        anyhow::bail!(ROOTFS_BRIDGE_PENDING)
+    fn logs(&self, id: &VmId, lines: u32, _hypervisor: bool) -> Result<String> {
+        // The `hypervisor` flag is meaningless for microsandbox — there's
+        // no separate hypervisor logs vs guest console split the way
+        // Firecracker has. We always return guest stdout+stderr (the
+        // upstream LogOptions default). When microsandbox grows a
+        // separate hypervisor stream we'll honour the flag.
+        let handle = block_on(async { microsandbox::Sandbox::get(&id.0).await })
+            .map_err(|e| anyhow::anyhow!(e))
+            .with_context(|| format!("microsandbox get for logs {}", id.0))?;
+
+        let opts = microsandbox::sandbox::LogOptions {
+            tail: usize::try_from(lines).ok().filter(|n| *n > 0),
+            since: None,
+            until: None,
+            sources: Vec::new(),
+        };
+        let entries = handle
+            .logs(&opts)
+            .map_err(|e| anyhow::anyhow!(e))
+            .with_context(|| format!("microsandbox logs for '{}'", id.0))?;
+
+        // Format as plain text: timestamp + source + line. Matches the
+        // Firecracker backend's String return shape (callers paginate
+        // or filter downstream). LogEntry.data is `bytes::Bytes` —
+        // we lossy-decode to UTF-8 because guest console output isn't
+        // strictly UTF-8 (e.g., ANSI control codes survive verbatim;
+        // a stray byte from a binary on stdout becomes U+FFFD rather
+        // than crashing the formatter).
+        let mut out = String::new();
+        for entry in entries {
+            use std::fmt::Write;
+            let line = String::from_utf8_lossy(&entry.data);
+            let _ = writeln!(
+                out,
+                "{} [{:?}] {}",
+                entry.timestamp.to_rfc3339(),
+                entry.source,
+                line
+            );
+        }
+        Ok(out)
     }
 
     fn is_available(&self) -> Result<bool> {
@@ -294,24 +402,79 @@ mod tests {
     }
 
     #[test]
-    fn microsandbox_start_returns_rootfs_bridge_pending() {
-        // W1.2: start() is the last stub — until the rootfs→OCI image
-        // bridge lands in W1.3, start() returns a clear error pointing
-        // at the followup. The test asserts the error chain mentions
-        // the bridge so an unrelated failure (e.g., a panic in
-        // block_on()) is distinguishable.
+    fn microsandbox_start_errors_when_rootfs_missing() {
+        // W1.3: start() now does real work. The first guard is the
+        // rootfs-existence check — a missing path must surface a
+        // clear error before we attempt to hard-link or call into the
+        // upstream API (which would otherwise emit a less-helpful
+        // error message about the missing disk).
         let config = VmStartConfig {
             name: "ms-test".to_string(),
-            rootfs_path: "/tmp/rootfs.ext4".to_string(),
+            rootfs_path: "/tmp/__mvm_test_definitely_missing__/rootfs.ext4".to_string(),
             ..Default::default()
         };
         let err = MicrosandboxBackend
             .start(&config)
-            .expect_err("start must error until W1.3 lands the rootfs bridge");
+            .expect_err("start must error when rootfs path doesn't exist");
+        let msg = err.to_string();
         assert!(
-            err.to_string().contains("rootfs"),
-            "error must reference the rootfs bridge, got: {err}"
+            msg.contains("rootfs path does not exist"),
+            "error must reference the missing-rootfs guard, got: {msg}"
         );
+    }
+
+    #[test]
+    fn rootfs_alias_creates_raw_hard_link_for_ext4() {
+        // The bridge between our `.ext4` rootfs files and microsandbox's
+        // `.raw`/`.qcow2`/`.vmdk`-only `.disk()` builder. Round-trip:
+        // create a fake .ext4, run the alias helper, expect a sibling
+        // .raw hard-link pointing at the same inode.
+        let temp = tempfile::tempdir().expect("tempdir");
+        let rootfs = temp.path().join("rootfs.ext4");
+        std::fs::write(&rootfs, b"fake-ext4-block-image").expect("write");
+
+        let (alias, created) =
+            ensure_microsandbox_rootfs_alias(&rootfs).expect("alias creation");
+        assert!(created, "first call should create the alias");
+        assert_eq!(alias, rootfs.with_extension("raw"));
+        assert!(alias.exists(), ".raw alias must exist after creation");
+
+        // Second call must be idempotent.
+        let (alias2, created2) =
+            ensure_microsandbox_rootfs_alias(&rootfs).expect("alias second call");
+        assert_eq!(alias2, alias);
+        assert!(!created2, "second call must reuse the existing alias");
+
+        // Hard-link contract: same inode (cheaper than copy, mutation
+        // is visible through both names — but rootfs is read-only at
+        // boot so this isn't a concern).
+        let m1 = std::fs::metadata(&rootfs).expect("rootfs meta");
+        let m2 = std::fs::metadata(&alias).expect("alias meta");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::MetadataExt;
+            assert_eq!(m1.ino(), m2.ino(), "hard-link must share the inode");
+        }
+        // On non-unix we just assert byte-equal sizes as a weaker proxy.
+        assert_eq!(m1.len(), m2.len());
+    }
+
+    #[test]
+    fn rootfs_alias_short_circuits_for_already_supported_extensions() {
+        // If a future backend hands us a path that's already `.raw`/
+        // `.qcow2`/`.vmdk`, no alias should be created. Asserting this
+        // explicitly so a refactor doesn't silently start hard-linking
+        // qcow2 files into raw aliases (which would corrupt the
+        // builder's format detection).
+        let temp = tempfile::tempdir().expect("tempdir");
+        for ext in ["raw", "qcow2", "vmdk"] {
+            let rootfs = temp.path().join(format!("rootfs.{ext}"));
+            std::fs::write(&rootfs, b"any").expect("write");
+            let (alias, created) =
+                ensure_microsandbox_rootfs_alias(&rootfs).expect("alias short-circuit");
+            assert_eq!(alias, rootfs, ".{ext} should pass through unchanged");
+            assert!(!created, ".{ext} should not create a new alias file");
+        }
     }
 
     #[test]
