@@ -73,4 +73,29 @@ in
   # Name + hypervisor metadata propagation
   metadata_propagates = (meta shellGuest).name == "shell-test"
     && (meta shellGuest).hypervisor == "firecracker";
+
+  # ── busybox-as-PID-1 invariants (W5.1) ────────────────────────
+  #
+  # ADR-013 §"Boot-time budget" pins the init system. Asserting it
+  # here so a future PR that swaps back to NixOS+systemd (e.g.,
+  # because it's "easier") fails this gate before merge.
+  init_system_is_busybox = (meta shellGuest).initSystem == "busybox";
+
+  # The expected boot budget is per-backend. Firecracker = 200ms;
+  # microsandbox/libkrun = 500ms; everything else falls back to 1s.
+  # The numbers are advisory metadata (Phase 9's `xtask perf`
+  # enforces them in CI); guarding them here prevents accidental
+  # regression of the *budget* itself.
+  boot_budget_firecracker_is_200ms =
+    (meta shellGuest).expectedBootMs == 200;
+
+  microsandbox_boot_budget_is_500ms =
+    let
+      msbGuest = mkGuest {
+        name = "msb-budget";
+        entrypoint.command = [ "/bin/x" ];
+        hypervisor = "microsandbox";
+      };
+    in
+    (meta msbGuest).expectedBootMs == 500;
 }

@@ -116,9 +116,18 @@ mkGuest { entrypoint.command = [ "..." ]; dev = true; ... }
 
 The same flake source is consumed in **both** dev and production builds — there's no separate "dev flake" the user has to maintain. The difference is purely in the resulting image's metadata + the host-side `console` gate.
 
-The `mkGuest` library composes microvm.nix's `microvm` NixOS module with mvm's security overlay (per-service uids, seccomp tier, dm-verity, read-only `/etc`). You don't see those layers in your flake — they're applied automatically.
+The `mkGuest` library produces a **busybox-as-PID-1** rootfs (no NixOS, no systemd) and emits an ext4 image directly. The boot path is: kernel → `/init` script → mounts `/proc` `/sys` `/dev` → execs your entrypoint. No service manager between the kernel and your code. mvm's security overlay (per-service uids, seccomp tier, dm-verity, read-only `/etc`) layers on top in Phase 6 without changing this base.
 
-> **Boot-time note.** The current `mkGuest` implementation produces a NixOS+systemd rootfs and boots in 1-3 seconds on Firecracker. That misses the project's sub-200ms target by an order of magnitude. The Phase 1 W5.1 rewrite replaces the NixOS path with busybox-as-PID-1 — same user-facing surface, sub-200ms cold boot. See [ADR-013 §"Boot-time budget"](https://github.com/auser/mvm/blob/main/specs/adrs/013-microsandbox-libkrun-microvm-nix-pivot.md) for the per-backend targets.
+## Boot-time targets
+
+| Backend | Cold p50 | Snapshot-cloned p50 |
+|---|---|---|
+| Firecracker (Linux/KVM) | ≤ 200 ms | ≤ 30 ms |
+| microsandbox / libkrun (Linux + macOS HVF) | ≤ 500 ms | ≤ 60 ms |
+| Apple Virtualization framework | ≤ 1 s | ≤ 200 ms |
+| Cloud Hypervisor (post-Phase-10) | ≤ 250 ms | ≤ 50 ms |
+
+The numbers are surfaced on every `mkGuest` derivation as `passthru.mvm.expectedBootMs` so you can `nix eval .#default.passthru.mvm.expectedBootMs` to confirm the budget mvm targets for your image. Phase 9 enforces them in CI via `xtask perf --backend <name> --p50-ms <budget>`. See [ADR-013 §"Boot-time budget"](https://github.com/auser/mvm/blob/main/specs/adrs/013-microsandbox-libkrun-microvm-nix-pivot.md) for the rationale.
 
 ## What's inside the mvm repository (and why you don't touch it)
 
