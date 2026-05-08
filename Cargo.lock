@@ -2932,6 +2932,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-backend"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "microsandbox",
+ "mvm-core",
+ "serde",
+]
+
+[[package]]
 name = "mvm-builder"
 version = "0.13.0"
 dependencies = [
@@ -2969,10 +2980,6 @@ dependencies = [
 
 [[package]]
 name = "mvm-providers"
-version = "0.13.0"
-
-[[package]]
-name = "mvm-sandbox"
 version = "0.13.0"
 
 [[package]]

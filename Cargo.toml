@@ -3,7 +3,7 @@ members = [
   "crates/mvm-builder",
   "crates/mvm-cli",
   "crates/mvm-core",
-  "crates/mvm-sandbox",
+  "crates/mvm-backend",
   "crates/mvm-providers",
 ]
 resolver = "3"
@@ -21,7 +21,7 @@ build = "build.rs"
 [workspace.dependencies]
 mvm-builder = { path = "crates/mvm-builder" }
 mvm-core = { path = "crates/mvm-core" }
-mvm-sandbox = { path = "crates/mvm-sandbox" }
+mvm-backend = { path = "crates/mvm-backend" }
 mvm-cli = { path = "crates/mvm-cli" }
 mvm-providers = { path = "crates/mvm-providers" }
 
@@ -41,6 +41,7 @@ tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 microsandbox = "0.4.5"
 libc = "0.2.186"
 rand = "0.10.1"
+async-trait = "0.1.89"
 
 
 # Package
