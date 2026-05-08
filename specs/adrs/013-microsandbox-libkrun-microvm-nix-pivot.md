@@ -9,6 +9,31 @@ related: ADR-002 (security posture), ADR-014 (VmBackend trait), plan 60-mvm-micr
 
 Proposed. Implementation tracked in `specs/plans/60-mvm-microsandbox-migration.md`. Phase 0 + Phase 1 deliver the build/exec pivot; subsequent phases compose on top.
 
+## Invariant — host does not need Nix
+
+**`mvmctl` runs on a stock host. Nix is not a prerequisite.** On first
+build, mvm bootstraps a small Linux builder microVM (microsandbox-backed,
+OCI image as the acceptable shape for the *builder* trust zone), runs
+`nix build` inside it, and extracts the resulting rootfs back to the
+host. The runtime path stays Nix-free; the builder path keeps Nix
+inside the sandbox where it belongs.
+
+Host-side Nix remains an **opt-in power-user path**:
+- contributors hacking on mvm itself who want a shared `/nix/store`,
+- users with `nix-darwin`'s `linux-builder` already configured (mvm
+  detects and uses it),
+- users with a remote `nix-daemon` URL.
+
+The full design is in §"Linux builder via microsandbox (no Lima)" below.
+The user-facing docs (install/*, getting-started/*, guides/*) reflect
+this invariant — host Nix is documented as optional, not required.
+
+> **Status (2026-05-08):** the bootstrap is in flight on `feat/micro`
+> as part of W6.x. Until it lands, contributors building rootfs images
+> still need host-side Nix (or `nix-darwin`'s `linux-builder` on macOS).
+> Docs describe the target user-facing shape; the contributor guide
+> notes the current gap.
+
 ## Context
 
 The previous iteration of `mvm` (at `../mvm`) used Lima as the macOS dev-VM hop and Firecracker as the production hypervisor on Linux. Two pain points motivated the pivot:

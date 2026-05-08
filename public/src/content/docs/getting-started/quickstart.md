@@ -9,40 +9,37 @@ description: Get a microVM running in under 5 minutes.
 mvmctl dev
 ```
 
-This single command detects your platform and handles everything:
-
-**On macOS 26+ (Apple Silicon):**
-1. Uses Apple Virtualization.framework directly -- no Lima needed
-2. Drops you into a dev shell
-
-**On macOS <26 or Linux without KVM:**
-1. Installs Lima if not present
-2. Creates and starts a Lima VM with `/dev/kvm`
-3. Installs Nix and Firecracker inside the Lima VM
-4. Drops you into the Lima VM shell
+This single command detects your platform and handles everything. **Builds run in a builder microVM that mvm sets up automatically — you don't need Nix on your host.** The builder owns its own `/nix/store` and keeps it warm across builds. Where the builder VM runs depends on your platform:
 
 **On Linux with `/dev/kvm`:**
-1. Skips Lima entirely
-2. Installs Nix and Firecracker natively on the host
+1. Selects Firecracker as the runtime backend
+2. Bootstraps the builder microVM on first build (one-time fetch); `nix build` runs inside it
 3. Drops you into a dev shell
 
+**On macOS (Apple Silicon or Intel):**
+1. Selects microsandbox (libkrun on Hypervisor.framework)
+2. Same builder microVM, hosted on libkrun
+3. Drops you into a dev shell
+
+**On Linux without KVM:**
+1. Falls back to microsandbox in software-emulation mode (slower; meant for CI / sandboxed CI runners)
+2. Same builder-microVM flow
+
 **Docker fallback (any platform):**
-1. If no hypervisor or KVM is available, falls back to Docker
-2. Runs your workload in a container with pause/resume support
+1. If no hypervisor backend works, falls back to Docker
+2. Runs your workload in a container with pause/resume support; security collapses to Tier 3
 
-Inside the dev shell, your home directory (`~`) is mounted read/write (Lima) or directly available (native Linux) -- your project files are right there. Nix, Firecracker, and `/dev/kvm` are all available.
-
-Exit the shell with `exit` or `Ctrl+D` -- the Lima VM (if used) keeps running in the background.
+Inside the dev shell your project directory is bind-mounted at `/work`. Exit with `exit` or `Ctrl+D` -- background services keep running.
 
 :::note
-On macOS / Linux without KVM, the first run downloads ~500MB of assets (Lima VM image). On native Linux, setup is much faster. Subsequent runs start in seconds on all platforms.
+First run downloads the builder image (~200MB) and the dev microVM image. Subsequent runs start in seconds.
 :::
 
 ## 2. Day-to-Day Commands
 
 ```bash
 mvmctl ls         # List running VMs (aliases: ps, status)
-mvmctl dev shell  # Open a shell in the Lima VM
+mvmctl dev shell  # Open a shell in the dev microVM
 mvmctl down       # Stop all running VMs
 mvmctl doctor     # Check system dependencies and configuration
 mvmctl console vm # Interactive shell into a running VM (PTY-over-vsock)

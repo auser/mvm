@@ -281,8 +281,23 @@ with mvm. Built via Nix on first use, cached at
 `~/.cache/mvm/default-microvm/` (kernel + rootfs). To customize, pass
 `--manifest` or `--flake` pointing at your own project's `mkGuest`
 output (see [Building MicroVM Images](/guides/building-microvm-images)).
-Nix is required to build the default; without a Linux builder on
-macOS, pass an already-built `--manifest` or fail with a clear error.
+
+Build resolution order on first use:
+
+1. **Builder microVM (default).** mvm bootstraps a small Linux builder
+   microVM (microsandbox-backed, see
+   [ADR-013 §"Linux builder via microsandbox"](/contributing/adr/013-microsandbox-pivot/)),
+   runs `nix build` inside it, and extracts the rootfs. No host-side
+   Nix required.
+2. **Host-side Nix (auto-detected).** If the host already has a working
+   Nix that can build Linux derivations (Linux Nix, or `nix-darwin`'s
+   `linux-builder`, or a remote `nix-daemon` URL), mvm uses it directly
+   and skips the builder microVM.
+3. **Prebuilt artifacts (offline).** If neither is available — for
+   example, a fully-offline host without the builder image cached — mvm
+   downloads the prebuilt `default-microvm` artifacts from the GitHub
+   release matching the `mvmctl` version, hash-verified per the
+   `*-checksums-sha256.txt` manifest (security claim 6).
 
 ## Cache
 
@@ -305,7 +320,7 @@ macOS, pass an already-built `--manifest` or fail with a clear error.
 | `mvmctl shell-init --emit-completions <shell>` | Emit just the shell-completion script (replaces the dropped `mvmctl completions <shell>`) |
 | `mvmctl metrics` | Show runtime metrics (Prometheus text format) |
 | `mvmctl metrics --json` | Show runtime metrics as JSON |
-| `mvmctl uninstall` | Remove Lima VM, Firecracker, and all mvm state (confirmation required) |
+| `mvmctl uninstall` | Remove Firecracker, the builder microVM image, and all mvm state (confirmation required) |
 | `mvmctl uninstall -y` | Uninstall without confirmation |
 | `mvmctl uninstall --all` | Also remove ~/.mvm/ config dir and /usr/local/bin/mvmctl binary |
 | `mvmctl uninstall --dry-run` | Print what would be removed without removing |

@@ -7,6 +7,24 @@ description: Architecture Decision Record for the cross-platform microVM pivot �
 
 Proposed. Implementation tracked in [Plan 60](https://github.com/auser/mvm/blob/main/specs/plans/60-mvm-microsandbox-migration.md). Phase 0 + Phase 1 deliver the build/exec pivot; subsequent phases compose on top.
 
+## Invariant — host does not need Nix
+
+`mvmctl` runs on a stock host. **Nix is not a prerequisite.** On first build, mvm bootstraps a small Linux builder microVM (microsandbox-backed), runs `nix build` inside it, and extracts the resulting rootfs to the host. The runtime path stays Nix-free; the builder path keeps Nix inside the sandbox where it belongs.
+
+Host-side Nix is an opt-in power-user path:
+
+- contributors hacking on mvm itself who want a shared `/nix/store`,
+- users with [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) already configured (mvm detects and uses it),
+- users with a remote `nix-daemon` URL.
+
+The full design is in [§"Linux builder via microsandbox (no Lima)"](#linux-builder-via-microsandbox-no-lima) below.
+
+> **Current status (2026-05-08):** the bootstrap is in flight on the
+> `feat/micro` branch as part of W6.x. Until it lands, contributors
+> building rootfs images still need host-side Nix (or `nix-darwin`'s
+> `linux-builder` on macOS). The docs describe the target user-facing
+> shape; the in-flight gap is a footnote, not the headline.
+
 ## Context
 
 The previous iteration of mvm used Lima as the macOS dev-VM hop and Firecracker as the production hypervisor on Linux. Two pain points motivated the pivot:
@@ -36,6 +54,27 @@ Three coupled choices:
 ```
 
 `mvmctl run --hypervisor microsandbox <flake>` always selects microsandbox explicitly regardless of the host's KVM status.
+
+## Linux builder via microsandbox (no Lima)
+
+macOS hosts can't `nix build` Linux derivations natively. The previous iteration solved that with a Lima VM as the Linux builder; this iteration drops Lima entirely. The replacement: **bootstrap a Linux builder inside microsandbox itself**.
+
+On a host without a Linux builder configured, `mvmctl build` does:
+
+1. Detects the gap — host has no Nix, or has Nix that can't build Linux derivations.
+2. Pulls a small, pinned Nix-bearing image — once, cached in `~/.cache/mvm/builder-image/`.
+3. Spawns a microsandbox sandbox from the image with the user's flake source bind-mounted as `/work`, the host's `/nix/store` shared in if present, and a sane PATH.
+4. Runs `nix build .#default` inside the sandbox.
+5. Extracts the rootfs back to the host.
+6. Hands it to the runtime path (which uses microsandbox's `RootfsSource::DiskImage` per the OCI non-goal — the *runtime* never pulls OCI).
+
+**Why this is consistent with the OCI non-goal.** The non-goal banned OCI from the **runtime/boot path** — where user workloads run, where reproducibility, offline-by-default, and no-registry-trust matter. The **builder** lives in a different trust zone: it has to fetch caches, talk to the network, and run arbitrary `nix build` derivations. Builder VMs and runtime VMs are governed by different policies; using OCI for the builder doesn't compromise the runtime's invariants.
+
+**Cache reuse.** When the host has a Nix install, its `/nix/store` is shared into the builder sandbox. Builds populate the host store; subsequent builds reuse the same cached derivations. This is the same trick `nix-darwin`'s `linux-builder` uses — the difference is mvm doesn't require the user to have configured `nix-darwin`.
+
+**Detection and fallback.** If the host already has a working Linux builder (`nix-darwin`'s `linux-builder`, or a remote `nix-daemon` URL), mvm detects it and uses it instead — the microsandbox-bootstrapped path is the *zero-config default*, not a forced override. Detection probes whether host Nix can realize a Linux derivation; success → host builds; failure → microsandbox bootstrap.
+
+**This replaces every previous reference to "configure `nix-darwin`'s `linux-builder`" in the docs.** Users with an existing builder keep using it; everyone else gets the microsandbox-bootstrapped path with no host-side configuration.
 
 ## Non-goal: OCI / container images
 

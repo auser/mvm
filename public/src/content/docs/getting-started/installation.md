@@ -47,11 +47,12 @@ mvmctl automatically detects your platform at startup and selects the best VM ba
 
 | Platform | Backend | What happens |
 |----------|---------|-------------|
-| **Linux with `/dev/kvm`** | Firecracker | Runs directly on KVM. No Lima needed. |
-| **macOS 26+** (Apple Silicon) | Apple Container | Uses Virtualization.framework. No Lima needed. |
-| **Docker available** | Docker | Container-based fallback. Runs anywhere Docker does. |
-| **macOS <26** | Lima + Firecracker | Lima VM provides `/dev/kvm`. Builds and Firecracker run inside Lima. |
-| **Linux without `/dev/kvm`** | Lima + Firecracker | Lima VM as fallback (same as macOS <26). |
+| **Linux with `/dev/kvm`** | Firecracker | Runs directly on KVM. Smallest attack surface, fastest cold boot. |
+| **macOS** (Apple Silicon / Intel) | microsandbox (libkrun) | Native Hypervisor.framework. No Lima, no Docker Desktop. |
+| **Linux without `/dev/kvm`** | microsandbox | Software-emulation fallback (slower; meant for CI runners). |
+| **Docker available** | Docker | Tier 3 container fallback. Used only if no hypervisor backend works. |
+
+You don't need Nix on the host. On first build, mvm bootstraps a Linux builder microVM, runs `nix build` inside it, and extracts the rootfs back. Host-side Nix is detected and used when present; otherwise the builder VM handles it.
 
 ### First-Time Setup
 
@@ -61,14 +62,14 @@ After installation, run the setup wizard:
 mvmctl init
 ```
 
-This walks through platform detection, dependency installation, Lima VM creation (if needed), default network setup, and XDG directory creation. Use `--non-interactive` for scripted environments.
+This walks through platform detection, dependency installation (Firecracker on Linux, libkrun via microsandbox on macOS), default network setup, and XDG directory creation. Use `--non-interactive` for scripted environments.
 
-Running `mvmctl dev` or `mvmctl bootstrap` also handles setup automatically -- they detect your platform, select the backend, install Lima only if needed, and set up Nix and Firecracker in the right environment.
+Running `mvmctl dev` or `mvmctl bootstrap` also handles setup automatically -- they detect your platform, select the backend, and stage the builder microVM image on first use.
 
 You can force a specific backend with `--hypervisor`:
 
 ```bash
-mvmctl up --flake . --hypervisor apple-container
+mvmctl up --flake . --hypervisor microsandbox
 mvmctl up --flake . --hypervisor firecracker
 mvmctl up --flake . --hypervisor docker
 mvmctl up --flake . --hypervisor qemu    # microvm.nix

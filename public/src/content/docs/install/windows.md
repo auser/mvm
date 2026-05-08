@@ -22,25 +22,19 @@ You'll need: Windows 10 21H2+ or Windows 11 (any), with a CPU that supports virt
    sudo apt-get update && sudo apt-get install -y curl git build-essential
    ```
 
-3. **Install Nix (multi-user)**:
-   ```bash
-   sh <(curl -L https://nixos.org/nix/install) --daemon
-   . /etc/profile.d/nix.sh
-   ```
-
-4. **Install mvmctl**:
+3. **Install mvmctl**:
    ```bash
    cargo install --git https://github.com/auser/mvm mvmctl
    ```
    Or download a release binary from the [releases page](https://github.com/auser/mvm/releases).
 
-5. **First-time setup**:
+4. **First-time setup**:
    ```bash
    mvmctl bootstrap
    ```
-   This pulls the dev image, verifies the SHA-256 manifest, and installs Firecracker. Idempotent — safe to re-run.
+   This pulls the dev image, verifies the SHA-256 manifest, and installs Firecracker. Idempotent — safe to re-run. You don't need Nix in your WSL2 distro: mvm bootstraps a builder microVM on first build and runs `nix build` inside it.
 
-6. **Verify Tier 1 isolation**:
+5. **Verify Tier 1 isolation**:
    ```bash
    mvmctl doctor
    ```
@@ -49,6 +43,17 @@ You'll need: Windows 10 21H2+ or Windows 11 (any), with a CPU that supports virt
 You're done. From here, follow the [Quick Start](/getting-started/quickstart) — everything works the same as on a native Linux host because WSL2 *is* a Linux host as far as mvm is concerned.
 
 See the [WSL2 walkthrough](/guides/windows-wsl2) for detail on bootstrap automation, port forwarding from Windows to a guest, and a few WSL2-specific quirks.
+
+### Optional: host-side Nix (in WSL2) for power users
+
+Skip this unless you're contributing to mvm itself or want a shared `/nix/store` between your editor and mvm. Inside the WSL2 distro:
+
+```bash
+sh <(curl -L https://nixos.org/nix/install) --daemon
+. /etc/profile.d/nix.sh
+```
+
+When `mvmctl build` detects a working host-side Nix that can build Linux derivations, it uses it directly and skips the builder microVM.
 
 ## Alternative: Tier 3 Docker fallback
 

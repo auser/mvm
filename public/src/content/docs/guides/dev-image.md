@@ -145,8 +145,10 @@ nix eval .#dev.passthru.mvm
 
 ### Cross-platform build notes
 
-- **Linux**: builds natively via Nix.
-- **macOS**: needs a Linux builder. The cleanest path is [`nix-darwin`'s `linux-builder`](/install/macos#configure-a-linux-builder-optional-but-recommended). Without it, `nix build .#dev` fails at evaluation time with a clear "no Linux builder" message.
+mvm bootstraps a Linux builder microVM (microsandbox-backed) on first build and runs `nix build` inside it. You don't need Nix on your host. See [ADR-013 §"Linux builder via microsandbox"](/contributing/adr/013-microsandbox-pivot/).
+
+- **Linux** (with `/dev/kvm`): the builder microVM runs on Firecracker. If you've opted into host-side Nix and it can build Linux derivations, mvm uses it directly and skips the builder VM.
+- **macOS**: the builder microVM runs on libkrun via Hypervisor.framework. If you already have [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) configured, mvm detects and uses it instead.
 - **Windows**: via the Tauri-only path ([ADR-031](/contributing/adr/013-microsandbox-pivot/)); the WSL2-backed builder handles `nix build`.
 
 ## Why this is structured this way

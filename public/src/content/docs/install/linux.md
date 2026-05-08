@@ -16,28 +16,9 @@ You'll need:
   ```
 
   If `/dev/kvm` exists but is `root`-only, add yourself to the `kvm` group: `sudo usermod -aG kvm "$USER"` (re-login required).
-- **Nix** (single-user or multi-user; either works).
 - **Rust 1.85+** if you build `mvmctl` from source.
 
-## Install Nix
-
-[Determinate Nix](https://determinate.systems/posts/determinate-nix-installer) is the easiest path:
-
-```bash
-curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
-```
-
-The upstream NixOS installer is also fine:
-
-```bash
-sh <(curl -L https://nixos.org/nix/install) --daemon
-```
-
-After install, open a fresh shell and verify:
-
-```bash
-nix --version
-```
+You **do not need Nix on your host**. mvm bootstraps a small Linux builder microVM on first build, runs `nix build` inside it, and extracts the resulting rootfs back to your host. See [ADR-013 §"Linux builder via microsandbox"](/contributing/adr/013-microsandbox-pivot/) for the design.
 
 ## Install mvmctl
 
@@ -74,7 +55,7 @@ cargo install mvmctl
 mvmctl doctor
 ```
 
-`doctor` checks for `/dev/kvm` access, Nix availability, the cache directory permissions, and the active backend. On a healthy Linux + KVM host you'll see Firecracker selected as the auto-default.
+`doctor` checks for `/dev/kvm` access, the cache directory permissions, and the active backend. On a healthy Linux + KVM host you'll see Firecracker selected as the auto-default. Host-side Nix is reported but not required.
 
 ## First microVM
 
@@ -94,9 +75,31 @@ See [Building MicroVM Images](/guides/building-microvm-images) for the user-faci
 
 **"`mvmctl run` falls back to microsandbox even though I have KVM"** — check `mvmctl doctor` output. The auto-select ladder picks Firecracker only when `/dev/kvm` is writable; if it's `root`-only, microsandbox wins as the cross-platform fallback. Same fix as above.
 
-**Nix build is slow** — first builds pull from `cache.nixos.org` and `cache.flakehub.com`. Subsequent builds hit the local store. The persistent builder microVM (Phase 1+) keeps `/nix/store` warm across builds; until that wave lands, the first run pays the cold-cache cost.
+**Nix build is slow** — first builds pull from `cache.nixos.org` and `cache.flakehub.com`. Subsequent builds hit the builder VM's `/nix/store`, which mvm keeps warm across runs. If you've opted into host-side Nix (below), the host store is shared into the builder VM and reused across both modes.
 
 **Firecracker errors with "TooManyOpenFiles"** — bump the open-files ulimit: `ulimit -n 4096`. mvm sets a sensible default but very-high-density runs need headroom.
+
+## Optional: host-side Nix for power users
+
+mvm doesn't need Nix on the host — the builder microVM handles all `nix build` invocations. You may still want host-side Nix if you're:
+
+- contributing to mvm itself and want a shared `/nix/store` between your editor's build commands and mvm's,
+- on a fast box where shaving the builder VM's per-invocation overhead matters,
+- already running a `nix-daemon` for other projects.
+
+If you opt in, [Determinate Nix](https://determinate.systems/posts/determinate-nix-installer) is the easiest path:
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
+```
+
+The upstream NixOS installer also works:
+
+```bash
+sh <(curl -L https://nixos.org/nix/install) --daemon
+```
+
+When `mvmctl build` detects a working host-side Nix that can build Linux derivations, it uses it directly and skips the builder microVM. Otherwise it falls through to the bootstrapped path.
 
 ## Distro-specific notes
 

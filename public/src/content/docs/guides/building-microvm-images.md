@@ -184,8 +184,10 @@ nix flake check --no-build
 
 ## Cross-platform notes
 
-- **Linux**: Nix builds natively against `/dev/kvm`. Firecracker is the default backend.
-- **macOS**: Nix builds need a Linux builder — either [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) or a remote `nix-daemon`. Once the build succeeds, microsandbox (libkrun-backed) runs the resulting microVM directly on Hypervisor.framework — no Lima hop. See [ADR-013](/contributing/adr/013-microsandbox-pivot/).
+mvm bootstraps a Linux builder microVM on first build (microsandbox-backed; see [ADR-013 §"Linux builder via microsandbox"](/contributing/adr/013-microsandbox-pivot/)) and runs `nix build` inside it. You don't need host-side Nix.
+
+- **Linux**: the builder microVM runs on Firecracker against `/dev/kvm`. Firecracker is also the default runtime backend. If you've opted into host-side Nix and it can build Linux derivations, mvm uses it directly and skips the builder VM.
+- **macOS**: the builder microVM runs on libkrun via Hypervisor.framework — no Lima hop. The resulting microVM is then booted on the same backend. If you already have [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) or a remote `nix-daemon` configured, mvm detects and uses it instead.
 - **Windows**: Tauri-only (the `mvm-studio` desktop app packages a WSL2-backed builder + runtime). See [ADR-031](https://github.com/auser/mvm/blob/main/specs/adrs/031-cross-platform-strategy.md).
 
 ## Rootless workloads
