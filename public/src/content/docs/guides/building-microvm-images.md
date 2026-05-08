@@ -72,6 +72,7 @@ nix build .#default
 | `hypervisor` | `string` (optional) | Override the default (`firecracker`). |
 | `vcpus`, `memory_mib` | `int` (optional) | Resource defaults; `mvm.toml` overrides at run time. |
 | `dev` | `bool` (optional) | Explicit accessible-vs-sealed override. Inferred from entrypoint by default. |
+| `uids` | `attrs` (optional) | `{ agent = 990; entrypoint = 0|1000; }` — privilege model override. See [Rootless workloads](#rootless-workloads) below. |
 | `extraFiles` | `attrs` (optional) | `{ "/abs/path" = { content; mode?; }; }` baked into the rootfs at build time. |
 
 ## Entrypoint forms
@@ -186,6 +187,47 @@ nix flake check --no-build
 - **Linux**: Nix builds natively against `/dev/kvm`. Firecracker is the default backend.
 - **macOS**: Nix builds need a Linux builder — either [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) or a remote `nix-daemon`. Once the build succeeds, microsandbox (libkrun-backed) runs the resulting microVM directly on Hypervisor.framework — no Lima hop. See [ADR-013](/contributing/adr/013-microsandbox-pivot/).
 - **Windows**: Tauri-only (the `mvm-studio` desktop app packages a WSL2-backed builder + runtime). See [ADR-031](https://github.com/auser/mvm/blob/main/specs/adrs/031-cross-platform-strategy.md).
+
+## Rootless workloads
+
+PID 1 must be uid 0 (kernel mandate). Everything else can — and by default in production *does* — run non-root. mkGuest's `uids` knob controls the privilege drop:
+
+| Process | Default uid | Role |
+|---|---|---|
+| `/init` (PID 1) | 0 | Mounts pseudofs, drops privs, exec's the entrypoint |
+| `mvm-guest-agent` | 990 | Vsock RPC handler (never needs root) |
+| Entrypoint (workload) | **0 in dev**, **1000 in prod** | Your service or shell |
+
+The dev/prod default split is intentional:
+
+- **Dev** keeps entrypoint as root because debug shells expect root: `apt install`, `mount`, `tcpdump`. Forcing rootless dev would break those flows on first try.
+- **Prod** drops to uid 1000 by default per ADR-002 W2.1 — "no guest binary can elevate to uid 0." A workload that *isn't* root can't be re-elevated.
+
+`/init` uses `setpriv --reuid=N --regid=N --clear-groups --no-new-privs --` to drop. `--no-new-privs` blocks `setuid` re-elevation, so even if the workload finds a SUID binary, it can't reach uid 0.
+
+### Override
+
+```nix
+# Rootless dev shell — forces non-root even in dev mode.
+mkGuest {
+  entrypoint.shell = "/bin/bash";
+  uids = { entrypoint = 1000; };
+}
+
+# Rootful prod workload — explicit override, rarely the right call.
+mkGuest {
+  entrypoint.command = [ "/usr/local/bin/serve" ];
+  uids = { entrypoint = 0; };
+}
+
+# Non-default agent uid (e.g. to avoid collisions with host-side ranges).
+mkGuest {
+  entrypoint.command = [ "/bin/x" ];
+  uids = { agent = 5000; };
+}
+```
+
+The resolved values surface as `passthru.mvm.uids = { agent; entrypoint; }` and `passthru.mvm.rootlessEntrypoint :: bool` so `mvmctl status` can cross-check against `/proc/<pid>/status` at runtime.
 
 ## Why no OCI
 

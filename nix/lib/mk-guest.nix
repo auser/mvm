@@ -75,6 +75,7 @@ in
 , vcpus          ? 1
 , memory_mib     ? 256
 , dev            ? null
+, uids           ? null   # { agent = <int>; entrypoint = <int>; } — see below
 , extraFiles     ? { }
 }:
 let
@@ -84,25 +85,74 @@ let
     else dev;
   isSealed = !isDev;
 
-  # Rendered entrypoint command-line that /init will exec. Only the
-  # shell + command forms are wired in this wave; multi-service
-  # supervision lands in W5.2 (needs a small Rust supervisor binary
-  # in the rootfs). We surface the "services" form's metadata
-  # correctly even though the runtime path errors at boot — that
-  # way the host-side passthru is right and only the in-guest
-  # supervisor is missing.
-  entrypointCmd =
-    if entrypointKind == "shell" then
-      "exec ${lib.escapeShellArg entrypoint.shell} -i"
-    else if entrypointKind == "command" then
-      "exec ${renderCommand entrypoint.command}"
+  # ── Privilege model (uids) ─────────────────────────────────────
+  #
+  # PID 1 must be uid 0 (kernel requirement); everything we can
+  # drop is dropped via `setpriv` before exec. Two configurable
+  # uids:
+  #
+  #   agent       — the host-mediated tool agent (vsock RPC handler).
+  #                 Always non-root; never needs privilege.
+  #
+  #   entrypoint  — the workload the user declared. Defaults differ
+  #                 by mode:
+  #                   dev = true  → uid 0 (root shell;
+  #                                  apt install / mount work)
+  #                   dev = false → uid 1000 (rootless workload;
+  #                                  defense in depth — ADR-002 W2.1)
+  #
+  # Override either via `uids = { agent = N; entrypoint = M; }` —
+  # e.g. `entrypoint = 1000` forces a rootless dev shell, or
+  # `entrypoint = 0` forces a rootful prod workload (rare; usually
+  # a misconfiguration).
+  defaultEntrypointUid = if isDev then 0 else 1000;
+  resolvedUids = {
+    agent = if uids != null && uids ? agent then uids.agent else 990;
+    entrypoint =
+      if uids != null && uids ? entrypoint
+      then uids.entrypoint
+      else defaultEntrypointUid;
+  };
+
+  # GID == UID by convention. /etc/group entries below mirror this.
+  # Phase 6 (W2.1) introduces per-service derived gids; for the
+  # Phase 1 W6.1 slice we keep it simple.
+  agentUid = resolvedUids.agent;
+  entrypointUid = resolvedUids.entrypoint;
+
+  # Wrap a command-line in `setpriv` when the target uid is non-zero.
+  # busybox provides setpriv from util-linux applets; the flags here
+  # match ADR-002 W2.3 (--reuid + --regid + --no-new-privs) so the
+  # privilege drop is consistent with the planned Phase 6 hardening.
+  # uid==0 short-circuits to the bare command — no point setpriv-ing
+  # to root.
+  setprivWrap = uid: cmd:
+    if uid == 0 then cmd
     else
+      "exec /bin/busybox setpriv --reuid=${toString uid} --regid=${toString uid} "
+      + "--clear-groups --no-new-privs -- ${cmd}";
+
+  rawEntrypointCmd =
+    if entrypointKind == "shell" then
+      "${lib.escapeShellArg entrypoint.shell} -i"
+    else if entrypointKind == "command" then
+      renderCommand entrypoint.command
+    else
+      "/bin/sh -i";  # services fallthrough; W5.2 wires the supervisor
+
+  # The full /etc/mvm/entrypoint body. For shell + command forms,
+  # setpriv-wrap as appropriate. For services (still stubbed),
+  # bail out with a clear note + recovery shell.
+  entrypointCmd =
+    if entrypointKind == "services" then
       ''
         echo "mkGuest: entrypoint.services is not yet wired in this iteration"
         echo "  (W5.2 ports the multi-service supervisor binary)"
         echo "  Falling through to a recovery shell for triage."
-        exec /bin/sh -i
-      '';
+        ${setprivWrap entrypointUid "/bin/sh -i"}
+      ''
+    else
+      "${setprivWrap entrypointUid rawEntrypointCmd}";
 
   # /init — our PID 1. Pure POSIX shell; busybox provides every
   # utility used here. Boot-time-critical path so kept terse and
@@ -226,16 +276,38 @@ let
     cp ${nameFile} "$out/etc/mvm/name"
     chmod 0444 "$out/etc/mvm/name"
 
-    # Minimal /etc/passwd + /etc/group so getuid() lookups don't
-    # silently fail. Only root (0) is provisioned at this stage —
-    # per-service uids land in Phase 6 (W2.1).
+    # /etc/passwd + /etc/group provision root (mandatory for PID 1)
+    # plus the agent + entrypoint uids resolved at build time.
+    # Per ADR-002 W2.2 (Phase 6) these become read-only via bind-
+    # mount once the security overlay lands; for W6.1 they're
+    # plain mode 0644.
+    #
+    # When entrypoint uid happens to be 0 (dev-mode default), the
+    # entry collapses to the root row — guarded against the
+    # duplicate by skipping the second cat. Same for the agent
+    # uid in the unlikely override case.
     cat > "$out/etc/passwd" <<EOF
     root:x:0:0:root:/root:/bin/sh
     EOF
+    if [ "${toString agentUid}" != "0" ]; then
+      printf 'mvm-agent:x:${toString agentUid}:${toString agentUid}:mvm guest agent:/var/empty:/bin/false\n' >> "$out/etc/passwd"
+    fi
+    if [ "${toString entrypointUid}" != "0" ] && [ "${toString entrypointUid}" != "${toString agentUid}" ]; then
+      printf 'mvm-worker:x:${toString entrypointUid}:${toString entrypointUid}:mvm workload:/home/mvm-worker:/bin/sh\n' >> "$out/etc/passwd"
+      mkdir -p "$out/home/mvm-worker"
+      chmod 0755 "$out/home/mvm-worker"
+    fi
     chmod 0644 "$out/etc/passwd"
+
     cat > "$out/etc/group" <<EOF
     root:x:0:
     EOF
+    if [ "${toString agentUid}" != "0" ]; then
+      printf 'mvm-agent:x:${toString agentUid}:\n' >> "$out/etc/group"
+    fi
+    if [ "${toString entrypointUid}" != "0" ] && [ "${toString entrypointUid}" != "${toString agentUid}" ]; then
+      printf 'mvm-worker:x:${toString entrypointUid}:\n' >> "$out/etc/group"
+    fi
     chmod 0644 "$out/etc/group"
 
     # Extra user-supplied files.
@@ -279,6 +351,16 @@ let
     # boot are the levers that keep us under it. A backend that can't
     # hit the floor is a backend we drop.
     expectedBootMs = 300;
+    # Privilege model — the resolved uids `setpriv` drops to before
+    # exec. PID 1 is uid 0 (kernel requirement); these are the
+    # workload + agent uids. Surfaces here so mvmctl status can
+    # verify the actual /proc/<pid>/Uid against the declared
+    # intent.
+    uids = {
+      agent = agentUid;
+      entrypoint = entrypointUid;
+    };
+    rootlessEntrypoint = entrypointUid != 0;
   };
 in
 rootfsImage.overrideAttrs (old: {

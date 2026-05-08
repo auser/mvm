@@ -97,4 +97,57 @@ in
       };
     in
     (meta msbGuest).expectedBootMs == 300;
+
+  # ── Privilege model invariants (W6.1 rootless) ────────────────
+  #
+  # Defaults: dev image runs entrypoint as root (debug-friendly
+  # shell); prod image runs entrypoint as uid 1000 (rootless
+  # workload, defense in depth); agent always uid 990.
+
+  dev_default_entrypoint_is_root = (meta shellGuest).uids.entrypoint == 0
+    && (meta shellGuest).rootlessEntrypoint == false;
+
+  prod_default_entrypoint_is_rootless = (meta commandGuest).uids.entrypoint == 1000
+    && (meta commandGuest).rootlessEntrypoint == true;
+
+  agent_uid_is_always_990_by_default = (meta shellGuest).uids.agent == 990
+    && (meta commandGuest).uids.agent == 990
+    && (meta servicesGuest).uids.agent == 990;
+
+  # ── Override path (uids = { ... } argument) ───────────────────
+
+  rootless_dev_shell_via_uids_override =
+    let
+      g = mkGuest {
+        name = "rootless-dev";
+        entrypoint.shell = "/bin/sh";
+        uids = { entrypoint = 1000; agent = 990; };
+      };
+    in
+    (meta g).rootlessEntrypoint == true
+    && (meta g).accessible == true   # still dev mode
+    && (meta g).uids.entrypoint == 1000;
+
+  rootful_prod_via_uids_override =
+    let
+      g = mkGuest {
+        name = "rootful-prod";
+        entrypoint.command = [ "/bin/x" ];
+        uids = { entrypoint = 0; };
+      };
+    in
+    (meta g).rootlessEntrypoint == false
+    && (meta g).sealed == true
+    && (meta g).uids.entrypoint == 0;
+
+  custom_agent_uid_round_trips =
+    let
+      g = mkGuest {
+        name = "custom-agent";
+        entrypoint.command = [ "/bin/x" ];
+        uids = { agent = 5000; };
+      };
+    in
+    (meta g).uids.agent == 5000
+    && (meta g).uids.entrypoint == 1000;  # default unaffected
 }

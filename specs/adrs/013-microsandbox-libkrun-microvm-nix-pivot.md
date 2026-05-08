@@ -81,6 +81,29 @@ The previous iteration shipped this exact strategy and was approaching the upstr
 
 CI perf gate: `xtask perf --backend <name> --p50-ms 300 --runs 100` (Phase 9). The smoke at `tests/smoke_e2e_boot.rs` (Phase 1 W6) runs a single boot and asserts the floor on every PR that touches the boot path.
 
+## Privilege model — rootless workloads on busybox PID 1
+
+PID 1 must be uid 0 (Linux kernel requirement; user-namespace tricks bring their own risk surface and are out of scope). `setpriv` drops privileges before exec'ing the workload, so the user-visible process tree is non-root by default in production.
+
+| Process | Uid | Why |
+|---|---|---|
+| `/init` (PID 1) | 0 | Kernel mandates. Mounts `/proc`/`/sys`/`/dev`, sets up the world, then exec's the entrypoint via `setpriv`. |
+| `mvm-guest-agent` | 990 | Vsock RPC handler. Never needs root. Always non-root regardless of mode. |
+| Entrypoint (workload) | 0 (dev) / 1000 (prod) | Root by default in dev for debug ergonomics (`apt`, `mount`, etc.); non-root by default in prod for defense in depth. Override via `uids = { entrypoint = … }`. |
+
+`setpriv` invocation uses `--reuid + --regid + --clear-groups + --no-new-privs` (matches ADR-002 W2.3). `--no-new-privs` blocks `setuid` re-elevation in the workload — a compromise of the entrypoint can't reach uid 0 even if it finds a SUID binary.
+
+**Why dev defaults to root:** dev shells are interactive debug surfaces. `apt install`, `mount /dev/sdX`, `tcpdump -i any` — all expect root. Defaulting dev to non-root would break those flows on first try and push users to flip the override, which is friction without payoff. Dev is *already* a less-secure mode (the `accessible` distinction in ADR-013 §"Sealed vs accessible"); rootful entrypoint is consistent with that posture.
+
+**Why prod defaults to non-root:** the ADR-002 W2.1 commitment — "no guest binary can elevate to uid 0." Defending against this requires the workload not *being* uid 0 to begin with. The rootless default lands a meaningful slice of W2.1 ahead of Phase 6's full security overlay; the rest of W2 (per-service uids, read-only `/etc`, dm-verity) layers on top without breaking the surface.
+
+**Override knob:** `uids = { agent = N; entrypoint = M; }` on the `mkGuest` call. Valid permutations:
+- `{ entrypoint = 1000 }` — rootless dev shell (forces non-root in dev mode)
+- `{ entrypoint = 0 }` — rootful prod workload (rare; usually a misconfiguration; blocked at policy level once the lint lands)
+- `{ agent = 5000 }` — non-default agent uid (e.g. to avoid collisions with a host-side range)
+
+Values surface on the resulting derivation as `passthru.mvm.uids = { agent; entrypoint; }` and `passthru.mvm.rootlessEntrypoint :: bool`. `mvmctl status` reads them and cross-checks against `/proc/<pid>/status` in the guest at runtime.
+
 ## Non-goal: OCI / container images
 
 **mvm is microVMs, not containers.** Even though microsandbox's API
