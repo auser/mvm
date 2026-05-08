@@ -1,149 +1,163 @@
 ---
 title: Dev Image
-description: How the dev image works, how to customize it, and how to rebuild it.
+description: How `mvmctl dev` boots a development microVM, the default image that ships with mvm, and how to write your own.
 ---
 
-The **dev image** is a minimal Linux VM image (kernel + ext4 rootfs) used by `mvmctl dev` to provide a build environment. It contains Nix, Git, GCC, Cargo, and other tools needed to build microVM images.
+A **dev image** is a microVM image whose entrypoint is an interactive shell — what `mvmctl dev` boots when you want a sandboxed shell for build/test/exploration. It's just an `mkGuest` call with `entrypoint.shell` set; the same library, the same flake shape, the same builder pipeline as any other mvm image.
 
-## How it works
+There are two paths:
 
-When you run `mvmctl dev up`, the CLI:
+1. **Use the default dev image that ships with mvm** — zero config, run `mvmctl dev up` and you're in a shell. Good for "I just want a sandboxed Linux shell to poke around in." See [The default dev image](#the-default-dev-image) below.
+2. **Write your own dev image** — declare it in your project's flake using `mvm.lib.<system>.mkGuest`. Adds your packages, your services, your config. The mvm repository's internals stay untouched — you're a consumer of the library, not a fork. See [Writing your own dev image](#writing-your-own-dev-image) below.
 
-1. Checks `~/.cache/mvm/dev/` for cached `vmlinux` and `rootfs.ext4`
-2. If missing, builds the image from `nix/images/builder/flake.nix` (requires Nix with a Linux builder)
-3. If Nix build fails (e.g. no Linux builder on macOS), downloads a pre-built image from the matching GitHub release
+Per [ADR-013](/contributing/adr/013-microsandbox-pivot/), the dev/prod distinction is encoded in the entrypoint shape (`shell` → accessible, `command`/`services` → sealed). The same `mvm.lib.<system>.mkGuest` API serves both.
 
-The dev image is built using the same `mkGuest` helper that builds all microVM images, so it follows the same conventions (busybox init, vsock communication, no SSH).
+## Writing your own dev image
 
-## Customizing the dev image
-
-The dev image flake lives at [`nix/images/builder/flake.nix`](https://github.com/auser/mvm/blob/main/nix/images/builder/flake.nix). It imports the parent flake at `nix/` and calls `mkGuest` with a list of packages.
-
-### Adding packages
-
-Edit the `packages` list in `nix/images/builder/flake.nix`:
+A dev image is just an mkGuest call with `entrypoint.shell` set. Your project's `flake.nix` already imports `mvm` as an input ([Building MicroVM Images](/guides/building-microvm-images) covers the basics); add a `packages.<system>.dev` output:
 
 ```nix
-packages = [
-  # ... existing packages ...
+{
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+    mvm.url     = "github:auser/mvm";
+  };
 
-  # Add your packages here
-  pkgs.jq
-  pkgs.ripgrep
-  pkgs.python3
-];
+  outputs = { self, nixpkgs, mvm, ... }:
+    let
+      system = "x86_64-linux";
+      pkgs   = import nixpkgs { inherit system; };
+    in
+    {
+      packages.${system} = {
+        # Production image — what `mvmctl up` builds.
+        default = mvm.lib.${system}.mkGuest {
+          name = "my-app";
+          entrypoint.command = [ "/usr/local/bin/serve" ];
+        };
+
+        # Dev image — what `mvmctl dev up` builds.
+        dev = mvm.lib.${system}.mkGuest {
+          name = "my-app-dev";
+
+          # entrypoint.shell auto-infers `dev = true` (accessible).
+          # `mvmctl console <vm>` attaches via vsock.
+          entrypoint.shell = "/bin/bash";
+
+          # Anything in nixpkgs.
+          packages = with pkgs; [
+            git
+            jq
+            ripgrep
+            python3
+          ];
+
+          # Optional: per-tenant defaults; mvm.toml overrides at run time.
+          vcpus = 2;
+          memory_mib = 1024;
+        };
+      };
+    };
+}
 ```
 
-Any package available in [nixpkgs](https://search.nixos.org/packages) can be added.
+Point `mvm.toml` at the dev output:
 
-### Adding services
+```toml
+flake     = "."
+profile   = "dev"
+vcpus     = 2
+memory_mib = 1024
+```
 
-To run a service inside the dev image, add a `services` block:
+Then:
+
+```sh
+mvmctl dev up         # builds the .dev output, boots it, drops you into the shell
+mvmctl dev down       # stop the dev VM
+mvmctl console        # reattach to the running shell
+```
+
+You **never edit anything inside the mvm repository** to customize your dev image. Your project owns its dev image; mvm is the library.
+
+### Adding services to your dev image
+
+The shell is your interactive surface, but you can run additional services in parallel via the `services` field:
 
 ```nix
-mvm.lib.${system}.mkGuest {
-  name = "mvm-dev";
-  hostname = "mvm-dev";
+dev = mvm.lib.${system}.mkGuest {
+  name = "my-app-dev";
+  entrypoint.shell = "/bin/bash";
 
-  packages = [ ... ];
-
-  services.my-daemon = {
-    command = "${pkgs.somePackage}/bin/daemon --flag";
+  services.postgres = {
+    command = [ "${pkgs.postgresql}/bin/postgres" "-D" "/var/lib/postgresql/data" ];
+    restart = "always";
   };
+  services.redis = {
+    command = [ "${pkgs.redis}/bin/redis-server" ];
+  };
+
+  packages = with pkgs; [ postgresql redis ];
 };
 ```
 
-See the [Nix Flakes guide](/guides/nix-flakes) for the full `mkGuest` API.
+Each service runs as its own supervised process. The shell stays your foreground; services are background.
+
+### Forcing the dev path on a sealed entrypoint
+
+If you want a dev image whose primary entrypoint is a *program* (not a shell) but still want `mvmctl console` to attach for debugging:
+
+```nix
+dev = mvm.lib.${system}.mkGuest {
+  name = "my-app-dev";
+  entrypoint.command = [ "/usr/local/bin/serve" "--debug" ];
+  dev = true;   # explicit override; auto-infer is `false` for command form
+};
+```
+
+See [Building MicroVM Images](/guides/building-microvm-images#sealed-vs-accessible--the-same-flake-works-for-both) for the full sealed/accessible matrix.
+
+## The default dev image
+
+If your project doesn't declare a `.dev` flake output, `mvmctl dev up` falls back to the default image that ships with mvm — a minimal busybox rootfs with a shell entrypoint. It exists so you can run `mvmctl dev up` with zero config and get something useful.
+
+The default image is **not** a starter template — don't fork it. It's there for the "I just want a shell" case. Once you have specific package or service requirements, switch to writing your own per the section above.
+
+(Internally the default lives at the workspace's `nix/profiles/minimal.nix` — but that file is a test fixture, not a user-facing entry point. The library's `mvm.lib.<system>.mkGuest` is what you should be calling.)
 
 ## Building the dev image locally
 
-### Prerequisites
+The build path is the same as any mvm image:
 
-- **Nix** installed on the host
-- **Linux builder** configured (required on macOS since the image targets Linux)
-
-### Build
-
-```bash
-# Build for the current architecture
-nix build ./nix/images/builder
-
-# Build for a specific architecture
-nix build ./nix/images/builder#packages.aarch64-linux.default
-nix build ./nix/images/builder#packages.x86_64-linux.default
+```sh
+# From your project directory:
+nix build .#dev
 ```
 
-The output is a Nix store path containing `vmlinux` (kernel) and `rootfs.ext4` (root filesystem).
+Output is a derivation with `passthru.mvm.{accessible, sealed, expectedBootMs}`. Check it:
 
-### Force a rebuild
-
-The CLI caches the dev image at `~/.cache/mvm/dev/`. To force a rebuild after modifying the flake:
-
-```bash
-# Remove the cached image
-rm -rf ~/.cache/mvm/dev/
-
-# Rebuild on next dev up
-mvmctl dev up
+```sh
+nix eval .#dev.passthru.mvm
+# { accessible = true; entrypointKind = "shell"; expectedBootMs = 300; ... }
 ```
 
-Or copy the built artifacts directly:
+`mvmctl dev up` runs the same `nix build` under the hood and boots the result.
 
-```bash
-STORE_PATH=$(nix build ./nix/images/builder --no-link --print-out-paths)
-mkdir -p ~/.cache/mvm/dev
-cp "$STORE_PATH/vmlinux" ~/.cache/mvm/dev/
-cp "$STORE_PATH/rootfs.ext4" ~/.cache/mvm/dev/
-```
+### Cross-platform build notes
 
-### macOS: setting up a Linux builder
+- **Linux**: builds natively via Nix.
+- **macOS**: needs a Linux builder. The cleanest path is [`nix-darwin`'s `linux-builder`](/install/macos#configure-a-linux-builder-optional-but-recommended). Without it, `nix build .#dev` fails at evaluation time with a clear "no Linux builder" message.
+- **Windows**: via the Tauri-only path ([ADR-031](/contributing/adr/013-microsandbox-pivot/)); the WSL2-backed builder handles `nix build`.
 
-macOS cannot build Linux images natively. You need a Linux builder for Nix:
+## Why this is structured this way
 
-**Option 1 -- Temporary** (run in a separate terminal):
+ADR-013 names a single architectural commitment: **mvm is a library, your project owns its flake.** The previous iteration of mvm shipped a `nix/images/builder/` directory with a default dev-image flake that users would fork or edit. That coupled every user's dev workflow to mvm's internal layout, so any refactor of the library broke everyone's build.
 
-```bash
-nix run 'nixpkgs#darwin.linux-builder'
-```
+The current shape:
 
-**Option 2 -- Permanent** (add to `/etc/nix/nix.conf`):
+- mvm exposes `mvm.lib.<system>.mkGuest` — a stable function the library promises not to break.
+- Your project's flake calls `mkGuest` and exports a `.dev` package.
+- `mvmctl dev` reads `mvm.toml`, runs `nix build .#dev` against your flake, boots the result.
+- mvm's internal layout (where `mkGuest` lives, what tests use it, etc.) can change freely without your project noticing.
 
-```
-builders = ssh-ng://builder@linux-builder aarch64-linux /etc/nix/builder_ed25519 4 1 kvm,big-parallel - -
-builders-use-substitutes = true
-```
-
-Then restart the Nix daemon:
-
-```bash
-sudo launchctl kickstart -k system/org.nixos.nix-daemon
-```
-
-## CI builds
-
-The release workflow (`.github/workflows/release.yml`) builds dev images for both `aarch64-linux` and `x86_64-linux` on native runners. The resulting `dev-vmlinux-{arch}` and `dev-rootfs-{arch}.ext4` artifacts are uploaded to each GitHub Release. This is the fallback source when local Nix builds aren't available.
-
-## Flake structure
-
-```
-nix/
-├── flake.nix                    # Parent flake — defines mkGuest (production)
-├── packages/
-│   ├── firecracker-kernel.nix
-│   ├── mvm-guest-agent.nix
-│   └── mvmctl.nix
-├── lib/
-│   ├── minimal-init/            # PID 1 init script generator
-│   ├── rootfs-templates/        # populate.sh.in etc.
-│   └── kernel-configs/
-├── dev/                         # Sibling flake — dev variant of mkGuest
-│   └── flake.nix
-└── images/
-    ├── builder/                 # Builder VM image (was nix/dev-image/)
-    │   ├── flake.nix            # Calls mkGuest with dev tools, role = "builder"
-    │   └── flake.lock
-    ├── default-tenant/          # Bundled fallback rootfs (was nix/default-microvm/)
-    └── examples/                # hello, hello-node, hello-python, llm-agent
-```
-
-The builder image flake references the parent via a relative path (`mvm.url = "path:../.."`), so changes to the kernel or init system are picked up automatically on the next build.
+[Building MicroVM Images](/guides/building-microvm-images) covers the same model for production (sealed) images. The dev case is the same library with `entrypoint.shell` set.
