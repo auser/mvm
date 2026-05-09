@@ -170,6 +170,18 @@ impl BuilderBackend for HostBackend<'_> {
         ctx.insert("rev_dir", rev_dir.clone());
         env.shell_exec_visible(&render_script("extract_artifacts_host", &ctx)?)?;
 
+        // Best-effort sidecar emit (W6.2.1 producer side). The dev
+        // path does the same in `pipeline::dev_build`. mvmd's pool
+        // builds are prod-only, so no `--impure` and no dev override
+        // are passed. See `crate::builder_vm::emit_sidecar_via_passthru_query`.
+        let attr = resolve_build_attribute_host(
+            env,
+            &self.spec.flake_ref,
+            &self.spec.role,
+            &self.spec.profile,
+        );
+        crate::builder_vm::emit_sidecar_via_passthru_query(env, &attr, &rev_dir, "", "");
+
         Ok(BackendBuildResult {
             revision_hash,
             lock_hash: self.lock_hash.clone(),

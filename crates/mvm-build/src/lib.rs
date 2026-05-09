@@ -1,5 +1,6 @@
 pub mod artifacts;
 pub mod backend;
+pub mod builder_vm;
 pub mod cache;
 pub mod firecracker;
 pub mod template_reuse;

@@ -3,7 +3,6 @@
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 
-use crate::bootstrap;
 use crate::ui;
 
 use mvm_core::naming::{validate_flake_ref, validate_template_name, validate_vm_name};
@@ -11,7 +10,7 @@ use mvm_core::user_config::MvmConfig;
 use mvm_core::util::parse_human_size;
 use mvm_core::vm_backend::VmId;
 use mvm_runtime::vm::backend::AnyBackend;
-use mvm_runtime::vm::{image, lima, microvm};
+use mvm_runtime::vm::{image, microvm};
 
 use super::super::env::apple_container::ensure_default_microvm_image;
 use super::Cli;
@@ -106,6 +105,9 @@ pub(in crate::commands) struct Args {
     /// Default behaviour resumes on connect.
     #[arg(long)]
     pub no_auto_resume: bool,
+    /// Build-mode override flags (`--dev` / `--prod`). Default: `--prod`.
+    #[command(flatten)]
+    pub build_mode: super::super::shared::BuildModeFlags,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
@@ -181,6 +183,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         .transpose()
         .context("Invalid --ttl value")?;
     let auto_resume = !args.no_auto_resume;
+    let build_mode = args.build_mode.resolve();
 
     cmd_run(RunParams {
         flake_ref: args.flake.as_deref(),
@@ -206,6 +209,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         sandbox_tags,
         sandbox_ttl,
         auto_resume,
+        build_mode,
     })
 }
 
@@ -236,6 +240,7 @@ pub(in crate::commands) struct RunParams<'a> {
     pub(super) sandbox_ttl: Option<std::time::Duration>,
     /// `false` when `--no-auto-resume` is set.
     pub(super) auto_resume: bool,
+    pub(super) build_mode: mvm_build::pipeline::BuildMode,
 }
 
 pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
@@ -263,6 +268,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         sandbox_tags,
         sandbox_ttl,
         auto_resume,
+        build_mode,
     } = params;
     let _span =
         tracing::info_span!("cmd_run", name = ?name, cpus = ?cpus, memory_mib = ?memory).entered();
@@ -302,14 +308,9 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
     // would inherit the same banner via their `security_profile()`.
     emit_security_banner_if_needed(effective_hypervisor);
 
-    // Apple Container doesn't need Lima — skip the upfront check entirely.
-    // For Firecracker on macOS, Lima is required for both build and runtime.
-    let needs_lima = effective_hypervisor != "apple-container"
-        && effective_hypervisor != "docker"
-        && bootstrap::is_lima_required();
-    if needs_lima {
-        lima::require_running()?;
-    }
+    // Lima is gone (ADR-013); no upfront VM check needed. The
+    // microsandbox-as-Linux-builder follow-up (W6.x) will reintroduce
+    // a builder-availability gate at this point when it lands.
     let _metrics_server = if metrics_port > 0 {
         Some(crate::metrics_server::MetricsServer::start(metrics_port)?)
     } else {
@@ -487,7 +488,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         );
         let run_build_env = mvm_runtime::build_env::default_build_env();
         let env = run_build_env.as_ref();
-        let result = mvm_build::dev_build::dev_build(env, &resolved, profile)?;
+        let result = mvm_build::dev_build::dev_build(env, &resolved, profile, build_mode)?;
         if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(env, &result) {
             ui::warn(&format!(
                 "Could not verify guest agent ({}). If built with mkGuest, the agent is already included.",
@@ -899,7 +900,12 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
             // Rebuild the flake.
             let env = mvm_runtime::build_env::RuntimeBuildEnv;
-            let result = match mvm_build::dev_build::dev_build(&env, &flake_dir, profile) {
+            let result = match mvm_build::dev_build::dev_build(
+                &env,
+                &flake_dir,
+                profile,
+                build_mode,
+            ) {
                 Ok(r) => r,
                 Err(e) => {
                     ui::warn(&format!("Rebuild failed: {e}; waiting for next change..."));

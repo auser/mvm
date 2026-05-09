@@ -24,6 +24,7 @@ pub mod microvm;
 pub mod microvm_nix;
 pub mod name_registry;
 pub mod network;
+pub mod runtime_meta;
 pub mod template;
 pub mod vminitd_client;
 pub mod volume_registry;

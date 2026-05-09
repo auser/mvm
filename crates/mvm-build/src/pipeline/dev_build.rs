@@ -3,6 +3,8 @@ use tracing::instrument;
 
 use mvm_core::build_env::ShellEnvironment;
 
+use super::BuildMode;
+
 /// Build the chained `--override-input` arguments that swap the user
 /// flake's `mvm` input for the dev variant at `nix/dev/`, and the dev
 /// variant's own `mvm` input for the local `nix/` parent flake.
@@ -38,7 +40,14 @@ use mvm_core::build_env::ShellEnvironment;
 ///      production agent, surfacing the misconfiguration explicitly
 ///      rather than silently producing a non-functional `mvmctl exec`
 ///      image.
-fn dev_override_flags(env: &dyn ShellEnvironment) -> String {
+fn dev_override_flags(env: &dyn ShellEnvironment, mode: BuildMode) -> String {
+    if !mode.injects_dev_override() {
+        // Prod-shape build: produce sealed images with the prod
+        // guest agent. No override, no --impure. The W6.2 console
+        // gate will refuse attach against the resulting image.
+        return String::new();
+    }
+
     if let Ok(url) = std::env::var("MVM_DEV_FLAKE_URL")
         && !url.trim().is_empty()
     {
@@ -226,6 +235,7 @@ pub fn dev_build(
     env: &dyn ShellEnvironment,
     flake_ref: &str,
     profile: Option<&str>,
+    mode: BuildMode,
 ) -> Result<DevBuildResult> {
     // Honour the host-side GC sentinel before any new build work
     // touches the store. The CLI's `dev up` writes
@@ -250,7 +260,7 @@ pub fn dev_build(
     // agent (vsock Exec handler compiled in) injected via --override-input
     // against the dev sibling flake at `nix/dev/`. User flakes contain no
     // dev/prod toggle — see `dev_override_flags()` for the contract.
-    let dev_override = dev_override_flags(env);
+    let dev_override = dev_override_flags(env, mode);
 
     // The override target references the workspace's `Cargo.lock` from a
     // path outside the user flake's source closure, which pure-eval rejects.
@@ -325,6 +335,20 @@ pub fn dev_build(
 
     // Step 5: Copy artifacts from Nix store to dev build directory
     copy_dev_artifacts(env, &nix_output_path, &build_dir)?;
+
+    // Step 5a: Emit the W7.x.1 sidecar manifest (`mvm-meta.json`)
+    // alongside the rootfs. Best-effort: a missing sidecar is fine
+    // (consumer in `vm/runtime_meta.rs::from_sidecar` defaults to
+    // accessible-by-default), but a present sidecar lights up the
+    // W6.2 console gate end-to-end. Failures here log + continue —
+    // surfacing the gap without breaking the build.
+    crate::builder_vm::emit_sidecar_via_passthru_query(
+        env,
+        &attr,
+        &build_dir,
+        &dev_override,
+        impure_flag,
+    );
 
     env.log_success(&format!("Artifacts stored at {}", build_dir));
 
@@ -946,7 +970,8 @@ mod tests {
         // Cache check returns yes
         env.stub_stdout("test -f", "yes");
 
-        let result = dev_build(&env, "/home/user/project", Some("minimal")).unwrap();
+        let result =
+            dev_build(&env, "/home/user/project", Some("minimal"), BuildMode::Dev).unwrap();
 
         assert!(result.cached);
         assert_eq!(result.revision_hash, "abc123");
@@ -964,7 +989,7 @@ mod tests {
         // Cache miss
         env.stub_stdout("test -f", "no");
 
-        let result = dev_build(&env, "/tmp/flake", Some("minimal")).unwrap();
+        let result = dev_build(&env, "/tmp/flake", Some("minimal"), BuildMode::Dev).unwrap();
 
         assert!(!result.cached);
         assert_eq!(result.revision_hash, "xyz789");
@@ -1053,7 +1078,7 @@ mod tests {
         // nix build output.
         env.stub_stdout("--print-out-paths", "/nix/store/abc123-tenant-minimal\n");
 
-        let result = dev_build(&env, "/tmp/flake", Some("minimal")).unwrap();
+        let result = dev_build(&env, "/tmp/flake", Some("minimal"), BuildMode::Dev).unwrap();
 
         // Verify --impure was added to nix build commands.
         let exec_log = env.exec_log.lock().unwrap();
@@ -1105,8 +1130,149 @@ mod tests {
         // stat calls return sizes
         env.stub_stdout("stat -c%s", "99999");
 
-        let result = dev_build(&env, "/tmp/flake", Some("minimal")).unwrap();
+        let result = dev_build(&env, "/tmp/flake", Some("minimal"), BuildMode::Dev).unwrap();
         // Sizes should be populated (exact value depends on stub matching)
         assert!(result.artifact_sizes.vmlinux_bytes > 0 || result.artifact_sizes.rootfs_bytes > 0);
+    }
+
+    fn fixture_passthru_json(accessible: bool) -> String {
+        format!(
+            r#"{{
+              "name": "fixture",
+              "accessible": {accessible},
+              "sealed": {sealed},
+              "entrypointKind": "shell",
+              "initSystem": "busybox",
+              "expectedBootMs": 300,
+              "agentBinary": "stub",
+              "rootlessEntrypoint": false,
+              "hypervisor": "microsandbox"
+            }}"#,
+            sealed = !accessible,
+        )
+    }
+
+    #[test]
+    fn emit_sidecar_writes_json_when_passthru_query_succeeds() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env = TestEnv::new();
+        env.stub_stdout("--json", &fixture_passthru_json(true));
+
+        crate::builder_vm::emit_sidecar_via_passthru_query(
+            &env,
+            "/tmp/flake#packages.x86_64-linux.tenant-worker",
+            tmp.path().to_str().unwrap(),
+            "",
+            "",
+        );
+
+        let sidecar = crate::builder_vm::ArtifactSidecar::read_from_dir(tmp.path())
+            .expect("read")
+            .expect("present");
+        assert!(sidecar.accessible);
+        assert_eq!(sidecar.name, "fixture");
+        assert_eq!(sidecar.hypervisor, "microsandbox");
+    }
+
+    #[test]
+    fn emit_sidecar_no_sidecar_when_passthru_query_returns_garbage() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env = TestEnv::new();
+        env.stub_stdout("--json", "{not json");
+
+        crate::builder_vm::emit_sidecar_via_passthru_query(
+            &env,
+            "/tmp/flake#packages.x86_64-linux.tenant-worker",
+            tmp.path().to_str().unwrap(),
+            "",
+            "",
+        );
+
+        let sidecar =
+            crate::builder_vm::ArtifactSidecar::read_from_dir(tmp.path()).expect("read");
+        assert!(sidecar.is_none());
+    }
+
+    #[test]
+    fn emit_sidecar_no_sidecar_when_query_returns_empty() {
+        // TestEnv returns Ok("") for unstubbed commands; empty
+        // stdout fails JSON parsing → log+continue → no sidecar.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env = TestEnv::new();
+
+        crate::builder_vm::emit_sidecar_via_passthru_query(
+            &env,
+            "/tmp/flake#packages.x86_64-linux.tenant-worker",
+            tmp.path().to_str().unwrap(),
+            "",
+            "",
+        );
+
+        let sidecar =
+            crate::builder_vm::ArtifactSidecar::read_from_dir(tmp.path()).expect("read");
+        assert!(sidecar.is_none());
+    }
+
+    #[test]
+    fn emit_sidecar_threads_overrides_into_command() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let env = TestEnv::new();
+        env.stub_stdout("--override-input mvm", &fixture_passthru_json(false));
+
+        crate::builder_vm::emit_sidecar_via_passthru_query(
+            &env,
+            "/tmp/flake#packages.x86_64-linux.tenant-worker",
+            tmp.path().to_str().unwrap(),
+            " --override-input mvm git+file:///workspace?dir=nix/dev",
+            " --impure",
+        );
+
+        let sidecar = crate::builder_vm::ArtifactSidecar::read_from_dir(tmp.path())
+            .expect("read")
+            .expect("present");
+        assert!(!sidecar.accessible, "sealed fixture round-tripped");
+    }
+
+    #[test]
+    fn build_mode_prod_emits_no_dev_override() {
+        // The whole point of W6.2.2: production-shape commands
+        // must not inject the dev sibling-flake override.
+        let env = TestEnv::new();
+        let flags = dev_override_flags(&env, BuildMode::Prod);
+        assert!(flags.is_empty(), "Prod must produce no override; got: {flags:?}");
+    }
+
+    #[test]
+    fn build_mode_dev_emits_override_when_workspace_layout_present() {
+        // In the workspace, dev_override_flags walks up from
+        // CARGO_MANIFEST_DIR for nix/dev/flake.nix. When found, it
+        // returns the override; when not, it logs a warning and
+        // returns "". Either outcome is valid here — we only assert
+        // that injects_dev_override is honored: if the layout is
+        // present, Dev produces an override; if absent (no warning
+        // sentinel to check for in this mock), the env var escape
+        // hatch can force one.
+        let env = TestEnv::new();
+        // SAFETY: tests only; MVM_DEV_FLAKE_URL is process-global
+        // but the value is harmless and we restore it.
+        let prev = std::env::var("MVM_DEV_FLAKE_URL").ok();
+        unsafe { std::env::set_var("MVM_DEV_FLAKE_URL", "git+file:///tmp/fake?dir=nix/dev") };
+        let flags = dev_override_flags(&env, BuildMode::Dev);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("MVM_DEV_FLAKE_URL", v),
+                None => std::env::remove_var("MVM_DEV_FLAKE_URL"),
+            }
+        }
+        assert!(
+            flags.contains("--override-input mvm"),
+            "Dev with MVM_DEV_FLAKE_URL set must produce an override; got: {flags:?}"
+        );
+    }
+
+    #[test]
+    fn build_mode_helper_classifies_correctly() {
+        assert!(BuildMode::Dev.injects_dev_override());
+        assert!(!BuildMode::Prod.injects_dev_override());
     }
 }

@@ -240,6 +240,56 @@ fn test_up_manifest_flag() {
 }
 
 #[test]
+fn test_up_dev_flag_resolves_dev_mode() {
+    let cli = Cli::try_parse_from(["mvmctl", "up", "--flake", ".", "--dev"]).unwrap();
+    match cli.command {
+        Commands::Up(up::Args { build_mode, .. }) => {
+            assert!(build_mode.dev);
+            assert!(!build_mode.prod);
+            assert_eq!(build_mode.resolve(), mvm_build::pipeline::BuildMode::Dev);
+        }
+        _ => panic!("Expected Up command"),
+    }
+}
+
+#[test]
+fn test_up_prod_flag_resolves_prod_mode() {
+    let cli = Cli::try_parse_from(["mvmctl", "up", "--flake", ".", "--prod"]).unwrap();
+    match cli.command {
+        Commands::Up(up::Args { build_mode, .. }) => {
+            assert!(!build_mode.dev);
+            assert!(build_mode.prod);
+            assert_eq!(build_mode.resolve(), mvm_build::pipeline::BuildMode::Prod);
+        }
+        _ => panic!("Expected Up command"),
+    }
+}
+
+#[test]
+fn test_up_no_build_mode_flag_defaults_to_prod() {
+    let cli = Cli::try_parse_from(["mvmctl", "up", "--flake", "."]).unwrap();
+    match cli.command {
+        Commands::Up(up::Args { build_mode, .. }) => {
+            assert!(!build_mode.dev);
+            assert!(!build_mode.prod);
+            // No flag → resolve to Prod (the architectural default).
+            assert_eq!(build_mode.resolve(), mvm_build::pipeline::BuildMode::Prod);
+        }
+        _ => panic!("Expected Up command"),
+    }
+}
+
+#[test]
+fn test_up_dev_and_prod_are_mutually_exclusive() {
+    let result =
+        Cli::try_parse_from(["mvmctl", "up", "--flake", ".", "--dev", "--prod"]);
+    assert!(
+        result.is_err(),
+        "passing both --dev and --prod must be a clap parse error"
+    );
+}
+
+#[test]
 fn test_up_manifest_short_flag() {
     let cli = Cli::try_parse_from(["mvmctl", "up", "-m", "openclaw"]).unwrap();
     match cli.command {
@@ -1161,9 +1211,10 @@ fn test_console_with_command() {
     let cli = Cli::try_parse_from(["mvmctl", "console", "myvm", "--command", "ls"]);
     assert!(cli.is_ok());
     match cli.unwrap().command {
-        Commands::Console(console::Args { name, command }) => {
+        Commands::Console(console::Args { name, command, force }) => {
             assert_eq!(name, "myvm");
             assert_eq!(command.as_deref(), Some("ls"));
+            assert!(!force, "default --force is off");
         }
         _ => panic!("Expected Console command"),
     }

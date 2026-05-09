@@ -3,6 +3,7 @@
 //! Each submodule owns one focused concern. `mod.rs` re-exports the public
 //! surface so call sites can keep using `super::shared::clap_vm_name` etc.
 
+mod build_mode;
 mod drive;
 mod event;
 mod format;
@@ -13,6 +14,7 @@ mod start;
 mod state;
 mod vsock;
 
+pub(super) use build_mode::BuildModeFlags;
 pub(super) use drive::{env_vars_to_drive_file, ports_to_drive_file, read_dir_to_drive_files};
 pub(super) use event::PhaseEvent;
 pub(super) use format::{human_bytes, shell_escape};

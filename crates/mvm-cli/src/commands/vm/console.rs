@@ -45,12 +45,35 @@ pub(in crate::commands) struct Args {
     /// Run a single command instead of an interactive shell
     #[arg(long)]
     pub command: Option<String>,
+    /// Bypass the sealed-image check (use with care: the image was
+    /// built without dev surface, so the in-VM agent may refuse
+    /// `Exec`/`ConsoleOpen` regardless).
+    #[arg(long)]
+    pub force: bool,
+}
+
+/// Refuse to attach if the VM's image was built sealed (dev = false /
+/// `passthru.mvm.accessible = false`). The state file is best-effort:
+/// missing or pre-W6.2 files are treated as accessible.
+fn enforce_accessible_gate(name: &str, force: bool) -> Result<()> {
+    if force {
+        return Ok(());
+    }
+    match mvm_runtime::vm::runtime_meta::read(name) {
+        Ok(Some(meta)) if !meta.accessible => anyhow::bail!(
+            "console refused: VM {name:?} was built from a sealed image (passthru.mvm.accessible = false). \
+             Sealed images don't ship the dev agent surface. \
+             Rebuild with `dev = true` or pass `--force` to attempt the attach anyway."
+        ),
+        _ => Ok(()),
+    }
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
     let name = &args.name;
     let command = args.command.as_deref();
     validate_vm_name(name).with_context(|| format!("Invalid VM name: {:?}", name))?;
+    enforce_accessible_gate(name, args.force)?;
 
     if let Some(cmd) = command {
         let transport = pick_console_transport(name)?;
@@ -359,3 +382,88 @@ fn run_console_relay(data_stream: std::os::unix::net::UnixStream) -> Result<()> 
 
     Ok(())
 }
+
+#[cfg(test)]
+mod accessible_gate_tests {
+    use super::*;
+    use mvm_runtime::vm::runtime_meta::{StartModeKind, VmRuntimeMeta, write as write_meta};
+    use std::sync::Mutex;
+
+    // Tests in this module mutate the process-global HOME env var to
+    // point at a temp dir; serialize them with a local mutex so they
+    // don't race when cargo runs the test binary with multiple threads.
+    static HOME_LOCK: Mutex<()> = Mutex::new(());
+
+    fn with_home<F: FnOnce(&std::path::Path)>(f: F) {
+        let _g = HOME_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let prev = std::env::var_os("HOME");
+        unsafe { std::env::set_var("HOME", tmp.path()) };
+        f(tmp.path());
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn gate_allows_when_meta_missing() {
+        with_home(|_| {
+            assert!(enforce_accessible_gate("never-started", false).is_ok());
+        });
+    }
+
+    #[test]
+    fn gate_allows_when_meta_says_accessible() {
+        with_home(|_| {
+            let name = "accessible-vm";
+            write_meta(
+                name,
+                &VmRuntimeMeta {
+                    mode: StartModeKind::Attached,
+                    accessible: true,
+                },
+            )
+            .expect("write");
+            assert!(enforce_accessible_gate(name, false).is_ok());
+        });
+    }
+
+    #[test]
+    fn gate_refuses_when_sealed() {
+        with_home(|_| {
+            let name = "sealed-vm";
+            write_meta(
+                name,
+                &VmRuntimeMeta {
+                    mode: StartModeKind::Detached,
+                    accessible: false,
+                },
+            )
+            .expect("write");
+            let err = enforce_accessible_gate(name, false).expect_err("must refuse");
+            let msg = err.to_string();
+            assert!(msg.contains("sealed image"), "msg: {msg}");
+            assert!(msg.contains("--force"), "msg should hint at --force: {msg}");
+        });
+    }
+
+    #[test]
+    fn gate_force_bypasses_sealed_refusal() {
+        with_home(|_| {
+            let name = "sealed-but-forced";
+            write_meta(
+                name,
+                &VmRuntimeMeta {
+                    mode: StartModeKind::Attached,
+                    accessible: false,
+                },
+            )
+            .expect("write");
+            assert!(enforce_accessible_gate(name, true).is_ok());
+        });
+    }
+}
+

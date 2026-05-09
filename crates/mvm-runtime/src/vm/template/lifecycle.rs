@@ -613,8 +613,12 @@ pub fn template_build_from_manifest(
         }
     }
 
-    let result =
-        mvm_build::dev_build::dev_build(env, &persisted.flake_ref, Some(&persisted.profile))?;
+    let result = mvm_build::dev_build::dev_build(
+        env,
+        &persisted.flake_ref,
+        Some(&persisted.profile),
+        mvm_build::pipeline::BuildMode::Prod,
+    )?;
 
     if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(env, &result) {
         ui::warn(&format!(
@@ -852,7 +856,12 @@ pub fn template_build(id: &str, force: bool, update_hash: bool) -> Result<()> {
             warn!("failed to clear dev build cache: {e}");
         }
     }
-    let result = mvm_build::dev_build::dev_build(env, &spec.flake_ref, Some(&spec.profile))?;
+    let result = mvm_build::dev_build::dev_build(
+        env,
+        &spec.flake_ref,
+        Some(&spec.profile),
+        mvm_build::pipeline::BuildMode::Prod,
+    )?;
     // Best-effort: inject guest agent if not already present.
     // Non-fatal because flakes built with mvm's mkGuest already include
     // guest-agent.nix, and the loop-mount check can fail on virtiofs.
@@ -1442,12 +1451,7 @@ pub struct Checksums {
 
 fn require_local_template_fs() -> Result<()> {
     // Registry push/pull needs direct file access to ~/.mvm/templates.
-    // On macOS, templates live inside Lima; run these commands inside the VM.
-    if mvm_core::platform::current().needs_lima() && !crate::shell::inside_lima() {
-        anyhow::bail!(
-            "template push/pull/verify must be run inside the Linux VM (try `mvm shell`, then rerun)"
-        );
-    }
+    // With Lima gone (ADR-013) the host always has direct access; no-op.
     Ok(())
 }
 

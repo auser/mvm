@@ -1,7 +1,7 @@
 use anyhow::Result;
 use mvm_core::vm_backend::{
-    BackendSecurityProfile, ClaimStatus, LayerCoverage, VmBackend, VmCapabilities, VmId, VmInfo,
-    VmStartConfig, VmStatus,
+    BackendSecurityProfile, ClaimStatus, LayerCoverage, StartMode, VmBackend, VmCapabilities,
+    VmId, VmInfo, VmStartConfig, VmStatus,
 };
 
 use super::apple_container::AppleContainerBackend;
@@ -108,6 +108,13 @@ impl VmBackend for FirecrackerBackend {
 
     fn start(&self, config: &VmStartConfig) -> Result<VmId> {
         let fc_config = FirecrackerConfig::from_start_config(config)?;
+        // Thread the W6.2.1 sidecar into per-VM runtime metadata so
+        // `mvmctl console` can enforce the accessible/sealed gate.
+        // Best-effort: a malformed sidecar surfaces an error here
+        // (build pipeline bug); a missing sidecar defaults to
+        // accessible=true.
+        let rootfs = std::path::Path::new(&config.rootfs_path);
+        crate::vm::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
         microvm::run_from_build(&fc_config.run_config)?;
         Ok(VmId(fc_config.run_config.name.clone()))
     }

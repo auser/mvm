@@ -18,7 +18,7 @@
 
 use anyhow::Result;
 use mvm_core::vm_backend::{
-    BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, VmBackend,
+    BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, StartMode, VmBackend,
     VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus,
 };
 
@@ -64,6 +64,13 @@ impl VmBackend for LibkrunBackend {
                 config.memory_mib,
             )
             .add_vsock_port(mvm_guest::vsock::GUEST_AGENT_PORT);
+
+        // W6.2.1: thread the build-time sidecar into per-VM runtime
+        // metadata so `mvmctl console` enforces the accessible/sealed
+        // gate on libkrun-launched VMs the same way as on the
+        // microsandbox/Firecracker paths.
+        let rootfs = std::path::Path::new(&config.rootfs_path);
+        crate::vm::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
 
         ui::info(&format!(
             "Starting libkrun VM '{}' (cpus={}, mem={}MiB)...",

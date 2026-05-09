@@ -26,7 +26,7 @@
 
 use anyhow::{Context, Result};
 use mvm_core::vm_backend::{
-    BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, VmBackend,
+    BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, StartMode, VmBackend,
     VmCapabilities, VmId, VmInfo, VmNetworkInfo, VmStartConfig, VmStatus,
 };
 
@@ -92,6 +92,17 @@ impl VmBackend for AppleContainerBackend {
         // APFS Copy-on-Write makes this O(1) regardless of rootfs size
         // when source and destination live on the same volume.
         let effective_rootfs = prepare_instance_rootfs(&config.name, &config.rootfs_path)?;
+
+        // W6.2.1: read the sidecar next to the *original* rootfs (the
+        // per-instance clone is a CoW copy under a different name; the
+        // sidecar lives next to the source). Populates the
+        // accessible/sealed flag for `mvmctl console`'s gate.
+        let original_rootfs = std::path::Path::new(&config.rootfs_path);
+        crate::vm::runtime_meta::record_from_rootfs(
+            &config.name,
+            StartMode::Detached,
+            original_rootfs,
+        )?;
 
         ui::info(&format!(
             "Starting Apple Container '{}' (cpus={}, mem={}MiB)...",

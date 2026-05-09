@@ -50,6 +50,9 @@ pub(in crate::commands) struct Args {
     /// Output structured JSON events instead of human-readable output
     #[arg(long)]
     pub json: bool,
+    /// Build-mode override flags (`--dev` / `--prod`). Default: `--prod`.
+    #[command(flatten)]
+    pub build_mode: super::super::shared::BuildModeFlags,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
@@ -60,7 +63,14 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     //   4. cwd walk-up finds a manifest → manifest mode
     //   5. fall back to legacy Mvmfile / built-in image build via image::build
     if let Some(flake_ref) = args.flake {
-        return build_flake(&flake_ref, args.profile.as_deref(), args.watch, args.json);
+        let mode = args.build_mode.resolve();
+        return build_flake(
+            &flake_ref,
+            args.profile.as_deref(),
+            args.watch,
+            args.json,
+            mode,
+        );
     }
 
     if let Some(manifest_path) = resolve_manifest_for_args(&args)? {
@@ -245,7 +255,13 @@ fn build_mvmfile(path: &str, output: Option<&str>) -> Result<()> {
     Ok(())
 }
 
-fn build_flake(flake_ref: &str, profile: Option<&str>, watch: bool, json: bool) -> Result<()> {
+fn build_flake(
+    flake_ref: &str,
+    profile: Option<&str>,
+    watch: bool,
+    json: bool,
+    mode: mvm_build::pipeline::BuildMode,
+) -> Result<()> {
     validate_flake_ref(flake_ref)
         .with_context(|| format!("Invalid flake reference: {:?}", flake_ref))?;
 
@@ -280,7 +296,7 @@ fn build_flake(flake_ref: &str, profile: Option<&str>, watch: bool, json: bool) 
             );
         }
 
-        let result = match mvm_build::dev_build::dev_build(env, &resolved, profile) {
+        let result = match mvm_build::dev_build::dev_build(env, &resolved, profile, mode) {
             Ok(r) => r,
             Err(e) => {
                 if json {

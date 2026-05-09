@@ -45,45 +45,30 @@ pub struct MicrosandboxBackend;
 
 /// Record the caller's `StartMode` intent for a sandbox name.
 ///
-/// Written to `~/.mvm/vms/<name>/mode.json` so subsequent
-/// `mvmctl status` / `mvmctl wait` / `mvmctl detach` calls know
-/// whether the caller expected attached or detached semantics.
-/// The microsandbox-side process is always detached (see
-/// `start_with_mode`); this metadata gates the host-side signal
-/// forwarding that lands in W7.
+/// Delegates to [`crate::vm::runtime_meta`], which owns the on-disk
+/// shape at `~/.mvm/vms/<name>/mode.json`. The `accessible` flag
+/// defaults to `true` here — used by call sites that don't have a
+/// rootfs path handy (e.g., `detach`, which works on an existing
+/// sandbox by name).
 ///
 /// Failure to write the registry is a soft warning — start()
 /// proceeds. The contract is "best-effort metadata," not
 /// load-bearing for VM lifecycle.
 fn record_start_mode(name: &str, mode: StartMode) -> Result<()> {
-    let dir = home_dir()
-        .ok_or_else(|| anyhow::anyhow!("$HOME unset; cannot locate ~/.mvm/vms/<name>/"))?
-        .join(".mvm")
-        .join("vms")
-        .join(name);
-    if let Err(e) = std::fs::create_dir_all(&dir) {
-        tracing::warn!(error = %e, sandbox = %name, "microsandbox: mode registry mkdir failed");
-        return Ok(());
-    }
-    let path = dir.join("mode.json");
-    let body = match mode {
-        StartMode::Attached => "{\"mode\":\"attached\"}\n",
-        StartMode::Detached => "{\"mode\":\"detached\"}\n",
-    };
-    if let Err(e) = std::fs::write(&path, body) {
-        tracing::warn!(error = %e, sandbox = %name, ?mode, "microsandbox: mode registry write failed");
-    }
-    Ok(())
+    let meta = crate::vm::runtime_meta::dev_attached(mode);
+    crate::vm::runtime_meta::write(name, &meta)
 }
 
-#[cfg(unix)]
-fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("HOME").map(std::path::PathBuf::from)
-}
-
-#[cfg(not(unix))]
-fn home_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("USERPROFILE").map(std::path::PathBuf::from)
+/// Thin alias for the cross-backend helper in
+/// [`crate::vm::runtime_meta::record_from_rootfs`]. Kept here so the
+/// existing tests in this module read naturally; new backends call
+/// the runtime_meta version directly.
+fn record_start_mode_from_rootfs(
+    name: &str,
+    mode: StartMode,
+    rootfs: &Path,
+) -> Result<()> {
+    crate::vm::runtime_meta::record_from_rootfs(name, mode, rootfs)
 }
 
 /// Bridge our Nix-built `rootfs.ext4` into a path microsandbox accepts.
@@ -203,7 +188,7 @@ impl VmBackend for MicrosandboxBackend {
         //    behavior is identical regardless; the host-side
         //    Ctrl-C signal forwarding is the W7 follow-up that
         //    closes the loop.
-        record_start_mode(&config.name, mode)?;
+        record_start_mode_from_rootfs(&config.name, mode, rootfs)?;
 
         let name = config.name.clone();
         block_on(async {
@@ -684,6 +669,60 @@ mod tests {
             let detached = std::fs::read_to_string(&mode_path).expect("mode.json still present");
             assert!(detached.contains("detached"), "second write didn't override: {detached}");
             assert!(!detached.contains("attached"), "old marker not cleared");
+        });
+    }
+
+    #[test]
+    fn record_start_mode_from_rootfs_sealed_sidecar_blocks_console() {
+        // Sealed image surfaced via passthru.mvm.accessible = false:
+        // the sidecar emits accessible:false; record_start_mode_from_rootfs
+        // propagates it into mode.json; mvmctl console's gate then
+        // refuses without --force. End-to-end W6.2 ↔ W7.x.1 flow.
+        with_home_temp(|home| {
+            let tmp = tempfile::tempdir().expect("artifact tempdir");
+            let rootfs = tmp.path().join("rootfs.ext4");
+            std::fs::write(&rootfs, b"unused").expect("create rootfs sentinel");
+
+            let sidecar = mvm_build::builder_vm::ArtifactSidecar {
+                name: "prod-sealed".to_string(),
+                accessible: false,
+                sealed: true,
+                entrypoint_kind: "command".to_string(),
+                init_system: "busybox".to_string(),
+                expected_boot_ms: 300,
+                agent_binary: "real".to_string(),
+                rootless_entrypoint: true,
+                hypervisor: "microsandbox".to_string(),
+            };
+            sidecar
+                .write_to_dir(tmp.path())
+                .expect("sidecar write");
+
+            let name = format!("sealed-{}", std::process::id());
+            record_start_mode_from_rootfs(&name, StartMode::Detached, &rootfs)
+                .expect("record");
+
+            let mode_path = home.join(".mvm").join("vms").join(&name).join("mode.json");
+            let body = std::fs::read_to_string(&mode_path).expect("mode.json present");
+            assert!(body.contains("\"accessible\":false"), "got: {body}");
+            assert!(body.contains("detached"), "got: {body}");
+        });
+    }
+
+    #[test]
+    fn record_start_mode_from_rootfs_missing_sidecar_defaults_accessible() {
+        with_home_temp(|home| {
+            let tmp = tempfile::tempdir().expect("artifact tempdir");
+            let rootfs = tmp.path().join("rootfs.ext4");
+            std::fs::write(&rootfs, b"unused").expect("create rootfs sentinel");
+
+            let name = format!("dev-{}", std::process::id());
+            record_start_mode_from_rootfs(&name, StartMode::Attached, &rootfs)
+                .expect("record");
+
+            let mode_path = home.join(".mvm").join("vms").join(&name).join("mode.json");
+            let body = std::fs::read_to_string(&mode_path).expect("mode.json present");
+            assert!(body.contains("\"accessible\":true"), "got: {body}");
         });
     }
 
