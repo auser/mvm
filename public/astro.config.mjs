@@ -43,8 +43,9 @@ export default defineConfig({
           items: [
             { label: "Installation", slug: "getting-started/installation" },
             { label: "Quick Start", slug: "getting-started/quickstart" },
-            { label: "Nix for mvm", slug: "getting-started/nix-for-mvm" },
             { label: "Your First MicroVM", slug: "getting-started/first-microvm" },
+            { label: "Connect an LLM", slug: "getting-started/connect-an-llm" },
+            { label: "Nix for mvm", slug: "getting-started/nix-for-mvm" },
           ],
         },
         {
@@ -56,9 +57,34 @@ export default defineConfig({
           ],
         },
         {
-          // `guides/templates` removed — its page wasn't ported over
-          // from the previous iteration. Re-add when Phase 5 (DX
-          // layer) ships the templates guide content.
+          label: "Working in the MicroVM",
+          items: [
+            { label: "Overview", slug: "working" },
+            { label: "Run commands & processes", slug: "working/commands" },
+            { label: "Filesystem operations", slug: "working/filesystem" },
+            { label: "Network & exposing ports", slug: "working/network" },
+            { label: "Persistence, pause & resume", slug: "working/persistence" },
+            { label: "Snapshots", slug: "working/snapshots" },
+          ],
+        },
+        {
+          label: "Console",
+          items: [
+            { label: "Overview", slug: "console" },
+            { label: "Attach to a microVM", slug: "console/attach" },
+            { label: "Transparent rebuilds", slug: "console/transparent-rebuild" },
+          ],
+        },
+        {
+          label: "Templates",
+          items: [
+            { label: "Overview", slug: "templates" },
+            { label: "Create a template", slug: "templates/create" },
+            { label: "Build & list", slug: "templates/build" },
+            { label: "Lifecycle", slug: "templates/lifecycle" },
+          ],
+        },
+        {
           label: "Guides",
           items: [
             { label: "Writing Nix Flakes", slug: "guides/nix-flakes" },
@@ -76,15 +102,30 @@ export default defineConfig({
           ],
         },
         {
+          label: "Examples",
+          items: [
+            { label: "Overview", slug: "examples" },
+            { label: "Sandbox for an AI agent", slug: "examples/ai-agent-sandbox" },
+            { label: "CI/CD ephemeral builder", slug: "examples/ci-cd-ephemeral-builder" },
+            { label: "Reproducible dev VM from a flake", slug: "examples/dev-vm-from-flake" },
+            { label: "Code interpreter pattern", slug: "examples/code-interpreter" },
+          ],
+        },
+        {
           label: "Security",
           items: [
             { label: "Matryoshka Model", slug: "security/matryoshka" },
+            { label: "Threat model", slug: "security/threat-model" },
+            { label: "Seven CI claims", slug: "security/ci-claims" },
+            { label: "Verified boot", slug: "security/verified-boot" },
           ],
         },
         {
           label: "Deploy",
           items: [
             { label: "AWS EC2", slug: "deploy/aws" },
+            { label: "Google Cloud Platform", slug: "deploy/gcp" },
+            { label: "Hetzner Cloud", slug: "deploy/hetzner" },
             { label: "Ubicloud", slug: "deploy/ubicloud" },
           ],
         },
@@ -92,9 +133,11 @@ export default defineConfig({
           label: "Reference",
           items: [
             { label: "CLI Commands", slug: "reference/cli-commands" },
+            { label: "Programmatic Use", slug: "reference/programmatic-use" },
             { label: "Architecture", slug: "reference/architecture" },
             { label: "Filesystem & Drives", slug: "reference/filesystem" },
             { label: "Guest Agent", slug: "reference/guest-agent" },
+            { label: "Limits & Resources", slug: "reference/limits" },
           ],
         },
         {
