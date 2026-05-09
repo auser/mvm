@@ -6,8 +6,6 @@ use std::sync::OnceLock;
 use mvm_core::linux_env::LinuxEnv;
 use mvm_core::platform;
 
-use crate::config::VM_NAME;
-
 /// Lima-backed Linux execution environment.
 ///
 /// Routes all commands through `limactl shell <vm_name> bash -c "..."`.
@@ -358,12 +356,9 @@ pub fn create_linux_env() -> Box<dyn LinuxEnv> {
         return Box::new(AppleContainerEnv::new("mvm-dev"));
     }
 
-    // Lima VM (macOS <26, Linux without KVM)
-    if plat.needs_lima() {
-        return Box::new(LimaEnv::new(VM_NAME));
-    }
-
-    // Native Linux with KVM
+    // Native Linux with KVM (Lima is gone per ADR-013; macOS <26 + Linux
+    // without KVM are expected to use the microsandbox-backed builder VM
+    // — wired in the W6.x microsandbox-as-Linux-builder follow-up).
     Box::new(NativeEnv)
 }
 

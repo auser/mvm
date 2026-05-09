@@ -1,8 +1,7 @@
 use anyhow::Result;
-use mvm_core::platform;
 use tracing::{instrument, warn};
 
-use super::{firecracker, lima, network};
+use super::{firecracker, network};
 use crate::config::*;
 use crate::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
 use crate::ui;
@@ -94,12 +93,12 @@ impl Drop for TapGuard {
 }
 
 /// Ensure we have a Linux execution environment.
-/// On macOS: checks that the Lima VM is running.
-/// On native Linux (including inside Lima): no-op.
+///
+/// Today this is always a no-op: native Linux runs Firecracker directly,
+/// macOS runs microsandbox, and the Lima fallback is gone (ADR-013).
+/// Kept as a function so callers stay well-formed; remove once every
+/// callsite is audited and the call itself can be dropped.
 fn require_linux_env() -> Result<()> {
-    if platform::current().needs_lima() {
-        lima::require_running()?;
-    }
     Ok(())
 }
 

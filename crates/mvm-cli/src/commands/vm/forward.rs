@@ -3,13 +3,11 @@
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 
-use crate::bootstrap;
 use crate::ui;
 
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::config;
-use mvm_runtime::vm::{lima, microvm};
+use mvm_runtime::vm::microvm;
 
 use super::Cli;
 use super::shared::{
@@ -89,55 +87,31 @@ pub(super) fn forward_ports(name: &str, port_specs: &[String]) -> Result<()> {
     }
     ui::info("Press Ctrl-C to stop forwarding.");
 
-    if bootstrap::is_lima_required() {
-        // macOS: SSH port-forward through Lima's SSH connection.
-        // SSH -L supports multiple -L flags in a single session.
-        lima::require_running()?;
-        let home = std::env::var("HOME").unwrap_or_else(|_| "~".to_string());
-        let ssh_config = format!("{}/.lima/{}/ssh.config", home, config::VM_NAME);
-
-        let mut cmd = std::process::Command::new("ssh");
-        cmd.arg("-F").arg(&ssh_config).arg("-N"); // no remote command
-        for &(local_port, guest_port) in &parsed {
-            cmd.arg("-L")
-                .arg(format!("{}:{}:{}", local_port, guest_ip, guest_port));
-        }
-        cmd.arg(format!("lima-{}", config::VM_NAME));
-
-        let status = cmd
-            .status()
-            .context("Failed to start SSH port forward. Is Lima running?")?;
-
-        if !status.success() {
-            anyhow::bail!("SSH port forward exited with status {}", status);
-        }
-    } else {
-        // Native Linux: socat proxy (microVM is directly reachable).
-        // Spawn a child for each port; wait on all.
-        let mut children: Vec<std::process::Child> = Vec::new();
-        for &(local_port, guest_port) in &parsed {
-            let child = std::process::Command::new("socat")
-                .arg(format!("TCP-LISTEN:{},fork,reuseaddr", local_port))
-                .arg(format!("TCP:{}:{}", guest_ip, guest_port))
-                .spawn()
-                .context("Failed to start socat. Install it with: sudo apt install socat")?;
-            // Register PID so the signal handler can clean it up.
-            if let Ok(mut pids) = CHILD_PIDS.lock() {
-                pids.push(child.id());
-            }
-            children.push(child);
-        }
-        // Wait for all children to exit (Ctrl-C triggers the signal handler
-        // which sends SIGTERM to each tracked child).
-        for mut child in children {
-            if let Err(e) = child.wait() {
-                tracing::warn!("failed to wait on socat child: {e}");
-            }
-        }
-        // Clear tracked PIDs after children exit.
+    // socat proxy: the microVM is directly reachable on the host
+    // bridge. Lima's SSH-tunnel fallback is gone (ADR-013).
+    let mut children: Vec<std::process::Child> = Vec::new();
+    for &(local_port, guest_port) in &parsed {
+        let child = std::process::Command::new("socat")
+            .arg(format!("TCP-LISTEN:{},fork,reuseaddr", local_port))
+            .arg(format!("TCP:{}:{}", guest_ip, guest_port))
+            .spawn()
+            .context("Failed to start socat. Install it with: sudo apt install socat")?;
+        // Register PID so the signal handler can clean it up.
         if let Ok(mut pids) = CHILD_PIDS.lock() {
-            pids.clear();
+            pids.push(child.id());
         }
+        children.push(child);
+    }
+    // Wait for all children to exit (Ctrl-C triggers the signal handler
+    // which sends SIGTERM to each tracked child).
+    for mut child in children {
+        if let Err(e) = child.wait() {
+            tracing::warn!("failed to wait on socat child: {e}");
+        }
+    }
+    // Clear tracked PIDs after children exit.
+    if let Ok(mut pids) = CHILD_PIDS.lock() {
+        pids.clear();
     }
 
     Ok(())

@@ -5,7 +5,6 @@ use tracing::instrument;
 
 use crate::config::VM_NAME;
 use crate::linux_env;
-use mvm_core::platform;
 
 /// Run a command on the host, capturing output.
 #[instrument(skip_all, fields(cmd, args_count = args.len()))]
@@ -57,17 +56,10 @@ pub fn run_on_vm(vm_name: &str, script: &str) -> Result<Output> {
         return Ok(output);
     }
 
-    if platform::current().needs_lima() {
-        Command::new("limactl")
-            .args(["shell", vm_name, "bash", "-c", script])
-            .output()
-            .with_context(|| format!("Failed to run command in Lima VM '{}'", vm_name))
-    } else {
-        Command::new("bash")
-            .args(["-c", script])
-            .output()
-            .with_context(|| "Failed to run command on host")
-    }
+    Command::new("bash")
+        .args(["-c", script])
+        .output()
+        .with_context(|| "Failed to run command on host")
 }
 
 /// Run a bash script in the Linux environment, with output visible to user.
@@ -77,34 +69,16 @@ pub fn run_on_vm_visible(vm_name: &str, script: &str) -> Result<()> {
         return linux_env::default_env().run_visible(script);
     }
 
-    let status = if platform::current().needs_lima() {
-        Command::new("limactl")
-            .args(["shell", vm_name, "bash", "-c", script])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| format!("Failed to run command in Lima VM '{}'", vm_name))?
-    } else {
-        Command::new("bash")
-            .args(["-c", script])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| "Failed to run command on host")?
-    };
+    let status = Command::new("bash")
+        .args(["-c", script])
+        .stdin(Stdio::inherit())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .status()
+        .with_context(|| "Failed to run command on host")?;
 
     if !status.success() {
-        if platform::current().needs_lima() {
-            anyhow::bail!(
-                "Command failed in Lima VM '{}' (exit {})",
-                vm_name,
-                status.code().unwrap_or(-1)
-            );
-        } else {
-            anyhow::bail!("Command failed (exit {})", status.code().unwrap_or(-1));
-        }
+        anyhow::bail!("Command failed (exit {})", status.code().unwrap_or(-1));
     }
     Ok(())
 }
@@ -153,21 +127,12 @@ pub fn run_on_vm_capture(vm_name: &str, script: &str) -> Result<Output> {
         return Ok(output);
     }
 
-    if platform::current().needs_lima() {
-        Command::new("limactl")
-            .args(["shell", vm_name, "bash", "-c", script])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("Failed to run command in Lima VM '{}'", vm_name))
-    } else {
-        Command::new("bash")
-            .args(["-c", script])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| "Failed to run command on host")
-    }
+    Command::new("bash")
+        .args(["-c", script])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .with_context(|| "Failed to run command on host")
 }
 
 /// Run a bash script in the default Linux environment, capturing stdout and stderr.
@@ -204,21 +169,12 @@ pub fn replace_process(cmd: &str, args: &[&str]) -> Result<()> {
 
 /// Replace the current process with `cmd args...`, wrapped for the VM runtime.
 ///
-/// On macOS (or Linux without KVM): exec `limactl shell <VM_NAME> <cmd> <args...>`
-/// On native Linux with KVM: exec `<cmd> <args...>` directly
-///
-/// This mirrors [`run_in_vm`] but uses process replacement (Unix exec) instead
-/// of spawning a child process. Needed for interactive TTY pass-through
-/// (e.g., SSH sessions, interactive shells).
+/// Mirrors [`run_in_vm`] but uses process replacement (Unix exec) instead of
+/// spawning a child. Needed for interactive TTY pass-through (e.g. interactive
+/// shells launched from `mvmctl`).
 #[cfg(unix)]
 pub fn replace_process_in_vm(cmd: &str, args: &[&str]) -> Result<()> {
-    if platform::current().needs_lima() {
-        let mut lima_args = vec!["shell", VM_NAME, cmd];
-        lima_args.extend_from_slice(args);
-        replace_process("limactl", &lima_args)
-    } else {
-        replace_process(cmd, args)
-    }
+    replace_process(cmd, args)
 }
 
 #[cfg(test)]

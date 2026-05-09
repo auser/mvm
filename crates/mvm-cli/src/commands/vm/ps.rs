@@ -3,11 +3,8 @@
 use anyhow::Result;
 use clap::Args as ClapArgs;
 
-use crate::bootstrap;
-
 use mvm_core::user_config::MvmConfig;
 use mvm_runtime::vm::backend::AnyBackend;
-use mvm_runtime::vm::lima;
 
 use super::Cli;
 
@@ -57,20 +54,11 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         all_vms.extend(vms);
     }
 
-    // Collect from Firecracker backend (if Lima is running)
-    if bootstrap::is_lima_required() {
-        if let Ok(lima::LimaStatus::Running) = lima::get_status() {
-            let fc_backend = AnyBackend::from_hypervisor("firecracker");
-            if let Ok(vms) = fc_backend.list() {
-                all_vms.extend(vms);
-            }
-        }
-    } else {
-        // Native Linux — Firecracker runs directly
-        let fc_backend = AnyBackend::from_hypervisor("firecracker");
-        if let Ok(vms) = fc_backend.list() {
-            all_vms.extend(vms);
-        }
+    // Collect from Firecracker backend. Lima is gone (ADR-013) — Firecracker
+    // runs directly on Linux+KVM hosts.
+    let fc_backend = AnyBackend::from_hypervisor("firecracker");
+    if let Ok(vms) = fc_backend.list() {
+        all_vms.extend(vms);
     }
 
     let _ = args.all;

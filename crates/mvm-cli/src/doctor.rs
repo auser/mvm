@@ -8,7 +8,6 @@ use mvm_core::vm_backend::ClaimStatus;
 use mvm_runtime::config::VM_NAME;
 use mvm_runtime::shell;
 use mvm_runtime::vm::backend::AnyBackend;
-use mvm_runtime::vm::lima;
 
 #[derive(Debug, Serialize)]
 struct Check {
@@ -59,14 +58,11 @@ pub fn run(json: bool) -> Result<()> {
 
     let in_vm = shell::inside_lima();
     if in_vm {
-        // Inside Lima VM: limactl is not needed, nix and firecracker are local
+        // Inside a Linux dev VM (legacy Lima marker still honored): nix
+        // and firecracker are local.
         checks.push(nix_version_check(None));
         checks.push(check_cmd("firecracker", "tools", "firecracker --version"));
     } else {
-        // On host: limactl needed for macOS, firecracker checked via Lima
-        if platform::current().needs_lima() {
-            checks.push(check_cmd("limactl", "tools", "limactl --version"));
-        }
         checks.push(nix_version_check(Some(VM_NAME)));
         checks.push(check_vm_cmd(
             "firecracker",
@@ -99,16 +95,7 @@ pub fn run(json: bool) -> Result<()> {
     checks.push(libkrun_check(plat));
     checks.push(docker_check(plat));
 
-    if plat.needs_lima() {
-        checks.push(lima_status_check());
-    }
-
     checks.push(disk_space_check(in_vm));
-
-    // Lima VM disk usage (only when Lima is running on macOS)
-    if plat.needs_lima() {
-        checks.push(lima_disk_check());
-    }
 
     // Nix store health
     checks.push(nix_store_check(in_vm));
@@ -493,35 +480,6 @@ fn libkrun_check(plat: Platform) -> Check {
     }
 }
 
-fn lima_status_check() -> Check {
-    match lima::get_status() {
-        Ok(lima::LimaStatus::Running) => Check {
-            name: "lima vm",
-            category: "platform",
-            ok: true,
-            info: "running".to_string(),
-        },
-        Ok(lima::LimaStatus::Stopped) => Check {
-            name: "lima vm",
-            category: "platform",
-            ok: false,
-            info: "stopped. Run 'mvmctl dev' or 'limactl start mvm'.".to_string(),
-        },
-        Ok(lima::LimaStatus::NotFound) => Check {
-            name: "lima vm",
-            category: "platform",
-            ok: false,
-            info: "not found. Run 'mvmctl setup' or 'mvmctl bootstrap'.".to_string(),
-        },
-        Err(e) => Check {
-            name: "lima vm",
-            category: "platform",
-            ok: false,
-            info: format!("check failed: {}", e),
-        },
-    }
-}
-
 fn disk_space_check(in_vm: bool) -> Check {
     let result = if in_vm {
         parse_disk_space("df -BG ~/.mvm 2>/dev/null || df -BG / 2>/dev/null")
@@ -706,59 +664,6 @@ fn nix_flakes_check(in_vm: bool) -> Check {
             category: "tools",
             ok: true,
             info: "unable to check (skipped)".to_string(),
-        },
-    }
-}
-
-// ── Lima VM health ────────────────────────────────────────────────────────
-
-/// Check Lima VM disk usage — warn if > 80% full.
-fn lima_disk_check() -> Check {
-    match shell::run_on_vm(VM_NAME, "df -h / 2>/dev/null") {
-        Ok(out) if out.status.success() => {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            // Parse "Use%" column from df output (5th column of 2nd line)
-            if let Some(pct) = stdout
-                .lines()
-                .nth(1)
-                .and_then(|line| line.split_whitespace().nth(4))
-                .and_then(|s| s.trim_end_matches('%').parse::<u64>().ok())
-            {
-                return if pct >= 90 {
-                    Check {
-                        name: "lima disk",
-                        category: "platform",
-                        ok: false,
-                        info: format!("{}% used (critically low space)", pct),
-                    }
-                } else if pct >= 80 {
-                    Check {
-                        name: "lima disk",
-                        category: "platform",
-                        ok: true,
-                        info: format!("{}% used (consider freeing space)", pct),
-                    }
-                } else {
-                    Check {
-                        name: "lima disk",
-                        category: "platform",
-                        ok: true,
-                        info: format!("{}% used", pct),
-                    }
-                };
-            }
-            Check {
-                name: "lima disk",
-                category: "platform",
-                ok: true,
-                info: "unable to parse (skipped)".to_string(),
-            }
-        }
-        _ => Check {
-            name: "lima disk",
-            category: "platform",
-            ok: true,
-            info: "VM not accessible (skipped)".to_string(),
         },
     }
 }

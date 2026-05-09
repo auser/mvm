@@ -2,19 +2,13 @@
 
 use anyhow::{Context, Result};
 
-use crate::bootstrap;
-
 use mvm_runtime::config;
 use mvm_runtime::shell;
-use mvm_runtime::vm::{firecracker, lima};
+use mvm_runtime::vm::firecracker;
 
-/// Resolve a VM name to its absolute directory path inside the Lima VM
-/// and verify it is running.
+/// Resolve a VM name to its absolute directory path and verify the VM
+/// is running. Lima preconditions removed — ADR-013 dropped Lima.
 pub fn resolve_running_vm(name: &str) -> Result<String> {
-    if bootstrap::is_lima_required() {
-        lima::require_running()?;
-    }
-
     let abs_vms = shell::run_in_vm_stdout(&format!("echo {}", config::VMS_DIR))?;
     let abs_dir = format!("{}/{}", abs_vms, name);
     let pid_file = format!("{}/fc.pid", abs_dir);
