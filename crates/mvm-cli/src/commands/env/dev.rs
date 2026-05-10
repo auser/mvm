@@ -1,12 +1,18 @@
-//! `mvmctl dev` — manage the Apple Container / microsandbox development
-//! environment.
+//! `mvmctl dev` — manage the development environment.
 //!
-//! Plan-60 / ADR-013 dropped Lima from mvm. On macOS 26+ Apple Silicon,
-//! `mvmctl dev` boots an Apple Container with Nix + build tools via
-//! PTY-over-vsock console. The non-Apple-Container path (Linux without
-//! KVM, macOS Intel, macOS pre-26) is wired up by W8 — until that lands,
-//! `mvmctl dev` on those hosts surfaces a clear error pointing at the
-//! plan-60 follow-up rather than running broken Lima code.
+//! Three host classes, three paths:
+//!
+//! - **macOS 26+ Apple Silicon** → `super::apple_container` boots a
+//!   dev VM via Apple Virtualization.framework and exposes a
+//!   PTY-over-vsock console.
+//! - **Linux + KVM** → `super::linux_native` treats the host shell as
+//!   the dev environment, installs Firecracker + downloads kernel/
+//!   rootfs assets, and optionally spawns an interactive subshell.
+//!   This is the W8.C path — replaces the W7-deleted Lima
+//!   `dev_up`/`dev_down`/`dev_status` helpers.
+//! - **macOS Intel / pre-26 / no-KVM Linux** → bails with a clear
+//!   reference to the W7.x.2 microsandbox-builder-VM follow-up,
+//!   the only path that brings Firecracker to those hosts.
 
 use anyhow::Result;
 use clap::{Args as ClapArgs, Subcommand};
@@ -14,10 +20,37 @@ use clap::{Args as ClapArgs, Subcommand};
 use crate::ui;
 
 use mvm_core::user_config::MvmConfig;
+use mvm_core::platform::{self, Platform};
 
 use super::super::vm::console;
 use super::Cli;
 use super::apple_container;
+use super::linux_native;
+
+/// Which `mvmctl dev` backend the current host uses.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevBackend {
+    /// macOS 26+ Apple Silicon — Apple Container dev VM.
+    AppleContainer,
+    /// Linux with `/dev/kvm` — host shell is the dev environment;
+    /// Firecracker runs natively.
+    LinuxKvm,
+    /// Neither path is wired today — macOS Intel, macOS pre-26,
+    /// Linux without KVM, Windows. The microsandbox builder VM
+    /// (W7.x.2) is the planned home for these.
+    Unsupported,
+}
+
+fn current_backend() -> DevBackend {
+    let plat = platform::current();
+    if plat.has_apple_containers() {
+        DevBackend::AppleContainer
+    } else if plat.has_kvm() && matches!(plat, Platform::LinuxNative | Platform::Wsl2) {
+        DevBackend::LinuxKvm
+    } else {
+        DevBackend::Unsupported
+    }
+}
 
 #[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct Args {
@@ -106,17 +139,21 @@ pub(in crate::commands) enum DevAction {
     },
 }
 
-/// Error shown on hosts where `mvmctl dev` can't run today (Linux
-/// without Apple Container, macOS Intel, macOS pre-26). Points the
-/// user at the plan-60 W8 follow-up so they have somewhere to look
-/// rather than an opaque "not implemented" message.
+/// Error shown on hosts where `mvmctl dev` can't run today — macOS
+/// Intel, macOS pre-26, Linux without KVM, Windows. Points the user
+/// at the W7.x.2 microsandbox-builder-VM follow-up so they have
+/// somewhere to look rather than an opaque "not implemented"
+/// message.
 fn bail_no_dev_backend() -> Result<()> {
     anyhow::bail!(
-        "`mvmctl dev` requires Apple Container (macOS 26+ Apple Silicon).\n\
-         Other hosts use the W8 direct-launch dev path, which has not\n\
-         shipped yet — see specs/SPRINT.md §\"Up next\". For now, run\n\
-         workloads with `mvmctl up <flake>` (which uses the production\n\
-         microVM backends) or wait for the W8 follow-up."
+        "`mvmctl dev` requires either:\n  \
+           - macOS 26+ Apple Silicon (Apple Container dev VM), or\n  \
+           - Linux with /dev/kvm (Firecracker runs natively on host).\n\
+         This host has neither. The microsandbox builder VM (W7.x.2 \
+         in specs/SPRINT.md) is the planned path for macOS Intel / \
+         pre-26 / no-KVM Linux. Until that lands, run workloads \
+         directly with `mvmctl up <flake>` using whichever backend \
+         `mvmctl doctor` reports as available."
     );
 }
 
@@ -130,6 +167,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         shell: false,
     });
 
+    let backend = current_backend();
     match action {
         DevAction::Up {
             cpus,
@@ -147,19 +185,23 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                 memory
             };
 
-            if mvm_core::platform::current().has_apple_containers() {
-                apple_container::cmd_dev_apple_container(effective_cpus, effective_mem, shell)
-            } else {
-                bail_no_dev_backend()
+            match backend {
+                DevBackend::AppleContainer => apple_container::cmd_dev_apple_container(
+                    effective_cpus,
+                    effective_mem,
+                    shell,
+                ),
+                DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native(shell),
+                DevBackend::Unsupported => bail_no_dev_backend(),
             }
         }
         DevAction::Down { reset } => {
-            let result = if mvm_core::platform::current().has_apple_containers() {
-                apple_container::cmd_dev_apple_container_down()
-            } else {
-                // Nothing to stop on non-Apple-Container hosts (no Lima).
-                // The gc-root cleanup below still runs.
-                Ok(())
+            let result = match backend {
+                DevBackend::AppleContainer => apple_container::cmd_dev_apple_container_down(),
+                DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_down(),
+                // Nothing to stop on unsupported hosts. The gc-root
+                // cleanup below still runs.
+                DevBackend::Unsupported => Ok(()),
             };
             // Always drop the dev-image GC root on `down`. It exists to
             // pin the rootfs/kernel store paths *while the VM is using
@@ -199,8 +241,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             }
             result
         }
-        DevAction::Shell { project: _project } => {
-            if mvm_core::platform::current().has_apple_containers() {
+        DevAction::Shell { project: _project } => match backend {
+            DevBackend::AppleContainer => {
                 if !apple_container::is_apple_container_dev_running() {
                     anyhow::bail!("Dev VM is not running. Start it with: mvmctl dev up");
                 }
@@ -213,21 +255,22 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                          or restart with: mvmctl dev down && mvmctl dev up --shell"
                     ),
                 }
-            } else {
-                bail_no_dev_backend()
             }
-        }
-        DevAction::Status => {
-            if mvm_core::platform::current().has_apple_containers() {
-                apple_container::cmd_dev_apple_container_status()
-            } else {
+            DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_shell(),
+            DevBackend::Unsupported => bail_no_dev_backend(),
+        },
+        DevAction::Status => match backend {
+            DevBackend::AppleContainer => apple_container::cmd_dev_apple_container_status(),
+            DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_status(),
+            DevBackend::Unsupported => {
                 ui::info(
-                    "Dev environment: not configured on this host (Apple Container unavailable).\n\
-                     The W8 direct-launch path will replace this — see specs/SPRINT.md.",
+                    "Dev environment: not configured on this host (Apple Container \
+                     unavailable and /dev/kvm missing). See W7.x.2 in specs/SPRINT.md \
+                     for the planned microsandbox-builder-VM path.",
                 );
                 Ok(())
             }
-        }
+        },
         DevAction::ImportImage {
             manifest,
             bundle,
@@ -239,10 +282,14 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             memory,
             shell,
         } => {
-            // Down
-            if mvm_core::platform::current().has_apple_containers() {
-                let _ = apple_container::cmd_dev_apple_container_down();
-            }
+            // Down (best-effort — Rebuild semantics is "discard and
+            // start over," so a stop failure here shouldn't block the
+            // re-up).
+            let _ = match backend {
+                DevBackend::AppleContainer => apple_container::cmd_dev_apple_container_down(),
+                DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_down(),
+                DevBackend::Unsupported => Ok(()),
+            };
 
             // Clear cached dev image
             let cache_dir = format!("{}/dev", mvm_core::config::mvm_cache_dir());
@@ -255,10 +302,14 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             } else {
                 memory
             };
-            if mvm_core::platform::current().has_apple_containers() {
-                apple_container::cmd_dev_apple_container(effective_cpus, effective_mem, shell)
-            } else {
-                bail_no_dev_backend()
+            match backend {
+                DevBackend::AppleContainer => apple_container::cmd_dev_apple_container(
+                    effective_cpus,
+                    effective_mem,
+                    shell,
+                ),
+                DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native(shell),
+                DevBackend::Unsupported => bail_no_dev_backend(),
             }
         }
     }

@@ -10,6 +10,7 @@ pub(super) mod cleanup;
 pub(super) mod dev;
 pub(super) mod doctor;
 pub(super) mod init;
+pub(super) mod linux_native;
 pub(super) mod setup;
 pub(super) mod shell_init;
 pub(super) mod uninstall;
