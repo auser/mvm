@@ -34,6 +34,7 @@ anyhow.workspace = true
 colored.workspace = true
 indicatif.workspace = true
 inquire.workspace = true
+libc.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

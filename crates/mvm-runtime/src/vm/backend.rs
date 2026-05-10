@@ -4,11 +4,13 @@ use mvm_core::vm_backend::{
     VmId, VmInfo, VmStartConfig, VmStatus,
 };
 
-use super::apple_container::AppleContainerBackend;
-use super::cloud_hypervisor::CloudHypervisorBackend;
-use super::docker::DockerBackend;
-use super::libkrun::LibkrunBackend;
-use super::microsandbox::MicrosandboxBackend;
+// W7: alt backends moved out of `mvm-runtime/vm/` into the
+// `mvm-backend` crate. Firecracker + MicrovmNix stay here until W8
+// unwinds the Lima `run_in_vm` substrate they depend on.
+use mvm_backend::{
+    AppleContainerBackend, CloudHypervisorBackend, DockerBackend, LibkrunBackend,
+    MicrosandboxBackend,
+};
 use super::{firecracker, microvm, microvm_nix};
 use crate::config::{PortMapping, VMS_DIR};
 use crate::shell::run_in_vm_stdout;

@@ -16,6 +16,37 @@
 use std::io;
 use std::path::Path;
 
+use anyhow::{Context, Result};
+
+/// Reflink-clone a rootfs file for per-instance use.
+///
+/// Plan 53 Plan D: when starting a VM from a template (or any time
+/// concurrent instances need their own writable rootfs), call this
+/// instead of pointing the hypervisor at the source directly. The
+/// clone shares blocks with the source until either side writes, so
+/// on APFS / btrfs / xfs the operation is O(1) wall-clock regardless
+/// of rootfs size. On filesystems without reflink support (ext4 in
+/// the default Lima VM, NTFS, etc.) it falls back to a byte copy.
+///
+/// `src` must exist; `dst` must not. The destination's parent
+/// directory is created if it doesn't already exist.
+///
+/// Apple VZ and Firecracker each expect a running VM to own its disk
+/// image — sharing a rootfs path between two concurrent VMs makes
+/// the second start fail. This helper is the seam where that
+/// per-instance ownership is created.
+#[tracing::instrument(skip_all, fields(src = %src.display(), dst = %dst.display()))]
+pub fn clone_rootfs_for_instance(src: &Path, dst: &Path) -> Result<CloneStrategy> {
+    if let Some(parent) = dst.parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating parent directory for {}", dst.display()))?;
+    }
+    let strategy = reflink_or_copy(src, dst)
+        .with_context(|| format!("cloning rootfs {} -> {}", src.display(), dst.display()))?;
+    tracing::debug!(?strategy, "rootfs clone complete");
+    Ok(strategy)
+}
+
 /// What strategy [`reflink_or_copy`] used to materialize the destination.
 ///
 /// `Reflink` is the fast path (O(1) metadata operation, blocks shared

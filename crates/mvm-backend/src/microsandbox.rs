@@ -45,7 +45,7 @@ pub struct MicrosandboxBackend;
 
 /// Record the caller's `StartMode` intent for a sandbox name.
 ///
-/// Delegates to [`crate::vm::runtime_meta`], which owns the on-disk
+/// Delegates to [`mvm_runtime_base::runtime_meta`], which owns the on-disk
 /// shape at `~/.mvm/vms/<name>/mode.json`. The `accessible` flag
 /// defaults to `true` here — used by call sites that don't have a
 /// rootfs path handy (e.g., `detach`, which works on an existing
@@ -55,12 +55,12 @@ pub struct MicrosandboxBackend;
 /// proceeds. The contract is "best-effort metadata," not
 /// load-bearing for VM lifecycle.
 fn record_start_mode(name: &str, mode: StartMode) -> Result<()> {
-    let meta = crate::vm::runtime_meta::dev_attached(mode);
-    crate::vm::runtime_meta::write(name, &meta)
+    let meta = mvm_runtime_base::runtime_meta::dev_attached(mode);
+    mvm_runtime_base::runtime_meta::write(name, &meta)
 }
 
 /// Thin alias for the cross-backend helper in
-/// [`crate::vm::runtime_meta::record_from_rootfs`]. Kept here so the
+/// [`mvm_runtime_base::runtime_meta::record_from_rootfs`]. Kept here so the
 /// existing tests in this module read naturally; new backends call
 /// the runtime_meta version directly.
 fn record_start_mode_from_rootfs(
@@ -68,7 +68,7 @@ fn record_start_mode_from_rootfs(
     mode: StartMode,
     rootfs: &Path,
 ) -> Result<()> {
-    crate::vm::runtime_meta::record_from_rootfs(name, mode, rootfs)
+    mvm_runtime_base::runtime_meta::record_from_rootfs(name, mode, rootfs)
 }
 
 /// Bridge our Nix-built `rootfs.ext4` into a path microsandbox accepts.
@@ -627,19 +627,20 @@ mod tests {
     }
 
     /// Serialize tests that mutate `$HOME` so they don't race each
-    /// other. Reuses the workspace-wide `DATA_DIR_TEST_LOCK` from
-    /// `vm/mod.rs` because env-var races are the same shape as
-    /// `MVM_DATA_DIR` races.
+    /// other. Reuses the workspace-wide `HOME_TEST_LOCK` from
+    /// `mvm-runtime-base::runtime_meta` (W7 substrate split) so this
+    /// crate's tests serialize against `mvm-runtime`'s
+    /// `runtime_meta` tests as well.
     fn with_home_temp<F>(f: F)
     where
         F: FnOnce(&std::path::Path),
     {
-        let _guard = crate::vm::DATA_DIR_TEST_LOCK
+        let _guard = crate::HOME_TEST_LOCK
             .lock()
-            .expect("DATA_DIR_TEST_LOCK poisoned");
+            .expect("HOME_TEST_LOCK poisoned");
         let temp = tempfile::tempdir().expect("tempdir");
         let saved = std::env::var_os("HOME");
-        // SAFETY: serialized via DATA_DIR_TEST_LOCK above.
+        // SAFETY: serialized via HOME_TEST_LOCK above.
         unsafe { std::env::set_var("HOME", temp.path()); }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             f(temp.path());

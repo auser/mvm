@@ -2,7 +2,7 @@
 name = "mvm-backend"
 version.workspace = true
 edition.workspace = true
-description = "VmBackend implementations for mvm — Firecracker, microsandbox, libkrun, Apple Container, Docker"
+description = "VmBackend implementations for mvm — Apple Container, Cloud Hypervisor, Docker, libkrun, microsandbox"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -10,20 +10,42 @@ authors.workspace = true
 
 # ── What this crate owns ───────────────────────────────────────────
 #
-# Every concrete `VmBackend` impl. The trait + types live in
-# `mvm-core::vm_backend`; concrete implementations + the
-# `AnyBackend` dispatch enum live here.
+# Concrete `VmBackend` implementations that are *not* coupled to the
+# Lima-era Firecracker substrate (`vm::microvm`, `vm::image`,
+# `vm::firecracker` helpers, the `run_in_vm` shell shim, etc.).
+# Plan-60 W7 moved these out of `mvm-runtime/src/vm/` so the alt
+# backends can sit *below* `mvm-runtime` in the dependency graph,
+# breaking the previous facade-only re-export pattern.
 #
-# Backends call into `mvm-providers` for FFI primitives (libkrun
-# bindings, Apple VZ glue) — that's the layer below us.
-# `mvm-runtime` consumes us through `AnyBackend` for VM lifecycle
-# orchestration.
-
-# Today this crate is a thin re-export of the dispatch types.
-# Full extraction (the impls themselves) lands in plan-60 W6 once
-# the config/shell/ui dependency-cycle is unwound.
+# Lives here:
+#   - apple_container.rs   (macOS 26+ Apple Virtualization.framework)
+#   - cloud_hypervisor.rs  (Tier 1 KVM peer of Firecracker; opt-in)
+#   - docker.rs            (Tier 3 fallback)
+#   - libkrun.rs           (raw libkrun shim — Linux KVM / macOS HVF)
+#   - microsandbox.rs      (libkrun-backed sandbox; Phase 1 default)
+#
+# Stays in `mvm-runtime` (W8 will move):
+#   - firecracker.rs (Lima-era installer helpers)
+#   - microvm.rs (Firecracker lifecycle via `run_in_vm`)
+#   - microvm_nix.rs (Firecracker via microvm.nix runner)
+#   - vm/backend.rs (`AnyBackend` dispatch + `FirecrackerBackend`)
+#
+# `mvm-runtime`'s `vm::backend.rs` imports the alt backends from this
+# crate to populate the `AnyBackend` dispatch enum. That direction —
+# `mvm-runtime` → `mvm-backend` — is the post-W7 invariant; the
+# previous `mvm-backend` → `mvm-runtime` re-export façade is gone.
 [dependencies]
-mvm-runtime.workspace = true
+mvm-core.workspace = true
+mvm-guest.workspace = true
+mvm-runtime-base.workspace = true
+mvm-providers.workspace = true
+
+anyhow.workspace = true
+microsandbox.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 
 [dev-dependencies]
+mvm-build.workspace = true
 tempfile.workspace = true

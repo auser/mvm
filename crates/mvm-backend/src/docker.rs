@@ -14,7 +14,7 @@ use mvm_core::vm_backend::{
     VmCapabilities, VmId, VmInfo, VmNetworkInfo, VmStartConfig, VmStatus,
 };
 
-use crate::ui;
+use mvm_runtime_base::ui;
 
 /// Label applied to all mvm-managed Docker containers.
 const MVM_LABEL: &str = "mvm.managed=true";

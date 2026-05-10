@@ -30,7 +30,7 @@ use mvm_core::vm_backend::{
     VmCapabilities, VmId, VmInfo, VmNetworkInfo, VmStartConfig, VmStatus,
 };
 
-use crate::ui;
+use mvm_runtime_base::ui;
 
 /// Apple Container backend using macOS Containerization framework.
 ///
@@ -98,7 +98,7 @@ impl VmBackend for AppleContainerBackend {
         // sidecar lives next to the source). Populates the
         // accessible/sealed flag for `mvmctl console`'s gate.
         let original_rootfs = std::path::Path::new(&config.rootfs_path);
-        crate::vm::runtime_meta::record_from_rootfs(
+        mvm_runtime_base::runtime_meta::record_from_rootfs(
             &config.name,
             StartMode::Detached,
             original_rootfs,
@@ -302,7 +302,7 @@ fn prepare_instance_rootfs_inner(
         })?;
     }
     let strategy =
-        crate::vm::template::lifecycle::clone_rootfs_for_instance(source_path, instance_path)?;
+        mvm_runtime_base::cow::clone_rootfs_for_instance(source_path, instance_path)?;
     tracing::info!(
         ?strategy,
         source = %source_path.display(),

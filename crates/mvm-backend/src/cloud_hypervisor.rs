@@ -26,7 +26,7 @@
 //!
 //! This file ships the final `VmBackend` shape: [`CloudHypervisorBackend`]
 //! declares its capabilities, security profile, and dispatch through
-//! [`AnyBackend`](super::backend::AnyBackend). Lifecycle methods today
+//! `mvm_runtime::vm::backend::AnyBackend`. Lifecycle methods today
 //! return a "not yet wired" error pointing at the bring-up wave —
 //! same pattern as `LibkrunBackend` until plan 57's libkrun spike
 //! landed real lifecycle. CH bring-up is a focused follow-up wave.

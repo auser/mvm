@@ -1,36 +1,46 @@
-//! mvm-backend — `VmBackend` dispatch surface (re-export façade).
+//! mvm-backend — concrete `VmBackend` implementations.
 //!
-//! ## Status
+//! Plan-60 W7 ended this crate's life as a re-export façade. Five
+//! concrete backends now live here directly — Apple Container, Cloud
+//! Hypervisor, Docker, raw libkrun, and microsandbox. Each module
+//! owns its `VmBackend` impl plus its tests.
 //!
-//! Today this crate is a **thin re-export** of the dispatch types
-//! (`AnyBackend`, `FirecrackerConfig`, etc.) that live in
-//! `mvm_runtime::vm::backend`. The architectural intent is for the
-//! concrete `VmBackend` *implementations* (`firecracker.rs`,
-//! `microsandbox.rs`, `libkrun.rs`, `apple_container.rs`, `docker.rs`,
-//! `microvm_nix.rs`) to live in this crate, with `mvm-runtime`
-//! depending on us for them. **They don't yet** because they reach
-//! back into `mvm_runtime::{config, shell, ui, vm::microvm, vm::image}`
-//! at compile time, and breaking that coupling needs those modules
-//! to either move down to a shared crate (likely `mvm-core` or a new
-//! `mvm-runtime-shared`) or be replaced with caller-passed
-//! abstractions.
+//! ## Dependency direction (post-W7)
 //!
-//! Plan-60 W6 carries the full extraction. Until then, this crate
-//! exists so:
+//!   mvm-core              ← VmBackend trait + types
+//!   mvm-runtime-base      ← ui + runtime_meta + cow (substrate)
+//!   mvm-providers         ← libkrun/Apple-VZ FFI shims
+//!     ↓                     ↓                     ↓
+//!     └─────── mvm-backend (this crate) ────────┘
+//!                          ↑
+//!                     mvm-runtime
+//!                     (consumes us via `vm::backend::AnyBackend`)
 //!
-//!   1. Workspace consumers (mvm-cli) can `use mvm_backend::AnyBackend`
-//!      with a stable path that doesn't change when the impls finish
-//!      moving.
-//!   2. The user-facing facade (`mvmctl::backend`) has a real crate
-//!      to point at.
-//!   3. The backend boundary is documented in code, not just in plan
-//!      docs — adding a new backend now starts here.
+//! ## What does *not* live here yet (W8)
 //!
-//! ## What lives where (interim)
-//!
-//!   crates/mvm-runtime/src/vm/{firecracker,microsandbox,libkrun,
-//!     apple_container,docker,microvm_nix,backend}.rs   ← impls
-//!   crates/mvm-providers/src/{libkrun,apple_container}/  ← FFI shims
-//!   crates/mvm-backend/src/lib.rs (this file)            ← re-exports
+//! `FirecrackerBackend`, `MicrovmNixBackend`, the `AnyBackend` dispatch
+//! enum, and the Lima-coupled `vm::firecracker`/`vm::microvm`/`vm::image`
+//! helpers stay in `mvm-runtime` until the W8 direct-launch rewrite
+//! collapses their `run_in_vm` calls into host-only operations. See
+//! `specs/SPRINT.md` "Up next" for the W8 scope.
 
-pub use mvm_runtime::vm::backend::{AnyBackend, FirecrackerConfig};
+pub mod apple_container;
+pub mod cloud_hypervisor;
+pub mod docker;
+pub mod libkrun;
+pub mod microsandbox;
+
+pub use apple_container::AppleContainerBackend;
+pub use cloud_hypervisor::CloudHypervisorBackend;
+pub use docker::DockerBackend;
+pub use libkrun::LibkrunBackend;
+pub use microsandbox::MicrosandboxBackend;
+
+/// Crate-wide test serialization for tests that mutate `HOME` or
+/// other process-global env vars. Re-exported from
+/// [`mvm_runtime_base::runtime_meta::HOME_TEST_LOCK`] so the
+/// alt-backend tests share the same mutex with `mvm-runtime` tests
+/// — without sharing one lock the modules race each other when
+/// their tests run on the same `cargo test` binary.
+#[cfg(test)]
+pub(crate) use mvm_runtime_base::runtime_meta::HOME_TEST_LOCK;

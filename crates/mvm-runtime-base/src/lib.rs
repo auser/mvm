@@ -9,5 +9,6 @@
 //! `vm::microvm`, `vm::image` — stays in `mvm-runtime` until the W8
 //! Firecracker direct-launch rewrite unwinds the Lima coupling.
 
+pub mod cow;
 pub mod runtime_meta;
 pub mod ui;

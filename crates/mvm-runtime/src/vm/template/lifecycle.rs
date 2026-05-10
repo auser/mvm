@@ -1,4 +1,3 @@
-use std::path::Path;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result, anyhow};
@@ -11,41 +10,17 @@ use tracing::{instrument, warn};
 
 use crate::shell;
 use crate::ui;
-use crate::vm::cow::{CloneStrategy, reflink_or_copy};
 use mvm_core::pool::ArtifactPaths;
 use mvm_core::template::{TemplateRevision, template_current_symlink};
 use mvm_core::time::utc_now;
 
-use super::registry::TemplateRegistry;
+// `clone_rootfs_for_instance` moved to `mvm_runtime_base::cow` (W7
+// substrate split). Re-exported here so existing
+// `crate::vm::template::lifecycle::clone_rootfs_for_instance` callers
+// keep resolving without each one having to migrate.
+pub use mvm_runtime_base::cow::clone_rootfs_for_instance;
 
-/// Reflink-clone a rootfs file for per-instance use.
-///
-/// Plan 53 Plan D: when starting a VM from a template (or any time
-/// concurrent instances need their own writable rootfs), call this
-/// instead of pointing the hypervisor at the source directly. The
-/// clone shares blocks with the source until either side writes, so
-/// on APFS / btrfs / xfs the operation is O(1) wall-clock regardless
-/// of rootfs size. On filesystems without reflink support (ext4 in
-/// the default Lima VM, NTFS, etc.) it falls back to a byte copy.
-///
-/// `src` must exist; `dst` must not. The destination's parent
-/// directory is created if it doesn't already exist.
-///
-/// Apple VZ and Firecracker each expect a running VM to own its disk
-/// image — sharing a rootfs path between two concurrent VMs makes
-/// the second start fail. This helper is the seam where that
-/// per-instance ownership is created.
-#[instrument(skip_all, fields(src = %src.display(), dst = %dst.display()))]
-pub fn clone_rootfs_for_instance(src: &Path, dst: &Path) -> Result<CloneStrategy> {
-    if let Some(parent) = dst.parent() {
-        std::fs::create_dir_all(parent)
-            .with_context(|| format!("creating parent directory for {}", dst.display()))?;
-    }
-    let strategy = reflink_or_copy(src, dst)
-        .with_context(|| format!("cloning rootfs {} -> {}", src.display(), dst.display()))?;
-    tracing::debug!(?strategy, "rootfs clone complete");
-    Ok(strategy)
-}
+use super::registry::TemplateRegistry;
 
 /// Run a shell command in the VM and check its exit code.
 /// Returns an error with stderr context if the command fails.
@@ -1871,6 +1846,7 @@ mod tests {
     use mvm_guest::integrations::{
         IntegrationHealthResult, IntegrationStateReport, IntegrationStatus,
     };
+    use mvm_runtime_base::cow::CloneStrategy;
 
     fn healthy_report(name: &str) -> IntegrationStateReport {
         IntegrationStateReport {

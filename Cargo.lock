@@ -3749,8 +3749,17 @@ checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 name = "mvm-backend"
 version = "0.13.0"
 dependencies = [
- "mvm-runtime",
+ "anyhow",
+ "microsandbox",
+ "mvm-build",
+ "mvm-core",
+ "mvm-guest",
+ "mvm-providers",
+ "mvm-runtime-base",
+ "serde_json",
  "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -3914,6 +3923,7 @@ dependencies = [
  "inquire",
  "libc",
  "microsandbox",
+ "mvm-backend",
  "mvm-build",
  "mvm-core",
  "mvm-guest",
@@ -3940,6 +3950,7 @@ dependencies = [
  "colored",
  "indicatif",
  "inquire",
+ "libc",
  "mvm-build",
  "mvm-core",
  "serde",

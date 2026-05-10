@@ -1,32 +1,42 @@
-// Backend impls — the concrete `VmBackend` implementations live
-// here for now; plan-60 W7 moves the alt backends to `mvm-backend`,
-// W8 will move Firecracker + MicrovmNix once the config/shell/
-// `vm::microvm` substrate's Lima coupling is unwound.
+// Plan-60 W7 split:
+//
+//   * The 5 alt `VmBackend` impls (apple_container, cloud_hypervisor,
+//     docker, libkrun, microsandbox) moved to `mvm-backend`.
+//   * The leaf substrate (`ui`, `runtime_meta`, `cow`) moved to
+//     `mvm-runtime-base`.
+//
+// What still lives here are the Firecracker-coupled pieces
+// (`firecracker.rs` Lima-era helpers, `microvm.rs` lifecycle,
+// `microvm_nix.rs`, the `AnyBackend` dispatch + `FirecrackerBackend`
+// in `backend.rs`). W8 moves them once the Lima `run_in_vm`
+// substrate is unwound.
 
-pub mod apple_container;
 pub mod backend;
-pub mod cloud_hypervisor;
-pub mod cow;
-pub mod docker;
 pub mod egress_proxy;
 pub mod firecracker;
 pub mod image;
 pub mod instance_snapshot;
-pub mod libkrun;
-pub mod microsandbox;
 pub mod microvm;
 pub mod microvm_nix;
 pub mod name_registry;
 pub mod network;
 pub mod template;
-
-// `runtime_meta` lives in `mvm-runtime-base` (W7 substrate split).
-// Re-exported here so existing `mvm_runtime::vm::runtime_meta::*`
-// imports keep resolving — notably `mvm-cli/commands/vm/console.rs`
-// and the W6.2 console gate's call sites.
-pub use mvm_runtime_base::runtime_meta;
 pub mod vminitd_client;
 pub mod volume_registry;
+
+// `runtime_meta` and `cow` live in `mvm-runtime-base` (W7 substrate
+// split). Re-exported here so existing `mvm_runtime::vm::{cow,
+// runtime_meta}::*` imports keep resolving — notably
+// `mvm-cli/commands/vm/console.rs` and the W6.2 console gate's call
+// sites for `runtime_meta`, and `vm::template::lifecycle` for `cow`.
+pub use mvm_runtime_base::{cow, runtime_meta};
+
+// The 5 alt backends live in `mvm-backend` (W7). Re-exported here so
+// `mvm_runtime::vm::{apple_container, cloud_hypervisor, docker,
+// libkrun, microsandbox}::*` paths keep resolving for any caller that
+// addresses them by their old `vm::` location. New code should reach
+// `mvm_backend::*` directly.
+pub use mvm_backend::{apple_container, cloud_hypervisor, docker, libkrun, microsandbox};
 
 /// Crate-wide test serialization for tests that mutate
 /// `MVM_DATA_DIR` (and thus rely on a process-global env var).
