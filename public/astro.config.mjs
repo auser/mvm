@@ -87,6 +87,7 @@ export default defineConfig({
             { label: "Architecture", slug: "reference/architecture" },
             { label: "Filesystem & Drives", slug: "reference/filesystem" },
             { label: "Guest Agent", slug: "reference/guest-agent" },
+            { label: "Workload Contract", slug: "reference/workload-contract" },
           ],
         },
         {
