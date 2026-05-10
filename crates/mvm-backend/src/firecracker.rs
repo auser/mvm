@@ -1,8 +1,8 @@
 use anyhow::Result;
 
-use crate::config::*;
-use crate::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
-use crate::ui;
+use mvm_runtime_base::config::*;
+use mvm_runtime_base::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
+use mvm_runtime_base::ui;
 use mvm_core::config::{ARCH, fc_version, fc_version_short};
 
 /// Check if Firecracker is installed inside the Lima VM.

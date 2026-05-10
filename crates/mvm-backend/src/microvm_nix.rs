@@ -4,10 +4,10 @@ use mvm_core::vm_backend::{
     VmStartConfig, VmStatus,
 };
 
-use crate::config::VMS_DIR;
-use crate::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
-use crate::ui;
-use crate::vm::{firecracker, microvm, network};
+use crate::{firecracker, microvm, network};
+use mvm_runtime_base::config::VMS_DIR;
+use mvm_runtime_base::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
+use mvm_runtime_base::ui;
 
 /// Configuration for a microvm.nix-based VM.
 ///
@@ -18,7 +18,7 @@ pub struct MicrovmNixConfig {
     /// VM name (user-provided or auto-generated).
     pub name: String,
     /// Network slot for this VM.
-    pub slot: crate::config::VmSlot,
+    pub slot: mvm_runtime_base::config::VmSlot,
     /// Directory containing microvm.nix runner scripts (`bin/microvm-run`).
     pub runner_dir: String,
     /// Nix store revision hash.
@@ -230,7 +230,7 @@ impl MicrovmNixBackend {
 
 /// Persist run info for a microvm.nix-started VM.
 fn write_run_info(config: &MicrovmNixConfig, abs_dir: &str) -> Result<()> {
-    let info = crate::config::RunInfo {
+    let info = mvm_runtime_base::config::RunInfo {
         schema_version: 1,
         mode: "microvm-nix".to_string(),
         name: Some(config.name.clone()),

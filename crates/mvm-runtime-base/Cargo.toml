@@ -29,6 +29,9 @@ authors.workspace = true
 [dependencies]
 mvm-core.workspace = true
 mvm-build.workspace = true
+mvm-guest.workspace = true
+mvm-providers.workspace = true
+mvm-security.workspace = true
 
 anyhow.workspace = true
 colored.workspace = true

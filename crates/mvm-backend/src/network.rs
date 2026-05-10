@@ -1,8 +1,8 @@
 use anyhow::Result;
 
-use crate::config::*;
-use crate::shell::run_in_vm_visible;
-use crate::ui;
+use mvm_runtime_base::config::*;
+use mvm_runtime_base::shell::run_in_vm_visible;
+use mvm_runtime_base::ui;
 
 // ============================================================================
 // Legacy dev-mode TAP networking (single VM, used by `mvm start/stop`)

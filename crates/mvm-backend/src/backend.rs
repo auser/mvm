@@ -4,18 +4,20 @@ use mvm_core::vm_backend::{
     VmId, VmInfo, VmStartConfig, VmStatus,
 };
 
-// W7: alt backends moved out of `mvm-runtime/vm/` into the
-// `mvm-backend` crate. Firecracker + MicrovmNix stay here until W8
-// unwinds the Lima `run_in_vm` substrate they depend on.
-use mvm_backend::{
-    AppleContainerBackend, CloudHypervisorBackend, DockerBackend, LibkrunBackend,
-    MicrosandboxBackend,
-};
-use super::{firecracker, microvm, microvm_nix};
-use crate::config::{PortMapping, VMS_DIR};
-use crate::shell::run_in_vm_stdout;
-use crate::vm::image::RuntimeVolume;
-use crate::vm::microvm::{DriveFile, FlakeRunConfig};
+// W8: every backend variant + the FC support modules live in this
+// crate now. `microvm`, `microvm_nix`, `image` are siblings under
+// `crate::`; the substrate (`config`, `shell`, `runtime_meta`) lives
+// in `mvm-runtime-base`.
+use crate::apple_container::AppleContainerBackend;
+use crate::cloud_hypervisor::CloudHypervisorBackend;
+use crate::docker::DockerBackend;
+use crate::image::RuntimeVolume;
+use crate::libkrun::LibkrunBackend;
+use crate::microsandbox::MicrosandboxBackend;
+use crate::microvm::{DriveFile, FlakeRunConfig};
+use crate::{firecracker, microvm, microvm_nix};
+use mvm_runtime_base::config::{PortMapping, VMS_DIR};
+use mvm_runtime_base::shell::run_in_vm_stdout;
 
 pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
 
@@ -116,7 +118,11 @@ impl VmBackend for FirecrackerBackend {
         // (build pipeline bug); a missing sidecar defaults to
         // accessible=true.
         let rootfs = std::path::Path::new(&config.rootfs_path);
-        crate::vm::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
+        mvm_runtime_base::runtime_meta::record_from_rootfs(
+            &config.name,
+            StartMode::Detached,
+            rootfs,
+        )?;
         microvm::run_from_build(&fc_config.run_config)?;
         Ok(VmId(fc_config.run_config.name.clone()))
     }

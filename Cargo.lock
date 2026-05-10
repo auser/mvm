@@ -3756,9 +3756,12 @@ dependencies = [
  "mvm-guest",
  "mvm-providers",
  "mvm-runtime-base",
+ "serde",
  "serde_json",
+ "sha2 0.10.9",
  "tempfile",
  "tokio",
+ "toml",
  "tracing",
 ]
 
@@ -3952,6 +3955,9 @@ dependencies = [
  "libc",
  "mvm-build",
  "mvm-core",
+ "mvm-guest",
+ "mvm-providers",
+ "mvm-security",
  "serde",
  "serde_json",
  "tempfile",
