@@ -19,18 +19,10 @@ pub mod vminitd_client;
 pub mod volume_registry;
 
 // Substrate re-exports — preserve the `mvm_runtime::vm::{cow,
-// runtime_meta}::*` paths for back-compat (mvmd's `mvmctl::runtime`
-// surface and the W6.2 console gate consume them).
+// runtime_meta}::*` paths. These have external consumers (mvmd's
+// `mvmctl::runtime` surface and the W6.2 console gate) so the
+// re-exports stay even after W8.B.3 migrated in-tree consumers.
 pub use mvm_runtime_base::{cow, runtime_meta};
-
-// Backend re-exports — preserve the `mvm_runtime::vm::*` paths so
-// the in-tree mvm-cli/mvm-supervisor consumers don't all migrate at
-// once. New code should reach `mvm_backend::*` directly; W8.B.3
-// migrated the load-bearing call sites already.
-pub use mvm_backend::{
-    apple_container, backend, cloud_hypervisor, docker, firecracker, image, libkrun,
-    microsandbox, microvm, microvm_nix, network,
-};
 
 /// Crate-wide test serialization for tests that mutate
 /// `MVM_DATA_DIR` (and thus rely on a process-global env var).

@@ -3,7 +3,7 @@
 
 use anyhow::Result;
 
-use mvm_runtime::vm::microvm;
+use mvm_backend::microvm;
 
 /// Convert port mappings into a `DriveFile` for the config drive.
 /// Writes `export MVM_PORT_MAP="3333:3000,3334:3002"`.

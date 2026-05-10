@@ -6,7 +6,7 @@ use clap::Args as ClapArgs;
 use crate::ui;
 
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::vm::microvm;
+use mvm_backend::microvm;
 
 use super::Cli;
 

@@ -5,7 +5,7 @@ use clap::Args as ClapArgs;
 
 use mvm_core::user_config::MvmConfig;
 use mvm_core::vm_backend::VmId;
-use mvm_runtime::vm::backend::AnyBackend;
+use mvm_backend::backend::AnyBackend;
 
 use super::Cli;
 

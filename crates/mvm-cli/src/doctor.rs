@@ -7,7 +7,7 @@ use mvm_core::platform::{self, Platform};
 use mvm_core::vm_backend::ClaimStatus;
 use mvm_runtime::config::VM_NAME;
 use mvm_runtime::shell;
-use mvm_runtime::vm::backend::AnyBackend;
+use mvm_backend::backend::AnyBackend;
 
 #[derive(Debug, Serialize)]
 struct Check {

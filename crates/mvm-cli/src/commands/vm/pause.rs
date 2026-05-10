@@ -41,7 +41,7 @@ pub(in crate::commands) struct ResumeArgs {
 
 pub(in crate::commands) fn run_pause(_cli: &Cli, args: PauseArgs, _cfg: &MvmConfig) -> Result<()> {
     validate_vm_name(&args.name).with_context(|| format!("Invalid VM name: {:?}", args.name))?;
-    let vm_dir = mvm_runtime::vm::microvm::resolve_running_vm_dir(&args.name)
+    let vm_dir = mvm_backend::microvm::resolve_running_vm_dir(&args.name)
         .with_context(|| format!("VM {:?} is not running", args.name))?;
     let socket = firecracker_socket(&vm_dir);
     let io = FirecrackerIO::new(socket);
@@ -83,7 +83,7 @@ pub(in crate::commands) fn run_resume(
     // restore-into-empty-VMM workflow). The substrate is
     // ready; the launcher integration is a follow-up.
     let vm_dir =
-        mvm_runtime::vm::microvm::resolve_running_vm_dir(&args.name).with_context(|| {
+        mvm_backend::microvm::resolve_running_vm_dir(&args.name).with_context(|| {
             format!(
                 "VM {:?} has no running Firecracker shell; resume currently \
                  requires a fresh `mvmctl up --resume-from-snapshot` (follow-up). \

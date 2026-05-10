@@ -9,8 +9,8 @@ use mvm_core::naming::{validate_flake_ref, validate_template_name, validate_vm_n
 use mvm_core::user_config::MvmConfig;
 use mvm_core::util::parse_human_size;
 use mvm_core::vm_backend::VmId;
-use mvm_runtime::vm::backend::AnyBackend;
-use mvm_runtime::vm::{image, microvm};
+use mvm_backend::backend::AnyBackend;
+use mvm_backend::{image, microvm};
 
 use super::super::env::apple_container::ensure_default_microvm_image;
 use super::Cli;

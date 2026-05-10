@@ -5,7 +5,7 @@ use clap::Args as ClapArgs;
 
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::vm::microvm;
+use mvm_backend::microvm;
 
 use super::Cli;
 use super::shared::clap_vm_name;

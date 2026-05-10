@@ -46,7 +46,7 @@
 use std::time::Duration;
 
 use mvmctl::core::vm_backend::{StartMode, VmId};
-use mvmctl::runtime::vm::microsandbox::MicrosandboxBackend;
+use mvmctl::backend::microsandbox::MicrosandboxBackend;
 
 const SMOKE_GATE: &str = "MVM_LIVE_SMOKE";
 const ROOTFS_VAR: &str = "MVM_TEST_ROOTFS";

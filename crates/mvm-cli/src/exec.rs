@@ -13,7 +13,7 @@
 
 use anyhow::{Context, Result};
 use mvm_core::vm_backend::{VmId, VmStartConfig, VmVolume};
-use mvm_runtime::vm::backend::AnyBackend;
+use mvm_backend::backend::AnyBackend;
 use mvm_runtime::vsock_transport;
 use serde::Deserialize;
 use std::collections::BTreeMap;
@@ -504,19 +504,19 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
     // VMS subdirectory so cleanup is straightforward.
     let vm_name = transient_vm_name();
     let staging_dir = format!("{}/{}/extras", mvm_runtime::config::VMS_DIR, vm_name);
-    let mut volumes: Vec<mvm_runtime::vm::image::RuntimeVolume> = Vec::new();
+    let mut volumes: Vec<mvm_backend::image::RuntimeVolume> = Vec::new();
     let mut add_dir_labels: Vec<String> = Vec::new();
     for (idx, dir) in req.add_dirs.iter().enumerate() {
         let label = format!("mvm-extra-{idx}");
         let image_path = format!("{staging_dir}/extra-{idx}.ext4");
-        mvm_runtime::vm::image::build_dir_image_ro(&dir.host_path, &label, &image_path)
+        mvm_backend::image::build_dir_image_ro(&dir.host_path, &label, &image_path)
             .with_context(|| {
                 format!(
                     "preparing --add-dir image for '{}' -> '{}'",
                     dir.host_path, dir.guest_path
                 )
             })?;
-        volumes.push(mvm_runtime::vm::image::RuntimeVolume {
+        volumes.push(mvm_backend::image::RuntimeVolume {
             host: image_path,
             guest: dir.guest_path.clone(),
             size: String::new(),
@@ -538,7 +538,7 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
     // to `rootfs.ext4`. Their absence is the dev-VM exemption from §W3.4.
     // Files live inside the Lima VM, so we can't `Path::exists()` them
     // from the host — shell out into the VM instead.
-    let (verity_path, roothash) = mvm_runtime::vm::microvm::probe_verity_sidecar(&rootfs);
+    let (verity_path, roothash) = mvm_backend::microvm::probe_verity_sidecar(&rootfs);
 
     let start_config = VmStartConfig {
         name: vm_name.clone(),
@@ -625,7 +625,7 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
             continue;
         }
         let image_path = format!("{staging_dir}/extra-{idx}.ext4");
-        if let Err(e) = mvm_runtime::vm::image::rsync_image_to_host(&image_path, &dir.host_path) {
+        if let Err(e) = mvm_backend::image::rsync_image_to_host(&image_path, &dir.host_path) {
             ui::warn(&format!(
                 "writable --add-dir sync-back failed for '{}' -> '{}': {e:#}",
                 dir.host_path, dir.guest_path,
@@ -654,8 +654,8 @@ fn restore_via_snapshot(
     snap_info: &mvm_core::template::SnapshotInfo,
     start_config: &VmStartConfig,
 ) -> Result<()> {
-    let slot = mvm_runtime::vm::microvm::allocate_slot(vm_name)?;
-    let run_config = mvm_runtime::vm::microvm::FlakeRunConfig {
+    let slot = mvm_backend::microvm::allocate_slot(vm_name)?;
+    let run_config = mvm_backend::microvm::FlakeRunConfig {
         name: vm_name.to_string(),
         slot,
         vmlinux_path: start_config.kernel_path.clone().unwrap_or_default(),
@@ -687,7 +687,7 @@ fn restore_via_snapshot(
     } else {
         mvm_core::template::template_snapshot_dir(template_id, &rev)
     };
-    mvm_runtime::vm::microvm::restore_from_template_snapshot(
+    mvm_backend::microvm::restore_from_template_snapshot(
         template_id,
         &run_config,
         &snap_dir,
@@ -793,7 +793,7 @@ pub fn boot_session_vm(
     // concurrent boots in the same session don't collide.
     let vm_name = format!("{}-{}", vm_name_prefix, transient_vm_name());
 
-    let (verity_path, roothash) = mvm_runtime::vm::microvm::probe_verity_sidecar(&rootfs);
+    let (verity_path, roothash) = mvm_backend::microvm::probe_verity_sidecar(&rootfs);
 
     let start_config = VmStartConfig {
         name: vm_name.clone(),

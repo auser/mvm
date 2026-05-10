@@ -151,6 +151,7 @@ path = "src/main.rs"
 mvm-core.workspace = true
 mvm-security.workspace = true
 mvm-runtime.workspace = true
+mvm-backend.workspace = true
 mvm-build.workspace = true
 mvm-guest.workspace = true
 mvm-cli.workspace = true

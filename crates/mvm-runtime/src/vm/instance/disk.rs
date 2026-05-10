@@ -1,7 +1,7 @@
 use anyhow::Result;
 
 use crate::shell;
-use crate::vm::microvm::DriveFile;
+use mvm_backend::microvm::DriveFile;
 
 /// Generate shell commands to inject `DriveFile`s into a mounted drive.
 fn drive_file_inject_commands(files: &[DriveFile]) -> String {

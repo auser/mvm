@@ -3,7 +3,7 @@
 //! surface to every command file.
 
 use mvm_runtime::config;
-use mvm_runtime::vm::{image, microvm};
+use mvm_backend::{image, microvm};
 
 /// Parameters for building a `VmStartConfig` from runtime-specific types.
 pub struct VmStartParams<'a> {

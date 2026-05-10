@@ -37,7 +37,7 @@
 //! smoke — we just need proof we made it past our own boundary).
 
 use mvmctl::core::vm_backend::VmId;
-use mvmctl::runtime::vm::microsandbox::MicrosandboxBackend;
+use mvmctl::backend::microsandbox::MicrosandboxBackend;
 
 const SMOKE_GATE: &str = "MVM_LIVE_SMOKE";
 

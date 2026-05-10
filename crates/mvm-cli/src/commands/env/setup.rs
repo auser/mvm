@@ -10,7 +10,7 @@ use crate::ui;
 
 use mvm_runtime::config;
 use mvm_runtime::shell;
-use mvm_runtime::vm::firecracker;
+use mvm_backend::firecracker;
 
 pub(super) fn run_setup_steps(
     force: bool,

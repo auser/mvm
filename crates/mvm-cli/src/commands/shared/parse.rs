@@ -2,7 +2,7 @@
 
 use anyhow::{Context, Result};
 
-use mvm_runtime::vm::image;
+use mvm_backend::image;
 
 /// Validate a VM name at Clap parse time.
 pub fn clap_vm_name(s: &str) -> Result<String, String> {

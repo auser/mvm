@@ -12,7 +12,7 @@ use mvm_core::manifest::{
 use mvm_core::naming::validate_flake_ref;
 use mvm_core::user_config::MvmConfig;
 use mvm_runtime::vm::template::lifecycle as tmpl;
-use mvm_runtime::vm::image;
+use mvm_backend::image;
 
 use super::Cli;
 use super::shared::{PhaseEvent, clap_flake_ref, resolve_flake_ref};
@@ -173,7 +173,7 @@ fn build_manifest(
     // template_persist_slot call refreshes updated_at/provenance and
     // preserves created_at via touch(); the synthesized created_at here
     // is only used for first-build slots.
-    let backend = mvm_runtime::vm::backend::AnyBackend::auto_select()
+    let backend = mvm_backend::backend::AnyBackend::auto_select()
         .name()
         .to_string();
     // Override flake_ref to the resolved (absolute) path so the slot's

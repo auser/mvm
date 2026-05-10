@@ -4033,6 +4033,7 @@ dependencies = [
  "assert_cmd",
  "chrono",
  "mimalloc",
+ "mvm-backend",
  "mvm-build",
  "mvm-cli",
  "mvm-core",

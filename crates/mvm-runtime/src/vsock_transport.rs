@@ -19,7 +19,7 @@ use anyhow::{Context, Result};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
 
-use crate::vm::microvm;
+use mvm_backend::microvm;
 
 /// Open a vsock connection to a port on a guest.
 ///

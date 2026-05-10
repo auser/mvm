@@ -4,7 +4,7 @@ use anyhow::{Context, Result};
 
 use mvm_runtime::config;
 use mvm_runtime::shell;
-use mvm_runtime::vm::firecracker;
+use mvm_backend::firecracker;
 
 /// Resolve a VM name to its absolute directory path and verify the VM
 /// is running. Lima preconditions removed — ADR-013 dropped Lima.

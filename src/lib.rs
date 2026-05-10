@@ -62,6 +62,12 @@ pub use mvm_security as security;
 /// See [`mvm_runtime`] for full documentation.
 pub use mvm_runtime as runtime;
 
+/// Concrete `VmBackend` implementations + `AnyBackend` dispatch.
+///
+/// See [`mvm_backend`] for full documentation. Plan-60 W7+W8 owned
+/// the move out of `mvm_runtime::vm::*` into a dedicated crate.
+pub use mvm_backend as backend;
+
 /// Nix builder pipeline for creating guest images.
 ///
 /// See [`mvm_build`] for full documentation.

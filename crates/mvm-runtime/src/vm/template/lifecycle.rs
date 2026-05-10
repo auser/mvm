@@ -1151,8 +1151,8 @@ pub fn wait_for_integrations_healthy(
 /// 7. Cleans up the temporary VM
 #[instrument(skip_all, fields(template_id = id, force, update_hash))]
 pub fn template_build_with_snapshot(id: &str, force: bool, update_hash: bool) -> Result<()> {
-    use crate::config::BRIDGE_IP;
-    use crate::vm::{microvm, network};
+    use mvm_backend::{microvm, network};
+    use mvm_runtime_base::config::BRIDGE_IP;
 
     // Step 1: Build artifacts (reuses existing template_build)
     template_build(id, force, update_hash)?;
@@ -1387,7 +1387,7 @@ pub fn template_build_with_snapshot(id: &str, force: bool, update_hash: bool) ->
 
 /// Clean up a temporary snapshot VM (best-effort).
 fn cleanup_snapshot_vm(abs_dir: &str, abs_socket: &str, slot: &crate::config::VmSlot) {
-    use crate::vm::network;
+    use mvm_backend::network;
 
     // Kill Firecracker process
     if let Err(e) = shell::run_in_vm(&format!(
