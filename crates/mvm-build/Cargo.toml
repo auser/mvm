@@ -13,13 +13,16 @@ mvm-core.workspace = true
 mvm-guest.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+microsandbox.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tera.workspace = true
 thiserror = "1"
+tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
+which = "6"
 
 [dev-dependencies]
 tempfile.workspace = true

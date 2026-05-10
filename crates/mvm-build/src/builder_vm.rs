@@ -253,9 +253,9 @@ pub enum BuilderVmError {
 }
 
 /// Stub implementation. Every method returns
-/// [`BuilderVmError::NotYetImplemented`]. Callers can dispatch to
-/// this today to surface the clear error message; the bootstrap wave
-/// swaps in `MicrosandboxBuilderVm`.
+/// [`BuilderVmError::NotYetImplemented`]. Kept around for tests that
+/// want a `BuilderVm` impl with deterministic error behavior;
+/// production code uses [`MicrosandboxBuilderVm`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubBuilderVm;
 
@@ -270,6 +270,357 @@ impl BuilderVm for StubBuilderVm {
     ) -> Result<BuilderArtifacts, BuilderVmError> {
         Err(BuilderVmError::NotYetImplemented)
     }
+}
+
+/// Default vCPU count for the builder sandbox. Tuned for "fast
+/// enough to feel native on a developer laptop" without saturating
+/// the host. Override via [`MicrosandboxBuilderVm::with_resources`].
+const BUILDER_DEFAULT_CPUS: u8 = 4;
+
+/// Default memory for the builder sandbox, in MiB. Nix derivations
+/// for guest rootfs builds peak well under 4 GiB; 4096 MiB leaves
+/// headroom for the dev tooling closure plus jobserver fan-out.
+const BUILDER_DEFAULT_MEMORY_MIB: u32 = 4096;
+
+/// Where in the sandbox the user's flake gets bind-mounted.
+/// ADR-013 step 3.
+pub const BUILDER_GUEST_WORK_DIR: &str = "/work";
+/// Where in the sandbox the host's nix store gets bind-mounted
+/// (when [`BuilderMounts::host_nix_store`] is `Some`).
+pub const BUILDER_GUEST_NIX_DIR: &str = "/nix";
+/// Where in the sandbox artifacts get extracted.
+pub const BUILDER_GUEST_OUT_DIR: &str = "/out";
+
+/// Real builder. Pulls [`BUILDER_OCI_IMAGE`] on demand (microsandbox
+/// manages the local OCI cache), spawns a sandbox with the three
+/// bind-mounts from ADR-013 step 3, runs `nix build` inside via
+/// `sandbox.shell()`, and copies the resolved output store path to
+/// `/out` before tearing the sandbox down.
+///
+/// ## Lifecycle
+///
+/// `run_build` is a one-shot: each call creates a fresh sandbox and
+/// drops it on the way out. Two reasons:
+///   1. Builds are independent; reusing a long-lived sandbox would
+///      mean coordinating concurrent `mvmctl build` invocations,
+///      which the caller doesn't promise.
+///   2. The OCI image cache is shared across invocations (microsandbox
+///      owns it), so the per-call cost is just the sandbox spawn
+///      (~200 ms) — not a repeat pull.
+///
+/// ## What it doesn't do
+///
+/// - **Per-call image-digest verification.** [`BUILDER_OCI_DIGEST_SHA256`]
+///   is still empty; once the pin lands, this impl checks it after
+///   pull and fails closed on mismatch. Until then, the pinned
+///   `:2.24.10` tag is the contract.
+/// - **Snapshot warm-pool.** ADR-013 hints at a future warm-pool of
+///   pre-loaded builder sandboxes for sub-second cold-start. Out of
+///   scope here.
+#[derive(Debug, Clone)]
+pub struct MicrosandboxBuilderVm {
+    cpus: u8,
+    memory_mib: u32,
+}
+
+impl Default for MicrosandboxBuilderVm {
+    fn default() -> Self {
+        Self {
+            cpus: BUILDER_DEFAULT_CPUS,
+            memory_mib: BUILDER_DEFAULT_MEMORY_MIB,
+        }
+    }
+}
+
+impl MicrosandboxBuilderVm {
+    /// Override the default vCPU / memory pair. Useful for CI runners
+    /// or low-memory hosts that can't afford the 4 GiB default.
+    pub fn with_resources(mut self, cpus: u8, memory_mib: u32) -> Self {
+        self.cpus = cpus;
+        self.memory_mib = memory_mib;
+        self
+    }
+}
+
+/// Bridge sync `BuilderVm` calls into microsandbox's async API.
+/// Same pattern as `mvm_backend::microsandbox::block_on` — the
+/// `tokio::Runtime` is built fresh per call so the trait stays
+/// `Send + Sync` and dyn-friendly. Per-call cost (~200 µs) is
+/// dominated by sandbox spawn (~200 ms) so the trade is fine.
+fn block_on<F: std::future::Future>(fut: F) -> F::Output {
+    let rt = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("failed to build single-threaded tokio runtime for builder VM bridge");
+    rt.block_on(fut)
+}
+
+/// Unique-per-build sandbox name derived from a flake reference +
+/// attr path + a timestamp. Doesn't need to be cryptographically
+/// random — microsandbox uses it as a handle for `Sandbox::get` etc.,
+/// and the sandbox is torn down at the end of `run_build` so name
+/// collisions only matter for concurrent invocations.
+fn sandbox_name(job: &BuilderJob) -> String {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let stamp = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    let mut h = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::{Hash, Hasher};
+    job.flake_ref.hash(&mut h);
+    job.attr_path.hash(&mut h);
+    format!("mvm-builder-{:x}-{}", h.finish(), stamp)
+}
+
+/// Quote a single shell argument for safe interpolation into a
+/// bash `-c` script. Same shape as
+/// `mvm-runtime-base::shell::shell_escape` (deleted in W7 with
+/// the rest of the Lima paths) — kept inline here so the builder
+/// crate doesn't take a dep on a runtime-side helper for one
+/// function.
+fn shell_quote_arg(input: &str) -> String {
+    format!("'{}'", input.replace('\'', "'\\''"))
+}
+
+/// Probe whether the host already has Nix available. True covers
+/// both:
+///   - Linux with host Nix (`nix` on PATH; `nix build` runs natively).
+///   - macOS with nix-darwin's `linux-builder` configured (`nix` on
+///     PATH; nix transparently routes Linux derivations to the
+///     configured SSH-backed Linux VM).
+///
+/// Returns false on macOS Intel / pre-26 / no-KVM-Linux without
+/// host Nix — the case the microsandbox builder serves.
+fn host_nix_available() -> bool {
+    which::which("nix").is_ok()
+}
+
+impl BuilderVm for MicrosandboxBuilderVm {
+    fn host_can_build(&self) -> Result<bool, BuilderVmError> {
+        Ok(host_nix_available())
+    }
+
+    fn run_build(
+        &self,
+        job: &BuilderJob,
+        mounts: &BuilderMounts,
+    ) -> Result<BuilderArtifacts, BuilderVmError> {
+        // Validate caller-supplied paths early; microsandbox will
+        // also reject these but with less useful messages.
+        if !mounts.flake_src.exists() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "flake source path does not exist: {}",
+                mounts.flake_src.display()
+            )));
+        }
+        std::fs::create_dir_all(&mounts.artifact_out).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating artifact output dir {}: {e}",
+                mounts.artifact_out.display()
+            ))
+        })?;
+
+        let params = RunBuildParams {
+            name: sandbox_name(job),
+            cpus: self.cpus,
+            memory_mib: self.memory_mib,
+            image: BUILDER_OCI_IMAGE.to_string(),
+            flake_src: mounts.flake_src.clone(),
+            host_nix_store: mounts.host_nix_store.clone(),
+            artifact_out: mounts.artifact_out.clone(),
+            flake_ref: job.flake_ref.clone(),
+            attr_path: job.attr_path.clone(),
+        };
+
+        block_on(async move { run_build_async(params).await })
+    }
+}
+
+/// Parameter bundle for [`run_build_async`]. Carried as a struct so
+/// the async helper stays clippy-clean against `too_many_arguments`
+/// — CLAUDE.md forbids suppressing that lint, and pulling 9 owned
+/// values across an `await` boundary one by one isn't readable
+/// anyway.
+struct RunBuildParams {
+    name: String,
+    cpus: u8,
+    memory_mib: u32,
+    image: String,
+    flake_src: PathBuf,
+    host_nix_store: Option<PathBuf>,
+    artifact_out: PathBuf,
+    flake_ref: String,
+    attr_path: String,
+}
+
+/// Async body of [`MicrosandboxBuilderVm::run_build`]. Lifted out so
+/// the sync trait method stays narrow and the async surface is
+/// testable in isolation when integration coverage lands.
+async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, BuilderVmError> {
+    let RunBuildParams {
+        name,
+        cpus,
+        memory_mib,
+        image,
+        flake_src,
+        host_nix_store,
+        artifact_out,
+        flake_ref,
+        attr_path,
+    } = params;
+
+    // 1. Spawn the sandbox.
+    let mut builder = microsandbox::Sandbox::builder(&name)
+        .image(image)
+        .pull_policy(microsandbox::sandbox::PullPolicy::IfMissing)
+        .cpus(cpus)
+        .memory(memory_mib)
+        .volume(BUILDER_GUEST_WORK_DIR, |m| {
+            m.bind(flake_src.as_path()).readonly()
+        })
+        .volume(BUILDER_GUEST_OUT_DIR, |m| {
+            m.bind(artifact_out.as_path())
+        });
+    if let Some(store) = host_nix_store.as_ref() {
+        builder = builder.volume(BUILDER_GUEST_NIX_DIR, |m| m.bind(store.as_path()));
+    }
+
+    let sandbox = builder
+        .create_detached()
+        .await
+        .map_err(|e| BuilderVmError::MicrosandboxUnavailable(format!("create_detached: {e}")))?;
+
+    // 2. Run `nix build` inside. Use `--no-link` so we don't
+    //    accumulate result symlinks across builds; capture the
+    //    output store path via `--print-out-paths` so the extraction
+    //    step knows what to copy.
+    let build_script = format!(
+        r#"set -euo pipefail
+cd {work}
+export NIX_CONFIG="experimental-features = nix-command flakes"
+nix build {flake_ref}#{attr_path} --no-link --print-out-paths
+"#,
+        work = shell_quote_arg(BUILDER_GUEST_WORK_DIR),
+        flake_ref = flake_ref,
+        attr_path = attr_path,
+    );
+
+    let build_out = sandbox.shell(build_script).await.map_err(|e| {
+        BuilderVmError::NixBuildFailed(format!("sandbox.shell(nix build): {e}"))
+    })?;
+    if !build_out.status().success {
+        let stderr = build_out
+            .stderr()
+            .unwrap_or_else(|_| "<non-utf8 stderr>".to_string());
+        // Tear down before returning — best-effort.
+        let _ = sandbox.stop().await;
+        return Err(BuilderVmError::NixBuildFailed(format!(
+            "exit {} — stderr:\n{}",
+            build_out.status().code,
+            stderr
+        )));
+    }
+
+    let nix_output_path = build_out
+        .stdout()
+        .map_err(|e| BuilderVmError::ExtractionFailed(format!("stdout was non-UTF-8: {e}")))?
+        .lines()
+        .rev()
+        .find(|l| l.starts_with("/nix/store/"))
+        .ok_or_else(|| {
+            BuilderVmError::ExtractionFailed(
+                "nix build inside sandbox produced no /nix/store output path".into(),
+            )
+        })?
+        .trim()
+        .to_string();
+    let revision_hash = extract_revision_hash(&nix_output_path);
+
+    // 3. Copy artifacts from the in-sandbox store path to /out.
+    //    Mirrors `copy_dev_artifacts` in `pipeline::dev_build` so the
+    //    on-host layout matches what the runtime path expects.
+    let copy_script = format!(
+        r#"set -euo pipefail
+out={out}
+src={src}
+cp -L "$src/vmlinux" "$out/vmlinux" 2>/dev/null || true
+cp -L "$src/rootfs.ext4" "$out/rootfs.ext4"
+[ -f "$src/initrd" ] && cp -L "$src/initrd" "$out/initrd"
+[ -f "$src/initrd.cpio.gz" ] && cp -L "$src/initrd.cpio.gz" "$out/initrd.cpio.gz"
+[ -f "$src/mvm-meta.json" ] && cp -L "$src/mvm-meta.json" "$out/mvm-meta.json"
+chmod -R u+w "$out"
+"#,
+        out = shell_quote_arg(BUILDER_GUEST_OUT_DIR),
+        src = shell_quote_arg(&nix_output_path),
+    );
+
+    let copy_out = sandbox
+        .shell(copy_script)
+        .await
+        .map_err(|e| BuilderVmError::ExtractionFailed(format!("sandbox.shell(cp): {e}")))?;
+    if !copy_out.status().success {
+        let stderr = copy_out
+            .stderr()
+            .unwrap_or_else(|_| "<non-utf8 stderr>".to_string());
+        let _ = sandbox.stop().await;
+        return Err(BuilderVmError::ExtractionFailed(format!(
+            "artifact copy failed (exit {}): {stderr}",
+            copy_out.status().code,
+        )));
+    }
+
+    // 4. Tear the sandbox down. Best-effort: a failure here doesn't
+    //    invalidate the artifacts that already landed in `out`. The
+    //    handle drops at function end either way, but explicit stop
+    //    frees the libkrun process slot now rather than at GC time.
+    if let Err(e) = sandbox.stop().await {
+        tracing::warn!(error = %e, "builder sandbox stop failed (artifacts intact)");
+    }
+
+    // 5. Resolve accessible flag from the sidecar that mkGuest
+    //    emits inside the store path. Mirrors what
+    //    `emit_sidecar_via_passthru_query` does on the host path —
+    //    the sidecar is already on the host filesystem thanks to
+    //    the bind-mount, so no separate query is needed.
+    let sidecar_path = ArtifactSidecar::path_in(&artifact_out);
+    let accessible = if sidecar_path.exists() {
+        ArtifactSidecar::read_from_dir(&artifact_out)
+            .ok()
+            .flatten()
+            .map(|s| s.accessible)
+    } else {
+        None
+    };
+
+    let rootfs_path = artifact_out.join("rootfs.ext4");
+    let kernel_path = {
+        let p = artifact_out.join("vmlinux");
+        if p.exists() { Some(p) } else { None }
+    };
+
+    Ok(BuilderArtifacts {
+        rootfs_path,
+        kernel_path,
+        revision_hash,
+        lock_hash: None,
+        accessible,
+    })
+}
+
+/// Extract the 32-character store-path hash from a path like
+/// `/nix/store/<hash>-<name>`. Returns the empty string if the path
+/// shape is unexpected. Mirrors
+/// `pipeline::dev_build::extract_revision_hash`'s behavior so the
+/// two code paths produce the same artifact-dir name for identical
+/// derivations.
+fn extract_revision_hash(nix_output_path: &str) -> String {
+    nix_output_path
+        .trim_start_matches("/nix/store/")
+        .split('-')
+        .next()
+        .unwrap_or("")
+        .to_string()
 }
 
 /// Resolve the host architecture's matching Linux system for flake
@@ -457,6 +808,89 @@ mod tests {
             .expect("write malformed");
         let result = ArtifactSidecar::read_from_dir(tmp.path());
         assert!(result.is_err(), "malformed sidecar should error");
+    }
+
+    #[test]
+    fn extract_revision_hash_pulls_leading_segment() {
+        let h = extract_revision_hash("/nix/store/abc123def456-mvm-rootfs-1.0.0");
+        assert_eq!(h, "abc123def456");
+    }
+
+    #[test]
+    fn extract_revision_hash_handles_malformed() {
+        assert_eq!(extract_revision_hash(""), "");
+        assert_eq!(extract_revision_hash("not-a-store-path"), "not");
+    }
+
+    #[test]
+    fn sandbox_name_has_stable_prefix() {
+        // Same flake+attr produces the same hash segment; only the
+        // timestamp varies. Lets us assert the prefix without
+        // hard-coding the full name.
+        let job = BuilderJob {
+            flake_ref: "git+file:///work".to_string(),
+            attr_path: "packages.x86_64-linux.default".to_string(),
+        };
+        let name = sandbox_name(&job);
+        assert!(name.starts_with("mvm-builder-"), "got {name}");
+        assert!(
+            name.len() > "mvm-builder-".len() + 4,
+            "name must carry a discriminator: {name}"
+        );
+    }
+
+    #[test]
+    fn microsandbox_builder_has_sensible_defaults() {
+        let b = MicrosandboxBuilderVm::default();
+        assert_eq!(b.cpus, BUILDER_DEFAULT_CPUS);
+        assert_eq!(b.memory_mib, BUILDER_DEFAULT_MEMORY_MIB);
+    }
+
+    #[test]
+    fn microsandbox_builder_with_resources_overrides() {
+        let b = MicrosandboxBuilderVm::default().with_resources(2, 2048);
+        assert_eq!(b.cpus, 2);
+        assert_eq!(b.memory_mib, 2048);
+    }
+
+    #[test]
+    fn shell_quote_arg_escapes_single_quotes() {
+        assert_eq!(shell_quote_arg("simple"), "'simple'");
+        assert_eq!(shell_quote_arg("with space"), "'with space'");
+        // Single quote inside: close, escaped quote, reopen.
+        assert_eq!(shell_quote_arg("it's"), "'it'\\''s'");
+    }
+
+    #[test]
+    fn run_build_validates_missing_flake_src() {
+        // Skip the path that actually spawns microsandbox — just
+        // exercise the input validation. Caller supplied a
+        // nonexistent flake src; we expect a clear error before
+        // anything heavy fires.
+        let b = MicrosandboxBuilderVm::default();
+        let job = BuilderJob {
+            flake_ref: ".".to_string(),
+            attr_path: "packages.x86_64-linux.default".to_string(),
+        };
+        let mounts = BuilderMounts {
+            flake_src: PathBuf::from("/definitely/does/not/exist"),
+            host_nix_store: None,
+            artifact_out: PathBuf::from("/tmp/mvm-builder-test-out"),
+        };
+        let err = b.run_build(&job, &mounts).expect_err("nonexistent flake should err");
+        assert!(matches!(err, BuilderVmError::ExtractionFailed(_)), "got {err:?}");
+        assert!(err.to_string().contains("does not exist"), "msg: {err}");
+    }
+
+    #[test]
+    fn host_can_build_is_a_pure_pathfn() {
+        // Result depends on whether the test runner has `nix` on
+        // PATH — both outcomes are valid. The test asserts the
+        // function returns Ok rather than erroring, since the impl
+        // shouldn't ever return Err here (only the absence vs.
+        // presence of nix matters).
+        let b = MicrosandboxBuilderVm::default();
+        assert!(b.host_can_build().is_ok());
     }
 
     #[test]
