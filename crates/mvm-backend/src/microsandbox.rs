@@ -181,14 +181,16 @@ impl VmBackend for MicrosandboxBackend {
         //    follow-up wave when we wire the host-side signal
         //    layer).
         //
-        //    For now, `mode` is *intent metadata* — recorded in
-        //    `~/.mvm/vms/<name>/mode.json` so subsequent
-        //    `wait()`/`detach()` calls know whether the caller
-        //    expected attached semantics. The microsandbox-side
-        //    behavior is identical regardless; the host-side
-        //    Ctrl-C signal forwarding is the W7 follow-up that
-        //    closes the loop.
+        //    The intent metadata is still recorded in
+        //    `~/.mvm/vms/<name>/mode.json` so subsequent calls
+        //    know whether the caller expected attached semantics.
+        //    W7 closed the host-side gap: `Attached` starts also
+        //    enter the per-process [`crate::handle_registry`] so
+        //    the CLI's SIGINT handler can stop them on Ctrl-C.
         record_start_mode_from_rootfs(&config.name, mode, rootfs)?;
+        if matches!(mode, StartMode::Attached) {
+            crate::handle_registry::register_attached(&config.name);
+        }
 
         let name = config.name.clone();
         block_on(async {
@@ -249,11 +251,17 @@ impl VmBackend for MicrosandboxBackend {
         // there's no hypervisor-side action to take.
         record_start_mode(&id.0, StartMode::Detached)
             .with_context(|| format!("microsandbox detach: writing mode for {}", id.0))?;
+        // Drop the attached registry entry — once detached, the
+        // host SIGINT handler should leave this sandbox alone.
+        crate::handle_registry::deregister(&id.0);
         tracing::info!(sandbox = %id.0, "microsandbox: detached");
         Ok(())
     }
 
     fn stop(&self, id: &VmId) -> Result<()> {
+        // Drop any attached registry entry up front so the SIGINT
+        // handler doesn't race with us during the async stop.
+        crate::handle_registry::deregister(&id.0);
         // `Sandbox::get(name)` returns a handle on a running sandbox.
         // We then call `.stop()` to gracefully drain and exit. If the
         // sandbox isn't running we treat that as success — this is a

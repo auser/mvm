@@ -216,6 +216,11 @@ pub fn run() -> Result<()> {
             return;
         }
         eprintln!("\nInterrupted, cleaning up...");
+        // W7 handle registry: walk Attached-mode microsandbox VMs and
+        // gracefully stop each. Best-effort; failures get logged. Runs
+        // before the child-pid sweep so SIGTERM-on-children doesn't
+        // race the sandbox's own teardown ordering.
+        let _ = mvm_backend::handle_registry::stop_all_attached();
         // Kill any tracked child processes (e.g., socat port-forwarders).
         if let Ok(pids) = pids.lock() {
             for &pid in pids.iter() {

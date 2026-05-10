@@ -27,6 +27,7 @@
 pub mod apple_container;
 pub mod cloud_hypervisor;
 pub mod docker;
+pub mod handle_registry;
 pub mod libkrun;
 pub mod microsandbox;
 
