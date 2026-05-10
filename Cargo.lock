@@ -3918,6 +3918,7 @@ dependencies = [
  "mvm-core",
  "mvm-guest",
  "mvm-providers",
+ "mvm-runtime-base",
  "mvm-security",
  "opendal",
  "rand 0.8.6",
@@ -3928,6 +3929,22 @@ dependencies = [
  "tera",
  "tokio",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "mvm-runtime-base"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "colored",
+ "indicatif",
+ "inquire",
+ "mvm-build",
+ "mvm-core",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tracing",
 ]
 

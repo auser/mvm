@@ -24,8 +24,13 @@ pub mod microvm;
 pub mod microvm_nix;
 pub mod name_registry;
 pub mod network;
-pub mod runtime_meta;
 pub mod template;
+
+// `runtime_meta` lives in `mvm-runtime-base` (W7 substrate split).
+// Re-exported here so existing `mvm_runtime::vm::runtime_meta::*`
+// imports keep resolving — notably `mvm-cli/commands/vm/console.rs`
+// and the W6.2 console gate's call sites.
+pub use mvm_runtime_base::runtime_meta;
 pub mod vminitd_client;
 pub mod volume_registry;
 
@@ -34,5 +39,10 @@ pub mod volume_registry;
 /// Multiple modules under `vm/` use this — without sharing one
 /// lock the modules race each other when their tests run on
 /// the same `cargo test` binary.
+///
+/// W7 split: tests that mutate `HOME` use
+/// [`mvm_runtime_base::runtime_meta::HOME_TEST_LOCK`] instead. Both
+/// locks coexist because they guard different env vars; merging
+/// would over-serialize unrelated tests.
 #[cfg(test)]
 pub(crate) static DATA_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());

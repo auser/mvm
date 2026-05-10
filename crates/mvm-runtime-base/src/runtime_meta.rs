@@ -27,11 +27,21 @@ use anyhow::{Context, Result};
 use mvm_core::vm_backend::StartMode;
 use serde::{Deserialize, Serialize};
 
+/// Workspace-wide test serialization for tests that mutate `HOME`
+/// (or any other process-global env var). Multiple modules across
+/// `mvm-runtime` and `mvm-backend` need this; sharing one lock
+/// prevents the modules' tests from racing each other when run on
+/// the same `cargo test` binary. Exposed unconditionally so
+/// downstream test suites can serialize against it without an
+/// extra feature gate.
+pub static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
 /// Runtime metadata persisted alongside a started VM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmRuntimeMeta {
     /// Caller's start-mode intent. Written by microsandbox's
-    /// `start_with_mode`; consumed by future signal-forwarding (W7).
+    /// `start_with_mode`; consumed by the W7 handle registry for
+    /// signal forwarding.
     pub mode: StartModeKind,
 
     /// Whether `mvmctl console` may attach to this VM.
@@ -102,8 +112,7 @@ pub fn write(name: &str, meta: &VmRuntimeMeta) -> Result<()> {
         tracing::warn!(error = %e, vm = %name, "runtime_meta: mkdir failed");
         return Ok(());
     }
-    let body = serde_json::to_string(meta)
-        .context("serializing VmRuntimeMeta")?;
+    let body = serde_json::to_string(meta).context("serializing VmRuntimeMeta")?;
     if let Err(e) = std::fs::write(&path, format!("{body}\n")) {
         tracing::warn!(error = %e, vm = %name, "runtime_meta: write failed");
     }
@@ -188,11 +197,11 @@ mod tests {
     where
         F: FnOnce(&std::path::Path),
     {
-        let _guard = crate::vm::DATA_DIR_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = HOME_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner());
         let tmp = tempfile::tempdir().expect("tempdir");
         let prev = std::env::var_os("HOME");
         // SAFETY: tests only; HOME is process-global but the
-        // DATA_DIR_TEST_LOCK serializes us with everything else that
+        // HOME_TEST_LOCK serializes us with everything else that
         // reads it.
         unsafe { std::env::set_var("HOME", tmp.path()) };
         f(tmp.path());
