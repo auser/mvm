@@ -4,7 +4,6 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 use serde::Serialize;
 
-use crate::bootstrap;
 use crate::ui;
 
 use mvm_core::manifest::{
@@ -13,7 +12,7 @@ use mvm_core::manifest::{
 use mvm_core::naming::validate_flake_ref;
 use mvm_core::user_config::MvmConfig;
 use mvm_runtime::vm::template::lifecycle as tmpl;
-use mvm_runtime::vm::{image, lima};
+use mvm_runtime::vm::image;
 
 use super::Cli;
 use super::shared::{PhaseEvent, clap_flake_ref, resolve_flake_ref};
@@ -146,11 +145,6 @@ fn build_manifest(
         manifest.flake.clone()
     };
 
-    // Skip Lima when Nix is available on the host (macOS with linux-builder).
-    let using_host_nix = mvm_core::platform::current().has_host_nix();
-    if !using_host_nix && bootstrap::is_lima_required() {
-        lima::require_running()?;
-    }
 
     if json {
         PhaseEvent::new("build", "manifest", "started")
@@ -268,11 +262,6 @@ fn build_flake(
     let build_env = mvm_runtime::build_env::default_build_env();
     let env = build_env.as_ref();
 
-    // Skip Lima when Nix is available on the host (macOS with linux-builder).
-    let using_host_nix = mvm_core::platform::current().has_host_nix();
-    if !using_host_nix && bootstrap::is_lima_required() {
-        lima::require_running()?;
-    }
 
     let resolved = resolve_flake_ref(flake_ref)?;
     let watch_enabled = watch && !resolved.contains(':');

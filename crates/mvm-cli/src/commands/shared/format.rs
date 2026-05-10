@@ -1,13 +1,5 @@
 //! Pure formatters — no I/O, no allocation outside the returned string.
 
-pub fn shell_escape(s: &str) -> String {
-    if s.contains(' ') || s.contains('\'') || s.contains('"') {
-        format!("'{}'", s.replace('\'', "'\\''"))
-    } else {
-        s.to_string()
-    }
-}
-
 pub fn human_bytes(bytes: u64) -> String {
     if bytes < 1024 {
         format!("{bytes}B")

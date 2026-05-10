@@ -1,23 +1,23 @@
-//! `mvmctl dev` — manage the Lima / Apple Container development environment.
+//! `mvmctl dev` — manage the Apple Container / microsandbox development
+//! environment.
+//!
+//! Plan-60 / ADR-013 dropped Lima from mvm. On macOS 26+ Apple Silicon,
+//! `mvmctl dev` boots an Apple Container with Nix + build tools via
+//! PTY-over-vsock console. The non-Apple-Container path (Linux without
+//! KVM, macOS Intel, macOS pre-26) is wired up by W8 — until that lands,
+//! `mvmctl dev` on those hosts surfaces a clear error pointing at the
+//! plan-60 follow-up rather than running broken Lima code.
 
 use anyhow::Result;
 use clap::{Args as ClapArgs, Subcommand};
 
-use crate::bootstrap;
-use crate::shell_init;
 use crate::ui;
 
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::config;
-use mvm_runtime::shell;
-use mvm_runtime::vm::{firecracker, lima};
 
 use super::super::vm::console;
 use super::Cli;
 use super::apple_container;
-use super::bootstrap::run_steps as bootstrap_steps;
-use super::setup::run_setup_steps;
-use super::shell::open_shell;
 
 #[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct Args {
@@ -27,57 +27,51 @@ pub(in crate::commands) struct Args {
 
 #[derive(Subcommand, Debug, Clone)]
 pub(in crate::commands) enum DevAction {
-    /// Bootstrap and start the dev environment
+    /// Bootstrap and start the dev environment.
     Up {
-        /// Number of vCPUs for the Lima VM
+        /// Number of vCPUs for the dev VM (Apple Container).
         #[arg(long, default_value = "8")]
-        lima_cpus: u32,
-        /// Memory (GiB) for the Lima VM
+        cpus: u32,
+        /// Memory (GiB) for the dev VM (Apple Container).
         #[arg(long, default_value = "16")]
-        lima_mem: u32,
-        /// Project directory to cd into inside the VM
+        memory: u32,
+        /// Project directory to cd into inside the VM.
         #[arg(long)]
         project: Option<String>,
-        /// Bind a Prometheus metrics endpoint on this port (0 = disabled)
+        /// Bind a Prometheus metrics endpoint on this port (0 = disabled).
         #[arg(long, default_value = "0")]
         metrics_port: u16,
-        /// Reload ~/.mvm/config.toml automatically when it changes
+        /// Reload ~/.mvm/config.toml automatically when it changes.
         #[arg(long)]
         watch_config: bool,
-        /// Force Lima backend even on macOS 26+ (where Apple Container is default)
-        #[arg(long)]
-        lima: bool,
-        /// Open an interactive shell after starting
+        /// Open an interactive shell after starting.
         #[arg(long, short = 's')]
         shell: bool,
     },
-    /// Stop the Lima development VM
+    /// Stop the development VM.
     Down {
         /// Also delete the cached dev image (vmlinux + rootfs.ext4) so the
         /// next `dev up` rebuilds from local source.
         #[arg(long)]
         reset: bool,
     },
-    /// Open a shell in the running Lima VM
+    /// Open a shell in the running dev VM.
     Shell {
-        /// Project directory to cd into inside the VM (Lima maps ~ → ~)
+        /// Project directory to cd into inside the VM.
         #[arg(long)]
         project: Option<String>,
     },
-    /// Show dev environment status (Lima VM, Firecracker, Nix)
+    /// Show dev environment status.
     Status,
-    /// Rebuild the dev environment (down + clear cache + up)
+    /// Rebuild the dev environment (down + clear cache + up).
     Rebuild {
-        /// Number of vCPUs for the Lima VM
+        /// Number of vCPUs for the dev VM (Apple Container).
         #[arg(long, default_value = "8")]
-        lima_cpus: u32,
-        /// Memory (GiB) for the Lima VM
+        cpus: u32,
+        /// Memory (GiB) for the dev VM (Apple Container).
         #[arg(long, default_value = "16")]
-        lima_mem: u32,
-        /// Force Lima backend even on macOS 26+
-        #[arg(long)]
-        lima: bool,
-        /// Open an interactive shell after rebuilding
+        memory: u32,
+        /// Open an interactive shell after rebuilding.
         #[arg(long, short = 's')]
         shell: bool,
     },
@@ -112,57 +106,60 @@ pub(in crate::commands) enum DevAction {
     },
 }
 
+/// Error shown on hosts where `mvmctl dev` can't run today (Linux
+/// without Apple Container, macOS Intel, macOS pre-26). Points the
+/// user at the plan-60 W8 follow-up so they have somewhere to look
+/// rather than an opaque "not implemented" message.
+fn bail_no_dev_backend() -> Result<()> {
+    anyhow::bail!(
+        "`mvmctl dev` requires Apple Container (macOS 26+ Apple Silicon).\n\
+         Other hosts use the W8 direct-launch dev path, which has not\n\
+         shipped yet — see specs/SPRINT.md §\"Up next\". For now, run\n\
+         workloads with `mvmctl up <flake>` (which uses the production\n\
+         microVM backends) or wait for the W8 follow-up."
+    );
+}
+
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
     let action = args.action.unwrap_or(DevAction::Up {
-        lima_cpus: 8,
-        lima_mem: 16,
+        cpus: 8,
+        memory: 16,
         project: None,
         metrics_port: 0,
         watch_config: false,
-        lima: false,
         shell: false,
     });
 
     match action {
         DevAction::Up {
-            lima_cpus,
-            lima_mem,
-            project,
-            metrics_port,
-            watch_config,
-            lima,
+            cpus,
+            memory,
+            project: _project,
+            metrics_port: _metrics_port,
+            watch_config: _watch_config,
             shell,
         } => {
             // CLI flag wins; otherwise fall back to per-user config defaults.
-            let effective_cpus = if lima_cpus == 8 {
-                cfg.lima_cpus
-            } else {
-                lima_cpus
-            };
-            let effective_mem = if lima_mem == 16 {
+            let effective_cpus = if cpus == 8 { cfg.lima_cpus } else { cpus };
+            let effective_mem = if memory == 16 {
                 cfg.lima_mem_gib
             } else {
-                lima_mem
+                memory
             };
 
-            let use_apple_container = !lima && mvm_core::platform::current().has_apple_containers();
-            if use_apple_container {
+            if mvm_core::platform::current().has_apple_containers() {
                 apple_container::cmd_dev_apple_container(effective_cpus, effective_mem, shell)
             } else {
-                dev_up(
-                    effective_cpus,
-                    effective_mem,
-                    project.as_deref(),
-                    metrics_port,
-                    watch_config,
-                )
+                bail_no_dev_backend()
             }
         }
         DevAction::Down { reset } => {
             let result = if mvm_core::platform::current().has_apple_containers() {
                 apple_container::cmd_dev_apple_container_down()
             } else {
-                dev_down()
+                // Nothing to stop on non-Apple-Container hosts (no Lima).
+                // The gc-root cleanup below still runs.
+                Ok(())
             };
             // Always drop the dev-image GC root on `down`. It exists to
             // pin the rootfs/kernel store paths *while the VM is using
@@ -202,7 +199,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             }
             result
         }
-        DevAction::Shell { project } => {
+        DevAction::Shell { project: _project } => {
             if mvm_core::platform::current().has_apple_containers() {
                 if !apple_container::is_apple_container_dev_running() {
                     anyhow::bail!("Dev VM is not running. Start it with: mvmctl dev up");
@@ -217,14 +214,18 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                     ),
                 }
             } else {
-                open_shell(project.as_deref())
+                bail_no_dev_backend()
             }
         }
         DevAction::Status => {
             if mvm_core::platform::current().has_apple_containers() {
                 apple_container::cmd_dev_apple_container_status()
             } else {
-                dev_status()
+                ui::info(
+                    "Dev environment: not configured on this host (Apple Container unavailable).\n\
+                     The W8 direct-launch path will replace this — see specs/SPRINT.md.",
+                );
+                Ok(())
             }
         }
         DevAction::ImportImage {
@@ -234,16 +235,13 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             rootfs,
         } => apple_container::cmd_dev_import_image(&manifest, &bundle, &vmlinux, &rootfs),
         DevAction::Rebuild {
-            lima_cpus,
-            lima_mem,
-            lima,
+            cpus,
+            memory,
             shell,
         } => {
             // Down
             if mvm_core::platform::current().has_apple_containers() {
                 let _ = apple_container::cmd_dev_apple_container_down();
-            } else {
-                let _ = dev_down();
             }
 
             // Clear cached dev image
@@ -251,204 +249,17 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             let _ = std::fs::remove_dir_all(&cache_dir);
 
             // Up
-            let effective_cpus = if lima_cpus == 8 {
-                cfg.lima_cpus
-            } else {
-                lima_cpus
-            };
-            let effective_mem = if lima_mem == 16 {
+            let effective_cpus = if cpus == 8 { cfg.lima_cpus } else { cpus };
+            let effective_mem = if memory == 16 {
                 cfg.lima_mem_gib
             } else {
-                lima_mem
+                memory
             };
-            let use_apple_container = !lima && mvm_core::platform::current().has_apple_containers();
-            if use_apple_container {
+            if mvm_core::platform::current().has_apple_containers() {
                 apple_container::cmd_dev_apple_container(effective_cpus, effective_mem, shell)
             } else {
-                dev_up(effective_cpus, effective_mem, None, 0, false)
+                bail_no_dev_backend()
             }
         }
     }
-}
-
-fn dev_up(
-    lima_cpus: u32,
-    lima_mem: u32,
-    project: Option<&str>,
-    metrics_port: u16,
-    watch_config: bool,
-) -> Result<()> {
-    let _metrics_server = if metrics_port > 0 {
-        Some(crate::metrics_server::MetricsServer::start(metrics_port)?)
-    } else {
-        None
-    };
-
-    // Start config watcher before setup so any reload during bootstrap is captured.
-    let _config_watcher = if watch_config {
-        let config_path = {
-            let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
-            std::path::PathBuf::from(home)
-                .join(".mvm")
-                .join("config.toml")
-        };
-        if config_path.exists() {
-            match crate::config_watcher::ConfigWatcher::start(&config_path) {
-                Ok(w) => {
-                    tracing::info!("Watching ~/.mvm/config.toml for changes");
-                    Some(w)
-                }
-                Err(e) => {
-                    tracing::warn!("Could not start config watcher: {e}");
-                    None
-                }
-            }
-        } else {
-            None
-        }
-    } else {
-        None
-    };
-
-    ui::info("Launching development environment...\n");
-
-    if bootstrap::is_lima_required() {
-        // macOS or Linux without KVM — need Lima
-        if which::which("limactl").is_err() {
-            ui::info("Lima not found. Running bootstrap...\n");
-            bootstrap_steps(false)?;
-        } else {
-            // W7.2: warn if there's a legacy `mvm` Lima VM from before the
-            // builder VM rename. We don't auto-migrate (limactl can't
-            // rename in-place and the user may have running tenant work).
-            bootstrap::warn_if_legacy_lima_vm()?;
-            let lima_status = lima::get_status()?;
-            match lima_status {
-                lima::LimaStatus::NotFound => {
-                    ui::info("Lima VM not found. Running setup...\n");
-                    run_setup_steps(false, lima_cpus, lima_mem)?;
-                }
-                lima::LimaStatus::Stopped => {
-                    ui::info("Lima VM is stopped. Starting...");
-                    lima::start()?;
-                }
-                lima::LimaStatus::Running => {}
-            }
-        }
-    }
-
-    // Install Firecracker binary if not present
-    if !firecracker::is_installed()? {
-        ui::info("Firecracker not installed. Installing...\n");
-        firecracker::install()?;
-    }
-
-    // Download kernel + squashfs only if missing
-    if !firecracker::has_base_assets()? {
-        ui::info("Downloading kernel and rootfs...\n");
-        firecracker::download_assets()?;
-        firecracker::prepare_rootfs()?;
-        firecracker::write_state()?;
-    }
-
-    // Ensure shell completions and dev aliases are in ~/.zshrc
-    shell_init::ensure_shell_init()?;
-
-    // Drop into the Lima VM shell (the development environment)
-    open_shell(project)
-}
-
-fn dev_down() -> Result<()> {
-    if !bootstrap::is_lima_required() {
-        ui::info("Lima is not required on this platform (native KVM available).");
-        return Ok(());
-    }
-
-    if which::which("limactl").is_err() {
-        anyhow::bail!("Lima is not installed. Run 'mvmctl dev up' to bootstrap first.");
-    }
-
-    let status = lima::get_status()?;
-    match status {
-        lima::LimaStatus::Running => {
-            ui::info("Stopping Lima development VM...");
-            lima::stop()?;
-            ui::success("Development VM stopped.");
-            Ok(())
-        }
-        lima::LimaStatus::Stopped => {
-            ui::info("Development VM is already stopped.");
-            Ok(())
-        }
-        lima::LimaStatus::NotFound => {
-            anyhow::bail!(
-                "Lima VM '{}' does not exist. Run 'mvmctl dev up' first.",
-                config::VM_NAME
-            );
-        }
-    }
-}
-
-fn dev_status() -> Result<()> {
-    if !bootstrap::is_lima_required() {
-        ui::info("Lima is not required on this platform (native KVM available).");
-        return Ok(());
-    }
-
-    if which::which("limactl").is_err() {
-        ui::warn("Lima is not installed. Run 'mvmctl dev up' to bootstrap.");
-        return Ok(());
-    }
-
-    let status = lima::get_status()?;
-    let status_str = match status {
-        lima::LimaStatus::Running => "Running",
-        lima::LimaStatus::Stopped => "Stopped",
-        lima::LimaStatus::NotFound => "Not found",
-    };
-
-    ui::info(&format!("Lima VM '{}': {status_str}", config::VM_NAME));
-
-    if matches!(status, lima::LimaStatus::Running) {
-        let fc_ver = shell::run_in_vm_stdout("firecracker --version 2>/dev/null | head -1")
-            .unwrap_or_default();
-        let nix_ver = shell::run_in_vm_stdout("nix --version 2>/dev/null").unwrap_or_default();
-
-        ui::info(&format!(
-            "  Firecracker: {}",
-            if fc_ver.trim().is_empty() {
-                "not installed"
-            } else {
-                fc_ver.trim()
-            }
-        ));
-        ui::info(&format!(
-            "  Nix:         {}",
-            if nix_ver.trim().is_empty() {
-                "not installed"
-            } else {
-                nix_ver.trim()
-            }
-        ));
-
-        let mvm_in_vm =
-            shell::run_in_vm_stdout("test -f /usr/local/bin/mvmctl && echo yes || echo no")
-                .unwrap_or_default();
-        if mvm_in_vm.trim() == "yes" {
-            let mvm_ver = shell::run_in_vm_stdout("/usr/local/bin/mvmctl --version 2>/dev/null")
-                .unwrap_or_default();
-            ui::info(&format!(
-                "  mvmctl:      {}",
-                if mvm_ver.trim().is_empty() {
-                    "installed"
-                } else {
-                    mvm_ver.trim()
-                }
-            ));
-        } else {
-            ui::warn("  mvmctl not installed in VM. Run 'mvmctl sync' to build and install it.");
-        }
-    }
-
-    Ok(())
 }

@@ -48,28 +48,20 @@ struct DoctorReport {
 }
 
 pub fn run(json: bool) -> Result<()> {
-    let mut checks = Vec::new();
-
     // ── Prerequisites (user must install before bootstrap) ───────
-    checks.push(check_cmd("rustup", "prerequisites", "rustup --version"));
-    checks.push(check_cmd("cargo", "prerequisites", "cargo --version"));
+    let mut checks = vec![
+        check_cmd("rustup", "prerequisites", "rustup --version"),
+        check_cmd("cargo", "prerequisites", "cargo --version"),
+    ];
 
     // ── Managed Tools (installed by bootstrap) ────────────────────
-
-    let in_vm = shell::inside_lima();
-    if in_vm {
-        // Inside a Linux dev VM (legacy Lima marker still honored): nix
-        // and firecracker are local.
-        checks.push(nix_version_check(None));
-        checks.push(check_cmd("firecracker", "tools", "firecracker --version"));
-    } else {
-        checks.push(nix_version_check(Some(VM_NAME)));
-        checks.push(check_vm_cmd(
-            "firecracker",
-            "tools",
-            "firecracker --version",
-        ));
-    }
+    //
+    // Plan-60 / ADR-013 dropped Lima; the doctor now always runs the
+    // checks against the builder VM (or the host when host-Nix is
+    // configured). The W8 direct-launch rewrite will fold the
+    // builder-VM probe into a host-only one.
+    checks.push(nix_version_check(Some(VM_NAME)));
+    checks.push(check_vm_cmd("firecracker", "tools", "firecracker --version"));
 
     checks.push(Check {
         name: "fc target",
@@ -79,7 +71,7 @@ pub fn run(json: bool) -> Result<()> {
     });
 
     // Nix flake support check
-    checks.push(nix_flakes_check(in_vm));
+    checks.push(nix_flakes_check(false));
 
     // ── Platform ──────────────────────────────────────────────────
     let plat = platform::current();
@@ -90,16 +82,16 @@ pub fn run(json: bool) -> Result<()> {
         info: platform_description(plat),
     });
 
-    checks.push(kvm_check(plat, in_vm));
+    checks.push(kvm_check(plat, false));
     checks.push(apple_container_check(plat));
     checks.push(libkrun_check(plat));
     checks.push(docker_check(plat));
 
-    checks.push(disk_space_check(in_vm));
+    checks.push(disk_space_check(false));
 
     // Nix store health
-    checks.push(nix_store_check(in_vm));
-    checks.push(nix_store_size_check(in_vm));
+    checks.push(nix_store_check(false));
+    checks.push(nix_store_size_check(false));
 
     // ── Security posture (plan 40 folded `mvmctl security` here) ──
     checks.push(security_audit_log_check());
@@ -1163,15 +1155,6 @@ mod tests {
             info: "not found".to_string(),
         };
         assert!(!c.ok);
-    }
-
-    #[test]
-    fn inside_lima_is_false_on_host() {
-        if std::env::var("LIMA_INSTANCE").is_err()
-            && !std::path::Path::new("/etc/lima-boot.conf").exists()
-        {
-            assert!(!shell::inside_lima());
-        }
     }
 
     #[test]

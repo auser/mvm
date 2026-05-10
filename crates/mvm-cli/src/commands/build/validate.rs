@@ -7,9 +7,7 @@ use clap::Args as ClapArgs;
 
 use mvm_core::user_config::MvmConfig;
 use mvm_runtime::shell;
-use mvm_runtime::vm::lima;
 
-use crate::bootstrap;
 use crate::ui;
 
 use super::Cli;
@@ -27,10 +25,6 @@ pub(in crate::commands) struct Args {
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
     let resolved = resolve_flake_ref(&args.flake)?;
-
-    if bootstrap::is_lima_required() {
-        lima::require_running()?;
-    }
 
     let script = format!("nix flake check {resolved}");
 

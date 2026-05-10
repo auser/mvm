@@ -1,5 +1,4 @@
 use anyhow::{Context, Result};
-use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use tracing::instrument;
 
@@ -141,14 +140,6 @@ pub fn run_in_vm_capture(script: &str) -> Result<Output> {
     linux_env::default_env().run_capture(script)
 }
 
-/// Heuristic: are we currently executing inside a Lima guest VM?
-/// Checks common Lima environment markers.
-pub fn inside_lima() -> bool {
-    std::env::var("LIMA_INSTANCE").is_ok()
-        || Path::new("/etc/lima-boot.conf").exists()
-        || Path::new("/run/lima-guestagent.sock").exists()
-}
-
 /// Replace the current process with an interactive command (for SSH/TTY).
 /// Uses Unix's process replacement — the Rust process is fully replaced, no return on success.
 /// Note: This is safe because all arguments are passed as an array, not via shell interpolation.
@@ -180,20 +171,6 @@ pub fn replace_process_in_vm(cmd: &str, args: &[&str]) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_inside_lima_false_on_host() {
-        // In CI/dev environments, we should NOT be inside Lima.
-        // If LIMA_INSTANCE is not set and the marker files don't exist,
-        // inside_lima() should return false.
-        unsafe { std::env::remove_var("LIMA_INSTANCE") };
-        // On a non-Lima machine, neither marker file exists.
-        if !Path::new("/etc/lima-boot.conf").exists()
-            && !Path::new("/run/lima-guestagent.sock").exists()
-        {
-            assert!(!inside_lima());
-        }
-    }
 
     #[test]
     fn test_run_host_echo() {

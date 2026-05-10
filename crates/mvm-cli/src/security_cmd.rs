@@ -26,9 +26,10 @@ pub fn run(json: bool) -> Result<()> {
 
 /// Collect posture checks by probing the environment.
 ///
-/// Shell-based checks gracefully degrade when Lima is not running.
+/// Shell-based checks gracefully degrade when the builder VM isn't
+/// reachable.
 fn collect_checks() -> Vec<PostureCheck> {
-    let vm_available = shell::inside_lima() || vm_is_reachable();
+    let vm_available = vm_is_reachable();
 
     let mut checks = Vec::new();
 

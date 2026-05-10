@@ -6,56 +6,41 @@
 
 use anyhow::Result;
 
-use crate::bootstrap;
 use crate::ui;
 
 use mvm_runtime::config;
 use mvm_runtime::shell;
-use mvm_runtime::vm::{firecracker, lima};
+use mvm_runtime::vm::firecracker;
 
-pub(super) fn run_setup_steps(force: bool, lima_cpus: u32, lima_mem: u32) -> Result<()> {
-    let total = 5;
+pub(super) fn run_setup_steps(
+    force: bool,
+    _builder_cpus: u32,
+    _builder_mem: u32,
+) -> Result<()> {
+    // Plan-60 / ADR-013 dropped Lima; what remains here is the
+    // Firecracker asset pipeline (kernel + rootfs + security
+    // baseline). The builder-VM sizing args are kept on the
+    // signature so callers don't break, but they're inert until
+    // W8 wires up direct-launch for the macOS / no-KVM path.
+    let total = 4;
 
-    // Step 1: Lima VM
-    if bootstrap::is_lima_required() {
-        let lima_status = lima::get_status()?;
-        if !force && matches!(lima_status, lima::LimaStatus::Running) {
-            ui::step(1, total, "Lima VM already running — skipping.");
-        } else {
-            let opts = config::LimaRenderOptions {
-                cpus: Some(lima_cpus),
-                memory_gib: Some(lima_mem),
-                ..Default::default()
-            };
-            let lima_yaml = config::render_lima_yaml_with(&opts)?;
-            ui::info(&format!(
-                "Lima VM resources: {} vCPUs, {} GiB memory",
-                lima_cpus, lima_mem,
-            ));
-            ui::step(1, total, "Setting up Lima VM...");
-            lima::ensure_running(lima_yaml.path())?;
-        }
-    } else {
-        ui::step(1, total, "Native Linux detected — skipping Lima VM setup.");
-    }
-
-    // Step 2: Firecracker (+ jailer from same release tarball)
+    // Step 1: Firecracker (+ jailer from same release tarball)
     if !force && firecracker::is_installed()? {
-        ui::step(2, total, "Firecracker already installed — skipping.");
+        ui::step(1, total, "Firecracker already installed — skipping.");
     } else {
-        ui::step(2, total, "Installing Firecracker...");
+        ui::step(1, total, "Installing Firecracker...");
         firecracker::install()?;
     }
 
-    // Step 3: Assets (kernel + squashfs)
+    // Step 2: Assets (kernel + squashfs)
     if !force && firecracker::has_base_assets()? {
         ui::step(
-            3,
+            2,
             total,
             "Kernel and rootfs already present \u{2014} skipping.",
         );
     } else {
-        ui::step(3, total, "Downloading kernel and rootfs...");
+        ui::step(2, total, "Downloading kernel and rootfs...");
         firecracker::download_assets()?;
     }
 
@@ -68,14 +53,14 @@ pub(super) fn run_setup_steps(force: bool, lima_cpus: u32, lima_mem: u32) -> Res
         firecracker::download_assets()?;
     }
 
-    // Step 4: Rootfs
-    ui::step(4, total, "Preparing root filesystem...");
+    // Step 3: Rootfs
+    ui::step(3, total, "Preparing root filesystem...");
     firecracker::prepare_rootfs()?;
 
     firecracker::write_state()?;
 
-    // Step 5: Security hardening
-    ui::step(5, total, "Setting up security baseline...");
+    // Step 4: Security hardening
+    ui::step(4, total, "Setting up security baseline...");
     setup_security_baseline()?;
 
     Ok(())

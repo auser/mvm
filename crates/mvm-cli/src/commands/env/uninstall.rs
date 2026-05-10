@@ -1,4 +1,4 @@
-//! `mvmctl uninstall` — remove the Lima VM, state directories, and binary.
+//! `mvmctl uninstall` — remove state directories and the mvmctl binary.
 
 use anyhow::Result;
 use clap::Args as ClapArgs;
@@ -6,7 +6,7 @@ use clap::Args as ClapArgs;
 use crate::ui;
 
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::vm::{lima, microvm};
+use mvm_runtime::vm::microvm;
 
 use super::Cli;
 
@@ -24,10 +24,10 @@ pub(in crate::commands) struct Args {
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
-    // Build the action plan. Dry-run avoids any external process calls so it
-    // stays fast even when Lima/limactl is unresponsive.
+    // Build the action plan. Dry-run avoids any external process calls so
+    // it stays fast.
     let mut actions: Vec<String> = vec![
-        "Destroy Lima VM 'mvm' (if present)".to_string(),
+        "Stop running microVMs (best-effort)".to_string(),
         "Remove /var/lib/mvm/ (VM state, volumes, run-info)".to_string(),
     ];
     if args.all {
@@ -55,22 +55,10 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         }
     }
 
-    // Now query Lima — only when actually performing the uninstall.
-    let lima_status = lima::get_status().unwrap_or(lima::LimaStatus::NotFound);
-
-    // Stop running microVMs first (best-effort).
-    if matches!(lima_status, lima::LimaStatus::Running)
-        && let Err(e) = microvm::stop()
-    {
+    // Stop running microVMs first (best-effort). Plan-60 / ADR-013
+    // dropped Lima; there is no Lima VM to destroy.
+    if let Err(e) = microvm::stop() {
         tracing::warn!("failed to stop microVMs before uninstall: {e}");
-    }
-
-    // Destroy Lima VM.
-    if !matches!(lima_status, lima::LimaStatus::NotFound) {
-        ui::info("Destroying Lima VM...");
-        if let Err(e) = lima::destroy() {
-            tracing::warn!("failed to destroy Lima VM: {e}");
-        }
     }
 
     // Remove /var/lib/mvm/.

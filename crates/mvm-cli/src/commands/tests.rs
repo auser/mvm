@@ -9,7 +9,7 @@ use clap::Parser;
 // follow the dispatcher's naming, regardless of which group they live in.
 use super::build::build;
 use super::catalog;
-use super::env::{cleanup, dev, init, uninstall};
+use super::env::{cleanup, init, uninstall};
 use super::ops::{audit, cache, config, metrics};
 use super::vm::{console, down, exec, forward, up};
 
@@ -17,7 +17,6 @@ use audit::AuditAction;
 use cache::CacheAction;
 use catalog::CatalogAction;
 use config::ConfigAction;
-use dev::DevAction;
 use up::RunParams;
 
 use super::shared::{
@@ -1527,19 +1526,6 @@ fn test_init_scaffold_with_prompt_flag() {
 }
 
 // --- Apple Container dev tests ---
-
-#[test]
-fn test_dev_up_with_lima_flag() {
-    let cli = Cli::try_parse_from(["mvmctl", "dev", "up", "--lima"]).unwrap();
-    match cli.command {
-        Commands::Dev(dev::Args {
-            action: Some(DevAction::Up { lima, .. }),
-        }) => {
-            assert!(lima);
-        }
-        _ => panic!("Expected Dev Up command"),
-    }
-}
 
 #[test]
 fn test_dev_down_parses() {

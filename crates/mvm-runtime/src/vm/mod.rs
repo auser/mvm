@@ -1,8 +1,7 @@
 // Backend impls — the concrete `VmBackend` implementations live
-// here for now; plan-60 W6 schedules the move into mvm-backend
-// once the config/shell/ui dependency-cycle is unwound. The
-// `mvm-backend` crate exists today as a thin re-export facade so
-// new consumers can use the stable path.
+// here for now; plan-60 W7 moves the alt backends to `mvm-backend`,
+// W8 will move Firecracker + MicrovmNix once the config/shell/
+// `vm::microvm` substrate's Lima coupling is unwound.
 
 pub mod apple_container;
 pub mod backend;
@@ -14,11 +13,6 @@ pub mod firecracker;
 pub mod image;
 pub mod instance_snapshot;
 pub mod libkrun;
-// Deprecated no-op shim — ADR-013 dropped Lima. The module exists
-// only to keep mvm-cli's existing imports compiling; its functions
-// all return "not running" / "no-op" / "NotFound." Cleanup wave
-// removes the call sites + this module.
-pub mod lima;
 pub mod microsandbox;
 pub mod microvm;
 pub mod microvm_nix;

@@ -4,7 +4,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result};
 use serde::Deserialize;
 
-use super::{firecracker, lima};
+use super::firecracker;
 use crate::config::MICROVM_DIR;
 use crate::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
 use crate::ui;
@@ -460,8 +460,6 @@ EONG
 pub fn build(name_or_path: &str, output: Option<&str>) -> Result<String> {
     let (_config_dir, config) = find_config(name_or_path)?;
     let name = &config.image.name;
-
-    lima::require_running()?;
 
     // Repair /dev/null if a previous interrupted build destroyed it
     repair_dev_null()?;

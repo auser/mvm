@@ -31,11 +31,16 @@ pub(super) fn run_steps(production: bool) -> Result<()> {
         bootstrap::check_package_manager()?;
     }
 
-    ui::info("\nInstalling prerequisites...");
-    bootstrap::ensure_lima()?;
-    bootstrap::warn_if_legacy_lima_vm()?;
+    // Plan-60 / ADR-013: dev mode is microsandbox/Apple-Container, not
+    // Lima — there's no Lima VM to provision here. The host-side
+    // prerequisite hint (libkrun on macOS Intel) is the only legacy
+    // bootstrap surface left; setup_steps below handles Firecracker
+    // assets via `run_in_vm`, which the W8 direct-launch rewrite will
+    // collapse into a host-only operation.
+    bootstrap::hint_libkrun_if_useful();
 
-    // Bootstrap uses default Lima resources (8 vCPUs, 16 GiB), never forces
+    // Default sizing for the builder VM; CLI-level overrides ride the
+    // setup path.
     run_setup_steps(false, 8, 16)?;
 
     ui::success("\nBootstrap complete! Run 'mvmctl dev' to enter the development environment.");

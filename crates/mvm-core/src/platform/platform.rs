@@ -17,18 +17,6 @@ pub enum Platform {
 }
 
 impl Platform {
-    /// Whether this platform needs Lima to run microVMs.
-    ///
-    /// **Deprecated:** Always returns `false`. ADR-013 dropped Lima
-    /// from mvm's dependency surface; the macOS/no-KVM-Linux path now
-    /// uses microsandbox+libkrun directly. Kept as a stub returning
-    /// `false` so existing callers (`if needs_lima() { … }` branches)
-    /// remain well-formed while their dead branches get pruned in
-    /// follow-up cleanup. Remove once no callers remain.
-    pub fn needs_lima(self) -> bool {
-        false
-    }
-
     /// Whether this platform can run Firecracker directly via /dev/kvm.
     pub fn has_kvm(self) -> bool {
         match self {
@@ -348,7 +336,6 @@ mod tests {
     #[test]
     fn test_current_platform_valid() {
         let p = current();
-        let _ = p.needs_lima();
         let _ = p.has_kvm();
         let _ = p.supports_native_runner();
         let _ = p.has_apple_containers();
