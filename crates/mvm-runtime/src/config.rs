@@ -1,39 +1,33 @@
-use mvm_core::config::{ARCH, fc_version};
 use serde::{Deserialize, Serialize};
-use std::io::Write;
-use std::path::PathBuf;
 
-/// Lima VM name. Renamed from `mvm` to `mvm-builder` (W7.2) to make its role
-/// — hosting `nix build`, Firecracker, and the per-tenant microVMs — visible
-/// at the limactl level. The bridge name `br-mvm`, log filter `RUST_LOG=mvm`,
-/// path `/var/lib/mvm/`, OCI label `mvm`, and Apple Container guest hostname
-/// `mvm-dev` are deliberately unchanged: they are not the Lima VM name.
-///
-/// Migration: an existing `mvm` Lima VM on a developer's machine continues to
-/// work — `mvmctl bootstrap` detects it and prints a one-line migration
-/// command instead of auto-renaming, since `limactl` lacks an in-place
-/// rename.
+/// Builder VM name. Carried over from the W7.2 Lima rename
+/// (`mvm` → `mvm-builder`); ADR-013 / plan-60 retired Lima itself,
+/// but the name still tags any future Linux builder VM (the
+/// microsandbox-as-Linux-builder follow-up in W7.x.2). The bridge
+/// name `br-mvm`, log filter `RUST_LOG=mvm`, path `/var/lib/mvm/`,
+/// OCI label `mvm`, and Apple Container guest hostname `mvm-dev`
+/// are deliberately *not* this constant — they exist on every host
+/// regardless of whether a builder VM is running.
 pub const VM_NAME: &str = "mvm-builder";
-
-/// Legacy Lima VM name. Kept as a constant so the migration UX in
-/// `mvm-cli::bootstrap` can detect a pre-rename install and tell the user
-/// what to run. Once we're confident the rename has propagated, this can
-/// go away.
-pub const LEGACY_VM_NAME: &str = "mvm";
 pub const API_SOCKET: &str = "/tmp/firecracker.socket";
 pub const TAP_DEV: &str = "tap0";
 pub const TAP_IP: &str = "172.16.0.1";
 pub const MASK_SHORT: &str = "/30";
 pub const GUEST_IP: &str = "172.16.0.2";
 pub const FC_MAC: &str = "06:00:AC:10:00:02";
-/// Path inside the Lima VM (~ expands to the VM user's home)
+/// Firecracker assets root. `~` expands against whichever shell
+/// runs the script — on Linux+KVM that's the host user; on macOS
+/// 26+ it's the Apple Container dev VM's user (commands route
+/// through the guest-agent vsock channel). On hosts where neither
+/// applies, the Firecracker backend isn't available — every script
+/// that would write here fails at the binary-invocation step.
 pub const MICROVM_DIR: &str = "~/microvm";
 
 // --- Multi-VM bridge networking ---
 pub const BRIDGE_DEV: &str = "br-mvm";
 pub const BRIDGE_IP: &str = "172.16.0.1";
 pub const BRIDGE_CIDR: &str = "172.16.0.1/24";
-/// Directory holding per-VM state: ~/microvm/vms/<name>/
+/// Per-VM state directory; resolves the same way as [`MICROVM_DIR`].
 pub const VMS_DIR: &str = "~/microvm/vms";
 
 /// Per-VM network + filesystem identity, derived from a slot index.
@@ -111,140 +105,9 @@ pub struct RunInfo {
     pub ports: Vec<PortMapping>,
 }
 
-/// Find the lima.yaml.tera template file.
-/// Looks in: 1) resources/ next to the binary, 2) source tree, 3) sibling project
-pub(crate) fn find_lima_template() -> anyhow::Result<PathBuf> {
-    let exe_dir = std::env::current_exe()?
-        .parent()
-        .expect("executable path must have a parent directory")
-        .to_path_buf();
-
-    // Check next to binary
-    let candidate = exe_dir.join("resources").join("lima.yaml.tera");
-    if candidate.exists() {
-        return Ok(candidate);
-    }
-
-    // Check in the source tree (development mode)
-    let manifest_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
-    let candidate = manifest_dir.join("resources").join("lima.yaml.tera");
-    if candidate.exists() {
-        return Ok(candidate);
-    }
-
-    // Check workspace root (crate is at crates/mvm-runtime/)
-    let workspace_root = manifest_dir
-        .parent()
-        .expect("manifest dir must have parent")
-        .parent()
-        .expect("crates dir must have parent");
-    let candidate = workspace_root.join("resources").join("lima.yaml.tera");
-    if candidate.exists() {
-        return Ok(candidate);
-    }
-
-    // Check sibling project (plain yaml fallback)
-    let candidate = workspace_root
-        .parent()
-        .expect("workspace root must have parent")
-        .join("firecracker-lima-vm")
-        .join("lima.yaml");
-    if candidate.exists() {
-        return Ok(candidate);
-    }
-
-    anyhow::bail!(
-        "Cannot find lima.yaml.tera. Place it in resources/ or ensure ../firecracker-lima-vm/lima.yaml exists."
-    )
-}
-
-/// Options for customizing Lima template rendering.
-#[derive(Debug, Default)]
-pub struct LimaRenderOptions {
-    /// Path to a custom lima.yaml.tera template. If `None`, the bundled template is used.
-    pub template_path: Option<PathBuf>,
-    /// Extra Tera context variables injected alongside the built-in ones.
-    /// These take precedence over built-in values if keys collide.
-    pub extra_context: std::collections::HashMap<String, String>,
-    /// Number of vCPUs for the Lima VM.
-    pub cpus: Option<u32>,
-    /// Memory in GiB for the Lima VM.
-    pub memory_gib: Option<u32>,
-    /// SSH local port binding for Lima.
-    pub ssh_port: Option<u16>,
-}
-
-/// Render the Lima YAML template with config values and return a temp file.
-/// The caller must hold the returned NamedTempFile until limactl has read it.
-pub fn render_lima_yaml() -> anyhow::Result<tempfile::NamedTempFile> {
-    render_lima_yaml_with(&LimaRenderOptions::default())
-}
-
-/// Render the Lima YAML template with custom options.
-pub fn render_lima_yaml_with(opts: &LimaRenderOptions) -> anyhow::Result<tempfile::NamedTempFile> {
-    let template_path = match &opts.template_path {
-        Some(p) => {
-            if !p.exists() {
-                anyhow::bail!("Custom Lima template not found: {}", p.display());
-            }
-            p.clone()
-        }
-        None => find_lima_template()?,
-    };
-
-    let template_str = std::fs::read_to_string(&template_path)
-        .map_err(|e| anyhow::anyhow!("Failed to read {}: {}", template_path.display(), e))?;
-
-    let mut tera = tera::Tera::default();
-    tera.add_raw_template("lima.yaml", &template_str)
-        .map_err(|e| anyhow::anyhow!("Failed to parse Lima template: {}", e))?;
-
-    let mut ctx = tera::Context::new();
-    ctx.insert("vm_name", VM_NAME);
-    ctx.insert("fc_version", &fc_version());
-    ctx.insert("arch", ARCH);
-    ctx.insert("tap_ip", TAP_IP);
-    ctx.insert("guest_ip", GUEST_IP);
-    ctx.insert("microvm_dir", MICROVM_DIR);
-
-    if let Some(cpus) = opts.cpus {
-        ctx.insert("lima_cpus", &cpus);
-    }
-    if let Some(mem) = opts.memory_gib {
-        ctx.insert("lima_memory", &mem);
-    }
-    if let Some(port) = opts.ssh_port {
-        ctx.insert("ssh_port", &port);
-    } else if let Ok(port_env) = std::env::var("MVM_SSH_PORT")
-        && let Ok(p) = port_env.parse::<u16>()
-    {
-        ctx.insert("ssh_port", &p);
-    }
-
-    for (key, value) in &opts.extra_context {
-        ctx.insert(key, value);
-    }
-
-    let rendered = tera
-        .render("lima.yaml", &ctx)
-        .map_err(|e| anyhow::anyhow!("Failed to render Lima template: {}", e))?;
-
-    let mut tmp = tempfile::Builder::new()
-        .prefix("mvm-lima-")
-        .suffix(".yaml")
-        .tempfile()
-        .map_err(|e| anyhow::anyhow!("Failed to create temp file: {}", e))?;
-
-    tmp.write_all(rendered.as_bytes())
-        .map_err(|e| anyhow::anyhow!("Failed to write rendered yaml: {}", e))?;
-
-    Ok(tmp)
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Read;
 
     #[test]
     fn test_constants_non_empty() {
@@ -426,160 +289,4 @@ mod tests {
         assert!(!mvm_core::config::is_production_mode());
     }
 
-    #[test]
-    fn test_find_lima_template_succeeds() {
-        // Should find resources/lima.yaml.tera in the source tree
-        let path = find_lima_template().unwrap();
-        assert!(path.exists());
-        assert!(path.to_str().unwrap().contains("lima.yaml"));
-    }
-
-    #[test]
-    fn test_render_lima_yaml_produces_valid_output() {
-        let tmp = render_lima_yaml().unwrap();
-        let mut content = String::new();
-        std::fs::File::open(tmp.path())
-            .unwrap()
-            .read_to_string(&mut content)
-            .unwrap();
-
-        // Should contain Lima YAML structure
-        assert!(content.contains("nestedVirtualization: true"));
-        assert!(content.contains("writable: true"));
-
-        // Lima's own template variable should be preserved (raw block unwrapped)
-        assert!(content.contains("{{.User}}"));
-
-        // Tera tags should NOT appear in output
-        assert!(!content.contains("{% raw %}"));
-        assert!(!content.contains("{% endraw %}"));
-    }
-
-    #[test]
-    fn test_render_lima_yaml_temp_file_has_yaml_suffix() {
-        let tmp = render_lima_yaml().unwrap();
-        let path_str = tmp.path().to_str().unwrap();
-        assert!(path_str.ends_with(".yaml"));
-        assert!(path_str.contains("mvm-lima-"));
-    }
-
-    #[test]
-    fn test_render_with_extra_context() {
-        let mut extra = std::collections::HashMap::new();
-        extra.insert("vm_name".to_string(), "custom-vm".to_string());
-        let opts = LimaRenderOptions {
-            extra_context: extra,
-            ..Default::default()
-        };
-        // Should succeed — extra context overrides vm_name but template
-        // doesn't directly embed it in a visible way. Just verify no error.
-        let tmp = render_lima_yaml_with(&opts).unwrap();
-        assert!(tmp.path().exists());
-    }
-
-    #[test]
-    fn test_render_with_custom_template() {
-        let mut custom = tempfile::NamedTempFile::new().unwrap();
-        std::io::Write::write_all(&mut custom, b"custom: {{ vm_name }}").unwrap();
-
-        let opts = LimaRenderOptions {
-            template_path: Some(custom.path().to_path_buf()),
-            ..Default::default()
-        };
-        let tmp = render_lima_yaml_with(&opts).unwrap();
-        let mut content = String::new();
-        std::fs::File::open(tmp.path())
-            .unwrap()
-            .read_to_string(&mut content)
-            .unwrap();
-        assert_eq!(content, "custom: mvm-builder");
-    }
-
-    #[test]
-    fn test_render_with_missing_custom_template_fails() {
-        let opts = LimaRenderOptions {
-            template_path: Some(PathBuf::from("/nonexistent/template.tera")),
-            ..Default::default()
-        };
-        assert!(render_lima_yaml_with(&opts).is_err());
-    }
-
-    #[test]
-    fn test_render_lima_yaml_includes_nix_profile() {
-        let tmp = render_lima_yaml().unwrap();
-        let mut content = String::new();
-        std::fs::File::open(tmp.path())
-            .unwrap()
-            .read_to_string(&mut content)
-            .unwrap();
-        assert!(
-            content.contains("mvm-nix.sh"),
-            "Lima template should install Nix profile.d script"
-        );
-        assert!(
-            content.contains("nix-daemon.sh"),
-            "Lima template should source nix-daemon.sh"
-        );
-    }
-
-    #[test]
-    fn test_render_lima_yaml_includes_mvm_tools_profile() {
-        let tmp = render_lima_yaml().unwrap();
-        let mut content = String::new();
-        std::fs::File::open(tmp.path())
-            .unwrap()
-            .read_to_string(&mut content)
-            .unwrap();
-        assert!(
-            content.contains("mvm-tools.sh"),
-            "Lima template should install mvm-tools profile.d script"
-        );
-        assert!(
-            content.contains("MVM_FC_VERSION"),
-            "Lima template should export MVM_FC_VERSION"
-        );
-    }
-
-    #[test]
-    fn test_render_with_lima_resources() {
-        let opts = LimaRenderOptions {
-            cpus: Some(8),
-            memory_gib: Some(16),
-            ..Default::default()
-        };
-        let tmp = render_lima_yaml_with(&opts).unwrap();
-        let mut content = String::new();
-        std::fs::File::open(tmp.path())
-            .unwrap()
-            .read_to_string(&mut content)
-            .unwrap();
-        assert!(
-            content.contains("cpus: 8"),
-            "Rendered YAML should contain cpus: 8, got:\n{}",
-            content
-        );
-        assert!(
-            content.contains(r#"memory: "16GiB""#),
-            "Rendered YAML should contain memory: \"16GiB\", got:\n{}",
-            content
-        );
-    }
-
-    #[test]
-    fn test_render_without_lima_resources_omits_fields() {
-        let tmp = render_lima_yaml().unwrap();
-        let mut content = String::new();
-        std::fs::File::open(tmp.path())
-            .unwrap()
-            .read_to_string(&mut content)
-            .unwrap();
-        assert!(
-            !content.contains("cpus:"),
-            "Default render should not contain cpus field"
-        );
-        assert!(
-            !content.contains("memory:"),
-            "Default render should not contain memory field"
-        );
-    }
 }

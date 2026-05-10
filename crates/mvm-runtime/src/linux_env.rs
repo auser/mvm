@@ -6,83 +6,6 @@ use std::sync::OnceLock;
 use mvm_core::linux_env::LinuxEnv;
 use mvm_core::platform;
 
-/// Lima-backed Linux execution environment.
-///
-/// Routes all commands through `limactl shell <vm_name> bash -c "..."`.
-/// Used on macOS and Linux without KVM.
-pub struct LimaEnv {
-    pub vm_name: String,
-}
-
-impl LimaEnv {
-    pub fn new(vm_name: &str) -> Self {
-        Self {
-            vm_name: vm_name.to_string(),
-        }
-    }
-}
-
-impl LinuxEnv for LimaEnv {
-    fn run(&self, script: &str) -> Result<Output> {
-        if let Some(output) = crate::shell_mock::intercept(script) {
-            return Ok(output);
-        }
-
-        Command::new("limactl")
-            .args(["shell", &self.vm_name, "bash", "-c", script])
-            .output()
-            .with_context(|| format!("Failed to run command in Lima VM '{}'", self.vm_name))
-    }
-
-    fn run_visible(&self, script: &str) -> Result<()> {
-        if let Some(output) = crate::shell_mock::intercept(script) {
-            if output.status.success() {
-                return Ok(());
-            }
-            anyhow::bail!(
-                "Command failed in Lima VM '{}' (exit {})",
-                self.vm_name,
-                output.status.code().unwrap_or(-1)
-            );
-        }
-
-        let status = Command::new("limactl")
-            .args(["shell", &self.vm_name, "bash", "-c", script])
-            .stdin(Stdio::inherit())
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::inherit())
-            .status()
-            .with_context(|| format!("Failed to run command in Lima VM '{}'", self.vm_name))?;
-
-        if !status.success() {
-            anyhow::bail!(
-                "Command failed in Lima VM '{}' (exit {})",
-                self.vm_name,
-                status.code().unwrap_or(-1)
-            );
-        }
-        Ok(())
-    }
-
-    fn run_stdout(&self, script: &str) -> Result<String> {
-        let output = self.run(script)?;
-        Ok(String::from_utf8_lossy(&output.stdout).trim().to_string())
-    }
-
-    fn run_capture(&self, script: &str) -> Result<Output> {
-        if let Some(output) = crate::shell_mock::intercept(script) {
-            return Ok(output);
-        }
-
-        Command::new("limactl")
-            .args(["shell", &self.vm_name, "bash", "-c", script])
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .output()
-            .with_context(|| format!("Failed to run command in Lima VM '{}'", self.vm_name))
-    }
-}
-
 /// Native Linux execution environment.
 ///
 /// Runs commands directly via `bash -c "..."`.
@@ -348,17 +271,22 @@ impl LinuxEnv for AppleContainerEnv {
 }
 
 /// Create the appropriate `LinuxEnv` for the current platform.
+///
+/// Apple Container hosts (macOS 26+) route through the dev VM's
+/// guest-agent vsock channel; everywhere else falls through to
+/// `bash -c` on the host. macOS Intel / pre-26 / no-KVM-Linux are
+/// expected to use the microsandbox-backed builder VM (W7.x.2
+/// follow-up) when one is present; absent that, scripts run against
+/// the bare host and any Linux-only tools they invoke fail loudly
+/// at runtime — the right shape, since pretending otherwise would
+/// silently produce broken artifacts.
 pub fn create_linux_env() -> Box<dyn LinuxEnv> {
     let plat = platform::current();
 
-    // Apple Container dev VM (macOS 26+)
     if plat.has_apple_containers() {
         return Box::new(AppleContainerEnv::new("mvm-dev"));
     }
 
-    // Native Linux with KVM (Lima is gone per ADR-013; macOS <26 + Linux
-    // without KVM are expected to use the microsandbox-backed builder VM
-    // — wired in the W6.x microsandbox-as-Linux-builder follow-up).
     Box::new(NativeEnv)
 }
 
@@ -373,12 +301,6 @@ pub fn default_env() -> &'static dyn LinuxEnv {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    #[test]
-    fn test_lima_env_name() {
-        let env = LimaEnv::new("test-vm");
-        assert_eq!(env.vm_name, "test-vm");
-    }
 
     #[test]
     fn test_create_linux_env_returns_env() {
