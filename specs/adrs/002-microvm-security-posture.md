@@ -2,7 +2,7 @@
 title: "ADR-002: microVM security posture — explicit guarantees, layered defenses"
 status: Accepted
 date: 2026-04-30
-revised: 2026-05-07
+revised: 2026-05-10
 supersedes: none
 related: ADR-001 (multi-backend execution); plan 25-microvm-hardening; plan 53-cross-platform-roadmap
 ---
@@ -12,6 +12,8 @@ related: ADR-001 (multi-backend execution); plan 25-microvm-hardening; plan 53-c
 Accepted. Implementation tracked in `specs/plans/25-microvm-hardening.md`. Workstreams W1–W6 shipped 2026-04-30.
 
 The 2026-05-07 revision adds the **Trust layers (Matryoshka model)** section, names the seven CI-enforced claims explicitly, and adds a **per-backend tier matrix** showing which claims hold for each backend in `AnyBackend`. None of the original decisions or surfaces change — the revision is a re-framing for legibility, motivated by plan 53 (cross-platform roadmap) where multiple backends with different tier coverage now coexist.
+
+The 2026-05-10 revision adds the **Framework references** subsection (MITRE ATT&CK / D3FEND / CREF mapping for each of the seven claims). Doc-only; no code, CI, or test impact.
 
 ## Context
 
@@ -122,6 +124,47 @@ L1 (host + hypervisor) has no claim of its own — the host is trusted
 by definition (see Threat model). L1 *enables* claim 3 (verified boot
 needs a hypervisor that respects the kernel cmdline). If the host is
 compromised, every layer falls; that case is explicitly out of scope.
+
+### Framework references
+
+Each claim is named here in MITRE vocabulary. Adversary technique = the
+ATT&CK behavior the claim *denies*; defensive technique = the D3FEND /
+CREF technique the claim *instantiates*. Mapping is for cross-reference
+only — the CI gate is the source of truth, not the framework code.
+
+| # | Adversary technique denied | Defensive technique instantiated |
+|---|---|---|
+| 1 | T1611 (Escape to Host) | D3FEND: Process Segmentation, Mandatory Access Control · CREF: Privilege Restriction, Segmentation |
+| 2 | T1548 (Abuse Elevation Control), T1068 (Exploitation for Privilege Escalation) | D3FEND: Local File Permissions, System Call Permissions · CREF: Privilege Restriction |
+| 3 | T1542.003 (Bootkit), T1601 (Modify System Image) | D3FEND: System Boot Verification · CREF: Substantiated Integrity |
+| 4 | T1059 (Command and Scripting Interpreter — surface eliminated, not detected) | CREF: Realignment (scope reduction by build-time exclusion) |
+| 5 | T1190-class (Exploit of host↔guest interface) | CREF: Substantiated Integrity (deser path proven via fuzzing + `deny_unknown_fields`) |
+| 6 | T1195.002 (Compromise Software Supply Chain) | D3FEND: Executable Integrity (hash + cosign signature verification) · CREF: Substantiated Integrity |
+| 7 | T1195.001 (Compromise Software Dependencies and Development Tools) | D3FEND: Software Composition Analysis · CREF: Substantiated Integrity |
+
+The cold-state guarantee (per-workload fresh boot, no warm pools — see
+CLAUDE.md and the `mvmctl run` lifecycle) is not in the seven-claim
+table because it is not a single CI gate; it is a structural property
+of the runtime. In framework terms it is **CREF: Non-Persistence**, and
+denies T1546 (Event-Triggered Execution) / T1547 (Boot or Logon
+Autostart) classes of persistence outright.
+
+Frameworks intentionally referenced:
+
+- ATT&CK Enterprise (technique IDs `T….`) — adversary behavior
+  catalog. Stable IDs across versions.
+- D3FEND — defensive technique catalog. Class names used here (e.g.
+  "System Boot Verification") are referenced rather than D3FEND IDs
+  because the ID scheme has churned across releases and the class
+  names are more durable.
+- CREF (Cyber Resiliency Engineering Framework) — names the *kind* of
+  resiliency each claim provides under the four CREF goals
+  (Anticipate / Withstand / Recover / Adapt). Most mvm claims are
+  Withstand-class; cold-state is Recover-class.
+
+ATLAS (adversarial ML) is not mapped here — mvm hosts AI workloads but
+makes no claim about their internals. Workloads are L5 (untrusted) and
+all five layers above are model-agnostic.
 
 ## Surfaces
 
