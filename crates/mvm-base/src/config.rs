@@ -288,5 +288,4 @@ mod tests {
         unsafe { std::env::remove_var("MVM_PRODUCTION") };
         assert!(!mvm_core::config::is_production_mode());
     }
-
 }

@@ -6,13 +6,13 @@ use serde::Serialize;
 
 use crate::ui;
 
+use mvm::vm::template::lifecycle as tmpl;
+use mvm_backend::image;
 use mvm_core::manifest::{
     self, Manifest, PersistedManifest, Provenance, resolve_manifest_config_path,
 };
 use mvm_core::naming::validate_flake_ref;
 use mvm_core::user_config::MvmConfig;
-use mvm::vm::template::lifecycle as tmpl;
-use mvm_backend::image;
 
 use super::Cli;
 use super::shared::{PhaseEvent, clap_flake_ref, resolve_flake_ref};
@@ -152,7 +152,6 @@ fn build_manifest(
         manifest.flake.clone()
     };
 
-
     if json {
         PhaseEvent::new("build", "manifest", "started")
             .with_message(&format!(
@@ -268,7 +267,6 @@ fn build_flake(
 
     let build_env = mvm::build_env::default_build_env();
     let env = build_env.as_ref();
-
 
     let resolved = resolve_flake_ref(flake_ref)?;
     let watch_enabled = watch && !resolved.contains(':');

@@ -254,7 +254,10 @@ pub struct VmExitStatus {
 impl VmExitStatus {
     /// A successful zero-exit-code status — used by backends that
     /// don't expose a real wait surface but want a sentinel value.
-    pub const SUCCESS: Self = VmExitStatus { code: Some(0), success: true };
+    pub const SUCCESS: Self = VmExitStatus {
+        code: Some(0),
+        success: true,
+    };
 }
 
 /// Capabilities that a backend may or may not support.
@@ -461,11 +464,7 @@ pub trait VmBackend: Send + Sync {
     /// the other gets the default-trampoline. Most production
     /// backends override this method (the more general one) and let
     /// `start` delegate.
-    fn start_with_mode(
-        &self,
-        _config: &VmStartConfig,
-        _mode: StartMode,
-    ) -> Result<VmId> {
+    fn start_with_mode(&self, _config: &VmStartConfig, _mode: StartMode) -> Result<VmId> {
         anyhow::bail!(
             "{}: start_with_mode is not implemented for this backend",
             self.name()

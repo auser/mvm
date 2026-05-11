@@ -58,23 +58,20 @@ impl VmBackend for LibkrunBackend {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("libkrun backend requires a kernel path"))?;
 
-        let ctx = mvm_providers::libkrun::KrunContext::new(&config.name, kernel, &config.rootfs_path)
-            .with_resources(
-                u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX),
-                config.memory_mib,
-            )
-            .add_vsock_port(mvm_guest::vsock::GUEST_AGENT_PORT);
+        let ctx =
+            mvm_providers::libkrun::KrunContext::new(&config.name, kernel, &config.rootfs_path)
+                .with_resources(
+                    u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX),
+                    config.memory_mib,
+                )
+                .add_vsock_port(mvm_guest::vsock::GUEST_AGENT_PORT);
 
         // W6.2.1: thread the build-time sidecar into per-VM runtime
         // metadata so `mvmctl console` enforces the accessible/sealed
         // gate on libkrun-launched VMs the same way as on the
         // microsandbox/Firecracker paths.
         let rootfs = std::path::Path::new(&config.rootfs_path);
-        mvm_base::runtime_meta::record_from_rootfs(
-            &config.name,
-            StartMode::Detached,
-            rootfs,
-        )?;
+        mvm_base::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
 
         ui::info(&format!(
             "Starting libkrun VM '{}' (cpus={}, mem={}MiB)...",

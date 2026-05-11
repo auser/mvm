@@ -12,9 +12,9 @@
 //! "exec not available" regardless of any runtime configuration.
 
 use anyhow::{Context, Result};
-use mvm_core::vm_backend::{VmId, VmStartConfig, VmVolume};
-use mvm_backend::backend::AnyBackend;
 use mvm::vsock_transport;
+use mvm_backend::backend::AnyBackend;
+use mvm_core::vm_backend::{VmId, VmStartConfig, VmVolume};
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -468,10 +468,9 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
                 let (spec, vmlinux, initrd, rootfs, rev) =
                     mvm::vm::template::lifecycle::template_artifacts_dispatched(name)
                         .with_context(|| format!("Loading template '{name}'"))?;
-                let snap =
-                    mvm::vm::template::lifecycle::template_snapshot_info_dispatched(name)
-                        .ok()
-                        .flatten();
+                let snap = mvm::vm::template::lifecycle::template_snapshot_info_dispatched(name)
+                    .ok()
+                    .flatten();
                 (
                     vmlinux,
                     initrd,
@@ -509,13 +508,14 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
     for (idx, dir) in req.add_dirs.iter().enumerate() {
         let label = format!("mvm-extra-{idx}");
         let image_path = format!("{staging_dir}/extra-{idx}.ext4");
-        mvm_backend::image::build_dir_image_ro(&dir.host_path, &label, &image_path)
-            .with_context(|| {
+        mvm_backend::image::build_dir_image_ro(&dir.host_path, &label, &image_path).with_context(
+            || {
                 format!(
                     "preparing --add-dir image for '{}' -> '{}'",
                     dir.host_path, dir.guest_path
                 )
-            })?;
+            },
+        )?;
         volumes.push(mvm_backend::image::RuntimeVolume {
             host: image_path,
             guest: dir.guest_path.clone(),

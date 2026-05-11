@@ -288,7 +288,10 @@ mod tests {
         let mut rev = make_revision("lock1", "minimal", "worker");
         rev.build_mode = None;
         let json = serde_json::to_string(&rev).unwrap();
-        assert!(!json.contains("build_mode"), "absent field should not serialize: {json}");
+        assert!(
+            !json.contains("build_mode"),
+            "absent field should not serialize: {json}"
+        );
         let back: TemplateRevision = serde_json::from_str(&json).unwrap();
         assert!(back.build_mode.is_none());
     }

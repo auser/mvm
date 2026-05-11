@@ -159,5 +159,4 @@ mod tests {
             assert!(check_homebrew().is_ok());
         }
     }
-
 }

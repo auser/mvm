@@ -5,12 +5,12 @@ use clap::Args as ClapArgs;
 
 use crate::ui;
 
+use mvm_backend::backend::AnyBackend;
+use mvm_backend::{image, microvm};
 use mvm_core::naming::{validate_flake_ref, validate_template_name, validate_vm_name};
 use mvm_core::user_config::MvmConfig;
 use mvm_core::util::parse_human_size;
 use mvm_core::vm_backend::VmId;
-use mvm_backend::backend::AnyBackend;
-use mvm_backend::{image, microvm};
 
 use super::super::env::apple_container::ensure_default_microvm_image;
 use super::Cli;
@@ -458,8 +458,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         ui::info(&format!("Using revision {}", rev));
 
         // Check for pre-built snapshot
-        let snap_info =
-            mvm::vm::template::lifecycle::template_snapshot_info_dispatched(tmpl)?;
+        let snap_info = mvm::vm::template::lifecycle::template_snapshot_info_dispatched(tmpl)?;
         if snap_info.is_some() {
             ui::info("Snapshot available — will restore instantly");
         }
@@ -811,7 +810,11 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
                 // Start host-side proxies
                 for pm in &pm_list {
-                    mvm_providers::apple_container::start_port_proxy(&vm_name_owned, pm.host, pm.guest);
+                    mvm_providers::apple_container::start_port_proxy(
+                        &vm_name_owned,
+                        pm.host,
+                        pm.guest,
+                    );
                     ui::info(&format!(
                         "Forwarding localhost:{} → guest tcp/{} (vsock)",
                         pm.host, pm.guest
@@ -900,18 +903,14 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
             // Rebuild the flake.
             let env = mvm::build_env::RuntimeBuildEnv;
-            let result = match mvm_build::dev_build::dev_build(
-                &env,
-                &flake_dir,
-                profile,
-                build_mode,
-            ) {
-                Ok(r) => r,
-                Err(e) => {
-                    ui::warn(&format!("Rebuild failed: {e}; waiting for next change..."));
-                    continue;
-                }
-            };
+            let result =
+                match mvm_build::dev_build::dev_build(&env, &flake_dir, profile, build_mode) {
+                    Ok(r) => r,
+                    Err(e) => {
+                        ui::warn(&format!("Rebuild failed: {e}; waiting for next change..."));
+                        continue;
+                    }
+                };
             if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(&env, &result) {
                 tracing::warn!("Guest agent check failed: {e}");
             }

@@ -62,13 +62,19 @@ mod tests {
 
     #[test]
     fn dev_flag_resolves_to_dev() {
-        let flags = BuildModeFlags { dev: true, prod: false };
+        let flags = BuildModeFlags {
+            dev: true,
+            prod: false,
+        };
         assert_eq!(flags.resolve(), BuildMode::Dev);
     }
 
     #[test]
     fn prod_flag_resolves_to_prod() {
-        let flags = BuildModeFlags { dev: false, prod: true };
+        let flags = BuildModeFlags {
+            dev: false,
+            prod: true,
+        };
         assert_eq!(flags.resolve(), BuildMode::Prod);
     }
 }

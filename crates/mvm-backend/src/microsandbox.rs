@@ -30,11 +30,11 @@
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use mvm_core::vm_backend::StartMode;
 use mvm_core::vm_backend::{
     BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, VmBackend,
     VmCapabilities, VmExitStatus, VmId, VmInfo, VmStartConfig, VmStatus,
 };
-use mvm_core::vm_backend::StartMode;
 
 /// microsandbox backend (libkrun-backed; cross-platform Linux/macOS/Windows).
 ///
@@ -63,11 +63,7 @@ fn record_start_mode(name: &str, mode: StartMode) -> Result<()> {
 /// [`mvm_base::runtime_meta::record_from_rootfs`]. Kept here so the
 /// existing tests in this module read naturally; new backends call
 /// the runtime_meta version directly.
-fn record_start_mode_from_rootfs(
-    name: &str,
-    mode: StartMode,
-    rootfs: &Path,
-) -> Result<()> {
+fn record_start_mode_from_rootfs(name: &str, mode: StartMode, rootfs: &Path) -> Result<()> {
     mvm_base::runtime_meta::record_from_rootfs(name, mode, rootfs)
 }
 
@@ -148,11 +144,7 @@ impl VmBackend for MicrosandboxBackend {
         }
     }
 
-    fn start_with_mode(
-        &self,
-        config: &VmStartConfig,
-        mode: StartMode,
-    ) -> Result<VmId> {
+    fn start_with_mode(&self, config: &VmStartConfig, mode: StartMode) -> Result<VmId> {
         // 1. Bridge the rootfs path. Microsandbox's `.disk()` builder
         //    only accepts .raw/.qcow2/.vmdk extensions; our build
         //    pipeline produces .ext4. The hard-link alias keeps disk
@@ -465,10 +457,22 @@ mod tests {
     #[test]
     fn microsandbox_capabilities_match_libkrun_substrate() {
         let caps = MicrosandboxBackend.capabilities();
-        assert!(caps.vsock, "vsock must always be available — guest agent contract");
-        assert!(!caps.snapshots, "Phase 7a wires snapshots; W1.1 advertises none");
-        assert!(!caps.pause_resume, "upstream microsandbox doesn't expose pause/resume");
-        assert!(!caps.tap_networking, "L4/L7 proxy in Phase 3 is the network path");
+        assert!(
+            caps.vsock,
+            "vsock must always be available — guest agent contract"
+        );
+        assert!(
+            !caps.snapshots,
+            "Phase 7a wires snapshots; W1.1 advertises none"
+        );
+        assert!(
+            !caps.pause_resume,
+            "upstream microsandbox doesn't expose pause/resume"
+        );
+        assert!(
+            !caps.tap_networking,
+            "L4/L7 proxy in Phase 3 is the network path"
+        );
     }
 
     #[test]
@@ -494,7 +498,10 @@ mod tests {
         let available = MicrosandboxBackend
             .is_available()
             .expect("is_available is infallible in W1.2");
-        assert!(available, "is_available must be true once microsandbox is linked");
+        assert!(
+            available,
+            "is_available must be true once microsandbox is linked"
+        );
     }
 
     #[test]
@@ -529,8 +536,7 @@ mod tests {
         let rootfs = temp.path().join("rootfs.ext4");
         std::fs::write(&rootfs, b"fake-ext4-block-image").expect("write");
 
-        let (alias, created) =
-            ensure_microsandbox_rootfs_alias(&rootfs).expect("alias creation");
+        let (alias, created) = ensure_microsandbox_rootfs_alias(&rootfs).expect("alias creation");
         assert!(created, "first call should create the alias");
         assert_eq!(alias, rootfs.with_extension("raw"));
         assert!(alias.exists(), ".raw alias must exist after creation");
@@ -582,8 +588,8 @@ mod tests {
         // We pick a deliberately-improbable name so a host with real
         // microsandbox state can't accidentally collide. If this test
         // ever flakes, swap the name for a UUID.
-        let result = MicrosandboxBackend
-            .stop(&VmId("__mvm_test_definitely_does_not_exist__".to_string()));
+        let result =
+            MicrosandboxBackend.stop(&VmId("__mvm_test_definitely_does_not_exist__".to_string()));
         // Either Ok (sandbox not found, idempotent path) or a list-
         // related error if microsandbox's DB isn't initialized — both
         // are acceptable in CI; we just guard against panics.
@@ -614,8 +620,8 @@ mod tests {
         // (the conservative "not running" status). Acceptable to
         // return Err here too if microsandbox's DB isn't initialized
         // — we guard against panic only.
-        let result = MicrosandboxBackend
-            .status(&VmId("__mvm_test_definitely_does_not_exist__".to_string()));
+        let result =
+            MicrosandboxBackend.status(&VmId("__mvm_test_definitely_does_not_exist__".to_string()));
         if let Ok(s) = result {
             assert_eq!(
                 s,
@@ -649,7 +655,9 @@ mod tests {
         let temp = tempfile::tempdir().expect("tempdir");
         let saved = std::env::var_os("HOME");
         // SAFETY: serialized via HOME_TEST_LOCK above.
-        unsafe { std::env::set_var("HOME", temp.path()); }
+        unsafe {
+            std::env::set_var("HOME", temp.path());
+        }
         let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
             f(temp.path());
         }));
@@ -672,11 +680,17 @@ mod tests {
             record_start_mode(&name, StartMode::Attached).expect("first write");
             let mode_path = home.join(".mvm").join("vms").join(&name).join("mode.json");
             let attached = std::fs::read_to_string(&mode_path).expect("mode.json present");
-            assert!(attached.contains("attached"), "expected attached, got: {attached}");
+            assert!(
+                attached.contains("attached"),
+                "expected attached, got: {attached}"
+            );
 
             record_start_mode(&name, StartMode::Detached).expect("second write overrides");
             let detached = std::fs::read_to_string(&mode_path).expect("mode.json still present");
-            assert!(detached.contains("detached"), "second write didn't override: {detached}");
+            assert!(
+                detached.contains("detached"),
+                "second write didn't override: {detached}"
+            );
             assert!(!detached.contains("attached"), "old marker not cleared");
         });
     }
@@ -703,13 +717,10 @@ mod tests {
                 rootless_entrypoint: true,
                 hypervisor: "microsandbox".to_string(),
             };
-            sidecar
-                .write_to_dir(tmp.path())
-                .expect("sidecar write");
+            sidecar.write_to_dir(tmp.path()).expect("sidecar write");
 
             let name = format!("sealed-{}", std::process::id());
-            record_start_mode_from_rootfs(&name, StartMode::Detached, &rootfs)
-                .expect("record");
+            record_start_mode_from_rootfs(&name, StartMode::Detached, &rootfs).expect("record");
 
             let mode_path = home.join(".mvm").join("vms").join(&name).join("mode.json");
             let body = std::fs::read_to_string(&mode_path).expect("mode.json present");
@@ -726,8 +737,7 @@ mod tests {
             std::fs::write(&rootfs, b"unused").expect("create rootfs sentinel");
 
             let name = format!("dev-{}", std::process::id());
-            record_start_mode_from_rootfs(&name, StartMode::Attached, &rootfs)
-                .expect("record");
+            record_start_mode_from_rootfs(&name, StartMode::Attached, &rootfs).expect("record");
 
             let mode_path = home.join(".mvm").join("vms").join(&name).join("mode.json");
             let body = std::fs::read_to_string(&mode_path).expect("mode.json present");
@@ -744,11 +754,16 @@ mod tests {
             // Pre-seed Attached so detach has something to flip.
             record_start_mode(&name, StartMode::Attached).expect("seed");
 
-            MicrosandboxBackend.detach(&id).expect("detach is infallible after seed");
+            MicrosandboxBackend
+                .detach(&id)
+                .expect("detach is infallible after seed");
 
             let mode_path = home.join(".mvm").join("vms").join(&name).join("mode.json");
             let body = std::fs::read_to_string(&mode_path).expect("mode.json present");
-            assert!(body.contains("detached"), "detach didn't flip intent, got: {body}");
+            assert!(
+                body.contains("detached"),
+                "detach didn't flip intent, got: {body}"
+            );
         });
     }
 

@@ -49,7 +49,6 @@ fn vm_exec(script: &str) -> Result<()> {
     Ok(())
 }
 
-
 #[instrument(skip_all, fields(template_id = %spec.template_id))]
 pub fn template_create(spec: &TemplateSpec) -> Result<()> {
     let dir = template_dir(&spec.template_id);
@@ -584,12 +583,8 @@ pub fn template_build_from_manifest(
         }
     }
 
-    let result = mvm_build::dev_build::dev_build(
-        env,
-        &persisted.flake_ref,
-        Some(&persisted.profile),
-        mode,
-    )?;
+    let result =
+        mvm_build::dev_build::dev_build(env, &persisted.flake_ref, Some(&persisted.profile), mode)?;
 
     if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(env, &result) {
         ui::warn(&format!(
@@ -978,7 +973,6 @@ pub fn wait_for_integrations_healthy(
     }
 }
 
-
 /// Artifact integrity manifest used by template push/pull.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
 pub struct Checksums {
@@ -1286,17 +1280,15 @@ pub fn template_verify(id: &str, revision: Option<&str>) -> Result<()> {
 // `mvm_base::snapshot_integrity` (W8.B). Re-exported below so
 // the local `create_snapshot` call site keeps resolving without
 // renaming.
-pub use mvm_base::snapshot_integrity::{
-    seal_snapshot_artifacts, verify_snapshot_artifacts,
-};
+pub use mvm_base::snapshot_integrity::{seal_snapshot_artifacts, verify_snapshot_artifacts};
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use mvm_base::cow::CloneStrategy;
     use mvm_guest::integrations::{
         IntegrationHealthResult, IntegrationStateReport, IntegrationStatus,
     };
-    use mvm_base::cow::CloneStrategy;
 
     fn healthy_report(name: &str) -> IntegrationStateReport {
         IntegrationStateReport {

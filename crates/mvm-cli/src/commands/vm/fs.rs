@@ -13,10 +13,10 @@ use anyhow::{Context, Result, bail};
 use clap::{Args as ClapArgs, Subcommand};
 use std::io::{Read, Write};
 
+use mvm_backend::microvm;
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
 use mvm_guest::vsock::{FsResult, GuestRequest};
-use mvm_backend::microvm;
 
 use super::Cli;
 use super::shared::{clap_vm_name, human_bytes};

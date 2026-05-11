@@ -442,8 +442,10 @@ pub(super) fn cmd_dev_apple_container_status() -> Result<()> {
     ));
 
     if running
-        && let Ok(mut stream) =
-            mvm_providers::apple_container::vsock_connect_any(DEV_VM_NAME, mvm_guest::vsock::GUEST_AGENT_PORT)
+        && let Ok(mut stream) = mvm_providers::apple_container::vsock_connect_any(
+            DEV_VM_NAME,
+            mvm_guest::vsock::GUEST_AGENT_PORT,
+        )
         && let Ok(mvm_guest::vsock::GuestResponse::ExecResult { stdout, .. }) =
             mvm_guest::vsock::send_request(
                 &mut stream,

@@ -6,11 +6,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 
-use mvm_core::naming::validate_vm_name;
-use mvm_core::user_config::MvmConfig;
 use mvm::vsock_transport::{
     AppleContainerTransport, FirecrackerTransport, VsockProxyTransport, VsockTransport,
 };
+use mvm_core::naming::validate_vm_name;
+use mvm_core::user_config::MvmConfig;
 
 use super::super::env::apple_container::dev_vsock_proxy_path;
 use super::Cli;
@@ -27,7 +27,9 @@ use crate::ui;
 /// connection (control + data + resize). Cloning the Arc lets the
 /// SIGWINCH handler thread reuse the same dispatch.
 fn pick_console_transport(name: &str) -> Result<Arc<dyn VsockTransport>> {
-    if mvm_providers::apple_container::vsock_connect(name, mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
+    if mvm_providers::apple_container::vsock_connect(name, mvm_guest::vsock::GUEST_AGENT_PORT)
+        .is_ok()
+    {
         return Ok(Arc::new(AppleContainerTransport::new(name)));
     }
     let proxy = dev_vsock_proxy_path();
@@ -466,4 +468,3 @@ mod accessible_gate_tests {
         });
     }
 }
-

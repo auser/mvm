@@ -280,8 +280,7 @@ fn test_up_no_build_mode_flag_defaults_to_prod() {
 
 #[test]
 fn test_up_dev_and_prod_are_mutually_exclusive() {
-    let result =
-        Cli::try_parse_from(["mvmctl", "up", "--flake", ".", "--dev", "--prod"]);
+    let result = Cli::try_parse_from(["mvmctl", "up", "--flake", ".", "--dev", "--prod"]);
     assert!(
         result.is_err(),
         "passing both --dev and --prod must be a clap parse error"
@@ -1210,7 +1209,11 @@ fn test_console_with_command() {
     let cli = Cli::try_parse_from(["mvmctl", "console", "myvm", "--command", "ls"]);
     assert!(cli.is_ok());
     match cli.unwrap().command {
-        Commands::Console(console::Args { name, command, force }) => {
+        Commands::Console(console::Args {
+            name,
+            command,
+            force,
+        }) => {
             assert_eq!(name, "myvm");
             assert_eq!(command.as_deref(), Some("ls"));
             assert!(!force, "default --force is off");

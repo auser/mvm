@@ -97,8 +97,7 @@ fn home_dir() -> Option<PathBuf> {
 }
 
 fn meta_path(name: &str) -> Result<PathBuf> {
-    let home =
-        home_dir().context("$HOME unset; cannot locate ~/.mvm/vms/<name>/mode.json")?;
+    let home = home_dir().context("$HOME unset; cannot locate ~/.mvm/vms/<name>/mode.json")?;
     Ok(home.join(".mvm").join("vms").join(name).join("mode.json"))
 }
 
@@ -130,8 +129,8 @@ pub fn read(name: &str) -> Result<Option<VmRuntimeMeta>> {
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
         Err(e) => return Err(e).with_context(|| format!("reading {}", path.display())),
     };
-    let meta: VmRuntimeMeta = serde_json::from_str(&body)
-        .with_context(|| format!("parsing {}", path.display()))?;
+    let meta: VmRuntimeMeta =
+        serde_json::from_str(&body).with_context(|| format!("parsing {}", path.display()))?;
     Ok(Some(meta))
 }
 
@@ -150,17 +149,9 @@ pub fn dev_attached(mode: StartMode) -> VmRuntimeMeta {
 /// fall back to `accessible: true` to preserve backward-compatible
 /// behavior for pre-W7.x.1 artifacts. Failures only surface when
 /// the sidecar exists and is malformed.
-pub fn from_sidecar(
-    mode: StartMode,
-    rootfs_dir: &std::path::Path,
-) -> Result<VmRuntimeMeta> {
+pub fn from_sidecar(mode: StartMode, rootfs_dir: &std::path::Path) -> Result<VmRuntimeMeta> {
     let sidecar = mvm_build::builder_vm::ArtifactSidecar::read_from_dir(rootfs_dir)
-        .with_context(|| {
-            format!(
-                "reading mvm-meta.json sidecar in {}",
-                rootfs_dir.display()
-            )
-        })?;
+        .with_context(|| format!("reading mvm-meta.json sidecar in {}", rootfs_dir.display()))?;
     let accessible = sidecar.map(|s| s.accessible).unwrap_or(true);
     Ok(VmRuntimeMeta {
         mode: mode.into(),
@@ -179,11 +170,7 @@ pub fn from_sidecar(
 /// Errors propagate when the sidecar exists but is malformed (a
 /// build pipeline bug worth surfacing); the underlying `write`
 /// step is best-effort and only logs warnings.
-pub fn record_from_rootfs(
-    name: &str,
-    mode: StartMode,
-    rootfs: &std::path::Path,
-) -> Result<()> {
+pub fn record_from_rootfs(name: &str, mode: StartMode, rootfs: &std::path::Path) -> Result<()> {
     let dir = rootfs.parent().unwrap_or_else(|| std::path::Path::new("."));
     let meta = from_sidecar(mode, dir)?;
     write(name, &meta)
@@ -271,7 +258,10 @@ mod tests {
     fn from_sidecar_missing_defaults_to_accessible() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let meta = from_sidecar(StartMode::Attached, tmp.path()).expect("ok");
-        assert!(meta.accessible, "missing sidecar should default to accessible");
+        assert!(
+            meta.accessible,
+            "missing sidecar should default to accessible"
+        );
         assert_eq!(meta.mode, StartModeKind::Attached);
     }
 

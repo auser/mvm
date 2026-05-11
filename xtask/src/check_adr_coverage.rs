@@ -80,11 +80,10 @@ fn extract_adr_refs(body: &str) -> Vec<u32> {
 ///     have committed, e.g. generated docs)
 fn scan_for_refs(root: &Path) -> Result<BTreeMap<u32, usize>> {
     let mut counts: BTreeMap<u32, usize> = BTreeMap::new();
-    let skip_dirs: BTreeSet<&str> =
-        ["target", "node_modules", ".git", "public"]
-            .iter()
-            .copied()
-            .collect();
+    let skip_dirs: BTreeSet<&str> = ["target", "node_modules", ".git", "public"]
+        .iter()
+        .copied()
+        .collect();
     let adrs_dir = root.join("specs/adrs");
 
     visit(&root.to_path_buf(), &mut counts, &skip_dirs, &adrs_dir)?;
@@ -97,8 +96,7 @@ fn visit(
     skip_dirs: &BTreeSet<&str>,
     adrs_dir: &Path,
 ) -> Result<()> {
-    let entries =
-        fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
+    let entries = fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))?;
     for entry in entries {
         let entry = entry?;
         let path = entry.path();
@@ -128,8 +126,20 @@ fn visit(
         let scan = matches!(
             path.extension().and_then(|e| e.to_str()),
             Some(
-                "rs" | "md" | "toml" | "yaml" | "yml" | "nix" | "json" | "txt"
-                | "sh" | "py" | "ts" | "tsx" | "js" | "jsx" | "html"
+                "rs" | "md"
+                    | "toml"
+                    | "yaml"
+                    | "yml"
+                    | "nix"
+                    | "json"
+                    | "txt"
+                    | "sh"
+                    | "py"
+                    | "ts"
+                    | "tsx"
+                    | "js"
+                    | "jsx"
+                    | "html"
             )
         );
         if !scan {

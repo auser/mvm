@@ -19,8 +19,8 @@ use clap::{Args as ClapArgs, Subcommand};
 
 use crate::ui;
 
-use mvm_core::user_config::MvmConfig;
 use mvm_core::platform::{self, Platform};
+use mvm_core::user_config::MvmConfig;
 
 use super::super::vm::console;
 use super::Cli;
@@ -186,11 +186,9 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             };
 
             match backend {
-                DevBackend::AppleContainer => apple_container::cmd_dev_apple_container(
-                    effective_cpus,
-                    effective_mem,
-                    shell,
-                ),
+                DevBackend::AppleContainer => {
+                    apple_container::cmd_dev_apple_container(effective_cpus, effective_mem, shell)
+                }
                 DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native(shell),
                 DevBackend::Unsupported => bail_no_dev_backend(),
             }
@@ -303,11 +301,9 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                 memory
             };
             match backend {
-                DevBackend::AppleContainer => apple_container::cmd_dev_apple_container(
-                    effective_cpus,
-                    effective_mem,
-                    shell,
-                ),
+                DevBackend::AppleContainer => {
+                    apple_container::cmd_dev_apple_container(effective_cpus, effective_mem, shell)
+                }
                 DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native(shell),
                 DevBackend::Unsupported => bail_no_dev_backend(),
             }

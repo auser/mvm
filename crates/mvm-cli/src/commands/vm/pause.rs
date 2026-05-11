@@ -18,9 +18,9 @@ use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
 use std::path::PathBuf;
 
+use mvm::vm::instance_snapshot::{FirecrackerIO, pause_and_seal, verify_and_resume};
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
-use mvm::vm::instance_snapshot::{FirecrackerIO, pause_and_seal, verify_and_resume};
 
 use super::Cli;
 use super::shared::clap_vm_name;
@@ -82,15 +82,14 @@ pub(in crate::commands) fn run_resume(
     // shell that's waiting for the snapshot load (Firecracker's
     // restore-into-empty-VMM workflow). The substrate is
     // ready; the launcher integration is a follow-up.
-    let vm_dir =
-        mvm_backend::microvm::resolve_running_vm_dir(&args.name).with_context(|| {
-            format!(
-                "VM {:?} has no running Firecracker shell; resume currently \
+    let vm_dir = mvm_backend::microvm::resolve_running_vm_dir(&args.name).with_context(|| {
+        format!(
+            "VM {:?} has no running Firecracker shell; resume currently \
                  requires a fresh `mvmctl up --resume-from-snapshot` (follow-up). \
                  Substrate verifies, the launcher integration is pending.",
-                args.name
-            )
-        })?;
+            args.name
+        )
+    })?;
     let socket = firecracker_socket(&vm_dir);
     let io = FirecrackerIO::new(socket);
 

@@ -65,4 +65,3 @@ pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
 /// their tests run on the same `cargo test` binary.
 #[cfg(test)]
 pub(crate) use mvm_base::runtime_meta::HOME_TEST_LOCK;
-

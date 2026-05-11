@@ -1136,7 +1136,9 @@ mod tests {
     #[test]
     fn test_proxy_port_allowlist() {
         // Allowed: guest agent control channel.
-        assert!(proxy_port_is_allowed(crate::apple_container::GUEST_AGENT_PORT));
+        assert!(proxy_port_is_allowed(
+            crate::apple_container::GUEST_AGENT_PORT
+        ));
         // Specifically, 52 — the historical privileged-port choice —
         // must be rejected now: it's outside the agent port and outside
         // both forwarder ranges. ADR-002 §W4.5.
@@ -1163,8 +1165,12 @@ mod tests {
         assert!(!proxy_port_is_allowed(53));
 
         // Rejected: agent-slot boundary (only the exact port is allowed).
-        assert!(!proxy_port_is_allowed(crate::apple_container::GUEST_AGENT_PORT - 1));
-        assert!(!proxy_port_is_allowed(crate::apple_container::GUEST_AGENT_PORT + 1));
+        assert!(!proxy_port_is_allowed(
+            crate::apple_container::GUEST_AGENT_PORT - 1
+        ));
+        assert!(!proxy_port_is_allowed(
+            crate::apple_container::GUEST_AGENT_PORT + 1
+        ));
 
         // Rejected: gap between agent slot and port-forward range.
         assert!(!proxy_port_is_allowed(100));

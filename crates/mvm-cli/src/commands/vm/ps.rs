@@ -3,8 +3,8 @@
 use anyhow::Result;
 use clap::Args as ClapArgs;
 
-use mvm_core::user_config::MvmConfig;
 use mvm_backend::backend::AnyBackend;
+use mvm_core::user_config::MvmConfig;
 
 use super::Cli;
 
@@ -69,8 +69,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     // If the registry can't be loaded we fall through to "no metadata"
     // and only the backend listing is shown.
     let registry_path = mvm::vm::name_registry::registry_path();
-    let registry =
-        mvm::vm::name_registry::VmNameRegistry::load(&registry_path).unwrap_or_default();
+    let registry = mvm::vm::name_registry::VmNameRegistry::load(&registry_path).unwrap_or_default();
 
     let now = chrono::Utc::now();
     let is_expired = |reg: &mvm::vm::name_registry::VmRegistration| -> bool {

@@ -27,8 +27,8 @@ fn nix_dir() -> PathBuf {
 #[test]
 fn flake_nix_exists_and_imports_microvm_nix() {
     let path = nix_dir().join("flake.nix");
-    let content = fs::read_to_string(&path)
-        .unwrap_or_else(|e| panic!("nix/flake.nix must be present: {e}"));
+    let content =
+        fs::read_to_string(&path).unwrap_or_else(|e| panic!("nix/flake.nix must be present: {e}"));
 
     // ADR-013 invariant: the flake imports microvm.nix as the foundation.
     // Any future PR that drops this input violates the ADR.
@@ -128,9 +128,7 @@ fn mk_guest_eval_assertions_all_pass_when_nix_available() {
     // process spawn per skipped test.
     let nix_check = Command::new("nix").arg("--version").output();
     if nix_check.is_err() {
-        eprintln!(
-            "[nix_flake_structure::mk_guest_eval] skipped — `nix` not on PATH"
-        );
+        eprintln!("[nix_flake_structure::mk_guest_eval] skipped — `nix` not on PATH");
         return;
     }
 

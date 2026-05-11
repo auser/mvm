@@ -12,10 +12,10 @@ use clap::{Args as ClapArgs, Subcommand};
 use std::collections::BTreeMap;
 use std::io::Write;
 
+use mvm_backend::microvm;
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
 use mvm_guest::vsock::{GuestRequest, ProcResult, ProcWaitEvent};
-use mvm_backend::microvm;
 
 use super::Cli;
 use super::shared::clap_vm_name;

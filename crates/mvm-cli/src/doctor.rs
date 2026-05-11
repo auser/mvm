@@ -2,12 +2,12 @@ use anyhow::Result;
 use serde::Serialize;
 
 use crate::ui;
-use mvm_core::config::fc_version;
-use mvm_core::platform::{self, Platform};
-use mvm_core::vm_backend::ClaimStatus;
 use mvm::config::VM_NAME;
 use mvm::shell;
 use mvm_backend::backend::AnyBackend;
+use mvm_core::config::fc_version;
+use mvm_core::platform::{self, Platform};
+use mvm_core::vm_backend::ClaimStatus;
 
 #[derive(Debug, Serialize)]
 struct Check {
@@ -61,7 +61,11 @@ pub fn run(json: bool) -> Result<()> {
     // configured). The W8 direct-launch rewrite will fold the
     // builder-VM probe into a host-only one.
     checks.push(nix_version_check(Some(VM_NAME)));
-    checks.push(check_vm_cmd("firecracker", "tools", "firecracker --version"));
+    checks.push(check_vm_cmd(
+        "firecracker",
+        "tools",
+        "firecracker --version",
+    ));
 
     checks.push(Check {
         name: "fc target",

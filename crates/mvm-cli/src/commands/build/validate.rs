@@ -5,8 +5,8 @@
 use anyhow::Result;
 use clap::Args as ClapArgs;
 
-use mvm_core::user_config::MvmConfig;
 use mvm::shell;
+use mvm_core::user_config::MvmConfig;
 
 use crate::ui;
 

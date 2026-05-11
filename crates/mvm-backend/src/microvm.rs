@@ -1917,7 +1917,8 @@ mod tests {
             if let Err(e) = mvm_base::shell::run_in_vm("kill -9 12345 2>/dev/null || true") {
                 tracing::warn!("failed to kill process: {e}");
             }
-            if let Err(e) = mvm_base::shell::run_in_vm("sudo ip link del tap0 2>/dev/null || true") {
+            if let Err(e) = mvm_base::shell::run_in_vm("sudo ip link del tap0 2>/dev/null || true")
+            {
                 tracing::warn!("failed to destroy TAP: {e}");
             }
             if let Err(e) = mvm_base::shell::run_in_vm("rm -rf /tmp/test-dir") {

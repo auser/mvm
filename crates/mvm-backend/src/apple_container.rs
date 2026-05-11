@@ -301,8 +301,7 @@ fn prepare_instance_rootfs_inner(
             )
         })?;
     }
-    let strategy =
-        mvm_base::cow::clone_rootfs_for_instance(source_path, instance_path)?;
+    let strategy = mvm_base::cow::clone_rootfs_for_instance(source_path, instance_path)?;
     tracing::info!(
         ?strategy,
         source = %source_path.display(),

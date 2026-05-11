@@ -137,7 +137,9 @@ impl VsockTransport for VsockProxyTransport {
 /// `connect()`. This matches the legacy ladder it replaces, which
 /// already did one throwaway probe before the real call.
 pub fn for_vm(vm_name: &str) -> Result<Box<dyn VsockTransport>> {
-    if mvm_providers::apple_container::vsock_connect(vm_name, mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
+    if mvm_providers::apple_container::vsock_connect(vm_name, mvm_guest::vsock::GUEST_AGENT_PORT)
+        .is_ok()
+    {
         return Ok(Box::new(AppleContainerTransport::new(vm_name)));
     }
     let fc = FirecrackerTransport::for_vm(vm_name)

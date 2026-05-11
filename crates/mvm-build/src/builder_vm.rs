@@ -479,9 +479,7 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
         .volume(BUILDER_GUEST_WORK_DIR, |m| {
             m.bind(flake_src.as_path()).readonly()
         })
-        .volume(BUILDER_GUEST_OUT_DIR, |m| {
-            m.bind(artifact_out.as_path())
-        });
+        .volume(BUILDER_GUEST_OUT_DIR, |m| m.bind(artifact_out.as_path()));
     if let Some(store) = host_nix_store.as_ref() {
         builder = builder.volume(BUILDER_GUEST_NIX_DIR, |m| m.bind(store.as_path()));
     }
@@ -506,9 +504,10 @@ nix build {flake_ref}#{attr_path} --no-link --print-out-paths
         attr_path = attr_path,
     );
 
-    let build_out = sandbox.shell(build_script).await.map_err(|e| {
-        BuilderVmError::NixBuildFailed(format!("sandbox.shell(nix build): {e}"))
-    })?;
+    let build_out = sandbox
+        .shell(build_script)
+        .await
+        .map_err(|e| BuilderVmError::NixBuildFailed(format!("sandbox.shell(nix build): {e}")))?;
     if !build_out.status().success {
         let stderr = build_out
             .stderr()
@@ -877,8 +876,13 @@ mod tests {
             host_nix_store: None,
             artifact_out: PathBuf::from("/tmp/mvm-builder-test-out"),
         };
-        let err = b.run_build(&job, &mounts).expect_err("nonexistent flake should err");
-        assert!(matches!(err, BuilderVmError::ExtractionFailed(_)), "got {err:?}");
+        let err = b
+            .run_build(&job, &mounts)
+            .expect_err("nonexistent flake should err");
+        assert!(
+            matches!(err, BuilderVmError::ExtractionFailed(_)),
+            "got {err:?}"
+        );
         assert!(err.to_string().contains("does not exist"), "msg: {err}");
     }
 
@@ -900,8 +904,7 @@ mod tests {
         // Asserting the field names guards against accidental rename.
         let tmp = tempfile::tempdir().expect("tempdir");
         fixture_sidecar().write_to_dir(tmp.path()).expect("write");
-        let body = std::fs::read_to_string(tmp.path().join(SIDECAR_FILENAME))
-            .expect("read raw");
+        let body = std::fs::read_to_string(tmp.path().join(SIDECAR_FILENAME)).expect("read raw");
         assert!(body.contains("\"entrypointKind\""), "got: {body}");
         assert!(body.contains("\"expectedBootMs\""), "got: {body}");
         assert!(body.contains("\"agentBinary\""), "got: {body}");

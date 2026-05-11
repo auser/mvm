@@ -3,9 +3,9 @@
 use anyhow::Result;
 use clap::Args as ClapArgs;
 
+use mvm_backend::backend::AnyBackend;
 use mvm_core::user_config::MvmConfig;
 use mvm_core::vm_backend::VmId;
-use mvm_backend::backend::AnyBackend;
 
 use super::Cli;
 
@@ -27,9 +27,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             let result = backend.stop(&VmId::from(n));
             // Deregister from the name registry (best-effort)
             let registry_path = mvm::vm::name_registry::registry_path();
-            if let Ok(mut registry) =
-                mvm::vm::name_registry::VmNameRegistry::load(&registry_path)
-            {
+            if let Ok(mut registry) = mvm::vm::name_registry::VmNameRegistry::load(&registry_path) {
                 registry.deregister(n);
                 let _ = registry.save(&registry_path);
             }

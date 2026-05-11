@@ -274,10 +274,7 @@ pub(crate) fn reap(abs_dir: &str) -> Result<()> {
 /// `CloudHypervisorBackend::list`. The presence of a `ch.pid`
 /// distinguishes CH-managed VMs from Firecracker's `fc.pid`.
 pub(crate) fn list_ch_vms() -> Result<Vec<String>> {
-    let abs_vms = run_in_vm_stdout(&format!(
-        "echo {}",
-        mvm_base::config::VMS_DIR
-    ))?;
+    let abs_vms = run_in_vm_stdout(&format!("echo {}", mvm_base::config::VMS_DIR))?;
     let abs_vms = abs_vms.trim();
     let listing = run_in_vm_stdout(&format!(
         r#"
@@ -345,7 +342,10 @@ mod tests {
         assert_eq!(parsed["cpus"]["max_vcpus"], 4);
         assert_eq!(parsed["memory"]["size"], 2048u64 * 1024 * 1024);
         assert_eq!(parsed["payload"]["kernel"], "/k/vmlinux");
-        assert_eq!(parsed["payload"]["cmdline"]["args"], "console=ttyS0 root=/dev/vda");
+        assert_eq!(
+            parsed["payload"]["cmdline"]["args"],
+            "console=ttyS0 root=/dev/vda"
+        );
         assert_eq!(parsed["disks"][0]["path"], "/k/rootfs.ext4");
         assert_eq!(parsed["disks"][0]["readonly"], false);
         assert_eq!(parsed["vsock"]["cid"], 3);

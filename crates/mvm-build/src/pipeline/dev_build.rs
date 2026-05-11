@@ -553,8 +553,7 @@ fn dev_build_via_microsandbox(
     // Write into a staging dir, then rename to the hashed
     // location once the build returns.
     let staging = format!("{}/.staging-{}", dev_builds_dir(), std::process::id());
-    std::fs::create_dir_all(&staging)
-        .with_context(|| format!("creating staging dir {staging}"))?;
+    std::fs::create_dir_all(&staging).with_context(|| format!("creating staging dir {staging}"))?;
 
     let mounts = BuilderMounts {
         flake_src,
@@ -581,13 +580,14 @@ fn dev_build_via_microsandbox(
         std::fs::create_dir_all(&final_dir).with_context(|| {
             format!("creating final build dir {final_dir} after rename failure")
         })?;
-        for entry in std::fs::read_dir(&staging)
-            .with_context(|| format!("reading staging dir {staging}"))?
+        for entry in
+            std::fs::read_dir(&staging).with_context(|| format!("reading staging dir {staging}"))?
         {
             let entry = entry?;
             let dst = std::path::Path::new(&final_dir).join(entry.file_name());
-            std::fs::copy(entry.path(), &dst)
-                .with_context(|| format!("copying {} -> {}", entry.path().display(), dst.display()))?;
+            std::fs::copy(entry.path(), &dst).with_context(|| {
+                format!("copying {} -> {}", entry.path().display(), dst.display())
+            })?;
         }
         let _ = std::fs::remove_dir_all(&staging);
         tracing::debug!(error = %e, "rename failed; fell back to copy");
@@ -1411,8 +1411,7 @@ mod tests {
             "",
         );
 
-        let sidecar =
-            crate::builder_vm::ArtifactSidecar::read_from_dir(tmp.path()).expect("read");
+        let sidecar = crate::builder_vm::ArtifactSidecar::read_from_dir(tmp.path()).expect("read");
         assert!(sidecar.is_none());
     }
 
@@ -1431,8 +1430,7 @@ mod tests {
             "",
         );
 
-        let sidecar =
-            crate::builder_vm::ArtifactSidecar::read_from_dir(tmp.path()).expect("read");
+        let sidecar = crate::builder_vm::ArtifactSidecar::read_from_dir(tmp.path()).expect("read");
         assert!(sidecar.is_none());
     }
 
@@ -1462,7 +1460,10 @@ mod tests {
         // must not inject the dev sibling-flake override.
         let env = TestEnv::new();
         let flags = dev_override_flags(&env, BuildMode::Prod);
-        assert!(flags.is_empty(), "Prod must produce no override; got: {flags:?}");
+        assert!(
+            flags.is_empty(),
+            "Prod must produce no override; got: {flags:?}"
+        );
     }
 
     #[test]

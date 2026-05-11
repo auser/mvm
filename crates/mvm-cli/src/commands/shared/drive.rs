@@ -7,9 +7,7 @@ use mvm_backend::microvm;
 
 /// Convert port mappings into a `DriveFile` for the config drive.
 /// Writes `export MVM_PORT_MAP="3333:3000,3334:3002"`.
-pub fn ports_to_drive_file(
-    ports: &[mvm::config::PortMapping],
-) -> Option<microvm::DriveFile> {
+pub fn ports_to_drive_file(ports: &[mvm::config::PortMapping]) -> Option<microvm::DriveFile> {
     if ports.is_empty() {
         return None;
     }

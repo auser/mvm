@@ -96,21 +96,18 @@ pub(super) fn cmd_dev_linux_native_status() -> Result<()> {
 
     ui::status_header();
     ui::status_line("Platform:", "Linux + KVM");
-    ui::status_line(
-        "/dev/kvm:",
-        if has_kvm { "present" } else { "Not present" },
-    );
+    ui::status_line("/dev/kvm:", if has_kvm { "present" } else { "Not present" });
     ui::status_line(
         "Firecracker:",
-        if fc_installed { "Running" } else { "Not running" },
+        if fc_installed {
+            "Running"
+        } else {
+            "Not running"
+        },
     );
     ui::status_line(
         "Kernel+rootfs:",
-        if has_assets {
-            "Running"
-        } else {
-            "Not present"
-        },
+        if has_assets { "Running" } else { "Not present" },
     );
 
     if !has_kvm {

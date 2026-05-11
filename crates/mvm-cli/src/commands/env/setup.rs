@@ -12,11 +12,7 @@ use mvm::config;
 use mvm::shell;
 use mvm_backend::firecracker;
 
-pub(super) fn run_setup_steps(
-    force: bool,
-    _builder_cpus: u32,
-    _builder_mem: u32,
-) -> Result<()> {
+pub(super) fn run_setup_steps(force: bool, _builder_cpus: u32, _builder_mem: u32) -> Result<()> {
     // Plan-60 / ADR-013 dropped Lima; what remains here is the
     // Firecracker asset pipeline (kernel + rootfs + security
     // baseline). The builder-VM sizing args are kept on the

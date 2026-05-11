@@ -1,7 +1,7 @@
 use anyhow::Result;
 use mvm_core::vm_backend::{
-    BackendSecurityProfile, ClaimStatus, LayerCoverage, StartMode, VmBackend, VmCapabilities,
-    VmId, VmInfo, VmStartConfig, VmStatus,
+    BackendSecurityProfile, ClaimStatus, LayerCoverage, StartMode, VmBackend, VmCapabilities, VmId,
+    VmInfo, VmStartConfig, VmStatus,
 };
 
 // W8: every backend variant + the FC support modules live in this
@@ -118,11 +118,7 @@ impl VmBackend for FirecrackerBackend {
         // (build pipeline bug); a missing sidecar defaults to
         // accessible=true.
         let rootfs = std::path::Path::new(&config.rootfs_path);
-        mvm_base::runtime_meta::record_from_rootfs(
-            &config.name,
-            StartMode::Detached,
-            rootfs,
-        )?;
+        mvm_base::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
         microvm::run_from_build(&fc_config.run_config)?;
         Ok(VmId(fc_config.run_config.name.clone()))
     }
@@ -255,8 +251,9 @@ impl AnyBackend {
             "docker" => Self::Docker(DockerBackend),
             "libkrun" | "krun" => Self::Libkrun(LibkrunBackend),
             "microsandbox" | "msb" => Self::Microsandbox(MicrosandboxBackend),
-            "cloud-hypervisor" | "cloud_hypervisor" | "ch" | "clh" =>
-                Self::CloudHypervisor(CloudHypervisorBackend),
+            "cloud-hypervisor" | "cloud_hypervisor" | "ch" | "clh" => {
+                Self::CloudHypervisor(CloudHypervisorBackend)
+            }
             "qemu" => Self::MicrovmNix(MicrovmNixBackend),
             _ => Self::Firecracker(FirecrackerBackend),
         }

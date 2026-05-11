@@ -36,8 +36,8 @@
 //! fails with a microsandbox-tagged error (also green for this
 //! smoke — we just need proof we made it past our own boundary).
 
-use mvmctl::core::vm_backend::VmId;
 use mvmctl::backend::microsandbox::MicrosandboxBackend;
+use mvmctl::core::vm_backend::VmId;
 
 const SMOKE_GATE: &str = "MVM_LIVE_SMOKE";
 

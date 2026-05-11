@@ -121,11 +121,7 @@ impl VmBackend for CloudHypervisorBackend {
         // backends. Records `accessible` from the sidecar so
         // `mvmctl console` enforces the gate consistently.
         let rootfs = std::path::Path::new(&config.rootfs_path);
-        mvm_base::runtime_meta::record_from_rootfs(
-            &config.name,
-            StartMode::Detached,
-            rootfs,
-        )?;
+        mvm_base::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
 
         // Spawn the daemon. Waits for the API socket.
         ch_runtime::start_ch_daemon(&abs_dir, &api_socket)?;
@@ -138,7 +134,11 @@ impl VmBackend for CloudHypervisorBackend {
             initrd_path: config.initrd_path.as_deref(),
             cmdline: Some(DEFAULT_CMDLINE),
             cpus: config.cpus.max(1),
-            memory_mib: if config.memory_mib == 0 { 256 } else { config.memory_mib },
+            memory_mib: if config.memory_mib == 0 {
+                256
+            } else {
+                config.memory_mib
+            },
             vsock_cid: 3,
             vsock_socket_path: vsock_socket,
         };
