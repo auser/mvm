@@ -20,6 +20,12 @@ async-trait = "0.1"
 base64.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
+# Plan 60 Phase 3 Slice B — L4 egress policy CIDR matching.
+ipnet.workspace = true
+# Plan 60 Phase 3 Slice B — pure-Rust DNS resolver, alternative to
+# the host libc's `getaddrinfo`. Opt-in; `TokioDnsResolver` stays the
+# default until consumers explicitly switch.
+hickory-resolver = { workspace = true, features = ["tokio-runtime"] }
 # `rand` in main deps (not dev-only): the TTL reaper (G6 of the parity
 # plan, "TTL reaper precision as side channel") applies ±10 s jitter
 # to its tick interval via a `Rng` so observers can't use TTL expiry

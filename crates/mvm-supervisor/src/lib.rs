@@ -39,6 +39,7 @@ pub mod backend;
 pub mod circuit_breaker;
 pub mod destination;
 pub mod egress;
+pub mod hickory_dns;
 pub mod injection_guard;
 pub mod inspector;
 pub mod instance_sampler;
@@ -46,6 +47,7 @@ pub mod keystore;
 pub mod l7_proxy;
 pub mod pii_redactor;
 pub mod policy_tool_gate;
+pub mod proxy;
 pub mod reaper;
 pub mod secrets_scanner;
 pub mod ssrf_guard;
@@ -64,6 +66,7 @@ pub use circuit_breaker::{
 };
 pub use destination::DestinationPolicy;
 pub use egress::{EgressDecision, EgressError, EgressProxy, NoopEgressProxy};
+pub use hickory_dns::HickoryDnsResolver;
 pub use injection_guard::{InjectionGuard, InjectionRule, RuleFamily};
 pub use inspector::{Inspector, InspectorChain, InspectorVerdict, RequestCtx};
 pub use instance_sampler::{OsSources, Sample, SampleTarget, Sources, sample_once};
@@ -77,6 +80,10 @@ pub use pii_redactor::{PiiRedactor, PiiRule, PiiValidator};
 pub use policy_tool_gate::{
     CapturingToolAuditSink, NoopToolAuditSink, PolicyToolGate, ToolAuditError, ToolAuditFields,
     ToolAuditSink, ToolOutcome,
+};
+pub use proxy::l4::{
+    L4Decision, L4Error, L4Gate, L4Policy, L4Rule, L4SpecError, LiveL4Gate, NoopL4Gate,
+    Protocol as L4Protocol,
 };
 pub use reaper::{
     DEFAULT_INTERVAL as REAPER_DEFAULT_INTERVAL, DEFAULT_JITTER as REAPER_DEFAULT_JITTER,

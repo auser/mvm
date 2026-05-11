@@ -71,8 +71,9 @@ use std::sync::Arc;
 use mvm_plan::{ExecutionPlan, FsPolicyRef, PolicyRef};
 use mvm_supervisor::{
     ArtifactCollector, DestinationPolicy, EgressProxy, InspectorChain, KeystoreReleaser,
-    L7EgressProxy, NoopArtifactCollector, NoopEgressAuditSink, NoopEgressProxy,
-    NoopKeystoreReleaser, NoopToolGate, PolicyToolGate, TokioDnsResolver, ToolGate,
+    L4Gate, L4SpecError, L7EgressProxy, LiveL4Gate, NoopArtifactCollector, NoopEgressAuditSink,
+    NoopEgressProxy, NoopKeystoreReleaser, NoopL4Gate, NoopToolGate, PolicyToolGate,
+    TokioDnsResolver, ToolGate,
 };
 
 /// The fixed identifier for the local-dev policy bundle. Any
@@ -83,17 +84,19 @@ use mvm_supervisor::{
 pub const LOCAL_DEFAULT: &str = "local-default";
 
 /// Trait-object bundle the supervisor consumes via its
-/// `with_egress` / `with_tool_gate` / `with_keystore` /
-/// `with_artifact_collector` builder calls.
+/// `with_l4_gate` / `with_egress` / `with_tool_gate` / `with_keystore`
+/// / `with_artifact_collector` builder calls.
 ///
 /// Each field is a `Box<dyn Trait>` so the resolver can return
 /// either a Noop (when the plan's refs are `"local-default"`) or
 /// a live impl (when a `<tenant>:<workload>` bundle parses) without
 /// leaking the concrete type to callers. Slice A (2026-05-11)
 /// flipped `egress` and `tool_gate` from Noop to live for parsed
-/// bundles; `keystore` and `artifacts` stay Noop until the
+/// bundles; Slice B (2026-05-11) adds the `network` slot for L4
+/// flow gating; `keystore` and `artifacts` stay Noop until the
 /// supervisor lift in mvm-hostd.
 pub struct ResolvedSlots {
+    pub network: Box<dyn L4Gate>,
     pub egress: Box<dyn EgressProxy>,
     pub tool_gate: Box<dyn ToolGate>,
     pub keystore: Box<dyn KeystoreReleaser>,
@@ -142,6 +145,17 @@ pub enum ResolveError {
         value: String,
         expected: &'static str,
     },
+
+    /// A bundle parsed but its `[[network.l4]]` rows failed to
+    /// translate into a live `LiveL4Gate` — unparseable CIDR,
+    /// unknown protocol, or inverted port range. The detail carries
+    /// the underlying `L4SpecError` so the operator knows which row
+    /// (by zero-based index) to fix. Plan 60 Phase 3 Slice B.
+    L4SpecInvalid {
+        value: String,
+        path: PathBuf,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -183,6 +197,15 @@ impl std::fmt::Display for ResolveError {
             } => write!(
                 f,
                 "policy ref {field} = {value:?} is not recognized (expected {expected})"
+            ),
+            Self::L4SpecInvalid {
+                value,
+                path,
+                detail,
+            } => write!(
+                f,
+                "policy bundle {value:?} (from {}) has an invalid [[network.l4]] row: {detail}",
+                path.display()
             ),
         }
     }
@@ -296,7 +319,8 @@ pub fn resolve_supervisor_components_with_dir(
         RefShape::LocalDefault => Ok(noop_slots()),
         RefShape::TenantWorkload { tenant, workload } => {
             let bundle = load_tenant_workload(base_dir, network, tenant, workload)?;
-            Ok(slots_from_bundle(&bundle))
+            let bundle_path = mvm_policy::toml_loader::bundle_path(base_dir, tenant, workload);
+            slots_from_bundle(&bundle, network, &bundle_path)
         }
         // classify_plan_refs already converts Unrecognized into a
         // typed error; this branch is dead but keeps the match
@@ -307,6 +331,7 @@ pub fn resolve_supervisor_components_with_dir(
 
 fn noop_slots() -> ResolvedSlots {
     ResolvedSlots {
+        network: Box::new(NoopL4Gate),
         egress: Box::new(NoopEgressProxy),
         tool_gate: Box::new(NoopToolGate),
         keystore: Box::new(NoopKeystoreReleaser),
@@ -315,10 +340,33 @@ fn noop_slots() -> ResolvedSlots {
 }
 
 /// Slice A — turn a parsed `PolicyBundle` into live supervisor
-/// component slots. Egress + tool-gate ship as real
-/// `L7EgressProxy` + `PolicyToolGate`; keystore + artifacts stay
-/// Noop until the mvm-hostd supervisor lift.
-fn slots_from_bundle(bundle: &mvm_policy::PolicyBundle) -> ResolvedSlots {
+/// component slots. Egress + tool-gate ship as real `L7EgressProxy`
+/// plus `PolicyToolGate`. Slice B adds the `network` slot constructed
+/// from `bundle.network.l4` rows via `LiveL4Gate::from_specs`.
+/// Keystore + artifacts stay Noop until the mvm-hostd supervisor lift.
+///
+/// Fallible because a bundle that parses through TOML can still
+/// carry an invalid `[[network.l4]]` row (unparseable CIDR,
+/// unknown proto, inverted port range). The error path surfaces
+/// `ResolveError::L4SpecInvalid` with the underlying detail so the
+/// operator knows which row to fix.
+fn slots_from_bundle(
+    bundle: &mvm_policy::PolicyBundle,
+    ref_value: &str,
+    path: &std::path::Path,
+) -> Result<ResolvedSlots, ResolveError> {
+    // L4 gate: translate `[[network.l4]]` rows into a `LiveL4Gate`.
+    // The empty-rows case yields a default-deny gate (matches
+    // ADR-002's fail-closed posture); explicit rows are the only way
+    // to permit outbound flows.
+    let l4 = LiveL4Gate::from_specs(&bundle.network.l4).map_err(|e: L4SpecError| {
+        ResolveError::L4SpecInvalid {
+            value: ref_value.to_string(),
+            path: path.to_path_buf(),
+            detail: e.to_string(),
+        }
+    })?;
+
     // L7 inspector chain: DestinationPolicy is the gating
     // inspector; SSRF / secrets / injection / PII layer on with
     // their own constructors in a future workstream. For Slice A
@@ -341,12 +389,13 @@ fn slots_from_bundle(bundle: &mvm_policy::PolicyBundle) -> ResolvedSlots {
         bundle.egress.allow_plain_http,
     );
     let tool_gate = PolicyToolGate::from_policy(&bundle.tool);
-    ResolvedSlots {
+    Ok(ResolvedSlots {
+        network: Box::new(l4),
         egress: Box::new(l7),
         tool_gate: Box::new(tool_gate),
         keystore: Box::new(NoopKeystoreReleaser),
         artifacts: Box::new(NoopArtifactCollector),
-    }
+    })
 }
 
 fn load_tenant_workload(
@@ -465,6 +514,20 @@ mod tests {
             .build()
             .unwrap();
         rt.block_on(async {
+            let net_err = slots
+                .network
+                .evaluate(
+                    mvm_supervisor::L4Protocol::Tcp,
+                    "1.1.1.1".parse().unwrap(),
+                    443,
+                )
+                .await
+                .expect_err("Noop L4 gate must error");
+            assert!(
+                matches!(net_err, mvm_supervisor::L4Error::NotWired),
+                "unexpected L4 err: {net_err:?}"
+            );
+
             let egress_err = slots
                 .egress
                 .inspect("example.com", "/")
@@ -577,12 +640,14 @@ mod tests {
         // `Supervisor::with_egress(self, Box<dyn EgressProxy>)` lift
         // is just a `.with_egress(slots.egress)` call away — no
         // adapter layer needed.
+        fn take_network(_: Box<dyn L4Gate>) {}
         fn take_egress(_: Box<dyn EgressProxy>) {}
         fn take_tool_gate(_: Box<dyn ToolGate>) {}
         fn take_keystore(_: Box<dyn KeystoreReleaser>) {}
         fn take_artifacts(_: Box<dyn ArtifactCollector>) {}
 
         let slots = resolve_supervisor_components(&fixture_plan()).unwrap();
+        take_network(slots.network);
         take_egress(slots.egress);
         take_tool_gate(slots.tool_gate);
         take_keystore(slots.keystore);
@@ -818,5 +883,197 @@ allowed = ["{name}"]
                 "unexpected artifact err: {art_err:?}"
             );
         });
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Plan 60 Phase 3 Slice B — live L4Gate from [[network.l4]] rows
+    //
+    // After Slice B, a parsed `<tenant>:<workload>` bundle yields a
+    // live `LiveL4Gate` in `slots.network` constructed from the
+    // bundle's `[[network.l4]]` rows. Empty rows = default-deny;
+    // non-empty rows allow the listed flows.
+    // ──────────────────────────────────────────────────────────────
+
+    fn fixture_bundle_with_l4_rule(proto: &str, cidr: &str, port: u16) -> String {
+        format!(
+            r#"
+schema_version = 1
+bundle_id      = "acme/net"
+bundle_version = 1
+
+[network]
+preset = "tenant-isolated"
+
+[[network.l4]]
+proto    = "{proto}"
+dst_cidr = "{cidr}"
+port_lo  = {port}
+port_hi  = {port}
+
+[egress]
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+"#,
+        )
+    }
+
+    #[test]
+    fn slice_b_returns_live_l4_gate_for_parsed_bundle() {
+        // A parsed bundle's `[[network.l4]]` row yields a live
+        // L4Gate — on-rule flow returns Allow, off-rule flow returns
+        // Deny. The `NotWired` error is what a NoopL4Gate would emit
+        // and proves Slice B's wiring is in place when absent.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_l4_rule("tcp", "10.0.0.0/24", 443),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("expected live slots, got {e}"));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // On-rule flow: TCP -> 10.0.0.5:443 is permitted.
+            let allow = slots
+                .network
+                .evaluate(
+                    mvm_supervisor::L4Protocol::Tcp,
+                    "10.0.0.5".parse().unwrap(),
+                    443,
+                )
+                .await
+                .expect("L4Gate must not return NotWired post-Slice-B");
+            assert_eq!(allow, mvm_supervisor::L4Decision::Allow);
+
+            // Off-rule flow: same host, different port → Deny.
+            let deny = slots
+                .network
+                .evaluate(
+                    mvm_supervisor::L4Protocol::Tcp,
+                    "10.0.0.5".parse().unwrap(),
+                    22,
+                )
+                .await
+                .expect("policy lookup itself must succeed");
+            assert!(
+                matches!(deny, mvm_supervisor::L4Decision::Deny { .. }),
+                "off-rule flow should produce Deny, got {deny:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn slice_b_empty_l4_section_yields_default_deny_gate() {
+        // A bundle without any `[[network.l4]]` rows still produces a
+        // live (non-Noop) gate — but every evaluate call returns
+        // Deny. This pins the fail-closed posture: an operator who
+        // forgets to author L4 rows can't accidentally bypass the
+        // gate; they get explicit default-deny.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_tool_allow("web_search"),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("expected live slots, got {e}"));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let d = slots
+                .network
+                .evaluate(
+                    mvm_supervisor::L4Protocol::Tcp,
+                    "8.8.8.8".parse().unwrap(),
+                    443,
+                )
+                .await
+                .expect("LiveL4Gate must not return NotWired even for empty policy");
+            assert!(
+                matches!(d, mvm_supervisor::L4Decision::Deny { .. }),
+                "empty L4 policy must default-deny, got {d:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn slice_b_refuses_bundle_with_invalid_l4_cidr() {
+        // A bundle that parses through TOML but carries an
+        // unparseable `dst_cidr` triggers L4SpecInvalid at translate
+        // time. The error names the path so operators can fix the
+        // file before re-running.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_l4_rule("tcp", "not-a-cidr", 443),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let err = match resolve_supervisor_components_with_dir(&plan, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("bad CIDR must be refused"),
+        };
+        match err {
+            ResolveError::L4SpecInvalid {
+                value,
+                path,
+                detail,
+            } => {
+                assert_eq!(value, "acme:web-worker");
+                let s = path.to_string_lossy();
+                assert!(s.contains("acme"), "path missing tenant: {s}");
+                assert!(s.contains("web-worker.toml"), "path missing workload: {s}");
+                assert!(detail.contains("not-a-cidr"), "detail missing cidr: {detail}");
+            }
+            other => panic!("expected L4SpecInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slice_b_refuses_bundle_with_unknown_l4_protocol() {
+        // Same gate, different translate-time failure mode — proto
+        // outside {"tcp", "udp"} fails loudly rather than silently
+        // skipping the row.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_l4_rule("icmp", "10.0.0.0/24", 0),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let err = match resolve_supervisor_components_with_dir(&plan, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("unknown proto must be refused"),
+        };
+        match err {
+            ResolveError::L4SpecInvalid { detail, .. } => {
+                assert!(detail.contains("icmp"), "detail missing proto: {detail}");
+            }
+            other => panic!("expected L4SpecInvalid, got {other:?}"),
+        }
     }
 }

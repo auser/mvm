@@ -1733,6 +1733,20 @@ work, not mvm's.
 **Risk**: macOS Keychain ↔ Linux Secret Service ↔ Windows Cred Mgr UX divergence. The `Keystore` trait abstracts this; cross-OS smoke tests gated per platform.
 
 ### Phase 3 — Network isolation: L4 + L7 proxies, firewall, vsock control, default-deny + policy gate (~10-14 days)
+
+**Status (2026-05-11)**: Slice A (live L7EgressProxy from policy
+bundles) shipped in bce44e9; Slice B (L4 policy substrate +
+`L4Gate` trait + `LiveL4Gate::from_specs` + W5 resolver wiring
+through `slots.network`) shipped 2026-05-11. The `HickoryDnsResolver`
+alternative to `TokioDnsResolver` ships under Slice B as well — an
+opt-in `DnsResolver` impl for operators who want DoT/DoH upstreams
+or a per-tenant resolver decoupled from `/etc/resolv.conf`. **Slice
+C remains outstanding**: the smoltcp/TUN userspace-TCP consumer
+that turns an `L4Gate::evaluate` decision into accept/drop on a
+per-VM TAP, the host firewall (nft/pf/wfp) additive layer, the
+DNS server endpoint guest VMs point `/etc/resolv.conf` at, and the
+per-tenant netns lift sequenced with mvm-hostd.
+
 **Goal**: A runtime VM cannot reach any external host unless its tenant policy explicitly allows it (per-protocol, per-port, per-CIDR or per-SNI). The builder VM is the one exception, gated by mvmd-signed policy. `mvmctl audit tail --vm <name>` shows every flow attempt.
 
 **Action**:

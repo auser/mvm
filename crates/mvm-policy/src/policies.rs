@@ -19,15 +19,66 @@
 
 use serde::{Deserialize, Serialize};
 
-/// Network policy. Wave 4 introduces per-tenant netns + bridge
-/// allocation. Today: name-only stub matching the existing
-/// `mvm-core::policy::network_policy` shape.
+/// Network policy. Plan 60 Phase 3 Slice B fills `l4` — the L4
+/// allow-list the supervisor's `L4Gate` consults at flow-establishment
+/// time. `preset` is the Wave-1 stub kept for forward compat with the
+/// `mvm-core::policy::network_policy` shape that older bundles may
+/// still carry.
+///
+/// `l4` is `#[serde(default)]` so bundles authored before Slice B
+/// (no `[[network.l4]]` rows) continue to parse — they evaluate as
+/// **default-deny** at the gate, matching ADR-002's fail-closed
+/// posture. To allow outbound traffic, add explicit rows.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct NetworkPolicy {
     /// Name of the network preset
     /// (`open` / `agent` / `tenant-isolated` / etc.). Stub.
     pub preset: Option<String>,
+    /// L4 allow-list (`proto`, `dst_cidr`, port range) evaluated by
+    /// the supervisor's `L4Gate` at flow-establishment time. Empty =
+    /// default-deny. Plan 60 Phase 3 Slice B.
+    #[serde(default)]
+    pub l4: Vec<L4RuleSpec>,
+}
+
+/// Wire-format L4 rule row inside `[[network.l4]]`. The supervisor's
+/// `LiveL4Gate::from_specs` parses `dst_cidr` via `ipnet::IpNet` and
+/// folds the rows into a concrete `mvm_supervisor::L4Policy`; this
+/// crate stays free of `ipnet` so the policy schema doesn't take a
+/// hard dep on the address-family crate.
+///
+/// Example TOML:
+///
+/// ```toml
+/// [[network.l4]]
+/// proto    = "tcp"
+/// dst_cidr = "10.0.0.0/24"
+/// port_lo  = 443
+/// port_hi  = 443
+///
+/// [[network.l4]]
+/// proto    = "udp"
+/// dst_cidr = "8.8.8.8/32"
+/// port_lo  = 0
+/// port_hi  = 0   # any-port wildcard
+/// ```
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct L4RuleSpec {
+    /// `"tcp"` or `"udp"`. The supervisor's `LiveL4Gate::from_specs`
+    /// refuses unknown protocols at translate time (loud failure at
+    /// admission, not silent drop at runtime).
+    pub proto: String,
+    /// Destination CIDR — parsed by `ipnet::IpNet`; both v4 and v6
+    /// supported. The supervisor refuses unparseable CIDRs at
+    /// translate time.
+    pub dst_cidr: String,
+    /// Inclusive low bound of the destination port range.
+    pub port_lo: u16,
+    /// Inclusive high bound. `port_lo == 0 && port_hi == 0` is the
+    /// "any port for this (proto, cidr)" wildcard.
+    pub port_hi: u16,
 }
 
 /// L7 egress policy. Plan 37 §15 differentiator. Wave 2.6 fills the

@@ -154,6 +154,7 @@ mod tests {
             bundle_version: 1,
             network: NetworkPolicy {
                 preset: Some("base-net".to_string()),
+                ..NetworkPolicy::default()
             },
             egress: EgressPolicy {
                 mode: Some("base-egress".to_string()),

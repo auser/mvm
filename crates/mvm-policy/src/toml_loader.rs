@@ -235,6 +235,95 @@ stream_destinations = ["file:///var/log/mvm/audit.jsonl"]
     }
 
     #[test]
+    fn parse_bundle_round_trips_l4_rules() {
+        // Plan 60 Phase 3 Slice B — `[[network.l4]]` rows attach an
+        // allow-list to the bundle. The supervisor's L4Gate consumes
+        // these at flow-establishment time; here we just prove the
+        // schema accepts the rows and surfaces them on `bundle.network`.
+        let text = format!(
+            r#"
+schema_version = {SCHEMA_VERSION}
+bundle_id      = "acme/net"
+bundle_version = 1
+
+[network]
+preset = "tenant-isolated"
+
+[[network.l4]]
+proto    = "tcp"
+dst_cidr = "10.0.0.0/24"
+port_lo  = 443
+port_hi  = 443
+
+[[network.l4]]
+proto    = "udp"
+dst_cidr = "8.8.8.8/32"
+port_lo  = 0
+port_hi  = 0
+
+[egress]
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+"#,
+        );
+        let bundle = parse_bundle(&text).unwrap();
+        assert_eq!(bundle.network.l4.len(), 2);
+        assert_eq!(bundle.network.l4[0].proto, "tcp");
+        assert_eq!(bundle.network.l4[0].dst_cidr, "10.0.0.0/24");
+        assert_eq!(bundle.network.l4[0].port_lo, 443);
+        assert_eq!(bundle.network.l4[0].port_hi, 443);
+        assert_eq!(bundle.network.l4[1].proto, "udp");
+        assert_eq!(bundle.network.l4[1].port_lo, 0);
+        assert_eq!(bundle.network.l4[1].port_hi, 0);
+    }
+
+    #[test]
+    fn parse_bundle_treats_missing_l4_section_as_empty() {
+        // `#[serde(default)]` on `NetworkPolicy::l4` means bundles
+        // authored before Slice B continue to parse — they evaluate
+        // as default-deny at the gate.
+        let bundle = parse_bundle(&minimal_bundle_toml()).unwrap();
+        assert!(
+            bundle.network.l4.is_empty(),
+            "empty bundle should deserialize l4 as empty vec"
+        );
+    }
+
+    #[test]
+    fn parse_bundle_rejects_unknown_field_inside_l4_row() {
+        // L4RuleSpec has deny_unknown_fields — a typo in a row's
+        // fields fails loud rather than silently dropping the rule.
+        let text = format!(
+            r#"
+schema_version = {SCHEMA_VERSION}
+bundle_id      = "acme/net"
+bundle_version = 1
+
+[network]
+
+[[network.l4]]
+proto    = "tcp"
+dst_cidr = "10.0.0.0/24"
+port_lo  = 443
+port_hi  = 443
+typo     = "oops"
+
+[egress]
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+"#,
+        );
+        let err = parse_bundle(&text).unwrap_err();
+        assert!(matches!(err, LoadError::Parse { .. }));
+    }
+
+    #[test]
     fn parse_bundle_rejects_schema_version_mismatch() {
         let text = r#"
 schema_version = 999

@@ -96,6 +96,7 @@ mod tests {
             bundle_version: 1,
             network: NetworkPolicy {
                 preset: Some("agent".to_string()),
+                ..NetworkPolicy::default()
             },
             egress: EgressPolicy {
                 mode: Some("l3_plus_l7".to_string()),
