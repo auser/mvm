@@ -9,6 +9,38 @@ pub const HOSTD_SOCKET_PATH: &str = "/run/mvm/hostd.sock";
 /// Maximum frame size for hostd IPC (1 MiB).
 const MAX_FRAME_SIZE: usize = 1024 * 1024;
 
+/// Wire-protocol version for hostd IPC (mvmd ↔ mvm-hostd Unix-socket
+/// control channel). Plan 60 Phase 8.
+///
+/// **Bump policy.** Increment when ANY of the following change in a
+/// way that's not backward-compatible with a peer at the previous
+/// version:
+///
+/// - A new `HostdRequest` or `HostdResponse` variant is added that
+///   older peers can't downgrade or ignore gracefully (most variant
+///   additions are forward-compat because serde rejects unknown
+///   variants on the receive side — so adding usually requires a
+///   bump unless deliberately gated by feature negotiation).
+/// - A field is added to an existing variant in a position that
+///   shifts wire layout (serde JSON is name-keyed so this is rare).
+/// - A field's semantic meaning changes (same name, different
+///   semantics — e.g., `timeout_secs` previously meant total but
+///   now means per-attempt).
+/// - The frame encoding shifts (e.g., switching from
+///   length-prefixed JSON to CBOR).
+///
+/// **Don't bump for:** new fields with `#[serde(default)]`, new
+/// variants that older clients refuse cleanly with a typed error,
+/// or comments / docstrings / internal helpers.
+///
+/// The mvmd repo's `tests/mvmd_compat.rs` pins this against
+/// frozen-byte fixtures for `AgentRequest::Reconcile`,
+/// `HostdRequest::Start`, and `HostdResponse::Started`, so a PR
+/// that shifts the wire format without bumping this constant fails
+/// CI on the mvmd side. The fixtures live next to the test;
+/// regenerate them in the same commit that bumps the version.
+pub const PROTOCOL_VERSION: u32 = 1;
+
 // ============================================================================
 // Request/Response types
 // ============================================================================
@@ -161,6 +193,28 @@ pub async fn recv_response<R: tokio::io::AsyncReadExt + Unpin>(
 mod tests {
     use super::*;
     use crate::tenant::TenantNet;
+
+    /// Plan 60 Phase 8 — pin the protocol version constant. mvmd's
+    /// `tests/mvmd_compat.rs` reads `PROTOCOL_VERSION` and compares
+    /// against its own frozen-byte fixtures; if this binary
+    /// disagrees with the mvmd snapshot, the fixture-set has
+    /// drifted and one side needs a refresh. Locking the value
+    /// here means a PR can't silently bump the const without also
+    /// updating this test (and prompting the fixture re-gen).
+    #[test]
+    fn protocol_version_is_one() {
+        assert_eq!(PROTOCOL_VERSION, 1);
+    }
+
+    #[test]
+    fn protocol_version_is_u32() {
+        // Compile-check the declared type. mvmd's wire-format test
+        // serialises `PROTOCOL_VERSION` as a 4-byte little-endian
+        // value; if this ever became u8 or u64, mvmd's pin would
+        // break in a confusing way. Pin the type here so the
+        // breakage is obvious.
+        let _: u32 = PROTOCOL_VERSION;
+    }
 
     #[test]
     fn test_hostd_request_start_roundtrip() {
