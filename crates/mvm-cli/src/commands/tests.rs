@@ -918,30 +918,94 @@ fn test_uninstall_all_flag_parses() {
 #[test]
 fn test_audit_tail_parses() {
     let cli = Cli::try_parse_from(["mvmctl", "audit", "tail"]).unwrap();
-    assert!(matches!(
-        cli.command,
+    match cli.command {
         Commands::Audit(audit::Args {
-            action: AuditAction::Tail {
-                lines: 20,
-                follow: false,
-            }
-        })
-    ));
+            action:
+                AuditAction::Tail {
+                    lines,
+                    follow,
+                    chain,
+                    tenant,
+                },
+        }) => {
+            assert_eq!(lines, 20);
+            assert!(!follow);
+            assert!(!chain, "tail defaults to legacy LocalAudit");
+            assert_eq!(tenant, "local");
+        }
+        _ => panic!("Expected Audit::Tail"),
+    }
 }
 
 #[test]
 fn test_audit_tail_follow_parses() {
     let cli =
         Cli::try_parse_from(["mvmctl", "audit", "tail", "--follow", "--lines", "50"]).unwrap();
-    assert!(matches!(
-        cli.command,
+    match cli.command {
         Commands::Audit(audit::Args {
-            action: AuditAction::Tail {
-                lines: 50,
-                follow: true,
-            }
-        })
-    ));
+            action:
+                AuditAction::Tail {
+                    lines,
+                    follow,
+                    chain: _,
+                    tenant: _,
+                },
+        }) => {
+            assert_eq!(lines, 50);
+            assert!(follow);
+        }
+        _ => panic!("Expected Audit::Tail"),
+    }
+}
+
+#[test]
+fn test_audit_tail_chain_flag_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "audit", "tail", "--chain"]).unwrap();
+    match cli.command {
+        Commands::Audit(audit::Args {
+            action: AuditAction::Tail { chain, tenant, .. },
+        }) => {
+            assert!(chain);
+            assert_eq!(tenant, "local");
+        }
+        _ => panic!("Expected Audit::Tail with --chain"),
+    }
+}
+
+#[test]
+fn test_audit_verify_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "audit", "verify"]).unwrap();
+    match cli.command {
+        Commands::Audit(audit::Args {
+            action: AuditAction::Verify { tenant },
+        }) => assert_eq!(tenant, "local"),
+        _ => panic!("Expected Audit::Verify"),
+    }
+}
+
+#[test]
+fn test_audit_verify_with_tenant() {
+    let cli = Cli::try_parse_from(["mvmctl", "audit", "verify", "--tenant", "acme"]).unwrap();
+    match cli.command {
+        Commands::Audit(audit::Args {
+            action: AuditAction::Verify { tenant },
+        }) => assert_eq!(tenant, "acme"),
+        _ => panic!("Expected Audit::Verify"),
+    }
+}
+
+#[test]
+fn test_audit_show_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "audit", "show", "plan-abc"]).unwrap();
+    match cli.command {
+        Commands::Audit(audit::Args {
+            action: AuditAction::Show { plan_id, tenant },
+        }) => {
+            assert_eq!(plan_id, "plan-abc");
+            assert_eq!(tenant, "local");
+        }
+        _ => panic!("Expected Audit::Show"),
+    }
 }
 
 #[test]

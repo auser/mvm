@@ -14,7 +14,9 @@ use mvm_core::vm_backend::VmId;
 
 use super::super::env::apple_container::ensure_default_microvm_image;
 use super::Cli;
+use super::audit_chain::AuditEmitter;
 use super::forward::forward_ports;
+use super::host_signer::load_or_init_at;
 use super::plan_admission::{AdmittedPlan, InMemoryNonceLedger, SystemClock, admit_for_run};
 use super::plan_builder::SynthesisInput;
 use super::shared::{
@@ -26,8 +28,8 @@ use super::shared::{
 
 /// Inputs for [`admit_plan_for_boot`]. Grouped so the helper avoids
 /// the workspace `clippy::too_many_arguments = "deny"` ceiling and so
-/// future callers (W4 audit, W5 policy slots) can extend the shape
-/// without churning every call site.
+/// future callers (W5 policy slots) can extend the shape without
+/// churning every call site.
 struct AdmitPlanForBootParams<'a> {
     pub tenant: &'a str,
     pub vm_name: &'a str,
@@ -41,6 +43,37 @@ struct AdmitPlanForBootParams<'a> {
     /// pass `None`, which resolves to `~/.mvm/keys/`; tests pass a
     /// tempdir so they don't write into the real user's home.
     pub keys_dir: Option<&'a std::path::Path>,
+    /// Override for the audit-chain directory (`~/.mvm/audit/`).
+    /// Tests inject a tempdir; production passes `None`.
+    pub audit_dir: Option<&'a std::path::Path>,
+}
+
+/// Bundle of artifacts produced by a successful admission: the
+/// admitted plan + the audit emitter wired against the host signer.
+/// Callers thread this through `cmd_run` so the `plan.launched` and
+/// `plan.failed` audit lines bind to the same plan_id.
+///
+/// Hand-written `Debug` (not derived) because `AuditEmitter` wraps a
+/// `FileAuditSigner` whose internals hold an Ed25519 secret key. The
+/// xtask `check-no-display-on-secret-types` lint would catch a
+/// derived `Debug` that forwarded; the manual impl prints only the
+/// plan_id + signer_id and elides the emitter's signing material.
+pub(super) struct AdmissionContext {
+    pub(super) admitted: AdmittedPlan,
+    pub(super) emitter: AuditEmitter,
+}
+
+// allow(secret-debug): hand-written Debug elides the AuditEmitter's
+// underlying FileAuditSigner (Ed25519 secret key); prints plan_id +
+// signer_id only.
+impl std::fmt::Debug for AdmissionContext {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AdmissionContext")
+            .field("plan_id", &self.admitted.plan_id)
+            .field("signer_id", &self.admitted.signer_id)
+            .field("emitter", &"<redacted: FileAuditSigner>")
+            .finish()
+    }
 }
 
 /// Run plan-64 admission (`synthesize → sign → verify → check_window →
@@ -61,11 +94,15 @@ struct AdmitPlanForBootParams<'a> {
 /// process is the `--watch` loop (multiple admits over the lifetime
 /// of one `cmd_run`), and that's the desired G4 behaviour.
 ///
+/// On success, also constructs an [`AuditEmitter`] for the host
+/// signer's key and emits the `plan.admitted` chain entry; subsequent
+/// `plan.launched` / `plan.failed` events bind to the same plan_id.
+///
 /// The image name on the plan is the VM name (the workload identifier
 /// the rest of the supervisor surface uses). Once `mvm-hostd` lifts
 /// the supervisor in-process, the proper `mvm_security::image_verify`
 /// signed-manifest path can replace this.
-fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<AdmittedPlan>> {
+fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<AdmissionContext>> {
     if p.no_supervisor {
         return Ok(None);
     }
@@ -99,7 +136,52 @@ fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<AdmittedP
         image_sha256 = %sha,
         "plan admitted",
     );
-    Ok(Some(admitted))
+
+    // Load the host signer's signing key for the audit chain. We
+    // re-read it (rather than threading it out of `admit_for_run`)
+    // because the key bytes are still on disk and the re-read is
+    // cheap — keeps `admit_for_run`'s shape unchanged. Audit failures
+    // here surface as `Err` so the caller sees them; in production
+    // mvmctl up degrades gracefully (logs a warning, continues).
+    let signer = match p.keys_dir {
+        Some(dir) => load_or_init_at(dir),
+        None => super::host_signer::load_or_init(),
+    }
+    .context("loading host signer for audit emitter")?;
+    let emitter = match p.audit_dir {
+        Some(dir) => AuditEmitter::with_dir(signer.signing, dir),
+        None => AuditEmitter::new(signer.signing),
+    }
+    .context("opening audit chain emitter")?;
+
+    if let Err(e) = emitter.emit_admitted(&admitted.plan, &admitted.signer_id) {
+        tracing::warn!(error = %e, "audit emit_admitted failed (non-fatal)");
+    }
+
+    Ok(Some(AdmissionContext { admitted, emitter }))
+}
+
+/// Emit `plan.launched` against the supplied admission context. No-op
+/// when admission was skipped (`--no-supervisor`). Tolerates emission
+/// failure with a `tracing::warn` so a flaky audit fs can't block a
+/// VM that already booted.
+pub(super) fn emit_launched_if(ctx: &Option<AdmissionContext>, backend: &str) {
+    let Some(ctx) = ctx else { return };
+    if let Err(e) = ctx.emitter.emit_launched(&ctx.admitted.plan, backend) {
+        tracing::warn!(error = %e, "audit emit_launched failed (non-fatal)");
+    }
+}
+
+/// Emit `plan.failed` against the supplied admission context. No-op
+/// when admission was skipped. `class` is a short grep-friendly tag
+/// (e.g. `backend-start`, `snapshot-restore`); `err` becomes the
+/// rendered error chain.
+pub(super) fn emit_failed_if(ctx: &Option<AdmissionContext>, class: &str, err: &anyhow::Error) {
+    let Some(ctx) = ctx else { return };
+    let msg = format!("{err:#}");
+    if let Err(e) = ctx.emitter.emit_failed(&ctx.admitted.plan, class, &msg) {
+        tracing::warn!(error = %e, "audit emit_failed failed (non-fatal)");
+    }
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -493,7 +575,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
         let direct_cpus = cpus.unwrap_or(2);
         let direct_mem = memory.unwrap_or(512);
-        let _admitted = admit_plan_for_boot(AdmitPlanForBootParams {
+        let admission = admit_plan_for_boot(AdmitPlanForBootParams {
             tenant,
             vm_name: &vm_name,
             backend_name: effective_hypervisor,
@@ -503,6 +585,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             no_supervisor,
             ledger: &admission_ledger,
             keys_dir: None,
+            audit_dir: None,
         })?;
 
         let start_config = mvm_core::vm_backend::VmStartConfig {
@@ -515,7 +598,11 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         };
 
         let backend = AnyBackend::from_hypervisor(effective_hypervisor);
-        backend.start(&start_config)?;
+        if let Err(e) = backend.start(&start_config) {
+            emit_failed_if(&admission, "backend-start", &e);
+            return Err(e);
+        }
+        emit_launched_if(&admission, effective_hypervisor);
 
         // Set up port forwarding from MVM_PORTS env var (via vsock)
         if let Ok(ports_str) = std::env::var("MVM_PORTS")
@@ -797,7 +884,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
     // happens here before either branch moves the path. The launchd
     // detach-fork further down inside the else-branch boots through
     // the same start_config, so it inherits this admission.
-    let _admitted_main = admit_plan_for_boot(AdmitPlanForBootParams {
+    let admission_main = admit_plan_for_boot(AdmitPlanForBootParams {
         tenant,
         vm_name: &vm_name,
         backend_name: effective_hypervisor,
@@ -807,6 +894,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         no_supervisor,
         ledger: &admission_ledger,
         keys_dir: None,
+        audit_dir: None,
     })?;
 
     // If a template snapshot exists AND the backend supports snapshots,
@@ -855,7 +943,13 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             2,
             &format!("Restoring VM '{}' from snapshot", vm_name_owned),
         );
-        microvm::restore_from_template_snapshot(tmpl, &run_config, &snap_dir, snap_info)?;
+        if let Err(e) =
+            microvm::restore_from_template_snapshot(tmpl, &run_config, &snap_dir, snap_info)
+        {
+            emit_failed_if(&admission_main, "snapshot-restore", &e);
+            return Err(e);
+        }
+        emit_launched_if(&admission_main, effective_hypervisor);
     } else {
         let (verity_path, roothash) = microvm::probe_verity_sidecar(&rootfs_path);
         let start_config = VmStartParams {
@@ -894,7 +988,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 .map(|p| format!("{}:{}", p.host, p.guest))
                 .collect();
 
-            mvm_providers::apple_container::install_launchd_direct(
+            if let Err(e) = mvm_providers::apple_container::install_launchd_direct(
                 &start_config.name,
                 start_config.kernel_path.as_deref().unwrap_or(""),
                 &start_config.rootfs_path,
@@ -902,12 +996,23 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 start_config.memory_mib as u64,
                 &port_specs,
             )
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+            .map_err(|e| anyhow::anyhow!("{e}"))
+            {
+                emit_failed_if(&admission_main, "launchd-install", &e);
+                return Err(e);
+            }
+            // The launchd agent is the actual VM owner now; treat
+            // install success as launch success for audit purposes.
+            emit_launched_if(&admission_main, effective_hypervisor);
             println!("{vm_name_owned}");
             return Ok(());
         }
 
-        backend.start(&start_config)?;
+        if let Err(e) = backend.start(&start_config) {
+            emit_failed_if(&admission_main, "backend-start", &e);
+            return Err(e);
+        }
+        emit_launched_if(&admission_main, effective_hypervisor);
     }
 
     mvm_core::audit::emit(
@@ -1105,7 +1210,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             // shared `admission_ledger` provides replay protection across
             // rebuilds — a synthesized plan can only admit once even if
             // the same artifact hash recurs (nonce is fresh per call).
-            if let Err(e) = admit_plan_for_boot(AdmitPlanForBootParams {
+            let watch_admission = match admit_plan_for_boot(AdmitPlanForBootParams {
                 tenant,
                 vm_name: &vm_name_owned,
                 backend_name: effective_hypervisor,
@@ -1115,12 +1220,16 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 no_supervisor,
                 ledger: &admission_ledger,
                 keys_dir: None,
+                audit_dir: None,
             }) {
-                ui::warn(&format!(
-                    "Plan admission failed: {e}; waiting for next change..."
-                ));
-                continue;
-            }
+                Ok(ctx) => ctx,
+                Err(e) => {
+                    ui::warn(&format!(
+                        "Plan admission failed: {e}; waiting for next change..."
+                    ));
+                    continue;
+                }
+            };
             let w_start_config = VmStartParams {
                 name: vm_name_owned.clone(),
                 rootfs_path: result.rootfs_path,
@@ -1141,10 +1250,12 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             .into_start_config();
             let w_backend = AnyBackend::from_hypervisor(effective_hypervisor);
             if let Err(e) = w_backend.start(&w_start_config) {
+                emit_failed_if(&watch_admission, "backend-start", &e);
                 ui::warn(&format!(
                     "Could not start VM: {e}; waiting for next change..."
                 ));
             } else {
+                emit_launched_if(&watch_admission, effective_hypervisor);
                 mvm_core::audit::emit(
                     mvm_core::audit::LocalAuditKind::VmStart,
                     Some(&vm_name_owned),
@@ -1281,6 +1392,7 @@ mod admit_plan_tests {
             no_supervisor: true,
             ledger: &ledger,
             keys_dir: None, // not read — short-circuit returns first
+            audit_dir: None,
         })
         .expect("must succeed");
         assert!(result.is_none(), "no_supervisor must return None");
@@ -1289,10 +1401,11 @@ mod admit_plan_tests {
     #[test]
     fn admits_real_rootfs_and_returns_plan_id() {
         let keys_dir = tempfile::tempdir().unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
         let rootfs_dir = tempfile::tempdir().unwrap();
         let rootfs = write_rootfs(rootfs_dir.path(), b"hello rootfs");
         let ledger = InMemoryNonceLedger::new();
-        let admitted = admit_plan_for_boot(AdmitPlanForBootParams {
+        let ctx = admit_plan_for_boot(AdmitPlanForBootParams {
             tenant: "local",
             vm_name: "vm-happy",
             backend_name: "firecracker",
@@ -1302,14 +1415,23 @@ mod admit_plan_tests {
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
+            audit_dir: Some(audit_dir.path()),
         })
         .expect("admission")
         .expect("Some when admission ran");
-        assert!(!admitted.plan_id.0.is_empty());
-        assert_eq!(admitted.plan.workload.0, "vm-happy");
-        assert_eq!(admitted.plan.tenant.0, "local");
-        assert_eq!(admitted.plan.resources.cpus, 2);
-        assert_eq!(admitted.plan.resources.mem_mib, 512);
+        assert!(!ctx.admitted.plan_id.0.is_empty());
+        assert_eq!(ctx.admitted.plan.workload.0, "vm-happy");
+        assert_eq!(ctx.admitted.plan.tenant.0, "local");
+        assert_eq!(ctx.admitted.plan.resources.cpus, 2);
+        assert_eq!(ctx.admitted.plan.resources.mem_mib, 512);
+
+        // The `plan.admitted` audit line must be present in the
+        // tenant's chain file already (admit_plan_for_boot emits
+        // it inline before returning).
+        let audit_path = audit_dir.path().join("local.jsonl");
+        let content = std::fs::read_to_string(&audit_path).expect("audit file exists");
+        assert!(content.contains("plan.admitted"));
+        assert!(content.contains(&ctx.admitted.plan_id.0));
     }
 
     #[test]
@@ -1317,6 +1439,7 @@ mod admit_plan_tests {
         // sha256_file fails when the file does not exist; the helper
         // must propagate the error with context naming the rootfs path.
         let keys_dir = tempfile::tempdir().unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
         let ledger = InMemoryNonceLedger::new();
         let err = admit_plan_for_boot(AdmitPlanForBootParams {
             tenant: "local",
@@ -1328,6 +1451,7 @@ mod admit_plan_tests {
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
+            audit_dir: Some(audit_dir.path()),
         })
         .expect_err("missing rootfs must fail");
         assert!(
@@ -1342,6 +1466,7 @@ mod admit_plan_tests {
         // admissions with different rootfs hashes (or even same hash —
         // synthesize_plan generates fresh nonces) must both succeed.
         let keys_dir = tempfile::tempdir().unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
         let rootfs_dir = tempfile::tempdir().unwrap();
         let rootfs = write_rootfs(rootfs_dir.path(), b"first");
         let ledger = InMemoryNonceLedger::new();
@@ -1356,6 +1481,7 @@ mod admit_plan_tests {
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
+            audit_dir: Some(audit_dir.path()),
         })
         .unwrap()
         .unwrap();
@@ -1369,10 +1495,25 @@ mod admit_plan_tests {
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
+            audit_dir: Some(audit_dir.path()),
         })
         .unwrap()
         .unwrap();
-        assert_ne!(a1.plan_id, a2.plan_id);
-        assert_ne!(a1.plan.nonce, a2.plan.nonce);
+        assert_ne!(a1.admitted.plan_id, a2.admitted.plan_id);
+        assert_ne!(a1.admitted.plan.nonce, a2.admitted.plan.nonce);
+    }
+
+    #[test]
+    fn emit_launched_and_failed_no_op_when_admission_skipped() {
+        // emit_*_if must be a no-op when admission was skipped — the
+        // legacy --no-supervisor path must not panic or write audit
+        // lines.
+        let none: Option<AdmissionContext> = None;
+        emit_launched_if(&none, "firecracker");
+        emit_failed_if(
+            &none,
+            "backend-start",
+            &anyhow::anyhow!("simulated failure"),
+        );
     }
 }

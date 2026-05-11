@@ -92,18 +92,19 @@ impl Default for InMemoryNonceLedger {
 }
 
 /// Result of a successful admission. Carries everything the caller
-/// needs to hand to the backend (the plan + its id) and to W4's
-/// audit signer (the signed envelope itself).
+/// needs to hand to the backend (the plan + its id), to W4's audit
+/// chain (the plan again, for `AuditEntry::for_plan`), and — for
+/// downstream consumers that want the canonical envelope — the
+/// `SignedExecutionPlan` itself.
 ///
-/// `plan` and `signed` are tagged `allow(dead_code)` in the W3 callsite
-/// commit because the only callers that consume them today are the
-/// in-module tests; W4 (`FileAuditSigner` wiring) reads both — the
-/// plan to derive an `AuditEntry::for_plan`, the signed envelope as
-/// the canonical artifact of admission. Keeping them on the struct
-/// stabilises the surface across the staged commits.
+/// `signed` carries a `#[allow(dead_code)]` because the only current
+/// consumer is in-module tests proving the envelope round-trips
+/// through `verify_plan`. Cross-process consumers (a future
+/// `mvm-hostd` lift, or `mvmctl plan show` once it lands) will read
+/// the envelope verbatim. Keeping the field on the struct stabilises
+/// the surface for those callers.
 #[derive(Debug)]
 pub struct AdmittedPlan {
-    #[allow(dead_code)]
     pub plan: ExecutionPlan,
     pub plan_id: PlanId,
     pub signer_id: String,
