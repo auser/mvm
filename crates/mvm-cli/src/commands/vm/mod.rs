@@ -10,6 +10,7 @@ pub(super) mod host_signer;
 pub(super) mod invoke;
 pub(super) mod logs;
 pub(super) mod pause;
+pub(super) mod plan_admission;
 pub(super) mod plan_builder;
 pub(super) mod proc;
 pub(super) mod ps;
