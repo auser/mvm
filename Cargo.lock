@@ -3900,6 +3900,7 @@ dependencies = [
  "mvm-guest",
  "mvm-mcp",
  "mvm-plan",
+ "mvm-policy",
  "mvm-providers",
  "mvm-security",
  "mvm-supervisor",
@@ -3999,7 +4000,9 @@ dependencies = [
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
+ "toml",
 ]
 
 [[package]]

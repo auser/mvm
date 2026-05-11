@@ -43,6 +43,7 @@ pub struct PolicyBundle {
     /// Per-tenant overlays. Resolved by composing the bundle's
     /// base policy with the matching tenant overlay (overlay wins
     /// on conflict). Empty map means no per-tenant variation.
+    #[serde(default)]
     pub tenant_overlays: BTreeMap<TenantId, TenantOverlay>,
 }
 

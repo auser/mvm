@@ -16,9 +16,11 @@ ed25519-dalek.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror = "1"
+toml.workspace = true
 
 [dev-dependencies]
 rand.workspace = true
+tempfile.workspace = true
 
 [lints]
 workspace = true

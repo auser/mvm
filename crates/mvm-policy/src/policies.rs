@@ -87,6 +87,7 @@ pub struct PiiPolicy {
     pub mode: Option<String>,
     /// Categories to act on (`email`, `cc_number`, `ssn`, ...).
     /// Empty means all categories the redactor knows about.
+    #[serde(default)]
     pub categories: Vec<String>,
 }
 
@@ -96,6 +97,7 @@ pub struct PiiPolicy {
 #[serde(deny_unknown_fields)]
 pub struct ToolPolicy {
     /// Names of tools the workload is allowed to invoke. Stub.
+    #[serde(default)]
     pub allowed: Vec<String>,
 }
 
@@ -104,7 +106,7 @@ pub struct ToolPolicy {
 /// source of truth that the supervisor's `ArtifactCollector` (Wave 3)
 /// consults at workload exit.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct ArtifactPolicy {
     pub capture_paths: Vec<String>,
     pub retention_days: u32,
@@ -112,7 +114,7 @@ pub struct ArtifactPolicy {
 
 /// Key policy. Plan 37 §12. Wave 3 wires `KeystoreReleaser`.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct KeyPolicy {
     /// 0 = no rotation; supervisor warns but accepts.
     pub rotation_interval_days: u32,
@@ -121,7 +123,7 @@ pub struct KeyPolicy {
 /// Audit policy. Plan 37 §22. Wave 3 wires chain signing + per-tenant
 /// streams.
 #[derive(Debug, Clone, PartialEq, Eq, Default, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
+#[serde(deny_unknown_fields, default)]
 pub struct AuditPolicy {
     /// Whether the supervisor should chain-sign each entry into the
     /// previous's hash for tamper-evidence.

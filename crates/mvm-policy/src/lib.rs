@@ -24,6 +24,7 @@ pub mod bundle;
 pub mod policies;
 pub mod resolver;
 pub mod signing;
+pub mod toml_loader;
 
 pub use bundle::{PolicyBundle, PolicyId, SCHEMA_VERSION, TenantOverlay};
 pub use policies::{

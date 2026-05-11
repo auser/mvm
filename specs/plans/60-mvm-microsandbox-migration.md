@@ -1797,19 +1797,20 @@ work, not mvm's.
 ### Phase 6 — Security model: seccomp, jailer, dm-verity, signed plans, attestation, fuzz harnesses (~10-14 days)
 
 **Status (2026-05-11)**: seccomp tiers, dm-verity, fuzz harnesses,
-prod-agent-no-exec, **signed-and-audited `ExecutionPlan`**, and the
-plan 64 W5 `PolicyRef` resolver substrate all shipped (CLAUDE.md
-security claims 1–8; ADR-041). The W5 resolver maps the plan's
-four `PolicyRef`/`FsPolicyRef` fields onto `Box<dyn EgressProxy>` /
-`Box<dyn ToolGate>` / `Box<dyn KeystoreReleaser>` /
-`Box<dyn ArtifactCollector>` slots, returning Noops for the
-`"local-default"` posture and a clear `NotYetImplemented` error
-for `"<tenant>:<workload>"` refs (the policy-bundle file format is
-this Phase's own future work). **Hardware attestation
-(TPM2/SEV-SNP/TDX) + the `mvmctl attest` CLI surface remain the
-only outstanding Phase 6 work**, sequenced together with the
-on-disk policy-bundle format and the mvm-hostd lift that turns the
-W5 resolver into a live consumer of `Supervisor::with_*` builders.
+prod-agent-no-exec, **signed-and-audited `ExecutionPlan`**, the
+plan 64 W5 `PolicyRef` resolver substrate, and the **on-disk
+policy-bundle TOML format** all shipped (CLAUDE.md security claims
+1–8; ADR-041). The W5 resolver now loads
+`~/.mvm/policies/<tenant>/<workload>.toml` for tenant-scoped refs
+via `mvm_policy::toml_loader`; parse errors surface as
+`ResolveError::BundleNotFound` / `BundleParseFailed` /
+`MixedRefs` / `Unrecognized` with operator-actionable detail.
+Returned slots remain Noops because no live consumer
+(L4/L7 proxies, real ToolGate) exists yet — Phase 3 builds those.
+**Hardware attestation (TPM2/SEV-SNP/TDX) + the `mvmctl attest`
+CLI surface remain the only outstanding Phase 6 work**, sequenced
+together with the mvm-hostd lift that turns the W5 resolver into
+a live consumer of `Supervisor::with_*` builders.
 
 **Goal**: `mvmctl up --security strict` applies a seccomp profile; rootfs verified at boot via dm-verity; signed Plans rejected if Ed25519 sig fails; fuzz harness runs in CI for vsock framing; **`mvmctl attest <vm>` returns a verifiable attestation report**.
 

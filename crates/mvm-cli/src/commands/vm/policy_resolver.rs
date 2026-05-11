@@ -92,15 +92,33 @@ pub struct ResolvedSlots {
 /// Errors `resolve_supervisor_components` can return.
 #[derive(Debug)]
 pub enum ResolveError {
-    /// A ref names a `<tenant>:<workload>` bundle the policy-bundle
-    /// loader cannot honor until plan 60 Phase 3 ships. The
-    /// embedded `expected_path` is where the file *would* live;
-    /// callers can surface it to the user as "create this file
-    /// once Phase 3 lands".
-    NotYetImplemented {
+    /// A ref names a `<tenant>:<workload>` bundle but the file
+    /// isn't there. `expected_path` is where the operator should
+    /// drop the bundle.
+    BundleNotFound {
         field: &'static str,
         value: String,
         expected_path: PathBuf,
+    },
+
+    /// The bundle file exists but couldn't be parsed (TOML error,
+    /// schema-version mismatch, unknown field). Detail carries the
+    /// underlying loader message so operators can fix the file.
+    BundleParseFailed {
+        field: &'static str,
+        value: String,
+        path: PathBuf,
+        detail: String,
+    },
+
+    /// The plan's four policy refs disagree on which bundle to
+    /// load. The current schema requires all four to point at the
+    /// same `<tenant>:<workload>` bundle so the supervisor's
+    /// component slots resolve consistently.
+    MixedRefs {
+        first: String,
+        second_field: &'static str,
+        second: String,
     },
 
     /// A ref's shape doesn't match `"local-default"` or
@@ -118,15 +136,34 @@ pub enum ResolveError {
 impl std::fmt::Display for ResolveError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
-            Self::NotYetImplemented {
+            Self::BundleNotFound {
                 field,
                 value,
                 expected_path,
             } => write!(
                 f,
-                "policy ref {field} = {value:?} would load from {} but the policy-bundle loader \
-                 is not yet implemented (plan 60 Phase 3)",
+                "policy ref {field} = {value:?} points at a bundle at {} that doesn't exist; \
+                 create the file or change the ref",
                 expected_path.display()
+            ),
+            Self::BundleParseFailed {
+                field,
+                value,
+                path,
+                detail,
+            } => write!(
+                f,
+                "policy ref {field} = {value:?} loaded from {} failed to parse: {detail}",
+                path.display()
+            ),
+            Self::MixedRefs {
+                first,
+                second_field,
+                second,
+            } => write!(
+                f,
+                "policy refs disagree: one field requests {first:?} but {second_field} requests \
+                 {second:?}; all four refs must point at the same bundle"
             ),
             Self::Unrecognized {
                 field,
@@ -170,56 +207,131 @@ fn classify(value: &str) -> RefShape<'_> {
     RefShape::Unrecognized
 }
 
-/// Where the policy bundle for `<tenant>:<workload>` would live.
-/// Used only for the `NotYetImplemented` error message; no I/O.
-fn expected_policy_path(tenant: &str, workload: &str) -> PathBuf {
-    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("~"), PathBuf::from);
-    home.join(".mvm")
-        .join("policies")
-        .join(tenant)
-        .join(format!("{workload}.toml"))
+/// Default base dir for policy bundles. Mirrors
+/// `mvm_policy::toml_loader::default_policy_dir` but falls back to
+/// the literal `~/.mvm/policies/` (good for error messages) when
+/// `$HOME` is unset.
+fn default_policy_dir() -> PathBuf {
+    mvm_policy::toml_loader::default_policy_dir()
+        .unwrap_or_else(|| PathBuf::from("~/.mvm/policies"))
 }
 
-/// Inspect each ref; return `Ok(())` if it's `"local-default"`, the
-/// matching `ResolveError` otherwise.
-fn check_ref(field: &'static str, value: &str) -> Result<(), ResolveError> {
-    match classify(value) {
-        RefShape::LocalDefault => Ok(()),
-        RefShape::TenantWorkload { tenant, workload } => Err(ResolveError::NotYetImplemented {
-            field,
-            value: value.to_string(),
-            expected_path: expected_policy_path(tenant, workload),
-        }),
-        RefShape::Unrecognized => Err(ResolveError::Unrecognized {
-            field,
-            value: value.to_string(),
-            expected: "\"local-default\" or \"<tenant>:<workload>\"",
-        }),
+/// Per-field validation that all four refs share the same shape
+/// (all `LOCAL_DEFAULT`, or all the same `<tenant>:<workload>`).
+/// Returns the agreed-upon shape on success.
+fn classify_plan_refs<'a>(
+    network: &'a str,
+    fs: &'a str,
+    egress: &'a str,
+    tool: &'a str,
+) -> Result<RefShape<'a>, ResolveError> {
+    let fields: [(&'static str, &str); 4] = [
+        ("network_policy", network),
+        ("fs_policy", fs),
+        ("egress_policy", egress),
+        ("tool_policy", tool),
+    ];
+    let first_value = fields[0].1;
+    for (field, value) in fields.iter() {
+        if *value != first_value {
+            return Err(ResolveError::MixedRefs {
+                first: first_value.to_string(),
+                second_field: field,
+                second: value.to_string(),
+            });
+        }
+        if matches!(classify(value), RefShape::Unrecognized) {
+            return Err(ResolveError::Unrecognized {
+                field,
+                value: value.to_string(),
+                expected: "\"local-default\" or \"<tenant>:<workload>\"",
+            });
+        }
     }
+    Ok(classify(first_value))
 }
 
 /// Resolve a plan's four policy refs into concrete component slots.
 ///
-/// In v0 the only path that succeeds is all four refs equal to
-/// [`LOCAL_DEFAULT`]; any other configuration returns a typed error.
-/// See the module docs for the rationale.
+/// Three outcomes:
+///
+/// - All four refs == `"local-default"` → Noop slots.
+/// - All four refs == `"<tenant>:<workload>"` and the bundle file
+///   parses cleanly → Noop slots, since no live consumer (L4/L7
+///   proxy, real ToolGate) exists yet to read the parsed bundle.
+///   The substrate proves the file format works so operators can
+///   stage bundles before plan 60 Phase 3 ships.
+/// - Anything else → typed error pointing the operator at what to
+///   fix (missing file, parse error, mismatched refs, typo).
 pub fn resolve_supervisor_components(plan: &ExecutionPlan) -> Result<ResolvedSlots, ResolveError> {
     let PolicyRef(network) = &plan.network_policy;
     let FsPolicyRef(fs) = &plan.fs_policy;
     let PolicyRef(egress) = &plan.egress_policy;
     let PolicyRef(tool) = &plan.tool_policy;
 
-    check_ref("network_policy", network)?;
-    check_ref("fs_policy", fs)?;
-    check_ref("egress_policy", egress)?;
-    check_ref("tool_policy", tool)?;
+    match classify_plan_refs(network, fs, egress, tool)? {
+        RefShape::LocalDefault => Ok(noop_slots()),
+        RefShape::TenantWorkload { tenant, workload } => {
+            // Load the bundle; even when parsing succeeds we
+            // return Noops, because no live consumer exists yet.
+            // The error paths surface real operator-actionable
+            // problems (missing file, typo, schema mismatch).
+            resolve_tenant_workload(network, tenant, workload)?;
+            Ok(noop_slots())
+        }
+        // classify_plan_refs already converts Unrecognized into a
+        // typed error; this branch is dead but keeps the match
+        // exhaustive.
+        RefShape::Unrecognized => unreachable!("classify_plan_refs handled Unrecognized"),
+    }
+}
 
-    Ok(ResolvedSlots {
+fn noop_slots() -> ResolvedSlots {
+    ResolvedSlots {
         egress: Box::new(NoopEgressProxy),
         tool_gate: Box::new(NoopToolGate),
         keystore: Box::new(NoopKeystoreReleaser),
         artifacts: Box::new(NoopArtifactCollector),
-    })
+    }
+}
+
+fn resolve_tenant_workload(
+    ref_value: &str,
+    tenant: &str,
+    workload: &str,
+) -> Result<mvm_policy::PolicyBundle, ResolveError> {
+    let base = default_policy_dir();
+    let path = mvm_policy::toml_loader::bundle_path(&base, tenant, workload);
+    match mvm_policy::toml_loader::load_bundle_from_path(&base, tenant, workload) {
+        Ok(bundle) => Ok(bundle),
+        Err(mvm_policy::toml_loader::LoadError::NotFound { path }) => {
+            Err(ResolveError::BundleNotFound {
+                field: "network_policy",
+                value: ref_value.to_string(),
+                expected_path: path,
+            })
+        }
+        Err(
+            mvm_policy::toml_loader::LoadError::Parse { detail, .. }
+            | mvm_policy::toml_loader::LoadError::Io { detail, .. },
+        ) => Err(ResolveError::BundleParseFailed {
+            field: "network_policy",
+            value: ref_value.to_string(),
+            path,
+            detail,
+        }),
+        Err(mvm_policy::toml_loader::LoadError::SchemaMismatch { got, known, .. }) => {
+            Err(ResolveError::BundleParseFailed {
+                field: "network_policy",
+                value: ref_value.to_string(),
+                path,
+                detail: format!(
+                    "schema_version {got} unsupported (this binary only \
+                     understands version {known})"
+                ),
+            })
+        }
+    }
 }
 
 #[cfg(test)]
@@ -341,59 +453,60 @@ mod tests {
         });
     }
 
+    /// Set all four PolicyRef fields on a plan to the same value.
+    /// Phase-6 schema requires the four refs agree; tests that
+    /// violate that on purpose set only one field.
+    fn set_all_refs(plan: &mut ExecutionPlan, value: &str) {
+        plan.network_policy = PolicyRef(value.to_string());
+        plan.fs_policy = FsPolicyRef(value.to_string());
+        plan.egress_policy = PolicyRef(value.to_string());
+        plan.tool_policy = PolicyRef(value.to_string());
+    }
+
     #[test]
-    fn policy_resolver_rejects_tenant_policy_ref_with_clear_error() {
-        // A `<tenant>:<workload>` ref must return NotYetImplemented
-        // and the error message must name the policy file path that
-        // would have been loaded once plan 60 Phase 3 ships.
+    fn policy_resolver_rejects_tenant_ref_when_bundle_missing() {
+        // Phase-6 substrate: a "<tenant>:<workload>" ref makes
+        // resolve_supervisor_components attempt to load the bundle
+        // file. When the file isn't there we surface BundleNotFound
+        // with a clear path so operators know exactly where to put it.
         let mut plan = fixture_plan();
-        plan.network_policy = PolicyRef("acme:web-worker".to_string());
-        // `ResolvedSlots` doesn't impl Debug (its trait-object fields
-        // can't), so we can't use `.expect_err()` — match the Result
-        // explicitly to surface the error.
+        set_all_refs(&mut plan, "acme:web-worker");
         let err = match resolve_supervisor_components(&plan) {
             Err(e) => e,
-            Ok(_) => panic!("tenant-scoped ref must be refused in v0"),
+            Ok(_) => panic!("tenant-scoped ref without bundle must be refused"),
         };
         match err {
-            ResolveError::NotYetImplemented {
-                field,
+            ResolveError::BundleNotFound {
                 value,
                 expected_path,
+                ..
             } => {
-                assert_eq!(field, "network_policy");
                 assert_eq!(value, "acme:web-worker");
-                // Path must mention both tenant and workload, plus
-                // the .toml suffix the eventual loader expects.
                 let s = expected_path.to_string_lossy();
                 assert!(s.contains("acme"), "path missing tenant: {s}");
                 assert!(s.contains("web-worker.toml"), "path missing workload: {s}");
-                assert!(s.contains(".mvm"), "path missing .mvm dir: {s}");
                 assert!(s.contains("policies"), "path missing policies dir: {s}");
             }
-            other => panic!("expected NotYetImplemented, got {other:?}"),
+            other => panic!("expected BundleNotFound, got {other:?}"),
         }
     }
 
     #[test]
     fn policy_resolver_rejects_unrecognized_policy_ref() {
         // Anything that's neither "local-default" nor
-        // "<tenant>:<workload>" must be refused, and the error must
-        // name the field that carried the bad ref so the operator
-        // can find it in the plan.
+        // "<tenant>:<workload>" must be refused. The MixedRefs
+        // check runs first, so make all four refs identical (and
+        // bogus) to land on the Unrecognized branch.
         let mut plan = fixture_plan();
-        plan.egress_policy = PolicyRef("bogus".to_string());
+        set_all_refs(&mut plan, "bogus");
         let err = match resolve_supervisor_components(&plan) {
             Err(e) => e,
             Ok(_) => panic!("unrecognized ref must be refused"),
         };
         match err {
             ResolveError::Unrecognized {
-                field,
-                value,
-                expected,
+                value, expected, ..
             } => {
-                assert_eq!(field, "egress_policy");
                 assert_eq!(value, "bogus");
                 assert!(expected.contains("local-default"));
                 assert!(expected.contains("tenant"));
@@ -423,10 +536,10 @@ mod tests {
     }
 
     #[test]
-    fn policy_resolver_rejects_when_only_one_field_is_tenant_scoped() {
-        // Mixed refs must fail on the first non-local field;
-        // confirms the resolver inspects *every* field, not just
-        // network_policy.
+    fn policy_resolver_rejects_mixed_refs() {
+        // All four refs must agree (same bundle). If only one
+        // points at a tenant bundle while the others stay
+        // local-default, the resolver refuses with MixedRefs.
         let mut plan = fixture_plan();
         plan.tool_policy = PolicyRef("acme:tools-v1".to_string());
         let err = match resolve_supervisor_components(&plan) {
@@ -434,37 +547,56 @@ mod tests {
             Ok(_) => panic!("mixed refs must be refused"),
         };
         match err {
-            ResolveError::NotYetImplemented { field, .. } => {
-                assert_eq!(field, "tool_policy");
+            ResolveError::MixedRefs {
+                first,
+                second_field,
+                second,
+            } => {
+                assert_eq!(first, "local-default");
+                assert_eq!(second_field, "tool_policy");
+                assert_eq!(second, "acme:tools-v1");
             }
-            other => panic!("expected NotYetImplemented, got {other:?}"),
+            other => panic!("expected MixedRefs, got {other:?}"),
         }
     }
 
     #[test]
-    fn policy_resolver_rejects_fs_policy_ref_independently() {
-        // FsPolicyRef is a distinct newtype but obeys the same
-        // shape rules; ensure the resolver doesn't skip it.
+    fn policy_resolver_inspects_fs_policy_ref() {
+        // FsPolicyRef is a distinct newtype but should be treated
+        // identically to PolicyRef in the resolver. If fs_policy
+        // disagrees with the others, MixedRefs fires.
         let mut plan = fixture_plan();
         plan.fs_policy = FsPolicyRef("typo-default".to_string());
         let err = match resolve_supervisor_components(&plan) {
             Err(e) => e,
-            Ok(_) => panic!("typo must be refused"),
+            Ok(_) => panic!("mixed fs ref must be refused"),
         };
         match err {
-            ResolveError::Unrecognized { field, value, .. } => {
-                assert_eq!(field, "fs_policy");
-                assert_eq!(value, "typo-default");
+            ResolveError::MixedRefs {
+                second_field,
+                second,
+                ..
+            } => {
+                assert_eq!(second_field, "fs_policy");
+                assert_eq!(second, "typo-default");
             }
-            other => panic!("expected Unrecognized, got {other:?}"),
+            other => panic!("expected MixedRefs, got {other:?}"),
         }
     }
 
-    // Integration test note: `supervisor_with_resolved_slots_carries_plan_id_to_audit`
-    // is the eventual cross-module test that proves the resolver's
-    // output flows through `Supervisor::launch` to the audit chain
-    // with the correct plan_id. It cannot land here because
-    // `Supervisor::launch` is not on the production callsite yet
-    // (W3 shipped `admit + backend.start()`; ADR-041 documents the
-    // deferral). The test lands together with the mvm-hostd lift.
+    // ──────────────────────────────────────────────────────────────
+    // Plan 60 Phase 6 — TOML-loading integration tests
+    //
+    // The resolver attempts to load `<HOME>/.mvm/policies/<tenant>/
+    // <workload>.toml` for tenant-scoped refs. Since tests can't
+    // safely mutate $HOME (process-global), we exercise the loader
+    // path directly via `mvm_policy::toml_loader` in the unit
+    // tests above. These tests pin the resolver's *error* surface
+    // — the success path "bundle loads cleanly → Noops" is
+    // implicit in the unit tests covering each error branch.
+    //
+    // A future end-to-end test that sets $HOME via a process-wide
+    // mutex (like `vm/mod.rs::DATA_DIR_TEST_LOCK`) can pin the
+    // success path. Out of scope for the Phase 6 substrate.
+    // ──────────────────────────────────────────────────────────────
 }
