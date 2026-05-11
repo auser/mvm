@@ -37,6 +37,7 @@
 
 pub mod apple_container;
 pub mod backend;
+pub mod ch_runtime;
 pub mod cloud_hypervisor;
 pub mod docker;
 pub mod firecracker;

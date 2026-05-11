@@ -24,24 +24,43 @@
 //!
 //! ## Status
 //!
-//! This file ships the final `VmBackend` shape: [`CloudHypervisorBackend`]
-//! declares its capabilities, security profile, and dispatch through
-//! `mvm_runtime::vm::backend::AnyBackend`. Lifecycle methods today
-//! return a "not yet wired" error pointing at the bring-up wave —
-//! same pattern as `LibkrunBackend` until plan 57's libkrun spike
-//! landed real lifecycle. CH bring-up is a focused follow-up wave.
+//! `start`/`stop`/`stop_all`/`status`/`list`/`logs` are wired
+//! against the Cloud Hypervisor JSON API via `crate::ch_runtime`.
+//! The implementation has not yet been validated end-to-end against
+//! a live `cloud-hypervisor` binary (mvm CI lacks a Linux+CH host
+//! today); the pure pieces (JSON config builder, path helpers) are
+//! unit-tested in `ch_runtime`, and the shell-out paths are
+//! reviewed against CH's published API but will surface real-world
+//! fitness issues on first live run.
 //!
-//! Once wired, CH will be selectable via:
+//! Once validated, CH is selectable via:
 //!
 //!   `mvmctl run --hypervisor cloud-hypervisor`
 //!
 //! and the `mkGuest { hypervisor = "cloud-hypervisor"; }` argument.
+//!
+//! ## What's deliberately out of scope here
+//!
+//! - **TAP networking.** CH supports `net` configs the same shape
+//!   as Firecracker, but mvm's TAP+bridge plumbing
+//!   (`crate::network`) is FC-specific today. The CH start path
+//!   does not configure networking — VMs boot with vsock only.
+//!   Wiring TAP in is a follow-up that mirrors what
+//!   `microvm::run_from_build` does for FC.
+//! - **Snapshot/restore.** CH supports them; the host-side
+//!   snapshot mvm orchestrates (`mvm-security::snapshot_hmac` +
+//!   `template_snapshot_dir`) is FC-API-shaped today.
+//! - **dm-verity.** ADR-002 §W3 targets Firecracker; CH parity
+//!   is the Tier-1-equality follow-up named in the security
+//!   profile note.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mvm_core::vm_backend::{
-    BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, VmBackend,
+    BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, StartMode, VmBackend,
     VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus,
 };
+
+use crate::ch_runtime;
 
 /// Cloud Hypervisor backend (rust-vmm; Linux/KVM + macOS/HVF).
 ///
@@ -50,9 +69,14 @@ use mvm_core::vm_backend::{
 /// between CH and FC is workload-shape, not security-shape.
 pub struct CloudHypervisorBackend;
 
-const NOT_YET_WIRED: &str = "Cloud Hypervisor backend is not yet wired \
-(near-term follow-up wave per plan 60 — ships the cloud-hypervisor \
-binary integration + the JSON-API client + the artifact dispatch)";
+/// Default kernel cmdline for CH-booted guests. Matches FC's mvm
+/// minimal-guest shape (`init=/init` runs the busybox /init from
+/// `mkGuest`'s rootfs; `console=ttyS0` so CH's `serial: Tty` mode
+/// gets the bootlog). No `net.ifnames=0`/`mvm.ip=...` because CH
+/// boots vsock-only here (see module docs on TAP being out of
+/// scope).
+const DEFAULT_CMDLINE: &str = "root=/dev/vda rw rootwait init=/init \
+console=ttyS0 reboot=k panic=1";
 
 impl VmBackend for CloudHypervisorBackend {
     fn name(&self) -> &str {
@@ -65,38 +89,141 @@ impl VmBackend for CloudHypervisorBackend {
         // generic at this level; backend-specific extras (GPU,
         // virtio-fs) are addressed via dedicated fields when the
         // VmStartConfig + VmCapabilities shapes grow them.
+        //
+        // `tap_networking: false` reflects the current
+        // implementation: the start path does not configure a TAP
+        // device. CH itself supports TAP — flip to `true` once the
+        // network-wiring follow-up lands.
         VmCapabilities {
             pause_resume: true,
             snapshots: true,
             vsock: true,
-            tap_networking: true,
+            tap_networking: false,
         }
     }
 
-    fn start(&self, _config: &VmStartConfig) -> Result<VmId> {
-        anyhow::bail!(NOT_YET_WIRED)
+    fn start(&self, config: &VmStartConfig) -> Result<VmId> {
+        let kernel = config
+            .kernel_path
+            .as_deref()
+            .ok_or_else(|| anyhow::anyhow!("cloud-hypervisor start requires kernel_path"))?;
+        if config.rootfs_path.is_empty() {
+            anyhow::bail!("cloud-hypervisor start requires rootfs_path");
+        }
+
+        // Per-VM directory + sockets. Same convention as FC.
+        let abs_dir = ch_runtime::ch_vm_dir(&config.name)
+            .with_context(|| format!("resolving per-VM dir for {}", config.name))?;
+        let api_socket = ch_runtime::ch_api_socket(&abs_dir);
+        let vsock_socket = ch_runtime::ch_vsock_socket(&abs_dir);
+
+        // W6.2 console gate — same call site as the other 4 real
+        // backends. Records `accessible` from the sidecar so
+        // `mvmctl console` enforces the gate consistently.
+        let rootfs = std::path::Path::new(&config.rootfs_path);
+        mvm_runtime_base::runtime_meta::record_from_rootfs(
+            &config.name,
+            StartMode::Detached,
+            rootfs,
+        )?;
+
+        // Spawn the daemon. Waits for the API socket.
+        ch_runtime::start_ch_daemon(&abs_dir, &api_socket)?;
+
+        // Configure the VM. CH ignores fields we omit; only the
+        // required shape is sent.
+        let args = ch_runtime::VmConfigArgs {
+            kernel_path: kernel,
+            rootfs_path: &config.rootfs_path,
+            initrd_path: config.initrd_path.as_deref(),
+            cmdline: Some(DEFAULT_CMDLINE),
+            cpus: config.cpus.max(1),
+            memory_mib: if config.memory_mib == 0 { 256 } else { config.memory_mib },
+            vsock_cid: 3,
+            vsock_socket_path: vsock_socket,
+        };
+        let body = ch_runtime::build_vm_config(&args);
+        ch_runtime::api_put(&api_socket, "/api/v1/vm.create", &body)?;
+
+        // Boot.
+        ch_runtime::api_put_empty(&api_socket, "/api/v1/vm.boot")?;
+
+        Ok(VmId(config.name.clone()))
     }
 
-    fn stop(&self, _id: &VmId) -> Result<()> {
-        anyhow::bail!(NOT_YET_WIRED)
+    fn stop(&self, id: &VmId) -> Result<()> {
+        let abs_dir = ch_runtime::ch_vm_dir(&id.0)
+            .with_context(|| format!("resolving per-VM dir for {}", id.0))?;
+        let api_socket = ch_runtime::ch_api_socket(&abs_dir);
+
+        // Graceful guest shutdown (ACPI poweroff). Best-effort:
+        // teardown of the VMM below reaps the daemon regardless.
+        let _ = ch_runtime::api_put_empty(&api_socket, "/api/v1/vm.shutdown");
+        // Then exit the VMM — frees the API socket + reaps the
+        // daemon's child processes.
+        let _ = ch_runtime::api_put_empty(&api_socket, "/api/v1/vmm.shutdown");
+
+        // Best-effort process + socket cleanup.
+        ch_runtime::reap(&abs_dir)
     }
 
     fn stop_all(&self) -> Result<()> {
-        // No running VMs in scaffolding — succeed silently so cleanup
-        // paths don't mask other errors.
-        Ok(())
+        let names = ch_runtime::list_ch_vms().unwrap_or_default();
+        let mut first_err: Option<anyhow::Error> = None;
+        for name in names {
+            if let Err(e) = self.stop(&VmId(name.clone())) {
+                tracing::warn!(vm = %name, error = %e, "stop_all: failed to stop CH VM");
+                if first_err.is_none() {
+                    first_err = Some(e);
+                }
+            }
+        }
+        match first_err {
+            Some(e) => Err(e),
+            None => Ok(()),
+        }
     }
 
-    fn status(&self, _id: &VmId) -> Result<VmStatus> {
-        Ok(VmStatus::Stopped)
+    fn status(&self, id: &VmId) -> Result<VmStatus> {
+        let abs_dir = match ch_runtime::ch_vm_dir(&id.0) {
+            Ok(d) => d,
+            Err(_) => return Ok(VmStatus::Stopped),
+        };
+        let pid_file = ch_runtime::ch_pid_file(&abs_dir);
+        if ch_runtime::is_pid_alive(&pid_file).unwrap_or(false) {
+            Ok(VmStatus::Running)
+        } else {
+            Ok(VmStatus::Stopped)
+        }
     }
 
     fn list(&self) -> Result<Vec<VmInfo>> {
-        Ok(Vec::new())
+        let names = ch_runtime::list_ch_vms().unwrap_or_default();
+        Ok(names
+            .into_iter()
+            .map(|name| VmInfo {
+                id: VmId(name.clone()),
+                name,
+                status: VmStatus::Running,
+                guest_ip: None,
+                cpus: 0,
+                memory_mib: 0,
+                profile: None,
+                revision: None,
+                flake_ref: None,
+                ports: Vec::new(),
+            })
+            .collect())
     }
 
-    fn logs(&self, _id: &VmId, _lines: u32, _hypervisor: bool) -> Result<String> {
-        anyhow::bail!(NOT_YET_WIRED)
+    fn logs(&self, id: &VmId, lines: u32, hypervisor: bool) -> Result<String> {
+        let abs_dir = ch_runtime::ch_vm_dir(&id.0)
+            .with_context(|| format!("resolving per-VM dir for {}", id.0))?;
+        let filename = if hypervisor { "ch.log" } else { "console.log" };
+        let log_file = format!("{abs_dir}/{filename}");
+        mvm_runtime_base::shell::run_in_vm_stdout(&format!(
+            "tail -n {lines} {log_file} 2>/dev/null || true"
+        ))
     }
 
     fn is_available(&self) -> Result<bool> {
@@ -172,7 +299,10 @@ mod tests {
         assert!(caps.pause_resume, "CH supports pause/resume");
         assert!(caps.snapshots, "CH supports snapshots");
         assert!(caps.vsock, "CH supports vsock");
-        assert!(caps.tap_networking, "CH supports TAP networking");
+        // tap_networking is false in this implementation — CH
+        // supports it, but the start path doesn't wire TAP yet.
+        // See module docs ("What's deliberately out of scope here").
+        assert!(!caps.tap_networking, "CH TAP wiring is a follow-up");
     }
 
     #[test]
@@ -188,7 +318,10 @@ mod tests {
     }
 
     #[test]
-    fn cloud_hypervisor_start_is_not_yet_wired() {
+    fn cloud_hypervisor_start_requires_kernel_path() {
+        // Empty kernel_path / missing rootfs surface as a clear
+        // input-validation error *before* any shell-out fires —
+        // catches misuse without needing a live CH binary.
         let config = VmStartConfig {
             name: "ch-test".to_string(),
             rootfs_path: "/tmp/rootfs.ext4".to_string(),
@@ -196,25 +329,48 @@ mod tests {
         };
         let err = CloudHypervisorBackend
             .start(&config)
-            .expect_err("scaffolding start must error");
+            .expect_err("start without kernel_path must error");
         assert!(
-            err.to_string().contains("not yet wired"),
-            "error must reference the bring-up followup, got: {err}"
+            err.to_string().contains("kernel_path"),
+            "error must name kernel_path, got: {err}"
         );
     }
 
     #[test]
-    fn cloud_hypervisor_stop_all_is_idempotent() {
-        CloudHypervisorBackend
-            .stop_all()
-            .expect("stop_all is a no-op in scaffolding");
+    fn cloud_hypervisor_start_requires_rootfs_path() {
+        let config = VmStartConfig {
+            name: "ch-test".to_string(),
+            kernel_path: Some("/k/vmlinux".to_string()),
+            rootfs_path: String::new(),
+            ..Default::default()
+        };
+        let err = CloudHypervisorBackend
+            .start(&config)
+            .expect_err("start without rootfs_path must error");
+        assert!(
+            err.to_string().contains("rootfs_path"),
+            "error must name rootfs_path, got: {err}"
+        );
     }
 
     #[test]
-    fn cloud_hypervisor_status_returns_stopped_in_scaffolding() {
+    fn cloud_hypervisor_stop_all_is_idempotent_when_no_vms() {
+        // No CH VMs in this test environment — stop_all walks an
+        // empty list and returns Ok. The host-mutating shell-out
+        // path is fenced by `list_ch_vms` returning empty.
+        CloudHypervisorBackend
+            .stop_all()
+            .expect("stop_all over no-VMs must be Ok");
+    }
+
+    #[test]
+    fn cloud_hypervisor_status_returns_stopped_when_pid_absent() {
+        // No pid file under ~/microvm/vms/<name>/ — status reports
+        // Stopped without erroring. Exercises the "no VM here" path
+        // through the real `is_pid_alive` shell-out.
         let s = CloudHypervisorBackend
-            .status(&VmId("any".to_string()))
-            .expect("status is conservative in scaffolding");
+            .status(&VmId("ch-status-test-no-vm".to_string()))
+            .expect("status must not error on absent VM");
         assert_eq!(s, VmStatus::Stopped);
     }
 
