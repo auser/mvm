@@ -5,6 +5,23 @@
 > left. Phase 2 prep substrate (`mvm-security::snapshot_crypto`,
 > `mvm-security::keystore`) landed in commit `a9386f8` on 2026-05-11.
 
+**Status (2026-05-11)**: **all six workstreams shipped**. ADR-042
+(`specs/adrs/042-encryption-substrate.md`) documents the closed
+surface. The plan-60 Phase 2 cornerstone — "encryption everywhere"
+— is user-observably true: tenant DEK rotates without re-encrypting
+data, snapshots are AES-GCM at rest under a host-local tenant DEK
+(falling back to HMAC-only when no DEK is configured), and
+`mvmctl secret put/get/ls/rm` is the prod-safe operator surface.
+
+| Workstream | Status | Landing commit |
+|---|---|---|
+| W1 — `key_rotation` primitives | ✅ shipped | f7e39a7 |
+| W2 — `SecretBox<T>` wrapping pass | ✅ shipped | b9e4e64 |
+| W3 — `KeyringProvider` + `FileKeyProvider` | ✅ shipped | 1ea9352 |
+| W4 — `mvmctl secret` CLI + `SecretStore` | ✅ shipped | a30f866 |
+| W5 — chunked snapshot AES-GCM | ✅ shipped | 6fc798d |
+| W6 — ADR-042 + CHANGELOG | ✅ shipped | (this commit) |
+
 ## State of play (2026-05-11)
 
 ### Already shipped — Phase 2 substrate

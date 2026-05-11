@@ -6,6 +6,66 @@ uses [SemVer](https://semver.org/) once it reaches 1.0.
 
 ## [Unreleased]
 
+### Added
+
+- **Plan 63 Phase 2 — encryption everywhere.** Closed in six
+  workstreams (commits `b9e4e64`, `1ea9352`, `f7e39a7`, `a30f866`,
+  `6fc798d`, plus this CHANGELOG entry):
+  - **W1** — `mvm-security::key_rotation` module with `rewrap_dek`
+    (dispatches on `WrapAlgorithm`; `Aes256Gcm` in-crate, `AesKwp`
+    refused with a pointer at mvmd), `rotate_master_key` +
+    `MasterKeyManifest` (versioned on-disk key store with atomic
+    manifest writes), `migrate_wrapped_keys` (resumable bulk
+    re-wrap), `rotate_luks_slot` (cryptsetup shell-out via
+    mode-0600 tempfiles — never argv), `reseal_snapshot`
+    (verify-under-old + reseal-under-new + atomic). 19 tests.
+  - **W2** — every secret-carrying type wraps `secrecy::SecretBox<T>`.
+    `KeyProvider::get_data_key` returns `SecretBox<Vec<u8>>`;
+    `snapshot_hmac::load_or_init_key` returns
+    `SecretBox<[u8; HMAC_KEY_BYTES]>`. xtask
+    `check-no-display-on-secret-types` lint runs on every PR.
+  - **W3** — `mvm-security::keystore` now ships `KeyringProvider`
+    (OS-native keystore: macOS Keychain via `new_with_target`,
+    Linux Secret Service, Windows Credential Manager) +
+    `FileKeyProvider` (raw 32 bytes at `<keys_dir>/<tenant>.key`,
+    mode 0600/0400) + `default_provider()` (auto-detects best
+    available impl). `keyring = "3"` lifted into workspace deps.
+    25 tests.
+  - **W4** — `mvm-security::secret_store` with the `SecretStore`
+    trait + `FileSecretStore` + `KeyringSecretStore` for
+    multi-key tenant secrets (distinct from `KeyProvider`'s
+    single-master-DEK shape). `mvmctl secret put/get/ls/rm`
+    CLI surface; the `get` handler refuses TTY without `--force`.
+    Audit log at `~/.mvm/audit/secrets.jsonl` records every CRUD
+    op without ever recording the value. 25 tests.
+  - **W5** — `mvm-security::snapshot_encryption` chunked
+    AES-256-GCM file-bound primitives + integration into
+    `mvm::vm::instance_snapshot::{pause_and_seal,
+    verify_and_resume}`. Snapshots encrypt transparently when a
+    tenant DEK is configured; HMAC seal covers the ciphertext.
+    Resume probes for MVSE magic and refuses unencrypted-under-
+    keyed-tenant as a downgrade defence (override via
+    `MVM_ALLOW_UNENCRYPTED_SNAPSHOT=1` for one-time migration).
+    19 tests.
+  - **W6** — ADR-042 ("Encryption substrate") documents the full
+    surface + this CHANGELOG entry. Plan 63 closes.
+
+  Tests: workspace at **2082 passed / 0 failed** post-W6. Plan-60
+  Phase 2 ("Encryption everywhere") moves from "substrate-only"
+  to user-observably true; tenant DEK rotation works without
+  re-encrypting data, snapshots are encrypted at rest, and
+  `mvmctl secret put` is the documented prod-safe surface.
+
+- **Plan 64 — supervisor wiring.** `mvmctl up` now admits a
+  signed `ExecutionPlan` through `mvm-plan::verify_plan` + G4
+  validity window + nonce replay-store, and emits chain-signed
+  audit entries to `~/.mvm/audit/<tenant>.jsonl`. CLAUDE.md
+  security claim 8 ("every workload runs from a signed, audited
+  ExecutionPlan") is now user-observably true. ADR-041 documents
+  the lifecycle; `policy_resolver::resolve_supervisor_components`
+  (W5) is the substrate that hands `ResolvedSlots` to a future
+  `Supervisor::launch` consumer once the mvm-hostd lift lands.
+
 ## [0.14.0] — 2026-05-11 — v1 → v2 cutover
 
 **This release replaces v1 with a complete rewrite at the same canonical

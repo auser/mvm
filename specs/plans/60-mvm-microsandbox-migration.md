@@ -1705,6 +1705,17 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 **Risk**: microsandbox 0.4.5 may not yet expose vsock PTY hooks compatible with our `mvm-guest::console`. Verify by reading microsandbox source first; fall back to microsandbox's own console if our framing doesn't fit.
 
 ### Phase 2 — Encryption everywhere (volumes, snapshots, secrets) + key rotation (~7-10 days)
+
+**Status (2026-05-11)**: ✅ shipped via plan 63 (`specs/plans/63-phase-2-encryption-everywhere.md`)
+W1–W6 + ADR-042 (`specs/adrs/042-encryption-substrate.md`).
+Tenant DEK rotates without re-encrypting data; snapshots are
+AES-GCM at rest under a host-local tenant DEK; `mvmctl secret
+put/get/ls/rm` is the prod-safe operator surface; every secret-
+carrying type wraps `secrecy::SecretBox<T>` with CI lint
+enforcement. Object-store volume encryption (`EncryptedBackend<B>`)
+lives on the mvmd side per plan 45 §D5 — that half is mvmd's
+work, not mvm's.
+
 **Goal**: `mvmctl volume create db --encrypt`, `mvmctl up --volume db:/var/db`, `mvmctl secret put api_token --tenant t1`, `mvmctl key rotate --kek tenant:t1`, `mvmctl snapshot save` — all with verified encryption at rest.
 
 **Action**:
