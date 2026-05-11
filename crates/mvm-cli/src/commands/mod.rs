@@ -170,6 +170,12 @@ pub(in crate::commands) enum Commands {
     /// hardware quote when a `attestation-{tpm2,sev-snp,tdx}` feature
     /// is wired in. Plan 60 Phase 6.
     Attest(ops::attest::Args),
+    /// Inspect a tenant policy bundle on disk (`show`, `verify`).
+    /// Operator-facing surface over the parsed-but-not-yet-enforced
+    /// bundles at `~/.mvm/policies/<tenant>/<workload>.toml`.
+    /// `mvmctl policy update` is stubbed in v0 — production updates
+    /// require an mvmd-signed plan (Phase 8). Plan 60 Phase 3 Slice D.
+    Policy(ops::policy::Args),
 }
 
 // ============================================================================
@@ -289,6 +295,7 @@ pub fn run() -> Result<()> {
         Commands::Volume(a) => vm::volume::run(&cli, a, &cfg),
         Commands::Secret(a) => ops::secret::run(&cli, a, &cfg),
         Commands::Attest(a) => ops::attest::run(&cli, a, &cfg),
+        Commands::Policy(a) => ops::policy::run(&cli, a, &cfg),
     };
 
     with_hints(result)
