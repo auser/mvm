@@ -3909,6 +3909,7 @@ dependencies = [
  "predicates",
  "rand 0.8.6",
  "reqwest 0.12.28",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2 0.10.9",

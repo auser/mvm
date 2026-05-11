@@ -7,5 +7,6 @@ pub(super) mod config;
 pub(super) mod mcp;
 pub(super) mod metrics;
 pub(super) mod network;
+pub(super) mod secret;
 
 pub(super) use super::{Cli, shared};

@@ -157,6 +157,13 @@ pub(in crate::commands) enum Commands {
     /// shadow verity-protected files. `--remote` proxies through
     /// mvmd's REST API for provider-backed buckets.
     Volume(vm::volume::Args),
+    /// Manage tenant secrets (put / get / ls / rm). Values are
+    /// stored in the OS-native keystore when reachable, else in
+    /// mode-0600 files under `~/.mvm/secrets/<tenant>/`. Every
+    /// put/get/delete/list emits an audit entry to
+    /// `~/.mvm/audit/secrets.jsonl` — values are never logged.
+    /// Plan 63 W4.
+    Secret(ops::secret::Args),
 }
 
 // ============================================================================
@@ -274,6 +281,7 @@ pub fn run() -> Result<()> {
         Commands::Resume(a) => vm::pause::run_resume(&cli, a, &cfg),
         Commands::Snapshot(a) => vm::pause::run_snapshot(&cli, a, &cfg),
         Commands::Volume(a) => vm::volume::run(&cli, a, &cfg),
+        Commands::Secret(a) => ops::secret::run(&cli, a, &cfg),
     };
 
     with_hints(result)

@@ -246,6 +246,23 @@ tests stay gated per-platform.
 
 ## W4 — `mvmctl secret` CLI surface (2 days)
 
+**Status (2026-05-11)**: ✅ shipped. `mvm-security::secret_store`
+adds the multi-key tenant secret abstraction (`SecretStore` trait
++ `FileSecretStore` + `KeyringSecretStore` + `default_secret_store`).
+`crates/mvm-cli/src/commands/ops/secret.rs` wires the four
+subcommands (`put`, `get`, `ls`, `rm`) onto that abstraction.
+17 unit tests cover the store backends; 8 cover the CLI handlers
++ audit log shape. Value sources are inline-flag / stdin (`--value
+-`) / `--value-file <PATH>`; `--value` and `--value-file` are
+mutually exclusive. The `get` handler refuses to write the value
+to a TTY unless `--force` is passed — protects against
+shoulder-surfing during interactive use; scripts using `$(mvmctl
+secret get …)` work because the pipe makes stdout non-tty. Audit
+emissions go to `~/.mvm/audit/secrets.jsonl` (one JSON line per
+operation, never including the value). Validation: `validate_shell_id`
+runs on both tenant and name *before* anything reaches disk or
+keyring, blocking `--tenant ../etc` and similar.
+
 **Goal**: `mvmctl secret put api_token --tenant t1 --value $API_TOKEN`,
 `mvmctl secret get api_token --tenant t1`, `mvmctl secret rm`,
 `mvmctl secret ls --tenant t1`.

@@ -24,6 +24,7 @@ chrono.workspace = true
 ed25519-dalek.workspace = true
 names.workspace = true
 rand.workspace = true
+secrecy.workspace = true
 uuid.workspace = true
 clap.workspace = true
 reqwest.workspace = true
