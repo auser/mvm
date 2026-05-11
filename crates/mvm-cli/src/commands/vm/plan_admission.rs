@@ -1,8 +1,3 @@
-// W3 callsite into up.rs's cmd_run is staged separately so this module
-// can be reviewed in isolation. Dead-code allow drops when up.rs
-// invokes `admit_for_run`.
-#![allow(dead_code)]
-
 //! Plan 64 W3 — plan-admission pipeline used by `mvmctl up`.
 //!
 //! Threads W1's `synthesize_plan` + W2's `host_signer` into the
@@ -99,11 +94,20 @@ impl Default for InMemoryNonceLedger {
 /// Result of a successful admission. Carries everything the caller
 /// needs to hand to the backend (the plan + its id) and to W4's
 /// audit signer (the signed envelope itself).
+///
+/// `plan` and `signed` are tagged `allow(dead_code)` in the W3 callsite
+/// commit because the only callers that consume them today are the
+/// in-module tests; W4 (`FileAuditSigner` wiring) reads both — the
+/// plan to derive an `AuditEntry::for_plan`, the signed envelope as
+/// the canonical artifact of admission. Keeping them on the struct
+/// stabilises the surface across the staged commits.
 #[derive(Debug)]
 pub struct AdmittedPlan {
+    #[allow(dead_code)]
     pub plan: ExecutionPlan,
     pub plan_id: PlanId,
     pub signer_id: String,
+    #[allow(dead_code)]
     pub signed: SignedExecutionPlan,
 }
 

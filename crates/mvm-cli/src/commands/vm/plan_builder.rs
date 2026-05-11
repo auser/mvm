@@ -1,8 +1,3 @@
-// W1 lands the synthesis path ahead of W3's callsite in `up.rs`.
-// Dead-code allow is scoped to this file — drops on its own once
-// `up::run` consumes `synthesize_plan`.
-#![allow(dead_code)]
-
 //! Plan 64 W1 — `ExecutionPlan` synthesis from `mvmctl up` CLI args.
 //!
 //! Turns the surface-level CLI shape (flake ref, name, cpus, memory,

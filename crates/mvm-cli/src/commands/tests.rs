@@ -1559,3 +1559,45 @@ fn test_is_apple_container_dev_running_returns_bool() {
 fn _runparams_has_lifetime() {
     fn _take(_p: RunParams<'_>) {}
 }
+
+// ---- Plan-64 W3 admission flags ----
+
+#[test]
+fn test_up_tenant_defaults_to_local() {
+    let cli = Cli::try_parse_from(["mvmctl", "up"]).expect("parse");
+    match cli.command {
+        Commands::Up(up::Args { tenant, .. }) => {
+            assert_eq!(tenant, "local", "tenant defaults to 'local' per ADR-002");
+        }
+        _ => panic!("Expected Up command"),
+    }
+}
+
+#[test]
+fn test_up_tenant_override_via_flag() {
+    let cli = Cli::try_parse_from(["mvmctl", "up", "--tenant", "acme"]).expect("parse");
+    match cli.command {
+        Commands::Up(up::Args { tenant, .. }) => assert_eq!(tenant, "acme"),
+        _ => panic!("Expected Up command"),
+    }
+}
+
+#[test]
+fn test_up_no_supervisor_defaults_off() {
+    let cli = Cli::try_parse_from(["mvmctl", "up"]).expect("parse");
+    match cli.command {
+        Commands::Up(up::Args { no_supervisor, .. }) => {
+            assert!(!no_supervisor, "admission is on by default");
+        }
+        _ => panic!("Expected Up command"),
+    }
+}
+
+#[test]
+fn test_up_no_supervisor_flag_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "up", "--no-supervisor"]).expect("parse");
+    match cli.command {
+        Commands::Up(up::Args { no_supervisor, .. }) => assert!(no_supervisor),
+        _ => panic!("Expected Up command"),
+    }
+}

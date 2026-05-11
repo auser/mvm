@@ -1,6 +1,3 @@
-// W2 lands the host-signer paths ahead of W3's callsite.
-#![allow(dead_code)]
-
 //! Plan 64 W2 — host-local Ed25519 signer for `ExecutionPlan` envelopes.
 //!
 //! Stores keypair under `~/.mvm/keys/host-signer.{ed25519,pub}`:
@@ -135,6 +132,10 @@ impl std::fmt::Debug for HostSigner {
 
 impl HostSigner {
     /// Verbatim copy of the public key for trusted-keys-list use.
+    /// Consumed by W4's audit chain (`FileAuditSigner` is built around
+    /// the host signer's keypair); kept on the surface in W3 so the
+    /// `pub` API is stable across the staged commits.
+    #[allow(dead_code)]
     pub fn verifying_key(&self) -> VerifyingKey {
         self.verifying
     }

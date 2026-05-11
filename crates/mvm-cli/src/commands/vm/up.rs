@@ -15,12 +15,92 @@ use mvm_core::vm_backend::VmId;
 use super::super::env::apple_container::ensure_default_microvm_image;
 use super::Cli;
 use super::forward::forward_ports;
+use super::plan_admission::{AdmittedPlan, InMemoryNonceLedger, SystemClock, admit_for_run};
+use super::plan_builder::SynthesisInput;
 use super::shared::{
     VmStartParams, VolumeSpec, clap_flake_ref, clap_port_spec, clap_vm_name, clap_volume_spec,
     env_vars_to_drive_file, parse_port_specs, parse_volume_spec, ports_to_drive_file,
     read_dir_to_drive_files, request_port_forward, resolve_flake_ref, resolve_network_policy,
     wait_for_guest_agent,
 };
+
+/// Inputs for [`admit_plan_for_boot`]. Grouped so the helper avoids
+/// the workspace `clippy::too_many_arguments = "deny"` ceiling and so
+/// future callers (W4 audit, W5 policy slots) can extend the shape
+/// without churning every call site.
+struct AdmitPlanForBootParams<'a> {
+    pub tenant: &'a str,
+    pub vm_name: &'a str,
+    pub backend_name: &'a str,
+    pub rootfs_path: &'a std::path::Path,
+    pub cpus: u32,
+    pub mem_mib: u64,
+    pub no_supervisor: bool,
+    pub ledger: &'a InMemoryNonceLedger,
+    /// Override for the host-signer keys directory. Production callers
+    /// pass `None`, which resolves to `~/.mvm/keys/`; tests pass a
+    /// tempdir so they don't write into the real user's home.
+    pub keys_dir: Option<&'a std::path::Path>,
+}
+
+/// Run plan-64 admission (`synthesize → sign → verify → check_window →
+/// nonce`) right before a backend `start()`. Called from every
+/// `mvmctl up` call site that boots a VM: the main path, the
+/// `MVM_DIRECT_BOOT` launchd branch, and the `--watch` rebuild loop.
+///
+/// `no_supervisor = true` short-circuits to `Ok(None)` so the legacy
+/// path keeps working while the deprecation grace window is open.
+/// The caller is expected to have already resolved the rootfs path on
+/// disk (admission hashes it for the plan's `SignedImageRef`); on
+/// first build the rootfs is the freshly-emitted Nix store path, on
+/// snapshot restore it is the template's frozen rootfs, on
+/// `MVM_DIRECT_BOOT` it is whatever the launchd agent staged.
+///
+/// Each `cmd_run` invocation owns its own [`InMemoryNonceLedger`] —
+/// the only way `admit_for_run` can refuse for replay within one
+/// process is the `--watch` loop (multiple admits over the lifetime
+/// of one `cmd_run`), and that's the desired G4 behaviour.
+///
+/// The image name on the plan is the VM name (the workload identifier
+/// the rest of the supervisor surface uses). Once `mvm-hostd` lifts
+/// the supervisor in-process, the proper `mvm_security::image_verify`
+/// signed-manifest path can replace this.
+fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<AdmittedPlan>> {
+    if p.no_supervisor {
+        return Ok(None);
+    }
+    let sha = mvm_security::image_verify::sha256_file(p.rootfs_path).with_context(|| {
+        format!(
+            "hashing rootfs at {} for plan admission",
+            p.rootfs_path.display()
+        )
+    })?;
+    let input = SynthesisInput {
+        vm_name: p.vm_name,
+        tenant: Some(p.tenant),
+        backend_name: p.backend_name,
+        image_name: p.vm_name,
+        image_sha256: &sha,
+        image_cosign_bundle: None,
+        cpus: p.cpus,
+        mem_mib: p.mem_mib,
+        disk_mib: 0,
+        boot_timeout_secs: 60,
+        exec_timeout_secs: 0,
+        destroy_on_exit: true,
+    };
+    let admitted = admit_for_run(&input, &SystemClock, p.ledger, p.keys_dir)?;
+    tracing::info!(
+        plan_id = %admitted.plan_id.0,
+        signer_id = %admitted.signer_id,
+        tenant = %p.tenant,
+        workload = %p.vm_name,
+        backend = %p.backend_name,
+        image_sha256 = %sha,
+        "plan admitted",
+    );
+    Ok(Some(admitted))
+}
 
 #[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct Args {
@@ -105,6 +185,15 @@ pub(in crate::commands) struct Args {
     /// Default behaviour resumes on connect.
     #[arg(long)]
     pub no_auto_resume: bool,
+    /// Tenant for the synthesized `ExecutionPlan` (plan 64). Defaults
+    /// to `"local"` per ADR-002's "one guest = one workload" model.
+    #[arg(long, default_value = "local")]
+    pub tenant: String,
+    /// Skip plan-64 admission (`synthesize → sign → verify → check_window
+    /// → nonce`). One-release escape hatch; prints a deprecation warning
+    /// when set. Will be removed once admission is the only path.
+    #[arg(long)]
+    pub no_supervisor: bool,
     /// Build-mode override flags (`--dev` / `--prod`). Default: `--prod`.
     #[command(flatten)]
     pub build_mode: super::super::shared::BuildModeFlags,
@@ -185,6 +274,13 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
     let auto_resume = !args.no_auto_resume;
     let build_mode = args.build_mode.resolve();
 
+    if args.no_supervisor {
+        ui::warn(
+            "--no-supervisor is a one-release escape hatch and will be removed; \
+             plan-64 admission becomes mandatory in the next minor release.",
+        );
+    }
+
     cmd_run(RunParams {
         flake_ref: args.flake.as_deref(),
         template_name: resolved_template_arg.as_deref(),
@@ -209,6 +305,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         sandbox_tags,
         sandbox_ttl,
         auto_resume,
+        tenant: &args.tenant,
+        no_supervisor: args.no_supervisor,
         build_mode,
     })
 }
@@ -240,6 +338,10 @@ pub(in crate::commands) struct RunParams<'a> {
     pub(super) sandbox_ttl: Option<std::time::Duration>,
     /// `false` when `--no-auto-resume` is set.
     pub(super) auto_resume: bool,
+    /// Tenant string for plan-64 `ExecutionPlan` synthesis.
+    pub(super) tenant: &'a str,
+    /// `true` when `--no-supervisor` is set — disables plan-64 admission.
+    pub(super) no_supervisor: bool,
     pub(super) build_mode: mvm_build::pipeline::BuildMode,
 }
 
@@ -268,6 +370,8 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         sandbox_tags,
         sandbox_ttl,
         auto_resume,
+        tenant,
+        no_supervisor,
         build_mode,
     } = params;
     let _span =
@@ -374,6 +478,11 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         let _ = registry.save(&registry_path);
     }
 
+    // Plan-64 admission ledger. One per `cmd_run`; the watch-mode loop
+    // reuses it across rebuilds so synthesized plans share a single
+    // replay-window across the lifetime of the process.
+    let admission_ledger = InMemoryNonceLedger::new();
+
     // Direct boot mode: launchd agent passes kernel/rootfs via env vars.
     // Skip the build/template loading entirely.
     if std::env::var("MVM_DIRECT_BOOT").as_deref() == Ok("1") {
@@ -382,12 +491,26 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         let rootfs = std::env::var("MVM_ROOTFS_PATH")
             .map_err(|_| anyhow::anyhow!("MVM_ROOTFS_PATH not set"))?;
 
+        let direct_cpus = cpus.unwrap_or(2);
+        let direct_mem = memory.unwrap_or(512);
+        let _admitted = admit_plan_for_boot(AdmitPlanForBootParams {
+            tenant,
+            vm_name: &vm_name,
+            backend_name: effective_hypervisor,
+            rootfs_path: std::path::Path::new(&rootfs),
+            cpus: direct_cpus,
+            mem_mib: direct_mem as u64,
+            no_supervisor,
+            ledger: &admission_ledger,
+            keys_dir: None,
+        })?;
+
         let start_config = mvm_core::vm_backend::VmStartConfig {
             name: vm_name.clone(),
             rootfs_path: rootfs,
             kernel_path: Some(kernel),
-            cpus: cpus.unwrap_or(2),
-            memory_mib: memory.unwrap_or(512),
+            cpus: direct_cpus,
+            memory_mib: direct_mem,
             ..Default::default()
         };
 
@@ -668,6 +791,23 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
     // SAFETY: called early in single-threaded CLI startup before spawning
     // worker threads; no other threads are reading env vars concurrently.
     unsafe { std::env::set_var("MVM_REEXEC_NAME", &vm_name) };
+
+    // Plan-64 admission for the regular boot path. Snapshot restore
+    // and cold-boot both consume `rootfs_path` below, so admission
+    // happens here before either branch moves the path. The launchd
+    // detach-fork further down inside the else-branch boots through
+    // the same start_config, so it inherits this admission.
+    let _admitted_main = admit_plan_for_boot(AdmitPlanForBootParams {
+        tenant,
+        vm_name: &vm_name,
+        backend_name: effective_hypervisor,
+        rootfs_path: std::path::Path::new(&rootfs_path),
+        cpus: final_cpus,
+        mem_mib: final_memory as u64,
+        no_supervisor,
+        ledger: &admission_ledger,
+        keys_dir: None,
+    })?;
 
     // If a template snapshot exists AND the backend supports snapshots,
     // restore from it instead of cold-booting.
@@ -961,6 +1101,26 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 w_config_files.push(f);
             }
             let (w_verity_path, w_roothash) = microvm::probe_verity_sidecar(&result.rootfs_path);
+            // Plan-64 admission for the watch-mode rebuild path. The
+            // shared `admission_ledger` provides replay protection across
+            // rebuilds — a synthesized plan can only admit once even if
+            // the same artifact hash recurs (nonce is fresh per call).
+            if let Err(e) = admit_plan_for_boot(AdmitPlanForBootParams {
+                tenant,
+                vm_name: &vm_name_owned,
+                backend_name: effective_hypervisor,
+                rootfs_path: std::path::Path::new(&result.rootfs_path),
+                cpus: final_cpus,
+                mem_mib: final_memory as u64,
+                no_supervisor,
+                ledger: &admission_ledger,
+                keys_dir: None,
+            }) {
+                ui::warn(&format!(
+                    "Plan admission failed: {e}; waiting for next change..."
+                ));
+                continue;
+            }
             let w_start_config = VmStartParams {
                 name: vm_name_owned.clone(),
                 rootfs_path: result.rootfs_path,
@@ -1080,5 +1240,139 @@ mod security_banner_tests {
                 None => std::env::remove_var("MVM_ACK_DOCKER_TIER"),
             }
         }
+    }
+}
+
+// ── Plan 64 W3 admit_plan_for_boot tests ────────────────────────────
+//
+// These tests stay scoped to the helper rather than `cmd_run` itself
+// because the dispatcher (`cmd_run`) calls into Lima/Firecracker
+// backends that need a live host environment. `admit_plan_for_boot`
+// is the bridge between CLI args and admission, so verifying it
+// in isolation covers the contract the dispatcher depends on without
+// pulling in `AnyBackend::from_hypervisor` startup.
+
+#[cfg(test)]
+mod admit_plan_tests {
+    use super::*;
+    use std::io::Write;
+
+    fn write_rootfs(dir: &std::path::Path, bytes: &[u8]) -> std::path::PathBuf {
+        let path = dir.join("rootfs.ext4");
+        let mut f = std::fs::File::create(&path).expect("create rootfs");
+        f.write_all(bytes).expect("write rootfs");
+        path
+    }
+
+    #[test]
+    fn no_supervisor_short_circuits_to_none() {
+        // The escape hatch must skip admission entirely — no host
+        // signer load, no rootfs hash, no nonce burn.
+        let dir = tempfile::tempdir().unwrap();
+        let rootfs = write_rootfs(dir.path(), b"unused");
+        let ledger = InMemoryNonceLedger::new();
+        let result = admit_plan_for_boot(AdmitPlanForBootParams {
+            tenant: "local",
+            vm_name: "vm-skip",
+            backend_name: "firecracker",
+            rootfs_path: &rootfs,
+            cpus: 2,
+            mem_mib: 512,
+            no_supervisor: true,
+            ledger: &ledger,
+            keys_dir: None, // not read — short-circuit returns first
+        })
+        .expect("must succeed");
+        assert!(result.is_none(), "no_supervisor must return None");
+    }
+
+    #[test]
+    fn admits_real_rootfs_and_returns_plan_id() {
+        let keys_dir = tempfile::tempdir().unwrap();
+        let rootfs_dir = tempfile::tempdir().unwrap();
+        let rootfs = write_rootfs(rootfs_dir.path(), b"hello rootfs");
+        let ledger = InMemoryNonceLedger::new();
+        let admitted = admit_plan_for_boot(AdmitPlanForBootParams {
+            tenant: "local",
+            vm_name: "vm-happy",
+            backend_name: "firecracker",
+            rootfs_path: &rootfs,
+            cpus: 2,
+            mem_mib: 512,
+            no_supervisor: false,
+            ledger: &ledger,
+            keys_dir: Some(keys_dir.path()),
+        })
+        .expect("admission")
+        .expect("Some when admission ran");
+        assert!(!admitted.plan_id.0.is_empty());
+        assert_eq!(admitted.plan.workload.0, "vm-happy");
+        assert_eq!(admitted.plan.tenant.0, "local");
+        assert_eq!(admitted.plan.resources.cpus, 2);
+        assert_eq!(admitted.plan.resources.mem_mib, 512);
+    }
+
+    #[test]
+    fn admission_failure_when_rootfs_missing() {
+        // sha256_file fails when the file does not exist; the helper
+        // must propagate the error with context naming the rootfs path.
+        let keys_dir = tempfile::tempdir().unwrap();
+        let ledger = InMemoryNonceLedger::new();
+        let err = admit_plan_for_boot(AdmitPlanForBootParams {
+            tenant: "local",
+            vm_name: "vm-missing",
+            backend_name: "firecracker",
+            rootfs_path: std::path::Path::new("/nonexistent/rootfs.ext4"),
+            cpus: 1,
+            mem_mib: 128,
+            no_supervisor: false,
+            ledger: &ledger,
+            keys_dir: Some(keys_dir.path()),
+        })
+        .expect_err("missing rootfs must fail");
+        assert!(
+            err.chain().any(|e| e.to_string().contains("rootfs")),
+            "error must name rootfs: {err}"
+        );
+    }
+
+    #[test]
+    fn two_admissions_in_same_run_produce_distinct_plan_ids() {
+        // The shared ledger is the per-`cmd_run` replay-store. Two
+        // admissions with different rootfs hashes (or even same hash —
+        // synthesize_plan generates fresh nonces) must both succeed.
+        let keys_dir = tempfile::tempdir().unwrap();
+        let rootfs_dir = tempfile::tempdir().unwrap();
+        let rootfs = write_rootfs(rootfs_dir.path(), b"first");
+        let ledger = InMemoryNonceLedger::new();
+
+        let a1 = admit_plan_for_boot(AdmitPlanForBootParams {
+            tenant: "local",
+            vm_name: "vm-1",
+            backend_name: "firecracker",
+            rootfs_path: &rootfs,
+            cpus: 1,
+            mem_mib: 128,
+            no_supervisor: false,
+            ledger: &ledger,
+            keys_dir: Some(keys_dir.path()),
+        })
+        .unwrap()
+        .unwrap();
+        let a2 = admit_plan_for_boot(AdmitPlanForBootParams {
+            tenant: "local",
+            vm_name: "vm-2",
+            backend_name: "firecracker",
+            rootfs_path: &rootfs,
+            cpus: 1,
+            mem_mib: 128,
+            no_supervisor: false,
+            ledger: &ledger,
+            keys_dir: Some(keys_dir.path()),
+        })
+        .unwrap()
+        .unwrap();
+        assert_ne!(a1.plan_id, a2.plan_id);
+        assert_ne!(a1.plan.nonce, a2.plan.nonce);
     }
 }
