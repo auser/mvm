@@ -39,6 +39,7 @@ pub mod backend;
 pub mod circuit_breaker;
 pub mod destination;
 pub mod egress;
+pub mod firewall;
 pub mod hickory_dns;
 pub mod injection_guard;
 pub mod inspector;
