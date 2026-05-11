@@ -140,6 +140,28 @@ pub fn run_in_vm_capture(script: &str) -> Result<Output> {
     linux_env::default_env().run_capture(script)
 }
 
+/// Quote `arg` so it can be safely interpolated as a single token in
+/// a bash script. Wraps the input in single quotes and escapes any
+/// embedded single quotes via the `'\''` idiom — works for arbitrary
+/// content (paths with spaces, dollar signs, backticks, embedded
+/// newlines) without further shell expansion.
+///
+/// Use this whenever a path or other untrusted-shape string flows
+/// into a `bash -c` script, especially for `run_in_vm*` callers.
+pub fn shell_quote(arg: &str) -> String {
+    let mut out = String::with_capacity(arg.len() + 2);
+    out.push('\'');
+    for c in arg.chars() {
+        if c == '\'' {
+            out.push_str(r"'\''");
+        } else {
+            out.push(c);
+        }
+    }
+    out.push('\'');
+    out
+}
+
 /// Replace the current process with an interactive command (for SSH/TTY).
 /// Uses Unix's process replacement — the Rust process is fully replaced, no return on success.
 /// Note: This is safe because all arguments are passed as an array, not via shell interpolation.
@@ -204,5 +226,61 @@ mod tests {
         assert!(result.is_err());
         let err_msg = result.unwrap_err().to_string();
         assert!(err_msg.contains("Command failed"));
+    }
+
+    #[test]
+    fn shell_quote_wraps_in_single_quotes() {
+        assert_eq!(shell_quote("hello"), "'hello'");
+    }
+
+    #[test]
+    fn shell_quote_escapes_embedded_single_quote() {
+        assert_eq!(shell_quote("it's"), r"'it'\''s'");
+    }
+
+    #[test]
+    fn shell_quote_preserves_shell_metacharacters() {
+        // The point of single-quote wrapping: no further expansion.
+        assert_eq!(shell_quote("a$b`c;d|e&f"), "'a$b`c;d|e&f'");
+    }
+
+    #[test]
+    fn shell_quote_handles_spaces_and_paths() {
+        assert_eq!(
+            shell_quote("/tmp/path with spaces/file"),
+            "'/tmp/path with spaces/file'"
+        );
+    }
+
+    #[test]
+    fn shell_quote_handles_empty_string() {
+        assert_eq!(shell_quote(""), "''");
+    }
+
+    #[test]
+    fn shell_quote_round_trips_through_bash() {
+        // The strongest test: actually run bash and verify the quoted
+        // arg comes back unchanged. Covers the corner cases (newlines,
+        // backslashes, sequences that look like substitutions).
+        for &arg in &[
+            "simple",
+            "spaces here",
+            "$VAR",
+            "`backticks`",
+            "a'b",
+            "a\nb",
+            "a\\b",
+            "$(injection attempt)",
+            "&& rm -rf /",
+        ] {
+            let quoted = shell_quote(arg);
+            let out =
+                run_host("bash", &["-c", &format!("printf '%s' {quoted}")]).expect("bash echo");
+            assert_eq!(
+                std::str::from_utf8(&out.stdout).unwrap(),
+                arg,
+                "shell_quote failed to round-trip {arg:?} (quoted as {quoted:?})"
+            );
+        }
     }
 }

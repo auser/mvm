@@ -51,7 +51,7 @@
 //! review can't catch.
 
 use anyhow::{Context, Result};
-use mvm_base::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
+use mvm_base::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible, shell_quote};
 
 /// Resolve the CH per-VM directory inside `VMS_DIR`. Same shape as
 /// FC's `microvm::resolve_vm_dir` so `mvmctl ls` and friends can
@@ -88,31 +88,40 @@ pub(crate) fn ch_vsock_socket(abs_dir: &str) -> String {
 /// the daemon survives the parent shell, redirect stdio into per-
 /// VM log files, write the PID to `ch.pid`. Waits for the API
 /// socket to appear before returning.
+///
+/// Path inputs are `shell_quote`d so a per-VM dir containing shell
+/// metacharacters can't escape into the host shell. The inner
+/// `bash -c '...'` body still uses unquoted variable references
+/// because by that point the variables are bash locals, not
+/// untrusted strings.
 pub(crate) fn start_ch_daemon(abs_dir: &str, abs_socket: &str) -> Result<()> {
+    let q_dir = shell_quote(abs_dir);
+    let q_socket = shell_quote(abs_socket);
     run_in_vm_visible(&format!(
         r#"
-        mkdir -p {dir}
-        sudo rm -f {socket}
-        rm -f {dir}/v.sock
-        touch {dir}/console.log {dir}/ch.log
-        sudo bash -c 'nohup setsid cloud-hypervisor --api-socket {socket} \
-            </dev/null >{dir}/console.log 2>{dir}/ch.log &
-            echo $! > {dir}/ch.pid'
+        set -eu
+        DIR={q_dir}
+        SOCK={q_socket}
+        mkdir -p "$DIR"
+        sudo rm -f "$SOCK"
+        rm -f "$DIR/v.sock"
+        touch "$DIR/console.log" "$DIR/ch.log"
+        sudo bash -c "nohup setsid cloud-hypervisor --api-socket \"$SOCK\" \
+            </dev/null >\"$DIR/console.log\" 2>\"$DIR/ch.log\" &
+            echo \$! > \"$DIR/ch.pid\""
 
         echo "[mvm] Waiting for CH API socket..."
         for i in $(seq 1 30); do
-            [ -S {socket} ] && break
+            [ -S "$SOCK" ] && break
             sleep 0.1
         done
 
-        if [ ! -S {socket} ]; then
+        if [ ! -S "$SOCK" ]; then
             echo "[mvm] ERROR: cloud-hypervisor API socket did not appear." >&2
             exit 1
         fi
         echo "[mvm] cloud-hypervisor started."
         "#,
-        socket = abs_socket,
-        dir = abs_dir,
     ))
 }
 
@@ -121,45 +130,65 @@ pub(crate) fn start_ch_daemon(abs_dir: &str, abs_socket: &str) -> Result<()> {
 /// Same shape as `microvm::api_put_socket` — shells out to
 /// `curl --unix-socket`. Non-2xx responses raise an error with
 /// the body included for diagnostics.
-pub(crate) fn api_put(socket: &str, endpoint: &str, body: &str) -> Result<()> {
-    let url = format!("http://localhost{endpoint}");
-    let script = format!(
-        r#"
-        response=$(sudo curl -s -w "\n%{{http_code}}" -X PUT --unix-socket {socket} \
-            -H 'Content-Type: application/json' \
-            --data '{body}' "{url}")
-        code=$(echo "$response" | tail -1)
-        out=$(echo "$response" | sed '$d')
-        if [ "$code" -ge 400 ]; then
-            echo "[mvm] ERROR: CH PUT {endpoint} returned $code: $out" >&2
-            exit 1
-        fi
-        "#,
-        socket = socket,
-        endpoint = endpoint,
-        body = body,
-        url = url,
-    );
-    run_in_vm_visible(&script)
+///
+/// The body is written to a temp file inside the per-VM dir and
+/// passed via `curl --data @<file>` so the JSON never traverses the
+/// shell. This is the security fix vs. the original
+/// `--data '{body}'` shape — a single-quote, backtick, or `$()` in a
+/// caller-supplied path would have escaped into the host shell
+/// otherwise. The endpoint string is allowlisted at the call site
+/// (literal `/api/v1/vm.*` constants) so it doesn't need quoting.
+pub(crate) fn api_put(abs_dir: &str, socket: &str, endpoint: &str, body: &str) -> Result<()> {
+    let body_file = format!("{abs_dir}/.ch-api-body.json");
+    std::fs::write(&body_file, body)
+        .with_context(|| format!("writing CH API body to {body_file}"))?;
+    let result = run_curl_put_with_file(socket, endpoint, Some(&body_file));
+    // Clean up the body file even if the request failed — best-effort.
+    let _ = std::fs::remove_file(&body_file);
+    result
 }
 
 /// PUT to a CH API endpoint with no body (used for boot/shutdown).
 pub(crate) fn api_put_empty(socket: &str, endpoint: &str) -> Result<()> {
+    run_curl_put_with_file(socket, endpoint, None)
+}
+
+/// Shared curl shell-out for both PUT variants.
+///
+/// The socket path is `shell_quote`d defensively even though it
+/// originates inside `~/microvm/vms/<name>/` (which `name` should
+/// have been validated upstream). Endpoint is interpolated raw
+/// because callers pass compile-time constants — flagged here so a
+/// future caller doesn't silently widen the trust assumption.
+fn run_curl_put_with_file(socket: &str, endpoint: &str, body_file: Option<&str>) -> Result<()> {
+    let q_socket = shell_quote(socket);
     let url = format!("http://localhost{endpoint}");
+    let q_url = shell_quote(&url);
+    let data_arg = match body_file {
+        Some(path) => {
+            // The `@`-prefix tells curl to read from a file; we still
+            // shell-quote the path to defend against unusual chars.
+            let q_path = shell_quote(path);
+            format!(
+                "--data @{q_path} -H 'Content-Type: application/json'",
+                q_path = &q_path[..]
+            )
+        }
+        None => String::new(),
+    };
+    let q_endpoint = shell_quote(endpoint);
     let script = format!(
         r#"
-        response=$(sudo curl -s -w "\n%{{http_code}}" -X PUT --unix-socket {socket} \
-            "{url}")
-        code=$(echo "$response" | tail -1)
-        out=$(echo "$response" | sed '$d')
+        set -eu
+        response=$(sudo curl -s -w "\n%{{http_code}}" -X PUT --unix-socket {q_socket} \
+            {data_arg} {q_url})
+        code=$(printf '%s' "$response" | tail -n1)
+        out=$(printf '%s' "$response" | sed '$d')
         if [ "$code" -ge 400 ]; then
-            echo "[mvm] ERROR: CH PUT {endpoint} returned $code: $out" >&2
+            echo "[mvm] ERROR: CH PUT $(printf '%s' {q_endpoint}) returned $code: $out" >&2
             exit 1
         fi
         "#,
-        socket = socket,
-        endpoint = endpoint,
-        url = url,
     );
     run_in_vm_visible(&script)
 }
@@ -246,12 +275,13 @@ fn json_str(s: &str) -> String {
 /// the FC backend's `is_pid_alive` heuristic (CH binary's argv[0]
 /// is `cloud-hypervisor` in Linux).
 pub(crate) fn is_pid_alive(pid_file: &str) -> Result<bool> {
+    let q_pid = shell_quote(pid_file);
     let out = run_in_vm_stdout(&format!(
-        r#"[ -f {pid} ] && p=$(cat {pid}) && \
+        r#"PID={q_pid}
+           [ -f "$PID" ] && p=$(cat "$PID") && \
            [ -f "/proc/$p/comm" ] && \
            [ "$(cat /proc/$p/comm)" = "cloud-hypervisor" ] && \
            echo yes || echo no"#,
-        pid = pid_file,
     ))?;
     Ok(out.trim() == "yes")
 }
@@ -261,29 +291,33 @@ pub(crate) fn is_pid_alive(pid_file: &str) -> Result<bool> {
 pub(crate) fn reap(abs_dir: &str) -> Result<()> {
     let socket = ch_api_socket(abs_dir);
     let pid_file = ch_pid_file(abs_dir);
+    let q_pid = shell_quote(&pid_file);
+    let q_socket = shell_quote(&socket);
     let _ = run_in_vm(&format!(
-        r#"[ -f {pid} ] && p=$(cat {pid}) && \
+        r#"PID={q_pid}
+           [ -f "$PID" ] && p=$(cat "$PID") && \
            sudo kill -TERM "$p" 2>/dev/null || true"#,
-        pid = pid_file,
     ));
-    let _ = run_in_vm(&format!("sudo rm -f {socket}"));
+    let _ = run_in_vm(&format!("sudo rm -f {q_socket}"));
     Ok(())
 }
 
 /// Scan `VMS_DIR` for per-VM dirs that contain `ch.pid`. Used by
 /// `CloudHypervisorBackend::list`. The presence of a `ch.pid`
 /// distinguishes CH-managed VMs from Firecracker's `fc.pid`.
+///
+/// `VMS_DIR` is a compile-time constant so doesn't need quoting; the
+/// `echo` resolves any leading `~/` against the shell that runs it.
 pub(crate) fn list_ch_vms() -> Result<Vec<String>> {
     let abs_vms = run_in_vm_stdout(&format!("echo {}", mvm_base::config::VMS_DIR))?;
-    let abs_vms = abs_vms.trim();
+    let q_dir = shell_quote(abs_vms.trim());
     let listing = run_in_vm_stdout(&format!(
-        r#"
-        for d in {dir}/*/; do
+        r#"DIR={q_dir}
+        for d in "$DIR"/*/; do
             [ -f "$d/ch.pid" ] || continue
             basename "$d"
         done
         "#,
-        dir = abs_vms,
     ))?;
     Ok(listing
         .lines()

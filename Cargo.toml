@@ -27,7 +27,13 @@ exclude = [
 resolver = "3"
 
 [workspace.package]
-version = "0.13.0"
+# 0.14.0 — first version after the v1→v2 cutover (2026-05-11).
+# v1's final release was 0.13.0 (tag v1-final, branch legacy/v1); the
+# v2 rewrite ships under the same project name + binary but is
+# functionally different software. Bumping the minor signals "0.x
+# breaking changes" without prematurely committing to a 1.0 stability
+# promise.
+version = "0.14.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
@@ -120,20 +126,20 @@ uuid = { version = "1", features = ["v4"] }
 which = "7"
 
 # Internal crates
-mvm-core = { path = "crates/mvm-core", version = "0.13.0" }
-mvm-guest = { path = "crates/mvm-guest", version = "0.13.0" }
-mvm-build = { path = "crates/mvm-build", version = "0.13.0" }
-mvm = { path = "crates/mvm", version = "0.13.0" }
-mvm-base = { path = "crates/mvm-base", version = "0.13.0" }
-mvm-security = { path = "crates/mvm-security", version = "0.13.0" }
-mvm-storage = { path = "crates/mvm-storage", version = "0.13.0" }
-mvm-plan = { path = "crates/mvm-plan", version = "0.13.0" }
-mvm-policy = { path = "crates/mvm-policy", version = "0.13.0" }
-mvm-supervisor = { path = "crates/mvm-supervisor", version = "0.13.0" }
-mvm-cli = { path = "crates/mvm-cli", version = "0.13.0" }
-mvm-mcp = { path = "crates/mvm-mcp", version = "0.13.0" }
-mvm-providers = { path = "crates/mvm-providers", version = "0.13.0" }
-mvm-backend = { path = "crates/mvm-backend", version = "0.13.0" }
+mvm-core = { path = "crates/mvm-core", version = "0.14.0" }
+mvm-guest = { path = "crates/mvm-guest", version = "0.14.0" }
+mvm-build = { path = "crates/mvm-build", version = "0.14.0" }
+mvm = { path = "crates/mvm", version = "0.14.0" }
+mvm-base = { path = "crates/mvm-base", version = "0.14.0" }
+mvm-security = { path = "crates/mvm-security", version = "0.14.0" }
+mvm-storage = { path = "crates/mvm-storage", version = "0.14.0" }
+mvm-plan = { path = "crates/mvm-plan", version = "0.14.0" }
+mvm-policy = { path = "crates/mvm-policy", version = "0.14.0" }
+mvm-supervisor = { path = "crates/mvm-supervisor", version = "0.14.0" }
+mvm-cli = { path = "crates/mvm-cli", version = "0.14.0" }
+mvm-mcp = { path = "crates/mvm-mcp", version = "0.14.0" }
+mvm-providers = { path = "crates/mvm-providers", version = "0.14.0" }
+mvm-backend = { path = "crates/mvm-backend", version = "0.14.0" }
 
 # Dev dependencies
 assert_cmd = "2"

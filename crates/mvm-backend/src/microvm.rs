@@ -1,10 +1,10 @@
-use anyhow::Result;
+use anyhow::{Context, Result};
 use tracing::{instrument, warn};
 
 use crate::image::RuntimeVolume;
 use crate::{firecracker, network};
 use mvm_base::config::*;
-use mvm_base::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
+use mvm_base::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible, shell_quote};
 use mvm_base::ui;
 
 // ============================================================================
@@ -186,46 +186,71 @@ fn api_put(path: &str, data: &str) -> Result<()> {
 }
 
 /// Send API PUT request to a specific Firecracker socket.
+///
+/// `data` is written to a temp file and passed via `curl --data @<file>`
+/// so the body never traverses the shell — guards against the
+/// `--data '{json}'` shape where a single-quote in `data` would
+/// escape into the host shell (`specs/01-project.md` flagged the v1
+/// shape's quoting fragility). `socket` and `path` are
+/// `shell_quote`d defensively.
 #[instrument(skip_all, fields(path))]
 pub fn api_put_socket(socket: &str, path: &str, data: &str) -> Result<()> {
-    let script = format!(
-        r#"
-        response=$(sudo curl -s -w "\n%{{http_code}}" -X PUT --unix-socket {socket} \
-            --data '{data}' "http://localhost{path}")
-        code=$(echo "$response" | tail -1)
-        body=$(echo "$response" | sed '$d')
-        if [ "$code" -ge 400 ]; then
-            echo "[mvm] ERROR: PUT {path} returned $code: $body" >&2
-            exit 1
-        fi
-        "#,
-        socket = socket,
-        path = path,
-        data = data,
-    );
-    run_in_vm_visible(&script)
+    fc_api_call("PUT", socket, path, Some(data))
 }
 
 /// Send API PATCH request to a specific Firecracker socket.
 #[instrument(skip_all, fields(path))]
 pub fn api_patch_socket(socket: &str, path: &str, data: &str) -> Result<()> {
+    fc_api_call("PATCH", socket, path, Some(data))
+}
+
+/// Shared body for FC's PUT/PATCH calls. Writes `data` (if Some) to a
+/// `NamedTempFile`, then shells out to curl with `--data @<file>` so
+/// the JSON body never goes through bash. All paths flowing into the
+/// script are `shell_quote`d.
+fn fc_api_call(method: &str, socket: &str, path: &str, data: Option<&str>) -> Result<()> {
+    use std::io::Write;
+    let q_socket = shell_quote(socket);
+    let url = format!("http://localhost{path}");
+    let q_url = shell_quote(&url);
+    let q_path = shell_quote(path);
+
+    let (data_arg, _body_holder) = match data {
+        Some(body) => {
+            let mut tmp = tempfile::NamedTempFile::new()
+                .with_context(|| "creating temp file for FC API body")?;
+            tmp.write_all(body.as_bytes())
+                .with_context(|| "writing FC API body to temp file")?;
+            tmp.flush()
+                .with_context(|| "flushing FC API body to temp file")?;
+            let path_str = tmp.path().to_string_lossy().into_owned();
+            let q_body_path = shell_quote(&path_str);
+            (
+                format!(
+                    "--data @{q_body_path} -H 'Content-Type: application/json'",
+                    q_body_path = &q_body_path[..]
+                ),
+                Some(tmp),
+            )
+        }
+        None => (String::new(), None),
+    };
+
     let script = format!(
         r#"
-        response=$(sudo curl -s -w "\n%{{http_code}}" -X PATCH --unix-socket {socket} \
-            -H 'Content-Type: application/json' \
-            --data '{data}' "http://localhost{path}")
-        code=$(echo "$response" | tail -1)
-        body=$(echo "$response" | sed '$d')
+        set -eu
+        response=$(sudo curl -s -w "\n%{{http_code}}" -X {method} --unix-socket {q_socket} \
+            {data_arg} {q_url})
+        code=$(printf '%s' "$response" | tail -n1)
+        body=$(printf '%s' "$response" | sed '$d')
         if [ "$code" -ge 400 ]; then
-            echo "[mvm] ERROR: PATCH {path} returned $code: $body" >&2
+            echo "[mvm] ERROR: {method} $(printf '%s' {q_path}) returned $code: $body" >&2
             exit 1
         fi
         "#,
-        socket = socket,
-        path = path,
-        data = data,
     );
     run_in_vm_visible(&script)
+    // _body_holder drops at function exit, deleting the temp file.
 }
 
 /// Configure the microVM via the Firecracker API (dev-mode, legacy).

@@ -143,7 +143,7 @@ impl VmBackend for CloudHypervisorBackend {
             vsock_socket_path: vsock_socket,
         };
         let body = ch_runtime::build_vm_config(&args);
-        ch_runtime::api_put(&api_socket, "/api/v1/vm.create", &body)?;
+        ch_runtime::api_put(&abs_dir, &api_socket, "/api/v1/vm.create", &body)?;
 
         // Boot.
         ch_runtime::api_put_empty(&api_socket, "/api/v1/vm.boot")?;
