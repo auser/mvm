@@ -1,4 +1,4 @@
-//! Plan 64 W5 — `PolicyRef → concrete component slot` resolver.
+//! Plan 64 W5 + Phase 3 Slice A — `PolicyRef → concrete component slot` resolver.
 //!
 //! `mvm-plan::ExecutionPlan` carries four policy refs that name (but
 //! do not contain) the policy bundle a workload runs under:
@@ -16,23 +16,31 @@
 //! `ArtifactCollector`) to make admission decisions; this resolver
 //! is the function that turns a plan's refs into those objects.
 //!
-//! ## Today (substrate-only)
+//! ## What lives where, post-Slice-A
 //!
-//! Plan 60 Phase 3 owns the policy-bundle file format — the actual
-//! TOML schema, the resolution rules, the cosign-bundle validation.
-//! Until that lands, this resolver returns:
+//! Live consumers shipped after parsing a `<tenant>:<workload>`
+//! bundle:
 //!
-//! - **All four refs == `"local-default"`** → `ResolvedSlots` of
-//!   fail-closed `NoopEgressProxy` / `NoopToolGate` /
-//!   `NoopKeystoreReleaser` / `NoopArtifactCollector`. The Noops
-//!   error with `NotWired` on first consult; a misconfigured
-//!   supervisor cannot accidentally pass tenant traffic through
-//!   them.
-//! - **Any ref shaped `"<tenant>:<workload>"`** →
-//!   [`ResolveError::NotYetImplemented`], naming the policy file
-//!   path that would have been loaded once Phase 3 ships.
-//! - **Anything else** → [`ResolveError::Unrecognized`], naming the
-//!   field and the value.
+//! - `egress_policy` → `L7EgressProxy::new` from
+//!   `mvm_supervisor::l7_proxy`. The chain wraps a
+//!   `DestinationPolicy::new(bundle.egress.allow_list)`; CONNECT
+//!   targets that miss the allow-list return 403 + audit. Plain-HTTP
+//!   is gated on `bundle.egress.allow_plain_http` per ADR-002.
+//! - `tool_policy` → `PolicyToolGate::from_policy(&bundle.tool)`
+//!   from `mvm_supervisor::policy_tool_gate`. RPC calls to tool
+//!   names absent from `bundle.tool.allowed` get
+//!   `ToolDecision::Deny`.
+//!
+//! Slots still Noop (await the supervisor lift in mvm-hostd):
+//!
+//! - `KeystoreReleaser` — secret release on the supervisor's
+//!   in-process path. Today the `keystore::default_provider()` +
+//!   `mvmctl secret` CLI cover operator-facing CRUD; the in-
+//!   workload `KeystoreReleaser` consumer ships with the
+//!   `Supervisor::launch` integration.
+//! - `ArtifactCollector` — wired with the supervisor lift; the
+//!   parsed `bundle.artifact.capture_paths` is read but not yet
+//!   handed to a live collector.
 //!
 //! ## No live consumer yet
 //!
@@ -42,13 +50,8 @@
 //! `Supervisor::with_egress` / `with_tool_gate` / etc. lives in the
 //! mvm-hostd lift (ADR-041 "negative / honest deferrals"). This
 //! module exists as substrate so the lift is a one-line change.
-//!
-//! ## Out of scope (named in plan 64 W5 § "Don't do")
-//!
-//! - The TOML policy file format — plan 60 Phase 3.
-//! - Wiring the resolver into `mvmctl up` — nowhere to wire, since
-//!   `Supervisor::launch` isn't on the production path yet.
-//! - The `BackendLauncher` adapter — explicit deferred from W3.
+//! Slice A's L7EgressProxy + PolicyToolGate constructors are ready
+//! and tested; the consumer just hasn't been built yet.
 //!
 //! ## Dead-code allow
 //!
@@ -63,16 +66,20 @@
 #![allow(dead_code)]
 
 use std::path::PathBuf;
+use std::sync::Arc;
 
 use mvm_plan::{ExecutionPlan, FsPolicyRef, PolicyRef};
 use mvm_supervisor::{
-    ArtifactCollector, EgressProxy, KeystoreReleaser, NoopArtifactCollector, NoopEgressProxy,
-    NoopKeystoreReleaser, NoopToolGate, ToolGate,
+    ArtifactCollector, DestinationPolicy, EgressProxy, InspectorChain, KeystoreReleaser,
+    L7EgressProxy, NoopArtifactCollector, NoopEgressAuditSink, NoopEgressProxy,
+    NoopKeystoreReleaser, NoopToolGate, PolicyToolGate, TokioDnsResolver, ToolGate,
 };
 
 /// The fixed identifier for the local-dev policy bundle. Any
 /// `PolicyRef`/`FsPolicyRef` whose inner value equals this string
-/// resolves to fail-closed Noops in v0.
+/// resolves to fail-closed Noops — no allow-list, no tool gate, no
+/// secret release. Use `<tenant>:<workload>` to point at a real
+/// bundle.
 pub const LOCAL_DEFAULT: &str = "local-default";
 
 /// Trait-object bundle the supervisor consumes via its
@@ -80,8 +87,12 @@ pub const LOCAL_DEFAULT: &str = "local-default";
 /// `with_artifact_collector` builder calls.
 ///
 /// Each field is a `Box<dyn Trait>` so the resolver can return
-/// either a Noop or a future real impl without leaking the concrete
-/// type to callers. v0 always returns Noops on the happy path.
+/// either a Noop (when the plan's refs are `"local-default"`) or
+/// a live impl (when a `<tenant>:<workload>` bundle parses) without
+/// leaking the concrete type to callers. Slice A (2026-05-11)
+/// flipped `egress` and `tool_gate` from Noop to live for parsed
+/// bundles; `keystore` and `artifacts` stay Noop until the
+/// supervisor lift in mvm-hostd.
 pub struct ResolvedSlots {
     pub egress: Box<dyn EgressProxy>,
     pub tool_gate: Box<dyn ToolGate>,
@@ -257,13 +268,25 @@ fn classify_plan_refs<'a>(
 ///
 /// - All four refs == `"local-default"` → Noop slots.
 /// - All four refs == `"<tenant>:<workload>"` and the bundle file
-///   parses cleanly → Noop slots, since no live consumer (L4/L7
-///   proxy, real ToolGate) exists yet to read the parsed bundle.
-///   The substrate proves the file format works so operators can
-///   stage bundles before plan 60 Phase 3 ships.
+///   parses cleanly → **live `L7EgressProxy` + `PolicyToolGate`**
+///   constructed from the bundle's `egress` + `tool` sections.
+///   Keystore + ArtifactCollector remain Noop until the
+///   supervisor lift in mvm-hostd. Plan 60 Phase 3 Slice A.
 /// - Anything else → typed error pointing the operator at what to
 ///   fix (missing file, parse error, mismatched refs, typo).
 pub fn resolve_supervisor_components(plan: &ExecutionPlan) -> Result<ResolvedSlots, ResolveError> {
+    resolve_supervisor_components_with_dir(plan, &default_policy_dir())
+}
+
+/// Test seam — same as [`resolve_supervisor_components`] but the
+/// policy-bundle base dir is supplied by the caller instead of
+/// resolved from `$HOME`. Tests use this with a `tempfile::tempdir()`
+/// to inject a known-good bundle without touching the host's
+/// `~/.mvm/policies/`.
+pub fn resolve_supervisor_components_with_dir(
+    plan: &ExecutionPlan,
+    base_dir: &std::path::Path,
+) -> Result<ResolvedSlots, ResolveError> {
     let PolicyRef(network) = &plan.network_policy;
     let FsPolicyRef(fs) = &plan.fs_policy;
     let PolicyRef(egress) = &plan.egress_policy;
@@ -272,12 +295,8 @@ pub fn resolve_supervisor_components(plan: &ExecutionPlan) -> Result<ResolvedSlo
     match classify_plan_refs(network, fs, egress, tool)? {
         RefShape::LocalDefault => Ok(noop_slots()),
         RefShape::TenantWorkload { tenant, workload } => {
-            // Load the bundle; even when parsing succeeds we
-            // return Noops, because no live consumer exists yet.
-            // The error paths surface real operator-actionable
-            // problems (missing file, typo, schema mismatch).
-            resolve_tenant_workload(network, tenant, workload)?;
-            Ok(noop_slots())
+            let bundle = load_tenant_workload(base_dir, network, tenant, workload)?;
+            Ok(slots_from_bundle(&bundle))
         }
         // classify_plan_refs already converts Unrecognized into a
         // typed error; this branch is dead but keeps the match
@@ -295,14 +314,49 @@ fn noop_slots() -> ResolvedSlots {
     }
 }
 
-fn resolve_tenant_workload(
+/// Slice A — turn a parsed `PolicyBundle` into live supervisor
+/// component slots. Egress + tool-gate ship as real
+/// `L7EgressProxy` + `PolicyToolGate`; keystore + artifacts stay
+/// Noop until the mvm-hostd supervisor lift.
+fn slots_from_bundle(bundle: &mvm_policy::PolicyBundle) -> ResolvedSlots {
+    // L7 inspector chain: DestinationPolicy is the gating
+    // inspector; SSRF / secrets / injection / PII layer on with
+    // their own constructors in a future workstream. For Slice A
+    // we ship DestinationPolicy alone — that's the operator-facing
+    // allow-list the policy bundle owns. Inspector chain stays
+    // wrappable; later workstreams append to it.
+    let chain = InspectorChain::new().with(Box::new(DestinationPolicy::new(
+        bundle.egress.allow_list.iter().cloned(),
+    )));
+    let body_cap = if bundle.egress.body_cap_bytes == 0 {
+        mvm_policy::DEFAULT_BODY_CAP_BYTES as usize
+    } else {
+        bundle.egress.body_cap_bytes as usize
+    };
+    let l7 = L7EgressProxy::new(
+        Arc::new(chain),
+        Arc::new(TokioDnsResolver),
+        Arc::new(NoopEgressAuditSink),
+        body_cap,
+        bundle.egress.allow_plain_http,
+    );
+    let tool_gate = PolicyToolGate::from_policy(&bundle.tool);
+    ResolvedSlots {
+        egress: Box::new(l7),
+        tool_gate: Box::new(tool_gate),
+        keystore: Box::new(NoopKeystoreReleaser),
+        artifacts: Box::new(NoopArtifactCollector),
+    }
+}
+
+fn load_tenant_workload(
+    base: &std::path::Path,
     ref_value: &str,
     tenant: &str,
     workload: &str,
 ) -> Result<mvm_policy::PolicyBundle, ResolveError> {
-    let base = default_policy_dir();
-    let path = mvm_policy::toml_loader::bundle_path(&base, tenant, workload);
-    match mvm_policy::toml_loader::load_bundle_from_path(&base, tenant, workload) {
+    let path = mvm_policy::toml_loader::bundle_path(base, tenant, workload);
+    match mvm_policy::toml_loader::load_bundle_from_path(base, tenant, workload) {
         Ok(bundle) => Ok(bundle),
         Err(mvm_policy::toml_loader::LoadError::NotFound { path }) => {
             Err(ResolveError::BundleNotFound {
@@ -585,18 +639,184 @@ mod tests {
     }
 
     // ──────────────────────────────────────────────────────────────
-    // Plan 60 Phase 6 — TOML-loading integration tests
+    // Plan 60 Phase 3 Slice A — live L7EgressProxy + PolicyToolGate
     //
-    // The resolver attempts to load `<HOME>/.mvm/policies/<tenant>/
-    // <workload>.toml` for tenant-scoped refs. Since tests can't
-    // safely mutate $HOME (process-global), we exercise the loader
-    // path directly via `mvm_policy::toml_loader` in the unit
-    // tests above. These tests pin the resolver's *error* surface
-    // — the success path "bundle loads cleanly → Noops" is
-    // implicit in the unit tests covering each error branch.
-    //
-    // A future end-to-end test that sets $HOME via a process-wide
-    // mutex (like `vm/mod.rs::DATA_DIR_TEST_LOCK`) can pin the
-    // success path. Out of scope for the Phase 6 substrate.
+    // After Slice A, a parsed `<tenant>:<workload>` bundle returns
+    // actual `L7EgressProxy` + `PolicyToolGate` impls instead of
+    // Noops. These tests use the `_with_dir` seam so they can
+    // inject a tempdir without mutating $HOME.
     // ──────────────────────────────────────────────────────────────
+
+    fn write_bundle(dir: &std::path::Path, tenant: &str, workload: &str, body: &str) {
+        let tenant_dir = dir.join(tenant);
+        std::fs::create_dir_all(&tenant_dir).unwrap();
+        std::fs::write(tenant_dir.join(format!("{workload}.toml")), body).unwrap();
+    }
+
+    fn fixture_bundle_with_tool_allow(name: &str) -> String {
+        format!(
+            r#"
+schema_version = 1
+bundle_id      = "acme/web-worker"
+bundle_version = 1
+
+[network]
+[egress]
+allow_list = [["api.example.com", 443]]
+allow_plain_http = false
+
+[pii]
+[tool]
+allowed = ["{name}"]
+[artifact]
+[keys]
+[audit]
+"#,
+        )
+    }
+
+    #[test]
+    fn slice_a_returns_l7_egress_proxy_for_parsed_bundle() {
+        // A parsed `<tenant>:<workload>` bundle yields a live
+        // L7EgressProxy — proven by:
+        //   1. An off-list host returns Deny (DestinationPolicy
+        //      gates before DNS, so this is hermetic).
+        //   2. An allow-listed host's inspect call does NOT
+        //      return `EgressError::NotWired` — a NoopEgressProxy
+        //      would. The L7EgressProxy may return `Allow` (when
+        //      DNS resolves) or `UpstreamUnreachable` (when DNS
+        //      fails, common in sandboxed test environments);
+        //      either outcome proves the proxy ran the chain.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_tool_allow("web_search"),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let slots = match resolve_supervisor_components_with_dir(&plan, tmp.path()) {
+            Ok(s) => s,
+            Err(e) => panic!("expected live slots, got error: {e}"),
+        };
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Off-list: DestinationPolicy denies before DNS — hermetic.
+            let deny = slots
+                .egress
+                .inspect("evil.example.com", "/x")
+                .await
+                .expect("policy lookup must succeed (not NotWired)");
+            assert!(
+                matches!(deny, mvm_supervisor::EgressDecision::Deny { .. }),
+                "off-list host should produce Deny, got {deny:?}"
+            );
+
+            // Allow-listed: the chain runs; outcome is either
+            // Allow (network present) or UpstreamUnreachable
+            // (sandbox). NotWired would mean the slot is still a
+            // NoopEgressProxy.
+            match slots.egress.inspect("api.example.com", "/v1/x").await {
+                Ok(_) => {}                                                    // Allow — DNS resolved
+                Err(mvm_supervisor::EgressError::UpstreamUnreachable(_)) => {} // sandboxed
+                Err(mvm_supervisor::EgressError::NotWired) => {
+                    panic!("slot is still a NoopEgressProxy — Slice A wiring missing")
+                }
+                Err(other) => panic!("unexpected egress error: {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn slice_a_returns_policy_tool_gate_for_parsed_bundle() {
+        // A parsed bundle's `tool.allowed` list controls
+        // PolicyToolGate::check — an on-list tool is Allow, an
+        // off-list one is Deny.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_tool_allow("web_search"),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("expected live slots, got {e}"));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let allow = slots
+                .tool_gate
+                .check("web_search")
+                .await
+                .expect("PolicyToolGate must not return NotWired post-Slice-A");
+            assert_eq!(allow, mvm_supervisor::ToolDecision::Allow);
+            let deny = slots
+                .tool_gate
+                .check("forbidden_tool")
+                .await
+                .expect("policy lookup itself must succeed");
+            assert!(
+                matches!(deny, mvm_supervisor::ToolDecision::Deny { .. }),
+                "off-list tool should produce Deny, got {deny:?}"
+            );
+        });
+    }
+
+    #[test]
+    fn slice_a_keystore_and_artifacts_remain_noop() {
+        // The supervisor lift in mvm-hostd ships the live
+        // KeystoreReleaser + ArtifactCollector consumers. Until
+        // then the resolver returns Noops for those slots even
+        // when the bundle parses cleanly. Tests pin that
+        // deliberate scope.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_tool_allow("web_search"),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("expected live slots, got {e}"));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let ks_err = slots
+                .keystore
+                .revoke("anything")
+                .await
+                .expect_err("Noop keystore must error NotWired");
+            assert!(
+                matches!(ks_err, mvm_supervisor::KeystoreError::NotWired),
+                "unexpected keystore err: {ks_err:?}"
+            );
+            let art_err = slots
+                .artifacts
+                .collect(&plan.plan_id)
+                .await
+                .expect_err("Noop artifact collector must error NotWired");
+            assert!(
+                matches!(art_err, mvm_supervisor::ArtifactError::NotWired),
+                "unexpected artifact err: {art_err:?}"
+            );
+        });
+    }
 }
