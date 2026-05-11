@@ -1,12 +1,17 @@
 use anyhow::{Context, Result};
-use zeroize::Zeroizing;
+use secrecy::SecretBox;
 
 /// Trait for providing encryption keys for tenant data volumes.
+///
+/// Returned bytes are wrapped in [`SecretBox`] so the key material is
+/// zeroized on drop and cannot be accidentally logged — the
+/// xtask `check-no-display-on-secret-types` lint enforces no `Debug`
+/// or `Display` on the box's contents (plan 63 W2). Callers consume
+/// the bytes via `.expose_secret()`.
 pub trait KeyProvider: Send + Sync {
     /// Get the data encryption key for a tenant.
     /// Returns 32 bytes (256-bit key for AES-256-XTS which uses 512-bit key internally).
-    /// Wrapped in Zeroizing to ensure key material is wiped from memory on drop.
-    fn get_data_key(&self, tenant_id: &str) -> Result<Zeroizing<Vec<u8>>>;
+    fn get_data_key(&self, tenant_id: &str) -> Result<SecretBox<Vec<u8>>>;
 }
 
 /// Reads keys from environment variables: MVM_TENANT_KEY_<TENANT_ID> (hex-encoded).
@@ -14,7 +19,7 @@ pub trait KeyProvider: Send + Sync {
 pub struct EnvKeyProvider;
 
 impl KeyProvider for EnvKeyProvider {
-    fn get_data_key(&self, tenant_id: &str) -> Result<Zeroizing<Vec<u8>>> {
+    fn get_data_key(&self, tenant_id: &str) -> Result<SecretBox<Vec<u8>>> {
         let var_name = format!(
             "MVM_TENANT_KEY_{}",
             tenant_id.to_uppercase().replace('-', "_")
@@ -22,7 +27,7 @@ impl KeyProvider for EnvKeyProvider {
         let hex = std::env::var(&var_name)
             .with_context(|| format!("Missing encryption key env var: {}", var_name))?;
         let key = hex_decode(&hex).with_context(|| format!("Invalid hex in {}", var_name))?;
-        Ok(Zeroizing::new(key))
+        Ok(SecretBox::new(Box::new(key)))
     }
 }
 
@@ -49,7 +54,7 @@ pub fn validate_shell_id(s: &str) -> Result<()> {
 pub struct FileKeyProvider;
 
 impl KeyProvider for FileKeyProvider {
-    fn get_data_key(&self, tenant_id: &str) -> Result<Zeroizing<Vec<u8>>> {
+    fn get_data_key(&self, tenant_id: &str) -> Result<SecretBox<Vec<u8>>> {
         validate_shell_id(tenant_id)
             .with_context(|| format!("Invalid tenant_id for key lookup: {:?}", tenant_id))?;
         let path = format!("/var/lib/mvm/keys/{}.key", tenant_id);
@@ -72,7 +77,7 @@ impl KeyProvider for FileKeyProvider {
                 .with_context(|| format!("Failed to read key file: {}", path))?;
         let key =
             hex_decode(output.trim()).with_context(|| format!("Invalid key data in {}", path))?;
-        Ok(Zeroizing::new(key))
+        Ok(SecretBox::new(Box::new(key)))
     }
 }
 
@@ -146,6 +151,7 @@ mod tests {
 
     #[test]
     fn test_env_key_provider_present() {
+        use secrecy::ExposeSecret;
         unsafe {
             std::env::set_var(
                 "MVM_TENANT_KEY_TESTX",
@@ -154,7 +160,7 @@ mod tests {
         };
         let provider = EnvKeyProvider;
         let key = provider.get_data_key("testx").unwrap();
-        assert_eq!(key.len(), 32);
+        assert_eq!(key.expose_secret().len(), 32);
         unsafe { std::env::remove_var("MVM_TENANT_KEY_TESTX") };
     }
 

@@ -31,6 +31,7 @@ use std::path::{Path, PathBuf};
 use anyhow::{Context, Result, bail};
 use hmac::{Hmac, Mac};
 use rand::RngCore;
+use secrecy::SecretBox;
 use serde::{Deserialize, Serialize};
 use sha2::Sha256;
 
@@ -156,8 +157,12 @@ pub enum VerifyError {
 
 /// Resolve `~/.mvm/snapshot.key` (or any equivalent path the caller
 /// provides), creating it if missing with 32 random bytes and mode
-/// 0600. Returns the key bytes. Idempotent.
-pub fn load_or_init_key(path: &Path) -> Result<[u8; HMAC_KEY_BYTES]> {
+/// 0600. Returns the key wrapped in `SecretBox` so accidental
+/// `Debug`/`Display` is a compile error and the bytes are zeroized
+/// on drop (plan 63 W2). Callers consume the key via
+/// `.expose_secret()` before passing it to `seal` / `verify`.
+/// Idempotent on repeated calls against an existing key file.
+pub fn load_or_init_key(path: &Path) -> Result<SecretBox<[u8; HMAC_KEY_BYTES]>> {
     if let Some(parent) = path.parent() {
         // Create parent if missing. Don't enforce parent perms here —
         // `~/.mvm/` is owned by other code (config dir helper).
@@ -177,7 +182,7 @@ pub fn load_or_init_key(path: &Path) -> Result<[u8; HMAC_KEY_BYTES]> {
         f.write_all(&buf)
             .with_context(|| format!("writing {}", path.display()))?;
         f.sync_all().ok();
-        return Ok(buf);
+        return Ok(SecretBox::new(Box::new(buf)));
     }
 
     let metadata = std::fs::metadata(path).with_context(|| format!("stat {}", path.display()))?;
@@ -202,7 +207,7 @@ pub fn load_or_init_key(path: &Path) -> Result<[u8; HMAC_KEY_BYTES]> {
     let mut f = File::open(path).with_context(|| format!("open {}", path.display()))?;
     f.read_exact(&mut buf)
         .with_context(|| format!("read {}", path.display()))?;
-    Ok(buf)
+    Ok(SecretBox::new(Box::new(buf)))
 }
 
 // ============================================================================
@@ -571,6 +576,7 @@ fn constant_time_eq(a: &[u8], b: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use secrecy::ExposeSecret;
 
     fn make_snap(dir: &Path) -> SnapshotFiles {
         let v = dir.join("vmstate.bin");
@@ -585,7 +591,7 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&path).unwrap();
-        assert_eq!(key.len(), HMAC_KEY_BYTES);
+        assert_eq!(key.expose_secret().len(), HMAC_KEY_BYTES);
         let mode = std::fs::metadata(&path).unwrap().permissions().mode() & 0o777;
         assert_eq!(mode, 0o600, "key file must be mode 0600");
     }
@@ -596,7 +602,11 @@ mod tests {
         let path = tmp.path().join("snapshot.key");
         let k1 = load_or_init_key(&path).unwrap();
         let k2 = load_or_init_key(&path).unwrap();
-        assert_eq!(k1, k2, "second call must return the same key");
+        assert_eq!(
+            k1.expose_secret(),
+            k2.expose_secret(),
+            "second call must return the same key"
+        );
     }
 
     #[test]
@@ -629,8 +639,8 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        let sealed = seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
-        let verified = verify(tmp.path(), &files, 1, "1.2.3", &key, false).unwrap();
+        let sealed = seal(tmp.path(), &files, 1, "1.2.3", key.expose_secret()).unwrap();
+        let verified = verify(tmp.path(), &files, 1, "1.2.3", key.expose_secret(), false).unwrap();
         assert_eq!(sealed, verified);
         assert_eq!(verified.epoch, 1);
     }
@@ -642,13 +652,13 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", key.expose_secret()).unwrap();
         // Tamper: replace one byte but keep the same length.
         let mut bytes = std::fs::read(&files.vmstate).unwrap();
         bytes[0] ^= 0xff;
         std::fs::write(&files.vmstate, &bytes).unwrap();
 
-        let err = verify(tmp.path(), &files, 1, "1.2.3", &key, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 1, "1.2.3", key.expose_secret(), false).unwrap_err();
         assert!(matches!(err, VerifyError::TagMismatch));
     }
 
@@ -659,12 +669,12 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", key.expose_secret()).unwrap();
         let mut bytes = std::fs::read(&files.mem).unwrap();
         bytes[0] ^= 0xff;
         std::fs::write(&files.mem, &bytes).unwrap();
 
-        let err = verify(tmp.path(), &files, 1, "1.2.3", &key, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 1, "1.2.3", key.expose_secret(), false).unwrap_err();
         assert!(matches!(err, VerifyError::TagMismatch));
     }
 
@@ -675,12 +685,12 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", key.expose_secret()).unwrap();
         // Truncate vmstate — caught by the fast-fail size check
         // before we stream the file.
         std::fs::write(&files.vmstate, b"shorter").unwrap();
 
-        let err = verify(tmp.path(), &files, 1, "1.2.3", &key, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 1, "1.2.3", key.expose_secret(), false).unwrap_err();
         match err {
             VerifyError::SizeMismatch { file, .. } => {
                 assert_eq!(file, "vmstate.bin");
@@ -696,14 +706,14 @@ mod tests {
 
         let key_path = tmp.path().join("snapshot.key");
         let key1 = load_or_init_key(&key_path).unwrap();
-        seal(tmp.path(), &files, 1, "1.2.3", &key1).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", key1.expose_secret()).unwrap();
 
         // Replace the key on disk to simulate a fresh host or rotation.
         std::fs::remove_file(&key_path).unwrap();
         let key2 = load_or_init_key(&key_path).unwrap();
-        assert_ne!(key1, key2);
+        assert_ne!(key1.expose_secret(), key2.expose_secret());
 
-        let err = verify(tmp.path(), &files, 1, "1.2.3", &key2, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 1, "1.2.3", key2.expose_secret(), false).unwrap_err();
         assert!(matches!(err, VerifyError::TagMismatch));
     }
 
@@ -714,8 +724,8 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
-        let err = verify(tmp.path(), &files, 1, "1.2.4", &key, false).unwrap_err();
+        seal(tmp.path(), &files, 1, "1.2.3", key.expose_secret()).unwrap();
+        let err = verify(tmp.path(), &files, 1, "1.2.4", key.expose_secret(), false).unwrap_err();
         match err {
             VerifyError::VersionMismatch { sealed, current } => {
                 assert_eq!(sealed, "1.2.3");
@@ -732,8 +742,8 @@ mod tests {
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
 
-        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
-        verify(tmp.path(), &files, 1, "9.9.9", &key, true).expect("should accept");
+        seal(tmp.path(), &files, 1, "1.2.3", key.expose_secret()).unwrap();
+        verify(tmp.path(), &files, 1, "9.9.9", key.expose_secret(), true).expect("should accept");
     }
 
     #[test]
@@ -742,7 +752,7 @@ mod tests {
         let files = make_snap(tmp.path());
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
-        let err = verify(tmp.path(), &files, 0, "1.2.3", &key, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 0, "1.2.3", key.expose_secret(), false).unwrap_err();
         assert!(matches!(err, VerifyError::SidecarMissing { .. }));
     }
 
@@ -752,13 +762,13 @@ mod tests {
         let files = make_snap(tmp.path());
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
-        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", key.expose_secret()).unwrap();
         let path = tmp.path().join(SIDECAR_FILENAME);
         let mut value: serde_json::Value =
             serde_json::from_slice(&std::fs::read(&path).unwrap()).unwrap();
         value["extra_field"] = serde_json::Value::Bool(true);
         std::fs::write(&path, serde_json::to_vec(&value).unwrap()).unwrap();
-        let err = verify(tmp.path(), &files, 1, "1.2.3", &key, false).unwrap_err();
+        let err = verify(tmp.path(), &files, 1, "1.2.3", key.expose_secret(), false).unwrap_err();
         assert!(matches!(err, VerifyError::SidecarParse { .. }));
     }
 
@@ -768,7 +778,7 @@ mod tests {
         let files = make_snap(tmp.path());
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
-        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", key.expose_secret()).unwrap();
         let mode = std::fs::metadata(tmp.path().join(SIDECAR_FILENAME))
             .unwrap()
             .permissions()
@@ -783,7 +793,7 @@ mod tests {
         let files = make_snap(tmp.path());
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
-        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
+        seal(tmp.path(), &files, 1, "1.2.3", key.expose_secret()).unwrap();
         assert!(!tmp.path().join(format!("{SIDECAR_FILENAME}.tmp")).exists());
         assert!(tmp.path().join(SIDECAR_FILENAME).exists());
     }
@@ -806,9 +816,9 @@ mod tests {
             mem: tmp2.path().join("mem.bin"),
         };
 
-        let key = [0u8; HMAC_KEY_BYTES];
-        let (_, tag1) = compute_tag(&files1, 1, "1", &key).unwrap();
-        let (_, tag2) = compute_tag(&files2, 1, "1", &key).unwrap();
+        let raw_key = [0u8; HMAC_KEY_BYTES];
+        let (_, tag1) = compute_tag(&files1, 1, "1", &raw_key).unwrap();
+        let (_, tag2) = compute_tag(&files2, 1, "1", &raw_key).unwrap();
         assert_ne!(tag1, tag2, "splice across vmstate/mem must change the tag");
     }
 
@@ -816,9 +826,9 @@ mod tests {
     fn test_compute_tag_epoch_changes_tag() {
         let tmp = tempfile::tempdir().unwrap();
         let files = make_snap(tmp.path());
-        let key = [0u8; HMAC_KEY_BYTES];
-        let (_, tag1) = compute_tag(&files, 1, "1", &key).unwrap();
-        let (_, tag2) = compute_tag(&files, 2, "1", &key).unwrap();
+        let raw_key = [0u8; HMAC_KEY_BYTES];
+        let (_, tag1) = compute_tag(&files, 1, "1", &raw_key).unwrap();
+        let (_, tag2) = compute_tag(&files, 2, "1", &raw_key).unwrap();
         assert_ne!(tag1, tag2, "epoch must be inside the HMAC envelope");
     }
 
@@ -831,8 +841,8 @@ mod tests {
 
         // Seal at epoch 3, then ask the verifier for "current
         // high-water mark = 5". The verifier must refuse.
-        seal(tmp.path(), &files, 3, "1.2.3", &key).unwrap();
-        let err = verify(tmp.path(), &files, 5, "1.2.3", &key, false).unwrap_err();
+        seal(tmp.path(), &files, 3, "1.2.3", key.expose_secret()).unwrap();
+        let err = verify(tmp.path(), &files, 5, "1.2.3", key.expose_secret(), false).unwrap_err();
         match err {
             VerifyError::EpochRollback { got, expected } => {
                 assert_eq!(got, 3);
@@ -848,8 +858,9 @@ mod tests {
         let files = make_snap(tmp.path());
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
-        seal(tmp.path(), &files, 1, "1.2.3", &key).unwrap();
-        verify(tmp.path(), &files, 99, "1.2.3", &key, true).expect("stale flag bypasses epoch");
+        seal(tmp.path(), &files, 1, "1.2.3", key.expose_secret()).unwrap();
+        verify(tmp.path(), &files, 99, "1.2.3", key.expose_secret(), true)
+            .expect("stale flag bypasses epoch");
     }
 
     #[test]
@@ -860,8 +871,9 @@ mod tests {
         let files = make_snap(tmp.path());
         let key_path = tmp.path().join("snapshot.key");
         let key = load_or_init_key(&key_path).unwrap();
-        seal(tmp.path(), &files, 7, "1.2.3", &key).unwrap();
-        verify(tmp.path(), &files, 7, "1.2.3", &key, false).expect("equal epoch verifies");
+        seal(tmp.path(), &files, 7, "1.2.3", key.expose_secret()).unwrap();
+        verify(tmp.path(), &files, 7, "1.2.3", key.expose_secret(), false)
+            .expect("equal epoch verifies");
     }
 
     #[test]

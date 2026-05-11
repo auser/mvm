@@ -119,8 +119,14 @@ pub fn pause_and_seal<IO: SnapshotIO>(vm_name: &str, io: &IO) -> Result<Integrit
         .next()
         .with_context(|| format!("advancing epoch counter for {}", dir.display()))?;
 
-    let sidecar = seal(&dir, &files, next_epoch, mvmctl_version, &key)
-        .with_context(|| format!("sealing instance snapshot at {}", dir.display()))?;
+    let sidecar = seal(
+        &dir,
+        &files,
+        next_epoch,
+        mvmctl_version,
+        secrecy::ExposeSecret::expose_secret(&key),
+    )
+    .with_context(|| format!("sealing instance snapshot at {}", dir.display()))?;
     Ok(sidecar)
 }
 
@@ -149,7 +155,14 @@ pub fn verify_and_resume<IO: SnapshotIO>(vm_name: &str, io: &IO) -> Result<Integ
     let store = EpochStore::new(dir.join(EPOCH_FILENAME));
     let min_epoch = store.load();
 
-    let sidecar = match verify(&dir, &files, min_epoch, mvmctl_version, &key, allow_stale) {
+    let sidecar = match verify(
+        &dir,
+        &files,
+        min_epoch,
+        mvmctl_version,
+        secrecy::ExposeSecret::expose_secret(&key),
+        allow_stale,
+    ) {
         Ok(s) => s,
         Err(e) => return Err(map_verify_error(e, &dir)),
     };

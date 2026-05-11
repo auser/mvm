@@ -203,18 +203,20 @@ pub fn instance_start(tenant_id: &str, pool_id: &str, instance_id: &str) -> Resu
 
         // LUKS encryption: if tenant has a key, encrypt the data volume
         if keystore::has_key(tenant_id) {
+            use secrecy::ExposeSecret;
             let provider = keystore::default_provider();
             let key = provider.get_data_key(tenant_id)?;
+            let key_bytes = key.expose_secret();
             let mapper_name = encryption::luks_mapper_name(tenant_id, instance_id);
 
             if !encryption::is_luks_volume(&raw_path)? {
                 encryption::create_encrypted_volume(
                     &raw_path,
                     spec.instance_resources.data_disk_mib,
-                    &key,
+                    key_bytes,
                 )?;
             }
-            let mapper_path = encryption::open_encrypted_volume(&raw_path, &mapper_name, &key)?;
+            let mapper_path = encryption::open_encrypted_volume(&raw_path, &mapper_name, key_bytes)?;
 
             // Format the mapper device if new
             if let Err(e) = shell::run_in_vm(&format!(

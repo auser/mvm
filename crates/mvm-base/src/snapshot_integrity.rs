@@ -50,9 +50,14 @@ pub fn seal_snapshot_artifacts(snap_dir: &str) -> Result<()> {
     let next_epoch = epoch_store
         .next()
         .with_context(|| format!("advancing epoch counter for {snap_dir}"))?;
-    let _sidecar =
-        mvm_security::snapshot_hmac::seal(snap_path, &files, next_epoch, mvmctl_version, &key)
-            .with_context(|| format!("sealing snapshot at {snap_dir}"))?;
+    let _sidecar = mvm_security::snapshot_hmac::seal(
+        snap_path,
+        &files,
+        next_epoch,
+        mvmctl_version,
+        secrecy::ExposeSecret::expose_secret(&key),
+    )
+    .with_context(|| format!("sealing snapshot at {snap_dir}"))?;
     Ok(())
 }
 
@@ -103,7 +108,7 @@ pub fn verify_snapshot_artifacts(snap_dir: &str) -> Result<()> {
         &files,
         min_epoch,
         mvmctl_version,
-        &key,
+        secrecy::ExposeSecret::expose_secret(&key),
         allow_stale,
     ) {
         Ok(_) => Ok(()),
