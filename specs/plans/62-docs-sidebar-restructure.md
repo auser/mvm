@@ -1,10 +1,13 @@
 # Plan 62 — Docs sidebar restructure with placeholder pages
 
-Status: **Ready to implement.** Self-contained: another session can pick
-this up cold without prior conversation context. The work is purely in
-`public/` — it does not touch crates, CLI, or any runtime code, so it
-can run in parallel with the plan-60 microsandbox migration without
-merge risk.
+Status: **✅ shipped (2026-05-11).** All 21 placeholder pages live
+under `public/src/content/docs/{working,templates,examples,security,
+reference,getting-started}/`, each carrying the documented
+frontmatter + TODO block + placeholder notice. `public/astro.config.mjs`
+sidebar reads in the documented order. Competitor name absent from
+every committed file (verified via grep over `public/src/` +
+`specs/plans/62-*`). Subsequent content sessions can fill pages in
+independently — that work is out of scope here.
 
 ## Why
 
