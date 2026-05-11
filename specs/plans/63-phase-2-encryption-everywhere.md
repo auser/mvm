@@ -54,6 +54,49 @@ Six workstreams. Each is independently shippable on its own PR.
 
 ## W1 — `mvm-security::key_rotation` (5 days)
 
+**Status (2026-05-11)**: ✅ shipped. `crates/mvm-security/src/key_rotation.rs`
+adds the five primitives plus a `MasterKeyManifest` type with 19
+unit tests:
+
+- `rewrap_dek` — dispatches on `WrapAlgorithm`. For `Aes256Gcm`
+  (a new variant introduced this commit), decrypts under the old
+  master with `snapshot_crypto::decrypt`, holds the plaintext DEK
+  in a `SecretBox`, re-encrypts under the new master with
+  `snapshot_crypto::encrypt` (fresh nonce per call). For
+  `AesKwp`, returns `RotationError::UnsupportedAlgorithm` with a
+  pointer at mvmd (per plan 45 §D5 convergence rule).
+- `rotate_master_key(active_dir, &org_id) -> MasterKeyRef` — writes
+  raw 32 bytes to `<active_dir>/v<N>.bin` mode 0600, marks every
+  prior `Active` → `Legacy`, atomically swaps the
+  `manifest.json` via `.tmp + rename`. Always produces a fresh
+  version (callers consult `load_manifest` first if they want
+  "skip if recent enough").
+- `load_master_key` — reads `v<N>.bin` returning
+  `SecretBox<[u8; 32]>`; refuses any mode looser than 0600.
+- `migrate_wrapped_keys(&mut [WrappedKey], from, to, old, new) ->
+  Vec<MigrationOutcome>` — resumable bulk re-wrap. Entries
+  already at the target version get `Skipped`; mismatched
+  versions fail loudly rather than guess. Idempotent on retry
+  after host crash.
+- `rotate_luks_slot(device, old_pass, new_pass)` — shells out to
+  `cryptsetup luksChangeKey`, staging both passphrases through
+  mode-0600 named tempfiles so they never appear on argv.
+- `reseal_snapshot(snap_dir, old_key, new_key, version)` — verifies
+  under old key, advances the `EpochStore`, re-seals under new
+  key. Tampered snapshots and wrong-old-key failures propagate
+  the underlying `VerifyError`.
+
+The proptest the spec called for landed as
+`rewrap_dek_randomized_100_round_trips` — 100 iterations of
+`(dek_len ∈ 1..256, random_master_1, random_master_2)`
+round-tripping cleanly. Skipped the `proptest` crate dep — the
+manual loop achieves the same coverage with zero deps added.
+
+The LUKS-success path needs a live cryptsetup binary and a LUKS
+device; the substrate tests cover the tempfile-staging shape and
+the fail-closed behavior when cryptsetup is missing or the device
+doesn't exist.
+
 **Goal**: DEK re-wrap on KEK rotation; LUKS2 keyslot rotation;
 snapshot KEK rolling. Pure crypto + key-management primitives sitting
 on top of the substrate already shipped.

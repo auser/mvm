@@ -396,7 +396,19 @@ pub struct VolumeEntry {
 #[serde(rename_all = "kebab-case")]
 pub enum WrapAlgorithm {
     /// AES Key Wrap with Padding (NIST SP 800-38F / RFC 5649).
+    /// Implemented mvmd-side per plan 45 §D5 ("EncryptedBackend
+    /// lives in mvmd, not mvm"); `mvm_security::key_rotation`'s
+    /// rewrap path returns `UnsupportedAlgorithm` when asked to
+    /// rewrap an `AesKwp` envelope.
     AesKwp,
+
+    /// AES-256-GCM AEAD wrap (12-byte nonce || ciphertext || 16-byte
+    /// tag, the `mvm_security::snapshot_crypto` envelope shape).
+    /// mvm-side rotation supports this variant out of the box —
+    /// `rewrap_dek` decrypts under the old master and re-encrypts
+    /// under the new master with a fresh nonce, preserving the
+    /// plaintext DEK. Plan 63 W1.
+    Aes256Gcm,
 }
 
 /// A per-volume AEAD key, wrapped under a versioned master key.
