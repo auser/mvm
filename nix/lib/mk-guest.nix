@@ -31,11 +31,12 @@
 # use its NixOS module — that's the systemd-heavy path we're
 # explicitly avoiding here.
 
-{ nixpkgs, microvm }:
+{ nixpkgs, microvm, mvmSrc }:
 { system }:
 let
   pkgs = import nixpkgs { inherit system; };
   lib  = nixpkgs.lib;
+
 
   # Static busybox — single binary, every shell utility as an applet.
   # `pkgsStatic` ensures no glibc dynamic-linker hop at /init time
@@ -84,6 +85,30 @@ let
     if dev == null then entrypointKind == "shell"
     else dev;
   isSealed = !isDev;
+
+  # ── Guest agent build (W6.1.2) ─────────────────────────────────
+  #
+  # Real Rust binary built from the workspace at `mvmSrc` via
+  # `nix/packages/mvm-guest-agent.nix`. Replaces the W6.1.1 sh-stub
+  # that previously lived inline here. The W7.x.2 microsandbox
+  # builder VM is what makes this buildable on hosts without native
+  # Linux Nix.
+  #
+  # The `dev-shell` Cargo feature gates the `do_exec` RPC handler
+  # (ADR-002 §W4.3 / `prod-agent-no-exec` CI gate). We tie it to
+  # `isDev` here so the same `mkGuest` call:
+  #
+  #   - Dev image (`entrypoint.shell = ...`, or `dev = true`)
+  #     → `do_exec` compiled in → `mvmctl exec`/`mvmctl console` work
+  #   - Prod/sealed image (`entrypoint.command`/`services`, or
+  #     `dev = false`)
+  #     → `do_exec` stripped → CI's symbol-absence gate passes
+  #
+  # Either way the binary is the production Rust build, not a stub.
+  guestAgentPkg = pkgs.callPackage ../packages/mvm-guest-agent.nix {
+    inherit mvmSrc;
+    withDevShell = isDev;
+  };
 
   # ── Privilege model (uids) ─────────────────────────────────────
   #
@@ -239,35 +264,33 @@ let
 
   nameFile = pkgs.writeText "mvm-name" "${name}\n";
 
-  # ── mvm-guest-agent — placeholder stub (W6.1.2 swaps for real Rust binary)
+  # ── mvm-guest-agent — production Rust binary (W6.1.2)
   #
-  # Real binary lives at `crates/mvm-guest/src/bin/mvm-guest-agent.rs`
-  # (~2400 LOC of vsock RPC + system metrics + tool dispatch).
-  # Cross-compiling it from a macOS dev host needs a Linux builder
-  # (nix-darwin's linux-builder, or a remote nix-daemon). To unblock
-  # the supervision-pattern work without taking on that dep, this
-  # wave ships a sh stub that:
+  # Built by `nix/packages/mvm-guest-agent.nix` from the workspace
+  # source at `mvmSrc`. The W6.1.1 sh-stub that previously lived here
+  # was a placeholder used while the cross-compile infrastructure
+  # was being staged; the W7.x.2 microsandbox builder VM made the
+  # real build host-Nix-free, which unblocked this swap.
   #
-  #   - exists at /usr/local/bin/mvm-guest-agent (so /init's exec
-  #     check finds it)
-  #   - logs its startup line to /dev/console so the supervision
-  #     shape is observable from the host
-  #   - sleeps in a loop indefinitely (the real agent's vsock
-  #     listener is also a long-running event loop)
-  #
-  # Swap-out for the real binary is a single attribute swap in the
-  # rootfsTree population step below. W6.1.2 lands the Nix
-  # derivation that builds the Rust binary as a target-Linux
-  # artifact and references it instead of this stub.
-  agentBinary = pkgs.writeShellScript "mvm-guest-agent-stub" ''
-    #!/bin/sh
-    # mvm-guest-agent (PLACEHOLDER STUB — W6.1.2 ships the real binary).
-    echo "mvm-guest-agent: stub started; uid=$(/bin/busybox id -u)" \
-      > /dev/console 2>&1 || true
-    while true; do
-      /bin/busybox sleep 3600
-    done
-  '';
+  # The binary is the same one the workspace's
+  # `crates/mvm-guest/src/bin/mvm-guest-agent.rs` Cargo target builds
+  # — vsock RPC handler, worker-pool dispatcher, integration manifest
+  # consumer, system metrics surface. ADR-002 §W4 documents the
+  # attack surface; ADR-002 §W4.3 documents the `dev-shell` feature
+  # gate that toggles `do_exec` between dev and prod images.
+  agentBinary = "${guestAgentPkg}/bin/mvm-guest-agent";
+
+  # `mvm-seccomp-apply` ships alongside the agent (same Cargo
+  # workspace member, same derivation). The per-service launch line
+  # in `mkServiceBlock` execs it via setpriv to apply the tier's
+  # seccomp filter before handing control to the workload.
+  seccompApplyBinary = "${guestAgentPkg}/bin/mvm-seccomp-apply";
+
+  # `mvm-verity-init` is the PID 1 of the verity initramfs (ADR-002
+  # §W3). Baked into the verity-initrd cpio.gz, not into the rootfs
+  # directly — wired here as a passthru export so the initramfs
+  # builder can reach it without duplicating the agent derivation.
+  verityInitBinary = "${guestAgentPkg}/bin/mvm-verity-init";
 
   # extraFiles — { "absolute/path" = { content; mode?; }; }
   extraFilePopulation = lib.concatMapStringsSep "\n"
@@ -421,11 +444,11 @@ let
       entrypoint = entrypointUid;
     };
     rootlessEntrypoint = entrypointUid != 0;
-    # Agent binary kind: "stub" for the placeholder shipped in W6.1.1,
-    # "real" once W6.1.2 swaps in the cross-compiled Rust binary.
-    # `mvmctl status` reads this; production deployments should
-    # require "real" (the stub doesn't speak vsock RPC).
-    agentBinary = "stub";
+    # Agent binary kind: "real" since W6.1.2 swapped in the cross-
+    # compiled Rust binary. The previous "stub" value flagged the
+    # W6.1.1 placeholder sh script. `mvmctl status` reads this;
+    # production deployments should refuse to boot a "stub" image.
+    agentBinary = "real";
   };
 in
 rootfsImage.overrideAttrs (old: {
@@ -437,5 +460,10 @@ rootfsImage.overrideAttrs (old: {
     # the runtime — no NixOS evaluation needed.
     inherit hypervisor;
     resources = { inherit vcpus memory_mib; };
+    # W6.1.2: expose the side-binaries from the guest-agent build so
+    # downstream derivations (verity-initrd, per-service launch line
+    # in `mkServiceBlock`) can reach `mvm-seccomp-apply` and
+    # `mvm-verity-init` without re-running the cargo build.
+    inherit guestAgentPkg seccompApplyBinary verityInitBinary;
   };
 })

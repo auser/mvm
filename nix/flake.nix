@@ -101,7 +101,12 @@
       # User flakes consume this as `inputs.mvm.lib.<system>.mkGuest`
       # to declare a microVM image. Implementation lives under
       # `./lib/`; the entry point is `./lib/default.nix`.
-      libFor = import ./lib { inherit nixpkgs microvm; };
+      # Pass `self` as `mvmSrc` so `nix/lib/mk-guest.nix` can build
+      # the real `mvm-guest-agent` from this flake's source tree
+      # (`nix/packages/mvm-guest-agent.nix`). On user-side
+      # consumption the path resolves to the fetched mvm input's
+      # store path — the workspace source travels with the flake.
+      libFor = import ./lib { inherit nixpkgs microvm; mvmSrc = self; };
     in
     {
       # ── User-facing: lib.<system>.mkGuest ────────────────────────

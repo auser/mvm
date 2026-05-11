@@ -3,9 +3,9 @@
 # part of mvm's public API. New helpers go in their own files under
 # `nix/lib/` and get re-exported here.
 
-{ nixpkgs, microvm }:
+{ nixpkgs, microvm, mvmSrc }:
 let
-  mkGuestImpl = import ./mk-guest.nix { inherit nixpkgs microvm; };
+  mkGuestImpl = import ./mk-guest.nix { inherit nixpkgs microvm mvmSrc; };
 in
 { system }:
 {

@@ -155,11 +155,12 @@ in
   #
   # Every mkGuest output advertises whether the bundled
   # mvm-guest-agent is the stub (W6.1.1) or the real binary
-  # (W6.1.2+). Production deployments should refuse to boot a
-  # "stub" image once the lint lands; for now the metadata is
-  # the contract.
+  # (W6.1.2+). Since W6.1.2 swapped in the cross-compiled Rust
+  # binary, every mkGuest output reports "real". A future
+  # production lint can fail any deployment whose
+  # `passthru.mvm.agentBinary` is not "real".
 
-  agent_binary_starts_as_stub = (meta shellGuest).agentBinary == "stub"
-    && (meta commandGuest).agentBinary == "stub"
-    && (meta servicesGuest).agentBinary == "stub";
+  agent_binary_is_real = (meta shellGuest).agentBinary == "real"
+    && (meta commandGuest).agentBinary == "real"
+    && (meta servicesGuest).agentBinary == "real";
 }
