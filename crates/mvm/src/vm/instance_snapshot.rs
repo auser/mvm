@@ -42,10 +42,26 @@ use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 
+use mvm_security::keystore;
+use mvm_security::snapshot_encryption;
 use mvm_security::snapshot_hmac::{
     EpochStore, IntegritySidecar, MEM_FILENAME, SIDECAR_FILENAME, SnapshotFiles, VMSTATE_FILENAME,
     VerifyError, files_in, load_or_init_key, seal, verify,
 };
+use secrecy::ExposeSecret;
+
+/// Tenant id used for snapshot encryption in mvm's single-host
+/// posture. Mirrors ADR-002's "one guest = one workload" framing —
+/// every snapshot belongs to the local tenant. mvmd's multi-tenant
+/// path uses a different code path that takes a `tenant_id`
+/// explicitly.
+pub const SNAPSHOT_TENANT_ID: &str = "local";
+
+/// Env var that lets operators opt out of the "encrypted snapshot
+/// when a key is configured" guard on resume — for the one-time
+/// v1 → v2 migration after upgrading mvmctl. Defaults to refusing
+/// unencrypted snapshots when a tenant DEK is configured.
+pub const ALLOW_UNENCRYPTED_ENV: &str = "MVM_ALLOW_UNENCRYPTED_SNAPSHOT";
 
 /// Filename of the persistent epoch counter inside an
 /// instance-snapshot dir. Hidden by default (`.epoch`) so a casual
@@ -107,6 +123,13 @@ pub fn pause_and_seal<IO: SnapshotIO>(vm_name: &str, io: &IO) -> Result<Integrit
         .with_context(|| format!("Firecracker create_snapshot({})", dir.display()))?;
     tighten_snapshot_file_modes(&dir)?;
 
+    // Encrypt vmstate + mem in place under the tenant DEK if one is
+    // available. Plan 63 W5: the HMAC envelope below then covers
+    // the ciphertext, so any tamper attempt fails the seal check
+    // before AEAD decryption is even attempted on resume.
+    encrypt_artifacts_if_keyed(&dir)
+        .with_context(|| format!("encrypting snapshot artifacts at {}", dir.display()))?;
+
     let key_path =
         mvm_security::snapshot_hmac::default_key_path(Path::new(&mvm_core::config::mvm_data_dir()));
     let key = load_or_init_key(&key_path)
@@ -124,7 +147,7 @@ pub fn pause_and_seal<IO: SnapshotIO>(vm_name: &str, io: &IO) -> Result<Integrit
         &files,
         next_epoch,
         mvmctl_version,
-        secrecy::ExposeSecret::expose_secret(&key),
+        key.expose_secret(),
     )
     .with_context(|| format!("sealing instance snapshot at {}", dir.display()))?;
     Ok(sidecar)
@@ -160,16 +183,107 @@ pub fn verify_and_resume<IO: SnapshotIO>(vm_name: &str, io: &IO) -> Result<Integ
         &files,
         min_epoch,
         mvmctl_version,
-        secrecy::ExposeSecret::expose_secret(&key),
+        key.expose_secret(),
         allow_stale,
     ) {
         Ok(s) => s,
         Err(e) => return Err(map_verify_error(e, &dir)),
     };
 
+    // HMAC verify passed → the artifacts on disk are the bytes that
+    // were sealed. If they're AES-GCM-encrypted (MVSE magic),
+    // decrypt them in place before handing to Firecracker.
+    decrypt_artifacts_if_encrypted(&dir)
+        .with_context(|| format!("decrypting snapshot artifacts at {}", dir.display()))?;
+
     io.load_snapshot(&dir)
         .with_context(|| format!("Firecracker load_snapshot({})", dir.display()))?;
     Ok(sidecar)
+}
+
+/// Encrypt `vmstate.bin` and `mem.bin` in place under the tenant
+/// DEK, when one is available. No-op when no DEK is configured —
+/// the resulting snapshot stays unencrypted, HMAC-only (Phase 1 /
+/// pre-W5 shape).
+fn encrypt_artifacts_if_keyed(dir: &Path) -> Result<()> {
+    let provider = keystore::default_provider();
+    let Ok(dek) = provider.get_data_key(SNAPSHOT_TENANT_ID) else {
+        // No tenant DEK configured — leave artifacts unencrypted.
+        // Operators who want at-rest encryption configure a key
+        // via `mvmctl secret put` or the MVM_TENANT_KEY_LOCAL env
+        // var (W3).
+        return Ok(());
+    };
+    let key_bytes = dek.expose_secret();
+    if key_bytes.len() != snapshot_encryption::KEY_SIZE {
+        bail!(
+            "tenant DEK is {} bytes, snapshot encryption requires {}",
+            key_bytes.len(),
+            snapshot_encryption::KEY_SIZE
+        );
+    }
+    for name in [VMSTATE_FILENAME, MEM_FILENAME] {
+        let p = dir.join(name);
+        if !p.exists() {
+            continue;
+        }
+        // Skip files that already begin with the MVSE magic — this
+        // makes pause_and_seal idempotent on retry after a crash
+        // that successfully encrypted but failed before sealing.
+        if snapshot_encryption::probe(&p)?.is_some() {
+            continue;
+        }
+        snapshot_encryption::encrypt_file_in_place(&p, key_bytes)
+            .with_context(|| format!("encrypting {}", p.display()))?;
+    }
+    Ok(())
+}
+
+/// Decrypt `vmstate.bin` and `mem.bin` in place when they carry the
+/// MVSE magic. Refuses to fall through silently when a DEK *is*
+/// configured but the artifacts are unencrypted (downgrade attack
+/// or v1-shape leftover); set `MVM_ALLOW_UNENCRYPTED_SNAPSHOT=1`
+/// to bypass during the one-time v1 → v2 migration.
+fn decrypt_artifacts_if_encrypted(dir: &Path) -> Result<()> {
+    let provider = keystore::default_provider();
+    let dek_opt = provider.get_data_key(SNAPSHOT_TENANT_ID).ok();
+
+    for name in [VMSTATE_FILENAME, MEM_FILENAME] {
+        let p = dir.join(name);
+        if !p.exists() {
+            continue;
+        }
+        let is_encrypted = snapshot_encryption::probe(&p)?.is_some();
+        match (is_encrypted, &dek_opt) {
+            (true, Some(dek)) => {
+                snapshot_encryption::decrypt_file_in_place(&p, dek.expose_secret())
+                    .with_context(|| format!("decrypting {}", p.display()))?;
+            }
+            (true, None) => {
+                bail!(
+                    "{} is AES-GCM encrypted but no tenant DEK is configured — \
+                     run `mvmctl secret put` to provision a key, then `mvmctl resume`",
+                    p.display()
+                );
+            }
+            (false, Some(_)) => {
+                if std::env::var(ALLOW_UNENCRYPTED_ENV).as_deref() != Ok("1") {
+                    bail!(
+                        "{} is not encrypted but a tenant DEK is configured — \
+                         refusing to resume (set {ALLOW_UNENCRYPTED_ENV}=1 to \
+                         force during v1 → v2 migration)",
+                        p.display()
+                    );
+                }
+                // No-op — operator opted in to the migration escape.
+            }
+            (false, None) => {
+                // Pre-W5 / Phase 1 shape: unencrypted artifact, no
+                // DEK configured. Resume normally.
+            }
+        }
+    }
+    Ok(())
 }
 
 /// Drop the on-disk snapshot files + sidecar + epoch counter for
@@ -596,5 +710,185 @@ mod tests {
     fn list_returns_empty_when_root_missing() {
         let _g = DataDirGuard::new();
         assert!(list_instance_snapshots().unwrap().is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Plan 63 W5 — encryption integration
+    // ──────────────────────────────────────────────────────────────
+
+    /// 32-byte tenant DEK, hex-encoded, suitable for the env-var
+    /// provider via `MVM_TENANT_KEY_LOCAL`.
+    const TEST_DEK_HEX: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+
+    /// RAII guard that pins `MVM_TENANT_KEY_LOCAL` for the lifetime
+    /// of the test. Combine with `DataDirGuard` (which holds the
+    /// data-dir lock) — both pieces must be in scope so the
+    /// env-var mutation is serialised across the test binary.
+    struct TenantKeyGuard {
+        prev: Option<String>,
+    }
+
+    impl TenantKeyGuard {
+        fn set(hex: &str) -> Self {
+            let prev = std::env::var("MVM_TENANT_KEY_LOCAL").ok();
+            unsafe {
+                std::env::set_var("MVM_TENANT_KEY_LOCAL", hex);
+            }
+            Self { prev }
+        }
+    }
+
+    impl Drop for TenantKeyGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("MVM_TENANT_KEY_LOCAL", v),
+                    None => std::env::remove_var("MVM_TENANT_KEY_LOCAL"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn pause_and_seal_encrypts_vmstate_and_mem_when_key_is_configured() {
+        let _g = DataDirGuard::new();
+        let _k = TenantKeyGuard::set(TEST_DEK_HEX);
+        let _s = pause_and_seal("vm-encrypt", &canned()).unwrap();
+        let dir = snapshot_dir("vm-encrypt");
+        // Both artifact files must now begin with the MVSE magic.
+        for name in [VMSTATE_FILENAME, MEM_FILENAME] {
+            let header = mvm_security::snapshot_encryption::probe(&dir.join(name))
+                .unwrap()
+                .unwrap_or_else(|| panic!("{name} should be encrypted (MVSE magic missing)"));
+            assert_eq!(
+                header.version,
+                mvm_security::snapshot_encryption::SCHEMA_VERSION
+            );
+        }
+        // And the on-disk vmstate must NOT contain the plaintext
+        // sentinel CannedIO writes (`b"vmstate-bytes"`) — confirms
+        // the file is genuinely encrypted, not just magic-tagged.
+        let ct = std::fs::read(dir.join(VMSTATE_FILENAME)).unwrap();
+        assert!(
+            !ct.windows(13).any(|w| w == b"vmstate-bytes"),
+            "plaintext leaked into ciphertext"
+        );
+    }
+
+    #[test]
+    fn pause_and_seal_leaves_artifacts_unencrypted_when_no_key() {
+        let _g = DataDirGuard::new();
+        // Defensive: clear the env var in case a parallel test left
+        // it set. The DataDirGuard's lock means we're alone for the
+        // duration of this test.
+        unsafe { std::env::remove_var("MVM_TENANT_KEY_LOCAL") };
+        let _s = pause_and_seal("vm-plain", &canned()).unwrap();
+        let dir = snapshot_dir("vm-plain");
+        // No MVSE magic — vmstate is raw bytes from CannedIO.
+        assert!(
+            mvm_security::snapshot_encryption::probe(&dir.join(VMSTATE_FILENAME))
+                .unwrap()
+                .is_none()
+        );
+        let raw = std::fs::read(dir.join(VMSTATE_FILENAME)).unwrap();
+        assert_eq!(raw, b"vmstate-bytes");
+    }
+
+    #[test]
+    fn verify_and_resume_round_trips_encrypted_snapshot() {
+        let _g = DataDirGuard::new();
+        let _k = TenantKeyGuard::set(TEST_DEK_HEX);
+        let sealed = pause_and_seal("vm-rt", &canned()).unwrap();
+        let verified = verify_and_resume("vm-rt", &canned()).unwrap();
+        assert_eq!(verified, sealed);
+        // After resume, the artifacts should be decrypted in place
+        // (Firecracker reads plaintext bytes).
+        let dir = snapshot_dir("vm-rt");
+        let pt = std::fs::read(dir.join(VMSTATE_FILENAME)).unwrap();
+        assert_eq!(pt, b"vmstate-bytes");
+    }
+
+    #[test]
+    fn verify_and_resume_rejects_encrypted_snapshot_with_wrong_key() {
+        let _g = DataDirGuard::new();
+        let _k = TenantKeyGuard::set(TEST_DEK_HEX);
+        pause_and_seal("vm-wk", &canned()).unwrap();
+        drop(_k);
+        // Swap to a different DEK and try to resume. HMAC verify
+        // passes (it's keyed on the host HMAC key, not the DEK), so
+        // we fail at the AEAD step.
+        let wrong = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let _k2 = TenantKeyGuard::set(wrong);
+        let err = verify_and_resume("vm-wk", &canned()).unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("decrypting") || s.contains("authentication"),
+            "want AEAD failure context, got: {s}"
+        );
+    }
+
+    #[test]
+    fn verify_and_resume_refuses_unencrypted_snapshot_when_key_configured() {
+        let _g = DataDirGuard::new();
+        // First seal WITHOUT a key — unencrypted, v1-shape.
+        unsafe { std::env::remove_var("MVM_TENANT_KEY_LOCAL") };
+        pause_and_seal("vm-mix", &canned()).unwrap();
+
+        // Now configure a key and try to resume. Plan 63 W5: refuse
+        // because the snapshot was sealed before the DEK was
+        // provisioned (downgrade vs v1 leftover indistinguishable
+        // at this layer).
+        let _k = TenantKeyGuard::set(TEST_DEK_HEX);
+        let err = verify_and_resume("vm-mix", &canned()).unwrap_err();
+        let chained: String = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            chained.contains("not encrypted") || chained.contains("DEK is configured"),
+            "want unencrypted-with-key refusal, got: {chained}"
+        );
+    }
+
+    #[test]
+    fn verify_and_resume_v1_unencrypted_bypass_via_env() {
+        // The one-time v1 → v2 migration escape: operator opts in
+        // via MVM_ALLOW_UNENCRYPTED_SNAPSHOT=1 to resume a pre-W5
+        // snapshot under a key-configured tenant.
+        let _g = DataDirGuard::new();
+        unsafe { std::env::remove_var("MVM_TENANT_KEY_LOCAL") };
+        pause_and_seal("vm-mig", &canned()).unwrap();
+
+        let _k = TenantKeyGuard::set(TEST_DEK_HEX);
+        unsafe { std::env::set_var(ALLOW_UNENCRYPTED_ENV, "1") };
+        let result = verify_and_resume("vm-mig", &canned());
+        unsafe { std::env::remove_var(ALLOW_UNENCRYPTED_ENV) };
+        assert!(
+            result.is_ok(),
+            "migration escape should let unencrypted v1 snapshot resume; got {:?}",
+            result.err()
+        );
+    }
+
+    #[test]
+    fn verify_and_resume_refuses_encrypted_snapshot_when_key_missing() {
+        let _g = DataDirGuard::new();
+        let _k = TenantKeyGuard::set(TEST_DEK_HEX);
+        pause_and_seal("vm-lost", &canned()).unwrap();
+        drop(_k);
+        // Operator lost the key. Resume must refuse rather than
+        // silently produce gibberish.
+        unsafe { std::env::remove_var("MVM_TENANT_KEY_LOCAL") };
+        let err = verify_and_resume("vm-lost", &canned()).unwrap_err();
+        let chained: String = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(
+            chained.contains("encrypted") && chained.contains("tenant DEK"),
+            "want missing-DEK refusal, got: {chained}"
+        );
     }
 }

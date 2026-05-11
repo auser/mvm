@@ -294,6 +294,41 @@ keyring, blocking `--tenant ../etc` and similar.
 
 ## W5 — `mvmctl snapshot save/load` AES-GCM wiring (3 days)
 
+**Status (2026-05-11)**: ✅ shipped. Encryption is now integrated
+into the existing `mvmctl pause` / `mvmctl resume` pipeline rather
+than a new `snapshot save / load` surface (the existing pause/
+resume already does the right thing — the rename would have been
+gratuitous). New module `mvm_security::snapshot_encryption` adds
+chunked AES-256-GCM file-bound primitives (`encrypt_file_in_place`,
+`decrypt_file_in_place`, `probe`) with a 24-byte header carrying
+the `MVSE` magic, schema version, chunk size, and plaintext size.
+1 MiB chunks; fresh nonce per chunk; AEAD authentication tag per
+chunk; HMAC seal covers the ciphertext.
+
+`mvm::vm::instance_snapshot::{pause_and_seal, verify_and_resume}`
+were extended to:
+
+- **pause**: if `keystore::default_provider().get_data_key("local")`
+  resolves, encrypt `vmstate.bin` and `mem.bin` in place under the
+  tenant DEK before sealing. Idempotent: a retry after a crash
+  detects existing MVSE magic and skips re-encryption.
+- **resume**: after HMAC verify, probe each artifact for MVSE
+  magic. Four branches:
+  - encrypted + DEK available → decrypt in place
+  - encrypted + DEK missing → refuse with clear "run `mvmctl
+    secret put`" pointer
+  - unencrypted + DEK configured → refuse (downgrade defence);
+    `MVM_ALLOW_UNENCRYPTED_SNAPSHOT=1` is the one-time
+    migration escape
+  - unencrypted + no DEK → pre-W5 path, resume normally
+
+19 tests cover the substrate (chunked encrypt/decrypt under/over
+the chunk boundary, exact-boundary, empty file, wrong key,
+tampered ciphertext, truncated file, probe semantics, encrypt
+failure leaves plaintext intact) plus 7 integration tests
+exercising the full pause→resume round-trip with all four
+DEK/encryption combinations + the migration-escape env var.
+
 **Goal**: `mvmctl snapshot save <vm>` produces an AEAD-encrypted
 snapshot bundle; `mvmctl snapshot load <bundle> --vm <name>` decrypts
 and restores. Wraps the existing snapshot pipeline (already shipping
