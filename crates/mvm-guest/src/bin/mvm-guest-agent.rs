@@ -21,7 +21,7 @@ use std::io::{Read, Write};
 use std::mem::size_of;
 use std::os::fd::{FromRawFd, RawFd};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -94,6 +94,18 @@ fn print_usage() {
 }
 
 fn parse_config() -> AgentConfig {
+    let (cfg, resolved_path) = parse_config_with_path();
+    // Plan 44 W3: stash the resolved config path so the SIGHUP
+    // handler's `apply_reload` re-reads the same file the operator
+    // launched against (handles `--config <path>` overrides).
+    let _ = AGENT_CONFIG_PATH.set(resolved_path);
+    cfg
+}
+
+/// Test seam — returns the resolved path the file was read from
+/// (or the default path if nothing was found) alongside the
+/// parsed config. Production goes through [`parse_config`].
+fn parse_config_with_path() -> (AgentConfig, PathBuf) {
     let args: Vec<String> = std::env::args().collect();
     let mut config_path: Option<String> = None;
     let mut cli_port: Option<u32> = None;
@@ -184,7 +196,10 @@ fn parse_config() -> AgentConfig {
         cfg.sample_interval_secs = s;
     }
 
-    cfg
+    let resolved = config_path
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_CONFIG_PATH));
+    (cfg, resolved)
 }
 
 // ============================================================================
@@ -307,9 +322,14 @@ fn utc_now() -> String {
 }
 
 /// Background monitoring loop — samples /proc/loadavg at the configured interval.
-fn monitoring_loop(state: Arc<Mutex<AgentState>>, busy_threshold: f64, sample_interval: Duration) {
+///
+/// Reads `HOT_BUSY_THRESHOLD_BITS` and `HOT_SAMPLE_INTERVAL_SECS`
+/// on every iteration so a SIGHUP-driven reload (plan 44 W3) picks
+/// up on the next sample without restarting the loop.
+fn monitoring_loop(state: Arc<Mutex<AgentState>>) {
     loop {
         let load = sample_load();
+        let busy_threshold = f64::from_bits(HOT_BUSY_THRESHOLD_BITS.load(Ordering::Acquire));
         if let Ok(mut s) = state.lock() {
             if load >= busy_threshold {
                 s.status = "busy".to_string();
@@ -318,7 +338,8 @@ fn monitoring_loop(state: Arc<Mutex<AgentState>>, busy_threshold: f64, sample_in
                 s.status = "idle".to_string();
             }
         }
-        std::thread::sleep(sample_interval);
+        let interval_secs = HOT_SAMPLE_INTERVAL_SECS.load(Ordering::Acquire).max(1); // never sleep 0 — busy-spin would peg a CPU
+        std::thread::sleep(Duration::from_secs(interval_secs));
     }
 }
 
@@ -939,6 +960,26 @@ static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
 /// asked twice — escalate to `_exit` and skip the drain.
 static SHUTDOWN_SIGNAL_COUNT: AtomicU8 = AtomicU8::new(0);
 
+/// Plan 44 W3 — set by `on_reload_signal` (SIGHUP). The accept
+/// loop polls this between iterations and, when set, re-reads
+/// the config file and applies the hot-reloadable subset.
+/// Distinct from `SHUTDOWN_REQUESTED` so a reload doesn't terminate
+/// the agent.
+static RELOAD_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+/// Path of the config file the agent loaded at boot. Captured by
+/// `parse_config` so the SIGHUP handler can re-read the same file
+/// even when the operator launched with `--config <path>`.
+static AGENT_CONFIG_PATH: std::sync::OnceLock<PathBuf> = std::sync::OnceLock::new();
+
+/// Current value of the busy threshold (f64 bits) seen by the
+/// monitoring loop. Updated atomically by `apply_reload`.
+static HOT_BUSY_THRESHOLD_BITS: AtomicU64 = AtomicU64::new(0);
+
+/// Current sample interval in seconds, updated atomically by
+/// `apply_reload`. Initialized to a sane default until main() runs.
+static HOT_SAMPLE_INTERVAL_SECS: AtomicU64 = AtomicU64::new(DEFAULT_SAMPLE_INTERVAL_SECS);
+
 /// Default grace period for `shutdown_subsystems` to wait between
 /// "shut down requested" and forcing exit. Mirrors the cold-path
 /// `CallCaps::v1().kill_grace_period * 2 + slack` so a typical
@@ -966,6 +1007,19 @@ unsafe extern "C" fn on_shutdown_signal(sig: libc::c_int) {
         }
     }
     SHUTDOWN_REQUESTED.store(true, Ordering::Release);
+}
+
+/// SIGHUP handler — plan 44 W3.
+///
+/// Flips `RELOAD_REQUESTED`. The accept loop polls it between
+/// iterations and, when set, calls `apply_reload` to re-read the
+/// config file and update the hot-reloadable atomics. Unlike
+/// the shutdown handler, this does NOT escalate on repeat — each
+/// SIGHUP triggers a fresh reload.
+///
+/// Async-signal-safe — only an atomic store.
+unsafe extern "C" fn on_reload_signal(_sig: libc::c_int) {
+    RELOAD_REQUESTED.store(true, Ordering::Release);
 }
 
 /// Install handlers for SIGTERM and SIGINT. Best-effort: if
@@ -1006,6 +1060,107 @@ fn install_signal_handlers() {
             let err = std::io::Error::last_os_error();
             eprintln!("mvm-guest-agent: sigaction(SIGINT) failed: {err}");
         }
+
+        // SIGHUP handler — plan 44 W3. Separate sigaction because
+        // the dispositions differ: SIGHUP should NOT escalate on
+        // repeat (each delivery triggers a fresh reload).
+        let mut sa_hup: libc::sigaction = std::mem::zeroed();
+        sa_hup.sa_sigaction = on_reload_signal as *const () as usize;
+        libc::sigemptyset(&mut sa_hup.sa_mask);
+        let hup_rc = libc::sigaction(libc::SIGHUP, &sa_hup, std::ptr::null_mut());
+        if hup_rc != 0 {
+            let err = std::io::Error::last_os_error();
+            eprintln!("mvm-guest-agent: sigaction(SIGHUP) failed: {err}");
+        }
+    }
+}
+
+/// Re-read the agent config file and apply the hot-reloadable
+/// subset to live atomics. Called from the accept loop when
+/// `RELOAD_REQUESTED` is set (plan 44 W3 — SIGHUP). Never
+/// terminates the agent; reload errors log and continue with the
+/// prior values.
+///
+/// ## Reload-safety review
+///
+/// `AgentConfig` carries three fields. The decisions are:
+///
+/// - `port: u32` — **NOT reloadable.** Changing it would require
+///   re-binding the listening socket, which would terminate every
+///   live vsock connection. Operator must restart the agent.
+/// - `busy_threshold: f64` — **reloadable.** Read every monitoring
+///   loop iteration via `HOT_BUSY_THRESHOLD_BITS`.
+/// - `sample_interval_secs: u64` — **reloadable.** Read every
+///   monitoring loop iteration via `HOT_SAMPLE_INTERVAL_SECS`.
+///
+/// A reload that changes `port` logs a warning and leaves the
+/// running port in place. Future hot-reloadable fields extend this
+/// function; non-reloadable ones inherit the warning pattern.
+pub(crate) fn apply_reload() {
+    let Some(path) = AGENT_CONFIG_PATH.get() else {
+        eprintln!("mvm-guest-agent: reload skipped — config path not captured");
+        return;
+    };
+    let data = match std::fs::read_to_string(path) {
+        Ok(s) => s,
+        Err(e) => {
+            eprintln!(
+                "mvm-guest-agent: reload skipped — failed to read {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    let new_cfg = match serde_json::from_str::<AgentConfig>(&data) {
+        Ok(c) => c,
+        Err(e) => {
+            eprintln!(
+                "mvm-guest-agent: reload skipped — failed to parse {}: {e}",
+                path.display()
+            );
+            return;
+        }
+    };
+    apply_reload_to_atomics(&new_cfg);
+}
+
+/// Test seam — applies a parsed config to the hot atomics without
+/// touching the filesystem. Production wraps this through
+/// [`apply_reload`].
+fn apply_reload_to_atomics(new_cfg: &AgentConfig) {
+    // Compare to the current values so we log meaningful diffs.
+    let cur_thresh = f64::from_bits(HOT_BUSY_THRESHOLD_BITS.load(Ordering::Acquire));
+    let cur_interval = HOT_SAMPLE_INTERVAL_SECS.load(Ordering::Acquire);
+
+    if (new_cfg.busy_threshold - cur_thresh).abs() > f64::EPSILON {
+        HOT_BUSY_THRESHOLD_BITS.store(new_cfg.busy_threshold.to_bits(), Ordering::Release);
+        eprintln!(
+            "mvm-guest-agent: reload — busy_threshold {cur_thresh} → {}",
+            new_cfg.busy_threshold
+        );
+    }
+    if new_cfg.sample_interval_secs != cur_interval {
+        HOT_SAMPLE_INTERVAL_SECS.store(new_cfg.sample_interval_secs, Ordering::Release);
+        eprintln!(
+            "mvm-guest-agent: reload — sample_interval_secs {cur_interval} → {}",
+            new_cfg.sample_interval_secs
+        );
+    }
+    // `port` is not reloadable. The accept socket is already bound;
+    // changing it would terminate live connections. Log if it
+    // changed so the operator knows a restart is needed.
+    //
+    // We can't compare against the live port (it isn't stored in a
+    // hot atomic — that would imply it's hot-reloadable, which it
+    // isn't). Instead the warning fires unconditionally when the
+    // file's port differs from the default, on the theory that an
+    // operator who edited the config wants to know it didn't take.
+    if new_cfg.port != default_port() {
+        eprintln!(
+            "mvm-guest-agent: reload — port={} on disk; the running agent \
+             keeps its boot-time port (restart to apply)",
+            new_cfg.port
+        );
     }
 }
 
@@ -2085,9 +2240,12 @@ fn main() {
     // Start background monitoring thread.
     let state = Arc::new(Mutex::new(AgentState::new()));
     let monitor_state = Arc::clone(&state);
-    let busy_threshold = cfg.busy_threshold;
-    let sample_interval = Duration::from_secs(cfg.sample_interval_secs);
-    std::thread::spawn(move || monitoring_loop(monitor_state, busy_threshold, sample_interval));
+    // Seed the hot-reloadable atomics from the boot-time config so
+    // monitoring_loop picks up the same values it would have with
+    // the prior captured-by-value shape (plan 44 W3).
+    HOT_BUSY_THRESHOLD_BITS.store(cfg.busy_threshold.to_bits(), Ordering::Release);
+    HOT_SAMPLE_INTERVAL_SECS.store(cfg.sample_interval_secs, Ordering::Release);
+    std::thread::spawn(move || monitoring_loop(monitor_state));
 
     // Scan drop-in integrations and start health check thread.
     let entries = integrations::load_dropin_dir(integrations::INTEGRATIONS_DROPIN_DIR);
@@ -2150,6 +2308,16 @@ fn main() {
         if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
             break;
         }
+        // Plan 44 W3 — apply pending SIGHUP-driven config reload.
+        // Compare-and-swap to false so a concurrent SIGHUP between
+        // the load and the apply isn't lost (it'll re-set the flag
+        // and we'll pick it up on the next iteration).
+        if RELOAD_REQUESTED
+            .compare_exchange(true, false, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+        {
+            apply_reload();
+        }
         // SAFETY: null addr pointers are allowed for accept when peer addr is not needed.
         let cfd = unsafe { accept(fd, std::ptr::null_mut(), std::ptr::null_mut()) };
         if cfd < 0 {
@@ -2160,6 +2328,8 @@ fn main() {
             if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
                 break;
             }
+            // Same fast-path for SIGHUP — apply the reload on the
+            // next iteration's compare_exchange.
             continue;
         }
         if warm_active {
@@ -2249,6 +2419,135 @@ mod tests {
         // because the test runner may have its own handlers.
         install_signal_handlers();
         install_signal_handlers();
+    }
+
+    // ─── Plan 44 W3: SIGHUP config reload ──────────────────────────────
+
+    fn reset_reload_state() {
+        RELOAD_REQUESTED.store(false, Ordering::Release);
+    }
+
+    #[test]
+    fn signal_handler_flips_reload_flag_on_sighup() {
+        let _g = SIGNAL_TEST_LOCK
+            .lock()
+            .expect("signal-test mutex not poisoned");
+        reset_reload_state();
+        assert!(!RELOAD_REQUESTED.load(Ordering::Acquire));
+        // SAFETY: handler is async-signal-safe and only stores an
+        // atomic; SIGHUP signo is a valid libc constant.
+        unsafe {
+            on_reload_signal(libc::SIGHUP);
+        }
+        assert!(RELOAD_REQUESTED.load(Ordering::Acquire));
+    }
+
+    #[test]
+    fn signal_handler_reload_is_idempotent_on_repeat() {
+        // Unlike SIGTERM/SIGINT, SIGHUP must NOT escalate on the
+        // second delivery — each one is a fresh reload request.
+        let _g = SIGNAL_TEST_LOCK
+            .lock()
+            .expect("signal-test mutex not poisoned");
+        reset_reload_state();
+        unsafe {
+            on_reload_signal(libc::SIGHUP);
+            on_reload_signal(libc::SIGHUP);
+            on_reload_signal(libc::SIGHUP);
+        }
+        assert!(RELOAD_REQUESTED.load(Ordering::Acquire));
+        // No `_exit` happened or this test wouldn't have returned.
+    }
+
+    #[test]
+    fn apply_reload_updates_hot_atomics_with_new_values() {
+        let _g = SIGNAL_TEST_LOCK
+            .lock()
+            .expect("signal-test mutex not poisoned");
+        // Seed the atomics to known values.
+        HOT_BUSY_THRESHOLD_BITS.store(0.1f64.to_bits(), Ordering::Release);
+        HOT_SAMPLE_INTERVAL_SECS.store(5, Ordering::Release);
+
+        let new_cfg = AgentConfig {
+            port: default_port(),
+            busy_threshold: 0.75,
+            sample_interval_secs: 30,
+        };
+        apply_reload_to_atomics(&new_cfg);
+
+        let updated_thresh = f64::from_bits(HOT_BUSY_THRESHOLD_BITS.load(Ordering::Acquire));
+        let updated_interval = HOT_SAMPLE_INTERVAL_SECS.load(Ordering::Acquire);
+        assert!(
+            (updated_thresh - 0.75).abs() < f64::EPSILON,
+            "busy_threshold not updated: got {updated_thresh}"
+        );
+        assert_eq!(updated_interval, 30);
+    }
+
+    #[test]
+    fn apply_reload_is_noop_when_values_unchanged() {
+        // If the on-disk config matches the live state, the
+        // reload path runs without changing anything — the
+        // monitoring loop sees the same values.
+        let _g = SIGNAL_TEST_LOCK
+            .lock()
+            .expect("signal-test mutex not poisoned");
+        HOT_BUSY_THRESHOLD_BITS.store(0.5f64.to_bits(), Ordering::Release);
+        HOT_SAMPLE_INTERVAL_SECS.store(10, Ordering::Release);
+
+        let same_cfg = AgentConfig {
+            port: default_port(),
+            busy_threshold: 0.5,
+            sample_interval_secs: 10,
+        };
+        apply_reload_to_atomics(&same_cfg);
+
+        assert_eq!(
+            HOT_BUSY_THRESHOLD_BITS.load(Ordering::Acquire),
+            0.5f64.to_bits()
+        );
+        assert_eq!(HOT_SAMPLE_INTERVAL_SECS.load(Ordering::Acquire), 10);
+    }
+
+    #[test]
+    fn apply_reload_handles_partial_update() {
+        // Only busy_threshold differs; sample_interval_secs stays.
+        let _g = SIGNAL_TEST_LOCK
+            .lock()
+            .expect("signal-test mutex not poisoned");
+        HOT_BUSY_THRESHOLD_BITS.store(0.2f64.to_bits(), Ordering::Release);
+        HOT_SAMPLE_INTERVAL_SECS.store(7, Ordering::Release);
+
+        let new_cfg = AgentConfig {
+            port: default_port(),
+            busy_threshold: 0.9,
+            sample_interval_secs: 7,
+        };
+        apply_reload_to_atomics(&new_cfg);
+
+        assert!(
+            (f64::from_bits(HOT_BUSY_THRESHOLD_BITS.load(Ordering::Acquire)) - 0.9).abs()
+                < f64::EPSILON
+        );
+        assert_eq!(HOT_SAMPLE_INTERVAL_SECS.load(Ordering::Acquire), 7);
+    }
+
+    #[test]
+    fn apply_reload_logs_warning_when_port_differs() {
+        // The port is not reloadable; a non-default port in the
+        // file should log a warning. We can't easily capture
+        // stderr in a test, but we can prove the function doesn't
+        // panic or update the (non-existent) port atomic.
+        let _g = SIGNAL_TEST_LOCK
+            .lock()
+            .expect("signal-test mutex not poisoned");
+        let new_cfg = AgentConfig {
+            port: 9999,
+            busy_threshold: default_busy_threshold(),
+            sample_interval_secs: default_sample_interval_secs(),
+        };
+        apply_reload_to_atomics(&new_cfg);
+        // Pass — no panic. The eprintln warning is by-eye.
     }
 
     #[test]

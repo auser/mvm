@@ -1,7 +1,13 @@
 # Plan 44 — Guest agent signal handling
 
-Status: **W1 + W2 shipped.** W3 (SIGHUP config reload) remains backlog —
-not load-bearing until config reload becomes a real feature.
+Status: **all three workstreams shipped (2026-05-11).** W1 (signal-
+handler primitive + SIGTERM/SIGINT graceful shutdown) and W2 (warm
+pool drain consumer) landed earlier; W3 (SIGHUP config reload)
+ships in this commit. The guest agent now responds to SIGHUP by
+re-reading its config file and applying the hot-reloadable subset
+(`busy_threshold`, `sample_interval_secs`) to live atomics that
+the monitoring loop reads on every iteration. The non-reloadable
+`port` field logs a warning so operators know a restart is needed.
 
 ## Background
 
@@ -157,17 +163,27 @@ finishing (currently relies on natural progression). The simpler
 form for v1: skip this; busy workers see SIGPIPE when the agent
 finally exits.
 
-### W3 — SIGHUP config reload (optional)
+### W3 — SIGHUP config reload
 
-If the same plan ships config reload, wire SIGHUP to a separate
-`RELOAD_REQUESTED: AtomicBool`. The accept loop checks both flags;
-on RELOAD, re-read `/etc/mvm/agent.json` and apply the
-hot-reloadable subset. Don't reload `runtime.json` — it pins
-worker-pool sizing decided at boot.
+**Status (2026-05-11)**: ✅ shipped. `on_reload_signal` handler
+flips `RELOAD_REQUESTED`; the accept loop's
+`compare_exchange(true, false)` swap calls `apply_reload` between
+iterations. Reload-safety review:
 
-Pre-requisite: an `AgentConfig` reload-safety review. Many fields
-(vsock port, integration drop-in dir) are not safely reloadable.
-Document the reloadable subset before shipping the SIGHUP path.
+| Field | Reloadable? | Why / How |
+|---|---|---|
+| `port: u32` | ❌ | Re-binding the listening socket would kill every live vsock connection. Logs a warning if the on-disk port differs from the default; operator restarts the agent to apply. |
+| `busy_threshold: f64` | ✅ | Read every monitoring loop iteration via `HOT_BUSY_THRESHOLD_BITS: AtomicU64` (stores `f64::to_bits`). |
+| `sample_interval_secs: u64` | ✅ | Read every monitoring loop iteration via `HOT_SAMPLE_INTERVAL_SECS: AtomicU64`. |
+
+`runtime.json` is **not** reloaded by this path — it pins
+worker-pool sizing decided at boot. A future workstream can add a
+`runtime.json` reload path if needed; the SIGHUP handler is the
+same. Unlike SIGTERM/SIGINT, SIGHUP does NOT escalate on repeat —
+each delivery triggers a fresh reload. The config path captured
+at boot (handles `--config <path>` overrides) is stashed in a
+`OnceLock<PathBuf>` so the reload reads the same file the agent
+originally loaded.
 
 ## Tests
 
