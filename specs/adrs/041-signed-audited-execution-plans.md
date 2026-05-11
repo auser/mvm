@@ -7,7 +7,7 @@ related: ADR-002 (microVM security posture); ADR-013 (microsandbox + libkrun piv
 
 ## Status
 
-Accepted. Implementation shipped in plan 64 W1–W4 (`specs/plans/64-supervisor-wiring.md`, commits ae81767 W1, a71e60a W2, 2671f5f + bc91d77 W3, 587a33e W4). W5 (`PolicyRef → concrete component slots`) and W6 (this doc + plan-60 Phase 6 mark-up) sequence the remaining substrate.
+Accepted. Implementation shipped in plan 64 W1–W6 (`specs/plans/64-supervisor-wiring.md`, commits ae81767 W1, a71e60a W2, 2671f5f + bc91d77 W3, 587a33e W4, 7184b9a W6, and the W5 commit that adds `crates/mvm-cli/src/commands/vm/policy_resolver.rs`). With W5 landed, plan 64 closes; the remaining `*Ref → real-impl` work (TOML policy bundle format, mvm-hostd consumer lift) is plan 60 Phase 3 / Phase 6 hardware attestation.
 
 The plan-60 §"Security model" claim 8 — *every workload runs from a signed, audited `ExecutionPlan`* — went from "proposed" to user-observably true with the W3 callsite + W4 audit chain landing together. CLAUDE.md updated 2026-05-11.
 
@@ -146,7 +146,7 @@ The CLI surface intentionally stops short of `mvmctl plan create / sign / verify
 - **Audit signer = plan signer.** v0 uses the host's single Ed25519 key for both. A compromised host can mint a fresh chain. Splitting these keys is plan 60 Phase 3.
 - **No trusted clock.** `SystemClock` reads the host wall-clock. A host can wind the clock back to admit a replayed plan within an expired window. `HostBoundRequest::QueryHostTime` (vsock-level) is plan 60 Phase 3.
 - **No attestation.** `AttestationRequirement { mode: Noop }` is honored but ignored. Real TPM2 / SEV-SNP / TDX integration is plan 60 Phase 3.
-- **PolicyRef slots all Noop.** `network_policy`, `fs_policy`, `egress_policy`, `tool_policy` all resolve to `"local-default"`, which W5's resolver maps to fail-closed Noops. Real resolution (`~/.mvm/policies/<tenant>/<workload>.toml`) lands in W5 + plan 60 Phase 3.
+- **PolicyRef slots all Noop.** `network_policy`, `fs_policy`, `egress_policy`, `tool_policy` all resolve to `"local-default"`, which W5's `policy_resolver::resolve_supervisor_components` maps to fail-closed Noops (`NoopEgressProxy` / `NoopToolGate` / `NoopKeystoreReleaser` / `NoopArtifactCollector`). The resolver refuses `"<tenant>:<workload>"` refs with a clear `NotYetImplemented` error naming the policy-bundle path; the on-disk TOML format and real-impl wiring land in plan 60 Phase 3. The W5 substrate has no live consumer yet — `up.rs::admit_plan_for_boot` ships `admit + backend.start()` rather than `Supervisor::launch`, so the resolver's `Box<dyn Trait>` slots are not yet handed to a supervisor builder. That happens with the mvm-hostd lift.
 
 ### Out of scope (named in plan 64's non-goals)
 
@@ -170,3 +170,4 @@ The CLI surface intentionally stops short of `mvmctl plan create / sign / verify
 - `crates/mvm-cli/src/commands/vm/up.rs::admit_plan_for_boot` — W3 callsite.
 - `crates/mvm-cli/src/commands/vm/audit_chain.rs` — W4 audit emitter.
 - `crates/mvm-cli/src/commands/ops/audit.rs` — `mvmctl audit verify / show / tail --chain` CLI surface.
+- `crates/mvm-cli/src/commands/vm/policy_resolver.rs` — W5 `PolicyRef → ResolvedSlots` resolver substrate.

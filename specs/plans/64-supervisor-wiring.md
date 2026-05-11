@@ -9,14 +9,23 @@
 >
 > Plan 64 closes that gap. Roughly 12 days, 6 workstreams.
 
-**Status (2026-05-11)**: W1–W4 + W6 shipped — every `mvmctl up`
-admits a signed `ExecutionPlan` and emits a chain-signed audit
-trail; CLAUDE.md security claim 8 is true and tracked. **W5
-(`PolicyRef → concrete component slots`) remains open** as the
-final workstream before plan 64 closes. ADR-041
-(`specs/adrs/041-signed-audited-execution-plans.md`) documents
-the shipped surface and the `*Ref` semantics gap that W5 + plan
-60 Phase 3 close.
+**Status (2026-05-11)**: **all six workstreams shipped**. Every
+`mvmctl up` admits a signed `ExecutionPlan` and emits a chain-signed
+audit trail; CLAUDE.md security claim 8 is true and tracked. The
+W5 `PolicyRef` resolver landed as substrate-only —
+`policy_resolver::resolve_supervisor_components` maps the four
+`PolicyRef`/`FsPolicyRef` fields onto `Box<dyn EgressProxy>` /
+`Box<dyn ToolGate>` / `Box<dyn KeystoreReleaser>` /
+`Box<dyn ArtifactCollector>` slots, returns Noops for
+`"local-default"`, and refuses `"<tenant>:<workload>"` with a
+clear `NotYetImplemented` error naming the policy file path that
+plan 60 Phase 3 will own. No live consumer yet (the W3 callsite
+still ships `admit + backend.start()` rather than
+`Supervisor::launch`); the resolver is the substrate that turns
+the eventual mvm-hostd lift into a one-line `.with_egress(...)`
+chain. ADR-041 (`specs/adrs/041-signed-audited-execution-plans.md`)
+documents the shipped surface and the `*Ref` semantics gap that
+plan 60 Phase 3 closes.
 
 | Workstream | Status | Landing commits |
 |---|---|---|
@@ -24,8 +33,8 @@ the shipped surface and the `*Ref` semantics gap that W5 + plan
 | W2 — host-side signing keypair | ✅ shipped 2026-05-11 | a71e60a |
 | W3 — admission substrate + callsite | ✅ shipped 2026-05-11 | 2671f5f, bc91d77 |
 | W4 — `FileAuditSigner` + `mvmctl audit` | ✅ shipped 2026-05-11 | 587a33e |
-| W5 — `PolicyRef` resolver | ⏳ open | — |
-| W6 — verification + ADR-041 + plan 60 Phase 6 mark-up | ✅ shipped 2026-05-11 | (this commit) |
+| W5 — `PolicyRef` resolver | ✅ shipped 2026-05-11 (substrate) | (this commit) |
+| W6 — verification + ADR-041 + plan 60 Phase 6 mark-up | ✅ shipped 2026-05-11 | 7184b9a |
 
 ## Discovery context
 
