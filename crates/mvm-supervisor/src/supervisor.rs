@@ -435,6 +435,70 @@ impl Supervisor {
     }
 }
 
+/// Stable identifiers for every inspector the canonical
+/// [`build_inspector_chain`] wires. Matches each inspector's
+/// `Inspector::name()` return value. Operators reference these
+/// names in `EgressPolicy::disabled_inspectors`; [`validate_egress_policy_inspector_names`]
+/// uses this list to fail-loud on typos.
+///
+/// **Order matches Plan 37 §15** (cheap/precise first, body
+/// inspectors last) — keep it that way if you add a name.
+pub const KNOWN_INSPECTOR_NAMES: &[&str] = &[
+    "destination_policy",
+    "ssrf_guard",
+    "secrets_scanner",
+    "injection_guard",
+    "pii_redactor",
+];
+
+/// Validation error for [`validate_egress_policy_inspector_names`].
+///
+/// The error carries the offending row index + the operator-supplied
+/// name + the list of valid names so a single error message tells
+/// the operator exactly which `[egress].disabled_inspectors` entry
+/// to fix and what to put there instead.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum EgressPolicyValidationError {
+    #[error(
+        "disabled_inspectors[{index}] = {name:?} is not a known inspector name; \
+         valid names are {valid:?}"
+    )]
+    UnknownDisabledInspector {
+        index: usize,
+        name: String,
+        valid: &'static [&'static str],
+    },
+}
+
+/// Verify every name in `policy.disabled_inspectors` matches a known
+/// inspector (member of [`KNOWN_INSPECTOR_NAMES`]).
+///
+/// `build_inspector_chain` itself stays lenient — it silently skips
+/// unknown names so in-process callers that own their config can
+/// extend the disabled list ahead of inspector additions. This
+/// function is the *admission-time* tightening: the W5 policy
+/// resolver in `mvm-cli` calls this to fail loud on typos
+/// (e.g. `["ssr_guard"]` would silently leave SSRF enforced; not
+/// catching that at admission means the operator thinks they
+/// disabled it).
+///
+/// Plan 60 Phase 3 Slice B follow-on.
+pub fn validate_egress_policy_inspector_names(
+    policy: &EgressPolicy,
+) -> Result<(), EgressPolicyValidationError> {
+    for (index, name) in policy.disabled_inspectors.iter().enumerate() {
+        if !KNOWN_INSPECTOR_NAMES.contains(&name.as_str()) {
+            return Err(EgressPolicyValidationError::UnknownDisabledInspector {
+                index,
+                name: name.clone(),
+                valid: KNOWN_INSPECTOR_NAMES,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Build an [`InspectorChain`] from the workload's [`EgressPolicy`].
 /// Order matches Plan 37 §15: cheap/most-precise checks first, body
 /// inspectors last (so a destination-denied request never pays the
@@ -1169,6 +1233,77 @@ mod tests {
         let chain = build_inspector_chain(&policy, None);
         // All 5 inspectors present.
         assert_eq!(chain.len(), 5);
+    }
+
+    #[test]
+    fn known_inspector_names_matches_chain_inspectors() {
+        // Each name in KNOWN_INSPECTOR_NAMES must actually disable a
+        // chain slot. Any drift between this constant and the
+        // canonical build_inspector_chain order is a bug.
+        for &name in KNOWN_INSPECTOR_NAMES {
+            let mut policy = dev_egress_policy(false);
+            policy.disabled_inspectors = vec![name.to_string()];
+            let chain = build_inspector_chain(&policy, None);
+            assert_eq!(
+                chain.len(),
+                KNOWN_INSPECTOR_NAMES.len() - 1,
+                "disabling {name:?} should drop exactly one inspector from the chain"
+            );
+        }
+    }
+
+    #[test]
+    fn validate_egress_policy_passes_known_names() {
+        let mut policy = dev_egress_policy(false);
+        policy.disabled_inspectors = vec![
+            "ssrf_guard".to_string(),
+            "pii_redactor".to_string(),
+        ];
+        validate_egress_policy_inspector_names(&policy).expect("known names");
+    }
+
+    #[test]
+    fn validate_egress_policy_passes_empty_list() {
+        // Empty disabled_inspectors is the common case (all
+        // inspectors enabled). Must validate cleanly.
+        let policy = dev_egress_policy(false);
+        validate_egress_policy_inspector_names(&policy).expect("empty list");
+    }
+
+    #[test]
+    fn validate_egress_policy_refuses_typo_with_row_index() {
+        let mut policy = dev_egress_policy(false);
+        policy.disabled_inspectors = vec![
+            "ssrf_guard".to_string(),
+            "secrets_scaner".to_string(), // typo
+        ];
+        let err = validate_egress_policy_inspector_names(&policy).expect_err("typo");
+        match err {
+            EgressPolicyValidationError::UnknownDisabledInspector { index, name, valid } => {
+                assert_eq!(index, 1);
+                assert_eq!(name, "secrets_scaner");
+                assert_eq!(valid, KNOWN_INSPECTOR_NAMES);
+            }
+        }
+    }
+
+    #[test]
+    fn validate_egress_policy_first_unknown_wins() {
+        // Returns on the first bad row — `index` reflects the
+        // earliest offender so operators fix in source order.
+        let mut policy = dev_egress_policy(false);
+        policy.disabled_inspectors = vec![
+            "destination_policy".to_string(),
+            "no_such_inspector".to_string(),
+            "another_bad_name".to_string(),
+        ];
+        let err = validate_egress_policy_inspector_names(&policy).expect_err("first wins");
+        match err {
+            EgressPolicyValidationError::UnknownDisabledInspector { index, name, .. } => {
+                assert_eq!(index, 1);
+                assert_eq!(name, "no_such_inspector");
+            }
+        }
     }
 
     // ---- Wave 2.7: with_tool_gate builder ----

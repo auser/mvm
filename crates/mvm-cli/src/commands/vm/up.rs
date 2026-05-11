@@ -237,6 +237,7 @@ fn resolve_policy_for_admission(
                 Some(ResolveError::MixedRefs { .. }) => "policy-refs-mixed",
                 Some(ResolveError::Unrecognized { .. }) => "policy-ref-unrecognized",
                 Some(ResolveError::L4SpecInvalid { .. }) => "policy-l4-spec-invalid",
+                Some(ResolveError::EgressPolicyInvalid { .. }) => "policy-egress-invalid",
                 None => "policy-resolve",
             };
             // Best-effort audit; resolver-failure is the fatal path,
@@ -1809,6 +1810,85 @@ bundle_version = 1
         let content = std::fs::read_to_string(&audit_path).expect("audit file exists");
         assert!(
             content.contains("\"error_class\":\"policy-bundle-not-found\""),
+            "audit chain must classify the failure: {content}"
+        );
+    }
+
+    #[test]
+    fn admission_fails_when_policy_bundle_has_unknown_disabled_inspector() {
+        // Tightening regression: an `[egress].disabled_inspectors`
+        // typo must fail admission with
+        // `error_class=policy-egress-invalid` rather than silently
+        // booting with the inspector still enforced.
+        use mvm_plan::PolicyRef;
+        let keys_dir = tempfile::tempdir().unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
+        let policy_dir = tempfile::tempdir().unwrap();
+        let tenant_dir = policy_dir.path().join("acme");
+        std::fs::create_dir_all(&tenant_dir).unwrap();
+        std::fs::write(
+            tenant_dir.join("vm-typo.toml"),
+            r#"
+schema_version = 1
+bundle_id      = "acme/vm-typo"
+bundle_version = 1
+
+[network]
+[egress]
+disabled_inspectors = ["ssrf_guarrd"]
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+"#,
+        )
+        .unwrap();
+
+        let rootfs_dir = tempfile::tempdir().unwrap();
+        let rootfs = write_rootfs(rootfs_dir.path(), b"typo-payload");
+        let ledger = InMemoryNonceLedger::new();
+        let sha = mvm_security::image_verify::sha256_file(&rootfs).unwrap();
+        let mut plan = admit_for_run(
+            &SynthesisInput {
+                vm_name: "vm-typo",
+                tenant: Some("acme"),
+                backend_name: "firecracker",
+                image_name: "vm-typo",
+                image_sha256: &sha,
+                image_cosign_bundle: None,
+                cpus: 1,
+                mem_mib: 128,
+                disk_mib: 0,
+                boot_timeout_secs: 60,
+                exec_timeout_secs: 0,
+                destroy_on_exit: true,
+            },
+            &SystemClock,
+            &ledger,
+            Some(keys_dir.path()),
+        )
+        .expect("admit")
+        .plan;
+        plan.network_policy = PolicyRef("acme:vm-typo".to_string());
+        plan.egress_policy = PolicyRef("acme:vm-typo".to_string());
+        plan.tool_policy = PolicyRef("acme:vm-typo".to_string());
+        plan.fs_policy = mvm_plan::FsPolicyRef("acme:vm-typo".to_string());
+
+        let signer = load_or_init_at(keys_dir.path()).expect("signer");
+        let emitter = AuditEmitter::with_dir(signer.signing, audit_dir.path()).unwrap();
+        let err = resolve_policy_for_admission(&plan, &emitter, Some(policy_dir.path()))
+            .expect_err("typo must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("ssrf_guarrd"),
+            "error must name the typo: {msg}"
+        );
+
+        let audit_path = audit_dir.path().join("acme.jsonl");
+        let content = std::fs::read_to_string(&audit_path).expect("audit file exists");
+        assert!(
+            content.contains("\"error_class\":\"policy-egress-invalid\""),
             "audit chain must classify the failure: {content}"
         );
     }

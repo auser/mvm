@@ -1740,15 +1740,26 @@ bundles) shipped in bce44e9; Slice B (L4 policy substrate +
 through `slots.network`) shipped 2026-05-11. The `HickoryDnsResolver`
 alternative to `TokioDnsResolver` ships under Slice B as well — an
 opt-in `DnsResolver` impl for operators who want DoT/DoH upstreams
-or a per-tenant resolver decoupled from `/etc/resolv.conf`. Two
-follow-on slices land alongside Slice B (also 2026-05-11): the W5
-resolver is now consumed by `up.rs::admit_plan_for_boot` (boot
+or a per-tenant resolver decoupled from `/etc/resolv.conf`. Four
+follow-on slices land alongside Slice B (also 2026-05-11): (1) the
+W5 resolver is now consumed by `up.rs::admit_plan_for_boot` (boot
 fails loudly on missing bundles / typos / bad L4 CIDRs instead of
-silently passing through Noops), and `slots_from_bundle` delegates
+silently passing through Noops); (2) `slots_from_bundle` delegates
 to `mvm_supervisor::build_inspector_chain` so the parsed bundle's
 L7 chain carries the full five inspectors (destination_policy /
-ssrf_guard / secrets_scanner / injection_guard / pii_redactor) and
-honors `bundle.egress.disabled_inspectors`. **Slice C remains
+ssrf_guard / secrets_scanner / injection_guard / pii_redactor)
+and honors `bundle.egress.disabled_inspectors`; (3) a new
+`LiveArtifactCollector` carries `bundle.artifact.{capture_paths,
+retention_days}` (the trait `collect()` errors with the distinct
+`ArtifactError::NotImplemented` until the mvm-hostd virtiofs
+sweep lands — observably different from `NotWired`); (4) the
+resolver path now runs `validate_egress_policy_inspector_names`
+before `build_inspector_chain`, so a typo in
+`[egress].disabled_inspectors` fails admission with
+`ResolveError::EgressPolicyInvalid` (`error_class =
+policy-egress-invalid`) instead of silently leaving the
+inspector enforced. `build_inspector_chain` itself stays lenient
+for in-process callers. **Slice C remains
 outstanding**: the smoltcp/TUN userspace-TCP consumer that turns
 an `L4Gate::evaluate` decision into accept/drop on a per-VM TAP,
 the host firewall (nft/pf/wfp) additive layer, the DNS server

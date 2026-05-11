@@ -70,10 +70,11 @@ use std::sync::Arc;
 
 use mvm_plan::{ExecutionPlan, FsPolicyRef, PolicyRef};
 use mvm_supervisor::{
-    ArtifactCollector, EgressProxy, KeystoreReleaser, L4Gate, L4SpecError, L7EgressProxy,
-    LiveArtifactCollector, LiveL4Gate, NoopArtifactCollector, NoopEgressAuditSink, NoopEgressProxy,
-    NoopKeystoreReleaser, NoopL4Gate, NoopToolGate, PolicyToolGate, TokioDnsResolver, ToolGate,
-    build_inspector_chain,
+    ArtifactCollector, EgressPolicyValidationError, EgressProxy, KeystoreReleaser, L4Gate,
+    L4SpecError, L7EgressProxy, LiveArtifactCollector, LiveL4Gate, NoopArtifactCollector,
+    NoopEgressAuditSink, NoopEgressProxy, NoopKeystoreReleaser, NoopL4Gate, NoopToolGate,
+    PolicyToolGate, TokioDnsResolver, ToolGate, build_inspector_chain,
+    validate_egress_policy_inspector_names,
 };
 
 /// The fixed identifier for the local-dev policy bundle. Any
@@ -156,6 +157,20 @@ pub enum ResolveError {
         path: PathBuf,
         detail: String,
     },
+
+    /// A bundle parsed but its `[egress].disabled_inspectors` list
+    /// names an inspector that doesn't exist (typo or future-name
+    /// drift). Tightening: `build_inspector_chain` itself stays
+    /// lenient (silently skips unknown names) because in-process
+    /// callers own their config; the resolver enforces fail-loud at
+    /// admission so a typo can't silently leave an inspector
+    /// enforced when the operator intended to disable it. Plan 60
+    /// Phase 3 Slice B follow-on.
+    EgressPolicyInvalid {
+        value: String,
+        path: PathBuf,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -205,6 +220,15 @@ impl std::fmt::Display for ResolveError {
             } => write!(
                 f,
                 "policy bundle {value:?} (from {}) has an invalid [[network.l4]] row: {detail}",
+                path.display()
+            ),
+            Self::EgressPolicyInvalid {
+                value,
+                path,
+                detail,
+            } => write!(
+                f,
+                "policy bundle {value:?} (from {}) has an invalid [egress] section: {detail}",
                 path.display()
             ),
         }
@@ -366,6 +390,20 @@ fn slots_from_bundle(
             detail: e.to_string(),
         }
     })?;
+
+    // Tighten `disabled_inspectors` to fail-loud on unknown names
+    // *at admission*. `build_inspector_chain` itself stays lenient
+    // (silently skips unknown names) so in-process supervisor
+    // callers can extend the disabled list ahead of inspector
+    // additions; the resolver path is the trust boundary where
+    // typos must surface loudly. Plan 60 Phase 3 Slice B follow-on.
+    validate_egress_policy_inspector_names(&bundle.egress).map_err(
+        |e: EgressPolicyValidationError| ResolveError::EgressPolicyInvalid {
+            value: ref_value.to_string(),
+            path: path.to_path_buf(),
+            detail: e.to_string(),
+        },
+    )?;
 
     // L7 inspector chain: delegate to the supervisor's canonical
     // builder so the order + `disabled_inspectors` semantics stay in
@@ -1290,13 +1328,16 @@ disabled_inspectors = [{list}]
     }
 
     #[test]
-    fn slice_b_inspector_chain_unknown_disabled_name_is_silently_skipped() {
-        // `disabled_inspectors` is a name-match list. An unknown
-        // name (typo, future inspector) doesn't error — it just
-        // matches nothing. This is the established
-        // `build_inspector_chain` behavior; we pin it from the
-        // resolver's perspective so a future tightening to fail-loud
-        // is a deliberate decision.
+    fn slice_b_build_inspector_chain_stays_lenient_on_unknown_names() {
+        // The underlying `build_inspector_chain` API is intentionally
+        // lenient: an unknown name in `disabled_inspectors` is
+        // silently skipped (chain still carries all 5 inspectors).
+        // The fail-loud tightening lives one layer up — the W5
+        // resolver path calls `validate_egress_policy_inspector_names`
+        // before `build_inspector_chain` (see the next test). This
+        // separation lets in-process supervisor callers extend their
+        // disabled list ahead of inspector additions without
+        // breaking, while the admission boundary stays strict.
         let tmp = tempfile::tempdir().unwrap();
         write_bundle(
             tmp.path(),
@@ -1315,8 +1356,81 @@ disabled_inspectors = [{list}]
         assert_eq!(
             chain.len(),
             5,
-            "unknown disabled-inspector name must not shrink chain"
+            "build_inspector_chain itself must stay lenient — unknown disabled names skip silently"
         );
+    }
+
+    #[test]
+    fn slice_b_resolver_refuses_bundle_with_unknown_disabled_inspector() {
+        // Tightening: the W5 resolver path runs
+        // `validate_egress_policy_inspector_names` before
+        // `build_inspector_chain`, so a typo in `disabled_inspectors`
+        // fails admission with `ResolveError::EgressPolicyInvalid`
+        // instead of silently leaving the inspector enforced.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_disabled_inspectors(&["ssrf_guard", "secrets_scaner"]),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let err = match resolve_supervisor_components_with_dir(&plan, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("typo in disabled_inspectors must be refused"),
+        };
+        match err {
+            ResolveError::EgressPolicyInvalid {
+                value,
+                path,
+                detail,
+            } => {
+                assert_eq!(value, "acme:web-worker");
+                let s = path.to_string_lossy();
+                assert!(s.contains("acme"), "path missing tenant: {s}");
+                assert!(
+                    s.contains("web-worker.toml"),
+                    "path missing workload: {s}"
+                );
+                assert!(
+                    detail.contains("secrets_scaner"),
+                    "detail must name the typo: {detail}"
+                );
+                assert!(
+                    detail.contains("1"),
+                    "detail must name the row index (1): {detail}"
+                );
+                // Operator should see the valid names enumerated so
+                // they can fix the typo without grep-ing source.
+                assert!(
+                    detail.contains("ssrf_guard")
+                        || detail.contains("secrets_scanner")
+                        || detail.contains("pii_redactor"),
+                    "detail should list at least one valid name: {detail}"
+                );
+            }
+            other => panic!("expected EgressPolicyInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slice_b_resolver_accepts_bundle_with_only_known_disabled_inspectors() {
+        // Regression for the tightening: a bundle with the right
+        // names continues to resolve cleanly (chain shrinks per the
+        // disabled list).
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_disabled_inspectors(&["ssrf_guard", "pii_redactor"]),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+        let _slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("known names should resolve: {e}"));
     }
 
     #[test]
