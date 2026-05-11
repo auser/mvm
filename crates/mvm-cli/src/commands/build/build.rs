@@ -73,7 +73,13 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     }
 
     if let Some(manifest_path) = resolve_manifest_for_args(&args)? {
-        return build_manifest(&manifest_path, args.force, args.update_hash, args.json);
+        return build_manifest(
+            &manifest_path,
+            args.force,
+            args.update_hash,
+            args.json,
+            args.build_mode.resolve(),
+        );
     }
 
     build_mvmfile(&args.path, args.output.as_deref())
@@ -117,6 +123,7 @@ fn build_manifest(
     force: bool,
     update_hash: bool,
     json: bool,
+    mode: mvm_build::pipeline::BuildMode,
 ) -> Result<()> {
     let manifest = Manifest::read_file(manifest_path)?;
     let canonical = std::fs::canonicalize(manifest_path).with_context(|| {
@@ -182,7 +189,7 @@ fn build_manifest(
         PersistedManifest::from_manifest(&manifest, &canonical, &backend, Provenance::current())?;
     persisted.flake_ref = resolved_flake;
 
-    let revision = match tmpl::template_build_from_manifest(&persisted, force, update_hash) {
+    let revision = match tmpl::template_build_from_manifest(&persisted, force, update_hash, mode) {
         Ok(r) => r,
         Err(e) => {
             if json {

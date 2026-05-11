@@ -150,6 +150,20 @@ pub struct TemplateRevision {
     pub data_disk_mib: u32,
     #[serde(default)]
     pub snapshot: Option<SnapshotInfo>,
+    /// Build mode the revision was produced with. `"dev"` =
+    /// `mvm_build::pipeline::BuildMode::Dev` (dev guest agent +
+    /// accessible image); `"prod"` (or absent) = `BuildMode::Prod`
+    /// (sealed image, no `do_exec`). Recorded on the revision so a
+    /// subsequent rebuild round-trips the same posture without the
+    /// user having to re-pass `--dev`/`--prod`. Plan-60 W6.2.3
+    /// follow-up.
+    ///
+    /// Optional + `default` so pre-W6.2.3 on-disk revisions parse
+    /// without a migration. Missing on read is treated as
+    /// `BuildMode::Prod` at the consumer site (the same default
+    /// `BuildModeFlags::resolve()` picks).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub build_mode: Option<String>,
 }
 
 impl TemplateRevision {
@@ -196,6 +210,7 @@ mod tests {
             mem_mib: 1024,
             data_disk_mib: 0,
             snapshot: None,
+            build_mode: None,
         }
     }
 
@@ -238,6 +253,44 @@ mod tests {
         b.revision_hash = "rev-zzz".to_string();
         // Different revision hashes but same flake_lock/profile → same cache key
         assert_eq!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn build_mode_does_not_affect_cache_key() {
+        // build_mode is a posture flag (dev vs prod). It's recorded on
+        // the revision so a rebuild round-trips it, but the cache key
+        // (flake_lock + profile) shouldn't care. Two revisions with
+        // the same lockfile + profile but different build_mode strings
+        // still hit the same cache slot.
+        let mut a = make_revision("lock1", "minimal", "worker");
+        a.build_mode = Some("dev".to_string());
+        let mut b = make_revision("lock1", "minimal", "worker");
+        b.build_mode = Some("prod".to_string());
+        assert_eq!(a.cache_key(), b.cache_key());
+    }
+
+    #[test]
+    fn build_mode_roundtrips_through_serde() {
+        let mut rev = make_revision("lock1", "minimal", "worker");
+        rev.build_mode = Some("dev".to_string());
+        let json = serde_json::to_string(&rev).unwrap();
+        assert!(json.contains("\"build_mode\":\"dev\""), "got: {json}");
+        let back: TemplateRevision = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.build_mode.as_deref(), Some("dev"));
+    }
+
+    #[test]
+    fn missing_build_mode_deserializes_as_none() {
+        // Pre-W6.2.3 on-disk revision.json files don't carry the
+        // `build_mode` field. Parsing must succeed and yield `None`
+        // (consumers treat that as `BuildMode::Prod`, matching the
+        // default `BuildModeFlags::resolve()`).
+        let mut rev = make_revision("lock1", "minimal", "worker");
+        rev.build_mode = None;
+        let json = serde_json::to_string(&rev).unwrap();
+        assert!(!json.contains("build_mode"), "absent field should not serialize: {json}");
+        let back: TemplateRevision = serde_json::from_str(&json).unwrap();
+        assert!(back.build_mode.is_none());
     }
 
     #[test]

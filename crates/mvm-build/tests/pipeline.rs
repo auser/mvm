@@ -186,6 +186,7 @@ fn template_revision_json(profile: &str, role: &str) -> String {
         mem_mib: 1024,
         data_disk_mib: 0,
         snapshot: None,
+        build_mode: None,
     };
     serde_json::to_string(&rev).unwrap()
 }

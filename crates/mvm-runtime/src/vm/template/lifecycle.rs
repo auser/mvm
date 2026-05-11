@@ -20,6 +20,16 @@ use mvm_core::time::utc_now;
 // keep resolving without each one having to migrate.
 pub use mvm_runtime_base::cow::clone_rootfs_for_instance;
 
+/// Wire-format string for a [`BuildMode`] when it lands on disk in
+/// the revision record. Matches the CLI's `--dev`/`--prod` flag
+/// names so the round-trip user-facing.
+fn build_mode_label(mode: mvm_build::pipeline::BuildMode) -> &'static str {
+    match mode {
+        mvm_build::pipeline::BuildMode::Dev => "dev",
+        mvm_build::pipeline::BuildMode::Prod => "prod",
+    }
+}
+
 use super::registry::TemplateRegistry;
 
 /// Run a shell command in the VM and check its exit code.
@@ -39,21 +49,6 @@ fn vm_exec(script: &str) -> Result<()> {
     Ok(())
 }
 
-/// Run a shell command in the VM, check exit code, and return stdout.
-fn vm_exec_stdout(script: &str) -> Result<String> {
-    let out = shell::run_in_vm(script)?;
-    if !out.status.success() {
-        let stderr = String::from_utf8_lossy(&out.stderr).trim().to_string();
-        let first_line = script.lines().next().unwrap_or(script);
-        return Err(anyhow!(
-            "Command failed (exit {}): {}\n  command: {}",
-            out.status.code().unwrap_or(-1),
-            stderr,
-            first_line,
-        ));
-    }
-    Ok(String::from_utf8_lossy(&out.stdout).trim().to_string())
-}
 
 #[instrument(skip_all, fields(template_id = %spec.template_id))]
 pub fn template_create(spec: &TemplateSpec) -> Result<()> {
@@ -565,6 +560,7 @@ pub fn template_build_from_manifest(
     persisted: &PersistedManifest,
     force: bool,
     update_hash: bool,
+    mode: mvm_build::pipeline::BuildMode,
 ) -> Result<TemplateRevision> {
     use crate::ui;
 
@@ -592,7 +588,7 @@ pub fn template_build_from_manifest(
         env,
         &persisted.flake_ref,
         Some(&persisted.profile),
-        mvm_build::pipeline::BuildMode::Prod,
+        mode,
     )?;
 
     if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(env, &result) {
@@ -701,6 +697,7 @@ pub fn template_build_from_manifest(
         mem_mib: persisted.mem_mib,
         data_disk_mib: persisted.data_disk_mib,
         snapshot: None,
+        build_mode: Some(build_mode_label(mode).to_string()),
     };
     let rev_json = serde_json::to_string_pretty(&revision)?;
     let rev_meta_path = format!("{rev_dst}/revision.json");
@@ -798,165 +795,6 @@ fn update_fod_hash(flake_ref: &str) -> Result<()> {
     ))?;
 
     ui::success(&format!("Updated outputHash: {}", new_hash));
-    Ok(())
-}
-
-/// Build a template using the dev build pipeline (local Nix in Lima).
-/// Artifacts are stored in ~/.mvm/templates/<id>/artifacts and the current symlink is updated.
-#[instrument(skip_all, fields(template_id = id, force, update_hash))]
-pub fn template_build(id: &str, force: bool, update_hash: bool) -> Result<()> {
-    use crate::ui;
-
-    let spec = template_load(id)?;
-    let build_env = crate::build_env::default_build_env();
-    let env = build_env.as_ref();
-
-    ui::info(&format!(
-        "Building template '{}' (flake: {}, profile: {})",
-        id, spec.flake_ref, spec.profile
-    ));
-
-    // Recompute fixed-output derivation hash if requested (e.g. after version bump).
-    if update_hash {
-        update_fod_hash(&spec.flake_ref)?;
-    }
-
-    // Use dev_build to produce artifacts via Nix in Lima.
-    // The dev build cache is keyed by Nix store hash at ~/.mvm/dev/builds/<hash>/,
-    // so --force must clear the entire builds directory.
-    if force {
-        ui::info("Force build: clearing dev build cache");
-        let builds_dir = format!("{}/dev/builds", mvm_core::config::mvm_data_dir());
-        if let Err(e) = env.shell_exec(&format!("rm -rf {builds_dir}")) {
-            warn!("failed to clear dev build cache: {e}");
-        }
-    }
-    let result = mvm_build::dev_build::dev_build(
-        env,
-        &spec.flake_ref,
-        Some(&spec.profile),
-        mvm_build::pipeline::BuildMode::Prod,
-    )?;
-    // Best-effort: inject guest agent if not already present.
-    // Non-fatal because flakes built with mvm's mkGuest already include
-    // guest-agent.nix, and the loop-mount check can fail on virtiofs.
-    // On host builds (macOS without Lima), the ext4 mount will fail
-    // gracefully — flakes using mkGuest already include the agent.
-    if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(env, &result) {
-        ui::warn(&format!(
-            "Could not verify guest agent ({}). If built with mvm's mkGuest, the agent is already included.",
-            e
-        ));
-    }
-
-    // Store artifacts in template revision directory
-    ui::info("Storing artifacts in template revision directory...");
-    let rev = &result.revision_hash;
-    let rev_dst = template_revision_dir(id, rev);
-    shell::run_in_vm(&format!("mkdir -p {rev_dst}"))?;
-    shell::run_in_vm(&format!("cp -a {} {rev_dst}/vmlinux", result.vmlinux_path))?;
-    if let Some(initrd) = &result.initrd_path {
-        shell::run_in_vm(&format!("cp -a {} {rev_dst}/initrd", initrd))?;
-    }
-    shell::run_in_vm(&format!(
-        "cp -a {} {rev_dst}/rootfs.ext4 && chmod u+w {rev_dst}/rootfs.ext4",
-        result.rootfs_path
-    ))?;
-
-    // Generate a minimal fc-base.json config for reference.
-    // Minimal guests (no initrd) need root= and init= on the kernel cmdline
-    // so the kernel can mount the rootfs and exec /init directly.
-    let boot_args = if result.initrd_path.is_some() {
-        "console=ttyS0 reboot=k panic=1 net.ifnames=0".to_string()
-    } else {
-        "root=/dev/vda rw rootwait init=/init console=ttyS0 reboot=k panic=1 net.ifnames=0"
-            .to_string()
-    };
-    let mut boot_source = serde_json::json!({
-        "kernel_image_path": "vmlinux",
-        "boot_args": boot_args
-    });
-    if result.initrd_path.is_some() {
-        boot_source["initrd_path"] = serde_json::json!("initrd");
-    }
-    let fc_config = serde_json::json!({
-        "boot-source": boot_source,
-        "drives": [{
-            "drive_id": "rootfs",
-            "path_on_host": "rootfs.ext4",
-            "is_root_device": true,
-            "is_read_only": false
-        }],
-        "machine-config": {
-            "vcpu_count": spec.vcpus,
-            "mem_size_mib": spec.mem_mib
-        }
-    });
-    let fc_json = serde_json::to_string_pretty(&fc_config)?;
-    shell::run_in_vm(&format!(
-        "cat > {rev_dst}/fc-base.json << 'MVMEOF'\n{fc_json}\nMVMEOF"
-    ))?;
-
-    // Update template current symlink
-    let current_link = template_current_symlink(id);
-    shell::run_in_vm(&format!("ln -snf revisions/{rev} {current_link}"))?;
-
-    // Compute actual flake.lock hash for accurate cache keys.
-    // Pool builds do this via the backend; template builds use dev_build directly,
-    // so we compute it here. Falls back to revision hash for remote flakes.
-    let flake_lock_hash = shell::run_in_vm_stdout(&format!(
-        "if [ -f {flake}/flake.lock ]; then nix hash path {flake}/flake.lock; else echo ''; fi",
-        flake = spec.flake_ref
-    ))
-    .unwrap_or_default()
-    .trim()
-    .to_string();
-    let flake_lock_hash = if flake_lock_hash.is_empty() {
-        rev.clone()
-    } else {
-        flake_lock_hash
-    };
-
-    // Record template revision metadata (with artifact sizes from dev_build)
-    let sizes = result.artifact_sizes.clone();
-    let revision = TemplateRevision {
-        schema_version: mvm_core::template::CURRENT_SCHEMA_VERSION,
-        revision_hash: rev.clone(),
-        flake_ref: spec.flake_ref.clone(),
-        flake_lock_hash,
-        artifact_paths: ArtifactPaths {
-            vmlinux: "vmlinux".to_string(),
-            rootfs: "rootfs.ext4".to_string(),
-            fc_base_config: "fc-base.json".to_string(),
-            initrd: if result.initrd_path.is_some() {
-                Some("initrd".to_string())
-            } else {
-                None
-            },
-            sizes: Some(sizes.clone()),
-        },
-        built_at: utc_now(),
-        profile: spec.profile.clone(),
-        role: spec.role.clone(),
-        vcpus: spec.vcpus,
-        mem_mib: spec.mem_mib,
-        data_disk_mib: spec.data_disk_mib,
-        snapshot: None,
-    };
-    let rev_json = serde_json::to_string_pretty(&revision)?;
-    let rev_meta_path = format!("{rev_dst}/revision.json");
-    shell::run_in_vm(&format!(
-        "cat > {rev_meta_path} << 'MVMEOF'\n{rev_json}\nMVMEOF"
-    ))?;
-
-    use mvm_core::pool::format_bytes;
-    ui::success(&format!(
-        "Template '{}' built successfully (revision: {}, rootfs: {}, kernel: {})",
-        id,
-        &rev[..rev.len().min(12)],
-        format_bytes(sizes.rootfs_bytes),
-        format_bytes(sizes.vmlinux_bytes),
-    ));
     Ok(())
 }
 
@@ -1140,279 +978,6 @@ pub fn wait_for_integrations_healthy(
     }
 }
 
-/// Build a template and then create a Firecracker snapshot for instant starts.
-///
-/// 1. Runs `template_build()` to produce artifacts
-/// 2. Boots a temporary Firecracker VM from those artifacts
-/// 3. Waits for the guest agent to become healthy (vsock ping)
-/// 4. Waits for all integration health checks to pass
-/// 5. Pauses vCPUs and creates a full snapshot
-/// 6. Stores snapshot files in the template revision directory
-/// 7. Cleans up the temporary VM
-#[instrument(skip_all, fields(template_id = id, force, update_hash))]
-pub fn template_build_with_snapshot(id: &str, force: bool, update_hash: bool) -> Result<()> {
-    use mvm_backend::{microvm, network};
-    use mvm_runtime_base::config::BRIDGE_IP;
-
-    // Step 1: Build artifacts (reuses existing template_build)
-    template_build(id, force, update_hash)?;
-
-    let spec = template_load(id)?;
-    let rev = current_revision_id(id)?;
-    let rev_dir = template_revision_dir(id, &rev);
-    let snap_dir = template_snapshot_dir(id, &rev);
-
-    ui::info("Creating snapshot: booting temporary VM...");
-
-    // Allocate a temporary network slot for the snapshot build
-    let snapshot_vm_name = format!("__snapshot-{}", id);
-    let slot = microvm::allocate_slot(&snapshot_vm_name)?;
-    let abs_dir = microvm::resolve_vm_dir(&slot)?;
-    let abs_socket = format!("{}/fc.socket", abs_dir);
-
-    // Build boot args matching what run_from_build would use (minimal guest)
-    let boot_args = format!(
-        "root=/dev/vda rw rootwait init=/init console=ttyS0 reboot=k panic=1 net.ifnames=0 mvm.ip={ip}/24 mvm.gw={gw}",
-        ip = slot.guest_ip,
-        gw = BRIDGE_IP,
-    );
-
-    // Create a runtime directory in the template for shared snapshot drives.
-    // Using template-relative paths ensures all instances can use symlinks
-    // to their own config/secrets without path conflicts.
-    let template_runtime_dir = format!("{}/runtime", template_dir(id));
-    shell::run_in_vm(&format!("mkdir -p {}", template_runtime_dir))?;
-
-    // Build a FlakeRunConfig for the temporary VM, using template runtime dir
-    // for config/secrets so the snapshot has stable paths.
-    // Verity sidecar lives next to the rootfs in the per-revision dir
-    // when the flake was built with `verifiedBoot = true`. Probe for
-    // both files together; present them as Some only when we can read
-    // the roothash, and lift the absent case to None so callers stay
-    // backward-compatible with pre-W3 templates.
-    let verity_sidecar = format!("{}/rootfs.verity", rev_dir);
-    let roothash_file = format!("{}/rootfs.roothash", rev_dir);
-    let (verity_path, roothash) = match (
-        shell::run_in_vm(&format!("[ -f {verity_sidecar} ]")),
-        shell::run_in_vm_stdout(&format!("cat {roothash_file} 2>/dev/null")),
-    ) {
-        (Ok(_), Ok(hash)) if !hash.trim().is_empty() => {
-            (Some(verity_sidecar.clone()), Some(hash.trim().to_string()))
-        }
-        _ => (None, None),
-    };
-    let run_config = microvm::FlakeRunConfig {
-        name: snapshot_vm_name.clone(),
-        slot: slot.clone(),
-        vmlinux_path: format!("{}/vmlinux", rev_dir),
-        initrd_path: None,
-        rootfs_path: format!("{}/rootfs.ext4", rev_dir),
-        verity_path,
-        roothash,
-        revision_hash: rev.clone(),
-        flake_ref: spec.flake_ref.clone(),
-        profile: Some(spec.profile.clone()),
-        cpus: spec.vcpus as u32,
-        memory: spec.mem_mib,
-        volumes: vec![],
-        config_files: vec![],
-        secret_files: vec![],
-        ports: vec![],
-        network_policy: mvm_core::network_policy::NetworkPolicy::default(),
-    };
-
-    // Ensure bridge + TAP
-    network::bridge_ensure()?;
-    network::tap_create(&slot)?;
-
-    // Clean up stale vsock socket from a previous template build.
-    // start_vm_firecracker only cleans abs_dir/v.sock, but the vsock device
-    // binds to template_runtime_dir/v.sock (a different path).
-    if let Err(e) = shell::run_in_vm(&format!("rm -f {}/v.sock", template_runtime_dir)) {
-        warn!("failed to remove stale vsock socket: {e}");
-    }
-
-    // Start Firecracker
-    let start_result = microvm::start_vm_firecracker(&abs_dir, &abs_socket);
-    if let Err(e) = start_result {
-        if let Err(e) = network::tap_destroy(&slot) {
-            warn!("failed to destroy TAP device on error: {e}");
-        }
-        return Err(e.context("Failed to start snapshot VM"));
-    }
-
-    // Configure and boot, using template runtime dir for config/secrets drives
-    if let Err(e) = microvm::configure_flake_microvm_with_drives_dir(
-        &run_config,
-        &abs_dir,
-        &abs_socket,
-        &template_runtime_dir,
-    ) {
-        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
-        return Err(e.context("Failed to configure snapshot VM"));
-    }
-
-    ui::info("Booting snapshot VM...");
-    std::thread::sleep(Duration::from_millis(15));
-    if let Err(e) = microvm::api_put_socket(
-        &abs_socket,
-        "/actions",
-        r#"{"action_type": "InstanceStart"}"#,
-    ) {
-        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
-        return Err(e.context("Failed to boot snapshot VM"));
-    }
-
-    // Make vsock accessible
-    if let Err(e) = shell::run_in_vm(&format!("sudo chmod 0666 {}/v.sock 2>/dev/null", abs_dir)) {
-        warn!("failed to chmod vsock socket: {e}");
-    }
-
-    // Wait for guest agent to become healthy
-    // Note: First boot can take 10-15 minutes on nested virtualization (macOS)
-    // due to V8 compilation overhead. 900s (15 min) timeout ensures snapshot
-    // creation succeeds even on slow systems.
-    let vsock_path = format!("{}/v.sock", abs_dir);
-    ui::info(
-        "Waiting for guest agent to become healthy (may take up to 15 minutes on first boot)...",
-    );
-    let health_result = wait_for_healthy(&vsock_path, 900, 2000);
-
-    if let Err(e) = health_result {
-        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
-        return Err(e.context("Snapshot VM did not become healthy"));
-    }
-
-    // Wait for all integration health checks to pass before snapshotting.
-    // This ensures applications (e.g., OpenClaw) have fully started before
-    // the VM state is captured.
-    ui::info("Waiting for integration health checks to pass...");
-    let integration_result = wait_for_integrations_healthy(&vsock_path, 900, 5000);
-
-    if let Err(e) = integration_result {
-        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
-        return Err(e.context("Snapshot VM integrations did not become healthy"));
-    }
-
-    // Pause vCPUs
-    ui::info("Pausing VM for snapshot...");
-    let pause_result = microvm::api_patch_socket(&abs_socket, "/vm", r#"{"state": "Paused"}"#);
-    if let Err(e) = pause_result {
-        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
-        return Err(e.context("Failed to pause VM for snapshot"));
-    }
-
-    // Create snapshot directory in template
-    shell::run_in_vm(&format!("mkdir -p {}", snap_dir))?;
-
-    // Create snapshot via Firecracker API
-    ui::info("Creating Firecracker snapshot...");
-    let snapshot_result = shell::run_in_vm(&format!(
-        r#"sudo curl -s --unix-socket {socket} -X PUT \
-            -H 'Content-Type: application/json' \
-            -d '{{"snapshot_type": "Full", "snapshot_path": "{snap}/vmstate.bin", "mem_file_path": "{snap}/mem.bin"}}' \
-            'http://localhost/snapshot/create'"#,
-        socket = abs_socket,
-        snap = snap_dir,
-    ));
-
-    if let Err(e) = snapshot_result {
-        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
-        return Err(e.context("Failed to create Firecracker snapshot"));
-    }
-
-    // Get snapshot file sizes
-    let vmstate_size: u64 = shell::run_in_vm_stdout(&format!(
-        "stat -c%s {}/vmstate.bin 2>/dev/null || echo 0",
-        snap_dir
-    ))?
-    .trim()
-    .parse()
-    .unwrap_or(0);
-    let mem_size: u64 = shell::run_in_vm_stdout(&format!(
-        "stat -c%s {}/mem.bin 2>/dev/null || echo 0",
-        snap_dir
-    ))?
-    .trim()
-    .parse()
-    .unwrap_or(0);
-
-    // ADR-007 / plan 41 W4 / M9: seal the snapshot with an HMAC
-    // sidecar so a tampered file (or a swap with attacker-controlled
-    // bytes) is detected at restore time. dm-verity (W3) covers
-    // rootfs disk reads but not memory images; this seals the gap.
-    if let Err(e) = seal_snapshot_artifacts(&snap_dir) {
-        // Snapshot files exist but couldn't be sealed — they are
-        // unusable under the strict policy. Tear down so we don't
-        // leave a half-protected artifact on disk.
-        let _ = shell::run_in_vm(&format!("sudo rm -rf {}", snap_dir));
-        cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
-        return Err(e.context("Failed to seal snapshot integrity sidecar"));
-    }
-
-    // Update revision.json with snapshot metadata
-    let snapshot_info = SnapshotInfo {
-        created_at: utc_now(),
-        vmstate_size_bytes: vmstate_size,
-        mem_size_bytes: mem_size,
-        boot_args: boot_args.clone(),
-        vcpus: spec.vcpus,
-        mem_mib: spec.mem_mib,
-    };
-
-    let rev_meta_path = format!("{}/revision.json", rev_dir);
-    let rev_data = vm_exec_stdout(&format!("cat {}", rev_meta_path))?;
-    let mut revision: TemplateRevision = serde_json::from_str(&rev_data)
-        .with_context(|| "Failed to parse revision.json for snapshot update")?;
-    revision.snapshot = Some(snapshot_info);
-
-    let updated_json = serde_json::to_string_pretty(&revision)?;
-    shell::run_in_vm(&format!(
-        "cat > {} << 'MVMEOF'\n{}\nMVMEOF",
-        rev_meta_path, updated_json
-    ))?;
-
-    // Clean up temporary VM
-    cleanup_snapshot_vm(&abs_dir, &abs_socket, &slot);
-
-    let total_mb = (vmstate_size + mem_size) / (1024 * 1024);
-    ui::success(&format!(
-        "Snapshot created for template '{}' ({}MB total)",
-        id, total_mb
-    ));
-    ui::info("Use 'mvmctl up --manifest' for instant starts from this snapshot.");
-
-    Ok(())
-}
-
-/// Clean up a temporary snapshot VM (best-effort).
-fn cleanup_snapshot_vm(abs_dir: &str, abs_socket: &str, slot: &crate::config::VmSlot) {
-    use mvm_backend::network;
-
-    // Kill Firecracker process
-    if let Err(e) = shell::run_in_vm(&format!(
-        r#"
-        if [ -f {dir}/fc.pid ]; then
-            sudo kill $(cat {dir}/fc.pid) 2>/dev/null || true
-        fi
-        sudo rm -f {socket}
-        "#,
-        dir = abs_dir,
-        socket = abs_socket,
-    )) {
-        warn!("failed to kill snapshot firecracker process: {e}");
-    }
-
-    // Destroy TAP
-    if let Err(e) = network::tap_destroy(slot) {
-        warn!("failed to destroy snapshot TAP device: {e}");
-    }
-
-    // Remove temp VM directory
-    if let Err(e) = shell::run_in_vm(&format!("rm -rf {}", abs_dir)) {
-        warn!("failed to remove snapshot temp directory: {e}");
-    }
-}
 
 /// Artifact integrity manifest used by template push/pull.
 #[derive(Debug, serde::Serialize, serde::Deserialize)]
