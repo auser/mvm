@@ -29,16 +29,45 @@ env:
 # The dedicated `apple` job below catches Darwin regressions before
 # any artifact ships.
 #
-# Removed at the same time:
+# Per PR push the lanes are:
+#
+#   lint  → fmt + clippy + check-adr-coverage (one runner)
+#   test  → cargo build + cargo test
+#   e2e   → cargo test --test e2e (needs test)
+#   mcp-server-smoke  → MCP JSON-RPC roundtrip
+#   nix-flake-check   → nix flake check across every flake
+#
+# Five jobs total. The collapses below are deliberate; reverting
+# any of them costs runner minutes for marginal feedback.
+#
+# Removed at various points:
 #   • The standalone `check` job — `clippy --all-targets` runs `cargo
 #     check` internally, so a separate `cargo check` lane was a wasted
 #     ~minute per PR.
 #   • The standalone `build-linux` job — `test` already runs `cargo
 #     build` + `cargo test` on ubuntu-latest, so `build-linux` was a
 #     duplicate. `e2e` now depends on `test` instead.
+#   • The standalone `fmt` and `check-adr-coverage` jobs — each ran
+#     sub-minute work behind a full runner spin-up. Folded into the
+#     unified `lint` job so the three share one runner, one cache,
+#     one toolchain install. Save ~3 min wall-clock + 2 runner-
+#     minutes per PR run.
 jobs:
-  fmt:
-    name: Format
+  # ── Lane: lint ──
+  # Collapsed `fmt` + `clippy` + `check-adr-coverage` into one
+  # runner. Each of the three was a separate job before, but each
+  # ran sub-minute work behind a full runner spin-up + toolchain
+  # install + cache restore (~1 minute of overhead per job). One
+  # shared runner cuts ~2 min of wall-clock and ~2 runner-minutes
+  # of billed cost from every PR.
+  #
+  # Ordering inside the job:
+  #   1. fmt   — sub-second; fail fast on whitespace drift
+  #   2. clippy — bulk of the time; the lint we actually care about
+  #   3. check-adr-coverage — informational only; never gates merge
+  #      (per-step `continue-on-error: true`)
+  lint:
+    name: Lint (fmt + clippy + adr-coverage)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -46,71 +75,31 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
         with:
-          components: rustfmt
+          components: rustfmt, clippy
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-lint-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-lint-
 
       - name: Check formatting
         run: cargo fmt -- --check
 
-  clippy:
-    name: Clippy
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-        with:
-          components: clippy
-
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-clippy-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-clippy-
-
       - name: Clippy
         run: cargo clippy --all-targets -- -D warnings
 
-  check-adr-coverage:
-    # Phase 0 exit criterion: `xtask check-adr-coverage` enumerates
-    # ADRs in `specs/adrs/` and matches them against in-code
-    # references. Surfaces:
-    #   - References to ADRs that don't exist as files (typos /
-    #     forward references to unwritten ADRs)
-    #   - ADRs with zero in-code references (process ADRs are
-    #     legitimately zero-ref; surfacing them is a soft
-    #     completeness signal)
-    #
-    # Runs as `continue-on-error: true` because the current
-    # workspace carries ~12 forward references from compliance
-    # docs to unwritten ADRs (SOC2/HIPAA/GDPR/PCI mapping docs
-    # cite ADR-020/-028/-036 etc.). Flipping this to a hard gate
-    # is a separate follow-up once those ADRs are written or the
-    # forward references retired.
-    name: ADR coverage (informational)
-    runs-on: ubuntu-latest
-    continue-on-error: true
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-xtask-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-xtask-
-
-      - name: cargo xtask check-adr-coverage
+      # `xtask check-adr-coverage` is informational — current
+      # workspace carries ~12 forward references from compliance
+      # doc stubs to unwritten ADRs (ADR-020/-026/-028/-029/-036/
+      # -042). Flipping this to a hard gate is a follow-up once
+      # those ADRs are written or the forward refs retired.
+      - name: ADR coverage (informational)
+        continue-on-error: true
         run: cargo run -p xtask -- check-adr-coverage
 
   test:
