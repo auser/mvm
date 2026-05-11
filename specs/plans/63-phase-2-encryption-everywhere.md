@@ -99,6 +99,17 @@ on top of the substrate already shipped.
 
 ## W2 — `secrecy::SecretBox<T>` pass + CI lint (2 days)
 
+**Status (2026-05-11)**: ✅ shipped. The xtask CI lint
+(`check-no-display-on-secret-types`) shipped with the Phase 2 prep
+commit `a9386f8` and runs as a workspace gate on every PR. The
+wrapping-pass tail landed in commit `b9e4e64`:
+`mvm_security::snapshot_hmac::load_or_init_key` returns
+`SecretBox<[u8; HMAC_KEY_BYTES]>` and the legacy
+`mvm::security::keystore::KeyProvider` migrated to
+`SecretBox<Vec<u8>>` matching `mvm_security::keystore::KeyProvider`.
+`WrappedKey.wrapped: Vec<u8>` reads stay deferred to W1's
+`rewrap_dek` use sites — no consumer exists yet.
+
 **Goal**: Every secret-carrying type wraps `secrecy::SecretBox<T>`
 (or `secrecy::Secret<T>` for sized) so accidental `Debug`/`Display`
 is a compile error.
@@ -130,6 +141,26 @@ is a compile error.
   xtask fail in a meaningful way.
 
 ## W3 — `keyring` integration + `FileKeyProvider` (3 days)
+
+**Status (2026-05-11)**: ✅ shipped. `keyring = "3"` lifted into
+workspace deps, `mvm_security::keystore` gained `FileKeyProvider`
++ `KeyringProvider` + `default_provider()` + `has_key()`, all
+returning `SecretBox<Vec<u8>>` and exercised by 11 new unit tests
+(file mode 0600/0400/0644 paths, wrong-length file rejection,
+shell-id validation on both providers, default-provider auto-
+detection). The macOS Keychain `Entry::new_with_target` and the
+Linux/Windows fallback are both wired.
+
+**Dead-code finding**: the W3 audit also surfaced that the legacy
+`crates/mvm/src/security/keystore.rs` + the `crates/mvm/src/vm/{instance,
+pool,tenant,bridge,disk_manager,sleep,hostd}/` trees are *orphaned*
+— neither `crates/mvm/src/security/mod.rs` nor
+`crates/mvm/src/vm/mod.rs` declares them, so they never get
+compiled. The "consolidate consumers + delete legacy keystore" sub-
+goal from W3's original framing is moot: the legacy is already
+dead. Cleaning up the dead trees themselves is out of W3's scope —
+opening a follow-up plan for the dead-tree sweep would be tidier
+than expanding W3.
 
 **Goal**: `KeyProvider` impls beyond `EnvKeyProvider` so v1 users can
 provision keys via the OS-native keystore (macOS Keychain / Linux

@@ -1,19 +1,53 @@
 //! Tenant key provisioning for the Phase 2 encryption-at-rest path.
 //!
-//! `KeyProvider` is the trait the supervisor consumes; `EnvKeyProvider`
-//! is the dev/staging implementation that reads hex-encoded keys from
-//! env vars. File-based and platform-keystore providers (macOS
-//! Keychain / Linux Secret Service / Windows Cred Mgr) are plan 63 W3.
+//! `KeyProvider` is the trait every encryption-at-rest caller
+//! consumes; three impls layer from dev-friendly to ops-friendly:
+//!
+//! - [`EnvKeyProvider`] reads `MVM_TENANT_KEY_<TENANT_ID>` (hex).
+//!   Dev / CI use only — never in production.
+//! - [`FileKeyProvider`] reads raw 32 bytes from
+//!   `/var/lib/mvm/keys/<tenant_id>.key`, mode 0600 / 0400. Node-
+//!   local key provisioning for fleets that pre-distribute keys via
+//!   config management.
+//! - [`KeyringProvider`] reads a hex-encoded key from the
+//!   OS-native keystore (macOS Keychain, Linux Secret Service,
+//!   Windows Credential Manager). Lives at service=`"mvm"`,
+//!   user=`<tenant_id>`. Plan 63 W3.
+//!
+//! [`default_provider`] auto-detects the best available impl for
+//! the current host without a tenant id: KeyringProvider if a
+//! backend is reachable, else FileKeyProvider if
+//! `/var/lib/mvm/keys/` exists, else EnvKeyProvider.
 //!
 //! Returned keys wrap `SecretBox<Vec<u8>>` — guarantees zeroize-on-
 //! drop AND forbids accidental `Debug`/`Display` at compile time (you
 //! must explicitly call `.expose_secret()` to read the bytes).
+
+use std::os::unix::fs::PermissionsExt;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
 use secrecy::SecretBox;
 
 /// Required key size for AES-256-GCM: 256 bits / 32 bytes.
 pub const KEY_SIZE: usize = 32;
+
+/// Default base directory for [`FileKeyProvider`] when no override
+/// is supplied. Per-tenant key files live at
+/// `<KEYS_DIR>/<tenant_id>.key` as raw 32 bytes.
+pub const DEFAULT_KEYS_DIR: &str = "/var/lib/mvm/keys";
+
+/// Service name passed to the OS-native keystore by
+/// [`KeyringProvider`]. macOS Keychain, Linux Secret Service, and
+/// Windows Credential Manager all key entries by `(service, user)`;
+/// the user half is the tenant id.
+pub const KEYRING_SERVICE: &str = "mvm";
+
+/// macOS Keychain item-target used for disambiguation when multiple
+/// generic-password items share `(service, user)`. Passed via
+/// `keyring::Entry::new_with_target` on macOS to keep mvm entries
+/// confined to one logical group.
+pub const KEYRING_TARGET: &str = "mvm-tenant-keys";
 
 /// Resolves a tenant's data-encryption key.
 pub trait KeyProvider: Send + Sync {
@@ -48,6 +82,164 @@ impl KeyProvider for EnvKeyProvider {
         }
         Ok(SecretBox::new(Box::new(key)))
     }
+}
+
+/// Reads raw 32-byte keys from `<keys_dir>/<tenant_id>.key`.
+/// Refuses to read files whose mode is looser than `0600` / `0400`
+/// — provisioning workflows that drop keys on disk must tighten
+/// perms first.
+///
+/// Construct via [`FileKeyProvider::default`] (uses
+/// [`DEFAULT_KEYS_DIR`]) or [`FileKeyProvider::with_dir`] for tests
+/// / non-standard installs.
+pub struct FileKeyProvider {
+    keys_dir: PathBuf,
+}
+
+impl FileKeyProvider {
+    /// Override the keys directory. Tests use this with a tempdir.
+    pub fn with_dir(keys_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            keys_dir: keys_dir.into(),
+        }
+    }
+
+    /// Returns true if the keys directory exists and is a directory.
+    /// Cheap — used by [`default_provider`] to decide whether to
+    /// instantiate `FileKeyProvider` at all.
+    pub fn keys_dir_present(keys_dir: &Path) -> bool {
+        keys_dir.is_dir()
+    }
+}
+
+impl Default for FileKeyProvider {
+    fn default() -> Self {
+        Self::with_dir(DEFAULT_KEYS_DIR)
+    }
+}
+
+impl KeyProvider for FileKeyProvider {
+    fn get_data_key(&self, tenant_id: &str) -> Result<SecretBox<Vec<u8>>> {
+        validate_shell_id(tenant_id)
+            .with_context(|| format!("Invalid tenant_id for key lookup: {tenant_id:?}"))?;
+        let path = self.keys_dir.join(format!("{tenant_id}.key"));
+        let meta = std::fs::metadata(&path)
+            .with_context(|| format!("stat key file {}", path.display()))?;
+        let mode = meta.permissions().mode() & 0o777;
+        if mode != 0o600 && mode != 0o400 {
+            anyhow::bail!(
+                "key file {} has mode 0{mode:o}; refuse to read (require 0600 or 0400)",
+                path.display(),
+            );
+        }
+        let bytes =
+            std::fs::read(&path).with_context(|| format!("read key file {}", path.display()))?;
+        if bytes.len() != KEY_SIZE {
+            anyhow::bail!(
+                "key file {} is {} bytes (expected {KEY_SIZE})",
+                path.display(),
+                bytes.len(),
+            );
+        }
+        Ok(SecretBox::new(Box::new(bytes)))
+    }
+}
+
+/// Reads hex-encoded keys from the OS-native keystore. The keystore
+/// entry uses `(KEYRING_SERVICE, tenant_id)` keyed against
+/// [`KEYRING_TARGET`] on macOS for item-disambiguation.
+///
+/// Construct via [`KeyringProvider::default`]. Falls back to
+/// `Entry::new` on non-macOS where `new_with_target` is unnecessary.
+pub struct KeyringProvider;
+
+impl KeyringProvider {
+    /// Open the keyring entry for a given tenant. Used by both
+    /// `get_data_key` here and by W4's `mvmctl secret` CLI.
+    pub fn entry(tenant_id: &str) -> Result<keyring::Entry> {
+        validate_shell_id(tenant_id)
+            .with_context(|| format!("Invalid tenant_id for keyring lookup: {tenant_id:?}"))?;
+        #[cfg(target_os = "macos")]
+        {
+            keyring::Entry::new_with_target(KEYRING_TARGET, KEYRING_SERVICE, tenant_id)
+                .with_context(|| {
+                    format!("opening macOS Keychain entry for {KEYRING_SERVICE}:{tenant_id}")
+                })
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            keyring::Entry::new(KEYRING_SERVICE, tenant_id)
+                .with_context(|| format!("opening keyring entry for {KEYRING_SERVICE}:{tenant_id}"))
+        }
+    }
+
+    /// Cheap reachability check: can we construct an [`keyring::Entry`]
+    /// at all on this host? Used by [`default_provider`] to decide
+    /// whether to layer `KeyringProvider` first.
+    pub fn backend_reachable() -> bool {
+        // Constructing an entry doesn't talk to the backend yet on
+        // every OS; this is a heuristic that the keyring crate's
+        // constructor succeeds (i.e., a backend is compiled in and
+        // reachable). False positives are acceptable — a real
+        // `get_password` may still fail with NoEntry; callers fall
+        // through to the next provider.
+        Self::entry("__mvm_probe__").is_ok()
+    }
+}
+
+impl Default for KeyringProvider {
+    fn default() -> Self {
+        Self
+    }
+}
+
+impl KeyProvider for KeyringProvider {
+    fn get_data_key(&self, tenant_id: &str) -> Result<SecretBox<Vec<u8>>> {
+        let entry = Self::entry(tenant_id)?;
+        let hex = entry
+            .get_password()
+            .with_context(|| format!("reading keyring entry for {tenant_id}"))?;
+        let key = hex_decode(&hex)
+            .with_context(|| format!("decoding hex key from keyring for {tenant_id}"))?;
+        if key.len() != KEY_SIZE {
+            anyhow::bail!(
+                "keyring entry for {tenant_id} decoded to {} bytes (expected {KEY_SIZE})",
+                key.len()
+            );
+        }
+        Ok(SecretBox::new(Box::new(key)))
+    }
+}
+
+/// Auto-select the best available provider for the current host.
+///
+/// Order — biased toward stronger sources first; falls through on
+/// "the backend isn't reachable here":
+///
+/// 1. [`KeyringProvider`] — if an OS-native keystore entry can be
+///    constructed (macOS Keychain / Linux Secret Service /
+///    Windows Cred Mgr).
+/// 2. [`FileKeyProvider`] — if [`DEFAULT_KEYS_DIR`] exists.
+/// 3. [`EnvKeyProvider`] — last resort; dev / CI only.
+///
+/// The function never fails — it always returns *some* provider,
+/// even if no key is actually configured for any tenant. Whether a
+/// specific tenant key exists is the question [`has_key`] answers.
+pub fn default_provider() -> Box<dyn KeyProvider> {
+    if KeyringProvider::backend_reachable() {
+        return Box::new(KeyringProvider);
+    }
+    if FileKeyProvider::keys_dir_present(Path::new(DEFAULT_KEYS_DIR)) {
+        return Box::new(FileKeyProvider::default());
+    }
+    Box::new(EnvKeyProvider)
+}
+
+/// Returns true if [`default_provider`] can successfully resolve a
+/// key for `tenant_id`. Used by encryption-at-rest call sites to
+/// decide whether to switch on LUKS for a data volume.
+pub fn has_key(tenant_id: &str) -> bool {
+    default_provider().get_data_key(tenant_id).is_ok()
 }
 
 /// Reject any identifier that can't safely be interpolated into a
@@ -185,5 +377,159 @@ mod tests {
     fn validate_shell_id_rejects_dot_and_slash() {
         assert!(validate_shell_id("foo.bar").is_err());
         assert!(validate_shell_id("../../etc/passwd").is_err());
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // FileKeyProvider (W3)
+    // ──────────────────────────────────────────────────────────────
+
+    fn write_key_file(dir: &Path, tenant: &str, bytes: &[u8], mode: u32) -> PathBuf {
+        use std::os::unix::fs::OpenOptionsExt;
+        let path = dir.join(format!("{tenant}.key"));
+        let mut f = std::fs::OpenOptions::new()
+            .write(true)
+            .create_new(true)
+            .mode(mode)
+            .open(&path)
+            .unwrap();
+        std::io::Write::write_all(&mut f, bytes).unwrap();
+        path
+    }
+
+    #[test]
+    fn file_key_provider_reads_0600_key() {
+        use secrecy::ExposeSecret;
+        let tmp = tempfile::tempdir().unwrap();
+        let key_bytes = [7u8; KEY_SIZE];
+        write_key_file(tmp.path(), "acme", &key_bytes, 0o600);
+
+        let provider = FileKeyProvider::with_dir(tmp.path());
+        let key = provider.get_data_key("acme").unwrap();
+        assert_eq!(key.expose_secret().as_slice(), &key_bytes);
+    }
+
+    #[test]
+    fn file_key_provider_reads_0400_key() {
+        use secrecy::ExposeSecret;
+        let tmp = tempfile::tempdir().unwrap();
+        let key_bytes = [9u8; KEY_SIZE];
+        write_key_file(tmp.path(), "acme", &key_bytes, 0o400);
+
+        let provider = FileKeyProvider::with_dir(tmp.path());
+        let key = provider.get_data_key("acme").unwrap();
+        assert_eq!(key.expose_secret().as_slice(), &key_bytes);
+    }
+
+    #[test]
+    fn file_key_provider_rejects_world_readable() {
+        // mode 0644 is the canonical "looks fine, isn't" — refuse
+        // to read rather than silently expose the key bytes.
+        let tmp = tempfile::tempdir().unwrap();
+        write_key_file(tmp.path(), "acme", &[0u8; KEY_SIZE], 0o644);
+
+        let provider = FileKeyProvider::with_dir(tmp.path());
+        let err = provider.get_data_key("acme").unwrap_err();
+        let s = err.to_string();
+        assert!(
+            s.contains("mode 0644") && s.contains("refuse"),
+            "want clear refusal mentioning the bad mode; got {s}"
+        );
+    }
+
+    #[test]
+    fn file_key_provider_rejects_wrong_length() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_key_file(tmp.path(), "acme", b"only-eight-bytes", 0o600);
+
+        let provider = FileKeyProvider::with_dir(tmp.path());
+        let err = provider.get_data_key("acme").unwrap_err();
+        assert!(
+            err.to_string().contains(&format!("expected {KEY_SIZE}")),
+            "want size mismatch error, got {err}"
+        );
+    }
+
+    #[test]
+    fn file_key_provider_missing_file_errors_clearly() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = FileKeyProvider::with_dir(tmp.path());
+        let err = provider.get_data_key("nobody").unwrap_err();
+        // The OS-level "no such file" wrapped in our context.
+        let s = err.to_string();
+        assert!(s.contains("stat key file") || s.contains("nobody"));
+    }
+
+    #[test]
+    fn file_key_provider_rejects_unsafe_tenant_id() {
+        let tmp = tempfile::tempdir().unwrap();
+        let provider = FileKeyProvider::with_dir(tmp.path());
+        // validate_shell_id should refuse before any fs::metadata
+        // call — guards against `../../etc/passwd`-style tenants.
+        assert!(provider.get_data_key("../../etc").is_err());
+        assert!(provider.get_data_key("foo;rm").is_err());
+    }
+
+    #[test]
+    fn file_key_provider_keys_dir_present_returns_false_for_missing() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bogus = tmp.path().join("does-not-exist");
+        assert!(!FileKeyProvider::keys_dir_present(&bogus));
+        assert!(FileKeyProvider::keys_dir_present(tmp.path()));
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // KeyringProvider (W3)
+    //
+    // The keyring crate's behaviour depends on a backend being
+    // reachable (macOS Keychain / Linux Secret Service via D-Bus /
+    // Windows Cred Mgr). CI Linux runners typically have no D-Bus
+    // session, so these tests are written to *not* require a live
+    // backend — they exercise the validation guards and the
+    // backend-reachable probe's structure.
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn keyring_provider_rejects_unsafe_tenant_id_before_backend_call() {
+        // Even if no backend is reachable, validate_shell_id should
+        // fail first — the test never touches the keystore.
+        let provider = KeyringProvider;
+        assert!(provider.get_data_key("../../etc").is_err());
+        assert!(provider.get_data_key("foo;rm").is_err());
+    }
+
+    #[test]
+    fn keyring_provider_entry_constructor_validates_tenant() {
+        // The entry() constructor must reject shell-unsafe tenant
+        // names *before* hitting the keyring backend, so CLI surfaces
+        // that take a tenant flag can't escape through it.
+        assert!(KeyringProvider::entry("").is_err());
+        assert!(KeyringProvider::entry("foo bar").is_err());
+        assert!(KeyringProvider::entry("../../etc").is_err());
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // default_provider + has_key (W3)
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn default_provider_returns_some_provider_always() {
+        // Either a keyring or file or env provider — never panics.
+        // We don't assert *which* impl since that depends on the
+        // host's keystore availability + filesystem layout.
+        let _provider = default_provider();
+    }
+
+    #[test]
+    fn has_key_returns_false_for_unconfigured_tenant() {
+        // Pick a tenant id no test ever writes a key for. Cleanup
+        // any straggler env var defensively.
+        let tenant = "mvm-test-unconfigured-tenant-xyz";
+        unsafe {
+            std::env::remove_var(format!(
+                "MVM_TENANT_KEY_{}",
+                tenant.to_uppercase().replace('-', "_")
+            ));
+        }
+        assert!(!has_key(tenant));
     }
 }

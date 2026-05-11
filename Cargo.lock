@@ -4024,6 +4024,7 @@ dependencies = [
  "anyhow",
  "chrono",
  "hmac",
+ "keyring",
  "mvm-core",
  "rand 0.8.6",
  "regex",

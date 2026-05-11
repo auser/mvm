@@ -123,6 +123,10 @@ notify-debouncer-mini = "0.5"
 anyhow = "1"
 chrono = { version = "0.4", features = ["serde"] }
 fs2 = "0.4"
+# OS-native keystore (macOS Keychain / Linux Secret Service / Windows
+# Credential Manager). Plan 63 W3 — KeyringProvider impl uses this for
+# per-tenant DEK storage outside env vars or world-readable disk.
+keyring = "3"
 tempfile = "3"
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }

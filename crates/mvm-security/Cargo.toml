@@ -23,6 +23,7 @@ aho-corasick.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 hmac.workspace = true
+keyring.workspace = true
 rand.workspace = true
 regex.workspace = true
 secrecy.workspace = true
