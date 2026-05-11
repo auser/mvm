@@ -60,11 +60,13 @@ aho-corasick = "1"
 regex = "1"
 
 # Crypto
+aes-gcm = "0.10"
 base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hmac = "0.12"
 rand = "0.8"
 sha2 = "0.10"
+zeroize = { version = "1", features = ["zeroize_derive"] }
 
 # Serialization
 serde = { version = "1", features = ["derive"] }

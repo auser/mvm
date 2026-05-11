@@ -18,6 +18,7 @@ manifest-verify = ["dep:sigstore", "dep:tokio"]
 
 [dependencies]
 mvm-core.workspace = true
+aes-gcm.workspace = true
 aho-corasick.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
@@ -29,6 +30,7 @@ serde_json.workspace = true
 sha2.workspace = true
 thiserror = "1"
 tracing.workspace = true
+zeroize.workspace = true
 
 # Optional: cosign keyless verification (gated behind `manifest-verify`).
 sigstore = { version = "0.13", default-features = false, features = ["bundle", "sigstore-trust-root", "rustls-tls"], optional = true }
