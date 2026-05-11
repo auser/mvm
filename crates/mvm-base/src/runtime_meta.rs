@@ -101,17 +101,39 @@ fn meta_path(name: &str) -> Result<PathBuf> {
     Ok(home.join(".mvm").join("vms").join(name).join("mode.json"))
 }
 
-/// Write the metadata file. Best-effort: mkdir failures and write
-/// failures log a warning and return `Ok(())`.
+/// Write the metadata file.
+///
+/// Return contract — split deliberately so callers know what each
+/// error class means:
+///
+/// - **`Err(...)`** is reserved for *programmer* failures: a missing
+///   `$HOME`, or a `VmRuntimeMeta` shape that can't be serialized
+///   (which would be a bug in the type, not the environment). These
+///   always propagate so a regression is visible.
+/// - **`Ok(())`** is returned on both success and *environmental*
+///   failures (mkdir failed, disk full, file write blocked). These
+///   log a WARN and continue — the metadata file is an advisory
+///   cache that `mvmctl console` reads to enforce its accessible-vs-
+///   sealed gate; a missing or stale file makes the gate default to
+///   "accessible" (legacy behavior). Failure to write is therefore
+///   degraded UX, not a security boundary failure.
+///
+/// **Security trust note**: the accessible-vs-sealed gate in
+/// `mvmctl console` is the *runtime* enforcement of ADR-002 claim 4.
+/// It depends on this file being written. If you're tightening the
+/// security posture in the future and want the gate to fail closed
+/// when this write doesn't land, you'd flip both this function's
+/// return shape and the gate's read-fail handling at the same time.
 pub fn write(name: &str, meta: &VmRuntimeMeta) -> Result<()> {
     let path = meta_path(name)?;
+    let body = serde_json::to_string(meta).context("serializing VmRuntimeMeta")?;
+
     if let Some(parent) = path.parent()
         && let Err(e) = std::fs::create_dir_all(parent)
     {
         tracing::warn!(error = %e, vm = %name, "runtime_meta: mkdir failed");
         return Ok(());
     }
-    let body = serde_json::to_string(meta).context("serializing VmRuntimeMeta")?;
     if let Err(e) = std::fs::write(&path, format!("{body}\n")) {
         tracing::warn!(error = %e, vm = %name, "runtime_meta: write failed");
     }

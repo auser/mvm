@@ -211,25 +211,29 @@ impl VmBackend for MicrosandboxBackend {
     }
 
     fn wait(&self, id: &VmId) -> Result<VmExitStatus> {
-        // microsandbox's `Sandbox::wait()` requires the caller to
-        // own the lifecycle handle, which we don't keep across
-        // sync boundary calls. As a pragmatic substitute, poll
-        // `Sandbox::list()` until the named sandbox disappears —
-        // O(seconds) granularity, fine for "block until exit"
-        // semantics. The W7 follow-up swaps this for a real
-        // signal-aware wait once the handle registry lands.
+        // microsandbox's `Sandbox::wait()` requires the caller to own
+        // the lifecycle handle, which we don't keep across the sync
+        // boundary. As a pragmatic substitute, poll `Sandbox::list()`
+        // until the named sandbox disappears — O(seconds) granularity,
+        // fine for "block until exit" semantics, but the cost is that
+        // we **cannot recover the exit code**: we see the sandbox
+        // disappear, not whether it exited 0 or was SIGKILLed.
+        //
+        // Before this fix the function returned `SUCCESS` here, which
+        // was a silent lie — any caller treating the return value as
+        // ground truth (audit chain, retry policy, CI gate) would
+        // believe a SIGKILLed sandbox was a clean exit.
+        // We now return `UNKNOWN` so callers can fail closed.
+        //
+        // The W7 follow-up swaps this for a real signal-aware wait
+        // once the handle registry retains the lifecycle handle.
         const POLL_INTERVAL: std::time::Duration = std::time::Duration::from_millis(250);
         loop {
             let handles = block_on(async { microsandbox::Sandbox::list().await })
                 .map_err(|e| anyhow::anyhow!(e))
                 .with_context(|| format!("microsandbox list (during wait for {})", id.0))?;
             if !handles.iter().any(|h| h.name() == id.0) {
-                // Sandbox no longer present — exited cleanly OR
-                // was killed externally. We can't disambiguate
-                // without the lifecycle handle, so report success
-                // by convention. mvmd's audit chain captures the
-                // distinction at the policy layer.
-                return Ok(VmExitStatus::SUCCESS);
+                return Ok(VmExitStatus::UNKNOWN);
             }
             std::thread::sleep(POLL_INTERVAL);
         }
@@ -768,14 +772,19 @@ mod tests {
     }
 
     #[test]
-    fn vm_exit_status_success_sentinel_round_trips() {
-        // Sanity: the SUCCESS const is what the polling wait()
-        // returns when the sandbox has disappeared. Asserting its
-        // shape so a future refactor can't silently change the
-        // semantics.
-        let s = VmExitStatus::SUCCESS;
-        assert_eq!(s.code, Some(0));
-        assert!(s.success);
+    fn vm_exit_status_unknown_sentinel_shape() {
+        // Sanity: wait() now returns UNKNOWN when the sandbox has
+        // disappeared (we can't recover the real exit code without
+        // owning the lifecycle handle). Asserting the shape so a
+        // future refactor can't silently flip back to lying-SUCCESS.
+        let s = VmExitStatus::UNKNOWN;
+        assert!(s.code.is_none(), "UNKNOWN must not claim a known code");
+        assert!(!s.success, "UNKNOWN must fail-closed for audit consumers");
+
+        // And SUCCESS keeps its shape for backends that *can* report it.
+        let ok = VmExitStatus::SUCCESS;
+        assert_eq!(ok.code, Some(0));
+        assert!(ok.success);
     }
 
     #[test]

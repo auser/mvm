@@ -258,6 +258,21 @@ impl VmExitStatus {
         code: Some(0),
         success: true,
     };
+
+    /// "Exited, but the exit code is not recoverable" — used by
+    /// backends that observe a sandbox/VM has gone away (e.g. by
+    /// polling `list()`) without retaining the lifecycle handle that
+    /// would carry the real exit code. `success: false` because the
+    /// caller cannot assume zero; `code: None` because we don't have
+    /// one to report.
+    ///
+    /// Distinct from `SUCCESS` so audit / policy consumers can detect
+    /// "backend reports unknown exit" and react (typically: treat as
+    /// failure unless a corroborating signal says otherwise).
+    pub const UNKNOWN: Self = VmExitStatus {
+        code: None,
+        success: false,
+    };
 }
 
 /// Capabilities that a backend may or may not support.
