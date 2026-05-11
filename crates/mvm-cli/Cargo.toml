@@ -20,6 +20,7 @@ mvm-mcp.workspace = true
 mvm-plan.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+ed25519-dalek.workspace = true
 names.workspace = true
 rand.workspace = true
 uuid.workspace = true
