@@ -9,6 +9,7 @@ pub(super) mod fs;
 pub(super) mod invoke;
 pub(super) mod logs;
 pub(super) mod pause;
+pub(super) mod plan_builder;
 pub(super) mod proc;
 pub(super) mod ps;
 pub(super) mod session;
