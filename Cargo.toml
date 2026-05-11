@@ -71,6 +71,10 @@ base64 = "0.22"
 ed25519-dalek = { version = "2", features = ["rand_core"] }
 hmac = "0.12"
 rand = "0.8"
+# `secrecy` wraps secret-carrying types so accidental `Debug`/`Display`
+# becomes a compile error. Plan 63 W2 — `SecretBox<T>` pass on every
+# `KeyProvider` / `WrappedKey` / snapshot-HMAC-key consumer.
+secrecy = { version = "0.10", features = ["serde"] }
 sha2 = "0.10"
 zeroize = { version = "1", features = ["zeroize_derive"] }
 

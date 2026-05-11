@@ -3,26 +3,24 @@
 //! `KeyProvider` is the trait the supervisor consumes; `EnvKeyProvider`
 //! is the dev/staging implementation that reads hex-encoded keys from
 //! env vars. File-based and platform-keystore providers (macOS
-//! Keychain / Linux Secret Service / Windows Cred Mgr) are Phase 2
-//! proper — they need to sit on the same trait surface but their
-//! storage shape depends on Sprint 49's `mvm-storage::VolumeBackend`
-//! decisions, so they aren't ported here.
+//! Keychain / Linux Secret Service / Windows Cred Mgr) are plan 63 W3.
 //!
-//! Returned keys wrap `Zeroizing<Vec<u8>>` so material is wiped from
-//! memory on drop.
+//! Returned keys wrap `SecretBox<Vec<u8>>` — guarantees zeroize-on-
+//! drop AND forbids accidental `Debug`/`Display` at compile time (you
+//! must explicitly call `.expose_secret()` to read the bytes).
 
 use anyhow::{Context, Result};
-use zeroize::Zeroizing;
+use secrecy::SecretBox;
 
 /// Required key size for AES-256-GCM: 256 bits / 32 bytes.
 pub const KEY_SIZE: usize = 32;
 
 /// Resolves a tenant's data-encryption key.
 pub trait KeyProvider: Send + Sync {
-    /// Return the data encryption key for `tenant_id`. Implementations
-    /// must wrap the returned bytes in `Zeroizing` so the key is
-    /// wiped from memory when the caller drops it.
-    fn get_data_key(&self, tenant_id: &str) -> Result<Zeroizing<Vec<u8>>>;
+    /// Return the data encryption key for `tenant_id`. Returned bytes
+    /// are wrapped in `SecretBox` so material is wiped on drop and
+    /// cannot be accidentally logged.
+    fn get_data_key(&self, tenant_id: &str) -> Result<SecretBox<Vec<u8>>>;
 }
 
 /// Reads keys from `MVM_TENANT_KEY_<TENANT_ID>` (hex-encoded, 64
@@ -31,7 +29,7 @@ pub trait KeyProvider: Send + Sync {
 pub struct EnvKeyProvider;
 
 impl KeyProvider for EnvKeyProvider {
-    fn get_data_key(&self, tenant_id: &str) -> Result<Zeroizing<Vec<u8>>> {
+    fn get_data_key(&self, tenant_id: &str) -> Result<SecretBox<Vec<u8>>> {
         validate_shell_id(tenant_id)
             .with_context(|| format!("Invalid tenant_id for key lookup: {tenant_id:?}"))?;
         let var = format!(
@@ -48,7 +46,7 @@ impl KeyProvider for EnvKeyProvider {
                 key.len()
             );
         }
-        Ok(Zeroizing::new(key))
+        Ok(SecretBox::new(Box::new(key)))
     }
 }
 
@@ -121,11 +119,23 @@ mod tests {
     }
 
     #[test]
-    fn env_provider_returns_zeroizing_key() {
+    fn env_provider_returns_secret_key_of_right_length() {
+        use secrecy::ExposeSecret;
         unsafe { std::env::set_var("MVM_TENANT_KEY_TESTX", VALID_KEY_HEX) };
         let key = EnvKeyProvider.get_data_key("testx").unwrap();
-        assert_eq!(key.len(), KEY_SIZE);
+        // `expose_secret()` is the only path to the bytes — that's
+        // the point of SecretBox.
+        assert_eq!(key.expose_secret().len(), KEY_SIZE);
         unsafe { std::env::remove_var("MVM_TENANT_KEY_TESTX") };
+    }
+
+    #[test]
+    fn env_provider_uppercases_and_swaps_hyphens_to_secret() {
+        use secrecy::ExposeSecret;
+        unsafe { std::env::set_var("MVM_TENANT_KEY_FOO_BAR", VALID_KEY_HEX) };
+        let key = EnvKeyProvider.get_data_key("foo-bar").unwrap();
+        assert_eq!(key.expose_secret().len(), KEY_SIZE);
+        unsafe { std::env::remove_var("MVM_TENANT_KEY_FOO_BAR") };
     }
 
     #[test]
@@ -142,15 +152,6 @@ mod tests {
         // *before* any env lookup happens.
         assert!(EnvKeyProvider.get_data_key("../../etc").is_err());
         assert!(EnvKeyProvider.get_data_key("foo;rm").is_err());
-    }
-
-    #[test]
-    fn env_provider_uppercases_and_swaps_hyphens() {
-        unsafe { std::env::set_var("MVM_TENANT_KEY_FOO_BAR", VALID_KEY_HEX) };
-        // tenant_id "foo-bar" must resolve to MVM_TENANT_KEY_FOO_BAR
-        let key = EnvKeyProvider.get_data_key("foo-bar").unwrap();
-        assert_eq!(key.len(), KEY_SIZE);
-        unsafe { std::env::remove_var("MVM_TENANT_KEY_FOO_BAR") };
     }
 
     #[test]
