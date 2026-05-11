@@ -39,7 +39,7 @@ pub(crate) fn boot_builder(
     // Set up TAP device for builder
     env.setup_tap(builder_net, &tenant_net.bridge_name)?;
 
-    // Generate FC config inline as JSON (avoids depending on mvm-runtime FcConfig types)
+    // Generate FC config inline as JSON (avoids depending on mvm FcConfig types)
     let fc_config_json = serde_json::json!({
         "boot-source": {
             "kernel_image_path": format!("{}/vmlinux", BUILDER_DIR),

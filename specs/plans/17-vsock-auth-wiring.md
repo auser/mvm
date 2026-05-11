@@ -20,8 +20,8 @@ This sprint wires the existing primitives into the production code paths with ba
 Before VM boot, generate per-session Ed25519 keypair and write it to the secrets drive.
 
 **Files:**
-- MODIFY: `crates/mvm-runtime/src/vm/instance/lifecycle.rs` — after creating the secrets drive image, write session keys
-- NEW: `crates/mvm-runtime/src/vm/session_keys.rs` — generate keypair, serialize PEM/raw, write to drive
+- MODIFY: `crates/mvm/src/vm/instance/lifecycle.rs` — after creating the secrets drive image, write session keys
+- NEW: `crates/mvm/src/vm/session_keys.rs` — generate keypair, serialize PEM/raw, write to drive
 
 **Key paths on secrets drive:**
 ```
@@ -74,7 +74,7 @@ The high-level API functions (`query_worker_status_at`, `ping_at`, etc.) current
 
 The host reads `SecurityPolicy` from the config drive to decide whether auth is required.
 
-**File:** MODIFY `crates/mvm-runtime/src/vm/instance/lifecycle.rs`
+**File:** MODIFY `crates/mvm/src/vm/instance/lifecycle.rs`
 
 **Logic:**
 - Load `SecurityPolicy` from config drive (or use default if absent)
@@ -126,12 +126,12 @@ Support mixed environments where some guests have keys and some don't.
 
 | What | Location |
 |------|----------|
-| Session key generation + disk write | `mvm-runtime/src/vm/session_keys.rs` (NEW) |
-| Pre-boot key provisioning hook | `mvm-runtime/src/vm/instance/lifecycle.rs` |
+| Session key generation + disk write | `mvm/src/vm/session_keys.rs` (NEW) |
+| Pre-boot key provisioning hook | `mvm/src/vm/instance/lifecycle.rs` |
 | Guest agent session state + auth read/write loop | `mvm-guest/src/bin/mvm-guest-agent.rs` |
 | `connect_authenticated` + `send_request_authenticated` | `mvm-guest/src/vsock.rs` |
 | Host key loading in CLI commands | `mvm-cli/src/commands.rs` |
-| SecurityPolicy loading from config drive | `mvm-runtime/src/vm/instance/lifecycle.rs` |
+| SecurityPolicy loading from config drive | `mvm/src/vm/instance/lifecycle.rs` |
 
 ---
 
@@ -139,7 +139,7 @@ Support mixed environments where some guests have keys and some don't.
 
 ### Phase A: Key provisioning (host side)
 
-1. Create `session_keys.rs` in mvm-runtime:
+1. Create `session_keys.rs` in mvm:
    - `generate_session_keypair() -> (SigningKey, VerifyingKey)`
    - `write_session_keys(secrets_dir: &str, host_signing_key: &SigningKey) -> Result<()>`
    - `load_host_signing_key(vm_dir: &str) -> Result<Option<SigningKey>>`

@@ -33,7 +33,7 @@ Phase 2: Integration Tests
 2a. Instance lifecycle tests:
 
 
-Create crates/mvm-runtime/tests/lifecycle.rs with 5 integration tests using the shell_mock infrastructure from crates/mvm-runtime/src/shell_mock.rs:
+Create crates/mvm/tests/lifecycle.rs with 5 integration tests using the shell_mock infrastructure from crates/mvm/src/shell_mock.rs:
 1. test_full_lifecycle_happy_path — create → start → warm → sleep → wake → stop → destroy
 2. test_invalid_transition_rejected — Running → Sleeping (must go through Warm first)
 3. test_quota_enforcement — start fails when tenant quota exceeded

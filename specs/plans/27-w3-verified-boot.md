@@ -49,7 +49,7 @@
 >   plus `root=/dev/dm-0 ro`. We also refuse to boot with both
 >   `MVM_NIX_STORE_DISK` and verity (mutually exclusive — the dev-VM
 >   exemption is the documented escape).
-> - **W3.3** Firecracker backend (`crates/mvm-runtime/src/vm/microvm.rs`)
+> - **W3.3** Firecracker backend (`crates/mvm/src/vm/microvm.rs`)
 >   added `verity_path` + `roothash` fields to `FlakeRunConfig` and
 >   `VmStartConfig`. `configure_flake_microvm_with_drives_dir` PUTs
 >   a third drive (`/drives/verity`) between rootfs and config so it
@@ -67,7 +67,7 @@
 >   string. A flip of `verifiedBoot=false` on a production path
 >   fails the merge.
 > - **Tests**
->   - `mvm-runtime`: `build_verity_dm_create_rejects_short_hash`,
+>   - `mvm`: `build_verity_dm_create_rejects_short_hash`,
 >     `build_verity_dm_create_rejects_non_hex_hash`,
 >     `probe_verity_sidecar_returns_none_for_path_without_parent`.
 >   - `mvm-apple-container`: `start_vm_rejects_short_roothash`,
@@ -259,13 +259,13 @@ Option B (kernel cmdline `dm-mod.create`) is **strongly preferred**:
 
 Same shape, different config surface. Firecracker takes drives via
 JSON config, not the VZ API. The existing
-`crates/mvm-runtime/src/vm/firecracker.rs` adds drives via the
+`crates/mvm/src/vm/firecracker.rs` adds drives via the
 `POST /drives/{drive_id}` endpoint. Add a third drive for
 `rootfs.verity`, update the boot args.
 
 **Files**
 
-- `crates/mvm-runtime/src/vm/firecracker.rs`: add a `verity_path:
+- `crates/mvm/src/vm/firecracker.rs`: add a `verity_path:
   Option<&str>` parameter to the boot path, post a third drive
   when present, append the same `dm-mod.create=…` to `boot_args`.
 
@@ -328,11 +328,11 @@ gate fails the merge.
 
 ## Tests added by this plan
 
-- `cargo test -p mvm-runtime --test verity_boot` — boot a microVM
+- `cargo test -p mvm --test verity_boot` — boot a microVM
   with verity, assert dm-0 root.
 - `cargo test -p mvm-build --test verity_artifacts` — eval test
   asserts the three files exist in the build output.
-- `cargo test -p mvm-runtime --test verity_tamper_panics` — flip a
+- `cargo test -p mvm --test verity_tamper_panics` — flip a
   byte, assert kernel panic at boot.
 
 ## CI gates

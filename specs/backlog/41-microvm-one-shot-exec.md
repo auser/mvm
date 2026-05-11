@@ -91,7 +91,7 @@ at `--template`/`--flake`.
 ### `read_only` field on volumes
 
 Threaded through `mvm_core::vm_backend::VmVolume`,
-`mvm_runtime::vm::image::RuntimeVolume`, and the Firecracker drive emit in
+`mvm::vm::image::RuntimeVolume`, and the Firecracker drive emit in
 `vm/microvm.rs`. Defaults to `false` for backwards compatibility with
 existing persistent volumes.
 
@@ -102,9 +102,9 @@ existing persistent volumes.
 | `crates/mvm-cli/src/exec.rs` | **new** — orchestrator + types + tests |
 | `crates/mvm-cli/src/commands.rs` | `Commands::Exec` Clap variant + `run_oneshot` wrapper; `ensure_default_microvm_image` + `find_default_microvm_flake`; `Commands::Up` source group no longer required; `cmd_run` falls back to default image |
 | `crates/mvm-cli/src/lib.rs` | `pub mod exec` |
-| `crates/mvm-runtime/src/vm/image.rs` | `RuntimeVolume.read_only` + `build_dir_image_ro` helper |
-| `crates/mvm-runtime/src/vm/microvm.rs` | Honor `vol.read_only` in Firecracker drive JSON |
-| `crates/mvm-runtime/src/vm/backend.rs` | Propagate `read_only` through `FirecrackerConfig::from_start_config` |
+| `crates/mvm/src/vm/image.rs` | `RuntimeVolume.read_only` + `build_dir_image_ro` helper |
+| `crates/mvm/src/vm/microvm.rs` | Honor `vol.read_only` in Firecracker drive JSON |
+| `crates/mvm/src/vm/backend.rs` | Propagate `read_only` through `FirecrackerConfig::from_start_config` |
 | `crates/mvm-core/src/vm_backend.rs` | `VmVolume.read_only` + `Default` impl |
 | `nix/default-microvm/flake.nix` | **new** — bundled default microVM image |
 | `public/src/content/docs/reference/cli-commands.md` | Documents `mvmctl exec` and the default-image fallback for `up`/`run`/`start` |

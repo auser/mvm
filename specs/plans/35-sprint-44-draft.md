@@ -103,7 +103,7 @@ across Firecracker snapshot.
       and runbook §6 documenting the round-trip. If NOT: extend
       the `PostRestore` vsock RPC handler to re-apply the verity
       target on signal.
-- [ ] **C2.3** `crates/mvm-runtime/tests/verity_snapshot_restore.rs`
+- [ ] **C2.3** `crates/mvm/tests/verity_snapshot_restore.rs`
       integration test, gated on Linux/KVM availability.
 
 **Done when**: snapshotting a verity template and restoring it

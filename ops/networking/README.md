@@ -3,7 +3,7 @@
 Bridge / TAP / iptables provisioning for the mvm host network.
 
 **Status (decided 2026-04-30): lenient reading.** The bridge / TAP /
-iptables setup stays in `crates/mvm-runtime/src/vm/network.rs` and
+iptables setup stays in `crates/mvm/src/vm/network.rs` and
 runs from `mvmctl dev up` / `mvmctl run`. Rationale: the
 [mvm-nix-best-practices guide](../../specs/references/mvm-nix-best-practices.md)
 hard rules (`flake.nix` / `devShells` / `shellHook`) target Nix

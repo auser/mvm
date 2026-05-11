@@ -294,7 +294,7 @@ pub(in crate::commands) fn dispatch(
 }
 
 fn dispatch_inner(vm_name: &str, stdin: Vec<u8>, timeout_secs: u64) -> Result<i32> {
-    let transport = mvm_runtime::vsock_transport::for_vm(vm_name)
+    let transport = mvm::vsock_transport::for_vm(vm_name)
         .with_context(|| format!("Picking transport for guest agent on '{vm_name}'"))?;
     let mut stream = transport
         .connect(mvm_guest::vsock::GUEST_AGENT_PORT)

@@ -12,10 +12,10 @@ authors.workspace = true
 mvm-core.workspace = true
 mvm-plan.workspace = true
 mvm-policy.workspace = true
-# `mvm-runtime` provides the `VmNameRegistry` the TTL reaper walks.
+# `mvm` provides the `VmNameRegistry` the TTL reaper walks.
 # Heavy dep, but the supervisor's eventual job is to drive runtime
 # operations anyway, so we'd be importing it shortly regardless.
-mvm-runtime.workspace = true
+mvm.workspace = true
 async-trait = "0.1"
 base64.workspace = true
 chrono.workspace = true

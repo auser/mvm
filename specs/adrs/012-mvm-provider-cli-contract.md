@@ -587,7 +587,7 @@ The mvm tree has *two* concerns that share the word "provider":
 
    Future modules: `cloud_hypervisor`, `windows_wfp`, etc. This crate
    is consumed by `mvm-backend` (the `VmBackend` impls), which is
-   consumed by `mvm-runtime` (lifecycle orchestration).
+   consumed by `mvm` (lifecycle orchestration).
 
 The two share a name but address different layers. Public Providers
 are what end users select; the internal `mvm-providers` crate is

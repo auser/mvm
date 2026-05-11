@@ -1,8 +1,8 @@
-//! mvm-runtime-base — shared substrate for `mvm-runtime` + `mvm-backend`.
+//! mvm-base — shared substrate for `mvm` + `mvm-backend`.
 //!
 //! Plan-60 W7+W8 lifted the substrate that backend implementations
-//! needed out of `mvm-runtime` so the concrete `VmBackend` impls could
-//! live in `mvm-backend` without a back-edge into `mvm-runtime`.
+//! needed out of `mvm` so the concrete `VmBackend` impls could
+//! live in `mvm-backend` without a back-edge into `mvm`.
 //!
 //! ## What lives here
 //!
@@ -15,12 +15,12 @@
 //! | `shell`         | Host + Linux-env command execution helpers             |
 //! | `linux_env`     | Dispatch trait impls (NativeEnv, AppleContainerEnv)    |
 //!
-//! ## Re-exports kept by `mvm-runtime`
+//! ## Re-exports kept by `mvm`
 //!
-//! `mvm-runtime`'s `lib.rs` re-exports the modules at their old
+//! `mvm`'s `lib.rs` re-exports the modules at their old
 //! paths so the mvmd contract surface (`mvmctl::runtime::shell`,
 //! `mvmctl::runtime::ui`, `mvmctl::runtime::shell_mock`) and the
-//! W6.2 console gate (`mvm_runtime::vm::runtime_meta`) keep
+//! W6.2 console gate (`mvm::vm::runtime_meta`) keep
 //! resolving.
 
 pub mod config;
@@ -31,7 +31,7 @@ pub mod shell;
 pub mod snapshot_integrity;
 pub mod ui;
 
-// Legacy re-export: `mvm_runtime_base::shell_mock::*` matches the
-// pre-W8 `mvm_runtime::shell_mock::*` path that mvmd's quic_integration
+// Legacy re-export: `mvm_base::shell_mock::*` matches the
+// pre-W8 `mvm::shell_mock::*` path that mvmd's quic_integration
 // test relies on.
 pub use shell::mock as shell_mock;

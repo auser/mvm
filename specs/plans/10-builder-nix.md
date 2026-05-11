@@ -69,15 +69,15 @@ crates/
   mvm-cli/
   mvm-core/
   mvm-agent/
-  mvm-runtime/
+  mvm/
   mvm-build/
   mvm-guest/
 
 Rules:
 - mvm-cli depends on mvm-agent and mvm-core only.
-- mvm-agent depends on mvm-core, mvm-runtime, mvm-build, mvm-guest.
-- mvm-runtime must not depend on mvm-agent.
-- mvm-build must not depend on mvm-runtime except through narrow interfaces.
+- mvm-agent depends on mvm-core, mvm, mvm-build, mvm-guest.
+- mvm must not depend on mvm-agent.
+- mvm-build must not depend on mvm except through narrow interfaces.
 - Keep dev mode intact (macOS + Lima) but isolate platform-specific code.
 
 ----------------------------------------------------------------
@@ -87,7 +87,7 @@ B) INTERNAL MODULE MAP (IMPLEMENT CLEANLY)
 Implement modules as previously defined:
 - mvm-core: ids, schema, state store, audit, hashing, config loader
 - mvm-agent: reconcile, planner, sleep policy, coordinator client
-- mvm-runtime: firecracker, jailer, cgroups, nftables, taps, bridges, volumes, luks
+- mvm: firecracker, jailer, cgroups, nftables, taps, bridges, volumes, luks
 - mvm-build: nix builder VM, artifact cache, config/secrets/job drives
 - mvm-guest: vsock protocol, openclaw connector mapping
 - mvm-cli: clap commands only

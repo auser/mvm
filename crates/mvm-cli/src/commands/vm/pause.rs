@@ -20,7 +20,7 @@ use std::path::PathBuf;
 
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::vm::instance_snapshot::{FirecrackerIO, pause_and_seal, verify_and_resume};
+use mvm::vm::instance_snapshot::{FirecrackerIO, pause_and_seal, verify_and_resume};
 
 use super::Cli;
 use super::shared::clap_vm_name;
@@ -49,8 +49,8 @@ pub(in crate::commands) fn run_pause(_cli: &Cli, args: PauseArgs, _cfg: &MvmConf
     let sidecar =
         pause_and_seal(&args.name, &io).with_context(|| format!("pausing VM {:?}", args.name))?;
 
-    let registry_path = mvm_runtime::vm::name_registry::registry_path();
-    if let Ok(mut registry) = mvm_runtime::vm::name_registry::VmNameRegistry::load(&registry_path) {
+    let registry_path = mvm::vm::name_registry::registry_path();
+    if let Ok(mut registry) = mvm::vm::name_registry::VmNameRegistry::load(&registry_path) {
         let _ = registry.set_paused(&args.name, true);
         let _ = registry.save(&registry_path);
     }
@@ -97,8 +97,8 @@ pub(in crate::commands) fn run_resume(
     let sidecar = verify_and_resume(&args.name, &io)
         .with_context(|| format!("resuming VM {:?}", args.name))?;
 
-    let registry_path = mvm_runtime::vm::name_registry::registry_path();
-    if let Ok(mut registry) = mvm_runtime::vm::name_registry::VmNameRegistry::load(&registry_path) {
+    let registry_path = mvm::vm::name_registry::registry_path();
+    if let Ok(mut registry) = mvm::vm::name_registry::VmNameRegistry::load(&registry_path) {
         let _ = registry.set_paused(&args.name, false);
         let _ = registry.save(&registry_path);
     }
@@ -158,7 +158,7 @@ pub(in crate::commands) fn run_snapshot(
 }
 
 fn snap_ls(json: bool) -> Result<()> {
-    let entries = mvm_runtime::vm::instance_snapshot::list_instance_snapshots()?;
+    let entries = mvm::vm::instance_snapshot::list_instance_snapshots()?;
     if json {
         #[derive(serde::Serialize)]
         struct Row<'a> {
@@ -204,12 +204,12 @@ fn snap_ls(json: bool) -> Result<()> {
 
 fn snap_rm(name: &str) -> Result<()> {
     validate_vm_name(name).with_context(|| format!("Invalid VM name: {:?}", name))?;
-    let removed = mvm_runtime::vm::instance_snapshot::delete_instance_snapshot(name)?;
+    let removed = mvm::vm::instance_snapshot::delete_instance_snapshot(name)?;
     if !removed {
         bail!("no snapshot found for VM {:?}", name);
     }
-    let registry_path = mvm_runtime::vm::name_registry::registry_path();
-    if let Ok(mut registry) = mvm_runtime::vm::name_registry::VmNameRegistry::load(&registry_path) {
+    let registry_path = mvm::vm::name_registry::registry_path();
+    if let Ok(mut registry) = mvm::vm::name_registry::VmNameRegistry::load(&registry_path) {
         let _ = registry.set_paused(name, false);
         let _ = registry.save(&registry_path);
     }

@@ -5,7 +5,7 @@
 //! we just need an abstraction so `Supervisor::launch(plan)` can
 //! be tested without a real Firecracker. The registry + concrete
 //! `FirecrackerBackend` / `AppleContainerBackend` impls land in
-//! a follow-up that lifts today's `mvm-runtime/src/vm/backend.rs`
+//! a follow-up that lifts today's `mvm/src/vm/backend.rs`
 //! `AnyBackend` enum behind this trait.
 
 use async_trait::async_trait;

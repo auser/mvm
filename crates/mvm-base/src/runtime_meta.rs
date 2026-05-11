@@ -29,7 +29,7 @@ use serde::{Deserialize, Serialize};
 
 /// Workspace-wide test serialization for tests that mutate `HOME`
 /// (or any other process-global env var). Multiple modules across
-/// `mvm-runtime` and `mvm-backend` need this; sharing one lock
+/// `mvm` and `mvm-backend` need this; sharing one lock
 /// prevents the modules' tests from racing each other when run on
 /// the same `cargo test` binary. Exposed unconditionally so
 /// downstream test suites can serialize against it without an

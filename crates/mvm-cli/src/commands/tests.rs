@@ -480,7 +480,7 @@ fn test_parse_port_specs_empty() {
 
 #[test]
 fn test_ports_to_drive_file() {
-    use mvm_runtime::config::PortMapping;
+    use mvm::config::PortMapping;
     let ports = vec![
         PortMapping {
             host: 3333,

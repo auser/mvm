@@ -146,7 +146,7 @@ The `VmBackend` trait gains `fn guest_channel(&self, id: &VmId) -> Result<Box<dy
 apple-container = ["mvm-apple-container"]
 docker = []  # pure Rust, no platform restriction
 
-# mvm-runtime/Cargo.toml
+# mvm/Cargo.toml
 [target.'cfg(target_os = "macos")'.dependencies]
 mvm-apple-container = { path = "../mvm-apple-container", optional = true }
 ```
@@ -188,7 +188,7 @@ Use `swift-bridge` crate for Rust↔Swift FFI to call Apple's Containerization f
 ### Architecture
 
 ```
-mvm-runtime (Rust)
+mvm (Rust)
   └── AppleContainerBackend
         └── swift-bridge FFI
               └── mvm-apple-container (Swift package)
@@ -282,7 +282,7 @@ No new `oci.rs` module needed for Apple Containers — the same ext4 rootfs work
 - `MicrovmNixConfig::from(&VmStartConfig)` — adds runner_dir, slot
 
 **0.6 Unify `AnyBackend::start()`**
-- File: `crates/mvm-runtime/src/vm/backend.rs`
+- File: `crates/mvm/src/vm/backend.rs`
 - Single `start(&self, config: &VmStartConfig) -> Result<VmId>` method
 - Remove `start_firecracker()` and `start_microvm_nix()` methods
 - Update all call sites in `crates/mvm-cli/src/commands.rs` (lines ~2683, 2812, 3021, 3066)
@@ -297,8 +297,8 @@ No new `oci.rs` module needed for Apple Containers — the same ext4 rootfs work
 - Conditional compilation: `#[cfg(target_os = "macos")]`
 - Cargo feature: `apple-container`
 
-**1.2 Add `AppleContainerBackend` to mvm-runtime**
-- File: `crates/mvm-runtime/src/vm/apple_container.rs`
+**1.2 Add `AppleContainerBackend` to mvm**
+- File: `crates/mvm/src/vm/apple_container.rs`
 - Implements `VmBackend` trait with `VmStartConfig`
 - Capabilities: vsock=true, snapshots=false, pause_resume=false, tap_networking=false
 - `guest_channel()` → vsock to guest agent port
@@ -320,7 +320,7 @@ No new `oci.rs` module needed for Apple Containers — the same ext4 rootfs work
 **2.1 Guest agent integration**
 - Launch mvm guest agent as a process via vminitd gRPC API
 - Rust gRPC client for vminitd's `SandboxContext` service (protobuf, vsock:1024)
-- File: `crates/mvm-runtime/src/vm/vminitd_client.rs`
+- File: `crates/mvm/src/vm/vminitd_client.rs`
 - mvm guest agent health checks work over vsock (same as Firecracker)
 
 **2.2 Dev mode backend awareness**
@@ -342,7 +342,7 @@ No new `oci.rs` module needed for Apple Containers — the same ext4 rootfs work
 ### Phase 3 — Docker Backend for Windows (~1 sprint)
 
 **3.1 Add `DockerBackend`**
-- File: `crates/mvm-runtime/src/vm/docker.rs`
+- File: `crates/mvm/src/vm/docker.rs`
 - Implements `VmBackend` via Docker Engine API (HTTP over unix socket / named pipe)
 - Capabilities: vsock=false, snapshots=false, pause_resume=false
 - `guest_channel()` → unix socket (mounted as volume in container)
@@ -380,9 +380,9 @@ No new `oci.rs` module needed for Apple Containers — the same ext4 rootfs work
 | `crates/mvm-apple-container/Sources/` | Swift wrapper code |
 | `crates/mvm-apple-container/src/lib.rs` | Rust bridge module |
 | `crates/mvm-apple-container/build.rs` | swift-bridge build script |
-| `crates/mvm-runtime/src/vm/apple_container.rs` | AppleContainerBackend impl |
-| `crates/mvm-runtime/src/vm/docker.rs` | DockerBackend impl |
-| `crates/mvm-runtime/src/vm/vminitd_client.rs` | gRPC client for vminitd |
+| `crates/mvm/src/vm/apple_container.rs` | AppleContainerBackend impl |
+| `crates/mvm/src/vm/docker.rs` | DockerBackend impl |
+| `crates/mvm/src/vm/vminitd_client.rs` | gRPC client for vminitd |
 | `crates/mvm-guest/src/unix_socket.rs` | Unix socket GuestChannel impl |
 
 ## Files to Modify
@@ -393,29 +393,29 @@ No new `oci.rs` module needed for Apple Containers — the same ext4 rootfs work
 | `crates/mvm-core/src/vm_backend.rs` | `VmStartConfig`, `GuestChannel`, `VmNetworkInfo`, remove associated `type Config` |
 | `crates/mvm-core/src/template.rs` | `TemplateKind` enum (Image vs Snapshot) |
 | `crates/mvm-core/src/platform.rs` | `has_apple_containers()` detection |
-| `crates/mvm-runtime/Cargo.toml` | Optional dep on `mvm-apple-container` (cfg macos) |
-| `crates/mvm-runtime/src/vm/backend.rs` | `AppleContainer` + `Docker` variants, unified `start()` |
-| `crates/mvm-runtime/src/vm/mod.rs` | Add `apple_container`, `docker`, `vminitd_client` modules |
-| `crates/mvm-runtime/src/vm/network.rs` | Parameterize subnet via `VmNetworkInfo` |
+| `crates/mvm/Cargo.toml` | Optional dep on `mvm-apple-container` (cfg macos) |
+| `crates/mvm/src/vm/backend.rs` | `AppleContainer` + `Docker` variants, unified `start()` |
+| `crates/mvm/src/vm/mod.rs` | Add `apple_container`, `docker`, `vminitd_client` modules |
+| `crates/mvm/src/vm/network.rs` | Parameterize subnet via `VmNetworkInfo` |
 | `crates/mvm-cli/src/commands.rs` | Unified `backend.start(&config)`, `--hypervisor` values, dev mode |
 | `crates/mvm-cli/src/doctor.rs` | Apple Container + Docker availability checks |
 | `crates/mvm-guest/src/vsock.rs` | Implement `GuestChannel` trait for vsock |
 | `crates/mvm-cli/src/commands.rs` (`cmd_dev`) | Backend-aware dev mode, `--lima` flag |
-| `crates/mvm-runtime/src/vm/template/` | `TemplateKind` support, capability-gated snapshot |
+| `crates/mvm/src/vm/template/` | `TemplateKind` support, capability-gated snapshot |
 
 ## Existing Code to Reuse
 
 | What | Where | How |
 |------|-------|-----|
 | `VmBackend` trait | `crates/mvm-core/src/vm_backend.rs` | Refactor + implement for new backends |
-| `AnyBackend` enum | `crates/mvm-runtime/src/vm/backend.rs` | Add new variants |
+| `AnyBackend` enum | `crates/mvm/src/vm/backend.rs` | Add new variants |
 | `VmCapabilities` | `crates/mvm-core/src/vm_backend.rs` | Declare per-backend capabilities |
 | Platform detection | `crates/mvm-core/src/platform.rs` | Extend with Apple Container check |
 | Nix rootfs builder | `crates/mvm-build/src/dev_build.rs` | Rootfs output feeds into OCI wrapper |
 | Guest agent vsock | `crates/mvm-guest/src/vsock.rs` | Wrap in `GuestChannel` trait |
 | `--hypervisor` CLI flag | `crates/mvm-cli/src/commands.rs` | Add new values |
 | Template struct | `crates/mvm-core/src/template.rs` | Add `TemplateKind` |
-| `FlakeRunConfig` | `crates/mvm-runtime/src/vm/microvm.rs` | Add `From<&VmStartConfig>` |
+| `FlakeRunConfig` | `crates/mvm/src/vm/microvm.rs` | Add `From<&VmStartConfig>` |
 
 ## Limitations & Risks
 

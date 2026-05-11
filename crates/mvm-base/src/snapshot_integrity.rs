@@ -2,11 +2,11 @@
 //! snapshots. ADR-007 / plan 41 W4 / M9.
 //!
 //! Plan-60 W8 lifted these helpers out of
-//! `mvm_runtime::vm::template::lifecycle` so the snapshot **verify**
+//! `mvm::vm::template::lifecycle` so the snapshot **verify**
 //! side (called from `mvm_backend::microvm::restore_from_template_snapshot`)
 //! can reach them without `mvm-backend` taking a back-edge on
-//! `mvm-runtime`. The **seal** side (called from
-//! `mvm_runtime::vm::template::lifecycle::create_snapshot`) keeps its
+//! `mvm`. The **seal** side (called from
+//! `mvm::vm::template::lifecycle::create_snapshot`) keeps its
 //! original call shape via the same module.
 //!
 //! Failure model:

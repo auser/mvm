@@ -45,7 +45,7 @@ pub struct MicrosandboxBackend;
 
 /// Record the caller's `StartMode` intent for a sandbox name.
 ///
-/// Delegates to [`mvm_runtime_base::runtime_meta`], which owns the on-disk
+/// Delegates to [`mvm_base::runtime_meta`], which owns the on-disk
 /// shape at `~/.mvm/vms/<name>/mode.json`. The `accessible` flag
 /// defaults to `true` here — used by call sites that don't have a
 /// rootfs path handy (e.g., `detach`, which works on an existing
@@ -55,12 +55,12 @@ pub struct MicrosandboxBackend;
 /// proceeds. The contract is "best-effort metadata," not
 /// load-bearing for VM lifecycle.
 fn record_start_mode(name: &str, mode: StartMode) -> Result<()> {
-    let meta = mvm_runtime_base::runtime_meta::dev_attached(mode);
-    mvm_runtime_base::runtime_meta::write(name, &meta)
+    let meta = mvm_base::runtime_meta::dev_attached(mode);
+    mvm_base::runtime_meta::write(name, &meta)
 }
 
 /// Thin alias for the cross-backend helper in
-/// [`mvm_runtime_base::runtime_meta::record_from_rootfs`]. Kept here so the
+/// [`mvm_base::runtime_meta::record_from_rootfs`]. Kept here so the
 /// existing tests in this module read naturally; new backends call
 /// the runtime_meta version directly.
 fn record_start_mode_from_rootfs(
@@ -68,7 +68,7 @@ fn record_start_mode_from_rootfs(
     mode: StartMode,
     rootfs: &Path,
 ) -> Result<()> {
-    mvm_runtime_base::runtime_meta::record_from_rootfs(name, mode, rootfs)
+    mvm_base::runtime_meta::record_from_rootfs(name, mode, rootfs)
 }
 
 /// Bridge our Nix-built `rootfs.ext4` into a path microsandbox accepts.
@@ -636,8 +636,8 @@ mod tests {
 
     /// Serialize tests that mutate `$HOME` so they don't race each
     /// other. Reuses the workspace-wide `HOME_TEST_LOCK` from
-    /// `mvm-runtime-base::runtime_meta` (W7 substrate split) so this
-    /// crate's tests serialize against `mvm-runtime`'s
+    /// `mvm-base::runtime_meta` (W7 substrate split) so this
+    /// crate's tests serialize against `mvm`'s
     /// `runtime_meta` tests as well.
     fn with_home_temp<F>(f: F)
     where

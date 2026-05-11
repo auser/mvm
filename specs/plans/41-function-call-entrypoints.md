@@ -126,7 +126,7 @@ stdin to stdout). Argv parsing tests in `crates/mvm-cli/tests/`.
 
 ### W4 — Snapshot integrity (HMAC)
 
-Lands in `crates/mvm-runtime/src/vm/microvm.rs`.
+Lands in `crates/mvm/src/vm/microvm.rs`.
 
 - On first run, generate `~/.mvm/snapshot.key` (32 random bytes,
   mode 0600). New helper in `mvm-core` for HMAC-SHA256 keyed-mac
@@ -175,7 +175,7 @@ exercised in `crates/mvm-cli/tests/doctor.rs`.
 
 ### W6 — Network: deny-default for function workloads
 
-Lands across `mvm-runtime/src/vm/network.rs`,
+Lands across `mvm/src/vm/network.rs`,
 `mvm-core/src/dev_network.rs`, and the IR consumer paths.
 
 - Recognize a new IR-derived signal that the workload is a

@@ -115,15 +115,15 @@ Additionally, the vsock protocol between host and guest has no authentication, n
 - [x] Add `SecurityPolicy`, `AuthenticatedFrame`, `SessionHello`/`SessionHelloAck`, `AccessPolicy`, `RateLimitPolicy`, `SessionPolicy` types in new `mvm-core/src/security.rs`
 - [x] Add `pub mod security` to `mvm-core/src/lib.rs`
 - [x] Implement authenticated frame wrappers (`write_authenticated_frame`, `read_authenticated_frame`) in `mvm-guest/src/vsock.rs`
-- [x] Add `ed25519-dalek`, `rand`, `chrono` dependencies to `mvm-guest/Cargo.toml`; add `ed25519-dalek`, `rand`, `base64` to `mvm-runtime/Cargo.toml`
-- [x] Add session key generation (`generate_session_keypair`, `provision_session_keys`, `load_session_key`, `load_verifying_key`) to `mvm-runtime/src/security/signing.rs`
+- [x] Add `ed25519-dalek`, `rand`, `chrono` dependencies to `mvm-guest/Cargo.toml`; add `ed25519-dalek`, `rand`, `base64` to `mvm/Cargo.toml`
+- [x] Add session key generation (`generate_session_keypair`, `provision_session_keys`, `load_session_key`, `load_verifying_key`) to `mvm/src/security/signing.rs`
 - [x] Implement challenge-response handshake (`handshake_as_host`, `handshake_as_guest`) after existing `CONNECT/OK`
 - [x] Key provisioning: `provision_session_keys()` writes per-session keypair to secrets drive (`/mnt/secrets/vsock/`) before VM boot
 - [x] Version negotiation: protocol version constants (`PROTOCOL_VERSION_AUTHENTICATED = 2`, `PROTOCOL_VERSION_LEGACY = 1`), `read_authenticated_frame` rejects mismatched versions
 - [x] Default `require_auth: false` in `SecurityPolicy`, all `AccessPolicy` toggles default true, `RateLimitPolicy` defaults 100 fps / 3000 fpm
-- [x] Enabled `pub mod security` in `mvm-runtime/src/lib.rs` (was dead code; trimmed to compilable modules: audit, cgroups, jailer, metadata, seccomp, signing)
+- [x] Enabled `pub mod security` in `mvm/src/lib.rs` (was dead code; trimmed to compilable modules: audit, cgroups, jailer, metadata, seccomp, signing)
 - [x] Fixed `generate_keypair()` to use `rand::rngs::OsRng` (was referencing unavailable `aes_gcm::aead::OsRng`)
-- [x] Tests (24 new): 8 mvm-core serde/defaults, 10 mvm-guest auth frame roundtrip + tampered rejection + wrong key + replay detection + session mismatch + handshake roundtrip + full exchange, 6 mvm-runtime session key provisioning + loading + error cases
+- [x] Tests (24 new): 8 mvm-core serde/defaults, 10 mvm-guest auth frame roundtrip + tampered rejection + wrong key + replay detection + session mismatch + handshake roundtrip + full exchange, 6 mvm session key provisioning + loading + error cases
 
 ## Phase 7: Command Gating
 **Status: COMPLETE**
@@ -132,12 +132,12 @@ Additionally, the vsock protocol between host and guest has no authentication, n
 
 - [x] Add `GateDecision`, `ApprovalVerdict`, `BlocklistEntry`, `BlocklistAction`, `BlocklistSeverity` types to `mvm-core/src/security.rs`
 - [x] Add `blocklist: Vec<BlocklistEntry>` field to `SecurityPolicy` (`#[serde(default)]` for backward compat)
-- [x] Create `mvm-runtime/src/security/command_gate.rs` — `CommandGate` struct with Aho-Corasick literal matching + glob wildcards
+- [x] Create `mvm/src/security/command_gate.rs` — `CommandGate` struct with Aho-Corasick literal matching + glob wildcards
 - [x] Gate logic: non-match → allow, Block → reject, RequireApproval → hold; `evaluate_dev_mode()` auto-approves with warning
 - [x] Default blocklist: 13 entries covering destructive commands, privilege escalation, sensitive file access, VM escape vectors
 - [x] Harden builder agent (`mvm-guest/src/bin/mvm-builder-agent.rs`): `validate_flake_ref()` rejects shell metacharacters + path traversal, `validate_build_attr()` requires `packages.` prefix, `load_security_policy()` checks `access.build == false`
-- [x] Export `command_gate` from `mvm-runtime/src/security/mod.rs`; add `aho-corasick` workspace dependency
-- [x] Tests (29 new): 7 mvm-core gate type serde/defaults, 14 mvm-runtime command gate (glob matching, literal block/approval/log, precedence, dev mode, default blocklist), 8 mvm-guest builder validation (flake_ref safety, attr validation, policy loading)
+- [x] Export `command_gate` from `mvm/src/security/mod.rs`; add `aho-corasick` workspace dependency
+- [x] Tests (29 new): 7 mvm-core gate type serde/defaults, 14 mvm command gate (glob matching, literal block/approval/log, precedence, dev mode, default blocklist), 8 mvm-guest builder validation (flake_ref safety, attr validation, policy loading)
 
 ## Phase 8: Threat Classification + Audit Extension
 **Status: COMPLETE**
@@ -145,25 +145,25 @@ Additionally, the vsock protocol between host and guest has no authentication, n
 **Goal:** Classify every vsock message against 10 threat categories using idiomatic Rust (not a wall of regex). Extend audit trail.
 
 - [x] Add `ThreatCategory` (10 variants: SecretExposure, DataExfiltration, Injection, Destructive, PrivilegeEscalation, SupplyChain, SensitiveFileAccess, SystemModification, NetworkAbuse, ToolPoisoning), `Severity` (5 levels with Ord), `ThreatFinding` struct to `mvm-core/src/security.rs`
-- [x] Create `mvm-runtime/src/security/threat_classifier.rs` — `ThreatClassifier` struct with three-tier detection:
+- [x] Create `mvm/src/security/threat_classifier.rs` — `ThreatClassifier` struct with three-tier detection:
   - [x] Tier 1: Aho-Corasick multi-pattern matching (70+ literals, single O(n) scan) — credential prefixes (AKIA, ghp_, sk_live_, xoxb-, etc.), destructive commands (rm -rf /, mkfs, dd, DROP TABLE, fork bomb), exfil domains (pastebin, ngrok, transfer.sh, webhook.site), privilege escalation (sudo, nsenter, unshare, capsh), sensitive files (.ssh/id_rsa, .aws/credentials, .kube/config), VM escape (/dev/kvm, release_agent, sysrq-trigger), injection (eval, exec, subprocess), system modification (iptables, sysctl, remount rw)
   - [x] Tier 2: Typed Rust pattern matching (str methods + match arms) — sensitive path analysis (/etc/passwd, /etc/shadow, /proc/self, /sys/fs/cgroup), command structure (12 dangerous binaries with sudo/path stripping), pipe-to-curl/wget exfil, reverse shell via /dev/tcp, PEM private key format, credential assignment, suspicious protocols (gopher://, dict://), setuid/setgid chmod detection (octal mode parsing), Nix patterns (--no-sandbox, --impure, nix-shell --run, remote builders)
   - [x] Tier 3: RegexSet (20 patterns) — AWS access key format, JWT tokens, hex-encoded secrets, base64 decode execution, shell command substitution ($(), backtick), IP:port connections, crontab modification, hex escape obfuscation, Python/Perl reverse shells, env exfiltration, DNS exfiltration, LD_PRELOAD injection, MMDS metadata access, /proc and /sys writes, setcap escalation, unusual port fetches
 - [x] MicroVM-specific patterns: /dev/kvm access, cgroup release_agent, cgroupfs mount, sysrq-trigger, prctl(PR_SET_NO_NEW_PRIVS), MMDS 169.254.169.254, Nix sandbox bypass
-- [x] Add `regex = "1"` workspace dependency; add `regex.workspace = true` to `mvm-runtime/Cargo.toml`
+- [x] Add `regex = "1"` workspace dependency; add `regex.workspace = true` to `mvm/Cargo.toml`
 - [x] Extend `AuditEntry` in `mvm-core/src/audit.rs`: add `threats: Vec<ThreatFinding>`, `gate_decision: Option<GateDecision>`, `frame_sequence: Option<u64>` fields (all `#[serde(default)]` for backward compat)
 - [x] Add 9 `AuditAction` variants: `VsockSessionStarted`, `VsockSessionEnded`, `VsockFrameReceived`, `CommandBlocked`, `CommandApproved`, `CommandDenied`, `ThreatDetected`, `RateLimitExceeded`, `SessionRecycled`
-- [x] Export `threat_classifier` from `mvm-runtime/src/security/mod.rs`
-- [x] Tests (63 new across 3 crates): 4 mvm-core threat type serde/ordering, 4 mvm-core audit backward compat + security fields, 55 mvm-runtime threat classifier (3 benign, 19 literal/Tier 1, 14 structural/Tier 2, 11 regex/Tier 3, 1 multi-category, 3 edge cases + throughput), updated all AuditEntry test constructions
+- [x] Export `threat_classifier` from `mvm/src/security/mod.rs`
+- [x] Tests (63 new across 3 crates): 4 mvm-core threat type serde/ordering, 4 mvm-core audit backward compat + security fields, 55 mvm threat classifier (3 benign, 19 literal/Tier 1, 14 structural/Tier 2, 11 regex/Tier 3, 1 multi-category, 3 edge cases + throughput), updated all AuditEntry test constructions
 
 ## Phase 9: Rate Limiting (mvm) + Health/Session Deferred to mvmd
 **Status: COMPLETE**
 
 **Goal:** Sliding-window rate limiter for vsock frames. Health monitoring and session lifecycle deferred to mvmd (fleet daemon behavior, not dev-tool scope).
 
-- [x] Create `mvm-runtime/src/security/rate_limiter.rs` — `RateLimiter` struct with sliding-window token bucket (1-second and 1-minute windows), `check_and_record()` / `check_and_record_at()` API, `RateLimitResult` enum (Allowed/ExceededPerSecond/ExceededPerMinute), allowed/rejected counters, `reset()`, `is_unlimited()`
+- [x] Create `mvm/src/security/rate_limiter.rs` — `RateLimiter` struct with sliding-window token bucket (1-second and 1-minute windows), `check_and_record()` / `check_and_record_at()` API, `RateLimitResult` enum (Allowed/ExceededPerSecond/ExceededPerMinute), allowed/rejected counters, `reset()`, `is_unlimited()`
 - [x] Uses `RateLimitPolicy` from `mvm-core/src/security.rs` (already exists: `frames_per_second`, `frames_per_minute`, defaults 100/3000)
-- [x] Export `rate_limiter` from `mvm-runtime/src/security/mod.rs`
+- [x] Export `rate_limiter` from `mvm/src/security/mod.rs`
 - [x] Tests (11 new): within-limits allowed, per-second exceeded, per-minute exceeded, window expiry allows after cooldown, minute window expiry, unlimited mode, per-second checked before per-minute, reset clears state, fps/fpm counters with window rollover, default policy, sustained rate within limit
 - **Deferred to mvmd:** `health_monitor.rs` (periodic vsock Ping, kill/restart) and `session_manager.rs` (session lifecycle, auto-recycle) — these are fleet daemon behaviors that require a long-running async runtime watching many VMs. See mvmd specs for implementation plan.
 
@@ -173,21 +173,21 @@ Additionally, the vsock protocol between host and guest has no authentication, n
 **Goal:** Multi-layer posture scoring, extract pure-logic security modules into standalone crate, add backend-agnostic VM trait.
 
 ### 10a: Extract `mvm-security` Crate
-- [x] Create `crates/mvm-security/` with `command_gate`, `threat_classifier`, `rate_limiter` (moved from `mvm-runtime/src/security/`)
-- [x] Re-export from `mvm-runtime::security` for backward compatibility (`pub use mvm_security::*`)
+- [x] Create `crates/mvm-security/` with `command_gate`, `threat_classifier`, `rate_limiter` (moved from `mvm/src/security/`)
+- [x] Re-export from `mvm::security` for backward compatibility (`pub use mvm_security::*`)
 - [x] Add `mvm-security` to root facade (`mvm::security`)
 - [x] Update `.github/workflows/publish-crates.yml` publish order (core → guest → security → build → runtime → cli)
-- [x] Remove `aho-corasick` and `regex` direct deps from mvm-runtime (now transitive via mvm-security)
+- [x] Remove `aho-corasick` and `regex` direct deps from mvm (now transitive via mvm-security)
 
 ### 10b: `VmBackend` Trait
 - [x] Create `mvm-core/src/vm_backend.rs` — `VmBackend` trait with associated `Config` type, `VmId`, `VmStatus`, `VmCapabilities`, `VmInfo` types
-- [x] Create `mvm-runtime/src/vm/backend.rs` — `FirecrackerBackend` implementing `VmBackend`, delegating to existing `microvm::*` and `firecracker::*` functions
-- [x] Tests (8 new): 6 mvm-core serde roundtrips + Display + defaults, 2 mvm-runtime backend name + capabilities
+- [x] Create `mvm/src/vm/backend.rs` — `FirecrackerBackend` implementing `VmBackend`, delegating to existing `microvm::*` and `firecracker::*` functions
+- [x] Tests (8 new): 6 mvm-core serde roundtrips + Display + defaults, 2 mvm backend name + capabilities
 
 ### 10c: Security Posture Scoring
 - [x] Add `SecurityLayer` enum (12 variants), `PostureCheck`, `PostureReport` types to `mvm-core/src/security.rs`
 - [x] Create `mvm-security/src/posture.rs` — `SecurityPosture` struct with `evaluate(checks, timestamp) -> PostureReport`, `uncovered_layers()`, `failed_checks()`, `passed_checks()`, `summary()` utilities
-- [x] Re-export `posture` from `mvm-runtime::security`
+- [x] Re-export `posture` from `mvm::security`
 - [x] Tests (17 new): 4 mvm-core posture type serde (layer count, layer roundtrip, check roundtrip, report roundtrip), 13 mvm-security posture evaluation (all-pass, mixed, all-fail, empty, uncovered layers, failed/passed filters, summary output, timestamp preservation, single check, layer tag coverage, all-covered)
 
 ### 10d: CLI — `mvm security status`

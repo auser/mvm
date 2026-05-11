@@ -155,7 +155,7 @@ require justification:
   `gnugrep`, `gawk`, `findutils`, `which`, `e2fsprogs`, `util-linux`.
 - **Justify or drop in builder variant**: `gnumake`, `git`, `curl`,
   `iproute2`, `iptables`, `jq`, `less`, `procps`. `iptables`+`jq` are
-  required by `mvm-runtime/src/vm/network.rs::bridge_ensure` only when
+  required by `mvm/src/vm/network.rs::bridge_ensure` only when
   the dev VM hosts transient microVMs (`mvmctl exec`); confirm whether
   the builder variant needs them or moves the bridge logic host-side.
 

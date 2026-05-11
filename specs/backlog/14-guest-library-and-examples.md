@@ -44,7 +44,7 @@ minimal Firecracker rootfs images from declarative Nix configurations.
 Added `mvmctl template build --snapshot` to create Firecracker snapshots at build time
 for instant VM restore (~200ms startup).
 
-- [x] `template_build_with_snapshot()` in `crates/mvm-runtime/src/vm/template/lifecycle.rs`
+- [x] `template_build_with_snapshot()` in `crates/mvm/src/vm/template/lifecycle.rs`
 - [x] Boot temporary VM from built artifacts
 - [x] `wait_for_healthy()` — vsock ping to guest agent
 - [x] `wait_for_integrations_healthy()` — per-service health checks

@@ -35,7 +35,7 @@ The mvm monorepo currently contains both a simple development tool (single-VM li
 **mvm-guest** — keep entire crate unchanged
 - Used by mvm-build for vsock builder agent protocol
 
-**mvm-runtime** — trim heavily
+**mvm** — trim heavily
 - **Keep:**
   - `shell.rs`, `shell_mock.rs` — command execution
   - `config.rs` — constants, Lima config, render helpers
@@ -86,7 +86,7 @@ mvmd/                          ← separate git repo
   src/lib.rs                   (facade re-exports)
   src/main.rs                  (entry: mvmd_cli::run())
   crates/
-    mvmd-runtime/              (orchestration modules from mvm-runtime)
+    mvmd-runtime/              (orchestration modules from mvm)
     mvmd-agent/                (was mvm-agent)
     mvmd-coordinator/          (was mvm-coordinator)
     mvmd-cli/                  (orchestration CLI commands)
@@ -100,7 +100,7 @@ mvm = { git = "https://github.com/auser/mvm" }
 ```
 Then in mvmd code: `use mvm::core::*`, `use mvm::runtime::*`, `use mvm::build::*`, `use mvm::guest::*`
 
-### mvmd-runtime contents (from mvm-runtime)
+### mvmd-runtime contents (from mvm)
 - `vm/bridge.rs`, `vm/disk_manager.rs`
 - `vm/instance/` — lifecycle, fc_config, net, disk, **snapshot** (save/restore for sleep/wake), health, parallel
 - `vm/pool/` — lifecycle, artifacts
@@ -154,7 +154,7 @@ pub trait BuildEnvironment: ShellEnvironment {
 
 Update `dev_build()` in mvm-build to accept `&dyn ShellEnvironment`.
 Keep `pool_build()`/`orchestrator` using `&dyn BuildEnvironment`.
-Update `RuntimeBuildEnv` in mvm-runtime to impl both traits.
+Update `RuntimeBuildEnv` in mvm to impl both traits.
 
 ### Step 2: Verify trait split
 Run `cargo build && cargo test` — all 374 tests pass. Pure refactor, no functional change.
@@ -173,15 +173,15 @@ git checkout -b refactor/simplify-mvm
 In `crates/mvm-cli/src/commands.rs`:
 - Remove command variants: `Tenant`, `Pool`, `Instance`, `Agent`, `Coordinator`, `DevCluster`, `Net`, `Node`, `Events`, `Add`, `New`, `Deploy`, `Connect`
 - Remove corresponding subcommand enums and handler functions
-- Remove imports: `bridge`, `pool`, `tenant` from `mvm_runtime::vm`
+- Remove imports: `bridge`, `pool`, `tenant` from `mvm::vm`
 - Delete `dev_cluster.rs`, `display.rs`, `http.rs`
 - Remove their `pub mod` declarations from `crates/mvm-cli/src/lib.rs`
 
-### Step 6: Trim mvm-runtime
-In `crates/mvm-runtime/src/vm/mod.rs`:
+### Step 6: Trim mvm
+In `crates/mvm/src/vm/mod.rs`:
 - Remove: `bridge`, `disk_manager`, `instance`, `pool`, `tenant` module declarations
 
-In `crates/mvm-runtime/src/lib.rs`:
+In `crates/mvm/src/lib.rs`:
 - Remove: `hostd`, `security`, `sleep`, `worker` module declarations
 
 Delete files/directories:
@@ -190,7 +190,7 @@ Delete files/directories:
 - `hostd/`, `security/`, `sleep/`, `worker/`
 
 Replace `RuntimeBuildEnv` in `build_env.rs` with `DevShellEnv` (only impl `ShellEnvironment`).
-Remove `mvm-hostd` binary from mvm-runtime `Cargo.toml`.
+Remove `mvm-hostd` binary from mvm `Cargo.toml`.
 Prune now-unused deps (ed25519-dalek, aes-gcm, zeroize, quinn, rcgen, rustls, etc.).
 
 ### Step 7: Trim root facade
@@ -263,7 +263,7 @@ mimalloc.workspace = true
 
 ### Step 11: Move orchestration code into mvmd crates
 
-**mvmd-runtime** (from mvm-runtime removed modules):
+**mvmd-runtime** (from mvm removed modules):
 - Copy `vm/bridge.rs`, `vm/disk_manager.rs` → `crates/mvmd-runtime/src/vm/`
 - Copy `vm/instance/` directory → `crates/mvmd-runtime/src/vm/instance/`
 - Copy `vm/pool/` directory → `crates/mvmd-runtime/src/vm/pool/`
@@ -293,9 +293,9 @@ mimalloc.workspace = true
 ### Step 12: Rewrite imports in mvmd
 All moved code needs import path updates:
 - `use mvm_core::` → `use mvm::core::`
-- `use mvm_runtime::shell` → `use mvm::runtime::shell`
-- `use mvm_runtime::config` → `use mvm::runtime::config`
-- `use mvm_runtime::ui` → `use mvm::runtime::ui`
+- `use mvm::shell` → `use mvm::runtime::shell`
+- `use mvm::config` → `use mvm::runtime::config`
+- `use mvm::ui` → `use mvm::runtime::ui`
 - `use mvm_build::` → `use mvm::build::`
 - `use mvm_guest::` → `use mvm::guest::`
 - `use crate::` stays for intra-crate refs within mvmd-runtime
@@ -335,4 +335,4 @@ cargo test
 2. **template_cmd.rs** may deeply reference orchestration build paths — needs careful inspection during Step 8.
 3. **Cross-repo version drift** — mitigated by `#[serde(default)]` on new fields (existing practice) and pinned git refs in mvmd.
 4. **display.rs** may have shared formatters — inspect before deleting; extract any dev-mode display helpers if needed.
-5. **mvm-runtime Cargo.toml cleanup** — many deps become unused after removing security/hostd. Must carefully prune.
+5. **mvm Cargo.toml cleanup** — many deps become unused after removing security/hostd. Must carefully prune.

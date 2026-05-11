@@ -14,7 +14,7 @@
 use anyhow::{Context, Result};
 use mvm_core::vm_backend::{VmId, VmStartConfig, VmVolume};
 use mvm_backend::backend::AnyBackend;
-use mvm_runtime::vsock_transport;
+use mvm::vsock_transport;
 use serde::Deserialize;
 use std::collections::BTreeMap;
 use std::path::Path;
@@ -466,10 +466,10 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
         match &req.image {
             ImageSource::Template(name) => {
                 let (spec, vmlinux, initrd, rootfs, rev) =
-                    mvm_runtime::vm::template::lifecycle::template_artifacts_dispatched(name)
+                    mvm::vm::template::lifecycle::template_artifacts_dispatched(name)
                         .with_context(|| format!("Loading template '{name}'"))?;
                 let snap =
-                    mvm_runtime::vm::template::lifecycle::template_snapshot_info_dispatched(name)
+                    mvm::vm::template::lifecycle::template_snapshot_info_dispatched(name)
                         .ok()
                         .flatten();
                 (
@@ -503,7 +503,7 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
     // Build read-only ext4 images for each --add-dir, staged in a transient
     // VMS subdirectory so cleanup is straightforward.
     let vm_name = transient_vm_name();
-    let staging_dir = format!("{}/{}/extras", mvm_runtime::config::VMS_DIR, vm_name);
+    let staging_dir = format!("{}/{}/extras", mvm::config::VMS_DIR, vm_name);
     let mut volumes: Vec<mvm_backend::image::RuntimeVolume> = Vec::new();
     let mut add_dir_labels: Vec<String> = Vec::new();
     for (idx, dir) in req.add_dirs.iter().enumerate() {
@@ -594,7 +594,7 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
     if !booted {
         ui::info(&format!("Booting transient VM '{vm_name}'..."));
         if let Err(e) = backend.start(&start_config) {
-            let _ = mvm_runtime::shell::run_in_vm(&format!("rm -rf {staging_dir}"));
+            let _ = mvm::shell::run_in_vm(&format!("rm -rf {staging_dir}"));
             return Err(e).context("starting transient microVM");
         }
     }
@@ -633,7 +633,7 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
         }
     }
 
-    let _ = mvm_runtime::shell::run_in_vm(&format!("rm -rf {staging_dir}"));
+    let _ = mvm::shell::run_in_vm(&format!("rm -rf {staging_dir}"));
 
     if interrupted.load(std::sync::atomic::Ordering::SeqCst) {
         anyhow::bail!("interrupted");
@@ -678,9 +678,9 @@ fn restore_via_snapshot(
         network_policy: mvm_core::network_policy::NetworkPolicy::default(),
     };
     let rev = if mvm_core::manifest::is_slot_hash_dirname(template_id) {
-        mvm_runtime::vm::template::lifecycle::current_revision_id_for_slot(template_id)?
+        mvm::vm::template::lifecycle::current_revision_id_for_slot(template_id)?
     } else {
-        mvm_runtime::vm::template::lifecycle::current_revision_id(template_id)?
+        mvm::vm::template::lifecycle::current_revision_id(template_id)?
     };
     let snap_dir = if mvm_core::manifest::is_slot_hash_dirname(template_id) {
         mvm_core::manifest::slot_snapshot_dir(template_id, &rev)
@@ -782,9 +782,9 @@ pub fn boot_session_vm(
     memory_mib: u32,
 ) -> Result<SessionVm> {
     let (spec, vmlinux, initrd, rootfs, rev) =
-        mvm_runtime::vm::template::lifecycle::template_artifacts_dispatched(env)
+        mvm::vm::template::lifecycle::template_artifacts_dispatched(env)
             .with_context(|| format!("Loading template '{env}'"))?;
-    let snap_info = mvm_runtime::vm::template::lifecycle::template_snapshot_info_dispatched(env)
+    let snap_info = mvm::vm::template::lifecycle::template_snapshot_info_dispatched(env)
         .ok()
         .flatten();
 

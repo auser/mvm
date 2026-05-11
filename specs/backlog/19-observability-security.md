@@ -104,7 +104,7 @@ After reading the code: `hex_decode` validation was already in place in `keystor
 
 ### 3.2 Wired into `RunInfo` load
 
-In `crates/mvm-runtime/src/vm/microvm.rs`:
+In `crates/mvm/src/vm/microvm.rs`:
 
 - [x] `RUN_INFO_SCHEMA_VERSION = 1` constant
 - [x] `RUN_INFO_MIGRATIONS: &[MigrateFn] = &[]` — empty for now, framework is live

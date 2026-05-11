@@ -1,6 +1,6 @@
 //! Vsock helpers for talking to the in-guest agent.
 //!
-//! Routes through `mvm_runtime::vsock_transport::AppleContainerTransport`
+//! Routes through `mvm::vsock_transport::AppleContainerTransport`
 //! intentionally — these helpers serve `mvmctl up` flows that today
 //! only target the Apple Container backend (Firecracker `up` uses a
 //! different code path). If/when a Firecracker `up` lands, swap to
@@ -8,7 +8,7 @@
 
 use anyhow::Result;
 
-use mvm_runtime::vsock_transport::{AppleContainerTransport, VsockTransport};
+use mvm::vsock_transport::{AppleContainerTransport, VsockTransport};
 
 /// Wait for the guest agent to respond to a Ping over vsock.
 /// Returns true if the agent is reachable within `timeout_secs`.

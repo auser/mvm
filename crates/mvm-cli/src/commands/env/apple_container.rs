@@ -5,7 +5,7 @@
 
 use anyhow::{Context, Result};
 
-use mvm_runtime::vsock_transport::{VsockProxyTransport, VsockTransport};
+use mvm::vsock_transport::{VsockProxyTransport, VsockTransport};
 
 use super::super::vm::console::console_interactive;
 use crate::ui;

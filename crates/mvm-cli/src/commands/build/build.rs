@@ -11,7 +11,7 @@ use mvm_core::manifest::{
 };
 use mvm_core::naming::validate_flake_ref;
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::vm::template::lifecycle as tmpl;
+use mvm::vm::template::lifecycle as tmpl;
 use mvm_backend::image;
 
 use super::Cli;
@@ -266,7 +266,7 @@ fn build_flake(
     validate_flake_ref(flake_ref)
         .with_context(|| format!("Invalid flake reference: {:?}", flake_ref))?;
 
-    let build_env = mvm_runtime::build_env::default_build_env();
+    let build_env = mvm::build_env::default_build_env();
     let env = build_env.as_ref();
 
 

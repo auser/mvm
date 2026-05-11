@@ -32,7 +32,7 @@ pub const SCHEMA_VERSION: u32 = 2;
 /// Typed contract for one workload's execution.
 ///
 /// Plan 37 §3.3. The fields here are the rubric — `enforce_*`
-/// in `mvm-runtime/src/enforce.rs` (Wave 1.5) walks the plan
+/// in `mvm/src/enforce.rs` (Wave 1.5) walks the plan
 /// field-by-field and rejects any plan that doesn't satisfy
 /// the corresponding §5 row.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

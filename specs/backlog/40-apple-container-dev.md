@@ -128,7 +128,7 @@ and doesn't compile on Linux. Production always uses Firecracker + KVM.
 
 ## Phase 3: AppleContainerEnv ✓
 
-- [x] `AppleContainerEnv` struct in `crates/mvm-runtime/src/linux_env.rs`
+- [x] `AppleContainerEnv` struct in `crates/mvm/src/linux_env.rs`
 - [x] Implements `LinuxEnv` trait via vsock `GuestRequest::Exec`
 - [x] `run()`, `run_visible()`, `run_stdout()`, `run_capture()` — all routed through vsock
 - [x] `exec_via_vsock()` — connects to guest agent, sends Exec request, returns `Output`
@@ -168,9 +168,9 @@ and doesn't compile on Linux. Production always uses Firecracker + KVM.
 |------|---------|
 | `crates/mvm-core/src/platform.rs` | `needs_lima()` conditional on `has_apple_containers()` |
 | `crates/mvm-cli/src/commands.rs` | Dev command routing for Apple Container |
-| `crates/mvm-runtime/src/linux_env.rs` | New `AppleContainerEnv` struct |
+| `crates/mvm/src/linux_env.rs` | New `AppleContainerEnv` struct |
 | `crates/mvm-apple-container/src/macos.rs` | Shared directory support |
-| `crates/mvm-runtime/src/build_env.rs` | Build env selection |
+| `crates/mvm/src/build_env.rs` | Build env selection |
 | `nix/dev-image/flake.nix` | New: dev environment rootfs flake |
 
 ---

@@ -223,7 +223,7 @@ never on the read path that matters.
 
 **Why this matters**
 
-The W3 implementation (`crates/mvm-runtime/src/vm/microvm.rs::configure_flake_microvm_with_drives_dir`)
+The W3 implementation (`crates/mvm/src/vm/microvm.rs::configure_flake_microvm_with_drives_dir`)
 sets `boot_args = "root=/dev/dm-0 ro rootwait init=/init {dm_create} {base_args}"`
 when verity is on. The Apple Container path (`crates/mvm-apple-container/src/macos.rs`)
 does the analogous thing. Both share the same defect: Firecracker's

@@ -63,7 +63,7 @@ tiers, each catching a class of attack the lower one can't:
 
 ### L3 — iptables allowlist (v1 — shipped)
 
-Already in `mvm-runtime/src/vm/network.rs::apply_network_policy`.
+Already in `mvm/src/vm/network.rs::apply_network_policy`.
 At TAP attach time, install `FORWARD` rules in the bridge chain that:
 
 - `DROP` all packets from the guest IP by default.
@@ -87,7 +87,7 @@ by SNI for HTTPS (CONNECT) and Host header for HTTP. CONNECT to a
 disallowed domain returns 403.
 
 **Implementation cost:** wraps `mitmdump` from nixpkgs (~50 LoC of
-process supervision in mvm-runtime); needs CA injection at boot
+process supervision in mvm); needs CA injection at boot
 inside the rootfs; needs per-VM port allocation; needs cleanup on
 crash.
 
@@ -196,6 +196,6 @@ is small but the IP-pin/iptables-update plumbing has corner cases
 - Related ADRs: ADR-002 (microVM security posture), ADR-003 (local
   MCP server)
 - Existing infrastructure: `mvm-core::policy::network_policy`,
-  `mvm-runtime::vm::network::{apply,cleanup}_network_policy`
+  `mvm::vm::network::{apply,cleanup}_network_policy`
 - L7 inspiration: archie-judd/agent-sandbox.nix's domain allowlist
   proxy pattern

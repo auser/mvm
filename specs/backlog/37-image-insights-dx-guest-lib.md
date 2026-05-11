@@ -167,7 +167,7 @@ cargo clippy --workspace -- -D warnings  # zero warnings
 | `crates/mvm-build/src/dev_build.rs` | Size capture, `DevBuildResult.artifact_sizes` |
 | `crates/mvm-build/src/orchestrator.rs` | `sizes: None` compat |
 | `crates/mvm-build/tests/pipeline.rs` | `sizes: None` compat |
-| `crates/mvm-runtime/src/vm/template/lifecycle.rs` | Store sizes, `template_load_current_revision()` |
+| `crates/mvm/src/vm/template/lifecycle.rs` | Store sizes, `template_load_current_revision()` |
 | `crates/mvm-cli/src/template_cmd.rs` | Enrich `info()`, python preset |
 | `crates/mvm-cli/src/commands.rs` | 5 new `with_hints()` patterns |
 | `crates/mvm-cli/src/doctor.rs` | Nix store size check |

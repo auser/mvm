@@ -51,13 +51,13 @@
 //! review can't catch.
 
 use anyhow::{Context, Result};
-use mvm_runtime_base::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
+use mvm_base::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
 
 /// Resolve the CH per-VM directory inside `VMS_DIR`. Same shape as
 /// FC's `microvm::resolve_vm_dir` so `mvmctl ls` and friends can
 /// walk a single directory and see both backend families.
 pub(crate) fn ch_vm_dir(name: &str) -> Result<String> {
-    let raw = format!("{}/{}", mvm_runtime_base::config::VMS_DIR, name);
+    let raw = format!("{}/{}", mvm_base::config::VMS_DIR, name);
     // `~/microvm/vms/<name>` resolves against the shell that runs
     // it; surface the absolute path via the same trick `microvm.rs`
     // uses (echo it through `run_in_vm_stdout`).
@@ -276,7 +276,7 @@ pub(crate) fn reap(abs_dir: &str) -> Result<()> {
 pub(crate) fn list_ch_vms() -> Result<Vec<String>> {
     let abs_vms = run_in_vm_stdout(&format!(
         "echo {}",
-        mvm_runtime_base::config::VMS_DIR
+        mvm_base::config::VMS_DIR
     ))?;
     let abs_vms = abs_vms.trim();
     let listing = run_in_vm_stdout(&format!(

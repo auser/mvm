@@ -6,7 +6,7 @@ OpenClaw runs AI agents inside Firecracker microVMs managed by mvm. The current 
 
 SafeClaw and the Field Manual are **reference material only** — no integration with SafeClaw. All security improvements are native Rust, implemented in mvm's existing crate structure.
 
-**Scope:** All 5 phases. Type and protocol changes in mvm (mvm-core, mvm-guest). Runtime security modules in mvm-runtime (reusable by mvmd as a dependency). mvmd-specific integration (QUIC approval flow, fleet-wide session management) is a follow-up after the mvm-side work lands.
+**Scope:** All 5 phases. Type and protocol changes in mvm (mvm-core, mvm-guest). Runtime security modules in mvm (reusable by mvmd as a dependency). mvmd-specific integration (QUIC approval flow, fleet-wide session management) is a follow-up after the mvm-side work lands.
 
 **Research:** See [specs/research/openclaw-security.md](../research/openclaw-security.md) for the full analysis of the OpenClaw Field Manual, SafeClaw codebase, and current mvm security gaps.
 
@@ -16,13 +16,13 @@ SafeClaw and the Field Manual are **reference material only** — no integration
 
 | What | Where | Used In |
 |------|-------|---------|
-| Ed25519 signing/verification | `crates/mvm-runtime/src/security/signing.rs` | Phase 1 (vsock auth) |
+| Ed25519 signing/verification | `crates/mvm/src/security/signing.rs` | Phase 1 (vsock auth) |
 | `SignedPayload` type | `crates/mvm-core/src/signing.rs` | Phase 1 (frame envelope) |
-| Audit log (append-only JSON, rotation) | `crates/mvm-runtime/src/security/audit.rs` | Phase 3 (extend) |
+| Audit log (append-only JSON, rotation) | `crates/mvm/src/security/audit.rs` | Phase 3 (extend) |
 | `AuditAction` + `AuditEntry` types | `crates/mvm-core/src/audit.rs` | Phase 3 (add variants) |
 | Secrets drive (ro, noexec) | `nix/openclaw/guests/baseline.nix` | Phase 1 (session keys) |
 | Config drive (ro) | `nix/openclaw/guests/baseline.nix` | Phase 5 (immutable policy) |
-| Jailer, cgroups, seccomp | `crates/mvm-runtime/src/security/` | Phase 5 (posture checks) |
+| Jailer, cgroups, seccomp | `crates/mvm/src/security/` | Phase 5 (posture checks) |
 | Vsock protocol (`read_frame`/`write_frame`) | `crates/mvm-guest/src/vsock.rs` | Phase 1 (wrap with auth) |
 
 ---
@@ -51,7 +51,7 @@ SafeClaw and the Field Manual are **reference material only** — no integration
 - MODIFY: `crates/mvm-core/src/lib.rs` (add `pub mod security`)
 - MODIFY: `crates/mvm-guest/src/vsock.rs` (authenticated wrappers)
 - MODIFY: `crates/mvm-guest/Cargo.toml` (add `ed25519-dalek`)
-- MODIFY: `crates/mvm-runtime/src/security/signing.rs` (session key generation)
+- MODIFY: `crates/mvm/src/security/signing.rs` (session key generation)
 
 **Tests:** Frame signing roundtrip, serde roundtrip, challenge-response handshake via mock UnixStream, tampered frame rejection, replay detection via sequence numbers.
 
@@ -66,7 +66,7 @@ SafeClaw and the Field Manual are **reference material only** — no integration
 - `ApprovalVerdict` — Approved / Denied { reason } / Timeout
 - `BlocklistEntry` — pattern (literal or glob), category, severity, action (Block/RequireApproval/Log)
 
-**New module `mvm-runtime/src/security/command_gate.rs`:**
+**New module `mvm/src/security/command_gate.rs`:**
 - Receives vsock frames, extracts command text
 - Matches against blocklist using Aho-Corasick (literals) + glob matching (wildcards like `rm -rf *`)
 - Non-match: allow. Match with Block action: reject immediately. Match with RequireApproval: hold up to 10 min
@@ -79,8 +79,8 @@ SafeClaw and the Field Manual are **reference material only** — no integration
 - Reject when `access.build == false`
 
 **Files:**
-- NEW: `crates/mvm-runtime/src/security/command_gate.rs`
-- MODIFY: `crates/mvm-runtime/src/security/mod.rs`
+- NEW: `crates/mvm/src/security/command_gate.rs`
+- MODIFY: `crates/mvm/src/security/mod.rs`
 - MODIFY: `crates/mvm-core/src/security.rs` (gate types)
 - MODIFY: `crates/mvm-guest/src/bin/mvm-builder-agent.rs` (validation)
 
@@ -97,7 +97,7 @@ SafeClaw and the Field Manual are **reference material only** — no integration
 - `ThreatFinding` — category, pattern_id, severity, matched_text, context
 - `Severity` enum — Critical, High, Medium, Low, Info
 
-**New module `mvm-runtime/src/security/threat_classifier.rs`:**
+**New module `mvm/src/security/threat_classifier.rs`:**
 
 Three-tier detection approach (minimize regex, maximize performance):
 
@@ -159,11 +159,11 @@ impl ThreatClassifier {
 - Add `AuditAction` variants: `VsockSessionStarted`, `VsockSessionEnded`, `VsockFrameReceived`, `CommandBlocked`, `CommandApproved`, `CommandDenied`, `ThreatDetected`, `RateLimitExceeded`, `SessionRecycled`
 
 **Files:**
-- NEW: `crates/mvm-runtime/src/security/threat_classifier.rs`
-- MODIFY: `crates/mvm-runtime/Cargo.toml` (add `aho-corasick`)
+- NEW: `crates/mvm/src/security/threat_classifier.rs`
+- MODIFY: `crates/mvm/Cargo.toml` (add `aho-corasick`)
 - MODIFY: `crates/mvm-core/src/security.rs` (threat types)
 - MODIFY: `crates/mvm-core/src/audit.rs` (extend AuditEntry + new actions)
-- MODIFY: `crates/mvm-runtime/src/security/audit.rs` (emit extended events)
+- MODIFY: `crates/mvm/src/security/audit.rs` (emit extended events)
 
 **Tests:** Known-bad pattern classification per category, benign message produces no findings, AuditEntry backward compat, performance benchmark (<10ms for 1000 frames — Aho-Corasick is O(n)).
 
@@ -173,7 +173,7 @@ impl ThreatClassifier {
 
 **Goal:** Host-side periodic vsock Ping with kill/restart on timeout. VM session recycling. Frame rate limiting.
 
-**New modules in `mvm-runtime/src/security/`:**
+**New modules in `mvm/src/security/`:**
 
 `health_monitor.rs`:
 - Periodic Ping via vsock, configurable interval
@@ -192,10 +192,10 @@ impl ThreatClassifier {
 - Exceeded frames are dropped + audit event (soft defense, no VM kill)
 
 **Files:**
-- NEW: `crates/mvm-runtime/src/security/health_monitor.rs`
-- NEW: `crates/mvm-runtime/src/security/session_manager.rs`
-- NEW: `crates/mvm-runtime/src/security/rate_limiter.rs`
-- MODIFY: `crates/mvm-runtime/src/security/mod.rs`
+- NEW: `crates/mvm/src/security/health_monitor.rs`
+- NEW: `crates/mvm/src/security/session_manager.rs`
+- NEW: `crates/mvm/src/security/rate_limiter.rs`
+- MODIFY: `crates/mvm/src/security/mod.rs`
 - MODIFY: `crates/mvm-core/src/security.rs` (session + rate limit types)
 
 **Tests:** Rate limiter allows/blocks correctly, session expiry triggers recycle, 3 consecutive ping failures triggers kill.
@@ -206,7 +206,7 @@ impl ThreatClassifier {
 
 **Goal:** Multi-layer health scoring for VM security configuration. Config drive integrity verification.
 
-**New module `mvm-runtime/src/security/posture.rs`:**
+**New module `mvm/src/security/posture.rs`:**
 - 12 security layers: JailerIsolation, CgroupLimits, SeccompFilter, NetworkIsolation, VsockAuth, EncryptionAtRest, EncryptionInTransit, AuditLogging, SecretManagement, ConfigImmutability, GuestHardening, SupplyChainIntegrity
 - Each layer has multiple checks -> `PostureCheck { name, score, status, detail }`
 - Overall score = `passed_checks / total_checks * 100`
@@ -219,7 +219,7 @@ impl ThreatClassifier {
 **CLI integration:** `mvm security status` or extend `mvm doctor --security`
 
 **Files:**
-- NEW: `crates/mvm-runtime/src/security/posture.rs`
+- NEW: `crates/mvm/src/security/posture.rs`
 - MODIFY: `crates/mvm-cli/src/commands.rs` (security status command)
 - MODIFY: `crates/mvm-core/src/security.rs` (posture types)
 
@@ -259,7 +259,7 @@ After each phase:
 
 ## mvmd Impact
 
-All work happens in the mvm repo first. mvmd consumes mvm-core and mvm-guest as dependencies, so type and protocol changes propagate automatically. The runtime security modules (threat classifier, rate limiter, posture checks) live in mvm-runtime and can be consumed by mvmd-runtime as a crate dependency — no code duplication.
+All work happens in the mvm repo first. mvmd consumes mvm-core and mvm-guest as dependencies, so type and protocol changes propagate automatically. The runtime security modules (threat classifier, rate limiter, posture checks) live in mvm and can be consumed by mvmd-runtime as a crate dependency — no code duplication.
 
 mvmd-specific follow-up work (separate from this plan):
 - Phase 2: coordinator provides approve/deny verdicts via QUIC

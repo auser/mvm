@@ -6,7 +6,7 @@ use clap::Args as ClapArgs;
 
 use mvm_core::manifest::{canonical_key_for_path, resolve_manifest_config_path};
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::vm::template::lifecycle as tmpl;
+use mvm::vm::template::lifecycle as tmpl;
 
 use super::super::Cli;
 

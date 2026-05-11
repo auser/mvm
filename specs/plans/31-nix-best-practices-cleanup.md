@@ -130,9 +130,9 @@ Fixes (folded into the phases below):
 
 | Rule | Current |
 |---|---|
-| Don't auto-create `/var/lib/mvm` | Currently created by `mvm-runtime`/Rust, not from `nix develop`. ✅ |
+| Don't auto-create `/var/lib/mvm` | Currently created by `mvm`/Rust, not from `nix develop`. ✅ |
 | Don't change `/dev/kvm` perms automatically | Compliant (Justfile + ops manuals). ✅ |
-| `ops/{bootstrap,systemd,networking,permissions}/` | Directory does **not exist**. Host setup lives in `Justfile`, `scripts/`, and per-platform Rust code in `crates/mvm-runtime/src/vm/network.rs`. ❌ |
+| `ops/{bootstrap,systemd,networking,permissions}/` | Directory does **not exist**. Host setup lives in `Justfile`, `scripts/`, and per-platform Rust code in `crates/mvm/src/vm/network.rs`. ❌ |
 
 ### Recommended Repo Layout
 
@@ -364,7 +364,7 @@ ops/
 │   └── kvm-access.sh       (one-shot: add user to kvm group on Linux; warn-only on macOS)
 ├── networking/
 │   ├── README.md
-│   └── bridge-setup.sh     (extracted from mvm-runtime/src/vm/network.rs scripted bits if applicable, otherwise documents how `mvmctl` does it)
+│   └── bridge-setup.sh     (extracted from mvm/src/vm/network.rs scripted bits if applicable, otherwise documents how `mvmctl` does it)
 └── systemd/
     └── README.md           (placeholder; mvmd's territory)
 ```
@@ -409,7 +409,7 @@ This is the largest scope change and is best done as its own PR after Phases 1-4
 | 3 (extension) | New `apps.${system}.dev` wrapper (calls `mvmctl dev up`) |
 | 3 (extension) | `.githooks/pre-commit` — add `nix fmt --check` step |
 | 3 (extension) | New `treefmt.toml` (rust + nix + sh + md) |
-| **Phase 1.5 (M)** | Lima VM rename `mvm` → `mvm-builder` across `crates/mvm-runtime/src/vm/lima.rs`, `crates/mvm-runtime/src/vm/network.rs`, `crates/mvm-cli/src/commands/env/dev.rs`, `crates/mvm-cli/src/bootstrap.rs`, `resources/lima.yaml.tera`, `Justfile`, `CLAUDE.md`, memory entries |
+| **Phase 1.5 (M)** | Lima VM rename `mvm` → `mvm-builder` across `crates/mvm/src/vm/lima.rs`, `crates/mvm/src/vm/network.rs`, `crates/mvm-cli/src/commands/env/dev.rs`, `crates/mvm-cli/src/bootstrap.rs`, `resources/lima.yaml.tera`, `Justfile`, `CLAUDE.md`, memory entries |
 | **Phase 1.5 (M)** | Migration UX: detect legacy `mvm` Lima VM on first run, print one-line manual migration command — no auto-rename |
 | **Phase 3a (N)** | Replace `mkNodeService`'s 3-stage FOD-then-patch pattern with `pkgs.buildNpmPackage`. Eliminates `chmod -R u+w` calls in `nix/flake.nix:271,297,307` |
 | **Phase 1 (O)** | Delete `nix/examples/paperclip/` and `nix/examples/openclaw/`. Remove their memory entries from `MEMORY.md` |
@@ -517,7 +517,7 @@ Each gets a header comment listing what host state it changes and why elevated p
 ### `mvmctl` host mutation (network.rs / TAP+bridge+iptables) — **resolved: lenient reading**
 
 `mvmctl dev up` and `mvmctl run` continue to invoke
-`crates/mvm-runtime/src/vm/network.rs` to set up the Linux bridge
+`crates/mvm/src/vm/network.rs` to set up the Linux bridge
 (`br-mvm`), TAP interfaces, and iptables NAT rules.
 
 Decision rationale: the guide's hard rule targets Nix *entry points*
@@ -553,8 +553,8 @@ Files touched (audit):
 
 | File | Change |
 |---|---|
-| `crates/mvm-runtime/src/vm/lima.rs` | All literal `"mvm"` references for the VM name → `"mvm-builder"` |
-| `crates/mvm-runtime/src/vm/network.rs` | `run_on_vm("mvm", ...)` calls → `"mvm-builder"` |
+| `crates/mvm/src/vm/lima.rs` | All literal `"mvm"` references for the VM name → `"mvm-builder"` |
+| `crates/mvm/src/vm/network.rs` | `run_on_vm("mvm", ...)` calls → `"mvm-builder"` |
 | `crates/mvm-cli/src/commands/env/dev.rs` | Status/help strings, lifecycle calls |
 | `crates/mvm-cli/src/bootstrap.rs` | First-run setup |
 | `resources/lima.yaml.tera` | If the template embeds the VM name |

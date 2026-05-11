@@ -1,5 +1,5 @@
 [package]
-name = "mvm-runtime"
+name = "mvm"
 version.workspace = true
 edition.workspace = true
 description = "Shell execution and VM lifecycle for mvm"
@@ -15,7 +15,7 @@ mvm-security.workspace = true
 mvm-guest.workspace = true
 mvm-build.workspace = true
 mvm-backend.workspace = true
-mvm-runtime-base.workspace = true
+mvm-base.workspace = true
 anyhow.workspace = true
 base64.workspace = true
 colored.workspace = true

@@ -12,7 +12,7 @@ Plan 53 (cross-platform roadmap) considered replacing our shell-out-to-the-`fire
 
 rust-vmm is a collection of Rust crates (`kvm-ioctls`, `vm-memory`, `virtio-queue`, `vhost`, `linux-loader`, `vfio-ioctls`, `vm-superio`, etc.) that VMMs are built from. Firecracker, Cloud Hypervisor, libkrun, crosvm, and Dragonball all share these crates. An improvement to `vm-memory` (e.g. Kani formal verification, IOMMU support, guest_memfd) benefits all of them simultaneously.
 
-"Internalization" would mean: instead of `mvm-runtime` shell-out-and-talk-to-the-`firecracker`-binary, we'd link rust-vmm crates directly into mvmctl and *be* a VMM.
+"Internalization" would mean: instead of `mvm` shell-out-and-talk-to-the-`firecracker`-binary, we'd link rust-vmm crates directly into mvmctl and *be* a VMM.
 
 ## Why we rejected it for now
 

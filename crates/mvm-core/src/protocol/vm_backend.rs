@@ -421,7 +421,7 @@ pub struct VmInfo {
 /// *what* to run; each backend translates it into backend-specific actions.
 ///
 /// This trait lives in `mvm-core` so it has no runtime dependencies.
-/// Implementations live in `mvm-runtime` (Firecracker, Apple Container)
+/// Implementations live in `mvm` (Firecracker, Apple Container)
 /// or future crates (Docker).
 ///
 /// # Examples

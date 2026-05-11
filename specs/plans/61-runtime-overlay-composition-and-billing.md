@@ -75,11 +75,11 @@ Decisions captured in the ADRs:
 This phase implements ADR-040. The runtime emits events; mvmd aggregates and bills.
 
 - New module `crates/mvm-core/src/usage.rs`: defines the canonical event schema (see ADR-040 for full enumeration). Types are `#[serde(deny_unknown_fields)]`.
-- New module `crates/mvm-runtime/src/usage/recorder.rs`: writes JSONL events to `~/.mvm/usage/<vm-id>/events.jsonl`. Append-only, durable, fsync on flush boundary.
-- Lifecycle hook integration in `crates/mvm-runtime/src/vm/instance/lifecycle.rs`: emit `Started`, `Stopped`, `Paused`, `Resumed`, `DiskAttached`, `DiskDetached`.
+- New module `crates/mvm/src/usage/recorder.rs`: writes JSONL events to `~/.mvm/usage/<vm-id>/events.jsonl`. Append-only, durable, fsync on flush boundary.
+- Lifecycle hook integration in `crates/mvm/src/vm/instance/lifecycle.rs`: emit `Started`, `Stopped`, `Paused`, `Resumed`, `DiskAttached`, `DiskDetached`.
 - Periodic resource sampler: every 10 s while running, emit `ResourceSample { vcpu_s, rss_bytes, disk_bytes_read, disk_bytes_written, net_bytes_in, net_bytes_out }`. Sampling source: provider-specific (apple-container exposes via Virtualization framework stats; libkrun via `krun_get_stats` or proc-side polling of the host VMM process).
 - Build minute accounting: `crates/mvm-build/src/dev_build.rs` emits `BuildStarted` / `BuildFinished` with elapsed wall-clock and the workspace ID it built for.
-- Caps enforcement: `crates/mvm-runtime/src/vm/instance/caps.rs` reads `~/.mvm/caps.json` (populated by mvmd in fleet mode; user-editable in dev). Enforces:
+- Caps enforcement: `crates/mvm/src/vm/instance/caps.rs` reads `~/.mvm/caps.json` (populated by mvmd in fleet mode; user-editable in dev). Enforces:
   - `max_session_duration_secs` — VM is force-stopped on expiry; emits `LimitHit { kind: Duration }`.
   - `max_concurrent_per_tenant` — `start` returns `Error::QuotaExceeded` and emits `LimitHit { kind: Concurrent }`.
   - `max_vcpu_per_vm`, `max_ram_mib_per_vm` — `start_with_config` rejects oversize.
@@ -99,7 +99,7 @@ This phase implements ADR-040. The runtime emits events; mvmd aggregates and bil
 - `crates/mvm-cli/src/commands/env/apple_container.rs` — `ensure_dev_image`, W5.1 verifier usage, launchd install.
 - `crates/mvm-providers/src/{apple_container,libkrun}/mod.rs` — provider scaffolds.
 - `crates/mvm-core/src/protocol/vm_backend.rs` — `StartMode`, `VmStartConfig`.
-- `crates/mvm-runtime/src/vm/tenant/quota.rs` — existing `TenantUsage` / `TenantQuota` (overlap with new metering — see Compatibility).
+- `crates/mvm/src/vm/tenant/quota.rs` — existing `TenantUsage` / `TenantQuota` (overlap with new metering — see Compatibility).
 - `specs/plans/{25,26,27}-*.md` — security floor (must remain intact).
 - `specs/plans/45-filesystem-volumes.md` — prior sandbox-runtime feature parity work; reuse where it overlaps with billing dims.
 
@@ -107,7 +107,7 @@ This phase implements ADR-040. The runtime emits events; mvmd aggregates and bil
 
 ## Compatibility notes
 
-- `TenantUsage` / `TenantQuota` in `mvm-core::tenant` and `mvm-runtime::vm::tenant::quota` are **fleet-level rollups** (Postgres-backed in mvmd). The new `usage` module in this plan is the **per-VM event stream** that feeds those rollups. They do not conflict; the rollups become consumers of the JSONL stream.
+- `TenantUsage` / `TenantQuota` in `mvm-core::tenant` and `mvm::vm::tenant::quota` are **fleet-level rollups** (Postgres-backed in mvmd). The new `usage` module in this plan is the **per-VM event stream** that feeds those rollups. They do not conflict; the rollups become consumers of the JSONL stream.
 - mvmd's `BuildEnvironment` impl in `mvmd-runtime` keeps working; `BuildStarted` / `BuildFinished` are emitted via the existing `record_revision` hook point.
 
 ## Verification

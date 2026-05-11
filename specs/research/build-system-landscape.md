@@ -227,7 +227,7 @@ fundamentally incompatible with mvm's model:
 - **No multi-pool** — single image per workload, not composable
 
 The legacy `mvm build` (Mvmfile.toml → bake ELF) path still exists in
-`crates/mvm-runtime/src/vm/image.rs` but is superseded by `mvm pool build` for production.
+`crates/mvm/src/vm/image.rs` but is superseded by `mvm pool build` for production.
 
 ---
 

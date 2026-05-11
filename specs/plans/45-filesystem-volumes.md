@@ -252,8 +252,8 @@ pub struct ObjectStoreSpec {
 - Host directory at `~/.mvm/volumes/<name>/`, mode 0700.
 - Registry at `~/.mvm/volumes/registry.json`, mode 0700 (matches W1.5 posture).
 - Commands: `mvmctl volume create <name> [--size <bytes>]`, `volume ls`, `volume rm <name> [--force]`.
-- Implementation: new `crates/mvm-runtime/src/vm/volume_registry.rs`.
-- **Replaces** the in-flight share registry. Delete `crates/mvm-runtime/src/vm/share_registry.rs`, `crates/mvm-cli/src/commands/vm/share.rs`, `crates/mvm-guest/src/share.rs` — fold their virtiofsd-spawn logic into the volume path.
+- Implementation: new `crates/mvm/src/vm/volume_registry.rs`.
+- **Replaces** the in-flight share registry. Delete `crates/mvm/src/vm/share_registry.rs`, `crates/mvm-cli/src/commands/vm/share.rs`, `crates/mvm-guest/src/share.rs` — fold their virtiofsd-spawn logic into the volume path.
 
 **W-DataPlane — local file ops + remote proxy.**
 - For local volumes: devs can `cp` directly to `~/.mvm/volumes/<name>/` on the host filesystem. v1 mvm CLI does not ship a separate data-plane subcommand (`cp`/`read`/`write`) for `LocalBackend` — the host FS is the data plane.
@@ -795,9 +795,9 @@ Items B1–B18 should be re-evaluated each sprint. When picking one up, capture 
 - `crates/mvm-core/src/lib.rs` — re-export new volume module.
 - `crates/mvm-core/src/volume.rs` — **new**: `OrgId`, `WorkspaceId`, `Volume`, `VolumeMount`, `VolumeName`, `VolumePath`, `VolumeEntry`, `VolumeError`, `VolumeBackendConfig`, `ObjectStoreSpec`, `WrappedKey`.
 - `crates/mvm-cli/src/config.rs` — extend `~/.mvm/config.toml` schema with `[scope] org` / `workspace` defaults (`local` / `default`).
-- `crates/mvm-runtime/Cargo.toml` — depend on `mvm-storage`.
-- `crates/mvm-runtime/src/vm/volume_registry.rs` — **new**: persistence, lifecycle, virtiofsd spawn (uses `backend.local_export_path()`).
-- `crates/mvm-runtime/src/vm/mod.rs` — wire up new module.
+- `crates/mvm/Cargo.toml` — depend on `mvm-storage`.
+- `crates/mvm/src/vm/volume_registry.rs` — **new**: persistence, lifecycle, virtiofsd spawn (uses `backend.local_export_path()`).
+- `crates/mvm/src/vm/mod.rs` — wire up new module.
 - `crates/mvm-cli/src/commands/vm/volume.rs` — **new**: CLI subcommand with `--backend {local,object-store}` and provider flags.
 - `crates/mvm-cli/src/commands/doctor.rs` — extend with FDE check (FileVault on macOS, LUKS on Linux).
 - `crates/mvm-cli/src/commands/vm/mod.rs` — register `volume` subcommand.
@@ -812,7 +812,7 @@ Items B1–B18 should be re-evaluated each sprint. When picking one up, capture 
 
 **mvm — delete (committed code from PR #87 "feat(sandbox-sdk): foundation"):**
 - `crates/mvm-cli/src/commands/vm/share.rs` (~197 LoC) — also remove `Commands::Share` registration in `crates/mvm-cli/src/commands/mod.rs` (lines 147 + 257).
-- `crates/mvm-runtime/src/vm/share_registry.rs` (~269 LoC) — also remove `pub mod share_registry;` from `crates/mvm-runtime/src/vm/mod.rs:15`.
+- `crates/mvm/src/vm/share_registry.rs` (~269 LoC) — also remove `pub mod share_registry;` from `crates/mvm/src/vm/mod.rs:15`.
 - `crates/mvm-guest/src/share.rs` (~390 LoC).
 - vsock `GuestRequest::MountShare` / `GuestRequest::UnmountShare` variants and their `ShareResult` response (`crates/mvm-guest/src/vsock.rs:332-342, 449-463, 1804-1809, 2116-2117`).
 - `crates/mvm-guest/src/bin/mvm-guest-agent.rs:1747-1755` agent-side dispatch.
@@ -844,7 +844,7 @@ These are committed via PR #87 (commit `c022a74`) on `feat/sprites-and-upstream-
    - **Trait contract tests** in `mvm-storage`: a generic `assert_backend_contract<B: VolumeBackend>(b)` test fixture (put → get round-trip; list → entries; rename → both keys reflect; delete → not-found; concurrent put/get).
    - Run the contract suite against `LocalBackend` and against `ObjectStoreBackend` with `InMemory` (`memory://`) for fast CI; against `LocalFileSystem` (`file://`) for FS-path coverage.
    - Mount-eligibility: `LocalBackend.local_export_path()` is `Some`; `ObjectStoreBackend.local_export_path()` is `None`; mount API returns clear error for the latter.
-2. **Live KVM smoke** (extend existing W3 fixture at `crates/mvm-runtime/src/vm/template/lifecycle.rs` and the plan-41 W3 fixture):
+2. **Live KVM smoke** (extend existing W3 fixture at `crates/mvm/src/vm/template/lifecycle.rs` and the plan-41 W3 fixture):
    - Boot dev VM with `--volume scratch:/mnt/scratch`; from inside guest, write `/mnt/scratch/file.txt`.
    - Tear down VM; reboot fresh VM; reattach `scratch`; verify file persists.
    - Boot a *second* VM mounting the same `scratch`; verify it sees the file (multi-attach proof).
@@ -893,7 +893,7 @@ These are committed via PR #87 (commit `c022a74`) on `feat/sprites-and-upstream-
 **mvm Sprint 46 (this plan):**
 1. **mvm-core types** (`OrgId`, `WorkspaceId`, `Volume`, `VolumeName`, `VolumeBackendConfig`, `ObjectStoreSpec`, `WrappedKey`, …) + serde roundtrip tests. Shared wire format with mvmd.
 2. **`mvm-storage` crate**: `VolumeBackend` trait + `LocalBackend` impl + generic contract test suite. Minimal deps.
-3. mvm-runtime: `volume_registry.rs` replacing `share_registry.rs`; virtiofsd spawn helper.
+3. mvm: `volume_registry.rs` replacing `share_registry.rs`; virtiofsd spawn helper.
 4. mvm-cli: `volume create|ls|rm` subcommands (local only); `mvmctl up --volume` flag; `mvmd_client` module for `--remote` proxy.
 5. mvm-guest: `MountVolume`/`UnmountVolume` vsock verbs + agent handler; replace `share` module; fuzz seeds.
 6. mvm-security: `VolumeNamePolicy` + `MountPathPolicy` extension for `/nix*` paths.

@@ -48,13 +48,13 @@ The binary was renamed from `mvm` to `mvmctl` but 20+ user-facing messages still
 - [x] `crates/mvm-cli/src/commands.rs` — "mvm up --flake" → "mvmctl up --flake"
 - [x] `crates/mvm-cli/src/bootstrap.rs` — "mvm bootstrap" → "mvmctl bootstrap"
 - [x] `crates/mvm-cli/src/ui.rs` — "mvm status" header → "mvmctl status"
-- [x] `crates/mvm-runtime/src/ui.rs` — "mvm status" header → "mvmctl status"
-- [x] `crates/mvm-runtime/src/vm/lima.rs` — "Run 'mvm start' or 'mvm setup'" → "mvmctl"
-- [x] `crates/mvm-runtime/src/vm/lima_state.rs` — "Run 'mvm setup' or 'mvm bootstrap'" → "mvmctl"
-- [x] `crates/mvm-runtime/src/vm/microvm.rs` — All "Use 'mvm stop/start/status/shell'" → "mvmctl" (8 instances)
-- [x] `crates/mvm-runtime/src/vm/image.rs` — "Run 'mvm setup'" → "mvmctl setup"
-- [x] `crates/mvm-runtime/src/vm/instance/lifecycle.rs` — "Run 'mvm pool build'" → "mvmctl pool build"
-- [x] `crates/mvm-runtime/src/security/certs.rs` — "Run 'mvm agent certs init'" → "mvmctl"
+- [x] `crates/mvm/src/ui.rs` — "mvm status" header → "mvmctl status"
+- [x] `crates/mvm/src/vm/lima.rs` — "Run 'mvm start' or 'mvm setup'" → "mvmctl"
+- [x] `crates/mvm/src/vm/lima_state.rs` — "Run 'mvm setup' or 'mvm bootstrap'" → "mvmctl"
+- [x] `crates/mvm/src/vm/microvm.rs` — All "Use 'mvm stop/start/status/shell'" → "mvmctl" (8 instances)
+- [x] `crates/mvm/src/vm/image.rs` — "Run 'mvm setup'" → "mvmctl setup"
+- [x] `crates/mvm/src/vm/instance/lifecycle.rs` — "Run 'mvm pool build'" → "mvmctl pool build"
+- [x] `crates/mvm/src/security/certs.rs` — "Run 'mvm agent certs init'" → "mvmctl"
 
 ### 1.2 Doctor messages
 

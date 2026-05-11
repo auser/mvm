@@ -69,12 +69,12 @@ pub fn parse_port_spec(spec: &str) -> Result<(u16, u16)> {
 }
 
 /// Parse multiple port specs into `PortMapping` values.
-pub fn parse_port_specs(specs: &[String]) -> Result<Vec<mvm_runtime::config::PortMapping>> {
+pub fn parse_port_specs(specs: &[String]) -> Result<Vec<mvm::config::PortMapping>> {
     specs
         .iter()
         .map(|s| {
             let (host, guest) = parse_port_spec(s)?;
-            Ok(mvm_runtime::config::PortMapping { host, guest })
+            Ok(mvm::config::PortMapping { host, guest })
         })
         .collect()
 }

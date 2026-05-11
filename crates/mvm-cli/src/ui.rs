@@ -2,15 +2,15 @@ use colored::Colorize;
 use indicatif::{ProgressBar, ProgressStyle};
 
 // ---------------------------------------------------------------------------
-// Verbosity (CLI-side mirror of mvm_runtime::ui)
+// Verbosity (CLI-side mirror of mvm::ui)
 // ---------------------------------------------------------------------------
 
 /// Print a progress / chatter message that's only useful when troubleshooting.
 /// Suppressed by default; shown when `--verbose`/`--debug` is passed or
-/// `RUST_LOG` is set. Delegates to [`mvm_runtime::ui::progress`] so both
+/// `RUST_LOG` is set. Delegates to [`mvm::ui::progress`] so both
 /// crates honor the same toggle.
 pub fn progress(msg: &str) {
-    mvm_runtime::ui::progress(msg);
+    mvm::ui::progress(msg);
 }
 
 // ---------------------------------------------------------------------------

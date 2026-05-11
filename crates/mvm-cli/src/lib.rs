@@ -1,5 +1,5 @@
 // mvm-cli: Clap commands, UI, bootstrap
-// Depends on mvm-core, mvm-runtime, mvm-build
+// Depends on mvm-core, mvm, mvm-build
 
 pub mod bootstrap;
 pub mod commands;

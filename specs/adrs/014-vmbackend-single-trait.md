@@ -11,7 +11,7 @@ Proposed. Implementation lands in Phase 0 (workspace reshape) and Phase 1 (Firec
 
 ## Context
 
-The current `mvm-runtime` skeleton introduces two parallel backend abstractions:
+The current `mvm` skeleton introduces two parallel backend abstractions:
 
 - `mvm-backend/src/backend/sandbox.rs` defines `Backend<Sandbox, Context>` with `prepare/boot/teardown` (most methods `todo!()`).
 - `mvm-builder/src/builder/mod.rs` defines `BuilderBackend` with `prepare/build/extract_artifacts/cleanup` (no impls).
@@ -29,9 +29,9 @@ Neither is acceptable.
 1. **Delete the hand-written `Backend<S,C>` and `BuilderBackend` traits.** They were placeholder skeletons the user OK'd replacing.
 2. **Adopt `mvm_core::protocol::vm_backend::VmBackend` as the single backend trait** (port verbatim from `../mvm/crates/mvm-core/src/protocol/vm_backend.rs` in Phase 0).
 3. **Implementations live in their own modules**, not their own traits:
-   - `mvm-runtime/src/vm/firecracker.rs` → `impl VmBackend for FirecrackerBackend`
-   - `mvm-runtime/src/vm/microsandbox.rs` → `impl VmBackend for MicrosandboxBackend`
-   - Future: `mvm-runtime/src/vm/cloud_hypervisor.rs` (post-Phase-10, gated by `backend-cloud-hypervisor` feature)
+   - `mvm/src/vm/firecracker.rs` → `impl VmBackend for FirecrackerBackend`
+   - `mvm/src/vm/microsandbox.rs` → `impl VmBackend for MicrosandboxBackend`
+   - Future: `mvm/src/vm/cloud_hypervisor.rs` (post-Phase-10, gated by `backend-cloud-hypervisor` feature)
 4. **Build vs. execution split is preserved** via a separate (existing) abstraction: `mvm_core::build_env::{ShellEnvironment, BuildEnvironment}`. `mvm-build` consumes `BuildEnvironment`; this is an orthogonal concern from `VmBackend`.
 5. **Backend selection** is centralized in `mvm-cli/src/commands/mod.rs::pick_backend()`:
    - env override `MVM_BACKEND` (explicit)

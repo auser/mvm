@@ -17,10 +17,10 @@
 //!
 //! # What this module does NOT do
 //!
-//! - Spawn `virtiofsd` on the host. That's mvm-runtime's job —
+//! - Spawn `virtiofsd` on the host. That's mvm's job —
 //!   the agent runs strictly inside the guest.
 //! - Track which volumes are attached. The host-side volume mount
-//!   registry (`crates/mvm-runtime/src/vm/volume_registry.rs`)
+//!   registry (`crates/mvm/src/vm/volume_registry.rs`)
 //!   owns that; the agent is stateless across calls.
 
 use std::path::Path;

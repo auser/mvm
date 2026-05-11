@@ -83,7 +83,7 @@ Create `nix/dev-image/flake.nix` using the existing `mkGuest` library:
 
 **New `LinuxEnv` implementation for executing commands inside the Apple Container dev VM.**
 
-- `crates/mvm-runtime/src/linux_env.rs` — Add `AppleContainerEnv` struct:
+- `crates/mvm/src/linux_env.rs` — Add `AppleContainerEnv` struct:
   - Holds VM ID (`"mvm-dev"`)
   - `run()`: Connect via `mvm_apple_container::vsock_connect(id, 52)`, send `GuestRequest::Exec`, return output
   - `run_visible()`: Same but stream stdout/stderr to terminal in real-time
@@ -108,7 +108,7 @@ Create `nix/dev-image/flake.nix` using the existing `mkGuest` library:
 
 **Ensure `mvmctl build --flake .` works without Lima on macOS 26+.**
 
-- `crates/mvm-runtime/src/build_env.rs` — `default_build_env()` already returns `HostBuildEnv` when `has_host_nix()` is true. Verify this path works for:
+- `crates/mvm/src/build_env.rs` — `default_build_env()` already returns `HostBuildEnv` when `has_host_nix()` is true. Verify this path works for:
   - `nix build` on macOS producing Linux ext4 rootfs (requires Nix cross-compilation or Linux builder)
   - If host Nix can't cross-compile: route build through `AppleContainerEnv` (run `nix build` inside the dev VM)
 
@@ -133,9 +133,9 @@ Create `nix/dev-image/flake.nix` using the existing `mkGuest` library:
 |------|---------|
 | `crates/mvm-core/src/platform.rs` | `needs_lima()` conditional on `has_apple_containers()` |
 | `crates/mvm-cli/src/commands.rs` | Dev command routing, `cmd_dev_apple_container()` |
-| `crates/mvm-runtime/src/linux_env.rs` | New `AppleContainerEnv` struct |
+| `crates/mvm/src/linux_env.rs` | New `AppleContainerEnv` struct |
 | `crates/mvm-apple-container/src/macos.rs` | Shared directory support in `start_vm()` |
-| `crates/mvm-runtime/src/build_env.rs` | Build env selection for Apple Container |
+| `crates/mvm/src/build_env.rs` | Build env selection for Apple Container |
 | `nix/dev-image/flake.nix` | New: dev environment rootfs flake |
 | `specs/SPRINT.md` | Sprint 40 |
 

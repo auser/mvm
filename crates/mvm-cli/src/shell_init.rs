@@ -132,7 +132,7 @@ pub fn print_shell_init() -> Result<()> {
 /// shell config modifications are not visible inside the VM. This function
 /// runs inside the VM to patch the VM's own ~/.bashrc.
 pub fn ensure_shell_init_in_vm() -> Result<()> {
-    use mvm_runtime::shell;
+    use mvm::shell;
 
     let kv_root = match detect_kv_root() {
         Ok(p) => p,

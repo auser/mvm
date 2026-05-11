@@ -11,7 +11,7 @@
 //! |--------|-------|---------|
 //! | [`core`] | mvm-core | Types, IDs, config, protocol, signing, routing |
 //! | [`security`] | mvm-security | Command gating, threat classification, rate limiting |
-//! | [`runtime`] | mvm-runtime | Shell execution, VM lifecycle, template management |
+//! | [`runtime`] | mvm | Shell execution, VM lifecycle, template management |
 //! | [`build`] | mvm-build | Nix builder pipeline |
 //! | [`guest`] | mvm-guest | Vsock protocol, integration manifest, guest agent |
 //!
@@ -59,13 +59,13 @@ pub use mvm_security as security;
 
 /// Shell execution, VM lifecycle, and template management.
 ///
-/// See [`mvm_runtime`] for full documentation.
-pub use mvm_runtime as runtime;
+/// See [`mvm`] for full documentation.
+pub use mvm as runtime;
 
 /// Concrete `VmBackend` implementations + `AnyBackend` dispatch.
 ///
 /// See [`mvm_backend`] for full documentation. Plan-60 W7+W8 owned
-/// the move out of `mvm_runtime::vm::*` into a dedicated crate.
+/// the move out of `mvm::vm::*` into a dedicated crate.
 pub use mvm_backend as backend;
 
 /// Nix builder pipeline for creating guest images.

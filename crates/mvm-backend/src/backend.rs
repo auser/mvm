@@ -7,7 +7,7 @@ use mvm_core::vm_backend::{
 // W8: every backend variant + the FC support modules live in this
 // crate now. `microvm`, `microvm_nix`, `image` are siblings under
 // `crate::`; the substrate (`config`, `shell`, `runtime_meta`) lives
-// in `mvm-runtime-base`.
+// in `mvm-base`.
 use crate::apple_container::AppleContainerBackend;
 use crate::cloud_hypervisor::CloudHypervisorBackend;
 use crate::docker::DockerBackend;
@@ -16,8 +16,8 @@ use crate::libkrun::LibkrunBackend;
 use crate::microsandbox::MicrosandboxBackend;
 use crate::microvm::{DriveFile, FlakeRunConfig};
 use crate::{firecracker, microvm, microvm_nix};
-use mvm_runtime_base::config::{PortMapping, VMS_DIR};
-use mvm_runtime_base::shell::run_in_vm_stdout;
+use mvm_base::config::{PortMapping, VMS_DIR};
+use mvm_base::shell::run_in_vm_stdout;
 
 pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
 
@@ -118,7 +118,7 @@ impl VmBackend for FirecrackerBackend {
         // (build pipeline bug); a missing sidecar defaults to
         // accessible=true.
         let rootfs = std::path::Path::new(&config.rootfs_path);
-        mvm_runtime_base::runtime_meta::record_from_rootfs(
+        mvm_base::runtime_meta::record_from_rootfs(
             &config.name,
             StartMode::Detached,
             rootfs,

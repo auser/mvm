@@ -379,7 +379,7 @@ impl Dispatcher for ExecDispatcher {
         // Memory ceiling check: reject envs whose recorded mem_mib
         // exceeds MVM_MCP_MEM_CEILING_MIB. Missing spec is a soft
         // pass since we don't know the size.
-        if let Ok(spec) = mvm_runtime::vm::template::lifecycle::template_load(&params.env)
+        if let Ok(spec) = mvm::vm::template::lifecycle::template_load(&params.env)
             && spec.mem_mib > self.mem_ceiling_mib
         {
             return error_result(format!(
@@ -508,7 +508,7 @@ fn parse_env_u32(name: &str, default: u32) -> u32 {
 }
 
 fn validate_env(env: &str) -> anyhow::Result<()> {
-    let envs = mvm_runtime::vm::template::lifecycle::template_list()?;
+    let envs = mvm::vm::template::lifecycle::template_list()?;
     if envs.iter().any(|e| e == env) {
         return Ok(());
     }

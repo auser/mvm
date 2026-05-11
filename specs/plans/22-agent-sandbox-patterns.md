@@ -51,7 +51,7 @@ iptables rules on the Lima VM's FORWARD chain constrain microVM egress by resolv
 ### Files
 
 - `mvm-core/src/network_policy.rs` (new) — `NetworkPolicy` enum, `HostPort`, presets
-- `mvm-runtime/src/vm/network.rs` — `apply_network_policy(slot, policy)` after TAP creation
+- `mvm/src/vm/network.rs` — `apply_network_policy(slot, policy)` after TAP creation
 - `mvm-cli/src/commands.rs` — `--network-allow`, `--network-preset` flags
 - `mvm-core/src/template.rs` — `network_policy` field
 
@@ -129,7 +129,7 @@ All agent writes go to overlay. After VM stop, inspect the overlay for changes.
 
 ### Files
 
-- `mvm-runtime/src/vm/fs_diff.rs` (new) — overlay inspection, diff manifest
+- `mvm/src/vm/fs_diff.rs` (new) — overlay inspection, diff manifest
 - `mvm-guest/src/vsock.rs` — `fs-diff` command handler
 - `mvm-cli/src/commands.rs` — `mvmctl diff <instance>` subcommand
 
@@ -171,9 +171,9 @@ GITHUB_TOKEN = { host = "api.github.com", value = "ghp_..." }
 
 ### Files
 
-- `mvm-runtime/src/vm/secret_proxy.rs` (new) — proxy implementation
+- `mvm/src/vm/secret_proxy.rs` (new) — proxy implementation
 - `mvm-core/src/secret_binding.rs` (new) — binding types, config parsing
-- `mvm-runtime/src/vm/microvm.rs` — proxy lifecycle (start before VM, stop after)
+- `mvm/src/vm/microvm.rs` — proxy lifecycle (start before VM, stop after)
 - `mvm-core/src/template.rs` — secret bindings in template config
 
 ---

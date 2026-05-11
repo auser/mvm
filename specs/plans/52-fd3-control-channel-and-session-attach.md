@@ -109,7 +109,7 @@ a fresh invoke against the existing session).
 
 - Look up session by id.
 - Invoke `dispatch_in_session(session_id, ...)` from
-  `mvm-runtime/src/vm/lifecycle.rs` (existing primitive). Don't
+  `mvm/src/vm/lifecycle.rs` (existing primitive). Don't
   boot a new VM; don't increment a refcount that prevents teardown;
   don't modify the session's idle-timer.
 - Inherits the fd-3 plumbing from Phase 1.

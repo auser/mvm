@@ -8,8 +8,8 @@ use anyhow::Result;
 
 use crate::ui;
 
-use mvm_runtime::config;
-use mvm_runtime::shell;
+use mvm::config;
+use mvm::shell;
 use mvm_backend::firecracker;
 
 pub(super) fn run_setup_steps(
@@ -70,7 +70,7 @@ pub(super) fn run_setup_steps(
 ///
 /// Idempotent — each step checks before acting.
 pub(super) fn setup_security_baseline() -> Result<()> {
-    use mvm_runtime::security::{jailer, seccomp};
+    use mvm::security::{jailer, seccomp};
 
     // Deploy strict seccomp filter profile
     seccomp::ensure_strict_profile()?;

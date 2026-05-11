@@ -3752,22 +3752,72 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "1d87ecb2933e8aeadb3e3a02b828fed80a7528047e68b4f424523a0981a3a084"
 
 [[package]]
-name = "mvm-backend"
+name = "mvm"
 version = "0.13.0"
 dependencies = [
  "anyhow",
+ "base64 0.22.1",
+ "colored",
+ "ed25519-dalek",
+ "indicatif",
+ "inquire",
+ "libc",
  "microsandbox",
+ "mvm-backend",
+ "mvm-base",
  "mvm-build",
  "mvm-core",
  "mvm-guest",
  "mvm-providers",
- "mvm-runtime-base",
+ "mvm-security",
+ "opendal",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
  "tokio",
  "toml",
+ "tracing",
+]
+
+[[package]]
+name = "mvm-backend"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "microsandbox",
+ "mvm-base",
+ "mvm-build",
+ "mvm-core",
+ "mvm-guest",
+ "mvm-providers",
+ "serde",
+ "serde_json",
+ "sha2 0.10.9",
+ "tempfile",
+ "tokio",
+ "toml",
+ "tracing",
+]
+
+[[package]]
+name = "mvm-base"
+version = "0.13.0"
+dependencies = [
+ "anyhow",
+ "colored",
+ "indicatif",
+ "inquire",
+ "libc",
+ "mvm-build",
+ "mvm-core",
+ "mvm-guest",
+ "mvm-providers",
+ "mvm-security",
+ "serde",
+ "serde_json",
+ "tempfile",
  "tracing",
 ]
 
@@ -3806,13 +3856,13 @@ dependencies = [
  "indicatif",
  "inquire",
  "libc",
+ "mvm",
  "mvm-backend",
  "mvm-build",
  "mvm-core",
  "mvm-guest",
  "mvm-mcp",
  "mvm-providers",
- "mvm-runtime",
  "mvm-security",
  "names",
  "notify",
@@ -3924,56 +3974,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "mvm-runtime"
-version = "0.13.0"
-dependencies = [
- "anyhow",
- "base64 0.22.1",
- "colored",
- "ed25519-dalek",
- "indicatif",
- "inquire",
- "libc",
- "microsandbox",
- "mvm-backend",
- "mvm-build",
- "mvm-core",
- "mvm-guest",
- "mvm-providers",
- "mvm-runtime-base",
- "mvm-security",
- "opendal",
- "rand 0.8.6",
- "serde",
- "serde_json",
- "sha2 0.10.9",
- "tempfile",
- "tokio",
- "toml",
- "tracing",
-]
-
-[[package]]
-name = "mvm-runtime-base"
-version = "0.13.0"
-dependencies = [
- "anyhow",
- "colored",
- "indicatif",
- "inquire",
- "libc",
- "mvm-build",
- "mvm-core",
- "mvm-guest",
- "mvm-providers",
- "mvm-security",
- "serde",
- "serde_json",
- "tempfile",
- "tracing",
-]
-
-[[package]]
 name = "mvm-security"
 version = "0.13.0"
 dependencies = [
@@ -4019,10 +4019,10 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "libc",
+ "mvm",
  "mvm-core",
  "mvm-plan",
  "mvm-policy",
- "mvm-runtime",
  "rand 0.8.6",
  "regex",
  "serde",
@@ -4042,12 +4042,12 @@ dependencies = [
  "assert_cmd",
  "chrono",
  "mimalloc",
+ "mvm",
  "mvm-backend",
  "mvm-build",
  "mvm-cli",
  "mvm-core",
  "mvm-guest",
- "mvm-runtime",
  "mvm-security",
  "objc2-foundation",
  "predicates",

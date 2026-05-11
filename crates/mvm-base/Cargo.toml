@@ -1,8 +1,8 @@
 [package]
-name = "mvm-runtime-base"
+name = "mvm-base"
 version.workspace = true
 edition.workspace = true
-description = "Shared substrate for mvm-runtime + mvm-backend (UI, per-VM runtime metadata)"
+description = "Shared substrate for mvm + mvm-backend (UI, per-VM runtime metadata)"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -10,10 +10,10 @@ authors.workspace = true
 
 # ── What this crate owns ───────────────────────────────────────────
 #
-# The leaf substrate that both `mvm-runtime` and `mvm-backend` need.
-# Plan-60 W7 lifted these modules out of `mvm-runtime` so concrete
+# The leaf substrate that both `mvm` and `mvm-backend` need.
+# Plan-60 W7 lifted these modules out of `mvm` so concrete
 # `VmBackend` implementations can sit in `mvm-backend` without a
-# back-edge into `mvm-runtime`.
+# back-edge into `mvm`.
 #
 # Currently:
 #   - `ui`            — `[mvm]` printing + spinners + interactive prompts

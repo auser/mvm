@@ -92,14 +92,14 @@ libkrun is a library, not a daemon. `krun_start_enter` blocks the calling thread
 
 **Recommendation**: ship Option A first (covers the dev workflow), file a follow-up issue for Option B once the spike validates the rest of the stack. Most users in Sprint 48 are dev-mode users; the persistent-VM use case is rarer for libkrun specifically.
 
-- **W4.1** Implement Option A. Files: `crates/mvm-runtime/src/vm/libkrun.rs` gains a `LIBKRUN_VMS: OnceLock<Mutex<HashMap<VmId, KrunHandle>>>` static. `start()` spawns the supervisor thread; `stop()` signals it to exit; `list()` returns keys; `status()` checks presence.
+- **W4.1** Implement Option A. Files: `crates/mvm/src/vm/libkrun.rs` gains a `LIBKRUN_VMS: OnceLock<Mutex<HashMap<VmId, KrunHandle>>>` static. `start()` spawns the supervisor thread; `stop()` signals it to exit; `list()` returns keys; `status()` checks presence.
 - **W4.2** `stop_all()` becomes a real implementation (today it's an empty `Ok(())` placeholder).
 
 ### W5 — CI lanes (0.5–1 day)
 
 Goal: regression coverage on every PR.
 
-- **W5.1** Extend `.github/workflows/ci.yml` with a `libkrun-macos-arm64` job that runs on `macos-latest` (which is Apple Silicon as of late 2025), installs libkrun via Homebrew, runs `cargo test -p mvm-libkrun -p mvm-runtime --test libkrun_smoke`. The smoke test boots `examples/minimal` and asserts the guest agent responds.
+- **W5.1** Extend `.github/workflows/ci.yml` with a `libkrun-macos-arm64` job that runs on `macos-latest` (which is Apple Silicon as of late 2025), installs libkrun via Homebrew, runs `cargo test -p mvm-libkrun -p mvm --test libkrun_smoke`. The smoke test boots `examples/minimal` and asserts the guest agent responds.
 - **W5.2** Once W3 lands, **the smoke test is the gate** — it'll catch regressions in libkrun's API, the Nix kernel cmdline, our wrapper code, and the codesigning path simultaneously.
 
 ### W6 — Cross-platform expansion (1 sprint follow-up — out of scope here)
@@ -122,7 +122,7 @@ These each merit their own one-day sub-sprint *after* plan 57 ships.
 | `crates/mvm-libkrun/src/sys.rs` | W1.3 | new — safe wrapper over generated bindings |
 | `crates/mvm-libkrun/src/lib.rs` | W1.4 | replace `NotYetWired` returns with real calls |
 | `crates/mvm-apple-container/macos/Entitlements.plist` (or equivalent) | W2.1 | add `com.apple.security.hypervisor` if not already present |
-| `crates/mvm-runtime/src/vm/libkrun.rs` | W4.1 | wire `LIBKRUN_VMS` registry, real lifecycle |
+| `crates/mvm/src/vm/libkrun.rs` | W4.1 | wire `LIBKRUN_VMS` registry, real lifecycle |
 | `examples/libkrun-smoke.rs` | W5.1 | new — minimal end-to-end test binary |
 | `.github/workflows/ci.yml` | W5.1 | new `libkrun-macos-arm64` job |
 | `public/.../guides/troubleshooting.md` | W2.3 | first-run codesigning prompt FAQ |
@@ -144,7 +144,7 @@ When the spike is done:
 - `mvmctl run --hypervisor libkrun --flake examples/minimal` boots, the guest agent responds to vsock health checks, and `Ctrl-C` stops the VM cleanly.
 - `mvmctl doctor` shows `libkrun: available` on the dev host and reports the active backend as `libkrun` when KVM/Apple Container are both unavailable.
 - `mvmctl run --hypervisor libkrun` on a host **without** libkrun installed errors with the exact `install_hint()` message — not a generic "command failed."
-- The CI lane (W5) is green on PRs that touch `crates/mvm-libkrun/`, `crates/mvm-runtime/src/vm/libkrun.rs`, or any file `examples/libkrun-smoke.rs` depends on.
+- The CI lane (W5) is green on PRs that touch `crates/mvm-libkrun/`, `crates/mvm/src/vm/libkrun.rs`, or any file `examples/libkrun-smoke.rs` depends on.
 
 ## Non-goals (named explicitly)
 

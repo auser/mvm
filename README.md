@@ -89,7 +89,7 @@ Layer 3: Guest
 | **mvm-core** | Pure types, IDs, config, protocol, signing, routing |
 | **mvm-guest** | Vsock protocol, integration health checks, guest agent binary |
 | **mvm-build** | Nix builder pipeline |
-| **mvm-runtime** | Shell execution, VM lifecycle, template management |
+| **mvm** | Shell execution, VM lifecycle, template management |
 | **mvm-security** | Security posture evaluation, jailer ops, seccomp profiles |
 | **mvm-apple-container** | Apple Virtualization.framework backend (macOS 26+) |
 | **mvm-cli** | Clap CLI, bootstrap, update, doctor, template commands |

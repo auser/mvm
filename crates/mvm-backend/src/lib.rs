@@ -24,13 +24,13 @@
 //! ## Dependency direction (post-W8)
 //!
 //!   mvm-core              ← VmBackend trait + types
-//!   mvm-runtime-base      ← config + shell + linux_env + ui +
+//!   mvm-base      ← config + shell + linux_env + ui +
 //!                           runtime_meta + cow (substrate)
 //!   mvm-providers         ← libkrun/Apple-VZ FFI shims
 //!     ↓                     ↓                     ↓
 //!     └─────── mvm-backend (this crate) ────────┘
 //!                          ↑
-//!                     mvm-runtime
+//!                     mvm
 //!                     (consumes us via `vm::backend::AnyBackend`)
 //!                     mvm-cli
 //!                     (consumes us directly)
@@ -59,10 +59,10 @@ pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
 
 /// Crate-wide test serialization for tests that mutate `HOME` or
 /// other process-global env vars. Re-exported from
-/// [`mvm_runtime_base::runtime_meta::HOME_TEST_LOCK`] so the
-/// alt-backend tests share the same mutex with `mvm-runtime` tests
+/// [`mvm_base::runtime_meta::HOME_TEST_LOCK`] so the
+/// alt-backend tests share the same mutex with `mvm` tests
 /// — without sharing one lock the modules race each other when
 /// their tests run on the same `cargo test` binary.
 #[cfg(test)]
-pub(crate) use mvm_runtime_base::runtime_meta::HOME_TEST_LOCK;
+pub(crate) use mvm_base::runtime_meta::HOME_TEST_LOCK;
 

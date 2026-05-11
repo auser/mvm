@@ -2,8 +2,8 @@
 
 use anyhow::{Context, Result};
 
-use mvm_runtime::config;
-use mvm_runtime::shell;
+use mvm::config;
+use mvm::shell;
 use mvm_backend::firecracker;
 
 /// Resolve a VM name to its absolute directory path and verify the VM
@@ -32,7 +32,7 @@ pub fn resolve_running_vm(name: &str) -> Result<String> {
 /// `Name` is kept only to resolve any pre-existing name-keyed slots.
 ///
 /// Callers that need the persisted manifest re-read it via
-/// `mvm_runtime::vm::template::lifecycle::template_load_slot(slot_hash)`
+/// `mvm::vm::template::lifecycle::template_load_slot(slot_hash)`
 /// — keeping the enum lean here avoids the `clippy::large_enum_variant`
 /// warning (`PersistedManifest` is ~350 bytes).
 #[derive(Debug, Clone)]
@@ -119,7 +119,7 @@ pub fn resolve_manifest_arg(arg: &str) -> Result<ManifestArgRef> {
     // `mvmctl up` doesn't proceed against a manifest that's never
     // been built. The slot's persisted record is dropped here —
     // callers that need it re-read via `template_load_slot`.
-    mvm_runtime::vm::template::lifecycle::template_load_slot(&slot_hash).with_context(|| {
+    mvm::vm::template::lifecycle::template_load_slot(&slot_hash).with_context(|| {
         format!(
             "Manifest at {} has no built slot — run `mvmctl build {}` first",
             canonical.display(),

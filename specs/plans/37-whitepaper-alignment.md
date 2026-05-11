@@ -30,10 +30,10 @@ The plan is sequenced for leverage: §3.3 (ExecutionPlan) and §7B (supervisor) 
 
 ### §3.1 MVM Runtime Layer
 **Target invariant:** `VmBackend` trait carries the execution contract; native backends include Firecracker, MicrovmNix, Apple Container; Lima/Incus/containerd are pluggable adapters.
-- **Done:** `crates/mvm-runtime/src/vm/backend.rs` `AnyBackend` enum.
+- **Done:** `crates/mvm/src/vm/backend.rs` `AnyBackend` enum.
 - **Build:** open the `VmBackend` trait for out-of-tree adapters (move dispatch into a registry `BackendRegistry::register(name, factory)`); ship a `LimaBackend` wrapper around the existing Lima dev-VM machinery to honor the §3.1 wording. **M**.
 - **Scaffold:** `IncusBackend` and `ContainerdBackend` empty crates with `unimplemented!()` and a clear "compatibility tier" comment so the trait surface is exercised.
-- **Verify:** `cargo test -p mvm-runtime backend::registry::roundtrip`; `mvmctl image fetch --backend lima` works.
+- **Verify:** `cargo test -p mvm backend::registry::roundtrip`; `mvmctl image fetch --backend lima` works.
 
 ### §3.2 mvmd Orchestration Layer (out of scope for `mvm`)
 - **Scaffold only:** in `mvm-core` add `pub mod mvmd_iface { /* signed control-plane wire types */ }` so mvmd can depend on `mvm-core` without reshaping it. **S**.
@@ -78,8 +78,8 @@ The plan is sequenced for leverage: §3.3 (ExecutionPlan) and §7B (supervisor) 
 
 ## §5 — What MVM Enforces
 **Target invariant:** the table is a rubric; each row maps to a runtime check.
-- **Build:** create `crates/mvm-runtime/src/enforce.rs` with one function per row (`enforce_image`, `enforce_plan`, `enforce_runtime`, `enforce_tenant`, `enforce_egress`, `enforce_keys`, `enforce_artifacts`, `enforce_audit`). Each is invoked from `Supervisor::launch` in declared order. **S** scaffold; **M** to fill.
-- **Verify:** `cargo test -p mvm-runtime enforce::table_complete` asserts all 8 rows are wired.
+- **Build:** create `crates/mvm/src/enforce.rs` with one function per row (`enforce_image`, `enforce_plan`, `enforce_runtime`, `enforce_tenant`, `enforce_egress`, `enforce_keys`, `enforce_artifacts`, `enforce_audit`). Each is invoked from `Supervisor::launch` in declared order. **S** scaffold; **M** to fill.
+- **Verify:** `cargo test -p mvm enforce::table_complete` asserts all 8 rows are wired.
 
 ---
 
@@ -116,7 +116,7 @@ The plan is sequenced for leverage: §3.3 (ExecutionPlan) and §7B (supervisor) 
   - Plan execution state machine (`Pending → Verified → Launched → Running → Stopping → Stopped`)
   - systemd unit + launchd plist (Linux + macOS dev-host).
   IPC: vsock to guest, Unix domain socket to `mvmctl`. **L** (this is the single biggest piece — but every sub-component is independently scaffolded below).
-- **Scaffold:** start by lifting existing `mvm-hostd` into `mvm-supervisor`; sub-components import from `mvm-runtime/src/security/*` rather than rewriting.
+- **Scaffold:** start by lifting existing `mvm-hostd` into `mvm-supervisor`; sub-components import from `mvm/src/security/*` rather than rewriting.
 - **Verify:** `mvmctl supervisor status` shows owner of each policy slot; integration test asserts a workload cannot reach the host network when supervisor is offline (fail-closed).
 
 ### §7C — Tenant Workload Sandbox
@@ -304,7 +304,7 @@ The plan is sequenced for leverage: §3.3 (ExecutionPlan) and §7B (supervisor) 
 
 ## §21 — Artifact Lifecycle
 **Target invariant:** workload outputs are governed (retention, expiry, encryption, access, audit) — not stdout-then-destroy.
-- **Done:** build-revision symlinks (`crates/mvm-runtime/src/vm/pool/artifacts.rs`).
+- **Done:** build-revision symlinks (`crates/mvm/src/vm/pool/artifacts.rs`).
 - **Build:**
   - **Capture path**: virtiofs mount `/artifacts` inside guest, owned by supervisor on host. Or vsock channel `ARTIFACT_PORT = 54` for streaming. Pick virtiofs (simpler). **M**.
   - **`ArtifactPolicy`** in plan: `{retention: Duration, expiry: SystemTime, encryption: EncryptionSpec, signing: bool, access: AccessControl}`. **S**.
@@ -429,8 +429,8 @@ Each wave assumes prior waves merged. Effort sums are per wave.
 - `crates/mvm-plan/src/lib.rs` — `ExecutionPlan`, `SignedExecutionPlan`, `*Ref`/`*Spec` types.
 - `crates/mvm-policy/src/lib.rs` — `PolicyBundle`, `EgressPolicy`, `PiiPolicy`, `ToolPolicy`, `ArtifactPolicy`, `KeyPolicy`, `AuditPolicy`, `EmergencyDenyRule`.
 - `crates/mvm-supervisor/src/main.rs`, `crates/mvm-supervisor/src/{egress, tool_gate, keystore, audit, artifact, state}.rs`.
-- `crates/mvm-runtime/src/vm/backend.rs` — open `BackendRegistry`.
-- `crates/mvm-runtime/src/security/attestation.rs` — gate caller; new `tpm2.rs`, `sev_snp.rs`, `tdx.rs` modules.
+- `crates/mvm/src/vm/backend.rs` — open `BackendRegistry`.
+- `crates/mvm/src/security/attestation.rs` — gate caller; new `tpm2.rs`, `sev_snp.rs`, `tdx.rs` modules.
 - `crates/mvm-core/src/mvmd_iface.rs` — wire types for orchestration boundary.
 - `crates/mvm-core/src/policy/audit.rs` — extend `AuditEntry`, add chain-signing.
 - `crates/mvm-cli/src/commands.rs` — new verbs: `plan`, `policy`, `supervisor`, `artifact`, `quarantine`, `wake`, `sleep`.

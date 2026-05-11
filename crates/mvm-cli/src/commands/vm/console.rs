@@ -8,7 +8,7 @@ use clap::Args as ClapArgs;
 
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::vsock_transport::{
+use mvm::vsock_transport::{
     AppleContainerTransport, FirecrackerTransport, VsockProxyTransport, VsockTransport,
 };
 
@@ -59,7 +59,7 @@ fn enforce_accessible_gate(name: &str, force: bool) -> Result<()> {
     if force {
         return Ok(());
     }
-    match mvm_runtime::vm::runtime_meta::read(name) {
+    match mvm::vm::runtime_meta::read(name) {
         Ok(Some(meta)) if !meta.accessible => anyhow::bail!(
             "console refused: VM {name:?} was built from a sealed image (passthru.mvm.accessible = false). \
              Sealed images don't ship the dev agent surface. \
@@ -386,7 +386,7 @@ fn run_console_relay(data_stream: std::os::unix::net::UnixStream) -> Result<()> 
 #[cfg(test)]
 mod accessible_gate_tests {
     use super::*;
-    use mvm_runtime::vm::runtime_meta::{StartModeKind, VmRuntimeMeta, write as write_meta};
+    use mvm::vm::runtime_meta::{StartModeKind, VmRuntimeMeta, write as write_meta};
     use std::sync::Mutex;
 
     // Tests in this module mutate the process-global HOME env var to

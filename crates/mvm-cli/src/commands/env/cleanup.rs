@@ -6,7 +6,7 @@ use clap::Args as ClapArgs;
 use crate::ui;
 
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::shell;
+use mvm::shell;
 
 use super::Cli;
 
@@ -42,7 +42,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     let _ = shell::run_in_vm("sudo rm -rf /tmp/* /var/tmp/* 2>/dev/null");
 
     // Step 2: Remove old dev-build symlinks and artifacts.
-    let env = mvm_runtime::build_env::RuntimeBuildEnv;
+    let env = mvm::build_env::RuntimeBuildEnv;
     let report = mvm_build::dev_build::cleanup_old_dev_builds(&env, keep_count)?;
 
     if args.verbose {

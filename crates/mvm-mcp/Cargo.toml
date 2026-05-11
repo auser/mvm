@@ -18,7 +18,7 @@ authors.workspace = true
 # `stdio` (default) layers on the JSON-RPC stdio loop. No dispatcher
 # implementations live here — callers (mvm-cli for the local mvmctl,
 # mvmd for the hosted variant) provide their own `Dispatcher` impl.
-# This keeps mvm-mcp free of any dependency on mvm-cli or mvm-runtime,
+# This keeps mvm-mcp free of any dependency on mvm-cli or mvm,
 # which would create a cycle.
 [features]
 default = ["stdio"]

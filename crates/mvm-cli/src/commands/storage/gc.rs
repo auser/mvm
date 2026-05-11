@@ -9,7 +9,7 @@ use super::Cli;
 use mvm_core::config::ensure_data_dir;
 use mvm_core::policy::audit::{LocalAuditEvent, LocalAuditKind, LocalAuditLog};
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::storage::{
+use mvm::storage::{
     Backend, DmsetupBackend, MockBackend, PoolConfig, ThinPool, ThinPoolImpl,
 };
 

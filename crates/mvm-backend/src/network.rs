@@ -1,8 +1,8 @@
 use anyhow::Result;
 
-use mvm_runtime_base::config::*;
-use mvm_runtime_base::shell::run_in_vm_visible;
-use mvm_runtime_base::ui;
+use mvm_base::config::*;
+use mvm_base::shell::run_in_vm_visible;
+use mvm_base::ui;
 
 // ============================================================================
 // Legacy dev-mode TAP networking (single VM, used by `mvm start/stop`)

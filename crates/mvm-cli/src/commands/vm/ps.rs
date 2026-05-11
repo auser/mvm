@@ -68,12 +68,12 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     // ls` without changing the `VmInfo` shape every backend produces.
     // If the registry can't be loaded we fall through to "no metadata"
     // and only the backend listing is shown.
-    let registry_path = mvm_runtime::vm::name_registry::registry_path();
+    let registry_path = mvm::vm::name_registry::registry_path();
     let registry =
-        mvm_runtime::vm::name_registry::VmNameRegistry::load(&registry_path).unwrap_or_default();
+        mvm::vm::name_registry::VmNameRegistry::load(&registry_path).unwrap_or_default();
 
     let now = chrono::Utc::now();
-    let is_expired = |reg: &mvm_runtime::vm::name_registry::VmRegistration| -> bool {
+    let is_expired = |reg: &mvm::vm::name_registry::VmRegistration| -> bool {
         reg.expires_at
             .as_deref()
             .and_then(mvm_core::util::time::parse_iso8601)

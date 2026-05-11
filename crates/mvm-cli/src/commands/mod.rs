@@ -182,7 +182,7 @@ pub fn run() -> Result<()> {
 
     // Verbose `[mvm]` chatter: explicit flag, or any RUST_LOG set.
     let verbose = cli.verbose || std::env::var_os("RUST_LOG").is_some();
-    mvm_runtime::ui::set_verbose(verbose);
+    mvm::ui::set_verbose(verbose);
 
     // Initialize logging.
     //

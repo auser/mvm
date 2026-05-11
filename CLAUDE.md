@@ -19,7 +19,7 @@ macOS / Linux Host (this CLI) -> Lima VM (Ubuntu) -> Firecracker microVM (/dev/k
 - `mvm-core` -- pure types, IDs, config, protocol, signing, routing (NO runtime deps)
 - `mvm-guest` -- vsock protocol, integration manifest/state (OpenClaw)
 - `mvm-build` -- Nix builder pipeline (dev_build uses `ShellEnvironment` trait, pool_build uses `BuildEnvironment`)
-- `mvm-runtime` -- shell execution, Lima/Firecracker VM lifecycle, UI, template management
+- `mvm` -- shell execution, Lima/Firecracker VM lifecycle, UI, template management
 - `mvm-cli` -- Clap CLI, bootstrap, update, doctor, template commands
 
 Root package: `src/lib.rs` (facade re-exports `mvmctl::core`, `mvmctl::runtime`, `mvmctl::build`, `mvmctl::guest`) + `src/main.rs` (thin CLI entry -> `mvm_cli::run()`)
@@ -31,7 +31,7 @@ Binary: `mvmctl` (from root, delegates to mvm-cli)
 mvm-core (foundation, no mvm deps)
 ├── mvm-guest (core)
 ├── mvm-build (core, guest)
-├── mvm-runtime (core, guest, build)
+├── mvm (core, guest, build)
 └── mvm-cli (core, runtime, build)
 ```
 
@@ -39,7 +39,7 @@ mvm-core (foundation, no mvm deps)
 
 mvm-core: `build_env.rs` (ShellEnvironment + BuildEnvironment traits), `pool.rs`, `instance.rs`, `tenant.rs`, `template.rs`, `naming.rs`, `signing.rs`, `routing.rs`, `protocol.rs`, `agent.rs`, `catalog.rs` (image catalog), `dev_network.rs` (named networks), `config.rs` (XDG directory functions)
 
-mvm-runtime: `shell.rs`, `config.rs`, `ui.rs`, `build_env.rs` (DevShellEnv impl), `vm/lima.rs`, `vm/firecracker.rs`, `vm/microvm.rs`, `vm/network.rs`, `vm/image.rs`, `vm/template/`
+mvm: `shell.rs`, `config.rs`, `ui.rs`, `build_env.rs` (DevShellEnv impl), `vm/lima.rs`, `vm/firecracker.rs`, `vm/microvm.rs`, `vm/network.rs`, `vm/image.rs`, `vm/template/`
 
 mvm-build: `dev_build.rs` (local Nix builds via ShellEnvironment), `build.rs` (orchestrated builds via BuildEnvironment), `nix_manifest.rs`, `scripts.rs`
 
@@ -65,7 +65,7 @@ BuildEnvironment : ShellEnvironment (extends)
 - **Dev mode** (`mvmctl build`, `mvmctl template build`): uses `dev_build()` with `&dyn ShellEnvironment`
 - **Fleet mode** (in mvmd): uses `pool_build()` with `&dyn BuildEnvironment`
 
-The `RuntimeBuildEnv` in mvm-runtime implements only `ShellEnvironment`. The full `BuildEnvironment` impl lives in mvmd-runtime.
+The `RuntimeBuildEnv` in mvm implements only `ShellEnvironment`. The full `BuildEnvironment` impl lives in mvmd-runtime.
 
 ### Key Design Decisions
 

@@ -166,7 +166,7 @@ regression covers both at once. Estimate: ½ day.
 
 ### C2 — Verity snapshot/restore parity
 
-`mvm-runtime/src/vm/microvm.rs::configure_flake_microvm_with_drives_dir`
+`mvm/src/vm/microvm.rs::configure_flake_microvm_with_drives_dir`
 adds `/drives/verity` and `initrd_path` to the Firecracker
 configure-VM API call. Firecracker snapshots serialize the active
 VM's drive list and boot-source. We have not re-run a template
@@ -200,7 +200,7 @@ and a doc note. If any fails, scope grows to include the
 
 **Files**
 
-- `crates/mvm-runtime/tests/verity_snapshot_restore.rs` — new
+- `crates/mvm/tests/verity_snapshot_restore.rs` — new
   integration test, gated on Linux/KVM availability (skip on
   macOS). Builds a transient verity template, snapshots,
   restores, asserts `/dev/dm-0` is still root.

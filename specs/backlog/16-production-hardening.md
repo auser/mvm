@@ -39,7 +39,7 @@
 ### Critical
 1. 83+ `let _ =` error swallows (silent failures in VM cleanup, LUKS, cgroups)
 2. 32 `.unwrap()` in production code (crash risk, violates AGENTS.md)
-3. mvm-runtime — zero organized tests (most complex crate)
+3. mvm — zero organized tests (most complex crate)
 4. mvm-guest — zero tests (37 unsafe blocks untested)
 5. No signal handling (Ctrl-C doesn't cleanup)
 
@@ -65,9 +65,9 @@
 ### 1.1 Replace `.unwrap()` with `.expect()` in production code (~32 instances)
 
 - [x] `crates/mvm-cli/src/update.rs` — 11 unwraps replaced with `.expect()`
-- [x] `crates/mvm-runtime/src/shell_mock.rs` — 6 unwraps replaced with `.expect()`
-- [x] `crates/mvm-runtime/src/config.rs` — 4 unwraps replaced with `.expect()`
-- [x] `crates/mvm-runtime/src/vm/image.rs` — 2 unwraps replaced with `.expect()`
+- [x] `crates/mvm/src/shell_mock.rs` — 6 unwraps replaced with `.expect()`
+- [x] `crates/mvm/src/config.rs` — 4 unwraps replaced with `.expect()`
+- [x] `crates/mvm/src/vm/image.rs` — 2 unwraps replaced with `.expect()`
 - [x] `crates/mvm-core/src/retry.rs` — 1 unwrap replaced with `.expect()`
 - [x] `crates/mvm-core/src/config.rs` — 1 unwrap replaced with `.expect()`
 
@@ -75,11 +75,11 @@
 
 Pattern: `let _ = op();` → `if let Err(e) = op() { tracing::warn!("description: {e}"); }`
 
-- [x] `crates/mvm-runtime/src/vm/instance/lifecycle.rs` — 14 instances replaced with warn logging
-- [x] `crates/mvm-runtime/src/vm/template/lifecycle.rs` — 9 instances replaced with warn logging
+- [x] `crates/mvm/src/vm/instance/lifecycle.rs` — 14 instances replaced with warn logging
+- [x] `crates/mvm/src/vm/template/lifecycle.rs` — 9 instances replaced with warn logging
 - [x] `crates/mvm-guest/src/bin/mvm-guest-agent.rs` — 7 instances replaced with eprintln logging
 - [x] `crates/mvm-guest/src/bin/mvm-builder-agent.rs` — 8 instances replaced with eprintln logging
-- [x] `crates/mvm-runtime/src/vm/microvm.rs` — 7 instances replaced with warn logging
+- [x] `crates/mvm/src/vm/microvm.rs` — 7 instances replaced with warn logging
 - [x] `crates/mvm-cli/src/update.rs` — 7 instances replaced with warn logging
 
 Note: Some `let _ =` may be intentionally ignored (e.g., removing a file that may not exist). Add `// intentionally ignored: <reason>` comment for those cases.
@@ -89,9 +89,9 @@ Note: Some `let _ =` may be intentionally ignored (e.g., removing a file that ma
 Pattern: `.parse().ok()` → `.parse().map_err(|e| tracing::warn!("parse failed: {e}")).ok()`
 
 - [x] `crates/mvm-guest/src/bin/mvm-guest-agent.rs` — 4 logged (CLI args + config parse), 6 skipped (idiomatic optional chains)
-- [x] `crates/mvm-runtime/src/vm/microvm.rs` — 3 logged (PID + config parse), 6 skipped (idiomatic `.ok()?` chains)
+- [x] `crates/mvm/src/vm/microvm.rs` — 3 logged (PID + config parse), 6 skipped (idiomatic `.ok()?` chains)
 - [x] `crates/mvm-cli/src/commands.rs` — 0 changed, all 8 reviewed as idiomatic best-effort patterns
-- [x] `crates/mvm-runtime/src/security/certs.rs` — 3 logged (cert queries), 4 skipped (`filter_map` patterns)
+- [x] `crates/mvm/src/security/certs.rs` — 3 logged (cert queries), 4 skipped (`filter_map` patterns)
 
 ### 1.4 Add signal handling for graceful shutdown
 
@@ -104,7 +104,7 @@ Pattern: `.parse().ok()` → `.parse().map_err(|e| tracing::warn!("parse failed:
 
 ## Phase 2: Test Coverage **Status: COMPLETE**
 
-### 2.1 mvm-runtime unit tests
+### 2.1 mvm unit tests
 
 - [x] `config.rs` — 25+ tests: config loading, defaults, serde roundtrip, Lima template rendering, VmSlot
 - [x] `shell.rs` — 6 tests: run_host success/failure/nonexistent, run_host_visible, inside_lima
@@ -142,7 +142,7 @@ guest agent binaries (appropriate as-is). Only 3 diagnostic instances need repla
 ### 3.2 Add tracing spans to critical paths (~40 functions)
 
 Pattern: `#[instrument(skip_all, fields(key_field = value, ...))]`
-Reference: `crates/mvm-runtime/src/vm/instance/lifecycle.rs` (6 functions already instrumented)
+Reference: `crates/mvm/src/vm/instance/lifecycle.rs` (6 functions already instrumented)
 
 **Tier 1 — Shell execution (10 functions):**
 - [x] `shell.rs` — `run_in_vm`, `run_in_vm_stdout`, `run_in_vm_visible`, `run_in_vm_capture`, `run_on_vm`, `run_on_vm_visible`, `run_on_vm_stdout`, `run_on_vm_capture`, `run_host`, `run_host_visible`

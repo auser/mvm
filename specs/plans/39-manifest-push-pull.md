@@ -48,7 +48,7 @@ identifier.
 
 ### Push (`mvmctl manifest push [PATH] [--revision <hash>]`)
 
-Producer side. Adapts `template_push` from `mvm-runtime` (which
+Producer side. Adapts `template_push` from `mvm` (which
 exists today, name-keyed) to operate on slot hashes.
 
 - Resolve PATH → slot_hash (same logic as other manifest verbs).
@@ -118,7 +118,7 @@ Until plan 36 ships, the flag is reserved (errors with a clear
 
 ### Registry transport
 
-Reuses `mvm-runtime::vm::template::registry::TemplateRegistry`
+Reuses `mvm::vm::template::registry::TemplateRegistry`
 (OpenDAL-backed, S3-or-equivalent). The path layout differs between
 slot-keyed and channel-keyed bundles:
 
@@ -136,8 +136,8 @@ what `current` points at on the channel.
 
 | File | Change |
 |---|---|
-| `crates/mvm-runtime/src/vm/template/lifecycle.rs` | New `template_push_slot(slot_hash, revision, channel_override)` and `template_pull_slot_to_dir(channel_or_hash, dst_dir, revision)` functions. Reuse the existing `TemplateRegistry` + `Checksums` infrastructure. |
-| `crates/mvm-runtime/src/vm/template/registry.rs` | Add `key_channel_revision_file`, `key_channel_current`, `key_slot_revision_file` helpers (channel-vs-slot-hash path layout). |
+| `crates/mvm/src/vm/template/lifecycle.rs` | New `template_push_slot(slot_hash, revision, channel_override)` and `template_pull_slot_to_dir(channel_or_hash, dst_dir, revision)` functions. Reuse the existing `TemplateRegistry` + `Checksums` infrastructure. |
+| `crates/mvm/src/vm/template/registry.rs` | Add `key_channel_revision_file`, `key_channel_current`, `key_slot_revision_file` helpers (channel-vs-slot-hash path layout). |
 | `crates/mvm-cli/src/commands/manifest/push.rs` (new) | Clap action: `mvmctl manifest push [PATH] [--revision] [--force-channel]`. |
 | `crates/mvm-cli/src/commands/manifest/pull.rs` (new) | Clap action: `mvmctl manifest pull <CHANNEL-OR-HASH> [DIR] [--revision] [--force]`. |
 | `crates/mvm-cli/src/commands/manifest/mod.rs` | Wire `Push`/`Pull` into the `ManifestAction` enum. |

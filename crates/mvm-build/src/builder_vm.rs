@@ -375,7 +375,7 @@ fn sandbox_name(job: &BuilderJob) -> String {
 
 /// Quote a single shell argument for safe interpolation into a
 /// bash `-c` script. Same shape as
-/// `mvm-runtime-base::shell::shell_escape` (deleted in W7 with
+/// `mvm-base::shell::shell_escape` (deleted in W7 with
 /// the rest of the Lima paths) — kept inline here so the builder
 /// crate doesn't take a dep on a runtime-side helper for one
 /// function.
@@ -641,7 +641,7 @@ fn shell_quote(input: &str) -> String {
 /// Best-effort sidecar emission: query `passthru.mvm` against the
 /// already-built flake/attr and write it to
 /// `<build_dir>/mvm-meta.json` so the consumer in
-/// `mvm-runtime::vm::runtime_meta::from_sidecar` can populate
+/// `mvm::vm::runtime_meta::from_sidecar` can populate
 /// `accessible` for the W6.2 console gate.
 ///
 /// Failure modes (all log+continue, never fail the build):

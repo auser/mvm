@@ -529,7 +529,7 @@ fn cmd_set_timeout(args: SetTimeoutArgs) -> Result<()> {
 /// enforcement. Errors propagate the underlying transport failure;
 /// the caller treats them as best-effort.
 fn dispatch_update_idle_timeout(vm_name: &str, secs: u64) -> Result<(u64, u64)> {
-    let transport = mvm_runtime::vsock_transport::for_vm(vm_name)
+    let transport = mvm::vsock_transport::for_vm(vm_name)
         .with_context(|| format!("Picking transport for guest agent on {vm_name:?}"))?;
     let mut stream = transport
         .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
@@ -707,7 +707,7 @@ fn dispatch_run_code(
         bail!("guest agent did not become reachable within 30s");
     }
 
-    let transport = mvm_runtime::vsock_transport::for_vm(&record.vm_name)
+    let transport = mvm::vsock_transport::for_vm(&record.vm_name)
         .with_context(|| format!("Picking transport for guest agent on {:?}", record.vm_name))?;
     let mut stream = transport
         .connect(mvm_guest::vsock::GUEST_AGENT_PORT)

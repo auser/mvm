@@ -417,7 +417,7 @@ path is unaffected. We can land this substrate safely and test it via
 **Untouched**:
 - `crates/mvm-cli/src/commands/vm/invoke.rs` — host CLI unchanged
 - `crates/mvm-cli/src/commands/vm/exec.rs` — session-mode is orthogonal
-- `crates/mvm-runtime/src/vsock_transport.rs` — host transport unchanged
+- `crates/mvm/src/vsock_transport.rs` — host transport unchanged
 - `nix/flake.nix` `mkGuest` — `runtime.json` ships via existing
   `extraFiles` mechanism
 

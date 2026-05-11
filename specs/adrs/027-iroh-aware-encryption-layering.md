@@ -39,7 +39,7 @@ Each layer rotates independently (see plan 60 §"Encryption and key rotation des
 **Positive**:
 - No double-encryption at the iroh hop (CPU, latency saved).
 - Each layer's key material is scoped to its threat (no master-key compromise across layers).
-- Layer documentation matches code structure — each `mvm-runtime/src/security/<name>.rs` aligns with one row in the table.
+- Layer documentation matches code structure — each `mvm/src/security/<name>.rs` aligns with one row in the table.
 
 **Negative**:
 - Operators must understand the layering to debug cert / key issues. Mitigated by a runbook (`specs/runbooks/key-management.md`, Phase 2).

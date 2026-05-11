@@ -12,7 +12,7 @@ substrate doesn't yet expose at the CLI:
 - `Session.info()` → `mvmctl session info -- <id>` (JSON on stdout)
 
 mvm's session machinery exists in
-`mvm/crates/mvm-runtime/src/vm/lifecycle.rs` (`boot_session_vm`,
+`mvm/crates/mvm/src/vm/lifecycle.rs` (`boot_session_vm`,
 `dispatch_in_session`, `tear_down_session_vm`) per Sprint 43 / plan 32
 PRs #21–#22. Currently consumed only by `mvmctl invoke`. There is no
 `mvmctl session` subcommand yet — these verbs are net-new CLI surface
@@ -70,7 +70,7 @@ Argv: `mvmctl session kill -- <session-id>`.
 
 - Read session registry; if missing, exit 1 with `session-not-found`.
 - Invoke `tear_down_session_vm(session_id)` from
-  `mvm-runtime/src/vm/lifecycle.rs`.
+  `mvm/src/vm/lifecycle.rs`.
 - In-flight invokes against this session resolve as failures —
   envelope `kind="session-killed"`. Plan 52's fd-3 work delivers
   the envelope shape; until then, exit code + stderr per existing

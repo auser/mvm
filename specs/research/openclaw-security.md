@@ -153,7 +153,7 @@ SafeClaw provides a concrete, working implementation of the "external observer" 
 - Drive mounts: config (ro), secrets (ro, noexec), data (rw, noexec)
 - nftables firewall: deny lateral movement, IP/MAC binding
 
-**Host-side security** (mvm-runtime/src/security/):
+**Host-side security** (mvm/src/security/):
 - Jailer: chroot + uid/gid isolation per VM
 - Cgroups v2: CPU/memory/IO limits
 - Seccomp: syscall filtering

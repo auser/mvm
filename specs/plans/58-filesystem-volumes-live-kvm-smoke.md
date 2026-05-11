@@ -8,7 +8,7 @@
 Plan 45 introduced the `Volume` primitive end-to-end across mvm:
 - `mvm-core::volume` wire types (Phase 1)
 - `mvm-storage::Backend` trait + `LocalBackend` impl (Phase 2)
-- mvm-runtime `volume_registry` replacing `share_registry` (Phase 5)
+- mvm `volume_registry` replacing `share_registry` (Phase 5)
 - mvm-cli `volume` subcommand replacing `share` (Phase 6)
 - mvm-guest `MountVolume` / `UnmountVolume` vsock verbs (Phase 7)
 - `mvm-security::policy::MountPathPolicy` extended for `/nix*` denials (Phase 8)
@@ -31,7 +31,7 @@ Lima VM on macOS provides a Linux + KVM environment, but spinning up nested Fire
 
 ### Setup
 
-- Build target: `crates/mvm-runtime/src/vm/template/lifecycle.rs` extended with a `volume_smoke_lifecycle` test fn, gated `#[cfg(feature = "live-kvm-smoke")]` so it doesn't pollute the normal `cargo test` run.
+- Build target: `crates/mvm/src/vm/template/lifecycle.rs` extended with a `volume_smoke_lifecycle` test fn, gated `#[cfg(feature = "live-kvm-smoke")]` so it doesn't pollute the normal `cargo test` run.
 - Reuse the existing W3 verity fixture's microVM image (`nix/images/default-tenant`) with `mkGuest.volumeMounts` declaring two mount points:
   ```nix
   volumeMounts = {
@@ -89,7 +89,7 @@ Plan 27's W3 fixture (`runbooks/w3-verified-boot.md`) already has the host-setup
 ## Exit criteria
 
 - All six scenarios pass on the W3 fixture host (CI lane: `live-volume-smoke`).
-- `cargo test --features live-kvm-smoke -p mvm-runtime --test volume_smoke` is green.
+- `cargo test --features live-kvm-smoke -p mvm --test volume_smoke` is green.
 - Output is captured into `specs/runbooks/plan-58-volume-smoke.md` with the actual virtiofsd / agent log excerpts so future debugging has a known-good baseline.
 
 ## Out of scope (Plan 58 itself)

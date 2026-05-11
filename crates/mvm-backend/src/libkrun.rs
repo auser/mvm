@@ -10,7 +10,7 @@
 //!
 //! This file provides the final `VmBackend` shape: [`LibkrunBackend`]
 //! declares its capabilities, security profile, and dispatch through
-//! `mvm_runtime::vm::backend::AnyBackend`. `start()` and `stop()`
+//! `mvm::vm::backend::AnyBackend`. `start()` and `stop()`
 //! delegate to `mvm_libkrun`, which today returns a "not yet wired"
 //! error pointing at the Plan E spike phase. Once the spike confirms
 //! kernel + vsock + entitlement compatibility, the lifecycle will be
@@ -22,7 +22,7 @@ use mvm_core::vm_backend::{
     VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus,
 };
 
-use mvm_runtime_base::ui;
+use mvm_base::ui;
 
 /// libkrun backend (Linux KVM / macOS Hypervisor.framework).
 pub struct LibkrunBackend;
@@ -70,7 +70,7 @@ impl VmBackend for LibkrunBackend {
         // gate on libkrun-launched VMs the same way as on the
         // microsandbox/Firecracker paths.
         let rootfs = std::path::Path::new(&config.rootfs_path);
-        mvm_runtime_base::runtime_meta::record_from_rootfs(
+        mvm_base::runtime_meta::record_from_rootfs(
             &config.name,
             StartMode::Detached,
             rootfs,

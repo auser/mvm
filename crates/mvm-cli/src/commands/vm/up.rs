@@ -144,7 +144,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
     let network_policy = if args.network_preset.is_some() || !args.network_allow.is_empty() {
         resolve_network_policy(args.network_preset.as_deref(), &args.network_allow)?
     } else if let Some(id_or_slot) = resolved_template_arg.as_deref()
-        && let Ok(spec) = mvm_runtime::vm::template::lifecycle::template_load_dispatched(id_or_slot)
+        && let Ok(spec) = mvm::vm::template::lifecycle::template_load_dispatched(id_or_slot)
         && let Some(default_policy) = spec.default_network_policy.clone()
     {
         crate::ui::info(&format!(
@@ -356,12 +356,12 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
     };
 
     // Register the VM name in the persistent registry (best-effort).
-    let registry_path = mvm_runtime::vm::name_registry::registry_path();
-    if let Ok(mut registry) = mvm_runtime::vm::name_registry::VmNameRegistry::load(&registry_path) {
+    let registry_path = mvm::vm::name_registry::registry_path();
+    if let Ok(mut registry) = mvm::vm::name_registry::VmNameRegistry::load(&registry_path) {
         // Deregister stale entry with the same name if it exists
         registry.deregister(&vm_name);
         let expires_at = sandbox_ttl.map(mvm_core::util::time::utc_plus_duration);
-        let _ = registry.register_with_metadata(mvm_runtime::vm::name_registry::RegisterParams {
+        let _ = registry.register_with_metadata(mvm::vm::name_registry::RegisterParams {
             name: &vm_name,
             vm_dir: "",
             network: network_name,
@@ -454,12 +454,12 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             &format!("Loading template '{}' for VM '{}'", tmpl, vm_name),
         );
         let (spec, vmlinux, initrd, rootfs, rev) =
-            mvm_runtime::vm::template::lifecycle::template_artifacts_dispatched(tmpl)?;
+            mvm::vm::template::lifecycle::template_artifacts_dispatched(tmpl)?;
         ui::info(&format!("Using revision {}", rev));
 
         // Check for pre-built snapshot
         let snap_info =
-            mvm_runtime::vm::template::lifecycle::template_snapshot_info_dispatched(tmpl)?;
+            mvm::vm::template::lifecycle::template_snapshot_info_dispatched(tmpl)?;
         if snap_info.is_some() {
             ui::info("Snapshot available — will restore instantly");
         }
@@ -486,7 +486,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 resolved, profile_display, vm_name
             ),
         );
-        let run_build_env = mvm_runtime::build_env::default_build_env();
+        let run_build_env = mvm::build_env::default_build_env();
         let env = run_build_env.as_ref();
         let result = mvm_build::dev_build::dev_build(env, &resolved, profile, build_mode)?;
         if let Err(e) = mvm_build::dev_build::ensure_guest_agent_if_needed(env, &result) {
@@ -702,9 +702,9 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             network_policy: network_policy.clone(),
         };
         let rev = if mvm_core::manifest::is_slot_hash_dirname(tmpl) {
-            mvm_runtime::vm::template::lifecycle::current_revision_id_for_slot(tmpl)?
+            mvm::vm::template::lifecycle::current_revision_id_for_slot(tmpl)?
         } else {
-            mvm_runtime::vm::template::lifecycle::current_revision_id(tmpl)?
+            mvm::vm::template::lifecycle::current_revision_id(tmpl)?
         };
         let snap_dir = if mvm_core::manifest::is_slot_hash_dirname(tmpl) {
             mvm_core::manifest::slot_snapshot_dir(tmpl, &rev)
@@ -899,7 +899,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             }
 
             // Rebuild the flake.
-            let env = mvm_runtime::build_env::RuntimeBuildEnv;
+            let env = mvm::build_env::RuntimeBuildEnv;
             let result = match mvm_build::dev_build::dev_build(
                 &env,
                 &flake_dir,

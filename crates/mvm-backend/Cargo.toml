@@ -13,8 +13,8 @@ authors.workspace = true
 # Concrete `VmBackend` implementations that are *not* coupled to the
 # Lima-era Firecracker substrate (`vm::microvm`, `vm::image`,
 # `vm::firecracker` helpers, the `run_in_vm` shell shim, etc.).
-# Plan-60 W7 moved these out of `mvm-runtime/src/vm/` so the alt
-# backends can sit *below* `mvm-runtime` in the dependency graph,
+# Plan-60 W7 moved these out of `mvm/src/vm/` so the alt
+# backends can sit *below* `mvm` in the dependency graph,
 # breaking the previous facade-only re-export pattern.
 #
 # Lives here:
@@ -24,20 +24,20 @@ authors.workspace = true
 #   - libkrun.rs           (raw libkrun shim — Linux KVM / macOS HVF)
 #   - microsandbox.rs      (libkrun-backed sandbox; Phase 1 default)
 #
-# Stays in `mvm-runtime` (W8 will move):
+# Stays in `mvm` (W8 will move):
 #   - firecracker.rs (Lima-era installer helpers)
 #   - microvm.rs (Firecracker lifecycle via `run_in_vm`)
 #   - microvm_nix.rs (Firecracker via microvm.nix runner)
 #   - vm/backend.rs (`AnyBackend` dispatch + `FirecrackerBackend`)
 #
-# `mvm-runtime`'s `vm::backend.rs` imports the alt backends from this
+# `mvm`'s `vm::backend.rs` imports the alt backends from this
 # crate to populate the `AnyBackend` dispatch enum. That direction —
-# `mvm-runtime` → `mvm-backend` — is the post-W7 invariant; the
-# previous `mvm-backend` → `mvm-runtime` re-export façade is gone.
+# `mvm` → `mvm-backend` — is the post-W7 invariant; the
+# previous `mvm-backend` → `mvm` re-export façade is gone.
 [dependencies]
 mvm-core.workspace = true
 mvm-guest.workspace = true
-mvm-runtime-base.workspace = true
+mvm-base.workspace = true
 mvm-providers.workspace = true
 
 anyhow.workspace = true

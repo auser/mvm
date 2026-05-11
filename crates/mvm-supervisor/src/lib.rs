@@ -13,7 +13,7 @@
 //! plist, lands in Wave 1.4 (Supervisor::launch happy path).
 //!
 //! Why scaffold-first: each component lifts a sizeable chunk of
-//! today's `mvm-runtime/src/security/*`. Landing the trait surface
+//! today's `mvm/src/security/*`. Landing the trait surface
 //! first lets every sub-component move under it with a typed contract,
 //! rather than the current grab-bag of free functions. The Noop impls
 //! are the fail-closed default — a supervisor wired up with default

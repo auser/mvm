@@ -26,9 +26,9 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         Some(n) => {
             let result = backend.stop(&VmId::from(n));
             // Deregister from the name registry (best-effort)
-            let registry_path = mvm_runtime::vm::name_registry::registry_path();
+            let registry_path = mvm::vm::name_registry::registry_path();
             if let Ok(mut registry) =
-                mvm_runtime::vm::name_registry::VmNameRegistry::load(&registry_path)
+                mvm::vm::name_registry::VmNameRegistry::load(&registry_path)
             {
                 registry.deregister(n);
                 let _ = registry.save(&registry_path);

@@ -35,7 +35,7 @@ pub const GUEST_CID: u32 = 3;
 /// callback to the historical port for grep-ability.
 ///
 /// **Single source of truth.** `mvm-apple-container` and
-/// `mvm-runtime::vm::vminitd_client` re-declare this value because
+/// `mvm::vm::vminitd_client` re-declare this value because
 /// they cannot depend on `mvm-guest`. If you change this, update those
 /// duplicates in the same commit; the workspace tests catch drift.
 pub const GUEST_AGENT_PORT: u32 = 5252;

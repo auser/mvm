@@ -21,11 +21,11 @@ Removed the top-level `Shell` command in favor of `dev shell`.
 
 ### Runtime additions
 
-Added `lima::stop_vm()` and `lima::stop()` to mvm-runtime (mirrors existing `start_vm`/`start` pattern).
+Added `lima::stop_vm()` and `lima::stop()` to mvm (mirrors existing `start_vm`/`start` pattern).
 
 ### Files modified
 
-- `crates/mvm-runtime/src/vm/lima.rs` — `stop_vm()`, `stop()`, updated error message
+- `crates/mvm/src/vm/lima.rs` — `stop_vm()`, `stop()`, updated error message
 - `crates/mvm-cli/src/commands.rs` — `DevCmd` enum, dispatch, `cmd_dev_down()`, `cmd_dev_status()`, removed `Shell` variant
 - `tests/cli.rs` — updated tests for new subcommand structure
 - `README.md`, `CLAUDE.md`, site docs — updated command references

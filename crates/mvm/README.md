@@ -1,4 +1,4 @@
-# mvm-runtime
+# mvm
 
 Shell execution, VM lifecycle management, and platform-aware operations. Implements the `ShellEnvironment` trait for dev builds and manages the full Lima + Firecracker stack.
 

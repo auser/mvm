@@ -8,7 +8,7 @@ use serde::Serialize;
 
 use mvm_core::domain::template_tags::TemplateTags;
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::vm::template::lifecycle as tmpl;
+use mvm::vm::template::lifecycle as tmpl;
 
 use super::super::Cli;
 

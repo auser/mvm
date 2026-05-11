@@ -75,7 +75,7 @@ requires authentication, which is mvmd's concern, not mvm's.
 
 **Implementation:** `attach` reuses the existing
 `dispatch_in_session(session_id, ...)` runtime primitive in
-`crates/mvm-runtime/src/vm/lifecycle.rs`. It does not boot a new
+`crates/mvm/src/vm/lifecycle.rs`. It does not boot a new
 VM, does not increment a refcount that would prevent teardown, and
 does not modify the session's idle-timer.
 

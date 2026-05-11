@@ -76,14 +76,14 @@ jobs:
 
           # Publish in dependency order: leaf crates first, root facade last.
           # mvm-apple-container is versioned independently — list it before
-          # mvm-runtime, which depends on it.
+          # mvm, which depends on it.
           CRATES=(
             mvm-core
             mvm-apple-container
             mvm-guest
             mvm-security
             mvm-build
-            mvm-runtime
+            mvm
             mvm-cli
             mvmctl
           )
@@ -107,7 +107,7 @@ jobs:
           }
 
           # True if exact version is already published — makes this loop
-          # idempotent so a partial run (mvm-runtime onwards left to do) can
+          # idempotent so a partial run (mvm onwards left to do) can
           # be resumed by re-dispatching without "already exists" failures.
           # crates.io rejects empty User-Agent with 403, so set one explicitly.
           crate_already_published() {

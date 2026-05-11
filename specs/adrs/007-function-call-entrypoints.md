@@ -222,7 +222,7 @@ See plan 41. Files touched:
 - `crates/mvm-cli/src/commands/vm/invoke.rs` (new) — `mvmctl invoke`
   CLI verb; reuses session-VM primitives in
   `crates/mvm-cli/src/exec.rs`.
-- `crates/mvm-runtime/src/vm/microvm.rs` — snapshot HMAC at
+- `crates/mvm/src/vm/microvm.rs` — snapshot HMAC at
   create/restore; key handling.
 - `crates/mvm-cli/src/commands/ops/doctor*` — verify
   `/etc/mvm/entrypoint` contract live; verify snapshot dir mode.

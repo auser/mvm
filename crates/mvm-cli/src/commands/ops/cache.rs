@@ -64,7 +64,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
                         "(dry-run) Would scan for orphaned builds — see `mvmctl manifest prune --orphans --dry-run` for details.",
                     );
                 } else {
-                    match mvm_runtime::vm::template::lifecycle::template_prune_orphan_slots() {
+                    match mvm::vm::template::lifecycle::template_prune_orphan_slots() {
                         Ok((count, _)) => {
                             mvm_core::audit::emit(
                                 mvm_core::audit::LocalAuditKind::SlotPrune,

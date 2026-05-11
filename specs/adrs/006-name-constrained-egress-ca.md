@@ -263,7 +263,7 @@ These are pointers, not the spec — plan 34's tier 2 owns the actual
 work:
 
 - Cert generation: `rcgen` (already in workspace? check Cargo.lock)
-  or `openssl-cli` shelling out via `mvm_runtime::shell::run_in_vm`
+  or `openssl-cli` shelling out via `mvm::shell::run_in_vm`
   on macOS. Pick `rcgen` if available — pure Rust, no shell.
 - nameConstraints encoding: `rcgen::CertificateParams::name_constraints`
   takes a list of permitted DNS names. Maps cleanly from

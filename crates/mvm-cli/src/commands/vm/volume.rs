@@ -32,7 +32,7 @@ use clap::{Args as ClapArgs, Subcommand};
 
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
-use mvm_runtime::vm::volume_registry::{VolumeMountEntry, VolumeMountRegistry};
+use mvm::vm::volume_registry::{VolumeMountEntry, VolumeMountRegistry};
 use mvm_security::policy::validate_mount_path;
 
 use super::Cli;

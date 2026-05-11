@@ -121,7 +121,7 @@ impl VmBackend for CloudHypervisorBackend {
         // backends. Records `accessible` from the sidecar so
         // `mvmctl console` enforces the gate consistently.
         let rootfs = std::path::Path::new(&config.rootfs_path);
-        mvm_runtime_base::runtime_meta::record_from_rootfs(
+        mvm_base::runtime_meta::record_from_rootfs(
             &config.name,
             StartMode::Detached,
             rootfs,
@@ -221,7 +221,7 @@ impl VmBackend for CloudHypervisorBackend {
             .with_context(|| format!("resolving per-VM dir for {}", id.0))?;
         let filename = if hypervisor { "ch.log" } else { "console.log" };
         let log_file = format!("{abs_dir}/{filename}");
-        mvm_runtime_base::shell::run_in_vm_stdout(&format!(
+        mvm_base::shell::run_in_vm_stdout(&format!(
             "tail -n {lines} {log_file} 2>/dev/null || true"
         ))
     }

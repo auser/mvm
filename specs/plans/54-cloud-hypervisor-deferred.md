@@ -46,10 +46,10 @@ The first condition alone is not enough — convenience wants are not posture-ch
 For estimation only; not commitments.
 
 - **Files to create**:
-  - `crates/mvm-runtime/src/vm/cloud_hypervisor.rs` — `CloudHypervisorBackend` impl over CH's HTTP-API-over-unix-socket.
+  - `crates/mvm/src/vm/cloud_hypervisor.rs` — `CloudHypervisorBackend` impl over CH's HTTP-API-over-unix-socket.
   - `specs/plans/<NN>-cloud-hypervisor-backend.md` — full plan with phases and tests.
 - **Files to modify**:
-  - `crates/mvm-runtime/src/vm/backend.rs` — add `CloudHypervisor` variant + `auto_select` rules.
+  - `crates/mvm/src/vm/backend.rs` — add `CloudHypervisor` variant + `auto_select` rules.
   - `crates/mvm-cli/src/commands/vm/up.rs` — `--hypervisor cloud-hypervisor` (alias `chv`).
   - `crates/mvm-core/src/protocol/vm_backend.rs` — extend `VmCapabilities` with `nested_kvm`, `gpu_passthrough`, `non_linux_guest`.
   - `crates/mvm-cli/src/bootstrap.rs` — install `cloud-hypervisor` binary (Nix package, distro packages, GitHub release).

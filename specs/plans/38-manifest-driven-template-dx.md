@@ -10,7 +10,7 @@ Today's `mvmctl template` surface forces three discrete steps to go from "I have
 
 `template create` does no build work — it just stashes CLI args as JSON. The flake is the actual source of truth (kernel, rootfs, services); resource defaults and policy are bookkeeping the user has to retype on every new template. The template *name* is invented at the command line and exists only as a registry path key.
 
-There is also an existing `Mvmfile.toml` flow on `mvmctl build` (`crates/mvm-runtime/src/vm/image.rs`) that is conceptually adjacent.
+There is also an existing `Mvmfile.toml` flow on `mvmctl build` (`crates/mvm/src/vm/image.rs`) that is conceptually adjacent.
 
 Goal: **make a manifest file the user-facing primitive, identified by path.** Commands operate on a manifest. The registry continues to exist (it's the indexed artifact store), but its keys are derived from the canonical manifest path — there is no user-visible "name." `Mvmfile.toml` and `mvm.toml` collapse into one schema with one parser.
 
@@ -66,7 +66,7 @@ Explicitly **NOT** in the manifest (mvmd or flake territory):
 
 The manifest's job is *how this dev tool builds and runs this flake*, not *what the flake contains* and not *how a fleet schedules it*.
 
-Existing `Mvmfile.toml` consumers in `mvm-runtime/src/vm/image.rs` migrate to this schema; legacy fields stay readable for one release with a deprecation hint.
+Existing `Mvmfile.toml` consumers in `mvm/src/vm/image.rs` migrate to this schema; legacy fields stay readable for one release with a deprecation hint.
 
 ### 2. Manifest discovery
 
@@ -326,7 +326,7 @@ Resource fields come straight from the IR's `Resources` block (`cpu_cores`, `mem
 
 - mvmforge `compile` learns to emit `mvm.toml`; stops emitting `launch.json` as a peer artifact.
 - mvmforge `up` translates IR → `mvmctl up` flags (cmd, env, mounts, source, network).
-- `crates/mvm-runtime/src/vm/exec.rs`: existing `launch.json`-reading accommodations are deprecated and removed once mvmforge stops emitting it. Out of scope for this plan; flag as a follow-up cleanup.
+- `crates/mvm/src/vm/exec.rs`: existing `launch.json`-reading accommodations are deprecated and removed once mvmforge stops emitting it. Out of scope for this plan; flag as a follow-up cleanup.
 
 **No code changes required in mvmctl for this plan to support mvmforge.** The minimal `mvm.toml` schema (5 fields) is in fact what makes mvmforge integration clean — anything richer would force mvmforge to duplicate logic about how to derive it from the IR.
 
@@ -353,7 +353,7 @@ mvmforge-ir  ←  mvm   (dev-dep, tests only — initial state)
 
 Pull-in plan:
 
-- **mvm (this repo)**: `mvmforge-ir` as a `dev-dependency`, used only by tests that exercise mvmforge-emitted directories (verification step 11). mvmctl proper does not need to understand the IR — mvmforge translates IR → `mvmctl up` flags. **Promote to runtime dep later only if** `mvmctl up` learns to consume the IR directly to replace the deprecated `launch.json` accommodations in `crates/mvm-runtime/src/vm/exec.rs`. Revisit at that point; until then, dev-dep keeps the workspace lean.
+- **mvm (this repo)**: `mvmforge-ir` as a `dev-dependency`, used only by tests that exercise mvmforge-emitted directories (verification step 11). mvmctl proper does not need to understand the IR — mvmforge translates IR → `mvmctl up` flags. **Promote to runtime dep later only if** `mvmctl up` learns to consume the IR directly to replace the deprecated `launch.json` accommodations in `crates/mvm/src/vm/exec.rs`. Revisit at that point; until then, dev-dep keeps the workspace lean.
 - **mvmd (separate repo)**: `mvmforge-ir` as a **runtime dependency**. mvmd is the natural consumer — it reads the IR for instance specs. This is where the IR's value compounds.
 - **mvmforge-cli stays independent.** Neither mvm nor mvmd ever depends on the CLI crate, only on `mvmforge-ir`.
 
@@ -432,7 +432,7 @@ This plan is currently at `/Users/auser/.claude/plans/dazzling-meandering-garden
 2. **Update `specs/SPRINT.md`** — add a new "Sprint 44 — manifest-driven template DX" section (or append to the existing Sprint 44 draft if it's still relevant, replacing the stub at `specs/plans/35-sprint-44-draft.md`). Sprint section should include:
    - Pointer to `plans/38-manifest-driven-template-dx.md`.
    - Coordination tickets for mvmforge `compile` to emit `mvm.toml` and stop emitting `launch.json`.
-   - Followup: deprecate `crates/mvm-runtime/src/vm/exec.rs` `launch.json` accommodations once mvmforge stops emitting it (cross-references existing follow-up [#5](https://github.com/tinylabscom/mvm/issues/5) which marked launch.json consumption as shipped).
+   - Followup: deprecate `crates/mvm/src/vm/exec.rs` `launch.json` accommodations once mvmforge stops emitting it (cross-references existing follow-up [#5](https://github.com/tinylabscom/mvm/issues/5) which marked launch.json consumption as shipped).
    - Followup: extract `mvmforge-ir` as a published dependency consumable by mvm (dev-dep) and mvmd (runtime-dep).
 3. The two ADR-relevant supersedences are noted inline in the plan but not opened as ADR amendments here:
    - ADR-004 Decision 6 ("per-template default network policy") superseded by user-global config + mvmd tenant config.
@@ -449,8 +449,8 @@ This plan is currently at `/Users/auser/.claude/plans/dazzling-meandering-garden
 | `crates/mvm-cli/src/commands/build/build.rs` | Existing `mvmctl build` becomes the manifest-aware build verb. Accepts optional `[PATH]` (file or dir; defaults to cwd walk-up). Manifest discovery + spec merge + slot persist + `dev_build` invocation all live here. The legacy `--flake` flag-flake mode and `Mvmfile.toml` path collapse into the one parser. |
 | `crates/mvm-cli/src/commands/manifest/mod.rs` (new) | New `Manifest` subcommand group with `Ls`, `Info`, `Rm`, `Push`, `Pull`, `Verify`, `Prune` actions. Single namespace for all slot-registry / object-storage operations. |
 | `crates/mvm-cli/src/template_cmd.rs` | Split: `init.rs` (new) absorbs the prompt planner (L505-948); the rest becomes thin wrappers behind the deprecated `template` alias. Extend `OpenAiTemplatePlan` (L485-496) and the JSON Schema (L832-930) with optional `resources` block; have the renderer emit `mvm.toml` alongside the scaffolded `flake.nix`. Remove `create_single`/`create_multi`/`edit`. |
-| `crates/mvm-runtime/src/vm/template/lifecycle.rs` | `template_create` → `template_persist` (writes the slot JSON keyed by hash); `template_load(slot_hash)`; `template_list` returns `(manifest_path, optional_name, last_revision_at)` tuples; `template_build` (L198) takes a slot key + persisted manifest instead of `id`. |
-| `crates/mvm-runtime/src/vm/image.rs` | Existing `Mvmfile.toml` parsing folded into the new `Manifest` parser. |
+| `crates/mvm/src/vm/template/lifecycle.rs` | `template_create` → `template_persist` (writes the slot JSON keyed by hash); `template_load(slot_hash)`; `template_list` returns `(manifest_path, optional_name, last_revision_at)` tuples; `template_build` (L198) takes a slot key + persisted manifest instead of `id`. |
+| `crates/mvm/src/vm/image.rs` | Existing `Mvmfile.toml` parsing folded into the new `Manifest` parser. |
 | `crates/mvm-build/src/template_reuse.rs` | (Missed in earlier draft.) Today calls `template_current_symlink()` / `template_revision_dir()` with `template_id` and computes a 3-component cache key (`flake_lock + profile + role`, L47-56). Update to slot-hash arg + 2-component cache key (drop role). |
 | `crates/mvm-core/src/domain/template.rs` (cache key) | `TemplateRevision::cache_key()` (L156-167) currently mixes in `role`. Drop the role component; update tests at L212-223 that assert role-sensitivity. |
 | `crates/mvm-build/tests/pipeline.rs` | `test_template_reuse_skips_build()` (and any sibling) — update fixtures to new slot layout + cache-key shape. |
@@ -472,7 +472,7 @@ Reuse:
 - `mvm_core::util::parse_human_size` — memory/disk sizes
 - `mvm_core::naming::validate_flake_ref` — flake validation
 - `commands::shared::resolve_optional_network_policy` — `--network-preset` / `--network-allow`
-- `mvm_runtime::vm::template::lifecycle::{template_build, template_build_with_snapshot}` — runtime build primitives stay; only their key argument changes from `id` to slot hash.
+- `mvm::vm::template::lifecycle::{template_build, template_build_with_snapshot}` — runtime build primitives stay; only their key argument changes from `id` to slot hash.
 
 ## Verification
 

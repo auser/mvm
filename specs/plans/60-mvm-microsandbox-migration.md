@@ -1,8 +1,8 @@
-# Plan: bring `mvm-runtime` to feature parity with `../mvm`, pivoted to microsandbox + libkrun, then rename to `mvm`
+# Plan: bring `mvm` to feature parity with `../mvm`, pivoted to microsandbox + libkrun, then rename to `mvm`
 
 ## Context
 
-The repo at `/Users/auser/work/tinylabs/mvmco/mvm-runtime` is a hand-written 5-crate skeleton (~520 LOC, almost entirely stubs). The previous iteration at `/Users/auser/work/tinylabs/mvmco/mvm` is a mature 13-crate Lima+Firecracker stack (~40-50K LOC) with full security model, persistent storage, networking, observability, and an MCP server. The orchestrator at `/Users/auser/work/tinylabs/mvmco/mvmd` (10 crates, ~305K LOC) imports the `mvmctl` facade as a library — that's the contract we cannot break.
+The repo at `/Users/auser/work/tinylabs/mvmco/mvm` is a hand-written 5-crate skeleton (~520 LOC, almost entirely stubs). The previous iteration at `/Users/auser/work/tinylabs/mvmco/mvm` is a mature 13-crate Lima+Firecracker stack (~40-50K LOC) with full security model, persistent storage, networking, observability, and an MCP server. The orchestrator at `/Users/auser/work/tinylabs/mvmco/mvmd` (10 crates, ~305K LOC) imports the `mvmctl` facade as a library — that's the contract we cannot break.
 
 The pivot in this iteration: **microsandbox (libkrun-backed) becomes the builder and the macOS/Windows execution path; Firecracker stays as the preferred Linux execution path**. The output of every build is a complete Nix-built microVM image with zero drift between machines. mvm is the library; mvmd is the orchestrator that consumes it.
 
@@ -34,7 +34,7 @@ The user's hard constraints:
 - **mvmd networking is iroh QUIC** (already TLS 1.3 by default with NAT traversal + relay). We do *not* duplicate TLS at the mvmd↔mvm-agent network hop — iroh handles it. We *do* still need mTLS at the mvmd-agent↔mvm-hostd Unix-socket hop (different process boundary, different threat).
 - **Code quality** — small files (≤ 400 LOC soft limit), idiomatic Rust, builder structs instead of long arg lists (no `#[allow(clippy::too_many_arguments)]` ever), tests everywhere (unit, integration, fuzz, smoke).
 - **Feature-gated** — cargo features keep the surface focused; dev-only paths cannot be compiled into production builds.
-- **Final rename** `mvm-runtime/` → `mvm/` once the migration is verified.
+- **Final rename** `mvm/` → `mvm/` once the migration is verified.
 
 The current hand-written skeleton (`mvm-backend::Backend<Sb,Ctx>`, `mvm-builder::BuilderBackend`, `mvm-providers` empty) **does not need to be preserved** — the user wrote it themselves and explicitly OK'd replacement. It conflicts with the `VmBackend` shape that mvmd already imports through the facade.
 
@@ -112,7 +112,7 @@ The builder VM is the **only** microVM allowed open egress (gated by the tenant'
 ## Target workspace layout
 
 ```
-mvm/                              (renamed from mvm-runtime/ at the end)
+mvm/                              (renamed from mvm/ at the end)
 ├── Cargo.toml                    (workspace root, mvmctl bin/lib package)
 ├── src/
 │   ├── lib.rs                    (mvmctl facade — mirrors ../mvm/src/lib.rs exactly)
@@ -126,7 +126,7 @@ mvm/                              (renamed from mvm-runtime/ at the end)
 │   ├── mvm-policy/               (A — copy verbatim, policy bundle eval)
 │   ├── mvm-guest/                (B — copy + adapt console/exec for microsandbox)
 │   ├── mvm-build/                (C — rewrite around microsandbox, salvage nix/*)
-│   ├── mvm-runtime/              (B — port lifecycle, swap Lima/FC-direct for VmBackend dispatch)
+│   ├── mvm/              (B — port lifecycle, swap Lima/FC-direct for VmBackend dispatch)
 │   ├── mvm-mcp/                  (B — copy + swap dispatcher to call VmBackend)
 │   ├── mvm-supervisor/           (A — copy verbatim, egress proxy + audit + redactor)
 │   ├── mvm-sdk/                  (A — port from mvmforge-sdk; Rust runtime types + traits)
@@ -469,7 +469,7 @@ The user-facing surface is identical; the backend differences are hidden behind 
 - Diff: ≤ 100 ms for typical session-sized snapshots
 
 ### Tests
-- Unit: `mvm_runtime::vm::snapshot::tests::save_load_round_trip`; `..::tests::tampered_memory_rejected`; `..::tests::fork_lineage_records_parent`
+- Unit: `mvm::vm::snapshot::tests::save_load_round_trip`; `..::tests::tampered_memory_rejected`; `..::tests::fork_lineage_records_parent`
 - Integration: `tests/cli.rs::test_snapshot_save_then_fork_independent_diverges`; `test_snapshot_diff_reports_file_changes`; `test_snapshot_retention_purges_expired`; `test_snapshot_export_then_import_round_trip`; `test_snapshot_purge_zero_fills_ciphertext`
 - Property: `proptest` over the AEAD layer (1000+ cases)
 - Performance: `tests/perf.rs::snapshot_save_p50_within_budget`, `..::snapshot_load_pool_p50_within_budget`
@@ -508,7 +508,7 @@ Session state is wiped only on explicit `kill`, idle timeout, or VM destruction.
 Agents that use vision + UI-automation need a graphical microVM. Built on:
 
 - **Inside guest**: `Xvfb` + `Xpra` (in the microvm.nix profile) provides a headless X11 display; `xdotool` and `wmctrl` synthesize input and query window tree.
-- **Host-side**: `mvm-runtime/src/compute_use/` exposes vsock RPCs:
+- **Host-side**: `mvm/src/compute_use/` exposes vsock RPCs:
   - `screenshot` → PNG bytes (resolution from manifest)
   - `input` ← `Vec<InputEvent>` (mouse moves/clicks, key down/up)
   - `windows` → `Vec<Window>` (tree of windows with positions, titles, app names)
@@ -549,7 +549,7 @@ mvmctl freeze <vm> > frozen.flake     # snapshot the current input set for repro
 
 The diff of base layers (old vs. new) is shown to the user with `--explain` so they understand what changed.
 
-Implementation lives in `mvm-runtime/src/install/` (new module). Drives `mvm-build` for the rebuild, `mvm-runtime/src/vm/snapshot.rs` for the swap, `mvm-runtime/src/vm/overlay.rs` for the persistent overlay management.
+Implementation lives in `mvm/src/install/` (new module). Drives `mvm-build` for the rebuild, `mvm/src/vm/snapshot.rs` for the swap, `mvm/src/vm/overlay.rs` for the persistent overlay management.
 
 ## Host-mediated agent tools
 
@@ -1142,7 +1142,7 @@ Two distinct workload classes; the answer is different for each:
 
 Every environment, every layer. Concrete techniques, ranked by expected impact:
 
-1. **Snapshot-based boot (Firecracker)**: Pre-build a "warm" microVM, take a Firecracker snapshot, clone it for each boot. Cuts cold-boot from ~500ms to <30ms. Implementation: `mvm-runtime/src/vm/snapshot_pool.rs` maintains a per-template pool of snapshots; `up` clones from pool. **Phase 1 ships warm-snapshot path; Phase 9 measures and tightens.**
+1. **Snapshot-based boot (Firecracker)**: Pre-build a "warm" microVM, take a Firecracker snapshot, clone it for each boot. Cuts cold-boot from ~500ms to <30ms. Implementation: `mvm/src/vm/snapshot_pool.rs` maintains a per-template pool of snapshots; `up` clones from pool. **Phase 1 ships warm-snapshot path; Phase 9 measures and tightens.**
 2. **Pre-warmed builder VM**: already in plan (Phase 1) — eliminates Nix builder cold-start.
 3. **PGO (profile-guided optimization)** for release builds: `cargo pgo` + a representative workload. ~10-20% on hot paths.
 4. **MUSL static builds** for `mvmctl` and `mvm-hostd`: faster process start, smaller binaries, no ldconfig.
@@ -1169,11 +1169,11 @@ Two distinct hops, two mechanisms:
 | Hop | Transport | Security | Source of truth |
 |---|---|---|---|
 | mvmd-coordinator ↔ mvmd-agent | iroh QUIC (with relay fallback) | TLS 1.3 native to iroh; ALPN `/mvmd/agent/1` | iroh handles; we do NOT layer extra TLS |
-| mvmd-agent ↔ mvm-hostd | Unix domain socket | mTLS via `rustls` + `rcgen`; certs per-node 7-day rotation | mvm-runtime (this repo) |
+| mvmd-agent ↔ mvm-hostd | Unix domain socket | mTLS via `rustls` + `rcgen`; certs per-node 7-day rotation | mvm (this repo) |
 | mvmctl ↔ guest agent | virtio-vsock | `AuthenticatedFrame` HMAC + X25519 ephemeral session keys (forward secrecy) | mvm-guest (this repo) |
 | mvmctl ↔ host keystore | OS API (Keychain/Cred Mgr/Secret Service) | platform-native; HSM/TPM where available | OS |
 | Volumes at rest | LUKS2 (Linux) / APFS-encrypted (macOS) / BitLocker (Windows) | AES-XTS | OS + our keystore wrap |
-| Snapshots at rest | AEAD: AES-256-GCM (preferred) or ChaCha20-Poly1305 | Per-snapshot DEK wrapped by tenant KEK | mvm-runtime (this repo) |
+| Snapshots at rest | AEAD: AES-256-GCM (preferred) or ChaCha20-Poly1305 | Per-snapshot DEK wrapped by tenant KEK | mvm (this repo) |
 
 This kills the impulse to "encrypt everything twice." iroh already gives us TLS 1.3 over QUIC; adding mTLS on top would just spend cycles. The hostd hop is *separately* mTLS because it's a different process boundary inside the host machine.
 
@@ -1336,7 +1336,7 @@ Beyond the layers already named, we also bake in:
 - **Hardware root of trust**: where TPM2 (Linux/Windows) or Secure Enclave (macOS) is present, store the tenant KEK there instead of in `keyring`. Crate: `tss-esapi` (Apache-2.0) for TPM2; macOS Secure Enclave via `security-framework` (MIT/Apache). Falls back to `keyring` where unavailable.
 - **`#![forbid(unsafe_code)]`** on every crate where possible. Where `unsafe` is unavoidable (FFI to microsandbox/libkrun, vsock ioctls), it lives in a single `unsafe-bridge` module per crate, reviewed by the `type-design-analyzer` agent.
 - **Continuous fuzzing in CI**: nightly job runs each fuzz target for 1h on the latest main. Crashes file an issue automatically; corpora are versioned in `crates/mvm-guest/fuzz/corpus/`.
-- **Two-person review on security paths**: `CODEOWNERS` requires review from a security-tagged reviewer for changes under `crates/mvm-security/`, `crates/mvm-supervisor/`, `crates/mvm-plan/`, `crates/mvm-policy/`, `crates/mvm-runtime/src/security/`.
+- **Two-person review on security paths**: `CODEOWNERS` requires review from a security-tagged reviewer for changes under `crates/mvm-security/`, `crates/mvm-supervisor/`, `crates/mvm-plan/`, `crates/mvm-policy/`, `crates/mvm/src/security/`.
 - **VM-level intrusion detection (feature-gated)**: optional guest-side `mvm-ids` daemon watches for syscall anomaly patterns (excessive `connect()` to new IPs, `ptrace` self-attach, suspicious `execve` chains). Reports via vsock; runs only when `ids` feature is on.
 - **RFC 3161 timestamping for the audit chain**: the chain's anchor events get TSA timestamps so the log is non-repudiable even if our internal clock is compromised. Crate: `rfc3161-client` (Apache-2.0).
 - **Encrypted env vars**: env vars passed to a guest are encrypted in transit (vsock auth frame already covers this) and never written to disk. Wired through `secrecy::SecretBox`.
@@ -1571,7 +1571,7 @@ Three layers, each with rotation:
 - AES-256-GCM with 96-bit random nonce + 128-bit authentication tag
 - Snapshots also wrapped with HMAC-SHA-256 chain so tampering is detectable across the audit log
 - Rotation: snapshots are short-lived; on KEK rotation, mark old snapshots as "decryptable-only"; new snapshots use new KEK
-- Implementation: `mvm-runtime/src/security/snapshot_crypto.rs` (port from `../mvm`)
+- Implementation: `mvm/src/security/snapshot_crypto.rs` (port from `../mvm`)
 
 **Layer 3 — in-transit + identity**
 - mvmd↔mvm-hostd: mTLS 1.3 over Unix socket via `rustls`; certs generated per node by `rcgen`, signed by the per-tenant CA
@@ -1623,7 +1623,7 @@ Each phase ships an independently demonstrable end-to-end flow. Each phase ends 
 | 7b | Built-in templates + computer-use + GPU virgl + TypeScript SDK alpha | `--template ai-sandbox/computer-use` end-to-end; `npm install @mvm/sdk` works | 7-10 | 019, 025 | Sprint 50 (cont.) |
 | 8 | mvmd integration contract verification | `cd ../mvmd && cargo test` green; signed-Plan reconciliation round-trips | 3-5 | — | Sprint 51 |
 | 9 | Hardening: deny + audit + reproducibility + perf + SBOM + compliance docs + SDK parity tests beta | `cargo deny` + `cargo audit` clean; cold boot ≤ 30 ms; all 3 SDKs pass `tests/sdk_compat/` | 7-10 | 024, 029 | Sprint 52 |
-| 10 | Rename `mvm-runtime/` → `mvm/`; archive old | repo lives at `/Users/auser/work/tinylabs/mvmco/mvm/`; mvmd points to new path | 1 | — | Sprint 53 closes |
+| 10 | Rename `mvm/` → `mvm/`; archive old | repo lives at `/Users/auser/work/tinylabs/mvmco/mvm/`; mvmd points to new path | 1 | — | Sprint 53 closes |
 
 Total calendar (sequential): ~12-16 weeks for one engineer. Phases 2-5 partially overlap (encryption, networking, observability, DX after Phase 1's backend lands). Phase 6 (security) and 7a (install/rebuild + tenant destroy) are gating for the hosted-cloud and compliance work.
 
@@ -1646,7 +1646,7 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 **Goal**: `cd ../mvmd && cargo build --workspace` is green against the new mvm. No microVMs work yet — but mvmd's compile gate stays unbroken, CI runs on Linux + macOS + Windows, and this plan + the active sprint are in the right places in the repo.
 
 **First action items (run before any code change)**:
-1. **Relocate this plan into the repo**: copy `/Users/auser/.claude/plans/context-ref-file-users-auser-work-tinyl-joyful-lemon.md` to `/Users/auser/work/tinylabs/mvmco/mvm-runtime/specs/plans/60-mvm-microsandbox-migration.md` (60 chosen to leave headroom above existing plans 0-40+; bump if collision). The repo copy becomes canonical from this point on.
+1. **Relocate this plan into the repo**: copy `/Users/auser/.claude/plans/context-ref-file-users-auser-work-tinyl-joyful-lemon.md` to `/Users/auser/work/tinylabs/mvmco/mvm/specs/plans/60-mvm-microsandbox-migration.md` (60 chosen to leave headroom above existing plans 0-40+; bump if collision). The repo copy becomes canonical from this point on.
 2. **Archive current SPRINT**: `git mv specs/SPRINT.md specs/backlog/42-microvm-hardening.md` (or whatever sprint number reflects the current shipped state).
 3. **Open Sprint 43**: new `specs/SPRINT.md` titled "Sprint 43 — mvm migration: Phase 0 (foundation + facade)". Body links to plan 60 and lists Phase 0's exit-test checklist.
 4. **Stub the new ADRs** (008, 009, 022, 026, 027, 028, 030): one file each under `specs/adrs/`, frontmatter + Context section filled, Decision/Consequences left as TODO. The user authorized creating ADRs during this session.
@@ -1662,9 +1662,9 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 - Stub `specs/compliance/{soc2-controls.md,pci-scope.md,hipaa-mapping.md,gdpr-mapping.md}` with table-of-contents-only content; Phase 9 fills them out.
 
 **Critical files**:
-- `/Users/auser/work/tinylabs/mvmco/mvm-runtime/Cargo.toml` — full rewrite of workspace block
-- `/Users/auser/work/tinylabs/mvmco/mvm-runtime/src/lib.rs` (NEW) — facade
-- `/Users/auser/work/tinylabs/mvmco/mvm-runtime/crates/mvm-core/` — copy of `/Users/auser/work/tinylabs/mvmco/mvm/crates/mvm-core/`
+- `/Users/auser/work/tinylabs/mvmco/mvm/Cargo.toml` — full rewrite of workspace block
+- `/Users/auser/work/tinylabs/mvmco/mvm/src/lib.rs` (NEW) — facade
+- `/Users/auser/work/tinylabs/mvmco/mvm/crates/mvm-core/` — copy of `/Users/auser/work/tinylabs/mvmco/mvm/crates/mvm-core/`
 
 **Exit tests**:
 - `cargo build --workspace` clean
@@ -1684,16 +1684,16 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 - Stand up `mvm-build` with microsandbox driver. Salvage `nix/manifest.rs`, `nix/scripts.rs`, `artifacts.rs`, `cache.rs`, `template_reuse.rs` from `../mvm/crates/mvm-build/src/`. Replace `pipeline/firecracker.rs` + `pipeline/vsock_builder.rs` with `pipeline/microsandbox.rs` that drives a **persistent builder microVM** (one warm sandbox per tenant; LRU-evicted; never destroyed mid-session).
 - Builder VM's policy permits egress to configured Nix substituters; runtime VMs default-deny (firewall not yet up — comes in Phase 3 — Phase 1's runtime VMs simply have no NIC).
 - Build outputs go to `~/.mvm/artifacts/<sha256>/` (content-addressed); runtime VMs reference by hash.
-- Stand up `mvm-runtime/src/vm/backend.rs` exposing `BackendKind::{Firecracker, Microsandbox}`. Detection: `cfg!(target_os = "linux") && /dev/kvm exists` → Firecracker; otherwise Microsandbox.
+- Stand up `mvm/src/vm/backend.rs` exposing `BackendKind::{Firecracker, Microsandbox}`. Detection: `cfg!(target_os = "linux") && /dev/kvm exists` → Firecracker; otherwise Microsandbox.
 - Implement `MicrosandboxBackend: VmBackend` (replace the `todo!()` in the user's existing `SandboxBackend` with a real `boot()`/`teardown()` aligned to the trait). Verify Windows-on-microsandbox status; if missing, document WSL2 fallback in ADR.
-- Port `FirecrackerBackend` from `../mvm/crates/mvm-runtime/src/vm/firecracker.rs`.
+- Port `FirecrackerBackend` from `../mvm/crates/mvm/src/vm/firecracker.rs`.
 - Port the guest-agent vsock console from `../mvm/crates/mvm-guest/src/{console.rs,vsock.rs}`. Vsock framing protocol stays in-house; the raw socket uses `tokio-vsock`.
 - Wire CLI commands `build`, `up`, `down`, `console`, `exec`, `builder ls/keep/evict` in `mvm-cli/src/commands/`.
 - All commands accept structured config via `bon`-derived builders — enforce `clippy::too_many_arguments` ban repo-wide via `[workspace.lints]`.
 - Cross-platform: CI runs the build on Linux, macOS, Windows; the smoke test runs at minimum on Linux + macOS (Windows path may rely on WSL2 initially).
 
 **Exit tests**:
-- Unit: `mvm_build::pipeline::microsandbox::tests::nix_build_produces_rootfs`; `..::tests::warm_builder_reused_across_calls`; `mvm_runtime::vm::backend::tests::auto_picks_firecracker_when_kvm_present`; `mvm_runtime::vm::microsandbox::tests::boot_and_teardown_round_trip`
+- Unit: `mvm_build::pipeline::microsandbox::tests::nix_build_produces_rootfs`; `..::tests::warm_builder_reused_across_calls`; `mvm::vm::backend::tests::auto_picks_firecracker_when_kvm_present`; `mvm::vm::microsandbox::tests::boot_and_teardown_round_trip`
 - Smoke: `tests/smoke_invoke.rs::boot_and_exec_hello_world` passes on macOS (microsandbox) and Linux (Firecracker); `tests/smoke_invoke.rs::builder_persists_across_two_builds` confirms warm-pool behaviour
 - CLI: ~25 of the 91 `tests/cli.rs` tests pass (build/up/down/console/exec/builder help + flag parsing)
 - Performance gate: cold-boot benchmark in `xtask/src/bench.rs` records boot time; alert if > 800ms (target 500ms; gate established here, tightened in Phase 9). Build cold-start vs. warm-start delta logged for the builder VM.
@@ -1704,14 +1704,14 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 **Goal**: `mvmctl volume create db --encrypt`, `mvmctl up --volume db:/var/db`, `mvmctl secret put api_token --tenant t1`, `mvmctl key rotate --kek tenant:t1`, `mvmctl snapshot save` — all with verified encryption at rest.
 
 **Action**:
-- Port `mvm-runtime/src/security/snapshot_crypto.rs`, `keystore.rs` from `../mvm`.
-- Port `mvm-runtime/src/vm/{disk_manager,volume_registry,instance/disk,instance/snapshot,cow}.rs`.
-- New `mvm-runtime/src/security/key_rotation.rs` — implements DEK re-wrap on KEK rotation; LUKS2 keyslot rotation; snapshot KEK rolling.
+- Port `mvm/src/security/snapshot_crypto.rs`, `keystore.rs` from `../mvm`.
+- Port `mvm/src/vm/{disk_manager,volume_registry,instance/disk,instance/snapshot,cow}.rs`.
+- New `mvm/src/security/key_rotation.rs` — implements DEK re-wrap on KEK rotation; LUKS2 keyslot rotation; snapshot KEK rolling.
 - Wire `keyring` (re-enable the commented-out targets in root `Cargo.toml`); add `directories` for XDG paths.
 - Secret types wrap `secrecy::SecretBox<T>`; CI custom-lint forbids `Display`/`Debug` on secret-carrying types.
 
 **Exit tests**:
-- Unit: `mvm_runtime::security::snapshot_crypto::tests::aead_round_trip`; `..::tests::tampered_ciphertext_rejected`; `mvm_security::snapshot_hmac::tests::chain_verifies`; `mvm_runtime::security::key_rotation::tests::rotate_kek_preserves_dek_decryption`
+- Unit: `mvm::security::snapshot_crypto::tests::aead_round_trip`; `..::tests::tampered_ciphertext_rejected`; `mvm_security::snapshot_hmac::tests::chain_verifies`; `mvm::security::key_rotation::tests::rotate_kek_preserves_dek_decryption`
 - Integration: `tests/cli.rs::test_volume_create_attach_persists_data_across_restart`; `test_snapshot_save_then_load_round_trip`; `test_snapshot_with_tampered_hmac_rejected`; `test_key_rotation_preserves_data`; `test_secret_put_then_inject_visible_in_guest_only`
 - Property: `proptest` over snapshot_crypto AEAD round-trips (1000 cases minimum)
 
@@ -1721,7 +1721,7 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 **Goal**: A runtime VM cannot reach any external host unless its tenant policy explicitly allows it (per-protocol, per-port, per-CIDR or per-SNI). The builder VM is the one exception, gated by mvmd-signed policy. `mvmctl audit tail --vm <name>` shows every flow attempt.
 
 **Action**:
-- Port `mvm-runtime/src/vm/{network,bridge,instance/net}.rs`. Adapt: Lima is dropped, so all bridge code targets host directly (Linux) or microsandbox's TUN bindings (macOS / Windows).
+- Port `mvm/src/vm/{network,bridge,instance/net}.rs`. Adapt: Lima is dropped, so all bridge code targets host directly (Linux) or microsandbox's TUN bindings (macOS / Windows).
 - **L4 proxy**: new `mvm-supervisor/src/proxy/l4.rs` (feature-gated `egress-l4-proxy`). Uses `smoltcp` for userspace TCP/UDP termination; `tun-rs` opens per-VM TAPs; per-tenant `(proto, dst_cidr, dst_port)` allowlist. Default action: drop + audit.
 - **L7 proxy**: new `mvm-supervisor/src/proxy/l7.rs` (feature-gated `egress-l7-proxy`, depends on L4). HTTPS SNI extraction; HTTP/1.1 + HTTP/2 via `hyper`; per-tenant SNI + path-prefix allowlist; optional MITM (only when tenant policy installs a CA into the guest).
 - **Firewall**: new `mvm-supervisor/src/firewall/{linux_nft,macos_pf,windows_wfp}.rs`. Linux uses `nftables-rs`; macOS shells out to `pfctl`; Windows shells out to `windivert`. All install default-deny on the runtime-VM TAP; only the proxy TUN endpoint is reachable. **The firewall is additive enforcement** — even if it's misconfigured, the proxy's allowlist still applies.
@@ -1731,7 +1731,7 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 - **No-IP-leak invariant**: all host↔guest control traffic on vsock; verify with packet-capture test that no IP packets cross the bridge during normal operation (only data-plane policy-permitted flows do).
 
 **Exit tests**:
-- Unit: `mvm_runtime::vm::network::tests::default_deny_drops_outbound`; `mvm_supervisor::proxy::l4::tests::allowlist_permits_then_blocks`; `..::proxy::l7::tests::sni_allowlist_blocks_others`; `..::tests::ssrf_link_local_blocked`; `mvm_supervisor::firewall::linux_nft::tests::default_deny_rules_install_idempotently`
+- Unit: `mvm::vm::network::tests::default_deny_drops_outbound`; `mvm_supervisor::proxy::l4::tests::allowlist_permits_then_blocks`; `..::proxy::l7::tests::sni_allowlist_blocks_others`; `..::tests::ssrf_link_local_blocked`; `mvm_supervisor::firewall::linux_nft::tests::default_deny_rules_install_idempotently`
 - Integration: `tests/cli.rs::test_runtime_vm_default_egress_blocked`; `test_runtime_vm_egress_allowed_only_after_policy_update`; `test_builder_vm_egress_allowed_and_logged`; `test_two_vms_named_network_resolve_each_other`; `test_port_forward_round_trip_http`; `test_audit_tail_shows_blocked_flow`; `test_l7_proxy_blocks_disallowed_sni`
 - Smoke: `tests/smoke_network.rs::no_packet_leakage_during_boot` — capture all bridge packets during a full boot cycle, assert none leave the supervisor unless policy-allowed
 - Cross-platform: firewall test runs on Linux with nftables, on macOS with pf (gated `#[cfg(target_os = "macos")]`); Windows test gated `#[cfg(windows)]` with WFP
@@ -1745,13 +1745,13 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 - Port `mvm-core/src/observability/{logging,metrics,instance_metrics}.rs` (already in Phase 0).
 - Wire every metric in the catalog (see "Comprehensive metrics catalog" section). Each metric has a unit test confirming its name + label set + cardinality bound. Audit hooks: emit a metric counter for every audit category.
 - New `mvm-cli/src/metrics_server.rs` — small `axum` server exposing `/metrics` for Prometheus scrape (feature-gated `metrics-prometheus`); optional OTLP exporter under `metrics-otel`.
-- Port `mvm-runtime/src/security/audit.rs` — chain-signed HMAC audit log; extend to every category (`cmd`, `lifecycle`, `secret`, `flow`, `plan`, `policy`, `key`, `host`, `audit`); add `mvmctl audit verify` command and `mvmctl audit ship` (when `audit-remote-sink` feature enabled).
+- Port `mvm/src/security/audit.rs` — chain-signed HMAC audit log; extend to every category (`cmd`, `lifecycle`, `secret`, `flow`, `plan`, `policy`, `key`, `host`, `audit`); add `mvmctl audit verify` command and `mvmctl audit ship` (when `audit-remote-sink` feature enabled).
 - Audit instrumentation lives in a single `mvm-supervisor::audit::Recorder` that every other crate calls — there is one audit path, not many.
 - Implement event bus on `tokio::sync::broadcast`; emit on every lifecycle transition.
 - `tracing` JSON formatter for guest stdout/stderr capture.
 
 **Exit tests**:
-- Unit: `mvm_core::observability::metrics::tests::counters_increment` (per-metric); `mvm_runtime::security::audit::tests::tampered_entry_breaks_chain`; `..::tests::chain_round_trip_n_entries`
+- Unit: `mvm_core::observability::metrics::tests::counters_increment` (per-metric); `mvm::security::audit::tests::tampered_entry_breaks_chain`; `..::tests::chain_round_trip_n_entries`
 - Integration: `tests/cli.rs::test_metrics_endpoint_exposes_full_catalog` — scrape `/metrics`, assert every metric name from the catalog appears; `test_audit_verify_reports_clean_chain`; `tests/audit_total_coverage.rs::every_command_emits_audit_entry` (drives the CLI through every subcommand and asserts ≥1 audit entry per); `tests/e2e/audit_emissions.rs::*` (file already exists — make it pass)
 
 **Risk**: cardinality blowup if labels include raw tenant IDs or VM IDs. Mitigation: tenant_hash (truncated SHA256) for tenant labels; vm_id labels limited to short-lived gauges that get reset on stop.
@@ -1783,7 +1783,7 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 **Goal**: `mvmctl up --security strict` applies a seccomp profile; rootfs verified at boot via dm-verity; signed Plans rejected if Ed25519 sig fails; fuzz harness runs in CI for vsock framing; **`mvmctl attest <vm>` returns a verifiable attestation report**.
 
 **Action**:
-- Port `mvm-runtime/src/security/{jailer,seccomp,signing,attestation,cgroups,certs}.rs` from `../mvm`.
+- Port `mvm/src/security/{jailer,seccomp,signing,attestation,cgroups,certs}.rs` from `../mvm`.
 - Stand up new crate `mvm-attestation` (or module under `mvm-security`): identity key lifecycle, runtime measurement loop, attestation header format, verification helpers.
 - SLSA-3 build attestation: cosign-sign every release artifact + publish to Rekor (`sigstore-rs`). In-toto attestation files committed alongside artifacts.
 - Boot attestation: dm-verity hash recorded in kernel cmdline; guest reports measurement on first vsock auth frame; host compares.
@@ -1792,11 +1792,11 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 - New CLI: `mvmctl attest`, `mvmctl attest verify`, `mvmctl attest export`.
 - Port `mvm-guest/src/bin/{mvm-verity-init,mvm-seccomp-apply,syscall-probe}.rs`.
 - Port `mvm-guest/fuzz/` directory (kept out of workspace per existing convention) with all four fuzz targets.
-- mTLS for mvmd↔mvm-hostd: port `mvm-runtime/src/security/certs.rs`, wire `rustls` + `rcgen`.
+- mTLS for mvmd↔mvm-hostd: port `mvm/src/security/certs.rs`, wire `rustls` + `rcgen`.
 - PII redactor: stand up `mvm-supervisor/src/redactor/` with the built-in pattern set; wire into audit log + tracing layer + metrics labels + MCP tool args.
 
 **Exit tests**:
-- Unit: `mvm_runtime::security::seccomp::tests::strict_blocks_ptrace`; `..::signing::tests::ed25519_round_trip`; `mvm_security::posture::tests::*`; `mvm_attestation::tests::identity_key_signs_runtime_report`; `..::tests::tampered_report_fails_verify`; `mvm_supervisor::redactor::tests::redacts_built_in_patterns`
+- Unit: `mvm::security::seccomp::tests::strict_blocks_ptrace`; `..::signing::tests::ed25519_round_trip`; `mvm_security::posture::tests::*`; `mvm_attestation::tests::identity_key_signs_runtime_report`; `..::tests::tampered_report_fails_verify`; `mvm_supervisor::redactor::tests::redacts_built_in_patterns`
 - Fuzz: `cargo +nightly fuzz run fuzz_authenticated_frame -- -runs=20000` exits 0 in CI; same for `fuzz_guest_request`, `fuzz_authed_path`, `fuzz_entrypoint_event`
 - Integration: `test_up_with_strict_seccomp_blocks_disallowed_syscall`; `test_signed_plan_rejected_when_signature_invalid`; `test_dm_verity_panics_on_tampered_block` (live KVM only, gated by env); `test_attest_round_trip_with_image_change_detection`; `tests/redactor.rs::no_pii_reaches_disk` (drives a session that prints PII, asserts log files + audit + metric scrape are clean)
 
@@ -1823,10 +1823,10 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 **Goal**: `mvmctl install foo` rebuilds the rootfs and swaps it underneath the user's persistent overlay; `/workspace` survives. `mvmctl tenant destroy` provably wipes a tenant's data and emits a destruction certificate.
 
 **Action**:
-- Stand up `mvm-runtime/src/install/` driving the rebuild flow.
-- Stand up `mvm-runtime/src/vm/overlay.rs` for the encrypted persistent overlay (extends Phase 2's volume work; introduces the two-layer rootfs+overlay model).
+- Stand up `mvm/src/install/` driving the rebuild flow.
+- Stand up `mvm/src/vm/overlay.rs` for the encrypted persistent overlay (extends Phase 2's volume work; introduces the two-layer rootfs+overlay model).
 - Implement rolling swap: pause → swap rootfs → resume; tmux sessions reattach.
-- Stand up `mvm-runtime/src/tenant/destroy.rs`: wipes volumes (LUKS keyslot revocation + zero-fill), snapshots (key destruction), audit log entries (redacted; chain anchors stay), keys; emits a destruction certificate signed by the host identity key. Required for hosted-cloud deprovisioning.
+- Stand up `mvm/src/tenant/destroy.rs`: wipes volumes (LUKS keyslot revocation + zero-fill), snapshots (key destruction), audit log entries (redacted; chain anchors stay), keys; emits a destruction certificate signed by the host identity key. Required for hosted-cloud deprovisioning.
 - New CLI: `install`, `uninstall`, `rebuild`, `freeze`, `--explain` flag for diff; `tenant destroy --tenant <id> --confirm-deletion`.
 
 **Exit tests**:
@@ -1840,7 +1840,7 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 
 **Action**:
 - Author `templates/{minimal,worker,ai-sandbox,safe-openclaw,computer-use,repl}/{flake.nix,mvm.toml}`.
-- For `computer-use`: add `mvm-runtime/src/compute_use/` with screenshot/input/windows/clipboard/process_list RPCs over vsock; the guest profile includes Xvfb, Xpra, xdotool, wmctrl, and a vetted browser (Chromium with a hardened seccomp profile).
+- For `computer-use`: add `mvm/src/compute_use/` with screenshot/input/windows/clipboard/process_list RPCs over vsock; the guest profile includes Xvfb, Xpra, xdotool, wmctrl, and a vetted browser (Chromium with a hardened seccomp profile).
 - Each template ships its own tenant policy bundle (egress allowlist, tool allowlist, seccomp tier) signed by mvmd.
 - `tests/templates.rs` boots each template, exercises its hello-world path, and asserts policy is enforced (e.g., `ai-sandbox` cannot reach raw internet but the web_search tool returns results).
 - **Stand up TypeScript SDK** (`typescript/@mvm/sdk`): runtime (`Sandbox.create`, `runCode`, `files`, `commands`, `snapshot`) + declarative (`App`, `Image`, `Secret`, `Volume`, `@fn`, `@cls`, `@enter`, `@method`, `@webEndpoint`, `Cron`, `.local()`/`.remote()`). napi-rs binding for hot paths; pure TS otherwise. Targets Node 20+, Bun, Deno. ESM + CJS, types included.
@@ -1856,7 +1856,7 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 **Goal**: `cd ../mvmd && cargo test --workspace` is green; signed-Plan reconciliation round-trips end-to-end; mvmd CLI drives a mvm-managed VM via Unix-socket `mvm-hostd`.
 
 **Action**:
-- Port `mvm-runtime/src/hostd/{mod,server}.rs` and `bin/mvm-hostd.rs` from `../mvm`.
+- Port `mvm/src/hostd/{mod,server}.rs` and `bin/mvm-hostd.rs` from `../mvm`.
 - Add `pub const PROTOCOL_VERSION: u32` to `mvm_core::protocol`. Document the bump policy in `specs/adrs/`.
 - New `tests/mvmd_compat.rs` — pulls in `mvmd-client` as a dev-dep and verifies wire-format stability for `AgentRequest::Reconcile`, `HostdRequest::Start`, `HostdResponse::Started`.
 
@@ -1870,7 +1870,7 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 **Goal**: `cargo deny check` + `cargo audit` clean; reproducibility double-build identical; **cold-boot ≤ 30 ms on Linux/Firecracker via snapshot pool** (≤ 500 ms cold path), ≤ 1 s on macOS/microsandbox; rootfs ≤ 20 MB for `minimal` template; SBOM emitted; PGO + MUSL release builds.
 
 **Action**:
-- Land snapshot pool: `mvm-runtime/src/vm/snapshot_pool.rs` keeps per-template warm Firecracker snapshots; `up` clones from pool. (Phase 1 set up the path; Phase 9 measures and tunes pool size + eviction.)
+- Land snapshot pool: `mvm/src/vm/snapshot_pool.rs` keeps per-template warm Firecracker snapshots; `up` clones from pool. (Phase 1 set up the path; Phase 9 measures and tunes pool size + eviction.)
 - Port `xtask/` reproducibility check, cosign-keyless workflows from `../mvm/.github/`.
 - Port `deny.toml` from `../mvm`.
 - Tighten boot: kernel modules trimmed (KVM_CLOCK + virtio + vsock + ext4 + dm-verity only), initramfs rewritten, Nix closure pruned, `vmlinux` direct-boot. Track in `specs/plans/<n>-boot-perf.md`.
@@ -1887,11 +1887,11 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 
 **Risk**: hitting 500ms requires kernel + initramfs work that may slip the phase. Acceptable to ship at 800ms initially and tighten in a follow-up sprint.
 
-### Phase 10 — Rename `mvm-runtime/` → `mvm/`, archive previous (~1 day)
+### Phase 10 — Rename `mvm/` → `mvm/`, archive previous (~1 day)
 **Goal**: Final repo lives at `/Users/auser/work/tinylabs/mvmco/mvm/`; the previous iteration moves to `/Users/auser/work/tinylabs/mvmco/mvm-legacy/`; mvmd is updated to point at the new path.
 
 **Action**:
-- `git mv mvm-runtime mvm` (from the workspace parent), update CI paths, update `Cargo.toml` `repository` URL, update mvmd's git pin to the new branch.
+- `git mv mvm mvm` (from the workspace parent), update CI paths, update `Cargo.toml` `repository` URL, update mvmd's git pin to the new branch.
 - Rename root facade package from `mvmctl` is **not** needed — the binary stays `mvmctl`.
 
 **Exit tests**: all prior phases' tests still green from the new path.
@@ -1961,9 +1961,9 @@ mvmctl down demo
 - `/Users/auser/work/tinylabs/mvmco/mvm/crates/mvm-core/src/protocol/vm_backend.rs` — the `VmBackend` trait; canonical backend abstraction
 - `/Users/auser/work/tinylabs/mvmco/mvmd/crates/mvmd-runtime/src/{vm,security,hostd}/` — where mvmd absorbed runtime code; we pull the more recent versions from here when they exist
 - `/Users/auser/work/tinylabs/mvmco/mvmd/crates/mvmd-agent/src/transport.rs` — QUIC/mTLS reference for our hostd surface
-- `/Users/auser/work/tinylabs/mvmco/mvm-runtime/tests/cli.rs` — 91-test CLI specification, our burndown gate
+- `/Users/auser/work/tinylabs/mvmco/mvm/tests/cli.rs` — 91-test CLI specification, our burndown gate
 - `/Users/auser/work/tinylabs/mvmco/mvmforge/crates/mvmforge-sdk/src/lib.rs` — source of `mvm-sdk`
-- `/Users/auser/work/tinylabs/mvmco/mvm-runtime/specs/plans/25-microvm-hardening.md` and `specs/adrs/002-microvm-security-posture.md` — security posture sequencing already designed by the user
+- `/Users/auser/work/tinylabs/mvmco/mvm/specs/plans/25-microvm-hardening.md` and `specs/adrs/002-microvm-security-posture.md` — security posture sequencing already designed by the user
 
 ## Estimated calendar time
 

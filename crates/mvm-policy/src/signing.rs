@@ -218,7 +218,7 @@ mod tests {
         // Sanity: a tenant overlay with only `pii: Some(_)` leaves
         // every other field as None (inherit-from-base semantics).
         // The actual base+overlay merge function lives in
-        // mvm-runtime's PolicyResolver (Wave 2); here we only assert
+        // mvm's PolicyResolver (Wave 2); here we only assert
         // that the wire format is what the resolver will read.
         let b = sample_bundle();
         let overlay = b

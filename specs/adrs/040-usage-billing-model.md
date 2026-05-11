@@ -29,9 +29,9 @@ Typical sandbox-runtime tier shape (used in the industry as a reference):
 mvm needs to **emit the metering events the runtime can observe**; mvmd aggregates per-tenant rollups and produces invoices. This ADR fixes the runtime-side event schema so mvmd can be built against a stable contract.
 
 Existing infrastructure to build on:
-- `crates/mvm-runtime/src/vm/tenant/quota.rs::TenantUsage` and `crates/mvm-core/src/tenant.rs::TenantQuota` — fleet-level rollups, Postgres-backed in mvmd.
+- `crates/mvm/src/vm/tenant/quota.rs::TenantUsage` and `crates/mvm-core/src/tenant.rs::TenantQuota` — fleet-level rollups, Postgres-backed in mvmd.
 - `crates/mvm-core/src/instance.rs::InstanceState` — per-VM state.
-- `crates/mvm-runtime/src/sleep/metrics.rs` — already emits sleep-related metrics; same shape can be reused.
+- `crates/mvm/src/sleep/metrics.rs` — already emits sleep-related metrics; same shape can be reused.
 - `crates/mvm-core/src/metering.rs` — three-axis decomposition (CPU, memory, storage) already documented; this ADR extends it with event emission.
 
 Plan 45 (filesystem-volumes, sandbox-runtime parity) shipped feature parity around volumes. This ADR is its commercial counterpart.
@@ -105,7 +105,7 @@ Caps are advisory in standalone dev mode (`~/.mvm/caps.json` user-editable; not 
 
 ### Bridge to existing types
 
-`TenantUsage` (current in-memory tenant rollup) becomes a *consumer* of the JSONL stream rather than a separately-maintained counter. Implementation: a small reducer in `mvm-runtime::vm::tenant::quota` reads the per-VM JSONL files for the tenant and computes `TenantUsage` on demand. Backwards compatible — all existing call sites keep working.
+`TenantUsage` (current in-memory tenant rollup) becomes a *consumer* of the JSONL stream rather than a separately-maintained counter. Implementation: a small reducer in `mvm::vm::tenant::quota` reads the per-VM JSONL files for the tenant and computes `TenantUsage` on demand. Backwards compatible — all existing call sites keep working.
 
 ## Consequences
 
@@ -121,7 +121,7 @@ Caps are advisory in standalone dev mode (`~/.mvm/caps.json` user-editable; not 
 - JSONL on disk grows unbounded if not scraped. Default 30-day retention rotates old files; mvmd-fleet scrapes ship-and-delete.
 
 **Neutral:**
-- The existing `mvm-runtime::sleep::metrics` module remains; usage events sit alongside it. Overlap is small (sleep metrics record state transitions; usage records billing-relevant deltas).
+- The existing `mvm::sleep::metrics` module remains; usage events sit alongside it. Overlap is small (sleep metrics record state transitions; usage records billing-relevant deltas).
 
 ## Alternatives considered
 

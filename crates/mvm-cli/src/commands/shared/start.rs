@@ -2,7 +2,7 @@
 //! `mvm_core::vm_backend::VmStartConfig` without exposing the conversion
 //! surface to every command file.
 
-use mvm_runtime::config;
+use mvm::config;
 use mvm_backend::{image, microvm};
 
 /// Parameters for building a `VmStartConfig` from runtime-specific types.

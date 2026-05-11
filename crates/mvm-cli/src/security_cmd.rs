@@ -2,7 +2,7 @@ use anyhow::Result;
 
 use mvm_core::security::{PostureCheck, SecurityLayer, SecurityPolicy};
 use mvm_core::time;
-use mvm_runtime::shell;
+use mvm::shell;
 use mvm_security::posture::SecurityPosture;
 
 use crate::ui;

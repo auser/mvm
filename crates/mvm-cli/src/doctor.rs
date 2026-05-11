@@ -5,8 +5,8 @@ use crate::ui;
 use mvm_core::config::fc_version;
 use mvm_core::platform::{self, Platform};
 use mvm_core::vm_backend::ClaimStatus;
-use mvm_runtime::config::VM_NAME;
-use mvm_runtime::shell;
+use mvm::config::VM_NAME;
+use mvm::shell;
 use mvm_backend::backend::AnyBackend;
 
 #[derive(Debug, Serialize)]

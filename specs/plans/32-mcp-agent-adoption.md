@@ -208,7 +208,7 @@ installs jq via apt; locally `brew install jq`.
 - `crates/mvm-cli/src/exec.rs` — `ExecRequest`/`ExecResult`/`run()`.
 - `crates/mvm-cli/src/commands/vm/exec.rs` — how the CLI builds
   `ExecRequest`.
-- `crates/mvm-runtime/src/vm/template/lifecycle.rs:81-97` —
+- `crates/mvm/src/vm/template/lifecycle.rs:81-97` —
   `template_list()`, used to populate the `env` allowlist.
 - `specs/adrs/002-microvm-security-posture.md` — ADR-003 must compose.
 
@@ -418,12 +418,12 @@ Wire it to TAP setup so allowlist enforcement happens at attach time.
 
 - `crates/mvm-core/src/network_policy.rs` — extend `NetworkPolicy` with
   `egress_mode: EgressMode { Off, Open, AllowDomains, AllowDomainsStrict }`.
-- `crates/mvm-runtime/src/vm/network.rs` — `tap_create()` honors the
+- `crates/mvm/src/vm/network.rs` — `tap_create()` honors the
   policy: spawns the egress proxy on a per-VM port, installs iptables
   rules in `MVMEGRESS-<vm>` chain, tears down on `tap_destroy()`.
-- `crates/mvm-runtime/src/vm/microvm.rs` — pass `HTTPS_PROXY` and
+- `crates/mvm/src/vm/microvm.rs` — pass `HTTPS_PROXY` and
   `MVM_EGRESS_CA_PATH` into the guest via existing env injection.
-- New: `crates/mvm-runtime/src/vm/egress_proxy.rs` — wrapper around
+- New: `crates/mvm/src/vm/egress_proxy.rs` — wrapper around
   `mitmdump` from nixpkgs; surfaced via `mvmctl doctor`.
 - `nix/lib/minimal-init/default.nix` — install the mvm CA cert at boot
   if `/run/mvm-egress.crt` is mounted.
@@ -433,7 +433,7 @@ Wire it to TAP setup so allowlist enforcement happens at attach time.
 
 ## Verification
 
-- `cargo test -p mvm-runtime egress` — unit tests for iptables rule
+- `cargo test -p mvm egress` — unit tests for iptables rule
   generation, allowlist parsing.
 - Integration: build `claude-code-vm` (Proposal B) with
   `network_policy.egress_mode = AllowDomainsStrict` + `domains =
@@ -506,7 +506,7 @@ bubblewrap-bound.
 
 - **First call with new session ID:** allocate a snapshot-resumed VM
   (or cold-boot if no snapshot for env). Call
-  `mvm_runtime::vm::microvm::run_from_snapshot()` from
+  `mvm::vm::microvm::run_from_snapshot()` from
   `lifecycle.rs:539`. Stash `(session_id → VmId)` in a local
   in-memory map (lifetime = MCP server process).
 - **Subsequent calls with same session ID:** route the command to the
@@ -589,7 +589,7 @@ Sits after A. Treat as A.2 — same crate, additive.
 
 - **B: secret injection mechanism.** Verify before starting B: read
   `crates/mvm-cli/src/exec.rs` for any `secret_files` field, and
-  `crates/mvm-runtime/src/vm/microvm.rs` for `secret_files: vec![]`
+  `crates/mvm/src/vm/microvm.rs` for `secret_files: vec![]`
   in `FlakeRunConfig`. If absent, B grows a sub-task to add it via
   mvm's existing secrets path (`/mnt/secrets` per ADR-002).
 
@@ -597,7 +597,7 @@ Sits after A. Treat as A.2 — same crate, additive.
   bridge `br-mvm` runs *inside the Lima VM* on macOS, not on the
   host. The egress-proxy launcher and iptables rules must dispatch
   via `shell::run_in_vm()`, not run directly on macOS. Follow the
-  established pattern in `crates/mvm-runtime/src/vm/network.rs`.
+  established pattern in `crates/mvm/src/vm/network.rs`.
 
 ## UX / interop (should do)
 

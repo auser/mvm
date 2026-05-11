@@ -108,7 +108,7 @@ Sprint 12 Phase 1 is done but missing the regression tests.
 ## Phase 2: Essential-Path Integration Tests (~20 tests, 1 week)
 
 ### 2a. Instance lifecycle test (5 tests)
-Using `shell_mock` infrastructure in `crates/mvm-runtime/src/shell_mock.rs`:
+Using `shell_mock` infrastructure in `crates/mvm/src/shell_mock.rs`:
 
 - [ ] `test_full_lifecycle_happy_path` — create → start → warm → sleep → wake → stop → destroy
 - [ ] `test_invalid_transition_rejected` — Running → Sleeping (invalid, must go through Warm)
@@ -117,7 +117,7 @@ Using `shell_mock` infrastructure in `crates/mvm-runtime/src/shell_mock.rs`:
 - [ ] `test_network_identity_preserved` — IP and MAC same after sleep/wake
 
 **Files:**
-- `crates/mvm-runtime/tests/lifecycle.rs` (new integration test file)
+- `crates/mvm/tests/lifecycle.rs` (new integration test file)
 
 ### 2b. Agent reconcile test (5 tests)
 
@@ -390,7 +390,7 @@ Use mocking where needed to avoid requiring actual Lima. Run clippy and tests wh
 
 **2a. Instance lifecycle tests:**
 ```
-Create crates/mvm-runtime/tests/lifecycle.rs with 5 integration tests using the shell_mock infrastructure from crates/mvm-runtime/src/shell_mock.rs:
+Create crates/mvm/tests/lifecycle.rs with 5 integration tests using the shell_mock infrastructure from crates/mvm/src/shell_mock.rs:
 1. test_full_lifecycle_happy_path — create → start → warm → sleep → wake → stop → destroy
 2. test_invalid_transition_rejected — Running → Sleeping (must go through Warm first)
 3. test_quota_enforcement — start fails when tenant quota exceeded

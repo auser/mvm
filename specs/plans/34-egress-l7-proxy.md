@@ -30,7 +30,7 @@ Plan 32 / `feat/egress-l7-proxy` shipped the foundation:
 
 - `mvm_core::policy::network_policy::EgressMode` enum
   (`Open` / `L3Only` / `L3PlusL7`).
-- `mvm_runtime::vm::egress_proxy` module with the `EgressProxy`
+- `mvm::vm::egress_proxy` module with the `EgressProxy`
   trait, `ProxyHandle`, `EgressProxyError` (with a
   `NotImplemented` variant pointing here), and a `StubEgressProxy`.
 - 4 unit tests cover the stub's "not implemented" surface.
@@ -69,7 +69,7 @@ L7 does NOT close:
 
 ### Tier 1 — `mitmdump` per-VM supervisor
 
-**File:** `crates/mvm-runtime/src/vm/egress_proxy.rs` (extend the
+**File:** `crates/mvm/src/vm/egress_proxy.rs` (extend the
 stub).
 
 `MitmdumpSupervisor` implements `EgressProxy`:
@@ -115,7 +115,7 @@ valid for 5 years. `mvmctl doctor` reports its presence/expiry.
 `mitmdump` is configured to use this CA via `--set
 ca_certs=~/.mvm/egress/ca.pem`. The same cert path is mounted
 read-only into every guest at `/etc/ssl/certs/mvm-egress.crt` via
-mvm-runtime's existing config-files plumbing (no new `secret_files`
+mvm's existing config-files plumbing (no new `secret_files`
 needed — cert is non-sensitive once distributed).
 
 Guest-side rootfs init (in `nix/lib/minimal-init/`) copies
@@ -124,7 +124,7 @@ when the file is present.
 
 ### Tier 3 — DNS-answer pinning (optional, per-policy)
 
-**File:** `crates/mvm-runtime/src/vm/dns_pin.rs` (new).
+**File:** `crates/mvm/src/vm/dns_pin.rs` (new).
 
 `dnsmasq` stub resolver on the host (or inside Lima on macOS) bound
 to a private CIDR the guest reaches. The stub:
@@ -143,7 +143,7 @@ extra defence enable it via
 ### Tier 4 — Wire it up
 
 **Files:**
-- `crates/mvm-runtime/src/vm/network.rs` — `apply_network_policy`
+- `crates/mvm/src/vm/network.rs` — `apply_network_policy`
   takes an `EgressMode` parameter and a `&dyn EgressProxy`. When
   `EgressMode::L3PlusL7`, it calls `proxy.start_for_vm` after the
   L3 rules. `cleanup_network_policy` calls `proxy.stop_for_vm`.
@@ -224,7 +224,7 @@ in §"Sequence" assumes they're folded.
   HTTP/2. Document; revisit if a guest needs HTTP/3 specifically.
 
 - **Cleanup on crash, tier 1 specifics (Tier 1).** Plan said "process
-  group" but `MitmdumpSupervisor` runs from an mvm-runtime call,
+  group" but `MitmdumpSupervisor` runs from an mvm call,
   which isn't a session leader. On Linux, set
   `prctl(PR_SET_PDEATHSIG, SIGKILL)` on the spawned mitmdump child so
   a parent crash doesn't orphan it. macOS has no PR_SET_PDEATHSIG —
@@ -298,9 +298,9 @@ in §"Sequence" assumes they're folded.
 
 | File | Change |
 |---|---|
-| `crates/mvm-runtime/src/vm/egress_proxy.rs` | Replace `StubEgressProxy` with `MitmdumpSupervisor`; add `prctl(PR_SET_PDEATHSIG)` on spawn (Linux) + watchdog poll (macOS); bind-then-commit port allocator; Prometheus metrics (`mvm_egress_proxy_*`) |
-| `crates/mvm-runtime/src/vm/dns_pin.rs` | new — dnsmasq supervisor |
-| `crates/mvm-runtime/src/vm/network.rs` | wire `apply_network_policy` to call the proxy; assert L3-then-L7 chain ordering; DROP UDP/443 from guest CIDR |
+| `crates/mvm/src/vm/egress_proxy.rs` | Replace `StubEgressProxy` with `MitmdumpSupervisor`; add `prctl(PR_SET_PDEATHSIG)` on spawn (Linux) + watchdog poll (macOS); bind-then-commit port allocator; Prometheus metrics (`mvm_egress_proxy_*`) |
+| `crates/mvm/src/vm/dns_pin.rs` | new — dnsmasq supervisor |
+| `crates/mvm/src/vm/network.rs` | wire `apply_network_policy` to call the proxy; assert L3-then-L7 chain ordering; DROP UDP/443 from guest CIDR |
 | `crates/mvm-core/src/policy/network_policy.rs` | extend `NetworkPolicy::Preset` / `AllowList` with `egress_mode: Option<EgressMode>` enrichment (not a sibling field) |
 | `crates/mvm-cli/src/commands/ops/egress.rs` | new — `mvmctl egress init-ca` (idempotent, refuses without `--force`); `mvmctl egress rotate-ca` |
 | `crates/mvm-core/src/policy/audit.rs` | new audit kind `EgressCaRotated` |

@@ -97,7 +97,7 @@ DX ideas while keeping our architecture.
 
 ### 1c. VM Name Registry ✓
 
-- [x] `VmNameRegistry` in `mvm-runtime/src/vm/name_registry.rs`
+- [x] `VmNameRegistry` in `mvm/src/vm/name_registry.rs`
 - [x] `VmRegistration` struct (vm_dir, network, guest_ip, slot_index, registered_at)
 - [x] `register()`, `deregister()`, `lookup()`, `names()` operations
 - [x] Atomic save via `mvm_core::atomic_io::atomic_write()`
@@ -281,7 +281,7 @@ mvmctl up --network <name>                        # Attach VM to named network
 | `crates/mvm-core/src/audit.rs` | Extended `LocalAuditKind` with 9 new variants |
 | `crates/mvm-core/src/user_config.rs` | XDG config dir with legacy fallback, `catalog_url` |
 | `crates/mvm-core/src/security.rs` | `AccessPolicy.console` field |
-| `crates/mvm-runtime/src/vm/name_registry.rs` | New: `VmNameRegistry` for name-based VM lookups |
+| `crates/mvm/src/vm/name_registry.rs` | New: `VmNameRegistry` for name-based VM lookups |
 | `crates/mvm-guest/src/vsock.rs` | Console protocol variants, `connect_to()` + `send_request()` public |
 | `crates/mvm-guest/src/console.rs` | New: PTY allocation, shell fork, vsock data relay |
 | `crates/mvm-guest/src/bin/mvm-guest-agent.rs` | Console session handler with `access.console` policy check |

@@ -71,11 +71,11 @@ Firecracker vsock only." Replace with a full subsection:
 mvm makes seven CI-enforced security claims:
 
 1. *No host-fs access from a guest beyond explicit shares.* —
-   tested: `crates/mvm-runtime/tests/w2-guest-isolation.rs`.
+   tested: `crates/mvm/tests/w2-guest-isolation.rs`.
 2. *No guest binary can elevate to uid 0.* —
-   tested: `crates/mvm-runtime/tests/w2-no-new-privs.rs`.
+   tested: `crates/mvm/tests/w2-no-new-privs.rs`.
 3. *A tampered rootfs ext4 fails to boot.* —
-   tested: `crates/mvm-runtime/tests/w3-verity-tamper.rs`.
+   tested: `crates/mvm/tests/w3-verity-tamper.rs`.
 4. *The guest agent does not contain `do_exec` in production.* —
    gated: `.github/workflows/security.yml::symbol-check`.
 5. *Vsock framing is fuzzed.* —

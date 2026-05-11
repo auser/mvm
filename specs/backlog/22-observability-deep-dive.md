@@ -79,9 +79,9 @@ The HTTP server uses only `std::net::TcpListener` (no new deps) to keep the depe
 - [x] In `crates/mvm-build/src/dev_build.rs`, wrap the nix build with `std::time::Instant` and record to `build_image_duration_ms`
 - [x] Add `tracing::info_span!("build_image", flake = %flake_ref)` around the build
 
-### 1.3 Instrument `vm_start` in `mvm-runtime`
+### 1.3 Instrument `vm_start` in `mvm`
 
-- [x] In `crates/mvm-runtime/src/vm/microvm.rs`, time the `start()` call and record to `vm_start_duration_ms`
+- [x] In `crates/mvm/src/vm/microvm.rs`, time the `start()` call and record to `vm_start_duration_ms`
 - [x] Add `tracing::info_span!("vm_start")` around the start sequence
 
 ### 1.4 Instrument vsock handshake in `mvm-guest`

@@ -2,7 +2,7 @@
 //!
 //! Phase 1 ships the read-only `info` verb and a `gc --dry-run` /
 //! `gc --apply` verb that operate against the storage abstraction in
-//! `mvm-runtime/src/storage/`. The MockBackend is the only impl that
+//! `mvm/src/storage/`. The MockBackend is the only impl that
 //! actually does anything today; the production DmsetupBackend lands
 //! its real `dmsetup` invocations in Phase 2 alongside the
 //! instance-create migration in `vm/template/lifecycle.rs`.

@@ -8,7 +8,7 @@ use anyhow::{Context, Result};
 use mvm_core::agent::{DesiredPool, DesiredState, DesiredTenant, DesiredTenantNetwork};
 use mvm_core::pool::{DesiredCounts, InstanceResources, Role};
 use mvm_core::tenant::TenantQuota;
-use mvm_runtime::security::certs;
+use mvm::security::certs;
 
 use crate::ui;
 

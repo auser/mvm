@@ -88,9 +88,9 @@ pub trait LinuxEnv: Send + Sync {
 }
 ```
 
-### 1b: `LimaEnv` + `NativeEnv` in mvm-runtime
+### 1b: `LimaEnv` + `NativeEnv` in mvm
 
-New file: `crates/mvm-runtime/src/linux_env.rs`
+New file: `crates/mvm/src/linux_env.rs`
 
 - `LimaEnv { vm_name: String }` — wraps `limactl shell <vm_name> bash -c "..."`
 - `NativeEnv` — wraps `bash -c "..."`
@@ -116,10 +116,10 @@ pub struct RuntimeBuildEnv<'a> {
 |------|--------|
 | `crates/mvm-core/src/linux_env.rs` | New trait |
 | `crates/mvm-core/src/lib.rs` | Add `pub mod linux_env` |
-| `crates/mvm-runtime/src/linux_env.rs` | New: LimaEnv, NativeEnv, factory |
-| `crates/mvm-runtime/src/lib.rs` | Add `pub mod linux_env` |
-| `crates/mvm-runtime/src/shell.rs` | Internal delegation to default LinuxEnv |
-| `crates/mvm-runtime/src/build_env.rs` | Accept `&dyn LinuxEnv` |
+| `crates/mvm/src/linux_env.rs` | New: LimaEnv, NativeEnv, factory |
+| `crates/mvm/src/lib.rs` | Add `pub mod linux_env` |
+| `crates/mvm/src/shell.rs` | Internal delegation to default LinuxEnv |
+| `crates/mvm/src/build_env.rs` | Accept `&dyn LinuxEnv` |
 
 ### Tests
 
@@ -345,7 +345,7 @@ pub enum AnyBackend {
 
 | File | Change |
 |------|--------|
-| `crates/mvm-runtime/src/vm/backend.rs` | Add AnyBackend, UnifiedRunConfig |
+| `crates/mvm/src/vm/backend.rs` | Add AnyBackend, UnifiedRunConfig |
 | `crates/mvm-cli/src/commands.rs` | Dispatch through AnyBackend |
 
 ---
@@ -356,7 +356,7 @@ pub enum AnyBackend {
 
 ### 4a: `MicrovmNixBackend`
 
-New file: `crates/mvm-runtime/src/vm/microvm_nix.rs`
+New file: `crates/mvm/src/vm/microvm_nix.rs`
 
 - `start()`: runs the preserved runner script from build output (`$out/bin/microvm-run`)
 - `stop()`: `SendCtrlAltDel` via FC API socket or kill
@@ -370,8 +370,8 @@ New file: `crates/mvm-runtime/src/vm/microvm_nix.rs`
 
 | File | Change |
 |------|--------|
-| `crates/mvm-runtime/src/vm/microvm_nix.rs` | New backend |
-| `crates/mvm-runtime/src/vm/backend.rs` | Add MicrovmNix variant |
+| `crates/mvm/src/vm/microvm_nix.rs` | New backend |
+| `crates/mvm/src/vm/backend.rs` | Add MicrovmNix variant |
 | `crates/mvm-build/src/dev_build.rs` | Copy runner script |
 
 ---

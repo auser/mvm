@@ -120,7 +120,7 @@ Even with per-worktree isolation, a few resources are shared and can cause concu
 
 ### Lima VM sharing
 
-The Lima VM (`mvm-builder`) is shared across worktrees by design — **never fork it per worktree**. It is expensive to boot, and the Nix store inside it is the warm cache that makes builds fast; a per-worktree VM would duplicate tens of GB of store, re-download the kernel/rootfs, and multiply boot time with no isolation benefit. There is also no second VM name baked into the codebase: `mvmctl`, the `Justfile`, CI, and AGENTS.md examples all hard-code `mvm-builder`, and `RuntimeBuildEnv` / `run_on_vm` route through `mvm_runtime::config::VM_NAME`.
+The Lima VM (`mvm-builder`) is shared across worktrees by design — **never fork it per worktree**. It is expensive to boot, and the Nix store inside it is the warm cache that makes builds fast; a per-worktree VM would duplicate tens of GB of store, re-download the kernel/rootfs, and multiply boot time with no isolation benefit. There is also no second VM name baked into the codebase: `mvmctl`, the `Justfile`, CI, and AGENTS.md examples all hard-code `mvm-builder`, and `RuntimeBuildEnv` / `run_on_vm` route through `mvm::config::VM_NAME`.
 
 The `MVM_DATA_DIR` override is what isolates per-feature state — templates, sockets, the microVM registry, snapshots, signing keys. Anything that would otherwise land in `~/.mvm` ends up under the worktree.
 

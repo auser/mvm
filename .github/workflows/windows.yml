@@ -12,8 +12,8 @@ name: Windows (informational)
 #
 # - `crates/mvm-apple-container/src/lib.rs::vsock_connect` returns
 #   `std::os::unix::net::UnixStream`, which doesn't exist on Windows.
-#   Callers in `mvm-runtime/src/vsock_transport.rs`,
-#   `mvm-runtime/src/linux_env.rs`, `mvm-cli/src/commands/vm/console.rs`,
+#   Callers in `mvm/src/vsock_transport.rs`,
+#   `mvm/src/linux_env.rs`, `mvm-cli/src/commands/vm/console.rs`,
 #   and `mvm-cli/src/commands/env/apple_container.rs` propagate this.
 # - Various `~/.mvm/...` path constructions assume `$HOME`. Windows uses
 #   `%USERPROFILE%`; follow-up under plan 53 Plan I.4 (WSL2 bootstrap).
