@@ -1,6 +1,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+mod check_adr_coverage;
+
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
     match args.get(1).map(|s| s.as_str()) {
@@ -8,14 +10,35 @@ fn main() -> Result<()> {
             let output_dir = parse_output_dir(&args).unwrap_or_else(default_man_dir);
             gen_man(&output_dir)
         }
-        Some(other) => anyhow::bail!("Unknown xtask: {:?}. Available: gen-man", other),
+        Some("check-adr-coverage") => {
+            let workspace = workspace_root();
+            check_adr_coverage::run(&workspace)
+        }
+        Some(other) => anyhow::bail!(
+            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage",
+            other
+        ),
         None => {
             eprintln!("Usage: cargo xtask <task>");
             eprintln!("Available tasks:");
             eprintln!("  gen-man [--output-dir DIR]   Generate man pages into DIR (default: man/)");
+            eprintln!("  check-adr-coverage           Report ADRs with no code references");
             std::process::exit(1);
         }
     }
+}
+
+/// Resolve the workspace root from the xtask manifest dir. xtask's
+/// `CARGO_MANIFEST_DIR` resolves to `<workspace>/xtask/`, so the
+/// workspace root is the parent directory.
+fn workspace_root() -> PathBuf {
+    let manifest = std::env::var("CARGO_MANIFEST_DIR")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
+    manifest
+        .parent()
+        .map(|p| p.to_path_buf())
+        .unwrap_or(manifest)
 }
 
 fn parse_output_dir(args: &[String]) -> Option<PathBuf> {
@@ -29,11 +52,7 @@ fn parse_output_dir(args: &[String]) -> Option<PathBuf> {
 }
 
 fn default_man_dir() -> PathBuf {
-    // Resolve workspace root: xtask's CARGO_MANIFEST_DIR is <workspace>/xtask/.
-    let manifest = std::env::var("CARGO_MANIFEST_DIR")
-        .map(PathBuf::from)
-        .unwrap_or_else(|_| std::env::current_dir().unwrap_or_default());
-    manifest.parent().unwrap_or(&manifest).join("man")
+    workspace_root().join("man")
 }
 
 pub fn gen_man(output_dir: &Path) -> Result<()> {

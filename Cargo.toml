@@ -35,6 +35,16 @@ repository = "https://github.com/auser/mvm"
 homepage = "https://github.com/auser/mvm"
 authors = ["mvm contributors"]
 
+# Workspace-wide lint policy. Plan-60 Phase 0 exit criterion — every
+# crate inherits this via `lints.workspace = true` in its own
+# Cargo.toml. CLAUDE.md says "No `clippy::too_many_arguments`: never
+# suppress this lint. Refactor into smaller functions or a config/
+# params struct." The lint here enforces that workspace-wide so a
+# future violator gets blocked at `cargo clippy --workspace --
+# -D warnings` instead of slipping through.
+[workspace.lints.clippy]
+too_many_arguments = "deny"
+
 [workspace.dependencies]
 # Async runtime
 tokio = { version = "1", features = ["full"] }

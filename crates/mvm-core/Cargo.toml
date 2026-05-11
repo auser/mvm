@@ -25,3 +25,6 @@ uuid.workspace = true
 fs2.workspace = true
 regex = "1"
 tempfile.workspace = true
+
+[lints]
+workspace = true

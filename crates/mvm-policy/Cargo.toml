@@ -19,3 +19,6 @@ thiserror = "1"
 
 [dev-dependencies]
 rand.workspace = true
+
+[lints]
+workspace = true

@@ -66,3 +66,6 @@ objc2-virtualization = { version = "0.3", features = [
 
 [dev-dependencies]
 tempfile = "3"
+
+[lints]
+workspace = true
