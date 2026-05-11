@@ -4027,6 +4027,7 @@ dependencies = [
  "aho-corasick",
  "anyhow",
  "chrono",
+ "ed25519-dalek",
  "hmac",
  "keyring",
  "mvm-core",

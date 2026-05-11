@@ -1,6 +1,7 @@
 //! Operational commands — config, networks, audit, metrics, cache.
 //! (Plan 40 folded `mvmctl security` into `mvmctl doctor`.)
 
+pub(super) mod attest;
 pub(super) mod audit;
 pub(super) mod cache;
 pub(super) mod config;

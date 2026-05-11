@@ -164,6 +164,12 @@ pub(in crate::commands) enum Commands {
     /// `~/.mvm/audit/secrets.jsonl` — values are never logged.
     /// Plan 63 W4.
     Secret(ops::secret::Args),
+    /// Emit or verify a host attestation report (`export`, `verify`,
+    /// `status`). The report carries an Ed25519-signed body with the
+    /// boot measurement, identity public key, and an optional
+    /// hardware quote when a `attestation-{tpm2,sev-snp,tdx}` feature
+    /// is wired in. Plan 60 Phase 6.
+    Attest(ops::attest::Args),
 }
 
 // ============================================================================
@@ -282,6 +288,7 @@ pub fn run() -> Result<()> {
         Commands::Snapshot(a) => vm::pause::run_snapshot(&cli, a, &cfg),
         Commands::Volume(a) => vm::volume::run(&cli, a, &cfg),
         Commands::Secret(a) => ops::secret::run(&cli, a, &cfg),
+        Commands::Attest(a) => ops::attest::run(&cli, a, &cfg),
     };
 
     with_hints(result)

@@ -16,12 +16,25 @@ authors.workspace = true
 default = ["manifest-verify"]
 manifest-verify = ["dep:sigstore", "dep:tokio"]
 
+# Hardware attestation provider stubs (plan 60 Phase 6).
+# Each feature enables the corresponding `HwAttestationProvider` impl
+# under `attestation::provider`. v0 stubs return
+# `AttestationError::NotYetImplemented`; real backends land
+# post-Phase-6 as the hosted mvmd cloud needs them for compliance.
+# Off by default — admission-time refusal when a tenant policy
+# demands a mode the binary wasn't compiled with stays loud rather
+# than silently downgrading.
+attestation-tpm2     = []
+attestation-sev-snp  = []
+attestation-tdx      = []
+
 [dependencies]
 mvm-core.workspace = true
 aes-gcm.workspace = true
 aho-corasick.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
+ed25519-dalek.workspace = true
 hmac.workspace = true
 keyring.workspace = true
 rand.workspace = true

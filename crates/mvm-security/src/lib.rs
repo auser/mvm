@@ -1,3 +1,4 @@
+pub mod attestation;
 pub mod command_gate;
 pub mod image_verify;
 pub mod key_rotation;

@@ -1794,23 +1794,32 @@ work, not mvm's.
 
 **Risk**: low.
 
-### Phase 6 — Security model: seccomp, jailer, dm-verity, signed plans, attestation, fuzz harnesses (~10-14 days)
+### Phase 6 — Security model: seccomp, jailer, dm-verity, signed plans, attestation, fuzz harnesses (~10-14 days) — ✅ shipped 2026-05-11
 
-**Status (2026-05-11)**: seccomp tiers, dm-verity, fuzz harnesses,
-prod-agent-no-exec, **signed-and-audited `ExecutionPlan`**, the
-plan 64 W5 `PolicyRef` resolver substrate, and the **on-disk
-policy-bundle TOML format** all shipped (CLAUDE.md security claims
-1–8; ADR-041). The W5 resolver now loads
+**Status (2026-05-11 — ✅ shipped)**: seccomp tiers, dm-verity, fuzz
+harnesses, prod-agent-no-exec, **signed-and-audited
+`ExecutionPlan`**, the plan 64 W5 `PolicyRef` resolver substrate,
+the **on-disk policy-bundle TOML format**, and now the
+**`mvm_security::attestation` module + `mvmctl attest`
+{export,verify,status} CLI surface** all shipped (CLAUDE.md
+security claims 1–8; ADR-041). The W5 resolver loads
 `~/.mvm/policies/<tenant>/<workload>.toml` for tenant-scoped refs
 via `mvm_policy::toml_loader`; parse errors surface as
 `ResolveError::BundleNotFound` / `BundleParseFailed` /
 `MixedRefs` / `Unrecognized` with operator-actionable detail.
 Returned slots remain Noops because no live consumer
 (L4/L7 proxies, real ToolGate) exists yet — Phase 3 builds those.
-**Hardware attestation (TPM2/SEV-SNP/TDX) + the `mvmctl attest`
-CLI surface remain the only outstanding Phase 6 work**, sequenced
-together with the mvm-hostd lift that turns the W5 resolver into
-a live consumer of `Supervisor::with_*` builders.
+Hardware attestation v0 ships as three feature-gated stubs
+(`attestation-tpm2`, `attestation-sev-snp`, `attestation-tdx`),
+each returning `AttestationError::NotYetImplemented` from
+`measure()`; the `HwAttestationProvider` trait + the supervisor
+admission gate that refuses unsupported modes on builds compiled
+without the feature are in place, ready for real hardware
+bring-up post-Phase-6 when the hosted mvmd cloud needs them for
+compliance. Runtime tier (boot attestation + dm-verity-root-hash
+wiring) tracks behind a `PLACEHOLDER_BOOT_MEASUREMENT` constant
+in the `mvmctl attest export` path — the report schema is
+already stable across the transition.
 
 **Goal**: `mvmctl up --security strict` applies a seccomp profile; rootfs verified at boot via dm-verity; signed Plans rejected if Ed25519 sig fails; fuzz harness runs in CI for vsock framing; **`mvmctl attest <vm>` returns a verifiable attestation report**.
 
