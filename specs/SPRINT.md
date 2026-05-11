@@ -994,6 +994,175 @@ Backend tier matrix gap closed simultaneously: ADR-002 now lists Cloud Hyperviso
 - Any user-facing CLI surface beyond `--help`/`--version` (Phase 1+)
 - mvm-studio (Tauri) wiring (Phase 5)
 
+## Sprint 51 — close the v1→v2 refactor (in flight)  [`plans/60-mvm-microsandbox-migration.md`](plans/60-mvm-microsandbox-migration.md), [`plans/63-phase-2-encryption-everywhere.md`](plans/63-phase-2-encryption-everywhere.md), [`plans/64-supervisor-wiring.md`](plans/64-supervisor-wiring.md)
+
+**Goal:** finish every remaining plan that the v1→v2 refactor
+depends on, so the campaign can declare itself closed. Sprint 50
+landed Phase 0 + 1 of the migration; Sprint 51 carries the
+remaining plan-60 phases, the closed-form plans the supervisor /
+encryption / signal threads needed, and the function-call surface
+that mvmforge depends on.
+
+**Status (2026-05-11):** 10 commits landed on `origin/main` in
+one focused batch closing four plans (64, 63, 62, 44) and the
+plan-60 Phase 6 policy-bundle TOML substrate. Workspace at **2098
+tests / 0 failed**; clippy `-D warnings` clean; nightly fmt
+clean; xtask `check-no-display-on-secret-types` clean. CLAUDE.md
+security claims 1–8 all true on every host. ADR-041 (signed +
+audited `ExecutionPlan`) and ADR-042 (encryption substrate)
+document the closed surfaces. Remaining work covers Phase 6
+hardware attestation, Phase 3 (network isolation), Phases 4/5/7
+through 10, plans 48/49/51/52 (function-call surface), plan 61
+(overlays + billing), and the partial-plan sweep (32 / 16 / 18).
+
+### Shipped (campaign batch 2026-05-11)
+
+| Plan | Workstream(s) | Commit |
+|---|---|---|
+| 64 — supervisor wiring | W5 — `PolicyRef` resolver substrate | `0aee20f` |
+| 63 — encryption everywhere (Phase 2) | W2 — `SecretBox<T>` wrapping pass | `b9e4e64` |
+| 63 | W3 — `KeyringProvider` + `FileKeyProvider` in mvm-security | `1ea9352` |
+| 63 | W1 — `key_rotation` primitives (rewrap_dek, rotate_master_key, migrate_wrapped_keys, rotate_luks_slot, reseal_snapshot) | `f7e39a7` |
+| 63 | W4 — `mvmctl secret put/get/ls/rm` + `SecretStore` backends | `a30f866` |
+| 63 | W5 — chunked AES-GCM in `pause_and_seal` / `verify_and_resume` | `6fc798d` |
+| 63 | W6 — ADR-042 + CHANGELOG + plan-60 Phase 2 mark-up | `8baa4e7` |
+| 62 — docs sidebar restructure | Substrate (21 stubs + sidebar config) had already landed; this commit just marks the status | `ae10ad9` |
+| 44 — agent signal handling | W3 — SIGHUP config reload (hot-reloadable subset via atomics) | `05f956e` |
+| 60 — microsandbox migration | Phase 6 — on-disk policy-bundle TOML format (`mvm_policy::toml_loader` + W5 resolver upgrade) | `a457012` |
+
+### Remaining workstreams (priority order)
+
+| # | Plan / phase | Est. days | Notes |
+|---|---|---|---|
+| 1 | Plan 60 Phase 6 tail — hardware attestation API stubs (TPM2 / SEV-SNP / TDX, feature-gated) | 5-7 | Closes Phase 6. Stand up `mvm-attestation` crate or module; `mvmctl attest [verify|export]` CLI. `AttestationRequirement` field on `ExecutionPlan` already exists and honors `Noop` today. |
+| 2 | Plan 60 Phase 3 — L4/L7 proxies + firewall + policy gate | 10-14 | The real consumer for the Phase 6 policy-bundle TOML. `mvm-supervisor/src/proxy/{l4,l7}.rs` + firewall shell-outs. Default-deny; tenant policy is the only thing that opens flows. |
+| 3 | Plan 60 Phase 4 — persistent observability | 7-10 | Prometheus + OTLP metrics endpoint; total-coverage audit (every action emits); structured logs; event bus on `tokio::sync::broadcast`. |
+| 4 | Plan 60 Phase 5 — DX layer (Python SDK, manifests, mvm-studio handshake) | 7-10 | `python/mvm` wheels via pyo3; `cargo xtask gen-stubs` for typed APIs. Templates from `../mvm/templates/` rewritten on microvm.nix. |
+| 5 | Plan 60 Phase 7 — MCP server + host-mediated tools + sessions | 7-10 | `rmcp` wire layer; `mvm.run` / `snapshot` / `eval` / `web_search` / `web_fetch` / `upload` / `download` per-tenant allowlisted. tmux-style `mvmctl session create/attach/detach`. |
+| 6 | Plan 60 Phase 7a — install/rebuild/persistent overlay/tenant destroy | 10-12 | Encrypted persistent overlay (extends plan 45's volume work); rolling rootfs swap; `mvmctl tenant destroy` emits a destruction certificate. |
+| 7 | Plan 60 Phase 7b — built-in templates + TypeScript SDK | 5-7 | `ai-sandbox` / `safe-openclaw` / `computer-use` / `repl` templates with bundled policy bundles. `typescript/@mvm/sdk` napi-rs binding for hot paths. |
+| 8 | Plan 60 Phase 8 — mvmd integration contract verification | 3-5 | Port `mvm/src/hostd/{mod,server}.rs`; `PROTOCOL_VERSION` const; wire-format stability test. **Coordinated with parallel mvmd work** — see "Cross-repo coordination" below. |
+| 9 | Plan 60 Phase 9 — perf + supply chain + SBOM | 7-10 | Cold-boot ≤500 ms Firecracker / ≤1 s microsandbox; rootfs ≤20 MB; PGO + MUSL builds; cosign-keyless artifacts; RFC 3161 timestamping. |
+| 10 | Plan 60 Phase 10 — rename + archive | 1 | `git mv mvm mvm` + update CI paths + bump mvmd's git pin. |
+| 11 | Plans 48 + 49 — function-service factories (ADR-010) | 7-10 | Wrapper-template relocation + function-service factory pattern. |
+| 12 | Plans 51 + 52 — session-lifecycle verbs + fd3 control channel (ADR-011) | 10-14 | Largest substrate change in the function-call line. |
+| 13 | Plan 61 — runtime overlays + billing | 14-21 | Dev/prod image transparency + sandbox-runtime billing dimensions. Six phases. |
+| 14 | Status sweep — plan 32 tail (MCP adoption tiers L1/L2/L4), plan 16 (microvm-nix-integration), plan 18 (nix-openclaw-integration) | 3-5 | Several minor plans with partial completion — audit + close or roll into a follow-up sprint. |
+
+**Total remaining envelope:** ~100 calendar days. Sprint 51 spans
+multiple sub-sprints in practice; treat the workstream rows as
+the unit of scheduling.
+
+### Cross-repo coordination (mvmd)
+
+Plan 60 Phase 8 depends on parallel work in the mvmd repo. The
+hand-off prompt for the mvmd session:
+
+```
+We're closing out the mvm refactor (plan 60 in the mvm repo).
+Three mvmd-side workstreams to unblock Phase 8:
+
+M1 — Unblock `cargo build --workspace`. mvmd has a sha2 dep
+     conflict per plan-64 notes. Resolve it, then bump the mvm
+     git pin to a SHA ≥ a457012 (plan 60 Phase 6 TOML loader).
+
+M2 — Stand up `mvm-hostd` daemon. Listens on Unix socket
+     `/run/mvm-hostd/control.sock` mode 0600. Receives
+     `HostdRequest::{Start, Stop, Status}` carrying
+     `SignedExecutionPlan`. On Start: verify envelope, call
+     `mvm_cli::commands::vm::policy_resolver::
+     resolve_supervisor_components(&plan)`, build a Supervisor
+     with `.with_egress` / `.with_tool_gate` / `.with_keystore`
+     / `.with_artifact_collector(slots.*)` + a FileAuditSigner,
+     then `supervisor.launch(&signed, &trusted_keys).await`.
+     Implement the `BackendLauncher` adapter wrapping
+     `mvm_backend::AnyBackend::start()` — the piece plan 64 W3
+     intentionally deferred (ADR-041).
+
+M3 — Wire-format stability. Add `pub const PROTOCOL_VERSION: u32`
+     to mvm's `mvm_core::protocol` (PR to mvm repo). New
+     `tests/mvmd_compat.rs` in mvmd: round-trips
+     `AgentRequest::Reconcile`, `HostdRequest::Start`,
+     `HostdResponse::Started` against frozen-byte fixtures.
+
+Verification: `cd ../mvm && cargo test --workspace`'s mvmd-compat
+test passes against your branch. When green, plan 60 Phase 8
+unblocks on the mvm side.
+```
+
+### Standing constraints
+
+- CLAUDE.md "Security model" defines the 8 CI-enforced claims;
+  don't regress any.
+- Workspace lint `clippy::too_many_arguments = "deny"` — use
+  struct args, not 5+ positionals.
+- xtask `check-no-display-on-secret-types` flags Debug/Display
+  on Secret/Token/Password/Wrapped*Key types. Stay clean or
+  annotate `// allow(secret-debug): <reason>`.
+- Every workstream: one commit + one tests-green checkpoint,
+  pushed directly to `origin/main` per the post-cutover flow
+  (no PR — the cutover commit `7184b9a` established this).
+
+### Verification gates (run after every workstream)
+
+```
+cargo test --workspace --no-fail-fast       # ≥ 2098 + new
+cargo clippy --workspace --all-targets -- -D warnings
+cargo +nightly fmt --check
+cargo run -p xtask -- check-no-display-on-secret-types
+```
+
+### Sprint 51 success criteria
+
+By close of Sprint 51, the project can claim:
+
+1. *Every plan 60 phase ships, including hardware-attestation
+   stubs, the L4/L7 proxies, observability, the DX layer,
+   templates, MCP, install/rebuild, mvmd integration, perf
+   gates, and the v1→v2 rename.*
+2. *Function-call surface plans (48, 49, 51, 52) close — the
+   substrate mvmforge consumes is stable.*
+3. *Plan 61's runtime overlay + billing model ships.*
+4. *Partial-completion plans (32, 16, 18) close or roll forward
+   into a successor sprint with explicit status.*
+5. *CLAUDE.md security claims 1–8 stay true; ADR-002 §"Out of
+   scope" remains accurate.*
+6. *`cargo test --workspace` passes; clippy `-D warnings` clean;
+   nightly fmt clean; xtask secret-debug lint clean.*
+
+### Non-goals (deferred / shelved / out-of-repo)
+
+These were deferred for stated reasons; Sprint 51 leaves them
+alone:
+
+- **Plan 15 — WASM container support** (SHELVED — no real WASM
+  workload exists; OCI artifact format hasn't stabilized far
+  enough).
+- **Plan 53 — cross-platform roadmap** (rejected on security-
+  posture grounds).
+- **Plans 54 / 55 / 56 — cloud-hypervisor / crosvm / rust-vmm
+  internalization** (deferred; CH already has Tier 1 backend
+  status without internalization).
+- **Plan 59 — llm-txt self-doc** (relocated to mvmd repo; out
+  of scope here).
+
+### What "campaign closed" looks like
+
+Sprint 51 closes when:
+
+1. Every `### Phase N` in plan 60 has a "✅ shipped" status
+   header.
+2. Plans 44, 48, 49, 51, 52, 61, 62, 63, 64 all have
+   "all workstreams shipped" status headers.
+3. Plans 32, 16, 18 are either fully shipped or have an
+   explicit closure note ("rolled forward to sprint 52", "no
+   longer relevant", etc.).
+4. The workspace test count is ≥ 2500 (rough envelope based on
+   how many workstreams are pending × typical per-workstream
+   test growth).
+5. CHANGELOG.md `[Unreleased]` section captures every shipped
+   plan with date, commit SHAs, and links to ADRs.
+
 ## Completed Sprints
 
 - [01-foundation.md](sprints/01-foundation.md)
