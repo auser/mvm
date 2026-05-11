@@ -193,12 +193,8 @@ pub enum L4Error {
 /// allow-lists) plausibly will.
 #[async_trait]
 pub trait L4Gate: Send + Sync {
-    async fn evaluate(
-        &self,
-        proto: Protocol,
-        ip: IpAddr,
-        port: u16,
-    ) -> Result<L4Decision, L4Error>;
+    async fn evaluate(&self, proto: Protocol, ip: IpAddr, port: u16)
+    -> Result<L4Decision, L4Error>;
 }
 
 /// Fail-closed default. A supervisor wired with `NoopL4Gate` errors
@@ -250,13 +246,14 @@ impl LiveL4Gate {
                     });
                 }
             };
-            let dst_cidr: IpNet = spec.dst_cidr.parse().map_err(|e: ipnet::AddrParseError| {
-                L4SpecError::BadCidr {
-                    index: i,
-                    value: spec.dst_cidr.clone(),
-                    detail: e.to_string(),
-                }
-            })?;
+            let dst_cidr: IpNet =
+                spec.dst_cidr
+                    .parse()
+                    .map_err(|e: ipnet::AddrParseError| L4SpecError::BadCidr {
+                        index: i,
+                        value: spec.dst_cidr.clone(),
+                        detail: e.to_string(),
+                    })?;
             if spec.port_lo > spec.port_hi
                 // 0-0 is the explicit any-port wildcard; any other
                 // `lo > hi` row is operator error.
@@ -372,11 +369,7 @@ mod tests {
 
     #[test]
     fn single_port_rule_matches_exact_flow() {
-        let p = L4Policy::new([L4Rule::single_port(
-            Protocol::Tcp,
-            v4("10.0.0.0/24"),
-            443,
-        )]);
+        let p = L4Policy::new([L4Rule::single_port(Protocol::Tcp, v4("10.0.0.0/24"), 443)]);
         assert_eq!(
             p.evaluate(Protocol::Tcp, ip4("10.0.0.5"), 443),
             L4Decision::Allow
@@ -385,33 +378,21 @@ mod tests {
 
     #[test]
     fn single_port_rule_denies_off_cidr() {
-        let p = L4Policy::new([L4Rule::single_port(
-            Protocol::Tcp,
-            v4("10.0.0.0/24"),
-            443,
-        )]);
+        let p = L4Policy::new([L4Rule::single_port(Protocol::Tcp, v4("10.0.0.0/24"), 443)]);
         let deny = p.evaluate(Protocol::Tcp, ip4("10.0.1.5"), 443);
         assert!(matches!(deny, L4Decision::Deny { .. }));
     }
 
     #[test]
     fn single_port_rule_denies_wrong_port() {
-        let p = L4Policy::new([L4Rule::single_port(
-            Protocol::Tcp,
-            v4("10.0.0.0/24"),
-            443,
-        )]);
+        let p = L4Policy::new([L4Rule::single_port(Protocol::Tcp, v4("10.0.0.0/24"), 443)]);
         let deny = p.evaluate(Protocol::Tcp, ip4("10.0.0.5"), 22);
         assert!(matches!(deny, L4Decision::Deny { .. }));
     }
 
     #[test]
     fn single_port_rule_denies_wrong_proto() {
-        let p = L4Policy::new([L4Rule::single_port(
-            Protocol::Tcp,
-            v4("10.0.0.0/24"),
-            443,
-        )]);
+        let p = L4Policy::new([L4Rule::single_port(Protocol::Tcp, v4("10.0.0.0/24"), 443)]);
         let deny = p.evaluate(Protocol::Udp, ip4("10.0.0.5"), 443);
         assert!(matches!(deny, L4Decision::Deny { .. }));
     }
@@ -540,7 +521,8 @@ mod tests {
     fn rule_rejects_unknown_field_at_parse() {
         // deny_unknown_fields on L4Rule — typo at parse time fails
         // loud, doesn't silently drop the bad key.
-        let bad = r#"{"proto":"tcp","dst_cidr":"10.0.0.0/24","port_lo":443,"port_hi":443,"oops":true}"#;
+        let bad =
+            r#"{"proto":"tcp","dst_cidr":"10.0.0.0/24","port_lo":443,"port_hi":443,"oops":true}"#;
         assert!(serde_json::from_str::<L4Rule>(bad).is_err());
     }
 
@@ -565,11 +547,7 @@ mod tests {
 
     #[test]
     fn live_l4_gate_allows_matching_flow() {
-        let policy = L4Policy::new([L4Rule::single_port(
-            Protocol::Tcp,
-            v4("10.0.0.0/24"),
-            443,
-        )]);
+        let policy = L4Policy::new([L4Rule::single_port(Protocol::Tcp, v4("10.0.0.0/24"), 443)]);
         let g = LiveL4Gate::new(policy);
         let d = block_on(g.evaluate(Protocol::Tcp, ip4("10.0.0.5"), 443)).expect("live ok");
         assert_eq!(d, L4Decision::Allow);
@@ -577,11 +555,7 @@ mod tests {
 
     #[test]
     fn live_l4_gate_denies_off_policy_flow() {
-        let policy = L4Policy::new([L4Rule::single_port(
-            Protocol::Tcp,
-            v4("10.0.0.0/24"),
-            443,
-        )]);
+        let policy = L4Policy::new([L4Rule::single_port(Protocol::Tcp, v4("10.0.0.0/24"), 443)]);
         let g = LiveL4Gate::new(policy);
         let d = block_on(g.evaluate(Protocol::Tcp, ip4("8.8.8.8"), 443)).expect("live ok");
         assert!(matches!(d, L4Decision::Deny { .. }));

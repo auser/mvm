@@ -70,8 +70,8 @@ use std::sync::Arc;
 
 use mvm_plan::{ExecutionPlan, FsPolicyRef, PolicyRef};
 use mvm_supervisor::{
-    ArtifactCollector, DestinationPolicy, EgressProxy, InspectorChain, KeystoreReleaser,
-    L4Gate, L4SpecError, L7EgressProxy, LiveL4Gate, NoopArtifactCollector, NoopEgressAuditSink,
+    ArtifactCollector, DestinationPolicy, EgressProxy, InspectorChain, KeystoreReleaser, L4Gate,
+    L4SpecError, L7EgressProxy, LiveL4Gate, NoopArtifactCollector, NoopEgressAuditSink,
     NoopEgressProxy, NoopKeystoreReleaser, NoopL4Gate, NoopToolGate, PolicyToolGate,
     TokioDnsResolver, ToolGate,
 };
@@ -1044,7 +1044,10 @@ port_hi  = {port}
                 let s = path.to_string_lossy();
                 assert!(s.contains("acme"), "path missing tenant: {s}");
                 assert!(s.contains("web-worker.toml"), "path missing workload: {s}");
-                assert!(detail.contains("not-a-cidr"), "detail missing cidr: {detail}");
+                assert!(
+                    detail.contains("not-a-cidr"),
+                    "detail missing cidr: {detail}"
+                );
             }
             other => panic!("expected L4SpecInvalid, got {other:?}"),
         }

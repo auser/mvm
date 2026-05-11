@@ -103,8 +103,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
 fn export_at(identity_dir: &std::path::Path, output: Option<PathBuf>) -> Result<()> {
     let key = identity::load_or_init_at(identity_dir).context("loading host identity key")?;
     let report = build_report(&key);
-    let json = serde_json::to_string_pretty(&report)
-        .context("serializing attestation report to JSON")?;
+    let json =
+        serde_json::to_string_pretty(&report).context("serializing attestation report to JSON")?;
 
     match output {
         Some(path) => {
@@ -127,8 +127,12 @@ fn verify_at(
 ) -> Result<()> {
     let bytes = std::fs::read(&report_path)
         .with_context(|| format!("reading {}", report_path.display()))?;
-    let report: AttestationReport = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing {} as JSON attestation report", report_path.display()))?;
+    let report: AttestationReport = serde_json::from_slice(&bytes).with_context(|| {
+        format!(
+            "parsing {} as JSON attestation report",
+            report_path.display()
+        )
+    })?;
 
     let signer_id = report.0.signer_id.clone();
 
@@ -183,7 +187,11 @@ fn status_at(identity_dir: &std::path::Path) -> Result<()> {
         } else {
             "not compiled (rebuild with feature flag to enable)"
         };
-        println!("  {:<8} feature={:<22}  {state}", kind.as_str(), kind.cargo_feature());
+        println!(
+            "  {:<8} feature={:<22}  {state}",
+            kind.as_str(),
+            kind.cargo_feature()
+        );
     }
     Ok(())
 }
