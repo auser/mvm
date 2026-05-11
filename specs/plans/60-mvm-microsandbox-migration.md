@@ -1784,6 +1784,14 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 **Risk**: low.
 
 ### Phase 6 — Security model: seccomp, jailer, dm-verity, signed plans, attestation, fuzz harnesses (~10-14 days)
+
+**Status (2026-05-11)**: partial — seccomp tiers, dm-verity, fuzz
+harnesses, prod-agent-no-exec, and **signed-and-audited
+`ExecutionPlan`** shipped (CLAUDE.md security claims 1–8;
+ADR-041). Hardware attestation (TPM2/SEV-SNP/TDX) + the
+`mvmctl attest` CLI surface remain deferred to Phase 3 work
+sequenced after plan 64 W5 (policy slot resolver).
+
 **Goal**: `mvmctl up --security strict` applies a seccomp profile; rootfs verified at boot via dm-verity; signed Plans rejected if Ed25519 sig fails; fuzz harness runs in CI for vsock framing; **`mvmctl attest <vm>` returns a verifiable attestation report**.
 
 **Action**:

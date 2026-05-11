@@ -9,6 +9,24 @@
 >
 > Plan 64 closes that gap. Roughly 12 days, 6 workstreams.
 
+**Status (2026-05-11)**: W1–W4 + W6 shipped — every `mvmctl up`
+admits a signed `ExecutionPlan` and emits a chain-signed audit
+trail; CLAUDE.md security claim 8 is true and tracked. **W5
+(`PolicyRef → concrete component slots`) remains open** as the
+final workstream before plan 64 closes. ADR-041
+(`specs/adrs/041-signed-audited-execution-plans.md`) documents
+the shipped surface and the `*Ref` semantics gap that W5 + plan
+60 Phase 3 close.
+
+| Workstream | Status | Landing commits |
+|---|---|---|
+| W1 — `ExecutionPlan` synthesis | ✅ shipped 2026-05-11 | ae81767 |
+| W2 — host-side signing keypair | ✅ shipped 2026-05-11 | a71e60a |
+| W3 — admission substrate + callsite | ✅ shipped 2026-05-11 | 2671f5f, bc91d77 |
+| W4 — `FileAuditSigner` + `mvmctl audit` | ✅ shipped 2026-05-11 | 587a33e |
+| W5 — `PolicyRef` resolver | ⏳ open | — |
+| W6 — verification + ADR-041 + plan 60 Phase 6 mark-up | ✅ shipped 2026-05-11 | (this commit) |
+
 ## Discovery context
 
 The 2026-05-11 cutover survey expected to cherry-pick `mvm-plan` and

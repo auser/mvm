@@ -82,10 +82,12 @@ The `RuntimeBuildEnv` in mvm implements only `ShellEnvironment`. The full `Build
 
 ## Security model
 
-mvm makes seven CI-enforced security claims. Each one is backed by a
+mvm makes eight CI-enforced security claims. Each one is backed by a
 test or a workflow gate; ADR-002 (`specs/adrs/002-microvm-security-posture.md`)
 describes the threat model and `specs/plans/25-microvm-hardening.md`
-sequences the implementation.
+sequences the implementation. Claim 8 was added by plan 64
+(`specs/plans/64-supervisor-wiring.md`) — see ADR-041
+(`specs/adrs/041-signed-audited-execution-plans.md`).
 
 1. **No host-fs access from a guest beyond explicit shares.** Per-service
    uid (W2.1), seccomp `standard` default (W1.1, W2.4), and `setpriv
@@ -117,6 +119,20 @@ sequences the implementation.
 7. **Cargo deps are audited on every PR.** `deny.toml` + the `deny`
    and `audit` jobs in CI (W5.2). Reproducibility double-build
    (W5.3) catches non-determinism that could mask injection.
+8. **Every workload runs from a signed, audited `ExecutionPlan`.**
+   `mvmctl up` synthesizes a typed `ExecutionPlan`, signs it under
+   the host's Ed25519 keypair at `~/.mvm/keys/host-signer.ed25519`
+   (mode 0600), verifies it through `mvm_plan::verify_plan`,
+   enforces the G4 validity window + nonce replay-store, and only
+   then dispatches the backend. Each admission emits
+   `plan.admitted` / `plan.launched` / `plan.failed` chain-signed
+   entries to `~/.mvm/audit/<tenant>.jsonl`; tampering breaks
+   `mvm_supervisor::verify_audit_chain` (surfaced via
+   `mvmctl audit verify`, which exits nonzero on detected drift).
+   Workspace `cargo test` exercises rejection paths on every PR
+   (plan 64 W1–W4 — `synthesize_plan`, `host_signer::load_or_init_at`,
+   `admit_for_run`, `AuditEmitter`; `xtask check-no-display-on-secret-types`
+   protects the host signer's redacted `Debug`).
 
 The guest agent itself runs as uid 901 under setpriv (W4.5); the
 host-side vsock proxy socket is mode 0700 (W1.2), the proxy port
