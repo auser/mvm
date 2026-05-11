@@ -93,5 +93,5 @@ pub use reaper::{
 pub use secrets_scanner::{DEFAULT_RULES, SecretRule, SecretsScanner};
 pub use ssrf_guard::SsrfGuard;
 pub use state::{PlanState, PlanStateMachine, StateTransitionError};
-pub use supervisor::{Supervisor, SupervisorError};
+pub use supervisor::{Supervisor, SupervisorError, build_inspector_chain};
 pub use tool_gate::{NoopToolGate, ToolDecision, ToolError, ToolGate};

@@ -449,7 +449,13 @@ impl Supervisor {
 /// [`InspectorReporter`]. The chain length is unchanged — wrappers
 /// preserve the wrapped inspector's `name()` so audit binding stays
 /// intact. (Plan 37 Addendum E1.)
-fn build_inspector_chain(
+///
+/// Public so the plan-64 W5 resolver in `mvm-cli::policy_resolver`
+/// can build the same canonical chain when it turns a parsed bundle
+/// into a `ResolvedSlots`. Keeping the order in one place avoids
+/// chain-shape drift between the in-process supervisor path and
+/// the CLI resolver.
+pub fn build_inspector_chain(
     policy: &EgressPolicy,
     breakers: Option<Arc<InspectorReporter>>,
 ) -> InspectorChain {

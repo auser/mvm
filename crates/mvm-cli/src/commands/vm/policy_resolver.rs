@@ -70,10 +70,9 @@ use std::sync::Arc;
 
 use mvm_plan::{ExecutionPlan, FsPolicyRef, PolicyRef};
 use mvm_supervisor::{
-    ArtifactCollector, DestinationPolicy, EgressProxy, InspectorChain, KeystoreReleaser, L4Gate,
-    L4SpecError, L7EgressProxy, LiveL4Gate, NoopArtifactCollector, NoopEgressAuditSink,
-    NoopEgressProxy, NoopKeystoreReleaser, NoopL4Gate, NoopToolGate, PolicyToolGate,
-    TokioDnsResolver, ToolGate,
+    ArtifactCollector, EgressProxy, KeystoreReleaser, L4Gate, L4SpecError, L7EgressProxy,
+    LiveL4Gate, NoopArtifactCollector, NoopEgressAuditSink, NoopEgressProxy, NoopKeystoreReleaser,
+    NoopL4Gate, NoopToolGate, PolicyToolGate, TokioDnsResolver, ToolGate, build_inspector_chain,
 };
 
 /// The fixed identifier for the local-dev policy bundle. Any
@@ -367,15 +366,15 @@ fn slots_from_bundle(
         }
     })?;
 
-    // L7 inspector chain: DestinationPolicy is the gating
-    // inspector; SSRF / secrets / injection / PII layer on with
-    // their own constructors in a future workstream. For Slice A
-    // we ship DestinationPolicy alone — that's the operator-facing
-    // allow-list the policy bundle owns. Inspector chain stays
-    // wrappable; later workstreams append to it.
-    let chain = InspectorChain::new().with(Box::new(DestinationPolicy::new(
-        bundle.egress.allow_list.iter().cloned(),
-    )));
+    // L7 inspector chain: delegate to the supervisor's canonical
+    // builder so the order + `disabled_inspectors` semantics stay in
+    // one place. Today's chain (Plan 37 §15 order) is:
+    //   destination_policy → ssrf_guard → secrets_scanner →
+    //   injection_guard → pii_redactor
+    // `None` for the breaker reporter — the in-process supervisor
+    // wraps with `CircuitBreaker` when it owns one; the CLI resolver
+    // path doesn't have a reporter to share, so the chain ships raw.
+    let chain = build_inspector_chain(&bundle.egress, None);
     let body_cap = if bundle.egress.body_cap_bytes == 0 {
         mvm_policy::DEFAULT_BODY_CAP_BYTES as usize
     } else {
@@ -1078,5 +1077,170 @@ port_hi  = {port}
             }
             other => panic!("expected L4SpecInvalid, got {other:?}"),
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Plan 60 Phase 3 follow-on — full L7 inspector chain in
+    // `slots_from_bundle`.
+    //
+    // Before this slice, `slots_from_bundle` hand-wired only
+    // `DestinationPolicy`. Now it delegates to the supervisor's
+    // canonical `build_inspector_chain`, which pulls in
+    // `SsrfGuard` / `SecretsScanner` / `InjectionGuard` /
+    // `PiiRedactor` and respects `bundle.egress.disabled_inspectors`.
+    // The L7 chain is private inside `L7EgressProxy`, so these tests
+    // verify the wiring by calling `build_inspector_chain` directly
+    // against the bundle's egress policy.
+    // ──────────────────────────────────────────────────────────────
+
+    fn fixture_bundle_with_disabled_inspectors(disabled: &[&str]) -> String {
+        let list = disabled
+            .iter()
+            .map(|n| format!("\"{n}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            r#"
+schema_version = 1
+bundle_id      = "acme/web-worker"
+bundle_version = 1
+
+[network]
+[egress]
+allow_list = [["api.example.com", 443]]
+disabled_inspectors = [{list}]
+
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+"#,
+        )
+    }
+
+    #[test]
+    fn slice_b_inspector_chain_full_default_has_five_inspectors() {
+        // A parsed bundle with no `disabled_inspectors` produces the
+        // full canonical chain: destination_policy + ssrf_guard +
+        // secrets_scanner + injection_guard + pii_redactor.
+        // We invoke `build_inspector_chain` against the bundle's
+        // parsed `EgressPolicy` to assert the chain shape, since the
+        // L7EgressProxy keeps its chain private.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_tool_allow("web_search"),
+        );
+        let bundle = mvm_policy::toml_loader::load_bundle_from_path(
+            tmp.path(),
+            "acme",
+            "web-worker",
+        )
+        .expect("bundle parses");
+        let chain =
+            mvm_supervisor::build_inspector_chain(&bundle.egress, None);
+        assert_eq!(
+            chain.len(),
+            5,
+            "default chain must carry all five inspectors"
+        );
+    }
+
+    #[test]
+    fn slice_b_inspector_chain_honors_disabled_inspectors() {
+        // A bundle that disables `ssrf_guard` and `secrets_scanner`
+        // must produce a 3-inspector chain. Naming is by
+        // `Inspector::name()` strings (Plan 37 §15).
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_disabled_inspectors(&["ssrf_guard", "secrets_scanner"]),
+        );
+        let bundle = mvm_policy::toml_loader::load_bundle_from_path(
+            tmp.path(),
+            "acme",
+            "web-worker",
+        )
+        .expect("bundle parses");
+        let chain =
+            mvm_supervisor::build_inspector_chain(&bundle.egress, None);
+        assert_eq!(
+            chain.len(),
+            3,
+            "two disabled inspectors must shrink chain to 3"
+        );
+    }
+
+    #[test]
+    fn slice_b_inspector_chain_unknown_disabled_name_is_silently_skipped() {
+        // `disabled_inspectors` is a name-match list. An unknown
+        // name (typo, future inspector) doesn't error — it just
+        // matches nothing. This is the established
+        // `build_inspector_chain` behavior; we pin it from the
+        // resolver's perspective so a future tightening to fail-loud
+        // is a deliberate decision.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_disabled_inspectors(&["typo_inspector"]),
+        );
+        let bundle = mvm_policy::toml_loader::load_bundle_from_path(
+            tmp.path(),
+            "acme",
+            "web-worker",
+        )
+        .expect("bundle parses");
+        let chain =
+            mvm_supervisor::build_inspector_chain(&bundle.egress, None);
+        assert_eq!(
+            chain.len(),
+            5,
+            "unknown disabled-inspector name must not shrink chain"
+        );
+    }
+
+    #[test]
+    fn slice_b_egress_still_denies_off_allow_list_with_full_chain() {
+        // Regression for Slice A's invariant: after we swap the
+        // hand-rolled DestinationPolicy chain for the full
+        // `build_inspector_chain` one, the off-allow-list deny path
+        // still fires (DestinationPolicy stays first in the chain
+        // order, so it short-circuits before SSRF / secrets /
+        // injection / PII).
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_tool_allow("web_search"),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("expected live slots, got {e}"));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let deny = slots
+                .egress
+                .inspect("evil.example.com", "/x")
+                .await
+                .expect("policy lookup must succeed (not NotWired)");
+            assert!(
+                matches!(deny, mvm_supervisor::EgressDecision::Deny { .. }),
+                "off-list host should still produce Deny after chain expansion, got {deny:?}"
+            );
+        });
     }
 }
