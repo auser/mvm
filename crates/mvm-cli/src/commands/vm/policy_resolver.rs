@@ -71,8 +71,9 @@ use std::sync::Arc;
 use mvm_plan::{ExecutionPlan, FsPolicyRef, PolicyRef};
 use mvm_supervisor::{
     ArtifactCollector, EgressProxy, KeystoreReleaser, L4Gate, L4SpecError, L7EgressProxy,
-    LiveL4Gate, NoopArtifactCollector, NoopEgressAuditSink, NoopEgressProxy, NoopKeystoreReleaser,
-    NoopL4Gate, NoopToolGate, PolicyToolGate, TokioDnsResolver, ToolGate, build_inspector_chain,
+    LiveArtifactCollector, LiveL4Gate, NoopArtifactCollector, NoopEgressAuditSink, NoopEgressProxy,
+    NoopKeystoreReleaser, NoopL4Gate, NoopToolGate, PolicyToolGate, TokioDnsResolver, ToolGate,
+    build_inspector_chain,
 };
 
 /// The fixed identifier for the local-dev policy bundle. Any
@@ -388,12 +389,19 @@ fn slots_from_bundle(
         bundle.egress.allow_plain_http,
     );
     let tool_gate = PolicyToolGate::from_policy(&bundle.tool);
+    // Artifact collector — carries the bundle's `capture_paths` +
+    // `retention_days` on the public fields so a future in-process
+    // consumer can downcast and consult them. `collect()` itself
+    // errors `ArtifactError::NotImplemented` (distinct from
+    // `NotWired`) until the mvm-hostd virtiofs-streaming lift wires
+    // the real capture mechanism.
+    let artifacts = LiveArtifactCollector::from_policy(&bundle.artifact);
     Ok(ResolvedSlots {
         network: Box::new(l4),
         egress: Box::new(l7),
         tool_gate: Box::new(tool_gate),
         keystore: Box::new(NoopKeystoreReleaser),
-        artifacts: Box::new(NoopArtifactCollector),
+        artifacts: Box::new(artifacts),
     })
 }
 
@@ -839,12 +847,15 @@ allowed = ["{name}"]
     }
 
     #[test]
-    fn slice_a_keystore_and_artifacts_remain_noop() {
+    fn slice_a_keystore_remains_noop_for_parsed_bundle() {
         // The supervisor lift in mvm-hostd ships the live
-        // KeystoreReleaser + ArtifactCollector consumers. Until
-        // then the resolver returns Noops for those slots even
-        // when the bundle parses cleanly. Tests pin that
-        // deliberate scope.
+        // KeystoreReleaser consumer. Until then the resolver returns
+        // a Noop keystore slot even when the bundle parses cleanly.
+        // Tests pin that deliberate scope.
+        //
+        // ArtifactCollector moved out of this test in the
+        // post-Slice-B follow-on (`LiveArtifactCollector`); its
+        // dedicated coverage lives below.
         let tmp = tempfile::tempdir().unwrap();
         write_bundle(
             tmp.path(),
@@ -872,14 +883,116 @@ allowed = ["{name}"]
                 matches!(ks_err, mvm_supervisor::KeystoreError::NotWired),
                 "unexpected keystore err: {ks_err:?}"
             );
-            let art_err = slots
+        });
+    }
+
+    fn fixture_bundle_with_artifact_paths(paths: &[&str], retention_days: u32) -> String {
+        let list = paths
+            .iter()
+            .map(|p| format!("\"{p}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            r#"
+schema_version = 1
+bundle_id      = "acme/web-worker"
+bundle_version = 1
+
+[network]
+[egress]
+[pii]
+[tool]
+
+[artifact]
+capture_paths = [{list}]
+retention_days = {retention_days}
+
+[keys]
+[audit]
+"#,
+        )
+    }
+
+    #[test]
+    fn slice_b_returns_live_artifact_collector_for_parsed_bundle() {
+        // A parsed `<tenant>:<workload>` bundle yields a live
+        // ArtifactCollector — collect() returns NotImplemented
+        // (configured + pending consumer) rather than NotWired.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_artifact_paths(&["/artifacts", "/output"], 14),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("expected live slots, got {e}"));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let err = slots
                 .artifacts
                 .collect(&plan.plan_id)
                 .await
-                .expect_err("Noop artifact collector must error NotWired");
+                .expect_err("live collector must surface NotImplemented");
+            match err {
+                mvm_supervisor::ArtifactError::NotImplemented {
+                    path_count,
+                    retention_days,
+                } => {
+                    assert_eq!(path_count, 2);
+                    assert_eq!(retention_days, 14);
+                }
+                other => panic!("expected NotImplemented, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn slice_b_empty_artifact_section_still_yields_live_collector() {
+        // A parsed bundle without an explicit `capture_paths` list
+        // still produces a Live collector — distinguishing
+        // "configured, no paths" from "no bundle". The collector
+        // surfaces 0 paths via NotImplemented; Noop would surface
+        // NotWired.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_tool_allow("web_search"),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("expected live slots, got {e}"));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let err = slots
+                .artifacts
+                .collect(&plan.plan_id)
+                .await
+                .expect_err("live collector must surface NotImplemented");
             assert!(
-                matches!(art_err, mvm_supervisor::ArtifactError::NotWired),
-                "unexpected artifact err: {art_err:?}"
+                matches!(
+                    err,
+                    mvm_supervisor::ArtifactError::NotImplemented {
+                        path_count: 0,
+                        retention_days: 0
+                    }
+                ),
+                "expected NotImplemented{{0,0}}, got {err:?}"
             );
         });
     }

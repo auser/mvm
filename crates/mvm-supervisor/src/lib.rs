@@ -56,7 +56,9 @@ pub mod state;
 pub mod supervisor;
 pub mod tool_gate;
 
-pub use artifact::{ArtifactCollector, ArtifactError, NoopArtifactCollector};
+pub use artifact::{
+    ArtifactCollector, ArtifactError, LiveArtifactCollector, NoopArtifactCollector,
+};
 pub use audit::{AuditEntry, AuditError, AuditSigner, CapturingAuditSigner, NoopAuditSigner};
 pub use audit_dedup::{Decision, DedupKey, RetryStormSummary, RetryStormSuppressor};
 pub use audit_file::{FileAuditSigner, SignedEnvelope, VerifyError, verify_audit_chain};
