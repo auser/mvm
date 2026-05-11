@@ -22,8 +22,8 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 # hickory-dns: mature, audited DNS resolver/server. Used by Cloudflare's
 # Pingora. Pinned in Cargo.lock per ADR-0018 §Dependency hygiene.
-hickory-server = "0.24"
-hickory-proto = "0.24"
+hickory-server = "0.26"
+hickory-proto = "0.26"
 
 [dev-dependencies]
 tempfile.workspace = true
