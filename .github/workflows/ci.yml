@@ -102,6 +102,13 @@ jobs:
         continue-on-error: true
         run: cargo run -p xtask -- check-adr-coverage
 
+      # Plan 63 W2 — secret-shaped types (Secret*, Password*, Token*,
+      # Wrapped*Key, etc.) cannot derive Debug/Display without an
+      # explicit `// allow(secret-debug): <reason>` opt-out comment.
+      # Hard gate; bypass requires a custom Debug impl that redacts.
+      - name: No Debug/Display on secret-named types
+        run: cargo run -p xtask -- check-no-display-on-secret-types
+
   test:
     name: Test
     runs-on: ubuntu-latest

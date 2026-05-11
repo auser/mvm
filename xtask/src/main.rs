@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 mod check_adr_coverage;
+mod check_no_display_on_secret_types;
 
 fn main() -> Result<()> {
     let args: Vec<String> = std::env::args().collect();
@@ -14,15 +15,26 @@ fn main() -> Result<()> {
             let workspace = workspace_root();
             check_adr_coverage::run(&workspace)
         }
+        Some("check-no-display-on-secret-types") => {
+            let workspace = workspace_root();
+            check_no_display_on_secret_types::run(&workspace)
+        }
         Some(other) => anyhow::bail!(
-            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage",
+            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage, check-no-display-on-secret-types",
             other
         ),
         None => {
             eprintln!("Usage: cargo xtask <task>");
             eprintln!("Available tasks:");
-            eprintln!("  gen-man [--output-dir DIR]   Generate man pages into DIR (default: man/)");
-            eprintln!("  check-adr-coverage           Report ADRs with no code references");
+            eprintln!(
+                "  gen-man [--output-dir DIR]              Generate man pages into DIR (default: man/)"
+            );
+            eprintln!(
+                "  check-adr-coverage                      Report ADRs with no code references"
+            );
+            eprintln!(
+                "  check-no-display-on-secret-types        Plan 63 W2 lint: reject Debug/Display on secret-named types"
+            );
             std::process::exit(1);
         }
     }

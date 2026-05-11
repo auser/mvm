@@ -401,7 +401,13 @@ pub enum WrapAlgorithm {
 
 /// A per-volume AEAD key, wrapped under a versioned master key.
 /// Stored in the volume registry record alongside the volume metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `Debug` is hand-written rather than derived because the default
+/// `Vec<u8>` Debug would print the wrapped bytes — even though those
+/// are ciphertext, the length leaks key shape, and printing leaks
+/// timing patterns to any consumer (logs, panics, error messages).
+/// The custom impl prints the byte length only.
+#[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct WrappedKey {
     /// Selects which master key version to unwrap with. Lets master
@@ -414,6 +420,22 @@ pub struct WrappedKey {
     pub algorithm: WrapAlgorithm,
 }
 
+// allow(secret-debug): hand-written Debug below redacts the wrapped
+// bytes; reports length only.
+impl std::fmt::Debug for WrappedKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WrappedKey")
+            .field("master_key_version", &self.master_key_version)
+            .field("wrapped", &format_args!("<{} bytes>", self.wrapped.len()))
+            .field("algorithm", &self.algorithm)
+            .finish()
+    }
+}
+
+// allow(secret-debug): metadata enum with no payload — variant
+// names are the entire information content. Derives Debug for the
+// 3 variant strings ("Active" / "Legacy" / "Revoked"), no secret
+// material involved.
 /// Lifecycle state of a master key version.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "kebab-case")]

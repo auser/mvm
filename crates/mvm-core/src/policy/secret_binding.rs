@@ -137,18 +137,52 @@ impl FromStr for SecretBinding {
 
 /// Resolved secret bindings ready for injection into a microVM.
 /// Contains the actual secret values (resolved from env or explicit).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Hand-written `Debug` rather than derived: the resolved bindings
+/// carry plaintext secret values via `ResolvedBinding::value`. The
+/// derived Debug would print those at any `{:?}` site (logs, panics,
+/// trace spans). Custom impl prints binding count + per-binding
+/// metadata sans value.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ResolvedSecrets {
     pub bindings: Vec<ResolvedBinding>,
 }
 
+// allow(secret-debug): hand-written Debug below redacts the
+// `value` field of every binding.
+impl std::fmt::Debug for ResolvedSecrets {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedSecrets")
+            .field("bindings", &self.bindings)
+            .finish()
+    }
+}
+
 /// A single resolved secret binding with its actual value.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+///
+/// Hand-written `Debug` prints the env-var / host / header (which
+/// are addressing metadata, not secrets) but redacts `value` to
+/// `<N bytes>`.
+#[derive(Clone, Serialize, Deserialize)]
 pub struct ResolvedBinding {
     pub env_var: String,
     pub target_host: String,
     pub header: String,
     pub value: String,
+}
+
+// allow(secret-debug): hand-written Debug below redacts the
+// `value` field. The other fields name *where* the secret goes, not
+// what it is.
+impl std::fmt::Debug for ResolvedBinding {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ResolvedBinding")
+            .field("env_var", &self.env_var)
+            .field("target_host", &self.target_host)
+            .field("header", &self.header)
+            .field("value", &format_args!("<{} bytes>", self.value.len()))
+            .finish()
+    }
 }
 
 impl ResolvedSecrets {
