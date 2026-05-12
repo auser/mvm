@@ -37,6 +37,49 @@
   # `nix/packages/mvm-guest-agent.nix` reads `${mvmSrc}/Cargo.lock`
   # to vendor the cargo closure — the lockfile lives at the
   # workspace root, not under `nix/`.
+  #
+  # ── Trust boundary (cache + attestation) ────────────────────────────
+  #
+  # This flake is built inside a microsandbox VM. The resulting
+  # `/nix/store` closure is persisted on the host at
+  # `~/.cache/mvm/builder-store/` (`mvm_build::builder_vm::builder_store_dir`),
+  # bind-mounted into the sandbox at `/scratch-nix`, and reused across
+  # builds. That dir is mvm-owned (mode 0700, NEVER the host's actual
+  # `/nix/store`).
+  #
+  # Why the cache is trustworthy: nix store paths are content-addressed
+  # by input hash, so a poisoned cache entry would land at a different
+  # path and could not satisfy a future build's input. `run_build_async`
+  # additionally runs `nix-store --verify --check-contents` on builder
+  # startup when a "dirty marker" indicates the previous run crashed,
+  # so NAR-hash divergence is caught before the cache is reused.
+  #
+  # The artifact pair that ends up at
+  # `nix/images/dev-prebuilt/<arch>/{vmlinux, rootfs.ext4}` ships
+  # alongside `checksums-sha256.txt` written by
+  # `xtask/src/build_dev_image.rs`. `mvmctl dev up` re-hashes the
+  # vendored slot on every boot via
+  # `apple_container::verify_vendored_checksums`; a mismatch hard-fails
+  # the boot, surfacing tamper / partial-copy issues immediately.
+  #
+  # Kernel override (further down): a custom kernel is a deliberate
+  # cache miss against `cache.nixos.org` because the rootfs has no
+  # `/lib/modules/` and vsock therefore has to be built in. First
+  # build of this flake on a host is slow (~20-25 min on aarch64);
+  # subsequent builds reuse the cached kernel closure from
+  # `~/.cache/mvm/builder-store/` and complete in ~30 s.
+  #
+  # macOS xattr caveat — bind-mount disabled by default on macOS.
+  # libkrun's virtio-fs proxy strips `setxattr` from bind-mounted
+  # APFS, which nix needs to mark chroot-store paths; `nix build`
+  # fails on the first store-path write with EIO. `run_build_async`
+  # detects macOS and force-fallbacks to an in-guest tmpfs (no
+  # persistent cache, cold ~25 min every run). Linux hosts get the
+  # bind-mount + warm cache. The block-device workaround
+  # (sparse ext4 file attached as a raw disk, mkfs'd by the guest)
+  # is the planned macOS fix — see Sprint 50 follow-up. Opt into
+  # the bind-mount today with `MVM_BUILDER_USE_HOST_STORE=1` only
+  # if you're working on that follow-up.
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -81,7 +124,31 @@
             entrypoint.shell = "/bin/sh";
             packages = builderPackages pkgs;
           };
-          kernelPkg = pkgs.linuxPackages.kernel;
+          # Override the stock kernel to compile vsock support in
+          # (rather than as modules). The rootfs we ship is a flat
+          # busybox tree without `/lib/modules/`, so `=m` modules can
+          # never load — `mvm-guest-agent` then fails `socket(AF_VSOCK,
+          # …)` because the address family isn't registered, and
+          # every host-side surface that talks to the agent
+          # (`mvmctl console`, `dev shell`, `build`) goes dark.
+          #
+          # Built-in:
+          #   - VSOCKETS:               AF_VSOCK address family
+          #   - VHOST_VSOCK:            host-side vhost driver path
+          #   - VIRTIO_VSOCKETS_COMMON: shared virtio-vsock plumbing
+          #   - VIRTIO_VSOCKETS:        guest-side virtio transport
+          #   - VHOST + VHOST_NET:      dependencies the above pull in
+          devKernel = pkgs.linuxPackages.kernel.override {
+            structuredExtraConfig = with pkgs.lib.kernel; {
+              VSOCKETS = yes;
+              VHOST = yes;
+              VHOST_VSOCK = yes;
+              VIRTIO_VSOCKETS_COMMON = yes;
+              VIRTIO_VSOCKETS = yes;
+            };
+            ignoreConfigErrors = true;
+          };
+          kernelPkg = devKernel;
           kernelFile =
             if pkgs.stdenv.hostPlatform.isAarch64
             then "Image"

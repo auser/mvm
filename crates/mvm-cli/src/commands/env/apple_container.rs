@@ -519,6 +519,18 @@ fn ensure_dev_image() -> Result<(String, String)> {
                  refusing to copy garbage into the prebuilt cache"
             )
         })?;
+        let vendored_dir = src_rootfs
+            .parent()
+            .expect("vendored rootfs always has a parent dir");
+        verify_vendored_checksums(vendored_dir).with_context(|| {
+            format!(
+                "vendored dev image at {source_label} failed checksum \
+                 verification — refusing to boot. The artifacts may have \
+                 been tampered, partially copied, or are out-of-sync with \
+                 the checksums sidecar. Re-run `cargo xtask build-dev-image` \
+                 to regenerate."
+            )
+        })?;
         std::fs::create_dir_all(&prebuilt_dir)
             .with_context(|| format!("creating prebuilt dir {prebuilt_dir}"))?;
         ui::info(&format!(
@@ -775,6 +787,77 @@ fn validate_dev_image_artifacts(
         );
     }
 
+    Ok(())
+}
+
+/// Verify every artifact listed in `<dir>/checksums-sha256.txt` against
+/// its on-disk SHA-256. The file is the same `<hex>  <name>\n` format
+/// emitted by `sha256sum` and `cargo xtask build-dev-image`, so the
+/// network-download path (`verify_unsigned_checksums` in `mvm-security`)
+/// and the local vendored path share one wire shape.
+///
+/// **Why this runs.** The vendored slot sits next to a persistent host
+/// `builder-store` (`builder_vm::builder_store_dir`). Re-hashing on
+/// every boot gives an early-warning signal if either layer (vendored
+/// artifacts or builder cache the artifacts came from) was tampered or
+/// got partial-copied. nix's content-addressed store paths already
+/// guarantee that *future* builds reject poisoned closures by input
+/// hash; this check covers the *already-emitted* artifact pair.
+///
+/// **Backwards-compat.** A missing sidecar is treated as a warning, not
+/// a fail. Older vendored slots (pre-checksum xtask) still boot, but
+/// the user sees a nudge to re-run the xtask to regenerate.
+/// **Present-but-mismatched** is hard-fail: that's the active-tamper
+/// signal we want to catch.
+fn verify_vendored_checksums(dir: &std::path::Path) -> Result<()> {
+    let checksums_path = dir.join("checksums-sha256.txt");
+    let body = match std::fs::read_to_string(&checksums_path) {
+        Ok(b) => b,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            ui::warn(&format!(
+                "{} is missing; skipping sidecar verification \
+                 (pre-checksum vendored slot). Re-run \
+                 `cargo xtask build-dev-image` to regenerate.",
+                checksums_path.display()
+            ));
+            return Ok(());
+        }
+        Err(e) => {
+            anyhow::bail!("reading {}: {e}", checksums_path.display());
+        }
+    };
+    for (lineno, raw) in body.lines().enumerate() {
+        let line = raw.trim();
+        if line.is_empty() {
+            continue;
+        }
+        let mut parts = line.splitn(2, char::is_whitespace);
+        let expected = parts.next().ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}:{} malformed line: {raw:?}",
+                checksums_path.display(),
+                lineno + 1
+            )
+        })?;
+        let name = parts.next().map(str::trim_start).ok_or_else(|| {
+            anyhow::anyhow!(
+                "{}:{} missing filename in line: {raw:?}",
+                checksums_path.display(),
+                lineno + 1
+            )
+        })?;
+        let artifact = dir.join(name);
+        let actual = mvm_security::image_verify::sha256_file(&artifact)
+            .with_context(|| format!("hashing {}", artifact.display()))?;
+        if !actual.eq_ignore_ascii_case(expected) {
+            anyhow::bail!(
+                "checksum mismatch for {}: expected {}, got {}",
+                artifact.display(),
+                expected,
+                actual
+            );
+        }
+    }
     Ok(())
 }
 
@@ -1613,7 +1696,7 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
 fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(String, String)> {
     use mvm_build::builder_vm::{
         BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, BuilderVm, MicrosandboxBuilderVm,
-        host_system_linux,
+        builder_store_dir, host_system_linux,
     };
 
     let flake_src = std::path::PathBuf::from(flake_dir);
@@ -1649,13 +1732,12 @@ fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(Strin
     };
     let mounts = BuilderMounts {
         flake_src: workspace,
-        // host_nix_store is intentionally None: the builder_vm always
-        // provisions a tmpfs at `/scratch-nix` and runs `nix build`
-        // with `--store /scratch-nix`. The host-side bind-mount is
-        // unused on macOS (Darwin-targeted closures, root-owned dir,
-        // xattr passthrough fails) and even on Linux the scratch
-        // tmpfs simplifies cleanup.
-        host_nix_store: None,
+        // Shared persistent /nix-store cache with `cargo xtask
+        // build-dev-image` so both paths warm the same closure cache.
+        // If the macOS xattr issue surfaces, `MVM_BUILDER_FORCE_TMPFS=1`
+        // is the documented escape hatch (run_build_async surfaces a
+        // hint when nix build fails with the EIO/xattr signature).
+        host_nix_store: Some(builder_store_dir()),
         artifact_out: std::path::PathBuf::from(out_dir),
     };
 
@@ -1942,6 +2024,66 @@ mod hash_verify_tests {
         assert!(
             err.contains("did not include") && err.contains("dev-vmlinux-x86_64"),
             "expected missing-entry error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_vendored_checksums_accepts_matching_artifacts() {
+        let dir = tempfile::tempdir().unwrap();
+        let vmlinux = b"fake vmlinux bytes";
+        let rootfs = b"fake rootfs bytes";
+        std::fs::write(dir.path().join("vmlinux"), vmlinux).unwrap();
+        std::fs::write(dir.path().join("rootfs.ext4"), rootfs).unwrap();
+        let manifest = format!(
+            "{}  vmlinux\n{}  rootfs.ext4\n",
+            hex_sha256(vmlinux),
+            hex_sha256(rootfs)
+        );
+        std::fs::write(dir.path().join("checksums-sha256.txt"), manifest).unwrap();
+        verify_vendored_checksums(dir.path()).expect("matching checksums should pass");
+    }
+
+    #[test]
+    fn verify_vendored_checksums_skips_when_sidecar_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("vmlinux"), b"anything").unwrap();
+        verify_vendored_checksums(dir.path())
+            .expect("missing sidecar should warn and pass for backwards-compat");
+    }
+
+    #[test]
+    fn verify_vendored_checksums_rejects_mismatch() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("vmlinux"), b"actual contents").unwrap();
+        let wrong = hex_sha256(b"different contents");
+        std::fs::write(
+            dir.path().join("checksums-sha256.txt"),
+            format!("{wrong}  vmlinux\n"),
+        )
+        .unwrap();
+        let err = verify_vendored_checksums(dir.path())
+            .expect_err("mismatch must hard-fail")
+            .to_string();
+        assert!(
+            err.contains("checksum mismatch") && err.contains("vmlinux"),
+            "expected checksum-mismatch error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn verify_vendored_checksums_rejects_malformed_line() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(
+            dir.path().join("checksums-sha256.txt"),
+            "missing-filename-after-this-hash\n",
+        )
+        .unwrap();
+        let err = verify_vendored_checksums(dir.path())
+            .expect_err("malformed line must fail")
+            .to_string();
+        assert!(
+            err.contains("missing filename"),
+            "expected missing-filename error, got: {err}"
         );
     }
 }
