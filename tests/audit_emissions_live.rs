@@ -303,6 +303,63 @@ fn manifest_prune_orphans_dry_run_does_not_emit_audit_entry() {
 }
 
 #[test]
+fn storage_gc_apply_emits_storage_gc_audit_entry_even_on_empty_pool() {
+    // Plan 37 §6 invariant: a state-changing verb emits one audit
+    // record per attempt, even when the body of work is a no-op.
+    // Running `mvmctl storage gc --apply --mock` against a fresh
+    // in-memory MockBackend lists zero volumes — but `--apply`
+    // is the operator's commit signal, so the attempt must still
+    // surface in the audit log. Failure here means the empty-pool
+    // early-return in storage/gc.rs is skipping the emit.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["storage", "gc", "--apply", "--mock"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl storage gc --apply --mock failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "storage_gc");
+    assert!(
+        hits >= 1,
+        "expected ≥1 storage_gc entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn storage_gc_dry_run_does_not_emit_audit_entry() {
+    // Negative complement: dry-run is read-only and must not emit.
+    // Plain `mvmctl storage gc --mock` (no `--apply`) is the dry-run
+    // surface — pin it as a no-emit invariant against a future
+    // regression that elevates the dry-run path into the emit branch.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["storage", "gc", "--mock"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl storage gc --mock failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "storage_gc");
+    assert_eq!(
+        hits, 0,
+        "dry-run must not write audit entries, got {hits} storage_gc \
+         entry/entries. Full log:\n{log}"
+    );
+}
+
+#[test]
 fn secret_put_emits_put_action_in_secret_audit_log() {
     // The `mvmctl secret` command writes per-action JSONL to a
     // separate audit file (`~/.mvm/audit/secrets.jsonl`); the
