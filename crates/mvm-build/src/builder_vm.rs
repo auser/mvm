@@ -549,6 +549,23 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
         .registry(|r| r.auth(microsandbox::RegistryAuth::Anonymous))
         .cpus(cpus)
         .memory(memory_mib)
+        // Network policy: allow_all for the builder trust zone.
+        //
+        // microsandbox's default is `public_only()` (deny-egress + one
+        // allow rule for `DestinationGroup::Public`). Empirically that
+        // lets the build hit `cache.nixos.org` but blocks `crates.io`
+        // — both are public CDNs, so the disparity is likely a quirk
+        // of how the `public` group classifier resolves CloudFront's
+        // IP ranges vs. Fastly's. Either way, the builder VM lives in
+        // a *different trust zone* than runtime VMs (ADR-013 §"Linux
+        // builder via microsandbox": it pulls from network, runs
+        // arbitrary Nix derivations, and is explicitly allowed
+        // internet egress for that purpose). `allow_all` matches the
+        // documented trust boundary.
+        //
+        // What we are NOT relaxing: runtime VMs continue to use their
+        // own (much tighter) policy; this only loosens the BUILDER.
+        .network(|n| n.policy(microsandbox::NetworkPolicy::allow_all()))
         .volume(BUILDER_GUEST_WORK_DIR, |m| {
             m.bind(flake_src.as_path()).readonly()
         })
@@ -718,7 +735,13 @@ nix build {flake_ref}#{attr_path}{store_flag} --no-link --print-out-paths --no-w
 rc=$?
 set -e
 if [ $rc -ne 0 ]; then
-  if grep -qiE 'xattr|extended attribute|input/output error' /tmp/mvm-nix-build.stderr 2>/dev/null; then
+  # Match the actual nix error signature, not the word "xattr" in
+  # isolation — the bare-word regex matched on store-path names like
+  # `/nix/store/...-xattr-1.6.1` (the Rust crate) and fired the
+  # diagnostic on every unrelated build failure. Real format from
+  # libkrun-on-APFS is `querying extended attributes of '<path>':
+  # Input/output error` or `setxattr ... : Input/output error`.
+  if grep -qiE 'querying extended attributes.*Input/output error|setxattr.*Input/output error' /tmp/mvm-nix-build.stderr 2>/dev/null; then
     echo "" >&2
     echo "MVM_BUILDER: nix build failed with xattr/EIO signature. The bind-mounted" >&2
     echo "MVM_BUILDER: {scratch} may not support extended attributes (known issue on" >&2
