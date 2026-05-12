@@ -64,6 +64,8 @@
 //!   **no** audit entry (the `AUDIT` leaves are all ReadOnly)
 //! - `mvmctl attest status` / `attest export` → **no** audit
 //!   entry (the `ATTEST` leaves are all ReadOnly)
+//! - `mvmctl session ls` / `volume ls <vm>` → **no** audit entry
+//!   (SESSION ls and VOLUME ls leaves are both ReadOnly)
 //! - `mvmctl ls` / `metrics` / `catalog list` → **no** audit entry
 //!   (top-level ReadOnly verbs — three more rows from
 //!   `AUDIT_POSTURE` pinned against a future regression that
@@ -1190,6 +1192,58 @@ fn uninstall_dry_run_does_not_emit_audit_entry() {
         hits, 0,
         "dry-run must not write uninstall audit entries, got {hits}. \
          Full log:\n{log}"
+    );
+}
+
+#[test]
+fn session_ls_does_not_emit_audit_entry() {
+    // Negative: `session ls` enumerates active sessions from the
+    // on-disk registry. Read-only; the `SESSION_SUB.ls` row is
+    // classified `ReadOnly`. Empty sandbox = empty session list,
+    // no entries emitted.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["session", "ls"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl session ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `session ls` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn volume_ls_does_not_emit_audit_entry() {
+    // Negative: `volume ls <vm>` lists registered volume mounts.
+    // Read-only against the per-VM volume registry. `VOLUME_SUB.ls`
+    // row is `ReadOnly`; empty sandbox = "(no volume mounts)",
+    // no audit entries.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["volume", "ls", "test-vm"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl volume ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `volume ls` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
     );
 }
 
