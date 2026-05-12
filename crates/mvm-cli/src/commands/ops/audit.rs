@@ -69,6 +69,34 @@ pub(in crate::commands) enum AuditAction {
         #[arg(long)]
         json: bool,
     },
+    /// Verify a destruction certificate (or array of certificates)
+    /// produced by `mvmctl tenant destroy`. Designed for use by an
+    /// off-host auditor — the verifier needs only the certificate
+    /// file + (optionally) the operator's host identity pubkey.
+    ///
+    /// Plan 60 Phase 7a Slice D. Each certificate carries an
+    /// Ed25519 signature over the destruction receipt fields; this
+    /// command checks the signature, refuses tampered fields, and
+    /// prints the verified receipts.
+    VerifyCert {
+        /// Path to the certificate file. Pass `-` to read from
+        /// stdin. Accepts either a single `SignedDestructionReceipt`
+        /// object or a JSON array of them (the shape `mvmctl tenant
+        /// destroy` writes).
+        cert: String,
+        /// Optional path to the operator's host identity pubkey.
+        /// When supplied, each certificate's embedded signer_pubkey
+        /// must match byte-for-byte. The file is the URL-safe-no-pad
+        /// base64 form of the 32-byte Ed25519 public key (the same
+        /// shape `~/.mvm/keys/host-signer.pub` encodes; pass it
+        /// through `cat host-signer.pub | base64`).
+        #[arg(long)]
+        pubkey: Option<std::path::PathBuf>,
+        /// Emit verified receipts as a JSON array on stdout (for
+        /// downstream tooling). Human summary still goes to stderr.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
@@ -88,7 +116,100 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         AuditAction::Verify { tenant } => audit_verify(&tenant),
         AuditAction::Show { plan_id, tenant } => audit_show(&tenant, &plan_id),
         AuditAction::Posture { json } => super::audit_posture::run(json),
+        AuditAction::VerifyCert { cert, pubkey, json } => {
+            verify_cert(&cert, pubkey.as_deref(), json)
+        }
     }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// Plan 60 Phase 7a Slice D — auditor-side verify-cert
+// ─────────────────────────────────────────────────────────────────
+
+fn verify_cert(cert: &str, pubkey_path: Option<&std::path::Path>, json: bool) -> Result<()> {
+    use base64::Engine;
+    use mvm::vm::overlay::{SignedDestructionReceipt, verify_destruction_receipt};
+
+    // 1. Slurp the cert. `-` reads from stdin so an auditor can
+    //    `cat certs.json | mvmctl audit verify-cert -`.
+    let raw = if cert == "-" {
+        let mut buf = String::new();
+        std::io::Read::read_to_string(&mut std::io::stdin(), &mut buf)
+            .context("reading certificate from stdin")?;
+        buf
+    } else {
+        std::fs::read_to_string(cert).with_context(|| format!("reading {cert}"))?
+    };
+
+    // 2. Parse — accept both shapes (mvmctl tenant destroy emits
+    //    an array; the Rust API + runbook snippet show single
+    //    objects).
+    let certs: Vec<SignedDestructionReceipt> = if raw.trim_start().starts_with('[') {
+        serde_json::from_str(&raw).context("decoding certificate array")?
+    } else {
+        let one: SignedDestructionReceipt =
+            serde_json::from_str(&raw).context("decoding certificate")?;
+        vec![one]
+    };
+
+    // 3. Optional expected pubkey. The file is the base64 form
+    //    `~/.mvm/keys/host-signer.pub | base64` produces.
+    let expected_pubkey = match pubkey_path {
+        Some(p) => {
+            let raw = std::fs::read_to_string(p)
+                .with_context(|| format!("reading pubkey file {}", p.display()))?;
+            let bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+                .decode(raw.trim().as_bytes())
+                .or_else(|_| {
+                    base64::engine::general_purpose::STANDARD.decode(raw.trim().as_bytes())
+                })
+                .with_context(|| format!("decoding base64 pubkey from {}", p.display()))?;
+            if bytes.len() != 32 {
+                anyhow::bail!(
+                    "pubkey file {} contains {} bytes; expected 32",
+                    p.display(),
+                    bytes.len()
+                );
+            }
+            let array: [u8; 32] = bytes.as_slice().try_into().unwrap();
+            Some(ed25519_dalek::VerifyingKey::from_bytes(&array).context("parsing pubkey")?)
+        }
+        None => None,
+    };
+
+    // 4. Verify each. Fail fast on the first refusal so the
+    //    operator sees a clear error per cert.
+    let mut verified: Vec<&mvm::vm::overlay::DestructionReceipt> = Vec::with_capacity(certs.len());
+    for (i, signed) in certs.iter().enumerate() {
+        let receipt =
+            verify_destruction_receipt(signed, expected_pubkey.as_ref()).with_context(|| {
+                format!(
+                    "verifying certificate {} ({}/{})",
+                    i + 1,
+                    signed.receipt.tenant,
+                    signed.receipt.workload,
+                )
+            })?;
+        verified.push(receipt);
+    }
+
+    // 5. Render. Human summary to stderr always; receipts JSON to
+    //    stdout when --json.
+    eprintln!(
+        "mvmctl audit verify-cert: {} certificate(s) verified",
+        verified.len()
+    );
+    for r in &verified {
+        eprintln!(
+            "  ✓ {}/{}: {} file(s), {} byte(s) wiped at {}",
+            r.tenant, r.workload, r.files_wiped, r.bytes_wiped, r.destroyed_at
+        );
+    }
+    if json {
+        let arr: Vec<&mvm::vm::overlay::DestructionReceipt> = verified;
+        println!("{}", serde_json::to_string_pretty(&arr)?);
+    }
+    Ok(())
 }
 
 fn audit_tail_chain(tenant: &str, lines: usize, follow: bool) -> Result<()> {
@@ -304,5 +425,144 @@ fn print_audit_line(line: &str) {
             // Non-local-audit line — print as-is (fleet AuditEntry, etc.)
             println!("{line}");
         }
+    }
+}
+
+#[cfg(test)]
+mod verify_cert_tests {
+    use super::*;
+    use base64::Engine;
+    use ed25519_dalek::SigningKey;
+    use mvm::vm::overlay::{
+        DestructionReceipt, SignedDestructionReceipt, sign_destruction_receipt,
+    };
+    use tempfile::tempdir;
+
+    fn sample_receipt() -> DestructionReceipt {
+        DestructionReceipt {
+            tenant: "acme".to_string(),
+            workload: "build".to_string(),
+            destroyed_at: chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .unwrap(),
+            files_wiped: 5,
+            bytes_wiped: 1024,
+        }
+    }
+
+    fn sign(receipt: &DestructionReceipt) -> (SignedDestructionReceipt, SigningKey) {
+        let key = SigningKey::generate(&mut rand::rngs::OsRng);
+        let signed = sign_destruction_receipt(receipt, &key);
+        (signed, key)
+    }
+
+    fn write_cert_file(signed: &SignedDestructionReceipt) -> tempfile::TempDir {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("cert.json");
+        std::fs::write(&path, serde_json::to_string_pretty(signed).unwrap()).unwrap();
+        dir
+    }
+
+    fn write_pubkey_file(key: &SigningKey, dir: &std::path::Path) -> std::path::PathBuf {
+        let pubkey = key.verifying_key();
+        let b64 = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(pubkey.to_bytes());
+        let path = dir.join("pubkey.b64");
+        std::fs::write(&path, b64).unwrap();
+        path
+    }
+
+    #[test]
+    fn verify_cert_accepts_valid_single_cert() {
+        let (signed, _key) = sign(&sample_receipt());
+        let dir = write_cert_file(&signed);
+        verify_cert(dir.path().join("cert.json").to_str().unwrap(), None, false).unwrap();
+    }
+
+    #[test]
+    fn verify_cert_accepts_array_form() {
+        let (signed1, _k1) = sign(&sample_receipt());
+        let (signed2, _k2) = sign(&DestructionReceipt {
+            workload: "test".to_string(),
+            ..sample_receipt()
+        });
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("certs.json");
+        let arr = vec![signed1, signed2];
+        std::fs::write(&path, serde_json::to_string_pretty(&arr).unwrap()).unwrap();
+        verify_cert(path.to_str().unwrap(), None, false).unwrap();
+    }
+
+    #[test]
+    fn verify_cert_rejects_tampered_field() {
+        let (mut signed, _key) = sign(&sample_receipt());
+        signed.receipt.tenant = "evil".to_string();
+        let dir = write_cert_file(&signed);
+        let err =
+            verify_cert(dir.path().join("cert.json").to_str().unwrap(), None, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("SignatureInvalid") || msg.contains("verifying certificate"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn verify_cert_with_matching_pubkey_succeeds() {
+        let (signed, key) = sign(&sample_receipt());
+        let dir = write_cert_file(&signed);
+        let pubkey_path = write_pubkey_file(&key, dir.path());
+        verify_cert(
+            dir.path().join("cert.json").to_str().unwrap(),
+            Some(&pubkey_path),
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn verify_cert_with_mismatched_pubkey_rejects() {
+        let (signed, _signer_key) = sign(&sample_receipt());
+        let dir = write_cert_file(&signed);
+        // Plant a DIFFERENT pubkey on disk.
+        let other = SigningKey::generate(&mut rand::rngs::OsRng);
+        let pubkey_path = write_pubkey_file(&other, dir.path());
+        let err = verify_cert(
+            dir.path().join("cert.json").to_str().unwrap(),
+            Some(&pubkey_path),
+            false,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("PubkeyMismatch") || msg.contains("verifying certificate"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn verify_cert_rejects_malformed_pubkey_file_size() {
+        let (signed, _key) = sign(&sample_receipt());
+        let dir = write_cert_file(&signed);
+        // Plant a short pubkey file — base64-decodes to wrong
+        // length.
+        let path = dir.path().join("bad-pubkey.b64");
+        std::fs::write(&path, "AAAA").unwrap(); // 3 bytes decoded
+        let err = verify_cert(
+            dir.path().join("cert.json").to_str().unwrap(),
+            Some(&path),
+            false,
+        )
+        .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("32"), "{msg}");
+    }
+
+    #[test]
+    fn verify_cert_rejects_unparseable_json() {
+        let dir = tempdir().unwrap();
+        let path = dir.path().join("nope.json");
+        std::fs::write(&path, "this is not json").unwrap();
+        let err = verify_cert(path.to_str().unwrap(), None, false).unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("decoding") || msg.contains("EOF"), "{msg}");
     }
 }
