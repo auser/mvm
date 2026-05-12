@@ -28,7 +28,7 @@ use mvm_mcp::{
 };
 use mvm_supervisor::ToolRegistry;
 use mvm_supervisor::tools::{download, staging, upload, web_fetch, web_search};
-use secrecy::ExposeSecret;
+use secrecy::SecretBox;
 
 use super::Cli;
 
@@ -187,27 +187,28 @@ const PROVIDER_CREDENTIAL_TENANT: &str = "local";
 ///    invoke time, which is the operator's downstream signal.
 /// 3. Otherwise — `None` (caller treats as unconfigured).
 ///
-/// The returned `String` is NOT a `SecretBox` because each
-/// downstream provider (`BraveSearchProvider`, etc.) takes a
-/// `String` and pins it inside its own struct. The unwrap is the
-/// boundary; from this point forward the key lives behind the
-/// provider's hand-written `Debug` redaction (W5 pattern).
+/// Plan 65 W6: the return type is `SecretBox<String>` (not a raw
+/// `String`) so the bytes zeroize on drop — even if the provider
+/// constructor that consumes it panics mid-build, the
+/// SecretBox-wrapped value still gets cleaned up. Each provider's
+/// `new()` accepts `SecretBox<String>` directly; this resolver
+/// hands ownership through end-to-end.
 fn resolve_provider_credential(
     direct_env_var: &str,
     secret_ref_env_var: &str,
     store: &dyn mvm_security::secret_store::SecretStore,
-) -> Option<String> {
+) -> Option<SecretBox<String>> {
     if let Ok(direct) = std::env::var(direct_env_var)
         && !direct.is_empty()
     {
-        return Some(direct);
+        return Some(SecretBox::new(Box::new(direct)));
     }
     let secret_name = std::env::var(secret_ref_env_var).ok()?;
     if secret_name.is_empty() {
         return None;
     }
     match store.get(PROVIDER_CREDENTIAL_TENANT, &secret_name) {
-        Ok(secret) => Some(secret.expose_secret().clone()),
+        Ok(secret) => Some(secret),
         Err(e) => {
             tracing::warn!(
                 env_var = secret_ref_env_var,
@@ -956,7 +957,15 @@ mod tests {
     // ──────────────────────────────────────────────────────────────
 
     use mvm_security::secret_store::{FileSecretStore, SecretStore};
-    use secrecy::SecretBox;
+    use secrecy::{ExposeSecret, SecretBox};
+
+    /// Expose the inner string of a `SecretBox` for test
+    /// assertions. The production path never does this — only
+    /// `BraveSearchProvider::search` etc. expose at the wire
+    /// boundary.
+    fn exposed(opt: Option<SecretBox<String>>) -> Option<String> {
+        opt.map(|s| s.expose_secret().clone())
+    }
 
     fn tempdir_store() -> (tempfile::TempDir, FileSecretStore) {
         let dir = tempfile::tempdir().unwrap();
@@ -976,7 +985,7 @@ mod tests {
         unsafe {
             std::env::remove_var(direct);
         }
-        assert_eq!(resolved.as_deref(), Some("direct-value"));
+        assert_eq!(exposed(resolved).as_deref(), Some("direct-value"));
     }
 
     #[test]
@@ -998,7 +1007,7 @@ mod tests {
         unsafe {
             std::env::remove_var(secret_ref);
         }
-        assert_eq!(resolved.as_deref(), Some("from-store"));
+        assert_eq!(exposed(resolved).as_deref(), Some("from-store"));
     }
 
     #[test]
@@ -1024,7 +1033,7 @@ mod tests {
             std::env::remove_var(direct);
             std::env::remove_var(secret_ref);
         }
-        assert_eq!(resolved.as_deref(), Some("direct-wins"));
+        assert_eq!(exposed(resolved).as_deref(), Some("direct-wins"));
     }
 
     #[test]
@@ -1061,7 +1070,7 @@ mod tests {
             std::env::remove_var(direct);
             std::env::remove_var(secret_ref);
         }
-        assert_eq!(resolved.as_deref(), Some("from-store-fallback"));
+        assert_eq!(exposed(resolved).as_deref(), Some("from-store-fallback"));
     }
 
     #[test]

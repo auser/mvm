@@ -176,6 +176,67 @@ forces the upstream to return a non-success status and asserts
 the resulting `SearchError::Upstream` message does not contain
 the API key string.
 
+### W6 — Provider credential lifetime (SHIPPED)
+
+**Status (2026-05-11 — ✅ shipped):**
+
+**Threat:** Provider API keys (`BraveSearchProvider::api_key`,
+`TavilySearchProvider::api_key`, `GoogleSearchProvider::api_key` +
+`cse_id`) live as raw `String` in the provider struct. When the
+provider drops, `String`'s allocator frees the heap buffer but
+does NOT zero the bytes — they sit in deallocated memory until
+overwritten. A memory-disclosure bug elsewhere in the supervisor
+(use-after-free, oversharing of a panic backtrace, debug print,
+core-dump-on-segfault) could leak the key.
+
+The CLAUDE.md threat model accepts "the host can read its own
+memory," but the LLM-agent boundary makes this a real concern:
+the agent isn't strictly a host actor, and a tool-call panic
+that writes a backtrace to a logger the agent reads is a
+plausible exfiltration path.
+
+**Mitigation (shipped):** Every provider credential now holds
+`SecretBox<String>` (from the `secrecy` crate; same wrapper plan
+63 W2 already uses across the codebase):
+
+- `Zeroize`-on-drop: the underlying `String`'s buffer is
+  cryptographically zeroed before the allocator reclaims it.
+- No `Debug`/`Display`: `SecretBox<T>` deliberately doesn't
+  implement either. Accidental `{provider:?}` formatting either
+  fails to compile (provider's own `Debug` is hand-written +
+  redacted, mirroring W5) or pins to the wrapper's own redacted
+  output.
+- `expose_secret()` is the only path to the inner string. The
+  providers call it exactly at the wire boundary
+  (`reqwest::Client::header(...)`, `query(...)`, JSON body
+  construction) and never store the exposed value in a longer-
+  lived binding.
+- The credential-resolver pipeline in `mvm-cli` is end-to-end
+  `SecretBox`: `resolve_provider_credential` returns
+  `Option<SecretBox<String>>`, providers accept `SecretBox<String>`
+  at construction. No intermediate `String` clone exists between
+  the secret store and the wire.
+
+**Defense vs. existing CLAUDE.md threat model:**
+
+- W4 covers env-var visibility (`/proc/<pid>/environ`).
+- W5 covers URL-embedded keys (Google) leaking through error
+  messages.
+- W6 covers in-process memory lifetime after the operator's
+  shell init has propagated the key into the supervisor.
+
+All three are needed: an operator with `BRAVE_API_KEY_FROM_SECRET`
+configured (W4 hardened) using Google search (W5 hardened) is
+still vulnerable to W6 unless the in-memory copy zeroizes on
+drop.
+
+**Exit tests:** All existing W5 tests continue to pass without
+modification (Debug redaction is unchanged; SecretBox doesn't
+expose). The `xtask check-no-display-on-secret-types` lint stays
+clean. The W4 resolver tests continue to verify the end-to-end
+secret-store pathway, now returning `SecretBox<String>` rather
+than `String`.
+
 ## Already-considered, not a hole
 
 These came up during the threat survey and are documented here
@@ -210,7 +271,10 @@ so a future audit doesn't re-flag them:
 | 1 | W1 + W3 | `ReqwestHttpFetcher` constructor + chunk loop | redirect-policy + body-cap-exact | `bfb82c6` |
 | 2 | W2 | Pre-resolve through `SsrfGuard::classify` + `PinnedDnsResolver` | ssrf-rejects-loopback/imds/rfc1918 | `5bbae28` |
 | 3 | W5 | `GoogleSearchProvider` + `redact_credentials` + redacted Debug | network-error-does-not-leak-api-key | `09839ab` |
-| 4 | W4 | `resolve_provider_credential` falls back to `mvm_security::secret_store` | direct-wins / fallback / miss / empty-direct | (this commit) |
+| 4 | W4 | `resolve_provider_credential` falls back to `mvm_security::secret_store` | direct-wins / fallback / miss / empty-direct | `69a5440` |
+| 5 (follow-on) | W1 + W2 for providers | `http_hardening::hardened_client_builder` + `SsrfFilteringResolver` consumed by Brave/Tavily/Google | filter-passes-public / rejects-loopback/imds/rfc1918 / partial-mix | `8acbc4c` |
+| 6 (follow-on) | DoS-via-huge-response | `http_hardening::read_capped` + 1 MiB default; providers parse from capped bytes | read-capped-* live-HTTP | `a437c0e` |
+| 7 — W6 | Provider credential lifetime | Brave/Tavily/Google `api_key` + Google `cse_id` switch to `SecretBox<String>`; constructors require `SecretBox` at type level; `resolve_provider_credential` returns `Option<SecretBox<String>>` end-to-end (no intermediate `String` clone) | secret-types xtask + all existing tests | (this commit) |
 
 Each slice lands as a separate commit with workspace tests +
 clippy `-D warnings` + secret-types xtask all clean.
