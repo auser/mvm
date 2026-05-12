@@ -14,6 +14,12 @@
 //! - `mvmctl cache prune --dry-run` → **no** audit entry
 //!   (dry-runs are read-only; pinning the negative)
 //! - `mvmctl network create <name>` → `NetworkCreate`
+//! - `mvmctl network remove <name>` → `NetworkRemove`
+//! - `mvmctl manifest prune --orphans` (empty registry) → `SlotPrune`
+//!   (emitted with `count=0` — Plan 37 §6 invariant: every state-
+//!   changing verb emits one record per attempt, even on no-op)
+//! - `mvmctl secret put` → secret-side audit JSONL at
+//!   `~/.mvm/audit/secrets.jsonl` carries `"action":"put"`
 //!
 //! ## Hermetic setup
 //!
@@ -70,6 +76,17 @@ impl AuditSandbox {
             .join("mvm")
             .join("log")
             .join("audit.jsonl")
+    }
+
+    /// The `mvmctl secret` command writes its own per-action JSONL
+    /// to `~/.mvm/audit/secrets.jsonl` (distinct from the
+    /// `LocalAudit` stream). Entries have shape
+    /// `{"action":"put","tenant":"...","name":"...","outcome":"ok",...}`.
+    fn secret_audit_log_path(&self) -> PathBuf {
+        self.home_path()
+            .join(".mvm")
+            .join("audit")
+            .join("secrets.jsonl")
     }
 
     /// Build a Command pre-wired with `HOME` overridden so every
@@ -188,5 +205,111 @@ fn network_create_emits_network_create_audit_entry() {
         hits >= 1,
         "expected ≥1 network_create entry in audit log, got {hits}. \
          Full log:\n{log}"
+    );
+}
+
+#[test]
+fn network_remove_emits_network_remove_audit_entry() {
+    // Create a network first, then remove it. Two audit entries
+    // are expected: one `network_create`, one `network_remove`.
+    let sandbox = AuditSandbox::new();
+
+    let create = sandbox
+        .mvmctl()
+        .args(["network", "create", "test-rm-audit-net"])
+        .output()
+        .expect("spawn mvmctl create");
+    assert!(
+        create.status.success(),
+        "create failed: stderr={}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let remove = sandbox
+        .mvmctl()
+        .args(["network", "remove", "test-rm-audit-net"])
+        .output()
+        .expect("spawn mvmctl remove");
+    assert!(
+        remove.status.success(),
+        "remove failed: stderr={}",
+        String::from_utf8_lossy(&remove.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "network_remove");
+    assert!(
+        hits >= 1,
+        "expected ≥1 network_remove entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_prune_orphans_emits_slot_prune_audit_entry() {
+    // Plan 37 §6 invariant: a state-changing verb emits one audit
+    // record per attempt, even when the body of work is a no-op.
+    // Running `manifest prune --orphans` against an empty registry
+    // walks zero slots but still emits one `slot_prune` entry.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["manifest", "prune", "--orphans"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest prune --orphans failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "slot_prune");
+    assert!(
+        hits >= 1,
+        "expected ≥1 slot_prune entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn secret_put_emits_put_action_in_secret_audit_log() {
+    // The `mvmctl secret` command writes per-action JSONL to a
+    // separate audit file (`~/.mvm/audit/secrets.jsonl`); the
+    // shape is `{"action":"put","tenant":...,"name":...,"outcome":"ok",...}`.
+    // This pins the entry shape so a regression that flips
+    // "action" → "verb" or relocates the file gets caught.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args([
+            "secret",
+            "put",
+            "api-key",
+            "--tenant",
+            "test-tenant",
+            "--value",
+            "deadbeef",
+        ])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl secret put failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = std::fs::read_to_string(sandbox.secret_audit_log_path()).unwrap_or_default();
+    assert!(
+        log.contains("\"action\":\"put\""),
+        "expected an 'action':'put' entry in secrets audit log. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("\"tenant\":\"test-tenant\""),
+        "audit entry must record the tenant. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("\"outcome\":\"ok\""),
+        "audit entry must record outcome=ok on success. Full log:\n{log}"
     );
 }
