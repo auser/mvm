@@ -16,10 +16,15 @@ mvm-policy.workspace = true
 # Heavy dep, but the supervisor's eventual job is to drive runtime
 # operations anyway, so we'd be importing it shortly regardless.
 mvm.workspace = true
+anyhow.workspace = true
 async-trait = "0.1"
 base64.workspace = true
 chrono.workspace = true
 ed25519-dalek.workspace = true
+# Used by the balloon reclaim controller as a cross-platform memory-
+# pressure source. PSI on Linux and `vm_pressure` on macOS are
+# stronger signals — wiring those in is a follow-up.
+sysinfo = { version = "0.30", default-features = false }
 # Plan 60 Phase 3 Slice B — L4 egress policy CIDR matching.
 ipnet.workspace = true
 # Plan 60 Phase 3 Slice B — pure-Rust DNS resolver, alternative to

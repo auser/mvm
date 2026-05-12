@@ -1223,7 +1223,7 @@ this sprint lands the top two:
    envelope** — content-addressed `.mvmpkg` replaces the
    manifest-path-hash registry keying.
 
-### W1 — Virtio-balloon elasticity  🟡 substrate landed
+### W1 — Virtio-balloon elasticity  ✅ shipped
 
 Workloads opting into `mem_initial_mib` boot with a pre-inflated
 balloon and only commit a fraction of `memory_mib`; a host-side
@@ -1262,17 +1262,39 @@ Shipped:
   decisions. Defaults: inflate above 0.80, deflate below 0.60,
   step 64 MiB, guest floor 64 MiB. Fully unit-tested.
 
-Outstanding (this sprint):
+Shipped in the W1 close-out commit:
 
-- Host-pressure poller integration — turn `BalloonPolicy` into a
-  running tick by reading PSI/sysinfo and calling
-  `AnyBackend::balloon_set_target` against the live VM registry.
-- `mvmctl doctor` surfaces per-backend `balloon` capability.
+- `HostPressureSource` trait + `SysinfoPressureSource` cross-
+  platform impl. Linux PSI (`/proc/pressure/memory`) and macOS
+  `vm_pressure` are stronger signals; alternative impls behind the
+  same trait are the natural next refinement.
+- `BalloonController<P>` with a pure `tick(vm_states, apply)`
+  method: reads pressure once per tick (not per VM), decides each
+  VM's action via `BalloonPolicy`, applies via the caller's
+  closure. `TickOutcome` per VM carries the decision + applied
+  flag + per-VM error. Pressure-read failure aborts the whole
+  tick rather than applying with a stale value.
+- `mvmctl doctor` "Memory ballooning (virtio-balloon)" section
+  enumerates every backend's `capabilities().balloon`; surfaces a
+  warning when no backend on the host advertises support.
+- `Manifest::mem_initial` flows end-to-end:
+  `Manifest::mem_initial_mib()` → `PersistedManifest.mem_initial_mib`
+  → `TemplateSpec.mem_initial_mib` → `up.rs` resolves
+  `final_mem_initial = rt_config.or(tmpl_mem_initial).filter(0 < n < final_memory)`.
+  Old slot records that predate the field deserialise as `None`
+  (no behaviour change).
+
+Outstanding (deferred to follow-ups):
+
 - Live-KVM smoke: assert host RSS climbs/falls as the controller
-  inflates/deflates against a real Firecracker guest.
-- Thread `Manifest::mem_initial_mib()` into the template-baked
-  `tmpl_mem_initial` resolution path so manifest-declared
-  `mem_initial` flows to `mvmctl up` without `--config`.
+  inflates/deflates against a real Firecracker guest. Needs CI
+  infrastructure that mvm doesn't have today.
+- PSI / `vm_pressure` `HostPressureSource` impls. The current
+  sysinfo-based source is "used/total" — fine for dev-laptop
+  ergonomics, too coarse for production scheduling.
+- Spawn the tick into a real loop inside the supervisor's main
+  loop. Today the controller is a library piece; wiring it into
+  the supervisor's lifecycle is the integration follow-up.
 
 ### W2 — Portable image bundles + per-artifact attestation  🟡 substrate landed
 

@@ -425,6 +425,13 @@ pub struct PersistedManifest {
 
     pub vcpus: u8,
     pub mem_mib: u32,
+    /// Initial host commitment in MiB when the source manifest opted
+    /// into virtio-balloon (`mem_initial = "256M"`). `None` keeps the
+    /// historical commit-mem_mib-at-boot shape. Backward-compat:
+    /// missing field deserialises to `None` so older slot records
+    /// keep working without a rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_initial_mib: Option<u32>,
     pub data_disk_mib: u32,
 
     /// Display name from the manifest (NOT the registry key).
@@ -464,6 +471,7 @@ impl PersistedManifest {
             .to_string();
         let manifest_hash = canonical_key_for_path(canonical_path)?;
         let mem_mib = manifest.mem_mib()?;
+        let mem_initial_mib = manifest.mem_initial_mib()?;
         let data_disk_mib = manifest.data_disk_mib()?;
         let now = provenance.built_at.clone();
         Ok(Self {
@@ -474,6 +482,7 @@ impl PersistedManifest {
             profile: manifest.profile.clone(),
             vcpus: manifest.vcpus,
             mem_mib,
+            mem_initial_mib,
             data_disk_mib,
             name: manifest.name.clone(),
             backend: backend.to_string(),
@@ -1031,11 +1040,58 @@ mod tests {
         let p = fixture_persisted(&tmp);
         assert_eq!(p.vcpus, 2);
         assert_eq!(p.mem_mib, 1024);
+        // Minimal manifest fixture has no `mem_initial` set.
+        assert_eq!(p.mem_initial_mib, None);
         assert_eq!(p.data_disk_mib, 0);
         assert_eq!(p.flake_ref, ".");
         assert_eq!(p.profile, "default");
         assert_eq!(p.backend, "firecracker");
         assert_eq!(p.schema_version, MANIFEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn persisted_from_manifest_carries_mem_initial_when_set() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+            flake = "."
+            profile = "default"
+            vcpus = 2
+            mem = "1024M"
+            mem_initial = "256M"
+        "#;
+        write(tmp.path(), "mvm.toml", toml);
+        let manifest = Manifest::read_file(&tmp.path().join("mvm.toml")).unwrap();
+        let canonical = std::fs::canonicalize(tmp.path().join("mvm.toml")).unwrap();
+        let p = PersistedManifest::from_manifest(
+            &manifest,
+            &canonical,
+            "firecracker",
+            Provenance {
+                toolchain_version: "0.13.0".to_string(),
+                builder_image_digest: None,
+                host_arch: "x86_64-linux".to_string(),
+                built_at: "2026-04-30T12:00:00Z".to_string(),
+                ir_hash: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.mem_initial_mib, Some(256));
+        // Schema-skip rule: a None mem_initial_mib must NOT serialise
+        // (older verifiers don't know the field). A Some value MUST
+        // serialise — verifiers need to see the balloon opt-in.
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"mem_initial_mib\":256"), "got: {json}");
+    }
+
+    #[test]
+    fn persisted_manifest_serde_skips_omitted_mem_initial() {
+        let tmp = TempDir::new().unwrap();
+        let p = fixture_persisted(&tmp);
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(
+            !json.contains("mem_initial_mib"),
+            "field with None value must not appear in JSON: {json}"
+        );
     }
 
     #[test]

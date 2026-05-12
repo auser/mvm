@@ -1,3 +1,5 @@
+use std::collections::BTreeMap;
+
 use anyhow::Result;
 use serde::Serialize;
 
@@ -44,6 +46,12 @@ struct SecurityPostureReport {
 struct DoctorReport {
     checks: Vec<Check>,
     security_posture: SecurityPostureReport,
+    /// Per-backend virtio-balloon capability surfaced by
+    /// `VmBackend::capabilities`. Lets users predict which backend
+    /// will honour `mem_initial` in their manifest before launching.
+    /// Ordered by `BTreeMap`'s natural backend-name order so JSON
+    /// output is deterministic.
+    balloon_support: BTreeMap<String, bool>,
     all_ok: bool,
 }
 
@@ -111,11 +119,15 @@ pub fn run(json: bool) -> Result<()> {
     // ── Active backend security posture (ADR-002 / plan 53) ──────
     let security_posture = collect_security_posture();
 
+    // ── Balloon capability per backend ────────────────────────────
+    let balloon_support = collect_balloon_support();
+
     // ── Render ────────────────────────────────────────────────────
     let all_ok = checks.iter().all(|c| c.ok);
     let report = DoctorReport {
         checks,
         security_posture,
+        balloon_support,
         all_ok,
     };
 
@@ -176,6 +188,55 @@ fn render_text(report: &DoctorReport) {
         );
     }
     render_security_posture(&report.security_posture);
+    render_balloon_support(&report.balloon_support);
+}
+
+/// Enumerate every backend's `capabilities().balloon`. The doctor
+/// surfaces this so a user authoring `mem_initial` in `mvm.toml`
+/// can see at a glance which backend will honour the opt-in (vs.
+/// which will silently ignore it because the underlying VMM doesn't
+/// support virtio-balloon).
+///
+/// Keyed by `&str` rather than `&'static str` so JSON serialisation
+/// gets a stable BTreeMap ordering. Names match `VmBackend::name`.
+fn collect_balloon_support() -> BTreeMap<String, bool> {
+    // Hypervisor selectors mirror `AnyBackend::from_hypervisor`. The
+    // list is hand-maintained because there's no general "iterate
+    // every backend" helper today; adding a new backend means
+    // adding it here so doctor surfaces it without lying.
+    let names = [
+        "firecracker",
+        "cloud-hypervisor",
+        "apple-container",
+        "docker",
+        "libkrun",
+        "microsandbox",
+        "qemu",
+    ];
+    let mut out = BTreeMap::new();
+    for name in names {
+        let backend = AnyBackend::from_hypervisor(name);
+        out.insert(backend.name().to_string(), backend.capabilities().balloon);
+    }
+    out
+}
+
+/// Print the balloon-support matrix in `mvmctl doctor` text mode.
+/// Stays concise — one section, one line per backend.
+fn render_balloon_support(support: &BTreeMap<String, bool>) {
+    let title = "Memory ballooning (virtio-balloon)";
+    println!("\n{}", title);
+    println!("{}", "-".repeat(title.len()));
+    for (backend, ok) in support {
+        let mark = if *ok { "yes" } else { "no" };
+        ui::status_line(&format!("  {backend}:"), mark);
+    }
+    if !support.values().any(|v| *v) {
+        ui::warn(
+            "  · No backend on this host advertises virtio-balloon. \
+             `mem_initial` in mvm.toml will be ignored at boot.",
+        );
+    }
 }
 
 // ── Active backend security posture (ADR-002 / plan 53) ──────
@@ -1272,6 +1333,19 @@ mod tests {
     }
 
     #[test]
+    fn collect_balloon_support_advertises_fc_and_ch() {
+        let support = collect_balloon_support();
+        // The hand-maintained list in collect_balloon_support must
+        // include both rust-vmm backends. If a future refactor drops
+        // one, this fails loudly.
+        assert_eq!(support.get("firecracker"), Some(&true));
+        assert_eq!(support.get("cloud-hypervisor"), Some(&true));
+        // And honestly-`false` backends should not be silently dropped.
+        assert_eq!(support.get("docker"), Some(&false));
+        assert_eq!(support.get("apple-container"), Some(&false));
+    }
+
+    #[test]
     fn doctor_report_serializes_to_json() {
         let report = DoctorReport {
             checks: vec![Check {
@@ -1281,6 +1355,7 @@ mod tests {
                 info: "v1.0".to_string(),
             }],
             security_posture: collect_security_posture(),
+            balloon_support: collect_balloon_support(),
             all_ok: true,
         };
         let json = serde_json::to_string(&report).unwrap();
