@@ -353,6 +353,7 @@ fn persisted_to_synthetic_spec(p: &PersistedManifest) -> TemplateSpec {
         role: String::new(),
         vcpus: p.vcpus,
         mem_mib: p.mem_mib,
+        mem_initial_mib: p.mem_initial_mib,
         data_disk_mib: p.data_disk_mib,
         created_at: p.created_at.clone(),
         updated_at: p.updated_at.clone(),

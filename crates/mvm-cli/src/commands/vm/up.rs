@@ -751,6 +751,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         source_profile,
         tmpl_cpus,
         tmpl_mem,
+        tmpl_mem_initial,
         snapshot_info,
     ) = if let Some(tmpl) = template_name {
         ui::step(
@@ -777,6 +778,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             Some(spec.profile.clone()),
             Some(spec.vcpus as u32),
             Some(spec.mem_mib),
+            spec.mem_initial_mib,
             snap_info,
         )
     } else if let Some(flake) = flake_ref {
@@ -816,6 +818,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             profile.map(|s| s.to_string()),
             None,
             None,
+            None, // tmpl_mem_initial — flake builds don't carry it
             None, // No snapshot for flake builds
         )
     } else {
@@ -837,6 +840,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             None,
             None,
             None,
+            None, // tmpl_mem_initial
             None,
         )
     };
@@ -898,11 +902,17 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         .or(rt_config.memory)
         .or(tmpl_mem)
         .unwrap_or(user_cfg.default_memory_mib);
-    // Balloon opt-in: when the manifest declares `mem_initial`, the
-    // backend creates a pre-inflated balloon and only commits this
-    // amount at boot. `None` preserves the historical behaviour.
+    // Balloon opt-in resolution. Precedence:
+    //   1. `--config` runtime override (`rt_config.mem_initial`)
+    //   2. Template-baked value (manifest's `mem_initial` from the
+    //      slot's PersistedManifest, via TemplateSpec.mem_initial_mib)
+    //   3. Off (legacy commit-mem_mib-at-boot shape)
+    // The final value must be strictly inside `(0, final_memory)`;
+    // anything else gets filtered to `None` so the FC + CH backends
+    // never see a value they'd reject anyway.
     let final_mem_initial = rt_config
         .mem_initial
+        .or(tmpl_mem_initial)
         .filter(|n| *n > 0 && *n < final_memory);
 
     // Parse port mappings and inject as config drive file
