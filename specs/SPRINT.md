@@ -1079,6 +1079,32 @@ Notes on commit-message vs diff mismatches in batch 2 (worth a
   WIP in the working tree. `0338c66` fixed the hook so this
   pattern won't recur.
 
+### Shipped — campaign batch 3 (2026-05-12, in flight as PR #106/#107/#108)
+
+Plan 60 Phase 4 audit-emit ergonomics + behavioral hardening, plus
+the cleanup-host-fs and MockBackend refactors that unlock VM-lifecycle
+live testing. Three open PRs stack on `main`:
+
+| PR | Branch | Scope | Live tests |
+|---|---|---|---|
+| #106 | feat/sprint-51-batch-3 | `audit_emit!` macro + `LocalAuditBuilder` API + `xtask check-audit-positional` lint + CI gate + 37-site positional emit migration + DRIFT-001 (microsandbox feature gate) + ADR-013 builder-VM swap | 6 → 26 |
+| #107 | feat/cleanup-host-fallback (targets #106) | `cleanup_old_dev_builds` drops `&dyn ShellEnvironment` for plain `std::fs`; `mvmctl cleanup` runs without a dev VM; SnapshotDelete live + 4 ReadOnly negative pins | 26 → 31 |
+| #108 | feat/mock-backend (targets #107) | `MockBackend` substrate (`AnyBackend::Mock` variant, 10 unit tests); `MVM_DIRECT_BOOT` LocalAudit emit parity + `--detach` fix; `up_with_mock_backend` end-to-end; `set-ttl` live + 8 more ReadOnly negative pins; ADR-044 documenting the convention | 31 → 40 |
+
+Coverage now: every Emits row in `AUDIT_POSTURE` that doesn't require
+a running Firecracker / Apple Container / Docker / microsandbox / Nix
+builder / GitHub network has a live drive-and-assert test. 15 ReadOnly
+leaves pin the no-emit invariants.
+
+Still hard (architectural refactors required to test hermetically):
+`pause` / `resume` (talk directly to FirecrackerIO, not through
+`AnyBackend.pause`/`resume`); `fs` / `proc start/signal/kill/stdin`
+(guest agent over vsock — needs vsock mock); `volume mount/unmount`
+(VM-attached); `build → TemplateBuild` (Nix builder); `update`
+(network); `uninstall` positive (real system paths).
+
+Reference: ADR-044 (`specs/adrs/044-audit-emit-macro.md`).
+
 ### Remaining workstreams (priority order)
 
 | # | Plan / phase | Est. days | Notes |
