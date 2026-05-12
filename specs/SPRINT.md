@@ -1003,19 +1003,29 @@ remaining plan-60 phases, the closed-form plans the supervisor /
 encryption / signal threads needed, and the function-call surface
 that mvmforge depends on.
 
-**Status (2026-05-11):** 10 commits landed on `origin/main` in
-one focused batch closing four plans (64, 63, 62, 44) and the
-plan-60 Phase 6 policy-bundle TOML substrate. Workspace at **2098
+**Status (2026-05-11 — evening, after batch 2):** 10 + 10 = 20
+commits landed on `origin/main` in two focused batches. The
+morning batch (batch 1) closed four plans (64, 63, 62, 44) and
+the plan-60 Phase 6 policy-bundle TOML substrate. The evening
+batch (batch 2) closed plan-60 Phase 6 hardware attestation,
+plan-60 Phase 3 Slices A + B + four resolver-tightening follow-
+ons (live L4Gate, hooked W5 resolver into `admit_plan_for_boot`,
+full L7 inspector chain, LiveArtifactCollector, fail-loud
+`disabled_inspectors`, LiveKeystoreReleaser, bundle.pii wiring),
+and the plan-60 Phase 4 `audit_total_coverage` scaffold with
+recursive per-subgroup classification. Workspace now at **2281
 tests / 0 failed**; clippy `-D warnings` clean; nightly fmt
 clean; xtask `check-no-display-on-secret-types` clean. CLAUDE.md
 security claims 1–8 all true on every host. ADR-041 (signed +
 audited `ExecutionPlan`) and ADR-042 (encryption substrate)
-document the closed surfaces. Remaining work covers Phase 6
-hardware attestation, Phase 3 (network isolation), Phases 4/5/7
-through 10, plans 48/49/51/52 (function-call surface), plan 61
-(overlays + billing), and the partial-plan sweep (32 / 16 / 18).
+document the closed surfaces. Remaining work covers Phase 3
+Slice C (smoltcp/TUN + firewall + DNS endpoint), Phase 4 audit
+end-to-end drive-and-assert promotion + `bundle.audit` wiring,
+Phases 5 / 7 through 10, plans 48/49/51/52 (function-call
+surface), plan 61 (overlays + billing), and the partial-plan
+sweep (32 / 16 / 18).
 
-### Shipped (campaign batch 2026-05-11)
+### Shipped — campaign batch 1 (2026-05-11 morning)
 
 | Plan | Workstream(s) | Commit |
 |---|---|---|
@@ -1030,28 +1040,47 @@ through 10, plans 48/49/51/52 (function-call surface), plan 61
 | 44 — agent signal handling | W3 — SIGHUP config reload (hot-reloadable subset via atomics) | `05f956e` |
 | 60 — microsandbox migration | Phase 6 — on-disk policy-bundle TOML format (`mvm_policy::toml_loader` + W5 resolver upgrade) | `a457012` |
 
+### Shipped — campaign batch 2 (2026-05-11 evening)
+
+| Plan | Workstream(s) | Commit |
+|---|---|---|
+| 60 — microsandbox migration | Phase 6 — `mvm_security::attestation` (`IdentityKey` lifecycle + signed report) + feature-gated `HwAttestationProvider` stubs (TPM2 / SEV-SNP / TDX) + `mvmctl attest {export, verify, status}` CLI | `d0ba736` |
+| 60 | Phase 3 Slice B — `mvm-policy::L4RuleSpec` + `mvm_supervisor::proxy::l4` (`L4Gate` trait, `LiveL4Gate::from_specs`) + `HickoryDnsResolver` + W5 resolver wires `slots.network` | `51581a8` |
+| 60 | Phase 3 follow-on — `up.rs::admit_plan_for_boot` calls `resolve_supervisor_components`; typed audit-chain `error_class` per failure mode | `ac87e8d` |
+| 60 | Phase 3 follow-on — `slots_from_bundle` delegates to `build_inspector_chain`, picking up SsrfGuard / SecretsScanner / InjectionGuard / PiiRedactor + honoring `disabled_inspectors` | `bf8079a` |
+| 60 | Phase 3 follow-on — `LiveArtifactCollector::from_policy(&bundle.artifact)` (NotImplemented carries `capture_paths` count + retention) | `72f272f` |
+| 60 | Phase 3 follow-on — `validate_egress_policy_inspector_names` fail-loud at admission on typos in `disabled_inspectors` | `586e0cd` |
+| 60 | Phase 3 follow-on — `LiveKeystoreReleaser::from_policy(&bundle.keys)` (closes last Noop slot in `slots_from_bundle`) | `36db455` |
+| 60 | Phase 3 follow-on — `bundle.pii.{mode, categories}` → `PiiRedactor::from_policy` + `build_inspector_chain_with_pii`; first slot where Live impl changes runtime behavior | `dc31b10` |
+| 60 | Phase 4 scaffold — `tests/audit_total_coverage.rs` walks `mvm_cli::cli_command()` + asserts every top-level subcommand has an `AuditPosture` classification | `c036cea` |
+| 60 | Phase 4 scaffold — recursive per-subgroup coverage (13 subgroup tables, ~54 leaf classifications including third-level `manifest tag` + `manifest alias`) | `dabd955` |
+
+Note: commit `d774200` carries the per-subgroup commit message but
+a parallel branch race landed unrelated diff bytes under it; the
+*actual* per-subgroup recursive walk shipped as `dabd955`
+immediately after with a clarifying header.
+
 ### Remaining workstreams (priority order)
 
 | # | Plan / phase | Est. days | Notes |
 |---|---|---|---|
-| 1 | Plan 60 Phase 6 tail — hardware attestation API stubs (TPM2 / SEV-SNP / TDX, feature-gated) | 5-7 | Closes Phase 6. Stand up `mvm-attestation` crate or module; `mvmctl attest [verify|export]` CLI. `AttestationRequirement` field on `ExecutionPlan` already exists and honors `Noop` today. |
-| 2 | Plan 60 Phase 3 — L4/L7 proxies + firewall + policy gate | 10-14 | The real consumer for the Phase 6 policy-bundle TOML. `mvm-supervisor/src/proxy/{l4,l7}.rs` + firewall shell-outs. Default-deny; tenant policy is the only thing that opens flows. |
-| 3 | Plan 60 Phase 4 — persistent observability | 7-10 | Prometheus + OTLP metrics endpoint; total-coverage audit (every action emits); structured logs; event bus on `tokio::sync::broadcast`. |
-| 4 | Plan 60 Phase 5 — DX layer (Python SDK, manifests, mvm-studio handshake) | 7-10 | `python/mvm` wheels via pyo3; `cargo xtask gen-stubs` for typed APIs. Templates from `../mvm/templates/` rewritten on microvm.nix. |
-| 5 | Plan 60 Phase 7 — MCP server + host-mediated tools + sessions | 7-10 | `rmcp` wire layer; `mvm.run` / `snapshot` / `eval` / `web_search` / `web_fetch` / `upload` / `download` per-tenant allowlisted. tmux-style `mvmctl session create/attach/detach`. |
-| 6 | Plan 60 Phase 7a — install/rebuild/persistent overlay/tenant destroy | 10-12 | Encrypted persistent overlay (extends plan 45's volume work); rolling rootfs swap; `mvmctl tenant destroy` emits a destruction certificate. |
-| 7 | Plan 60 Phase 7b — built-in templates + TypeScript SDK | 5-7 | `ai-sandbox` / `safe-openclaw` / `computer-use` / `repl` templates with bundled policy bundles. `typescript/@mvm/sdk` napi-rs binding for hot paths. |
-| 8 | Plan 60 Phase 8 — mvmd integration contract verification | 3-5 | Port `mvm/src/hostd/{mod,server}.rs`; `PROTOCOL_VERSION` const; wire-format stability test. **Coordinated with parallel mvmd work** — see "Cross-repo coordination" below. |
-| 9 | Plan 60 Phase 9 — perf + supply chain + SBOM | 7-10 | Cold-boot ≤500 ms Firecracker / ≤1 s microsandbox; rootfs ≤20 MB; PGO + MUSL builds; cosign-keyless artifacts; RFC 3161 timestamping. |
-| 10 | Plan 60 Phase 10 — rename + archive | 1 | `git mv mvm mvm` + update CI paths + bump mvmd's git pin. |
-| 11 | Plans 48 + 49 — function-service factories (ADR-010) | 7-10 | Wrapper-template relocation + function-service factory pattern. |
-| 12 | Plans 51 + 52 — session-lifecycle verbs + fd3 control channel (ADR-011) | 10-14 | Largest substrate change in the function-call line. |
-| 13 | Plan 61 — runtime overlays + billing | 14-21 | Dev/prod image transparency + sandbox-runtime billing dimensions. Six phases. |
-| 14 | Status sweep — plan 32 tail (MCP adoption tiers L1/L2/L4), plan 16 (microvm-nix-integration), plan 18 (nix-openclaw-integration) | 3-5 | Several minor plans with partial completion — audit + close or roll into a follow-up sprint. |
+| 1 | Plan 60 Phase 3 Slice C — smoltcp/TUN userspace-TCP consumer + host firewall (nft / pf / WFP) + DNS server endpoint + per-tenant netns lift | 8-12 | The remaining Phase 3 work after Slices A + B + four resolver follow-ons closed in batch 2. Turns `L4Gate::evaluate` decisions into accept/drop on per-VM TAPs; brings up the firewall additive layer; provisions the resolver guest VMs point `/etc/resolv.conf` at. Pairs with the mvm-hostd lift (#7 below). |
+| 2 | Plan 60 Phase 4 — persistent observability | 5-8 | Scaffold shipped in batch 2 (`tests/audit_total_coverage.rs` recursive coverage of all CLI subcommands at every depth). Remaining: Prometheus + OTLP metrics endpoint; promote `audit_total_coverage` `Emits` rows to live drive-and-assert tests as each command gains a hermetic fixture; wire `bundle.audit.{chain_signing, stream_destinations}` into `AuditEmitter` construction; structured logs; event bus on `tokio::sync::broadcast`. |
+| 3 | Plan 60 Phase 5 — DX layer (Python SDK, manifests, mvm-studio handshake) | 7-10 | `python/mvm` wheels via pyo3; `cargo xtask gen-stubs` for typed APIs. Templates from `../mvm/templates/` rewritten on microvm.nix. |
+| 4 | Plan 60 Phase 7 — MCP server + host-mediated tools + sessions | 7-10 | `rmcp` wire layer; `mvm.run` / `snapshot` / `eval` / `web_search` / `web_fetch` / `upload` / `download` per-tenant allowlisted. tmux-style `mvmctl session create/attach/detach`. |
+| 5 | Plan 60 Phase 7a — install/rebuild/persistent overlay/tenant destroy | 10-12 | Encrypted persistent overlay (extends plan 45's volume work); rolling rootfs swap; `mvmctl tenant destroy` emits a destruction certificate. |
+| 6 | Plan 60 Phase 7b — built-in templates + TypeScript SDK | 5-7 | `ai-sandbox` / `safe-openclaw` / `computer-use` / `repl` templates with bundled policy bundles. `typescript/@mvm/sdk` napi-rs binding for hot paths. |
+| 7 | Plan 60 Phase 8 — mvmd integration contract verification | 3-5 | Port `mvm/src/hostd/{mod,server}.rs`; `PROTOCOL_VERSION` const; wire-format stability test. **Coordinated with parallel mvmd work** — see "Cross-repo coordination" below. The mvm-hostd supervisor lift this depends on is what makes every Live impl in `slots_from_bundle` (shipped batch 2) actually enforce. |
+| 8 | Plan 60 Phase 9 — perf + supply chain + SBOM | 7-10 | Cold-boot ≤500 ms Firecracker / ≤1 s microsandbox; rootfs ≤20 MB; PGO + MUSL builds; cosign-keyless artifacts; RFC 3161 timestamping. |
+| 9 | Plan 60 Phase 10 — rename + archive | 1 | `git mv mvm mvm` + update CI paths + bump mvmd's git pin. |
+| 10 | Plans 48 + 49 — function-service factories (ADR-010) | 7-10 | Wrapper-template relocation + function-service factory pattern. |
+| 11 | Plans 51 + 52 — session-lifecycle verbs + fd3 control channel (ADR-011) | 10-14 | Largest substrate change in the function-call line. |
+| 12 | Plan 61 — runtime overlays + billing | 14-21 | Dev/prod image transparency + sandbox-runtime billing dimensions. Six phases. |
+| 13 | Status sweep — plan 32 tail (MCP adoption tiers L1/L2/L4), plan 16 (microvm-nix-integration), plan 18 (nix-openclaw-integration) | 3-5 | Several minor plans with partial completion — audit + close or roll into a follow-up sprint. |
 
-**Total remaining envelope:** ~100 calendar days. Sprint 51 spans
-multiple sub-sprints in practice; treat the workstream rows as
-the unit of scheduling.
+**Total remaining envelope:** ~90 calendar days after batch 2
+(was ~100). Sprint 51 spans multiple sub-sprints in practice;
+treat the workstream rows as the unit of scheduling.
 
 ### Cross-repo coordination (mvmd)
 
