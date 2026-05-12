@@ -25,7 +25,7 @@ pub(in crate::commands) struct Args {
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
     let result = update::update(args.check, args.force, args.skip_verify);
     if result.is_ok() && !args.check {
-        mvm_core::audit::emit(mvm_core::audit::LocalAuditKind::UpdateInstall, None, None);
+        mvm_core::audit::event(mvm_core::audit::LocalAuditKind::UpdateInstall).emit();
     }
     result
 }

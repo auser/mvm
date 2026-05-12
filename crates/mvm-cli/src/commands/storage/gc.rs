@@ -110,7 +110,9 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         }
         Outcome::PoolUnavailable(err) => format!("pool_unavailable={err}"),
     };
-    mvm_core::audit::emit(LocalAuditKind::StorageGc, None, Some(&detail));
+    mvm_core::audit::event(LocalAuditKind::StorageGc)
+        .detail(detail)
+        .emit();
 
     Ok(())
 }

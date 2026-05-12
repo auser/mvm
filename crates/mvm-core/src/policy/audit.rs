@@ -307,25 +307,107 @@ impl LocalAuditLog {
     }
 }
 
+/// Start composing a local audit event.
+///
+/// Preferred over the positional [`emit`] / [`emit_to`] helpers — chains
+/// read top-to-bottom and adding a new optional field (e.g. `outcome`)
+/// won't churn every call site. The event lands in
+/// [`default_audit_log`] when terminated with [`LocalAuditBuilder::emit`];
+/// tests redirect via [`LocalAuditBuilder::to_path`] before terminating.
+///
+/// ```ignore
+/// audit::event(LocalAuditKind::CachePrune)
+///     .detail(format!("count={count}"))
+///     .emit();
+/// ```
+pub fn event(kind: LocalAuditKind) -> LocalAuditBuilder {
+    LocalAuditBuilder {
+        kind,
+        vm_name: None,
+        detail: None,
+        path_override: None,
+    }
+}
+
+/// Fluent builder for [`LocalAuditEvent`]. Construct with [`event`].
+#[must_use = "the audit event isn't written until `.emit()` is called"]
+pub struct LocalAuditBuilder {
+    kind: LocalAuditKind,
+    vm_name: Option<String>,
+    detail: Option<String>,
+    path_override: Option<PathBuf>,
+}
+
+impl LocalAuditBuilder {
+    /// Attach a VM identifier to the event. Optional.
+    pub fn vm_name(mut self, name: impl Into<String>) -> Self {
+        self.vm_name = Some(name.into());
+        self
+    }
+
+    /// Attach a free-form `detail` string. Conventionally a
+    /// space-separated `key=value` list (`source=… count=…`).
+    pub fn detail(mut self, detail: impl Into<String>) -> Self {
+        self.detail = Some(detail.into());
+        self
+    }
+
+    /// Redirect the emission to an explicit path instead of
+    /// [`default_audit_log`]. Used by tests so emission can be
+    /// observed without mutating `MVM_STATE_DIR` (which serializes
+    /// badly across the test runner).
+    pub fn to_path(mut self, path: impl Into<PathBuf>) -> Self {
+        self.path_override = Some(path.into());
+        self
+    }
+
+    /// Land the event. Best-effort: open/write failures are logged
+    /// via `tracing::warn!` and never propagated — audit failures
+    /// must not block the operation being logged.
+    pub fn emit(self) {
+        let path = self
+            .path_override
+            .unwrap_or_else(|| PathBuf::from(default_audit_log()));
+        let event = LocalAuditEvent::now(self.kind, self.vm_name, self.detail);
+        match LocalAuditLog::open(&path).and_then(|log| log.append(&event)) {
+            Ok(()) => {}
+            Err(e) => tracing::warn!("audit log write failed: {e}"),
+        }
+    }
+}
+
 /// Emit a local audit event to the default log path (best-effort).
 ///
-/// Errors are logged via `tracing::warn!` and never propagated — audit
-/// failures must not block the operation being logged.
+/// Thin shim over [`event`] / [`LocalAuditBuilder::emit`] kept for
+/// existing positional call sites. New code should prefer the builder
+/// — the chained form scales to additional optional fields without
+/// touching every caller.
 pub fn emit(kind: LocalAuditKind, vm_name: Option<&str>, detail: Option<&str>) {
-    emit_to(&PathBuf::from(default_audit_log()), kind, vm_name, detail);
+    let mut b = event(kind);
+    if let Some(n) = vm_name {
+        b = b.vm_name(n);
+    }
+    if let Some(d) = detail {
+        b = b.detail(d);
+    }
+    b.emit();
 }
 
 /// Emit a local audit event to an explicit path (best-effort).
 ///
-/// Same contract as [`emit`] but the destination is supplied by the
-/// caller. Used by tests so emission can be observed without mutating
-/// `MVM_STATE_DIR` (which serializes badly across the test runner).
+/// Thin shim over [`event`] / [`LocalAuditBuilder::to_path`] kept for
+/// existing positional call sites. Tests should prefer
+/// `event(kind).to_path(p).emit()` for parity with production-path
+/// composition.
 pub fn emit_to(path: &Path, kind: LocalAuditKind, vm_name: Option<&str>, detail: Option<&str>) {
-    let event = LocalAuditEvent::now(kind, vm_name.map(str::to_owned), detail.map(str::to_owned));
-    match LocalAuditLog::open(path).and_then(|log| log.append(&event)) {
-        Ok(()) => {}
-        Err(e) => tracing::warn!("audit log write failed: {e}"),
+    let mut b = event(kind).to_path(path.to_path_buf());
+    if let Some(n) = vm_name {
+        b = b.vm_name(n);
     }
+    if let Some(d) = detail {
+        b = b.detail(d);
+    }
+    b.emit();
 }
 
 /// Audit event types for per-tenant audit logging.
@@ -687,6 +769,61 @@ mod tests {
         assert!(contents.contains("snapshot_integrity_failed"));
         assert!(contents.contains("vm-x"));
         assert!(contents.contains("tag_mismatch"));
+    }
+
+    #[test]
+    fn builder_with_no_optionals_matches_legacy_emit() {
+        // Builder default state is the same wire shape `emit` produces
+        // with `(kind, None, None)` — minus the timestamp string,
+        // which is `now()` on each call. The kind + null optionals
+        // are what matter for the contract.
+        let tmp = tempfile::tempdir().unwrap();
+        let p_builder = tmp.path().join("builder.jsonl");
+        let p_legacy = tmp.path().join("legacy.jsonl");
+
+        event(LocalAuditKind::CachePrune).to_path(&p_builder).emit();
+        emit_to(&p_legacy, LocalAuditKind::CachePrune, None, None);
+
+        let builder_line = std::fs::read_to_string(&p_builder).unwrap();
+        let legacy_line = std::fs::read_to_string(&p_legacy).unwrap();
+        // Drop the timestamp segment from each so we compare shape, not
+        // wall-clock drift between the two `chrono::Utc::now()` calls.
+        let strip_ts = |s: &str| -> String {
+            // Format: {"timestamp":"…","kind":"…",…}
+            let v: serde_json::Value = serde_json::from_str(s.trim()).unwrap();
+            let mut obj = v.as_object().unwrap().clone();
+            obj.remove("timestamp");
+            serde_json::to_string(&obj).unwrap()
+        };
+        assert_eq!(strip_ts(&builder_line), strip_ts(&legacy_line));
+    }
+
+    #[test]
+    fn builder_with_vm_name_and_detail_carries_both_fields() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("audit.jsonl");
+        event(LocalAuditKind::VmStop)
+            .vm_name("vm-42")
+            .detail("source=test")
+            .to_path(&path)
+            .emit();
+        let body = std::fs::read_to_string(&path).unwrap();
+        let v: serde_json::Value = serde_json::from_str(body.trim()).unwrap();
+        assert_eq!(v["kind"], "vm_stop");
+        assert_eq!(v["vm_name"], "vm-42");
+        assert_eq!(v["detail"], "source=test");
+    }
+
+    #[test]
+    fn builder_terminator_required_must_use_emit() {
+        // Compile-time check that `#[must_use]` on the builder
+        // surfaces a warning if a caller forgets `.emit()`. We can't
+        // assert the warning in unit tests; this test just shows that
+        // the type is usable in the documented chained form so a
+        // refactor that breaks the API surfaces as a compile error.
+        let _b = event(LocalAuditKind::CachePrune).detail("noop");
+        // intentionally not calling `.emit()` — confirms the dead
+        // builder is the lint surface, not a runtime panic.
     }
 
     #[test]

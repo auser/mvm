@@ -26,6 +26,8 @@
 //! - `mvmctl manifest tag rm <tpl> <tag>` → `ManifestTagRemove`
 //! - `mvmctl manifest tag ls <tpl>` → **no** audit entry
 //! - `mvmctl manifest alias set <tpl> <alias> <rev>` → `ManifestAliasSet`
+//! - `mvmctl manifest alias rm <tpl> <alias>` → `ManifestAliasRemove`
+//! - `mvmctl manifest alias ls <tpl>` → **no** audit entry
 //! - `mvmctl secret put` → secret-side audit JSONL at
 //!   `~/.mvm/audit/secrets.jsonl` carries `"action":"put"`
 //!
@@ -457,6 +459,77 @@ fn manifest_tag_ls_does_not_emit_audit_entry() {
         add_hits + rm_hits,
         0,
         "read-only `manifest tag ls` must not emit; got {add_hits} add \
+         and {rm_hits} remove entries. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_alias_rm_emits_manifest_alias_remove_audit_entry() {
+    // Set an alias, then remove it. Pins the remove half of the
+    // alias subgroup against a future regression that swaps the
+    // emit kind or drops it entirely.
+    let sandbox = AuditSandbox::new();
+    let set = sandbox
+        .mvmctl()
+        .args([
+            "manifest",
+            "alias",
+            "set",
+            "test-tmpl",
+            "to-remove",
+            "abc123def456abc123def456abc123de",
+        ])
+        .output()
+        .expect("spawn mvmctl set");
+    assert!(
+        set.status.success(),
+        "mvmctl manifest alias set failed: stderr={}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let rm = sandbox
+        .mvmctl()
+        .args(["manifest", "alias", "rm", "test-tmpl", "to-remove"])
+        .output()
+        .expect("spawn mvmctl rm");
+    assert!(
+        rm.status.success(),
+        "mvmctl manifest alias rm failed: stderr={}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "manifest_alias_remove");
+    assert!(
+        hits >= 1,
+        "expected ≥1 manifest_alias_remove entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_alias_ls_does_not_emit_audit_entry() {
+    // Negative complement: `manifest alias ls` is read-only. Pins
+    // the `MANIFEST_ALIAS` table's `ls → ReadOnly` row against a
+    // future regression that adds an emit to the list path.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["manifest", "alias", "ls", "test-tmpl"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest alias ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let set_hits = count_entries_with_kind(&log, "manifest_alias_set");
+    let rm_hits = count_entries_with_kind(&log, "manifest_alias_remove");
+    assert_eq!(
+        set_hits + rm_hits,
+        0,
+        "read-only `manifest alias ls` must not emit; got {set_hits} set \
          and {rm_hits} remove entries. Full log:\n{log}"
     );
 }
