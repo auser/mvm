@@ -13,8 +13,13 @@ autobins = false
 mvm-core.workspace = true
 mvm-security.workspace = true
 mvm-guest.workspace = true
-mvm-build.workspace = true
-mvm-backend.workspace = true
+# `default-features = false` + the feature-forwarding block below lets
+# library consumers of the `mvmctl` facade (e.g. mvmd) disable the
+# microsandbox backend via `default-features = false`. The mvm binary
+# stays unchanged because mvm-cli + mvmctl keep `backends-microsandbox`
+# in their default features.
+mvm-build = { workspace = true, default-features = false }
+mvm-backend = { workspace = true, default-features = false }
 mvm-base.workspace = true
 anyhow.workspace = true
 base64.workspace = true
@@ -32,9 +37,15 @@ tempfile.workspace = true
 toml.workspace = true
 tracing.workspace = true
 tokio.workspace = true
-microsandbox.workspace = true
 mvm-providers.workspace = true
 libc.workspace = true
+
+[features]
+default = ["backends-microsandbox"]
+backends-microsandbox = [
+    "mvm-build/backends-microsandbox",
+    "mvm-backend/backends-microsandbox",
+]
 
 [lints]
 workspace = true

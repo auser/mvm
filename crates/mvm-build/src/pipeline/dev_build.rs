@@ -243,11 +243,29 @@ pub fn dev_build(
     // sandbox — the path that brings `mvmctl build` to macOS Intel /
     // pre-26 / no-KVM Linux without host Nix.
     if !env_has_nix(env) {
-        env.log_info(
-            "No `nix` available through the current shell environment — \
-             falling back to the microsandbox builder VM.",
-        );
-        return dev_build_via_microsandbox(env, flake_ref, profile, mode);
+        #[cfg(feature = "backends-microsandbox")]
+        {
+            env.log_info(
+                "No `nix` available through the current shell environment — \
+                 falling back to the microsandbox builder VM.",
+            );
+            return dev_build_via_microsandbox(env, flake_ref, profile, mode);
+        }
+        #[cfg(not(feature = "backends-microsandbox"))]
+        {
+            // The microsandbox-backed builder is the only fallback for
+            // hosts without local `nix`; gating it out means there's no
+            // path to satisfy the build. Bail with a pointer to the two
+            // recoveries the user has from here (install host Nix, or
+            // rebuild with the feature on).
+            let _ = (env, flake_ref, profile, mode);
+            anyhow::bail!(
+                "No `nix` on PATH and the microsandbox builder backend was \
+                 compiled out (feature `backends-microsandbox` disabled). \
+                 Install host Nix (Determinate Nix or upstream) or rebuild \
+                 with `--features backends-microsandbox`."
+            );
+        }
     }
 
     // Honour the host-side GC sentinel before any new build work
@@ -490,6 +508,7 @@ fn env_has_nix(env: &dyn ShellEnvironment) -> bool {
 /// `dev_build` doesn't have to special-case `BuilderVmError`
 /// variants. The error messages already point at recovery paths
 /// (install host Nix, configure nix-darwin's `linux-builder`).
+#[cfg(feature = "backends-microsandbox")]
 fn dev_build_via_microsandbox(
     env: &dyn ShellEnvironment,
     flake_ref: &str,
@@ -1320,6 +1339,7 @@ mod tests {
         assert!(!env_has_nix(&env));
     }
 
+    #[cfg(feature = "backends-microsandbox")]
     #[test]
     fn dev_build_falls_back_to_builder_vm_when_nix_missing() {
         // When `env_has_nix` returns false, `dev_build` routes through
@@ -1341,6 +1361,28 @@ mod tests {
         assert!(
             msg.contains("microsandbox builder VM") || msg.contains("does not exist"),
             "expected builder-VM error, got: {msg}"
+        );
+    }
+
+    #[cfg(not(feature = "backends-microsandbox"))]
+    #[test]
+    fn dev_build_bails_clearly_when_nix_missing_and_microsandbox_disabled() {
+        // Without `backends-microsandbox`, `dev_build` has no fallback
+        // when host nix is unavailable. The bail must name the disabled
+        // feature so the user knows what knob to flip.
+        let env = TestEnv::new();
+        env.stub_stdout("nix --version", "");
+        let result = dev_build(
+            &env,
+            "/definitely/not/a/real/flake/dir",
+            Some("minimal"),
+            BuildMode::Dev,
+        );
+        let err = result.expect_err("must bail when no nix and no fallback");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("backends-microsandbox"),
+            "bail must name the feature: {msg}"
         );
     }
 

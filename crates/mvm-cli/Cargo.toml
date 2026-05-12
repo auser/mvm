@@ -11,11 +11,15 @@ authors.workspace = true
 [dependencies]
 mvm-core.workspace = true
 mvm-guest.workspace = true
-mvm.workspace = true
-mvm-build.workspace = true
+# `default-features = false` + the feature-forwarding block carries the
+# `backends-microsandbox` choice down to the leaf crates that actually
+# pull microsandbox. See the same pattern in `crates/mvm/Cargo.toml` and
+# the root `Cargo.toml`.
+mvm = { workspace = true, default-features = false }
+mvm-build = { workspace = true, default-features = false }
 mvm-security.workspace = true
 mvm-providers.workspace = true
-mvm-backend.workspace = true
+mvm-backend = { workspace = true, default-features = false }
 mvm-mcp.workspace = true
 mvm-plan.workspace = true
 mvm-policy.workspace = true
@@ -51,6 +55,14 @@ which.workspace = true
 [dev-dependencies]
 assert_cmd.workspace = true
 predicates.workspace = true
+
+[features]
+default = ["backends-microsandbox"]
+backends-microsandbox = [
+    "mvm/backends-microsandbox",
+    "mvm-build/backends-microsandbox",
+    "mvm-backend/backends-microsandbox",
+]
 
 [lints]
 workspace = true

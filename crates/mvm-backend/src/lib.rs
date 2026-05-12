@@ -44,16 +44,25 @@ pub mod firecracker;
 pub mod handle_registry;
 pub mod image;
 pub mod libkrun;
-pub mod microsandbox;
 pub mod microvm;
 pub mod microvm_nix;
 pub mod network;
+
+// `microsandbox` is the only self-contained backend integration that
+// can be feature-gated as a unit — the upstream crate pulls a sqlite
+// implementation that collides with library consumers (DRIFT-001).
+// One cfg at the module declaration gates the whole integration; the
+// few call-sites in `backend.rs` carry matching cfgs grouped by
+// function.
+#[cfg(feature = "backends-microsandbox")]
+pub mod microsandbox;
 
 pub use apple_container::AppleContainerBackend;
 pub use backend::{AnyBackend, FirecrackerBackend, FirecrackerConfig};
 pub use cloud_hypervisor::CloudHypervisorBackend;
 pub use docker::DockerBackend;
 pub use libkrun::LibkrunBackend;
+#[cfg(feature = "backends-microsandbox")]
 pub use microsandbox::MicrosandboxBackend;
 pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
 
@@ -63,5 +72,10 @@ pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
 /// alt-backend tests share the same mutex with `mvm` tests
 /// — without sharing one lock the modules race each other when
 /// their tests run on the same `cargo test` binary.
-#[cfg(test)]
+///
+/// Only the microsandbox tests reach the re-export through
+/// `crate::HOME_TEST_LOCK`; the `handle_registry` tests import
+/// from `mvm_base` directly. The cfg matches the only consumer so
+/// no-default-features builds stay warning-clean.
+#[cfg(all(test, feature = "backends-microsandbox"))]
 pub(crate) use mvm_base::runtime_meta::HOME_TEST_LOCK;
