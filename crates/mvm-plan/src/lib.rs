@@ -27,11 +27,17 @@
 //!   the validity check answers "should we accept this otherwise-
 //!   valid plan now".
 
+pub mod bundle;
 pub mod plan;
 pub mod signing;
 pub mod types;
 pub mod validity;
 
+pub use bundle::{
+    ArtifactRole, BUNDLE_SCHEMA_VERSION, BundleArtifact, BundleManifest, BundleVerifyError,
+    FsTrustStore, KeyId, PlanArtifact, TrustStore, VerifiedBundle, VerityInfo, bundle_sha256,
+    read_and_verify_bundle, sha256_hex, signature_from_base64, signature_to_base64, write_bundle,
+};
 pub use plan::{ExecutionPlan, SCHEMA_VERSION};
 pub use signing::{PlanVerifyError, SignedExecutionPlan, sign_plan, verify_plan};
 pub use types::{
