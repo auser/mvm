@@ -181,6 +181,15 @@ jobs:
   # mvm-prod (the parent), so the prod guest agent lands in the
   # rootfs regardless of any caller's --override-input.
   builder-image:
+    # Disabled until `packages.<sys>.builder` is restored in
+    # `nix/images/builder/flake.nix`. The current builder flake only
+    # exposes `packages.<sys>.default` (the dev variant) — the sealed
+    # builder variant (prod-agent, verifiedBoot=true, dm-verity
+    # sidecar) per Plan 36 / ADR-005 needs the historical wiring
+    # from git 20f776e adapted to the post-microsandbox shape. Wired
+    # but not running so the artifact-list and dependency surface
+    # stay correct for when it lands.
+    if: false
     strategy:
       matrix:
         include:
@@ -245,6 +254,15 @@ jobs:
             staging/builder-image-${{ matrix.arch }}.manifest.json
 
   default-microvm:
+    # Disabled until `nix/images/default-tenant/flake.nix` is
+    # restored. The dir doesn't exist in the current tree, so the
+    # `nix build ./nix/images/default-tenant#...` invocation below
+    # fails immediately. The "bundled default microVM" feature
+    # (used by `mvmctl up` when no --flake or --template is given)
+    # is independent of the source-checkout boot path the dev
+    # image carries, so we can ship v0.14.x without it. Re-enable
+    # when the default-tenant flake lands.
+    if: false
     # Build the bundled default microVM image used by `mvmctl exec` /
     # `mvmctl up` when no --flake or --template was given. Mirrors the
     # dev-image job: native per-arch builds, unsigned artifacts.
@@ -287,7 +305,13 @@ jobs:
             staging/default-microvm-${{ matrix.arch }}-checksums-sha256.txt
 
   release:
-    needs: [build, dev-image, builder-image, default-microvm]
+    # The `builder-image` and `default-microvm` jobs are disabled
+    # below (their flakes/outputs are missing from this tree — see
+    # the `if: false` gates). Once those flakes land, add them
+    # back to the dependency list and to the `gh release create`
+    # asset glob set so a v0.14.x can publish the full asset
+    # matrix again.
+    needs: [build, dev-image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -367,6 +391,9 @@ jobs:
           GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG_NAME: ${{ github.ref_name }}
         run: |
+          # builder-image-* and default-microvm-* assets are omitted —
+          # their producer jobs are disabled (see `if: false` further
+          # down). Re-add the globs when those flakes are restored.
           gh release create "${TAG_NAME}" \
             --title "${TAG_NAME}" \
             --generate-notes \
@@ -378,15 +405,6 @@ jobs:
             artifacts/dev-image-*-checksums-sha256.txt \
             artifacts/dev-image-*.manifest.json \
             artifacts/dev-image-*.manifest.json.bundle \
-            artifacts/builder-vmlinux-* \
-            artifacts/builder-rootfs-* \
-            artifacts/builder-initrd-* \
-            artifacts/builder-image-*-checksums-sha256.txt \
-            artifacts/builder-image-*.manifest.json \
-            artifacts/builder-image-*.manifest.json.bundle \
-            artifacts/default-microvm-vmlinux-* \
-            artifacts/default-microvm-rootfs-* \
-            artifacts/default-microvm-*-checksums-sha256.txt \
             sbom.cdx.json \
             sbom.cdx.json.bundle
 
