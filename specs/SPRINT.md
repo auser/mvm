@@ -1003,19 +1003,23 @@ remaining plan-60 phases, the closed-form plans the supervisor /
 encryption / signal threads needed, and the function-call surface
 that mvmforge depends on.
 
-**Status (2026-05-11 — evening, after batch 2):** 10 + 10 = 20
-commits landed on `origin/main` in two focused batches. The
-morning batch (batch 1) closed four plans (64, 63, 62, 44) and
-the plan-60 Phase 6 policy-bundle TOML substrate. The evening
-batch (batch 2) closed plan-60 Phase 6 hardware attestation,
-plan-60 Phase 3 Slices A + B + four resolver-tightening follow-
-ons (live L4Gate, hooked W5 resolver into `admit_plan_for_boot`,
-full L7 inspector chain, LiveArtifactCollector, fail-loud
-`disabled_inspectors`, LiveKeystoreReleaser, bundle.pii wiring),
-and the plan-60 Phase 4 `audit_total_coverage` scaffold with
-recursive per-subgroup classification. Workspace now at **2281
-tests / 0 failed**; clippy `-D warnings` clean; nightly fmt
-clean; xtask `check-no-display-on-secret-types` clean. CLAUDE.md
+**Status (2026-05-11 — evening, after batch 2):** 10 + 15 = 25
+commits landed on `origin/main` across two focused batches.
+The morning batch (batch 1) closed four plans (64, 63, 62, 44)
+and the plan-60 Phase 6 policy-bundle TOML substrate. The
+evening batch (batch 2) closed plan-60 Phase 6 hardware
+attestation, plan-60 Phase 3 Slices A + B + four resolver-
+tightening follow-ons (live L4Gate, hooked W5 resolver into
+`admit_plan_for_boot`, full L7 inspector chain,
+LiveArtifactCollector, fail-loud `disabled_inspectors`,
+LiveKeystoreReleaser, bundle.pii wiring), the plan-60 Phase 4
+`audit_total_coverage` scaffold with recursive per-subgroup
+classification, plan-60 Phase 4 audit-stream URL-shape
+validation, and 9 live drive-and-assert audit-emission tests
+covering cache / network / manifest / secret subcommands.
+Workspace now at **2311 tests / 0 failed**; clippy
+`-D warnings` clean; nightly fmt clean; xtask
+`check-no-display-on-secret-types` clean. CLAUDE.md
 security claims 1–8 all true on every host. ADR-041 (signed +
 audited `ExecutionPlan`) and ADR-042 (encryption substrate)
 document the closed surfaces. Remaining work covers Phase 3
@@ -1054,11 +1058,26 @@ sweep (32 / 16 / 18).
 | 60 | Phase 3 follow-on — `bundle.pii.{mode, categories}` → `PiiRedactor::from_policy` + `build_inspector_chain_with_pii`; first slot where Live impl changes runtime behavior | `dc31b10` |
 | 60 | Phase 4 scaffold — `tests/audit_total_coverage.rs` walks `mvm_cli::cli_command()` + asserts every top-level subcommand has an `AuditPosture` classification | `c036cea` |
 | 60 | Phase 4 scaffold — recursive per-subgroup coverage (13 subgroup tables, ~54 leaf classifications including third-level `manifest tag` + `manifest alias`) | `dabd955` |
+| 60 | Phase 4 follow-on — `validate_audit_policy_stream_destinations` fail-loud at admission on unknown URL schemes in `bundle.audit.stream_destinations` (`ResolveError::AuditPolicyInvalid`, `error_class = policy-audit-invalid`) | `c5c37f2` |
+| 60 | Phase 4 follow-on — `tests/audit_emissions_live.rs` first 3 live drive-and-assert tests (cache prune, cache prune --dry-run negative, network create) | `d852f5a` |
+| 60 | Phase 4 follow-on — 3 more live tests (network remove, manifest prune --orphans, secret put) | `3759af8` |
+| 60 | Phase 4 follow-on — 3 secret-cluster live tests (secret get/ls/rm); discovered + pinned the on-disk action-name decoupling (`ls` → `"list"`, `rm` → `"delete"`) | `b22feae` |
+| hooks | `chore(hooks)` — pre-commit hook no longer re-stages unstaged WIP via `git add -u`; snapshots originally-staged paths up front | `0338c66` |
 
-Note: commit `d774200` carries the per-subgroup commit message but
-a parallel branch race landed unrelated diff bytes under it; the
-*actual* per-subgroup recursive walk shipped as `dabd955`
-immediately after with a clarifying header.
+Notes on commit-message vs diff mismatches in batch 2 (worth a
+`git log` reader knowing about):
+
+- `d774200` carries the "per-subgroup audit coverage" message but
+  the diff is actually two other-agent files (`cmd_audit.rs` +
+  `mod.rs`) that landed under it during a parallel branch race.
+  The *actual* per-subgroup recursive walk shipped as `dabd955`
+  immediately after with a clarifying header.
+- `b22feae` is titled `test(microsandbox): satisfy clippy::io-other-error
+  on Linux` but its diff also includes 107 lines of new
+  `audit_emissions_live.rs` content (the secret get / ls / rm
+  cluster). The pre-commit hook's `git add -u` re-staged unstaged
+  WIP in the working tree. `0338c66` fixed the hook so this
+  pattern won't recur.
 
 ### Remaining workstreams (priority order)
 
