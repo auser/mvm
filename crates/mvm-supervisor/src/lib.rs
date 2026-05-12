@@ -89,6 +89,7 @@ pub use l7_proxy::{
     EgressAuditSink, EgressOutcome, EvaluationResult, L7EgressProxy, NoopEgressAuditSink,
     TokioDnsResolver, parse_connect,
 };
+pub use lifecycle_hooks::{LifecycleHooks, standard_hooks};
 pub use pii_redactor::{
     Mode as PiiMode, PII_CATEGORY_NAMES, PiiPolicyError, PiiRedactor, PiiRule, PiiValidator,
 };
