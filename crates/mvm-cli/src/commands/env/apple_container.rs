@@ -582,7 +582,8 @@ fn ensure_dev_image() -> Result<(String, String)> {
                 "Could not download dev image for v{version}: {download_err}\n\
                  Searching for a local fallback under ~/.mvm/dev/."
             ));
-            if let Some((src_kernel, src_rootfs, source_label)) = find_local_fallback_image() {
+            let fallback = find_local_fallback_image().or_else(find_vendored_dev_image);
+            if let Some((src_kernel, src_rootfs, source_label)) = fallback {
                 ui::warn(&format!(
                     "Using local fallback from {source_label}. \
                      This is not the published v{version} image — boot it knowing the \
@@ -598,8 +599,9 @@ fn ensure_dev_image() -> Result<(String, String)> {
                 Ok((kernel_path, rootfs_path))
             } else {
                 Err(download_err.context(
-                    "no local fallback found under ~/.mvm/dev/prebuilt/v*/ \
-                     or ~/.mvm/dev/builds/*/",
+                    "no local fallback found under ~/.mvm/dev/prebuilt/v*/, \
+                     ~/.mvm/dev/builds/*/, or the source-checkout's \
+                     nix/images/dev-prebuilt/<arch>/",
                 ))
             }
         }
@@ -648,6 +650,41 @@ fn find_local_fallback_image() -> Option<(std::path::PathBuf, std::path::PathBuf
     candidates.sort_by_key(|(mtime, ..)| *mtime);
     let (_, dir, label) = candidates.into_iter().next_back()?;
     Some((dir.join("vmlinux"), dir.join("rootfs.ext4"), label))
+}
+
+/// Look for a vendored dev image inside the source checkout the mvmctl
+/// binary was compiled from: `{workspace_root}/nix/images/dev-prebuilt/
+/// <arch>/{vmlinux, rootfs.ext4}`. The path is checked last in the
+/// fallback cascade — it's the most predictable source ("what the
+/// repo ships") but only useful when `mvmctl` runs out of its source
+/// checkout: `CARGO_MANIFEST_DIR` is baked at compile time and points
+/// into `~/.cargo/registry/` for `cargo install`-ed builds, where the
+/// directory will reliably be missing. That's fine — for installed
+/// binaries the `~/.mvm/dev/` auto-discover path covers the offline
+/// case.
+///
+/// `arch` mirrors the matrix used by `download_dev_image`: `aarch64`
+/// on Apple Silicon / aarch64-linux, `x86_64` everywhere else.
+fn find_vendored_dev_image() -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(manifest_dir).parent()?.parent()?;
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let dir = workspace_root
+        .join("nix")
+        .join("images")
+        .join("dev-prebuilt")
+        .join(arch);
+    let kernel = dir.join("vmlinux");
+    let rootfs = dir.join("rootfs.ext4");
+    if !kernel.is_file() || !rootfs.is_file() {
+        return None;
+    }
+    let label = format!("vendored {}", dir.display());
+    Some((kernel, rootfs, label))
 }
 
 /// Drop every direct child of `prebuilt_root` except the one for the
