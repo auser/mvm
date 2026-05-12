@@ -131,7 +131,15 @@ jobs:
         # fails with `unable to find library -lcap-ng`. Ubuntu's GH
         # runner image ships the runtime library but not the -dev
         # headers/symlinks that `cc` needs at link time.
-        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+        #
+        # gnome-keyring + dbus-x11 are runtime deps for the secret-store
+        # live tests in tests/audit_emissions_live.rs — the `keyring`
+        # crate's default Linux backend is `secret-service`, which needs
+        # a running Secret Service daemon. Without one, `mvmctl secret
+        # put` fails with `org.freedesktop.secrets was not provided`.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcap-ng-dev gnome-keyring dbus-x11
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -147,7 +155,19 @@ jobs:
         run: cargo build --all-targets
 
       - name: Run tests
-        run: cargo test
+        # Run cargo test inside a fresh dbus session with gnome-keyring
+        # unlocked under an empty password. `dbus-run-session` spawns
+        # a private session bus and exports DBUS_SESSION_BUS_ADDRESS;
+        # piping `\n` to `gnome-keyring-daemon --unlock` sets the empty
+        # password and prints env vars the daemon expects in its
+        # environment. The whole chain runs as one shell invocation so
+        # the env propagates to `cargo test`.
+        run: |
+          dbus-run-session -- bash -c '
+            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
+            export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
+            cargo test
+          '
 
   e2e:
     name: E2E Tests
