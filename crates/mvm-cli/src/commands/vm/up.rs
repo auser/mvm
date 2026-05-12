@@ -852,6 +852,15 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         }
         emit_launched_if(&admission, effective_hypervisor);
 
+        // Plan 37 §6 — match the main path's VmStart LocalAudit emit
+        // (line ~1114). Without this the launchd-spawned direct-boot
+        // surface skips the LocalAudit stream entirely, breaking the
+        // "every state-changing CLI verb emits one record per attempt"
+        // invariant for the only verb that runs under launchd. Also
+        // unblocks hermetic end-to-end tests of `mvmctl up` via
+        // MVM_DIRECT_BOOT + `--hypervisor mock`.
+        mvm_core::audit_emit!(VmStart, vm: &vm_name);
+
         // Set up port forwarding from MVM_PORTS env var (via vsock)
         if let Ok(ports_str) = std::env::var("MVM_PORTS")
             && !ports_str.is_empty()
@@ -870,6 +879,15 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             } else {
                 ui::warn("Guest agent not reachable — port forwarding unavailable.");
             }
+        }
+
+        // `--detach` short-circuits the Ctrl+C loop. The launchd
+        // agent always passes `--detach` (it owns the VM lifecycle
+        // and uses launchd's own restart/keepalive semantics — the
+        // long-lived CLI process would be redundant). Same shape as
+        // the main path's detach branch at line ~1117.
+        if detach {
+            return Ok(());
         }
 
         ui::info(&format!("VM '{}' running. Press Ctrl+C to stop.", vm_name));
