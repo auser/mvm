@@ -1393,6 +1393,59 @@ Outstanding (deferred follow-ups):
   wiring so `trust add/remove` flips from `InteractiveOrControl`
   to `Emits(...)` in the posture table.
 
+### W3 — Network default flip (deny-by-default)  ✅ shipped
+
+Pre-Sprint 52 `NetworkPolicy::default()` returned `unrestricted()`
+— the entire rest of the ADR-002 model confined the guest at every
+other layer, but egress was wide open. W3 flips the safe default
+to `deny_all()`. Workloads that need network access opt in
+explicitly via `--network-preset` / `--network-allow` /
+`mvmctl trust`-provisioned template policies.
+
+Shipped:
+
+- `NetworkPolicy::default()` in
+  `crates/mvm-core/src/policy/network_policy.rs` returns
+  `Self::deny_all()` (was `Self::unrestricted()`).
+- `mvmctl up` warning when the resolved policy is unrestricted —
+  both for the explicit-CLI-flag path
+  (`--network-preset unrestricted`) and for templates whose baked
+  `default_network_policy` is unrestricted. Names the source so
+  the user knows where the opt-out came from. Suppressible via
+  `MVM_ACK_UNRESTRICTED_NETWORK=1` for CI / scripted use.
+- ADR-002 10th claim shipped: *no untrusted workload reaches the
+  network unless explicitly admitted by policy.* Framework refs
+  added (ATT&CK T1071 / T1041; D3FEND Network Traffic Filtering;
+  CREF Privilege Restriction).
+- Tests updated:
+  - `policy_default_is_deny_all` (renamed from
+    `policy_default_is_unrestricted`) asserts the deny-all shape.
+  - `test_resolve_network_policy_default_is_deny_all` flipped to
+    match. Comment notes the pre-Sprint-52 expectation.
+- 334 supervisor + all-crate lib tests green;
+  `cargo test --test audit_total_coverage` green; clippy clean.
+
+Breaking change disclosure for release notes:
+
+> **Breaking:** `mvmctl up` and the rest of mvm now refuse network
+> egress by default. Workloads that previously relied on
+> implicit unrestricted egress must pass
+> `--network-preset unrestricted` (which emits a launch-time
+> warning) or one of the safer presets (`dev`, `agent`,
+> `registries`). The escape hatch
+> `MVM_ACK_UNRESTRICTED_NETWORK=1` suppresses the warning.
+
+Outstanding (deferred follow-ups):
+
+- CI lane `network-default-is-deny` — a black-box assertion that
+  `mvmctl up` with no flags refuses outbound connectivity from
+  inside the guest. Needs a live-KVM smoke harness mvm doesn't
+  have today; the unit-level guarantee shipped in this commit.
+- `mvmctl doctor` could surface the network default visibly in
+  its security-posture section as a corollary of claim 10. The
+  posture section reads from `BackendSecurityProfile`; teaching
+  it about runtime policy defaults is a small follow-on.
+
 ### Sprint 52 success criteria
 
 1. *A workload with `mem_initial = "256M"` and `mem = "1024M"`

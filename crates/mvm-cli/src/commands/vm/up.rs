@@ -406,7 +406,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
     // this field; manifest-keyed slots don't — runtime policy moves
     // to `mvmctl up` flags / `~/.mvm/config.toml` / mvmd per plan 38
     // §"Manifest scope"). Explicit CLI flags always win.
-    let network_policy = if args.network_preset.is_some() || !args.network_allow.is_empty() {
+    let explicit_cli_network = args.network_preset.is_some() || !args.network_allow.is_empty();
+    let network_policy = if explicit_cli_network {
         resolve_network_policy(args.network_preset.as_deref(), &args.network_allow)?
     } else if let Some(id_or_slot) = resolved_template_arg.as_deref()
         && let Ok(spec) = mvm::vm::template::lifecycle::template_load_dispatched(id_or_slot)
@@ -419,6 +420,33 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
     } else {
         resolve_network_policy(None, &[])?
     };
+
+    // ADR-002 claim 10 — deny-by-default network. When the resolved
+    // policy is `unrestricted`, the user (or a template they
+    // selected) explicitly opted out of the safe default. Surface
+    // that as a one-line warning so operators are never surprised
+    // by wide-open egress. Suppressible via
+    // `MVM_ACK_UNRESTRICTED_NETWORK=1` for CI / scripted use that
+    // already knows what it's doing.
+    if network_policy.is_unrestricted()
+        && std::env::var_os("MVM_ACK_UNRESTRICTED_NETWORK").is_none()
+    {
+        let source = if explicit_cli_network {
+            "--network-preset unrestricted (CLI flag)"
+        } else {
+            "template's default_network_policy (baked at build time)"
+        };
+        // vm_name isn't bound at this point in the flow; use the
+        // user-supplied --name (or "(unnamed)" placeholder) which
+        // matches what the rest of the boot log shows.
+        let label = args.name.as_deref().unwrap_or("(unnamed)");
+        crate::ui::warn(&format!(
+            "⚠ VM '{label}' will boot with UNRESTRICTED network egress (source: {source}).\n   \
+             ADR-002 claim 10 sets deny-all as the safe default; \
+             this workload opted out. Set MVM_ACK_UNRESTRICTED_NETWORK=1 \
+             to suppress this warning."
+        ));
+    }
     let seccomp_tier: mvm_security::seccomp::SeccompTier =
         args.seccomp.parse().context("Invalid --seccomp value")?;
     let secret_bindings: Vec<mvm_core::secret_binding::SecretBinding> = args
