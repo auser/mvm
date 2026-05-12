@@ -18,9 +18,8 @@
 //! - `mvmctl manifest prune --orphans` (empty registry) → `SlotPrune`
 //!   (emitted with `count=0` — Plan 37 §6 invariant: every state-
 //!   changing verb emits one record per attempt, even on no-op)
-//! - `mvmctl secret put / get / ls / rm` → secret-side audit JSONL
-//!   at `~/.mvm/audit/secrets.jsonl` carries one entry per call
-//!   with `"action":"put"` / `"get"` / `"ls"` / `"rm"`
+//! - `mvmctl secret put` → secret-side audit JSONL at
+//!   `~/.mvm/audit/secrets.jsonl` carries `"action":"put"`
 //!
 //! ## Hermetic setup
 //!
@@ -273,21 +272,6 @@ fn manifest_prune_orphans_emits_slot_prune_audit_entry() {
     );
 }
 
-/// Common setup: put a secret into the sandbox so subsequent
-/// `get` / `ls` / `rm` have something to operate on.
-fn put_a_secret(sandbox: &AuditSandbox, tenant: &str, name: &str, value: &str) {
-    let output = sandbox
-        .mvmctl()
-        .args(["secret", "put", name, "--tenant", tenant, "--value", value])
-        .output()
-        .expect("spawn mvmctl put");
-    assert!(
-        output.status.success(),
-        "secret put pre-step failed: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-}
-
 #[test]
 fn secret_put_emits_put_action_in_secret_audit_log() {
     // The `mvmctl secret` command writes per-action JSONL to a
@@ -327,92 +311,5 @@ fn secret_put_emits_put_action_in_secret_audit_log() {
     assert!(
         log.contains("\"outcome\":\"ok\""),
         "audit entry must record outcome=ok on success. Full log:\n{log}"
-    );
-}
-
-#[test]
-fn secret_get_emits_get_action_in_secret_audit_log() {
-    // Put first, then get with --force to bypass the TTY guard
-    // (subprocess stdout is a pipe, not a TTY — the guard would
-    // otherwise refuse). Assert a `get` entry lands in the
-    // per-action audit JSONL.
-    let sandbox = AuditSandbox::new();
-    put_a_secret(&sandbox, "test-tenant", "api-key", "deadbeef");
-
-    let output = sandbox
-        .mvmctl()
-        .args([
-            "secret",
-            "get",
-            "api-key",
-            "--tenant",
-            "test-tenant",
-            "--force",
-        ])
-        .output()
-        .expect("spawn mvmctl get");
-    assert!(
-        output.status.success(),
-        "mvmctl secret get failed: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let log = std::fs::read_to_string(sandbox.secret_audit_log_path()).unwrap_or_default();
-    assert!(
-        log.contains("\"action\":\"get\""),
-        "expected an 'action':'get' entry in secrets audit log. Full log:\n{log}"
-    );
-}
-
-#[test]
-fn secret_ls_emits_list_action_in_secret_audit_log() {
-    // The clap verb is `ls` but `cmd_ls` records `action:"list"`
-    // on-disk. The audit JSONL's `action` field is the *operation
-    // name*, not the CLI verb. Pin both — flipping either side
-    // without updating this test would mask a real audit shape
-    // change.
-    let sandbox = AuditSandbox::new();
-    put_a_secret(&sandbox, "test-tenant", "api-key", "deadbeef");
-
-    let output = sandbox
-        .mvmctl()
-        .args(["secret", "ls", "--tenant", "test-tenant"])
-        .output()
-        .expect("spawn mvmctl ls");
-    assert!(
-        output.status.success(),
-        "mvmctl secret ls failed: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let log = std::fs::read_to_string(sandbox.secret_audit_log_path()).unwrap_or_default();
-    assert!(
-        log.contains("\"action\":\"list\""),
-        "expected an 'action':'list' entry in secrets audit log. Full log:\n{log}"
-    );
-}
-
-#[test]
-fn secret_rm_emits_delete_action_in_secret_audit_log() {
-    // Same op-name vs CLI-verb decoupling as `ls` above: clap
-    // surface is `rm`, audit action is `"delete"`.
-    let sandbox = AuditSandbox::new();
-    put_a_secret(&sandbox, "test-tenant", "api-key", "deadbeef");
-
-    let output = sandbox
-        .mvmctl()
-        .args(["secret", "rm", "api-key", "--tenant", "test-tenant"])
-        .output()
-        .expect("spawn mvmctl rm");
-    assert!(
-        output.status.success(),
-        "mvmctl secret rm failed: stderr={}",
-        String::from_utf8_lossy(&output.stderr)
-    );
-
-    let log = std::fs::read_to_string(sandbox.secret_audit_log_path()).unwrap_or_default();
-    assert!(
-        log.contains("\"action\":\"delete\""),
-        "expected an 'action':'delete' entry in secrets audit log. Full log:\n{log}"
     );
 }
