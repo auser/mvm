@@ -49,14 +49,26 @@ while IFS= read -r f; do
 done <<< "$staged"
 
 if [ "$has_rust" -eq 1 ]; then
+    # Snapshot the originally-staged Rust file set so we only re-stage
+    # *those* after `cargo fmt --all`. Without this guard, the
+    # subsequent `git add` would sweep in WIP files left modified in
+    # the working tree but never staged — silently bundling unrelated
+    # work into focused commits.
+    staged_rust="$(printf '%s\n' "$staged" | grep -E '\.rs$' || true)"
+
     echo "pre-commit: cargo fmt --all"
     if ! cargo fmt --all; then
         echo "  cargo fmt failed."
         exit 1
     fi
-    if ! git diff --quiet --exit-code; then
-        echo "pre-commit: re-staging formatted files"
-        git add -u
+    if [ -n "$staged_rust" ]; then
+        # Only re-stage files that were already part of this commit.
+        # `git add` is a no-op for paths fmt didn't touch.
+        while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ ! -f "$f" ] && continue
+            git add -- "$f"
+        done <<< "$staged_rust"
     fi
 
     if [ "${MVM_SKIP_CLIPPY:-0}" = "1" ]; then
