@@ -1,14 +1,26 @@
-//! `cargo xtask build-dev-image` — build the dev VM image via Nix and drop
-//! the outputs into the vendored slot at
-//! `nix/images/dev-prebuilt/<arch>/{vmlinux, rootfs.ext4}`.
+//! `cargo xtask build-dev-image` — build the dev VM image and drop it
+//! into the source-checkout vendored slot at
+//! `nix/images/dev-prebuilt/<arch>/{vmlinux, rootfs.ext4,
+//! checksums-sha256.txt}`.
 //!
-//! That slot is the highest-precedence source in
-//! `mvm_cli::commands::env::apple_container::find_vendored_dev_image` — when
-//! the binary runs from a source checkout that has those files, it boots
-//! from them directly and skips the GitHub-release download. So populating
-//! the slot is what flips `mvmctl dev up` from "downloading prebuilt"
-//! (currently a 404 against `tinylabscom/mvm` v0.14.0) to "using vendored
-//! dev image from source checkout".
+//! ## Self-bootstrapping — no host Nix required
+//!
+//! The task does **not** shell out to a host `nix` binary. Instead it
+//! drives [`mvm_build::builder_vm::MicrosandboxBuilderVm`] — the same
+//! microsandbox-backed Linux builder that `mvmctl build` uses to build
+//! user microVM images. That sandbox spawns `docker.io/nixos/nix:2.24.10`
+//! via Apple Virtualization Framework / libkrun (macOS) or KVM (Linux),
+//! bind-mounts the workspace at `/work`, and runs `nix build` *inside*
+//! the sandbox. The host needs zero Nix install — `mvmctl` ships
+//! microsandbox in-binary and microsandbox pulls the public
+//! `nixos/nix:2.24.10` image once.
+//!
+//! Net effect: on a fresh macOS 26+ Apple Silicon host with nothing
+//! installed but `mvmctl`, `cargo xtask build-dev-image` produces a
+//! working dev VM image. After it runs once, the image lives in the
+//! vendored slot and `mvmctl dev up` boots from there at the highest-
+//! precedence layer of `ensure_dev_image`'s cascade — so subsequent
+//! starts don't even need microsandbox or network reachability.
 //!
 //! ## Contract
 //!
@@ -22,25 +34,17 @@
 //!   `<hash>  <name>` format that `sha256sum` and
 //!   `mvm-security::image_verify::verify_unsigned_checksums` parse.
 //!
-//! ## Prerequisites
-//!
-//! The xtask shells out to `nix build`; the host must have Nix on PATH
-//! and able to build the requested Linux system. On native Linux that's
-//! the kernel's KVM; on macOS that's either a remote builder via
-//! `builders` in `/etc/nix/nix.conf` or `nix-darwin`'s `linux-builder`
-//! NixOS module. Failure to build is propagated with the underlying
-//! Nix stderr — the xtask never silently substitutes a stale or
-//! prebuilt artifact.
-//!
-//! The expected flake is at `nix/images/builder/flake.nix` and exposes
-//! `packages.<system>.default` as a derivation whose `$out` directory
-//! contains `vmlinux` and `rootfs.ext4`. If the flake is missing the
-//! xtask fails fast with a pointer at the git history (commit `20f776e`
-//! has the historical version) so callers know exactly what to restore
-//! before retrying.
+//! That contract is consumed by
+//! `mvm_cli::commands::env::apple_container::find_vendored_dev_image`,
+//! which is the highest-precedence path in `ensure_dev_image` for
+//! source-checkout users.
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
+
+use mvm_build::builder_vm::{
+    BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, BuilderVm, MicrosandboxBuilderVm,
+};
 
 /// Parse `cargo xtask build-dev-image [--arch <arch>]` and dispatch.
 pub fn run(args: &[String], workspace: &Path) -> Result<()> {
@@ -67,8 +71,10 @@ pub fn run(args: &[String], workspace: &Path) -> Result<()> {
 const HELP_TEXT: &str = "\
 Usage: cargo xtask build-dev-image [--arch <arch>]
 
-Builds the dev VM image via `nix build ./nix/images/builder#packages.<arch>-linux.default`
-and copies vmlinux + rootfs.ext4 + checksums into nix/images/dev-prebuilt/<arch>/.
+Builds the dev VM image inside a microsandbox-managed Linux sandbox
+(via Apple Virtualization Framework / libkrun on macOS, KVM on Linux)
+and copies vmlinux + rootfs.ext4 + checksums into
+nix/images/dev-prebuilt/<arch>/. No host Nix install required.
 
 Args:
   --arch <arch>   Target architecture (aarch64 or x86_64).
@@ -76,18 +82,16 @@ Args:
                   (aarch64-darwin → aarch64, x86_64-linux → x86_64, etc.).
 
 Prerequisites:
-  - `nix` on PATH with flakes enabled.
-  - A working builder for the target Linux system (native KVM on Linux,
-    remote builder or nix-darwin linux-builder on macOS).
+  - macOS 26+ on Apple Silicon, or Linux with KVM.
+  - Network reachability to docker.io (first run pulls nixos/nix:2.24.10;
+    subsequent runs are cached).
   - The flake at nix/images/builder/flake.nix exposes
     packages.<arch>-linux.default with vmlinux + rootfs.ext4 in $out.
 ";
 
 /// Map the host arch to the matching Linux-system identifier used by
 /// `mvmctl`'s download path (`download_dev_image` uses the same mapping
-/// at `apple_container.rs`). Defaults are "aarch64" on Apple Silicon /
-/// aarch64-linux and "x86_64" everywhere else — mirrors the
-/// `cfg!(target_arch = "aarch64")` test there.
+/// at `apple_container.rs`).
 fn host_arch_for_linux() -> &'static str {
     if cfg!(target_arch = "aarch64") {
         "aarch64"
@@ -104,61 +108,105 @@ fn validate_arch(arch: &str) -> Result<()> {
 }
 
 fn build_and_install(workspace: &Path, arch: &str) -> Result<()> {
-    let builder_flake = workspace.join("nix").join("images").join("builder");
-    let flake_nix = builder_flake.join("flake.nix");
+    let flake_nix = workspace
+        .join("nix")
+        .join("images")
+        .join("builder")
+        .join("flake.nix");
     if !flake_nix.exists() {
         anyhow::bail!(
             "Builder flake not found at {}.\n\n\
-             The flake existed historically at git commit 20f776e; restore it via\n\
-             `git show 20f776e:nix/images/builder/flake.nix > {}`\n\
-             (adapt inputs as needed — the historical version references a\n\
-             nix/dev/ sibling that no longer exists in the tree).",
-            flake_nix.display(),
+             The flake should be checked into the source tree at\n\
+             nix/images/builder/flake.nix and expose\n\
+             packages.<arch>-linux.default producing vmlinux + rootfs.ext4.",
             flake_nix.display(),
         );
     }
 
-    if !nix_on_path() {
-        anyhow::bail!(
-            "`nix` not found on PATH. Install Nix from https://nixos.org/download \
-             and re-run."
-        );
+    // The builder runs `nix build` inside a read-only bind of the
+    // workspace, so a stale `flake.lock` with `path:..`-style entries
+    // is unrepresentable: nix can't write a new lock (EROFS) and the
+    // old one trips strict pure-mode validation. Pair this with the
+    // `--no-write-lock-file --impure` flags inside the builder
+    // (mvm-build/src/builder_vm.rs:run_build_async). Net: every xtask
+    // run re-evaluates inputs from scratch — fine for the bootstrap,
+    // and the kernel + nixpkgs revs are still pinned through the
+    // parent flake's lock at `nix/flake.lock`.
+    let lock = flake_nix.parent().unwrap().join("flake.lock");
+    if lock.exists() {
+        std::fs::remove_file(&lock)
+            .with_context(|| format!("removing stale {}", lock.display()))?;
     }
 
-    let attr = format!("packages.{arch}-linux.default");
-    let flake_ref = format!("{}#{attr}", builder_flake.display());
+    // The sandbox bind-mounts `workspace` at /work (read-only).
+    // microsandbox owns /out for artifact extraction. The flake_ref
+    // inside the sandbox is the absolute path to the builder flake
+    // under that mount — `path:..` resolves there to the parent
+    // mvm flake at /work/nix/, which in turn resolves its own
+    // `mvm-workspace = path:..` to /work/, where `Cargo.lock` lives.
+    let artifact_out =
+        tempfile::tempdir().context("creating tempdir for builder artifact extraction")?;
+    let job = BuilderJob {
+        // Bare path — nix auto-detects /work as a git repo (the host
+        // workspace's `.git` is in the bind-mount) and uses the
+        // git+file fetcher. That gives us two things `path:` doesn't:
+        //   1. The flake resolves against the workspace root, so
+        //      `path:../..`-style relative inputs find their
+        //      neighbours (`path:` stages only the leaf subdir and
+        //      escapes the store with "outside of its parent's store
+        //      path").
+        //   2. `?dir=` works in older nix versions (the `path:`
+        //      variant errors "unsupported parameter 'dir'" on nix
+        //      2.24, which is what the builder image ships).
+        //
+        // `git config --global --add safe.directory '*'` inside the
+        // sandbox (set by run_build_async's build_script) is what
+        // makes the git fetcher work across the bind-mount's
+        // host-uid ownership; without it, git refuses with
+        // "repository '/work' is not owned by current user".
+        flake_ref: format!("git+file://{BUILDER_GUEST_WORK_DIR}?dir=nix/images/builder"),
+        attr_path: format!("packages.{arch}-linux.default"),
+    };
+    let mounts = BuilderMounts {
+        flake_src: workspace.to_path_buf(),
+        // Never bind the host /nix on macOS: it's root-owned and
+        // contains Darwin-targeted closures the Linux sandbox can't
+        // execute. See the same reasoning in
+        // `apple_container.rs::build_image_via_microsandbox`.
+        host_nix_store: None,
+        artifact_out: artifact_out.path().to_path_buf(),
+    };
 
-    println!("xtask build-dev-image: nix build {flake_ref}");
-    let store_path = run_nix_build(&flake_ref)?;
-    let store_path = Path::new(&store_path);
+    println!(
+        "xtask build-dev-image: running mvm-build's MicrosandboxBuilderVm\n\
+         (no host Nix needed — `nixos/nix:2.24.10` runs inside the sandbox)"
+    );
+    let builder = MicrosandboxBuilderVm::default();
+    let artifacts = builder
+        .run_build(&job, &mounts)
+        .map_err(|e| anyhow::anyhow!("microsandbox builder failed: {e}"))?;
 
-    let src_kernel = store_path.join("vmlinux");
-    let src_rootfs = store_path.join("rootfs.ext4");
-    if !src_kernel.is_file() {
+    let src_kernel = artifacts.kernel_path.ok_or_else(|| {
+        anyhow::anyhow!(
+            "builder produced no vmlinux — the flake's \
+             packages.{arch}-linux.default output must include `vmlinux` \
+             in its $out directory"
+        )
+    })?;
+    if !artifacts.rootfs_path.is_file() {
         anyhow::bail!(
-            "nix build succeeded but {} is missing — does the flake's \
-             packages.{arch}-linux.default output expose a vmlinux file in \
-             its $out directory?",
-            src_kernel.display(),
-        );
-    }
-    if !src_rootfs.is_file() {
-        anyhow::bail!(
-            "nix build succeeded but {} is missing — does the flake's \
-             packages.{arch}-linux.default output expose a rootfs.ext4 file \
-             in its $out directory?",
-            src_rootfs.display(),
+            "builder reported success but rootfs.ext4 is missing at {}",
+            artifacts.rootfs_path.display(),
         );
     }
 
     let dest_dir = vendored_slot(workspace, arch);
     std::fs::create_dir_all(&dest_dir)
         .with_context(|| format!("creating vendored slot at {}", dest_dir.display()))?;
-
     let dest_kernel = dest_dir.join("vmlinux");
     let dest_rootfs = dest_dir.join("rootfs.ext4");
     copy_with_mode(&src_kernel, &dest_kernel)?;
-    copy_with_mode(&src_rootfs, &dest_rootfs)?;
+    copy_with_mode(&artifacts.rootfs_path, &dest_rootfs)?;
     let checksums = format!(
         "{}  vmlinux\n{}  rootfs.ext4\n",
         sha256_hex(&dest_kernel)?,
@@ -174,62 +222,14 @@ fn build_and_install(workspace: &Path, arch: &str) -> Result<()> {
     println!("  {}", checksums_path.display());
     println!(
         "\n`mvmctl dev up` from this checkout will now boot from the vendored\n\
-         slot instead of downloading from the release page."
+         slot at highest precedence — no GitHub release download needed."
     );
     Ok(())
 }
 
-fn nix_on_path() -> bool {
-    std::process::Command::new("nix")
-        .arg("--version")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
-        .status()
-        .map(|s| s.success())
-        .unwrap_or(false)
-}
-
-/// Run `nix build <flake_ref> --no-link --print-out-paths` and return the
-/// resolved store path of the first output line. Nix's stderr is
-/// inherited so the operator sees per-derivation build progress in real
-/// time — capturing it would silently swallow a 30-minute toolchain
-/// rebuild's status updates.
-fn run_nix_build(flake_ref: &str) -> Result<String> {
-    let output = std::process::Command::new("nix")
-        .args([
-            "--extra-experimental-features",
-            "nix-command flakes",
-            "build",
-            flake_ref,
-            "--no-link",
-            "--print-out-paths",
-        ])
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::inherit())
-        .output()
-        .with_context(|| format!("spawning `nix build {flake_ref}`"))?;
-    if !output.status.success() {
-        anyhow::bail!(
-            "`nix build {flake_ref}` failed with exit {}. See stderr above.",
-            output.status.code().unwrap_or(-1)
-        );
-    }
-    let stdout = String::from_utf8(output.stdout).context("nix build emitted non-UTF-8 stdout")?;
-    let store_path = stdout
-        .lines()
-        .find(|l| l.starts_with("/nix/store/"))
-        .ok_or_else(|| {
-            anyhow::anyhow!("nix build produced no /nix/store/... output path (stdout: {stdout:?})")
-        })?
-        .trim()
-        .to_string();
-    Ok(store_path)
-}
-
-/// Copy a file, then chmod the destination to 0644 so the operator can
-/// re-run the xtask without `rm`-ing read-only Nix store copies. Nix
-/// store files are mode 0444; `std::fs::copy` preserves source mode by
-/// default, which would make a subsequent overwrite EACCES.
+/// Copy a file, then chmod the destination to 0644. Nix store files
+/// come back mode 0444; preserving that source mode would make a
+/// subsequent xtask re-run EACCES on overwrite.
 fn copy_with_mode(src: &Path, dest: &Path) -> Result<()> {
     std::fs::copy(src, dest)
         .with_context(|| format!("copying {} → {}", src.display(), dest.display()))?;
@@ -243,6 +243,7 @@ fn copy_with_mode(src: &Path, dest: &Path) -> Result<()> {
 }
 
 fn sha256_hex(path: &Path) -> Result<String> {
+    use sha2::Digest;
     use std::io::Read;
     let mut f = std::fs::File::open(path)
         .with_context(|| format!("opening {} for hashing", path.display()))?;
@@ -255,10 +256,8 @@ fn sha256_hex(path: &Path) -> Result<String> {
         if n == 0 {
             break;
         }
-        use sha2::Digest;
         hasher.update(&buf[..n]);
     }
-    use sha2::Digest;
     Ok(format!("{:x}", hasher.finalize()))
 }
 
@@ -286,9 +285,6 @@ mod tests {
     fn validate_arch_rejects_others() {
         assert!(validate_arch("riscv64").is_err());
         assert!(validate_arch("").is_err());
-        // Guard against accidentally accepting full system identifiers —
-        // the flake attribute we emit assumes the caller passes the
-        // bare arch and we append `-linux`.
         assert!(validate_arch("aarch64-linux").is_err());
     }
 
@@ -315,15 +311,10 @@ mod tests {
             msg.contains("Builder flake not found"),
             "expected a clear flake-missing error, got: {msg}"
         );
-        assert!(
-            msg.contains("20f776e"),
-            "expected the historical-recovery pointer, got: {msg}"
-        );
     }
 
     #[test]
     fn help_flag_short_circuits() {
-        // --help should not require a workspace state — should print and exit Ok.
         let tmp = tempfile::tempdir().unwrap();
         run(&["--help".to_string()], tmp.path()).expect("help should be Ok");
     }

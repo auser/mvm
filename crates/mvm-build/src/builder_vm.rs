@@ -529,11 +529,29 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
     //    accumulate result symlinks across builds; capture the
     //    output store path via `--print-out-paths` so the extraction
     //    step knows what to copy.
+    //
+    // `--no-write-lock-file --impure` is what unblocks builds inside
+    // the sandbox when the flake has path inputs (`path:..`-style):
+    //   - The bind-mounted `/work` is read-only, so any attempt to
+    //     write the lock fails with EROFS.
+    //   - Path inputs are "unlocked" by construction (no content hash
+    //     to verify against), so strict pure-mode rejects them with
+    //     "lock file contains unlocked input '{"path":"...","type":"path"}'".
+    //   - The lockfile is also nuked from `/work/<flake>` on the host
+    //     before this script runs (see the xtask), so there's nothing
+    //     stale to re-validate.
     let build_script = format!(
         r#"set -euo pipefail
 cd {work}
+# `safe.directory = *` neutralises the cross-uid check git 2.35+
+# enforces on bind-mounted repos. Without it, nix's git fetcher
+# (engaged whenever the flake path lives under a `.git` dir, which
+# `/work` does) errors "repository '/work' is not owned by current
+# user". `git config --global` writes to /root inside the sandbox —
+# fresh per spawn — so this never leaks to the host.
+git config --global --add safe.directory '*'
 export NIX_CONFIG="experimental-features = nix-command flakes"
-nix build {flake_ref}#{attr_path} --no-link --print-out-paths
+nix build {flake_ref}#{attr_path} --no-link --print-out-paths --no-write-lock-file --impure
 "#,
         work = shell_quote_arg(BUILDER_GUEST_WORK_DIR),
         flake_ref = flake_ref,
