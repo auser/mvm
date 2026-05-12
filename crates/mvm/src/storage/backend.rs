@@ -67,8 +67,9 @@ pub struct BackendVolumeStats {
 
 /// Production backend that shells out to `dmsetup`. On non-Linux
 /// hosts (macOS dev hosts) every method returns
-/// `StorageError::BackendUnavailable`. Real CoW lives in the Lima VM
-/// where this backend can run with root privileges.
+/// `StorageError::BackendUnavailable`. Real CoW lives in the dev VM
+/// (Apple Container on macOS, native Linux otherwise) where this
+/// backend can run with root privileges.
 pub struct DmsetupBackend;
 
 impl DmsetupBackend {

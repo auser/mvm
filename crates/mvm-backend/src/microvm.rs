@@ -11,13 +11,13 @@ use mvm_base::ui;
 // RAII resource guards — prevent leaks when VM launch fails partway through
 // ============================================================================
 
-/// RAII guard for a Firecracker process started inside the Lima VM.
+/// RAII guard for a Firecracker process started inside the dev VM.
 ///
 /// On drop, kills the Firecracker process using the PID file and cleans up
 /// the API socket. Call `defuse()` after a successful launch to prevent
 /// cleanup (ownership transfers to the normal stop path).
 pub struct FirecrackerGuard {
-    /// Absolute path to the VM directory inside the Lima VM (contains fc.pid, fc.socket).
+    /// Absolute path to the VM directory inside the dev VM (contains fc.pid, fc.socket).
     abs_dir: Option<String>,
 }
 
@@ -59,7 +59,7 @@ impl Drop for FirecrackerGuard {
     }
 }
 
-/// RAII guard for a TAP network interface created inside the Lima VM.
+/// RAII guard for a TAP network interface created inside the dev VM.
 ///
 /// On drop, destroys the TAP device. Call `defuse()` after a successful
 /// launch to prevent cleanup (ownership transfers to the normal stop path).
@@ -102,12 +102,12 @@ fn require_linux_env() -> Result<()> {
     Ok(())
 }
 
-/// Resolve MICROVM_DIR (~) to an absolute path inside the Lima VM.
+/// Resolve MICROVM_DIR (~) to an absolute path inside the dev VM.
 fn resolve_microvm_dir() -> Result<String> {
     run_in_vm_stdout(&format!("echo {}", MICROVM_DIR))
 }
 
-/// Resolve a per-VM directory path (~ expansion) inside the Lima VM.
+/// Resolve a per-VM directory path (~ expansion) inside the dev VM.
 pub fn resolve_vm_dir(slot: &VmSlot) -> Result<String> {
     run_in_vm_stdout(&format!("echo {}", slot.vm_dir))
 }
@@ -118,7 +118,7 @@ pub fn resolve_running_vm_dir(name: &str) -> Result<String> {
     Ok(format!("{}/{}", abs_vms, name))
 }
 
-/// Start the Firecracker daemon inside the Lima VM (background).
+/// Start the Firecracker daemon inside the dev VM (background).
 #[instrument(skip_all)]
 fn start_firecracker_daemon(abs_dir: &str) -> Result<()> {
     ui::info("Starting Firecracker...");
@@ -321,7 +321,7 @@ fn configure_microvm(state: &MvmState, abs_dir: &str) -> Result<()> {
 /// Full start sequence: network, firecracker, configure, boot (headless).
 ///
 /// MicroVMs never have SSH enabled. They run as headless workloads and
-/// communicate via vsock. Use `mvmctl shell` to access the Lima VM environment.
+/// communicate via vsock. Use `mvmctl dev shell` to access the dev VM environment.
 #[instrument(skip_all)]
 pub fn start() -> Result<()> {
     require_linux_env()?;
@@ -379,7 +379,7 @@ pub fn start() -> Result<()> {
         "",
         "Use 'mvmctl status' to check the microVM.",
         "Use 'mvmctl stop' to shut down the microVM.",
-        "Use 'mvmctl shell' to access the Lima VM environment.",
+        "Use 'mvmctl dev shell' to access the dev VM environment.",
     ]);
 
     Ok(())
@@ -510,11 +510,11 @@ pub struct FlakeRunConfig {
     pub name: String,
     /// Network slot for this VM.
     pub slot: VmSlot,
-    /// Absolute path to the kernel image inside the Lima VM.
+    /// Absolute path to the kernel image inside the dev VM.
     pub vmlinux_path: String,
     /// Absolute path to the initial ramdisk (NixOS stage-1), if present.
     pub initrd_path: Option<String>,
-    /// Absolute path to the root filesystem inside the Lima VM.
+    /// Absolute path to the root filesystem inside the dev VM.
     pub rootfs_path: String,
     /// Absolute path to the dm-verity sidecar (Merkle hash tree) inside
     /// the Lima VM. Present when the flake was built with
@@ -1418,7 +1418,7 @@ pub fn create_dev_secrets_drive(abs_dir: &str, secret_files: &[DriveFile]) -> Re
     Ok(path)
 }
 
-/// Probe the directory containing `rootfs_path` (inside the Lima VM)
+/// Probe the directory containing `rootfs_path` (inside the dev VM)
 /// for the dm-verity sidecar files emitted by mkGuest when
 /// `verifiedBoot = true`. Returns `(Some(verity_path), Some(roothash))`
 /// when both files are present and the roothash decodes to a 64-char
@@ -1772,7 +1772,7 @@ pub fn is_pid_alive(pid: u32) -> bool {
     }
 }
 
-/// Scan `VMS_DIR` inside the Lima VM for orphaned entries — run-info.json files
+/// Scan `VMS_DIR` inside the dev VM for orphaned entries — run-info.json files
 /// whose stored Firecracker PID is no longer alive.
 ///
 /// Returns a list of VM names with orphaned state files.

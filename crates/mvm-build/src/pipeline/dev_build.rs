@@ -151,7 +151,7 @@ fn run_gc_if_requested(env: &dyn ShellEnvironment) {
     }
 }
 
-/// Result of a dev build via `nix build` in the Lima VM.
+/// Result of a dev build via `nix build` in the dev VM.
 #[derive(Debug, Clone)]
 pub struct DevBuildResult {
     /// Directory containing artifacts: ~/.mvm/dev/builds/<hash>/
@@ -260,7 +260,7 @@ fn cleanup_builds_in(builds_dir: &std::path::Path, keep: usize) -> Result<DevBui
     })
 }
 
-/// Build a microVM image from a Nix flake directly in the Lima VM.
+/// Build a microVM image from a Nix flake directly in the dev VM.
 ///
 /// Runs `nix build` with visible output, then copies the resulting
 /// kernel and rootfs to a dev build directory keyed by Nix store hash.

@@ -398,7 +398,7 @@ fn platform_description(plat: Platform) -> String {
 }
 
 fn kvm_check(plat: Platform, in_vm: bool) -> Check {
-    // Inside Lima VM or native Linux: check /dev/kvm locally
+    // Inside the dev VM or native Linux: check /dev/kvm locally.
     if in_vm
         || plat == Platform::LinuxNative
         || plat == Platform::LinuxNoKvm
@@ -409,7 +409,7 @@ fn kvm_check(plat: Platform, in_vm: bool) -> Check {
         return match shell::run_host("bash", &["-c", "test -c /dev/kvm && echo ok"]) {
             Ok(out) if out.status.success() => {
                 let context = if in_vm {
-                    "available (inside Lima VM)"
+                    "available (inside dev VM)"
                 } else {
                     "available"
                 };
@@ -425,7 +425,7 @@ fn kvm_check(plat: Platform, in_vm: bool) -> Check {
                 category: "platform",
                 ok: false,
                 info: if in_vm {
-                    "/dev/kvm not accessible inside Lima VM".to_string()
+                    "/dev/kvm not accessible inside dev VM".to_string()
                 } else {
                     "not available. Enable virtualization in BIOS or check permissions on /dev/kvm."
                         .to_string()

@@ -25,8 +25,8 @@ use anyhow::{Context, Result};
 /// instead of pointing the hypervisor at the source directly. The
 /// clone shares blocks with the source until either side writes, so
 /// on APFS / btrfs / xfs the operation is O(1) wall-clock regardless
-/// of rootfs size. On filesystems without reflink support (ext4 in
-/// the default Lima VM, NTFS, etc.) it falls back to a byte copy.
+/// of rootfs size. On filesystems without reflink support (ext4
+/// inside the dev VM, NTFS, etc.) it falls back to a byte copy.
 ///
 /// `src` must exist; `dst` must not. The destination's parent
 /// directory is created if it doesn't already exist.

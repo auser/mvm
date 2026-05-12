@@ -35,8 +35,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
 
 /// Forward a port from a running microVM to localhost.
 ///
-/// On macOS this tunnels through Lima's SSH connection; on native Linux
-/// it spawns a local socat proxy.
+/// On macOS this tunnels through the dev VM's vsock channel; on native
+/// Linux it spawns a local socat proxy.
 ///
 /// Each `port_spec` is either `GUEST_PORT` (binds to same local port) or
 /// `LOCAL_PORT:GUEST_PORT`.  Multiple ports are forwarded concurrently —
@@ -88,7 +88,7 @@ pub(super) fn forward_ports(name: &str, port_specs: &[String]) -> Result<()> {
     ui::info("Press Ctrl-C to stop forwarding.");
 
     // socat proxy: the microVM is directly reachable on the host
-    // bridge. Lima's SSH-tunnel fallback is gone (ADR-013).
+    // bridge. The pre-ADR-013 Lima SSH-tunnel fallback is gone.
     let mut children: Vec<std::process::Child> = Vec::new();
     for &(local_port, guest_port) in &parsed {
         let child = std::process::Command::new("socat")

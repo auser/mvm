@@ -566,17 +566,20 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         }
     }
     // Auto-select backend when no explicit hypervisor is specified.
-    // Priority: KVM (Firecracker direct) → Apple Container → Lima + Firecracker
+    // Priority: native KVM (Firecracker direct) → Apple Container →
+    // Docker fallback → Firecracker (which will fail loudly if no
+    // virtualisation is reachable, surfacing the real problem rather
+    // than silently picking a backend the caller didn't ask for).
     let effective_hypervisor = if hypervisor == "firecracker" {
         let plat = mvm_core::platform::current();
         if plat.has_kvm() {
-            "firecracker" // native KVM — best option
+            "firecracker"
         } else if plat.has_apple_containers() {
-            "apple-container" // macOS 26+ — no Lima
+            "apple-container"
         } else if plat.has_docker() {
-            "docker" // universal fallback
+            "docker"
         } else {
-            "firecracker" // Lima fallback
+            "firecracker"
         }
     } else {
         hypervisor
@@ -588,9 +591,11 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
     // would inherit the same banner via their `security_profile()`.
     emit_security_banner_if_needed(effective_hypervisor);
 
-    // Lima is gone (ADR-013); no upfront VM check needed. The
-    // microsandbox-as-Linux-builder follow-up (W6.x) will reintroduce
-    // a builder-availability gate at this point when it lands.
+    // No upfront VM availability check — the runtime backends
+    // self-validate at `start_with_mode` and surface a structured
+    // error if their hypervisor isn't reachable. (The
+    // microsandbox-as-Linux-builder follow-up — W6.x — may
+    // reintroduce a builder-availability gate at this point.)
     let _metrics_server = if metrics_port > 0 {
         Some(crate::metrics_server::MetricsServer::start(metrics_port)?)
     } else {
@@ -1464,8 +1469,9 @@ mod security_banner_tests {
 // ── Plan 64 W3 admit_plan_for_boot tests ────────────────────────────
 //
 // These tests stay scoped to the helper rather than `cmd_run` itself
-// because the dispatcher (`cmd_run`) calls into Lima/Firecracker
-// backends that need a live host environment. `admit_plan_for_boot`
+// because the dispatcher (`cmd_run`) calls into Firecracker / Apple
+// Container / microsandbox backends that need a live host environment.
+// `admit_plan_for_boot`
 // is the bridge between CLI args and admission, so verifying it
 // in isolation covers the contract the dispatcher depends on without
 // pulling in `AnyBackend::from_hypervisor` startup.

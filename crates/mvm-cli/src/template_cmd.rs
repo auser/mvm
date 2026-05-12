@@ -14,7 +14,7 @@ fn now_iso() -> String {
 ///
 /// `local` is preserved for source compatibility with the CLI args
 /// shape; project-scaffold is always local in plan 38 (the legacy
-/// `--vm` mode that initialised a directory inside the Lima VM is
+/// `--vm` mode that initialised a directory inside the dev VM is
 /// gone with the rest of the `template *` namespace).
 pub fn init(
     name: &str,

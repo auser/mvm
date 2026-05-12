@@ -5,7 +5,7 @@ use mvm_base::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible};
 use mvm_base::ui;
 use mvm_core::config::{ARCH, fc_version, fc_version_short};
 
-/// Check if Firecracker is installed inside the Lima VM.
+/// Check if Firecracker is installed inside the dev VM.
 pub fn is_installed() -> Result<bool> {
     let output = run_in_vm("command -v firecracker >/dev/null 2>&1")?;
     Ok(output.status.success())
@@ -40,7 +40,7 @@ fn jailer_is_installed() -> Result<bool> {
     Ok(output.status.success())
 }
 
-/// Install Firecracker (and jailer) inside the Lima VM.
+/// Install Firecracker (and jailer) inside the dev VM.
 ///
 /// Idempotent: skips if both binaries are already present. If firecracker
 /// is installed but the jailer is missing, downloads the release tarball
@@ -111,7 +111,7 @@ fn install_jailer_from_tarball(version: &str) -> Result<()> {
     Ok(())
 }
 
-/// Download kernel and rootfs into ~/microvm/ inside the Lima VM.
+/// Download kernel and rootfs into ~/microvm/ inside the dev VM.
 ///
 /// Downloads run in parallel when both are needed.
 pub fn download_assets() -> Result<()> {
@@ -265,7 +265,7 @@ pub fn validate_rootfs_squashfs() -> Result<bool> {
     Ok(output.status.success())
 }
 
-/// Check if the Firecracker process is running inside the Lima VM.
+/// Check if the Firecracker process is running inside the dev VM.
 pub fn is_running() -> Result<bool> {
     let output = run_in_vm("pgrep -x firecracker >/dev/null 2>&1")?;
     Ok(output.status.success())

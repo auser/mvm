@@ -481,7 +481,7 @@ mod tests {
     #[test]
     #[cfg(not(target_os = "linux"))]
     fn os_sources_return_empty_on_non_linux() {
-        // Confirms the Lima-dev-host fallback compiles and yields
+        // Confirms the macOS-dev-host fallback compiles and yields
         // `None` rather than panicking. The supervisor will fall
         // through to "no metrics" in that case.
         assert_eq!(read_os_proc_stat(1), Sample::default());

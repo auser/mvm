@@ -358,7 +358,7 @@ exec "$BAKE_EXE" --cpus "$CPUS" --memory "$MEMORY" "${{BAKE_ARGS[@]}}"
 // Build
 // ---------------------------------------------------------------------------
 
-/// Repair /dev/null inside the Lima VM if it has wrong permissions or was
+/// Repair /dev/null inside the dev VM if it has wrong permissions or was
 /// deleted.  This can happen when a previous `mvm build` was Ctrl-C'd while
 /// bind mounts were active, causing `rm -rf` to destroy device nodes through
 /// the mount.
@@ -367,7 +367,7 @@ fn repair_dev_null() -> Result<()> {
     // skip the command if /dev/null itself is broken.
     let check = run_in_vm("test -c /dev/null -a -w /dev/null")?;
     if !check.status.success() {
-        ui::warn("Repairing /dev/null in Lima VM...");
+        ui::warn("Repairing /dev/null in dev VM...");
         run_in_vm(
             "sudo rm -f /dev/null && sudo mknod /dev/null c 1 3 && sudo chmod 666 /dev/null",
         )?;
@@ -404,7 +404,7 @@ fn ensure_base_assets() -> Result<()> {
     Ok(())
 }
 
-/// Ensure squashfs-tools is available in the Lima VM.
+/// Ensure squashfs-tools is available in the dev VM.
 fn ensure_squashfs_tools() -> Result<()> {
     let has_it = run_in_vm("command -v mksquashfs >/dev/null 2>&1")?;
     if !has_it.status.success() {
@@ -414,7 +414,7 @@ fn ensure_squashfs_tools() -> Result<()> {
     Ok(())
 }
 
-/// Ensure the bake binary is available in the Lima VM.
+/// Ensure the bake binary is available in the dev VM.
 fn ensure_bake() -> Result<()> {
     let has_it = run_in_vm(&format!("test -x {dir}/tools/bake", dir = MICROVM_DIR))?;
     if has_it.status.success() {
@@ -639,7 +639,7 @@ echo "[mvm] Phase 2 complete: squashfs created."
 
     // Generate host_init.sh
     let host_init = generate_host_init(&config);
-    // Write it into the Lima VM
+    // Write it into the dev VM
     run_in_vm(&format!(
         r#"cat > $HOME/microvm/images/{name}.host_init.sh << 'HOSTINITEOF'
 {host_init}
@@ -682,7 +682,7 @@ ls -lh "$IMAGES_DIR/{name}.$(uname -m).elf"
         name = name,
     ))?;
 
-    // Get the default path inside the Lima VM
+    // Get the default path inside the dev VM
     let vm_elf_path = run_in_vm_stdout(&format!(
         "echo $HOME/microvm/images/{name}.$(uname -m).elf",
         name = name,
@@ -698,7 +698,7 @@ ls -lh "$IMAGES_DIR/{name}.$(uname -m).elf"
                 out,
             ])
             .status()
-            .context("Failed to copy ELF from Lima VM")?;
+            .context("Failed to copy ELF from dev VM")?;
         if !status.success() {
             anyhow::bail!("Failed to copy ELF to {}", out);
         }
@@ -719,7 +719,7 @@ ls -lh "$IMAGES_DIR/{name}.$(uname -m).elf"
 ///
 /// Used by `mvmctl exec --add-dir host:guest` to share a host directory
 /// into a transient microVM without virtio-fs. The image is created inside
-/// the Linux build environment (Lima VM on macOS, host on Linux) and sized
+/// the Linux build environment (dev VM on macOS, host on Linux) and sized
 /// from the directory's actual contents plus headroom.
 ///
 /// `host_dir` must already be reachable inside the Linux build environment

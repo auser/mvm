@@ -51,7 +51,7 @@ pub fn init() -> Result<()> {
 
     // Self-signed certs for local QUIC.
     certs::generate_self_signed("dev-node")
-        .with_context(|| "Failed to generate dev TLS certificates (Lima VM must be running)")?;
+        .with_context(|| "Failed to generate dev TLS certificates (dev VM must be running)")?;
 
     // Desired state: dev tenant with gateway + worker pools.
     let desired = default_desired_state();

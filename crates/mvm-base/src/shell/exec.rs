@@ -39,7 +39,9 @@ pub fn run_host_visible(cmd: &str, args: &[&str]) -> Result<()> {
 /// Run a bash script in the Linux environment, capturing output.
 ///
 /// On native Linux with KVM: runs `bash -c` directly on the host.
-/// On macOS or Linux without KVM: runs via `limactl shell` inside a Lima VM.
+/// On macOS 26+ Apple Silicon: routes through the Apple Container dev VM
+/// via the guest-agent vsock channel ([`AppleContainerEnv`]). Other
+/// platforms route through the platform-appropriate [`LinuxEnv`].
 ///
 /// When `vm_name` matches the default VM name, this delegates to the
 /// [`LinuxEnv`](mvm_core::linux_env::LinuxEnv) abstraction. For custom

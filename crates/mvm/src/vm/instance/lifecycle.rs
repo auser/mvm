@@ -669,8 +669,11 @@ pub fn instance_ssh(tenant_id: &str, pool_id: &str, instance_id: &str) -> Result
     let ssh_key = tenant_ssh_key_path(tenant_id);
     let guest_ip = &state.net.guest_ip;
 
-    // Use process replacement for clean TTY pass-through
-    // The SSH command runs inside the Lima VM
+    // Use process replacement for clean TTY pass-through.
+    // The SSH command runs inside the dev VM. (NOTE: still
+    // invokes `limactl shell` below — pre-ADR-013 code that hasn't
+    // been refactored to route through the Apple Container exec
+    // channel yet. Tracked separately.)
     shell::replace_process(
         "limactl",
         &[

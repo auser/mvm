@@ -175,7 +175,7 @@ pub(crate) fn sync_local_flake_if_needed(
         return None; // remote ref, nothing to do
     }
 
-    // Canonicalize inside the Lima/host environment.
+    // Canonicalize inside the dev VM (macOS) / host (Linux).
     let realpath = env
         .shell_exec_stdout(&format!("realpath {} 2>/dev/null", flake_ref))
         .ok()?;

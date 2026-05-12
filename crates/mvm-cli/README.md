@@ -7,7 +7,7 @@ Clap-based CLI commands, bootstrap workflow, diagnostics, update mechanism, and 
 | Module | Purpose |
 |--------|---------|
 | `commands` | Main CLI entry point (`run()`), all command definitions and handlers |
-| `bootstrap` | Full environment setup (Homebrew/apt, Lima, Nix, Firecracker) |
+| `bootstrap` | Full environment setup (Homebrew/apt, dev VM, Nix, Firecracker) |
 | `doctor` | System diagnostics and dependency checks (`mvmctl doctor`) |
 | `update` | Self-update from GitHub releases |
 | `template_cmd` | Template CRUD commands (create, list, build, delete, push, pull) |
@@ -21,15 +21,15 @@ Clap-based CLI commands, bootstrap workflow, diagnostics, update mechanism, and 
 | Command | Description |
 |---------|-------------|
 | `mvmctl bootstrap` | Full setup from scratch |
-| `mvmctl setup` | Create Lima VM, install Firecracker |
-| `mvmctl dev` | Launch Lima dev environment (auto-bootstraps) |
+| `mvmctl setup` | Create dev VM, install Firecracker |
+| `mvmctl dev` | Launch the dev microVM environment (auto-bootstraps) |
 | `mvmctl start [image]` | Start headless Firecracker microVM |
 | `mvmctl stop [name]` | Stop a running microVM |
-| `mvmctl shell` | Open a shell in the Lima VM |
-| `mvmctl sync` | Build mvmctl from source inside Lima and install |
+| `mvmctl dev shell` | Open a shell in the dev VM |
+| `mvmctl sync` | Build mvmctl from source inside the dev VM and install |
 | `mvmctl build --flake .` | Build microVM image from Nix flake |
 | `mvmctl run --flake .` | Build + start microVM |
-| `mvmctl status` | Show Lima and microVM status |
+| `mvmctl status` | Show dev VM and microVM status |
 | `mvmctl logs <name>` | Show microVM console or hypervisor logs |
 | `mvmctl doctor [--json]` | System diagnostics |
 | `mvmctl update` | Check for and install latest version |

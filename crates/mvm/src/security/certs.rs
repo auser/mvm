@@ -7,7 +7,7 @@ use tracing::warn;
 
 use crate::shell;
 
-/// Certificate directory inside the Lima VM.
+/// Certificate directory inside the dev VM.
 const CERT_DIR: &str = "/var/lib/mvm/certs";
 
 /// Certificate file paths.
@@ -114,7 +114,7 @@ pub fn generate_self_signed(node_id: &str) -> Result<CertPaths> {
     node_params.distinguished_name = node_dn;
     let node_cert = node_params.signed_by(&node_key, &ca_cert, &ca_key)?;
 
-    // Write PEM files to the Lima VM
+    // Write PEM files to the dev VM
     let ca_pem = ca_cert.pem();
     let node_cert_pem = node_cert.pem();
     let node_key_pem = node_key.serialize_pem();

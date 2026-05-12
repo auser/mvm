@@ -43,7 +43,7 @@ pub(in crate::commands) struct Cli {
 pub(in crate::commands) enum Commands {
     /// Full environment setup from scratch
     Bootstrap(env::bootstrap::Args),
-    /// Manage the Lima development environment (up, down, shell, status)
+    /// Manage the dev microVM environment (up, down, shell, status)
     Dev(env::dev::Args),
     /// Remove old dev-build artifacts and run Nix garbage collection
     Cleanup(env::cleanup::Args),
@@ -77,7 +77,7 @@ pub(in crate::commands) enum Commands {
     Metrics(ops::metrics::Args),
     /// Read or write global operator config (~/.mvm/config.toml)
     Config(ops::config::Args),
-    /// Remove Lima VM, Firecracker binary, and all mvm state (clean uninstall)
+    /// Remove the dev VM, Firecracker binary, and all mvm state (clean uninstall)
     Uninstall(env::uninstall::Args),
     /// View the local audit log (~/.mvm/log/audit.jsonl)
     Audit(ops::audit::Args),

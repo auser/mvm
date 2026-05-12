@@ -536,7 +536,7 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
     // Probe for the verity sidecar alongside the rootfs. ADR-002 §W3.2:
     // production microVMs ship `rootfs.verity` + `rootfs.roothash` next
     // to `rootfs.ext4`. Their absence is the dev-VM exemption from §W3.4.
-    // Files live inside the Lima VM, so we can't `Path::exists()` them
+    // Files live inside the dev VM, so we can't `Path::exists()` them
     // from the host — shell out into the VM instead.
     let (verity_path, roothash) = mvm_backend::microvm::probe_verity_sidecar(&rootfs);
 

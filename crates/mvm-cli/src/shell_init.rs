@@ -126,9 +126,9 @@ pub fn print_shell_init() -> Result<()> {
     Ok(())
 }
 
-/// Ensure the shell init block is present in the Lima VM's ~/.bashrc.
+/// Ensure the shell init block is present in the dev VM's ~/.bashrc.
 ///
-/// Lima VMs have a separate home directory from the host, so the host's
+/// The dev VM has a separate home directory from the host, so the host's
 /// shell config modifications are not visible inside the VM. This function
 /// runs inside the VM to patch the VM's own ~/.bashrc.
 pub fn ensure_shell_init_in_vm() -> Result<()> {

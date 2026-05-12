@@ -8,7 +8,7 @@ use mvm_base::ui;
 // Legacy dev-mode TAP networking (single VM, used by `mvm start/stop`)
 // ============================================================================
 
-/// Set up TAP networking, IP forwarding, and NAT inside the Lima VM.
+/// Set up TAP networking, IP forwarding, and NAT inside the dev VM.
 pub fn setup() -> Result<()> {
     ui::info("Setting up network...");
     run_in_vm_visible(&format!(
