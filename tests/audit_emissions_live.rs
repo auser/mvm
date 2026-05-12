@@ -39,6 +39,14 @@
 //!   degrade to warnings when the dev VM isn't reachable, but
 //!   Step 2 — the build-cache prune — runs on host fs and the
 //!   audit emit always fires)
+//! - `mvmctl up --hypervisor mock --detach --no-supervisor` (with
+//!   `MVM_DIRECT_BOOT=1` + stub kernel/rootfs files) → `VmStart`
+//!   (end-to-end exercise of the launchd-spawned direct-boot path
+//!   against the in-memory `MockBackend`. The mock makes the
+//!   backend dispatch hermetic; `MVM_DIRECT_BOOT` skips the
+//!   build + template lookup. Together they let `mvmctl up` run
+//!   to completion on a CI runner with no KVM / Nix / Apple
+//!   Container / Docker / microsandbox)
 //! - `mvmctl down` (no args, empty sandbox) → `VmStop`
 //!   (`stop_all` is tolerant of an empty VM registry and emits
 //!   with `detail=stop_all_ok`)
@@ -741,6 +749,65 @@ fn cleanup_emits_slot_prune_audit_entry_even_with_no_builds() {
         log.contains("source=cleanup"),
         "slot_prune detail must carry source=cleanup to disambiguate \
          from manifest-prune emits. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn up_with_mock_backend_emits_vm_start_audit_entry() {
+    // End-to-end test of `mvmctl up` against the in-memory
+    // `MockBackend`. Pre-PR-#108 this row needed a real Firecracker
+    // / Apple Container / Docker / microsandbox to exercise — none
+    // of which are hermetic on a CI runner. The MockBackend
+    // substrate (PR #108) and the `MVM_DIRECT_BOOT` direct-boot
+    // path together close that gap:
+    //   * `MVM_DIRECT_BOOT=1` + stub artifact env vars skip the
+    //     build + template-lookup pre-flight that needs real Nix.
+    //   * `--hypervisor mock` routes the backend dispatch to the
+    //     in-memory `MockBackend`.
+    //   * `--detach` short-circuits the Ctrl+C loop so the
+    //     subprocess exits cleanly.
+    //   * `--no-supervisor` skips plan-64 admission (which needs
+    //     the host signer key + audit dir) — the test pins
+    //     `vm_start` LocalAudit, which fires regardless.
+    let sandbox = AuditSandbox::new();
+    let stub_dir = sandbox.home_path().join("stub");
+    std::fs::create_dir_all(&stub_dir).expect("mkdir stub");
+    let kernel = stub_dir.join("vmlinux");
+    let rootfs = stub_dir.join("rootfs.ext4");
+    std::fs::write(&kernel, b"fake-kernel").expect("write stub kernel");
+    std::fs::write(&rootfs, b"fake-rootfs").expect("write stub rootfs");
+
+    let output = sandbox
+        .mvmctl()
+        .env("MVM_DIRECT_BOOT", "1")
+        .env("MVM_KERNEL_PATH", &kernel)
+        .env("MVM_ROOTFS_PATH", &rootfs)
+        .args([
+            "up",
+            "--hypervisor",
+            "mock",
+            "--name",
+            "test-up-vm",
+            "--no-supervisor",
+            "--detach",
+        ])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl up failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_start");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_start entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("\"vm_name\":\"test-up-vm\""),
+        "vm_start must carry vm_name=test-up-vm. Full log:\n{log}"
     );
 }
 
