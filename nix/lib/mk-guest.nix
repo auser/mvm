@@ -414,8 +414,11 @@ let
   # Package the tree as an ext4 image. nixpkgs ships a make-ext4-fs
   # derivation that handles the mkfs + populate dance correctly.
   # All arguments arrive in a single set via callPackage's auto-arg
-  # injection.
-  rootfsImage = pkgs.callPackage <nixpkgs/nixos/lib/make-ext4-fs.nix> {
+  # injection. Reference make-ext4-fs.nix via the flake input
+  # (`${nixpkgs}/...`) rather than the angle-bracket form (`<nixpkgs/...>`)
+  # — the latter trips flake pure evaluation ("cannot look up
+  # '<nixpkgs/...>' in pure evaluation mode").
+  rootfsImage = pkgs.callPackage "${nixpkgs}/nixos/lib/make-ext4-fs.nix" {
     storePaths = [ rootfsTree ];
     volumeLabel = "mvm-${name}";
     populateImageCommands = ''
