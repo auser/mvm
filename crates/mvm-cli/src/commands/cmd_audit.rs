@@ -173,6 +173,8 @@ impl Commands {
             Commands::Secret(_) => "secret",
             Commands::Attest(_) => "attest",
             Commands::Policy(_) => "policy",
+            Commands::Bundle(_) => "bundle",
+            Commands::Trust(_) => "trust",
         }
     }
 }

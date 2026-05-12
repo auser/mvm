@@ -1,4 +1,5 @@
 mod build;
+mod bundle;
 mod catalog;
 mod cmd_audit;
 mod env;
@@ -6,6 +7,7 @@ mod manifest;
 mod ops;
 mod shared;
 mod storage;
+mod trust;
 mod vm;
 
 #[cfg(test)]
@@ -177,6 +179,16 @@ pub(in crate::commands) enum Commands {
     /// `mvmctl policy update` is stubbed in v0 — production updates
     /// require an mvmd-signed plan (Phase 8). Plan 60 Phase 3 Slice D.
     Policy(ops::policy::Args),
+    /// Seal a built template into a portable, signed `.mvmpkg`
+    /// archive — or verify one against the local trust store.
+    /// Sprint 52 W2 close-out. Bundles are content-addressed and
+    /// signed by the host signer; consumers verify via
+    /// `mvmctl trust`-managed publisher pubkeys.
+    Bundle(bundle::Args),
+    /// Manage the bundle-publisher trust store at
+    /// `~/.mvm/trusted-publishers/`. `mvmctl bundle fetch` looks
+    /// pubkeys up via this store before verifying signatures.
+    Trust(trust::Args),
 }
 
 // ============================================================================
@@ -304,6 +316,8 @@ pub fn run() -> Result<()> {
         Commands::Secret(a) => ops::secret::run(&cli, a, &cfg),
         Commands::Attest(a) => ops::attest::run(&cli, a, &cfg),
         Commands::Policy(a) => ops::policy::run(&cli, a, &cfg),
+        Commands::Bundle(a) => bundle::run(&cli, a, &cfg),
+        Commands::Trust(a) => trust::run(&cli, a, &cfg),
     };
 
     cmd_audit::emit_cmd_outcome(cmd_recorder.as_ref(), verb, &result);
