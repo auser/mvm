@@ -239,6 +239,7 @@ fn resolve_policy_for_admission(
                 Some(ResolveError::L4SpecInvalid { .. }) => "policy-l4-spec-invalid",
                 Some(ResolveError::EgressPolicyInvalid { .. }) => "policy-egress-invalid",
                 Some(ResolveError::PiiPolicyInvalid { .. }) => "policy-pii-invalid",
+                Some(ResolveError::AuditPolicyInvalid { .. }) => "policy-audit-invalid",
                 None => "policy-resolve",
             };
             // Best-effort audit; resolver-failure is the fatal path,
