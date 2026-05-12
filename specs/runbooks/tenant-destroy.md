@@ -58,40 +58,108 @@ The auditor has three pieces of evidence:
 
 1. The signed-certificate JSON (`certs.json`).
 2. The operator's host identity pubkey (`operator-pubkey.b64`).
-3. The chain-signed `cmd.tenant.*` audit entries in the
-   operator's `~/.mvm/audit/local.jsonl` (optional but
-   recommended — provides an anchor that's hard to forge
-   retroactively).
+3. The operator's audit chain (`~/.mvm/audit/local.jsonl`).
 
-### Verifying with the supplied pubkey
+Each piece feeds an independent verification axis. An attacker
+forging a destruction certificate has to defeat **all three**:
 
-The simplest path is the CLI verb — same `mvmctl` binary the
-operator runs, but `audit verify-cert` is read-only + makes no
-network calls so an auditor can run it on a freshly installed
-host without touching state:
+| Axis | What it checks | What it catches |
+|------|----------------|-----------------|
+| Signature | Ed25519 over canonical payload | Receipt-field tampering |
+| Pubkey pin | Embedded `signer_pubkey` matches operator's known key | Forgery under attacker key |
+| Chain anchor | SHA-256 fingerprint in `lifecycle.tenant.destroyed` event | Forging without chain anchor; cert swap post-emission |
+
+### One-command three-axis verification
+
+The strongest check is the single CLI invocation that exercises
+all three axes:
 
 ```bash
-# Verify against the operator's claimed pubkey
-$ mvmctl audit verify-cert certs.json --pubkey operator-pubkey.b64
+$ mvmctl audit verify-cert certs.json \
+      --pubkey operator-pubkey.b64 \
+      --chain operator-audit-chain.jsonl
 mvmctl audit verify-cert: 3 certificate(s) verified
-  ✓ acme/build-runner: 42 file(s), 1048576 byte(s) wiped at 2026-05-11T18:00:00Z
-  ✓ acme/code-eval: 8 file(s), 524288 byte(s) wiped at 2026-05-11T18:00:01Z
-  ✓ acme/test-runner: 17 file(s), 65536 byte(s) wiped at 2026-05-11T18:00:02Z
-
-# Or pipe it in
-$ cat certs.json | mvmctl audit verify-cert - --pubkey operator-pubkey.b64
-
-# Or get JSON back (verified receipts, no signatures)
-$ mvmctl audit verify-cert certs.json --pubkey operator-pubkey.b64 --json
+  ✓ acme/build-runner: 42 file(s), 1048576 byte(s) wiped at 2026-05-11T18:00:00Z [chain ✓]
+  ✓ acme/code-eval: 8 file(s), 524288 byte(s) wiped at 2026-05-11T18:00:01Z [chain ✓]
+  ✓ acme/test-runner: 17 file(s), 65536 byte(s) wiped at 2026-05-11T18:00:02Z [chain ✓]
 ```
 
-The command exits non-zero on any failure: `SignatureInvalid`
-(tenant rename, files_wiped padding, timestamp shift, anything
-that touches the receipt fields after signing), `PubkeyMismatch`
-(certificate's embedded `signer_pubkey` doesn't match the
-`--pubkey` file), `UnsupportedVersion` (future v2+ certificate
-the auditor's verifier hasn't been updated to parse), or a
-parse error on the cert / pubkey file.
+Per-cert markers tell the auditor which axis fired:
+
+- `[chain ✓]` — fingerprint matches an audit-chain entry
+- `[chain ✗ MISSING ENTRY]` — cert claims a destruction the
+  chain doesn't witness; suspect forged cert
+- `[chain ✗ FINGERPRINT MISMATCH]` — chain has an entry for
+  this tenant/workload but the fingerprint differs; operator
+  swapped a cert after the chain was written
+
+The command exits non-zero if any chain check fails (Missing
+or Mismatched). Skipping the `--chain` axis (just omit the
+flag) exits zero — useful when the auditor doesn't have access
+to the operator's chain file.
+
+### Other failure modes the command surfaces
+
+- **SignatureInvalid** — any receipt field tampered after
+  signing (tenant rename, `files_wiped` padding, timestamp
+  shift). Exit non-zero.
+- **PubkeyMismatch** — cert's embedded `signer_pubkey` doesn't
+  match `--pubkey`. Exit non-zero.
+- **UnsupportedVersion** — future v2+ certificate the
+  auditor's verifier hasn't been updated to parse. Exit
+  non-zero.
+- Parse error on the cert or pubkey file — exit non-zero with
+  context.
+
+### Reading the chain manually
+
+If the auditor wants to inspect the chain entries directly
+(e.g., to investigate a `[chain ✗ MISSING ENTRY]` result),
+`mvmctl audit tail --chain` walks the chain file:
+
+```bash
+$ mvmctl audit tail --chain --tenant local | \
+    jq 'select(.entry.event == "lifecycle.tenant.destroyed")'
+{
+  "entry": {
+    "event": "lifecycle.tenant.destroyed",
+    "labels": {
+      "tenant": "acme",
+      "workload": "build-runner",
+      "files_wiped": "42",
+      "bytes_wiped": "1048576",
+      "cert_fingerprint": "8a3f2c91..."
+    },
+    ...
+  },
+  ...
+}
+```
+
+Recomputing the fingerprint from the cert file confirms a
+match:
+
+```bash
+$ jq -c '.[0]' certs.json | shasum -a 256
+8a3f2c91... -
+```
+
+The `mvmctl audit verify-cert --chain` flow does this
+comparison automatically; the manual path is for diagnostics.
+
+### Pipe + stdin
+
+The cert source supports `-` so an auditor can pipe:
+
+```bash
+$ cat certs.json | mvmctl audit verify-cert - \
+      --pubkey operator-pubkey.b64 \
+      --chain operator-audit-chain.jsonl
+```
+
+JSON output (`--json`) emits `{ "receipts": [...],
+"chain_matches": ["matched", ...] }` aligned by index for
+programmatic consumers.
 
 If the auditor prefers Rust (e.g., embedding the check into
 their own audit pipeline), the same `mvm::vm::overlay` module
@@ -126,30 +194,37 @@ for cert in &certs {
 Both paths produce the same verdict — the CLI is a thin wrapper
 over the same `verify_destruction_receipt` function.
 
-### Cross-referencing the audit chain
+### Two additional cross-reference signals
 
-The audit chain entry the operator emitted at the time of the
-destroy gives a second anchor:
+The audit chain carries two more event types the auditor can
+consult independently of the per-workload
+`lifecycle.tenant.destroyed` events that `--chain` matches
+against:
 
 ```bash
-$ mvmctl audit show --tenant local | jq 'select(.event | startswith("cmd.tenant"))'
+$ mvmctl audit tail --chain --tenant local | \
+    jq 'select(.entry.event | startswith("cmd.tenant"))'
 {
-  "event": "cmd.tenant.invoked",
-  "timestamp": "2026-05-11T18:00:00Z",
-  ...
+  "entry": { "event": "cmd.tenant.invoked", ...,
+             "labels": { "verb": "tenant", "pid": "12345" } }
 }
 {
-  "event": "cmd.tenant.completed",
-  "timestamp": "2026-05-11T18:00:01Z",
-  ...
+  "entry": { "event": "cmd.tenant.completed", ...,
+             "labels": { "verb": "tenant" } }
 }
 ```
 
-Both entries are chain-signed; `mvmctl audit verify` walks the
-full chain and exits nonzero on any tamper. Cross-referencing
-`cmd.tenant.completed`'s timestamp against the certificate's
-`destroyed_at` gives the auditor a check independent of the
-certificate's own signature.
+These are the `cmd.*` audit envelope from plan 60 Phase 4 —
+every `mvmctl <verb>` invocation produces one `invoked` + one
+`completed`/`failed` event. The auditor checks:
+
+- That the `cmd.tenant.completed` timestamp brackets the per-
+  workload `lifecycle.tenant.destroyed` timestamps.
+- That `mvmctl audit verify --tenant local` succeeds — confirms
+  the chain hasn't been tampered after the fact.
+
+`mvmctl audit verify` walks the full chain and exits non-zero
+on any signature or chain-link failure.
 
 ## What the certificate proves
 
