@@ -290,20 +290,40 @@ impl BuilderVm for StubBuilderVm {
 const BUILDER_DEFAULT_CPUS: u8 = 4;
 
 /// In-sandbox tmpfs size for the scratch nix store, in MiB. Sized for
-/// the worst realistic case: cross-compiling `mvm-guest-agent` for
-/// aarch64-linux pulls a Rust toolchain (~3 GiB), the nixpkgs stdenv
-/// (~700 MiB), plus the workload-specific closure. 8 GiB leaves
-/// headroom for parallel derivation downloads without OOMing the
-/// guest. Backed by guest RAM, so [`BUILDER_DEFAULT_MEMORY_MIB`] has
-/// to be at least this big plus what the actual build processes
-/// allocate (rustc peaks ~2 GiB per crate).
-const BUILDER_SCRATCH_STORE_MIB: u32 = 12288;
+/// the worst realistic case: building the Linux kernel from source
+/// (the dev-image flake overrides the kernel config to compile vsock
+/// in, which busts the binary cache and forces a from-source rebuild).
+/// A full aarch64 kernel build produces ~25-30 GiB of intermediate
+/// object files across all modules; 48 GiB leaves headroom alongside
+/// the Rust toolchain (~3 GiB), nixpkgs stdenv (~700 MiB), and the
+/// workload closure. Backed by guest RAM, so
+/// [`BUILDER_DEFAULT_MEMORY_MIB`] has to be at least this big plus
+/// what the actual build processes allocate.
+const BUILDER_SCRATCH_STORE_MIB: u32 = 49152;
 
-/// Default memory for the builder sandbox, in MiB. Nix derivations
-/// for guest rootfs builds peak well under 4 GiB; 4096 MiB leaves
-/// headroom for the dev tooling closure plus jobserver fan-out.
+/// Default memory for the builder sandbox, in MiB. Has to fit
+/// [`BUILDER_SCRATCH_STORE_MIB`] (the tmpfs lives in guest RAM) plus
+/// what the heaviest derivation needs in process memory — the kernel
+/// link step + parallel `gcc` invocations peak around 6-8 GiB.
 #[cfg(feature = "backends-microsandbox")]
-const BUILDER_DEFAULT_MEMORY_MIB: u32 = 16384;
+const BUILDER_DEFAULT_MEMORY_MIB: u32 = 57344;
+
+/// Canonical host directory for the persistent builder /nix/store
+/// cache. Shared by `cargo xtask build-dev-image` and `mvmctl dev up`'s
+/// microsandbox build path so they hit the same closure cache — first
+/// build of a flake change is slow, every subsequent build is cheap.
+///
+/// **Trust boundary.** This dir is mvm-owned (created mode 0700,
+/// never the host's actual `/nix/store`). Nix store paths are
+/// content-addressed by input hash, so a poisoned entry would have a
+/// different path and could not satisfy a future build's input.
+/// `nix-store --verify --check-contents` re-checks NAR hashes on
+/// builder startup when the dirty-marker indicates a crashed run
+/// (`run_build_async`'s integrity-check block).
+#[cfg(feature = "backends-microsandbox")]
+pub fn builder_store_dir() -> std::path::PathBuf {
+    std::path::PathBuf::from(mvm_core::config::mvm_cache_dir()).join("builder-store")
+}
 
 /// Where in the sandbox the user's flake gets bind-mounted.
 /// ADR-013 step 3.
@@ -533,26 +553,69 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
             m.bind(flake_src.as_path()).readonly()
         })
         .volume(BUILDER_GUEST_OUT_DIR, |m| m.bind(artifact_out.as_path()));
-    // Scratch nix store as a tmpfs inside the sandbox. Three reasons
-    // this beats bind-mounting a host path:
+
+    // Scratch nix store backing the chroot store at `/scratch-nix`:
     //
-    //   - tmpfs lives in the guest kernel — xattr ops (which nix uses
-    //     to mark chroot stores) work natively. Bind-mounts from
-    //     macOS APFS through libkrun's filesystem proxy fail with
-    //     "querying extended attributes … Input/output error" on the
-    //     very first store-path write.
-    //   - The sandbox's default writable overlay is small (a few GiB
-    //     at most); the Rust toolchain alone exhausts it. tmpfs lets
-    //     us name our own size up to whatever the guest RAM
-    //     supports.
-    //   - No host side-effects: the scratch dies with the sandbox.
-    //     `host_nix_store` exists for Linux-native shared-store
-    //     reuse and is unused here — that path is documented in
-    //     `BuilderMounts` but isn't exercised by the macOS bootstrap.
-    let _ = host_nix_store;
-    builder = builder.volume(BUILDER_GUEST_SCRATCH_STORE, |m| {
-        m.tmpfs().size(BUILDER_SCRATCH_STORE_MIB)
-    });
+    //   - **`Some(host_dir)`**: bind-mount the host dir. The realised
+    //     closure persists across builds — a custom-kernel rebuild
+    //     (~25 min cold on aarch64/4-vCPU) amortises to a ~30 s warm
+    //     hit on the next run. Trust boundary: this dir is mvm-owned
+    //     (mode 0700, never the host's actual `/nix/store`); nix's
+    //     content-addressed store paths give us cache integrity by
+    //     construction, and the in-script `nix-store --verify` below
+    //     re-checks NAR hashes after a crashed run.
+    //   - **`None`**: in-guest tmpfs sized to `BUILDER_SCRATCH_STORE_MIB`.
+    //     Always correct; the cache dies with the sandbox.
+    //
+    // **macOS xattr caveat — default to tmpfs.** Bind-mounts from APFS
+    // through libkrun's virtio-fs proxy strip `setxattr` ops, which nix
+    // uses to mark chroot-store paths; `nix build` fails on the very
+    // first store-path write with "querying extended attributes …
+    // Input/output error". On macOS we therefore force-fallback to
+    // tmpfs by default — correct, slower (no warm cache), and matches
+    // what shipped before the bind-mount wiring existed.
+    //
+    // Env-var overrides (both honored on every platform):
+    //   - `MVM_BUILDER_FORCE_TMPFS=1` — always tmpfs, even on Linux.
+    //     The escape hatch when `host_nix_store` is in a bad state.
+    //   - `MVM_BUILDER_USE_HOST_STORE=1` — opt back into the bind-mount
+    //     on macOS for testing the block-device follow-up. Without it,
+    //     macOS hosts never exercise the bind-mount path today.
+    let force_tmpfs_env = std::env::var("MVM_BUILDER_FORCE_TMPFS").as_deref() == Ok("1");
+    let use_host_store_opt_in = std::env::var("MVM_BUILDER_USE_HOST_STORE").as_deref() == Ok("1");
+    let macos_default_tmpfs = cfg!(target_os = "macos") && !use_host_store_opt_in;
+    let force_tmpfs = force_tmpfs_env || macos_default_tmpfs;
+    if macos_default_tmpfs && host_nix_store.is_some() && !force_tmpfs_env {
+        tracing::info!(
+            "macOS host detected; persistent builder /nix-store cache is disabled \
+             (libkrun virtio-fs strips setxattr). Set MVM_BUILDER_USE_HOST_STORE=1 \
+             to opt into the bind-mount once the block-device workaround lands."
+        );
+    }
+    let effective_store = if force_tmpfs { None } else { host_nix_store };
+    let using_host_store = effective_store.is_some();
+    builder = if let Some(store) = effective_store.as_ref() {
+        std::fs::create_dir_all(store).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating host builder-store cache at {}: {e}",
+                store.display()
+            ))
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            // ADR-002 W1.5: mvm-owned cache dirs are mode 0700.
+            let _ = std::fs::set_permissions(store, std::fs::Permissions::from_mode(0o700));
+        }
+        let host_dir = store.clone();
+        builder.volume(BUILDER_GUEST_SCRATCH_STORE, move |m| {
+            m.bind(host_dir.as_path())
+        })
+    } else {
+        builder.volume(BUILDER_GUEST_SCRATCH_STORE, |m| {
+            m.tmpfs().size(BUILDER_SCRATCH_STORE_MIB)
+        })
+    };
 
     let sandbox = builder
         .create_detached()
@@ -579,6 +642,51 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
     // overlay is too small for non-trivial closures (Rust toolchain
     // ~3 GiB on its own).
     let store_flag = format!(" --store {}", BUILDER_GUEST_SCRATCH_STORE);
+
+    // Opportunistic cache-integrity protocol. When the scratch store
+    // is a bind-mounted host dir, surviving state from a crashed
+    // previous run is possible — so we use a "dirty marker" pattern:
+    //
+    //   1. On entry, if `.mvm-builder-dirty` is present, the previous
+    //      run did not exit cleanly. Re-NAR-hash every path via
+    //      `nix-store --verify --check-contents`; on mismatch, wipe
+    //      the cache and start fresh.
+    //   2. Drop a fresh marker before kicking off `nix build`.
+    //   3. Remove the marker on clean exit (the last line of the
+    //      happy path). `set -euo pipefail` propagates any nix-build
+    //      failure, so the marker stays put on crash and the next
+    //      run re-verifies.
+    //
+    // Tmpfs runs skip the dance — there's nothing to recover, and
+    // verify against an empty store is just noise.
+    let integrity_check = if using_host_store {
+        format!(
+            r#"if [ -f {scratch}/.mvm-builder-dirty ]; then
+  echo "MVM_BUILDER: previous build did not exit cleanly; verifying cache..." >&2
+  if nix-store --verify --check-contents --store {scratch}; then
+    echo "MVM_BUILDER: cache integrity verified." >&2
+    rm -f {scratch}/.mvm-builder-dirty
+  else
+    echo "MVM_BUILDER: cache verify failed; wiping {scratch} and rebuilding cold." >&2
+    find {scratch} -mindepth 1 -maxdepth 1 -exec rm -rf {{}} +
+  fi
+fi
+touch {scratch}/.mvm-builder-dirty
+"#,
+            scratch = BUILDER_GUEST_SCRATCH_STORE,
+        )
+    } else {
+        String::new()
+    };
+    let cleanup_marker = if using_host_store {
+        format!(
+            "rm -f {scratch}/.mvm-builder-dirty\n",
+            scratch = BUILDER_GUEST_SCRATCH_STORE,
+        )
+    } else {
+        String::new()
+    };
+
     let build_script = format!(
         r#"set -euo pipefail
 cd {work}
@@ -598,15 +706,34 @@ git config --global --add safe.directory '*'
 # scratch lives; pointing it at /scratch-nix/build co-locates the
 # build scratch with the store scratch on the same tmpfs.
 mkdir -p {scratch}/build
-export NIX_CONFIG="experimental-features = nix-command flakes
+{integrity_check}export NIX_CONFIG="experimental-features = nix-command flakes
 build-dir = {scratch}/build"
-nix build {flake_ref}#{attr_path}{store_flag} --no-link --print-out-paths --no-write-lock-file --impure
-"#,
+# Tee stderr so we can pattern-match the xattr failure mode and
+# surface the tmpfs escape hatch when bind-mount + APFS + libkrun
+# trips it. PIPESTATUS preserves nix's exit code through the tee.
+set +e
+nix build {flake_ref}#{attr_path}{store_flag} --no-link --print-out-paths --no-write-lock-file --impure 2> >(tee /tmp/mvm-nix-build.stderr >&2)
+rc=$?
+set -e
+if [ $rc -ne 0 ]; then
+  if grep -qiE 'xattr|extended attribute|input/output error' /tmp/mvm-nix-build.stderr 2>/dev/null; then
+    echo "" >&2
+    echo "MVM_BUILDER: nix build failed with xattr/EIO signature. The bind-mounted" >&2
+    echo "MVM_BUILDER: {scratch} may not support extended attributes (known issue on" >&2
+    echo "MVM_BUILDER: macOS APFS through libkrun's virtio-fs). Re-run with" >&2
+    echo "MVM_BUILDER:   MVM_BUILDER_FORCE_TMPFS=1 cargo run -p xtask -- build-dev-image" >&2
+    echo "MVM_BUILDER: to fall back to an in-guest tmpfs scratch store." >&2
+  fi
+  exit $rc
+fi
+{cleanup_marker}"#,
         work = shell_quote_arg(BUILDER_GUEST_WORK_DIR),
         flake_ref = flake_ref,
         attr_path = attr_path,
         store_flag = store_flag,
         scratch = BUILDER_GUEST_SCRATCH_STORE,
+        integrity_check = integrity_check,
+        cleanup_marker = cleanup_marker,
     );
 
     let build_out = sandbox

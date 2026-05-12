@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 
 use mvm_build::builder_vm::{
     BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, BuilderVm, MicrosandboxBuilderVm,
+    builder_store_dir,
 };
 
 /// Parse `cargo xtask build-dev-image [--arch <arch>]` and dispatch.
@@ -167,28 +168,13 @@ fn build_and_install(workspace: &Path, arch: &str) -> Result<()> {
         flake_ref: format!("git+file://{BUILDER_GUEST_WORK_DIR}?dir=nix/images/builder"),
         attr_path: format!("packages.{arch}-linux.default"),
     };
-    // Persistent scratch /nix store on the host. The microsandbox
-    // sandbox's writable layer is small (a few GiB at most); building
-    // the Rust toolchain closure for cross-compiling
-    // `mvm-guest-agent` blows past that with "No space left on
-    // device". Bind-mounting a host directory at `/nix` inside the
-    // sandbox redirects the closure to host disk where there's
-    // typically hundreds of GiB free.
-    //
-    // We deliberately do *not* reuse the host's actual `/nix` (it's
-    // root-owned + Darwin-targeted on macOS; reasoning matches
-    // `apple_container.rs::build_image_via_microsandbox`). Instead a
-    // dedicated scratch root under `~/.cache/mvm/xtask-builder-store/`
-    // is persistent across xtask invocations — nix reuses already-
-    // realised closures so re-runs are fast.
-    let scratch_store =
-        std::path::PathBuf::from(mvm_core::config::mvm_cache_dir()).join("xtask-builder-store");
-    std::fs::create_dir_all(&scratch_store).with_context(|| {
-        format!(
-            "creating xtask scratch nix store at {}",
-            scratch_store.display()
-        )
-    })?;
+    // Persistent scratch /nix store on the host, shared with
+    // `mvmctl dev up`'s local-build path via `builder_store_dir()`.
+    // Bind-mounted at `/scratch-nix` inside the sandbox; nix uses it
+    // as `--store /scratch-nix` so realised closures (custom kernel,
+    // rust toolchain, etc.) persist across builds. First build is
+    // cold (~25 min); subsequent builds are warm (~30 s).
+    let scratch_store = builder_store_dir();
     let mounts = BuilderMounts {
         flake_src: workspace.to_path_buf(),
         host_nix_store: Some(scratch_store.clone()),
