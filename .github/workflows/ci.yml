@@ -116,6 +116,16 @@ jobs:
       - name: No Debug/Display on secret-named types
         run: cargo run -p xtask -- check-no-display-on-secret-types
 
+      # Plan 60 Phase 4 — every audit emit goes through the
+      # `audit_emit!` macro so the positional `(kind, vm, detail)`
+      # shape never sneaks back in. The macro keeps call sites
+      # one-liners and turns "add a new optional field" into a
+      # one-method change in the builder. Bypass via
+      # `// allow(audit-positional): <reason>` directly above the
+      # call (matches the secret-debug opt-out convention).
+      - name: No positional audit::emit / event-chain calls
+        run: cargo run -p xtask -- check-audit-positional
+
   test:
     name: Test
     runs-on: ubuntu-latest

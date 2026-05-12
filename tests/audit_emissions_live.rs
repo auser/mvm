@@ -32,6 +32,8 @@
 //!   (idempotent against a missing slot — `--force` is the cleanup
 //!   contract; the stub `mvm.toml` is enough to canonicalise the
 //!   path key)
+//! - `mvmctl config set <key> <value>` → `ConfigChange`
+//! - `mvmctl config show` → **no** audit entry
 //! - `mvmctl secret put / get / ls / rm` → secret-side audit JSONL
 //!   at `~/.mvm/audit/secrets.jsonl` carries one entry per call
 //!   with `"action":"put"` / `"get"` / `"list"` / `"delete"`. The
@@ -613,6 +615,67 @@ fn manifest_alias_set_emits_manifest_alias_set_audit_entry() {
         hits >= 1,
         "expected ≥1 manifest_alias_set entry in audit log, got {hits}. \
          Full log:\n{log}"
+    );
+}
+
+#[test]
+fn config_set_emits_config_change_audit_entry() {
+    // `mvmctl config set <key> <value>` writes to
+    // `~/.mvm/config.toml` and emits `ConfigChange` — config file
+    // mutations are the only after-the-fact record of operator
+    // intent on settings that change runtime behavior (default
+    // backend, network policy, etc.).
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["config", "set", "default_cpus", "4"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl config set failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "config_change");
+    assert!(
+        hits >= 1,
+        "expected ≥1 config_change entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+    // The key + value should also land in the detail field so an
+    // operator scanning the audit log can see what changed.
+    assert!(
+        log.contains("key=default_cpus value=4"),
+        "config_change detail must carry the key+value pair. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn config_show_does_not_emit_audit_entry() {
+    // Negative: `config show` is read-only. Pins the
+    // AUDIT_POSTURE classification (Emits at the top level, but
+    // only `set` actually mutates).
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["config", "show"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl config show failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "config_change");
+    assert_eq!(
+        hits, 0,
+        "read-only `config show` must not emit; got {hits} \
+         config_change entry/entries. Full log:\n{log}"
     );
 }
 
