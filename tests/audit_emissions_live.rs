@@ -39,6 +39,12 @@
 //!   degrade to warnings when the dev VM isn't reachable, but
 //!   Step 2 — the build-cache prune — runs on host fs and the
 //!   audit emit always fires)
+//! - `mvmctl down` (no args, empty sandbox) → `VmStop`
+//!   (`stop_all` is tolerant of an empty VM registry and emits
+//!   with `detail=stop_all_ok`)
+//! - `mvmctl down <name>` (empty sandbox) → `VmStop`
+//!   (Firecracker's `stop_vm` is tolerant of missing VMs;
+//!   audit emits `detail=ok`)
 //! - `mvmctl snapshot rm <name>` → `SnapshotDelete`
 //!   (test pre-creates `~/.mvm/instances/<name>/snapshot/` so the
 //!   bail-when-missing branch doesn't short-circuit the emit)
@@ -735,6 +741,66 @@ fn cleanup_emits_slot_prune_audit_entry_even_with_no_builds() {
         log.contains("source=cleanup"),
         "slot_prune detail must carry source=cleanup to disambiguate \
          from manifest-prune emits. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn down_no_args_emits_vm_stop_audit_entry() {
+    // `mvmctl down` (no args, empty registry) calls `backend.stop_all`,
+    // which Firecracker satisfies as a no-op when no VMs are running.
+    // The verb emits `vm_stop` with `detail=stop_all_ok` regardless
+    // — Plan 37 §6: every state-changing CLI verb emits one record
+    // per attempt, even no-ops.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["down"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl down failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_stop");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_stop entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("stop_all_ok"),
+        "vm_stop detail must record stop_all outcome. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn down_with_name_emits_vm_stop_for_that_name() {
+    // `mvmctl down <vm>` against a fresh sandbox: Firecracker's
+    // `stop_vm` is tolerant of missing VMs (returns Ok), the verb
+    // emits `vm_stop` with `vm_name=<vm>` and `detail=ok`.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["down", "ghost-vm"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl down ghost-vm failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_stop");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_stop entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("\"vm_name\":\"ghost-vm\""),
+        "vm_stop must carry vm_name=ghost-vm. Full log:\n{log}"
     );
 }
 

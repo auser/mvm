@@ -16,6 +16,7 @@ use crate::libkrun::LibkrunBackend;
 #[cfg(feature = "backends-microsandbox")]
 use crate::microsandbox::MicrosandboxBackend;
 use crate::microvm::{DriveFile, FlakeRunConfig};
+use crate::mock::MockBackend;
 use crate::{firecracker, microvm, microvm_nix};
 use mvm_base::config::{PortMapping, VMS_DIR};
 use mvm_base::shell::run_in_vm_stdout;
@@ -233,6 +234,13 @@ pub enum AnyBackend {
     /// beyond what FC supports. Opt-in via `--hypervisor cloud-hypervisor`;
     /// auto_select keeps Firecracker as the KVM default.
     CloudHypervisor(CloudHypervisorBackend),
+    /// In-memory mock — test-only. Records `start`/`stop`/`pause`/
+    /// `resume` calls against a `Mutex<HashMap>` and never touches
+    /// the host. Selected only via explicit `--hypervisor mock`;
+    /// `auto_select` never falls through here. See
+    /// [`crate::mock::MockBackend`] for the rationale and security
+    /// profile (Tier 3 / claims unknown).
+    Mock(MockBackend),
 }
 
 impl AnyBackend {
@@ -268,6 +276,11 @@ impl AnyBackend {
                 Self::CloudHypervisor(CloudHypervisorBackend)
             }
             "qemu" => Self::MicrovmNix(MicrovmNixBackend),
+            // Test-only in-memory backend. See `crate::mock`. Routing
+            // here from a production caller is a misconfiguration, but
+            // the explicit selector lets integration tests drive every
+            // VM-lifecycle CLI verb hermetically.
+            "mock" => Self::Mock(MockBackend::new()),
             _ => Self::Firecracker(FirecrackerBackend),
         }
     }
@@ -357,6 +370,7 @@ impl AnyBackend {
             #[cfg(feature = "backends-microsandbox")]
             Self::Microsandbox(b) => b,
             Self::CloudHypervisor(b) => b,
+            Self::Mock(b) => b,
         }
     }
 
