@@ -146,15 +146,19 @@ let
   entrypointUid = resolvedUids.entrypoint;
 
   # Wrap a command-line in `setpriv` when the target uid is non-zero.
-  # busybox provides setpriv from util-linux applets; the flags here
-  # match ADR-002 W2.3 (--reuid + --regid + --no-new-privs) so the
-  # privilege drop is consistent with the planned Phase 6 hardening.
-  # uid==0 short-circuits to the bare command — no point setpriv-ing
-  # to root.
+  # Uses util-linux's `setpriv` (symlinked into /usr/local/bin via the
+  # packages closure), not busybox's stripped applet — busybox doesn't
+  # recognise the `--reuid` / `--regid` long options and silently fails
+  # the launch with "setpriv: unrecognized option: reuid=…", which
+  # then breaks the workload AND any agent we wrap in setpriv. The
+  # flags here match ADR-002 W2.3 (--reuid + --regid + --no-new-privs)
+  # so the privilege drop is consistent with the planned Phase 6
+  # hardening. uid==0 short-circuits to the bare command — no point
+  # setpriv-ing to root.
   setprivWrap = uid: cmd:
     if uid == 0 then cmd
     else
-      "exec /bin/busybox setpriv --reuid=${toString uid} --regid=${toString uid} "
+      "exec /usr/local/bin/setpriv --reuid=${toString uid} --regid=${toString uid} "
       + "--clear-groups --no-new-privs -- ${cmd}";
 
   rawEntrypointCmd =
@@ -196,10 +200,13 @@ let
     # mvm /init — busybox PID 1 (plan 60 / ADR-013).
 
     # Stage 1 — kernel pseudofs. Required before anything else
-    # can read /proc/self or write to /dev/console.
-    /bin/busybox mount -t proc     proc     /proc
-    /bin/busybox mount -t sysfs    sysfs    /sys
-    /bin/busybox mount -t devtmpfs devtmpfs /dev
+    # can read /proc/self or write to /dev/console. `mountpoint -q`
+    # short-circuits when the kernel already mounted devtmpfs (the
+    # default with CONFIG_DEVTMPFS_MOUNT) — otherwise the explicit
+    # mount fails "Resource busy" and clutters the console log.
+    /bin/busybox mount -t proc  proc  /proc
+    /bin/busybox mount -t sysfs sysfs /sys
+    /bin/busybox mountpoint -q /dev || /bin/busybox mount -t devtmpfs devtmpfs /dev
 
     # Stage 2 — runtime tmpfs. /tmp + /run are RAM so the rootfs
     # stays read-only-leaning; volumes (Phase 2) attach to fixed
@@ -214,8 +221,14 @@ let
     # us but can't talk to us. We never block on it — if the agent
     # fails to start, the entrypoint still runs and the lack of
     # agent shows up in `mvmctl status`.
+    # Same util-linux-vs-busybox setpriv distinction as in
+    # `setprivWrap` above — busybox's applet doesn't grok `--reuid`,
+    # so use `/usr/local/bin/setpriv` (util-linux, symlinked from the
+    # packages closure). Without this the agent never starts and the
+    # whole vsock surface (`mvmctl console`, exec, lifecycle hooks)
+    # is dark.
     if [ -x /usr/local/bin/mvm-guest-agent ]; then
-      /bin/busybox setsid /bin/busybox setpriv \
+      /bin/busybox setsid /usr/local/bin/setpriv \
         --reuid=${toString agentUid} --regid=${toString agentUid} \
         --clear-groups --no-new-privs \
         -- /usr/local/bin/mvm-guest-agent &
