@@ -40,6 +40,7 @@ pub mod backend;
 pub mod circuit_breaker;
 pub mod destination;
 pub mod egress;
+pub mod event_bus;
 pub mod firewall;
 pub mod hickory_dns;
 pub mod injection_guard;
@@ -74,6 +75,7 @@ pub use circuit_breaker::{
 };
 pub use destination::DestinationPolicy;
 pub use egress::{EgressDecision, EgressError, EgressProxy, NoopEgressProxy};
+pub use event_bus::{DEFAULT_CAPACITY as EVENT_BUS_DEFAULT_CAPACITY, EventBus, LifecycleEvent};
 pub use hickory_dns::HickoryDnsResolver;
 pub use injection_guard::{InjectionGuard, InjectionRule, RuleFamily};
 pub use inspector::{Inspector, InspectorChain, InspectorVerdict, RequestCtx};
