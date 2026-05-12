@@ -390,6 +390,13 @@ let
     # exec it. Mode 0555 so the agent can't rewrite itself; ownership
     # is the build-time user (Nix sandbox has no root) — Phase 6 W2.2
     # binds /etc + /usr read-only at boot to make this load-bearing.
+    # `mkdir -p` is load-bearing too: the FHS-skeleton mkdir at the
+    # top of this script doesn't include `usr/local/bin` (the later
+    # extra-packages section creates it, but that runs *after* this
+    # cp). Without this line the build dies "cp: cannot create
+    # regular file ... usr/local/bin/mvm-guest-agent: No such file
+    # or directory" — the parent dir hasn't been made yet.
+    mkdir -p "$out/usr/local/bin"
     cp ${agentBinary} "$out/usr/local/bin/mvm-guest-agent"
     chmod 0555 "$out/usr/local/bin/mvm-guest-agent"
 

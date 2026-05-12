@@ -10,6 +10,7 @@ clap.workspace = true
 clap_mangen.workspace = true
 mvm-cli.workspace = true
 mvm-build = { workspace = true, features = ["backends-microsandbox"] }
+mvm-core.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 

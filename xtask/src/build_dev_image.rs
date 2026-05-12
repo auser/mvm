@@ -167,13 +167,31 @@ fn build_and_install(workspace: &Path, arch: &str) -> Result<()> {
         flake_ref: format!("git+file://{BUILDER_GUEST_WORK_DIR}?dir=nix/images/builder"),
         attr_path: format!("packages.{arch}-linux.default"),
     };
+    // Persistent scratch /nix store on the host. The microsandbox
+    // sandbox's writable layer is small (a few GiB at most); building
+    // the Rust toolchain closure for cross-compiling
+    // `mvm-guest-agent` blows past that with "No space left on
+    // device". Bind-mounting a host directory at `/nix` inside the
+    // sandbox redirects the closure to host disk where there's
+    // typically hundreds of GiB free.
+    //
+    // We deliberately do *not* reuse the host's actual `/nix` (it's
+    // root-owned + Darwin-targeted on macOS; reasoning matches
+    // `apple_container.rs::build_image_via_microsandbox`). Instead a
+    // dedicated scratch root under `~/.cache/mvm/xtask-builder-store/`
+    // is persistent across xtask invocations — nix reuses already-
+    // realised closures so re-runs are fast.
+    let scratch_store =
+        std::path::PathBuf::from(mvm_core::config::mvm_cache_dir()).join("xtask-builder-store");
+    std::fs::create_dir_all(&scratch_store).with_context(|| {
+        format!(
+            "creating xtask scratch nix store at {}",
+            scratch_store.display()
+        )
+    })?;
     let mounts = BuilderMounts {
         flake_src: workspace.to_path_buf(),
-        // Never bind the host /nix on macOS: it's root-owned and
-        // contains Darwin-targeted closures the Linux sandbox can't
-        // execute. See the same reasoning in
-        // `apple_container.rs::build_image_via_microsandbox`.
-        host_nix_store: None,
+        host_nix_store: Some(scratch_store.clone()),
         artifact_out: artifact_out.path().to_path_buf(),
     };
 

@@ -31,3 +31,12 @@ keys
 # Worktree-local dev env (use .envrc.example as template)
 /.envrc
 /.mvm-test/
+
+# Built dev VM image artifacts produced by `cargo xtask build-dev-image`.
+# Each pair is ~800 MiB (vmlinux + rootfs.ext4) — too big for git,
+# and reproducible from `nix/images/builder/flake.nix` so there's no
+# durable record we'd lose by not committing them. CI publishes them
+# to the GitHub release page; source-checkout users regenerate on
+# demand. `find_vendored_dev_image` reads from this dir at highest
+# precedence in `ensure_dev_image`.
+/nix/images/dev-prebuilt/

@@ -289,18 +289,35 @@ impl BuilderVm for StubBuilderVm {
 #[cfg(feature = "backends-microsandbox")]
 const BUILDER_DEFAULT_CPUS: u8 = 4;
 
+/// In-sandbox tmpfs size for the scratch nix store, in MiB. Sized for
+/// the worst realistic case: cross-compiling `mvm-guest-agent` for
+/// aarch64-linux pulls a Rust toolchain (~3 GiB), the nixpkgs stdenv
+/// (~700 MiB), plus the workload-specific closure. 8 GiB leaves
+/// headroom for parallel derivation downloads without OOMing the
+/// guest. Backed by guest RAM, so [`BUILDER_DEFAULT_MEMORY_MIB`] has
+/// to be at least this big plus what the actual build processes
+/// allocate (rustc peaks ~2 GiB per crate).
+const BUILDER_SCRATCH_STORE_MIB: u32 = 12288;
+
 /// Default memory for the builder sandbox, in MiB. Nix derivations
 /// for guest rootfs builds peak well under 4 GiB; 4096 MiB leaves
 /// headroom for the dev tooling closure plus jobserver fan-out.
 #[cfg(feature = "backends-microsandbox")]
-const BUILDER_DEFAULT_MEMORY_MIB: u32 = 4096;
+const BUILDER_DEFAULT_MEMORY_MIB: u32 = 16384;
 
 /// Where in the sandbox the user's flake gets bind-mounted.
 /// ADR-013 step 3.
 pub const BUILDER_GUEST_WORK_DIR: &str = "/work";
-/// Where in the sandbox the host's nix store gets bind-mounted
-/// (when [`BuilderMounts::host_nix_store`] is `Some`).
-pub const BUILDER_GUEST_NIX_DIR: &str = "/nix";
+/// Where in the sandbox the host's scratch nix store gets bind-mounted
+/// (when [`BuilderMounts::host_nix_store`] is `Some`). NOT `/nix` —
+/// that path is where the sandbox image's own Nix tooling lives
+/// (`/nix/store/<hash>-bash`, `…-nix`, etc.). Overlaying our host
+/// scratch dir on top of `/nix` would shadow those tools, breaking
+/// `/bin/sh` at the most fundamental level. Instead we mount the
+/// scratch dir at this sibling path and pass it to nix via
+/// `--store`, which redirects build outputs while keeping the
+/// image's own tools resolvable through `/nix/store`.
+pub const BUILDER_GUEST_SCRATCH_STORE: &str = "/scratch-nix";
 /// Where in the sandbox artifacts get extracted.
 pub const BUILDER_GUEST_OUT_DIR: &str = "/out";
 
@@ -516,9 +533,26 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
             m.bind(flake_src.as_path()).readonly()
         })
         .volume(BUILDER_GUEST_OUT_DIR, |m| m.bind(artifact_out.as_path()));
-    if let Some(store) = host_nix_store.as_ref() {
-        builder = builder.volume(BUILDER_GUEST_NIX_DIR, |m| m.bind(store.as_path()));
-    }
+    // Scratch nix store as a tmpfs inside the sandbox. Three reasons
+    // this beats bind-mounting a host path:
+    //
+    //   - tmpfs lives in the guest kernel — xattr ops (which nix uses
+    //     to mark chroot stores) work natively. Bind-mounts from
+    //     macOS APFS through libkrun's filesystem proxy fail with
+    //     "querying extended attributes … Input/output error" on the
+    //     very first store-path write.
+    //   - The sandbox's default writable overlay is small (a few GiB
+    //     at most); the Rust toolchain alone exhausts it. tmpfs lets
+    //     us name our own size up to whatever the guest RAM
+    //     supports.
+    //   - No host side-effects: the scratch dies with the sandbox.
+    //     `host_nix_store` exists for Linux-native shared-store
+    //     reuse and is unused here — that path is documented in
+    //     `BuilderMounts` but isn't exercised by the macOS bootstrap.
+    let _ = host_nix_store;
+    builder = builder.volume(BUILDER_GUEST_SCRATCH_STORE, |m| {
+        m.tmpfs().size(BUILDER_SCRATCH_STORE_MIB)
+    });
 
     let sandbox = builder
         .create_detached()
@@ -540,6 +574,11 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
     //   - The lockfile is also nuked from `/work/<flake>` on the host
     //     before this script runs (see the xtask), so there's nothing
     //     stale to re-validate.
+    // `--store /scratch-nix` redirects nix-build outputs to the tmpfs
+    // mounted at that path. Always on — the sandbox's writable
+    // overlay is too small for non-trivial closures (Rust toolchain
+    // ~3 GiB on its own).
+    let store_flag = format!(" --store {}", BUILDER_GUEST_SCRATCH_STORE);
     let build_script = format!(
         r#"set -euo pipefail
 cd {work}
@@ -550,12 +589,24 @@ cd {work}
 # user". `git config --global` writes to /root inside the sandbox —
 # fresh per spawn — so this never leaks to the host.
 git config --global --add safe.directory '*'
-export NIX_CONFIG="experimental-features = nix-command flakes"
-nix build {flake_ref}#{attr_path} --no-link --print-out-paths --no-write-lock-file --impure
+# Mirror /scratch-nix for per-derivation build dirs too. Without
+# this nix's daemon uses /tmp inside each derivation's build
+# sandbox, which is a small tmpfs separate from /scratch-nix and
+# fills up extracting big cargo-vendor closures with "cp: No space
+# left on device" — even though /scratch-nix has plenty of room.
+# `build-dir` is the nix.conf knob that controls where derivation
+# scratch lives; pointing it at /scratch-nix/build co-locates the
+# build scratch with the store scratch on the same tmpfs.
+mkdir -p {scratch}/build
+export NIX_CONFIG="experimental-features = nix-command flakes
+build-dir = {scratch}/build"
+nix build {flake_ref}#{attr_path}{store_flag} --no-link --print-out-paths --no-write-lock-file --impure
 "#,
         work = shell_quote_arg(BUILDER_GUEST_WORK_DIR),
         flake_ref = flake_ref,
         attr_path = attr_path,
+        store_flag = store_flag,
+        scratch = BUILDER_GUEST_SCRATCH_STORE,
     );
 
     let build_out = sandbox
@@ -575,12 +626,17 @@ nix build {flake_ref}#{attr_path} --no-link --print-out-paths --no-write-lock-fi
         )));
     }
 
+    // `nix build --print-out-paths` emits absolute store paths. With
+    // a `--store` chroot they look like `/scratch-nix/nix/store/<hash>`
+    // rather than the bare `/nix/store/<hash>`. Match either —
+    // anything containing `/nix/store/` is good enough; the path is
+    // already absolute and ready to `cp` from.
     let nix_output_path = build_out
         .stdout()
         .map_err(|e| BuilderVmError::ExtractionFailed(format!("stdout was non-UTF-8: {e}")))?
         .lines()
         .rev()
-        .find(|l| l.starts_with("/nix/store/"))
+        .find(|l| l.contains("/nix/store/"))
         .ok_or_else(|| {
             BuilderVmError::ExtractionFailed(
                 "nix build inside sandbox produced no /nix/store output path".into(),
@@ -593,6 +649,18 @@ nix build {flake_ref}#{attr_path} --no-link --print-out-paths --no-write-lock-fi
     // 3. Copy artifacts from the in-sandbox store path to /out.
     //    Mirrors `copy_dev_artifacts` in `pipeline::dev_build` so the
     //    on-host layout matches what the runtime path expects.
+    // With `--store /scratch-nix` in play, nix prints the *canonical*
+    // store path (`/nix/store/<hash>-name`) — that's the logical
+    // address it'd have in a normal store — but the file lives
+    // physically under the chroot at `/scratch-nix/nix/store/<hash>-name`.
+    // Map canonical → physical here so `cp` can actually read it.
+    // When no chroot store is configured the canonical and physical
+    // paths coincide and the prefix is empty.
+    let physical_src = if store_flag.is_empty() {
+        nix_output_path.clone()
+    } else {
+        format!("{}{}", BUILDER_GUEST_SCRATCH_STORE, nix_output_path)
+    };
     let copy_script = format!(
         r#"set -euo pipefail
 out={out}
@@ -605,7 +673,7 @@ cp -L "$src/rootfs.ext4" "$out/rootfs.ext4"
 chmod -R u+w "$out"
 "#,
         out = shell_quote_arg(BUILDER_GUEST_OUT_DIR),
-        src = shell_quote_arg(&nix_output_path),
+        src = shell_quote_arg(&physical_src),
     );
 
     let copy_out = sandbox

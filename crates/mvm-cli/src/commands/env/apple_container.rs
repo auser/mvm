@@ -498,6 +498,39 @@ pub(super) fn cmd_dev_apple_container_status() -> Result<()> {
 fn ensure_dev_image() -> Result<(String, String)> {
     let local_flake = find_dev_image_flake().ok();
 
+    let version = env!("CARGO_PKG_VERSION");
+    let prebuilt_root = format!("{}/dev/prebuilt", mvm_core::config::mvm_data_dir());
+    let prebuilt_dir = format!("{prebuilt_root}/v{version}");
+    let kernel_path = format!("{prebuilt_dir}/vmlinux");
+    let rootfs_path = format!("{prebuilt_dir}/rootfs.ext4");
+
+    // Vendored slot beats local-flake build. When
+    // `nix/images/dev-prebuilt/<arch>/{vmlinux, rootfs.ext4}` is
+    // present in this source checkout, those artifacts are what the
+    // tree currently ships — rebuilding from `nix/images/builder/`
+    // would just reproduce the same closure (multi-minute via the
+    // microsandbox builder) only to land back here. Vendored wins.
+    // Without this gate, every `mvmctl dev up` re-runs the builder
+    // even when the source-of-truth image is already on disk.
+    if let Some((src_kernel, src_rootfs, source_label)) = find_vendored_dev_image() {
+        validate_dev_image_artifacts(&src_kernel, &src_rootfs).with_context(|| {
+            format!(
+                "vendored dev image at {source_label} failed sanity check — \
+                 refusing to copy garbage into the prebuilt cache"
+            )
+        })?;
+        std::fs::create_dir_all(&prebuilt_dir)
+            .with_context(|| format!("creating prebuilt dir {prebuilt_dir}"))?;
+        ui::info(&format!(
+            "Using vendored dev image from source checkout ({source_label})."
+        ));
+        std::fs::copy(&src_kernel, &kernel_path)
+            .with_context(|| format!("copying vendored kernel {src_kernel:?} → {kernel_path}"))?;
+        std::fs::copy(&src_rootfs, &rootfs_path)
+            .with_context(|| format!("copying vendored rootfs {src_rootfs:?} → {rootfs_path}"))?;
+        return Ok((kernel_path, rootfs_path));
+    }
+
     #[cfg(feature = "backends-microsandbox")]
     if let Some(flake_dir) = &local_flake {
         let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
@@ -556,13 +589,8 @@ fn ensure_dev_image() -> Result<(String, String)> {
              downloading published prebuilt instead of local build.",
         );
     }
-    let version = env!("CARGO_PKG_VERSION");
-    let prebuilt_root = format!("{}/dev/prebuilt", mvm_core::config::mvm_data_dir());
-    let prebuilt_dir = format!("{prebuilt_root}/v{version}");
     std::fs::create_dir_all(&prebuilt_dir)
         .with_context(|| format!("creating prebuilt dir {prebuilt_dir}"))?;
-    let kernel_path = format!("{prebuilt_dir}/vmlinux");
-    let rootfs_path = format!("{prebuilt_dir}/rootfs.ext4");
     // Cache hit on the current version's dir — fast path. Validate
     // first; if either file is below the size floor or the rootfs
     // lacks the ext4 magic, treat the cache as poisoned and delete it
@@ -586,33 +614,6 @@ fn ensure_dev_image() -> Result<(String, String)> {
                 let _ = std::fs::remove_file(&rootfs_path);
             }
         }
-    }
-    // Source-checkout-first. When the binary was compiled out of an
-    // mvm source tree that has `nix/images/dev-prebuilt/<arch>/`
-    // populated, that's the authoritative dev image for this build —
-    // skip GitHub entirely. The helper returns `None` for installed
-    // binaries (their `CARGO_MANIFEST_DIR` resolves into
-    // `~/.cargo/registry/` where the directory will never exist) and
-    // for source checkouts that haven't vendored anything yet, in
-    // which case we fall through to the published prebuilt as before.
-    if let Some((src_kernel, src_rootfs, source_label)) = find_vendored_dev_image() {
-        validate_dev_image_artifacts(&src_kernel, &src_rootfs).with_context(|| {
-            format!(
-                "vendored dev image at {source_label} failed sanity check — \
-                 refusing to copy garbage into the prebuilt cache"
-            )
-        })?;
-        ui::info(&format!(
-            "Using vendored dev image from source checkout ({source_label})."
-        ));
-        std::fs::copy(&src_kernel, &kernel_path)
-            .with_context(|| format!("copying vendored kernel {src_kernel:?} → {kernel_path}"))?;
-        std::fs::copy(&src_rootfs, &rootfs_path)
-            .with_context(|| format!("copying vendored rootfs {src_rootfs:?} → {rootfs_path}"))?;
-        // No prune — vendored is the source of truth for this binary,
-        // not a download; leaving older `v*/` dirs around lets
-        // installed-binary users keep their offline-fallback cache.
-        return Ok((kernel_path, rootfs_path));
     }
     // Try the published prebuilt. Defer the prune until *after* a
     // successful download — old `~/.mvm/dev/prebuilt/v*/` dirs and
@@ -1620,34 +1621,41 @@ fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(Strin
         anyhow::bail!("flake dir does not exist: {flake_dir}");
     }
 
-    // Bind-mount /nix opportunistically on Linux hosts that already
-    // run native Nix — the builder reuses already-realized store paths,
-    // and absence is fine because the in-sandbox store fetches from
-    // substituters. Skip the bind on macOS: a multi-user Nix install
-    // there leaves `/nix` owned by `root:wheel` (Apple Container's
-    // bind-mounter fails with EACCES), *and* the store contains
-    // Darwin-targeted closures that a Linux microVM can't execute
-    // anyway. The microsandbox builder is on the macOS path precisely
-    // because the host has no usable Linux Nix; reusing its Darwin
-    // store is wrong regardless of permissions.
-    let host_nix_store = if cfg!(target_os = "macos") {
-        None
-    } else {
-        let host_nix = std::path::PathBuf::from("/nix");
-        if host_nix.join("store").is_dir() {
-            Some(host_nix)
-        } else {
-            None
-        }
-    };
+    // Walk up from `flake_dir` (which is `<workspace>/nix/images/builder`)
+    // to the workspace root. The builder flake uses
+    // `builtins.path { path = ../../..; }` to stage the workspace and
+    // `import (workspace + "/nix/lib") ...`. If we bind-mounted the
+    // builder dir at /work, `../../..` would escape the bind-mount
+    // and nix errors with "path '...mvm-workspace/nix/lib' does not
+    // exist". Mounting the workspace root instead means
+    // `../../..` resolves within `/work`, the same shape the xtask
+    // already uses.
+    let workspace = flake_src
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("flake dir has no workspace root: {flake_dir}"))?
+        .to_path_buf();
 
     let job = BuilderJob {
-        flake_ref: BUILDER_GUEST_WORK_DIR.to_string(),
+        // `git+file://` + `?dir=` lets nix evaluate the builder flake
+        // while the staged tree resolves all `path:..`-style relative
+        // inputs inside the workspace. The bare-path variant would
+        // make nix's git fetcher engage on the host's `.git` and
+        // trip on cross-uid ownership (`safe.directory '*'` in the
+        // build script accepts it).
+        flake_ref: format!("git+file://{BUILDER_GUEST_WORK_DIR}?dir=nix/images/builder"),
         attr_path: format!("packages.{}.default", host_system_linux()),
     };
     let mounts = BuilderMounts {
-        flake_src,
-        host_nix_store,
+        flake_src: workspace,
+        // host_nix_store is intentionally None: the builder_vm always
+        // provisions a tmpfs at `/scratch-nix` and runs `nix build`
+        // with `--store /scratch-nix`. The host-side bind-mount is
+        // unused on macOS (Darwin-targeted closures, root-owned dir,
+        // xattr passthrough fails) and even on Linux the scratch
+        // tmpfs simplifies cleanup.
+        host_nix_store: None,
         artifact_out: std::path::PathBuf::from(out_dir),
     };
 

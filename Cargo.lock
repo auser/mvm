@@ -8648,6 +8648,7 @@ dependencies = [
  "clap_mangen",
  "mvm-build",
  "mvm-cli",
+ "mvm-core",
  "sha2 0.10.9",
  "tempfile",
 ]
