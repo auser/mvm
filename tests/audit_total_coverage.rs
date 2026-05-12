@@ -69,7 +69,10 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("uninstall", AuditPosture::Emits("Uninstall")),
     ("init", AuditPosture::InteractiveOrControl),
     // VM lifecycle.
-    ("up", AuditPosture::Emits("plan.admitted+plan.launched+VmStart")),
+    (
+        "up",
+        AuditPosture::Emits("plan.admitted+plan.launched+VmStart"),
+    ),
     ("down", AuditPosture::Emits("VmStop")),
     ("logs", AuditPosture::ReadOnly),
     ("forward", AuditPosture::ReadOnly),
