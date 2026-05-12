@@ -50,6 +50,7 @@
 
 pub mod time_now;
 pub mod web_fetch;
+pub mod web_search;
 
 use std::collections::BTreeMap;
 
