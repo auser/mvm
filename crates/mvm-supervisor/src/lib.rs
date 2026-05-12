@@ -58,6 +58,7 @@ pub mod ssrf_guard;
 pub mod state;
 pub mod supervisor;
 pub mod tool_gate;
+pub mod tools;
 
 pub use artifact::{
     ArtifactCollector, ArtifactError, LiveArtifactCollector, NoopArtifactCollector,
@@ -114,3 +115,4 @@ pub use supervisor::{
     validate_egress_policy_inspector_names,
 };
 pub use tool_gate::{NoopToolGate, ToolDecision, ToolError, ToolGate};
+pub use tools::{HostMediatedTool, ToolInvokeError, ToolRegistry};
