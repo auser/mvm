@@ -58,9 +58,7 @@ fn add(template: &str, tag: &str) -> Result<()> {
         .save(template)
         .with_context(|| format!("saving tags catalog for {:?}", template))?;
     println!("{template}: added tag {tag:?}");
-    mvm_core::audit::event(mvm_core::audit::LocalAuditKind::ManifestTagAdd)
-        .detail(format!("template={template} tag={tag}"))
-        .emit();
+    mvm_core::audit_emit!(ManifestTagAdd, "template={template} tag={tag}");
     Ok(())
 }
 
@@ -73,9 +71,7 @@ fn rm(template: &str, tag: &str) -> Result<()> {
     }
     catalog.save(template)?;
     println!("{template}: removed tag {tag:?}");
-    mvm_core::audit::event(mvm_core::audit::LocalAuditKind::ManifestTagRemove)
-        .detail(format!("template={template} tag={tag}"))
-        .emit();
+    mvm_core::audit_emit!(ManifestTagRemove, "template={template} tag={tag}");
     Ok(())
 }
 

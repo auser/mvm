@@ -389,11 +389,7 @@ fn audit_build_ok(mode: &str, source: &str, slot_hash: &str, artifact: &str) {
     } else {
         format!("mode={mode} source={source} slot_hash={slot_hash} artifact={artifact}")
     };
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::TemplateBuild,
-        None,
-        Some(&detail),
-    );
+    mvm_core::audit_emit!(TemplateBuild, "{detail}");
 }
 
 /// Emit a `TemplateBuildError` audit line for a failed build.
@@ -405,9 +401,8 @@ fn audit_build_ok(mode: &str, source: &str, slot_hash: &str, artifact: &str) {
 fn audit_build_error(mode: &str, source: &str, err: &anyhow::Error) {
     let head = err.to_string();
     let head = head.lines().next().unwrap_or("").trim();
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::TemplateBuildError,
-        None,
-        Some(&format!("mode={mode} source={source} error={head}")),
+    mvm_core::audit_emit!(
+        TemplateBuildError,
+        "mode={mode} source={source} error={head}"
     );
 }

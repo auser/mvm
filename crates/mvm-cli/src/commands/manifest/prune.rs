@@ -37,9 +37,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
 
     let (count, removed) = tmpl::template_prune_orphan_slots()?;
 
-    mvm_core::audit::event(mvm_core::audit::LocalAuditKind::SlotPrune)
-        .detail(format!("source=manifest_prune count={count}"))
-        .emit();
+    mvm_core::audit_emit!(SlotPrune, "source=manifest_prune count={count}");
 
     if args.json {
         #[derive(serde::Serialize)]

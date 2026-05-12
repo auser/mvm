@@ -6,7 +6,6 @@ use std::sync::Arc;
 
 use super::Cli;
 use mvm::storage::{Backend, DmsetupBackend, MockBackend, PoolConfig, ThinPool, ThinPoolImpl};
-use mvm_core::policy::audit::LocalAuditKind;
 use mvm_core::user_config::MvmConfig;
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -110,9 +109,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         }
         Outcome::PoolUnavailable(err) => format!("pool_unavailable={err}"),
     };
-    mvm_core::audit::event(LocalAuditKind::StorageGc)
-        .detail(detail)
-        .emit();
+    mvm_core::audit_emit!(StorageGc, "{detail}");
 
     Ok(())
 }

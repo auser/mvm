@@ -102,7 +102,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         }
     }
 
-    mvm_core::audit::event(mvm_core::audit::LocalAuditKind::Uninstall).emit();
+    mvm_core::audit_emit!(Uninstall);
     ui::success("Uninstall complete.");
     Ok(())
 }

@@ -167,11 +167,7 @@ fn cmd_start(name: &str, argv: &[String], envs: &[String], cwd: Option<&str>) ->
     match result {
         ProcResult::Started { pid_token } => {
             println!("{pid_token}");
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::VmProcStart,
-                Some(name),
-                Some(&format!("argv0={} token={pid_token}", argv[0])),
-            );
+            mvm_core::audit_emit!(VmProcStart, vm: name, "argv0={} token={pid_token}" , argv[0]);
             Ok(())
         }
         other => bail!("Unexpected ProcResult variant for Start: {:?}", other),
@@ -222,11 +218,7 @@ fn cmd_signal(name: &str, token: &str, signum: i32) -> Result<()> {
     let result = unwrap_proc(mvm_guest::vsock::send_proc_request(&dir, req)?)?;
     match result {
         ProcResult::Signaled => {
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::VmProcSignal,
-                Some(name),
-                Some(&format!("token={token} signum={signum}")),
-            );
+            mvm_core::audit_emit!(VmProcSignal, vm: name, "token={token} signum={signum}");
             Ok(())
         }
         other => bail!("Unexpected ProcResult variant for Signal: {:?}", other),
@@ -241,11 +233,7 @@ fn cmd_kill(name: &str, token: &str) -> Result<()> {
     let result = unwrap_proc(mvm_guest::vsock::send_proc_request(&dir, req)?)?;
     match result {
         ProcResult::Killed => {
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::Kill,
-                Some(name),
-                Some(&format!("scope=guest_proc token={token}")),
-            );
+            mvm_core::audit_emit!(Kill, vm: name, "scope=guest_proc token={token}");
             Ok(())
         }
         other => bail!("Unexpected ProcResult variant for Kill: {:?}", other),
@@ -271,11 +259,7 @@ fn cmd_stdin(name: &str, token: &str, content: Option<String>) -> Result<()> {
     match result {
         ProcResult::InputAccepted { bytes_accepted } => {
             eprintln!("accepted {bytes_accepted} bytes");
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::VmProcStdin,
-                Some(name),
-                Some(&format!("token={token} bytes={bytes_accepted}")),
-            );
+            mvm_core::audit_emit!(VmProcStdin, vm: name, "token={token} bytes={bytes_accepted}");
             Ok(())
         }
         other => bail!("Unexpected ProcResult variant for SendInput: {:?}", other),

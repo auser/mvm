@@ -307,6 +307,79 @@ impl LocalAuditLog {
     }
 }
 
+/// Convenience macro for the most common audit emit shapes.
+///
+/// The four arms mirror the chained-builder forms but collapse the
+/// `event(LocalAuditKind::Variant)…emit()` boilerplate to a single
+/// line:
+///
+/// ```ignore
+/// // bare — no vm_name, no detail
+/// audit_emit!(CachePrune);
+///
+/// // detail via format-string
+/// audit_emit!(StorageGc, "count={count}");
+/// audit_emit!(SlotPrune, "source={src} count={n}", src = "x", n = 4);
+///
+/// // vm_name + no detail
+/// audit_emit!(SlotRemove, vm: slot_hash);
+///
+/// // vm_name + format-string detail (positional or named args)
+/// audit_emit!(
+///     SlotRemove,
+///     vm: slot_hash,
+///     "manifest_path={} manifest_file_deleted={deleted}",
+///     path.display(),
+///     deleted = file_was_deleted,
+/// );
+/// ```
+///
+/// More elaborate compositions (multiple modifiers, conditional
+/// fields) should drop down to [`event`] + [`LocalAuditBuilder`]
+/// directly. The macro deliberately doesn't add knobs beyond the
+/// four shapes — every existing call site falls into one of them.
+#[macro_export]
+macro_rules! audit_emit {
+    // Bare:  audit_emit!(CachePrune)
+    ($variant:ident $(,)?) => {
+        $crate::policy::audit::event(
+            $crate::policy::audit::LocalAuditKind::$variant
+        ).emit()
+    };
+
+    // vm_name + format-string detail (positional or named format args):
+    //   audit_emit!(SlotRemove, vm: hash, "path={}", p);
+    //   audit_emit!(SlotRemove, vm: hash, "k={v}", v = "x");
+    ($variant:ident, vm: $vm:expr, $($args:tt)+) => {
+        $crate::policy::audit::event(
+            $crate::policy::audit::LocalAuditKind::$variant
+        )
+            .vm_name($vm)
+            .detail(format!($($args)+))
+            .emit()
+    };
+
+    // vm_name only:  audit_emit!(SlotRemove, vm: hash)
+    ($variant:ident, vm: $vm:expr $(,)?) => {
+        $crate::policy::audit::event(
+            $crate::policy::audit::LocalAuditKind::$variant
+        )
+            .vm_name($vm)
+            .emit()
+    };
+
+    // Format-string detail (positional or named format args):
+    //   audit_emit!(StorageGc, "count={count}");
+    //   audit_emit!(SlotPrune, "src={src} count={n}", src = "x", n = 4);
+    ($variant:ident, $($args:tt)+) => {
+        $crate::policy::audit::event(
+            $crate::policy::audit::LocalAuditKind::$variant
+        )
+            .detail(format!($($args)+))
+            .emit()
+    };
+}
+
 /// Start composing a local audit event.
 ///
 /// Preferred over the positional [`emit`] / [`emit_to`] helpers — chains
@@ -812,6 +885,29 @@ mod tests {
         assert_eq!(v["kind"], "vm_stop");
         assert_eq!(v["vm_name"], "vm-42");
         assert_eq!(v["detail"], "source=test");
+    }
+
+    #[test]
+    fn audit_emit_macro_all_four_arms_compile() {
+        // The macro routes through `default_audit_log()`, which depends
+        // on process env vars — driving it from a unit test would need
+        // a process-global mutex around `set_var`/`remove_var`. Skip
+        // the file-contents check here: end-to-end validation lives in
+        // `tests/audit_emissions_live.rs`, where each migrated call
+        // site is exercised via a subprocess with hermetic HOME.
+        //
+        // What this test buys: a compile-time shape check that all
+        // four arms expand cleanly against `LocalAuditKind` variants
+        // and the surrounding builder API. Renaming a variant or
+        // changing `LocalAuditBuilder`'s signature surfaces here as a
+        // compile error before the migration sites notice.
+        if false {
+            crate::audit_emit!(CachePrune);
+            crate::audit_emit!(StorageGc, "count={n}", n = 3);
+            let hash = String::from("deadbeef");
+            crate::audit_emit!(SlotRemove, vm: hash.clone());
+            crate::audit_emit!(SlotRemove, vm: hash, "path={p}", p = "/x");
+        }
     }
 
     #[test]

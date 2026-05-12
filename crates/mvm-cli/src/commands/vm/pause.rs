@@ -58,13 +58,8 @@ pub(in crate::commands) fn run_pause(_cli: &Cli, args: PauseArgs, _cfg: &MvmConf
         "{}: paused (epoch {}, vmstate {} B, mem {} B)",
         args.name, sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
     );
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::WorkloadSleep,
-        Some(&args.name),
-        Some(&format!(
-            "epoch={} vmstate={} mem={}",
-            sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
-        )),
+    mvm_core::audit_emit!(WorkloadSleep, vm: args.name, "epoch={} vmstate={} mem={}" ,
+        sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
     );
     Ok(())
 }
@@ -105,13 +100,8 @@ pub(in crate::commands) fn run_resume(
         "{}: resumed (epoch {}, vmstate {} B, mem {} B)",
         args.name, sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
     );
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::WorkloadWake,
-        Some(&args.name),
-        Some(&format!(
-            "epoch={} vmstate={} mem={}",
-            sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
-        )),
+    mvm_core::audit_emit!(WorkloadWake, vm: args.name, "epoch={} vmstate={} mem={}" ,
+        sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
     );
     Ok(())
 }
@@ -213,10 +203,6 @@ fn snap_rm(name: &str) -> Result<()> {
         let _ = registry.save(&registry_path);
     }
     println!("{}: snapshot removed", name);
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::SnapshotDelete,
-        Some(name),
-        None,
-    );
+    mvm_core::audit_emit!(SnapshotDelete, vm: name);
     Ok(())
 }

@@ -1111,11 +1111,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         emit_launched_if(&admission_main, effective_hypervisor);
     }
 
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::VmStart,
-        Some(&vm_name_owned),
-        None,
-    );
+    mvm_core::audit_emit!(VmStart, vm: &vm_name_owned);
 
     // Apple Virtualization VMs live in-process — the process must stay alive.
     if effective_hypervisor == "apple-container" && !detach {
@@ -1353,11 +1349,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 ));
             } else {
                 emit_launched_if(&watch_admission, effective_hypervisor);
-                mvm_core::audit::emit(
-                    mvm_core::audit::LocalAuditKind::VmStart,
-                    Some(&vm_name_owned),
-                    None,
-                );
+                mvm_core::audit_emit!(VmStart, vm: &vm_name_owned);
                 ui::success(&format!("VM '{}' rebooted.", vm_name_owned));
             }
         }
