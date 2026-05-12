@@ -568,6 +568,27 @@ fn ensure_dev_image() -> Result<(String, String)> {
         prune_old_prebuilts(&prebuilt_root, version);
         return Ok((kernel_path, rootfs_path));
     }
+    // Source-checkout-first. When the binary was compiled out of an
+    // mvm source tree that has `nix/images/dev-prebuilt/<arch>/`
+    // populated, that's the authoritative dev image for this build —
+    // skip GitHub entirely. The helper returns `None` for installed
+    // binaries (their `CARGO_MANIFEST_DIR` resolves into
+    // `~/.cargo/registry/` where the directory will never exist) and
+    // for source checkouts that haven't vendored anything yet, in
+    // which case we fall through to the published prebuilt as before.
+    if let Some((src_kernel, src_rootfs, source_label)) = find_vendored_dev_image() {
+        ui::info(&format!(
+            "Using vendored dev image from source checkout ({source_label})."
+        ));
+        std::fs::copy(&src_kernel, &kernel_path)
+            .with_context(|| format!("copying vendored kernel {src_kernel:?} → {kernel_path}"))?;
+        std::fs::copy(&src_rootfs, &rootfs_path)
+            .with_context(|| format!("copying vendored rootfs {src_rootfs:?} → {rootfs_path}"))?;
+        // No prune — vendored is the source of truth for this binary,
+        // not a download; leaving older `v*/` dirs around lets
+        // installed-binary users keep their offline-fallback cache.
+        return Ok((kernel_path, rootfs_path));
+    }
     // Try the published prebuilt. Defer the prune until *after* a
     // successful download — old `~/.mvm/dev/prebuilt/v*/` dirs and
     // historical `~/.mvm/dev/builds/<hash>/` artifacts are our last-
@@ -582,8 +603,7 @@ fn ensure_dev_image() -> Result<(String, String)> {
                 "Could not download dev image for v{version}: {download_err}\n\
                  Searching for a local fallback under ~/.mvm/dev/."
             ));
-            let fallback = find_local_fallback_image().or_else(find_vendored_dev_image);
-            if let Some((src_kernel, src_rootfs, source_label)) = fallback {
+            if let Some((src_kernel, src_rootfs, source_label)) = find_local_fallback_image() {
                 ui::warn(&format!(
                     "Using local fallback from {source_label}. \
                      This is not the published v{version} image — boot it knowing the \
@@ -599,9 +619,8 @@ fn ensure_dev_image() -> Result<(String, String)> {
                 Ok((kernel_path, rootfs_path))
             } else {
                 Err(download_err.context(
-                    "no local fallback found under ~/.mvm/dev/prebuilt/v*/, \
-                     ~/.mvm/dev/builds/*/, or the source-checkout's \
-                     nix/images/dev-prebuilt/<arch>/",
+                    "no local fallback found under ~/.mvm/dev/prebuilt/v*/ \
+                     or ~/.mvm/dev/builds/*/",
                 ))
             }
         }
