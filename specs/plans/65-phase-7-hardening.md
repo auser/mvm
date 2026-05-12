@@ -100,33 +100,52 @@ uses a test server returning a known body length and asserts
 the accumulated body never exceeds the cap by more than zero
 bytes.
 
-### W4 — API keys in env vars (MEDIUM, v0 acceptable)
+### W4 — API keys in env vars → secret_store fallback (SHIPPED)
+
+**Status (2026-05-11 — ✅ shipped):**
 
 **Threat:** Environment variables (`BRAVE_SEARCH_API_KEY`,
-`TAVILY_API_KEY`, `GOOGLE_API_KEY`) are visible to the
-calling user via `/proc/<pid>/environ` (mode 0400 on Linux,
-readable by uid 0 and the calling user only).
+`TAVILY_API_KEY`, `GOOGLE_API_KEY`, `GOOGLE_CSE_ID`) are visible
+to the calling user via `/proc/<pid>/environ` (mode 0400 on
+Linux, readable by uid 0 and the calling user only).
 
-**Mitigation (v0):** Document the limitation. The CLAUDE.md
-threat model already names "mvmctl trusts the host with
-private build keys" — env-var-readable-by-uid is consistent.
+**Mitigation (shipped):** `build_tool_registry` resolves each
+provider credential through `resolve_provider_credential`,
+which falls back to `mvm-security::secret_store` (OS keyring
+on Mac/Linux+gnome-keyring; file fallback elsewhere, mode 0600
+under `~/.mvm/secrets/local/`) when the operator opts in via
+the `*_FROM_SECRET` env-var pair.
 
-**Mitigation (follow-up, plan 65 W4):** Pull provider API keys
-from `mvm-security::secret_store` (the keyring backend
-`mvmctl secret` already uses). Operator workflow:
+Resolution order:
+
+1. Direct value env var (`BRAVE_SEARCH_API_KEY` etc.) — wins
+   when set and non-empty; preserves backward compatibility.
+2. Secret-name env var (`BRAVE_API_KEY_FROM_SECRET` etc.) —
+   names a secret stored via `mvmctl secret put`.
+3. Otherwise — `None`; the "allowed-but-unregistered"
+   config-drift error fires at invoke time.
+
+Operator workflow (hardened posture):
 
 ```bash
 mvmctl secret put brave-api-key --value-file <(cat brave.key)
-# then in env:
+mvmctl secret put google-api-key --value-file <(cat google.key)
+mvmctl secret put google-cse-id --value-file <(echo $GOOGLE_CSE_ID)
+
 export BRAVE_API_KEY_FROM_SECRET=brave-api-key
+export GOOGLE_API_KEY_FROM_SECRET=google-api-key
+export GOOGLE_CSE_ID_FROM_SECRET=google-cse-id
+export MVM_WEB_SEARCH_ALLOWLIST=brave,google
+mvmctl mcp stdio
 ```
 
-`BraveSearchProvider::new` resolves either a literal value
-(`BRAVE_SEARCH_API_KEY`) OR a secret-store reference
-(`BRAVE_API_KEY_FROM_SECRET`).
-
-**Exit test (when shipped):**
-`build_tool_registry::tests::resolves_brave_key_from_secret_store`.
+Exit tests (shipped):
+- `resolve_credential_returns_direct_env_var_when_set`
+- `resolve_credential_returns_secret_store_value_when_direct_unset`
+- `resolve_credential_prefers_direct_when_both_set`
+- `resolve_credential_returns_none_when_neither_env_var_set`
+- `resolve_credential_skips_empty_direct_value`
+- `resolve_credential_returns_none_on_secret_store_miss`
 
 ### W5 — Google's API-key-in-URL surface (CRITICAL when Google ships)
 
@@ -186,12 +205,12 @@ so a future audit doesn't re-flag them:
 
 ## Implementation order
 
-| Slice | Threats | Surface | Tests |
-|-------|---------|---------|-------|
-| 1 | W1 + W3 | `ReqwestHttpFetcher` constructor + chunk loop | redirect-policy + body-cap-exact |
-| 2 | W2 | New `staging::SsrfDnsResolver` + reqwest pin | resolve-rejects-private + e2e |
-| 3 | W5 | `GoogleSearchProvider` built on the hardened fetcher | key-not-in-error-strings |
-| 4 (deferred) | W4 | `secret_store` resolution in `build_tool_registry` | key-from-secret-store |
+| Slice | Threats | Surface | Tests | Commit |
+|-------|---------|---------|-------|--------|
+| 1 | W1 + W3 | `ReqwestHttpFetcher` constructor + chunk loop | redirect-policy + body-cap-exact | `bfb82c6` |
+| 2 | W2 | Pre-resolve through `SsrfGuard::classify` + `PinnedDnsResolver` | ssrf-rejects-loopback/imds/rfc1918 | `5bbae28` |
+| 3 | W5 | `GoogleSearchProvider` + `redact_credentials` + redacted Debug | network-error-does-not-leak-api-key | `09839ab` |
+| 4 | W4 | `resolve_provider_credential` falls back to `mvm_security::secret_store` | direct-wins / fallback / miss / empty-direct | (this commit) |
 
 Each slice lands as a separate commit with workspace tests +
 clippy `-D warnings` + secret-types xtask all clean.

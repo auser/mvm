@@ -28,6 +28,7 @@ use mvm_mcp::{
 };
 use mvm_supervisor::ToolRegistry;
 use mvm_supervisor::tools::{download, staging, upload, web_fetch, web_search};
+use secrecy::ExposeSecret;
 
 use super::Cli;
 
@@ -148,6 +149,78 @@ impl Default for ExecDispatcher {
     }
 }
 
+/// Plan 65 W4 — operator-rotatable provider credentials. When set,
+/// the value names a secret stored via `mvmctl secret put` (default
+/// tenant `local`). The supervisor fetches the value through
+/// `mvm_security::secret_store::default_secret_store()` — OS
+/// keyring on Mac/Linux with gnome-keyring, file fallback elsewhere
+/// (mode 0600 under `~/.mvm/secrets/local/`).
+///
+/// Pattern: each provider gets *one* "from secret" env var paired
+/// with the existing "direct value" env var. The direct value wins
+/// when both are set (backward compatibility); operators rotating
+/// from env-var to secret-store posture rm-and-rebuild their shell
+/// init.
+const BRAVE_API_KEY_FROM_SECRET_ENV_VAR: &str = "BRAVE_API_KEY_FROM_SECRET";
+const TAVILY_API_KEY_FROM_SECRET_ENV_VAR: &str = "TAVILY_API_KEY_FROM_SECRET";
+const GOOGLE_API_KEY_FROM_SECRET_ENV_VAR: &str = "GOOGLE_API_KEY_FROM_SECRET";
+const GOOGLE_CSE_ID_FROM_SECRET_ENV_VAR: &str = "GOOGLE_CSE_ID_FROM_SECRET";
+
+/// Tenant id under which provider credentials are stored. Matches
+/// the default tenant `mvmctl secret put` uses, so an operator can
+/// run `mvmctl secret put brave-api-key --value-file <(cat key)`
+/// and reference it via `BRAVE_API_KEY_FROM_SECRET=brave-api-key`.
+const PROVIDER_CREDENTIAL_TENANT: &str = "local";
+
+/// Plan 65 W4 — resolve a provider credential from either the
+/// direct-value env var (v0 posture, visible to the calling user
+/// via `/proc/<pid>/environ`) or a named secret in the secret store
+/// (hardened posture, file mode 0600 or OS keyring).
+///
+/// Resolution order:
+/// 1. `direct_env_var` — if set and non-empty, use it verbatim.
+/// 2. `secret_ref_env_var` — if set, look up that name in the
+///    secret store under the `local` tenant. If the lookup fails
+///    (missing entry, permission error, store wedged), log a
+///    `tracing::warn` and return `None` — the existing
+///    "allowed-but-unregistered" config-drift error fires at
+///    invoke time, which is the operator's downstream signal.
+/// 3. Otherwise — `None` (caller treats as unconfigured).
+///
+/// The returned `String` is NOT a `SecretBox` because each
+/// downstream provider (`BraveSearchProvider`, etc.) takes a
+/// `String` and pins it inside its own struct. The unwrap is the
+/// boundary; from this point forward the key lives behind the
+/// provider's hand-written `Debug` redaction (W5 pattern).
+fn resolve_provider_credential(
+    direct_env_var: &str,
+    secret_ref_env_var: &str,
+    store: &dyn mvm_security::secret_store::SecretStore,
+) -> Option<String> {
+    if let Ok(direct) = std::env::var(direct_env_var)
+        && !direct.is_empty()
+    {
+        return Some(direct);
+    }
+    let secret_name = std::env::var(secret_ref_env_var).ok()?;
+    if secret_name.is_empty() {
+        return None;
+    }
+    match store.get(PROVIDER_CREDENTIAL_TENANT, &secret_name) {
+        Ok(secret) => Some(secret.expose_secret().clone()),
+        Err(e) => {
+            tracing::warn!(
+                env_var = secret_ref_env_var,
+                secret_name = %secret_name,
+                tenant = PROVIDER_CREDENTIAL_TENANT,
+                error = %e,
+                "could not resolve provider credential from secret_store"
+            );
+            None
+        }
+    }
+}
+
 /// Build the Phase 7 tool registry the MCP dispatcher hands out.
 ///
 /// Today:
@@ -207,8 +280,19 @@ fn build_tool_registry() -> ToolRegistry {
         .unwrap_or_else(|| "noop".to_string());
     let mut search_tool =
         web_search::WebSearchTool::with_allowlist(search_allow.iter().cloned(), default_provider);
+    // Plan 65 W4 — credentials resolve through env var OR named
+    // secret-store entry. The secret_store backs `mvmctl secret`
+    // (OS keyring on Mac/Linux with gnome-keyring, file fallback
+    // elsewhere). Operators rotate by re-running `mvmctl secret
+    // put`; the supervisor picks up the new value on next
+    // `mvmctl mcp stdio` boot.
+    let secret_store = mvm_security::secret_store::default_secret_store();
     if search_allow.contains("brave")
-        && let Ok(key) = std::env::var(web_search::BRAVE_API_KEY_ENV_VAR)
+        && let Some(key) = resolve_provider_credential(
+            web_search::BRAVE_API_KEY_ENV_VAR,
+            BRAVE_API_KEY_FROM_SECRET_ENV_VAR,
+            secret_store.as_ref(),
+        )
     {
         match web_search::BraveSearchProvider::new(key) {
             Ok(p) => {
@@ -224,7 +308,11 @@ fn build_tool_registry() -> ToolRegistry {
         }
     }
     if search_allow.contains("tavily")
-        && let Ok(key) = std::env::var(web_search::TAVILY_API_KEY_ENV_VAR)
+        && let Some(key) = resolve_provider_credential(
+            web_search::TAVILY_API_KEY_ENV_VAR,
+            TAVILY_API_KEY_FROM_SECRET_ENV_VAR,
+            secret_store.as_ref(),
+        )
     {
         match web_search::TavilySearchProvider::new(key) {
             Ok(p) => {
@@ -239,37 +327,49 @@ fn build_tool_registry() -> ToolRegistry {
             }
         }
     }
-    if search_allow.contains("google")
-        && let Ok(api_key) = std::env::var(web_search::GOOGLE_API_KEY_ENV_VAR)
-        && let Ok(cse_id) = std::env::var(web_search::GOOGLE_CSE_ID_ENV_VAR)
-    {
-        match web_search::GoogleSearchProvider::new(api_key, cse_id) {
-            Ok(p) => {
-                search_tool = search_tool.register_provider(Arc::new(p));
+    if search_allow.contains("google") {
+        let api_key = resolve_provider_credential(
+            web_search::GOOGLE_API_KEY_ENV_VAR,
+            GOOGLE_API_KEY_FROM_SECRET_ENV_VAR,
+            secret_store.as_ref(),
+        );
+        let cse_id = resolve_provider_credential(
+            web_search::GOOGLE_CSE_ID_ENV_VAR,
+            GOOGLE_CSE_ID_FROM_SECRET_ENV_VAR,
+            secret_store.as_ref(),
+        );
+        match (api_key, cse_id) {
+            (Some(api_key), Some(cse_id)) => {
+                match web_search::GoogleSearchProvider::new(api_key, cse_id) {
+                    Ok(p) => {
+                        search_tool = search_tool.register_provider(Arc::new(p));
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            error = %e,
+                            "GoogleSearchProvider init failed; mvm.web_search 'google' provider will \
+                             be allowlisted-but-unregistered"
+                        );
+                    }
+                }
             }
-            Err(e) => {
-                // Plan 65 W5: the error from `new()` doesn't carry the
-                // key (construction only builds the reqwest client),
-                // but be conservative and don't propagate `e` into
-                // `tracing` via `Display` either — log the canonical
-                // message only.
+            _ => {
+                // Helpful diagnostic — one or both of API key + CSE
+                // ID isn't reachable via env var or secret store.
+                // The existing "allowed-but-unregistered" config-
+                // drift error fires at invoke time too, but this
+                // warning surfaces the issue at supervisor boot.
                 tracing::warn!(
-                    error = %e,
-                    "GoogleSearchProvider init failed; mvm.web_search 'google' provider will be \
-                     allowlisted-but-unregistered"
+                    "mvm.web_search 'google' is allowlisted but the API key and/or CSE ID is not \
+                     reachable via env var ({}, {}) or secret_store ({}, {}); provider will be \
+                     allowlisted-but-unregistered",
+                    web_search::GOOGLE_API_KEY_ENV_VAR,
+                    web_search::GOOGLE_CSE_ID_ENV_VAR,
+                    GOOGLE_API_KEY_FROM_SECRET_ENV_VAR,
+                    GOOGLE_CSE_ID_FROM_SECRET_ENV_VAR,
                 );
             }
         }
-    } else if search_allow.contains("google") {
-        // Helpful diagnostic when only one of the two env vars is
-        // set — the existing "allowed-but-unregistered" config-drift
-        // error fires at invoke time, but the operator might miss it.
-        tracing::warn!(
-            "mvm.web_search 'google' is allowlisted but {} and/or {} is unset; \
-             provider will be allowlisted-but-unregistered",
-            web_search::GOOGLE_API_KEY_ENV_VAR,
-            web_search::GOOGLE_CSE_ID_ENV_VAR,
-        );
     }
     registry.register(Box::new(search_tool));
 
@@ -845,5 +945,142 @@ mod tests {
         assert!(result.is_error);
         let ContentBlock::Text { text } = &result.content[0];
         assert!(text.contains("not on per-tenant allowlist"), "got: {text}");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Plan 65 W4 — resolve_provider_credential
+    //
+    // Env-var manipulation in tests is process-global, so each
+    // test uses a unique env-var name to avoid races with parallel
+    // tests touching the same key.
+    // ──────────────────────────────────────────────────────────────
+
+    use mvm_security::secret_store::{FileSecretStore, SecretStore};
+    use secrecy::SecretBox;
+
+    fn tempdir_store() -> (tempfile::TempDir, FileSecretStore) {
+        let dir = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::with_dir(dir.path());
+        (dir, store)
+    }
+
+    #[test]
+    fn resolve_credential_returns_direct_env_var_when_set() {
+        let direct = "MVM_TEST_CRED_DIRECT_RETURNED";
+        let secret = "MVM_TEST_CRED_DIRECT_RETURNED_FROM_SECRET";
+        unsafe {
+            std::env::set_var(direct, "direct-value");
+        }
+        let (_dir, store) = tempdir_store();
+        let resolved = resolve_provider_credential(direct, secret, &store);
+        unsafe {
+            std::env::remove_var(direct);
+        }
+        assert_eq!(resolved.as_deref(), Some("direct-value"));
+    }
+
+    #[test]
+    fn resolve_credential_returns_secret_store_value_when_direct_unset() {
+        let direct = "MVM_TEST_CRED_FALLBACK_DIRECT";
+        let secret_ref = "MVM_TEST_CRED_FALLBACK_FROM_SECRET";
+        unsafe {
+            std::env::set_var(secret_ref, "my-stored-key");
+        }
+        let (_dir, store) = tempdir_store();
+        store
+            .put(
+                PROVIDER_CREDENTIAL_TENANT,
+                "my-stored-key",
+                &SecretBox::new(Box::new("from-store".to_string())),
+            )
+            .unwrap();
+        let resolved = resolve_provider_credential(direct, secret_ref, &store);
+        unsafe {
+            std::env::remove_var(secret_ref);
+        }
+        assert_eq!(resolved.as_deref(), Some("from-store"));
+    }
+
+    #[test]
+    fn resolve_credential_prefers_direct_when_both_set() {
+        // Backward-compat invariant: the direct value wins when an
+        // operator has both env vars set.
+        let direct = "MVM_TEST_CRED_PRIORITY_DIRECT";
+        let secret_ref = "MVM_TEST_CRED_PRIORITY_FROM_SECRET";
+        unsafe {
+            std::env::set_var(direct, "direct-wins");
+            std::env::set_var(secret_ref, "stored-name");
+        }
+        let (_dir, store) = tempdir_store();
+        store
+            .put(
+                PROVIDER_CREDENTIAL_TENANT,
+                "stored-name",
+                &SecretBox::new(Box::new("stored-loses".to_string())),
+            )
+            .unwrap();
+        let resolved = resolve_provider_credential(direct, secret_ref, &store);
+        unsafe {
+            std::env::remove_var(direct);
+            std::env::remove_var(secret_ref);
+        }
+        assert_eq!(resolved.as_deref(), Some("direct-wins"));
+    }
+
+    #[test]
+    fn resolve_credential_returns_none_when_neither_env_var_set() {
+        let (_dir, store) = tempdir_store();
+        let resolved = resolve_provider_credential(
+            "MVM_TEST_CRED_UNSET_DIRECT_DEFINITELY",
+            "MVM_TEST_CRED_UNSET_REF_DEFINITELY",
+            &store,
+        );
+        assert!(resolved.is_none());
+    }
+
+    #[test]
+    fn resolve_credential_skips_empty_direct_value() {
+        // An empty env var is functionally unset. Fall through to
+        // the secret-store lookup.
+        let direct = "MVM_TEST_CRED_EMPTY_DIRECT";
+        let secret_ref = "MVM_TEST_CRED_EMPTY_FROM_SECRET";
+        unsafe {
+            std::env::set_var(direct, "");
+            std::env::set_var(secret_ref, "actual-name");
+        }
+        let (_dir, store) = tempdir_store();
+        store
+            .put(
+                PROVIDER_CREDENTIAL_TENANT,
+                "actual-name",
+                &SecretBox::new(Box::new("from-store-fallback".to_string())),
+            )
+            .unwrap();
+        let resolved = resolve_provider_credential(direct, secret_ref, &store);
+        unsafe {
+            std::env::remove_var(direct);
+            std::env::remove_var(secret_ref);
+        }
+        assert_eq!(resolved.as_deref(), Some("from-store-fallback"));
+    }
+
+    #[test]
+    fn resolve_credential_returns_none_on_secret_store_miss() {
+        // The secret-name env var is set but the named secret
+        // doesn't exist in the store. The resolver returns None
+        // so the caller's existing "allowed-but-unregistered"
+        // config-drift path fires; a tracing::warn surfaces the
+        // miss to the operator at boot time.
+        let secret_ref = "MVM_TEST_CRED_MISS_FROM_SECRET";
+        unsafe {
+            std::env::set_var(secret_ref, "no-such-name");
+        }
+        let (_dir, store) = tempdir_store();
+        let resolved =
+            resolve_provider_credential("MVM_TEST_CRED_MISS_DIRECT_UNSET", secret_ref, &store);
+        unsafe {
+            std::env::remove_var(secret_ref);
+        }
+        assert!(resolved.is_none());
     }
 }
