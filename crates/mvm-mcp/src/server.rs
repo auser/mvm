@@ -139,13 +139,19 @@ fn tools_call_response<D: Dispatcher>(
         .get("name")
         .and_then(Value::as_str)
         .ok_or_else(|| JsonRpcError::invalid_params("missing tool name"))?;
-    if name != "run" {
-        return Err(JsonRpcError::method_not_found(&format!("tool '{name}'")));
-    }
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
-    let run_params: RunParams = serde_json::from_value(args)
-        .map_err(|e| JsonRpcError::invalid_params(format!("decoding `run` params: {e}")))?;
-    let result = dispatcher.run(run_params);
+    let result = if name == "run" {
+        // Legacy single-tool path — typed RunParams + microVM dispatch.
+        let run_params: RunParams = serde_json::from_value(args)
+            .map_err(|e| JsonRpcError::invalid_params(format!("decoding `run` params: {e}")))?;
+        dispatcher.run(run_params)
+    } else {
+        // Plan 60 Phase 7 — typed-name registry tools (mvm.time_now,
+        // mvm.web_fetch, mvm.web_search, …). The dispatcher's
+        // `invoke_tool` decides; an unwired dispatcher's default impl
+        // returns an `is_error: true` ToolResult naming the tool.
+        dispatcher.invoke_tool(name, args)
+    };
     serde_json::to_value(&result)
         .map_err(|e| JsonRpcError::internal_error(format!("encoding tool result: {e}")))
 }
@@ -191,7 +197,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_single_run_tool() {
+    fn tools_list_returns_run_and_phase_7_tools() {
         let dispatcher = MockDispatcher {
             last_env: std::sync::Mutex::new(None),
         };
@@ -199,8 +205,11 @@ mod tests {
         let resp = run_one(req, &dispatcher);
         let result = resp.result.unwrap();
         let tools = result["tools"].as_array().unwrap();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0]["name"], "run");
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert!(names.contains(&"run"), "got: {names:?}");
+        assert!(names.contains(&"mvm.time_now"), "got: {names:?}");
+        assert!(names.contains(&"mvm.web_fetch"), "got: {names:?}");
+        assert!(names.contains(&"mvm.web_search"), "got: {names:?}");
     }
 
     #[test]
@@ -223,17 +232,27 @@ mod tests {
     }
 
     #[test]
-    fn tools_call_rejects_unknown_tool_name() {
+    fn tools_call_routes_unknown_tool_to_invoke_tool_default() {
+        // Plan 60 Phase 7: names other than `run` route through
+        // `Dispatcher::invoke_tool`. The MockDispatcher inherits the
+        // default impl, which returns an `is_error: true` ToolResult
+        // (NOT a JSON-RPC method-not-found). The MCP wire layer
+        // returns success at the JSON-RPC level so the client doesn't
+        // retry — the structured error reaches the LLM via the
+        // tool_result envelope.
         let dispatcher = MockDispatcher {
             last_env: std::sync::Mutex::new(None),
         };
         let req = r#"{
             "jsonrpc":"2.0","id":4,"method":"tools/call",
-            "params":{"name":"not-a-tool","arguments":{}}
+            "params":{"name":"mvm.time_now","arguments":{}}
         }"#;
         let resp = run_one(req, &dispatcher);
-        let err = resp.error.unwrap();
-        assert_eq!(err.code, -32601, "method not found");
+        assert!(resp.error.is_none(), "got JSON-RPC error: {:?}", resp.error);
+        let result = resp.result.unwrap();
+        assert_eq!(result["isError"], true);
+        let text = result["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("mvm.time_now"), "got: {text}");
     }
 
     #[test]
