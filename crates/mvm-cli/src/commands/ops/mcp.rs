@@ -212,6 +212,22 @@ fn build_tool_registry() -> ToolRegistry {
             }
         }
     }
+    if search_allow.contains("tavily")
+        && let Ok(key) = std::env::var(web_search::TAVILY_API_KEY_ENV_VAR)
+    {
+        match web_search::TavilySearchProvider::new(key) {
+            Ok(p) => {
+                search_tool = search_tool.register_provider(Arc::new(p));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "TavilySearchProvider init failed; mvm.web_search 'tavily' provider will be \
+                     allowlisted-but-unregistered"
+                );
+            }
+        }
+    }
     registry.register(Box::new(search_tool));
 
     registry

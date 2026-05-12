@@ -401,6 +401,125 @@ impl HostMediatedTool for WebSearchTool {
     }
 }
 
+/// Tavily Search API provider. Documented at
+/// <https://docs.tavily.com/api-reference/endpoint/search>.
+///
+/// Tavily's auth shape differs from Brave's: the API key travels
+/// inside the JSON request body (`"api_key": "<key>"`), and the
+/// search itself is a POST (not a GET-with-query-string). Otherwise
+/// the abstraction matches — supervisor owns the key, the agent
+/// never sees it.
+///
+/// Tavily is "search-for-LLMs" by design: each result row carries
+/// a `content` field that's an LLM-friendly snippet (often longer
+/// than Brave's `description`). We map it to `snippet` so the
+/// agent surface stays uniform across providers.
+pub struct TavilySearchProvider {
+    api_key: String,
+    client: reqwest::Client,
+    endpoint: String,
+}
+
+impl TavilySearchProvider {
+    /// Canonical Tavily Search API endpoint.
+    pub const DEFAULT_ENDPOINT: &'static str = "https://api.tavily.com/search";
+
+    /// Default per-call timeout. Tavily aggregates multiple
+    /// upstreams and historically responds in 1-3 s; 20 s gives
+    /// plenty of headroom for the slow-tail case.
+    const DEFAULT_TIMEOUT_SECS: u64 = 20;
+
+    /// Build with the default endpoint + a fresh reqwest client.
+    pub fn new(api_key: impl Into<String>) -> Result<Self, SearchError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS))
+            .build()
+            .map_err(|e| SearchError::Upstream(format!("building reqwest client: {e}")))?;
+        Ok(Self {
+            api_key: api_key.into(),
+            client,
+            endpoint: Self::DEFAULT_ENDPOINT.to_string(),
+        })
+    }
+
+    /// Test seam — point at a mock HTTP server. Production callers
+    /// stick with the default.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+}
+
+/// Minimal extractor for Tavily's `/search` response. Like the
+/// Brave extractor, we intentionally do NOT
+/// `deny_unknown_fields` — Tavily adds optional fields over time
+/// (`answer`, `images`, `follow_up_questions`, `response_time`)
+/// and an upstream addition shouldn't brittle our parse.
+#[derive(Debug, Deserialize)]
+struct TavilyResponse {
+    #[serde(default)]
+    results: Vec<TavilyResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct TavilyResult {
+    title: String,
+    url: String,
+    #[serde(default)]
+    content: String,
+}
+
+#[async_trait]
+impl SearchProvider for TavilySearchProvider {
+    fn name(&self) -> &'static str {
+        "tavily"
+    }
+
+    async fn search(&self, query: &str, max_results: u32) -> Result<Vec<SearchHit>, SearchError> {
+        // Tavily's documented cap is 20 results per call. Clamp so a
+        // caller-supplied 50 doesn't trip an upstream 422.
+        let max = max_results.min(20);
+        let body = serde_json::json!({
+            "api_key": self.api_key,
+            "query": query,
+            "max_results": max,
+        });
+        let response = self
+            .client
+            .post(&self.endpoint)
+            .json(&body)
+            .send()
+            .await
+            .map_err(|e| SearchError::Upstream(e.to_string()))?;
+        let status = response.status();
+        if status.as_u16() == 429 {
+            return Err(SearchError::RateLimited);
+        }
+        if !status.is_success() {
+            return Err(SearchError::Upstream(format!(
+                "Tavily search returned status {status}"
+            )));
+        }
+        let parsed: TavilyResponse = response
+            .json()
+            .await
+            .map_err(|e| SearchError::Upstream(format!("decoding Tavily response: {e}")))?;
+        let hits: Vec<SearchHit> = parsed
+            .results
+            .into_iter()
+            .map(|r| SearchHit {
+                title: r.title,
+                url: r.url,
+                snippet: r.content,
+            })
+            .collect();
+        if hits.is_empty() {
+            return Err(SearchError::Empty);
+        }
+        Ok(hits)
+    }
+}
+
 /// Parse a comma-separated env-var into a set of provider names.
 /// Same shape as [`crate::tools::web_fetch::allowlist_from_env_var`];
 /// kept as a sibling for tidiness rather than re-exported, since
@@ -430,6 +549,11 @@ pub const DEFAULT_PROVIDER_ENV_VAR: &str = "MVM_WEB_SEARCH_DEFAULT";
 /// When unset (and `"brave"` is on the allowlist), the "allowed
 /// but unregistered" config-drift error fires on first invoke.
 pub const BRAVE_API_KEY_ENV_VAR: &str = "BRAVE_SEARCH_API_KEY";
+
+/// Canonical env-var name for the operator's Tavily API key. Same
+/// posture as [`BRAVE_API_KEY_ENV_VAR`] — set this and put
+/// `"tavily"` on `MVM_WEB_SEARCH_ALLOWLIST` to enable.
+pub const TAVILY_API_KEY_ENV_VAR: &str = "TAVILY_API_KEY";
 
 #[cfg(test)]
 mod tests {
@@ -776,6 +900,78 @@ mod tests {
         }"#;
         let r: BraveResult = serde_json::from_str(json).expect("parse");
         assert_eq!(r.description, "");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // TavilySearchProvider
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn tavily_provider_is_named_tavily() {
+        let p = TavilySearchProvider::new("test-key").expect("build tavily");
+        assert_eq!(p.name(), "tavily");
+    }
+
+    #[test]
+    fn tavily_provider_constructs_with_default_endpoint() {
+        let p = TavilySearchProvider::new("key").unwrap();
+        assert_eq!(p.endpoint, TavilySearchProvider::DEFAULT_ENDPOINT);
+    }
+
+    #[test]
+    fn tavily_provider_with_endpoint_overrides() {
+        let p = TavilySearchProvider::new("key")
+            .unwrap()
+            .with_endpoint("https://mock.test/search");
+        assert_eq!(p.endpoint, "https://mock.test/search");
+    }
+
+    #[test]
+    fn tavily_response_parses_canonical_payload() {
+        let json = r#"{
+            "query": "rust async",
+            "response_time": 1.23,
+            "results": [
+                {
+                    "title": "Tokio",
+                    "url": "https://tokio.rs/",
+                    "content": "An asynchronous runtime for Rust",
+                    "score": 0.95,
+                    "raw_content": null
+                },
+                {
+                    "title": "async-std",
+                    "url": "https://async.rs/",
+                    "content": "Async version of the Rust standard library"
+                }
+            ]
+        }"#;
+        let parsed: TavilyResponse = serde_json::from_str(json).expect("parse");
+        assert_eq!(parsed.results.len(), 2);
+        assert_eq!(parsed.results[0].title, "Tokio");
+        assert_eq!(parsed.results[0].url, "https://tokio.rs/");
+        assert!(parsed.results[0].content.contains("asynchronous"));
+    }
+
+    #[test]
+    fn tavily_response_handles_missing_results_field() {
+        // A query with no hits may omit `results`. The extractor
+        // defaults to empty so a downstream `if hits.is_empty()`
+        // check fires SearchError::Empty cleanly.
+        let json = r#"{ "query": "x", "response_time": 0.4 }"#;
+        let parsed: TavilyResponse = serde_json::from_str(json).expect("parse");
+        assert!(parsed.results.is_empty());
+    }
+
+    #[test]
+    fn tavily_result_tolerates_missing_content() {
+        // Tavily occasionally returns hits without `content` for
+        // image / video rows. Map to empty snippet.
+        let json = r#"{
+            "title": "x", "url": "https://x.test/"
+        }"#;
+        let r: TavilyResult = serde_json::from_str(json).expect("parse");
+        assert_eq!(r.content, "");
     }
 
     // ──────────────────────────────────────────────────────────────
