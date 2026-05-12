@@ -273,6 +273,36 @@ fn manifest_prune_orphans_emits_slot_prune_audit_entry() {
 }
 
 #[test]
+fn manifest_prune_orphans_dry_run_does_not_emit_audit_entry() {
+    // Negative complement to `manifest_prune_orphans_emits_slot_prune…`.
+    // Plan 37 §6 says state-changing verbs emit on every attempt; the
+    // dry-run path is read-only by contract and must NOT emit. The
+    // implementation routes dry-run to `run_dry` (manifest/prune.rs)
+    // which returns before reaching the `audit::emit` call — this
+    // test pins that against a future regression that moves the
+    // emit above the dry-run branch.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["manifest", "prune", "--orphans", "--dry-run"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest prune --orphans --dry-run failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "slot_prune");
+    assert_eq!(
+        hits, 0,
+        "dry-run must not write audit entries, got {hits} slot_prune \
+         entry/entries. Full log:\n{log}"
+    );
+}
+
+#[test]
 fn secret_put_emits_put_action_in_secret_audit_log() {
     // The `mvmctl secret` command writes per-action JSONL to a
     // separate audit file (`~/.mvm/audit/secrets.jsonl`); the
