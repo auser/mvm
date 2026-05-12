@@ -1427,8 +1427,18 @@ fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(Strin
 }
 
 /// Find the dev-image Nix flake directory.
+///
+/// Returns `Ok(path)` only when `nix/images/builder/flake.nix` is present —
+/// that flake is the only one whose `packages.<sys>.default` output
+/// produces the vmlinux + rootfs.ext4 + sidecar shape that
+/// `MicrosandboxBuilderVm::run_build` extracts from `/out`. The
+/// parent `nix/flake.nix` exposes a library (`lib.mkGuest`) plus an
+/// `internal-minimal-runner` test fixture, neither of which match
+/// that contract — falling back to it earlier yielded a misleading
+/// "double-prefix attribute" `nix build` failure inside the
+/// sandbox. The bail signals `ensure_dev_image` to take the
+/// published-prebuilt download path (W5.1 — hash-verified).
 fn find_dev_image_flake() -> Result<String> {
-    // Check in the source tree
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = std::path::Path::new(manifest_dir)
         .parent()
@@ -1440,16 +1450,7 @@ fn find_dev_image_flake() -> Result<String> {
         return Ok(candidate.to_str().unwrap_or(".").to_string());
     }
 
-    // Fall back to the parent flake's minimal profile
-    let parent = workspace_root.join("nix");
-    if parent.join("flake.nix").exists() {
-        return Ok(parent.to_str().unwrap_or(".").to_string());
-    }
-
-    anyhow::bail!(
-        "Dev image flake not found. Expected at nix/images/builder/flake.nix\n\
-         or nix/flake.nix"
-    )
+    anyhow::bail!("Dev image flake not found. Expected at nix/images/builder/flake.nix")
 }
 
 /// Locate the bundled `nix/images/default-tenant/` flake.

@@ -28,6 +28,10 @@
 //! - `mvmctl manifest alias set <tpl> <alias> <rev>` → `ManifestAliasSet`
 //! - `mvmctl manifest alias rm <tpl> <alias>` → `ManifestAliasRemove`
 //! - `mvmctl manifest alias ls <tpl>` → **no** audit entry
+//! - `mvmctl manifest rm <path> --force` → `SlotRemove`
+//!   (idempotent against a missing slot — `--force` is the cleanup
+//!   contract; the stub `mvm.toml` is enough to canonicalise the
+//!   path key)
 //! - `mvmctl secret put / get / ls / rm` → secret-side audit JSONL
 //!   at `~/.mvm/audit/secrets.jsonl` carries one entry per call
 //!   with `"action":"put"` / `"get"` / `"list"` / `"delete"`. The
@@ -467,6 +471,44 @@ fn manifest_tag_ls_does_not_emit_audit_entry() {
         0,
         "read-only `manifest tag ls` must not emit; got {add_hits} add \
          and {rm_hits} remove entries. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_rm_emits_slot_remove_audit_entry() {
+    // `manifest rm <path> --force` removes the slot keyed on the
+    // canonicalised manifest path. The `--force` flag makes
+    // `template_delete_slot` idempotent against missing slots, so
+    // the test works against a fresh sandbox: write a stub
+    // `mvm.toml`, then drive `manifest rm` — the audit entry lands
+    // even though the slot directory was never created.
+    let sandbox = AuditSandbox::new();
+    let manifest_path = sandbox.home_path().join("mvm.toml");
+    std::fs::write(&manifest_path, "[meta]\nname = \"live-test-rm\"\n")
+        .expect("write stub mvm.toml");
+
+    let output = sandbox
+        .mvmctl()
+        .args([
+            "manifest",
+            "rm",
+            manifest_path.to_str().expect("utf-8 tempdir path"),
+            "--force",
+        ])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest rm --force failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "slot_remove");
+    assert!(
+        hits >= 1,
+        "expected ≥1 slot_remove entry in audit log, got {hits}. \
+         Full log:\n{log}"
     );
 }
 
