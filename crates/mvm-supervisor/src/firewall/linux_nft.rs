@@ -138,7 +138,7 @@ pub fn apply(rules: &str) -> Result<(), NftError> {
             .ok_or_else(|| NftError::Spawn(std::io::Error::other("nft stdin unavailable")))?;
         stdin.write_all(rules.as_bytes()).map_err(NftError::Stdin)?;
     }
-    let output = child.wait_with_output().map_err(|e| NftError::Spawn(e))?;
+    let output = child.wait_with_output().map_err(NftError::Spawn)?;
     if !output.status.success() {
         return Err(NftError::NonZero {
             status: output.status,

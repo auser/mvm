@@ -77,6 +77,13 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install system build deps
+        # xtask transitively links libcap-ng via microsandbox →
+        # msb_krun_devices → capng. Lint runs `cargo run -p xtask`
+        # twice (adr-coverage + secret-types check), which requires
+        # the library to be present at link time.
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+
       - name: Cache cargo
         uses: actions/cache@v5
         with:
@@ -118,6 +125,14 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
+      - name: Install system build deps
+        # `capng` (transitive via microsandbox → msb_krun_devices) links
+        # against system `libcap-ng`. Without `libcap-ng-dev` the linker
+        # fails with `unable to find library -lcap-ng`. Ubuntu's GH
+        # runner image ships the runtime library but not the -dev
+        # headers/symlinks that `cc` needs at link time.
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+
       - name: Cache cargo
         uses: actions/cache@v5
         with:
@@ -143,6 +158,9 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system build deps (see test job for why)
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -171,8 +189,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Install jq (for JSON-RPC response parsing)
-        run: sudo apt-get update && sudo apt-get install -y jq
+      - name: Install jq + libcap-ng (see test job for why)
+        run: sudo apt-get update && sudo apt-get install -y jq libcap-ng-dev
 
       - name: Cache cargo
         uses: actions/cache@v5
