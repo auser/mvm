@@ -1276,16 +1276,66 @@ Outstanding (this sprint):
   `tmpl_mem_initial` resolution path so manifest-declared
   `mem_initial` flows to `mvmctl up` without `--config`.
 
-### W2 — Portable image bundles + per-artifact attestation  ⚪ next
+### W2 — Portable image bundles + per-artifact attestation  🟡 substrate landed
 
 Sigstore-style trust model: bundle ships a signed `manifest.json`
 with per-artifact SHA-256s; the publisher's public key lives
 out-of-band at `~/.mvm/trusted-publishers/<key_id>.pub`. dm-verity
 (claim 3) gives independent per-block integrity inside the rootfs.
-Bundle hash + `key_id` pin into `ExecutionPlan::PlanArtifact` so
-admission re-verifies on every launch.
+Bundle hash + `key_id` pin into `PlanArtifact` so admission
+re-verifies on every launch.
 
-Not started.
+Shipped (`mvm-plan::bundle`):
+
+- `BundleManifest` (canonical-JSON, `deny_unknown_fields`),
+  `BundleArtifact`, `ArtifactRole` enum, `VerityInfo` binding.
+- `KeyId` — content-derived identifier (sha256(pubkey) truncated to
+  32 hex chars). Well-formedness validator.
+- `write_bundle()` — emits a tar archive of `manifest.json` +
+  `manifest.sig` + `artifacts/*`. Pre-flight asserts the signing
+  key matches the manifest's declared `key_id` and that every
+  artifact byte-blob matches its declared sha256 + size_bytes.
+- `read_and_verify_bundle()` — 6-step verification sequence:
+  schema-version sniff (pre-sig) → key_id probe (pre-sig) →
+  trust-store lookup → Ed25519 verify → full manifest parse →
+  per-artifact sha256 + size + path-safety re-check. All four
+  failure modes (UnknownKey, SignatureInvalid,
+  ArtifactSha256Mismatch, UnsafePath) reject before extraction.
+- `TrustStore` trait + `FsTrustStore` rooted at
+  `~/.mvm/trusted-publishers/<key_id>.pub`. Pubkey files are 32
+  raw Ed25519 bytes — no PEM, no headers; populated out-of-band
+  for now (`mvmctl trust add` is the follow-up).
+- `PlanArtifact` (re-exported from `mvm_plan::PlanArtifact`):
+  `bundle_sha256` + base64 `manifest_sig` + `key_id`. Sized for
+  inlining inside an `ExecutionPlan`; the supervisor's admit path
+  re-verifies in a follow-up.
+- 18 new unit tests covering: clean round-trip, unknown-key
+  rejection, tampered manifest rejection (sig fail or parse fail),
+  wrong key under correct key_id (KeyIdMismatch), tampered
+  artifact byte rejection (with same-length tamper to exercise the
+  hash path), missing-artifact rejection, unsafe-path rejection
+  (`..`), schema-version-bump rejection, write-time key/key_id
+  mismatch detection, write-time artifact sha256 drift detection,
+  trust-store file load + miss + malformed-key-id short circuit,
+  PlanArtifact JSON round-trip + signature re-decode + deny-unknown-fields.
+
+Outstanding (this sprint):
+
+- `mvmctl bundle export <template> --out <path>` — build pipeline
+  emits `.mvmpkg` archives keyed by content (not manifest-path
+  hash).
+- `mvmctl bundle fetch <url-or-path>` — download + verify + extract
+  into the local template registry, replacing the
+  `~/.mvm/templates/<sha256(manifest_path)>/...` keying scheme with
+  bundle-sha256 directories.
+- `mvmctl trust add/list/remove` — manage
+  `~/.mvm/trusted-publishers/` from the CLI rather than file copy.
+- Supervisor admit path: when an `ExecutionPlan` carries a
+  `PlanArtifact`, re-run `read_and_verify_bundle` against the
+  on-disk archive before backend dispatch; chain-sign the
+  admission outcome to the audit log.
+- 9th security claim drafted in ADR-002: *every published bundle
+  is content-addressed, key_id-pinned, and re-verified at admit.*
 
 ### Sprint 52 success criteria
 

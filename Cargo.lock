@@ -4056,12 +4056,17 @@ dependencies = [
 name = "mvm-plan"
 version = "0.14.0"
 dependencies = [
+ "anyhow",
+ "base64 0.22.1",
  "chrono",
  "ed25519-dalek",
  "mvm-core",
  "rand 0.8.6",
  "serde",
  "serde_json",
+ "sha2 0.10.9",
+ "tar",
+ "tempfile",
  "thiserror 1.0.69",
 ]
 
