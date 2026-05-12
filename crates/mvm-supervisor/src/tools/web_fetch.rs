@@ -39,17 +39,20 @@
 //!   by the same egress proxy (`L7EgressProxy`) that mediates the
 //!   guest's outbound traffic.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
+use std::net::SocketAddr;
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use base64::Engine;
 use base64::engine::general_purpose::URL_SAFE_NO_PAD;
+use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 use url::Url;
 
 use super::{HostMediatedTool, ToolInvokeError};
+use crate::ssrf_guard::SsrfGuard;
 
 pub const TOOL_NAME: &str = "mvm.web_fetch";
 
@@ -106,35 +109,57 @@ impl HttpFetcher for NoopHttpFetcher {
     }
 }
 
-/// Production [`HttpFetcher`] backed by a shared
-/// [`reqwest::Client`]. The client is built once at construction
-/// so the TLS handshake + DNS cache amortize across calls. Body
-/// reads use [`reqwest::Response::chunk`] in a manual loop so
-/// `max_bytes` is enforced incrementally — a server that lies
-/// about Content-Length cannot exhaust supervisor memory.
+/// Production [`HttpFetcher`] backed by [`reqwest::Client`]. The
+/// client is built **per call** so the SSRF pre-resolve (plan 65
+/// W2) can pin reqwest to the validated IP set for that one host
+/// plus that one fetch — closing the DNS-rebinding window between
+/// our check and reqwest's connect.
+///
+/// Body reads use [`reqwest::Response::chunk`] in a manual loop
+/// so `max_bytes` is enforced incrementally (plan 65 W3) — a
+/// server that lies about Content-Length cannot exhaust
+/// supervisor memory.
 ///
 /// HTTPS-only is enforced upstream in [`WebFetchTool::invoke`];
 /// the fetcher trusts its caller did that and does not re-check.
-/// Operator-supplied timeout via `ReqwestHttpFetcher::new` (default
-/// 30 s) caps the round-trip wall-clock for both connect and read
-/// phases.
+/// Operator-supplied timeout via `ReqwestHttpFetcher::new`
+/// (default 30 s) caps the round-trip wall-clock for both
+/// connect and read phases.
 ///
 /// ## Hardening (plan 65)
 ///
-/// - **W1 — no auto-redirect**: the embedded client is built with
-///   `reqwest::redirect::Policy::none()`. An allowlisted upstream
-///   that responds 3xx surfaces the status code + headers
-///   verbatim; the agent must re-call with the new URL, which
-///   re-runs the per-host allowlist check in
-///   [`WebFetchTool::invoke`]. Closes the "allowlisted host
-///   redirects to evil host" bypass.
+/// - **W1 — no auto-redirect**: each per-call client is built
+///   with `reqwest::redirect::Policy::none()`. An allowlisted
+///   upstream that responds 3xx surfaces the status code +
+///   headers verbatim; the agent must re-call with the new URL,
+///   which re-runs the per-host allowlist check in
+///   [`WebFetchTool::invoke`].
+/// - **W2 — SSRF / DNS-rebinding defense**: before each fetch,
+///   the host is resolved via [`tokio::net::lookup_host`] and
+///   every returned IP is classified through
+///   [`SsrfGuard::classify`]. Any private / loopback /
+///   link-local / multicast / metadata-service IP triggers a
+///   refusal. The validated IPs are pinned via a custom reqwest
+///   resolver ([`PinnedDnsResolver`]) so reqwest cannot
+///   re-resolve to a different IP. The pre-resolve filter +
+///   pinned resolver are two independent layers — defense in
+///   depth.
 /// - **W3 — exact body cap**: the chunk loop refuses *before* a
 ///   chunk that would overflow `max_bytes` lands in the
 ///   accumulator. The accumulated body is exactly `≤ max_bytes`
 ///   on every successful return; a `BodyTooLarge` indicates the
 ///   upstream wanted to send more.
+#[derive(Debug)]
 pub struct ReqwestHttpFetcher {
-    client: reqwest::Client,
+    timeout_secs: u64,
+    /// When `false`, skip the W2 pre-resolve + SSRF filter +
+    /// pinned resolver. Test seam only — production callers use
+    /// [`Self::new`] / [`Self::with_timeout_secs`] which set this
+    /// to `true`. The escape hatch exists so the W1/W3 tests
+    /// (which talk to a `127.0.0.1` one-shot server) can exercise
+    /// the redirect-policy + body-cap codepaths without tripping
+    /// the SSRF guard on loopback.
+    enforce_ssrf: bool,
 }
 
 impl ReqwestHttpFetcher {
@@ -144,33 +169,135 @@ impl ReqwestHttpFetcher {
     /// hung connection occupy a tokio task forever.
     pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
 
-    /// Build with [`Self::DEFAULT_TIMEOUT_SECS`].
+    /// Build with [`Self::DEFAULT_TIMEOUT_SECS`]. SSRF guard
+    /// enabled.
+    ///
+    /// Returns `Result` for backward compatibility — construction
+    /// itself is infallible since the reqwest client is built
+    /// per-call inside [`Self::fetch`]. The signature stays
+    /// `Result` so callers that already pattern-match on it
+    /// (`.expect` / `match`) don't break.
     pub fn new() -> Result<Self, FetchError> {
         Self::with_timeout_secs(Self::DEFAULT_TIMEOUT_SECS)
     }
 
     /// Build with an explicit timeout.
-    ///
-    /// The constructed client disables reqwest's default redirect
-    /// follow (plan 65 W1): a server returning 3xx surfaces the
-    /// status code to the caller instead of silently chasing the
-    /// `Location:` header, so the allowlist gets a fresh chance
-    /// to refuse the new host.
     pub fn with_timeout_secs(timeout_secs: u64) -> Result<Self, FetchError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(timeout_secs))
-            .redirect(reqwest::redirect::Policy::none())
+        Ok(Self {
+            timeout_secs,
+            enforce_ssrf: true,
+        })
+    }
+
+    /// Test seam — build a fetcher with the SSRF guard disabled.
+    /// Production callers MUST NOT use this; the loopback /
+    /// private-IP rejection is load-bearing for the security
+    /// posture documented in plan 65.
+    #[cfg(test)]
+    pub(crate) fn test_unsafe_no_ssrf(timeout_secs: u64) -> Self {
+        Self {
+            timeout_secs,
+            enforce_ssrf: false,
+        }
+    }
+
+    /// Build a one-shot `reqwest::Client` for a single fetch.
+    /// When `enforce_ssrf` is on, the client is built with a
+    /// pinned DNS resolver that returns the supplied
+    /// `safe_addresses` verbatim for `host` — so reqwest cannot
+    /// re-resolve to a different IP between our check and the
+    /// connect.
+    fn build_client(
+        &self,
+        host: &str,
+        safe_addresses: Vec<SocketAddr>,
+    ) -> Result<reqwest::Client, FetchError> {
+        let mut builder = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(self.timeout_secs))
+            .redirect(reqwest::redirect::Policy::none());
+        if self.enforce_ssrf {
+            let mut pins = HashMap::new();
+            pins.insert(host.to_string(), safe_addresses);
+            builder = builder.dns_resolver(Arc::new(PinnedDnsResolver { pins }));
+        }
+        builder
             .build()
-            .map_err(|e| FetchError::Network(format!("building reqwest client: {e}")))?;
-        Ok(Self { client })
+            .map_err(|e| FetchError::Network(format!("building reqwest client: {e}")))
+    }
+}
+
+/// Plan 65 W2 — reqwest DNS resolver pinned to a pre-validated
+/// IP set for one host. Returns the pinned addresses verbatim
+/// when asked for the matching host name; returns an empty
+/// iterator for anything else (which causes reqwest to fail
+/// the connection with "no addresses"). Combined with W1's
+/// no-auto-redirect, "anything else" should never reach this
+/// resolver in practice.
+#[derive(Debug)]
+struct PinnedDnsResolver {
+    pins: HashMap<String, Vec<SocketAddr>>,
+}
+
+impl Resolve for PinnedDnsResolver {
+    fn resolve(&self, name: Name) -> Resolving {
+        let key = name.as_str().to_string();
+        let pins = self.pins.get(&key).cloned().unwrap_or_default();
+        Box::pin(async move {
+            let iter: Addrs = Box::new(pins.into_iter());
+            Ok(iter)
+        })
     }
 }
 
 #[async_trait]
 impl HttpFetcher for ReqwestHttpFetcher {
     async fn fetch(&self, url: &Url, max_bytes: u64) -> Result<FetchedResponse, FetchError> {
-        let mut response = self
-            .client
+        // Plan 65 W2 — pre-resolve the host, run every returned
+        // IP through `SsrfGuard::classify`, and refuse if any
+        // resolve to a private / loopback / link-local /
+        // multicast / metadata IP. The validated IPs are pinned
+        // into the per-call reqwest client's resolver so the
+        // DNS-rebinding window between our check and the connect
+        // is closed.
+        let host = url
+            .host_str()
+            .ok_or_else(|| FetchError::Network("URL has no host component".to_string()))?
+            .to_string();
+        let port = url.port_or_known_default().ok_or_else(|| {
+            FetchError::Network("URL has no port and no scheme default".to_string())
+        })?;
+
+        let safe_addresses = if self.enforce_ssrf {
+            let resolved = tokio::net::lookup_host((host.as_str(), port))
+                .await
+                .map_err(|e| FetchError::Network(format!("DNS resolution for {host:?}: {e}")))?;
+            let mut blocked: Vec<String> = Vec::new();
+            let mut safe: Vec<SocketAddr> = Vec::new();
+            for sa in resolved {
+                match SsrfGuard::classify(sa.ip()) {
+                    Some(reason) => blocked.push(format!("{} ({reason})", sa.ip())),
+                    None => safe.push(sa),
+                }
+            }
+            if !blocked.is_empty() {
+                return Err(FetchError::Network(format!(
+                    "DNS for {host:?} resolves to blocked address(es) [{}]; \
+                     refusing to fetch (plan 65 W2 SSRF guard)",
+                    blocked.join(", ")
+                )));
+            }
+            if safe.is_empty() {
+                return Err(FetchError::Network(format!(
+                    "DNS for {host:?} returned no addresses"
+                )));
+            }
+            safe
+        } else {
+            Vec::new()
+        };
+
+        let client = self.build_client(&host, safe_addresses)?;
+        let mut response = client
             .get(url.clone())
             .send()
             .await
@@ -762,6 +889,8 @@ mod tests {
     async fn reqwest_does_not_auto_follow_redirects() {
         // Plan 65 W1: an upstream returning 302 + Location must
         // surface the 302 to the caller, not the redirected body.
+        // Uses `test_unsafe_no_ssrf` because the test server binds
+        // to loopback, which the W2 guard would otherwise refuse.
         let response = "HTTP/1.1 302 Found\r\n\
             Location: http://evil.example/exfil\r\n\
             Content-Length: 0\r\n\
@@ -770,7 +899,7 @@ mod tests {
             .to_string();
         let port = spawn_one_shot_server(response).await;
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
-        let fetcher = ReqwestHttpFetcher::new().unwrap();
+        let fetcher = ReqwestHttpFetcher::test_unsafe_no_ssrf(30);
         let resp = fetcher.fetch(&url, 1024).await.expect("fetch");
         assert_eq!(
             resp.status, 302,
@@ -785,8 +914,7 @@ mod tests {
     #[tokio::test]
     async fn body_cap_is_enforced_exactly() {
         // Plan 65 W3: an upstream returning more bytes than the
-        // caller's max_bytes must fail with `BodyTooLarge` —
-        // **before** the oversize bytes land in the accumulator.
+        // caller's max_bytes must fail with `BodyTooLarge`.
         let payload = "A".repeat(40);
         let response = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -797,7 +925,7 @@ mod tests {
         );
         let port = spawn_one_shot_server(response).await;
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
-        let fetcher = ReqwestHttpFetcher::new().unwrap();
+        let fetcher = ReqwestHttpFetcher::test_unsafe_no_ssrf(30);
         let err = fetcher.fetch(&url, 8).await.unwrap_err();
         assert!(
             matches!(err, FetchError::BodyTooLarge { limit: 8 }),
@@ -807,8 +935,7 @@ mod tests {
 
     #[tokio::test]
     async fn body_at_exactly_max_bytes_succeeds() {
-        // Boundary: a body of exactly max_bytes must succeed, not
-        // trip BodyTooLarge.
+        // Boundary: a body of exactly max_bytes must succeed.
         let payload = "B".repeat(16);
         let response = format!(
             "HTTP/1.1 200 OK\r\n\
@@ -819,9 +946,82 @@ mod tests {
         );
         let port = spawn_one_shot_server(response).await;
         let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
-        let fetcher = ReqwestHttpFetcher::new().unwrap();
+        let fetcher = ReqwestHttpFetcher::test_unsafe_no_ssrf(30);
         let resp = fetcher.fetch(&url, 16).await.expect("at-cap fetch");
         assert_eq!(resp.body.len(), 16);
         assert_eq!(resp.body, payload.as_bytes());
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Plan 65 W2 — SSRF guard rejects private / loopback / metadata
+    //
+    // These tests use the SSRF-enabled production constructor
+    // (`new()`) and point the fetcher at IP literals known to be
+    // in the SsrfGuard's deny list. No live HTTP server is needed
+    // — the rejection happens at the pre-resolve filter, before
+    // any network connection.
+    // ──────────────────────────────────────────────────────────────
+
+    #[tokio::test]
+    async fn ssrf_guard_rejects_loopback_target() {
+        let fetcher = ReqwestHttpFetcher::new().unwrap();
+        let url = Url::parse("http://127.0.0.1:9/").unwrap();
+        let err = fetcher.fetch(&url, 1024).await.unwrap_err();
+        match err {
+            FetchError::Network(msg) => {
+                assert!(msg.contains("SSRF guard"), "expected SSRF guard ref: {msg}");
+                assert!(msg.contains("loopback"), "expected loopback reason: {msg}");
+                assert!(msg.contains("127.0.0.1"), "expected IP in message: {msg}");
+            }
+            other => panic!("expected Network, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_rejects_aws_imds_target() {
+        // The cloud-metadata IP (169.254.169.254) has a specific
+        // SsrfGuard reason that wins over the generic link-local
+        // label. The error message must mention "metadata" so an
+        // operator reading the audit log understands the threat.
+        let fetcher = ReqwestHttpFetcher::new().unwrap();
+        let url = Url::parse("http://169.254.169.254/latest/meta-data/").unwrap();
+        let err = fetcher.fetch(&url, 1024).await.unwrap_err();
+        match err {
+            FetchError::Network(msg) => {
+                assert!(msg.contains("metadata"), "expected metadata reason: {msg}");
+                assert!(
+                    msg.contains("169.254.169.254"),
+                    "expected IP in message: {msg}"
+                );
+            }
+            other => panic!("expected Network, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_rejects_rfc1918_private_target() {
+        let fetcher = ReqwestHttpFetcher::new().unwrap();
+        let url = Url::parse("http://10.0.0.1/admin").unwrap();
+        let err = fetcher.fetch(&url, 1024).await.unwrap_err();
+        match err {
+            FetchError::Network(msg) => {
+                assert!(msg.contains("RFC1918"), "expected RFC1918 reason: {msg}");
+            }
+            other => panic!("expected Network, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn ssrf_guard_skipped_when_test_seam_used() {
+        // Compile + behavior pin: the test seam disables the guard
+        // so the W1/W3 tests above can talk to 127.0.0.1. If a
+        // future refactor flips the default to "always SSRF
+        // regardless of flag", this test catches it.
+        let fetcher = ReqwestHttpFetcher::test_unsafe_no_ssrf(30);
+        // We don't actually fetch — just observe that constructing
+        // a fetcher with the seam and then hitting loopback wouldn't
+        // trigger SsrfGuard. Confirmed implicitly by the W1/W3
+        // tests above succeeding.
+        assert!(!fetcher.enforce_ssrf);
     }
 }
