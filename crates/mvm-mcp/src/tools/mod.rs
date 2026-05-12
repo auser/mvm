@@ -139,6 +139,52 @@ pub fn web_fetch_input_schema() -> serde_json::Value {
     })
 }
 
+/// JSON Schema for the `mvm.upload` tool. Mirrors
+/// `mvm_supervisor::tools::upload::UploadParams`.
+pub fn upload_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["path", "content_base64"],
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative path under the per-tenant staging root. No absolute paths, no '..' components, no control characters; length capped at 512 bytes."
+            },
+            "content_base64": {
+                "type": "string",
+                "description": "URL-safe-no-pad base64 of the payload bytes. Binary content round-trips losslessly."
+            },
+            "max_bytes": {
+                "type": "integer",
+                "description": "Post-decode size cap, in bytes. Defaults to 16 MiB; values above 256 MiB are clamped.",
+                "minimum": 1
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// JSON Schema for the `mvm.download` tool. Mirrors
+/// `mvm_supervisor::tools::download::DownloadParams`.
+pub fn download_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative path under the per-tenant staging root. Same validation as mvm.upload."
+            },
+            "max_bytes": {
+                "type": "integer",
+                "description": "Cap on file size, in bytes. Defaults to 16 MiB; values above 256 MiB are clamped. Files larger than the cap return an error instead of a partial read.",
+                "minimum": 1
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
 /// JSON Schema for the `mvm.web_search` tool. Mirrors
 /// `mvm_supervisor::tools::web_search::WebSearchParams`.
 pub fn web_search_input_schema() -> serde_json::Value {
@@ -200,6 +246,20 @@ pub fn all_tools() -> Vec<ToolSchema> {
                     .to_string(),
             input_schema: web_search_input_schema(),
         },
+        ToolSchema {
+            name: "mvm.upload".to_string(),
+            description:
+                "Write a base64-encoded payload to a relative path under the per-tenant staging area on the host. Path validation rejects absolute paths, '..' components, control characters, and length > 512 bytes. The staging area is a host-side directory (~/.mvm/tool-staging/<tenant>/ by default; override via MVM_TOOL_STAGING_DIR) that the workload can read through a controlled channel."
+                    .to_string(),
+            input_schema: upload_input_schema(),
+        },
+        ToolSchema {
+            name: "mvm.download".to_string(),
+            description:
+                "Read a relative path from the per-tenant staging area and return the bytes as URL-safe-no-pad base64. Same path validation + size caps as mvm.upload. Use the `bytes` field to learn the file size without decoding."
+                    .to_string(),
+            input_schema: download_input_schema(),
+        },
     ]
 }
 
@@ -246,7 +306,9 @@ mod tests {
         assert!(names.contains(&"mvm.time_now"));
         assert!(names.contains(&"mvm.web_fetch"));
         assert!(names.contains(&"mvm.web_search"));
-        assert_eq!(tools.len(), 4);
+        assert!(names.contains(&"mvm.upload"));
+        assert!(names.contains(&"mvm.download"));
+        assert_eq!(tools.len(), 6);
     }
 
     #[test]

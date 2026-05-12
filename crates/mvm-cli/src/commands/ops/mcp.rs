@@ -27,7 +27,7 @@ use mvm_mcp::{
     SessionMap, SessionState, ToolResult,
 };
 use mvm_supervisor::ToolRegistry;
-use mvm_supervisor::tools::{web_fetch, web_search};
+use mvm_supervisor::tools::{download, staging, upload, web_fetch, web_search};
 
 use super::Cli;
 
@@ -240,6 +240,16 @@ fn build_tool_registry() -> ToolRegistry {
         }
     }
     registry.register(Box::new(search_tool));
+
+    // mvm.upload + mvm.download — share one per-tenant FsStagingArea.
+    // Default tenant matches the rest of the host-local scope ("local");
+    // a future slice plumbs the per-call tenant once mvmctl mcp gains
+    // the corresponding policy bundle.
+    let staging_area = staging::default_for_tenant("local");
+    registry.register(Box::new(upload::UploadTool::with_staging(
+        staging_area.clone(),
+    )));
+    registry.register(Box::new(download::DownloadTool::with_staging(staging_area)));
 
     registry
 }

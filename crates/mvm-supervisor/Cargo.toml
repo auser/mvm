@@ -55,11 +55,12 @@ reqwest = { workspace = true }
 tokio = { workspace = true, features = ["net", "rt"] }
 tracing.workspace = true
 
-# Sampler (A3) reads `/proc/<pid>/stat` and uses `sysconf(_SC_CLK_TCK)` /
-# `_SC_PAGESIZE` to convert jiffies → microseconds and pages → bytes.
-# Linux-only; the non-Linux source readers compile to empty stubs that
-# don't reference libc, so the dep is gated.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Plan 60 Phase 7 staging tools: `O_NOFOLLOW` on read/write opens
+# defends the upload + download path validators against a symlink
+# planted inside the staging dir. Unix-wide (macOS + Linux); the
+# Windows branch in `staging.rs` falls back to a `symlink_metadata`
+# check.
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]
