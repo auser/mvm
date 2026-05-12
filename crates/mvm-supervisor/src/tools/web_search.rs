@@ -41,7 +41,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
-use super::http_hardening::hardened_client_builder;
+use super::http_hardening::{DEFAULT_RESPONSE_BODY_CAP, hardened_client_builder, read_capped};
 use super::{HostMediatedTool, ToolInvokeError};
 
 pub const TOOL_NAME: &str = "mvm.web_search";
@@ -212,9 +212,13 @@ impl SearchProvider for BraveSearchProvider {
                 "Brave search returned status {status}"
             )));
         }
-        let parsed: BraveResponse = response
-            .json()
+        // Plan 65 follow-on — cap the response body before parsing so
+        // a malicious upstream (or compromised CDN) can't push
+        // gigabytes of JSON at the supervisor.
+        let body = read_capped(response, DEFAULT_RESPONSE_BODY_CAP)
             .await
+            .map_err(SearchError::Upstream)?;
+        let parsed: BraveResponse = serde_json::from_slice(&body)
             .map_err(|e| SearchError::Upstream(format!("decoding Brave response: {e}")))?;
         let hits: Vec<SearchHit> = parsed
             .web
@@ -501,9 +505,10 @@ impl SearchProvider for TavilySearchProvider {
                 "Tavily search returned status {status}"
             )));
         }
-        let parsed: TavilyResponse = response
-            .json()
+        let body = read_capped(response, DEFAULT_RESPONSE_BODY_CAP)
             .await
+            .map_err(SearchError::Upstream)?;
+        let parsed: TavilyResponse = serde_json::from_slice(&body)
             .map_err(|e| SearchError::Upstream(format!("decoding Tavily response: {e}")))?;
         let hits: Vec<SearchHit> = parsed
             .results
@@ -690,7 +695,10 @@ impl SearchProvider for GoogleSearchProvider {
                 "Google search returned status {status}"
             ))));
         }
-        let parsed: GoogleResponse = response.json().await.map_err(|e| {
+        let body = read_capped(response, DEFAULT_RESPONSE_BODY_CAP)
+            .await
+            .map_err(|msg| SearchError::Upstream(self.redact_credentials(msg)))?;
+        let parsed: GoogleResponse = serde_json::from_slice(&body).map_err(|e| {
             SearchError::Upstream(self.redact_credentials(format!("decoding Google response: {e}")))
         })?;
         let hits: Vec<SearchHit> = parsed
