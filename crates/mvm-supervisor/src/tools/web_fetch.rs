@@ -96,7 +96,7 @@ pub enum FetchError {
 
 /// Default fetcher — refuses every call with [`FetchError::Unwired`].
 /// Used as the substrate's fail-closed placeholder; gets swapped for
-/// a real HTTP client in a follow-up slice.
+/// a real HTTP client in production.
 pub struct NoopHttpFetcher;
 
 #[async_trait]
@@ -105,6 +105,109 @@ impl HttpFetcher for NoopHttpFetcher {
         Err(FetchError::Unwired)
     }
 }
+
+/// Production [`HttpFetcher`] backed by a shared
+/// [`reqwest::Client`]. The client is built once at construction
+/// so the TLS handshake + DNS cache amortize across calls. Body
+/// reads use [`reqwest::Response::chunk`] in a manual loop so
+/// `max_bytes` is enforced incrementally — a server that lies
+/// about Content-Length cannot exhaust supervisor memory.
+///
+/// HTTPS-only is enforced upstream in [`WebFetchTool::invoke`];
+/// the fetcher trusts its caller did that and does not re-check.
+/// Operator-supplied timeout via `ReqwestHttpFetcher::new` (default
+/// 30 s) caps the round-trip wall-clock for both connect and read
+/// phases.
+pub struct ReqwestHttpFetcher {
+    client: reqwest::Client,
+}
+
+impl ReqwestHttpFetcher {
+    /// Default timeout for one fetch round-trip (connect + read).
+    /// Conservative — most legitimate fetches complete in <2 s; the
+    /// 30 s upper bound forgives slow upstreams without letting a
+    /// hung connection occupy a tokio task forever.
+    pub const DEFAULT_TIMEOUT_SECS: u64 = 30;
+
+    /// Build with [`Self::DEFAULT_TIMEOUT_SECS`].
+    pub fn new() -> Result<Self, FetchError> {
+        Self::with_timeout_secs(Self::DEFAULT_TIMEOUT_SECS)
+    }
+
+    /// Build with an explicit timeout.
+    pub fn with_timeout_secs(timeout_secs: u64) -> Result<Self, FetchError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(timeout_secs))
+            .build()
+            .map_err(|e| FetchError::Network(format!("building reqwest client: {e}")))?;
+        Ok(Self { client })
+    }
+}
+
+#[async_trait]
+impl HttpFetcher for ReqwestHttpFetcher {
+    async fn fetch(&self, url: &Url, max_bytes: u64) -> Result<FetchedResponse, FetchError> {
+        let mut response = self
+            .client
+            .get(url.clone())
+            .send()
+            .await
+            .map_err(|e| FetchError::Network(e.to_string()))?;
+        let status = response.status().as_u16();
+        let content_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|v| v.to_str().ok())
+            .map(String::from);
+
+        // Streaming accumulator. A server that lies about
+        // Content-Length still can't push past `max_bytes` because
+        // we hard-cut after each chunk lands.
+        let cap = max_bytes as usize;
+        let mut body: Vec<u8> = Vec::with_capacity(cap.min(64 * 1024));
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|e| FetchError::Network(e.to_string()))?
+        {
+            if body.len().saturating_add(chunk.len()) > cap {
+                return Err(FetchError::BodyTooLarge { limit: max_bytes });
+            }
+            body.extend_from_slice(&chunk);
+        }
+        Ok(FetchedResponse {
+            status,
+            body,
+            content_type,
+        })
+    }
+}
+
+/// Parse a comma-separated env-var value into a set of allowlisted
+/// hostnames. Empty/missing returns an empty set (the fail-closed
+/// default the substrate ships with).
+///
+/// Whitespace around commas is trimmed; empty entries are dropped so
+/// a trailing comma in the env var doesn't widen the allowlist.
+/// Hostnames are stored verbatim — the caller is responsible for
+/// ensuring they match `url.host_str()` exactly (lower-case ASCII
+/// in practice).
+///
+/// Example: `MVM_WEB_FETCH_ALLOWLIST=api.openai.com,api.anthropic.com`.
+pub fn allowlist_from_env_var(var_name: &str) -> std::collections::BTreeSet<String> {
+    let Ok(raw) = std::env::var(var_name) else {
+        return std::collections::BTreeSet::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Canonical env-var name carrying the `mvm.web_fetch` host
+/// allowlist. Read once at supervisor / dispatcher start.
+pub const ALLOWLIST_ENV_VAR: &str = "MVM_WEB_FETCH_ALLOWLIST";
 
 /// One agent-callable web fetch, scoped to an allowlist of upstream
 /// hosts.
@@ -505,5 +608,84 @@ mod tests {
     fn fail_closed_is_the_default_construction() {
         let t = WebFetchTool::default();
         assert!(t.allowlist().is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // allowlist_from_env_var
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn allowlist_from_env_var_parses_comma_separated() {
+        // Use a process-unique var name so parallel tests don't
+        // race on the same key.
+        let var = "MVM_TEST_WEB_FETCH_ALLOWLIST_PARSE";
+        // SAFETY: tests are single-threaded for this var; the name
+        // is unique to this test.
+        unsafe {
+            std::env::set_var(var, "api.openai.com,api.anthropic.com,api.brave.com");
+        }
+        let set = allowlist_from_env_var(var);
+        assert!(set.contains("api.openai.com"));
+        assert!(set.contains("api.anthropic.com"));
+        assert!(set.contains("api.brave.com"));
+        assert_eq!(set.len(), 3);
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn allowlist_from_env_var_drops_empty_entries_and_trims_whitespace() {
+        let var = "MVM_TEST_WEB_FETCH_ALLOWLIST_TRIM";
+        unsafe {
+            std::env::set_var(var, "  api.openai.com  , ,, api.brave.com,");
+        }
+        let set = allowlist_from_env_var(var);
+        assert!(set.contains("api.openai.com"));
+        assert!(set.contains("api.brave.com"));
+        // Empty entries (`,,` / trailing comma) and whitespace-only
+        // entries don't widen the allowlist.
+        assert_eq!(set.len(), 2);
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn allowlist_from_env_var_unset_returns_empty_set() {
+        // A truly-unset var must produce an empty set, not panic.
+        // Pick a name unlikely to be set by any CI environment.
+        let set = allowlist_from_env_var("MVM_TEST_WEB_FETCH_ALLOWLIST_DEFINITELY_NOT_SET_XYZZY");
+        assert!(set.is_empty());
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // ReqwestHttpFetcher
+    //
+    // Live network behaviour is not exercised here — the impl is
+    // covered by the policy/validation layer's tests against a
+    // stub fetcher. These tests pin the construction surface so a
+    // future refactor that breaks `new()` / `with_timeout_secs()`
+    // trips loudly.
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn reqwest_fetcher_constructs_with_default_timeout() {
+        let _f = ReqwestHttpFetcher::new().expect("build default reqwest fetcher");
+    }
+
+    #[test]
+    fn reqwest_fetcher_constructs_with_explicit_timeout() {
+        let _f = ReqwestHttpFetcher::with_timeout_secs(5).expect("build with timeout");
+    }
+
+    #[test]
+    fn reqwest_fetcher_is_a_host_mediated_tool_via_web_fetch() {
+        // Compile-check: `ReqwestHttpFetcher` satisfies the
+        // `HttpFetcher` trait so it slots into
+        // `WebFetchTool::with_fetcher`.
+        let f = ReqwestHttpFetcher::new().unwrap();
+        let _tool =
+            WebFetchTool::with_allowlist(["api.example".to_string()]).with_fetcher(Arc::new(f));
     }
 }
