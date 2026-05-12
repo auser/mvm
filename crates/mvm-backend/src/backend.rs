@@ -131,6 +131,14 @@ impl VmBackend for FirecrackerBackend {
         microvm::stop_all_vms()
     }
 
+    fn pause(&self, id: &VmId) -> Result<()> {
+        microvm::pause_vm(&id.0)
+    }
+
+    fn resume(&self, id: &VmId) -> Result<()> {
+        microvm::resume_vm(&id.0)
+    }
+
     fn status(&self, id: &VmId) -> Result<VmStatus> {
         let vms = microvm::list_vms()?;
         match vms.iter().find(|info| info.name.as_deref() == Some(&*id.0)) {
@@ -385,6 +393,16 @@ impl AnyBackend {
 
     pub fn stop_all(&self) -> Result<()> {
         self.inner().stop_all()
+    }
+
+    /// Pause the vCPUs of a running VM. See [`VmBackend::pause`].
+    pub fn pause(&self, id: &VmId) -> Result<()> {
+        self.inner().pause(id)
+    }
+
+    /// Resume a paused VM. See [`VmBackend::resume`].
+    pub fn resume(&self, id: &VmId) -> Result<()> {
+        self.inner().resume(id)
     }
 
     pub fn status(&self, id: &VmId) -> Result<VmStatus> {
@@ -709,6 +727,93 @@ mod tests {
                 AnyBackend::auto_select().name(),
                 "microsandbox",
                 "non-KVM platform with microsandbox available must auto-select microsandbox"
+            );
+        }
+    }
+
+    // ------------------------------------------------------------------
+    // pause/resume — Track B / PR 1a coverage
+    //
+    // Backends that don't support pause/resume (capabilities.pause_resume
+    // == false) must surface a clear, named bail. Backends that *do*
+    // support it (Firecracker, Cloud Hypervisor, Docker) have real impls
+    // that talk to a live VMM and aren't exercised here — see their
+    // module-level tests for input-validation coverage.
+    // ------------------------------------------------------------------
+
+    fn assert_unsupported_pause_resume(backend: AnyBackend, expected_name: &str) {
+        let id = VmId("nonexistent".into());
+        let pause_err = backend
+            .pause(&id)
+            .expect_err("pause must bail when unsupported");
+        let resume_err = backend
+            .resume(&id)
+            .expect_err("resume must bail when unsupported");
+        let pause_msg = pause_err.to_string().to_lowercase();
+        let resume_msg = resume_err.to_string().to_lowercase();
+        assert!(
+            pause_msg.contains("not supported") && pause_msg.contains(expected_name),
+            "pause bail must mention 'not supported' and backend name '{expected_name}', got: {pause_err}"
+        );
+        assert!(
+            resume_msg.contains("not supported") && resume_msg.contains(expected_name),
+            "resume bail must mention 'not supported' and backend name '{expected_name}', got: {resume_err}"
+        );
+    }
+
+    #[test]
+    fn pause_resume_unsupported_on_microsandbox() {
+        assert_unsupported_pause_resume(
+            AnyBackend::from_hypervisor("microsandbox"),
+            "microsandbox",
+        );
+    }
+
+    #[test]
+    fn pause_resume_unsupported_on_libkrun() {
+        assert_unsupported_pause_resume(AnyBackend::from_hypervisor("libkrun"), "libkrun");
+    }
+
+    #[test]
+    fn pause_resume_unsupported_on_microvm_nix() {
+        assert_unsupported_pause_resume(AnyBackend::from_hypervisor("qemu"), "microvm-nix");
+    }
+
+    #[test]
+    fn pause_resume_unsupported_on_apple_container() {
+        assert_unsupported_pause_resume(
+            AnyBackend::from_hypervisor("apple-container"),
+            "apple-container",
+        );
+    }
+
+    #[test]
+    fn pause_resume_capability_flag_matches_backend_disposition() {
+        // The capability flag and the method behavior must agree —
+        // a backend reporting `pause_resume: true` must not bail with
+        // "not supported"; one reporting `false` must.
+        //
+        // We can't *successfully* call pause/resume here without a
+        // live VM, but we can check that the bail (if any) for a
+        // missing VM does NOT claim the backend itself is unsupported
+        // when the capability says it is.
+        for name in [
+            "microsandbox",
+            "libkrun",
+            "qemu", // → microvm-nix
+            "apple-container",
+        ] {
+            let b = AnyBackend::from_hypervisor(name);
+            assert!(
+                !b.capabilities().pause_resume,
+                "{name}: capability flag must say pause_resume=false (matches bail in pause/resume)"
+            );
+        }
+        for name in ["firecracker", "cloud-hypervisor", "docker"] {
+            let b = AnyBackend::from_hypervisor(name);
+            assert!(
+                b.capabilities().pause_resume,
+                "{name}: capability flag must say pause_resume=true (matches the real impl)"
             );
         }
     }

@@ -1597,12 +1597,9 @@ bundle_version = 1
             "web-worker",
             &fixture_bundle_with_pii(Some("disabled"), &[]),
         );
-        let bundle = mvm_policy::toml_loader::load_bundle_from_path(
-            tmp.path(),
-            "acme",
-            "web-worker",
-        )
-        .expect("bundle parses");
+        let bundle =
+            mvm_policy::toml_loader::load_bundle_from_path(tmp.path(), "acme", "web-worker")
+                .expect("bundle parses");
         let chain =
             mvm_supervisor::build_inspector_chain_with_pii(&bundle.egress, &bundle.pii, None)
                 .expect("disabled is valid");

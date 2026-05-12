@@ -205,14 +205,13 @@ jobs:
       - name: Eval-check every flake
         run: |
           set -euo pipefail
-          for d in ./nix \
-                   ./nix/dev \
-                   ./nix/images/builder \
-                   ./nix/images/default-tenant \
-                   ./nix/images/examples/hello \
-                   ./nix/images/examples/hello-node \
-                   ./nix/images/examples/hello-python \
-                   ./nix/images/examples/llm-agent; do
+          # Discover flakes dynamically — the nix tree has been
+          # reshuffled over time and a hard-coded list goes stale
+          # silently (the directory check failed in main CI after the
+          # `nix/dev` + `nix/images/*` subtrees were removed without a
+          # matching workflow update).
+          find nix -name flake.nix -type f -print0 | sort -z | while IFS= read -r -d '' flake; do
+            d="$(dirname "$flake")"
             echo "=== $d ==="
             nix flake check --no-build "$d"
           done

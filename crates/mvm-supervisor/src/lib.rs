@@ -110,7 +110,6 @@ pub use ssrf_guard::SsrfGuard;
 pub use state::{PlanState, PlanStateMachine, StateTransitionError};
 pub use supervisor::{
     EgressPolicyValidationError, KNOWN_INSPECTOR_NAMES, Supervisor, SupervisorError,
-    build_inspector_chain, build_inspector_chain_with_pii,
-    validate_egress_policy_inspector_names,
+    build_inspector_chain, build_inspector_chain_with_pii, validate_egress_policy_inspector_names,
 };
 pub use tool_gate::{NoopToolGate, ToolDecision, ToolError, ToolGate};

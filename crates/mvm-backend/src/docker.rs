@@ -8,7 +8,7 @@
 //! Port forwarding uses Docker's native `-p` flag.
 //! Containers run detached by default — no launchd or foreground blocking needed.
 
-use anyhow::Result;
+use anyhow::{Context, Result};
 use mvm_core::vm_backend::{
     BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, VmBackend,
     VmCapabilities, VmId, VmInfo, VmNetworkInfo, VmStartConfig, VmStatus,
@@ -216,6 +216,18 @@ impl VmBackend for DockerBackend {
         let name = container_name(&id.0);
         let _ = docker_cmd(&["stop", &name]);
         let _ = docker_cmd(&["rm", "-f", &name]);
+        Ok(())
+    }
+
+    fn pause(&self, id: &VmId) -> Result<()> {
+        let name = container_name(&id.0);
+        docker_cmd(&["pause", &name]).with_context(|| format!("docker pause {name}"))?;
+        Ok(())
+    }
+
+    fn resume(&self, id: &VmId) -> Result<()> {
+        let name = container_name(&id.0);
+        docker_cmd(&["unpause", &name]).with_context(|| format!("docker unpause {name}"))?;
         Ok(())
     }
 

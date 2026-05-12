@@ -166,7 +166,10 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("uninstall", AuditPosture::Emits("Uninstall")),
     ("init", AuditPosture::InteractiveOrControl),
     // VM lifecycle.
-    ("up", AuditPosture::Emits("plan.admitted+plan.launched+VmStart")),
+    (
+        "up",
+        AuditPosture::Emits("plan.admitted+plan.launched+VmStart"),
+    ),
     ("down", AuditPosture::Emits("VmStop")),
     ("logs", AuditPosture::ReadOnly),
     ("forward", AuditPosture::ReadOnly),
@@ -224,8 +227,7 @@ fn audit_walk(
     missing: &mut Vec<String>,
     stale: &mut Vec<String>,
 ) {
-    let declared_map: BTreeMap<&'static str, AuditPosture> =
-        declared.iter().copied().collect();
+    let declared_map: BTreeMap<&'static str, AuditPosture> = declared.iter().copied().collect();
     let clap_names: Vec<String> = clap_sub
         .get_subcommands()
         .map(|s| s.get_name().to_string())
@@ -311,8 +313,7 @@ fn audit_posture_table_has_no_duplicate_subcommand_names_at_any_level() {
     // across different parents is fine (e.g. `manifest ls` and
     // `network list` aren't the same).
     fn check(group: &[(&'static str, AuditPosture)], parent_path: &[&str]) {
-        let mut seen: std::collections::BTreeSet<&str> =
-            std::collections::BTreeSet::new();
+        let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
         for (name, _) in group {
             assert!(
                 seen.insert(*name),

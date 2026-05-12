@@ -96,10 +96,7 @@ pub(super) fn emit_cmd_outcome<T, E>(
 {
     let Some(rec) = recorder else { return };
     let (phase, extras) = match outcome {
-        Ok(_) => (
-            "completed",
-            vec![("verb".to_string(), verb.to_string())],
-        ),
+        Ok(_) => ("completed", vec![("verb".to_string(), verb.to_string())]),
         Err(e) => (
             "failed",
             vec![

@@ -21,15 +21,10 @@
 
 pub mod libkrun;
 
-#[cfg(target_os = "macos")]
+// `apple_container` is unconditionally exposed; the module itself uses
+// `#[cfg(target_os = "macos")]` to gate the Virtualization.framework
+// implementation behind `mod macos;` and provides non-macOS fallbacks
+// at each public entry point. Cross-platform callers can therefore
+// reference `mvm_providers::apple_container::*` without sprinkling
+// `cfg` guards at every call site.
 pub mod apple_container;
-
-#[cfg(not(target_os = "macos"))]
-pub mod apple_container {
-    //! Stub: Apple Virtualization.framework only exists on macOS.
-    //! Non-macOS targets get a no-op surface so cross-platform
-    //! callers don't need `cfg(target_os = "macos")` at every site.
-    pub fn is_available() -> bool {
-        false
-    }
-}

@@ -167,6 +167,22 @@ impl VmBackend for CloudHypervisorBackend {
         ch_runtime::reap(&abs_dir)
     }
 
+    fn pause(&self, id: &VmId) -> Result<()> {
+        let abs_dir = ch_runtime::ch_vm_dir(&id.0)
+            .with_context(|| format!("resolving per-VM dir for {}", id.0))?;
+        let api_socket = ch_runtime::ch_api_socket(&abs_dir);
+        ch_runtime::api_put_empty(&api_socket, "/api/v1/vm.pause")
+            .with_context(|| format!("PUT /api/v1/vm.pause for VM '{}'", id.0))
+    }
+
+    fn resume(&self, id: &VmId) -> Result<()> {
+        let abs_dir = ch_runtime::ch_vm_dir(&id.0)
+            .with_context(|| format!("resolving per-VM dir for {}", id.0))?;
+        let api_socket = ch_runtime::ch_api_socket(&abs_dir);
+        ch_runtime::api_put_empty(&api_socket, "/api/v1/vm.resume")
+            .with_context(|| format!("PUT /api/v1/vm.resume for VM '{}'", id.0))
+    }
+
     fn stop_all(&self) -> Result<()> {
         let names = ch_runtime::list_ch_vms().unwrap_or_default();
         let mut first_err: Option<anyhow::Error> = None;
