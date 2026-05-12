@@ -60,8 +60,10 @@
 //!   (test pre-creates `~/.mvm/instances/<name>/snapshot/` so the
 //!   bail-when-missing branch doesn't short-circuit the emit)
 //! - `mvmctl snapshot ls` → **no** audit entry
-//! - `mvmctl audit tail` / `audit verify` → **no** audit entry
-//! - `mvmctl attest status` → **no** audit entry
+//! - `mvmctl audit tail` / `audit verify` / `audit show <id>` →
+//!   **no** audit entry (the `AUDIT` leaves are all ReadOnly)
+//! - `mvmctl attest status` / `attest export` → **no** audit
+//!   entry (the `ATTEST` leaves are all ReadOnly)
 //! - `mvmctl ls` / `metrics` / `catalog list` → **no** audit entry
 //!   (top-level ReadOnly verbs — three more rows from
 //!   `AUDIT_POSTURE` pinned against a future regression that
@@ -1188,6 +1190,59 @@ fn uninstall_dry_run_does_not_emit_audit_entry() {
         hits, 0,
         "dry-run must not write uninstall audit entries, got {hits}. \
          Full log:\n{log}"
+    );
+}
+
+#[test]
+fn audit_show_does_not_emit_local_audit_entry() {
+    // Negative: `audit show <plan_id>` filters chain entries by
+    // plan_id. Read-only against the LocalAudit stream. With an
+    // arbitrary plan_id the command reports "No audit entries
+    // found" and exits 0 — the LocalAudit stream must remain
+    // empty.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["audit", "show", "00000000-0000-0000-0000-000000000000"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl audit show failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `audit show` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn attest_export_does_not_emit_local_audit_entry() {
+    // Negative: `attest export` prints the host's attestation
+    // report as JSON. Pure read — the `ATTEST_SUB` table
+    // classifies all three leaves (export / verify / status) as
+    // ReadOnly.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["attest", "export"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl attest export failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `attest export` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
     );
 }
 
