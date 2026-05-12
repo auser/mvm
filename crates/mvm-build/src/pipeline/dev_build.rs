@@ -186,24 +186,62 @@ pub struct DevBuildCleanupReport {
 
 /// Remove old cached dev builds, keeping the newest `keep` revisions.
 ///
-/// Returns a report with the number of removed revisions and removed paths.
+/// Operates directly on the host filesystem under [`dev_builds_dir`]
+/// (`~/.mvm/dev/builds/`). Lima-era versions of this function shelled
+/// through `ShellEnvironment` so the `ls`/`rm` ran inside the dev VM,
+/// but the dev VM only ever bind-mounted the same host directory —
+/// the indirection was the artifact of a now-retired runtime, not a
+/// semantic requirement. Running on the host directly drops the
+/// dev-VM dependency: `mvmctl cleanup` now works in CI / fresh
+/// installs where the builder VM isn't (yet) reachable.
+///
+/// Returns a report with the number of removed revisions and the
+/// list of removed absolute paths.
 #[instrument(skip_all, fields(keep))]
-pub fn cleanup_old_dev_builds(
-    env: &dyn ShellEnvironment,
-    keep: usize,
-) -> Result<DevBuildCleanupReport> {
-    let builds_dir = dev_builds_dir();
-    let list_script = format!(
-        "if [ -d {dir} ]; then ls -1dt {dir}/* 2>/dev/null || true; fi",
-        dir = shell_quote(&builds_dir),
-    );
-    let output = env.shell_exec_stdout(&list_script)?;
-    let builds: Vec<&str> = output
-        .lines()
-        .filter(|line| !line.trim().is_empty())
-        .collect();
+pub fn cleanup_old_dev_builds(keep: usize) -> Result<DevBuildCleanupReport> {
+    cleanup_builds_in(std::path::Path::new(&dev_builds_dir()), keep)
+}
 
-    if builds.len() <= keep {
+/// Inner helper that operates on an explicit `builds_dir`. Lifted
+/// out so unit tests can drive the logic against a tempdir without
+/// touching `HOME` / `MVM_DATA_DIR`. The public
+/// [`cleanup_old_dev_builds`] is the production entry point.
+///
+/// Newest-first sort uses mtime. Ties go to lexicographic order so a
+/// deterministic outcome survives the rare clock-resolution collision.
+fn cleanup_builds_in(builds_dir: &std::path::Path, keep: usize) -> Result<DevBuildCleanupReport> {
+    if !builds_dir.is_dir() {
+        return Ok(DevBuildCleanupReport {
+            removed_count: 0,
+            removed_paths: vec![],
+        });
+    }
+
+    // Collect (path, mtime) tuples for every immediate child dir.
+    // Files at this level are unexpected — the layout is one dir per
+    // revision hash — but we tolerate them by ignoring (they're not
+    // candidates for prune).
+    let mut entries: Vec<(std::path::PathBuf, std::time::SystemTime)> = Vec::new();
+    for entry in std::fs::read_dir(builds_dir)
+        .with_context(|| format!("reading {}", builds_dir.display()))?
+        .flatten()
+    {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let mtime = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        entries.push((path, mtime));
+    }
+    // Newest first; ties broken by lexicographic path order so the
+    // outcome is deterministic on filesystems whose mtime resolution
+    // is coarser than the test loop creates entries.
+    entries.sort_by(|a, b| b.1.cmp(&a.1).then_with(|| a.0.cmp(&b.0)));
+
+    if entries.len() <= keep {
         return Ok(DevBuildCleanupReport {
             removed_count: 0,
             removed_paths: vec![],
@@ -211,9 +249,9 @@ pub fn cleanup_old_dev_builds(
     }
 
     let mut removed_paths = Vec::new();
-    for path in builds.iter().skip(keep) {
-        env.shell_exec(&format!("rm -rf {}", shell_quote(path)))?;
-        removed_paths.push((*path).to_string());
+    for (path, _) in entries.iter().skip(keep) {
+        std::fs::remove_dir_all(path).with_context(|| format!("removing {}", path.display()))?;
+        removed_paths.push(path.display().to_string());
     }
 
     Ok(DevBuildCleanupReport {
@@ -1062,46 +1100,53 @@ mod tests {
 
     #[test]
     fn test_cleanup_old_dev_builds_no_directory() {
-        let env = TestEnv::new();
-        env.stub_stdout("ls -1dt", "");
-
-        let report = cleanup_old_dev_builds(&env, 2).unwrap();
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let report = cleanup_builds_in(&tmp.path().join("does-not-exist"), 2).unwrap();
         assert_eq!(report.removed_count, 0);
         assert!(report.removed_paths.is_empty());
     }
 
     #[test]
     fn test_cleanup_old_dev_builds_keeps_newest() {
-        let env = TestEnv::new();
-        env.stub_stdout(
-            "ls -1dt",
-            concat!(
-                "/home/test/.mvm/dev/builds/newest\n",
-                "/home/test/.mvm/dev/builds/middle\n",
-                "/home/test/.mvm/dev/builds/oldest\n"
-            ),
-        );
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let builds = tmp.path().join("builds");
+        std::fs::create_dir_all(&builds).expect("mkdir builds");
 
-        let report = cleanup_old_dev_builds(&env, 1).unwrap();
+        // Create three build dirs with a 50 ms gap so mtimes are
+        // distinct on filesystems with coarse resolution (HFS+ is
+        // 1 s; APFS / most Linux is 1 ns — 50 ms covers both).
+        for name in ["oldest", "middle", "newest"] {
+            std::fs::create_dir(builds.join(name)).expect("mkdir build subdir");
+            std::thread::sleep(std::time::Duration::from_millis(50));
+        }
+
+        let report = cleanup_builds_in(&builds, 1).unwrap();
         assert_eq!(report.removed_count, 2);
-        assert_eq!(
-            report.removed_paths,
-            vec![
-                "/home/test/.mvm/dev/builds/middle".to_string(),
-                "/home/test/.mvm/dev/builds/oldest".to_string()
-            ]
-        );
-
-        let exec_log = env.exec_log.lock().unwrap();
+        // Removed paths are sorted newest-first then by removal
+        // order — "middle" and "oldest" should be in the report.
+        let names: Vec<String> = report
+            .removed_paths
+            .iter()
+            .filter_map(|p| {
+                std::path::Path::new(p)
+                    .file_name()?
+                    .to_str()
+                    .map(String::from)
+            })
+            .collect();
+        assert!(names.contains(&"oldest".to_string()), "got {names:?}");
+        assert!(names.contains(&"middle".to_string()), "got {names:?}");
         assert!(
-            exec_log
-                .iter()
-                .any(|cmd| cmd.contains("rm -rf '/home/test/.mvm/dev/builds/middle'"))
+            !names.contains(&"newest".to_string()),
+            "newest must be kept; got {names:?}"
         );
         assert!(
-            exec_log
-                .iter()
-                .any(|cmd| cmd.contains("rm -rf '/home/test/.mvm/dev/builds/oldest'"))
+            builds.join("newest").is_dir(),
+            "newest build dir must still exist on disk"
+        );
+        assert!(
+            !builds.join("middle").exists() && !builds.join("oldest").exists(),
+            "pruned build dirs must be removed from disk"
         );
     }
 
