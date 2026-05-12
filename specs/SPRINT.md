@@ -1296,7 +1296,7 @@ Outstanding (deferred to follow-ups):
   loop. Today the controller is a library piece; wiring it into
   the supervisor's lifecycle is the integration follow-up.
 
-### W2 — Portable image bundles + per-artifact attestation  🟡 substrate landed
+### W2 — Portable image bundles + per-artifact attestation  🟢 CLI surface shipped
 
 Sigstore-style trust model: bundle ships a signed `manifest.json`
 with per-artifact SHA-256s; the publisher's public key lives
@@ -1339,23 +1339,59 @@ Shipped (`mvm-plan::bundle`):
   trust-store file load + miss + malformed-key-id short circuit,
   PlanArtifact JSON round-trip + signature re-decode + deny-unknown-fields.
 
-Outstanding (this sprint):
+Shipped in the W2 close-out commit:
 
-- `mvmctl bundle export <template> --out <path>` — build pipeline
-  emits `.mvmpkg` archives keyed by content (not manifest-path
-  hash).
-- `mvmctl bundle fetch <url-or-path>` — download + verify + extract
-  into the local template registry, replacing the
-  `~/.mvm/templates/<sha256(manifest_path)>/...` keying scheme with
-  bundle-sha256 directories.
-- `mvmctl trust add/list/remove` — manage
-  `~/.mvm/trusted-publishers/` from the CLI rather than file copy.
-- Supervisor admit path: when an `ExecutionPlan` carries a
-  `PlanArtifact`, re-run `read_and_verify_bundle` against the
-  on-disk archive before backend dispatch; chain-sign the
-  admission outcome to the audit log.
-- 9th security claim drafted in ADR-002: *every published bundle
-  is content-addressed, key_id-pinned, and re-verified at admit.*
+- `mvmctl bundle export <TEMPLATE> --out <PATH> [--label]`:
+  resolves the template's current revision (kernel + rootfs +
+  optional initrd + optional dm-verity sidecar), hashes each
+  artifact, builds a `BundleManifest`, signs with the host signer
+  (same key that signs `ExecutionPlan` envelopes), and writes the
+  archive. Refuses to ship a bundle whose declared sha256/size or
+  key_id doesn't match the signing key / actual bytes — caught at
+  write time so misconfigured publishers never ship unverifiable
+  bundles.
+- `mvmctl bundle fetch <PATH> [--trust-store <DIR>] [--json]`:
+  reads the archive, looks the publisher pubkey up via
+  `FsTrustStore` (defaults to `~/.mvm/trusted-publishers/`), runs
+  the full 6-step rejection ladder, prints a verified-bundle
+  summary (sha256, key_id, publisher, arch, profile, label,
+  artifact count, verity yes/no) or full manifest JSON. Refuses
+  on any verification failure before extraction.
+- `mvmctl trust add <PUBKEY> [--force]`: reads 32 raw Ed25519
+  pubkey bytes, derives `key_id`, writes `<key_id>.pub` to the
+  trust store (mode 0644). Refuses to overwrite without `--force`.
+  Trust-store directory created at mode 0700 on first use.
+- `mvmctl trust list [--json]`: enumerates the store, filters to
+  well-formed `<key_id>.pub` entries, sorted output.
+- `mvmctl trust remove <KEY_ID>`: unlinks by key_id; refuses if
+  the key_id is malformed (32 hex chars expected).
+- `cmd_audit::verb_name` + `AUDIT_POSTURE` table extended with
+  `bundle` (DelegatesToSub: export = `InteractiveOrControl`,
+  fetch = `ReadOnly`) and `trust` (DelegatesToSub: add/remove =
+  `InteractiveOrControl` until the audit-chain emitter wiring
+  lands; list = `ReadOnly`).
+- ADR-002 9th claim shipped: *every published bundle is
+  content-addressed, key_id-pinned, and re-verified at fetch.*
+  Backed by `mvm_plan::bundle::read_and_verify_bundle` rejection-
+  ladder tests. ADR-002 also caught up to document claim 8
+  (signed `ExecutionPlan`, already shipped in plan 64 / ADR-041
+  but never previously in the ADR table).
+
+Outstanding (deferred follow-ups):
+
+- HTTP `mvmctl bundle fetch <url>` — adds a wire client; out of
+  scope for the substrate-close-out commit.
+- Supervisor admit-time bundle re-verify wired into
+  `ExecutionPlan::PlanArtifact`. Requires a plan schema bump
+  (carries `bundle_sha256` + `manifest_sig_base64` + `key_id`),
+  which is its own ADR-touching change.
+- Registry replacement: replace
+  `~/.mvm/templates/<sha256(manifest_path)>/...` keying with
+  bundle-sha256 directories so a fetched bundle slots into the
+  template flow directly.
+- `LocalAuditKind::TrustAdd` / `TrustRemove` variants + emitter
+  wiring so `trust add/remove` flips from `InteractiveOrControl`
+  to `Emits(...)` in the posture table.
 
 ### Sprint 52 success criteria
 

@@ -150,6 +150,40 @@ const SNAPSHOT_SUB: &[(&str, AuditPosture)] = &[
     ("rm", AuditPosture::Emits("SnapshotDelete")),
 ];
 
+// Sprint 52 W2 — bundle / trust subcommand tables.
+//
+// `bundle export` writes a `.mvmpkg` archive to disk under the
+// host's `--out` path; that's a local artifact, not host-side
+// state that the audit chain tracks, so it shipped as
+// `InteractiveOrControl` rather than `Emits` for now. Bumping it
+// to a `BundleExport` emission is the natural follow-up when the
+// host-side bundle registry lands.
+//
+// `bundle fetch` is verify-only in this commit (no extraction),
+// so it's `ReadOnly`. When the registry-replacement flow lands
+// and fetch starts mutating `~/.mvm/templates/<bundle-sha256>/`,
+// this row flips to `Emits("BundleFetch")`.
+//
+// `trust` mutates `~/.mvm/trusted-publishers/`. add/remove emit
+// audit entries (publisher trust is host-trust-boundary state);
+// list is `ReadOnly`.
+const BUNDLE_SUB: &[(&str, AuditPosture)] = &[
+    ("export", AuditPosture::InteractiveOrControl),
+    ("fetch", AuditPosture::ReadOnly),
+];
+
+// trust add/remove mutate `~/.mvm/trusted-publishers/` but the
+// audit chain integration (new `LocalAuditKind::TrustAdd /
+// TrustRemove` variants + emitter wiring) hasn't landed yet —
+// same staged shape `policy update` used while waiting on plan
+// 60 Phase 8. Bumping these to `Emits("TrustAdd"/"TrustRemove")`
+// is the follow-up that goes with the audit-chain hook-up.
+const TRUST_SUB: &[(&str, AuditPosture)] = &[
+    ("add", AuditPosture::InteractiveOrControl),
+    ("list", AuditPosture::ReadOnly),
+    ("remove", AuditPosture::InteractiveOrControl),
+];
+
 /// Every top-level `mvmctl` subcommand keyed by its clap name.
 ///
 /// Order matches the `Commands` enum in
@@ -202,6 +236,9 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("secret", AuditPosture::DelegatesToSub(SECRET_SUB)),
     ("attest", AuditPosture::DelegatesToSub(ATTEST_SUB)),
     ("policy", AuditPosture::DelegatesToSub(POLICY_SUB)),
+    // Sprint 52 W2 — bundles + trust store.
+    ("bundle", AuditPosture::DelegatesToSub(BUNDLE_SUB)),
+    ("trust", AuditPosture::DelegatesToSub(TRUST_SUB)),
 ];
 
 // ──────────────────────────────────────────────────────────────────
