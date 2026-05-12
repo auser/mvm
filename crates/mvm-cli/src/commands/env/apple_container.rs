@@ -561,13 +561,93 @@ fn ensure_dev_image() -> Result<(String, String)> {
     let prebuilt_dir = format!("{prebuilt_root}/v{version}");
     std::fs::create_dir_all(&prebuilt_dir)
         .with_context(|| format!("creating prebuilt dir {prebuilt_dir}"))?;
-    prune_old_prebuilts(&prebuilt_root, version);
     let kernel_path = format!("{prebuilt_dir}/vmlinux");
     let rootfs_path = format!("{prebuilt_dir}/rootfs.ext4");
+    // Cache hit on the current version's dir — fast path.
     if std::path::Path::new(&kernel_path).exists() && std::path::Path::new(&rootfs_path).exists() {
+        prune_old_prebuilts(&prebuilt_root, version);
         return Ok((kernel_path, rootfs_path));
     }
-    download_dev_image(&kernel_path, &rootfs_path)
+    // Try the published prebuilt. Defer the prune until *after* a
+    // successful download — old `~/.mvm/dev/prebuilt/v*/` dirs and
+    // historical `~/.mvm/dev/builds/<hash>/` artifacts are our last-
+    // resort fallback when the release page lacks v{version} assets.
+    match download_dev_image(&kernel_path, &rootfs_path) {
+        Ok(result) => {
+            prune_old_prebuilts(&prebuilt_root, version);
+            Ok(result)
+        }
+        Err(download_err) => {
+            ui::warn(&format!(
+                "Could not download dev image for v{version}: {download_err}\n\
+                 Searching for a local fallback under ~/.mvm/dev/."
+            ));
+            if let Some((src_kernel, src_rootfs, source_label)) = find_local_fallback_image() {
+                ui::warn(&format!(
+                    "Using local fallback from {source_label}. \
+                     This is not the published v{version} image — boot it knowing the \
+                     versions differ. Publish v{version} assets or restore the local \
+                     builder flake to make this go away."
+                ));
+                std::fs::copy(&src_kernel, &kernel_path).with_context(|| {
+                    format!("copying fallback kernel {src_kernel:?} → {kernel_path}")
+                })?;
+                std::fs::copy(&src_rootfs, &rootfs_path).with_context(|| {
+                    format!("copying fallback rootfs {src_rootfs:?} → {rootfs_path}")
+                })?;
+                Ok((kernel_path, rootfs_path))
+            } else {
+                Err(download_err.context(
+                    "no local fallback found under ~/.mvm/dev/prebuilt/v*/ \
+                     or ~/.mvm/dev/builds/*/",
+                ))
+            }
+        }
+    }
+}
+
+/// Search for any locally-cached dev image as a fallback when the
+/// published-prebuilt download fails. Looks under:
+///
+/// - `~/.mvm/dev/prebuilt/v*/{vmlinux,rootfs.ext4}` — previously
+///   downloaded prebuilts for earlier versions.
+/// - `~/.mvm/dev/builds/<hash>/{vmlinux,rootfs.ext4}` — historical
+///   nix-darwin `linux-builder` outputs from the pre-microsandbox era.
+///
+/// Returns the most-recently-modified pair so a user with a recent
+/// successful build/download keeps booting, with a short label
+/// (e.g. `v0.13.0` or `builds/abcdef…`) for the warning surface.
+/// `None` means nothing usable was found.
+fn find_local_fallback_image() -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let dev_root = format!("{}/dev", mvm_core::config::mvm_data_dir());
+
+    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, String)> = Vec::new();
+    for sub in ["prebuilt", "builds"] {
+        let parent = std::path::Path::new(&dev_root).join(sub);
+        let Ok(entries) = std::fs::read_dir(&parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let kernel = dir.join("vmlinux");
+            let rootfs = dir.join("rootfs.ext4");
+            if !kernel.is_file() || !rootfs.is_file() {
+                continue;
+            }
+            let mtime = std::fs::metadata(&rootfs)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let label = format!("{sub}/{}", entry.file_name().to_string_lossy());
+            candidates.push((mtime, dir, label));
+        }
+    }
+
+    candidates.sort_by_key(|(mtime, ..)| *mtime);
+    let (_, dir, label) = candidates.into_iter().next_back()?;
+    Some((dir.join("vmlinux"), dir.join("rootfs.ext4"), label))
 }
 
 /// Drop every direct child of `prebuilt_root` except the one for the
