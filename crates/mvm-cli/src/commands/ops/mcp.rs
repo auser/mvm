@@ -26,6 +26,7 @@ use mvm_mcp::{
     ContentBlock, Dispatcher, ReapReason, Reaper, RunParams, SessionConfig, SessionLookup,
     SessionMap, SessionState, ToolResult,
 };
+use mvm_supervisor::ToolRegistry;
 
 use super::Cli;
 
@@ -120,6 +121,13 @@ struct ExecDispatcher {
     sessions: Arc<Mutex<SessionMap>>,
     warm_vms: WarmVms,
     reaper: Arc<DispatcherReaper>,
+    /// Plan 60 Phase 7 host-mediated tools (`mvm.time_now`,
+    /// `mvm.web_fetch`, `mvm.web_search`). Built once at dispatcher
+    /// construction; shared across every `tools/call` invocation.
+    /// Default registry ships fail-closed for the web tools —
+    /// operators wire per-tenant allowlists by replacing this with
+    /// a configured registry in a follow-up slice.
+    tool_registry: Arc<ToolRegistry>,
 }
 
 impl Default for ExecDispatcher {
@@ -134,6 +142,7 @@ impl Default for ExecDispatcher {
                 warm_vms: Arc::clone(&warm_vms),
             }),
             warm_vms,
+            tool_registry: Arc::new(ToolRegistry::with_defaults()),
         }
     }
 }
@@ -443,6 +452,45 @@ impl Dispatcher for ExecDispatcher {
             }
         }
     }
+
+    /// Plan 60 Phase 7 — route registry tools through
+    /// `mvm_supervisor::ToolRegistry`. The legacy `run` tool stays
+    /// on its dedicated method; everything else (`mvm.time_now`,
+    /// `mvm.web_fetch`, `mvm.web_search`, …) lands here.
+    ///
+    /// `ToolRegistry::invoke` is async; the MCP wire layer is sync,
+    /// so we spin up a current-thread runtime per call (same pattern
+    /// as `vm::audit_chain::AuditEmitter`'s `block_on`). Tool calls
+    /// are infrequent relative to per-call cost, and the runtime
+    /// build is dominated by everything else in the dispatch path.
+    fn invoke_tool(&self, name: &str, params: serde_json::Value) -> ToolResult {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                return error_result(format!(
+                    "internal: building tokio runtime for tool {name:?}: {e}"
+                ));
+            }
+        };
+        match rt.block_on(self.tool_registry.invoke(name, params)) {
+            Ok(value) => {
+                // Render the JSON value as a single Text content
+                // block. The LLM client parses the body; pretty-
+                // printing keeps it human-readable when an operator
+                // inspects audit logs.
+                let text = serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|e| format!("(failed to serialize tool result: {e})"));
+                ToolResult {
+                    content: vec![ContentBlock::Text { text }],
+                    is_error: false,
+                }
+            }
+            Err(e) => error_result(e.to_string()),
+        }
+    }
 }
 
 struct InflightGuard<'a>(&'a AtomicUsize);
@@ -610,5 +658,52 @@ mod tests {
     #[test]
     fn shell_escape_no_quotes() {
         assert_eq!(shell_escape("plain"), "'plain'");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Plan 60 Phase 7 — invoke_tool routes through ToolRegistry
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn invoke_tool_routes_time_now_through_registry() {
+        // The default ExecDispatcher carries a registry with the 3
+        // Phase 7 builtins. `mvm.time_now` is unconditionally
+        // reachable (no allowlist needed), so this is the
+        // simplest "the wiring works" smoke test.
+        let dispatcher = ExecDispatcher::default();
+        let result = dispatcher.invoke_tool("mvm.time_now", serde_json::json!({}));
+        assert!(!result.is_error, "got error: {result:?}");
+        let ContentBlock::Text { text } = &result.content[0];
+        // The registry's TimeNowResult shape has `"time"` + `"format"` fields.
+        assert!(text.contains("\"time\""), "got: {text}");
+        assert!(text.contains("\"format\""), "got: {text}");
+    }
+
+    #[test]
+    fn invoke_tool_renders_unknown_tool_as_is_error() {
+        // The registry's `UnknownTool` error must surface as an
+        // `is_error: true` ToolResult (NOT a JSON-RPC error), so
+        // the LLM client sees the failure instead of retrying.
+        let dispatcher = ExecDispatcher::default();
+        let result = dispatcher.invoke_tool("mvm.does_not_exist", serde_json::json!({}));
+        assert!(result.is_error);
+        let ContentBlock::Text { text } = &result.content[0];
+        assert!(text.contains("mvm.does_not_exist"), "got: {text}");
+    }
+
+    #[test]
+    fn invoke_tool_web_fetch_fails_closed_with_clear_message() {
+        // The default registry registers `mvm.web_fetch` with an
+        // empty allowlist (Default::default() = fail_closed). The
+        // operator sees a clear "not on allowlist" error rather
+        // than a silent fall-through.
+        let dispatcher = ExecDispatcher::default();
+        let result = dispatcher.invoke_tool(
+            "mvm.web_fetch",
+            serde_json::json!({ "url": "https://example.com/" }),
+        );
+        assert!(result.is_error);
+        let ContentBlock::Text { text } = &result.content[0];
+        assert!(text.contains("not on per-tenant allowlist"), "got: {text}");
     }
 }
