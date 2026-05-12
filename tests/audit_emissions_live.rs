@@ -34,6 +34,12 @@
 //!   path key)
 //! - `mvmctl config set <key> <value>` → `ConfigChange`
 //! - `mvmctl config show` → **no** audit entry
+//! - `mvmctl snapshot rm <name>` → `SnapshotDelete`
+//!   (test pre-creates `~/.mvm/instances/<name>/snapshot/` so the
+//!   bail-when-missing branch doesn't short-circuit the emit)
+//! - `mvmctl snapshot ls` → **no** audit entry
+//! - `mvmctl audit tail` / `audit verify` → **no** audit entry
+//! - `mvmctl attest status` → **no** audit entry
 //! - `mvmctl secret put / get / ls / rm` → secret-side audit JSONL
 //!   at `~/.mvm/audit/secrets.jsonl` carries one entry per call
 //!   with `"action":"put"` / `"get"` / `"list"` / `"delete"`. The
@@ -676,6 +682,158 @@ fn config_show_does_not_emit_audit_entry() {
         hits, 0,
         "read-only `config show` must not emit; got {hits} \
          config_change entry/entries. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn snapshot_rm_emits_snapshot_delete_audit_entry() {
+    // `mvmctl snapshot rm <vm>` removes the snapshot directory and
+    // emits `SnapshotDelete`. `delete_instance_snapshot` returns
+    // `Ok(false)` when the directory is missing — the CLI then
+    // bails *before* the emit point. To exercise the emit branch
+    // hermetically, pre-create the snapshot dir with stub bytes.
+    // No real Firecracker / VM is involved.
+    let sandbox = AuditSandbox::new();
+    let snap_dir = sandbox
+        .home_path()
+        .join(".mvm")
+        .join("instances")
+        .join("test-snap")
+        .join("snapshot");
+    std::fs::create_dir_all(&snap_dir).expect("mkdir snapshot dir");
+    std::fs::write(snap_dir.join("vmstate.bin"), b"stub").expect("write vmstate stub");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["snapshot", "rm", "test-snap"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl snapshot rm failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "snapshot_delete");
+    assert!(
+        hits >= 1,
+        "expected ≥1 snapshot_delete entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+    // The vm_name field should carry the snapshot identity so
+    // operator searches by VM name find the matching emit.
+    assert!(
+        log.contains("\"vm_name\":\"test-snap\""),
+        "snapshot_delete must carry vm_name=test-snap. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn snapshot_ls_does_not_emit_audit_entry() {
+    // Negative: `snapshot ls` is read-only. `SNAPSHOT_SUB` in
+    // `audit_total_coverage.rs` classifies it as `ReadOnly`; this
+    // test pins that against a future regression that adds an
+    // emit to the list path.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["snapshot", "ls"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl snapshot ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "snapshot_delete");
+    assert_eq!(
+        hits, 0,
+        "read-only `snapshot ls` must not emit snapshot_delete; \
+         got {hits}. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn audit_tail_does_not_emit_local_audit_entry() {
+    // Negative: `audit tail` reads the LocalAudit stream. The audit
+    // CLI itself is ReadOnly (classification in
+    // `audit_total_coverage.rs`); reading the log must not add to it.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["audit", "tail"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl audit tail failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The LocalAudit stream (`<state>/log/audit.jsonl`) must be
+    // empty — tail reads but does not write. The plan-64 chain at
+    // `~/.mvm/audit/<tenant>.jsonl` always gains cmd.* entries
+    // from the audit emitter middleware, which is by design and
+    // separate from the LocalAudit stream this lint guards.
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `audit tail` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn audit_verify_does_not_emit_local_audit_entry() {
+    // Negative: `audit verify` validates the plan-64 chain.
+    // Read-only against the LocalAudit stream. Note the verify
+    // command itself appends cmd.* chain entries via the emitter
+    // middleware — that's a separate stream and not in scope here.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["audit", "verify"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl audit verify failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `audit verify` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn attest_status_does_not_emit_local_audit_entry() {
+    // Negative: `attest status` reports the host's attestation
+    // identity — pure read. `ATTEST_SUB` classifies all three
+    // leaves (export / verify / status) as ReadOnly.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["attest", "status"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl attest status failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `attest status` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
     );
 }
 
