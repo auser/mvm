@@ -78,6 +78,29 @@ in
 , dev            ? null
 , uids           ? null   # { agent = <int>; entrypoint = <int>; } — see below
 , extraFiles     ? { }
+# ── kernel + matching modules ────────────────────────────────────────
+#
+# When set, mkGuest installs the kernel's `/lib/modules/<modDirVersion>/`
+# tree into the rootfs and adds `pkgs.kmod` to the packages closure so
+# /init can `modprobe` modules at boot. The motivating use case is
+# vsock: the rootfs is busybox-flat, so `vsock=m` modules can't load
+# unless we ship the matching modules tree. Earlier iterations
+# `.override`-d the kernel to compile vsock built-in — that busts
+# `cache.nixos.org` (custom .config = unique derivation hash) and
+# added ~22 min to every cold dev-image build. Shipping modules
+# instead keeps the stock binary-cached kernel.
+#
+# **Match exactly.** The modules tree is version-pinned to its
+# kernel; mixing kernel + modules from different builds is undefined
+# behaviour. Callers pass the kernel derivation; mkGuest pulls
+# `kernel.modDirVersion` to name the install directory.
+#
+# Rootfs growth: ~50 MB on aarch64 nixpkgs (full modules tree). An
+# opportunistic prune to just the vsock + virtio module subtree is
+# a follow-up — at that point modules.dep needs re-running through
+# `depmod -b $out`, which adds complexity disproportionate to the
+# size win for a dev image.
+, kernel         ? null
 }:
 let
   entrypointKind = classifyEntrypoint entrypoint;
@@ -144,6 +167,15 @@ let
   # Phase 1 W6.1 slice we keep it simple.
   agentUid = resolvedUids.agent;
   entrypointUid = resolvedUids.entrypoint;
+
+  # Kernel-modules support: when a kernel is wired in, pull `pkgs.kmod`
+  # so /usr/local/bin/modprobe (and its depmod-built index) is available
+  # in the guest. busybox's modprobe applet works for trivial cases but
+  # drops corner cases (compressed-module variants, alias lookups) that
+  # `kmod`'s modprobe handles properly. Without modprobe the modules
+  # tree we ship is just dead weight on disk.
+  hasKernel = kernel != null;
+  effectivePackages = packages ++ pkgs.lib.optional hasKernel pkgs.kmod;
 
   # Wrap a command-line in `setpriv` when the target uid is non-zero.
   # Uses util-linux's `setpriv` (symlinked into /usr/local/bin via the
@@ -213,6 +245,27 @@ let
     # mountpoints instead.
     /bin/busybox mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
     /bin/busybox mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+
+    # Stage 2.4 — kernel modules (when a kernel was wired into the
+    # rootfs at build time). Most importantly the vsock chain: the
+    # agent in Stage 2.5 opens AF_VSOCK, and if the vsock module
+    # family isn't loaded that `socket()` returns EAFNOSUPPORT,
+    # taking the whole host↔guest agent surface (`mvmctl console`,
+    # exec, lifecycle) dark.
+    #
+    # Defensive on three axes:
+    #   - `[ -x modprobe ]`: modules-less images (kernel = null at
+    #     mkGuest time) skip the loop silently.
+    #   - `modprobe -q`: silent on already-loaded / built-in modules.
+    #   - `|| true`: module names drift across kernel versions
+    #     (vmw_vsock_virtio_transport vs. vsock_virtio_transport).
+    #     Try the canonical names; the first that loads wins. As
+    #     long as `vsock` itself loads, AF_VSOCK is registered.
+    if [ -x /usr/local/bin/modprobe ] && [ -d /lib/modules ]; then
+      for mod in vsock vmw_vsock_virtio_transport vsock_loopback; do
+        /usr/local/bin/modprobe -q "$mod" 2>/dev/null || true
+      done
+    fi
 
     # Stage 2.5 — guest agent supervisor. Fork the agent into
     # the background under its own uid before we drop to the
@@ -428,7 +481,19 @@ let
           done
         fi
       '')
-      packages}
+      effectivePackages}
+
+    # Kernel modules tree, when a matching kernel was supplied. We
+    # copy (not symlink) so the rootfs is self-contained — the host's
+    # /nix/store isn't visible to the guest at boot. /lib/modules is
+    # made read-only so a compromised entrypoint can't replace a
+    # module with one of its own choosing.
+    ${pkgs.lib.optionalString hasKernel ''
+      mkdir -p "$out/lib/modules"
+      cp -R ${kernel}/lib/modules/${kernel.modDirVersion} \
+        "$out/lib/modules/${kernel.modDirVersion}"
+      chmod -R a-w "$out/lib/modules/${kernel.modDirVersion}"
+    ''}
   '';
 
   # Package the tree as an ext4 image. nixpkgs ships a make-ext4-fs

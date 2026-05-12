@@ -62,24 +62,26 @@
   # `apple_container::verify_vendored_checksums`; a mismatch hard-fails
   # the boot, surfacing tamper / partial-copy issues immediately.
   #
-  # Kernel override (further down): a custom kernel is a deliberate
-  # cache miss against `cache.nixos.org` because the rootfs has no
-  # `/lib/modules/` and vsock therefore has to be built in. First
-  # build of this flake on a host is slow (~20-25 min on aarch64);
-  # subsequent builds reuse the cached kernel closure from
-  # `~/.cache/mvm/builder-store/` and complete in ~30 s.
+  # Kernel: stock `pkgs.linuxPackages.kernel` — `cache.nixos.org`
+  # binary hit, no per-cold-build kernel compile. mkGuest installs
+  # the matching `/lib/modules/<kver>/` tree into the rootfs and
+  # /init `modprobe`s vsock before the guest agent opens its socket.
+  # Cold build target: ~2-3 min (down from ~25 min when we shipped
+  # a custom kernel with vsock built-in — see issue #110 for the
+  # migration).
   #
   # macOS xattr caveat — bind-mount disabled by default on macOS.
   # libkrun's virtio-fs proxy strips `setxattr` from bind-mounted
   # APFS, which nix needs to mark chroot-store paths; `nix build`
   # fails on the first store-path write with EIO. `run_build_async`
   # detects macOS and force-fallbacks to an in-guest tmpfs (no
-  # persistent cache, cold ~25 min every run). Linux hosts get the
-  # bind-mount + warm cache. The block-device workaround
-  # (sparse ext4 file attached as a raw disk, mkfs'd by the guest)
-  # is the planned macOS fix — see Sprint 50 follow-up. Opt into
-  # the bind-mount today with `MVM_BUILDER_USE_HOST_STORE=1` only
-  # if you're working on that follow-up.
+  # persistent cache, cold ~2-3 min every run with the stock kernel
+  # since #110). Linux hosts get the bind-mount + warm cache. The
+  # block-device workaround (sparse ext4 file attached as a raw
+  # disk, mkfs'd by the guest) is the planned macOS fix — see
+  # issue #109. Opt into the bind-mount today with
+  # `MVM_BUILDER_USE_HOST_STORE=1` only if you're working on that
+  # follow-up.
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
@@ -119,36 +121,20 @@
       mkBuilderImage = system:
         let
           pkgs = import nixpkgs { inherit system; };
+          # Stock nixpkgs kernel — `cache.nixos.org` binary hit, no
+          # ~22 min kernel compile per cold build. vsock is shipped
+          # as kernel modules; mkGuest below installs the matching
+          # `/lib/modules/<kver>/` subtree into the rootfs and the
+          # /init `modprobe`s vsock before forking the guest agent.
+          # See issue #110 for the rationale and the migration off
+          # the previous custom-kernel override.
+          kernelPkg = pkgs.linuxPackages.kernel;
           rootfs = (libFor { inherit system; }).mkGuest {
             name = "mvm-dev";
             entrypoint.shell = "/bin/sh";
             packages = builderPackages pkgs;
+            kernel = kernelPkg;
           };
-          # Override the stock kernel to compile vsock support in
-          # (rather than as modules). The rootfs we ship is a flat
-          # busybox tree without `/lib/modules/`, so `=m` modules can
-          # never load — `mvm-guest-agent` then fails `socket(AF_VSOCK,
-          # …)` because the address family isn't registered, and
-          # every host-side surface that talks to the agent
-          # (`mvmctl console`, `dev shell`, `build`) goes dark.
-          #
-          # Built-in:
-          #   - VSOCKETS:               AF_VSOCK address family
-          #   - VHOST_VSOCK:            host-side vhost driver path
-          #   - VIRTIO_VSOCKETS_COMMON: shared virtio-vsock plumbing
-          #   - VIRTIO_VSOCKETS:        guest-side virtio transport
-          #   - VHOST + VHOST_NET:      dependencies the above pull in
-          devKernel = pkgs.linuxPackages.kernel.override {
-            structuredExtraConfig = with pkgs.lib.kernel; {
-              VSOCKETS = yes;
-              VHOST = yes;
-              VHOST_VSOCK = yes;
-              VIRTIO_VSOCKETS_COMMON = yes;
-              VIRTIO_VSOCKETS = yes;
-            };
-            ignoreConfigErrors = true;
-          };
-          kernelPkg = devKernel;
           kernelFile =
             if pkgs.stdenv.hostPlatform.isAarch64
             then "Image"

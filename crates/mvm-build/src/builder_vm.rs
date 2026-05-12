@@ -557,13 +557,15 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
     // Scratch nix store backing the chroot store at `/scratch-nix`:
     //
     //   - **`Some(host_dir)`**: bind-mount the host dir. The realised
-    //     closure persists across builds — a custom-kernel rebuild
-    //     (~25 min cold on aarch64/4-vCPU) amortises to a ~30 s warm
-    //     hit on the next run. Trust boundary: this dir is mvm-owned
-    //     (mode 0700, never the host's actual `/nix/store`); nix's
-    //     content-addressed store paths give us cache integrity by
-    //     construction, and the in-script `nix-store --verify` below
-    //     re-checks NAR hashes after a crashed run.
+    //     closure persists across builds — a clean dev-image build
+    //     (~2-3 min cold on aarch64/4-vCPU since the kernel is a
+    //     stock binary-cache hit; see issue #110) amortises to a
+    //     ~30 s warm hit on the next run. Trust boundary: this dir
+    //     is mvm-owned (mode 0700, never the host's actual
+    //     `/nix/store`); nix's content-addressed store paths give us
+    //     cache integrity by construction, and the in-script
+    //     `nix-store --verify` below re-checks NAR hashes after a
+    //     crashed run.
     //   - **`None`**: in-guest tmpfs sized to `BUILDER_SCRATCH_STORE_MIB`.
     //     Always correct; the cache dies with the sandbox.
     //
