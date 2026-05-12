@@ -80,7 +80,9 @@ pub use hickory_dns::HickoryDnsResolver;
 pub use injection_guard::{InjectionGuard, InjectionRule, RuleFamily};
 pub use inspector::{Inspector, InspectorChain, InspectorVerdict, RequestCtx};
 pub use instance_sampler::{OsSources, Sample, SampleTarget, Sources, sample_once};
-pub use keystore::{KeystoreError, KeystoreReleaser, NoopKeystoreReleaser, SecretGrant};
+pub use keystore::{
+    KeystoreError, KeystoreReleaser, LiveKeystoreReleaser, NoopKeystoreReleaser, SecretGrant,
+};
 pub use l7_proxy::{
     AuditFields, CapturingEgressAuditSink, ConnectParseError, ConnectRequest, DnsResolver,
     EgressAuditSink, EgressOutcome, EvaluationResult, L7EgressProxy, NoopEgressAuditSink,

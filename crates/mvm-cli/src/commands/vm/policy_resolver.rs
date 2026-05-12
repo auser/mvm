@@ -71,9 +71,9 @@ use std::sync::Arc;
 use mvm_plan::{ExecutionPlan, FsPolicyRef, PolicyRef};
 use mvm_supervisor::{
     ArtifactCollector, EgressPolicyValidationError, EgressProxy, KeystoreReleaser, L4Gate,
-    L4SpecError, L7EgressProxy, LiveArtifactCollector, LiveL4Gate, NoopArtifactCollector,
-    NoopEgressAuditSink, NoopEgressProxy, NoopKeystoreReleaser, NoopL4Gate, NoopToolGate,
-    PolicyToolGate, TokioDnsResolver, ToolGate, build_inspector_chain,
+    L4SpecError, L7EgressProxy, LiveArtifactCollector, LiveKeystoreReleaser, LiveL4Gate,
+    NoopArtifactCollector, NoopEgressAuditSink, NoopEgressProxy, NoopKeystoreReleaser, NoopL4Gate,
+    NoopToolGate, PolicyToolGate, TokioDnsResolver, ToolGate, build_inspector_chain,
     validate_egress_policy_inspector_names,
 };
 
@@ -434,11 +434,18 @@ fn slots_from_bundle(
     // `NotWired`) until the mvm-hostd virtiofs-streaming lift wires
     // the real capture mechanism.
     let artifacts = LiveArtifactCollector::from_policy(&bundle.artifact);
+    // Keystore releaser — carries the bundle's `rotation_interval_days`
+    // on the public field. `release`/`revoke` error
+    // `KeystoreError::NotImplemented` until the mvm-hostd
+    // attestation-gated release flow wires in. Closing the last
+    // Noop slot in slots_from_bundle: every parsed bundle field
+    // now surfaces somewhere live.
+    let keystore = LiveKeystoreReleaser::from_policy(&bundle.keys);
     Ok(ResolvedSlots {
         network: Box::new(l4),
         egress: Box::new(l7),
         tool_gate: Box::new(tool_gate),
-        keystore: Box::new(NoopKeystoreReleaser),
+        keystore: Box::new(keystore),
         artifacts: Box::new(artifacts),
     })
 }
@@ -884,16 +891,73 @@ allowed = ["{name}"]
         });
     }
 
+    fn fixture_bundle_with_key_rotation(days: u32) -> String {
+        format!(
+            r#"
+schema_version = 1
+bundle_id      = "acme/web-worker"
+bundle_version = 1
+
+[network]
+[egress]
+[pii]
+[tool]
+[artifact]
+
+[keys]
+rotation_interval_days = {days}
+
+[audit]
+"#,
+        )
+    }
+
     #[test]
-    fn slice_a_keystore_remains_noop_for_parsed_bundle() {
-        // The supervisor lift in mvm-hostd ships the live
-        // KeystoreReleaser consumer. Until then the resolver returns
-        // a Noop keystore slot even when the bundle parses cleanly.
-        // Tests pin that deliberate scope.
-        //
-        // ArtifactCollector moved out of this test in the
-        // post-Slice-B follow-on (`LiveArtifactCollector`); its
-        // dedicated coverage lives below.
+    fn slice_b_returns_live_keystore_releaser_for_parsed_bundle() {
+        // A parsed `<tenant>:<workload>` bundle yields a live
+        // KeystoreReleaser — release() + revoke() return
+        // NotImplemented (configured + pending consumer) rather than
+        // NotWired. This is the last Noop slot closed in
+        // slots_from_bundle.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_key_rotation(30),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("expected live slots, got {e}"));
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let err = slots
+                .keystore
+                .revoke("anything")
+                .await
+                .expect_err("live keystore must surface NotImplemented");
+            match err {
+                mvm_supervisor::KeystoreError::NotImplemented {
+                    rotation_interval_days,
+                } => assert_eq!(rotation_interval_days, 30),
+                other => panic!("expected NotImplemented, got {other:?}"),
+            }
+        });
+    }
+
+    #[test]
+    fn slice_b_empty_keys_section_still_yields_live_keystore() {
+        // A parsed bundle without an explicit `[keys]` block still
+        // produces a Live keystore — distinguishing "configured, no
+        // rotation" from "no bundle". The releaser surfaces
+        // rotation_interval_days=0 via NotImplemented; Noop would
+        // surface NotWired.
         let tmp = tempfile::tempdir().unwrap();
         write_bundle(
             tmp.path(),
@@ -912,14 +976,19 @@ allowed = ["{name}"]
             .build()
             .unwrap();
         rt.block_on(async {
-            let ks_err = slots
+            let err = slots
                 .keystore
                 .revoke("anything")
                 .await
-                .expect_err("Noop keystore must error NotWired");
+                .expect_err("live keystore must surface NotImplemented");
             assert!(
-                matches!(ks_err, mvm_supervisor::KeystoreError::NotWired),
-                "unexpected keystore err: {ks_err:?}"
+                matches!(
+                    err,
+                    mvm_supervisor::KeystoreError::NotImplemented {
+                        rotation_interval_days: 0
+                    }
+                ),
+                "expected NotImplemented{{0}}, got {err:?}"
             );
         });
     }
@@ -1285,14 +1354,10 @@ disabled_inspectors = [{list}]
             "web-worker",
             &fixture_bundle_with_tool_allow("web_search"),
         );
-        let bundle = mvm_policy::toml_loader::load_bundle_from_path(
-            tmp.path(),
-            "acme",
-            "web-worker",
-        )
-        .expect("bundle parses");
-        let chain =
-            mvm_supervisor::build_inspector_chain(&bundle.egress, None);
+        let bundle =
+            mvm_policy::toml_loader::load_bundle_from_path(tmp.path(), "acme", "web-worker")
+                .expect("bundle parses");
+        let chain = mvm_supervisor::build_inspector_chain(&bundle.egress, None);
         assert_eq!(
             chain.len(),
             5,
@@ -1312,14 +1377,10 @@ disabled_inspectors = [{list}]
             "web-worker",
             &fixture_bundle_with_disabled_inspectors(&["ssrf_guard", "secrets_scanner"]),
         );
-        let bundle = mvm_policy::toml_loader::load_bundle_from_path(
-            tmp.path(),
-            "acme",
-            "web-worker",
-        )
-        .expect("bundle parses");
-        let chain =
-            mvm_supervisor::build_inspector_chain(&bundle.egress, None);
+        let bundle =
+            mvm_policy::toml_loader::load_bundle_from_path(tmp.path(), "acme", "web-worker")
+                .expect("bundle parses");
+        let chain = mvm_supervisor::build_inspector_chain(&bundle.egress, None);
         assert_eq!(
             chain.len(),
             3,
@@ -1345,14 +1406,10 @@ disabled_inspectors = [{list}]
             "web-worker",
             &fixture_bundle_with_disabled_inspectors(&["typo_inspector"]),
         );
-        let bundle = mvm_policy::toml_loader::load_bundle_from_path(
-            tmp.path(),
-            "acme",
-            "web-worker",
-        )
-        .expect("bundle parses");
-        let chain =
-            mvm_supervisor::build_inspector_chain(&bundle.egress, None);
+        let bundle =
+            mvm_policy::toml_loader::load_bundle_from_path(tmp.path(), "acme", "web-worker")
+                .expect("bundle parses");
+        let chain = mvm_supervisor::build_inspector_chain(&bundle.egress, None);
         assert_eq!(
             chain.len(),
             5,
@@ -1390,10 +1447,7 @@ disabled_inspectors = [{list}]
                 assert_eq!(value, "acme:web-worker");
                 let s = path.to_string_lossy();
                 assert!(s.contains("acme"), "path missing tenant: {s}");
-                assert!(
-                    s.contains("web-worker.toml"),
-                    "path missing workload: {s}"
-                );
+                assert!(s.contains("web-worker.toml"), "path missing workload: {s}");
                 assert!(
                     detail.contains("secrets_scaner"),
                     "detail must name the typo: {detail}"

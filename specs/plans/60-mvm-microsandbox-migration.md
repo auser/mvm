@@ -1740,7 +1740,7 @@ bundles) shipped in bce44e9; Slice B (L4 policy substrate +
 through `slots.network`) shipped 2026-05-11. The `HickoryDnsResolver`
 alternative to `TokioDnsResolver` ships under Slice B as well — an
 opt-in `DnsResolver` impl for operators who want DoT/DoH upstreams
-or a per-tenant resolver decoupled from `/etc/resolv.conf`. Four
+or a per-tenant resolver decoupled from `/etc/resolv.conf`. Five
 follow-on slices land alongside Slice B (also 2026-05-11): (1) the
 W5 resolver is now consumed by `up.rs::admit_plan_for_boot` (boot
 fails loudly on missing bundles / typos / bad L4 CIDRs instead of
@@ -1759,7 +1759,12 @@ before `build_inspector_chain`, so a typo in
 `ResolveError::EgressPolicyInvalid` (`error_class =
 policy-egress-invalid`) instead of silently leaving the
 inspector enforced. `build_inspector_chain` itself stays lenient
-for in-process callers. **Slice C remains
+for in-process callers; (5) `LiveKeystoreReleaser::from_policy`
+closes the last Noop slot in `slots_from_bundle` — every parsed
+bundle field now surfaces somewhere live, with
+`KeystoreError::NotImplemented { rotation_interval_days }`
+distinguishing "configured, pending consumer" from the
+`NotWired` "no bundle" case. **Slice C remains
 outstanding**: the smoltcp/TUN userspace-TCP consumer that turns
 an `L4Gate::evaluate` decision into accept/drop on a per-VM TAP,
 the host firewall (nft/pf/wfp) additive layer, the DNS server

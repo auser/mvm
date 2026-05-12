@@ -242,9 +242,7 @@ fn resolve_policy_for_admission(
             };
             // Best-effort audit; resolver-failure is the fatal path,
             // audit emit success/failure doesn't change that.
-            if let Err(audit_err) =
-                emitter.emit_failed(plan, class, &format!("{err:#}"))
-            {
+            if let Err(audit_err) = emitter.emit_failed(plan, class, &format!("{err:#}")) {
                 tracing::warn!(
                     error = %audit_err,
                     "audit emit_failed for policy-resolve failed (non-fatal)"

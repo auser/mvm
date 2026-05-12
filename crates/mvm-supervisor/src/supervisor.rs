@@ -1255,10 +1255,7 @@ mod tests {
     #[test]
     fn validate_egress_policy_passes_known_names() {
         let mut policy = dev_egress_policy(false);
-        policy.disabled_inspectors = vec![
-            "ssrf_guard".to_string(),
-            "pii_redactor".to_string(),
-        ];
+        policy.disabled_inspectors = vec!["ssrf_guard".to_string(), "pii_redactor".to_string()];
         validate_egress_policy_inspector_names(&policy).expect("known names");
     }
 
