@@ -54,6 +54,21 @@ pub(in crate::commands) enum AuditAction {
         #[arg(long, default_value = "local")]
         tenant: String,
     },
+    /// Run a read-only security-posture self-test. Reports the live
+    /// state of plan-65 + plan-7a mitigations on this host (host
+    /// signer present, audit chain verifiable, allowlists populated,
+    /// overlay root 0700, TLS minimum pinned, …) so an operator
+    /// can confirm their config without reading source.
+    ///
+    /// Read-only: makes no network calls, writes no files, mutates
+    /// no state.
+    Posture {
+        /// Emit a machine-readable JSON object to stdout instead of
+        /// the human-readable summary. Useful for monitoring +
+        /// configuration-drift detection.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
@@ -72,6 +87,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         }
         AuditAction::Verify { tenant } => audit_verify(&tenant),
         AuditAction::Show { plan_id, tenant } => audit_show(&tenant, &plan_id),
+        AuditAction::Posture { json } => super::audit_posture::run(json),
     }
 }
 
