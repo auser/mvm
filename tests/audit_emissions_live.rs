@@ -34,6 +34,11 @@
 //!   path key)
 //! - `mvmctl config set <key> <value>` → `ConfigChange`
 //! - `mvmctl config show` → **no** audit entry
+//! - `mvmctl cleanup --keep 5` → `SlotPrune`
+//!   (`source=cleanup removed=N`; the VM-dependent Step 1 / Step 3
+//!   degrade to warnings when the dev VM isn't reachable, but
+//!   Step 2 — the build-cache prune — runs on host fs and the
+//!   audit emit always fires)
 //! - `mvmctl snapshot rm <name>` → `SnapshotDelete`
 //!   (test pre-creates `~/.mvm/instances/<name>/snapshot/` so the
 //!   bail-when-missing branch doesn't short-circuit the emit)
@@ -694,6 +699,46 @@ fn config_show_does_not_emit_audit_entry() {
         hits, 0,
         "read-only `config show` must not emit; got {hits} \
          config_change entry/entries. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn cleanup_emits_slot_prune_audit_entry_even_with_no_builds() {
+    // `mvmctl cleanup --keep 5` is the highest-friction Emits row
+    // promoted to a live test: it runs three steps, two of which
+    // (`run_in_vm` for /tmp cleanup + nix-collect-garbage) need a
+    // running dev VM. Pre-refactor, the verb panicked out before
+    // reaching the audit emit when the VM was unreachable. The
+    // host-fallback in `cleanup_old_dev_builds` (now plain
+    // `std::fs::read_dir` / `remove_dir_all`) lets Step 2 succeed
+    // against `~/.mvm/dev/builds/` directly; the VM-dependent
+    // steps degrade to warnings, and the emit lands at the end
+    // regardless. The test asserts the empty-cache case (zero
+    // build dirs to prune) — `count=0` is the Plan 37 §6
+    // every-attempt-emits invariant in action.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["cleanup", "--keep", "5"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl cleanup --keep 5 failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "slot_prune");
+    assert!(
+        hits >= 1,
+        "expected ≥1 slot_prune entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+    assert!(
+        log.contains("source=cleanup"),
+        "slot_prune detail must carry source=cleanup to disambiguate \
+         from manifest-prune emits. Full log:\n{log}"
     );
 }
 
