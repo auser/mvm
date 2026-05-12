@@ -18,6 +18,14 @@
 //! - `mvmctl manifest prune --orphans` (empty registry) → `SlotPrune`
 //!   (emitted with `count=0` — Plan 37 §6 invariant: every state-
 //!   changing verb emits one record per attempt, even on no-op)
+//! - `mvmctl manifest prune --orphans --dry-run` → **no** audit entry
+//! - `mvmctl storage gc --apply --mock` (empty pool) → `StorageGc`
+//!   (no-op attempt emits with `count=0` / `pool_unavailable=…`)
+//! - `mvmctl storage gc --mock` (dry-run) → **no** audit entry
+//! - `mvmctl manifest tag add <tpl> <tag>` → `ManifestTagAdd`
+//! - `mvmctl manifest tag rm <tpl> <tag>` → `ManifestTagRemove`
+//! - `mvmctl manifest tag ls <tpl>` → **no** audit entry
+//! - `mvmctl manifest alias set <tpl> <alias> <rev>` → `ManifestAliasSet`
 //! - `mvmctl secret put` → secret-side audit JSONL at
 //!   `~/.mvm/audit/secrets.jsonl` carries `"action":"put"`
 //!
@@ -356,6 +364,133 @@ fn storage_gc_dry_run_does_not_emit_audit_entry() {
         hits, 0,
         "dry-run must not write audit entries, got {hits} storage_gc \
          entry/entries. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_tag_add_emits_manifest_tag_add_audit_entry() {
+    // `manifest tag add <template> <tag>` writes to
+    // `~/.mvm/templates/<template>/tags.json` and emits
+    // `ManifestTagAdd`. `TemplateTags::load` is forgiving — missing
+    // templates yield an empty catalog — so the test runs against a
+    // fresh sandbox without any pre-existing slot.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["manifest", "tag", "add", "test-tmpl", "live-test-tag"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest tag add failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "manifest_tag_add");
+    assert!(
+        hits >= 1,
+        "expected ≥1 manifest_tag_add entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_tag_rm_emits_manifest_tag_remove_audit_entry() {
+    // Add a tag, then remove it. Two audit entries expected — one
+    // `manifest_tag_add`, one `manifest_tag_remove` — but this test
+    // pins only the remove half (the add half has its own test
+    // above).
+    let sandbox = AuditSandbox::new();
+    let add = sandbox
+        .mvmctl()
+        .args(["manifest", "tag", "add", "test-tmpl", "to-remove"])
+        .output()
+        .expect("spawn mvmctl add");
+    assert!(
+        add.status.success(),
+        "mvmctl manifest tag add failed: stderr={}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let rm = sandbox
+        .mvmctl()
+        .args(["manifest", "tag", "rm", "test-tmpl", "to-remove"])
+        .output()
+        .expect("spawn mvmctl rm");
+    assert!(
+        rm.status.success(),
+        "mvmctl manifest tag rm failed: stderr={}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "manifest_tag_remove");
+    assert!(
+        hits >= 1,
+        "expected ≥1 manifest_tag_remove entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_tag_ls_does_not_emit_audit_entry() {
+    // Negative complement: `manifest tag ls` is read-only and must
+    // NOT emit. Pins the `MANIFEST_TAG` table's `ReadOnly` row in
+    // `tests/audit_total_coverage.rs` against a future regression
+    // that adds an emit to the list path.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["manifest", "tag", "ls", "test-tmpl"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest tag ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let add_hits = count_entries_with_kind(&log, "manifest_tag_add");
+    let rm_hits = count_entries_with_kind(&log, "manifest_tag_remove");
+    assert_eq!(
+        add_hits + rm_hits,
+        0,
+        "read-only `manifest tag ls` must not emit; got {add_hits} add \
+         and {rm_hits} remove entries. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_alias_set_emits_manifest_alias_set_audit_entry() {
+    // `manifest alias set <template> <alias> <rev>` writes to the
+    // same `tags.json` and emits `ManifestAliasSet`. Same
+    // forgiving-load story as `manifest tag add` above.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args([
+            "manifest",
+            "alias",
+            "set",
+            "test-tmpl",
+            "latest",
+            "abc123def456abc123def456abc123de",
+        ])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest alias set failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "manifest_alias_set");
+    assert!(
+        hits >= 1,
+        "expected ≥1 manifest_alias_set entry in audit log, got {hits}. \
+         Full log:\n{log}"
     );
 }
 
