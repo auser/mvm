@@ -289,24 +289,36 @@ impl BuilderVm for StubBuilderVm {
 #[cfg(feature = "backends-microsandbox")]
 const BUILDER_DEFAULT_CPUS: u8 = 4;
 
-/// In-sandbox tmpfs size for the scratch nix store, in MiB. Sized for
-/// the worst realistic case: building the Linux kernel from source
-/// (the dev-image flake overrides the kernel config to compile vsock
-/// in, which busts the binary cache and forces a from-source rebuild).
-/// A full aarch64 kernel build produces ~25-30 GiB of intermediate
-/// object files across all modules; 48 GiB leaves headroom alongside
-/// the Rust toolchain (~3 GiB), nixpkgs stdenv (~700 MiB), and the
-/// workload closure. Backed by guest RAM, so
-/// [`BUILDER_DEFAULT_MEMORY_MIB`] has to be at least this big plus
-/// what the actual build processes allocate.
-const BUILDER_SCRATCH_STORE_MIB: u32 = 49152;
+/// In-sandbox tmpfs size for the scratch nix store, in MiB. Holds
+/// the realised closure for one build: Rust toolchain (~3 GiB),
+/// nixpkgs stdenv (~700 MiB), the kernel build (~6-8 GiB of object
+/// files for an aarch64 minimal config — vmlinuz + busybox modules,
+/// not allmodconfig), and workload-specific closures. 24 GiB leaves
+/// headroom for parallel derivation downloads without OOMing the
+/// guest. Backed by guest RAM, so [`BUILDER_DEFAULT_MEMORY_MIB`]
+/// has to be at least this big plus the heaviest derivation's
+/// process memory.
+///
+/// **Sizing history.** Bumped to 48 GiB initially under the
+/// assumption that an `allmodconfig` kernel was needed; the real
+/// dev-image kernel is a tiny built-in-only config (no modules tree
+/// at all — `mk-guest` rootfs has no `/lib/modules/`). A 48 GiB
+/// tmpfs left only ~8 GiB of guest RAM for processes, and rustc
+/// peaks during `mvm-guest-agent`'s codegen reliably tipped the
+/// guest into OOM on hosts with anything else competing for RAM
+/// (browsers, IDE, etc.). 24 GiB tmpfs + 16 GiB process RAM is the
+/// new baseline.
+const BUILDER_SCRATCH_STORE_MIB: u32 = 24576;
 
 /// Default memory for the builder sandbox, in MiB. Has to fit
 /// [`BUILDER_SCRATCH_STORE_MIB`] (the tmpfs lives in guest RAM) plus
-/// what the heaviest derivation needs in process memory — the kernel
-/// link step + parallel `gcc` invocations peak around 6-8 GiB.
+/// what the heaviest derivation needs in process memory — rustc
+/// during `mvm-guest-agent`'s codegen + parallel cargo crate
+/// compilations peak around 6-10 GiB. 40 GiB total = 24 GiB tmpfs +
+/// 16 GiB process RAM, which fits comfortably on a 64 GiB laptop
+/// alongside an IDE / browser / other dev tooling.
 #[cfg(feature = "backends-microsandbox")]
-const BUILDER_DEFAULT_MEMORY_MIB: u32 = 57344;
+const BUILDER_DEFAULT_MEMORY_MIB: u32 = 40960;
 
 /// Canonical host directory for the persistent builder /nix/store
 /// cache. Shared by `cargo xtask build-dev-image` and `mvmctl dev up`'s
@@ -323,6 +335,99 @@ const BUILDER_DEFAULT_MEMORY_MIB: u32 = 57344;
 #[cfg(feature = "backends-microsandbox")]
 pub fn builder_store_dir() -> std::path::PathBuf {
     std::path::PathBuf::from(mvm_core::config::mvm_cache_dir()).join("builder-store")
+}
+
+/// Convert a host path to a guest mountpoint string for microsandbox.
+/// Microsandbox volume APIs take `&str`, so non-UTF-8 paths are a
+/// hard fail rather than a lossy lossy-conversion. Surfaces the
+/// offending path in the error so misconfigured caches are easy to
+/// spot.
+#[cfg(feature = "backends-microsandbox")]
+fn path_to_guest_str(p: &Path) -> Result<String, BuilderVmError> {
+    p.to_str().map(str::to_string).ok_or_else(|| {
+        BuilderVmError::ExtractionFailed(format!(
+            "path {} contains non-UTF-8 bytes; microsandbox volume \
+                 mountpoints require a string path",
+            p.display()
+        ))
+    })
+}
+
+/// If `flake_src` is a git worktree (its `.git` is a file, not a dir),
+/// return the parent repo's `.git` directory on the host. Bind-mounting
+/// that dir into the sandbox at the same absolute path lets the
+/// `gitdir:` pointer inside `<flake_src>/.git` resolve, which nix
+/// requires for `git+file://` flake refs.
+///
+/// Returns `None` for a regular checkout (`.git` is a directory) or
+/// when the workspace has no `.git` at all (e.g. tarball builds).
+/// Errors for a malformed pointer file or a pointer that escapes the
+/// expected `<repo>/.git/worktrees/<name>` shape — the caller should
+/// surface those rather than silently fall back, since silent fallback
+/// reproduces the original "fatal: not a git repository" failure.
+pub fn worktree_parent_git_dir(flake_src: &Path) -> Result<Option<PathBuf>, BuilderVmError> {
+    let dot_git = flake_src.join(".git");
+    let meta = match std::fs::symlink_metadata(&dot_git) {
+        Ok(m) => m,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "stat {}: {e}",
+                dot_git.display()
+            )));
+        }
+    };
+    if meta.is_dir() {
+        return Ok(None);
+    }
+    let body = std::fs::read_to_string(&dot_git).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!(
+            "read worktree pointer {}: {e}",
+            dot_git.display()
+        ))
+    })?;
+    let raw_target = body
+        .lines()
+        .find_map(|l| l.strip_prefix("gitdir:"))
+        .map(str::trim)
+        .ok_or_else(|| {
+            BuilderVmError::ExtractionFailed(format!(
+                "{} missing `gitdir:` line — not a worktree pointer",
+                dot_git.display()
+            ))
+        })?;
+    let gitdir = if Path::new(raw_target).is_absolute() {
+        PathBuf::from(raw_target)
+    } else {
+        flake_src.join(raw_target)
+    };
+    // Worktree gitdir lives at `<repo>/.git/worktrees/<name>`. Walk up
+    // two levels to reach the main `.git`. Anything else is a shape
+    // we don't support and shouldn't silently bind-mount.
+    let parent_git = gitdir
+        .parent()
+        .and_then(|worktrees_dir| worktrees_dir.parent())
+        .ok_or_else(|| {
+            BuilderVmError::ExtractionFailed(format!(
+                "worktree gitdir {} has unexpected shape (need <repo>/.git/worktrees/<name>)",
+                gitdir.display()
+            ))
+        })?
+        .to_path_buf();
+    if parent_git.file_name().and_then(|n| n.to_str()) != Some(".git") {
+        return Err(BuilderVmError::ExtractionFailed(format!(
+            "worktree gitdir {} resolved to {} which is not a `.git` directory",
+            gitdir.display(),
+            parent_git.display()
+        )));
+    }
+    if !parent_git.is_dir() {
+        return Err(BuilderVmError::ExtractionFailed(format!(
+            "worktree parent .git {} does not exist on host",
+            parent_git.display()
+        )));
+    }
+    Ok(Some(parent_git))
 }
 
 /// Where in the sandbox the user's flake gets bind-mounted.
@@ -554,6 +659,37 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
         })
         .volume(BUILDER_GUEST_OUT_DIR, |m| m.bind(artifact_out.as_path()));
 
+    // Worktree support. When `flake_src` is a `git worktree add`-ed
+    // checkout, its `.git` is a pointer file like
+    //   gitdir: /abs/path/to/repo/.git/worktrees/<name>
+    // pointing OUTSIDE the workspace, and the parent gitdir's own
+    // `gitdir` metadata file records the worktree's host absolute
+    // path (e.g. `/abs/path/to/worktree-checkout/.git`). nix's
+    // `git+file://` fetcher follows BOTH chains, so two bind-mounts
+    // are needed inside the sandbox — at the SAME host absolute paths
+    // — for the pointers to resolve:
+    //
+    //   1. Parent repo's `.git` → mounted readonly at its host abs
+    //      path; satisfies `<flake_src>/.git`'s `gitdir:` pointer.
+    //   2. The workspace itself → ALSO mounted at its host abs path
+    //      (in addition to `/work`); satisfies the parent gitdir's
+    //      back-reference to where the worktree lives on disk.
+    //
+    // Without both, you get either "fatal: not a git repository" (1
+    // missing) or "failed to open directory '<host-path>': No such
+    // file or directory" (2 missing). Both mounts are readonly — git
+    // only needs read access for flake fetching.
+    if let Some(parent_git) = worktree_parent_git_dir(&flake_src)? {
+        let parent_guest = path_to_guest_str(&parent_git)?;
+        let parent_host = parent_git.clone();
+        builder = builder.volume(&parent_guest, |m| m.bind(parent_host.as_path()).readonly());
+        let workspace_guest = path_to_guest_str(&flake_src)?;
+        let workspace_host = flake_src.clone();
+        builder = builder.volume(&workspace_guest, |m| {
+            m.bind(workspace_host.as_path()).readonly()
+        });
+    }
+
     // Scratch nix store backing the chroot store at `/scratch-nix`:
     //
     //   - **`Some(host_dir)`**: bind-mount the host dir. The realised
@@ -716,7 +852,11 @@ nix build {flake_ref}#{attr_path}{store_flag} --no-link --print-out-paths --no-w
 rc=$?
 set -e
 if [ $rc -ne 0 ]; then
-  if grep -qiE 'xattr|extended attribute|input/output error' /tmp/mvm-nix-build.stderr 2>/dev/null; then
+  # Match the canonical nix xattr error phrase (which always
+  # co-occurs with EIO when libkrun strips setxattr from APFS),
+  # not just the substring "xattr" — that hits legitimate package
+  # names like `xattr-1.6.1` being copied from cache.nixos.org.
+  if grep -qE 'querying extended attributes of .*: Input/output error|setxattr: Input/output error' /tmp/mvm-nix-build.stderr 2>/dev/null; then
     echo "" >&2
     echo "MVM_BUILDER: nix build failed with xattr/EIO signature. The bind-mounted" >&2
     echo "MVM_BUILDER: {scratch} may not support extended attributes (known issue on" >&2
@@ -1172,5 +1312,74 @@ mod tests {
         assert!(body.contains("\"rootlessEntrypoint\""), "got: {body}");
         // The accessible field is the W6.2 wire — check it's present.
         assert!(body.contains("\"accessible\""), "got: {body}");
+    }
+
+    #[test]
+    fn worktree_parent_git_dir_returns_none_for_regular_checkout() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir(tmp.path().join(".git")).unwrap();
+        assert!(worktree_parent_git_dir(tmp.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn worktree_parent_git_dir_returns_none_when_no_dot_git() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(worktree_parent_git_dir(tmp.path()).unwrap().is_none());
+    }
+
+    #[test]
+    fn worktree_parent_git_dir_resolves_pointer_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let parent_git = tmp.path().join("repo").join(".git");
+        let worktree_gitdir = parent_git.join("worktrees").join("feature-x");
+        std::fs::create_dir_all(&worktree_gitdir).unwrap();
+        let workspace = tmp.path().join("worktree-checkout");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join(".git"),
+            format!("gitdir: {}\n", worktree_gitdir.display()),
+        )
+        .unwrap();
+        let resolved = worktree_parent_git_dir(&workspace).unwrap().unwrap();
+        assert_eq!(resolved, parent_git);
+    }
+
+    #[test]
+    fn worktree_parent_git_dir_rejects_pointer_to_non_dot_git_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        // `gitdir:` points to /tmp/.../wrong/place — last two segments
+        // aren't `<repo>/.git/worktrees/<name>`, so we refuse rather
+        // than bind-mount something unexpected into the sandbox.
+        let bogus = tmp
+            .path()
+            .join("not-a-git-tree")
+            .join("worktrees")
+            .join("x");
+        std::fs::create_dir_all(&bogus).unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(
+            workspace.join(".git"),
+            format!("gitdir: {}\n", bogus.display()),
+        )
+        .unwrap();
+        let err = worktree_parent_git_dir(&workspace).unwrap_err().to_string();
+        assert!(
+            err.contains("not a `.git` directory"),
+            "expected shape-check error, got: {err}"
+        );
+    }
+
+    #[test]
+    fn worktree_parent_git_dir_rejects_missing_gitdir_line() {
+        let tmp = tempfile::tempdir().unwrap();
+        let workspace = tmp.path().join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::write(workspace.join(".git"), "no gitdir prefix here\n").unwrap();
+        let err = worktree_parent_git_dir(&workspace).unwrap_err().to_string();
+        assert!(
+            err.contains("missing `gitdir:`"),
+            "expected missing-prefix error, got: {err}"
+        );
     }
 }
