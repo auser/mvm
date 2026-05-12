@@ -4497,6 +4497,7 @@ dependencies = [
  "assert_cmd",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "httpmock",
  "mimalloc",
  "mvm",
@@ -4508,8 +4509,10 @@ dependencies = [
  "mvm-security",
  "objc2-foundation",
  "predicates",
+ "rand 0.8.6",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
