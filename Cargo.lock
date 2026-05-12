@@ -8699,6 +8699,7 @@ dependencies = [
  "clap",
  "clap_mangen",
  "mvm-cli",
+ "sha2 0.10.9",
  "tempfile",
 ]
 
