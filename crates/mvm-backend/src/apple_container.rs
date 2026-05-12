@@ -66,6 +66,12 @@ impl VmBackend for AppleContainerBackend {
             snapshots: false,
             vsock: true,
             tap_networking: false,
+            // Apple's Virtualization framework does not expose
+            // virtio-balloon to guests; memory ballooning is handled
+            // by the host kernel via macOS memory pressure, not by
+            // an in-guest device. Declared `false` so the host-side
+            // reclaim controller skips this backend cleanly.
+            balloon: false,
         }
     }
 

@@ -22,6 +22,10 @@ pub struct VmStartParams<'a> {
     pub profile: Option<String>,
     pub cpus: u32,
     pub memory_mib: u32,
+    /// Opt into virtio-balloon: when `Some(n)`, the host commits `n`
+    /// MiB at boot and the balloon claws back `memory_mib - n` MiB.
+    /// `None` keeps the legacy "commit memory_mib at boot" behaviour.
+    pub mem_initial_mib: Option<u32>,
     pub volumes: &'a [image::RuntimeVolume],
     pub config_files: &'a [microvm::DriveFile],
     pub secret_files: &'a [microvm::DriveFile],
@@ -42,6 +46,7 @@ impl VmStartParams<'_> {
             profile: self.profile,
             cpus: self.cpus,
             memory_mib: self.memory_mib,
+            mem_initial_mib: self.mem_initial_mib,
             ports: self
                 .port_mappings
                 .iter()

@@ -898,6 +898,12 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         .or(rt_config.memory)
         .or(tmpl_mem)
         .unwrap_or(user_cfg.default_memory_mib);
+    // Balloon opt-in: when the manifest declares `mem_initial`, the
+    // backend creates a pre-inflated balloon and only commits this
+    // amount at boot. `None` preserves the historical behaviour.
+    let final_mem_initial = rt_config
+        .mem_initial
+        .filter(|n| *n > 0 && *n < final_memory);
 
     // Parse port mappings and inject as config drive file
     let port_mappings = parse_port_specs(ports)?;
@@ -1018,6 +1024,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             profile: source_profile,
             cpus: final_cpus,
             memory: final_memory,
+            mem_initial: final_mem_initial,
             volumes: volume_cfg,
             config_files,
             secret_files,
@@ -1060,6 +1067,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             profile: source_profile,
             cpus: final_cpus,
             memory_mib: final_memory,
+            mem_initial_mib: final_mem_initial,
             volumes: &volume_cfg,
             config_files: &config_files,
             secret_files: &secret_files,
@@ -1339,6 +1347,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 profile: profile.map(|s| s.to_string()),
                 cpus: final_cpus,
                 memory_mib: final_memory,
+                mem_initial_mib: final_mem_initial,
                 volumes: &w_volume_cfg,
                 config_files: &w_config_files,
                 secret_files: &w_secret_files,

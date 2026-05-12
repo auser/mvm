@@ -116,6 +116,10 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         image,
         cpus: args.cpus,
         memory_mib,
+        // mvmctl exec is a one-shot transient; no balloon plumbing
+        // here yet. The manifest-driven path on mvmctl up is where
+        // mem_initial gets sourced for long-running workloads.
+        mem_initial_mib: None,
         add_dirs,
         env: env_pairs,
         target,

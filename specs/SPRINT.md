@@ -1211,6 +1211,98 @@ Sprint 51 closes when:
 5. CHANGELOG.md `[Unreleased]` section captures every shipped
    plan with date, commit SHAs, and links to ADRs.
 
+## Sprint 52 — smolvm gap-closing (in flight)
+
+Scope: pick the ideas mvm is missing from smolvm
+([smolmachines.com](https://smolmachines.com/)) that close real UX
+or perf gaps without compromising the eight ADR-002 security
+claims. The decision document
+(`/Users/auser/.claude/plans/is-there-anything-mvm-giggly-bear.md`)
+ranks eight candidates; this sprint lands the top two:
+
+1. **Virtio-balloon elasticity** — "mem cap, not commitment."
+2. **Portable image bundles + per-artifact attestation in a signed
+   envelope** — content-addressed `.mvmpkg` replaces the
+   manifest-path-hash registry keying.
+
+### W1 — Virtio-balloon elasticity  🟡 substrate landed
+
+Workloads opting into `mem_initial_mib` boot with a pre-inflated
+balloon and only commit a fraction of `memory_mib`; a host-side
+reclaim controller adjusts the balloon over the VM's life.
+
+Shipped:
+
+- `mvm-core` — `VmStartConfig::mem_initial_mib`,
+  `VmCapabilities::balloon`, `BalloonState`,
+  `VmBackend::balloon_set_target` + `balloon_state` trait methods.
+- `mvm-backend::microvm` — `FlakeRunConfig::mem_initial` +
+  validate(); FC start path PUTs `/balloon` with
+  `deflate_on_oom: true`; new `balloon_set_target` / `balloon_state`
+  free functions wrap the FC PATCH + GET endpoints.
+- `mvm-backend::cloud_hypervisor` — `VmConfigArgs::balloon_mib`,
+  emits the top-level `"balloon"` field in vm.create JSON, and
+  `balloon_set_target` posts to `/api/v1/vm.resize`
+  (`desired_balloon`); `balloon_state` parses `/api/v1/vm.info`.
+- `mvm-backend::{apple_container, docker, libkrun, microsandbox,
+  microvm_nix}` — `VmCapabilities::balloon = false` declared
+  honestly with rationale next to each (Apple's VZ has no
+  virtio-balloon; Docker is cgroup-mem not balloon; libkrun's C
+  API + microsandbox builder don't surface balloon control today).
+- `mvm-core::manifest` — `mem_initial: Option<String>` field with
+  `parse_human_size`-backed validation (rejects zero, rejects
+  `>= mem`); `Manifest::mem_initial_mib()` helper.
+- `mvm-backend::image::RuntimeConfig.mem_initial` for the
+  `--config` flow.
+- `mvm-cli::commands::shared::start::VmStartParams.mem_initial_mib`
+  threading through both `up.rs` call sites.
+- `mvm-cli::exec::ExecRequest.mem_initial_mib` threading;
+  short-lived session VM and `mvmctl exec` default to `None`
+  (no balloon).
+- `mvm-supervisor::balloon` — pure-function `BalloonPolicy`
+  (two-threshold band + guest floor) returning `BalloonAction`
+  decisions. Defaults: inflate above 0.80, deflate below 0.60,
+  step 64 MiB, guest floor 64 MiB. Fully unit-tested.
+
+Outstanding (this sprint):
+
+- Host-pressure poller integration — turn `BalloonPolicy` into a
+  running tick by reading PSI/sysinfo and calling
+  `AnyBackend::balloon_set_target` against the live VM registry.
+- `mvmctl doctor` surfaces per-backend `balloon` capability.
+- Live-KVM smoke: assert host RSS climbs/falls as the controller
+  inflates/deflates against a real Firecracker guest.
+- Thread `Manifest::mem_initial_mib()` into the template-baked
+  `tmpl_mem_initial` resolution path so manifest-declared
+  `mem_initial` flows to `mvmctl up` without `--config`.
+
+### W2 — Portable image bundles + per-artifact attestation  ⚪ next
+
+Sigstore-style trust model: bundle ships a signed `manifest.json`
+with per-artifact SHA-256s; the publisher's public key lives
+out-of-band at `~/.mvm/trusted-publishers/<key_id>.pub`. dm-verity
+(claim 3) gives independent per-block integrity inside the rootfs.
+Bundle hash + `key_id` pin into `ExecutionPlan::PlanArtifact` so
+admission re-verifies on every launch.
+
+Not started.
+
+### Sprint 52 success criteria
+
+1. *A workload with `mem_initial = "256M"` and `mem = "1024M"`
+   boots on Firecracker and cloud-hypervisor with the balloon
+   pre-inflated to 768 MiB; the host commits 256 MiB.*
+2. *`AnyBackend::balloon_set_target` adjusts a running FC VM's
+   commitment without reboot, observable through `balloon_state`.*
+3. *A `.mvmpkg` bundle built on machine A round-trips through the
+   registry, fetches to machine B, and `mvmctl up` succeeds; a
+   tampered manifest fails admission with a clear error.*
+4. *`mvm_plan::verify_plan` refuses an `ExecutionPlan` pinned to
+   a bundle whose `key_id` is not in the consumer's trust store.*
+5. *Backwards compatibility: every existing workspace test plus
+   `cargo clippy --workspace --all-targets -- -D warnings` stays
+   green throughout.*
+
 ## Completed Sprints
 
 - [01-foundation.md](sprints/01-foundation.md)

@@ -37,6 +37,7 @@ pub mod audit_dedup;
 pub mod audit_file;
 pub mod audit_recorder;
 pub mod backend;
+pub mod balloon;
 pub mod circuit_breaker;
 pub mod destination;
 pub mod egress;

@@ -42,6 +42,10 @@ impl VmBackend for LibkrunBackend {
             snapshots: false,
             vsock: true,
             tap_networking: false,
+            // libkrun's C API doesn't expose virtio-balloon control
+            // today; the upstream crate carries no `.balloon(...)`
+            // builder. Declared `false` until wiring lands.
+            balloon: false,
         }
     }
 
