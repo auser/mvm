@@ -133,8 +133,14 @@ jobs:
           ARCH: ${{ matrix.arch }}
         run: |
           SYSTEM="${ARCH}-linux"
+          # `--impure` is needed because nix/images/builder/flake.nix
+          # stages the workspace via `builtins.path { path = ../../..; }`.
+          # That path resolves outside the flake's source tree, which
+          # pure mode rejects. The workspace is intrinsically per-checkout;
+          # the cosign-signed manifest (plan 36) is the trust anchor
+          # downstream readers actually verify, not flake purity.
           nix build "./nix/images/builder#packages.${SYSTEM}.default" \
-            --no-link --print-out-paths > /tmp/store-path.txt
+            --no-link --print-out-paths --impure > /tmp/store-path.txt
           STORE_PATH=$(head -1 /tmp/store-path.txt)
           echo "${STORE_PATH}" > /tmp/dev-store-path.txt
           mkdir -p staging
