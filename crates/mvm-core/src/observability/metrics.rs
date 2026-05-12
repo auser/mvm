@@ -62,10 +62,38 @@ pub struct Metrics {
     pub dev_image_verify_expired: AtomicU64,
     pub dev_image_verify_network: AtomicU64,
     pub dev_image_verify_duration_ms: AtomicU64,
+
+    // ── Plan 60 Phase 4 audit counters (per-category) ───────────────
+    // Incremented by `mvm_supervisor::Recorder` on every successful
+    // emit. The 9 categories match `EventCategory::as_str()`; the
+    // metric name is `mvm_audit_<category>_total`. Downstream
+    // dashboards graph these to spot category-level anomalies (a
+    // spike in `flow.egress.denied` events without a corresponding
+    // `flow.egress.allowed` spike means something is hammering the
+    // proxy).
+    pub audit_cmd_total: AtomicU64,
+    pub audit_lifecycle_total: AtomicU64,
+    pub audit_secret_total: AtomicU64,
+    pub audit_flow_total: AtomicU64,
+    pub audit_plan_total: AtomicU64,
+    pub audit_policy_total: AtomicU64,
+    pub audit_key_total: AtomicU64,
+    pub audit_host_total: AtomicU64,
+    pub audit_audit_total: AtomicU64,
+}
+
+impl Default for Metrics {
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 impl Metrics {
-    fn new() -> Self {
+    /// Construct a fresh `Metrics` with every counter at zero.
+    /// Production callers use [`global`] for the singleton;
+    /// tests and per-tenant accumulators construct local
+    /// instances and drive them explicitly.
+    pub fn new() -> Self {
         Self {
             requests_total: AtomicU64::new(0),
             requests_reconcile: AtomicU64::new(0),
@@ -99,6 +127,15 @@ impl Metrics {
             dev_image_verify_expired: AtomicU64::new(0),
             dev_image_verify_network: AtomicU64::new(0),
             dev_image_verify_duration_ms: AtomicU64::new(0),
+            audit_cmd_total: AtomicU64::new(0),
+            audit_lifecycle_total: AtomicU64::new(0),
+            audit_secret_total: AtomicU64::new(0),
+            audit_flow_total: AtomicU64::new(0),
+            audit_plan_total: AtomicU64::new(0),
+            audit_policy_total: AtomicU64::new(0),
+            audit_key_total: AtomicU64::new(0),
+            audit_host_total: AtomicU64::new(0),
+            audit_audit_total: AtomicU64::new(0),
         }
     }
 
@@ -141,6 +178,15 @@ impl Metrics {
             dev_image_verify_expired: self.dev_image_verify_expired.load(Ordering::Relaxed),
             dev_image_verify_network: self.dev_image_verify_network.load(Ordering::Relaxed),
             dev_image_verify_duration_ms: self.dev_image_verify_duration_ms.load(Ordering::Relaxed),
+            audit_cmd_total: self.audit_cmd_total.load(Ordering::Relaxed),
+            audit_lifecycle_total: self.audit_lifecycle_total.load(Ordering::Relaxed),
+            audit_secret_total: self.audit_secret_total.load(Ordering::Relaxed),
+            audit_flow_total: self.audit_flow_total.load(Ordering::Relaxed),
+            audit_plan_total: self.audit_plan_total.load(Ordering::Relaxed),
+            audit_policy_total: self.audit_policy_total.load(Ordering::Relaxed),
+            audit_key_total: self.audit_key_total.load(Ordering::Relaxed),
+            audit_host_total: self.audit_host_total.load(Ordering::Relaxed),
+            audit_audit_total: self.audit_audit_total.load(Ordering::Relaxed),
         }
     }
 
@@ -347,6 +393,64 @@ impl Metrics {
             "Last dev/builder image verification wall-clock in milliseconds",
         );
 
+        // Plan 60 Phase 4 — per-category audit counters. Names
+        // follow the `mvm_audit_<category>_total` pattern; the
+        // category names match `EventCategory::as_str()`.
+        write_metric(
+            &mut out,
+            "mvm_audit_cmd_total",
+            s.audit_cmd_total,
+            "Audit events in the `cmd` category (CLI command invocations)",
+        );
+        write_metric(
+            &mut out,
+            "mvm_audit_lifecycle_total",
+            s.audit_lifecycle_total,
+            "Audit events in the `lifecycle` category (VM/instance state transitions)",
+        );
+        write_metric(
+            &mut out,
+            "mvm_audit_secret_total",
+            s.audit_secret_total,
+            "Audit events in the `secret` category (mvmctl secret CRUD)",
+        );
+        write_metric(
+            &mut out,
+            "mvm_audit_flow_total",
+            s.audit_flow_total,
+            "Audit events in the `flow` category (network flow attempts)",
+        );
+        write_metric(
+            &mut out,
+            "mvm_audit_plan_total",
+            s.audit_plan_total,
+            "Audit events in the `plan` category (ExecutionPlan lifecycle)",
+        );
+        write_metric(
+            &mut out,
+            "mvm_audit_policy_total",
+            s.audit_policy_total,
+            "Audit events in the `policy` category (PolicyBundle operations)",
+        );
+        write_metric(
+            &mut out,
+            "mvm_audit_key_total",
+            s.audit_key_total,
+            "Audit events in the `key` category (encryption-key rotation/release)",
+        );
+        write_metric(
+            &mut out,
+            "mvm_audit_host_total",
+            s.audit_host_total,
+            "Audit events in the `host` category (supervisor/mvm-hostd lifecycle)",
+        );
+        write_metric(
+            &mut out,
+            "mvm_audit_audit_total",
+            s.audit_audit_total,
+            "Audit events in the `audit` category (meta-events about the audit stream)",
+        );
+
         out
     }
 }
@@ -408,6 +512,27 @@ pub struct MetricsSnapshot {
     pub dev_image_verify_network: u64,
     #[serde(default)]
     pub dev_image_verify_duration_ms: u64,
+
+    // Plan 60 Phase 4 audit counters. All `#[serde(default)]` so a
+    // snapshot from a pre-Phase-4 binary still deserialises here.
+    #[serde(default)]
+    pub audit_cmd_total: u64,
+    #[serde(default)]
+    pub audit_lifecycle_total: u64,
+    #[serde(default)]
+    pub audit_secret_total: u64,
+    #[serde(default)]
+    pub audit_flow_total: u64,
+    #[serde(default)]
+    pub audit_plan_total: u64,
+    #[serde(default)]
+    pub audit_policy_total: u64,
+    #[serde(default)]
+    pub audit_key_total: u64,
+    #[serde(default)]
+    pub audit_host_total: u64,
+    #[serde(default)]
+    pub audit_audit_total: u64,
 }
 
 #[cfg(test)]

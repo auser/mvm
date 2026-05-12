@@ -1372,6 +1372,15 @@ mod tests {
             dev_image_verify_expired: 0,
             dev_image_verify_network: 0,
             dev_image_verify_duration_ms: 0,
+            audit_cmd_total: 0,
+            audit_lifecycle_total: 0,
+            audit_secret_total: 0,
+            audit_flow_total: 0,
+            audit_plan_total: 0,
+            audit_policy_total: 0,
+            audit_key_total: 0,
+            audit_host_total: 0,
+            audit_audit_total: 0,
         };
         let resp = AgentResponse::Metrics(snapshot);
         let json = serde_json::to_string(&resp).unwrap();

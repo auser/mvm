@@ -47,7 +47,9 @@
 
 use std::collections::BTreeMap;
 use std::sync::Arc;
+use std::sync::atomic::Ordering;
 
+use mvm_core::observability::metrics::Metrics;
 use mvm_plan::{ExecutionPlan, PlanId, TenantId};
 use mvm_policy::PolicyBundle;
 
@@ -151,17 +153,44 @@ pub struct Recorder {
     /// bound events read tenant from the plan; this fallback is
     /// only consulted when no plan is in scope.
     default_tenant: TenantId,
+    /// Optional Prometheus-side counters. When `Some`, every
+    /// successful emit increments `audit_<category>_total`. Tests
+    /// inject a local `Metrics` instance to assert; production
+    /// wires the singleton via `Recorder::with_global_metrics()`.
+    metrics: Option<Arc<Metrics>>,
 }
 
 impl Recorder {
-    /// Build with an explicit signer + default tenant. The default
-    /// tenant feeds unbound events (host startup, audit-verify
-    /// outcomes); plan-bound events inherit from the plan.
+    /// Build with an explicit signer + default tenant. Metrics
+    /// wiring is off — call `with_metrics` or
+    /// `with_global_metrics` to enable per-category counter
+    /// increments.
     pub fn new(signer: Arc<dyn AuditSigner>, default_tenant: TenantId) -> Self {
         Self {
             signer,
             default_tenant,
+            metrics: None,
         }
+    }
+
+    /// Attach a metrics registry. Every successful emit
+    /// increments `audit_<category>_total` on it. Returns `self`
+    /// for chaining.
+    ///
+    /// Production callers build the Arc once at boot and share
+    /// across all Recorders. The global singleton from
+    /// `mvm_core::observability::metrics::global()` is a
+    /// `&'static Metrics`; bridging that to `Arc<Metrics>`
+    /// requires either an Arc-of-Arc (`Arc::new(...)` per caller,
+    /// shared accumulator via the Arc internals) or a follow-up
+    /// that changes `global()` to return `Arc<Metrics>` directly.
+    /// For Phase 4 v1, callers that want global semantics
+    /// construct a single `Arc::new(Metrics::new())` at process
+    /// start and pass that Arc everywhere — same shape, no
+    /// 'static juggling.
+    pub fn with_metrics(mut self, metrics: Arc<Metrics>) -> Self {
+        self.metrics = Some(metrics);
+        self
     }
 
     /// Emit a plan-bound event. The category's prefix must match
@@ -191,6 +220,7 @@ impl Recorder {
         let merged = merge_extras(category, extras);
         let entry = AuditEntry::for_plan(plan, bundle, event_name, merged);
         self.signer.sign_and_emit(&entry).await?;
+        self.bump_metric(category);
         Ok(())
     }
 
@@ -214,7 +244,26 @@ impl Recorder {
         validate_event_prefix(category, &event_name)?;
         let entry = self.unbound_entry(category, event_name, extras);
         self.signer.sign_and_emit(&entry).await?;
+        self.bump_metric(category);
         Ok(())
+    }
+
+    fn bump_metric(&self, category: EventCategory) {
+        let Some(ref m) = self.metrics else {
+            return;
+        };
+        let counter = match category {
+            EventCategory::Cmd => &m.audit_cmd_total,
+            EventCategory::Lifecycle => &m.audit_lifecycle_total,
+            EventCategory::Secret => &m.audit_secret_total,
+            EventCategory::Flow => &m.audit_flow_total,
+            EventCategory::Plan => &m.audit_plan_total,
+            EventCategory::Policy => &m.audit_policy_total,
+            EventCategory::Key => &m.audit_key_total,
+            EventCategory::Host => &m.audit_host_total,
+            EventCategory::Audit => &m.audit_audit_total,
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
     }
 
     fn unbound_entry(
@@ -580,6 +629,134 @@ mod tests {
             signer.entries()[0].labels.get("category"),
             Some(&"plan".to_string())
         );
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Metrics integration (Phase 4 piece 2)
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn metrics_counter_bumps_on_plan_bound_emit() {
+        let signer = Arc::new(CapturingAuditSigner::new());
+        let metrics = Arc::new(Metrics::new());
+        let recorder = Recorder::new(signer.clone(), TenantId("local".to_string()))
+            .with_metrics(metrics.clone());
+        let plan = fixture_plan();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            recorder
+                .record_plan_bound(EventCategory::Plan, "plan.admitted", &plan, None, [])
+                .await
+                .unwrap();
+            recorder
+                .record_plan_bound(EventCategory::Plan, "plan.launched", &plan, None, [])
+                .await
+                .unwrap();
+        });
+        let snap = metrics.snapshot();
+        assert_eq!(snap.audit_plan_total, 2);
+        // Other categories untouched.
+        assert_eq!(snap.audit_cmd_total, 0);
+        assert_eq!(snap.audit_host_total, 0);
+    }
+
+    #[test]
+    fn metrics_counter_bumps_on_unbound_emit() {
+        let signer = Arc::new(CapturingAuditSigner::new());
+        let metrics = Arc::new(Metrics::new());
+        let recorder =
+            Recorder::new(signer, TenantId("local".to_string())).with_metrics(metrics.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            recorder
+                .record_unbound(EventCategory::Host, "host.started", [])
+                .await
+                .unwrap();
+            recorder
+                .record_unbound(EventCategory::Secret, "secret.put", [])
+                .await
+                .unwrap();
+            recorder
+                .record_unbound(EventCategory::Secret, "secret.get", [])
+                .await
+                .unwrap();
+        });
+        let snap = metrics.snapshot();
+        assert_eq!(snap.audit_host_total, 1);
+        assert_eq!(snap.audit_secret_total, 2);
+        assert_eq!(snap.audit_plan_total, 0);
+    }
+
+    #[test]
+    fn metrics_counter_not_bumped_when_signer_fails() {
+        // If the signer rejects the entry, the metrics counter
+        // should NOT bump — otherwise dashboards over-count.
+        use crate::audit::NoopAuditSigner;
+        let metrics = Arc::new(Metrics::new());
+        let recorder = Recorder::new(Arc::new(NoopAuditSigner), TenantId("local".to_string()))
+            .with_metrics(metrics.clone());
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        let res = rt.block_on(async {
+            recorder
+                .record_unbound(EventCategory::Host, "host.started", [])
+                .await
+        });
+        assert!(res.is_err());
+        assert_eq!(metrics.snapshot().audit_host_total, 0);
+    }
+
+    #[test]
+    fn recorder_without_metrics_still_emits() {
+        // The metrics-less path is the default. Recorder constructed
+        // without with_metrics should emit the entry and not panic.
+        let signer = Arc::new(CapturingAuditSigner::new());
+        let recorder = Recorder::new(signer.clone(), TenantId("local".to_string()));
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            recorder
+                .record_unbound(EventCategory::Cmd, "cmd.up.invoked", [])
+                .await
+                .unwrap();
+        });
+        assert_eq!(signer.entries().len(), 1);
+    }
+
+    #[test]
+    fn prometheus_exposition_carries_all_nine_audit_counters() {
+        // The Phase 4 catalog: every category has a stable metric
+        // name in the prometheus exposition. Pin all 9 here so a
+        // refactor of write_metric calls can't silently drop one.
+        let metrics = Metrics::new();
+        let prom = metrics.prometheus_exposition();
+        for category in [
+            "cmd",
+            "lifecycle",
+            "secret",
+            "flow",
+            "plan",
+            "policy",
+            "key",
+            "host",
+            "audit",
+        ] {
+            let metric_name = format!("mvm_audit_{category}_total");
+            assert!(
+                prom.contains(&metric_name),
+                "prometheus exposition missing {metric_name}"
+            );
+        }
     }
 
     #[test]
