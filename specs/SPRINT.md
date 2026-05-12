@@ -1211,14 +1211,12 @@ Sprint 51 closes when:
 5. CHANGELOG.md `[Unreleased]` section captures every shipped
    plan with date, commit SHAs, and links to ADRs.
 
-## Sprint 52 — smolvm gap-closing (in flight)
+## Sprint 52 — elastic memory + portable signed bundles (in flight)
 
-Scope: pick the ideas mvm is missing from smolvm
-([smolmachines.com](https://smolmachines.com/)) that close real UX
-or perf gaps without compromising the eight ADR-002 security
-claims. The decision document
-(`/Users/auser/.claude/plans/is-there-anything-mvm-giggly-bear.md`)
-ranks eight candidates; this sprint lands the top two:
+Two ergonomics + reach gaps in the platform that need closing
+without compromising the eight ADR-002 security claims. The
+decision document outside the repo enumerates eight candidates;
+this sprint lands the top two:
 
 1. **Virtio-balloon elasticity** — "mem cap, not commitment."
 2. **Portable image bundles + per-artifact attestation in a signed
