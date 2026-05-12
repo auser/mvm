@@ -41,6 +41,7 @@ use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::http_hardening::hardened_client_builder;
 use super::{HostMediatedTool, ToolInvokeError};
 
 pub const TOOL_NAME: &str = "mvm.web_search";
@@ -134,14 +135,14 @@ impl BraveSearchProvider {
     /// Canonical Brave Search API endpoint.
     pub const DEFAULT_ENDPOINT: &'static str = "https://api.search.brave.com/res/v1/web/search";
 
-    /// Build with the default endpoint + a fresh reqwest client.
+    /// Build with the default endpoint + a hardened reqwest client
+    /// (plan 65 W1 no-auto-redirect + W2 SSRF-filtering resolver).
     /// `api_key` is the value of the operator's
     /// `X-Subscription-Token`. The caller is responsible for
     /// sourcing it from a secret store; this constructor takes the
     /// raw bytes and pins them inside `self`.
     pub fn new(api_key: impl Into<String>) -> Result<Self, SearchError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+        let client = hardened_client_builder(15)
             .build()
             .map_err(|e| SearchError::Upstream(format!("building reqwest client: {e}")))?;
         Ok(Self {
@@ -429,10 +430,10 @@ impl TavilySearchProvider {
     /// plenty of headroom for the slow-tail case.
     const DEFAULT_TIMEOUT_SECS: u64 = 20;
 
-    /// Build with the default endpoint + a fresh reqwest client.
+    /// Build with the default endpoint + a hardened reqwest client
+    /// (plan 65 W1 + W2 — no auto-redirect, SSRF-filtering resolver).
     pub fn new(api_key: impl Into<String>) -> Result<Self, SearchError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS))
+        let client = hardened_client_builder(Self::DEFAULT_TIMEOUT_SECS)
             .build()
             .map_err(|e| SearchError::Upstream(format!("building reqwest client: {e}")))?;
         Ok(Self {
@@ -580,8 +581,11 @@ impl GoogleSearchProvider {
     /// `cse_id` (Custom Search Engine ID) are pinned inside the
     /// struct and consumed only by the HTTP send.
     pub fn new(api_key: impl Into<String>, cse_id: impl Into<String>) -> Result<Self, SearchError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS))
+        // Plan 65 W1 + W2: hardened builder applies no-auto-redirect
+        // and an SSRF-filtering DNS resolver. The reqwest client
+        // can't be poisoned via DNS or chased to a non-Google host
+        // via 3xx.
+        let client = hardened_client_builder(Self::DEFAULT_TIMEOUT_SECS)
             .build()
             .map_err(|e| SearchError::Upstream(format!("building reqwest client: {e}")))?;
         Ok(Self {
