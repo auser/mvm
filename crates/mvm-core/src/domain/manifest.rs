@@ -94,9 +94,20 @@ pub struct Manifest {
     #[serde(default = "default_vcpus")]
     pub vcpus: u8,
 
-    /// Human-readable memory size (`512M`, `1G`, `1024`, …).
+    /// Human-readable memory size (`512M`, `1G`, `1024`, …). Acts as
+    /// the *cap* on guest memory; when [`mem_initial`](Self::mem_initial)
+    /// is also set, this is the upper bound the balloon can deflate to.
     #[serde(default = "default_mem")]
     pub mem: String,
+
+    /// Optional initial host commitment (e.g. `256M`, `1G`). When set,
+    /// opts the workload into virtio-balloon: the backend attaches a
+    /// balloon device pre-inflated to `mem - mem_initial`, so the host
+    /// commits only this amount at boot. The reclaim controller can
+    /// adjust the balloon over the VM's life. Must parse to a value
+    /// strictly between zero and `mem`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_initial: Option<String>,
 
     /// Human-readable data disk size; `"0"` means no data disk.
     #[serde(default = "default_data_disk")]
@@ -151,6 +162,23 @@ impl Manifest {
                 "manifest field `mem` must be >= {MIN_MEM_MIB} MiB (got {mem} MiB)"
             ));
         }
+        if let Some(mi) = self.mem_initial.as_deref() {
+            let mi_mib = parse_human_size(mi)
+                .with_context(|| format!("invalid `mem_initial` field: {mi:?}"))?;
+            if mi_mib == 0 {
+                return Err(anyhow!(
+                    "manifest field `mem_initial` must be > 0 when set; \
+                     omit it to opt out of virtio-balloon"
+                ));
+            }
+            if mi_mib >= mem {
+                return Err(anyhow!(
+                    "manifest field `mem_initial` ({mi_mib} MiB) must be \
+                     strictly less than `mem` ({mem} MiB); the balloon needs \
+                     a non-zero inflation target"
+                ));
+            }
+        }
         let _ = parse_human_size(&self.data_disk)
             .with_context(|| format!("invalid `data_disk` field: {:?}", self.data_disk))?;
         if let Some(name) = self.name.as_deref() {
@@ -160,9 +188,21 @@ impl Manifest {
         Ok(())
     }
 
-    /// Memory in MiB, parsed from the human-readable string.
+    /// Memory cap in MiB, parsed from the human-readable string.
     pub fn mem_mib(&self) -> Result<u32> {
         parse_human_size(&self.mem).with_context(|| format!("invalid `mem` field: {:?}", self.mem))
+    }
+
+    /// Initial host commitment in MiB, when the workload opted into
+    /// virtio-balloon. Returns `Ok(None)` when the field is unset
+    /// (legacy "commit `mem` at boot" behaviour).
+    pub fn mem_initial_mib(&self) -> Result<Option<u32>> {
+        match self.mem_initial.as_deref() {
+            Some(s) => parse_human_size(s)
+                .map(Some)
+                .with_context(|| format!("invalid `mem_initial` field: {s:?}")),
+            None => Ok(None),
+        }
     }
 
     /// Data disk in MiB.
@@ -645,6 +685,76 @@ mod tests {
         let m = Manifest::from_toml_str(minimal_manifest_toml()).unwrap();
         assert_eq!(m.mem_mib().unwrap(), 1024);
         assert_eq!(m.data_disk_mib().unwrap(), 0);
+    }
+
+    #[test]
+    fn mem_initial_absent_means_no_balloon_opt_in() {
+        let m = Manifest::from_toml_str(minimal_manifest_toml()).unwrap();
+        assert!(m.mem_initial.is_none());
+        assert!(m.mem_initial_mib().unwrap().is_none());
+    }
+
+    #[test]
+    fn mem_initial_set_parses_and_validates() {
+        let toml = r#"
+            flake = "."
+            profile = "default"
+            vcpus = 2
+            mem = "1024M"
+            mem_initial = "256M"
+        "#;
+        let m = Manifest::from_toml_str(toml).expect("parses");
+        assert_eq!(m.mem_initial.as_deref(), Some("256M"));
+        assert_eq!(m.mem_initial_mib().unwrap(), Some(256));
+    }
+
+    #[test]
+    fn mem_initial_zero_rejected() {
+        let toml = r#"
+            flake = "."
+            profile = "default"
+            vcpus = 2
+            mem = "1024M"
+            mem_initial = "0"
+        "#;
+        let err = Manifest::from_toml_str(toml).expect_err("rejects zero mem_initial");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mem_initial"), "msg was {msg}");
+    }
+
+    #[test]
+    fn mem_initial_at_least_mem_rejected() {
+        // mem_initial >= mem leaves no headroom for the balloon to inflate.
+        let toml = r#"
+            flake = "."
+            profile = "default"
+            vcpus = 2
+            mem = "1024M"
+            mem_initial = "1024M"
+        "#;
+        let err = Manifest::from_toml_str(toml).expect_err("rejects >=mem mem_initial");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("strictly less than"), "msg was {msg}");
+    }
+
+    #[test]
+    fn mem_initial_unparseable_rejected() {
+        let toml = r#"
+            flake = "."
+            profile = "default"
+            vcpus = 2
+            mem = "1024M"
+            mem_initial = "spuds"
+        "#;
+        let err = Manifest::from_toml_str(toml).expect_err("rejects junk mem_initial");
+        assert!(format!("{err:#}").contains("mem_initial"));
+    }
+
+    #[test]
+    fn serde_skips_omitted_mem_initial() {
+        let m = Manifest::from_toml_str(minimal_manifest_toml()).unwrap();
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("mem_initial"));
     }
 
     #[test]

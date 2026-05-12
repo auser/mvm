@@ -52,8 +52,21 @@ pub struct VmStartConfig {
     pub profile: Option<String>,
     /// Number of vCPUs.
     pub cpus: u32,
-    /// Memory in MiB.
+    /// Memory cap in MiB. The guest may not allocate beyond this. When
+    /// [`mem_initial_mib`](Self::mem_initial_mib) is `None`, this is
+    /// also the host-committed amount at boot (the historical mvm
+    /// shape). When `mem_initial_mib` is `Some`, this becomes a cap
+    /// rather than a commitment — see that field's docs.
     pub memory_mib: u32,
+    /// Optional initial host commitment in MiB, opting the workload
+    /// into virtio-balloon elasticity. When `Some(n)`, the backend
+    /// creates a virtio-balloon device pre-inflated to
+    /// `memory_mib - n` MiB so the host only commits `n` MiB at boot;
+    /// the host-side reclaim controller adjusts the balloon over the
+    /// VM's life. Must satisfy `0 < n <= memory_mib`. When `None`,
+    /// no balloon is attached and the full `memory_mib` is committed
+    /// at boot (backward-compatible default).
+    pub mem_initial_mib: Option<u32>,
     /// Declared port mappings (host:guest) for forwarding and guest config.
     pub ports: Vec<VmPortMapping>,
     /// Extra volumes to mount in the guest.
@@ -289,6 +302,35 @@ pub struct VmCapabilities {
     pub vsock: bool,
     /// Supports TAP-based networking (Firecracker/Docker: yes, WASM: no).
     pub tap_networking: bool,
+    /// Supports a virtio-balloon device with runtime inflate/deflate.
+    /// When `true`, [`VmBackend::balloon_set_target`] is wired and the
+    /// host-side reclaim controller can adjust guest commitment
+    /// without rebooting the VM. cgroup-style memory limiting (Docker)
+    /// is **not** a balloon and stays `false`.
+    pub balloon: bool,
+}
+
+/// Snapshot of a VM's virtio-balloon state, returned by
+/// [`VmBackend::balloon_state`].
+///
+/// All values are in MiB. The reclaim controller compares
+/// `host_committed_mib` against host memory pressure to decide
+/// whether to call [`VmBackend::balloon_set_target`] up or down.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct BalloonState {
+    /// The cap declared by the workload — equal to
+    /// `VmStartConfig::memory_mib` at boot. Useful as the upper bound
+    /// for `inflated_mib` (the balloon cannot inflate past this).
+    pub max_mib: u32,
+    /// Current balloon inflation, i.e. memory the guest has handed
+    /// back to the host. Increases under host pressure; decreases
+    /// when the guest needs the pages.
+    pub inflated_mib: u32,
+    /// Effective host commitment after subtracting the balloon —
+    /// `max_mib - inflated_mib`. Tracked separately because some
+    /// VMMs report it directly and the subtraction may not be
+    /// perfectly exact across the wire.
+    pub host_committed_mib: u32,
 }
 
 // ---------------------------------------------------------------------------
@@ -576,6 +618,39 @@ pub trait VmBackend: Send + Sync {
         anyhow::bail!("{} does not provide guest channel info", self.name())
     }
 
+    /// Set the virtio-balloon inflation target (in MiB).
+    ///
+    /// `target_inflate_mib` is the number of MiB the guest should
+    /// hand back to the host. `0` deflates the balloon completely;
+    /// `VmStartConfig::memory_mib` would (in principle) reclaim
+    /// everything but is rejected by sensible backends since the
+    /// guest needs *some* memory to function.
+    ///
+    /// Only meaningful when [`VmCapabilities::balloon`] is `true`
+    /// **and** the VM was started with `VmStartConfig::mem_initial_mib`
+    /// set — otherwise the backend never created a balloon device and
+    /// this call has nothing to operate on.
+    ///
+    /// The default impl bails so backends that don't support balloon
+    /// surface a clear error to the reclaim controller.
+    fn balloon_set_target(&self, _id: &VmId, _target_inflate_mib: u32) -> Result<()> {
+        anyhow::bail!(
+            "{}: virtio-balloon is not supported by this backend",
+            self.name()
+        )
+    }
+
+    /// Read the current balloon state of a VM.
+    ///
+    /// Same support contract as
+    /// [`balloon_set_target`](Self::balloon_set_target).
+    fn balloon_state(&self, _id: &VmId) -> Result<BalloonState> {
+        anyhow::bail!(
+            "{}: virtio-balloon is not supported by this backend",
+            self.name()
+        )
+    }
+
     /// Return the ADR-002 security profile for this backend.
     ///
     /// Each backend declares which of the seven CI-enforced claims hold,
@@ -654,6 +729,19 @@ mod tests {
         assert!(!caps.snapshots);
         assert!(!caps.vsock);
         assert!(!caps.tap_networking);
+        assert!(!caps.balloon);
+    }
+
+    #[test]
+    fn test_balloon_state_serde_roundtrip() {
+        let s = BalloonState {
+            max_mib: 2048,
+            inflated_mib: 512,
+            host_committed_mib: 1536,
+        };
+        let json = serde_json::to_string(&s).unwrap();
+        let parsed: BalloonState = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, s);
     }
 
     #[test]
@@ -705,6 +793,9 @@ mod tests {
         assert!(config.initrd_path.is_none());
         assert_eq!(config.cpus, 0);
         assert_eq!(config.memory_mib, 0);
+        // Default opts out of balloon — preserves the historical
+        // "memory_mib is committed at boot" contract.
+        assert!(config.mem_initial_mib.is_none());
         assert!(config.ports.is_empty());
         assert!(config.volumes.is_empty());
         assert!(config.config_files.is_empty());

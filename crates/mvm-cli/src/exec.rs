@@ -146,6 +146,14 @@ pub struct ExecRequest {
     pub image: ImageSource,
     pub cpus: u32,
     pub memory_mib: u32,
+    /// Opt into virtio-balloon. `None` keeps the legacy "commit
+    /// memory_mib at boot" behaviour; `Some(n)` commits only `n` MiB
+    /// initially and lets the host-side reclaim controller adjust.
+    /// See [`VmStartConfig::mem_initial_mib`].
+    ///
+    /// [`VmStartConfig::mem_initial_mib`]:
+    ///     mvm_core::vm_backend::VmStartConfig::mem_initial_mib
+    pub mem_initial_mib: Option<u32>,
     pub add_dirs: Vec<AddDir>,
     pub env: Vec<(String, String)>,
     pub target: ExecTarget,
@@ -552,6 +560,7 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
         profile: profile.clone(),
         cpus: req.cpus,
         memory_mib: req.memory_mib,
+        mem_initial_mib: req.mem_initial_mib,
         ports: Vec::new(),
         volumes: volumes
             .iter()
@@ -668,6 +677,12 @@ fn restore_via_snapshot(
         profile: start_config.profile.clone(),
         cpus: start_config.cpus,
         memory: start_config.memory_mib,
+        // Inherit the balloon decision from the start_config. The
+        // snapshot path is rare for balloon-enabled workloads (FC
+        // snapshots don't checkpoint balloon state cleanly), but
+        // we preserve the field so a future fix doesn't have to
+        // re-thread it.
+        mem_initial: start_config.mem_initial_mib,
         // Snapshot-eligible callers have no extra volumes; if that ever
         // changes the snapshot layout will mismatch and Firecracker will
         // refuse to load — `snapshot_eligible` enforces this.
@@ -807,6 +822,9 @@ pub fn boot_session_vm(
         profile: Some(spec.profile),
         cpus,
         memory_mib,
+        // Session VMs are short-lived MCP-driven boots; balloon
+        // elasticity isn't useful here, so leave commit at boot.
+        mem_initial_mib: None,
         ports: vec![],
         volumes: vec![],
         config_files: vec![],
@@ -856,6 +874,7 @@ pub fn dispatch_in_session(vm: &SessionVm, code: String, timeout_secs: u64) -> R
         image: ImageSource::Template(String::new()),
         cpus: 0,
         memory_mib: 0,
+        mem_initial_mib: None,
         add_dirs: vec![],
         env: vec![],
         target: ExecTarget::Inline {
@@ -1032,6 +1051,7 @@ mod tests {
             image: ImageSource::Template("t".into()),
             cpus: 1,
             memory_mib: 256,
+            mem_initial_mib: None,
             add_dirs: Vec::new(),
             env: Vec::new(),
             target: ExecTarget::Inline {
@@ -1048,6 +1068,7 @@ mod tests {
             image: ImageSource::Template("t".into()),
             cpus: 1,
             memory_mib: 256,
+            mem_initial_mib: None,
             add_dirs: Vec::new(),
             env: Vec::new(),
             target: ExecTarget::Inline {
@@ -1068,6 +1089,7 @@ mod tests {
             image: ImageSource::Template("t".into()),
             cpus: 1,
             memory_mib: 256,
+            mem_initial_mib: None,
             add_dirs: vec![AddDir {
                 host_path: "/h".into(),
                 guest_path: "/g".into(),
@@ -1092,6 +1114,7 @@ mod tests {
             image: ImageSource::Template("t".into()),
             cpus: 1,
             memory_mib: 256,
+            mem_initial_mib: None,
             add_dirs: vec![AddDir {
                 host_path: "/h".into(),
                 guest_path: "/g".into(),
@@ -1320,6 +1343,7 @@ mod tests {
             image: ImageSource::Template("t".into()),
             cpus: 1,
             memory_mib: 256,
+            mem_initial_mib: None,
             add_dirs: Vec::new(),
             env: Vec::new(),
             target: ExecTarget::LaunchPlan {
@@ -1343,6 +1367,7 @@ mod tests {
             image: ImageSource::Template("t".into()),
             cpus: 1,
             memory_mib: 256,
+            mem_initial_mib: None,
             add_dirs: Vec::new(),
             env: vec![("CLI_OVER".to_string(), "wins".to_string())],
             target: ExecTarget::LaunchPlan {
@@ -1381,6 +1406,7 @@ mod tests {
             image: ImageSource::Template("t".into()),
             cpus: 1,
             memory_mib: 256,
+            mem_initial_mib: None,
             add_dirs: Vec::new(),
             env: Vec::new(),
             target: ExecTarget::Inline {

@@ -73,6 +73,11 @@ impl VmBackend for MicrovmNixBackend {
             snapshots: false,
             vsock: true,
             tap_networking: true,
+            // microvm.nix-launched runners delegate to whichever VMM
+            // the flake picked (qemu / firecracker / cloud-hypervisor /
+            // crosvm). Surfacing balloon honestly would require
+            // peeking at the runner script — leave `false` for now.
+            balloon: false,
         }
     }
 

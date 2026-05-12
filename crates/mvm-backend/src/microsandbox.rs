@@ -141,6 +141,11 @@ impl VmBackend for MicrosandboxBackend {
             snapshots: false,
             vsock: true,
             tap_networking: false,
+            // Inherits libkrun's stance: no balloon control surfaced
+            // by the upstream microsandbox builder. Track libkrun's
+            // capability flag; flip both together when the upstream
+            // crate gains a `.balloon(...)` method.
+            balloon: false,
         }
     }
 

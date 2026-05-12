@@ -153,6 +153,7 @@ impl ExecDispatcher {
             image: crate::exec::ImageSource::Template(env.to_string()),
             cpus: DEFAULT_VM_CPUS,
             memory_mib: DEFAULT_VM_MEM_MIB,
+            mem_initial_mib: None,
             add_dirs: Vec::new(),
             env: Vec::new(),
             target: crate::exec::ExecTarget::Inline { argv },

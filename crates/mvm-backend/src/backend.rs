@@ -47,6 +47,7 @@ impl FirecrackerConfig {
             profile: config.profile.clone(),
             cpus: config.cpus,
             memory: config.memory_mib,
+            mem_initial: config.mem_initial_mib,
             volumes: config
                 .volumes
                 .iter()
@@ -102,11 +103,17 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn capabilities(&self) -> VmCapabilities {
+        // Firecracker ships a virtio-balloon device with PATCH-able
+        // target via `/balloon`; the start path attaches it whenever
+        // `VmStartConfig::mem_initial_mib` is `Some`. Capability is
+        // advertised unconditionally so the host-side controller can
+        // discover support before deciding to plumb a workload.
         VmCapabilities {
             pause_resume: true,
             snapshots: true,
             vsock: true,
             tap_networking: true,
+            balloon: true,
         }
     }
 
@@ -137,6 +144,28 @@ impl VmBackend for FirecrackerBackend {
 
     fn resume(&self, id: &VmId) -> Result<()> {
         microvm::resume_vm(&id.0)
+    }
+
+    fn balloon_set_target(&self, id: &VmId, target_inflate_mib: u32) -> Result<()> {
+        microvm::balloon_set_target(&id.0, target_inflate_mib)
+    }
+
+    fn balloon_state(&self, id: &VmId) -> Result<mvm_core::vm_backend::BalloonState> {
+        let inflated = microvm::balloon_state(&id.0)?;
+        // FC reports the inflation amount via /balloon; the cap is
+        // tracked host-side in the VM's runtime metadata (RunInfo).
+        // List the VM to recover its declared cap.
+        let vms = microvm::list_vms()?;
+        let info = vms
+            .into_iter()
+            .find(|i| i.name.as_deref() == Some(&*id.0))
+            .ok_or_else(|| anyhow::anyhow!("balloon_state: VM '{}' not found in list", id.0))?;
+        let max_mib = info.memory;
+        Ok(mvm_core::vm_backend::BalloonState {
+            max_mib,
+            inflated_mib: inflated,
+            host_committed_mib: max_mib.saturating_sub(inflated),
+        })
     }
 
     fn status(&self, id: &VmId) -> Result<VmStatus> {
@@ -403,6 +432,17 @@ impl AnyBackend {
     /// Resume a paused VM. See [`VmBackend::resume`].
     pub fn resume(&self, id: &VmId) -> Result<()> {
         self.inner().resume(id)
+    }
+
+    /// Set the virtio-balloon inflation target. See
+    /// [`VmBackend::balloon_set_target`].
+    pub fn balloon_set_target(&self, id: &VmId, target_inflate_mib: u32) -> Result<()> {
+        self.inner().balloon_set_target(id, target_inflate_mib)
+    }
+
+    /// Read the current balloon state. See [`VmBackend::balloon_state`].
+    pub fn balloon_state(&self, id: &VmId) -> Result<mvm_core::vm_backend::BalloonState> {
+        self.inner().balloon_state(id)
     }
 
     pub fn status(&self, id: &VmId) -> Result<VmStatus> {

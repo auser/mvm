@@ -116,6 +116,11 @@ impl VmBackend for DockerBackend {
             snapshots: false,
             vsock: false,
             tap_networking: false,
+            // Docker uses cgroup memory caps, not virtio-balloon —
+            // the reclaim mechanic is fundamentally different (OOM
+            // kill / swap, not an in-guest driver returning pages).
+            // The reclaim controller treats this as no-balloon.
+            balloon: false,
         }
     }
 
