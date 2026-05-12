@@ -485,13 +485,26 @@ let
 
     # Kernel modules tree, when a matching kernel was supplied. We
     # copy (not symlink) so the rootfs is self-contained — the host's
-    # /nix/store isn't visible to the guest at boot. /lib/modules is
-    # made read-only so a compromised entrypoint can't replace a
-    # module with one of its own choosing.
+    # /nix/store isn't visible to the guest at boot. `--reflink=auto`
+    # turns the per-module copies into metadata-only operations on
+    # filesystems that support reflinks (APFS, btrfs) and falls back
+    # to a regular copy elsewhere. `/lib/modules` is made read-only
+    # so a compromised entrypoint can't replace a module with one of
+    # its own choosing.
+    #
+    # `source` and `build` are symlinks nixpkgs drops into the
+    # modules tree pointing at the kernel-headers store path
+    # (`/nix/store/<hash>-linux-<ver>-dev`). Inside the guest those
+    # paths never exist, so the links dangle and `modprobe` emits a
+    # "could not stat /lib/modules/<kver>/source" warning on every
+    # call. The guest never reads kernel headers, so removing the
+    # links is harmless and silences the warning.
     ${pkgs.lib.optionalString hasKernel ''
       mkdir -p "$out/lib/modules"
-      cp -R ${kernel}/lib/modules/${kernel.modDirVersion} \
+      cp -a --reflink=auto ${kernel}/lib/modules/${kernel.modDirVersion} \
         "$out/lib/modules/${kernel.modDirVersion}"
+      rm -f "$out/lib/modules/${kernel.modDirVersion}/source" \
+            "$out/lib/modules/${kernel.modDirVersion}/build"
       chmod -R a-w "$out/lib/modules/${kernel.modDirVersion}"
     ''}
   '';
