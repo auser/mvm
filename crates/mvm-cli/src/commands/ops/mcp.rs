@@ -239,6 +239,38 @@ fn build_tool_registry() -> ToolRegistry {
             }
         }
     }
+    if search_allow.contains("google")
+        && let Ok(api_key) = std::env::var(web_search::GOOGLE_API_KEY_ENV_VAR)
+        && let Ok(cse_id) = std::env::var(web_search::GOOGLE_CSE_ID_ENV_VAR)
+    {
+        match web_search::GoogleSearchProvider::new(api_key, cse_id) {
+            Ok(p) => {
+                search_tool = search_tool.register_provider(Arc::new(p));
+            }
+            Err(e) => {
+                // Plan 65 W5: the error from `new()` doesn't carry the
+                // key (construction only builds the reqwest client),
+                // but be conservative and don't propagate `e` into
+                // `tracing` via `Display` either — log the canonical
+                // message only.
+                tracing::warn!(
+                    error = %e,
+                    "GoogleSearchProvider init failed; mvm.web_search 'google' provider will be \
+                     allowlisted-but-unregistered"
+                );
+            }
+        }
+    } else if search_allow.contains("google") {
+        // Helpful diagnostic when only one of the two env vars is
+        // set — the existing "allowed-but-unregistered" config-drift
+        // error fires at invoke time, but the operator might miss it.
+        tracing::warn!(
+            "mvm.web_search 'google' is allowlisted but {} and/or {} is unset; \
+             provider will be allowlisted-but-unregistered",
+            web_search::GOOGLE_API_KEY_ENV_VAR,
+            web_search::GOOGLE_CSE_ID_ENV_VAR,
+        );
+    }
     registry.register(Box::new(search_tool));
 
     // mvm.upload + mvm.download — share one per-tenant FsStagingArea.
