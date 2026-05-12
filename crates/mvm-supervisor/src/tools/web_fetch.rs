@@ -118,6 +118,21 @@ impl HttpFetcher for NoopHttpFetcher {
 /// Operator-supplied timeout via `ReqwestHttpFetcher::new` (default
 /// 30 s) caps the round-trip wall-clock for both connect and read
 /// phases.
+///
+/// ## Hardening (plan 65)
+///
+/// - **W1 — no auto-redirect**: the embedded client is built with
+///   `reqwest::redirect::Policy::none()`. An allowlisted upstream
+///   that responds 3xx surfaces the status code + headers
+///   verbatim; the agent must re-call with the new URL, which
+///   re-runs the per-host allowlist check in
+///   [`WebFetchTool::invoke`]. Closes the "allowlisted host
+///   redirects to evil host" bypass.
+/// - **W3 — exact body cap**: the chunk loop refuses *before* a
+///   chunk that would overflow `max_bytes` lands in the
+///   accumulator. The accumulated body is exactly `≤ max_bytes`
+///   on every successful return; a `BodyTooLarge` indicates the
+///   upstream wanted to send more.
 pub struct ReqwestHttpFetcher {
     client: reqwest::Client,
 }
@@ -135,9 +150,16 @@ impl ReqwestHttpFetcher {
     }
 
     /// Build with an explicit timeout.
+    ///
+    /// The constructed client disables reqwest's default redirect
+    /// follow (plan 65 W1): a server returning 3xx surfaces the
+    /// status code to the caller instead of silently chasing the
+    /// `Location:` header, so the allowlist gets a fresh chance
+    /// to refuse the new host.
     pub fn with_timeout_secs(timeout_secs: u64) -> Result<Self, FetchError> {
         let client = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(timeout_secs))
+            .redirect(reqwest::redirect::Policy::none())
             .build()
             .map_err(|e| FetchError::Network(format!("building reqwest client: {e}")))?;
         Ok(Self { client })
@@ -160,9 +182,17 @@ impl HttpFetcher for ReqwestHttpFetcher {
             .and_then(|v| v.to_str().ok())
             .map(String::from);
 
-        // Streaming accumulator. A server that lies about
-        // Content-Length still can't push past `max_bytes` because
-        // we hard-cut after each chunk lands.
+        // Streaming accumulator (plan 65 W3 — exact body cap).
+        //
+        // The chunk-overflow check runs **before** the chunk
+        // lands in the accumulator. The accumulated body is
+        // guaranteed to be `≤ cap` on every successful return; a
+        // `BodyTooLarge` indicates the upstream wanted to send
+        // more. The chunk that triggered the refusal has already
+        // been read into reqwest's internal buffer (we can't
+        // prevent that — the read happens during `.chunk().await`)
+        // but it never reaches the accumulator and the connection
+        // is dropped on the `?` return.
         let cap = max_bytes as usize;
         let mut body: Vec<u8> = Vec::with_capacity(cap.min(64 * 1024));
         while let Some(chunk) = response
@@ -174,6 +204,10 @@ impl HttpFetcher for ReqwestHttpFetcher {
                 return Err(FetchError::BodyTooLarge { limit: max_bytes });
             }
             body.extend_from_slice(&chunk);
+            debug_assert!(
+                body.len() <= cap,
+                "body accumulator exceeded max_bytes — W3 invariant violated"
+            );
         }
         Ok(FetchedResponse {
             status,
@@ -687,5 +721,107 @@ mod tests {
         let f = ReqwestHttpFetcher::new().unwrap();
         let _tool =
             WebFetchTool::with_allowlist(["api.example".to_string()]).with_fetcher(Arc::new(f));
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Plan 65 hardening — W1 (no auto-redirect) + W3 (exact body cap)
+    //
+    // Both tests boot a one-shot HTTP/1.1 server on 127.0.0.1 and
+    // exercise the real reqwest client. http:// is fine here — the
+    // tool layer's https-only check runs in `WebFetchTool::invoke`,
+    // not in the fetcher itself, so the fetcher can be tested
+    // against plain HTTP. The SSRF guard (plan 65 W2) lands in a
+    // separate slice; until then, loopback IPs are reachable, which
+    // is what these tests rely on.
+    // ──────────────────────────────────────────────────────────────
+
+    /// Bind a TCP listener on 127.0.0.1:0, accept one connection,
+    /// drain its request, write `response`, then close. Returns the
+    /// port the listener bound to.
+    async fn spawn_one_shot_server(response: String) -> u16 {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind");
+        let port = listener.local_addr().expect("addr").port();
+        tokio::spawn(async move {
+            if let Ok((mut stream, _)) = listener.accept().await {
+                // Drain the request headers. The body is empty for
+                // a GET so this single read is enough — we don't
+                // need to parse, just consume what reqwest sent.
+                let mut buf = [0u8; 4096];
+                let _ = stream.read(&mut buf).await;
+                let _ = stream.write_all(response.as_bytes()).await;
+                let _ = stream.shutdown().await;
+            }
+        });
+        port
+    }
+
+    #[tokio::test]
+    async fn reqwest_does_not_auto_follow_redirects() {
+        // Plan 65 W1: an upstream returning 302 + Location must
+        // surface the 302 to the caller, not the redirected body.
+        let response = "HTTP/1.1 302 Found\r\n\
+            Location: http://evil.example/exfil\r\n\
+            Content-Length: 0\r\n\
+            Connection: close\r\n\
+            \r\n"
+            .to_string();
+        let port = spawn_one_shot_server(response).await;
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let fetcher = ReqwestHttpFetcher::new().unwrap();
+        let resp = fetcher.fetch(&url, 1024).await.expect("fetch");
+        assert_eq!(
+            resp.status, 302,
+            "redirect was auto-followed; the W1 hardening regressed"
+        );
+        assert!(
+            resp.body.is_empty(),
+            "redirect target's body leaked into the response"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_cap_is_enforced_exactly() {
+        // Plan 65 W3: an upstream returning more bytes than the
+        // caller's max_bytes must fail with `BodyTooLarge` —
+        // **before** the oversize bytes land in the accumulator.
+        let payload = "A".repeat(40);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+            Content-Length: 40\r\n\
+            Connection: close\r\n\
+            \r\n\
+            {payload}"
+        );
+        let port = spawn_one_shot_server(response).await;
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let fetcher = ReqwestHttpFetcher::new().unwrap();
+        let err = fetcher.fetch(&url, 8).await.unwrap_err();
+        assert!(
+            matches!(err, FetchError::BodyTooLarge { limit: 8 }),
+            "expected BodyTooLarge {{ limit: 8 }}, got {err:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_at_exactly_max_bytes_succeeds() {
+        // Boundary: a body of exactly max_bytes must succeed, not
+        // trip BodyTooLarge.
+        let payload = "B".repeat(16);
+        let response = format!(
+            "HTTP/1.1 200 OK\r\n\
+            Content-Length: 16\r\n\
+            Connection: close\r\n\
+            \r\n\
+            {payload}"
+        );
+        let port = spawn_one_shot_server(response).await;
+        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
+        let fetcher = ReqwestHttpFetcher::new().unwrap();
+        let resp = fetcher.fetch(&url, 16).await.expect("at-cap fetch");
+        assert_eq!(resp.body.len(), 16);
+        assert_eq!(resp.body, payload.as_bytes());
     }
 }
