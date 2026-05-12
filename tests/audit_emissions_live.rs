@@ -45,6 +45,10 @@
 //! - `mvmctl snapshot ls` → **no** audit entry
 //! - `mvmctl audit tail` / `audit verify` → **no** audit entry
 //! - `mvmctl attest status` → **no** audit entry
+//! - `mvmctl ls` / `metrics` / `catalog list` → **no** audit entry
+//!   (top-level ReadOnly verbs — three more rows from
+//!   `AUDIT_POSTURE` pinned against a future regression that
+//!   adds an emit to a read-only path)
 //! - `mvmctl secret put / get / ls / rm` → secret-side audit JSONL
 //!   at `~/.mvm/audit/secrets.jsonl` carries one entry per call
 //!   with `"action":"put"` / `"get"` / `"list"` / `"delete"`. The
@@ -866,6 +870,80 @@ fn audit_verify_does_not_emit_local_audit_entry() {
         log.is_empty(),
         "read-only `audit verify` must not write to the LocalAudit \
          stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn top_level_ls_does_not_emit_audit_entry() {
+    // `mvmctl ls` reports running VMs. Pure read. Top-level
+    // `("ls", AuditPosture::ReadOnly)` row in `AUDIT_POSTURE`.
+    // Pinning the empty-sandbox case — output is "No running VMs."
+    // and the audit log stays empty.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["ls"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `mvmctl ls` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn metrics_does_not_emit_audit_entry() {
+    // `mvmctl metrics` prints Prometheus exposition. Pure read.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["metrics"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl metrics failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `mvmctl metrics` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn catalog_list_does_not_emit_audit_entry() {
+    // `mvmctl catalog list` enumerates bundled images. The catalog
+    // is compiled in; no disk reads beyond mvmctl's binary itself.
+    // Pure read.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["catalog", "list"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl catalog list failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `mvmctl catalog list` must not write to the \
+         LocalAudit stream. Full log:\n{log}"
     );
 }
 
