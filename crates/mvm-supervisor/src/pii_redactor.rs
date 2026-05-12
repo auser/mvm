@@ -176,10 +176,110 @@ impl PiiRedactor {
         Self::new(DEFAULT_RULES, Mode::Detect).expect("DEFAULT_RULES must compile")
     }
 
+    /// Construct from a parsed `mvm_policy::PiiPolicy`. Returns
+    /// `Ok(None)` when the policy explicitly disables PII scanning
+    /// (`mode = "disabled"`) — the caller skips inserting the
+    /// inspector into the chain rather than inserting a no-op that
+    /// always Allows.
+    ///
+    /// Mode mapping:
+    ///   - `None` / `Some("detect")` → [`Mode::Detect`] (default)
+    ///   - `Some("redact")` → [`Mode::Redact`]
+    ///   - `Some("refuse")` → [`Mode::Block`]
+    ///   - `Some("disabled")` → `Ok(None)` (skip the inspector)
+    ///   - anything else → [`PiiPolicyError::UnknownMode`]
+    ///
+    /// Category filter:
+    ///   - empty list → all [`DEFAULT_RULES`] (the implicit "scan
+    ///     everything" case)
+    ///   - non-empty list → only rules whose `name` appears in the
+    ///     list. Unknown names yield [`PiiPolicyError::UnknownCategory`]
+    ///     so a typo fails admission instead of silently scanning
+    ///     fewer categories than the operator intended.
+    pub fn from_policy(policy: &mvm_policy::PiiPolicy) -> Result<Option<Self>, PiiPolicyError> {
+        let mode = match policy.mode.as_deref() {
+            None | Some("detect") => Mode::Detect,
+            Some("redact") => Mode::Redact,
+            Some("refuse") => Mode::Block,
+            Some("disabled") => return Ok(None),
+            Some(other) => {
+                return Err(PiiPolicyError::UnknownMode {
+                    value: other.to_string(),
+                    valid: &["disabled", "detect", "redact", "refuse"],
+                });
+            }
+        };
+
+        // Build the rule subset. Empty categories list → all defaults.
+        let rules: Vec<PiiRule> = if policy.categories.is_empty() {
+            DEFAULT_RULES.to_vec()
+        } else {
+            let mut out: Vec<PiiRule> = Vec::with_capacity(policy.categories.len());
+            for (index, want) in policy.categories.iter().enumerate() {
+                let matched = DEFAULT_RULES.iter().find(|r| r.name == want.as_str());
+                match matched {
+                    Some(r) => out.push(*r),
+                    None => {
+                        return Err(PiiPolicyError::UnknownCategory {
+                            index,
+                            name: want.clone(),
+                            valid: PII_CATEGORY_NAMES,
+                        });
+                    }
+                }
+            }
+            out
+        };
+
+        // Pattern compilation cannot fail for DEFAULT_RULES (already
+        // proven at runtime by `with_default_rules`), but `new` is
+        // fallible in the general case. Surface as Internal in the
+        // unlikely event the runtime regex compiler hiccups.
+        let red = Self::new(&rules, mode).map_err(|e| PiiPolicyError::Internal(e.to_string()))?;
+        Ok(Some(red))
+    }
+
     pub fn mode(&self) -> Mode {
         self.mode
     }
+}
 
+/// Stable list of category names recognised by [`PiiRedactor::from_policy`].
+/// Matches `DEFAULT_RULES.iter().map(|r| r.name)` order. Public so
+/// callers (the W5 resolver, the operator-facing `mvmctl policy`
+/// inspector) can enumerate the valid names.
+pub const PII_CATEGORY_NAMES: &[&str] = &["email", "us_ssn", "credit_card", "e164_phone"];
+
+/// Errors from [`PiiRedactor::from_policy`]. Each variant names the
+/// offending value + the list of valid alternatives so a single
+/// error message tells the operator exactly what to fix.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum PiiPolicyError {
+    #[error(
+        "pii.mode = {value:?} is not recognised; valid values are {valid:?} \
+         (or omit the field for default detect-only)"
+    )]
+    UnknownMode {
+        value: String,
+        valid: &'static [&'static str],
+    },
+
+    #[error(
+        "pii.categories[{index}] = {name:?} is not a known PII category; \
+         valid names are {valid:?}"
+    )]
+    UnknownCategory {
+        index: usize,
+        name: String,
+        valid: &'static [&'static str],
+    },
+
+    #[error("internal regex error compiling PII rules: {0}")]
+    Internal(String),
+}
+
+impl PiiRedactor {
     /// Scan a byte slice. Returns the rule names that fired,
     /// post-validator (so a non-Luhn 16-digit run won't appear).
     /// Stable rule-list order; no duplicates.

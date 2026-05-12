@@ -73,8 +73,8 @@ use mvm_supervisor::{
     ArtifactCollector, EgressPolicyValidationError, EgressProxy, KeystoreReleaser, L4Gate,
     L4SpecError, L7EgressProxy, LiveArtifactCollector, LiveKeystoreReleaser, LiveL4Gate,
     NoopArtifactCollector, NoopEgressAuditSink, NoopEgressProxy, NoopKeystoreReleaser, NoopL4Gate,
-    NoopToolGate, PolicyToolGate, TokioDnsResolver, ToolGate, build_inspector_chain,
-    validate_egress_policy_inspector_names,
+    NoopToolGate, PiiPolicyError, PolicyToolGate, TokioDnsResolver, ToolGate,
+    build_inspector_chain_with_pii, validate_egress_policy_inspector_names,
 };
 
 /// The fixed identifier for the local-dev policy bundle. Any
@@ -171,6 +171,18 @@ pub enum ResolveError {
         path: PathBuf,
         detail: String,
     },
+
+    /// A bundle parsed but its `[pii]` section names an unknown
+    /// mode (typo on `detect` / `redact` / `refuse` / `disabled`)
+    /// or an unknown category in `pii.categories`. Fail-loud at
+    /// admission so an operator who intended to scan all 4 default
+    /// categories but typo'd one doesn't silently get only 3
+    /// scanned. Plan 60 Phase 3 Slice B follow-on.
+    PiiPolicyInvalid {
+        value: String,
+        path: PathBuf,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -229,6 +241,15 @@ impl std::fmt::Display for ResolveError {
             } => write!(
                 f,
                 "policy bundle {value:?} (from {}) has an invalid [egress] section: {detail}",
+                path.display()
+            ),
+            Self::PiiPolicyInvalid {
+                value,
+                path,
+                detail,
+            } => write!(
+                f,
+                "policy bundle {value:?} (from {}) has an invalid [pii] section: {detail}",
                 path.display()
             ),
         }
@@ -410,10 +431,20 @@ fn slots_from_bundle(
     // one place. Today's chain (Plan 37 §15 order) is:
     //   destination_policy → ssrf_guard → secrets_scanner →
     //   injection_guard → pii_redactor
-    // `None` for the breaker reporter — the in-process supervisor
-    // wraps with `CircuitBreaker` when it owns one; the CLI resolver
-    // path doesn't have a reporter to share, so the chain ships raw.
-    let chain = build_inspector_chain(&bundle.egress, None);
+    // The `with_pii` variant honors the bundle's `[pii]` section
+    // (mode + categories) so a tenant policy can switch the
+    // redactor to `redact`/`refuse` or scope it to a subset of
+    // default categories. `None` for the breaker reporter — the
+    // in-process supervisor wraps with `CircuitBreaker` when it
+    // owns one; the CLI resolver path doesn't have a reporter to
+    // share, so the chain ships raw.
+    let chain = build_inspector_chain_with_pii(&bundle.egress, &bundle.pii, None).map_err(
+        |e: PiiPolicyError| ResolveError::PiiPolicyInvalid {
+            value: ref_value.to_string(),
+            path: path.to_path_buf(),
+            detail: e.to_string(),
+        },
+    )?;
     let body_cap = if bundle.egress.body_cap_bytes == 0 {
         mvm_policy::DEFAULT_BODY_CAP_BYTES as usize
     } else {
@@ -1485,6 +1516,183 @@ disabled_inspectors = [{list}]
         set_all_refs(&mut plan, "acme:web-worker");
         let _slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
             .unwrap_or_else(|e| panic!("known names should resolve: {e}"));
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Plan 60 Phase 3 — `[pii]` policy wiring
+    //
+    // `slots_from_bundle` now calls `build_inspector_chain_with_pii`
+    // so a tenant bundle's `[pii]` section (mode + categories) drives
+    // runtime behaviour. The resolver path enforces fail-loud on
+    // unknown mode strings or category names — typos at admission
+    // are an operator error to fix, not silently degraded
+    // enforcement.
+    // ──────────────────────────────────────────────────────────────
+
+    fn fixture_bundle_with_pii(mode: Option<&str>, categories: &[&str]) -> String {
+        let mode_line = match mode {
+            Some(m) => format!("mode = \"{m}\""),
+            None => String::new(),
+        };
+        let cats = categories
+            .iter()
+            .map(|c| format!("\"{c}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        let cats_line = if categories.is_empty() {
+            String::new()
+        } else {
+            format!("categories = [{cats}]")
+        };
+        format!(
+            r#"
+schema_version = 1
+bundle_id      = "acme/web-worker"
+bundle_version = 1
+
+[network]
+[egress]
+
+[pii]
+{mode_line}
+{cats_line}
+
+[tool]
+[artifact]
+[keys]
+[audit]
+"#,
+        )
+    }
+
+    #[test]
+    fn slice_b_resolver_accepts_pii_mode_redact_and_subset_categories() {
+        // `pii.mode = "redact"` + a category subset must parse + resolve.
+        // The inspector chain stays at length 5 (pii_redactor present
+        // with operator-supplied mode + categories).
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_pii(Some("redact"), &["email", "us_ssn"]),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+        let _slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("redact + subset must resolve: {e}"));
+    }
+
+    #[test]
+    fn slice_b_resolver_disabled_pii_mode_drops_inspector_from_chain() {
+        // `pii.mode = "disabled"` is the operator-natural kill-switch.
+        // The chain returned by `build_inspector_chain_with_pii` then
+        // has 4 inspectors. We can't observe chain length through the
+        // L7EgressProxy directly, but we can probe via the shared
+        // builder against the parsed bundle's egress + pii.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_pii(Some("disabled"), &[]),
+        );
+        let bundle = mvm_policy::toml_loader::load_bundle_from_path(
+            tmp.path(),
+            "acme",
+            "web-worker",
+        )
+        .expect("bundle parses");
+        let chain =
+            mvm_supervisor::build_inspector_chain_with_pii(&bundle.egress, &bundle.pii, None)
+                .expect("disabled is valid");
+        assert_eq!(
+            chain.len(),
+            4,
+            "pii.mode = disabled must drop the inspector"
+        );
+
+        // Now drive through the resolver end-to-end too — slots
+        // construct without error.
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+        let _slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("disabled-mode bundle must resolve: {e}"));
+    }
+
+    #[test]
+    fn slice_b_resolver_refuses_bundle_with_unknown_pii_mode() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_pii(Some("paranoid"), &[]),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let err = match resolve_supervisor_components_with_dir(&plan, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("unknown pii.mode must be refused"),
+        };
+        match err {
+            ResolveError::PiiPolicyInvalid {
+                value,
+                path,
+                detail,
+            } => {
+                assert_eq!(value, "acme:web-worker");
+                let s = path.to_string_lossy();
+                assert!(s.contains("acme"), "path missing tenant: {s}");
+                assert!(
+                    detail.contains("paranoid"),
+                    "detail must name the bad mode: {detail}"
+                );
+                // Operator should see the valid mode enumeration.
+                assert!(
+                    detail.contains("detect")
+                        && detail.contains("redact")
+                        && detail.contains("refuse")
+                        && detail.contains("disabled"),
+                    "detail should list valid modes: {detail}"
+                );
+            }
+            other => panic!("expected PiiPolicyInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slice_b_resolver_refuses_bundle_with_unknown_pii_category() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_pii(Some("detect"), &["email", "license_plate"]),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let err = match resolve_supervisor_components_with_dir(&plan, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("unknown pii category must be refused"),
+        };
+        match err {
+            ResolveError::PiiPolicyInvalid { detail, .. } => {
+                assert!(
+                    detail.contains("license_plate"),
+                    "detail must name the bad category: {detail}"
+                );
+                assert!(
+                    detail.contains("email")
+                        || detail.contains("us_ssn")
+                        || detail.contains("credit_card"),
+                    "detail should list at least one valid category: {detail}"
+                );
+            }
+            other => panic!("expected PiiPolicyInvalid, got {other:?}"),
+        }
     }
 
     #[test]

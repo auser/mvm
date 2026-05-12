@@ -48,6 +48,7 @@ pub mod inspector;
 pub mod instance_sampler;
 pub mod keystore;
 pub mod l7_proxy;
+pub mod lifecycle_hooks;
 pub mod pii_redactor;
 pub mod policy_tool_gate;
 pub mod proxy;
@@ -88,7 +89,9 @@ pub use l7_proxy::{
     EgressAuditSink, EgressOutcome, EvaluationResult, L7EgressProxy, NoopEgressAuditSink,
     TokioDnsResolver, parse_connect,
 };
-pub use pii_redactor::{PiiRedactor, PiiRule, PiiValidator};
+pub use pii_redactor::{
+    Mode as PiiMode, PII_CATEGORY_NAMES, PiiPolicyError, PiiRedactor, PiiRule, PiiValidator,
+};
 pub use policy_tool_gate::{
     CapturingToolAuditSink, NoopToolAuditSink, PolicyToolGate, ToolAuditError, ToolAuditFields,
     ToolAuditSink, ToolOutcome,
@@ -106,6 +109,7 @@ pub use ssrf_guard::SsrfGuard;
 pub use state::{PlanState, PlanStateMachine, StateTransitionError};
 pub use supervisor::{
     EgressPolicyValidationError, KNOWN_INSPECTOR_NAMES, Supervisor, SupervisorError,
-    build_inspector_chain, validate_egress_policy_inspector_names,
+    build_inspector_chain, build_inspector_chain_with_pii,
+    validate_egress_policy_inspector_names,
 };
 pub use tool_gate::{NoopToolGate, ToolDecision, ToolError, ToolGate};

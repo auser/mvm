@@ -1764,7 +1764,15 @@ closes the last Noop slot in `slots_from_bundle` — every parsed
 bundle field now surfaces somewhere live, with
 `KeystoreError::NotImplemented { rotation_interval_days }`
 distinguishing "configured, pending consumer" from the
-`NotWired` "no bundle" case. **Slice C remains
+`NotWired` "no bundle" case; (6) the L7 inspector chain now uses
+`build_inspector_chain_with_pii` from the resolver path, so a
+tenant bundle's `[pii]` section (mode + categories) actually
+drives the redactor — `mode = "redact"` flips to `Mode::Redact`,
+`mode = "disabled"` drops the inspector entirely, `categories`
+filters `DEFAULT_RULES` by rule name. Typos on `pii.mode` or
+`pii.categories` surface as `ResolveError::PiiPolicyInvalid`
+(`error_class = policy-pii-invalid`) instead of silently scanning
+fewer categories than the operator intended. **Slice C remains
 outstanding**: the smoltcp/TUN userspace-TCP consumer that turns
 an `L4Gate::evaluate` decision into accept/drop on a per-VM TAP,
 the host firewall (nft/pf/wfp) additive layer, the DNS server
