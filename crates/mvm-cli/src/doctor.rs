@@ -17,6 +17,37 @@ struct Check {
     info: String,
 }
 
+/// Path of the host-side vsock proxy socket for the dev VM.
+///
+/// The Apple Container backend names the dev VM `mvm-dev` and writes its
+/// proxy socket under `mvm_share_dir()` — its presence is doctor's signal
+/// that the builder VM is reachable. The legacy `mvm-builder` constant
+/// (`VM_NAME`) is the routing key for `shell::run_on_vm`, not a filesystem
+/// path.
+fn dev_vm_socket_path() -> String {
+    format!(
+        "{}/vms/mvm-dev/vsock.sock",
+        mvm_core::config::mvm_share_dir()
+    )
+}
+
+fn dev_vm_running() -> bool {
+    std::path::Path::new(&dev_vm_socket_path()).exists()
+}
+
+/// Informational `Check` returned when a builder-tool probe can't run
+/// because the dev VM is down. Doctor exits 0 in this case — builder
+/// tooling lives in the dev VM, never on the host, so its absence is
+/// not a host-side defect.
+fn builder_tool_skipped(name: &'static str, category: &'static str) -> Check {
+    Check {
+        name,
+        category,
+        ok: true,
+        info: "skipped — dev VM not running; run `mvmctl dev up` to verify".into(),
+    }
+}
+
 /// JSON-serializable view of a backend's ADR-002 security profile,
 /// surfaced under `security_posture` in `mvmctl doctor --json`.
 #[derive(Debug, Serialize)]
@@ -54,18 +85,26 @@ pub fn run(json: bool) -> Result<()> {
         check_cmd("cargo", "prerequisites", "cargo --version"),
     ];
 
-    // ── Managed Tools (installed by bootstrap) ────────────────────
+    // ── Managed Tools (installed inside the dev VM) ──────────────
     //
-    // Plan-60 / ADR-013 dropped Lima; the doctor now always runs the
-    // checks against the builder VM (or the host when host-Nix is
-    // configured). The W8 direct-launch rewrite will fold the
-    // builder-VM probe into a host-only one.
-    checks.push(nix_version_check(Some(VM_NAME)));
-    checks.push(check_vm_cmd(
-        "firecracker",
-        "tools",
-        "firecracker --version",
-    ));
+    // Builder tooling (nix, firecracker, nix store, flakes) belongs to
+    // the dev VM, never the host. When the dev VM isn't running these
+    // probes return informational `Check`s and doctor exits 0 — the host
+    // is not expected to own them. Routing still goes through `VM_NAME`,
+    // which `shell::run_on_vm` maps to the platform's default LinuxEnv
+    // (Apple Container `mvm-dev` on macOS 26+; future microsandbox
+    // builder elsewhere).
+    let vm_up = dev_vm_running();
+    checks.push(if vm_up {
+        nix_version_check()
+    } else {
+        builder_tool_skipped("nix", "tools")
+    });
+    checks.push(if vm_up {
+        check_vm_cmd("firecracker", "tools", "firecracker --version")
+    } else {
+        builder_tool_skipped("firecracker", "tools")
+    });
 
     checks.push(Check {
         name: "fc target",
@@ -75,7 +114,11 @@ pub fn run(json: bool) -> Result<()> {
     });
 
     // Nix flake support check
-    checks.push(nix_flakes_check(false));
+    checks.push(if vm_up {
+        nix_flakes_check()
+    } else {
+        builder_tool_skipped("nix flakes", "tools")
+    });
 
     // ── Platform ──────────────────────────────────────────────────
     let plat = platform::current();
@@ -94,8 +137,16 @@ pub fn run(json: bool) -> Result<()> {
     checks.push(disk_space_check(false));
 
     // Nix store health
-    checks.push(nix_store_check(false));
-    checks.push(nix_store_size_check(false));
+    checks.push(if vm_up {
+        nix_store_check()
+    } else {
+        builder_tool_skipped("nix store", "tools")
+    });
+    checks.push(if vm_up {
+        nix_store_size_check()
+    } else {
+        builder_tool_skipped("nix store size", "disk")
+    });
 
     // ── Security posture (plan 40 folded `mvmctl security` here) ──
     checks.push(security_audit_log_check());
@@ -383,20 +434,15 @@ fn kvm_check(plat: Platform, in_vm: bool) -> Check {
         };
     }
 
-    // macOS host: check /dev/kvm inside the Lima VM
-    match shell::run_in_vm("test -c /dev/kvm && echo ok") {
-        Ok(out) if out.status.success() => Check {
-            name: "kvm",
-            category: "platform",
-            ok: true,
-            info: "available (via Lima VM)".to_string(),
-        },
-        _ => Check {
-            name: "kvm",
-            category: "platform",
-            ok: false,
-            info: "Lima VM not running or /dev/kvm unavailable. Run 'mvmctl setup'.".to_string(),
-        },
+    // macOS host: /dev/kvm doesn't exist anywhere in the stack — the
+    // backend is Apple Container / libkrun / microsandbox driven by
+    // Hypervisor.framework. Plan-60 / ADR-013 retired Lima; reporting
+    // KVM as missing on macOS is a pre-Plan-60 artifact.
+    Check {
+        name: "kvm",
+        category: "platform",
+        ok: true,
+        info: "n/a on macOS (Hypervisor.framework via libkrun / Apple Container)".to_string(),
     }
 }
 
@@ -526,12 +572,12 @@ const NIX_MIN_VERSION: (u64, u64) = (2, 4);
 const NIX_RECOMMENDED_VERSION: (u64, u64) = (2, 13);
 
 /// Check Nix version and validate it meets minimum requirements.
-/// `vm_name`: if Some, run `nix --version` inside the Lima VM; if None, run locally.
-fn nix_version_check(vm_name: Option<&str>) -> Check {
-    let output_result = match vm_name {
-        Some(vm) => shell::run_on_vm(vm, "nix --version"),
-        None => shell::run_host("bash", &["-lc", "nix --version"]),
-    };
+///
+/// Always probes the dev VM — nix is never expected on the host. The
+/// caller in `run()` gates this on [`dev_vm_running`]; calling it when
+/// the dev VM is down will return an error `Check`.
+fn nix_version_check() -> Check {
+    let output_result = shell::run_on_vm(VM_NAME, "nix --version");
 
     match output_result {
         Ok(out) if out.status.success() => {
@@ -615,14 +661,12 @@ fn parse_nix_version(output: &str) -> Option<(u64, u64, u64)> {
     Some((major, minor, patch))
 }
 
-/// Check that Nix flake support is enabled (experimental-features includes nix-command and flakes).
-fn nix_flakes_check(in_vm: bool) -> Check {
+/// Check that Nix flake support is enabled (experimental-features includes
+/// nix-command and flakes). Always probes the dev VM; gated on
+/// [`dev_vm_running`] by the caller.
+fn nix_flakes_check() -> Check {
     let cmd = "nix show-config 2>/dev/null | grep -i experimental-features || echo 'not found'";
-    let output_result = if in_vm {
-        shell::run_host("bash", &["-lc", cmd])
-    } else {
-        shell::run_on_vm(VM_NAME, cmd)
-    };
+    let output_result = shell::run_on_vm(VM_NAME, cmd);
 
     match output_result {
         Ok(out) if out.status.success() => {
@@ -666,14 +710,11 @@ fn nix_flakes_check(in_vm: bool) -> Check {
 
 // ── Nix store health ──────────────────────────────────────────────────────
 
-/// Check Nix store accessibility via `nix store ping`.
-fn nix_store_check(in_vm: bool) -> Check {
+/// Check Nix store accessibility via `nix store ping`. Always probes the
+/// dev VM; gated on [`dev_vm_running`] by the caller.
+fn nix_store_check() -> Check {
     let cmd = "nix store ping 2>&1";
-    let output_result = if in_vm {
-        shell::run_host("bash", &["-lc", cmd])
-    } else {
-        shell::run_on_vm(VM_NAME, cmd)
-    };
+    let output_result = shell::run_on_vm(VM_NAME, cmd);
 
     match output_result {
         Ok(out) if out.status.success() => {
@@ -706,14 +747,11 @@ fn nix_store_check(in_vm: bool) -> Check {
     }
 }
 
-/// Check Nix store size and warn if it exceeds 20 GiB.
-fn nix_store_size_check(in_vm: bool) -> Check {
+/// Check Nix store size and warn if it exceeds 20 GiB. Always probes the
+/// dev VM; gated on [`dev_vm_running`] by the caller.
+fn nix_store_size_check() -> Check {
     let cmd = "du -sb /nix/store 2>/dev/null | awk '{print $1}'";
-    let output_result = if in_vm {
-        shell::run_host("bash", &["-lc", cmd])
-    } else {
-        shell::run_on_vm(VM_NAME, cmd)
-    };
+    let output_result = shell::run_on_vm(VM_NAME, cmd);
 
     match output_result {
         Ok(out) if out.status.success() => {
@@ -856,9 +894,11 @@ fn detect_host_fde() -> String {
     }
 }
 
-/// `~/.mvm` should be mode 0700 (ADR-002 §W1.5).
+/// `~/.mvm` should be mode 0700 (ADR-002 §W1.5). The XDG share directory
+/// (`mvm_share_dir`) lands at the OS default mode (0755 on macOS Tahoe);
+/// the data dir (`mvm_data_dir`) is the one the security model owns.
 fn security_data_dir_mode_check() -> Check {
-    let dir = mvm_core::config::mvm_share_dir();
+    let dir = mvm_core::config::mvm_data_dir();
     let Ok(meta) = std::fs::symlink_metadata(&dir) else {
         return Check {
             name: "data dir mode",
@@ -1299,5 +1339,125 @@ mod tests {
             posture.tier
         );
         assert_eq!(posture.claims.len(), 7);
+    }
+
+    // ── Dev-VM gating + data-dir-mode routing tests ─────────────────
+    //
+    // These tests mutate `MVM_DATA_DIR` / `MVM_SHARE_DIR` to redirect
+    // doctor's filesystem probes at a tempdir. Env-var mutation is
+    // process-wide, so a `Mutex` serializes them.
+
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev_data: Option<String>,
+        prev_share: Option<String>,
+        _tmp_data: Option<tempfile::TempDir>,
+        _tmp_share: Option<tempfile::TempDir>,
+    }
+
+    impl EnvGuard {
+        fn new(data: Option<tempfile::TempDir>, share: Option<tempfile::TempDir>) -> Self {
+            let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev_data = std::env::var("MVM_DATA_DIR").ok();
+            let prev_share = std::env::var("MVM_SHARE_DIR").ok();
+            unsafe {
+                if let Some(d) = data.as_ref() {
+                    std::env::set_var("MVM_DATA_DIR", d.path());
+                }
+                if let Some(s) = share.as_ref() {
+                    std::env::set_var("MVM_SHARE_DIR", s.path());
+                }
+            }
+            EnvGuard {
+                _guard: g,
+                prev_data,
+                prev_share,
+                _tmp_data: data,
+                _tmp_share: share,
+            }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev_data {
+                    Some(v) => std::env::set_var("MVM_DATA_DIR", v),
+                    None => std::env::remove_var("MVM_DATA_DIR"),
+                }
+                match &self.prev_share {
+                    Some(v) => std::env::set_var("MVM_SHARE_DIR", v),
+                    None => std::env::remove_var("MVM_SHARE_DIR"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn dev_vm_socket_path_uses_share_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let expected = format!("{}/vms/mvm-dev/vsock.sock", tmp.path().display());
+        let _g = EnvGuard::new(None, Some(tmp));
+        assert_eq!(dev_vm_socket_path(), expected);
+    }
+
+    #[test]
+    fn dev_vm_running_is_false_when_no_socket() {
+        let _g = EnvGuard::new(None, Some(tempfile::tempdir().unwrap()));
+        assert!(
+            !dev_vm_running(),
+            "fresh tempdir has no vsock socket; dev_vm_running must be false"
+        );
+    }
+
+    #[test]
+    fn builder_tool_skipped_reports_ok_with_skip_marker() {
+        let c = builder_tool_skipped("nix", "tools");
+        assert!(c.ok, "skip is informational, not a failure");
+        assert_eq!(c.name, "nix");
+        assert_eq!(c.category, "tools");
+        assert!(
+            c.info.contains("dev VM not running"),
+            "expected skip marker, got: {}",
+            c.info
+        );
+    }
+
+    #[test]
+    fn kvm_check_on_macos_is_informational() {
+        let c = kvm_check(Platform::MacOS, false);
+        assert!(c.ok, "macOS kvm check must not fail: {}", c.info);
+        assert!(
+            c.info.contains("Hypervisor.framework"),
+            "expected Hypervisor.framework rationale, got: {}",
+            c.info
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn security_data_dir_mode_check_reads_data_dir_not_share_dir() {
+        use std::os::unix::fs::PermissionsExt;
+        let data = tempfile::tempdir().unwrap();
+        let share = tempfile::tempdir().unwrap();
+        // data dir 0700 (the one we want checked), share dir 0755 (decoy).
+        std::fs::set_permissions(data.path(), std::fs::Permissions::from_mode(0o700)).unwrap();
+        std::fs::set_permissions(share.path(), std::fs::Permissions::from_mode(0o755)).unwrap();
+        let _g = EnvGuard::new(Some(data), Some(share));
+        let c = security_data_dir_mode_check();
+        assert!(
+            c.ok,
+            "expected ok because data dir is 0700, got: {}",
+            c.info
+        );
+        assert!(
+            c.info.contains("0700"),
+            "info should report the data dir's mode, got: {}",
+            c.info
+        );
     }
 }
