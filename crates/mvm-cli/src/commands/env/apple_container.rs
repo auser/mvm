@@ -563,10 +563,29 @@ fn ensure_dev_image() -> Result<(String, String)> {
         .with_context(|| format!("creating prebuilt dir {prebuilt_dir}"))?;
     let kernel_path = format!("{prebuilt_dir}/vmlinux");
     let rootfs_path = format!("{prebuilt_dir}/rootfs.ext4");
-    // Cache hit on the current version's dir — fast path.
+    // Cache hit on the current version's dir — fast path. Validate
+    // first; if either file is below the size floor or the rootfs
+    // lacks the ext4 magic, treat the cache as poisoned and delete it
+    // so the cascade below can re-populate from a healthy source. The
+    // typical poisoning vector is an earlier copy from a stub or
+    // half-downloaded source — the size floor catches the stub case
+    // (~12 B vs. ~16 MiB minimum), and the magic check catches a
+    // wrong-format file at the right size.
     if std::path::Path::new(&kernel_path).exists() && std::path::Path::new(&rootfs_path).exists() {
-        prune_old_prebuilts(&prebuilt_root, version);
-        return Ok((kernel_path, rootfs_path));
+        match validate_dev_image_artifacts(&kernel_path, &rootfs_path) {
+            Ok(()) => {
+                prune_old_prebuilts(&prebuilt_root, version);
+                return Ok((kernel_path, rootfs_path));
+            }
+            Err(e) => {
+                ui::warn(&format!(
+                    "Cached dev image at {prebuilt_dir} failed sanity check ({e}); \
+                     deleting and rebuilding."
+                ));
+                let _ = std::fs::remove_file(&kernel_path);
+                let _ = std::fs::remove_file(&rootfs_path);
+            }
+        }
     }
     // Source-checkout-first. When the binary was compiled out of an
     // mvm source tree that has `nix/images/dev-prebuilt/<arch>/`
@@ -577,6 +596,12 @@ fn ensure_dev_image() -> Result<(String, String)> {
     // for source checkouts that haven't vendored anything yet, in
     // which case we fall through to the published prebuilt as before.
     if let Some((src_kernel, src_rootfs, source_label)) = find_vendored_dev_image() {
+        validate_dev_image_artifacts(&src_kernel, &src_rootfs).with_context(|| {
+            format!(
+                "vendored dev image at {source_label} failed sanity check — \
+                 refusing to copy garbage into the prebuilt cache"
+            )
+        })?;
         ui::info(&format!(
             "Using vendored dev image from source checkout ({source_label})."
         ));
@@ -658,6 +683,15 @@ fn find_local_fallback_image() -> Option<(std::path::PathBuf, std::path::PathBuf
             if !kernel.is_file() || !rootfs.is_file() {
                 continue;
             }
+            // Silently skip cache entries that look corrupt (stub
+            // bytes from a botched earlier copy, half-written
+            // downloads, etc.). The auto-discover path is best-effort
+            // — surfacing every bad candidate as a warning would
+            // spam the boot path; the cascade just falls through to
+            // a healthier candidate or to the next layer.
+            if validate_dev_image_artifacts(&kernel, &rootfs).is_err() {
+                continue;
+            }
             let mtime = std::fs::metadata(&rootfs)
                 .and_then(|m| m.modified())
                 .unwrap_or(std::time::UNIX_EPOCH);
@@ -669,6 +703,78 @@ fn find_local_fallback_image() -> Option<(std::path::PathBuf, std::path::PathBuf
     candidates.sort_by_key(|(mtime, ..)| *mtime);
     let (_, dir, label) = candidates.into_iter().next_back()?;
     Some((dir.join("vmlinux"), dir.join("rootfs.ext4"), label))
+}
+
+/// Sanity-check that a `(vmlinux, rootfs.ext4)` pair looks like a real
+/// dev image. Fast-fails before copying or returning the artifacts as
+/// usable, so a stub or truncated file can't poison the prebuilt cache.
+///
+/// Two checks per file:
+///
+/// - **Size floor.** A real `vmlinux` is several MiB (typical ARM64
+///   Image is 15–20 MiB); a real `rootfs.ext4` is ~700 MiB. Reject
+///   anything under a conservative floor (1 MiB / 4 MiB respectively)
+///   to catch the stub-file case (~12 B from a botched test, ~0 B
+///   from a torn-down download).
+/// - **Ext4 magic.** The ext4 superblock starts at byte 1024; the
+///   `s_magic` field is at byte 1080 (offset 56 inside the
+///   superblock) and equals `0xEF53` little-endian. Only the rootfs
+///   gets this check — `vmlinux` formats vary by arch (ARM64
+///   `Image`, x86 bzImage, etc.) so there's no portable magic to
+///   match.
+fn validate_dev_image_artifacts(
+    kernel: impl AsRef<std::path::Path>,
+    rootfs: impl AsRef<std::path::Path>,
+) -> Result<()> {
+    const KERNEL_MIN_BYTES: u64 = 1024 * 1024;
+    const ROOTFS_MIN_BYTES: u64 = 4 * 1024 * 1024;
+    const EXT4_MAGIC_OFFSET: u64 = 1024 + 56;
+    const EXT4_MAGIC: [u8; 2] = [0x53, 0xEF];
+
+    let kernel = kernel.as_ref();
+    let rootfs = rootfs.as_ref();
+
+    let kernel_size = std::fs::metadata(kernel)
+        .with_context(|| format!("stat {}", kernel.display()))?
+        .len();
+    if kernel_size < KERNEL_MIN_BYTES {
+        anyhow::bail!(
+            "kernel at {} is only {} bytes (expected ≥ {})",
+            kernel.display(),
+            kernel_size,
+            KERNEL_MIN_BYTES,
+        );
+    }
+
+    let rootfs_size = std::fs::metadata(rootfs)
+        .with_context(|| format!("stat {}", rootfs.display()))?
+        .len();
+    if rootfs_size < ROOTFS_MIN_BYTES {
+        anyhow::bail!(
+            "rootfs at {} is only {} bytes (expected ≥ {})",
+            rootfs.display(),
+            rootfs_size,
+            ROOTFS_MIN_BYTES,
+        );
+    }
+
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f =
+        std::fs::File::open(rootfs).with_context(|| format!("open {}", rootfs.display()))?;
+    f.seek(SeekFrom::Start(EXT4_MAGIC_OFFSET))
+        .with_context(|| format!("seek to ext4 magic in {}", rootfs.display()))?;
+    let mut magic = [0u8; 2];
+    f.read_exact(&mut magic)
+        .with_context(|| format!("read ext4 magic from {}", rootfs.display()))?;
+    if magic != EXT4_MAGIC {
+        anyhow::bail!(
+            "rootfs at {} does not have ext4 magic at offset {} (got {magic:02x?})",
+            rootfs.display(),
+            EXT4_MAGIC_OFFSET,
+        );
+    }
+
+    Ok(())
 }
 
 /// Look for a vendored dev image inside the source checkout the mvmctl
