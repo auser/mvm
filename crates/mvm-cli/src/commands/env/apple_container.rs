@@ -505,6 +505,19 @@ fn ensure_dev_image() -> Result<(String, String)> {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating dev-image out parent {}", parent.display()))?;
         }
+        // Replace a stale symlink (e.g. the nix-darwin `linux-builder`
+        // legacy points `current` at a root-owned `/nix/store/…-mvm-dev`
+        // path) with a real, writable directory. `create_dir_all` is a
+        // no-op against an existing symlink, so without this the
+        // microsandbox bind-mount of `out_dir` lands on the read-only
+        // Nix store path and Apple Container fails with EACCES.
+        if std::path::Path::new(&out_dir)
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            std::fs::remove_file(&out_dir)
+                .with_context(|| format!("removing stale dev-image symlink at {out_dir}"))?;
+        }
         std::fs::create_dir_all(&out_dir)
             .with_context(|| format!("creating dev-image out dir {out_dir}"))?;
 
@@ -1367,14 +1380,25 @@ fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(Strin
         anyhow::bail!("flake dir does not exist: {flake_dir}");
     }
 
-    // Bind-mount /nix opportunistically: if it exists on the host, the
-    // builder reuses already-realized store paths; if not, fetches from
-    // substituters. Either way the host doesn't have to have Nix.
-    let host_nix = std::path::PathBuf::from("/nix");
-    let host_nix_store = if host_nix.join("store").is_dir() {
-        Some(host_nix)
-    } else {
+    // Bind-mount /nix opportunistically on Linux hosts that already
+    // run native Nix — the builder reuses already-realized store paths,
+    // and absence is fine because the in-sandbox store fetches from
+    // substituters. Skip the bind on macOS: a multi-user Nix install
+    // there leaves `/nix` owned by `root:wheel` (Apple Container's
+    // bind-mounter fails with EACCES), *and* the store contains
+    // Darwin-targeted closures that a Linux microVM can't execute
+    // anyway. The microsandbox builder is on the macOS path precisely
+    // because the host has no usable Linux Nix; reusing its Darwin
+    // store is wrong regardless of permissions.
+    let host_nix_store = if cfg!(target_os = "macos") {
         None
+    } else {
+        let host_nix = std::path::PathBuf::from("/nix");
+        if host_nix.join("store").is_dir() {
+            Some(host_nix)
+        } else {
+            None
+        }
     };
 
     let job = BuilderJob {
