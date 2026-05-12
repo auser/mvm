@@ -27,6 +27,7 @@ use mvm_mcp::{
     SessionMap, SessionState, ToolResult,
 };
 use mvm_supervisor::ToolRegistry;
+use mvm_supervisor::tools::web_fetch;
 
 use super::Cli;
 
@@ -142,9 +143,44 @@ impl Default for ExecDispatcher {
                 warm_vms: Arc::clone(&warm_vms),
             }),
             warm_vms,
-            tool_registry: Arc::new(ToolRegistry::with_defaults()),
+            tool_registry: Arc::new(build_tool_registry()),
         }
     }
+}
+
+/// Build the Phase 7 tool registry the MCP dispatcher hands out.
+///
+/// Today:
+/// - `mvm.time_now` — always reachable.
+/// - `mvm.web_fetch` — uses [`web_fetch::ReqwestHttpFetcher`] when
+///   constructable; allowlist comes from
+///   `$MVM_WEB_FETCH_ALLOWLIST` (comma-separated). When the env var
+///   is unset, the allowlist is empty and every fetch fails closed.
+/// - `mvm.web_search` — fail-closed default (per-provider adapters
+///   ship in a follow-up slice).
+///
+/// On `ReqwestHttpFetcher::new()` failure (extraordinarily rare —
+/// reqwest builds the TLS stack lazily), we log a `tracing::warn`
+/// and fall back to `NoopHttpFetcher` so the registry still ships.
+fn build_tool_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::with_defaults();
+    let allow = web_fetch::allowlist_from_env_var(web_fetch::ALLOWLIST_ENV_VAR);
+    let mut tool = web_fetch::WebFetchTool::with_allowlist(allow);
+    match web_fetch::ReqwestHttpFetcher::new() {
+        Ok(f) => {
+            tool = tool.with_fetcher(Arc::new(f));
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ReqwestHttpFetcher init failed; mvm.web_fetch will use Noop fallback"
+            );
+        }
+    }
+    // Re-register replaces the fail-closed default that
+    // `with_defaults` planted.
+    registry.register(Box::new(tool));
+    registry
 }
 
 impl ExecDispatcher {

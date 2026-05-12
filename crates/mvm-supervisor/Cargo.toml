@@ -44,6 +44,10 @@ thiserror = "1"
 # Plan 60 Phase 7 — `web_fetch` tool parses RFC-3986 URLs to enforce
 # scheme/host invariants before the allowlist check.
 url = "2"
+# Plan 60 Phase 7 — `ReqwestHttpFetcher` (the reqwest-backed
+# `HttpFetcher` impl for `mvm.web_fetch`). Workspace feature set
+# already includes `rustls-tls` so we don't pull openssl.
+reqwest = { workspace = true }
 # Wave 2.6: L7EgressProxy uses tokio::net::lookup_host for the
 # production DnsResolver impl. Tests use only `macros + rt`, the
 # proxy needs `net` for lookup. `rt-multi-thread` lands when the
