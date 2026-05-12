@@ -144,8 +144,11 @@ pub struct OverlayHandle {
 }
 
 /// Audit-grade record of a destruction operation. Slice D signs
-/// this under the host identity key + emits it to the audit chain.
-#[derive(Debug, Clone, PartialEq, Eq)]
+/// this under the host identity key — see
+/// [`sign_destruction_receipt`] / [`verify_destruction_receipt`]
+/// and the [`SignedDestructionReceipt`] envelope below.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct DestructionReceipt {
     pub tenant: String,
     pub workload: String,
@@ -157,6 +160,171 @@ pub struct DestructionReceipt {
     /// Total bytes overwritten across all files. Useful as a
     /// sanity check vs. the overlay's pre-destroy `size_bytes`.
     pub bytes_wiped: u64,
+}
+
+impl DestructionReceipt {
+    /// Canonical bytes the destruction signature is computed over.
+    ///
+    /// Format (version-prefixed, pipe-delimited):
+    ///
+    /// ```text
+    /// destruction|v1|<tenant>|<workload>|<destroyed_at_unix_nanos>|<files_wiped>|<bytes_wiped>
+    /// ```
+    ///
+    /// Pipe-delimited rather than JSON because JSON object-key
+    /// ordering isn't guaranteed across serializers — that would
+    /// make verification implementation-dependent. The v1 prefix
+    /// pins the format; bumping it (e.g. to v2 if we add a field)
+    /// invalidates prior signatures by design.
+    pub fn signature_payload(&self) -> Vec<u8> {
+        let ts_nanos = self
+            .destroyed_at
+            .timestamp_nanos_opt()
+            .unwrap_or_else(|| self.destroyed_at.timestamp() * 1_000_000_000);
+        format!(
+            "destruction|v1|{tenant}|{workload}|{ts}|{files}|{bytes}",
+            tenant = self.tenant,
+            workload = self.workload,
+            ts = ts_nanos,
+            files = self.files_wiped,
+            bytes = self.bytes_wiped,
+        )
+        .into_bytes()
+    }
+}
+
+/// Slice D — `DestructionReceipt` wrapped in an Ed25519 signature
+/// plus the signing key's identity (the host identity pubkey,
+/// base64-encoded). An operator who needs to prove a tenant's
+/// data was erased hands this envelope over: the auditor verifies
+/// the signature with a known-trusted pubkey and matches the
+/// receipt fields against the audit chain's `tenant.destroyed`
+/// event.
+///
+/// ## Wire shape
+///
+/// The envelope serializes to JSON for operator-friendliness;
+/// `#[serde(deny_unknown_fields)]` keeps the wire pinned. The
+/// `signature` and `signer_pubkey` are URL-safe-no-pad base64
+/// (same encoding the plan-64 audit chain uses for envelope
+/// hashes + signatures).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SignedDestructionReceipt {
+    pub receipt: DestructionReceipt,
+    /// URL-safe-no-pad base64 of the 64-byte Ed25519 signature
+    /// over `receipt.signature_payload()`.
+    pub signature: String,
+    /// URL-safe-no-pad base64 of the signer's 32-byte Ed25519
+    /// public key. An auditor uses this to look up the signer
+    /// (operator key fingerprint) in their trust store.
+    pub signer_pubkey: String,
+    /// Format version. Pins `signature_payload`'s shape. Future
+    /// bumps invalidate prior signatures by design.
+    pub version: u32,
+}
+
+/// Sign a [`DestructionReceipt`] under `signing_key`. The
+/// public-key fingerprint included in the envelope is derived
+/// from the signing key, so the auditor doesn't have to be told
+/// separately which key signed.
+///
+/// Production callers pass `host_signer.signing` (the operator's
+/// host identity key, plan 64 W2). Tests inject a fresh ephemeral
+/// keypair.
+pub fn sign_destruction_receipt(
+    receipt: &DestructionReceipt,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> SignedDestructionReceipt {
+    use base64::Engine;
+    use ed25519_dalek::Signer;
+    let payload = receipt.signature_payload();
+    let signature = signing_key.sign(&payload);
+    let signer_pubkey = signing_key.verifying_key();
+    SignedDestructionReceipt {
+        receipt: receipt.clone(),
+        signature: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(signature.to_bytes()),
+        signer_pubkey: base64::engine::general_purpose::URL_SAFE_NO_PAD
+            .encode(signer_pubkey.to_bytes()),
+        version: 1,
+    }
+}
+
+#[derive(Debug, Error)]
+pub enum DestructionVerifyError {
+    #[error("unsupported destruction-receipt version {got} (expected 1)")]
+    UnsupportedVersion { got: u32 },
+    #[error("signer pubkey not base64: {0}")]
+    PubkeyDecode(String),
+    #[error("signer pubkey wrong length: got {got} bytes (expected 32)")]
+    PubkeyLength { got: usize },
+    #[error("signer pubkey malformed: {0}")]
+    PubkeyParse(String),
+    #[error("signer pubkey {got:?} does not match expected {expected:?}")]
+    PubkeyMismatch { got: String, expected: String },
+    #[error("signature not base64: {0}")]
+    SignatureDecode(String),
+    #[error("signature wrong length: got {got} bytes (expected 64)")]
+    SignatureLength { got: usize },
+    #[error("signature invalid for this receipt + pubkey")]
+    SignatureInvalid,
+}
+
+/// Verify a [`SignedDestructionReceipt`]. If `expected_signer_pubkey`
+/// is `Some`, additionally check that the envelope's embedded
+/// `signer_pubkey` matches it byte-for-byte (so an operator can
+/// pin to a specific host identity).
+///
+/// Returns the inner receipt on success — the caller has both the
+/// receipt fields AND the assurance that they were signed by the
+/// expected key.
+pub fn verify_destruction_receipt<'a>(
+    signed: &'a SignedDestructionReceipt,
+    expected_signer_pubkey: Option<&ed25519_dalek::VerifyingKey>,
+) -> Result<&'a DestructionReceipt, DestructionVerifyError> {
+    use base64::Engine;
+    use ed25519_dalek::{Signature, Verifier, VerifyingKey};
+    if signed.version != 1 {
+        return Err(DestructionVerifyError::UnsupportedVersion {
+            got: signed.version,
+        });
+    }
+    let pubkey_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(signed.signer_pubkey.as_bytes())
+        .map_err(|e| DestructionVerifyError::PubkeyDecode(e.to_string()))?;
+    if pubkey_bytes.len() != 32 {
+        return Err(DestructionVerifyError::PubkeyLength {
+            got: pubkey_bytes.len(),
+        });
+    }
+    let mut pk_array = [0u8; 32];
+    pk_array.copy_from_slice(&pubkey_bytes);
+    let pubkey = VerifyingKey::from_bytes(&pk_array)
+        .map_err(|e| DestructionVerifyError::PubkeyParse(e.to_string()))?;
+    if let Some(expected) = expected_signer_pubkey
+        && pubkey.to_bytes() != expected.to_bytes()
+    {
+        return Err(DestructionVerifyError::PubkeyMismatch {
+            got: signed.signer_pubkey.clone(),
+            expected: base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(expected.to_bytes()),
+        });
+    }
+    let sig_bytes = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(signed.signature.as_bytes())
+        .map_err(|e| DestructionVerifyError::SignatureDecode(e.to_string()))?;
+    if sig_bytes.len() != 64 {
+        return Err(DestructionVerifyError::SignatureLength {
+            got: sig_bytes.len(),
+        });
+    }
+    let mut sig_array = [0u8; 64];
+    sig_array.copy_from_slice(&sig_bytes);
+    let signature = Signature::from_bytes(&sig_array);
+    let payload = signed.receipt.signature_payload();
+    pubkey
+        .verify(&payload, &signature)
+        .map_err(|_| DestructionVerifyError::SignatureInvalid)?;
+    Ok(&signed.receipt)
 }
 
 #[derive(Debug, Error)]
@@ -845,5 +1013,172 @@ mod tests {
         let m = NoopOverlayManager;
         let err = m.destroy_overlay("a", "b").await.unwrap_err();
         assert!(matches!(err, OverlayError::Unwired));
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Slice D — SignedDestructionReceipt (sign + verify)
+    // ──────────────────────────────────────────────────────────────
+
+    use ed25519_dalek::SigningKey;
+    use rand::rngs::OsRng;
+
+    fn sample_receipt() -> DestructionReceipt {
+        DestructionReceipt {
+            tenant: "acme".to_string(),
+            workload: "build-runner".to_string(),
+            destroyed_at: DateTime::<Utc>::from_timestamp(1_700_000_000, 123_456_789).unwrap(),
+            files_wiped: 42,
+            bytes_wiped: 1_048_576,
+        }
+    }
+
+    #[test]
+    fn signature_payload_is_stable_pipe_delimited() {
+        // Pin the wire format so a future refactor that changes
+        // field order or delimiter breaks loudly. An auditor's
+        // verifier reconstructs this byte-for-byte.
+        let receipt = sample_receipt();
+        let payload = receipt.signature_payload();
+        let s = String::from_utf8(payload).unwrap();
+        assert_eq!(
+            s,
+            "destruction|v1|acme|build-runner|1700000000123456789|42|1048576"
+        );
+    }
+
+    #[test]
+    fn sign_then_verify_round_trip() {
+        let key = SigningKey::generate(&mut OsRng);
+        let receipt = sample_receipt();
+        let signed = sign_destruction_receipt(&receipt, &key);
+        // Embedded fields match the input
+        assert_eq!(&signed.receipt, &receipt);
+        assert_eq!(signed.version, 1);
+        // Round-trip
+        let recovered = verify_destruction_receipt(&signed, None).unwrap();
+        assert_eq!(recovered, &receipt);
+    }
+
+    #[test]
+    fn verify_with_expected_pubkey_succeeds_on_match() {
+        let key = SigningKey::generate(&mut OsRng);
+        let signed = sign_destruction_receipt(&sample_receipt(), &key);
+        let vk = key.verifying_key();
+        verify_destruction_receipt(&signed, Some(&vk)).unwrap();
+    }
+
+    #[test]
+    fn verify_with_expected_pubkey_rejects_on_mismatch() {
+        let signer = SigningKey::generate(&mut OsRng);
+        let other = SigningKey::generate(&mut OsRng);
+        let signed = sign_destruction_receipt(&sample_receipt(), &signer);
+        let err = verify_destruction_receipt(&signed, Some(&other.verifying_key())).unwrap_err();
+        assert!(matches!(err, DestructionVerifyError::PubkeyMismatch { .. }));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_tenant() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut signed = sign_destruction_receipt(&sample_receipt(), &key);
+        signed.receipt.tenant = "evil".to_string();
+        let err = verify_destruction_receipt(&signed, None).unwrap_err();
+        assert!(matches!(err, DestructionVerifyError::SignatureInvalid));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_files_wiped() {
+        // The signature is over the byte payload, which includes
+        // the wipe count. Re-padding the count to hide a leak
+        // breaks verification.
+        let key = SigningKey::generate(&mut OsRng);
+        let mut signed = sign_destruction_receipt(&sample_receipt(), &key);
+        signed.receipt.files_wiped = 0; // "we wiped nothing"
+        let err = verify_destruction_receipt(&signed, None).unwrap_err();
+        assert!(matches!(err, DestructionVerifyError::SignatureInvalid));
+    }
+
+    #[test]
+    fn verify_rejects_tampered_timestamp() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut signed = sign_destruction_receipt(&sample_receipt(), &key);
+        signed.receipt.destroyed_at += chrono::Duration::seconds(1);
+        let err = verify_destruction_receipt(&signed, None).unwrap_err();
+        assert!(matches!(err, DestructionVerifyError::SignatureInvalid));
+    }
+
+    #[test]
+    fn verify_rejects_unsupported_version() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut signed = sign_destruction_receipt(&sample_receipt(), &key);
+        signed.version = 999;
+        let err = verify_destruction_receipt(&signed, None).unwrap_err();
+        assert!(matches!(
+            err,
+            DestructionVerifyError::UnsupportedVersion { got: 999 }
+        ));
+    }
+
+    #[test]
+    fn verify_rejects_malformed_signature_base64() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut signed = sign_destruction_receipt(&sample_receipt(), &key);
+        signed.signature = "not_base64!!!@@@".to_string();
+        let err = verify_destruction_receipt(&signed, None).unwrap_err();
+        assert!(matches!(
+            err,
+            DestructionVerifyError::SignatureDecode(_)
+                | DestructionVerifyError::SignatureLength { .. }
+        ));
+    }
+
+    #[test]
+    fn signed_receipt_round_trips_through_json() {
+        // Operators hand the SignedDestructionReceipt over as
+        // JSON; this test pins the serde shape so a future
+        // refactor that drops `#[serde(deny_unknown_fields)]` or
+        // reorders fields trips a regression.
+        let key = SigningKey::generate(&mut OsRng);
+        let signed = sign_destruction_receipt(&sample_receipt(), &key);
+        let serialized = serde_json::to_string(&signed).unwrap();
+        let parsed: SignedDestructionReceipt = serde_json::from_str(&serialized).unwrap();
+        assert_eq!(parsed, signed);
+        // And the parsed envelope still verifies.
+        verify_destruction_receipt(&parsed, None).unwrap();
+    }
+
+    #[test]
+    fn signed_receipt_rejects_unknown_json_field() {
+        let key = SigningKey::generate(&mut OsRng);
+        let signed = sign_destruction_receipt(&sample_receipt(), &key);
+        let mut json: serde_json::Value = serde_json::to_value(&signed).unwrap();
+        json.as_object_mut()
+            .unwrap()
+            .insert("extra".into(), serde_json::json!("smuggled"));
+        let s = serde_json::to_string(&json).unwrap();
+        // deny_unknown_fields refuses.
+        let err = serde_json::from_str::<SignedDestructionReceipt>(&s).unwrap_err();
+        assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[tokio::test]
+    async fn end_to_end_destroy_then_sign_then_verify() {
+        // The shipped use case: destroy an overlay, sign the
+        // returned receipt under a host-identity key, hand the
+        // envelope to an auditor.
+        let (mgr, _dir) = manager();
+        let h = mgr.create_overlay("acme", "wkl").await.unwrap();
+        std::fs::write(h.root.join("a.txt"), b"hello").unwrap();
+        std::fs::write(h.root.join("b.bin"), b"world").unwrap();
+        let receipt = mgr.destroy_overlay("acme", "wkl").await.unwrap();
+        assert_eq!(receipt.files_wiped, 2);
+        assert_eq!(receipt.bytes_wiped, 10);
+
+        let key = SigningKey::generate(&mut OsRng);
+        let signed = sign_destruction_receipt(&receipt, &key);
+        let verified = verify_destruction_receipt(&signed, Some(&key.verifying_key())).unwrap();
+        assert_eq!(verified.tenant, "acme");
+        assert_eq!(verified.workload, "wkl");
+        assert_eq!(verified.files_wiped, 2);
+        assert_eq!(verified.bytes_wiped, 10);
     }
 }
