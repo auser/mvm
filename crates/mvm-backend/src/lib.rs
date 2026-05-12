@@ -46,6 +46,7 @@ pub mod image;
 pub mod libkrun;
 pub mod microvm;
 pub mod microvm_nix;
+pub mod mock;
 pub mod network;
 
 // `microsandbox` is the only self-contained backend integration that
@@ -65,6 +66,7 @@ pub use libkrun::LibkrunBackend;
 #[cfg(feature = "backends-microsandbox")]
 pub use microsandbox::MicrosandboxBackend;
 pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
+pub use mock::MockBackend;
 
 /// Crate-wide test serialization for tests that mutate `HOME` or
 /// other process-global env vars. Re-exported from
