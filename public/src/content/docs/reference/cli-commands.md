@@ -22,7 +22,7 @@ description: Complete command reference for mvmctl.
 | `mvmctl up --metrics-port PORT` | Bind a Prometheus metrics endpoint (0 = disabled) |
 | `mvmctl up --watch-config` | Reload ~/.mvm/config.toml automatically when it changes |
 | `mvmctl up --watch` | Watch flake for changes and auto-rebuild + reboot |
-| `mvmctl up --network-preset <preset>` | Network egress policy: `unrestricted` (default), `none`, `registries`, `dev`, `agent` (LLM-inference + GitHub bundle — see [ADR-004](https://github.com/auser/mvm/blob/main/specs/adrs/004-hypervisor-egress-policy.md)) |
+| `mvmctl up --network-preset <preset>` | Network egress policy: `unrestricted` (default), `none`, `registries`, `dev`, `agent` (LLM-inference + GitHub bundle — see [ADR-004](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/004-hypervisor-egress-policy.md)) |
 | `mvmctl up --network-allow host:port` | Allow egress to specific host:port (repeatable, mutually exclusive with preset) |
 | `mvmctl up --seccomp <tier>` | Seccomp profile: `essential`, `minimal`, `standard` (default), `network`, `unrestricted`. Default flipped from `unrestricted` → `standard` per ADR-002 §W1.1. |
 | `mvmctl up --secret KEY:host` | Bind a secret to a domain (repeatable; see [Config & Secrets](/guides/config-secrets/)) |

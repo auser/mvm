@@ -638,7 +638,7 @@ fn download_dev_image(kernel_path: &str, rootfs_path: &str) -> Result<(String, S
 
 fn download_dev_image_inner(kernel_path: &str, rootfs_path: &str) -> Result<(String, String)> {
     let version = env!("CARGO_PKG_VERSION");
-    let base_url = format!("https://github.com/auser/mvm/releases/download/v{version}");
+    let base_url = format!("https://github.com/tinylabscom/mvm/releases/download/v{version}");
     // Detect host arch to download the right image.
     // Apple Silicon (aarch64-darwin) needs aarch64-linux image.
     // Intel Mac (x86_64-darwin) needs x86_64-linux image.
@@ -765,8 +765,9 @@ fn try_fetch_signed_manifest(
 
     // GitHub Actions keyless OIDC: the SAN encodes the workflow URL
     // bound to the tag, and the issuer is GitHub's token endpoint.
-    let expected_identity =
-        format!("https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/v{version}");
+    let expected_identity = format!(
+        "https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/v{version}"
+    );
     let expected_issuer = "https://token.actions.githubusercontent.com";
 
     let manifest = if std::env::var_os("MVM_SKIP_COSIGN_VERIFY").is_some() {
@@ -881,7 +882,7 @@ fn try_fetch_revocation_list() -> Result<Option<mvm_security::image_verify::Revo
 
     // Refresh if cache is stale (or absent).
     if cache_age > twenty_four_hours {
-        let base = "https://github.com/auser/mvm/releases/download/revocations";
+        let base = "https://github.com/tinylabscom/mvm/releases/download/revocations";
         let json_url = format!("{base}/revoked-versions.json");
         let bundle_url = format!("{base}/revoked-versions.json.bundle");
 
@@ -954,8 +955,7 @@ fn try_fetch_revocation_list() -> Result<Option<mvm_security::image_verify::Revo
     // workflow's OIDC identity, not the per-release workflow. A
     // separate identity ensures a leaked image-signing cert can't
     // fabricate a permissive revocation list (and vice versa).
-    let expected_identity =
-        "https://github.com/auser/mvm/.github/workflows/revocations.yml@refs/tags/revocations";
+    let expected_identity = "https://github.com/tinylabscom/mvm/.github/workflows/revocations.yml@refs/tags/revocations";
     let expected_issuer = "https://token.actions.githubusercontent.com";
 
     if std::env::var_os("MVM_SKIP_COSIGN_VERIFY").is_some() {
@@ -1025,8 +1025,9 @@ pub fn cmd_dev_import_image(
     let bundle_bytes = std::fs::read(bundle_path)
         .with_context(|| format!("reading cosign bundle at {bundle_path}"))?;
 
-    let expected_identity =
-        format!("https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/v{version}");
+    let expected_identity = format!(
+        "https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/v{version}"
+    );
     let expected_issuer = "https://token.actions.githubusercontent.com";
 
     let manifest = if std::env::var_os("MVM_SKIP_COSIGN_VERIFY").is_some() {
@@ -1182,12 +1183,9 @@ fn bump_verify_outcome(outcome: &str) {
     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if outcome != "network" {
         let mvmctl_version = env!("CARGO_PKG_VERSION");
-        mvm_core::audit::emit(
-            mvm_core::audit::LocalAuditKind::ImageVerifyFailed,
-            None,
-            Some(&format!(
-                "outcome={outcome} mvmctl_version={mvmctl_version}"
-            )),
+        mvm_core::audit_emit!(
+            ImageVerifyFailed,
+            "outcome={outcome} mvmctl_version={mvmctl_version}"
         );
     }
 }
@@ -1339,7 +1337,7 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
              still in flight. Check the release page or retry in a few\n\
              minutes:\n\
              \n\
-             \x20   https://github.com/auser/mvm/releases/tag/v{version}\n\
+             \x20   https://github.com/tinylabscom/mvm/releases/tag/v{version}\n\
              \n\
              To build locally instead, set up a Nix Linux builder:\n\
              \n\
@@ -1529,7 +1527,7 @@ fn download_default_microvm_image(
     rootfs_path: &str,
 ) -> Result<(String, String)> {
     let version = env!("CARGO_PKG_VERSION");
-    let base_url = format!("https://github.com/auser/mvm/releases/download/v{version}");
+    let base_url = format!("https://github.com/tinylabscom/mvm/releases/download/v{version}");
     let arch = if cfg!(target_arch = "aarch64") {
         "aarch64"
     } else {

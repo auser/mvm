@@ -240,7 +240,7 @@ Triage in this order:
    cosign verify-blob \
      --bundle dev-image-aarch64.manifest.json.bundle \
      --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-     --certificate-identity-regexp "https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/v0.14.0" \
+     --certificate-identity-regexp "https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/v0.14.0" \
      dev-image-aarch64.manifest.json
    ```
    Same identity wording mvmctl uses internally.
@@ -275,9 +275,9 @@ Network failure during the 24-hour revocation-list refresh. mvmctl tolerates up 
 ```bash
 mkdir -p ~/.cache/mvm/revocations
 curl -L -o ~/.cache/mvm/revocations/revoked-versions.json \
-  https://github.com/auser/mvm/releases/download/revocations/revoked-versions.json
+  https://github.com/tinylabscom/mvm/releases/download/revocations/revoked-versions.json
 curl -L -o ~/.cache/mvm/revocations/revoked-versions.json.bundle \
-  https://github.com/auser/mvm/releases/download/revocations/revoked-versions.json.bundle
+  https://github.com/tinylabscom/mvm/releases/download/revocations/revoked-versions.json.bundle
 ```
 
 For air-gapped hosts that can never reach github.com, see [Air-gapped Bootstrap](airgapped-bootstrap).

@@ -857,7 +857,7 @@ fn render_prompt_generated_flake(name: &str, spec: &GeneratedTemplateSpec) -> St
     }
 
     format!(
-        "{{\n  description = \"mvm microVM — {} prompt scaffold\";\n\n  inputs = {{\n    mvm.url = \"github:auser/mvm?dir=nix\";\n    nixpkgs.url = \"github:NixOS/nixpkgs/nixos-25.11\";\n  }};\n\n  outputs = {{ mvm, nixpkgs, ... }}:\n    let\n{}\n    in {{\n      packages.${{system}}.default = mvm.lib.${{system}}.mkGuest {{\n{}\n      }};\n    }};\n}}\n",
+        "{{\n  description = \"mvm microVM — {} prompt scaffold\";\n\n  inputs = {{\n    mvm.url = \"github:tinylabscom/mvm?dir=nix\";\n    nixpkgs.url = \"github:NixOS/nixpkgs/nixos-25.11\";\n  }};\n\n  outputs = {{ mvm, nixpkgs, ... }}:\n    let\n{}\n    in {{\n      packages.${{system}}.default = mvm.lib.${{system}}.mkGuest {{\n{}\n      }};\n    }};\n}}\n",
         spec.primary_preset,
         let_lines.join("\n"),
         body_lines.join("\n")

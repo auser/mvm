@@ -178,7 +178,7 @@ pub fn parse_manifest(bytes: &[u8]) -> VerifyResult<SignedManifest> {
 ///
 /// `expected_identity` is the *exact* SAN that the signing certificate
 /// must carry — e.g.
-/// `https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/v0.14.0`.
+/// `https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/v0.14.0`.
 /// Caller builds it from the manifest's expected version so each tagged
 /// release verifies against its own bound identity. Sigstore's
 /// `Identity` policy is exact-match only; there is no glob/regex

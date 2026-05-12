@@ -25,7 +25,7 @@ export function CTABanner() {
           <a href={`${base}getting-started/quickstart/`}>
             <Button size="lg">Quick Start Guide</Button>
           </a>
-          <a href="https://github.com/auser/mvm" target="_blank" rel="noopener">
+          <a href="https://github.com/tinylabscom/mvm" target="_blank" rel="noopener">
             <Button variant="outline" size="lg">
               View on GitHub
             </Button>

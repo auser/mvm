@@ -45,8 +45,8 @@ sh <(curl -L https://nixos.org/nix/install) --daemon
 . /etc/profile.d/nix.sh
 
 # Install mvmctl
-cargo install --git https://github.com/auser/mvm mvmctl
-# or grab a release binary from https://github.com/auser/mvm/releases
+cargo install --git https://github.com/tinylabscom/mvm mvmctl
+# or grab a release binary from https://github.com/tinylabscom/mvm/releases
 
 # First-time setup
 mvmctl bootstrap

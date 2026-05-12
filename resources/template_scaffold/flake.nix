@@ -4,7 +4,7 @@
   inputs = {
     # mvm provides lib.mkGuest — the microVM image builder.
     # For local development, override with: mvm.url = "path:/path/to/mvm/nix";
-    mvm.url = "github:auser/mvm?dir=nix";
+    mvm.url = "github:tinylabscom/mvm?dir=nix";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
   };
 

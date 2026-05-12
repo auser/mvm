@@ -1,7 +1,7 @@
 You are a senior Rust infrastructure architect and systems designer.
 
 You are working in the existing repository:
-https://github.com/auser/mvm
+https://github.com/tinylabscom/mvm
 
 Your task is to update the architecture and repo layout to match the full multi-tenant OpenClaw microVM fleet design we have discussed, using:
 

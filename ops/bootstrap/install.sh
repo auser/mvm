@@ -4,13 +4,13 @@
 #
 # NEVER run this via curl|bash in production.
 # Download first, verify, then execute:
-#   curl -LO https://github.com/auser/mvm/releases/download/vX.Y.Z/mvm-install.sh
-#   curl -LO https://github.com/auser/mvm/releases/download/vX.Y.Z/checksums-sha256.txt
+#   curl -LO https://github.com/tinylabscom/mvm/releases/download/vX.Y.Z/mvm-install.sh
+#   curl -LO https://github.com/tinylabscom/mvm/releases/download/vX.Y.Z/checksums-sha256.txt
 #   chmod +x mvm-install.sh && ./mvm-install.sh
 
 set -euo pipefail
 
-REPO="auser/mvm"
+REPO="tinylabscom/mvm"
 INSTALL_DIR="/usr/local/bin"
 VERSION=""
 

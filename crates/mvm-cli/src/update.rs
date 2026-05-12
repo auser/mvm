@@ -6,7 +6,7 @@ use crate::http;
 use crate::ui;
 use mvm::shell::run_host;
 
-const GITHUB_REPO: &str = "auser/mvm";
+const GITHUB_REPO: &str = "tinylabscom/mvm";
 
 /// Current version compiled into the binary (from Cargo.toml).
 fn current_version() -> &'static str {

@@ -122,7 +122,7 @@ Docker Desktop on Windows 10/11 uses WSL2 by default. If you've manually switche
 
 ## Anything else
 
-[Open a GitHub issue](https://github.com/auser/mvm/issues) with the output of:
+[Open a GitHub issue](https://github.com/tinylabscom/mvm/issues) with the output of:
 
 ```bash
 mvmctl doctor --json > doctor.json

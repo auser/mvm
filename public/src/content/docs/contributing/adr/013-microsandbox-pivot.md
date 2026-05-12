@@ -5,7 +5,7 @@ description: Architecture Decision Record for the cross-platform microVM pivot �
 
 ## Status
 
-Proposed. Implementation tracked in [Plan 60](https://github.com/auser/mvm/blob/main/specs/plans/60-mvm-microsandbox-migration.md). Phase 0 + Phase 1 deliver the build/exec pivot; subsequent phases compose on top.
+Proposed. Implementation tracked in [Plan 60](https://github.com/tinylabscom/mvm/blob/main/specs/plans/60-mvm-microsandbox-migration.md). Phase 0 + Phase 1 deliver the build/exec pivot; subsequent phases compose on top.
 
 ## Invariant — host does not need Nix
 
@@ -99,7 +99,7 @@ Why this is a stated invariant, not a default:
 ### Negative
 
 - Adds a third-party dep (microvm.nix) to the build trust boundary — pinned by hash and CI-audited (`xtask audit-flake`).
-- Some Linux-specific guarantees (dm-verity at boot, seccomp tier "strict") only hold on the Firecracker path. The microsandbox path uses image-hash-on-load + HMAC chain instead. Documented in the per-backend tier matrix in [ADR-002](https://github.com/auser/mvm/blob/main/specs/adrs/002-microvm-security-posture.md).
+- Some Linux-specific guarantees (dm-verity at boot, seccomp tier "strict") only hold on the Firecracker path. The microsandbox path uses image-hash-on-load + HMAC chain instead. Documented in the per-backend tier matrix in [ADR-002](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/002-microvm-security-posture.md).
 
 ### Fallback (named explicitly)
 
@@ -119,7 +119,7 @@ If a microvm.nix per-bump audit (`xtask audit-flake`) surfaces a security regres
 
 ## Related
 
-- [Plan 60: mvm-microsandbox migration](https://github.com/auser/mvm/blob/main/specs/plans/60-mvm-microsandbox-migration.md) — full implementation roadmap
-- [ADR-002: microVM security posture](https://github.com/auser/mvm/blob/main/specs/adrs/002-microvm-security-posture.md) — per-backend tier matrix
-- [ADR-014: VmBackend single trait](https://github.com/auser/mvm/blob/main/specs/adrs/014-vmbackend-single-trait.md) — the trait surface microsandbox implements
-- [ADR-031: Cross-platform strategy](https://github.com/auser/mvm/blob/main/specs/adrs/031-cross-platform-strategy.md) — Linux native, macOS native, Windows Tauri-only
+- [Plan 60: mvm-microsandbox migration](https://github.com/tinylabscom/mvm/blob/main/specs/plans/60-mvm-microsandbox-migration.md) — full implementation roadmap
+- [ADR-002: microVM security posture](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/002-microvm-security-posture.md) — per-backend tier matrix
+- [ADR-014: VmBackend single trait](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/014-vmbackend-single-trait.md) — the trait surface microsandbox implements
+- [ADR-031: Cross-platform strategy](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/031-cross-platform-strategy.md) — Linux native, macOS native, Windows Tauri-only

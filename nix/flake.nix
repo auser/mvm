@@ -14,7 +14,7 @@
   #
   #   # my-app/flake.nix
   #   {
-  #     inputs.mvm.url = "github:auser/mvm";
+  #     inputs.mvm.url = "github:tinylabscom/mvm";
   #     outputs = { self, mvm, ... }: {
   #       packages.x86_64-linux.default = mvm.lib.x86_64-linux.mkGuest {
   #         name = "my-app";

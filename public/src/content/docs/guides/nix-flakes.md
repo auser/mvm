@@ -10,7 +10,7 @@ mvmctl uses Nix flakes to produce reproducible microVM images. Each build runs `
 ```nix
 {
   inputs = {
-    mvm.url = "github:auser/mvm?dir=nix";
+    mvm.url = "github:tinylabscom/mvm?dir=nix";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
   };
 
@@ -286,7 +286,7 @@ A worked example: a microVM that boots `claude-code` (or any other agent binary)
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    mvm.url     = "github:auser/mvm";
+    mvm.url     = "github:tinylabscom/mvm";
     # Or from numtide/llm-agents.nix for the agent binary.
   };
 
@@ -328,4 +328,4 @@ mvmctl up \
 
 Why a microVM and not a process sandbox: process sandboxes share the host kernel and trust it. A microVM gives the agent its own kernel, so a kernel exploit can't pivot to the host.
 
-Full security composition (per-service uid, seccomp tier, secrets mode, verified boot) is documented in [ADR-002](https://github.com/auser/mvm/blob/main/specs/adrs/002-microvm-security-posture.md) and the [Rootless workloads section](/guides/building-microvm-images#rootless-workloads).
+Full security composition (per-service uid, seccomp tier, secrets mode, verified boot) is documented in [ADR-002](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/002-microvm-security-posture.md) and the [Rootless workloads section](/guides/building-microvm-images#rootless-workloads).

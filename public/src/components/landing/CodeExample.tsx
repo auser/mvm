@@ -15,7 +15,7 @@ mvmctl vm ping`;
 
 const nixFlake = `{
   inputs = {
-    mvm.url = "github:auser/mvm?dir=nix";
+    mvm.url = "github:tinylabscom/mvm?dir=nix";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
   };
 

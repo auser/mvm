@@ -19,7 +19,7 @@ use super::BuildMode;
 ///
 /// This is the SOLE place in the build pipeline that wires in the dev
 /// guest agent. User flakes never reference `nix/dev/`; they always
-/// declare `mvm.url = "github:auser/mvm?dir=nix"` (or a local path
+/// declare `mvm.url = "github:tinylabscom/mvm?dir=nix"` (or a local path
 /// equivalent), which resolves to the production library. mvmctl, by
 /// definition the dev tool, injects these overrides on every `nix build`
 /// it performs so its images get the dev agent (vsock Exec handler
@@ -30,7 +30,7 @@ use super::BuildMode;
 ///   1. `MVM_DEV_FLAKE_URL` env var — escape hatch. When set, used
 ///      verbatim as the override target. The chained `mvm/mvm` override
 ///      is suppressed because callers using this env var are pointing at
-///      a self-contained dev flake (e.g. `github:auser/mvm?dir=nix/dev`
+///      a self-contained dev flake (e.g. `github:tinylabscom/mvm?dir=nix/dev`
 ///      once published) that already pins its own `mvm` input correctly.
 ///   2. Workspace root resolved by walking up from the compile-time
 ///      manifest dir until we find `nix/flake.nix` (parent flake) and

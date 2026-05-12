@@ -60,7 +60,7 @@ pub fn bootstrap_wsl2() -> Result<()> {
              Install it from an elevated PowerShell:\n  \
                  wsl --install\n\
              Then reboot and re-run `mvmctl bootstrap`. See\n  \
-                 https://github.com/auser/mvm/blob/main/public/src/content/docs/install/windows.md"
+                 https://github.com/tinylabscom/mvm/blob/main/public/src/content/docs/install/windows.md"
         );
     }
 

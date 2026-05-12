@@ -233,12 +233,12 @@ check; plan 36 wraps it in cosign verification of the manifest.
 1. Always download the manifest first.
 2. Verify `manifest.json.sig` against `manifest.json.pem` and the
    expected OIDC identity
-   (`https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/v*`)
+   (`https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/v*`)
    using the `sigstore` Rust crate's offline-bundle path.
 3. Pin the version: `manifest.version == env!("CARGO_PKG_VERSION")`
    exactly. No "newer is fine."
 4. **Revocation check** (best-effort, online-only): fetch
-   `https://github.com/auser/mvm/releases/download/revocations/revoked-versions.json`
+   `https://github.com/tinylabscom/mvm/releases/download/revocations/revoked-versions.json`
    at most once per 24h (cache + cosign-verify). If `manifest.version`
    is in the list, hard fail with the recall reason. Network failure is
    non-fatal only if the cached revocation file is fresh (<7d).

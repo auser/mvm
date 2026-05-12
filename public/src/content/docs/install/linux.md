@@ -25,19 +25,19 @@ You **do not need Nix on your host**. mvm bootstraps a small Linux builder micro
 ### One-liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/tinylabscom/mvm/main/install.sh | sh
 ```
 
 ### Pin a version
 
 ```bash
-MVM_VERSION=v0.13.0 curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+MVM_VERSION=v0.13.0 curl -fsSL https://raw.githubusercontent.com/tinylabscom/mvm/main/install.sh | sh
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/auser/mvm.git
+git clone https://github.com/tinylabscom/mvm.git
 cd mvm
 cargo build --release
 install -m 0755 target/release/mvmctl ~/.local/bin/mvmctl
@@ -103,7 +103,7 @@ When `mvmctl build` detects a working host-side Nix that can build Linux derivat
 
 ## Distro-specific notes
 
-- **Ubuntu/Debian** — `apt install qemu-utils e2fsprogs` if you need `mkfs.ext4` for the [smoke test](https://github.com/auser/mvm/blob/main/tests/smoke_microsandbox.rs).
+- **Ubuntu/Debian** — `apt install qemu-utils e2fsprogs` if you need `mkfs.ext4` for the [smoke test](https://github.com/tinylabscom/mvm/blob/main/tests/smoke_microsandbox.rs).
 - **Fedora/RHEL** — `dnf install e2fsprogs qemu-img`. Make sure SELinux isn't blocking `/dev/kvm` access (it usually isn't, but `audit2why` is your friend if it does).
 - **Arch** — `pacman -S e2fsprogs qemu-img`. Already lean.
-- **NixOS** — easiest path: `nix profile install github:auser/mvm`. KVM is enabled by default; `kvm` group membership is the only thing to verify.
+- **NixOS** — easiest path: `nix profile install github:tinylabscom/mvm`. KVM is enabled by default; `kvm` group membership is the only thing to verify.

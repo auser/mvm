@@ -26,7 +26,7 @@ memory_mib = 256
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    mvm.url     = "github:auser/mvm";
+    mvm.url     = "github:tinylabscom/mvm";
   };
 
   outputs = { self, nixpkgs, mvm, ... }: {
@@ -160,7 +160,7 @@ The `mkGuest` library produces a **busybox-as-PID-1** rootfs (no NixOS, no syste
 | microsandbox / libkrun (macOS HVF) | ≤ 300 ms | ≤ 60 ms | macOS path; HVF adds ~100ms over KVM. |
 | Apple Virtualization framework | ≤ 300 ms | ≤ 200 ms | Legacy ladder; superseded by microsandbox per ADR-013. |
 
-The numbers are surfaced on every `mkGuest` derivation as `passthru.mvm.expectedBootMs` so you can `nix eval .#default.passthru.mvm.expectedBootMs` to confirm. Phase 9 enforces with `xtask perf --backend <name> --p50-ms 300 --runs 100`. See [ADR-013 §"Boot-time budget"](https://github.com/auser/mvm/blob/main/specs/adrs/013-microsandbox-libkrun-microvm-nix-pivot.md) for rationale.
+The numbers are surfaced on every `mkGuest` derivation as `passthru.mvm.expectedBootMs` so you can `nix eval .#default.passthru.mvm.expectedBootMs` to confirm. Phase 9 enforces with `xtask perf --backend <name> --p50-ms 300 --runs 100`. See [ADR-013 §"Boot-time budget"](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/013-microsandbox-libkrun-microvm-nix-pivot.md) for rationale.
 
 The floor is achievable because the rootfs uses **busybox-as-PID-1** with a custom `/init` (no NixOS, no systemd, no OpenRC). See [ADR-013](/contributing/adr/013-microsandbox-pivot/) for why this matters and the implementation breadcrumb.
 
@@ -188,7 +188,7 @@ mvm bootstraps a Linux builder microVM on first build (microsandbox-backed; see 
 
 - **Linux**: the builder microVM runs on Firecracker against `/dev/kvm`. Firecracker is also the default runtime backend. If you've opted into host-side Nix and it can build Linux derivations, mvm uses it directly and skips the builder VM.
 - **macOS**: the builder microVM runs on libkrun via Hypervisor.framework — no Lima hop. The resulting microVM is then booted on the same backend. If you already have [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) or a remote `nix-daemon` configured, mvm detects and uses it instead.
-- **Windows**: Tauri-only (the `mvm-studio` desktop app packages a WSL2-backed builder + runtime). See [ADR-031](https://github.com/auser/mvm/blob/main/specs/adrs/031-cross-platform-strategy.md).
+- **Windows**: Tauri-only (the `mvm-studio` desktop app packages a WSL2-backed builder + runtime). See [ADR-031](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/031-cross-platform-strategy.md).
 
 ## Rootless workloads
 

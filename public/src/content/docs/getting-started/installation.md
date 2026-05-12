@@ -6,19 +6,19 @@ description: Install mvmctl on macOS or Linux.
 ## One-Liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/tinylabscom/mvm/main/install.sh | sh
 ```
 
 ## Pin a Version
 
 ```bash
-MVM_VERSION=v0.7.0 curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+MVM_VERSION=v0.7.0 curl -fsSL https://raw.githubusercontent.com/tinylabscom/mvm/main/install.sh | sh
 ```
 
 ## From Source
 
 ```bash
-git clone https://github.com/auser/mvm.git
+git clone https://github.com/tinylabscom/mvm.git
 cd mvm
 cargo build --release
 cp target/release/mvmctl ~/.local/bin/

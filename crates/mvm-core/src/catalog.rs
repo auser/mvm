@@ -11,7 +11,7 @@ pub struct CatalogEntry {
     pub name: String,
     /// Short description of the image.
     pub description: String,
-    /// Nix flake reference (e.g. "github:auser/mvm-images#minimal").
+    /// Nix flake reference (e.g. "github:tinylabscom/mvm-images#minimal").
     pub flake_ref: String,
     /// Nix profile to build (e.g. "minimal", "gateway").
     pub profile: String,
@@ -69,7 +69,7 @@ mod tests {
                 CatalogEntry {
                     name: "minimal".to_string(),
                     description: "Bare-bones microVM image".to_string(),
-                    flake_ref: "github:auser/mvm-images#minimal".to_string(),
+                    flake_ref: "github:tinylabscom/mvm-images#minimal".to_string(),
                     profile: "minimal".to_string(),
                     default_cpus: 1,
                     default_memory_mib: 256,
@@ -78,7 +78,7 @@ mod tests {
                 CatalogEntry {
                     name: "http-server".to_string(),
                     description: "Nginx-based HTTP server".to_string(),
-                    flake_ref: "github:auser/mvm-images#http".to_string(),
+                    flake_ref: "github:tinylabscom/mvm-images#http".to_string(),
                     profile: "http".to_string(),
                     default_cpus: 2,
                     default_memory_mib: 512,
@@ -87,7 +87,7 @@ mod tests {
                 CatalogEntry {
                     name: "postgres".to_string(),
                     description: "PostgreSQL database server".to_string(),
-                    flake_ref: "github:auser/mvm-images#postgres".to_string(),
+                    flake_ref: "github:tinylabscom/mvm-images#postgres".to_string(),
                     profile: "postgres".to_string(),
                     default_cpus: 2,
                     default_memory_mib: 1024,

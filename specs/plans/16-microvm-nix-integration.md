@@ -18,7 +18,7 @@ Users never reference microvm.nix directly. mvm's flake internally pulls in micr
 ```nix
 {
   inputs = {
-    mvm.url = "github:auser/mvm";
+    mvm.url = "github:tinylabscom/mvm";
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
   };
 
@@ -257,7 +257,7 @@ Rewrite `nix/openclaw/flake.nix` — becomes trivial:
 ```nix
 {
   inputs = {
-    mvm.url = "path:../../";  # or github:auser/mvm
+    mvm.url = "path:../../";  # or github:tinylabscom/mvm
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-24.11";
   };
 
@@ -290,7 +290,7 @@ Rewrite `nix/openclaw/flake.nix` — becomes trivial:
 
 ```nix
 {
-  inputs.mvm.url = "github:auser/mvm";
+  inputs.mvm.url = "github:tinylabscom/mvm";
 
   outputs = { mvm, ... }:
     let system = "aarch64-linux"; # change to x86_64-linux if needed
