@@ -133,14 +133,27 @@ impl ToolRegistry {
         }
     }
 
-    /// Build with the default tool set: every Phase 7 builtin
-    /// implementing `Default + HostMediatedTool` is registered.
-    /// Today: `mvm.time_now`. Future slices grow this list as
-    /// `web_search`, `web_fetch`, `upload`, `download`, `code_eval`
-    /// land.
+    /// Build with the default tool set: every Phase 7 builtin is
+    /// registered with its fail-closed `Default::default()` config.
+    ///
+    /// Today's registrations:
+    ///
+    /// - `mvm.time_now` — always reachable; no allowlist needed
+    ///   (pure host-clock read with no upstream).
+    /// - `mvm.web_fetch` — fail-closed by default (empty host
+    ///   allowlist + [`web_fetch::NoopHttpFetcher`]). Operators
+    ///   call [`Self::register`] with a configured
+    ///   [`web_fetch::WebFetchTool`] to enable.
+    /// - `mvm.web_search` — fail-closed by default (empty provider
+    ///   allowlist + [`web_search::NoopSearchProvider`]).
+    ///
+    /// Future slices grow this list as `upload`, `download`, and
+    /// `code_eval` land.
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
         r.register(Box::new(time_now::TimeNowTool));
+        r.register(Box::new(web_fetch::WebFetchTool::default()));
+        r.register(Box::new(web_search::WebSearchTool::default()));
         r
     }
 
@@ -293,10 +306,58 @@ mod tests {
     }
 
     #[test]
-    fn with_defaults_registers_time_now() {
+    fn with_defaults_registers_all_three_phase_7_builtins() {
+        // The Phase 7 substrate ships three tools out of the box.
+        // `time_now` is reachable; `web_fetch` and `web_search` are
+        // wired with fail-closed defaults so an operator who calls
+        // them without configuring an allowlist gets a clear
+        // "not on allowlist" or "fetcher not wired" error.
         let r = ToolRegistry::with_defaults();
-        assert!(r.is_registered("mvm.time_now"));
-        assert!(r.names().contains(&"mvm.time_now"));
+        for builtin in ["mvm.time_now", "mvm.web_fetch", "mvm.web_search"] {
+            assert!(
+                r.is_registered(builtin),
+                "default registry must include {builtin}"
+            );
+        }
+        assert_eq!(r.names().len(), 3);
+    }
+
+    #[tokio::test]
+    async fn with_defaults_web_fetch_is_fail_closed() {
+        // Sanity: a fresh registry hands out a `WebFetchTool` that
+        // refuses every host. This is the contract that lets
+        // operators ship the substrate with no per-tenant config and
+        // not accidentally leak.
+        let r = ToolRegistry::with_defaults();
+        let err = r
+            .invoke(
+                "mvm.web_fetch",
+                serde_json::json!({ "url": "https://x.example/" }),
+            )
+            .await
+            .unwrap_err();
+        match err {
+            ToolInvokeError::Upstream { tool, message } => {
+                assert_eq!(tool, "mvm.web_fetch");
+                assert!(message.contains("not on per-tenant allowlist"), "{message}");
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn with_defaults_web_search_is_fail_closed() {
+        let r = ToolRegistry::with_defaults();
+        let err = r
+            .invoke("mvm.web_search", serde_json::json!({ "query": "x" }))
+            .await
+            .unwrap_err();
+        match err {
+            ToolInvokeError::Upstream { tool, .. } => {
+                assert_eq!(tool, "mvm.web_search");
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
     }
 
     #[test]
