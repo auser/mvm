@@ -24,6 +24,15 @@
 //!   `resolve()` returns an error mentioning the SSRF guard so
 //!   the operator sees the cause; if *any* IPs survive, only the
 //!   safe set is handed to reqwest.
+//! - **W7 — TLS 1.3 minimum**: `min_tls_version` pinned to
+//!   [`reqwest::tls::Version::TLS_1_3`]. TLS 1.2 is acceptable
+//!   today but only TLS 1.3 mandates forward secrecy on every
+//!   cipher suite, drops the static-RSA key-exchange escape
+//!   hatch, and removes the legacy MAC-then-encrypt construction.
+//!   All Phase-7-targeted upstreams (Brave / Tavily / Google /
+//!   OpenAI / Anthropic / Cloudflare / AWS / Azure / GCP) support
+//!   TLS 1.3; pinning the floor at 1.3 closes a downgrade vector
+//!   without breaking any legitimate operator workflow.
 //!
 //! ## Difference from [`crate::tools::web_fetch::ReqwestHttpFetcher`]'s pre-resolve
 //!
@@ -49,14 +58,21 @@ use reqwest::dns::{Addrs, Name, Resolve, Resolving};
 
 use crate::ssrf_guard::SsrfGuard;
 
-/// Build a `reqwest::ClientBuilder` pre-configured with W1 + W2
-/// hardening. Callers add their own per-tool config (headers,
-/// user-agent, etc.) before `.build()`.
+/// Minimum TLS version every Phase 7 reqwest client accepts.
+/// Plan 65 W7 — pin at TLS 1.3 to mandate forward secrecy +
+/// AEAD-only ciphers + remove the static-RSA + MAC-then-encrypt
+/// legacy paths. All operator-likely upstreams support 1.3.
+pub const MIN_TLS_VERSION: reqwest::tls::Version = reqwest::tls::Version::TLS_1_3;
+
+/// Build a `reqwest::ClientBuilder` pre-configured with W1, W2,
+/// and W7 hardening. Callers add their own per-tool config
+/// (headers, user-agent, etc.) before `.build()`.
 pub fn hardened_client_builder(timeout_secs: u64) -> reqwest::ClientBuilder {
     reqwest::Client::builder()
         .timeout(Duration::from_secs(timeout_secs))
         .redirect(reqwest::redirect::Policy::none())
         .dns_resolver(Arc::new(SsrfFilteringResolver))
+        .min_tls_version(MIN_TLS_VERSION)
 }
 
 /// reqwest `Resolve` impl that delegates to the system resolver
@@ -217,6 +233,16 @@ mod tests {
         // accidentally breaks the chain.
         let client = hardened_client_builder(15).build();
         assert!(client.is_ok());
+    }
+
+    #[test]
+    fn w7_min_tls_version_is_pinned_at_1_3() {
+        // Plan 65 W7 pin: the MIN_TLS_VERSION constant must remain
+        // at TLS 1.3. A future refactor that loosens it (e.g. for
+        // a one-off legacy upstream) needs to update the plan-65
+        // doc + flip this assertion explicitly. The pin keeps the
+        // hardening posture visible from a one-line grep.
+        assert_eq!(MIN_TLS_VERSION, reqwest::tls::Version::TLS_1_3);
     }
 
     // ──────────────────────────────────────────────────────────────

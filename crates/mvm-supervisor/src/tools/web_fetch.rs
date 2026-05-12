@@ -212,9 +212,14 @@ impl ReqwestHttpFetcher {
         host: &str,
         safe_addresses: Vec<SocketAddr>,
     ) -> Result<reqwest::Client, FetchError> {
+        // Plan 65 W7 — pin TLS to 1.3 minimum. Matches the
+        // shared `http_hardening::hardened_client_builder` so
+        // every reqwest-using surface in mvm-supervisor refuses
+        // downgrade to TLS 1.2.
         let mut builder = reqwest::Client::builder()
             .timeout(std::time::Duration::from_secs(self.timeout_secs))
-            .redirect(reqwest::redirect::Policy::none());
+            .redirect(reqwest::redirect::Policy::none())
+            .min_tls_version(crate::tools::http_hardening::MIN_TLS_VERSION);
         if self.enforce_ssrf {
             let mut pins = HashMap::new();
             pins.insert(host.to_string(), safe_addresses);

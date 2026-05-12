@@ -237,6 +237,54 @@ clean. The W4 resolver tests continue to verify the end-to-end
 secret-store pathway, now returning `SecretBox<String>` rather
 than `String`.
 
+### W7 — TLS 1.3 minimum on every reqwest client (SHIPPED)
+
+**Status (2026-05-11 — ✅ shipped):**
+
+**Threat:** Every Phase 7 surface that talks to an upstream
+(`ReqwestHttpFetcher`, the three search providers) inherits
+reqwest's TLS-version defaults. Reqwest with `rustls-tls`
+historically allowed TLS 1.2 as the floor. TLS 1.2 supports
+cipher suites without forward secrecy (static-RSA key exchange)
+and the MAC-then-encrypt construction (which has a documented
+oracle-attack history — Lucky13, etc.). Even when a *given*
+upstream negotiates TLS 1.3, a downgrade-attack vector exists
+during the handshake.
+
+The threat is real but small in practice: all operator-likely
+upstreams (Brave / Tavily / Google Custom Search / OpenAI /
+Anthropic / Cloudflare / AWS / Azure / GCP) advertise TLS 1.3
+in their `ClientHello`. The downgrade vector is closed by
+pinning the floor at 1.3 explicitly.
+
+**Mitigation (shipped):** The `http_hardening` module exports
+`MIN_TLS_VERSION = TLS_1_3`; the `hardened_client_builder` sets
+`.min_tls_version(MIN_TLS_VERSION)`. `ReqwestHttpFetcher`'s
+per-call builder reads the same constant. A `tracing::warn` is
+not needed at runtime because a TLS 1.2-only upstream would
+surface a handshake-failure error to the operator.
+
+A unit test (`w7_min_tls_version_is_pinned_at_1_3`) pins the
+constant so a future refactor that loosens it (e.g. for a
+one-off legacy upstream) needs to update this plan + flip the
+assertion explicitly. The pin keeps the hardening posture
+visible from a one-line grep.
+
+**Trade-off accepted:** Operators talking to legacy TLS 1.2-only
+upstreams hit a handshake failure. The Phase 7 use case (LLM
+agent → modern API) doesn't surface any such upstream in
+practice; if an operator needs one, they wrap the upstream in a
+TLS 1.3 reverse proxy on the host side.
+
+**Out of scope (deferred):**
+
+- **Cipher-suite pinning** within TLS 1.3. rustls defaults to a
+  good set (TLS_AES_256_GCM_SHA384, TLS_CHACHA20_POLY1305_SHA256,
+  TLS_AES_128_GCM_SHA256). No operationally relevant attack
+  shapes this further.
+- **TLS 1.2 with cipher-suite filtering** as a fallback for
+  legacy environments. Adds matrix complexity without a use case.
+
 ## Already-considered, not a hole
 
 These came up during the threat survey and are documented here
@@ -274,7 +322,8 @@ so a future audit doesn't re-flag them:
 | 4 | W4 | `resolve_provider_credential` falls back to `mvm_security::secret_store` | direct-wins / fallback / miss / empty-direct | `69a5440` |
 | 5 (follow-on) | W1 + W2 for providers | `http_hardening::hardened_client_builder` + `SsrfFilteringResolver` consumed by Brave/Tavily/Google | filter-passes-public / rejects-loopback/imds/rfc1918 / partial-mix | `8acbc4c` |
 | 6 (follow-on) | DoS-via-huge-response | `http_hardening::read_capped` + 1 MiB default; providers parse from capped bytes | read-capped-* live-HTTP | `a437c0e` |
-| 7 — W6 | Provider credential lifetime | Brave/Tavily/Google `api_key` + Google `cse_id` switch to `SecretBox<String>`; constructors require `SecretBox` at type level; `resolve_provider_credential` returns `Option<SecretBox<String>>` end-to-end (no intermediate `String` clone) | secret-types xtask + all existing tests | (this commit) |
+| 7 — W6 | Provider credential lifetime | Brave/Tavily/Google `api_key` + Google `cse_id` switch to `SecretBox<String>`; constructors require `SecretBox` at type level; `resolve_provider_credential` returns `Option<SecretBox<String>>` end-to-end (no intermediate `String` clone) | secret-types xtask + all existing tests | `6d12fc5` |
+| 8 — W7 | TLS 1.3 minimum on every reqwest client | `http_hardening::MIN_TLS_VERSION = TLS_1_3`; both `hardened_client_builder` (providers) and `ReqwestHttpFetcher::build_client` (web_fetch) pin via `.min_tls_version(MIN_TLS_VERSION)` | `w7_min_tls_version_is_pinned_at_1_3` constant pin | (this commit) |
 
 Each slice lands as a separate commit with workspace tests +
 clippy `-D warnings` + secret-types xtask all clean.
