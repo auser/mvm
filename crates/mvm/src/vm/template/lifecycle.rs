@@ -992,7 +992,7 @@ fn require_local_template_fs() -> Result<()> {
 /// Resolve a built template to its current artifact paths.
 ///
 /// Returns `(spec, vmlinux, initrd, rootfs, revision_hash)`.
-/// The artifact paths are absolute and valid inside the Lima VM.
+/// The artifact paths are absolute and valid inside the dev VM.
 #[instrument(skip_all, fields(template_id = id))]
 pub fn template_artifacts(
     id: &str,
