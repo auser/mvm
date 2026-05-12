@@ -3,7 +3,6 @@
     "microvm": {
       "inputs": {
         "nixpkgs": [
-          "mvm",
           "nixpkgs"
         ],
         "spectrum": "spectrum"
@@ -22,22 +21,6 @@
         "type": "github"
       }
     },
-    "mvm": {
-      "inputs": {
-        "microvm": "microvm",
-        "mvm-workspace": "mvm-workspace",
-        "nixpkgs": "nixpkgs"
-      },
-      "locked": {
-        "path": "../..",
-        "type": "path"
-      },
-      "original": {
-        "path": "../..",
-        "type": "path"
-      },
-      "parent": []
-    },
     "mvm-workspace": {
       "flake": false,
       "locked": {
@@ -48,9 +31,7 @@
         "path": "..",
         "type": "path"
       },
-      "parent": [
-        "mvm"
-      ]
+      "parent": []
     },
     "nixpkgs": {
       "locked": {
@@ -70,11 +51,9 @@
     },
     "root": {
       "inputs": {
-        "mvm": "mvm",
-        "nixpkgs": [
-          "mvm",
-          "nixpkgs"
-        ]
+        "microvm": "microvm",
+        "mvm-workspace": "mvm-workspace",
+        "nixpkgs": "nixpkgs"
       }
     },
     "spectrum": {
