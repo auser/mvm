@@ -4170,6 +4170,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tracing",
+ "url",
 ]
 
 [[package]]

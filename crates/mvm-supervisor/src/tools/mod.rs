@@ -49,6 +49,7 @@
 //!    substrate does not pre-allowlist anything).
 
 pub mod time_now;
+pub mod web_fetch;
 
 use std::collections::BTreeMap;
 
@@ -191,13 +192,10 @@ impl ToolRegistry {
         let Some(tool) = self.tools.get(name) else {
             let err = ToolInvokeError::UnknownTool {
                 tool: name.to_string(),
-                available: self
-                    .names()
-                    .into_iter()
-                    .map(String::from)
-                    .collect(),
+                available: self.names().into_iter().map(String::from).collect(),
             };
-            self.emit_audit(name, "failed", Some(&err.to_string())).await;
+            self.emit_audit(name, "failed", Some(&err.to_string()))
+                .await;
             return Err(err);
         };
         let result = tool.invoke(params).await;
@@ -218,10 +216,7 @@ impl ToolRegistry {
         if let Some(err) = error {
             extras.push(("error".to_string(), err.to_string()));
         }
-        if let Err(e) = rec
-            .record_unbound(EventCategory::Cmd, event, extras)
-            .await
-        {
+        if let Err(e) = rec.record_unbound(EventCategory::Cmd, event, extras).await {
             tracing::warn!(error = %e, tool = name, "tool audit emit failed");
         }
     }
@@ -346,16 +341,11 @@ mod tests {
     #[tokio::test]
     async fn invoke_emits_completed_audit_on_success() {
         let (reg, signer) = build_registry_with_recorder();
-        reg.invoke("mvm.echo", serde_json::json!({}))
-            .await
-            .unwrap();
+        reg.invoke("mvm.echo", serde_json::json!({})).await.unwrap();
         let entries = signer.entries();
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].event, "cmd.tool.mvm.echo.completed");
-        assert_eq!(
-            entries[0].labels.get("tool"),
-            Some(&"mvm.echo".to_string())
-        );
+        assert_eq!(entries[0].labels.get("tool"), Some(&"mvm.echo".to_string()));
         assert_eq!(
             entries[0].labels.get("phase"),
             Some(&"completed".to_string())
