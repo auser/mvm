@@ -65,8 +65,37 @@ The auditor has three pieces of evidence:
 
 ### Verifying with the supplied pubkey
 
-A Rust verifier (the operator runs `mvm` already, but a third
-party can lift `mvm::vm::overlay` into their own check):
+The simplest path is the CLI verb — same `mvmctl` binary the
+operator runs, but `audit verify-cert` is read-only + makes no
+network calls so an auditor can run it on a freshly installed
+host without touching state:
+
+```bash
+# Verify against the operator's claimed pubkey
+$ mvmctl audit verify-cert certs.json --pubkey operator-pubkey.b64
+mvmctl audit verify-cert: 3 certificate(s) verified
+  ✓ acme/build-runner: 42 file(s), 1048576 byte(s) wiped at 2026-05-11T18:00:00Z
+  ✓ acme/code-eval: 8 file(s), 524288 byte(s) wiped at 2026-05-11T18:00:01Z
+  ✓ acme/test-runner: 17 file(s), 65536 byte(s) wiped at 2026-05-11T18:00:02Z
+
+# Or pipe it in
+$ cat certs.json | mvmctl audit verify-cert - --pubkey operator-pubkey.b64
+
+# Or get JSON back (verified receipts, no signatures)
+$ mvmctl audit verify-cert certs.json --pubkey operator-pubkey.b64 --json
+```
+
+The command exits non-zero on any failure: `SignatureInvalid`
+(tenant rename, files_wiped padding, timestamp shift, anything
+that touches the receipt fields after signing), `PubkeyMismatch`
+(certificate's embedded `signer_pubkey` doesn't match the
+`--pubkey` file), `UnsupportedVersion` (future v2+ certificate
+the auditor's verifier hasn't been updated to parse), or a
+parse error on the cert / pubkey file.
+
+If the auditor prefers Rust (e.g., embedding the check into
+their own audit pipeline), the same `mvm::vm::overlay` module
+exports `verify_destruction_receipt`:
 
 ```rust
 use mvm::vm::overlay::{verify_destruction_receipt, SignedDestructionReceipt};
@@ -94,13 +123,8 @@ for cert in &certs {
 }
 ```
 
-`verify_destruction_receipt` returns `Err(SignatureInvalid)` if
-*any* field of the embedded receipt was tampered after signing
-— tenant rename, files_wiped padding, timestamp shift, all
-fail. It also surfaces `PubkeyMismatch` if the certificate's
-embedded `signer_pubkey` doesn't match the operator's claimed
-pubkey, and `UnsupportedVersion` for future v2+ certificates the
-auditor's verifier hasn't been updated to parse.
+Both paths produce the same verdict — the CLI is a thin wrapper
+over the same `verify_destruction_receipt` function.
 
 ### Cross-referencing the audit chain
 
