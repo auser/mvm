@@ -1,5 +1,5 @@
 //! Plan 60 Phase 4 — every CLI subcommand must declare its audit
-//! posture.
+//! posture, at every level of the clap tree.
 //!
 //! Plan 60 §"Phase 4 — Persistent observability" exit test
 //! `every_command_emits_audit_entry` is the eventual goal: drive
@@ -8,38 +8,37 @@
 //! every command (many need a running VM, lima, or network), so it
 //! grows incrementally as commands gain testable setups.
 //!
-//! What this scaffold ships *now* is the **enforcement that every
-//! command has a declared audit posture**. The test walks
-//! `mvm_cli::cli_command()` to enumerate every subcommand and checks
-//! each against a static [`AUDIT_POSTURE`] table. Adding a new CLI
-//! subcommand without a corresponding entry in the table is a
-//! compile-time-equivalent failure: the test fails until the new
-//! command is classified.
+//! What this scaffold ships is the **enforcement that every command
+//! has a declared audit posture**, recursively. The test walks
+//! `mvm_cli::cli_command()` and checks each leaf — top-level
+//! subcommands AND the leaves of every `DelegatesToSub` subgroup —
+//! against a static [`AUDIT_POSTURE`] table. Adding a new CLI verb
+//! (top-level or nested) without a corresponding entry fails the
+//! test until the new verb is classified.
 //!
 //! Each subcommand is classified as one of:
 //!
 //! - [`AuditPosture::Emits`] — the command MUST emit ≥1 audit entry on
 //!   success. The entry kind is named (`LocalAuditKind::*` or a
-//!   `plan.*` chain event). Future work: drive the command and assert
-//!   the named entry appears.
+//!   `plan.*` chain event).
 //! - [`AuditPosture::ReadOnly`] — the command only reads host state.
-//!   No audit entry expected. Examples: `ls`, `logs`, `diff`,
-//!   `metrics`, `audit tail`, `doctor`. Tightening to "ReadOnly
-//!   commands emit a `cmd.read` audit entry" is a separate slice.
+//!   No audit entry expected.
 //! - [`AuditPosture::DelegatesToSub`] — the verb is a subcommand
-//!   group (e.g., `manifest`, `network`, `volume`); the leaves of
-//!   each subgroup carry their own audit posture. This scaffold
-//!   covers the top-level Commands enum only; per-subgroup coverage
-//!   ships in follow-on slices.
+//!   group; its inner table classifies the leaves. The walk
+//!   descends recursively for each `DelegatesToSub`, so nested
+//!   subgroups (e.g. `manifest tag add`) are covered to arbitrary
+//!   depth without special-casing.
 //! - [`AuditPosture::InteractiveOrControl`] — interactive PTY surface
-//!   (`console`, `exec`, `dev`), shell/installer surfaces (`bootstrap`,
-//!   `init`, `shell-init`), or pure control-plane commands (`mcp`)
-//!   that have their own audit channels (e.g., MCP emits
-//!   `McpToolsCallRun` per tool call). The top-level command itself
-//!   doesn't emit a single entry; the inner protocol does.
+//!   (`console`, `exec`, `dev`), shell/installer surfaces
+//!   (`bootstrap`, `init`, `shell-init`), or pure control-plane
+//!   commands (`mcp`) whose audit channel is the inner protocol.
 //!
-//! Adding a new posture variant or refining the table is a
-//! deliberate change — the test is the source of truth.
+//! When a clap subcommand has its own subcommands but its posture
+//! here is NOT `DelegatesToSub` (e.g. `audit` is `ReadOnly` even
+//! though it has tail/verify/show leaves, all of which are read-
+//! only), the walk doesn't drill — the operator-facing classification
+//! is the unit. Promote to `DelegatesToSub(inner)` to enforce
+//! per-leaf coverage there.
 
 use std::collections::BTreeMap;
 
@@ -49,9 +48,107 @@ use std::collections::BTreeMap;
 enum AuditPosture {
     Emits(&'static str),
     ReadOnly,
-    DelegatesToSub,
+    DelegatesToSub(&'static [(&'static str, AuditPosture)]),
     InteractiveOrControl,
 }
+
+// ──────────────────────────────────────────────────────────────────
+// Per-subgroup leaf tables.
+// ──────────────────────────────────────────────────────────────────
+
+const MANIFEST_TAG: &[(&str, AuditPosture)] = &[
+    ("add", AuditPosture::Emits("ManifestTagAdd")),
+    ("rm", AuditPosture::Emits("ManifestTagRemove")),
+    ("ls", AuditPosture::ReadOnly),
+];
+
+const MANIFEST_ALIAS: &[(&str, AuditPosture)] = &[
+    ("set", AuditPosture::Emits("ManifestAliasSet")),
+    ("rm", AuditPosture::Emits("ManifestAliasRemove")),
+    ("ls", AuditPosture::ReadOnly),
+];
+
+const MANIFEST_SUB: &[(&str, AuditPosture)] = &[
+    ("ls", AuditPosture::ReadOnly),
+    ("info", AuditPosture::ReadOnly),
+    ("rm", AuditPosture::Emits("SlotRemove")),
+    ("prune", AuditPosture::Emits("SlotPrune")),
+    ("verify", AuditPosture::ReadOnly),
+    ("tag", AuditPosture::DelegatesToSub(MANIFEST_TAG)),
+    ("alias", AuditPosture::DelegatesToSub(MANIFEST_ALIAS)),
+];
+
+const STORAGE_SUB: &[(&str, AuditPosture)] = &[
+    ("info", AuditPosture::ReadOnly),
+    ("gc", AuditPosture::Emits("StorageGc")),
+];
+
+const NETWORK_SUB: &[(&str, AuditPosture)] = &[
+    ("create", AuditPosture::Emits("NetworkCreate")),
+    ("list", AuditPosture::ReadOnly),
+    ("inspect", AuditPosture::ReadOnly),
+    ("remove", AuditPosture::Emits("NetworkRemove")),
+];
+
+const CACHE_SUB: &[(&str, AuditPosture)] = &[
+    ("info", AuditPosture::ReadOnly),
+    ("prune", AuditPosture::Emits("CachePrune")),
+];
+
+const VOLUME_SUB: &[(&str, AuditPosture)] = &[
+    ("mount", AuditPosture::Emits("VmVolumeAdd")),
+    ("ls", AuditPosture::ReadOnly),
+    ("unmount", AuditPosture::Emits("VmVolumeRemove")),
+];
+
+const SECRET_SUB: &[(&str, AuditPosture)] = &[
+    ("put", AuditPosture::Emits("SecretPut")),
+    ("get", AuditPosture::Emits("SecretGet")),
+    ("ls", AuditPosture::ReadOnly),
+    ("rm", AuditPosture::Emits("SecretRm")),
+];
+
+const ATTEST_SUB: &[(&str, AuditPosture)] = &[
+    ("export", AuditPosture::ReadOnly),
+    ("verify", AuditPosture::ReadOnly),
+    ("status", AuditPosture::ReadOnly),
+];
+
+const POLICY_SUB: &[(&str, AuditPosture)] = &[
+    ("show", AuditPosture::ReadOnly),
+    ("verify", AuditPosture::ReadOnly),
+    // `policy update` is stubbed pending the mvmd-signed-plan flow
+    // (plan 60 Phase 8). Once it lands, this row flips to
+    // `Emits("PolicyApply")`.
+    ("update", AuditPosture::InteractiveOrControl),
+];
+
+const SESSION_SUB: &[(&str, AuditPosture)] = &[
+    ("start", AuditPosture::Emits("SessionStart")),
+    ("ls", AuditPosture::ReadOnly),
+    ("info", AuditPosture::ReadOnly),
+    ("attach", AuditPosture::InteractiveOrControl),
+    ("exec", AuditPosture::InteractiveOrControl),
+    ("run-code", AuditPosture::InteractiveOrControl),
+    ("console", AuditPosture::InteractiveOrControl),
+    ("kill", AuditPosture::Emits("Kill")),
+    ("set-timeout", AuditPosture::Emits("VmTtlSet")),
+    ("reap", AuditPosture::Emits("Kill")),
+];
+
+const PROC_SUB: &[(&str, AuditPosture)] = &[
+    ("start", AuditPosture::Emits("VmProcStart")),
+    ("ls", AuditPosture::ReadOnly),
+    ("signal", AuditPosture::Emits("VmProcSignal")),
+    ("kill", AuditPosture::Emits("Kill")),
+    ("stdin", AuditPosture::Emits("VmProcStdin")),
+    ("wait", AuditPosture::ReadOnly),
+];
+
+const SNAPSHOT_SUB: &[(&str, AuditPosture)] = &[
+    ("ls", AuditPosture::ReadOnly),
+    ("rm", AuditPosture::Emits("SnapshotDelete")),
+];
 
 /// Every top-level `mvmctl` subcommand keyed by its clap name.
 ///
@@ -78,17 +175,17 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("console", AuditPosture::InteractiveOrControl),
     ("exec", AuditPosture::InteractiveOrControl),
     ("invoke", AuditPosture::Emits("plan.admitted+plan.launched")),
-    ("session", AuditPosture::DelegatesToSub),
+    ("session", AuditPosture::DelegatesToSub(SESSION_SUB)),
     ("set-ttl", AuditPosture::Emits("VmTtlSet")),
     ("fs", AuditPosture::Emits("VmFsMutate")),
-    ("proc", AuditPosture::DelegatesToSub),
+    ("proc", AuditPosture::DelegatesToSub(PROC_SUB)),
     ("pause", AuditPosture::Emits("VmStop")),
     ("resume", AuditPosture::Emits("VmStart")),
-    ("snapshot", AuditPosture::DelegatesToSub),
-    ("volume", AuditPosture::DelegatesToSub),
+    ("snapshot", AuditPosture::DelegatesToSub(SNAPSHOT_SUB)),
+    ("volume", AuditPosture::DelegatesToSub(VOLUME_SUB)),
     // Build / artifact / registry.
-    ("manifest", AuditPosture::DelegatesToSub),
-    ("storage", AuditPosture::DelegatesToSub),
+    ("manifest", AuditPosture::DelegatesToSub(MANIFEST_SUB)),
+    ("storage", AuditPosture::DelegatesToSub(STORAGE_SUB)),
     ("build", AuditPosture::Emits("TemplateBuild")),
     ("validate", AuditPosture::ReadOnly),
     ("catalog", AuditPosture::ReadOnly),
@@ -96,78 +193,149 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("metrics", AuditPosture::ReadOnly),
     ("config", AuditPosture::Emits("ConfigChange")),
     ("audit", AuditPosture::ReadOnly),
-    ("network", AuditPosture::DelegatesToSub),
-    ("cache", AuditPosture::DelegatesToSub),
+    ("network", AuditPosture::DelegatesToSub(NETWORK_SUB)),
+    ("cache", AuditPosture::DelegatesToSub(CACHE_SUB)),
     ("mcp", AuditPosture::InteractiveOrControl),
-    ("secret", AuditPosture::DelegatesToSub),
-    ("attest", AuditPosture::DelegatesToSub),
-    // Policy bundle inspector — `show` / `verify` are read-only;
-    // `update` is stubbed pending mvmd-signed plan flow (Phase 8).
-    ("policy", AuditPosture::DelegatesToSub),
+    ("secret", AuditPosture::DelegatesToSub(SECRET_SUB)),
+    ("attest", AuditPosture::DelegatesToSub(ATTEST_SUB)),
+    ("policy", AuditPosture::DelegatesToSub(POLICY_SUB)),
 ];
 
-#[test]
-fn every_top_level_subcommand_has_audit_posture_declared() {
-    let cmd = mvm_cli::commands::cli_command();
-    let declared: BTreeMap<&'static str, AuditPosture> = AUDIT_POSTURE.iter().copied().collect();
+// ──────────────────────────────────────────────────────────────────
+// Recursive walk helpers.
+// ──────────────────────────────────────────────────────────────────
 
-    // Enumerate the clap subcommand names.
-    let clap_names: Vec<String> = cmd
+/// Path through the subcommand tree, e.g. `["manifest", "tag", "add"]`.
+type Path<'a> = Vec<&'a str>;
+
+/// Render a path for error messages: `manifest tag add`.
+fn path_str(path: &[&str]) -> String {
+    path.join(" ")
+}
+
+/// Walk the (declared, clap) trees in lockstep. Reports every leaf
+/// in clap that's missing from the declared table (`missing`) and
+/// every entry in the declared table that's stale w.r.t. clap
+/// (`stale`).
+fn audit_walk(
+    declared: &[(&'static str, AuditPosture)],
+    clap_sub: &clap::Command,
+    parent_path: &[&str],
+    missing: &mut Vec<String>,
+    stale: &mut Vec<String>,
+) {
+    let declared_map: BTreeMap<&'static str, AuditPosture> =
+        declared.iter().copied().collect();
+    let clap_names: Vec<String> = clap_sub
         .get_subcommands()
         .map(|s| s.get_name().to_string())
         .collect();
-
-    // Each clap name must be present in the table.
-    let mut missing_in_table: Vec<&str> = Vec::new();
-    for name in &clap_names {
-        if !declared.contains_key(name.as_str()) {
-            missing_in_table.push(name.as_str());
-        }
-    }
-    assert!(
-        missing_in_table.is_empty(),
-        "{} CLI subcommand(s) lack an audit-posture declaration in \
-         tests/audit_total_coverage.rs::AUDIT_POSTURE: {:?}. \
-         Add an entry (Emits | ReadOnly | DelegatesToSub | \
-         InteractiveOrControl) before merging the new command.",
-        missing_in_table.len(),
-        missing_in_table
-    );
-
-    // Each table entry must correspond to a real clap subcommand —
-    // catches a rename that left a stale row behind.
     let clap_set: std::collections::BTreeSet<&str> =
         clap_names.iter().map(String::as_str).collect();
-    let mut stale_in_table: Vec<&str> = Vec::new();
-    for name in declared.keys() {
-        if !clap_set.contains(name) {
-            stale_in_table.push(name);
+
+    // Missing-in-table: clap names not present in declared.
+    for name in &clap_names {
+        if !declared_map.contains_key(name.as_str()) {
+            let mut p: Path = parent_path.to_vec();
+            p.push(name.as_str());
+            missing.push(path_str(&p));
         }
     }
-    assert!(
-        stale_in_table.is_empty(),
-        "{} stale entry/entries in AUDIT_POSTURE for subcommand(s) the \
-         clap tree no longer exposes: {:?}. Remove the stale row(s) \
-         or rename the entry to match the new clap subcommand name.",
-        stale_in_table.len(),
-        stale_in_table
-    );
+    // Stale-in-table: declared names not present in clap.
+    for name in declared_map.keys() {
+        if !clap_set.contains(name) {
+            let mut p: Path = parent_path.to_vec();
+            p.push(name);
+            stale.push(path_str(&p));
+        }
+    }
+
+    // Recurse into DelegatesToSub entries whose clap subgroup
+    // actually exists.
+    for (name, posture) in declared {
+        if let AuditPosture::DelegatesToSub(inner) = posture
+            && let Some(sub_clap) = clap_sub.find_subcommand(name)
+        {
+            let mut child_path: Path = parent_path.to_vec();
+            child_path.push(name);
+            audit_walk(inner, sub_clap, &child_path, missing, stale);
+        }
+    }
 }
 
 #[test]
-fn audit_posture_table_has_no_duplicate_subcommand_names() {
-    let mut seen: std::collections::BTreeSet<&str> = std::collections::BTreeSet::new();
-    for (name, _) in AUDIT_POSTURE.iter() {
-        assert!(
-            seen.insert(*name),
-            "duplicate AUDIT_POSTURE entry for subcommand {name:?}"
-        );
+fn every_subcommand_at_every_level_has_audit_posture_declared() {
+    let cmd = mvm_cli::commands::cli_command();
+    let mut missing: Vec<String> = Vec::new();
+    let mut stale: Vec<String> = Vec::new();
+    audit_walk(AUDIT_POSTURE, &cmd, &[], &mut missing, &mut stale);
+
+    assert!(
+        missing.is_empty(),
+        "{} CLI subcommand path(s) lack an audit-posture declaration \
+         in tests/audit_total_coverage.rs: {:?}. Add an entry \
+         (Emits | ReadOnly | DelegatesToSub | InteractiveOrControl) \
+         before merging the new command.",
+        missing.len(),
+        missing
+    );
+    assert!(
+        stale.is_empty(),
+        "{} stale audit-posture entry/entries for subcommand path(s) \
+         the clap tree no longer exposes: {:?}. Remove or rename to \
+         match the current clap subcommand name(s).",
+        stale.len(),
+        stale
+    );
+}
+
+/// Visit every `(path, posture)` pair in the declared tree.
+fn for_each_posture(
+    declared: &[(&'static str, AuditPosture)],
+    parent_path: &[&str],
+    visit: &mut impl FnMut(&[&str], AuditPosture),
+) {
+    for (name, posture) in declared {
+        let mut p: Path = parent_path.to_vec();
+        p.push(name);
+        visit(&p, *posture);
+        if let AuditPosture::DelegatesToSub(inner) = posture {
+            for_each_posture(inner, &p, visit);
+        }
     }
+}
+
+#[test]
+fn audit_posture_table_has_no_duplicate_subcommand_names_at_any_level() {
+    // No duplicate name within a single (sub)group. A duplicate
+    // across different parents is fine (e.g. `manifest ls` and
+    // `network list` aren't the same).
+    fn check(group: &[(&'static str, AuditPosture)], parent_path: &[&str]) {
+        let mut seen: std::collections::BTreeSet<&str> =
+            std::collections::BTreeSet::new();
+        for (name, _) in group {
+            assert!(
+                seen.insert(*name),
+                "duplicate AUDIT_POSTURE entry for subcommand {:?} \
+                 inside parent path {:?}",
+                name,
+                path_str(parent_path)
+            );
+        }
+        for (name, posture) in group {
+            if let AuditPosture::DelegatesToSub(inner) = posture {
+                let mut child: Path = parent_path.to_vec();
+                child.push(name);
+                check(inner, &child);
+            }
+        }
+    }
+    check(AUDIT_POSTURE, &[]);
 }
 
 #[test]
 fn audit_posture_emits_entries_reference_known_audit_kinds() {
-    // Best-effort lint: every `Emits(name)` string should mention at
+    // Best-effort lint: every `Emits(spec)` value should mention at
     // least one token that maps to a real audit category — either a
     // `LocalAuditKind` variant name (CamelCase) or a `plan.*` chain
     // event. This catches typos like `Emits("VmStrt")` without
@@ -176,31 +344,60 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
     // The check uses a static allowlist; expanding the allowlist is
     // a deliberate change tied to the actual audit-emission code.
     const KNOWN_TOKENS: &[&str] = &[
-        // LocalAuditKind variants the current Emits rows reference.
-        "VmStart",
-        "VmStop",
-        "VmFsMutate",
-        "VmTtlSet",
-        "TemplateBuild",
+        // LocalAuditKind variants the Emits rows reference. Keep
+        // alphabetised within sections so a new audit kind's
+        // addition is one obvious line.
+        // Top-level + per-subgroup mutation kinds:
+        "CachePrune",
         "ConfigChange",
+        "Kill",
+        "ManifestAliasRemove",
+        "ManifestAliasSet",
+        "ManifestTagAdd",
+        "ManifestTagRemove",
+        "NetworkCreate",
+        "NetworkRemove",
+        "SecretGet",
+        "SecretPut",
+        "SecretRm",
+        "SessionStart",
+        "SlotPrune",
+        "SlotRemove",
+        "SnapshotDelete",
+        "StorageGc",
+        "TemplateBuild",
         "Uninstall",
         "UpdateInstall",
-        "SlotPrune",
+        "VmFsMutate",
+        "VmProcSignal",
+        "VmProcStart",
+        "VmProcStdin",
+        "VmStart",
+        "VmStop",
+        "VmTtlSet",
+        "VmVolumeAdd",
+        "VmVolumeRemove",
         // Plan-64 audit-chain events.
         "plan.admitted",
         "plan.launched",
     ];
-    for (name, posture) in AUDIT_POSTURE {
+
+    let mut failures: Vec<(String, &'static str)> = Vec::new();
+    for_each_posture(AUDIT_POSTURE, &[], &mut |path, posture| {
         if let AuditPosture::Emits(spec) = posture {
             let hit = KNOWN_TOKENS.iter().any(|tok| spec.contains(tok));
-            assert!(
-                hit,
-                "AUDIT_POSTURE[{name:?}] = Emits({spec:?}) names no \
-                 known audit category — typo, or the allowlist in \
-                 audit_total_coverage.rs::audit_posture_emits_entries_\
-                 reference_known_audit_kinds needs the new token added \
-                 alongside the new LocalAuditKind variant."
-            );
+            if !hit {
+                failures.push((path_str(path), spec));
+            }
         }
-    }
+    });
+    assert!(
+        failures.is_empty(),
+        "{} Emits row(s) name no known audit token — typo, or the \
+         allowlist in audit_posture_emits_entries_reference_known_audit_kinds \
+         needs the new token added alongside the new LocalAuditKind variant. \
+         Offenders: {:?}",
+        failures.len(),
+        failures
+    );
 }
