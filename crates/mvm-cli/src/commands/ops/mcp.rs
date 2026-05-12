@@ -27,7 +27,7 @@ use mvm_mcp::{
     SessionMap, SessionState, ToolResult,
 };
 use mvm_supervisor::ToolRegistry;
-use mvm_supervisor::tools::web_fetch;
+use mvm_supervisor::tools::{web_fetch, web_search};
 
 use super::Cli;
 
@@ -156,19 +156,28 @@ impl Default for ExecDispatcher {
 ///   constructable; allowlist comes from
 ///   `$MVM_WEB_FETCH_ALLOWLIST` (comma-separated). When the env var
 ///   is unset, the allowlist is empty and every fetch fails closed.
-/// - `mvm.web_search` — fail-closed default (per-provider adapters
-///   ship in a follow-up slice).
+/// - `mvm.web_search` — allowlist comes from
+///   `$MVM_WEB_SEARCH_ALLOWLIST`; default provider comes from
+///   `$MVM_WEB_SEARCH_DEFAULT` (or the first allowlist entry).
+///   When `"brave"` is on the allowlist AND `$BRAVE_SEARCH_API_KEY`
+///   is set, a [`web_search::BraveSearchProvider`] is registered.
+///   Without the key, the existing "allowed but unregistered =
+///   config drift" error fires on first invoke so the
+///   misconfiguration is loud, not silent.
 ///
-/// On `ReqwestHttpFetcher::new()` failure (extraordinarily rare —
-/// reqwest builds the TLS stack lazily), we log a `tracing::warn`
-/// and fall back to `NoopHttpFetcher` so the registry still ships.
+/// On `ReqwestHttpFetcher::new()` / `BraveSearchProvider::new()`
+/// failure (extraordinarily rare), we log a `tracing::warn` and
+/// fall back to the substrate's Noop default so the registry still
+/// ships.
 fn build_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::with_defaults();
+
+    // mvm.web_fetch
     let allow = web_fetch::allowlist_from_env_var(web_fetch::ALLOWLIST_ENV_VAR);
-    let mut tool = web_fetch::WebFetchTool::with_allowlist(allow);
+    let mut fetch_tool = web_fetch::WebFetchTool::with_allowlist(allow);
     match web_fetch::ReqwestHttpFetcher::new() {
         Ok(f) => {
-            tool = tool.with_fetcher(Arc::new(f));
+            fetch_tool = fetch_tool.with_fetcher(Arc::new(f));
         }
         Err(e) => {
             tracing::warn!(
@@ -177,9 +186,34 @@ fn build_tool_registry() -> ToolRegistry {
             );
         }
     }
-    // Re-register replaces the fail-closed default that
-    // `with_defaults` planted.
-    registry.register(Box::new(tool));
+    registry.register(Box::new(fetch_tool));
+
+    // mvm.web_search
+    let search_allow = web_search::allowlist_from_env_var(web_search::ALLOWLIST_ENV_VAR);
+    let default_provider = std::env::var(web_search::DEFAULT_PROVIDER_ENV_VAR)
+        .ok()
+        .or_else(|| search_allow.iter().next().cloned())
+        .unwrap_or_else(|| "noop".to_string());
+    let mut search_tool =
+        web_search::WebSearchTool::with_allowlist(search_allow.iter().cloned(), default_provider);
+    if search_allow.contains("brave")
+        && let Ok(key) = std::env::var(web_search::BRAVE_API_KEY_ENV_VAR)
+    {
+        match web_search::BraveSearchProvider::new(key) {
+            Ok(p) => {
+                search_tool = search_tool.register_provider(Arc::new(p));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "BraveSearchProvider init failed; mvm.web_search 'brave' provider will be \
+                     allowlisted-but-unregistered"
+                );
+            }
+        }
+    }
+    registry.register(Box::new(search_tool));
+
     registry
 }
 

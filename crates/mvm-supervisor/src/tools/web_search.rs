@@ -108,6 +108,131 @@ impl SearchProvider for NoopSearchProvider {
     }
 }
 
+/// Brave Search API provider. Documented at
+/// <https://api.search.brave.com/app/documentation>.
+///
+/// Auth is a `X-Subscription-Token` header carrying the operator's
+/// API key. The agent never sees the key — it's pinned inside this
+/// struct at construction and consumed only by the HTTP send.
+///
+/// ## Wire shape
+///
+/// Brave's `/res/v1/web/search` returns JSON with a `web.results`
+/// array; each row carries `{ title, url, description }`. Other
+/// fields exist (mixed, query, type, …) but we ignore them — this
+/// is an upstream API so `deny_unknown_fields` would brittle the
+/// type to a single Brave version. The minimal extractor types
+/// `BraveResponse`/`BraveWebResults`/`BraveResult` carry only what
+/// we need.
+pub struct BraveSearchProvider {
+    api_key: String,
+    client: reqwest::Client,
+    endpoint: String,
+}
+
+impl BraveSearchProvider {
+    /// Canonical Brave Search API endpoint.
+    pub const DEFAULT_ENDPOINT: &'static str = "https://api.search.brave.com/res/v1/web/search";
+
+    /// Build with the default endpoint + a fresh reqwest client.
+    /// `api_key` is the value of the operator's
+    /// `X-Subscription-Token`. The caller is responsible for
+    /// sourcing it from a secret store; this constructor takes the
+    /// raw bytes and pins them inside `self`.
+    pub fn new(api_key: impl Into<String>) -> Result<Self, SearchError> {
+        let client = reqwest::Client::builder()
+            .timeout(std::time::Duration::from_secs(15))
+            .build()
+            .map_err(|e| SearchError::Upstream(format!("building reqwest client: {e}")))?;
+        Ok(Self {
+            api_key: api_key.into(),
+            client,
+            endpoint: Self::DEFAULT_ENDPOINT.to_string(),
+        })
+    }
+
+    /// Override the endpoint — used by tests to point at a mock
+    /// HTTP server. Production callers stick with the default.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+}
+
+/// Minimal extractor for the Brave web-search response. We
+/// intentionally do not `deny_unknown_fields` — Brave's payload
+/// carries many fields we don't care about and adding/removing one
+/// upstream shouldn't break our parse.
+#[derive(Debug, Deserialize)]
+struct BraveResponse {
+    #[serde(default)]
+    web: Option<BraveWebResults>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveWebResults {
+    #[serde(default)]
+    results: Vec<BraveResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct BraveResult {
+    title: String,
+    url: String,
+    #[serde(default)]
+    description: String,
+}
+
+#[async_trait]
+impl SearchProvider for BraveSearchProvider {
+    fn name(&self) -> &'static str {
+        "brave"
+    }
+
+    async fn search(&self, query: &str, max_results: u32) -> Result<Vec<SearchHit>, SearchError> {
+        // Brave's `count` param caps at 20 per their docs. Clamp
+        // before forwarding so a caller-supplied 50 doesn't trip a
+        // 422 from upstream.
+        let count = max_results.min(20);
+        let response = self
+            .client
+            .get(&self.endpoint)
+            .header("X-Subscription-Token", &self.api_key)
+            .query(&[("q", query), ("count", &count.to_string())])
+            .send()
+            .await
+            .map_err(|e| SearchError::Upstream(e.to_string()))?;
+        let status = response.status();
+        if status.as_u16() == 429 {
+            return Err(SearchError::RateLimited);
+        }
+        if !status.is_success() {
+            return Err(SearchError::Upstream(format!(
+                "Brave search returned status {status}"
+            )));
+        }
+        let parsed: BraveResponse = response
+            .json()
+            .await
+            .map_err(|e| SearchError::Upstream(format!("decoding Brave response: {e}")))?;
+        let hits: Vec<SearchHit> = parsed
+            .web
+            .map(|w| w.results)
+            .unwrap_or_default()
+            .into_iter()
+            .map(|r| SearchHit {
+                title: r.title,
+                url: r.url,
+                snippet: r.description,
+            })
+            .collect();
+        if hits.is_empty() {
+            return Err(SearchError::Empty);
+        }
+        Ok(hits)
+    }
+}
+
 /// One agent-callable search surface, scoped to an allowlist of
 /// provider names.
 pub struct WebSearchTool {
@@ -275,6 +400,36 @@ impl HostMediatedTool for WebSearchTool {
         })
     }
 }
+
+/// Parse a comma-separated env-var into a set of provider names.
+/// Same shape as [`crate::tools::web_fetch::allowlist_from_env_var`];
+/// kept as a sibling for tidiness rather than re-exported, since
+/// the audit / error messages here name "provider" specifically.
+///
+/// Example: `MVM_WEB_SEARCH_ALLOWLIST=brave,google`.
+pub fn allowlist_from_env_var(var_name: &str) -> std::collections::BTreeSet<String> {
+    let Ok(raw) = std::env::var(var_name) else {
+        return std::collections::BTreeSet::new();
+    };
+    raw.split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(String::from)
+        .collect()
+}
+
+/// Canonical env-var name for the `mvm.web_search` provider
+/// allowlist.
+pub const ALLOWLIST_ENV_VAR: &str = "MVM_WEB_SEARCH_ALLOWLIST";
+
+/// Canonical env-var name for the `mvm.web_search` default
+/// provider. Must appear in the allowlist to be reachable.
+pub const DEFAULT_PROVIDER_ENV_VAR: &str = "MVM_WEB_SEARCH_DEFAULT";
+
+/// Canonical env-var name for the operator's Brave Search API key.
+/// When unset (and `"brave"` is on the allowlist), the "allowed
+/// but unregistered" config-drift error fires on first invoke.
+pub const BRAVE_API_KEY_ENV_VAR: &str = "BRAVE_SEARCH_API_KEY";
 
 #[cfg(test)]
 mod tests {
@@ -539,5 +694,113 @@ mod tests {
     fn noop_provider_is_named_noop() {
         let p = NoopSearchProvider;
         assert_eq!(p.name(), "noop");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // BraveSearchProvider
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn brave_provider_is_named_brave() {
+        let p = BraveSearchProvider::new("test-key").expect("build brave");
+        assert_eq!(p.name(), "brave");
+    }
+
+    #[test]
+    fn brave_provider_constructs_with_default_endpoint() {
+        let p = BraveSearchProvider::new("key").unwrap();
+        assert_eq!(p.endpoint, BraveSearchProvider::DEFAULT_ENDPOINT);
+    }
+
+    #[test]
+    fn brave_provider_with_endpoint_overrides() {
+        let p = BraveSearchProvider::new("key")
+            .unwrap()
+            .with_endpoint("https://mock.test/search");
+        assert_eq!(p.endpoint, "https://mock.test/search");
+    }
+
+    #[test]
+    fn brave_response_parses_minimal_payload() {
+        // Parsing pins: the minimal extractor types must consume a
+        // real-shaped Brave response without choking on extra
+        // fields and must map description → snippet.
+        let json = r#"{
+            "type": "search",
+            "query": { "original": "rust" },
+            "mixed": { "type": "mixed", "main": [], "top": [], "side": [] },
+            "web": {
+                "type": "search",
+                "results": [
+                    {
+                        "title": "The Rust Programming Language",
+                        "url": "https://www.rust-lang.org/",
+                        "description": "A language empowering everyone…",
+                        "is_source_local": false
+                    },
+                    {
+                        "title": "Cargo",
+                        "url": "https://crates.io/",
+                        "description": "The Rust package registry"
+                    }
+                ]
+            }
+        }"#;
+        let parsed: BraveResponse = serde_json::from_str(json).expect("parse");
+        let web = parsed.web.expect("web array present");
+        assert_eq!(web.results.len(), 2);
+        assert_eq!(web.results[0].title, "The Rust Programming Language");
+        assert_eq!(web.results[0].url, "https://www.rust-lang.org/");
+        assert!(
+            web.results[0]
+                .description
+                .starts_with("A language empowering")
+        );
+    }
+
+    #[test]
+    fn brave_response_handles_missing_web_field() {
+        // A search with no results may omit the `web` key entirely.
+        // Don't panic; map to empty hits.
+        let json = r#"{ "type": "search", "query": { "original": "x" } }"#;
+        let parsed: BraveResponse = serde_json::from_str(json).expect("parse");
+        assert!(parsed.web.is_none());
+    }
+
+    #[test]
+    fn brave_result_tolerates_missing_description() {
+        // `description` defaults to empty string when absent, so a
+        // snippet-less hit still produces a SearchHit shape.
+        let json = r#"{
+            "title": "x", "url": "https://x.test/"
+        }"#;
+        let r: BraveResult = serde_json::from_str(json).expect("parse");
+        assert_eq!(r.description, "");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Env-var config helpers
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn allowlist_env_var_parses_comma_separated() {
+        let var = "MVM_TEST_WEB_SEARCH_ALLOWLIST_PARSE";
+        unsafe {
+            std::env::set_var(var, "brave,google,duckduckgo");
+        }
+        let set = allowlist_from_env_var(var);
+        assert!(set.contains("brave"));
+        assert!(set.contains("google"));
+        assert!(set.contains("duckduckgo"));
+        assert_eq!(set.len(), 3);
+        unsafe {
+            std::env::remove_var(var);
+        }
+    }
+
+    #[test]
+    fn allowlist_env_var_unset_returns_empty_set() {
+        let set = allowlist_from_env_var("MVM_TEST_WEB_SEARCH_DEFINITELY_NOT_SET_PLUGH");
+        assert!(set.is_empty());
     }
 }
