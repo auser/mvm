@@ -10,5 +10,6 @@ pub(super) mod metrics;
 pub(super) mod network;
 pub(super) mod policy;
 pub(super) mod secret;
+pub(super) mod tenant;
 
 pub(super) use super::{Cli, shared};

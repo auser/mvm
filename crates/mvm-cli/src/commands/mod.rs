@@ -189,6 +189,11 @@ pub(in crate::commands) enum Commands {
     /// `~/.mvm/trusted-publishers/`. `mvmctl bundle fetch` looks
     /// pubkeys up via this store before verifying signatures.
     Trust(trust::Args),
+    /// Tenant lifecycle: destroy a tenant's overlays + emit signed
+    /// destruction certificates. Plan 60 Phase 7a Slices A + D.
+    /// Hosted-cloud operators use this to satisfy the "provably
+    /// erased" deprovisioning contract.
+    Tenant(ops::tenant::Args),
 }
 
 // ============================================================================
@@ -318,6 +323,7 @@ pub fn run() -> Result<()> {
         Commands::Policy(a) => ops::policy::run(&cli, a, &cfg),
         Commands::Bundle(a) => bundle::run(&cli, a, &cfg),
         Commands::Trust(a) => trust::run(&cli, a, &cfg),
+        Commands::Tenant(a) => ops::tenant::run(&cli, a, &cfg),
     };
 
     cmd_audit::emit_cmd_outcome(cmd_recorder.as_ref(), verb, &result);

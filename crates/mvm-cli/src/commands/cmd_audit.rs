@@ -181,6 +181,7 @@ impl Commands {
             Commands::Policy(_) => "policy",
             Commands::Bundle(_) => "bundle",
             Commands::Trust(_) => "trust",
+            Commands::Tenant(_) => "tenant",
         }
     }
 }
