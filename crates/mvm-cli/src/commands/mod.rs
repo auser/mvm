@@ -1,5 +1,6 @@
 mod build;
 mod catalog;
+mod cmd_audit;
 mod env;
 mod manifest;
 mod ops;
@@ -256,6 +257,13 @@ pub fn run() -> Result<()> {
     // Load operator config once; used as fallback for lima_cpus, lima_mem, cpus, memory.
     let cfg = mvm_core::user_config::load(None);
 
+    // Plan 60 Phase 4 — wrap dispatch in cmd.<verb>.{invoked,completed,failed}
+    // audit envelope. Best-effort: a recorder failure logs a warning and the
+    // command runs without cmd-level audit.
+    let cmd_recorder = cmd_audit::build_cmd_recorder();
+    let verb = cli.command.verb_name();
+    cmd_audit::emit_cmd_invoked(cmd_recorder.as_ref(), verb);
+
     let result = match cli.command.clone() {
         Commands::Bootstrap(a) => env::bootstrap::run(&cli, a, &cfg),
         Commands::Dev(a) => env::dev::run(&cli, a, &cfg),
@@ -297,6 +305,8 @@ pub fn run() -> Result<()> {
         Commands::Attest(a) => ops::attest::run(&cli, a, &cfg),
         Commands::Policy(a) => ops::policy::run(&cli, a, &cfg),
     };
+
+    cmd_audit::emit_cmd_outcome(cmd_recorder.as_ref(), verb, &result);
 
     with_hints(result)
 }
