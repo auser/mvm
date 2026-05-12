@@ -494,9 +494,22 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
     } = params;
 
     // 1. Spawn the sandbox.
+    //
+    // Force anonymous auth for `BUILDER_OCI_IMAGE` (public Docker Hub
+    // image). microsandbox's default `resolve_registry_auth` consults
+    // the host's Docker credential helper (`~/.docker/config.json` +
+    // osxkeychain on macOS) before falling through to anonymous, and a
+    // stale Docker Hub PAT in the keychain poisons the token exchange:
+    // `oci-client::_auth` returns `Err(AuthenticationFailure)`, which
+    // `get_auth_token` then silently swallows via `.ok()??` — the
+    // manifest request goes out unauthenticated, returns 401, and the
+    // surfaced error is the misleading "Not authorized: url
+    // …/manifests/2.24.10". A public builder image never needs creds,
+    // so bypassing the helper makes that failure mode impossible.
     let mut builder = microsandbox::Sandbox::builder(&name)
         .image(image)
         .pull_policy(microsandbox::sandbox::PullPolicy::IfMissing)
+        .registry(|r| r.auth(microsandbox::RegistryAuth::Anonymous))
         .cpus(cpus)
         .memory(memory_mib)
         .volume(BUILDER_GUEST_WORK_DIR, |m| {
