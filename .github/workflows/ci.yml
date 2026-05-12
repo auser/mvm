@@ -193,7 +193,13 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-e2e-
 
       - name: Run E2E tests
-        run: cargo test --test e2e
+        # The repo's end-to-end test target is `smoke_e2e_boot`
+        # (renamed from `e2e` during the workspace import). It
+        # self-skips unless `MVM_LIVE_SMOKE=1` + `MVM_TEST_ROOTFS`
+        # are set, so this lane runs the no-op skip path on
+        # GitHub-hosted runners and acts as a compile + linker
+        # tripwire for the boot-path crate graph.
+        run: cargo test --test smoke_e2e_boot
 
   # Note: cargo-audit, cargo-deny, reproducibility, and prod-agent-no-exec
   # were duplicated here AND in security.yml. They now live only in
