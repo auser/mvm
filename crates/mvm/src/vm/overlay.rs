@@ -232,6 +232,35 @@ pub struct SignedDestructionReceipt {
 /// Production callers pass `host_signer.signing` (the operator's
 /// host identity key, plan 64 W2). Tests inject a fresh ephemeral
 /// keypair.
+/// Audit-chain cross-reference anchor for a signed destruction
+/// certificate. Returns the lowercase-hex SHA-256 digest of the
+/// canonical compact-JSON serialization of `signed`.
+///
+/// Used by the operator at emission time (the per-workload
+/// `lifecycle.tenant.destroyed` audit-chain event carries this in
+/// its `cert_fingerprint` label) and by an auditor at verification
+/// time (the auditor recomputes the fingerprint from the on-disk
+/// certificate file and matches it against the chain entry).
+///
+/// The serialization is compact (no whitespace) for two reasons:
+/// 1. The hash is over a deterministic byte string — pretty-
+///    printing would make the digest depend on the serde_json
+///    version's whitespace choices.
+/// 2. Operators distributing the certificate file may pretty-
+///    print or re-encode it; the auditor parses + recompactifies
+///    via the same `to_vec` path so the digest matches regardless.
+pub fn cert_fingerprint(signed: &SignedDestructionReceipt) -> String {
+    use sha2::{Digest, Sha256};
+    // Unwrap: serializing a struct with all-String / all-numeric
+    // fields cannot fail at runtime.
+    let bytes = serde_json::to_vec(signed).expect("cert serde");
+    let digest = Sha256::digest(&bytes);
+    digest
+        .iter()
+        .map(|b| format!("{b:02x}"))
+        .collect::<String>()
+}
+
 pub fn sign_destruction_receipt(
     receipt: &DestructionReceipt,
     signing_key: &ed25519_dalek::SigningKey,
@@ -1158,6 +1187,50 @@ mod tests {
         // deny_unknown_fields refuses.
         let err = serde_json::from_str::<SignedDestructionReceipt>(&s).unwrap_err();
         assert!(err.to_string().contains("unknown field"), "{err}");
+    }
+
+    #[test]
+    fn cert_fingerprint_is_stable_for_same_cert() {
+        let key = SigningKey::generate(&mut OsRng);
+        let signed = sign_destruction_receipt(&sample_receipt(), &key);
+        let f1 = cert_fingerprint(&signed);
+        let f2 = cert_fingerprint(&signed);
+        // Lowercase-hex SHA-256 = 64 chars.
+        assert_eq!(f1.len(), 64);
+        assert!(
+            f1.chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_uppercase())
+        );
+        assert_eq!(f1, f2);
+    }
+
+    #[test]
+    fn cert_fingerprint_changes_when_receipt_tamper() {
+        let key = SigningKey::generate(&mut OsRng);
+        let mut signed = sign_destruction_receipt(&sample_receipt(), &key);
+        let original = cert_fingerprint(&signed);
+        signed.receipt.tenant = "tampered".to_string();
+        let tampered = cert_fingerprint(&signed);
+        assert_ne!(original, tampered);
+    }
+
+    #[test]
+    fn cert_fingerprint_is_independent_of_pretty_printing() {
+        // The auditor receives the cert as JSON. Pretty-printed
+        // vs. compact-printed inputs must produce the same
+        // fingerprint after parse+recompact. We exercise this
+        // round-trip explicitly because operator-side emission
+        // and auditor-side verification take different paths to
+        // the bytes that get hashed.
+        let key = SigningKey::generate(&mut OsRng);
+        let signed = sign_destruction_receipt(&sample_receipt(), &key);
+        let direct = cert_fingerprint(&signed);
+
+        let pretty = serde_json::to_string_pretty(&signed).unwrap();
+        let reparsed: SignedDestructionReceipt = serde_json::from_str(&pretty).unwrap();
+        let after_pretty = cert_fingerprint(&reparsed);
+
+        assert_eq!(direct, after_pretty);
     }
 
     #[tokio::test]

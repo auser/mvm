@@ -34,11 +34,14 @@ use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 
 use mvm::vm::overlay::{
-    FsOverlayManager, OverlayManager, SignedDestructionReceipt, sign_destruction_receipt,
+    FsOverlayManager, OverlayManager, SignedDestructionReceipt, cert_fingerprint,
+    sign_destruction_receipt,
 };
 use mvm_core::user_config::MvmConfig;
+use mvm_supervisor::{EventCategory, Recorder};
 
 use super::Cli;
+use crate::commands::cmd_audit;
 use crate::commands::vm::host_signer;
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -90,6 +93,52 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     }
 }
 
+/// Plan 60 Phase 7a — audit-chain cross-reference event. Each
+/// successful workload destroy emits one chain-signed entry under
+/// [`EventCategory::Lifecycle`] with the per-workload fields plus
+/// the cert's SHA-256 fingerprint. An auditor holding both the
+/// chain (via `mvmctl audit show`) and the on-disk certs can
+/// confirm they refer to the same event by recomputing the
+/// fingerprint via [`mvm::vm::overlay::cert_fingerprint`].
+fn emit_chain_event(
+    recorder: &Recorder,
+    signed: &SignedDestructionReceipt,
+    rt: &tokio::runtime::Runtime,
+) {
+    let fingerprint = cert_fingerprint(signed);
+    let extras: Vec<(String, String)> = vec![
+        ("tenant".to_string(), signed.receipt.tenant.clone()),
+        ("workload".to_string(), signed.receipt.workload.clone()),
+        (
+            "files_wiped".to_string(),
+            signed.receipt.files_wiped.to_string(),
+        ),
+        (
+            "bytes_wiped".to_string(),
+            signed.receipt.bytes_wiped.to_string(),
+        ),
+        ("cert_fingerprint".to_string(), fingerprint),
+    ];
+    // Best-effort emission. The certificate is the load-bearing
+    // evidence; the chain anchor is a cross-reference. If the
+    // chain emission fails (signer wedged, audit dir not
+    // writable, …), the destruction still succeeded — log the
+    // failure but don't fail the operator's command.
+    if let Err(e) = rt.block_on(recorder.record_unbound(
+        EventCategory::Lifecycle,
+        "lifecycle.tenant.destroyed",
+        extras,
+    )) {
+        tracing::warn!(
+            error = %e,
+            tenant = %signed.receipt.tenant,
+            workload = %signed.receipt.workload,
+            "lifecycle.tenant.destroyed chain emission failed; certificate \
+             is still valid as standalone evidence"
+        );
+    }
+}
+
 fn destroy_tenant(
     tenant: &str,
     confirm_deletion: bool,
@@ -138,6 +187,10 @@ fn destroy_tenant(
 
     eprintln!("  found {} overlay(s)", overlays.len());
 
+    // Audit-chain cross-reference recorder. Best-effort — see
+    // `emit_chain_event`'s doc.
+    let chain_recorder = cmd_audit::build_cmd_recorder();
+
     let mut certificates: Vec<SignedDestructionReceipt> = Vec::with_capacity(overlays.len());
     let mut total_files: u64 = 0;
     let mut total_bytes: u64 = 0;
@@ -151,7 +204,11 @@ fn destroy_tenant(
             "  ✓ {}/{}: {} file(s), {} byte(s) wiped",
             receipt.tenant, receipt.workload, receipt.files_wiped, receipt.bytes_wiped
         );
-        certificates.push(sign_destruction_receipt(&receipt, &signer.signing));
+        let signed = sign_destruction_receipt(&receipt, &signer.signing);
+        if let Some(ref rec) = chain_recorder {
+            emit_chain_event(rec, &signed, &rt);
+        }
+        certificates.push(signed);
     }
 
     eprintln!(
@@ -256,6 +313,126 @@ mod tests {
         // operator's downstream parser sees `[]`.
         let dir = tempdir().unwrap();
         destroy_tenant("never-created", true, Some(dir.path().to_path_buf())).unwrap();
+    }
+
+    // ──────────────────────────────────────────────────────────
+    // Audit chain emission
+    //
+    // `emit_chain_event` is the load-bearing piece; we exercise
+    // it directly with a CapturingAuditSigner so the assertion
+    // is self-contained (the integration with the real signer
+    // is covered by the existing host_signer + audit_chain
+    // tests, and by the operator workflow at runtime).
+    // ──────────────────────────────────────────────────────────
+
+    use mvm::vm::overlay::{DestructionReceipt, cert_fingerprint, sign_destruction_receipt};
+    use mvm_plan::TenantId;
+    use mvm_supervisor::CapturingAuditSigner;
+    use std::sync::Arc;
+
+    fn capturing_recorder() -> (Recorder, Arc<CapturingAuditSigner>) {
+        let signer = Arc::new(CapturingAuditSigner::new());
+        let rec = Recorder::new(signer.clone(), TenantId("local".to_string()));
+        (rec, signer)
+    }
+
+    fn synthetic_signed() -> SignedDestructionReceipt {
+        let receipt = DestructionReceipt {
+            tenant: "acme".to_string(),
+            workload: "build-runner".to_string(),
+            destroyed_at: chrono::DateTime::<chrono::Utc>::from_timestamp(1_700_000_000, 0)
+                .unwrap(),
+            files_wiped: 42,
+            bytes_wiped: 1024,
+        };
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        sign_destruction_receipt(&receipt, &key)
+    }
+
+    #[test]
+    fn emit_chain_event_writes_lifecycle_event_with_canonical_labels() {
+        let (rec, signer) = capturing_recorder();
+        let signed = synthetic_signed();
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        emit_chain_event(&rec, &signed, &rt);
+
+        let entries = signer.entries();
+        assert_eq!(entries.len(), 1);
+        let entry = &entries[0];
+        assert_eq!(entry.event, "lifecycle.tenant.destroyed");
+        assert_eq!(entry.labels.get("tenant").map(String::as_str), Some("acme"));
+        assert_eq!(
+            entry.labels.get("workload").map(String::as_str),
+            Some("build-runner")
+        );
+        assert_eq!(
+            entry.labels.get("files_wiped").map(String::as_str),
+            Some("42")
+        );
+        assert_eq!(
+            entry.labels.get("bytes_wiped").map(String::as_str),
+            Some("1024")
+        );
+    }
+
+    #[test]
+    fn emit_chain_event_carries_matching_cert_fingerprint() {
+        // The chain entry's `cert_fingerprint` label must match
+        // the value `cert_fingerprint(&signed)` returns — that's
+        // the load-bearing cross-reference. An auditor with the
+        // chain entry + the certificate computes
+        // cert_fingerprint(parsed_cert) and asserts equality.
+        let (rec, signer) = capturing_recorder();
+        let signed = synthetic_signed();
+        let expected = cert_fingerprint(&signed);
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        emit_chain_event(&rec, &signed, &rt);
+
+        let entries = signer.entries();
+        assert_eq!(
+            entries[0]
+                .labels
+                .get("cert_fingerprint")
+                .map(String::as_str),
+            Some(expected.as_str())
+        );
+        // Fingerprint shape sanity.
+        assert_eq!(expected.len(), 64); // SHA-256 hex
+    }
+
+    #[test]
+    fn emit_chain_event_fingerprint_differs_per_cert() {
+        // Two different workload destroys produce two different
+        // fingerprints in the chain — operators don't get a
+        // single chain entry that could be replayed against a
+        // different cert.
+        let (rec, signer) = capturing_recorder();
+        let signed_a = synthetic_signed();
+        let mut signed_b = signed_a.clone();
+        signed_b.receipt.workload = "code-eval".to_string();
+        // Re-sign with the same key so the cert is internally
+        // consistent; only the labels + fingerprint change.
+        let key = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        signed_b = sign_destruction_receipt(&signed_b.receipt, &key);
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        emit_chain_event(&rec, &signed_a, &rt);
+        emit_chain_event(&rec, &signed_b, &rt);
+
+        let entries = signer.entries();
+        assert_eq!(entries.len(), 2);
+        let fp_a = entries[0].labels.get("cert_fingerprint").unwrap();
+        let fp_b = entries[1].labels.get("cert_fingerprint").unwrap();
+        assert_ne!(fp_a, fp_b, "fingerprints must differ per cert");
     }
 
     #[test]
