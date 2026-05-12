@@ -49,6 +49,10 @@
 //!   (top-level ReadOnly verbs — three more rows from
 //!   `AUDIT_POSTURE` pinned against a future regression that
 //!   adds an emit to a read-only path)
+//! - `mvmctl uninstall --yes --dry-run` → **no** audit entry
+//!   (the positive `Uninstall` path is real-system-destructive
+//!   and not safely-hermetic, but the dry-run path is read-only
+//!   by contract and can be pinned)
 //! - `mvmctl secret put / get / ls / rm` → secret-side audit JSONL
 //!   at `~/.mvm/audit/secrets.jsonl` carries one entry per call
 //!   with `"action":"put"` / `"get"` / `"list"` / `"delete"`. The
@@ -944,6 +948,37 @@ fn catalog_list_does_not_emit_audit_entry() {
         log.is_empty(),
         "read-only `mvmctl catalog list` must not write to the \
          LocalAudit stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn uninstall_dry_run_does_not_emit_audit_entry() {
+    // `mvmctl uninstall --yes` emits `Uninstall` at the end, but
+    // its three filesystem mutations (`/var/lib/mvm`, `~/.mvm/`,
+    // `/usr/local/bin/mvmctl`) are real system paths that can't
+    // safely be exercised in a hermetic test — a dev with an
+    // actual install on the local machine would have sudo block
+    // the test mid-run. The dry-run path returns before any of
+    // those steps and (per the implementation) before the audit
+    // emit; this test pins that contract.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["uninstall", "--yes", "--dry-run"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl uninstall --yes --dry-run failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "uninstall");
+    assert_eq!(
+        hits, 0,
+        "dry-run must not write uninstall audit entries, got {hits}. \
+         Full log:\n{log}"
     );
 }
 
