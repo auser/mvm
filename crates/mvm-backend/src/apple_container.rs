@@ -143,6 +143,22 @@ impl VmBackend for AppleContainerBackend {
         stop_result
     }
 
+    fn pause(&self, _id: &VmId) -> Result<()> {
+        // Apple Virtualization.framework supports VZ pause/resume but the
+        // `container` CLI's surface doesn't expose it; matches
+        // `capabilities().pause_resume == false`. Revisit if we drop the
+        // CLI shell-out for a direct VZ binding.
+        anyhow::bail!(
+            "pause is not supported by the apple-container backend (the `container` CLI does not expose VZ pause)"
+        )
+    }
+
+    fn resume(&self, _id: &VmId) -> Result<()> {
+        anyhow::bail!(
+            "resume is not supported by the apple-container backend (the `container` CLI does not expose VZ pause)"
+        )
+    }
+
     fn stop_all(&self) -> Result<()> {
         let ids = mvm_providers::apple_container::list_ids();
         for id in &ids {

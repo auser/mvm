@@ -89,6 +89,17 @@ impl VmBackend for MicrovmNixBackend {
         microvm::stop_all_vms()
     }
 
+    fn pause(&self, _id: &VmId) -> Result<()> {
+        // microvm.nix wraps QEMU which can pause via QMP, but mvm doesn't
+        // wire QMP today (the microvm.nix shape boots without an exposed
+        // monitor socket). Matches `capabilities().pause_resume == false`.
+        anyhow::bail!("pause is not supported by the microvm-nix backend (QMP monitor not wired)")
+    }
+
+    fn resume(&self, _id: &VmId) -> Result<()> {
+        anyhow::bail!("resume is not supported by the microvm-nix backend (QMP monitor not wired)")
+    }
+
     fn status(&self, id: &VmId) -> Result<VmStatus> {
         let vms = microvm::list_vms()?;
         match vms.iter().find(|info| info.name.as_deref() == Some(&*id.0)) {

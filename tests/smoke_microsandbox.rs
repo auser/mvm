@@ -88,10 +88,7 @@ mod live {
             .output()?;
         if !out.status.success() {
             let stderr = String::from_utf8_lossy(&out.stderr);
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::Other,
-                format!("mkfs.ext4 failed: {stderr}"),
-            ));
+            return Err(std::io::Error::other(format!("mkfs.ext4 failed: {stderr}")));
         }
         Ok(())
     }

@@ -526,6 +526,24 @@ pub trait VmBackend: Send + Sync {
     /// Stop all VMs managed by this backend.
     fn stop_all(&self) -> Result<()>;
 
+    /// Pause the vCPUs of a running VM, leaving the VMM alive.
+    ///
+    /// Used by the orchestrator's sleep/wake path (mvmd Track I in the
+    /// `what-do-we-need-deep-dolphin` plan): pause → snapshot → resume,
+    /// or pause → stop for a clean shutdown.
+    ///
+    /// Backends without pause/resume support — see
+    /// [`VmCapabilities::pause_resume`] — return `Err`. Implementors
+    /// MUST keep the capability flag and this method's behavior in
+    /// sync: if `capabilities().pause_resume == true`, `pause` must
+    /// be a real operation; if `false`, `pause` errors clearly.
+    fn pause(&self, id: &VmId) -> Result<()>;
+
+    /// Resume vCPUs previously paused with [`pause`](Self::pause).
+    ///
+    /// See [`pause`](Self::pause) for the contract.
+    fn resume(&self, id: &VmId) -> Result<()>;
+
     /// Query the status of a specific VM.
     fn status(&self, id: &VmId) -> Result<VmStatus>;
 

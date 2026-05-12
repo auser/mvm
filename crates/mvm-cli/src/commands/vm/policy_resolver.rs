@@ -70,11 +70,12 @@ use std::sync::Arc;
 
 use mvm_plan::{ExecutionPlan, FsPolicyRef, PolicyRef};
 use mvm_supervisor::{
-    ArtifactCollector, EgressPolicyValidationError, EgressProxy, KeystoreReleaser, L4Gate,
-    L4SpecError, L7EgressProxy, LiveArtifactCollector, LiveKeystoreReleaser, LiveL4Gate,
-    NoopArtifactCollector, NoopEgressAuditSink, NoopEgressProxy, NoopKeystoreReleaser, NoopL4Gate,
-    NoopToolGate, PiiPolicyError, PolicyToolGate, TokioDnsResolver, ToolGate,
-    build_inspector_chain_with_pii, validate_egress_policy_inspector_names,
+    ArtifactCollector, AuditPolicyValidationError, EgressPolicyValidationError, EgressProxy,
+    KeystoreReleaser, L4Gate, L4SpecError, L7EgressProxy, LiveArtifactCollector,
+    LiveKeystoreReleaser, LiveL4Gate, NoopArtifactCollector, NoopEgressAuditSink, NoopEgressProxy,
+    NoopKeystoreReleaser, NoopL4Gate, NoopToolGate, PiiPolicyError, PolicyToolGate,
+    TokioDnsResolver, ToolGate, build_inspector_chain_with_pii,
+    validate_audit_policy_stream_destinations, validate_egress_policy_inspector_names,
 };
 
 /// The fixed identifier for the local-dev policy bundle. Any
@@ -183,6 +184,21 @@ pub enum ResolveError {
         path: PathBuf,
         detail: String,
     },
+
+    /// A bundle parsed but its `[audit].stream_destinations` list
+    /// carries a URL whose scheme isn't recognised (typo like
+    /// `htpps://...`). Fail-loud at admission so an operator who
+    /// thought they were configuring TLS audit replication doesn't
+    /// silently boot with the entry dropped. The eventual audit-
+    /// stream replicator (Plan 60 Phase 4 follow-on after the
+    /// mvm-hostd lift) is the live consumer; this validation
+    /// catches typos *before* the resolver hands an unusable URL
+    /// list downstream.
+    AuditPolicyInvalid {
+        value: String,
+        path: PathBuf,
+        detail: String,
+    },
 }
 
 impl std::fmt::Display for ResolveError {
@@ -250,6 +266,15 @@ impl std::fmt::Display for ResolveError {
             } => write!(
                 f,
                 "policy bundle {value:?} (from {}) has an invalid [pii] section: {detail}",
+                path.display()
+            ),
+            Self::AuditPolicyInvalid {
+                value,
+                path,
+                detail,
+            } => write!(
+                f,
+                "policy bundle {value:?} (from {}) has an invalid [audit] section: {detail}",
                 path.display()
             ),
         }
@@ -420,6 +445,21 @@ fn slots_from_bundle(
     // typos must surface loudly. Plan 60 Phase 3 Slice B follow-on.
     validate_egress_policy_inspector_names(&bundle.egress).map_err(
         |e: EgressPolicyValidationError| ResolveError::EgressPolicyInvalid {
+            value: ref_value.to_string(),
+            path: path.to_path_buf(),
+            detail: e.to_string(),
+        },
+    )?;
+
+    // Same fail-loud posture for `[audit].stream_destinations` —
+    // shape-check each URL's scheme prefix against
+    // `KNOWN_AUDIT_STREAM_SCHEMES`. The eventual replicator (Plan 60
+    // Phase 4 follow-on after the mvm-hostd lift) is the live
+    // consumer; this admission gate catches typos like
+    // `htpps://audit...` so the operator sees them at boot rather
+    // than after a forensic dig through the audit chain.
+    validate_audit_policy_stream_destinations(&bundle.audit).map_err(
+        |e: AuditPolicyValidationError| ResolveError::AuditPolicyInvalid {
             value: ref_value.to_string(),
             path: path.to_path_buf(),
             detail: e.to_string(),
@@ -1690,6 +1730,129 @@ bundle_version = 1
             }
             other => panic!("expected PiiPolicyInvalid, got {other:?}"),
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Plan 60 Phase 4 follow-on — `[audit].stream_destinations`
+    // shape validation
+    //
+    // The resolver runs `validate_audit_policy_stream_destinations`
+    // before constructing slots so a typo on an audit-stream URL
+    // fails admission rather than silently dropping the entry
+    // downstream of the (yet-to-ship) audit replicator.
+    // ──────────────────────────────────────────────────────────────
+
+    fn fixture_bundle_with_audit_destinations(destinations: &[&str]) -> String {
+        let list = destinations
+            .iter()
+            .map(|d| format!("\"{d}\""))
+            .collect::<Vec<_>>()
+            .join(", ");
+        format!(
+            r#"
+schema_version = 1
+bundle_id      = "acme/web-worker"
+bundle_version = 1
+
+[network]
+[egress]
+[pii]
+[tool]
+[artifact]
+[keys]
+
+[audit]
+chain_signing = true
+stream_destinations = [{list}]
+"#,
+        )
+    }
+
+    #[test]
+    fn slice_b_resolver_accepts_known_audit_schemes() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_audit_destinations(&[
+                "file:///var/log/mvm/audit.jsonl",
+                "https://audit.example.com/ingest",
+            ]),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+        let _slots = resolve_supervisor_components_with_dir(&plan, tmp.path())
+            .unwrap_or_else(|e| panic!("known schemes must resolve: {e}"));
+    }
+
+    #[test]
+    fn slice_b_resolver_refuses_bundle_with_typo_in_audit_destination() {
+        // `htpps://` is the canonical typo. Validator must catch it
+        // and the resolver must surface as PolicyInvalid with the
+        // row index named.
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_audit_destinations(&[
+                "file:///var/log/mvm/audit.jsonl",
+                "htpps://audit.example.com/ingest",
+            ]),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+
+        let err = match resolve_supervisor_components_with_dir(&plan, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("typo in audit URL must be refused"),
+        };
+        match err {
+            ResolveError::AuditPolicyInvalid {
+                value,
+                path,
+                detail,
+            } => {
+                assert_eq!(value, "acme:web-worker");
+                let s = path.to_string_lossy();
+                assert!(s.contains("acme"), "path missing tenant: {s}");
+                assert!(
+                    detail.contains("htpps://audit.example.com/ingest"),
+                    "detail must name the typo: {detail}"
+                );
+                assert!(
+                    detail.contains("1"),
+                    "detail must name the row index (1): {detail}"
+                );
+                assert!(
+                    detail.contains("https://") || detail.contains("file://"),
+                    "detail should list at least one valid scheme: {detail}"
+                );
+            }
+            other => panic!("expected AuditPolicyInvalid, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn slice_b_resolver_refuses_audit_destination_without_scheme() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web-worker",
+            &fixture_bundle_with_audit_destinations(&["/var/log/audit.jsonl"]),
+        );
+        let mut plan = fixture_plan();
+        set_all_refs(&mut plan, "acme:web-worker");
+        let err = match resolve_supervisor_components_with_dir(&plan, tmp.path()) {
+            Err(e) => e,
+            Ok(_) => panic!("scheme-less audit URL must be refused"),
+        };
+        assert!(
+            matches!(err, ResolveError::AuditPolicyInvalid { .. }),
+            "{err}"
+        );
     }
 
     #[test]

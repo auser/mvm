@@ -281,6 +281,22 @@ impl VmBackend for MicrosandboxBackend {
         })
     }
 
+    fn pause(&self, _id: &VmId) -> Result<()> {
+        // microsandbox's public API doesn't expose pause/resume today;
+        // matches `capabilities().pause_resume == false`. Revisit when
+        // upstream surfaces the libkrun pause primitive (tracked in the
+        // Phase 7a snapshot-model work alluded to in `capabilities()`).
+        anyhow::bail!(
+            "pause is not supported by the microsandbox backend (upstream API does not expose vCPU pause)"
+        )
+    }
+
+    fn resume(&self, _id: &VmId) -> Result<()> {
+        anyhow::bail!(
+            "resume is not supported by the microsandbox backend (upstream API does not expose vCPU pause)"
+        )
+    }
+
     fn stop_all(&self) -> Result<()> {
         // Best-effort: list everything microsandbox knows about and stop
         // each. Errors stopping any single sandbox are surfaced *after*

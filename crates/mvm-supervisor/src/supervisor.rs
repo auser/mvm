@@ -499,6 +499,60 @@ pub fn validate_egress_policy_inspector_names(
     Ok(())
 }
 
+/// URL schemes accepted in [`mvm_policy::AuditPolicy::stream_destinations`].
+/// The supervisor's eventual audit-stream replicator (Plan 60 Phase 4
+/// follow-on after the mvm-hostd lift) will emit each entry to its
+/// matching backend; validating shape at admission means a typo
+/// (`fil:///var/log/...` vs `file:///var/log/...`) fails the boot
+/// loudly instead of silently dropping audit emissions.
+pub const KNOWN_AUDIT_STREAM_SCHEMES: &[&str] = &["file://", "unix://", "https://", "http://"];
+
+/// Validation error for [`validate_audit_policy_stream_destinations`].
+///
+/// The error names the offending row index + the operator-supplied
+/// value + the accepted scheme list so a single error message tells
+/// the operator exactly which `[audit].stream_destinations` entry to
+/// fix.
+#[derive(Debug, Error, PartialEq, Eq)]
+#[non_exhaustive]
+pub enum AuditPolicyValidationError {
+    #[error(
+        "stream_destinations[{index}] = {value:?} doesn't use a known URL scheme; \
+         valid prefixes are {valid:?}"
+    )]
+    UnknownStreamScheme {
+        index: usize,
+        value: String,
+        valid: &'static [&'static str],
+    },
+}
+
+/// Verify every entry in `policy.stream_destinations` starts with a
+/// known scheme prefix.
+///
+/// The supervisor's eventual replicator (waiting on the mvm-hostd
+/// lift) is the consumer; this function is the *admission-time*
+/// shape gate so an operator who typo'd `htpps://` doesn't think
+/// they've configured TLS audit replication while the boot proceeds
+/// in silence. Plan 60 Phase 4 follow-on.
+pub fn validate_audit_policy_stream_destinations(
+    policy: &mvm_policy::AuditPolicy,
+) -> Result<(), AuditPolicyValidationError> {
+    for (index, value) in policy.stream_destinations.iter().enumerate() {
+        if !KNOWN_AUDIT_STREAM_SCHEMES
+            .iter()
+            .any(|scheme| value.starts_with(scheme))
+        {
+            return Err(AuditPolicyValidationError::UnknownStreamScheme {
+                index,
+                value: value.clone(),
+                valid: KNOWN_AUDIT_STREAM_SCHEMES,
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Build an [`InspectorChain`] from the workload's [`EgressPolicy`].
 /// Order matches Plan 37 §15: cheap/most-precise checks first, body
 /// inspectors last (so a destination-denied request never pays the
@@ -1423,6 +1477,66 @@ mod tests {
                 assert!(valid.contains(&"us_ssn"));
             }
             other => panic!("expected UnknownCategory, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn validate_audit_policy_accepts_known_schemes() {
+        let policy = mvm_policy::AuditPolicy {
+            chain_signing: true,
+            stream_destinations: vec![
+                "file:///var/log/mvm/audit.jsonl".to_string(),
+                "https://audit.example.com/ingest".to_string(),
+                "unix:///run/audit.sock".to_string(),
+            ],
+        };
+        validate_audit_policy_stream_destinations(&policy).expect("known schemes ok");
+    }
+
+    #[test]
+    fn validate_audit_policy_passes_empty_destinations() {
+        // Empty stream_destinations is the common case — no audit
+        // replication configured. Must validate cleanly.
+        let policy = mvm_policy::AuditPolicy::default();
+        validate_audit_policy_stream_destinations(&policy).expect("empty ok");
+    }
+
+    #[test]
+    fn validate_audit_policy_refuses_typo_with_row_index() {
+        let policy = mvm_policy::AuditPolicy {
+            chain_signing: true,
+            stream_destinations: vec![
+                "file:///var/log/mvm/audit.jsonl".to_string(),
+                "htpps://audit.example.com/ingest".to_string(), // typo
+            ],
+        };
+        let err = validate_audit_policy_stream_destinations(&policy).expect_err("typo");
+        match err {
+            AuditPolicyValidationError::UnknownStreamScheme {
+                index,
+                value,
+                valid,
+            } => {
+                assert_eq!(index, 1);
+                assert_eq!(value, "htpps://audit.example.com/ingest");
+                assert!(valid.contains(&"https://"));
+                assert!(valid.contains(&"file://"));
+            }
+        }
+    }
+
+    #[test]
+    fn validate_audit_policy_refuses_scheme_less_value() {
+        let policy = mvm_policy::AuditPolicy {
+            chain_signing: true,
+            stream_destinations: vec!["/var/log/audit.jsonl".to_string()],
+        };
+        let err = validate_audit_policy_stream_destinations(&policy).expect_err("no scheme");
+        match err {
+            AuditPolicyValidationError::UnknownStreamScheme { index, value, .. } => {
+                assert_eq!(index, 0);
+                assert_eq!(value, "/var/log/audit.jsonl");
+            }
         }
     }
 

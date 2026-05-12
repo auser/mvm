@@ -202,6 +202,10 @@ objc2-foundation = { version = "0.3", features = ["NSRunLoop", "NSDate", "NSAuto
 [dev-dependencies]
 assert_cmd.workspace = true
 chrono.workspace = true
+# Plan 60 Phase 4 — `tests/audit_total_coverage.rs` walks the
+# `clap::Command` tree returned by `mvm_cli::commands::cli_command()`
+# to enforce that every subcommand has a declared audit posture.
+clap.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

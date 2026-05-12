@@ -95,6 +95,22 @@ impl VmBackend for LibkrunBackend {
         Ok(())
     }
 
+    fn pause(&self, _id: &VmId) -> Result<()> {
+        // libkrun's C API does not expose vCPU pause/resume today;
+        // matches `capabilities().pause_resume == false`. When upstream
+        // surfaces it (or we wire HVF/KVM ioctl access ourselves), flip
+        // the capability flag and replace this bail with a real impl.
+        anyhow::bail!(
+            "pause is not supported by the libkrun backend (upstream C API does not expose vCPU pause)"
+        )
+    }
+
+    fn resume(&self, _id: &VmId) -> Result<()> {
+        anyhow::bail!(
+            "resume is not supported by the libkrun backend (upstream C API does not expose vCPU pause)"
+        )
+    }
+
     fn status(&self, _id: &VmId) -> Result<VmStatus> {
         // No real lifecycle yet — assume stopped.
         Ok(VmStatus::Stopped)

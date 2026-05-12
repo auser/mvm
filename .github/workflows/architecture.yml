@@ -1,0 +1,121 @@
+name: Architecture invariants
+
+# Architectural invariants enforced at CI time. Each lane corresponds to
+# a numbered invariant in the cross-repo plan
+# `~/.claude/plans/what-do-we-need-deep-dolphin.md` "Architectural
+# invariants" section. Failure on any lane blocks merge.
+#
+# Why a separate workflow from ci.yml: invariants are slow-moving and
+# high-signal — a violation is almost always a real architectural drift,
+# not a flaky test. Keeping them isolated makes the green/red signal
+# obvious in PR review and lets us add lanes without touching the
+# day-to-day CI surface.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  # ── Invariant #1: Only mvmd runs orchestration servers ──────────────
+  # mvm is a library + CLI substrate. No NEW orchestration / control-
+  # plane server in any mvm crate. Five categories of *substrate*
+  # server exist in mvm today and are explicitly allowlisted below —
+  # adding to the allowlist requires a new category, not a new server
+  # in an existing category.
+  #
+  # Substrate categories (allowlisted):
+  #   1. Privilege boundary — mvm-hostd (`crates/mvm/src/hostd/`).
+  #      Runs as root; mvmd-agent talks to it over UDS so the
+  #      orchestrator doesn't need privilege. Collapsing into mvmd
+  #      would destroy the privilege boundary it exists to provide.
+  #   2. Per-VM security primitives — L7 egress proxy
+  #      (`crates/mvm-supervisor/src/l7_proxy.rs`). Inspects outbound
+  #      HTTP from each guest. Lives next to the workload, not at the
+  #      orchestrator tier — moving to mvmd would force every per-VM
+  #      flow through the control plane.
+  #   3. Per-VM provider plumbing — Apple Container sockets
+  #      (`crates/mvm-providers/src/apple_container/macos.rs`).
+  #      Provider-specific guest-channel transport.
+  #   4. Observability — Prometheus metrics endpoint
+  #      (`crates/mvm-cli/src/metrics_server.rs`). Scrape surface.
+  #   5. Ephemeral port discovery — `TcpListener::bind("127.0.0.1:0")`
+  #      in `crates/mvm-cli/src/template_cmd.rs`. Binds to find a free
+  #      port; drops the listener immediately. Not a daemon.
+  #
+  # The in-guest vsock agent in `mvm-guest` is also excluded — it
+  # runs *inside* the microVM, not on the host.
+  #
+  # Plan reference: `~/.claude/plans/what-do-we-need-deep-dolphin.md`
+  # architectural invariant #1.
+  no-orchestration-server-in-mvm:
+    name: Invariant #1 — no orchestration server in mvm
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install ripgrep
+        run: sudo apt-get install -y ripgrep
+
+      - name: Grep mvm crates for server-binding patterns outside substrate allowlist
+        run: |
+          set -e
+
+          # Server-binding patterns. Each is a strong signal that a
+          # crate is acting as a server, not a client:
+          #   axum::Router / axum::serve / axum::Server — axum entry points
+          #   hyper::Server / hyper::server::conn — hyper 0.x and 1.x
+          #     (NOT hyper::Client / hyper::Body — those are fine; used
+          #     by reqwest etc.)
+          #   tonic::transport::Server — gRPC server
+          #   TcpListener::bind / UnixListener::bind — direct listening
+          #   NamedPipeServer — Windows named pipes server
+          PATTERNS='\b(axum::Router|axum::serve|axum::Server|hyper::Server|hyper::server::conn|tonic::transport::Server|TcpListener::bind|UnixListener::bind|NamedPipeServer)\b'
+
+          # Substrate allowlist — files documented in this workflow's
+          # header. Adding to the list requires a new category, not a
+          # new server in an existing category.
+          MATCHES=$(rg \
+              --type rust \
+              --glob '!**/target/**' \
+              --glob '!crates/mvm-guest/**' \
+              --glob '!xtask/**' \
+              --glob '!**/tests/**' \
+              --glob '!**/benches/**' \
+              --glob '!**/examples/**' \
+              --glob '!crates/mvm/src/hostd/**' \
+              --glob '!crates/mvm-supervisor/src/l7_proxy.rs' \
+              --glob '!crates/mvm-providers/src/apple_container/**' \
+              --glob '!crates/mvm-cli/src/metrics_server.rs' \
+              --glob '!crates/mvm-cli/src/template_cmd.rs' \
+              -e "$PATTERNS" \
+              crates/ src/ \
+              || true)
+
+          if [ -n "$MATCHES" ]; then
+            echo "::error::Architectural invariant #1 violated: a new server appeared in mvm outside the substrate allowlist."
+            echo ""
+            echo "$MATCHES"
+            echo ""
+            echo "mvm is a library + CLI substrate. Orchestration servers belong in mvmd."
+            echo ""
+            echo "If your addition is a new category of substrate (privilege boundary,"
+            echo "per-VM security, per-VM provider plumbing, observability, or ephemeral"
+            echo "port discovery), document it at the top of"
+            echo ".github/workflows/architecture.yml AND add the file to the allowlist"
+            echo "in the same PR. The bar is 'a new category emerged' — not 'I want to"
+            echo "add a new server here'."
+            echo ""
+            echo "If your addition belongs in mvmd, move it to mvmd."
+            exit 1
+          fi
+
+          echo "No orchestration servers in mvm — invariant #1 holds."

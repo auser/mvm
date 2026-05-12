@@ -12,6 +12,7 @@ pub mod observability;
 pub mod user_config;
 
 pub mod domain;
+pub mod mvmd_iface;
 pub mod platform;
 pub mod policy;
 pub mod protocol;

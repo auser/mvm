@@ -828,6 +828,67 @@ pub fn restore_from_template_snapshot(
     Ok(())
 }
 
+/// Pause the vCPUs of a running Firecracker VM.
+///
+/// Sends `PATCH /vm` with `{"state":"Paused"}` to the per-VM control
+/// socket. The VMM stays alive; vCPUs stop scheduling. Used by mvmd's
+/// sleep path (snapshot-on-sleep, restore-on-wake).
+///
+/// Errors loudly if the VM is not running rather than silently treating
+/// it as a no-op — a stale `pause` against a vanished VM should surface
+/// the inconsistency, not be swallowed.
+#[instrument(skip_all, fields(name))]
+pub fn pause_vm(name: &str) -> Result<()> {
+    require_linux_env()?;
+
+    let abs_vms = run_in_vm_stdout(&format!("echo {}", VMS_DIR))?;
+    let abs_dir = format!("{}/{}", abs_vms.trim(), name);
+    let pid_file = format!("{}/fc.pid", abs_dir);
+    let socket = format!("{}/fc.socket", abs_dir);
+
+    if !firecracker::is_vm_running(&pid_file)? {
+        anyhow::bail!("VM '{}' is not running", name);
+    }
+
+    let q_socket = shell_quote(&socket);
+    run_in_vm(&format!(
+        r#"sudo curl -fsS -X PATCH --unix-socket {q_socket} \
+            -H 'Content-Type: application/json' \
+            -d '{{"state":"Paused"}}' \
+            'http://localhost/vm'"#,
+    ))
+    .with_context(|| format!("PATCH /vm Paused for VM '{}'", name))?;
+    Ok(())
+}
+
+/// Resume vCPUs of a paused Firecracker VM.
+///
+/// Counterpart to [`pause_vm`]. Sends `PATCH /vm` with
+/// `{"state":"Resumed"}` to the per-VM control socket.
+#[instrument(skip_all, fields(name))]
+pub fn resume_vm(name: &str) -> Result<()> {
+    require_linux_env()?;
+
+    let abs_vms = run_in_vm_stdout(&format!("echo {}", VMS_DIR))?;
+    let abs_dir = format!("{}/{}", abs_vms.trim(), name);
+    let pid_file = format!("{}/fc.pid", abs_dir);
+    let socket = format!("{}/fc.socket", abs_dir);
+
+    if !firecracker::is_vm_running(&pid_file)? {
+        anyhow::bail!("VM '{}' is not running", name);
+    }
+
+    let q_socket = shell_quote(&socket);
+    run_in_vm(&format!(
+        r#"sudo curl -fsS -X PATCH --unix-socket {q_socket} \
+            -H 'Content-Type: application/json' \
+            -d '{{"state":"Resumed"}}' \
+            'http://localhost/vm'"#,
+    ))
+    .with_context(|| format!("PATCH /vm Resumed for VM '{}'", name))?;
+    Ok(())
+}
+
 /// Stop a specific named VM.
 #[instrument(skip_all, fields(name))]
 pub fn stop_vm(name: &str) -> Result<()> {

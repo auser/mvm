@@ -1,31 +1,32 @@
 #!/bin/bash
-# Pre-commit hook for mvm — light, host-runnable.
+# Pre-commit hook for mvm — catches what CI catches, locally.
 #
-# Per AGENTS.md: this hook fires once per commit at the main checkout
-# (because git always runs from there), and it must stay fast and host-
-# friendly so it doesn't block worktree workflows. Heavy checks
-# (workspace clippy, full test suite, supply-chain gates) live in CI,
-# not here.
+# Activation: `git config core.hooksPath .githooks` (one-time per clone).
+# The repository ships this hook to prevent the two failure modes that
+# wasted main-branch CI minutes most often: format drift and clippy
+# warnings. Both gates are enforced in CI with `-D warnings`, so the
+# local hook mirrors that exactly.
 #
 # What this hook does:
 #   1. Skip entirely if the staged set is empty.
 #   2. Run cargo fmt --all if any Rust files are staged (auto-fixes,
-#      re-stages). Cargo fmt works on the macOS host.
-#   3. For every staged *.nix file, run `nix fmt` from inside that
+#      re-stages).
+#   3. Run cargo clippy --workspace --all-targets -- -D warnings if
+#      any Rust files are staged. Set MVM_SKIP_CLIPPY=1 to bypass when
+#      iterating fast (CI still gates the merge).
+#   4. For every staged *.nix file, run `nix fmt` from inside that
 #      file's directory (auto-fixes, re-stages) — IF the nix CLI is
 #      available. Otherwise skip silently.
 #
-# What this hook deliberately does NOT do:
-#   - cargo check / cargo build / cargo clippy / cargo test — the
-#     workspace targets Linux-specific deps and these don't compile
-#     cleanly on the macOS host. Run them via Lima or rely on CI.
+# Heavier checks that still belong in CI only:
+#   - cargo test --workspace — slow on a cold build, and the workspace
+#     has Linux-only test binaries that don't compile on macOS hosts.
 #   - cargo-deny / cargo-audit — supply-chain gates run in CI
 #     (.github/workflows/security.yml).
 #
 # To run the heavier checks locally before pushing:
-#   limactl shell mvm-builder -- cargo clippy --workspace --all-targets -- -D warnings
-#   limactl shell mvm-builder -- cargo nextest run --workspace
-#   limactl shell mvm-builder -- cargo deny check
+#   cargo test --workspace
+#   cargo deny check
 #   just ci
 
 set -e
@@ -48,14 +49,39 @@ while IFS= read -r f; do
 done <<< "$staged"
 
 if [ "$has_rust" -eq 1 ]; then
+    # Snapshot the originally-staged Rust file set so we only re-stage
+    # *those* after `cargo fmt --all`. Without this guard, the
+    # subsequent `git add` would sweep in WIP files left modified in
+    # the working tree but never staged — silently bundling unrelated
+    # work into focused commits.
+    staged_rust="$(printf '%s\n' "$staged" | grep -E '\.rs$' || true)"
+
     echo "pre-commit: cargo fmt --all"
     if ! cargo fmt --all; then
         echo "  cargo fmt failed."
         exit 1
     fi
-    if ! git diff --quiet --exit-code; then
-        echo "pre-commit: re-staging formatted files"
-        git add -u
+    if [ -n "$staged_rust" ]; then
+        # Only re-stage files that were already part of this commit.
+        # `git add` is a no-op for paths fmt didn't touch.
+        while IFS= read -r f; do
+            [ -z "$f" ] && continue
+            [ ! -f "$f" ] && continue
+            git add -- "$f"
+        done <<< "$staged_rust"
+    fi
+
+    if [ "${MVM_SKIP_CLIPPY:-0}" = "1" ]; then
+        echo "pre-commit: cargo clippy SKIPPED (MVM_SKIP_CLIPPY=1)"
+    else
+        echo "pre-commit: cargo clippy --workspace --all-targets -- -D warnings"
+        if ! cargo clippy --workspace --all-targets -- -D warnings; then
+            echo
+            echo "  clippy failed. CI gates on the same '-D warnings' rule, so"
+            echo "  this commit will fail on push. Re-run with MVM_SKIP_CLIPPY=1"
+            echo "  if you genuinely need to land a WIP commit; otherwise fix."
+            exit 1
+        fi
     fi
 fi
 
