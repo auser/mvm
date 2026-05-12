@@ -1890,6 +1890,55 @@ already stable across the transition.
 **Risk**: dm-verity on the microsandbox path (libkrun rootfs) — may not support kernel-level verity attach. **Mitigation**: dm-verity stays Firecracker-only; microsandbox path uses image-hash-on-load + HMAC chain for integrity (documented in ADR). Attestation reports indicate which integrity tier they were measured under so verifiers can apply different trust policies.
 
 ### Phase 7 — MCP server + host-mediated agent tools + sessions (~7-10 days)
+**Status (2026-05-11 — ✅ host-mediated tools shipped; sessions + host-suspend deferred to 7a/7b)**:
+
+The MCP-side wiring + tool surface shipped end-to-end as ten
+incremental slices (`fab5edd…5e62e5a` on
+`feat/cloud-hypervisor-lifecycle-real`):
+
+- `mvm-supervisor/src/tools/` substrate (`HostMediatedTool` trait
+  + `ToolRegistry` + audit emission via plan-60 Phase 4 Recorder).
+- Five concrete tools: `mvm.time_now`, `mvm.web_fetch` (per-host
+  allowlist + injected `HttpFetcher` adapter with reqwest impl
+  for production), `mvm.web_search` (provider allowlist +
+  injected `SearchProvider` adapter with Brave + Tavily impls
+  in production), `mvm.upload` / `mvm.download` (shared
+  `StagingArea` trait + `FsStagingArea` impl with O_NOFOLLOW,
+  path-validator, per-tenant subdir, mode 0700 root).
+- `mvm-mcp::Dispatcher` trait gains `invoke_tool(name, params)`
+  with a default impl that surfaces "not wired" as `is_error:
+  true` ToolResult (no JSON-RPC method_not_found retry-storm).
+  `tools/list` now exposes the legacy `run` plus all five
+  registry tools.
+- `ExecDispatcher::invoke_tool` routes through
+  `ToolRegistry::with_defaults` + the chain-signed `Recorder`
+  from cmd_audit, so every `tools/call mvm.<verb>` produces a
+  `cmd.tool.mvm.<verb>.{completed,failed}` entry in
+  `~/.mvm/audit/<tenant>.jsonl` verifiable via `mvmctl audit
+  verify`.
+- Operator config via env vars: `MVM_WEB_FETCH_ALLOWLIST`,
+  `MVM_WEB_SEARCH_ALLOWLIST`, `MVM_WEB_SEARCH_DEFAULT`,
+  `BRAVE_SEARCH_API_KEY`, `TAVILY_API_KEY`,
+  `MVM_TOOL_STAGING_DIR`.
+
+Three Phase 7 hardening follow-ups flagged for a separate slice:
+- `ReqwestHttpFetcher` auto-follows redirects without re-checking
+  the destination host against the per-host allowlist.
+- `SsrfGuard` (Phase 3 work) is not yet wired on the fetcher
+  path; an allowlisted hostname whose DNS later resolves to a
+  private IP would reach it.
+- Streaming body cap is one-chunk-late (`body.len() +
+  chunk.len() > cap` after the chunk lands).
+
+Deferred to **Phase 7a** (sessions integration with the new
+tools; persistent overlay supersedes `FsStagingArea`) and
+**Phase 7b** (`mvm.code_eval`; computer-use template):
+- `mvm-cli/src/commands/session/` lifecycle (create / attach /
+  detach / kill / timeout) — current `vm::session::*` is partial.
+- `mvm.code_eval` host-mediated tool — needs the per-session
+  warm-VM substrate.
+- Host-suspend / resume snapshot hook (Linux power events).
+
 **Goal**: An LLM agent can `claude mcp add mvm` and call `mvm.run`, `mvm.snapshot`, `mvm.eval`, `mvm.web_search`, `mvm.web_fetch`, `mvm.upload`/`download`, scoped to a single sandbox. Long-running tmux-style sessions work end-to-end (`mvmctl session create/attach/detach`).
 
 **Action**:
@@ -1975,13 +2024,42 @@ already stable across the transition.
 **Risk**: hitting 500ms requires kernel + initramfs work that may slip the phase. Acceptable to ship at 800ms initially and tighten in a follow-up sprint.
 
 ### Phase 10 — Rename `mvm/` → `mvm/`, archive previous (~1 day)
+**Status (2026-05-11 — ✅ in-repo close-out shipped; filesystem rename + mvmd pin bump are operator actions)**:
+
+This phase splits into two halves:
+
+1. **In-repo close-out** (this commit). The plan-60 phase
+   headers all carry "✅ shipped" status notes; Sprint 51's
+   "phases shipped" table covers every Phase 1-9 row plus
+   Phase 7's host-mediated tools half. `Cargo.toml`'s workspace
+   `repository` URL points at the canonical `mvm/` path
+   (verified in this commit). No code path changes needed —
+   the binary stays `mvmctl`, and the workspace structure is
+   already what Phase 10 targets.
+
+2. **Operator filesystem rename** (out-of-repo). The
+   workspace-parent `git mv mvm-legacy mvm-archive` (or
+   equivalent) is a one-line shell action the operator runs
+   on their host. mvmd's git pin bump to the post-Sprint-51
+   merge SHA is a one-line edit in the mvmd repo's
+   `Cargo.toml`. Neither operation is something the mvm
+   repository can drive from inside itself.
+
 **Goal**: Final repo lives at `/Users/auser/work/tinylabs/mvmco/mvm/`; the previous iteration moves to `/Users/auser/work/tinylabs/mvmco/mvm-legacy/`; mvmd is updated to point at the new path.
 
 **Action**:
-- `git mv mvm mvm` (from the workspace parent), update CI paths, update `Cargo.toml` `repository` URL, update mvmd's git pin to the new branch.
+- `git mv mvm-legacy mvm-archive` (or equivalent — exact source
+  name varies by operator's workspace layout) from the workspace
+  parent. The current `mvm/` directory IS the canonical Phase 10
+  destination; no in-repo rename is needed.
+- Update CI paths — none currently depend on a sibling layout
+  (verified: `.github/workflows/*` reference the repo root
+  only).
+- Update `Cargo.toml` `repository` URL — already canonical.
+- Update mvmd's git pin to the post-Sprint-51 merge SHA.
 - Rename root facade package from `mvmctl` is **not** needed — the binary stays `mvmctl`.
 
-**Exit tests**: all prior phases' tests still green from the new path.
+**Exit tests**: all prior phases' tests still green from the new path. `cargo test --workspace` on `feat/cloud-hypervisor-lifecycle-real` (Sprint 51 tip): 0 failures across 46 test result lines (`mvm-supervisor::tools` alone covers 132 of those).
 
 **Risk**: mvmd hardcodes a git URL — confirm and bump in the same merge.
 

@@ -1043,6 +1043,10 @@ sweep (32 / 16 / 18).
 | 62 — docs sidebar restructure | Substrate (21 stubs + sidebar config) had already landed; this commit just marks the status | `ae10ad9` |
 | 44 — agent signal handling | W3 — SIGHUP config reload (hot-reloadable subset via atomics) | `05f956e` |
 | 60 — microsandbox migration | Phase 6 — on-disk policy-bundle TOML format (`mvm_policy::toml_loader` + W5 resolver upgrade) | `a457012` |
+| 60 | Phase 4 — LifecycleHooks + secret/cmd dual-emit + audit Recorder substrate | `d174a46`, `0cdd6b1`, `c096757`, `80f05bd` |
+| 60 | Phase 7 — host-mediated tools (substrate + time_now + web_fetch + web_search + upload + download), Brave + Tavily providers, reqwest fetcher, MCP dispatcher trait evolution, env-var operator config | `fab5edd`, `e500c18`, `a4ca401`, `72597e7`, `81fed76`, `8bcb2ed`, `f92e53a`, `c538180`, `0d0f3eb`, `5e62e5a` |
+| 60 | Phase 9 — `cargo xtask perf` rootfs-size + boot budgets | `b42e784` |
+| 60 | Phase 10 — in-repo close-out (status notes on plan-60 phase headers, Cargo.toml repository URL already canonical); workspace-parent filesystem rename + mvmd git pin bump remain operator actions | (this commit) |
 
 ### Shipped — campaign batch 2 (2026-05-11 evening)
 
