@@ -172,6 +172,17 @@ impl Default for ExecDispatcher {
 fn build_tool_registry() -> ToolRegistry {
     let mut registry = ToolRegistry::with_defaults();
 
+    // Plan 60 Phase 4 wire-up: every successful tool invocation
+    // emits a `cmd.tool.<name>.{completed,failed}` chain-signed
+    // entry through the host signer's FileAuditSigner. When the
+    // signer isn't reachable (no $HOME, key not initialized, loose
+    // perms) we log a warning in `build_cmd_recorder` and skip the
+    // attachment — tool calls still succeed; the audit footprint
+    // just doesn't land. Same posture as `cmd.*` envelopes.
+    if let Some(rec) = crate::commands::cmd_audit::build_cmd_recorder() {
+        registry = registry.with_recorder(rec);
+    }
+
     // mvm.web_fetch
     let allow = web_fetch::allowlist_from_env_var(web_fetch::ALLOWLIST_ENV_VAR);
     let mut fetch_tool = web_fetch::WebFetchTool::with_allowlist(allow);
