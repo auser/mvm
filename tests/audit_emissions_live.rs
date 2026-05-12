@@ -47,6 +47,9 @@
 //!   build + template lookup. Together they let `mvmctl up` run
 //!   to completion on a CI runner with no KVM / Nix / Apple
 //!   Container / Docker / microsandbox)
+//! - `mvmctl set-ttl <vm> <duration>` (after `up --hypervisor mock`)
+//!   → `VmTtlSet` (chains off the up-via-mock fixture; the verb
+//!   operates on the persistent name registry that `up` populates)
 //! - `mvmctl down` (no args, empty sandbox) → `VmStop`
 //!   (`stop_all` is tolerant of an empty VM registry and emits
 //!   with `detail=stop_all_ok`)
@@ -764,31 +767,29 @@ fn cleanup_emits_slot_prune_audit_entry_even_with_no_builds() {
     );
 }
 
-#[test]
-fn up_with_mock_backend_emits_vm_start_audit_entry() {
-    // End-to-end test of `mvmctl up` against the in-memory
-    // `MockBackend`. Pre-PR-#108 this row needed a real Firecracker
-    // / Apple Container / Docker / microsandbox to exercise — none
-    // of which are hermetic on a CI runner. The MockBackend
-    // substrate (PR #108) and the `MVM_DIRECT_BOOT` direct-boot
-    // path together close that gap:
-    //   * `MVM_DIRECT_BOOT=1` + stub artifact env vars skip the
-    //     build + template-lookup pre-flight that needs real Nix.
-    //   * `--hypervisor mock` routes the backend dispatch to the
-    //     in-memory `MockBackend`.
-    //   * `--detach` short-circuits the Ctrl+C loop so the
-    //     subprocess exits cleanly.
-    //   * `--no-supervisor` skips plan-64 admission (which needs
-    //     the host signer key + audit dir) — the test pins
-    //     `vm_start` LocalAudit, which fires regardless.
-    let sandbox = AuditSandbox::new();
+/// Bring up an `--hypervisor mock` VM in the sandbox via the
+/// `MVM_DIRECT_BOOT` direct-boot path. Returns when the VM is
+/// registered in the name registry (which `up` does before
+/// dispatching to the backend). Used as a fixture by tests of
+/// state-changing verbs that operate on a registered VM
+/// (`set-ttl`, future `pause`/`resume`/etc. work).
+///
+/// Pass-through env: `MVM_DIRECT_BOOT=1` + stub kernel/rootfs
+/// files skip the build + template-lookup pre-flight that needs
+/// real Nix; `--hypervisor mock` routes backend dispatch to
+/// [`mvm_backend::MockBackend`]; `--detach` short-circuits the
+/// Ctrl+C loop; `--no-supervisor` skips plan-64 admission.
+fn bring_up_mock_vm(sandbox: &AuditSandbox, name: &str) {
     let stub_dir = sandbox.home_path().join("stub");
     std::fs::create_dir_all(&stub_dir).expect("mkdir stub");
     let kernel = stub_dir.join("vmlinux");
     let rootfs = stub_dir.join("rootfs.ext4");
-    std::fs::write(&kernel, b"fake-kernel").expect("write stub kernel");
-    std::fs::write(&rootfs, b"fake-rootfs").expect("write stub rootfs");
-
+    if !kernel.exists() {
+        std::fs::write(&kernel, b"fake-kernel").expect("write stub kernel");
+    }
+    if !rootfs.exists() {
+        std::fs::write(&rootfs, b"fake-rootfs").expect("write stub rootfs");
+    }
     let output = sandbox
         .mvmctl()
         .env("MVM_DIRECT_BOOT", "1")
@@ -799,17 +800,29 @@ fn up_with_mock_backend_emits_vm_start_audit_entry() {
             "--hypervisor",
             "mock",
             "--name",
-            "test-up-vm",
+            name,
             "--no-supervisor",
             "--detach",
         ])
         .output()
-        .expect("spawn mvmctl");
+        .expect("spawn mvmctl up");
     assert!(
         output.status.success(),
-        "mvmctl up failed: stderr={}",
+        "fixture: bring_up_mock_vm({name}) failed: stderr={}",
         String::from_utf8_lossy(&output.stderr)
     );
+}
+
+#[test]
+fn up_with_mock_backend_emits_vm_start_audit_entry() {
+    // End-to-end test of `mvmctl up` against the in-memory
+    // `MockBackend`. Pre-MockBackend this row needed a real
+    // Firecracker / Apple Container / Docker / microsandbox to
+    // exercise — none of which are hermetic on a CI runner. The
+    // MockBackend substrate + the `MVM_DIRECT_BOOT` direct-boot
+    // path (see `bring_up_mock_vm`) together close that gap.
+    let sandbox = AuditSandbox::new();
+    bring_up_mock_vm(&sandbox, "test-up-vm");
 
     let log = read_audit_log(&sandbox.audit_log_path());
     let hits = count_entries_with_kind(&log, "vm_start");
@@ -820,6 +833,69 @@ fn up_with_mock_backend_emits_vm_start_audit_entry() {
     assert!(
         log.contains("\"vm_name\":\"test-up-vm\""),
         "vm_start must carry vm_name=test-up-vm. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn set_ttl_emits_vm_ttl_set_audit_entry() {
+    // `mvmctl set-ttl <vm> <duration>` operates on the persistent
+    // name registry that `mvmctl up` populates. Bring up a mock
+    // VM first (registers it), then update its TTL — the verb
+    // emits `vm_ttl_set` with `expires_at=<RFC3339>` in detail.
+    let sandbox = AuditSandbox::new();
+    bring_up_mock_vm(&sandbox, "test-ttl-vm");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["set-ttl", "test-ttl-vm", "1h"])
+        .output()
+        .expect("spawn mvmctl set-ttl");
+    assert!(
+        output.status.success(),
+        "mvmctl set-ttl failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_ttl_set");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_ttl_set entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("\"vm_name\":\"test-ttl-vm\""),
+        "vm_ttl_set must carry vm_name=test-ttl-vm. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("expires_at="),
+        "vm_ttl_set detail must record expires_at. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn set_ttl_clear_emits_vm_ttl_set_with_cleared_detail() {
+    // Negative-shape complement: `set-ttl --clear` removes the
+    // TTL and emits the same `vm_ttl_set` kind but with
+    // `detail=expires_at=cleared`. Pins both the verb's "set"
+    // and "clear" paths in one suite.
+    let sandbox = AuditSandbox::new();
+    bring_up_mock_vm(&sandbox, "test-ttl-clear-vm");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["set-ttl", "test-ttl-clear-vm", "--clear"])
+        .output()
+        .expect("spawn mvmctl set-ttl --clear");
+    assert!(
+        output.status.success(),
+        "mvmctl set-ttl --clear failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.contains("expires_at=cleared"),
+        "set-ttl --clear must record expires_at=cleared. Full log:\n{log}"
     );
 }
 
