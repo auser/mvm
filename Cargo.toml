@@ -291,3 +291,11 @@ codegen-units = 1
 name = "libkrun-smoke"
 path = "examples/libkrun-smoke.rs"
 required-features = ["libkrun-sys"]
+
+# Plan 57 W3 — bootcheck. Validates libkrun can boot any Linux kernel
+# on this host; consumes existing dev-prebuilt artifacts by default so
+# it runs without first building the minimal flake.
+[[example]]
+name = "libkrun-bootcheck"
+path = "examples/libkrun-bootcheck.rs"
+required-features = ["libkrun-sys"]

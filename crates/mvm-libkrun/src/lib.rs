@@ -162,6 +162,13 @@ pub struct KrunContext {
     /// the cmdline is the most likely source of "VM boots but produces
     /// no output" failures — set it explicitly when validating.
     pub kernel_cmdline: Option<String>,
+    /// Redirect the guest's implicit virtio-console (hvc0) to a host
+    /// file. When `Some`, libkrun writes everything the kernel +
+    /// userspace emit to this path — the load-bearing observability
+    /// hook for "did the kernel actually boot?". `None` leaves the
+    /// console attached to libkrun's default (stdout of the calling
+    /// process).
+    pub console_output_path: Option<PathBuf>,
     /// Guest-port → host-Unix-socket mappings. For each entry,
     /// libkrun bridges the guest's `AF_VSOCK` port `guest_port` to
     /// the named host Unix socket. The host process is responsible
@@ -196,6 +203,7 @@ impl KrunContext {
             vcpus: 1,
             ram_mib: 256,
             kernel_cmdline: None,
+            console_output_path: None,
             vsock_listeners: Vec::new(),
         }
     }
@@ -211,6 +219,16 @@ impl KrunContext {
     /// override and fall back to libkrun's built-in default.
     pub fn with_kernel_cmdline(mut self, cmdline: impl Into<String>) -> Self {
         self.kernel_cmdline = Some(cmdline.into());
+        self
+    }
+
+    /// Redirect the implicit virtio-console output to `path`. Required
+    /// when the caller can't observe the calling process's stdout —
+    /// e.g. a spawned libkrun child whose stdout the parent doesn't
+    /// inherit. Setting this is the canonical observability hook for
+    /// "is the kernel even reaching userspace?" boot-check tests.
+    pub fn with_console_output(mut self, path: impl Into<PathBuf>) -> Self {
+        self.console_output_path = Some(path.into());
         self
     }
 
@@ -312,6 +330,9 @@ fn configure(ctx: &KrunContext) -> Result<sys::Context, Error> {
         ctx.kernel_cmdline.as_deref(),
     )?;
     krun.add_disk("root", Path::new(&ctx.rootfs_path), false)?;
+    if let Some(path) = &ctx.console_output_path {
+        krun.set_console_output(path)?;
+    }
     for listener in &ctx.vsock_listeners {
         krun.add_vsock_port(listener.guest_port, &listener.host_socket)?;
     }
