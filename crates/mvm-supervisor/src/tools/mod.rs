@@ -49,6 +49,7 @@
 //!    substrate does not pre-allowlist anything).
 
 pub mod download;
+pub mod http_hardening;
 pub mod staging;
 pub mod time_now;
 pub mod upload;

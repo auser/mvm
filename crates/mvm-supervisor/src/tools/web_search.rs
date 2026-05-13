@@ -38,9 +38,11 @@ use std::collections::BTreeSet;
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use secrecy::{ExposeSecret, SecretBox};
 use serde::{Deserialize, Serialize};
 use thiserror::Error;
 
+use super::http_hardening::{DEFAULT_RESPONSE_BODY_CAP, hardened_client_builder, read_capped};
 use super::{HostMediatedTool, ToolInvokeError};
 
 pub const TOOL_NAME: &str = "mvm.web_search";
@@ -115,6 +117,15 @@ impl SearchProvider for NoopSearchProvider {
 /// API key. The agent never sees the key — it's pinned inside this
 /// struct at construction and consumed only by the HTTP send.
 ///
+/// ## W6 — credential lifetime hardening (plan 65)
+///
+/// `api_key` is held as `SecretBox<String>` so the bytes zeroize
+/// on drop. The wrapper also refuses accidental `Debug`/`Display`
+/// formatting — only `expose_secret()` at the wire boundary
+/// returns the underlying string. The provider does NOT derive
+/// `Debug`; tests that need to print a representation should use
+/// `name()` instead.
+///
 /// ## Wire shape
 ///
 /// Brave's `/res/v1/web/search` returns JSON with a `web.results`
@@ -125,7 +136,7 @@ impl SearchProvider for NoopSearchProvider {
 /// `BraveResponse`/`BraveWebResults`/`BraveResult` carry only what
 /// we need.
 pub struct BraveSearchProvider {
-    api_key: String,
+    api_key: SecretBox<String>,
     client: reqwest::Client,
     endpoint: String,
 }
@@ -134,18 +145,20 @@ impl BraveSearchProvider {
     /// Canonical Brave Search API endpoint.
     pub const DEFAULT_ENDPOINT: &'static str = "https://api.search.brave.com/res/v1/web/search";
 
-    /// Build with the default endpoint + a fresh reqwest client.
-    /// `api_key` is the value of the operator's
-    /// `X-Subscription-Token`. The caller is responsible for
-    /// sourcing it from a secret store; this constructor takes the
-    /// raw bytes and pins them inside `self`.
-    pub fn new(api_key: impl Into<String>) -> Result<Self, SearchError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(15))
+    /// Build with the default endpoint + a hardened reqwest client
+    /// (plan 65 W1 no-auto-redirect + W2 SSRF-filtering resolver).
+    /// `api_key` is the operator's `X-Subscription-Token` value
+    /// wrapped in `SecretBox<String>` so it zeroizes on drop
+    /// (plan 65 W6). The constructor takes a `SecretBox` rather
+    /// than `impl Into<String>` so the operator must explicitly
+    /// commit to the secret-lifetime contract — accidental raw-
+    /// string construction stops at the type system.
+    pub fn new(api_key: SecretBox<String>) -> Result<Self, SearchError> {
+        let client = hardened_client_builder(15)
             .build()
             .map_err(|e| SearchError::Upstream(format!("building reqwest client: {e}")))?;
         Ok(Self {
-            api_key: api_key.into(),
+            api_key,
             client,
             endpoint: Self::DEFAULT_ENDPOINT.to_string(),
         })
@@ -197,7 +210,10 @@ impl SearchProvider for BraveSearchProvider {
         let response = self
             .client
             .get(&self.endpoint)
-            .header("X-Subscription-Token", &self.api_key)
+            .header(
+                "X-Subscription-Token",
+                self.api_key.expose_secret().as_str(),
+            )
             .query(&[("q", query), ("count", &count.to_string())])
             .send()
             .await
@@ -211,9 +227,13 @@ impl SearchProvider for BraveSearchProvider {
                 "Brave search returned status {status}"
             )));
         }
-        let parsed: BraveResponse = response
-            .json()
+        // Plan 65 follow-on — cap the response body before parsing so
+        // a malicious upstream (or compromised CDN) can't push
+        // gigabytes of JSON at the supervisor.
+        let body = read_capped(response, DEFAULT_RESPONSE_BODY_CAP)
             .await
+            .map_err(SearchError::Upstream)?;
+        let parsed: BraveResponse = serde_json::from_slice(&body)
             .map_err(|e| SearchError::Upstream(format!("decoding Brave response: {e}")))?;
         let hits: Vec<SearchHit> = parsed
             .web
@@ -407,15 +427,15 @@ impl HostMediatedTool for WebSearchTool {
 /// Tavily's auth shape differs from Brave's: the API key travels
 /// inside the JSON request body (`"api_key": "<key>"`), and the
 /// search itself is a POST (not a GET-with-query-string). Otherwise
-/// the abstraction matches — supervisor owns the key, the agent
-/// never sees it.
+/// the abstraction matches — supervisor owns the key (held as
+/// `SecretBox<String>`; plan 65 W6), the agent never sees it.
 ///
 /// Tavily is "search-for-LLMs" by design: each result row carries
 /// a `content` field that's an LLM-friendly snippet (often longer
 /// than Brave's `description`). We map it to `snippet` so the
 /// agent surface stays uniform across providers.
 pub struct TavilySearchProvider {
-    api_key: String,
+    api_key: SecretBox<String>,
     client: reqwest::Client,
     endpoint: String,
 }
@@ -429,14 +449,15 @@ impl TavilySearchProvider {
     /// plenty of headroom for the slow-tail case.
     const DEFAULT_TIMEOUT_SECS: u64 = 20;
 
-    /// Build with the default endpoint + a fresh reqwest client.
-    pub fn new(api_key: impl Into<String>) -> Result<Self, SearchError> {
-        let client = reqwest::Client::builder()
-            .timeout(std::time::Duration::from_secs(Self::DEFAULT_TIMEOUT_SECS))
+    /// Build with the default endpoint + a hardened reqwest client
+    /// (plan 65 W1 + W2 + W6 — no auto-redirect, SSRF-filtering
+    /// resolver, zeroize-on-drop credential).
+    pub fn new(api_key: SecretBox<String>) -> Result<Self, SearchError> {
+        let client = hardened_client_builder(Self::DEFAULT_TIMEOUT_SECS)
             .build()
             .map_err(|e| SearchError::Upstream(format!("building reqwest client: {e}")))?;
         Ok(Self {
-            api_key: api_key.into(),
+            api_key,
             client,
             endpoint: Self::DEFAULT_ENDPOINT.to_string(),
         })
@@ -480,7 +501,7 @@ impl SearchProvider for TavilySearchProvider {
         // caller-supplied 50 doesn't trip an upstream 422.
         let max = max_results.min(20);
         let body = serde_json::json!({
-            "api_key": self.api_key,
+            "api_key": self.api_key.expose_secret(),
             "query": query,
             "max_results": max,
         });
@@ -500,9 +521,10 @@ impl SearchProvider for TavilySearchProvider {
                 "Tavily search returned status {status}"
             )));
         }
-        let parsed: TavilyResponse = response
-            .json()
+        let body = read_capped(response, DEFAULT_RESPONSE_BODY_CAP)
             .await
+            .map_err(SearchError::Upstream)?;
+        let parsed: TavilyResponse = serde_json::from_slice(&body)
             .map_err(|e| SearchError::Upstream(format!("decoding Tavily response: {e}")))?;
         let hits: Vec<SearchHit> = parsed
             .results
@@ -511,6 +533,206 @@ impl SearchProvider for TavilySearchProvider {
                 title: r.title,
                 url: r.url,
                 snippet: r.content,
+            })
+            .collect();
+        if hits.is_empty() {
+            return Err(SearchError::Empty);
+        }
+        Ok(hits)
+    }
+}
+
+/// Google Custom Search API provider. Documented at
+/// <https://developers.google.com/custom-search/v1/overview>.
+///
+/// ## W5 — API-key-in-URL hardening (plan 65)
+///
+/// Google's Custom Search v1 endpoint requires both an API key
+/// AND a Custom Search Engine (CSE) ID in the URL query string:
+///
+/// ```text
+/// https://www.googleapis.com/customsearch/v1?key=<API_KEY>&cx=<CSE_ID>&q=<query>
+/// ```
+///
+/// This is structurally less safe than Brave's
+/// `X-Subscription-Token` header or Tavily's request-body field
+/// — URLs show up in:
+///
+/// - `reqwest::Error::Display` formatting on network failures
+///   (the error string includes the requested URL with query
+///   params).
+/// - Server access logs at the upstream (Google's own logs are
+///   the operator's problem, not ours).
+/// - Audit fields if we naively wrap the error.
+///
+/// **Mitigation (this struct):**
+///
+/// 1. The constructed URL is never passed to `tracing` or audit
+///    fields. The provider builds the URL inside `search()` via
+///    reqwest's `query()` helper and discards it after the send.
+/// 2. Any error string surfaced upward goes through
+///    [`redact_credentials`], which replaces every occurrence of
+///    the API key and CSE ID with `<REDACTED>`. The redacted
+///    string is what reaches the audit chain + `tracing` +
+///    operator-visible diagnostics.
+/// 3. The hand-written `Debug` impl below redacts both
+///    credentials, so accidental `{provider:?}` formatting
+///    (e.g. via `tracing::error!(provider = ?p, ...)`) does not
+///    leak the key.
+/// 4. The agent never sees either credential — same posture as
+///    Brave + Tavily; the supervisor owns them.
+pub struct GoogleSearchProvider {
+    api_key: SecretBox<String>,
+    cse_id: SecretBox<String>,
+    client: reqwest::Client,
+    endpoint: String,
+}
+
+impl GoogleSearchProvider {
+    /// Canonical Google Custom Search API endpoint.
+    pub const DEFAULT_ENDPOINT: &'static str = "https://www.googleapis.com/customsearch/v1";
+
+    /// Default per-call timeout. Google CSE typically responds in
+    /// ~500ms; 15 s covers slow-tail without permitting hung
+    /// connections to occupy a tokio task.
+    const DEFAULT_TIMEOUT_SECS: u64 = 15;
+
+    /// Build with the default endpoint + a fresh reqwest client.
+    /// Both `api_key` (your operator's Google Cloud API key) and
+    /// `cse_id` (Custom Search Engine ID) are pinned inside the
+    /// struct and consumed only by the HTTP send.
+    pub fn new(api_key: SecretBox<String>, cse_id: SecretBox<String>) -> Result<Self, SearchError> {
+        // Plan 65 W1 + W2 + W6: hardened builder applies
+        // no-auto-redirect + SSRF-filtering DNS resolver; both
+        // credentials are held as `SecretBox<String>` so they
+        // zeroize on drop. The reqwest client can't be poisoned
+        // via DNS or chased to a non-Google host via 3xx, and the
+        // bytes don't sit in freed memory after the provider drops.
+        let client = hardened_client_builder(Self::DEFAULT_TIMEOUT_SECS)
+            .build()
+            .map_err(|e| SearchError::Upstream(format!("building reqwest client: {e}")))?;
+        Ok(Self {
+            api_key,
+            cse_id,
+            client,
+            endpoint: Self::DEFAULT_ENDPOINT.to_string(),
+        })
+    }
+
+    /// Test seam — point at a mock HTTP server. Production callers
+    /// stick with the default.
+    pub fn with_endpoint(mut self, endpoint: impl Into<String>) -> Self {
+        self.endpoint = endpoint.into();
+        self
+    }
+
+    /// W5 redaction helper. Replaces every occurrence of the API
+    /// key + CSE ID in `message` with `<REDACTED>`. Public for
+    /// tests that want to assert the same redaction shape; the
+    /// production path uses it internally before every `SearchError`
+    /// emission.
+    ///
+    /// The credentials live behind `SecretBox<String>` (W6), so
+    /// this method exposes them only for the duration of the
+    /// `String::replace` call — the underlying bytes don't escape
+    /// into a longer-lived borrow.
+    pub fn redact_credentials(&self, message: String) -> String {
+        let api_key = self.api_key.expose_secret();
+        let cse_id = self.cse_id.expose_secret();
+        let scrubbed = if api_key.is_empty() {
+            message
+        } else {
+            message.replace(api_key.as_str(), "<REDACTED>")
+        };
+        if cse_id.is_empty() {
+            scrubbed
+        } else {
+            scrubbed.replace(cse_id.as_str(), "<REDACTED>")
+        }
+    }
+}
+
+// Hand-written Debug redacts both credentials. Mirrors the
+// `HostSigner` pattern from plan 64 W2.
+//
+// allow(secret-debug): the Debug impl is the redaction, not a leak.
+impl std::fmt::Debug for GoogleSearchProvider {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("GoogleSearchProvider")
+            .field("api_key", &"<redacted>")
+            .field("cse_id", &"<redacted>")
+            .field("endpoint", &self.endpoint)
+            .finish()
+    }
+}
+
+/// Minimal extractor for Google Custom Search's response. Like
+/// the other provider response types, we intentionally do not
+/// `deny_unknown_fields` — Google's payload carries many fields
+/// (`queries`, `searchInformation`, `context`, …) that we don't
+/// need; tracking them would brittle the parse to a single API
+/// version.
+#[derive(Debug, Deserialize)]
+struct GoogleResponse {
+    #[serde(default)]
+    items: Vec<GoogleResult>,
+}
+
+#[derive(Debug, Deserialize)]
+struct GoogleResult {
+    title: String,
+    link: String,
+    #[serde(default)]
+    snippet: String,
+}
+
+#[async_trait]
+impl SearchProvider for GoogleSearchProvider {
+    fn name(&self) -> &'static str {
+        "google"
+    }
+
+    async fn search(&self, query: &str, max_results: u32) -> Result<Vec<SearchHit>, SearchError> {
+        // Google CSE caps `num` at 10 per call. Clamp before
+        // forwarding so a caller-supplied 50 doesn't trip a 400.
+        let num = max_results.min(10);
+        let response = self
+            .client
+            .get(&self.endpoint)
+            .query(&[
+                ("key", self.api_key.expose_secret().as_str()),
+                ("cx", self.cse_id.expose_secret().as_str()),
+                ("q", query),
+                ("num", &num.to_string()),
+            ])
+            .send()
+            .await
+            .map_err(|e| SearchError::Upstream(self.redact_credentials(e.to_string())))?;
+        let status = response.status();
+        if status.as_u16() == 429 {
+            return Err(SearchError::RateLimited);
+        }
+        if !status.is_success() {
+            // Status messages from reqwest include the URL on some
+            // error paths. Scrub defensively even though the
+            // canonical "non-success" string here doesn't.
+            return Err(SearchError::Upstream(self.redact_credentials(format!(
+                "Google search returned status {status}"
+            ))));
+        }
+        let body = read_capped(response, DEFAULT_RESPONSE_BODY_CAP)
+            .await
+            .map_err(|msg| SearchError::Upstream(self.redact_credentials(msg)))?;
+        let parsed: GoogleResponse = serde_json::from_slice(&body).map_err(|e| {
+            SearchError::Upstream(self.redact_credentials(format!("decoding Google response: {e}")))
+        })?;
+        let hits: Vec<SearchHit> = parsed
+            .items
+            .into_iter()
+            .map(|r| SearchHit {
+                title: r.title,
+                url: r.link,
+                snippet: r.snippet,
             })
             .collect();
         if hits.is_empty() {
@@ -555,9 +777,27 @@ pub const BRAVE_API_KEY_ENV_VAR: &str = "BRAVE_SEARCH_API_KEY";
 /// `"tavily"` on `MVM_WEB_SEARCH_ALLOWLIST` to enable.
 pub const TAVILY_API_KEY_ENV_VAR: &str = "TAVILY_API_KEY";
 
+/// Canonical env-var name for the operator's Google Cloud API
+/// key. Paired with [`GOOGLE_CSE_ID_ENV_VAR`]; both must be set
+/// AND `"google"` must appear on `MVM_WEB_SEARCH_ALLOWLIST` for
+/// the Google provider to be reachable.
+pub const GOOGLE_API_KEY_ENV_VAR: &str = "GOOGLE_API_KEY";
+
+/// Canonical env-var name for the operator's Google Custom Search
+/// Engine ID (the `cx=` parameter). See
+/// [`GOOGLE_API_KEY_ENV_VAR`].
+pub const GOOGLE_CSE_ID_ENV_VAR: &str = "GOOGLE_CSE_ID";
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Test helper: wrap a literal in `SecretBox<String>`. The
+    /// production callers receive a `SecretBox` from the credential
+    /// resolver in mvm-cli; tests build their own here.
+    fn sk(s: &str) -> SecretBox<String> {
+        SecretBox::new(Box::new(s.to_string()))
+    }
 
     struct StubProvider {
         name: &'static str,
@@ -826,19 +1066,19 @@ mod tests {
 
     #[test]
     fn brave_provider_is_named_brave() {
-        let p = BraveSearchProvider::new("test-key").expect("build brave");
+        let p = BraveSearchProvider::new(sk("test-key")).expect("build brave");
         assert_eq!(p.name(), "brave");
     }
 
     #[test]
     fn brave_provider_constructs_with_default_endpoint() {
-        let p = BraveSearchProvider::new("key").unwrap();
+        let p = BraveSearchProvider::new(sk("key")).unwrap();
         assert_eq!(p.endpoint, BraveSearchProvider::DEFAULT_ENDPOINT);
     }
 
     #[test]
     fn brave_provider_with_endpoint_overrides() {
-        let p = BraveSearchProvider::new("key")
+        let p = BraveSearchProvider::new(sk("key"))
             .unwrap()
             .with_endpoint("https://mock.test/search");
         assert_eq!(p.endpoint, "https://mock.test/search");
@@ -908,19 +1148,19 @@ mod tests {
 
     #[test]
     fn tavily_provider_is_named_tavily() {
-        let p = TavilySearchProvider::new("test-key").expect("build tavily");
+        let p = TavilySearchProvider::new(sk("test-key")).expect("build tavily");
         assert_eq!(p.name(), "tavily");
     }
 
     #[test]
     fn tavily_provider_constructs_with_default_endpoint() {
-        let p = TavilySearchProvider::new("key").unwrap();
+        let p = TavilySearchProvider::new(sk("key")).unwrap();
         assert_eq!(p.endpoint, TavilySearchProvider::DEFAULT_ENDPOINT);
     }
 
     #[test]
     fn tavily_provider_with_endpoint_overrides() {
-        let p = TavilySearchProvider::new("key")
+        let p = TavilySearchProvider::new(sk("key"))
             .unwrap()
             .with_endpoint("https://mock.test/search");
         assert_eq!(p.endpoint, "https://mock.test/search");
@@ -972,6 +1212,142 @@ mod tests {
         }"#;
         let r: TavilyResult = serde_json::from_str(json).expect("parse");
         assert_eq!(r.content, "");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // GoogleSearchProvider (plan 65 W5)
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn google_provider_is_named_google() {
+        let p = GoogleSearchProvider::new(sk("test-key"), sk("test-cse")).unwrap();
+        assert_eq!(p.name(), "google");
+    }
+
+    #[test]
+    fn google_provider_constructs_with_default_endpoint() {
+        let p = GoogleSearchProvider::new(sk("k"), sk("c")).unwrap();
+        assert_eq!(p.endpoint, GoogleSearchProvider::DEFAULT_ENDPOINT);
+    }
+
+    #[test]
+    fn google_response_parses_canonical_payload() {
+        let json = r#"{
+            "kind": "customsearch#search",
+            "searchInformation": { "totalResults": "2" },
+            "items": [
+                {
+                    "kind": "customsearch#result",
+                    "title": "Tokio",
+                    "link": "https://tokio.rs/",
+                    "snippet": "An asynchronous runtime for Rust"
+                },
+                {
+                    "title": "async-std",
+                    "link": "https://async.rs/",
+                    "snippet": "Async stdlib for Rust"
+                }
+            ]
+        }"#;
+        let parsed: GoogleResponse = serde_json::from_str(json).expect("parse");
+        assert_eq!(parsed.items.len(), 2);
+        assert_eq!(parsed.items[0].title, "Tokio");
+        assert_eq!(parsed.items[0].link, "https://tokio.rs/");
+        assert!(parsed.items[0].snippet.contains("asynchronous"));
+    }
+
+    #[test]
+    fn google_response_handles_missing_items_field() {
+        let json = r#"{ "kind": "customsearch#search" }"#;
+        let parsed: GoogleResponse = serde_json::from_str(json).expect("parse");
+        assert!(parsed.items.is_empty());
+    }
+
+    #[test]
+    fn google_result_tolerates_missing_snippet() {
+        let json = r#"{ "title": "x", "link": "https://x.test/" }"#;
+        let r: GoogleResult = serde_json::from_str(json).expect("parse");
+        assert_eq!(r.snippet, "");
+    }
+
+    #[test]
+    fn google_provider_debug_redacts_credentials() {
+        // The hand-written Debug must NOT print the api_key or
+        // cse_id verbatim, so `tracing::error!(provider = ?p,
+        // ...)` doesn't leak them into the audit chain.
+        let p = GoogleSearchProvider::new(sk("MY-SECRET-KEY"), sk("MY-CSE-ID")).unwrap();
+        let formatted = format!("{p:?}");
+        assert!(
+            !formatted.contains("MY-SECRET-KEY"),
+            "key leaked into Debug: {formatted}"
+        );
+        assert!(
+            !formatted.contains("MY-CSE-ID"),
+            "cse_id leaked into Debug: {formatted}"
+        );
+        assert!(
+            formatted.contains("redacted"),
+            "expected explicit redaction marker in Debug: {formatted}"
+        );
+    }
+
+    #[test]
+    fn redact_credentials_removes_api_key_and_cse_id() {
+        let p = GoogleSearchProvider::new(sk("MY-SECRET-KEY"), sk("MY-CSE-ID")).unwrap();
+        let raw = "connect error to \
+                   https://www.googleapis.com/customsearch/v1?key=MY-SECRET-KEY&cx=MY-CSE-ID&q=x"
+            .to_string();
+        let scrubbed = p.redact_credentials(raw);
+        assert!(
+            !scrubbed.contains("MY-SECRET-KEY"),
+            "key leaked through redact_credentials: {scrubbed}"
+        );
+        assert!(
+            !scrubbed.contains("MY-CSE-ID"),
+            "cse_id leaked through redact_credentials: {scrubbed}"
+        );
+        assert!(
+            scrubbed.contains("<REDACTED>"),
+            "expected explicit marker in redacted output: {scrubbed}"
+        );
+    }
+
+    #[test]
+    fn redact_credentials_handles_empty_inputs_without_expanding() {
+        // Edge case: a fixture provider constructed with empty
+        // strings would, under naive `String::replace("", ...)`,
+        // expand a marker between every character. The impl
+        // short-circuits empty inputs to avoid that.
+        let p = GoogleSearchProvider::new(sk(""), sk("")).unwrap();
+        assert_eq!(
+            p.redact_credentials("hello world".to_string()),
+            "hello world"
+        );
+    }
+
+    #[tokio::test]
+    async fn google_search_network_error_does_not_leak_api_key() {
+        // W5 end-to-end: point at an unreachable port so reqwest
+        // returns a network error whose Display includes the URL
+        // (which contains the API key). The provider must scrub
+        // it before wrapping into SearchError::Upstream.
+        let p = GoogleSearchProvider::new(sk("MY-SECRET-KEY"), sk("MY-CSE-ID"))
+            .unwrap()
+            .with_endpoint("http://127.0.0.1:1/");
+        let err = p.search("rust async", 5).await.unwrap_err();
+        match err {
+            SearchError::Upstream(msg) => {
+                assert!(
+                    !msg.contains("MY-SECRET-KEY"),
+                    "API key leaked into Upstream error: {msg}"
+                );
+                assert!(
+                    !msg.contains("MY-CSE-ID"),
+                    "CSE id leaked into Upstream error: {msg}"
+                );
+            }
+            other => panic!("expected Upstream, got {other:?}"),
+        }
     }
 
     // ──────────────────────────────────────────────────────────────
