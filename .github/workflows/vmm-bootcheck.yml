@@ -32,8 +32,7 @@ on:
       - "crates/mvm-backend/src/ch_runtime.rs"
       - "examples/libkrun-bootcheck.rs"
       - "examples/ch-bootcheck.rs"
-      - "nix/images/builder/**"
-      - "nix/lib/**"
+      - "examples/minimal/**"
       - ".github/workflows/vmm-bootcheck.yml"
   pull_request:
     paths:
@@ -43,8 +42,7 @@ on:
       - "crates/mvm-backend/src/ch_runtime.rs"
       - "examples/libkrun-bootcheck.rs"
       - "examples/ch-bootcheck.rs"
-      - "nix/images/builder/**"
-      - "nix/lib/**"
+      - "examples/minimal/**"
       - ".github/workflows/vmm-bootcheck.yml"
   workflow_dispatch:
 
@@ -56,9 +54,14 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  # Build the dev-image kernel + rootfs on Linux runners.
-  # Mirrors the dev-image job in release.yml. Uses host Nix on the
-  # runner — NO microsandbox involvement, which is the load-bearing
+  # Build the minimal flake's kernel + rootfs on Linux runners.
+  # The dev-image flake under nix/images/builder/ bakes in the mvm
+  # guest agent and its ~480-crate Cargo closure (and is currently
+  # broken for unrelated reasons — see release.yml's failures). For
+  # the boot-validation gate we only need ANY working Linux kernel +
+  # ext4 rootfs; examples/minimal/flake.nix produces the smallest
+  # such pair (busybox + a static vsock_ok C binary). Uses host Nix on
+  # the runner — NO microsandbox involvement, which is the load-bearing
   # invariant for "we can drop microsandbox." The aarch64 artifact is
   # consumed by the macOS libkrun job; the x86_64 artifact by the
   # Linux CH job on the same workflow.
@@ -80,13 +83,13 @@ jobs:
       - name: Install Nix
         uses: DeterminateSystems/nix-installer-action@main
 
-      - name: Build dev image via host Nix (no microsandbox)
+      - name: Build minimal flake via host Nix (no microsandbox)
         env:
           SYSTEM: ${{ matrix.system }}
           ARCH: ${{ matrix.arch }}
         run: |
           set -euo pipefail
-          nix build "./nix/images/builder#packages.${SYSTEM}.default" \
+          nix build "./examples/minimal#packages.${SYSTEM}.default" \
             --no-link --print-out-paths > /tmp/store-path.txt
           STORE_PATH=$(head -1 /tmp/store-path.txt)
           mkdir -p staging
@@ -97,7 +100,7 @@ jobs:
       - name: Upload image artifacts
         uses: actions/upload-artifact@v7
         with:
-          name: dev-image-${{ matrix.arch }}
+          name: minimal-image-${{ matrix.arch }}
           path: |
             staging/vmlinux
             staging/rootfs.ext4
@@ -122,7 +125,7 @@ jobs:
       - name: Download dev image (aarch64)
         uses: actions/download-artifact@v5
         with:
-          name: dev-image-aarch64
+          name: minimal-image-aarch64
           path: ci-artifacts
 
       - name: Build libkrun-bootcheck
@@ -177,7 +180,7 @@ jobs:
       - name: Download dev image (x86_64)
         uses: actions/download-artifact@v5
         with:
-          name: dev-image-x86_64
+          name: minimal-image-x86_64
           path: ci-artifacts
 
       - name: Build ch-bootcheck
