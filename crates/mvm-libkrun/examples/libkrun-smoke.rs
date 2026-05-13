@@ -117,9 +117,19 @@ fn main() -> ExitCode {
         eprintln!("warn: krun_set_log_level failed: {e}");
     }
 
+    // Per-VM vsock socket dir. The smoke binary doesn't run a sibling
+    // listener (it becomes the guest), so any AF_VSOCK connect inside
+    // the guest will fail with ECONNREFUSED — that's expected for the
+    // W3 spike. Plan 57 W4's supervisor adds the host-side listener.
+    let socket_dir = format!("{}/.mvm/vms/mvm-libkrun-smoke", args.home);
+    if let Err(e) = std::fs::create_dir_all(&socket_dir) {
+        eprintln!("warn: create_dir_all {socket_dir}: {e}");
+    }
+
     let mut ctx = KrunContext::new("mvm-libkrun-smoke", &args.kernel, &args.rootfs)
         .with_resources(args.vcpus, args.mem_mib)
         .with_cmdline(&args.cmdline)
+        .with_vsock_socket_dir(&socket_dir)
         .add_vsock_port(mvm_guest::vsock::GUEST_AGENT_PORT);
     if let Some(dd) = args.data_disk {
         ctx = ctx.add_disk("data", dd, false);
@@ -173,6 +183,7 @@ struct Args {
     console_output: Option<String>,
     vcpus: u8,
     mem_mib: u32,
+    home: String,
     help: bool,
 }
 
@@ -227,6 +238,7 @@ impl Args {
             console_output,
             vcpus,
             mem_mib,
+            home,
             help,
         })
     }

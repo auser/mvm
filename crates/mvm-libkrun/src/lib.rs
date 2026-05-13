@@ -188,6 +188,19 @@ pub struct KrunContext {
     /// default for an interactive smoke test). Plan 57 W3 uses this
     /// to capture early-boot kernel output for diagnosis.
     pub console_output_path: Option<String>,
+    /// Directory on the host where the per-vsock-port Unix socket
+    /// files live. libkrun proxies between each guest-side
+    /// `AF_VSOCK` port (TSI / virtio-vsock) and the corresponding
+    /// `vsock-<port>.sock` inside this directory; a sibling host
+    /// process (e.g. `mvmctl console <vm>` or the guest-agent
+    /// vsock client in mvm-supervisor) speaks to the guest by
+    /// opening the unix socket. When `None`, [`vsock_socket_path`]
+    /// falls back to `/tmp/mvm-libkrun-<name>-vsock-<port>.sock`
+    /// — fine for the spike smoke binary, but real consumers
+    /// (Plan 57 W4 supervisor, Plan 72 builder-VM launcher) should
+    /// always set a stable per-VM dir under `~/.mvm/vms/<name>/`
+    /// so cross-process clients can find it.
+    pub vsock_socket_dir: Option<String>,
 }
 
 impl KrunContext {
@@ -209,6 +222,23 @@ impl KrunContext {
             vsock_ports: Vec::new(),
             extra_disks: Vec::new(),
             console_output_path: None,
+            vsock_socket_dir: None,
+        }
+    }
+
+    /// Resolve the host-side unix socket path libkrun should pair
+    /// with `port`. If [`Self::vsock_socket_dir`] is set, returns
+    /// `<dir>/vsock-<port>.sock`; otherwise falls back to a per-VM
+    /// `/tmp` path scoped by [`Self::name`]. The fallback is fine
+    /// for the spike smoke binary but real consumers should always
+    /// supply an explicit dir (see field docs).
+    pub fn vsock_socket_path(&self, port: u32) -> std::path::PathBuf {
+        match &self.vsock_socket_dir {
+            Some(dir) => std::path::PathBuf::from(dir).join(format!("vsock-{port}.sock")),
+            None => std::path::PathBuf::from(format!(
+                "/tmp/mvm-libkrun-{}-vsock-{port}.sock",
+                self.name
+            )),
         }
     }
 
@@ -252,6 +282,15 @@ impl KrunContext {
     /// place (writes to the calling process's stdout).
     pub fn with_console_output(mut self, path: impl Into<String>) -> Self {
         self.console_output_path = Some(path.into());
+        self
+    }
+
+    /// Set the per-VM directory libkrun should place vsock unix
+    /// socket files under. See [`Self::vsock_socket_dir`] for the
+    /// rationale; this builder method ensures consumers can chain it
+    /// alongside the other resource setters.
+    pub fn with_vsock_socket_dir(mut self, dir: impl Into<String>) -> Self {
+        self.vsock_socket_dir = Some(dir.into());
         self
     }
 }
@@ -309,30 +348,40 @@ fn configure(ctx: &KrunContext) -> Result<sys::Context, Error> {
     for disk in &ctx.extra_disks {
         krun.add_disk(&disk.id, Path::new(&disk.path), disk.read_only)?;
     }
-    // NOTE on vsock device wiring (plan 57 W3.3, deferred):
+    // libkrun's vsock model — what plan 57 W3.3 settled on after the
+    // first end-to-end smoke (2026-05-13):
     //
-    // libkrun exposes two vsock APIs:
-    //   - `krun_add_vsock(ctx, tsi_features)` — adds a *virtio-vsock*
-    //     device the guest sees as `/dev/vsock`.
-    //   - `krun_add_vsock_port(ctx, port, host_path)` — registers a
-    //     port→host-Unix-socket mapping for TSI (Transparent Socket
-    //     Impersonation) mode.
+    // - TSI (Transparent Socket Impersonation) is auto-enabled when
+    //   no virtio-net device is added. The libkrun README is
+    //   explicit: "TSI for AF_INET and AF_INET6 is automatically
+    //   enabled when no network interface is added to the VM." We
+    //   never call `krun_add_net_*`, so TSI is always on, and the
+    //   virtio-vsock device exists implicitly.
     //
-    // Calling both in the same context returns `-EEXIST` from the
-    // second call: TSI mode and a plain virtio-vsock device are
-    // mutually exclusive in libkrun's current design. Plan 57 W3.3
-    // (separate PR) picks the right one for the guest agent and
-    // wires the cross-process socket path; until then `add_vsock_port`
-    // is exercised by itself, which is what the W1 unit tests asserted
-    // and what the W3 boot smoke ran against.
+    // - `krun_add_vsock` (no `_port`) is for *adding a second
+    //   independent virtio-vsock device*. Because TSI already
+    //   provides one, calling it returns `-EEXIST` (verified on
+    //   libkrun 1.17.4). Do not call it from the W3 path.
+    //
+    // - `krun_add_vsock_port(ctx, port, host_path)` pairs a
+    //   guest-side vsock port with a host unix socket. libkrun
+    //   does *not* create the socket file — that's the host's
+    //   responsibility. The owning host process binds a
+    //   `UnixListener` at `host_path` before calling `start_enter`;
+    //   when the guest opens `AF_VSOCK` to `port`, libkrun proxies
+    //   it to a client connection at the listener.
+    //
+    // The W4 supervisor / Plan 72 builder-VM launcher own the
+    // listener; this configure() step just registers the path so
+    // libkrun knows where to send traffic. The smoke binary
+    // (`examples/libkrun-smoke.rs`) registers the path too even
+    // though it has no sibling listener — that's fine: an
+    // unbound path means the guest's AF_VSOCK connects will fail
+    // with ECONNREFUSED inside the guest, which the W3 spike
+    // doesn't care about. The W4 PR adds the listener.
     for &port in &ctx.vsock_ports {
-        // libkrun's `krun_add_vsock_port` requires a host-side Unix
-        // socket path. The full backend wiring (which generates that
-        // path under ~/.mvm/vms/<name>/) lands alongside the W4 state
-        // tracker; the W1 + W3 exercises use a stub path scoped to
-        // the VM name so concurrent guests don't clash.
-        let socket = format!("/tmp/mvm-libkrun-{}-vsock-{port}.sock", ctx.name);
-        krun.add_vsock_port(port, Path::new(&socket))?;
+        let socket = ctx.vsock_socket_path(port);
+        krun.add_vsock_port(port, &socket)?;
     }
     if let Some(console_path) = &ctx.console_output_path {
         krun.set_console_output(Path::new(console_path))?;
@@ -439,6 +488,48 @@ mod tests {
         assert_eq!(ctx.vcpus, 2);
         assert_eq!(ctx.ram_mib, 512);
         assert_eq!(ctx.vsock_ports, vec![5252]);
+    }
+
+    /// Plan 57 W3.3: the per-VM `vsock_socket_dir` overrides the
+    /// `/tmp` fallback. Real consumers (W4 supervisor, Plan 72
+    /// builder-VM launcher) always supply a dir under
+    /// `~/.mvm/vms/<name>/` so cross-process clients can find it
+    /// without scanning `/tmp`.
+    #[test]
+    fn vsock_socket_path_falls_back_to_tmp_when_no_dir_set() {
+        let ctx = KrunContext::new("vm-1", "/k", "/r");
+        let path = ctx.vsock_socket_path(5252);
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/tmp/mvm-libkrun-vm-1-vsock-5252.sock")
+        );
+    }
+
+    #[test]
+    fn vsock_socket_path_uses_configured_dir_when_set() {
+        let ctx =
+            KrunContext::new("vm-1", "/k", "/r").with_vsock_socket_dir("/home/user/.mvm/vms/vm-1");
+        let path = ctx.vsock_socket_path(5252);
+        assert_eq!(
+            path,
+            std::path::PathBuf::from("/home/user/.mvm/vms/vm-1/vsock-5252.sock")
+        );
+    }
+
+    /// Multiple ports share one dir; libkrun proxies each
+    /// independently. The name → port pairing keeps cross-VM
+    /// concurrency on a single host from clashing.
+    #[test]
+    fn vsock_socket_path_distinguishes_ports() {
+        let ctx = KrunContext::new("vm-1", "/k", "/r")
+            .with_vsock_socket_dir("/d")
+            .add_vsock_port(5252)
+            .add_vsock_port(5253);
+        let a = ctx.vsock_socket_path(5252);
+        let b = ctx.vsock_socket_path(5253);
+        assert_ne!(a, b);
+        assert!(a.file_name().unwrap().to_string_lossy().contains("5252"));
+        assert!(b.file_name().unwrap().to_string_lossy().contains("5253"));
     }
 
     #[test]
