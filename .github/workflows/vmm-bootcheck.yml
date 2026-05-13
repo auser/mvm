@@ -120,7 +120,10 @@ jobs:
         uses: dtolnay/rust-toolchain@stable
 
       - name: Install libkrun
-        run: brew install libkrun
+        # libkrun is not in homebrew-core; the official tap is slp/krun
+        # (https://github.com/slp/homebrew-krun). `brew install <tap>/<repo>/<formula>`
+        # auto-taps if needed.
+        run: brew install slp/krun/libkrun
 
       - name: Download dev image (aarch64)
         uses: actions/download-artifact@v5

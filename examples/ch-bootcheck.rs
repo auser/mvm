@@ -31,6 +31,7 @@
 //! - `74` — `cloud-hypervisor` not found on PATH.
 //! - `75` — artifacts missing.
 
+use std::io::Read;
 use std::path::PathBuf;
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -106,6 +107,13 @@ fn run() -> i32 {
     // we don't have two competing sinks. `--cpus boot=1 --memory
     // size=256M` matches libkrun-bootcheck's shape. `--disk
     // path=<rootfs>` exposes the ext4 as `/dev/vda` in the guest.
+    //
+    // Stderr is piped (not inherited) so we can dump it into the test
+    // report after CH exits — CH's own boot diagnostics (kernel format
+    // rejection, missing KVM features, etc.) live there, not in the
+    // guest's serial output. The earlier "NoOutput" failure mode where
+    // the file was empty turns out to be CH refusing the kernel before
+    // booting anything; capturing stderr surfaces that.
     let mut child = match Command::new(&ch_bin)
         .args([
             "--cpus",
@@ -123,7 +131,7 @@ fn run() -> i32 {
             "--console",
             "off",
         ])
-        .stdout(Stdio::null())
+        .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
     {
@@ -145,17 +153,39 @@ fn run() -> i32 {
     let _ = child.kill();
     let exit_status = child.wait().ok();
 
+    // Drain CH's own output streams. Both are read after the kill so
+    // the process is guaranteed reaped before we try to consume them.
+    let mut ch_stdout = String::new();
+    let mut ch_stderr = String::new();
+    if let Some(mut s) = child.stdout.take() {
+        let _ = s.read_to_string(&mut ch_stdout);
+    }
+    if let Some(mut s) = child.stderr.take() {
+        let _ = s.read_to_string(&mut ch_stderr);
+    }
+
     let serial = std::fs::read_to_string(&serial_path).unwrap_or_default();
     let _ = std::fs::remove_file(&serial_path);
 
-    eprintln!("\n──── serial tail (last 1024 bytes) ────");
+    if !ch_stdout.trim().is_empty() {
+        eprintln!("\n──── cloud-hypervisor stdout ────");
+        eprintln!("{}", ch_stdout.trim_end());
+        eprintln!("──── end stdout ────");
+    }
+    if !ch_stderr.trim().is_empty() {
+        eprintln!("\n──── cloud-hypervisor stderr ────");
+        eprintln!("{}", ch_stderr.trim_end());
+        eprintln!("──── end stderr ────");
+    }
+
+    eprintln!("\n──── guest serial tail (last 1024 bytes) ────");
     let tail = if serial.len() > 1024 {
         &serial[serial.len() - 1024..]
     } else {
         &serial
     };
     eprintln!("{tail}");
-    eprintln!("──── end serial tail ────\n");
+    eprintln!("──── end guest serial tail ────\n");
 
     eprintln!("[ch-bootcheck] child exit: {exit_status:?}");
     eprintln!("[ch-bootcheck] outcome: {outcome:?}");
