@@ -174,6 +174,9 @@ const BUNDLE_SUB: &[(&str, AuditPosture)] = &[
     // `~/.mvm/bundles/<sha>/` and emits
     // `LocalAuditKind::BundleInstall` via `mvm_core::audit::emit`.
     ("install", AuditPosture::Emits("BundleInstall")),
+    // `bundle gc` removes one (or all) installed bundles and emits
+    // `LocalAuditKind::BundleGc` on the success arm.
+    ("gc", AuditPosture::Emits("BundleGc")),
 ];
 
 // trust add/remove mutate `~/.mvm/trusted-publishers/` and emit
@@ -412,6 +415,7 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
         "VmProcSignal",
         "VmProcStart",
         "VmProcStdin",
+        "BundleGc",
         "BundleInstall",
         "TrustAdd",
         "TrustRemove",
