@@ -231,6 +231,16 @@ let
     #!/bin/sh
     # mvm /init — busybox PID 1 (plan 60 / ADR-013).
 
+    # PATH. The kernel hands PID 1 a minimal default
+    # `/sbin:/usr/sbin:/bin:/usr/bin` (the bare-bones fhs); without
+    # an explicit override, tools symlinked at `/usr/local/bin/`
+    # (every package in mkGuest's `packages` closure ends up there)
+    # are invisible to ad-hoc shell invocations and to anything the
+    # entrypoint or agent execs without an absolute path.
+    # `/usr/local/bin` goes first so user-installed packages shadow
+    # busybox applets for the same name when present.
+    export PATH=/usr/local/bin:/usr/local/sbin:/sbin:/usr/sbin:/bin:/usr/bin
+
     # Stage 1 — kernel pseudofs. Required before anything else
     # can read /proc/self or write to /dev/console. `mountpoint -q`
     # short-circuits when the kernel already mounted devtmpfs (the
@@ -580,13 +590,71 @@ let
   # (`${nixpkgs}/...`) rather than the angle-bracket form (`<nixpkgs/...>`)
   # — the latter trips flake pure evaluation ("cannot look up
   # '<nixpkgs/...>' in pure evaluation mode").
-  rootfsImage = pkgs.callPackage "${nixpkgs}/nixos/lib/make-ext4-fs.nix" {
-    storePaths = [ rootfsTree ];
-    volumeLabel = "mvm-${name}";
-    populateImageCommands = ''
-      cp -a --reflink=auto ${rootfsTree}/. ./files/
-    '';
-  };
+  # Build the ext4 rootfs ourselves rather than calling
+  # `nixos/lib/make-ext4-fs.nix`. The reason: we need to intervene
+  # between the closure-copy step and the mkfs step to strip
+  # `/share/{doc,man,info,locale,…}` content from every nix-store
+  # path in the rootfs. That content is ~80-150 MB of man pages,
+  # locale catalogs, gtk-doc, etc. — none of which the guest reads
+  # at runtime; for production microVMs the rationale is stronger
+  # (defense-in-depth: smaller surface).
+  #
+  # The body below mirrors `make-ext4-fs.nix`'s logic — populate
+  # from `rootfsTree`, walk `closureInfo.store-paths`, then mkfs —
+  # but with the strip step interposed before mkfs and a final
+  # `resize2fs -M` to compact the freed space.
+  rootfsImage = pkgs.runCommand "mvm-rootfs-${name}.ext4" {
+    nativeBuildInputs = [ pkgs.e2fsprogs ];
+    closureInfo = pkgs.closureInfo { rootPaths = [ rootfsTree ]; };
+  } ''
+    set -eu
+
+    mkdir -p ./files
+
+    # 1. Populate from rootfsTree (the /init, /bin/* symlinks,
+    # /etc/* metadata, /lib/modules tree if any).
+    cp -a --reflink=auto ${rootfsTree}/. ./files/
+
+    # 2. Bring in the transitive nix-store closure. Mirrors what
+    # `make-ext4-fs.nix` does internally.
+    cp $closureInfo/registration ./files/nix-path-registration
+    while read -r p; do
+      target="./files''${p}"
+      mkdir -p "$(dirname "$target")"
+      cp -dpRn --reflink=auto "$p" "$target" || true
+    done < $closureInfo/store-paths
+
+    # 3. Strip the inert documentation/locale content from every
+    # store path. ~80-150 MB savings depending on closure shape.
+    # `find -prune` so we don't descend into the about-to-be-deleted
+    # directories. The `|| true`s are belt-and-braces: a missing
+    # /share dir, a read-only entry, or a permission edge case
+    # shouldn't fail the whole build — worst case is we ship the
+    # original (larger) image.
+    chmod -R u+w ./files/nix/store 2>/dev/null || true
+    for sub in doc man info locale gtk-doc bash-completion zsh fish; do
+      find ./files/nix/store -mindepth 3 -maxdepth 3 -type d -name "$sub" \
+        -path "*/share/$sub" -prune -exec rm -rf {} + 2>/dev/null || true
+    done
+
+    # 4. Size: content + 10% slack + 16 MiB metadata floor.
+    # mkfs.ext4 needs a pre-sized output file.
+    size=$(du -sb ./files/ | awk '{print $1}')
+    size=$(( size + size / 10 + 16 * 1024 * 1024 ))
+    truncate -s "$size" $out
+
+    # 5. mkfs the staged tree. `-d` populates the FS from a host
+    # directory in a single pass (no mounting required — works in
+    # the nix sandbox). `-L` matches what `make-ext4-fs.nix` set.
+    mkfs.ext4 -L "mvm-${name}" -d ./files -F $out
+
+    # 6. Compact to the minimum size that still fits the content.
+    # The 10% slack above is for mkfs's metadata; resize2fs -M then
+    # shrinks the FS to its post-population minimum.
+    e2fsck -y -f $out >/dev/null
+    resize2fs -M $out
+    e2fsck -y -f $out >/dev/null
+  '';
 
   mvmMeta = {
     inherit name hypervisor;
