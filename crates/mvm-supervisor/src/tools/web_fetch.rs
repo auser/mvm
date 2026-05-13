@@ -190,11 +190,21 @@ impl ReqwestHttpFetcher {
     }
 
     /// Test seam — build a fetcher with the SSRF guard disabled.
+    ///
     /// Production callers MUST NOT use this; the loopback /
     /// private-IP rejection is load-bearing for the security
-    /// posture documented in plan 65.
-    #[cfg(test)]
-    pub(crate) fn test_unsafe_no_ssrf(timeout_secs: u64) -> Self {
+    /// posture documented in plan 65. The function is `pub` only so
+    /// integration tests under `crates/mvm-supervisor/tests/` can
+    /// exercise the W1/W3 hardening against loopback fixtures
+    /// (`#[cfg(test)]` items in the library are invisible to
+    /// integration tests; the architecture.yml invariant scan
+    /// forbids binding TCP listeners in production source files
+    /// even inside inline `#[cfg(test)]` modules, so the
+    /// live-listener tests had to move out). Hidden from rustdoc
+    /// so the public-API surface still reads as "fetcher with SSRF
+    /// on".
+    #[doc(hidden)]
+    pub fn test_unsafe_no_ssrf(timeout_secs: u64) -> Self {
         Self {
             timeout_secs,
             enforce_ssrf: false,
@@ -858,104 +868,13 @@ mod tests {
     // ──────────────────────────────────────────────────────────────
     // Plan 65 hardening — W1 (no auto-redirect) + W3 (exact body cap)
     //
-    // Both tests boot a one-shot HTTP/1.1 server on 127.0.0.1 and
-    // exercise the real reqwest client. http:// is fine here — the
-    // tool layer's https-only check runs in `WebFetchTool::invoke`,
-    // not in the fetcher itself, so the fetcher can be tested
-    // against plain HTTP. The SSRF guard (plan 65 W2) lands in a
-    // separate slice; until then, loopback IPs are reachable, which
-    // is what these tests rely on.
+    // Live-listener tests for W1 + W3 boot a one-shot HTTP/1.1 server
+    // on 127.0.0.1 and exercise the real reqwest client. They live in
+    // `crates/mvm-supervisor/tests/web_fetch_loopback.rs` — the
+    // architecture.yml invariant scan forbids binding TCP listeners
+    // in production source files even inside inline `#[cfg(test)]`
+    // modules.
     // ──────────────────────────────────────────────────────────────
-
-    /// Bind a TCP listener on 127.0.0.1:0, accept one connection,
-    /// drain its request, write `response`, then close. Returns the
-    /// port the listener bound to.
-    async fn spawn_one_shot_server(response: String) -> u16 {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                // Drain the request headers. The body is empty for
-                // a GET so this single read is enough — we don't
-                // need to parse, just consume what reqwest sent.
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf).await;
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-        port
-    }
-
-    #[tokio::test]
-    async fn reqwest_does_not_auto_follow_redirects() {
-        // Plan 65 W1: an upstream returning 302 + Location must
-        // surface the 302 to the caller, not the redirected body.
-        // Uses `test_unsafe_no_ssrf` because the test server binds
-        // to loopback, which the W2 guard would otherwise refuse.
-        let response = "HTTP/1.1 302 Found\r\n\
-            Location: http://evil.example/exfil\r\n\
-            Content-Length: 0\r\n\
-            Connection: close\r\n\
-            \r\n"
-            .to_string();
-        let port = spawn_one_shot_server(response).await;
-        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
-        let fetcher = ReqwestHttpFetcher::test_unsafe_no_ssrf(30);
-        let resp = fetcher.fetch(&url, 1024).await.expect("fetch");
-        assert_eq!(
-            resp.status, 302,
-            "redirect was auto-followed; the W1 hardening regressed"
-        );
-        assert!(
-            resp.body.is_empty(),
-            "redirect target's body leaked into the response"
-        );
-    }
-
-    #[tokio::test]
-    async fn body_cap_is_enforced_exactly() {
-        // Plan 65 W3: an upstream returning more bytes than the
-        // caller's max_bytes must fail with `BodyTooLarge`.
-        let payload = "A".repeat(40);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
-            Content-Length: 40\r\n\
-            Connection: close\r\n\
-            \r\n\
-            {payload}"
-        );
-        let port = spawn_one_shot_server(response).await;
-        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
-        let fetcher = ReqwestHttpFetcher::test_unsafe_no_ssrf(30);
-        let err = fetcher.fetch(&url, 8).await.unwrap_err();
-        assert!(
-            matches!(err, FetchError::BodyTooLarge { limit: 8 }),
-            "expected BodyTooLarge {{ limit: 8 }}, got {err:?}"
-        );
-    }
-
-    #[tokio::test]
-    async fn body_at_exactly_max_bytes_succeeds() {
-        // Boundary: a body of exactly max_bytes must succeed.
-        let payload = "B".repeat(16);
-        let response = format!(
-            "HTTP/1.1 200 OK\r\n\
-            Content-Length: 16\r\n\
-            Connection: close\r\n\
-            \r\n\
-            {payload}"
-        );
-        let port = spawn_one_shot_server(response).await;
-        let url = Url::parse(&format!("http://127.0.0.1:{port}/")).unwrap();
-        let fetcher = ReqwestHttpFetcher::test_unsafe_no_ssrf(30);
-        let resp = fetcher.fetch(&url, 16).await.expect("at-cap fetch");
-        assert_eq!(resp.body.len(), 16);
-        assert_eq!(resp.body, payload.as_bytes());
-    }
 
     // ──────────────────────────────────────────────────────────────
     // Plan 65 W2 — SSRF guard rejects private / loopback / metadata

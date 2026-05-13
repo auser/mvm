@@ -248,80 +248,9 @@ mod tests {
     // ──────────────────────────────────────────────────────────────
     // read_capped — live HTTP via one-shot 127.0.0.1 server
     //
-    // Same harness pattern as `web_fetch::tests`: we bind a TCP
-    // listener on 127.0.0.1:0, accept one connection, write a
-    // hardcoded HTTP/1.1 response, and assert reqwest's behavior.
-    // The SsrfFilteringResolver does NOT participate — these tests
-    // build a stock reqwest::Client and feed it a real Response. We
-    // only test the chunk-loop accumulator, not the client.
+    // Lives in `crates/mvm-supervisor/tests/http_hardening_loopback.rs`
+    // — the architecture.yml invariant scan forbids binding TCP
+    // listeners in production source files even inside inline
+    // `#[cfg(test)]` modules.
     // ──────────────────────────────────────────────────────────────
-
-    async fn spawn_one_shot_server(response: String) -> u16 {
-        use tokio::io::{AsyncReadExt, AsyncWriteExt};
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("bind");
-        let port = listener.local_addr().expect("addr").port();
-        tokio::spawn(async move {
-            if let Ok((mut stream, _)) = listener.accept().await {
-                let mut buf = [0u8; 4096];
-                let _ = stream.read(&mut buf).await;
-                let _ = stream.write_all(response.as_bytes()).await;
-                let _ = stream.shutdown().await;
-            }
-        });
-        port
-    }
-
-    async fn fetch_from_test_server(
-        response_body: String,
-        max_bytes: usize,
-    ) -> Result<Vec<u8>, String> {
-        let port = spawn_one_shot_server(response_body).await;
-        // Bare client — bypassing SsrfFilteringResolver because the
-        // test server binds to loopback. The accumulator under test
-        // is the body of read_capped, which doesn't care about the
-        // resolver.
-        let client = reqwest::Client::builder()
-            .timeout(Duration::from_secs(5))
-            .build()
-            .unwrap();
-        let response = client
-            .get(format!("http://127.0.0.1:{port}/"))
-            .send()
-            .await
-            .map_err(|e| format!("connect: {e}"))?;
-        read_capped(response, max_bytes).await
-    }
-
-    #[tokio::test]
-    async fn read_capped_returns_full_body_when_under_cap() {
-        let payload = "hello world";
-        let response = format!(
-            "HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
-            payload.len(),
-            payload
-        );
-        let body = fetch_from_test_server(response, 1024).await.unwrap();
-        assert_eq!(body, payload.as_bytes());
-    }
-
-    #[tokio::test]
-    async fn read_capped_refuses_oversize_response() {
-        let payload = "A".repeat(40);
-        let response =
-            format!("HTTP/1.1 200 OK\r\nContent-Length: 40\r\nConnection: close\r\n\r\n{payload}");
-        let err = fetch_from_test_server(response, 16).await.unwrap_err();
-        assert!(err.contains("exceeded max_bytes"), "{err}");
-        assert!(err.contains("16"), "{err}");
-    }
-
-    #[tokio::test]
-    async fn read_capped_succeeds_at_exact_boundary() {
-        let payload = "B".repeat(16);
-        let response =
-            format!("HTTP/1.1 200 OK\r\nContent-Length: 16\r\nConnection: close\r\n\r\n{payload}");
-        let body = fetch_from_test_server(response, 16).await.unwrap();
-        assert_eq!(body.len(), 16);
-    }
 }
