@@ -190,6 +190,18 @@ pub enum LocalAuditKind {
     /// trusting the per-tenant JSONL rollup file (which the audit
     /// chain authenticates by sealing each bucket here).
     MeteringEpoch,
+    // --- Sprint 52 W2: bundle trust store mutations ---
+    //
+    // `~/.mvm/trusted-publishers/<key_id>.pub` is the host-trust-
+    // boundary state for bundle admission (claim 9). Every add /
+    // remove leaves an audit line so a forensics pass can answer
+    // "which publishers were trusted at the moment of incident."
+    /// `mvmctl trust add <pubkey>` — enrolled a publisher's Ed25519
+    /// pubkey in the trust store. Detail: `key_id=<32hex>`.
+    TrustAdd,
+    /// `mvmctl trust remove <key_id>` — un-enrolled a publisher.
+    /// Detail: `key_id=<32hex>`.
+    TrustRemove,
     // --- Plan 47: dm-thin storage pool ops ---
     /// `mvmctl storage gc` removed one or more orphaned thin volumes
     /// from the pool. Detail carries the removed volume names (or a
@@ -636,6 +648,9 @@ mod tests {
             LocalAuditKind::SessionConsoleOpen,
             LocalAuditKind::SessionKill,
             LocalAuditKind::SessionReap,
+            // Sprint 52 W2 trust-store mutations.
+            LocalAuditKind::TrustAdd,
+            LocalAuditKind::TrustRemove,
         ];
         for kind in kinds {
             let json = serde_json::to_string(&kind).unwrap();
@@ -665,6 +680,9 @@ mod tests {
             (LocalAuditKind::SessionConsoleOpen, "session_console_open"),
             (LocalAuditKind::SessionKill, "session_kill"),
             (LocalAuditKind::SessionReap, "session_reap"),
+            // Sprint 52 W2 trust-store mutations.
+            (LocalAuditKind::TrustAdd, "trust_add"),
+            (LocalAuditKind::TrustRemove, "trust_remove"),
         ];
         for (kind, expected) in kinds_and_strings {
             let json = serde_json::to_string(&kind).unwrap();

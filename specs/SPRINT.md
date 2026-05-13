@@ -1417,19 +1417,46 @@ Shipped in the W2 admit-time re-verify commit:
   `verify_plan_bundle` tests covering every PlanBundleError
   variant.
 
-Outstanding (deferred follow-ups):
+Shipped in the W2 follow-on (registry replacement + bundle-pin
+CLI + audit-kind variants):
 
-- `mvmctl up --bundle-pin <path>` (or a manifest field) so the
-  CLI side populates `SynthesisInput.bundle_pin`. Today the
-  substrate is there; production callers just need to point at
-  a real bundle.
-- Registry replacement: replace
-  `~/.mvm/templates/<sha256(manifest_path)>/...` keying with
-  bundle-sha256 directories so a fetched bundle slots into the
-  template flow directly.
-- `LocalAuditKind::TrustAdd` / `TrustRemove` variants + emitter
-  wiring so `trust add/remove` flips from `InteractiveOrControl`
-  to `Emits(...)` in the posture table.
+- **Bundle registry** at `~/.mvm/bundles/<sha>/`. New
+  `BundleRegistry::install` atomically extracts a verified
+  `.mvmpkg` (stage to `<sha>.partial/`, rename to `<sha>/`),
+  also persists the archive bytes at `<sha>.mvmpkg` so
+  `FsBundleResolver` continues to find them. `find(sha)` returns
+  an `InstalledBundle` with `path_for_role()` / `path_for_name()`
+  helpers. `template_artifacts_dispatched` and the three other
+  `_dispatched` variants now disambiguate 64-char hex ids:
+  templates-slot wins when present, fall through to bundle
+  registry otherwise. Bundle-served templates default vcpus/mem
+  from operator config (manifest doesn't carry resources today).
+- **`mvmctl bundle install <SOURCE> [--force]`** verb. Reuses
+  `BundleSource` parser from fetch.rs (local path or `https://`);
+  runs the verification ladder, atomically installs, prints
+  `Installed bundle <sha> (N artifacts, key_id=...)`.
+- **`mvmctl up --bundle-pin <PATH>`** flag. Reads the archive,
+  verifies via `FsTrustStore::default_path()`, derives the
+  `PlanArtifact` triple via `bundle_pin_from_archive`, hands an
+  in-memory `BundleAdmissionContext` to `admit_for_run`. Claim 9
+  re-verify fires on every launch.
+- **`LocalAuditKind::TrustAdd` / `TrustRemove`** added to the
+  audit-kind enum + casing pins + serde round-trip test.
+  `mvmctl trust add/remove` now emit via
+  `mvm_core::audit::emit`; `AUDIT_POSTURE` TRUST_SUB flipped from
+  `InteractiveOrControl` → `Emits(...)`.
+- `BUNDLE_SUB::install` row added with posture
+  `InteractiveOrControl` (will flip to `Emits("BundleInstall")`
+  once the install audit hook ships).
+
+Outstanding (deferred, none blocking):
+
+- `BundleInstall` audit-kind + emitter wiring (flips the install
+  row to `Emits(...)`). Small follow-up.
+- Bundle manifest could carry vcpus/mem_mib so the synthetic
+  TemplateSpec stops defaulting from operator config (bundle-
+  schema bump).
+- `mvmctl bundle gc` to prune installed bundles by sha.
 
 ### W3 — Network default flip (deny-by-default)  ✅ shipped
 

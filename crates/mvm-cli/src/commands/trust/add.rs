@@ -72,6 +72,12 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         perms.set_mode(0o644);
         std::fs::set_permissions(&dst, perms)?;
     }
+    mvm_core::audit::emit(
+        mvm_core::audit::LocalAuditKind::TrustAdd,
+        None,
+        Some(&format!("key_id={}", key_id.0)),
+    );
+
     println!("Trusted key_id {}", key_id.0);
     Ok(())
 }
