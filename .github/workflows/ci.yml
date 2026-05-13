@@ -142,14 +142,12 @@ jobs:
         # runner image ships the runtime library but not the -dev
         # headers/symlinks that `cc` needs at link time.
         #
-        # gnome-keyring + dbus-x11 are runtime deps for the secret-store
-        # live tests in tests/audit_emissions_live.rs — the `keyring`
-        # crate's default Linux backend is `secret-service`, which needs
-        # a running Secret Service daemon. Without one, `mvmctl secret
-        # put` fails with `org.freedesktop.secrets was not provided`.
+        # The secret-store live tests in tests/audit_emissions_live.rs
+        # pin `MVM_SECRET_STORE_BACKEND=file` in the sandbox, so no
+        # DBus / Secret Service is needed here.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcap-ng-dev gnome-keyring dbus-x11
+          sudo apt-get install -y libcap-ng-dev
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -165,19 +163,7 @@ jobs:
         run: cargo build --all-targets
 
       - name: Run tests
-        # Run cargo test inside a fresh dbus session with gnome-keyring
-        # unlocked under an empty password. `dbus-run-session` spawns
-        # a private session bus and exports DBUS_SESSION_BUS_ADDRESS;
-        # piping `\n` to `gnome-keyring-daemon --unlock` sets the empty
-        # password and prints env vars the daemon expects in its
-        # environment. The whole chain runs as one shell invocation so
-        # the env propagates to `cargo test`.
-        run: |
-          dbus-run-session -- bash -c '
-            eval "$(printf "\n" | gnome-keyring-daemon --unlock --components=secrets)"
-            export GNOME_KEYRING_CONTROL SSH_AUTH_SOCK
-            cargo test
-          '
+        run: cargo test
 
   e2e:
     name: E2E Tests
@@ -264,10 +250,16 @@ jobs:
           # silently (the directory check failed in main CI after the
           # `nix/dev` + `nix/images/*` subtrees were removed without a
           # matching workflow update).
+          # `./` prefix is load-bearing: a bare path like `nix` or
+          # `nix/images/builder` is parsed as `flake:<name>` (registry
+          # lookup), not a local path. `nix` happens to resolve to
+          # NixOS/nix upstream — so the pre-fix command silently
+          # checked the wrong flake — while `nix/images/builder`
+          # fails with `'builder' is not a commit hash`.
           find nix -name flake.nix -type f -print0 | sort -z | while IFS= read -r -d '' flake; do
             d="$(dirname "$flake")"
             echo "=== $d ==="
-            nix flake check --no-build "$d"
+            nix flake check --no-build "./$d"
           done
 
   # ── Lane: Apple (release-only) ────────────────────────────────────
