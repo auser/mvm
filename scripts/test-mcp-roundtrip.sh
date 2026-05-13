@@ -5,7 +5,10 @@
 # real JSON-RPC roundtrip, and asserts:
 #
 #   1. `initialize` returns the pinned protocol version + serverInfo.
-#   2. `tools/list` returns exactly one tool named `run`.
+#   2. `tools/list` includes the `run` tool plus the Phase 7
+#      host-mediated tool set (mvm.time_now / web_fetch / web_search /
+#      upload / download); `run`'s input schema still carries the
+#      single-tool fields exercised by Assertion 4.
 #   3. `tools/call run` against an unregistered env returns a structured
 #      MCP-shaped `isError: true` result (NOT a JSON-RPC error code).
 #      This validates the env-allowlist gate without needing a real
@@ -111,29 +114,38 @@ fi
 echo "    initialize: protocolVersion=$PROTO_VERSION serverInfo.name=$SERVER_NAME"
 
 # --- Assertion 3: tools/list ------------------------------------------
+# Plan 60 Phase 7 added host-mediated tools alongside `run`. The
+# assertion is: `run` is present (its env-allowlist gate is what
+# Assertion 4 exercises), the Phase 7 mvm.* set is present (so a
+# future regression that drops a tool from the default registry
+# trips loudly here), and the schema fields on `run` still match
+# the single-tool dispatch contract.
 LIST=$(sed -n '2p' "$OUT")
 TOOL_COUNT=$(echo "$LIST" | jq -r '.result.tools | length // empty')
-if [ "$TOOL_COUNT" != "1" ]; then
-    echo "==> FAIL: tools/list expected 1 tool, got $TOOL_COUNT" >&2
+if [ -z "$TOOL_COUNT" ] || [ "$TOOL_COUNT" = "0" ]; then
+    echo "==> FAIL: tools/list returned no tools" >&2
     echo "$LIST" >&2
     exit 1
 fi
-TOOL_NAME=$(echo "$LIST" | jq -r '.result.tools[0].name // empty')
-if [ "$TOOL_NAME" != "run" ]; then
-    echo "==> FAIL: tools/list expected name 'run', got '$TOOL_NAME'" >&2
-    exit 1
-fi
-# The single-tool design (plan 32 / nix-sandbox-mcp insight) requires
-# `env`, `code`, `session`, `close`, `timeout_secs` in the schema.
-SCHEMA=$(echo "$LIST" | jq -c '.result.tools[0].inputSchema.properties // empty')
-for field in env code session close timeout_secs; do
-    if ! echo "$SCHEMA" | jq -e --arg f "$field" '.[$f]' >/dev/null 2>&1; then
-        echo "==> FAIL: tools/list schema missing field '$field'" >&2
-        echo "    schema: $SCHEMA" >&2
+for expected in run mvm.time_now mvm.web_fetch mvm.web_search mvm.upload mvm.download; do
+    PRESENT=$(echo "$LIST" | jq --arg t "$expected" -r '.result.tools | map(.name) | index($t) // empty')
+    if [ -z "$PRESENT" ]; then
+        echo "==> FAIL: tools/list missing expected tool '$expected'" >&2
+        echo "$LIST" >&2
         exit 1
     fi
 done
-echo "    tools/list: 1 tool ('run'), schema contains env/code/session/close/timeout_secs"
+# Schema check is scoped to `run` — that's the tool Assertion 4
+# dispatches against.
+RUN_SCHEMA=$(echo "$LIST" | jq -c '.result.tools[] | select(.name == "run") | .inputSchema.properties // empty')
+for field in env code session close timeout_secs; do
+    if ! echo "$RUN_SCHEMA" | jq -e --arg f "$field" '.[$f]' >/dev/null 2>&1; then
+        echo "==> FAIL: tools/list schema for 'run' missing field '$field'" >&2
+        echo "    schema: $RUN_SCHEMA" >&2
+        exit 1
+    fi
+done
+echo "    tools/list: $TOOL_COUNT tools (incl. 'run' + Phase 7 mvm.* set), schema for 'run' contains env/code/session/close/timeout_secs"
 
 # --- Assertion 4: tools/call against unknown env returns isError ------
 # This is the env-allowlist gate. Without an actual microVM template

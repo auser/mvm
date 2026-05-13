@@ -41,6 +41,13 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror = "1"
+# Plan 60 Phase 7 — `web_fetch` tool parses RFC-3986 URLs to enforce
+# scheme/host invariants before the allowlist check.
+url = "2"
+# Plan 60 Phase 7 — `ReqwestHttpFetcher` (the reqwest-backed
+# `HttpFetcher` impl for `mvm.web_fetch`). Workspace feature set
+# already includes `rustls-tls` so we don't pull openssl.
+reqwest = { workspace = true }
 # Wave 2.6: L7EgressProxy uses tokio::net::lookup_host for the
 # production DnsResolver impl. Tests use only `macros + rt`, the
 # proxy needs `net` for lookup. `rt-multi-thread` lands when the
@@ -48,11 +55,12 @@ thiserror = "1"
 tokio = { workspace = true, features = ["net", "rt"] }
 tracing.workspace = true
 
-# Sampler (A3) reads `/proc/<pid>/stat` and uses `sysconf(_SC_CLK_TCK)` /
-# `_SC_PAGESIZE` to convert jiffies → microseconds and pages → bytes.
-# Linux-only; the non-Linux source readers compile to empty stubs that
-# don't reference libc, so the dep is gated.
-[target.'cfg(target_os = "linux")'.dependencies]
+# Plan 60 Phase 7 staging tools: `O_NOFOLLOW` on read/write opens
+# defends the upload + download path validators against a symlink
+# planted inside the staging dir. Unix-wide (macOS + Linux); the
+# Windows branch in `staging.rs` falls back to a `symlink_metadata`
+# check.
+[target.'cfg(unix)'.dependencies]
 libc.workspace = true
 
 [dev-dependencies]

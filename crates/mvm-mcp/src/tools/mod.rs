@@ -102,15 +102,165 @@ pub struct ToolSchema {
     pub input_schema: serde_json::Value,
 }
 
-/// All tools exposed by mvmctl mcp. v1 = exactly one.
+/// JSON Schema for the `mvm.time_now` tool. Mirrors
+/// `mvm_supervisor::tools::time_now::TimeNowParams`.
+pub fn time_now_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "properties": {
+            "format": {
+                "type": "string",
+                "enum": ["rfc3339", "unix"],
+                "description": "Output format. 'rfc3339' (default) returns an ISO-8601 string; 'unix' returns seconds-since-epoch as a decimal string."
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// JSON Schema for the `mvm.web_fetch` tool. Mirrors
+/// `mvm_supervisor::tools::web_fetch::WebFetchParams`.
+pub fn web_fetch_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["url"],
+        "properties": {
+            "url": {
+                "type": "string",
+                "description": "Absolute https:// URL to fetch. http:// and other schemes are rejected. The destination host must appear in the per-tenant allowlist."
+            },
+            "max_bytes": {
+                "type": "integer",
+                "description": "Cap on response body length, in bytes. Defaults to 1 MiB; values above 16 MiB are clamped.",
+                "minimum": 1
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// JSON Schema for the `mvm.upload` tool. Mirrors
+/// `mvm_supervisor::tools::upload::UploadParams`.
+pub fn upload_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["path", "content_base64"],
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative path under the per-tenant staging root. No absolute paths, no '..' components, no control characters; length capped at 512 bytes."
+            },
+            "content_base64": {
+                "type": "string",
+                "description": "URL-safe-no-pad base64 of the payload bytes. Binary content round-trips losslessly."
+            },
+            "max_bytes": {
+                "type": "integer",
+                "description": "Post-decode size cap, in bytes. Defaults to 16 MiB; values above 256 MiB are clamped.",
+                "minimum": 1
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// JSON Schema for the `mvm.download` tool. Mirrors
+/// `mvm_supervisor::tools::download::DownloadParams`.
+pub fn download_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["path"],
+        "properties": {
+            "path": {
+                "type": "string",
+                "description": "Relative path under the per-tenant staging root. Same validation as mvm.upload."
+            },
+            "max_bytes": {
+                "type": "integer",
+                "description": "Cap on file size, in bytes. Defaults to 16 MiB; values above 256 MiB are clamped. Files larger than the cap return an error instead of a partial read.",
+                "minimum": 1
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// JSON Schema for the `mvm.web_search` tool. Mirrors
+/// `mvm_supervisor::tools::web_search::WebSearchParams`.
+pub fn web_search_input_schema() -> serde_json::Value {
+    serde_json::json!({
+        "type": "object",
+        "required": ["query"],
+        "properties": {
+            "query": {
+                "type": "string",
+                "description": "Free-form search query. Non-empty, no control characters, length capped at 1024."
+            },
+            "provider": {
+                "type": "string",
+                "description": "Optional provider name (e.g. 'brave', 'google'). Falls back to the tool's default_provider. Must appear in the per-tenant allowlist."
+            },
+            "max_results": {
+                "type": "integer",
+                "description": "Cap on result count. Default 10; values above 50 are clamped.",
+                "minimum": 1
+            }
+        },
+        "additionalProperties": false
+    })
+}
+
+/// All tools exposed by mvmctl mcp.
+///
+/// - `run` — legacy single-tool "boot a microVM and execute code".
+/// - `mvm.time_now`, `mvm.web_fetch`, `mvm.web_search` — plan 60
+///   Phase 7 host-mediated tools (implementations live in
+///   `mvm-supervisor::tools`).
 pub fn all_tools() -> Vec<ToolSchema> {
-    vec![ToolSchema {
-        name: "run".to_string(),
-        description:
-            "Run code inside a fresh mvm microVM. Single tool; the `env` parameter selects which pre-built environment to boot — either a built-in preset (`shell`, `bash`, `python`, `node`) or a path to a project directory whose `mvm.toml` has been built via `mvmctl build`. Output is captured (stdout, stderr, exit_code). Each call boots and tears down a transient VM (session reuse is reserved). Use `mvmctl manifest ls` on the host to discover available manifest-keyed environments."
-                .to_string(),
-        input_schema: run_input_schema(),
-    }]
+    vec![
+        ToolSchema {
+            name: "run".to_string(),
+            description:
+                "Run code inside a fresh mvm microVM. Single tool; the `env` parameter selects which pre-built environment to boot — either a built-in preset (`shell`, `bash`, `python`, `node`) or a path to a project directory whose `mvm.toml` has been built via `mvmctl build`. Output is captured (stdout, stderr, exit_code). Each call boots and tears down a transient VM (session reuse is reserved). Use `mvmctl manifest ls` on the host to discover available manifest-keyed environments."
+                    .to_string(),
+            input_schema: run_input_schema(),
+        },
+        ToolSchema {
+            name: "mvm.time_now".to_string(),
+            description:
+                "Return the host wall-clock time as either RFC 3339 (default) or Unix seconds. No upstream call, no network — useful as a diagnostic that the agent → supervisor pipe is alive."
+                    .to_string(),
+            input_schema: time_now_input_schema(),
+        },
+        ToolSchema {
+            name: "mvm.web_fetch".to_string(),
+            description:
+                "Fetch a single https:// URL. The destination host must appear in the per-tenant allowlist (operators grant per-host access). The response body comes back as URL-safe-no-pad base64 so binary content (images, gzip, etc.) round-trips losslessly; `bytes` carries the pre-encoding length."
+                    .to_string(),
+            input_schema: web_fetch_input_schema(),
+        },
+        ToolSchema {
+            name: "mvm.web_search".to_string(),
+            description:
+                "Search the web through a per-tenant allowlisted provider (Brave / Google / DuckDuckGo / …). The agent does not see the provider's API key; the supervisor owns it. Returns up to `max_results` hits, each with title / url / snippet."
+                    .to_string(),
+            input_schema: web_search_input_schema(),
+        },
+        ToolSchema {
+            name: "mvm.upload".to_string(),
+            description:
+                "Write a base64-encoded payload to a relative path under the per-tenant staging area on the host. Path validation rejects absolute paths, '..' components, control characters, and length > 512 bytes. The staging area is a host-side directory (~/.mvm/tool-staging/<tenant>/ by default; override via MVM_TOOL_STAGING_DIR) that the workload can read through a controlled channel."
+                    .to_string(),
+            input_schema: upload_input_schema(),
+        },
+        ToolSchema {
+            name: "mvm.download".to_string(),
+            description:
+                "Read a relative path from the per-tenant staging area and return the bytes as URL-safe-no-pad base64. Same path validation + size caps as mvm.upload. Use the `bytes` field to learn the file size without decoding."
+                    .to_string(),
+            input_schema: download_input_schema(),
+        },
+    ]
 }
 
 #[cfg(test)]
@@ -149,23 +299,31 @@ mod tests {
     }
 
     #[test]
-    fn all_tools_returns_single_run_tool() {
+    fn all_tools_returns_run_plus_phase_7_tools() {
         let tools = all_tools();
-        assert_eq!(tools.len(), 1);
-        assert_eq!(tools[0].name, "run");
+        let names: Vec<&str> = tools.iter().map(|t| t.name.as_str()).collect();
+        assert!(names.contains(&"run"));
+        assert!(names.contains(&"mvm.time_now"));
+        assert!(names.contains(&"mvm.web_fetch"));
+        assert!(names.contains(&"mvm.web_search"));
+        assert!(names.contains(&"mvm.upload"));
+        assert!(names.contains(&"mvm.download"));
+        assert_eq!(tools.len(), 6);
     }
 
     #[test]
-    fn tools_list_token_budget_under_500() {
+    fn tools_list_token_budget_under_2000() {
         // Byte-count heuristic where 1 token ≈ 4 bytes (well-known
-        // approximation for Claude/GPT-4 family). The plan's target
-        // is ≤ 500 tokens for `tools/list`. Guards against schema
-        // bloat as we add description text over time.
+        // approximation for Claude/GPT-4 family). Plan 60 Phase 7
+        // grows the tool count from 1 to 4; budget scales with it.
+        // 2000 tokens (~8000 bytes) leaves headroom for the planned
+        // `upload`/`download`/`code_eval` additions; tighten once
+        // those land.
         let serialized = serde_json::to_string(&all_tools()).unwrap();
         let approx_tokens = serialized.len() / 4;
         assert!(
-            approx_tokens < 500,
-            "tools/list too large: ~{} tokens ({} bytes); target < 500",
+            approx_tokens < 2000,
+            "tools/list too large: ~{} tokens ({} bytes); target < 2000",
             approx_tokens,
             serialized.len()
         );

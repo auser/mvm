@@ -26,6 +26,8 @@ use mvm_mcp::{
     ContentBlock, Dispatcher, ReapReason, Reaper, RunParams, SessionConfig, SessionLookup,
     SessionMap, SessionState, ToolResult,
 };
+use mvm_supervisor::ToolRegistry;
+use mvm_supervisor::tools::{download, staging, upload, web_fetch, web_search};
 
 use super::Cli;
 
@@ -120,6 +122,13 @@ struct ExecDispatcher {
     sessions: Arc<Mutex<SessionMap>>,
     warm_vms: WarmVms,
     reaper: Arc<DispatcherReaper>,
+    /// Plan 60 Phase 7 host-mediated tools (`mvm.time_now`,
+    /// `mvm.web_fetch`, `mvm.web_search`). Built once at dispatcher
+    /// construction; shared across every `tools/call` invocation.
+    /// Default registry ships fail-closed for the web tools —
+    /// operators wire per-tenant allowlists by replacing this with
+    /// a configured registry in a follow-up slice.
+    tool_registry: Arc<ToolRegistry>,
 }
 
 impl Default for ExecDispatcher {
@@ -134,8 +143,115 @@ impl Default for ExecDispatcher {
                 warm_vms: Arc::clone(&warm_vms),
             }),
             warm_vms,
+            tool_registry: Arc::new(build_tool_registry()),
         }
     }
+}
+
+/// Build the Phase 7 tool registry the MCP dispatcher hands out.
+///
+/// Today:
+/// - `mvm.time_now` — always reachable.
+/// - `mvm.web_fetch` — uses [`web_fetch::ReqwestHttpFetcher`] when
+///   constructable; allowlist comes from
+///   `$MVM_WEB_FETCH_ALLOWLIST` (comma-separated). When the env var
+///   is unset, the allowlist is empty and every fetch fails closed.
+/// - `mvm.web_search` — allowlist comes from
+///   `$MVM_WEB_SEARCH_ALLOWLIST`; default provider comes from
+///   `$MVM_WEB_SEARCH_DEFAULT` (or the first allowlist entry).
+///   When `"brave"` is on the allowlist AND `$BRAVE_SEARCH_API_KEY`
+///   is set, a [`web_search::BraveSearchProvider`] is registered.
+///   Without the key, the existing "allowed but unregistered =
+///   config drift" error fires on first invoke so the
+///   misconfiguration is loud, not silent.
+///
+/// On `ReqwestHttpFetcher::new()` / `BraveSearchProvider::new()`
+/// failure (extraordinarily rare), we log a `tracing::warn` and
+/// fall back to the substrate's Noop default so the registry still
+/// ships.
+fn build_tool_registry() -> ToolRegistry {
+    let mut registry = ToolRegistry::with_defaults();
+
+    // Plan 60 Phase 4 wire-up: every successful tool invocation
+    // emits a `cmd.tool.<name>.{completed,failed}` chain-signed
+    // entry through the host signer's FileAuditSigner. When the
+    // signer isn't reachable (no $HOME, key not initialized, loose
+    // perms) we log a warning in `build_cmd_recorder` and skip the
+    // attachment — tool calls still succeed; the audit footprint
+    // just doesn't land. Same posture as `cmd.*` envelopes.
+    if let Some(rec) = crate::commands::cmd_audit::build_cmd_recorder() {
+        registry = registry.with_recorder(rec);
+    }
+
+    // mvm.web_fetch
+    let allow = web_fetch::allowlist_from_env_var(web_fetch::ALLOWLIST_ENV_VAR);
+    let mut fetch_tool = web_fetch::WebFetchTool::with_allowlist(allow);
+    match web_fetch::ReqwestHttpFetcher::new() {
+        Ok(f) => {
+            fetch_tool = fetch_tool.with_fetcher(Arc::new(f));
+        }
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "ReqwestHttpFetcher init failed; mvm.web_fetch will use Noop fallback"
+            );
+        }
+    }
+    registry.register(Box::new(fetch_tool));
+
+    // mvm.web_search
+    let search_allow = web_search::allowlist_from_env_var(web_search::ALLOWLIST_ENV_VAR);
+    let default_provider = std::env::var(web_search::DEFAULT_PROVIDER_ENV_VAR)
+        .ok()
+        .or_else(|| search_allow.iter().next().cloned())
+        .unwrap_or_else(|| "noop".to_string());
+    let mut search_tool =
+        web_search::WebSearchTool::with_allowlist(search_allow.iter().cloned(), default_provider);
+    if search_allow.contains("brave")
+        && let Ok(key) = std::env::var(web_search::BRAVE_API_KEY_ENV_VAR)
+    {
+        match web_search::BraveSearchProvider::new(key) {
+            Ok(p) => {
+                search_tool = search_tool.register_provider(Arc::new(p));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "BraveSearchProvider init failed; mvm.web_search 'brave' provider will be \
+                     allowlisted-but-unregistered"
+                );
+            }
+        }
+    }
+    if search_allow.contains("tavily")
+        && let Ok(key) = std::env::var(web_search::TAVILY_API_KEY_ENV_VAR)
+    {
+        match web_search::TavilySearchProvider::new(key) {
+            Ok(p) => {
+                search_tool = search_tool.register_provider(Arc::new(p));
+            }
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "TavilySearchProvider init failed; mvm.web_search 'tavily' provider will be \
+                     allowlisted-but-unregistered"
+                );
+            }
+        }
+    }
+    registry.register(Box::new(search_tool));
+
+    // mvm.upload + mvm.download — share one per-tenant FsStagingArea.
+    // Default tenant matches the rest of the host-local scope ("local");
+    // a future slice plumbs the per-call tenant once mvmctl mcp gains
+    // the corresponding policy bundle.
+    let staging_area = staging::default_for_tenant("local");
+    registry.register(Box::new(upload::UploadTool::with_staging(
+        staging_area.clone(),
+    )));
+    registry.register(Box::new(download::DownloadTool::with_staging(staging_area)));
+
+    registry
 }
 
 impl ExecDispatcher {
@@ -444,6 +560,45 @@ impl Dispatcher for ExecDispatcher {
             }
         }
     }
+
+    /// Plan 60 Phase 7 — route registry tools through
+    /// `mvm_supervisor::ToolRegistry`. The legacy `run` tool stays
+    /// on its dedicated method; everything else (`mvm.time_now`,
+    /// `mvm.web_fetch`, `mvm.web_search`, …) lands here.
+    ///
+    /// `ToolRegistry::invoke` is async; the MCP wire layer is sync,
+    /// so we spin up a current-thread runtime per call (same pattern
+    /// as `vm::audit_chain::AuditEmitter`'s `block_on`). Tool calls
+    /// are infrequent relative to per-call cost, and the runtime
+    /// build is dominated by everything else in the dispatch path.
+    fn invoke_tool(&self, name: &str, params: serde_json::Value) -> ToolResult {
+        let rt = match tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+        {
+            Ok(rt) => rt,
+            Err(e) => {
+                return error_result(format!(
+                    "internal: building tokio runtime for tool {name:?}: {e}"
+                ));
+            }
+        };
+        match rt.block_on(self.tool_registry.invoke(name, params)) {
+            Ok(value) => {
+                // Render the JSON value as a single Text content
+                // block. The LLM client parses the body; pretty-
+                // printing keeps it human-readable when an operator
+                // inspects audit logs.
+                let text = serde_json::to_string_pretty(&value)
+                    .unwrap_or_else(|e| format!("(failed to serialize tool result: {e})"));
+                ToolResult {
+                    content: vec![ContentBlock::Text { text }],
+                    is_error: false,
+                }
+            }
+            Err(e) => error_result(e.to_string()),
+        }
+    }
 }
 
 struct InflightGuard<'a>(&'a AtomicUsize);
@@ -611,5 +766,52 @@ mod tests {
     #[test]
     fn shell_escape_no_quotes() {
         assert_eq!(shell_escape("plain"), "'plain'");
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Plan 60 Phase 7 — invoke_tool routes through ToolRegistry
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn invoke_tool_routes_time_now_through_registry() {
+        // The default ExecDispatcher carries a registry with the 3
+        // Phase 7 builtins. `mvm.time_now` is unconditionally
+        // reachable (no allowlist needed), so this is the
+        // simplest "the wiring works" smoke test.
+        let dispatcher = ExecDispatcher::default();
+        let result = dispatcher.invoke_tool("mvm.time_now", serde_json::json!({}));
+        assert!(!result.is_error, "got error: {result:?}");
+        let ContentBlock::Text { text } = &result.content[0];
+        // The registry's TimeNowResult shape has `"time"` + `"format"` fields.
+        assert!(text.contains("\"time\""), "got: {text}");
+        assert!(text.contains("\"format\""), "got: {text}");
+    }
+
+    #[test]
+    fn invoke_tool_renders_unknown_tool_as_is_error() {
+        // The registry's `UnknownTool` error must surface as an
+        // `is_error: true` ToolResult (NOT a JSON-RPC error), so
+        // the LLM client sees the failure instead of retrying.
+        let dispatcher = ExecDispatcher::default();
+        let result = dispatcher.invoke_tool("mvm.does_not_exist", serde_json::json!({}));
+        assert!(result.is_error);
+        let ContentBlock::Text { text } = &result.content[0];
+        assert!(text.contains("mvm.does_not_exist"), "got: {text}");
+    }
+
+    #[test]
+    fn invoke_tool_web_fetch_fails_closed_with_clear_message() {
+        // The default registry registers `mvm.web_fetch` with an
+        // empty allowlist (Default::default() = fail_closed). The
+        // operator sees a clear "not on allowlist" error rather
+        // than a silent fall-through.
+        let dispatcher = ExecDispatcher::default();
+        let result = dispatcher.invoke_tool(
+            "mvm.web_fetch",
+            serde_json::json!({ "url": "https://example.com/" }),
+        );
+        assert!(result.is_error);
+        let ContentBlock::Text { text } = &result.content[0];
+        assert!(text.contains("not on per-tenant allowlist"), "got: {text}");
     }
 }
