@@ -55,9 +55,47 @@
       # Stage the workspace root (`<repo>/`, three levels up from
       # this flake's `nix/images/builder/`) into the store. The
       # `name` argument is what shows up in derivation logs.
+      #
+      # The filter excludes large directories that are never inputs to
+      # the dev-image build: `target/` (cargo build output, multi-GB),
+      # `.git/` (history), `result*` (nix build symlinks), and a few
+      # developer-environment dirs. Without it, `builtins.path` hashes
+      # and store-copies the whole workspace on every evaluation —
+      # slow on cold caches and wasteful even when warm.
+      #
+      # When running inside the microsandbox builder VM, the flake is
+      # fetched via `path:` URL which store-copies just the flake
+      # subdir; `../../..` from that store location resolves outside
+      # the workspace and would trip over sandbox-internal files like
+      # `/.msb/agent.sock`. The builder passes `MVM_WORKSPACE_PATH`
+      # (under `--impure`) pointing at the workspace mount, and we
+      # use that absolute path when set. Outside the sandbox (e.g.
+      # running `nix build` directly on the host), the env var is
+      # empty and `../../..` works as before.
+      workspaceRoot =
+        let
+          envPath = builtins.getEnv "MVM_WORKSPACE_PATH";
+        in
+        if envPath != "" then /. + envPath else ../../..;
       workspace = builtins.path {
-        path = ../../..;
+        path = workspaceRoot;
         name = "mvm-workspace";
+        filter =
+          path: _type:
+          let
+            base = baseNameOf path;
+          in
+          !(builtins.elem base [
+            "target"
+            ".git"
+            "result"
+            "node_modules"
+            ".direnv"
+            ".cargo"
+            ".claude"
+            ".worktrees"
+          ])
+          && !(nixpkgs.lib.hasPrefix "result-" base);
       };
 
       # Import the parent flake's library code directly. `nix/lib/`
