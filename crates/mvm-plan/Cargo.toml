@@ -18,11 +18,13 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tar = "0.4"
+# Used by BundleRegistry::install for atomic-write of the cached
+# `<sha>.mvmpkg` file via `NamedTempFile::persist`.
+tempfile.workspace = true
 thiserror = "1"
 
 [dev-dependencies]
 rand.workspace = true
-tempfile.workspace = true
 
 [lints]
 workspace = true

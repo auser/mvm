@@ -31,7 +31,8 @@ use mvm_core::user_config::MvmConfig;
 use super::Cli;
 
 mod export;
-mod fetch;
+pub(super) mod fetch;
+mod install;
 
 #[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct Args {
@@ -49,11 +50,17 @@ pub(in crate::commands) enum BundleAction {
     /// Reports the parsed manifest on success; rejects on any of
     /// the failure modes in `BundleVerifyError`.
     Fetch(fetch::Args),
+    /// Verify and atomically install a `.mvmpkg` archive into the
+    /// local bundle registry (`~/.mvm/bundles/<sha>/`). Once
+    /// installed, `mvmctl up --manifest <sha>` launches from it.
+    /// Sprint 52 W2 registry-replacement substrate.
+    Install(install::Args),
 }
 
 pub(in crate::commands) fn run(cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
     match args.action {
         BundleAction::Export(a) => export::run(cli, a, cfg),
         BundleAction::Fetch(a) => fetch::run(cli, a, cfg),
+        BundleAction::Install(a) => install::run(cli, a, cfg),
     }
 }

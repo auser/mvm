@@ -359,6 +359,331 @@ impl BundleResolver for FsBundleResolver {
     }
 }
 
+// ---------------------------------------------------------------------------
+// BundleRegistry — content-addressed installed-bundle layout
+// ---------------------------------------------------------------------------
+
+/// A bundle that has been verified and extracted onto disk under
+/// `~/.mvm/bundles/<bundle_sha256>/`. Holds the artifact root path
+/// plus the parsed manifest so callers can resolve per-role
+/// artifact paths without re-reading the JSON.
+///
+/// Returned by [`BundleRegistry::install`] and
+/// [`BundleRegistry::find`]. Drop is a no-op — installs persist
+/// across processes; cleanup is the caller's job (typically a
+/// future `mvmctl bundle gc`).
+#[derive(Debug, Clone)]
+pub struct InstalledBundle {
+    /// Lowercase-hex SHA-256 of the archive bytes the bundle was
+    /// installed from. Equal to the directory name under the
+    /// registry root.
+    pub sha256: String,
+    /// Directory holding the extracted manifest + artifacts. The
+    /// `manifest.json` / `manifest.sig` / `artifacts/*` files live
+    /// inside this directory.
+    pub root: PathBuf,
+    /// Parsed manifest, recovered from the extract. Cheap to clone
+    /// because the manifest is small (kilobytes at most).
+    pub manifest: BundleManifest,
+}
+
+impl InstalledBundle {
+    /// Find an artifact by role inside the install directory.
+    /// Returns the absolute filesystem path; the file existence check
+    /// is the caller's responsibility (the manifest's per-artifact
+    /// sha256 was already verified at install time, so reading the
+    /// file is safe to assume).
+    pub fn path_for_role(&self, role: &ArtifactRole) -> Option<PathBuf> {
+        self.manifest
+            .find_by_role(role)
+            .map(|a| self.root.join(&a.path))
+    }
+
+    /// Same as [`path_for_role`](Self::path_for_role) but keyed by
+    /// the artifact's `name` field. Useful for verity sidecars
+    /// whose role is `VerityHashSidecar` but whose binding to the
+    /// rootfs is named-not-roled.
+    pub fn path_for_name(&self, name: &str) -> Option<PathBuf> {
+        self.manifest
+            .find_by_name(name)
+            .map(|a| self.root.join(&a.path))
+    }
+}
+
+/// Errors specific to bundle install.
+#[derive(Debug, Error)]
+pub enum BundleInstallError {
+    #[error("bundle archive failed verification: {0}")]
+    Verify(#[source] BundleVerifyError),
+
+    #[error("filesystem error installing bundle {bundle_sha256}: {reason}")]
+    Io {
+        bundle_sha256: String,
+        reason: String,
+    },
+
+    #[error("bundle {bundle_sha256} is already installed; pass `force` to overwrite")]
+    AlreadyInstalled { bundle_sha256: String },
+}
+
+/// Content-addressed registry of installed bundles. Each entry is a
+/// directory keyed by `<bundle_sha256>` containing the verified
+/// manifest, signature, and extracted artifacts. The registry sits
+/// next to the archive cache that [`FsBundleResolver`] reads —
+/// installs write both the original `<sha>.mvmpkg` (for re-fetch
+/// /verify) and the unpacked `<sha>/` (for template loading).
+///
+/// Install is atomic: extraction happens into a `<sha>.partial/`
+/// staging dir; only after every artifact landed does the rename
+/// to `<sha>/` happen. Crash mid-install leaves either no entry
+/// or the previous entry — never half an install.
+pub struct BundleRegistry {
+    root: PathBuf,
+}
+
+impl BundleRegistry {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { root: dir.into() }
+    }
+
+    /// Default path: `~/.mvm/bundles/`. Same root [`FsBundleResolver`]
+    /// uses — the archive (`<sha>.mvmpkg`) and the unpacked
+    /// directory (`<sha>/`) cohabit under one tree.
+    pub fn default_path() -> anyhow::Result<Self> {
+        let home = std::env::var_os("HOME").ok_or_else(|| {
+            anyhow::anyhow!("$HOME is not set; cannot resolve bundle registry root")
+        })?;
+        let p = PathBuf::from(home).join(".mvm").join("bundles");
+        Ok(Self::new(p))
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+
+    /// Absolute path to the archive cache file for a given sha256.
+    pub fn archive_path(&self, bundle_sha256: &str) -> PathBuf {
+        self.root.join(format!("{bundle_sha256}.mvmpkg"))
+    }
+
+    /// Absolute path to the extracted-bundle directory for a given
+    /// sha256.
+    pub fn install_dir(&self, bundle_sha256: &str) -> PathBuf {
+        self.root.join(bundle_sha256)
+    }
+
+    /// Install a verified archive into the registry. Verifies the
+    /// archive against `trust`, extracts every declared artifact
+    /// atomically (stage to `<sha>.partial/`, rename to `<sha>/`),
+    /// and writes the archive bytes to `<sha>.mvmpkg` so a later
+    /// `BundleResolver::resolve` finds them.
+    ///
+    /// Idempotent when `force == false`: if `<sha>/` already exists
+    /// the call returns `AlreadyInstalled`. `force == true` removes
+    /// the existing install and replaces it.
+    pub fn install(
+        &self,
+        archive_bytes: &[u8],
+        trust: &dyn TrustStore,
+        force: bool,
+    ) -> Result<InstalledBundle, BundleInstallError> {
+        let verified =
+            read_and_verify_bundle(archive_bytes, trust).map_err(BundleInstallError::Verify)?;
+        let sha = bundle_sha256(archive_bytes);
+
+        let install_dir = self.install_dir(&sha);
+        if install_dir.exists() {
+            if !force {
+                return Err(BundleInstallError::AlreadyInstalled {
+                    bundle_sha256: sha.clone(),
+                });
+            }
+            std::fs::remove_dir_all(&install_dir).map_err(|e| BundleInstallError::Io {
+                bundle_sha256: sha.clone(),
+                reason: format!(
+                    "removing existing install at {}: {e}",
+                    install_dir.display()
+                ),
+            })?;
+        }
+
+        // Ensure the registry root exists with tight perms — same
+        // shape as the trust store directory.
+        std::fs::create_dir_all(&self.root).map_err(|e| BundleInstallError::Io {
+            bundle_sha256: sha.clone(),
+            reason: format!("creating registry root {}: {e}", self.root.display()),
+        })?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            if let Ok(meta) = std::fs::metadata(&self.root) {
+                let mut perms = meta.permissions();
+                perms.set_mode(0o700);
+                let _ = std::fs::set_permissions(&self.root, perms);
+            }
+        }
+
+        // Stage extracts into <sha>.partial/. A previous crash
+        // could have left this dir behind; remove it first.
+        let staging = self.root.join(format!("{sha}.partial"));
+        if staging.exists() {
+            std::fs::remove_dir_all(&staging).map_err(|e| BundleInstallError::Io {
+                bundle_sha256: sha.clone(),
+                reason: format!("removing stale staging at {}: {e}", staging.display()),
+            })?;
+        }
+        std::fs::create_dir_all(&staging).map_err(|e| BundleInstallError::Io {
+            bundle_sha256: sha.clone(),
+            reason: format!("creating staging dir {}: {e}", staging.display()),
+        })?;
+
+        // Write manifest.json + manifest.sig + each artifact into
+        // the staging dir. `verified.artifacts` is keyed by the
+        // archive-relative path the verifier already validated as
+        // safe — direct join is OK.
+        let manifest_bytes =
+            verified
+                .manifest
+                .canonical_bytes()
+                .map_err(|e| BundleInstallError::Io {
+                    bundle_sha256: sha.clone(),
+                    reason: format!("re-serialising manifest: {e:#}"),
+                })?;
+        write_into(&staging, MANIFEST_FILENAME, &manifest_bytes, &sha)?;
+
+        // Recover the signature blob from the original archive —
+        // verified.artifacts doesn't carry it as an entry, but the
+        // tar does.
+        let sig_bytes = read_signature_from_archive(archive_bytes).map_err(|reason| {
+            BundleInstallError::Io {
+                bundle_sha256: sha.clone(),
+                reason,
+            }
+        })?;
+        write_into(&staging, SIGNATURE_FILENAME, &sig_bytes, &sha)?;
+
+        for (rel_path, bytes) in &verified.artifacts {
+            write_into(&staging, rel_path, bytes, &sha)?;
+        }
+
+        // Promote the staging dir to its final name. `rename` is
+        // atomic on POSIX within the same filesystem; the registry
+        // root lives inside `~/.mvm/` so this is always within
+        // `$HOME`'s filesystem in practice.
+        std::fs::rename(&staging, &install_dir).map_err(|e| BundleInstallError::Io {
+            bundle_sha256: sha.clone(),
+            reason: format!(
+                "promoting staging {} → install {}: {e}",
+                staging.display(),
+                install_dir.display()
+            ),
+        })?;
+
+        // Also persist the archive bytes so FsBundleResolver finds
+        // them. Atomic via NamedTempFile + persist.
+        let archive_path = self.archive_path(&sha);
+        let mut tmp =
+            tempfile::NamedTempFile::new_in(&self.root).map_err(|e| BundleInstallError::Io {
+                bundle_sha256: sha.clone(),
+                reason: format!("creating archive tempfile: {e}"),
+            })?;
+        std::io::Write::write_all(tmp.as_file_mut(), archive_bytes).map_err(|e| {
+            BundleInstallError::Io {
+                bundle_sha256: sha.clone(),
+                reason: format!("writing archive bytes: {e}"),
+            }
+        })?;
+        tmp.persist(&archive_path)
+            .map_err(|e| BundleInstallError::Io {
+                bundle_sha256: sha.clone(),
+                reason: format!(
+                    "persisting archive {} → {}: {e}",
+                    e.file.path().display(),
+                    archive_path.display()
+                ),
+            })?;
+
+        Ok(InstalledBundle {
+            sha256: sha,
+            root: install_dir,
+            manifest: verified.manifest,
+        })
+    }
+
+    /// Resolve an installed bundle by sha256. Returns `Ok(None)`
+    /// when the entry isn't present (the caller often wants to
+    /// fall through to a different lookup); errors only on I/O
+    /// or corrupt-manifest cases.
+    pub fn find(&self, bundle_sha256: &str) -> anyhow::Result<Option<InstalledBundle>> {
+        let dir = self.install_dir(bundle_sha256);
+        if !dir.exists() {
+            return Ok(None);
+        }
+        let manifest_path = dir.join(MANIFEST_FILENAME);
+        let bytes = std::fs::read(&manifest_path).map_err(|e| {
+            anyhow::anyhow!(
+                "reading installed bundle manifest at {}: {e}",
+                manifest_path.display()
+            )
+        })?;
+        let manifest: BundleManifest = serde_json::from_slice(&bytes).map_err(|e| {
+            anyhow::anyhow!(
+                "parsing installed bundle manifest at {}: {e}",
+                manifest_path.display()
+            )
+        })?;
+        Ok(Some(InstalledBundle {
+            sha256: bundle_sha256.to_string(),
+            root: dir,
+            manifest,
+        }))
+    }
+}
+
+/// Write a single file under `dir` atomically. Used by
+/// [`BundleRegistry::install`] for every staged artifact + the
+/// manifest + the signature.
+fn write_into(
+    dir: &Path,
+    rel_path: &str,
+    bytes: &[u8],
+    bundle_sha256: &str,
+) -> Result<(), BundleInstallError> {
+    let target = dir.join(rel_path);
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| BundleInstallError::Io {
+            bundle_sha256: bundle_sha256.to_string(),
+            reason: format!("creating {}: {e}", parent.display()),
+        })?;
+    }
+    std::fs::write(&target, bytes).map_err(|e| BundleInstallError::Io {
+        bundle_sha256: bundle_sha256.to_string(),
+        reason: format!("writing {}: {e}", target.display()),
+    })
+}
+
+/// Read just the signature blob from a `.mvmpkg` archive without
+/// going through the full verification pass. Used by
+/// [`BundleRegistry::install`] to copy the signature into the
+/// extracted directory.
+fn read_signature_from_archive(archive: &[u8]) -> Result<Vec<u8>, String> {
+    let mut tar = tar::Archive::new(std::io::Cursor::new(archive));
+    for entry in tar.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let path = entry
+            .path()
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned();
+        if path == SIGNATURE_FILENAME {
+            let mut bytes = Vec::with_capacity(64);
+            std::io::Read::read_to_end(&mut entry, &mut bytes).map_err(|e| e.to_string())?;
+            return Ok(bytes);
+        }
+    }
+    Err(format!("{SIGNATURE_FILENAME} not present in archive"))
+}
+
 /// Verify a plan's pinned bundle at admit time.
 ///
 /// Runs the full [`read_and_verify_bundle`] rejection ladder against
@@ -1566,6 +1891,160 @@ mod tests {
             Err(PlanBundleError::BundleSha256Mismatch { .. }) => {}
             other => panic!("expected BundleSha256Mismatch, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bundle_registry_install_roundtrip() {
+        // Install a clean bundle → assert both the archive file
+        // and the extracted dir exist, and that `find` recovers
+        // the parsed manifest.
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = BundleRegistry::new(tmp.path());
+        let sk = fresh_key();
+        let archive = build_bundle(&sk, b"kernel-bytes", b"rootfs-bytes");
+        let store = trust(&sk);
+
+        let installed = registry
+            .install(&archive, &store, false)
+            .expect("install succeeds");
+
+        // Archive file landed.
+        let archive_path = registry.archive_path(&installed.sha256);
+        assert!(
+            archive_path.exists(),
+            "archive missing at {:?}",
+            archive_path
+        );
+        let archive_back = std::fs::read(&archive_path).unwrap();
+        assert_eq!(archive_back, archive);
+
+        // Extracted dir landed.
+        let install_dir = registry.install_dir(&installed.sha256);
+        assert!(install_dir.is_dir());
+        assert!(install_dir.join(MANIFEST_FILENAME).exists());
+        assert!(install_dir.join(SIGNATURE_FILENAME).exists());
+        assert!(install_dir.join("artifacts/vmlinux").exists());
+        assert!(install_dir.join("artifacts/rootfs.ext4").exists());
+
+        // find() recovers the same handle.
+        let recovered = registry
+            .find(&installed.sha256)
+            .expect("find succeeds")
+            .expect("entry present");
+        assert_eq!(recovered.sha256, installed.sha256);
+        assert_eq!(recovered.manifest, installed.manifest);
+    }
+
+    #[test]
+    fn bundle_registry_install_rejects_tampered_archive() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = BundleRegistry::new(tmp.path());
+        let sk = fresh_key();
+        let mut archive = build_bundle(&sk, b"k", b"r");
+        archive[200] ^= 0x01; // tamper
+        let store = trust(&sk);
+
+        let err = registry
+            .install(&archive, &store, false)
+            .expect_err("must refuse tampered bundle");
+        assert!(matches!(err, BundleInstallError::Verify(_)));
+
+        // No partial state left behind. read_dir's first entry — if
+        // any — is unexpected; clippy's `never_loop` lint flags the
+        // explicit for-loop form here so the assertion uses next().
+        if let Some(entry) = std::fs::read_dir(tmp.path()).unwrap().flatten().next() {
+            let name = entry.file_name().into_string().unwrap();
+            panic!("unexpected file in registry after refusal: {name}");
+        }
+    }
+
+    #[test]
+    fn bundle_registry_install_refuses_overwrite_without_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = BundleRegistry::new(tmp.path());
+        let sk = fresh_key();
+        let archive = build_bundle(&sk, b"k", b"r");
+        let store = trust(&sk);
+
+        registry
+            .install(&archive, &store, false)
+            .expect("first install");
+        let err = registry
+            .install(&archive, &store, false)
+            .expect_err("second install without force must refuse");
+        assert!(matches!(err, BundleInstallError::AlreadyInstalled { .. }));
+    }
+
+    #[test]
+    fn bundle_registry_install_overwrites_with_force() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = BundleRegistry::new(tmp.path());
+        let sk = fresh_key();
+        let archive = build_bundle(&sk, b"k", b"r");
+        let store = trust(&sk);
+
+        let first = registry.install(&archive, &store, false).unwrap();
+        let second = registry
+            .install(&archive, &store, true)
+            .expect("force install succeeds");
+        assert_eq!(first.sha256, second.sha256);
+        // Re-installable means the extracted dir is fresh — at
+        // minimum the manifest still parses.
+        assert_eq!(first.manifest, second.manifest);
+    }
+
+    #[test]
+    fn bundle_registry_install_cleans_up_stale_staging() {
+        // Simulate a crash mid-install by pre-creating the
+        // `<sha>.partial/` staging dir with junk in it. The next
+        // install must remove it and replace cleanly.
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = BundleRegistry::new(tmp.path());
+        let sk = fresh_key();
+        let archive = build_bundle(&sk, b"k", b"r");
+        let store = trust(&sk);
+        let sha = bundle_sha256(&archive);
+        let staging = tmp.path().join(format!("{sha}.partial"));
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("junk"), b"left over from crash").unwrap();
+
+        let installed = registry
+            .install(&archive, &store, false)
+            .expect("install survives stale staging");
+        assert_eq!(installed.sha256, sha);
+        // Staging dir got removed during install (rename consumed it).
+        assert!(!staging.exists(), "staging dir survived install");
+    }
+
+    #[test]
+    fn bundle_registry_find_misses_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = BundleRegistry::new(tmp.path());
+        let result = registry.find(&"0".repeat(64)).expect("ok");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn installed_bundle_finds_artifacts_by_role_and_name() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = BundleRegistry::new(tmp.path());
+        let sk = fresh_key();
+        let archive = build_bundle(&sk, b"k", b"r");
+        let store = trust(&sk);
+        let installed = registry.install(&archive, &store, false).unwrap();
+
+        let kernel = installed
+            .path_for_role(&ArtifactRole::Kernel)
+            .expect("kernel role present");
+        assert!(kernel.ends_with("artifacts/vmlinux"));
+        assert!(kernel.exists());
+
+        let by_name = installed
+            .path_for_name("rootfs.ext4")
+            .expect("rootfs by name present");
+        assert!(by_name.exists());
+
+        assert!(installed.path_for_role(&ArtifactRole::Initrd).is_none());
     }
 
     #[test]
