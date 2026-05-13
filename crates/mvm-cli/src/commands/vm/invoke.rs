@@ -90,6 +90,27 @@ pub(in crate::commands) struct Args {
     /// compiled in.
     #[arg(long, requires = "keep_alive")]
     pub keep_alive_dev: bool,
+
+    /// Attach this call to an existing warm session id. The Python /
+    /// TypeScript SDKs pass this when a user wraps `f.remote(...)` in
+    /// an `mv.session(...)` context manager, so multiple back-to-back
+    /// calls reuse the same warm VM. **Plan 60 Phase 5 Slice E1: the
+    /// flag is accepted so the SDK's argv doesn't get rejected at
+    /// parse time, but routing into an existing session is wired by
+    /// the session-pool plan (Phase 5c).** A non-empty value prints a
+    /// warning and the call falls back to the transient-VM path.
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
+
+    /// Dispatch into a specific function within a multi-function app
+    /// (ADR-0014 Phase 2). Single-function apps ignore the selector
+    /// because their primary entrypoint is the only one. **Plan 60
+    /// Phase 5 Slice E1: the flag is accepted so the SDK's argv
+    /// (`--fn <name>` from `WorkloadRef.attr(...)`) doesn't get
+    /// rejected; actual routing lands when ADR-0014 Phase 2 wires
+    /// per-function dispatch on the agent side.**
+    #[arg(long, value_name = "NAME")]
+    pub r#fn: Option<String>,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
@@ -98,6 +119,20 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             "--reset is wired but no-op in this build (session-pool plan); \
              treating as default behaviour",
         );
+    }
+    if let Some(id) = &args.session {
+        ui::warn(&format!(
+            "--session {id} is accepted but no-op in this build \
+             (session-pool plan, plan 60 Phase 5c); falling back to a \
+             transient VM for this call"
+        ));
+    }
+    if let Some(name) = &args.r#fn {
+        ui::warn(&format!(
+            "--fn {name} is accepted but no-op in this build \
+             (multi-function dispatch lands with ADR-0014 Phase 2); \
+             the workload's primary entrypoint will be dispatched"
+        ));
     }
 
     // v1: invoke targets a *template*. Resolve through the same shared
