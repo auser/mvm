@@ -162,10 +162,14 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     if args.no_vm {
         // Dev shortcut — bypass VM boot and run the wrapper directly
         // on the host. Plan 60 Phase 5 Slice E1b. See
-        // `invoke_no_vm.rs` for the full contract.
-        ui::warn(
-            "--no-vm: bypassing VM boot, running wrapper on the host. \
-             Not for production. None of the in-VM hardening applies.",
+        // `invoke_no_vm.rs` for the full contract. `eprintln!`
+        // instead of `ui::warn` because the latter writes to stdout
+        // (a pre-existing inconsistency vs `ui::error`); stdout under
+        // --no-vm is reserved for the wrapper's encoded return value
+        // that the SDK decodes.
+        eprintln!(
+            "[mvm] --no-vm: bypassing VM boot, running wrapper on the host. \
+             Not for production. None of the in-VM hardening applies."
         );
         let stdin_bytes = read_stdin_payload(args.stdin.as_deref())?;
         let exit_code = super::invoke_no_vm::run(&args, stdin_bytes)?;
