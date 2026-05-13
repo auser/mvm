@@ -191,6 +191,104 @@ docs-dev:
 docs-build:
     cd public && pnpm build
 
+# ── VMM setup ────────────────────────────────────────────────────────────
+
+# Install libkrun (macOS via slp/krun tap; Linux via apt/dnf/pacman)
+setup-libkrun:
+    #!/usr/bin/env bash
+    # macOS:   brew install slp/krun/libkrun  (libkrun is not in core;
+    #                                          the qualified form auto-taps)
+    # Linux:   apt install libkrun-dev        (Debian/Ubuntu, drags libkrun1)
+    #          dnf install libkrun-devel      (Fedora/RHEL)
+    #          pacman -S libkrun              (Arch / community)
+    # Other:   build from source at https://github.com/containers/libkrun
+    #
+    # After install, verify with:
+    #   cargo run --example libkrun-bootcheck --features libkrun-sys
+    set -euo pipefail
+    # Idempotency probe: if the shared library is already present at
+    # any standard location, skip the package-manager invocation. Both
+    # brew-on-Darwin and apt-on-Linux happily re-process an already-
+    # installed package, but the diagnostic noise ("Error: libkrun
+    # X.Y.Z is already installed") obscures the verify line that
+    # actually matters. Short-circuit so a re-run after install is
+    # clean.
+    EXISTING=""
+    for p in \
+        /opt/homebrew/lib/libkrun.dylib \
+        /usr/local/lib/libkrun.dylib \
+        /usr/lib/x86_64-linux-gnu/libkrun.so \
+        /usr/lib/aarch64-linux-gnu/libkrun.so \
+        /usr/lib64/libkrun.so \
+        /usr/local/lib/libkrun.so
+    do
+        if [ -f "$p" ]; then
+            EXISTING="$p"
+            break
+        fi
+    done
+    if [ -n "$EXISTING" ]; then
+        echo "libkrun already installed at $EXISTING — skipping package install."
+        echo
+        echo "Next: cargo run --example libkrun-bootcheck --features libkrun-sys"
+        exit 0
+    fi
+
+    case "$(uname -s)" in
+        Darwin)
+            if ! command -v brew >/dev/null; then
+                echo "error: Homebrew not found. Install: https://brew.sh" >&2
+                exit 1
+            fi
+            echo "→ brew install slp/krun/libkrun"
+            brew install slp/krun/libkrun
+            ;;
+        Linux)
+            if command -v apt-get >/dev/null; then
+                echo "→ apt install libkrun-dev"
+                sudo apt-get update
+                sudo apt-get install -y libkrun-dev
+            elif command -v dnf >/dev/null; then
+                echo "→ dnf install libkrun-devel"
+                sudo dnf install -y libkrun-devel
+            elif command -v pacman >/dev/null; then
+                echo "→ pacman -S libkrun"
+                sudo pacman -S --needed libkrun
+            else
+                echo "error: no recognized package manager (apt / dnf / pacman)." >&2
+                echo "       Build from source: https://github.com/containers/libkrun" >&2
+                exit 1
+            fi
+            ;;
+        *)
+            echo "error: libkrun is not supported on $(uname -s)." >&2
+            exit 1
+            ;;
+    esac
+    echo
+    echo "Verifying install…"
+    found=0
+    for p in \
+        /opt/homebrew/lib/libkrun.dylib \
+        /usr/local/lib/libkrun.dylib \
+        /usr/lib/x86_64-linux-gnu/libkrun.so \
+        /usr/lib/aarch64-linux-gnu/libkrun.so \
+        /usr/lib64/libkrun.so \
+        /usr/local/lib/libkrun.so
+    do
+        if [ -f "$p" ]; then
+            echo "  ✓ $p"
+            found=1
+        fi
+    done
+    if [ "$found" -eq 0 ]; then
+        echo "  ! libkrun shared library not found at the standard locations." >&2
+        echo "  ! If you installed manually, set MVM_LIBKRUN_HEADER and link search path." >&2
+        exit 1
+    fi
+    echo
+    echo "Next: cargo run --example libkrun-bootcheck --features libkrun-sys"
+
 # ── Utilities ────────────────────────────────────────────────────────────
 
 # Clean build artifacts
