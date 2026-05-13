@@ -94,6 +94,12 @@ pub struct SynthesisInput<'a> {
     /// Whether the post-run lifecycle should destroy the VM on exit.
     /// True for one-shot CLI workloads; false for daemon-shape services.
     pub destroy_on_exit: bool,
+    /// Optional pin to a content-addressed `.mvmpkg` bundle. When
+    /// set, the synthesised plan carries the pin and the supervisor's
+    /// admit path re-verifies the archive against this triple before
+    /// backend dispatch. Sprint 52 W2 follow-on substrate — populating
+    /// it from `mvmctl up` flags is the next step.
+    pub bundle_pin: Option<mvm_plan::bundle::PlanArtifact>,
 }
 
 /// Build an unsigned `ExecutionPlan` from CLI-shaped input.
@@ -170,6 +176,7 @@ pub fn synthesize_plan(input: &SynthesisInput<'_>) -> Result<ExecutionPlan> {
         valid_from: now,
         valid_until: now + Duration::minutes(VALIDITY_WINDOW_MINUTES),
         nonce,
+        bundle: input.bundle_pin.clone(),
     })
 }
 
@@ -200,6 +207,7 @@ mod tests {
             boot_timeout_secs: 60,
             exec_timeout_secs: 0,
             destroy_on_exit: false,
+            bundle_pin: None,
         }
     }
 

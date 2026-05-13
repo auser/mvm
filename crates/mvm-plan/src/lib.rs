@@ -34,9 +34,10 @@ pub mod types;
 pub mod validity;
 
 pub use bundle::{
-    ArtifactRole, BUNDLE_SCHEMA_VERSION, BundleArtifact, BundleManifest, BundleVerifyError,
-    FsTrustStore, KeyId, PlanArtifact, TrustStore, VerifiedBundle, VerityInfo, bundle_sha256,
-    read_and_verify_bundle, sha256_hex, signature_from_base64, signature_to_base64, write_bundle,
+    ArtifactRole, BUNDLE_SCHEMA_VERSION, BundleArtifact, BundleManifest, BundleResolveError,
+    BundleResolver, BundleVerifyError, FsBundleResolver, FsTrustStore, KeyId, PlanArtifact,
+    PlanBundleError, TrustStore, VerifiedBundle, VerityInfo, bundle_sha256, read_and_verify_bundle,
+    sha256_hex, signature_from_base64, signature_to_base64, verify_plan_bundle, write_bundle,
 };
 pub use plan::{ExecutionPlan, SCHEMA_VERSION};
 pub use signing::{PlanVerifyError, SignedExecutionPlan, sign_plan, verify_plan};
