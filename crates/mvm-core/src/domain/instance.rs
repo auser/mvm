@@ -6,6 +6,89 @@ use serde::{Deserialize, Serialize};
 use crate::idle_metrics::IdleMetrics;
 use crate::pool::Role;
 
+// ============================================================================
+// Workspace volume attach + workload classification (cross-repo with mvmd)
+// ============================================================================
+//
+// These types are the canonical mvm-core definitions for the workspace
+// volume attach surface introduced in mvmd Phase 1057/1058 (plan 32 —
+// `mvmd-integrations` memory service). They were defined locally in
+// `mvmd-runtime` first and are promoted here so the protocol types can
+// thread them without a circular dep. mvmd will drop its local copies
+// and re-export from `mvm_core::instance` once it bumps its mvm pin.
+
+/// Read/write mode for a workspace volume attached to an instance.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash)]
+#[serde(rename_all = "snake_case")]
+pub enum VolumeMode {
+    ReadOnly,
+    ReadWrite,
+}
+
+/// Request to attach a workspace-scoped volume into an instance at start.
+///
+/// Identity is `(workspace_id, name)`; the on-host backing file lives at
+/// `/var/lib/mvm/workspaces/<workspace_id>/volumes/<name>.ext4` (mvmd's
+/// `mvmd_runtime::vm::workspace::volumes` owns the layout). `mount_path`
+/// is threaded through to the guest config-drive metadata.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct VolumeAttach {
+    /// Workspace that owns the volume.
+    pub workspace_id: String,
+    /// Volume name within the workspace (file stem of `<name>.ext4`).
+    pub name: String,
+    /// Mount path inside the guest.
+    pub mount_path: String,
+    pub mode: VolumeMode,
+}
+
+/// Workload class — drives sleep policy, auto-provision rules, and
+/// resource defaults. Sandbox is the user-controlled ephemeral default;
+/// Service is workspace-owned, auto-provisioned, long-running (e.g. the
+/// per-workspace memory service).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq, Hash, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum WorkloadClass {
+    /// User-controlled, ephemeral. Default for sandboxes.
+    #[default]
+    Sandbox,
+    /// Auto-provisioned, workspace-owned, long-running.
+    Service,
+}
+
+// ============================================================================
+// Desired instance state (declarative target the reconciler drives toward)
+// ============================================================================
+
+/// Declarative per-instance desired state.
+///
+/// Carries identity + the workspace/volume/class metadata that the
+/// scheduler and `mvm-hostd` need to materialize an instance. Distinct
+/// from [`InstanceState`], which is the *observed* runtime state.
+///
+/// Backward compatibility: every field added after the initial shape
+/// MUST carry `#[serde(default)]` so older serialized payloads keep
+/// deserializing cleanly. Tested via
+/// `test_desired_instance_backward_compat`.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub struct DesiredInstance {
+    pub instance_id: String,
+    pub pool_id: String,
+    pub tenant_id: String,
+    /// Workspace this instance belongs to.
+    /// Required for service-class workloads; optional for sandbox-class
+    /// during migration (None = workspace-unknown, treated as
+    /// tenant-only).
+    #[serde(default)]
+    pub workspace_id: Option<String>,
+    /// Workspace-scoped volumes to attach at instance start.
+    #[serde(default)]
+    pub volumes: Vec<VolumeAttach>,
+    /// Workload class — drives sleep policy, auto-provision rules, etc.
+    #[serde(default)]
+    pub workload_class: WorkloadClass,
+}
+
 /// Instance lifecycle status. Only instances have runtime state.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -290,5 +373,106 @@ mod tests {
         assert_eq!(InstanceStatus::Running.to_string(), "running");
         assert_eq!(InstanceStatus::Sleeping.to_string(), "sleeping");
         assert_eq!(InstanceStatus::Destroyed.to_string(), "destroyed");
+    }
+
+    // ------------- VolumeMode / VolumeAttach / WorkloadClass -------------
+
+    #[test]
+    fn test_volume_mode_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&VolumeMode::ReadOnly).unwrap(),
+            "\"read_only\""
+        );
+        assert_eq!(
+            serde_json::to_string(&VolumeMode::ReadWrite).unwrap(),
+            "\"read_write\""
+        );
+        let parsed: VolumeMode = serde_json::from_str("\"read_only\"").unwrap();
+        assert_eq!(parsed, VolumeMode::ReadOnly);
+    }
+
+    #[test]
+    fn test_workload_class_serializes_snake_case() {
+        assert_eq!(
+            serde_json::to_string(&WorkloadClass::Sandbox).unwrap(),
+            "\"sandbox\""
+        );
+        assert_eq!(
+            serde_json::to_string(&WorkloadClass::Service).unwrap(),
+            "\"service\""
+        );
+    }
+
+    #[test]
+    fn test_workload_class_default_is_sandbox() {
+        assert_eq!(WorkloadClass::default(), WorkloadClass::Sandbox);
+    }
+
+    #[test]
+    fn test_volume_attach_roundtrip() {
+        let attach = VolumeAttach {
+            workspace_id: "ws-prod".to_string(),
+            name: "memory".to_string(),
+            mount_path: "/var/lib/memory".to_string(),
+            mode: VolumeMode::ReadWrite,
+        };
+        let json = serde_json::to_string(&attach).unwrap();
+        let parsed: VolumeAttach = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, attach);
+    }
+
+    // ------------- DesiredInstance -------------
+
+    #[test]
+    fn test_desired_instance_roundtrip_full() {
+        let di = DesiredInstance {
+            instance_id: "i-abc123".to_string(),
+            pool_id: "memory-svc".to_string(),
+            tenant_id: "acme".to_string(),
+            workspace_id: Some("ws-prod".to_string()),
+            volumes: vec![VolumeAttach {
+                workspace_id: "ws-prod".to_string(),
+                name: "memory".to_string(),
+                mount_path: "/var/lib/memory".to_string(),
+                mode: VolumeMode::ReadWrite,
+            }],
+            workload_class: WorkloadClass::Service,
+        };
+        let json = serde_json::to_string(&di).unwrap();
+        let parsed: DesiredInstance = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, di);
+    }
+
+    #[test]
+    fn test_desired_instance_backward_compat() {
+        // Pre-workspace JSON (no workspace_id, volumes, workload_class)
+        // must still deserialize with defaults — sandbox-class sandboxes
+        // produced before Phase 1058 land here.
+        let json = r#"{
+            "instance_id": "i-legacy",
+            "pool_id": "workers",
+            "tenant_id": "acme"
+        }"#;
+        let parsed: DesiredInstance = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.instance_id, "i-legacy");
+        assert_eq!(parsed.workspace_id, None);
+        assert!(parsed.volumes.is_empty());
+        assert_eq!(parsed.workload_class, WorkloadClass::Sandbox);
+    }
+
+    #[test]
+    fn test_desired_instance_partial_compat() {
+        // Mid-migration payload: workspace_id present, but no volumes
+        // and no workload_class — should default sensibly.
+        let json = r#"{
+            "instance_id": "i-mid",
+            "pool_id": "workers",
+            "tenant_id": "acme",
+            "workspace_id": "ws-prod"
+        }"#;
+        let parsed: DesiredInstance = serde_json::from_str(json).unwrap();
+        assert_eq!(parsed.workspace_id.as_deref(), Some("ws-prod"));
+        assert!(parsed.volumes.is_empty());
+        assert_eq!(parsed.workload_class, WorkloadClass::Sandbox);
     }
 }
