@@ -62,6 +62,18 @@ impl MockBackend {
     pub fn count(&self) -> usize {
         self.state.lock().map(|s| s.len()).unwrap_or(0)
     }
+
+    /// Host-side per-VM directory for a mock VM. Lives under
+    /// `<mvm_data_dir>/mock-vms/<name>/` so it never collides with
+    /// the Lima-era `~/microvm/vms/<name>` path that
+    /// `resolve_running_vm_dir` expects for real Firecracker VMs.
+    /// Plan 65 W1: `pause.rs` and `resume.rs` read the snapshot
+    /// directory through here when `--hypervisor mock` is set.
+    pub fn vm_dir(name: &str) -> std::path::PathBuf {
+        std::path::PathBuf::from(mvm_core::config::mvm_data_dir())
+            .join("mock-vms")
+            .join(name)
+    }
 }
 
 impl VmBackend for MockBackend {
@@ -87,6 +99,13 @@ impl VmBackend for MockBackend {
         if state.contains_key(&config.name) {
             bail!("mock: VM '{}' already running", config.name);
         }
+        // Plan 65 W1: create a host-side per-VM directory so the
+        // verbs that probe `<vm_dir>/...` paths (pause/resume's
+        // snapshot dir; future fs/proc/volume work) find something
+        // real. Best-effort — a failure here doesn't abort start
+        // because not every consumer needs the directory.
+        let vm_dir = Self::vm_dir(&config.name);
+        let _ = std::fs::create_dir_all(&vm_dir);
         state.insert(
             config.name.clone(),
             MockVm {
