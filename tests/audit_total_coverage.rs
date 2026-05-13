@@ -171,9 +171,9 @@ const BUNDLE_SUB: &[(&str, AuditPosture)] = &[
     ("export", AuditPosture::InteractiveOrControl),
     ("fetch", AuditPosture::ReadOnly),
     // `bundle install` mutates the local bundle registry under
-    // `~/.mvm/bundles/<sha>/`. Substrate posture for now; once the
-    // audit-chain hook ships, this flips to Emits("BundleInstall").
-    ("install", AuditPosture::InteractiveOrControl),
+    // `~/.mvm/bundles/<sha>/` and emits
+    // `LocalAuditKind::BundleInstall` via `mvm_core::audit::emit`.
+    ("install", AuditPosture::Emits("BundleInstall")),
 ];
 
 // trust add/remove mutate `~/.mvm/trusted-publishers/` and emit
@@ -412,6 +412,7 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
         "VmProcSignal",
         "VmProcStart",
         "VmProcStdin",
+        "BundleInstall",
         "TrustAdd",
         "TrustRemove",
         "VmStart",

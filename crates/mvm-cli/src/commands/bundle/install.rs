@@ -68,6 +68,15 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         .install(&bytes, &trust, args.force)
         .with_context(|| format!("installing bundle from {}", args.source))?;
 
+    mvm_core::audit::emit(
+        mvm_core::audit::LocalAuditKind::BundleInstall,
+        None,
+        Some(&format!(
+            "bundle_sha256={},key_id={}",
+            installed.sha256, installed.manifest.key_id.0,
+        )),
+    );
+
     println!(
         "Installed bundle {} ({} artifacts, publisher key_id={})",
         installed.sha256,
