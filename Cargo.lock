@@ -3867,6 +3867,7 @@ version = "0.14.0"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
+ "chrono",
  "colored",
  "ed25519-dalek",
  "indicatif",
@@ -3878,6 +3879,7 @@ dependencies = [
  "mvm-build",
  "mvm-core",
  "mvm-guest",
+ "mvm-plan",
  "mvm-providers",
  "mvm-security",
  "opendal",

@@ -79,6 +79,15 @@ impl BundleSource {
     }
 }
 
+/// Pub variant of [`load_archive_bytes`] for sibling subcommands
+/// (`mvmctl bundle install`) that reuse the same source-parsing +
+/// transport rules. Parses `source` into a [`BundleSource`] and
+/// dispatches.
+pub(in crate::commands) fn load_bundle_bytes(source: &str, allow_http: bool) -> Result<Vec<u8>> {
+    let parsed = BundleSource::parse(source);
+    load_archive_bytes(&parsed, allow_http)
+}
+
 /// Load the archive bytes, honouring the source's transport
 /// rules. HTTPS downloads write to a temp file (via
 /// `crate::http::download_file`) and read back — the temp file is

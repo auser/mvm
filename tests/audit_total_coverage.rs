@@ -170,6 +170,10 @@ const SNAPSHOT_SUB: &[(&str, AuditPosture)] = &[
 const BUNDLE_SUB: &[(&str, AuditPosture)] = &[
     ("export", AuditPosture::InteractiveOrControl),
     ("fetch", AuditPosture::ReadOnly),
+    // `bundle install` mutates the local bundle registry under
+    // `~/.mvm/bundles/<sha>/`. Substrate posture for now; once the
+    // audit-chain hook ships, this flips to Emits("BundleInstall").
+    ("install", AuditPosture::InteractiveOrControl),
 ];
 
 // trust add/remove mutate `~/.mvm/trusted-publishers/` but the
