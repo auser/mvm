@@ -28,11 +28,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     let path = dir.join(format!("{}.pub", id.0));
     match std::fs::remove_file(&path) {
         Ok(()) => {
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::TrustRemove,
-                None,
-                Some(&format!("key_id={}", id.0)),
-            );
+            mvm_core::audit_emit!(TrustRemove, "key_id={}", id.0);
             println!("Removed key_id {}", id.0);
             Ok(())
         }
