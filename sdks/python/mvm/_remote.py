@@ -39,6 +39,7 @@ from __future__ import annotations
 
 import asyncio
 import functools
+import inspect
 import json
 import os
 import re
@@ -109,6 +110,7 @@ __all__ = [
     "SecretInArgWarning",
     "SecretInArgError",
     "EmittingContextError",
+    "NoVmIntrospectionError",
     "WorkloadRef",
 ]
 
@@ -125,6 +127,14 @@ DEFAULT_KILL_GRACE_SEC = 5.0
 # that doesn't exist yet because the artifact for it is still being
 # built.
 EMITTING_ENV_VAR = "MVM_EMITTING"
+
+# Slice E1b: setting MVM_NO_VM=1 routes dispatch through
+# `mvmctl invoke --no-vm`, which runs the wrapper directly on the
+# host (no VM boot, no vsock). Per-call module/function/source-path
+# are derived from the wrapped Python function via `inspect`. Only
+# valid for :class:`RemoteFunction` (cross-workload
+# :class:`WorkloadRef` calls have no local fn to introspect).
+NO_VM_ENV_VAR = "MVM_NO_VM"
 
 
 class EmittingContextError(RuntimeError):
@@ -196,6 +206,55 @@ class PayloadTooLarge(MvmTransportError):
     if your function genuinely needs to receive a large blob, prefer a
     mounted volume or the secrets subsystem over the args channel.
     """
+
+
+class NoVmIntrospectionError(MvmTransportError):
+    """``MVM_NO_VM=1`` was set but the call has no in-process Python
+    function to introspect (e.g. cross-workload :class:`WorkloadRef`
+    dispatch). Cross-workload calls require a real VM."""
+
+
+def _no_vm_flags_for(fn: Callable[..., Any], format: str) -> list[str]:
+    """Derive the per-call `--no-vm` argv flags from the wrapped fn.
+
+    The Rust side wants `--language` / `--module` / `--function` /
+    `--format` / `--source-path` and uses these to write a temp
+    `wrapper.json` + spawn the embedded oneshot wrapper. Module and
+    function come from the function object itself; the source path is
+    the directory of the file `fn` is defined in.
+
+    A function defined in `__main__` (script-style execution, REPL)
+    has no stable module name the wrapper can import — raise the same
+    determinism error the emit path would.
+    """
+    module = getattr(fn, "__module__", None)
+    function_name = getattr(fn, "__name__", None)
+    if not isinstance(module, str) or not module or module == "__main__":
+        raise NoVmIntrospectionError(
+            f"MVM_NO_VM=1 cannot dispatch a function whose __module__ "
+            f"is {module!r}. Define the function in an importable "
+            "module so the wrapper can locate it."
+        )
+    if not isinstance(function_name, str) or not function_name:
+        raise NoVmIntrospectionError(
+            "MVM_NO_VM=1 cannot dispatch a function with no __name__"
+        )
+    try:
+        source_file = inspect.getfile(fn)
+    except (TypeError, OSError) as exc:
+        raise NoVmIntrospectionError(
+            f"MVM_NO_VM=1 could not locate the source file for "
+            f"{module}.{function_name}: {exc}"
+        ) from exc
+    source_path = os.path.dirname(os.path.abspath(source_file))
+    return [
+        "--no-vm",
+        "--language", "python",
+        "--module", module,
+        "--function", function_name,
+        "--format", format,
+        "--source-path", source_path,
+    ]
 
 
 def _locate_mvmctl() -> str:
@@ -351,6 +410,7 @@ def _prepare_invoke(
     *,
     fn_selector: str | None = None,
     use_active_session: bool = True,
+    fn: Callable[..., Any] | None = None,
 ) -> tuple[list[str], bytes, float, int]:
     """Run pre-spawn checks shared by sync and async dispatch paths.
 
@@ -368,6 +428,11 @@ def _prepare_invoke(
     dispatch via :class:`WorkloadRef` opts out — sessions are scoped
     to a single workload, so a session for workload A must not leak
     into a call against workload B.
+
+    ``fn``: the wrapped Python function. Required when ``MVM_NO_VM=1``
+    so the SDK can derive module / function / source-path from the
+    local definition and feed them to ``mvmctl invoke --no-vm``.
+    ``None`` is fine outside `--no-vm` mode.
     """
     _check_emitting_context(call_site)
     _check_id("workload_id", workload_id)
@@ -386,13 +451,31 @@ def _prepare_invoke(
     # at IR + SDK level, but defense in depth) cannot be misparsed as a
     # flag. All optional flags must come *before* the separator.
     argv: list[str] = [bin_path, "invoke"]
-    if use_active_session:
-        session_id = current_session_id()
-        if session_id is not None:
-            _check_id("session_id", session_id)
-            argv += ["--session", session_id]
-    if fn_selector is not None:
-        argv += ["--fn", fn_selector]
+    no_vm = os.environ.get(NO_VM_ENV_VAR) == "1"
+    if no_vm:
+        if fn is None:
+            raise NoVmIntrospectionError(
+                f"MVM_NO_VM=1 set but no local function available to "
+                f"introspect for {call_site}. --no-vm is only valid "
+                "for RemoteFunction calls; cross-workload WorkloadRef "
+                "dispatch requires a real VM."
+            )
+        argv += _no_vm_flags_for(fn, format)
+        # Sessions and --fn don't apply on the local-dispatch path:
+        # the wrapper picks `fn` from the inspected definition, and
+        # there's no warm VM to attach to.
+    else:
+        if use_active_session:
+            session_id = current_session_id()
+            if session_id is not None:
+                _check_id("session_id", session_id)
+                argv += ["--session", session_id]
+        if fn_selector is not None:
+            argv += ["--fn", fn_selector]
+    # The SDK always feeds the encoded `[args, kwargs]` payload to
+    # mvmctl over our own stdin pipe; `--stdin -` tells mvmctl to
+    # consume it rather than discarding stdin (default is empty).
+    argv += ["--stdin", "-"]
     argv += ["--", workload_id]
     timeout = env_float("MVM_INVOKE_TIMEOUT_SEC", DEFAULT_INVOKE_TIMEOUT_SEC)
     cap = env_int("MVM_MAX_OUTPUT_BYTES", DEFAULT_MAX_OUTPUT_BYTES)
@@ -420,6 +503,7 @@ def _invoke_sync(
     call_site: str = "RemoteFunction.sync(...)",
     fn_selector: str | None = None,
     use_active_session: bool = True,
+    fn: Callable[..., Any] | None = None,
 ) -> Any:
     argv, payload, timeout, cap = _prepare_invoke(
         call_site,
@@ -429,6 +513,7 @@ def _invoke_sync(
         kwargs,
         fn_selector=fn_selector,
         use_active_session=use_active_session,
+        fn=fn,
     )
     try:
         proc = run_capped(
@@ -459,6 +544,7 @@ async def _invoke_async(
     call_site: str = "RemoteFunction.__call__(...)",
     fn_selector: str | None = None,
     use_active_session: bool = True,
+    fn: Callable[..., Any] | None = None,
 ) -> Any:
     argv, payload, timeout, cap = _prepare_invoke(
         call_site,
@@ -468,6 +554,7 @@ async def _invoke_async(
         kwargs,
         fn_selector=fn_selector,
         use_active_session=use_active_session,
+        fn=fn,
     )
     # `create_subprocess_exec` is the argv-list (no-shell) async spawn
     # primitive — equivalent of POSIX execve, not shell-style exec.
@@ -578,11 +665,15 @@ class RemoteFunction:
         return self._fn
 
     def __call__(self, *args: Any, **kwargs: Any) -> Awaitable[Any]:
-        return _invoke_async(self._workload_id, self._format, args, kwargs)
+        return _invoke_async(
+            self._workload_id, self._format, args, kwargs, fn=self._fn
+        )
 
     def sync(self, *args: Any, **kwargs: Any) -> Any:
         """Synchronous remote dispatch. Same wire path as ``await f(...)``."""
-        return _invoke_sync(self._workload_id, self._format, args, kwargs)
+        return _invoke_sync(
+            self._workload_id, self._format, args, kwargs, fn=self._fn
+        )
 
 
 class _BoundRemoteCall:

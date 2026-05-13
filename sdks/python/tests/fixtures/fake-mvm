@@ -120,6 +120,16 @@ case "$subcommand" in
           fi
           shift 2
           ;;
+        --stdin)
+          # The SDK passes `--stdin -` so the real mvmctl reads stdin
+          # rather than discarding it. Accept and ignore: the fake-mvm
+          # always drains stdin via `cat` below regardless of the flag.
+          if [ -z "${2:-}" ]; then
+            echo "fake-mvm: --stdin requires a path or '-'" >&2
+            exit 64
+          fi
+          shift 2
+          ;;
         --)
           shift
           workload="${1:-}"

@@ -16,6 +16,11 @@ let
   # the contract `mkGuest`'s composition layer consumes (see
   # `tests/factory_shape.nix`).
   mkFunctionServiceImpl = import ./factories/mkFunctionService.nix;
+
+  # plan 71 — one-line IR-to-image helper. Reads a workload IR JSON,
+  # composes `mkFunctionService` with `mkGuest`, returns the rootfs
+  # derivation directly. Documented at `nix/lib/factories/README.md`.
+  mkFunctionWorkloadImpl = import ./mkFunctionWorkload.nix { inherit nixpkgs microvm mvmSrc; };
 in
 { system }:
 {
@@ -28,4 +33,8 @@ in
   # schema and `nix/lib/factories/languages/` for the language
   # registry.
   mkFunctionService = mkFunctionServiceImpl;
+
+  # Turn a workload IR JSON into a microVM rootfs in one call.
+  # See `nix/lib/mkFunctionWorkload.nix` for the supported IR shape.
+  mkFunctionWorkload = args: (mkFunctionWorkloadImpl { inherit system; }) args;
 }
