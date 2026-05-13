@@ -1,31 +1,57 @@
 //! libkrun backend for mvm.
 //!
-//! Plan 53 §"Plan E" / Sprint 48: scaffolding for a Tier 2 microVM
-//! backend that runs on Linux KVM, macOS Apple Silicon, and macOS Intel
-//! (the only VMM in mvm's tree that covers all three). The lifecycle
-//! delegates to [`mvm_libkrun`], which in turn wraps the Red Hat libkrun
-//! C library.
+//! Plan 53 §"Plan E" / Sprint 48: Tier 2 microVM backend that runs on
+//! Linux KVM, macOS Apple Silicon, and macOS Intel. The lifecycle
+//! delegates to a per-VM `mvm-libkrun-supervisor` subprocess (plan 57
+//! W4) rather than calling libkrun in-process: `krun_start_enter` calls
+//! `exit()` on the host process when the guest powers off, so any
+//! in-process registry would tear down sibling guests. One process per
+//! VM scopes the `exit()` to that supervisor and lets the parent
+//! `mvmctl` survive a guest shutdown.
 //!
-//! # Status
+//! ## Lifecycle
 //!
-//! This file provides the final `VmBackend` shape: [`LibkrunBackend`]
-//! declares its capabilities, security profile, and dispatch through
-//! `mvm::vm::backend::AnyBackend`. `start()` and `stop()`
-//! delegate to `mvm_libkrun`, which today returns a "not yet wired"
-//! error pointing at the Plan E spike phase. Once the spike confirms
-//! kernel + vsock + entitlement compatibility, the lifecycle will be
-//! real with no caller-side changes.
+//! - `start` writes `~/.mvm/vms/<name>/{rootfs.ref,kernel.ref}` runtime
+//!   metadata (so `mvmctl console` can find the artifacts), serializes a
+//!   [`SupervisorConfig`], spawns `mvm-libkrun-supervisor` with the JSON
+//!   on stdin, and waits up to [`PID_FILE_TIMEOUT`] for the supervisor
+//!   to write its PID file. Returns once the supervisor is running or
+//!   exits with an error if the spawn fails or PID file never appears.
+//! - `stop` reads `<vm_state_dir>/libkrun.pid`, sends `SIGTERM`, polls
+//!   for the process to exit, and falls back to `SIGKILL` if it doesn't
+//!   die within [`STOP_TIMEOUT`].
+//! - `status` reads the PID file and probes with `kill(pid, 0)`.
+//! - `list` walks `~/.mvm/vms/*/libkrun.pid`.
 
-use anyhow::Result;
+use anyhow::{Result, anyhow, bail};
 use mvm_core::vm_backend::{
     BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, StartMode, VmBackend,
     VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus,
 };
 
 use mvm_base::ui;
+use mvm_libkrun::{KrunContext, SupervisorConfig};
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 /// libkrun backend (Linux KVM / macOS Hypervisor.framework).
 pub struct LibkrunBackend;
+
+/// How long [`LibkrunBackend::start`] waits for the supervisor to
+/// write its PID file before giving up and killing the child.
+const PID_FILE_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// How long [`LibkrunBackend::stop`] waits after `SIGTERM` before
+/// escalating to `SIGKILL`.
+const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Default kernel cmdline for libkrun-launched guests.
+/// `console=hvc0` matches libkrun's virtio-console wiring (plan 57 W3
+/// finding); `root=/dev/vda rw init=/init` matches Apple Container's
+/// boot for the same Nix-built rootfs layout.
+const DEFAULT_CMDLINE: &str = "console=hvc0 root=/dev/vda rw init=/init";
 
 impl VmBackend for LibkrunBackend {
     fn name(&self) -> &str {
@@ -51,7 +77,7 @@ impl VmBackend for LibkrunBackend {
 
     fn start(&self, config: &VmStartConfig) -> Result<VmId> {
         if !mvm_libkrun::is_available() {
-            anyhow::bail!(
+            bail!(
                 "libkrun is not installed on this host.\n  {}",
                 mvm_libkrun::install_hint()
             );
@@ -60,71 +86,232 @@ impl VmBackend for LibkrunBackend {
         let kernel = config
             .kernel_path
             .as_deref()
-            .ok_or_else(|| anyhow::anyhow!("libkrun backend requires a kernel path"))?;
+            .ok_or_else(|| anyhow!("libkrun backend requires a kernel path"))?;
 
-        let ctx = mvm_libkrun::KrunContext::new(&config.name, kernel, &config.rootfs_path)
-            .with_resources(
-                u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX),
-                config.memory_mib,
-            )
-            .add_vsock_port(mvm_guest::vsock::GUEST_AGENT_PORT);
+        let supervisor_path = resolve_supervisor_path()?;
+        let state_dir = vm_state_dir(&config.name);
+        std::fs::create_dir_all(&state_dir)
+            .map_err(|e| anyhow!("create per-VM state dir {}: {e}", state_dir.display()))?;
 
         // W6.2.1: thread the build-time sidecar into per-VM runtime
         // metadata so `mvmctl console` enforces the accessible/sealed
         // gate on libkrun-launched VMs the same way as on the
         // microsandbox/Firecracker paths.
-        let rootfs = std::path::Path::new(&config.rootfs_path);
+        let rootfs = Path::new(&config.rootfs_path);
         mvm_base::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
 
+        let vcpus = u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX);
+        let krun = KrunContext::new(&config.name, kernel, &config.rootfs_path)
+            .with_resources(vcpus, config.memory_mib)
+            .with_cmdline(DEFAULT_CMDLINE)
+            .with_vsock_socket_dir(state_dir.to_string_lossy().into_owned())
+            .add_vsock_port(mvm_guest::vsock::GUEST_AGENT_PORT);
+
+        let cfg = SupervisorConfig {
+            krun,
+            vm_state_dir: state_dir.to_string_lossy().into_owned(),
+            pid_file_name: None,
+        };
+        let pid_file = cfg.pid_file();
+        // Remove any stale PID file from a previous crashed supervisor
+        // so the wait-loop below can detect the new one unambiguously.
+        let _ = std::fs::remove_file(&pid_file);
+
+        let json =
+            serde_json::to_string(&cfg).map_err(|e| anyhow!("serialize SupervisorConfig: {e}"))?;
+
         ui::info(&format!(
-            "Starting libkrun VM '{}' (cpus={}, mem={}MiB)...",
-            config.name, ctx.vcpus, ctx.ram_mib
+            "Starting libkrun VM '{}' (cpus={vcpus}, mem={}MiB) via {}...",
+            config.name,
+            config.memory_mib,
+            supervisor_path.display(),
         ));
 
-        mvm_libkrun::start(&ctx).map_err(|e| anyhow::anyhow!("libkrun start: {e}"))?;
-        ui::success(&format!("libkrun VM '{}' started.", config.name));
+        let mut child = Command::new(&supervisor_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow!("spawn {}: {e}", supervisor_path.display()))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("supervisor stdin was not piped"))?
+            .write_all(json.as_bytes())
+            .map_err(|e| anyhow!("pipe SupervisorConfig to supervisor stdin: {e}"))?;
+
+        // Poll for the PID file to appear; if the supervisor exits
+        // first, surface its status instead of waiting the full
+        // timeout.
+        let deadline = Instant::now() + PID_FILE_TIMEOUT;
+        loop {
+            if pid_file.exists() {
+                break;
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| anyhow!("poll supervisor child: {e}"))?
+            {
+                bail!(
+                    "supervisor exited before writing PID file (status: {status}). \
+                     Check stderr above for libkrun errors."
+                );
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                bail!(
+                    "supervisor did not write {} within {:?}; killed",
+                    pid_file.display(),
+                    PID_FILE_TIMEOUT
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        ui::success(&format!(
+            "libkrun VM '{}' started (pid file: {}).",
+            config.name,
+            pid_file.display()
+        ));
         Ok(VmId(config.name.clone()))
     }
 
     fn stop(&self, id: &VmId) -> Result<()> {
-        mvm_libkrun::stop(&id.0).map_err(|e| anyhow::anyhow!("libkrun stop: {e}"))
-    }
+        let pid_path = vm_state_dir(&id.0).join("libkrun.pid");
+        let pid = match read_pid(&pid_path) {
+            Some(p) => p,
+            None => {
+                // No PID file: nothing to do, but tell the user so it's
+                // not silent. Matches `mvmctl stop` on a never-started
+                // VM.
+                ui::info(&format!(
+                    "libkrun VM '{}' has no PID file at {}; nothing to stop.",
+                    id.0,
+                    pid_path.display()
+                ));
+                return Ok(());
+            }
+        };
 
-    fn stop_all(&self) -> Result<()> {
-        // Until the Plan E spike lands a real registry of running
-        // libkrun VMs, stop_all is a no-op. Real implementation tracks
-        // VMs in `~/.mvm/vms/<name>/libkrun.pid` (parallel to
-        // Firecracker's pidfile convention).
+        if !pid_alive(pid) {
+            ui::info(&format!(
+                "libkrun VM '{}' PID {pid} is not running; cleaning up state.",
+                id.0
+            ));
+            let _ = std::fs::remove_file(&pid_path);
+            return Ok(());
+        }
+
+        // SIGTERM first — gives libkrun a chance to clean up
+        // virtio-blk file descriptors. Then SIGKILL if it ignores us.
+        send_signal(pid, libc::SIGTERM);
+        let deadline = Instant::now() + STOP_TIMEOUT;
+        while Instant::now() < deadline {
+            if !pid_alive(pid) {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if pid_alive(pid) {
+            ui::info(&format!(
+                "libkrun VM '{}' PID {pid} did not exit after SIGTERM within {STOP_TIMEOUT:?}; sending SIGKILL.",
+                id.0
+            ));
+            send_signal(pid, libc::SIGKILL);
+        }
+
+        let _ = std::fs::remove_file(&pid_path);
+        ui::success(&format!("libkrun VM '{}' stopped.", id.0));
         Ok(())
     }
 
+    fn stop_all(&self) -> Result<()> {
+        let vms = self.list()?;
+        let mut last_err = None;
+        for vm in vms {
+            if let Err(e) = self.stop(&VmId(vm.name.clone())) {
+                tracing::warn!(name = vm.name, error = %e, "stop_all: stop failed");
+                last_err = Some(e);
+            }
+        }
+        if let Some(e) = last_err {
+            Err(e)
+        } else {
+            Ok(())
+        }
+    }
+
     fn pause(&self, _id: &VmId) -> Result<()> {
-        // libkrun's C API does not expose vCPU pause/resume today;
-        // matches `capabilities().pause_resume == false`. When upstream
-        // surfaces it (or we wire HVF/KVM ioctl access ourselves), flip
-        // the capability flag and replace this bail with a real impl.
-        anyhow::bail!(
+        bail!(
             "pause is not supported by the libkrun backend (upstream C API does not expose vCPU pause)"
         )
     }
 
     fn resume(&self, _id: &VmId) -> Result<()> {
-        anyhow::bail!(
+        bail!(
             "resume is not supported by the libkrun backend (upstream C API does not expose vCPU pause)"
         )
     }
 
-    fn status(&self, _id: &VmId) -> Result<VmStatus> {
-        // No real lifecycle yet — assume stopped.
-        Ok(VmStatus::Stopped)
+    fn status(&self, id: &VmId) -> Result<VmStatus> {
+        let pid_path = vm_state_dir(&id.0).join("libkrun.pid");
+        match read_pid(&pid_path) {
+            Some(pid) if pid_alive(pid) => Ok(VmStatus::Running),
+            _ => Ok(VmStatus::Stopped),
+        }
     }
 
     fn list(&self) -> Result<Vec<VmInfo>> {
-        Ok(Vec::new())
+        let root = vms_root();
+        let entries = match std::fs::read_dir(&root) {
+            Ok(it) => it,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
+            Err(e) => return Err(anyhow!("read {}: {e}", root.display())),
+        };
+        let mut vms = Vec::new();
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if !path.is_dir() {
+                continue;
+            }
+            let pid_path = path.join("libkrun.pid");
+            if !pid_path.exists() {
+                // Not a libkrun-managed VM (e.g. Apple Container under
+                // the same ~/.mvm/vms/ root).
+                continue;
+            }
+            let name = match entry.file_name().into_string() {
+                Ok(s) => s,
+                Err(_) => continue, // skip non-UTF-8 dir names
+            };
+            let alive = read_pid(&pid_path).is_some_and(pid_alive);
+            // The supervisor doesn't surface cpus/memory/ports back to
+            // the parent today; W4.3 (the integration-test PR) reads
+            // these out of the live VM via a status RPC over vsock.
+            // Until then, `list` reports the name + running state and
+            // leaves the discoverable-from-runtime fields empty.
+            vms.push(VmInfo {
+                id: VmId(name.clone()),
+                name,
+                status: if alive {
+                    VmStatus::Running
+                } else {
+                    VmStatus::Stopped
+                },
+                guest_ip: None,
+                cpus: 0,
+                memory_mib: 0,
+                profile: None,
+                revision: None,
+                flake_ref: None,
+                ports: Vec::new(),
+            });
+        }
+        Ok(vms)
     }
 
     fn logs(&self, id: &VmId, _lines: u32, _hypervisor: bool) -> Result<String> {
-        anyhow::bail!("libkrun logs not yet implemented for VM '{}'", id.0)
+        bail!("libkrun logs not yet implemented for VM '{}'", id.0)
     }
 
     fn is_available(&self) -> Result<bool> {
@@ -136,6 +323,13 @@ impl VmBackend for LibkrunBackend {
             "libkrun must be installed via the host's package manager.\n  {}",
             mvm_libkrun::install_hint()
         ));
+        // Also surface where we look for the supervisor binary so
+        // operators can pre-flight the install before hitting a
+        // mid-`mvmctl up` failure.
+        match resolve_supervisor_path() {
+            Ok(path) => ui::info(&format!("Supervisor binary: {}", path.display())),
+            Err(e) => ui::info(&format!("Supervisor binary: NOT FOUND ({e})")),
+        }
         Ok(())
     }
 
@@ -179,6 +373,74 @@ impl VmBackend for LibkrunBackend {
     }
 }
 
+// ─── helpers ───────────────────────────────────────────────────────
+
+fn vms_root() -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    PathBuf::from(home).join(".mvm/vms")
+}
+
+fn vm_state_dir(name: &str) -> PathBuf {
+    vms_root().join(name)
+}
+
+/// Resolve the absolute path to the `mvm-libkrun-supervisor` binary,
+/// checking three sources in order:
+///
+/// 1. `MVM_LIBKRUN_SUPERVISOR_PATH` — explicit override, used by tests
+///    and `cargo run` workflows.
+/// 2. A binary named `mvm-libkrun-supervisor` adjacent to the current
+///    executable — the layout produced by `cargo install mvm-libkrun`
+///    or by a Homebrew bottle that ships `mvmctl` and
+///    `mvm-libkrun-supervisor` side-by-side.
+/// 3. `PATH` lookup.
+///
+/// Returns an actionable error if all three fail.
+fn resolve_supervisor_path() -> Result<PathBuf> {
+    if let Some(p) = std::env::var_os("MVM_LIBKRUN_SUPERVISOR_PATH") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Ok(path);
+        }
+        bail!(
+            "MVM_LIBKRUN_SUPERVISOR_PATH points at {} which is not a file",
+            path.display()
+        );
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join("mvm-libkrun-supervisor");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    if let Ok(path) = which::which("mvm-libkrun-supervisor") {
+        return Ok(path);
+    }
+    bail!(
+        "mvm-libkrun-supervisor binary not found. Looked for: \
+         $MVM_LIBKRUN_SUPERVISOR_PATH, alongside the current exe, and on $PATH. \
+         Install it via `cargo install --path crates/mvm-libkrun --features libkrun-sys` \
+         or set MVM_LIBKRUN_SUPERVISOR_PATH=/abs/path/to/the/binary."
+    )
+}
+
+fn read_pid(path: &Path) -> Option<libc::pid_t> {
+    let s = std::fs::read_to_string(path).ok()?;
+    s.trim().parse::<libc::pid_t>().ok()
+}
+
+fn pid_alive(pid: libc::pid_t) -> bool {
+    // `kill(pid, 0)` returns 0 if the process exists (and the caller
+    // has permission to signal it), -1 with errno=ESRCH if not.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+fn send_signal(pid: libc::pid_t, sig: libc::c_int) {
+    unsafe { libc::kill(pid, sig) };
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -210,10 +472,6 @@ mod tests {
 
     #[test]
     fn libkrun_install_message_is_actionable() {
-        // The install() method is informational on every host — it shells
-        // out to ui::info instead of attempting to install. The check is
-        // just that we can call it without panicking; the actual hint
-        // copy lives in mvm_libkrun::install_hint().
         LibkrunBackend.install().expect("install hint never errors");
         let hint = mvm_libkrun::install_hint();
         assert!(!hint.is_empty());
@@ -227,7 +485,7 @@ mod tests {
             ..Default::default()
         };
         // No kernel_path set → start should fail with a precise message
-        // before attempting to call into mvm_libkrun.
+        // before attempting to spawn the supervisor.
         let err = LibkrunBackend
             .start(&config)
             .expect_err("expected failure without kernel_path");
@@ -238,17 +496,82 @@ mod tests {
         );
     }
 
+    /// A VM with no PID file is `Stopped`. Mirrors what `mvmctl status
+    /// <name>` reports for a never-started VM.
     #[test]
-    fn libkrun_status_returns_stopped_in_scaffolding() {
+    fn libkrun_status_is_stopped_when_no_pid_file() {
         let status = LibkrunBackend
-            .status(&VmId("any-vm".to_string()))
+            .status(&VmId("never-started-vm".to_string()))
             .expect("status should not error");
         assert_eq!(status, VmStatus::Stopped);
     }
 
+    /// Serialise env-var mutations across tests in this module —
+    /// cargo runs tests in parallel by default, and `std::env::set_var`
+    /// is process-global. Without this, a sibling test can flip
+    /// `HOME` (or `MVM_LIBKRUN_SUPERVISOR_PATH`) mid-call and corrupt
+    /// our assertions. Matches the same pattern in
+    /// `mvm_providers::apple_container::macos::tests::with_temp_home`.
+    fn with_env<F: FnOnce()>(body: F) {
+        use std::sync::Mutex;
+        static ENV_LOCK: Mutex<()> = Mutex::new(());
+        // Poisoned guard is fine — earlier panic doesn't taint env
+        // for us; we restore explicitly below.
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|p| p.into_inner());
+        body();
+    }
+
+    /// `list` skips directories under `~/.mvm/vms/` that don't carry a
+    /// `libkrun.pid` (e.g. Apple-Container-managed VMs sharing the
+    /// same root). Returns an empty list when the root doesn't exist.
     #[test]
-    fn libkrun_list_returns_empty_in_scaffolding() {
-        let vms = LibkrunBackend.list().expect("list should not error");
-        assert!(vms.is_empty());
+    fn libkrun_list_returns_empty_when_no_vms_dir() {
+        with_env(|| {
+            // Point HOME at a fresh temp dir so we get a known-empty
+            // ~/.mvm/vms/ layout.
+            let temp = tempfile::tempdir().expect("tempdir");
+            let saved = std::env::var_os("HOME");
+            // SAFETY: serialised by ENV_LOCK.
+            unsafe { std::env::set_var("HOME", temp.path()) };
+            let result = LibkrunBackend.list();
+            unsafe {
+                match saved {
+                    Some(v) => std::env::set_var("HOME", v),
+                    None => std::env::remove_var("HOME"),
+                }
+            }
+            let vms = result.expect("list should not error on missing root");
+            assert!(vms.is_empty(), "expected empty list, got {vms:?}");
+        });
+    }
+
+    #[test]
+    fn resolve_supervisor_path_honors_env_override() {
+        with_env(|| {
+            let temp = tempfile::NamedTempFile::new().expect("tempfile");
+            // SAFETY: serialised by ENV_LOCK.
+            unsafe { std::env::set_var("MVM_LIBKRUN_SUPERVISOR_PATH", temp.path()) };
+            let result = resolve_supervisor_path();
+            unsafe { std::env::remove_var("MVM_LIBKRUN_SUPERVISOR_PATH") };
+            let path = result.expect("env override resolves");
+            assert_eq!(path, temp.path());
+        });
+    }
+
+    #[test]
+    fn resolve_supervisor_path_rejects_missing_env_target() {
+        with_env(|| {
+            // SAFETY: serialised by ENV_LOCK.
+            unsafe {
+                std::env::set_var(
+                    "MVM_LIBKRUN_SUPERVISOR_PATH",
+                    "/definitely/does/not/exist/mvm-libkrun-supervisor",
+                )
+            };
+            let result = resolve_supervisor_path();
+            unsafe { std::env::remove_var("MVM_LIBKRUN_SUPERVISOR_PATH") };
+            let err = result.expect_err("expected missing-file error");
+            assert!(err.to_string().contains("not a file"));
+        });
     }
 }

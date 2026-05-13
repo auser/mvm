@@ -34,11 +34,18 @@ build = "build.rs"
 [dependencies]
 libc.workspace = true
 tracing = "0.1"
+# `serde` is always on (with `derive`) so the `KrunContext`,
+# `KrunDisk`, and `SupervisorConfig` types are serializable from
+# any consumer — notably `mvm-backend::LibkrunBackend`, which
+# builds the supervisor's JSON without ever enabling `libkrun-sys`
+# itself. Compile cost is marginal; serde is already in nearly
+# every other workspace crate's dep graph.
+serde = { workspace = true }
 # Plan 57 W4 supervisor binary (`src/bin/mvm-libkrun-supervisor.rs`)
-# needs JSON config parsing on stdin and pulls `ensure_signed()` from
-# mvm-providers (macOS codesigning gate). All optional and gated on
-# `libkrun-sys` so the default workspace build (CI fast lane, hosts
-# without libkrun.h) skips the heavier dep graph.
+# needs JSON parsing on stdin and pulls `ensure_signed()` from
+# mvm-providers (macOS codesigning gate). Both are optional and
+# gated on `libkrun-sys` so the default workspace build (CI fast
+# lane, hosts without libkrun.h) skips the heavier dep graph.
 #
 # We intentionally do NOT pull `mvm-guest` from regular deps: that
 # would close a cycle (mvm-core → mvm-libkrun → mvm-guest → mvm-core,
@@ -49,7 +56,6 @@ tracing = "0.1"
 # `libkrun-smoke` example keeps `mvm-guest` as a dev-dep because
 # dev-deps are excluded from cycle analysis.
 mvm-providers = { workspace = true, optional = true }
-serde = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
 
 [build-dependencies]
@@ -67,7 +73,6 @@ default = []
 # supervisor binary and its mvm-guest/mvm-providers/serde dep chain.
 libkrun-sys = [
     "dep:mvm-providers",
-    "dep:serde",
     "dep:serde_json",
 ]
 

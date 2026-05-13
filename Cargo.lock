@@ -4109,6 +4109,7 @@ name = "mvm-backend"
 version = "0.14.0"
 dependencies = [
  "anyhow",
+ "libc",
  "microsandbox",
  "mvm-base",
  "mvm-build",
@@ -4123,6 +4124,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "which 7.0.3",
 ]
 
 [[package]]

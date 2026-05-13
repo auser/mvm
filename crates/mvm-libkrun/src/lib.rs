@@ -159,8 +159,7 @@ pub fn install_paths() -> Vec<&'static str> {
 /// libkrun mounts the rootfs at `/dev/vda` (by convention from the
 /// order disks are added); each `KrunDisk` becomes `/dev/vdb`,
 /// `/dev/vdc`, … in the order they appear in [`KrunContext::extra_disks`].
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "libkrun-sys", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KrunDisk {
     /// Symbolic identifier passed to `krun_add_disk` (`block_id`).
     /// Not user-visible inside the guest; libkrun uses it for
@@ -179,8 +178,7 @@ pub struct KrunDisk {
 /// Field shape is stable across the W1 → W3 transition; the FFI calls
 /// that consume each field live in [`sys`] under the `libkrun-sys`
 /// feature.
-#[derive(Debug, Clone)]
-#[cfg_attr(feature = "libkrun-sys", derive(serde::Serialize, serde::Deserialize))]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KrunContext {
     pub name: String,
     pub kernel_path: String,
@@ -455,7 +453,11 @@ pub fn start_enter(ctx: &KrunContext) -> Result<std::convert::Infallible, Error>
 /// `LibkrunBackend::start()` produces. Holds the [`KrunContext`] plus
 /// supervisor-process bookkeeping fields that don't belong on the
 /// pure-FFI config type.
-#[cfg(feature = "libkrun-sys")]
+///
+/// Always available (not feature-gated) because `mvm-backend`'s
+/// `LibkrunBackend::start()` constructs it and serializes to JSON
+/// without ever turning on `libkrun-sys` itself — the supervisor
+/// process on the other end of the pipe is the one that links libkrun.
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct SupervisorConfig {
     /// The guest configuration to hand to libkrun.
@@ -472,9 +474,12 @@ pub struct SupervisorConfig {
     pub pid_file_name: Option<String>,
 }
 
-#[cfg(feature = "libkrun-sys")]
 impl SupervisorConfig {
-    fn pid_file(&self) -> std::path::PathBuf {
+    /// Resolve the absolute path to the PID file
+    /// (`<vm_state_dir>/<pid_file_name>`). Used by the supervisor to
+    /// write its PID and by `LibkrunBackend` to read it for
+    /// `stop`/`status`/`list`.
+    pub fn pid_file(&self) -> std::path::PathBuf {
         std::path::PathBuf::from(&self.vm_state_dir)
             .join(self.pid_file_name.as_deref().unwrap_or("libkrun.pid"))
     }
