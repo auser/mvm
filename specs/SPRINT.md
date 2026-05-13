@@ -1449,14 +1449,27 @@ CLI + audit-kind variants):
   `InteractiveOrControl` (will flip to `Emits("BundleInstall")`
   once the install audit hook ships).
 
-Outstanding (deferred, none blocking):
+Closed out in the W2 final commits (`90cef3d`, `ad3f52c`,
+TBD-resources):
 
-- `BundleInstall` audit-kind + emitter wiring (flips the install
-  row to `Emits(...)`). Small follow-up.
-- Bundle manifest could carry vcpus/mem_mib so the synthetic
-  TemplateSpec stops defaulting from operator config (bundle-
-  schema bump).
-- `mvmctl bundle gc` to prune installed bundles by sha.
+- `LocalAuditKind::BundleInstall` variant + emit from
+  `mvmctl bundle install` + AUDIT_POSTURE flipped to
+  `Emits("BundleInstall")`.
+- `mvmctl bundle gc <SHA>` and `--all` verbs +
+  `BundleRegistry::remove` + `list` + new
+  `LocalAuditKind::BundleGc`. Interactive --all confirms unless
+  `--yes` (or non-TTY).
+- `BundleResources { vcpus, mem_mib }` optional field on
+  `BundleManifest`. **BUNDLE_SCHEMA_VERSION bumped 1 → 2.** v1
+  bundles deserialise cleanly with `resources = None`; v2 with
+  resources are the new default for `mvmctl bundle export`.
+  Older verifiers see `schema_version = 2` and refuse with
+  `UnsupportedSchema` (deliberate fail-closed).
+  `bundle_artifacts_for_sha` prefers manifest resources over
+  operator config when present; CLI `--cpus` / `--memory` still
+  override.
+
+W2 is now fully shipped end-to-end with no outstanding follow-ups.
 
 ### W3 — Network default flip (deny-by-default)  ✅ shipped
 

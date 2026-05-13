@@ -65,7 +65,16 @@ use thiserror::Error;
 /// Highest bundle-manifest schema version this build understands.
 /// Verifiers fail closed on a future bump rather than silently
 /// dropping fields they don't know about.
-pub const BUNDLE_SCHEMA_VERSION: u32 = 1;
+///
+/// Bumped 1 → 2 in Sprint 52 W2 residual C when `BundleManifest`
+/// gained the optional `resources: Option<BundleResources>`
+/// field. Older verifiers `#[serde(deny_unknown_fields)]` would
+/// refuse v2 bundles on the field alone, but the version sniff
+/// runs first and surfaces a clear `UnsupportedSchema` error.
+/// Newer verifiers reading a v1 bundle accept the missing field
+/// via `#[serde(default)]` and fall back to operator-config
+/// defaults at launch time.
+pub const BUNDLE_SCHEMA_VERSION: u32 = 2;
 
 /// Filename inside the archive for the canonical-JSON manifest.
 pub const MANIFEST_FILENAME: &str = "manifest.json";
@@ -148,6 +157,25 @@ pub struct BundleArtifact {
     pub size_bytes: u64,
 }
 
+/// Resource expectations the bundle publisher recorded at build
+/// time. Optional on the wire (`#[serde(default)]` via the parent
+/// struct's `Option<BundleResources>`), present in v2+ bundles.
+/// Old (`schema_version = 1`) bundles deserialise with `None` and
+/// the template loader defaults to operator config.
+///
+/// Both fields are advisory: `mvmctl up --cpus / --memory`
+/// overrides them. The point is to let a bundle ship with sensible
+/// resource expectations baked in so dev-laptop users don't have
+/// to remember the right values.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct BundleResources {
+    /// vCPU count the workload was sized for at build time.
+    pub vcpus: u32,
+    /// Memory cap in MiB the workload was sized for at build time.
+    pub mem_mib: u32,
+}
+
 /// dm-verity binding for the rootfs. Present when the workload was
 /// built with `verifiedBoot = true` (ADR-002 §W3).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -207,6 +235,14 @@ pub struct BundleManifest {
     /// dm-verity binding, when the rootfs was built verified.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub verity: Option<VerityInfo>,
+    /// Advisory resource expectations recorded by the publisher at
+    /// build time. `Some(...)` in v2+ bundles; `None` for v1
+    /// bundles (handled via `#[serde(default)]`). The template
+    /// loader uses these to set defaults when `mvmctl up` doesn't
+    /// pass `--cpus` / `--memory` explicitly. ADR-002 claim 9
+    /// re-verify still re-hashes the field as part of the manifest.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub resources: Option<BundleResources>,
 }
 
 impl BundleManifest {
@@ -1328,6 +1364,7 @@ mod tests {
             labels: BTreeMap::new(),
             artifacts,
             verity: None,
+            resources: None,
         }
     }
 
@@ -2221,6 +2258,71 @@ mod tests {
             Err(BundleResolveError::MissingBundle { .. }) => {}
             other => panic!("expected MissingBundle, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn bundle_manifest_resources_round_trip_when_set() {
+        let sk = fresh_key();
+        let key_id = KeyId::from_pubkey(&sk.verifying_key());
+        let mut manifest = make_manifest(key_id, Vec::new());
+        manifest.resources = Some(BundleResources {
+            vcpus: 4,
+            mem_mib: 2048,
+        });
+        let bytes = manifest.canonical_bytes().unwrap();
+        let parsed: BundleManifest = serde_json::from_slice(&bytes).unwrap();
+        assert_eq!(parsed.resources, manifest.resources);
+        let json = String::from_utf8(bytes).unwrap();
+        assert!(json.contains("\"resources\""), "got: {json}");
+    }
+
+    #[test]
+    fn bundle_manifest_resources_omitted_when_none() {
+        // Backwards compat: v2-built bundles whose publisher chose
+        // not to declare resources still emit the manifest WITHOUT
+        // an empty "resources":null object, so a v1 verifier doing
+        // a "would this parse as v1?" check sees a clean wire.
+        let sk = fresh_key();
+        let key_id = KeyId::from_pubkey(&sk.verifying_key());
+        let manifest = make_manifest(key_id, Vec::new()); // resources: None
+        let bytes = manifest.canonical_bytes().unwrap();
+        let json = String::from_utf8(bytes).unwrap();
+        assert!(
+            !json.contains("resources"),
+            "skip_serializing_if must elide the field: {json}"
+        );
+    }
+
+    #[test]
+    fn bundle_manifest_v1_loads_with_no_resources_field() {
+        // Round-trip a hand-rolled v1 manifest (no `resources`
+        // field) and assert it parses cleanly into the v2 struct
+        // with `resources = None`. Protects against a future
+        // accidental drop of `#[serde(default)]` on the field.
+        let sk = fresh_key();
+        let key_id = KeyId::from_pubkey(&sk.verifying_key());
+        let v1_json = format!(
+            r#"{{
+                "schema_version": 1,
+                "publisher": "test",
+                "key_id": "{}",
+                "arch": "aarch64",
+                "created_at": "2026-05-01T00:00:00Z",
+                "artifacts": []
+            }}"#,
+            key_id.0
+        );
+        let parsed: BundleManifest = serde_json::from_str(&v1_json).expect("v1 parses");
+        assert_eq!(parsed.schema_version, 1);
+        assert!(parsed.resources.is_none());
+        assert!(parsed.verity.is_none());
+    }
+
+    #[test]
+    fn bundle_schema_version_is_two() {
+        // Pin the current version constant — bumps are deliberate;
+        // a silent rev should trip this test.
+        assert_eq!(BUNDLE_SCHEMA_VERSION, 2);
     }
 
     #[test]

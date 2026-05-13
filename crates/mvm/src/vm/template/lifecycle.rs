@@ -459,10 +459,16 @@ fn bundle_artifacts_for_sha(
         .path_for_role(&ArtifactRole::Initrd)
         .map(|p| p.to_string_lossy().into_owned());
 
-    // Operator-config-defaulted resources. Bundle manifest doesn't
-    // currently declare vcpus/mem; the CLI's `--cpus` / `--memory`
-    // override these at `mvmctl up` time.
+    // Resource resolution: bundle manifest's `resources` field
+    // wins when set (BUNDLE_SCHEMA_VERSION 2+ bundles ship this).
+    // Falls back to operator config for v1 bundles or when the
+    // publisher chose to omit. CLI `--cpus` / `--memory` still
+    // overrides both at `mvmctl up` time.
     let user_cfg = mvm_core::user_config::load(None);
+    let (vcpus_u32, mem_mib) = match installed.manifest.resources.as_ref() {
+        Some(r) => (r.vcpus, r.mem_mib),
+        None => (user_cfg.default_cpus, user_cfg.default_memory_mib),
+    };
     let now = chrono::Utc::now().to_rfc3339();
     let spec = TemplateSpec {
         schema_version: mvm_core::template::CURRENT_SCHEMA_VERSION,
@@ -470,8 +476,8 @@ fn bundle_artifacts_for_sha(
         flake_ref: format!("bundle:{bundle_sha256}"),
         profile: installed.manifest.profile.clone().unwrap_or_default(),
         role: String::new(),
-        vcpus: u8::try_from(user_cfg.default_cpus.min(u32::from(u8::MAX))).unwrap_or(u8::MAX),
-        mem_mib: user_cfg.default_memory_mib,
+        vcpus: u8::try_from(vcpus_u32.min(u32::from(u8::MAX))).unwrap_or(u8::MAX),
+        mem_mib,
         mem_initial_mib: None,
         data_disk_mib: 0,
         created_at: installed.manifest.created_at.clone(),
