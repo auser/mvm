@@ -64,7 +64,7 @@ agent split from commit `4e6c5fa` and the existing sibling flake at
 ### 3. Cosign keyless via GitHub OIDC, identity-bound to release tags
 
 The expected signing identity is
-`https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/v*`.
+`https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/v*`.
 The release pipeline is the only entity that can produce verifiable
 artifacts; an unsigned-or-untagged build cannot accidentally claim
 project authority.

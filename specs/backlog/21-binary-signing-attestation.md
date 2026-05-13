@@ -84,7 +84,7 @@ The upgrade safety guardrail (smoke test + rollback) prevents a defective releas
     cosign verify-blob \
       --bundle mvmctl-aarch64-apple-darwin.tar.gz.bundle \
       --certificate-oidc-issuer https://token.actions.githubusercontent.com \
-      --certificate-identity-regexp 'https://github.com/auser/mvm/.github/workflows/release.yml.*' \
+      --certificate-identity-regexp 'https://github.com/tinylabscom/mvm/.github/workflows/release.yml.*' \
       mvmctl-aarch64-apple-darwin.tar.gz
     ```
   - Verification proves: built by GitHub Actions, from the official repo, at a specific tag

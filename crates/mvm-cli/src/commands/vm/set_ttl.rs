@@ -70,10 +70,6 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             "expires_at=cleared".to_string()
         }
     };
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::VmTtlSet,
-        Some(&args.name),
-        Some(&detail),
-    );
+    mvm_core::audit_emit!(VmTtlSet, vm: &args.name, "{detail}");
     Ok(())
 }

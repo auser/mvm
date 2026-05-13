@@ -1,7 +1,7 @@
 You are a senior systems engineer and Rust infrastructure architect.
 
 You are working inside the existing repository:
-https://github.com/auser/mvm
+https://github.com/tinylabscom/mvm
 
 Your task is to integrate Nix-flake-based, reproducible Firecracker microVM builds and multi-tenant lifecycle management into this repo, replacing the current “build image” approach entirely.
 

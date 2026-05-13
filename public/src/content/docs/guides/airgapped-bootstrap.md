@@ -42,7 +42,7 @@ On a host that can reach github.com:
 ```bash
 VERSION=v0.14.0  # match the mvmctl version that will consume them
 ARCH=aarch64     # or x86_64
-BASE="https://github.com/auser/mvm/releases/download/${VERSION}"
+BASE="https://github.com/tinylabscom/mvm/releases/download/${VERSION}"
 
 for f in \
   "dev-image-${ARCH}.manifest.json" \
@@ -63,7 +63,7 @@ manifest-only tampering before sneakernet:
 cosign verify-blob \
   --bundle "dev-image-${ARCH}.manifest.json.bundle" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --certificate-identity-regexp "https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/${VERSION}" \
+  --certificate-identity-regexp "https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/${VERSION}" \
   "dev-image-${ARCH}.manifest.json"
 ```
 
@@ -124,7 +124,7 @@ fresh `revoked-versions.json` + `.bundle` pair into
 
 ```bash
 # On a connected host:
-BASE="https://github.com/auser/mvm/releases/download/revocations"
+BASE="https://github.com/tinylabscom/mvm/releases/download/revocations"
 curl -LO "${BASE}/revoked-versions.json"
 curl -LO "${BASE}/revoked-versions.json.bundle"
 

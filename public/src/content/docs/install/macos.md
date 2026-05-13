@@ -18,19 +18,19 @@ You **do not need Nix on your Mac**. mvm bootstraps a small Linux builder microV
 ### One-liner
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+curl -fsSL https://raw.githubusercontent.com/tinylabscom/mvm/main/install.sh | sh
 ```
 
 ### Pin a version
 
 ```bash
-MVM_VERSION=v0.13.0 curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh
+MVM_VERSION=v0.13.0 curl -fsSL https://raw.githubusercontent.com/tinylabscom/mvm/main/install.sh | sh
 ```
 
 ### From source
 
 ```bash
-git clone https://github.com/auser/mvm.git
+git clone https://github.com/tinylabscom/mvm.git
 cd mvm
 cargo build --release
 install -m 0755 target/release/mvmctl ~/.local/bin/mvmctl

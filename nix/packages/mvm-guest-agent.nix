@@ -81,7 +81,7 @@ pkgs.rustPlatform.buildRustPackage {
 
   meta = with lib; {
     description = "mvm guest agent — vsock RPC handler for microVM guests";
-    homepage = "https://github.com/auser/mvm";
+    homepage = "https://github.com/tinylabscom/mvm";
     license = licenses.asl20;
     platforms = platforms.linux;
   };

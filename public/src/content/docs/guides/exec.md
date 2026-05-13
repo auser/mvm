@@ -149,7 +149,7 @@ The snapshot path activates only when:
 On macOS / Lima QEMU, vsock snapshots return `os error 95` (EOPNOTSUPP);
 restore failures fall back to cold boot with a warning rather than
 aborting. The harder branch -- parameterized snapshots that allow
-`--add-dir` -- is tracked in [issue #7](https://github.com/auser/mvm/issues/7).
+`--add-dir` -- is tracked in [issue #7](https://github.com/tinylabscom/mvm/issues/7).
 
 ## Resource controls
 

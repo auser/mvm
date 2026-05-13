@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 mod check_adr_coverage;
+mod check_audit_positional;
 mod check_no_display_on_secret_types;
 mod perf;
 
@@ -20,9 +21,13 @@ fn main() -> Result<()> {
             let workspace = workspace_root();
             check_no_display_on_secret_types::run(&workspace)
         }
+        Some("check-audit-positional") => {
+            let workspace = workspace_root();
+            check_audit_positional::run(&workspace)
+        }
         Some("perf") => perf::run(&args[2..]),
         Some(other) => anyhow::bail!(
-            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage, check-no-display-on-secret-types, perf",
+            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage, check-no-display-on-secret-types, check-audit-positional, perf",
             other
         ),
         None => {
@@ -36,6 +41,9 @@ fn main() -> Result<()> {
             );
             eprintln!(
                 "  check-no-display-on-secret-types        Plan 63 W2 lint: reject Debug/Display on secret-named types"
+            );
+            eprintln!(
+                "  check-audit-positional                  Plan 60 Phase 4 lint: reject positional audit::emit / event-chain calls"
             );
             eprintln!(
                 "  perf <subcommand>                       Plan 60 Phase 9 perf gates (rootfs-size, boot)"

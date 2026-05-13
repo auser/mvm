@@ -218,8 +218,8 @@ mod tests {
     fn test_validate_flake_ref_safe_patterns() {
         assert!(validate_flake_ref(".").is_ok());
         assert!(validate_flake_ref("/build-in").is_ok());
-        assert!(validate_flake_ref("github:auser/mvm").is_ok());
-        assert!(validate_flake_ref("git+https://github.com/auser/mvm").is_ok());
+        assert!(validate_flake_ref("github:tinylabscom/mvm").is_ok());
+        assert!(validate_flake_ref("git+https://github.com/tinylabscom/mvm").is_ok());
         assert!(validate_flake_ref("path:/some/local/path").is_ok());
     }
 

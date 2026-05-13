@@ -1,7 +1,7 @@
 You are a senior virtualization performance engineer and Rust systems architect.
 
 You are working in the existing repository:
-https://github.com/auser/mvm
+https://github.com/tinylabscom/mvm
 
 Assume the repo already supports:
 - multi-tenant Firecracker microVMs

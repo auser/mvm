@@ -9,7 +9,7 @@ owner: mvmd team
 ## Status
 
 Proposed. **Implementation lives in the
-[mvmd](https://github.com/auser/mvmd) repository, not this one.** This
+[mvmd](https://github.com/tinylabscom/mvmd) repository, not this one.** This
 document is mvm's permanent record of the boundary so the protocol
 crate stays a single source of truth.
 

@@ -121,6 +121,21 @@ if [ "$has_nix" -eq 1 ] && command -v nix >/dev/null 2>&1; then
         flake_root="$repo_root/nix"
         if [ ! -f "$flake_root/flake.nix" ]; then
             echo "pre-commit: skipping nix fmt — no flake at $flake_root/flake.nix"
+        # `nix/flake.nix` doesn't currently declare a `formatter.<system>`
+        # output, which makes `nix fmt` error with
+        # "does not provide attribute 'formatter.<system>'" — the same
+        # error for every staged file. That's a configuration gap, not
+        # a per-file formatting problem, and treating it as a per-file
+        # failure spams the commit log with N identical errors and
+        # blocks the commit on macOS hosts where contributors have nix
+        # installed (typical when nix-darwin's linux-builder is set
+        # up). Probe the formatter once; skip gracefully when absent —
+        # mirroring the `command -v nix` skip a few lines up.
+        elif ! (cd "$flake_root" && \
+                nix --extra-experimental-features 'nix-command flakes' \
+                    eval --raw ".#formatter.$(nix eval --impure --raw --expr 'builtins.currentSystem')" \
+                    >/dev/null 2>&1); then
+            echo "pre-commit: skipping nix fmt — flake at $flake_root has no formatter output for this system"
         else
             echo "pre-commit: nix fmt (staged .nix files, formatter from nix/)"
             fmt_failed=0

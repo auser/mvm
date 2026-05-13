@@ -24,9 +24,9 @@ You'll need: Windows 10 21H2+ or Windows 11 (any), with a CPU that supports virt
 
 3. **Install mvmctl**:
    ```bash
-   cargo install --git https://github.com/auser/mvm mvmctl
+   cargo install --git https://github.com/tinylabscom/mvm mvmctl
    ```
-   Or download a release binary from the [releases page](https://github.com/auser/mvm/releases).
+   Or download a release binary from the [releases page](https://github.com/tinylabscom/mvm/releases).
 
 4. **First-time setup**:
    ```bash
@@ -74,7 +74,7 @@ The Docker tier exists as a convenience, not a sandbox. If your workload involve
 
 ## What about native Windows microVMs?
 
-There isn't a maintained native-Windows microVM stack we'd want to ship today. We considered Cloud Hypervisor + WHPX (the Hyper-V virtualization API) and rejected it for security-posture reasons — see [plan 53 §"Plan F"](https://github.com/auser/mvm/blob/main/specs/plans/54-cloud-hypervisor-deferred.md) and the [Matryoshka model](/security/matryoshka). The 2026 microVM ecosystem treats Windows as a *guest OS*, not a *host platform* for microVM tooling. WSL2 is the right answer.
+There isn't a maintained native-Windows microVM stack we'd want to ship today. We considered Cloud Hypervisor + WHPX (the Hyper-V virtualization API) and rejected it for security-posture reasons — see [plan 53 §"Plan F"](https://github.com/tinylabscom/mvm/blob/main/specs/plans/54-cloud-hypervisor-deferred.md) and the [Matryoshka model](/security/matryoshka). The 2026 microVM ecosystem treats Windows as a *guest OS*, not a *host platform* for microVM tooling. WSL2 is the right answer.
 
 If you need a real native-Windows microVM tool, look at Docker Desktop's own sandbox feature (released Jan 2026) — it uses Hyper-V directly and is purpose-built for that. mvm complements rather than competes.
 

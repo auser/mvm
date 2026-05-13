@@ -36,7 +36,7 @@ This split also means:
 User templates (`mvmctl template create/build/list`) and the bundled `nix/examples/*` are independent flakes that reference the parent via:
 
 ```nix
-inputs.mvm.url = "github:auser/mvm?dir=nix";   # or path:.../nix
+inputs.mvm.url = "github:tinylabscom/mvm?dir=nix";   # or path:.../nix
 # … then …
 mvm.lib.${system}.mkGuest { … }
 ```
@@ -47,7 +47,7 @@ Phase 1 modifies `mkGuest`'s internals (`nix/minimal-init/default.nix`, `nix/roo
 - No runtime chmod/chgrp loop in the init script
 - `udhcpc.sh` resolved to a `/nix/store` path instead of heredoc'd at boot
 
-**Phase 2 (repo layout move) needs care.** Templates that pin to sub-paths of `nix/` (e.g., `path:../mvm/nix/minimal-init`) would break. The published URL convention is `github:auser/mvm?dir=nix` and the local convention is `path:.../nix` (the **directory containing `flake.nix`**). As long as `nix/flake.nix` itself doesn't move and keeps exporting `lib.<system>.mkGuest` with the same signature, templates don't need to change. **What does need updating:** any internal mvmctl logic that hard-codes paths like `nix/dev` or `nix/dev-image` (used by `--override-input mvm <abs>/nix/dev` per the dev-image flake's chained-input pattern).
+**Phase 2 (repo layout move) needs care.** Templates that pin to sub-paths of `nix/` (e.g., `path:../mvm/nix/minimal-init`) would break. The published URL convention is `github:tinylabscom/mvm?dir=nix` and the local convention is `path:.../nix` (the **directory containing `flake.nix`**). As long as `nix/flake.nix` itself doesn't move and keeps exporting `lib.<system>.mkGuest` with the same signature, templates don't need to change. **What does need updating:** any internal mvmctl logic that hard-codes paths like `nix/dev` or `nix/dev-image` (used by `--override-input mvm <abs>/nix/dev` per the dev-image flake's chained-input pattern).
 
 **Templates definitely needing source updates** during Phase 2: only the *bundled examples* in `nix/examples/*/flake.nix`, because they live in this repo and reference sibling paths. User-authored templates outside this repo never reference internal paths.
 
@@ -290,7 +290,7 @@ Each output below has an explicit "where this runs" annotation. macOS dev-machin
 - Wire into `nix/flake.nix` as `packages.${system}.{mvm,default}`.
 
 **3b. `apps.${system}.{mvm,default}`**
-- `flake-utils.lib.mkApp` over `packages.${system}.mvm`. `nix run github:auser/mvm -- --help` works on the dev machine without a full install.
+- `flake-utils.lib.mkApp` over `packages.${system}.mvm`. `nix run github:tinylabscom/mvm -- --help` works on the dev machine without a full install.
 
 **3c. `devShells.${system}.default` — host (dev-machine) shell**
 - New `nix/devshells/host.nix`, exposed at `devShells.${system}.default` on **darwin systems** and as a leaner alternative on Linux (for contributors who don't run `mvmctl dev`).
@@ -496,7 +496,7 @@ After the audit, several originally-deferred items belong in this work because t
 ### Pulled into Phase 3 (output-additions sweep)
 
 - **`xtask` as `packages.<sys>.xtask`**. Currently `xtask` rides along inside `mvm-guest-agent`'s source fileset, which means an unrelated `xtask` change rebuilds the agent. Promote it to its own package, and exclude `xtask` from the agent's fileset.
-- **`apps.${system}.dev`**. Trivial wrapper that runs `mvmctl dev up`. Saves new contributors typing — `nix run github:auser/mvm#dev` is more discoverable than reading the README.
+- **`apps.${system}.dev`**. Trivial wrapper that runs `mvmctl dev up`. Saves new contributors typing — `nix run github:tinylabscom/mvm#dev` is more discoverable than reading the README.
 - **`nix fmt --check` in `.githooks/pre-commit`**. Once `formatter.${system}` and `treefmt.toml` land, wire them into the existing pre-commit hook so formatting drift fails locally instead of in CI.
 
 ### Promoted from "Phase 5 deferred" to "in this work"
@@ -636,7 +636,7 @@ The audit at the top of this plan separated these. The middle row (Nix-sandbox `
 
 ## Quick answers to your questions
 
-1. **Will this update template files?** Phase 1 — **no template source changes needed**; the rootfs perm fixes propagate automatically next time a template is rebuilt (which happens inside the builder VM via `mvmctl template build`). Phase 2 — only the **bundled** `nix/examples/*/flake.nix` need any change (and only if they reach into renamed sub-paths, which none currently do), plus mvmctl's internal `--override-input` paths in `crates/mvm-build/src/pipeline/dev_build.rs` and `crates/mvm-cli/src/commands/env/{dev,apple_container}.rs`. **External user templates are unaffected** because they pin `mvm.url = "github:auser/mvm?dir=nix"`.
+1. **Will this update template files?** Phase 1 — **no template source changes needed**; the rootfs perm fixes propagate automatically next time a template is rebuilt (which happens inside the builder VM via `mvmctl template build`). Phase 2 — only the **bundled** `nix/examples/*/flake.nix` need any change (and only if they reach into renamed sub-paths, which none currently do), plus mvmctl's internal `--override-input` paths in `crates/mvm-build/src/pipeline/dev_build.rs` and `crates/mvm-cli/src/commands/env/{dev,apple_container}.rs`. **External user templates are unaffected** because they pin `mvm.url = "github:tinylabscom/mvm?dir=nix"`.
 
 2. **Builder VM vs dev machine.** The plan has two distinct dev shells (`devShells.<sys>.default` host, `devShells.<sys>.builder` builder VM), heavy build tooling gated to Linux via `optionalAttrs pkgs.stdenv.isLinux`, and shared between `nix/images/builder/flake.nix` and `devShells.<sys>.builder` via a new `nix/lib/builder-tools.nix`. Phase 1's bake-perms-into-rootfs work runs inside the builder VM's Nix sandbox.
 

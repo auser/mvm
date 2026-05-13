@@ -37,8 +37,8 @@ version = "0.14.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/auser/mvm"
-homepage = "https://github.com/auser/mvm"
+repository = "https://github.com/tinylabscom/mvm"
+homepage = "https://github.com/tinylabscom/mvm"
 authors = ["mvm contributors"]
 
 # Workspace-wide lint policy. Plan-60 Phase 0 exit criterion — every
@@ -145,21 +145,31 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 which = "7"
 
-# Internal crates
+# Internal crates.
+#
+# DRIFT-001 (Plan 31 Track A): the four crates that participate in the
+# `backends-microsandbox` feature chain declare `default-features = false`
+# at the workspace level. This is required because member crates can't
+# override `default-features` on a workspace-inherited dep — Cargo accepts
+# the override only when the workspace entry already has the field. The
+# member crates that want the feature active opt back in via the
+# `backends-microsandbox` feature chain (see `crates/mvm-cli/Cargo.toml`
+# and the root `[features]` block below). Library consumers (e.g. mvmd)
+# do `mvmctl = { default-features = false }` and pick up the off-state.
 mvm-core = { path = "crates/mvm-core", version = "0.14.0" }
 mvm-guest = { path = "crates/mvm-guest", version = "0.14.0" }
-mvm-build = { path = "crates/mvm-build", version = "0.14.0" }
-mvm = { path = "crates/mvm", version = "0.14.0" }
+mvm-build = { path = "crates/mvm-build", version = "0.14.0", default-features = false }
+mvm = { path = "crates/mvm", version = "0.14.0", default-features = false }
 mvm-base = { path = "crates/mvm-base", version = "0.14.0" }
 mvm-security = { path = "crates/mvm-security", version = "0.14.0" }
 mvm-storage = { path = "crates/mvm-storage", version = "0.14.0" }
 mvm-plan = { path = "crates/mvm-plan", version = "0.14.0" }
 mvm-policy = { path = "crates/mvm-policy", version = "0.14.0" }
 mvm-supervisor = { path = "crates/mvm-supervisor", version = "0.14.0" }
-mvm-cli = { path = "crates/mvm-cli", version = "0.14.0" }
+mvm-cli = { path = "crates/mvm-cli", version = "0.14.0", default-features = false }
 mvm-mcp = { path = "crates/mvm-mcp", version = "0.14.0" }
 mvm-providers = { path = "crates/mvm-providers", version = "0.14.0" }
-mvm-backend = { path = "crates/mvm-backend", version = "0.14.0" }
+mvm-backend = { path = "crates/mvm-backend", version = "0.14.0", default-features = false }
 
 # Dev dependencies
 assert_cmd = "2"
@@ -188,11 +198,18 @@ path = "src/main.rs"
 [dependencies]
 mvm-core.workspace = true
 mvm-security.workspace = true
-mvm.workspace = true
-mvm-backend.workspace = true
-mvm-build.workspace = true
+# `default-features = false` propagates the off-switch down to the leaf
+# crates that pull microsandbox. The `backends-microsandbox` feature on
+# this crate (default-on so the binary build is unchanged) re-activates
+# it through the forwarding chain. Library consumers (e.g. mvmd) do
+# `mvmctl = { path = "../mvm", default-features = false }` to skip the
+# microsandbox dep entirely and avoid its sqlx-sqlite pull-in, which
+# collides with rusqlite via `links = "sqlite3"`.
+mvm = { workspace = true, default-features = false }
+mvm-backend = { workspace = true, default-features = false }
+mvm-build = { workspace = true, default-features = false }
 mvm-guest.workspace = true
-mvm-cli.workspace = true
+mvm-cli = { workspace = true, default-features = false }
 anyhow.workspace = true
 mimalloc.workspace = true
 
@@ -209,6 +226,21 @@ clap.workspace = true
 predicates.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+
+[features]
+# DRIFT-001 (Plan 31 Track A): `backends-microsandbox` controls whether
+# the upstream `microsandbox` crate is compiled into the chain. It pulls
+# sqlx-sqlite -> libsqlite3-sys (links = "sqlite3"), which collides with
+# library consumers that already link sqlite via a different version
+# (notably mvmd-gateway's rusqlite). Default-on keeps the mvmctl binary
+# unchanged; library consumers do `default-features = false` to opt out.
+default = ["backends-microsandbox"]
+backends-microsandbox = [
+    "mvm/backends-microsandbox",
+    "mvm-backend/backends-microsandbox",
+    "mvm-build/backends-microsandbox",
+    "mvm-cli/backends-microsandbox",
+]
 
 [profile.release]
 opt-level = 3

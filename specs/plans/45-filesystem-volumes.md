@@ -41,7 +41,7 @@ The "open question — `tenant_id` ↔ `org_id`" called out later in this plan i
 
 ### D4 — mvm-storage placement via the `mvmctl` facade
 
-mvmd's root `Cargo.toml` declares `mvmctl = { git = "https://github.com/auser/mvm.git", branch = "main" }`. Adding a new `mvm-storage` workspace member to mvm and re-exporting through the `mvmctl` facade is the correct slot — mvmd picks it up via the existing git dep with no extra wiring. **Confirmed.**
+mvmd's root `Cargo.toml` declares `mvmctl = { git = "https://github.com/tinylabscom/mvm.git", branch = "main" }`. Adding a new `mvm-storage` workspace member to mvm and re-exporting through the `mvmctl` facade is the correct slot — mvmd picks it up via the existing git dep with no extra wiring. **Confirmed.**
 
 ### D5 — mvm-side scope reduction (Path C: thin REST client to mvmd)
 

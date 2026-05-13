@@ -66,11 +66,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
                 } else {
                     match mvm::vm::template::lifecycle::template_prune_orphan_slots() {
                         Ok((count, _)) => {
-                            mvm_core::audit::emit(
-                                mvm_core::audit::LocalAuditKind::SlotPrune,
-                                None,
-                                Some(&format!("source=cache_prune count={count}")),
-                            );
+                            mvm_core::audit_emit!(SlotPrune, "source=cache_prune count={count}");
                             if count > 0 {
                                 ui::success(&format!("Pruned {count} orphaned build(s)."));
                             } else {
@@ -88,11 +84,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             if !path.exists() {
                 ui::info("Cache directory does not exist. Nothing to prune.");
                 if !dry_run {
-                    mvm_core::audit::emit(
-                        mvm_core::audit::LocalAuditKind::CachePrune,
-                        None,
-                        Some("removed=0 freed_bytes=0 cache_dir=missing"),
-                    );
+                    mvm_core::audit_emit!(CachePrune, "removed=0 freed_bytes=0 cache_dir=missing");
                 }
                 return Ok(());
             }
@@ -142,11 +134,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             // audit record. We only mutate disk on the non-dry-run
             // path; dry-run reads only and stays out of the log.
             if !dry_run {
-                mvm_core::audit::emit(
-                    mvm_core::audit::LocalAuditKind::CachePrune,
-                    None,
-                    Some(&format!("removed={removed} freed_bytes={freed}")),
-                );
+                mvm_core::audit_emit!(CachePrune, "removed={removed} freed_bytes={freed}");
             }
             Ok(())
         }

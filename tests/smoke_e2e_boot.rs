@@ -43,6 +43,11 @@
 //!
 //! Both are tracked in Sprint 50.
 
+// Whole-file gate: the e2e boot smoke uses `MicrosandboxBackend`
+// directly. Library-consumer builds disable the `backends-microsandbox`
+// feature and skip this file entirely.
+#![cfg(feature = "backends-microsandbox")]
+
 use std::time::Duration;
 
 use mvmctl::backend::microsandbox::MicrosandboxBackend;

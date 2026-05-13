@@ -55,7 +55,7 @@ sudo apt-get install -y curl git build-essential
 sh <(curl -L https://nixos.org/nix/install) --daemon
 . /etc/profile.d/nix.sh
 
-cargo install --git https://github.com/auser/mvm mvmctl
+cargo install --git https://github.com/tinylabscom/mvm mvmctl
 mvmctl bootstrap
 ```
 
@@ -91,7 +91,7 @@ Both carry the same Tier 1 isolation when configured correctly. The decision is 
 
 ## Why mvm doesn't ship a Cloud-Hypervisor backend
 
-Tangentially relevant since Ubicloud runs CH: mvm has *considered and rejected* adding Cloud Hypervisor as a first-class backend (see [Plan 54 in the project repo](https://github.com/auser/mvm/blob/main/specs/plans/54-cloud-hypervisor-deferred.md)). Reason: every advantage CH ships is a feature Firecracker deliberately excluded for attack-surface reasons. We keep Firecracker as the unambiguous security baseline. This is unrelated to Ubicloud's choice to use CH at *its* layer (where the larger device model is needed for general-purpose guests).
+Tangentially relevant since Ubicloud runs CH: mvm has *considered and rejected* adding Cloud Hypervisor as a first-class backend (see [Plan 54 in the project repo](https://github.com/tinylabscom/mvm/blob/main/specs/plans/54-cloud-hypervisor-deferred.md)). Reason: every advantage CH ships is a feature Firecracker deliberately excluded for attack-surface reasons. We keep Firecracker as the unambiguous security baseline. This is unrelated to Ubicloud's choice to use CH at *its* layer (where the larger device model is needed for general-purpose guests).
 
 ## See also
 

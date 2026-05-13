@@ -76,7 +76,7 @@ If you need to read source from a Windows directory, do it explicitly with `cp` 
 
 ## What's coming in Sprint 48
 
-[Plan I.4](https://github.com/auser/mvm/blob/main/specs/plans/53-cross-platform-roadmap.md) (WSL2 bootstrap automation) will turn the manual steps above into:
+[Plan I.4](https://github.com/tinylabscom/mvm/blob/main/specs/plans/53-cross-platform-roadmap.md) (WSL2 bootstrap automation) will turn the manual steps above into:
 
 ```powershell
 mvmctl bootstrap

@@ -28,7 +28,7 @@ data_disk = "0"
 name = "openclaw"             # optional; display + S3 channel hint
 ```
 
-That's it. Build inputs (`flake`, `profile`) and dev sizing (`vcpus`, `mem`, `data_disk`). No `role`, no `[network]`, no `[[variants]]`, no dependencies — those are flake territory or [`mvmd`](https://github.com/auser/mvmd) territory, not the dev tool's.
+That's it. Build inputs (`flake`, `profile`) and dev sizing (`vcpus`, `mem`, `data_disk`). No `role`, no `[network]`, no `[[variants]]`, no dependencies — those are flake territory or [`mvmd`](https://github.com/tinylabscom/mvmd) territory, not the dev tool's.
 
 Each field's owner:
 

@@ -96,7 +96,7 @@ mvmd/                          ← separate git repo
 mvmd depends on the `mvm` facade crate, which re-exports all sub-crates:
 ```toml
 [dependencies]
-mvm = { git = "https://github.com/auser/mvm" }
+mvm = { git = "https://github.com/tinylabscom/mvm" }
 ```
 Then in mvmd code: `use mvm::core::*`, `use mvm::runtime::*`, `use mvm::build::*`, `use mvm::guest::*`
 
@@ -249,7 +249,7 @@ version = "0.1.0"
 edition = "2024"
 
 [workspace.dependencies]
-mvm = { git = "https://github.com/auser/mvm" }
+mvm = { git = "https://github.com/tinylabscom/mvm" }
 # ...same shared deps as mvm workspace (tokio, serde, etc.)
 
 [package]

@@ -18,8 +18,37 @@
 //! - `mvmctl manifest prune --orphans` (empty registry) → `SlotPrune`
 //!   (emitted with `count=0` — Plan 37 §6 invariant: every state-
 //!   changing verb emits one record per attempt, even on no-op)
-//! - `mvmctl secret put` → secret-side audit JSONL at
-//!   `~/.mvm/audit/secrets.jsonl` carries `"action":"put"`
+//! - `mvmctl manifest prune --orphans --dry-run` → **no** audit entry
+//! - `mvmctl storage gc --apply --mock` (empty pool) → `StorageGc`
+//!   (no-op attempt emits with `count=0` / `pool_unavailable=…`)
+//! - `mvmctl storage gc --mock` (dry-run) → **no** audit entry
+//! - `mvmctl manifest tag add <tpl> <tag>` → `ManifestTagAdd`
+//! - `mvmctl manifest tag rm <tpl> <tag>` → `ManifestTagRemove`
+//! - `mvmctl manifest tag ls <tpl>` → **no** audit entry
+//! - `mvmctl manifest alias set <tpl> <alias> <rev>` → `ManifestAliasSet`
+//! - `mvmctl manifest alias rm <tpl> <alias>` → `ManifestAliasRemove`
+//! - `mvmctl manifest alias ls <tpl>` → **no** audit entry
+//! - `mvmctl manifest rm <path> --force` → `SlotRemove`
+//!   (idempotent against a missing slot — `--force` is the cleanup
+//!   contract; the stub `mvm.toml` is enough to canonicalise the
+//!   path key)
+//! - `mvmctl config set <key> <value>` → `ConfigChange`
+//! - `mvmctl config show` → **no** audit entry
+//! - `mvmctl snapshot rm <name>` → `SnapshotDelete`
+//!   (test pre-creates `~/.mvm/instances/<name>/snapshot/` so the
+//!   bail-when-missing branch doesn't short-circuit the emit)
+//! - `mvmctl snapshot ls` → **no** audit entry
+//! - `mvmctl audit tail` / `audit verify` → **no** audit entry
+//! - `mvmctl attest status` → **no** audit entry
+//! - `mvmctl secret put / get / ls / rm` → secret-side audit JSONL
+//!   at `~/.mvm/audit/secrets.jsonl` carries one entry per call
+//!   with `"action":"put"` / `"get"` / `"list"` / `"delete"`. The
+//!   CLI verb and on-disk action name are decoupled — `ls` →
+//!   `"list"`, `rm` → `"delete"` — so the negative tests also pin
+//!   the rename surface against accidental drift. The sandbox
+//!   sets `MVM_SECRET_STORE_BACKEND=file` so the test never
+//!   touches the OS keystore (no DBus / Keychain dependency on
+//!   any host).
 //!
 //! ## Hermetic setup
 //!
@@ -109,7 +138,19 @@ impl AuditSandbox {
             .env_remove("MVM_STATE_DIR")
             .env_remove("MVM_CACHE_DIR")
             .env_remove("MVM_SHARE_DIR")
-            .env_remove("MVM_CONFIG_DIR");
+            .env_remove("MVM_CONFIG_DIR")
+            // Pin the file-backed secret store. The default
+            // (`default_secret_store`) auto-picks the OS keyring
+            // when reachable, which on Linux CI runners means the
+            // libsecret / Secret-Service path — and the `keyring`
+            // crate reports the backend reachable based on header
+            // availability, not a live `set_password` round-trip.
+            // CI runners with `libsecret` but no live Secret-Service
+            // daemon would otherwise fail every secret_* test with
+            // a socket-not-found error. Pinning `file` here makes
+            // the suite hermetic: no DBus, no keychain, no
+            // host-state dependency.
+            .env("MVM_SECRET_STORE_BACKEND", "file");
         c
     }
 }
@@ -273,6 +314,557 @@ fn manifest_prune_orphans_emits_slot_prune_audit_entry() {
 }
 
 #[test]
+fn manifest_prune_orphans_dry_run_does_not_emit_audit_entry() {
+    // Negative complement to `manifest_prune_orphans_emits_slot_prune…`.
+    // Plan 37 §6 says state-changing verbs emit on every attempt; the
+    // dry-run path is read-only by contract and must NOT emit. The
+    // implementation routes dry-run to `run_dry` (manifest/prune.rs)
+    // which returns before reaching the `audit::emit` call — this
+    // test pins that against a future regression that moves the
+    // emit above the dry-run branch.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["manifest", "prune", "--orphans", "--dry-run"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest prune --orphans --dry-run failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "slot_prune");
+    assert_eq!(
+        hits, 0,
+        "dry-run must not write audit entries, got {hits} slot_prune \
+         entry/entries. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn storage_gc_apply_emits_storage_gc_audit_entry_even_on_empty_pool() {
+    // Plan 37 §6 invariant: a state-changing verb emits one audit
+    // record per attempt, even when the body of work is a no-op.
+    // Running `mvmctl storage gc --apply --mock` against a fresh
+    // in-memory MockBackend lists zero volumes — but `--apply`
+    // is the operator's commit signal, so the attempt must still
+    // surface in the audit log. Failure here means the empty-pool
+    // early-return in storage/gc.rs is skipping the emit.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["storage", "gc", "--apply", "--mock"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl storage gc --apply --mock failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "storage_gc");
+    assert!(
+        hits >= 1,
+        "expected ≥1 storage_gc entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn storage_gc_dry_run_does_not_emit_audit_entry() {
+    // Negative complement: dry-run is read-only and must not emit.
+    // Plain `mvmctl storage gc --mock` (no `--apply`) is the dry-run
+    // surface — pin it as a no-emit invariant against a future
+    // regression that elevates the dry-run path into the emit branch.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["storage", "gc", "--mock"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl storage gc --mock failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "storage_gc");
+    assert_eq!(
+        hits, 0,
+        "dry-run must not write audit entries, got {hits} storage_gc \
+         entry/entries. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_tag_add_emits_manifest_tag_add_audit_entry() {
+    // `manifest tag add <template> <tag>` writes to
+    // `~/.mvm/templates/<template>/tags.json` and emits
+    // `ManifestTagAdd`. `TemplateTags::load` is forgiving — missing
+    // templates yield an empty catalog — so the test runs against a
+    // fresh sandbox without any pre-existing slot.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["manifest", "tag", "add", "test-tmpl", "live-test-tag"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest tag add failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "manifest_tag_add");
+    assert!(
+        hits >= 1,
+        "expected ≥1 manifest_tag_add entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_tag_rm_emits_manifest_tag_remove_audit_entry() {
+    // Add a tag, then remove it. Two audit entries expected — one
+    // `manifest_tag_add`, one `manifest_tag_remove` — but this test
+    // pins only the remove half (the add half has its own test
+    // above).
+    let sandbox = AuditSandbox::new();
+    let add = sandbox
+        .mvmctl()
+        .args(["manifest", "tag", "add", "test-tmpl", "to-remove"])
+        .output()
+        .expect("spawn mvmctl add");
+    assert!(
+        add.status.success(),
+        "mvmctl manifest tag add failed: stderr={}",
+        String::from_utf8_lossy(&add.stderr)
+    );
+    let rm = sandbox
+        .mvmctl()
+        .args(["manifest", "tag", "rm", "test-tmpl", "to-remove"])
+        .output()
+        .expect("spawn mvmctl rm");
+    assert!(
+        rm.status.success(),
+        "mvmctl manifest tag rm failed: stderr={}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "manifest_tag_remove");
+    assert!(
+        hits >= 1,
+        "expected ≥1 manifest_tag_remove entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_tag_ls_does_not_emit_audit_entry() {
+    // Negative complement: `manifest tag ls` is read-only and must
+    // NOT emit. Pins the `MANIFEST_TAG` table's `ReadOnly` row in
+    // `tests/audit_total_coverage.rs` against a future regression
+    // that adds an emit to the list path.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["manifest", "tag", "ls", "test-tmpl"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest tag ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let add_hits = count_entries_with_kind(&log, "manifest_tag_add");
+    let rm_hits = count_entries_with_kind(&log, "manifest_tag_remove");
+    assert_eq!(
+        add_hits + rm_hits,
+        0,
+        "read-only `manifest tag ls` must not emit; got {add_hits} add \
+         and {rm_hits} remove entries. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_rm_emits_slot_remove_audit_entry() {
+    // `manifest rm <path> --force` removes the slot keyed on the
+    // canonicalised manifest path. The `--force` flag makes
+    // `template_delete_slot` idempotent against missing slots, so
+    // the test works against a fresh sandbox: write a stub
+    // `mvm.toml`, then drive `manifest rm` — the audit entry lands
+    // even though the slot directory was never created.
+    let sandbox = AuditSandbox::new();
+    let manifest_path = sandbox.home_path().join("mvm.toml");
+    std::fs::write(&manifest_path, "[meta]\nname = \"live-test-rm\"\n")
+        .expect("write stub mvm.toml");
+
+    let output = sandbox
+        .mvmctl()
+        .args([
+            "manifest",
+            "rm",
+            manifest_path.to_str().expect("utf-8 tempdir path"),
+            "--force",
+        ])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest rm --force failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "slot_remove");
+    assert!(
+        hits >= 1,
+        "expected ≥1 slot_remove entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_alias_rm_emits_manifest_alias_remove_audit_entry() {
+    // Set an alias, then remove it. Pins the remove half of the
+    // alias subgroup against a future regression that swaps the
+    // emit kind or drops it entirely.
+    let sandbox = AuditSandbox::new();
+    let set = sandbox
+        .mvmctl()
+        .args([
+            "manifest",
+            "alias",
+            "set",
+            "test-tmpl",
+            "to-remove",
+            "abc123def456abc123def456abc123de",
+        ])
+        .output()
+        .expect("spawn mvmctl set");
+    assert!(
+        set.status.success(),
+        "mvmctl manifest alias set failed: stderr={}",
+        String::from_utf8_lossy(&set.stderr)
+    );
+    let rm = sandbox
+        .mvmctl()
+        .args(["manifest", "alias", "rm", "test-tmpl", "to-remove"])
+        .output()
+        .expect("spawn mvmctl rm");
+    assert!(
+        rm.status.success(),
+        "mvmctl manifest alias rm failed: stderr={}",
+        String::from_utf8_lossy(&rm.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "manifest_alias_remove");
+    assert!(
+        hits >= 1,
+        "expected ≥1 manifest_alias_remove entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_alias_ls_does_not_emit_audit_entry() {
+    // Negative complement: `manifest alias ls` is read-only. Pins
+    // the `MANIFEST_ALIAS` table's `ls → ReadOnly` row against a
+    // future regression that adds an emit to the list path.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["manifest", "alias", "ls", "test-tmpl"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest alias ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let set_hits = count_entries_with_kind(&log, "manifest_alias_set");
+    let rm_hits = count_entries_with_kind(&log, "manifest_alias_remove");
+    assert_eq!(
+        set_hits + rm_hits,
+        0,
+        "read-only `manifest alias ls` must not emit; got {set_hits} set \
+         and {rm_hits} remove entries. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn manifest_alias_set_emits_manifest_alias_set_audit_entry() {
+    // `manifest alias set <template> <alias> <rev>` writes to the
+    // same `tags.json` and emits `ManifestAliasSet`. Same
+    // forgiving-load story as `manifest tag add` above.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args([
+            "manifest",
+            "alias",
+            "set",
+            "test-tmpl",
+            "latest",
+            "abc123def456abc123def456abc123de",
+        ])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl manifest alias set failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "manifest_alias_set");
+    assert!(
+        hits >= 1,
+        "expected ≥1 manifest_alias_set entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn config_set_emits_config_change_audit_entry() {
+    // `mvmctl config set <key> <value>` writes to
+    // `~/.mvm/config.toml` and emits `ConfigChange` — config file
+    // mutations are the only after-the-fact record of operator
+    // intent on settings that change runtime behavior (default
+    // backend, network policy, etc.).
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["config", "set", "default_cpus", "4"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl config set failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "config_change");
+    assert!(
+        hits >= 1,
+        "expected ≥1 config_change entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+    // The key + value should also land in the detail field so an
+    // operator scanning the audit log can see what changed.
+    assert!(
+        log.contains("key=default_cpus value=4"),
+        "config_change detail must carry the key+value pair. \
+         Full log:\n{log}"
+    );
+}
+
+#[test]
+fn config_show_does_not_emit_audit_entry() {
+    // Negative: `config show` is read-only. Pins the
+    // AUDIT_POSTURE classification (Emits at the top level, but
+    // only `set` actually mutates).
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["config", "show"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl config show failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "config_change");
+    assert_eq!(
+        hits, 0,
+        "read-only `config show` must not emit; got {hits} \
+         config_change entry/entries. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn snapshot_rm_emits_snapshot_delete_audit_entry() {
+    // `mvmctl snapshot rm <vm>` removes the snapshot directory and
+    // emits `SnapshotDelete`. `delete_instance_snapshot` returns
+    // `Ok(false)` when the directory is missing — the CLI then
+    // bails *before* the emit point. To exercise the emit branch
+    // hermetically, pre-create the snapshot dir with stub bytes.
+    // No real Firecracker / VM is involved.
+    let sandbox = AuditSandbox::new();
+    let snap_dir = sandbox
+        .home_path()
+        .join(".mvm")
+        .join("instances")
+        .join("test-snap")
+        .join("snapshot");
+    std::fs::create_dir_all(&snap_dir).expect("mkdir snapshot dir");
+    std::fs::write(snap_dir.join("vmstate.bin"), b"stub").expect("write vmstate stub");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["snapshot", "rm", "test-snap"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl snapshot rm failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "snapshot_delete");
+    assert!(
+        hits >= 1,
+        "expected ≥1 snapshot_delete entry in audit log, got {hits}. \
+         Full log:\n{log}"
+    );
+    // The vm_name field should carry the snapshot identity so
+    // operator searches by VM name find the matching emit.
+    assert!(
+        log.contains("\"vm_name\":\"test-snap\""),
+        "snapshot_delete must carry vm_name=test-snap. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn snapshot_ls_does_not_emit_audit_entry() {
+    // Negative: `snapshot ls` is read-only. `SNAPSHOT_SUB` in
+    // `audit_total_coverage.rs` classifies it as `ReadOnly`; this
+    // test pins that against a future regression that adds an
+    // emit to the list path.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["snapshot", "ls"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl snapshot ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "snapshot_delete");
+    assert_eq!(
+        hits, 0,
+        "read-only `snapshot ls` must not emit snapshot_delete; \
+         got {hits}. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn audit_tail_does_not_emit_local_audit_entry() {
+    // Negative: `audit tail` reads the LocalAudit stream. The audit
+    // CLI itself is ReadOnly (classification in
+    // `audit_total_coverage.rs`); reading the log must not add to it.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["audit", "tail"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl audit tail failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    // The LocalAudit stream (`<state>/log/audit.jsonl`) must be
+    // empty — tail reads but does not write. The plan-64 chain at
+    // `~/.mvm/audit/<tenant>.jsonl` always gains cmd.* entries
+    // from the audit emitter middleware, which is by design and
+    // separate from the LocalAudit stream this lint guards.
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `audit tail` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn audit_verify_does_not_emit_local_audit_entry() {
+    // Negative: `audit verify` validates the plan-64 chain.
+    // Read-only against the LocalAudit stream. Note the verify
+    // command itself appends cmd.* chain entries via the emitter
+    // middleware — that's a separate stream and not in scope here.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["audit", "verify"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl audit verify failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `audit verify` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn attest_status_does_not_emit_local_audit_entry() {
+    // Negative: `attest status` reports the host's attestation
+    // identity — pure read. `ATTEST_SUB` classifies all three
+    // leaves (export / verify / status) as ReadOnly.
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .args(["attest", "status"])
+        .output()
+        .expect("spawn mvmctl");
+    assert!(
+        output.status.success(),
+        "mvmctl attest status failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `attest status` must not write to the LocalAudit \
+         stream. Full log:\n{log}"
+    );
+}
+
+/// Common setup: put a secret into the sandbox so subsequent
+/// `get` / `ls` / `rm` have something to operate on.
+fn put_a_secret(sandbox: &AuditSandbox, tenant: &str, name: &str, value: &str) {
+    let output = sandbox
+        .mvmctl()
+        .args(["secret", "put", name, "--tenant", tenant, "--value", value])
+        .output()
+        .expect("spawn mvmctl put");
+    assert!(
+        output.status.success(),
+        "secret put pre-step failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+#[test]
 fn secret_put_emits_put_action_in_secret_audit_log() {
     // The `mvmctl secret` command writes per-action JSONL to a
     // separate audit file (`~/.mvm/audit/secrets.jsonl`); the
@@ -311,5 +903,92 @@ fn secret_put_emits_put_action_in_secret_audit_log() {
     assert!(
         log.contains("\"outcome\":\"ok\""),
         "audit entry must record outcome=ok on success. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn secret_get_emits_get_action_in_secret_audit_log() {
+    // Put first, then get with `--force` to bypass the TTY guard
+    // (subprocess stdout is a pipe, not a TTY — the guard would
+    // otherwise refuse). Assert a `get` entry lands in the
+    // per-action audit JSONL.
+    let sandbox = AuditSandbox::new();
+    put_a_secret(&sandbox, "test-tenant", "api-key", "deadbeef");
+
+    let output = sandbox
+        .mvmctl()
+        .args([
+            "secret",
+            "get",
+            "api-key",
+            "--tenant",
+            "test-tenant",
+            "--force",
+        ])
+        .output()
+        .expect("spawn mvmctl get");
+    assert!(
+        output.status.success(),
+        "mvmctl secret get failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = std::fs::read_to_string(sandbox.secret_audit_log_path()).unwrap_or_default();
+    assert!(
+        log.contains("\"action\":\"get\""),
+        "expected an 'action':'get' entry in secrets audit log. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn secret_ls_emits_list_action_in_secret_audit_log() {
+    // The clap verb is `ls` but `cmd_ls` records `action:"list"`
+    // on-disk. The audit JSONL's `action` field is the *operation
+    // name*, not the CLI verb. Pin both — flipping either side
+    // without updating this test would mask a real audit shape
+    // change.
+    let sandbox = AuditSandbox::new();
+    put_a_secret(&sandbox, "test-tenant", "api-key", "deadbeef");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["secret", "ls", "--tenant", "test-tenant"])
+        .output()
+        .expect("spawn mvmctl ls");
+    assert!(
+        output.status.success(),
+        "mvmctl secret ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = std::fs::read_to_string(sandbox.secret_audit_log_path()).unwrap_or_default();
+    assert!(
+        log.contains("\"action\":\"list\""),
+        "expected an 'action':'list' entry in secrets audit log. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn secret_rm_emits_delete_action_in_secret_audit_log() {
+    // Same op-name vs CLI-verb decoupling as `ls` above: clap
+    // surface is `rm`, audit action is `"delete"`.
+    let sandbox = AuditSandbox::new();
+    put_a_secret(&sandbox, "test-tenant", "api-key", "deadbeef");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["secret", "rm", "api-key", "--tenant", "test-tenant"])
+        .output()
+        .expect("spawn mvmctl rm");
+    assert!(
+        output.status.success(),
+        "mvmctl secret rm failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = std::fs::read_to_string(sandbox.secret_audit_log_path()).unwrap_or_default();
+    assert!(
+        log.contains("\"action\":\"delete\""),
+        "expected an 'action':'delete' entry in secrets audit log. Full log:\n{log}"
     );
 }

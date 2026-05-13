@@ -13,7 +13,14 @@ mvm-core.workspace = true
 mvm-guest.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
-microsandbox.workspace = true
+# Optional — see the same dep in `mvm-backend/Cargo.toml` for the
+# sqlite-link-conflict rationale. `MicrosandboxBuilderVm` and its async
+# runner are the only consumers in this crate; both gate behind
+# `backends-microsandbox`. The non-microsandbox helpers (`ArtifactSidecar`,
+# `emit_sidecar_via_passthru_query`, builder-dir constants) stay
+# unconditional so `mvm-base` and `pipeline::dev_build` keep compiling
+# either way.
+microsandbox = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -26,6 +33,15 @@ which = "6"
 
 [dev-dependencies]
 tempfile.workspace = true
+
+[features]
+# `backends-microsandbox` is default-on so `cargo {build,test} -p mvm-build`
+# exercises `MicrosandboxBuilderVm`. The mvmctl facade, mvm-cli, and the mvm
+# crate all declare `default-features = false` on their mvm-build dep and
+# re-forward the feature, so library consumers (e.g. mvmd) can disable the
+# whole chain via `mvmctl { default-features = false }`.
+default = ["backends-microsandbox"]
+backends-microsandbox = ["dep:microsandbox"]
 
 [lints]
 workspace = true

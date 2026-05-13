@@ -23,7 +23,7 @@ mvm's job is to let you run **untrusted code** — third-party software, AI-gene
 
 Each layer trusts only the layer **below** it. An attacker has to break through every boundary above to reach the host. A failure in any one layer is bounded — the layer below still enforces its own contract.
 
-This pattern (sometimes called the *matryoshka* model after the nested Russian dolls) is the same defense-in-depth used by Fly.io Sprites, AWS Lambda's SnapStart, Vercel Sandbox, and Kata Containers. mvm's adaptation is that **L5 is enforced inside the guest** — even a guest-kernel compromise doesn't give arbitrary access to other in-guest services. See [ADR-002](https://github.com/auser/mvm/blob/main/specs/adrs/002-microvm-security-posture.md) for the full decision record.
+This pattern (sometimes called the *matryoshka* model after the nested Russian dolls) is the same defense-in-depth used by Fly.io Sprites, AWS Lambda's SnapStart, Vercel Sandbox, and Kata Containers. mvm's adaptation is that **L5 is enforced inside the guest** — even a guest-kernel compromise doesn't give arbitrary access to other in-guest services. See [ADR-002](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/002-microvm-security-posture.md) for the full decision record.
 
 ## The seven claims
 
@@ -95,7 +95,7 @@ If your threat model needs any of those, mvm is not the right tool today. ADR-00
 
 ## See also
 
-- [ADR-002 (full decision record)](https://github.com/auser/mvm/blob/main/specs/adrs/002-microvm-security-posture.md)
-- [Plan 25 (microVM hardening — the implementation sequence for the seven claims)](https://github.com/auser/mvm/blob/main/specs/plans/25-microvm-hardening.md)
-- [Plan 53 (cross-platform roadmap — backend tier discipline)](https://github.com/auser/mvm/blob/main/specs/plans/53-cross-platform-roadmap.md)
+- [ADR-002 (full decision record)](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/002-microvm-security-posture.md)
+- [Plan 25 (microVM hardening — the implementation sequence for the seven claims)](https://github.com/tinylabscom/mvm/blob/main/specs/plans/25-microvm-hardening.md)
+- [Plan 53 (cross-platform roadmap — backend tier discipline)](https://github.com/tinylabscom/mvm/blob/main/specs/plans/53-cross-platform-roadmap.md)
 - ["Your container is not a sandbox" (emirb, 2026)](https://emirb.github.io/blog/microvm-2026/) — the post that crystallized the matryoshka framing in the broader microVM ecosystem.

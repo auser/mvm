@@ -20,7 +20,7 @@ A dev image is just an mkGuest call with `entrypoint.shell` set. Your project's 
 {
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
-    mvm.url     = "github:auser/mvm";
+    mvm.url     = "github:tinylabscom/mvm";
   };
 
   outputs = { self, nixpkgs, mvm, ... }:
