@@ -1,6 +1,7 @@
 use anyhow::{Context, Result};
 use serde::{Deserialize, Serialize};
 
+use crate::instance::VolumeAttach;
 use crate::tenant::TenantNet;
 
 /// Default Unix domain socket path for hostd.
@@ -39,7 +40,16 @@ const MAX_FRAME_SIZE: usize = 1024 * 1024;
 /// that shifts the wire format without bumping this constant fails
 /// CI on the mvmd side. The fixtures live next to the test;
 /// regenerate them in the same commit that bumps the version.
-pub const PROTOCOL_VERSION: u32 = 1;
+///
+/// **History:**
+/// - `1`: initial shape (plan 60 Phase 8, ADR-043).
+/// - `2`: workspace-volume attach — `workspace_id` threaded through
+///   every instance-scoped `HostdRequest` variant and `volumes:
+///   Vec<VolumeAttach>` added to `StartInstance`. All new fields are
+///   `#[serde(default)]` so old payloads still deserialize; the bump
+///   forces mvmd-side fixture refresh because byte output changes
+///   when defaults are present (JSON keys appear with default values).
+pub const PROTOCOL_VERSION: u32 = 2;
 
 // ============================================================================
 // Request/Response types
@@ -56,12 +66,25 @@ pub enum HostdRequest {
         tenant_id: String,
         pool_id: String,
         instance_id: String,
+        /// Workspace owning the instance (PROTOCOL_VERSION 2+).
+        /// `None` for legacy sandbox-class instances created before
+        /// workspace identity was threaded through.
+        #[serde(default)]
+        workspace_id: Option<String>,
+        /// Workspace-scoped volumes to attach at start
+        /// (PROTOCOL_VERSION 2+). Wiring into the Firecracker config
+        /// happens mvmd-side in `mvmd_runtime::vm::workspace::*`.
+        #[serde(default)]
+        volumes: Vec<VolumeAttach>,
     },
     /// Stop a running instance (kill FC, teardown cgroup, TAP).
     StopInstance {
         tenant_id: String,
         pool_id: String,
         instance_id: String,
+        /// Workspace owning the instance (PROTOCOL_VERSION 2+).
+        #[serde(default)]
+        workspace_id: Option<String>,
     },
     /// Snapshot and suspend an instance.
     SleepInstance {
@@ -71,12 +94,18 @@ pub enum HostdRequest {
         force: bool,
         #[serde(default)]
         drain_timeout_secs: Option<u64>,
+        /// Workspace owning the instance (PROTOCOL_VERSION 2+).
+        #[serde(default)]
+        workspace_id: Option<String>,
     },
     /// Restore an instance from snapshot.
     WakeInstance {
         tenant_id: String,
         pool_id: String,
         instance_id: String,
+        /// Workspace owning the instance (PROTOCOL_VERSION 2+).
+        #[serde(default)]
+        workspace_id: Option<String>,
     },
     /// Destroy an instance and optionally wipe volumes.
     DestroyInstance {
@@ -84,6 +113,9 @@ pub enum HostdRequest {
         pool_id: String,
         instance_id: String,
         wipe_volumes: bool,
+        /// Workspace owning the instance (PROTOCOL_VERSION 2+).
+        #[serde(default)]
+        workspace_id: Option<String>,
     },
     /// Create per-tenant bridge and NAT rules.
     SetupNetwork { tenant_id: String, net: TenantNet },
@@ -202,8 +234,9 @@ mod tests {
     /// here means a PR can't silently bump the const without also
     /// updating this test (and prompting the fixture re-gen).
     #[test]
-    fn protocol_version_is_one() {
-        assert_eq!(PROTOCOL_VERSION, 1);
+    fn protocol_version_is_two() {
+        // Bumped from 1 to 2 in the workspace-volume attach change.
+        assert_eq!(PROTOCOL_VERSION, 2);
     }
 
     #[test]
@@ -222,6 +255,8 @@ mod tests {
             tenant_id: "acme".to_string(),
             pool_id: "workers".to_string(),
             instance_id: "i-abc123".to_string(),
+            workspace_id: None,
+            volumes: vec![],
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: HostdRequest = serde_json::from_str(&json).unwrap();
@@ -230,10 +265,46 @@ mod tests {
                 tenant_id,
                 pool_id,
                 instance_id,
+                workspace_id,
+                volumes,
             } => {
                 assert_eq!(tenant_id, "acme");
                 assert_eq!(pool_id, "workers");
                 assert_eq!(instance_id, "i-abc123");
+                assert_eq!(workspace_id, None);
+                assert!(volumes.is_empty());
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    #[test]
+    fn test_hostd_request_start_with_workspace_volumes_roundtrip() {
+        use crate::instance::{VolumeAttach, VolumeMode};
+        let req = HostdRequest::StartInstance {
+            tenant_id: "acme".to_string(),
+            pool_id: "memory-svc".to_string(),
+            instance_id: "i-mem".to_string(),
+            workspace_id: Some("ws-prod".to_string()),
+            volumes: vec![VolumeAttach {
+                workspace_id: "ws-prod".to_string(),
+                name: "memory".to_string(),
+                mount_path: "/var/lib/memory".to_string(),
+                mode: VolumeMode::ReadWrite,
+            }],
+        };
+        let json = serde_json::to_string(&req).unwrap();
+        let parsed: HostdRequest = serde_json::from_str(&json).unwrap();
+        match parsed {
+            HostdRequest::StartInstance {
+                workspace_id,
+                volumes,
+                ..
+            } => {
+                assert_eq!(workspace_id.as_deref(), Some("ws-prod"));
+                assert_eq!(volumes.len(), 1);
+                assert_eq!(volumes[0].mount_path, "/var/lib/memory");
+                assert_eq!(volumes[0].mode, VolumeMode::ReadWrite);
             }
             _ => panic!("Wrong variant"),
         }
@@ -245,6 +316,7 @@ mod tests {
             tenant_id: "acme".to_string(),
             pool_id: "workers".to_string(),
             instance_id: "i-abc123".to_string(),
+            workspace_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: HostdRequest = serde_json::from_str(&json).unwrap();
@@ -259,6 +331,7 @@ mod tests {
             instance_id: "i-abc123".to_string(),
             force: true,
             drain_timeout_secs: Some(30),
+            workspace_id: Some("ws-prod".to_string()),
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: HostdRequest = serde_json::from_str(&json).unwrap();
@@ -266,10 +339,12 @@ mod tests {
             HostdRequest::SleepInstance {
                 force,
                 drain_timeout_secs,
+                workspace_id,
                 ..
             } => {
                 assert!(force);
                 assert_eq!(drain_timeout_secs, Some(30));
+                assert_eq!(workspace_id.as_deref(), Some("ws-prod"));
             }
             _ => panic!("Wrong variant"),
         }
@@ -281,6 +356,7 @@ mod tests {
             tenant_id: "acme".to_string(),
             pool_id: "workers".to_string(),
             instance_id: "i-abc123".to_string(),
+            workspace_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: HostdRequest = serde_json::from_str(&json).unwrap();
@@ -294,6 +370,7 @@ mod tests {
             pool_id: "workers".to_string(),
             instance_id: "i-abc123".to_string(),
             wipe_volumes: true,
+            workspace_id: None,
         };
         let json = serde_json::to_string(&req).unwrap();
         let parsed: HostdRequest = serde_json::from_str(&json).unwrap();
@@ -301,6 +378,104 @@ mod tests {
             HostdRequest::DestroyInstance { wipe_volumes, .. } => assert!(wipe_volumes),
             _ => panic!("Wrong variant"),
         }
+    }
+
+    /// PROTOCOL_VERSION 1 wire format — payload predates workspace_id
+    /// and volumes. Must still deserialize so an mvmd-agent pinned to
+    /// v1 can still talk to a v2 mvm-hostd while the cross-repo bump
+    /// rolls out.
+    #[test]
+    fn test_hostd_request_start_v1_backward_compat() {
+        let v1_json = r#"{
+            "StartInstance": {
+                "tenant_id": "acme",
+                "pool_id": "workers",
+                "instance_id": "i-legacy"
+            }
+        }"#;
+        let parsed: HostdRequest = serde_json::from_str(v1_json).unwrap();
+        match parsed {
+            HostdRequest::StartInstance {
+                tenant_id,
+                workspace_id,
+                volumes,
+                ..
+            } => {
+                assert_eq!(tenant_id, "acme");
+                assert_eq!(workspace_id, None);
+                assert!(volumes.is_empty());
+            }
+            _ => panic!("Wrong variant"),
+        }
+    }
+
+    /// Same v1-compat check for the other instance-scoped variants —
+    /// the workspace_id field must be optional everywhere it landed.
+    #[test]
+    fn test_hostd_request_instance_variants_v1_backward_compat() {
+        let cases = [
+            r#"{"StopInstance":{"tenant_id":"t","pool_id":"p","instance_id":"i"}}"#,
+            r#"{"SleepInstance":{"tenant_id":"t","pool_id":"p","instance_id":"i","force":false}}"#,
+            r#"{"WakeInstance":{"tenant_id":"t","pool_id":"p","instance_id":"i"}}"#,
+            r#"{"DestroyInstance":{"tenant_id":"t","pool_id":"p","instance_id":"i","wipe_volumes":false}}"#,
+        ];
+        for json in cases {
+            let parsed: HostdRequest = serde_json::from_str(json)
+                .unwrap_or_else(|e| panic!("v1 payload {json:?} should parse: {e}"));
+            // Each instance variant carries workspace_id; assert it
+            // defaults to None when the v1 payload omits it.
+            let ws = match &parsed {
+                HostdRequest::StopInstance { workspace_id, .. } => workspace_id,
+                HostdRequest::SleepInstance { workspace_id, .. } => workspace_id,
+                HostdRequest::WakeInstance { workspace_id, .. } => workspace_id,
+                HostdRequest::DestroyInstance { workspace_id, .. } => workspace_id,
+                _ => panic!("unexpected variant for {json:?}"),
+            };
+            assert_eq!(
+                ws, &None,
+                "v1 payload {json:?} should default workspace_id to None"
+            );
+        }
+    }
+
+    /// PROTOCOL_VERSION 2 canonical fixture for StartInstance with the
+    /// new fields populated. mvmd-side `tests/mvmd_compat.rs` mirrors
+    /// this shape; if the serialized bytes drift, both sides need a
+    /// refresh in the same commit (ADR-043).
+    #[test]
+    fn test_hostd_request_start_v2_fixture() {
+        use crate::instance::{VolumeAttach, VolumeMode};
+        let req = HostdRequest::StartInstance {
+            tenant_id: "acme".to_string(),
+            pool_id: "memory-svc".to_string(),
+            instance_id: "i-mem-001".to_string(),
+            workspace_id: Some("ws-prod".to_string()),
+            volumes: vec![VolumeAttach {
+                workspace_id: "ws-prod".to_string(),
+                name: "memory".to_string(),
+                mount_path: "/var/lib/memory".to_string(),
+                mode: VolumeMode::ReadWrite,
+            }],
+        };
+        let actual = serde_json::to_string(&req).unwrap();
+        let expected = concat!(
+            r#"{"StartInstance":{"#,
+            r#""tenant_id":"acme","#,
+            r#""pool_id":"memory-svc","#,
+            r#""instance_id":"i-mem-001","#,
+            r#""workspace_id":"ws-prod","#,
+            r#""volumes":[{"#,
+            r#""workspace_id":"ws-prod","#,
+            r#""name":"memory","#,
+            r#""mount_path":"/var/lib/memory","#,
+            r#""mode":"read_write""#,
+            r#"}]"#,
+            r#"}}"#,
+        );
+        assert_eq!(actual, expected);
+        // Round-trip the fixture to make sure parsing matches construction.
+        let parsed: HostdRequest = serde_json::from_str(expected).unwrap();
+        assert!(matches!(parsed, HostdRequest::StartInstance { .. }));
     }
 
     #[test]
@@ -379,11 +554,14 @@ mod tests {
                 tenant_id: "t".to_string(),
                 pool_id: "p".to_string(),
                 instance_id: "i".to_string(),
+                workspace_id: None,
+                volumes: vec![],
             },
             HostdRequest::StopInstance {
                 tenant_id: "t".to_string(),
                 pool_id: "p".to_string(),
                 instance_id: "i".to_string(),
+                workspace_id: None,
             },
             HostdRequest::SleepInstance {
                 tenant_id: "t".to_string(),
@@ -391,17 +569,20 @@ mod tests {
                 instance_id: "i".to_string(),
                 force: false,
                 drain_timeout_secs: None,
+                workspace_id: None,
             },
             HostdRequest::WakeInstance {
                 tenant_id: "t".to_string(),
                 pool_id: "p".to_string(),
                 instance_id: "i".to_string(),
+                workspace_id: None,
             },
             HostdRequest::DestroyInstance {
                 tenant_id: "t".to_string(),
                 pool_id: "p".to_string(),
                 instance_id: "i".to_string(),
                 wipe_volumes: false,
+                workspace_id: None,
             },
             HostdRequest::SetupNetwork {
                 tenant_id: "t".to_string(),

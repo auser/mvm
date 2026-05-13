@@ -74,6 +74,11 @@ fn execute(request: HostdRequest) -> HostdResponse {
             tenant_id,
             pool_id,
             instance_id,
+            // workspace_id + volumes (PROTOCOL_VERSION 2+) are consumed
+            // mvmd-side in `mvmd_runtime::vm::workspace::*`; the legacy
+            // mvm-hostd implementation here ignores them until plan 60
+            // lifts hostd into mvmd.
+            ..
         } => {
             if let Err(e) = validate_ids(&tenant_id, &pool_id, Some(&instance_id)) {
                 return HostdResponse::Error {
@@ -91,6 +96,7 @@ fn execute(request: HostdRequest) -> HostdResponse {
             tenant_id,
             pool_id,
             instance_id,
+            ..
         } => {
             if let Err(e) = validate_ids(&tenant_id, &pool_id, Some(&instance_id)) {
                 return HostdResponse::Error {
@@ -110,6 +116,7 @@ fn execute(request: HostdRequest) -> HostdResponse {
             instance_id,
             force,
             drain_timeout_secs: _,
+            ..
         } => {
             if let Err(e) = validate_ids(&tenant_id, &pool_id, Some(&instance_id)) {
                 return HostdResponse::Error {
@@ -127,6 +134,7 @@ fn execute(request: HostdRequest) -> HostdResponse {
             tenant_id,
             pool_id,
             instance_id,
+            ..
         } => {
             if let Err(e) = validate_ids(&tenant_id, &pool_id, Some(&instance_id)) {
                 return HostdResponse::Error {
@@ -145,6 +153,7 @@ fn execute(request: HostdRequest) -> HostdResponse {
             pool_id,
             instance_id,
             wipe_volumes,
+            ..
         } => {
             if let Err(e) = validate_ids(&tenant_id, &pool_id, Some(&instance_id)) {
                 return HostdResponse::Error {
@@ -214,6 +223,8 @@ mod tests {
             tenant_id: "INVALID!!".to_string(),
             pool_id: "workers".to_string(),
             instance_id: "i-abc".to_string(),
+            workspace_id: None,
+            volumes: vec![],
         });
         match resp {
             HostdResponse::Error { message } => {
@@ -229,6 +240,7 @@ mod tests {
             tenant_id: "acme".to_string(),
             pool_id: "INVALID!!".to_string(),
             instance_id: "i-abc".to_string(),
+            workspace_id: None,
         });
         match resp {
             HostdResponse::Error { message } => {
