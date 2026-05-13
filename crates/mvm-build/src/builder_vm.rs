@@ -636,6 +636,54 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
         })
     };
 
+    // Git-worktree support. When `flake_src/.git` is a regular file
+    // with a `gitdir:` reference (`git worktree add`-style checkout),
+    // that reference is a host-absolute path to
+    // `<main-repo>/.git/worktrees/<name>/`. Nix's git fetcher follows
+    // the indirection at flake-evaluation time; without the matching
+    // path also inside the sandbox the build fails with `fatal: not a
+    // git repository: <gitdir-path>`.
+    //
+    // Fix: bind-mount two additional host paths at their absolute
+    // host locations so the gitdir chain resolves:
+    //
+    //   1. The worktree itself at its host-absolute path. The flake
+    //      is also bound at `/work` for the build context, but git's
+    //      worktree-discovery walks the host-absolute path it sees in
+    //      the `.git` file's gitdir line.
+    //   2. The main repo's `.git/` directory at its host-absolute
+    //      path. The gitdir target's `commondir` file points back via
+    //      `../..` to the main `.git/`, so without this mount the
+    //      common-state lookup (HEAD, refs, packed-refs) fails.
+    //
+    // No-op when running from the main worktree (`.git` is a real
+    // directory, not a `gitdir:` indirection file).
+    let mut worktree_mirrors: Vec<std::path::PathBuf> = Vec::new();
+    let dot_git = flake_src.join(".git");
+    if dot_git.is_file() {
+        let body = std::fs::read_to_string(&dot_git).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "reading worktree .git file at {}: {e}",
+                dot_git.display()
+            ))
+        })?;
+        if let Some(gitdir_line) = body.lines().find(|l| l.starts_with("gitdir:")) {
+            let gitdir_str = gitdir_line.trim_start_matches("gitdir:").trim();
+            let gitdir = std::path::PathBuf::from(gitdir_str);
+            // gitdir = <main-repo>/.git/worktrees/<name>/
+            // main .git = grandparent of gitdir
+            if let Some(main_git) = gitdir.parent().and_then(|p| p.parent()) {
+                worktree_mirrors.push(flake_src.clone());
+                worktree_mirrors.push(main_git.to_path_buf());
+            }
+        }
+    }
+    for path in worktree_mirrors {
+        let host = path.clone();
+        let guest = path.to_string_lossy().into_owned();
+        builder = builder.volume(guest, move |m| m.bind(host.as_path()).readonly());
+    }
+
     let sandbox = builder
         .create_detached()
         .await
