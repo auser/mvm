@@ -275,6 +275,37 @@ pub fn dev_build(
     profile: Option<&str>,
     mode: BuildMode,
 ) -> Result<DevBuildResult> {
+    // Plan 68: `MVM_BUILD_STUB_OUTDIR` lets the live test suite
+    // skip the Nix build entirely and treat the env-var's value as
+    // the build output directory. The directory must contain
+    // `vmlinux` + `rootfs.ext4`. Same env-var-escape-hatch shape
+    // `MVM_DIRECT_BOOT` uses for `mvmctl up`. Logged loudly so a
+    // production misconfiguration can't go silent.
+    if let Ok(stub) = std::env::var("MVM_BUILD_STUB_OUTDIR")
+        && !stub.trim().is_empty()
+    {
+        env.log_warn(&format!(
+            "MVM_BUILD_STUB_OUTDIR={stub} set; skipping nix build (test path)."
+        ));
+        let _ = (flake_ref, profile, mode);
+        let stub_path = std::path::PathBuf::from(stub.trim());
+        let revision_hash = stub_path
+            .file_name()
+            .and_then(|s| s.to_str())
+            .map(String::from)
+            .unwrap_or_else(|| "stub".to_string());
+        return Ok(DevBuildResult {
+            build_dir: stub_path.display().to_string(),
+            vmlinux_path: stub_path.join("vmlinux").display().to_string(),
+            rootfs_path: stub_path.join("rootfs.ext4").display().to_string(),
+            initrd_path: None,
+            revision_hash,
+            cached: false,
+            runner_dir: None,
+            artifact_sizes: mvm_core::pool::ArtifactSizes::default(),
+        });
+    }
+
     // W7.x.2 dispatch: if the `env` channel has `nix` on PATH, run
     // the build there (host on Linux+host-Nix, Apple Container dev
     // VM on macOS 26+, etc.). Otherwise spawn a microsandbox builder
@@ -850,6 +881,17 @@ pub fn ensure_guest_agent_if_needed(
     env: &dyn ShellEnvironment,
     build_result: &DevBuildResult,
 ) -> Result<()> {
+    // Plan 68: same stub-outdir escape-hatch as `dev_build`. When the
+    // build itself was a stub, the rootfs is a placeholder file, not
+    // an ext4 image — attempting to `sudo mount` it would prompt for
+    // a password and hang the test. Skip injection in that mode.
+    if std::env::var("MVM_BUILD_STUB_OUTDIR")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false)
+    {
+        env.log_warn("MVM_BUILD_STUB_OUTDIR set; skipping guest-agent injection (test path).");
+        return Ok(());
+    }
     let mvm_src = match detect_mvm_src() {
         Some(p) => p,
         None => {
