@@ -176,16 +176,14 @@ const BUNDLE_SUB: &[(&str, AuditPosture)] = &[
     ("install", AuditPosture::InteractiveOrControl),
 ];
 
-// trust add/remove mutate `~/.mvm/trusted-publishers/` but the
-// audit chain integration (new `LocalAuditKind::TrustAdd /
-// TrustRemove` variants + emitter wiring) hasn't landed yet —
-// same staged shape `policy update` used while waiting on plan
-// 60 Phase 8. Bumping these to `Emits("TrustAdd"/"TrustRemove")`
-// is the follow-up that goes with the audit-chain hook-up.
+// trust add/remove mutate `~/.mvm/trusted-publishers/` and emit
+// `LocalAuditKind::{TrustAdd, TrustRemove}` via
+// `mvm_core::audit::emit`. Sprint 52 W2 phase-3 close-out
+// promoted these from `InteractiveOrControl` to `Emits(...)`.
 const TRUST_SUB: &[(&str, AuditPosture)] = &[
-    ("add", AuditPosture::InteractiveOrControl),
+    ("add", AuditPosture::Emits("TrustAdd")),
     ("list", AuditPosture::ReadOnly),
-    ("remove", AuditPosture::InteractiveOrControl),
+    ("remove", AuditPosture::Emits("TrustRemove")),
 ];
 
 /// Every top-level `mvmctl` subcommand keyed by its clap name.
@@ -414,6 +412,8 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
         "VmProcSignal",
         "VmProcStart",
         "VmProcStdin",
+        "TrustAdd",
+        "TrustRemove",
         "VmStart",
         "VmStop",
         "VmTtlSet",
