@@ -30,6 +30,8 @@ use mvm_core::vm_backend::{
     VmCapabilities, VmExitStatus, VmId, VmInfo, VmNetworkInfo, VmStartConfig, VmStatus,
 };
 
+use crate::mock_guest_agent::MockGuestAgent;
+
 /// Per-VM state held by [`MockBackend`].
 #[derive(Debug, Clone)]
 struct MockVm {
@@ -47,9 +49,15 @@ struct MockVm {
 /// The interior `Mutex<HashMap>` is wrapped in an `Arc` so cloning the
 /// backend (e.g. across an `AnyBackend::Mock(MockBackend)` enum copy)
 /// shares state. The `Default` impl returns an empty registry.
+///
+/// `agents` holds one [`MockGuestAgent`] per VM. Plan 66 W1/W2 — the
+/// agent listens on `<vm_dir>/runtime/v.sock` so host-side `fs` and
+/// `proc` callers find a working endpoint at the same path
+/// Firecracker exposes for the real vsock UDS.
 #[derive(Debug, Default, Clone)]
 pub struct MockBackend {
     state: std::sync::Arc<Mutex<HashMap<String, MockVm>>>,
+    agents: std::sync::Arc<Mutex<HashMap<String, MockGuestAgent>>>,
 }
 
 impl MockBackend {
@@ -106,6 +114,25 @@ impl VmBackend for MockBackend {
         // because not every consumer needs the directory.
         let vm_dir = Self::vm_dir(&config.name);
         let _ = std::fs::create_dir_all(&vm_dir);
+        // Plan 66 W1/W2: spawn the mock vsock guest-agent on
+        // `<vm_dir>/runtime/v.sock`. Failure to start the agent is
+        // *not* fatal — the audit-emit tests that don't touch
+        // fs/proc still want the VM to come up. The fs/proc tests
+        // will see a clearer "connect failed" error than they
+        // would from a missing agent.
+        match MockGuestAgent::start(&vm_dir) {
+            Ok(agent) => {
+                if let Ok(mut agents) = self.agents.lock() {
+                    agents.insert(config.name.clone(), agent);
+                }
+            }
+            Err(e) => {
+                tracing::warn!(
+                    "mock: failed to start MockGuestAgent for '{}': {e}",
+                    config.name
+                );
+            }
+        }
         state.insert(
             config.name.clone(),
             MockVm {
@@ -134,6 +161,17 @@ impl VmBackend for MockBackend {
             .lock()
             .map_err(|_| anyhow::anyhow!("mock backend state mutex poisoned"))?;
         state.remove(&id.0);
+        // Drop the agent (which joins its thread + removes the socket)
+        // and the on-disk VM dir. Plan 66 W1/W2.
+        if let Ok(mut agents) = self.agents.lock()
+            && let Some(agent) = agents.remove(&id.0)
+        {
+            agent.stop();
+        }
+        let vm_dir = Self::vm_dir(&id.0);
+        if vm_dir.exists() {
+            let _ = std::fs::remove_dir_all(&vm_dir);
+        }
         Ok(())
     }
 
@@ -142,7 +180,19 @@ impl VmBackend for MockBackend {
             .state
             .lock()
             .map_err(|_| anyhow::anyhow!("mock backend state mutex poisoned"))?;
+        let names: Vec<String> = state.keys().cloned().collect();
         state.clear();
+        if let Ok(mut agents) = self.agents.lock() {
+            for (_, agent) in agents.drain() {
+                agent.stop();
+            }
+        }
+        for name in names {
+            let vm_dir = Self::vm_dir(&name);
+            if vm_dir.exists() {
+                let _ = std::fs::remove_dir_all(&vm_dir);
+            }
+        }
         Ok(())
     }
 

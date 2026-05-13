@@ -47,6 +47,7 @@ pub mod libkrun;
 pub mod microvm;
 pub mod microvm_nix;
 pub mod mock;
+pub mod mock_guest_agent;
 pub mod network;
 
 // `microsandbox` is the only self-contained backend integration that
