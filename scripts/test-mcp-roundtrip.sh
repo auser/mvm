@@ -5,7 +5,7 @@
 # real JSON-RPC roundtrip, and asserts:
 #
 #   1. `initialize` returns the pinned protocol version + serverInfo.
-#   2. `tools/list` returns exactly one tool named `run`.
+#   2. `tools/list` returns the expected Phase 7 tool set.
 #   3. `tools/call run` against an unregistered env returns a structured
 #      MCP-shaped `isError: true` result (NOT a JSON-RPC error code).
 #      This validates the env-allowlist gate without needing a real
@@ -113,27 +113,31 @@ echo "    initialize: protocolVersion=$PROTO_VERSION serverInfo.name=$SERVER_NAM
 # --- Assertion 3: tools/list ------------------------------------------
 LIST=$(sed -n '2p' "$OUT")
 TOOL_COUNT=$(echo "$LIST" | jq -r '.result.tools | length // empty')
-if [ "$TOOL_COUNT" != "1" ]; then
-    echo "==> FAIL: tools/list expected 1 tool, got $TOOL_COUNT" >&2
+if [ "$TOOL_COUNT" != "4" ]; then
+    echo "==> FAIL: tools/list expected 4 tools, got $TOOL_COUNT" >&2
     echo "$LIST" >&2
     exit 1
 fi
-TOOL_NAME=$(echo "$LIST" | jq -r '.result.tools[0].name // empty')
-if [ "$TOOL_NAME" != "run" ]; then
-    echo "==> FAIL: tools/list expected name 'run', got '$TOOL_NAME'" >&2
-    exit 1
-fi
-# The single-tool design (plan 32 / nix-sandbox-mcp insight) requires
+
+for tool in run mvm.time_now mvm.web_fetch mvm.web_search; do
+    if ! echo "$LIST" | jq -e --arg t "$tool" '.result.tools[] | select(.name == $t)' >/dev/null 2>&1; then
+        echo "==> FAIL: tools/list missing expected tool '$tool'" >&2
+        echo "$LIST" >&2
+        exit 1
+    fi
+done
+
+# The run tool design (plan 32 / nix-sandbox-mcp insight) requires
 # `env`, `code`, `session`, `close`, `timeout_secs` in the schema.
-SCHEMA=$(echo "$LIST" | jq -c '.result.tools[0].inputSchema.properties // empty')
+SCHEMA=$(echo "$LIST" | jq -c '.result.tools[] | select(.name == "run") | .inputSchema.properties // empty')
 for field in env code session close timeout_secs; do
     if ! echo "$SCHEMA" | jq -e --arg f "$field" '.[$f]' >/dev/null 2>&1; then
-        echo "==> FAIL: tools/list schema missing field '$field'" >&2
+        echo "==> FAIL: tools/list run schema missing field '$field'" >&2
         echo "    schema: $SCHEMA" >&2
         exit 1
     fi
 done
-echo "    tools/list: 1 tool ('run'), schema contains env/code/session/close/timeout_secs"
+echo "    tools/list: 4 tools (run + host-mediated tools), run schema contains env/code/session/close/timeout_secs"
 
 # --- Assertion 4: tools/call against unknown env returns isError ------
 # This is the env-allowlist gate. Without an actual microVM template
