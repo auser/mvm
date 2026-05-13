@@ -84,6 +84,14 @@
 //!   (top-level ReadOnly verbs — three more rows from
 //!   `AUDIT_POSTURE` pinned against a future regression that
 //!   adds an emit to a read-only path)
+//! - `mvmctl update` (against an `httpmock` server returning the
+//!   current version) → `UpdateInstall` (Plan 69: the
+//!   `MVM_UPDATE_API_URL` env-var redirects the
+//!   `https://api.github.com/.../releases/latest` query to a local
+//!   mock that returns the current binary's own version.
+//!   `update::update` exits early with "already up to date" and
+//!   the outer wrapper emits `UpdateInstall`. No real network, no
+//!   binary swap.)
 //! - `mvmctl uninstall --yes --dry-run` → **no** audit entry
 //!   (the positive `Uninstall` path is real-system-destructive
 //!   and not safely-hermetic, but the dry-run path is read-only
@@ -1255,6 +1263,84 @@ fn catalog_list_does_not_emit_audit_entry() {
         log.is_empty(),
         "read-only `mvmctl catalog list` must not write to the \
          LocalAudit stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn update_emits_update_install_audit_entry_against_mocked_github() {
+    // Plan 69: `mvmctl update` reaches `api.github.com/releases/latest`
+    // by default. The `MVM_UPDATE_API_URL` env-var redirects the
+    // base URL to a local `httpmock` server, which returns the
+    // current binary's own version. `update::update` then exits
+    // early on the "already up to date" branch — Ok(()) without
+    // swapping the binary — and the outer wrapper at
+    // `commands/env/update.rs` emits `UpdateInstall`. No real
+    // network, no binary swap, no install dance.
+    let server = httpmock::MockServer::start();
+    let current_version = env!("CARGO_PKG_VERSION");
+    let _api_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path_contains("/releases/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(format!(r#"{{"tag_name":"v{current_version}"}}"#));
+    });
+
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .env("MVM_UPDATE_API_URL", server.base_url())
+        .args(["update"])
+        .output()
+        .expect("spawn mvmctl update");
+    assert!(
+        output.status.success(),
+        "mvmctl update failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "update_install");
+    assert!(
+        hits >= 1,
+        "expected ≥1 update_install entry, got {hits}. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn update_check_does_not_emit_audit_entry() {
+    // Negative: `update --check` short-circuits before the install
+    // path AND before the outer wrapper's audit-emit branch
+    // (`!args.check` guard at `commands/env/update.rs`). Read-only;
+    // pins that against a future regression that emits on check.
+    let server = httpmock::MockServer::start();
+    let _api_mock = server.mock(|when, then| {
+        when.method(httpmock::Method::GET)
+            .path_contains("/releases/latest");
+        then.status(200)
+            .header("content-type", "application/json")
+            .body(r#"{"tag_name":"v0.999.0"}"#);
+    });
+
+    let sandbox = AuditSandbox::new();
+    let output = sandbox
+        .mvmctl()
+        .env("MVM_UPDATE_API_URL", server.base_url())
+        .args(["update", "--check"])
+        .output()
+        .expect("spawn mvmctl update --check");
+    assert!(
+        output.status.success(),
+        "mvmctl update --check failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "update_install");
+    assert_eq!(
+        hits, 0,
+        "read-only `update --check` must not emit; got {hits}. \
+         Full log:\n{log}"
     );
 }
 

@@ -223,6 +223,9 @@ chrono.workspace = true
 # `clap::Command` tree returned by `mvm_cli::commands::cli_command()`
 # to enforce that every subcommand has a declared audit posture.
 clap.workspace = true
+# Plan 69: local mock HTTP server for the `mvmctl update` live test.
+# Avoids reaching the real GitHub release API in CI / on dev machines.
+httpmock = "0.7"
 predicates.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true

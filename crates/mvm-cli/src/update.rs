@@ -41,10 +41,42 @@ fn detect_target() -> Result<&'static str> {
     );
 }
 
+/// Base URL for the GitHub releases query.
+///
+/// Defaults to `https://api.github.com`. `MVM_UPDATE_API_URL` overrides
+/// for hermetic tests (plan 69) — the env-var supplies the bare host
+/// (e.g. `http://127.0.0.1:8080`) and the existing path suffix
+/// `/repos/<repo>/releases/latest` is appended. The override path
+/// emits a warning so the bypass is visible in stderr.
+fn github_api_base() -> String {
+    if let Ok(base) = std::env::var("MVM_UPDATE_API_URL")
+        && !base.trim().is_empty()
+    {
+        eprintln!("[mvm] MVM_UPDATE_API_URL set; using {base} (test path).");
+        return base.trim().trim_end_matches('/').to_string();
+    }
+    String::from("https://api.github.com")
+}
+
+/// Base URL for GitHub release-asset downloads.
+///
+/// Defaults to `https://github.com`. `MVM_UPDATE_DOWNLOAD_URL` overrides
+/// for hermetic tests — same shape as `MVM_UPDATE_API_URL`.
+fn github_download_base() -> String {
+    if let Ok(base) = std::env::var("MVM_UPDATE_DOWNLOAD_URL")
+        && !base.trim().is_empty()
+    {
+        eprintln!("[mvm] MVM_UPDATE_DOWNLOAD_URL set; using {base} (test path).");
+        return base.trim().trim_end_matches('/').to_string();
+    }
+    String::from("https://github.com")
+}
+
 /// Query the GitHub releases API for the latest release tag name.
 fn fetch_latest_version() -> Result<String> {
     let url = format!(
-        "https://api.github.com/repos/{}/releases/latest",
+        "{}/repos/{}/releases/latest",
+        github_api_base(),
         GITHUB_REPO
     );
 
@@ -90,8 +122,10 @@ fn parse_checksum_line(line: &str) -> Result<[u8; 32]> {
 /// and confirms it matches the digest of the file at `archive_path`.
 fn verify_checksum(version: &str, archive_name: &str, archive_path: &Path) -> Result<()> {
     let checksum_url = format!(
-        "https://github.com/{}/releases/download/{}/checksums-sha256.txt",
-        GITHUB_REPO, version
+        "{}/{}/releases/download/{}/checksums-sha256.txt",
+        github_download_base(),
+        GITHUB_REPO,
+        version
     );
 
     let checksum_text = http::fetch_text(&checksum_url)
@@ -140,8 +174,11 @@ fn hex_encode(bytes: &[u8]) -> String {
 fn download_release(version: &str, target: &str, tmp_dir: &Path) -> Result<()> {
     let archive_name = format!("mvmctl-{}.tar.gz", target);
     let download_url = format!(
-        "https://github.com/{}/releases/download/{}/{}",
-        GITHUB_REPO, version, archive_name
+        "{}/{}/releases/download/{}/{}",
+        github_download_base(),
+        GITHUB_REPO,
+        version,
+        archive_name
     );
     let dest = tmp_dir.join(&archive_name);
 
@@ -428,8 +465,11 @@ fn verify_signature(version: &str, archive_name: &str, archive_path: &Path) -> R
 
     let bundle_name = format!("{}.bundle", archive_name);
     let bundle_url = format!(
-        "https://github.com/{}/releases/download/{}/{}",
-        GITHUB_REPO, version, bundle_name
+        "{}/{}/releases/download/{}/{}",
+        github_download_base(),
+        GITHUB_REPO,
+        version,
+        bundle_name
     );
     let bundle_path = archive_path
         .parent()
