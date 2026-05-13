@@ -143,6 +143,15 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         (None, None) => None,
     };
 
+    // Bake the template's declared resources into the bundle so
+    // `mvmctl up <bundle-sha>` on another host gets sensible
+    // defaults without re-discovering them. CLI `--cpus` /
+    // `--memory` still override at launch time.
+    let resources = Some(mvm_plan::BundleResources {
+        vcpus: spec.vcpus as u32,
+        mem_mib: spec.mem_mib,
+    });
+
     let manifest = BundleManifest {
         schema_version: BUNDLE_SCHEMA_VERSION,
         publisher: host_signer::host_signer_id(),
@@ -155,6 +164,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         labels: Default::default(),
         artifacts,
         verity,
+        resources,
     };
 
     // ---- 4. Sign + write the archive ----

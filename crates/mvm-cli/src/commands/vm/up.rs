@@ -1684,6 +1684,7 @@ mod admit_plan_tests {
                 },
             ],
             verity: None,
+            resources: None,
         };
         let archive = write_bundle(
             &manifest,

@@ -446,6 +446,7 @@ mod tests {
                 make_art("rootfs.ext4", ArtifactRole::Rootfs, rootfs),
             ],
             verity: None,
+            resources: None,
         };
         let archive = write_bundle(
             &manifest,
