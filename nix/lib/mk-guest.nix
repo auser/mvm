@@ -510,13 +510,66 @@ let
     # "could not stat /lib/modules/<kver>/source" warning on every
     # call. The guest never reads kernel headers, so removing the
     # links is harmless and silences the warning.
+    #
+    # **Trim to the vsock closure.** The full nixpkgs modules tree
+    # is ~280 MB on aarch64 — thousands of drivers for hardware and
+    # filesystems the dev VM never touches (USB, sound, wifi, dozens
+    # of FS implementations, etc.). We only ever `modprobe` the
+    # vsock chain, so anything outside that closure is pure
+    # rootfs bloat. After the copy:
+    #
+    #   1. Walk `modprobe --show-depends` for each module the init
+    #      script loads (the `keepModules` list, derived from
+    #      Stage 2.4 in /init below).
+    #   2. Delete every `.ko*` file outside that closure, then prune
+    #      empty subdirs.
+    #   3. Regenerate `modules.dep`, `modules.alias`, etc. via
+    #      `depmod -b $out <kver>` so modprobe at runtime sees a
+    #      consistent index against the trimmed tree.
+    #
+    # End-state rootfs growth: ~5 MB (vsock closure + index files)
+    # vs. ~280 MB (full tree) — restoring the rootfs to roughly its
+    # pre-#110 size.
+    #
+    # If `modprobe --show-depends` produces no output the trim bails
+    # loudly: shipping an unloadable rootfs is worse than shipping a
+    # fat one.
     ${pkgs.lib.optionalString hasKernel ''
       mkdir -p "$out/lib/modules"
       cp -a --reflink=auto ${kernel.modules or kernel}/lib/modules/${kernel.modDirVersion} \
         "$out/lib/modules/${kernel.modDirVersion}"
       rm -f "$out/lib/modules/${kernel.modDirVersion}/source" \
             "$out/lib/modules/${kernel.modDirVersion}/build"
-      chmod -R a-w "$out/lib/modules/${kernel.modDirVersion}"
+
+      KVER=${kernel.modDirVersion}
+      KMODDIR="$out/lib/modules/$KVER"
+      # `cp -a` preserved the nix-store source's mode-0555 directories
+      # (everything in /nix/store is read-only). Without flipping the
+      # directories to writable, the trim's `rm` calls fail because rm
+      # needs write permission on the parent dir, not on the file itself.
+      # The closing `chmod -R a-w` below re-locks the tree.
+      chmod -R u+w "$KMODDIR"
+      KEEP=$(mktemp)
+      for mod in vmw_vsock_virtio_transport vsock_loopback; do
+        ${pkgs.kmod}/bin/modprobe --show-depends -d "$out" -S "$KVER" "$mod" 2>/dev/null \
+          | ${pkgs.gnugrep}/bin/grep '^insmod' \
+          | ${pkgs.gawk}/bin/awk '{print $2}' \
+          >> "$KEEP" || true
+      done
+      ${pkgs.coreutils}/bin/sort -u "$KEEP" -o "$KEEP"
+      if [ ! -s "$KEEP" ]; then
+        echo "mk-guest: modprobe --show-depends produced no output for vsock; refusing to trim" >&2
+        exit 1
+      fi
+      ${pkgs.findutils}/bin/find "$KMODDIR" -name '*.ko*' -type f | while read -r f; do
+        ${pkgs.gnugrep}/bin/grep -Fxq "$f" "$KEEP" || rm -f "$f"
+      done
+      ${pkgs.findutils}/bin/find "$KMODDIR" -type d -empty -delete
+
+      # Regenerate the index files for the trimmed tree.
+      ${pkgs.kmod}/bin/depmod -b "$out" "$KVER"
+
+      chmod -R a-w "$out/lib/modules/$KVER"
     ''}
   '';
 
