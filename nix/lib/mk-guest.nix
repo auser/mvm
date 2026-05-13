@@ -492,6 +492,17 @@ let
     # so a compromised entrypoint can't replace a module with one of
     # its own choosing.
     #
+    # **Multi-output kernel.** nixpkgs' linux kernel derivation is
+    # multi-output: `$out` is the boot image (Image / bzImage),
+    # `$dev` is headers + build infra, and `$modules` is the actual
+    # module tree (see `pkgs/os-specific/linux/kernel/build.nix` —
+    # `INSTALL_MOD_PATH=${placeholder "modules"}` puts the modules
+    # into the `modules` output). Reading `${kernel}/lib/modules/...`
+    # (the default output) gets you nothing; you need
+    # `${kernel.modules}/lib/modules/...`. Non-modular kernels
+    # don't have the extra output, so `kernel.modules or kernel`
+    # falls back gracefully.
+    #
     # `source` and `build` are symlinks nixpkgs drops into the
     # modules tree pointing at the kernel-headers store path
     # (`/nix/store/<hash>-linux-<ver>-dev`). Inside the guest those
@@ -501,7 +512,7 @@ let
     # links is harmless and silences the warning.
     ${pkgs.lib.optionalString hasKernel ''
       mkdir -p "$out/lib/modules"
-      cp -a --reflink=auto ${kernel}/lib/modules/${kernel.modDirVersion} \
+      cp -a --reflink=auto ${kernel.modules or kernel}/lib/modules/${kernel.modDirVersion} \
         "$out/lib/modules/${kernel.modDirVersion}"
       rm -f "$out/lib/modules/${kernel.modDirVersion}/source" \
             "$out/lib/modules/${kernel.modDirVersion}/build"
