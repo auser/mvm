@@ -135,8 +135,16 @@ fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<Admission
         boot_timeout_secs: 60,
         exec_timeout_secs: 0,
         destroy_on_exit: true,
+        // Substrate-only: pin is None today. A follow-up CLI flag
+        // (`--bundle-pin <path>`) will populate this from a fetched
+        // and verified `.mvmpkg` so admit_for_run re-verifies before
+        // backend dispatch. ADR-002 claim 9 — load-bearing at launch.
+        bundle_pin: None,
     };
-    let admitted = admit_for_run(&input, &SystemClock, p.ledger, p.keys_dir)?;
+    // No bundle pin in v1 — when populated, pass a
+    // `BundleAdmissionContext` with the resolver + trust store. The
+    // admission path refuses if a pin is present without context.
+    let admitted = admit_for_run(&input, &SystemClock, p.ledger, p.keys_dir, None)?;
     tracing::info!(
         plan_id = %admitted.plan_id.0,
         signer_id = %admitted.signer_id,
@@ -1776,10 +1784,12 @@ bundle_version = 1
                 boot_timeout_secs: 60,
                 exec_timeout_secs: 0,
                 destroy_on_exit: true,
+                bundle_pin: None,
             },
             &SystemClock,
             &ledger,
             Some(keys_dir.path()),
+            None,
         )
         .expect("admit")
         .plan;
@@ -1831,10 +1841,12 @@ bundle_version = 1
                 boot_timeout_secs: 60,
                 exec_timeout_secs: 0,
                 destroy_on_exit: true,
+                bundle_pin: None,
             },
             &SystemClock,
             &ledger,
             Some(keys_dir.path()),
+            None,
         )
         .expect("admit")
         .plan;
@@ -1910,10 +1922,12 @@ disabled_inspectors = ["ssrf_guarrd"]
                 boot_timeout_secs: 60,
                 exec_timeout_secs: 0,
                 destroy_on_exit: true,
+                bundle_pin: None,
             },
             &SystemClock,
             &ledger,
             Some(keys_dir.path()),
+            None,
         )
         .expect("admit")
         .plan;
@@ -1995,10 +2009,12 @@ port_hi  = 443
                 boot_timeout_secs: 60,
                 exec_timeout_secs: 0,
                 destroy_on_exit: true,
+                bundle_pin: None,
             },
             &SystemClock,
             &ledger,
             Some(keys_dir.path()),
+            None,
         )
         .expect("admit")
         .plan;

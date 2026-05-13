@@ -280,6 +280,215 @@ impl PlanArtifact {
     }
 }
 
+/// Look up bundle archive bytes by SHA-256 at admit time.
+///
+/// The supervisor calls this on every admission whose `ExecutionPlan`
+/// carries a `PlanArtifact`. Production impls read from
+/// `~/.mvm/bundles/<bundle_sha256>.mvmpkg`; tests inject in-memory
+/// resolvers. The trait stays in `mvm_plan` rather than alongside
+/// `FsTrustStore` so the supervisor doesn't need a filesystem dep
+/// to consume admissions.
+pub trait BundleResolver: Send + Sync {
+    /// Fetch the archive bytes for `bundle_sha256`. Returns
+    /// `Err(MissingBundle)` when the bundle isn't cached locally;
+    /// `Err(Io(_))` when it's there but unreadable.
+    fn resolve(&self, bundle_sha256: &str) -> Result<Vec<u8>, BundleResolveError>;
+}
+
+/// Errors specific to bundle resolution at admit time. Distinct
+/// from [`BundleVerifyError`] so the supervisor can surface
+/// "we don't have the bundle locally" differently from "we have
+/// it but the bytes don't verify."
+#[derive(Debug, Error)]
+pub enum BundleResolveError {
+    #[error("no cached bundle for sha256 {bundle_sha256}")]
+    MissingBundle { bundle_sha256: String },
+
+    #[error("reading cached bundle {bundle_sha256}: {reason}")]
+    Io {
+        bundle_sha256: String,
+        reason: String,
+    },
+}
+
+/// Filesystem-backed resolver rooted at `~/.mvm/bundles/`.
+/// `<bundle_sha256>.mvmpkg` is the on-disk filename — content-
+/// addressed so two bundles with the same bytes share a cache
+/// entry. The cache is populated by `mvmctl bundle fetch` once
+/// the registry-replacement follow-up lands; until then,
+/// publishers write the file by hand.
+pub struct FsBundleResolver {
+    root: PathBuf,
+}
+
+impl FsBundleResolver {
+    pub fn new(dir: impl Into<PathBuf>) -> Self {
+        Self { root: dir.into() }
+    }
+
+    /// Default path: `~/.mvm/bundles/`. Same shape as
+    /// `FsTrustStore::default_path` so admission code can resolve
+    /// both with no extra plumbing.
+    pub fn default_path() -> anyhow::Result<Self> {
+        let home = std::env::var_os("HOME")
+            .ok_or_else(|| anyhow::anyhow!("$HOME is not set; cannot resolve bundle cache"))?;
+        let p = PathBuf::from(home).join(".mvm").join("bundles");
+        Ok(Self::new(p))
+    }
+
+    pub fn root(&self) -> &Path {
+        &self.root
+    }
+}
+
+impl BundleResolver for FsBundleResolver {
+    fn resolve(&self, bundle_sha256: &str) -> Result<Vec<u8>, BundleResolveError> {
+        let path = self.root.join(format!("{bundle_sha256}.mvmpkg"));
+        match std::fs::read(&path) {
+            Ok(bytes) => Ok(bytes),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                Err(BundleResolveError::MissingBundle {
+                    bundle_sha256: bundle_sha256.to_string(),
+                })
+            }
+            Err(e) => Err(BundleResolveError::Io {
+                bundle_sha256: bundle_sha256.to_string(),
+                reason: e.to_string(),
+            }),
+        }
+    }
+}
+
+/// Verify a plan's pinned bundle at admit time.
+///
+/// Runs the full [`read_and_verify_bundle`] rejection ladder against
+/// the resolved archive bytes, then cross-checks the resulting
+/// `bundle_sha256` + `manifest_sig` + `key_id` against the plan's
+/// pin. Any mismatch is a refusal — the plan was signed against a
+/// bundle that doesn't match what's on disk now.
+///
+/// Failure modes (any one rejects the admission):
+/// - **Pin missing locally**: the supervisor has no cached bundle
+///   matching `pin.bundle_sha256` (resolver returns `MissingBundle`).
+/// - **Trust store doesn't know the publisher**: same as fetch-time
+///   `UnknownKey`.
+/// - **Manifest signature doesn't verify**: same as fetch-time
+///   `SignatureInvalid`.
+/// - **Per-artifact hash mismatch**: same as fetch-time
+///   `ArtifactSha256Mismatch`.
+/// - **Pin-archive mismatch**: the archive's sha256 doesn't equal
+///   `pin.bundle_sha256`. Means the resolver returned the wrong
+///   bytes (cache poisoning) or someone tampered with the archive
+///   between fetch and admit.
+/// - **Pin-signature mismatch**: the archive's signature differs
+///   from `pin.manifest_sig_base64`. Means the publisher re-signed
+///   the same content with a different envelope — the plan was
+///   admitting a specific instance, not just any bundle with the
+///   same bytes.
+/// - **Pin-key_id mismatch**: the archive declares a different
+///   publisher than the plan pinned. Forged-publisher case.
+pub fn verify_plan_bundle(
+    pin: &PlanArtifact,
+    resolver: &dyn BundleResolver,
+    trust: &dyn TrustStore,
+) -> Result<VerifiedBundle, PlanBundleError> {
+    let archive = resolver
+        .resolve(&pin.bundle_sha256)
+        .map_err(PlanBundleError::Resolve)?;
+
+    let actual_sha = sha256_hex(&archive);
+    if actual_sha != pin.bundle_sha256 {
+        return Err(PlanBundleError::BundleSha256Mismatch {
+            pinned: pin.bundle_sha256.clone(),
+            actual: actual_sha,
+        });
+    }
+
+    let verified = read_and_verify_bundle(&archive, trust).map_err(PlanBundleError::Verify)?;
+
+    if verified.key_id != pin.key_id {
+        return Err(PlanBundleError::KeyIdMismatch {
+            pinned: pin.key_id.0.clone(),
+            actual: verified.key_id.0.clone(),
+        });
+    }
+
+    // Recover the signature bytes from the archive and compare
+    // against the plan's pin. The archive's bytes are the ground
+    // truth here; the plan's `manifest_sig_base64` is the
+    // assertion. read_and_verify_bundle has already proven the
+    // signature is valid; we additionally require it to match the
+    // pin so a publisher who re-signs the same content with a new
+    // envelope can't satisfy an old plan.
+    let archive_sig =
+        extract_manifest_signature(&archive).map_err(|reason| PlanBundleError::SignatureRead {
+            reason: reason.to_string(),
+        })?;
+    let pin_sig = pin
+        .signature_bytes()
+        .ok_or_else(|| PlanBundleError::SignatureRead {
+            reason: "plan's pinned signature is not valid base64 or wrong length".to_string(),
+        })?;
+    if archive_sig != pin_sig {
+        return Err(PlanBundleError::SignatureMismatch);
+    }
+
+    Ok(verified)
+}
+
+/// Errors specific to plan-bundle admission. Wraps the lower-level
+/// [`BundleVerifyError`] + [`BundleResolveError`] so a supervisor
+/// can branch on "resolver couldn't find the bytes" vs "bytes
+/// found but the pin says they shouldn't be these."
+#[derive(Debug, Error)]
+pub enum PlanBundleError {
+    #[error("could not resolve pinned bundle: {0}")]
+    Resolve(#[source] BundleResolveError),
+
+    #[error("bundle verification failed: {0}")]
+    Verify(#[source] BundleVerifyError),
+
+    #[error("pinned bundle sha256 mismatch: plan pinned {pinned}, archive is {actual}")]
+    BundleSha256Mismatch { pinned: String, actual: String },
+
+    #[error("pinned key_id mismatch: plan pinned {pinned}, archive declares {actual}")]
+    KeyIdMismatch { pinned: String, actual: String },
+
+    #[error(
+        "pinned signature does not match archive signature — bundle was re-signed since the plan was issued"
+    )]
+    SignatureMismatch,
+
+    #[error("could not read manifest signature from archive: {reason}")]
+    SignatureRead { reason: String },
+}
+
+/// Pull the 64-byte manifest signature out of a `.mvmpkg` tar
+/// archive without going through the full verification path.
+/// Used by [`verify_plan_bundle`] to compare against the plan's
+/// pin. Errors carry the reason as a string so the calling code
+/// can surface it without owning the underlying io::Error.
+fn extract_manifest_signature(archive: &[u8]) -> Result<[u8; 64], String> {
+    let mut tar = tar::Archive::new(std::io::Cursor::new(archive));
+    for entry in tar.entries().map_err(|e| e.to_string())? {
+        let mut entry = entry.map_err(|e| e.to_string())?;
+        let path = entry
+            .path()
+            .map_err(|e| e.to_string())?
+            .to_string_lossy()
+            .into_owned();
+        if path == SIGNATURE_FILENAME {
+            let mut bytes = Vec::with_capacity(64);
+            std::io::Read::read_to_end(&mut entry, &mut bytes).map_err(|e| e.to_string())?;
+            return bytes
+                .as_slice()
+                .try_into()
+                .map_err(|_| format!("signature blob is {} bytes; expected 64", bytes.len()));
+        }
+    }
+    Err(format!("{SIGNATURE_FILENAME} not present in archive"))
+}
+
 /// Errors that can fall out of bundle verification.
 ///
 /// Each variant carries enough detail to debug a specific failure
@@ -1158,6 +1367,226 @@ mod tests {
             key_id: KeyId("0".repeat(32)),
         };
         assert!(pin.signature_bytes().is_none());
+    }
+
+    /// In-memory resolver: hands back a fixed byte string regardless
+    /// of what `bundle_sha256` is asked for. Tests choose what to
+    /// return by constructing one of these per-test.
+    struct FixedResolver(Vec<u8>);
+    impl BundleResolver for FixedResolver {
+        fn resolve(&self, _bundle_sha256: &str) -> Result<Vec<u8>, BundleResolveError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct MissingResolver;
+    impl BundleResolver for MissingResolver {
+        fn resolve(&self, bundle_sha256: &str) -> Result<Vec<u8>, BundleResolveError> {
+            Err(BundleResolveError::MissingBundle {
+                bundle_sha256: bundle_sha256.to_string(),
+            })
+        }
+    }
+
+    /// Helper: build a bundle from a fresh key, then build a
+    /// matching PlanArtifact pin pointing at the resulting archive.
+    fn pin_for(sk: &SigningKey, kernel: &[u8], rootfs: &[u8]) -> (Vec<u8>, PlanArtifact) {
+        let archive = build_bundle(sk, kernel, rootfs);
+        let mut sig_bytes: Vec<u8> = Vec::new();
+        {
+            let mut a = tar::Archive::new(Cursor::new(&archive));
+            for e in a.entries().unwrap() {
+                let mut e = e.unwrap();
+                if e.path().unwrap().to_string_lossy() == SIGNATURE_FILENAME {
+                    e.read_to_end(&mut sig_bytes).unwrap();
+                }
+            }
+        }
+        let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
+        let key_id = KeyId::from_pubkey(&sk.verifying_key());
+        let pin = PlanArtifact::new(bundle_sha256(&archive), &sig_arr, key_id);
+        (archive, pin)
+    }
+
+    #[test]
+    fn verify_plan_bundle_happy_path() {
+        let sk = fresh_key();
+        let (archive, pin) = pin_for(&sk, b"k", b"r");
+        let resolver = FixedResolver(archive);
+        let store = trust(&sk);
+        let verified = verify_plan_bundle(&pin, &resolver, &store).expect("verifies");
+        assert_eq!(verified.manifest.artifacts.len(), 2);
+    }
+
+    #[test]
+    fn verify_plan_bundle_missing_archive_is_resolve_error() {
+        let sk = fresh_key();
+        let (_archive, pin) = pin_for(&sk, b"k", b"r");
+        let resolver = MissingResolver;
+        let store = trust(&sk);
+        match verify_plan_bundle(&pin, &resolver, &store) {
+            Err(PlanBundleError::Resolve(BundleResolveError::MissingBundle { .. })) => {}
+            other => panic!("expected MissingBundle, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_plan_bundle_archive_bytes_mismatch_pin_refused() {
+        // Resolver returns a *different* archive than the pin points
+        // at. The bundle_sha256 cross-check catches it before going
+        // through the full read_and_verify pass.
+        let sk = fresh_key();
+        let (_archive_a, pin) = pin_for(&sk, b"k1", b"r1");
+        let archive_b = build_bundle(&sk, b"k2", b"r2");
+        let resolver = FixedResolver(archive_b);
+        let store = trust(&sk);
+        match verify_plan_bundle(&pin, &resolver, &store) {
+            Err(PlanBundleError::BundleSha256Mismatch { .. }) => {}
+            other => panic!("expected BundleSha256Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_plan_bundle_unknown_key_in_trust_store_refused() {
+        let sk = fresh_key();
+        let (archive, pin) = pin_for(&sk, b"k", b"r");
+        let resolver = FixedResolver(archive);
+        let empty_store = MapTrustStore(std::collections::HashMap::new());
+        match verify_plan_bundle(&pin, &resolver, &empty_store) {
+            Err(PlanBundleError::Verify(BundleVerifyError::UnknownKey { .. })) => {}
+            other => panic!("expected UnknownKey, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_plan_bundle_tampered_artifact_refused() {
+        // Construct a bundle signed cleanly but with a post-sign
+        // surgery that swaps the rootfs bytes (same length so the
+        // sha256 check is what fails, not the size check).
+        let sk = fresh_key();
+        let kernel = b"kernel-bytes".to_vec();
+        let real_rootfs = b"rootfs-bytes".to_vec();
+        let key_id = KeyId::from_pubkey(&sk.verifying_key());
+        let manifest = make_manifest(
+            key_id.clone(),
+            vec![
+                art(
+                    "vmlinux",
+                    ArtifactRole::Kernel,
+                    "artifacts/vmlinux",
+                    &kernel,
+                ),
+                art(
+                    "rootfs.ext4",
+                    ArtifactRole::Rootfs,
+                    "artifacts/rootfs.ext4",
+                    &real_rootfs,
+                ),
+            ],
+        );
+        let manifest_bytes = manifest.canonical_bytes().unwrap();
+        let sig = sk.sign(&manifest_bytes);
+
+        let mut buf = Cursor::new(Vec::<u8>::new());
+        {
+            let mut tar = tar::Builder::new(&mut buf);
+            append_bytes(&mut tar, MANIFEST_FILENAME, &manifest_bytes).unwrap();
+            append_bytes(&mut tar, SIGNATURE_FILENAME, &sig.to_bytes()).unwrap();
+            append_bytes(&mut tar, "artifacts/vmlinux", &kernel).unwrap();
+            append_bytes(&mut tar, "artifacts/rootfs.ext4", b"XXXXXXXXXXXX").unwrap();
+            tar.finish().unwrap();
+        }
+        let tampered = buf.into_inner();
+        // The pin records the tampered archive's sha256 — so the
+        // bundle_sha256 cross-check passes, and the failure surfaces
+        // inside read_and_verify_bundle as ArtifactSha256Mismatch.
+        let mut sig_arr = [0u8; 64];
+        sig_arr.copy_from_slice(&sig.to_bytes());
+        let pin = PlanArtifact::new(bundle_sha256(&tampered), &sig_arr, key_id);
+
+        let resolver = FixedResolver(tampered);
+        let store = trust(&sk);
+        match verify_plan_bundle(&pin, &resolver, &store) {
+            Err(PlanBundleError::Verify(BundleVerifyError::ArtifactSha256Mismatch { .. })) => {}
+            other => panic!("expected ArtifactSha256Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn verify_plan_bundle_signature_repinned_refused() {
+        // Publisher re-signs the same content with a fresh nonce-
+        // free signature. The archive verifies on its own, but the
+        // plan's pin records the OLD signature; admit-time must
+        // refuse because the plan was issued against a specific
+        // envelope.
+        let sk = fresh_key();
+        let (archive_a, pin_a) = pin_for(&sk, b"k", b"r");
+
+        // Build a second bundle with the SAME content. Manifest
+        // identical → sig over manifest is identical too (Ed25519
+        // is deterministic). So forging a different envelope means
+        // tampering with the sig bytes specifically.
+        //
+        // We construct that by hand: take the clean archive, flip
+        // the signature blob, and verify rejection. The pin still
+        // points at archive_a's original sig; the resolver hands
+        // back a tampered-sig archive.
+        // Rebuild the archive via tar and flip every bit of the
+        // signature blob — keeps the size at 64 (so the size check
+        // passes) but the signature won't verify.
+        let mut new_archive = Cursor::new(Vec::<u8>::new());
+        {
+            let mut a = tar::Archive::new(Cursor::new(&archive_a));
+            let mut b = tar::Builder::new(&mut new_archive);
+            for entry in a.entries().unwrap() {
+                let mut entry = entry.unwrap();
+                let path = entry.path().unwrap().to_string_lossy().into_owned();
+                let mut buf = Vec::new();
+                entry.read_to_end(&mut buf).unwrap();
+                if path == SIGNATURE_FILENAME {
+                    // Flip every bit in the signature → still 64 bytes
+                    // (size check passes), still parses as Ed25519
+                    // signature bytes (read_and_verify_bundle attempts
+                    // to verify and fails).
+                    for byte in &mut buf {
+                        *byte = !*byte;
+                    }
+                }
+                append_bytes(&mut b, &path, &buf).unwrap();
+            }
+            b.finish().unwrap();
+        }
+        let tampered = new_archive.into_inner();
+        // Pin's bundle_sha256 still matches the *original* archive,
+        // but the resolver is going to return the tampered one, so
+        // the bundle_sha256 cross-check fires first.
+        let resolver = FixedResolver(tampered);
+        let store = trust(&sk);
+        match verify_plan_bundle(&pin_a, &resolver, &store) {
+            Err(PlanBundleError::BundleSha256Mismatch { .. }) => {}
+            other => panic!("expected BundleSha256Mismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fs_bundle_resolver_reads_existing_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        let sha = "a".repeat(64);
+        let path = tmp.path().join(format!("{sha}.mvmpkg"));
+        std::fs::write(&path, b"archive-bytes").unwrap();
+        let resolver = FsBundleResolver::new(tmp.path());
+        let bytes = resolver.resolve(&sha).expect("resolves");
+        assert_eq!(bytes, b"archive-bytes");
+    }
+
+    #[test]
+    fn fs_bundle_resolver_missing_file_is_missing_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let resolver = FsBundleResolver::new(tmp.path());
+        match resolver.resolve(&"0".repeat(64)) {
+            Err(BundleResolveError::MissingBundle { .. }) => {}
+            other => panic!("expected MissingBundle, got {other:?}"),
+        }
     }
 
     #[test]

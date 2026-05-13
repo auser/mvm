@@ -50,7 +50,14 @@ which.workspace = true
 
 [dev-dependencies]
 assert_cmd.workspace = true
+ed25519-dalek.workspace = true
 predicates.workspace = true
+rand.workspace = true
+# Sprint 52 W2 follow-on: admit-time bundle re-verify tests need
+# to crack open `.mvmpkg` archives to recover the manifest sig
+# for pin construction. tar is the same dep mvm-plan uses
+# production-side.
+tar = "0.4"
 
 [lints]
 workspace = true

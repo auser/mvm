@@ -45,9 +45,10 @@
 use anyhow::{Context, Result};
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
+use mvm_plan::bundle::{BundleResolver, TrustStore};
 use mvm_plan::{
     ExecutionPlan, NonceStore, PlanId, PlanValidityError, SignedExecutionPlan, check_window,
-    sign_plan, verify_plan,
+    sign_plan, verify_plan, verify_plan_bundle,
 };
 use std::sync::Mutex;
 
@@ -112,12 +113,26 @@ pub struct AdmittedPlan {
     pub signed: SignedExecutionPlan,
 }
 
+/// Optional bundle-admission context for plans pinned to a
+/// `.mvmpkg`. Carries the resolver (where to find the archive
+/// bytes by sha256) and the trust store (which publisher pubkeys
+/// to accept). `admit_for_run` ignores it when the plan has no
+/// pin; rejects when the plan has a pin but the context is
+/// `None` (operator misconfiguration); runs full re-verify when
+/// both are present.
+pub struct BundleAdmissionContext<'a> {
+    pub resolver: &'a dyn BundleResolver,
+    pub trust: &'a dyn TrustStore,
+}
+
 /// Run the full admission pipeline for an `mvmctl up` invocation.
 ///
 /// On success, the caller proceeds to `backend.start()` knowing the
 /// plan was signed under the host signer, verified with the host's
-/// own public key, satisfies its own validity window, and hasn't been
-/// admitted before (replay protection).
+/// own public key, satisfies its own validity window, hasn't been
+/// admitted before (replay protection), and — when the plan pins a
+/// `.mvmpkg` bundle — the on-disk archive matches the pin
+/// byte-for-byte and verifies under the trust store.
 ///
 /// On failure, the user gets a clear error per failure class:
 ///   - `tenant must not be empty` / `vm_name must not be empty` —
@@ -126,11 +141,14 @@ pub struct AdmittedPlan {
 ///     keystore guard
 ///   - `plan validity window violated: {detail}` — G4 window check
 ///   - `plan replay detected for signer {id}; nonce {hex}` — G4 nonce
+///   - `bundle re-verify failed: {detail}` — pinned bundle missing,
+///     unknown publisher, tampered, or sha256/sig/key_id mismatch
 pub fn admit_for_run(
     input: &SynthesisInput<'_>,
     clock: &dyn Clock,
     ledger: &InMemoryNonceLedger,
     host_signer_keys_dir: Option<&std::path::Path>,
+    bundle_ctx: Option<&BundleAdmissionContext<'_>>,
 ) -> Result<AdmittedPlan> {
     // Build the unsigned plan first. Synthesis failures are caught
     // before we touch the keystore — keeps "signed bad plan" from
@@ -175,6 +193,22 @@ pub fn admit_for_run(
             .context("replay protection check")?;
     }
 
+    // ADR-002 claim 9 — bundle re-verify at admit time. Only fires
+    // when the plan pinned a bundle; missing context with a pinned
+    // plan is operator misconfiguration (mvmctl up wasn't wired
+    // with a resolver/trust store), so we refuse rather than skip
+    // silently.
+    if let Some(pin) = verified.bundle.as_ref() {
+        let ctx = bundle_ctx.ok_or_else(|| {
+            anyhow::anyhow!(
+                "plan pins bundle {bundle} but no BundleAdmissionContext was provided — refuse",
+                bundle = pin.bundle_sha256
+            )
+        })?;
+        verify_plan_bundle(pin, ctx.resolver, ctx.trust)
+            .with_context(|| format!("bundle re-verify for pin {}", pin.bundle_sha256))?;
+    }
+
     Ok(AdmittedPlan {
         plan_id: verified.plan_id.clone(),
         signer_id,
@@ -204,6 +238,7 @@ mod tests {
             boot_timeout_secs: 30,
             exec_timeout_secs: 0,
             destroy_on_exit: true,
+            bundle_pin: None,
         }
     }
 
@@ -220,8 +255,14 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let clock = SystemClock;
         let ledger = InMemoryNonceLedger::new();
-        let admitted = admit_for_run(&fixture_input("vm1"), &clock, &ledger, Some(dir.path()))
-            .expect("happy path");
+        let admitted = admit_for_run(
+            &fixture_input("vm1"),
+            &clock,
+            &ledger,
+            Some(dir.path()),
+            None,
+        )
+        .expect("happy path");
         assert!(!admitted.plan_id.0.is_empty());
         assert!(admitted.signer_id.starts_with("host:"));
         // The signed envelope must be re-verifiable with the public
@@ -289,6 +330,7 @@ mod tests {
             &SystemClock,
             &InMemoryNonceLedger::new(),
             Some(dir.path()),
+            None,
         )
         .unwrap();
         // The signed field is what W4's audit signer will hash;
@@ -307,6 +349,7 @@ mod tests {
             &SystemClock,
             &InMemoryNonceLedger::new(),
             Some(dir.path()),
+            None,
         )
         .expect_err("must refuse");
         assert!(
@@ -320,9 +363,230 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let clock = SystemClock;
         let ledger = InMemoryNonceLedger::new();
-        let a1 = admit_for_run(&fixture_input("vm1"), &clock, &ledger, Some(dir.path())).unwrap();
-        let a2 = admit_for_run(&fixture_input("vm1"), &clock, &ledger, Some(dir.path())).unwrap();
+        let a1 = admit_for_run(
+            &fixture_input("vm1"),
+            &clock,
+            &ledger,
+            Some(dir.path()),
+            None,
+        )
+        .unwrap();
+        let a2 = admit_for_run(
+            &fixture_input("vm1"),
+            &clock,
+            &ledger,
+            Some(dir.path()),
+            None,
+        )
+        .unwrap();
         assert_ne!(a1.plan_id, a2.plan_id);
         assert_ne!(a1.plan.nonce, a2.plan.nonce);
+    }
+
+    // ── ADR-002 claim 9: admit-time bundle re-verify ─────────────
+    //
+    // Tests exercise the boundary between `synthesize_plan`'s
+    // `bundle_pin` (the input) and `admit_for_run`'s
+    // `BundleAdmissionContext` (the verifier seam). The mvm_plan
+    // bundle module already tests every BundleVerifyError /
+    // PlanBundleError variant in isolation; these tests prove the
+    // wiring fires when admit_for_run sees a pinned plan.
+
+    use mvm_plan::bundle::{
+        BundleResolveError, BundleResolver, KeyId as BundleKeyId, PlanArtifact, TrustStore,
+        bundle_sha256, write_bundle,
+    };
+    use std::collections::HashMap;
+
+    struct FixedResolver(Vec<u8>);
+    impl BundleResolver for FixedResolver {
+        fn resolve(&self, _bundle_sha256: &str) -> Result<Vec<u8>, BundleResolveError> {
+            Ok(self.0.clone())
+        }
+    }
+
+    struct MapTrust(HashMap<BundleKeyId, ed25519_dalek::VerifyingKey>);
+    impl TrustStore for MapTrust {
+        fn lookup(&self, key_id: &BundleKeyId) -> Option<ed25519_dalek::VerifyingKey> {
+            self.0.get(key_id).copied()
+        }
+    }
+
+    /// Build a minimal signed bundle around `(kernel, rootfs)` bytes.
+    /// Returns the archive plus the matching `PlanArtifact` pin.
+    fn make_test_bundle(
+        sk: &ed25519_dalek::SigningKey,
+        kernel: &[u8],
+        rootfs: &[u8],
+    ) -> (Vec<u8>, PlanArtifact) {
+        use mvm_plan::bundle::{
+            ARTIFACTS_DIR, ArtifactRole, BUNDLE_SCHEMA_VERSION, BundleArtifact, BundleManifest,
+            sha256_hex,
+        };
+        let key_id = BundleKeyId::from_pubkey(&sk.verifying_key());
+        let make_art = |name: &str, role: ArtifactRole, bytes: &[u8]| BundleArtifact {
+            name: name.to_string(),
+            role,
+            path: format!("{ARTIFACTS_DIR}/{name}"),
+            sha256: sha256_hex(bytes),
+            size_bytes: bytes.len() as u64,
+        };
+        let manifest = BundleManifest {
+            schema_version: BUNDLE_SCHEMA_VERSION,
+            publisher: "test".to_string(),
+            key_id: key_id.clone(),
+            arch: "aarch64".to_string(),
+            kernel_version: None,
+            profile: None,
+            workload_label: None,
+            created_at: "2026-05-13T00:00:00Z".to_string(),
+            labels: std::collections::BTreeMap::new(),
+            artifacts: vec![
+                make_art("vmlinux", ArtifactRole::Kernel, kernel),
+                make_art("rootfs.ext4", ArtifactRole::Rootfs, rootfs),
+            ],
+            verity: None,
+        };
+        let archive = write_bundle(
+            &manifest,
+            sk,
+            vec![
+                (format!("{ARTIFACTS_DIR}/vmlinux"), kernel.to_vec()),
+                (format!("{ARTIFACTS_DIR}/rootfs.ext4"), rootfs.to_vec()),
+            ],
+        )
+        .expect("write_bundle");
+
+        // Recover the signature bytes from the archive for the pin.
+        let mut sig_bytes: Vec<u8> = Vec::new();
+        let mut a = tar::Archive::new(std::io::Cursor::new(&archive));
+        for entry in a.entries().unwrap() {
+            let mut entry = entry.unwrap();
+            if entry.path().unwrap().to_string_lossy() == "manifest.sig" {
+                std::io::Read::read_to_end(&mut entry, &mut sig_bytes).unwrap();
+                break;
+            }
+        }
+        let sig_arr: [u8; 64] = sig_bytes.as_slice().try_into().unwrap();
+        let pin = PlanArtifact::new(bundle_sha256(&archive), &sig_arr, key_id);
+        (archive, pin)
+    }
+
+    fn input_with_pin<'a>(vm_name: &'a str, pin: &PlanArtifact) -> SynthesisInput<'a> {
+        let mut input = fixture_input(vm_name);
+        input.bundle_pin = Some(pin.clone());
+        input
+    }
+
+    #[test]
+    fn admit_with_clean_pinned_bundle_passes() {
+        // Generate the publisher key out of band, build a bundle,
+        // enrol the pubkey in the trust store, hand admit_for_run a
+        // matching pin + context.
+        let dir = tempfile::tempdir().unwrap();
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (archive, pin) = make_test_bundle(&sk, b"kernel-bytes", b"rootfs-bytes");
+        let mut map = HashMap::new();
+        let key_id = BundleKeyId::from_pubkey(&sk.verifying_key());
+        map.insert(key_id, sk.verifying_key());
+        let trust = MapTrust(map);
+        let resolver = FixedResolver(archive);
+        let ctx = BundleAdmissionContext {
+            resolver: &resolver,
+            trust: &trust,
+        };
+        let admitted = admit_for_run(
+            &input_with_pin("vm-pinned", &pin),
+            &SystemClock,
+            &InMemoryNonceLedger::new(),
+            Some(dir.path()),
+            Some(&ctx),
+        )
+        .expect("clean pin admits");
+        assert!(admitted.plan.bundle.is_some());
+    }
+
+    #[test]
+    fn admit_with_pin_but_no_context_refuses() {
+        // Publisher misconfiguration: plan carries a pin but the
+        // mvmctl up path didn't wire a BundleAdmissionContext. The
+        // admit path refuses rather than silently skipping the
+        // re-verify step (fail closed, not fail open).
+        let dir = tempfile::tempdir().unwrap();
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (_archive, pin) = make_test_bundle(&sk, b"k", b"r");
+        let err = admit_for_run(
+            &input_with_pin("vm-no-ctx", &pin),
+            &SystemClock,
+            &InMemoryNonceLedger::new(),
+            Some(dir.path()),
+            None,
+        )
+        .expect_err("must refuse without context");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("BundleAdmissionContext"), "got: {msg}");
+    }
+
+    #[test]
+    fn admit_with_unknown_publisher_in_trust_store_refuses() {
+        let dir = tempfile::tempdir().unwrap();
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (archive, pin) = make_test_bundle(&sk, b"k", b"r");
+        // Empty trust store — publisher's key_id is unknown locally.
+        let trust = MapTrust(HashMap::new());
+        let resolver = FixedResolver(archive);
+        let ctx = BundleAdmissionContext {
+            resolver: &resolver,
+            trust: &trust,
+        };
+        let err = admit_for_run(
+            &input_with_pin("vm-untrusted", &pin),
+            &SystemClock,
+            &InMemoryNonceLedger::new(),
+            Some(dir.path()),
+            Some(&ctx),
+        )
+        .expect_err("must refuse unknown publisher");
+        let msg = format!("{err:#}");
+        // The error chain bubbles up the BundleVerifyError::UnknownKey
+        // variant from the read_and_verify pass.
+        assert!(
+            err.chain().any(|e| e.to_string().contains("key_id")),
+            "expected key_id mention; got: {msg}"
+        );
+    }
+
+    #[test]
+    fn admit_with_pin_mismatching_archive_refuses() {
+        // Resolver returns a different archive than the pin describes.
+        // The bundle_sha256 cross-check catches it before the
+        // signature verify even runs.
+        let dir = tempfile::tempdir().unwrap();
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (_archive_a, pin_a) = make_test_bundle(&sk, b"kA", b"rA");
+        let (archive_b, _pin_b) = make_test_bundle(&sk, b"kB", b"rB");
+        let mut map = HashMap::new();
+        map.insert(
+            BundleKeyId::from_pubkey(&sk.verifying_key()),
+            sk.verifying_key(),
+        );
+        let trust = MapTrust(map);
+        let resolver = FixedResolver(archive_b);
+        let ctx = BundleAdmissionContext {
+            resolver: &resolver,
+            trust: &trust,
+        };
+        let err = admit_for_run(
+            &input_with_pin("vm-pin-drift", &pin_a),
+            &SystemClock,
+            &InMemoryNonceLedger::new(),
+            Some(dir.path()),
+            Some(&ctx),
+        )
+        .expect_err("must refuse pin drift");
+        assert!(
+            err.chain().any(|e| e.to_string().contains("sha256")),
+            "expected sha256 mismatch chain; got {err:#}"
+        );
     }
 }

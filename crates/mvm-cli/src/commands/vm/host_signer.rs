@@ -359,6 +359,7 @@ mod tests {
             boot_timeout_secs: 30,
             exec_timeout_secs: 0,
             destroy_on_exit: true,
+            bundle_pin: None,
         })
         .expect("synth");
 

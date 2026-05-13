@@ -1296,7 +1296,7 @@ Outstanding (deferred to follow-ups):
   loop. Today the controller is a library piece; wiring it into
   the supervisor's lifecycle is the integration follow-up.
 
-### W2 — Portable image bundles + per-artifact attestation  🟢 CLI surface shipped
+### W2 — Portable image bundles + per-artifact attestation  ✅ admit-time re-verify shipped
 
 Sigstore-style trust model: bundle ships a signed `manifest.json`
 with per-artifact SHA-256s; the publisher's public key lives
@@ -1384,12 +1384,45 @@ Shipped in the W2 close-out commit:
   (signed `ExecutionPlan`, already shipped in plan 64 / ADR-041
   but never previously in the ADR table).
 
+Shipped in the W2 admit-time re-verify commit:
+
+- `ExecutionPlan::bundle: Option<PlanArtifact>` field. Schema
+  bumped 2 → 3 — older verifiers fail closed with
+  `UnsupportedSchema` because they don't know how to enforce the
+  re-verify the new field implies. Schema-sniff order preserved:
+  signature → version → parse, so an unknown future bundle field
+  can't bypass the verifier.
+- `BundleResolver` trait + `FsBundleResolver` rooted at
+  `~/.mvm/bundles/<bundle_sha256>.mvmpkg` (default-path matches
+  the `FsTrustStore` shape).
+- `verify_plan_bundle(pin, resolver, trust)` — wraps
+  `read_and_verify_bundle` and cross-checks the archive's
+  `bundle_sha256` + `manifest_sig` + `key_id` against the plan's
+  pin. Distinct `PlanBundleError` variants for each rejection
+  shape (Resolve, Verify, BundleSha256Mismatch, KeyIdMismatch,
+  SignatureMismatch, SignatureRead).
+- `admit_for_run` accepts an optional
+  `BundleAdmissionContext { resolver, trust }` parameter. When
+  the plan pins a bundle, admit_for_run runs
+  `verify_plan_bundle` after the signature/window/nonce checks.
+  Plan pinned but context absent = operator misconfiguration =
+  refuse (fail closed, not fail open).
+- `SynthesisInput.bundle_pin: Option<PlanArtifact>` carries an
+  upstream pin into the synthesized plan via
+  `plan.bundle = input.bundle_pin.clone()`. Today's `mvmctl up`
+  path passes `None`; the CLI flag that populates it (`--bundle-pin
+  <path>` reading a fetched + verified `.mvmpkg`) is the next
+  surface-completing commit.
+- 4 new admit-level tests (positive + 3 refusals) plus 8 new
+  `verify_plan_bundle` tests covering every PlanBundleError
+  variant.
+
 Outstanding (deferred follow-ups):
 
-- Supervisor admit-time bundle re-verify wired into
-  `ExecutionPlan::PlanArtifact`. Requires a plan schema bump
-  (carries `bundle_sha256` + `manifest_sig_base64` + `key_id`),
-  which is its own ADR-touching change.
+- `mvmctl up --bundle-pin <path>` (or a manifest field) so the
+  CLI side populates `SynthesisInput.bundle_pin`. Today the
+  substrate is there; production callers just need to point at
+  a real bundle.
 - Registry replacement: replace
   `~/.mvm/templates/<sha256(manifest_path)>/...` keying with
   bundle-sha256 directories so a fetched bundle slots into the

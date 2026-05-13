@@ -616,6 +616,7 @@ mod tests {
             valid_from: now,
             valid_until: now + chrono::Duration::minutes(10),
             nonce: Nonce::from_bytes([0u8; 16]),
+            bundle: None,
         }
     }
 
