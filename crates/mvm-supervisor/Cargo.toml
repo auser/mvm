@@ -55,7 +55,9 @@ reqwest = { workspace = true }
 # production DnsResolver impl. Tests use only `macros + rt`, the
 # proxy needs `net` for lookup. `rt-multi-thread` lands when the
 # TCP listener loop ships in 2.6 chunk (c).
-tokio = { workspace = true, features = ["net", "rt"] }
+# Sprint 52 W1 follow-on: balloon_runtime spawns a periodic
+# `tokio::time::sleep`-driven tick loop, hence the `time` feature.
+tokio = { workspace = true, features = ["net", "rt", "time", "sync"] }
 tracing.workspace = true
 
 # Plan 60 Phase 7 staging tools: `O_NOFOLLOW` on read/write opens
@@ -68,7 +70,7 @@ libc.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time"] }
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync", "test-util"] }
 
 [lints]
 workspace = true

@@ -38,6 +38,7 @@ pub mod audit_file;
 pub mod audit_recorder;
 pub mod backend;
 pub mod balloon;
+pub mod balloon_runtime;
 pub mod circuit_breaker;
 pub mod destination;
 pub mod egress;
@@ -72,6 +73,7 @@ pub use audit_recorder::{
     UNBOUND_PLAN_ID,
 };
 pub use backend::{BackendError, BackendLauncher, NoopBackendLauncher};
+pub use balloon_runtime::{BalloonRuntimeConfig, run_balloon_loop, run_one_tick};
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitState, Clock as CircuitBreakerClock,
     InspectorReporter, SystemClock as CircuitBreakerSystemClock,
