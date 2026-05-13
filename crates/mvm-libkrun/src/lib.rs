@@ -26,7 +26,7 @@ use std::path::{Path, PathBuf};
 mod sys;
 
 #[cfg(feature = "libkrun-sys")]
-pub use sys::{KernelFormat, LogLevel};
+pub use sys::{KernelFormat, LogLevel, set_log_level};
 
 /// Errors returned by this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]

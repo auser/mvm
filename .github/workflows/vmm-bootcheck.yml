@@ -171,13 +171,21 @@ jobs:
           sudo mv cloud-hypervisor /usr/local/bin/cloud-hypervisor
           cloud-hypervisor --version
 
-      - name: Confirm /dev/kvm is exposed
+      - name: Confirm /dev/kvm is exposed and grant runner access
+        # On `ubuntu-latest` /dev/kvm is owned `root:kvm` mode 0660;
+        # the runner user isn't in the kvm group so cloud-hypervisor
+        # gets EACCES. `chmod 666` for the duration of this job is the
+        # canonical GHA fix (used by every published KVM-based CI
+        # recipe). The runner is ephemeral so widening the mode is
+        # confined to this VM.
         run: |
           set -euo pipefail
           if [ ! -e /dev/kvm ]; then
             echo "::error::/dev/kvm is missing on this runner. Cloud-hypervisor cannot run without KVM."
             exit 1
           fi
+          ls -la /dev/kvm
+          sudo chmod 666 /dev/kvm
           ls -la /dev/kvm
 
       - name: Download dev image (x86_64)

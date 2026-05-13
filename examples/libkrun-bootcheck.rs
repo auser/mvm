@@ -215,6 +215,16 @@ fn run_child() {
     let console = std::env::var(CONSOLE_ENV).expect("child requires CONSOLE");
     let cmdline = std::env::var(CMDLINE_ENV).expect("child requires CMDLINE");
 
+    // Crank libkrun's internal log level — when the FFI rejects a
+    // call we want to see *which* one and *why*, not just rc -22 in
+    // the wrapper. Failure to set is non-fatal: we'd rather attempt
+    // the boot with default logging than abort here.
+    if let Err(e) = mvm_libkrun::set_log_level(mvm_libkrun::LogLevel::Debug) {
+        eprintln!("[bootcheck child] set_log_level(Debug) failed (continuing): {e}");
+    } else {
+        eprintln!("[bootcheck child] libkrun log level = Debug");
+    }
+
     let ctx = KrunContext::new("bootcheck", &kernel, &rootfs)
         .with_resources(1, 256)
         .with_kernel_cmdline(&cmdline)
