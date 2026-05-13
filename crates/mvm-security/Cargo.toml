@@ -10,10 +10,11 @@ authors.workspace = true
 
 [features]
 # Enables cosign-keyless manifest verification via the sigstore Rust crate.
-# Default-on for release builds; disable with --no-default-features for a
-# smaller binary at the cost of a fail-closed `verify_manifest` stub.
+# Opt-in because Sigstore pulls a large OIDC/TUF/Rekor dependency graph.
+# Builds without it keep the same public API, but `verify_manifest` and
+# `verify_signed_payload` fail closed.
 # Plan 36 / ADR 005.
-default = ["manifest-verify"]
+default = []
 manifest-verify = ["dep:sigstore", "dep:tokio"]
 
 # Hardware attestation provider stubs (plan 60 Phase 6).
