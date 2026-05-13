@@ -604,7 +604,7 @@ let
   # but with the strip step interposed before mkfs and a final
   # `resize2fs -M` to compact the freed space.
   rootfsImage = pkgs.runCommand "mvm-rootfs-${name}.ext4" {
-    nativeBuildInputs = [ pkgs.e2fsprogs ];
+    nativeBuildInputs = [ pkgs.e2fsprogs pkgs.binutils pkgs.util-linux ];
     closureInfo = pkgs.closureInfo { rootPaths = [ rootfsTree ]; };
   } ''
     set -eu
@@ -615,6 +615,15 @@ let
     # /etc/* metadata, /lib/modules tree if any).
     cp -a --reflink=auto ${rootfsTree}/. ./files/
 
+    # `cp -a` propagated the rootfsTree's read-only directory modes
+    # (everything in /nix/store is mode 0555) to the populated
+    # subtree, including `./files/` itself in some cp variants.
+    # Without flipping back to writable, the closure-copy step
+    # below fails with "cannot create regular file ...: Permission
+    # denied". The mkfs step at the end snapshots the final modes
+    # so this only affects the in-build staging dir.
+    chmod -R u+w ./files
+
     # 2. Bring in the transitive nix-store closure. Mirrors what
     # `make-ext4-fs.nix` does internally.
     cp $closureInfo/registration ./files/nix-path-registration
@@ -624,7 +633,7 @@ let
       cp -dpRn --reflink=auto "$p" "$target" || true
     done < $closureInfo/store-paths
 
-    # 3. Strip the inert documentation/locale content from every
+    # 3a. Strip the inert documentation/locale content from every
     # store path. ~80-150 MB savings depending on closure shape.
     # `find -prune` so we don't descend into the about-to-be-deleted
     # directories. The `|| true`s are belt-and-braces: a missing
@@ -636,6 +645,42 @@ let
       find ./files/nix/store -mindepth 3 -maxdepth 3 -type d -name "$sub" \
         -path "*/share/$sub" -prune -exec rm -rf {} + 2>/dev/null || true
     done
+
+    # 3b. ELF binary strip. `strip --strip-unneeded` drops debug
+    # symbols and unused symbol-table entries from ELF executables
+    # + shared libraries inside the closure. Typical win is 5-15%
+    # per binary; aggregated across a closure of nix + git + perl +
+    # rust toolchain, that's ~10-25 MB.
+    #
+    # Defensive: skip non-ELF files (busybox applet symlinks, scripts,
+    # `.ko*` kernel modules — those have their own strip mechanism
+    # and are already xz-compressed), skip already-stripped files
+    # (the `--strip-unneeded` is no-op then anyway), continue past
+    # any single file's failure. We use the magic-byte check rather
+    # than `file` so we don't pull in libmagic.
+    is_elf() {
+      head -c 4 "$1" 2>/dev/null | od -An -c | tr -d ' \n' \
+        | grep -qE '^.177ELF'
+    }
+    find ./files/nix/store -type f \
+      \( -path '*/bin/*' -o -path '*/sbin/*' -o -path '*/lib/*' \
+         -o -path '*/libexec/*' \) \
+      ! -name '*.ko' ! -name '*.ko.xz' ! -name '*.ko.zst' \
+      ! -name '*.py' ! -name '*.pl' ! -name '*.sh' \
+      | while read -r f; do
+          [ -L "$f" ] && continue
+          is_elf "$f" || continue
+          strip --strip-unneeded "$f" 2>/dev/null || true
+        done
+
+    # 3c. Hardlink-dedupe identical files across the closure. nixpkgs
+    # builds with deterministic output, so e.g. `/share/zoneinfo/UTC`
+    # is byte-for-byte the same in glibc-2.40, glibc-2.41, in the
+    # man-db output even after our /share strip didn't catch it,
+    # etc. `util-linux`'s `hardlink` walks the tree and replaces
+    # byte-equal regular files with hardlinks to a single inode.
+    # Typical win: 5-15 MB across a closure of this size.
+    hardlink -q ./files/nix/store 2>/dev/null || true
 
     # 4. Size: content + 10% slack + 16 MiB metadata floor.
     # mkfs.ext4 needs a pre-sized output file.
