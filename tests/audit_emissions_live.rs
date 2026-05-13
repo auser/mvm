@@ -75,6 +75,11 @@
 //!   entry (the `ATTEST` leaves are all ReadOnly)
 //! - `mvmctl session ls` / `volume ls <vm>` → **no** audit entry
 //!   (SESSION ls and VOLUME ls leaves are both ReadOnly)
+//! - `mvmctl volume mount <vm> ...` → `VmVolumeAdd` (Plan 67:
+//!   the verb operates purely on the host-side
+//!   `~/.mvm/instances/<vm>/volume_mounts.json` registry — no
+//!   virtio-fs daemon attach, no backend dispatch)
+//! - `mvmctl volume unmount <vm> <guest>` → `VmVolumeRemove`
 //! - `mvmctl ls` / `metrics` / `catalog list` → **no** audit entry
 //!   (top-level ReadOnly verbs — three more rows from
 //!   `AUDIT_POSTURE` pinned against a future regression that
@@ -1333,6 +1338,105 @@ fn volume_ls_does_not_emit_audit_entry() {
         log.is_empty(),
         "read-only `volume ls` must not write to the LocalAudit \
          stream. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn volume_mount_emits_vm_volume_add_audit_entry() {
+    // Plan 67: `volume mount` operates purely on the host-side
+    // `~/.mvm/instances/<vm>/volume_mounts.json` registry — no
+    // virtio-fs daemon attach, no Firecracker socket. The audit
+    // emit fires after the registry write. Hermetic out of the box.
+    let sandbox = AuditSandbox::new();
+    let host_share = sandbox.home_path().join("share");
+    std::fs::create_dir_all(&host_share).expect("mkdir host share");
+
+    let output = sandbox
+        .mvmctl()
+        .args([
+            "volume",
+            "mount",
+            "vol-test-vm",
+            "--volume",
+            "mydata",
+            "--host",
+            host_share.to_str().expect("utf-8 path"),
+            "--guest",
+            "/mnt/data",
+        ])
+        .output()
+        .expect("spawn mvmctl volume mount");
+    assert!(
+        output.status.success(),
+        "mvmctl volume mount failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_volume_add");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_volume_add entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("\"vm_name\":\"vol-test-vm\""),
+        "vm_volume_add must carry vm_name=vol-test-vm. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("guest=/mnt/data"),
+        "vm_volume_add detail must record guest=/mnt/data. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn volume_unmount_emits_vm_volume_remove_audit_entry() {
+    // Plan 67: mount-then-unmount round-trip. Both emits land in
+    // the LocalAudit stream; this test pins the remove half.
+    let sandbox = AuditSandbox::new();
+    let host_share = sandbox.home_path().join("share");
+    std::fs::create_dir_all(&host_share).expect("mkdir host share");
+
+    let mount = sandbox
+        .mvmctl()
+        .args([
+            "volume",
+            "mount",
+            "vol-rm-vm",
+            "--volume",
+            "mydata",
+            "--host",
+            host_share.to_str().expect("utf-8 path"),
+            "--guest",
+            "/mnt/data",
+        ])
+        .output()
+        .expect("spawn mvmctl volume mount");
+    assert!(
+        mount.status.success(),
+        "mvmctl volume mount failed: stderr={}",
+        String::from_utf8_lossy(&mount.stderr)
+    );
+
+    let unmount = sandbox
+        .mvmctl()
+        .args(["volume", "unmount", "vol-rm-vm", "/mnt/data"])
+        .output()
+        .expect("spawn mvmctl volume unmount");
+    assert!(
+        unmount.status.success(),
+        "mvmctl volume unmount failed: stderr={}",
+        String::from_utf8_lossy(&unmount.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_volume_remove");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_volume_remove entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("\"vm_name\":\"vol-rm-vm\""),
+        "vm_volume_remove must carry vm_name=vol-rm-vm. Full log:\n{log}"
     );
 }
 
