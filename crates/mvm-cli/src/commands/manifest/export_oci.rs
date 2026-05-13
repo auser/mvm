@@ -89,11 +89,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     })?;
     let bytes = std::fs::metadata(&args.out).map(|m| m.len()).unwrap_or(0);
 
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::ImageExportOci,
-        None,
-        Some(&format!("template={slot_hash},bytes={bytes}")),
-    );
+    mvm_core::audit_emit!(ImageExportOci, "template={slot_hash},bytes={bytes}");
 
     println!(
         "Exported OCI tarball to {} ({} bytes)",
