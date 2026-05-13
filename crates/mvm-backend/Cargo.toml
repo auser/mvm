@@ -45,9 +45,9 @@ anyhow.workspace = true
 # microsandbox pulls sqlx-sqlite -> libsqlite3-sys (links = "sqlite3"),
 # which collides with library consumers that already link sqlite via a
 # different libsqlite3-sys version (notably mvmd-gateway's rusqlite per
-# its ADR-0003). Gating the dep on `backends-microsandbox` lets those
+# its ADR-0003). Gating the dep on `contributor-bootstrap` lets those
 # consumers skip the collision in lean builds. The backend remains available
-# via `--features backends-microsandbox`.
+# via `--features contributor-bootstrap`.
 microsandbox = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -63,7 +63,7 @@ mvm-build.workspace = true
 [features]
 # Heavy microsandbox support is opt-in for lean default builds.
 default = []
-backends-microsandbox = ["dep:microsandbox"]
+contributor-bootstrap = ["dep:microsandbox"]
 
 [lints]
 workspace = true

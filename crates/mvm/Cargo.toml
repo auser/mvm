@@ -45,9 +45,9 @@ libc.workspace = true
 
 [features]
 default = []
-backends-microsandbox = [
-    "mvm-build/backends-microsandbox",
-    "mvm-backend/backends-microsandbox",
+contributor-bootstrap = [
+    "mvm-build/contributor-bootstrap",
+    "mvm-backend/contributor-bootstrap",
 ]
 manifest-verify = ["mvm-security/manifest-verify"]
 template-registry-s3 = ["dep:opendal"]

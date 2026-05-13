@@ -150,12 +150,12 @@ which = "7"
 # Internal crates.
 #
 # DRIFT-001 (Plan 31 Track A): the four crates that participate in the
-# `backends-microsandbox` feature chain declare `default-features = false`
+# `contributor-bootstrap` feature chain declare `default-features = false`
 # at the workspace level. This is required because member crates can't
 # override `default-features` on a workspace-inherited dep — Cargo accepts
 # the override only when the workspace entry already has the field. The
 # member crates that want the feature active opt back in via the
-# `backends-microsandbox` feature chain (see `crates/mvm-cli/Cargo.toml`
+# `contributor-bootstrap` feature chain (see `crates/mvm-cli/Cargo.toml`
 # and the root `[features]` block below). Library consumers (e.g. mvmd)
 # do `mvmctl = { default-features = false }` and pick up the off-state.
 mvm-core = { path = "crates/mvm-core", version = "0.14.0" }
@@ -212,7 +212,7 @@ mvm-core.workspace = true
 mvm-security.workspace = true
 # `default-features = false` keeps the heavy microsandbox stack out of the
 # lean default binary. Operators who need the libkrun/microsandbox path opt in
-# with `--features backends-microsandbox`.
+# with `--features contributor-bootstrap`.
 mvm = { workspace = true, default-features = false }
 mvm-backend = { workspace = true, default-features = false }
 mvm-build = { workspace = true, default-features = false }
@@ -247,11 +247,11 @@ tokio = { workspace = true, features = ["macros", "rt"] }
 [features]
 # Keep the default production build lean. Heavy integrations remain opt-in.
 default = []
-backends-microsandbox = [
-    "mvm/backends-microsandbox",
-    "mvm-backend/backends-microsandbox",
-    "mvm-build/backends-microsandbox",
-    "mvm-cli/backends-microsandbox",
+contributor-bootstrap = [
+    "mvm/contributor-bootstrap",
+    "mvm-backend/contributor-bootstrap",
+    "mvm-build/contributor-bootstrap",
+    "mvm-cli/contributor-bootstrap",
 ]
 custom-dns = ["mvm-cli/custom-dns"]
 dev-watch = ["mvm-cli/dev-watch"]

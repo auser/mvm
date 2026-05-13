@@ -13,7 +13,7 @@ use crate::cloud_hypervisor::CloudHypervisorBackend;
 use crate::docker::DockerBackend;
 use crate::image::RuntimeVolume;
 use crate::libkrun::LibkrunBackend;
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 use crate::microsandbox::MicrosandboxBackend;
 use crate::microvm::{DriveFile, FlakeRunConfig};
 use crate::mock::MockBackend;
@@ -253,8 +253,8 @@ pub enum AnyBackend {
     Libkrun(LibkrunBackend),
     /// microsandbox (plan 60 — ADR-013) — higher-level libkrun wrapper.
     /// Linux still prefers Firecracker when KVM is available. Gated on
-    /// `backends-microsandbox`, which lean default builds leave disabled.
-    #[cfg(feature = "backends-microsandbox")]
+    /// `contributor-bootstrap`, which lean default builds leave disabled.
+    #[cfg(feature = "contributor-bootstrap")]
     Microsandbox(MicrosandboxBackend),
     /// Cloud Hypervisor — rust-vmm peer of Firecracker at Tier 1. Adds
     /// VFIO passthrough, virtio-gpu, virtio-fs, and larger guests
@@ -297,7 +297,7 @@ impl AnyBackend {
             "apple-container" => Self::AppleContainer(AppleContainerBackend),
             "docker" => Self::Docker(DockerBackend),
             "libkrun" | "krun" => Self::Libkrun(LibkrunBackend),
-            #[cfg(feature = "backends-microsandbox")]
+            #[cfg(feature = "contributor-bootstrap")]
             "microsandbox" | "msb" => Self::Microsandbox(MicrosandboxBackend),
             "cloud-hypervisor" | "cloud_hypervisor" | "ch" | "clh" => {
                 Self::CloudHypervisor(CloudHypervisorBackend)
@@ -315,7 +315,7 @@ impl AnyBackend {
     /// Select the best backend for the current platform.
     ///
     /// Firecracker is the production target — it always wins when KVM
-    /// is available. When `backends-microsandbox` is enabled and KVM is
+    /// is available. When `contributor-bootstrap` is enabled and KVM is
     /// not available, microsandbox is the cross-platform Tier 2 choice.
     /// Lean default builds skip it and continue down the fallback ladder.
     ///
@@ -346,10 +346,10 @@ impl AnyBackend {
         //    without a separate libkrun install. Sits above Apple
         //    Container in the ladder because plan 60 schedules
         //    AppleContainer removal in favor of microsandbox.
-        //    Gated on `backends-microsandbox` — when off, this arm is
+        //    Gated on `contributor-bootstrap` — when off, this arm is
         //    absent and the ladder falls through to Apple Container /
         //    libkrun / Docker.
-        #[cfg(feature = "backends-microsandbox")]
+        #[cfg(feature = "contributor-bootstrap")]
         if plat.has_microsandbox() {
             return Self::Microsandbox(MicrosandboxBackend);
         }
@@ -391,7 +391,7 @@ impl AnyBackend {
             Self::AppleContainer(b) => b,
             Self::Docker(b) => b,
             Self::Libkrun(b) => b,
-            #[cfg(feature = "backends-microsandbox")]
+            #[cfg(feature = "contributor-bootstrap")]
             Self::Microsandbox(b) => b,
             Self::CloudHypervisor(b) => b,
             Self::Mock(b) => b,
@@ -647,7 +647,7 @@ mod tests {
         assert!(p.layer_coverage.is_microvm());
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     #[test]
     fn test_any_backend_from_hypervisor_microsandbox() {
         // Plan 60 ADR-013 — explicit "microsandbox" routing. Both the
@@ -659,7 +659,7 @@ mod tests {
         assert_eq!(short.name(), "microsandbox");
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     #[test]
     fn test_microsandbox_via_any_backend_security_profile_tier_2() {
         // The dispatch must surface the inner backend's full security
@@ -758,7 +758,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     #[test]
     fn test_auto_select_prefers_microsandbox_on_macos() {
         // ADR-013 invariant: on macOS, microsandbox wins over Apple
@@ -777,7 +777,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     #[test]
     fn test_auto_select_returns_microsandbox_when_microsandbox_available_and_no_kvm() {
         // The contract: if has_microsandbox() && !has_kvm(), the
@@ -824,7 +824,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     #[test]
     fn pause_resume_unsupported_on_microsandbox() {
         assert_unsupported_pause_resume(
@@ -865,7 +865,7 @@ mod tests {
         // in — when the feature is off `from_hypervisor("microsandbox")`
         // falls through to Firecracker and the assertion would flip.
         let unsupported: &[&str] = &[
-            #[cfg(feature = "backends-microsandbox")]
+            #[cfg(feature = "contributor-bootstrap")]
             "microsandbox",
             "libkrun",
             "qemu", // → microvm-nix

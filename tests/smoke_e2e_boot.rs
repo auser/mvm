@@ -44,9 +44,9 @@
 //! Both are tracked in Sprint 50.
 
 // Whole-file gate: the e2e boot smoke uses `MicrosandboxBackend`
-// directly. Library-consumer builds disable the `backends-microsandbox`
+// directly. Library-consumer builds disable the `contributor-bootstrap`
 // feature and skip this file entirely.
-#![cfg(feature = "backends-microsandbox")]
+#![cfg(feature = "contributor-bootstrap")]
 
 use std::time::Duration;
 

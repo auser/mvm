@@ -273,26 +273,26 @@ impl BuilderVm for StubBuilderVm {
 }
 
 // =====================================================================
-// microsandbox-backed builder (feature `backends-microsandbox`)
+// microsandbox-backed builder (feature `contributor-bootstrap`)
 //
 // Everything below until `extract_revision_hash` is the microsandbox
 // integration. Library consumers of the `mvmctl` facade can disable the
 // whole block via `default-features = false`; the upstream microsandbox
 // crate pulls sqlx-sqlite which collides with rusqlite-based DBs (see
 // DRIFT-001). The `cfg`-attributes below all reference the single
-// `backends-microsandbox` feature flag.
+// `contributor-bootstrap` feature flag.
 // =====================================================================
 
 /// Default vCPU count for the builder sandbox. Tuned for "fast
 /// enough to feel native on a developer laptop" without saturating
 /// the host. Override via [`MicrosandboxBuilderVm::with_resources`].
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 const BUILDER_DEFAULT_CPUS: u8 = 4;
 
 /// Default memory for the builder sandbox, in MiB. Nix derivations
 /// for guest rootfs builds peak well under 4 GiB; 4096 MiB leaves
 /// headroom for the dev tooling closure plus jobserver fan-out.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 const BUILDER_DEFAULT_MEMORY_MIB: u32 = 4096;
 
 /// Where in the sandbox the user's flake gets bind-mounted.
@@ -330,14 +330,14 @@ pub const BUILDER_GUEST_OUT_DIR: &str = "/out";
 /// - **Snapshot warm-pool.** ADR-013 hints at a future warm-pool of
 ///   pre-loaded builder sandboxes for sub-second cold-start. Out of
 ///   scope here.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 #[derive(Debug, Clone)]
 pub struct MicrosandboxBuilderVm {
     cpus: u8,
     memory_mib: u32,
 }
 
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 impl Default for MicrosandboxBuilderVm {
     fn default() -> Self {
         Self {
@@ -347,7 +347,7 @@ impl Default for MicrosandboxBuilderVm {
     }
 }
 
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 impl MicrosandboxBuilderVm {
     /// Override the default vCPU / memory pair. Useful for CI runners
     /// or low-memory hosts that can't afford the 4 GiB default.
@@ -363,7 +363,7 @@ impl MicrosandboxBuilderVm {
 /// `tokio::Runtime` is built fresh per call so the trait stays
 /// `Send + Sync` and dyn-friendly. Per-call cost (~200 µs) is
 /// dominated by sandbox spawn (~200 ms) so the trade is fine.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -377,7 +377,7 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 /// random — microsandbox uses it as a handle for `Sandbox::get` etc.,
 /// and the sandbox is torn down at the end of `run_build` so name
 /// collisions only matter for concurrent invocations.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 fn sandbox_name(job: &BuilderJob) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let stamp = SystemTime::now()
@@ -397,7 +397,7 @@ fn sandbox_name(job: &BuilderJob) -> String {
 /// the rest of the Lima paths) — kept inline here so the builder
 /// crate doesn't take a dep on a runtime-side helper for one
 /// function.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 fn shell_quote_arg(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\\''"))
 }
@@ -411,12 +411,12 @@ fn shell_quote_arg(input: &str) -> String {
 ///
 /// Returns false on macOS Intel / pre-26 / no-KVM-Linux without
 /// host Nix — the case the microsandbox builder serves.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 fn host_nix_available() -> bool {
     which::which("nix").is_ok()
 }
 
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 impl BuilderVm for MicrosandboxBuilderVm {
     fn host_can_build(&self) -> Result<bool, BuilderVmError> {
         Ok(host_nix_available())
@@ -463,7 +463,7 @@ impl BuilderVm for MicrosandboxBuilderVm {
 /// — CLAUDE.md forbids suppressing that lint, and pulling 9 owned
 /// values across an `await` boundary one by one isn't readable
 /// anyway.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 struct RunBuildParams {
     name: String,
     cpus: u8,
@@ -479,7 +479,7 @@ struct RunBuildParams {
 /// Async body of [`MicrosandboxBuilderVm::run_build`]. Lifted out so
 /// the sync trait method stays narrow and the async surface is
 /// testable in isolation when integration coverage lands.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, BuilderVmError> {
     let RunBuildParams {
         name,
@@ -679,7 +679,7 @@ chmod -R u+w "$out"
 /// two code paths produce the same artifact-dir name for identical
 /// derivations.
 ///
-/// Only `run_build_async` (gated on `backends-microsandbox`) and the
+/// Only `run_build_async` (gated on `contributor-bootstrap`) and the
 /// unit tests exercise this helper; the `#[allow(dead_code)]` keeps
 /// no-default-features library builds warning-clean without forcing
 /// a wider cfg expression.
@@ -892,7 +892,7 @@ mod tests {
         assert_eq!(extract_revision_hash("not-a-store-path"), "not");
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     #[test]
     fn sandbox_name_has_stable_prefix() {
         // Same flake+attr produces the same hash segment; only the
@@ -910,7 +910,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     #[test]
     fn microsandbox_builder_has_sensible_defaults() {
         let b = MicrosandboxBuilderVm::default();
@@ -918,7 +918,7 @@ mod tests {
         assert_eq!(b.memory_mib, BUILDER_DEFAULT_MEMORY_MIB);
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     #[test]
     fn microsandbox_builder_with_resources_overrides() {
         let b = MicrosandboxBuilderVm::default().with_resources(2, 2048);
@@ -926,7 +926,7 @@ mod tests {
         assert_eq!(b.memory_mib, 2048);
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     #[test]
     fn shell_quote_arg_escapes_single_quotes() {
         assert_eq!(shell_quote_arg("simple"), "'simple'");
@@ -935,7 +935,7 @@ mod tests {
         assert_eq!(shell_quote_arg("it's"), "'it'\\''s'");
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     #[test]
     fn run_build_validates_missing_flake_src() {
         // Skip the path that actually spawns microsandbox — just
@@ -962,7 +962,7 @@ mod tests {
         assert!(err.to_string().contains("does not exist"), "msg: {err}");
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     #[test]
     fn host_can_build_is_a_pure_pathfn() {
         // Result depends on whether the test runner has `nix` on

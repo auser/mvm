@@ -32,7 +32,7 @@ If plan 57 stalls, **W0 still ships standalone** — the three sandbox-correctne
 5. Exits 0 with no manual intervention.
 6. Cold cache: completes in <8 min on a sustained 100 Mb/s connection.
 7. Warm cache (`/nix` virtio-blk preserved from a prior run): rebuilds unchanged dev image in <30 s.
-8. `cargo metadata --features ''` shows no `microsandbox*` crate in the default-feature closure of `mvmctl`. `--features backends-microsandbox` still compiles for the deprecation window.
+8. `cargo metadata --features ''` shows no `microsandbox*` crate in the default-feature closure of `mvmctl`. `--features contributor-bootstrap` still compiles for the deprecation window.
 9. CI passes the workspace + clippy + every plan-71-introduced live test on macOS aarch64 and Linux x86_64.
 
 When all nine hold, ADR-046 flips from Proposed to Accepted and the plan moves to `specs/backlog/`.
@@ -123,7 +123,7 @@ impl BuilderVm for LibkrunBuilderVm {
 
 ### Feature gate
 
-`backends-builder-vm-libkrun` (new). Default-off in this phase. `mvmctl` keeps using `backends-microsandbox` by default until W5 flips the polarity.
+`backends-builder-vm-libkrun` (new). Default-off in this phase. `mvmctl` keeps using `contributor-bootstrap` by default until W5 flips the polarity.
 
 ### W1 acceptance
 
@@ -289,7 +289,7 @@ Reshape `ensure_dev_image` to encode the two-layer artifact rule from ADR-046 §
 ### Feature flag polarity
 
 - `backends-builder-vm-libkrun` becomes the new default — covers Layer 1 + Layer 2 on user-facing paths.
-- `backends-microsandbox` is renamed `contributor-bootstrap` to make its scope explicit:
+- `contributor-bootstrap` is renamed `contributor-bootstrap` to make its scope explicit:
   - Off by default.
   - On, it adds **only** the Stage 0.b microsandbox launcher for building the in-repo `nix/images/builder-vm/flake.nix`. It is *not* a runtime backend, *not* selectable via `--hypervisor microsandbox`, and *not* called for user-facing builds.
   - This rename happens in W5 — code that's left behind for end-user-facing fallback in earlier phases gets deleted here as part of the cutover. End users without libkrun get an install hint, not a microsandbox fallback.

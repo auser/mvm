@@ -44,10 +44,10 @@ use anyhow::Result;
 // `VmBackend` + `VmId` are only used to call `MicrosandboxBackend::stop`
 // when the feature is on. Gated with the import to avoid an unused-import
 // warning on no-default-features builds.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 use mvm_core::vm_backend::{VmBackend, VmId};
 
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 use crate::MicrosandboxBackend;
 
 /// Metadata kept for each attached sandbox. The map's key is the
@@ -122,7 +122,7 @@ pub fn stop_all_attached() -> Vec<String> {
     if names.is_empty() {
         return names;
     }
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     {
         let backend = MicrosandboxBackend;
         for name in &names {
@@ -138,7 +138,7 @@ pub fn stop_all_attached() -> Vec<String> {
             deregister(name);
         }
     }
-    #[cfg(not(feature = "backends-microsandbox"))]
+    #[cfg(not(feature = "contributor-bootstrap"))]
     {
         // Without the microsandbox backend, the registry is never
         // populated by any internal code — but `register_attached` is

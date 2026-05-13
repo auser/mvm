@@ -16,7 +16,7 @@ chrono.workspace = true
 # Optional — see the same dep in `mvm-backend/Cargo.toml` for the
 # sqlite-link-conflict rationale. `MicrosandboxBuilderVm` and its async
 # runner are the only consumers in this crate; both gate behind
-# `backends-microsandbox`. The non-microsandbox helpers (`ArtifactSidecar`,
+# `contributor-bootstrap`. The non-microsandbox helpers (`ArtifactSidecar`,
 # `emit_sidecar_via_passthru_query`, builder-dir constants) stay
 # unconditional so `mvm-base` and `pipeline::dev_build` keep compiling
 # either way.
@@ -36,7 +36,7 @@ tempfile.workspace = true
 [features]
 # Heavy microsandbox support is opt-in for lean default builds.
 default = []
-backends-microsandbox = ["dep:microsandbox"]
+contributor-bootstrap = ["dep:microsandbox"]
 
 [lints]
 workspace = true
