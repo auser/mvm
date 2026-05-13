@@ -117,7 +117,7 @@ pub trait SnapshotIO {
 /// 3. Tighten file modes to 0600.
 /// 4. Bump the per-instance epoch counter.
 /// 5. Seal the HMAC envelope with the new epoch.
-pub fn pause_and_seal<IO: SnapshotIO>(vm_name: &str, io: &IO) -> Result<IntegritySidecar> {
+pub fn pause_and_seal<IO: SnapshotIO + ?Sized>(vm_name: &str, io: &IO) -> Result<IntegritySidecar> {
     let dir = prepare_instance_snapshot_dir(vm_name)?;
     io.create_snapshot(&dir)
         .with_context(|| format!("Firecracker create_snapshot({})", dir.display()))?;
@@ -159,7 +159,10 @@ pub fn pause_and_seal<IO: SnapshotIO>(vm_name: &str, io: &IO) -> Result<Integrit
 ///
 /// Returns the verified sidecar so the caller can audit it before
 /// resuming Firecracker.
-pub fn verify_and_resume<IO: SnapshotIO>(vm_name: &str, io: &IO) -> Result<IntegritySidecar> {
+pub fn verify_and_resume<IO: SnapshotIO + ?Sized>(
+    vm_name: &str,
+    io: &IO,
+) -> Result<IntegritySidecar> {
     let dir = snapshot_dir(vm_name);
     if !dir.exists() {
         bail!(

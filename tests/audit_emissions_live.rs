@@ -50,6 +50,15 @@
 //! - `mvmctl set-ttl <vm> <duration>` (after `up --hypervisor mock`)
 //!   → `VmTtlSet` (chains off the up-via-mock fixture; the verb
 //!   operates on the persistent name registry that `up` populates)
+//! - `mvmctl pause <vm> --hypervisor mock` (after `up`) →
+//!   `WorkloadSleep` (Plan 65: pause routes through the SnapshotIO
+//!   trait; `--hypervisor mock` swaps in `CannedIO` so the seal
+//!   step writes deterministic 12-byte vmstate + 8-byte mem stubs
+//!   instead of talking to a real Firecracker UDS)
+//! - `mvmctl resume <vm> --hypervisor mock` (after `pause`) →
+//!   `WorkloadWake` (mirrors; verify-and-resume against the sealed
+//!   sidecar succeeds because the seal was written under
+//!   deterministic-stubs round-trip)
 //! - `mvmctl down` (no args, empty sandbox) → `VmStop`
 //!   (`stop_all` is tolerant of an empty VM registry and emits
 //!   with `detail=stop_all_ok`)
@@ -900,6 +909,86 @@ fn set_ttl_clear_emits_vm_ttl_set_with_cleared_detail() {
     assert!(
         log.contains("expires_at=cleared"),
         "set-ttl --clear must record expires_at=cleared. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn pause_emits_workload_sleep_audit_entry() {
+    // Plan 65 W3: `mvmctl pause --hypervisor mock` exercises the
+    // snapshot-and-seal path against `CannedIO` (deterministic
+    // 12-byte vmstate + 8-byte mem stubs). Pre-Plan-65 the verb
+    // would have bailed on `resolve_running_vm_dir` because the
+    // mock VM has no Lima-shaped vm_dir; the `--hypervisor mock`
+    // selector routes through `MockBackend::vm_dir(name)` instead.
+    let sandbox = AuditSandbox::new();
+    bring_up_mock_vm(&sandbox, "pause-vm");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["pause", "pause-vm", "--hypervisor", "mock"])
+        .output()
+        .expect("spawn mvmctl pause");
+    assert!(
+        output.status.success(),
+        "mvmctl pause failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "workload_sleep");
+    assert!(
+        hits >= 1,
+        "expected ≥1 workload_sleep entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("\"vm_name\":\"pause-vm\""),
+        "workload_sleep must carry vm_name=pause-vm. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("epoch="),
+        "workload_sleep detail must record the epoch. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn resume_emits_workload_wake_audit_entry() {
+    // Plan 65 W3: pause-then-resume against the mock backend.
+    // The seal-and-verify round-trip works because `CannedIO`
+    // writes its stubs to disk and `verify_and_resume` reads
+    // them back through the same HMAC-sealed sidecar.
+    let sandbox = AuditSandbox::new();
+    bring_up_mock_vm(&sandbox, "resume-vm");
+
+    let pause = sandbox
+        .mvmctl()
+        .args(["pause", "resume-vm", "--hypervisor", "mock"])
+        .output()
+        .expect("spawn mvmctl pause");
+    assert!(
+        pause.status.success(),
+        "mvmctl pause failed: stderr={}",
+        String::from_utf8_lossy(&pause.stderr)
+    );
+    let resume = sandbox
+        .mvmctl()
+        .args(["resume", "resume-vm", "--hypervisor", "mock"])
+        .output()
+        .expect("spawn mvmctl resume");
+    assert!(
+        resume.status.success(),
+        "mvmctl resume failed: stderr={}",
+        String::from_utf8_lossy(&resume.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "workload_wake");
+    assert!(
+        hits >= 1,
+        "expected ≥1 workload_wake entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("\"vm_name\":\"resume-vm\""),
+        "workload_wake must carry vm_name=resume-vm. Full log:\n{log}"
     );
 }
 
