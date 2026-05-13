@@ -65,7 +65,7 @@ Goal: `mvmctl` + libkrun + `Hypervisor.framework` boot a guest without the macOS
 
 ### W3 — End-to-end boot validation (the actual spike, 2–3 days)
 
-> Status update 2026-05-13: **W3.1, W3.2, W3.4 (cmdline + console) shipped.** W3.3 (vsock health check) deferred to a follow-on PR — see "Findings" below for why.
+> Status update 2026-05-13: **W3.1, W3.2, W3.4 (cmdline + console) shipped in PR #154.** W3.3 vsock plumbing decision shipped in the follow-on PR; the host-side listener + full guest-agent ping still wait on W4's process-lifecycle work. See "Findings" + "W3.3 follow-up" below.
 
 Goal: prove a real Nix-built kernel + ext4 rootfs boots in libkrun on macOS Apple Silicon and the guest agent comes up on vsock.
 
@@ -105,6 +105,16 @@ What's **deferred to a follow-on PR (W3.3)**:
 - A vsock health-check ping against `mvm_guest::vsock::GUEST_AGENT_PORT` from the host. `krun_start_enter` consumes the calling process (calls `exit()` on success), so the ping has to come from a sibling process or fork. The W4 supervisor-thread / launchd lane resolves the process-lifecycle side of this naturally.
 
 Decision recorded: **the libkrun macOS Apple Silicon path is viable.** Plan 72 (builder-VM-via-libkrun) is unblocked on the boot side; the remaining wiring is state-tracking (W4) and CI (W5).
+
+#### W3.3 follow-up — vsock plumbing decision, 2026-05-13
+
+After reading the libkrun upstream README (Homebrew ships it as `/opt/homebrew/Cellar/libkrun/1.17.4/README.md`) and an empty-listener experiment on this host:
+
+1. **TSI (Transparent Socket Impersonation) is auto-enabled** when no virtio-net device is added. The README is explicit: "TSI for AF_INET and AF_INET6 is automatically enabled when no network interface is added to the VM." We never call `krun_add_net_*`, so TSI is on and the virtio-vsock device is created implicitly. The earlier "`add_vsock` vs `add_vsock_port` are mutually exclusive" finding was the symptom — `add_vsock` is documented as *adding a second independent virtio-vsock device*, which collides with the TSI-provided one. The right call for our use case is `add_vsock_port` alone; `add_vsock` is the wrong API for mvm and stays out of the `configure()` path.
+2. **libkrun does not create the host-side unix socket file.** Verified by running the smoke binary with `~/.mvm/vms/<name>/` set as the per-VM dir and inspecting the dir at +10s — empty. The host is responsible for binding a `UnixListener` at the path before `start_enter`; libkrun then proxies traffic from each guest-side `AF_VSOCK port` to a *client* connection at that listener. Apple Container's `start_vsock_proxy_listener` (`crates/mvm-providers/src/apple_container/macos.rs`) is the analogue; the W4 supervisor adopts the same pattern.
+3. **Per-VM socket dir is now configurable.** `KrunContext::with_vsock_socket_dir(...)` + the `vsock_socket_path(port) -> PathBuf` helper. Default fallback (used by the smoke binary) is `/tmp/mvm-libkrun-<name>-vsock-<port>.sock`; W4 + Plan 72 consumers always supply `~/.mvm/vms/<name>/` so cross-process clients (e.g. `mvmctl console`) can find the socket without scanning `/tmp`.
+
+Full guest-agent health-check ping is still W4-gated: the smoke binary becomes the guest, so it can't simultaneously be the host that connects to the unix listener. Once W4 lands a sibling supervisor process (or launchd unit), the same wiring + the existing `mvm_guest::vsock` framing closes the loop.
 
 ### W4 — State tracking decision (1–2 days)
 
