@@ -192,6 +192,14 @@ const TRUST_SUB: &[(&str, AuditPosture)] = &[
     ("remove", AuditPosture::Emits("TrustRemove")),
 ];
 
+// Plan 60 Phase 7a Slices A + D. `tenant destroy` writes signed
+// destruction certificates to stdout; the per-workload chain
+// emission (`lifecycle.tenant.destroyed`) lives in the plan-64
+// audit chain rather than the legacy LocalAuditKind stream, so
+// the row is `InteractiveOrControl` here. The signature/chain
+// integrity is exercised by `tests/tenant_destroy_e2e.rs`.
+const TENANT_SUB: &[(&str, AuditPosture)] = &[("destroy", AuditPosture::InteractiveOrControl)];
+
 /// Every top-level `mvmctl` subcommand keyed by its clap name.
 ///
 /// Order matches the `Commands` enum in
@@ -247,6 +255,11 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     // Sprint 52 W2 — bundles + trust store.
     ("bundle", AuditPosture::DelegatesToSub(BUNDLE_SUB)),
     ("trust", AuditPosture::DelegatesToSub(TRUST_SUB)),
+    // Plan 60 Phase 7a Slices A + D — destroys overlays + emits
+    // signed certificates. `tenant destroy` is the only leaf
+    // today; future Slice E adds `rebuild`, Slice 7b adds
+    // `install` / `uninstall`.
+    ("tenant", AuditPosture::DelegatesToSub(TENANT_SUB)),
 ];
 
 // ──────────────────────────────────────────────────────────────────

@@ -4177,6 +4177,7 @@ name = "mvm"
 version = "0.14.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "base64 0.22.1",
  "chrono",
  "colored",
@@ -4199,6 +4200,7 @@ dependencies = [
  "serde_json",
  "sha2 0.10.9",
  "tempfile",
+ "thiserror 1.0.69",
  "tokio",
  "toml",
  "tracing",
@@ -4272,6 +4274,7 @@ version = "0.14.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
+ "base64 0.22.1",
  "chrono",
  "clap",
  "clap_complete",
@@ -4494,6 +4497,7 @@ dependencies = [
  "assert_cmd",
  "chrono",
  "clap",
+ "ed25519-dalek",
  "httpmock",
  "mimalloc",
  "mvm",
@@ -4505,8 +4509,10 @@ dependencies = [
  "mvm-security",
  "objc2-foundation",
  "predicates",
+ "rand 0.8.6",
  "serde_json",
  "tempfile",
+ "tokio",
 ]
 
 [[package]]
