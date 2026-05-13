@@ -38,6 +38,7 @@ inquire.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+tar = "0.4"
 tempfile.workspace = true
 tera.workspace = true
 toml.workspace = true
@@ -53,11 +54,6 @@ assert_cmd.workspace = true
 ed25519-dalek.workspace = true
 predicates.workspace = true
 rand.workspace = true
-# Sprint 52 W2 follow-on: admit-time bundle re-verify tests need
-# to crack open `.mvmpkg` archives to recover the manifest sig
-# for pin construction. tar is the same dep mvm-plan uses
-# production-side.
-tar = "0.4"
 
 [lints]
 workspace = true

@@ -17,7 +17,9 @@ use super::Cli;
 use super::audit_chain::AuditEmitter;
 use super::forward::forward_ports;
 use super::host_signer::load_or_init_at;
-use super::plan_admission::{AdmittedPlan, InMemoryNonceLedger, SystemClock, admit_for_run};
+use super::plan_admission::{
+    AdmittedPlan, BundleAdmissionContext, InMemoryNonceLedger, SystemClock, admit_for_run,
+};
 use super::plan_builder::SynthesisInput;
 use super::policy_resolver::{
     LOCAL_DEFAULT, ResolveError, resolve_supervisor_components,
@@ -34,6 +36,61 @@ use super::shared::{
 /// the workspace `clippy::too_many_arguments = "deny"` ceiling and so
 /// future callers (W5 policy slots) can extend the shape without
 /// churning every call site.
+/// In-memory `BundleResolver` scoped to a single admission. Used
+/// when `mvmctl up --bundle-pin <path>` already has the archive
+/// bytes — no need to walk the filesystem registry again.
+struct InMemoryBundleResolver {
+    bytes: Vec<u8>,
+}
+
+impl InMemoryBundleResolver {
+    fn new(bytes: Vec<u8>) -> Self {
+        Self { bytes }
+    }
+}
+
+impl mvm_plan::BundleResolver for InMemoryBundleResolver {
+    fn resolve(
+        &self,
+        _bundle_sha256: &str,
+    ) -> std::result::Result<Vec<u8>, mvm_plan::BundleResolveError> {
+        Ok(self.bytes.clone())
+    }
+}
+
+/// Build a `PlanArtifact` pin from a verified bundle archive.
+/// Pulls the 64-byte signature out of the `manifest.sig` entry,
+/// hashes the archive for the bundle_sha256 field, and stamps the
+/// publisher's `key_id`.
+fn bundle_pin_from_archive(
+    archive: &[u8],
+    key_id: mvm_plan::KeyId,
+) -> Result<mvm_plan::PlanArtifact> {
+    let mut tar = tar::Archive::new(std::io::Cursor::new(archive));
+    for entry in tar.entries().context("walking archive entries")? {
+        let mut entry = entry.context("reading archive entry")?;
+        let path = entry
+            .path()
+            .context("reading archive entry path")?
+            .to_string_lossy()
+            .into_owned();
+        if path == "manifest.sig" {
+            let mut bytes = Vec::with_capacity(64);
+            std::io::Read::read_to_end(&mut entry, &mut bytes)
+                .context("reading manifest.sig bytes")?;
+            let sig_arr: [u8; 64] = bytes.as_slice().try_into().map_err(|_| {
+                anyhow::anyhow!("manifest.sig is {} bytes; expected 64", bytes.len())
+            })?;
+            return Ok(mvm_plan::PlanArtifact::new(
+                mvm_plan::bundle_sha256(archive),
+                &sig_arr,
+                key_id,
+            ));
+        }
+    }
+    anyhow::bail!("archive has no manifest.sig entry")
+}
+
 struct AdmitPlanForBootParams<'a> {
     pub tenant: &'a str,
     pub vm_name: &'a str,
@@ -56,6 +113,12 @@ struct AdmitPlanForBootParams<'a> {
     /// tempdir so a bogus bundle can be staged without touching the
     /// real user's home.
     pub policy_dir: Option<&'a std::path::Path>,
+    /// Optional path to a `.mvmpkg` bundle archive. When set, the
+    /// archive is read + verified at admit time, the resulting
+    /// `PlanArtifact` is embedded into the plan, and the supervisor's
+    /// admit path re-verifies on every launch. Production callers
+    /// thread `args.bundle_pin`; tests pass `None`.
+    pub bundle_pin: Option<&'a std::path::Path>,
 }
 
 /// Bundle of artifacts produced by a successful admission: the
@@ -122,6 +185,37 @@ fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<Admission
             p.rootfs_path.display()
         )
     })?;
+
+    // ADR-002 claim 9 — bundle pin (when supplied).
+    //
+    // Read the archive bytes, verify them against the local trust
+    // store, then construct the `PlanArtifact` triple
+    // (bundle_sha256 + manifest_sig + key_id). The supervisor's
+    // admit path re-runs the same verifier against the on-disk
+    // archive — defence in depth between CLI synth and backend
+    // dispatch. Errors surface before admit so the user sees them
+    // without a confusing post-sign rejection.
+    let (bundle_pin, bundle_resolver, bundle_trust) = match p.bundle_pin {
+        Some(path) => {
+            let bytes = std::fs::read(path)
+                .with_context(|| format!("reading bundle archive at {}", path.display()))?;
+            let trust = mvm_plan::FsTrustStore::default_path()
+                .context("resolving default trust-store path (~/.mvm/trusted-publishers/)")?;
+            let verified = mvm_plan::read_and_verify_bundle(&bytes, &trust)
+                .with_context(|| format!("verifying bundle at {}", path.display()))?;
+            let pin =
+                bundle_pin_from_archive(&bytes, verified.key_id.clone()).with_context(|| {
+                    format!("extracting signature from bundle at {}", path.display())
+                })?;
+            // Use an in-memory resolver scoped to this admission —
+            // the caller supplied the path, so we already have the
+            // bytes; no need to walk the FS registry again.
+            let resolver = InMemoryBundleResolver::new(bytes);
+            (Some(pin), Some(resolver), Some(trust))
+        }
+        None => (None, None, None),
+    };
+
     let input = SynthesisInput {
         vm_name: p.vm_name,
         tenant: Some(p.tenant),
@@ -135,16 +229,22 @@ fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<Admission
         boot_timeout_secs: 60,
         exec_timeout_secs: 0,
         destroy_on_exit: true,
-        // Substrate-only: pin is None today. A follow-up CLI flag
-        // (`--bundle-pin <path>`) will populate this from a fetched
-        // and verified `.mvmpkg` so admit_for_run re-verifies before
-        // backend dispatch. ADR-002 claim 9 — load-bearing at launch.
-        bundle_pin: None,
+        bundle_pin: bundle_pin.clone(),
     };
-    // No bundle pin in v1 — when populated, pass a
-    // `BundleAdmissionContext` with the resolver + trust store. The
-    // admission path refuses if a pin is present without context.
-    let admitted = admit_for_run(&input, &SystemClock, p.ledger, p.keys_dir, None)?;
+    let admission_ctx = match (&bundle_resolver, &bundle_trust) {
+        (Some(r), Some(t)) => Some(BundleAdmissionContext {
+            resolver: r,
+            trust: t,
+        }),
+        _ => None,
+    };
+    let admitted = admit_for_run(
+        &input,
+        &SystemClock,
+        p.ledger,
+        p.keys_dir,
+        admission_ctx.as_ref(),
+    )?;
     tracing::info!(
         plan_id = %admitted.plan_id.0,
         signer_id = %admitted.signer_id,
@@ -378,6 +478,16 @@ pub(in crate::commands) struct Args {
     /// when set. Will be removed once admission is the only path.
     #[arg(long)]
     pub no_supervisor: bool,
+    /// Pin the launch to a specific `.mvmpkg` bundle. The path is
+    /// read at admit time, verified against the local trust store
+    /// (`~/.mvm/trusted-publishers/`), and embedded into the
+    /// `ExecutionPlan` as a `PlanArtifact`. The supervisor's admit
+    /// path then re-verifies the bundle against the pin before
+    /// backend dispatch — claim 9 load-bearing at launch. Use the
+    /// same path you handed to `mvmctl bundle fetch` /
+    /// `mvmctl bundle install`.
+    #[arg(long, value_name = "PATH")]
+    pub bundle_pin: Option<std::path::PathBuf>,
     /// Build-mode override flags (`--dev` / `--prod`). Default: `--prod`.
     #[command(flatten)]
     pub build_mode: super::super::shared::BuildModeFlags,
@@ -519,6 +629,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         auto_resume,
         tenant: &args.tenant,
         no_supervisor: args.no_supervisor,
+        bundle_pin: args.bundle_pin.as_deref(),
         build_mode,
     })
 }
@@ -554,6 +665,10 @@ pub(in crate::commands) struct RunParams<'a> {
     pub(super) tenant: &'a str,
     /// `true` when `--no-supervisor` is set — disables plan-64 admission.
     pub(super) no_supervisor: bool,
+    /// Optional `.mvmpkg` archive path that admit_for_run re-verifies
+    /// against the local trust store before backend dispatch.
+    /// `Some(p)` populates `PlanArtifact` in the synthesised plan.
+    pub(super) bundle_pin: Option<&'a std::path::Path>,
     pub(super) build_mode: mvm_build::pipeline::BuildMode,
 }
 
@@ -584,6 +699,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         auto_resume,
         tenant,
         no_supervisor,
+        bundle_pin,
         build_mode,
     } = params;
     let _span =
@@ -717,6 +833,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             keys_dir: None,
             audit_dir: None,
             policy_dir: None,
+            bundle_pin,
         })?;
 
         let start_config = mvm_core::vm_backend::VmStartConfig {
@@ -1043,6 +1160,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         keys_dir: None,
         audit_dir: None,
         policy_dir: None,
+        bundle_pin,
     })?;
 
     // If a template snapshot exists AND the backend supports snapshots,
@@ -1372,6 +1490,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 keys_dir: None,
                 audit_dir: None,
                 policy_dir: None,
+                bundle_pin,
             }) {
                 Ok(ctx) => ctx,
                 Err(e) => {
@@ -1527,6 +1646,101 @@ mod admit_plan_tests {
         path
     }
 
+    /// Build a signed `.mvmpkg` archive in-memory so the
+    /// `--bundle-pin` test path doesn't need a real fetched bundle.
+    /// Uses mvm_plan's own writer + signing primitives.
+    fn make_bundle_for_pin(sk: &ed25519_dalek::SigningKey) -> (Vec<u8>, mvm_plan::KeyId) {
+        use mvm_plan::{
+            ArtifactRole, BUNDLE_SCHEMA_VERSION, BundleArtifact, BundleManifest, KeyId, sha256_hex,
+            write_bundle,
+        };
+        let key_id = KeyId::from_pubkey(&sk.verifying_key());
+        let kernel = b"kernel-bytes".to_vec();
+        let rootfs = b"rootfs-bytes".to_vec();
+        let manifest = BundleManifest {
+            schema_version: BUNDLE_SCHEMA_VERSION,
+            publisher: "test".to_string(),
+            key_id: key_id.clone(),
+            arch: "aarch64".to_string(),
+            kernel_version: None,
+            profile: None,
+            workload_label: None,
+            created_at: "2026-05-13T00:00:00Z".to_string(),
+            labels: Default::default(),
+            artifacts: vec![
+                BundleArtifact {
+                    name: "vmlinux".to_string(),
+                    role: ArtifactRole::Kernel,
+                    path: "artifacts/vmlinux".to_string(),
+                    sha256: sha256_hex(&kernel),
+                    size_bytes: kernel.len() as u64,
+                },
+                BundleArtifact {
+                    name: "rootfs.ext4".to_string(),
+                    role: ArtifactRole::Rootfs,
+                    path: "artifacts/rootfs.ext4".to_string(),
+                    sha256: sha256_hex(&rootfs),
+                    size_bytes: rootfs.len() as u64,
+                },
+            ],
+            verity: None,
+        };
+        let archive = write_bundle(
+            &manifest,
+            sk,
+            vec![
+                ("artifacts/vmlinux".to_string(), kernel),
+                ("artifacts/rootfs.ext4".to_string(), rootfs),
+            ],
+        )
+        .expect("write_bundle");
+        (archive, key_id)
+    }
+
+    #[test]
+    fn bundle_pin_from_archive_recovers_signature_and_sha() {
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let (archive, key_id) = make_bundle_for_pin(&sk);
+        let pin = bundle_pin_from_archive(&archive, key_id.clone()).expect("recovers pin");
+        assert_eq!(pin.bundle_sha256, mvm_plan::bundle_sha256(&archive));
+        assert_eq!(pin.key_id, key_id);
+        // Signature round-trips through base64 → bytes → verify.
+        let sig_arr = pin.signature_bytes().expect("base64 decodes");
+        assert_eq!(sig_arr.len(), 64);
+    }
+
+    #[test]
+    fn bundle_pin_from_archive_missing_signature_errors() {
+        // Bundle without a `manifest.sig` entry — built by hand so
+        // the helper sees the gap. The function must bail with a
+        // clear message rather than panic.
+        let mut buf = std::io::Cursor::new(Vec::<u8>::new());
+        {
+            let mut tar = tar::Builder::new(&mut buf);
+            let mut header = tar::Header::new_gnu();
+            header.set_size(0);
+            header.set_mode(0o644);
+            header.set_cksum();
+            tar.append_data(&mut header, "manifest.json", std::io::Cursor::new(b""))
+                .unwrap();
+            tar.finish().unwrap();
+        }
+        let archive = buf.into_inner();
+        let sk = ed25519_dalek::SigningKey::generate(&mut rand::rngs::OsRng);
+        let key_id = mvm_plan::KeyId::from_pubkey(&sk.verifying_key());
+        let err = bundle_pin_from_archive(&archive, key_id).expect_err("must fail");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("manifest.sig"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn in_memory_bundle_resolver_returns_archive_bytes() {
+        let bytes = b"hello-archive".to_vec();
+        let resolver = InMemoryBundleResolver::new(bytes.clone());
+        let out = mvm_plan::BundleResolver::resolve(&resolver, "anything").unwrap();
+        assert_eq!(out, bytes);
+    }
+
     #[test]
     fn no_supervisor_short_circuits_to_none() {
         // The escape hatch must skip admission entirely — no host
@@ -1546,6 +1760,7 @@ mod admit_plan_tests {
             keys_dir: None, // not read — short-circuit returns first
             audit_dir: None,
             policy_dir: None,
+            bundle_pin: None,
         })
         .expect("must succeed");
         assert!(result.is_none(), "no_supervisor must return None");
@@ -1570,6 +1785,7 @@ mod admit_plan_tests {
             keys_dir: Some(keys_dir.path()),
             audit_dir: Some(audit_dir.path()),
             policy_dir: None,
+            bundle_pin: None,
         })
         .expect("admission")
         .expect("Some when admission ran");
@@ -1607,6 +1823,7 @@ mod admit_plan_tests {
             keys_dir: Some(keys_dir.path()),
             audit_dir: Some(audit_dir.path()),
             policy_dir: None,
+            bundle_pin: None,
         })
         .expect_err("missing rootfs must fail");
         assert!(
@@ -1638,6 +1855,7 @@ mod admit_plan_tests {
             keys_dir: Some(keys_dir.path()),
             audit_dir: Some(audit_dir.path()),
             policy_dir: None,
+            bundle_pin: None,
         })
         .unwrap()
         .unwrap();
@@ -1653,6 +1871,7 @@ mod admit_plan_tests {
             keys_dir: Some(keys_dir.path()),
             audit_dir: Some(audit_dir.path()),
             policy_dir: None,
+            bundle_pin: None,
         })
         .unwrap()
         .unwrap();
@@ -1710,6 +1929,7 @@ mod admit_plan_tests {
             keys_dir: Some(keys_dir.path()),
             audit_dir: Some(audit_dir.path()),
             policy_dir: Some(policy_dir.path()),
+            bundle_pin: None,
         })
         .expect("admission")
         .expect("Some when admission ran");
