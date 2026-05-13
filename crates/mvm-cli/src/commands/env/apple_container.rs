@@ -1620,6 +1620,39 @@ fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(Strin
         anyhow::bail!("flake dir does not exist: {flake_dir}");
     }
 
+    // The bundled flakes live at `<workspace>/nix/images/<name>/` and
+    // use `builtins.path { path = ../../..; }` to capture the workspace
+    // root (for `mkGuest` lib + `Cargo.lock`). To make that resolve
+    // correctly inside the sandbox, mount the whole workspace at /work
+    // and point `flake_ref` at the subdir. Mounting only the flake dir
+    // (the previous design) made `../../..` resolve to `/` of the
+    // sandbox, which tripped over `/.msb/agent.sock` and other
+    // microsandbox-internal files Nix can't import.
+    let workspace_root = flake_src
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| {
+            anyhow::anyhow!("flake dir is not three levels deep in workspace: {flake_dir}")
+        })?
+        .to_path_buf();
+    let flake_rel = flake_src
+        .strip_prefix(&workspace_root)
+        .map_err(|_| anyhow::anyhow!("flake dir not under derived workspace root: {flake_dir}"))?;
+    // `path:` URL forces Nix's filesystem flake fetcher rather than the
+    // git fetcher. The git fetcher gets engaged automatically whenever
+    // the flake path sits under a `.git` directory (the workspace
+    // mount always does), and it fails on git worktrees — the
+    // worktree's `.git` is a file whose `gitdir:` redirect points
+    // outside the bind mount.
+    let guest_flake_ref = format!(
+        "path:{}/{}",
+        BUILDER_GUEST_WORK_DIR,
+        flake_rel
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("flake subpath has non-UTF-8 bytes: {flake_rel:?}"))?
+    );
+
     // Bind-mount /nix opportunistically on Linux hosts that already
     // run native Nix — the builder reuses already-realized store paths,
     // and absence is fine because the in-sandbox store fetches from
@@ -1642,11 +1675,11 @@ fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(Strin
     };
 
     let job = BuilderJob {
-        flake_ref: BUILDER_GUEST_WORK_DIR.to_string(),
+        flake_ref: guest_flake_ref,
         attr_path: format!("packages.{}.default", host_system_linux()),
     };
     let mounts = BuilderMounts {
-        flake_src,
+        flake_src: workspace_root,
         host_nix_store,
         artifact_out: std::path::PathBuf::from(out_dir),
     };

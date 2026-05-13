@@ -542,15 +542,26 @@ async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, Bui
     //     stale to re-validate.
     let build_script = format!(
         r#"set -euo pipefail
-cd {work}
+# Run `git config --global` BEFORE cd'ing into the workspace mount.
 # `safe.directory = *` neutralises the cross-uid check git 2.35+
-# enforces on bind-mounted repos. Without it, nix's git fetcher
-# (engaged whenever the flake path lives under a `.git` dir, which
-# `/work` does) errors "repository '/work' is not owned by current
-# user". `git config --global` writes to /root inside the sandbox —
-# fresh per spawn — so this never leaks to the host.
+# enforces on bind-mounted repos — engaged by nix's git fetcher when
+# the flake path lives under a `.git` dir (`/work` does). `--global`
+# writes to /root inside the sandbox (fresh per spawn; never leaks
+# to the host), but git's *startup* still walks cwd upward looking
+# for a repo; in a git-worktree workspace the discovered `.git` is
+# a *file* whose `gitdir:` redirect points to a host path that
+# doesn't exist in the sandbox, so the discovery itself errors
+# "not a git repository" with exit 128 before `--global` is
+# processed. Running from `/` sidesteps the cwd scan entirely.
 git config --global --add safe.directory '*'
+cd {work}
 export NIX_CONFIG="experimental-features = nix-command flakes"
+# Tell the flake where the workspace lives in this sandbox. Without
+# this, the flake's relative path import resolves against the
+# store-copied flake dir (because `path:` URL semantics) and ends
+# up at `/`, tripping on sandbox-internal files like
+# `/.msb/agent.sock`. The flake reads this under `--impure`.
+export MVM_WORKSPACE_PATH={work}
 nix build {flake_ref}#{attr_path} --no-link --print-out-paths --no-write-lock-file --impure
 "#,
         work = shell_quote_arg(BUILDER_GUEST_WORK_DIR),
