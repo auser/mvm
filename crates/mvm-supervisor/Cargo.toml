@@ -62,7 +62,10 @@ tracing.workspace = true
 
 # Plan 60 Phase 7 staging tools: `O_NOFOLLOW` on read/write opens
 # defends the upload + download path validators against a symlink
-# planted inside the staging dir. Unix-wide (macOS + Linux); the
+# planted inside the staging dir. Sprint 52 W1 follow-on also
+# leans on this unix-wide libc dep for macOS's
+# `sysctlbyname("kern.memorystatus_vm_pressure_level")` reader in
+# `VmPressureLevelSource`. Unix-wide (macOS + Linux); the
 # Windows branch in `staging.rs` falls back to a `symlink_metadata`
 # check.
 [target.'cfg(unix)'.dependencies]
