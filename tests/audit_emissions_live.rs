@@ -1713,6 +1713,7 @@ fn secret_put_emits_put_action_in_secret_audit_log() {
     let sandbox = AuditSandbox::new();
     let output = sandbox
         .mvmctl()
+        .env("MVM_SECRET_STORE_BACKEND", "file")
         .args([
             "secret",
             "put",
