@@ -34,7 +34,8 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomBytes } from "node:crypto";
 
-const WRAPPER_CONFIG_PATH = "/etc/mvm/wrapper.json";
+const WRAPPER_CONFIG_PATH =
+  process.env.MVM_WRAPPER_CONFIG_PATH || "/etc/mvm/wrapper.json";
 const MAX_NESTING_DEPTH = 64;
 const DEFAULT_MAX_INPUT_BYTES = 16 * 1024 * 1024; // 16 MiB
 const MAX_FRAME_BYTES = 256 * 1024; // mvm_guest::worker_protocol cap

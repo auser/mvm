@@ -36,7 +36,8 @@ import { resolve } from "node:path";
 import { pathToFileURL } from "node:url";
 import { randomBytes } from "node:crypto";
 
-const WRAPPER_CONFIG_PATH = "/etc/mvm/wrapper.json";
+const WRAPPER_CONFIG_PATH =
+  process.env.MVM_WRAPPER_CONFIG_PATH || "/etc/mvm/wrapper.json";
 const MAX_NESTING_DEPTH = 64;
 let mainInvoked = false;
 // Defense-in-depth stdin cap. Substrate enforces a hard upstream cap

@@ -47,7 +47,9 @@ import struct
 import sys
 from typing import Any
 
-WRAPPER_CONFIG_PATH = "/etc/mvm/wrapper.json"
+WRAPPER_CONFIG_PATH = os.environ.get(
+    "MVM_WRAPPER_CONFIG_PATH", "/etc/mvm/wrapper.json"
+)
 MAX_NESTING_DEPTH = 64
 DEFAULT_MAX_INPUT_BYTES = 16 * 1024 * 1024  # 16 MiB
 MAX_FRAME_BYTES = 256 * 1024  # mvm_guest::worker_protocol cap

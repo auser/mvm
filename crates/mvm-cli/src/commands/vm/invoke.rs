@@ -111,9 +111,66 @@ pub(in crate::commands) struct Args {
     /// per-function dispatch on the agent side.**
     #[arg(long, value_name = "NAME")]
     pub r#fn: Option<String>,
+
+    /// **Dev shortcut** — bypass VM boot and run the workload's
+    /// wrapper directly on the host. Exercises the full wire contract
+    /// (encode → wrapper → user function → encode → decode) without
+    /// any Nix or virtualization. Plan 60 Phase 5 Slice E1b. The
+    /// `--language` / `--module` / `--function` / `--format` /
+    /// `--source-path` flags below carry the per-call info the SDK
+    /// would normally bake into `/etc/mvm/wrapper.json` at image
+    /// build time; the positional manifest argument is accepted but
+    /// ignored.
+    ///
+    /// **Not for production.** None of the in-VM hardening
+    /// (seccomp tier, namespace isolation, RLIMIT_CORE) applies. Use
+    /// for SDK iteration, CI smoke, and dev loops on machines
+    /// without Linux/KVM/Lima.
+    #[arg(long)]
+    pub no_vm: bool,
+
+    /// Wrapper language for `--no-vm`. Maps directly to the IR
+    /// `Entrypoint::Function.language` field. Required when
+    /// `--no-vm` is set; ignored otherwise.
+    #[arg(long, value_name = "LANG", requires = "no_vm")]
+    pub language: Option<String>,
+
+    /// Module identifier for `--no-vm`. For Python: dotted path
+    /// (`pkg.mod`). For Node: module path (`./src/mod.mjs`).
+    /// Required when `--no-vm` is set.
+    #[arg(long, value_name = "MODULE", requires = "no_vm")]
+    pub module: Option<String>,
+
+    /// Function identifier within the module for `--no-vm`.
+    /// Required when `--no-vm` is set.
+    #[arg(long, value_name = "FUNCTION", requires = "no_vm")]
+    pub function: Option<String>,
+
+    /// Wire-format for stdin args + stdout return under `--no-vm`.
+    /// One of `json` or `msgpack`. Default `json`.
+    #[arg(long, value_name = "FMT", default_value = "json", requires = "no_vm")]
+    pub format: String,
+
+    /// Absolute path to the user's source tree for `--no-vm`. The
+    /// wrapper imports `<module>` relative to this path. Required
+    /// when `--no-vm` is set.
+    #[arg(long, value_name = "PATH", requires = "no_vm")]
+    pub source_path: Option<String>,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
+    if args.no_vm {
+        // Dev shortcut — bypass VM boot and run the wrapper directly
+        // on the host. Plan 60 Phase 5 Slice E1b. See
+        // `invoke_no_vm.rs` for the full contract.
+        ui::warn(
+            "--no-vm: bypassing VM boot, running wrapper on the host. \
+             Not for production. None of the in-VM hardening applies.",
+        );
+        let stdin_bytes = read_stdin_payload(args.stdin.as_deref())?;
+        let exit_code = super::invoke_no_vm::run(&args, stdin_bytes)?;
+        std::process::exit(exit_code);
+    }
     if args.reset {
         ui::warn(
             "--reset is wired but no-op in this build (session-pool plan); \

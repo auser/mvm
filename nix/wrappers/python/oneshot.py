@@ -48,7 +48,9 @@ import secrets
 import sys
 from typing import Any
 
-WRAPPER_CONFIG_PATH = "/etc/mvm/wrapper.json"
+WRAPPER_CONFIG_PATH = os.environ.get(
+    "MVM_WRAPPER_CONFIG_PATH", "/etc/mvm/wrapper.json"
+)
 MAX_NESTING_DEPTH = 64
 _main_invoked = False
 # Defense-in-depth stdin cap. The substrate enforces a hard cap upstream
