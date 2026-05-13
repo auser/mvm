@@ -1,37 +1,14 @@
 # Agent Working Agreement
 
-## Lima VM Requirement
+## Builder VM Requirement
 
-All Nix builds, Firecracker operations, `mvmctl` runtime commands (anything that boots, talks to, or manages microVMs), and Linux-specific syscalls MUST be run inside the Lima VM. Use `limactl shell mvm-builder -- <command>` to execute commands inside the VM. The Lima VM name is `mvm-builder` (renamed from `mvm` in W7.2).
+All Nix builds/evals, Firecracker operations, `mvmctl` runtime commands (anything that boots, talks to, or manages microVMs), and Linux-specific syscalls MUST run inside the project builder VM, not a Lima VM. Do not use `limactl` for this repo. The builder VM is the current Linux execution boundary for Nix and microVM work.
 
-**Run cargo on the macOS host wherever it compiles cleanly.** `cargo test`, `cargo check`, and `cargo build` should default to the host so worktrees don't deadlock on the single shared Lima VM (cargo target-dir contention, registry locks, and `.git/index` cross-mount races are real and have caused us to lose work). Tests that genuinely need Linux — vsock, jailer/seccomp, dm-verity, network namespaces, anything that pokes at `/dev/kvm` or `/proc/net` — should be gated with `#[cfg(target_os = "linux")]` and only those sub-targets are run inside Lima. Workspace-wide `cargo clippy --workspace --all-targets -- -D warnings` is still expected to pass inside Lima before merge, since clippy needs to see the Linux-gated code paths.
+**Run cargo on the macOS host wherever it compiles cleanly.** `cargo test`, `cargo check`, and `cargo build` should default to the host so worktrees don't deadlock on shared builder state (cargo target-dir contention, registry locks, and `.git/index` cross-mount races are real and have caused us to lose work). Tests that genuinely need Linux — vsock, jailer/seccomp, dm-verity, network namespaces, anything that pokes at `/dev/kvm` or `/proc/net` — should be gated with `#[cfg(target_os = "linux")]` and only those sub-targets are run inside the builder VM. Workspace-wide `cargo clippy --workspace --all-targets -- -D warnings` is still expected to pass in the Linux builder environment before merge, since clippy needs to see the Linux-gated code paths.
 
-**git only runs from the main `mvm/` checkout, never from inside a worktree directory and never from inside Lima.** The main checkout is the single git operator for the whole repo. To act on a worktree's branch, use `git -C /path/to/.worktrees/mvm-<slug> <cmd>` from the main checkout — that drives the worktree's index/HEAD/refs while keeping the running git process anchored at the main checkout. Reasons: (1) only one git process at a time touches `.git/objects`, `.git/packed-refs`, and the shared `.git/hooks/` invocation context, eliminating the cross-worktree contention that has caused us to lose work; (2) the 9p/virtiofs share with Lima does not share git's lock semantics, so git from inside Lima deadlocks against host-side git. Cargo/nix/firecracker/mvmctl commands still run from each worktree's own directory — only `git` is centralized.
+**git only runs from the main `mvm/` checkout, never from inside a worktree directory and never from inside the builder VM.** The main checkout is the single git operator for the whole repo. To act on a worktree's branch, use `git -C /path/to/.worktrees/mvm-<slug> <cmd>` from the main checkout — that drives the worktree's index/HEAD/refs while keeping the running git process anchored at the main checkout. Reasons: (1) only one git process at a time touches `.git/objects`, `.git/packed-refs`, and the shared `.git/hooks/` invocation context, eliminating the cross-worktree contention that has caused us to lose work; (2) VM/shared-filesystem lock semantics can deadlock against host-side git. Cargo/nix/firecracker/mvmctl commands still run from each worktree's own directory — only `git` is centralized.
 
-If the Lima VM is not running, boot it with:
-
-```bash
-cargo run -- dev
-```
-
-Once running, access it with:
-
-```bash
-limactl shell mvm-builder
-```
-
-Examples:
-- `limactl shell mvm-builder -- cargo run --quiet -- build openclaw --force`
-- `limactl shell mvm-builder -- cargo run --quiet -- up --manifest openclaw --name oc`
-- `limactl shell mvm-builder -- cargo run --quiet -- logs oc`
-- `limactl shell mvm-builder -- cargo run --quiet -- down oc`
-- `limactl shell mvm-builder -- nix build .#packages.aarch64-linux.default`
-- `limactl shell mvm-builder -- nix path-info -rsh /nix/store/<hash>`
-- `limactl shell mvm-builder -- cargo test --workspace`
-- `limactl shell mvm-builder -- cargo clippy --workspace -- -D warnings`
-- `limactl shell mvm-builder -- cargo check --workspace`
-
-**Important:** `mvmctl` (via `cargo run`) commands like `build`, `up`, `down`, `logs`, and `ls` must be run inside the Lima VM — they talk to Firecracker which only runs inside Linux. `cargo test` / `cargo check` / `cargo build` should run on the macOS host by default (see "Run cargo on the macOS host" above); only `cargo clippy --workspace --all-targets` and tests gated on `target_os = "linux"` need Lima. `cargo run -- dev` always runs on the macOS host directly.
+**Important:** `mvmctl` (via `cargo run`) commands like `build`, `up`, `down`, `logs`, and `ls` must be run inside the builder VM — they talk to Linux-only microVM tooling. `cargo test` / `cargo check` / `cargo build` should run on the macOS host by default (see "Run cargo on the macOS host" above); only `cargo clippy --workspace --all-targets`, Nix eval/build checks, and tests gated on `target_os = "linux"` need the builder VM.
 
 ## Worktree Workflow for Features
 
@@ -88,7 +65,7 @@ Agents working inside a worktree directory should not invoke `git` directly. If 
 
 ### Isolating mutable state
 
-Worktrees share `~/.mvm`, `~/.cache/mvm`, `~/.cargo`, `~/.rustup`, the Lima VM, the Nix store, and any pushed registries with the main checkout. Per-worktree isolation is achieved by overriding three env vars for the duration of a command:
+Worktrees share `~/.mvm`, `~/.cache/mvm`, `~/.cargo`, `~/.rustup`, the builder VM, the Nix store, and any pushed registries with the main checkout. Per-worktree isolation is achieved by overriding three env vars for the duration of a command:
 
 ```bash
 MVM_DATA_DIR="$PWD/.mvm-test"      \
@@ -115,16 +92,16 @@ One-time per clone: run `just install-hooks` from the main checkout to point `co
 Even with per-worktree isolation, a few resources are shared and can cause concurrent commands to interfere:
 
 - **`.git/objects/`, `.git/packed-refs`, and the shared hooks dir.** Each `git worktree add` directory has its own index, HEAD, and refs (in `.git/worktrees/<name>/`), but the object store, packed refs, and hooks dir are one set. The "git only runs from the main checkout" rule (see the top of this doc) is what keeps these from colliding — never bypass it. Even with that rule, the pre-commit hook still gets invoked on every commit, so keep it limited to formatting + fast checks; don't run a full `cargo test --workspace` from inside a hook.
-- **The Lima VM's `/var/lib/mvm/`, `br-mvm` bridge, and TAP devices.** Vary microVM and TAP names between worktrees if you need two microVMs running at the same time.
-- **The Nix store inside Lima.** This is shared by design (warm cache) and Nix's own locking handles it.
+- **The builder VM's `/var/lib/mvm/`, `br-mvm` bridge, and TAP devices.** Vary microVM and TAP names between worktrees if you need two microVMs running at the same time.
+- **The Nix store inside the builder VM.** This is shared by design (warm cache) and Nix's own locking handles it.
 
-### Lima VM sharing
+### Builder VM sharing
 
-The Lima VM (`mvm-builder`) is shared across worktrees by design — **never fork it per worktree**. It is expensive to boot, and the Nix store inside it is the warm cache that makes builds fast; a per-worktree VM would duplicate tens of GB of store, re-download the kernel/rootfs, and multiply boot time with no isolation benefit. There is also no second VM name baked into the codebase: `mvmctl`, the `Justfile`, CI, and AGENTS.md examples all hard-code `mvm-builder`, and `RuntimeBuildEnv` / `run_on_vm` route through `mvm::config::VM_NAME`.
+The builder VM is shared across worktrees by design — **never fork it per worktree**. It is expensive to boot, and the Nix store inside it is the warm cache that makes builds fast; a per-worktree VM would duplicate tens of GB of store, re-download the kernel/rootfs, and multiply boot time with no isolation benefit.
 
 The `MVM_DATA_DIR` override is what isolates per-feature state — templates, sockets, the microVM registry, snapshots, signing keys. Anything that would otherwise land in `~/.mvm` ends up under the worktree.
 
-State that *does* live inside the shared Lima VM (`/var/lib/mvm/`, the `br-mvm` bridge, TAP devices, in-flight microVMs) is the only collision surface between worktrees. If two worktrees need to run microVMs concurrently, give them distinct microVM and TAP names — do not spin up a second Lima VM.
+State that *does* live inside the shared builder VM (`/var/lib/mvm/`, the `br-mvm` bridge, TAP devices, in-flight microVMs) is the only collision surface between worktrees. If two worktrees need to run microVMs concurrently, give them distinct microVM and TAP names — do not spin up a second builder VM.
 
 ### Optional: direnv
 
