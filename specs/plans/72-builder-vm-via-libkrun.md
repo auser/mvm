@@ -1,4 +1,4 @@
-# Plan 71 — Builder VM via libkrun (drop microsandbox from the build path)
+# Plan 72 — Builder VM via libkrun (drop microsandbox from the build path)
 
 > Status: proposed
 > Owner: TBD
@@ -19,7 +19,7 @@ If plan 57 stalls, **W0 still ships standalone** — the three sandbox-correctne
 
 - Plan 57 W1–W3 landed: `mvm_libkrun::start_with_config` boots a Linux kernel + ext4 rootfs on macOS Apple Silicon with vsock, console redirected to host stdout, and clean power-off detection. Linux KVM path doesn't have to be wired yet — Firecracker covers Linux for the duration of this plan.
 - `mvm_libkrun::Error::NotYetWired` removed (plan 57 acceptance criterion).
-- A macOS Apple Silicon laptop with Xcode CLI tools + Homebrew + `brew install libkrun`. Plan 71 W0–W4 develop against this; CI matrix adds Linux KVM in W5.
+- A macOS Apple Silicon laptop with Xcode CLI tools + Homebrew + `brew install libkrun`. Plan 72 W0–W4 develop against this; CI matrix adds Linux KVM in W5.
 
 ## Acceptance criteria (whole-plan)
 
@@ -323,7 +323,7 @@ W5's cutover already moves microsandbox behind `--features contributor-bootstrap
 
 ### Removing microsandbox entirely (deferred)
 
-If a thinner Stage 0 emerges (e.g. a hand-rolled libkrun + nixos/nix OCI extractor, or a checked-in pre-built stage-0 microVM image that's small enough to live in git LFS), the `contributor-bootstrap` feature can swap its backend without touching the user-facing path. That work is *not* part of plan 71. It's tracked as a follow-up; the goal of plan 71 is to get user-facing builds off microsandbox, not to eliminate microsandbox from every workflow.
+If a thinner Stage 0 emerges (e.g. a hand-rolled libkrun + nixos/nix OCI extractor, or a checked-in pre-built stage-0 microVM image that's small enough to live in git LFS), the `contributor-bootstrap` feature can swap its backend without touching the user-facing path. That work is *not* part of plan 72. It's tracked as a follow-up; the goal of plan 72 is to get user-facing builds off microsandbox, not to eliminate microsandbox from every workflow.
 
 ### W6 acceptance
 
@@ -340,14 +340,14 @@ If a thinner Stage 0 emerges (e.g. a hand-rolled libkrun + nixos/nix OCI extract
 - **Multi-platform Windows support.** Windows is out of scope for this plan; libkrun doesn't run there. The microsandbox builder path is the only one that ever could have worked on Windows, and even then via WSL2.
 - **Snapshotting the builder VM**. The builder is single-purpose and exit-on-completion. No reason to snapshot. If a contributor wants a long-lived dev VM they want `mvmctl dev shell` (different path, libkrun-backed via plan 57).
 - **Honoring host Nix when present.** Per CLAUDE.md §"Host Nix is never used by mvmctl", mvmctl does not consult any host Nix install in any code path. This is a *removal* of ADR-013's "host Nix remains an opt-in power-user path" clause — that clause is superseded for everything inside `mvmctl`. Contributors with `nix-darwin`'s `linux-builder` see exactly the same behavior as contributors without it. Determinism is the reason.
-- **Eliminating microsandbox from the contributor-bootstrap path.** Plan 71 demotes it to that scope; further reduction (vendoring a thinner OCI runner, shipping a stage-0 microVM in git LFS) is tracked as a follow-up. The minimum scope here is getting *user-facing builds* off microsandbox and giving contributors a from-source dev loop that doesn't depend on the release pipeline.
+- **Eliminating microsandbox from the contributor-bootstrap path.** Plan 72 demotes it to that scope; further reduction (vendoring a thinner OCI runner, shipping a stage-0 microVM in git LFS) is tracked as a follow-up. The minimum scope here is getting *user-facing builds* off microsandbox and giving contributors a from-source dev loop that doesn't depend on the release pipeline.
 - **Forcing contributors to download a prebuilt builder VM in a source checkout.** Source-checkout `mvmctl dev up` always runs `nix build` against the in-repo flakes for both Layer 1 (builder VM image) and Layer 2 (dev shell / user image). The mvm-published prebuilt is end-user infrastructure only — a contributor modifying `nix/images/builder-vm/flake.nix` must see their changes in the next invocation without any release-pipeline round-trip.
 
 ## Risks and mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Plan 57 doesn't reach W1 acceptance before plan 71 W1 wants to start. | Vendoring fallback in ADR-046 §"Fallback / escape hatch" — fork microsandbox, add `upper_size_mib`, ship that as v0.15.x while plan 57 catches up. |
+| Plan 57 doesn't reach W1 acceptance before plan 72 W1 wants to start. | Vendoring fallback in ADR-046 §"Fallback / escape hatch" — fork microsandbox, add `upper_size_mib`, ship that as v0.15.x while plan 57 catches up. |
 | The published builder VM image takes >1.2 GiB compressed and bandwidth-constrained users complain. | Audit the rootfs closure in W2; trim packages until budget is met. `du -h $out/rootfs.ext4` is a CI gate. |
 | Cold-cache `nix build` doesn't fit the <8 min budget. | Ship the builder VM image with a *bigger* seed `/nix/store` containing the most expensive paths (rustc closure, nixpkgs stdenv). Tradeoff: bigger image, faster cold-cache. Adjust in W2 based on measurement. |
 | Bind-mount `/nix-store → /nix` interacts badly with the rootfs's existing `/nix/store/...-bash` lookups during init. | Mount order: tmpfs `/tmp`, then bind `/nix-store → /nix`, *then* exec `/bin/sh` for `/job/cmd.sh`. By the time the shell runs, `/nix` resolves to the persistent store with the seed copied in. The init binary itself uses no `/nix` paths (it's statically linked). |
