@@ -378,22 +378,27 @@ pub fn ensure_signed() {
     std::process::exit(1);
 }
 
+/// Ad-hoc entitlements plist applied by [`sign_binary`]. Lifted to a
+/// const so the entitlement set is testable from the module's unit
+/// tests (`test_entitlements_cover_both_frameworks`) — the merged W2
+/// change inlined the XML, which made the "did we keep both keys"
+/// invariant invisible to CI.
+const ENTITLEMENTS_PLIST: &str = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
+    <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
+    \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
+    <plist version=\"1.0\"><dict>\n\
+    <key>com.apple.security.virtualization</key><true/>\n\
+    <key>com.apple.security.hypervisor</key><true/>\n\
+    </dict></plist>";
+
 /// Sign the binary ad-hoc with both VZ and Hypervisor.framework
 /// entitlements (no self-restart).
 ///
 /// Called by `ensure_signed()` and also by the `-d` detach path to
 /// pre-sign before installing the launchd agent.
 fn sign_binary(exe_str: &str) {
-    let ent = "<?xml version=\"1.0\" encoding=\"UTF-8\"?>\n\
-        <!DOCTYPE plist PUBLIC \"-//Apple//DTD PLIST 1.0//EN\" \
-        \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
-        <plist version=\"1.0\"><dict>\n\
-        <key>com.apple.security.virtualization</key><true/>\n\
-        <key>com.apple.security.hypervisor</key><true/>\n\
-        </dict></plist>";
-
     let ent_path = std::env::temp_dir().join("mvm-entitlements.plist");
-    if std::fs::write(&ent_path, ent).is_err() {
+    if std::fs::write(&ent_path, ENTITLEMENTS_PLIST).is_err() {
         return;
     }
 
@@ -1056,6 +1061,26 @@ mod tests {
             .map(|d| d.as_nanos())
             .unwrap_or(0);
         format!("{}-{}", std::process::id(), nanos)
+    }
+
+    /// Plan 57 W2: both `com.apple.security.virtualization` (VZ) and
+    /// `com.apple.security.hypervisor` (direct Hypervisor.framework /
+    /// libkrun) must be stamped by the same ad-hoc sign so a single
+    /// `mvmctl` binary can drive both backends without re-signing on
+    /// every backend swap. A regression that drops either key is a
+    /// silent runtime failure (kernel rejects the framework call),
+    /// so guard the invariant from CI.
+    #[test]
+    fn test_entitlements_cover_both_frameworks() {
+        assert!(
+            ENTITLEMENTS_PLIST.contains("<key>com.apple.security.virtualization</key>"),
+            "entitlements plist must declare the VZ entitlement"
+        );
+        assert!(
+            ENTITLEMENTS_PLIST.contains("<key>com.apple.security.hypervisor</key>"),
+            "entitlements plist must declare the direct Hypervisor.framework entitlement \
+             (required by libkrun on macOS)"
+        );
     }
 
     #[test]
