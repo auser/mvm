@@ -2,6 +2,7 @@
 
 use anyhow::Result;
 use clap::Args as ClapArgs;
+use std::path::PathBuf;
 
 use crate::ui;
 
@@ -9,6 +10,28 @@ use mvm_backend::microvm;
 use mvm_core::user_config::MvmConfig;
 
 use super::Cli;
+
+/// Optionally rewrite an absolute system path under a sandbox prefix.
+/// Plan 70: when `MVM_UNINSTALL_PATH_PREFIX` is set, the verb's
+/// `/var/lib/mvm` and `/usr/local/bin/mvmctl` targets relocate under
+/// the prefix and the sudo invocation is skipped (plain
+/// `std::fs::remove_*`) because the rewritten paths live in
+/// test-owned territory. Logs a `ui::warn` on bypass so the
+/// override is visible.
+///
+/// Returns `(rewritten_path, use_sudo)`. `use_sudo == false` means
+/// the caller should bypass `sudo` because either (a) the override
+/// is set, or (b) future caller logic may want to drop sudo for
+/// some other reason — currently only (a) is wired.
+fn sandbox_path(p: &str) -> (PathBuf, bool) {
+    match std::env::var("MVM_UNINSTALL_PATH_PREFIX") {
+        Ok(prefix) if !prefix.trim().is_empty() => {
+            let stripped = p.strip_prefix('/').unwrap_or(p);
+            (PathBuf::from(prefix.trim()).join(stripped), false)
+        }
+        _ => (PathBuf::from(p), true),
+    }
+}
 
 #[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct Args {
@@ -55,6 +78,20 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         }
     }
 
+    // Plan 70: when MVM_UNINSTALL_PATH_PREFIX is set the system
+    // paths below get rewritten under that prefix and sudo is
+    // skipped. Surface the bypass loudly so a misconfigured
+    // production caller can't miss it.
+    let prefix_set = std::env::var("MVM_UNINSTALL_PATH_PREFIX")
+        .map(|v| !v.trim().is_empty())
+        .unwrap_or(false);
+    if prefix_set {
+        ui::warn(
+            "MVM_UNINSTALL_PATH_PREFIX set; rewriting system paths under \
+             the prefix and skipping sudo (test path).",
+        );
+    }
+
     // Stop running microVMs first (best-effort). Plan-60 / ADR-013
     // dropped Lima; there is no Lima VM to destroy.
     if let Err(e) = microvm::stop() {
@@ -62,16 +99,21 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     }
 
     // Remove /var/lib/mvm/.
-    let state_dir = std::path::Path::new("/var/lib/mvm");
+    let (state_dir, use_sudo) = sandbox_path("/var/lib/mvm");
     if state_dir.exists() {
-        ui::info("Removing /var/lib/mvm/...");
-        let status = std::process::Command::new("sudo")
-            .args(["rm", "-rf", "/var/lib/mvm"])
-            .status();
-        match status {
-            Ok(s) if s.success() => {}
-            Ok(s) => tracing::warn!("sudo rm /var/lib/mvm exited with status {s}"),
-            Err(e) => tracing::warn!("failed to remove /var/lib/mvm: {e}"),
+        ui::info(&format!("Removing {}...", state_dir.display()));
+        if use_sudo {
+            let status = std::process::Command::new("sudo")
+                .args(["rm", "-rf"])
+                .arg(&state_dir)
+                .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => tracing::warn!("sudo rm {} exited with status {s}", state_dir.display()),
+                Err(e) => tracing::warn!("failed to remove {}: {e}", state_dir.display()),
+            }
+        } else if let Err(e) = std::fs::remove_dir_all(&state_dir) {
+            tracing::warn!("failed to remove {}: {e}", state_dir.display());
         }
     }
 
@@ -88,16 +130,21 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         }
 
         // Remove /usr/local/bin/mvmctl.
-        let bin = std::path::Path::new("/usr/local/bin/mvmctl");
+        let (bin, use_sudo) = sandbox_path("/usr/local/bin/mvmctl");
         if bin.exists() {
-            ui::info("Removing /usr/local/bin/mvmctl...");
-            let status = std::process::Command::new("sudo")
-                .args(["rm", "-f", "/usr/local/bin/mvmctl"])
-                .status();
-            match status {
-                Ok(s) if s.success() => {}
-                Ok(s) => tracing::warn!("sudo rm mvmctl exited with status {s}"),
-                Err(e) => tracing::warn!("failed to remove /usr/local/bin/mvmctl: {e}"),
+            ui::info(&format!("Removing {}...", bin.display()));
+            if use_sudo {
+                let status = std::process::Command::new("sudo")
+                    .args(["rm", "-f"])
+                    .arg(&bin)
+                    .status();
+                match status {
+                    Ok(s) if s.success() => {}
+                    Ok(s) => tracing::warn!("sudo rm {} exited with status {s}", bin.display()),
+                    Err(e) => tracing::warn!("failed to remove {}: {e}", bin.display()),
+                }
+            } else if let Err(e) = std::fs::remove_file(&bin) {
+                tracing::warn!("failed to remove {}: {e}", bin.display());
             }
         }
     }
