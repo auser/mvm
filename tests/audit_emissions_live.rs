@@ -1801,3 +1801,67 @@ fn secret_rm_emits_delete_action_in_secret_audit_log() {
         "expected an 'action':'delete' entry in secrets audit log. Full log:\n{log}"
     );
 }
+
+#[test]
+fn build_emits_template_build_audit_entry_against_stub_outdir() {
+    // Plan 68: `mvmctl build --flake <stub-flake> --profile minimal`
+    // reaches `mvm_build::dev_build::dev_build`, which normally
+    // shells out to `nix build`. With `MVM_BUILD_STUB_OUTDIR` set,
+    // dev_build returns a synthetic `DevBuildResult` pointing at
+    // the stub directory and skips both the Nix invocation and the
+    // guest-agent injection step. The outer build_flake wrapper
+    // still calls `audit_build_ok("flake", &resolved, "", &revision)`,
+    // which emits one `template_build` record. Hermetic — no Nix,
+    // no Lima, no Apple Container, no sudo.
+    let sandbox = AuditSandbox::new();
+
+    // Stub build output: a directory whose basename becomes the
+    // revision hash (per dev_build's stub branch). `vmlinux` and
+    // `rootfs.ext4` are placeholders so any downstream caller that
+    // statted them sees real files.
+    let stub_out = sandbox.home_path().join("stub-out");
+    std::fs::create_dir_all(&stub_out).expect("mkdir stub_out");
+    std::fs::write(stub_out.join("vmlinux"), b"fake-kernel").expect("write stub kernel");
+    std::fs::write(stub_out.join("rootfs.ext4"), b"fake-rootfs").expect("write stub rootfs");
+
+    // Stub flake source. `validate_flake_ref` accepts a local path
+    // containing `flake.nix`; the stub-outdir branch never reads
+    // it.
+    let flake_dir = sandbox.home_path().join("flake");
+    std::fs::create_dir_all(&flake_dir).expect("mkdir flake_dir");
+    std::fs::write(flake_dir.join("flake.nix"), b"# stub\n").expect("write stub flake");
+
+    let output = sandbox
+        .mvmctl()
+        .env("MVM_BUILD_STUB_OUTDIR", &stub_out)
+        .args([
+            "build",
+            "--flake",
+            flake_dir.to_str().expect("utf-8 flake path"),
+            "--profile",
+            "minimal",
+        ])
+        .output()
+        .expect("spawn mvmctl build");
+    assert!(
+        output.status.success(),
+        "mvmctl build failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "template_build");
+    assert!(
+        hits >= 1,
+        "expected ≥1 template_build entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("mode=flake"),
+        "expected detail to record mode=flake. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("artifact=stub-out"),
+        "expected detail to record artifact=stub-out (the stub-outdir basename). Full log:\n{log}"
+    );
+}
