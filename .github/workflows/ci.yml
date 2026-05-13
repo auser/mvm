@@ -116,6 +116,16 @@ jobs:
       - name: No Debug/Display on secret-named types
         run: cargo run -p xtask -- check-no-display-on-secret-types
 
+      # Plan 60 Phase 4 — every audit emit goes through the
+      # `audit_emit!` macro so the positional `(kind, vm, detail)`
+      # shape never sneaks back in. The macro keeps call sites
+      # one-liners and turns "add a new optional field" into a
+      # one-method change in the builder. Bypass via
+      # `// allow(audit-positional): <reason>` directly above the
+      # call (matches the secret-debug opt-out convention).
+      - name: No positional audit::emit / event-chain calls
+        run: cargo run -p xtask -- check-audit-positional
+
   test:
     name: Test
     runs-on: ubuntu-latest
@@ -131,7 +141,13 @@ jobs:
         # fails with `unable to find library -lcap-ng`. Ubuntu's GH
         # runner image ships the runtime library but not the -dev
         # headers/symlinks that `cc` needs at link time.
-        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+        #
+        # The secret-store live tests in tests/audit_emissions_live.rs
+        # pin `MVM_SECRET_STORE_BACKEND=file` in the sandbox, so no
+        # DBus / Secret Service is needed here.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcap-ng-dev
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -173,7 +189,13 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-e2e-
 
       - name: Run E2E tests
-        run: cargo test --test e2e
+        # The repo's end-to-end test target is `smoke_e2e_boot`
+        # (renamed from `e2e` during the workspace import). It
+        # self-skips unless `MVM_LIVE_SMOKE=1` + `MVM_TEST_ROOTFS`
+        # are set, so this lane runs the no-op skip path on
+        # GitHub-hosted runners and acts as a compile + linker
+        # tripwire for the boot-path crate graph.
+        run: cargo test --test smoke_e2e_boot
 
   # Note: cargo-audit, cargo-deny, reproducibility, and prod-agent-no-exec
   # were duplicated here AND in security.yml. They now live only in
@@ -228,10 +250,16 @@ jobs:
           # silently (the directory check failed in main CI after the
           # `nix/dev` + `nix/images/*` subtrees were removed without a
           # matching workflow update).
+          # `./` prefix is load-bearing: a bare path like `nix` or
+          # `nix/images/builder` is parsed as `flake:<name>` (registry
+          # lookup), not a local path. `nix` happens to resolve to
+          # NixOS/nix upstream — so the pre-fix command silently
+          # checked the wrong flake — while `nix/images/builder`
+          # fails with `'builder' is not a commit hash`.
           find nix -name flake.nix -type f -print0 | sort -z | while IFS= read -r -d '' flake; do
             d="$(dirname "$flake")"
             echo "=== $d ==="
-            nix flake check --no-build "$d"
+            nix flake check --no-build "./$d"
           done
 
   # ── Lane: Apple (release-only) ────────────────────────────────────

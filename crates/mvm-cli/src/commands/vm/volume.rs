@@ -197,13 +197,8 @@ fn mount(vm_name: &str, volume_name: &str, host: &str, guest: &str, rw: bool) ->
         "note: virtiofsd-on-host + Firecracker virtio-device-attach are a follow-up; \
          the registry entry + agent MountVolume verb are ready."
     );
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::VmVolumeAdd,
-        Some(vm_name),
-        Some(&format!(
-            "volume={volume_name} host={host} guest={canonical_guest} ro={}",
-            !rw
-        )),
+    mvm_core::audit_emit!(VmVolumeAdd, vm: vm_name, "volume={volume_name} host={host} guest={canonical_guest} ro={}" ,
+        !rw
     );
     Ok(())
 }
@@ -248,13 +243,8 @@ fn unmount(vm_name: &str, guest_path: &str) -> Result<()> {
         "{vm_name}: unmounted volume {} from {} (host={})",
         dropped.volume_name, dropped.guest_path, dropped.host_path
     );
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::VmVolumeRemove,
-        Some(vm_name),
-        Some(&format!(
-            "volume={} guest={}",
-            dropped.volume_name, dropped.guest_path
-        )),
+    mvm_core::audit_emit!(VmVolumeRemove, vm: vm_name, "volume={} guest={}" ,
+        dropped.volume_name, dropped.guest_path
     );
     Ok(())
 }

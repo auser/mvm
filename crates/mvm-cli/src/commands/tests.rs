@@ -1160,9 +1160,17 @@ fn test_run_cli_flag_overrides_config_memory() {
 }
 
 #[test]
-fn test_resolve_network_policy_default() {
+fn test_resolve_network_policy_default_is_deny_all() {
+    // ADR-002 claim 10: the safe default is deny-all. Workloads
+    // that need network access opt in explicitly. Pre-Sprint 52
+    // this test asserted `is_unrestricted()` — flipped here as
+    // part of the default flip.
     let policy = resolve_network_policy(None, &[]).unwrap();
-    assert!(policy.is_unrestricted());
+    assert!(!policy.is_unrestricted());
+    let rules = policy
+        .resolve_rules()
+        .expect("default resolves to a concrete rule set");
+    assert!(rules.is_empty(), "deny-all should yield no allow rules");
 }
 
 #[test]

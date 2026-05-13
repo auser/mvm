@@ -320,7 +320,7 @@ protocol-only` clean (mvmd-ready per plan 33).
 |---|---|---|---|
 | **L7 egress runtime backing** (7 tiers + 12 cross-cutting considerations folded — see plan 34 §"Cross-cutting considerations") | [`plans/34-egress-l7-proxy.md`](plans/34-egress-l7-proxy.md) | Heavyweight runtime dep (mitmdump pulls Python + cryptography, ~80 MiB closure); CA cert generation has corner cases (Name-Constrained per-VM leaves, rotation, expiry); DNS pinning needs IPv6 + CNAME-chain handling. Live-KVM integration testing is mandatory. New ADR-006 (PR #33) locks the cryptographic story before code starts. | ~1.5 sprints |
 | **A.2 v2 live-KVM smoke** (cold-boot vs warm-VM latency comparison on `claude-code-vm`; race-condition test for parallel first-calls in same session; snapshot-resume against the Anthropic-allowlisted agent VM) | Plan 32 §"Proposal A.2" | Hardware not available in the dev environment; needs a Linux/KVM host with a real Firecracker stack. | ~1 day |
-| **Hosted MCP transport (HTTP/SSE)** | [`plans/33-hosted-mcp-transport.md`](plans/33-hosted-mcp-transport.md) | Cross-repo: implementation lives in [mvmd](https://github.com/auser/mvmd). mvm-mcp's `protocol-only` feature is already shipped (PR #20) so mvmd can consume the wire schema unchanged. | mvmd owns sizing |
+| **Hosted MCP transport (HTTP/SSE)** | [`plans/33-hosted-mcp-transport.md`](plans/33-hosted-mcp-transport.md) | Cross-repo: implementation lives in [mvmd](https://github.com/tinylabscom/mvmd). mvm-mcp's `protocol-only` feature is already shipped (PR #20) so mvmd can consume the wire schema unchanged. | mvmd owns sizing |
 | **Per-template `default_network_policy`** ✅ shipped (PR `feat/template-default-network-policy`) | ADR-004 §"Decisions" 6 | `TemplateSpec` gains `Option<NetworkPolicy>` (back-compat via `#[serde(default)]` + `skip_serializing_if`). `mvmctl template create --network-preset agent` bakes it; `mvmctl up` consults it as fallback when no CLI flags supplied; `mvmctl template info` prints it. `llm-agent` README updated to use the baked default. | ~1 day |
 | **CI lane `mcp-server-smoke`** ✅ shipped (PR #24) | Plan 32 §"Proposal A — CI gate" | Real JSON-RPC roundtrip script + CI job. Caught a real `logging::init` stdout-pollution bug in the process. | ~½ day |
 
@@ -1043,6 +1043,10 @@ sweep (32 / 16 / 18).
 | 62 — docs sidebar restructure | Substrate (21 stubs + sidebar config) had already landed; this commit just marks the status | `ae10ad9` |
 | 44 — agent signal handling | W3 — SIGHUP config reload (hot-reloadable subset via atomics) | `05f956e` |
 | 60 — microsandbox migration | Phase 6 — on-disk policy-bundle TOML format (`mvm_policy::toml_loader` + W5 resolver upgrade) | `a457012` |
+| 60 | Phase 4 — LifecycleHooks + secret/cmd dual-emit + audit Recorder substrate | `d174a46`, `0cdd6b1`, `c096757`, `80f05bd` |
+| 60 | Phase 7 — host-mediated tools (substrate + time_now + web_fetch + web_search + upload + download), Brave + Tavily providers, reqwest fetcher, MCP dispatcher trait evolution, env-var operator config | `fab5edd`, `e500c18`, `a4ca401`, `72597e7`, `81fed76`, `8bcb2ed`, `f92e53a`, `c538180`, `0d0f3eb`, `5e62e5a` |
+| 60 | Phase 9 — `cargo xtask perf` rootfs-size + boot budgets | `b42e784` |
+| 60 | Phase 10 — in-repo close-out (status notes on plan-60 phase headers, Cargo.toml repository URL already canonical); workspace-parent filesystem rename + mvmd git pin bump remain operator actions | (this commit) |
 
 ### Shipped — campaign batch 2 (2026-05-11 evening)
 
@@ -1079,6 +1083,32 @@ Notes on commit-message vs diff mismatches in batch 2 (worth a
   WIP in the working tree. `0338c66` fixed the hook so this
   pattern won't recur.
 
+### Shipped — campaign batch 3 (2026-05-12, in flight as PR #106/#107/#108)
+
+Plan 60 Phase 4 audit-emit ergonomics + behavioral hardening, plus
+the cleanup-host-fs and MockBackend refactors that unlock VM-lifecycle
+live testing. Three open PRs stack on `main`:
+
+| PR | Branch | Scope | Live tests |
+|---|---|---|---|
+| #106 | feat/sprint-51-batch-3 | `audit_emit!` macro + `LocalAuditBuilder` API + `xtask check-audit-positional` lint + CI gate + 37-site positional emit migration + DRIFT-001 (microsandbox feature gate) + ADR-013 builder-VM swap | 6 → 26 |
+| #107 | feat/cleanup-host-fallback (targets #106) | `cleanup_old_dev_builds` drops `&dyn ShellEnvironment` for plain `std::fs`; `mvmctl cleanup` runs without a dev VM; SnapshotDelete live + 4 ReadOnly negative pins | 26 → 31 |
+| #108 | feat/mock-backend (targets #107) | `MockBackend` substrate (`AnyBackend::Mock` variant, 10 unit tests); `MVM_DIRECT_BOOT` LocalAudit emit parity + `--detach` fix; `up_with_mock_backend` end-to-end; `set-ttl` live + 8 more ReadOnly negative pins; ADR-044 documenting the convention | 31 → 40 |
+
+Coverage now: every Emits row in `AUDIT_POSTURE` that doesn't require
+a running Firecracker / Apple Container / Docker / microsandbox / Nix
+builder / GitHub network has a live drive-and-assert test. 15 ReadOnly
+leaves pin the no-emit invariants.
+
+Still hard (architectural refactors required to test hermetically):
+`pause` / `resume` (talk directly to FirecrackerIO, not through
+`AnyBackend.pause`/`resume`); `fs` / `proc start/signal/kill/stdin`
+(guest agent over vsock — needs vsock mock); `volume mount/unmount`
+(VM-attached); `build → TemplateBuild` (Nix builder); `update`
+(network); `uninstall` positive (real system paths).
+
+Reference: ADR-044 (`specs/adrs/044-audit-emit-macro.md`).
+
 ### Remaining workstreams (priority order)
 
 | # | Plan / phase | Est. days | Notes |
@@ -1086,13 +1116,13 @@ Notes on commit-message vs diff mismatches in batch 2 (worth a
 | 1 | Plan 60 Phase 3 Slice C — smoltcp/TUN userspace-TCP consumer + host firewall (nft / pf / WFP) + DNS server endpoint + per-tenant netns lift | 8-12 | The remaining Phase 3 work after Slices A + B + four resolver follow-ons closed in batch 2. Turns `L4Gate::evaluate` decisions into accept/drop on per-VM TAPs; brings up the firewall additive layer; provisions the resolver guest VMs point `/etc/resolv.conf` at. Pairs with the mvm-hostd lift (#7 below). |
 | 2 | Plan 60 Phase 4 — persistent observability | 5-8 | Scaffold shipped in batch 2 (`tests/audit_total_coverage.rs` recursive coverage of all CLI subcommands at every depth). Remaining: Prometheus + OTLP metrics endpoint; promote `audit_total_coverage` `Emits` rows to live drive-and-assert tests as each command gains a hermetic fixture; wire `bundle.audit.{chain_signing, stream_destinations}` into `AuditEmitter` construction; structured logs; event bus on `tokio::sync::broadcast`. |
 | 3 | Plan 60 Phase 5 — DX layer (Python SDK, manifests, mvm-studio handshake) | 7-10 | `python/mvm` wheels via pyo3; `cargo xtask gen-stubs` for typed APIs. Templates from `../mvm/templates/` rewritten on microvm.nix. |
-| 4 | Plan 60 Phase 7 — MCP server + host-mediated tools + sessions | 7-10 | PR #105 exposes `run`, `mvm.time_now`, `mvm.web_fetch`, and `mvm.web_search`; CI smoke now asserts the four-tool MCP list and the secret audit live test pins `MVM_SECRET_STORE_BACKEND=file` for hermetic Linux runners. Remaining follow-up: snapshot/eval/upload/download and tmux-style sessions. |
+| 4 | Plan 60 Phase 7 — MCP server + host-mediated tools + sessions | 7-10 | PR #105 exposes `run`, `mvm.time_now`, `mvm.web_fetch`, `mvm.web_search`, `mvm.upload`, and `mvm.download`; CI smoke now asserts that MCP tool set and the secret audit live test pins `MVM_SECRET_STORE_BACKEND=file` for hermetic Linux runners. Remaining follow-up: snapshot/eval and tmux-style sessions. |
 | 5 | Plan 60 Phase 7a — install/rebuild/persistent overlay/tenant destroy | 10-12 | Encrypted persistent overlay (extends plan 45's volume work); rolling rootfs swap; `mvmctl tenant destroy` emits a destruction certificate. |
 | 6 | Plan 60 Phase 7b — built-in templates + TypeScript SDK | 5-7 | `ai-sandbox` / `safe-openclaw` / `computer-use` / `repl` templates with bundled policy bundles. `typescript/@mvm/sdk` napi-rs binding for hot paths. |
 | 7 | Plan 60 Phase 8 — mvmd integration contract verification | 3-5 | Port `mvm/src/hostd/{mod,server}.rs`; `PROTOCOL_VERSION` const; wire-format stability test. **Coordinated with parallel mvmd work** — see "Cross-repo coordination" below. The mvm-hostd supervisor lift this depends on is what makes every Live impl in `slots_from_bundle` (shipped batch 2) actually enforce. |
 | 8 | Plan 60 Phase 9 — perf + supply chain + SBOM | 7-10 | Cold-boot ≤500 ms Firecracker / ≤1 s microsandbox; rootfs ≤20 MB; PGO + MUSL builds; cosign-keyless artifacts; RFC 3161 timestamping. |
 | 9 | Plan 60 Phase 10 — rename + archive | 1 | `git mv mvm mvm` + update CI paths + bump mvmd's git pin. |
-| 10 | Plans 48 + 49 — function-service factories (ADR-010) | 7-10 | Wrapper-template relocation + function-service factory pattern. |
+| 10 | Plans 48 + 49 + 71 — function-service factories (ADR-010) + workload helper | 7-10 | Wrapper-template relocation + function-service factory pattern. Plan 71 wires `mkFunctionService` into a one-line IR-to-image helper (`mkFunctionWorkload`); unblocks Phase 5 Slice E3 live-VM smoke. |
 | 11 | Plans 51 + 52 — session-lifecycle verbs + fd3 control channel (ADR-011) | 10-14 | Largest substrate change in the function-call line. |
 | 12 | Plan 61 — runtime overlays + billing | 14-21 | Dev/prod image transparency + sandbox-runtime billing dimensions. Six phases. |
 | 13 | Status sweep — plan 32 tail (MCP adoption tiers L1/L2/L4), plan 16 (microvm-nix-integration), plan 18 (nix-openclaw-integration) | 3-5 | Several minor plans with partial completion — audit + close or roll into a follow-up sprint. |
@@ -1210,6 +1240,381 @@ Sprint 51 closes when:
    test growth).
 5. CHANGELOG.md `[Unreleased]` section captures every shipped
    plan with date, commit SHAs, and links to ADRs.
+
+## Sprint 52 — elastic memory + portable signed bundles (in flight)
+
+Two ergonomics + reach gaps in the platform that need closing
+without compromising the eight ADR-002 security claims. The
+decision document outside the repo enumerates eight candidates;
+this sprint lands the top two:
+
+1. **Virtio-balloon elasticity** — "mem cap, not commitment."
+2. **Portable image bundles + per-artifact attestation in a signed
+   envelope** — content-addressed `.mvmpkg` replaces the
+   manifest-path-hash registry keying.
+
+### W1 — Virtio-balloon elasticity  ✅ shipped
+
+Workloads opting into `mem_initial_mib` boot with a pre-inflated
+balloon and only commit a fraction of `memory_mib`; a host-side
+reclaim controller adjusts the balloon over the VM's life.
+
+Shipped:
+
+- `mvm-core` — `VmStartConfig::mem_initial_mib`,
+  `VmCapabilities::balloon`, `BalloonState`,
+  `VmBackend::balloon_set_target` + `balloon_state` trait methods.
+- `mvm-backend::microvm` — `FlakeRunConfig::mem_initial` +
+  validate(); FC start path PUTs `/balloon` with
+  `deflate_on_oom: true`; new `balloon_set_target` / `balloon_state`
+  free functions wrap the FC PATCH + GET endpoints.
+- `mvm-backend::cloud_hypervisor` — `VmConfigArgs::balloon_mib`,
+  emits the top-level `"balloon"` field in vm.create JSON, and
+  `balloon_set_target` posts to `/api/v1/vm.resize`
+  (`desired_balloon`); `balloon_state` parses `/api/v1/vm.info`.
+- `mvm-backend::{apple_container, docker, libkrun, microsandbox,
+  microvm_nix}` — `VmCapabilities::balloon = false` declared
+  honestly with rationale next to each (Apple's VZ has no
+  virtio-balloon; Docker is cgroup-mem not balloon; libkrun's C
+  API + microsandbox builder don't surface balloon control today).
+- `mvm-core::manifest` — `mem_initial: Option<String>` field with
+  `parse_human_size`-backed validation (rejects zero, rejects
+  `>= mem`); `Manifest::mem_initial_mib()` helper.
+- `mvm-backend::image::RuntimeConfig.mem_initial` for the
+  `--config` flow.
+- `mvm-cli::commands::shared::start::VmStartParams.mem_initial_mib`
+  threading through both `up.rs` call sites.
+- `mvm-cli::exec::ExecRequest.mem_initial_mib` threading;
+  short-lived session VM and `mvmctl exec` default to `None`
+  (no balloon).
+- `mvm-supervisor::balloon` — pure-function `BalloonPolicy`
+  (two-threshold band + guest floor) returning `BalloonAction`
+  decisions. Defaults: inflate above 0.80, deflate below 0.60,
+  step 64 MiB, guest floor 64 MiB. Fully unit-tested.
+
+Shipped in the W1 close-out commit:
+
+- `HostPressureSource` trait + `SysinfoPressureSource` cross-
+  platform impl. Linux PSI (`/proc/pressure/memory`) and macOS
+  `vm_pressure` are stronger signals; alternative impls behind the
+  same trait are the natural next refinement.
+- `BalloonController<P>` with a pure `tick(vm_states, apply)`
+  method: reads pressure once per tick (not per VM), decides each
+  VM's action via `BalloonPolicy`, applies via the caller's
+  closure. `TickOutcome` per VM carries the decision + applied
+  flag + per-VM error. Pressure-read failure aborts the whole
+  tick rather than applying with a stale value.
+- `mvmctl doctor` "Memory ballooning (virtio-balloon)" section
+  enumerates every backend's `capabilities().balloon`; surfaces a
+  warning when no backend on the host advertises support.
+- `Manifest::mem_initial` flows end-to-end:
+  `Manifest::mem_initial_mib()` → `PersistedManifest.mem_initial_mib`
+  → `TemplateSpec.mem_initial_mib` → `up.rs` resolves
+  `final_mem_initial = rt_config.or(tmpl_mem_initial).filter(0 < n < final_memory)`.
+  Old slot records that predate the field deserialise as `None`
+  (no behaviour change).
+
+Outstanding (deferred to follow-ups):
+
+- Live-KVM smoke: assert host RSS climbs/falls as the controller
+  inflates/deflates against a real Firecracker guest. Needs CI
+  infrastructure that mvm doesn't have today.
+- PSI / `vm_pressure` `HostPressureSource` impls. The current
+  sysinfo-based source is "used/total" — fine for dev-laptop
+  ergonomics, too coarse for production scheduling.
+- Spawn the tick into a real loop inside the supervisor's main
+  loop. Today the controller is a library piece; wiring it into
+  the supervisor's lifecycle is the integration follow-up.
+
+### W2 — Portable image bundles + per-artifact attestation  ✅ admit-time re-verify shipped
+
+Sigstore-style trust model: bundle ships a signed `manifest.json`
+with per-artifact SHA-256s; the publisher's public key lives
+out-of-band at `~/.mvm/trusted-publishers/<key_id>.pub`. dm-verity
+(claim 3) gives independent per-block integrity inside the rootfs.
+Bundle hash + `key_id` pin into `PlanArtifact` so admission
+re-verifies on every launch.
+
+Shipped (`mvm-plan::bundle`):
+
+- `BundleManifest` (canonical-JSON, `deny_unknown_fields`),
+  `BundleArtifact`, `ArtifactRole` enum, `VerityInfo` binding.
+- `KeyId` — content-derived identifier (sha256(pubkey) truncated to
+  32 hex chars). Well-formedness validator.
+- `write_bundle()` — emits a tar archive of `manifest.json` +
+  `manifest.sig` + `artifacts/*`. Pre-flight asserts the signing
+  key matches the manifest's declared `key_id` and that every
+  artifact byte-blob matches its declared sha256 + size_bytes.
+- `read_and_verify_bundle()` — 6-step verification sequence:
+  schema-version sniff (pre-sig) → key_id probe (pre-sig) →
+  trust-store lookup → Ed25519 verify → full manifest parse →
+  per-artifact sha256 + size + path-safety re-check. All four
+  failure modes (UnknownKey, SignatureInvalid,
+  ArtifactSha256Mismatch, UnsafePath) reject before extraction.
+- `TrustStore` trait + `FsTrustStore` rooted at
+  `~/.mvm/trusted-publishers/<key_id>.pub`. Pubkey files are 32
+  raw Ed25519 bytes — no PEM, no headers; populated out-of-band
+  for now (`mvmctl trust add` is the follow-up).
+- `PlanArtifact` (re-exported from `mvm_plan::PlanArtifact`):
+  `bundle_sha256` + base64 `manifest_sig` + `key_id`. Sized for
+  inlining inside an `ExecutionPlan`; the supervisor's admit path
+  re-verifies in a follow-up.
+- 18 new unit tests covering: clean round-trip, unknown-key
+  rejection, tampered manifest rejection (sig fail or parse fail),
+  wrong key under correct key_id (KeyIdMismatch), tampered
+  artifact byte rejection (with same-length tamper to exercise the
+  hash path), missing-artifact rejection, unsafe-path rejection
+  (`..`), schema-version-bump rejection, write-time key/key_id
+  mismatch detection, write-time artifact sha256 drift detection,
+  trust-store file load + miss + malformed-key-id short circuit,
+  PlanArtifact JSON round-trip + signature re-decode + deny-unknown-fields.
+
+Shipped in the W2 close-out commit:
+
+- `mvmctl bundle export <TEMPLATE> --out <PATH> [--label]`:
+  resolves the template's current revision (kernel + rootfs +
+  optional initrd + optional dm-verity sidecar), hashes each
+  artifact, builds a `BundleManifest`, signs with the host signer
+  (same key that signs `ExecutionPlan` envelopes), and writes the
+  archive. Refuses to ship a bundle whose declared sha256/size or
+  key_id doesn't match the signing key / actual bytes — caught at
+  write time so misconfigured publishers never ship unverifiable
+  bundles.
+- `mvmctl bundle fetch <SOURCE> [--trust-store <DIR>] [--json] [--allow-http]`:
+  reads the archive (from a local path **or** an `https://` URL —
+  HTTPS uses rustls + webpki-roots through the existing
+  `crate::http::download_file` helper, written to a temp file
+  that drops on scope exit), looks the publisher pubkey up via
+  `FsTrustStore` (defaults to `~/.mvm/trusted-publishers/`), runs
+  the full 6-step rejection ladder, prints a verified-bundle
+  summary (sha256, key_id, publisher, arch, profile, label,
+  artifact count, verity yes/no) or full manifest JSON. Plain
+  `http://` URLs are refused by default — the Ed25519 signature
+  still catches tampering, but HTTP exposes traffic metadata, so
+  the user must opt in explicitly via `--allow-http` (with a
+  launch-time warning). Refuses on any verification failure
+  before extraction.
+- `mvmctl trust add <PUBKEY> [--force]`: reads 32 raw Ed25519
+  pubkey bytes, derives `key_id`, writes `<key_id>.pub` to the
+  trust store (mode 0644). Refuses to overwrite without `--force`.
+  Trust-store directory created at mode 0700 on first use.
+- `mvmctl trust list [--json]`: enumerates the store, filters to
+  well-formed `<key_id>.pub` entries, sorted output.
+- `mvmctl trust remove <KEY_ID>`: unlinks by key_id; refuses if
+  the key_id is malformed (32 hex chars expected).
+- `cmd_audit::verb_name` + `AUDIT_POSTURE` table extended with
+  `bundle` (DelegatesToSub: export = `InteractiveOrControl`,
+  fetch = `ReadOnly`) and `trust` (DelegatesToSub: add/remove =
+  `InteractiveOrControl` until the audit-chain emitter wiring
+  lands; list = `ReadOnly`).
+- ADR-002 9th claim shipped: *every published bundle is
+  content-addressed, key_id-pinned, and re-verified at fetch.*
+  Backed by `mvm_plan::bundle::read_and_verify_bundle` rejection-
+  ladder tests. ADR-002 also caught up to document claim 8
+  (signed `ExecutionPlan`, already shipped in plan 64 / ADR-041
+  but never previously in the ADR table).
+
+Shipped in the W2 admit-time re-verify commit:
+
+- `ExecutionPlan::bundle: Option<PlanArtifact>` field. Schema
+  bumped 2 → 3 — older verifiers fail closed with
+  `UnsupportedSchema` because they don't know how to enforce the
+  re-verify the new field implies. Schema-sniff order preserved:
+  signature → version → parse, so an unknown future bundle field
+  can't bypass the verifier.
+- `BundleResolver` trait + `FsBundleResolver` rooted at
+  `~/.mvm/bundles/<bundle_sha256>.mvmpkg` (default-path matches
+  the `FsTrustStore` shape).
+- `verify_plan_bundle(pin, resolver, trust)` — wraps
+  `read_and_verify_bundle` and cross-checks the archive's
+  `bundle_sha256` + `manifest_sig` + `key_id` against the plan's
+  pin. Distinct `PlanBundleError` variants for each rejection
+  shape (Resolve, Verify, BundleSha256Mismatch, KeyIdMismatch,
+  SignatureMismatch, SignatureRead).
+- `admit_for_run` accepts an optional
+  `BundleAdmissionContext { resolver, trust }` parameter. When
+  the plan pins a bundle, admit_for_run runs
+  `verify_plan_bundle` after the signature/window/nonce checks.
+  Plan pinned but context absent = operator misconfiguration =
+  refuse (fail closed, not fail open).
+- `SynthesisInput.bundle_pin: Option<PlanArtifact>` carries an
+  upstream pin into the synthesized plan via
+  `plan.bundle = input.bundle_pin.clone()`. Today's `mvmctl up`
+  path passes `None`; the CLI flag that populates it (`--bundle-pin
+  <path>` reading a fetched + verified `.mvmpkg`) is the next
+  surface-completing commit.
+- 4 new admit-level tests (positive + 3 refusals) plus 8 new
+  `verify_plan_bundle` tests covering every PlanBundleError
+  variant.
+
+Shipped in the W2 follow-on (registry replacement + bundle-pin
+CLI + audit-kind variants):
+
+- **Bundle registry** at `~/.mvm/bundles/<sha>/`. New
+  `BundleRegistry::install` atomically extracts a verified
+  `.mvmpkg` (stage to `<sha>.partial/`, rename to `<sha>/`),
+  also persists the archive bytes at `<sha>.mvmpkg` so
+  `FsBundleResolver` continues to find them. `find(sha)` returns
+  an `InstalledBundle` with `path_for_role()` / `path_for_name()`
+  helpers. `template_artifacts_dispatched` and the three other
+  `_dispatched` variants now disambiguate 64-char hex ids:
+  templates-slot wins when present, fall through to bundle
+  registry otherwise. Bundle-served templates default vcpus/mem
+  from operator config (manifest doesn't carry resources today).
+- **`mvmctl bundle install <SOURCE> [--force]`** verb. Reuses
+  `BundleSource` parser from fetch.rs (local path or `https://`);
+  runs the verification ladder, atomically installs, prints
+  `Installed bundle <sha> (N artifacts, key_id=...)`.
+- **`mvmctl up --bundle-pin <PATH>`** flag. Reads the archive,
+  verifies via `FsTrustStore::default_path()`, derives the
+  `PlanArtifact` triple via `bundle_pin_from_archive`, hands an
+  in-memory `BundleAdmissionContext` to `admit_for_run`. Claim 9
+  re-verify fires on every launch.
+- **`LocalAuditKind::TrustAdd` / `TrustRemove`** added to the
+  audit-kind enum + casing pins + serde round-trip test.
+  `mvmctl trust add/remove` now emit via
+  `mvm_core::audit::emit`; `AUDIT_POSTURE` TRUST_SUB flipped from
+  `InteractiveOrControl` → `Emits(...)`.
+- `BUNDLE_SUB::install` row added with posture
+  `InteractiveOrControl` (will flip to `Emits("BundleInstall")`
+  once the install audit hook ships).
+
+Closed out in the W2 final commits (`90cef3d`, `ad3f52c`,
+TBD-resources):
+
+- `LocalAuditKind::BundleInstall` variant + emit from
+  `mvmctl bundle install` + AUDIT_POSTURE flipped to
+  `Emits("BundleInstall")`.
+- `mvmctl bundle gc <SHA>` and `--all` verbs +
+  `BundleRegistry::remove` + `list` + new
+  `LocalAuditKind::BundleGc`. Interactive --all confirms unless
+  `--yes` (or non-TTY).
+- `BundleResources { vcpus, mem_mib }` optional field on
+  `BundleManifest`. **BUNDLE_SCHEMA_VERSION bumped 1 → 2.** v1
+  bundles deserialise cleanly with `resources = None`; v2 with
+  resources are the new default for `mvmctl bundle export`.
+  Older verifiers see `schema_version = 2` and refuse with
+  `UnsupportedSchema` (deliberate fail-closed).
+  `bundle_artifacts_for_sha` prefers manifest resources over
+  operator config when present; CLI `--cpus` / `--memory` still
+  override.
+
+W2 is now fully shipped end-to-end with no outstanding follow-ups.
+
+### W3 — Network default flip (deny-by-default)  ✅ shipped
+
+Pre-Sprint 52 `NetworkPolicy::default()` returned `unrestricted()`
+— the entire rest of the ADR-002 model confined the guest at every
+other layer, but egress was wide open. W3 flips the safe default
+to `deny_all()`. Workloads that need network access opt in
+explicitly via `--network-preset` / `--network-allow` /
+`mvmctl trust`-provisioned template policies.
+
+Shipped:
+
+- `NetworkPolicy::default()` in
+  `crates/mvm-core/src/policy/network_policy.rs` returns
+  `Self::deny_all()` (was `Self::unrestricted()`).
+- `mvmctl up` warning when the resolved policy is unrestricted —
+  both for the explicit-CLI-flag path
+  (`--network-preset unrestricted`) and for templates whose baked
+  `default_network_policy` is unrestricted. Names the source so
+  the user knows where the opt-out came from. Suppressible via
+  `MVM_ACK_UNRESTRICTED_NETWORK=1` for CI / scripted use.
+- ADR-002 10th claim shipped: *no untrusted workload reaches the
+  network unless explicitly admitted by policy.* Framework refs
+  added (ATT&CK T1071 / T1041; D3FEND Network Traffic Filtering;
+  CREF Privilege Restriction).
+- Tests updated:
+  - `policy_default_is_deny_all` (renamed from
+    `policy_default_is_unrestricted`) asserts the deny-all shape.
+  - `test_resolve_network_policy_default_is_deny_all` flipped to
+    match. Comment notes the pre-Sprint-52 expectation.
+- 334 supervisor + all-crate lib tests green;
+  `cargo test --test audit_total_coverage` green; clippy clean.
+
+Breaking change disclosure for release notes:
+
+> **Breaking:** `mvmctl up` and the rest of mvm now refuse network
+> egress by default. Workloads that previously relied on
+> implicit unrestricted egress must pass
+> `--network-preset unrestricted` (which emits a launch-time
+> warning) or one of the safer presets (`dev`, `agent`,
+> `registries`). The escape hatch
+> `MVM_ACK_UNRESTRICTED_NETWORK=1` suppresses the warning.
+
+Outstanding (deferred follow-ups):
+
+- CI lane `network-default-is-deny` — a black-box assertion that
+  `mvmctl up` with no flags refuses outbound connectivity from
+  inside the guest. Needs a live-KVM smoke harness mvm doesn't
+  have today; the unit-level guarantee shipped in this commit.
+- `mvmctl doctor` could surface the network default visibly in
+  its security-posture section as a corollary of claim 10. The
+  posture section reads from `BackendSecurityProfile`; teaching
+  it about runtime policy defaults is a small follow-on.
+
+### W4 — OCI export (reach to non-KVM hosts) ✅ shipped
+
+Sprint 52 follow-on item from the original ranking (`#4a` in the
+decision doc) — extends mvm-built workloads to hosts without KVM
+by exposing the OCI tarball Nix already produces internally.
+
+Shipped:
+
+- `template_build_from_manifest` now copies `image.tar.gz` into
+  the slot's revision dir (when the flake's `mkGuest` opted into
+  `dockerTools.streamLayeredImage`). Best-effort — flakes that
+  don't emit it just don't get one.
+- New `mvmctl manifest export-oci <TEMPLATE> --out <PATH>` verb.
+  Resolves a slot-hash / manifest-path / legacy name to the slot
+  dir, finds the OCI tarball alongside the rootfs, copies it to
+  `--out`. Clear error when the tarball is absent (with the
+  rebuild hint).
+- `LocalAuditKind::ImageExportOci` variant + snake_case wire pin
+  (`image_export_oci`) + all-variants serialize roundtrip.
+- AUDIT_POSTURE MANIFEST_SUB gains an `export-oci` row with
+  `Emits("ImageExportOci")`.
+- 2 new tests: resolve-to-slot-hash rejects unknown shas with a
+  hint, verb is registered in the CLI tree.
+
+End-to-end flow:
+
+```
+# Build the template on a KVM host
+mvmctl build <manifest>
+# Export to a Docker-loadable tarball
+mvmctl manifest export-oci <slot> --out ./mvm-workload.tar.gz
+# On any host with Docker / Podman
+docker load -i mvm-workload.tar.gz
+docker run mvm-...
+```
+
+Outstanding (deferred):
+
+- Bundle-source path: `mvmctl bundle export-oci <sha>` for
+  installed bundles, not just slot-built templates. Bundle
+  manifests don't currently carry the OCI tarball; adding it
+  would be a bundle-schema bump.
+- Direct `--push <registry>` for one-step deployment. The current
+  shape is "copy to a file, then docker push manually" — `--push`
+  would streamline.
+
+### Sprint 52 success criteria
+
+1. *A workload with `mem_initial = "256M"` and `mem = "1024M"`
+   boots on Firecracker and cloud-hypervisor with the balloon
+   pre-inflated to 768 MiB; the host commits 256 MiB.*
+2. *`AnyBackend::balloon_set_target` adjusts a running FC VM's
+   commitment without reboot, observable through `balloon_state`.*
+3. *A `.mvmpkg` bundle built on machine A round-trips through the
+   registry, fetches to machine B, and `mvmctl up` succeeds; a
+   tampered manifest fails admission with a clear error.*
+4. *`mvm_plan::verify_plan` refuses an `ExecutionPlan` pinned to
+   a bundle whose `key_id` is not in the consumer's trust store.*
+5. *Backwards compatibility: every existing workspace test plus
+   `cargo clippy --workspace --all-targets -- -D warnings` stays
+   green throughout.*
 
 ## Completed Sprints
 

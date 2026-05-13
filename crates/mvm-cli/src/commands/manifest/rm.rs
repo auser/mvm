@@ -56,13 +56,11 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         println!("Removed slot {}", slot_hash);
     }
 
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::SlotRemove,
-        Some(&slot_hash),
-        Some(&format!(
-            "manifest_path={} manifest_file_deleted={manifest_file_deleted}",
-            canonical.display()
-        )),
+    mvm_core::audit_emit!(
+        SlotRemove,
+        vm: slot_hash.clone(),
+        "manifest_path={} manifest_file_deleted={manifest_file_deleted}",
+        canonical.display(),
     );
 
     Ok(())

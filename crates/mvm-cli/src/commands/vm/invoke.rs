@@ -90,14 +90,110 @@ pub(in crate::commands) struct Args {
     /// compiled in.
     #[arg(long, requires = "keep_alive")]
     pub keep_alive_dev: bool,
+
+    /// Attach this call to an existing warm session id. The Python /
+    /// TypeScript SDKs pass this when a user wraps `f.remote(...)` in
+    /// an `mv.session(...)` context manager, so multiple back-to-back
+    /// calls reuse the same warm VM. **Plan 60 Phase 5 Slice E1: the
+    /// flag is accepted so the SDK's argv doesn't get rejected at
+    /// parse time, but routing into an existing session is wired by
+    /// the session-pool plan (Phase 5c).** A non-empty value prints a
+    /// warning and the call falls back to the transient-VM path.
+    #[arg(long, value_name = "ID")]
+    pub session: Option<String>,
+
+    /// Dispatch into a specific function within a multi-function app
+    /// (ADR-0014 Phase 2). Single-function apps ignore the selector
+    /// because their primary entrypoint is the only one. **Plan 60
+    /// Phase 5 Slice E1: the flag is accepted so the SDK's argv
+    /// (`--fn <name>` from `WorkloadRef.attr(...)`) doesn't get
+    /// rejected; actual routing lands when ADR-0014 Phase 2 wires
+    /// per-function dispatch on the agent side.**
+    #[arg(long, value_name = "NAME")]
+    pub r#fn: Option<String>,
+
+    /// **Dev shortcut** — bypass VM boot and run the workload's
+    /// wrapper directly on the host. Exercises the full wire contract
+    /// (encode → wrapper → user function → encode → decode) without
+    /// any Nix or virtualization. Plan 60 Phase 5 Slice E1b. The
+    /// `--language` / `--module` / `--function` / `--format` /
+    /// `--source-path` flags below carry the per-call info the SDK
+    /// would normally bake into `/etc/mvm/wrapper.json` at image
+    /// build time; the positional manifest argument is accepted but
+    /// ignored.
+    ///
+    /// **Not for production.** None of the in-VM hardening
+    /// (seccomp tier, namespace isolation, RLIMIT_CORE) applies. Use
+    /// for SDK iteration, CI smoke, and dev loops on machines
+    /// without Linux/KVM/Lima.
+    #[arg(long)]
+    pub no_vm: bool,
+
+    /// Wrapper language for `--no-vm`. Maps directly to the IR
+    /// `Entrypoint::Function.language` field. Required when
+    /// `--no-vm` is set; ignored otherwise.
+    #[arg(long, value_name = "LANG", requires = "no_vm")]
+    pub language: Option<String>,
+
+    /// Module identifier for `--no-vm`. For Python: dotted path
+    /// (`pkg.mod`). For Node: module path (`./src/mod.mjs`).
+    /// Required when `--no-vm` is set.
+    #[arg(long, value_name = "MODULE", requires = "no_vm")]
+    pub module: Option<String>,
+
+    /// Function identifier within the module for `--no-vm`.
+    /// Required when `--no-vm` is set.
+    #[arg(long, value_name = "FUNCTION", requires = "no_vm")]
+    pub function: Option<String>,
+
+    /// Wire-format for stdin args + stdout return under `--no-vm`.
+    /// One of `json` or `msgpack`. Default `json`.
+    #[arg(long, value_name = "FMT", default_value = "json", requires = "no_vm")]
+    pub format: String,
+
+    /// Absolute path to the user's source tree for `--no-vm`. The
+    /// wrapper imports `<module>` relative to this path. Required
+    /// when `--no-vm` is set.
+    #[arg(long, value_name = "PATH", requires = "no_vm")]
+    pub source_path: Option<String>,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
+    if args.no_vm {
+        // Dev shortcut — bypass VM boot and run the wrapper directly
+        // on the host. Plan 60 Phase 5 Slice E1b. See
+        // `invoke_no_vm.rs` for the full contract. `eprintln!`
+        // instead of `ui::warn` because the latter writes to stdout
+        // (a pre-existing inconsistency vs `ui::error`); stdout under
+        // --no-vm is reserved for the wrapper's encoded return value
+        // that the SDK decodes.
+        eprintln!(
+            "[mvm] --no-vm: bypassing VM boot, running wrapper on the host. \
+             Not for production. None of the in-VM hardening applies."
+        );
+        let stdin_bytes = read_stdin_payload(args.stdin.as_deref())?;
+        let exit_code = super::invoke_no_vm::run(&args, stdin_bytes)?;
+        std::process::exit(exit_code);
+    }
     if args.reset {
         ui::warn(
             "--reset is wired but no-op in this build (session-pool plan); \
              treating as default behaviour",
         );
+    }
+    if let Some(id) = &args.session {
+        ui::warn(&format!(
+            "--session {id} is accepted but no-op in this build \
+             (session-pool plan, plan 60 Phase 5c); falling back to a \
+             transient VM for this call"
+        ));
+    }
+    if let Some(name) = &args.r#fn {
+        ui::warn(&format!(
+            "--fn {name} is accepted but no-op in this build \
+             (multi-function dispatch lands with ADR-0014 Phase 2); \
+             the workload's primary entrypoint will be dispatched"
+        ));
     }
 
     // v1: invoke targets a *template*. Resolve through the same shared

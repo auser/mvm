@@ -1,5 +1,5 @@
 //! Nix-specific helpers — flake/profile manifest schema and builder script
-//! templates rendered through Tera.
+//! templates rendered through the small placeholder renderer in `scripts`.
 
 pub mod manifest;
 pub mod scripts;

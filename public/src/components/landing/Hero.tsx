@@ -67,7 +67,7 @@ export function Hero() {
   const base = rawBase.endsWith("/") ? rawBase : `${rawBase}/`;
   const [copied, setCopied] = useState(false);
   const installCmd =
-    "curl -fsSL https://raw.githubusercontent.com/auser/mvm/main/install.sh | sh";
+    "curl -fsSL https://raw.githubusercontent.com/tinylabscom/mvm/main/install.sh | sh";
 
   function copyInstall() {
     navigator.clipboard.writeText(installCmd);
@@ -125,7 +125,7 @@ export function Hero() {
                 <Button size="lg">Get Started</Button>
               </a>
               <a
-                href="https://github.com/auser/mvm"
+                href="https://github.com/tinylabscom/mvm"
                 target="_blank"
                 rel="noopener"
               >

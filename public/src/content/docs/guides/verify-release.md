@@ -8,7 +8,7 @@ description: How to verify that an mvmctl release binary was built by the offici
 Every `mvmctl` release is signed using [Sigstore cosign](https://docs.sigstore.dev/cosign/overview/) with keyless OIDC signing. This means:
 
 - **No secret key is stored anywhere** — signatures are tied to the GitHub Actions OIDC token used at release time.
-- **Verification proves provenance** — the artifact was built by the official `release.yml` workflow, from the `auser/mvm` repository, at a specific tag.
+- **Verification proves provenance** — the artifact was built by the official `release.yml` workflow, from the `tinylabscom/mvm` repository, at a specific tag.
 - **Tamper detection** — any modification to the binary after signing will cause verification to fail.
 
 Each release includes, alongside the `.tar.gz` archives:
@@ -40,15 +40,15 @@ apt install cosign
 
 ## Verifying a Release Binary
 
-1. Download the archive and its bundle from the [GitHub releases page](https://github.com/auser/mvm/releases):
+1. Download the archive and its bundle from the [GitHub releases page](https://github.com/tinylabscom/mvm/releases):
 
 ```bash
 # Replace <version> and <target> as appropriate
 VERSION=v0.7.0
 TARGET=aarch64-apple-darwin  # or x86_64-apple-darwin, x86_64-unknown-linux-gnu, etc.
 
-curl -LO "https://github.com/auser/mvm/releases/download/${VERSION}/mvmctl-${TARGET}.tar.gz"
-curl -LO "https://github.com/auser/mvm/releases/download/${VERSION}/mvmctl-${TARGET}.tar.gz.bundle"
+curl -LO "https://github.com/tinylabscom/mvm/releases/download/${VERSION}/mvmctl-${TARGET}.tar.gz"
+curl -LO "https://github.com/tinylabscom/mvm/releases/download/${VERSION}/mvmctl-${TARGET}.tar.gz.bundle"
 ```
 
 2. Verify the signature:
@@ -57,7 +57,7 @@ curl -LO "https://github.com/auser/mvm/releases/download/${VERSION}/mvmctl-${TAR
 cosign verify-blob \
   --bundle "mvmctl-${TARGET}.tar.gz.bundle" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --certificate-identity-regexp "https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/.*" \
+  --certificate-identity-regexp "https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/.*" \
   "mvmctl-${TARGET}.tar.gz"
 ```
 
@@ -74,13 +74,13 @@ Any failure means the artifact was not produced by the official pipeline and **s
 ## Verifying the SBOM
 
 ```bash
-curl -LO "https://github.com/auser/mvm/releases/download/${VERSION}/sbom.cdx.json"
-curl -LO "https://github.com/auser/mvm/releases/download/${VERSION}/sbom.cdx.json.bundle"
+curl -LO "https://github.com/tinylabscom/mvm/releases/download/${VERSION}/sbom.cdx.json"
+curl -LO "https://github.com/tinylabscom/mvm/releases/download/${VERSION}/sbom.cdx.json.bundle"
 
 cosign verify-blob \
   --bundle sbom.cdx.json.bundle \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --certificate-identity-regexp "https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/.*" \
+  --certificate-identity-regexp "https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/.*" \
   sbom.cdx.json
 ```
 
@@ -93,7 +93,7 @@ cosign verify-blob \
 To verify manually:
 
 ```bash
-curl -LO "https://github.com/auser/mvm/releases/download/${VERSION}/checksums-sha256.txt"
+curl -LO "https://github.com/tinylabscom/mvm/releases/download/${VERSION}/checksums-sha256.txt"
 shasum -a 256 --check <(grep "mvmctl-${TARGET}.tar.gz" checksums-sha256.txt)
 ```
 
@@ -104,7 +104,7 @@ shasum -a 256 --check <(grep "mvmctl-${TARGET}.tar.gz" checksums-sha256.txt)
 | Claim | How it's enforced |
 |-------|------------------|
 | Built by GitHub Actions | `--certificate-oidc-issuer https://token.actions.githubusercontent.com` |
-| From the `auser/mvm` repo | `--certificate-identity-regexp .../auser/mvm/...` |
+| From the `tinylabscom/mvm` repo | `--certificate-identity-regexp .../tinylabscom/mvm/...` |
 | By the release workflow | `--certificate-identity-regexp .../release.yml...` |
 | At a specific git tag | The OIDC token embeds the `ref` claim |
 
@@ -123,13 +123,13 @@ VERSION=v0.14.0  # replace with the release you're verifying
 ARCH=aarch64     # or x86_64
 VARIANT=dev      # or builder
 
-curl -LO "https://github.com/auser/mvm/releases/download/${VERSION}/${VARIANT}-image-${ARCH}.manifest.json"
-curl -LO "https://github.com/auser/mvm/releases/download/${VERSION}/${VARIANT}-image-${ARCH}.manifest.json.bundle"
+curl -LO "https://github.com/tinylabscom/mvm/releases/download/${VERSION}/${VARIANT}-image-${ARCH}.manifest.json"
+curl -LO "https://github.com/tinylabscom/mvm/releases/download/${VERSION}/${VARIANT}-image-${ARCH}.manifest.json.bundle"
 
 cosign verify-blob \
   --bundle "${VARIANT}-image-${ARCH}.manifest.json.bundle" \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --certificate-identity-regexp "https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/${VERSION}" \
+  --certificate-identity-regexp "https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/${VERSION}" \
   "${VARIANT}-image-${ARCH}.manifest.json"
 ```
 
@@ -149,13 +149,13 @@ jq -r '.artifacts[] | "\(.sha256)  \(.name)"' "${VARIANT}-image-${ARCH}.manifest
 A separate `revocations` release tag publishes a cosign-signed `revoked-versions.json`. mvmctl checks this list on every `dev up` and refuses to use any image whose version is recalled. The recall reason is surfaced verbatim in the failure message, pointing at the upgrade path.
 
 ```bash
-curl -LO "https://github.com/auser/mvm/releases/download/revocations/revoked-versions.json"
-curl -LO "https://github.com/auser/mvm/releases/download/revocations/revoked-versions.json.bundle"
+curl -LO "https://github.com/tinylabscom/mvm/releases/download/revocations/revoked-versions.json"
+curl -LO "https://github.com/tinylabscom/mvm/releases/download/revocations/revoked-versions.json.bundle"
 
 cosign verify-blob \
   --bundle revoked-versions.json.bundle \
   --certificate-oidc-issuer "https://token.actions.githubusercontent.com" \
-  --certificate-identity-regexp "https://github.com/auser/mvm/.github/workflows/revocations.yml@refs/tags/revocations" \
+  --certificate-identity-regexp "https://github.com/tinylabscom/mvm/.github/workflows/revocations.yml@refs/tags/revocations" \
   revoked-versions.json
 ```
 

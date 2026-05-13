@@ -1,43 +1,34 @@
-//! libkrun backend bindings for mvm.
+//! Rust bindings for Red Hat libkrun (Linux KVM, macOS Hypervisor.framework).
 //!
-//! libkrun is Red Hat's library-style VMM (Apache-2.0). Unlike Firecracker
-//! (separate binary, HTTP API) or Apple Virtualization.framework (Swift /
-//! objc2 FFI), libkrun is a C library you link directly into your binary.
-//! On Linux it uses KVM; on macOS it uses Hypervisor.framework — making it
-//! the only VMM in mvm's consideration set that runs on **both** macOS
-//! Apple Silicon and macOS Intel without Lima. On Linux it gives us a
-//! single-binary alternative to the firecracker-on-PATH dependency.
+//! libkrun is a library-style VMM: linked directly into the calling binary
+//! rather than spawned as a separate daemon. On Linux it uses KVM; on
+//! macOS it uses Hypervisor.framework. It is the only VMM mvm carries
+//! that runs on both macOS Apple Silicon **and** macOS Intel without
+//! Lima.
 //!
-//! See plan 53 §"Plan E" for design context and the fork test that
-//! qualified libkrun as the one new backend we add in Sprint 48.
+//! # Build modes
 //!
-//! # Status (Sprint 48 lane-laying)
+//! - **default** (no feature) — no FFI, no link to libkrun. [`start`]
+//!   and [`stop`] return [`Error::NotYetWired`]. The workspace compiles
+//!   on hosts without libkrun installed.
+//! - **`libkrun-sys`** — bindgen-generated FFI from `libkrun.h` plus
+//!   `-lkrun` linking. [`start`] and [`stop`] dispatch through
+//!   [`sys::Context`] into real libkrun calls.
 //!
-//! This crate ships **scaffolding** with the final public API shape:
-//! [`KrunContext`] for construction, [`start`] / [`stop`] for lifecycle,
-//! [`is_available`] for runtime detection. The implementation is gated
-//! on a real libkrun install — see `specs/plans/57-libkrun-spike.md`
-//! for the work that lands the bindings, codesigning, and end-to-end
-//! boot validation.
-//!
-//! Until then, [`start`] / [`stop`] return [`Error::NotYetWired`] with a
-//! pointer to plan 57, and [`is_available`] checks the host for a
-//! libkrun shared library at standard install locations (Homebrew on
-//! macOS, distro packages on Linux).
-//!
-//! # Platform support
-//!
-//! - **macOS Apple Silicon**: libkrun ships in Homebrew as `libkrun`.
-//! - **macOS Intel**: libkrun via Hypervisor.framework also works.
-//! - **Linux x86_64 / aarch64**: libkrun is in most distro repos, or
-//!   build from source via Nix.
-//! - **Windows**: not supported. libkrun has no Windows port.
+//! Plan 57 W1 wires the bindings; W2 adds the macOS codesigning
+//! entitlement; W3 validates an end-to-end boot. This crate stays
+//! narrowly focused on the FFI; backend dispatch and lifecycle live in
+//! `mvm-backend` and `mvm-cli`.
 
 use std::path::Path;
 
-/// Errors returned by this crate. `NotYetWired` is the placeholder
-/// until the Plan E spike lands; once the bindings are real, this
-/// variant goes away.
+#[cfg(feature = "libkrun-sys")]
+mod sys;
+
+#[cfg(feature = "libkrun-sys")]
+pub use sys::{KernelFormat, LogLevel};
+
+/// Errors returned by this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
     /// libkrun is not installed on the host (no shared library found at
@@ -46,15 +37,21 @@ pub enum Error {
         /// Suggested install command for the user.
         install_hint: &'static str,
     },
-    /// libkrun is installed but this crate's bindings haven't landed
-    /// yet (Plan E spike pending). Returned by [`start`] / [`stop`]
-    /// in Sprint 48 scaffolding.
+    /// Built without the `libkrun-sys` feature — the FFI bindings are
+    /// compiled out so [`start`] / [`stop`] cannot dispatch. Rebuild
+    /// with `--features libkrun-sys` on a host where libkrun is
+    /// installed.
     NotYetWired {
         /// Tracking issue / plan reference.
         tracking: &'static str,
     },
-    /// Generic libkrun call failure — populated once bindings are real.
-    Krun(String),
+    /// libkrun returned a negative errno from one of its C functions.
+    /// The value is the raw return code (which libkrun documents as
+    /// `-EINVAL`, `-ENOMEM`, etc. for most calls).
+    Krun(i32),
+    /// A path or string argument contained an interior NUL byte or
+    /// was not representable as UTF-8 / a C string.
+    InvalidCString,
 }
 
 impl std::fmt::Display for Error {
@@ -65,11 +62,14 @@ impl std::fmt::Display for Error {
             }
             Self::NotYetWired { tracking } => write!(
                 f,
-                "libkrun bindings are not yet wired up (tracking: {tracking}). \
-                 The Plan E spike phase has to land before this backend can \
-                 boot guests."
+                "libkrun FFI is not compiled into this build (tracking: {tracking}). \
+                 Rebuild with `--features libkrun-sys` on a host with libkrun installed."
             ),
-            Self::Krun(msg) => write!(f, "libkrun call failed: {msg}"),
+            Self::Krun(rc) => write!(f, "libkrun call failed with rc {rc}"),
+            Self::InvalidCString => write!(
+                f,
+                "argument contained an interior NUL byte or non-UTF-8 path"
+            ),
         }
     }
 }
@@ -80,9 +80,8 @@ impl std::error::Error for Error {}
 /// shared library at the standard install locations.
 ///
 /// **Not the same as "is functional"** — even if `is_available()`
-/// returns `true`, the [`start`] call may still fail with
-/// [`Error::NotYetWired`] until the libkrun spike (specs/plans/
-/// 57-libkrun-spike.md) lands the real bindings. Treat this as a
+/// returns `true`, a build without the `libkrun-sys` feature will still
+/// return [`Error::NotYetWired`] from [`start`]. Treat this as a
 /// precondition probe: if it returns `false`, point the user at
 /// [`install_hint`].
 pub fn is_available() -> bool {
@@ -147,8 +146,9 @@ pub fn install_paths() -> Vec<&'static str> {
 
 /// Configuration for a libkrun guest VM.
 ///
-/// Final API shape — the spike phase will populate the inner
-/// representation but callers won't have to change.
+/// Pure data — no I/O until [`start`] consumes it. Field shape is
+/// stable across the W1 → W3 transition; the FFI calls that consume
+/// each field live in [`sys`] under the `libkrun-sys` feature.
 #[derive(Debug, Clone)]
 pub struct KrunContext {
     pub name: String,
@@ -193,22 +193,70 @@ impl KrunContext {
     }
 }
 
-/// Start a libkrun guest from `ctx`. Currently a stub — see
-/// [`Error::NotYetWired`].
+/// Start a libkrun guest from `ctx`.
+///
+/// **Plan 57 W1 scope.** With the `libkrun-sys` feature enabled, this
+/// allocates a libkrun configuration context, applies CPU/memory,
+/// kernel, rootfs, and vsock-port configuration through the FFI, then
+/// frees the context and returns `Ok(())`. It does **not** call
+/// `krun_start_enter` (which blocks until the guest exits) — the
+/// blocking-thread lifecycle and state-tracking work is W3 + W4 of
+/// plan 57. Today the call exists so consumers can exercise the
+/// wrapper end-to-end on a host with libkrun installed; the W3 PR
+/// upgrades it to actually boot.
+///
+/// Without the feature, returns [`Error::NotYetWired`].
 pub fn start(ctx: &KrunContext) -> Result<(), Error> {
     if !is_available() {
         return Err(Error::NotInstalled {
             install_hint: install_hint(),
         });
     }
-    let _ = ctx; // silence unused-arg until bindings land
-    Err(Error::NotYetWired {
-        tracking: "specs/plans/57-libkrun-spike.md",
-    })
+    #[cfg(not(feature = "libkrun-sys"))]
+    {
+        let _ = ctx;
+        Err(Error::NotYetWired {
+            tracking: "specs/plans/57-libkrun-spike.md W3+W4",
+        })
+    }
+    #[cfg(feature = "libkrun-sys")]
+    {
+        start_via_ffi(ctx)
+    }
 }
 
-/// Stop a running libkrun guest by name. Stub for the Sprint 48
-/// scaffolding — see [`Error::NotYetWired`].
+#[cfg(feature = "libkrun-sys")]
+fn start_via_ffi(ctx: &KrunContext) -> Result<(), Error> {
+    let krun = sys::Context::new()?;
+    krun.set_vm_config(ctx.vcpus, ctx.ram_mib)?;
+    krun.set_kernel(
+        Path::new(&ctx.kernel_path),
+        sys::KernelFormat::Elf,
+        None,
+        ctx.kernel_cmdline.as_deref(),
+    )?;
+    krun.add_disk("root", Path::new(&ctx.rootfs_path), false)?;
+    for &port in &ctx.vsock_ports {
+        // libkrun's `krun_add_vsock_port` requires a host-side Unix
+        // socket path. The full backend wiring (which generates that
+        // path under ~/.mvm/vms/<name>/) lands in W3 alongside the
+        // boot validation. For W1 the FFI exercise stops short of
+        // booting, so a stub path is sufficient to confirm the wrapper
+        // accepts the call.
+        let socket = format!("/tmp/mvm-libkrun-{}-vsock-{port}.sock", ctx.name);
+        krun.add_vsock_port(port, Path::new(&socket))?;
+    }
+    // `krun_start_enter` deliberately not invoked — that's W3 + W4.
+    // Dropping the context here frees it cleanly through `Context::Drop`.
+    Ok(())
+}
+
+/// Stop a running libkrun guest by name.
+///
+/// **Plan 57 W1 scope.** The blocking-thread + registry lifecycle that
+/// would let us find and signal a running VM is W4 of plan 57. Today
+/// this returns [`Error::NotYetWired`] regardless of feature — there
+/// is no running state to stop yet.
 pub fn stop(name: &str) -> Result<(), Error> {
     if !is_available() {
         return Err(Error::NotInstalled {
@@ -217,7 +265,7 @@ pub fn stop(name: &str) -> Result<(), Error> {
     }
     let _ = name;
     Err(Error::NotYetWired {
-        tracking: "specs/plans/57-libkrun-spike.md",
+        tracking: "specs/plans/57-libkrun-spike.md W4",
     })
 }
 
@@ -254,31 +302,35 @@ mod tests {
     }
 
     #[test]
-    fn start_errors_when_not_installed_or_not_yet_wired() {
-        let ctx = KrunContext::new("vm", "/k", "/r");
-        let err = start(&ctx).expect_err("scaffolding always errors");
-        // Either "not installed" (most common in CI) or "not yet wired"
-        // (when libkrun *is* installed on the dev's host) — both are
-        // acceptable surfaces for the scaffolding phase.
-        assert!(matches!(
-            err,
-            Error::NotInstalled { .. } | Error::NotYetWired { .. }
-        ));
-    }
-
-    #[test]
     fn error_display_messages_are_actionable() {
         let not_installed = Error::NotInstalled {
             install_hint: "brew install libkrun",
         };
         let not_wired = Error::NotYetWired {
-            tracking: "plan 53",
+            tracking: "plan 57",
         };
-        let krun_err = Error::Krun("kvm_create failed".to_string());
+        let krun_err = Error::Krun(-22);
+        let invalid = Error::InvalidCString;
         // Each variant produces a non-empty, distinct message that
         // names what to do next.
         assert!(format!("{not_installed}").contains("brew install"));
-        assert!(format!("{not_wired}").contains("plan 53"));
-        assert!(format!("{krun_err}").contains("kvm_create"));
+        assert!(format!("{not_wired}").contains("plan 57"));
+        assert!(format!("{krun_err}").contains("-22"));
+        assert!(format!("{invalid}").contains("NUL"));
+    }
+
+    /// When libkrun isn't installed on the host, `start` short-circuits
+    /// before touching the FFI — works the same way with or without
+    /// the `libkrun-sys` feature.
+    #[test]
+    fn start_errors_when_not_installed() {
+        if is_available() {
+            // Host has libkrun; this test exercises the fast-fail path,
+            // not the FFI surface, so skip.
+            return;
+        }
+        let ctx = KrunContext::new("vm", "/k", "/r");
+        let err = start(&ctx).expect_err("scaffolding errors without libkrun");
+        assert!(matches!(err, Error::NotInstalled { .. }));
     }
 }

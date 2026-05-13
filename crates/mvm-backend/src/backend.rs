@@ -13,8 +13,10 @@ use crate::cloud_hypervisor::CloudHypervisorBackend;
 use crate::docker::DockerBackend;
 use crate::image::RuntimeVolume;
 use crate::libkrun::LibkrunBackend;
+#[cfg(feature = "backends-microsandbox")]
 use crate::microsandbox::MicrosandboxBackend;
 use crate::microvm::{DriveFile, FlakeRunConfig};
+use crate::mock::MockBackend;
 use crate::{firecracker, microvm, microvm_nix};
 use mvm_base::config::{PortMapping, VMS_DIR};
 use mvm_base::shell::run_in_vm_stdout;
@@ -47,6 +49,7 @@ impl FirecrackerConfig {
             profile: config.profile.clone(),
             cpus: config.cpus,
             memory: config.memory_mib,
+            mem_initial: config.mem_initial_mib,
             volumes: config
                 .volumes
                 .iter()
@@ -102,11 +105,17 @@ impl VmBackend for FirecrackerBackend {
     }
 
     fn capabilities(&self) -> VmCapabilities {
+        // Firecracker ships a virtio-balloon device with PATCH-able
+        // target via `/balloon`; the start path attaches it whenever
+        // `VmStartConfig::mem_initial_mib` is `Some`. Capability is
+        // advertised unconditionally so the host-side controller can
+        // discover support before deciding to plumb a workload.
         VmCapabilities {
             pause_resume: true,
             snapshots: true,
             vsock: true,
             tap_networking: true,
+            balloon: true,
         }
     }
 
@@ -137,6 +146,28 @@ impl VmBackend for FirecrackerBackend {
 
     fn resume(&self, id: &VmId) -> Result<()> {
         microvm::resume_vm(&id.0)
+    }
+
+    fn balloon_set_target(&self, id: &VmId, target_inflate_mib: u32) -> Result<()> {
+        microvm::balloon_set_target(&id.0, target_inflate_mib)
+    }
+
+    fn balloon_state(&self, id: &VmId) -> Result<mvm_core::vm_backend::BalloonState> {
+        let inflated = microvm::balloon_state(&id.0)?;
+        // FC reports the inflation amount via /balloon; the cap is
+        // tracked host-side in the VM's runtime metadata (RunInfo).
+        // List the VM to recover its declared cap.
+        let vms = microvm::list_vms()?;
+        let info = vms
+            .into_iter()
+            .find(|i| i.name.as_deref() == Some(&*id.0))
+            .ok_or_else(|| anyhow::anyhow!("balloon_state: VM '{}' not found in list", id.0))?;
+        let max_mib = info.memory;
+        Ok(mvm_core::vm_backend::BalloonState {
+            max_mib,
+            inflated_mib: inflated,
+            host_committed_mib: max_mib.saturating_sub(inflated),
+        })
     }
 
     fn status(&self, id: &VmId) -> Result<VmStatus> {
@@ -220,15 +251,23 @@ pub enum AnyBackend {
     /// libkrun (plan 53 §"Plan E") — Linux KVM / macOS HVF, including
     /// macOS Intel where Apple Container is unavailable.
     Libkrun(LibkrunBackend),
-    /// microsandbox (plan 60 — ADR-013) — higher-level libkrun wrapper;
-    /// the cross-platform Phase 1 default for macOS/Windows. Linux still
-    /// prefers Firecracker when KVM is available.
+    /// microsandbox (plan 60 — ADR-013) — higher-level libkrun wrapper.
+    /// Linux still prefers Firecracker when KVM is available. Gated on
+    /// `backends-microsandbox`, which lean default builds leave disabled.
+    #[cfg(feature = "backends-microsandbox")]
     Microsandbox(MicrosandboxBackend),
     /// Cloud Hypervisor — rust-vmm peer of Firecracker at Tier 1. Adds
     /// VFIO passthrough, virtio-gpu, virtio-fs, and larger guests
     /// beyond what FC supports. Opt-in via `--hypervisor cloud-hypervisor`;
     /// auto_select keeps Firecracker as the KVM default.
     CloudHypervisor(CloudHypervisorBackend),
+    /// In-memory mock — test-only. Records `start`/`stop`/`pause`/
+    /// `resume` calls against a `Mutex<HashMap>` and never touches
+    /// the host. Selected only via explicit `--hypervisor mock`;
+    /// `auto_select` never falls through here. See
+    /// [`crate::mock::MockBackend`] for the rationale and security
+    /// profile (Tier 3 / claims unknown).
+    Mock(MockBackend),
 }
 
 impl AnyBackend {
@@ -258,11 +297,17 @@ impl AnyBackend {
             "apple-container" => Self::AppleContainer(AppleContainerBackend),
             "docker" => Self::Docker(DockerBackend),
             "libkrun" | "krun" => Self::Libkrun(LibkrunBackend),
+            #[cfg(feature = "backends-microsandbox")]
             "microsandbox" | "msb" => Self::Microsandbox(MicrosandboxBackend),
             "cloud-hypervisor" | "cloud_hypervisor" | "ch" | "clh" => {
                 Self::CloudHypervisor(CloudHypervisorBackend)
             }
             "qemu" => Self::MicrovmNix(MicrovmNixBackend),
+            // Test-only in-memory backend. See `crate::mock`. Routing
+            // here from a production caller is a misconfiguration, but
+            // the explicit selector lets integration tests drive every
+            // VM-lifecycle CLI verb hermetically.
+            "mock" => Self::Mock(MockBackend::new()),
             _ => Self::Firecracker(FirecrackerBackend),
         }
     }
@@ -270,10 +315,9 @@ impl AnyBackend {
     /// Select the best backend for the current platform.
     ///
     /// Firecracker is the production target — it always wins when KVM
-    /// is available. When KVM isn't available (macOS host, Linux without
-    /// KVM, etc.), microsandbox is the cross-platform default per
-    /// ADR-013; the legacy fallbacks below it exist for the narrow
-    /// case where microsandbox itself is feature-gated out.
+    /// is available. When `backends-microsandbox` is enabled and KVM is
+    /// not available, microsandbox is the cross-platform Tier 2 choice.
+    /// Lean default builds skip it and continue down the fallback ladder.
     ///
     /// Priority:
     /// 1. **Firecracker** (if `/dev/kvm` available — production Tier 1)
@@ -297,11 +341,15 @@ impl AnyBackend {
             return Self::Firecracker(FirecrackerBackend);
         }
 
-        // 2. microsandbox — ADR-013 cross-platform default. Vendors
+        // 2. microsandbox — ADR-013 cross-platform backend. Vendors
         //    libkrunfw so works on macOS arm64/x86_64 + Linux no-KVM
         //    without a separate libkrun install. Sits above Apple
         //    Container in the ladder because plan 60 schedules
         //    AppleContainer removal in favor of microsandbox.
+        //    Gated on `backends-microsandbox` — when off, this arm is
+        //    absent and the ladder falls through to Apple Container /
+        //    libkrun / Docker.
+        #[cfg(feature = "backends-microsandbox")]
         if plat.has_microsandbox() {
             return Self::Microsandbox(MicrosandboxBackend);
         }
@@ -329,11 +377,9 @@ impl AnyBackend {
             return Self::Docker(DockerBackend);
         }
 
-        // Final default. Reachable only when has_microsandbox is
-        // feature-gated off AND no other tier is available; the
-        // start() call then fails with the production-path error
-        // message rather than silently picking a backend the
-        // caller didn't ask for.
+        // Final default. Reachable when no tier is available; start()
+        // then fails with the production-path error message rather than
+        // silently picking a backend the caller didn't ask for.
         Self::Firecracker(FirecrackerBackend)
     }
 
@@ -345,8 +391,10 @@ impl AnyBackend {
             Self::AppleContainer(b) => b,
             Self::Docker(b) => b,
             Self::Libkrun(b) => b,
+            #[cfg(feature = "backends-microsandbox")]
             Self::Microsandbox(b) => b,
             Self::CloudHypervisor(b) => b,
+            Self::Mock(b) => b,
         }
     }
 
@@ -403,6 +451,17 @@ impl AnyBackend {
     /// Resume a paused VM. See [`VmBackend::resume`].
     pub fn resume(&self, id: &VmId) -> Result<()> {
         self.inner().resume(id)
+    }
+
+    /// Set the virtio-balloon inflation target. See
+    /// [`VmBackend::balloon_set_target`].
+    pub fn balloon_set_target(&self, id: &VmId, target_inflate_mib: u32) -> Result<()> {
+        self.inner().balloon_set_target(id, target_inflate_mib)
+    }
+
+    /// Read the current balloon state. See [`VmBackend::balloon_state`].
+    pub fn balloon_state(&self, id: &VmId) -> Result<mvm_core::vm_backend::BalloonState> {
+        self.inner().balloon_state(id)
     }
 
     pub fn status(&self, id: &VmId) -> Result<VmStatus> {
@@ -588,6 +647,7 @@ mod tests {
         assert!(p.layer_coverage.is_microvm());
     }
 
+    #[cfg(feature = "backends-microsandbox")]
     #[test]
     fn test_any_backend_from_hypervisor_microsandbox() {
         // Plan 60 ADR-013 — explicit "microsandbox" routing. Both the
@@ -599,6 +659,7 @@ mod tests {
         assert_eq!(short.name(), "microsandbox");
     }
 
+    #[cfg(feature = "backends-microsandbox")]
     #[test]
     fn test_microsandbox_via_any_backend_security_profile_tier_2() {
         // The dispatch must surface the inner backend's full security
@@ -697,6 +758,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "backends-microsandbox")]
     #[test]
     fn test_auto_select_prefers_microsandbox_on_macos() {
         // ADR-013 invariant: on macOS, microsandbox wins over Apple
@@ -715,6 +777,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "backends-microsandbox")]
     #[test]
     fn test_auto_select_returns_microsandbox_when_microsandbox_available_and_no_kvm() {
         // The contract: if has_microsandbox() && !has_kvm(), the
@@ -761,6 +824,7 @@ mod tests {
         );
     }
 
+    #[cfg(feature = "backends-microsandbox")]
     #[test]
     fn pause_resume_unsupported_on_microsandbox() {
         assert_unsupported_pause_resume(
@@ -797,12 +861,17 @@ mod tests {
         // live VM, but we can check that the bail (if any) for a
         // missing VM does NOT claim the backend itself is unsupported
         // when the capability says it is.
-        for name in [
+        // `microsandbox` only participates when the backend is compiled
+        // in — when the feature is off `from_hypervisor("microsandbox")`
+        // falls through to Firecracker and the assertion would flip.
+        let unsupported: &[&str] = &[
+            #[cfg(feature = "backends-microsandbox")]
             "microsandbox",
             "libkrun",
             "qemu", // → microvm-nix
             "apple-container",
-        ] {
+        ];
+        for &name in unsupported {
             let b = AnyBackend::from_hypervisor(name);
             assert!(
                 !b.capabilities().pause_resume,

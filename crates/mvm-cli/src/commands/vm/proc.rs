@@ -126,6 +126,16 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
 
 fn instance_dir_for(name: &str) -> Result<String> {
     validate_vm_name(name).with_context(|| format!("Invalid VM name: {:?}", name))?;
+    // Plan 66 W3: if a mock VM is registered at
+    // `<mvm_data_dir>/mock-vms/<name>/runtime/v.sock`, route to it
+    // directly. The check is filesystem-based — production code
+    // never reaches the mock-vms path because `MockBackend` only
+    // populates it under `--hypervisor mock`. Falls through to the
+    // Lima-era resolver when no mock is in play.
+    let mock_dir = mvm_backend::MockBackend::vm_dir(name);
+    if mock_dir.join("runtime").join("v.sock").exists() {
+        return Ok(mock_dir.to_string_lossy().into_owned());
+    }
     microvm::resolve_running_vm_dir(name)
 }
 
@@ -167,11 +177,7 @@ fn cmd_start(name: &str, argv: &[String], envs: &[String], cwd: Option<&str>) ->
     match result {
         ProcResult::Started { pid_token } => {
             println!("{pid_token}");
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::VmProcStart,
-                Some(name),
-                Some(&format!("argv0={} token={pid_token}", argv[0])),
-            );
+            mvm_core::audit_emit!(VmProcStart, vm: name, "argv0={} token={pid_token}" , argv[0]);
             Ok(())
         }
         other => bail!("Unexpected ProcResult variant for Start: {:?}", other),
@@ -222,11 +228,7 @@ fn cmd_signal(name: &str, token: &str, signum: i32) -> Result<()> {
     let result = unwrap_proc(mvm_guest::vsock::send_proc_request(&dir, req)?)?;
     match result {
         ProcResult::Signaled => {
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::VmProcSignal,
-                Some(name),
-                Some(&format!("token={token} signum={signum}")),
-            );
+            mvm_core::audit_emit!(VmProcSignal, vm: name, "token={token} signum={signum}");
             Ok(())
         }
         other => bail!("Unexpected ProcResult variant for Signal: {:?}", other),
@@ -241,11 +243,7 @@ fn cmd_kill(name: &str, token: &str) -> Result<()> {
     let result = unwrap_proc(mvm_guest::vsock::send_proc_request(&dir, req)?)?;
     match result {
         ProcResult::Killed => {
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::Kill,
-                Some(name),
-                Some(&format!("scope=guest_proc token={token}")),
-            );
+            mvm_core::audit_emit!(Kill, vm: name, "scope=guest_proc token={token}");
             Ok(())
         }
         other => bail!("Unexpected ProcResult variant for Kill: {:?}", other),
@@ -271,11 +269,7 @@ fn cmd_stdin(name: &str, token: &str, content: Option<String>) -> Result<()> {
     match result {
         ProcResult::InputAccepted { bytes_accepted } => {
             eprintln!("accepted {bytes_accepted} bytes");
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::VmProcStdin,
-                Some(name),
-                Some(&format!("token={token} bytes={bytes_accepted}")),
-            );
+            mvm_core::audit_emit!(VmProcStdin, vm: name, "token={token} bytes={bytes_accepted}");
             Ok(())
         }
         other => bail!("Unexpected ProcResult variant for SendInput: {:?}", other),

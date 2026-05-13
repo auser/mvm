@@ -353,6 +353,7 @@ fn persisted_to_synthetic_spec(p: &PersistedManifest) -> TemplateSpec {
         role: String::new(),
         vcpus: p.vcpus,
         mem_mib: p.mem_mib,
+        mem_initial_mib: p.mem_initial_mib,
         data_disk_mib: p.data_disk_mib,
         created_at: p.created_at.clone(),
         updated_at: p.updated_at.clone(),
@@ -360,9 +361,17 @@ fn persisted_to_synthetic_spec(p: &PersistedManifest) -> TemplateSpec {
     }
 }
 
-/// Unified entry point that dispatches to the slot-keyed function when
-/// `id_or_slot` looks like a 64-char lowercase-hex slot hash, or to
-/// the legacy name-keyed function otherwise.
+/// Unified entry point that dispatches by id/key shape:
+///
+/// 1. **Legacy name** (e.g. `claude-code-vm`) → `template_artifacts`.
+/// 2. **Slot hash** (`sha256(canonical_manifest_path)`, 64-char hex,
+///    and the slot dir exists under `~/.mvm/templates/`) →
+///    `template_artifacts_for_slot`.
+/// 3. **Bundle sha256** (also 64-char hex, but the slot dir doesn't
+///    exist; the bundle registry under `~/.mvm/bundles/<sha>/` does)
+///    → [`bundle_artifacts_for_sha`]. Sprint 52 W2 registry-
+///    replacement substrate — bundles are content-addressed images
+///    fetched + installed via `mvmctl bundle install`.
 ///
 /// Used by `mvmctl up` / `mvmctl exec` so the CLI can resolve a
 /// `--manifest <PATH>` argument to a slot hash and pass it through
@@ -372,45 +381,167 @@ pub fn template_artifacts_dispatched(
     id_or_slot: &str,
 ) -> Result<(TemplateSpec, String, Option<String>, String, String)> {
     if is_slot_hash_dirname(id_or_slot) {
-        let (persisted, vmlinux, initrd, rootfs, rev) = template_artifacts_for_slot(id_or_slot)?;
-        Ok((
-            persisted_to_synthetic_spec(&persisted),
-            vmlinux,
-            initrd,
-            rootfs,
-            rev,
-        ))
+        // A 64-char hex string is ambiguous: it could be a templates/
+        // slot hash OR a bundle sha256. Resolve by checking which
+        // directory actually exists. Templates-slot wins when both
+        // are present (legacy build-on-this-host stays the primary
+        // path).
+        let slot_path = std::path::Path::new(&slot_dir(id_or_slot)).to_path_buf();
+        if slot_path.exists() {
+            let (persisted, vmlinux, initrd, rootfs, rev) =
+                template_artifacts_for_slot(id_or_slot)?;
+            Ok((
+                persisted_to_synthetic_spec(&persisted),
+                vmlinux,
+                initrd,
+                rootfs,
+                rev,
+            ))
+        } else {
+            bundle_artifacts_for_sha(id_or_slot)
+        }
     } else {
         template_artifacts(id_or_slot)
     }
 }
 
+/// Resolve a bundle-sha256 reference through
+/// [`mvm_plan::BundleRegistry`] (default path
+/// `~/.mvm/bundles/<sha>/`). Returns the same shape as
+/// [`template_artifacts`] / [`template_artifacts_for_slot`] so the
+/// dispatch fan-in is uniform.
+///
+/// `revision_hash` for a bundle equals the bundle sha — bundles are
+/// content-addressed, so the "revision" of a content-addressed unit
+/// is just its hash. `TemplateSpec.template_id` is set the same way.
+///
+/// `vcpus` / `mem_mib` come from operator config defaults because
+/// the bundle manifest doesn't carry resources today (a future
+/// schema bump would let bundles declare them; for now `mvmctl up`
+/// `--cpus` / `--memory` override). The CLI surfaces this as a
+/// "bundle X uses default resources" info line so users aren't
+/// surprised when no per-template defaults flow through.
+fn bundle_artifacts_for_sha(
+    bundle_sha256: &str,
+) -> Result<(TemplateSpec, String, Option<String>, String, String)> {
+    use mvm_plan::ArtifactRole;
+
+    let registry = mvm_plan::BundleRegistry::default_path()
+        .context("resolving default bundle registry root")?;
+    let installed = registry
+        .find(bundle_sha256)
+        .with_context(|| format!("looking up bundle {bundle_sha256} in registry"))?
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no installed bundle for {bundle_sha256} — run `mvmctl bundle install` first"
+            )
+        })?;
+
+    let kernel = installed
+        .path_for_role(&ArtifactRole::Kernel)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "bundle {bundle_sha256} has no Kernel artifact — manifest is missing a vmlinux entry"
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
+    let rootfs = installed
+        .path_for_role(&ArtifactRole::Rootfs)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "bundle {bundle_sha256} has no Rootfs artifact — manifest is missing a rootfs entry"
+            )
+        })?
+        .to_string_lossy()
+        .into_owned();
+    let initrd = installed
+        .path_for_role(&ArtifactRole::Initrd)
+        .map(|p| p.to_string_lossy().into_owned());
+
+    // Resource resolution: bundle manifest's `resources` field
+    // wins when set (BUNDLE_SCHEMA_VERSION 2+ bundles ship this).
+    // Falls back to operator config for v1 bundles or when the
+    // publisher chose to omit. CLI `--cpus` / `--memory` still
+    // overrides both at `mvmctl up` time.
+    let user_cfg = mvm_core::user_config::load(None);
+    let (vcpus_u32, mem_mib) = match installed.manifest.resources.as_ref() {
+        Some(r) => (r.vcpus, r.mem_mib),
+        None => (user_cfg.default_cpus, user_cfg.default_memory_mib),
+    };
+    let now = chrono::Utc::now().to_rfc3339();
+    let spec = TemplateSpec {
+        schema_version: mvm_core::template::CURRENT_SCHEMA_VERSION,
+        template_id: bundle_sha256.to_string(),
+        flake_ref: format!("bundle:{bundle_sha256}"),
+        profile: installed.manifest.profile.clone().unwrap_or_default(),
+        role: String::new(),
+        vcpus: u8::try_from(vcpus_u32.min(u32::from(u8::MAX))).unwrap_or(u8::MAX),
+        mem_mib,
+        mem_initial_mib: None,
+        data_disk_mib: 0,
+        created_at: installed.manifest.created_at.clone(),
+        updated_at: now,
+        default_network_policy: None,
+    };
+
+    // Bundle sha == revision, since bundles are content-addressed.
+    Ok((spec, kernel, initrd, rootfs, bundle_sha256.to_string()))
+}
+
 /// Dispatched variant of [`template_load`] / [`template_load_slot`].
 /// Returns a [`TemplateSpec`] regardless of which key shape was used.
+///
+/// Bundle-sha256 fallthrough mirrors `template_artifacts_dispatched`:
+/// when the 64-char hex name doesn't have a templates/ slot dir,
+/// look it up in the bundle registry.
 pub fn template_load_dispatched(id_or_slot: &str) -> Result<TemplateSpec> {
     if is_slot_hash_dirname(id_or_slot) {
-        let persisted = template_load_slot(id_or_slot)?;
-        Ok(persisted_to_synthetic_spec(&persisted))
+        let slot_path = std::path::Path::new(&slot_dir(id_or_slot)).to_path_buf();
+        if slot_path.exists() {
+            let persisted = template_load_slot(id_or_slot)?;
+            Ok(persisted_to_synthetic_spec(&persisted))
+        } else {
+            // Reuse the artifact-resolver to derive a TemplateSpec
+            // from an installed bundle — same fields, same defaults.
+            let (spec, _vm, _ir, _rf, _rev) = bundle_artifacts_for_sha(id_or_slot)?;
+            Ok(spec)
+        }
     } else {
         template_load(id_or_slot)
     }
 }
 
 /// Dispatched variant of [`template_snapshot_info`] /
-/// [`template_snapshot_info_for_slot`].
+/// [`template_snapshot_info_for_slot`]. Bundles don't ship
+/// snapshots today (the snapshot is a per-host FC artifact tied to
+/// the machine that built it); the bundle fallthrough returns
+/// `None` rather than erroring.
 pub fn template_snapshot_info_dispatched(id_or_slot: &str) -> Result<Option<SnapshotInfo>> {
     if is_slot_hash_dirname(id_or_slot) {
-        template_snapshot_info_for_slot(id_or_slot)
+        let slot_path = std::path::Path::new(&slot_dir(id_or_slot)).to_path_buf();
+        if slot_path.exists() {
+            template_snapshot_info_for_slot(id_or_slot)
+        } else {
+            Ok(None)
+        }
     } else {
         template_snapshot_info(id_or_slot)
     }
 }
 
 /// Dispatched variant of [`template_has_snapshot`] /
-/// [`template_has_snapshot_for_slot`].
+/// [`template_has_snapshot_for_slot`]. Same bundle-fallthrough
+/// shape as `template_snapshot_info_dispatched`: bundles never
+/// have snapshots in v1.
 pub fn template_has_snapshot_dispatched(id_or_slot: &str) -> Result<bool> {
     if is_slot_hash_dirname(id_or_slot) {
-        template_has_snapshot_for_slot(id_or_slot)
+        let slot_path = std::path::Path::new(&slot_dir(id_or_slot)).to_path_buf();
+        if slot_path.exists() {
+            template_has_snapshot_for_slot(id_or_slot)
+        } else {
+            Ok(false)
+        }
     } else {
         template_has_snapshot(id_or_slot)
     }
@@ -606,6 +737,19 @@ pub fn template_build_from_manifest(
     shell::run_in_vm(&format!(
         "cp -a {} {rev_dst}/rootfs.ext4 && chmod u+w {rev_dst}/rootfs.ext4",
         result.rootfs_path
+    ))?;
+
+    // Copy the OCI image tarball (if the flake's `mkGuest` emits one
+    // via `dockerTools.streamLayeredImage`). When present, this is
+    // what `mvmctl manifest export-oci <template>` returns so users
+    // can `docker load` the mvm-built workload on a non-KVM host.
+    // Best-effort: the copy is gated on the artifact existing in the
+    // dev-build dir; flakes that don't emit `image.tar.gz` just don't
+    // get one in the slot, and `export-oci` errors with a clear
+    // "rebuild with the OCI output enabled" message.
+    let oci_src = format!("{}/image.tar.gz", result.build_dir);
+    shell::run_in_vm(&format!(
+        "if [ -e {oci_src} ]; then cp -a {oci_src} {rev_dst}/image.tar.gz; fi"
     ))?;
 
     // Generate a minimal fc-base.json for reference. Same logic as

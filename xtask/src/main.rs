@@ -1,8 +1,11 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
+mod build_dev_image;
 mod check_adr_coverage;
+mod check_audit_positional;
 mod check_no_display_on_secret_types;
+mod gen_stubs;
 mod perf;
 
 fn main() -> Result<()> {
@@ -20,9 +23,25 @@ fn main() -> Result<()> {
             let workspace = workspace_root();
             check_no_display_on_secret_types::run(&workspace)
         }
+        Some("check-audit-positional") => {
+            let workspace = workspace_root();
+            check_audit_positional::run(&workspace)
+        }
         Some("perf") => perf::run(&args[2..]),
+        Some("build-dev-image") => {
+            let workspace = workspace_root();
+            build_dev_image::run(&args[2..], &workspace)
+        }
+        Some("gen-stubs") => {
+            let workspace = workspace_root();
+            gen_stubs::generate(&workspace)
+        }
+        Some("check-stubs") => {
+            let workspace = workspace_root();
+            gen_stubs::check(&workspace)
+        }
         Some(other) => anyhow::bail!(
-            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage, check-no-display-on-secret-types, perf",
+            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage, check-no-display-on-secret-types, check-audit-positional, perf, build-dev-image, gen-stubs, check-stubs",
             other
         ),
         None => {
@@ -38,7 +57,19 @@ fn main() -> Result<()> {
                 "  check-no-display-on-secret-types        Plan 63 W2 lint: reject Debug/Display on secret-named types"
             );
             eprintln!(
+                "  check-audit-positional                  Plan 60 Phase 4 lint: reject positional audit::emit / event-chain calls"
+            );
+            eprintln!(
                 "  perf <subcommand>                       Plan 60 Phase 9 perf gates (rootfs-size, boot)"
+            );
+            eprintln!(
+                "  build-dev-image [--arch <arch>]         Build the dev VM image and drop it into nix/images/dev-prebuilt/<arch>/"
+            );
+            eprintln!(
+                "  gen-stubs                               Plan 60 Phase 5: regenerate schema/workload-ir-v0.json + Python/TS IR types from mvm-ir"
+            );
+            eprintln!(
+                "  check-stubs                             Plan 60 Phase 5: CI gate — fail if generated stubs are stale"
             );
             std::process::exit(1);
         }

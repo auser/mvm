@@ -36,6 +36,11 @@
 //! fails with a microsandbox-tagged error (also green for this
 //! smoke — we just need proof we made it past our own boundary).
 
+// Whole-file gate: the smoke only makes sense when the microsandbox
+// backend is compiled in. Library-consumer builds disable the
+// `backends-microsandbox` feature and skip this file entirely.
+#![cfg(feature = "backends-microsandbox")]
+
 use mvmctl::backend::microsandbox::MicrosandboxBackend;
 use mvmctl::core::vm_backend::VmId;
 

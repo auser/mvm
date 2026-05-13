@@ -103,12 +103,18 @@ adaptation is that L5 is enforced *inside* the guest by uid/seccomp
 (plan 26), so even a guest-kernel compromise (L3 fall) doesn't grant
 arbitrary access to other in-guest services.
 
-## The seven CI-enforced claims
+## The CI-enforced claims
 
 Each claim is backed by a CI gate that fails the build if the claim
 ceases to hold. Claims are mapped to the trust layer they *primarily*
 defend; many claims have ripple effects across multiple layers, but
 the primary defended layer is the one the gate fails first.
+
+The original ADR shipped with seven claims. Claim 8 (signed
+`ExecutionPlan`) was added by plan 64 / ADR-041 and named in
+CLAUDE.md but not in this table until now. Claim 9 (signed
+bundles) is Sprint 52 W2 — this commit catches the table up to
+both.
 
 | # | Claim | Primary layer | Workstream | CI gate |
 |---|---|---|---|---|
@@ -119,6 +125,9 @@ the primary defended layer is the one the gate fails first.
 | 5 | Vsock framing is fuzzed | L2/L4 | W4.1, W4.2 | `cargo-fuzz` targets in `crates/mvm-guest/fuzz/`; `deny_unknown_fields` audit |
 | 6 | Pre-built dev image is hash-verified | cross-cutting (supply chain) | W5.1 | `download_dev_image` SHA-256 check; `MVM_SKIP_HASH_VERIFY` only documented escape |
 | 7 | Cargo deps are audited on every PR | cross-cutting (supply chain) | W5.2 | `cargo-deny` + `cargo-audit` jobs; reproducibility double-build (W5.3) |
+| 8 | Every workload runs from a signed, audited `ExecutionPlan` | cross-cutting (policy + audit) | plan 64 W1–W4, ADR-041 | `synthesize_plan` / `host_signer::load_or_init_at` / `admit_for_run` / `AuditEmitter` round-trip + tamper rejection tests; `xtask check-no-display-on-secret-types` |
+| 9 | Every published bundle is content-addressed, key_id-pinned, and re-verified at fetch **and at admit time** | cross-cutting (supply chain + integrity) | Sprint 52 W2 + admit-time re-verify follow-on | `mvm_plan::bundle::read_and_verify_bundle` + `mvm_plan::bundle::verify_plan_bundle` rejection-ladder tests: unknown-key, tampered manifest, key_id mismatch, tampered artifact, missing artifact, unsafe path, schema bump, pin-archive sha256 drift, pin-signature drift; `mvmctl bundle fetch` round-trip + `admit_for_run` tests asserting refusal on pin-without-context and pin-archive mismatch |
+| 10 | No untrusted workload reaches the network unless explicitly admitted by policy | cross-cutting (data containment) | Sprint 52 W3 | `policy_default_is_deny_all` + `test_resolve_network_policy_default_is_deny_all`; `mvmctl up` emits an opt-in warning when the resolved policy is `unrestricted` (escape hatch is `MVM_ACK_UNRESTRICTED_NETWORK=1`) |
 
 L1 (host + hypervisor) has no claim of its own — the host is trusted
 by definition (see Threat model). L1 *enables* claim 3 (verified boot
@@ -141,6 +150,9 @@ only — the CI gate is the source of truth, not the framework code.
 | 5 | T1190-class (Exploit of host↔guest interface) | CREF: Substantiated Integrity (deser path proven via fuzzing + `deny_unknown_fields`) |
 | 6 | T1195.002 (Compromise Software Supply Chain) | D3FEND: Executable Integrity (hash + cosign signature verification) · CREF: Substantiated Integrity |
 | 7 | T1195.001 (Compromise Software Dependencies and Development Tools) | D3FEND: Software Composition Analysis · CREF: Substantiated Integrity |
+| 8 | T1565 (Data Manipulation), T1574 (Hijack Execution Flow — policy substitution variant) | D3FEND: Authentication, Authorization · CREF: Substantiated Integrity (every launch traces back to a signed, validity-windowed plan) |
+| 9 | T1195.002 (Compromise Software Supply Chain — image variant), T1565.001 (Stored Data Manipulation) | D3FEND: Authentication, Executable Integrity · CREF: Substantiated Integrity (manifest-signed + per-artifact hash + key_id-pinned trust establishment) |
+| 10 | T1071 (Application Layer Protocol — data exfiltration channel), T1041 (Exfiltration Over C2 Channel) | D3FEND: Network Traffic Filtering, Outbound Traffic Filtering · CREF: Privilege Restriction (deny-all default; egress is an explicit opt-in) |
 
 The cold-state guarantee (per-workload fresh boot, no warm pools — see
 CLAUDE.md and the `mvmctl run` lifecycle) is not in the seven-claim

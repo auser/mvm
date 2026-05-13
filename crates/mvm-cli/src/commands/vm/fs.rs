@@ -165,6 +165,16 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
 
 fn instance_dir_for(name: &str) -> Result<String> {
     validate_vm_name(name).with_context(|| format!("Invalid VM name: {:?}", name))?;
+    // Plan 66 W3: if a mock VM is registered at
+    // `<mvm_data_dir>/mock-vms/<name>/runtime/v.sock`, route to it
+    // directly. The check is filesystem-based — production code
+    // never reaches the mock-vms path because `MockBackend` only
+    // populates it under `--hypervisor mock`. Falls through to the
+    // Lima-era resolver when no mock is in play.
+    let mock_dir = mvm_backend::MockBackend::vm_dir(name);
+    if mock_dir.join("runtime").join("v.sock").exists() {
+        return Ok(mock_dir.to_string_lossy().into_owned());
+    }
     microvm::resolve_running_vm_dir(name)
 }
 
@@ -221,11 +231,7 @@ fn cmd_write(
     match result {
         FsResult::Write { bytes_written } => {
             eprintln!("wrote {} bytes", bytes_written);
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::VmFsMutate,
-                Some(name),
-                Some(&format!("op=write path={path} bytes={bytes_written}")),
-            );
+            mvm_core::audit_emit!(VmFsMutate, vm: name, "op=write path={path} bytes={bytes_written}");
             Ok(())
         }
         other => bail!("Unexpected FsResult variant for Write: {:?}", other),
@@ -309,13 +315,7 @@ fn cmd_mkdir(name: &str, path: &str, mode: u32, parents: bool) -> Result<()> {
     let result = unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)?;
     match result {
         FsResult::Mkdir => {
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::VmFsMutate,
-                Some(name),
-                Some(&format!(
-                    "op=mkdir path={path} mode={mode:o} parents={parents}"
-                )),
-            );
+            mvm_core::audit_emit!(VmFsMutate, vm: name, "op=mkdir path={path} mode={mode:o} parents={parents}");
             Ok(())
         }
         other => bail!("Unexpected FsResult variant for Mkdir: {:?}", other),
@@ -333,13 +333,7 @@ fn cmd_rm(name: &str, path: &str, recursive: bool) -> Result<()> {
     match result {
         FsResult::Remove { entries_removed } => {
             eprintln!("removed {} entries", entries_removed);
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::VmFsMutate,
-                Some(name),
-                Some(&format!(
-                    "op=rm path={path} recursive={recursive} entries={entries_removed}"
-                )),
-            );
+            mvm_core::audit_emit!(VmFsMutate, vm: name, "op=rm path={path} recursive={recursive} entries={entries_removed}");
             Ok(())
         }
         other => bail!("Unexpected FsResult variant for Remove: {:?}", other),
@@ -356,11 +350,7 @@ fn cmd_mv(name: &str, from: &str, to: &str) -> Result<()> {
     let result = unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)?;
     match result {
         FsResult::Move => {
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::VmFsMutate,
-                Some(name),
-                Some(&format!("op=mv from={from} to={to}")),
-            );
+            mvm_core::audit_emit!(VmFsMutate, vm: name, "op=mv from={from} to={to}");
             Ok(())
         }
         other => bail!("Unexpected FsResult variant for Move: {:?}", other),

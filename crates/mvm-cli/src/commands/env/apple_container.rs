@@ -481,384 +481,63 @@ pub(super) fn cmd_dev_apple_container_status() -> Result<()> {
     Ok(())
 }
 
-/// Ensure the Nix linux-builder VM is running, SSH is configured, and
-/// nix-daemon knows about it.
-///
-/// `nix run 'nixpkgs#darwin.linux-builder'` starts a QEMU VM on port 31022
-/// and writes `/etc/nix/builder_ed25519`, but does NOT create the SSH config
-/// that maps `linux-builder` → `localhost:31022`. It also does not add the
-/// `builders` line to nix.conf. This function handles all three pieces:
-/// 1. Start the builder VM in the background if not already running
-/// 2. Write the SSH host alias so nix-daemon can connect
-/// 3. Add the `builders` line to nix.custom.conf
-///
-/// Returns `true` if the builder appears reachable after any fixup.
-fn ensure_linux_builder_ssh_config() -> bool {
-    #[cfg(not(target_os = "macos"))]
-    {
-        false
-    }
-
-    #[cfg(target_os = "macos")]
-    {
-        use std::io::Write;
-        use std::net::TcpStream;
-        use std::time::Duration;
-
-        let key_path = "/etc/nix/builder_ed25519";
-        let builder_port: u16 = 31022;
-
-        let builder_listening = || {
-            TcpStream::connect_timeout(
-                &format!("127.0.0.1:{builder_port}")
-                    .parse()
-                    .expect("valid socket address literal"),
-                Duration::from_secs(2),
-            )
-            .is_ok()
-        };
-
-        // If builder is not listening, try to start it automatically
-        if !builder_listening() {
-            let nix_bin = find_nix_binary();
-            ui::info("  Starting Nix linux-builder VM in the background...");
-
-            // Launch as a background process. The builder writes
-            // /etc/nix/builder_ed25519 on first run (needs sudo).
-            // Redirect output to a log file so it doesn't clutter the terminal.
-            let log_path = format!("{}/linux-builder.log", mvm_core::config::mvm_cache_dir());
-            let log_file = std::fs::File::create(&log_path)
-                .or_else(|_| std::fs::File::create("/dev/null"))
-                .expect("failed to open /dev/null");
-            let stderr_file = log_file
-                .try_clone()
-                .or_else(|_| std::fs::File::create("/dev/null"))
-                .expect("failed to open /dev/null");
-
-            let child = std::process::Command::new(&nix_bin)
-                .args(["run", "nixpkgs#darwin.linux-builder"])
-                .stdout(log_file)
-                .stderr(stderr_file)
-                .stdin(std::process::Stdio::null())
-                .spawn();
-
-            if child.is_err() {
-                return false;
-            }
-
-            // Wait for the builder to become ready (port 31022 + key file).
-            // First boot can take a while as it downloads the builder VM.
-            ui::info(
-                "  Waiting for linux-builder to become ready (this may take a minute on first run)...",
-            );
-            let deadline = std::time::Instant::now() + Duration::from_secs(120);
-            loop {
-                if std::time::Instant::now() > deadline {
-                    ui::warn("  Timed out waiting for linux-builder to start.");
-                    return false;
-                }
-                if std::path::Path::new(key_path).exists() && builder_listening() {
-                    break;
-                }
-                std::thread::sleep(Duration::from_secs(2));
-            }
-        }
-
-        // Key must exist (created by the linux-builder on first run)
-        if !std::path::Path::new(key_path).exists() {
-            return false;
-        }
-
-        // --- SSH config ---
-        // Check that the SSH config exists AND uses the correct user ("builder",
-        // not "root"). Older versions wrote "User root" which doesn't work.
-        let ssh_config_dir = std::path::Path::new("/etc/ssh/ssh_config.d");
-        let config_path = ssh_config_dir.join("200-linux-builder.conf");
-
-        let expected_config = format!(
-            "Host linux-builder\n\
-             \x20 HostName localhost\n\
-             \x20 Port {builder_port}\n\
-             \x20 User builder\n\
-             \x20 IdentityFile {key_path}\n\
-             \x20 IdentitiesOnly yes\n\
-             \x20 StrictHostKeyChecking no\n\
-             \x20 UserKnownHostsFile /dev/null\n\
-             \x20 LogLevel ERROR\n"
-        );
-
-        let ssh_needs_write = if config_path.exists() {
-            // Re-write if the existing config has wrong user
-            std::fs::read_to_string(&config_path)
-                .map(|c| !c.contains("User builder"))
-                .unwrap_or(true)
-        } else {
-            // Also check via ssh -G whether some other config provides
-            // a correct mapping (e.g. user's own ~/.ssh/config)
-            let ssh_check = std::process::Command::new("ssh")
-                .args(["-G", "linux-builder"])
-                .output();
-            if let Ok(out) = ssh_check {
-                let cfg = String::from_utf8_lossy(&out.stdout);
-                let has_host = cfg.lines().any(|l| {
-                    l.strip_prefix("hostname ")
-                        .is_some_and(|h| h.trim() != "linux-builder")
-                });
-                let has_user = cfg.lines().any(|l| {
-                    l.strip_prefix("user ")
-                        .is_some_and(|u| u.trim() == "builder")
-                });
-                !has_host || !has_user
-            } else {
-                true
-            }
-        };
-
-        let mut ssh_ok = !ssh_needs_write;
-        if ssh_needs_write {
-            let tmp_path = "/tmp/mvm-linux-builder-ssh.conf";
-            if let Ok(mut f) = std::fs::File::create(tmp_path)
-                && f.write_all(expected_config.as_bytes()).is_ok()
-            {
-                let status = std::process::Command::new("sudo")
-                    .args(["cp", tmp_path, config_path.to_str().unwrap_or_default()])
-                    .status();
-                let _ = std::fs::remove_file(tmp_path);
-                ssh_ok = matches!(status, Ok(s) if s.success());
-            }
-        }
-
-        if !ssh_ok {
-            return false;
-        }
-
-        // --- nix.conf builders line ---
-        // nix-daemon needs a `builders` entry pointing at the linux-builder.
-        // Determinate Nix uses nix.custom.conf (included from nix.conf).
-        // Also fix stale configs that used the wrong SSH user.
-        let builders_line = format!(
-            "builders = ssh-ng://builder@linux-builder aarch64-linux {key_path} 4 1 kvm,big-parallel - -"
-        );
-
-        let nix_custom = std::path::Path::new("/etc/nix/nix.custom.conf");
-        let nix_conf = std::path::Path::new("/etc/nix/nix.conf");
-
-        let nix_needs_write = {
-            let has_correct = [nix_custom, nix_conf].iter().any(|path| {
-                std::fs::read_to_string(path)
-                    .map(|c| {
-                        c.lines().any(|l| {
-                            l.trim_start().starts_with("builders")
-                                && l.contains("builder@linux-builder")
-                        })
-                    })
-                    .unwrap_or(false)
-            });
-            !has_correct
-        };
-
-        if nix_needs_write {
-            ui::info("  Configuring nix-daemon to use the linux-builder...");
-
-            // Read existing content, strip any old mvmctl builder block, append fresh one
-            let existing = std::fs::read_to_string(nix_custom).unwrap_or_default();
-            let cleaned: String = {
-                let mut skip = false;
-                let mut lines = Vec::new();
-                for line in existing.lines() {
-                    if line.contains("Added by mvmctl for darwin.linux-builder") {
-                        skip = true;
-                        continue;
-                    }
-                    if skip {
-                        // Skip the builders and builders-use-substitutes lines
-                        if line.trim_start().starts_with("builders") {
-                            continue;
-                        }
-                        // Blank line after the block — skip it too, then stop skipping
-                        if line.trim().is_empty() {
-                            skip = false;
-                            continue;
-                        }
-                        skip = false;
-                    }
-                    lines.push(line);
-                }
-                lines.join("\n")
-            };
-
-            let new_content = format!(
-                "{cleaned}\n\
-                 # Added by mvmctl for darwin.linux-builder\n\
-                 {builders_line}\n\
-                 builders-use-substitutes = true\n"
-            );
-
-            let tmp_path = "/tmp/mvm-nix-custom-append.conf";
-            if let Ok(mut f) = std::fs::File::create(tmp_path)
-                && f.write_all(new_content.as_bytes()).is_ok()
-            {
-                let status = std::process::Command::new("sudo")
-                    .args(["cp", tmp_path, nix_custom.to_str().unwrap_or_default()])
-                    .status();
-                let _ = std::fs::remove_file(tmp_path);
-                if !matches!(status, Ok(s) if s.success()) {
-                    return false;
-                }
-
-                // Restart nix-daemon so it picks up the new config.
-                let restarted = std::process::Command::new("sudo")
-                    .args([
-                        "launchctl",
-                        "kickstart",
-                        "-k",
-                        "system/systems.determinate.nix-daemon",
-                    ])
-                    .status()
-                    .is_ok_and(|s| s.success());
-                if !restarted {
-                    let _ = std::process::Command::new("sudo")
-                        .args([
-                            "launchctl",
-                            "kickstart",
-                            "-k",
-                            "system/org.nixos.nix-daemon",
-                        ])
-                        .status();
-                }
-            }
-        }
-
-        true
-    }
-}
-
 /// Resolve the dev image (kernel + rootfs) to absolute paths.
 ///
-/// Builds the dev-image flake via Nix if needed, otherwise relies on
-/// Nix's content-addressed cache (rebuild is a no-op when source is
-/// unchanged). Updates a GC-root symlink at `~/.mvm/dev/current` so
-/// `nix-collect-garbage` won't reap the live image while it's in use.
+/// In a source checkout: builds the dev-image flake via the mvm-owned
+/// microsandbox builder VM (ADR-013 §"Linux builder via microsandbox
+/// (no Lima)"). The builder bootstraps from a pinned OCI image
+/// (`docker.io/nixos/nix:2.24.10`) — no host Nix, no `nix-darwin`
+/// linux-builder, no external infrastructure required.
 ///
-/// Returns paths under the GC-root symlink rather than into /nix/store
-/// directly — this keeps the launchd plist and user-facing logs stable
-/// across rebuilds (the symlink target moves, the symlink path doesn't).
+/// Outside a source checkout: falls back to the GitHub-release
+/// download of a pre-built image.
+///
+/// Failures of the local build are surfaced loudly — never silently
+/// substituted with the prebuilt, since the prebuilt would mask local
+/// rootfs changes.
 fn ensure_dev_image() -> Result<(String, String)> {
-    // Resolution policy:
-    //   * In a source checkout (find_dev_image_flake() Ok): always
-    //     run nix build. Nix dedupes content-addressed builds, so a
-    //     no-op rebuild is fast; an actual change is picked up
-    //     automatically without a manual cache wipe.
-    //   * Outside a source checkout (find_dev_image_flake() Err):
-    //     fall back to the GitHub-release download.
-    //
-    // Failures of the local build are surfaced loudly — never silently
-    // substituted with the prebuilt, since the prebuilt would mask
-    // local rootfs changes.
-    let plat = mvm_core::platform::current();
     let local_flake = find_dev_image_flake().ok();
-    let host_nix = plat.has_host_nix();
 
-    if let Some(flake_dir) = &local_flake
-        && host_nix
-    {
+    #[cfg(feature = "backends-microsandbox")]
+    if let Some(flake_dir) = &local_flake {
+        let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
+        if let Some(parent) = std::path::Path::new(&out_dir).parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating dev-image out parent {}", parent.display()))?;
+        }
+        // Replace a stale symlink (e.g. the nix-darwin `linux-builder`
+        // legacy points `current` at a root-owned `/nix/store/…-mvm-dev`
+        // path) with a real, writable directory. `create_dir_all` is a
+        // no-op against an existing symlink, so without this the
+        // microsandbox bind-mount of `out_dir` lands on the read-only
+        // Nix store path and Apple Container fails with EACCES.
+        if std::path::Path::new(&out_dir)
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            std::fs::remove_file(&out_dir)
+                .with_context(|| format!("removing stale dev-image symlink at {out_dir}"))?;
+        }
+        std::fs::create_dir_all(&out_dir)
+            .with_context(|| format!("creating dev-image out dir {out_dir}"))?;
+
         ui::info(&format!(
-            "Resolving dev image via Nix from local checkout: {flake_dir}"
+            "Building dev image via microsandbox builder VM from: {flake_dir}"
         ));
-        let nix_bin = find_nix_binary();
-
-        // On macOS, ensure the linux-builder SSH config exists so nix-daemon
-        // can reach the builder VM on localhost:31022.
-        if cfg!(target_os = "macos") && ensure_linux_builder_ssh_config() {
-            ui::info("  Linux builder detected and SSH configured.");
-        }
-
-        // Build into a Nix-managed indirect GC root at ~/.mvm/dev/current.
-        // `nix build --out-link` materialises a symlink that survives
-        // garbage collection. The symlink path is stable; its target
-        // moves each time the source closure changes. Builds against
-        // unchanged source resolve in milliseconds via Nix's content
-        // cache — no separate filesystem cache, no manual reset.
-        let gc_root = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
-        if let Some(parent) = std::path::Path::new(&gc_root).parent() {
-            std::fs::create_dir_all(parent).with_context(|| {
-                format!("creating dev-image GC root parent {}", parent.display())
-            })?;
-        }
-
-        let mut child = std::process::Command::new(&nix_bin)
-            .args([
-                "build",
-                &format!(
-                    "{flake_dir}#packages.{}.default",
-                    mvm_build::dev_build::linux_system()
-                ),
-                "--out-link",
-                &gc_root,
-                "--print-out-paths",
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .context("Failed to run nix build")?;
-
-        let stdout = {
-            let mut buf = String::new();
-            if let Some(mut out) = child.stdout.take() {
-                use std::io::Read;
-                let _ = out.read_to_string(&mut buf);
+        match build_image_via_microsandbox(flake_dir, &out_dir) {
+            Ok((kernel, rootfs)) => {
+                ui::success(&format!("Dev image ready at {out_dir}."));
+                return Ok((kernel, rootfs));
             }
-            buf
-        };
-        let status = child.wait().context("nix build process failed")?;
-
-        if status.success() {
-            let store_path = stdout.trim().to_string();
-            let ks = format!("{gc_root}/vmlinux");
-            let rs = format!("{gc_root}/rootfs.ext4");
-            if std::path::Path::new(&ks).exists() && std::path::Path::new(&rs).exists() {
-                ui::success(&format!("Dev image ready (store path: {store_path})."));
-                return Ok((ks, rs));
+            Err(e) => {
+                anyhow::bail!(
+                    "Dev image build failed (source checkout: {flake_dir}).\n{e}\n\n\
+                     Refusing to fall back to the published prebuilt because it would mask\n\
+                     local rootfs changes. To force the prebuilt anyway, move or delete\n\
+                     nix/images/builder/flake.nix so the source-checkout heuristic stops matching."
+                );
             }
         }
-
-        // Local nix build failed. Re-run with --dry-run to capture stderr
-        // (the first run streamed stderr to the terminal for user visibility).
-        let diag = std::process::Command::new(&nix_bin)
-            .args([
-                "build",
-                &format!(
-                    "{flake_dir}#packages.{}.default",
-                    mvm_build::dev_build::linux_system()
-                ),
-                "--no-link",
-                "--dry-run",
-            ])
-            .output()
-            .ok();
-        let stderr = diag
-            .as_ref()
-            .map(|o| String::from_utf8_lossy(&o.stderr).into_owned())
-            .unwrap_or_default();
-        let hint = if stderr.contains("required system or feature not available") {
-            "\n\nNix cannot cross-compile Linux images on this Mac.\n\
-             No Linux builder detected. Either:\n\
-             \x20 1. Run in another terminal (keeps running):\n\
-             \x20    nix run 'nixpkgs#darwin.linux-builder'\n\
-             \x20 2. Or add to /etc/nix/nix.conf (permanent):\n\
-             \x20    builders = ssh-ng://builder@linux-builder aarch64-linux /etc/nix/builder_ed25519 4 1 kvm,big-parallel - -\n\
-             \x20    builders-use-substitutes = true"
-                .to_string()
-        } else {
-            String::new()
-        };
-        anyhow::bail!(
-            "Local dev image build failed (running from source checkout: {flake_dir}).\n\
-             {stderr}{hint}\n\n\
-             Refusing to fall back to the published prebuilt because it would mask\n\
-             local rootfs changes. To force the prebuilt anyway, move or delete\n\
-             nix/images/builder/flake.nix so the source-checkout heuristic stops matching."
-        );
     }
 
     // No local source checkout — download the published prebuilt.
@@ -869,21 +548,268 @@ fn ensure_dev_image() -> Result<(String, String)> {
     // not the union of every version ever installed.
     if local_flake.is_none() {
         ui::info("No local dev-image flake found; downloading published prebuilt.");
-    } else if !host_nix {
-        ui::info("No `nix` binary on host; downloading published prebuilt instead of local build.");
+    } else {
+        // `backends-microsandbox` is off — library-consumer build that
+        // never owns a dev VM. The only path forward is the prebuilt.
+        ui::info(
+            "Builder-VM backend compiled out (no `backends-microsandbox` feature); \
+             downloading published prebuilt instead of local build.",
+        );
     }
     let version = env!("CARGO_PKG_VERSION");
     let prebuilt_root = format!("{}/dev/prebuilt", mvm_core::config::mvm_data_dir());
     let prebuilt_dir = format!("{prebuilt_root}/v{version}");
     std::fs::create_dir_all(&prebuilt_dir)
         .with_context(|| format!("creating prebuilt dir {prebuilt_dir}"))?;
-    prune_old_prebuilts(&prebuilt_root, version);
     let kernel_path = format!("{prebuilt_dir}/vmlinux");
     let rootfs_path = format!("{prebuilt_dir}/rootfs.ext4");
+    // Cache hit on the current version's dir — fast path. Validate
+    // first; if either file is below the size floor or the rootfs
+    // lacks the ext4 magic, treat the cache as poisoned and delete it
+    // so the cascade below can re-populate from a healthy source. The
+    // typical poisoning vector is an earlier copy from a stub or
+    // half-downloaded source — the size floor catches the stub case
+    // (~12 B vs. ~16 MiB minimum), and the magic check catches a
+    // wrong-format file at the right size.
     if std::path::Path::new(&kernel_path).exists() && std::path::Path::new(&rootfs_path).exists() {
+        match validate_dev_image_artifacts(&kernel_path, &rootfs_path) {
+            Ok(()) => {
+                prune_old_prebuilts(&prebuilt_root, version);
+                return Ok((kernel_path, rootfs_path));
+            }
+            Err(e) => {
+                ui::warn(&format!(
+                    "Cached dev image at {prebuilt_dir} failed sanity check ({e}); \
+                     deleting and rebuilding."
+                ));
+                let _ = std::fs::remove_file(&kernel_path);
+                let _ = std::fs::remove_file(&rootfs_path);
+            }
+        }
+    }
+    // Source-checkout-first. When the binary was compiled out of an
+    // mvm source tree that has `nix/images/dev-prebuilt/<arch>/`
+    // populated, that's the authoritative dev image for this build —
+    // skip GitHub entirely. The helper returns `None` for installed
+    // binaries (their `CARGO_MANIFEST_DIR` resolves into
+    // `~/.cargo/registry/` where the directory will never exist) and
+    // for source checkouts that haven't vendored anything yet, in
+    // which case we fall through to the published prebuilt as before.
+    if let Some((src_kernel, src_rootfs, source_label)) = find_vendored_dev_image() {
+        validate_dev_image_artifacts(&src_kernel, &src_rootfs).with_context(|| {
+            format!(
+                "vendored dev image at {source_label} failed sanity check — \
+                 refusing to copy garbage into the prebuilt cache"
+            )
+        })?;
+        ui::info(&format!(
+            "Using vendored dev image from source checkout ({source_label})."
+        ));
+        std::fs::copy(&src_kernel, &kernel_path)
+            .with_context(|| format!("copying vendored kernel {src_kernel:?} → {kernel_path}"))?;
+        std::fs::copy(&src_rootfs, &rootfs_path)
+            .with_context(|| format!("copying vendored rootfs {src_rootfs:?} → {rootfs_path}"))?;
+        // No prune — vendored is the source of truth for this binary,
+        // not a download; leaving older `v*/` dirs around lets
+        // installed-binary users keep their offline-fallback cache.
         return Ok((kernel_path, rootfs_path));
     }
-    download_dev_image(&kernel_path, &rootfs_path)
+    // Try the published prebuilt. Defer the prune until *after* a
+    // successful download — old `~/.mvm/dev/prebuilt/v*/` dirs and
+    // historical `~/.mvm/dev/builds/<hash>/` artifacts are our last-
+    // resort fallback when the release page lacks v{version} assets.
+    match download_dev_image(&kernel_path, &rootfs_path) {
+        Ok(result) => {
+            prune_old_prebuilts(&prebuilt_root, version);
+            Ok(result)
+        }
+        Err(download_err) => {
+            ui::warn(&format!(
+                "Could not download dev image for v{version}: {download_err}\n\
+                 Searching for a local fallback under ~/.mvm/dev/."
+            ));
+            if let Some((src_kernel, src_rootfs, source_label)) = find_local_fallback_image() {
+                ui::warn(&format!(
+                    "Using local fallback from {source_label}. \
+                     This is not the published v{version} image — boot it knowing the \
+                     versions differ. Publish v{version} assets or restore the local \
+                     builder flake to make this go away."
+                ));
+                std::fs::copy(&src_kernel, &kernel_path).with_context(|| {
+                    format!("copying fallback kernel {src_kernel:?} → {kernel_path}")
+                })?;
+                std::fs::copy(&src_rootfs, &rootfs_path).with_context(|| {
+                    format!("copying fallback rootfs {src_rootfs:?} → {rootfs_path}")
+                })?;
+                Ok((kernel_path, rootfs_path))
+            } else {
+                Err(download_err.context(
+                    "no local fallback found under ~/.mvm/dev/prebuilt/v*/ \
+                     or ~/.mvm/dev/builds/*/",
+                ))
+            }
+        }
+    }
+}
+
+/// Search for any locally-cached dev image as a fallback when the
+/// published-prebuilt download fails. Looks under:
+///
+/// - `~/.mvm/dev/prebuilt/v*/{vmlinux,rootfs.ext4}` — previously
+///   downloaded prebuilts for earlier versions.
+/// - `~/.mvm/dev/builds/<hash>/{vmlinux,rootfs.ext4}` — historical
+///   nix-darwin `linux-builder` outputs from the pre-microsandbox era.
+///
+/// Returns the most-recently-modified pair so a user with a recent
+/// successful build/download keeps booting, with a short label
+/// (e.g. `v0.13.0` or `builds/abcdef…`) for the warning surface.
+/// `None` means nothing usable was found.
+fn find_local_fallback_image() -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let dev_root = format!("{}/dev", mvm_core::config::mvm_data_dir());
+
+    let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, String)> = Vec::new();
+    for sub in ["prebuilt", "builds"] {
+        let parent = std::path::Path::new(&dev_root).join(sub);
+        let Ok(entries) = std::fs::read_dir(&parent) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let dir = entry.path();
+            if !dir.is_dir() {
+                continue;
+            }
+            let kernel = dir.join("vmlinux");
+            let rootfs = dir.join("rootfs.ext4");
+            if !kernel.is_file() || !rootfs.is_file() {
+                continue;
+            }
+            // Silently skip cache entries that look corrupt (stub
+            // bytes from a botched earlier copy, half-written
+            // downloads, etc.). The auto-discover path is best-effort
+            // — surfacing every bad candidate as a warning would
+            // spam the boot path; the cascade just falls through to
+            // a healthier candidate or to the next layer.
+            if validate_dev_image_artifacts(&kernel, &rootfs).is_err() {
+                continue;
+            }
+            let mtime = std::fs::metadata(&rootfs)
+                .and_then(|m| m.modified())
+                .unwrap_or(std::time::UNIX_EPOCH);
+            let label = format!("{sub}/{}", entry.file_name().to_string_lossy());
+            candidates.push((mtime, dir, label));
+        }
+    }
+
+    candidates.sort_by_key(|(mtime, ..)| *mtime);
+    let (_, dir, label) = candidates.into_iter().next_back()?;
+    Some((dir.join("vmlinux"), dir.join("rootfs.ext4"), label))
+}
+
+/// Sanity-check that a `(vmlinux, rootfs.ext4)` pair looks like a real
+/// dev image. Fast-fails before copying or returning the artifacts as
+/// usable, so a stub or truncated file can't poison the prebuilt cache.
+///
+/// Two checks per file:
+///
+/// - **Size floor.** A real `vmlinux` is several MiB (typical ARM64
+///   Image is 15–20 MiB); a real `rootfs.ext4` is ~700 MiB. Reject
+///   anything under a conservative floor (1 MiB / 4 MiB respectively)
+///   to catch the stub-file case (~12 B from a botched test, ~0 B
+///   from a torn-down download).
+/// - **Ext4 magic.** The ext4 superblock starts at byte 1024; the
+///   `s_magic` field is at byte 1080 (offset 56 inside the
+///   superblock) and equals `0xEF53` little-endian. Only the rootfs
+///   gets this check — `vmlinux` formats vary by arch (ARM64
+///   `Image`, x86 bzImage, etc.) so there's no portable magic to
+///   match.
+fn validate_dev_image_artifacts(
+    kernel: impl AsRef<std::path::Path>,
+    rootfs: impl AsRef<std::path::Path>,
+) -> Result<()> {
+    const KERNEL_MIN_BYTES: u64 = 1024 * 1024;
+    const ROOTFS_MIN_BYTES: u64 = 4 * 1024 * 1024;
+    const EXT4_MAGIC_OFFSET: u64 = 1024 + 56;
+    const EXT4_MAGIC: [u8; 2] = [0x53, 0xEF];
+
+    let kernel = kernel.as_ref();
+    let rootfs = rootfs.as_ref();
+
+    let kernel_size = std::fs::metadata(kernel)
+        .with_context(|| format!("stat {}", kernel.display()))?
+        .len();
+    if kernel_size < KERNEL_MIN_BYTES {
+        anyhow::bail!(
+            "kernel at {} is only {} bytes (expected ≥ {})",
+            kernel.display(),
+            kernel_size,
+            KERNEL_MIN_BYTES,
+        );
+    }
+
+    let rootfs_size = std::fs::metadata(rootfs)
+        .with_context(|| format!("stat {}", rootfs.display()))?
+        .len();
+    if rootfs_size < ROOTFS_MIN_BYTES {
+        anyhow::bail!(
+            "rootfs at {} is only {} bytes (expected ≥ {})",
+            rootfs.display(),
+            rootfs_size,
+            ROOTFS_MIN_BYTES,
+        );
+    }
+
+    use std::io::{Read, Seek, SeekFrom};
+    let mut f =
+        std::fs::File::open(rootfs).with_context(|| format!("open {}", rootfs.display()))?;
+    f.seek(SeekFrom::Start(EXT4_MAGIC_OFFSET))
+        .with_context(|| format!("seek to ext4 magic in {}", rootfs.display()))?;
+    let mut magic = [0u8; 2];
+    f.read_exact(&mut magic)
+        .with_context(|| format!("read ext4 magic from {}", rootfs.display()))?;
+    if magic != EXT4_MAGIC {
+        anyhow::bail!(
+            "rootfs at {} does not have ext4 magic at offset {} (got {magic:02x?})",
+            rootfs.display(),
+            EXT4_MAGIC_OFFSET,
+        );
+    }
+
+    Ok(())
+}
+
+/// Look for a vendored dev image inside the source checkout the mvmctl
+/// binary was compiled from: `{workspace_root}/nix/images/dev-prebuilt/
+/// <arch>/{vmlinux, rootfs.ext4}`. The path is checked last in the
+/// fallback cascade — it's the most predictable source ("what the
+/// repo ships") but only useful when `mvmctl` runs out of its source
+/// checkout: `CARGO_MANIFEST_DIR` is baked at compile time and points
+/// into `~/.cargo/registry/` for `cargo install`-ed builds, where the
+/// directory will reliably be missing. That's fine — for installed
+/// binaries the `~/.mvm/dev/` auto-discover path covers the offline
+/// case.
+///
+/// `arch` mirrors the matrix used by `download_dev_image`: `aarch64`
+/// on Apple Silicon / aarch64-linux, `x86_64` everywhere else.
+fn find_vendored_dev_image() -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(manifest_dir).parent()?.parent()?;
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let dir = workspace_root
+        .join("nix")
+        .join("images")
+        .join("dev-prebuilt")
+        .join(arch);
+    let kernel = dir.join("vmlinux");
+    let rootfs = dir.join("rootfs.ext4");
+    if !kernel.is_file() || !rootfs.is_file() {
+        return None;
+    }
+    let label = format!("vendored {}", dir.display());
+    Some((kernel, rootfs, label))
 }
 
 /// Drop every direct child of `prebuilt_root` except the one for the
@@ -954,7 +880,7 @@ fn download_dev_image(kernel_path: &str, rootfs_path: &str) -> Result<(String, S
 
 fn download_dev_image_inner(kernel_path: &str, rootfs_path: &str) -> Result<(String, String)> {
     let version = env!("CARGO_PKG_VERSION");
-    let base_url = format!("https://github.com/auser/mvm/releases/download/v{version}");
+    let base_url = format!("https://github.com/tinylabscom/mvm/releases/download/v{version}");
     // Detect host arch to download the right image.
     // Apple Silicon (aarch64-darwin) needs aarch64-linux image.
     // Intel Mac (x86_64-darwin) needs x86_64-linux image.
@@ -1081,8 +1007,9 @@ fn try_fetch_signed_manifest(
 
     // GitHub Actions keyless OIDC: the SAN encodes the workflow URL
     // bound to the tag, and the issuer is GitHub's token endpoint.
-    let expected_identity =
-        format!("https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/v{version}");
+    let expected_identity = format!(
+        "https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/v{version}"
+    );
     let expected_issuer = "https://token.actions.githubusercontent.com";
 
     let manifest = if std::env::var_os("MVM_SKIP_COSIGN_VERIFY").is_some() {
@@ -1197,7 +1124,7 @@ fn try_fetch_revocation_list() -> Result<Option<mvm_security::image_verify::Revo
 
     // Refresh if cache is stale (or absent).
     if cache_age > twenty_four_hours {
-        let base = "https://github.com/auser/mvm/releases/download/revocations";
+        let base = "https://github.com/tinylabscom/mvm/releases/download/revocations";
         let json_url = format!("{base}/revoked-versions.json");
         let bundle_url = format!("{base}/revoked-versions.json.bundle");
 
@@ -1270,8 +1197,7 @@ fn try_fetch_revocation_list() -> Result<Option<mvm_security::image_verify::Revo
     // workflow's OIDC identity, not the per-release workflow. A
     // separate identity ensures a leaked image-signing cert can't
     // fabricate a permissive revocation list (and vice versa).
-    let expected_identity =
-        "https://github.com/auser/mvm/.github/workflows/revocations.yml@refs/tags/revocations";
+    let expected_identity = "https://github.com/tinylabscom/mvm/.github/workflows/revocations.yml@refs/tags/revocations";
     let expected_issuer = "https://token.actions.githubusercontent.com";
 
     if std::env::var_os("MVM_SKIP_COSIGN_VERIFY").is_some() {
@@ -1341,8 +1267,9 @@ pub fn cmd_dev_import_image(
     let bundle_bytes = std::fs::read(bundle_path)
         .with_context(|| format!("reading cosign bundle at {bundle_path}"))?;
 
-    let expected_identity =
-        format!("https://github.com/auser/mvm/.github/workflows/release.yml@refs/tags/v{version}");
+    let expected_identity = format!(
+        "https://github.com/tinylabscom/mvm/.github/workflows/release.yml@refs/tags/v{version}"
+    );
     let expected_issuer = "https://token.actions.githubusercontent.com";
 
     let manifest = if std::env::var_os("MVM_SKIP_COSIGN_VERIFY").is_some() {
@@ -1498,12 +1425,9 @@ fn bump_verify_outcome(outcome: &str) {
     counter.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
     if outcome != "network" {
         let mvmctl_version = env!("CARGO_PKG_VERSION");
-        mvm_core::audit::emit(
-            mvm_core::audit::LocalAuditKind::ImageVerifyFailed,
-            None,
-            Some(&format!(
-                "outcome={outcome} mvmctl_version={mvmctl_version}"
-            )),
+        mvm_core::audit_emit!(
+            ImageVerifyFailed,
+            "outcome={outcome} mvmctl_version={mvmctl_version}"
         );
     }
 }
@@ -1655,7 +1579,7 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
              still in flight. Check the release page or retry in a few\n\
              minutes:\n\
              \n\
-             \x20   https://github.com/auser/mvm/releases/tag/v{version}\n\
+             \x20   https://github.com/tinylabscom/mvm/releases/tag/v{version}\n\
              \n\
              To build locally instead, set up a Nix Linux builder:\n\
              \n\
@@ -1671,25 +1595,123 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
-/// Find the `nix` binary, checking PATH and common install locations.
-fn find_nix_binary() -> String {
-    if which::which("nix").is_ok() {
-        return "nix".to_string();
+/// Build a microVM image (kernel + rootfs) by spawning the mvm-owned
+/// microsandbox builder VM and running `nix build` inside it.
+///
+/// `flake_dir` is bind-mounted into the builder as `/work`; the builder
+/// runs `nix build /work#packages.<linux_system>.default` and copies
+/// the resulting artifacts to `out_dir`. The host's `/nix/store` is
+/// bind-mounted opportunistically (when present) for cache reuse — its
+/// absence is fine, the builder will fetch from substituters.
+///
+/// ADR-013 §"Linux builder via microsandbox (no Lima)" — this replaces
+/// the previous host-nix + `nix-darwin` `linux-builder` path so mvm
+/// owns the builder VM end-to-end and the user needs no external Nix
+/// configuration on the host.
+#[cfg(feature = "backends-microsandbox")]
+fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(String, String)> {
+    use mvm_build::builder_vm::{
+        BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, BuilderVm, MicrosandboxBuilderVm,
+        host_system_linux,
+    };
+
+    let flake_src = std::path::PathBuf::from(flake_dir);
+    if !flake_src.exists() {
+        anyhow::bail!("flake dir does not exist: {flake_dir}");
     }
-    for path in &[
-        "/nix/var/nix/profiles/default/bin/nix",
-        "/run/current-system/sw/bin/nix",
-    ] {
-        if std::path::Path::new(path).exists() {
-            return path.to_string();
+
+    // The bundled flakes live at `<workspace>/nix/images/<name>/` and
+    // use `builtins.path { path = ../../..; }` to capture the workspace
+    // root (for `mkGuest` lib + `Cargo.lock`). To make that resolve
+    // correctly inside the sandbox, mount the whole workspace at /work
+    // and point `flake_ref` at the subdir. Mounting only the flake dir
+    // (the previous design) made `../../..` resolve to `/` of the
+    // sandbox, which tripped over `/.msb/agent.sock` and other
+    // microsandbox-internal files Nix can't import.
+    let workspace_root = flake_src
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| {
+            anyhow::anyhow!("flake dir is not three levels deep in workspace: {flake_dir}")
+        })?
+        .to_path_buf();
+    let flake_rel = flake_src
+        .strip_prefix(&workspace_root)
+        .map_err(|_| anyhow::anyhow!("flake dir not under derived workspace root: {flake_dir}"))?;
+    // `path:` URL forces Nix's filesystem flake fetcher rather than the
+    // git fetcher. The git fetcher gets engaged automatically whenever
+    // the flake path sits under a `.git` directory (the workspace
+    // mount always does), and it fails on git worktrees — the
+    // worktree's `.git` is a file whose `gitdir:` redirect points
+    // outside the bind mount.
+    let guest_flake_ref = format!(
+        "path:{}/{}",
+        BUILDER_GUEST_WORK_DIR,
+        flake_rel
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("flake subpath has non-UTF-8 bytes: {flake_rel:?}"))?
+    );
+
+    // Bind-mount /nix opportunistically on Linux hosts that already
+    // run native Nix — the builder reuses already-realized store paths,
+    // and absence is fine because the in-sandbox store fetches from
+    // substituters. Skip the bind on macOS: a multi-user Nix install
+    // there leaves `/nix` owned by `root:wheel` (Apple Container's
+    // bind-mounter fails with EACCES), *and* the store contains
+    // Darwin-targeted closures that a Linux microVM can't execute
+    // anyway. The microsandbox builder is on the macOS path precisely
+    // because the host has no usable Linux Nix; reusing its Darwin
+    // store is wrong regardless of permissions.
+    let host_nix_store = if cfg!(target_os = "macos") {
+        None
+    } else {
+        let host_nix = std::path::PathBuf::from("/nix");
+        if host_nix.join("store").is_dir() {
+            Some(host_nix)
+        } else {
+            None
         }
+    };
+
+    let job = BuilderJob {
+        flake_ref: guest_flake_ref,
+        attr_path: format!("packages.{}.default", host_system_linux()),
+    };
+    let mounts = BuilderMounts {
+        flake_src: workspace_root,
+        host_nix_store,
+        artifact_out: std::path::PathBuf::from(out_dir),
+    };
+
+    MicrosandboxBuilderVm::default()
+        .run_build(&job, &mounts)
+        .map_err(|e| anyhow::anyhow!("microsandbox builder VM: {e}"))?;
+
+    let kernel = format!("{out_dir}/vmlinux");
+    let rootfs = format!("{out_dir}/rootfs.ext4");
+    if !std::path::Path::new(&kernel).exists() {
+        anyhow::bail!("builder VM did not produce vmlinux at {kernel}");
     }
-    "nix".to_string() // fall back to PATH, let the error happen naturally
+    if !std::path::Path::new(&rootfs).exists() {
+        anyhow::bail!("builder VM did not produce rootfs.ext4 at {rootfs}");
+    }
+    Ok((kernel, rootfs))
 }
 
 /// Find the dev-image Nix flake directory.
+///
+/// Returns `Ok(path)` only when `nix/images/builder/flake.nix` is present —
+/// that flake is the only one whose `packages.<sys>.default` output
+/// produces the vmlinux + rootfs.ext4 + sidecar shape that
+/// `MicrosandboxBuilderVm::run_build` extracts from `/out`. The
+/// parent `nix/flake.nix` exposes a library (`lib.mkGuest`) plus an
+/// `internal-minimal-runner` test fixture, neither of which match
+/// that contract — falling back to it earlier yielded a misleading
+/// "double-prefix attribute" `nix build` failure inside the
+/// sandbox. The bail signals `ensure_dev_image` to take the
+/// published-prebuilt download path (W5.1 — hash-verified).
 fn find_dev_image_flake() -> Result<String> {
-    // Check in the source tree
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = std::path::Path::new(manifest_dir)
         .parent()
@@ -1701,23 +1723,17 @@ fn find_dev_image_flake() -> Result<String> {
         return Ok(candidate.to_str().unwrap_or(".").to_string());
     }
 
-    // Fall back to the parent flake's minimal profile
-    let parent = workspace_root.join("nix");
-    if parent.join("flake.nix").exists() {
-        return Ok(parent.to_str().unwrap_or(".").to_string());
-    }
-
-    anyhow::bail!(
-        "Dev image flake not found. Expected at nix/images/builder/flake.nix\n\
-         or nix/flake.nix"
-    )
+    anyhow::bail!("Dev image flake not found. Expected at nix/images/builder/flake.nix")
 }
 
 /// Locate the bundled `nix/images/default-tenant/` flake.
 ///
 /// This is the fallback used by image-taking commands (`mvmctl exec`,
 /// `mvmctl up`) when neither `--flake` nor `--manifest` is supplied.
-/// (Was `nix/default-microvm/` before W7.3.)
+/// (Was `nix/default-microvm/` before W7.3.) Only the builder-VM path
+/// in `ensure_default_microvm_image` consumes this helper; gating
+/// matches that single call site.
+#[cfg(feature = "backends-microsandbox")]
 fn find_default_microvm_flake() -> Result<String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = std::path::Path::new(manifest_dir)
@@ -1740,12 +1756,14 @@ fn find_default_microvm_flake() -> Result<String> {
 /// Ensure the bundled default microVM image (kernel + rootfs) is in the cache.
 ///
 /// Used by any image-taking command when no `--flake` or `--manifest` was
-/// supplied. Builds via Nix on first use and caches under
-/// `~/.cache/mvm/default-microvm/`. Returns `(kernel_path, rootfs_path)`.
+/// supplied. Builds via the mvm-owned microsandbox builder VM on first
+/// use and caches under `~/.cache/mvm/default-microvm/`. Returns
+/// `(kernel_path, rootfs_path)`.
 ///
-/// On hosts without Nix (or where the local Nix build fails — e.g. macOS
-/// without a Linux builder configured), falls back to downloading a
-/// pre-built image from the matching GitHub release.
+/// If the local build fails or no source flake is available (e.g. an
+/// installed-binary build with `backends-microsandbox` compiled out),
+/// falls back to downloading a pre-built image from the matching
+/// GitHub release.
 pub(crate) fn ensure_default_microvm_image() -> Result<(String, String)> {
     let cache_dir = format!("{}/default-microvm", mvm_core::config::mvm_cache_dir());
     std::fs::create_dir_all(&cache_dir)?;
@@ -1757,55 +1775,20 @@ pub(crate) fn ensure_default_microvm_image() -> Result<(String, String)> {
         return Ok((kernel_path, rootfs_path));
     }
 
-    let plat = mvm_core::platform::current();
-    if plat.has_host_nix()
-        && let Ok(flake_dir) = find_default_microvm_flake()
-    {
-        let nix_bin = find_nix_binary();
-
-        if cfg!(target_os = "macos") && ensure_linux_builder_ssh_config() {
-            ui::info("  Linux builder detected and SSH configured.");
-        }
-
-        ui::info("Building default microVM image via Nix (first time only)...");
-        let mut child = std::process::Command::new(&nix_bin)
-            .args([
-                "build",
-                &format!(
-                    "{flake_dir}#packages.{}.default",
-                    mvm_build::dev_build::linux_system()
-                ),
-                "--no-link",
-                "--print-out-paths",
-            ])
-            .stdout(std::process::Stdio::piped())
-            .stderr(std::process::Stdio::inherit())
-            .spawn()
-            .context("Failed to run nix build")?;
-
-        let stdout = {
-            let mut buf = String::new();
-            if let Some(mut out) = child.stdout.take() {
-                use std::io::Read;
-                let _ = out.read_to_string(&mut buf);
-            }
-            buf
-        };
-        let status = child.wait().context("nix build process failed")?;
-
-        if status.success() {
-            let store_path = stdout.trim().to_string();
-            let ks = format!("{store_path}/vmlinux");
-            let rs = format!("{store_path}/rootfs.ext4");
-            if std::path::Path::new(&ks).exists() && std::path::Path::new(&rs).exists() {
-                std::fs::copy(&ks, &kernel_path)?;
-                std::fs::copy(&rs, &rootfs_path)?;
+    #[cfg(feature = "backends-microsandbox")]
+    if let Ok(flake_dir) = find_default_microvm_flake() {
+        ui::info("Building default microVM image via microsandbox builder VM (first time only)...");
+        match build_image_via_microsandbox(&flake_dir, &cache_dir) {
+            Ok(_) => {
                 ui::success("Default microVM image built and cached.");
                 return Ok((kernel_path, rootfs_path));
             }
+            Err(e) => {
+                ui::warn(&format!(
+                    "Local builder VM build failed ({e}); falling back to pre-built download."
+                ));
+            }
         }
-
-        ui::warn("Local Nix build failed; falling back to pre-built download.");
     }
 
     download_default_microvm_image(&kernel_path, &rootfs_path)
@@ -1819,7 +1802,7 @@ fn download_default_microvm_image(
     rootfs_path: &str,
 ) -> Result<(String, String)> {
     let version = env!("CARGO_PKG_VERSION");
-    let base_url = format!("https://github.com/auser/mvm/releases/download/v{version}");
+    let base_url = format!("https://github.com/tinylabscom/mvm/releases/download/v{version}");
     let arch = if cfg!(target_arch = "aarch64") {
         "aarch64"
     } else {

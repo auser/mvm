@@ -66,12 +66,9 @@ fn set(template: &str, alias: &str, revision_hash: &str) -> Result<()> {
         .with_context(|| format!("setting alias {alias:?} → {revision_hash:?}"))?;
     catalog.save(template)?;
     println!("{template}: alias {alias:?} → {revision_hash}");
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::ManifestAliasSet,
-        None,
-        Some(&format!(
-            "template={template} alias={alias} rev={revision_hash}"
-        )),
+    mvm_core::audit_emit!(
+        ManifestAliasSet,
+        "template={template} alias={alias} rev={revision_hash}"
     );
     Ok(())
 }
@@ -85,11 +82,7 @@ fn rm(template: &str, alias: &str) -> Result<()> {
     }
     catalog.save(template)?;
     println!("{template}: removed alias {alias:?}");
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::ManifestAliasRemove,
-        None,
-        Some(&format!("template={template} alias={alias}")),
-    );
+    mvm_core::audit_emit!(ManifestAliasRemove, "template={template} alias={alias}");
     Ok(())
 }
 

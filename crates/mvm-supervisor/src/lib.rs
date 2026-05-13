@@ -37,11 +37,14 @@ pub mod audit_dedup;
 pub mod audit_file;
 pub mod audit_recorder;
 pub mod backend;
+pub mod balloon;
+pub mod balloon_runtime;
 pub mod circuit_breaker;
 pub mod destination;
 pub mod egress;
 pub mod event_bus;
 pub mod firewall;
+#[cfg(feature = "custom-dns")]
 pub mod hickory_dns;
 pub mod injection_guard;
 pub mod inspector;
@@ -71,6 +74,13 @@ pub use audit_recorder::{
     UNBOUND_PLAN_ID,
 };
 pub use backend::{BackendError, BackendLauncher, NoopBackendLauncher};
+#[cfg(target_os = "macos")]
+pub use balloon::VmPressureLevelSource;
+pub use balloon::{
+    BalloonAction, BalloonController, BalloonPolicy, HostPressure, HostPressureSource,
+    PsiPressureSource, SysinfoPressureSource, TickOutcome, default_pressure_source,
+};
+pub use balloon_runtime::{BalloonRuntimeConfig, run_balloon_loop, run_one_tick};
 pub use circuit_breaker::{
     CircuitBreaker, CircuitBreakerConfig, CircuitState, Clock as CircuitBreakerClock,
     InspectorReporter, SystemClock as CircuitBreakerSystemClock,
@@ -78,6 +88,7 @@ pub use circuit_breaker::{
 pub use destination::DestinationPolicy;
 pub use egress::{EgressDecision, EgressError, EgressProxy, NoopEgressProxy};
 pub use event_bus::{DEFAULT_CAPACITY as EVENT_BUS_DEFAULT_CAPACITY, EventBus, LifecycleEvent};
+#[cfg(feature = "custom-dns")]
 pub use hickory_dns::HickoryDnsResolver;
 pub use injection_guard::{InjectionGuard, InjectionRule, RuleFamily};
 pub use inspector::{Inspector, InspectorChain, InspectorVerdict, RequestCtx};

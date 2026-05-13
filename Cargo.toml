@@ -7,6 +7,7 @@ members = [
     "crates/mvm-policy",
     "crates/mvm-supervisor",
     "crates/mvm-providers",
+    "crates/mvm-libkrun",
     "crates/mvm-backend",
     "crates/mvm-base",
     "crates/mvm",
@@ -14,6 +15,16 @@ members = [
     "crates/mvm-guest",
     "crates/mvm-cli",
     "crates/mvm-mcp",
+    # plan 60 Phase 5 — build-time SDK port from ../mvmforge.
+    # mvm-ir is the canonical Workload IR; mvm-sdk is the builder
+    # surface; mvm-sdk-macros is a placeholder for the proc-macro
+    # surface that lands in a Phase 5 follow-on.
+    "crates/mvm-ir",
+    "crates/mvm-sdk",
+    "crates/mvm-sdk-macros",
+    # plan 60 Phase 5 Slice C — in-guest entrypoint runner for
+    # function-call workloads, ported from mvmforge-runtime.
+    "crates/mvm-runner",
     "xtask",
 ]
 # cargo-fuzz crates have to be excluded from the main workspace because
@@ -37,8 +48,8 @@ version = "0.14.0"
 edition = "2024"
 rust-version = "1.85"
 license = "Apache-2.0"
-repository = "https://github.com/auser/mvm"
-homepage = "https://github.com/auser/mvm"
+repository = "https://github.com/tinylabscom/mvm"
+homepage = "https://github.com/tinylabscom/mvm"
 authors = ["mvm contributors"]
 
 # Workspace-wide lint policy. Plan-60 Phase 0 exit criterion — every
@@ -91,14 +102,8 @@ colored = "3"
 indicatif = "0.17"
 inquire = "0.7"
 
-# Template engine
-tera = "1"
-
 # Object storage abstraction (used for dev template registry)
 opendal = { version = "0.50", features = ["services-s3"] }
-
-# Allocator
-mimalloc = "0.1"
 
 # HTTP client (for CLI upgrade)
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
@@ -115,7 +120,7 @@ libc = "0.2"
 # the service binary).
 seccompiler = "0.5"
 
-# File watching
+# File watching (dev-watch feature only)
 notify = "7"
 notify-debouncer-mini = "0.5"
 
@@ -125,10 +130,7 @@ notify-debouncer-mini = "0.5"
 # format the policy bundle TOML uses.
 ipnet = { version = "2", features = ["serde"] }
 
-# Pure-Rust DNS resolver — replaces the host's libc getaddrinfo (which
-# `TokioDnsResolver` calls into) when operators want allow-listed
-# resolvers, per-VM resolver configs, or DoT/DoH upstreams. Plan 60
-# Phase 3 Slice B.
+# Pure-Rust DNS resolver, used only by the opt-in custom-dns feature.
 hickory-resolver = "0.24"
 
 # Utilities
@@ -145,21 +147,41 @@ tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
 uuid = { version = "1", features = ["v4"] }
 which = "7"
 
-# Internal crates
+# Internal crates.
+#
+# DRIFT-001 (Plan 31 Track A): the four crates that participate in the
+# `backends-microsandbox` feature chain declare `default-features = false`
+# at the workspace level. This is required because member crates can't
+# override `default-features` on a workspace-inherited dep — Cargo accepts
+# the override only when the workspace entry already has the field. The
+# member crates that want the feature active opt back in via the
+# `backends-microsandbox` feature chain (see `crates/mvm-cli/Cargo.toml`
+# and the root `[features]` block below). Library consumers (e.g. mvmd)
+# do `mvmctl = { default-features = false }` and pick up the off-state.
 mvm-core = { path = "crates/mvm-core", version = "0.14.0" }
 mvm-guest = { path = "crates/mvm-guest", version = "0.14.0" }
-mvm-build = { path = "crates/mvm-build", version = "0.14.0" }
-mvm = { path = "crates/mvm", version = "0.14.0" }
+mvm-build = { path = "crates/mvm-build", version = "0.14.0", default-features = false }
+mvm = { path = "crates/mvm", version = "0.14.0", default-features = false }
 mvm-base = { path = "crates/mvm-base", version = "0.14.0" }
 mvm-security = { path = "crates/mvm-security", version = "0.14.0" }
 mvm-storage = { path = "crates/mvm-storage", version = "0.14.0" }
 mvm-plan = { path = "crates/mvm-plan", version = "0.14.0" }
 mvm-policy = { path = "crates/mvm-policy", version = "0.14.0" }
 mvm-supervisor = { path = "crates/mvm-supervisor", version = "0.14.0" }
-mvm-cli = { path = "crates/mvm-cli", version = "0.14.0" }
+mvm-cli = { path = "crates/mvm-cli", version = "0.14.0", default-features = false }
+
+# plan 60 Phase 5 — build-time SDK port from ../mvmforge.
+mvm-ir = { path = "crates/mvm-ir", version = "0.14.0" }
+mvm-sdk = { path = "crates/mvm-sdk", version = "0.14.0" }
+mvm-sdk-macros = { path = "crates/mvm-sdk-macros", version = "0.14.0" }
 mvm-mcp = { path = "crates/mvm-mcp", version = "0.14.0" }
 mvm-providers = { path = "crates/mvm-providers", version = "0.14.0" }
-mvm-backend = { path = "crates/mvm-backend", version = "0.14.0" }
+# Plan 57 W1 — libkrun FFI bindings split out of mvm-providers so the
+# bindgen + libclang build cost is isolated from the Apple-VZ objc2
+# stack. Default feature set is empty; consumers wanting real FFI
+# enable `libkrun-sys` on a host with libkrun installed.
+mvm-libkrun = { path = "crates/mvm-libkrun", version = "0.14.0" }
+mvm-backend = { path = "crates/mvm-backend", version = "0.14.0", default-features = false }
 
 # Dev dependencies
 assert_cmd = "2"
@@ -188,13 +210,15 @@ path = "src/main.rs"
 [dependencies]
 mvm-core.workspace = true
 mvm-security.workspace = true
-mvm.workspace = true
-mvm-backend.workspace = true
-mvm-build.workspace = true
+# `default-features = false` keeps the heavy microsandbox stack out of the
+# lean default binary. Operators who need the libkrun/microsandbox path opt in
+# with `--features backends-microsandbox`.
+mvm = { workspace = true, default-features = false }
+mvm-backend = { workspace = true, default-features = false }
+mvm-build = { workspace = true, default-features = false }
 mvm-guest.workspace = true
-mvm-cli.workspace = true
+mvm-cli = { workspace = true, default-features = false }
 anyhow.workspace = true
-mimalloc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3", features = ["NSRunLoop", "NSDate", "NSAutoreleasePool"] }
@@ -206,9 +230,40 @@ chrono.workspace = true
 # `clap::Command` tree returned by `mvm_cli::commands::cli_command()`
 # to enforce that every subcommand has a declared audit posture.
 clap.workspace = true
+# Plan 69: local mock HTTP server for the `mvmctl update` live test.
+# Avoids reaching the real GitHub release API in CI / on dev machines.
+httpmock = "0.7"
+# Plan 60 Phase 7a — `tests/tenant_destroy_e2e.rs` exercises the
+# operator→auditor pipeline end-to-end. `mvm` (path dep above)
+# pulls these transitively at runtime; the integration test
+# binary needs its own usage.
+ed25519-dalek.workspace = true
 predicates.workspace = true
+rand.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["macros", "rt"] }
+
+[features]
+# Keep the default production build lean. Heavy integrations remain opt-in.
+default = []
+backends-microsandbox = [
+    "mvm/backends-microsandbox",
+    "mvm-backend/backends-microsandbox",
+    "mvm-build/backends-microsandbox",
+    "mvm-cli/backends-microsandbox",
+]
+custom-dns = ["mvm-cli/custom-dns"]
+dev-watch = ["mvm-cli/dev-watch"]
+manifest-verify = [
+    "mvm/manifest-verify",
+    "mvm-cli/manifest-verify",
+    "mvm-security/manifest-verify",
+]
+template-registry-s3 = [
+    "mvm/template-registry-s3",
+    "mvm-cli/template-registry-s3",
+]
 
 [profile.release]
 opt-level = 3

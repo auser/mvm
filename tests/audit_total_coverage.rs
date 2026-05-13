@@ -76,6 +76,9 @@ const MANIFEST_SUB: &[(&str, AuditPosture)] = &[
     ("verify", AuditPosture::ReadOnly),
     ("tag", AuditPosture::DelegatesToSub(MANIFEST_TAG)),
     ("alias", AuditPosture::DelegatesToSub(MANIFEST_ALIAS)),
+    // `manifest export-oci` copies a slot's image.tar.gz onto the
+    // host filesystem and emits `LocalAuditKind::ImageExportOci`.
+    ("export-oci", AuditPosture::Emits("ImageExportOci")),
 ];
 
 const STORAGE_SUB: &[(&str, AuditPosture)] = &[
@@ -150,6 +153,53 @@ const SNAPSHOT_SUB: &[(&str, AuditPosture)] = &[
     ("rm", AuditPosture::Emits("SnapshotDelete")),
 ];
 
+// Sprint 52 W2 — bundle / trust subcommand tables.
+//
+// `bundle export` writes a `.mvmpkg` archive to disk under the
+// host's `--out` path; that's a local artifact, not host-side
+// state that the audit chain tracks, so it shipped as
+// `InteractiveOrControl` rather than `Emits` for now. Bumping it
+// to a `BundleExport` emission is the natural follow-up when the
+// host-side bundle registry lands.
+//
+// `bundle fetch` is verify-only in this commit (no extraction),
+// so it's `ReadOnly`. When the registry-replacement flow lands
+// and fetch starts mutating `~/.mvm/templates/<bundle-sha256>/`,
+// this row flips to `Emits("BundleFetch")`.
+//
+// `trust` mutates `~/.mvm/trusted-publishers/`. add/remove emit
+// audit entries (publisher trust is host-trust-boundary state);
+// list is `ReadOnly`.
+const BUNDLE_SUB: &[(&str, AuditPosture)] = &[
+    ("export", AuditPosture::InteractiveOrControl),
+    ("fetch", AuditPosture::ReadOnly),
+    // `bundle install` mutates the local bundle registry under
+    // `~/.mvm/bundles/<sha>/` and emits
+    // `LocalAuditKind::BundleInstall` via `mvm_core::audit::emit`.
+    ("install", AuditPosture::Emits("BundleInstall")),
+    // `bundle gc` removes one (or all) installed bundles and emits
+    // `LocalAuditKind::BundleGc` on the success arm.
+    ("gc", AuditPosture::Emits("BundleGc")),
+];
+
+// trust add/remove mutate `~/.mvm/trusted-publishers/` and emit
+// `LocalAuditKind::{TrustAdd, TrustRemove}` via
+// `mvm_core::audit::emit`. Sprint 52 W2 phase-3 close-out
+// promoted these from `InteractiveOrControl` to `Emits(...)`.
+const TRUST_SUB: &[(&str, AuditPosture)] = &[
+    ("add", AuditPosture::Emits("TrustAdd")),
+    ("list", AuditPosture::ReadOnly),
+    ("remove", AuditPosture::Emits("TrustRemove")),
+];
+
+// Plan 60 Phase 7a Slices A + D. `tenant destroy` writes signed
+// destruction certificates to stdout; the per-workload chain
+// emission (`lifecycle.tenant.destroyed`) lives in the plan-64
+// audit chain rather than the legacy LocalAuditKind stream, so
+// the row is `InteractiveOrControl` here. The signature/chain
+// integrity is exercised by `tests/tenant_destroy_e2e.rs`.
+const TENANT_SUB: &[(&str, AuditPosture)] = &[("destroy", AuditPosture::InteractiveOrControl)];
+
 /// Every top-level `mvmctl` subcommand keyed by its clap name.
 ///
 /// Order matches the `Commands` enum in
@@ -202,6 +252,14 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("secret", AuditPosture::DelegatesToSub(SECRET_SUB)),
     ("attest", AuditPosture::DelegatesToSub(ATTEST_SUB)),
     ("policy", AuditPosture::DelegatesToSub(POLICY_SUB)),
+    // Sprint 52 W2 — bundles + trust store.
+    ("bundle", AuditPosture::DelegatesToSub(BUNDLE_SUB)),
+    ("trust", AuditPosture::DelegatesToSub(TRUST_SUB)),
+    // Plan 60 Phase 7a Slices A + D — destroys overlays + emits
+    // signed certificates. `tenant destroy` is the only leaf
+    // today; future Slice E adds `rebuild`, Slice 7b adds
+    // `install` / `uninstall`.
+    ("tenant", AuditPosture::DelegatesToSub(TENANT_SUB)),
 ];
 
 // ──────────────────────────────────────────────────────────────────
@@ -373,6 +431,11 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
         "VmProcSignal",
         "VmProcStart",
         "VmProcStdin",
+        "BundleGc",
+        "BundleInstall",
+        "ImageExportOci",
+        "TrustAdd",
+        "TrustRemove",
         "VmStart",
         "VmStop",
         "VmTtlSet",

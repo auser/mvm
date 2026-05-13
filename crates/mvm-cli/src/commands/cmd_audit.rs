@@ -40,7 +40,13 @@ use super::vm::host_signer;
 /// Best-effort Recorder for `cmd.*` envelopes. Returns `None` (with
 /// a `tracing::warn`) when any setup step fails — the CLI runs
 /// without cmd-level audit in that case.
-pub(super) fn build_cmd_recorder() -> Option<Recorder> {
+///
+/// Also used by `commands::ops::mcp::build_tool_registry` to wire
+/// the same chain-signed audit stream into the host-mediated
+/// `ToolRegistry`. The Recorder is category-agnostic (callers pass
+/// `EventCategory::Cmd` for both `cmd.<verb>` and
+/// `cmd.tool.<verb>` events) so one builder serves both consumers.
+pub(crate) fn build_cmd_recorder() -> Option<Recorder> {
     let signer = match host_signer::load_or_init() {
         Ok(s) => s,
         Err(e) => {
@@ -173,6 +179,9 @@ impl Commands {
             Commands::Secret(_) => "secret",
             Commands::Attest(_) => "attest",
             Commands::Policy(_) => "policy",
+            Commands::Bundle(_) => "bundle",
+            Commands::Trust(_) => "trust",
+            Commands::Tenant(_) => "tenant",
         }
     }
 }

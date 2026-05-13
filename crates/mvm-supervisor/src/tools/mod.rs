@@ -48,7 +48,11 @@
 //!    `mvm-policy::ToolPolicy::DEFAULTS` (separate slice; this
 //!    substrate does not pre-allowlist anything).
 
+pub mod download;
+pub mod http_hardening;
+pub mod staging;
 pub mod time_now;
+pub mod upload;
 pub mod web_fetch;
 pub mod web_search;
 
@@ -146,14 +150,19 @@ impl ToolRegistry {
     ///   [`web_fetch::WebFetchTool`] to enable.
     /// - `mvm.web_search` — fail-closed by default (empty provider
     ///   allowlist + [`web_search::NoopSearchProvider`]).
+    /// - `mvm.upload` / `mvm.download` — fail-closed by default
+    ///   ([`staging::NoopStagingArea`]); operators wire a real
+    ///   [`staging::FsStagingArea`] via the env-driven
+    ///   `build_tool_registry` helper in `mvm-cli`.
     ///
-    /// Future slices grow this list as `upload`, `download`, and
-    /// `code_eval` land.
+    /// Future slices grow this list as `code_eval` lands.
     pub fn with_defaults() -> Self {
         let mut r = Self::new();
         r.register(Box::new(time_now::TimeNowTool));
         r.register(Box::new(web_fetch::WebFetchTool::default()));
         r.register(Box::new(web_search::WebSearchTool::default()));
+        r.register(Box::new(upload::UploadTool::default()));
+        r.register(Box::new(download::DownloadTool::default()));
         r
     }
 
@@ -306,20 +315,26 @@ mod tests {
     }
 
     #[test]
-    fn with_defaults_registers_all_three_phase_7_builtins() {
-        // The Phase 7 substrate ships three tools out of the box.
-        // `time_now` is reachable; `web_fetch` and `web_search` are
-        // wired with fail-closed defaults so an operator who calls
-        // them without configuring an allowlist gets a clear
-        // "not on allowlist" or "fetcher not wired" error.
+    fn with_defaults_registers_all_phase_7_builtins() {
+        // The Phase 7 substrate ships five tools out of the box.
+        // `time_now` is reachable; the rest are wired with
+        // fail-closed defaults so an operator who calls them
+        // without configuring an allowlist / staging area gets a
+        // clear "not wired" error.
         let r = ToolRegistry::with_defaults();
-        for builtin in ["mvm.time_now", "mvm.web_fetch", "mvm.web_search"] {
+        for builtin in [
+            "mvm.time_now",
+            "mvm.web_fetch",
+            "mvm.web_search",
+            "mvm.upload",
+            "mvm.download",
+        ] {
             assert!(
                 r.is_registered(builtin),
                 "default registry must include {builtin}"
             );
         }
-        assert_eq!(r.names().len(), 3);
+        assert_eq!(r.names().len(), 5);
     }
 
     #[tokio::test]

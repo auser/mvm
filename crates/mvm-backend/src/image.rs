@@ -113,6 +113,13 @@ pub struct RuntimeConfig {
     pub cpus: Option<u32>,
     #[serde(default)]
     pub memory: Option<u32>,
+    /// Initial host commitment in MiB when opting into virtio-balloon.
+    /// `None` keeps the legacy "commit `memory` at boot" behaviour.
+    /// When `Some(n)`, the workload boots with `memory - n` MiB worth
+    /// of balloon pre-inflated and the host reclaim controller adjusts
+    /// over the VM's lifetime.
+    #[serde(default)]
+    pub mem_initial: Option<u32>,
     #[serde(default)]
     pub volumes: Vec<RuntimeVolume>,
 }

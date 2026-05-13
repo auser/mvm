@@ -10,6 +10,7 @@
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 
+use crate::bundle::PlanArtifact;
 use crate::types::{
     ArtifactPolicy, AttestationRequirement, AuditLabels, FsPolicyRef, KeyRotationSpec, Nonce,
     PlanId, PolicyRef, PostRunLifecycle, ReleasePin, Resources, RuntimeProfileRef, SecretBinding,
@@ -27,7 +28,15 @@ use crate::types::{
 /// reject v2 plans with `UnsupportedSchema`; this is the correct
 /// fail-closed behavior — they can't enforce the validity window
 /// they don't understand.
-pub const SCHEMA_VERSION: u32 = 2;
+///
+/// Bumped 2 → 3 in Sprint 52 W2 follow-on with the addition of
+/// `bundle: Option<PlanArtifact>` — the supervisor's admit path
+/// re-verifies the pinned bundle archive before backend dispatch
+/// (ADR-002 claim 9 fully load-bearing at launch, not just at
+/// fetch). Older verifiers will reject v3 plans with
+/// `UnsupportedSchema` because they don't know how to re-verify
+/// the binding.
+pub const SCHEMA_VERSION: u32 = 3;
 
 /// Typed contract for one workload's execution.
 ///
@@ -115,4 +124,20 @@ pub struct ExecutionPlan {
     /// ledger self-prunes once `valid_until` passes for a stored
     /// nonce. Plan 37 Addendum G4.
     pub nonce: Nonce,
+
+    /// Optional pin to a content-addressed `.mvmpkg` bundle. When
+    /// present, the supervisor's admit path re-runs
+    /// [`crate::bundle::read_and_verify_bundle`] against the
+    /// resolved archive bytes, then compares the resulting
+    /// `bundle_sha256` + `manifest_sig` + `key_id` against the
+    /// pinned values here. Any mismatch refuses the admission —
+    /// ADR-002 claim 9 is load-bearing at launch, not just at
+    /// fetch.
+    ///
+    /// `None` (the default) means the plan is not pinned to a
+    /// bundle; the admit path skips the bundle re-verify step.
+    /// Sprint 52 W2 follow-on shipped this field; populating it
+    /// from CLI synthesis is the next step, after this substrate.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub bundle: Option<PlanArtifact>,
 }

@@ -3,6 +3,7 @@
 
 pub(super) mod attest;
 pub(super) mod audit;
+pub(super) mod audit_posture;
 pub(super) mod cache;
 pub(super) mod config;
 pub(super) mod mcp;
@@ -10,5 +11,6 @@ pub(super) mod metrics;
 pub(super) mod network;
 pub(super) mod policy;
 pub(super) mod secret;
+pub(super) mod tenant;
 
 pub(super) use super::{Cli, shared};

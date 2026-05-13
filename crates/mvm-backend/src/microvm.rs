@@ -532,8 +532,15 @@ pub struct FlakeRunConfig {
     pub profile: Option<String>,
     /// Number of vCPUs.
     pub cpus: u32,
-    /// Memory in MiB.
+    /// Memory cap in MiB.
     pub memory: u32,
+    /// Initial host commitment in MiB when opting into virtio-balloon.
+    /// `None` = full commitment at boot (legacy default). `Some(n)`
+    /// attaches a virtio-balloon device pre-inflated to
+    /// `memory - n` MiB so the host commits only `n` MiB at boot;
+    /// the host-side controller can PATCH the balloon target at
+    /// runtime via Firecracker's `/balloon` endpoint.
+    pub mem_initial: Option<u32>,
     /// Extra volumes to attach (mounted via config drive, not SSH).
     pub volumes: Vec<RuntimeVolume>,
     /// Extra files to write onto the config drive.
@@ -557,6 +564,25 @@ impl FlakeRunConfig {
                 "memory must be between 128 and 65536 MiB (got {})",
                 self.memory
             );
+        }
+        if let Some(initial) = self.mem_initial {
+            // The balloon device must leave the guest with some
+            // headroom; 0-byte commitment doesn't boot, and a value
+            // >= memory is nonsensical (balloon would claim 0 or
+            // negative pages). The CLI clamps these via filter() but
+            // backends are the second line of defence.
+            if initial == 0 {
+                anyhow::bail!(
+                    "mem_initial must be > 0 when set; got 0 (use None to opt out of balloon)"
+                );
+            }
+            if initial >= self.memory {
+                anyhow::bail!(
+                    "mem_initial ({initial}) must be strictly less than memory ({}); \
+                     the balloon needs a non-zero inflation target",
+                    self.memory
+                );
+            }
         }
         if self.name.is_empty() {
             anyhow::bail!("VM name must not be empty");
@@ -891,6 +917,78 @@ pub fn resume_vm(name: &str) -> Result<()> {
 
 /// Stop a specific named VM.
 #[instrument(skip_all, fields(name))]
+/// Adjust the virtio-balloon inflation target for a running FC VM.
+///
+/// `target_inflate_mib` is the amount the balloon should claim back
+/// from the guest. The guest's effective commitment is `memory -
+/// target_inflate_mib`. Firecracker expresses this through its
+/// `PATCH /balloon` endpoint with `amount_mib`.
+///
+/// Returns an error if the VM was started without
+/// `mem_initial.is_some()` — no balloon device exists to PATCH.
+/// Firecracker surfaces this as HTTP 400 with a clear message.
+pub fn balloon_set_target(name: &str, target_inflate_mib: u32) -> Result<()> {
+    require_linux_env()?;
+
+    let abs_vms = run_in_vm_stdout(&format!("echo {}", VMS_DIR))?;
+    let abs_dir = format!("{}/{}", abs_vms.trim(), name);
+    let pid_file = format!("{}/fc.pid", abs_dir);
+    let socket = format!("{}/fc.socket", abs_dir);
+
+    if !firecracker::is_vm_running(&pid_file)? {
+        anyhow::bail!("VM '{}' is not running", name);
+    }
+
+    let q_socket = shell_quote(&socket);
+    run_in_vm(&format!(
+        r#"sudo curl -fsS -X PATCH --unix-socket {q_socket} \
+            -H 'Content-Type: application/json' \
+            -d '{{"amount_mib":{target}}}' \
+            'http://localhost/balloon'"#,
+        target = target_inflate_mib,
+    ))
+    .with_context(|| {
+        format!(
+            "PATCH /balloon (amount_mib={target_inflate_mib}) for VM '{name}'; \
+             VM may have been launched without `mem_initial` (no balloon device)"
+        )
+    })?;
+    Ok(())
+}
+
+/// Read the current balloon state of a running FC VM.
+///
+/// Returns the inflation amount in MiB. `0` means the balloon is
+/// fully deflated (guest has all of `memory`). Combined with the
+/// VM's declared `memory` cap (e.g. from `list_vms()`), the host
+/// reclaim controller derives the effective commitment.
+pub fn balloon_state(name: &str) -> Result<u32> {
+    require_linux_env()?;
+
+    let abs_vms = run_in_vm_stdout(&format!("echo {}", VMS_DIR))?;
+    let abs_dir = format!("{}/{}", abs_vms.trim(), name);
+    let pid_file = format!("{}/fc.pid", abs_dir);
+    let socket = format!("{}/fc.socket", abs_dir);
+
+    if !firecracker::is_vm_running(&pid_file)? {
+        anyhow::bail!("VM '{}' is not running", name);
+    }
+
+    let q_socket = shell_quote(&socket);
+    let body = run_in_vm_stdout(&format!(
+        r#"sudo curl -fsS --unix-socket {q_socket} 'http://localhost/balloon'"#,
+    ))
+    .with_context(|| format!("GET /balloon for VM '{name}'"))?;
+
+    let parsed: serde_json::Value = serde_json::from_str(body.trim())
+        .with_context(|| format!("parse /balloon response: {body:?}"))?;
+    let amount = parsed
+        .get("amount_mib")
+        .and_then(|v| v.as_u64())
+        .ok_or_else(|| anyhow::anyhow!("/balloon response missing amount_mib: {body}"))?;
+    Ok(amount as u32)
+}
+
 pub fn stop_vm(name: &str) -> Result<()> {
     require_linux_env()?;
 
@@ -1672,6 +1770,33 @@ pub fn configure_flake_microvm_with_drives_dir(
         ),
     )?;
 
+    // Virtio-balloon. Only attached when the workload opted in via
+    // `mem_initial`. The device boots pre-inflated to `memory -
+    // mem_initial` MiB so the host commits only `mem_initial` MiB
+    // until the reclaim controller deflates the balloon.
+    //
+    // `deflate_on_oom = true` is mandatory: under guest memory
+    // pressure the device must yield pages back, otherwise the guest
+    // OOM-kills the workload while the host still has memory it
+    // could give back. `stats_polling_interval_s = 1` lets the host
+    // controller poll real guest commitment without driving the
+    // guest's stat refresh too aggressively.
+    if let Some(initial) = config.mem_initial {
+        let amount_mib = config.memory.saturating_sub(initial);
+        ui::info(&format!(
+            "Attaching virtio-balloon (cap {} MiB, initial commit {} MiB, balloon {} MiB)",
+            config.memory, initial, amount_mib
+        ));
+        api_put_socket(
+            socket,
+            "/balloon",
+            &format!(
+                r#"{{"amount_mib": {amount}, "deflate_on_oom": true, "stats_polling_interval_s": 1}}"#,
+                amount = amount_mib,
+            ),
+        )?;
+    }
+
     Ok(())
 }
 
@@ -1868,6 +1993,66 @@ mod tests {
         assert!(f.name.is_empty());
         assert!(f.content.is_empty());
         assert_eq!(f.mode, 0o444);
+    }
+
+    fn baseline_run_config(mem_initial: Option<u32>) -> FlakeRunConfig {
+        FlakeRunConfig {
+            name: "v".to_string(),
+            slot: VmSlot::new("v", 0),
+            vmlinux_path: "/k/vmlinux".to_string(),
+            initrd_path: None,
+            rootfs_path: "/k/rootfs.ext4".to_string(),
+            verity_path: None,
+            roothash: None,
+            revision_hash: "abc".to_string(),
+            flake_ref: "/p".to_string(),
+            profile: None,
+            cpus: 2,
+            memory: 1024,
+            mem_initial,
+            volumes: Vec::new(),
+            config_files: Vec::new(),
+            secret_files: Vec::new(),
+            ports: Vec::new(),
+            network_policy: mvm_core::network_policy::NetworkPolicy::default(),
+        }
+    }
+
+    #[test]
+    fn flake_run_config_validate_accepts_none_mem_initial() {
+        baseline_run_config(None).validate().unwrap();
+    }
+
+    #[test]
+    fn flake_run_config_validate_accepts_valid_mem_initial() {
+        // 256 < 1024 → balloon device gets `1024 - 256 = 768` MiB
+        // inflation, host commits 256 MiB.
+        baseline_run_config(Some(256)).validate().unwrap();
+    }
+
+    #[test]
+    fn flake_run_config_validate_rejects_zero_mem_initial() {
+        let err = baseline_run_config(Some(0))
+            .validate()
+            .expect_err("rejects zero mem_initial");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mem_initial"), "msg was: {msg}");
+    }
+
+    #[test]
+    fn flake_run_config_validate_rejects_mem_initial_equal_to_memory() {
+        let err = baseline_run_config(Some(1024))
+            .validate()
+            .expect_err("rejects mem_initial == memory");
+        assert!(format!("{err:#}").contains("strictly less than"));
+    }
+
+    #[test]
+    fn flake_run_config_validate_rejects_mem_initial_above_memory() {
+        let err = baseline_run_config(Some(2048))
+            .validate()
+            .expect_err("rejects mem_initial > memory");
+        assert!(format!("{err:#}").contains("strictly less than"));
     }
 
     #[test]

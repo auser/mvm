@@ -42,14 +42,18 @@ impl VmBackend for LibkrunBackend {
             snapshots: false,
             vsock: true,
             tap_networking: false,
+            // libkrun's C API doesn't expose virtio-balloon control
+            // today; the upstream crate carries no `.balloon(...)`
+            // builder. Declared `false` until wiring lands.
+            balloon: false,
         }
     }
 
     fn start(&self, config: &VmStartConfig) -> Result<VmId> {
-        if !mvm_providers::libkrun::is_available() {
+        if !mvm_libkrun::is_available() {
             anyhow::bail!(
                 "libkrun is not installed on this host.\n  {}",
-                mvm_providers::libkrun::install_hint()
+                mvm_libkrun::install_hint()
             );
         }
 
@@ -58,13 +62,12 @@ impl VmBackend for LibkrunBackend {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("libkrun backend requires a kernel path"))?;
 
-        let ctx =
-            mvm_providers::libkrun::KrunContext::new(&config.name, kernel, &config.rootfs_path)
-                .with_resources(
-                    u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX),
-                    config.memory_mib,
-                )
-                .add_vsock_port(mvm_guest::vsock::GUEST_AGENT_PORT);
+        let ctx = mvm_libkrun::KrunContext::new(&config.name, kernel, &config.rootfs_path)
+            .with_resources(
+                u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX),
+                config.memory_mib,
+            )
+            .add_vsock_port(mvm_guest::vsock::GUEST_AGENT_PORT);
 
         // W6.2.1: thread the build-time sidecar into per-VM runtime
         // metadata so `mvmctl console` enforces the accessible/sealed
@@ -78,13 +81,13 @@ impl VmBackend for LibkrunBackend {
             config.name, ctx.vcpus, ctx.ram_mib
         ));
 
-        mvm_providers::libkrun::start(&ctx).map_err(|e| anyhow::anyhow!("libkrun start: {e}"))?;
+        mvm_libkrun::start(&ctx).map_err(|e| anyhow::anyhow!("libkrun start: {e}"))?;
         ui::success(&format!("libkrun VM '{}' started.", config.name));
         Ok(VmId(config.name.clone()))
     }
 
     fn stop(&self, id: &VmId) -> Result<()> {
-        mvm_providers::libkrun::stop(&id.0).map_err(|e| anyhow::anyhow!("libkrun stop: {e}"))
+        mvm_libkrun::stop(&id.0).map_err(|e| anyhow::anyhow!("libkrun stop: {e}"))
     }
 
     fn stop_all(&self) -> Result<()> {
@@ -125,13 +128,13 @@ impl VmBackend for LibkrunBackend {
     }
 
     fn is_available(&self) -> Result<bool> {
-        Ok(mvm_providers::libkrun::is_available())
+        Ok(mvm_libkrun::is_available())
     }
 
     fn install(&self) -> Result<()> {
         ui::info(&format!(
             "libkrun must be installed via the host's package manager.\n  {}",
-            mvm_providers::libkrun::install_hint()
+            mvm_libkrun::install_hint()
         ));
         Ok(())
     }
@@ -210,9 +213,9 @@ mod tests {
         // The install() method is informational on every host — it shells
         // out to ui::info instead of attempting to install. The check is
         // just that we can call it without panicking; the actual hint
-        // copy lives in mvm_providers::libkrun::install_hint().
+        // copy lives in mvm_libkrun::install_hint().
         LibkrunBackend.install().expect("install hint never errors");
-        let hint = mvm_providers::libkrun::install_hint();
+        let hint = mvm_libkrun::install_hint();
         assert!(!hint.is_empty());
     }
 

@@ -146,9 +146,5 @@ pub fn verify_snapshot_artifacts(snap_dir: &str) -> Result<()> {
 /// tamper (`tag_mismatch`) from version drift (`version_mismatch`)
 /// from lower-level I/O / encoding failures (`other`).
 fn audit_snapshot_integrity_failure(snap_dir: &str, detail: &str) {
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::SnapshotIntegrityFailed,
-        Some(snap_dir),
-        Some(detail),
-    );
+    mvm_core::audit_emit!(SnapshotIntegrityFailed, vm: snap_dir, "{detail}");
 }

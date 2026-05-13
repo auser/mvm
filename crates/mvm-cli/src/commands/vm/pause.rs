@@ -18,7 +18,9 @@ use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
 use std::path::PathBuf;
 
-use mvm::vm::instance_snapshot::{FirecrackerIO, pause_and_seal, verify_and_resume};
+use mvm::vm::instance_snapshot::{
+    CannedIO, FirecrackerIO, SnapshotIO, pause_and_seal, verify_and_resume,
+};
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
 
@@ -30,6 +32,14 @@ pub(in crate::commands) struct PauseArgs {
     /// Name of the VM to pause
     #[arg(value_parser = clap_vm_name)]
     pub name: String,
+    /// Hypervisor to drive the snapshot through. Defaults to
+    /// `firecracker`. `--hypervisor mock` swaps the FirecrackerIO
+    /// snapshot transport for `CannedIO` (writes deterministic
+    /// stub bytes to vmstate.bin + mem.bin), letting plan 65's
+    /// live tests exercise `WorkloadSleep` without a real
+    /// Firecracker socket.
+    #[arg(long, default_value = "firecracker")]
+    pub hypervisor: String,
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -37,17 +47,48 @@ pub(in crate::commands) struct ResumeArgs {
     /// Name of the VM to resume
     #[arg(value_parser = clap_vm_name)]
     pub name: String,
+    /// Hypervisor to drive the restore through. Defaults to
+    /// `firecracker`. See `pause --help` for the `mock` variant.
+    #[arg(long, default_value = "firecracker")]
+    pub hypervisor: String,
+}
+
+/// Pick the `SnapshotIO` impl matching the hypervisor selector.
+/// Plan 65 W2: `mock` swaps in `CannedIO` for hermetic
+/// `WorkloadSleep` / `WorkloadWake` audit-emit coverage; every
+/// other selector uses `FirecrackerIO` against the running VM's
+/// UDS socket.
+fn snapshot_io_for(hypervisor: &str, vm_name: &str) -> Result<Box<dyn SnapshotIO>> {
+    if hypervisor == "mock" {
+        // The mock VM's per-VM directory lives at
+        // `<mvm_data_dir>/mock-vms/<name>/` and is created by
+        // `MockBackend::start_with_mode`. Nothing to validate here
+        // beyond its existence — `pause_and_seal` writes the
+        // snapshot files into a sibling `snapshot/` directory.
+        let dir = mvm_backend::MockBackend::vm_dir(vm_name);
+        if !dir.exists() {
+            bail!(
+                "mock VM {vm_name:?} is not running (no directory at {})",
+                dir.display()
+            );
+        }
+        return Ok(Box::new(CannedIO {
+            vmstate_bytes: b"mock-vmstate".to_vec(),
+            mem_bytes: b"mock-mem".to_vec(),
+        }));
+    }
+    let vm_dir = mvm_backend::microvm::resolve_running_vm_dir(vm_name)
+        .with_context(|| format!("VM {vm_name:?} is not running"))?;
+    let socket = firecracker_socket(&vm_dir);
+    Ok(Box::new(FirecrackerIO::new(socket)))
 }
 
 pub(in crate::commands) fn run_pause(_cli: &Cli, args: PauseArgs, _cfg: &MvmConfig) -> Result<()> {
     validate_vm_name(&args.name).with_context(|| format!("Invalid VM name: {:?}", args.name))?;
-    let vm_dir = mvm_backend::microvm::resolve_running_vm_dir(&args.name)
-        .with_context(|| format!("VM {:?} is not running", args.name))?;
-    let socket = firecracker_socket(&vm_dir);
-    let io = FirecrackerIO::new(socket);
+    let io = snapshot_io_for(&args.hypervisor, &args.name)?;
 
     let sidecar =
-        pause_and_seal(&args.name, &io).with_context(|| format!("pausing VM {:?}", args.name))?;
+        pause_and_seal(&args.name, &*io).with_context(|| format!("pausing VM {:?}", args.name))?;
 
     let registry_path = mvm::vm::name_registry::registry_path();
     if let Ok(mut registry) = mvm::vm::name_registry::VmNameRegistry::load(&registry_path) {
@@ -58,13 +99,8 @@ pub(in crate::commands) fn run_pause(_cli: &Cli, args: PauseArgs, _cfg: &MvmConf
         "{}: paused (epoch {}, vmstate {} B, mem {} B)",
         args.name, sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
     );
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::WorkloadSleep,
-        Some(&args.name),
-        Some(&format!(
-            "epoch={} vmstate={} mem={}",
-            sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
-        )),
+    mvm_core::audit_emit!(WorkloadSleep, vm: &args.name, "epoch={} vmstate={} mem={}" ,
+        sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
     );
     Ok(())
 }
@@ -81,19 +117,13 @@ pub(in crate::commands) fn run_resume(
     // requires the user to have already started a fresh VM
     // shell that's waiting for the snapshot load (Firecracker's
     // restore-into-empty-VMM workflow). The substrate is
-    // ready; the launcher integration is a follow-up.
-    let vm_dir = mvm_backend::microvm::resolve_running_vm_dir(&args.name).with_context(|| {
-        format!(
-            "VM {:?} has no running Firecracker shell; resume currently \
-                 requires a fresh `mvmctl up --resume-from-snapshot` (follow-up). \
-                 Substrate verifies, the launcher integration is pending.",
-            args.name
-        )
-    })?;
-    let socket = firecracker_socket(&vm_dir);
-    let io = FirecrackerIO::new(socket);
+    // ready; the launcher integration is a follow-up. Plan 65
+    // W2: `--hypervisor mock` swaps in `CannedIO` so the
+    // verify-resume path can land its `WorkloadWake` audit emit
+    // without a live Firecracker socket.
+    let io = snapshot_io_for(&args.hypervisor, &args.name)?;
 
-    let sidecar = verify_and_resume(&args.name, &io)
+    let sidecar = verify_and_resume(&args.name, &*io)
         .with_context(|| format!("resuming VM {:?}", args.name))?;
 
     let registry_path = mvm::vm::name_registry::registry_path();
@@ -105,13 +135,8 @@ pub(in crate::commands) fn run_resume(
         "{}: resumed (epoch {}, vmstate {} B, mem {} B)",
         args.name, sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
     );
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::WorkloadWake,
-        Some(&args.name),
-        Some(&format!(
-            "epoch={} vmstate={} mem={}",
-            sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
-        )),
+    mvm_core::audit_emit!(WorkloadWake, vm: &args.name, "epoch={} vmstate={} mem={}" ,
+        sidecar.epoch, sidecar.vmstate_len, sidecar.mem_len
     );
     Ok(())
 }
@@ -213,10 +238,6 @@ fn snap_rm(name: &str) -> Result<()> {
         let _ = registry.save(&registry_path);
     }
     println!("{}: snapshot removed", name);
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::SnapshotDelete,
-        Some(name),
-        None,
-    );
+    mvm_core::audit_emit!(SnapshotDelete, vm: name);
     Ok(())
 }

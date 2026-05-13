@@ -94,9 +94,20 @@ pub struct Manifest {
     #[serde(default = "default_vcpus")]
     pub vcpus: u8,
 
-    /// Human-readable memory size (`512M`, `1G`, `1024`, …).
+    /// Human-readable memory size (`512M`, `1G`, `1024`, …). Acts as
+    /// the *cap* on guest memory; when [`mem_initial`](Self::mem_initial)
+    /// is also set, this is the upper bound the balloon can deflate to.
     #[serde(default = "default_mem")]
     pub mem: String,
+
+    /// Optional initial host commitment (e.g. `256M`, `1G`). When set,
+    /// opts the workload into virtio-balloon: the backend attaches a
+    /// balloon device pre-inflated to `mem - mem_initial`, so the host
+    /// commits only this amount at boot. The reclaim controller can
+    /// adjust the balloon over the VM's life. Must parse to a value
+    /// strictly between zero and `mem`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_initial: Option<String>,
 
     /// Human-readable data disk size; `"0"` means no data disk.
     #[serde(default = "default_data_disk")]
@@ -151,6 +162,23 @@ impl Manifest {
                 "manifest field `mem` must be >= {MIN_MEM_MIB} MiB (got {mem} MiB)"
             ));
         }
+        if let Some(mi) = self.mem_initial.as_deref() {
+            let mi_mib = parse_human_size(mi)
+                .with_context(|| format!("invalid `mem_initial` field: {mi:?}"))?;
+            if mi_mib == 0 {
+                return Err(anyhow!(
+                    "manifest field `mem_initial` must be > 0 when set; \
+                     omit it to opt out of virtio-balloon"
+                ));
+            }
+            if mi_mib >= mem {
+                return Err(anyhow!(
+                    "manifest field `mem_initial` ({mi_mib} MiB) must be \
+                     strictly less than `mem` ({mem} MiB); the balloon needs \
+                     a non-zero inflation target"
+                ));
+            }
+        }
         let _ = parse_human_size(&self.data_disk)
             .with_context(|| format!("invalid `data_disk` field: {:?}", self.data_disk))?;
         if let Some(name) = self.name.as_deref() {
@@ -160,9 +188,21 @@ impl Manifest {
         Ok(())
     }
 
-    /// Memory in MiB, parsed from the human-readable string.
+    /// Memory cap in MiB, parsed from the human-readable string.
     pub fn mem_mib(&self) -> Result<u32> {
         parse_human_size(&self.mem).with_context(|| format!("invalid `mem` field: {:?}", self.mem))
+    }
+
+    /// Initial host commitment in MiB, when the workload opted into
+    /// virtio-balloon. Returns `Ok(None)` when the field is unset
+    /// (legacy "commit `mem` at boot" behaviour).
+    pub fn mem_initial_mib(&self) -> Result<Option<u32>> {
+        match self.mem_initial.as_deref() {
+            Some(s) => parse_human_size(s)
+                .map(Some)
+                .with_context(|| format!("invalid `mem_initial` field: {s:?}")),
+            None => Ok(None),
+        }
     }
 
     /// Data disk in MiB.
@@ -385,6 +425,13 @@ pub struct PersistedManifest {
 
     pub vcpus: u8,
     pub mem_mib: u32,
+    /// Initial host commitment in MiB when the source manifest opted
+    /// into virtio-balloon (`mem_initial = "256M"`). `None` keeps the
+    /// historical commit-mem_mib-at-boot shape. Backward-compat:
+    /// missing field deserialises to `None` so older slot records
+    /// keep working without a rebuild.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_initial_mib: Option<u32>,
     pub data_disk_mib: u32,
 
     /// Display name from the manifest (NOT the registry key).
@@ -424,6 +471,7 @@ impl PersistedManifest {
             .to_string();
         let manifest_hash = canonical_key_for_path(canonical_path)?;
         let mem_mib = manifest.mem_mib()?;
+        let mem_initial_mib = manifest.mem_initial_mib()?;
         let data_disk_mib = manifest.data_disk_mib()?;
         let now = provenance.built_at.clone();
         Ok(Self {
@@ -434,6 +482,7 @@ impl PersistedManifest {
             profile: manifest.profile.clone(),
             vcpus: manifest.vcpus,
             mem_mib,
+            mem_initial_mib,
             data_disk_mib,
             name: manifest.name.clone(),
             backend: backend.to_string(),
@@ -645,6 +694,76 @@ mod tests {
         let m = Manifest::from_toml_str(minimal_manifest_toml()).unwrap();
         assert_eq!(m.mem_mib().unwrap(), 1024);
         assert_eq!(m.data_disk_mib().unwrap(), 0);
+    }
+
+    #[test]
+    fn mem_initial_absent_means_no_balloon_opt_in() {
+        let m = Manifest::from_toml_str(minimal_manifest_toml()).unwrap();
+        assert!(m.mem_initial.is_none());
+        assert!(m.mem_initial_mib().unwrap().is_none());
+    }
+
+    #[test]
+    fn mem_initial_set_parses_and_validates() {
+        let toml = r#"
+            flake = "."
+            profile = "default"
+            vcpus = 2
+            mem = "1024M"
+            mem_initial = "256M"
+        "#;
+        let m = Manifest::from_toml_str(toml).expect("parses");
+        assert_eq!(m.mem_initial.as_deref(), Some("256M"));
+        assert_eq!(m.mem_initial_mib().unwrap(), Some(256));
+    }
+
+    #[test]
+    fn mem_initial_zero_rejected() {
+        let toml = r#"
+            flake = "."
+            profile = "default"
+            vcpus = 2
+            mem = "1024M"
+            mem_initial = "0"
+        "#;
+        let err = Manifest::from_toml_str(toml).expect_err("rejects zero mem_initial");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("mem_initial"), "msg was {msg}");
+    }
+
+    #[test]
+    fn mem_initial_at_least_mem_rejected() {
+        // mem_initial >= mem leaves no headroom for the balloon to inflate.
+        let toml = r#"
+            flake = "."
+            profile = "default"
+            vcpus = 2
+            mem = "1024M"
+            mem_initial = "1024M"
+        "#;
+        let err = Manifest::from_toml_str(toml).expect_err("rejects >=mem mem_initial");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("strictly less than"), "msg was {msg}");
+    }
+
+    #[test]
+    fn mem_initial_unparseable_rejected() {
+        let toml = r#"
+            flake = "."
+            profile = "default"
+            vcpus = 2
+            mem = "1024M"
+            mem_initial = "spuds"
+        "#;
+        let err = Manifest::from_toml_str(toml).expect_err("rejects junk mem_initial");
+        assert!(format!("{err:#}").contains("mem_initial"));
+    }
+
+    #[test]
+    fn serde_skips_omitted_mem_initial() {
+        let m = Manifest::from_toml_str(minimal_manifest_toml()).unwrap();
+        let json = serde_json::to_string(&m).unwrap();
+        assert!(!json.contains("mem_initial"));
     }
 
     #[test]
@@ -921,11 +1040,58 @@ mod tests {
         let p = fixture_persisted(&tmp);
         assert_eq!(p.vcpus, 2);
         assert_eq!(p.mem_mib, 1024);
+        // Minimal manifest fixture has no `mem_initial` set.
+        assert_eq!(p.mem_initial_mib, None);
         assert_eq!(p.data_disk_mib, 0);
         assert_eq!(p.flake_ref, ".");
         assert_eq!(p.profile, "default");
         assert_eq!(p.backend, "firecracker");
         assert_eq!(p.schema_version, MANIFEST_SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn persisted_from_manifest_carries_mem_initial_when_set() {
+        let tmp = TempDir::new().unwrap();
+        let toml = r#"
+            flake = "."
+            profile = "default"
+            vcpus = 2
+            mem = "1024M"
+            mem_initial = "256M"
+        "#;
+        write(tmp.path(), "mvm.toml", toml);
+        let manifest = Manifest::read_file(&tmp.path().join("mvm.toml")).unwrap();
+        let canonical = std::fs::canonicalize(tmp.path().join("mvm.toml")).unwrap();
+        let p = PersistedManifest::from_manifest(
+            &manifest,
+            &canonical,
+            "firecracker",
+            Provenance {
+                toolchain_version: "0.13.0".to_string(),
+                builder_image_digest: None,
+                host_arch: "x86_64-linux".to_string(),
+                built_at: "2026-04-30T12:00:00Z".to_string(),
+                ir_hash: None,
+            },
+        )
+        .unwrap();
+        assert_eq!(p.mem_initial_mib, Some(256));
+        // Schema-skip rule: a None mem_initial_mib must NOT serialise
+        // (older verifiers don't know the field). A Some value MUST
+        // serialise — verifiers need to see the balloon opt-in.
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(json.contains("\"mem_initial_mib\":256"), "got: {json}");
+    }
+
+    #[test]
+    fn persisted_manifest_serde_skips_omitted_mem_initial() {
+        let tmp = TempDir::new().unwrap();
+        let p = fixture_persisted(&tmp);
+        let json = serde_json::to_string(&p).unwrap();
+        assert!(
+            !json.contains("mem_initial_mib"),
+            "field with None value must not appear in JSON: {json}"
+        );
     }
 
     #[test]

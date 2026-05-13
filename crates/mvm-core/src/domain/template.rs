@@ -53,6 +53,14 @@ pub struct TemplateSpec {
     pub role: String,
     pub vcpus: u8,
     pub mem_mib: u32,
+    /// Initial host commitment in MiB when the template opts into
+    /// virtio-balloon. `None` keeps the legacy "commit `mem_mib` at
+    /// boot" behaviour; `Some(n)` sources `VmStartConfig::mem_initial_mib`
+    /// from the template when `mvmctl up` doesn't override it on the
+    /// CLI or via `--config`. Backward-compat: missing field
+    /// deserialises to `None` for templates that predate the schema.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mem_initial_mib: Option<u32>,
     pub data_disk_mib: u32,
     pub created_at: String,
     pub updated_at: String,
@@ -420,6 +428,7 @@ mod tests {
             role: "agent".to_string(),
             vcpus: 2,
             mem_mib: 1024,
+            mem_initial_mib: None,
             data_disk_mib: 0,
             created_at: "2025-01-01T00:00:00Z".to_string(),
             updated_at: "2025-01-01T00:00:00Z".to_string(),

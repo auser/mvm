@@ -1,0 +1,385 @@
+#!/usr/bin/env bash
+# Fake `mvmctl` shim for CI per ADR-0005 §9.
+#
+# Verbs:
+#   --version                            host-side floor probe
+#   up --flake <dir>                     boot path; asserts artifact contract
+#   invoke <workload> [--session <id>]   function-call dispatch (plan-0003)
+#   session start <workload>             warm-VM session bring-up
+#   session stop <id>                    warm-VM session teardown
+#
+# Tests drive behavior via env:
+#   MVM_FAKE_MVM_VERSION       reported semver (default 0.10.1)
+#   MVM_FAKE_MVM_EXIT          exit code (default 0)
+#   MVM_FAKE_MVM_RECORD        path: append a record per call
+#   MVM_FAKE_MVM_STDOUT        stdout content for `up`
+#   MVM_FAKE_MVM_INVOKE_OUT    bytes to write for `invoke`
+#   MVM_FAKE_MVM_INVOKE_STDERR stderr content for `invoke` (e.g. error envelope)
+#   MVM_FAKE_MVM_INVOKE_DELAY_MS  sleep before responding (test timeouts)
+#   MVM_FAKE_MVM_INVOKE_OUT_KIB   write N KiB of zero-byte output (test caps)
+#   MVM_FAKE_MVM_SESSION_ID    session id to emit on `session start` (default s-1)
+#   MVM_FAKE_MVM_SESSION_DELAY_MS sleep before responding for session verbs
+
+set -euo pipefail
+
+if [ "${1:-}" = "--version" ]; then
+  echo "mvmctl ${MVM_FAKE_MVM_VERSION:-0.10.1}"
+  exit 0
+fi
+
+record() {
+  if [ -n "${MVM_FAKE_MVM_RECORD:-}" ]; then
+    {
+      echo "--"
+      for line in "$@"; do
+        echo "$line"
+      done
+    } >> "$MVM_FAKE_MVM_RECORD"
+  fi
+}
+
+subcommand="${1:-}"
+
+case "$subcommand" in
+  up)
+    flag="${2:-}"
+    if [ "$flag" = "--manifest" ]; then
+      # Sandbox SDK path. We accept arbitrary --manifest <name>
+      # plus the secondary flags `mvm.Sandbox` may emit
+      # (`--name`, `--cpus`, `--memory`, `--tag`, `--ttl`,
+      # `--no-auto-resume`, `--detach`). Record the full argv
+      # for inspection; tests control assigned name via
+      # MVM_FAKE_MVM_VM_NAME (default "vm-fake").
+      shift
+      argv_dump=""
+      while [ "$#" -gt 0 ]; do
+        argv_dump="$argv_dump $1"
+        shift
+      done
+      record "subcommand=up" "flag=--manifest" "argv=$argv_dump"
+      vm_name="${MVM_FAKE_MVM_VM_NAME:-vm-fake}"
+      if [ -n "${MVM_FAKE_MVM_STDOUT:-}" ]; then
+        echo "$MVM_FAKE_MVM_STDOUT"
+      else
+        echo "Started VM $vm_name"
+      fi
+      exit "${MVM_FAKE_MVM_EXIT:-0}"
+    fi
+    flake_path="${3:-}"
+    if [ "$flag" != "--flake" ]; then
+      echo "fake-mvm: expected '--flake' or '--manifest' flag, got: $flag" >&2
+      exit 64
+    fi
+    if [ -z "$flake_path" ] || [ ! -d "$flake_path" ]; then
+      echo "fake-mvm: flake path not provided or not a dir: $flake_path" >&2
+      exit 64
+    fi
+    flake="$flake_path/flake.nix"
+    launch="$flake_path/launch.json"
+    if [ ! -f "$flake" ]; then
+      echo "fake-mvm: missing flake.nix in $flake_path" >&2
+      exit 65
+    fi
+    if [ ! -f "$launch" ]; then
+      echo "fake-mvm: missing launch.json in $flake_path" >&2
+      exit 65
+    fi
+    for field in artifact_format_version flake_attribute flake_path ir_hash ir_schema_version toolchain_version workload_id; do
+      if ! grep -q "\"$field\"" "$launch"; then
+        echo "fake-mvm: launch.json missing field: $field" >&2
+        exit 66
+      fi
+    done
+    record "subcommand=up" "flag=$flag" "flake_path=$flake_path" "launch=$(cat "$launch")"
+    if [ -n "${MVM_FAKE_MVM_STDOUT:-}" ]; then
+      echo "$MVM_FAKE_MVM_STDOUT"
+    fi
+    exit "${MVM_FAKE_MVM_EXIT:-0}"
+    ;;
+  invoke)
+    # Parse: mvmctl invoke [--session <id>] [--fn <name>] [--] <workload>
+    shift  # drop "invoke"
+    session=""
+    fn=""
+    workload=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --session)
+          session="${2:-}"
+          if [ -z "$session" ]; then
+            echo "fake-mvm: --session requires an id" >&2
+            exit 64
+          fi
+          shift 2
+          ;;
+        --fn)
+          fn="${2:-}"
+          if [ -z "$fn" ]; then
+            echo "fake-mvm: --fn requires a function name" >&2
+            exit 64
+          fi
+          shift 2
+          ;;
+        --stdin)
+          # The SDK passes `--stdin -` so the real mvmctl reads stdin
+          # rather than discarding it. Accept and ignore: the fake-mvm
+          # always drains stdin via `cat` below regardless of the flag.
+          if [ -z "${2:-}" ]; then
+            echo "fake-mvm: --stdin requires a path or '-'" >&2
+            exit 64
+          fi
+          shift 2
+          ;;
+        --)
+          shift
+          workload="${1:-}"
+          shift || true
+          break
+          ;;
+        -*)
+          echo "fake-mvm: unknown flag for invoke: $1" >&2
+          exit 64
+          ;;
+        *)
+          workload="$1"
+          shift
+          break
+          ;;
+      esac
+    done
+    if [ -z "$workload" ]; then
+      echo "fake-mvm: invoke requires <workload>" >&2
+      exit 64
+    fi
+    # Drain stdin so the caller's pipe write completes; capture for record.
+    stdin_bytes=$(cat || true)
+    record "subcommand=invoke" "workload=$workload" "session=$session" "fn=$fn" "stdin=$stdin_bytes"
+    if [ -n "${MVM_FAKE_MVM_INVOKE_DELAY_MS:-}" ]; then
+      # Bash sleep accepts fractional seconds.
+      sleep "$(awk "BEGIN{print ${MVM_FAKE_MVM_INVOKE_DELAY_MS}/1000}")"
+    fi
+    if [ -n "${MVM_FAKE_MVM_INVOKE_STDERR:-}" ]; then
+      printf '%s' "$MVM_FAKE_MVM_INVOKE_STDERR" >&2
+    fi
+    if [ -n "${MVM_FAKE_MVM_INVOKE_OUT_KIB:-}" ]; then
+      # Emit N KiB of 'A' bytes via dd. Used to exercise the SDK's output cap.
+      dd if=/dev/zero bs=1024 count="$MVM_FAKE_MVM_INVOKE_OUT_KIB" 2>/dev/null \
+        | tr '\0' 'A'
+    elif [ -n "${MVM_FAKE_MVM_INVOKE_OUT:-}" ]; then
+      printf '%s' "$MVM_FAKE_MVM_INVOKE_OUT"
+    fi
+    exit "${MVM_FAKE_MVM_EXIT:-0}"
+    ;;
+  session)
+    verb="${2:-}"
+    case "$verb" in
+      start)
+        # Parse: mvmctl session start [--] <workload>
+        shift 2  # drop "session" "start"
+        if [ "${1:-}" = "--" ]; then shift; fi
+        workload="${1:-}"
+        if [ -z "$workload" ]; then
+          echo "fake-mvm: session start requires <workload>" >&2
+          exit 64
+        fi
+        if [ -n "${MVM_FAKE_MVM_SESSION_DELAY_MS:-}" ]; then
+          sleep "$(awk "BEGIN{print ${MVM_FAKE_MVM_SESSION_DELAY_MS}/1000}")"
+        fi
+        session_id="${MVM_FAKE_MVM_SESSION_ID:-s-1}"
+        record "subcommand=session" "verb=start" "workload=$workload" "session_id=$session_id"
+        echo "$session_id"
+        exit "${MVM_FAKE_MVM_EXIT:-0}"
+        ;;
+      stop)
+        # Parse: mvmctl session stop [--] <session-id>
+        shift 2
+        if [ "${1:-}" = "--" ]; then shift; fi
+        sid="${1:-}"
+        if [ -z "$sid" ]; then
+          echo "fake-mvm: session stop requires <session-id>" >&2
+          exit 64
+        fi
+        if [ -n "${MVM_FAKE_MVM_SESSION_DELAY_MS:-}" ]; then
+          sleep "$(awk "BEGIN{print ${MVM_FAKE_MVM_SESSION_DELAY_MS}/1000}")"
+        fi
+        record "subcommand=session" "verb=stop" "session_id=$sid"
+        exit "${MVM_FAKE_MVM_EXIT:-0}"
+        ;;
+      *)
+        echo "fake-mvm: unknown session verb: $verb" >&2
+        exit 64
+        ;;
+    esac
+    ;;
+  ls)
+    # `mvmctl ls --json [--tag k=v]... [--show-expired]` — sandbox SDK
+    # calls this for `Sandbox.list()` / `info()` / `connect()`. Tests
+    # control the response via MVM_FAKE_MVM_LS_OUT (raw JSON
+    # array text); default empty.
+    shift
+    json_flag="false"
+    show_expired="false"
+    tag_filter=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --json) json_flag="true"; shift;;
+        --show-expired) show_expired="true"; shift;;
+        --tag) tag_filter="$tag_filter $2"; shift 2;;
+        *) shift;;
+      esac
+    done
+    record "subcommand=ls" "json=$json_flag" "show_expired=$show_expired" "tags=$tag_filter"
+    if [ "$json_flag" = "true" ]; then
+      echo "${MVM_FAKE_MVM_LS_OUT:-[]}"
+    fi
+    exit "${MVM_FAKE_MVM_EXIT:-0}"
+    ;;
+  down)
+    shift
+    name="${1:-}"
+    record "subcommand=down" "name=$name"
+    exit "${MVM_FAKE_MVM_EXIT:-0}"
+    ;;
+  pause)
+    shift
+    name="${1:-}"
+    record "subcommand=pause" "name=$name"
+    if [ -n "${MVM_FAKE_MVM_PAUSE_OUT:-}" ]; then
+      echo "$MVM_FAKE_MVM_PAUSE_OUT"
+    fi
+    exit "${MVM_FAKE_MVM_EXIT:-0}"
+    ;;
+  resume)
+    shift
+    name="${1:-}"
+    record "subcommand=resume" "name=$name"
+    if [ -n "${MVM_FAKE_MVM_RESUME_OUT:-}" ]; then
+      echo "$MVM_FAKE_MVM_RESUME_OUT"
+    fi
+    exit "${MVM_FAKE_MVM_EXIT:-0}"
+    ;;
+  set-ttl)
+    shift
+    name="${1:-}"
+    duration="${2:-}"
+    record "subcommand=set-ttl" "name=$name" "duration=$duration"
+    exit "${MVM_FAKE_MVM_EXIT:-0}"
+    ;;
+  snapshot)
+    verb="${2:-}"
+    case "$verb" in
+      ls)
+        shift 2
+        record "subcommand=snapshot" "verb=ls"
+        # Honour --json by emitting JSON; non-json mode prints the
+        # human-readable table, but tests always pass --json.
+        echo "${MVM_FAKE_MVM_SNAPSHOT_LS_OUT:-[]}"
+        exit "${MVM_FAKE_MVM_EXIT:-0}"
+        ;;
+      rm)
+        shift 2
+        name="${1:-}"
+        record "subcommand=snapshot" "verb=rm" "name=$name"
+        exit "${MVM_FAKE_MVM_EXIT:-0}"
+        ;;
+      *)
+        echo "fake-mvm: unknown snapshot verb: $verb" >&2
+        exit 64
+        ;;
+    esac
+    ;;
+  metrics)
+    # `mvmctl metrics --instance <id> --json` — sandbox SDK calls this
+    # from `sandbox.metrics()`. Tests control the response via
+    # MVM_FAKE_MVM_METRICS_OUT.
+    shift
+    instance=""
+    while [ "$#" -gt 0 ]; do
+      case "$1" in
+        --instance) instance="$2"; shift 2;;
+        --json) shift;;
+        *) shift;;
+      esac
+    done
+    record "subcommand=metrics" "instance=$instance"
+    # Avoid `${VAR:-{}}` because bash's default-value substitution
+    # treats the inner `}` as the end of the expansion and appends
+    # a stray `}` literal to the output. Branch explicitly instead.
+    if [ -n "${MVM_FAKE_MVM_METRICS_OUT:-}" ]; then
+      echo "$MVM_FAKE_MVM_METRICS_OUT"
+    else
+      echo '{}'
+    fi
+    exit "${MVM_FAKE_MVM_EXIT:-0}"
+    ;;
+  fs)
+    verb="${2:-}"
+    shift 2
+    record "subcommand=fs" "verb=$verb" "args=$*"
+    case "$verb" in
+      read)
+        # `mvmctl fs read <vm> <path> [--offset N] [--length N]` —
+        # write canned bytes to stdout.
+        if [ -n "${MVM_FAKE_MVM_FS_READ_OUT:-}" ]; then
+          printf '%s' "$MVM_FAKE_MVM_FS_READ_OUT"
+        fi
+        ;;
+      write)
+        # Drain stdin so the writer's pipe completes.
+        cat > /dev/null
+        ;;
+      ls)
+        echo "${MVM_FAKE_MVM_FS_LS_OUT:-[]}"
+        ;;
+      stat)
+        if [ -n "${MVM_FAKE_MVM_FS_STAT_OUT:-}" ]; then
+          echo "$MVM_FAKE_MVM_FS_STAT_OUT"
+        else
+          echo '{}'
+        fi
+        ;;
+      mkdir|rm|mv)
+        # No stdout for confirmation verbs; record-only.
+        ;;
+      *)
+        echo "fake-mvm: unknown fs verb: $verb" >&2
+        exit 64
+        ;;
+    esac
+    exit "${MVM_FAKE_MVM_EXIT:-0}"
+    ;;
+  proc)
+    verb="${2:-}"
+    shift 2
+    record "subcommand=proc" "verb=$verb" "args=$*"
+    case "$verb" in
+      start)
+        # Echoes the pid_token to stdout. Tests control via
+        # MVM_FAKE_MVM_PROC_TOKEN.
+        echo "${MVM_FAKE_MVM_PROC_TOKEN:-ptok-deadbeef}"
+        ;;
+      ls)
+        echo "${MVM_FAKE_MVM_PROC_LS_OUT:-[]}"
+        ;;
+      stdin)
+        cat > /dev/null
+        ;;
+      signal|kill)
+        ;;
+      wait)
+        # mvmctl proc wait propagates the child's exit code; tests
+        # set MVM_FAKE_MVM_PROC_WAIT_EXIT.
+        exit "${MVM_FAKE_MVM_PROC_WAIT_EXIT:-0}"
+        ;;
+      *)
+        echo "fake-mvm: unknown proc verb: $verb" >&2
+        exit 64
+        ;;
+    esac
+    exit "${MVM_FAKE_MVM_EXIT:-0}"
+    ;;
+  *)
+    echo "fake-mvm: unknown subcommand: $subcommand" >&2
+    exit 64
+    ;;
+esac

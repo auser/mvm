@@ -360,8 +360,24 @@ impl NetworkPolicy {
 }
 
 impl Default for NetworkPolicy {
+    /// Deny-all is the safe default.
+    ///
+    /// Pre-Sprint 52, `Default` returned `unrestricted()`. The old
+    /// posture contradicted the rest of the ADR-002 security model
+    /// (claims 1–9 confine the guest at every other layer; an
+    /// unrestricted egress default undermined the claim that
+    /// untrusted code can't reach arbitrary network destinations).
+    /// Sprint 52 flipped the default to `deny_all` so the safe
+    /// posture is the one workloads get without opting in.
+    ///
+    /// Migration shape: `mvmctl up` callers who relied on the old
+    /// default get a warning if they explicitly pass
+    /// `--network-preset unrestricted`. Template authors who want
+    /// open egress declare it in the template's
+    /// `default_network_policy`. The escape hatch is named, never
+    /// silent.
     fn default() -> Self {
-        Self::unrestricted()
+        Self::deny_all()
     }
 }
 
@@ -593,8 +609,19 @@ mod tests {
     }
 
     #[test]
-    fn policy_default_is_unrestricted() {
-        assert!(NetworkPolicy::default().is_unrestricted());
+    fn policy_default_is_deny_all() {
+        // ADR-002 claim 10: the safe default is deny-all. Workloads
+        // that need network access opt in explicitly via
+        // `--network-preset` or a template's
+        // `default_network_policy`. The escape hatch is
+        // `--network-preset unrestricted`, which mvmctl warns about
+        // at launch.
+        let default = NetworkPolicy::default();
+        assert!(!default.is_unrestricted());
+        let rules = default
+            .resolve_rules()
+            .expect("default resolves to a concrete rule set");
+        assert!(rules.is_empty(), "deny-all should yield no allow rules");
     }
 
     #[test]

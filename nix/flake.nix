@@ -14,7 +14,7 @@
   #
   #   # my-app/flake.nix
   #   {
-  #     inputs.mvm.url = "github:auser/mvm";
+  #     inputs.mvm.url = "github:tinylabscom/mvm";
   #     outputs = { self, mvm, ... }: {
   #       packages.x86_64-linux.default = mvm.lib.x86_64-linux.mkGuest {
   #         name = "my-app";
@@ -67,12 +67,24 @@
       url = "github:microvm-nix/microvm.nix";
       inputs.nixpkgs.follows = "nixpkgs";
     };
+
+    # Workspace root — the Rust crates live one level up from this
+    # flake. `mvm-guest-agent.nix` reads `Cargo.lock` from `mvmSrc`,
+    # so `mvmSrc = self` was wrong: `self` is the `nix/` subtree of
+    # the repo, which doesn't contain `Cargo.lock`. Explicit
+    # `path:..` + `flake = false` stages the whole workspace into
+    # the store so cargo can see the lockfile and the crates.
+    mvm-workspace = {
+      url = "path:..";
+      flake = false;
+    };
   };
 
   outputs =
     { self
     , nixpkgs
     , microvm
+    , mvm-workspace
     , ...
     }:
     let
@@ -101,12 +113,16 @@
       # User flakes consume this as `inputs.mvm.lib.<system>.mkGuest`
       # to declare a microVM image. Implementation lives under
       # `./lib/`; the entry point is `./lib/default.nix`.
-      # Pass `self` as `mvmSrc` so `nix/lib/mk-guest.nix` can build
-      # the real `mvm-guest-agent` from this flake's source tree
-      # (`nix/packages/mvm-guest-agent.nix`). On user-side
-      # consumption the path resolves to the fetched mvm input's
-      # store path — the workspace source travels with the flake.
-      libFor = import ./lib { inherit nixpkgs microvm; mvmSrc = self; };
+      # Pass the `mvm-workspace` flake input (the workspace root,
+      # one level up from this flake) as `mvmSrc` so
+      # `nix/packages/mvm-guest-agent.nix` can resolve
+      # `${mvmSrc}/Cargo.lock` — that lockfile is at the workspace
+      # root, not under `nix/`, so `mvmSrc = self` (the historical
+      # value) failed `nix build` with "Path 'nix/Cargo.lock' does
+      # not exist". The flake-input form preserves purity: nix
+      # stages the workspace into the store as a regular input
+      # snapshot.
+      libFor = import ./lib { inherit nixpkgs microvm; mvmSrc = mvm-workspace; };
     in
     {
       # ── User-facing: lib.<system>.mkGuest ────────────────────────

@@ -161,11 +161,7 @@ pub(in crate::commands) fn console_interactive(name: &str) -> Result<()> {
         .connect(data_port)
         .context("Failed to connect to console data port")?;
 
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::ConsoleSessionStart,
-        Some(name),
-        Some(&format!("session_id={session_id}")),
-    );
+    mvm_core::audit_emit!(ConsoleSessionStart, vm: name, "session_id={session_id}");
 
     // Set up SIGWINCH handler to forward terminal resizes
     let resize_sender = setup_sigwinch_handler(transport.clone(), session_id);
@@ -182,11 +178,7 @@ pub(in crate::commands) fn console_interactive(name: &str) -> Result<()> {
     IN_CONSOLE_MODE.store(false, std::sync::atomic::Ordering::SeqCst);
     drop(resize_sender);
 
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::ConsoleSessionEnd,
-        Some(name),
-        Some(&format!("session_id={session_id}")),
-    );
+    mvm_core::audit_emit!(ConsoleSessionEnd, vm: name, "session_id={session_id}");
 
     println!("\nConsole session ended.");
     result.map(|_| ())

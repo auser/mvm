@@ -153,6 +153,32 @@ pub(crate) fn api_put_empty(socket: &str, endpoint: &str) -> Result<()> {
     run_curl_put_with_file(socket, endpoint, None)
 }
 
+/// GET a CH API endpoint, returning the response body as a string.
+///
+/// Used by read-only endpoints like `/api/v1/vm.info` (and via that,
+/// the balloon-state path). Same defensive quoting rules as `api_put`;
+/// the endpoint argument is a compile-time constant at call sites.
+pub(crate) fn api_get(socket: &str, endpoint: &str) -> Result<String> {
+    let q_socket = shell_quote(socket);
+    let url = format!("http://localhost{endpoint}");
+    let q_url = shell_quote(&url);
+    let q_endpoint = shell_quote(endpoint);
+    let script = format!(
+        r#"
+        set -eu
+        response=$(sudo curl -s -w "\n%{{http_code}}" --unix-socket {q_socket} {q_url})
+        code=$(printf '%s' "$response" | tail -n1)
+        out=$(printf '%s' "$response" | sed '$d')
+        if [ "$code" -ge 400 ]; then
+            echo "[mvm] ERROR: CH GET $(printf '%s' {q_endpoint}) returned $code: $out" >&2
+            exit 1
+        fi
+        printf '%s' "$out"
+        "#,
+    );
+    run_in_vm_stdout(&script)
+}
+
 /// Shared curl shell-out for both PUT variants.
 ///
 /// The socket path is `shell_quote`d defensively even though it
@@ -215,6 +241,20 @@ pub(crate) fn build_vm_config(args: &VmConfigArgs<'_>) -> String {
         Some(c) => format!(", \"cmdline\": {{ \"args\": {} }}", json_str(c)),
         None => String::new(),
     };
+    // Cloud-hypervisor expresses the virtio-balloon device through
+    // the top-level `balloon` field: `size` is the *initial balloon
+    // inflation* in bytes (memory the guest hands back at boot).
+    // Same semantics as Firecracker's `amount_mib`. We only emit the
+    // field when the workload opted in; absent = no balloon device.
+    let balloon = match args.balloon_mib {
+        Some(mib) if mib > 0 => {
+            let bytes = u64::from(mib) * 1024 * 1024;
+            // `deflate_on_oom: true` matches the FC mandatory shape —
+            // guest must be able to take pages back under pressure.
+            format!(r#", "balloon": {{ "size": {bytes}, "deflate_on_oom": true }}"#,)
+        }
+        _ => String::new(),
+    };
     format!(
         r#"{{
           "cpus": {{ "boot_vcpus": {cpus}, "max_vcpus": {cpus} }},
@@ -225,7 +265,7 @@ pub(crate) fn build_vm_config(args: &VmConfigArgs<'_>) -> String {
           ],
           "vsock": {{ "cid": {vsock_cid}, "socket": {vsock_socket} }},
           "console": {{ "mode": "Off" }},
-          "serial": {{ "mode": "Tty" }}
+          "serial": {{ "mode": "Tty" }}{balloon}
         }}"#,
         cpus = args.cpus,
         memory_bytes = memory_bytes,
@@ -235,6 +275,7 @@ pub(crate) fn build_vm_config(args: &VmConfigArgs<'_>) -> String {
         rootfs = json_str(args.rootfs_path),
         vsock_cid = args.vsock_cid,
         vsock_socket = json_str(&args.vsock_socket_path),
+        balloon = balloon,
     )
 }
 
@@ -247,6 +288,11 @@ pub(crate) struct VmConfigArgs<'a> {
     pub cmdline: Option<&'a str>,
     pub cpus: u32,
     pub memory_mib: u32,
+    /// Initial balloon inflation in MiB. `None` (or `Some(0)`) omits
+    /// the balloon device entirely. When `Some(n)` with `n > 0`, CH
+    /// attaches a balloon pre-inflated to `n` MiB; the host commits
+    /// `memory_mib - n` MiB at boot. Equivalent to FC's `amount_mib`.
+    pub balloon_mib: Option<u32>,
     pub vsock_cid: u32,
     pub vsock_socket_path: String,
 }
@@ -362,6 +408,7 @@ mod tests {
             cmdline: Some("console=ttyS0 root=/dev/vda"),
             cpus: 4,
             memory_mib: 2048,
+            balloon_mib: None,
             vsock_cid: 3,
             vsock_socket_path: "/tmp/v.sock".to_string(),
         };
@@ -395,6 +442,7 @@ mod tests {
             cmdline: None,
             cpus: 1,
             memory_mib: 256,
+            balloon_mib: None,
             vsock_cid: 3,
             vsock_socket_path: "/tmp/v.sock".to_string(),
         };
@@ -412,11 +460,76 @@ mod tests {
             cmdline: None,
             cpus: 1,
             memory_mib: 256,
+            balloon_mib: None,
             vsock_cid: 3,
             vsock_socket_path: "/tmp/v.sock".to_string(),
         };
         let json = build_vm_config(&args);
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
         assert!(parsed["payload"]["initramfs"].is_null());
+    }
+
+    #[test]
+    fn build_vm_config_omits_balloon_when_unset() {
+        let args = VmConfigArgs {
+            kernel_path: "/k/vmlinux",
+            rootfs_path: "/k/rootfs.ext4",
+            initrd_path: None,
+            cmdline: None,
+            cpus: 1,
+            memory_mib: 1024,
+            balloon_mib: None,
+            vsock_cid: 3,
+            vsock_socket_path: "/tmp/v.sock".to_string(),
+        };
+        let json = build_vm_config(&args);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert!(
+            parsed["balloon"].is_null(),
+            "no balloon device emitted when balloon_mib is None: {json}"
+        );
+    }
+
+    #[test]
+    fn build_vm_config_omits_balloon_when_zero() {
+        // Zero is a defensive "user opted in but to nothing useful";
+        // the CH config builder treats it the same as None.
+        let args = VmConfigArgs {
+            kernel_path: "/k/vmlinux",
+            rootfs_path: "/k/rootfs.ext4",
+            initrd_path: None,
+            cmdline: None,
+            cpus: 1,
+            memory_mib: 1024,
+            balloon_mib: Some(0),
+            vsock_cid: 3,
+            vsock_socket_path: "/tmp/v.sock".to_string(),
+        };
+        let json = build_vm_config(&args);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        assert!(parsed["balloon"].is_null(), "balloon: 0 should be omitted");
+    }
+
+    #[test]
+    fn build_vm_config_emits_balloon_when_present() {
+        // mem 1024 MiB, balloon 256 MiB → host commits 768 MiB.
+        let args = VmConfigArgs {
+            kernel_path: "/k/vmlinux",
+            rootfs_path: "/k/rootfs.ext4",
+            initrd_path: None,
+            cmdline: None,
+            cpus: 1,
+            memory_mib: 1024,
+            balloon_mib: Some(256),
+            vsock_cid: 3,
+            vsock_socket_path: "/tmp/v.sock".to_string(),
+        };
+        let json = build_vm_config(&args);
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("valid JSON");
+        // CH expects balloon size in bytes.
+        assert_eq!(parsed["balloon"]["size"], 256u64 * 1024 * 1024);
+        assert_eq!(parsed["balloon"]["deflate_on_oom"], true);
+        // Memory cap stays unchanged.
+        assert_eq!(parsed["memory"]["size"], 1024u64 * 1024 * 1024);
     }
 }

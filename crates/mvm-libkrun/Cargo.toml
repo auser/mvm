@@ -1,0 +1,53 @@
+[package]
+name = "mvm-libkrun"
+version.workspace = true
+edition.workspace = true
+description = "Rust bindings for the Red Hat libkrun C library (Linux KVM, macOS HVF)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+build = "build.rs"
+
+# ── What this crate is ─────────────────────────────────────────────
+#
+# Thin Rust bindings + a safe wrapper around Red Hat libkrun's C API.
+# libkrun is a library-style VMM: linked directly into the calling
+# binary, no out-of-process daemon. On Linux it uses KVM; on macOS it
+# uses Hypervisor.framework. mvm uses it as a Tier 2 microVM backend
+# and (post-Plan-71) the builder-VM substrate.
+#
+# Two build modes:
+#
+#   * default (no feature) — no FFI, no link to libkrun. `start`/`stop`
+#     return `Error::NotYetWired`. The workspace builds cleanly on hosts
+#     without libkrun installed.
+#
+#   * `libkrun-sys` — bindgen-generated FFI + `-lkrun` link. Requires
+#     libkrun.h on the host (probed by build.rs at the standard install
+#     locations) and a working libkrun shared library at link time.
+#
+# Plan 57 W1 lands the bindings; W2 adds macOS codesigning entitlements;
+# W3 validates an end-to-end boot. This crate stays narrowly focused on
+# the FFI surface — backend dispatch lives in mvm-backend.
+
+[dependencies]
+libc.workspace = true
+tracing = "0.1"
+
+[build-dependencies]
+# `bindgen` is required only when the `libkrun-sys` feature is on; we
+# still list it unconditionally so the crate manifest reflects the real
+# build-time graph. The build script returns early when the feature is
+# off, so libclang isn't invoked in the default workspace build.
+bindgen = "0.72"
+
+[features]
+default = []
+# Opt-in: generate FFI bindings and link `libkrun`. Off by default so
+# the workspace builds on hosts without libkrun installed (CI fast lane,
+# Linux contributors who don't run the Tier 2 backend).
+libkrun-sys = []
+
+[lints]
+workspace = true

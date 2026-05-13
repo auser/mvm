@@ -74,7 +74,10 @@ pub fn run(args: &[String]) -> Result<()> {
     match args.first().map(|s| s.as_str()) {
         Some("rootfs-size") => rootfs_size_subcommand(&args[1..]),
         Some("boot") => boot_subcommand(&args[1..]),
-        Some(other) => bail!("Unknown perf subcommand {other:?}. Available: rootfs-size, boot"),
+        Some("budgets") => budgets_subcommand(&args[1..]),
+        Some(other) => {
+            bail!("Unknown perf subcommand {other:?}. Available: rootfs-size, boot, budgets")
+        }
         None => {
             eprintln!("Usage: cargo xtask perf <subcommand>");
             eprintln!(
@@ -84,8 +87,166 @@ pub fn run(args: &[String]) -> Result<()> {
             eprintln!(
                 "                                 Statistical cold-boot benchmark (Linux/KVM, MVM_LIVE_SMOKE=1)"
             );
+            eprintln!(
+                "  budgets [--json]               Print every documented perf budget as a table"
+            );
             std::process::exit(1);
         }
+    }
+}
+
+// ============================================================================
+// budgets subcommand — single-source-of-truth release-readiness inventory
+// ============================================================================
+
+fn budgets_subcommand(args: &[String]) -> Result<()> {
+    let json = args.iter().any(|a| a == "--json");
+    let budgets = all_budgets();
+    if json {
+        println!("{}", serde_json::to_string_pretty(&budgets)?);
+    } else {
+        render_budgets_human(&budgets);
+    }
+    Ok(())
+}
+
+/// One performance budget the project commits to. The full set
+/// is the single source of truth for plan-60 Phase 9 perf claims
+/// plus plan-65 and plan-7a per-resource caps; the budgets are
+/// pinned by tests in this module so doc/code drift is caught at
+/// PR review.
+#[derive(Debug, serde::Serialize)]
+pub struct PerfBudget {
+    pub name: &'static str,
+    pub limit: u64,
+    pub unit: &'static str,
+    pub source: &'static str,
+    pub description: &'static str,
+}
+
+/// The canonical list of perf budgets, used by `xtask perf
+/// budgets` and exported for tests. Adding a budget? Edit here
+/// and add a constant-pin test below so the spec/code link is
+/// enforced.
+pub fn all_budgets() -> Vec<PerfBudget> {
+    vec![
+        PerfBudget {
+            name: "rootfs_size",
+            limit: ROOTFS_MAX_BYTES,
+            unit: "bytes",
+            source: "plan-60 Phase 9 + ADR-013",
+            description: "Minimal-template ext4 rootfs size",
+        },
+        PerfBudget {
+            name: "firecracker_cold_boot",
+            limit: FIRECRACKER_BOOT_BUDGET.as_millis() as u64,
+            unit: "ms",
+            source: "ADR-013 §\"Per-backend boot budgets\"",
+            description: "Firecracker cold-boot wall-clock (1 vCPU / 256 MiB)",
+        },
+        PerfBudget {
+            name: "microsandbox_cold_boot",
+            limit: MICROSANDBOX_BOOT_BUDGET.as_millis() as u64,
+            unit: "ms",
+            source: "ADR-013 §\"Per-backend boot budgets\"",
+            description: "Microsandbox cold-boot wall-clock",
+        },
+        PerfBudget {
+            name: "default_response_body_cap",
+            limit: 1 << 20,
+            unit: "bytes",
+            source: "plan-65 follow-on (a437c0e)",
+            description: "Per-tool capped response body for web_fetch + search providers",
+        },
+        PerfBudget {
+            name: "web_fetch_max_bytes",
+            limit: 16 * (1 << 20),
+            unit: "bytes",
+            source: "plan-60 Phase 7 (e500c18)",
+            description: "Hard upper bound on mvm.web_fetch max_bytes (caller-supplied is clamped)",
+        },
+        PerfBudget {
+            name: "tool_max_query_len",
+            limit: 1024,
+            unit: "bytes",
+            source: "plan-60 Phase 7 (a4ca401)",
+            description: "Max query string length for mvm.web_search",
+        },
+        PerfBudget {
+            name: "tool_max_results",
+            limit: 50,
+            unit: "items",
+            source: "plan-60 Phase 7 (a4ca401)",
+            description: "Hard upper bound on mvm.web_search max_results",
+        },
+        PerfBudget {
+            name: "overlay_quota_default",
+            limit: 10 * (1 << 30),
+            unit: "bytes",
+            source: "plan-7a Slice A (f6d95c6)",
+            description: "Default per-overlay quota (LUKS impl enforces at FS layer in Slice B)",
+        },
+        PerfBudget {
+            name: "overlay_max_name_len",
+            limit: 64,
+            unit: "bytes",
+            source: "plan-7a Slice A (f6d95c6)",
+            description: "Max length of a tenant id or workload id in overlay paths",
+        },
+        PerfBudget {
+            name: "staging_max_path_len",
+            limit: 512,
+            unit: "bytes",
+            source: "plan-60 Phase 7 (5e62e5a)",
+            description: "Max length of a relative path under the tool staging area",
+        },
+        PerfBudget {
+            name: "staging_max_allowed_bytes",
+            limit: 256 * (1 << 20),
+            unit: "bytes",
+            source: "plan-60 Phase 7 (5e62e5a)",
+            description: "Hard upper bound on mvm.upload/download max_bytes (clamped)",
+        },
+    ]
+}
+
+fn render_budgets_human(budgets: &[PerfBudget]) {
+    eprintln!(
+        "cargo xtask perf budgets — {} budget(s) tracked",
+        budgets.len()
+    );
+    eprintln!();
+    let max_name = budgets.iter().map(|b| b.name.len()).max().unwrap_or(0);
+    for b in budgets {
+        let value = format_value(b.limit, b.unit);
+        eprintln!("  {:<width$}  {}", b.name, value, width = max_name);
+        eprintln!(
+            "  {:<width$}    └─ {} ({})",
+            "",
+            b.description,
+            b.source,
+            width = max_name
+        );
+    }
+}
+
+fn format_value(limit: u64, unit: &str) -> String {
+    match unit {
+        "bytes" => {
+            const KIB: u64 = 1 << 10;
+            const MIB: u64 = 1 << 20;
+            const GIB: u64 = 1 << 30;
+            if limit >= GIB && limit.is_multiple_of(GIB) {
+                format!("{} bytes ({} GiB)", limit, limit / GIB)
+            } else if limit >= MIB && limit.is_multiple_of(MIB) {
+                format!("{} bytes ({} MiB)", limit, limit / MIB)
+            } else if limit >= KIB && limit.is_multiple_of(KIB) {
+                format!("{} bytes ({} KiB)", limit, limit / KIB)
+            } else {
+                format!("{limit} bytes")
+            }
+        }
+        _ => format!("{limit} {unit}"),
     }
 }
 
@@ -383,5 +544,115 @@ mod tests {
     fn backend_budgets_match_constants() {
         assert_eq!(Backend::Firecracker.budget(), FIRECRACKER_BOOT_BUDGET);
         assert_eq!(Backend::Microsandbox.budget(), MICROSANDBOX_BOOT_BUDGET);
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // budgets subcommand — single-source-of-truth inventory
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn all_budgets_has_expected_count() {
+        // The count is a tripwire — if someone adds a budget without
+        // a corresponding constant-pin test, this assert pushes them
+        // to update both.
+        assert_eq!(all_budgets().len(), 11);
+    }
+
+    #[test]
+    fn all_budgets_names_are_unique() {
+        let mut seen = std::collections::HashSet::new();
+        for b in all_budgets() {
+            assert!(seen.insert(b.name), "duplicate budget name: {}", b.name);
+        }
+    }
+
+    #[test]
+    fn all_budgets_have_non_empty_fields() {
+        for b in all_budgets() {
+            assert!(!b.name.is_empty(), "empty name");
+            assert!(!b.unit.is_empty(), "empty unit for {}", b.name);
+            assert!(!b.source.is_empty(), "empty source for {}", b.name);
+            assert!(
+                !b.description.is_empty(),
+                "empty description for {}",
+                b.name
+            );
+            assert!(b.limit > 0, "zero limit for {}", b.name);
+        }
+    }
+
+    #[test]
+    fn all_budgets_pin_rootfs_to_constant() {
+        let b = all_budgets()
+            .into_iter()
+            .find(|b| b.name == "rootfs_size")
+            .expect("rootfs_size budget");
+        assert_eq!(b.limit, ROOTFS_MAX_BYTES);
+    }
+
+    #[test]
+    fn all_budgets_pin_firecracker_to_constant() {
+        let b = all_budgets()
+            .into_iter()
+            .find(|b| b.name == "firecracker_cold_boot")
+            .expect("firecracker_cold_boot budget");
+        assert_eq!(b.limit, FIRECRACKER_BOOT_BUDGET.as_millis() as u64);
+    }
+
+    #[test]
+    fn all_budgets_pin_microsandbox_to_constant() {
+        let b = all_budgets()
+            .into_iter()
+            .find(|b| b.name == "microsandbox_cold_boot")
+            .expect("microsandbox_cold_boot budget");
+        assert_eq!(b.limit, MICROSANDBOX_BOOT_BUDGET.as_millis() as u64);
+    }
+
+    #[test]
+    fn format_value_renders_bytes_with_kib() {
+        let s = format_value(1024, "bytes");
+        assert!(s.contains("1024 bytes"), "got: {s}");
+        assert!(s.contains("1 KiB"), "got: {s}");
+    }
+
+    #[test]
+    fn format_value_renders_bytes_with_mib() {
+        let s = format_value(1 << 20, "bytes");
+        assert!(s.contains("1 MiB"), "got: {s}");
+    }
+
+    #[test]
+    fn format_value_renders_bytes_with_gib() {
+        let s = format_value(10 * (1 << 30), "bytes");
+        assert!(s.contains("10 GiB"), "got: {s}");
+    }
+
+    #[test]
+    fn format_value_renders_non_round_bytes_plain() {
+        // 1025 isn't a multiple of KiB — render just the byte count.
+        let s = format_value(1025, "bytes");
+        assert_eq!(s, "1025 bytes");
+    }
+
+    #[test]
+    fn format_value_renders_non_bytes_unit_verbatim() {
+        let s = format_value(500, "ms");
+        assert_eq!(s, "500 ms");
+    }
+
+    #[test]
+    fn budgets_subcommand_json_serializes_cleanly() {
+        // Roundtrip: the inventory should serialize as a JSON array
+        // of objects with the documented shape so monitoring consumers
+        // can rely on it.
+        let budgets = all_budgets();
+        let json = serde_json::to_string(&budgets).unwrap();
+        let parsed: serde_json::Value = serde_json::from_str(&json).unwrap();
+        let arr = parsed.as_array().expect("top-level array");
+        assert_eq!(arr.len(), budgets.len());
+        let first = &arr[0];
+        for field in ["name", "limit", "unit", "source", "description"] {
+            assert!(first.get(field).is_some(), "missing field: {field}");
+        }
     }
 }

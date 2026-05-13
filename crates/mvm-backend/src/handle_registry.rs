@@ -41,8 +41,13 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
+// `VmBackend` + `VmId` are only used to call `MicrosandboxBackend::stop`
+// when the feature is on. Gated with the import to avoid an unused-import
+// warning on no-default-features builds.
+#[cfg(feature = "backends-microsandbox")]
 use mvm_core::vm_backend::{VmBackend, VmId};
 
+#[cfg(feature = "backends-microsandbox")]
 use crate::MicrosandboxBackend;
 
 /// Metadata kept for each attached sandbox. The map's key is the
@@ -117,18 +122,31 @@ pub fn stop_all_attached() -> Vec<String> {
     if names.is_empty() {
         return names;
     }
-    let backend = MicrosandboxBackend;
-    for name in &names {
-        if let Err(e) = backend.stop(&VmId(name.clone())) {
-            tracing::warn!(
-                sandbox = %name,
-                error = %e,
-                "ctrl-c: failed to stop attached sandbox; orphaned",
-            );
-        } else {
-            tracing::info!(sandbox = %name, "ctrl-c: stopped attached sandbox");
+    #[cfg(feature = "backends-microsandbox")]
+    {
+        let backend = MicrosandboxBackend;
+        for name in &names {
+            if let Err(e) = backend.stop(&VmId(name.clone())) {
+                tracing::warn!(
+                    sandbox = %name,
+                    error = %e,
+                    "ctrl-c: failed to stop attached sandbox; orphaned",
+                );
+            } else {
+                tracing::info!(sandbox = %name, "ctrl-c: stopped attached sandbox");
+            }
+            deregister(name);
         }
-        deregister(name);
+    }
+    #[cfg(not(feature = "backends-microsandbox"))]
+    {
+        // Without the microsandbox backend, the registry is never
+        // populated by any internal code — but `register_attached` is
+        // a `pub fn` so an external caller could populate it anyway.
+        // Drain defensively so the registry doesn't grow unbounded.
+        for name in &names {
+            deregister(name);
+        }
     }
     names
 }

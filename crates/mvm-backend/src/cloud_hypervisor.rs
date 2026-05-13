@@ -99,6 +99,12 @@ impl VmBackend for CloudHypervisorBackend {
             snapshots: true,
             vsock: true,
             tap_networking: false,
+            // Cloud-hypervisor exposes virtio-balloon via the
+            // `balloon` field on `VmConfig` and the
+            // `/api/v1/vm.resize` endpoint for runtime adjustment.
+            // Same opt-in shape as Firecracker — present only when
+            // `VmStartConfig::mem_initial_mib` is `Some`.
+            balloon: true,
         }
     }
 
@@ -126,6 +132,27 @@ impl VmBackend for CloudHypervisorBackend {
         // Spawn the daemon. Waits for the API socket.
         ch_runtime::start_ch_daemon(&abs_dir, &api_socket)?;
 
+        let memory_mib = if config.memory_mib == 0 {
+            256
+        } else {
+            config.memory_mib
+        };
+        // Balloon opt-in. CH validates `mem_initial < memory` for us
+        // at vm.create, but we mirror Firecracker's defensive check
+        // so the misuse surfaces with a clearer host-side message.
+        let balloon_mib = match config.mem_initial_mib {
+            Some(0) => {
+                anyhow::bail!("cloud-hypervisor: mem_initial_mib must be > 0 when set");
+            }
+            Some(initial) if initial >= memory_mib => {
+                anyhow::bail!(
+                    "cloud-hypervisor: mem_initial_mib ({initial}) must be < memory_mib ({memory_mib})"
+                );
+            }
+            Some(initial) => Some(memory_mib - initial),
+            None => None,
+        };
+
         // Configure the VM. CH ignores fields we omit; only the
         // required shape is sent.
         let args = ch_runtime::VmConfigArgs {
@@ -134,11 +161,8 @@ impl VmBackend for CloudHypervisorBackend {
             initrd_path: config.initrd_path.as_deref(),
             cmdline: Some(DEFAULT_CMDLINE),
             cpus: config.cpus.max(1),
-            memory_mib: if config.memory_mib == 0 {
-                256
-            } else {
-                config.memory_mib
-            },
+            memory_mib,
+            balloon_mib,
             vsock_cid: 3,
             vsock_socket_path: vsock_socket,
         };
@@ -181,6 +205,56 @@ impl VmBackend for CloudHypervisorBackend {
         let api_socket = ch_runtime::ch_api_socket(&abs_dir);
         ch_runtime::api_put_empty(&api_socket, "/api/v1/vm.resume")
             .with_context(|| format!("PUT /api/v1/vm.resume for VM '{}'", id.0))
+    }
+
+    fn balloon_set_target(&self, id: &VmId, target_inflate_mib: u32) -> Result<()> {
+        let abs_dir = ch_runtime::ch_vm_dir(&id.0)
+            .with_context(|| format!("resolving per-VM dir for {}", id.0))?;
+        let api_socket = ch_runtime::ch_api_socket(&abs_dir);
+        let bytes = u64::from(target_inflate_mib) * 1024 * 1024;
+        // CH's resize endpoint accepts `desired_vcpus`, `desired_ram`,
+        // and `desired_balloon` (all optional). Sending only the
+        // balloon field leaves vcpus + ram alone.
+        let body = format!(r#"{{"desired_balloon": {bytes}}}"#);
+        ch_runtime::api_put(&abs_dir, &api_socket, "/api/v1/vm.resize", &body).with_context(|| {
+            format!(
+                "PUT /api/v1/vm.resize (desired_balloon={bytes}) for VM '{}'; \
+                     VM may have been launched without `mem_initial_mib` (no balloon device)",
+                id.0
+            )
+        })
+    }
+
+    fn balloon_state(&self, id: &VmId) -> Result<mvm_core::vm_backend::BalloonState> {
+        let abs_dir = ch_runtime::ch_vm_dir(&id.0)
+            .with_context(|| format!("resolving per-VM dir for {}", id.0))?;
+        let api_socket = ch_runtime::ch_api_socket(&abs_dir);
+        let body = ch_runtime::api_get(&api_socket, "/api/v1/vm.info")
+            .with_context(|| format!("GET /api/v1/vm.info for VM '{}'", id.0))?;
+        let parsed: serde_json::Value = serde_json::from_str(body.trim())
+            .with_context(|| format!("parse vm.info response: {body:?}"))?;
+
+        // Memory cap comes from `config.memory.size` (bytes); CH
+        // doesn't echo a separate "max balloon" so we derive it.
+        // Current balloon inflation is at `config.balloon.size` —
+        // CH keeps the live size up-to-date there after resize.
+        let memory_bytes = parsed
+            .pointer("/config/memory/size")
+            .and_then(|v| v.as_u64())
+            .ok_or_else(|| anyhow::anyhow!("vm.info missing /config/memory/size: {body}"))?;
+        let balloon_bytes = parsed
+            .pointer("/config/balloon/size")
+            .and_then(|v| v.as_u64())
+            .unwrap_or(0);
+
+        let mib = |b: u64| (b / (1024 * 1024)) as u32;
+        let max_mib = mib(memory_bytes);
+        let inflated_mib = mib(balloon_bytes);
+        Ok(mvm_core::vm_backend::BalloonState {
+            max_mib,
+            inflated_mib,
+            host_committed_mib: max_mib.saturating_sub(inflated_mib),
+        })
     }
 
     fn stop_all(&self) -> Result<()> {

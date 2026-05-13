@@ -1,7 +1,7 @@
 You are a senior systems integrator and Rust infrastructure engineer.
 
 You are working in the existing repository:
-https://github.com/auser/mvm
+https://github.com/tinylabscom/mvm
 
 Assume the following have ALREADY been implemented:
 

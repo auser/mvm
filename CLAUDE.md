@@ -4,7 +4,7 @@
 
 Rust CLI for building and running Firecracker microVMs on macOS (via Lima) and Linux. Handles the full dev lifecycle: bootstrapping, Nix-based image builds, single-VM management, and reusable template creation.
 
-Multi-tenant fleet orchestration (tenants, pools, instances, agents, coordinators) lives in the separate [mvmd](https://github.com/auser/mvmd) repository.
+Multi-tenant fleet orchestration (tenants, pools, instances, agents, coordinators) lives in the separate [mvmd](https://github.com/tinylabscom/mvmd) repository.
 
 ```
 macOS / Linux Host (this CLI) -> Lima VM (Ubuntu) -> Firecracker microVM (/dev/kvm)
@@ -79,6 +79,8 @@ The `RuntimeBuildEnv` in mvm implements only `ShellEnvironment`. The full `Build
 - **Templates use dev_build path**: `mvmctl template build` runs `nix build` locally in the Lima VM (no ephemeral FC builder VMs).
 - **mvm-core stays whole**: orchestration types (tenant, pool, instance, agent, protocol) remain in mvm-core even though they're only used by mvmd. This avoids a third shared-types crate and keeps the facade dependency simple.
 - **No `clippy::too_many_arguments`**: never suppress this lint. Refactor into smaller functions or a config/params struct.
+- **Source-checkout builds never depend on mvm-published artifacts**: when `mvmctl` is run from a source checkout of this repo (anywhere `find_dev_image_flake()` / `find_builder_vm_flake()` returns `Some`), every VM image is built locally from the in-repo flakes — both the builder VM image (`nix/images/builder-vm/`) and the user-facing image (`nix/images/dev-shell/`, user `--flake`, etc.). The mvm-published prebuilts on GitHub releases are end-user infrastructure only; they are never a prerequisite for any source-checkout workflow. A contributor modifying `nix/images/builder-vm/flake.nix` must see their change in the very next `mvmctl dev up` with no release-pipeline round-trip. See ADR-046 §"Two artifact layers, two acquisition paths" for the resolution rule and ADR-046 §"Why the contributor path doesn't download" for the rationale.
+- **Host Nix is never used by mvmctl**, even when present: `mvmctl` does not shell out to a host `nix` binary, does not consult `nix-darwin`'s `linux-builder`, and does not honor `nix-daemon` URLs in any code path. Every Nix evaluation goes through a VM we launched — Stage 0 is microsandbox + `nixos/nix:2.24.10` (the contributor-bootstrap path that produces the builder VM image in a source checkout); subsequent builds run inside that builder VM via libkrun (macOS) or Firecracker (Linux). The reason is determinism and consistency: the same `mvmctl` produces the same artifacts on every host regardless of what the host happens to have installed. A contributor with host Nix installed must not see different behavior from a contributor without it. This invariant supersedes ADR-013's "host Nix remains an opt-in power-user path" clause for everything inside `mvmctl`.
 
 ## Security model
 

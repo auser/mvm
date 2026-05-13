@@ -18,7 +18,7 @@ export default defineConfig({
         replacesTitle: true,
       },
       social: [
-        { icon: "github", label: "GitHub", href: "https://github.com/auser/mvm" },
+        { icon: "github", label: "GitHub", href: "https://github.com/tinylabscom/mvm" },
       ],
       expressiveCode: {
         themes: ["github-dark"],

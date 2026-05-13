@@ -81,11 +81,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             let json = serde_json::to_string_pretty(&net)?;
             std::fs::write(&path, json)?;
 
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::NetworkCreate,
-                None,
-                Some(&name),
-            );
+            mvm_core::audit_emit!(NetworkCreate, "{name}");
 
             ui::success(&format!(
                 "Created network {:?} (bridge={}, subnet={})",
@@ -143,11 +139,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             }
             std::fs::remove_file(&path)?;
 
-            mvm_core::audit::emit(
-                mvm_core::audit::LocalAuditKind::NetworkRemove,
-                None,
-                Some(&name),
-            );
+            mvm_core::audit_emit!(NetworkRemove, "{name}");
 
             ui::success(&format!("Removed network {:?}", name));
             Ok(())
