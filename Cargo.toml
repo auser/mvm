@@ -21,6 +21,9 @@ members = [
     "crates/mvm-ir",
     "crates/mvm-sdk",
     "crates/mvm-sdk-macros",
+    # plan 60 Phase 5 Slice C — in-guest entrypoint runner for
+    # function-call workloads, ported from mvmforge-runtime.
+    "crates/mvm-runner",
     "xtask",
 ]
 # cargo-fuzz crates have to be excluded from the main workspace because
