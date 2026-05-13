@@ -4275,6 +4275,8 @@ dependencies = [
  "libc",
  "mvm-guest",
  "mvm-providers",
+ "serde",
+ "serde_json",
  "tracing",
 ]
 

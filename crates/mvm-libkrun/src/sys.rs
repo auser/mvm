@@ -146,6 +146,21 @@ impl Context {
         check(unsafe { bindings::krun_add_vsock_port(self.ctx_id, port, path.as_ptr()) })
     }
 
+    /// Like [`Self::add_vsock_port`], but explicitly states which side
+    /// listens. With `listen = true` ("guest expects connections to
+    /// be initiated from host side"), libkrun creates a unix socket
+    /// **listener** at `host_path`; sibling host processes connect to
+    /// it as clients and libkrun forwards the connection to the
+    /// guest's `AF_VSOCK` server. This is the right mode for mvm's
+    /// guest agent, which always listens on `GUEST_AGENT_PORT`. With
+    /// `listen = false`, libkrun does not create the file — the host
+    /// is expected to bind a listener at `host_path` and libkrun
+    /// proxies guest-initiated connects to it.
+    pub fn add_vsock_port2(&self, port: u32, host_path: &Path, listen: bool) -> Result<(), Error> {
+        let path = cstring(host_path)?;
+        check(unsafe { bindings::krun_add_vsock_port2(self.ctx_id, port, path.as_ptr(), listen) })
+    }
+
     pub fn add_virtiofs(&self, tag: &str, host_path: &Path) -> Result<(), Error> {
         let tag = CString::new(tag).map_err(|_| Error::InvalidCString)?;
         let path = cstring(host_path)?;
