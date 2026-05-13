@@ -152,7 +152,7 @@ jobs:
         uses: dtolnay/rust-toolchain@nightly
 
       - name: Build A
-        run: cargo build --release --locked --bin mvmctl
+        run: cargo build --release --locked --bin mvmctl --features backends-microsandbox,template-registry-s3,dev-watch,custom-dns,manifest-verify
 
       - name: Hash A
         run: sha256sum target/release/mvmctl | tee /tmp/hash-a.txt
@@ -161,7 +161,7 @@ jobs:
         run: cargo clean
 
       - name: Build B
-        run: cargo build --release --locked --bin mvmctl
+        run: cargo build --release --locked --bin mvmctl --features backends-microsandbox,template-registry-s3,dev-watch,custom-dns,manifest-verify
 
       - name: Hash B
         run: sha256sum target/release/mvmctl | tee /tmp/hash-b.txt

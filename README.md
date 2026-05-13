@@ -17,7 +17,7 @@ Override with `--hypervisor`:
 | Backend | Host | Tier | Notes |
 |---|---|---|---|
 | [Firecracker](https://firecracker-microvm.github.io/) | Linux + `/dev/kvm`, WSL2 | 1 | Default on KVM hosts; snapshots, dm-verity, full security posture |
-| [microsandbox](https://github.com/microsandbox/microsandbox) (libkrun) | macOS (HVF), Linux without KVM | 2 | Cross-platform default; bundled libkrun |
+| [microsandbox](https://github.com/microsandbox/microsandbox) (libkrun) | macOS (HVF), Linux without KVM | 2 | Cross-platform backend; enable with `--features backends-microsandbox` when building from source |
 | [Apple Container](https://developer.apple.com/documentation/virtualization) | macOS 26+ Apple Silicon | 2 | Native Virtualization.framework |
 | [Cloud Hypervisor](https://www.cloudhypervisor.org/) | Linux + KVM | 1 (opt-in) | Wider device model than Firecracker — VFIO, virtio-fs, larger guests |
 
@@ -34,6 +34,9 @@ curl -fsSL https://raw.githubusercontent.com/tinylabscom/mvm/main/install.sh | s
 git clone https://github.com/tinylabscom/mvm.git && cd mvm
 cargo build --release
 cp target/release/mvmctl ~/.local/bin/
+
+# Include the microsandbox/libkrun backend in a source build
+cargo build --release --features backends-microsandbox
 
 # Via Cargo (after first crates.io release of 0.14.0)
 cargo install mvmctl
@@ -75,13 +78,13 @@ runtime enforcement of security claim 4 (CLAUDE.md "Security model").
 ```
 Layer 1: Host (Linux, macOS, Windows-via-WSL2 in progress)
   mvmctl runs natively. Direct host shell on Linux+KVM.
-  On macOS, Nix builds happen in MicrosandboxBuilderVm
-  (an OCI nix:2.24.10 sandbox) if host Nix isn't present.
+  On macOS source builds, enable `backends-microsandbox` to use
+  MicrosandboxBuilderVm when host Nix isn't present.
 
 Layer 2: VM backend (auto-selected per ADR-013)
   Firecracker  ─── KVM microVMs (Tier 1; default on Linux+KVM)
   Cloud Hypervisor ─ KVM, wider device model (Tier 1; opt-in)
-  microsandbox ──── libkrun (Tier 2; cross-platform default)
+  microsandbox ──── libkrun (Tier 2; opt-in source-build feature)
   Apple Container ─ Virtualization.framework (macOS 26+ AS)
 
 Layer 3: Guest

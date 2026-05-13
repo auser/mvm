@@ -43,6 +43,7 @@ pub mod destination;
 pub mod egress;
 pub mod event_bus;
 pub mod firewall;
+#[cfg(feature = "custom-dns")]
 pub mod hickory_dns;
 pub mod injection_guard;
 pub mod inspector;
@@ -79,6 +80,7 @@ pub use circuit_breaker::{
 pub use destination::DestinationPolicy;
 pub use egress::{EgressDecision, EgressError, EgressProxy, NoopEgressProxy};
 pub use event_bus::{DEFAULT_CAPACITY as EVENT_BUS_DEFAULT_CAPACITY, EventBus, LifecycleEvent};
+#[cfg(feature = "custom-dns")]
 pub use hickory_dns::HickoryDnsResolver;
 pub use injection_guard::{InjectionGuard, InjectionRule, RuleFamily};
 pub use inspector::{Inspector, InspectorChain, InspectorVerdict, RequestCtx};

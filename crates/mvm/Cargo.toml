@@ -14,11 +14,8 @@ mvm-core.workspace = true
 mvm-plan.workspace = true
 mvm-security.workspace = true
 mvm-guest.workspace = true
-# `default-features = false` + the feature-forwarding block below lets
-# library consumers of the `mvmctl` facade (e.g. mvmd) disable the
-# microsandbox backend via `default-features = false`. The mvm binary
-# stays unchanged because mvm-cli + mvmctl keep `backends-microsandbox`
-# in their default features.
+# `default-features = false` + the feature-forwarding block below keeps the
+# heavy microsandbox backend out of lean production builds unless requested.
 mvm-build = { workspace = true, default-features = false }
 mvm-backend = { workspace = true, default-features = false }
 mvm-base.workspace = true
@@ -31,7 +28,7 @@ rand.workspace = true
 secrecy.workspace = true
 indicatif.workspace = true
 inquire.workspace = true
-opendal.workspace = true
+opendal = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -43,12 +40,13 @@ mvm-providers.workspace = true
 libc.workspace = true
 
 [features]
-default = ["backends-microsandbox"]
+default = []
 backends-microsandbox = [
     "mvm-build/backends-microsandbox",
     "mvm-backend/backends-microsandbox",
 ]
 manifest-verify = ["mvm-security/manifest-verify"]
+template-registry-s3 = ["dep:opendal"]
 
 [lints]
 workspace = true

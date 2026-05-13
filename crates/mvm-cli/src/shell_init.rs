@@ -10,20 +10,12 @@ const MARKER_END: &str = "# <<< mvmctl <<<";
 /// Generate the shell init block with completions and dev aliases.
 ///
 /// The block template lives in `resources/shell_init.sh.tera` and is
-/// embedded at compile time, then rendered via Tera at runtime.
+/// embedded at compile time. It uses only three fixed placeholders.
 pub fn generate_block(kv_root: &str) -> String {
-    let mut tera = tera::Tera::default();
-    tera.add_raw_template(
-        "shell_init",
-        include_str!("../resources/shell_init.sh.tera"),
-    )
-    .expect("embedded shell_init template should parse");
-    let mut ctx = tera::Context::new();
-    ctx.insert("kv_root", kv_root);
-    ctx.insert("marker_start", MARKER_START);
-    ctx.insert("marker_end", MARKER_END);
-    tera.render("shell_init", &ctx)
-        .expect("shell_init template should render")
+    include_str!("../resources/shell_init.sh.tera")
+        .replace("{{ marker_start }}", MARKER_START)
+        .replace("{{ marker_end }}", MARKER_END)
+        .replace("{{ kv_root }}", kv_root)
         .trim()
         .to_string()
 }

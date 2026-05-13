@@ -3,7 +3,7 @@ title: "Install mvm on macOS"
 description: "mvm on macOS runs natively via microsandbox + libkrun on Hypervisor.framework — no Lima, no Docker Desktop. Apple Silicon (arm64) is the primary target; Intel Macs work too."
 ---
 
-mvm on macOS uses **microsandbox** as the backend — a libkrun wrapper that boots microVMs on Apple's Hypervisor.framework. There's no Lima VM in the loop, no Docker Desktop, no Apple Container detour. The choice is recorded in [ADR-013](/contributing/adr/013-microsandbox-pivot/) and ADR-031.
+mvm on macOS can use **microsandbox** as the backend — a libkrun wrapper that boots microVMs on Apple's Hypervisor.framework. Source builds keep this dependency-heavy backend behind the `backends-microsandbox` feature; release builds that include macOS microsandbox support are built with that feature enabled. The choice is recorded in [ADR-013](/contributing/adr/013-microsandbox-pivot/) and ADR-031.
 
 Apple Silicon (M-series) is the primary target. Intel Macs (x86_64) work but the upstream microsandbox path on Intel is less exercised — file an issue if anything misbehaves.
 
@@ -11,7 +11,7 @@ Apple Silicon (M-series) is the primary target. Intel Macs (x86_64) work but the
 
 - macOS 13 (Ventura) or newer. macOS 12 might work but isn't tested; macOS 11 lacks the Hypervisor.framework features microsandbox needs.
 
-You **do not need Nix on your Mac**. mvm bootstraps a small Linux builder microVM (microsandbox-backed) on first build, runs `nix build` inside it, and extracts the resulting rootfs back to the host. This is the zero-config default — no `nix-darwin`, no remote `nix-daemon`, no host-side configuration. See [§"Linux builds on macOS"](#linux-builds-on-macos--zero-config-by-default) below for the design.
+You **do not need Nix on your Mac** when using a build that includes `backends-microsandbox`. mvm bootstraps a small Linux builder microVM (microsandbox-backed) on first build, runs `nix build` inside it, and extracts the resulting rootfs back to the host. See [§"Linux builds on macOS"](#linux-builds-on-macos--zero-config-by-default) below for the design.
 
 ## Install mvmctl
 
@@ -33,6 +33,13 @@ MVM_VERSION=v0.13.0 curl -fsSL https://raw.githubusercontent.com/tinylabscom/mvm
 git clone https://github.com/tinylabscom/mvm.git
 cd mvm
 cargo build --release
+install -m 0755 target/release/mvmctl ~/.local/bin/mvmctl
+```
+
+To include the microsandbox/libkrun backend in a source build:
+
+```bash
+cargo build --release --features backends-microsandbox
 install -m 0755 target/release/mvmctl ~/.local/bin/mvmctl
 ```
 
@@ -88,7 +95,7 @@ mvmctl run
 
 **`mvmctl run` boots but `mvmctl console` fails to attach** — the `console` subcommand is only enabled for *accessible* images. If your `entrypoint.command = [ ... ]`, the build is *sealed* and console attach is rejected. Switch to `entrypoint.shell = "/bin/sh"` or pass `dev = true` in your `mkGuest` call. See [Building MicroVM Images](/guides/building-microvm-images).
 
-**"microsandbox: libkrunfw not found"** — microsandbox 0.4.5 vendors libkrunfw, so this should never happen on a normal `cargo install`. If you see it, check that your `mvmctl` binary wasn't compiled with `--no-default-features`; `microsandbox` is in the default feature set.
+**"microsandbox backend unavailable"** — source builds omit microsandbox unless built with `--features backends-microsandbox`. Rebuild with that feature if you need the libkrun-backed macOS path.
 
 ## Apple Silicon vs Intel notes
 

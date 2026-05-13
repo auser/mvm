@@ -24,7 +24,6 @@ microsandbox = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
-tera.workspace = true
 thiserror = "1"
 tokio.workspace = true
 toml.workspace = true
@@ -35,12 +34,8 @@ which = "6"
 tempfile.workspace = true
 
 [features]
-# `backends-microsandbox` is default-on so `cargo {build,test} -p mvm-build`
-# exercises `MicrosandboxBuilderVm`. The mvmctl facade, mvm-cli, and the mvm
-# crate all declare `default-features = false` on their mvm-build dep and
-# re-forward the feature, so library consumers (e.g. mvmd) can disable the
-# whole chain via `mvmctl { default-features = false }`.
-default = ["backends-microsandbox"]
+# Heavy microsandbox support is opt-in for lean default builds.
+default = []
 backends-microsandbox = ["dep:microsandbox"]
 
 [lints]

@@ -45,9 +45,8 @@ anyhow.workspace = true
 # which collides with library consumers that already link sqlite via a
 # different libsqlite3-sys version (notably mvmd-gateway's rusqlite per
 # its ADR-0003). Gating the dep on `backends-microsandbox` lets those
-# consumers do `default-features = false` on `mvmctl` and skip the
-# collision; the mvm binary keeps the backend by leaving the feature
-# default-on through the forwarding chain in mvm-cli + mvmctl.
+# consumers skip the collision in lean builds. The backend remains available
+# via `--features backends-microsandbox`.
 microsandbox = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -61,12 +60,8 @@ tracing.workspace = true
 mvm-build.workspace = true
 
 [features]
-# `backends-microsandbox` is default-on so `cargo {build,test} -p mvm-backend`
-# exercises the same code paths the mvmctl binary does. The mvmctl facade,
-# mvm-cli, and the mvm crate all declare `default-features = false` on their
-# mvm-backend dep and re-forward the feature, so library consumers (e.g. mvmd)
-# can disable the whole chain via `mvmctl { default-features = false }`.
-default = ["backends-microsandbox"]
+# Heavy microsandbox support is opt-in for lean default builds.
+default = []
 backends-microsandbox = ["dep:microsandbox"]
 
 [lints]

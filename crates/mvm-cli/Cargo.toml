@@ -44,10 +44,9 @@ serde_json.workspace = true
 sha2.workspace = true
 tar = "0.4"
 tempfile.workspace = true
-tera.workspace = true
 toml.workspace = true
-notify.workspace = true
-notify-debouncer-mini.workspace = true
+notify = { workspace = true, optional = true }
+notify-debouncer-mini = { workspace = true, optional = true }
 tokio = { workspace = true, features = ["rt"] }
 tracing.workspace = true
 tracing-subscriber.workspace = true
@@ -60,16 +59,19 @@ predicates.workspace = true
 rand.workspace = true
 
 [features]
-default = ["backends-microsandbox"]
+default = []
 backends-microsandbox = [
     "mvm/backends-microsandbox",
     "mvm-build/backends-microsandbox",
     "mvm-backend/backends-microsandbox",
 ]
+custom-dns = ["mvm-supervisor/custom-dns"]
+dev-watch = ["dep:notify", "dep:notify-debouncer-mini"]
 manifest-verify = [
     "mvm/manifest-verify",
     "mvm-security/manifest-verify",
 ]
+template-registry-s3 = ["mvm/template-registry-s3"]
 
 [lints]
 workspace = true

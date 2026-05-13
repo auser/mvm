@@ -251,11 +251,9 @@ pub enum AnyBackend {
     /// libkrun (plan 53 §"Plan E") — Linux KVM / macOS HVF, including
     /// macOS Intel where Apple Container is unavailable.
     Libkrun(LibkrunBackend),
-    /// microsandbox (plan 60 — ADR-013) — higher-level libkrun wrapper;
-    /// the cross-platform Phase 1 default for macOS/Windows. Linux still
-    /// prefers Firecracker when KVM is available. Gated on
-    /// `backends-microsandbox` (default-on for the mvmctl binary; library
-    /// consumers can opt out to avoid the sqlx-sqlite link conflict).
+    /// microsandbox (plan 60 — ADR-013) — higher-level libkrun wrapper.
+    /// Linux still prefers Firecracker when KVM is available. Gated on
+    /// `backends-microsandbox`, which lean default builds leave disabled.
     #[cfg(feature = "backends-microsandbox")]
     Microsandbox(MicrosandboxBackend),
     /// Cloud Hypervisor — rust-vmm peer of Firecracker at Tier 1. Adds
@@ -317,10 +315,9 @@ impl AnyBackend {
     /// Select the best backend for the current platform.
     ///
     /// Firecracker is the production target — it always wins when KVM
-    /// is available. When KVM isn't available (macOS host, Linux without
-    /// KVM, etc.), microsandbox is the cross-platform default per
-    /// ADR-013; the legacy fallbacks below it exist for the narrow
-    /// case where microsandbox itself is feature-gated out.
+    /// is available. When `backends-microsandbox` is enabled and KVM is
+    /// not available, microsandbox is the cross-platform Tier 2 choice.
+    /// Lean default builds skip it and continue down the fallback ladder.
     ///
     /// Priority:
     /// 1. **Firecracker** (if `/dev/kvm` available — production Tier 1)
@@ -344,7 +341,7 @@ impl AnyBackend {
             return Self::Firecracker(FirecrackerBackend);
         }
 
-        // 2. microsandbox — ADR-013 cross-platform default. Vendors
+        // 2. microsandbox — ADR-013 cross-platform backend. Vendors
         //    libkrunfw so works on macOS arm64/x86_64 + Linux no-KVM
         //    without a separate libkrun install. Sits above Apple
         //    Container in the ladder because plan 60 schedules
@@ -380,11 +377,9 @@ impl AnyBackend {
             return Self::Docker(DockerBackend);
         }
 
-        // Final default. Reachable only when has_microsandbox is
-        // feature-gated off AND no other tier is available; the
-        // start() call then fails with the production-path error
-        // message rather than silently picking a backend the
-        // caller didn't ask for.
+        // Final default. Reachable when no tier is available; start()
+        // then fails with the production-path error message rather than
+        // silently picking a backend the caller didn't ask for.
         Self::Firecracker(FirecrackerBackend)
     }
 

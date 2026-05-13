@@ -154,11 +154,11 @@ release VERSION:
 
 # Build optimized release binary
 release-build:
-    cargo build --release
+    cargo build --release --features backends-microsandbox,template-registry-s3,dev-watch,custom-dns,manifest-verify
 
 # Cross-compile release binary for a target
 release-build-target TARGET:
-    cargo build --release --target {{TARGET}}
+    cargo build --release --target {{TARGET}} --features backends-microsandbox,template-registry-s3,dev-watch,custom-dns,manifest-verify
 
 # Dry-run crates.io publish (all crates in dependency order)
 publish-dry-run:

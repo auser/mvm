@@ -13,7 +13,7 @@ Nix builder pipeline for producing Firecracker microVM images. Supports two buil
 | `firecracker` | Firecracker-specific build configuration generation |
 | `nix_manifest` | `NixManifest` parsing from `mvm-profiles.toml` |
 | `orchestrator` | Ephemeral builder VM lifecycle management |
-| `scripts` | Bash script templates (rendered via Tera) |
+| `scripts` | Bash script templates (small placeholder renderer) |
 | `template_reuse` | Template-based build optimization |
 | `vsock_builder` | Vsock-based communication with builder VMs |
 | `backend` | Storage backend implementations |

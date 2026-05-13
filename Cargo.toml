@@ -91,14 +91,8 @@ colored = "3"
 indicatif = "0.17"
 inquire = "0.7"
 
-# Template engine
-tera = "1"
-
 # Object storage abstraction (used for dev template registry)
 opendal = { version = "0.50", features = ["services-s3"] }
-
-# Allocator
-mimalloc = "0.1"
 
 # HTTP client (for CLI upgrade)
 reqwest = { version = "0.12", features = ["blocking", "json", "rustls-tls"], default-features = false }
@@ -115,7 +109,7 @@ libc = "0.2"
 # the service binary).
 seccompiler = "0.5"
 
-# File watching
+# File watching (dev-watch feature only)
 notify = "7"
 notify-debouncer-mini = "0.5"
 
@@ -125,10 +119,7 @@ notify-debouncer-mini = "0.5"
 # format the policy bundle TOML uses.
 ipnet = { version = "2", features = ["serde"] }
 
-# Pure-Rust DNS resolver — replaces the host's libc getaddrinfo (which
-# `TokioDnsResolver` calls into) when operators want allow-listed
-# resolvers, per-VM resolver configs, or DoT/DoH upstreams. Plan 60
-# Phase 3 Slice B.
+# Pure-Rust DNS resolver, used only by the opt-in custom-dns feature.
 hickory-resolver = "0.24"
 
 # Utilities
@@ -198,20 +189,15 @@ path = "src/main.rs"
 [dependencies]
 mvm-core.workspace = true
 mvm-security.workspace = true
-# `default-features = false` propagates the off-switch down to the leaf
-# crates that pull microsandbox. The `backends-microsandbox` feature on
-# this crate (default-on so the binary build is unchanged) re-activates
-# it through the forwarding chain. Library consumers (e.g. mvmd) do
-# `mvmctl = { path = "../mvm", default-features = false }` to skip the
-# microsandbox dep entirely and avoid its sqlx-sqlite pull-in, which
-# collides with rusqlite via `links = "sqlite3"`.
+# `default-features = false` keeps the heavy microsandbox stack out of the
+# lean default binary. Operators who need the libkrun/microsandbox path opt in
+# with `--features backends-microsandbox`.
 mvm = { workspace = true, default-features = false }
 mvm-backend = { workspace = true, default-features = false }
 mvm-build = { workspace = true, default-features = false }
 mvm-guest.workspace = true
 mvm-cli = { workspace = true, default-features = false }
 anyhow.workspace = true
-mimalloc.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3", features = ["NSRunLoop", "NSDate", "NSAutoreleasePool"] }
@@ -231,23 +217,24 @@ serde_json.workspace = true
 tempfile.workspace = true
 
 [features]
-# DRIFT-001 (Plan 31 Track A): `backends-microsandbox` controls whether
-# the upstream `microsandbox` crate is compiled into the chain. It pulls
-# sqlx-sqlite -> libsqlite3-sys (links = "sqlite3"), which collides with
-# library consumers that already link sqlite via a different version
-# (notably mvmd-gateway's rusqlite). Default-on keeps the mvmctl binary
-# unchanged; library consumers do `default-features = false` to opt out.
-default = ["backends-microsandbox"]
+# Keep the default production build lean. Heavy integrations remain opt-in.
+default = []
 backends-microsandbox = [
     "mvm/backends-microsandbox",
     "mvm-backend/backends-microsandbox",
     "mvm-build/backends-microsandbox",
     "mvm-cli/backends-microsandbox",
 ]
+custom-dns = ["mvm-cli/custom-dns"]
+dev-watch = ["mvm-cli/dev-watch"]
 manifest-verify = [
     "mvm/manifest-verify",
     "mvm-cli/manifest-verify",
     "mvm-security/manifest-verify",
+]
+template-registry-s3 = [
+    "mvm/template-registry-s3",
+    "mvm-cli/template-registry-s3",
 ]
 
 [profile.release]
