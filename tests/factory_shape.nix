@@ -1,8 +1,12 @@
-# Offline smoke test for plan 48: function-service factories on
-# `mvm.lib.<system>`. Asserts the factories evaluate and return the
-# `{ extraFiles, servicePackages, service }` triple that
-# `mvm/specs/contracts/...` (or mvmforge's binding contract at
-# `mvmforge/specs/contracts/mvm-mkfunctionservice.md`) requires.
+# Offline smoke test for the function-service factory contract.
+# Asserts that `mvm.lib.<system>.mkFunctionService` evaluates and
+# returns the `{ extraFiles, servicePackages, service }` triple that
+# `mkGuest`'s composition layer consumes.
+#
+# Originally written as plan-48 spec (one factory per language); now
+# exercises the unified `mkFunctionService` introduced by plan 60
+# Phase 5 Slice E1, parameterized by `language`. Adding a language to
+# the registry is verified by appending its name to `results` below.
 #
 # Run via:
 #
@@ -12,7 +16,7 @@
 #
 # Asserts (per language):
 #   1. `extraFiles` is an attrset containing `/etc/mvm/entrypoint` and
-#      a wrapper at `/usr/lib/mvm/wrappers/runner`.
+#      the wrapper at `/usr/lib/mvm/wrappers/runner`.
 #   2. `servicePackages` is a list.
 #   3. `service` is an attrset with at least `command` and `env`.
 
@@ -23,13 +27,14 @@ let
   pkgs = import flake.inputs.nixpkgs { inherit system; };
   lib = pkgs.lib;
   appPkg = pkgs.writeText "stub-app" "stub";
+  mkFunctionService = flake.lib.${system}.mkFunctionService;
 
-  testFactory =
-    name: factory:
+  testLanguage =
+    language:
     let
-      out = factory {
-        inherit pkgs appPkg;
-        workloadId = "test-${name}";
+      out = mkFunctionService {
+        inherit pkgs appPkg language;
+        workloadId = "test-${language}";
         module = "main";
         function = "handler";
         format = "json";
@@ -38,26 +43,23 @@ let
         out ? extraFiles
         && lib.isAttrs out.extraFiles
         && (out.extraFiles ? "/etc/mvm/entrypoint")
+        && (out.extraFiles ? "/usr/lib/mvm/wrappers/runner")
         && out ? servicePackages
         && lib.isList out.servicePackages
         && out ? service
         && lib.isAttrs out.service
-        && out.service ? command;
+        && out.service ? command
+        && out.service ? env;
     in
-    if ok then "${name}: ok" else "${name}: FAIL ${builtins.toJSON (builtins.attrNames out)}";
+    if ok then "${language}: ok" else "${language}: FAIL ${builtins.toJSON (builtins.attrNames out)}";
 
-  resultPython = testFactory "python" flake.lib.${system}.mkPythonFunctionService;
-  resultNode = testFactory "node" flake.lib.${system}.mkNodeFunctionService;
-  # Wasm factory has different inputs (module is a .wasm path, no
-  # appPkg in same shape) — skip in this smoke; cover separately.
-  results = [
-    resultPython
-    resultNode
-  ];
+  # Each language entry in the registry should evaluate via the
+  # unified factory. Adding a language is appending its name here.
+  results = map testLanguage [ "python" "node" ];
 
   allOk = builtins.all (r: lib.hasInfix ": ok" r) results;
 in
 if allOk then
-  "plan-48 factory_shape: 2/2 passed (${lib.concatStringsSep ", " results})"
+  "factory_shape: ${toString (builtins.length results)}/${toString (builtins.length results)} passed (${lib.concatStringsSep ", " results})"
 else
-  "plan-48 factory_shape: FAIL — ${lib.concatStringsSep "; " results}"
+  "factory_shape: FAIL — ${lib.concatStringsSep "; " results}"

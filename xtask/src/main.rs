@@ -5,6 +5,7 @@ mod build_dev_image;
 mod check_adr_coverage;
 mod check_audit_positional;
 mod check_no_display_on_secret_types;
+mod gen_stubs;
 mod perf;
 
 fn main() -> Result<()> {
@@ -31,8 +32,16 @@ fn main() -> Result<()> {
             let workspace = workspace_root();
             build_dev_image::run(&args[2..], &workspace)
         }
+        Some("gen-stubs") => {
+            let workspace = workspace_root();
+            gen_stubs::generate(&workspace)
+        }
+        Some("check-stubs") => {
+            let workspace = workspace_root();
+            gen_stubs::check(&workspace)
+        }
         Some(other) => anyhow::bail!(
-            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage, check-no-display-on-secret-types, check-audit-positional, perf, build-dev-image",
+            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage, check-no-display-on-secret-types, check-audit-positional, perf, build-dev-image, gen-stubs, check-stubs",
             other
         ),
         None => {
@@ -55,6 +64,12 @@ fn main() -> Result<()> {
             );
             eprintln!(
                 "  build-dev-image [--arch <arch>]         Build the dev VM image and drop it into nix/images/dev-prebuilt/<arch>/"
+            );
+            eprintln!(
+                "  gen-stubs                               Plan 60 Phase 5: regenerate schema/workload-ir-v0.json + Python/TS IR types from mvm-ir"
+            );
+            eprintln!(
+                "  check-stubs                             Plan 60 Phase 5: CI gate — fail if generated stubs are stale"
             );
             std::process::exit(1);
         }
