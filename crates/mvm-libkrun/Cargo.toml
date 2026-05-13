@@ -49,5 +49,26 @@ default = []
 # Linux contributors who don't run the Tier 2 backend).
 libkrun-sys = []
 
+[dev-dependencies]
+# The plan 57 W3 smoke example pulls `GUEST_AGENT_PORT` so the smoke
+# binary and the production vsock plumbing stay in sync on which port
+# the guest agent expects.
+mvm-guest.workspace = true
+# `ensure_signed()` is plan 57 W2's codesigning gate. macOS rejects
+# any process that calls `Hypervisor.framework` without
+# `com.apple.security.hypervisor`; the smoke binary self-signs on
+# first run and re-spawns, same as `mvmctl up --hypervisor
+# apple-container` does.
+mvm-providers.workspace = true
+
+# Plan 57 W3 — manual smoke binary that boots a Nix-built kernel +
+# ext4 rootfs via libkrun and blocks until the guest exits. Gated on
+# `libkrun-sys` so the example only compiles on hosts with libkrun.h
+# present.
+[[example]]
+name = "libkrun-smoke"
+path = "examples/libkrun-smoke.rs"
+required-features = ["libkrun-sys"]
+
 [lints]
 workspace = true
