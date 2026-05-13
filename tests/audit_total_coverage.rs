@@ -76,6 +76,9 @@ const MANIFEST_SUB: &[(&str, AuditPosture)] = &[
     ("verify", AuditPosture::ReadOnly),
     ("tag", AuditPosture::DelegatesToSub(MANIFEST_TAG)),
     ("alias", AuditPosture::DelegatesToSub(MANIFEST_ALIAS)),
+    // `manifest export-oci` copies a slot's image.tar.gz onto the
+    // host filesystem and emits `LocalAuditKind::ImageExportOci`.
+    ("export-oci", AuditPosture::Emits("ImageExportOci")),
 ];
 
 const STORAGE_SUB: &[(&str, AuditPosture)] = &[
@@ -417,6 +420,7 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
         "VmProcStdin",
         "BundleGc",
         "BundleInstall",
+        "ImageExportOci",
         "TrustAdd",
         "TrustRemove",
         "VmStart",

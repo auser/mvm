@@ -1524,6 +1524,52 @@ Outstanding (deferred follow-ups):
   posture section reads from `BackendSecurityProfile`; teaching
   it about runtime policy defaults is a small follow-on.
 
+### W4 — OCI export (reach to non-KVM hosts) ✅ shipped
+
+Sprint 52 follow-on item from the original ranking (`#4a` in the
+decision doc) — extends mvm-built workloads to hosts without KVM
+by exposing the OCI tarball Nix already produces internally.
+
+Shipped:
+
+- `template_build_from_manifest` now copies `image.tar.gz` into
+  the slot's revision dir (when the flake's `mkGuest` opted into
+  `dockerTools.streamLayeredImage`). Best-effort — flakes that
+  don't emit it just don't get one.
+- New `mvmctl manifest export-oci <TEMPLATE> --out <PATH>` verb.
+  Resolves a slot-hash / manifest-path / legacy name to the slot
+  dir, finds the OCI tarball alongside the rootfs, copies it to
+  `--out`. Clear error when the tarball is absent (with the
+  rebuild hint).
+- `LocalAuditKind::ImageExportOci` variant + snake_case wire pin
+  (`image_export_oci`) + all-variants serialize roundtrip.
+- AUDIT_POSTURE MANIFEST_SUB gains an `export-oci` row with
+  `Emits("ImageExportOci")`.
+- 2 new tests: resolve-to-slot-hash rejects unknown shas with a
+  hint, verb is registered in the CLI tree.
+
+End-to-end flow:
+
+```
+# Build the template on a KVM host
+mvmctl build <manifest>
+# Export to a Docker-loadable tarball
+mvmctl manifest export-oci <slot> --out ./mvm-workload.tar.gz
+# On any host with Docker / Podman
+docker load -i mvm-workload.tar.gz
+docker run mvm-...
+```
+
+Outstanding (deferred):
+
+- Bundle-source path: `mvmctl bundle export-oci <sha>` for
+  installed bundles, not just slot-built templates. Bundle
+  manifests don't currently carry the OCI tarball; adding it
+  would be a bundle-schema bump.
+- Direct `--push <registry>` for one-step deployment. The current
+  shape is "copy to a file, then docker push manually" — `--push`
+  would streamline.
+
 ### Sprint 52 success criteria
 
 1. *A workload with `mem_initial = "256M"` and `mem = "1024M"`
