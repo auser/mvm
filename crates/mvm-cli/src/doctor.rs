@@ -164,6 +164,7 @@ pub fn run(json: bool) -> Result<()> {
     checks.push(security_dev_image_check());
     checks.push(security_deny_config_check());
     checks.push(security_default_network_check());
+    checks.push(security_network_policy_default_check());
     checks.push(security_snapshot_key_check());
     checks.push(security_snapshot_dirs_check());
 
@@ -1099,6 +1100,38 @@ fn security_default_network_check() -> Check {
     }
 }
 
+/// ADR-002 claim 10: *no untrusted workload reaches the network unless
+/// explicitly admitted by policy.* Sprint 52 W3 flipped
+/// `NetworkPolicy::default()` from `unrestricted()` to `deny_all()` so
+/// the safe posture is the one workloads get without opting in. This
+/// check makes the runtime default visible in `mvmctl doctor` so the
+/// claim is observably enforced rather than implicit in the codepath.
+///
+/// Pure read of the policy default — no I/O, no platform branching.
+/// A future regression that flipped the default back to `unrestricted`
+/// would surface here loudly.
+fn security_network_policy_default_check() -> Check {
+    use mvm_core::policy::network_policy::NetworkPolicy;
+    let default = NetworkPolicy::default();
+    // `NetworkPolicy::deny_all()` constructs the canonical deny-all
+    // shape; equality against that is the load-bearing assertion.
+    // Comparing against the constructor rather than introspecting
+    // variants keeps this check resilient to future variant adds.
+    let is_deny_all = default == NetworkPolicy::deny_all();
+    Check {
+        name: "network policy default (claim 10)",
+        category: "security",
+        ok: is_deny_all,
+        info: if is_deny_all {
+            "deny_all (claim 10 holds — egress refused unless explicitly admitted)".to_string()
+        } else {
+            "unrestricted — claim 10 does NOT hold; ADR-002 §10 regression. \
+             Workloads boot with open egress unless --network-preset is set explicitly."
+                .to_string()
+        },
+    }
+}
+
 /// `~/.mvm/snapshot.key` should be mode 0600 (ADR-007 §W4 / M9).
 ///
 /// Absence is informational — the file is created lazily on first
@@ -1532,6 +1565,28 @@ mod tests {
         assert!(
             c.info.contains("0700"),
             "info should report the data dir's mode, got: {}",
+            c.info
+        );
+    }
+
+    #[test]
+    fn security_network_policy_default_check_reports_claim_10_holding() {
+        // Sprint 52 W3 invariant: `NetworkPolicy::default()` returns
+        // `deny_all`. If a future regression flips it back to
+        // `unrestricted`, this check fails loudly in doctor — pinning
+        // claim 10 against silent drift.
+        let c = security_network_policy_default_check();
+        assert_eq!(c.category, "security");
+        assert!(c.ok, "claim 10 must hold; doctor saw: {}", c.info);
+        assert!(
+            c.info.contains("deny_all"),
+            "info should call out deny_all; got: {}",
+            c.info
+        );
+        assert!(
+            c.info.contains("claim 10 holds"),
+            "info should name claim 10 so operators searching the doctor \
+             output for the claim find it; got: {}",
             c.info
         );
     }
