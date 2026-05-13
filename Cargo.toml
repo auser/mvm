@@ -220,6 +220,15 @@ mvm-guest.workspace = true
 mvm-cli = { workspace = true, default-features = false }
 anyhow.workspace = true
 
+# Plan 57 W3 — example-only deps for `cargo run --example libkrun-smoke`.
+# `mvm-libkrun` is optional so the default workspace build does not link
+# libkrun; flip the root `libkrun-sys` feature (declared below) to pull
+# in the FFI. `mvm-providers` is optional too; the smoke example calls
+# its `ensure_signed()` to attach the macOS hypervisor entitlement
+# before invoking libkrun.
+mvm-libkrun = { workspace = true, optional = true }
+mvm-providers = { workspace = true, optional = true }
+
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3", features = ["NSRunLoop", "NSDate", "NSAutoreleasePool"] }
 
@@ -253,6 +262,11 @@ backends-microsandbox = [
     "mvm-build/backends-microsandbox",
     "mvm-cli/backends-microsandbox",
 ]
+# Plan 57 W3 — enables the libkrun FFI bindings + link, required to run
+# `cargo run --example libkrun-smoke`. Activating the feature also pulls
+# in the optional `mvm-providers` dependency so the smoke example can
+# call `ensure_signed()` for the macOS hypervisor entitlement.
+libkrun-sys = ["dep:mvm-libkrun", "mvm-libkrun/libkrun-sys", "dep:mvm-providers"]
 custom-dns = ["mvm-cli/custom-dns"]
 dev-watch = ["mvm-cli/dev-watch"]
 manifest-verify = [
@@ -270,3 +284,10 @@ opt-level = 3
 strip = true
 lto = true
 codegen-units = 1
+
+# Plan 57 W3 — libkrun smoke test. Gated by the `libkrun-sys` feature
+# so `cargo build --workspace` on hosts without libkrun keeps working.
+[[example]]
+name = "libkrun-smoke"
+path = "examples/libkrun-smoke.rs"
+required-features = ["libkrun-sys"]

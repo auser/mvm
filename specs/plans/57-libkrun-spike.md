@@ -67,14 +67,84 @@ Goal: `mvmctl` + libkrun + `Hypervisor.framework` boot a guest without the macOS
 
 Goal: prove a real Nix-built kernel + ext4 rootfs boots in libkrun on macOS Apple Silicon and the guest agent comes up on vsock.
 
-- **W3.1** Pick the validation flake. `examples/minimal` is the canonical "smallest-thing-that-boots" target across mvm. Build it: `mvmctl build --flake examples/minimal`. Outputs are `vmlinux`, `rootfs.ext4`, and possibly `initrd`.
-- **W3.2** Construct a `KrunContext` pointing at those artifacts and invoke `mvm_libkrun::start()` directly (bypass the `LibkrunBackend` for the spike — the backend's job is to plumb config, not validate boot). Run from a unit test or a small `examples/libkrun-smoke.rs` binary.
-- **W3.3** Confirm the guest agent's vsock listener responds. Use `mvm_guest::vsock::GUEST_AGENT_PORT` and the existing health-check protocol that Firecracker / Apple Container already use.
-- **W3.4** **Risks to validate explicitly**:
-  - **Kernel cmdline.** Firecracker boots with `console=ttyS0`; libkrun expects `console=hvc0` (virtio-console). Likely fix: pass a libkrun-specific cmdline via `KrunContext.kernel_cmdline`. The Nix build may need a `mkGuest` `cmdlineFor = "libkrun" | "firecracker"` parameter, or just override at runtime via the existing cmdline plumbing in `VmStartConfig`.
-  - **Console device.** No serial → console output may not appear. Confirm libkrun routes hvc0 to stdout in the calling process, or wire it through a host-side log file.
-  - **vsock device naming.** Firecracker uses `/dev/vhost-vsock`; libkrun's macOS path uses an internal abstraction. Confirm the guest sees vsock on cid 3 (standard guest CID) and the agent's listening port matches.
-  - **Verified boot (claim 3) is out of scope for the spike.** The Nix flake's `verifiedBoot = false` exemption (the dev VM path) covers this. Plan 25 §W3 follow-up promotes claim 3 from "DoesNotHold" to "Holds" for libkrun once dm-verity is wired through.
+- **W3.1** Author a smallest-thing-that-boots flake at
+  `examples/minimal/flake.nix`. The dev-image flake under
+  `nix/images/builder/` is unusable here: its closure (rustc + ~480
+  cargo crates baked into the guest agent) overflows microsandbox's
+  4 GiB overlay during evaluation, so the build never completes.
+  The minimal flake instead pairs `pkgs.linuxPackages.kernel` with a
+  hand-rolled ext4 staging — `pkgs.runCommand` + `mke2fs -d` over a
+  directory containing `pkgs.pkgsStatic.busybox` and a single static
+  C binary (`vsock_ok.c`) compiled via `pkgs.pkgsStatic.stdenv`.
+  `/init` mounts `/proc /sys /dev`, runs `vsock_ok` (which connects
+  vsock `CID_HOST:1234` and writes `"ok\n"`), then powers off via
+  `/proc/sysrq-trigger`.
+- **W3.2** Author `examples/libkrun-smoke.rs` at the workspace root,
+  gated by a new `libkrun-sys` feature on the root package. The
+  example handles libkrun's process-ownership semantics
+  (`krun_start_enter` `exit()`s the calling process on success) via
+  spawn-self: the parent binds a Unix listener at
+  `$TMPDIR/mvm-libkrun-smoke.sock`, spawns itself with
+  `MVM_LIBKRUN_SMOKE_CHILD=1`, the child calls `mvm_libkrun::boot`,
+  and the parent reads `"ok\n"` off the vsock bridge before reaping
+  the child.
+- **W3.3** Wire `ensure_signed()`: the example calls
+  `mvm_providers::apple_container::ensure_signed` before any libkrun
+  call so the macOS `com.apple.security.hypervisor` entitlement (PR
+  #151) is applied and inherited by the spawned child. We did not
+  embed the call inside `mvm_libkrun::start`/`boot` because
+  `mvm-libkrun` sits one layer below `mvm-providers` in the
+  dependency graph — having libkrun depend on providers would
+  invert the layering. The example wiring is the "less invasive"
+  option named in the W3 spec.
+- **W3.4** `mvm_libkrun::boot(&ctx) -> Result<Infallible, Error>`
+  lands as the real-boot entry point alongside the example: it
+  configures the context via the existing `sys::Context` wrappers
+  then calls `krun_start_enter`. The `Infallible` Ok arm encodes
+  the process-suicide semantics — only `Err` is reachable
+  (configuration rejected before the VMM loop). `KrunContext`
+  grew a `VsockListener { guest_port, host_socket }` shape and a
+  `with_kernel_cmdline` builder; `add_vsock_port(port)` rotated
+  into `add_vsock_listener(port, host_socket)` because
+  `krun_add_vsock_port` requires the caller to name the host-side
+  Unix socket (the host process must be `bind`-listening on it
+  *before* the guest boots). `mvm-backend`'s `LibkrunBackend`
+  updated in lockstep — it generates a per-VM tmpdir socket path
+  until W4 lands the `~/.mvm/vms/<name>/` registry.
+- **W3.5** Build path: `cargo xtask build-libkrun-smoke-image`
+  drives the minimal flake through the existing microsandbox
+  builder (`MicrosandboxBuilderVm`) and drops `vmlinux + rootfs.ext4`
+  at `examples/minimal/result/` — the same path `nix build`
+  creates via symlink, so the smoke example's default discovery
+  works for either build path. On a Linux host with Nix installed,
+  `(cd examples/minimal && nix build .#default)` is the supported
+  alternative. Host Nix on macOS is explicitly NOT required
+  (CLAUDE.md invariant); the xtask is the macOS path.
+- **W3.6** **Risks to validate explicitly**:
+  - **Kernel cmdline.** Firecracker boots with `console=ttyS0`;
+    libkrun's implicit console is virtio-console (hvc0). The example
+    pins `console=hvc0 root=/dev/vda rw panic=1 loglevel=4` via
+    `KrunContext::with_kernel_cmdline`. If the kernel logs end up
+    invisible on the host, swap to `krun_set_console_output` (a
+    file) or `krun_add_virtio_console_default` (explicit fd) — both
+    already wrapped in `sys::Context`.
+  - **Console device.** No serial → console output may not appear.
+    libkrun's stdout is the implicit virtio-console; confirm it
+    routes to the child process's stdout/stderr. If not, wire
+    `krun_set_console_output` at `examples/minimal/result/console.log`
+    or similar.
+  - **vsock device naming.** Firecracker uses `/dev/vhost-vsock`;
+    libkrun's macOS path uses an internal abstraction. The host-side
+    `krun_add_vsock_port(1234, <socket>)` bridges to the guest's
+    `AF_VSOCK` listener on the standard guest CID. The
+    `examples/minimal` `vsock_ok.c` targets `VMADDR_CID_HOST` (CID 2),
+    which is what libkrun routes the bridge to. If the connect fails
+    inside the guest, capture `dmesg` to confirm `vsock` and
+    `vmw_vsock_virtio_transport` are present.
+  - **Verified boot (claim 3) is out of scope for the spike.** The
+    minimal flake does not produce dm-verity sidecars; Plan 25 §W6.4
+    promotes claim 3 to "Holds" for libkrun once verity wires
+    through `KrunContext`.
 
 ### W4 — State tracking decision (1–2 days)
 

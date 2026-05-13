@@ -2,6 +2,7 @@ use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
 mod build_dev_image;
+mod build_libkrun_smoke_image;
 mod check_adr_coverage;
 mod check_audit_positional;
 mod check_no_display_on_secret_types;
@@ -32,6 +33,10 @@ fn main() -> Result<()> {
             let workspace = workspace_root();
             build_dev_image::run(&args[2..], &workspace)
         }
+        Some("build-libkrun-smoke-image") => {
+            let workspace = workspace_root();
+            build_libkrun_smoke_image::run(&args[2..], &workspace)
+        }
         Some("gen-stubs") => {
             let workspace = workspace_root();
             gen_stubs::generate(&workspace)
@@ -41,7 +46,7 @@ fn main() -> Result<()> {
             gen_stubs::check(&workspace)
         }
         Some(other) => anyhow::bail!(
-            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage, check-no-display-on-secret-types, check-audit-positional, perf, build-dev-image, gen-stubs, check-stubs",
+            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage, check-no-display-on-secret-types, check-audit-positional, perf, build-dev-image, build-libkrun-smoke-image, gen-stubs, check-stubs",
             other
         ),
         None => {
@@ -64,6 +69,9 @@ fn main() -> Result<()> {
             );
             eprintln!(
                 "  build-dev-image [--arch <arch>]         Build the dev VM image and drop it into nix/images/dev-prebuilt/<arch>/"
+            );
+            eprintln!(
+                "  build-libkrun-smoke-image [--arch <arch>]  Plan 57 W3: build examples/minimal flake into examples/minimal/result/"
             );
             eprintln!(
                 "  gen-stubs                               Plan 60 Phase 5: regenerate schema/workload-ir-v0.json + Python/TS IR types from mvm-ir"

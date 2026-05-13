@@ -62,12 +62,23 @@ impl VmBackend for LibkrunBackend {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("libkrun backend requires a kernel path"))?;
 
+        let agent_port = mvm_guest::vsock::GUEST_AGENT_PORT;
+        // Per-VM scratch socket path. The W4 registry (plan 57) replaces
+        // this with `~/.mvm/vms/<name>/libkrun.vsock-<port>.sock` so
+        // mvmctl can find live sockets after a restart; for now the
+        // backend just owns a stable tmpdir path matching the W1
+        // convention so `mvmctl console` and the host-side proxy can
+        // dial it deterministically.
+        let agent_socket = std::env::temp_dir().join(format!(
+            "mvm-libkrun-{}-vsock-{}.sock",
+            config.name, agent_port
+        ));
         let ctx = mvm_libkrun::KrunContext::new(&config.name, kernel, &config.rootfs_path)
             .with_resources(
                 u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX),
                 config.memory_mib,
             )
-            .add_vsock_port(mvm_guest::vsock::GUEST_AGENT_PORT);
+            .add_vsock_listener(agent_port, agent_socket);
 
         // W6.2.1: thread the build-time sidecar into per-VM runtime
         // metadata so `mvmctl console` enforces the accessible/sealed

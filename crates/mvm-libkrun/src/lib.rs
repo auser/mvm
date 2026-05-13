@@ -20,7 +20,7 @@
 //! narrowly focused on the FFI; backend dispatch and lifecycle live in
 //! `mvm-backend` and `mvm-cli`.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 #[cfg(feature = "libkrun-sys")]
 mod sys;
@@ -146,9 +146,9 @@ pub fn install_paths() -> Vec<&'static str> {
 
 /// Configuration for a libkrun guest VM.
 ///
-/// Pure data — no I/O until [`start`] consumes it. Field shape is
-/// stable across the W1 → W3 transition; the FFI calls that consume
-/// each field live in [`sys`] under the `libkrun-sys` feature.
+/// Pure data — no I/O until [`start`] or [`boot`] consumes it. The
+/// FFI calls that translate each field into a libkrun configuration
+/// context live in [`sys`] under the `libkrun-sys` feature.
 #[derive(Debug, Clone)]
 pub struct KrunContext {
     pub name: String,
@@ -156,13 +156,34 @@ pub struct KrunContext {
     pub rootfs_path: String,
     pub vcpus: u8,
     pub ram_mib: u32,
+    /// Override the kernel command line. When `None`, libkrun chooses
+    /// its own default (which has `console=hvc0` baked in for the
+    /// virtio-console path it ships). Plan 57 W3 risks call out that
+    /// the cmdline is the most likely source of "VM boots but produces
+    /// no output" failures — set it explicitly when validating.
     pub kernel_cmdline: Option<String>,
-    pub vsock_ports: Vec<u32>,
+    /// Guest-port → host-Unix-socket mappings. For each entry,
+    /// libkrun bridges the guest's `AF_VSOCK` port `guest_port` to
+    /// the named host Unix socket. The host process is responsible
+    /// for `bind`/`listen` on `host_socket` *before* the guest boots,
+    /// because libkrun connects the bridge eagerly during startup.
+    pub vsock_listeners: Vec<VsockListener>,
+}
+
+/// One vsock port mapping. Built into [`KrunContext`] via
+/// [`KrunContext::add_vsock_listener`]. The `host_socket` path is
+/// owned by the caller — libkrun does not create it, it expects an
+/// already-bound listener.
+#[derive(Debug, Clone)]
+pub struct VsockListener {
+    pub guest_port: u32,
+    pub host_socket: PathBuf,
 }
 
 impl KrunContext {
     /// Construct a context for a guest. No I/O — this is pure
-    /// configuration. The actual VM creation happens in [`start`].
+    /// configuration. The actual VM creation happens in [`start`]
+    /// or [`boot`].
     pub fn new(
         name: impl Into<String>,
         kernel_path: impl Into<String>,
@@ -175,7 +196,7 @@ impl KrunContext {
             vcpus: 1,
             ram_mib: 256,
             kernel_cmdline: None,
-            vsock_ports: Vec::new(),
+            vsock_listeners: Vec::new(),
         }
     }
 
@@ -186,24 +207,34 @@ impl KrunContext {
         self
     }
 
-    /// Append a vsock port the guest agent will listen on.
-    pub fn add_vsock_port(mut self, port: u32) -> Self {
-        self.vsock_ports.push(port);
+    /// Replace the kernel command line. Pass `None` to clear an
+    /// override and fall back to libkrun's built-in default.
+    pub fn with_kernel_cmdline(mut self, cmdline: impl Into<String>) -> Self {
+        self.kernel_cmdline = Some(cmdline.into());
+        self
+    }
+
+    /// Append a vsock listener mapping. `host_socket` must point at a
+    /// Unix socket path that the host process binds and listens on
+    /// before the guest boots — see [`VsockListener`].
+    pub fn add_vsock_listener(mut self, guest_port: u32, host_socket: impl Into<PathBuf>) -> Self {
+        self.vsock_listeners.push(VsockListener {
+            guest_port,
+            host_socket: host_socket.into(),
+        });
         self
     }
 }
 
-/// Start a libkrun guest from `ctx`.
+/// Configure a libkrun guest from `ctx` without starting it.
 ///
-/// **Plan 57 W1 scope.** With the `libkrun-sys` feature enabled, this
-/// allocates a libkrun configuration context, applies CPU/memory,
-/// kernel, rootfs, and vsock-port configuration through the FFI, then
-/// frees the context and returns `Ok(())`. It does **not** call
-/// `krun_start_enter` (which blocks until the guest exits) — the
-/// blocking-thread lifecycle and state-tracking work is W3 + W4 of
-/// plan 57. Today the call exists so consumers can exercise the
-/// wrapper end-to-end on a host with libkrun installed; the W3 PR
-/// upgrades it to actually boot.
+/// With the `libkrun-sys` feature enabled, this allocates a libkrun
+/// configuration context, applies CPU/memory, kernel, rootfs, and
+/// vsock listener configuration through the FFI, then frees the
+/// context and returns `Ok(())`. It does **not** call
+/// `krun_start_enter` — use [`boot`] for that. This entry point
+/// exists to exercise the configuration calls in isolation (e.g.
+/// "does the kernel exist and parse?" without actually running it).
 ///
 /// Without the feature, returns [`Error::NotYetWired`].
 pub fn start(ctx: &KrunContext) -> Result<(), Error> {
@@ -221,34 +252,70 @@ pub fn start(ctx: &KrunContext) -> Result<(), Error> {
     }
     #[cfg(feature = "libkrun-sys")]
     {
-        start_via_ffi(ctx)
+        let _ = configure(ctx)?;
+        Ok(())
+    }
+}
+
+/// Configure libkrun from `ctx` and call `krun_start_enter`.
+///
+/// libkrun documents `krun_start_enter` as never returning on
+/// success: the VMM assumes full control of the process and `exit`s
+/// with the guest's exit code once the microVM shuts down. The
+/// return type here reflects that — `Result<Infallible, Error>` —
+/// so the `Ok` arm is uninhabited and the only observable return is
+/// a configuration error from `krun_start_enter` itself
+/// ([`Error::Krun`]).
+///
+/// This is the entry point [`examples/libkrun-smoke.rs`] uses; it
+/// is intentionally a "give libkrun the whole process" function.
+/// Embedding it inside a long-lived `mvmctl` is the W4 + plan 72
+/// scope (subprocess supervision / launchd daemon).
+///
+/// Without the `libkrun-sys` feature, returns [`Error::NotYetWired`].
+pub fn boot(ctx: &KrunContext) -> Result<std::convert::Infallible, Error> {
+    if !is_available() {
+        return Err(Error::NotInstalled {
+            install_hint: install_hint(),
+        });
+    }
+    #[cfg(not(feature = "libkrun-sys"))]
+    {
+        let _ = ctx;
+        Err(Error::NotYetWired {
+            tracking: "specs/plans/57-libkrun-spike.md W3+W4",
+        })
+    }
+    #[cfg(feature = "libkrun-sys")]
+    {
+        let krun = configure(ctx)?;
+        // `start_enter` returns only on configuration error; on
+        // success the VMM `exit()`s the process directly.
+        krun.start_enter()
     }
 }
 
 #[cfg(feature = "libkrun-sys")]
-fn start_via_ffi(ctx: &KrunContext) -> Result<(), Error> {
+fn configure(ctx: &KrunContext) -> Result<sys::Context, Error> {
     let krun = sys::Context::new()?;
     krun.set_vm_config(ctx.vcpus, ctx.ram_mib)?;
+    // Most Nix-built kernels we test against are raw ARM64 `Image` /
+    // x86_64 `bzImage` files, both of which libkrun accepts as
+    // `KRUN_KERNEL_FORMAT_RAW`. Consumers that ship an ELF vmlinux
+    // (e.g. dev builds with `CONFIG_RELOCATABLE=y`) should swap to
+    // `KernelFormat::Elf` via a follow-up KrunContext field — out of
+    // scope for the Plan 57 W3 smoke validation.
     krun.set_kernel(
         Path::new(&ctx.kernel_path),
-        sys::KernelFormat::Elf,
+        sys::KernelFormat::Raw,
         None,
         ctx.kernel_cmdline.as_deref(),
     )?;
     krun.add_disk("root", Path::new(&ctx.rootfs_path), false)?;
-    for &port in &ctx.vsock_ports {
-        // libkrun's `krun_add_vsock_port` requires a host-side Unix
-        // socket path. The full backend wiring (which generates that
-        // path under ~/.mvm/vms/<name>/) lands in W3 alongside the
-        // boot validation. For W1 the FFI exercise stops short of
-        // booting, so a stub path is sufficient to confirm the wrapper
-        // accepts the call.
-        let socket = format!("/tmp/mvm-libkrun-{}-vsock-{port}.sock", ctx.name);
-        krun.add_vsock_port(port, Path::new(&socket))?;
+    for listener in &ctx.vsock_listeners {
+        krun.add_vsock_port(listener.guest_port, &listener.host_socket)?;
     }
-    // `krun_start_enter` deliberately not invoked — that's W3 + W4.
-    // Dropping the context here frees it cleanly through `Context::Drop`.
-    Ok(())
+    Ok(krun)
 }
 
 /// Stop a running libkrun guest by name.
@@ -294,11 +361,21 @@ mod tests {
     fn krun_context_builds_without_io() {
         let ctx = KrunContext::new("vm-1", "/path/vmlinux", "/path/rootfs.ext4")
             .with_resources(2, 512)
-            .add_vsock_port(5252);
+            .with_kernel_cmdline("console=hvc0 root=/dev/vda rw")
+            .add_vsock_listener(5252, "/tmp/mvm-libkrun-vm-1.sock");
         assert_eq!(ctx.name, "vm-1");
         assert_eq!(ctx.vcpus, 2);
         assert_eq!(ctx.ram_mib, 512);
-        assert_eq!(ctx.vsock_ports, vec![5252]);
+        assert_eq!(
+            ctx.kernel_cmdline.as_deref(),
+            Some("console=hvc0 root=/dev/vda rw")
+        );
+        assert_eq!(ctx.vsock_listeners.len(), 1);
+        assert_eq!(ctx.vsock_listeners[0].guest_port, 5252);
+        assert_eq!(
+            ctx.vsock_listeners[0].host_socket,
+            Path::new("/tmp/mvm-libkrun-vm-1.sock")
+        );
     }
 
     #[test]
