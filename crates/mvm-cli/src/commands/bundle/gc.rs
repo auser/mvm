@@ -118,11 +118,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         }
         s
     };
-    mvm_core::audit::emit(
-        mvm_core::audit::LocalAuditKind::BundleGc,
-        None,
-        Some(&detail),
-    );
+    mvm_core::audit_emit!(BundleGc, "{detail}");
 
     println!("Removed {} bundle(s).", removed.len());
     for sha in &removed {
