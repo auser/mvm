@@ -14,6 +14,7 @@ use mvm_core::user_config::MvmConfig;
 use super::Cli;
 
 mod alias;
+mod export_oci;
 mod info;
 mod ls;
 mod prune;
@@ -49,6 +50,11 @@ pub(in crate::commands) enum ManifestAction {
     /// Manage movable `alias → revision_hash` pointers (`set`, `rm`, `ls`).
     /// `mvmctl up --manifest <template>@<alias>` resolves through here.
     Alias(alias::Args),
+    /// Export a slot's OCI tarball (`image.tar.gz`) so a non-KVM
+    /// host can `docker load` the workload. Requires the flake's
+    /// `mkGuest` to opt into `dockerTools.streamLayeredImage`.
+    #[command(name = "export-oci")]
+    ExportOci(export_oci::Args),
 }
 
 pub(in crate::commands) fn run(cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
@@ -60,5 +66,6 @@ pub(in crate::commands) fn run(cli: &Cli, args: Args, cfg: &MvmConfig) -> Result
         ManifestAction::Verify(a) => verify::run(cli, a, cfg),
         ManifestAction::Tag(a) => tag::run(cli, a, cfg),
         ManifestAction::Alias(a) => alias::run(cli, a, cfg),
+        ManifestAction::ExportOci(a) => export_oci::run(cli, a, cfg),
     }
 }

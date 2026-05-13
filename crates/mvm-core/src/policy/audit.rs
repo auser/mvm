@@ -212,6 +212,12 @@ pub enum LocalAuditKind {
     /// Detail: `removed=<count>,shas=<sha1>[,sha2,...]` (truncated
     /// to the first ~5 shas for sweeps).
     BundleGc,
+    /// `mvmctl manifest export-oci <template> --out <path>` —
+    /// copied a slot's OCI tarball (produced by `mkGuest`'s
+    /// `dockerTools.streamLayeredImage`) to a user-supplied path
+    /// so a non-KVM host can `docker load` it. Detail:
+    /// `template=<slot>,revision=<rev>,bytes=<size>`.
+    ImageExportOci,
     // --- Plan 47: dm-thin storage pool ops ---
     /// `mvmctl storage gc` removed one or more orphaned thin volumes
     /// from the pool. Detail carries the removed volume names (or a
@@ -664,6 +670,8 @@ mod tests {
             // Sprint 52 W2 bundle registry mutations.
             LocalAuditKind::BundleInstall,
             LocalAuditKind::BundleGc,
+            // OCI export follow-on.
+            LocalAuditKind::ImageExportOci,
         ];
         for kind in kinds {
             let json = serde_json::to_string(&kind).unwrap();
@@ -699,6 +707,8 @@ mod tests {
             // Sprint 52 W2 bundle registry mutations.
             (LocalAuditKind::BundleInstall, "bundle_install"),
             (LocalAuditKind::BundleGc, "bundle_gc"),
+            // OCI export follow-on.
+            (LocalAuditKind::ImageExportOci, "image_export_oci"),
         ];
         for (kind, expected) in kinds_and_strings {
             let json = serde_json::to_string(&kind).unwrap();

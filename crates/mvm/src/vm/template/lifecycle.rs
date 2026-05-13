@@ -739,6 +739,19 @@ pub fn template_build_from_manifest(
         result.rootfs_path
     ))?;
 
+    // Copy the OCI image tarball (if the flake's `mkGuest` emits one
+    // via `dockerTools.streamLayeredImage`). When present, this is
+    // what `mvmctl manifest export-oci <template>` returns so users
+    // can `docker load` the mvm-built workload on a non-KVM host.
+    // Best-effort: the copy is gated on the artifact existing in the
+    // dev-build dir; flakes that don't emit `image.tar.gz` just don't
+    // get one in the slot, and `export-oci` errors with a clear
+    // "rebuild with the OCI output enabled" message.
+    let oci_src = format!("{}/image.tar.gz", result.build_dir);
+    shell::run_in_vm(&format!(
+        "if [ -e {oci_src} ]; then cp -a {oci_src} {rev_dst}/image.tar.gz; fi"
+    ))?;
+
     // Generate a minimal fc-base.json for reference. Same logic as
     // template_build: minimal guests (no initrd) need root= and init=
     // on the kernel cmdline; initrd-bearing guests rely on the initrd's
