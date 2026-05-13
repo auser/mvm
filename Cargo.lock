@@ -4114,6 +4114,7 @@ dependencies = [
  "mvm-build",
  "mvm-core",
  "mvm-guest",
+ "mvm-libkrun",
  "mvm-providers",
  "serde",
  "serde_json",
@@ -4186,6 +4187,7 @@ dependencies = [
  "mvm-build",
  "mvm-core",
  "mvm-guest",
+ "mvm-libkrun",
  "mvm-mcp",
  "mvm-plan",
  "mvm-policy",
@@ -4220,6 +4222,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "fs2",
+ "mvm-libkrun",
  "mvm-providers",
  "regex",
  "serde",
@@ -4262,6 +4265,15 @@ dependencies = [
  "serde",
  "serde_json",
  "sha2 0.10.9",
+]
+
+[[package]]
+name = "mvm-libkrun"
+version = "0.14.0"
+dependencies = [
+ "bindgen",
+ "libc",
+ "tracing",
 ]
 
 [[package]]

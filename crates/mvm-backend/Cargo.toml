@@ -39,6 +39,7 @@ mvm-core.workspace = true
 mvm-guest.workspace = true
 mvm-base.workspace = true
 mvm-providers.workspace = true
+mvm-libkrun.workspace = true
 
 anyhow.workspace = true
 # microsandbox pulls sqlx-sqlite -> libsqlite3-sys (links = "sqlite3"),

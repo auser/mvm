@@ -126,7 +126,7 @@ pub fn hint_libkrun_if_useful() {
     if plat.has_kvm() || plat.is_windows() {
         return;
     }
-    if mvm_providers::libkrun::is_available() {
+    if mvm_libkrun::is_available() {
         ui::info(
             "Detected libkrun on this host; you can opt in with `mvmctl run --hypervisor libkrun`.",
         );
@@ -138,7 +138,7 @@ pub fn hint_libkrun_if_useful() {
     if matches!(plat, Platform::MacOS) && !plat.has_apple_containers() {
         ui::info(&format!(
             "Tip: install libkrun for a no-Lima Tier 2 microVM path on this Mac.\n  {}",
-            mvm_providers::libkrun::install_hint()
+            mvm_libkrun::install_hint()
         ));
     }
 }

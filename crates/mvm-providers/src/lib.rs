@@ -1,10 +1,13 @@
 //! mvm-providers — virtualization-framework primitives.
 //!
-//! Internal FFI / SDK shim layer. Each module wraps one underlying
-//! virtualization framework:
+//! Internal FFI / SDK shim layer for the Apple Virtualization.framework
+//! integration:
 //!
-//!   - [`libkrun`]         — Red Hat libkrun C library (Linux KVM, macOS HVF)
 //!   - [`apple_container`] — Apple Virtualization.framework (macOS only)
+//!
+//! libkrun FFI lives in its sibling crate `mvm-libkrun` (split out by
+//! plan 57 W1 so the `bindgen` + `libclang` build cost stays out of
+//! consumers that don't link libkrun).
 //!
 //! [`mvm-backend`](https://docs.rs/mvm-backend) consumes these modules
 //! to implement the `VmBackend` trait. End-user code should never
@@ -18,8 +21,6 @@
 //! but address different layers: this crate is *internal FFI*; ADR-012
 //! talks about *user-selectable execution targets*. The disambiguation
 //! note in ADR-012 carries the full story.
-
-pub mod libkrun;
 
 // `apple_container` is unconditionally exposed; the module itself uses
 // `#[cfg(target_os = "macos")]` to gate the Virtualization.framework
