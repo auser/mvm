@@ -244,6 +244,11 @@ backends-microsandbox = [
     "mvm-build/backends-microsandbox",
     "mvm-cli/backends-microsandbox",
 ]
+manifest-verify = [
+    "mvm/manifest-verify",
+    "mvm-cli/manifest-verify",
+    "mvm-security/manifest-verify",
+]
 
 [profile.release]
 opt-level = 3

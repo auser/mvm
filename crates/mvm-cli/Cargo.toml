@@ -66,6 +66,10 @@ backends-microsandbox = [
     "mvm-build/backends-microsandbox",
     "mvm-backend/backends-microsandbox",
 ]
+manifest-verify = [
+    "mvm/manifest-verify",
+    "mvm-security/manifest-verify",
+]
 
 [lints]
 workspace = true
