@@ -45,10 +45,10 @@
 //!   with `"action":"put"` / `"get"` / `"list"` / `"delete"`. The
 //!   CLI verb and on-disk action name are decoupled — `ls` →
 //!   `"list"`, `rm` → `"delete"` — so the negative tests also pin
-//!   the rename surface against accidental drift. CI provides the
-//!   Linux Secret Service via dbus-run-session + gnome-keyring
-//!   (see `.github/workflows/ci.yml`); macOS uses the system
-//!   Keychain natively.
+//!   the rename surface against accidental drift. The sandbox
+//!   sets `MVM_SECRET_STORE_BACKEND=file` so the test never
+//!   touches the OS keystore (no DBus / Keychain dependency on
+//!   any host).
 //!
 //! ## Hermetic setup
 //!
@@ -138,7 +138,19 @@ impl AuditSandbox {
             .env_remove("MVM_STATE_DIR")
             .env_remove("MVM_CACHE_DIR")
             .env_remove("MVM_SHARE_DIR")
-            .env_remove("MVM_CONFIG_DIR");
+            .env_remove("MVM_CONFIG_DIR")
+            // Pin the file-backed secret store. The default
+            // (`default_secret_store`) auto-picks the OS keyring
+            // when reachable, which on Linux CI runners means the
+            // libsecret / Secret-Service path — and the `keyring`
+            // crate reports the backend reachable based on header
+            // availability, not a live `set_password` round-trip.
+            // CI runners with `libsecret` but no live Secret-Service
+            // daemon would otherwise fail every secret_* test with
+            // a socket-not-found error. Pinning `file` here makes
+            // the suite hermetic: no DBus, no keychain, no
+            // host-state dependency.
+            .env("MVM_SECRET_STORE_BACKEND", "file");
         c
     }
 }

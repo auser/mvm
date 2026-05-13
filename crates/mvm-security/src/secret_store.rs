@@ -19,7 +19,11 @@
 //!   crate's enumeration is uneven across backends).
 //!
 //! [`default_secret_store`] auto-picks Keyring if reachable, else
-//! File.
+//! File. Set `MVM_SECRET_STORE_BACKEND=file` to pin the file
+//! backend (escape hatch for hosts where the keyring's
+//! reachability probe lies — Linux CI runners with `libsecret`
+//! headers but no live `secret-service` daemon are the canonical
+//! case).
 //!
 //! ## Why two backends
 //!
@@ -333,12 +337,40 @@ impl SecretStore for KeyringSecretStore {
     }
 }
 
-/// Auto-pick the best available SecretStore for the current host.
+/// Env-var override for [`default_secret_store`]. Accepted values
+/// (case-insensitive): `file`, `keyring`, `auto`. Anything else is
+/// treated as `auto` with a `tracing::warn`. Documented in the
+/// security model section of CLAUDE.md as the escape hatch for
+/// hosts where the keyring backend is unreliable (CI Linux runners
+/// without a Secret Service, headless servers, etc).
+pub const BACKEND_ENV: &str = "MVM_SECRET_STORE_BACKEND";
+
+/// Auto-pick the best available SecretStore for the current host,
+/// honoring the [`BACKEND_ENV`] override.
 ///
-/// Order: KeyringSecretStore if the OS keystore backend is
-/// reachable, else FileSecretStore. Mirrors
+/// Order (when env is `auto` or unset): KeyringSecretStore if the
+/// OS keystore backend is reachable, else FileSecretStore. Mirrors
 /// [`crate::keystore::default_provider`].
+///
+/// On a host whose keyring's `Entry::new` succeeds but `set_password`
+/// later fails (Linux runner with `libsecret` headers but no
+/// `secret-service` daemon), set `MVM_SECRET_STORE_BACKEND=file` to
+/// pin the file backend up-front.
 pub fn default_secret_store() -> Box<dyn SecretStore> {
+    match std::env::var(BACKEND_ENV).ok().as_deref() {
+        Some(v) if v.eq_ignore_ascii_case("file") => return Box::new(FileSecretStore::default()),
+        Some(v) if v.eq_ignore_ascii_case("keyring") => {
+            return Box::new(KeyringSecretStore::default());
+        }
+        Some(v) if !v.is_empty() && !v.eq_ignore_ascii_case("auto") => {
+            tracing::warn!(
+                value = v,
+                env = BACKEND_ENV,
+                "unrecognized secret-store backend; falling back to auto"
+            );
+        }
+        _ => {}
+    }
     if crate::keystore::KeyringProvider::backend_reachable() {
         return Box::new(KeyringSecretStore::default());
     }
@@ -502,6 +534,16 @@ mod tests {
         // Doesn't panic regardless of host keyring availability.
         let _store = default_secret_store();
     }
+
+    /// End-to-end behavior of the env-var override is exercised by
+    /// the integration tests in `tests/audit_emissions_live.rs` (the
+    /// sandbox sets `MVM_SECRET_STORE_BACKEND=file` and asserts the
+    /// `~/.mvm/audit/secrets.jsonl` shape, which only writes if the
+    /// file backend actually took effect). The override threading
+    /// goes through `std::env::var`, which is process-global; an
+    /// in-process unit test would race with parallel tests that read
+    /// `HOME` (we'd have to redirect HOME to observe a file write).
+    /// Pinning happens at the CLI subprocess boundary instead.
 
     // ──────────────────────────────────────────────────────────────
     // KeyringSecretStore index — backend-independent tests
