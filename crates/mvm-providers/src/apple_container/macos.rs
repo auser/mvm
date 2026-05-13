@@ -323,8 +323,17 @@ fn read_persisted_vm_ids() -> Vec<String> {
     ids
 }
 
-/// Ensure the running binary has the virtualization entitlement.
-/// If not, sign it ad-hoc and re-exec the process.
+/// Ensure the running binary carries both VZ and Hypervisor.framework
+/// entitlements:
+///
+/// - `com.apple.security.virtualization` — gates `mvm-providers`'s
+///   Virtualization framework usage.
+/// - `com.apple.security.hypervisor` — gates libkrun's direct
+///   `Hypervisor.framework` calls (plan 72 W1 wires this into the
+///   builder-VM launcher).
+///
+/// If either is missing, signs ad-hoc with both keys and re-runs the
+/// binary via the existing self-restart path below.
 ///
 /// When `MVM_SIGNED=1` is set (by re-exec or launchd agents), the
 /// re-exec is skipped — the parent already signed the binary on disk
@@ -341,17 +350,23 @@ pub fn ensure_signed() {
     };
     let exe_str = exe.to_str().unwrap_or("");
 
-    // Check if already signed with the required entitlement
+    // Both entitlements must be present. Binaries signed before W2
+    // landed have only `virtualization`; the missing `hypervisor`
+    // key forces a one-time re-sign on first run after upgrade.
     if let Ok(output) = std::process::Command::new("codesign")
         .args(["-d", "--entitlements", "-", "--xml", exe_str])
         .output()
         && output.status.success()
-        && String::from_utf8_lossy(&output.stdout).contains("com.apple.security.virtualization")
     {
-        return;
+        let ent_xml = String::from_utf8_lossy(&output.stdout);
+        let has_virt = ent_xml.contains("com.apple.security.virtualization");
+        let has_hyper = ent_xml.contains("com.apple.security.hypervisor");
+        if has_virt && has_hyper {
+            return;
+        }
     }
 
-    tracing::info!("Signing binary with virtualization entitlement...");
+    tracing::info!("Signing binary with virtualization + hypervisor entitlements...");
     sign_binary(exe_str);
 
     use std::os::unix::process::CommandExt;
@@ -363,7 +378,8 @@ pub fn ensure_signed() {
     std::process::exit(1);
 }
 
-/// Sign the binary with the virtualization entitlement (no re-exec).
+/// Sign the binary ad-hoc with both VZ and Hypervisor.framework
+/// entitlements (no self-restart).
 ///
 /// Called by `ensure_signed()` and also by the `-d` detach path to
 /// pre-sign before installing the launchd agent.
@@ -373,6 +389,7 @@ fn sign_binary(exe_str: &str) {
         \"http://www.apple.com/DTDs/PropertyList-1.0.dtd\">\n\
         <plist version=\"1.0\"><dict>\n\
         <key>com.apple.security.virtualization</key><true/>\n\
+        <key>com.apple.security.hypervisor</key><true/>\n\
         </dict></plist>";
 
     let ent_path = std::env::temp_dir().join("mvm-entitlements.plist");
