@@ -20,8 +20,11 @@ name: VMM bootcheck
 # pr title/body/head_ref reach `run:` blocks.
 
 on:
+  # No `branches:` filter so the gate runs on feature branches too. The
+  # narrow `paths:` filter (VMM/backend/example/builder-flake files only)
+  # keeps the cost bounded — pushes that don't touch any of those skip
+  # the run entirely.
   push:
-    branches: [main]
     paths:
       - "crates/mvm-libkrun/**"
       - "crates/mvm-backend/src/libkrun.rs"
