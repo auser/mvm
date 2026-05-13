@@ -207,6 +207,11 @@ pub enum LocalAuditKind {
     /// Detail: `bundle_sha256=<64hex>,key_id=<32hex>`. Emitted only
     /// on the success arm; verify failures don't reach the emit.
     BundleInstall,
+    /// `mvmctl bundle gc <sha>` or `mvmctl bundle gc --all` —
+    /// pruned one or more installed bundles from the registry.
+    /// Detail: `removed=<count>,shas=<sha1>[,sha2,...]` (truncated
+    /// to the first ~5 shas for sweeps).
+    BundleGc,
     // --- Plan 47: dm-thin storage pool ops ---
     /// `mvmctl storage gc` removed one or more orphaned thin volumes
     /// from the pool. Detail carries the removed volume names (or a
@@ -656,8 +661,9 @@ mod tests {
             // Sprint 52 W2 trust-store mutations.
             LocalAuditKind::TrustAdd,
             LocalAuditKind::TrustRemove,
-            // Sprint 52 W2 bundle registry mutation.
+            // Sprint 52 W2 bundle registry mutations.
             LocalAuditKind::BundleInstall,
+            LocalAuditKind::BundleGc,
         ];
         for kind in kinds {
             let json = serde_json::to_string(&kind).unwrap();
@@ -690,8 +696,9 @@ mod tests {
             // Sprint 52 W2 trust-store mutations.
             (LocalAuditKind::TrustAdd, "trust_add"),
             (LocalAuditKind::TrustRemove, "trust_remove"),
-            // Sprint 52 W2 bundle install.
+            // Sprint 52 W2 bundle registry mutations.
             (LocalAuditKind::BundleInstall, "bundle_install"),
+            (LocalAuditKind::BundleGc, "bundle_gc"),
         ];
         for (kind, expected) in kinds_and_strings {
             let json = serde_json::to_string(&kind).unwrap();

@@ -610,6 +610,84 @@ impl BundleRegistry {
         })
     }
 
+    /// Remove an installed bundle. Best-effort symmetric to
+    /// [`install`](Self::install): unlinks both the
+    /// `<sha>.mvmpkg` cached archive AND the extracted
+    /// `<sha>/` directory. Idempotent on already-absent entries
+    /// (returns `Ok(false)`); returns `Ok(true)` when at least
+    /// one of the two artifacts was found and removed.
+    ///
+    /// Reports IO failures verbatim. Partial cleanup is possible
+    /// (archive removed but directory removal raced an open file);
+    /// the caller's audit log should reflect the *attempt*, not
+    /// the success — the next install of the same sha will refuse
+    /// (or overwrite with `force`) cleanly either way.
+    pub fn remove(&self, bundle_sha256: &str) -> anyhow::Result<bool> {
+        let mut removed_any = false;
+
+        let archive = self.archive_path(bundle_sha256);
+        match std::fs::remove_file(&archive) {
+            Ok(()) => removed_any = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "removing archive {}: {e}",
+                    archive.display()
+                ));
+            }
+        }
+
+        let dir = self.install_dir(bundle_sha256);
+        match std::fs::remove_dir_all(&dir) {
+            Ok(()) => removed_any = true,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "removing install dir {}: {e}",
+                    dir.display()
+                ));
+            }
+        }
+
+        Ok(removed_any)
+    }
+
+    /// List the bundle sha256s currently installed under the
+    /// registry root. Returns sorted output so consumers (CLI
+    /// listing, `bundle gc --all`) see deterministic order.
+    /// Skips entries that don't look like a bundle install
+    /// (anything other than a 64-lowercase-hex directory).
+    pub fn list(&self) -> anyhow::Result<Vec<String>> {
+        let mut out = Vec::new();
+        let read_dir = match std::fs::read_dir(&self.root) {
+            Ok(r) => r,
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(out),
+            Err(e) => {
+                return Err(anyhow::anyhow!(
+                    "reading registry root {}: {e}",
+                    self.root.display()
+                ));
+            }
+        };
+        for entry in read_dir.flatten() {
+            if !entry.file_type().map(|t| t.is_dir()).unwrap_or(false) {
+                continue;
+            }
+            let name = entry.file_name().to_string_lossy().into_owned();
+            // Bundle sha is 64 lowercase hex chars; staging dirs
+            // (`<sha>.partial/`) and archive files don't match.
+            if name.len() == 64
+                && name
+                    .chars()
+                    .all(|c| c.is_ascii_digit() || ('a'..='f').contains(&c))
+            {
+                out.push(name);
+            }
+        }
+        out.sort();
+        Ok(out)
+    }
+
     /// Resolve an installed bundle by sha256. Returns `Ok(None)`
     /// when the entry isn't present (the caller often wants to
     /// fall through to a different lookup); errors only on I/O
@@ -2014,6 +2092,83 @@ mod tests {
         assert_eq!(installed.sha256, sha);
         // Staging dir got removed during install (rename consumed it).
         assert!(!staging.exists(), "staging dir survived install");
+    }
+
+    #[test]
+    fn bundle_registry_remove_unlinks_archive_and_dir() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = BundleRegistry::new(tmp.path());
+        let sk = fresh_key();
+        let archive = build_bundle(&sk, b"k", b"r");
+        let store = trust(&sk);
+        let installed = registry.install(&archive, &store, false).unwrap();
+        let sha = installed.sha256.clone();
+
+        assert!(registry.archive_path(&sha).exists());
+        assert!(registry.install_dir(&sha).exists());
+
+        let touched = registry.remove(&sha).expect("remove ok");
+        assert!(touched, "should report something was removed");
+        assert!(!registry.archive_path(&sha).exists());
+        assert!(!registry.install_dir(&sha).exists());
+    }
+
+    #[test]
+    fn bundle_registry_remove_idempotent_when_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = BundleRegistry::new(tmp.path());
+        let touched = registry.remove(&"a".repeat(64)).expect("remove ok");
+        assert!(!touched, "no archive + no dir → returns false");
+    }
+
+    #[test]
+    fn bundle_registry_list_returns_installed_shas_sorted() {
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = BundleRegistry::new(tmp.path());
+        let sk = fresh_key();
+        let store = trust(&sk);
+        // Two distinct bundles.
+        let a = build_bundle(&sk, b"kA", b"rA");
+        let b = build_bundle(&sk, b"kB", b"rB");
+        let sha_a = registry.install(&a, &store, false).unwrap().sha256;
+        let sha_b = registry.install(&b, &store, false).unwrap().sha256;
+
+        let listed = registry.list().expect("list ok");
+        assert_eq!(listed.len(), 2);
+        // Sorted output.
+        let mut expected = vec![sha_a.clone(), sha_b.clone()];
+        expected.sort();
+        assert_eq!(listed, expected);
+    }
+
+    #[test]
+    fn bundle_registry_list_skips_non_sha_entries() {
+        // Stray files / partial-install staging dirs / arbitrary
+        // dot-files must not appear in the listing.
+        let tmp = tempfile::tempdir().unwrap();
+        let registry = BundleRegistry::new(tmp.path());
+        std::fs::write(tmp.path().join("not-a-bundle.txt"), b"junk").unwrap();
+        std::fs::create_dir_all(tmp.path().join("abc.partial")).unwrap();
+        std::fs::create_dir_all(tmp.path().join("XYZ".repeat(22) + "ab")).unwrap(); // wrong case
+        let sk = fresh_key();
+        let store = trust(&sk);
+        let archive = build_bundle(&sk, b"k", b"r");
+        let sha = registry.install(&archive, &store, false).unwrap().sha256;
+
+        let listed = registry.list().expect("list ok");
+        assert_eq!(listed, vec![sha]);
+    }
+
+    #[test]
+    fn bundle_registry_list_empty_when_root_absent() {
+        // Calling list() before any install (root doesn't exist
+        // yet) returns an empty vec rather than erroring — the
+        // gc verb uses this on a fresh host.
+        let tmp = tempfile::tempdir().unwrap();
+        let absent = tmp.path().join("never-created");
+        let registry = BundleRegistry::new(&absent);
+        let listed = registry.list().expect("list ok");
+        assert!(listed.is_empty());
     }
 
     #[test]

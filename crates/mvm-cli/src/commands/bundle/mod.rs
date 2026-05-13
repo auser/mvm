@@ -32,6 +32,7 @@ use super::Cli;
 
 mod export;
 pub(super) mod fetch;
+mod gc;
 mod install;
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -55,6 +56,10 @@ pub(in crate::commands) enum BundleAction {
     /// installed, `mvmctl up --manifest <sha>` launches from it.
     /// Sprint 52 W2 registry-replacement substrate.
     Install(install::Args),
+    /// Prune installed bundles from the registry. Either a specific
+    /// `<SHA>` or `--all` to wipe everything. Emits
+    /// `LocalAuditKind::BundleGc` on success.
+    Gc(gc::Args),
 }
 
 pub(in crate::commands) fn run(cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
@@ -62,5 +67,6 @@ pub(in crate::commands) fn run(cli: &Cli, args: Args, cfg: &MvmConfig) -> Result
         BundleAction::Export(a) => export::run(cli, a, cfg),
         BundleAction::Fetch(a) => fetch::run(cli, a, cfg),
         BundleAction::Install(a) => install::run(cli, a, cfg),
+        BundleAction::Gc(a) => gc::run(cli, a, cfg),
     }
 }
