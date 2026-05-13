@@ -299,3 +299,12 @@ required-features = ["libkrun-sys"]
 name = "libkrun-bootcheck"
 path = "examples/libkrun-bootcheck.rs"
 required-features = ["libkrun-sys"]
+
+# Plan 57 W3 / cross-platform — cloud-hypervisor bootcheck. Sibling to
+# libkrun-bootcheck; shells out to the `cloud-hypervisor` binary
+# (Linux/KVM) so it needs no feature gate and no link-time deps. The
+# CI workflow in .github/workflows/vmm-bootcheck.yml runs this on a
+# `ubuntu-latest` runner.
+[[example]]
+name = "ch-bootcheck"
+path = "examples/ch-bootcheck.rs"

@@ -1,0 +1,189 @@
+name: VMM bootcheck
+
+# Plan 57 W3 / cross-platform — gates the two VMMs that mvm targets
+# for replacing the microsandbox-backed builder VM:
+#
+#   - libkrun on macOS Apple Silicon (Hypervisor.framework)
+#   - cloud-hypervisor on Linux x86_64 (KVM)
+#
+# Both jobs build a Nix-built kernel + ext4 rootfs (no microsandbox
+# involved — the build runs in `DeterminateSystems/nix-installer-action`
+# on the GHA runner directly) and boot it under the target VMM, tailing
+# the kernel console for userspace markers.
+#
+# Per ADR-038 (CI execution policy): the heavier macOS runner only fires
+# when libkrun-relevant code changes; the Linux job runs on every
+# qualifying push because Linux runners are ~10× cheaper.
+#
+# Security note: this workflow uses only workflow-internal values
+# (matrix entries, github.workspace) — no user-controlled inputs like
+# pr title/body/head_ref reach `run:` blocks.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "crates/mvm-libkrun/**"
+      - "crates/mvm-backend/src/libkrun.rs"
+      - "crates/mvm-backend/src/cloud_hypervisor.rs"
+      - "crates/mvm-backend/src/ch_runtime.rs"
+      - "examples/libkrun-bootcheck.rs"
+      - "examples/ch-bootcheck.rs"
+      - "nix/images/builder/**"
+      - "nix/lib/**"
+      - ".github/workflows/vmm-bootcheck.yml"
+  pull_request:
+    paths:
+      - "crates/mvm-libkrun/**"
+      - "crates/mvm-backend/src/libkrun.rs"
+      - "crates/mvm-backend/src/cloud_hypervisor.rs"
+      - "crates/mvm-backend/src/ch_runtime.rs"
+      - "examples/libkrun-bootcheck.rs"
+      - "examples/ch-bootcheck.rs"
+      - "nix/images/builder/**"
+      - "nix/lib/**"
+      - ".github/workflows/vmm-bootcheck.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  # Build the dev-image kernel + rootfs on Linux runners.
+  # Mirrors the dev-image job in release.yml. Uses host Nix on the
+  # runner — NO microsandbox involvement, which is the load-bearing
+  # invariant for "we can drop microsandbox." The aarch64 artifact is
+  # consumed by the macOS libkrun job; the x86_64 artifact by the
+  # Linux CH job on the same workflow.
+  build-image:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+            system: aarch64-linux
+          - arch: x86_64
+            runner: ubuntu-latest
+            system: x86_64-linux
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build dev image via host Nix (no microsandbox)
+        env:
+          SYSTEM: ${{ matrix.system }}
+          ARCH: ${{ matrix.arch }}
+        run: |
+          set -euo pipefail
+          nix build "./nix/images/builder#packages.${SYSTEM}.default" \
+            --no-link --print-out-paths > /tmp/store-path.txt
+          STORE_PATH=$(head -1 /tmp/store-path.txt)
+          mkdir -p staging
+          cp "$STORE_PATH/vmlinux"      "staging/vmlinux"
+          cp "$STORE_PATH/rootfs.ext4"  "staging/rootfs.ext4"
+          ls -la staging/
+
+      - name: Upload image artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: dev-image-${{ matrix.arch }}
+          path: |
+            staging/vmlinux
+            staging/rootfs.ext4
+          retention-days: 1
+
+  # libkrun on macOS Apple Silicon.
+  # Validates the macOS half of the cross-platform matrix. `macos-latest`
+  # has been Apple Silicon since late 2024; libkrun installs cleanly via
+  # Homebrew. The aarch64 dev-image was produced by build-image above.
+  libkrun-macos:
+    needs: build-image
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install libkrun
+        run: brew install libkrun
+
+      - name: Download dev image (aarch64)
+        uses: actions/download-artifact@v5
+        with:
+          name: dev-image-aarch64
+          path: ci-artifacts
+
+      - name: Build libkrun-bootcheck
+        run: cargo build --example libkrun-bootcheck --features libkrun-sys
+
+      # Outcome legend (mirrored in the example's --help):
+      #   exit 0 — PASS (kernel reached userspace; libkrun viable)
+      #   exit 1 — PARTIAL (kernel booted, rootfs/init failed; libkrun OK)
+      #   exit 2 — FAIL (no kernel output; libkrun did not get the kernel running)
+      #   exit 75 — artifacts missing (CI plumbing bug)
+      - name: Run libkrun-bootcheck
+        env:
+          MVM_LIBKRUN_BOOTCHECK_KERNEL: ${{ github.workspace }}/ci-artifacts/vmlinux
+          MVM_LIBKRUN_BOOTCHECK_ROOTFS: ${{ github.workspace }}/ci-artifacts/rootfs.ext4
+        run: cargo run --example libkrun-bootcheck --features libkrun-sys
+
+  # cloud-hypervisor on Linux x86_64.
+  # Validates the Linux half of the cross-platform matrix. GHA's
+  # `ubuntu-latest` runners expose `/dev/kvm`; CH boots straight against
+  # it. The x86_64 dev-image was produced by build-image above.
+  ch-linux:
+    needs: build-image
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install cloud-hypervisor
+        env:
+          # Pin to a known version. Bump explicitly when CH cuts a
+          # release — auto-tracking `latest` is how CI flakes manifest.
+          CH_VERSION: v40.0
+        run: |
+          set -euo pipefail
+          curl -fL -o cloud-hypervisor \
+            "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
+          chmod +x cloud-hypervisor
+          sudo mv cloud-hypervisor /usr/local/bin/cloud-hypervisor
+          cloud-hypervisor --version
+
+      - name: Confirm /dev/kvm is exposed
+        run: |
+          set -euo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm is missing on this runner. Cloud-hypervisor cannot run without KVM."
+            exit 1
+          fi
+          ls -la /dev/kvm
+
+      - name: Download dev image (x86_64)
+        uses: actions/download-artifact@v5
+        with:
+          name: dev-image-x86_64
+          path: ci-artifacts
+
+      - name: Build ch-bootcheck
+        run: cargo build --example ch-bootcheck
+
+      # Same outcome legend as libkrun-bootcheck above. Additional code:
+      #   exit 74 — `cloud-hypervisor` binary not found (install step failed)
+      - name: Run ch-bootcheck
+        env:
+          MVM_CH_BOOTCHECK_KERNEL: ${{ github.workspace }}/ci-artifacts/vmlinux
+          MVM_CH_BOOTCHECK_ROOTFS: ${{ github.workspace }}/ci-artifacts/rootfs.ext4
+        run: cargo run --example ch-bootcheck

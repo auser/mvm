@@ -150,15 +150,15 @@ fn run_parent() -> i32 {
     eprintln!("[bootcheck] child exit: {exit_status:?}");
     eprintln!("[bootcheck] outcome: {outcome:?}");
     match outcome {
-        Outcome::KernelReachedUserspace => {
+        Outcome::ReachedUserspace => {
             println!("PASS — libkrun booted Linux to userspace on this host");
             0
         }
-        Outcome::KernelBootedButInitFailed => {
+        Outcome::KernelBooted => {
             println!("PARTIAL — kernel booted; init/rootfs broke. libkrun itself works.");
             1
         }
-        Outcome::KernelStartedButNoOutput => {
+        Outcome::NoOutput => {
             println!(
                 "FAIL — no kernel output observed. Cmdline / console mis-routed, or kernel never started."
             );
@@ -169,9 +169,9 @@ fn run_parent() -> i32 {
 
 #[derive(Debug)]
 enum Outcome {
-    KernelReachedUserspace,
-    KernelBootedButInitFailed,
-    KernelStartedButNoOutput,
+    ReachedUserspace,
+    KernelBooted,
+    NoOutput,
 }
 
 fn tail_for_boot_markers(path: &PathBuf) -> Outcome {
@@ -189,7 +189,7 @@ fn tail_for_boot_markers(path: &PathBuf) -> Outcome {
             || content.contains("# ")
         // shell prompt
         {
-            return Outcome::KernelReachedUserspace;
+            return Outcome::ReachedUserspace;
         }
         // Kernel markers.
         if content.contains("Linux version") || content.contains("Booting Linux") {
@@ -203,9 +203,9 @@ fn tail_for_boot_markers(path: &PathBuf) -> Outcome {
     }
 
     if seen_panic || seen_kernel {
-        Outcome::KernelBootedButInitFailed
+        Outcome::KernelBooted
     } else {
-        Outcome::KernelStartedButNoOutput
+        Outcome::NoOutput
     }
 }
 
