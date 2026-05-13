@@ -1,13 +1,22 @@
-use anyhow::{Context, Result, anyhow, bail};
+#[cfg(feature = "template-registry-s3")]
+use anyhow::Context;
+use anyhow::{Result, anyhow, bail};
 
+#[cfg(feature = "template-registry-s3")]
 use opendal::Operator;
+#[cfg(feature = "template-registry-s3")]
 use opendal::services::S3;
 
+#[cfg(feature = "template-registry-s3")]
 pub struct TemplateRegistry {
     op: opendal::BlockingOperator,
     prefix: String,
 }
 
+#[cfg(not(feature = "template-registry-s3"))]
+pub struct TemplateRegistry;
+
+#[cfg(feature = "template-registry-s3")]
 impl TemplateRegistry {
     pub fn from_env() -> Result<Option<Self>> {
         let endpoint = match std::env::var("MVM_TEMPLATE_REGISTRY_ENDPOINT") {
@@ -115,5 +124,55 @@ impl TemplateRegistry {
             bail!("Template registry prefix is empty");
         }
         Ok(())
+    }
+}
+
+#[cfg(not(feature = "template-registry-s3"))]
+impl TemplateRegistry {
+    pub fn from_env() -> Result<Option<Self>> {
+        match std::env::var("MVM_TEMPLATE_REGISTRY_ENDPOINT") {
+            Ok(v) if !v.trim().is_empty() => bail!(
+                "S3 template registry support is disabled in this build; rebuild with \
+                 --features template-registry-s3"
+            ),
+            _ => Ok(None),
+        }
+    }
+
+    pub fn key_current(&self, template_id: &str) -> String {
+        format!("templates/{}/current", template_id.trim_matches('/'))
+    }
+
+    pub fn key_revision_base(&self, template_id: &str, revision: &str) -> String {
+        format!(
+            "templates/{}/revisions/{}",
+            template_id.trim_matches('/'),
+            revision
+        )
+    }
+
+    pub fn key_revision_file(&self, template_id: &str, revision: &str, file: &str) -> String {
+        format!("{}/{}", self.key_revision_base(template_id, revision), file)
+    }
+
+    pub fn put_bytes(&self, _key: &str, _data: Vec<u8>) -> Result<()> {
+        bail!("S3 template registry support is disabled in this build")
+    }
+
+    pub fn get_bytes(&self, _key: &str) -> Result<Vec<u8>> {
+        bail!("S3 template registry support is disabled in this build")
+    }
+
+    pub fn put_text(&self, key: &str, text: &str) -> Result<()> {
+        self.put_bytes(key, text.as_bytes().to_vec())
+    }
+
+    pub fn get_text(&self, key: &str) -> Result<String> {
+        let bytes = self.get_bytes(key)?;
+        String::from_utf8(bytes).map_err(|e| anyhow!("invalid utf-8 in object {}: {}", key, e))
+    }
+
+    pub fn require_configured(&self) -> Result<()> {
+        bail!("S3 template registry support is disabled in this build")
     }
 }

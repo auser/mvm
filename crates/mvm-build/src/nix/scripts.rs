@@ -1,13 +1,8 @@
-use anyhow::{Context, Result, anyhow};
+use anyhow::{Result, anyhow, bail};
 use std::collections::BTreeMap;
-use std::sync::OnceLock;
 
-// NOTE: Builder script templates use Tera's `{{ var }}` syntax.
-// If you need to embed a literal `{{...}}` string (e.g. Go templates like `{{.Status}}`)
-// inside a builder script, wrap it in a raw block:
-//   {% raw %}{{.Status}}{% endraw %}
-
-static TERA: OnceLock<Result<tera::Tera>> = OnceLock::new();
+// NOTE: Builder script templates support only simple `{{ var }}` placeholders.
+// Keep script logic in shell and pass pre-rendered values through the context.
 
 fn script_source(name: &str) -> Option<&'static str> {
     match name {
@@ -51,6 +46,7 @@ fn script_source(name: &str) -> Option<&'static str> {
     }
 }
 
+#[cfg(test)]
 fn script_names() -> &'static [&'static str] {
     &[
         "ensure_builder_artifacts",
@@ -68,46 +64,52 @@ fn script_names() -> &'static [&'static str] {
     ]
 }
 
-fn build_tera() -> Result<tera::Tera> {
-    let mut tera = tera::Tera::default();
-    // Shell scripts must not be HTML-escaped.
-    tera.autoescape_on(vec![]);
-
-    for name in script_names() {
-        let src = script_source(name)
-            .ok_or_else(|| anyhow!("builder script template source not found: {name}"))?;
-        tera.add_raw_template(name, src)
-            .map_err(anyhow::Error::new)
-            .with_context(|| format!("Failed to parse builder script template {name}"))?;
-    }
-
-    Ok(tera)
-}
-
-fn tera_instance() -> Result<&'static tera::Tera> {
-    match TERA.get_or_init(build_tera) {
-        Ok(t) => Ok(t),
-        Err(e) => {
-            Err(anyhow!(e.to_string())).context("Failed to initialize builder script templates")
-        }
-    }
-}
-
 pub fn render_script(name: &str, context: &BTreeMap<&str, String>) -> Result<String> {
-    let tera = tera_instance()?;
+    let src = script_source(name).ok_or_else(|| anyhow!("unknown script template: {name}"))?;
+    validate_template(name, src)?;
 
-    if script_source(name).is_none() {
-        return Err(anyhow!("unknown script template: {name}"));
+    let mut rendered = String::with_capacity(src.len());
+    let mut rest = src;
+    while let Some(start) = rest.find("{{") {
+        rendered.push_str(&rest[..start]);
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("}}") else {
+            bail!("unterminated template placeholder in script {name}");
+        };
+        let key = after_start[..end].trim();
+        if key.is_empty() {
+            bail!("empty template placeholder in script {name}");
+        }
+        let value = context
+            .get(key)
+            .ok_or_else(|| anyhow!("missing template variable {key:?} for script {name}"))?;
+        rendered.push_str(value);
+        rest = &after_start[end + 2..];
     }
+    rendered.push_str(rest);
+    Ok(rendered)
+}
 
-    let mut ctx = tera::Context::new();
-    for (k, v) in context {
-        ctx.insert(*k, v);
+fn validate_template(name: &str, src: &str) -> Result<()> {
+    let mut rest = src;
+    while let Some(start) = rest.find("{{") {
+        let after_start = &rest[start + 2..];
+        let Some(end) = after_start.find("}}") else {
+            bail!("unterminated template placeholder in script {name}");
+        };
+        let key = after_start[..end].trim();
+        if key.is_empty() {
+            bail!("empty template placeholder in script {name}");
+        }
+        if !key
+            .chars()
+            .all(|c| c == '_' || c == '-' || c.is_ascii_alphanumeric())
+        {
+            bail!("unsupported template placeholder {key:?} in script {name}");
+        }
+        rest = &after_start[end + 2..];
     }
-
-    tera.render(name, &ctx)
-        .map_err(anyhow::Error::new)
-        .with_context(|| format!("Failed to render script {name}"))
+    Ok(())
 }
 
 #[cfg(test)]
@@ -116,7 +118,10 @@ mod tests {
 
     #[test]
     fn test_templates_parse() {
-        build_tera().expect("builder templates should parse");
+        for name in script_names() {
+            let src = script_source(name).expect("script listed in script_names should exist");
+            validate_template(name, src).expect("builder templates should parse");
+        }
     }
 
     #[test]
@@ -128,8 +133,7 @@ mod tests {
         let msg = format!("{err:#}");
         eprintln!("{msg}");
         assert!(msg.contains("launch_firecracker_ssh"));
-        // Don't overfit the exact wording, but ensure it's a render-time failure surfaced via Tera.
-        assert!(msg.contains("Failed to render script launch_firecracker_ssh"));
+        assert!(msg.contains("missing template variable"));
     }
 
     #[test]

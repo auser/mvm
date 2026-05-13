@@ -1,9 +1,11 @@
 use std::path::Path;
 use std::sync::mpsc;
+#[cfg(feature = "dev-watch")]
 use std::time::Duration;
 
 use anyhow::Result;
 use mvm_core::user_config::MvmConfig;
+#[cfg(feature = "dev-watch")]
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 
 /// Events sent from the background watcher thread.
@@ -27,11 +29,21 @@ impl ConfigWatcher {
     /// Start watching `path`.  Returns immediately; the debouncer runs on a
     /// background thread managed by `notify`.
     pub fn start(path: &Path) -> Result<Self> {
+        #[cfg(not(feature = "dev-watch"))]
+        {
+            let _ = path;
+            anyhow::bail!(
+                "config watch support is disabled in this build; rebuild with --features dev-watch"
+            );
+        }
+
+        #[cfg(feature = "dev-watch")]
         Self::start_with_debounce(path, Duration::from_millis(500))
     }
 
     /// Like [`start`] but with a configurable debounce duration.  Useful in
     /// tests where a shorter debounce keeps suites fast.
+    #[cfg(feature = "dev-watch")]
     pub fn start_with_debounce(path: &Path, debounce: Duration) -> Result<Self> {
         // Canonicalize so that event.path comparisons work reliably.
         let watch_file = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
@@ -121,12 +133,14 @@ mod tests {
     use super::*;
     use mvm_core::user_config::MvmConfig;
 
+    #[cfg(feature = "dev-watch")]
     fn write_config(path: &Path, cfg: &MvmConfig) {
         let text = toml::to_string_pretty(cfg).unwrap();
         std::fs::write(path, text).unwrap();
     }
 
     #[test]
+    #[cfg(feature = "dev-watch")]
     fn test_config_watcher_detects_change() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");
@@ -169,6 +183,7 @@ mod tests {
     }
 
     #[test]
+    #[cfg(feature = "dev-watch")]
     fn test_config_watcher_invalid_toml_sends_parse_error() {
         let dir = tempfile::tempdir().unwrap();
         let config_path = dir.path().join("config.toml");

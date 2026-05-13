@@ -1,8 +1,11 @@
 use std::path::{Path, PathBuf};
+#[cfg(feature = "dev-watch")]
 use std::sync::mpsc;
+#[cfg(feature = "dev-watch")]
 use std::time::Duration;
 
 use anyhow::Result;
+#[cfg(feature = "dev-watch")]
 use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 
 /// Wait for filesystem changes in the given flake directory.
@@ -14,38 +17,50 @@ use notify_debouncer_mini::{DebouncedEventKind, new_debouncer};
 /// inotify on Linux) instead of polling. Changes are debounced by 500ms to
 /// avoid redundant rebuilds from rapid file saves.
 pub fn wait_for_changes(flake_dir: &str) -> Result<PathBuf> {
-    let flake_path = Path::new(flake_dir).canonicalize()?;
+    #[cfg(not(feature = "dev-watch"))]
+    {
+        let _ = flake_dir;
+        anyhow::bail!(
+            "file watch support is disabled in this build; rebuild with --features dev-watch"
+        );
+    }
 
-    let (tx, rx) = mpsc::channel();
+    #[cfg(feature = "dev-watch")]
+    {
+        let flake_path = Path::new(flake_dir).canonicalize()?;
 
-    let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
+        let (tx, rx) = mpsc::channel();
 
-    // Watch the flake directory recursively for .nix and .lock changes
-    debouncer
-        .watcher()
-        .watch(&flake_path, notify::RecursiveMode::Recursive)?;
+        let mut debouncer = new_debouncer(Duration::from_millis(500), tx)?;
 
-    // Wait for a relevant change
-    loop {
-        match rx.recv() {
-            Ok(Ok(events)) => {
-                for event in &events {
-                    if event.kind == DebouncedEventKind::Any && is_nix_file(&event.path) {
-                        return Ok(event.path.clone());
+        // Watch the flake directory recursively for .nix and .lock changes
+        debouncer
+            .watcher()
+            .watch(&flake_path, notify::RecursiveMode::Recursive)?;
+
+        // Wait for a relevant change
+        loop {
+            match rx.recv() {
+                Ok(Ok(events)) => {
+                    for event in &events {
+                        if event.kind == DebouncedEventKind::Any && is_nix_file(&event.path) {
+                            return Ok(event.path.clone());
+                        }
                     }
                 }
-            }
-            Ok(Err(e)) => {
-                tracing::warn!("watch error: {e}");
-            }
-            Err(e) => {
-                anyhow::bail!("watch channel closed: {e}");
+                Ok(Err(e)) => {
+                    tracing::warn!("watch error: {e}");
+                }
+                Err(e) => {
+                    anyhow::bail!("watch channel closed: {e}");
+                }
             }
         }
     }
 }
 
 /// Check if a path is a Nix-related file we care about.
+#[cfg(any(feature = "dev-watch", test))]
 fn is_nix_file(path: &Path) -> bool {
     let Some(ext) = path.extension() else {
         // flake.lock has no extension — check by filename

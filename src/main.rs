@@ -1,8 +1,3 @@
-use mimalloc::MiMalloc;
-
-#[global_allocator]
-static GLOBAL: MiMalloc = MiMalloc;
-
 fn main() -> anyhow::Result<()> {
     // On macOS, Virtualization.framework requires the main thread to pump
     // NSRunLoop for VM lifecycle callbacks. Run the CLI on a background
