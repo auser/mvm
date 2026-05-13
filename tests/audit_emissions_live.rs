@@ -845,6 +845,36 @@ fn bring_up_mock_vm(sandbox: &AuditSandbox, name: &str) {
     );
 }
 
+/// Per-test handle for a mock VM whose host-side vsock surface lives
+/// in *this* (test) process. Pair with `mvmctl fs *` / `mvmctl proc *`
+/// subprocesses — they discover the listener via the
+/// filesystem-based mock detection in `instance_dir_for`.
+///
+/// Plan 66 W4. The `mvmctl up --hypervisor mock` subprocess pattern
+/// used by `bring_up_mock_vm` doesn't work here because the
+/// MockGuestAgent the subprocess spawns dies with the subprocess —
+/// follow-up commands would find a stale socket and fail to connect.
+/// Hosting the agent in the test process keeps it alive across every
+/// subprocess invocation for the duration of the test.
+struct MockVmAgentFixture {
+    _agent: mvm_backend::mock_guest_agent::MockGuestAgent,
+}
+
+/// Create the mock-vms VM directory under the sandbox's HOME and
+/// spawn a [`MockGuestAgent`](mvm_backend::mock_guest_agent::MockGuestAgent)
+/// listening at `<vm_dir>/runtime/v.sock`. Returns when the listener
+/// is ready to accept connections.
+fn start_mock_vm_agent(sandbox: &AuditSandbox, name: &str) -> MockVmAgentFixture {
+    // mvm_data_dir() resolves to `<HOME>/.mvm` by default. The
+    // subprocess sees HOME=sandbox.home_path() and so will compute
+    // the same path; we compute it here from the same root.
+    let vm_dir = sandbox.home_path().join(".mvm").join("mock-vms").join(name);
+    std::fs::create_dir_all(&vm_dir).expect("mkdir mock vm_dir");
+    let agent = mvm_backend::mock_guest_agent::MockGuestAgent::start(&vm_dir)
+        .expect("start mock guest agent");
+    MockVmAgentFixture { _agent: agent }
+}
+
 #[test]
 fn up_with_mock_backend_emits_vm_start_audit_entry() {
     // End-to-end test of `mvmctl up` against the in-memory
@@ -1863,5 +1893,295 @@ fn build_emits_template_build_audit_entry_against_stub_outdir() {
     assert!(
         log.contains("artifact=stub-out"),
         "expected detail to record artifact=stub-out (the stub-outdir basename). Full log:\n{log}"
+    );
+}
+
+// ============================================================================
+// Plan 66 W4 — `mvmctl fs *` and `mvmctl proc *` live tests.
+//
+// Each test stands up a `MockGuestAgent` in the test process, then
+// drives the matching CLI subcommand as a subprocess. The CLI's
+// `instance_dir_for` helper detects the mock-vms socket and routes
+// the vsock request to the in-process agent instead of the
+// Lima-era `microvm::resolve_running_vm_dir` shell-out.
+// ============================================================================
+
+#[test]
+fn fs_write_emits_vm_fs_mutate_audit_entry() {
+    let sandbox = AuditSandbox::new();
+    let _fixture = start_mock_vm_agent(&sandbox, "t-fsw");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["fs", "write", "t-fsw", "/tmp/hello", "--content", "hi"])
+        .output()
+        .expect("spawn mvmctl fs write");
+    assert!(
+        output.status.success(),
+        "mvmctl fs write failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_fs_mutate");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_fs_mutate entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("op=write path=/tmp/hello bytes=2"),
+        "expected op=write detail with bytes=2. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn fs_mkdir_emits_vm_fs_mutate_audit_entry() {
+    let sandbox = AuditSandbox::new();
+    let _fixture = start_mock_vm_agent(&sandbox, "t-fsmk");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["fs", "mkdir", "t-fsmk", "/tmp/newdir"])
+        .output()
+        .expect("spawn mvmctl fs mkdir");
+    assert!(
+        output.status.success(),
+        "mvmctl fs mkdir failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_fs_mutate");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_fs_mutate entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("op=mkdir path=/tmp/newdir"),
+        "expected op=mkdir detail. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn fs_rm_emits_vm_fs_mutate_audit_entry() {
+    let sandbox = AuditSandbox::new();
+    let _fixture = start_mock_vm_agent(&sandbox, "t-fsrm");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["fs", "rm", "t-fsrm", "/tmp/stale"])
+        .output()
+        .expect("spawn mvmctl fs rm");
+    assert!(
+        output.status.success(),
+        "mvmctl fs rm failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_fs_mutate");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_fs_mutate entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("op=rm path=/tmp/stale"),
+        "expected op=rm detail. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn fs_mv_emits_vm_fs_mutate_audit_entry() {
+    let sandbox = AuditSandbox::new();
+    let _fixture = start_mock_vm_agent(&sandbox, "t-fsmv");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["fs", "mv", "t-fsmv", "/tmp/src", "/tmp/dst"])
+        .output()
+        .expect("spawn mvmctl fs mv");
+    assert!(
+        output.status.success(),
+        "mvmctl fs mv failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_fs_mutate");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_fs_mutate entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("op=mv from=/tmp/src to=/tmp/dst"),
+        "expected op=mv detail. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn fs_ls_does_not_emit_audit_entry() {
+    // Read-only: `fs ls` doesn't mutate, so no LocalAudit emit.
+    let sandbox = AuditSandbox::new();
+    let _fixture = start_mock_vm_agent(&sandbox, "t-fsls");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["fs", "ls", "t-fsls", "/tmp"])
+        .output()
+        .expect("spawn mvmctl fs ls");
+    assert!(
+        output.status.success(),
+        "mvmctl fs ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `mvmctl fs ls` must not write to LocalAudit. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn proc_start_emits_vm_proc_start_audit_entry() {
+    let sandbox = AuditSandbox::new();
+    let _fixture = start_mock_vm_agent(&sandbox, "t-ps");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["proc", "start", "t-ps", "--", "/bin/true"])
+        .output()
+        .expect("spawn mvmctl proc start");
+    assert!(
+        output.status.success(),
+        "mvmctl proc start failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_proc_start");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_proc_start entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("argv0=/bin/true"),
+        "expected argv0=/bin/true detail. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn proc_signal_emits_vm_proc_signal_audit_entry() {
+    let sandbox = AuditSandbox::new();
+    let _fixture = start_mock_vm_agent(&sandbox, "t-psg");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["proc", "signal", "t-psg", "proc-fake-token", "15"])
+        .output()
+        .expect("spawn mvmctl proc signal");
+    assert!(
+        output.status.success(),
+        "mvmctl proc signal failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_proc_signal");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_proc_signal entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("token=proc-fake-token signum=15"),
+        "expected token+signum detail. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn proc_kill_emits_kill_audit_entry() {
+    let sandbox = AuditSandbox::new();
+    let _fixture = start_mock_vm_agent(&sandbox, "t-pk");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["proc", "kill", "t-pk", "proc-fake-token"])
+        .output()
+        .expect("spawn mvmctl proc kill");
+    assert!(
+        output.status.success(),
+        "mvmctl proc kill failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "kill");
+    assert!(
+        hits >= 1,
+        "expected ≥1 kill entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("scope=guest_proc token=proc-fake-token"),
+        "expected scope=guest_proc detail. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn proc_stdin_emits_vm_proc_stdin_audit_entry() {
+    let sandbox = AuditSandbox::new();
+    let _fixture = start_mock_vm_agent(&sandbox, "t-pst");
+
+    let output = sandbox
+        .mvmctl()
+        .args([
+            "proc",
+            "stdin",
+            "t-pst",
+            "proc-fake-token",
+            "--content",
+            "hello",
+        ])
+        .output()
+        .expect("spawn mvmctl proc stdin");
+    assert!(
+        output.status.success(),
+        "mvmctl proc stdin failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "vm_proc_stdin");
+    assert!(
+        hits >= 1,
+        "expected ≥1 vm_proc_stdin entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("token=proc-fake-token bytes=5"),
+        "expected token+bytes=5 detail. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn proc_ls_does_not_emit_audit_entry() {
+    // Read-only: `proc ls` doesn't mutate, so no LocalAudit emit.
+    let sandbox = AuditSandbox::new();
+    let _fixture = start_mock_vm_agent(&sandbox, "t-pls");
+
+    let output = sandbox
+        .mvmctl()
+        .args(["proc", "ls", "t-pls"])
+        .output()
+        .expect("spawn mvmctl proc ls");
+    assert!(
+        output.status.success(),
+        "mvmctl proc ls failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        log.is_empty(),
+        "read-only `mvmctl proc ls` must not write to LocalAudit. Full log:\n{log}"
     );
 }
