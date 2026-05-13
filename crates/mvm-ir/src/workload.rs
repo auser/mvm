@@ -377,6 +377,9 @@ pub enum EnvValue {
     },
 }
 
+// allow(secret-debug): metadata-only — `name` is a secret-store key (not
+// the secret value), `mount` is a delivery shape (env-var name or file
+// path). No secret bytes ever live in this struct.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(deny_unknown_fields)]
 pub struct SecretRef {
@@ -384,6 +387,9 @@ pub struct SecretRef {
     pub mount: SecretMount,
 }
 
+// allow(secret-debug): metadata-only — variants carry the env-var name
+// or filesystem path the secret will be delivered at, not the secret
+// itself. The actual material is resolved at admission time.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, JsonSchema)]
 #[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
 pub enum SecretMount {
