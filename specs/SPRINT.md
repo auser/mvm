@@ -1350,13 +1350,20 @@ Shipped in the W2 close-out commit:
   key_id doesn't match the signing key / actual bytes — caught at
   write time so misconfigured publishers never ship unverifiable
   bundles.
-- `mvmctl bundle fetch <PATH> [--trust-store <DIR>] [--json]`:
-  reads the archive, looks the publisher pubkey up via
+- `mvmctl bundle fetch <SOURCE> [--trust-store <DIR>] [--json] [--allow-http]`:
+  reads the archive (from a local path **or** an `https://` URL —
+  HTTPS uses rustls + webpki-roots through the existing
+  `crate::http::download_file` helper, written to a temp file
+  that drops on scope exit), looks the publisher pubkey up via
   `FsTrustStore` (defaults to `~/.mvm/trusted-publishers/`), runs
   the full 6-step rejection ladder, prints a verified-bundle
   summary (sha256, key_id, publisher, arch, profile, label,
-  artifact count, verity yes/no) or full manifest JSON. Refuses
-  on any verification failure before extraction.
+  artifact count, verity yes/no) or full manifest JSON. Plain
+  `http://` URLs are refused by default — the Ed25519 signature
+  still catches tampering, but HTTP exposes traffic metadata, so
+  the user must opt in explicitly via `--allow-http` (with a
+  launch-time warning). Refuses on any verification failure
+  before extraction.
 - `mvmctl trust add <PUBKEY> [--force]`: reads 32 raw Ed25519
   pubkey bytes, derives `key_id`, writes `<key_id>.pub` to the
   trust store (mode 0644). Refuses to overwrite without `--force`.
@@ -1379,8 +1386,6 @@ Shipped in the W2 close-out commit:
 
 Outstanding (deferred follow-ups):
 
-- HTTP `mvmctl bundle fetch <url>` — adds a wire client; out of
-  scope for the substrate-close-out commit.
 - Supervisor admit-time bundle re-verify wired into
   `ExecutionPlan::PlanArtifact`. Requires a plan schema bump
   (carries `bundle_sha256` + `manifest_sig_base64` + `key_id`),
