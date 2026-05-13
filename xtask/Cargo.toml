@@ -8,8 +8,10 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 clap_mangen.workspace = true
-mvm-cli.workspace = true
 mvm-build = { workspace = true, features = ["backends-microsandbox"] }
+mvm-cli.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 sha2.workspace = true
 tempfile.workspace = true
 
