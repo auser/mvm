@@ -189,6 +189,34 @@ mvmctl up --flake . --hypervisor qemu    # microvm.nix
 mvmctl doctor   # check available backends
 ```
 
+### macOS: first-run codesigning for `apple-container` and `libkrun`
+
+Both `mvmctl up --hypervisor apple-container` and (once plan 57 W3 wires guest boot) `mvmctl up --hypervisor libkrun` need ad-hoc codesigning before the macOS kernel will let the binary touch the hypervisor APIs:
+
+- `com.apple.security.virtualization` — required by `Virtualization.framework` (the `apple-container` backend).
+- `com.apple.security.hypervisor` — required by direct `Hypervisor.framework` callers (the `libkrun` backend).
+
+On the **first** run of either backend, `mvmctl` ad-hoc signs itself with both entitlements and re-spawns the current invocation. The same signed binary covers both backends, so swapping `--hypervisor` between `apple-container` and `libkrun` does not re-sign.
+
+What you'll see on the first run:
+
+```
+$ mvmctl up --flake . --hypervisor apple-container
+INFO Signing binary with virtualization + hypervisor entitlements...
+…starts the VM…
+```
+
+On macOS 14+ the ad-hoc signature is accepted by Gatekeeper without an extra prompt. If you had previously installed `mvmctl` from a Homebrew bottle signed against an older entitlement set (virtualization only), the re-spawn will trigger once on the next run after upgrade to lift the binary to both entitlements; subsequent runs are silent.
+
+To pre-sign in CI (skip the re-spawn entirely), set `MVM_SIGNED=1` once the binary on disk already carries both entitlements — the wrapper trusts the env var and skips the codesign probe.
+
+If the signing step itself fails, check that the Xcode command-line tools are installed:
+
+```bash
+xcode-select --install
+codesign --version    # should report a build number
+```
+
 ### No `/dev/kvm` available (cloud VMs without nested virt)
 
 Hitting `KVM not available` on a cloud instance? Three options, in order of recommendation.
