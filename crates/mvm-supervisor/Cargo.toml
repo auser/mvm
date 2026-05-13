@@ -57,6 +57,13 @@ tracing.workspace = true
 [target.'cfg(target_os = "linux")'.dependencies]
 libc.workspace = true
 
+# Sprint 52 W1 follow-on (PSI/vm_pressure): `VmPressureLevelSource`
+# on macOS calls `sysctlbyname("kern.memorystatus_vm_pressure_level")`
+# via libc to get the kernel's discrete pressure level (Normal/Warn/
+# Critical) — a stronger signal than the sysinfo used/total ratio.
+[target.'cfg(target_os = "macos")'.dependencies]
+libc.workspace = true
+
 [dev-dependencies]
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "net", "io-util", "time", "sync", "test-util"] }
