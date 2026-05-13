@@ -19,6 +19,7 @@ mvm = { workspace = true, default-features = false }
 mvm-build = { workspace = true, default-features = false }
 mvm-security.workspace = true
 mvm-providers.workspace = true
+mvm-libkrun.workspace = true
 mvm-backend = { workspace = true, default-features = false }
 mvm-mcp.workspace = true
 mvm-plan.workspace = true

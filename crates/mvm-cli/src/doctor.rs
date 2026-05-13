@@ -579,7 +579,7 @@ fn libkrun_check(plat: Platform) -> Check {
             name: "libkrun",
             category: "platform",
             ok: true, // Optional; not a failure.
-            info: format!("not available ({})", mvm_providers::libkrun::install_hint()),
+            info: format!("not available ({})", mvm_libkrun::install_hint()),
         }
     }
 }
