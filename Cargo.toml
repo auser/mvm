@@ -14,6 +14,13 @@ members = [
     "crates/mvm-guest",
     "crates/mvm-cli",
     "crates/mvm-mcp",
+    # plan 60 Phase 5 — build-time SDK port from ../mvmforge.
+    # mvm-ir is the canonical Workload IR; mvm-sdk is the builder
+    # surface; mvm-sdk-macros is a placeholder for the proc-macro
+    # surface that lands in a Phase 5 follow-on.
+    "crates/mvm-ir",
+    "crates/mvm-sdk",
+    "crates/mvm-sdk-macros",
     "xtask",
 ]
 # cargo-fuzz crates have to be excluded from the main workspace because
@@ -167,6 +174,11 @@ mvm-plan = { path = "crates/mvm-plan", version = "0.14.0" }
 mvm-policy = { path = "crates/mvm-policy", version = "0.14.0" }
 mvm-supervisor = { path = "crates/mvm-supervisor", version = "0.14.0" }
 mvm-cli = { path = "crates/mvm-cli", version = "0.14.0", default-features = false }
+
+# plan 60 Phase 5 — build-time SDK port from ../mvmforge.
+mvm-ir = { path = "crates/mvm-ir", version = "0.14.0" }
+mvm-sdk = { path = "crates/mvm-sdk", version = "0.14.0" }
+mvm-sdk-macros = { path = "crates/mvm-sdk-macros", version = "0.14.0" }
 mvm-mcp = { path = "crates/mvm-mcp", version = "0.14.0" }
 mvm-providers = { path = "crates/mvm-providers", version = "0.14.0" }
 mvm-backend = { path = "crates/mvm-backend", version = "0.14.0", default-features = false }
