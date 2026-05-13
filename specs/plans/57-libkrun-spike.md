@@ -65,6 +65,8 @@ Goal: `mvmctl` + libkrun + `Hypervisor.framework` boot a guest without the macOS
 
 ### W3 — End-to-end boot validation (the actual spike, 2–3 days)
 
+> Status update 2026-05-13: **W3.1, W3.2, W3.4 (cmdline + console) shipped.** W3.3 (vsock health check) deferred to a follow-on PR — see "Findings" below for why.
+
 Goal: prove a real Nix-built kernel + ext4 rootfs boots in libkrun on macOS Apple Silicon and the guest agent comes up on vsock.
 
 - **W3.1** Pick the validation flake. `examples/minimal` is the canonical "smallest-thing-that-boots" target across mvm. Build it: `mvmctl build --flake examples/minimal`. Outputs are `vmlinux`, `rootfs.ext4`, and possibly `initrd`.
@@ -75,6 +77,34 @@ Goal: prove a real Nix-built kernel + ext4 rootfs boots in libkrun on macOS Appl
   - **Console device.** No serial → console output may not appear. Confirm libkrun routes hvc0 to stdout in the calling process, or wire it through a host-side log file.
   - **vsock device naming.** Firecracker uses `/dev/vhost-vsock`; libkrun's macOS path uses an internal abstraction. Confirm the guest sees vsock on cid 3 (standard guest CID) and the agent's listening port matches.
   - **Verified boot (claim 3) is out of scope for the spike.** The Nix flake's `verifiedBoot = false` exemption (the dev VM path) covers this. Plan 25 §W3 follow-up promotes claim 3 from "DoesNotHold" to "Holds" for libkrun once dm-verity is wired through.
+
+#### Findings — first end-to-end boot, 2026-05-13
+
+Run on: macOS 15.6 (Apple Silicon, M-series), libkrun 1.17.4 via Homebrew, kernel + rootfs from the pre-Plan-72 `~/.mvm/dev/current/` dev-VM artifacts (built 2026-05-12).
+
+**Boot path shipped**: `cargo run --example libkrun-smoke -p mvm-libkrun --features libkrun-sys`. Source: `crates/mvm-libkrun/examples/libkrun-smoke.rs`.
+
+What worked first-try on the W2 codesigned binary:
+
+1. **`console=hvc0 root=/dev/vda rw init=/init` is correct.** The plan's prediction held: libkrun's Hypervisor.framework path drops the Firecracker `console=ttyS0` form and uses virtio-console (`hvc0`) — the same cmdline Apple Container already produces in `crates/mvm-providers/src/apple_container/macos.rs`. Without this swap the kernel boots but emits no console output.
+2. **ARM64 "Image" kernel format = libkrun `KRUN_KERNEL_FORMAT_RAW`.** Nix's `nixpkgs.linuxPackages` cross-built `vmlinux` is a flat ARM64 boot Image, not ELF. `KernelFormat::Raw` consumes it directly. W1's wrapper had defaulted to `Elf`; the W3 smoke flipped that, and the W1 unit test doesn't exercise the kernel-format value so the change is safe.
+3. **Multiple virtio-blk devices work.** Rootfs at `/dev/vda` (736 MiB ext4), `~/.mvm/dev/nix-store.img` at `/dev/vdb` (64 GiB sparse). The kernel boot log enumerates both; `EXT4-fs (vda): mounted filesystem … r/w with ordered data mode` is the success signal.
+4. **`krun_set_console_output(path)` routes hvc0 to a host file** — confirmed by checking `/tmp/mvm-libkrun-smoke-console.log` for the full kernel boot log post-shutdown. Useful for both manual smoke tests and the W5 CI lane.
+5. **Plan 57 W2's codesigning gate is load-bearing.** The first run without `ensure_signed()` failed at `krun_start_enter` with `Internal(Vm(VmSetup(VmCreate)))` / rc `-22`. After `ensure_signed()` self-signs the binary with both entitlements and re-spawns, boot succeeds. The smoke binary now calls `ensure_signed()` first so subsequent reruns are silent (`MVM_SIGNED=1`).
+
+Risks the plan named that **did not materialize**:
+
+- The Nix `mkGuest` build did not need a `cmdlineFor = "libkrun" | "firecracker"` switch. Overriding `KrunContext.kernel_cmdline` at runtime is sufficient — the same kernel binary boots under Firecracker (`ttyS0`) and libkrun (`hvc0`) depending on what the host passes.
+- The codesigning entitlement composed cleanly with the existing VZ entitlement (plan 57 W2 + PR #151 already validated this for the codesign step; W3 confirmed it at runtime).
+- No `mkGuest` change was needed for libkrun-specific kernel features.
+
+What's **deferred to a follow-on PR (W3.3)**:
+
+- **`krun_add_vsock` vs `krun_add_vsock_port` are mutually exclusive in libkrun's current API.** Calling `add_vsock(0)` after `add_vsock_port(...)` returns `-EEXIST`; the reverse order has the same result. The W3 smoke ran with only `add_vsock_port` (which is enough for TSI-mode pseudo-vsock) and the guest booted to userspace, but the dev rootfs's guest-agent listener uses true virtio-vsock and needs `add_vsock`. Picking the right mode (real virtio-vsock for the guest agent, TSI for ipc-style port forwards) and the per-VM host socket path is W3.3.
+- The dev rootfs `/init` itself hits a BusyBox-vs-util-linux incompatibility (`setpriv: unrecognized option: reuid=990`) — orthogonal to libkrun. Tracked separately under the dev-VM owners; the libkrun layer did its job by getting `/init` running.
+- A vsock health-check ping against `mvm_guest::vsock::GUEST_AGENT_PORT` from the host. `krun_start_enter` consumes the calling process (calls `exit()` on success), so the ping has to come from a sibling process or fork. The W4 supervisor-thread / launchd lane resolves the process-lifecycle side of this naturally.
+
+Decision recorded: **the libkrun macOS Apple Silicon path is viable.** Plan 72 (builder-VM-via-libkrun) is unblocked on the boot side; the remaining wiring is state-tracking (W4) and CI (W5).
 
 ### W4 — State tracking decision (1–2 days)
 
