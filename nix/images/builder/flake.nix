@@ -113,9 +113,23 @@
         mvmSrc = workspace;
       };
 
+      # The dev VM's explicit package closure. Anything busybox-static
+      # already provides (sh, coreutils, grep, sed, awk, find, which,
+      # ps, top, more) is intentionally omitted — busybox covers the
+      # script + interactive surface, and the GNU-vs-busybox flag
+      # differences haven't bitten us yet on the things this VM
+      # actually runs (`nix build`, file-system ops, ad-hoc shell).
+      # If a real incompatibility surfaces, add the specific GNU
+      # package back; default is "trust busybox, ship one set."
+      #
+      # Caveat: `nix`'s own closure transitively pulls in bash +
+      # coreutils for derivation stdenv use. Dropping those from
+      # this list doesn't remove them from `/nix/store/` — it just
+      # means the rootfs has fewer `/usr/local/bin/` symlinks. A
+      # future post-mkfs strip of `/share/{doc,man,info,locale}` is
+      # where the bigger size wins live.
       builderPackages = pkgs: with pkgs; [
-        bashInteractive coreutils gnugrep gnused gawk findutils which less
-        nix git gnumake curl jq iproute2 iptables e2fsprogs util-linux procps
+        nix git gnumake curl jq iproute2 iptables e2fsprogs util-linux
       ];
 
       mkBuilderImage = system:
