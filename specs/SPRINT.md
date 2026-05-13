@@ -1118,7 +1118,7 @@ Reference: ADR-044 (`specs/adrs/044-audit-emit-macro.md`).
 | 7 | Plan 60 Phase 8 — mvmd integration contract verification | 3-5 | Port `mvm/src/hostd/{mod,server}.rs`; `PROTOCOL_VERSION` const; wire-format stability test. **Coordinated with parallel mvmd work** — see "Cross-repo coordination" below. The mvm-hostd supervisor lift this depends on is what makes every Live impl in `slots_from_bundle` (shipped batch 2) actually enforce. |
 | 8 | Plan 60 Phase 9 — perf + supply chain + SBOM | 7-10 | Cold-boot ≤500 ms Firecracker / ≤1 s microsandbox; rootfs ≤20 MB; PGO + MUSL builds; cosign-keyless artifacts; RFC 3161 timestamping. |
 | 9 | Plan 60 Phase 10 — rename + archive | 1 | `git mv mvm mvm` + update CI paths + bump mvmd's git pin. |
-| 10 | Plans 48 + 49 — function-service factories (ADR-010) | 7-10 | Wrapper-template relocation + function-service factory pattern. |
+| 10 | Plans 48 + 49 + 71 — function-service factories (ADR-010) + workload helper | 7-10 | Wrapper-template relocation + function-service factory pattern. Plan 71 wires `mkFunctionService` into a one-line IR-to-image helper (`mkFunctionWorkload`); unblocks Phase 5 Slice E3 live-VM smoke. |
 | 11 | Plans 51 + 52 — session-lifecycle verbs + fd3 control channel (ADR-011) | 10-14 | Largest substrate change in the function-call line. |
 | 12 | Plan 61 — runtime overlays + billing | 14-21 | Dev/prod image transparency + sandbox-runtime billing dimensions. Six phases. |
 | 13 | Status sweep — plan 32 tail (MCP adoption tiers L1/L2/L4), plan 16 (microvm-nix-integration), plan 18 (nix-openclaw-integration) | 3-5 | Several minor plans with partial completion — audit + close or roll into a follow-up sprint. |

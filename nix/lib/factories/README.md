@@ -5,6 +5,23 @@
 mvm-emitted artifact when the workload declares
 `entrypoint.kind = "function"` (plan 0003 / ADR-0009).
 
+For the common single-app, single-function case, prefer the
+**`mkFunctionWorkload`** one-call helper at `nix/lib/mkFunctionWorkload.nix`
+(plan 71). It reads the workload IR JSON, composes this factory
+with `mkGuest`, and returns the rootfs derivation directly:
+
+```nix
+packages.${system}.default = mvm.lib.${system}.mkFunctionWorkload {
+  irFile = ./workload-ir.json;
+  appPkg = ./src;
+};
+```
+
+This factory remains the recommended entry point when you need
+custom `mkGuest` composition (multi-app workloads, hand-rolled
+network policy, mounts, addons, …). The helper rejects those
+shapes with an explicit pointer to this composition path.
+
 ## Files
 
 - `mkFunctionService.nix` — single generic factory. Dispatches on the
