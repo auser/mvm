@@ -92,6 +92,12 @@
 //!   `update::update` exits early with "already up to date" and
 //!   the outer wrapper emits `UpdateInstall`. No real network, no
 //!   binary swap.)
+//! - `mvmctl uninstall --yes --all` (with `MVM_UNINSTALL_PATH_PREFIX`
+//!   pointing at a sandbox sub-dir) → `Uninstall` (Plan 70: the
+//!   override rewrites `/var/lib/mvm` and `/usr/local/bin/mvmctl`
+//!   under the prefix and skips sudo, so the positive path is
+//!   exercised end-to-end without sudo prompts or destruction of
+//!   a developer's real install)
 //! - `mvmctl uninstall --yes --dry-run` → **no** audit entry
 //!   (the positive `Uninstall` path is real-system-destructive
 //!   and not safely-hermetic, but the dry-run path is read-only
@@ -1341,6 +1347,54 @@ fn update_check_does_not_emit_audit_entry() {
         hits, 0,
         "read-only `update --check` must not emit; got {hits}. \
          Full log:\n{log}"
+    );
+}
+
+#[test]
+fn uninstall_yes_all_emits_uninstall_audit_entry_via_prefix_override() {
+    // Plan 70: the positive `Uninstall` path mutates real system
+    // paths (`/var/lib/mvm`, `/usr/local/bin/mvmctl`) via sudo —
+    // not safely-hermetic on a developer's machine. The
+    // `MVM_UNINSTALL_PATH_PREFIX` env-var rewrites the targets
+    // under a sandbox sub-dir and skips sudo. The audit emit fires
+    // unconditionally at the end of the verb, so the test pins the
+    // emit + the on-disk side-effect (the rewritten paths are
+    // gone).
+    let sandbox = AuditSandbox::new();
+    let prefix = sandbox.home_path().join("system-root");
+    let stub_state_dir = prefix.join("var/lib/mvm");
+    let stub_bin = prefix.join("usr/local/bin/mvmctl");
+    std::fs::create_dir_all(&stub_state_dir).expect("mkdir state stub");
+    std::fs::create_dir_all(stub_bin.parent().unwrap()).expect("mkdir bin dir");
+    std::fs::write(&stub_bin, b"#!/bin/sh\nexit 0\n").expect("write stub binary");
+
+    let output = sandbox
+        .mvmctl()
+        .env("MVM_UNINSTALL_PATH_PREFIX", &prefix)
+        .args(["uninstall", "--yes", "--all"])
+        .output()
+        .expect("spawn mvmctl uninstall");
+    assert!(
+        output.status.success(),
+        "mvmctl uninstall failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "uninstall");
+    assert!(
+        hits >= 1,
+        "expected ≥1 uninstall entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        !stub_state_dir.exists(),
+        "stub state dir at {} must be removed",
+        stub_state_dir.display()
+    );
+    assert!(
+        !stub_bin.exists(),
+        "stub binary at {} must be removed",
+        stub_bin.display()
     );
 }
 
