@@ -149,18 +149,37 @@ fn run_parent() -> i32 {
 
     eprintln!("[bootcheck] child exit: {exit_status:?}");
     eprintln!("[bootcheck] outcome: {outcome:?}");
+    // Gate semantics: this binary answers "is the VMM viable on this
+    // host?" — not "is our rootfs complete?". Kernel-reached-userspace
+    // and kernel-booted-but-rootfs-failed both prove the VMM works.
+    // NoOutput means libkrun (or its caller) couldn't even get the
+    // kernel running, which IS a VMM-side failure. Strict-mode (env
+    // `MVM_LIBKRUN_BOOTCHECK_STRICT=1`) demands ReachedUserspace for
+    // smoke tests that also validate the rootfs path.
+    let strict = std::env::var("MVM_LIBKRUN_BOOTCHECK_STRICT").is_ok();
     match outcome {
         Outcome::ReachedUserspace => {
             println!("PASS — libkrun booted Linux to userspace on this host");
             0
         }
+        Outcome::KernelBooted if !strict => {
+            println!(
+                "PASS — libkrun booted the Linux kernel (rootfs/init incomplete; \
+                 not part of the VMM-viability gate)"
+            );
+            0
+        }
         Outcome::KernelBooted => {
-            println!("PARTIAL — kernel booted; init/rootfs broke. libkrun itself works.");
+            println!(
+                "PARTIAL — kernel booted but did not reach userspace. \
+                 (strict mode set MVM_LIBKRUN_BOOTCHECK_STRICT=1)"
+            );
             1
         }
         Outcome::NoOutput => {
             println!(
-                "FAIL — no kernel output observed. Cmdline / console mis-routed, or kernel never started."
+                "FAIL — no kernel output observed. Cmdline / console mis-routed, \
+                 or kernel never started."
             );
             2
         }
@@ -214,6 +233,36 @@ fn run_child() {
     let rootfs = std::env::var(ROOTFS_ENV).expect("child requires ROOTFS");
     let console = std::env::var(CONSOLE_ENV).expect("child requires CONSOLE");
     let cmdline = std::env::var(CMDLINE_ENV).expect("child requires CMDLINE");
+
+    // Dump the current binary's codesigning + entitlements. `ensure_signed`
+    // ran in the parent (and would have re-exec'd) before reaching here,
+    // so the entitlement plist embedded in this binary IS what
+    // Hypervisor.framework consults. If `com.apple.security.hypervisor`
+    // is missing, `hv_vm_create` returns EPERM and `krun_start_enter`
+    // surfaces `VmSetup(VmCreate)`.
+    #[cfg(target_os = "macos")]
+    {
+        if let Ok(exe) = std::env::current_exe() {
+            eprintln!("[bootcheck child] codesign probe on {}", exe.display());
+            match Command::new("codesign")
+                .args(["-d", "--entitlements", ":-"])
+                .arg(&exe)
+                .output()
+            {
+                Ok(out) => {
+                    let so = String::from_utf8_lossy(&out.stdout);
+                    let se = String::from_utf8_lossy(&out.stderr);
+                    if !so.trim().is_empty() {
+                        eprintln!("[bootcheck child] codesign entitlements stdout:\n{so}");
+                    }
+                    if !se.trim().is_empty() {
+                        eprintln!("[bootcheck child] codesign stderr:\n{se}");
+                    }
+                }
+                Err(e) => eprintln!("[bootcheck child] codesign probe failed: {e}"),
+            }
+        }
+    }
 
     // Crank libkrun's internal log level — when the FFI rejects a
     // call we want to see *which* one and *why*, not just rc -22 in

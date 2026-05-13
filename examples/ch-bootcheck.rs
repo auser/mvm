@@ -189,18 +189,36 @@ fn run() -> i32 {
 
     eprintln!("[ch-bootcheck] child exit: {exit_status:?}");
     eprintln!("[ch-bootcheck] outcome: {outcome:?}");
+    // Gate semantics match libkrun-bootcheck: the question is "is the
+    // VMM viable on this host?" Kernel-reached-userspace and kernel-
+    // booted-but-rootfs-failed both prove the VMM works. NoOutput is
+    // the only outcome that indicates a VMM-side failure. Strict mode
+    // (`MVM_CH_BOOTCHECK_STRICT=1`) tightens the gate to require
+    // userspace markers for smoke tests that also validate the rootfs.
+    let strict = std::env::var("MVM_CH_BOOTCHECK_STRICT").is_ok();
     match outcome {
         Outcome::ReachedUserspace => {
             println!("PASS — cloud-hypervisor booted Linux to userspace on this host");
             0
         }
+        Outcome::KernelBooted if !strict => {
+            println!(
+                "PASS — cloud-hypervisor booted the Linux kernel (rootfs/init \
+                 incomplete; not part of the VMM-viability gate)"
+            );
+            0
+        }
         Outcome::KernelBooted => {
-            println!("PARTIAL — kernel booted; init/rootfs broke. cloud-hypervisor itself works.");
+            println!(
+                "PARTIAL — kernel booted but did not reach userspace. \
+                 (strict mode set MVM_CH_BOOTCHECK_STRICT=1)"
+            );
             1
         }
         Outcome::NoOutput => {
             println!(
-                "FAIL — no kernel output observed. Cmdline / serial mis-routed, or CH never started the guest."
+                "FAIL — no kernel output observed. Cmdline / serial mis-routed, \
+                 or CH never started the guest."
             );
             2
         }
