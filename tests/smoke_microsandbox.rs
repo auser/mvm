@@ -38,8 +38,8 @@
 
 // Whole-file gate: the smoke only makes sense when the microsandbox
 // backend is compiled in. Library-consumer builds disable the
-// `backends-microsandbox` feature and skip this file entirely.
-#![cfg(feature = "backends-microsandbox")]
+// `contributor-bootstrap` feature and skip this file entirely.
+#![cfg(feature = "contributor-bootstrap")]
 
 use mvmctl::backend::microsandbox::MicrosandboxBackend;
 use mvmctl::core::vm_backend::VmId;

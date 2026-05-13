@@ -56,7 +56,7 @@ pub mod network;
 // One cfg at the module declaration gates the whole integration; the
 // few call-sites in `backend.rs` carry matching cfgs grouped by
 // function.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 pub mod microsandbox;
 
 pub use apple_container::AppleContainerBackend;
@@ -64,7 +64,7 @@ pub use backend::{AnyBackend, FirecrackerBackend, FirecrackerConfig};
 pub use cloud_hypervisor::CloudHypervisorBackend;
 pub use docker::DockerBackend;
 pub use libkrun::LibkrunBackend;
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 pub use microsandbox::MicrosandboxBackend;
 pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
 pub use mock::MockBackend;
@@ -80,5 +80,5 @@ pub use mock::MockBackend;
 /// `crate::HOME_TEST_LOCK`; the `handle_registry` tests import
 /// from `mvm_base` directly. The cfg matches the only consumer so
 /// no-default-features builds stay warning-clean.
-#[cfg(all(test, feature = "backends-microsandbox"))]
+#[cfg(all(test, feature = "contributor-bootstrap"))]
 pub(crate) use mvm_base::runtime_meta::HOME_TEST_LOCK;

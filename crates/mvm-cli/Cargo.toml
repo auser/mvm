@@ -12,7 +12,7 @@ authors.workspace = true
 mvm-core.workspace = true
 mvm-guest.workspace = true
 # `default-features = false` + the feature-forwarding block carries the
-# `backends-microsandbox` choice down to the leaf crates that actually
+# `contributor-bootstrap` choice down to the leaf crates that actually
 # pull microsandbox. See the same pattern in `crates/mvm/Cargo.toml` and
 # the root `Cargo.toml`.
 mvm = { workspace = true, default-features = false }
@@ -64,10 +64,10 @@ rand.workspace = true
 
 [features]
 default = []
-backends-microsandbox = [
-    "mvm/backends-microsandbox",
-    "mvm-build/backends-microsandbox",
-    "mvm-backend/backends-microsandbox",
+contributor-bootstrap = [
+    "mvm/contributor-bootstrap",
+    "mvm-build/contributor-bootstrap",
+    "mvm-backend/contributor-bootstrap",
 ]
 custom-dns = ["mvm-supervisor/custom-dns"]
 dev-watch = ["dep:notify", "dep:notify-debouncer-mini"]

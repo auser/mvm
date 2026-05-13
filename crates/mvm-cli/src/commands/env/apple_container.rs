@@ -498,7 +498,7 @@ pub(super) fn cmd_dev_apple_container_status() -> Result<()> {
 fn ensure_dev_image() -> Result<(String, String)> {
     let local_flake = find_dev_image_flake().ok();
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     if let Some(flake_dir) = &local_flake {
         let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
         if let Some(parent) = std::path::Path::new(&out_dir).parent() {
@@ -549,10 +549,10 @@ fn ensure_dev_image() -> Result<(String, String)> {
     if local_flake.is_none() {
         ui::info("No local dev-image flake found; downloading published prebuilt.");
     } else {
-        // `backends-microsandbox` is off — library-consumer build that
+        // `contributor-bootstrap` is off — library-consumer build that
         // never owns a dev VM. The only path forward is the prebuilt.
         ui::info(
-            "Builder-VM backend compiled out (no `backends-microsandbox` feature); \
+            "Builder-VM backend compiled out (no `contributor-bootstrap` feature); \
              downloading published prebuilt instead of local build.",
         );
     }
@@ -1608,7 +1608,7 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
 /// the previous host-nix + `nix-darwin` `linux-builder` path so mvm
 /// owns the builder VM end-to-end and the user needs no external Nix
 /// configuration on the host.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(String, String)> {
     use mvm_build::builder_vm::{
         BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, BuilderVm, MicrosandboxBuilderVm,
@@ -1733,7 +1733,7 @@ fn find_dev_image_flake() -> Result<String> {
 /// (Was `nix/default-microvm/` before W7.3.) Only the builder-VM path
 /// in `ensure_default_microvm_image` consumes this helper; gating
 /// matches that single call site.
-#[cfg(feature = "backends-microsandbox")]
+#[cfg(feature = "contributor-bootstrap")]
 fn find_default_microvm_flake() -> Result<String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = std::path::Path::new(manifest_dir)
@@ -1761,7 +1761,7 @@ fn find_default_microvm_flake() -> Result<String> {
 /// `(kernel_path, rootfs_path)`.
 ///
 /// If the local build fails or no source flake is available (e.g. an
-/// installed-binary build with `backends-microsandbox` compiled out),
+/// installed-binary build with `contributor-bootstrap` compiled out),
 /// falls back to downloading a pre-built image from the matching
 /// GitHub release.
 pub(crate) fn ensure_default_microvm_image() -> Result<(String, String)> {
@@ -1775,7 +1775,7 @@ pub(crate) fn ensure_default_microvm_image() -> Result<(String, String)> {
         return Ok((kernel_path, rootfs_path));
     }
 
-    #[cfg(feature = "backends-microsandbox")]
+    #[cfg(feature = "contributor-bootstrap")]
     if let Ok(flake_dir) = find_default_microvm_flake() {
         ui::info("Building default microVM image via microsandbox builder VM (first time only)...");
         match build_image_via_microsandbox(&flake_dir, &cache_dir) {
