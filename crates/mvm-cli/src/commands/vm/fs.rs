@@ -165,6 +165,16 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
 
 fn instance_dir_for(name: &str) -> Result<String> {
     validate_vm_name(name).with_context(|| format!("Invalid VM name: {:?}", name))?;
+    // Plan 66 W3: if a mock VM is registered at
+    // `<mvm_data_dir>/mock-vms/<name>/runtime/v.sock`, route to it
+    // directly. The check is filesystem-based — production code
+    // never reaches the mock-vms path because `MockBackend` only
+    // populates it under `--hypervisor mock`. Falls through to the
+    // Lima-era resolver when no mock is in play.
+    let mock_dir = mvm_backend::MockBackend::vm_dir(name);
+    if mock_dir.join("runtime").join("v.sock").exists() {
+        return Ok(mock_dir.to_string_lossy().into_owned());
+    }
     microvm::resolve_running_vm_dir(name)
 }
 
