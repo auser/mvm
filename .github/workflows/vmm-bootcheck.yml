@@ -107,12 +107,27 @@ jobs:
           retention-days: 1
 
   # libkrun on macOS Apple Silicon.
-  # Validates the macOS half of the cross-platform matrix. `macos-latest`
-  # has been Apple Silicon since late 2024; libkrun installs cleanly via
-  # Homebrew. The aarch64 dev-image was produced by build-image above.
+  #
+  # Builds + runs the libkrun-bootcheck against the aarch64 image.
+  # `continue-on-error: true` because GitHub-hosted macos-latest
+  # runners are themselves virtual machines on Apple Silicon and
+  # Apple's Hypervisor.framework rejects `hv_vm_create()` from
+  # inside those guests — the entitlement is correctly applied
+  # (verified by codesign --entitlements dump) but HVF refuses to
+  # nest. The blocking gate is `ch-linux`; this job's value is the
+  # entitlement / link-time / build-time surface, not the boot.
+  #
+  # To get real libkrun-boot CI on macOS, options are:
+  #   (a) self-hosted runner on Apple Silicon hardware (one-time setup)
+  #   (b) GitHub's paid `macos-15-large` bare-metal runner (per-min cost)
+  #
+  # Until either is wired, local-dev validation answers the gate;
+  # the macOS bootcheck has been confirmed PASS locally on an M4 Max
+  # against the dev-prebuilt artifacts (commit 13d2a37).
   libkrun-macos:
     needs: build-image
     runs-on: macos-latest
+    continue-on-error: true
     steps:
       - uses: actions/checkout@v6
 
