@@ -52,6 +52,15 @@ pub enum Error {
     /// A path or string argument contained an interior NUL byte or
     /// was not representable as UTF-8 / a C string.
     InvalidCString,
+    /// Filesystem I/O failure while setting up the supervisor's per-VM
+    /// state directory or PID file. Carries a free-form context
+    /// string rather than the raw `io::Error` so the `PartialEq`/`Eq`
+    /// derives on `Error` keep working.
+    Io {
+        /// Operation + path + underlying message, formatted by the
+        /// caller. E.g. `create_dir_all /Users/x/.mvm/vms/foo: permission denied`.
+        context: String,
+    },
 }
 
 impl std::fmt::Display for Error {
@@ -70,6 +79,7 @@ impl std::fmt::Display for Error {
                 f,
                 "argument contained an interior NUL byte or non-UTF-8 path"
             ),
+            Self::Io { context } => write!(f, "supervisor I/O error: {context}"),
         }
     }
 }
@@ -150,6 +160,7 @@ pub fn install_paths() -> Vec<&'static str> {
 /// order disks are added); each `KrunDisk` becomes `/dev/vdb`,
 /// `/dev/vdc`, … in the order they appear in [`KrunContext::extra_disks`].
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "libkrun-sys", derive(serde::Serialize, serde::Deserialize))]
 pub struct KrunDisk {
     /// Symbolic identifier passed to `krun_add_disk` (`block_id`).
     /// Not user-visible inside the guest; libkrun uses it for
@@ -169,6 +180,7 @@ pub struct KrunDisk {
 /// that consume each field live in [`sys`] under the `libkrun-sys`
 /// feature.
 #[derive(Debug, Clone)]
+#[cfg_attr(feature = "libkrun-sys", derive(serde::Serialize, serde::Deserialize))]
 pub struct KrunContext {
     pub name: String,
     pub kernel_path: String,
@@ -348,8 +360,8 @@ fn configure(ctx: &KrunContext) -> Result<sys::Context, Error> {
     for disk in &ctx.extra_disks {
         krun.add_disk(&disk.id, Path::new(&disk.path), disk.read_only)?;
     }
-    // libkrun's vsock model — what plan 57 W3.3 settled on after the
-    // first end-to-end smoke (2026-05-13):
+    // libkrun's vsock model — refined by plan 57 W4 after a closer
+    // read of `libkrun.h`:
     //
     // - TSI (Transparent Socket Impersonation) is auto-enabled when
     //   no virtio-net device is added. The libkrun README is
@@ -358,30 +370,28 @@ fn configure(ctx: &KrunContext) -> Result<sys::Context, Error> {
     //   never call `krun_add_net_*`, so TSI is always on, and the
     //   virtio-vsock device exists implicitly.
     //
-    // - `krun_add_vsock` (no `_port`) is for *adding a second
-    //   independent virtio-vsock device*. Because TSI already
-    //   provides one, calling it returns `-EEXIST` (verified on
-    //   libkrun 1.17.4). Do not call it from the W3 path.
+    // - `krun_add_vsock` is for *adding a second independent*
+    //   virtio-vsock device, and requires `krun_disable_implicit_vsock`
+    //   first. Because TSI already provides one, naively calling it
+    //   returns `-EEXIST` (verified on libkrun 1.17.4). Do not use
+    //   from mvm's path.
     //
-    // - `krun_add_vsock_port(ctx, port, host_path)` pairs a
-    //   guest-side vsock port with a host unix socket. libkrun
-    //   does *not* create the socket file — that's the host's
-    //   responsibility. The owning host process binds a
-    //   `UnixListener` at `host_path` before calling `start_enter`;
-    //   when the guest opens `AF_VSOCK` to `port`, libkrun proxies
-    //   it to a client connection at the listener.
-    //
-    // The W4 supervisor / Plan 72 builder-VM launcher own the
-    // listener; this configure() step just registers the path so
-    // libkrun knows where to send traffic. The smoke binary
-    // (`examples/libkrun-smoke.rs`) registers the path too even
-    // though it has no sibling listener — that's fine: an
-    // unbound path means the guest's AF_VSOCK connects will fail
-    // with ECONNREFUSED inside the guest, which the W3 spike
-    // doesn't care about. The W4 PR adds the listener.
+    // - **Direction matters.** `krun_add_vsock_port` (no `_2`)
+    //   documents "port that the guest will connect to for IPC" —
+    //   guest is the client, host is the server, host binds the
+    //   listener. `krun_add_vsock_port2(..., listen=true)` flips
+    //   it: "guest expects connections to be initiated from host
+    //   side" — guest is the server, libkrun creates the unix
+    //   socket file as a listener, host processes connect as
+    //   clients. mvm's guest agent always *listens* on
+    //   `GUEST_AGENT_PORT`, so `listen=true` is the right mode for
+    //   every vsock port we register here. The W3.3 PR used
+    //   `add_vsock_port` (no `_2`); that was the wrong direction
+    //   but happened to boot because nothing in the guest actually
+    //   tried to use vsock. W4 corrects it.
     for &port in &ctx.vsock_ports {
         let socket = ctx.vsock_socket_path(port);
-        krun.add_vsock_port(port, &socket)?;
+        krun.add_vsock_port2(port, &socket, /* listen = */ true)?;
     }
     if let Some(console_path) = &ctx.console_output_path {
         krun.set_console_output(Path::new(console_path))?;
@@ -437,6 +447,76 @@ pub fn start_enter(ctx: &KrunContext) -> Result<std::convert::Infallible, Error>
     {
         let krun = configure(ctx)?;
         krun.start_enter()
+    }
+}
+
+/// Configuration consumed by [`run_supervisor`] — the JSON shape that
+/// the `mvm-libkrun-supervisor` binary reads from stdin and that
+/// `LibkrunBackend::start()` produces. Holds the [`KrunContext`] plus
+/// supervisor-process bookkeeping fields that don't belong on the
+/// pure-FFI config type.
+#[cfg(feature = "libkrun-sys")]
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct SupervisorConfig {
+    /// The guest configuration to hand to libkrun.
+    pub krun: KrunContext,
+    /// Directory under which the supervisor writes its PID file and
+    /// (via `KrunContext::vsock_socket_dir`) the per-port vsock
+    /// listener sockets. Typically `~/.mvm/vms/<name>/`. Created if
+    /// absent.
+    pub vm_state_dir: String,
+    /// File name inside `vm_state_dir` to receive the supervisor's
+    /// PID. Defaults to `"libkrun.pid"` when `None`. Plan 72's
+    /// builder VM uses a different name (`builder.pid`) so the user
+    /// dev VM and the builder can coexist in the same directory tree.
+    pub pid_file_name: Option<String>,
+}
+
+#[cfg(feature = "libkrun-sys")]
+impl SupervisorConfig {
+    fn pid_file(&self) -> std::path::PathBuf {
+        std::path::PathBuf::from(&self.vm_state_dir)
+            .join(self.pid_file_name.as_deref().unwrap_or("libkrun.pid"))
+    }
+}
+
+/// Run a libkrun guest under a long-lived supervisor process.
+///
+/// **Plan 57 W4 entry point.** Each call owns exactly one libkrun
+/// guest for the lifetime of the calling process. Steps:
+///
+/// 1. Create `vm_state_dir` if absent.
+/// 2. Write the calling process's PID to `<vm_state_dir>/<pid_file_name>`.
+/// 3. Call [`start_enter`], which configures libkrun (including the
+///    `add_vsock_port2(listen=true)` host-listener registration so
+///    libkrun creates the unix socket file as a server) and then
+///    blocks the calling thread in `krun_start_enter`.
+///
+/// `krun_start_enter` calls `exit()` on the supervisor when the
+/// guest powers off cleanly. That's the point of running one process
+/// per VM — only this supervisor terminates; the parent `mvmctl` and
+/// any sibling supervisors are unaffected.
+///
+/// Without the `libkrun-sys` feature, returns [`Error::NotYetWired`].
+#[cfg(feature = "libkrun-sys")]
+pub fn run_supervisor(cfg: &SupervisorConfig) -> Result<std::convert::Infallible, Error> {
+    std::fs::create_dir_all(&cfg.vm_state_dir).map_err(|e| Error::Io {
+        context: format!("create_dir_all {}: {e}", cfg.vm_state_dir),
+    })?;
+    let pid_path = cfg.pid_file();
+    let pid = std::process::id().to_string();
+    std::fs::write(&pid_path, &pid).map_err(|e| Error::Io {
+        context: format!("write pid file {}: {e}", pid_path.display()),
+    })?;
+    start_enter(&cfg.krun)
+}
+
+/// Non-FFI-feature stub so callers can reference the function name
+/// regardless of build configuration. Returns [`Error::NotYetWired`].
+#[cfg(not(feature = "libkrun-sys"))]
+pub fn run_supervisor_unavailable() -> Error {
+    Error::NotYetWired {
+        tracking: "specs/plans/57-libkrun-spike.md W4 — rebuild with --features libkrun-sys",
     }
 }
 

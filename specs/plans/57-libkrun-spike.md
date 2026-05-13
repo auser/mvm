@@ -130,10 +130,13 @@ libkrun is a library, not a daemon. `krun_start_enter` blocks the calling thread
   - Pro: matches Firecracker / Apple Container UX (`mvmctl start` returns immediately).
   - Con: more code, more failure modes.
 
-**Recommendation**: ship Option A first (covers the dev workflow), file a follow-up issue for Option B once the spike validates the rest of the stack. Most users in Sprint 48 are dev-mode users; the persistent-VM use case is rarer for libkrun specifically.
+**Recommendation (revised 2026-05-13 after the W3 spike): ship Option B.** Option A's "background thread holds the libkrun handle" pattern collapses on close: `krun_start_enter` calls `exit()` on the *whole process* when the guest powers off cleanly (libkrun documents this; reproduced in the W3 smoke as the `start_enter` return type becoming `Result<Infallible, _>`). That means stopping any one VM in a multi-VM registry would tear down the mvmctl process and every other libkrun guest it was supervising. Option A *would* work for the single-VM dev shell, but the moment the design grows to plan 72's builder VM + a user-facing `mvmctl up --hypervisor libkrun`, Option A's blast radius is unacceptable. Option B (subprocess per VM) sidesteps the `exit()` problem entirely — each supervisor process owns exactly one libkrun guest, and the parent mvmctl returns immediately after spawning.
 
-- **W4.1** Implement Option A. Files: `crates/mvm/src/vm/libkrun.rs` gains a `LIBKRUN_VMS: OnceLock<Mutex<HashMap<VmId, KrunHandle>>>` static. `start()` spawns the supervisor thread; `stop()` signals it to exit; `list()` returns keys; `status()` checks presence.
-- **W4.2** `stop_all()` becomes a real implementation (today it's an empty `Ok(())` placeholder).
+- **W4.1** Add a `mvm-libkrun-supervisor` binary in `crates/mvm-libkrun/src/bin/`. It reads a `SupervisorConfig` JSON document from stdin, runs `ensure_signed()` (W2 codesigning gate), creates the per-VM directory under `~/.mvm/vms/<name>/`, writes its own PID to `~/.mvm/vms/<name>/libkrun.pid`, registers each vsock port via `krun_add_vsock_port2(listen=true)` (libkrun then creates the unix socket file as a listener when the guest binds to the matching `AF_VSOCK` port), then calls `mvm_libkrun::start_enter`. Process lifetime equals VM lifetime: `exit()` from libkrun terminates only this supervisor, not its parent.
+
+  *Finding from the W4 spike run (2026-05-13):* the supervisor writes its PID and reaches `start_enter` cleanly. With the dev-VM artifacts the guest boots through the kernel but the rootfs's init crashes at a BusyBox `setpriv: unrecognized option: reuid=990`, so the guest never gets to `AF_VSOCK::bind(GUEST_AGENT_PORT)`. libkrun creates the unix socket file lazily on first guest bind, so the per-VM dir stays empty until a working guest agent runs. The supervisor infrastructure is correct; full vsock proof needs the dev-VM init fix (orthogonal — tracked under the dev-VM owners) or a minimal test rootfs that just opens a vsock listener.
+- **W4.2** Wire `LibkrunBackend::start()` to spawn the supervisor via `std::process::Command::new(supervisor_path())`, pipe the config JSON to stdin, and return. `LibkrunBackend::stop()` reads the PID file and signals (SIGTERM, optionally promoted via shutdown_eventfd). `list()` walks `~/.mvm/vms/*/libkrun.pid`. `stop_all()` iterates the same walk.
+- **W4.3** Add an integration test that spawns the supervisor on the W3 dev artifacts, connects a `UnixStream` to the bound vsock listener, and waits for libkrun to proxy a single byte. This is the missing W3.3 health-check that the spike couldn't run in-process.
 
 ### W5 — CI lanes (0.5–1 day)
 
@@ -162,7 +165,8 @@ These each merit their own one-day sub-sprint *after* plan 57 ships.
 | `crates/mvm-libkrun/src/sys.rs` | W1.3 | new — safe wrapper over generated bindings |
 | `crates/mvm-libkrun/src/lib.rs` | W1.4 | replace `NotYetWired` returns with real calls |
 | `crates/mvm-apple-container/macos/Entitlements.plist` (or equivalent) | W2.1 | add `com.apple.security.hypervisor` if not already present |
-| `crates/mvm/src/vm/libkrun.rs` | W4.1 | wire `LIBKRUN_VMS` registry, real lifecycle |
+| `crates/mvm-libkrun/src/bin/mvm-libkrun-supervisor.rs` | W4.1 | new — one process per libkrun guest, owns the host-side vsock listeners + PID file |
+| `crates/mvm-backend/src/libkrun.rs` | W4.2 | wire `LibkrunBackend::start/stop/list` to spawn / signal / walk the supervisor processes |
 | `examples/libkrun-smoke.rs` | W5.1 | new — minimal end-to-end test binary |
 | `.github/workflows/ci.yml` | W5.1 | new `libkrun-macos-arm64` job |
 | `public/.../guides/troubleshooting.md` | W2.3 | first-run codesigning prompt FAQ |

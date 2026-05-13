@@ -34,6 +34,23 @@ build = "build.rs"
 [dependencies]
 libc.workspace = true
 tracing = "0.1"
+# Plan 57 W4 supervisor binary (`src/bin/mvm-libkrun-supervisor.rs`)
+# needs JSON config parsing on stdin and pulls `ensure_signed()` from
+# mvm-providers (macOS codesigning gate). All optional and gated on
+# `libkrun-sys` so the default workspace build (CI fast lane, hosts
+# without libkrun.h) skips the heavier dep graph.
+#
+# We intentionally do NOT pull `mvm-guest` from regular deps: that
+# would close a cycle (mvm-core → mvm-libkrun → mvm-guest → mvm-core,
+# since mvm-core depends on mvm-libkrun for `Platform::has_libkrun`).
+# The supervisor receives the vsock port list via the JSON config —
+# the symbolic `GUEST_AGENT_PORT` constant is only needed by callers
+# composing the config, not by the supervisor consuming it. The
+# `libkrun-smoke` example keeps `mvm-guest` as a dev-dep because
+# dev-deps are excluded from cycle analysis.
+mvm-providers = { workspace = true, optional = true }
+serde = { workspace = true, optional = true }
+serde_json = { workspace = true, optional = true }
 
 [build-dependencies]
 # `bindgen` is required only when the `libkrun-sys` feature is on; we
@@ -46,13 +63,17 @@ bindgen = "0.72"
 default = []
 # Opt-in: generate FFI bindings and link `libkrun`. Off by default so
 # the workspace builds on hosts without libkrun installed (CI fast lane,
-# Linux contributors who don't run the Tier 2 backend).
-libkrun-sys = []
+# Linux contributors who don't run the Tier 2 backend). Enables the
+# supervisor binary and its mvm-guest/mvm-providers/serde dep chain.
+libkrun-sys = [
+    "dep:mvm-providers",
+    "dep:serde",
+    "dep:serde_json",
+]
 
 [dev-dependencies]
-# The plan 57 W3 smoke example pulls `GUEST_AGENT_PORT` so the smoke
-# binary and the production vsock plumbing stay in sync on which port
-# the guest agent expects.
+# The plan 57 W3 smoke example shares `GUEST_AGENT_PORT` with the
+# production vsock plumbing.
 mvm-guest.workspace = true
 # `ensure_signed()` is plan 57 W2's codesigning gate. macOS rejects
 # any process that calls `Hypervisor.framework` without
@@ -68,6 +89,16 @@ mvm-providers.workspace = true
 [[example]]
 name = "libkrun-smoke"
 path = "examples/libkrun-smoke.rs"
+required-features = ["libkrun-sys"]
+
+# Plan 57 W4 — long-running supervisor process. One process per
+# libkrun guest. Reads a JSON `SupervisorConfig` on stdin, binds host
+# vsock listeners, writes its PID under ~/.mvm/vms/<name>/, then
+# `start_enter`s the guest. The W4.2 PR wires
+# `LibkrunBackend::start()` to spawn this binary.
+[[bin]]
+name = "mvm-libkrun-supervisor"
+path = "src/bin/mvm-libkrun-supervisor.rs"
 required-features = ["libkrun-sys"]
 
 [lints]
