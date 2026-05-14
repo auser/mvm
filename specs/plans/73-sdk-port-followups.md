@@ -87,6 +87,53 @@ inside the libkrun builder VM:
 into. Pure-Rust primitives are ready (Phase 9 commits); this
 followup is the in-VM glue.
 
+### B.2.x — Egress allowlist (LANDED)
+
+The egress-allowlist slice ships an HTTP CONNECT proxy
+(`crates/mvm-egress-proxy/`) that the builder VM runs alongside
+the installer. `mvm-builder-init::install::run_install` spawns
+the proxy before invoking `uv` / `pnpm`, injects
+`HTTPS_PROXY` + `HTTP_PROXY` env pointing at `http://127.0.0.1:8443`,
+and tears the proxy down after. The proxy embeds the four
+ADR-047 hostnames at compile time — no env-var override on
+production builds; the `dev-shell` feature flag exposes a
+test-only `MVM_EGRESS_ALLOWLIST` override.
+
+The builder VM flake installs the proxy at
+`/sbin/mvm-egress-proxy` (alongside `/sbin/mvm-builder-init`),
+and PID 1 picks it up via PATH lookup. Tests live in
+`crates/mvm-egress-proxy/src/{allowlist,proxy}.rs` (24 unit
+tests) and `crates/mvm-builder-init/src/install.rs::tests`
+(proxy lifecycle wraps the installer + env vars set + abort
+on proxy failure).
+
+### B.2.y — Complementary iptables drop-rule (NOT YET)
+
+B.2.x's proxy is the only enforcement mechanism today. A
+pathological installer that ignores `HTTPS_PROXY` could
+theoretically dial pypi.org directly. Defense-in-depth: add
+an iptables rule inside the builder VM that drops outbound
+traffic *not* originating from the proxy's UID, so even a
+misbehaving installer's direct fetch fails closed. Scope:
+
+- New systemd-style setup invocation inside
+  `mvm-builder-init::linux::setup_network` that loads an
+  `iptables -A OUTPUT` rule. Specifically `-m owner --uid-owner
+  <proxy_uid> -j ACCEPT` then `-A OUTPUT -j DROP` so only
+  proxy-originated egress is allowed.
+- Run the proxy under a dedicated UID (currently it runs as
+  PID 1's UID — root). Add a `mvm-egress-proxy` system user
+  in the builder VM rootfs (uid 902, mirroring the agent's
+  uid 901 slot).
+- Test gate: extend `scripts/test-app-deps-ci-gate.sh` with a
+  smoke test that boots the builder VM with a manipulated env
+  (`HTTPS_PROXY=`), runs a forbidden curl from inside, asserts
+  the iptables rule drops it.
+
+**Blocked on:** Plan 72 W4/W5 — needs a live builder VM to
+exercise the iptables rule. Once B.2.x is merged + the
+builder VM lands, this can ship as a small followon PR.
+
 ## Followup C — `mvmctl deps` CLI verbs
 
 User-facing surface for the volume audit pipeline:

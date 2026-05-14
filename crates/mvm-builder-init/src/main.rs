@@ -72,6 +72,8 @@ use std::process::ExitCode;
 mod install;
 #[allow(dead_code)]
 mod install_spec;
+#[allow(dead_code)]
+mod proxy;
 
 fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
@@ -200,8 +202,11 @@ mod linux {
     /// via the *presence* of result.json. Anything that prevents
     /// us from writing result.json gets logged + falls through.
     fn run_install_job(spec_path: &str) {
-        use crate::install::{InstallError, RESULT_FILENAME, SystemCommandRunner, run_install};
+        use crate::install::{
+            InstallContext, InstallError, RESULT_FILENAME, SystemCommandRunner, run_install,
+        };
         use crate::install_spec::parse;
+        use crate::proxy::ChildProxyLifecycle;
 
         let bytes = match std::fs::read(spec_path) {
             Ok(b) => b,
@@ -221,8 +226,21 @@ mod linux {
         };
 
         let runner = SystemCommandRunner;
-        let report = match run_install(&spec, Path::new(JOB_DIR), Path::new(OUT_DIR), &runner, None)
-        {
+        // Plan 73 Followup B.2.x: the production proxy lifecycle
+        // spawns `mvm-egress-proxy` from PATH. The builder VM
+        // flake installs the binary at `/sbin/mvm-egress-proxy`
+        // (alongside `/sbin/mvm-builder-init`), which is on the
+        // kernel's default PATH for PID 1.
+        let mut proxy = ChildProxyLifecycle::default_binary();
+        let ctx = InstallContext {
+            spec: &spec,
+            job_dir: Path::new(JOB_DIR),
+            out_dir: Path::new(OUT_DIR),
+            runner: &runner,
+            extra_path: None,
+            proxy: &mut proxy,
+        };
+        let report = match run_install(ctx) {
             Ok(r) => r,
             Err(InstallError::InstallerMissing { program }) => {
                 eprintln!(
