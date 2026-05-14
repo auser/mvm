@@ -1,0 +1,657 @@
+---
+title: From Workload IR to MicroVM Image
+description: How mvm lowers an SDK-emitted Workload IR through Nix factories into a bootable microVM rootfs.
+---
+
+This guide explains the full pipeline that turns a workload described in an SDK (Python, Rust) into a bootable microVM rootfs. The pipeline has three layers and a build orchestrator; each layer is a small, addressable boundary you can read, replace, or skip.
+
+```
++----------------------+    emit_json     +-----------------------+
+|  Your SDK code       | ───────────────▶ |   Workload IR (JSON)  |
+|  (@mvm.app(), Rust   |                  |   canonical, hashable |
+|   builder, …)        |                  +-----------+-----------+
++----------------------+                              │
+                                                      │ readFile + fromJSON
+                                                      ▼
+                                          +-----------------------+
+                                          |  mkFunctionWorkload   |
+                                          |  (nix/lib helper)     |
+                                          +-----------+-----------+
+                                                      │ composes
+                                  ┌───────────────────┴───────────────────┐
+                                  ▼                                       ▼
+                    +-----------------------+               +-----------------------+
+                    |   mkFunctionService   |               |        mkGuest        |
+                    |   (per-language       |               |   (rootfs builder,    |
+                    |    factory)           |               |    busybox-as-PID-1)  |
+                    +-----------+-----------+               +-----------+-----------+
+                                │ extraFiles, packages,                 │
+                                │ service block                         │
+                                └───────────────────┬───────────────────┘
+                                                    ▼
+                                          +-----------------------+
+                                          |   rootfs.ext4 +       |
+                                          |   vmlinux +           |
+                                          |   mvm-meta.json       |
+                                          +-----------------------+
+```
+
+The IR is the contract; everything else is mechanical.
+
+## Layer 1 — The Workload IR
+
+The IR is a JSON document with a fixed schema. It describes one or more applications, each with a source, image, entrypoints, resources, dependencies, network policy, and optional addons. Two equivalent IR documents always serialize to the same bytes and the same hash.
+
+**Source of truth:** `crates/mvm-ir/src/workload.rs`
+
+The top-level shape:
+
+```rust
+pub struct Workload {
+    pub schema_version: String,                       // currently "0.1"
+    pub id: String,                                   // workload identifier
+    pub apps: Vec<App>,                               // one or more apps
+    pub volumes: Vec<Volume>,                         // optional volume decls
+    pub extensions: BTreeMap<String, serde_json::Value>,
+}
+```
+
+Each `App` carries:
+
+| Field | Purpose |
+|-------|---------|
+| `name` | App name |
+| `source` | Code source: `LocalPath`, `NixDerivation`, or `OciImage` |
+| `image` | Image spec: `nix_packages` (list of nixpkgs attrs) or `oci_base` |
+| `entrypoints` | One or more entrypoints (see below) |
+| `env` | Environment variables |
+| `mounts` | Optional config / secret / data mounts |
+| `network` | Optional egress policy |
+| `resources` | `vcpus`, `memory_mb`, `boot_timeout_secs` |
+| `dependencies` | Lockfile declaration (Python/Node) or `none` |
+| `threat_tier` | `Untrusted` (default) or `Trusted` |
+| `addons` | Composable addon-uses (ADR-0018) |
+
+Entrypoints come in two shapes:
+
+1. **Command-style** — a shell command that runs once at boot. The familiar `services: { my-app.command = "..." }` flow.
+2. **Function-style** — a long-running language wrapper that dispatches named functions per vsock call. Carries `language`, `module`, `function`, `format` (`json` | `msgpack`), optional `args_schema` / `return_schema`, optional warm-process `concurrency` block (ADR-0011), and a `primary` flag for multi-function apps.
+
+### Canonical form and hashing
+
+The IR is canonicalized to **RFC 8785** (keys sorted, no whitespace, deterministic escaping) before it is hashed or written to disk:
+
+- `crates/mvm-ir/src/canonicalize.rs` — produces the canonical byte sequence
+- `crates/mvm-ir/src/hash.rs` — `ir_hash()` returns the lowercase-hex SHA-256
+
+Two semantically equivalent IRs (different field order, different whitespace) **must** produce the same hash. The hash is what binds an IR to a launch plan and to an audit-chain entry (ADR-002 claim 8). If you change a workload's IR, its hash changes; if you change anything else, it does not.
+
+### Validation
+
+`crates/mvm-ir/src/validate.rs` runs the host-side checks. It rejects:
+
+- IRs with the wrong `schema_version`
+- Missing required fields, unknown fields (every type uses `#[serde(deny_unknown_fields)]`)
+- Languages not in `crates/mvm-ir/data/supported_languages.txt`
+- Unpinned dependencies — exits with `E_UNPINNED_DEPS`
+- Secret-shaped fields that leak into args/return schemas
+
+Validation runs in two places: in the SDK before emit, and again on the host when `mvmctl` ingests the IR. Don't trust an IR you didn't validate yourself.
+
+## Layer 2 — Producing the IR from an SDK
+
+The SDKs (Python today, Rust today, TypeScript soon) are all generated from the JSON schema for `Workload`, so they cannot drift from the IR. They share one **subprocess contract** (ADR-0002): the SDK runs the user's declaration code, builds an in-memory IR, and writes it out as canonical JSON. It never runs the user's workload on the host.
+
+### Python
+
+```python
+import mvm
+
+@mvm.app(
+    name="hello",
+    image=mvm.image.nix_packages(["python3"]),
+    resources=mvm.resources(vcpus=1, memory_mb=256),
+    dependencies=mvm.deps.none(),
+)
+@mvm.function(language="python", module="app", function="greet", format="json")
+def greet(name: str) -> str:
+    return f"hello, {name}"
+```
+
+`mvmctl emit entry.py` runs the user's module under `MVM_EMITTING=1` and `MVM_IR_OUT=/path/to/workload-ir.json`. The decorators build a `Workload` dataclass tree, `_dsl.emit_json()` calls `json.dumps(..., sort_keys=True, separators=(",", ":"))`, and the canonical bytes land at `MVM_IR_OUT` (or stdout when unset).
+
+### Rust
+
+```rust
+use mvm_sdk::{workload, image, resources};
+
+fn main() -> Result<(), mvm_sdk::EmitError> {
+    let wl = workload("hello")
+        .app(|a| a
+            .image(image::nix_packages(["python3"]))
+            .resources(resources(1, 256))
+            .function("python", "app", "greet", "json"))
+        .build()?;
+    mvm_sdk::emit(&wl)
+}
+```
+
+The Rust builders are `#[must_use]` and enforce required fields at compile time. `emit()` honors the same `MVM_IR_OUT` contract.
+
+After emission, you have a `workload-ir.json` file on disk. That's the boundary between "your code" and "mvm's build pipeline."
+
+## Layer 3 — Lowering IR into a Nix flake: `mkFunctionWorkload`
+
+The IR is **not directly rendered to flake.nix text**. There is no `.nix.tmpl` and no text substitution. Instead, mvm ships a Nix helper that reads the IR JSON at evaluation time and synthesizes a rootfs derivation. Your `flake.nix` is one line:
+
+```nix
+{
+  inputs = {
+    mvm.url = "github:tinylabscom/mvm?dir=nix";
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+  };
+
+  outputs = { mvm, nixpkgs, ... }:
+    let system = "aarch64-linux"; in {
+      packages.${system}.default = mvm.lib.${system}.mkFunctionWorkload {
+        irFile = ./workload-ir.json;
+        appPkg = ./src;
+      };
+    };
+}
+```
+
+**Source:** `nix/lib/mkFunctionWorkload.nix` (Plan 71)
+
+What it does, step by step:
+
+1. **Read the IR.** `ir = builtins.fromJSON (builtins.readFile irFile)`. Nix reads the canonical JSON directly; no preprocessor.
+2. **Validate the shape.** This helper supports exactly one app, exactly one primary function entrypoint, and a `nix_packages` image. Anything richer throws with a helpful error pointing you at the long form (mkFunctionService + mkGuest by hand).
+3. **Extract the function fields.** `language`, `module`, `function`, `format`, `working_dir` (defaults to `/app`).
+4. **Call the factory.** Pass those fields plus `appPkg` and `workloadId = ir.id` to `mkFunctionService` (Layer 4).
+5. **Compose with mkGuest.** Take the factory's `extraFiles` + `servicePackages`, add the IR's `image.packages` (`map (p: pkgs.${p}) (image.packages or [])`), wrap it all in a boot script that symlinks `appPkg` into `working_dir`, and hand the bundle to `mkGuest` (Layer 5).
+
+The helper is intentionally narrow. If you need a multi-function workload, a non-nix-packages image, network policy, mounts, or addons, drop down to:
+
+```nix
+mvm.lib.${system}.mkFunctionService { ... } +
+mvm.lib.${system}.mkGuest { ... }
+```
+
+…and assemble the pieces yourself. The factories are designed to compose; the one-liner is just a sugar shell for the most common shape.
+
+## Layer 4 — Per-language wiring: `mkFunctionService`
+
+**Source:** `nix/lib/factories/mkFunctionService.nix` (Plan 60, ADR-0008)
+
+This is the language-aware layer. It takes the function fields from the IR and produces three artifacts:
+
+| Output | What it is |
+|--------|------------|
+| `extraFiles` | Files baked into the rootfs at known paths (see below) |
+| `servicePackages` | Nix packages added to the rootfs (interpreter + wrapper deps) |
+| `service` | A `services.<workloadId>` block that mkGuest consumes |
+
+The four files baked into every function workload:
+
+| Path | Contents |
+|------|----------|
+| `/etc/mvm/entrypoint` | Symlink/pointer to `/usr/lib/mvm/wrappers/runner` |
+| `/usr/lib/mvm/wrappers/runner` | The wrapper script (per-language) the agent execs per call |
+| `/etc/mvm/wrapper.json` | `{ module, function, format, working_dir, mode = "prod" }` — what the wrapper itself reads at startup |
+| `/etc/mvm/runtime.json` | `{ language, module, function, format, source_path, concurrency? }` — what the guest agent reads to decide how to dispatch |
+
+The two JSON files have different consumers on purpose: `runtime.json` is the agent's contract (its schema mirrors `mvm_guest::runtime_config::RuntimeConfig` exactly, with `deny_unknown_fields`), and `wrapper.json` is the wrapper's contract. Splitting them means the agent and the wrapper can evolve independently.
+
+The language registry lives at `nix/lib/factories/languages/` — one file per supported language. Adding a new language is **three changes**:
+
+1. Drop `nix/lib/factories/languages/<lang>.nix` with `servicePackages`, `language`, `runnerScript` attrs
+2. Add it to the `default.nix` switchboard in that directory
+3. Add the bare name to `crates/mvm-ir/data/supported_languages.txt`
+
+No factory-side switch, no caller switch. The dispatcher in `mkFunctionService` looks it up.
+
+### Concurrency
+
+If the IR's entrypoint carries a `concurrency` block (ADR-0011), the factory:
+
+- Includes it verbatim in `runtime.json` so the agent can start a warm-process pool
+- Selects the language's `longrunning` wrapper instead of `oneshot`
+
+Absent that block, function calls run cold-tier: agent execs the oneshot wrapper, which dispatches once and exits.
+
+## Layer 5 — The rootfs builder: `mkGuest`
+
+**Source:** `nix/lib/mk-guest.nix` (Plan 60, ADR-013)
+
+`mkGuest` is the low-level rootfs builder. It is the same function command-style workloads use; the function-call path just calls it through a factory.
+
+What it provides:
+
+- **Firecracker kernel** (`vmlinux`)
+- **Busybox-as-PID-1 init** — under-5-second cold boot, no systemd
+- **Guest agent** — Rust binary built from `mvm-src`, communicates over vsock (ADR-002 W4.1, W6.1.2). In production builds, the `do_exec` symbol is gated out of the agent (CI claim 4); the `dev-shell` feature flag enables it for dev images only.
+- **Networking** — `eth0` configured via kernel boot args, NAT to host
+- **Privilege model** — PID 1 runs as uid 0 (kernel requirement); the entrypoint and agent run rootless (uid 1000 in prod, uid 0 in dev for the dev shell)
+- **Hardening** — `setpriv --no-new-privs` (W2.3), seccomp `standard` (W2.4), per-service uids (W2.1), read-only `/etc` overlay (W2.2), dm-verity verified boot (W3)
+- **Drive mounting** — `/mnt/config`, `/mnt/secrets`, `/mnt/data`
+
+It outputs `rootfs.ext4` + `vmlinux`, and writes a `passthru.mvm` attribute set that the host reads as `mvm-meta.json` next to the artifact. Fields include `name`, `accessible`, `sealed`, `entrypointKind`, `init_system`, `expected_boot_ms`, `agent_binary`, `rootless_entrypoint`, `vmlinux_present`. The runtime path consumes the sidecar via `mvm_build::builder_vm::ArtifactSidecar`.
+
+The full mkGuest parameter list is documented in [Writing Nix Flakes](/guides/nix-flakes/).
+
+## The build pipeline — turning the derivation into artifacts
+
+You now have a Nix derivation. To get a bootable rootfs on disk, `mvmctl` runs `nix build` against it. On Linux with KVM, that can happen natively; on macOS (and Linux hosts without a usable Nix), the build runs inside a **builder VM**.
+
+**Orchestrator:** `crates/mvm-build/src/pipeline/orchestrator.rs::pool_build`
+
+The orchestrator picks a builder mode (`host` | `vsock` | `ssh` | `auto`) and dispatches to one of the backends under `crates/mvm-build/src/backend/`. For each build it:
+
+1. **Prepares mounts.** Workspace mounted RO at `/work` inside the builder VM. Host `/nix` mounted RO when present; otherwise an empty store. Artifact dir mounted RW at `/out`.
+2. **Boots the builder VM.** 4 vCPU, 4096 MiB default. The builder image itself is built from this repo's flakes (`nix/images/builder-vm/`) — never downloaded — when running from a source checkout. (See CLAUDE.md: "Source-checkout builds never depend on mvm-published artifacts".)
+3. **Runs `nix build`.** With `--override-input mvm git+file://...?dir=nix` so the builder VM consumes the in-tree `nix/lib` you're editing, not a pinned release.
+4. **Extracts artifacts.** Copies `rootfs.ext4`, `vmlinux`, and `mvm-meta.json` back to the host artifact dir.
+
+The host never runs `nix` itself. Plan 72 is migrating the builder VM from microsandbox to libkrun (macOS) / Firecracker (Linux); the contract is unchanged.
+
+### Caching and reuse
+
+`crates/mvm-build/src/template_reuse.rs` keys artifacts by **the SHA-256 of `flake.lock`** (or the flake content hash in dev). If your `flake.lock` is unchanged, the previous rootfs is reused. The Nix store revision hash (`<hash>-rootfs.ext4`) is recorded in `~/.mvm/dev/builds/<rev>/` (dev) or the mvmd pool dir (prod). Sidecar `mvm-meta.json` is written atomically alongside.
+
+The cache is content-addressed, not time-addressed. Touching a source file does not invalidate; changing what `flake.lock` resolves to (or what the IR hashes to) does.
+
+## What changes when you change the IR
+
+A concrete worked example. You change `image.packages` from `["python3"]` to `["python3", "curl"]` and re-emit:
+
+1. SDK serializes new canonical JSON. `ir_hash()` changes.
+2. Validation re-runs. Passes.
+3. `nix build` re-evaluates. `mkFunctionWorkload` reads the new JSON, calls `mkFunctionService` (unchanged factory output — function fields didn't move), passes `imagePackages = [pkgs.python3 pkgs.curl]` to `mkGuest`.
+4. `mkGuest` produces a different store-path because the package set differs.
+5. `flake.lock` is unchanged, so the cache key would match — but the **store path** doesn't, so a rebuild runs. The builder VM rebuilds and extracts.
+6. Audit chain records the new IR hash. Launching the workload now binds to that hash.
+
+If you change something the helper validates against (e.g. add a second app), Nix evaluation fails fast with the throw from `mkFunctionWorkload` pointing at the long-form escape hatch. You never get a half-built rootfs from a malformed IR.
+
+## A worked example
+
+This section walks one workload end-to-end so you can see every layer's output.
+
+### The Python source
+
+`src/app.py`:
+
+```python
+def greet(name: str) -> str:
+    return f"hello, {name}"
+```
+
+### The SDK declaration
+
+`entry.py`:
+
+```python
+import mvm
+
+@mvm.app(
+    name="hello",
+    source=mvm.source.local("./src"),
+    image=mvm.image.nix_packages(["python3"]),
+    resources=mvm.resources(vcpus=1, memory_mb=256),
+    dependencies=mvm.deps.none(),
+)
+@mvm.function(
+    language="python",
+    module="app",
+    function="greet",
+    format="json",
+    primary=True,
+)
+def _spec(): pass
+```
+
+### The emitted IR
+
+`mvmctl emit entry.py > workload-ir.json` produces canonical JSON. With whitespace re-added for readability:
+
+```json
+{
+  "schema_version": "0.1",
+  "id": "hello",
+  "apps": [
+    {
+      "name": "hello",
+      "source":      { "kind": "local_path", "path": "./src", "include": ["**"], "exclude": [] },
+      "image":       { "kind": "nix_packages", "packages": ["python3"] },
+      "entrypoints": [
+        {
+          "kind":     "function",
+          "language": "python",
+          "module":   "app",
+          "function": "greet",
+          "format":   "json",
+          "primary":  true
+        }
+      ],
+      "resources":    { "vcpus": 1, "memory_mb": 256, "boot_timeout_secs": 30 },
+      "dependencies": { "kind": "none" }
+    }
+  ],
+  "volumes": [],
+  "extensions": {}
+}
+```
+
+`mvmctl validate workload-ir.json` accepts it. `ir_hash()` returns a stable lowercase-hex SHA-256; copy that hash anywhere you need to refer to this exact IR (launch plan, audit entry, cache key).
+
+### The flake
+
+`flake.nix`:
+
+```nix
+{
+  inputs.mvm.url = "github:tinylabscom/mvm?dir=nix";
+  inputs.nixpkgs.url = "github:NixOS/nixpkgs/nixos-25.11";
+
+  outputs = { mvm, nixpkgs, ... }:
+    let system = "aarch64-linux"; in {
+      packages.${system}.default = mvm.lib.${system}.mkFunctionWorkload {
+        irFile = ./workload-ir.json;
+        appPkg = ./src;
+      };
+    };
+}
+```
+
+### What ends up in the rootfs
+
+After `nix build`, the rootfs ext4 contains (paths simplified):
+
+```
+/etc/mvm/entrypoint              # = "/usr/lib/mvm/wrappers/runner"
+/etc/mvm/wrapper.json            # baked from the IR
+/etc/mvm/runtime.json            # agent's contract
+/usr/lib/mvm/wrappers/runner     # Python oneshot wrapper
+/app                             # symlink → /nix/store/.../src
+```
+
+`/etc/mvm/wrapper.json` (what the wrapper reads at startup):
+
+```json
+{
+  "module":      "app",
+  "function":    "greet",
+  "format":      "json",
+  "working_dir": "/app",
+  "mode":        "prod"
+}
+```
+
+`/etc/mvm/runtime.json` (what the agent reads):
+
+```json
+{
+  "language":    "python",
+  "module":      "app",
+  "function":    "greet",
+  "format":      "json",
+  "source_path": "/app"
+}
+```
+
+Note the IR's `working_dir` field ends up baked into both files. Nothing is decided at call time except the args bytes.
+
+## IR field reference
+
+The Workload IR types live in `crates/mvm-ir/src/workload.rs`. The full schema is enforced at the type level (`#[serde(deny_unknown_fields)]` everywhere); this section names the variants you'll most often choose between.
+
+### `Source` — where the code comes from
+
+```rust
+enum Source {
+    LocalPath  { path: String, include: Vec<String>, exclude: Vec<String> },
+    NixDerivation { expr: String },
+    OciImage   { reference: String, digest: String },
+}
+```
+
+| Variant | Used for | Notes |
+|---------|----------|-------|
+| `LocalPath` | The everyday case | `include`/`exclude` are glob lists; defaults to `["**"]` / `[]` |
+| `NixDerivation` | Source is itself produced by Nix | The `expr` evaluates inside the same flake |
+| `OciImage` | Importing a pre-built image | Requires a `digest`; no tags accepted |
+
+### `Image` — what the rootfs is built from
+
+```rust
+enum Image {
+    NixPackages { packages: Vec<String> },
+    OciBase     { reference: String, digest: String },
+}
+```
+
+`NixPackages` is what `mkFunctionWorkload` supports today. The list is mapped one-to-one onto `pkgs.<name>` and added to the rootfs (`map (p: pkgs.${p}) (image.packages or [])` in `mkFunctionWorkload.nix:88`). `OciBase` requires the long-form route until the OCI path lands.
+
+### `Dependencies` — language deps that aren't in stdlib
+
+```rust
+enum Dependencies {
+    Python { lockfile: String, tool: PythonTool },   // Uv | PipTools
+    Node   { lockfile: String, tool: NodeTool },     // Pnpm | Npm | Yarn
+    None,
+}
+```
+
+The validator rejects unpinned dependencies with `E_UNPINNED_DEPS`. Pinning rules per tool:
+
+- `uv` — `uv.lock` (TOML, hash-pinned by uv itself)
+- `pip-tools` — `requirements.txt` rendered with `pip-compile --generate-hashes`; every requirement must carry `--hash=sha256:...`
+- `pnpm` — `pnpm-lock.yaml` (every dep carries `integrity:`)
+- `npm` — `package-lock.json` v3 (every dep carries `integrity` + `resolved`)
+- `yarn` — `yarn.lock` (Yarn classic v1, every entry carries `integrity "sha512-..."`)
+
+If your workload only needs the language standard library, set `dependencies = mvm.deps.none()` explicitly. There's no implicit "none"; the validator wants you to declare your posture.
+
+### `Entrypoint` — how the wrapper inside the microVM is dispatched
+
+```rust
+enum Entrypoint {
+    Command  { command: Vec<String>, working_dir: String, env: BTreeMap<…> },
+    Function {
+        language: String,
+        module: String, function: String,
+        format: Format,                              // Json | Msgpack
+        primary: bool,
+        args_schema: Option<serde_json::Value>,
+        return_schema: Option<serde_json::Value>,
+        concurrency: Option<ConcurrencyConfig>,
+        extra_imports: Vec<String>,
+        working_dir: String,
+    },
+}
+```
+
+`Command` is the legacy "shell command that runs once at boot" shape. `Function` is the modern dispatch-per-call shape and is what `mkFunctionWorkload` was built for.
+
+`format` selects how the wrapper encodes args (stdin) and returns (stdout). The set is closed at `Json` and `Msgpack`. Code-executing serialization formats are forbidden by ADR-0009 and the wrappers never import them.
+
+## The dispatch protocol
+
+Once the rootfs is booted and the agent is up, a function call is just a vsock RPC. The shape:
+
+```
+host (mvmctl invoke <id> --input name=Alice)
+     │
+     ▼  vsock: RunEntrypoint { stdin = encoded([args, kwargs]) }
+agent (uid 990, dev_image: do_exec gated by `dev-shell` feature)
+     │
+     ▼  fork+exec /etc/mvm/entrypoint → /usr/lib/mvm/wrappers/runner
+wrapper (cold: per-call process; warm: per-pool process)
+     │
+     ▼  reads /etc/mvm/wrapper.json + stdin
+     ▼  dispatches `module:function` (Python: importlib; Node: import)
+     ▼  encodes return value with `format`
+     ▼  writes encoded bytes to stdout, exits 0
+agent reads stdout, packages as vsock reply
+host receives encoded return
+```
+
+The wire envelope on stdin is `[positional_args, keyword_args]` — a two-element array (or array-of-objects in msgpack). The return value is encoded directly (not wrapped). On error, the wrapper writes a sanitized error envelope to **stderr** (mode `prod` strips tracebacks and file paths; mode `dev` keeps them) and exits non-zero.
+
+### Oneshot vs longrunning wrappers
+
+The factory picks between two wrapper variants per language based on whether the IR's `concurrency` block is present:
+
+| Block | Wrapper picked | Behavior |
+|-------|----------------|----------|
+| absent | `oneshot` (e.g. `nix/wrappers/python/oneshot.py`) | Fresh process per call. `os.chdir(working_dir)` + `sys.path.insert(0, working_dir)` happen once and are never undone — the wrapper hard-errors on a second invocation. Cold-tier dispatch. |
+| present (ADR-0011) | `longrunning` (e.g. `nix/wrappers/python/longrunning.py`) | Warm-process pool. The agent reuses processes across calls; the wrapper scrubs per-call state between invocations. |
+
+`prod` mode (default for `mkFunctionWorkload`) sets `PR_SET_DUMPABLE=0`, sanitizes the error envelope (no traceback, no file paths, no payload bytes in logs), and caps stdin at 16 MiB defense-in-depth (the substrate also enforces a hard cap upstream). `dev` mode keeps tracebacks and is set by the dev-image build.
+
+Both wrappers enforce the same decoder hardening: max nesting depth 64, reject duplicate keys, reject non-finite floats.
+
+## Dependencies and the deps volume
+
+This is the design direction; consult the project memory and active plans for current shipping status.
+
+When `dependencies` is `Python {...}` or `Node {...}`, the build pipeline doesn't install deps into the rootfs itself. Instead:
+
+1. The lockfile is hashed (with the tool name and language) into a content-addressed cache key.
+2. A **builder microVM** runs `uv pip install` / `pnpm install --frozen-lockfile` / etc. into a fresh volume. The user's source tree is mounted but no host code runs.
+3. The resulting volume is tagged with the lockfile hash and stored in the deps cache.
+4. At launch, the volume is mounted **read-only** at the configured site-packages / node_modules path. Two workloads with the same lockfile hash share the same volume.
+
+The deps volume carries an SBOM, a fetch log, attestations, and a CVE scan; all of those are bound to the volume hash and to the admission audit chain (proposed claim 9).
+
+The rootfs itself stays minimal — it carries only the interpreter and the language registry's `servicePackages`. Deps live next door.
+
+## From IR hash to ExecutionPlan to audit chain
+
+The IR hash isn't decorative — it's load-bearing in the admission path.
+
+**`mvmctl up`** (`crates/mvm-cli/src/commands/vm/plan_admission.rs`):
+
+1. Resolves the workload → IR JSON → `ir_hash`.
+2. Calls `synthesize_plan(input)` (`plan_builder.rs`) to build a typed `ExecutionPlan` carrying the IR hash, image ref, resources, policy refs, validity window, and a fresh nonce.
+3. Signs the plan with the host's Ed25519 keypair at `~/.mvm/keys/host-signer.ed25519` (mode 0600).
+4. Verifies through `mvm_plan::verify_plan`.
+5. Enforces validity window (G4) and nonce replay-store.
+6. Dispatches to the backend.
+
+**Audit emissions** (`crates/mvm-supervisor/src/audit_recorder.rs`):
+
+- `plan.admitted` — admission accepted, chain-signed
+- `plan.launched` — backend dispatch succeeded
+- `plan.failed` — admission rejected, with reason
+
+All three reference `(plan_id, plan_version)` and the IR hash. The log is hash-chained: entry N includes the hash of entry N-1. Tampering breaks `mvm_supervisor::verify_audit_chain`, which `mvmctl audit verify` surfaces as a nonzero exit.
+
+The contract: **every workload mvm runs is launched from a signed ExecutionPlan that names a specific IR hash**. No IR hash, no launch.
+
+## Inspecting build output
+
+`mkGuest` writes a `passthru.mvm` attribute set into the derivation. You can inspect it without running the VM:
+
+```bash
+nix eval --json '.#default.passthru.mvm'
+```
+
+Typical output:
+
+```json
+{
+  "name":                  "hello",
+  "accessible":            false,
+  "sealed":                true,
+  "entrypointKind":        "command",
+  "init_system":           "busybox",
+  "expected_boot_ms":      4200,
+  "agent_binary":          "/nix/store/...-mvm-guest-agent",
+  "rootless_entrypoint":   true,
+  "vmlinux_present":       true,
+  "initrd_present":        false
+}
+```
+
+The same metadata is written next to the rootfs on the host as `mvm-meta.json`, consumed at runtime by `mvm_build::builder_vm::ArtifactSidecar`. If `mvm-meta.json` and `passthru.mvm` ever diverge, the host-side artifact is wrong.
+
+To inspect the rootfs itself:
+
+```bash
+nix build .#default
+file result/rootfs.ext4
+debugfs -R 'ls /etc/mvm' result/rootfs.ext4
+debugfs -R 'cat /etc/mvm/runtime.json' result/rootfs.ext4
+```
+
+(You'll need `e2fsprogs` for `debugfs`.)
+
+## Caching layers
+
+There are three caches you can reason about independently:
+
+| Cache | Key | Where | Invalidated by |
+|-------|-----|-------|----------------|
+| Nix store | Output-path hash | `/nix/store` (in the builder VM) | Any change to inputs (packages, scripts, IR via `readFile`) |
+| Artifact reuse | `flake.lock` SHA-256 (or flake content hash in dev) | `~/.mvm/dev/builds/<rev>/` | Changing `flake.lock` content |
+| Deps volume | `(language, tool, lockfile-hash)` | Deps cache (designed) | Changing the lockfile |
+
+A practical consequence: touching a package version in `flake.lock` invalidates artifact reuse but only changes the Nix store path of affected derivations. Touching the IR changes the IR hash (so audit/plan bind to a new identity) and changes the Nix store path of the rootfs (so the rebuild is real) but does **not** invalidate the deps volume unless the lockfile also changed.
+
+## Error reference
+
+Common errors you'll meet, with where they originate:
+
+| Error | Origin | Meaning |
+|-------|--------|---------|
+| `E_UNPINNED_DEPS` | `crates/mvm-ir/src/validate.rs` | A dependency lockfile entry doesn't carry the expected hash format. Use `uv lock`, `pip-compile --generate-hashes`, or pnpm/npm/yarn lockfiles with integrity entries. |
+| `UnsupportedSchema` (plan verifier) | `crates/mvm-plan/src/plan.rs` | Plan schema_version is newer than this binary understands. Update mvmctl. |
+| `mkFunctionWorkload: IR must have exactly one app` | `nix/lib/mkFunctionWorkload.nix:75` | Helper only supports single-app workloads. Drop to mkFunctionService + mkGuest by hand. |
+| `mkFunctionWorkload: app.image.kind must be "nix_packages"` | `nix/lib/mkFunctionWorkload.nix:83` | Helper doesn't support `oci_base`. Long-form route until OCI is wired through. |
+| `mkFunctionWorkload: expected exactly one primary function entrypoint` | `nix/lib/mkFunctionWorkload.nix:99` | Multi-function dispatch is ADR-0014 Phase 2; today, mark exactly one entrypoint `primary: true` and let the helper bake just that one, or use the long form. |
+| `mkFunctionService: language "<x>" has no entry in the language registry` | `nix/lib/factories/mkFunctionService.nix:59` | Add `nix/lib/factories/languages/<lang>.nix`, register in `default.nix`, append to `crates/mvm-ir/data/supported_languages.txt`. |
+
+## Why this design
+
+A few choices look unusual until you've seen them play out.
+
+**Why is the IR JSON instead of TOML / YAML?** Because the canonical form (RFC 8785) has one — and only one — byte sequence for any value tree. TOML and YAML both accept multiple valid renderings of the same data; that breaks content-addressing. JSON with RFC 8785 gives us "two equivalent IRs hash the same" for free.
+
+**Why is the flake helper not a code generator?** Because the flake the user writes is already minimal (`mkFunctionWorkload { irFile = ...; appPkg = ./.; }`). A code generator would have to be re-run every time the IR changed, and its output would need to be committed or `.gitignore`d. Reading the IR at Nix evaluation time means the flake stays static; the IR can change without touching `flake.nix`.
+
+**Why do `wrapper.json` and `runtime.json` carry overlapping fields?** Two consumers, two contracts. The agent owns `runtime.json` (and ships its schema via `mvm_guest::runtime_config::RuntimeConfig` with `deny_unknown_fields`). The wrapper owns `wrapper.json` (its schema is in `nix/wrappers/README.md`). Splitting lets the agent and the wrapper evolve independently. The overlap is intentional duplication: both consumers need the same module/function/format triple to do their jobs.
+
+**Why busybox-as-PID-1?** Cold boot under 5 seconds. systemd would dominate the boot budget. ADR-0013 spells out the math and the trade-offs.
+
+**Why do command-style entrypoints still exist?** Long-running services — web servers, queue workers, anything that doesn't fit "dispatch a function per call" — boot once and stay up. The function-call path is for fine-grained per-invocation workloads. The command-style path stays first-class.
+
+## Glossary
+
+- **IR (Workload IR)** — The JSON document a SDK emits. Single source of truth for the workload.
+- **`ir_hash`** — Lowercase-hex SHA-256 of the canonical IR.
+- **Canonical form** — RFC 8785 serialization: sorted keys, no whitespace, deterministic escaping.
+- **`mkFunctionWorkload`** — Nix helper that reads an IR JSON file and produces a rootfs derivation.
+- **`mkFunctionService`** — Per-language factory that bakes wrapper configs into the rootfs.
+- **`mkGuest`** — Low-level rootfs builder. Busybox init, guest agent, hardening.
+- **Wrapper** — The per-language script that decodes stdin, calls `module:function`, encodes stdout.
+- **Oneshot / longrunning** — Wrapper variants: per-call process vs. warm-process pool.
+- **Agent** — The Rust binary in the guest that handles vsock RPCs. Forks the wrapper.
+- **ExecutionPlan** — Signed admission contract; carries the IR hash and policy refs.
+- **Audit chain** — Hash-chained log of `plan.admitted` / `plan.launched` / `plan.failed` entries.
+- **Threat tier** — `Untrusted` (default) or `Trusted`. Drives mvmd's SMT-affinity scheduler (ADR-0018).
+- **Addon** — Composable sibling microVM bridged into the workload mesh (ADR-0018/0020).
+
+## Where to read next
+
+- **[Writing Nix Flakes](/guides/nix-flakes/)** — full mkGuest reference for command-style workloads and richer compositions
+- **`crates/mvm-ir/src/workload.rs`** — the Workload IR type definitions (canonical reference)
+- **`nix/lib/mkFunctionWorkload.nix`** — the IR → derivation helper (read it; it's 150 lines)
+- **`nix/lib/factories/mkFunctionService.nix`** — per-language factory
+- **`nix/lib/mk-guest.nix`** — the rootfs builder
+- **ADR-0003** — schema source-of-truth and SDK conformance
+- **ADR-0008** — function-service factories
+- **ADR-0009** — function entrypoint control protocol
+- **ADR-0013** — busybox-as-PID-1 strategy, microvm.nix adoption
+- **Plan 71** (`specs/plans/71-mkfunction-workload-helper.md`) — the design for `mkFunctionWorkload`
