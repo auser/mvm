@@ -186,21 +186,42 @@ impl LibkrunBuilderVm {
         Ok(())
     }
 
-    /// Validate the job description. Both fields must be non-empty
-    /// strings; `flake_ref` may include a `path:` or `git+` prefix
-    /// but the prefix-less form is also accepted (libkrun runs the
-    /// command verbatim inside the builder VM, where the file
-    /// system is paths libkrun mounted).
+    /// Validate the job description. For [`BuilderJob::Flake`] both
+    /// fields must be non-empty strings (`flake_ref` may include a
+    /// `path:` or `git+` prefix but the prefix-less form is also
+    /// accepted — libkrun runs the command verbatim inside the
+    /// builder VM). For [`BuilderJob::Install`] the spec path must
+    /// exist on the host; B.2 will fill in the rest of the
+    /// install-pipeline validation against the parsed spec.
     pub(crate) fn validate_job(&self, job: &BuilderJob) -> Result<(), BuilderVmError> {
-        if job.flake_ref.trim().is_empty() {
-            return Err(BuilderVmError::NixBuildFailed(
-                "BuilderJob.flake_ref is empty".to_string(),
-            ));
-        }
-        if job.attr_path.trim().is_empty() {
-            return Err(BuilderVmError::NixBuildFailed(
-                "BuilderJob.attr_path is empty".to_string(),
-            ));
+        match job {
+            BuilderJob::Flake {
+                flake_ref,
+                attr_path,
+            } => {
+                if flake_ref.trim().is_empty() {
+                    return Err(BuilderVmError::NixBuildFailed(
+                        "BuilderJob.flake_ref is empty".to_string(),
+                    ));
+                }
+                if attr_path.trim().is_empty() {
+                    return Err(BuilderVmError::NixBuildFailed(
+                        "BuilderJob.attr_path is empty".to_string(),
+                    ));
+                }
+            }
+            BuilderJob::Install { spec_path } => {
+                // The install pipeline ships in Plan 73 Followup B.2;
+                // validate the file exists so a future caller's
+                // typo surfaces here rather than as an opaque
+                // NotYetImplemented mid-pipeline.
+                if !spec_path.is_file() {
+                    return Err(BuilderVmError::ExtractionFailed(format!(
+                        "BuilderJob::Install spec_path does not exist or is not a file: {}",
+                        spec_path.display()
+                    )));
+                }
+            }
         }
         Ok(())
     }
@@ -226,6 +247,15 @@ impl BuilderVm for LibkrunBuilderVm {
         //    errors than failing inside the libkrun FFI.
         self.validate_mounts(mounts)?;
         self.validate_job(job)?;
+
+        // Plan 73 Followup B.2.0 plumbing: the Install variant is
+        // a typed seam for the application-deps install pipeline
+        // (Followup B.2). The flake-build path below is unchanged;
+        // the install path lands in B.2.
+        match job {
+            BuilderJob::Flake { .. } => {}
+            BuilderJob::Install { .. } => return Err(BuilderVmError::NotYetImplemented),
+        }
 
         // 2. Refuse to proceed on a host without libkrun. The
         //    `backends-builder-vm-libkrun` feature being compiled
@@ -338,7 +368,7 @@ impl BuilderVm for LibkrunBuilderVm {
             None
         };
 
-        Ok(BuilderArtifacts {
+        Ok(BuilderArtifacts::Image {
             rootfs_path,
             kernel_path,
             // The Nix store path hash isn't trivially recoverable
@@ -514,7 +544,21 @@ fn unique_job_id() -> String {
 /// `/bin/sh -eu` and is responsible for invoking `nix build`
 /// against the user's flake and dropping `vmlinux` +
 /// `rootfs.ext4` into `/out`.
+///
+/// Plan 73 Followup B.2.0 added the [`BuilderJob`] dispatch
+/// here. The `Flake` arm renders today's `nix build` script;
+/// the `Install` arm errors with [`BuilderVmError::NotYetImplemented`]
+/// — Followup B.2 fills it in by emitting the per-ecosystem
+/// install script + result.json contract.
 fn stage_job_dir(job_dir: &Path, job: &BuilderJob) -> Result<(), BuilderVmError> {
+    let (flake_ref, attr_path) = match job {
+        BuilderJob::Flake {
+            flake_ref,
+            attr_path,
+        } => (flake_ref.as_str(), attr_path.as_str()),
+        BuilderJob::Install { .. } => return Err(BuilderVmError::NotYetImplemented),
+    };
+
     std::fs::create_dir_all(job_dir).map_err(|e| {
         BuilderVmError::ExtractionFailed(format!("creating job dir {}: {e}", job_dir.display()))
     })?;
@@ -573,8 +617,8 @@ fi
 chmod 0644 /out/rootfs.ext4 2>/dev/null || true
 [ -f /out/vmlinux ] && chmod 0644 /out/vmlinux 2>/dev/null || true
 "#,
-        flake_ref = shell_single_quote_escape(&job.flake_ref),
-        attr_path = shell_single_quote_escape(&job.attr_path),
+        flake_ref = shell_single_quote_escape(flake_ref),
+        attr_path = shell_single_quote_escape(attr_path),
     );
 
     let cmd_path = job_dir.join("cmd.sh");
@@ -726,7 +770,7 @@ mod tests {
     }
 
     fn ok_job() -> BuilderJob {
-        BuilderJob {
+        BuilderJob::Flake {
             flake_ref: "path:/work".to_string(),
             attr_path: "packages.x86_64-linux.default".to_string(),
         }
@@ -813,7 +857,7 @@ mod tests {
 
     #[test]
     fn validate_job_rejects_empty_flake_ref() {
-        let job = BuilderJob {
+        let job = BuilderJob::Flake {
             flake_ref: "".to_string(),
             attr_path: "packages.x86_64-linux.default".to_string(),
         };
@@ -823,12 +867,77 @@ mod tests {
 
     #[test]
     fn validate_job_rejects_whitespace_only_attr_path() {
-        let job = BuilderJob {
+        let job = BuilderJob::Flake {
             flake_ref: "path:/work".to_string(),
             attr_path: "   ".to_string(),
         };
         let err = LibkrunBuilderVm::default().validate_job(&job).unwrap_err();
         assert!(format!("{err}").contains("attr_path"));
+    }
+
+    #[test]
+    fn validate_job_rejects_install_with_missing_spec() {
+        // The Install variant validates that spec_path actually
+        // exists — Followup B.2 will read it inside the VM, so the
+        // host needs the file present before dispatch.
+        let job = BuilderJob::Install {
+            spec_path: PathBuf::from("/definitely/does/not/exist.json"),
+        };
+        let err = LibkrunBuilderVm::default().validate_job(&job).unwrap_err();
+        assert!(
+            matches!(err, BuilderVmError::ExtractionFailed(_)),
+            "got {err:?}"
+        );
+        assert!(
+            format!("{err}").contains("spec_path"),
+            "expected spec_path in error: {err}"
+        );
+    }
+
+    #[test]
+    fn validate_job_accepts_install_with_existing_spec() {
+        // Smoke-test the happy path of Install validation. We
+        // don't construct a real spec — the parsing arrives in
+        // B.2. We only check that a real file passes.
+        let scratch = TempDir::new().unwrap();
+        let spec_path = scratch.path().join("spec.json");
+        std::fs::write(&spec_path, b"{}").unwrap();
+        let job = BuilderJob::Install { spec_path };
+        LibkrunBuilderVm::default().validate_job(&job).unwrap();
+    }
+
+    #[test]
+    fn run_build_rejects_install_variant_with_not_yet_implemented() {
+        // Plumbing-only: the Install variant is a typed seam for
+        // Followup B.2. Until then libkrun must surface
+        // NotYetImplemented after passing input validation rather
+        // than proceeding into the flake-build pipeline.
+        let scratch = TempDir::new().unwrap();
+        let spec_path = scratch.path().join("spec.json");
+        std::fs::write(&spec_path, b"{}").unwrap();
+        let mounts = ok_mounts(&scratch);
+        let err = LibkrunBuilderVm::default()
+            .run_build(&BuilderJob::Install { spec_path }, &mounts)
+            .unwrap_err();
+        assert!(
+            matches!(err, BuilderVmError::NotYetImplemented),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn stage_job_dir_rejects_install_variant() {
+        // The stager only knows about the Flake shape today. The
+        // Install seam returns NotYetImplemented so B.2 can swap
+        // in the per-ecosystem install script without touching
+        // call sites.
+        let scratch = TempDir::new().unwrap();
+        let job_dir = scratch.path().join("job-1");
+        let spec_path = scratch.path().join("spec.json");
+        std::fs::write(&spec_path, b"{}").unwrap();
+        let err =
+            stage_job_dir(&job_dir, &BuilderJob::Install { spec_path }).expect_err("install path");
+        assert!(matches!(err, BuilderVmError::NotYetImplemented));
     }
 
     #[test]
@@ -888,7 +997,7 @@ mod tests {
     fn stage_job_dir_writes_cmd_sh_with_escaped_inputs() {
         let scratch = TempDir::new().unwrap();
         let job_dir = scratch.path().join("job-1");
-        let job = BuilderJob {
+        let job = BuilderJob::Flake {
             flake_ref: "path:/work/nix/images/foo".to_string(),
             attr_path: "packages.x86_64-linux.default".to_string(),
         };

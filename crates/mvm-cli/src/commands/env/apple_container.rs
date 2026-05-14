@@ -1798,7 +1798,7 @@ fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(Strin
         }
     };
 
-    let job = BuilderJob {
+    let job = BuilderJob::Flake {
         flake_ref: guest_flake_ref,
         attr_path: format!("packages.{}.default", host_system_linux()),
     };
@@ -2157,7 +2157,7 @@ fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     // the git fetcher, which would discover `/work/.git` and trip on
     // worktree files whose `gitdir:` redirects point outside the
     // mount).
-    let job = BuilderJob {
+    let job = BuilderJob::Flake {
         flake_ref: "path:/work/nix/images/builder".to_string(),
         attr_path: format!("packages.{}.default", host_system_linux()),
     };

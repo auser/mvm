@@ -71,44 +71,104 @@ pub struct BuilderMounts {
     pub artifact_out: PathBuf,
 }
 
-/// What the builder is asked to produce. The flake attribute path is
-/// system-specific; the bootstrap maps host architecture to the
-/// matching Linux system (`aarch64-linux` on Apple Silicon,
-/// `x86_64-linux` on Intel/AMD).
+/// What the builder is asked to produce.
+///
+/// Plan 73 Followup B.2.0 generalised this from a single nix-build
+/// shape into an enum so the same trait can dispatch both the
+/// existing flake builds (`Flake`) and the application-dependency
+/// install pipeline (`Install`) that Followup B.2 will wire. Each
+/// variant pairs 1:1 with a [`BuilderArtifacts`] variant — see the
+/// per-variant docs there for the expected outputs.
+///
+/// This is plumbing only: the `Install` variant is reserved here so
+/// B.2 can land behavior changes against a stable shape, and today
+/// every backend errors with [`BuilderVmError::NotYetImplemented`]
+/// when it sees an `Install` job.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuilderJob {
-    /// Flake reference (e.g. `git+file:///work?dir=.`, `.#default`,
-    /// `path:./.`).
-    pub flake_ref: String,
-    /// Attribute path under the flake (e.g.
-    /// `packages.x86_64-linux.tenant-worker`). Resolved by callers
-    /// before invoking the builder.
-    pub attr_path: String,
+pub enum BuilderJob {
+    /// Build a Nix flake attribute. The flake attribute path is
+    /// system-specific; callers map host architecture to the
+    /// matching Linux system (`aarch64-linux` on Apple Silicon,
+    /// `x86_64-linux` on Intel/AMD).
+    Flake {
+        /// Flake reference (e.g. `git+file:///work?dir=.`, `.#default`,
+        /// `path:./.`).
+        flake_ref: String,
+        /// Attribute path under the flake (e.g.
+        /// `packages.x86_64-linux.tenant-worker`). Resolved by callers
+        /// before invoking the builder.
+        attr_path: String,
+    },
+
+    /// Application-dependency install pipeline (ADR-047, Followup
+    /// B.2). The builder VM reads a serialised install spec from
+    /// `spec_path` (lockfile + source-root + ecosystem + gate),
+    /// runs the corresponding package manager (`uv pip install
+    /// --no-deps`, `pnpm install --frozen-lockfile`, …) inside the
+    /// VM, seals the resulting volume with SBOM + fetch log + CVE +
+    /// attestations, and emits a `result.json` next to the volume.
+    ///
+    /// **Today every backend errors with
+    /// [`BuilderVmError::NotYetImplemented`] for this variant.**
+    /// Plan 73 Followup B.2 wires the libkrun backend; the
+    /// microsandbox backend never gets this variant.
+    Install {
+        /// Absolute host path to the install-spec JSON the builder
+        /// VM reads at start-up. Followup B.2 defines the shape;
+        /// today the orchestrator does not produce one.
+        spec_path: PathBuf,
+    },
 }
 
-/// Result of a successful build. Mirrors the host-backend's
-/// `BackendBuildResult` shape so the runtime path can consume both
-/// transparently.
+/// Result of a successful build. The variant returned matches the
+/// [`BuilderJob`] variant the caller passed: a `Flake` job yields
+/// [`BuilderArtifacts::Image`]; an `Install` job yields
+/// [`BuilderArtifacts::InstallVolume`].
+///
+/// Mirrors the host-backend's `BackendBuildResult` shape so the
+/// runtime path can consume both transparently.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct BuilderArtifacts {
-    /// Absolute host path to the extracted rootfs (typically
-    /// `~/.mvm/dev/builds/<rev>/rootfs.ext4`).
-    pub rootfs_path: PathBuf,
-    /// Optional kernel image path (some flakes emit one; verity
-    /// initramfs is paired with the kernel).
-    pub kernel_path: Option<PathBuf>,
-    /// Nix store revision hash (the leading `<hash>` segment of the
-    /// derivation's output store path). Used as the artifact dir
-    /// name and for cache lookups.
-    pub revision_hash: String,
-    /// `flake.lock` SHA-256, recorded for cache tracking.
-    pub lock_hash: Option<String>,
-    /// `passthru.mvm.accessible` — wires through to
-    /// `runtime_meta.accessible`, populating the W6.2 console gate.
-    /// `None` means the flake didn't surface the field; callers
-    /// default to `true` for backward compatibility (W6.2's same
-    /// default).
-    pub accessible: Option<bool>,
+pub enum BuilderArtifacts {
+    /// Output of a [`BuilderJob::Flake`] build — a kernel +
+    /// rootfs pair ready for boot, plus revision metadata.
+    Image {
+        /// Absolute host path to the extracted rootfs (typically
+        /// `~/.mvm/dev/builds/<rev>/rootfs.ext4`).
+        rootfs_path: PathBuf,
+        /// Optional kernel image path (some flakes emit one; verity
+        /// initramfs is paired with the kernel).
+        kernel_path: Option<PathBuf>,
+        /// Nix store revision hash (the leading `<hash>` segment of
+        /// the derivation's output store path). Used as the artifact
+        /// dir name and for cache lookups.
+        revision_hash: String,
+        /// `flake.lock` SHA-256, recorded for cache tracking.
+        lock_hash: Option<String>,
+        /// `passthru.mvm.accessible` — wires through to
+        /// `runtime_meta.accessible`, populating the W6.2 console
+        /// gate. `None` means the flake didn't surface the field;
+        /// callers default to `true` for backward compatibility
+        /// (W6.2's same default).
+        accessible: Option<bool>,
+    },
+
+    /// Output of a [`BuilderJob::Install`] run — a sealed deps
+    /// volume on the host filesystem plus a structured result
+    /// document. Followup B.2 will fill this in; today no backend
+    /// constructs this variant.
+    InstallVolume {
+        /// Directory the builder VM sealed the application-deps
+        /// volume into (content + SBOM + fetch log + CVE scan +
+        /// attestations + meta). Caller hashes this with
+        /// `mvm_sdk::compile::deps_audit::verify_sealed_volume` to
+        /// derive the canonical `volume_hash`.
+        volume_dir: PathBuf,
+        /// JSON sidecar emitted by `mvm-builder-init` next to the
+        /// volume describing the install outcome (exit code,
+        /// installer stderr tail, timings). Shape pinned by
+        /// Followup B.2.
+        result_json_path: PathBuf,
+    },
 }
 
 /// Filename for the sidecar manifest written next to a built
@@ -369,11 +429,15 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     rt.block_on(fut)
 }
 
-/// Unique-per-build sandbox name derived from a flake reference +
-/// attr path + a timestamp. Doesn't need to be cryptographically
-/// random — microsandbox uses it as a handle for `Sandbox::get` etc.,
+/// Unique-per-build sandbox name derived from the job + a
+/// timestamp. Doesn't need to be cryptographically random —
+/// microsandbox uses it as a handle for `Sandbox::get` etc.,
 /// and the sandbox is torn down at the end of `run_build` so name
 /// collisions only matter for concurrent invocations.
+///
+/// Only the [`BuilderJob::Flake`] variant ever reaches this helper
+/// because microsandbox refuses install jobs upstream; the match
+/// arm for `Install` is wired for compile completeness.
 #[cfg(feature = "contributor-bootstrap")]
 fn sandbox_name(job: &BuilderJob) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
@@ -383,8 +447,18 @@ fn sandbox_name(job: &BuilderJob) -> String {
         .unwrap_or(0);
     let mut h = std::collections::hash_map::DefaultHasher::new();
     use std::hash::{Hash, Hasher};
-    job.flake_ref.hash(&mut h);
-    job.attr_path.hash(&mut h);
+    match job {
+        BuilderJob::Flake {
+            flake_ref,
+            attr_path,
+        } => {
+            flake_ref.hash(&mut h);
+            attr_path.hash(&mut h);
+        }
+        BuilderJob::Install { spec_path } => {
+            spec_path.hash(&mut h);
+        }
+    }
     format!("mvm-builder-{:x}-{}", h.finish(), stamp)
 }
 
@@ -406,6 +480,19 @@ impl BuilderVm for MicrosandboxBuilderVm {
         job: &BuilderJob,
         mounts: &BuilderMounts,
     ) -> Result<BuilderArtifacts, BuilderVmError> {
+        // Microsandbox is contributor-bootstrap only and runs the
+        // nix-build path. The Install variant is reserved for Plan
+        // 73 Followup B.2 on the libkrun backend; surface the
+        // mismatch with NotYetImplemented rather than silently
+        // falling through.
+        let (flake_ref, attr_path) = match job {
+            BuilderJob::Flake {
+                flake_ref,
+                attr_path,
+            } => (flake_ref.clone(), attr_path.clone()),
+            BuilderJob::Install { .. } => return Err(BuilderVmError::NotYetImplemented),
+        };
+
         // Validate caller-supplied paths early; microsandbox will
         // also reject these but with less useful messages.
         if !mounts.flake_src.exists() {
@@ -429,8 +516,8 @@ impl BuilderVm for MicrosandboxBuilderVm {
             flake_src: mounts.flake_src.clone(),
             host_nix_store: mounts.host_nix_store.clone(),
             artifact_out: mounts.artifact_out.clone(),
-            flake_ref: job.flake_ref.clone(),
-            attr_path: job.attr_path.clone(),
+            flake_ref,
+            attr_path,
         };
 
         block_on(async move { run_build_async(params).await })
@@ -647,7 +734,7 @@ chmod -R u+w "$out"
         if p.exists() { Some(p) } else { None }
     };
 
-    Ok(BuilderArtifacts {
+    Ok(BuilderArtifacts::Image {
         rootfs_path,
         kernel_path,
         revision_hash,
@@ -782,9 +869,27 @@ mod tests {
     #[test]
     fn stub_returns_not_yet_implemented_for_run_build() {
         let stub = StubBuilderVm;
-        let job = BuilderJob {
+        let job = BuilderJob::Flake {
             flake_ref: ".".to_string(),
             attr_path: "packages.x86_64-linux.default".to_string(),
+        };
+        let mounts = BuilderMounts {
+            flake_src: PathBuf::from("/tmp/flake"),
+            host_nix_store: None,
+            artifact_out: PathBuf::from("/tmp/out"),
+        };
+        let err = stub.run_build(&job, &mounts).expect_err("stub returns err");
+        assert!(matches!(err, BuilderVmError::NotYetImplemented));
+    }
+
+    #[test]
+    fn stub_returns_not_yet_implemented_for_install_job() {
+        // The B.2.0 plumbing reserves the Install variant; until B.2
+        // wires behavior, every backend (including the stub) must
+        // surface NotYetImplemented for it.
+        let stub = StubBuilderVm;
+        let job = BuilderJob::Install {
+            spec_path: PathBuf::from("/tmp/spec.json"),
         };
         let mounts = BuilderMounts {
             flake_src: PathBuf::from("/tmp/flake"),
@@ -868,7 +973,7 @@ mod tests {
         // Same flake+attr produces the same hash segment; only the
         // timestamp varies. Lets us assert the prefix without
         // hard-coding the full name.
-        let job = BuilderJob {
+        let job = BuilderJob::Flake {
             flake_ref: "git+file:///work".to_string(),
             attr_path: "packages.x86_64-linux.default".to_string(),
         };
@@ -913,7 +1018,7 @@ mod tests {
         // nonexistent flake src; we expect a clear error before
         // anything heavy fires.
         let b = MicrosandboxBuilderVm::default();
-        let job = BuilderJob {
+        let job = BuilderJob::Flake {
             flake_ref: ".".to_string(),
             attr_path: "packages.x86_64-linux.default".to_string(),
         };
@@ -930,6 +1035,30 @@ mod tests {
             "got {err:?}"
         );
         assert!(err.to_string().contains("does not exist"), "msg: {err}");
+    }
+
+    #[cfg(feature = "contributor-bootstrap")]
+    #[test]
+    fn microsandbox_rejects_install_job_variant() {
+        // The microsandbox backend doesn't get install-pipeline
+        // support (Plan 73 Followup B.2 wires libkrun only). Any
+        // Install job must fail fast with NotYetImplemented.
+        let b = MicrosandboxBuilderVm::default();
+        let job = BuilderJob::Install {
+            spec_path: PathBuf::from("/tmp/spec.json"),
+        };
+        let mounts = BuilderMounts {
+            flake_src: PathBuf::from("/tmp"),
+            host_nix_store: None,
+            artifact_out: PathBuf::from("/tmp/mvm-builder-install-test-out"),
+        };
+        let err = b
+            .run_build(&job, &mounts)
+            .expect_err("install variant must error on microsandbox");
+        assert!(
+            matches!(err, BuilderVmError::NotYetImplemented),
+            "got {err:?}"
+        );
     }
 
     #[test]

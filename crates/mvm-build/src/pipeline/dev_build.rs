@@ -614,7 +614,7 @@ fn dev_build_via_microsandbox(
         flake_ref.to_string()
     });
 
-    let job = BuilderJob {
+    let job = BuilderJob::Flake {
         // Inside the sandbox, the flake source is bind-mounted at
         // `/work` — the build command references that path, not
         // the host path the user passed in.
@@ -653,14 +653,27 @@ fn dev_build_via_microsandbox(
         .run_build(&job, &mounts)
         .map_err(|e| anyhow::anyhow!("microsandbox builder VM: {e}"))?;
 
+    // Plan 73 Followup B.2.0: BuilderArtifacts is now an enum. The
+    // microsandbox / libkrun nix-build paths both return `Image`;
+    // surface any future variant slipping through as an error
+    // rather than a silent path mismatch.
+    let revision_hash = match artifacts {
+        crate::builder_vm::BuilderArtifacts::Image { revision_hash, .. } => revision_hash,
+        crate::builder_vm::BuilderArtifacts::InstallVolume { .. } => {
+            anyhow::bail!(
+                "microsandbox builder returned BuilderArtifacts::InstallVolume \
+                 for a Flake job — unreachable until Plan 73 Followup B.2"
+            );
+        }
+    };
+
     // Move staging dir to its final hashed location. If a parallel
     // build raced us to the same revision (cache hit), discard
     // ours.
-    let final_dir = dev_build_dir(&artifacts.revision_hash);
+    let final_dir = dev_build_dir(&revision_hash);
     if std::path::Path::new(&final_dir).exists() {
         env.log_info(&format!(
-            "Cache hit on rev {}; discarding staged build.",
-            artifacts.revision_hash
+            "Cache hit on rev {revision_hash}; discarding staged build."
         ));
         let _ = std::fs::remove_dir_all(&staging);
     } else if let Err(e) = std::fs::rename(&staging, &final_dir) {
@@ -697,7 +710,7 @@ fn dev_build_via_microsandbox(
         vmlinux_path,
         initrd_path,
         rootfs_path,
-        revision_hash: artifacts.revision_hash,
+        revision_hash,
         cached: false,
         runner_dir,
         artifact_sizes,
