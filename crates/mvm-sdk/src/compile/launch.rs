@@ -65,6 +65,16 @@ struct LaunchPlan<'a> {
     /// without re-merging at flake-evaluation time. Empty phases
     /// serialize as empty arrays.
     hooks: serde_json::Value,
+    /// Application-dep declaration (ADR-047 / Plan 73 Followup D).
+    /// `null` for stdlib-only workloads or apps declared with
+    /// `mvm.no_deps()`. Carries `{ "kind": "python" | "node",
+    /// "lockfile": "...", "tool": "uv"|"pip_tools"|"pnpm"|"npm"|"yarn" }`
+    /// otherwise. The builder VM's install pipeline (Followup B.2)
+    /// reads this field to dispatch the right installer; the
+    /// supervisor admission gate (Followup A) reads the resolved
+    /// `volume_hash` separately from the build manifest.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    dependencies: Option<serde_json::Value>,
 }
 
 pub fn build_launch_json(
@@ -89,6 +99,19 @@ pub fn build_launch_json(
     // a flat array.
     let addon_hooks: Vec<&Hooks> = app.addons.iter().map(|a| &a.hooks).collect();
     let merged_hooks = merge_hooks(&app.hooks, &addon_hooks);
+    // ADR-047 / Plan 73 Followup D: only emit a `dependencies` block
+    // when the app declares lockfile-backed deps. `Dependencies::None`
+    // and `None` both flatten to "no deps key in launch.json" so the
+    // Nix factory consuming this can `if launch.dependencies?` to
+    // branch the install path.
+    let dependencies = app
+        .dependencies
+        .as_ref()
+        .and_then(|d| match d {
+            mvm_ir::Dependencies::None => None,
+            other => Some(serde_json::to_value(other)),
+        })
+        .transpose()?;
     let plan = LaunchPlan {
         artifact_format_version: ARTIFACT_FORMAT_VERSION,
         flake_attribute: FLAKE_ATTRIBUTE,
@@ -111,6 +134,7 @@ pub fn build_launch_json(
             "expected_peers": expected_peers,
         }),
         hooks: serde_json::to_value(&merged_hooks)?,
+        dependencies,
     };
     canonicalize(&plan)
 }

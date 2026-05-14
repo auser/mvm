@@ -84,12 +84,17 @@ The `RuntimeBuildEnv` in mvm implements only `ShellEnvironment`. The full `Build
 
 ## Security model
 
-mvm makes eight CI-enforced security claims. Each one is backed by a
+mvm makes nine CI-enforced security claims. Each one is backed by a
 test or a workflow gate; ADR-002 (`specs/adrs/002-microvm-security-posture.md`)
 describes the threat model and `specs/plans/25-microvm-hardening.md`
 sequences the implementation. Claim 8 was added by plan 64
 (`specs/plans/64-supervisor-wiring.md`) — see ADR-041
-(`specs/adrs/041-signed-audited-execution-plans.md`).
+(`specs/adrs/041-signed-audited-execution-plans.md`). Claim 9 was added
+by Plan 73 Followup D (CI gate) — see ADR-047
+(`specs/adrs/047-app-deps-audit-pipeline.md`). (ADR-002's full claim
+table also names two additional cross-cutting claims for signed bundles
+and default-deny network policy; those are tracked there because they
+post-date the CLAUDE.md per-claim summary below.)
 
 1. **No host-fs access from a guest beyond explicit shares.** Per-service
    uid (W2.1), seccomp `standard` default (W1.1, W2.4), and `setpriv
@@ -135,6 +140,31 @@ sequences the implementation. Claim 8 was added by plan 64
    (plan 64 W1–W4 — `synthesize_plan`, `host_signer::load_or_init_at`,
    `admit_for_run`, `AuditEmitter`; `xtask check-no-display-on-secret-types`
    protects the host signer's redacted `Debug`).
+9. **Every application-dep volume is hash-locked, attestation-checked,
+   CVE-scanned, SBOM-enumerated, and bound to the workload's audit
+   chain.** ADR-047 / Plan 73 Followups A + B.1/B.2/B.3 + C + D wire
+   this end-to-end: the builder VM (`mvm-builder-init` +
+   `LibkrunBuilderVm::run_build` Install arm) installs deps into a
+   sealed volume at `~/.mvm/volumes/deps/<volume_hash>/` carrying
+   `content/`, `sbom.cdx.json`, `fetch.log`, `cve.json`, and a
+   hash-chained `meta.json`; `mvm-supervisor`'s admission verifier
+   calls `mvm_sdk::compile::deps_audit::verify_sealed_volume` before
+   launch and refuses tampered volumes; `mvmctl up --prod` fails
+   closed on high/critical CVE findings or stub SBOM/CVE
+   (`mvm_build::app_deps_gate::apply_install_gate`); `mvmctl deps
+   inspect` / `mvmctl deps audit` surface the sealed sidecars without
+   a VM spawn. The `app-deps-audit` job in `.github/workflows/ci.yml`
+   (Followup D) gates every PR: it exercises `mvmctl compile` on
+   `examples/python/hello-app-with-deps/`, seals a clean + a high-CVE
+   fixture via `mvm-build`'s `mvm-app-deps-fixture-tool` example,
+   asserts `mvmctl deps inspect --json` reports a well-formed report,
+   asserts the prod gate refuses the high-CVE fixture and the dev
+   gate admits it, and asserts a byte-flip on `cve.json` makes
+   inspect refuse via `verify_sealed_volume`. Full builder-VM round-trip
+   (real `uv pip install` + `pip-audit` inside the libkrun /
+   cloud-hypervisor builder VM) is still gated on Plan 72 W4/W5
+   cutover; the CI lane exercises every code path that doesn't
+   require a working microVM backend.
 
 The guest agent itself runs as uid 901 under setpriv (W4.5); the
 host-side vsock proxy socket is mode 0700 (W1.2), the proxy port

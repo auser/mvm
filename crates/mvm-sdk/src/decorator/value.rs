@@ -12,8 +12,8 @@ use std::path::{Path, PathBuf};
 
 use mvm_ir::{
     App, Dependencies, Entrypoint, EnvValue, Format, HookCmd, Hooks, Image, Mount, Network,
-    NetworkEgress, NetworkMode, PortForward, PortProto, Resources, SecretMount, SecretRef, Source,
-    Workload,
+    NetworkEgress, NetworkMode, NodeTool, PortForward, PortProto, PythonTool, Resources,
+    SecretMount, SecretRef, Source, Workload,
 };
 
 use super::ParseError;
@@ -42,6 +42,14 @@ pub const HELPER_ALLOWLIST: &[&str] = &[
     "mvm.hook",
     "mvm.addons.database",
     "mvm.addons.service",
+    // Plan 73 Followup D — wires the ADR-047 app-deps pipeline through
+    // the static decorator path. The runtime SDK helpers landed in
+    // `mvm_sdk::ctor::deps`; the decorator parser needs them in the
+    // allowlist so `@mvm.app(dependencies=mvm.python_deps("uv.lock"))`
+    // round-trips through `mvmctl compile <script>` into a launch.json
+    // the install pipeline (Followup B.2) can drive.
+    "mvm.python_deps",
+    "mvm.node_deps",
 ];
 
 /// The parsed shape of a kwarg's value. Lowered to IR types by
@@ -186,6 +194,19 @@ pub fn lower_to_workload(
     // surface until the follow-up wires them in.
     let _ = kwargs.remove("addons");
 
+    // Plan 73 Followup D — `dependencies=mvm.python_deps(...)` /
+    // `dependencies=mvm.node_deps(...)` lowering. The decorator path is
+    // the user-facing entry into the ADR-047 install pipeline: the
+    // emitted launch.json carries a `dependencies` field that the
+    // builder VM consumes (Followup B.2) to install hash-pinned deps
+    // into a sealed volume. Defaults to `Dependencies::None` (matches
+    // the imperative SDK's `mvm.no_deps()`) so workloads that don't
+    // declare deps keep working unchanged.
+    let dependencies = match kwargs.remove("dependencies") {
+        Some(v) => Some(helper_to_dependencies(v, path, decorator_line)?),
+        None => Some(Dependencies::None),
+    };
+
     if let Some((name, _)) = kwargs.into_iter().next() {
         return Err(ParseError::HelperBadKwarg {
             path: path.to_path_buf(),
@@ -221,7 +242,7 @@ pub fn lower_to_workload(
         mounts: Vec::<Mount>::new(),
         network,
         resources,
-        dependencies: Some(Dependencies::None),
+        dependencies,
         threat_tier: Default::default(),
         addons: vec![],
         hooks,
@@ -470,6 +491,96 @@ fn helper_to_network(v: Value, path: &Path, line: usize) -> Result<Network, Pars
         peers: vec![],
         dns: None,
     })
+}
+
+/// Lower `dependencies=mvm.python_deps(lockfile=..., tool=...)` /
+/// `dependencies=mvm.node_deps(...)` to [`Dependencies`]. Plan 73
+/// Followup D wires this into the static decorator path so the
+/// ADR-047 install pipeline has a user-facing entry that doesn't
+/// require the imperative SDK runtime.
+fn helper_to_dependencies(v: Value, path: &Path, line: usize) -> Result<Dependencies, ParseError> {
+    let Value::Helper {
+        name, mut kwargs, ..
+    } = v
+    else {
+        return Err(ParseError::HelperBadKwarg {
+            path: path.to_path_buf(),
+            line,
+            helper: "mvm.app".to_string(),
+            kwarg: "dependencies".to_string(),
+            detail: format!("expected mvm.python_deps(...)/mvm.node_deps(...), got {v:?}"),
+        });
+    };
+    match name.as_str() {
+        "mvm.python_deps" => {
+            let lockfile = pop_string_kwarg(&mut kwargs, "lockfile").ok_or_else(|| {
+                ParseError::HelperMissingKwarg {
+                    path: path.to_path_buf(),
+                    line,
+                    helper: "mvm.python_deps".to_string(),
+                    kwarg: "lockfile",
+                }
+            })?;
+            // `tool` defaults to `uv`; the SDK helper documents the same
+            // default. `pip_tools` is the only other accepted value.
+            let tool_str =
+                pop_string_kwarg(&mut kwargs, "tool").unwrap_or_else(|| "uv".to_string());
+            let tool = match tool_str.as_str() {
+                "uv" => PythonTool::Uv,
+                // `pip-tools` is the user-facing spelling; canonicalize
+                // to the IR's snake_case variant.
+                "pip_tools" | "pip-tools" => PythonTool::PipTools,
+                other => {
+                    return Err(ParseError::HelperBadKwarg {
+                        path: path.to_path_buf(),
+                        line,
+                        helper: "mvm.python_deps".to_string(),
+                        kwarg: "tool".to_string(),
+                        detail: format!(
+                            "unknown tool {other:?}; expected 'uv' or 'pip-tools'/'pip_tools'"
+                        ),
+                    });
+                }
+            };
+            Ok(Dependencies::Python { lockfile, tool })
+        }
+        "mvm.node_deps" => {
+            let lockfile = pop_string_kwarg(&mut kwargs, "lockfile").ok_or_else(|| {
+                ParseError::HelperMissingKwarg {
+                    path: path.to_path_buf(),
+                    line,
+                    helper: "mvm.node_deps".to_string(),
+                    kwarg: "lockfile",
+                }
+            })?;
+            let tool_str =
+                pop_string_kwarg(&mut kwargs, "tool").unwrap_or_else(|| "pnpm".to_string());
+            let tool = match tool_str.as_str() {
+                "pnpm" => NodeTool::Pnpm,
+                "npm" => NodeTool::Npm,
+                "yarn" => NodeTool::Yarn,
+                other => {
+                    return Err(ParseError::HelperBadKwarg {
+                        path: path.to_path_buf(),
+                        line,
+                        helper: "mvm.node_deps".to_string(),
+                        kwarg: "tool".to_string(),
+                        detail: format!("unknown tool {other:?}; expected 'pnpm' / 'npm' / 'yarn'"),
+                    });
+                }
+            };
+            Ok(Dependencies::Node { lockfile, tool })
+        }
+        other => Err(ParseError::HelperBadKwarg {
+            path: path.to_path_buf(),
+            line,
+            helper: "mvm.app".to_string(),
+            kwarg: "dependencies".to_string(),
+            detail: format!(
+                "not a dependency-shaped helper: {other}; expected mvm.python_deps/mvm.node_deps"
+            ),
+        }),
+    }
 }
 
 fn helper_to_env_value(v: Value, path: &Path, line: usize) -> Result<EnvValue, ParseError> {
