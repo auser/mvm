@@ -266,9 +266,11 @@ httpmock = "0.7"
 ed25519-dalek.workspace = true
 predicates.workspace = true
 rand.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
+toml.workspace = true
 
 [features]
 # Plan 72 W5.B cutover: `backends-builder-vm-libkrun` is default so the
