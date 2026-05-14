@@ -3,35 +3,31 @@ title: Troubleshooting
 description: Common issues and their solutions.
 ---
 
-## Lima VM Issues
+## Dev VM Issues
 
-### "Lima VM not found"
+The dev VM is the Linux environment mvmctl runs Nix builds in. On macOS 26+ it's an Apple Container; on macOS Intel / pre-26 it's libkrun via `Hypervisor.framework`; on Linux with `/dev/kvm` the host shell *is* the dev environment and no VM hop exists.
+
+### "Dev VM is not running"
 
 ```
-Error: Lima VM 'mvm-builder' is not available. Run 'mvmctl bootstrap' first.
+Error: Dev VM is not running. Start it with: mvmctl dev up
 ```
 
-**Fix**: Run `mvmctl bootstrap` (idempotent — installs Lima/Firecracker if missing, no-ops otherwise).
+**Fix**: `mvmctl dev up` (idempotent — installs Firecracker if missing, no-ops otherwise).
 
-### "Failed to run command in Lima VM"
-
-The Lima VM exists but is stopped.
-
-**Fix**:
-```bash
-limactl start mvm-builder
-# or
-mvmctl dev  # auto-starts Lima
-```
-
-### Lima VM is stuck
+### Dev VM is stuck
 
 ```bash
-limactl stop mvm-builder --force
-limactl start mvm-builder
+mvmctl dev down
+mvmctl dev up
 ```
 
-If that fails:
+If that fails, rebuild from scratch:
+```bash
+mvmctl dev rebuild
+```
+
+Or for a full reset:
 ```bash
 mvmctl uninstall
 mvmctl bootstrap
@@ -54,8 +50,8 @@ mvmctl logs <name> --hypervisor   # Firecracker logs
 
 **Fix**:
 ```bash
-# Check for orphaned TAP devices (inside Lima VM)
-limactl shell mvm-builder bash -c "ip link show | grep tap"
+# Check for orphaned TAP devices (inside the dev VM)
+mvmctl dev shell -- ip link show | grep tap
 ```
 
 ### Instance won't start after sleep
@@ -105,7 +101,7 @@ mvmctl build --flake .
 error: No space left on device
 ```
 
-**Cause**: The Nix store or Lima disk is full.
+**Cause**: The Nix store or dev VM disk is full.
 
 **Fix**:
 ```bash
@@ -150,32 +146,32 @@ error: timed out waiting for ...
 
 **Cause**: Network connectivity issue or a service failed to start within the expected time.
 
-**Fix**: Check that the Lima VM has internet access and that your service binds to the correct port. Use `mvmctl logs <name>` to inspect guest output.
+**Fix**: Check that the dev VM has internet access and that your service binds to the correct port. Use `mvmctl logs <name>` to inspect guest output.
 
 ## Network Issues
 
 ### MicroVM has no internet
 
 ```bash
-# Inside the Lima VM, check NAT rules
-limactl shell mvm-builder bash -c "sudo iptables -t nat -L"
+# Inside the dev VM, check NAT rules
+mvmctl dev shell -- sudo iptables -t nat -L
 
 # Check the TAP device exists
-limactl shell mvm-builder bash -c "ip link show tap0"
+mvmctl dev shell -- ip link show tap0
 ```
 
 ### Can't access project files inside microVM
 
-The Firecracker microVM has an **isolated filesystem**. Use `mvmctl dev shell` to access the Lima VM where your home directory is mounted, or pass volumes with `--volume`.
+The Firecracker microVM has an **isolated filesystem**. Use `mvmctl dev shell` to access the dev VM where your home directory is mounted, or pass volumes with `--volume`.
 
 ## Performance Issues
 
-### Lima VM is slow
+### Dev VM is slow
 
-Adjust resources:
+Adjust resources (or persist the override with `mvmctl config set dev_vm_cpus 8 && mvmctl config set dev_vm_mem_gib 16`):
 ```bash
-mvmctl uninstall
-mvmctl dev up --lima-cpus 8 --lima-mem 16
+mvmctl dev down
+mvmctl dev up --cpus 8 --memory 16
 ```
 
 ### Wrong backend selected
@@ -241,7 +237,7 @@ export MVM_ACK_DOCKER_TIER=1
 
 ### Rootfs corrupted
 
-Re-run `mvmctl bootstrap` — it's idempotent and repaves any corrupted rootfs from the upstream squashfs without destroying the Lima VM:
+Re-run `mvmctl bootstrap` — it's idempotent and repaves any corrupted rootfs from the upstream squashfs without destroying the dev VM:
 ```bash
 mvmctl bootstrap
 ```

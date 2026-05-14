@@ -37,7 +37,7 @@ The Ubicloud VM gives you `/dev/kvm` (it advertises nested virt to the guest), s
 
 Use the Ubicloud console or CLI to provision a VM. Recommended sizing for an mvm host:
 
-- **vCPUs**: 8+ (mvm guests cost 1–2 vCPUs each; the host needs headroom for the Lima-equivalent build environment)
+- **vCPUs**: 8+ (mvm guests cost 1–2 vCPUs each; the host needs headroom for build work)
 - **RAM**: 16+ GiB
 - **Disk**: 100+ GiB
 - **Image**: Ubuntu 24.04 LTS
@@ -59,7 +59,7 @@ cargo install --git https://github.com/tinylabscom/mvm mvmctl
 mvmctl bootstrap
 ```
 
-Same as the [AWS guide](/deploy/aws) from this point on. `mvmctl bootstrap` detects `/dev/kvm` and skips the Lima install path.
+Same as the [AWS guide](/deploy/aws) from this point on. `mvmctl bootstrap` detects `/dev/kvm` and uses Firecracker natively.
 
 ## Verify
 

@@ -323,10 +323,10 @@ The snapshot path activates only when *all* of the following hold:
   snapshot's recorded drive layout);
 - the active backend reports snapshot support.
 
-On macOS / Lima QEMU, vsock snapshots return `os error 95` (EOPNOTSUPP);
-restore failures fall back to cold boot with a warning rather than
-aborting the exec. See the [Sandboxed Exec](/guides/exec/) guide for
-the full background.
+On macOS backends without Firecracker (Apple Container, libkrun), vsock
+snapshots return `os error 95` (EOPNOTSUPP); restore failures fall back
+to cold boot with a warning rather than aborting the exec. See the
+[Sandboxed Exec](/guides/exec/) guide for the full background.
 
 ## Default microVM Image
 
@@ -412,7 +412,6 @@ All commands accept these global options:
 | `MVM_TEMPLATE_REGISTRY_SECRET_ACCESS_KEY` | S3 secret access key | None |
 | `MVM_TEMPLATE_REGISTRY_PREFIX` | Key prefix inside the bucket | `mvm` |
 | `MVM_TEMPLATE_REGISTRY_REGION` | S3 region | `us-east-1` |
-| `MVM_SSH_PORT` | Lima SSH local port | `60022` |
 | `OPENAI_API_KEY` | Enables LLM-backed template planning for `template init --prompt` | None |
 | `MVM_TEMPLATE_PROVIDER` | Prompt planning provider: `auto`, `openai`, `local`, or `heuristic` | `auto` |
 | `MVM_TEMPLATE_OPENAI_MODEL` | OpenAI model used for prompt planning | `gpt-5.2` |

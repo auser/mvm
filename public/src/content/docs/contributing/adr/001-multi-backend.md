@@ -24,7 +24,7 @@ Use Firecracker as the primary production backend. Support multiple backends: Ap
 ## Rationale
 
 - **Firecracker**: Minimalist design (<50K LOC), ~125ms cold boot, snapshot support, hardware isolation via KVM
-- **Apple Container**: Sub-second startup on macOS 26+, no Lima overhead, native vsock -- ideal for dev workflows
+- **Apple Container**: Sub-second startup on macOS 26+, native Hypervisor.framework, native vsock -- ideal for dev workflows
 - **Auto-selection**: Developers get the best experience on their platform without manual configuration
 - **Docker**: Universal fallback when no hypervisor is available -- pause/resume via container lifecycle, unix socket guest channel
 - **microvm.nix**: NixOS-native QEMU runner with vsock and TAP networking support
@@ -35,14 +35,14 @@ Use Firecracker as the primary production backend. Support multiple backends: Ap
 1. **KVM available** (Linux with `/dev/kvm`) -- Firecracker directly
 2. **macOS 26+** (Apple Silicon) -- Apple Virtualization.framework
 3. **Docker running** -- Docker as container-based fallback
-4. **Other** (macOS <26, Linux without KVM) -- Lima VM + Firecracker
+4. **Other** (macOS <26 / Intel, Linux without KVM) -- libkrun via Hypervisor.framework, or Docker fallback (see ADR-013)
 
 Override with `--hypervisor firecracker`, `--hypervisor apple-container`, `--hypervisor qemu`, or `--hypervisor docker`.
 
 ## Consequences
 
 - Requires Linux with `/dev/kvm` for native Firecracker, or macOS 26+ for Apple Container
-- Lima is only needed as a fallback (macOS <26 or Linux without KVM, and Docker not available)
+- macOS <26 / Intel falls back to libkrun via Hypervisor.framework; Docker is the final tier (see ADR-013 for the Lima retirement)
 - Guests must use a Linux kernel (no Windows/macOS guests)
 - No OCI image compatibility -- uses Nix flakes for image building instead
 - Snapshots only available on Firecracker backend

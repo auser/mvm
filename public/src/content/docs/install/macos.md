@@ -1,6 +1,6 @@
 ---
 title: "Install mvm on macOS"
-description: "mvm on macOS runs natively via microsandbox + libkrun on Hypervisor.framework — no Lima, no Docker Desktop. Apple Silicon (arm64) is the primary target; Intel Macs work too."
+description: "mvm on macOS runs natively via microsandbox + libkrun on Hypervisor.framework. No Docker Desktop required. Apple Silicon (arm64) is the primary target; Intel Macs work too."
 ---
 
 mvm on macOS can use **microsandbox** as the backend — a libkrun wrapper that boots microVMs on Apple's Hypervisor.framework. Source builds keep this dependency-heavy backend behind the `contributor-bootstrap` feature; release builds that include macOS microsandbox support are built with that feature enabled. The choice is recorded in [ADR-013](/contributing/adr/013-microsandbox-pivot/) and ADR-031.
