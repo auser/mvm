@@ -551,9 +551,23 @@ fn plist_env_string_value(plist: &str, key: &str) -> Option<String> {
 fn ensure_dev_image() -> Result<(String, String)> {
     let local_flake = find_dev_image_flake().ok();
 
-    #[cfg(feature = "contributor-bootstrap")]
-    if let Some(flake_dir) = &local_flake {
-        let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
+    // Prepare the shared output directory for any source-checkout
+    // build path. Pulled out of the per-backend branches below so
+    // both the libkrun (W5 cutover) and microsandbox (legacy) paths
+    // see the same writable dir. Variable is unused when both
+    // builder-VM features are off (downloaded-prebuilt-only build);
+    // the cfg-gated underscore prefix keeps the `-D warnings` lint
+    // happy without losing the readable name.
+    #[cfg(any(
+        feature = "backends-builder-vm-libkrun",
+        feature = "contributor-bootstrap"
+    ))]
+    let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
+    #[cfg(any(
+        feature = "backends-builder-vm-libkrun",
+        feature = "contributor-bootstrap"
+    ))]
+    if local_flake.is_some() {
         if let Some(parent) = std::path::Path::new(&out_dir).parent() {
             std::fs::create_dir_all(parent)
                 .with_context(|| format!("creating dev-image out parent {}", parent.display()))?;
@@ -573,7 +587,37 @@ fn ensure_dev_image() -> Result<(String, String)> {
         }
         std::fs::create_dir_all(&out_dir)
             .with_context(|| format!("creating dev-image out dir {out_dir}"))?;
+    }
 
+    // Plan 72 W5 cutover: when `backends-builder-vm-libkrun` is on
+    // AND libkrun is installed on the host, build via libkrun. If
+    // it fails for any reason — Layer 1 bootstrap missing,
+    // supervisor binary not on PATH, libkrun rejecting the VM —
+    // fall through to the microsandbox path so users on hosts in
+    // transition aren't blocked. A future PR will flip to
+    // "libkrun-only" once the cutover is battle-tested.
+    #[cfg(feature = "backends-builder-vm-libkrun")]
+    if let Some(flake_dir) = &local_flake
+        && mvm_libkrun::is_available()
+    {
+        ui::info(&format!(
+            "Building dev image via libkrun builder VM (Plan 72 W5) from: {flake_dir}"
+        ));
+        match build_image_via_libkrun(flake_dir, &out_dir) {
+            Ok((kernel, rootfs)) => {
+                ui::success(&format!("Dev image ready at {out_dir} (via libkrun)."));
+                return Ok((kernel, rootfs));
+            }
+            Err(e) => {
+                ui::warn(&format!(
+                    "libkrun builder failed ({e}); falling back to microsandbox path."
+                ));
+            }
+        }
+    }
+
+    #[cfg(feature = "contributor-bootstrap")]
+    if let Some(flake_dir) = &local_flake {
         ui::info(&format!(
             "Building dev image via microsandbox builder VM from: {flake_dir}"
         ));
@@ -1748,6 +1792,103 @@ fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(Strin
     }
     if !std::path::Path::new(&rootfs).exists() {
         anyhow::bail!("builder VM did not produce rootfs.ext4 at {rootfs}");
+    }
+    Ok((kernel, rootfs))
+}
+
+/// Build the dev image via libkrun (Plan 72 W5 cutover, Layer 2).
+///
+/// Parallel to [`build_image_via_microsandbox`] but uses the
+/// [`LibkrunBuilderVm`] launcher that #172 wired in W4. Two-layer
+/// rule from ADR-046:
+///
+/// 1. **Layer 1**: ensure the cached builder VM image exists at
+///    `~/.cache/mvm/builder-vm/<arch>/`. If empty, call
+///    [`bootstrap_builder_vm_image`] (which requires the
+///    `contributor-bootstrap` feature to run Stage 0 microsandbox
+///    against `nix/images/builder-vm/flake.nix`). Subsequent runs
+///    skip this step and reuse the cache.
+/// 2. **Layer 2**: invoke `LibkrunBuilderVm::run_build` against the
+///    user's dev-shell flake. The Layer 1 image boots inside
+///    libkrun, runs `nix build` against the workspace mounted at
+///    `/work`, and copies `vmlinux + rootfs.ext4` to `/out`.
+///
+/// On any error, the caller decides whether to bail or fall through
+/// to the microsandbox path — currently the W5 dispatch falls
+/// through, so a libkrun build failure is *not* fatal; the
+/// microsandbox path retries. That's the safe cutover semantics for
+/// this slice; a future PR will tighten to "libkrun-only when
+/// `backends-builder-vm-libkrun` is on" once the path is battle-tested.
+#[cfg(feature = "backends-builder-vm-libkrun")]
+fn build_image_via_libkrun(flake_dir: &str, out_dir: &str) -> Result<(String, String)> {
+    use mvm_build::builder_vm::{BuilderJob, BuilderMounts, BuilderVm, host_system_linux};
+    use mvm_build::libkrun_builder::LibkrunBuilderVm;
+
+    // Layer 1 — ensure the builder VM image is in the cache.
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let layer1_cache = format!("{}/builder-vm/{arch}", mvm_core::config::mvm_cache_dir());
+    let layer1_kernel = format!("{layer1_cache}/vmlinux");
+    let layer1_rootfs = format!("{layer1_cache}/rootfs.ext4");
+    if !std::path::Path::new(&layer1_kernel).exists()
+        || !std::path::Path::new(&layer1_rootfs).exists()
+    {
+        ui::info(
+            "Layer 1 builder VM image not in cache; bootstrapping via Stage 0 microsandbox \
+             (one-time, takes a few minutes).",
+        );
+        bootstrap_builder_vm_image().context("Layer 1 builder VM bootstrap")?;
+    }
+
+    // Layer 2 — build the user's dev-shell flake via libkrun.
+    let flake_src = std::path::PathBuf::from(flake_dir);
+    let workspace_root = flake_src
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| {
+            anyhow::anyhow!("flake dir is not three levels deep in workspace: {flake_dir}")
+        })?
+        .to_path_buf();
+    let flake_rel = flake_src
+        .strip_prefix(&workspace_root)
+        .map_err(|_| anyhow::anyhow!("flake dir not under derived workspace root: {flake_dir}"))?;
+    let guest_flake_ref = format!(
+        "path:/work/{}",
+        flake_rel
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("flake subpath has non-UTF-8 bytes: {flake_rel:?}"))?
+    );
+
+    let job = BuilderJob {
+        flake_ref: guest_flake_ref,
+        attr_path: format!("packages.{}.default", host_system_linux()),
+    };
+    let mounts = BuilderMounts {
+        flake_src: workspace_root,
+        // libkrun doesn't bind-mount the host's /nix store — it
+        // uses the persistent virtio-blk store the launcher manages.
+        host_nix_store: None,
+        artifact_out: std::path::PathBuf::from(out_dir),
+    };
+
+    ui::info(&format!(
+        "Building dev image via libkrun (Layer 2) from: {flake_dir}"
+    ));
+    LibkrunBuilderVm::default()
+        .run_build(&job, &mounts)
+        .map_err(|e| anyhow::anyhow!("libkrun builder VM: {e}"))?;
+
+    let kernel = format!("{out_dir}/vmlinux");
+    let rootfs = format!("{out_dir}/rootfs.ext4");
+    if !std::path::Path::new(&kernel).exists() {
+        anyhow::bail!("libkrun builder VM did not produce vmlinux at {kernel}");
+    }
+    if !std::path::Path::new(&rootfs).exists() {
+        anyhow::bail!("libkrun builder VM did not produce rootfs.ext4 at {rootfs}");
     }
     Ok((kernel, rootfs))
 }

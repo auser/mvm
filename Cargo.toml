@@ -261,7 +261,10 @@ contributor-bootstrap = [
 # W4; default-on after Plan 72 W5 cutover. Only `mvm-build` carries
 # the implementation today; the feature surfaces here so workspace-
 # level builds can opt in cleanly.
-backends-builder-vm-libkrun = ["mvm-build/backends-builder-vm-libkrun"]
+backends-builder-vm-libkrun = [
+    "mvm-build/backends-builder-vm-libkrun",
+    "mvm-cli/backends-builder-vm-libkrun",
+]
 custom-dns = ["mvm-cli/custom-dns"]
 dev-watch = ["mvm-cli/dev-watch"]
 manifest-verify = [

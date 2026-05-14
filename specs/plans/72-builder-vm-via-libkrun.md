@@ -309,6 +309,29 @@ Reshape `ensure_dev_image` to encode the two-layer artifact rule from ADR-046 §
 - Live test `tests/dev_up_contributor_bootstrap.rs` exercises the `--features contributor-bootstrap` Stage 0 path. This test must explicitly verify that no host `nix` binary is invoked (e.g. by putting a poisoned `nix` shim at the front of `PATH` that exits non-zero and asserting the build still succeeds).
 - A contributor edit to `nix/images/builder-vm/flake.nix` (e.g. adding `htop` to `builderPackages`) shows up in the next `mvmctl dev up` without a release-pipeline round-trip.
 
+#### W5 progress — dispatch swap (2026-05-13)
+
+Second slice of W5 after the bootstrap helpers in #178. Wires the libkrun-first branch into `ensure_dev_image`:
+
+- **`build_image_via_libkrun(flake_dir, out_dir)`** — parallel to `build_image_via_microsandbox`. Layer 1: probes `~/.cache/mvm/builder-vm/<arch>/{vmlinux,rootfs.ext4}`; on cache miss calls `bootstrap_builder_vm_image()` (Stage 0 microsandbox, requires `contributor-bootstrap`). Layer 2: constructs `BuilderJob` + `BuilderMounts` against the dev-shell flake, delegates to `LibkrunBuilderVm::run_build`, validates the `vmlinux + rootfs.ext4` output.
+- **`ensure_dev_image` dispatch** — when `backends-builder-vm-libkrun` is on AND `mvm_libkrun::is_available()`, try the libkrun path first. On any failure (Layer 1 bootstrap missing, supervisor binary not on PATH, libkrun rejecting the VM, etc.) fall through to the existing microsandbox path. The cascade lets users on hosts mid-transition keep working while the new path lands.
+- **Feature wiring** — `backends-builder-vm-libkrun` propagates from workspace → `mvm-cli` → `mvm-build`. Default-off in this PR for safety; a follow-up flips the default once the cutover is battle-tested.
+
+**Verified locally** (macOS Apple Silicon):
+
+- `cargo build -p mvm-cli` — green (no feature).
+- `cargo build -p mvm-cli --features backends-builder-vm-libkrun` — green.
+- `cargo build -p mvm-cli --features contributor-bootstrap` — green.
+- `cargo build -p mvm-cli --features "backends-builder-vm-libkrun contributor-bootstrap"` — green.
+- `cargo clippy -p mvm-cli --features backends-builder-vm-libkrun --all-targets -- -D warnings` and the combined-feature variant — both clean.
+- `cargo test -p mvm-cli --features backends-builder-vm-libkrun` — 487/487 pass.
+
+**Still queued for W5**:
+
+- Flip `backends-builder-vm-libkrun` default to ON. Held back here because users without libkrun installed need a graceful path; today they keep the microsandbox fallback. After the next CI lane lands ("libkrun-only path proves itself"), the flip is a one-line Cargo.toml change.
+- Live tests `tests/dev_up_libkrun.rs` + `tests/dev_up_contributor_bootstrap.rs`. Not in this slice; needs the prebuilt download path (currently absent for installed binaries) or fixtures pre-staged in CI.
+- Air-gapped variant + `mvmctl builder-vm bootstrap` subcommand.
+
 ---
 
 ## W6 — Hygiene (not removal)

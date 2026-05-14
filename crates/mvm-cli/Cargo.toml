@@ -69,6 +69,11 @@ contributor-bootstrap = [
     "mvm-build/contributor-bootstrap",
     "mvm-backend/contributor-bootstrap",
 ]
+# Plan 72 W5 cutover: when on, `ensure_dev_image` tries the
+# libkrun-backed builder VM (`LibkrunBuilderVm`) before falling
+# back to the microsandbox path. Default-off until the cutover
+# is battle-tested; flip in a follow-up PR.
+backends-builder-vm-libkrun = ["mvm-build/backends-builder-vm-libkrun"]
 custom-dns = ["mvm-supervisor/custom-dns"]
 dev-watch = ["dep:notify", "dep:notify-debouncer-mini"]
 manifest-verify = [
