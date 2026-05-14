@@ -122,6 +122,15 @@ Extends `ShellEnvironment` for fleet orchestration:
 - `ensure_bridge()`, `setup_tap()`, `teardown_tap()`
 - `record_revision()`
 
+### Supervisor Enforcement
+
+`mvm-supervisor` owns the host-side policy slots used after plan admission:
+
+- `L4Gate` evaluates policy-bundle `[[network.l4]]` rows with default-deny semantics
+- `FirewallEnforcer` installs per-VM default-deny host firewall rules before backend launch and tears them down on failed launch or stop
+- `LinuxNftFirewall` generates VM-scoped nftables tables that only allow TAP traffic to the supervisor proxy interface
+- `NoopFirewallEnforcer` fails closed when no platform firewall is wired
+
 ## How It Works
 
 At startup, mvmctl detects the platform and selects the appropriate backend:
