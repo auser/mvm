@@ -1354,6 +1354,29 @@ fn test_policy_lint_json_parses() {
     }
 }
 
+#[test]
+fn test_policy_diff_json_parses() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "policy",
+        "diff",
+        "acme:web-v1",
+        "acme:web-v2",
+        "--json",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Policy(policy::Args {
+            action: PolicyAction::Diff { left, right, json },
+        }) => {
+            assert_eq!(left, "acme:web-v1");
+            assert_eq!(right, "acme:web-v2");
+            assert!(json);
+        }
+        other => panic!("Expected Policy Diff command, got {other:?}"),
+    }
+}
+
 // --- Network CLI tests ---
 
 #[test]
