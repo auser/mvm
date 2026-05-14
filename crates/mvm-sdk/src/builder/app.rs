@@ -108,6 +108,13 @@ impl AppBuilder {
             dependencies: self.dependencies,
             threat_tier: Default::default(),
             addons: vec![],
+            // SDK port Phase 1a — `hooks` is a four-phase struct
+            // of `Vec<HookCmd>` that defaults to all-empty (and
+            // serializes as `{}` thanks to per-field
+            // `skip_serializing_if = "Vec::is_empty"`). Builders
+            // that need to declare hooks use `App::with_hooks` (or
+            // the addon-aware merge path) downstream.
+            hooks: Default::default(),
         })
     }
 }
