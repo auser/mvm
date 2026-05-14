@@ -65,6 +65,26 @@ pub(in crate::commands) enum Commands {
     Storage(storage::Args),
     /// Build a microVM image from a Mvmfile.toml config or Nix flake
     Build(build::build::Args),
+    /// Render a Workload IR into `flake.nix` + `launch.json` + bundled
+    /// source (mvm-sdk compile pipeline).
+    ///
+    /// v1 accepts a pre-rendered IR JSON via `--from-ir <path>` or `-`
+    /// for stdin; the decorator-script (`@mvm.app`) and runtime-script
+    /// (`Sandbox`) entry forms land with SDK-port Phases 4 and 7
+    /// respectively. Output ending in `.tar.gz`/`.tgz` writes a
+    /// deterministic archive; otherwise a directory.
+    ///
+    /// Mode resolution: `--mode {live|plan|record}` is the explicit
+    /// form; `--prod` is the alias for `record` (the default for
+    /// compile); `--dev` is refused (use `mvmctl run` for live).
+    /// `MVM_SDK_MODE` env var overrides flags.
+    Compile(build::compile::Args),
+    /// Compile a workload and ship the resulting signed archive to
+    /// mvmd. v1 stub end: builds the single `.tar.gz` (compile output
+    /// plus an embedded `mvmd-spec.json` per mvmd ADR-0020) and logs
+    /// what the real HTTP client would `POST /v1/workloads`. The real
+    /// shipping path lands with mvmd Plan 48 Phase 1090.
+    Deploy(build::deploy::Args),
     /// Build and run a VM from a Nix flake, a manifest path, or the bundled default image.
     ///
     /// If neither `--flake` nor `--manifest` is supplied, the bundled
@@ -293,6 +313,8 @@ pub fn run() -> Result<()> {
         Commands::Manifest(a) => manifest::run(&cli, a, &cfg),
         Commands::Storage(a) => storage::run(&cli, a, &cfg),
         Commands::Build(a) => build::build::run(&cli, a, &cfg),
+        Commands::Compile(a) => build::compile::run(&cli, a, &cfg),
+        Commands::Deploy(a) => build::deploy::run(&cli, a, &cfg),
         Commands::Up(a) => vm::up::run(&cli, a, &cfg),
         Commands::Down(a) => vm::down::run(&cli, a, &cfg),
         Commands::ShellInit(a) => env::shell_init::run(&cli, a, &cfg),
