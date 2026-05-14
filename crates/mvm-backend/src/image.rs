@@ -374,7 +374,7 @@ fn repair_dev_null() -> Result<()> {
     // skip the command if /dev/null itself is broken.
     let check = run_in_vm("test -c /dev/null -a -w /dev/null")?;
     if !check.status.success() {
-        ui::warn("Repairing /dev/null in Lima VM...");
+        ui::warn("Repairing /dev/null in builder VM...");
         run_in_vm(
             "sudo rm -f /dev/null && sudo mknod /dev/null c 1 3 && sudo chmod 666 /dev/null",
         )?;

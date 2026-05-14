@@ -178,9 +178,9 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             shell,
         } => {
             // CLI flag wins; otherwise fall back to per-user config defaults.
-            let effective_cpus = if cpus == 8 { cfg.lima_cpus } else { cpus };
+            let effective_cpus = if cpus == 8 { cfg.dev_vm_cpus } else { cpus };
             let effective_mem = if memory == 16 {
-                cfg.lima_mem_gib
+                cfg.dev_vm_mem_gib
             } else {
                 memory
             };
@@ -294,9 +294,9 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             let _ = std::fs::remove_dir_all(&cache_dir);
 
             // Up
-            let effective_cpus = if cpus == 8 { cfg.lima_cpus } else { cpus };
+            let effective_cpus = if cpus == 8 { cfg.dev_vm_cpus } else { cpus };
             let effective_mem = if memory == 16 {
-                cfg.lima_mem_gib
+                cfg.dev_vm_mem_gib
             } else {
                 memory
             };

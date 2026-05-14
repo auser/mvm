@@ -153,7 +153,7 @@ mod tests {
         std::thread::sleep(Duration::from_millis(50));
 
         let updated = MvmConfig {
-            lima_cpus: 4,
+            dev_vm_cpus: 4,
             ..MvmConfig::default()
         };
         write_config(&config_path, &updated);
@@ -164,7 +164,7 @@ mod tests {
         while std::time::Instant::now() < deadline {
             match watcher.receiver.try_recv() {
                 Ok(ConfigReloadEvent::Reloaded(cfg)) => {
-                    assert_eq!(cfg.lima_cpus, 4);
+                    assert_eq!(cfg.dev_vm_cpus, 4);
                     received = true;
                     break;
                 }
@@ -225,20 +225,20 @@ mod tests {
         let mut cfg = MvmConfig::default();
 
         let new_cfg = MvmConfig {
-            lima_cpus: 12,
+            dev_vm_cpus: 12,
             ..MvmConfig::default()
         };
         tx.send(ConfigReloadEvent::Reloaded(new_cfg)).unwrap();
 
         cfg = apply_pending_reloads(cfg, &rx);
-        assert_eq!(cfg.lima_cpus, 12);
+        assert_eq!(cfg.dev_vm_cpus, 12);
     }
 
     #[test]
     fn test_apply_pending_reloads_keeps_cfg_on_error() {
         let (tx, rx) = mpsc::channel();
         let mut cfg = MvmConfig {
-            lima_cpus: 6,
+            dev_vm_cpus: 6,
             ..MvmConfig::default()
         };
 
@@ -247,6 +247,6 @@ mod tests {
 
         cfg = apply_pending_reloads(cfg, &rx);
         // Config unchanged after parse error.
-        assert_eq!(cfg.lima_cpus, 6);
+        assert_eq!(cfg.dev_vm_cpus, 6);
     }
 }

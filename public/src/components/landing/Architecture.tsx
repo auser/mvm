@@ -73,7 +73,7 @@ export function Architecture() {
                 </div>
                 <div className="mt-3 flex flex-wrap gap-x-4 gap-y-1 text-[10px] text-label">
                   <span><strong className="text-emphasis">Linux + KVM</strong> — native</span>
-                  <span><strong className="text-emphasis">macOS</strong> — via Lima VM</span>
+                  <span><strong className="text-emphasis">macOS</strong> — via libkrun / Apple Container</span>
                 </div>
               </div>
 
@@ -90,8 +90,8 @@ export function Architecture() {
                   </div>
                 </div>
                 <p className="mt-2 text-xs text-label leading-relaxed">
-                  Native macOS 26+ on Apple Silicon. Sub-second startup, no Lima
-                  needed.
+                  Native macOS 26+ on Apple Silicon. Sub-second startup via
+                  Apple Container.
                 </p>
                 <div className="mt-3 flex flex-wrap gap-1.5">
                   {["vsock", "fast boot"].map((c) => (
@@ -129,7 +129,7 @@ export function Architecture() {
                   ))}
                 </div>
                 <div className="mt-3 text-[10px] text-label">
-                  <strong className="text-emphasis">Linux</strong> — native or via Lima
+                  <strong className="text-emphasis">Linux</strong> — native KVM
                 </div>
               </div>
 

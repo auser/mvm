@@ -24,10 +24,11 @@ pub struct SecurityConfig {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(default)]
 pub struct MvmConfig {
-    /// vCPUs allocated to the Lima VM (default: 8)
-    pub lima_cpus: u32,
-    /// Memory in GiB allocated to the Lima VM (default: 16)
-    pub lima_mem_gib: u32,
+    /// vCPUs allocated to the dev VM (default: 8). macOS uses Apple
+    /// Container; Linux uses native KVM.
+    pub dev_vm_cpus: u32,
+    /// Memory in GiB allocated to the dev VM (default: 16).
+    pub dev_vm_mem_gib: u32,
     /// Default vCPU count for `mvmctl run` (default: 2)
     pub default_cpus: u32,
     /// Default memory in MiB for `mvmctl run` (default: 512)
@@ -45,8 +46,8 @@ pub struct MvmConfig {
 impl Default for MvmConfig {
     fn default() -> Self {
         Self {
-            lima_cpus: 8,
-            lima_mem_gib: 16,
+            dev_vm_cpus: 8,
+            dev_vm_mem_gib: 16,
             default_cpus: 2,
             default_memory_mib: 512,
             log_format: None,
@@ -134,14 +135,14 @@ pub fn save(cfg: &MvmConfig, override_dir: Option<&Path>) -> Result<()> {
 /// Returns `Err` for unknown keys or unparseable values.
 pub fn set_key(cfg: &mut MvmConfig, key: &str, value: &str) -> Result<()> {
     match key {
-        "lima_cpus" => {
-            cfg.lima_cpus = value.parse().with_context(|| {
-                format!("lima_cpus must be a positive integer, got {:?}", value)
+        "dev_vm_cpus" => {
+            cfg.dev_vm_cpus = value.parse().with_context(|| {
+                format!("dev_vm_cpus must be a positive integer, got {:?}", value)
             })?;
         }
-        "lima_mem_gib" => {
-            cfg.lima_mem_gib = value.parse().with_context(|| {
-                format!("lima_mem_gib must be a positive integer, got {:?}", value)
+        "dev_vm_mem_gib" => {
+            cfg.dev_vm_mem_gib = value.parse().with_context(|| {
+                format!("dev_vm_mem_gib must be a positive integer, got {:?}", value)
             })?;
         }
         "default_cpus" => {
@@ -185,7 +186,7 @@ pub fn set_key(cfg: &mut MvmConfig, key: &str, value: &str) -> Result<()> {
         }
         other => {
             anyhow::bail!(
-                "Unknown config key {:?}. Valid keys: lima_cpus, lima_mem_gib, \
+                "Unknown config key {:?}. Valid keys: dev_vm_cpus, dev_vm_mem_gib, \
                  default_cpus, default_memory_mib, log_format, metrics_port, catalog_url",
                 other
             );
@@ -201,8 +202,8 @@ mod tests {
     #[test]
     fn test_default_values() {
         let cfg = MvmConfig::default();
-        assert_eq!(cfg.lima_cpus, 8);
-        assert_eq!(cfg.lima_mem_gib, 16);
+        assert_eq!(cfg.dev_vm_cpus, 8);
+        assert_eq!(cfg.dev_vm_mem_gib, 16);
         assert_eq!(cfg.default_cpus, 2);
         assert_eq!(cfg.default_memory_mib, 512);
         assert!(cfg.log_format.is_none());
@@ -230,36 +231,36 @@ mod tests {
         // added must continue to deserialize cleanly with default security
         // values. Serde's `#[serde(default)]` on the struct gives us this.
         let legacy = r#"
-            lima_cpus = 4
-            lima_mem_gib = 8
+            dev_vm_cpus = 4
+            dev_vm_mem_gib = 8
             default_cpus = 2
             default_memory_mib = 512
         "#;
         let cfg: MvmConfig = toml::from_str(legacy).unwrap();
-        assert_eq!(cfg.lima_cpus, 4);
+        assert_eq!(cfg.dev_vm_cpus, 4);
         assert!(!cfg.security.ack_docker_tier);
     }
 
     #[test]
     fn test_toml_roundtrip() {
         let cfg = MvmConfig {
-            lima_cpus: 4,
+            dev_vm_cpus: 4,
             metrics_port: Some(9091),
             ..MvmConfig::default()
         };
 
         let text = toml::to_string_pretty(&cfg).unwrap();
         let parsed: MvmConfig = toml::from_str(&text).unwrap();
-        assert_eq!(parsed.lima_cpus, 4);
+        assert_eq!(parsed.dev_vm_cpus, 4);
         assert_eq!(parsed.metrics_port, Some(9091));
-        assert_eq!(parsed.lima_mem_gib, 16);
+        assert_eq!(parsed.dev_vm_mem_gib, 16);
     }
 
     #[test]
     fn test_load_from_empty_dir_returns_defaults_and_creates_file() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = load(Some(tmp.path()));
-        assert_eq!(cfg.lima_cpus, 8);
+        assert_eq!(cfg.dev_vm_cpus, 8);
         // File should have been created
         assert!(tmp.path().join("config.toml").exists());
     }
@@ -268,22 +269,22 @@ mod tests {
     fn test_save_and_load_roundtrip() {
         let tmp = tempfile::tempdir().unwrap();
         let cfg = MvmConfig {
-            lima_cpus: 6,
+            dev_vm_cpus: 6,
             default_memory_mib: 1024,
             ..MvmConfig::default()
         };
         save(&cfg, Some(tmp.path())).unwrap();
 
         let loaded = load(Some(tmp.path()));
-        assert_eq!(loaded.lima_cpus, 6);
+        assert_eq!(loaded.dev_vm_cpus, 6);
         assert_eq!(loaded.default_memory_mib, 1024);
     }
 
     #[test]
     fn test_set_key_known_key() {
         let mut cfg = MvmConfig::default();
-        set_key(&mut cfg, "lima_cpus", "4").unwrap();
-        assert_eq!(cfg.lima_cpus, 4);
+        set_key(&mut cfg, "dev_vm_cpus", "4").unwrap();
+        assert_eq!(cfg.dev_vm_cpus, 4);
     }
 
     #[test]
@@ -291,7 +292,7 @@ mod tests {
         let mut cfg = MvmConfig::default();
         let err = set_key(&mut cfg, "not_a_key", "5").unwrap_err();
         assert!(err.to_string().contains("Unknown config key"));
-        assert!(err.to_string().contains("lima_cpus"));
+        assert!(err.to_string().contains("dev_vm_cpus"));
     }
 
     #[test]
@@ -323,7 +324,7 @@ mod tests {
     #[test]
     fn test_set_key_invalid_value_error() {
         let mut cfg = MvmConfig::default();
-        let err = set_key(&mut cfg, "lima_cpus", "not-a-number").unwrap_err();
+        let err = set_key(&mut cfg, "dev_vm_cpus", "not-a-number").unwrap_err();
         assert!(err.to_string().contains("integer"));
     }
 }
