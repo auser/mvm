@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::bundle::PlanArtifact;
 use crate::types::{
-    ArtifactPolicy, AttestationRequirement, AuditLabels, FsPolicyRef, KeyRotationSpec, Nonce,
-    PlanId, PolicyRef, PostRunLifecycle, ReleasePin, Resources, RuntimeProfileRef, SecretBinding,
-    SignedImageRef, TenantId, WorkloadId,
+    ArtifactPolicy, AttestationRequirement, AuditLabels, DepsVolumeBinding, FsPolicyRef,
+    KeyRotationSpec, Nonce, PlanId, PolicyRef, PostRunLifecycle, ReleasePin, Resources,
+    RuntimeProfileRef, SecretBinding, SignedImageRef, TenantId, WorkloadId,
 };
 
 /// Wire-format version. Bump when fields change in a way older
@@ -140,4 +140,18 @@ pub struct ExecutionPlan {
     /// from CLI synthesis is the next step, after this substrate.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub bundle: Option<PlanArtifact>,
+
+    /// Optional pin to an application-dependencies volume sealed
+    /// by `mvm_sdk::compile::deps_audit::seal_volume`. When present,
+    /// the supervisor's admit path re-runs `verify_sealed_volume`
+    /// against `~/.mvm/volumes/deps/<volume_hash>/`, then compares
+    /// the derived volume hash + manifest sha against the pinned
+    /// values here. Any mismatch refuses admission — ADR-047
+    /// security claim 9.
+    ///
+    /// `None` (the default during migration; see ADR-047 §"Migration")
+    /// means the plan has no deps volume; the admit path skips this
+    /// step. Plan 73 Followup A.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub deps_volume: Option<DepsVolumeBinding>,
 }

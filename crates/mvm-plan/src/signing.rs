@@ -178,6 +178,7 @@ mod tests {
             valid_until: Utc.with_ymd_and_hms(2026, 5, 1, 1, 0, 0).unwrap(),
             nonce: Nonce::from_bytes([0xab; 16]),
             bundle: None,
+            deps_volume: None,
         }
     }
 
@@ -272,6 +273,50 @@ mod tests {
         let bytes = serde_json::to_vec(&value).unwrap();
         let result: Result<ExecutionPlan, _> = serde_json::from_slice(&bytes);
         assert!(result.is_err(), "deny_unknown_fields must reject");
+    }
+
+    #[test]
+    fn plan_with_deps_volume_signs_and_verifies() {
+        // Plan 73 Followup A: ExecutionPlan carries
+        // `deps_volume: Option<DepsVolumeBinding>`. A plan with a
+        // populated binding must round-trip through sign → verify
+        // unchanged, and the resulting bytes must canonicalize
+        // deterministically so the host signer always produces the
+        // same signature input for the same plan.
+        let mut plan = sample_plan();
+        plan.deps_volume = Some(
+            crate::DepsVolumeBinding::new("a".repeat(64), "b".repeat(64)).expect("valid binding"),
+        );
+        let (sk, vk) = fresh_key();
+        let signed_a = sign_plan(&plan, &sk, "test-signer");
+        let signed_b = sign_plan(&plan, &sk, "test-signer");
+        // Deterministic signing input: identical bytes ⇒ identical
+        // signatures (Ed25519 is deterministic; we'd lose that
+        // property if canonicalization drifted).
+        assert_eq!(signed_a.0.payload, signed_b.0.payload);
+        assert_eq!(signed_a.0.signature, signed_b.0.signature);
+        let recovered = verify_plan(&signed_a, &[("test-signer", &vk)]).unwrap();
+        assert_eq!(recovered, plan);
+        assert_eq!(
+            recovered.deps_volume.as_ref().unwrap().volume_hash,
+            "a".repeat(64)
+        );
+    }
+
+    #[test]
+    fn plan_without_deps_volume_omits_field_from_wire_format() {
+        // `#[serde(default, skip_serializing_if = "Option::is_none")]`
+        // means a `None` binding doesn't appear in the canonical
+        // bytes — preserves byte compatibility for existing
+        // claim-8-only plans signed before Followup A.
+        let plan = sample_plan();
+        assert!(plan.deps_volume.is_none());
+        let bytes = serde_json::to_vec(&plan).unwrap();
+        let json_str = std::str::from_utf8(&bytes).unwrap();
+        assert!(
+            !json_str.contains("deps_volume"),
+            "expected `deps_volume` absent from wire bytes for None binding"
+        );
     }
 
     #[test]

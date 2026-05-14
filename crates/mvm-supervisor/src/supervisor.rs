@@ -15,9 +15,14 @@
 
 use std::sync::{Arc, Mutex};
 
+use std::path::PathBuf;
+
 use chrono::{DateTime, Utc};
 use ed25519_dalek::VerifyingKey;
-use mvm_plan::{NonceStore, PlanId, PlanValidityError, SignedExecutionPlan, check_window};
+use mvm_plan::{
+    DepsVolumeBinding, NonceStore, PlanId, PlanValidityError, SignedExecutionPlan, check_window,
+};
+use mvm_sdk::compile::deps_audit::{VolumeError, verify_sealed_volume};
 use thiserror::Error;
 use tracing::warn;
 
@@ -91,6 +96,36 @@ pub enum SupervisorError {
 
     #[error("policy violation: {0}")]
     PolicyViolation(String),
+
+    /// Plan 73 Followup A / ADR-047 claim 9: the plan pinned a deps
+    /// volume but `verify_sealed_volume` re-derived a different hash
+    /// from the on-disk content. The volume was tampered with after
+    /// the plan was signed (or after the volume was sealed).
+    #[error(
+        "deps-volume tampered: plan pinned volume_hash {expected}, computed {actual} from on-disk content"
+    )]
+    DepsVolumeTampered { expected: String, actual: String },
+
+    /// Plan 73 Followup A: the on-disk `meta.json` parses cleanly but
+    /// its bytes don't hash to the plan's `manifest_sha256`. A
+    /// belt-and-suspenders check against future hash-derivation
+    /// drift — if a forger ever produces content that hashes to the
+    /// same `volume_hash`, the manifest sha must still mismatch.
+    #[error(
+        "deps-volume manifest sha mismatch: plan pinned {expected}, computed {actual} from on-disk meta.json"
+    )]
+    DepsVolumeManifestMismatch { expected: String, actual: String },
+
+    /// Plan 73 Followup A: the plan pinned a deps volume but the
+    /// resolved directory doesn't exist on disk (workload built on
+    /// a different host, volume was GC'd, etc.). Fail closed — no
+    /// silent recovery to a "best-effort" launch.
+    #[error("deps-volume missing or unreadable at {}: {source}", path.display())]
+    DepsVolumeIo {
+        path: PathBuf,
+        #[source]
+        source: VolumeError,
+    },
 }
 
 pub struct Supervisor {
@@ -117,6 +152,13 @@ pub struct Supervisor {
     /// inspector built by [`Supervisor::with_l7_egress`] is wrapped
     /// in a [`CircuitBreaker`] that consults this reporter.
     pub circuit_breakers: Option<Arc<InspectorReporter>>,
+
+    /// Root directory the deps-volume admission gate (Plan 73
+    /// Followup A) walks to find `<volume_hash>/` directories.
+    /// `None` (the default) resolves to
+    /// [`mvm_core::config::mvm_deps_volumes_dir`] at admit time;
+    /// tests inject a tempdir.
+    pub deps_volumes_root: Option<PathBuf>,
 }
 
 impl Default for Supervisor {
@@ -136,6 +178,7 @@ impl Default for Supervisor {
             clock: Arc::new(SystemClock),
             nonce_store: Arc::new(Mutex::new(NonceStore::new())),
             circuit_breakers: None,
+            deps_volumes_root: None,
         }
     }
 }
@@ -219,12 +262,35 @@ impl Supervisor {
             return Err(SupervisorError::from(e));
         }
 
+        // Step 1.6 (Plan 73 Followup A / ADR-047 claim 9): if the
+        // plan pinned an application-dependencies volume, re-derive
+        // its hash from the on-disk content and compare. A tampered
+        // volume (mutated content, forged SBOM, garbage in cve.json,
+        // anything that breaks the seal) fails the admission closed
+        // — no silent recovery, no "best-effort" launch. The check
+        // runs after nonce so a replay is rejected before we touch
+        // the filesystem, but before `plan.admitted` so a tamper
+        // surfaces as a dedicated rejection event in the audit chain
+        // (not a fake "admitted then backend failed").
+        if let Some(binding) = plan.deps_volume.as_ref()
+            && let Err(e) = self.verify_deps_volume(binding)
+        {
+            self.emit_audit_then_fail(&plan, "plan.rejected.deps_volume", &e.to_string())
+                .await?;
+            return Err(e);
+        }
+
         // Plan is fully admitted at this point — signature, window,
-        // and nonce all check out. Emit the success audit before any
-        // resource-allocating work so the trail is preserved even
-        // if the backend fails next. Audit failure here fails the
-        // launch fail-closed (§22 / B17: audit emits before forward).
-        if let Err(e) = self.emit_admission_audit(&plan, "plan.admitted", "").await {
+        // nonce, and (if pinned) deps volume all check out. Emit the
+        // success audit before any resource-allocating work so the
+        // trail is preserved even if the backend fails next. Audit
+        // failure here fails the launch fail-closed (§22 / B17:
+        // audit emits before forward).
+        let admitted_extras = deps_volume_audit_extras(plan.deps_volume.as_ref());
+        if let Err(e) = self
+            .emit_admission_audit_with_extras(&plan, "plan.admitted", "", admitted_extras)
+            .await
+        {
             self.transition_or_warn(PlanState::Failed);
             return Err(e);
         }
@@ -255,12 +321,88 @@ impl Supervisor {
             SupervisorError::from(e)
         })?;
 
-        if let Err(e) = self.emit_admission_audit(&plan, "plan.running", "").await {
+        let running_extras = deps_volume_audit_extras(plan.deps_volume.as_ref());
+        if let Err(e) = self
+            .emit_admission_audit_with_extras(&plan, "plan.running", "", running_extras)
+            .await
+        {
             self.transition_or_warn(PlanState::Failed);
             return Err(e);
         }
 
         Ok(())
+    }
+
+    /// Re-derive the on-disk volume hash via
+    /// `mvm_sdk::compile::deps_audit::verify_sealed_volume` and
+    /// compare against the plan's pinned `DepsVolumeBinding`.
+    /// Plan 73 Followup A.
+    ///
+    /// Two checks:
+    ///
+    /// 1. The recomputed `volume_hash` must equal the plan's pin.
+    /// 2. The on-disk `meta.json` bytes must sha256 to the plan's
+    ///    pinned `manifest_sha256`. (`verify_sealed_volume` itself
+    ///    only proves the manifest matches the artifacts; the
+    ///    manifest's *bytes* are a separate pin so a forger who
+    ///    finds a hash collision still hits this gate.)
+    ///
+    /// Both fail closed with a typed `SupervisorError` variant the
+    /// admission path turns into a `plan.rejected.deps_volume`
+    /// audit entry.
+    fn verify_deps_volume(&self, binding: &DepsVolumeBinding) -> Result<(), SupervisorError> {
+        use mvm_sdk::compile::deps_audit::FILE_MANIFEST;
+        use sha2::{Digest, Sha256};
+
+        let volume_dir = self.resolve_deps_volume_dir(&binding.volume_hash);
+
+        // Re-derive the canonical volume hash from on-disk artifacts.
+        let computed =
+            verify_sealed_volume(&volume_dir).map_err(|source| SupervisorError::DepsVolumeIo {
+                path: volume_dir.clone(),
+                source,
+            })?;
+        if computed != binding.volume_hash {
+            return Err(SupervisorError::DepsVolumeTampered {
+                expected: binding.volume_hash.clone(),
+                actual: computed,
+            });
+        }
+
+        // Belt-and-suspenders: hash the on-disk meta.json bytes
+        // directly and compare. Defends against a future change in
+        // `derive_volume_hash` that would otherwise let two different
+        // manifests resolve to the same volume hash.
+        let manifest_path = volume_dir.join(FILE_MANIFEST);
+        let manifest_bytes =
+            std::fs::read(&manifest_path).map_err(|e| SupervisorError::DepsVolumeIo {
+                path: volume_dir.clone(),
+                source: VolumeError::Io {
+                    path: manifest_path.clone(),
+                    source: e,
+                },
+            })?;
+        let manifest_sha = format!("{:x}", Sha256::digest(&manifest_bytes));
+        if manifest_sha != binding.manifest_sha256 {
+            return Err(SupervisorError::DepsVolumeManifestMismatch {
+                expected: binding.manifest_sha256.clone(),
+                actual: manifest_sha,
+            });
+        }
+
+        Ok(())
+    }
+
+    /// Resolve `<volumes_root>/<volume_hash>` for a deps-volume pin.
+    /// Uses the supervisor's `deps_volumes_root` override when set
+    /// (tests), otherwise the canonical
+    /// [`mvm_core::config::mvm_deps_volumes_dir`].
+    fn resolve_deps_volume_dir(&self, volume_hash: &str) -> PathBuf {
+        let root = self
+            .deps_volumes_root
+            .clone()
+            .unwrap_or_else(|| PathBuf::from(mvm_core::config::mvm_deps_volumes_dir()));
+        root.join(volume_hash)
     }
 
     /// Emit a rejection audit entry and then transition the state
@@ -298,12 +440,28 @@ impl Supervisor {
         event: &str,
         reason: &str,
     ) -> Result<(), SupervisorError> {
-        let extras = if reason.is_empty() {
-            vec![]
-        } else {
-            vec![("reason".to_string(), reason.to_string())]
-        };
-        let entry = crate::audit::AuditEntry::for_plan(plan, None, event, extras);
+        self.emit_admission_audit_with_extras(plan, event, reason, Vec::new())
+            .await
+    }
+
+    /// Variant of [`emit_admission_audit`] that carries caller-supplied
+    /// extra labels alongside the `reason` field. Plan 73 Followup A
+    /// uses this to pin the deps-volume `volume_hash` +
+    /// `manifest_sha256` into every `plan.admitted` / `plan.running`
+    /// entry for a deps-bound workload, so `mvmctl audit verify`
+    /// detects drift if either hash changes between runs.
+    async fn emit_admission_audit_with_extras(
+        &self,
+        plan: &mvm_plan::ExecutionPlan,
+        event: &str,
+        reason: &str,
+        extras: Vec<(String, String)>,
+    ) -> Result<(), SupervisorError> {
+        let mut merged = extras;
+        if !reason.is_empty() {
+            merged.push(("reason".to_string(), reason.to_string()));
+        }
+        let entry = crate::audit::AuditEntry::for_plan(plan, None, event, merged);
         match self.audit.sign_and_emit(&entry).await {
             Ok(()) => Ok(()),
             Err(crate::audit::AuditError::NotWired) => {
@@ -432,6 +590,28 @@ impl Supervisor {
     pub fn with_tool_gate(mut self, policy: &ToolPolicy) -> Self {
         self.tool_gate = Arc::new(PolicyToolGate::from_policy(policy));
         self
+    }
+}
+
+/// Build the `(key, value)` extras the supervisor stamps onto every
+/// admission audit entry (`plan.admitted` / `plan.running`) for a
+/// deps-bound workload. Plan 73 Followup A — `mvmctl audit verify`
+/// reads these back to detect drift if either hash changes between
+/// the plan signing and the on-disk volume.
+///
+/// Returns an empty `Vec` when the plan has no deps-volume binding,
+/// so the existing claim-8 audit shape (no deps_volume extras) is
+/// preserved verbatim for plans that don't opt in.
+fn deps_volume_audit_extras(binding: Option<&DepsVolumeBinding>) -> Vec<(String, String)> {
+    match binding {
+        Some(b) => vec![
+            ("deps_volume_hash".to_string(), b.volume_hash.clone()),
+            (
+                "deps_manifest_sha256".to_string(),
+                b.manifest_sha256.clone(),
+            ),
+        ],
+        None => Vec::new(),
     }
 }
 
@@ -774,6 +954,7 @@ mod tests {
             valid_until: Utc.with_ymd_and_hms(2026, 5, 1, 1, 0, 0).unwrap(),
             nonce: Nonce::from_bytes([0xab; 16]),
             bundle: None,
+            deps_volume: None,
         }
     }
 
@@ -1696,5 +1877,338 @@ mod tests {
             .expect("wire ok");
         let dec = s.egress.inspect("evil.com", "/").await.expect("inspect ok");
         assert!(matches!(dec, crate::EgressDecision::Deny { .. }));
+    }
+
+    // ----- Plan 73 Followup A — deps-volume admission gate (claim 9) -----
+    //
+    // The supervisor's admission path verifies `plan.deps_volume`
+    // against the on-disk sealed volume before admitting. These tests
+    // cover the five cases the followup spec calls out:
+    //
+    //   1. plan with `deps_volume = None`  — admits cleanly (claim 8
+    //      regression guard)
+    //   2. plan + matching on-disk volume   — admits cleanly
+    //   3. plan + tampered content         — `DepsVolumeTampered`
+    //   4. plan + missing volume directory — `DepsVolumeIo`
+    //   5. plan + wrong recorded hash      — `DepsVolumeTampered`
+    //
+    // Plus a hand-tamper round trip that proves the admission gate
+    // genuinely refuses a `cve.json` mutation post-seal, and an
+    // audit-chain assertion that `plan.admitted` / `plan.running`
+    // entries pin both hashes when a deps-volume is bound.
+
+    use mvm_sdk::compile::deps_audit::{FILE_CVE, FILE_MANIFEST, seal_volume};
+    use sha2::Digest as _;
+    use std::collections::BTreeMap as DepsBTreeMap;
+    use std::fs;
+    use std::path::Path as DepsPath;
+
+    /// Build a complete sealed volume at `<root>/<volume_hash>/` and
+    /// return the seal result + on-disk manifest sha256. Mirrors the
+    /// `Fixture::build_sealed` helper in `mvm_sdk::deps_audit::tests`
+    /// but exposes the manifest sha so a supervisor test can pin both
+    /// values into a `DepsVolumeBinding`.
+    fn build_sealed_volume(
+        root: &DepsPath,
+        name: &str,
+    ) -> (
+        PathBuf,
+        mvm_sdk::compile::deps_audit::VolumeSealResult,
+        String,
+    ) {
+        let v = root.join(name);
+        let content = v.join("content");
+        fs::create_dir_all(&content).unwrap();
+        fs::write(content.join("a.txt"), b"alpha\n").unwrap();
+        fs::create_dir_all(content.join("sub")).unwrap();
+        fs::write(content.join("sub").join("b.txt"), b"beta\n").unwrap();
+
+        let sbom = v.join("sbom.cdx.json");
+        fs::write(&sbom, br#"{"bomFormat":"CycloneDX","specVersion":"1.5"}"#).unwrap();
+        let fl = v.join("fetch.log");
+        fs::write(&fl, b"GET https://pypi.org/simple/requests/\n").unwrap();
+        let cve = v.join(FILE_CVE);
+        fs::write(&cve, br#"{"results":[]}"#).unwrap();
+
+        let result = seal_volume(
+            &content,
+            &sbom,
+            &fl,
+            &cve,
+            "2026-05-13T00:00:00Z",
+            DepsBTreeMap::new(),
+        )
+        .expect("seal");
+        fs::write(v.join(FILE_MANIFEST), &result.manifest_bytes).unwrap();
+        let manifest_sha = format!("{:x}", sha2::Sha256::digest(&result.manifest_bytes));
+        (v, result, manifest_sha)
+    }
+
+    fn plan_with_deps_volume(
+        volume_hash: &str,
+        manifest_sha256: &str,
+    ) -> Result<ExecutionPlan, mvm_plan::DepsVolumeBindingError> {
+        let mut plan = sample_plan();
+        plan.deps_volume = Some(DepsVolumeBinding::new(volume_hash, manifest_sha256)?);
+        Ok(plan)
+    }
+
+    #[tokio::test]
+    async fn no_deps_volume_admits_cleanly_preserving_claim_8() {
+        // Claim-8 regression guard: a plan without `deps_volume`
+        // walks the same path as before this followup landed. No
+        // filesystem touch, no new audit labels.
+        let plan = sample_plan();
+        assert!(plan.deps_volume.is_none());
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let (mut s, audit) = make_supervisor_with_audit(backend.clone());
+
+        s.launch(&signed, &[("test", &vk)]).await.unwrap();
+
+        assert_eq!(s.state.current(), PlanState::Running);
+        assert_eq!(audit_events(&audit), vec!["plan.admitted", "plan.running"]);
+        for entry in audit.entries() {
+            assert!(!entry.labels.contains_key("deps_volume_hash"));
+            assert!(!entry.labels.contains_key("deps_manifest_sha256"));
+        }
+    }
+
+    #[tokio::test]
+    async fn matching_deps_volume_admits_and_audits_both_hashes() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (_dir, sealed, manifest_sha) = build_sealed_volume(tmp.path(), &"a".repeat(64));
+        let plan = plan_with_deps_volume(&sealed.volume_hash, &manifest_sha).expect("binding");
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let (mut s, audit) = make_supervisor_with_audit(backend.clone());
+        s.deps_volumes_root = Some(tmp.path().to_path_buf());
+        // Rename the directory to match the volume hash so the
+        // supervisor's resolver finds it.
+        fs::rename(
+            tmp.path().join("a".repeat(64)),
+            tmp.path().join(&sealed.volume_hash),
+        )
+        .unwrap();
+
+        s.launch(&signed, &[("test", &vk)]).await.unwrap();
+
+        assert_eq!(s.state.current(), PlanState::Running);
+        assert_eq!(audit_events(&audit), vec!["plan.admitted", "plan.running"]);
+        for entry in audit.entries() {
+            assert_eq!(
+                entry.labels.get("deps_volume_hash"),
+                Some(&sealed.volume_hash)
+            );
+            assert_eq!(
+                entry.labels.get("deps_manifest_sha256"),
+                Some(&manifest_sha)
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn tampered_cve_after_seal_refuses_admission() {
+        // The followup spec's "hand-tamper" gate: build a sealed
+        // volume, sign a plan referencing it, prove it admits;
+        // then write garbage to cve.json and prove the same plan
+        // no longer admits. This is claim 9's anchor test.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (vol_dir, sealed, manifest_sha) = build_sealed_volume(tmp.path(), &"b".repeat(64));
+        fs::rename(&vol_dir, tmp.path().join(&sealed.volume_hash)).unwrap();
+        let final_vol_dir = tmp.path().join(&sealed.volume_hash);
+        let plan = plan_with_deps_volume(&sealed.volume_hash, &manifest_sha).expect("binding");
+
+        // Round 1: pristine volume admits.
+        {
+            let (signed, _sk, vk) = sign_sample(&plan);
+            let backend = Arc::new(MockBackend::new());
+            let mut s = make_supervisor_with_backend(backend.clone());
+            s.deps_volumes_root = Some(tmp.path().to_path_buf());
+            s.launch(&signed, &[("test", &vk)]).await.unwrap();
+            assert_eq!(s.state.current(), PlanState::Running);
+        }
+
+        // Round 2: tamper cve.json and re-launch with a fresh plan
+        // (fresh nonce so we're not testing replay protection).
+        fs::write(final_vol_dir.join(FILE_CVE), b"{\"results\":[\"FORGED\"]}").unwrap();
+        let mut tampered_plan = plan.clone();
+        tampered_plan.nonce = Nonce::from_bytes([0xcd; 16]); // fresh nonce
+        let (signed, _sk, vk) = sign_sample(&tampered_plan);
+        let backend = Arc::new(MockBackend::new());
+        let (mut s, audit) = make_supervisor_with_audit(backend.clone());
+        s.deps_volumes_root = Some(tmp.path().to_path_buf());
+
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+
+        // The supervisor sees the cve hash mismatch before the volume
+        // hash check; it surfaces as DepsVolumeIo wrapping
+        // VolumeError::HashMismatch — verify_sealed_volume catches the
+        // tamper directly rather than getting to derive_volume_hash.
+        // Either DepsVolumeTampered or DepsVolumeIo{HashMismatch} is a
+        // valid fail-closed outcome.
+        match &result {
+            Err(SupervisorError::DepsVolumeTampered { .. }) => {}
+            Err(SupervisorError::DepsVolumeIo {
+                source: VolumeError::HashMismatch { kind, .. },
+                ..
+            }) => {
+                assert_eq!(*kind, "cve");
+            }
+            other => panic!("expected deps-volume rejection, got {other:?}"),
+        }
+        assert_eq!(s.state.current(), PlanState::Failed);
+        assert!(
+            audit_events(&audit)
+                .iter()
+                .any(|e| e == "plan.rejected.deps_volume"),
+            "audit events: {:?}",
+            audit_events(&audit)
+        );
+        // No `plan.admitted` for the tampered launch — admission
+        // failed before the success entry is emitted.
+        assert!(!audit_events(&audit).contains(&"plan.admitted".to_string()));
+        assert!(backend.launches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn missing_volume_directory_refuses_admission() {
+        let tmp = tempfile::tempdir().expect("tmp");
+        // Don't actually build the volume — the directory under
+        // `<tmp>/<hash>/` will not exist.
+        let fake_volume_hash = "0".repeat(64);
+        let fake_manifest_sha = "1".repeat(64);
+        let plan =
+            plan_with_deps_volume(&fake_volume_hash, &fake_manifest_sha).expect("binding shape");
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let (mut s, audit) = make_supervisor_with_audit(backend.clone());
+        s.deps_volumes_root = Some(tmp.path().to_path_buf());
+
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+
+        match &result {
+            Err(SupervisorError::DepsVolumeIo { path, source }) => {
+                assert!(path.ends_with(&fake_volume_hash));
+                assert!(matches!(source, VolumeError::Missing(_)));
+            }
+            other => panic!("expected DepsVolumeIo(Missing), got {other:?}"),
+        }
+        assert_eq!(s.state.current(), PlanState::Failed);
+        assert!(
+            audit_events(&audit)
+                .iter()
+                .any(|e| e == "plan.rejected.deps_volume")
+        );
+        assert!(backend.launches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn matching_content_but_wrong_recorded_hash_refuses() {
+        // The on-disk volume is internally consistent (every artifact
+        // hashes correctly against meta.json), but the plan pins a
+        // *different* `volume_hash` than the one the on-disk content
+        // actually derives. This is the "attacker swapped the plan's
+        // pin to point at a different volume" case.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (_dir, sealed, manifest_sha) = build_sealed_volume(tmp.path(), &"c".repeat(64));
+        // Place the sealed dir at a *different* hash — the supervisor
+        // resolves to that path for the plan's claimed hash, finds the
+        // real (other-hash) volume, but verify_sealed_volume returns
+        // the actual hash and the comparison fails.
+        let claimed_hash = "d".repeat(64);
+        fs::rename(
+            tmp.path().join("c".repeat(64)),
+            tmp.path().join(&claimed_hash),
+        )
+        .unwrap();
+        let plan = plan_with_deps_volume(&claimed_hash, &manifest_sha).expect("binding");
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let (mut s, audit) = make_supervisor_with_audit(backend.clone());
+        s.deps_volumes_root = Some(tmp.path().to_path_buf());
+
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+
+        match &result {
+            Err(SupervisorError::DepsVolumeTampered { expected, actual }) => {
+                assert_eq!(*expected, claimed_hash);
+                assert_eq!(*actual, sealed.volume_hash);
+            }
+            other => panic!("expected DepsVolumeTampered, got {other:?}"),
+        }
+        assert!(
+            audit_events(&audit)
+                .iter()
+                .any(|e| e == "plan.rejected.deps_volume")
+        );
+        assert!(backend.launches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn matching_volume_hash_but_wrong_manifest_sha_refuses() {
+        // The volume_hash check passes, but the pinned
+        // manifest_sha256 is wrong. Belt-and-suspenders: even a
+        // future hash-derivation drift that lets two manifests
+        // resolve to the same volume hash still fails closed here.
+        let tmp = tempfile::tempdir().expect("tmp");
+        let (_dir, sealed, _real_manifest_sha) = build_sealed_volume(tmp.path(), &"e".repeat(64));
+        fs::rename(
+            tmp.path().join("e".repeat(64)),
+            tmp.path().join(&sealed.volume_hash),
+        )
+        .unwrap();
+        let bogus_manifest_sha = "f".repeat(64);
+        let plan =
+            plan_with_deps_volume(&sealed.volume_hash, &bogus_manifest_sha).expect("binding");
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let mut s = make_supervisor_with_backend(backend.clone());
+        s.deps_volumes_root = Some(tmp.path().to_path_buf());
+
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+
+        match &result {
+            Err(SupervisorError::DepsVolumeManifestMismatch { expected, actual }) => {
+                assert_eq!(*expected, bogus_manifest_sha);
+                assert_ne!(*actual, bogus_manifest_sha);
+            }
+            other => panic!("expected DepsVolumeManifestMismatch, got {other:?}"),
+        }
+        assert!(backend.launches().is_empty());
+    }
+
+    #[test]
+    fn deps_volume_binding_validates_hash_lengths() {
+        // The wire-shape gate: a 63-char or 65-char hex string is
+        // rejected at construction time so a malformed pin never
+        // reaches the supervisor.
+        assert!(matches!(
+            DepsVolumeBinding::new("a".repeat(63), "b".repeat(64)),
+            Err(mvm_plan::DepsVolumeBindingError::WrongLength { len: 63 })
+        ));
+        assert!(matches!(
+            DepsVolumeBinding::new("a".repeat(64), "b".repeat(65)),
+            Err(mvm_plan::DepsVolumeBindingError::WrongLength { len: 65 })
+        ));
+        assert!(matches!(
+            DepsVolumeBinding::new("A".repeat(64), "b".repeat(64)),
+            Err(mvm_plan::DepsVolumeBindingError::NonHex { ch: 'A' })
+        ));
+        DepsVolumeBinding::new("0".repeat(64), "1".repeat(64)).expect("valid pin");
+    }
+
+    #[test]
+    fn deps_volume_binding_serde_rejects_short_hex() {
+        // Wire format: a forged plan carrying a too-short volume_hash
+        // must fail at deserialise (deny_unknown_fields gives us
+        // unknown-field protection; this test pins the explicit
+        // hex-length validator we added).
+        let bad = serde_json::json!({
+            "volume_hash": "abc",
+            "manifest_sha256": "b".repeat(64),
+        });
+        let err = serde_json::from_value::<DepsVolumeBinding>(bad).unwrap_err();
+        assert!(err.to_string().contains("64"));
     }
 }

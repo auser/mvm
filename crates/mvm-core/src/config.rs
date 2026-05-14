@@ -239,6 +239,36 @@ pub fn mvm_share_dir() -> String {
     format!("{}/.local/share/mvm", home_dir())
 }
 
+/// Root directory for application-dependency volumes sealed by
+/// `mvm_sdk::compile::deps_audit::seal_volume`. Each immediate child
+/// is a `<volume_hash>/` directory containing `content/`,
+/// `sbom.cdx.json`, `fetch.log`, `cve.json`, `meta.json`.
+///
+/// Resolution order:
+///   1. `MVM_DEPS_VOLUMES_DIR` env var (test override)
+///   2. `<mvm_data_dir()>/volumes/deps`
+///
+/// The supervisor's admission gate (ADR-047 security claim 9 /
+/// Plan 73 Followup A) reads this dir; `mvmctl build` (Followup B)
+/// writes to it.
+pub fn mvm_deps_volumes_dir() -> String {
+    if let Ok(d) = std::env::var("MVM_DEPS_VOLUMES_DIR")
+        && !d.is_empty()
+    {
+        return d;
+    }
+    format!("{}/volumes/deps", mvm_data_dir())
+}
+
+/// Resolve `<deps_volumes_dir>/<volume_hash>` for a single deps
+/// volume. The caller is responsible for verifying the directory
+/// exists and matches its sealed manifest — see
+/// `mvm_sdk::compile::deps_audit::verify_sealed_volume`. Plan 73
+/// Followup A.
+pub fn deps_volume_dir(volume_hash: &str) -> std::path::PathBuf {
+    std::path::PathBuf::from(mvm_deps_volumes_dir()).join(volume_hash)
+}
+
 /// Check if running in production mode (MVM_PRODUCTION=1).
 pub fn is_production_mode() -> bool {
     std::env::var("MVM_PRODUCTION")

@@ -177,6 +177,11 @@ pub fn synthesize_plan(input: &SynthesisInput<'_>) -> Result<ExecutionPlan> {
         valid_until: now + Duration::minutes(VALIDITY_WINDOW_MINUTES),
         nonce,
         bundle: input.bundle_pin.clone(),
+        // Plan 73 Followup A: synthesizers don't pin a deps volume
+        // yet — that lands once `mvmctl build --deps` (Followup C)
+        // emits the binding. Today's `mvmctl up` flow always passes
+        // `None` and the supervisor skips the deps-volume gate.
+        deps_volume: None,
     })
 }
 
