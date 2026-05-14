@@ -1,52 +1,59 @@
-//! Libkrun-backed builder VM (Plan 72 W1 scaffolding).
+//! Libkrun-backed builder VM.
 //!
 //! Plan 72 ADR-046 chose libkrun-direct (on macOS Apple Silicon /
 //! Intel) and Firecracker (on Linux) as the replacement for the
-//! microsandbox-backed builder VM. This module is the libkrun half.
+//! microsandbox-backed builder VM. This module is the libkrun half;
+//! W1 → W4 of the migration shipped the launcher end-to-end.
 //!
-//! ## Status — Plan 72 W1 (scaffolding)
+//! ## What `LibkrunBuilderVm` does
 //!
-//! What W1 ships:
+//! Given a populated builder VM image cache and `mvm-libkrun-supervisor`
+//! on PATH, `run_build` runs a one-shot `nix build` against the
+//! caller's `BuilderJob` and returns `BuilderArtifacts`. The
+//! pipeline (in [`BuilderVm::run_build`]):
 //!
-//! - The `LibkrunBuilderVm` struct + `BuilderVm` trait impl shape.
-//! - Resource defaults matching Plan 72 §W1 (4 vCPU, 4 GiB RAM,
-//!   64 GiB sparse virtio-blk for the persistent `/nix` store).
-//! - Mount-validation (existence, UTF-8 representability for the
-//!   libkrun C API boundary, artifact-dir creation).
-//! - Host probe (`host_can_build`) that consults libkrun's
-//!   `is_available()` so callers can sanity-check the environment
-//!   before invoking `run_build`.
-//!
-//! What W1 does NOT ship (deferred to W2–W4):
-//!
-//! - The builder VM image acquisition (W2 — `nix/images/builder-vm/`
-//!   flake + CI release artifact + `~/.cache/mvm/builder-vm/<arch>/`
-//!   cache).
-//! - The `mvm-builder-init` PID-1 binary (W3).
-//! - virtio-fs / virtio-blk / vsock plumbing for `/work`, `/out`,
-//!   `/job`, `/nix-store` mounts (W4).
-//! - The actual `mvm_libkrun::start_enter` invocation +
-//!   power-off detection + job-result extraction (W4 + W5 cutover).
-//!
-//! Until W2–W4 land, `run_build` returns
-//! [`BuilderVmError::LibkrunNotShipped`] after validation, so callers
-//! can wire dispatch and exercise the error path in tests; the
-//! data-plane fills in incrementally.
+//! 1. Validate mounts + job (`validate_mounts`, `validate_job`).
+//! 2. Check `mvm_libkrun::is_available()` — bail with install hint
+//!    if libkrun isn't on the host.
+//! 3. Locate `mvm-libkrun-supervisor` (env override / next-to-exe /
+//!    PATH).
+//! 4. Read the builder VM image from
+//!    `~/.cache/mvm/builder-vm/<arch>/` — vmlinux + rootfs.ext4 +
+//!    cmdline.txt + manifest.json, the shape Plan 72 W2's flake
+//!    emits. Populated by Plan 72 W5's `bootstrap_builder_vm_image`
+//!    (`mvm-cli::commands::env::apple_container`).
+//! 5. Allocate / reuse the persistent `/nix-store-<arch>.img`
+//!    sparse virtio-blk image (64 GiB cap by default; idempotent
+//!    across invocations so the warm Nix store survives).
+//! 6. Stage `<job_dir>/cmd.sh` with the shell-escaped flake_ref +
+//!    attr_path, plus the canonical `nix build` invocation.
+//! 7. Build a `KrunContext`: kernel + rootfs + cmdline + per-VM
+//!    vsock dir + virtio-blk (Nix store) + virtio-fs (work / out /
+//!    job).
+//! 8. Spawn `mvm-libkrun-supervisor`, pipe the `SupervisorConfig`
+//!    JSON to stdin, **wait** for it to exit (unlike
+//!    `LibkrunBackend::start` which returns after the PID file
+//!    appears — the builder is a one-shot).
+//! 9. Read `<job_dir>/result` (JSON: `{exit_code, stderr_tail}`)
+//!    that `mvm-builder-init` wrote.
+//! 10. Validate the artifact dir now contains `rootfs.ext4` (and
+//!     optionally `vmlinux`); return `BuilderArtifacts`.
 //!
 //! ## Feature gate
 //!
-//! Gated behind `backends-builder-vm-libkrun`. Default-off until W5's
-//! cutover flips the polarity. Library consumers that don't need the
-//! libkrun builder build with `default-features = false`.
+//! Gated behind `backends-builder-vm-libkrun`. Default-off until
+//! Plan 72 W5.B / W5.C cutover flips `ensure_dev_image` to dispatch
+//! through `LibkrunBuilderVm`. Library consumers that don't need
+//! the libkrun builder build with `default-features = false`.
 //!
 //! ## Not the runtime backend
 //!
 //! `LibkrunBackend` (`crates/mvm-backend/src/libkrun.rs`) is for
-//! running user microVMs; this module is for building them. The two
-//! share `mvm-libkrun`'s FFI but compose differently — the builder
-//! mounts a workspace + persistent `/nix`-store disk and runs a
-//! one-shot `nix build`, while the runtime mounts the user's rootfs
-//! and runs the user's entrypoint.
+//! running user microVMs; this module is for building them. The
+//! two share `mvm-libkrun`'s FFI but compose differently — the
+//! builder mounts a workspace + persistent `/nix`-store disk and
+//! runs a one-shot `nix build`, while the runtime mounts the
+//! user's rootfs and runs the user's entrypoint.
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
