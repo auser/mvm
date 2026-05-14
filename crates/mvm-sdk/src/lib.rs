@@ -49,12 +49,12 @@ mod error;
 
 // Prelude — every previously-public item lives here so
 // `use mvm_sdk::*;` resolves identically across the split.
-pub use builder::{app, workload, AppBuilder, WorkloadBuilder};
+pub use builder::{AppBuilder, WorkloadBuilder, app, workload};
 pub use ctor::deps::{no_deps, node_deps, node_deps_with, python_deps, python_deps_with};
-pub use ctor::entrypoint::{entrypoint_command, entrypoint_function, EntrypointExt};
+pub use ctor::entrypoint::{EntrypointExt, entrypoint_command, entrypoint_function};
 pub use ctor::image::{nix_packages, oci_base};
 pub use ctor::network::{
-    dns_none, dns_resolver, dns_system, egress, host_port, network, NetworkExt,
+    NetworkExt, dns_none, dns_resolver, dns_system, egress, host_port, network,
 };
 pub use ctor::resources::resources;
 pub use ctor::source::{local_path, nix_derivation, oci_image};
@@ -64,11 +64,11 @@ pub use error::{BuildError, EmitError};
 // IR type re-exports — public surface aliases consumed by downstream
 // fixtures (the corpus byte-identity gate from ADR-0015) and tests.
 pub use mvm_ir::{
-    ir_hash, App as IrApp, Dependencies as IrDependencies, Entrypoint as IrEntrypoint,
+    App as IrApp, Dependencies as IrDependencies, Entrypoint as IrEntrypoint,
     EnvValue as IrEnvValue, Format as IrFormat, HostPort, Image as IrImage, Mount as IrMount,
     MountMode, MountSource, Network as IrNetwork, NetworkDns as IrNetworkDns,
     NetworkEgress as IrNetworkEgress, NetworkMode as IrNetworkMode, NodeTool as IrNodeTool,
     PortForward as IrPortForward, PortProto, PythonTool as IrPythonTool, Resources as IrResources,
     SecretMount, SecretRef, Source as IrSource, ValidationError, Volume as IrVolume,
-    Workload as IrWorkload,
+    Workload as IrWorkload, ir_hash,
 };
