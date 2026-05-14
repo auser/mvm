@@ -146,7 +146,7 @@ fn build_and_install(workspace: &Path, arch: &str) -> Result<()> {
     // `mvm-workspace = path:..` to /work/, where `Cargo.lock` lives.
     let artifact_out =
         tempfile::tempdir().context("creating tempdir for builder artifact extraction")?;
-    let job = BuilderJob {
+    let job = BuilderJob::Flake {
         // Bare path — nix auto-detects /work as a git repo (the host
         // workspace's `.git` is in the bind-mount) and uses the
         // git+file fetcher. That gives us two things `path:` doesn't:
@@ -186,19 +186,39 @@ fn build_and_install(workspace: &Path, arch: &str) -> Result<()> {
         .run_build(&job, &mounts)
         .map_err(|e| anyhow::anyhow!("microsandbox builder failed: {e}"))?;
 
-    let src_kernel = artifacts.kernel_path.ok_or_else(|| {
-        anyhow::anyhow!(
-            "builder produced no vmlinux — the flake's \
-             packages.{arch}-linux.default output must include `vmlinux` \
-             in its $out directory"
-        )
-    })?;
-    if !artifacts.rootfs_path.is_file() {
-        anyhow::bail!(
-            "builder reported success but rootfs.ext4 is missing at {}",
-            artifacts.rootfs_path.display(),
-        );
-    }
+    // Plan 73 Followup B.2.0: BuilderArtifacts is now an enum. The
+    // xtask path always feeds a Flake job, so it always receives an
+    // Image. Surface a future variant as an error rather than a
+    // silent path mismatch.
+    let (src_kernel, src_rootfs) = match artifacts {
+        mvm_build::builder_vm::BuilderArtifacts::Image {
+            kernel_path,
+            rootfs_path,
+            ..
+        } => {
+            let kernel = kernel_path.ok_or_else(|| {
+                anyhow::anyhow!(
+                    "builder produced no vmlinux — the flake's \
+                     packages.{arch}-linux.default output must include `vmlinux` \
+                     in its $out directory"
+                )
+            })?;
+            if !rootfs_path.is_file() {
+                anyhow::bail!(
+                    "builder reported success but rootfs.ext4 is missing at {}",
+                    rootfs_path.display(),
+                );
+            }
+            (kernel, rootfs_path)
+        }
+        mvm_build::builder_vm::BuilderArtifacts::InstallVolume { .. } => {
+            anyhow::bail!(
+                "xtask build-dev-image expected a Flake build but the \
+                 builder returned an InstallVolume — unreachable until \
+                 Plan 73 Followup B.2"
+            );
+        }
+    };
 
     let dest_dir = vendored_slot(workspace, arch);
     std::fs::create_dir_all(&dest_dir)
@@ -206,7 +226,7 @@ fn build_and_install(workspace: &Path, arch: &str) -> Result<()> {
     let dest_kernel = dest_dir.join("vmlinux");
     let dest_rootfs = dest_dir.join("rootfs.ext4");
     copy_with_mode(&src_kernel, &dest_kernel)?;
-    copy_with_mode(&artifacts.rootfs_path, &dest_rootfs)?;
+    copy_with_mode(&src_rootfs, &dest_rootfs)?;
     let checksums = format!(
         "{}  vmlinux\n{}  rootfs.ext4\n",
         sha256_hex(&dest_kernel)?,
