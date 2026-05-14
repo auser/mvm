@@ -2,6 +2,7 @@ mod build;
 mod bundle;
 mod catalog;
 mod cmd_audit;
+mod deps;
 mod env;
 mod manifest;
 mod ops;
@@ -236,6 +237,15 @@ pub(in crate::commands) enum Commands {
     /// Hosted-cloud operators use this to satisfy the "provably
     /// erased" deprovisioning contract.
     Tenant(ops::tenant::Args),
+    /// Inspect + re-audit cached application-dependency volumes.
+    /// Plan 73 Followup C. The deps cache lives at
+    /// `~/.mvm/volumes/deps/<volume_hash>/`; each volume seals four
+    /// audit artifacts (content + SBOM + fetch.log + cve.json) plus
+    /// a hash-chained manifest (`mvm_sdk::compile::deps_audit`).
+    /// `deps inspect` pretty-prints those artifacts; `deps audit`
+    /// re-runs the CVE scan against the current pip-audit / pnpm
+    /// audit feed and reseals the volume.
+    Deps(deps::Args),
 }
 
 // ============================================================================
@@ -372,6 +382,7 @@ pub fn run() -> Result<()> {
         Commands::Bundle(a) => bundle::run(&cli, a, &cfg),
         Commands::Trust(a) => trust::run(&cli, a, &cfg),
         Commands::Tenant(a) => ops::tenant::run(&cli, a, &cfg),
+        Commands::Deps(a) => deps::run(&cli, a, &cfg),
     };
 
     cmd_audit::emit_cmd_outcome(cmd_recorder.as_ref(), verb, &result);

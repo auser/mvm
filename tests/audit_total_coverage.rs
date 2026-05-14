@@ -202,6 +202,17 @@ const TRUST_SUB: &[(&str, AuditPosture)] = &[
 // integrity is exercised by `tests/tenant_destroy_e2e.rs`.
 const TENANT_SUB: &[(&str, AuditPosture)] = &[("destroy", AuditPosture::InteractiveOrControl)];
 
+// Plan 73 Followup C — sealed deps-volume cache. `deps inspect` is
+// read-only (pretty-prints meta.json + sidecars without mutating
+// the volume). `deps audit` re-runs the CVE scan, rewrites
+// `cve.json`, bumps `meta.json.last_audit_at`, and atomically
+// renames the volume directory to its new sealed hash — every
+// processed volume gets one `LocalAuditKind::DepsAudit` line.
+const DEPS_SUB: &[(&str, AuditPosture)] = &[
+    ("inspect", AuditPosture::ReadOnly),
+    ("audit", AuditPosture::Emits("DepsAudit")),
+];
+
 /// Every top-level `mvmctl` subcommand keyed by its clap name.
 ///
 /// Order matches the `Commands` enum in
@@ -276,6 +287,8 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     // today; future Slice E adds `rebuild`, Slice 7b adds
     // `install` / `uninstall`.
     ("tenant", AuditPosture::DelegatesToSub(TENANT_SUB)),
+    // Plan 73 Followup C — sealed deps-volume cache verbs.
+    ("deps", AuditPosture::DelegatesToSub(DEPS_SUB)),
 ];
 
 // ──────────────────────────────────────────────────────────────────
@@ -425,6 +438,7 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
         // Top-level + per-subgroup mutation kinds:
         "CachePrune",
         "ConfigChange",
+        "DepsAudit",
         "Kill",
         "ManifestAliasRemove",
         "ManifestAliasSet",

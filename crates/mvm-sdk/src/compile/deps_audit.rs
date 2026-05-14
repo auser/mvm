@@ -177,20 +177,51 @@ pub fn seal_volume(
     created_at: impl Into<String>,
     annotations: BTreeMap<String, String>,
 ) -> Result<VolumeSealResult, VolumeError> {
+    let created_at = created_at.into();
+    let last_audit_at = created_at.clone();
+    reseal_volume(
+        content_dir,
+        sbom,
+        fetch_log,
+        cve,
+        created_at,
+        last_audit_at,
+        annotations,
+    )
+}
+
+/// Re-seal a dep volume after `mvmctl deps audit` re-runs the CVE
+/// scan. Identical to [`seal_volume`] except that `created_at` and
+/// `last_audit_at` are independent so the audit verb can preserve
+/// the original creation time while stamping the fresh re-audit
+/// timestamp.
+///
+/// Re-audit rewrites `cve.json` → the cve sha256 changes → the
+/// manifest hash changes → the volume hash changes. Callers
+/// atomically rename `<root>/<old_hash>/` → `<root>/<new_hash>/`
+/// once this function returns.
+pub fn reseal_volume(
+    content_dir: &Path,
+    sbom: &Path,
+    fetch_log: &Path,
+    cve: &Path,
+    created_at: impl Into<String>,
+    last_audit_at: impl Into<String>,
+    annotations: BTreeMap<String, String>,
+) -> Result<VolumeSealResult, VolumeError> {
     let content_sha256 = hash_dir(content_dir)?;
     let sbom_sha256 = hash_file(sbom)?;
     let fetch_log_sha256 = hash_file(fetch_log)?;
     let cve_sha256 = hash_file(cve)?;
 
-    let created_at = created_at.into();
     let manifest = VolumeManifest {
         schema_version: VOLUME_MANIFEST_SCHEMA_VERSION,
         content_sha256: content_sha256.clone(),
         sbom_sha256,
         fetch_log_sha256,
         cve_sha256,
-        created_at: created_at.clone(),
-        last_audit_at: created_at,
+        created_at: created_at.into(),
+        last_audit_at: last_audit_at.into(),
         annotations,
     };
     let manifest_bytes = canonical_json(&manifest)?;
