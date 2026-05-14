@@ -2,6 +2,7 @@
 
 pub(super) mod audit_chain;
 pub(super) mod console;
+pub(super) mod cp;
 pub(super) mod diff;
 pub(super) mod down;
 pub(super) mod exec;
@@ -17,6 +18,7 @@ pub(super) mod plan_builder;
 pub(super) mod policy_resolver;
 pub(super) mod proc;
 pub(super) mod ps;
+pub(super) mod sandbox;
 pub(super) mod session;
 pub(super) mod set_ttl;
 pub(super) mod up;

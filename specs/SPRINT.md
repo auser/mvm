@@ -1600,6 +1600,35 @@ Outstanding (deferred):
   shape is "copy to a file, then docker push manually" — `--push`
   would streamline.
 
+### W5 — secure one-shot `run` UX ✅ shipped
+
+Follow-on from the agent sandbox CLI review: expose the secure happy
+path as `mvmctl run`, while preserving `mvmctl exec` as the lower-level
+dev-compatible spelling.
+
+Shipped:
+
+- New top-level `mvmctl run` command delegates to the existing cold
+  transient execution machinery.
+- `--profile restrictive|standard|dev|permissive` gates host-impacting
+  options before dispatch.
+- `standard` is the default and refuses writable host shares; `restrictive`
+  refuses env injection and all host shares; `permissive` requires
+  `MVM_ACK_PERMISSIVE_RUN=1`.
+- `mvmctl run --receipt <path>` writes a host-signed JSON receipt with
+  invocation hashes, output hashes, and exit status; raw argv/env values
+  and raw output are deliberately omitted.
+- `mvmctl receipt verify <path>` verifies the receipt signature against
+  the local host-signer public key, with `--pubkey` for portable checks.
+- `mvmctl sandbox gc` adds a dry-run-by-default cleanup path for stale
+  sandbox registry entries. `--apply` only removes stopped/expired entries
+  that no backend reports as live and emits `SandboxGc`.
+- `mvmctl cp` copies one regular file across the host/VM boundary with exactly
+  one `VM:/absolute/path` endpoint, a default 16 MiB cap, no overwrite unless
+  `--force`, guest-side path-policy validation, and `VmFileCopy` audit without
+  host paths or file contents.
+- CLI reference and parser tests cover the new command and profile surface.
+
 ### Sprint 52 success criteria
 
 1. *A workload with `mem_initial = "256M"` and `mem = "1024M"`

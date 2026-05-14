@@ -86,6 +86,8 @@ const STORAGE_SUB: &[(&str, AuditPosture)] = &[
     ("gc", AuditPosture::Emits("StorageGc")),
 ];
 
+const SANDBOX_SUB: &[(&str, AuditPosture)] = &[("gc", AuditPosture::Emits("SandboxGc"))];
+
 const NETWORK_SUB: &[(&str, AuditPosture)] = &[
     ("create", AuditPosture::Emits("NetworkCreate")),
     ("list", AuditPosture::ReadOnly),
@@ -226,6 +228,10 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("ls", AuditPosture::ReadOnly),
     ("diff", AuditPosture::ReadOnly),
     ("console", AuditPosture::InteractiveOrControl),
+    ("run", AuditPosture::InteractiveOrControl),
+    ("receipt", AuditPosture::ReadOnly),
+    ("sandbox", AuditPosture::DelegatesToSub(SANDBOX_SUB)),
+    ("cp", AuditPosture::Emits("VmFileCopy")),
     ("exec", AuditPosture::InteractiveOrControl),
     ("invoke", AuditPosture::Emits("plan.admitted+plan.launched")),
     ("session", AuditPosture::DelegatesToSub(SESSION_SUB)),
@@ -419,6 +425,7 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
         "SecretGet",
         "SecretPut",
         "SecretRm",
+        "SandboxGc",
         "SessionStart",
         "SlotPrune",
         "SlotRemove",
@@ -427,6 +434,7 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
         "TemplateBuild",
         "Uninstall",
         "UpdateInstall",
+        "VmFileCopy",
         "VmFsMutate",
         "VmProcSignal",
         "VmProcStart",

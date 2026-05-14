@@ -97,6 +97,20 @@ pub(in crate::commands) enum Commands {
     Cache(ops::cache::Args),
     /// Scaffold a project (`mvm.toml` + `flake.nix`). Use `mvmctl bootstrap` for first-time environment setup.
     Init(env::init::Args),
+    /// Boot a fresh transient microVM, run one command, and tear down (dev-mode only).
+    ///
+    /// This is the secure happy path for one-shot sandboxed execution. It delegates
+    /// to the same cold VM machinery as `mvmctl exec`, but adds security profiles
+    /// before dispatch: `standard` by default, `restrictive` for no env or host
+    /// shares, `dev` for writable local shares, and `permissive` only with an
+    /// explicit acknowledgment environment variable.
+    Run(vm::exec::RunArgs),
+    /// Verify signed execution receipts emitted by `mvmctl run --receipt`.
+    Receipt(vm::exec::ReceiptArgs),
+    /// Inspect and clean sandbox lifecycle state.
+    Sandbox(vm::sandbox::Args),
+    /// Copy one file between the host and a running VM.
+    Cp(vm::cp::Args),
     /// Boot a transient microVM, run a single command, and tear down (dev-mode only).
     ///
     /// Inspired by cco — same one-command UX, but with a Firecracker microVM as the sandbox.
@@ -307,6 +321,10 @@ pub fn run() -> Result<()> {
         Commands::Console(a) => vm::console::run(&cli, a, &cfg),
         Commands::Cache(a) => ops::cache::run(&cli, a, &cfg),
         Commands::Init(a) => env::init::run(&cli, a, &cfg),
+        Commands::Run(a) => vm::exec::run_secure(&cli, a, &cfg),
+        Commands::Receipt(a) => vm::exec::run_receipt(&cli, a, &cfg),
+        Commands::Sandbox(a) => vm::sandbox::run(&cli, a, &cfg),
+        Commands::Cp(a) => vm::cp::run(&cli, a, &cfg),
         Commands::Exec(a) => vm::exec::run(&cli, a, &cfg),
         Commands::Invoke(a) => vm::invoke::run(&cli, a, &cfg),
         Commands::Session(a) => vm::session::run(&cli, a, &cfg),

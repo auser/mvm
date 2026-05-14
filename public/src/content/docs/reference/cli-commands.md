@@ -177,6 +177,55 @@ description: Complete command reference for mvmctl.
 
 ## One-shot Exec
 
+`mvmctl run` is the default one-shot sandbox UX. It boots a fresh transient
+microVM, runs one command, and tears the VM down on exit. `mvmctl exec` remains
+available as the lower-level/dev-compatible spelling for the same cold execution
+machinery. Like `exec`, arbitrary command dispatch currently requires a
+dev-feature guest agent; production guests should use `mvmctl invoke`.
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl run -- <cmd>...` | Boot the bundled default microVM image, run `<cmd>`, exit |
+| `mvmctl run --manifest <name-or-path> -- <cmd>...` | Boot a registered manifest/template instead of the default |
+| `mvmctl run --profile standard -- <cmd>` | Default profile: explicit env is allowed; host shares must be read-only |
+| `mvmctl run --profile restrictive -- <cmd>` | No env injection and no host directory shares |
+| `mvmctl run --profile dev --add-dir .:/work:rw -- <cmd>` | Dev profile: permits writable host shares for local iteration |
+| `mvmctl run --profile permissive -- <cmd>` | Escape hatch; requires `MVM_ACK_PERMISSIVE_RUN=1` |
+| `mvmctl run --add-dir HOST:GUEST[:MODE] -- <cmd>` | Mount a host directory. `MODE` defaults to `ro`; `rw` requires `--profile dev` or `permissive` |
+| `mvmctl run --env KEY=VAL -- <cmd>` | Inject an explicit environment variable. Repeatable; disabled by `--profile restrictive` |
+| `mvmctl run --cpus <n> --memory <size> -- <cmd>` | Resize the transient VM |
+| `mvmctl run --timeout <secs> -- <cmd>` | Per-command timeout |
+| `mvmctl run --receipt <path> -- <cmd>` | Write a signed JSON receipt with invocation hashes, output hashes, and exit status. Raw argv, env values, stdout, and stderr are not stored. |
+| `mvmctl receipt verify <path>` | Verify a signed run receipt against `~/.mvm/keys/host-signer.pub` |
+| `mvmctl receipt verify <path> --pubkey <path>` | Verify a signed run receipt against an explicit raw Ed25519 public key |
+
+## Sandbox State
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl sandbox gc` | Dry-run cleanup of stale sandbox name-registry entries for stopped or expired VMs |
+| `mvmctl sandbox gc --dry-run` | Explicit dry-run; reports candidates and does not mutate state |
+| `mvmctl sandbox gc --apply` | Remove stale stopped/expired registry entries and emit a `SandboxGc` audit entry |
+
+`sandbox gc` never tears down a live VM. Entries that still appear as starting,
+running, or paused in a backend listing are skipped; cleanup only removes stale
+host registry records.
+
+## File Copy
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl cp <host-path> <vm>:/absolute/path` | Copy one regular file from the host into a running VM |
+| `mvmctl cp <vm>:/absolute/path <host-path>` | Copy one regular file from a running VM to the host |
+| `mvmctl cp --force <src> <dst>` | Overwrite an existing destination |
+| `mvmctl cp --create-parents <src> <dst>` | Create destination parent directories |
+| `mvmctl cp --max-bytes <n> <src> <dst>` | Refuse copies larger than the byte cap. Default: 16 MiB |
+
+Exactly one endpoint must use `VM:/absolute/path` form. Guest paths are
+validated by the guest agent's filesystem policy before any read or write. Host
+paths and file contents are not written to audit logs; successful copies emit
+`VmFileCopy` with direction, guest path, and byte count.
+
 `mvmctl exec` boots a fresh transient microVM, runs a single command, and tears it
 down on exit — like `cco` or `docker run --rm`, but with a Firecracker microVM
 as the sandbox. **Dev-mode only**: the guest agent's Exec handler is compiled in
