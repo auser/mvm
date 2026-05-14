@@ -106,6 +106,21 @@
 
       # Per Plan 72 §W2 — narrower than the dev-shell image.
       # See module-level docs above for the rationale on each.
+      #
+      # Plan 73 Followup B.2 adds the application-dependency
+      # install pipeline (ADR-047): `uv` / `pnpm` drive the
+      # installer, `cyclonedx-py` / `pnpm sbom` emit SBOMs, and
+      # `pip-audit` / `pnpm audit` run the CVE scan. Each is
+      # currently a soft gate — `mvm-builder-init::install`
+      # emits a CycloneDX-1.5 empty stub when the SBOM / CVE
+      # tool isn't on PATH and logs a warning. B.2.x will
+      # hard-gate the SBOM + CVE side once the egress allowlist
+      # lands.
+      #
+      # TODO(B.2.x): pin a network egress allowlist
+      # (`pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`,
+      # `objects.githubusercontent.com`) per ADR-047 §"Lifecycle
+      # gates" — today's builder VM has open egress.
       builderPackages = pkgs: with pkgs; [
         bashInteractive
         coreutils
@@ -122,6 +137,16 @@
         iproute2
         e2fsprogs
         util-linux
+        # Plan 73 Followup B.2 — app-deps install pipeline.
+        uv
+        pnpm
+        # `cyclonedx-py` ships under `python3Packages` in
+        # nixpkgs (the upstream package name; `pkgs.cyclonedx-py`
+        # is the entry point binary). Pulls a Python interpreter
+        # closure but the same one `pip-audit` needs, so the
+        # marginal cost is minor.
+        python3Packages.cyclonedx-bom
+        python3Packages.pip-audit
       ];
 
       # Build `mvm-builder-init` (Plan 72 W3) for the target system.

@@ -248,15 +248,6 @@ impl BuilderVm for LibkrunBuilderVm {
         self.validate_mounts(mounts)?;
         self.validate_job(job)?;
 
-        // Plan 73 Followup B.2.0 plumbing: the Install variant is
-        // a typed seam for the application-deps install pipeline
-        // (Followup B.2). The flake-build path below is unchanged;
-        // the install path lands in B.2.
-        match job {
-            BuilderJob::Flake { .. } => {}
-            BuilderJob::Install { .. } => return Err(BuilderVmError::NotYetImplemented),
-        }
-
         // 2. Refuse to proceed on a host without libkrun. The
         //    `backends-builder-vm-libkrun` feature being compiled
         //    in doesn't imply the runtime library is installed.
@@ -283,10 +274,10 @@ impl BuilderVm for LibkrunBuilderVm {
         //    warm Nix store.
         let nix_store_img = ensure_nix_store_image(host_arch_tag(), u64::from(self.nix_store_mib))?;
 
-        // 6. Stage the per-build job dir (`cmd.sh` + `env` +
-        //    placeholder `result`). The job ID derives from a
-        //    monotonic timestamp so concurrent invocations on
-        //    one host don't clobber.
+        // 6. Stage the per-build job dir. Flake jobs get
+        //    `cmd.sh`; install jobs get `install_spec.json`.
+        //    `mvm-builder-init` (Plan 72 W3 + Plan 73 Followup
+        //    B.2) dispatches based on which file it sees.
         let job_id = unique_job_id();
         let job_dir = builder_vm_cache_dir().join("jobs").join(&job_id);
         stage_job_dir(&job_dir, job)?;
@@ -294,7 +285,9 @@ impl BuilderVm for LibkrunBuilderVm {
         // 7. Build the `KrunContext` libkrun consumes. Three
         //    virtio-fs shares (work / out / job), one virtio-blk
         //    (Nix store), and the canonical cmdline pinned at the
-        //    flake output.
+        //    flake output. The mount layout is identical for
+        //    flake + install jobs — the guest decides what to do
+        //    with each share based on the staged job files.
         let vm_name = format!("mvm-builder-vm-{job_id}");
         let vm_state_dir = builder_vm_cache_dir().join("vms").join(&vm_name);
         std::fs::create_dir_all(&vm_state_dir).map_err(|e| {
@@ -341,47 +334,14 @@ impl BuilderVm for LibkrunBuilderVm {
             )));
         }
 
-        // 9. Read the guest's structured exit status.
-        let result = read_job_result(&job_dir)?;
-        if result.exit_code != 0 {
-            return Err(BuilderVmError::NixBuildFailed(format!(
-                "guest cmd.sh exited {} — stderr tail:\n{}",
-                result.exit_code, result.stderr_tail
-            )));
+        // 9. Per-variant result parsing + artifact validation.
+        //    Flake jobs read `<job_dir>/result` (legacy shape);
+        //    install jobs read `<artifact_out>/result.json` and
+        //    return a different artifact variant.
+        match job {
+            BuilderJob::Flake { .. } => finalize_flake_job(&job_dir, &mounts.artifact_out, &job_id),
+            BuilderJob::Install { .. } => finalize_install_job(&mounts.artifact_out),
         }
-
-        // 10. Validate the artifacts the cmd.sh script was
-        //     supposed to drop into `/out`. The guest wrote them
-        //     via virtio-fs — they show up on the host at
-        //     `mounts.artifact_out`.
-        let rootfs_path = mounts.artifact_out.join("rootfs.ext4");
-        if !rootfs_path.is_file() {
-            return Err(BuilderVmError::ExtractionFailed(format!(
-                "builder VM exited cleanly but {} was not written",
-                rootfs_path.display()
-            )));
-        }
-        let kernel_path_out = mounts.artifact_out.join("vmlinux");
-        let kernel_path = if kernel_path_out.is_file() {
-            Some(kernel_path_out)
-        } else {
-            None
-        };
-
-        Ok(BuilderArtifacts::Image {
-            rootfs_path,
-            kernel_path,
-            // The Nix store path hash isn't trivially recoverable
-            // from inside the host here — `nix build` printed it
-            // to stdout inside the guest and the cmd.sh discards
-            // it after copy. Plan 72 W5 can plumb it through via
-            // a `/job/store-path` sidecar if cache-keying needs
-            // it; for now the artifact dir's own digest is the
-            // cache key the host carries.
-            revision_hash: job_id,
-            lock_hash: None,
-            accessible: None,
-        })
     }
 
     fn cleanup(&self) -> Result<(), BuilderVmError> {
@@ -539,29 +499,57 @@ fn unique_job_id() -> String {
     format!("{now:013}-{pid}")
 }
 
-/// Stage `<job_dir>/cmd.sh` with the shell script the guest's
-/// PID 1 (`mvm-builder-init`) executes. `cmd.sh` runs
-/// `/bin/sh -eu` and is responsible for invoking `nix build`
-/// against the user's flake and dropping `vmlinux` +
-/// `rootfs.ext4` into `/out`.
+/// Filename of the install-spec JSON the host stages for
+/// install jobs. Matches the constant `mvm-builder-init` checks
+/// for inside the VM — keep these in sync.
+pub(crate) const INSTALL_SPEC_FILENAME: &str = "install_spec.json";
+
+/// Filename of the install report `mvm-builder-init` writes into
+/// `artifact_out/` after the install pipeline finishes. The host
+/// reads + parses this to decide whether the install succeeded.
+pub(crate) const INSTALL_RESULT_FILENAME: &str = "result.json";
+
+/// Stage the per-job dir for the given [`BuilderJob`].
 ///
-/// Plan 73 Followup B.2.0 added the [`BuilderJob`] dispatch
-/// here. The `Flake` arm renders today's `nix build` script;
-/// the `Install` arm errors with [`BuilderVmError::NotYetImplemented`]
-/// — Followup B.2 fills it in by emitting the per-ecosystem
-/// install script + result.json contract.
+/// - [`BuilderJob::Flake`]: writes `<job_dir>/cmd.sh` with the
+///   `nix build` script the guest's PID 1 dispatches via
+///   `/bin/sh -eu`.
+/// - [`BuilderJob::Install`]: copies the caller's install spec
+///   to `<job_dir>/install_spec.json`. `mvm-builder-init` probes
+///   for this filename first; when present it routes through the
+///   app-deps install pipeline (Plan 73 Followup B.2) instead of
+///   running `cmd.sh`.
+///
+/// The two modes are mutually exclusive — install jobs don't
+/// emit a `cmd.sh`, flake jobs don't emit an install spec.
 fn stage_job_dir(job_dir: &Path, job: &BuilderJob) -> Result<(), BuilderVmError> {
+    std::fs::create_dir_all(job_dir).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!("creating job dir {}: {e}", job_dir.display()))
+    })?;
+
     let (flake_ref, attr_path) = match job {
         BuilderJob::Flake {
             flake_ref,
             attr_path,
         } => (flake_ref.as_str(), attr_path.as_str()),
-        BuilderJob::Install { .. } => return Err(BuilderVmError::NotYetImplemented),
+        BuilderJob::Install { spec_path } => {
+            // Copy the caller's spec into the per-job dir so the
+            // virtio-fs share carries it into the guest at
+            // `/job/install_spec.json`. `mvm-builder-init`
+            // (Plan 73 Followup B.2) detects that filename and
+            // dispatches through the install pipeline instead of
+            // running cmd.sh.
+            let dst = job_dir.join(INSTALL_SPEC_FILENAME);
+            std::fs::copy(spec_path, &dst).map_err(|e| {
+                BuilderVmError::ExtractionFailed(format!(
+                    "copying install spec {} -> {}: {e}",
+                    spec_path.display(),
+                    dst.display()
+                ))
+            })?;
+            return Ok(());
+        }
     };
-
-    std::fs::create_dir_all(job_dir).map_err(|e| {
-        BuilderVmError::ExtractionFailed(format!("creating job dir {}: {e}", job_dir.display()))
-    })?;
 
     // Render the `cmd.sh` content. flake_ref and attr_path are
     // user-controlled; emit them inside `'…'` quoted shell
@@ -634,6 +622,127 @@ chmod 0644 /out/rootfs.ext4 2>/dev/null || true
 /// then reopen. Standard sh-escape pattern.
 fn shell_single_quote_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
+}
+
+/// Finalize a flake build: read `<job_dir>/result`, validate the
+/// `rootfs.ext4` (and optional `vmlinux`) landed in
+/// `artifact_out`, return a [`BuilderArtifacts::Image`].
+fn finalize_flake_job(
+    job_dir: &Path,
+    artifact_out: &Path,
+    job_id: &str,
+) -> Result<BuilderArtifacts, BuilderVmError> {
+    let result = read_job_result(job_dir)?;
+    if result.exit_code != 0 {
+        return Err(BuilderVmError::NixBuildFailed(format!(
+            "guest cmd.sh exited {} — stderr tail:\n{}",
+            result.exit_code, result.stderr_tail
+        )));
+    }
+
+    let rootfs_path = artifact_out.join("rootfs.ext4");
+    if !rootfs_path.is_file() {
+        return Err(BuilderVmError::ExtractionFailed(format!(
+            "builder VM exited cleanly but {} was not written",
+            rootfs_path.display()
+        )));
+    }
+    let kernel_path_out = artifact_out.join("vmlinux");
+    let kernel_path = if kernel_path_out.is_file() {
+        Some(kernel_path_out)
+    } else {
+        None
+    };
+
+    Ok(BuilderArtifacts::Image {
+        rootfs_path,
+        kernel_path,
+        // The Nix store path hash isn't trivially recoverable
+        // from inside the host here — `nix build` printed it
+        // to stdout inside the guest and the cmd.sh discards
+        // it after copy. Plan 72 W5 can plumb it through via
+        // a `/job/store-path` sidecar if cache-keying needs
+        // it; for now the artifact dir's own digest is the
+        // cache key the host carries.
+        revision_hash: job_id.to_string(),
+        lock_hash: None,
+        accessible: None,
+    })
+}
+
+/// Finalize an install job (Plan 73 Followup B.2): validate the
+/// install report `mvm-builder-init` wrote to
+/// `<artifact_out>/result.json`, fail closed on `installer_exit_code
+/// != 0`, and return [`BuilderArtifacts::InstallVolume`] pointing
+/// at the directory. Sealing the volume (via
+/// `mvm_sdk::compile::deps_audit::seal_volume`) and renaming into
+/// the deps cache is the orchestrator's job
+/// (`mvm_build::app_deps::install_app_deps`) — keeping it out of
+/// the builder VM means the same code path covers fresh installs
+/// and cache rehydrations.
+fn finalize_install_job(artifact_out: &Path) -> Result<BuilderArtifacts, BuilderVmError> {
+    let result_path = artifact_out.join(INSTALL_RESULT_FILENAME);
+    if !result_path.is_file() {
+        return Err(BuilderVmError::ExtractionFailed(format!(
+            "install job VM exited cleanly but {} was not written",
+            result_path.display()
+        )));
+    }
+    let body = std::fs::read_to_string(&result_path).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!("reading {}: {e}", result_path.display()))
+    })?;
+    let report: InstallResultReport = serde_json::from_str(&body).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!(
+            "parsing {} as JSON: {e}\nbody:\n{body}",
+            result_path.display()
+        ))
+    })?;
+
+    if report.installer_exit_code != 0 {
+        let reason = report
+            .failure_reason
+            .clone()
+            .unwrap_or_else(|| format!("installer exited {}", report.installer_exit_code));
+        return Err(BuilderVmError::NixBuildFailed(format!(
+            "install pipeline failed inside builder VM: {reason}"
+        )));
+    }
+
+    // The four sealed-volume artifacts must all be present —
+    // mvm-builder-init emits stubs on missing optional tooling
+    // (SBOM / CVE) so absence here means the guest crashed mid-
+    // pipeline. seal_volume would catch this too, but failing
+    // closed at the builder layer pins the error to the right
+    // diagnostic message.
+    for name in ["content", "sbom.cdx.json", "fetch.log", "cve.json"] {
+        let p = artifact_out.join(name);
+        if !p.exists() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "install job VM exited cleanly but sealed-volume artifact {} is missing",
+                p.display()
+            )));
+        }
+    }
+
+    Ok(BuilderArtifacts::InstallVolume {
+        volume_dir: artifact_out.to_path_buf(),
+        result_json_path: result_path,
+    })
+}
+
+/// Parsed shape of `<artifact_out>/result.json` — the install
+/// report `mvm-builder-init::install::InstallReport::to_json`
+/// emits. Field set kept in sync with the writer; an additive
+/// change to the writer (B.2.x egress allowlist diagnostics, for
+/// example) needs a matching `#[serde(default)]` field here.
+#[derive(Debug, Deserialize)]
+struct InstallResultReport {
+    installer_exit_code: i32,
+    /// Set when `mvm-builder-init` synthesizes a failure report
+    /// (e.g. installer binary missing on PATH). Surfaced in the
+    /// host-side error message.
+    #[serde(default)]
+    failure_reason: Option<String>,
 }
 
 /// Read and parse `<job_dir>/result`. The guest's PID 1
@@ -907,11 +1016,13 @@ mod tests {
     }
 
     #[test]
-    fn run_build_rejects_install_variant_with_not_yet_implemented() {
-        // Plumbing-only: the Install variant is a typed seam for
-        // Followup B.2. Until then libkrun must surface
-        // NotYetImplemented after passing input validation rather
-        // than proceeding into the flake-build pipeline.
+    fn run_build_surfaces_environment_gaps_for_install_variant() {
+        // Plan 73 Followup B.2 wires the Install variant — passing
+        // input validation no longer trips NotYetImplemented. With
+        // a CI runner that doesn't carry libkrun + the supervisor
+        // binary, run_build now surfaces the same environment-gap
+        // shape as the Flake variant. Asserts the wiring proceeds
+        // past validation rather than short-circuiting.
         let scratch = TempDir::new().unwrap();
         let spec_path = scratch.path().join("spec.json");
         std::fs::write(&spec_path, b"{}").unwrap();
@@ -920,24 +1031,126 @@ mod tests {
             .run_build(&BuilderJob::Install { spec_path }, &mounts)
             .unwrap_err();
         assert!(
-            matches!(err, BuilderVmError::NotYetImplemented),
+            matches!(
+                err,
+                BuilderVmError::MicrosandboxUnavailable(_) | BuilderVmError::ExtractionFailed(_)
+            ),
+            "unexpected error variant: {err:?}"
+        );
+    }
+
+    #[test]
+    fn stage_job_dir_install_copies_spec_into_job_dir() {
+        // Plan 73 Followup B.2: install jobs stage
+        // `<job_dir>/install_spec.json` rather than `cmd.sh`. The
+        // guest's `mvm-builder-init` probes for that filename and
+        // dispatches through the install pipeline.
+        let scratch = TempDir::new().unwrap();
+        let job_dir = scratch.path().join("job-1");
+        let spec_path = scratch.path().join("spec.json");
+        let spec_body = br#"{"language":"python","lockfile_relative_path":"uv.lock","source_mount":"/work","gate":"dev"}"#;
+        std::fs::write(&spec_path, spec_body).unwrap();
+        stage_job_dir(&job_dir, &BuilderJob::Install { spec_path }).expect("stage ok");
+        let dst = job_dir.join(INSTALL_SPEC_FILENAME);
+        assert!(dst.is_file(), "install_spec.json must be staged at {dst:?}");
+        let on_disk = std::fs::read(&dst).unwrap();
+        assert_eq!(on_disk, spec_body, "spec bytes must round-trip verbatim");
+        // No cmd.sh is emitted for install jobs.
+        assert!(
+            !job_dir.join("cmd.sh").exists(),
+            "install jobs must not stage cmd.sh"
+        );
+    }
+
+    #[test]
+    fn finalize_install_job_requires_result_json() {
+        // Empty artifact dir → ExtractionFailed pointing at the
+        // missing result.json. Surfaces guest crashes that
+        // prevented mvm-builder-init from finalizing the report.
+        let scratch = TempDir::new().unwrap();
+        let err = finalize_install_job(scratch.path()).unwrap_err();
+        assert!(matches!(err, BuilderVmError::ExtractionFailed(_)));
+        assert!(err.to_string().contains("result.json"), "got {err}");
+    }
+
+    #[test]
+    fn finalize_install_job_rejects_nonzero_installer_exit() {
+        let scratch = TempDir::new().unwrap();
+        // Populate enough of the layout that the missing-artifacts
+        // check doesn't trip first.
+        std::fs::create_dir_all(scratch.path().join("content")).unwrap();
+        std::fs::write(scratch.path().join("sbom.cdx.json"), b"{}").unwrap();
+        std::fs::write(scratch.path().join("fetch.log"), b"").unwrap();
+        std::fs::write(scratch.path().join("cve.json"), b"{}").unwrap();
+        std::fs::write(
+            scratch.path().join(INSTALL_RESULT_FILENAME),
+            br#"{"installer_exit_code":1,"sbom_emitted":false,"cve_emitted":false,"language":"python","gate":"dev","content_path":"/out/content","sbom_path":"/out/sbom.cdx.json","fetch_log_path":"/out/fetch.log","cve_path":"/out/cve.json","failure_reason":"lockfile not found"}"#,
+        )
+        .unwrap();
+        let err = finalize_install_job(scratch.path()).unwrap_err();
+        match err {
+            BuilderVmError::NixBuildFailed(msg) => {
+                assert!(msg.contains("lockfile not found"), "got {msg}");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_install_job_returns_install_volume_on_happy_path() {
+        let scratch = TempDir::new().unwrap();
+        std::fs::create_dir_all(scratch.path().join("content")).unwrap();
+        std::fs::write(scratch.path().join("sbom.cdx.json"), b"{}").unwrap();
+        std::fs::write(scratch.path().join("fetch.log"), b"").unwrap();
+        std::fs::write(scratch.path().join("cve.json"), b"{}").unwrap();
+        std::fs::write(
+            scratch.path().join(INSTALL_RESULT_FILENAME),
+            br#"{"installer_exit_code":0,"sbom_emitted":true,"cve_emitted":true,"language":"python","gate":"prod","content_path":"/out/content","sbom_path":"/out/sbom.cdx.json","fetch_log_path":"/out/fetch.log","cve_path":"/out/cve.json"}"#,
+        )
+        .unwrap();
+        let art = finalize_install_job(scratch.path()).unwrap();
+        match art {
+            BuilderArtifacts::InstallVolume {
+                volume_dir,
+                result_json_path,
+            } => {
+                assert_eq!(volume_dir, scratch.path());
+                assert_eq!(
+                    result_json_path,
+                    scratch.path().join(INSTALL_RESULT_FILENAME)
+                );
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_install_job_rejects_missing_sealed_artifact() {
+        let scratch = TempDir::new().unwrap();
+        // result.json says success, but the sealed-volume sidecars
+        // are missing. Fail closed so seal_volume doesn't later
+        // chase a half-populated dir.
+        std::fs::write(
+            scratch.path().join(INSTALL_RESULT_FILENAME),
+            br#"{"installer_exit_code":0,"sbom_emitted":true,"cve_emitted":true,"language":"python","gate":"dev","content_path":"/out/content","sbom_path":"/out/sbom.cdx.json","fetch_log_path":"/out/fetch.log","cve_path":"/out/cve.json"}"#,
+        )
+        .unwrap();
+        let err = finalize_install_job(scratch.path()).unwrap_err();
+        assert!(
+            matches!(err, BuilderVmError::ExtractionFailed(_)),
             "got {err:?}"
         );
     }
 
     #[test]
-    fn stage_job_dir_rejects_install_variant() {
-        // The stager only knows about the Flake shape today. The
-        // Install seam returns NotYetImplemented so B.2 can swap
-        // in the per-ecosystem install script without touching
-        // call sites.
+    fn finalize_install_job_rejects_malformed_result_json() {
         let scratch = TempDir::new().unwrap();
-        let job_dir = scratch.path().join("job-1");
-        let spec_path = scratch.path().join("spec.json");
-        std::fs::write(&spec_path, b"{}").unwrap();
-        let err =
-            stage_job_dir(&job_dir, &BuilderJob::Install { spec_path }).expect_err("install path");
-        assert!(matches!(err, BuilderVmError::NotYetImplemented));
+        std::fs::write(scratch.path().join(INSTALL_RESULT_FILENAME), b"{not valid").unwrap();
+        let err = finalize_install_job(scratch.path()).unwrap_err();
+        match err {
+            BuilderVmError::ExtractionFailed(msg) => assert!(msg.contains("parsing"), "got {msg}"),
+            other => panic!("wrong variant: {other:?}"),
+        }
     }
 
     #[test]

@@ -56,6 +56,23 @@
 
 use std::process::ExitCode;
 
+// Cross-platform modules. The install-spec parser and install
+// pipeline runner live here so `cargo test` on macOS exercises the
+// dispatch logic via shell stubs without paying for a Linux cross-
+// compile. The Linux-only `linux` module composes them with the
+// real PID-1 mount / power-off dance.
+//
+// `allow(dead_code)` because the modules are consumed from
+// `linux::run_install_job` on Linux and from `#[cfg(test)]` blocks
+// on every host. On non-Linux non-test builds (workspace ergonomics
+// + reproducible builds) every public item looks "unused" — clippy
+// would flag them otherwise. Real dead code would still surface as
+// red because the tests would lose coverage.
+#[allow(dead_code)]
+mod install;
+#[allow(dead_code)]
+mod install_spec;
+
 fn main() -> ExitCode {
     #[cfg(target_os = "linux")]
     {
@@ -125,6 +142,14 @@ mod linux {
     /// (`krun_set_console_output`).
     const STDERR_TAIL_LINES: usize = 20;
 
+    /// Filename for the structured install spec (Plan 73 Followup
+    /// B.2). When `/job/install_spec.json` is present the init
+    /// binary routes through the app-deps install pipeline instead
+    /// of dispatching `/job/cmd.sh`. The two modes are mutually
+    /// exclusive — install jobs don't carry a cmd.sh, flake jobs
+    /// don't carry an install_spec.json.
+    const INSTALL_SPEC_FILENAME: &str = "install_spec.json";
+
     pub fn run() -> ExitCode {
         eprintln!("mvm-builder-init: pid 1 starting");
 
@@ -142,6 +167,17 @@ mod linux {
             eprintln!("mvm-builder-init: setup_network warning (non-fatal): {e}");
         }
 
+        // Plan 73 Followup B.2 dispatch: install jobs hand the init
+        // binary a structured spec rather than a shell script. We
+        // probe for the spec first; if absent, fall through to the
+        // existing cmd.sh flake-build flow.
+        let install_spec_path = format!("{JOB_DIR}/{INSTALL_SPEC_FILENAME}");
+        if Path::new(&install_spec_path).exists() {
+            eprintln!("mvm-builder-init: install spec detected, routing through install pipeline");
+            run_install_job(&install_spec_path);
+            return power_off();
+        }
+
         let cmd_path = format!("{JOB_DIR}/cmd.sh");
         if !Path::new(&cmd_path).exists() {
             write_result(2, &format!("missing {cmd_path}"));
@@ -151,6 +187,102 @@ mod linux {
         let (code, tail) = run_job(&cmd_path);
         write_result(code, &tail);
         power_off()
+    }
+
+    /// Drive the install pipeline against `/job/install_spec.json`.
+    /// Emits `/job/result.json` (the typed report — distinct from
+    /// `/job/result`, which the flake-build path writes); the host
+    /// reads it to pick up exit code + sidecar paths.
+    ///
+    /// We deliberately don't propagate failures back as a process
+    /// exit code: the VM is going to `reboot()` regardless, and
+    /// the host distinguishes "install failed" vs "init crashed"
+    /// via the *presence* of result.json. Anything that prevents
+    /// us from writing result.json gets logged + falls through.
+    fn run_install_job(spec_path: &str) {
+        use crate::install::{InstallError, RESULT_FILENAME, SystemCommandRunner, run_install};
+        use crate::install_spec::parse;
+
+        let bytes = match std::fs::read(spec_path) {
+            Ok(b) => b,
+            Err(e) => {
+                eprintln!("mvm-builder-init: read {spec_path}: {e}");
+                write_install_failure(2, &format!("read install spec: {e}"));
+                return;
+            }
+        };
+        let spec = match parse(&bytes) {
+            Ok(s) => s,
+            Err(e) => {
+                eprintln!("mvm-builder-init: parse {spec_path}: {e}");
+                write_install_failure(2, &format!("parse install spec: {e}"));
+                return;
+            }
+        };
+
+        let runner = SystemCommandRunner;
+        let report = match run_install(&spec, Path::new(JOB_DIR), Path::new(OUT_DIR), &runner, None)
+        {
+            Ok(r) => r,
+            Err(InstallError::InstallerMissing { program }) => {
+                eprintln!(
+                    "mvm-builder-init: installer `{program}` not on PATH — builder VM is missing required tools"
+                );
+                write_install_failure(
+                    127,
+                    &format!("installer `{program}` not on PATH inside builder VM"),
+                );
+                return;
+            }
+            Err(InstallError::Io(why)) => {
+                eprintln!("mvm-builder-init: install pipeline IO: {why}");
+                write_install_failure(2, &format!("install pipeline IO: {why}"));
+                return;
+            }
+        };
+
+        // Write the typed report into /out — the host reads it
+        // from `artifact_out/result.json` post-power-off. Plan 73
+        // Followup B.2's contract: result.json lives next to the
+        // four sealed-volume artifacts so a single virtio-fs
+        // share carries everything the host needs. Hand-rolled
+        // JSON via InstallReport::to_json so we don't pull
+        // serde_json into the init binary's closure.
+        let path = format!("{OUT_DIR}/{RESULT_FILENAME}");
+        if let Err(e) = std::fs::write(&path, format!("{}\n", report.to_json())) {
+            eprintln!("mvm-builder-init: failed to write {path}: {e}");
+        }
+    }
+
+    /// Emit a synthetic install-failure result so the host can
+    /// distinguish "guest crashed before running install" from
+    /// "install ran and exited nonzero." The shape matches
+    /// [`crate::install::InstallReport::to_json`] so the host's
+    /// parser doesn't need a separate code path.
+    fn write_install_failure(exit_code: i32, reason: &str) {
+        use crate::install::{
+            CONTENT_SUBDIR, CVE_FILENAME, FETCH_LOG_FILENAME, RESULT_FILENAME, SBOM_FILENAME,
+        };
+        let escaped = json_escape(reason);
+        // Synthesize a result.json that pins all sidecars at their
+        // canonical paths but flags everything as un-emitted. The
+        // host's parser sees installer_exit_code != 0 and refuses
+        // to seal the volume.
+        let body = format!(
+            r#"{{"installer_exit_code":{exit_code},"sbom_emitted":false,"cve_emitted":false,"language":"unknown","gate":"unknown","content_path":"{OUT_DIR}/{CONTENT_SUBDIR}","sbom_path":"{OUT_DIR}/{SBOM_FILENAME}","fetch_log_path":"{OUT_DIR}/{FETCH_LOG_FILENAME}","cve_path":"{OUT_DIR}/{CVE_FILENAME}","failure_reason":"{escaped}"}}"#,
+        );
+        let path = format!("{OUT_DIR}/{RESULT_FILENAME}");
+        // Best-effort: if /out isn't mounted (the install-spec
+        // dispatch ran before virtio-fs came up), at least try
+        // /job so the host has *somewhere* to pick up the failure
+        // signal.
+        if let Err(e) = std::fs::write(&path, format!("{body}\n")) {
+            eprintln!("mvm-builder-init: failed to write {path}: {e}");
+            let fallback = format!("{JOB_DIR}/{RESULT_FILENAME}");
+            if let Err(e2) = std::fs::write(&fallback, format!("{body}\n")) {
+                eprintln!("mvm-builder-init: failed to write {fallback}: {e2}");
+            }
+        }
     }
 
     fn setup_filesystems() -> Result<(), String> {

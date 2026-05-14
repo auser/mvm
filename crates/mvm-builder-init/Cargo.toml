@@ -24,6 +24,13 @@ path = "src/main.rs"
 # workspace builds don't drag in the dep tree.
 nix = { version = "0.29", features = ["mount", "reboot"] }
 
+[dev-dependencies]
+# Test scratch dirs + JSON parsing for assertions against the
+# hand-rolled `InstallReport::to_json` output. Production builds
+# never see these — they live behind `cfg(test)` only.
+tempfile.workspace = true
+serde_json.workspace = true
+
 [lints]
 workspace = true
 
