@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 use super::super::env::apple_container::ensure_default_microvm_image;
+use super::host_signer::{host_signer_id, load_or_init, PUBLIC_FILENAME};
 use super::Cli;
-use super::host_signer::{PUBLIC_FILENAME, host_signer_id, load_or_init};
 use crate::ui;
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -103,6 +103,13 @@ pub(in crate::commands) struct RunArgs {
     /// stores raw argv, env values, stdout, or stderr.
     #[arg(long, value_name = "PATH")]
     pub receipt: Option<PathBuf>,
+    /// Print a machine-readable, redacted execution summary as JSON.
+    ///
+    /// Guest stdout/stderr are not streamed in this mode; the JSON carries
+    /// only byte counts and hashes. Combine with `--receipt` when a signed
+    /// artifact is needed.
+    #[arg(long)]
+    pub json: bool,
     /// Path to an mvmforge launch document. Mutually exclusive with trailing argv.
     #[arg(long, value_name = "PATH", conflicts_with = "argv")]
     pub launch_plan: Option<String>,
@@ -172,17 +179,27 @@ pub(in crate::commands) fn run_receipt(
 pub(in crate::commands) fn run_secure(cli: &Cli, args: RunArgs, cfg: &MvmConfig) -> Result<()> {
     validate_run_profile(&args)?;
     let receipt_path = args.receipt.clone();
-    if let Some(path) = receipt_path {
+    if args.json || receipt_path.is_some() {
         let receipt_input = ReceiptInput::from_run_args(&args)?;
+        let json_requested = args.json;
         let req = build_exec_request(args.into_exec_args(), "`mvmctl run`")?;
         let output = crate::exec::run_captured(req)?;
-        if !output.stdout.is_empty() {
+        if !json_requested && !output.stdout.is_empty() {
             print!("{}", output.stdout);
         }
-        if !output.stderr.is_empty() {
+        if !json_requested && !output.stderr.is_empty() {
             eprint!("{}", output.stderr);
         }
-        write_run_receipt(&path, receipt_input, &output)?;
+        let summary = RunJsonSummary::from_parts(receipt_input.clone(), &output, receipt_path);
+        if let Some(path) = summary.receipt_path.as_deref() {
+            write_run_receipt(path, receipt_input, &output)?;
+        }
+        if json_requested {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary).context("serializing run JSON summary")?
+            );
+        }
         if output.exit_code != 0 {
             std::process::exit(output.exit_code);
         }
@@ -370,6 +387,30 @@ struct RunReceiptSignature {
     signature_base64: String,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunJsonSummary {
+    schema_version: u32,
+    invocation: ReceiptInput,
+    outcome: ReceiptOutcome,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    receipt_path: Option<PathBuf>,
+}
+
+impl RunJsonSummary {
+    fn from_parts(
+        invocation: ReceiptInput,
+        output: &crate::exec::ExecOutput,
+        receipt_path: Option<PathBuf>,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            invocation,
+            outcome: ReceiptOutcome::from_exec_output(output),
+            receipt_path,
+        }
+    }
+}
+
 impl ReceiptInput {
     fn from_run_args(args: &RunArgs) -> Result<Self> {
         let command = if let Some(path) = &args.launch_plan {
@@ -545,6 +586,7 @@ mod tests {
             env: Vec::new(),
             timeout: 60,
             receipt: None,
+            json: false,
             launch_plan: None,
             argv: vec!["/bin/true".to_string()],
         }
@@ -618,6 +660,27 @@ mod tests {
         assert!(!json.contains("secret stderr"));
         assert_eq!(outcome.stdout_bytes, "secret stdout".len());
         assert_eq!(outcome.stderr_bytes, "secret stderr".len());
+    }
+
+    #[test]
+    fn run_json_summary_omits_raw_output() {
+        let args = run_args(RunProfile::Standard);
+        let output = crate::exec::ExecOutput {
+            exit_code: 0,
+            stdout: "sensitive stdout".to_string(),
+            stderr: "sensitive stderr".to_string(),
+        };
+        let summary = RunJsonSummary::from_parts(
+            ReceiptInput::from_run_args(&args).expect("receipt input"),
+            &output,
+            Some(PathBuf::from("/tmp/receipt.json")),
+        );
+        let json = serde_json::to_string(&summary).expect("serialize summary");
+        assert!(json.contains("stdout_sha256"));
+        assert!(json.contains("stderr_sha256"));
+        assert!(json.contains("/tmp/receipt.json"));
+        assert!(!json.contains("sensitive stdout"));
+        assert!(!json.contains("sensitive stderr"));
     }
 
     #[test]

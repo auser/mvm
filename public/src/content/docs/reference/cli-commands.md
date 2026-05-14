@@ -196,8 +196,14 @@ dev-feature guest agent; production guests should use `mvmctl invoke`.
 | `mvmctl run --cpus <n> --memory <size> -- <cmd>` | Resize the transient VM |
 | `mvmctl run --timeout <secs> -- <cmd>` | Per-command timeout |
 | `mvmctl run --receipt <path> -- <cmd>` | Write a signed JSON receipt with invocation hashes, output hashes, and exit status. Raw argv, env values, stdout, and stderr are not stored. |
+| `mvmctl run --json -- <cmd>` | Print a redacted JSON execution summary with invocation metadata and output hashes. Guest stdout/stderr are not streamed. |
+| `mvmctl run --json --receipt <path> -- <cmd>` | Print the same JSON summary and also write a signed receipt artifact |
 | `mvmctl receipt verify <path>` | Verify a signed run receipt against `~/.mvm/keys/host-signer.pub` |
 | `mvmctl receipt verify <path> --pubkey <path>` | Verify a signed run receipt against an explicit raw Ed25519 public key |
+
+`run --json` is intended for machine callers. It preserves the command's exit
+code, but the JSON does not include raw argv, env values, stdout, stderr, or host
+paths.
 
 ## Sandbox State
 

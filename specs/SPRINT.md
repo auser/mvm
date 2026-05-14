@@ -1622,6 +1622,9 @@ Shipped:
 - `mvmctl run --receipt <path>` writes a host-signed JSON receipt with
   invocation hashes, output hashes, and exit status; raw argv/env values
   and raw output are deliberately omitted.
+- `mvmctl run --json` emits an unsigned machine-readable execution summary
+  using the same redacted invocation/outcome shape as receipts. Guest stdout
+  and stderr are not streamed in JSON mode; only hashes and byte counts appear.
 - `mvmctl receipt verify <path>` verifies the receipt signature against
   the local host-signer public key, with `--pubkey` for portable checks.
 - `mvmctl sandbox gc` adds a dry-run-by-default cleanup path for stale

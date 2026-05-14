@@ -21,9 +21,9 @@ use config::ConfigAction;
 use up::RunParams;
 
 use super::shared::{
-    VolumeSpec, clap_flake_ref, clap_port_spec, clap_vm_name, clap_volume_spec,
-    env_vars_to_drive_file, parse_port_spec, parse_port_specs, parse_volume_spec,
-    ports_to_drive_file, read_dir_to_drive_files, resolve_flake_ref, resolve_network_policy,
+    clap_flake_ref, clap_port_spec, clap_vm_name, clap_volume_spec, env_vars_to_drive_file,
+    parse_port_spec, parse_port_specs, parse_volume_spec, ports_to_drive_file,
+    read_dir_to_drive_files, resolve_flake_ref, resolve_network_policy, VolumeSpec,
 };
 
 #[test]
@@ -1345,6 +1345,7 @@ fn run_default_profile_argv_only() {
             env,
             timeout,
             receipt,
+            json,
             launch_plan,
             argv,
         }) => {
@@ -1356,6 +1357,7 @@ fn run_default_profile_argv_only() {
             assert!(env.is_empty());
             assert_eq!(timeout, 60);
             assert!(receipt.is_none(), "receipt should default to None");
+            assert!(!json, "json should default to false");
             assert!(launch_plan.is_none(), "launch_plan should default to None");
             assert_eq!(argv, vec!["uname".to_string(), "-a".to_string()]);
         }
@@ -1406,6 +1408,18 @@ fn run_receipt_flag_parses() {
                 receipt.as_deref(),
                 Some(std::path::Path::new("/tmp/mvm-run-receipt.json"))
             );
+        }
+        _ => panic!("Expected Run command"),
+    }
+}
+
+#[test]
+fn run_json_flag_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "run", "--json", "--", "/bin/true"]).expect("parse");
+    match cli.command {
+        Commands::Run(exec::RunArgs { json, argv, .. }) => {
+            assert!(json);
+            assert_eq!(argv, vec!["/bin/true".to_string()]);
         }
         _ => panic!("Expected Run command"),
     }
@@ -1912,7 +1926,9 @@ fn test_compile_from_recording_parses() {
             ..
         }) => {
             assert_eq!(
-                from_recording.as_deref().map(|p| p.to_string_lossy().into_owned()),
+                from_recording
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned()),
                 Some("/tmp/rec.json".to_string())
             );
             assert!(from_ir.is_none());
@@ -1945,8 +1961,8 @@ fn test_compile_from_recording_conflicts_with_from_ir() {
 
 #[test]
 fn test_compile_default_no_from_flags_leaves_them_none() {
-    let cli = Cli::try_parse_from(["mvmctl", "compile", "--from-ir", "/tmp/ir.json"])
-        .expect("parse");
+    let cli =
+        Cli::try_parse_from(["mvmctl", "compile", "--from-ir", "/tmp/ir.json"]).expect("parse");
     match cli.command {
         Commands::Compile(compile::Args {
             from_ir,
