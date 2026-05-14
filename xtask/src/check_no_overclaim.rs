@@ -41,7 +41,9 @@ pub fn run(workspace: &Path) -> Result<()> {
         .collect();
 
     if active.is_empty() {
-        eprintln!("check-no-overclaim: no active gates (all claims at status Shipped or claims/ empty)");
+        eprintln!(
+            "check-no-overclaim: no active gates (all claims at status Shipped or claims/ empty)"
+        );
         return Ok(());
     }
 
@@ -273,9 +275,7 @@ fn find_phrase(source: &str, phrase: &str) -> Option<usize> {
 fn path_is_exempt(rel_path: &Path, exempt_paths: &[String]) -> bool {
     let s = rel_path.to_string_lossy();
     let s = s.replace('\\', "/");
-    exempt_paths
-        .iter()
-        .any(|pattern| glob_match(pattern, &s))
+    exempt_paths.iter().any(|pattern| glob_match(pattern, &s))
 }
 
 /// Match `path` against a glob pattern with `**` and `*` support.
@@ -348,13 +348,7 @@ fn visit_inner(
         if path.is_dir() {
             if matches!(
                 name.as_str(),
-                "target"
-                    | ".git"
-                    | ".worktrees"
-                    | "node_modules"
-                    | "result"
-                    | ".direnv"
-                    | ".cargo"
+                "target" | ".git" | ".worktrees" | "node_modules" | "result" | ".direnv" | ".cargo"
             ) || name.starts_with("result-")
             {
                 continue;
@@ -364,10 +358,7 @@ fn visit_inner(
             path.extension().and_then(|e| e.to_str()),
             Some("md") | Some("rs") | Some("toml") | Some("nix")
         ) {
-            let rel = path
-                .strip_prefix(root)
-                .unwrap_or(&path)
-                .to_path_buf();
+            let rel = path.strip_prefix(root).unwrap_or(&path).to_path_buf();
             cb(&rel, &path)?;
         }
     }
