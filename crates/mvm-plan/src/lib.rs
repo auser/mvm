@@ -43,9 +43,10 @@ pub use bundle::{
 pub use plan::{ExecutionPlan, SCHEMA_VERSION};
 pub use signing::{PlanVerifyError, SignedExecutionPlan, sign_plan, verify_plan};
 pub use types::{
-    ArtifactPolicy, AttestationMode, AttestationRequirement, DepsVolumeBinding,
-    DepsVolumeBindingError, FsPolicyRef, KeyRotationSpec, Nonce, NonceParseError, PlanId,
-    PolicyRef, PostRunLifecycle, ReleasePin, Resources, RuntimeProfileRef, SecretBinding,
-    SecretSource, SignedImageRef, TenantId, TimeoutSpec, Variant, WorkloadId,
+    AdmissionProfile, ArtifactPolicy, AttestationMode, AttestationRequirement, AuditTaxonomy,
+    DepsVolumeBinding, DepsVolumeBindingError, FsPolicyRef, KeyRotationSpec, Nonce,
+    NonceParseError, PlanId, PlanSeccompTier, PlanSeccompTierParseError, PolicyRef,
+    PostRunLifecycle, ReleasePin, Resources, RuntimeProfileRef, SecretBinding, SecretReleasePolicy,
+    SecretSource, SignedImageRef, TenantId, TimeoutSpec, Variant, WorkloadId, WorkloadIntent,
 };
 pub use validity::{NonceStore, PlanValidityError, check_window};

@@ -154,6 +154,10 @@ mod tests {
                     exec_secs: 600,
                 },
             },
+            admission_profile: AdmissionProfile::local_default(
+                "code:execute",
+                PlanSeccompTier::Standard,
+            ),
             network_policy: PolicyRef("default-deny".to_string()),
             fs_policy: FsPolicyRef("default".to_string()),
             secrets: vec![],

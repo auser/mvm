@@ -78,6 +78,7 @@ Each `Ref`-typed field of `ExecutionPlan` is a placeholder that resolves to a co
 | `workload` | VM name (post-validation) | image-baked workload manifest | mvm-build |
 | `runtime_profile` | backend name (`firecracker` / `microsandbox` / `apple-container`) | flake `passthru.mvm.profile` | mvm-build |
 | `image` | `{ name: vm_name, sha256: <rootfs-hash>, cosign_bundle: None }` | `mvm-security::image_verify` signed-manifest path with cosign bundle | mvm-security |
+| `admission_profile` | intent-bound binding of `intent`, selected seccomp tier, policy refs, secret-release posture, and audit taxonomy; direct `mvmctl up` defaults to `intent = "vm:boot"` | mvmd / SDK intent resolver picks named profiles such as `code:execute`, `agent:web-research`, `deploy:publish`, then refuses inconsistent requested powers | mvm-plan + mvmd policy resolver |
 | `network_policy` / `fs_policy` / `egress_policy` / `tool_policy` | `"local-default"` → Noops, OR `"<tenant>:<workload>"` → loads `~/.mvm/policies/<tenant>/<workload>.toml` (still returns Noops; no live consumer yet) | real `EgressProxy` / `ToolGate` / `KeystoreReleaser` / `ArtifactCollector` impls reading the parsed bundle | plan 60 Phase 3 (proxies) + mvm-hostd lift |
 | `secrets` | empty | mvmd-resolved `SecretGrant` set | mvmd + plan 63 W3 keyring |
 | `artifact_policy` | `{ capture_paths: [], retention_days: 0 }` | per-policy bundle | W5 |

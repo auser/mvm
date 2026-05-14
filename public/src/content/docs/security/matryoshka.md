@@ -41,6 +41,20 @@ mvm makes seven CI-enforced security claims. Each one is backed by a continuous-
 
 L1 (host + hypervisor) doesn't carry its own claim — the host is **trusted** by definition. If your host is compromised, every layer falls. Locking down the host (firewall, package hygiene, full-disk encryption) is your responsibility.
 
+## Intent-bound admission profiles
+
+Every workload also goes through a signed admission step before boot. `mvmctl up` synthesizes an `ExecutionPlan`, signs it with the host key, checks its validity window and replay nonce, then emits a chain-signed audit entry.
+
+The plan now carries an `admission_profile`: a compact record of the workload's declared intent and the controls selected for that intent:
+
+- intent, for example `vm:boot`, `code:execute`, or `agent:web-research`
+- seccomp tier selected for the run
+- network, filesystem, egress, and tool policy refs
+- secret-release posture (`none`, plan-bound, or attestation-bound)
+- audit taxonomy and required labels
+
+This does **not** add a second seccomp implementation or new execution capability inside the sandbox. Runtime syscall filtering still comes from `mvm-security` and the guest `seccomp.json` manifest. The admission profile records the selected tier in the signed plan so the audit chain can prove which security posture the workload was admitted under.
+
 ## Per-backend tier matrix
 
 mvm runs on multiple backends. Not all backends carry all seven claims. The tier you actually get depends on which backend mvm picks for your run.

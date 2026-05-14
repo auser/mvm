@@ -98,6 +98,8 @@ struct AdmitPlanForBootParams<'a> {
     pub rootfs_path: &'a std::path::Path,
     pub cpus: u32,
     pub mem_mib: u64,
+    pub seccomp_tier: mvm_plan::PlanSeccompTier,
+    pub secret_release: mvm_plan::SecretReleasePolicy,
     pub no_supervisor: bool,
     pub ledger: &'a InMemoryNonceLedger,
     /// Override for the host-signer keys directory. Production callers
@@ -126,6 +128,24 @@ struct AdmitPlanForBootParams<'a> {
     /// the on-disk sealed volume before launch — ADR-047 claim 9.
     /// `None` preserves the claim-8 baseline (no deps gate).
     pub deps_volume: Option<mvm_plan::DepsVolumeBinding>,
+}
+
+fn plan_seccomp_tier(
+    tier: mvm_security::seccomp::SeccompTier,
+) -> Result<mvm_plan::PlanSeccompTier> {
+    tier.to_string()
+        .parse()
+        .context("converting runtime seccomp tier into plan seccomp tier")
+}
+
+fn secret_release_policy(
+    bindings: &[mvm_core::secret_binding::SecretBinding],
+) -> mvm_plan::SecretReleasePolicy {
+    if bindings.is_empty() {
+        mvm_plan::SecretReleasePolicy::None
+    } else {
+        mvm_plan::SecretReleasePolicy::PlanBound
+    }
 }
 
 /// Bundle of artifacts produced by a successful admission: the
@@ -230,6 +250,14 @@ fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<Admission
         image_name: p.vm_name,
         image_sha256: &sha,
         image_cosign_bundle: None,
+        intent: None,
+        seccomp_tier: p.seccomp_tier,
+        network_policy_ref: None,
+        fs_policy_ref: None,
+        egress_policy_ref: None,
+        tool_policy_ref: None,
+        secret_release: p.secret_release,
+        audit_event_prefix: None,
         cpus: p.cpus,
         mem_mib: p.mem_mib,
         disk_mib: 0,
@@ -760,6 +788,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         .map(|s| s.parse())
         .collect::<Result<Vec<_>>>()
         .context("Invalid --secret value")?;
+    let plan_seccomp_tier = plan_seccomp_tier(seccomp_tier)?;
+    let plan_secret_release = secret_release_policy(&secret_bindings);
 
     // Sandbox metadata (W1 of the filesystem-volumes plan). Tag charset/length
     // validation happens in the security crate so audit-event emission
@@ -838,6 +868,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         network_policy,
         network_name: &args.network,
         seccomp_tier,
+        plan_seccomp_tier,
+        plan_secret_release,
         secret_bindings,
         sandbox_tags,
         sandbox_ttl,
@@ -919,6 +951,8 @@ pub(in crate::commands) struct RunParams<'a> {
     pub(super) network_policy: mvm_core::network_policy::NetworkPolicy,
     pub(super) network_name: &'a str,
     pub(super) seccomp_tier: mvm_security::seccomp::SeccompTier,
+    pub(super) plan_seccomp_tier: mvm_plan::PlanSeccompTier,
+    pub(super) plan_secret_release: mvm_plan::SecretReleasePolicy,
     pub(super) secret_bindings: Vec<mvm_core::secret_binding::SecretBinding>,
     /// Validated sandbox tags from `--tag k=v`.
     pub(super) sandbox_tags: std::collections::BTreeMap<String, String>,
@@ -970,6 +1004,8 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         network_policy,
         network_name,
         seccomp_tier,
+        plan_seccomp_tier,
+        plan_secret_release,
         secret_bindings,
         sandbox_tags,
         sandbox_ttl,
@@ -1115,6 +1151,8 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             rootfs_path: std::path::Path::new(&rootfs),
             cpus: direct_cpus,
             mem_mib: direct_mem as u64,
+            seccomp_tier: plan_seccomp_tier,
+            secret_release: plan_secret_release,
             no_supervisor,
             ledger: &admission_ledger,
             keys_dir: None,
@@ -1461,6 +1499,8 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         rootfs_path: std::path::Path::new(&rootfs_path),
         cpus: final_cpus,
         mem_mib: final_memory as u64,
+        seccomp_tier: plan_seccomp_tier,
+        secret_release: plan_secret_release,
         no_supervisor,
         ledger: &admission_ledger,
         keys_dir: None,
@@ -1788,6 +1828,8 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 rootfs_path: std::path::Path::new(&result.rootfs_path),
                 cpus: final_cpus,
                 mem_mib: final_memory as u64,
+                seccomp_tier: plan_seccomp_tier,
+                secret_release: plan_secret_release,
                 no_supervisor,
                 ledger: &admission_ledger,
                 keys_dir: None,
@@ -2056,6 +2098,8 @@ mod admit_plan_tests {
             rootfs_path: &rootfs,
             cpus: 2,
             mem_mib: 512,
+            seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
+            secret_release: mvm_plan::SecretReleasePolicy::None,
             no_supervisor: true,
             ledger: &ledger,
             keys_dir: None, // not read — short-circuit returns first
@@ -2082,6 +2126,8 @@ mod admit_plan_tests {
             rootfs_path: &rootfs,
             cpus: 2,
             mem_mib: 512,
+            seccomp_tier: mvm_plan::PlanSeccompTier::Network,
+            secret_release: mvm_plan::SecretReleasePolicy::PlanBound,
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
@@ -2097,6 +2143,14 @@ mod admit_plan_tests {
         assert_eq!(ctx.admitted.plan.tenant.0, "local");
         assert_eq!(ctx.admitted.plan.resources.cpus, 2);
         assert_eq!(ctx.admitted.plan.resources.mem_mib, 512);
+        assert_eq!(
+            ctx.admitted.plan.admission_profile.seccomp_tier,
+            mvm_plan::PlanSeccompTier::Network
+        );
+        assert_eq!(
+            ctx.admitted.plan.admission_profile.secret_release,
+            mvm_plan::SecretReleasePolicy::PlanBound
+        );
 
         // The `plan.admitted` audit line must be present in the
         // tenant's chain file already (admit_plan_for_boot emits
@@ -2121,6 +2175,8 @@ mod admit_plan_tests {
             rootfs_path: std::path::Path::new("/nonexistent/rootfs.ext4"),
             cpus: 1,
             mem_mib: 128,
+            seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
+            secret_release: mvm_plan::SecretReleasePolicy::None,
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
@@ -2154,6 +2210,8 @@ mod admit_plan_tests {
             rootfs_path: &rootfs,
             cpus: 1,
             mem_mib: 128,
+            seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
+            secret_release: mvm_plan::SecretReleasePolicy::None,
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
@@ -2171,6 +2229,8 @@ mod admit_plan_tests {
             rootfs_path: &rootfs,
             cpus: 1,
             mem_mib: 128,
+            seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
+            secret_release: mvm_plan::SecretReleasePolicy::None,
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
@@ -2230,6 +2290,8 @@ mod admit_plan_tests {
             rootfs_path: &rootfs,
             cpus: 1,
             mem_mib: 128,
+            seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
+            secret_release: mvm_plan::SecretReleasePolicy::None,
             no_supervisor: false,
             ledger: &ledger,
             keys_dir: Some(keys_dir.path()),
@@ -2305,6 +2367,14 @@ bundle_version = 1
                 image_name: "vm-live",
                 image_sha256: &sha,
                 image_cosign_bundle: None,
+                intent: None,
+                seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
+                network_policy_ref: None,
+                fs_policy_ref: None,
+                egress_policy_ref: None,
+                tool_policy_ref: None,
+                secret_release: mvm_plan::SecretReleasePolicy::None,
+                audit_event_prefix: None,
                 cpus: 1,
                 mem_mib: 128,
                 disk_mib: 0,
@@ -2363,6 +2433,14 @@ bundle_version = 1
                 image_name: "vm-nope",
                 image_sha256: &sha,
                 image_cosign_bundle: None,
+                intent: None,
+                seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
+                network_policy_ref: None,
+                fs_policy_ref: None,
+                egress_policy_ref: None,
+                tool_policy_ref: None,
+                secret_release: mvm_plan::SecretReleasePolicy::None,
+                audit_event_prefix: None,
                 cpus: 1,
                 mem_mib: 128,
                 disk_mib: 0,
@@ -2445,6 +2523,14 @@ disabled_inspectors = ["ssrf_guarrd"]
                 image_name: "vm-typo",
                 image_sha256: &sha,
                 image_cosign_bundle: None,
+                intent: None,
+                seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
+                network_policy_ref: None,
+                fs_policy_ref: None,
+                egress_policy_ref: None,
+                tool_policy_ref: None,
+                secret_release: mvm_plan::SecretReleasePolicy::None,
+                audit_event_prefix: None,
                 cpus: 1,
                 mem_mib: 128,
                 disk_mib: 0,
@@ -2533,6 +2619,14 @@ port_hi  = 443
                 image_name: "vm-bad",
                 image_sha256: &sha,
                 image_cosign_bundle: None,
+                intent: None,
+                seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
+                network_policy_ref: None,
+                fs_policy_ref: None,
+                egress_policy_ref: None,
+                tool_policy_ref: None,
+                secret_release: mvm_plan::SecretReleasePolicy::None,
+                audit_event_prefix: None,
                 cpus: 1,
                 mem_mib: 128,
                 disk_mib: 0,

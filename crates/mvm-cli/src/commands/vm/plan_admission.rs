@@ -221,6 +221,7 @@ pub fn admit_for_run(
 mod tests {
     use super::*;
     use chrono::TimeZone;
+    use mvm_plan::{PlanSeccompTier, SecretReleasePolicy};
 
     const FIXTURE_SHA: &str = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
 
@@ -232,6 +233,14 @@ mod tests {
             image_name: "img",
             image_sha256: FIXTURE_SHA,
             image_cosign_bundle: None,
+            intent: None,
+            seccomp_tier: PlanSeccompTier::Standard,
+            network_policy_ref: None,
+            fs_policy_ref: None,
+            egress_policy_ref: None,
+            tool_policy_ref: None,
+            secret_release: SecretReleasePolicy::None,
+            audit_event_prefix: None,
             cpus: 1,
             mem_mib: 256,
             disk_mib: 0,

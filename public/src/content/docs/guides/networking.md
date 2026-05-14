@@ -96,6 +96,8 @@ mvmctl up --flake . --seccomp minimal     # Signals, pipes, timers only
 
 The seccomp manifest is written to the config drive as `seccomp.json` for the guest init to apply via `prctl(PR_SET_SECCOMP)`. Tiers are cumulative — each includes all syscalls from lower tiers.
 
+The same tier is also copied into the signed `ExecutionPlan` admission profile. That profile is audit/provenance data: it binds the declared workload intent to the chosen seccomp tier, policy refs, secret-release posture, and audit labels. The actual syscall enforcement remains the guest seccomp manifest generated from `mvm-security`; the plan-side tier exists so `mvmctl audit verify` can prove which posture was admitted.
+
 | Tier | Syscalls | Use Case |
 |------|----------|----------|
 | `essential` | ~40 | Process bootstrap only (linker, glibc init) |

@@ -564,9 +564,9 @@ fn load_tenant_workload(
 mod tests {
     use super::*;
     use mvm_plan::{
-        ArtifactPolicy, AttestationMode, AttestationRequirement, KeyRotationSpec, Nonce, PlanId,
-        PostRunLifecycle, Resources, RuntimeProfileRef, SCHEMA_VERSION, SignedImageRef, TenantId,
-        TimeoutSpec, WorkloadId,
+        AdmissionProfile, ArtifactPolicy, AttestationMode, AttestationRequirement, KeyRotationSpec,
+        Nonce, PlanId, PlanSeccompTier, PostRunLifecycle, Resources, RuntimeProfileRef,
+        SCHEMA_VERSION, SignedImageRef, TenantId, TimeoutSpec, WorkloadId,
     };
     use std::collections::BTreeMap;
 
@@ -593,6 +593,10 @@ mod tests {
                     exec_secs: 0,
                 },
             },
+            admission_profile: AdmissionProfile::local_default(
+                "vm:boot",
+                PlanSeccompTier::Standard,
+            ),
             network_policy: PolicyRef(LOCAL_DEFAULT.to_string()),
             fs_policy: FsPolicyRef(LOCAL_DEFAULT.to_string()),
             secrets: Vec::new(),

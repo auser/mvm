@@ -12,9 +12,9 @@ use serde::{Deserialize, Serialize};
 
 use crate::bundle::PlanArtifact;
 use crate::types::{
-    ArtifactPolicy, AttestationRequirement, AuditLabels, DepsVolumeBinding, FsPolicyRef,
-    KeyRotationSpec, Nonce, PlanId, PolicyRef, PostRunLifecycle, ReleasePin, Resources,
-    RuntimeProfileRef, SecretBinding, SignedImageRef, TenantId, WorkloadId,
+    AdmissionProfile, ArtifactPolicy, AttestationRequirement, AuditLabels, DepsVolumeBinding,
+    FsPolicyRef, KeyRotationSpec, Nonce, PlanId, PolicyRef, PostRunLifecycle, ReleasePin,
+    Resources, RuntimeProfileRef, SecretBinding, SignedImageRef, TenantId, WorkloadId,
 };
 
 /// Wire-format version. Bump when fields change in a way older
@@ -36,7 +36,13 @@ use crate::types::{
 /// fetch). Older verifiers will reject v3 plans with
 /// `UnsupportedSchema` because they don't know how to re-verify
 /// the binding.
-pub const SCHEMA_VERSION: u32 = 3;
+///
+/// Bumped 3 → 4 with the addition of intent-bound
+/// `admission_profile`: older verifiers do not know how to check
+/// that seccomp, network, tool, secret-release, and audit controls
+/// were resolved under one profile, so they must reject rather than
+/// silently ignore the binding.
+pub const SCHEMA_VERSION: u32 = 4;
 
 /// Typed contract for one workload's execution.
 ///
@@ -72,6 +78,12 @@ pub struct ExecutionPlan {
     pub image: SignedImageRef,
 
     pub resources: Resources,
+
+    /// Intent-bound profile resolved before admission. This binds the
+    /// workload purpose to the concrete seccomp tier, policy refs,
+    /// secret-release posture, and audit taxonomy the runtime must
+    /// enforce for this boot.
+    pub admission_profile: AdmissionProfile,
 
     /// Network policy reference. Wave 2 wires this to
     /// `mvm-policy::EgressPolicy` (L7 + PII rules) via the
