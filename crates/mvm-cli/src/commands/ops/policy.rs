@@ -8,10 +8,17 @@
 //!   the canonical wire shape. Useful for debugging "did my edit
 //!   take?" and for piping into other tools.
 //! - **`mvmctl policy verify <tenant>:<workload>`** — load + parse +
-//!   schema-version check + translate every `[[network.l4]]` row
-//!   into a `LiveL4Gate`. Catches typos and unparseable CIDRs *at
-//!   admission time on the operator's host* rather than at boot
-//!   inside the supervisor. Exits non-zero on any error.
+//!   schema-version check + run the same policy validators used at
+//!   supervisor admission time. Catches typos and unparseable CIDRs
+//!   *on the operator's host* rather than at boot inside the
+//!   supervisor. Exits non-zero on any error.
+//! - **`mvmctl policy explain <tenant>:<workload> [--json]`** —
+//!   validate and summarize the admission decision. JSON output is
+//!   deliberately redacted: it includes counts and policy posture, not
+//!   raw artifact paths or audit destination URLs.
+//! - **`mvmctl policy lint <tenant>:<workload> [--json]`** —
+//!   validate and flag risky-but-admissible posture. Findings are
+//!   redacted for the same reason as `explain`.
 //! - **`mvmctl policy update`** — stubbed; the production update
 //!   flow requires an mvmd-signed plan (plan 60 Phase 8 territory).
 //!   Errors with a clear pointer; no on-disk side effects.
@@ -28,6 +35,7 @@ use std::path::PathBuf;
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 use mvm_policy::toml_loader::{self, LoadError};
+use serde::Serialize;
 
 use mvm_core::user_config::MvmConfig;
 
@@ -52,10 +60,26 @@ pub(in crate::commands) enum PolicyAction {
         json: bool,
     },
     /// Validate a tenant policy bundle: parse + schema-version
-    /// check + translate L4 rules. Exits non-zero on any failure.
+    /// check + admission validators. Exits non-zero on any failure.
     Verify {
         /// `<tenant>:<workload>` identifier.
         bundle: String,
+    },
+    /// Validate and explain the effective admission posture.
+    Explain {
+        /// `<tenant>:<workload>` identifier.
+        bundle: String,
+        /// Emit a redacted machine-readable explanation.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Validate and flag risky-but-admissible policy posture.
+    Lint {
+        /// `<tenant>:<workload>` identifier.
+        bundle: String,
+        /// Emit a redacted machine-readable lint report.
+        #[arg(long)]
+        json: bool,
     },
     /// Update is stubbed in v0 — production updates require an
     /// mvmd-signed plan. See plan 60 Phase 8.
@@ -74,6 +98,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     match args.action {
         PolicyAction::Show { bundle, json } => cmd_show(&base_dir, &bundle, json),
         PolicyAction::Verify { bundle } => cmd_verify(&base_dir, &bundle),
+        PolicyAction::Explain { bundle, json } => cmd_explain(&base_dir, &bundle, json),
+        PolicyAction::Lint { bundle, json } => cmd_lint(&base_dir, &bundle, json),
         PolicyAction::Update { bundle, from } => cmd_update(&bundle, from.as_deref()),
     }
 }
@@ -118,21 +144,320 @@ fn cmd_show(base_dir: &std::path::Path, bundle_ref: &str, as_json: bool) -> Resu
 fn cmd_verify(base_dir: &std::path::Path, bundle_ref: &str) -> Result<()> {
     let (tenant, workload) = parse_bundle_ref(bundle_ref)?;
     let bundle = load_bundle(base_dir, bundle_ref, tenant, workload)?;
-
-    // L4 translate check — catches bad CIDRs / unknown protos /
-    // inverted port ranges at the operator's host before the
-    // supervisor sees them at boot.
-    if !bundle.network.l4.is_empty() {
-        mvm_supervisor::LiveL4Gate::from_specs(&bundle.network.l4)
-            .map_err(|e| anyhow::anyhow!("[[network.l4]] translation failed: {e}"))?;
-    }
+    validate_bundle(&bundle)?;
 
     eprintln!(
         "OK — bundle {bundle_ref} (schema_version={}, bundle_id={}, \
-         bundle_version={}) parses and translates cleanly",
+         bundle_version={}) parses and validates cleanly",
         bundle.schema_version, bundle.bundle_id.0, bundle.bundle_version
     );
     Ok(())
+}
+
+fn cmd_explain(base_dir: &std::path::Path, bundle_ref: &str, as_json: bool) -> Result<()> {
+    let (tenant, workload) = parse_bundle_ref(bundle_ref)?;
+    let bundle = load_bundle(base_dir, bundle_ref, tenant, workload)?;
+    let explain = build_explain(bundle_ref, tenant, workload, &bundle)?;
+
+    if as_json {
+        let json =
+            serde_json::to_string_pretty(&explain).context("serializing policy explanation")?;
+        println!("{json}");
+    } else {
+        render_explain_human(&explain);
+    }
+    Ok(())
+}
+
+fn cmd_lint(base_dir: &std::path::Path, bundle_ref: &str, as_json: bool) -> Result<()> {
+    let (tenant, workload) = parse_bundle_ref(bundle_ref)?;
+    let bundle = load_bundle(base_dir, bundle_ref, tenant, workload)?;
+    let report = build_lint_report(bundle_ref, tenant, workload, &bundle)?;
+
+    if as_json {
+        let json =
+            serde_json::to_string_pretty(&report).context("serializing policy lint report")?;
+        println!("{json}");
+    } else {
+        render_lint_human(&report);
+    }
+
+    if report.issues.is_empty() {
+        Ok(())
+    } else {
+        anyhow::bail!(
+            "policy lint found {} issue(s) for {bundle_ref}",
+            report.issues.len()
+        )
+    }
+}
+
+fn validate_bundle(bundle: &mvm_policy::PolicyBundle) -> Result<usize> {
+    mvm_supervisor::LiveL4Gate::from_specs(&bundle.network.l4)
+        .map_err(|e| anyhow::anyhow!("[[network.l4]] translation failed: {e}"))?;
+    mvm_supervisor::validate_egress_policy_inspector_names(&bundle.egress)
+        .map_err(|e| anyhow::anyhow!("[egress].disabled_inspectors validation failed: {e}"))?;
+    mvm_supervisor::validate_audit_policy_stream_destinations(&bundle.audit)
+        .map_err(|e| anyhow::anyhow!("[audit].stream_destinations validation failed: {e}"))?;
+    let chain = mvm_supervisor::build_inspector_chain_with_pii(&bundle.egress, &bundle.pii, None)
+        .map_err(|e| anyhow::anyhow!("[pii] validation failed: {e}"))?;
+    Ok(chain.len())
+}
+
+fn build_explain(
+    bundle_ref: &str,
+    tenant: &str,
+    workload: &str,
+    bundle: &mvm_policy::PolicyBundle,
+) -> Result<PolicyExplain> {
+    let inspector_chain_len = validate_bundle(bundle)?;
+    Ok(PolicyExplain {
+        schema_version: 1,
+        bundle_ref: bundle_ref.to_string(),
+        tenant: tenant.to_string(),
+        workload: workload.to_string(),
+        bundle_id: bundle.bundle_id.0.clone(),
+        bundle_version: bundle.bundle_version,
+        validation: ExplainValidation {
+            status: "ok",
+            checks: vec![
+                "schema_version",
+                "network_l4",
+                "egress_inspectors",
+                "pii_policy",
+                "audit_destinations",
+            ],
+        },
+        network: ExplainNetwork {
+            default_action: "deny",
+            preset: bundle.network.preset.clone(),
+            l4_rule_count: bundle.network.l4.len(),
+            l4_rules: bundle.network.l4.iter().map(ExplainL4Rule::from).collect(),
+        },
+        egress: ExplainEgress {
+            default_action: "deny",
+            mode: bundle.egress.mode.clone(),
+            allow_plain_http: bundle.egress.allow_plain_http,
+            body_cap_bytes: effective_body_cap(&bundle.egress),
+            allow_list_count: bundle.egress.allow_list.len(),
+            allow_list_ports: sorted_ports(&bundle.egress.allow_list),
+            wildcard_port_count: bundle
+                .egress
+                .allow_list
+                .iter()
+                .filter(|(_, port)| *port == 0)
+                .count(),
+            disabled_inspectors: bundle.egress.disabled_inspectors.clone(),
+            enabled_inspectors: enabled_inspector_names(&bundle.egress, &bundle.pii),
+            inspector_chain_len,
+            pii_mode: bundle
+                .pii
+                .mode
+                .clone()
+                .unwrap_or_else(|| "detect".to_string()),
+            pii_category_count: bundle.pii.categories.len(),
+        },
+        tool: ExplainTool {
+            default_action: "deny",
+            allowed_count: bundle.tool.allowed.len(),
+            allowed: bundle.tool.allowed.clone(),
+        },
+        artifact: ExplainArtifact {
+            capture_path_count: bundle.artifact.capture_paths.len(),
+            retention_days: bundle.artifact.retention_days,
+        },
+        keys: ExplainKeys {
+            rotation_interval_days: bundle.keys.rotation_interval_days,
+        },
+        audit: ExplainAudit {
+            chain_signing: bundle.audit.chain_signing,
+            stream_destination_count: bundle.audit.stream_destinations.len(),
+            stream_destination_schemes: audit_destination_schemes(&bundle.audit),
+        },
+    })
+}
+
+fn build_lint_report(
+    bundle_ref: &str,
+    tenant: &str,
+    workload: &str,
+    bundle: &mvm_policy::PolicyBundle,
+) -> Result<PolicyLintReport> {
+    validate_bundle(bundle)?;
+    let mut issues = Vec::new();
+    lint_egress(bundle, &mut issues);
+    lint_pii(bundle, &mut issues);
+    lint_audit(bundle, &mut issues);
+    lint_keys(bundle, &mut issues);
+    lint_network(bundle, &mut issues);
+    lint_artifact(bundle, &mut issues);
+
+    let status = if issues.is_empty() { "ok" } else { "warn" };
+    Ok(PolicyLintReport {
+        schema_version: 1,
+        bundle_ref: bundle_ref.to_string(),
+        tenant: tenant.to_string(),
+        workload: workload.to_string(),
+        bundle_id: bundle.bundle_id.0.clone(),
+        bundle_version: bundle.bundle_version,
+        status,
+        issue_count: issues.len(),
+        issues,
+    })
+}
+
+fn lint_egress(bundle: &mvm_policy::PolicyBundle, issues: &mut Vec<PolicyLintIssue>) {
+    if bundle.egress.allow_plain_http {
+        issues.push(PolicyLintIssue::warning(
+            "POLICY_LINT_PLAIN_HTTP",
+            "egress",
+            "plain HTTP egress is enabled",
+        ));
+    }
+    if bundle.egress.mode.as_deref() == Some("open") {
+        issues.push(PolicyLintIssue::warning(
+            "POLICY_LINT_L7_PROXY_DISABLED",
+            "egress",
+            "egress mode is open, bypassing the L7 proxy",
+        ));
+    }
+    for name in &bundle.egress.disabled_inspectors {
+        issues.push(PolicyLintIssue::warning(
+            "POLICY_LINT_EGRESS_INSPECTOR_DISABLED",
+            "egress.disabled_inspectors",
+            format!("security inspector {name:?} is disabled"),
+        ));
+    }
+    let wildcard_count = bundle
+        .egress
+        .allow_list
+        .iter()
+        .filter(|(_, port)| *port == 0)
+        .count();
+    if wildcard_count > 0 {
+        issues.push(PolicyLintIssue::warning(
+            "POLICY_LINT_EGRESS_WILDCARD_PORT",
+            "egress.allow_list",
+            format!("{wildcard_count} egress allow-list entries use a wildcard port"),
+        ));
+    }
+}
+
+fn lint_pii(bundle: &mvm_policy::PolicyBundle, issues: &mut Vec<PolicyLintIssue>) {
+    if bundle.pii.mode.as_deref() == Some("disabled")
+        || bundle
+            .egress
+            .disabled_inspectors
+            .iter()
+            .any(|name| name == "pii_redactor")
+    {
+        issues.push(PolicyLintIssue::warning(
+            "POLICY_LINT_PII_DISABLED",
+            "pii",
+            "PII inspection is disabled",
+        ));
+    }
+}
+
+fn lint_audit(bundle: &mvm_policy::PolicyBundle, issues: &mut Vec<PolicyLintIssue>) {
+    if !bundle.audit.chain_signing {
+        issues.push(PolicyLintIssue::warning(
+            "POLICY_LINT_AUDIT_CHAIN_UNSIGNED",
+            "audit.chain_signing",
+            "audit chain signing is disabled",
+        ));
+    }
+    let plaintext_count = bundle
+        .audit
+        .stream_destinations
+        .iter()
+        .filter(|destination| destination.starts_with("http://"))
+        .count();
+    if plaintext_count > 0 {
+        issues.push(PolicyLintIssue::warning(
+            "POLICY_LINT_AUDIT_PLAINTEXT_DESTINATION",
+            "audit.stream_destinations",
+            format!("{plaintext_count} audit stream destination(s) use plaintext HTTP"),
+        ));
+    }
+}
+
+fn lint_keys(bundle: &mvm_policy::PolicyBundle, issues: &mut Vec<PolicyLintIssue>) {
+    match bundle.keys.rotation_interval_days {
+        0 => issues.push(PolicyLintIssue::warning(
+            "POLICY_LINT_KEY_ROTATION_DISABLED",
+            "keys.rotation_interval_days",
+            "key rotation is disabled",
+        )),
+        days if days > 90 => issues.push(PolicyLintIssue::warning(
+            "POLICY_LINT_KEY_ROTATION_LONG",
+            "keys.rotation_interval_days",
+            format!("key rotation interval is {days} days"),
+        )),
+        _ => {}
+    }
+}
+
+fn lint_network(bundle: &mvm_policy::PolicyBundle, issues: &mut Vec<PolicyLintIssue>) {
+    for (index, rule) in bundle.network.l4.iter().enumerate() {
+        if rule.port_lo == 0 && rule.port_hi == 0 {
+            issues.push(PolicyLintIssue::warning(
+                "POLICY_LINT_L4_WILDCARD_PORT",
+                "network.l4",
+                format!("L4 rule {index} allows every destination port"),
+            ));
+        }
+        if is_broad_cidr(&rule.dst_cidr) {
+            issues.push(PolicyLintIssue::warning(
+                "POLICY_LINT_L4_BROAD_CIDR",
+                "network.l4",
+                format!("L4 rule {index} uses a broad destination CIDR"),
+            ));
+        }
+    }
+}
+
+fn lint_artifact(bundle: &mvm_policy::PolicyBundle, issues: &mut Vec<PolicyLintIssue>) {
+    let sensitive_count = bundle
+        .artifact
+        .capture_paths
+        .iter()
+        .filter(|path| looks_sensitive_capture_path(path))
+        .count();
+    if sensitive_count > 0 {
+        issues.push(PolicyLintIssue::warning(
+            "POLICY_LINT_ARTIFACT_SENSITIVE_CAPTURE",
+            "artifact.capture_paths",
+            format!("{sensitive_count} artifact capture path(s) look sensitive"),
+        ));
+    }
+}
+
+fn is_broad_cidr(value: &str) -> bool {
+    let Some((addr, prefix)) = value.rsplit_once('/') else {
+        return false;
+    };
+    let Ok(prefix) = prefix.parse::<u8>() else {
+        return false;
+    };
+    if addr.contains(':') {
+        prefix <= 32
+    } else {
+        prefix <= 8
+    }
+}
+
+fn looks_sensitive_capture_path(path: &str) -> bool {
+    let lower = path.to_ascii_lowercase();
+    lower == "/etc"
+        || lower.starts_with("/etc/")
+        || lower.contains("/.ssh")
+        || lower.contains("/.aws")
+        || lower.contains("/.config")
+        || lower.contains("secret")
+        || lower.contains("token")
+        || lower.contains("credential")
+        || lower.contains("private_key")
 }
 
 fn cmd_update(bundle_ref: &str, _from: Option<&std::path::Path>) -> Result<()> {
@@ -253,6 +578,263 @@ fn render_human(bundle: &mvm_policy::PolicyBundle, tenant: &str, workload: &str)
     );
 }
 
+fn render_explain_human(explain: &PolicyExplain) {
+    println!("policy explain  {}", explain.bundle_ref);
+    println!("  validation = {}", explain.validation.status);
+    println!(
+        "  bundle     = {}@{}",
+        explain.bundle_id, explain.bundle_version
+    );
+    println!("  [network]");
+    println!("    default_action = {}", explain.network.default_action);
+    println!("    l4_rule_count  = {}", explain.network.l4_rule_count);
+    println!("  [egress]");
+    println!(
+        "    default_action      = {}",
+        explain.egress.default_action
+    );
+    println!(
+        "    allow_list_count    = {}",
+        explain.egress.allow_list_count
+    );
+    println!(
+        "    allow_plain_http    = {}",
+        explain.egress.allow_plain_http
+    );
+    println!(
+        "    enabled_inspectors  = {:?}",
+        explain.egress.enabled_inspectors
+    );
+    println!("    pii_mode            = {}", explain.egress.pii_mode);
+    println!("  [tool]");
+    println!("    allowed_count = {}", explain.tool.allowed_count);
+    println!("  [artifact]");
+    println!(
+        "    capture_path_count = {}",
+        explain.artifact.capture_path_count
+    );
+    println!(
+        "    retention_days     = {}",
+        explain.artifact.retention_days
+    );
+    println!("  [keys]");
+    println!(
+        "    rotation_interval_days = {}",
+        explain.keys.rotation_interval_days
+    );
+    println!("  [audit]");
+    println!(
+        "    chain_signing            = {}",
+        explain.audit.chain_signing
+    );
+    println!(
+        "    stream_destination_count = {}",
+        explain.audit.stream_destination_count
+    );
+    println!(
+        "    stream_destination_schemes = {:?}",
+        explain.audit.stream_destination_schemes
+    );
+}
+
+fn render_lint_human(report: &PolicyLintReport) {
+    println!("policy lint  {}", report.bundle_ref);
+    println!("  status = {}", report.status);
+    if report.issues.is_empty() {
+        println!("  issues = []");
+        return;
+    }
+
+    println!("  issues:");
+    for issue in &report.issues {
+        println!(
+            "    [{}] {} {} - {}",
+            issue.severity, issue.code, issue.section, issue.message
+        );
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyLintReport {
+    schema_version: u32,
+    bundle_ref: String,
+    tenant: String,
+    workload: String,
+    bundle_id: String,
+    bundle_version: u32,
+    status: &'static str,
+    issue_count: usize,
+    issues: Vec<PolicyLintIssue>,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyLintIssue {
+    severity: &'static str,
+    code: &'static str,
+    section: &'static str,
+    message: String,
+}
+
+impl PolicyLintIssue {
+    fn warning(code: &'static str, section: &'static str, message: impl Into<String>) -> Self {
+        Self {
+            severity: "warning",
+            code,
+            section,
+            message: message.into(),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyExplain {
+    schema_version: u32,
+    bundle_ref: String,
+    tenant: String,
+    workload: String,
+    bundle_id: String,
+    bundle_version: u32,
+    validation: ExplainValidation,
+    network: ExplainNetwork,
+    egress: ExplainEgress,
+    tool: ExplainTool,
+    artifact: ExplainArtifact,
+    keys: ExplainKeys,
+    audit: ExplainAudit,
+}
+
+#[derive(Debug, Serialize)]
+struct ExplainValidation {
+    status: &'static str,
+    checks: Vec<&'static str>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExplainNetwork {
+    default_action: &'static str,
+    preset: Option<String>,
+    l4_rule_count: usize,
+    l4_rules: Vec<ExplainL4Rule>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExplainL4Rule {
+    proto: String,
+    dst_cidr: String,
+    port: ExplainPortRange,
+}
+
+impl From<&mvm_policy::L4RuleSpec> for ExplainL4Rule {
+    fn from(rule: &mvm_policy::L4RuleSpec) -> Self {
+        Self {
+            proto: rule.proto.clone(),
+            dst_cidr: rule.dst_cidr.clone(),
+            port: ExplainPortRange {
+                lo: rule.port_lo,
+                hi: rule.port_hi,
+                wildcard: rule.port_lo == 0 && rule.port_hi == 0,
+            },
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct ExplainPortRange {
+    lo: u16,
+    hi: u16,
+    wildcard: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct ExplainEgress {
+    default_action: &'static str,
+    mode: Option<String>,
+    allow_plain_http: bool,
+    body_cap_bytes: u64,
+    allow_list_count: usize,
+    allow_list_ports: Vec<u16>,
+    wildcard_port_count: usize,
+    disabled_inspectors: Vec<String>,
+    enabled_inspectors: Vec<&'static str>,
+    inspector_chain_len: usize,
+    pii_mode: String,
+    pii_category_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct ExplainTool {
+    default_action: &'static str,
+    allowed_count: usize,
+    allowed: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct ExplainArtifact {
+    capture_path_count: usize,
+    retention_days: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct ExplainKeys {
+    rotation_interval_days: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct ExplainAudit {
+    chain_signing: bool,
+    stream_destination_count: usize,
+    stream_destination_schemes: Vec<&'static str>,
+}
+
+fn effective_body_cap(policy: &mvm_policy::EgressPolicy) -> u64 {
+    if policy.body_cap_bytes == 0 {
+        mvm_policy::DEFAULT_BODY_CAP_BYTES
+    } else {
+        policy.body_cap_bytes
+    }
+}
+
+fn sorted_ports(allow_list: &[(String, u16)]) -> Vec<u16> {
+    let mut ports: Vec<u16> = allow_list.iter().map(|(_, port)| *port).collect();
+    ports.sort_unstable();
+    ports.dedup();
+    ports
+}
+
+fn enabled_inspector_names(
+    egress: &mvm_policy::EgressPolicy,
+    pii: &mvm_policy::PiiPolicy,
+) -> Vec<&'static str> {
+    mvm_supervisor::KNOWN_INSPECTOR_NAMES
+        .iter()
+        .copied()
+        .filter(|name| {
+            !egress
+                .disabled_inspectors
+                .iter()
+                .any(|disabled| disabled == name)
+        })
+        .filter(|name| *name != "pii_redactor" || pii.mode.as_deref() != Some("disabled"))
+        .collect()
+}
+
+fn audit_destination_schemes(audit: &mvm_policy::AuditPolicy) -> Vec<&'static str> {
+    let mut schemes: Vec<&'static str> = audit
+        .stream_destinations
+        .iter()
+        .filter_map(|destination| {
+            mvm_supervisor::KNOWN_AUDIT_STREAM_SCHEMES
+                .iter()
+                .copied()
+                .find(|scheme| destination.starts_with(scheme))
+        })
+        .map(|scheme| scheme.trim_end_matches("://"))
+        .collect();
+    schemes.sort_unstable();
+    schemes.dedup();
+    schemes
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -278,6 +860,118 @@ allowed = ["web_search"]
 [artifact]
 [keys]
 [audit]
+"#
+    }
+
+    fn sensitive_bundle_toml() -> &'static str {
+        r#"
+schema_version = 1
+bundle_id      = "acme/web-worker"
+bundle_version = 7
+
+[network]
+[[network.l4]]
+proto    = "tcp"
+dst_cidr = "10.0.0.0/24"
+port_lo  = 443
+port_hi  = 443
+
+[egress]
+allow_list = [["private-api.example.internal", 443], ["metrics.example.internal", 0]]
+allow_plain_http = false
+disabled_inspectors = ["injection_guard"]
+
+[pii]
+mode = "redact"
+categories = ["email"]
+
+[tool]
+allowed = ["web_search", "fetch_url"]
+
+[artifact]
+capture_paths = ["/home/user/.ssh", "/var/lib/app/customer-export.json"]
+retention_days = 3
+
+[keys]
+rotation_interval_days = 30
+
+[audit]
+chain_signing = true
+stream_destinations = ["https://audit.example.internal/tenant/acme", "file:///var/log/mvm/acme.jsonl"]
+"#
+    }
+
+    fn clean_lint_bundle_toml() -> &'static str {
+        r#"
+schema_version = 1
+bundle_id      = "acme/clean"
+bundle_version = 1
+
+[network]
+[[network.l4]]
+proto    = "tcp"
+dst_cidr = "203.0.113.10/32"
+port_lo  = 443
+port_hi  = 443
+
+[egress]
+allow_list = [["api.example.com", 443]]
+allow_plain_http = false
+
+[pii]
+mode = "redact"
+
+[tool]
+allowed = ["web_search"]
+
+[artifact]
+capture_paths = ["/work/output"]
+retention_days = 7
+
+[keys]
+rotation_interval_days = 30
+
+[audit]
+chain_signing = true
+stream_destinations = ["https://audit.example.com/ingest"]
+"#
+    }
+
+    fn risky_lint_bundle_toml() -> &'static str {
+        r#"
+schema_version = 1
+bundle_id      = "acme/risky"
+bundle_version = 1
+
+[network]
+[[network.l4]]
+proto    = "tcp"
+dst_cidr = "0.0.0.0/0"
+port_lo  = 0
+port_hi  = 0
+
+[egress]
+mode = "open"
+allow_list = [["private-api.example.internal", 0]]
+allow_plain_http = true
+disabled_inspectors = ["pii_redactor"]
+
+[pii]
+mode = "disabled"
+
+[tool]
+allowed = ["web_search"]
+
+[artifact]
+capture_paths = ["/home/user/.ssh", "/work/output"]
+retention_days = 30
+
+[keys]
+rotation_interval_days = 0
+
+[audit]
+chain_signing = false
+stream_destinations = ["http://audit.example.internal/ingest"]
 "#
     }
 
@@ -340,6 +1034,175 @@ allowed = ["web_search"]
         let tmp = tempfile::tempdir().unwrap();
         write_bundle(tmp.path(), "acme", "web-worker", minimal_bundle_toml());
         cmd_verify(tmp.path(), "acme:web-worker").unwrap();
+    }
+
+    #[test]
+    fn cmd_explain_accepts_clean_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "web-worker", minimal_bundle_toml());
+        cmd_explain(tmp.path(), "acme:web-worker", false).unwrap();
+        cmd_explain(tmp.path(), "acme:web-worker", true).unwrap();
+    }
+
+    #[test]
+    fn explain_json_redacts_paths_and_audit_destinations() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "web-worker", sensitive_bundle_toml());
+        let bundle = load_bundle(tmp.path(), "acme:web-worker", "acme", "web-worker").unwrap();
+        let explain = build_explain("acme:web-worker", "acme", "web-worker", &bundle).unwrap();
+        let json = serde_json::to_string(&explain).unwrap();
+
+        assert!(json.contains("\"capture_path_count\":2"));
+        assert!(json.contains("\"stream_destination_count\":2"));
+        assert!(json.contains("\"https\""));
+        assert!(json.contains("\"file\""));
+        assert!(!json.contains("/home/user/.ssh"));
+        assert!(!json.contains("customer-export"));
+        assert!(!json.contains("audit.example.internal/tenant/acme"));
+        assert!(!json.contains("private-api.example.internal"));
+    }
+
+    #[test]
+    fn cmd_explain_catches_unknown_disabled_inspector() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web",
+            r#"
+schema_version = 1
+bundle_id      = "acme/web"
+bundle_version = 1
+
+[network]
+[egress]
+disabled_inspectors = ["ssr_guard"]
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+"#,
+        );
+        let err = cmd_explain(tmp.path(), "acme:web", true).unwrap_err();
+        let chained: String = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(chained.contains("disabled_inspectors"));
+        assert!(chained.contains("ssr_guard"));
+    }
+
+    #[test]
+    fn cmd_explain_catches_bad_audit_destination_scheme() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "web",
+            r#"
+schema_version = 1
+bundle_id      = "acme/web"
+bundle_version = 1
+
+[network]
+[egress]
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+stream_destinations = ["htpps://audit.example.com/ingest"]
+"#,
+        );
+        let err = cmd_explain(tmp.path(), "acme:web", true).unwrap_err();
+        let chained: String = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(chained.contains("stream_destinations"));
+        assert!(chained.contains("htpps://audit.example.com/ingest"));
+    }
+
+    #[test]
+    fn cmd_lint_accepts_clean_bundle() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "clean", clean_lint_bundle_toml());
+        cmd_lint(tmp.path(), "acme:clean", false).unwrap();
+        cmd_lint(tmp.path(), "acme:clean", true).unwrap();
+    }
+
+    #[test]
+    fn cmd_lint_fails_when_findings_exist() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "risky", risky_lint_bundle_toml());
+        let err = cmd_lint(tmp.path(), "acme:risky", true).unwrap_err();
+        assert!(err.to_string().contains("policy lint found"));
+    }
+
+    #[test]
+    fn lint_report_flags_risky_posture_without_raw_sensitive_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "risky", risky_lint_bundle_toml());
+        let bundle = load_bundle(tmp.path(), "acme:risky", "acme", "risky").unwrap();
+        let report = build_lint_report("acme:risky", "acme", "risky", &bundle).unwrap();
+        let codes: Vec<&str> = report.issues.iter().map(|issue| issue.code).collect();
+
+        assert_eq!(report.status, "warn");
+        assert!(codes.contains(&"POLICY_LINT_PLAIN_HTTP"));
+        assert!(codes.contains(&"POLICY_LINT_L7_PROXY_DISABLED"));
+        assert!(codes.contains(&"POLICY_LINT_EGRESS_INSPECTOR_DISABLED"));
+        assert!(codes.contains(&"POLICY_LINT_PII_DISABLED"));
+        assert!(codes.contains(&"POLICY_LINT_AUDIT_CHAIN_UNSIGNED"));
+        assert!(codes.contains(&"POLICY_LINT_AUDIT_PLAINTEXT_DESTINATION"));
+        assert!(codes.contains(&"POLICY_LINT_KEY_ROTATION_DISABLED"));
+        assert!(codes.contains(&"POLICY_LINT_L4_BROAD_CIDR"));
+        assert!(codes.contains(&"POLICY_LINT_L4_WILDCARD_PORT"));
+        assert!(codes.contains(&"POLICY_LINT_EGRESS_WILDCARD_PORT"));
+        assert!(codes.contains(&"POLICY_LINT_ARTIFACT_SENSITIVE_CAPTURE"));
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(!json.contains("/home/user/.ssh"));
+        assert!(!json.contains("private-api.example.internal"));
+        assert!(!json.contains("audit.example.internal/ingest"));
+    }
+
+    #[test]
+    fn cmd_lint_rejects_invalid_policy_before_linting() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "bad",
+            r#"
+schema_version = 1
+bundle_id      = "acme/bad"
+bundle_version = 1
+
+[network]
+[[network.l4]]
+proto    = "tcp"
+dst_cidr = "not-a-cidr"
+port_lo  = 443
+port_hi  = 443
+
+[egress]
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+"#,
+        );
+        let err = cmd_lint(tmp.path(), "acme:bad", true).unwrap_err();
+        let chained: String = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(chained.contains("translation failed"));
     }
 
     #[test]
