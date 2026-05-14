@@ -288,6 +288,110 @@ fn test_up_dev_and_prod_are_mutually_exclusive() {
     );
 }
 
+// Plan 73 Followup B.3 — `--from-workload-ir <path>` flag wires
+// `mvmctl up` into the app-deps install pipeline. These tests pin
+// the flag-parse surface (clap-side); the install-pipeline integration
+// itself is covered by `app_deps_gate::tests` + the helper unit tests
+// in `vm/up.rs::resolve_deps_volume_binding`-adjacent fixtures.
+
+#[test]
+fn test_up_from_workload_ir_flag_parses() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "up",
+        "--flake",
+        ".",
+        "--from-workload-ir",
+        "./workload.ir.json",
+    ])
+    .expect("clap parses --from-workload-ir");
+    match cli.command {
+        Commands::Up(up::Args {
+            from_workload_ir, ..
+        }) => {
+            assert_eq!(
+                from_workload_ir,
+                Some(std::path::PathBuf::from("./workload.ir.json"))
+            );
+        }
+        _ => panic!("Expected Up command"),
+    }
+}
+
+#[test]
+fn test_up_from_workload_ir_absent_means_none() {
+    // Claim-8 preservation guard: when the user doesn't pass the
+    // flag, `from_workload_ir` is `None` and `mvmctl up` runs its
+    // pre-Followup-B.3 path with `deps_volume = None` on the plan.
+    let cli = Cli::try_parse_from(["mvmctl", "up", "--flake", "."]).unwrap();
+    match cli.command {
+        Commands::Up(up::Args {
+            from_workload_ir, ..
+        }) => {
+            assert!(from_workload_ir.is_none());
+        }
+        _ => panic!("Expected Up command"),
+    }
+}
+
+#[test]
+fn test_up_from_workload_ir_combines_with_prod_gate_flag() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "up",
+        "--flake",
+        ".",
+        "--from-workload-ir",
+        "./workload.ir.json",
+        "--prod",
+    ])
+    .expect("clap parses --from-workload-ir + --prod");
+    match cli.command {
+        Commands::Up(up::Args {
+            from_workload_ir,
+            build_mode,
+            ..
+        }) => {
+            assert_eq!(
+                from_workload_ir,
+                Some(std::path::PathBuf::from("./workload.ir.json"))
+            );
+            assert!(build_mode.prod);
+            assert_eq!(build_mode.resolve(), mvm_build::pipeline::BuildMode::Prod);
+        }
+        _ => panic!("Expected Up command"),
+    }
+}
+
+#[test]
+fn test_up_from_workload_ir_combines_with_dev_gate_flag() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "up",
+        "--flake",
+        ".",
+        "--from-workload-ir",
+        "./workload.ir.json",
+        "--dev",
+    ])
+    .expect("clap parses --from-workload-ir + --dev");
+    match cli.command {
+        Commands::Up(up::Args {
+            from_workload_ir,
+            build_mode,
+            ..
+        }) => {
+            assert_eq!(
+                from_workload_ir,
+                Some(std::path::PathBuf::from("./workload.ir.json"))
+            );
+            assert!(build_mode.dev);
+            assert_eq!(build_mode.resolve(), mvm_build::pipeline::BuildMode::Dev);
+        }
+        _ => panic!("Expected Up command"),
+    }
+}
+
 #[test]
 fn test_up_manifest_short_flag() {
     let cli = Cli::try_parse_from(["mvmctl", "up", "-m", "openclaw"]).unwrap();

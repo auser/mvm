@@ -239,6 +239,7 @@ mod tests {
             exec_timeout_secs: 0,
             destroy_on_exit: true,
             bundle_pin: None,
+            deps_volume: None,
         }
     }
 
