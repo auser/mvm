@@ -38,6 +38,7 @@ Recent maintenance:
 
 - [x] `mvmctl dev status` now reports the same Apple Container dev image paths that `dev up` boots (`~/.mvm/dev/current`, versioned prebuilts, or launchd-provided paths), instead of only checking the legacy cache location.
 - [x] Added an opt-in `runtime_boot_bench` live test for already-built runtime images, covering serial boots and three-way concurrent fan-out against a 200 ms per-VM budget.
+- [x] Extended `runtime_boot_bench` with TOML config-file input, Apple Container backend defaults, configurable CPU/memory sizing, and Apple guest-agent readiness probing.
 
 ## In-flight workstreams
 

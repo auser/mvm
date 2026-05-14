@@ -4,17 +4,16 @@
 //! It measures only backend launch of prebuilt `vmlinux` + `rootfs.ext4`
 //! artifacts, with an optional guest-agent readiness check.
 //!
-//! Run on a Linux/KVM builder host with:
+//! Run with a config file:
 //!
 //! ```text
-//! MVM_RUNTIME_BOOT_BENCH=1 \
-//! MVM_RUNTIME_BOOT_BACKEND=firecracker \
-//! MVM_RUNTIME_BOOT_KERNEL=/path/to/vmlinux \
-//! MVM_RUNTIME_BOOT_ROOTFS=/path/to/rootfs.ext4 \
-//! cargo test --test runtime_boot_bench -- --nocapture
+//! MVM_RUNTIME_BOOT_CONFIG=/tmp/mvm-runtime-boot.toml \
+//!   cargo test --test runtime_boot_bench prebuilt_runtime_image_boots_within_budget -- --exact --nocapture
 //! ```
 //!
 //! Optional knobs:
+//! - `MVM_RUNTIME_BOOT_BENCH=1` to run from environment variables only.
+//! - `MVM_RUNTIME_BOOT_CONFIG=/path/to/config.toml` for TOML config.
 //! - `MVM_RUNTIME_BOOT_RUNS=10` for serial samples.
 //! - `MVM_RUNTIME_BOOT_CONCURRENT=3` for fan-out width.
 //! - `MVM_RUNTIME_BOOT_BUDGET_MS=200` for the per-VM max budget.
@@ -25,11 +24,14 @@ use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, bail};
+use mvm::vsock_transport::VsockTransport as _;
 use mvm_backend::backend::AnyBackend;
 use mvm_core::vm_backend::VmStartConfig;
 use mvm_guest::vsock::{GuestRequest, GuestResponse};
+use serde::Deserialize;
 
 const ENABLE_VAR: &str = "MVM_RUNTIME_BOOT_BENCH";
+const CONFIG_VAR: &str = "MVM_RUNTIME_BOOT_CONFIG";
 const BACKEND_VAR: &str = "MVM_RUNTIME_BOOT_BACKEND";
 const KERNEL_VAR: &str = "MVM_RUNTIME_BOOT_KERNEL";
 const ROOTFS_VAR: &str = "MVM_RUNTIME_BOOT_ROOTFS";
@@ -37,6 +39,8 @@ const RUNS_VAR: &str = "MVM_RUNTIME_BOOT_RUNS";
 const CONCURRENT_VAR: &str = "MVM_RUNTIME_BOOT_CONCURRENT";
 const BUDGET_VAR: &str = "MVM_RUNTIME_BOOT_BUDGET_MS";
 const READY_VAR: &str = "MVM_RUNTIME_BOOT_READY";
+const CPUS_VAR: &str = "MVM_RUNTIME_BOOT_CPUS";
+const MEMORY_MIB_VAR: &str = "MVM_RUNTIME_BOOT_MEMORY_MIB";
 
 const DEFAULT_BACKEND: &str = "firecracker";
 const DEFAULT_RUNS: usize = 5;
@@ -93,25 +97,69 @@ struct BenchSpec {
     concurrent: usize,
     budget: Duration,
     ready: ReadySignal,
+    cpus: u32,
+    memory_mib: u32,
 }
 
 impl BenchSpec {
     fn from_env() -> Result<Option<Self>> {
-        if std::env::var(ENABLE_VAR).as_deref() != Ok("1") {
+        let config = RawBenchConfig::from_env()?;
+        if std::env::var(ENABLE_VAR).as_deref() != Ok("1") && config.is_none() {
             return Ok(None);
         }
+        let config = config.unwrap_or_default();
 
-        let kernel = required_path(KERNEL_VAR)?;
-        let rootfs = required_path(ROOTFS_VAR)?;
+        let kernel = required_path(KERNEL_VAR, config.kernel)?;
+        let rootfs = required_path(ROOTFS_VAR, config.rootfs)?;
+        let ready =
+            ReadySignal::parse(&env_string_opt(READY_VAR, config.ready).unwrap_or_else(|| {
+                default_ready_for_backend(&env_string_opt(BACKEND_VAR, config.backend.clone()))
+            }))?;
         Ok(Some(Self {
-            backend: env_string(BACKEND_VAR, DEFAULT_BACKEND),
+            backend: env_string_opt(BACKEND_VAR, config.backend)
+                .unwrap_or_else(|| DEFAULT_BACKEND.to_string()),
             kernel,
             rootfs,
-            runs: env_usize(RUNS_VAR, DEFAULT_RUNS)?,
-            concurrent: env_usize(CONCURRENT_VAR, DEFAULT_CONCURRENT)?,
-            budget: Duration::from_millis(env_u64(BUDGET_VAR, DEFAULT_BUDGET_MS)?),
-            ready: ReadySignal::parse(&env_string(READY_VAR, DEFAULT_READY.as_str()))?,
+            runs: env_usize(RUNS_VAR, config.runs, DEFAULT_RUNS)?,
+            concurrent: env_usize(CONCURRENT_VAR, config.concurrent, DEFAULT_CONCURRENT)?,
+            budget: Duration::from_millis(env_u64(
+                BUDGET_VAR,
+                config.budget_ms,
+                DEFAULT_BUDGET_MS,
+            )?),
+            ready,
+            cpus: env_u32(CPUS_VAR, config.cpus, 1)?,
+            memory_mib: env_u32(MEMORY_MIB_VAR, config.memory_mib, 256)?,
         }))
+    }
+}
+
+#[derive(Debug, Clone, Default, Deserialize)]
+#[serde(deny_unknown_fields, rename_all = "kebab-case")]
+struct RawBenchConfig {
+    backend: Option<String>,
+    kernel: Option<PathBuf>,
+    rootfs: Option<PathBuf>,
+    runs: Option<usize>,
+    concurrent: Option<usize>,
+    #[serde(alias = "budget_ms")]
+    budget_ms: Option<u64>,
+    ready: Option<String>,
+    cpus: Option<u32>,
+    #[serde(alias = "memory_mib")]
+    memory_mib: Option<u32>,
+}
+
+impl RawBenchConfig {
+    fn from_env() -> Result<Option<Self>> {
+        let Some(path) = std::env::var_os(CONFIG_VAR).map(PathBuf::from) else {
+            return Ok(None);
+        };
+        let raw = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {CONFIG_VAR}={}", path.display()))?;
+        let config = toml::from_str(&raw)
+            .with_context(|| format!("parsing {CONFIG_VAR}={}", path.display()))?;
+        Ok(Some(config))
     }
 }
 
@@ -190,8 +238,8 @@ fn measure_one(spec: &BenchSpec, name: String) -> Result<BootMeasurement> {
         name: name.clone(),
         rootfs_path: spec.rootfs.to_string_lossy().into_owned(),
         kernel_path: Some(spec.kernel.to_string_lossy().into_owned()),
-        cpus: 1,
-        memory_mib: 256,
+        cpus: spec.cpus,
+        memory_mib: spec.memory_mib,
         revision_hash: "runtime-boot-bench".to_string(),
         flake_ref: "prebuilt-runtime-image".to_string(),
         ..Default::default()
@@ -221,6 +269,9 @@ fn wait_until_ready(spec: &BenchSpec, name: &str) -> Result<()> {
 }
 
 fn wait_for_guest_agent(backend: &str, name: &str) -> Result<()> {
+    if backend == "apple-container" {
+        return wait_for_apple_guest_agent(name);
+    }
     let uds_path = guest_agent_socket_path(backend, name)?;
     let deadline = Instant::now() + READY_TIMEOUT;
     let mut last_err = None;
@@ -239,6 +290,32 @@ fn wait_for_guest_agent(backend: &str, name: &str) -> Result<()> {
             uds_path.display(),
             READY_TIMEOUT
         )
+    }))
+}
+
+fn wait_for_apple_guest_agent(name: &str) -> Result<()> {
+    let transport = mvm::vsock_transport::AppleContainerTransport::new(name);
+    let deadline = Instant::now() + READY_TIMEOUT;
+    let mut last_err = None;
+
+    while Instant::now() < deadline {
+        match transport.connect(mvm_guest::vsock::GUEST_AGENT_PORT) {
+            Ok(mut stream) => {
+                match mvm_guest::vsock::send_request(&mut stream, &GuestRequest::Ping) {
+                    Ok(GuestResponse::Pong) => return Ok(()),
+                    Ok(other) => {
+                        last_err = Some(anyhow::anyhow!("unexpected ping response: {other:?}"))
+                    }
+                    Err(e) => last_err = Some(e),
+                }
+            }
+            Err(e) => last_err = Some(e),
+        }
+        std::thread::sleep(READY_POLL);
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!("Apple Container guest agent did not become ready within {READY_TIMEOUT:?}")
     }))
 }
 
@@ -298,30 +375,44 @@ fn assert_within_budget(label: &str, actual: Duration, budget: Duration) {
     );
 }
 
-fn required_path(var: &str) -> Result<PathBuf> {
-    let raw = std::env::var_os(var).ok_or_else(|| anyhow::anyhow!("{var} is required"))?;
-    let path = PathBuf::from(raw);
+fn required_path(var: &str, configured: Option<PathBuf>) -> Result<PathBuf> {
+    let path = std::env::var_os(var)
+        .map(PathBuf::from)
+        .or(configured)
+        .ok_or_else(|| anyhow::anyhow!("{var} is required, or set it in {CONFIG_VAR}"))?;
     if !path.is_file() {
         bail!("{var}={} is not a file", path.display());
     }
     Ok(path)
 }
 
-fn env_string(var: &str, default: &str) -> String {
-    std::env::var(var).unwrap_or_else(|_| default.to_string())
+fn env_string_opt(var: &str, configured: Option<String>) -> Option<String> {
+    std::env::var(var).ok().or(configured)
 }
 
-fn env_usize(var: &str, default: usize) -> Result<usize> {
-    let value = env_u64(var, default as u64)?;
+fn default_ready_for_backend(backend: &Option<String>) -> String {
+    match backend.as_deref() {
+        Some("apple-container") => ReadySignal::StartReturn.as_str().to_string(),
+        _ => DEFAULT_READY.as_str().to_string(),
+    }
+}
+
+fn env_usize(var: &str, configured: Option<usize>, default: usize) -> Result<usize> {
+    let value = env_u64(var, configured.map(|v| v as u64), default as u64)?;
     usize::try_from(value).with_context(|| format!("{var} does not fit in usize: {value}"))
 }
 
-fn env_u64(var: &str, default: u64) -> Result<u64> {
+fn env_u32(var: &str, configured: Option<u32>, default: u32) -> Result<u32> {
+    let value = env_u64(var, configured.map(u64::from), u64::from(default))?;
+    u32::try_from(value).with_context(|| format!("{var} does not fit in u32: {value}"))
+}
+
+fn env_u64(var: &str, configured: Option<u64>, default: u64) -> Result<u64> {
     match std::env::var(var) {
         Ok(raw) => raw
             .parse::<u64>()
             .with_context(|| format!("parsing {var}={raw:?} as u64")),
-        Err(_) => Ok(default),
+        Err(_) => Ok(configured.unwrap_or(default)),
     }
 }
 
@@ -373,6 +464,31 @@ fn summary_reports_percentiles_and_max() {
     assert_eq!(summary.p50, Duration::from_millis(20));
     assert_eq!(summary.p95, Duration::from_millis(40));
     assert_eq!(summary.max, Duration::from_millis(40));
+}
+
+#[test]
+fn config_file_shape_accepts_apple_container_defaults() {
+    let config: RawBenchConfig = toml::from_str(
+        r#"
+backend = "apple-container"
+kernel = "/tmp/vmlinux"
+rootfs = "/tmp/rootfs.ext4"
+runs = 2
+concurrent = 3
+budget-ms = 200
+cpus = 1
+memory-mib = 256
+"#,
+    )
+    .expect("parse runtime boot bench config");
+
+    assert_eq!(config.backend.as_deref(), Some("apple-container"));
+    assert_eq!(config.runs, Some(2));
+    assert_eq!(config.concurrent, Some(3));
+    assert_eq!(
+        default_ready_for_backend(&config.backend),
+        ReadySignal::StartReturn.as_str()
+    );
 }
 
 #[test]
