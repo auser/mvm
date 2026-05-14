@@ -1655,6 +1655,10 @@ Shipped:
   inspectors, unsigned audit chains, long/disabled key rotation, broad L4
   CIDRs, wildcard ports, and sensitive-looking artifact capture paths. JSON is
   redacted with the same no-raw-paths/URLs/hostnames rule as `policy explain`.
+- `mvmctl policy diff <left> <right> [--json]` validates both bundles and
+  emits a redacted change report for policy review before rollout. Raw artifact
+  paths, audit destination URLs, egress hostnames, and CIDRs are replaced with
+  stable fingerprints and safe summaries.
 - CLI reference and parser tests cover the new command and profile surface.
 
 ### Sprint 52 success criteria

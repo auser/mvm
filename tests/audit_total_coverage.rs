@@ -124,6 +124,7 @@ const POLICY_SUB: &[(&str, AuditPosture)] = &[
     ("verify", AuditPosture::ReadOnly),
     ("explain", AuditPosture::ReadOnly),
     ("lint", AuditPosture::ReadOnly),
+    ("diff", AuditPosture::ReadOnly),
     // `policy update` is stubbed pending the mvmd-signed-plan flow
     // (plan 60 Phase 8). Once it lands, this row flips to
     // `Emits("PolicyApply")`.

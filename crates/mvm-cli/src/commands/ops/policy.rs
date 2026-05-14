@@ -19,6 +19,10 @@
 //! - **`mvmctl policy lint <tenant>:<workload> [--json]`** —
 //!   validate and flag risky-but-admissible posture. Findings are
 //!   redacted for the same reason as `explain`.
+//! - **`mvmctl policy diff <left> <right> [--json]`** — validate
+//!   both bundles and compare a redacted policy snapshot. The diff
+//!   shows safe summaries and fingerprints rather than raw hostnames,
+//!   artifact paths, audit destinations, or CIDRs.
 //! - **`mvmctl policy update`** — stubbed; the production update
 //!   flow requires an mvmd-signed plan (plan 60 Phase 8 territory).
 //!   Errors with a clear pointer; no on-disk side effects.
@@ -30,12 +34,13 @@
 //! flag into `--tenant T --workload W` would diverge from that
 //! contract; this module sticks with the single positional.
 
-use std::path::PathBuf;
+use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
 use mvm_policy::toml_loader::{self, LoadError};
 use serde::Serialize;
+use sha2::{Digest, Sha256};
 
 use mvm_core::user_config::MvmConfig;
 
@@ -81,6 +86,16 @@ pub(in crate::commands) enum PolicyAction {
         #[arg(long)]
         json: bool,
     },
+    /// Validate and compare two tenant policy bundles.
+    Diff {
+        /// Left `<tenant>:<workload>` identifier.
+        left: String,
+        /// Right `<tenant>:<workload>` identifier.
+        right: String,
+        /// Emit a redacted machine-readable diff report.
+        #[arg(long)]
+        json: bool,
+    },
     /// Update is stubbed in v0 — production updates require an
     /// mvmd-signed plan. See plan 60 Phase 8.
     Update {
@@ -100,6 +115,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         PolicyAction::Verify { bundle } => cmd_verify(&base_dir, &bundle),
         PolicyAction::Explain { bundle, json } => cmd_explain(&base_dir, &bundle, json),
         PolicyAction::Lint { bundle, json } => cmd_lint(&base_dir, &bundle, json),
+        PolicyAction::Diff { left, right, json } => cmd_diff(&base_dir, &left, &right, json),
         PolicyAction::Update { bundle, from } => cmd_update(&bundle, from.as_deref()),
     }
 }
@@ -192,6 +208,28 @@ fn cmd_lint(base_dir: &std::path::Path, bundle_ref: &str, as_json: bool) -> Resu
     }
 }
 
+fn cmd_diff(
+    base_dir: &std::path::Path,
+    left_ref: &str,
+    right_ref: &str,
+    as_json: bool,
+) -> Result<()> {
+    let (left_tenant, left_workload) = parse_bundle_ref(left_ref)?;
+    let (right_tenant, right_workload) = parse_bundle_ref(right_ref)?;
+    let left = load_bundle(base_dir, left_ref, left_tenant, left_workload)?;
+    let right = load_bundle(base_dir, right_ref, right_tenant, right_workload)?;
+    let report = build_diff_report(left_ref, right_ref, &left, &right)?;
+
+    if as_json {
+        let json =
+            serde_json::to_string_pretty(&report).context("serializing policy diff report")?;
+        println!("{json}");
+    } else {
+        render_diff_human(&report);
+    }
+    Ok(())
+}
+
 fn validate_bundle(bundle: &mvm_policy::PolicyBundle) -> Result<usize> {
     mvm_supervisor::LiveL4Gate::from_specs(&bundle.network.l4)
         .map_err(|e| anyhow::anyhow!("[[network.l4]] translation failed: {e}"))?;
@@ -202,6 +240,41 @@ fn validate_bundle(bundle: &mvm_policy::PolicyBundle) -> Result<usize> {
     let chain = mvm_supervisor::build_inspector_chain_with_pii(&bundle.egress, &bundle.pii, None)
         .map_err(|e| anyhow::anyhow!("[pii] validation failed: {e}"))?;
     Ok(chain.len())
+}
+
+fn build_diff_report(
+    left_ref: &str,
+    right_ref: &str,
+    left: &mvm_policy::PolicyBundle,
+    right: &mvm_policy::PolicyBundle,
+) -> Result<PolicyDiffReport> {
+    validate_bundle(left).context("left policy validation failed")?;
+    validate_bundle(right).context("right policy validation failed")?;
+
+    let left_snapshot = DiffSnapshot::from_bundle(left)?;
+    let right_snapshot = DiffSnapshot::from_bundle(right)?;
+    let left_value =
+        serde_json::to_value(&left_snapshot).context("serializing left policy snapshot")?;
+    let right_value =
+        serde_json::to_value(&right_snapshot).context("serializing right policy snapshot")?;
+    let mut changes = Vec::new();
+    diff_values("", &left_value, &right_value, &mut changes);
+
+    let status = if changes.is_empty() {
+        "same"
+    } else {
+        "changed"
+    };
+    Ok(PolicyDiffReport {
+        schema_version: 1,
+        left_ref: left_ref.to_string(),
+        right_ref: right_ref.to_string(),
+        left: DiffBundleMeta::from_bundle(left),
+        right: DiffBundleMeta::from_bundle(right),
+        status,
+        change_count: changes.len(),
+        changes,
+    })
 }
 
 fn build_explain(
@@ -652,6 +725,389 @@ fn render_lint_human(report: &PolicyLintReport) {
             issue.severity, issue.code, issue.section, issue.message
         );
     }
+}
+
+fn render_diff_human(report: &PolicyDiffReport) {
+    println!("policy diff  {} -> {}", report.left_ref, report.right_ref);
+    println!("  status       = {}", report.status);
+    println!("  change_count = {}", report.change_count);
+    if report.changes.is_empty() {
+        println!("  changes = []");
+        return;
+    }
+
+    println!("  changes:");
+    for change in &report.changes {
+        println!("    [{}] {}", change.kind, change.path);
+        if let Some(before) = &change.before {
+            println!("      before = {}", compact_json(before));
+        }
+        if let Some(after) = &change.after {
+            println!("      after  = {}", compact_json(after));
+        }
+    }
+}
+
+fn diff_values(
+    path: &str,
+    left: &serde_json::Value,
+    right: &serde_json::Value,
+    changes: &mut Vec<PolicyDiffChange>,
+) {
+    if left == right {
+        return;
+    }
+
+    match (left, right) {
+        (serde_json::Value::Object(left_map), serde_json::Value::Object(right_map)) => {
+            let keys: BTreeSet<&String> = left_map.keys().chain(right_map.keys()).collect();
+            for key in keys {
+                let child_path = join_json_path(path, key);
+                match (left_map.get(key), right_map.get(key)) {
+                    (Some(l), Some(r)) => diff_values(&child_path, l, r, changes),
+                    (Some(l), None) => changes.push(PolicyDiffChange::new(
+                        &child_path,
+                        "removed",
+                        Some(l.clone()),
+                        None,
+                    )),
+                    (None, Some(r)) => changes.push(PolicyDiffChange::new(
+                        &child_path,
+                        "added",
+                        None,
+                        Some(r.clone()),
+                    )),
+                    (None, None) => {}
+                }
+            }
+        }
+        _ => changes.push(PolicyDiffChange::new(
+            path,
+            "changed",
+            Some(left.clone()),
+            Some(right.clone()),
+        )),
+    }
+}
+
+fn join_json_path(parent: &str, child: &str) -> String {
+    if parent.is_empty() {
+        child.to_string()
+    } else {
+        format!("{parent}.{child}")
+    }
+}
+
+fn section_for_path(path: &str) -> String {
+    path.split('.').next().unwrap_or(path).to_string()
+}
+
+fn compact_json(value: &serde_json::Value) -> String {
+    serde_json::to_string(value).unwrap_or_else(|_| "<unserializable>".to_string())
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyDiffReport {
+    schema_version: u32,
+    left_ref: String,
+    right_ref: String,
+    left: DiffBundleMeta,
+    right: DiffBundleMeta,
+    status: &'static str,
+    change_count: usize,
+    changes: Vec<PolicyDiffChange>,
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyDiffChange {
+    section: String,
+    path: String,
+    kind: &'static str,
+    before: Option<serde_json::Value>,
+    after: Option<serde_json::Value>,
+}
+
+impl PolicyDiffChange {
+    fn new(
+        path: &str,
+        kind: &'static str,
+        before: Option<serde_json::Value>,
+        after: Option<serde_json::Value>,
+    ) -> Self {
+        Self {
+            section: section_for_path(path),
+            path: path.to_string(),
+            kind,
+            before,
+            after,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DiffBundleMeta {
+    bundle_id: String,
+    bundle_version: u32,
+}
+
+impl DiffBundleMeta {
+    fn from_bundle(bundle: &mvm_policy::PolicyBundle) -> Self {
+        Self {
+            bundle_id: bundle.bundle_id.0.clone(),
+            bundle_version: bundle.bundle_version,
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DiffSnapshot {
+    metadata: DiffMetadata,
+    network: DiffNetwork,
+    egress: DiffEgress,
+    pii: DiffPii,
+    tool: DiffTool,
+    artifact: DiffArtifact,
+    keys: DiffKeys,
+    audit: DiffAudit,
+    tenant_overlays: DiffTenantOverlays,
+}
+
+impl DiffSnapshot {
+    fn from_bundle(bundle: &mvm_policy::PolicyBundle) -> Result<Self> {
+        Ok(Self {
+            metadata: DiffMetadata {
+                schema_version: bundle.schema_version,
+                bundle_id: bundle.bundle_id.0.clone(),
+                bundle_version: bundle.bundle_version,
+            },
+            network: DiffNetwork {
+                preset: bundle.network.preset.clone(),
+                l4_rules: diff_l4_rules(&bundle.network.l4),
+            },
+            egress: DiffEgress {
+                mode: bundle.egress.mode.clone(),
+                allow_plain_http: bundle.egress.allow_plain_http,
+                body_cap_bytes: effective_body_cap(&bundle.egress),
+                allow_list: diff_host_ports(&bundle.egress.allow_list),
+                disabled_inspectors: sorted_strings(&bundle.egress.disabled_inspectors),
+            },
+            pii: DiffPii {
+                mode: bundle
+                    .pii
+                    .mode
+                    .clone()
+                    .unwrap_or_else(|| "detect".to_string()),
+                categories: sorted_strings(&bundle.pii.categories),
+            },
+            tool: DiffTool {
+                allowed: sorted_strings(&bundle.tool.allowed),
+            },
+            artifact: DiffArtifact {
+                capture_path_count: bundle.artifact.capture_paths.len(),
+                capture_paths: diff_redacted_items("path", &bundle.artifact.capture_paths),
+                retention_days: bundle.artifact.retention_days,
+            },
+            keys: DiffKeys {
+                rotation_interval_days: bundle.keys.rotation_interval_days,
+            },
+            audit: DiffAudit {
+                chain_signing: bundle.audit.chain_signing,
+                stream_destination_count: bundle.audit.stream_destinations.len(),
+                stream_destinations: diff_audit_destinations(&bundle.audit.stream_destinations),
+            },
+            tenant_overlays: DiffTenantOverlays {
+                count: bundle.tenant_overlays.len(),
+                fingerprint: fingerprint_json(&bundle.tenant_overlays)?,
+            },
+        })
+    }
+}
+
+#[derive(Debug, Serialize)]
+struct DiffMetadata {
+    schema_version: u32,
+    bundle_id: String,
+    bundle_version: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffNetwork {
+    preset: Option<String>,
+    l4_rules: Vec<DiffL4Rule>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct DiffL4Rule {
+    proto: String,
+    dst_cidr_family: &'static str,
+    dst_cidr_prefix: Option<u8>,
+    dst_cidr_fingerprint: String,
+    port_lo: u16,
+    port_hi: u16,
+    wildcard_port: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffEgress {
+    mode: Option<String>,
+    allow_plain_http: bool,
+    body_cap_bytes: u64,
+    allow_list: Vec<DiffHostPort>,
+    disabled_inspectors: Vec<String>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct DiffHostPort {
+    host_fingerprint: String,
+    port: u16,
+    wildcard_port: bool,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffPii {
+    mode: String,
+    categories: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffTool {
+    allowed: Vec<String>,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffArtifact {
+    capture_path_count: usize,
+    capture_paths: Vec<DiffRedactedItem>,
+    retention_days: u32,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct DiffRedactedItem {
+    kind: &'static str,
+    fingerprint: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffKeys {
+    rotation_interval_days: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffAudit {
+    chain_signing: bool,
+    stream_destination_count: usize,
+    stream_destinations: Vec<DiffAuditDestination>,
+}
+
+#[derive(Debug, Serialize, PartialEq, Eq, PartialOrd, Ord)]
+struct DiffAuditDestination {
+    scheme: &'static str,
+    fingerprint: String,
+}
+
+#[derive(Debug, Serialize)]
+struct DiffTenantOverlays {
+    count: usize,
+    fingerprint: String,
+}
+
+fn diff_l4_rules(rules: &[mvm_policy::L4RuleSpec]) -> Vec<DiffL4Rule> {
+    let mut out: Vec<DiffL4Rule> = rules
+        .iter()
+        .map(|rule| {
+            let (family, prefix) = cidr_shape(&rule.dst_cidr);
+            DiffL4Rule {
+                proto: rule.proto.clone(),
+                dst_cidr_family: family,
+                dst_cidr_prefix: prefix,
+                dst_cidr_fingerprint: fingerprint_str(&rule.dst_cidr),
+                port_lo: rule.port_lo,
+                port_hi: rule.port_hi,
+                wildcard_port: rule.port_lo == 0 && rule.port_hi == 0,
+            }
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+fn diff_host_ports(allow_list: &[(String, u16)]) -> Vec<DiffHostPort> {
+    let mut out: Vec<DiffHostPort> = allow_list
+        .iter()
+        .map(|(host, port)| DiffHostPort {
+            host_fingerprint: fingerprint_str(host),
+            port: *port,
+            wildcard_port: *port == 0,
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+fn diff_redacted_items(kind: &'static str, values: &[String]) -> Vec<DiffRedactedItem> {
+    let mut out: Vec<DiffRedactedItem> = values
+        .iter()
+        .map(|value| DiffRedactedItem {
+            kind,
+            fingerprint: fingerprint_str(value),
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+fn diff_audit_destinations(destinations: &[String]) -> Vec<DiffAuditDestination> {
+    let mut out: Vec<DiffAuditDestination> = destinations
+        .iter()
+        .map(|destination| DiffAuditDestination {
+            scheme: audit_destination_scheme(destination),
+            fingerprint: fingerprint_str(destination),
+        })
+        .collect();
+    out.sort_unstable();
+    out
+}
+
+fn sorted_strings(values: &[String]) -> Vec<String> {
+    let mut out = values.to_vec();
+    out.sort();
+    out.dedup();
+    out
+}
+
+fn cidr_shape(value: &str) -> (&'static str, Option<u8>) {
+    let Some((addr, prefix)) = value.rsplit_once('/') else {
+        return ("unknown", None);
+    };
+    let family = if addr.contains(':') { "ipv6" } else { "ipv4" };
+    (family, prefix.parse().ok())
+}
+
+fn audit_destination_scheme(destination: &str) -> &'static str {
+    mvm_supervisor::KNOWN_AUDIT_STREAM_SCHEMES
+        .iter()
+        .copied()
+        .find(|scheme| destination.starts_with(scheme))
+        .map(|scheme| scheme.trim_end_matches("://"))
+        .unwrap_or("unknown")
+}
+
+fn fingerprint_json<T: Serialize>(value: &T) -> Result<String> {
+    let bytes = serde_json::to_vec(value).context("serializing value for fingerprint")?;
+    Ok(fingerprint_bytes(&bytes))
+}
+
+fn fingerprint_str(value: &str) -> String {
+    fingerprint_bytes(value.as_bytes())
+}
+
+fn fingerprint_bytes(value: &[u8]) -> String {
+    let digest = Sha256::digest(value);
+    let mut out = String::from("sha256:");
+    for byte in digest.iter().take(8) {
+        out.push_str(&format!("{byte:02x}"));
+    }
+    out
 }
 
 #[derive(Debug, Serialize)]
@@ -1202,6 +1658,91 @@ port_hi  = 443
             .map(|c| c.to_string())
             .collect::<Vec<_>>()
             .join(" | ");
+        assert!(chained.contains("translation failed"));
+    }
+
+    #[test]
+    fn cmd_diff_accepts_identical_bundles() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "left", clean_lint_bundle_toml());
+        write_bundle(tmp.path(), "acme", "right", clean_lint_bundle_toml());
+        cmd_diff(tmp.path(), "acme:left", "acme:right", false).unwrap();
+        cmd_diff(tmp.path(), "acme:left", "acme:right", true).unwrap();
+
+        let left = load_bundle(tmp.path(), "acme:left", "acme", "left").unwrap();
+        let right = load_bundle(tmp.path(), "acme:right", "acme", "right").unwrap();
+        let report = build_diff_report("acme:left", "acme:right", &left, &right).unwrap();
+        assert_eq!(report.status, "same");
+        assert_eq!(report.change_count, 0);
+    }
+
+    #[test]
+    fn diff_report_flags_changes_without_raw_sensitive_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "left", minimal_bundle_toml());
+        write_bundle(tmp.path(), "acme", "right", sensitive_bundle_toml());
+        let left = load_bundle(tmp.path(), "acme:left", "acme", "left").unwrap();
+        let right = load_bundle(tmp.path(), "acme:right", "acme", "right").unwrap();
+        let report = build_diff_report("acme:left", "acme:right", &left, &right).unwrap();
+        let paths: Vec<&str> = report
+            .changes
+            .iter()
+            .map(|change| change.path.as_str())
+            .collect();
+
+        assert_eq!(report.status, "changed");
+        assert!(report.change_count > 0);
+        assert!(paths.contains(&"metadata.bundle_version"));
+        assert!(paths.contains(&"network.l4_rules"));
+        assert!(paths.contains(&"egress.allow_list"));
+        assert!(paths.contains(&"artifact.capture_paths"));
+        assert!(paths.contains(&"audit.stream_destinations"));
+
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(json.contains("host_fingerprint"));
+        assert!(json.contains("sha256:"));
+        assert!(!json.contains("/home/user/.ssh"));
+        assert!(!json.contains("customer-export"));
+        assert!(!json.contains("private-api.example.internal"));
+        assert!(!json.contains("audit.example.internal/tenant/acme"));
+        assert!(!json.contains("10.0.0.0/24"));
+    }
+
+    #[test]
+    fn cmd_diff_rejects_invalid_policy_before_diffing() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "left", clean_lint_bundle_toml());
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "bad",
+            r#"
+schema_version = 1
+bundle_id      = "acme/bad"
+bundle_version = 1
+
+[network]
+[[network.l4]]
+proto    = "tcp"
+dst_cidr = "not-a-cidr"
+port_lo  = 443
+port_hi  = 443
+
+[egress]
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+"#,
+        );
+        let err = cmd_diff(tmp.path(), "acme:left", "acme:bad", true).unwrap_err();
+        let chained: String = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
+        assert!(chained.contains("right policy validation failed"));
         assert!(chained.contains("translation failed"));
     }
 
