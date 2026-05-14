@@ -73,6 +73,12 @@ contributor-bootstrap = [
     "mvm-build/contributor-bootstrap",
     "mvm-backend/contributor-bootstrap",
 ]
+# Plan 72 W5.B — wire `ensure_dev_image` to dispatch through
+# `LibkrunBuilderVm` (via `mvm-build`'s `backends-builder-vm-libkrun`
+# feature) on source-checkout builds. Off by default until W5.C's
+# polarity flip; opting in gates the dispatch through libkrun at the
+# call site without rewriting the rest of the cascade.
+backends-builder-vm-libkrun = ["mvm-build/backends-builder-vm-libkrun"]
 custom-dns = ["mvm-supervisor/custom-dns"]
 dev-watch = ["dep:notify", "dep:notify-debouncer-mini"]
 manifest-verify = [
