@@ -16,8 +16,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use mvm_guest::entrypoint::ValidatedEntrypoint;
+use mvm_guest::lifecycle_hooks::ReadinessConfig;
 use mvm_guest::runtime_config::{InProcessMode, WarmProcessConfig};
-use mvm_guest::worker_pool::{DispatchOutcome, SlotSnapshot, WorkerPool};
+use mvm_guest::worker_pool::{DispatchError, DispatchOutcome, SlotSnapshot, WorkerPool};
 use mvm_guest::worker_protocol::WorkerOutcome;
 
 /// Cargo sets `CARGO_BIN_EXE_<name>` at compile time for integration
@@ -52,7 +53,14 @@ fn start_pool_with_behavior(cfg: WarmProcessConfig, behavior: Option<&str>) -> A
     let env: Vec<(String, String)> = behavior
         .map(|b| vec![("MVM_FAKE_RUNNER_BEHAVIOR".to_string(), b.to_string())])
         .unwrap_or_default();
-    WorkerPool::start(cfg, entry, env).expect("pool start")
+    let pool = WorkerPool::start(cfg, entry, env).expect("pool start");
+    // Plan 73 Followup E: the pool now starts in `NotReady` state.
+    // These integration tests don't exercise the readiness gate
+    // (covered separately in unit + integration tests for the probe
+    // itself); mark it ready immediately so the existing dispatch
+    // round-trips behave as they did pre-Followup-E.
+    pool.mark_ready();
+    pool
 }
 
 fn dispatch(pool: &Arc<WorkerPool>, payload: &[u8]) -> DispatchOutcome {
@@ -391,4 +399,133 @@ fn queue_full_returns_error() {
 
     let _ = h1.join().expect("h1");
     let _ = h2.join().expect("h2");
+}
+
+// ─── Plan 73 Followup E — readiness gate integration tests ───────────────────
+//
+// These tests build a real `WorkerPool` (against the fake-runner
+// fixture) but stand up a tempdir-scoped after_start.sh script
+// instead of the production `/etc/mvm/hooks/after_start.sh`. The pool
+// API takes the script path through `ReadinessConfig`, so we can
+// point at the fixture without touching `/etc`.
+
+use std::fs;
+use std::io::Write;
+use std::os::unix::fs::PermissionsExt;
+use std::path::Path;
+
+fn write_probe(dir: &Path, name: &str, body: &str) -> PathBuf {
+    let p = dir.join(name);
+    let mut f = fs::File::create(&p).expect("create probe");
+    f.write_all(body.as_bytes()).expect("write probe body");
+    let mut perms = fs::metadata(&p).expect("probe metadata").permissions();
+    perms.set_mode(0o755);
+    fs::set_permissions(&p, perms).expect("chmod probe");
+    p
+}
+
+/// Build a pool but don't `mark_ready`. The dispatch path returns
+/// `NotReady` until `wait_for_ready` succeeds.
+fn start_pool_unready(cfg: WarmProcessConfig) -> Arc<WorkerPool> {
+    let entry = Arc::new(validated_for_fake_runner());
+    WorkerPool::start(cfg, entry, Vec::new()).expect("pool start")
+}
+
+#[test]
+fn dispatch_refuses_until_readiness_marked() {
+    let pool = start_pool_unready(cfg(1, 100, 1024));
+    let res = pool.dispatch(b"hello".to_vec(), 5);
+    assert!(matches!(res, Err(DispatchError::NotReady)));
+    assert!(!pool.is_ready());
+    pool.mark_ready();
+    assert!(pool.is_ready());
+    let out = pool
+        .dispatch(b"hello".to_vec(), 5)
+        .expect("post-ready dispatch ok");
+    assert_eq!(out.stdout, b"hello");
+}
+
+#[test]
+fn wait_for_ready_succeeds_against_passing_probe() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let probe = write_probe(tmp.path(), "after_start.sh", "#!/bin/sh\nexit 0\n");
+    let pool = start_pool_unready(cfg(1, 100, 1024));
+    let cfg_probe = ReadinessConfig::new(probe)
+        .with_timeout(Duration::from_secs(2))
+        .with_interval(Duration::from_millis(50));
+    pool.wait_for_ready(&cfg_probe).expect("ready");
+    assert!(pool.is_ready());
+    pool.dispatch(b"ok".to_vec(), 5)
+        .expect("dispatch ok after ready");
+}
+
+#[test]
+fn wait_for_ready_succeeds_after_initial_failures() {
+    // Probe fails twice then exits 0 — exact pattern from the plan's
+    // test gate ("after_start.sh exits 1 thrice then 0").
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let counter = tmp.path().join("count");
+    fs::write(&counter, "0").expect("seed counter");
+    let body = format!(
+        "#!/bin/sh\nc=$(cat {ctr})\nc=$((c+1))\necho $c > {ctr}\n[ $c -ge 3 ] && exit 0\nexit 1\n",
+        ctr = counter.display()
+    );
+    let probe = write_probe(tmp.path(), "after_start.sh", &body);
+    let pool = start_pool_unready(cfg(1, 100, 1024));
+    let cfg_probe = ReadinessConfig::new(probe)
+        .with_timeout(Duration::from_secs(3))
+        .with_interval(Duration::from_millis(50));
+
+    // While warming, dispatch should fail-closed.
+    assert!(matches!(
+        pool.dispatch(b"early".to_vec(), 5),
+        Err(DispatchError::NotReady)
+    ));
+
+    pool.wait_for_ready(&cfg_probe).expect("warmed up");
+    assert!(pool.is_ready());
+    let out = pool
+        .dispatch(b"after-warmup".to_vec(), 5)
+        .expect("dispatch after warmup");
+    assert_eq!(out.stdout, b"after-warmup");
+}
+
+#[test]
+fn wait_for_ready_marks_ready_when_probe_missing() {
+    // Defensive: if for any reason the baked after_start.sh isn't
+    // there, the pool should fall through cleanly and accept invokes
+    // (an absent script is semantically equivalent to "no after_start
+    // hook declared").
+    let pool = start_pool_unready(cfg(1, 100, 1024));
+    let cfg_probe = ReadinessConfig::new(PathBuf::from("/nonexistent/after_start.sh"))
+        .with_timeout(Duration::from_millis(200))
+        .with_interval(Duration::from_millis(50));
+    pool.wait_for_ready(&cfg_probe)
+        .expect("missing probe is ok");
+    assert!(pool.is_ready());
+    pool.dispatch(b"ok".to_vec(), 5)
+        .expect("dispatch ok with absent probe");
+}
+
+#[test]
+fn wait_for_ready_timeout_leaves_pool_not_ready() {
+    let tmp = tempfile::tempdir().expect("tempdir");
+    let probe = write_probe(tmp.path(), "after_start.sh", "#!/bin/sh\nexit 1\n");
+    let pool = start_pool_unready(cfg(1, 100, 1024));
+    let cfg_probe = ReadinessConfig::new(probe)
+        .with_timeout(Duration::from_millis(250))
+        .with_interval(Duration::from_millis(50));
+    let err = pool.wait_for_ready(&cfg_probe).unwrap_err();
+    assert!(
+        matches!(
+            err,
+            mvm_guest::lifecycle_hooks::ReadinessError::Timeout { .. }
+        ),
+        "expected Timeout, got {err:?}"
+    );
+    assert!(!pool.is_ready(), "timeout must leave pool NotReady");
+    assert!(matches!(
+        pool.dispatch(b"x".to_vec(), 5),
+        Err(DispatchError::NotReady)
+    ));
 }

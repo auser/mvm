@@ -4483,9 +4483,11 @@ dependencies = [
  "objc2-foundation",
  "predicates",
  "rand 0.8.6",
+ "serde",
  "serde_json",
  "tempfile",
  "tokio",
+ "toml",
 ]
 
 [[package]]

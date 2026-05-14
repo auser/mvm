@@ -21,7 +21,7 @@ pub(in crate::commands) enum ConfigAction {
     Edit,
     /// Set a single config key
     Set {
-        /// Config key (e.g. lima_cpus)
+        /// Config key (e.g. dev_vm_cpus)
         key: String,
         /// New value
         value: String,

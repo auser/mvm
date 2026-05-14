@@ -9,7 +9,7 @@ use crate::ui;
 
 /// Run the `mvm security status` command.
 ///
-/// Probes the host/Lima VM for security feature availability across
+/// Probes the host/builder VM for security feature availability across
 /// [`SecurityLayer`] variants and produces a posture report.
 pub fn run(json: bool) -> Result<()> {
     let checks = collect_checks();
@@ -232,11 +232,11 @@ fn no_vm_check(layer: SecurityLayer, name: &str) -> PostureCheck {
         layer,
         name: name.to_string(),
         passed: false,
-        detail: "Lima VM not running".to_string(),
+        detail: "builder VM not running".to_string(),
     }
 }
 
-/// Quick probe to see if the Lima VM is reachable.
+/// Quick probe to see if the builder VM is reachable.
 fn vm_is_reachable() -> bool {
     shell::run_in_vm_stdout("echo ok").is_ok()
 }
@@ -334,7 +334,7 @@ mod tests {
     fn test_no_vm_check_always_fails() {
         let check = no_vm_check(SecurityLayer::SeccompFilter, "Seccomp strict profile");
         assert!(!check.passed);
-        assert!(check.detail.contains("Lima VM not running"));
+        assert!(check.detail.contains("builder VM not running"));
     }
 
     #[test]

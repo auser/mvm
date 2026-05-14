@@ -41,17 +41,16 @@ description: Complete command reference for mvmctl.
 
 | Command | Description |
 |---------|-------------|
-| `mvmctl bootstrap` | Full setup from scratch: Homebrew deps (macOS), Lima, Firecracker, kernel, rootfs (idempotent — safe to re-run) |
+| `mvmctl bootstrap` | Full setup from scratch: Homebrew deps (macOS), Firecracker, kernel, rootfs (idempotent — safe to re-run) |
 | `mvmctl bootstrap --production` | Production mode (skip Homebrew, assume Linux with apt) |
-| `mvmctl dev [up]` | Auto-bootstrap if needed, start dev VM, drop into shell. Uses Apple Container on macOS 26+, Lima otherwise. |
+| `mvmctl dev [up]` | Auto-bootstrap if needed, start dev VM, drop into shell. Uses Apple Container on macOS 26+; native KVM on Linux. |
 | `mvmctl dev up --project ~/dir` | Auto-bootstrap then cd into a project directory |
 | `mvmctl dev up --metrics-port PORT` | Bind a Prometheus metrics endpoint (0 = disabled) |
 | `mvmctl dev up --watch-config` | Reload ~/.mvm/config.toml automatically when it changes |
-| `mvmctl dev up --lima` | Force Lima backend even on macOS 26+ |
 | `mvmctl dev up --shell` (or `-s`) | Open an interactive shell after starting |
-| `mvmctl dev down` | Stop the Lima development VM |
+| `mvmctl dev down` | Stop the dev VM |
 | `mvmctl dev down --reset` | Also delete the cached dev image so the next `dev up` rebuilds from local source |
-| `mvmctl dev shell` | Open a shell in the running Lima VM |
+| `mvmctl dev shell` | Open a shell in the running dev VM |
 | `mvmctl dev shell --project ~/dir` | Open shell and cd into a project directory |
 | `mvmctl dev status` | Show dev environment backend, running state, and cached image paths |
 | `mvmctl dev rebuild` | Stop, clear cache, and rebuild + restart the dev VM |
@@ -128,7 +127,7 @@ description: Complete command reference for mvmctl.
 |---------|-------------|
 | `mvmctl config show` | Print current config as TOML |
 | `mvmctl config edit` | Open the config file in $EDITOR (falls back to nano) |
-| `mvmctl config set <key> <value>` | Set a single config key (e.g. `mvmctl config set lima_cpus 4`) |
+| `mvmctl config set <key> <value>` | Set a single config key (e.g. `mvmctl config set dev_vm_cpus 4`) |
 
 ## Audit
 
@@ -196,8 +195,14 @@ dev-feature guest agent; production guests should use `mvmctl invoke`.
 | `mvmctl run --cpus <n> --memory <size> -- <cmd>` | Resize the transient VM |
 | `mvmctl run --timeout <secs> -- <cmd>` | Per-command timeout |
 | `mvmctl run --receipt <path> -- <cmd>` | Write a signed JSON receipt with invocation hashes, output hashes, and exit status. Raw argv, env values, stdout, and stderr are not stored. |
+| `mvmctl run --json -- <cmd>` | Print a redacted JSON execution summary with invocation metadata and output hashes. Guest stdout/stderr are not streamed. |
+| `mvmctl run --json --receipt <path> -- <cmd>` | Print the same JSON summary and also write a signed receipt artifact |
 | `mvmctl receipt verify <path>` | Verify a signed run receipt against `~/.mvm/keys/host-signer.pub` |
 | `mvmctl receipt verify <path> --pubkey <path>` | Verify a signed run receipt against an explicit raw Ed25519 public key |
+
+`run --json` is intended for machine callers. It preserves the command's exit
+code, but the JSON does not include raw argv, env values, stdout, stderr, or host
+paths.
 
 ## Sandbox State
 
@@ -206,10 +211,13 @@ dev-feature guest agent; production guests should use `mvmctl invoke`.
 | `mvmctl sandbox gc` | Dry-run cleanup of stale sandbox name-registry entries for stopped or expired VMs |
 | `mvmctl sandbox gc --dry-run` | Explicit dry-run; reports candidates and does not mutate state |
 | `mvmctl sandbox gc --apply` | Remove stale stopped/expired registry entries and emit a `SandboxGc` audit entry |
+| `mvmctl sandbox gc --json` | Print a machine-readable GC summary with candidates, reasons, and removed count |
 
 `sandbox gc` never tears down a live VM. Entries that still appear as starting,
 running, or paused in a backend listing are skipped; cleanup only removes stale
 host registry records.
+`--json` does not change the safety mode: cleanup remains dry-run unless
+`--apply` is also passed.
 
 ## File Copy
 
@@ -220,11 +228,15 @@ host registry records.
 | `mvmctl cp --force <src> <dst>` | Overwrite an existing destination |
 | `mvmctl cp --create-parents <src> <dst>` | Create destination parent directories |
 | `mvmctl cp --max-bytes <n> <src> <dst>` | Refuse copies larger than the byte cap. Default: 16 MiB |
+| `mvmctl cp --json <src> <dst>` | Print a machine-readable copy summary without host paths or file contents |
 
 Exactly one endpoint must use `VM:/absolute/path` form. Guest paths are
 validated by the guest agent's filesystem policy before any read or write. Host
 paths and file contents are not written to audit logs; successful copies emit
 `VmFileCopy` with direction, guest path, and byte count.
+`--json` follows the same redaction rule: the summary includes direction, VM
+name, guest path, copied byte count, and effective copy options, but not the
+host endpoint.
 
 `mvmctl exec` boots a fresh transient microVM, runs a single command, and tears it
 down on exit — like `cco` or `docker run --rm`, but with a Firecracker microVM

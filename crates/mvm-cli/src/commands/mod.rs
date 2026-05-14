@@ -45,7 +45,7 @@ pub(in crate::commands) struct Cli {
 pub(in crate::commands) enum Commands {
     /// Full environment setup from scratch
     Bootstrap(env::bootstrap::Args),
-    /// Manage the Lima development environment (up, down, shell, status)
+    /// Manage the dev VM (up, down, shell, status). macOS uses Apple Container; Linux uses native KVM.
     Dev(env::dev::Args),
     /// Remove old dev-build artifacts and run Nix garbage collection
     Cleanup(env::cleanup::Args),
@@ -99,7 +99,7 @@ pub(in crate::commands) enum Commands {
     Metrics(ops::metrics::Args),
     /// Read or write global operator config (~/.mvm/config.toml)
     Config(ops::config::Args),
-    /// Remove Lima VM, Firecracker binary, and all mvm state (clean uninstall)
+    /// Remove the dev VM, Firecracker binary, and all mvm state (clean uninstall)
     Uninstall(env::uninstall::Args),
     /// View the local audit log (~/.mvm/log/audit.jsonl)
     Audit(ops::audit::Args),
@@ -305,7 +305,7 @@ pub fn run() -> Result<()> {
         tracing::warn!("failed to install signal handler: {e}");
     }
 
-    // Load operator config once; used as fallback for lima_cpus, lima_mem, cpus, memory.
+    // Load operator config once; used as fallback for dev_vm_cpus, dev_vm_mem_gib, cpus, memory.
     let cfg = mvm_core::user_config::load(None);
 
     // Plan 60 Phase 4 — wrap dispatch in cmd.<verb>.{invoked,completed,failed}

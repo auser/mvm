@@ -113,10 +113,9 @@ pub fn check_homebrew() -> Result<()> {
 /// Print an informational hint about libkrun availability (plan 53
 /// §"Plan E"). libkrun is optional — when it's available, `mvmctl run`
 /// can use it as a Tier 2 backend on macOS Intel and macOS <26 (where
-/// Apple Container is unavailable) without going through Lima. This
-/// function does *not* attempt to install libkrun automatically since
-/// it lives in the host's package manager (Homebrew on macOS, distro
-/// packages on Linux).
+/// Apple Container is unavailable). This function does *not* attempt
+/// to install libkrun automatically since it lives in the host's
+/// package manager (Homebrew on macOS, distro packages on Linux).
 ///
 /// Idempotent and safe to call from any bootstrap path.
 pub fn hint_libkrun_if_useful() {
@@ -134,10 +133,10 @@ pub fn hint_libkrun_if_useful() {
     }
     // Only suggest the install on platforms where libkrun would
     // materially improve the user experience — i.e. macOS without
-    // Apple Container, where today the only path is Lima.
+    // Apple Container.
     if matches!(plat, Platform::MacOS) && !plat.has_apple_containers() {
         ui::info(&format!(
-            "Tip: install libkrun for a no-Lima Tier 2 microVM path on this Mac.\n  {}",
+            "Tip: install libkrun for a Tier 2 microVM path on this Mac.\n  {}",
             mvm_libkrun::install_hint()
         ));
     }

@@ -842,12 +842,12 @@ fn test_config_show_parses() {
 
 #[test]
 fn test_config_set_parses() {
-    let cli = Cli::try_parse_from(["mvmctl", "config", "set", "lima_cpus", "4"]).unwrap();
+    let cli = Cli::try_parse_from(["mvmctl", "config", "set", "dev_vm_cpus", "4"]).unwrap();
     match cli.command {
         Commands::Config(config::Args {
             action: ConfigAction::Set { key, value },
         }) => {
-            assert_eq!(key, "lima_cpus");
+            assert_eq!(key, "dev_vm_cpus");
             assert_eq!(value, "4");
         }
         _ => panic!("Expected Config Set command"),
@@ -855,23 +855,23 @@ fn test_config_set_parses() {
 }
 
 #[test]
-fn test_config_show_output_contains_lima_cpus() {
+fn test_config_show_output_contains_dev_vm_cpus() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = mvm_core::user_config::MvmConfig::default();
     mvm_core::user_config::save(&cfg, Some(tmp.path())).unwrap();
     let loaded = mvm_core::user_config::load(Some(tmp.path()));
     let text = toml::to_string_pretty(&loaded).unwrap();
-    assert!(text.contains("lima_cpus"));
+    assert!(text.contains("dev_vm_cpus"));
 }
 
 #[test]
 fn test_config_set_persists() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = mvm_core::user_config::load(Some(tmp.path()));
-    mvm_core::user_config::set_key(&mut cfg, "lima_cpus", "4").unwrap();
+    mvm_core::user_config::set_key(&mut cfg, "dev_vm_cpus", "4").unwrap();
     mvm_core::user_config::save(&cfg, Some(tmp.path())).unwrap();
     let reloaded = mvm_core::user_config::load(Some(tmp.path()));
-    assert_eq!(reloaded.lima_cpus, 4);
+    assert_eq!(reloaded.dev_vm_cpus, 4);
 }
 
 #[test]
@@ -1345,6 +1345,7 @@ fn run_default_profile_argv_only() {
             env,
             timeout,
             receipt,
+            json,
             launch_plan,
             argv,
         }) => {
@@ -1356,6 +1357,7 @@ fn run_default_profile_argv_only() {
             assert!(env.is_empty());
             assert_eq!(timeout, 60);
             assert!(receipt.is_none(), "receipt should default to None");
+            assert!(!json, "json should default to false");
             assert!(launch_plan.is_none(), "launch_plan should default to None");
             assert_eq!(argv, vec!["uname".to_string(), "-a".to_string()]);
         }
@@ -1412,6 +1414,18 @@ fn run_receipt_flag_parses() {
 }
 
 #[test]
+fn run_json_flag_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "run", "--json", "--", "/bin/true"]).expect("parse");
+    match cli.command {
+        Commands::Run(exec::RunArgs { json, argv, .. }) => {
+            assert!(json);
+            assert_eq!(argv, vec!["/bin/true".to_string()]);
+        }
+        _ => panic!("Expected Run command"),
+    }
+}
+
+#[test]
 fn receipt_verify_parses() {
     let cli =
         Cli::try_parse_from(["mvmctl", "receipt", "verify", "/tmp/receipt.json"]).expect("parse");
@@ -1455,13 +1469,19 @@ fn sandbox_gc_defaults_to_dry_run() {
     let cli = Cli::try_parse_from(["mvmctl", "sandbox", "gc"]).expect("parse");
     match cli.command {
         Commands::Sandbox(sandbox::Args {
-            action: sandbox::SandboxAction::Gc(sandbox::GcArgs { dry_run, apply }),
+            action:
+                sandbox::SandboxAction::Gc(sandbox::GcArgs {
+                    dry_run,
+                    apply,
+                    json,
+                }),
         }) => {
             assert!(
                 !dry_run,
                 "--dry-run flag is optional because dry-run is default"
             );
             assert!(!apply);
+            assert!(!json);
         }
         _ => panic!("Expected Sandbox gc command"),
     }
@@ -1472,10 +1492,29 @@ fn sandbox_gc_apply_parses() {
     let cli = Cli::try_parse_from(["mvmctl", "sandbox", "gc", "--apply"]).expect("parse");
     match cli.command {
         Commands::Sandbox(sandbox::Args {
-            action: sandbox::SandboxAction::Gc(sandbox::GcArgs { dry_run, apply }),
+            action:
+                sandbox::SandboxAction::Gc(sandbox::GcArgs {
+                    dry_run,
+                    apply,
+                    json,
+                }),
         }) => {
             assert!(!dry_run);
             assert!(apply);
+            assert!(!json);
+        }
+        _ => panic!("Expected Sandbox gc command"),
+    }
+}
+
+#[test]
+fn sandbox_gc_json_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "sandbox", "gc", "--json"]).expect("parse");
+    match cli.command {
+        Commands::Sandbox(sandbox::Args {
+            action: sandbox::SandboxAction::Gc(sandbox::GcArgs { json, .. }),
+        }) => {
+            assert!(json);
         }
         _ => panic!("Expected Sandbox gc command"),
     }
@@ -1507,12 +1546,26 @@ fn cp_host_to_guest_parses() {
             force,
             create_parents,
             max_bytes,
+            json,
         }) => {
             assert_eq!(source, "./host.txt");
             assert_eq!(destination, "vm1:/tmp/host.txt");
             assert!(force);
             assert!(create_parents);
             assert_eq!(max_bytes, 1024);
+            assert!(!json);
+        }
+        _ => panic!("Expected Cp command"),
+    }
+}
+
+#[test]
+fn cp_json_flag_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "cp", "--json", "./host.txt", "vm1:/tmp/host.txt"])
+        .expect("parse");
+    match cli.command {
+        Commands::Cp(cp::Args { json, .. }) => {
+            assert!(json);
         }
         _ => panic!("Expected Cp command"),
     }
@@ -1529,12 +1582,14 @@ fn cp_guest_to_host_defaults_parse() {
             force,
             create_parents,
             max_bytes,
+            json,
         }) => {
             assert_eq!(source, "vm1:/tmp/out.txt");
             assert_eq!(destination, "./out.txt");
             assert!(!force);
             assert!(!create_parents);
             assert_eq!(max_bytes, 16 * 1024 * 1024);
+            assert!(!json);
         }
         _ => panic!("Expected Cp command"),
     }

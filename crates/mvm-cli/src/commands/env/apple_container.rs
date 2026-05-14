@@ -539,12 +539,15 @@ fn plist_env_string_value(plist: &str, key: &str) -> Option<String> {
 /// Replaces a stale symlink (the nix-darwin `linux-builder` legacy
 /// pointed `current` at a root-owned `/nix/store/…-mvm-dev` path)
 /// with a real, writable directory. `create_dir_all` is a no-op
-/// against an existing symlink, so without this the microsandbox
-/// bind-mount of `out_dir` lands on the read-only Nix store path
-/// and Apple Container fails with EACCES. The libkrun virtio-fs
-/// mount hits the same EACCES — same cleanup applies to both
-/// dispatch paths.
-#[cfg(feature = "contributor-bootstrap")]
+/// against an existing symlink, so without this the libkrun
+/// virtio-fs `/out` mount lands on the read-only Nix store path
+/// and Apple Container fails with EACCES.
+///
+/// `allow(dead_code)`: only reachable under the libkrun-dispatch
+/// branch of `ensure_dev_image`, which itself is gated on
+/// `backends-builder-vm-libkrun`. Default-features-off builds
+/// don't reach this helper.
+#[allow(dead_code)]
 fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
     if let Some(parent) = std::path::Path::new(out_dir).parent() {
         std::fs::create_dir_all(parent)
@@ -578,12 +581,14 @@ fn source_checkout_requires_contributor_bootstrap(flake_dir: &str) -> anyhow::Er
 
 /// Resolve the dev image (kernel + rootfs) to absolute paths.
 ///
-/// In a source checkout: prefers the libkrun-backed builder VM
+/// In a source checkout: uses the libkrun-backed builder VM
 /// (Plan 72 W4/W5 — `LibkrunBuilderVm` runs `nix build` against the
 /// dev-shell flake from inside a microVM with a persistent 64 GiB
-/// `/nix` store). Falls back to direct microsandbox on hosts without
-/// libkrun (until that path also exceeds microsandbox's 4 GiB overlay
-/// for the rustc closure).
+/// `/nix` store). Libkrun isn't installed → loud error pointing at
+/// the install command; **no microsandbox fallback for the dev-shell
+/// image** (Plan 72 W5.C — the dev-shell rustc closure overflows
+/// microsandbox's 4 GiB overlay anyway, so a fallback that would
+/// just disk-out is worse than an actionable error).
 ///
 /// Outside a source checkout: falls back to the GitHub-release
 /// download of a pre-built image.
@@ -599,72 +604,67 @@ fn ensure_dev_image() -> Result<(String, String)> {
         return Err(source_checkout_requires_contributor_bootstrap(flake_dir));
     }
 
-    // Plan 72 W5.B — source-checkout dispatch.
+    // Plan 72 W5.B + W5.C — source-checkout dispatch.
     //
-    // Two implementation paths live here during the W5 transition.
-    // Both require `contributor-bootstrap` because Stage 0 (the
-    // microsandbox bootstrap of the builder-vm rootfs from the W2 flake)
-    // is the only way a contributor host without pre-fetched release
-    // artifacts can populate `~/.cache/mvm/builder-vm/<arch>/`. The
-    // dispatch order is:
+    // libkrun is the only supported builder for the dev-shell flake.
+    // Plan 72 W5.C removed the legacy direct-microsandbox fallback
+    // because:
     //
-    //   1. libkrun-backed builder VM (W4 launcher; preferred):
-    //      `backends-builder-vm-libkrun` compiled in AND
-    //      `mvm_libkrun::is_available()` true AND
-    //      `find_builder_vm_flake()` succeeds. This is the only path
-    //      that fits the dev-shell rustc+cargo closure, which overflows
-    //      microsandbox's hardcoded 4 GiB overlay.
+    //   1. The dev-shell rustc + cargo closure overflows microsandbox's
+    //      hardcoded 4 GiB writable overlay (the load-bearing reason
+    //      ADR-046 / Plan 72 exists). A fallback that would fail with
+    //      "No space left on device" is worse than a clear install
+    //      hint.
     //
-    //   2. Direct microsandbox build of the dev-shell flake (legacy):
-    //      kept as the fallback for hosts without libkrun. Will fail
-    //      with `No space left on device` once the dev-shell closure
-    //      catches up to the overlay limit, but unblocks contributors
-    //      on libkrun-less hosts in the interim.
+    //   2. libkrun is now a documented prerequisite for the source-
+    //      checkout dev loop on macOS Apple Silicon / Linux KVM hosts.
+    //      `mvmctl doctor` reports its absence; `brew install libkrun`
+    //      (macOS) / distro package (Linux) is the install path.
     //
-    // Failures in path 1 are loud and refuse silent fallback to path 2,
-    // since the typical failure mode (libkrun runtime mismatch,
-    // builder-vm image cache missing) is a config error that hiding
-    // behind microsandbox would mask.
-    #[cfg(feature = "contributor-bootstrap")]
-    if let Some(flake_dir) = &local_flake {
+    // microsandbox is still used INSIDE `build_image_via_libkrun` for
+    // Stage 0 (building the small Layer 1 builder VM image from the
+    // in-repo W2 flake — a closure that fits the 4 GiB overlay). That
+    // path is gated by `contributor-bootstrap` and lives in
+    // `bootstrap_builder_vm_image`. It's not a runtime fallback.
+    //
+    // Failures are loud and refuse silent fallback to the prebuilt,
+    // since the typical failure mode (libkrun runtime mismatch, builder-
+    // vm image cache missing) is a config error that hiding behind the
+    // prebuilt would mask.
+    // Gate the dispatch itself on `backends-builder-vm-libkrun`. The
+    // earlier `contributor-bootstrap` guard is intentionally stricter
+    // for source checkouts: contributors must build Layer 1 from the
+    // in-repo W2 flake instead of downloading the published builder-VM
+    // artifacts.
+    #[cfg(feature = "backends-builder-vm-libkrun")]
+    if let Some(flake_dir) = &local_flake
+        && find_builder_vm_flake().is_ok()
+    {
         let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
         prepare_dev_image_out_dir(&out_dir)?;
 
-        #[cfg(feature = "backends-builder-vm-libkrun")]
-        if mvm_libkrun::is_available() && find_builder_vm_flake().is_ok() {
-            ui::info(&format!(
-                "Building dev image via libkrun builder VM (Plan 72 W5) from: {flake_dir}"
-            ));
-            match build_image_via_libkrun(&out_dir) {
-                Ok((kernel, rootfs)) => {
-                    ui::success(&format!("Dev image ready at {out_dir}."));
-                    return Ok((kernel, rootfs));
-                }
-                Err(e) => {
-                    anyhow::bail!(
-                        "libkrun builder VM build failed (source checkout: {flake_dir}).\n{e:#}\n\n\
-                         Refusing to fall back to the published prebuilt because it would mask\n\
-                         local rootfs changes, and refusing to fall back to microsandbox because\n\
-                         the dev-shell rustc closure overflows microsandbox's 4 GiB overlay\n\
-                         (the whole reason Plan 72 exists). To force the prebuilt anyway, move\n\
-                         or delete nix/images/builder/flake.nix so the source-checkout heuristic\n\
-                         stops matching."
-                    );
-                }
-            }
+        if !mvm_libkrun::is_available() {
+            anyhow::bail!(
+                "libkrun is required to build the dev image from source (Plan 72 W5.C).\n\
+                 {}\n\n\
+                 Once installed, retry `mvmctl dev up`. If you intend to use the published\n\
+                 prebuilt instead (no local builds), move or delete\n\
+                 nix/images/builder/flake.nix so the source-checkout heuristic stops matching.",
+                mvm_libkrun::install_hint(),
+            );
         }
 
         ui::info(&format!(
-            "Building dev image via microsandbox (legacy path; Plan 72 W5 prefers libkrun) from: {flake_dir}"
+            "Building dev image via libkrun builder VM (Plan 72 W5) from: {flake_dir}"
         ));
-        match build_image_via_microsandbox(flake_dir, &out_dir) {
+        match build_image_via_libkrun(&out_dir) {
             Ok((kernel, rootfs)) => {
                 ui::success(&format!("Dev image ready at {out_dir}."));
                 return Ok((kernel, rootfs));
             }
             Err(e) => {
                 anyhow::bail!(
-                    "Dev image build failed (source checkout: {flake_dir}).\n{e:#}\n\n\
+                    "libkrun builder VM build failed (source checkout: {flake_dir}).\n{e:#}\n\n\
                      Refusing to fall back to the published prebuilt because it would mask\n\
                      local rootfs changes. To force the prebuilt anyway, move or delete\n\
                      nix/images/builder/flake.nix so the source-checkout heuristic stops matching."
@@ -1907,31 +1907,35 @@ fn find_builder_vm_flake() -> Result<String> {
 ///   image** with the large rustc closure.
 ///
 /// Source-checkout-only by design — `find_builder_vm_flake()`
-/// must succeed. Installed binaries take the download-prebuilt
-/// path (deferred to a Plan 72 W2 release-workflow follow-up).
+/// Two acquisition paths share one cache shape (matching the
+/// `LibkrunBuilderVm::run_build` `~/.cache/mvm/builder-vm/<arch>/`
+/// contract from `mvm-build/src/libkrun_builder.rs::ensure_builder_vm_image`):
 ///
-/// Requires the `contributor-bootstrap` feature for the
-/// microsandbox path. When the feature is off, returns a clear
-/// error pointing at the rebuild command.
+/// 1. **Contributor path** — when `contributor-bootstrap` is on and
+///    `find_builder_vm_flake()` returns Ok, Stage 0 microsandbox
+///    builds the W2 flake locally. This is what a contributor editing
+///    `nix/images/builder-vm/` wants: their edits show up on the very
+///    next `mvmctl dev up`, no release-pipeline round-trip.
 ///
-/// W5.B (this PR) wires this into `ensure_dev_image` — invoked
-/// during the libkrun dispatch path to populate the cache before
-/// `LibkrunBuilderVm::run_build` reads from it.
+/// 2. **End-user download path** — otherwise, fetch the per-arch
+///    artifacts the W2 release-workflow job publishes
+///    (`builder-vm-vmlinux-<arch>`, `builder-vm-rootfs-<arch>.ext4`,
+///    optional `builder-vm-<arch>.cmdline.txt` / `manifest.json`)
+///    from `releases/download/v<version>/`. SHA-256 verifies per
+///    ADR-002 §W5.1 via the published checksums file.
+///
+/// Cache hit (both `vmlinux` and `rootfs.ext4` already present) is the
+/// fast path on either branch — no work done.
+///
+/// W5.B wired this into `ensure_dev_image`; Plan 72 W5's "Layer 1
+/// outside source checkout — download the published prebuilt"
+/// follow-up landed here.
 ///
 /// `allow(dead_code)`: same justification as
-/// [`find_builder_vm_flake`] — only called when both
-/// `contributor-bootstrap` and `backends-builder-vm-libkrun` are on.
-/// The negative-path test below exercises the `cfg(not(contributor-
-/// bootstrap))` branch (which bails) and keeps the function from
-/// being silently broken in that configuration.
+/// [`find_builder_vm_flake`] — only called when
+/// `backends-builder-vm-libkrun` is on.
 #[allow(dead_code)]
 fn bootstrap_builder_vm_image() -> Result<()> {
-    let flake_dir = find_builder_vm_flake().with_context(|| {
-        "bootstrap requires a source checkout of mvm (the builder-vm flake is \
-         only present in-repo; for installed binaries the prebuilt download path \
-         from Plan 72's release-workflow follow-up will populate the cache instead)"
-    })?;
-
     let arch = if cfg!(target_arch = "aarch64") {
         "aarch64"
     } else {
@@ -1941,13 +1945,29 @@ fn bootstrap_builder_vm_image() -> Result<()> {
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
 
-    #[cfg(feature = "contributor-bootstrap")]
+    // Cache hit fast path. Skip the per-call rebuild/redownload cost
+    // when the artifacts the consumer reads (`vmlinux` + `rootfs.ext4`)
+    // already live in the per-arch cache dir. A future PR can wire
+    // `manifest.json` SHA verification here to turn this from "exists"
+    // into "hash-matches-the-current-release", but for now existence is
+    // sufficient — both producer paths populate the same files
+    // atomically.
+    let cached_kernel = format!("{out_dir}/vmlinux");
+    let cached_rootfs = format!("{out_dir}/rootfs.ext4");
+    if std::path::Path::new(&cached_kernel).is_file()
+        && std::path::Path::new(&cached_rootfs).is_file()
     {
+        ui::info(&format!("Builder VM image already cached at {out_dir}."));
+        return Ok(());
+    }
+
+    #[cfg(feature = "contributor-bootstrap")]
+    if let Ok(flake_dir) = find_builder_vm_flake() {
         ui::info(&format!(
             "Bootstrapping builder VM image via Stage 0 (microsandbox + nixos/nix:2.24.10) \
              from: {flake_dir}"
         ));
-        match build_image_via_microsandbox(&flake_dir, &out_dir) {
+        return match build_image_via_microsandbox(&flake_dir, &out_dir) {
             Ok((kernel, rootfs)) => {
                 ui::success(&format!(
                     "Builder VM image ready at {out_dir} (kernel={kernel}, rootfs={rootfs})."
@@ -1960,19 +1980,117 @@ fn bootstrap_builder_vm_image() -> Result<()> {
                  (no rustc, no cargo crates — see Plan 72 §W2). If it doesn't, the package list \
                  in nix/images/builder-vm/flake.nix needs trimming."
             )),
+        };
+    }
+
+    // No in-repo flake (installed binary) OR no contributor-bootstrap
+    // feature compiled in. Fall through to the release-artifact
+    // download path.
+    ui::info(&format!(
+        "Builder VM image not in cache; downloading published prebuilt for v{}...",
+        env!("CARGO_PKG_VERSION")
+    ));
+    download_builder_vm_image(arch, &out_dir).with_context(|| {
+        "downloading the builder VM image. The release-artifact path is the only \
+         option for installed-binary users without contributor-bootstrap; rebuild \
+         with `cargo install --path . --features contributor-bootstrap` to use the \
+         in-repo Stage 0 microsandbox path instead."
+    })?;
+    Ok(())
+}
+
+/// Download the per-arch Layer 1 builder VM artifacts published by the
+/// `builder-vm-image` release-workflow job into the local cache dir,
+/// SHA-256-verified per ADR-002 §W5.1.
+///
+/// Mirrors `download_dev_image_inner` for the dev-shell image, minus
+/// cosign signing (Plan 36 ADR-005 extends to builder-vm artifacts as
+/// a follow-up). The required artifacts are `vmlinux` + `rootfs.ext4`;
+/// `cmdline.txt` and `manifest.json` sidecars are best-effort
+/// downloads with a fallback at the `mvm-build` consumer
+/// (`ensure_builder_vm_image` uses the canonical Plan 72 §W2 cmdline
+/// when `cmdline.txt` is missing).
+#[allow(dead_code)]
+fn download_builder_vm_image(arch: &str, cache_dir: &str) -> Result<()> {
+    let version = env!("CARGO_PKG_VERSION");
+    let names = builder_vm_artifact_names(arch);
+    let base_url = format!("https://github.com/tinylabscom/mvm/releases/download/v{version}");
+    let kernel_url = format!("{base_url}/{}", names.kernel);
+    let rootfs_url = format!("{base_url}/{}", names.rootfs);
+    let cmdline_url = format!("{base_url}/{}", names.cmdline);
+    let manifest_url = format!("{base_url}/{}", names.manifest);
+    let checksums_url = format!("{base_url}/{}", names.checksums);
+
+    // Required artifacts only; sidecars get best-effort treatment
+    // below. `fetch_expected_hashes` enforces that the checksum file
+    // contains entries for everything in `wanted` before any download
+    // starts.
+    let expected = fetch_expected_hashes(&checksums_url, &[&names.kernel, &names.rootfs])?;
+
+    ui::info("  Fetching kernel...");
+    let kernel_path = format!("{cache_dir}/vmlinux");
+    download_file(&kernel_url, &kernel_path).map_err(|e| {
+        bump_verify_outcome("network");
+        e.context(format!(
+            "Failed to download builder VM kernel from {kernel_url}"
+        ))
+    })?;
+    verify_artifact_hash(&kernel_path, &names.kernel, expected.get(&names.kernel))?;
+
+    ui::info("  Fetching rootfs...");
+    let rootfs_path = format!("{cache_dir}/rootfs.ext4");
+    download_file(&rootfs_url, &rootfs_path).map_err(|e| {
+        bump_verify_outcome("network");
+        e.context(format!(
+            "Failed to download builder VM rootfs from {rootfs_url}"
+        ))
+    })?;
+    verify_artifact_hash(&rootfs_path, &names.rootfs, expected.get(&names.rootfs))?;
+
+    // Sidecars — best-effort. `cmdline.txt` has a documented fallback
+    // in `mvm-build::libkrun_builder::ensure_builder_vm_image`;
+    // `manifest.json` is informational. A 404 on either is fine; a
+    // hash mismatch when the file IS present is still a hard fail.
+    if let Some(expected_cmdline) = expected.get(&names.cmdline) {
+        let cmdline_path = format!("{cache_dir}/cmdline.txt");
+        if download_file(&cmdline_url, &cmdline_path).is_ok() {
+            verify_artifact_hash(&cmdline_path, &names.cmdline, Some(expected_cmdline))?;
+        }
+    }
+    if let Some(expected_manifest) = expected.get(&names.manifest) {
+        let manifest_path = format!("{cache_dir}/manifest.json");
+        if download_file(&manifest_url, &manifest_path).is_ok() {
+            verify_artifact_hash(&manifest_path, &names.manifest, Some(expected_manifest))?;
         }
     }
 
-    #[cfg(not(feature = "contributor-bootstrap"))]
-    {
-        let _ = flake_dir;
-        let _ = out_dir;
-        anyhow::bail!(
-            "Builder VM Stage 0 bootstrap requires the `contributor-bootstrap` feature. \
-             Rebuild with `cargo install --path . --features contributor-bootstrap` \
-             (source-checkout contributors) or wait for Plan 72's release-workflow \
-             follow-up that publishes the builder-vm prebuilt."
-        );
+    ui::success(&format!(
+        "Builder VM image downloaded, hash-verified, and cached at {cache_dir}."
+    ));
+    Ok(())
+}
+
+/// Per-arch artifact filenames the release workflow's
+/// `builder-vm-image` job uploads. Pure function — no I/O, no
+/// network — so the unit test can verify naming matches the
+/// release.yml side without touching the network.
+#[allow(dead_code)]
+struct BuilderVmArtifactNames {
+    kernel: String,
+    rootfs: String,
+    cmdline: String,
+    manifest: String,
+    checksums: String,
+}
+
+#[allow(dead_code)]
+fn builder_vm_artifact_names(arch: &str) -> BuilderVmArtifactNames {
+    BuilderVmArtifactNames {
+        kernel: format!("builder-vm-vmlinux-{arch}"),
+        rootfs: format!("builder-vm-rootfs-{arch}.ext4"),
+        cmdline: format!("builder-vm-{arch}.cmdline.txt"),
+        manifest: format!("builder-vm-{arch}.manifest.json"),
+        checksums: format!("builder-vm-{arch}-checksums-sha256.txt"),
     }
 }
 
@@ -1996,10 +2114,11 @@ fn bootstrap_builder_vm_image() -> Result<()> {
 ///   - confirmed `find_builder_vm_flake().is_ok()` (Layer 1 source is
 ///     present in the workspace),
 ///   - run [`prepare_dev_image_out_dir`] on `out_dir`.
-#[cfg(all(
-    feature = "contributor-bootstrap",
-    feature = "backends-builder-vm-libkrun"
-))]
+// Gated only on `backends-builder-vm-libkrun` after Plan 72 W5.C:
+// `bootstrap_builder_vm_image` handles the no-`contributor-bootstrap`
+// case via the release-artifact download path. Stage 0 microsandbox
+// is the contributor fast-path, not a hard requirement.
+#[cfg(feature = "backends-builder-vm-libkrun")]
 fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     use mvm_build::builder_vm::{BuilderJob, BuilderMounts, BuilderVm, host_system_linux};
     use mvm_build::libkrun_builder::LibkrunBuilderVm;
@@ -2542,22 +2661,26 @@ mod builder_vm_bootstrap_tests {
         );
     }
 
-    /// When the `contributor-bootstrap` feature is OFF, Stage 0
-    /// has no driver and the bootstrap must error with the
-    /// rebuild hint rather than silently no-op.
-    #[cfg(not(feature = "contributor-bootstrap"))]
+    /// Per-arch artifact filenames must match what the release
+    /// workflow's `builder-vm-image` job uploads. Pure function —
+    /// asserts the contract between `builder_vm_artifact_names()`
+    /// (the consumer side that constructs download URLs) and the
+    /// `cp "$STORE_PATH/..." "staging/builder-vm-..."` lines in
+    /// `.github/workflows/release.yml` (the producer side).
     #[test]
-    fn bootstrap_builder_vm_image_errors_without_contributor_bootstrap() {
-        let err = bootstrap_builder_vm_image()
-            .expect_err("expected an error when contributor-bootstrap is off")
-            .to_string();
-        assert!(
-            err.contains("contributor-bootstrap"),
-            "error should mention the missing feature: {err}"
-        );
-        assert!(
-            err.contains("Rebuild") || err.contains("--features"),
-            "error should hint at the rebuild command: {err}"
-        );
+    fn builder_vm_artifact_names_match_release_workflow() {
+        let n = builder_vm_artifact_names("aarch64");
+        assert_eq!(n.kernel, "builder-vm-vmlinux-aarch64");
+        assert_eq!(n.rootfs, "builder-vm-rootfs-aarch64.ext4");
+        assert_eq!(n.cmdline, "builder-vm-aarch64.cmdline.txt");
+        assert_eq!(n.manifest, "builder-vm-aarch64.manifest.json");
+        assert_eq!(n.checksums, "builder-vm-aarch64-checksums-sha256.txt");
+
+        let n = builder_vm_artifact_names("x86_64");
+        assert_eq!(n.kernel, "builder-vm-vmlinux-x86_64");
+        assert_eq!(n.rootfs, "builder-vm-rootfs-x86_64.ext4");
+        assert_eq!(n.cmdline, "builder-vm-x86_64.cmdline.txt");
+        assert_eq!(n.manifest, "builder-vm-x86_64.manifest.json");
+        assert_eq!(n.checksums, "builder-vm-x86_64-checksums-sha256.txt");
     }
 }

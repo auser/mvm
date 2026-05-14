@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result};
 use clap::{Args as ClapArgs, Subcommand};
+use serde::Serialize;
 use std::collections::BTreeSet;
 
 use mvm_backend::backend::AnyBackend;
@@ -30,15 +31,19 @@ pub(in crate::commands) struct GcArgs {
     /// Actually remove stale registry entries.
     #[arg(long)]
     pub apply: bool,
+    /// Print a machine-readable GC summary as JSON.
+    #[arg(long)]
+    pub json: bool,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
 struct GcCandidate {
     name: String,
     reason: GcReason,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "kebab-case")]
 enum GcReason {
     ExpiredStopped,
     Stopped,
@@ -51,6 +56,16 @@ impl GcReason {
             Self::Stopped => "stopped",
         }
     }
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct GcSummary {
+    schema_version: u32,
+    dry_run: bool,
+    applied: bool,
+    candidate_count: usize,
+    removed_count: usize,
+    candidates: Vec<GcCandidate>,
 }
 
 pub(in crate::commands) fn run(cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
@@ -74,19 +89,8 @@ fn run_gc(_cli: &Cli, args: GcArgs, _cfg: &MvmConfig) -> Result<()> {
     let dry_run = !args.apply;
 
     if dry_run {
-        if candidates.is_empty() {
-            println!("sandbox gc: no stale sandbox registry entries (dry-run)");
-            return Ok(());
-        }
-        println!(
-            "sandbox gc: would remove {} stale registry entr{} (dry-run):",
-            candidates.len(),
-            if candidates.len() == 1 { "y" } else { "ies" }
-        );
-        for candidate in &candidates {
-            println!("  {} ({})", candidate.name, candidate.reason.as_str());
-        }
-        println!("re-run with --apply to actually remove registry entries");
+        let summary = GcSummary::new(true, 0, candidates);
+        emit_gc_summary(&summary, args.json)?;
         return Ok(());
     }
 
@@ -100,22 +104,76 @@ fn run_gc(_cli: &Cli, args: GcArgs, _cfg: &MvmConfig) -> Result<()> {
         )
     })?;
 
-    println!(
-        "sandbox gc: removed {} stale registry entr{}",
-        candidates.len(),
-        if candidates.len() == 1 { "y" } else { "ies" }
-    );
-    for candidate in &candidates {
-        println!("  {} ({})", candidate.name, candidate.reason.as_str());
-    }
+    let removed_count = candidates.len();
+    let summary = GcSummary::new(false, removed_count, candidates);
+    emit_gc_summary(&summary, args.json)?;
 
-    let names: Vec<&str> = candidates.iter().map(|c| c.name.as_str()).collect();
+    let names: Vec<&str> = summary.candidates.iter().map(|c| c.name.as_str()).collect();
     let detail = if names.len() <= 8 {
         format!("removed={},names=[{}]", names.len(), names.join(","))
     } else {
         format!("removed={}", names.len())
     };
     mvm_core::audit_emit!(SandboxGc, "{detail}");
+    Ok(())
+}
+
+impl GcSummary {
+    fn new(dry_run: bool, removed_count: usize, candidates: Vec<GcCandidate>) -> Self {
+        let candidate_count = candidates.len();
+        Self {
+            schema_version: 1,
+            dry_run,
+            applied: !dry_run,
+            candidate_count,
+            removed_count,
+            candidates,
+        }
+    }
+}
+
+fn emit_gc_summary(summary: &GcSummary, json: bool) -> Result<()> {
+    if json {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(summary).context("serializing sandbox gc JSON summary")?
+        );
+        return Ok(());
+    }
+
+    if summary.dry_run {
+        if summary.candidates.is_empty() {
+            println!("sandbox gc: no stale sandbox registry entries (dry-run)");
+            return Ok(());
+        }
+        println!(
+            "sandbox gc: would remove {} stale registry entr{} (dry-run):",
+            summary.candidates.len(),
+            if summary.candidates.len() == 1 {
+                "y"
+            } else {
+                "ies"
+            }
+        );
+        for candidate in &summary.candidates {
+            println!("  {} ({})", candidate.name, candidate.reason.as_str());
+        }
+        println!("re-run with --apply to actually remove registry entries");
+        return Ok(());
+    }
+
+    println!(
+        "sandbox gc: removed {} stale registry entr{}",
+        summary.removed_count,
+        if summary.removed_count == 1 {
+            "y"
+        } else {
+            "ies"
+        }
+    );
+    for candidate in &summary.candidates {
+        println!("  {} ({})", candidate.name, candidate.reason.as_str());
+    }
     Ok(())
 }
 
@@ -216,5 +274,25 @@ mod tests {
                 reason: GcReason::ExpiredStopped,
             }]
         );
+    }
+
+    #[test]
+    fn gc_summary_serializes_candidates_and_counts() {
+        let summary = GcSummary::new(
+            true,
+            0,
+            vec![GcCandidate {
+                name: "stopped".to_string(),
+                reason: GcReason::Stopped,
+            }],
+        );
+        let json = serde_json::to_string(&summary).expect("json");
+
+        assert!(json.contains("\"schema_version\":1"));
+        assert!(json.contains("\"dry_run\":true"));
+        assert!(json.contains("\"candidate_count\":1"));
+        assert!(json.contains("\"removed_count\":0"));
+        assert!(json.contains("\"name\":\"stopped\""));
+        assert!(json.contains("\"reason\":\"stopped\""));
     }
 }
