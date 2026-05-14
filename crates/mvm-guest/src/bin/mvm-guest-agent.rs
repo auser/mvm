@@ -31,6 +31,7 @@ use mvm_guest::entrypoint::{
 use mvm_guest::integrations::{
     self, IntegrationEntry, IntegrationHealthResult, IntegrationStateReport, IntegrationStatus,
 };
+use mvm_guest::lifecycle_hooks::{self, ReadinessConfig};
 use mvm_guest::probes::{self, ProbeEntry, ProbeOutputFormat, ProbeResult};
 use mvm_guest::runtime_config::{self, ConcurrencyConfig};
 use mvm_guest::vsock::{
@@ -48,6 +49,31 @@ use serde::Deserialize;
 const DEFAULT_CONFIG_PATH: &str = "/etc/mvm/agent.json";
 const DEFAULT_BUSY_THRESHOLD: f64 = 0.1;
 const DEFAULT_SAMPLE_INTERVAL_SECS: u64 = 5;
+
+// SDK port Phase 10b / Plan 73 Followup E — baked-in lifecycle hook
+// paths. The Nix factory at `nix/lib/factories/mkFunctionService.nix`
+// always emits these scripts (no-op `:` body when the user declared
+// no commands for the phase). The agent only needs to know the
+// canonical path; missing-script fall-through is handled inside
+// `lifecycle_hooks` defensively.
+const AFTER_START_HOOK: &str = "/etc/mvm/hooks/after_start.sh";
+const BEFORE_STOP_HOOK: &str = "/etc/mvm/hooks/before_stop.sh";
+
+/// Maximum time to wait for the after_start probe to exit 0 before
+/// the agent gives up. Mirrors the value Plan 73 Followup E §"Tasks"
+/// calls out (30s). On timeout, the pool stays NotReady and dispatch
+/// refuses fast.
+const READINESS_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Sleep between readiness probe attempts. 200 ms balances fast
+/// ready-detection against shell-fork overhead.
+const READINESS_INTERVAL: Duration = Duration::from_millis(200);
+
+/// Maximum time to give the before_stop hook before SIGKILL.
+const SHUTDOWN_HOOK_GRACE: Duration = Duration::from_secs(10);
+
+/// Sleep between shutdown-hook completion checks.
+const SHUTDOWN_HOOK_POLL: Duration = Duration::from_millis(200);
 
 #[derive(Deserialize)]
 struct AgentConfig {
@@ -1172,10 +1198,43 @@ fn apply_reload_to_atomics(new_cfg: &AgentConfig) {
 /// integration teardown) want orderly exit.
 fn shutdown_subsystems(grace: Duration) {
     eprintln!("mvm-guest-agent: shutdown requested; draining for up to {grace:?}");
+    // SDK port Phase 10c / Plan 73 Followup E. Run the workload's
+    // baked `before_stop.sh` hook *before* tearing down the worker
+    // pool so the hook can still see live workers (e.g. to flush
+    // application state through them). Best-effort: missing script /
+    // non-zero exit / grace overrun all log + continue. SIGKILL on
+    // the agent itself bypasses this entire path by design.
+    run_before_stop_hook();
     if let Some(Some(pool)) = WARM_POOL.get() {
         pool.shutdown(grace);
     }
     eprintln!("mvm-guest-agent: drain complete; exiting");
+}
+
+/// Fire the baked `before_stop.sh` hook with the configured grace
+/// deadline. Log-only: shutdown continues regardless of outcome. The
+/// Nix factory always bakes this script (no-op `:` body when no
+/// commands declared), but we treat `ScriptMissing` as success so a
+/// half-assembled rootfs doesn't wedge teardown.
+fn run_before_stop_hook() {
+    match lifecycle_hooks::run_shutdown_hook(
+        Path::new(BEFORE_STOP_HOOK),
+        SHUTDOWN_HOOK_GRACE,
+        SHUTDOWN_HOOK_POLL,
+    ) {
+        Ok(()) => {
+            eprintln!("mvm-guest-agent: before_stop hook completed cleanly");
+        }
+        Err(lifecycle_hooks::ShutdownError::ScriptMissing { script }) => {
+            eprintln!(
+                "mvm-guest-agent: before_stop hook `{}` not present; nothing to run",
+                script.display()
+            );
+        }
+        Err(e) => {
+            eprintln!("mvm-guest-agent: before_stop hook failed (continuing shutdown): {e}");
+        }
+    }
 }
 
 /// Validate `/etc/mvm/entrypoint` at agent boot. The result is stashed in
@@ -1217,7 +1276,20 @@ fn init_warm_pool() {
             Some(ConcurrencyConfig::WarmProcess(wp)) => match VALIDATED_ENTRYPOINT.get() {
                 Some(Ok(entry)) => match entry.try_clone() {
                     Ok(cloned) => match WorkerPool::start(wp, Arc::new(cloned), Vec::new()) {
-                        Ok(pool) => Some(pool),
+                        Ok(pool) => {
+                            // Plan 73 Followup E: run the baked
+                            // `after_start.sh` readiness probe before
+                            // letting traffic in. Pool starts in
+                            // `NotReady`; `wait_for_ready` flips it
+                            // on success, leaves it `NotReady` on
+                            // timeout/exec error so subsequent
+                            // dispatches fast-fail with `NotReady`
+                            // (host surface: Busy + "warming up"
+                            // message) rather than hitting an
+                            // unwarmed wrapper.
+                            wait_for_after_start(&pool);
+                            Some(pool)
+                        }
                         Err(e) => {
                             eprintln!(
                                 "mvm-guest-agent: warm-process pool start failed: {e}; refusing to boot"
@@ -1246,6 +1318,37 @@ fn init_warm_pool() {
         }
     };
     let _ = WARM_POOL.set(result);
+}
+
+/// Run the baked `after_start.sh` readiness probe and gate the
+/// worker pool's traffic spigot on its success. SDK port Phase 10c /
+/// Plan 73 Followup E.
+///
+/// - On success (or absent script: workload declared no after_start
+///   hook), the pool flips to ready and dispatch starts accepting
+///   invokes.
+/// - On timeout / exec error, the pool stays `NotReady`. The agent
+///   keeps the vsock listener up — operators get a host-visible log
+///   line + every dispatch returns `Busy` with a "warming up"
+///   message. Better than silently dispatching to an unready
+///   workload.
+fn wait_for_after_start(pool: &Arc<WorkerPool>) {
+    let cfg = ReadinessConfig::new(AFTER_START_HOOK)
+        .with_timeout(READINESS_TIMEOUT)
+        .with_interval(READINESS_INTERVAL);
+    match pool.wait_for_ready(&cfg) {
+        Ok(()) => {
+            eprintln!(
+                "mvm-guest-agent: warm-process pool ready (after_start probe `{AFTER_START_HOOK}` ok)"
+            );
+        }
+        Err(e) => {
+            eprintln!(
+                "mvm-guest-agent: warm-process pool not ready — after_start probe failed: {e}; \
+                 dispatches will surface NotReady until manual intervention"
+            );
+        }
+    }
 }
 
 /// Generate a per-call TMPDIR path under /tmp. The mutex guarantees only
@@ -1497,6 +1600,14 @@ fn dispatch_via_warm_pool(
         Err(DispatchError::NoLiveWorkers) => evt(EntrypointEvent::Error {
             kind: RunEntrypointError::InternalError,
             message: "warm-process pool has no live workers".into(),
+        }),
+        // Plan 73 Followup E: after_start readiness probe has not yet
+        // succeeded — workload is still warming up. Surface as Busy
+        // so the host's retry semantics apply (same as queue-full);
+        // the message distinguishes the cause for operators.
+        Err(DispatchError::NotReady) => evt(EntrypointEvent::Error {
+            kind: RunEntrypointError::Busy,
+            message: "warm-process pool warming up (after_start probe not yet ready)".into(),
         }),
     }
 }
@@ -2693,5 +2804,95 @@ mod tests {
         assert_eq!(PORT_FORWARD_TCP_HOST, "127.0.0.1");
         let parsed: std::net::IpAddr = PORT_FORWARD_TCP_HOST.parse().unwrap();
         assert!(parsed.is_loopback(), "port-forward target must be loopback");
+    }
+
+    // ─── Plan 73 Followup E — lifecycle-hook wiring tests ──────────────────
+    //
+    // The production agent points at `/etc/mvm/hooks/{after_start,
+    // before_stop}.sh` baked by the Nix factory. The unit tests below
+    // exercise the wiring helpers against tempdir-baked scripts via
+    // the underlying `mvm_guest::lifecycle_hooks` API — the production
+    // wrappers (`wait_for_after_start`, `run_before_stop_hook`) are
+    // thin path-resolution + logging shells over that API, so we test
+    // the API contract end-to-end through them by parameterizing on
+    // the path. Direct calls to `wait_for_after_start` /
+    // `run_before_stop_hook` exercise the const-path wrappers and
+    // assert they tolerate a missing production hook (the agent's
+    // unit-test environment never has `/etc/mvm/hooks/*` baked).
+
+    use std::fs;
+    use std::io::Write;
+    use std::os::unix::fs::PermissionsExt;
+    use std::path::Path as StdPath;
+
+    fn write_hook_script(dir: &StdPath, name: &str, body: &str) -> PathBuf {
+        let p = dir.join(name);
+        let mut f = fs::File::create(&p).expect("create hook script");
+        f.write_all(body.as_bytes()).expect("write hook body");
+        let mut perms = fs::metadata(&p).expect("hook metadata").permissions();
+        perms.set_mode(0o755);
+        fs::set_permissions(&p, perms).expect("chmod hook");
+        p
+    }
+
+    #[test]
+    fn run_before_stop_hook_tolerates_missing_production_path() {
+        // The const path `/etc/mvm/hooks/before_stop.sh` does not
+        // exist in unit-test environments. The wrapper must not
+        // panic, must not exit, must log + continue. We can't easily
+        // assert log content here, so the assertion is "this returns
+        // without panicking" — the wrapper has no return value.
+        run_before_stop_hook();
+    }
+
+    #[test]
+    fn run_shutdown_hook_via_lifecycle_api_writes_marker() {
+        // Mirrors plan 73 test gate §"a second workload whose
+        // before_stop.sh writes a marker file proves shutdown hooks
+        // fired on clean teardown." We can't reach the const path,
+        // but we can prove the underlying API the wrapper calls
+        // honors the contract.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let marker = tmp.path().join("stopped.marker");
+        let body = format!(
+            "#!/bin/sh\necho fired > {marker}\n",
+            marker = marker.display()
+        );
+        let script = write_hook_script(tmp.path(), "before_stop.sh", &body);
+        lifecycle_hooks::run_shutdown_hook(&script, SHUTDOWN_HOOK_GRACE, SHUTDOWN_HOOK_POLL)
+            .expect("clean shutdown hook");
+        let contents = fs::read_to_string(&marker).expect("marker file present");
+        assert_eq!(contents.trim(), "fired");
+    }
+
+    #[test]
+    fn run_shutdown_hook_via_lifecycle_api_kills_after_grace() {
+        // The shutdown wrapper SIGKILLs a runaway hook after the
+        // configured grace deadline so a buggy `before_stop.sh`
+        // can't wedge teardown.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let script = write_hook_script(tmp.path(), "slow.sh", "#!/bin/sh\nsleep 5\n");
+        let err = lifecycle_hooks::run_shutdown_hook(
+            &script,
+            Duration::from_millis(200),
+            Duration::from_millis(50),
+        )
+        .unwrap_err();
+        assert!(matches!(
+            err,
+            lifecycle_hooks::ShutdownError::GraceExceeded { .. }
+        ));
+    }
+
+    #[test]
+    fn readiness_constants_match_plan_73() {
+        // Lock in the plan's tunables — guards against an accidental
+        // edit that would silently soften the readiness deadline.
+        assert_eq!(READINESS_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(READINESS_INTERVAL, Duration::from_millis(200));
+        assert_eq!(SHUTDOWN_HOOK_GRACE, Duration::from_secs(10));
+        assert_eq!(SHUTDOWN_HOOK_POLL, Duration::from_millis(200));
+        assert_eq!(AFTER_START_HOOK, "/etc/mvm/hooks/after_start.sh");
+        assert_eq!(BEFORE_STOP_HOOK, "/etc/mvm/hooks/before_stop.sh");
     }
 }

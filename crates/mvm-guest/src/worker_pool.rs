@@ -31,6 +31,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use crate::entrypoint::{self, ControlRecord, ValidatedEntrypoint};
+use crate::lifecycle_hooks::{self, ReadinessConfig, ReadinessError};
 use crate::runtime_config::WarmProcessConfig;
 use crate::worker_protocol::{
     WorkerCallRequest, WorkerCallResponse, WorkerOutcome, read_pipe_frame, write_pipe_frame,
@@ -101,6 +102,13 @@ pub enum DispatchError {
     /// Every slot is `Dead` and respawn is failing. Surfaces as
     /// `EntrypointEvent::Error { kind: InternalError }`.
     NoLiveWorkers,
+    /// Pool processes have spawned but the `after_start.sh` readiness
+    /// probe has not yet succeeded — the workload says it's still
+    /// warming up. SDK port Phase 10c / Plan 73 Followup E. Maps to
+    /// `EntrypointEvent::Error { kind: Busy }` host-side with a
+    /// distinguishing message; admission can surface this as
+    /// "warming up" rather than overload.
+    NotReady,
 }
 
 impl std::fmt::Display for DispatchError {
@@ -109,6 +117,12 @@ impl std::fmt::Display for DispatchError {
             DispatchError::QueueFull => write!(f, "worker pool queue full"),
             DispatchError::ShuttingDown => write!(f, "worker pool is shutting down"),
             DispatchError::NoLiveWorkers => write!(f, "worker pool has no live workers"),
+            DispatchError::NotReady => {
+                write!(
+                    f,
+                    "worker pool warming up — after_start probe not yet ready"
+                )
+            }
         }
     }
 }
@@ -163,6 +177,18 @@ pub struct WorkerPool {
     /// `set_idle_timeout` (driven by the `UpdateIdleTimeout` vsock
     /// verb). The recycler-sweep thread reads this value each tick.
     idle_timeout_secs: AtomicU64,
+    /// SDK port Phase 10c / Plan 73 Followup E. Flips to `true` after
+    /// the workload's `after_start.sh` readiness probe exits 0 (or
+    /// the script is absent / the workload declares no after_start
+    /// hook). Until then, `dispatch` refuses with
+    /// [`DispatchError::NotReady`] so we don't ship invokes to a
+    /// process that hasn't said it's warm yet.
+    ///
+    /// Initialized `false` in `start()`. The agent calls
+    /// [`WorkerPool::wait_for_ready`] (blocking) or
+    /// [`WorkerPool::mark_ready`] (no probe declared) before opening
+    /// the accept loop's traffic spigot.
+    ready: AtomicBool,
 }
 
 impl WorkerPool {
@@ -220,6 +246,12 @@ impl WorkerPool {
             // `UpdateIdleTimeout` vsock verb sets this at runtime;
             // host-side reaper remains the safety net regardless.
             idle_timeout_secs: AtomicU64::new(0),
+            // Plan 73 Followup E: workers are spawned but not yet
+            // dispatchable until the after_start probe says they are
+            // (or the caller calls `mark_ready` directly because no
+            // probe was declared). `dispatch` returns `NotReady` while
+            // this is `false`.
+            ready: AtomicBool::new(false),
         });
 
         // Spawn the idle-recycler sweep thread. It reads
@@ -248,6 +280,55 @@ impl WorkerPool {
         self.idle_timeout_secs.load(Ordering::Acquire)
     }
 
+    /// Snapshot whether the pool is currently dispatchable. `false`
+    /// until `wait_for_ready` / `mark_ready` flips it; once set,
+    /// stays `true` until the pool is dropped. Plan 73 Followup E.
+    pub fn is_ready(&self) -> bool {
+        self.ready.load(Ordering::Acquire)
+    }
+
+    /// Mark the pool dispatchable without running a readiness probe.
+    /// Used by the agent when the workload declared no `after_start`
+    /// hook (the baked script is missing), and by tests that don't
+    /// want to script a probe binary. Plan 73 Followup E.
+    pub fn mark_ready(&self) {
+        self.ready.store(true, Ordering::Release);
+    }
+
+    /// Block until the after_start readiness probe at
+    /// `cfg.script_path` succeeds, then mark the pool dispatchable.
+    /// On a missing script (no `after_start` hook declared) the pool
+    /// is marked ready immediately and `Ok(())` returned — the
+    /// factory always bakes the script, but defensive handling keeps
+    /// us robust if rootfs assembly is interrupted.
+    ///
+    /// Plan 73 Followup E. Called by the agent's `init_warm_pool`
+    /// after [`WorkerPool::start`] returns, before the accept loop
+    /// begins handling traffic. On timeout / exec error, the pool
+    /// stays `NotReady` and subsequent `dispatch` calls refuse fast;
+    /// the caller can log + leave the agent up so an operator sees
+    /// the failure mode (admission gate, host log).
+    pub fn wait_for_ready(&self, cfg: &ReadinessConfig) -> Result<(), ReadinessError> {
+        match lifecycle_hooks::poll_readiness(cfg) {
+            Ok(()) => {
+                self.ready.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(ReadinessError::ScriptMissing { script }) => {
+                // No after_start hook declared (factory should always
+                // bake the script, but if it's gone, fall through
+                // cleanly — empty-hook == ready).
+                eprintln!(
+                    "mvm-guest-agent: after_start probe `{}` not present; marking pool ready",
+                    script.display()
+                );
+                self.ready.store(true, Ordering::Release);
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
     /// Dispatch one call to a free worker. Blocks (FIFO via Condvar)
     /// if all workers are busy, up to `max_queue_depth` total
     /// waiters; the `(pool_size + 1)`th waiter gets `QueueFull`.
@@ -262,6 +343,11 @@ impl WorkerPool {
         stdin: Vec<u8>,
         timeout_secs: u64,
     ) -> Result<DispatchOutcome, DispatchError> {
+        // Plan 73 Followup E: refuse dispatch until the after_start
+        // probe has succeeded. Cheap atomic load on the hot path.
+        if !self.ready.load(Ordering::Acquire) {
+            return Err(DispatchError::NotReady);
+        }
         let (idx, mut handle) = self.acquire()?;
         let pgid = handle.pid as i32;
 
@@ -711,6 +797,8 @@ mod tests {
         assert!(format!("{}", DispatchError::QueueFull).contains("queue full"));
         assert!(format!("{}", DispatchError::ShuttingDown).contains("shutting down"));
         assert!(format!("{}", DispatchError::NoLiveWorkers).contains("no live workers"));
+        // Plan 73 Followup E.
+        assert!(format!("{}", DispatchError::NotReady).contains("warming up"));
     }
 
     #[test]
