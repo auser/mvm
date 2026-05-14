@@ -1625,6 +1625,9 @@ Shipped:
 - `mvmctl run --json` emits an unsigned machine-readable execution summary
   using the same redacted invocation/outcome shape as receipts. Guest stdout
   and stderr are not streamed in JSON mode; only hashes and byte counts appear.
+- Live smoke coverage for `mvmctl run --json --receipt` is gated behind
+  `MVM_LIVE_SMOKE=1` and compares the public JSON summary to the signed
+  receipt without allowing raw guest output into either artifact.
 - `mvmctl receipt verify <path>` verifies the receipt signature against
   the local host-signer public key, with `--pubkey` for portable checks.
 - `mvmctl sandbox gc` adds a dry-run-by-default cleanup path for stale
