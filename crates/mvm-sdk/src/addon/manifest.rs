@@ -144,6 +144,11 @@ fn default_credential_ttl_hours() -> u32 {
 /// be added in a non-breaking minor release. Today only `Generated`
 /// is shipped; the registry rejects manifests that try to use any
 /// other variant at publish time.
+// allow(secret-debug): metadata enum — variants name the
+// *strategy* for credential delivery, not the credentials
+// themselves. `Generated` is a snake_case discriminator string;
+// no key material flows through this type. Same shape as
+// `MasterKeyState` in `mvm-core::domain::volume`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
