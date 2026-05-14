@@ -74,10 +74,7 @@ pub enum ReadinessError {
         "after_start readiness probe `{}` did not succeed within {elapsed:?}",
         script.display()
     )]
-    Timeout {
-        script: PathBuf,
-        elapsed: Duration,
-    },
+    Timeout { script: PathBuf, elapsed: Duration },
 
     /// The script path doesn't exist or isn't executable. Surface
     /// distinct from `ExecError` so the caller can fall through
