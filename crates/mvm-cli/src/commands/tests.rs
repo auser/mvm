@@ -12,7 +12,7 @@ use super::build::compile;
 use super::catalog;
 use super::env::{cleanup, init, uninstall};
 use super::ops::{audit, cache, config, metrics};
-use super::vm::{console, down, exec, forward, up};
+use super::vm::{console, cp, down, exec, forward, sandbox, up};
 
 use audit::AuditAction;
 use cache::CacheAction;
@@ -701,9 +701,11 @@ fn test_parse_port_spec_invalid() {
 }
 
 // -------------------------------------------------------------------------
-// Top-level verb tests (plan 40 dropped `ps`, `start`, `run`, `flake`,
+// Top-level verb tests (plan 40 dropped `ps`, `start`, `flake`,
 // `image`, `setup`, `completions`, `security` — `ls`/`up`/`validate`/
-// `catalog`/`doctor` cover the cleaned surface)
+// `catalog`/`doctor` cover the cleaned surface). `run` was reintroduced
+// later as the secure one-shot execution UX, distinct from the old `up`
+// alias.
 // -------------------------------------------------------------------------
 
 #[test]
@@ -725,9 +727,15 @@ fn test_start_verb_is_unrecognized() {
 }
 
 #[test]
-fn test_run_verb_is_unrecognized() {
-    let result = Cli::try_parse_from(["mvmctl", "run", "--flake", "."]);
-    assert!(result.is_err(), "`run` alias was dropped in plan 40");
+fn test_run_command_is_recognized() {
+    let cli = Cli::try_parse_from(["mvmctl", "run", "--", "/bin/true"]).unwrap();
+    match cli.command {
+        Commands::Run(exec::RunArgs { profile, argv, .. }) => {
+            assert_eq!(profile, exec::RunProfile::Standard);
+            assert_eq!(argv, vec!["/bin/true".to_string()]);
+        }
+        _ => panic!("Expected Run command"),
+    }
 }
 
 #[test]
@@ -1321,6 +1329,214 @@ fn exec_default_manifest_argv_only() {
             assert_eq!(argv, vec!["uname".to_string(), "-a".to_string()]);
         }
         _ => panic!("Expected Exec command"),
+    }
+}
+
+#[test]
+fn run_default_profile_argv_only() {
+    let cli = Cli::try_parse_from(["mvmctl", "run", "--", "uname", "-a"]).expect("parse");
+    match cli.command {
+        Commands::Run(exec::RunArgs {
+            manifest,
+            cpus,
+            memory,
+            profile,
+            add_dir,
+            env,
+            timeout,
+            receipt,
+            launch_plan,
+            argv,
+        }) => {
+            assert!(manifest.is_none(), "manifest should default to None");
+            assert_eq!(cpus, 2);
+            assert_eq!(memory, "512M");
+            assert_eq!(profile, exec::RunProfile::Standard);
+            assert!(add_dir.is_empty());
+            assert!(env.is_empty());
+            assert_eq!(timeout, 60);
+            assert!(receipt.is_none(), "receipt should default to None");
+            assert!(launch_plan.is_none(), "launch_plan should default to None");
+            assert_eq!(argv, vec!["uname".to_string(), "-a".to_string()]);
+        }
+        _ => panic!("Expected Run command"),
+    }
+}
+
+#[test]
+fn run_accepts_restrictive_profile() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "run",
+        "--profile",
+        "restrictive",
+        "--",
+        "/bin/true",
+    ])
+    .expect("parse");
+    match cli.command {
+        Commands::Run(exec::RunArgs { profile, argv, .. }) => {
+            assert_eq!(profile, exec::RunProfile::Restrictive);
+            assert_eq!(argv, vec!["/bin/true".to_string()]);
+        }
+        _ => panic!("Expected Run command"),
+    }
+}
+
+#[test]
+fn run_rejects_unknown_profile() {
+    let cli = Cli::try_parse_from(["mvmctl", "run", "--profile", "unsafe", "--", "/bin/true"]);
+    assert!(cli.is_err());
+}
+
+#[test]
+fn run_receipt_flag_parses() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "run",
+        "--receipt",
+        "/tmp/mvm-run-receipt.json",
+        "--",
+        "/bin/true",
+    ])
+    .expect("parse");
+    match cli.command {
+        Commands::Run(exec::RunArgs { receipt, .. }) => {
+            assert_eq!(
+                receipt.as_deref(),
+                Some(std::path::Path::new("/tmp/mvm-run-receipt.json"))
+            );
+        }
+        _ => panic!("Expected Run command"),
+    }
+}
+
+#[test]
+fn receipt_verify_parses() {
+    let cli =
+        Cli::try_parse_from(["mvmctl", "receipt", "verify", "/tmp/receipt.json"]).expect("parse");
+    match cli.command {
+        Commands::Receipt(exec::ReceiptArgs {
+            action: exec::ReceiptAction::Verify { path, pubkey: None },
+        }) => {
+            assert_eq!(path, std::path::Path::new("/tmp/receipt.json"));
+        }
+        _ => panic!("Expected Receipt verify command"),
+    }
+}
+
+#[test]
+fn receipt_verify_pubkey_flag_parses() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "receipt",
+        "verify",
+        "/tmp/receipt.json",
+        "--pubkey",
+        "/tmp/host-signer.pub",
+    ])
+    .expect("parse");
+    match cli.command {
+        Commands::Receipt(exec::ReceiptArgs {
+            action: exec::ReceiptAction::Verify { path, pubkey },
+        }) => {
+            assert_eq!(path, std::path::Path::new("/tmp/receipt.json"));
+            assert_eq!(
+                pubkey.as_deref(),
+                Some(std::path::Path::new("/tmp/host-signer.pub"))
+            );
+        }
+        _ => panic!("Expected Receipt verify command"),
+    }
+}
+
+#[test]
+fn sandbox_gc_defaults_to_dry_run() {
+    let cli = Cli::try_parse_from(["mvmctl", "sandbox", "gc"]).expect("parse");
+    match cli.command {
+        Commands::Sandbox(sandbox::Args {
+            action: sandbox::SandboxAction::Gc(sandbox::GcArgs { dry_run, apply }),
+        }) => {
+            assert!(
+                !dry_run,
+                "--dry-run flag is optional because dry-run is default"
+            );
+            assert!(!apply);
+        }
+        _ => panic!("Expected Sandbox gc command"),
+    }
+}
+
+#[test]
+fn sandbox_gc_apply_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "sandbox", "gc", "--apply"]).expect("parse");
+    match cli.command {
+        Commands::Sandbox(sandbox::Args {
+            action: sandbox::SandboxAction::Gc(sandbox::GcArgs { dry_run, apply }),
+        }) => {
+            assert!(!dry_run);
+            assert!(apply);
+        }
+        _ => panic!("Expected Sandbox gc command"),
+    }
+}
+
+#[test]
+fn sandbox_gc_rejects_apply_and_dry_run_together() {
+    let result = Cli::try_parse_from(["mvmctl", "sandbox", "gc", "--apply", "--dry-run"]);
+    assert!(result.is_err());
+}
+
+#[test]
+fn cp_host_to_guest_parses() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "cp",
+        "--force",
+        "--create-parents",
+        "--max-bytes",
+        "1024",
+        "./host.txt",
+        "vm1:/tmp/host.txt",
+    ])
+    .expect("parse");
+    match cli.command {
+        Commands::Cp(cp::Args {
+            source,
+            destination,
+            force,
+            create_parents,
+            max_bytes,
+        }) => {
+            assert_eq!(source, "./host.txt");
+            assert_eq!(destination, "vm1:/tmp/host.txt");
+            assert!(force);
+            assert!(create_parents);
+            assert_eq!(max_bytes, 1024);
+        }
+        _ => panic!("Expected Cp command"),
+    }
+}
+
+#[test]
+fn cp_guest_to_host_defaults_parse() {
+    let cli =
+        Cli::try_parse_from(["mvmctl", "cp", "vm1:/tmp/out.txt", "./out.txt"]).expect("parse");
+    match cli.command {
+        Commands::Cp(cp::Args {
+            source,
+            destination,
+            force,
+            create_parents,
+            max_bytes,
+        }) => {
+            assert_eq!(source, "vm1:/tmp/out.txt");
+            assert_eq!(destination, "./out.txt");
+            assert!(!force);
+            assert!(!create_parents);
+            assert_eq!(max_bytes, 16 * 1024 * 1024);
+        }
+        _ => panic!("Expected Cp command"),
     }
 }
 

@@ -163,6 +163,10 @@ pub enum LocalAuditKind {
     /// guest-filesystem mutation through the FsRpc surface. The
     /// `detail` field carries the operation kind and target path.
     VmFsMutate,
+    /// `mvmctl cp <src> <dst>` copied a file across the host/guest
+    /// boundary. Detail carries direction, guest path, and byte count;
+    /// host paths and file contents are deliberately omitted.
+    VmFileCopy,
     /// `mvmctl vm snapshot delete` — removes a saved snapshot from
     /// the host's snapshot store.
     SnapshotDelete,
@@ -223,6 +227,10 @@ pub enum LocalAuditKind {
     /// from the pool. Detail carries the removed volume names (or a
     /// truncated count for large sweeps).
     StorageGc,
+    /// `mvmctl sandbox gc --apply` removed stale VM name-registry
+    /// records for expired or stopped sandboxes. Detail carries the
+    /// removed count and, for small sweeps, the VM names.
+    SandboxGc,
     /// Pool-full event surfaced from a clone/snapshot attempt. Detail
     /// carries used + capacity bytes. Operators correlate with their
     /// disk-pressure alerts.

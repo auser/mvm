@@ -163,7 +163,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     }
 }
 
-fn instance_dir_for(name: &str) -> Result<String> {
+pub(super) fn instance_dir_for(name: &str) -> Result<String> {
     validate_vm_name(name).with_context(|| format!("Invalid VM name: {:?}", name))?;
     // Plan 66 W3: if a mock VM is registered at
     // `<mvm_data_dir>/mock-vms/<name>/runtime/v.sock`, route to it
