@@ -48,6 +48,7 @@ Recent maintenance:
 - [ ] Plan 74 W0 (claims hygiene and docs guardrails) in flight — new public Sandbox parity status page (`security/sandbox-parity-status.md`), `cargo xtask check-doc-claims` lint covering `<100ms` / `any OCI image` / `secrets cannot leak` / variants, `mvmforge` cleanup in `guides/exec.md` and `reference/cli-commands.md`, gap-analysis updated for current `crates/mvm-sdk` layout and mvmd ADR-0020 handoff, and a new `specs/plans/74-w1-w6-attack-plan.md` sequencing sidecar that defers risk discussion to plan 74's `## Risks` section (R1-R12).
 - [x] Added intent-bound admission profiles to signed `ExecutionPlan` v4, binding intent, seccomp tier, policy refs, secret-release posture, and audit taxonomy without adding new sandbox execution capability.
 - [x] Documented the host-orchestrated builder VM flow across the website docs, clarifying that `mvmctl build` runs from the host while Nix evaluation/builds execute inside the builder VM and runtime boot benchmarks consume already-built artifacts.
+- [x] Aligned `dev_build` with the builder VM invariant by removing the host-Nix dispatch probe from the normal path; Nix builds now route through the libkrun builder VM when builder-VM support is compiled in.
 
 ## In-flight workstreams
 
