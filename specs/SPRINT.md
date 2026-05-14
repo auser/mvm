@@ -1645,6 +1645,10 @@ Shipped:
 - `mvmctl cp --json` emits a redacted machine-readable copy summary with
   direction, VM name, guest path, byte count, and effective copy options; host
   paths and file contents are omitted.
+- `mvmctl policy explain <tenant>:<workload> [--json]` validates the same
+  policy bundle admission gates as the resolver and emits a redacted admission
+  posture summary; JSON omits raw artifact paths, audit destination URLs, and
+  egress hostnames.
 - CLI reference and parser tests cover the new command and profile surface.
 
 ### Sprint 52 success criteria

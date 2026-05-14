@@ -11,13 +11,14 @@ use super::build::build;
 use super::build::compile;
 use super::catalog;
 use super::env::{cleanup, init, uninstall};
-use super::ops::{audit, cache, config, metrics};
+use super::ops::{audit, cache, config, metrics, policy};
 use super::vm::{console, cp, down, exec, forward, sandbox, up};
 
 use audit::AuditAction;
 use cache::CacheAction;
 use catalog::CatalogAction;
 use config::ConfigAction;
+use policy::PolicyAction;
 use up::RunParams;
 
 use super::shared::{
@@ -1219,6 +1220,20 @@ fn test_resolve_network_policy_invalid_allow_entry() {
     let allow = vec!["not-a-host-port".to_string()];
     let result = resolve_network_policy(None, &allow);
     assert!(result.is_err());
+}
+
+#[test]
+fn test_policy_explain_json_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "policy", "explain", "acme:web", "--json"]).unwrap();
+    match cli.command {
+        Commands::Policy(policy::Args {
+            action: PolicyAction::Explain { bundle, json },
+        }) => {
+            assert_eq!(bundle, "acme:web");
+            assert!(json);
+        }
+        other => panic!("Expected Policy Explain command, got {other:?}"),
+    }
 }
 
 // --- Network CLI tests ---

@@ -137,6 +137,17 @@ description: Complete command reference for mvmctl.
 | `mvmctl audit tail -n <N>` | Show the last N audit events |
 | `mvmctl audit tail -f` | Follow audit log output (poll until Ctrl-C) |
 
+## Policy
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl policy show <tenant>:<workload>` | Load and print a policy bundle from `~/.mvm/policies/<tenant>/<workload>.toml` |
+| `mvmctl policy show <tenant>:<workload> --json` | Emit the canonical policy bundle JSON |
+| `mvmctl policy verify <tenant>:<workload>` | Parse the bundle and run admission validators for schema version, L4 rules, disabled egress inspectors, PII policy, and audit destinations |
+| `mvmctl policy explain <tenant>:<workload>` | Validate the bundle and print a human-readable admission posture summary |
+| `mvmctl policy explain <tenant>:<workload> --json` | Emit a redacted machine-readable admission summary with counts, defaults, enabled inspectors, and audit destination schemes. Raw artifact capture paths, audit destination URLs, and egress hostnames are omitted. |
+| `mvmctl policy update <tenant>:<workload> --from <path>` | Reserved for mvmd-signed policy updates; v0 refuses local mutation and exits with guidance |
+
 ## Flake Validation
 
 | Command | Description |
