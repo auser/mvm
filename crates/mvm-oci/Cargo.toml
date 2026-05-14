@@ -1,0 +1,27 @@
+[package]
+name = "mvm-oci"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+description = "OCI image distribution client for mvm — registry resolution, manifest fetch, digest verification. Layer fetch / unpack and rootfs materialization land in later plan 74 W1 PRs."
+
+[dependencies]
+async-trait = "0.1"
+hex.workspace = true
+oci-client = { version = "0.16", default-features = false, features = ["rustls-tls"] }
+serde.workspace = true
+serde_json.workspace = true
+sha2.workspace = true
+thiserror = "1"
+tokio = { workspace = true, features = ["macros", "rt"] }
+url = "2"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+
+[lints]
+workspace = true

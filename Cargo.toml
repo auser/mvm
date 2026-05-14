@@ -15,6 +15,13 @@ members = [
     "crates/mvm-guest",
     "crates/mvm-cli",
     "crates/mvm-mcp",
+    # plan 74 W1 — OCI image distribution client (registry resolution,
+    # manifest fetch, digest verification; layer fetch + ext4 unpack +
+    # verity generation land in subsequent W1 PRs). Anonymous-only at
+    # W1.1; private auth lands later behind the credential redaction
+    # contract from ADR-049. mvmd consumes this crate as a library per
+    # ADR-048 §"Runtime Ownership" — keep its dep closure small.
+    "crates/mvm-oci",
     # Plan 72 W3 — PID-1 for the libkrun builder VM. Linux-only at
     # runtime; the crate compiles on macOS / Windows as an inert
     # binary so workspace builds stay green for non-Linux contributors.
