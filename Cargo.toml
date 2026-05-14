@@ -19,6 +19,11 @@ members = [
     # runtime; the crate compiles on macOS / Windows as an inert
     # binary so workspace builds stay green for non-Linux contributors.
     "crates/mvm-builder-init",
+    # Plan 73 Followup B.2.x — HTTP CONNECT proxy with hostname
+    # allowlist for the builder VM's application-deps install.
+    # Linux-only at runtime; same workspace-ergonomics rule as
+    # mvm-builder-init.
+    "crates/mvm-egress-proxy",
     # plan 60 Phase 5 — build-time SDK port from ../mvmforge.
     # mvm-ir is the canonical Workload IR; mvm-sdk is the builder
     # surface; mvm-sdk-macros is a placeholder for the proc-macro
@@ -208,6 +213,11 @@ mvm-providers = { path = "crates/mvm-providers", version = "0.14.0" }
 # enable `libkrun-sys` on a host with libkrun installed.
 mvm-libkrun = { path = "crates/mvm-libkrun", version = "0.14.0" }
 mvm-backend = { path = "crates/mvm-backend", version = "0.14.0", default-features = false }
+
+# Plan 73 Followup B.2.x — builder-VM egress allowlist proxy.
+# mvm-builder-init spawns this as a subprocess before the
+# installer + tears it down after.
+mvm-egress-proxy = { path = "crates/mvm-egress-proxy", version = "0.14.0" }
 
 # Dev dependencies
 assert_cmd = "2"

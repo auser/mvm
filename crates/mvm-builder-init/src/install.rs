@@ -44,6 +44,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 
 use crate::install_spec::{GateLevel, InstallSpec, Language};
+use crate::proxy::{PROXY_URL, ProxyLifecycle};
 
 /// Subdir under `<job_dir>` that holds the installed payload. Same
 /// name as the canonical sealed-volume layout
@@ -123,6 +124,24 @@ pub trait CommandRunner {
         args: &[&str],
         log_path: Option<&Path>,
         extra_path: Option<&Path>,
+    ) -> Result<i32, String> {
+        self.run_with_env(program, args, log_path, extra_path, &[])
+    }
+
+    /// Like [`Self::run`] but accepts extra environment variables
+    /// to set on the child. The installer wrap path
+    /// ([`run_install`]) uses this to inject `HTTP_PROXY` +
+    /// `HTTPS_PROXY` pointing at the in-VM `mvm-egress-proxy`
+    /// (Plan 73 Followup B.2.x). Implementors that don't need
+    /// env-var injection can rely on the default impl of
+    /// [`Self::run`] and override only this method.
+    fn run_with_env(
+        &self,
+        program: &str,
+        args: &[&str],
+        log_path: Option<&Path>,
+        extra_path: Option<&Path>,
+        env: &[(&str, &str)],
     ) -> Result<i32, String>;
 
     /// Whether `program` resolves on PATH (with `extra_path`
@@ -144,12 +163,13 @@ pub trait CommandRunner {
 pub struct SystemCommandRunner;
 
 impl CommandRunner for SystemCommandRunner {
-    fn run(
+    fn run_with_env(
         &self,
         program: &str,
         args: &[&str],
         log_path: Option<&Path>,
         extra_path: Option<&Path>,
+        env: &[(&str, &str)],
     ) -> Result<i32, String> {
         let mut cmd = Command::new(program);
         cmd.args(args);
@@ -161,6 +181,9 @@ impl CommandRunner for SystemCommandRunner {
                 prepended.push(&path_env);
             }
             cmd.env("PATH", prepended);
+        }
+        for (k, v) in env {
+            cmd.env(k, v);
         }
 
         match log_path {
@@ -236,11 +259,31 @@ impl std::fmt::Display for InstallError {
 
 impl std::error::Error for InstallError {}
 
-/// Public entry point. Run the install pipeline for `spec`,
-/// writing the four sealed-volume artifacts (`content/`, SBOM,
-/// fetch log, CVE) into `out_dir` and the install report into
-/// `job_dir/result.json`. `runner` spawns each subprocess;
-/// `extra_path` flows into the runner so tests can stub binaries.
+/// Bundle of parameters [`run_install`] needs. Grouped into a
+/// struct so the signature stays under the workspace's
+/// `clippy::too_many_arguments = "deny"` lint (CLAUDE.md: "never
+/// suppress this lint"). All fields are mandatory except
+/// `extra_path` (which is `None` in production and a tempdir-
+/// of-stubs in tests).
+pub struct InstallContext<'a> {
+    pub spec: &'a InstallSpec,
+    pub job_dir: &'a Path,
+    pub out_dir: &'a Path,
+    pub runner: &'a dyn CommandRunner,
+    pub extra_path: Option<&'a Path>,
+    /// Egress-proxy lifecycle. Started before the installer
+    /// spawns, stopped after. Plan 73 Followup B.2.x. Production
+    /// uses [`crate::proxy::ChildProxyLifecycle`]; tests use
+    /// [`crate::proxy::NoopProxyLifecycle`] or a fake.
+    pub proxy: &'a mut dyn ProxyLifecycle,
+}
+
+/// Public entry point. Run the install pipeline for the spec in
+/// `ctx`, writing the four sealed-volume artifacts (`content/`,
+/// SBOM, fetch log, CVE) into `ctx.out_dir` and the install
+/// report into `ctx.job_dir/result.json`. The runner spawns each
+/// subprocess; `extra_path` flows into the runner so tests can
+/// stub binaries.
 ///
 /// Splitting `out_dir` from `job_dir` keeps the host's mount
 /// layout honest: the host bind-mounts the (writable) sealed-
@@ -248,13 +291,26 @@ impl std::error::Error for InstallError {}
 /// Co-locating the sidecars in `/out` lets the host rename the
 /// whole directory into the deps cache in one syscall, without
 /// shuffling files across mount points.
-pub fn run_install(
-    spec: &InstallSpec,
-    job_dir: &Path,
-    out_dir: &Path,
-    runner: &dyn CommandRunner,
-    extra_path: Option<&Path>,
-) -> Result<InstallReport, InstallError> {
+///
+/// ## Egress allowlist (Plan 73 Followup B.2.x)
+///
+/// Before invoking the installer we start `ctx.proxy` (an HTTP
+/// CONNECT proxy that refuses anything outside ADR-047's four
+/// hostnames) and set `HTTP_PROXY` + `HTTPS_PROXY` on the
+/// installer's env to `http://127.0.0.1:8443`. After the
+/// installer exits — whether successfully or not — we tear the
+/// proxy down. SBOM + CVE sidecars run *without* the proxy env:
+/// they operate against on-disk content the installer already
+/// fetched, so they don't need network.
+pub fn run_install(ctx: InstallContext<'_>) -> Result<InstallReport, InstallError> {
+    let InstallContext {
+        spec,
+        job_dir,
+        out_dir,
+        runner,
+        extra_path,
+        proxy,
+    } = ctx;
     fs::create_dir_all(out_dir)
         .map_err(|e| InstallError::Io(format!("create {}: {e}", out_dir.display())))?;
     let content_dir = out_dir.join(CONTENT_SUBDIR);
@@ -280,16 +336,44 @@ pub fn run_install(
         });
     }
 
+    // Bring the egress proxy up before the installer. The
+    // installer dials `http://127.0.0.1:8443` for every fetch;
+    // it must be listening before `uv` / `pnpm` makes the first
+    // request. A proxy startup failure is a hard error — without
+    // the allowlist the install would bypass ADR-047's gate.
+    proxy
+        .start()
+        .map_err(|e| InstallError::Io(format!("egress proxy start: {e}")))?;
+
+    // Inject HTTP_PROXY + HTTPS_PROXY on the installer's env. Both
+    // are set so `uv` (HTTPS_PROXY-aware) and `npm`-style tools
+    // that occasionally consult HTTP_PROXY both route through us.
+    // The lowercase forms (`https_proxy` / `http_proxy`) are also
+    // honored by some installers — we set them for safety even
+    // though uv/pnpm don't strictly need them.
+    let env = [
+        ("HTTPS_PROXY", PROXY_URL),
+        ("HTTP_PROXY", PROXY_URL),
+        ("https_proxy", PROXY_URL),
+        ("http_proxy", PROXY_URL),
+    ];
+
     let installer_args = installer.args(&lockfile_in_vm, &content_dir);
     let installer_args_refs: Vec<&str> = installer_args.iter().map(|s| s.as_str()).collect();
-    let installer_exit_code = runner
-        .run(
-            installer.program,
-            &installer_args_refs,
-            Some(&fetch_log),
-            extra_path,
-        )
-        .map_err(InstallError::Io)?;
+    let installer_result = runner.run_with_env(
+        installer.program,
+        &installer_args_refs,
+        Some(&fetch_log),
+        extra_path,
+        &env,
+    );
+
+    // Tear the proxy down before propagating errors / running the
+    // sidecars. SBOM + CVE don't go through the proxy (no network),
+    // so leaving it up would only delay shutdown.
+    proxy.stop();
+
+    let installer_exit_code = installer_result.map_err(InstallError::Io)?;
 
     // Best-effort SBOM + CVE; the optional-gate fallback emits a
     // CycloneDX-1.5 empty stub if the tool isn't available. The
@@ -555,13 +639,15 @@ mod tests {
     }
 
     /// Record of every command the stub runner saw. Per-call entry
-    /// has the program name + arg list + whether log_path was set.
-    /// Tests assert the right sequence of invocations.
+    /// has the program name, arg list, whether log_path was set,
+    /// and the env vars injected. Tests assert the right sequence
+    /// of invocations and that the proxy env reached the installer.
     #[derive(Debug, Clone, PartialEq, Eq)]
     struct Invocation {
         program: String,
         args: Vec<String>,
         logged: bool,
+        env: Vec<(String, String)>,
     }
 
     struct StubRunner {
@@ -604,17 +690,22 @@ mod tests {
     }
 
     impl CommandRunner for StubRunner {
-        fn run(
+        fn run_with_env(
             &self,
             program: &str,
             args: &[&str],
             log_path: Option<&Path>,
             _extra_path: Option<&Path>,
+            env: &[(&str, &str)],
         ) -> Result<i32, String> {
             self.calls.lock().unwrap().borrow_mut().push(Invocation {
                 program: program.to_string(),
                 args: args.iter().map(|s| s.to_string()).collect(),
                 logged: log_path.is_some(),
+                env: env
+                    .iter()
+                    .map(|(k, v)| ((*k).to_string(), (*v).to_string()))
+                    .collect(),
             });
             // Make the side-effect of writing real output for SBOM
             // / CVE tools explicit — without it the test for
@@ -648,22 +739,98 @@ mod tests {
         }
     }
 
+    /// Test-only proxy lifecycle that records start / stop calls
+    /// so tests can assert the install pipeline starts the proxy
+    /// before the installer + stops it after. Used in addition to
+    /// `crate::proxy::NoopProxyLifecycle` because the noop version
+    /// doesn't capture call order — and the order is the whole
+    /// point of the integration test.
+    #[derive(Debug)]
+    struct FakeProxy {
+        events: Mutex<RefCell<Vec<&'static str>>>,
+        start_result: Result<(), String>,
+    }
+
+    impl FakeProxy {
+        fn ok() -> Self {
+            Self {
+                events: Mutex::new(RefCell::new(Vec::new())),
+                start_result: Ok(()),
+            }
+        }
+
+        fn failing(reason: &str) -> Self {
+            Self {
+                events: Mutex::new(RefCell::new(Vec::new())),
+                start_result: Err(reason.to_string()),
+            }
+        }
+
+        fn events(&self) -> Vec<&'static str> {
+            self.events.lock().unwrap().borrow().clone()
+        }
+    }
+
+    impl ProxyLifecycle for FakeProxy {
+        fn start(&mut self) -> Result<(), String> {
+            self.events.lock().unwrap().borrow_mut().push("start");
+            self.start_result.clone()
+        }
+
+        fn stop(&mut self) {
+            self.events.lock().unwrap().borrow_mut().push("stop");
+        }
+
+        fn is_running(&self) -> bool {
+            // Crude: we're "running" iff start was the last event.
+            self.events
+                .lock()
+                .unwrap()
+                .borrow()
+                .last()
+                .copied()
+                .unwrap_or("")
+                == "start"
+        }
+    }
+
+    /// Convenience: run_install against the stub runner + a fake
+    /// proxy, returning both the install report and the proxy's
+    /// observed start/stop events. Keeps test arms readable.
+    fn run_install_with_fakes(
+        spec: &InstallSpec,
+        job_dir: &Path,
+        out_dir: &Path,
+        runner: &dyn CommandRunner,
+    ) -> (Result<InstallReport, InstallError>, Vec<&'static str>) {
+        let mut proxy = FakeProxy::ok();
+        let ctx = InstallContext {
+            spec,
+            job_dir,
+            out_dir,
+            runner,
+            extra_path: None,
+            proxy: &mut proxy,
+        };
+        let report = run_install(ctx);
+        let events = proxy.events();
+        (report, events)
+    }
+
     #[test]
     fn python_happy_path_runs_uv_then_sidecars() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = StubRunner::new(&["uv", "cyclonedx-py", "pip-audit"]);
-        let report = run_install(
-            &ok_spec(),
-            &tmp.path().join("job"),
-            tmp.path(),
-            &runner,
-            None,
-        )
-        .unwrap();
+        let (report, events) =
+            run_install_with_fakes(&ok_spec(), &tmp.path().join("job"), tmp.path(), &runner);
+        let report = report.unwrap();
         assert_eq!(report.installer_exit_code, 0);
         assert!(report.sbom_emitted);
         assert!(report.cve_emitted);
         assert!(report.content_path.ends_with("/content"));
+
+        // Proxy lifecycle: start before the installer, stop after.
+        assert_eq!(events, vec!["start", "stop"]);
 
         let calls = runner.calls();
         // First call: uv pip install --no-deps --requirements
@@ -674,9 +841,31 @@ mod tests {
         assert!(calls[0].args.contains(&"--no-deps".to_string()));
         assert!(calls[0].args.contains(&"/work/uv.lock".to_string()));
         assert!(calls[0].logged, "installer must tee to fetch.log");
+        // Plan 73 Followup B.2.x: HTTPS_PROXY + HTTP_PROXY env on
+        // the installer's invocation.
+        let env_keys: Vec<&str> = calls[0].env.iter().map(|(k, _)| k.as_str()).collect();
+        assert!(env_keys.contains(&"HTTPS_PROXY"), "env: {:?}", calls[0].env);
+        assert!(env_keys.contains(&"HTTP_PROXY"), "env: {:?}", calls[0].env);
+        let https = calls[0]
+            .env
+            .iter()
+            .find(|(k, _)| k == "HTTPS_PROXY")
+            .map(|(_, v)| v.as_str())
+            .unwrap();
+        assert_eq!(https, "http://127.0.0.1:8443");
 
-        // Subsequent: cyclonedx-py + pip-audit.
-        assert!(calls.iter().any(|c| c.program == "cyclonedx-py"));
+        // Subsequent: cyclonedx-py + pip-audit. Sidecars run
+        // *without* the proxy env (no network — they read on-disk
+        // content the installer fetched).
+        let sbom_call = calls
+            .iter()
+            .find(|c| c.program == "cyclonedx-py")
+            .expect("cyclonedx-py invoked");
+        assert!(
+            sbom_call.env.is_empty(),
+            "sidecars must not inherit proxy env: {:?}",
+            sbom_call.env
+        );
         assert!(calls.iter().any(|c| c.program == "pip-audit"));
 
         // Artifacts on disk.
@@ -696,14 +885,18 @@ mod tests {
             gate: GateLevel::Prod,
         };
         let runner = StubRunner::new(&["pnpm"]);
-        let report =
-            run_install(&spec, &tmp.path().join("job"), tmp.path(), &runner, None).unwrap();
+        let (report, events) =
+            run_install_with_fakes(&spec, &tmp.path().join("job"), tmp.path(), &runner);
+        let report = report.unwrap();
         assert_eq!(report.language, Language::Node);
         assert_eq!(report.gate, GateLevel::Prod);
+        assert_eq!(events, vec!["start", "stop"]);
         let calls = runner.calls();
         assert_eq!(calls[0].program, "pnpm");
         assert_eq!(calls[0].args[0], "install");
         assert!(calls[0].args.contains(&"--frozen-lockfile".to_string()));
+        // Node installer also gets proxy env.
+        assert!(calls[0].env.iter().any(|(k, _)| k == "HTTPS_PROXY"));
     }
 
     #[test]
@@ -711,18 +904,16 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // "uv" absent → InstallerMissing.
         let runner = StubRunner::new(&["cyclonedx-py", "pip-audit"]);
-        let err = run_install(
-            &ok_spec(),
-            &tmp.path().join("job"),
-            tmp.path(),
-            &runner,
-            None,
-        )
-        .unwrap_err();
+        let (result, events) =
+            run_install_with_fakes(&ok_spec(), &tmp.path().join("job"), tmp.path(), &runner);
+        let err = result.unwrap_err();
         match err {
             InstallError::InstallerMissing { program } => assert_eq!(program, "uv"),
             other => panic!("wrong variant: {other:?}"),
         }
+        // Proxy is *not* started when the installer is missing —
+        // we bail before reaching the proxy.start() call.
+        assert!(events.is_empty(), "proxy must not run if installer absent");
     }
 
     #[test]
@@ -732,18 +923,17 @@ mod tests {
         // distinction from the missing-installer case.
         let tmp = tempfile::tempdir().unwrap();
         let runner = StubRunner::new(&["uv", "cyclonedx-py", "pip-audit"]).with_exit("uv", 1);
-        let report = run_install(
-            &ok_spec(),
-            &tmp.path().join("job"),
-            tmp.path(),
-            &runner,
-            None,
-        )
-        .unwrap();
+        let (report, events) =
+            run_install_with_fakes(&ok_spec(), &tmp.path().join("job"), tmp.path(), &runner);
+        let report = report.unwrap();
         assert_eq!(report.installer_exit_code, 1);
         // Sidecars still run — the SBOM / CVE captures empty
         // state for the partial install, which is informative.
         assert!(report.sbom_emitted);
+        // Proxy still goes through its lifecycle even on installer
+        // failure (we tear it down before propagating the error so
+        // we don't leak a listening port).
+        assert_eq!(events, vec!["start", "stop"]);
     }
 
     #[test]
@@ -751,14 +941,9 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         // No `cyclonedx-py`.
         let runner = StubRunner::new(&["uv", "pip-audit"]);
-        let report = run_install(
-            &ok_spec(),
-            &tmp.path().join("job"),
-            tmp.path(),
-            &runner,
-            None,
-        )
-        .unwrap();
+        let (report, _events) =
+            run_install_with_fakes(&ok_spec(), &tmp.path().join("job"), tmp.path(), &runner);
+        let report = report.unwrap();
         assert!(
             !report.sbom_emitted,
             "stub fallback marks sbom_emitted=false"
@@ -775,14 +960,9 @@ mod tests {
     fn missing_cve_tool_emits_stub() {
         let tmp = tempfile::tempdir().unwrap();
         let runner = StubRunner::new(&["uv", "cyclonedx-py"]);
-        let report = run_install(
-            &ok_spec(),
-            &tmp.path().join("job"),
-            tmp.path(),
-            &runner,
-            None,
-        )
-        .unwrap();
+        let (report, _events) =
+            run_install_with_fakes(&ok_spec(), &tmp.path().join("job"), tmp.path(), &runner);
+        let report = report.unwrap();
         assert!(!report.cve_emitted);
         let body = fs::read_to_string(tmp.path().join(CVE_FILENAME)).unwrap();
         let parsed: serde_json::Value = serde_json::from_str(&body).unwrap();
@@ -799,8 +979,9 @@ mod tests {
             gate: GateLevel::Dev,
         };
         let runner = StubRunner::new(&["pnpm"]);
-        let report =
-            run_install(&spec, &tmp.path().join("job"), tmp.path(), &runner, None).unwrap();
+        let (report, _events) =
+            run_install_with_fakes(&spec, &tmp.path().join("job"), tmp.path(), &runner);
+        let report = report.unwrap();
         assert!(report.sbom_emitted);
         assert!(report.cve_emitted);
         let calls = runner.calls();
@@ -825,23 +1006,11 @@ mod tests {
         // dispatch so a retry produces a fresh transcript.
         let tmp = tempfile::tempdir().unwrap();
         let runner = StubRunner::new(&["uv", "cyclonedx-py", "pip-audit"]);
-        let _ = run_install(
-            &ok_spec(),
-            &tmp.path().join("job"),
-            tmp.path(),
-            &runner,
-            None,
-        )
-        .unwrap();
+        let (_, _) =
+            run_install_with_fakes(&ok_spec(), &tmp.path().join("job"), tmp.path(), &runner);
         let first = fs::read_to_string(tmp.path().join(FETCH_LOG_FILENAME)).unwrap();
-        let _ = run_install(
-            &ok_spec(),
-            &tmp.path().join("job"),
-            tmp.path(),
-            &runner,
-            None,
-        )
-        .unwrap();
+        let (_, _) =
+            run_install_with_fakes(&ok_spec(), &tmp.path().join("job"), tmp.path(), &runner);
         let second = fs::read_to_string(tmp.path().join(FETCH_LOG_FILENAME)).unwrap();
         // Truncation means we don't see the first run's content
         // duplicated in the second.
@@ -851,6 +1020,62 @@ mod tests {
             first.matches(first_marker).count(),
             "log was not truncated between runs"
         );
+    }
+
+    /// Plan 73 Followup B.2.x: if the egress proxy can't be
+    /// started, the install fails *before* the installer runs.
+    /// Bypassing the proxy would violate ADR-047's allowlist
+    /// invariant — fail-closed is mandatory.
+    #[test]
+    fn proxy_start_failure_aborts_before_installer() {
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = StubRunner::new(&["uv", "cyclonedx-py", "pip-audit"]);
+        let mut proxy = FakeProxy::failing("bind 127.0.0.1:8443: address in use");
+        let ctx = InstallContext {
+            spec: &ok_spec(),
+            job_dir: &tmp.path().join("job"),
+            out_dir: tmp.path(),
+            runner: &runner,
+            extra_path: None,
+            proxy: &mut proxy,
+        };
+        let err = run_install(ctx).unwrap_err();
+        match err {
+            InstallError::Io(msg) => {
+                assert!(msg.contains("egress proxy"), "msg: {msg}");
+                assert!(msg.contains("address in use"), "msg: {msg}");
+            }
+            other => panic!("wrong variant: {other:?}"),
+        }
+        // The installer never spawned — no uv invocation recorded.
+        let calls = runner.calls();
+        assert!(
+            !calls.iter().any(|c| c.program == "uv"),
+            "uv ran even though proxy failed: {calls:?}"
+        );
+    }
+
+    /// Plan 73 Followup B.2.x: the proxy env vars match the
+    /// `crate::proxy::PROXY_URL` constant. If someone changes
+    /// the URL on one side and forgets the other, this test
+    /// flags the drift.
+    #[test]
+    fn installer_env_uses_constant_proxy_url() {
+        use crate::proxy::PROXY_URL;
+        let tmp = tempfile::tempdir().unwrap();
+        let runner = StubRunner::new(&["uv", "cyclonedx-py", "pip-audit"]);
+        let (_, _) =
+            run_install_with_fakes(&ok_spec(), &tmp.path().join("job"), tmp.path(), &runner);
+        let calls = runner.calls();
+        let uv_call = calls.iter().find(|c| c.program == "uv").unwrap();
+        for key in ["HTTPS_PROXY", "HTTP_PROXY", "https_proxy", "http_proxy"] {
+            let v = uv_call
+                .env
+                .iter()
+                .find(|(k, _)| k == key)
+                .unwrap_or_else(|| panic!("missing env var {key} in {:?}", uv_call.env));
+            assert_eq!(v.1, PROXY_URL, "env {key} drift");
+        }
     }
 
     #[test]

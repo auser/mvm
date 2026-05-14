@@ -117,10 +117,18 @@
       # hard-gate the SBOM + CVE side once the egress allowlist
       # lands.
       #
-      # TODO(B.2.x): pin a network egress allowlist
-      # (`pypi.org`, `files.pythonhosted.org`, `registry.npmjs.org`,
-      # `objects.githubusercontent.com`) per ADR-047 §"Lifecycle
-      # gates" — today's builder VM has open egress.
+      # Plan 73 Followup B.2.x closed the egress side: the
+      # builder VM now runs `mvm-egress-proxy` (built via
+      # `mvmEgressProxyFor system`, installed at
+      # `/sbin/mvm-egress-proxy` via `extraFiles` below).
+      # `mvm-builder-init::install::run_install` spawns it
+      # before the installer + injects `HTTPS_PROXY` /
+      # `HTTP_PROXY` on `uv` / `pnpm`'s env. The proxy refuses
+      # anything outside ADR-047's four hostnames:
+      # `pypi.org`, `files.pythonhosted.org`,
+      # `registry.npmjs.org`, `objects.githubusercontent.com`.
+      # Complementary iptables drop-rule defense-in-depth is
+      # B.2.y (not in this slice).
       builderPackages = pkgs: with pkgs; [
         bashInteractive
         coreutils
@@ -178,6 +186,32 @@
           };
         };
 
+      # Build `mvm-egress-proxy` (Plan 73 Followup B.2.x) for the
+      # target system. Same `rustPlatform.buildRustPackage` shape
+      # as `mvm-builder-init` — the workspace's `Cargo.lock`
+      # drives the closure so we don't fork dep versions across
+      # the two builder-VM binaries. Tests run in CI's
+      # `cargo test --workspace` lane; `doCheck = false` here for
+      # the same reason.
+      mvmEgressProxyFor = system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "mvm-egress-proxy";
+          version = "0.14.0";
+          src = workspace;
+          cargoLock = {
+            lockFile = workspace + "/Cargo.lock";
+          };
+          buildAndTestSubdir = "crates/mvm-egress-proxy";
+          doCheck = false;
+          meta = {
+            description = "Builder-VM egress allowlist proxy (Plan 73 Followup B.2.x, ADR-047)";
+            mainProgram = "mvm-egress-proxy";
+          };
+        };
+
       # Canonical kernel cmdline for the builder VM. `LibkrunBuilderVm`
       # (Plan 72 W4) reads this from the cmdline.txt output and
       # passes it to `mvm_libkrun::KrunContext.kernel_cmdline`.
@@ -194,6 +228,7 @@
         let
           pkgs = import nixpkgs { inherit system; };
           builderInit = mvmBuilderInitFor system;
+          egressProxy = mvmEgressProxyFor system;
           # Stock nixpkgs kernel. Pass it to `mkGuest` so the rootfs
           # ships its module tree (`/lib/modules/<kver>/`); the
           # builder VM doesn't run the standard `/init` modprobe path
@@ -212,6 +247,15 @@
             extraFiles = {
               "/sbin/mvm-builder-init" =
                 "${builderInit}/bin/mvm-builder-init";
+              # Plan 73 Followup B.2.x — egress allowlist proxy.
+              # `mvm-builder-init::install::run_install` spawns
+              # this from PATH (kernel default PATH includes
+              # `/sbin`) before invoking `uv` / `pnpm`. The
+              # binary embeds the ADR-047 four-hostname list at
+              # compile time; no env-var override path on the
+              # production build.
+              "/sbin/mvm-egress-proxy" =
+                "${egressProxy}/bin/mvm-egress-proxy";
             };
             kernel = kernelPkg;
           };
@@ -221,7 +265,7 @@
         pkgs.runCommand "mvm-builder-vm-image-${system}"
           {
             passthru = {
-              inherit rootfs builderInit;
+              inherit rootfs builderInit egressProxy;
               kernel = kernelPkg;
               cmdline = builderCmdline;
             };

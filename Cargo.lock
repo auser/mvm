@@ -4174,6 +4174,7 @@ dependencies = [
 name = "mvm-builder-init"
 version = "0.14.0"
 dependencies = [
+ "libc",
  "nix 0.29.0",
  "serde_json",
  "tempfile",
@@ -4250,6 +4251,14 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+]
+
+[[package]]
+name = "mvm-egress-proxy"
+version = "0.14.0"
+dependencies = [
+ "libc",
+ "tempfile",
 ]
 
 [[package]]

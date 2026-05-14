@@ -38,10 +38,15 @@ jobs:
   #      orchestrator doesn't need privilege. Collapsing into mvmd
   #      would destroy the privilege boundary it exists to provide.
   #   2. Per-VM security primitives — L7 egress proxy
-  #      (`crates/mvm-supervisor/src/l7_proxy.rs`). Inspects outbound
-  #      HTTP from each guest. Lives next to the workload, not at the
-  #      orchestrator tier — moving to mvmd would force every per-VM
-  #      flow through the control plane.
+  #      (`crates/mvm-supervisor/src/l7_proxy.rs`) and builder-VM
+  #      install-time egress allowlist proxy
+  #      (`crates/mvm-egress-proxy/`). The L7 proxy inspects outbound
+  #      HTTP from each running guest; the install proxy enforces
+  #      ADR-047's registry allowlist inside the builder VM during
+  #      `uv pip install` / `pnpm install` (Plan 73 Followup B.2.x).
+  #      Both live next to the workload, not at the orchestrator
+  #      tier — moving either to mvmd would force every per-VM flow
+  #      through the control plane.
   #   3. Per-VM provider plumbing — Apple Container sockets
   #      (`crates/mvm-providers/src/apple_container/macos.rs`).
   #      Provider-specific guest-channel transport.
@@ -99,6 +104,7 @@ jobs:
               --glob '!**/examples/**' \
               --glob '!crates/mvm/src/hostd/**' \
               --glob '!crates/mvm-supervisor/src/l7_proxy.rs' \
+              --glob '!crates/mvm-egress-proxy/**' \
               --glob '!crates/mvm-providers/src/apple_container/**' \
               --glob '!crates/mvm-cli/src/metrics_server.rs' \
               --glob '!crates/mvm-cli/src/template_cmd.rs' \
