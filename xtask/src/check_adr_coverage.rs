@@ -161,22 +161,104 @@ fn visit(
     Ok(())
 }
 
-/// Discover ADRs in `specs/adrs/`. Returns a map `number → slug`.
+/// Discover ADRs in `specs/adrs/` and `public/src/content/docs/contributing/adr/`.
+/// Returns a map `number → slug`. The public-docs directory carries a
+/// handful of user-facing ADRs (currently 001 + 013) that are NOT
+/// duplicated under `specs/adrs/`; discovering both directories means
+/// references to those numbers resolve cleanly without forcing every
+/// public ADR to also live in `specs/adrs/`.
 fn discover_adrs(root: &Path) -> Result<BTreeMap<u32, String>> {
-    let dir = root.join("specs/adrs");
-    if !dir.exists() {
-        return Ok(BTreeMap::new());
-    }
+    let dirs = [
+        root.join("specs/adrs"),
+        root.join("public/src/content/docs/contributing/adr"),
+    ];
     let mut out = BTreeMap::new();
-    for entry in fs::read_dir(&dir).with_context(|| format!("reading {}", dir.display()))? {
-        let entry = entry?;
-        let name = entry.file_name().to_string_lossy().to_string();
-        if let Some((n, slug)) = parse_adr_filename(&name) {
-            out.insert(n, slug);
+    for dir in &dirs {
+        if !dir.exists() {
+            continue;
+        }
+        for entry in fs::read_dir(dir).with_context(|| format!("reading {}", dir.display()))? {
+            let entry = entry?;
+            let name = entry.file_name().to_string_lossy().to_string();
+            if let Some((n, slug)) = parse_adr_filename(&name) {
+                // First-wins so `specs/adrs/` takes precedence when
+                // an ADR number happens to exist in both directories
+                // (a future drift signal worth catching, but not
+                // something this lint should hard-fail on).
+                out.entry(n).or_insert(slug);
+            }
         }
     }
     Ok(out)
 }
+
+/// Numbers whose ADR file doesn't (yet) exist but whose in-code
+/// references are intentional. Each entry pairs the ADR number with a
+/// one-line rationale that appears in the lint output, so future
+/// auditors can see why the reference was tolerated.
+///
+/// Adding a new entry here should always be paired with a follow-up
+/// to either (a) write the real ADR, (b) replace references with a
+/// successor ADR, or (c) delete the references entirely. The
+/// allowlist exists to keep the CI signal clean while that work is
+/// sequenced, not to make broken references permanent.
+const KNOWN_MISSING_ADRS: &[(u32, &str)] = &[
+    (
+        9,
+        "function-call entrypoints — split across ADR-007/008/010/011 during the function-service \
+         refactor; references to the original ADR-009 number are historical",
+    ),
+    (
+        15,
+        "legacy plan-era ADR reference; no canonical doc shipped — replace refs with the relevant \
+         ADR-027/028/029 (encryption layering) or delete during a follow-up sweep",
+    ),
+    (
+        16,
+        "single legacy ref; superseded by the encryption-substrate ADRs (042 / 027) — delete in a \
+         follow-up sweep",
+    ),
+    (
+        17,
+        "legacy refs predating the cross-platform-strategy split — successor is ADR-031",
+    ),
+    (
+        18,
+        "47 refs to a legacy provider-CLI concept — successor is ADR-012 (mvm-provider-cli-contract)",
+    ),
+    (
+        19,
+        "legacy refs; no canonical doc shipped — follow-up sweep should replace with the relevant \
+         function-service ADR (008/010) or delete",
+    ),
+    (
+        20,
+        "legacy refs to a runtime-overlay precursor — successor is ADR-039 (runtime-overlay-composition)",
+    ),
+    (
+        26,
+        "single legacy ref to an unwritten ADR — delete or rewrite in a follow-up",
+    ),
+    (
+        28,
+        "legacy refs to an unwritten ADR; concept folded into ADR-027 (iroh-aware encryption) and \
+         ADR-042 (encryption substrate)",
+    ),
+    (
+        29,
+        "single legacy ref; concept folded into ADR-027 / ADR-042",
+    ),
+    (
+        36,
+        "AI-agent threat model — flagged TBD in specs/compliance/soc2-controls.md; ADR pending the \
+         agent threat model write-up",
+    ),
+    (
+        999,
+        "test literal inside this xtask's own unit tests (extract_adr_refs_finds_padded_and_unpadded) \
+         — the scanner sees its own test fixture",
+    ),
+];
 
 /// Run the check; print findings; return Err on any "[error]" line.
 pub fn run(workspace: &Path) -> Result<()> {
@@ -184,10 +266,20 @@ pub fn run(workspace: &Path) -> Result<()> {
     let refs = scan_for_refs(workspace)?;
 
     let mut errors = 0usize;
+    let known_missing: BTreeMap<u32, &'static str> = KNOWN_MISSING_ADRS.iter().copied().collect();
 
     // 1. References to non-existent ADRs (typos or stale refs).
+    //    Allowlisted numbers emit `[warn]` with the rationale; the
+    //    rest are hard errors.
     for (&n, &count) in refs.iter() {
-        if !adrs.contains_key(&n) {
+        if adrs.contains_key(&n) {
+            continue;
+        }
+        if let Some(reason) = known_missing.get(&n) {
+            println!(
+                "[warn]  ADR-{n:03} referenced {count}x; allowlisted as known-missing: {reason}"
+            );
+        } else {
             println!(
                 "[error] ADR-{n:03} referenced {count}x in code, but \
                  specs/adrs/{n:03}-*.md does not exist"
