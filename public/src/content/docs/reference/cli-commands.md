@@ -195,11 +195,19 @@ dev-feature guest agent; production guests should use `mvmctl invoke`.
 | `mvmctl run --env KEY=VAL -- <cmd>` | Inject an explicit environment variable. Repeatable; disabled by `--profile restrictive` |
 | `mvmctl run --cpus <n> --memory <size> -- <cmd>` | Resize the transient VM |
 | `mvmctl run --timeout <secs> -- <cmd>` | Per-command timeout |
+| `mvmctl run --dry-run -- <cmd>` | Validate and explain the run plan without resolving an image, booting a VM, writing a receipt, or executing the command |
+| `mvmctl run --dry-run --json -- <cmd>` | Print the dry-run preflight summary as redacted JSON |
 | `mvmctl run --receipt <path> -- <cmd>` | Write a signed JSON receipt with invocation hashes, output hashes, and exit status. Raw argv, env values, stdout, and stderr are not stored. |
 | `mvmctl run --json -- <cmd>` | Print a redacted JSON execution summary with invocation metadata and output hashes. Guest stdout/stderr are not streamed. |
 | `mvmctl run --json --receipt <path> -- <cmd>` | Print the same JSON summary and also write a signed receipt artifact |
 | `mvmctl receipt verify <path>` | Verify a signed run receipt against `~/.mvm/keys/host-signer.pub` |
 | `mvmctl receipt verify <path> --pubkey <path>` | Verify a signed run receipt against an explicit raw Ed25519 public key |
+
+`run --dry-run` is a preflight-only path. It validates profile, env-key,
+resource, and host-share policy, then reports hashes and policy-relevant
+metadata. Manifest arguments, argv, host paths, and receipt paths are hashed
+rather than printed. It deliberately does not resolve manifests, build/download
+the default image, start a VM, execute the command, or write a receipt.
 
 `run --json` is intended for machine callers. It preserves the command's exit
 code, but the JSON does not include raw argv, env values, stdout, stderr, or host

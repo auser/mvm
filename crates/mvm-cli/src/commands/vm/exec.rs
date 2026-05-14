@@ -110,6 +110,13 @@ pub(in crate::commands) struct RunArgs {
     /// artifact is needed.
     #[arg(long)]
     pub json: bool,
+    /// Validate and explain the effective run plan without booting a VM.
+    ///
+    /// This preflight never resolves, builds, or starts the selected image. It
+    /// reports hashes and policy-relevant metadata only; raw argv, env values,
+    /// and host paths are omitted.
+    #[arg(long)]
+    pub dry_run: bool,
     /// Path to an mvmforge launch document. Mutually exclusive with trailing argv.
     #[arg(long, value_name = "PATH", conflicts_with = "argv")]
     pub launch_plan: Option<String>,
@@ -178,6 +185,19 @@ pub(in crate::commands) fn run_receipt(
 
 pub(in crate::commands) fn run_secure(cli: &Cli, args: RunArgs, cfg: &MvmConfig) -> Result<()> {
     validate_run_profile(&args)?;
+    if args.dry_run {
+        let summary = RunPreflightSummary::from_args(&args)?;
+        if args.json {
+            println!(
+                "{}",
+                serde_json::to_string_pretty(&summary)
+                    .context("serializing run preflight JSON summary")?
+            );
+        } else {
+            print_run_preflight_human(&summary);
+        }
+        return Ok(());
+    }
     let receipt_path = args.receipt.clone();
     if args.json || receipt_path.is_some() {
         let receipt_input = ReceiptInput::from_run_args(&args)?;
@@ -271,18 +291,7 @@ fn build_exec_request(args: Args, command_name: &str) -> Result<crate::exec::Exe
     }
     let mut env_pairs = Vec::with_capacity(args.env.len());
     for kv in &args.env {
-        let (k, v) = kv
-            .split_once('=')
-            .ok_or_else(|| anyhow::anyhow!("--env '{kv}': expected KEY=VALUE"))?;
-        if k.is_empty() {
-            anyhow::bail!("--env '{kv}': KEY must not be empty");
-        }
-        if !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
-            || k.starts_with(|c: char| c.is_ascii_digit())
-        {
-            anyhow::bail!("--env '{kv}': KEY must match [A-Za-z_][A-Za-z0-9_]* (got '{k}')");
-        }
-        env_pairs.push((k.to_string(), v.to_string()));
+        env_pairs.push(parse_env_pair(kv)?);
     }
     // Plan 38 §4: --manifest <PATH> accepts a manifest path / dir in
     // addition to legacy names. Resolve up front so the downstream
@@ -396,6 +405,49 @@ struct RunJsonSummary {
     receipt_path: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunPreflightSummary {
+    schema_version: u32,
+    dry_run: bool,
+    will_execute: bool,
+    invocation: RunPreflightInvocation,
+    resources: RunPreflightResources,
+    image: RunPreflightImage,
+    receipt: RunPreflightReceipt,
+    notes: Vec<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunPreflightReceipt {
+    requested: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    path_sha256: Option<String>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunPreflightInvocation {
+    profile: String,
+    command: ReceiptCommand,
+    env_keys: Vec<String>,
+    add_dirs: Vec<ReceiptAddDir>,
+    timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct RunPreflightResources {
+    cpus: u32,
+    memory: String,
+    memory_mib: u32,
+    timeout_secs: u64,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+enum RunPreflightImage {
+    DefaultMicrovm,
+    Manifest { argument_sha256: String },
+}
+
 impl RunJsonSummary {
     fn from_parts(
         invocation: ReceiptInput,
@@ -407,6 +459,112 @@ impl RunJsonSummary {
             invocation,
             outcome: ReceiptOutcome::from_exec_output(output),
             receipt_path,
+        }
+    }
+}
+
+impl RunPreflightSummary {
+    fn from_args(args: &RunArgs) -> Result<Self> {
+        let memory_mib = parse_human_size(&args.memory).context("Invalid --memory")?;
+        for kv in &args.env {
+            parse_env_pair(kv)?;
+        }
+        // Force mount parsing now so dry-run rejects the same malformed or
+        // disallowed host-share specs as an actual run, without resolving an
+        // image or touching the VM runtime.
+        for spec in &args.add_dir {
+            crate::exec::AddDir::parse(spec)?;
+        }
+        let image = match args.manifest.as_ref() {
+            Some(manifest) => RunPreflightImage::Manifest {
+                argument_sha256: sha256_hex(manifest.as_bytes()),
+            },
+            None => RunPreflightImage::DefaultMicrovm,
+        };
+        let mut notes = vec![
+            "preflight only; no image was resolved, built, booted, or executed".to_string(),
+            "raw argv, env values, and host paths are intentionally omitted".to_string(),
+        ];
+        if args.receipt.is_some() {
+            notes.push(
+                "receipt path is hashed, but no receipt is written during dry-run".to_string(),
+            );
+        }
+
+        let receipt_input = ReceiptInput::from_run_args(args)?;
+
+        Ok(Self {
+            schema_version: 1,
+            dry_run: true,
+            will_execute: false,
+            invocation: RunPreflightInvocation {
+                profile: receipt_input.profile,
+                command: receipt_input.command,
+                env_keys: receipt_input.env_keys,
+                add_dirs: receipt_input.add_dirs,
+                timeout_secs: receipt_input.timeout_secs,
+            },
+            resources: RunPreflightResources {
+                cpus: args.cpus,
+                memory: args.memory.clone(),
+                memory_mib,
+                timeout_secs: args.timeout,
+            },
+            image,
+            receipt: RunPreflightReceipt {
+                requested: args.receipt.is_some(),
+                path_sha256: args
+                    .receipt
+                    .as_ref()
+                    .map(|path| sha256_hex(path.to_string_lossy().as_bytes())),
+            },
+            notes,
+        })
+    }
+}
+
+fn print_run_preflight_human(summary: &RunPreflightSummary) {
+    println!("mvmctl run dry-run: no VM will be booted");
+    match &summary.image {
+        RunPreflightImage::DefaultMicrovm => {
+            println!("image: bundled default microVM (not resolved)");
+        }
+        RunPreflightImage::Manifest { argument_sha256 } => {
+            println!("image: manifest/template argument sha256={argument_sha256} (not resolved)");
+        }
+    }
+    println!(
+        "resources: cpus={} memory={} ({} MiB) timeout={}s",
+        summary.resources.cpus,
+        summary.resources.memory,
+        summary.resources.memory_mib,
+        summary.resources.timeout_secs
+    );
+    println!("profile: {}", summary.invocation.profile);
+    println!("command: {}", summary.invocation.command.describe());
+    if summary.invocation.env_keys.is_empty() {
+        println!("env: none");
+    } else {
+        println!("env keys: {}", summary.invocation.env_keys.join(","));
+    }
+    if summary.invocation.add_dirs.is_empty() {
+        println!("host shares: none");
+    } else {
+        println!("host shares:");
+        for dir in &summary.invocation.add_dirs {
+            println!(
+                "  host_sha256={} -> {} ({})",
+                dir.host_path_sha256,
+                dir.guest_path,
+                if dir.read_only { "ro" } else { "rw" }
+            );
+        }
+    }
+    if summary.receipt.requested {
+        if let Some(path_sha256) = &summary.receipt.path_sha256 {
+            println!("receipt: requested path_sha256={path_sha256} (not written in dry-run)");
+        } else {
+            println!("receipt: requested (not written in dry-run)");
         }
     }
 }
@@ -463,6 +621,20 @@ impl ReceiptInput {
     }
 }
 
+impl ReceiptCommand {
+    fn describe(&self) -> String {
+        match self {
+            Self::Inline {
+                argv_len,
+                argv_sha256,
+            } => format!("inline argv_len={argv_len} argv_sha256={argv_sha256}"),
+            Self::LaunchPlan { path_sha256 } => {
+                format!("launch_plan path_sha256={path_sha256}")
+            }
+        }
+    }
+}
+
 impl ReceiptOutcome {
     fn from_exec_output(output: &crate::exec::ExecOutput) -> Self {
         Self {
@@ -474,6 +646,21 @@ impl ReceiptOutcome {
             stderr_bytes: output.stderr.len(),
         }
     }
+}
+
+fn parse_env_pair(kv: &str) -> Result<(String, String)> {
+    let (k, v) = kv
+        .split_once('=')
+        .ok_or_else(|| anyhow::anyhow!("--env '{kv}': expected KEY=VALUE"))?;
+    if k.is_empty() {
+        anyhow::bail!("--env '{kv}': KEY must not be empty");
+    }
+    if !k.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        || k.starts_with(|c: char| c.is_ascii_digit())
+    {
+        anyhow::bail!("--env '{kv}': KEY must match [A-Za-z_][A-Za-z0-9_]* (got '{k}')");
+    }
+    Ok((k.to_string(), v.to_string()))
 }
 
 fn write_run_receipt(
@@ -587,6 +774,7 @@ mod tests {
             timeout: 60,
             receipt: None,
             json: false,
+            dry_run: false,
             launch_plan: None,
             argv: vec!["/bin/true".to_string()],
         }
@@ -681,6 +869,44 @@ mod tests {
         assert!(json.contains("/tmp/receipt.json"));
         assert!(!json.contains("sensitive stdout"));
         assert!(!json.contains("sensitive stderr"));
+    }
+
+    #[test]
+    fn run_preflight_summary_is_redacted_and_does_not_execute() {
+        let mut args = run_args(RunProfile::Dev);
+        args.dry_run = true;
+        args.json = true;
+        args.manifest = Some("/private/manifest/mvm.toml".to_string());
+        args.argv = vec!["curl".to_string(), "token-secret".to_string()];
+        args.env.push("API_TOKEN=secret-value".to_string());
+        args.add_dir.push("/private/project:/work:ro".to_string());
+        args.receipt = Some(PathBuf::from("/tmp/run-receipt.json"));
+
+        let summary = RunPreflightSummary::from_args(&args).expect("preflight summary");
+        let json = serde_json::to_string(&summary).expect("serialize summary");
+
+        assert!(summary.dry_run);
+        assert!(!summary.will_execute);
+        assert_eq!(summary.resources.memory_mib, 512);
+        assert!(json.contains("\"kind\":\"manifest\""));
+        assert!(json.contains("API_TOKEN"));
+        assert!(json.contains("/work"));
+        assert!(json.contains("\"requested\":true"));
+        assert!(!json.contains("/tmp/run-receipt.json"));
+        assert!(!json.contains("/private/manifest/mvm.toml"));
+        assert!(!json.contains("token-secret"));
+        assert!(!json.contains("secret-value"));
+        assert!(!json.contains("/private/project"));
+    }
+
+    #[test]
+    fn run_preflight_validates_env_keys() {
+        let mut args = run_args(RunProfile::Standard);
+        args.dry_run = true;
+        args.env.push("1BAD=value".to_string());
+
+        let err = RunPreflightSummary::from_args(&args).expect_err("invalid env key");
+        assert!(err.to_string().contains("KEY must match"));
     }
 
     #[test]
