@@ -25,6 +25,10 @@ members = [
     # plan 60 Phase 5 Slice C — in-guest entrypoint runner for
     # function-call workloads, ported from mvmforge-runtime.
     "crates/mvm-runner",
+    # plan 72 W3 — PID 1 inside the Layer-1 builder VM. Linux-only
+    # at runtime (compiles to a stub on macOS so `cargo build
+    # --workspace` keeps working there).
+    "crates/mvm-builder-init",
     "xtask",
 ]
 # cargo-fuzz crates have to be excluded from the main workspace because

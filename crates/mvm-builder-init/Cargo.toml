@@ -1,0 +1,23 @@
+[package]
+name = "mvm-builder-init"
+description = "Plan 72 W3 — PID 1 inside the Layer-1 builder VM. Mounts pseudofs, brings up the persistent Nix store on /dev/vdb, starts DHCP on eth0, runs /job/cmd.sh, and powers off."
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+
+[[bin]]
+name = "mvm-builder-init"
+path = "src/main.rs"
+
+# Linux-only at runtime. Cargo workspace builds on macOS, so the
+# crate must still *compile* there — the stub in main.rs prints a
+# message and exits 1. The init logic lives in src/init.rs behind
+# `#[cfg(target_os = "linux")]` so the libc-mount calls don't even
+# reach the type checker on non-Linux.
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = { workspace = true }
+
+[lints]
+workspace = true
