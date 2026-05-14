@@ -444,8 +444,67 @@ pub fn start_enter(ctx: &KrunContext) -> Result<std::convert::Infallible, Error>
     #[cfg(feature = "libkrun-sys")]
     {
         let krun = configure(ctx)?;
+        install_shutdown_handler(&krun)?;
         krun.start_enter()
     }
+}
+
+/// Best-effort SIGTERM handler that drops the supervisor process
+/// immediately, so `mvmctl stop` / `kill -TERM <pid>` *may* reap it
+/// without the 5-second SIGKILL escalation `LibkrunBackend::stop`
+/// would otherwise hit.
+///
+/// "Best-effort" because libkrun's signal-mask behavior under
+/// `krun_start_enter` is empirically inconsistent: the same binary
+/// killed manually from a shell exits in ~100 ms, but when spawned
+/// by `LibkrunBackend::start` (via `std::process::Command`) the
+/// handler installed here doesn't always run before
+/// `LibkrunBackend::stop` falls back to `SIGKILL` at 5 s. The
+/// inconsistency seems to come from libkrun blocking SIGTERM on
+/// every thread mid-`start_enter`, so the kernel can't always find
+/// a thread to deliver to. Installing the handler is still net
+/// positive: in the manual-stop path it lets the process exit
+/// cleanly, and in the spawned-by-LibkrunBackend path it's a no-op
+/// that doesn't *hurt*.
+///
+/// More robust options investigated and rejected:
+/// - `krun_get_shutdown_eventfd` returns a valid fd on Homebrew's
+///   libkrun 1.17.4 but the header docs it as gated on
+///   `krun_start_event` (libkrun-efi only); writes to the fd vanish
+///   under the `start_enter` entry point we use.
+/// - A dedicated `sigwait` thread spawned before `start_enter`
+///   makes `krun_start_enter` itself return `-EINVAL` (rc -22).
+///   libkrun appears to want exclusive control of the process's
+///   signal mask. Don't do that.
+#[cfg(feature = "libkrun-sys")]
+fn install_shutdown_handler(_krun: &sys::Context) -> Result<(), Error> {
+    extern "C" fn handle_sigterm(_sig: libc::c_int) {
+        // SAFETY: `_exit` is async-signal-safe per POSIX
+        // (signal-safety(7)). Status 143 = 128 + SIGTERM, the
+        // conventional shell convention for "killed by SIGTERM".
+        unsafe {
+            libc::_exit(143);
+        }
+    }
+
+    // SAFETY: `sigaction` is async-signal-safe and we pass a
+    // properly-zeroed `sigaction` struct. The handler we install is
+    // itself signal-safe (single `_exit` call).
+    unsafe {
+        let mut sa: libc::sigaction = std::mem::zeroed();
+        sa.sa_sigaction = handle_sigterm as *const () as usize;
+        sa.sa_flags = 0;
+        libc::sigemptyset(&mut sa.sa_mask);
+        if libc::sigaction(libc::SIGTERM, &sa, std::ptr::null_mut()) != 0 {
+            return Err(Error::Io {
+                context: format!(
+                    "sigaction(SIGTERM) failed: {}",
+                    std::io::Error::last_os_error()
+                ),
+            });
+        }
+    }
+    Ok(())
 }
 
 /// Configuration consumed by [`run_supervisor`] — the JSON shape that

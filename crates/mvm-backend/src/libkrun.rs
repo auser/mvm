@@ -44,8 +44,16 @@ pub struct LibkrunBackend;
 const PID_FILE_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// How long [`LibkrunBackend::stop`] waits after `SIGTERM` before
-/// escalating to `SIGKILL`.
-const STOP_TIMEOUT: Duration = Duration::from_secs(5);
+/// escalating to `SIGKILL`. Tight because libkrun's signal handling
+/// under `krun_start_enter` is empirically unreliable — when the
+/// supervisor is spawned via `std::process::Command` (the production
+/// `mvmctl up` path), SIGTERM often doesn't reach the in-supervisor
+/// `sigaction` handler before we escalate. The in-supervisor handler
+/// (see `mvm_libkrun::install_shutdown_handler`) still helps the
+/// shell-stop case where SIGTERM is delivered cleanly (~200 ms); in
+/// the always-escalate cargo-spawn / launchd path a shorter timeout
+/// means `mvmctl stop` returns in 2 s instead of 5 s.
+const STOP_TIMEOUT: Duration = Duration::from_secs(2);
 
 /// Default kernel cmdline for libkrun-launched guests.
 /// `console=hvc0` matches libkrun's virtio-console wiring (plan 57 W3
