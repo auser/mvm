@@ -44,15 +44,15 @@ with open(out, "w") as f:
 "#;
 
 fn python3_on_path() -> Option<std::path::PathBuf> {
-    which::which("python3").ok().or_else(|| which::which("python").ok())
+    which::which("python3")
+        .ok()
+        .or_else(|| which::which("python").ok())
 }
 
 #[test]
 fn auto_exec_python_script_emits_recording_and_compile_lowers_it() {
     let Some(python) = python3_on_path() else {
-        eprintln!(
-            "skipping auto_exec_python_script_emits_recording: no python3/python on PATH"
-        );
+        eprintln!("skipping auto_exec_python_script_emits_recording: no python3/python on PATH");
         return;
     };
 
@@ -79,8 +79,7 @@ fn auto_exec_python_script_emits_recording_and_compile_lowers_it() {
     let bytes = std::fs::read(&out_recording).unwrap();
     let recording: mvm_sdk::runtime::RuntimeRecording =
         serde_json::from_slice(&bytes).expect("recording JSON parses");
-    let workload =
-        mvm_sdk::runtime::compile_recording(&recording).expect("lowering succeeds");
+    let workload = mvm_sdk::runtime::compile_recording(&recording).expect("lowering succeeds");
 
     assert_eq!(workload.id, "etl-test");
     match &workload.apps[0].entrypoints[0] {

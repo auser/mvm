@@ -57,7 +57,11 @@ pub(in crate::commands) struct Args {
     /// `mvm.emit_recording_json()`) from this path and lower it into
     /// a Workload before compile. Mutually exclusive with `--from-ir`
     /// and the positional entry.
-    #[arg(long = "from-recording", value_name = "PATH", conflicts_with = "from_ir")]
+    #[arg(
+        long = "from-recording",
+        value_name = "PATH",
+        conflicts_with = "from_ir"
+    )]
     pub from_recording: Option<PathBuf>,
 
     /// Output path. Directory by default; ending in `.tar.gz`/`.tgz`
@@ -185,9 +189,8 @@ fn load_workload(args: &Args) -> Result<Workload> {
                     // `--from-recording` does.
                     auto_exec_record_script(&path, ScriptLanguage::Python)
                 }
-                Err(e) => Err(anyhow::anyhow!("{e}")).with_context(|| {
-                    format!("parsing @mvm.app decorator in {}", path.display())
-                }),
+                Err(e) => Err(anyhow::anyhow!("{e}"))
+                    .with_context(|| format!("parsing @mvm.app decorator in {}", path.display())),
             }
         }
         WorkloadSource::RuntimeScript(path) => {
