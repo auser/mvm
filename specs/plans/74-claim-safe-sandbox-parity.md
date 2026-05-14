@@ -235,6 +235,34 @@ dev-profile-only; production-profile admission rejects pulled
 templates without a verity sidecar. ADR-050 §Implementation Plan
 adds the concrete task list onto W1.
 
+### R13 — Guest agent and SDK runtime placement for pulled images (W1, W3, W4)
+
+**Current state.** `nix/lib/mk-guest.nix` bakes
+`mvm-guest-agent`, `mvm-seccomp-apply`, and `mvm-runner` into
+every Nix-built image's closure. Per-language SDK runtime
+libraries (ADR-049 vsock substitution hooks) are also expected to
+sit inside the rootfs. An OCI-pulled rootfs (W1) is **user
+content** with none of those binaries — left alone, the agent
+has nowhere to live, ADR-049's hooks have nothing to bind to,
+and W3 substitution silently breaks for OCI workloads.
+
+**Failure mode.** Two bad options if left unaddressed: (a)
+inject the agent + SDK runtime into the OCI rootfs at unpack
+time, mutating the image and breaking digest pinning; or (b)
+ship OCI ingest with no agent inside pulled images, making them
+second-class citizens that can't be `mvmctl exec`'d, can't
+participate in W3 secret substitution, and can't use the W4
+lifecycle surface. Either way the unified-runtime promise of
+ADR-048 collapses.
+
+**Mitigation owner.** Resolved by [ADR-051](../adrs/051-mvm-runtime-overlay-disk.md):
+ship a separate verity-sealed `mvm-runtime` overlay disk
+attached to every microVM (Nix-built and OCI-pulled alike),
+mounted read-only at `/mvm/runtime/`. The OCI rootfs stays
+byte-for-byte identical to the registry content. ADR-051
+§Implementation Plan folds the overlay build, `mkGuest`
+refactor, and `/mvm` path-collision check into W1.3 and W1.4.
+
 ### R4 — Audit volume without backpressure (W2)
 
 **Current state.** Today's L3 allow-list emits per-event audit (the

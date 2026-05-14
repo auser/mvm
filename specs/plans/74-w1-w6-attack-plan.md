@@ -510,21 +510,26 @@ Quick map from workstream to load-bearing risks:
 
 | Workstream | Risks that affect kickoff   |
 | ---------- | --------------------------- |
-| W1 OCI     | **R3** (verity A or B before code lands), **R10** (layer-unpack CVE class), R8 |
+| W1 OCI     | **R3** (verity A or B before code lands), **R10** (layer-unpack CVE class), **R13** (runtime overlay disk gates W1.3-W1.4), R8 |
 | W2 network | R1, **R4** (audit backpressure), R6, **R9** (TLS substitution mechanism), **R11** (non-HTTP egress), **R12** (DoH/DoT bypass), R8 |
-| W3 secrets | R1, **R2** (panic hook is new), R5 (snapshot interaction), R6, **R9** (substitution mechanism gates W3 entirely), R11 (non-HTTP secret channels), R8 |
-| W4 SDK     | R6 (macOS kqueue parity), R8 |
+| W3 secrets | R1, **R2** (panic hook is new), R5 (snapshot interaction), R6, **R9** (substitution mechanism gates W3 entirely), R11 (non-HTTP secret channels), R13 (SDK runtime is in the overlay), R8 |
+| W4 SDK     | R6 (macOS kqueue parity), R13 (SDK lifecycle binaries live in the overlay), R8 |
 | W5 perf    | R7 (publish every readiness boundary), R8 |
 | W6 storage | R4 (new audit kinds), R8 |
 
-**R3 and R9 are now decided** —
+**R3, R9, and R13 are now decided** —
 [ADR-050](050-oci-image-verity-posture.md) picks pull-time verity
-generation for W1, and
-[ADR-049](049-secret-substitution-mechanism.md) picks the vsock
-side-channel for W3 (with proxy-with-CA available later as an
-explicit opt-in feature flag). Both ADRs ship with concrete task
-additions for their workstreams. The remaining top-level risks
-(R1, R2, R4-R8, R10-R12) stay open and reference the parent plan.
+generation for W1, [ADR-049](049-secret-substitution-mechanism.md)
+picks the vsock side-channel for W3 (with proxy-with-CA available
+later as an explicit opt-in feature flag), and
+[ADR-051](051-mvm-runtime-overlay-disk.md) introduces a separate
+verity-sealed mvm-runtime overlay disk that hosts the guest
+agent, seccomp shim, runner, and per-language SDK runtime
+libraries for *every* microVM (Nix-built and OCI-pulled alike),
+unifying the agent placement story. ADR-051 also forces a
+one-time refactor of `mkGuest` to stop baking those binaries
+into per-image closures. The remaining top-level risks (R1, R2,
+R4-R8, R10-R12) stay open and reference the parent plan.
 
 ## Verification
 
