@@ -489,6 +489,11 @@ jobs:
         # not require microsandbox. Output gets staged at
         # $GITHUB_WORKSPACE/ci-artifacts/{vmlinux, rootfs.ext4}; the
         # next step points the bootcheck at those paths via env vars.
+        #
+        # chmod after cp: nix/store files come back mode 0444. CH opens
+        # the rootfs RW by default and fails with
+        # `VmBoot(DeviceManager(Disk(... PermissionDenied)))` against a
+        # read-only file. The runner owns the copy, so 0644 is fine.
         run: |
           set -euo pipefail
           nix build "./nix/images/builder#packages.x86_64-linux.default" \
@@ -497,6 +502,7 @@ jobs:
           mkdir -p ci-artifacts
           cp "$STORE_PATH/vmlinux"     ci-artifacts/vmlinux
           cp "$STORE_PATH/rootfs.ext4" ci-artifacts/rootfs.ext4
+          chmod 0644 ci-artifacts/vmlinux ci-artifacts/rootfs.ext4
           ls -la ci-artifacts/
 
       - name: Build ch-bootcheck example
