@@ -279,11 +279,14 @@ contributor-bootstrap = [
     "mvm-build/contributor-bootstrap",
     "mvm-cli/contributor-bootstrap",
 ]
-# Plan 72 W1: libkrun-backed builder VM. Scaffolding-only through
-# W4; default-on after Plan 72 W5 cutover. Only `mvm-build` carries
-# the implementation today; the feature surfaces here so workspace-
-# level builds can opt in cleanly.
-backends-builder-vm-libkrun = ["mvm-build/backends-builder-vm-libkrun"]
+# Plan 72 W1+W4+W5.B: libkrun-backed builder VM. Default-off until
+# the W5.C polarity flip. When on, mvm-cli's `ensure_dev_image`
+# dispatches through `LibkrunBuilderVm` on source-checkout builds
+# before falling through to the microsandbox + prebuilt cascade.
+backends-builder-vm-libkrun = [
+    "mvm-build/backends-builder-vm-libkrun",
+    "mvm-cli/backends-builder-vm-libkrun",
+]
 custom-dns = ["mvm-cli/custom-dns"]
 dev-watch = ["mvm-cli/dev-watch"]
 manifest-verify = [

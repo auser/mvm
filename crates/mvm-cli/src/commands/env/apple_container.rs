@@ -551,6 +551,66 @@ fn plist_env_string_value(plist: &str, key: &str) -> Option<String> {
 fn ensure_dev_image() -> Result<(String, String)> {
     let local_flake = find_dev_image_flake().ok();
 
+    // Plan 72 W5.B — libkrun-direct dispatch on source-checkout builds.
+    //
+    // When the `backends-builder-vm-libkrun` feature is on AND we have
+    // a local dev-image flake, build via `LibkrunBuilderVm` (which boots
+    // the W2 builder-VM image under libkrun and runs `nix build` inside
+    // a microVM with virtio-fs + virtio-blk wiring). This branch runs
+    // BEFORE the existing `contributor-bootstrap` microsandbox branch
+    // so contributors with both features active prefer libkrun — that
+    // matches ADR-046's target end-state, but without removing the
+    // microsandbox fallback yet (W5.C scope).
+    //
+    // If the libkrun path fails for any reason (libkrun not installed,
+    // cache empty + can't bootstrap, build error), we fall THROUGH to
+    // the microsandbox branch when that feature is also on. Once W5.C
+    // flips the polarity, the fallback gets removed and an end user
+    // without libkrun gets an actionable install hint instead.
+    #[cfg(feature = "backends-builder-vm-libkrun")]
+    if let Some(flake_dir) = &local_flake {
+        let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
+        if let Some(parent) = std::path::Path::new(&out_dir).parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating dev-image out parent {}", parent.display()))?;
+        }
+        // Mirror the microsandbox branch's stale-symlink replacement
+        // (nix-darwin's `linux-builder` legacy `current` -> root-owned
+        // store path) so a re-run after switching builders doesn't
+        // EACCES on the virtio-fs `out` mount.
+        if std::path::Path::new(&out_dir)
+            .symlink_metadata()
+            .is_ok_and(|m| m.file_type().is_symlink())
+        {
+            std::fs::remove_file(&out_dir)
+                .with_context(|| format!("removing stale dev-image symlink at {out_dir}"))?;
+        }
+        std::fs::create_dir_all(&out_dir)
+            .with_context(|| format!("creating dev-image out dir {out_dir}"))?;
+
+        ui::info(&format!(
+            "Building dev image via LibkrunBuilderVm from: {flake_dir}"
+        ));
+        match try_build_dev_image_via_libkrun(flake_dir, &out_dir) {
+            Ok((kernel, rootfs)) => {
+                ui::success(&format!("Dev image ready at {out_dir}."));
+                return Ok((kernel, rootfs));
+            }
+            Err(e) => {
+                // Soft fall-through: if microsandbox is also compiled
+                // in we let the next branch try. The `contributor-
+                // bootstrap` path has the same "refuse to silently
+                // fall back to prebuilts" policy, so the loud-failure
+                // story is preserved end-to-end. W5.C removes this
+                // fallback by deleting the microsandbox cfg below.
+                ui::warn(&format!(
+                    "LibkrunBuilderVm build failed: {e}\n\
+                     Falling through to the microsandbox branch if available."
+                ));
+            }
+        }
+    }
+
     #[cfg(feature = "contributor-bootstrap")]
     if let Some(flake_dir) = &local_flake {
         let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
@@ -1752,6 +1812,146 @@ fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(Strin
     Ok((kernel, rootfs))
 }
 
+/// Plan 72 W5.B — libkrun-direct counterpart of
+/// [`build_image_via_microsandbox`]. Same input shape (a flake dir
+/// and an out dir), same return type, different VMM under the hood:
+///
+/// 1. [`ensure_builder_vm_cache`] populates the Layer-1 builder VM
+///    image (kernel + rootfs + cmdline) at
+///    `~/.cache/mvm/builder-vm/<arch>/`.
+/// 2. `LibkrunBuilderVm::run_build` boots that image under libkrun,
+///    mounts the workspace via virtio-fs (`work`), the artifact dir
+///    via virtio-fs (`out`), and a sparse persistent `/nix-store`
+///    via virtio-blk.
+/// 3. The script staged in the per-job dir invokes `nix build` on
+///    the user's flake inside the guest; artifacts land at `/out`
+///    which the host sees as `out_dir`.
+///
+/// Loud failures, no silent fallback to the prebuilt — same policy
+/// as the microsandbox path.
+#[cfg(feature = "backends-builder-vm-libkrun")]
+fn try_build_dev_image_via_libkrun(flake_dir: &str, out_dir: &str) -> Result<(String, String)> {
+    use mvm_build::builder_vm::{
+        BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, BuilderVm, host_system_linux,
+    };
+    use mvm_build::libkrun_builder::LibkrunBuilderVm;
+
+    let flake_src = std::path::PathBuf::from(flake_dir);
+    if !flake_src.exists() {
+        anyhow::bail!("flake dir does not exist: {flake_dir}");
+    }
+
+    // Pre-flight: the libkrun launcher reads the Layer-1 builder VM
+    // image from `~/.cache/mvm/builder-vm/<arch>/`. If empty, this
+    // either bootstraps it via Stage 0 (`contributor-bootstrap`) or
+    // bails with an actionable install hint.
+    ensure_builder_vm_cache()?;
+
+    // Same workspace-rooting trick as `build_image_via_microsandbox`:
+    // mount the whole workspace at /work and point `flake_ref` at the
+    // subdir. The bundled flakes use `builtins.path { path = ../../..; }`
+    // to capture the workspace root, so the mount must cover the
+    // parent.
+    let workspace_root = flake_src
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| {
+            anyhow::anyhow!("flake dir is not three levels deep in workspace: {flake_dir}")
+        })?
+        .to_path_buf();
+    let flake_rel = flake_src
+        .strip_prefix(&workspace_root)
+        .map_err(|_| anyhow::anyhow!("flake dir not under derived workspace root: {flake_dir}"))?;
+    // `path:` URL — same reason as the microsandbox path: forces Nix's
+    // filesystem fetcher rather than the git fetcher (the latter fails
+    // on worktrees where `.git` is a file).
+    let guest_flake_ref = format!(
+        "path:{}/{}",
+        BUILDER_GUEST_WORK_DIR,
+        flake_rel
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("flake subpath has non-UTF-8 bytes: {flake_rel:?}"))?
+    );
+
+    let job = BuilderJob {
+        flake_ref: guest_flake_ref,
+        attr_path: format!("packages.{}.default", host_system_linux()),
+    };
+    let mounts = BuilderMounts {
+        flake_src: workspace_root,
+        // libkrun's path provides a virtio-blk-backed persistent
+        // `/nix-store` image inside the guest — no host bind, by
+        // design. Cache reuse happens through that image, not via
+        // a host `/nix` shadow.
+        host_nix_store: None,
+        artifact_out: std::path::PathBuf::from(out_dir),
+    };
+
+    LibkrunBuilderVm::default()
+        .run_build(&job, &mounts)
+        .map_err(|e| anyhow::anyhow!("LibkrunBuilderVm: {e}"))?;
+
+    let kernel = format!("{out_dir}/vmlinux");
+    let rootfs = format!("{out_dir}/rootfs.ext4");
+    if !std::path::Path::new(&kernel).exists() {
+        anyhow::bail!("LibkrunBuilderVm reported success but {kernel} is missing");
+    }
+    if !std::path::Path::new(&rootfs).exists() {
+        anyhow::bail!("LibkrunBuilderVm reported success but {rootfs} is missing");
+    }
+    Ok((kernel, rootfs))
+}
+
+/// Ensure `~/.cache/mvm/builder-vm/<arch>/` contains the Layer-1
+/// builder VM image (Plan 72 W2 output:
+/// `vmlinux + rootfs.ext4 + cmdline.txt`). On a fresh host the cache
+/// is empty — with the `contributor-bootstrap` feature on we trigger
+/// Stage 0 (microsandbox + `nixos/nix:2.24.10`) via
+/// [`bootstrap_builder_vm_image`]; otherwise we bail with a clear
+/// rebuild hint. The W5 release-workflow follow-up adds a download
+/// path for installed binaries; that's not in this PR.
+#[cfg(feature = "backends-builder-vm-libkrun")]
+fn ensure_builder_vm_cache() -> Result<()> {
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let cache_dir = format!("{}/builder-vm/{arch}", mvm_core::config::mvm_cache_dir());
+    let kernel = std::path::Path::new(&cache_dir).join("vmlinux");
+    let rootfs = std::path::Path::new(&cache_dir).join("rootfs.ext4");
+    let cmdline = std::path::Path::new(&cache_dir).join("cmdline.txt");
+    if kernel.is_file() && rootfs.is_file() && cmdline.is_file() {
+        // Hit. Don't re-bootstrap (would re-run Stage 0 unnecessarily).
+        // The cache key is hash(flake.nix || flake.lock) — invalidation
+        // on flake edits is a Plan 72 W5 follow-up; today the user
+        // deletes the cache dir manually after editing the flake.
+        return Ok(());
+    }
+
+    #[cfg(feature = "contributor-bootstrap")]
+    {
+        ui::info(&format!(
+            "Builder VM image cache empty at {cache_dir} — bootstrapping via Stage 0 \
+             (`contributor-bootstrap`)."
+        ));
+        bootstrap_builder_vm_image()
+            .with_context(|| "Stage 0 bootstrap of the builder VM image failed")
+    }
+
+    #[cfg(not(feature = "contributor-bootstrap"))]
+    {
+        let _ = (kernel, rootfs, cmdline);
+        anyhow::bail!(
+            "Builder VM image cache is empty at {cache_dir}, and Stage 0 bootstrap requires \
+             `--features contributor-bootstrap`. Rebuild mvmctl with that feature on, or \
+             wait for the Plan 72 W5 release-workflow follow-up that publishes the \
+             builder-vm prebuilt for download."
+        );
+    }
+}
+
 /// Find the dev-image Nix flake directory.
 ///
 /// Returns `Ok(path)` only when `nix/images/builder/flake.nix` is present —
@@ -2369,6 +2569,102 @@ mod builder_vm_bootstrap_tests {
         assert!(
             err.contains("Rebuild") || err.contains("--features"),
             "error should hint at the rebuild command: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+#[cfg(feature = "backends-builder-vm-libkrun")]
+mod libkrun_dispatch_tests {
+    //! Plan 72 W5.B — `ensure_builder_vm_cache` + `try_build_dev_image_via_libkrun`.
+    //!
+    //! These tests cover the pre-flight surface — the part that runs
+    //! before `LibkrunBuilderVm::run_build` is invoked. The actual
+    //! build path needs a real libkrun + a populated builder VM cache;
+    //! that's exercised end-to-end by the `dev_up_libkrun.rs` live
+    //! test (Plan 72 W5 acceptance criterion) once it lands.
+    use super::*;
+
+    /// `ensure_builder_vm_cache` is a no-op when the cache is
+    /// already populated. We override `MVM_CACHE_DIR` to a tempdir,
+    /// pre-create the three load-bearing files, and assert the
+    /// function returns `Ok(())` without trying to bootstrap
+    /// (which would shell out to microsandbox).
+    #[test]
+    fn ensure_builder_vm_cache_short_circuits_when_populated() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let arch = if cfg!(target_arch = "aarch64") {
+            "aarch64"
+        } else {
+            "x86_64"
+        };
+        let cache = scratch.path().join("builder-vm").join(arch);
+        std::fs::create_dir_all(&cache).unwrap();
+        std::fs::write(cache.join("vmlinux"), b"").unwrap();
+        std::fs::write(cache.join("rootfs.ext4"), b"").unwrap();
+        std::fs::write(cache.join("cmdline.txt"), b"console=hvc0").unwrap();
+
+        // SAFETY guard: clear afterwards so a subsequent test in the
+        // same process doesn't inherit our override. Wrap the call
+        // in catch_unwind so a panic restores the env vars too.
+        let prev = std::env::var_os("MVM_CACHE_DIR");
+        unsafe {
+            std::env::set_var("MVM_CACHE_DIR", scratch.path());
+        }
+        let result = std::panic::catch_unwind(ensure_builder_vm_cache);
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("MVM_CACHE_DIR", v),
+                None => std::env::remove_var("MVM_CACHE_DIR"),
+            }
+        }
+        match result {
+            Ok(Ok(())) => {}
+            Ok(Err(e)) => panic!("expected Ok, got Err: {e}"),
+            Err(p) => std::panic::resume_unwind(p),
+        }
+    }
+
+    /// Without `contributor-bootstrap`, an empty cache must error
+    /// with the rebuild hint — not silently no-op (which would let
+    /// the libkrun build proceed with a missing image and trip a
+    /// less-actionable error inside `LibkrunBuilderVm::run_build`).
+    #[cfg(not(feature = "contributor-bootstrap"))]
+    #[test]
+    fn ensure_builder_vm_cache_errors_on_empty_cache_without_bootstrap() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let prev = std::env::var_os("MVM_CACHE_DIR");
+        unsafe {
+            std::env::set_var("MVM_CACHE_DIR", scratch.path());
+        }
+        let err = ensure_builder_vm_cache().unwrap_err();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("MVM_CACHE_DIR", v),
+                None => std::env::remove_var("MVM_CACHE_DIR"),
+            }
+        }
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("contributor-bootstrap"),
+            "expected the rebuild hint, got: {msg}"
+        );
+    }
+
+    /// `try_build_dev_image_via_libkrun` rejects a missing flake
+    /// dir up front, before any heavy work (libkrun probe, cache
+    /// allocation, supervisor spawn).
+    #[test]
+    fn try_build_dev_image_via_libkrun_rejects_missing_flake_dir() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let missing = scratch.path().join("nope");
+        let out = scratch.path().join("out");
+        let err = try_build_dev_image_via_libkrun(missing.to_str().unwrap(), out.to_str().unwrap())
+            .unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("does not exist"),
+            "expected missing-flake-dir error, got: {msg}"
         );
     }
 }
