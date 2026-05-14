@@ -160,27 +160,25 @@ mvmctl exec --timeout 300 -- ./long-running-task.sh
 
 Defaults: 2 vCPUs, 512 MiB, 60-second timeout per command.
 
-## Driving from an mvmforge launch plan
+## Driving from a launch plan
 
-If you're using [mvmforge](https://github.com/tinylabscom/decorationer)
-to declare workloads, you can hand `mvmctl exec` either the `launch.json`
-artifact from `mvmforge compile` or the Workload IR manifest from
-`mvmforge emit` — `--launch-plan` accepts both shapes and auto-detects:
+`mvmctl exec --launch-plan <path>` accepts either of two JSON
+shapes — a `launch.json` artifact (top-level `entrypoint`) or a
+Workload IR manifest (top-level `apps[]`) — and auto-detects which
+one it is given. Both shapes were historically produced by the
+`mvmforge` toolchain
+([see the migration guide](/guides/mvmforge-migration/));
+the canonical producer today is `mvmctl compile` in the mvm SDK.
 
 ```bash
-mvmforge compile manifest.json --out ./build
+mvmctl compile manifest.json --out ./build
 mvmctl exec --launch-plan ./build/launch.json
-```
-
-```bash
-mvmforge emit app.py > manifest.json
-mvmctl exec --launch-plan manifest.json
 ```
 
 Only the entrypoint is consumed in v1; image selection still comes from
 `--manifest` or the bundled default.
 
-**LaunchPlan artifact** (`mvmforge compile`'s `launch.json` output):
+**LaunchPlan artifact** (top-level `entrypoint`):
 
 ```json
 {
@@ -195,7 +193,7 @@ Only the entrypoint is consumed in v1; image selection still comes from
 }
 ```
 
-**Workload IR manifest** (`mvmforge emit` stdout):
+**Workload IR manifest** (top-level `apps[]`):
 
 ```json
 {
@@ -213,10 +211,10 @@ Only the entrypoint is consumed in v1; image selection still comes from
 }
 ```
 
-For long-running workloads, prefer `mvmforge up` (or
-`mvmctl up --flake <artifact-dir>`): mvmforge bakes the entrypoint into
-the generated flake's `services.<id>.command`, and mvm's PID-1 init
-supervises it across reboots.
+For long-running workloads, prefer `mvmctl up --flake <artifact-dir>`:
+the SDK bakes the entrypoint into the generated flake's
+`services.<id>.command`, and mvm's PID-1 init supervises it across
+reboots.
 
 Multi-app launch plans are rejected -- that's an orchestration concern
 that belongs in `mvmd`, not in `mvmctl exec`. Env precedence (lowest →

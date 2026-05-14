@@ -32,11 +32,11 @@ CLI is Docker-shaped: `msb run|start|stop|rm|ls|ps|inspect|logs|metrics` plus a 
 |---|---|---|---|
 | Sub-100ms cold boot | Claimed | Not measured / not advertised | **Gap** |
 | Daemonless runtime | Yes (child of SDK process) | Mostly (CLI-spawned FC, optional supervisor) | Parity-ish |
-| OCI image as primary rootfs source | Yes (Docker Hub, GHCR, ECR, GCR) | Round-trip only — Nix flake → `dockerTools.streamLayeredImage` → OCI tar → `docker load` (`crates/mvm-backend/src/docker.rs:3-5`). No upstream `docker pull <image>` ingest; no `fn pull` anywhere in the workspace. | **Partial — round-trip yes, upstream pull no** |
+| OCI image as primary rootfs source | Yes (Docker Hub, GHCR, ECR, GCR) | Round-trip only — Nix flake → `dockerTools.streamLayeredImage` → OCI tar → `docker load` (`crates/mvm-backend/src/docker.rs:3-5`). No upstream `docker pull <image>` ingest. Upstream-pull ingest tracked as plan 74 W1; cross-repo handoff to mvmd via mvmd ADR-0020 (OCI images as microVM workloads). | **Partial — round-trip yes, upstream pull planned** |
 | Nix-built reproducible rootfs | No | Yes (catalog, flakes, Mvmfile) | **Lead** |
-| Python SDK | Yes | Not in `crates/` today. Planned in plan 60 Phase 5 as `python/` (pyo3-bound). ~7-10 day estimate, not started. | **Gap (planned)** |
-| TypeScript SDK | Yes | Not in `crates/` today. Planned in plan 60 Phase 5 as `typescript/` (napi-rs). Not started. | **Gap (planned)** |
-| Rust SDK | Yes (`libkrun` crate) | Not in `crates/` today. `mvm-sdk` existed in the previous iteration (`../mvm`) and as `mvmforge-sdk` in `../mvmforge`. Plan 60 Phase 5 ports it back as `crates/mvm-sdk/` + `mvm-sdk-macros` + `mvm-sdk-addon`. | **Gap (planned, port available)** |
+| Python SDK | Yes | Build-time decorator surface ships in `crates/mvm-sdk` (declarations + IR emission); runtime lifecycle surface (`create` / run / `snapshot` / `stop`) tracked as plan 74 W4. pyo3 binding planned. | **Partial (decorator yes, runtime lifecycle planned)** |
+| TypeScript SDK | Yes | Build-time decorator surface ships via the Rust core in `crates/mvm-sdk`; runtime lifecycle surface tracked as plan 74 W4. napi-rs binding planned. | **Partial (decorator yes, runtime lifecycle planned)** |
+| Rust SDK | Yes (`libkrun` crate) | Build-time SDK ships as `crates/mvm-sdk` + `crates/mvm-sdk-macros` (ported from the previous `mvmforge-sdk` per [migration guide](../public/src/content/docs/guides/mvmforge-migration.md)). Runtime lifecycle surface tracked as plan 74 W4. | **Partial (build-time yes, lifecycle planned)** |
 | Snapshots (capture writable layer, restart) | Yes (`msb snapshot create`) | Yes — instance pause/resume with HMAC + replay-store seal | **Lead** (stronger) |
 | Templates (pre-baked rootfs) | Implicit via image layers | Yes, first-class (`template build/list/...`) | **Lead** |
 | Volumes (named, persistent) | Yes (`volume create/ls/rm`) | virtio-fs mounts via `vm volume`, no named-volume CRUD | Partial |

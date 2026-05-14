@@ -276,7 +276,7 @@ the feature, so the handler is not present in the binary at all.
 |---------|-------------|
 | `mvmctl exec -- <cmd>...` | Boot the bundled default microVM image, run `<cmd>`, exit |
 | `mvmctl exec --manifest <name> -- <cmd>...` | Boot a registered template instead of the default |
-| `mvmctl exec --launch-plan <path> ` | Run the entrypoint from an [mvmforge](https://github.com/tinylabscom/decorationer) document — either the `launch.json` artifact (top-level `entrypoint`) or the Workload IR manifest (top-level `apps[]`). Mutually exclusive with trailing argv |
+| `mvmctl exec --launch-plan <path> ` | Run the entrypoint from a `launch.json` artifact (top-level `entrypoint`) or a Workload IR manifest (top-level `apps[]`). See the [mvmforge migration guide](/guides/mvmforge-migration/) for the historical origin. Mutually exclusive with trailing argv |
 | `mvmctl exec --add-dir HOST:GUEST[:MODE] -- <cmd>` | Mount a host directory inside the guest. `MODE` is `ro` (default — writes discarded) or `rw` (writes rsynced back to the host after the command exits — see [ADR-002](/contributing/adr/002-writable-add-dir/)). Repeatable |
 | `mvmctl exec --env KEY=VAL -- <cmd>` | Inject an environment variable. Repeatable. Overrides any env vars carried by `--launch-plan` |
 | `mvmctl exec --cpus <n>` / `--memory <size>` | Resize the transient VM (defaults: 2 vCPUs, 512 MiB) |
@@ -290,17 +290,19 @@ mvmctl exec --manifest minimal -- /bin/true            # named template
 mvmctl exec --add-dir .:/work -- ls /work              # share current dir, RO
 mvmctl exec --add-dir .:/work:rw -- touch /work/x      # writable, rsynced back
 mvmctl exec -e DEBUG=1 -- env | grep DEBUG             # env var injection
-mvmctl exec --launch-plan ./launch.json                # mvmforge entrypoint
+mvmctl exec --launch-plan ./launch.json                # launch-plan entrypoint
 ```
 
 ### Launch-plan shape
 
-`--launch-plan` accepts either of mvmforge's two JSON documents — the
-shape is auto-detected. Only the entrypoint is consumed (image selection
-still comes from `--manifest` or the bundled default in v1).
+`--launch-plan` accepts either of two JSON shapes — the shape is
+auto-detected. Only the entrypoint is consumed (image selection
+still comes from `--manifest` or the bundled default in v1). Both
+shapes were historically produced by the `mvmforge` toolchain
+([migration guide](/guides/mvmforge-migration/)); `mvmctl compile`
+is the canonical producer today.
 
-**LaunchPlan artifact** (`mvmforge compile`'s `launch.json`, top-level
-`entrypoint`):
+**LaunchPlan artifact** (top-level `entrypoint`):
 
 ```json
 {
@@ -315,7 +317,7 @@ still comes from `--manifest` or the bundled default in v1).
 }
 ```
 
-**Workload IR manifest** (`mvmforge emit` stdout, top-level `apps[]`):
+**Workload IR manifest** (top-level `apps[]`):
 
 ```json
 {

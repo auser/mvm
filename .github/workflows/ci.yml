@@ -125,15 +125,9 @@ jobs:
       - name: No forbidden dependency families
         run: cargo run -p xtask -- check-forbidden-deps
 
-      # Plan 75 W0 — user-facing repo text cannot use phrases
-      # gated by a claim file in specs/claims/ whose status is
-      # not Shipped. Prevents docs / README / CLI help from
-      # claiming a capability before its CI gate passes. Each
-      # claim file declares its own exempt_paths; design docs
-      # (specs/**) and history (CHANGELOG.md) are exempt by
-      # convention. Hard gate; admit a phrase by either flipping
-      # its claim to Shipped (once the CI gate ratifies it) or
-      # adding the path to the claim's exempt_paths.
+      - name: Gated doc claims (plan 74 W0)
+        run: cargo run -p xtask -- check-doc-claims
+
       - name: No overclaiming (gated phrases from specs/claims/)
         run: cargo run -p xtask -- check-no-overclaim
 

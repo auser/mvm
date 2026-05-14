@@ -119,6 +119,7 @@ export default defineConfig({
             { label: "Threat model", slug: "security/threat-model" },
             { label: "Seven CI claims", slug: "security/ci-claims" },
             { label: "Verified boot", slug: "security/verified-boot" },
+            { label: "Sandbox parity status", slug: "security/sandbox-parity-status" },
           ],
         },
         {
