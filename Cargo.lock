@@ -4488,6 +4488,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "toml",
+ "which 7.0.3",
 ]
 
 [[package]]

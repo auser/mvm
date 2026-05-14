@@ -1347,6 +1347,9 @@ fn run_default_profile_argv_only() {
             receipt,
             json,
             launch_plan,
+            mode,
+            dev,
+            prod,
             argv,
         }) => {
             assert!(manifest.is_none(), "manifest should default to None");
@@ -1359,6 +1362,9 @@ fn run_default_profile_argv_only() {
             assert!(receipt.is_none(), "receipt should default to None");
             assert!(!json, "json should default to false");
             assert!(launch_plan.is_none(), "launch_plan should default to None");
+            assert!(mode.is_none(), "mode should default to None");
+            assert!(!dev, "dev should default to false");
+            assert!(!prod, "prod should default to false");
             assert_eq!(argv, vec!["uname".to_string(), "-a".to_string()]);
         }
         _ => panic!("Expected Run command"),

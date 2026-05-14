@@ -124,6 +124,14 @@ pub(in crate::commands) enum Commands {
     /// before dispatch: `standard` by default, `restrictive` for no env or host
     /// shares, `dev` for writable local shares, and `permissive` only with an
     /// explicit acknowledgment environment variable.
+    ///
+    /// SDK transport modes (Plan 73 Followup H): pass `--mode plan <script>`
+    /// to run a Sandbox-shaped Python / TypeScript / JavaScript script with
+    /// each `Sandbox` operation routed through `mvm_supervisor::admit_for_run`
+    /// for a dry-run admission check. No microVM ever boots; useful for
+    /// validating admission gates without the cost of a VM boot. `--mode live`
+    /// (alias `--dev`) is reserved for Followup H-live; `--mode record`
+    /// redirects users to `mvmctl compile`.
     Run(vm::exec::RunArgs),
     /// Verify signed execution receipts emitted by `mvmctl run --receipt`.
     Receipt(vm::exec::ReceiptArgs),

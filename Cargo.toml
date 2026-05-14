@@ -271,6 +271,9 @@ serde_json.workspace = true
 tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt"] }
 toml.workspace = true
+# Plan 73 Followup H — `tests/run_plan_mode.rs` resolves python3 from
+# PATH to drive the SDK record-mode auto-exec end-to-end.
+which.workspace = true
 
 [features]
 # Plan 72 W5.B cutover: `backends-builder-vm-libkrun` is default so the
