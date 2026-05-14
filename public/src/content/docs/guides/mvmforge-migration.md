@@ -64,3 +64,23 @@ surface.
 
 For the full v1 SDK surface see [the SDK
 guide](/guides/sdk/).
+
+## What if you're hitting issues
+
+The hard rename is deliberate, so the most common failure mode is a
+caller that still references the old name — usually `mvmforge` in an
+`import`, `MVMFORGE_*` in CI env, or `mv.func` in a decorator.
+Search-and-replace per the table above resolves most of it.
+
+If you hit something the table above doesn't cover — a missing
+helper, a behavioural difference at runtime, a CI script that fails
+in a way the rename doesn't explain — please open an issue at
+[github.com/tinylabscom/mvm/issues](https://github.com/tinylabscom/mvm/issues)
+with:
+
+- the mvmforge call site you're porting (the file + the line),
+- the equivalent you tried in `mvm`,
+- the error you saw (full stderr + exit code).
+
+The maintainer team treats mvmforge → mvm migration friction as a
+documentation defect: if you got stuck, this guide is missing a row.
