@@ -261,6 +261,24 @@ libkrun console wired to host stdout via vsock — same as plan 57. No additiona
 - Live stdout streaming visible in `mvmctl dev up` output. No 5-minute silent block before the dump-on-failure.
 - Air-gapped variant builds the minimal dev image entirely from the seed `/nix` (proves the seed closure is complete).
 
+#### W4 progress (2026-05-13) — `run_build` plumbing
+
+First slice of W4 shipped: `LibkrunBuilderVm::run_build` replaces the `LibkrunNotShipped` stub with a working supervisor-spawn pipeline. Steps wired:
+
+1. **Image resolution** (`resolve_builder_image`): probes `MVM_BUILDER_VM_IMAGE_DIR` env override, falls back to `~/.cache/mvm/builder-vm/<arch>/{vmlinux,rootfs.ext4}`. Returns an actionable `ExtractionFailed` naming both paths and pointing at the Stage 0 / W5 cutover path when neither resolves.
+2. **Job staging** (`stage_job`): per-job dir at `~/.cache/mvm/builder-vm/jobs/<pid>-<nanos>/`, writes a `cmd.sh` invoking `nix build <flake_ref>#<attr_path>` with `--no-link --print-out-paths --no-write-lock-file --impure`. `MVM_WORKSPACE_PATH=/work` is exported per Plan 72 W0.2; the script chmods 0755 so `mvm-builder-init` can exec it directly.
+3. **Persistent /nix store** (`allocate_nix_store_img`): sparse `truncate` to `nix_store_mib * 1024 * 1024` bytes at `~/.cache/mvm/builder-vm/nix-store-<arch>.img` on first build; subsequent builds reuse. ext4 format happens inside the guest on first boot (mvm-builder-init's job per W3).
+4. **SupervisorConfig** (`build_supervisor_config`): three virtio-fs mounts (`work` → flake src, `out` → artifact dir, `job` → job dir), one virtio-blk (`nix-store` → the sparse image), no vsock ports (one-shot builder needs no guest agent). The W2 kernel cmdline `init=/sbin/mvm-builder-init` is overridden here as a belt-and-suspenders. Per-job state under `~/.mvm/vms/mvm-builder-<job-id>/` with `pid_file_name = "builder.pid"` so the directory namespace doesn't collide with user VMs that use `libkrun.pid`.
+5. **Supervisor spawn** (`spawn_supervisor_and_wait`): inlines a three-step `resolve_supervisor_path` (env override → adjacent to `current_exe()` → `which`) — duplicated from `LibkrunBackend` since `mvm-build` can't depend on `mvm-backend`. Spawns the supervisor, pipes the JSON, blocks on `child.wait()`. Plan 57's SIGTERM handler + 2 s SIGKILL fallback (PR #170) propagates to the builder VM stop path automatically.
+6. **Result extraction** (`finalize_artifacts`): reads `/job/result` (one-line exit code + tail) written by mvm-builder-init before poweroff. Validates `mounts.artifact_out` carries `vmlinux` + `rootfs.ext4` and constructs `BuilderArtifacts`.
+
+**Out of scope** for this slice (queued):
+
+- The `nix/images/builder-vm/` Stage 0 build path (microsandbox + `--features contributor-bootstrap`) — W5's cutover writes the cache directory `resolve_builder_image` probes. Today an empty cache requires `MVM_BUILDER_VM_IMAGE_DIR` pointing at pre-staged artifacts.
+- Network (vmnet on macOS, TAP on Linux). The builder VM still needs `cache.nixos.org` for non-air-gapped builds; mvm-builder-init's network probe runs but fails open with no NIC attached. Air-gapped builds work today against the seed `/nix`.
+- Live stdout streaming via vsock. The supervisor's stdout inherits the parent's, so the guest's hvc0 console writes to `console.log` per-job. Real-time streaming is a follow-on.
+- Pulling the supervisor-path resolver into `mvm-libkrun` so both `LibkrunBackend` and `LibkrunBuilderVm` share one impl. Small refactor; not in this slice.
+
 ---
 
 ## W5 — Cutover

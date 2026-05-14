@@ -202,6 +202,427 @@ fn ensure_utf8_path(p: &std::path::Path, field: &str) -> Result<(), BuilderVmErr
     Ok(())
 }
 
+/// Concrete `(kernel_path, rootfs_path)` for the builder VM. Resolved
+/// once per `run_build` invocation; both paths must be readable files
+/// for the host to even consider spawning the supervisor.
+#[derive(Debug, Clone)]
+struct BuilderImage {
+    kernel: std::path::PathBuf,
+    rootfs: std::path::PathBuf,
+}
+
+/// Resolve the builder VM image (kernel + rootfs.ext4). Two probe
+/// orders, both kept narrow on purpose:
+///
+/// 1. `MVM_BUILDER_VM_IMAGE_DIR` env var, if set, must point at a
+///    directory containing both `vmlinux` and `rootfs.ext4`. This is
+///    the dev / test escape hatch — Plan 72 W4 land sites that haven't
+///    wired the Stage 0 build path yet use this to point at pre-staged
+///    artifacts.
+/// 2. `~/.cache/mvm/builder-vm/<arch>/{vmlinux,rootfs.ext4}` — the
+///    cache layout Plan 72 W5's cutover writes to. Missing today
+///    because nothing populates the cache yet; the env-var override
+///    above is the only way to actually run.
+///
+/// When neither resolves, returns an actionable error naming both
+/// paths plus the env var.
+fn resolve_builder_image() -> Result<BuilderImage, BuilderVmError> {
+    if let Some(dir) = std::env::var_os("MVM_BUILDER_VM_IMAGE_DIR") {
+        let dir = std::path::PathBuf::from(dir);
+        let kernel = dir.join("vmlinux");
+        let rootfs = dir.join("rootfs.ext4");
+        if !kernel.is_file() || !rootfs.is_file() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "MVM_BUILDER_VM_IMAGE_DIR={} is missing vmlinux and/or rootfs.ext4",
+                dir.display()
+            )));
+        }
+        return Ok(BuilderImage { kernel, rootfs });
+    }
+    let cache = builder_vm_cache_dir();
+    let kernel = cache.join("vmlinux");
+    let rootfs = cache.join("rootfs.ext4");
+    if kernel.is_file() && rootfs.is_file() {
+        return Ok(BuilderImage { kernel, rootfs });
+    }
+    Err(BuilderVmError::ExtractionFailed(format!(
+        "no builder VM image found. \
+         Set MVM_BUILDER_VM_IMAGE_DIR=<dir with vmlinux + rootfs.ext4>, \
+         or build the in-repo flake (nix/images/builder-vm/) via the Stage 0 \
+         microsandbox path (`--features contributor-bootstrap`) which writes \
+         to {}. The Stage 0 wiring is plan 72 W5's job and is not in this slice.",
+        cache.display()
+    )))
+}
+
+/// Where Plan 72 W5's cutover will cache the builder VM image. Today
+/// nothing writes here; resolution falls back to the env-var override.
+fn builder_vm_cache_dir() -> std::path::PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    std::path::PathBuf::from(home).join(format!(".cache/mvm/builder-vm/{arch}"))
+}
+
+/// Stage the per-job directory under
+/// `~/.cache/mvm/builder-vm/jobs/<uuid>/` with the `cmd.sh` script
+/// that `mvm-builder-init` (Plan 72 W3 PID-1) executes inside the
+/// guest. The init writes `/job/result` (a small JSON) when the
+/// command completes; the host reads it after the supervisor exits.
+///
+/// `cmd.sh` is plain `nix build` with the flake reference and attr
+/// path the caller supplied. `--no-write-lock-file` keeps the lock
+/// the host already pinned authoritative; `--print-out-paths`
+/// dumps the store-path the host parses to derive the revision hash.
+/// `--impure` is required because `MVM_WORKSPACE_PATH=/work` is
+/// consumed by the flake's workspace import (Plan 72 W0.2).
+fn stage_job(job: &BuilderJob) -> Result<std::path::PathBuf, BuilderVmError> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let job_uuid = generate_job_id();
+    let job_dir =
+        std::path::PathBuf::from(&home).join(format!(".cache/mvm/builder-vm/jobs/{job_uuid}"));
+    std::fs::create_dir_all(&job_dir).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!("create job dir {}: {e}", job_dir.display()))
+    })?;
+    let cmd_script = format!(
+        "#!/bin/sh\n\
+         set -eu\n\
+         export MVM_WORKSPACE_PATH=/work\n\
+         cd /work\n\
+         exec nix build {flake_ref}#{attr_path} \\\n\
+             --no-link \\\n\
+             --print-out-paths \\\n\
+             --no-write-lock-file \\\n\
+             --impure\n",
+        flake_ref = job.flake_ref,
+        attr_path = job.attr_path,
+    );
+    let cmd_path = job_dir.join("cmd.sh");
+    std::fs::write(&cmd_path, cmd_script).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!("write {}: {e}", cmd_path.display()))
+    })?;
+    // Mode 0755 so `mvm-builder-init` can exec it directly.
+    set_file_executable(&cmd_path)?;
+    Ok(job_dir)
+}
+
+fn set_file_executable(path: &std::path::Path) -> Result<(), BuilderVmError> {
+    use std::os::unix::fs::PermissionsExt as _;
+    let mut perm = std::fs::metadata(path)
+        .map_err(|e| BuilderVmError::ExtractionFailed(format!("stat {}: {e}", path.display())))?
+        .permissions();
+    perm.set_mode(0o755);
+    std::fs::set_permissions(path, perm)
+        .map_err(|e| BuilderVmError::ExtractionFailed(format!("chmod {}: {e}", path.display())))?;
+    Ok(())
+}
+
+/// Job-dir name derived from PID + nanos. Not a real UUID — we just
+/// need uniqueness across concurrent builds on one host, not global.
+fn generate_job_id() -> String {
+    let pid = std::process::id();
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!("{pid}-{nanos}")
+}
+
+/// Allocate the persistent `/nix`-store sparse image at
+/// `~/.cache/mvm/builder-vm/nix-store-<arch>.img`. On first call
+/// `truncate` creates a sparse file of `mib` MiB; subsequent calls
+/// reuse the existing file. ext4 formatting happens inside the guest
+/// on first boot (`mvm-builder-init`, plan 72 W3).
+fn allocate_nix_store_img(mib: u32) -> Result<std::path::PathBuf, BuilderVmError> {
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let dir = std::path::PathBuf::from(&home).join(".cache/mvm/builder-vm");
+    std::fs::create_dir_all(&dir).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!("create cache dir {}: {e}", dir.display()))
+    })?;
+    let path = dir.join(format!("nix-store-{arch}.img"));
+    if !path.exists() {
+        // ftruncate creates a sparse hole; the file occupies 0
+        // bytes on disk until the guest writes blocks via ext4.
+        let bytes = u64::from(mib).saturating_mul(1024 * 1024);
+        let file = std::fs::File::create(&path).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!("create {}: {e}", path.display()))
+        })?;
+        file.set_len(bytes).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "ftruncate {} to {bytes}: {e}",
+                path.display()
+            ))
+        })?;
+    }
+    Ok(path)
+}
+
+/// Build the `SupervisorConfig` JSON the
+/// `mvm-libkrun-supervisor` binary reads from stdin (plan 57 W4.1
+/// contract). The builder VM differs from a user-facing libkrun
+/// guest in a few ways:
+///
+/// - Three virtio-fs mounts: workspace at `/work` (RO from the
+///   builder's perspective, RW from the host's), artifact dir at
+///   `/out`, job dir at `/job`. libkrun's virtio-fs API today
+///   doesn't expose read-only; mvm-builder-init bind-mounts each
+///   share read-only into the guest namespace before exec'ing
+///   cmd.sh (plan 72 W3).
+/// - One virtio-blk: the persistent `/nix`-store image as `/dev/vdb`.
+/// - No vsock ports — the builder doesn't need a guest agent. The
+///   guest writes `/job/result` and shuts down; the host reads the
+///   result file after the supervisor exits.
+fn build_supervisor_config(
+    vm: &LibkrunBuilderVm,
+    mounts: &BuilderMounts,
+    image: &BuilderImage,
+    job_dir: &std::path::Path,
+    nix_store_img: &std::path::Path,
+) -> Result<mvm_libkrun::SupervisorConfig, BuilderVmError> {
+    use mvm_libkrun::{KrunContext, SupervisorConfig};
+
+    // Per-job state dir under ~/.mvm/vms/ so the supervisor's PID
+    // file and any vsock sockets don't collide with user-facing VMs.
+    let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+    let vm_name = format!(
+        "mvm-builder-{}",
+        job_dir
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or("anon")
+    );
+    let vm_state_dir = std::path::PathBuf::from(&home).join(format!(".mvm/vms/{vm_name}"));
+    std::fs::create_dir_all(&vm_state_dir).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!(
+            "create vm_state_dir {}: {e}",
+            vm_state_dir.display()
+        ))
+    })?;
+
+    let kernel = image
+        .kernel
+        .to_str()
+        .ok_or_else(|| {
+            BuilderVmError::ExtractionFailed(format!(
+                "kernel path is not UTF-8: {:?}",
+                image.kernel
+            ))
+        })?
+        .to_string();
+    let rootfs = image
+        .rootfs
+        .to_str()
+        .ok_or_else(|| {
+            BuilderVmError::ExtractionFailed(format!(
+                "rootfs path is not UTF-8: {:?}",
+                image.rootfs
+            ))
+        })?
+        .to_string();
+    let nix_store = nix_store_img
+        .to_str()
+        .ok_or_else(|| {
+            BuilderVmError::ExtractionFailed(format!(
+                "nix-store image path is not UTF-8: {nix_store_img:?}"
+            ))
+        })?
+        .to_string();
+
+    let mut ctx = KrunContext::new(&vm_name, kernel, rootfs)
+        .with_resources(vm.vcpus, vm.memory_mib)
+        // The W2 builder VM rootfs hardcodes `init=/sbin/mvm-builder-init`
+        // in its baked cmdline, but we override here too as a
+        // belt-and-suspenders for any pre-W2 image variant.
+        .with_cmdline("console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-builder-init")
+        .add_disk("nix-store", nix_store, false)
+        .with_console_output(
+            vm_state_dir
+                .join("console.log")
+                .to_string_lossy()
+                .into_owned(),
+        )
+        .with_vsock_socket_dir(vm_state_dir.to_string_lossy().into_owned());
+
+    // virtio-fs mounts. PR #168 added the API; tags match
+    // `mvm-builder-init`'s expected mount points (plan 72 W3).
+    ctx = add_virtiofs(ctx, "work", &mounts.flake_src)?;
+    ctx = add_virtiofs(ctx, "out", &mounts.artifact_out)?;
+    ctx = add_virtiofs(ctx, "job", job_dir)?;
+
+    Ok(SupervisorConfig {
+        krun: ctx,
+        vm_state_dir: vm_state_dir.to_string_lossy().into_owned(),
+        pid_file_name: Some("builder.pid".to_string()),
+    })
+}
+
+/// Attach a virtio-fs share. Stringifies the host path and delegates
+/// to the existing `KrunContext::add_virtiofs` builder; isolates the
+/// UTF-8 check in one place.
+fn add_virtiofs(
+    ctx: mvm_libkrun::KrunContext,
+    tag: &str,
+    host_path: &std::path::Path,
+) -> Result<mvm_libkrun::KrunContext, BuilderVmError> {
+    let host = host_path
+        .to_str()
+        .ok_or_else(|| {
+            BuilderVmError::ExtractionFailed(format!(
+                "virtio-fs share '{tag}' host path is not UTF-8: {host_path:?}"
+            ))
+        })?
+        .to_string();
+    Ok(ctx.add_virtio_fs(tag, host))
+}
+
+/// Spawn `mvm-libkrun-supervisor` with the JSON config on stdin and
+/// block until it exits. Returns Ok on a clean guest poweroff,
+/// Err with an actionable message on any failure.
+fn spawn_supervisor_and_wait(
+    cfg: &mvm_libkrun::SupervisorConfig,
+    job_dir: &std::path::Path,
+) -> Result<(), BuilderVmError> {
+    use std::io::Write;
+    use std::process::{Command, Stdio};
+
+    let supervisor = resolve_supervisor_path()?;
+    let json = serde_json::to_string(cfg).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!("serialize SupervisorConfig: {e}"))
+    })?;
+
+    let mut child = Command::new(&supervisor)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "spawn supervisor {}: {e}",
+                supervisor.display()
+            ))
+        })?;
+    child
+        .stdin
+        .take()
+        .ok_or_else(|| {
+            BuilderVmError::ExtractionFailed("supervisor stdin was not piped".to_string())
+        })?
+        .write_all(json.as_bytes())
+        .map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "pipe SupervisorConfig to supervisor stdin: {e}"
+            ))
+        })?;
+
+    let status = child
+        .wait()
+        .map_err(|e| BuilderVmError::ExtractionFailed(format!("wait on supervisor: {e}")))?;
+
+    // Read /job/result (written by mvm-builder-init before
+    // poweroff). The guest writes a tiny `<exit>\n<stderr-tail>`
+    // form, where exit is the nix-build process's return code.
+    let result_path = job_dir.join("result");
+    if !result_path.is_file() {
+        return Err(BuilderVmError::NixBuildFailed(format!(
+            "supervisor exited (status {status:?}) but guest never wrote /job/result. \
+             Check vm_state_dir console.log for kernel panic / init failure."
+        )));
+    }
+    let result_body = std::fs::read_to_string(&result_path).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!("read job result {}: {e}", result_path.display()))
+    })?;
+    let (exit_line, tail) = result_body
+        .split_once('\n')
+        .unwrap_or((result_body.as_str(), ""));
+    let exit_code: i32 = exit_line.trim().parse().map_err(|_| {
+        BuilderVmError::NixBuildFailed(format!(
+            "guest /job/result is not a valid exit code: {exit_line:?}"
+        ))
+    })?;
+    if exit_code != 0 {
+        return Err(BuilderVmError::NixBuildFailed(format!(
+            "nix build inside builder VM exited {exit_code}. Tail: {tail}"
+        )));
+    }
+    Ok(())
+}
+
+/// Resolve the path to the `mvm-libkrun-supervisor` binary. Three
+/// fallbacks, same shape as `LibkrunBackend::resolve_supervisor_path`
+/// but inlined here to avoid a `mvm-build → mvm-backend` cycle. Both
+/// implementations will move into `mvm-libkrun` once we add a
+/// common path resolver there (small follow-up; not in this slice).
+fn resolve_supervisor_path() -> Result<std::path::PathBuf, BuilderVmError> {
+    if let Some(p) = std::env::var_os("MVM_LIBKRUN_SUPERVISOR_PATH") {
+        let path = std::path::PathBuf::from(p);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(BuilderVmError::ExtractionFailed(format!(
+            "MVM_LIBKRUN_SUPERVISOR_PATH points at {} which is not a file",
+            path.display()
+        )));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join("mvm-libkrun-supervisor");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    if let Ok(path) = which::which("mvm-libkrun-supervisor") {
+        return Ok(path);
+    }
+    Err(BuilderVmError::ExtractionFailed(
+        "mvm-libkrun-supervisor binary not found. Build it with `cargo build \
+         -p mvm-libkrun --bin mvm-libkrun-supervisor --features libkrun-sys` \
+         and either install adjacent to mvmctl or set \
+         MVM_LIBKRUN_SUPERVISOR_PATH=/abs/path/to/the/binary."
+            .to_string(),
+    ))
+}
+
+/// After the supervisor exits and `/job/result` reports success,
+/// confirm `mounts.artifact_out` carries the expected outputs and
+/// build a `BuilderArtifacts`. The dev image build emits
+/// `vmlinux` + `rootfs.ext4`; both must be present.
+fn finalize_artifacts(mounts: &BuilderMounts) -> Result<BuilderArtifacts, BuilderVmError> {
+    let kernel = mounts.artifact_out.join("vmlinux");
+    let rootfs = mounts.artifact_out.join("rootfs.ext4");
+    if !rootfs.is_file() {
+        return Err(BuilderVmError::ExtractionFailed(format!(
+            "guest reported success but {} is missing",
+            rootfs.display()
+        )));
+    }
+    let kernel_path = kernel.is_file().then_some(kernel);
+    // Revision hash derives from the artifact path's parent name in
+    // the production flow; for now we use a content-hash placeholder.
+    // Plan 72 W5 wires the real revision-hash extraction.
+    let revision_hash = mounts
+        .artifact_out
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown")
+        .to_string();
+    Ok(BuilderArtifacts {
+        rootfs_path: rootfs,
+        kernel_path,
+        revision_hash,
+        lock_hash: None,
+        accessible: None,
+    })
+}
+
 impl BuilderVm for LibkrunBuilderVm {
     fn host_can_build(&self) -> Result<bool, BuilderVmError> {
         // libkrun never satisfies the "host can build Linux
@@ -220,8 +641,8 @@ impl BuilderVm for LibkrunBuilderVm {
         job: &BuilderJob,
         mounts: &BuilderMounts,
     ) -> Result<BuilderArtifacts, BuilderVmError> {
-        // Step 1: catch bad input now, so W2–W4 don't have to
-        // re-validate on the FFI boundary.
+        // Step 1: catch bad input now so libkrun FFI doesn't have
+        // to re-validate later.
         self.validate_mounts(mounts)?;
         self.validate_job(job)?;
 
@@ -236,22 +657,47 @@ impl BuilderVm for LibkrunBuilderVm {
             )));
         }
 
-        // Step 3 (W2): resolve the builder VM image (kernel +
-        //   rootfs.ext4) — `nix/images/builder-vm/flake.nix` in a
-        //   source checkout, downloaded prebuilt for installed
-        //   binaries.
-        // Step 4 (W3): stage `cmd.sh` + `env` under the job dir,
-        //   allocate the per-build `/nix`-store sparse image if
-        //   the cache miss.
-        // Step 5 (W4): build the `KrunContext` with virtio-fs +
-        //   virtio-blk + vsock mounts, call
-        //   `mvm_libkrun::start_enter`, poll for power-off,
-        //   read `/job/result`.
-        // Step 6 (W4): validate `mounts.artifact_out` now
-        //   contains `vmlinux` + `rootfs.ext4` and construct
-        //   `BuilderArtifacts`.
-        let _ = (job, mounts);
-        Err(BuilderVmError::LibkrunNotShipped)
+        // Step 3: resolve the builder VM image. In a source
+        // checkout this comes from `nix build
+        // nix/images/builder-vm#packages.<arch>.default` (Plan 72
+        // W2 flake) via the Stage 0 path (microsandbox +
+        // `contributor-bootstrap` feature) — separate slice, not
+        // wired here. For now we accept `MVM_BUILDER_VM_IMAGE_DIR`
+        // as an override so local dev iteration and the
+        // forthcoming `tests/builder_vm_lifecycle.rs` test can
+        // point at pre-staged artifacts.
+        let image = resolve_builder_image()?;
+
+        // Step 4: stage the per-job dir with `cmd.sh` that
+        // `mvm-builder-init` (Plan 72 W3) reads + executes.
+        let job_dir = stage_job(job)?;
+
+        // Step 5: allocate the persistent `/nix`-store sparse
+        // image. ext4 format happens inside the guest on first
+        // boot (mvm-builder-init detects the empty superblock and
+        // mkfs's it); host-side we just `truncate` to the
+        // configured cap.
+        let nix_store_img = allocate_nix_store_img(self.nix_store_mib)?;
+
+        // Step 6: build the SupervisorConfig the
+        // mvm-libkrun-supervisor binary expects on stdin (plan
+        // 57 W4.1 contract). virtio-fs for workspace + artifacts +
+        // job dir; virtio-blk for the persistent nix store.
+        let cfg = build_supervisor_config(self, mounts, &image, &job_dir, &nix_store_img)?;
+
+        // Step 7: spawn the supervisor and block until it exits.
+        // `krun_start_enter` calls `exit()` when the guest powers
+        // off, so the supervisor's exit status corresponds to the
+        // guest's. mvm-builder-init writes `/job/result` *before*
+        // calling poweroff, so the host can read the actual nix
+        // build status after the supervisor is gone.
+        spawn_supervisor_and_wait(&cfg, &job_dir)?;
+
+        // Step 8: validate artifacts ended up in
+        // `mounts.artifact_out` and construct the result. The dev
+        // image build produces `vmlinux` + `rootfs.ext4`; both must
+        // be present.
+        finalize_artifacts(mounts)
     }
 
     fn cleanup(&self) -> Result<(), BuilderVmError> {
@@ -407,20 +853,37 @@ mod tests {
     }
 
     #[test]
-    fn run_build_returns_not_shipped_or_unavailable_on_clean_input() {
-        // Good input → either LibkrunNotShipped (libkrun installed,
-        // W2–W4 not yet implemented) or MicrosandboxUnavailable
-        // (libkrun not installed). The CI matrix runs both states;
-        // either outcome is the W1 acceptance shape.
+    fn run_build_surfaces_missing_image_when_libkrun_installed() {
+        // Plan 72 W4 wire-up: with valid mounts/job, `run_build`
+        // walks past validation and image resolution. Two terminal
+        // shapes from this point:
+        //
+        // - libkrun installed but no builder VM image cached and no
+        //   `MVM_BUILDER_VM_IMAGE_DIR` set → `ExtractionFailed`
+        //   pointing the user at the env-var override + the
+        //   Stage 0 path (plan 72 W5).
+        // - libkrun not installed at all (no shared library on
+        //   PATH) → `MicrosandboxUnavailable` carrying the install
+        //   hint.
+        //
+        // Either shape is the W4 acceptance for an empty host —
+        // the CI matrix runs both. The supervisor-spawn / boot path
+        // exercised against a real builder image lives in
+        // `tests/builder_vm_lifecycle.rs` (separate slice, opt-in
+        // via env var, skipped in CI for cost).
         let scratch = TempDir::new().unwrap();
         let mounts = ok_mounts(&scratch);
+        // Make sure no leftover env var from a previous test run
+        // turns this into the supervisor-spawn path. SAFETY:
+        // single-threaded test.
+        unsafe { std::env::remove_var("MVM_BUILDER_VM_IMAGE_DIR") };
         let err = LibkrunBuilderVm::default()
             .run_build(&ok_job(), &mounts)
             .unwrap_err();
         assert!(
             matches!(
                 err,
-                BuilderVmError::LibkrunNotShipped | BuilderVmError::MicrosandboxUnavailable(_)
+                BuilderVmError::ExtractionFailed(_) | BuilderVmError::MicrosandboxUnavailable(_)
             ),
             "unexpected error variant: {err:?}"
         );
