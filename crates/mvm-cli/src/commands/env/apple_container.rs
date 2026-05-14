@@ -498,28 +498,42 @@ pub(super) fn cmd_dev_apple_container_status() -> Result<()> {
 fn ensure_dev_image() -> Result<(String, String)> {
     let local_flake = find_dev_image_flake().ok();
 
+    // Plan 72 W5 cutover (partial). When the libkrun builder is on,
+    // try the Layer-1+Layer-2 libkrun path first; on error, warn and
+    // fall through to the microsandbox path. Once plan 57 W3 lands
+    // (libkrun boot validation), this branch always succeeds in a
+    // source checkout and the microsandbox path below gets deleted
+    // along with `backends-microsandbox` itself (W5 §"Feature flag
+    // polarity"). Today the branch is dead-on-arrival — every libkrun
+    // call returns `LibkrunUnavailable` — but the wiring lets a
+    // contributor flip the feature flag on and watch the path light
+    // up the moment 57 W3 merges.
+    #[cfg(feature = "backends-builder-vm-libkrun")]
+    if let Some(flake_dir) = &local_flake {
+        let out_dir = prepare_dev_image_out_dir()?;
+        ui::info(&format!(
+            "Building dev image via libkrun builder VM from: {flake_dir}"
+        ));
+        match try_build_dev_image_via_libkrun(flake_dir, &out_dir) {
+            Ok((kernel, rootfs)) => {
+                ui::success(&format!("Dev image ready at {out_dir} (libkrun)."));
+                return Ok((kernel, rootfs));
+            }
+            Err(e) => {
+                ui::warn(&format!(
+                    "libkrun-backed dev image build failed: {e}\n\
+                     Falling back to microsandbox. Plan 57 W3 (libkrun boot \
+                     validation) is the gating dep — until it lands, this fallback \
+                     is the load-bearing path."
+                ));
+                // Fall through to the microsandbox branch below.
+            }
+        }
+    }
+
     #[cfg(feature = "backends-microsandbox")]
     if let Some(flake_dir) = &local_flake {
-        let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
-        if let Some(parent) = std::path::Path::new(&out_dir).parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating dev-image out parent {}", parent.display()))?;
-        }
-        // Replace a stale symlink (e.g. the nix-darwin `linux-builder`
-        // legacy points `current` at a root-owned `/nix/store/…-mvm-dev`
-        // path) with a real, writable directory. `create_dir_all` is a
-        // no-op against an existing symlink, so without this the
-        // microsandbox bind-mount of `out_dir` lands on the read-only
-        // Nix store path and Apple Container fails with EACCES.
-        if std::path::Path::new(&out_dir)
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink())
-        {
-            std::fs::remove_file(&out_dir)
-                .with_context(|| format!("removing stale dev-image symlink at {out_dir}"))?;
-        }
-        std::fs::create_dir_all(&out_dir)
-            .with_context(|| format!("creating dev-image out dir {out_dir}"))?;
+        let out_dir = prepare_dev_image_out_dir()?;
 
         ui::info(&format!(
             "Building dev image via microsandbox builder VM from: {flake_dir}"
@@ -1695,6 +1709,112 @@ fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(Strin
     }
     if !std::path::Path::new(&rootfs).exists() {
         anyhow::bail!("builder VM did not produce rootfs.ext4 at {rootfs}");
+    }
+    Ok((kernel, rootfs))
+}
+
+/// Prepare the host-side directory the dev-image build's artifacts
+/// land in. Shared by the libkrun (plan 72 W5) and microsandbox (W7.x)
+/// branches of `ensure_dev_image` so the two paths cannot diverge on
+/// out-dir layout.
+///
+/// Replaces a stale symlink at `~/.mvm/dev/current` with a real
+/// writable directory. The legacy nix-darwin `linux-builder` path
+/// pointed `current` at a root-owned `/nix/store/...-mvm-dev` store
+/// path; `create_dir_all` is a no-op against an existing symlink, so
+/// without the unlink the bind-mount would land on the read-only
+/// store path and the builder VM would EACCES on artifact writes.
+#[cfg(any(feature = "backends-microsandbox", feature = "backends-builder-vm-libkrun"))]
+fn prepare_dev_image_out_dir() -> Result<String> {
+    let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
+    if let Some(parent) = std::path::Path::new(&out_dir).parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating dev-image out parent {}", parent.display()))?;
+    }
+    if std::path::Path::new(&out_dir)
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        std::fs::remove_file(&out_dir)
+            .with_context(|| format!("removing stale dev-image symlink at {out_dir}"))?;
+    }
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating dev-image out dir {out_dir}"))?;
+    Ok(out_dir)
+}
+
+/// Build the Layer-2 dev image inside the Layer-1 libkrun builder VM.
+///
+/// Plan 72 W5 cutover entry-point. Resolves the Layer-1 builder VM
+/// image via `crate::builder_vm_image::ensure_builder_vm_image()`
+/// (cache lookup → Stage 0 microsandbox build under
+/// `--features contributor-bootstrap` → release download — see
+/// `mvm_cli::builder_vm_image`), then constructs a
+/// `LibkrunBuilderVm` with that image and runs the same nix build
+/// job the microsandbox path produces.
+///
+/// Until plan 57 W3 (libkrun boot validation) lands, the underlying
+/// `LibkrunBuilderVm::run_build` returns `LibkrunUnavailable` from
+/// every call — this helper exists so the wiring is in place and the
+/// branch in `ensure_dev_image` can flip the moment the boot path
+/// works. The error path in `ensure_dev_image` warns + falls through
+/// to microsandbox during the transition.
+#[cfg(feature = "backends-builder-vm-libkrun")]
+fn try_build_dev_image_via_libkrun(flake_dir: &str, out_dir: &str) -> Result<(String, String)> {
+    use mvm_build::builder_vm::{
+        BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, host_system_linux,
+    };
+    use mvm_build::libkrun_builder::LibkrunBuilderVm;
+
+    let flake_src = std::path::PathBuf::from(flake_dir);
+    if !flake_src.exists() {
+        anyhow::bail!("flake dir does not exist: {flake_dir}");
+    }
+
+    // Derive workspace root + relative subdir, same as
+    // `build_image_via_microsandbox`. The libkrun path inherits the
+    // same `path:`-URL + workspace-mount-at-/work convention so the
+    // flake's `builtins.path { path = ../../..; }` resolves under
+    // `/work/...` inside the guest.
+    let workspace_root = flake_src
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| {
+            anyhow::anyhow!("flake dir is not three levels deep in workspace: {flake_dir}")
+        })?
+        .to_path_buf();
+    let flake_rel = flake_src.strip_prefix(&workspace_root).map_err(|_| {
+        anyhow::anyhow!("flake dir not under derived workspace root: {flake_dir}")
+    })?;
+    let flake_rel_str = flake_rel.to_str().ok_or_else(|| {
+        anyhow::anyhow!("flake subpath has non-UTF-8 bytes: {flake_rel:?}")
+    })?;
+    let guest_flake_ref = format!("path:{BUILDER_GUEST_WORK_DIR}/{flake_rel_str}");
+
+    let job = BuilderJob {
+        flake_ref: guest_flake_ref,
+        attr_path: format!("packages.{}.default", host_system_linux()),
+    };
+    let mounts = BuilderMounts {
+        flake_src: workspace_root,
+        host_nix_store: None,
+        artifact_out: std::path::PathBuf::from(out_dir),
+    };
+
+    let image = crate::builder_vm_image::ensure_builder_vm_image()
+        .context("resolving Layer-1 builder VM image (plan 72 W5)")?;
+    let vm = LibkrunBuilderVm::new().with_image(image);
+    mvm_build::builder_vm::BuilderVm::run_build(&vm, &job, &mounts)
+        .map_err(|e| anyhow::anyhow!("libkrun builder VM run_build: {e}"))?;
+
+    let kernel = format!("{out_dir}/vmlinux");
+    let rootfs = format!("{out_dir}/rootfs.ext4");
+    if !std::path::Path::new(&kernel).exists() {
+        anyhow::bail!("libkrun builder VM did not produce vmlinux at {kernel}");
+    }
+    if !std::path::Path::new(&rootfs).exists() {
+        anyhow::bail!("libkrun builder VM did not produce rootfs.ext4 at {rootfs}");
     }
     Ok((kernel, rootfs))
 }
