@@ -12,8 +12,8 @@ use sha2::{Digest, Sha256};
 use std::path::{Path, PathBuf};
 
 use super::super::env::apple_container::ensure_default_microvm_image;
-use super::host_signer::{host_signer_id, load_or_init, PUBLIC_FILENAME};
 use super::Cli;
+use super::host_signer::{PUBLIC_FILENAME, host_signer_id, load_or_init};
 use crate::ui;
 
 #[derive(ClapArgs, Debug, Clone)]
