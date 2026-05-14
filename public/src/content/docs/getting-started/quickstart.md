@@ -32,7 +32,7 @@ This single command detects your platform and handles everything. **Builds run i
 Inside the dev shell your project directory is bind-mounted at `/work`. Exit with `exit` or `Ctrl+D` -- background services keep running.
 
 :::note
-First run downloads the builder image (~200MB) and the dev microVM image. Subsequent runs start in seconds.
+Release binaries download the builder image (~200MB) and dev microVM image on first run. From a source checkout, `mvmctl dev up` builds from the in-repo flakes; source builds must enable `contributor-bootstrap` for that local builder path.
 :::
 
 ## 2. Day-to-Day Commands
