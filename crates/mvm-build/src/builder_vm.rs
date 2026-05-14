@@ -194,17 +194,17 @@ impl ArtifactSidecar {
 /// lets call sites be wired against the future API and lets tests
 /// cover the error path.
 pub trait BuilderVm {
-    /// Step 1 (ADR-013): probe whether the local environment is
-    /// already capable of a Linux build (host Nix + nix-darwin
-    /// linux-builder, or Linux + host Nix). When `true`, the caller
-    /// should fall through to `HostBackend` and skip the builder VM.
-    fn host_can_build(&self) -> Result<bool, BuilderVmError>;
-
     /// Steps 2-5 (ADR-013): pull the OCI image (if not cached),
     /// spawn a sandbox with the given mounts, run `nix build` for
     /// the job, and extract artifacts to `mounts.artifact_out`.
     /// Idempotent w.r.t. the image cache; not idempotent w.r.t. the
     /// artifact dir (caller cleans up).
+    ///
+    /// There is no host-Nix fallback. The CLAUDE.md invariant —
+    /// *"Host Nix is never used by mvmctl, even when present"* —
+    /// rules out a `host_can_build`-style probe: every Nix evaluation
+    /// must go through a VM we launched, so we always take the
+    /// builder-VM path.
     fn run_build(
         &self,
         job: &BuilderJob,
@@ -260,9 +260,6 @@ pub enum BuilderVmError {
 pub struct StubBuilderVm;
 
 impl BuilderVm for StubBuilderVm {
-    fn host_can_build(&self) -> Result<bool, BuilderVmError> {
-        Err(BuilderVmError::NotYetImplemented)
-    }
     fn run_build(
         &self,
         _job: &BuilderJob,
@@ -402,26 +399,8 @@ fn shell_quote_arg(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\\''"))
 }
 
-/// Probe whether the host already has Nix available. True covers
-/// both:
-///   - Linux with host Nix (`nix` on PATH; `nix build` runs natively).
-///   - macOS with nix-darwin's `linux-builder` configured (`nix` on
-///     PATH; nix transparently routes Linux derivations to the
-///     configured SSH-backed Linux VM).
-///
-/// Returns false on macOS Intel / pre-26 / no-KVM-Linux without
-/// host Nix — the case the microsandbox builder serves.
-#[cfg(feature = "contributor-bootstrap")]
-fn host_nix_available() -> bool {
-    which::which("nix").is_ok()
-}
-
 #[cfg(feature = "contributor-bootstrap")]
 impl BuilderVm for MicrosandboxBuilderVm {
-    fn host_can_build(&self) -> Result<bool, BuilderVmError> {
-        Ok(host_nix_available())
-    }
-
     fn run_build(
         &self,
         job: &BuilderJob,
@@ -801,20 +780,6 @@ mod tests {
     }
 
     #[test]
-    fn stub_returns_not_yet_implemented_for_host_can_build() {
-        let stub = StubBuilderVm;
-        let err = stub.host_can_build().expect_err("stub returns err");
-        assert!(
-            matches!(err, BuilderVmError::NotYetImplemented),
-            "got {err:?}"
-        );
-        assert!(
-            err.to_string().contains("ADR-013"),
-            "error should point at ADR: {err}"
-        );
-    }
-
-    #[test]
     fn stub_returns_not_yet_implemented_for_run_build() {
         let stub = StubBuilderVm;
         let job = BuilderJob {
@@ -965,18 +930,6 @@ mod tests {
             "got {err:?}"
         );
         assert!(err.to_string().contains("does not exist"), "msg: {err}");
-    }
-
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn host_can_build_is_a_pure_pathfn() {
-        // Result depends on whether the test runner has `nix` on
-        // PATH — both outcomes are valid. The test asserts the
-        // function returns Ok rather than erroring, since the impl
-        // shouldn't ever return Err here (only the absence vs.
-        // presence of nix matters).
-        let b = MicrosandboxBuilderVm::default();
-        assert!(b.host_can_build().is_ok());
     }
 
     #[test]

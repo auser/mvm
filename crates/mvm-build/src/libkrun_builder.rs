@@ -217,18 +217,6 @@ fn ensure_utf8_path(p: &std::path::Path, field: &str) -> Result<(), BuilderVmErr
 }
 
 impl BuilderVm for LibkrunBuilderVm {
-    fn host_can_build(&self) -> Result<bool, BuilderVmError> {
-        // libkrun never satisfies the "host can build Linux
-        // derivations directly" predicate — by definition we run
-        // the VM. Returning `false` makes the dispatch in
-        // `ensure_dev_image` fall through to `run_build` rather
-        // than short-circuiting to host Nix (forbidden anyway per
-        // CLAUDE.md §"Host Nix is never used by mvmctl"). When
-        // libkrun isn't installed the call site can still consult
-        // `mvm_libkrun::is_available()` for a clearer error.
-        Ok(false)
-    }
-
     fn run_build(
         &self,
         job: &BuilderJob,
@@ -750,13 +738,6 @@ mod tests {
         assert_eq!(vm.vcpus, 4);
         assert_eq!(vm.memory_mib, 4096);
         assert_eq!(vm.nix_store_mib, 65536);
-    }
-
-    #[test]
-    fn host_can_build_always_false() {
-        // libkrun never short-circuits to host Nix.
-        let vm = LibkrunBuilderVm::default();
-        assert!(!vm.host_can_build().unwrap());
     }
 
     #[test]
