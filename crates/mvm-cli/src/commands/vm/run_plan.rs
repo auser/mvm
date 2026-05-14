@@ -207,6 +207,11 @@ fn synthesis_input_for_app<'a>(workload: &'a Workload, app: &'a App) -> Result<S
         exec_timeout_secs: 0,
         destroy_on_exit: true,
         bundle_pin: None,
+        // Plan-mode synthesis (Followup H-plan) does not run the
+        // install pipeline; it synthesizes one plan per Sandbox call
+        // for dry-run admission. Followup B.3 wires deps_volume into
+        // the live `mvmctl up` path only.
+        deps_volume: None,
     })
 }
 

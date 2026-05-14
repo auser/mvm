@@ -1,4 +1,5 @@
 pub mod app_deps;
+pub mod app_deps_gate;
 pub mod artifacts;
 pub mod backend;
 pub mod builder_vm;

@@ -38,9 +38,9 @@
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use mvm_plan::{
-    ArtifactPolicy, AttestationMode, AttestationRequirement, ExecutionPlan, FsPolicyRef,
-    KeyRotationSpec, Nonce, PlanId, PolicyRef, PostRunLifecycle, Resources, RuntimeProfileRef,
-    SCHEMA_VERSION, SignedImageRef, TenantId, TimeoutSpec, WorkloadId,
+    ArtifactPolicy, AttestationMode, AttestationRequirement, DepsVolumeBinding, ExecutionPlan,
+    FsPolicyRef, KeyRotationSpec, Nonce, PlanId, PolicyRef, PostRunLifecycle, Resources,
+    RuntimeProfileRef, SCHEMA_VERSION, SignedImageRef, TenantId, TimeoutSpec, WorkloadId,
 };
 use rand::RngCore;
 use std::collections::BTreeMap;
@@ -100,6 +100,16 @@ pub struct SynthesisInput<'a> {
     /// backend dispatch. Sprint 52 W2 follow-on substrate — populating
     /// it from `mvmctl up` flags is the next step.
     pub bundle_pin: Option<mvm_plan::bundle::PlanArtifact>,
+    /// Optional pin to an application-dependencies volume sealed by
+    /// `mvm_sdk::compile::deps_audit::seal_volume`. Populated by
+    /// `mvmctl up`'s deps-install path (Plan 73 Followup B.3) when
+    /// the workload declares `App.dependencies = Dependencies::Python
+    /// | Dependencies::Node`; absent when `Dependencies::None` /
+    /// no `--from-workload-ir` flag is set. The supervisor's admit
+    /// path re-runs `verify_sealed_volume` against the pinned
+    /// `volume_hash` + `manifest_sha256` before backend dispatch
+    /// (ADR-047 security claim 9).
+    pub deps_volume: Option<DepsVolumeBinding>,
 }
 
 /// Build an unsigned `ExecutionPlan` from CLI-shaped input.
@@ -177,11 +187,11 @@ pub fn synthesize_plan(input: &SynthesisInput<'_>) -> Result<ExecutionPlan> {
         valid_until: now + Duration::minutes(VALIDITY_WINDOW_MINUTES),
         nonce,
         bundle: input.bundle_pin.clone(),
-        // Plan 73 Followup A: synthesizers don't pin a deps volume
-        // yet — that lands once `mvmctl build --deps` (Followup C)
-        // emits the binding. Today's `mvmctl up` flow always passes
-        // `None` and the supervisor skips the deps-volume gate.
-        deps_volume: None,
+        // Plan 73 Followup B.3: populated by the caller when an
+        // `mvmctl up --from-workload-ir <path>` invocation drove
+        // `install_app_deps` to a sealed volume. `None` preserves
+        // claim 8 (the supervisor's deps-volume gate is skipped).
+        deps_volume: input.deps_volume.clone(),
     })
 }
 
@@ -213,6 +223,7 @@ mod tests {
             exec_timeout_secs: 0,
             destroy_on_exit: false,
             bundle_pin: None,
+            deps_volume: None,
         }
     }
 
@@ -345,5 +356,42 @@ mod tests {
     fn schema_version_is_pinned() {
         let plan = synthesize_plan(&input("myvm")).unwrap();
         assert_eq!(plan.schema_version, SCHEMA_VERSION);
+    }
+
+    #[test]
+    fn without_deps_volume_plan_carries_none() {
+        // Claim-8 preservation guard: when the caller doesn't pin a
+        // deps volume, the plan carries `deps_volume = None` and the
+        // supervisor's admission path skips the gate (Followup A).
+        let plan = synthesize_plan(&input("myvm")).unwrap();
+        assert!(plan.deps_volume.is_none());
+    }
+
+    #[test]
+    fn with_deps_volume_plan_carries_binding_verbatim() {
+        // Followup B.3 path: `mvmctl up`'s install pipeline yielded
+        // an `InstallResult`; the caller turns it into a
+        // `DepsVolumeBinding` and threads it through synthesis. The
+        // plan field must round-trip the volume + manifest hashes
+        // verbatim so the supervisor's verifier (Followup A) re-derives
+        // them against the on-disk volume.
+        let volume_hash = "a".repeat(64);
+        let manifest_sha256 = "b".repeat(64);
+        let binding = DepsVolumeBinding::new(&volume_hash, &manifest_sha256).expect("binding");
+        let mut inp = input("myvm");
+        inp.deps_volume = Some(binding.clone());
+        let plan = synthesize_plan(&inp).unwrap();
+        assert_eq!(plan.deps_volume, Some(binding));
+    }
+
+    #[test]
+    fn deps_volume_round_trips_through_serde() {
+        let binding = DepsVolumeBinding::new("a".repeat(64), "b".repeat(64)).expect("binding");
+        let mut inp = input("myvm");
+        inp.deps_volume = Some(binding.clone());
+        let plan = synthesize_plan(&inp).unwrap();
+        let json = serde_json::to_string(&plan).expect("plan serializes");
+        let parsed: ExecutionPlan = serde_json::from_str(&json).expect("plan parses");
+        assert_eq!(parsed.deps_volume, Some(binding));
     }
 }

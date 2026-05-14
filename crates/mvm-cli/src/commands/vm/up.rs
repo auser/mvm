@@ -119,6 +119,13 @@ struct AdmitPlanForBootParams<'a> {
     /// admit path re-verifies on every launch. Production callers
     /// thread `args.bundle_pin`; tests pass `None`.
     pub bundle_pin: Option<&'a std::path::Path>,
+    /// Optional deps-volume binding produced by `mvmctl up`'s
+    /// install pipeline (Plan 73 Followup B.3). When `Some`, the
+    /// synthesised `ExecutionPlan` carries `deps_volume = Some(...)`,
+    /// and the supervisor's admission gate (Followup A) re-verifies
+    /// the on-disk sealed volume before launch — ADR-047 claim 9.
+    /// `None` preserves the claim-8 baseline (no deps gate).
+    pub deps_volume: Option<mvm_plan::DepsVolumeBinding>,
 }
 
 /// Bundle of artifacts produced by a successful admission: the
@@ -230,6 +237,7 @@ fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<Admission
         exec_timeout_secs: 0,
         destroy_on_exit: true,
         bundle_pin: bundle_pin.clone(),
+        deps_volume: p.deps_volume.clone(),
     };
     let admission_ctx = match (&bundle_resolver, &bundle_trust) {
         (Some(r), Some(t)) => Some(BundleAdmissionContext {
@@ -386,6 +394,150 @@ pub(super) fn emit_failed_if(ctx: &Option<AdmissionContext>, class: &str, err: &
     }
 }
 
+/// Plan 73 Followup B.3 — resolve a deps-volume binding for the
+/// supplied Workload IR.
+///
+/// When `workload_ir_path = None` the function returns `Ok(None)` and
+/// the synthesized plan carries `deps_volume = None` (claim-8 preserved).
+///
+/// When the IR loads cleanly + has a `Dependencies::Python` /
+/// `Dependencies::Node` declaration, runs `install_app_deps` against
+/// the host cache (driver = `None`: cache-hit-only — `mvmctl up`
+/// does not spawn the builder VM today; `mvmctl deps build`
+/// (Followup C) is the verb that drives the cache-miss path) and
+/// then runs `apply_install_gate` on the resolved volume. On `--prod`
+/// any gate-error bubbles as `anyhow::Error`; on `--dev` warnings
+/// are logged and the function still returns the binding.
+///
+/// IR-load errors propagate verbatim so the user sees them (a typo in
+/// `--from-workload-ir <path>` should fail before VM boot, not silently
+/// degrade to "no deps").
+fn resolve_deps_volume_binding(
+    workload_ir_path: Option<&std::path::Path>,
+    build_mode: mvm_build::pipeline::BuildMode,
+) -> Result<Option<mvm_plan::DepsVolumeBinding>> {
+    resolve_deps_volume_binding_with_cache(workload_ir_path, build_mode, None)
+}
+
+/// Cache-root-overridable form of [`resolve_deps_volume_binding`].
+/// Tests inject a per-tempdir override so they don't touch the user's
+/// `~/.mvm/volumes/deps/` and don't race each other through the
+/// shared `MVM_DEPS_VOLUMES_DIR` env var. Production callers route
+/// through the no-override helper which resolves the canonical path.
+fn resolve_deps_volume_binding_with_cache(
+    workload_ir_path: Option<&std::path::Path>,
+    build_mode: mvm_build::pipeline::BuildMode,
+    cache_root_override: Option<&std::path::Path>,
+) -> Result<Option<mvm_plan::DepsVolumeBinding>> {
+    let Some(ir_path) = workload_ir_path else {
+        return Ok(None);
+    };
+    let bytes = std::fs::read(ir_path)
+        .with_context(|| format!("reading workload IR at {}", ir_path.display()))?;
+    let workload: mvm_ir::Workload = serde_json::from_slice(&bytes)
+        .with_context(|| format!("parsing workload IR at {}", ir_path.display()))?;
+
+    // v1 surface: one app per workload. ADR-0009; the IR validator
+    // (`mvm validate`) rejects empty `apps`, so `[0]` is safe on a
+    // validated IR. Multi-app workloads with mixed dep declarations
+    // are a future ADR — punt now.
+    let Some(app) = workload.apps.first() else {
+        anyhow::bail!(
+            "workload IR at {} has no apps; --from-workload-ir requires at least one app",
+            ir_path.display()
+        );
+    };
+
+    // `Dependencies::None` and absent-field both mean "no lockfile".
+    let dep = match &app.dependencies {
+        None | Some(mvm_ir::Dependencies::None) => return Ok(None),
+        Some(d) => d,
+    };
+
+    // Resolve lockfile path + language from the IR.
+    let (language, lockfile_rel) = match dep {
+        mvm_ir::Dependencies::Python { lockfile, .. } => {
+            (mvm_build::app_deps::Language::Python, lockfile)
+        }
+        mvm_ir::Dependencies::Node { lockfile, .. } => {
+            (mvm_build::app_deps::Language::Node, lockfile)
+        }
+        // unreachable: handled above.
+        mvm_ir::Dependencies::None => return Ok(None),
+    };
+    let source_root = source_root_for_app(app, ir_path)?;
+    let lockfile_path = source_root.join(lockfile_rel);
+    let gate = match build_mode {
+        mvm_build::pipeline::BuildMode::Prod => mvm_build::app_deps::GateLevel::Prod,
+        mvm_build::pipeline::BuildMode::Dev => mvm_build::app_deps::GateLevel::Dev,
+    };
+
+    let spec = mvm_build::app_deps::InstallSpec {
+        lockfile: lockfile_path,
+        source_root,
+        language,
+        gate,
+        cache_root_override: cache_root_override.map(std::path::Path::to_path_buf),
+    };
+
+    // Driver = None: `mvmctl up` is the consumer of an already-built
+    // deps volume. The cache-miss → builder-VM dispatch is the job of
+    // `mvmctl deps build` (Followup C). On a miss we surface the
+    // typed `DriverNotProvided` to the user with a pointer to that
+    // verb (lands in C).
+    let install = mvm_build::app_deps::install_app_deps(&spec, None).map_err(|e| match e {
+        mvm_build::app_deps::InstallError::DriverNotProvided { .. } => anyhow::anyhow!(
+            "no cached deps volume for this lockfile; run `mvmctl deps build \
+                 --from-workload-ir {}` first (Plan 73 Followup C)",
+            ir_path.display()
+        ),
+        other => anyhow::Error::new(other),
+    })?;
+
+    // Gate. On --prod a typed `GateError` aborts the boot; on --dev
+    // every issue is logged + we proceed with the binding.
+    mvm_build::app_deps_gate::apply_install_gate(&install, gate)
+        .with_context(|| format!("app-deps gate ({gate:?}) refused the install"))?;
+
+    let binding = mvm_plan::DepsVolumeBinding::new(&install.volume_hash, &install.manifest_sha256)
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "install pipeline returned a malformed hash pair: {e} \
+                     (volume_hash={}, manifest_sha256={})",
+                install.volume_hash,
+                install.manifest_sha256
+            )
+        })?;
+    Ok(Some(binding))
+}
+
+/// Resolve the `source_root` for an app's lockfile path. For
+/// `Source::LocalPath { path, .. }` the source root is the directory
+/// the path resolves against — relative paths root at the IR file's
+/// parent; absolute paths are used verbatim. Other source kinds (`Nix
+/// derivation`, `OCI image`) carry no host-resolvable source root, so
+/// they're refused here with a hint.
+fn source_root_for_app(app: &mvm_ir::App, ir_path: &std::path::Path) -> Result<std::path::PathBuf> {
+    match &app.source {
+        mvm_ir::Source::LocalPath { path, .. } => {
+            let p = std::path::Path::new(path);
+            if p.is_absolute() {
+                Ok(p.to_path_buf())
+            } else {
+                let base = ir_path
+                    .parent()
+                    .unwrap_or_else(|| std::path::Path::new("."));
+                Ok(base.join(p))
+            }
+        }
+        mvm_ir::Source::NixDerivation { .. } | mvm_ir::Source::OciImage { .. } => anyhow::bail!(
+            "Workload IR app source is {:?}; --from-workload-ir + dependency \
+             installation only supports `Source::LocalPath` today",
+            app.source
+        ),
+    }
+}
+
 #[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct Args {
     /// Nix flake reference (local path or remote URI)
@@ -489,8 +641,24 @@ pub(in crate::commands) struct Args {
     #[arg(long, value_name = "PATH")]
     pub bundle_pin: Option<std::path::PathBuf>,
     /// Build-mode override flags (`--dev` / `--prod`). Default: `--prod`.
+    /// These also drive the Plan 73 Followup B.3 app-deps gate when
+    /// `--from-workload-ir` is set: `--prod` fails closed on missing
+    /// SBOM / missing CVE scan / high or critical CVE findings;
+    /// `--dev` warns and continues.
     #[command(flatten)]
     pub build_mode: super::super::shared::BuildModeFlags,
+    /// Path to a Workload IR JSON describing the app being booted.
+    /// When the IR carries `App.dependencies = Dependencies::Python
+    /// | Dependencies::Node`, `mvmctl up` resolves the lockfile
+    /// through `mvm_build::app_deps::install_app_deps` (cache-hit
+    /// only — Plan 73 Followup B.3 does not spawn the builder VM
+    /// from `mvmctl up`; the volume must already exist) and pins
+    /// the resulting `DepsVolumeBinding` into the synthesized
+    /// `ExecutionPlan`. When omitted or when the IR carries
+    /// `Dependencies::None`, the plan's `deps_volume` is `None`
+    /// (claim-8 preserved). ADR-047 claim 9.
+    #[arg(long = "from-workload-ir", value_name = "PATH")]
+    pub from_workload_ir: Option<std::path::PathBuf>,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
@@ -631,6 +799,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         no_supervisor: args.no_supervisor,
         bundle_pin: args.bundle_pin.as_deref(),
         build_mode,
+        workload_ir_path: args.from_workload_ir.as_deref(),
     })
 }
 
@@ -670,6 +839,12 @@ pub(in crate::commands) struct RunParams<'a> {
     /// `Some(p)` populates `PlanArtifact` in the synthesised plan.
     pub(super) bundle_pin: Option<&'a std::path::Path>,
     pub(super) build_mode: mvm_build::pipeline::BuildMode,
+    /// Optional path to a Workload IR JSON. When set + the IR
+    /// carries `App.dependencies = Dependencies::Python |
+    /// Dependencies::Node`, the deps install pipeline runs +
+    /// pins a `DepsVolumeBinding` into the synthesized plan.
+    /// Plan 73 Followup B.3.
+    pub(super) workload_ir_path: Option<&'a std::path::Path>,
 }
 
 pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
@@ -701,6 +876,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         no_supervisor,
         bundle_pin,
         build_mode,
+        workload_ir_path,
     } = params;
     let _span =
         tracing::info_span!("cmd_run", name = ?name, cpus = ?cpus, memory_mib = ?memory).entered();
@@ -811,6 +987,14 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
     // replay-window across the lifetime of the process.
     let admission_ledger = InMemoryNonceLedger::new();
 
+    // Plan 73 Followup B.3 — resolve the deps-volume binding once
+    // (cache-hit path only — `mvmctl up` does not spawn the builder
+    // VM today; that's `mvmctl deps build` in Followup C) and thread
+    // it to every admit_plan_for_boot call site below. Returns
+    // `Ok(None)` when `--from-workload-ir` is absent or the IR
+    // carries no lockfile (claim-8 preserved).
+    let deps_volume_binding = resolve_deps_volume_binding(workload_ir_path, build_mode)?;
+
     // Direct boot mode: launchd agent passes kernel/rootfs via env vars.
     // Skip the build/template loading entirely.
     if std::env::var("MVM_DIRECT_BOOT").as_deref() == Ok("1") {
@@ -834,6 +1018,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             audit_dir: None,
             policy_dir: None,
             bundle_pin,
+            deps_volume: deps_volume_binding.clone(),
         })?;
 
         let start_config = mvm_core::vm_backend::VmStartConfig {
@@ -1179,6 +1364,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         audit_dir: None,
         policy_dir: None,
         bundle_pin,
+        deps_volume: deps_volume_binding.clone(),
     })?;
 
     // If a template snapshot exists AND the backend supports snapshots,
@@ -1505,6 +1691,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 audit_dir: None,
                 policy_dir: None,
                 bundle_pin,
+                deps_volume: deps_volume_binding.clone(),
             }) {
                 Ok(ctx) => ctx,
                 Err(e) => {
@@ -1772,6 +1959,7 @@ mod admit_plan_tests {
             audit_dir: None,
             policy_dir: None,
             bundle_pin: None,
+            deps_volume: None,
         })
         .expect("must succeed");
         assert!(result.is_none(), "no_supervisor must return None");
@@ -1797,6 +1985,7 @@ mod admit_plan_tests {
             audit_dir: Some(audit_dir.path()),
             policy_dir: None,
             bundle_pin: None,
+            deps_volume: None,
         })
         .expect("admission")
         .expect("Some when admission ran");
@@ -1835,6 +2024,7 @@ mod admit_plan_tests {
             audit_dir: Some(audit_dir.path()),
             policy_dir: None,
             bundle_pin: None,
+            deps_volume: None,
         })
         .expect_err("missing rootfs must fail");
         assert!(
@@ -1867,6 +2057,7 @@ mod admit_plan_tests {
             audit_dir: Some(audit_dir.path()),
             policy_dir: None,
             bundle_pin: None,
+            deps_volume: None,
         })
         .unwrap()
         .unwrap();
@@ -1883,6 +2074,7 @@ mod admit_plan_tests {
             audit_dir: Some(audit_dir.path()),
             policy_dir: None,
             bundle_pin: None,
+            deps_volume: None,
         })
         .unwrap()
         .unwrap();
@@ -1941,6 +2133,7 @@ mod admit_plan_tests {
             audit_dir: Some(audit_dir.path()),
             policy_dir: Some(policy_dir.path()),
             bundle_pin: None,
+            deps_volume: None,
         })
         .expect("admission")
         .expect("Some when admission ran");
@@ -2016,6 +2209,7 @@ bundle_version = 1
                 exec_timeout_secs: 0,
                 destroy_on_exit: true,
                 bundle_pin: None,
+                deps_volume: None,
             },
             &SystemClock,
             &ledger,
@@ -2073,6 +2267,7 @@ bundle_version = 1
                 exec_timeout_secs: 0,
                 destroy_on_exit: true,
                 bundle_pin: None,
+                deps_volume: None,
             },
             &SystemClock,
             &ledger,
@@ -2154,6 +2349,7 @@ disabled_inspectors = ["ssrf_guarrd"]
                 exec_timeout_secs: 0,
                 destroy_on_exit: true,
                 bundle_pin: None,
+                deps_volume: None,
             },
             &SystemClock,
             &ledger,
@@ -2241,6 +2437,7 @@ port_hi  = 443
                 exec_timeout_secs: 0,
                 destroy_on_exit: true,
                 bundle_pin: None,
+                deps_volume: None,
             },
             &SystemClock,
             &ledger,
@@ -2269,6 +2466,394 @@ port_hi  = 443
         assert!(
             content.contains("\"error_class\":\"policy-l4-spec-invalid\""),
             "audit chain must classify the failure: {content}"
+        );
+    }
+}
+
+// Plan 73 Followup B.3 — `resolve_deps_volume_binding` unit tests.
+//
+// These cover the new helper that turns a Workload IR + a build-mode
+// flag into an `Option<DepsVolumeBinding>` for plan synthesis. The
+// cache-miss path (which would dispatch the libkrun builder VM)
+// surfaces as `DriverNotProvided` per Followup B.3's policy ("mvmctl
+// up consumes a cached volume; mvmctl deps build is the verb that
+// drives the cache-miss path"); cache-hit fixtures use the same
+// `seal_volume` primitives as `mvm-build/tests/app_deps_orchestrator.rs`
+// so the wire format stays pinned.
+#[cfg(test)]
+mod resolve_deps_volume_tests {
+    use super::*;
+    use mvm_sdk::compile::deps_audit::{
+        FILE_CONTENT_DIR, FILE_CVE, FILE_FETCH_LOG, FILE_MANIFEST, FILE_SBOM, seal_volume,
+    };
+    use std::collections::BTreeMap;
+    use std::path::Path;
+
+    /// Build a workload-IR JSON file with the supplied `dependencies`
+    /// shape. Returns the path the test should pass to
+    /// `resolve_deps_volume_binding`.
+    fn write_workload_ir(
+        dir: &Path,
+        deps: Option<serde_json::Value>,
+        source_path: &str,
+    ) -> std::path::PathBuf {
+        let mut app = serde_json::json!({
+            "name": "app1",
+            "source": { "kind": "local_path", "path": source_path },
+            "image": { "kind": "nix_packages", "packages": ["python3"] },
+            "entrypoints": [
+                { "kind": "command", "command": ["/bin/true"] }
+            ],
+            "resources": { "memory_mb": 256, "cpu_cores": 1, "rootfs_size_mb": 512 }
+        });
+        if let Some(d) = deps {
+            app["dependencies"] = d;
+        }
+        let workload = serde_json::json!({
+            "schema_version": "0.1.0",
+            "id": "test-workload",
+            "apps": [app]
+        });
+        let path = dir.join("workload.ir.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&workload).unwrap()).unwrap();
+        path
+    }
+
+    /// Seal a deps volume into `cache_root/<volume_hash>/` and write
+    /// the index pointer so a subsequent `install_app_deps` call
+    /// returns `cache_hit = true`. Mirrors `seal_into_cache` in
+    /// `crates/mvm-build/tests/app_deps_orchestrator.rs`.
+    fn seal_volume_into_cache(
+        cache_root: &Path,
+        lockfile_path: &Path,
+        sbom_body: &[u8],
+        cve_body: &[u8],
+    ) -> String {
+        let scratch = cache_root.join("scratch");
+        let content_dir = scratch.join(FILE_CONTENT_DIR);
+        std::fs::create_dir_all(&content_dir).unwrap();
+        std::fs::write(content_dir.join("placeholder"), b"installed\n").unwrap();
+        let sbom = scratch.join(FILE_SBOM);
+        std::fs::write(&sbom, sbom_body).unwrap();
+        let fetch_log = scratch.join(FILE_FETCH_LOG);
+        std::fs::write(&fetch_log, b"GET https://pypi.org/x\n").unwrap();
+        let cve = scratch.join(FILE_CVE);
+        std::fs::write(&cve, cve_body).unwrap();
+
+        let sealed = seal_volume(
+            &content_dir,
+            &sbom,
+            &fetch_log,
+            &cve,
+            "2026-05-14T00:00:00Z",
+            BTreeMap::new(),
+        )
+        .expect("seal");
+        let final_dir = cache_root.join(&sealed.volume_hash);
+        std::fs::rename(&scratch, &final_dir).unwrap();
+        std::fs::write(final_dir.join(FILE_MANIFEST), &sealed.manifest_bytes).unwrap();
+
+        // Index pointer.
+        let lockfile_bytes = std::fs::read(lockfile_path).unwrap();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&lockfile_bytes);
+        let mut lock_sha = String::new();
+        for b in h.finalize() {
+            lock_sha.push_str(&format!("{b:02x}"));
+        }
+        let lockfile_hash = mvm_build::app_deps::derive_lockfile_hash(
+            &lock_sha,
+            mvm_build::app_deps::Language::Python,
+            mvm_build::app_deps::GateLevel::Prod,
+        );
+        let index = cache_root.join("index");
+        std::fs::create_dir_all(&index).unwrap();
+        std::fs::write(index.join(&lockfile_hash), &sealed.volume_hash).unwrap();
+        sealed.volume_hash
+    }
+
+    const REAL_SBOM: &[u8] =
+        br#"{"bomFormat":"CycloneDX","specVersion":"1.5","components":[{"name":"requests"}]}"#;
+    const REAL_CVE: &[u8] = br#"{"results":[],"dependencies":[],"summary":{"fixed":0}}"#;
+
+    #[test]
+    fn no_workload_ir_returns_none() {
+        // Claim-8 preservation: `mvmctl up` without `--from-workload-ir`
+        // never touches the deps cache and produces a plan whose
+        // `deps_volume` is `None`.
+        let binding =
+            resolve_deps_volume_binding(None, mvm_build::pipeline::BuildMode::Prod).unwrap();
+        assert!(binding.is_none());
+    }
+
+    #[test]
+    fn workload_ir_without_dependencies_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let ir = write_workload_ir(tmp.path(), None, project.to_str().unwrap());
+        let binding =
+            resolve_deps_volume_binding(Some(&ir), mvm_build::pipeline::BuildMode::Prod).unwrap();
+        assert!(binding.is_none());
+    }
+
+    #[test]
+    fn workload_ir_with_dependencies_none_returns_none() {
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        let ir = write_workload_ir(
+            tmp.path(),
+            Some(serde_json::json!({ "kind": "none" })),
+            project.to_str().unwrap(),
+        );
+        let binding =
+            resolve_deps_volume_binding(Some(&ir), mvm_build::pipeline::BuildMode::Prod).unwrap();
+        assert!(binding.is_none());
+    }
+
+    #[test]
+    fn workload_ir_with_python_lockfile_cache_hit_returns_binding() {
+        // Plan 73 Followup B.3 happy path: workload declares a
+        // `Dependencies::Python` with a lockfile; the cache already
+        // holds a sealed volume; resolve_deps_volume_binding produces
+        // a `DepsVolumeBinding` whose hashes match the seal result.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(
+            project.join("uv.lock"),
+            b"version = 1\n[[package]]\nname = \"requests\"\n",
+        )
+        .unwrap();
+
+        let ir = write_workload_ir(
+            tmp.path(),
+            Some(serde_json::json!({
+                "kind": "python",
+                "lockfile": "uv.lock",
+                "tool": "uv"
+            })),
+            project.to_str().unwrap(),
+        );
+
+        // Per-test cache root keeps parallel `cargo test` from
+        // racing on `~/.mvm/volumes/deps/` or a shared env var.
+        let cache_root = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let volume_hash =
+            seal_volume_into_cache(&cache_root, &project.join("uv.lock"), REAL_SBOM, REAL_CVE);
+
+        let binding = resolve_deps_volume_binding_with_cache(
+            Some(&ir),
+            mvm_build::pipeline::BuildMode::Prod,
+            Some(&cache_root),
+        )
+        .expect("cache hit + clean prod gate")
+        .expect("Some when IR carries Python deps");
+        assert_eq!(binding.volume_hash, volume_hash);
+    }
+
+    #[test]
+    fn workload_ir_with_python_lockfile_cache_miss_surfaces_typed_error() {
+        // Cache miss under `mvmctl up` is currently a hard error
+        // pointing at `mvmctl deps build` (Followup C). The error
+        // message must mention that verb so the user knows how to
+        // proceed.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("uv.lock"), b"unique-bytes-12345\n").unwrap();
+
+        let ir = write_workload_ir(
+            tmp.path(),
+            Some(serde_json::json!({
+                "kind": "python",
+                "lockfile": "uv.lock",
+                "tool": "uv"
+            })),
+            project.to_str().unwrap(),
+        );
+
+        let cache_root = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+
+        let err = resolve_deps_volume_binding_with_cache(
+            Some(&ir),
+            mvm_build::pipeline::BuildMode::Prod,
+            Some(&cache_root),
+        )
+        .expect_err("must fail on cache miss");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("mvmctl deps build"),
+            "miss diagnostic must point at the C verb: {msg}"
+        );
+    }
+
+    #[test]
+    fn workload_ir_prod_gate_rejects_stub_sbom() {
+        // Cache holds a sealed volume whose SBOM is the documented
+        // empty-tool stub — `cyclonedx-py` wasn't on the builder VM
+        // PATH. `--prod` (the default for `mvmctl up`) must refuse.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("uv.lock"), b"some-stub-lockfile\n").unwrap();
+
+        let ir = write_workload_ir(
+            tmp.path(),
+            Some(serde_json::json!({
+                "kind": "python",
+                "lockfile": "uv.lock",
+                "tool": "uv"
+            })),
+            project.to_str().unwrap(),
+        );
+
+        let cache_root = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+        let stub_sbom = br#"{"bomFormat":"CycloneDX","specVersion":"1.5","components":[]}"#;
+        let _ = seal_volume_into_cache(&cache_root, &project.join("uv.lock"), stub_sbom, REAL_CVE);
+
+        let err = resolve_deps_volume_binding_with_cache(
+            Some(&ir),
+            mvm_build::pipeline::BuildMode::Prod,
+            Some(&cache_root),
+        )
+        .expect_err("stub SBOM must fail prod gate");
+        let chain: Vec<String> = err.chain().map(|e| e.to_string()).collect();
+        assert!(
+            chain
+                .iter()
+                .any(|s| s.contains("empty-tool stub") || s.contains("SBOM")),
+            "error chain must mention SBOM stub: {chain:?}"
+        );
+    }
+
+    #[test]
+    fn workload_ir_dev_gate_warns_and_returns_binding_for_stub_sbom() {
+        // Same stub-SBOM scenario, but `--dev`: the helper logs a
+        // warning and returns the binding. The plan synthesizer
+        // gets `Some(...)` and the supervisor's admit gate verifies
+        // the on-disk volume the normal way.
+        let tmp = tempfile::tempdir().unwrap();
+        let project = tmp.path().join("project");
+        std::fs::create_dir_all(&project).unwrap();
+        std::fs::write(project.join("uv.lock"), b"dev-stub-lockfile\n").unwrap();
+
+        let ir = write_workload_ir(
+            tmp.path(),
+            Some(serde_json::json!({
+                "kind": "python",
+                "lockfile": "uv.lock",
+                "tool": "uv"
+            })),
+            project.to_str().unwrap(),
+        );
+
+        let cache_root = tmp.path().join("cache");
+        std::fs::create_dir_all(&cache_root).unwrap();
+
+        // Re-seal the cache under the *dev* lockfile_hash variant.
+        let scratch = cache_root.join("dev-scratch");
+        let content_dir = scratch.join(FILE_CONTENT_DIR);
+        std::fs::create_dir_all(&content_dir).unwrap();
+        std::fs::write(content_dir.join("placeholder"), b"installed\n").unwrap();
+        let sbom = scratch.join(FILE_SBOM);
+        std::fs::write(
+            &sbom,
+            br#"{"bomFormat":"CycloneDX","specVersion":"1.5","components":[]}"#,
+        )
+        .unwrap();
+        let fetch_log = scratch.join(FILE_FETCH_LOG);
+        std::fs::write(&fetch_log, b"").unwrap();
+        let cve = scratch.join(FILE_CVE);
+        std::fs::write(&cve, REAL_CVE).unwrap();
+        let sealed = seal_volume(
+            &content_dir,
+            &sbom,
+            &fetch_log,
+            &cve,
+            "2026-05-14T00:00:00Z",
+            BTreeMap::new(),
+        )
+        .unwrap();
+        let final_dir = cache_root.join(&sealed.volume_hash);
+        std::fs::rename(&scratch, &final_dir).unwrap();
+        std::fs::write(final_dir.join(FILE_MANIFEST), &sealed.manifest_bytes).unwrap();
+        let lockfile_bytes = std::fs::read(project.join("uv.lock")).unwrap();
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(&lockfile_bytes);
+        let mut lock_sha = String::new();
+        for b in h.finalize() {
+            lock_sha.push_str(&format!("{b:02x}"));
+        }
+        let lockfile_hash = mvm_build::app_deps::derive_lockfile_hash(
+            &lock_sha,
+            mvm_build::app_deps::Language::Python,
+            mvm_build::app_deps::GateLevel::Dev,
+        );
+        let index = cache_root.join("index");
+        std::fs::create_dir_all(&index).unwrap();
+        std::fs::write(index.join(&lockfile_hash), &sealed.volume_hash).unwrap();
+
+        let binding = resolve_deps_volume_binding_with_cache(
+            Some(&ir),
+            mvm_build::pipeline::BuildMode::Dev,
+            Some(&cache_root),
+        )
+        .expect("dev gate warns + returns Ok")
+        .expect("Some when IR carries Python deps");
+        assert_eq!(binding.volume_hash, sealed.volume_hash);
+    }
+
+    #[test]
+    fn workload_ir_with_unparseable_json_propagates_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let bad = tmp.path().join("garbage.ir.json");
+        std::fs::write(&bad, b"this is not json").unwrap();
+        let err = resolve_deps_volume_binding(Some(&bad), mvm_build::pipeline::BuildMode::Prod)
+            .expect_err("must fail on bad JSON");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("parsing workload IR"),
+            "error must mention parsing: {msg}"
+        );
+    }
+
+    #[test]
+    fn workload_ir_non_local_path_source_rejected() {
+        // `Source::OciImage` doesn't carry a host-resolvable
+        // source root for the install pipeline. Surface a clear
+        // error rather than silently failing later.
+        let tmp = tempfile::tempdir().unwrap();
+        let workload = serde_json::json!({
+            "schema_version": "0.1.0",
+            "id": "oci-workload",
+            "apps": [{
+                "name": "app1",
+                "source": {
+                    "kind": "oci_image",
+                    "reference": "library/python:3.12",
+                    "digest": "sha256:abc"
+                },
+                "image": { "kind": "nix_packages", "packages": ["python3"] },
+                "entrypoints": [{ "kind": "command", "command": ["/bin/true"] }],
+                "resources": { "memory_mb": 256, "cpu_cores": 1, "rootfs_size_mb": 512 },
+                "dependencies": { "kind": "python", "lockfile": "uv.lock", "tool": "uv" }
+            }]
+        });
+        let path = tmp.path().join("workload.ir.json");
+        std::fs::write(&path, serde_json::to_string_pretty(&workload).unwrap()).unwrap();
+        let err = resolve_deps_volume_binding(Some(&path), mvm_build::pipeline::BuildMode::Prod)
+            .expect_err("non-local source must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("Source::LocalPath") || msg.contains("LocalPath"),
+            "error must name the unsupported source kind: {msg}"
         );
     }
 }
