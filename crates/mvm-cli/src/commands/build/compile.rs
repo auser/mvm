@@ -351,16 +351,16 @@ fn resolve_interpreter(lang: ScriptLanguage) -> Result<PathBuf> {
             if let Some(p) = env_override("MVM_TSX") {
                 return Ok(p);
             }
-            for candidate in ["tsx", "bun", "deno"] {
-                if let Ok(found) = which::which(candidate) {
-                    return Ok(found);
-                }
+            // Project-local `./node_modules/.bin/<runner>` wins over a
+            // PATH-installed runner: this lets a `package.json` /
+            // lockfile pin the exact version without forcing the user
+            // to install one globally. Resolution is cwd-relative
+            // because `mvmctl compile` is run from a project root.
+            // See `crate::ts_runner` for the full resolution order.
+            if let Some(p) = crate::ts_runner::resolve() {
+                return Ok(p);
             }
-            bail!(
-                "no TypeScript runner found on PATH (tried `tsx`, `bun`, `deno`). \
-                 Install one (e.g. `npm install -g tsx`) or set `MVM_TSX=<path>` \
-                 and re-run."
-            )
+            bail!("{}", crate::ts_runner::install_hint())
         }
     }
 }
@@ -456,4 +456,58 @@ fn resolve_manifest_dir(args: &Args) -> Result<PathBuf> {
         }
     };
     Ok(basis)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate `MVM_TSX` (process-wide).
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    /// Restore-on-drop guard for `MVM_TSX`. Used to exercise the
+    /// env-override short-circuit in `resolve_interpreter` without
+    /// leaking state into sibling tests.
+    struct TsxGuard {
+        _guard: std::sync::MutexGuard<'static, ()>,
+        prev: Option<String>,
+    }
+
+    impl TsxGuard {
+        fn set(value: Option<&str>) -> Self {
+            let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+            let prev = std::env::var("MVM_TSX").ok();
+            unsafe {
+                match value {
+                    Some(v) => std::env::set_var("MVM_TSX", v),
+                    None => std::env::remove_var("MVM_TSX"),
+                }
+            }
+            TsxGuard { _guard: g, prev }
+        }
+    }
+
+    impl Drop for TsxGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.prev {
+                    Some(v) => std::env::set_var("MVM_TSX", v),
+                    None => std::env::remove_var("MVM_TSX"),
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn resolve_interpreter_typescript_honours_mvm_tsx_override() {
+        // Sanity: MVM_TSX pin must short-circuit before the
+        // project-local / PATH lookup. We can't usefully check that
+        // the path *exists* (no fixture), but we can check that the
+        // returned PathBuf is the override verbatim.
+        let _g = TsxGuard::set(Some("/usr/local/bin/tsx-pinned"));
+        let resolved =
+            resolve_interpreter(ScriptLanguage::TypeScript).expect("MVM_TSX must short-circuit");
+        assert_eq!(resolved, PathBuf::from("/usr/local/bin/tsx-pinned"));
+    }
 }

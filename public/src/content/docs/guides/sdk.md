@@ -107,3 +107,55 @@ Nix factory to bake into `/etc/mvm/hooks/<phase>.sh`.
 `.tar.gz`. v1 ships a stub HTTP client that logs the bundle and exits
 0; the real `POST /v1/workloads` lands once mvmd Plan 48 Phase 1090
 is live.
+
+## TypeScript runner
+
+`mvmctl compile app.ts` walks the AST statically for `mvm.app({...})`
+calls and does not run user code. When a `.ts` script uses the
+record-mode `Sandbox` API instead (no `mvm.app` decorator), `mvmctl
+compile` falls back to **auto-run**: it spawns the script on the host
+with `MVM_SDK_MODE=record` set, and the SDK's atexit hook writes a
+recording JSON that the CLI then lowers into a `Workload`.
+
+That auto-run path needs a TypeScript-aware runner — plain `node`
+cannot execute `.ts` in mvm's supported Node range. Three runners
+are supported, in priority order: **`tsx`**, **`bun`**, **`deno`**.
+
+### Install one
+
+| OS         | Recipe                                                                                  |
+| ---------- | --------------------------------------------------------------------------------------- |
+| macOS (Homebrew) | `brew install tsx` *or* `brew install oven-sh/bun/bun` *or* `brew install deno`      |
+| Any (npm)        | `npm install -g tsx`                                                                  |
+| Any (pnpm)       | `pnpm add -g tsx`                                                                     |
+| Any (yarn)       | `yarn global add tsx`                                                                 |
+| Any (bun)        | `curl -fsSL https://bun.sh/install \| bash`                                           |
+| Any (deno)       | `curl -fsSL https://deno.land/install.sh \| sh`                                       |
+
+Prefer the project-local install if you want a reproducible lockfile-
+pinned runner:
+
+```sh
+npm install --save-dev tsx
+```
+
+That puts the binary at `./node_modules/.bin/tsx`, and `mvmctl
+compile` picks it up automatically — see the resolution order below.
+
+### Resolution order
+
+`mvmctl compile` resolves the runner in this order, picking the
+first hit:
+
+1. `MVM_TSX=<path>` env override — explicit pin (any binary).
+2. `./node_modules/.bin/tsx` — cwd-relative, lockfile-pinned.
+3. `./node_modules/.bin/bun`.
+4. `./node_modules/.bin/deno`.
+5. `tsx` on `PATH`.
+6. `bun` on `PATH`.
+7. `deno` on `PATH`.
+
+If nothing resolves, the command fails with the install hint
+shown above. `mvmctl doctor` surfaces the same hint in its
+`Tools` section — run it after a fresh checkout to confirm
+your host is wired up.

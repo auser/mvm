@@ -141,6 +141,7 @@ pub fn run(json: bool) -> Result<()> {
     checks.push(apple_container_check(plat));
     checks.push(libkrun_check(plat));
     checks.push(docker_check(plat));
+    checks.push(ts_runner_check());
 
     checks.push(disk_space_check(false));
 
@@ -581,6 +582,64 @@ fn libkrun_check(plat: Platform) -> Check {
             ok: true, // Optional; not a failure.
             info: format!("not available ({})", mvm_libkrun::install_hint()),
         }
+    }
+}
+
+/// TypeScript runner probe — `mvmctl compile <script.ts>` auto-runs
+/// the script on the host with `MVM_SDK_MODE=record` and lowers the
+/// emitted recording into a Workload. That path needs a TS-aware
+/// runner (`tsx`, `bun`, or `deno`); plain `node` can't execute `.ts`
+/// in mvm's supported Node range.
+///
+/// **WARN (not FAIL) when missing.** A TS runner is only required if
+/// the user actually runs `mvmctl compile` on a `.ts` script — most
+/// mvm workflows (Python, IR-JSON, decorator-only TS) don't need one.
+/// Doctor surfaces the install hint so the gap is discoverable, but
+/// `mvmctl doctor` still exits 0 to avoid breaking CI on hosts that
+/// genuinely don't want a Node toolchain.
+///
+/// Probe is cheap: at most three `which::which` lookups plus one
+/// cwd-relative `is_file` per runner — no subprocesses.
+fn ts_runner_check() -> Check {
+    // Project-local resolution wins over PATH — see
+    // `crate::ts_runner` module docs for the full order.
+    if let Some(p) = crate::ts_runner::project_local() {
+        return Check {
+            name: "TypeScript runner",
+            category: "tools",
+            ok: true,
+            info: format!(
+                "project-local at {} (used by `mvmctl compile <script.ts>`)",
+                p.display()
+            ),
+        };
+    }
+    if let Some(p) = crate::ts_runner::on_path() {
+        return Check {
+            name: "TypeScript runner",
+            category: "tools",
+            ok: true,
+            info: format!(
+                "{} on PATH ({})",
+                p.file_name()
+                    .and_then(|s| s.to_str())
+                    .unwrap_or("<unknown>"),
+                p.display()
+            ),
+        };
+    }
+    Check {
+        name: "TypeScript runner",
+        category: "tools",
+        // `ok: true` is the WARN posture — doctor reports the gap in
+        // the `info` field but does not exit nonzero. The install
+        // hint is verbose on purpose; this is the one place users
+        // discover the project-local + global recipes.
+        ok: true,
+        info: format!(
+            "not found — {} (only required if you run `mvmctl compile <script.ts>`)",
+            crate::ts_runner::install_hint()
+        ),
     }
 }
 
@@ -1565,6 +1624,97 @@ mod tests {
         assert!(
             c.info.contains("0700"),
             "info should report the data dir's mode, got: {}",
+            c.info
+        );
+    }
+
+    #[test]
+    fn ts_runner_check_reports_warn_posture_with_install_hint_when_missing() {
+        // Force a clean lookup: no MVM_TSX pin, no project-local
+        // ./node_modules/.bin, and (most critically) an empty PATH
+        // so the host's own `tsx`/`bun`/`deno` can't make this test
+        // flaky. The probe must still return `ok: true` (WARN, not
+        // FAIL) so `mvmctl doctor` exits 0 on a host without a TS
+        // runner.
+        let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_path = std::env::var("PATH").ok();
+        let prev_tsx = std::env::var("MVM_TSX").ok();
+        let prev_cwd = std::env::current_dir().expect("cwd");
+        let tmp = tempfile::tempdir().unwrap();
+        unsafe {
+            std::env::set_var("PATH", "");
+            std::env::remove_var("MVM_TSX");
+        }
+        std::env::set_current_dir(tmp.path()).expect("chdir");
+
+        let c = ts_runner_check();
+
+        // Restore before any assert can fail the test.
+        let _ = std::env::set_current_dir(&prev_cwd);
+        unsafe {
+            match prev_path {
+                Some(v) => std::env::set_var("PATH", v),
+                None => std::env::remove_var("PATH"),
+            }
+            match prev_tsx {
+                Some(v) => std::env::set_var("MVM_TSX", v),
+                None => std::env::remove_var("MVM_TSX"),
+            }
+        }
+        drop(g);
+
+        assert_eq!(c.name, "TypeScript runner");
+        assert_eq!(c.category, "tools");
+        assert!(
+            c.ok,
+            "TS-runner probe is WARN-only (informational), not FAIL: info={}",
+            c.info
+        );
+        assert!(
+            c.info.contains("not found"),
+            "expected 'not found' marker, got: {}",
+            c.info
+        );
+        // Install hint must be inlined so `mvmctl doctor` users
+        // don't need to re-discover the per-OS recipe elsewhere.
+        for s in ["tsx", "bun", "deno", "MVM_TSX"] {
+            assert!(c.info.contains(s), "info missing {s:?}: {}", c.info);
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn ts_runner_check_reports_pass_when_project_local_present() {
+        use std::os::unix::fs::PermissionsExt;
+        let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev_cwd = std::env::current_dir().expect("cwd");
+        let prev_tsx = std::env::var("MVM_TSX").ok();
+        let tmp = tempfile::tempdir().unwrap();
+        let bin = tmp.path().join("node_modules").join(".bin");
+        std::fs::create_dir_all(&bin).unwrap();
+        let tsx = bin.join("tsx");
+        std::fs::write(&tsx, "#!/bin/sh\nexit 0\n").unwrap();
+        std::fs::set_permissions(&tsx, std::fs::Permissions::from_mode(0o755)).unwrap();
+        unsafe {
+            std::env::remove_var("MVM_TSX");
+        }
+        std::env::set_current_dir(tmp.path()).expect("chdir");
+
+        let c = ts_runner_check();
+
+        let _ = std::env::set_current_dir(&prev_cwd);
+        unsafe {
+            match prev_tsx {
+                Some(v) => std::env::set_var("MVM_TSX", v),
+                None => std::env::remove_var("MVM_TSX"),
+            }
+        }
+        drop(g);
+
+        assert!(c.ok);
+        assert!(
+            c.info.contains("project-local"),
+            "expected 'project-local' marker, got: {}",
             c.info
         );
     }
