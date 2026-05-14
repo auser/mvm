@@ -2,6 +2,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
+use serde::Serialize;
 use std::io::Write;
 use std::path::{Path, PathBuf};
 
@@ -29,6 +30,12 @@ pub(in crate::commands) struct Args {
     /// Maximum bytes to copy. Defaults to 16 MiB.
     #[arg(long, default_value_t = DEFAULT_MAX_BYTES)]
     pub max_bytes: u64,
+    /// Print a machine-readable copy summary as JSON.
+    ///
+    /// The summary omits host paths and file contents; it includes only the
+    /// guest path, direction, byte count, and copy options.
+    #[arg(long)]
+    pub json: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -37,10 +44,29 @@ enum Endpoint {
     Guest { vm: String, path: String },
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct CopySummary {
+    schema_version: u32,
+    direction: CopyDirection,
+    vm: String,
+    guest_path: String,
+    bytes_copied: u64,
+    force: bool,
+    create_parents: bool,
+    max_bytes: u64,
+}
+
+#[derive(Debug, Clone, Copy, Serialize)]
+#[serde(rename_all = "snake_case")]
+enum CopyDirection {
+    HostToGuest,
+    GuestToHost,
+}
+
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
     let source = parse_endpoint(&args.source)?;
     let destination = parse_endpoint(&args.destination)?;
-    match (&source, &destination) {
+    let summary = match (&source, &destination) {
         (Endpoint::Host(host), Endpoint::Guest { vm, path }) => {
             copy_host_to_guest(host, vm, path, &args)
         }
@@ -53,10 +79,31 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         (Endpoint::Host(_), Endpoint::Host(_)) => {
             bail!("mvmctl cp requires one endpoint in `VM:/absolute/path` form")
         }
+    }?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&summary)?);
+    } else {
+        match (&source, &destination) {
+            (Endpoint::Host(_), Endpoint::Guest { .. }) => {
+                eprintln!(
+                    "copied {} bytes to {}:{}",
+                    summary.bytes_copied, summary.vm, summary.guest_path
+                );
+            }
+            (Endpoint::Guest { .. }, Endpoint::Host(host)) => {
+                eprintln!(
+                    "copied {} bytes to {}",
+                    summary.bytes_copied,
+                    host.display()
+                );
+            }
+            _ => unreachable!("endpoint shape validated before copy"),
+        }
     }
+    Ok(())
 }
 
-fn copy_host_to_guest(host: &Path, vm: &str, guest_path: &str, args: &Args) -> Result<()> {
+fn copy_host_to_guest(host: &Path, vm: &str, guest_path: &str, args: &Args) -> Result<CopySummary> {
     let meta = std::fs::metadata(host)
         .with_context(|| format!("Failed to stat host source {}", host.display()))?;
     if !meta.is_file() {
@@ -85,19 +132,24 @@ fn copy_host_to_guest(host: &Path, vm: &str, guest_path: &str, args: &Args) -> R
     };
     match unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)? {
         FsResult::Write { bytes_written } => {
-            eprintln!("copied {} bytes to {vm}:{guest_path}", bytes_written);
             mvm_core::audit_emit!(
                 VmFileCopy,
                 vm: vm,
                 "direction=host_to_guest path={guest_path} bytes={bytes_written}"
             );
-            Ok(())
+            Ok(CopySummary::new(
+                CopyDirection::HostToGuest,
+                vm,
+                guest_path,
+                bytes_written,
+                args,
+            ))
         }
         other => bail!("Unexpected FsResult variant for Write: {:?}", other),
     }
 }
 
-fn copy_guest_to_host(vm: &str, guest_path: &str, host: &Path, args: &Args) -> Result<()> {
+fn copy_guest_to_host(vm: &str, guest_path: &str, host: &Path, args: &Args) -> Result<CopySummary> {
     let stat = guest_stat(vm, guest_path)?;
     if !matches!(stat.kind, mvm_guest::vsock::FsEntryKind::File) {
         bail!("Guest source {vm}:{guest_path} is not a regular file");
@@ -154,16 +206,42 @@ fn copy_guest_to_host(vm: &str, guest_path: &str, host: &Path, args: &Args) -> R
                 .with_context(|| format!("Failed to open host destination {}", host.display()))?;
             file.write_all(&content)
                 .with_context(|| format!("Failed to write host destination {}", host.display()))?;
-            eprintln!("copied {} bytes to {}", content.len(), host.display());
             mvm_core::audit_emit!(
                 VmFileCopy,
                 vm: vm,
                 "direction=guest_to_host path={guest_path} bytes={}",
                 content.len()
             );
-            Ok(())
+            Ok(CopySummary::new(
+                CopyDirection::GuestToHost,
+                vm,
+                guest_path,
+                content.len() as u64,
+                args,
+            ))
         }
         other => bail!("Unexpected FsResult variant for Read: {:?}", other),
+    }
+}
+
+impl CopySummary {
+    fn new(
+        direction: CopyDirection,
+        vm: &str,
+        guest_path: &str,
+        bytes_copied: u64,
+        args: &Args,
+    ) -> Self {
+        Self {
+            schema_version: 1,
+            direction,
+            vm: vm.to_string(),
+            guest_path: guest_path.to_string(),
+            bytes_copied,
+            force: args.force,
+            create_parents: args.create_parents,
+            max_bytes: args.max_bytes,
+        }
     }
 }
 
@@ -243,5 +321,29 @@ mod tests {
     #[test]
     fn parse_endpoint_rejects_invalid_vm_name() {
         assert!(parse_endpoint("BadName:/tmp/file").is_err());
+    }
+
+    #[test]
+    fn copy_summary_omits_host_paths() {
+        let args = Args {
+            source: "/private/source.txt".to_string(),
+            destination: "vm1:/tmp/source.txt".to_string(),
+            force: true,
+            create_parents: true,
+            max_bytes: 4096,
+            json: true,
+        };
+        let summary = CopySummary::new(
+            CopyDirection::HostToGuest,
+            "vm1",
+            "/tmp/source.txt",
+            12,
+            &args,
+        );
+        let json = serde_json::to_string(&summary).expect("json");
+
+        assert!(json.contains("host_to_guest"));
+        assert!(json.contains("/tmp/source.txt"));
+        assert!(!json.contains("/private/source.txt"));
     }
 }

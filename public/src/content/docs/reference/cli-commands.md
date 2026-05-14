@@ -196,8 +196,14 @@ dev-feature guest agent; production guests should use `mvmctl invoke`.
 | `mvmctl run --cpus <n> --memory <size> -- <cmd>` | Resize the transient VM |
 | `mvmctl run --timeout <secs> -- <cmd>` | Per-command timeout |
 | `mvmctl run --receipt <path> -- <cmd>` | Write a signed JSON receipt with invocation hashes, output hashes, and exit status. Raw argv, env values, stdout, and stderr are not stored. |
+| `mvmctl run --json -- <cmd>` | Print a redacted JSON execution summary with invocation metadata and output hashes. Guest stdout/stderr are not streamed. |
+| `mvmctl run --json --receipt <path> -- <cmd>` | Print the same JSON summary and also write a signed receipt artifact |
 | `mvmctl receipt verify <path>` | Verify a signed run receipt against `~/.mvm/keys/host-signer.pub` |
 | `mvmctl receipt verify <path> --pubkey <path>` | Verify a signed run receipt against an explicit raw Ed25519 public key |
+
+`run --json` is intended for machine callers. It preserves the command's exit
+code, but the JSON does not include raw argv, env values, stdout, stderr, or host
+paths.
 
 ## Sandbox State
 
@@ -206,10 +212,13 @@ dev-feature guest agent; production guests should use `mvmctl invoke`.
 | `mvmctl sandbox gc` | Dry-run cleanup of stale sandbox name-registry entries for stopped or expired VMs |
 | `mvmctl sandbox gc --dry-run` | Explicit dry-run; reports candidates and does not mutate state |
 | `mvmctl sandbox gc --apply` | Remove stale stopped/expired registry entries and emit a `SandboxGc` audit entry |
+| `mvmctl sandbox gc --json` | Print a machine-readable GC summary with candidates, reasons, and removed count |
 
 `sandbox gc` never tears down a live VM. Entries that still appear as starting,
 running, or paused in a backend listing are skipped; cleanup only removes stale
 host registry records.
+`--json` does not change the safety mode: cleanup remains dry-run unless
+`--apply` is also passed.
 
 ## File Copy
 
@@ -220,11 +229,15 @@ host registry records.
 | `mvmctl cp --force <src> <dst>` | Overwrite an existing destination |
 | `mvmctl cp --create-parents <src> <dst>` | Create destination parent directories |
 | `mvmctl cp --max-bytes <n> <src> <dst>` | Refuse copies larger than the byte cap. Default: 16 MiB |
+| `mvmctl cp --json <src> <dst>` | Print a machine-readable copy summary without host paths or file contents |
 
 Exactly one endpoint must use `VM:/absolute/path` form. Guest paths are
 validated by the guest agent's filesystem policy before any read or write. Host
 paths and file contents are not written to audit logs; successful copies emit
 `VmFileCopy` with direction, guest path, and byte count.
+`--json` follows the same redaction rule: the summary includes direction, VM
+name, guest path, copied byte count, and effective copy options, but not the
+host endpoint.
 
 `mvmctl exec` boots a fresh transient microVM, runs a single command, and tears it
 down on exit — like `cco` or `docker run --rm`, but with a Firecracker microVM

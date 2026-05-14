@@ -1623,15 +1623,27 @@ Shipped:
 - `mvmctl run --receipt <path>` writes a host-signed JSON receipt with
   invocation hashes, output hashes, and exit status; raw argv/env values
   and raw output are deliberately omitted.
+- `mvmctl run --json` emits an unsigned machine-readable execution summary
+  using the same redacted invocation/outcome shape as receipts. Guest stdout
+  and stderr are not streamed in JSON mode; only hashes and byte counts appear.
+- Live smoke coverage for `mvmctl run --json --receipt` is gated behind
+  `MVM_LIVE_SMOKE=1` and compares the public JSON summary to the signed
+  receipt without allowing raw guest output into either artifact.
 - `mvmctl receipt verify <path>` verifies the receipt signature against
   the local host-signer public key, with `--pubkey` for portable checks.
 - `mvmctl sandbox gc` adds a dry-run-by-default cleanup path for stale
   sandbox registry entries. `--apply` only removes stopped/expired entries
   that no backend reports as live and emits `SandboxGc`.
+- `mvmctl sandbox gc --json` emits the same candidate/removal decision as a
+  machine-readable summary and preserves dry-run-by-default behavior unless
+  `--apply` is supplied.
 - `mvmctl cp` copies one regular file across the host/VM boundary with exactly
   one `VM:/absolute/path` endpoint, a default 16 MiB cap, no overwrite unless
   `--force`, guest-side path-policy validation, and `VmFileCopy` audit without
   host paths or file contents.
+- `mvmctl cp --json` emits a redacted machine-readable copy summary with
+  direction, VM name, guest path, byte count, and effective copy options; host
+  paths and file contents are omitted.
 - CLI reference and parser tests cover the new command and profile surface.
 
 ### Sprint 52 success criteria
