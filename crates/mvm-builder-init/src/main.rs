@@ -98,9 +98,26 @@ mod linux {
     const NIX_TARGET: &str = "/nix";
 
     /// Per-job command staging dir (`/job/cmd.sh`, `/job/env`,
-    /// `/job/result`). virtio-fs from the host (Plan 72 W4
-    /// will wire it).
+    /// `/job/result`). Mounted via virtio-fs from the host
+    /// (`LibkrunBuilderVm` declares the `job` tag — see Plan 72 W4).
     const JOB_DIR: &str = "/job";
+
+    /// Workspace bind from the host — the in-repo flake the user
+    /// is building. Read-only from the guest's perspective (the
+    /// host mounts the workspace virtio-fs share read-only).
+    const WORK_DIR: &str = "/work";
+
+    /// Artifact-extraction dir. The user's `cmd.sh` writes
+    /// `vmlinux` + `rootfs.ext4` here; the host reads them back
+    /// out after the VM powers off.
+    const OUT_DIR: &str = "/out";
+
+    /// Three virtio-fs tags that match the host-side
+    /// `KrunContext::add_virtio_fs` declarations in
+    /// `LibkrunBuilderVm::run_build`. Order doesn't matter; the
+    /// guest mounts each by tag.
+    const VIRTIOFS_MOUNTS: &[(&str, &str)] =
+        &[("work", WORK_DIR), ("out", OUT_DIR), ("job", JOB_DIR)];
 
     /// Max stderr lines we capture into `/job/result`. Keeps
     /// the result file small; the host-side supervisor still
@@ -155,6 +172,22 @@ mod linux {
 
         std::fs::create_dir_all(NIX_TARGET).map_err(|e| format!("create {NIX_TARGET}: {e}"))?;
         bind_mount(NIX_STORE_MOUNT, NIX_TARGET)?;
+
+        // virtio-fs shares declared by `LibkrunBuilderVm` (Plan 72
+        // W4). Each entry is `(tag, target)` — the kernel routes
+        // `mount -t virtiofs <tag> <target>` to the daemon libkrun
+        // spawned for that share. Mounting is best-effort per
+        // share: if the host omitted one (e.g. an offline build
+        // path with no `/out` need), we still want to reach
+        // `/job/cmd.sh` if `/job` was supplied. Per-share errors
+        // print to stderr but don't fail init — the failing share
+        // surfaces as a normal file-not-found inside cmd.sh.
+        for (tag, target) in VIRTIOFS_MOUNTS {
+            if let Err(e) = mount_virtiofs(tag, target) {
+                eprintln!("mvm-builder-init: virtio-fs '{tag}' -> {target} failed: {e}");
+            }
+        }
+
         Ok(())
     }
 
@@ -249,6 +282,24 @@ mod linux {
             None::<&str>,
         )
         .map_err(|e| format!("bind {source} -> {target}: {e}"))
+    }
+
+    /// Mount a libkrun-exported virtio-fs share. `tag` is the
+    /// symbolic identifier the host registered via
+    /// `krun_add_virtiofs` (mvm-libkrun's `KrunVirtioFs.tag`);
+    /// the kernel routes the mount through libkrun's
+    /// `virtiofsd` daemon. Creates the target dir if absent.
+    fn mount_virtiofs(tag: &str, target: &str) -> Result<(), String> {
+        use nix::mount::{MsFlags, mount};
+        std::fs::create_dir_all(target).map_err(|e| format!("create {target}: {e}"))?;
+        mount(
+            Some(tag),
+            target,
+            Some("virtiofs"),
+            MsFlags::empty(),
+            None::<&str>,
+        )
+        .map_err(|e| format!("mount virtiofs {tag} -> {target}: {e}"))
     }
 
     /// Probe the ext4 magic at offset 0x438 (the superblock's
