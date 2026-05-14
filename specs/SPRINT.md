@@ -1649,6 +1649,11 @@ Shipped:
   policy bundle admission gates as the resolver and emits a redacted admission
   posture summary; JSON omits raw artifact paths, audit destination URLs, and
   egress hostnames.
+- `mvmctl policy lint <tenant>:<workload> [--json]` validates the bundle and
+  fails on risky-but-admissible posture such as plain HTTP egress, disabled
+  inspectors, unsigned audit chains, long/disabled key rotation, broad L4
+  CIDRs, wildcard ports, and sensitive-looking artifact capture paths. JSON is
+  redacted with the same no-raw-paths/URLs/hostnames rule as `policy explain`.
 - CLI reference and parser tests cover the new command and profile surface.
 
 ### Sprint 52 success criteria
