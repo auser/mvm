@@ -534,13 +534,42 @@ fn plist_env_string_value(plist: &str, key: &str) -> Option<String> {
     None
 }
 
+/// Prepare `~/.mvm/dev/current/` for a fresh dev-image build.
+///
+/// Replaces a stale symlink (the nix-darwin `linux-builder` legacy
+/// pointed `current` at a root-owned `/nix/store/…-mvm-dev` path)
+/// with a real, writable directory. `create_dir_all` is a no-op
+/// against an existing symlink, so without this the microsandbox
+/// bind-mount of `out_dir` lands on the read-only Nix store path
+/// and Apple Container fails with EACCES. The libkrun virtio-fs
+/// mount hits the same EACCES — same cleanup applies to both
+/// dispatch paths.
+#[cfg(feature = "contributor-bootstrap")]
+fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
+    if let Some(parent) = std::path::Path::new(out_dir).parent() {
+        std::fs::create_dir_all(parent)
+            .with_context(|| format!("creating dev-image out parent {}", parent.display()))?;
+    }
+    if std::path::Path::new(out_dir)
+        .symlink_metadata()
+        .is_ok_and(|m| m.file_type().is_symlink())
+    {
+        std::fs::remove_file(out_dir)
+            .with_context(|| format!("removing stale dev-image symlink at {out_dir}"))?;
+    }
+    std::fs::create_dir_all(out_dir)
+        .with_context(|| format!("creating dev-image out dir {out_dir}"))?;
+    Ok(())
+}
+
 /// Resolve the dev image (kernel + rootfs) to absolute paths.
 ///
-/// In a source checkout: builds the dev-image flake via the mvm-owned
-/// microsandbox builder VM (ADR-013 §"Linux builder via microsandbox
-/// (no Lima)"). The builder bootstraps from a pinned OCI image
-/// (`docker.io/nixos/nix:2.24.10`) — no host Nix, no `nix-darwin`
-/// linux-builder, no external infrastructure required.
+/// In a source checkout: prefers the libkrun-backed builder VM
+/// (Plan 72 W4/W5 — `LibkrunBuilderVm` runs `nix build` against the
+/// dev-shell flake from inside a microVM with a persistent 64 GiB
+/// `/nix` store). Falls back to direct microsandbox on hosts without
+/// libkrun (until that path also exceeds microsandbox's 4 GiB overlay
+/// for the rustc closure).
 ///
 /// Outside a source checkout: falls back to the GitHub-release
 /// download of a pre-built image.
@@ -551,31 +580,63 @@ fn plist_env_string_value(plist: &str, key: &str) -> Option<String> {
 fn ensure_dev_image() -> Result<(String, String)> {
     let local_flake = find_dev_image_flake().ok();
 
+    // Plan 72 W5.B — source-checkout dispatch.
+    //
+    // Two implementation paths live here during the W5 transition.
+    // Both require `contributor-bootstrap` because Stage 0 (the
+    // microsandbox bootstrap of the builder-vm rootfs from the W2 flake)
+    // is the only way a contributor host without pre-fetched release
+    // artifacts can populate `~/.cache/mvm/builder-vm/<arch>/`. The
+    // dispatch order is:
+    //
+    //   1. libkrun-backed builder VM (W4 launcher; preferred):
+    //      `backends-builder-vm-libkrun` compiled in AND
+    //      `mvm_libkrun::is_available()` true AND
+    //      `find_builder_vm_flake()` succeeds. This is the only path
+    //      that fits the dev-shell rustc+cargo closure, which overflows
+    //      microsandbox's hardcoded 4 GiB overlay.
+    //
+    //   2. Direct microsandbox build of the dev-shell flake (legacy):
+    //      kept as the fallback for hosts without libkrun. Will fail
+    //      with `No space left on device` once the dev-shell closure
+    //      catches up to the overlay limit, but unblocks contributors
+    //      on libkrun-less hosts in the interim.
+    //
+    // Failures in path 1 are loud and refuse silent fallback to path 2,
+    // since the typical failure mode (libkrun runtime mismatch,
+    // builder-vm image cache missing) is a config error that hiding
+    // behind microsandbox would mask.
     #[cfg(feature = "contributor-bootstrap")]
     if let Some(flake_dir) = &local_flake {
         let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
-        if let Some(parent) = std::path::Path::new(&out_dir).parent() {
-            std::fs::create_dir_all(parent)
-                .with_context(|| format!("creating dev-image out parent {}", parent.display()))?;
+        prepare_dev_image_out_dir(&out_dir)?;
+
+        #[cfg(feature = "backends-builder-vm-libkrun")]
+        if mvm_libkrun::is_available() && find_builder_vm_flake().is_ok() {
+            ui::info(&format!(
+                "Building dev image via libkrun builder VM (Plan 72 W5) from: {flake_dir}"
+            ));
+            match build_image_via_libkrun(&out_dir) {
+                Ok((kernel, rootfs)) => {
+                    ui::success(&format!("Dev image ready at {out_dir}."));
+                    return Ok((kernel, rootfs));
+                }
+                Err(e) => {
+                    anyhow::bail!(
+                        "libkrun builder VM build failed (source checkout: {flake_dir}).\n{e}\n\n\
+                         Refusing to fall back to the published prebuilt because it would mask\n\
+                         local rootfs changes, and refusing to fall back to microsandbox because\n\
+                         the dev-shell rustc closure overflows microsandbox's 4 GiB overlay\n\
+                         (the whole reason Plan 72 exists). To force the prebuilt anyway, move\n\
+                         or delete nix/images/builder/flake.nix so the source-checkout heuristic\n\
+                         stops matching."
+                    );
+                }
+            }
         }
-        // Replace a stale symlink (e.g. the nix-darwin `linux-builder`
-        // legacy points `current` at a root-owned `/nix/store/…-mvm-dev`
-        // path) with a real, writable directory. `create_dir_all` is a
-        // no-op against an existing symlink, so without this the
-        // microsandbox bind-mount of `out_dir` lands on the read-only
-        // Nix store path and Apple Container fails with EACCES.
-        if std::path::Path::new(&out_dir)
-            .symlink_metadata()
-            .is_ok_and(|m| m.file_type().is_symlink())
-        {
-            std::fs::remove_file(&out_dir)
-                .with_context(|| format!("removing stale dev-image symlink at {out_dir}"))?;
-        }
-        std::fs::create_dir_all(&out_dir)
-            .with_context(|| format!("creating dev-image out dir {out_dir}"))?;
 
         ui::info(&format!(
-            "Building dev image via microsandbox builder VM from: {flake_dir}"
+            "Building dev image via microsandbox (legacy path; Plan 72 W5 prefers libkrun) from: {flake_dir}"
         ));
         match build_image_via_microsandbox(flake_dir, &out_dir) {
             Ok((kernel, rootfs)) => {
@@ -1792,10 +1853,15 @@ fn find_dev_image_flake() -> Result<String> {
 /// `LibkrunBuilderVm` (Plan 72 W4) handles via virtio-blk-backed
 /// `/nix` instead.
 ///
-/// `dead_code` allow: today the only non-test caller is
-/// [`bootstrap_builder_vm_image`], which itself isn't wired to
-/// `ensure_dev_image` yet (that's the W5.B dispatch swap). Once
-/// the swap lands, the lint clears naturally.
+/// W5.B (this PR) wires this into `ensure_dev_image` as a precondition
+/// for the libkrun dispatch path — when it returns `Ok`, the host has
+/// the Layer 1 builder-VM flake it needs to bootstrap.
+///
+/// `allow(dead_code)`: the function is only called from the
+/// libkrun-dispatch path inside `ensure_dev_image`, which itself only
+/// compiles under `all(contributor-bootstrap, backends-builder-vm-libkrun)`.
+/// Default-features and contributor-bootstrap-only builds compile the
+/// function but never reach it; the lint silencing covers those.
 #[allow(dead_code)]
 fn find_builder_vm_flake() -> Result<String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -1838,11 +1904,16 @@ fn find_builder_vm_flake() -> Result<String> {
 /// microsandbox path. When the feature is off, returns a clear
 /// error pointing at the rebuild command.
 ///
-/// `dead_code` allow: W5.B (next PR) wires this into
-/// `ensure_dev_image` so source-checkout `mvmctl dev up` invokes
-/// it on cache miss. Today the function exists, has tests, and
-/// is callable directly — but no production code path reaches it,
-/// hence the lint silencing.
+/// W5.B (this PR) wires this into `ensure_dev_image` — invoked
+/// during the libkrun dispatch path to populate the cache before
+/// `LibkrunBuilderVm::run_build` reads from it.
+///
+/// `allow(dead_code)`: same justification as
+/// [`find_builder_vm_flake`] — only called when both
+/// `contributor-bootstrap` and `backends-builder-vm-libkrun` are on.
+/// The negative-path test below exercises the `cfg(not(contributor-
+/// bootstrap))` branch (which bails) and keeps the function from
+/// being silently broken in that configuration.
 #[allow(dead_code)]
 fn bootstrap_builder_vm_image() -> Result<()> {
     let flake_dir = find_builder_vm_flake().with_context(|| {
@@ -1893,6 +1964,99 @@ fn bootstrap_builder_vm_image() -> Result<()> {
              follow-up that publishes the builder-vm prebuilt."
         );
     }
+}
+
+/// Plan 72 W5.B — build the dev-shell image via the libkrun-backed
+/// builder VM.
+///
+/// Layer 1 (the builder VM image at `~/.cache/mvm/builder-vm/<arch>/`)
+/// is bootstrapped via [`bootstrap_builder_vm_image`] on cache miss
+/// (Stage 0 = microsandbox + nixos/nix:2.24.10). Layer 2 (the dev-shell
+/// image the user boots into via `mvmctl dev up`) is built by
+/// `LibkrunBuilderVm::run_build` against the in-repo
+/// `nix/images/builder/` flake, inside a libkrun guest that mounts the
+/// workspace at `/work` and writes its artifacts back through a
+/// virtio-fs `/out` share.
+///
+/// On success returns the host-side paths to the produced `vmlinux`
+/// and `rootfs.ext4` in `out_dir` (mirroring `build_image_via_microsandbox`).
+///
+/// Caller is expected to have:
+///   - confirmed `mvm_libkrun::is_available()` true,
+///   - confirmed `find_builder_vm_flake().is_ok()` (Layer 1 source is
+///     present in the workspace),
+///   - run [`prepare_dev_image_out_dir`] on `out_dir`.
+#[cfg(all(
+    feature = "contributor-bootstrap",
+    feature = "backends-builder-vm-libkrun"
+))]
+fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
+    use mvm_build::builder_vm::{BuilderJob, BuilderMounts, BuilderVm, host_system_linux};
+    use mvm_build::libkrun_builder::LibkrunBuilderVm;
+
+    // Stage 0 — ensure Layer 1 (the builder VM image) is in
+    // `~/.cache/mvm/builder-vm/<arch>/`. Idempotent: first call builds
+    // it via microsandbox; subsequent calls find the cache populated
+    // and return immediately. Currently always pays the rebuild cost
+    // because microsandbox doesn't surface a content-hash check — a
+    // future PR can wire `manifest.json` SHA verification to make this
+    // a cheap cache hit.
+    bootstrap_builder_vm_image()
+        .context("Stage 0 builder-VM image bootstrap (precondition for libkrun dispatch)")?;
+
+    // Workspace root for the `/work` virtio-fs share. `find_dev_image_flake()`
+    // returns `<workspace>/nix/images/builder`; the workspace itself is
+    // three levels up. The dev-shell flake at
+    // `nix/images/builder/flake.nix` reads `MVM_WORKSPACE_PATH=/work`
+    // (set in the guest's `cmd.sh` by `LibkrunBuilderVm`) under
+    // `--impure`, so the flake's `builtins.path` import lands on the
+    // mount rather than the store-copied flake dir. Plan 72 W0
+    // wired both halves of this.
+    let dev_flake = find_dev_image_flake().context(
+        "dev-shell flake missing at nix/images/builder/flake.nix; libkrun dispatch needs it as Layer 2 source",
+    )?;
+    let workspace_root = std::path::Path::new(&dev_flake)
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive workspace root from {dev_flake}"))?
+        .to_path_buf();
+
+    // Inside the guest, `/work` is the workspace mount. The dev-shell
+    // flake lives at `/work/nix/images/builder` from the cmd.sh's
+    // perspective. `path:` forces Nix's filesystem flake fetcher (not
+    // the git fetcher, which would discover `/work/.git` and trip on
+    // worktree files whose `gitdir:` redirects point outside the
+    // mount).
+    let job = BuilderJob {
+        flake_ref: "path:/work/nix/images/builder".to_string(),
+        attr_path: format!("packages.{}.default", host_system_linux()),
+    };
+    let mounts = BuilderMounts {
+        flake_src: workspace_root,
+        // libkrun keeps `/nix` on a persistent virtio-blk; no host
+        // bind-mount of `/nix/store` is used or wanted (would be a
+        // Darwin-x-Linux closure mismatch on macOS anyway).
+        host_nix_store: None,
+        artifact_out: std::path::PathBuf::from(out_dir),
+    };
+
+    LibkrunBuilderVm::default()
+        .run_build(&job, &mounts)
+        .map_err(|e| anyhow::anyhow!("libkrun builder VM: {e}"))?;
+
+    // run_build wrote vmlinux + rootfs.ext4 into out_dir via the
+    // virtio-fs `/out` mount; the same files mvm-cli is about to
+    // hand back to the dev-up path.
+    let kernel = format!("{out_dir}/vmlinux");
+    let rootfs = format!("{out_dir}/rootfs.ext4");
+    if !std::path::Path::new(&kernel).exists() {
+        anyhow::bail!("libkrun builder VM exited cleanly but did not produce {kernel}");
+    }
+    if !std::path::Path::new(&rootfs).exists() {
+        anyhow::bail!("libkrun builder VM exited cleanly but did not produce {rootfs}");
+    }
+    Ok((kernel, rootfs))
 }
 
 /// Locate the bundled `nix/images/default-tenant/` flake.

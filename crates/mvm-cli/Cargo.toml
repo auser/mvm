@@ -67,12 +67,20 @@ predicates.workspace = true
 rand.workspace = true
 
 [features]
-default = []
+# Plan 72 W5.B cutover: `backends-builder-vm-libkrun` is now default so
+# `mvmctl dev up` prefers the libkrun-backed builder VM (64 GiB
+# persistent /nix store) over microsandbox (4 GiB overlay too small for
+# the dev-shell rustc closure). Library consumers that don't want the
+# libkrun FFI in their closure build with `default-features = false`.
+# Runtime gating via `mvm_libkrun::is_available()` still falls back
+# cleanly when libkrun isn't installed on the host.
+default = ["backends-builder-vm-libkrun"]
 contributor-bootstrap = [
     "mvm/contributor-bootstrap",
     "mvm-build/contributor-bootstrap",
     "mvm-backend/contributor-bootstrap",
 ]
+backends-builder-vm-libkrun = ["mvm-build/backends-builder-vm-libkrun"]
 custom-dns = ["mvm-supervisor/custom-dns"]
 dev-watch = ["dep:notify", "dep:notify-debouncer-mini"]
 manifest-verify = [

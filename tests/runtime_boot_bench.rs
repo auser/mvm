@@ -1,0 +1,386 @@
+//! Live boot benchmark for already-built runtime images.
+//!
+//! This deliberately excludes the builder VM and Nix image build path.
+//! It measures only backend launch of prebuilt `vmlinux` + `rootfs.ext4`
+//! artifacts, with an optional guest-agent readiness check.
+//!
+//! Run on a Linux/KVM builder host with:
+//!
+//! ```text
+//! MVM_RUNTIME_BOOT_BENCH=1 \
+//! MVM_RUNTIME_BOOT_BACKEND=firecracker \
+//! MVM_RUNTIME_BOOT_KERNEL=/path/to/vmlinux \
+//! MVM_RUNTIME_BOOT_ROOTFS=/path/to/rootfs.ext4 \
+//! cargo test --test runtime_boot_bench -- --nocapture
+//! ```
+//!
+//! Optional knobs:
+//! - `MVM_RUNTIME_BOOT_RUNS=10` for serial samples.
+//! - `MVM_RUNTIME_BOOT_CONCURRENT=3` for fan-out width.
+//! - `MVM_RUNTIME_BOOT_BUDGET_MS=200` for the per-VM max budget.
+//! - `MVM_RUNTIME_BOOT_READY=start-return|guest-agent`.
+
+use std::path::{Path, PathBuf};
+use std::sync::{Arc, Barrier};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use anyhow::{Context, Result, bail};
+use mvm_backend::backend::AnyBackend;
+use mvm_core::vm_backend::VmStartConfig;
+use mvm_guest::vsock::{GuestRequest, GuestResponse};
+
+const ENABLE_VAR: &str = "MVM_RUNTIME_BOOT_BENCH";
+const BACKEND_VAR: &str = "MVM_RUNTIME_BOOT_BACKEND";
+const KERNEL_VAR: &str = "MVM_RUNTIME_BOOT_KERNEL";
+const ROOTFS_VAR: &str = "MVM_RUNTIME_BOOT_ROOTFS";
+const RUNS_VAR: &str = "MVM_RUNTIME_BOOT_RUNS";
+const CONCURRENT_VAR: &str = "MVM_RUNTIME_BOOT_CONCURRENT";
+const BUDGET_VAR: &str = "MVM_RUNTIME_BOOT_BUDGET_MS";
+const READY_VAR: &str = "MVM_RUNTIME_BOOT_READY";
+
+const DEFAULT_BACKEND: &str = "firecracker";
+const DEFAULT_RUNS: usize = 5;
+const DEFAULT_CONCURRENT: usize = 3;
+const DEFAULT_BUDGET_MS: u64 = 200;
+const DEFAULT_READY: ReadySignal = ReadySignal::GuestAgent;
+const READY_TIMEOUT: Duration = Duration::from_secs(5);
+const READY_POLL: Duration = Duration::from_millis(5);
+
+#[test]
+fn prebuilt_runtime_image_boots_within_budget() -> Result<()> {
+    let Some(spec) = BenchSpec::from_env()? else {
+        eprintln!("[runtime_boot_bench] skipped; set {ENABLE_VAR}=1 to run the live benchmark");
+        return Ok(());
+    };
+
+    let serial = measure_serial(&spec)?;
+    let serial_summary = summarize(&serial);
+    eprintln!(
+        "[runtime_boot_bench] serial backend={} ready={:?} runs={} p50={}ms p95={}ms max={}ms budget={}ms",
+        spec.backend,
+        spec.ready,
+        serial.len(),
+        serial_summary.p50.as_millis(),
+        serial_summary.p95.as_millis(),
+        serial_summary.max.as_millis(),
+        spec.budget.as_millis(),
+    );
+    assert_within_budget("serial max", serial_summary.max, spec.budget);
+
+    let concurrent = measure_concurrent(&spec)?;
+    let concurrent_summary = summarize(&concurrent);
+    eprintln!(
+        "[runtime_boot_bench] concurrent backend={} ready={:?} count={} p50={}ms p95={}ms max={}ms budget={}ms",
+        spec.backend,
+        spec.ready,
+        concurrent.len(),
+        concurrent_summary.p50.as_millis(),
+        concurrent_summary.p95.as_millis(),
+        concurrent_summary.max.as_millis(),
+        spec.budget.as_millis(),
+    );
+    assert_within_budget("concurrent max", concurrent_summary.max, spec.budget);
+
+    Ok(())
+}
+
+#[derive(Debug, Clone)]
+struct BenchSpec {
+    backend: String,
+    kernel: PathBuf,
+    rootfs: PathBuf,
+    runs: usize,
+    concurrent: usize,
+    budget: Duration,
+    ready: ReadySignal,
+}
+
+impl BenchSpec {
+    fn from_env() -> Result<Option<Self>> {
+        if std::env::var(ENABLE_VAR).as_deref() != Ok("1") {
+            return Ok(None);
+        }
+
+        let kernel = required_path(KERNEL_VAR)?;
+        let rootfs = required_path(ROOTFS_VAR)?;
+        Ok(Some(Self {
+            backend: env_string(BACKEND_VAR, DEFAULT_BACKEND),
+            kernel,
+            rootfs,
+            runs: env_usize(RUNS_VAR, DEFAULT_RUNS)?,
+            concurrent: env_usize(CONCURRENT_VAR, DEFAULT_CONCURRENT)?,
+            budget: Duration::from_millis(env_u64(BUDGET_VAR, DEFAULT_BUDGET_MS)?),
+            ready: ReadySignal::parse(&env_string(READY_VAR, DEFAULT_READY.as_str()))?,
+        }))
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReadySignal {
+    StartReturn,
+    GuestAgent,
+}
+
+impl ReadySignal {
+    fn parse(raw: &str) -> Result<Self> {
+        match raw {
+            "start-return" | "start_return" | "start" => Ok(Self::StartReturn),
+            "guest-agent" | "guest_agent" | "agent" => Ok(Self::GuestAgent),
+            other => bail!("unknown {READY_VAR}={other:?}; expected start-return or guest-agent"),
+        }
+    }
+
+    const fn as_str(self) -> &'static str {
+        match self {
+            Self::StartReturn => "start-return",
+            Self::GuestAgent => "guest-agent",
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct BootMeasurement {
+    elapsed: Duration,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Summary {
+    p50: Duration,
+    p95: Duration,
+    max: Duration,
+}
+
+fn measure_serial(spec: &BenchSpec) -> Result<Vec<BootMeasurement>> {
+    let mut measurements = Vec::with_capacity(spec.runs);
+    for run in 0..spec.runs {
+        let name = unique_vm_name(&format!("serial-{run}"));
+        measurements.push(measure_one(spec, name)?);
+    }
+    Ok(measurements)
+}
+
+fn measure_concurrent(spec: &BenchSpec) -> Result<Vec<BootMeasurement>> {
+    let barrier = Arc::new(Barrier::new(spec.concurrent));
+    let mut handles = Vec::with_capacity(spec.concurrent);
+
+    for idx in 0..spec.concurrent {
+        let spec = spec.clone();
+        let barrier = Arc::clone(&barrier);
+        let name = unique_vm_name(&format!("concurrent-{idx}"));
+        handles.push(std::thread::spawn(move || {
+            barrier.wait();
+            measure_one(&spec, name)
+        }));
+    }
+
+    let mut measurements = Vec::with_capacity(spec.concurrent);
+    for handle in handles {
+        measurements.push(
+            handle
+                .join()
+                .map_err(|_| anyhow::anyhow!("concurrent boot worker panicked"))??,
+        );
+    }
+    Ok(measurements)
+}
+
+fn measure_one(spec: &BenchSpec, name: String) -> Result<BootMeasurement> {
+    let backend = AnyBackend::from_hypervisor(&spec.backend);
+    let config = VmStartConfig {
+        name: name.clone(),
+        rootfs_path: spec.rootfs.to_string_lossy().into_owned(),
+        kernel_path: Some(spec.kernel.to_string_lossy().into_owned()),
+        cpus: 1,
+        memory_mib: 256,
+        revision_hash: "runtime-boot-bench".to_string(),
+        flake_ref: "prebuilt-runtime-image".to_string(),
+        ..Default::default()
+    };
+
+    let started = Instant::now();
+    let id = backend
+        .start(&config)
+        .with_context(|| format!("starting benchmark VM {name} with backend {}", spec.backend))?;
+    let ready_result = wait_until_ready(spec, &name);
+    let elapsed = started.elapsed();
+    let stop_result = backend.stop(&id);
+
+    if let Err(e) = stop_result {
+        eprintln!("[runtime_boot_bench] warning: failed to stop {name}: {e}");
+    }
+    ready_result?;
+
+    Ok(BootMeasurement { elapsed })
+}
+
+fn wait_until_ready(spec: &BenchSpec, name: &str) -> Result<()> {
+    match spec.ready {
+        ReadySignal::StartReturn => Ok(()),
+        ReadySignal::GuestAgent => wait_for_guest_agent(&spec.backend, name),
+    }
+}
+
+fn wait_for_guest_agent(backend: &str, name: &str) -> Result<()> {
+    let uds_path = guest_agent_socket_path(backend, name)?;
+    let deadline = Instant::now() + READY_TIMEOUT;
+    let mut last_err = None;
+
+    while Instant::now() < deadline {
+        match ping_guest_agent(&uds_path) {
+            Ok(()) => return Ok(()),
+            Err(e) => last_err = Some(e),
+        }
+        std::thread::sleep(READY_POLL);
+    }
+
+    Err(last_err.unwrap_or_else(|| {
+        anyhow::anyhow!(
+            "guest agent did not become ready at {} within {:?}",
+            uds_path.display(),
+            READY_TIMEOUT
+        )
+    }))
+}
+
+fn guest_agent_socket_path(backend: &str, name: &str) -> Result<PathBuf> {
+    match backend {
+        "firecracker" => {
+            let home = std::env::var("HOME").context("resolving HOME for Firecracker VM state")?;
+            Ok(Path::new(&home)
+                .join("microvm")
+                .join("vms")
+                .join(name)
+                .join("v.sock"))
+        }
+        "libkrun" | "krun" => Ok(Path::new(&mvm_core::config::mvm_data_dir())
+            .join("vms")
+            .join(name)
+            .join(format!("vsock-{}.sock", mvm_guest::vsock::GUEST_AGENT_PORT))),
+        other => bail!(
+            "{READY_VAR}=guest-agent is not wired for backend {other:?}; use {READY_VAR}=start-return"
+        ),
+    }
+}
+
+fn ping_guest_agent(uds_path: &Path) -> Result<()> {
+    let mut stream = mvm_guest::vsock::connect_to(&uds_path.to_string_lossy(), 1)?;
+    let response = mvm_guest::vsock::send_request(&mut stream, &GuestRequest::Ping)?;
+    match response {
+        GuestResponse::Pong => Ok(()),
+        other => bail!("unexpected ping response: {other:?}"),
+    }
+}
+
+fn summarize(measurements: &[BootMeasurement]) -> Summary {
+    assert!(
+        !measurements.is_empty(),
+        "benchmark must have at least one measurement"
+    );
+    let mut values: Vec<_> = measurements.iter().map(|m| m.elapsed).collect();
+    values.sort();
+    Summary {
+        p50: percentile(&values, 50),
+        p95: percentile(&values, 95),
+        max: *values.last().expect("non-empty values"),
+    }
+}
+
+fn percentile(sorted: &[Duration], pct: usize) -> Duration {
+    assert!(!sorted.is_empty(), "percentile needs at least one sample");
+    let rank = ((sorted.len() * pct).div_ceil(100)).saturating_sub(1);
+    sorted[rank.min(sorted.len() - 1)]
+}
+
+fn assert_within_budget(label: &str, actual: Duration, budget: Duration) {
+    assert!(
+        actual <= budget,
+        "{label} exceeded runtime boot budget: {actual:?} > {budget:?}"
+    );
+}
+
+fn required_path(var: &str) -> Result<PathBuf> {
+    let raw = std::env::var_os(var).ok_or_else(|| anyhow::anyhow!("{var} is required"))?;
+    let path = PathBuf::from(raw);
+    if !path.is_file() {
+        bail!("{var}={} is not a file", path.display());
+    }
+    Ok(path)
+}
+
+fn env_string(var: &str, default: &str) -> String {
+    std::env::var(var).unwrap_or_else(|_| default.to_string())
+}
+
+fn env_usize(var: &str, default: usize) -> Result<usize> {
+    let value = env_u64(var, default as u64)?;
+    usize::try_from(value).with_context(|| format!("{var} does not fit in usize: {value}"))
+}
+
+fn env_u64(var: &str, default: u64) -> Result<u64> {
+    match std::env::var(var) {
+        Ok(raw) => raw
+            .parse::<u64>()
+            .with_context(|| format!("parsing {var}={raw:?} as u64")),
+        Err(_) => Ok(default),
+    }
+}
+
+fn unique_vm_name(label: &str) -> String {
+    let millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_millis())
+        .unwrap_or(0);
+    format!("mvm-boot-bench-{label}-{}-{millis}", std::process::id())
+}
+
+#[test]
+fn ready_signal_parser_accepts_expected_aliases() {
+    assert_eq!(
+        ReadySignal::parse("start-return").expect("parse start-return"),
+        ReadySignal::StartReturn
+    );
+    assert_eq!(
+        ReadySignal::parse("start").expect("parse start"),
+        ReadySignal::StartReturn
+    );
+    assert_eq!(
+        ReadySignal::parse("guest-agent").expect("parse guest-agent"),
+        ReadySignal::GuestAgent
+    );
+    assert_eq!(
+        ReadySignal::parse("agent").expect("parse agent"),
+        ReadySignal::GuestAgent
+    );
+}
+
+#[test]
+fn summary_reports_percentiles_and_max() {
+    let measurements = [
+        BootMeasurement {
+            elapsed: Duration::from_millis(10),
+        },
+        BootMeasurement {
+            elapsed: Duration::from_millis(20),
+        },
+        BootMeasurement {
+            elapsed: Duration::from_millis(30),
+        },
+        BootMeasurement {
+            elapsed: Duration::from_millis(40),
+        },
+    ];
+    let summary = summarize(&measurements);
+    assert_eq!(summary.p50, Duration::from_millis(20));
+    assert_eq!(summary.p95, Duration::from_millis(40));
+    assert_eq!(summary.max, Duration::from_millis(40));
+}
+
+#[test]
+fn live_bench_is_disabled_by_default() -> Result<()> {
+    if std::env::var(ENABLE_VAR).is_ok() {
+        eprintln!("[runtime_boot_bench] env already set; skipping disabled-by-default assertion");
+        return Ok(());
+    }
+    assert!(BenchSpec::from_env()?.is_none());
+    Ok(())
+}
