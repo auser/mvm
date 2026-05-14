@@ -12,6 +12,11 @@ man/*.1
 nixos.qcow2
 .ash_history
 keys
+# Local dev-image build output. The sibling `nix/images/builder/` and
+# `nix/images/builder-vm/` directories are flake sources and stay
+# tracked; this one is a build artifact that can run into the hundreds
+# of megabytes per arch.
+nix/images/dev-prebuilt/
 
 # Override the user's global gitignore for this specific path. The CLI
 # crate has a `build/` subdirectory that hosts the `mvmctl build`
