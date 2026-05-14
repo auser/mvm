@@ -6,6 +6,9 @@
 pub(super) mod build;
 pub(super) mod compile;
 pub(super) mod deploy;
+/// Shared helpers for the SDK record-mode auto-exec path. Used by
+/// `mvmctl compile <Sandbox-script>` and `mvmctl run --mode plan`.
+pub(in crate::commands) mod sandbox_record;
 pub(super) mod validate;
 
 pub(super) use super::{Cli, shared};

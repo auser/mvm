@@ -27,7 +27,6 @@
 
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 
 use anyhow::{Context, Result, bail};
 use clap::{Args as ClapArgs, ValueEnum};
@@ -36,9 +35,11 @@ use mvm_core::user_config::MvmConfig;
 use mvm_ir::Workload;
 use mvm_sdk::compile::{compile, compile_archive, is_archive_output};
 use mvm_sdk::decorator::{ParseError, parse_python, parse_typescript};
-use mvm_sdk::runtime::{RuntimeRecording, compile_recording};
 
 use super::Cli;
+use super::sandbox_record::{
+    ScriptLanguage, auto_exec_record_script, load_recording, script_language_from_path,
+};
 
 #[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct Args {
@@ -198,177 +199,29 @@ fn load_workload(args: &Args) -> Result<Workload> {
             // (mvm.app({...})(fn)); on NoDecoratedFunction, auto-exec
             // via tsx / bun / deno.
             // .js / .mjs / .cjs → Sandbox-shaped only; auto-exec via node.
-            let ext = path.extension().and_then(|e| e.to_str()).unwrap_or("");
-            if matches!(ext, "ts" | "tsx" | "mts" | "cts") {
-                let bytes = std::fs::read(&path)
-                    .with_context(|| format!("reading decorator script {}", path.display()))?;
-                match parse_typescript(&bytes, &path) {
-                    Ok((workload, _manifest)) => Ok(workload),
-                    Err(ParseError::NoDecoratedFunction { .. }) => {
-                        auto_exec_record_script(&path, ScriptLanguage::TypeScript)
+            match script_language_from_path(&path) {
+                Some(ScriptLanguage::TypeScript) => {
+                    let bytes = std::fs::read(&path)
+                        .with_context(|| format!("reading decorator script {}", path.display()))?;
+                    match parse_typescript(&bytes, &path) {
+                        Ok((workload, _manifest)) => Ok(workload),
+                        Err(ParseError::NoDecoratedFunction { .. }) => {
+                            auto_exec_record_script(&path, ScriptLanguage::TypeScript)
+                        }
+                        Err(e) => Err(anyhow::anyhow!("{e}")).with_context(|| {
+                            format!(
+                                "parsing mvm.app({{...}})(fn) decorator in {}",
+                                path.display()
+                            )
+                        }),
                     }
-                    Err(e) => Err(anyhow::anyhow!("{e}")).with_context(|| {
-                        format!(
-                            "parsing mvm.app({{...}})(fn) decorator in {}",
-                            path.display()
-                        )
-                    }),
                 }
-            } else if matches!(ext, "js" | "mjs" | "cjs") {
-                auto_exec_record_script(&path, ScriptLanguage::Node)
-            } else {
-                bail!(no_decorator_runtime_message(&path))
-            }
-        }
-    }
-}
-
-fn load_recording(path: &Path) -> Result<Workload> {
-    let bytes = std::fs::read(path)
-        .with_context(|| format!("reading runtime recording from {}", path.display()))?;
-    let recording: RuntimeRecording = serde_json::from_slice(&bytes)
-        .with_context(|| format!("parsing runtime recording JSON from {}", path.display()))?;
-    compile_recording(&recording)
-        .map_err(|e| anyhow::anyhow!("{e}"))
-        .with_context(|| format!("lowering runtime recording from {}", path.display()))
-}
-
-/// Languages the auto-exec path supports.
-#[derive(Debug, Clone, Copy)]
-enum ScriptLanguage {
-    /// Python via `python3` (or `python`); Phase 7e.
-    Python,
-    /// Plain JavaScript via `node`; Phase 7f.
-    Node,
-    /// TypeScript via `tsx`, `bun`, or `deno`. The `node` binary
-    /// alone can't run `.ts` files in mvm's supported Node range,
-    /// so the CLI insists on a TS-aware runner. Phase 7f.
-    TypeScript,
-}
-
-/// Phase 7e — run `<interpreter> <script>` on the host with
-/// `MVM_SDK_MODE=record` and `MVM_SDK_OUT_PATH=<tempfile>`, then
-/// load the recording the SDK's atexit hook wrote and lower it
-/// to a Workload.
-///
-/// **Security**: this *runs the user's script on the host*. Per
-/// S2 in the SDK plan, this is a deliberate departure from the
-/// decorator path's "never executes user code on the host" rule;
-/// `mvmctl compile <Sandbox-script>` is opt-in for that posture.
-/// Users who don't want it can use the `@mvm.app` decorator path
-/// instead (which the decorator parser handles statically).
-fn auto_exec_record_script(script: &Path, lang: ScriptLanguage) -> Result<Workload> {
-    let interpreter = resolve_interpreter(lang)?;
-    let tmp = tempfile::Builder::new()
-        .prefix("mvm-recording-")
-        .suffix(".json")
-        .tempfile()
-        .context("creating tempfile for runtime recording capture")?;
-    let out_path = tmp.path().to_path_buf();
-
-    eprintln!(
-        "running {} on the host with MVM_SDK_MODE=record (Phase 7e/7f auto-exec)",
-        script.display()
-    );
-
-    let mut cmd = Command::new(&interpreter);
-    // Deno's default sandbox refuses fs writes; the SDK's atexit
-    // hook needs to write the recording, so opt out explicitly.
-    let basename = interpreter
-        .file_name()
-        .and_then(|s| s.to_str())
-        .unwrap_or("");
-    if basename.starts_with("deno") {
-        cmd.arg("run").arg("--allow-all");
-    }
-    let status = cmd
-        .arg(script)
-        .env("MVM_SDK_MODE", "record")
-        .env("MVM_SDK_OUT_PATH", &out_path)
-        .status()
-        .with_context(|| {
-            format!(
-                "spawning {} to run record-mode script {}",
-                interpreter.display(),
-                script.display()
-            )
-        })?;
-    if !status.success() {
-        bail!(
-            "record-mode script {} exited with {:?} (no Workload emitted). \
-             Re-run it under {} with MVM_SDK_MODE=record to see the error.",
-            script.display(),
-            status.code(),
-            interpreter.display()
-        );
-    }
-    if !out_path.exists() {
-        bail!(
-            "record-mode script {} did not emit a recording. Confirm the \
-             script imports `mvm` and calls `Sandbox.create(...)`; the SDK's \
-             atexit hook writes the recording to MVM_SDK_OUT_PATH on process \
-             exit, which only fires when a Sandbox was constructed.",
-            script.display()
-        );
-    }
-    load_recording(&out_path)
-}
-
-/// Resolve which interpreter to spawn for a given language. Each
-/// language has a discrete env-var override (`MVM_PYTHON`, `MVM_NODE`,
-/// `MVM_TSX`) so users with non-standard layouts can pin a binary
-/// explicitly. The fallback search order is best-effort but explicit
-/// in the error message when nothing is found.
-fn resolve_interpreter(lang: ScriptLanguage) -> Result<PathBuf> {
-    match lang {
-        ScriptLanguage::Python => {
-            if let Some(p) = env_override("MVM_PYTHON") {
-                return Ok(p);
-            }
-            for candidate in ["python3", "python"] {
-                if let Ok(found) = which::which(candidate) {
-                    return Ok(found);
+                Some(ScriptLanguage::Node) => auto_exec_record_script(&path, ScriptLanguage::Node),
+                Some(ScriptLanguage::Python) | None => {
+                    bail!(no_decorator_runtime_message(&path))
                 }
             }
-            bail!(
-                "no Python interpreter found on PATH (tried `python3`, `python`). \
-                 Install Python 3.10+ or set `MVM_PYTHON=<path>` and re-run."
-            )
         }
-        ScriptLanguage::Node => {
-            if let Some(p) = env_override("MVM_NODE") {
-                return Ok(p);
-            }
-            if let Ok(found) = which::which("node") {
-                return Ok(found);
-            }
-            bail!(
-                "no Node.js interpreter found on PATH (tried `node`). \
-                 Install Node 20+ or set `MVM_NODE=<path>` and re-run."
-            )
-        }
-        ScriptLanguage::TypeScript => {
-            if let Some(p) = env_override("MVM_TSX") {
-                return Ok(p);
-            }
-            // Project-local `./node_modules/.bin/<runner>` wins over a
-            // PATH-installed runner: this lets a `package.json` /
-            // lockfile pin the exact version without forcing the user
-            // to install one globally. Resolution is cwd-relative
-            // because `mvmctl compile` is run from a project root.
-            // See `crate::ts_runner` for the full resolution order.
-            if let Some(p) = crate::ts_runner::resolve() {
-                return Ok(p);
-            }
-            bail!("{}", crate::ts_runner::install_hint())
-        }
-    }
-}
-
-fn env_override(name: &str) -> Option<PathBuf> {
-    match std::env::var(name) {
-        Ok(v) if !v.is_empty() => Some(PathBuf::from(v)),
-        _ => None,
     }
 }
 
@@ -461,53 +314,51 @@ fn resolve_manifest_dir(args: &Args) -> Result<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::Mutex;
 
-    /// Serializes tests that mutate `MVM_TSX` (process-wide).
-    static ENV_LOCK: Mutex<()> = Mutex::new(());
-
-    /// Restore-on-drop guard for `MVM_TSX`. Used to exercise the
-    /// env-override short-circuit in `resolve_interpreter` without
-    /// leaking state into sibling tests.
-    struct TsxGuard {
-        _guard: std::sync::MutexGuard<'static, ()>,
-        prev: Option<String>,
-    }
-
-    impl TsxGuard {
-        fn set(value: Option<&str>) -> Self {
-            let g = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
-            let prev = std::env::var("MVM_TSX").ok();
-            unsafe {
-                match value {
-                    Some(v) => std::env::set_var("MVM_TSX", v),
-                    None => std::env::remove_var("MVM_TSX"),
-                }
-            }
-            TsxGuard { _guard: g, prev }
-        }
-    }
-
-    impl Drop for TsxGuard {
-        fn drop(&mut self) {
-            unsafe {
-                match &self.prev {
-                    Some(v) => std::env::set_var("MVM_TSX", v),
-                    None => std::env::remove_var("MVM_TSX"),
-                }
-            }
-        }
+    #[test]
+    fn resolve_mode_default_is_record() {
+        let args = Args {
+            entry: Some("./foo.json".to_string()),
+            from_ir: None,
+            from_recording: None,
+            out: PathBuf::from("./out"),
+            mode: None,
+            prod: false,
+            dev: false,
+        };
+        let mode = resolve_mode(&args).expect("default mode resolves");
+        assert!(matches!(mode, Mode::Record));
     }
 
     #[test]
-    fn resolve_interpreter_typescript_honours_mvm_tsx_override() {
-        // Sanity: MVM_TSX pin must short-circuit before the
-        // project-local / PATH lookup. We can't usefully check that
-        // the path *exists* (no fixture), but we can check that the
-        // returned PathBuf is the override verbatim.
-        let _g = TsxGuard::set(Some("/usr/local/bin/tsx-pinned"));
-        let resolved =
-            resolve_interpreter(ScriptLanguage::TypeScript).expect("MVM_TSX must short-circuit");
-        assert_eq!(resolved, PathBuf::from("/usr/local/bin/tsx-pinned"));
+    fn resolve_mode_prod_resolves_to_record() {
+        let args = Args {
+            entry: Some("./foo.json".to_string()),
+            from_ir: None,
+            from_recording: None,
+            out: PathBuf::from("./out"),
+            mode: None,
+            prod: true,
+            dev: false,
+        };
+        let mode = resolve_mode(&args).expect("--prod resolves to record");
+        assert!(matches!(mode, Mode::Record));
+    }
+
+    #[test]
+    fn resolve_mode_dev_is_refused_on_compile() {
+        let args = Args {
+            entry: Some("./foo.json".to_string()),
+            from_ir: None,
+            from_recording: None,
+            out: PathBuf::from("./out"),
+            mode: None,
+            prod: false,
+            dev: true,
+        };
+        let err = resolve_mode(&args).expect_err("--dev must be refused on compile");
+        let msg = err.to_string();
+        assert!(msg.contains("--dev"));
+        assert!(msg.contains("mvmctl run"));
     }
 }
