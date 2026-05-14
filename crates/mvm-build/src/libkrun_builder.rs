@@ -48,9 +48,7 @@
 //! one-shot `nix build`, while the runtime mounts the user's rootfs
 //! and runs the user's entrypoint.
 
-use crate::builder_vm::{
-    BuilderArtifacts, BuilderJob, BuilderMounts, BuilderVm, BuilderVmError,
-};
+use crate::builder_vm::{BuilderArtifacts, BuilderJob, BuilderMounts, BuilderVm, BuilderVmError};
 
 /// Default vCPU count for the builder VM. Nix builds are
 /// embarrassingly parallel at the derivation level; 4 cores is the
@@ -338,7 +336,9 @@ mod tests {
         let scratch = TempDir::new().unwrap();
         let mounts = ok_mounts(&scratch);
         assert!(!mounts.artifact_out.exists());
-        LibkrunBuilderVm::default().validate_mounts(&mounts).unwrap();
+        LibkrunBuilderVm::default()
+            .validate_mounts(&mounts)
+            .unwrap();
         assert!(mounts.artifact_out.is_dir());
     }
 
@@ -420,8 +420,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                BuilderVmError::LibkrunNotShipped
-                    | BuilderVmError::MicrosandboxUnavailable(_)
+                BuilderVmError::LibkrunNotShipped | BuilderVmError::MicrosandboxUnavailable(_)
             ),
             "unexpected error variant: {err:?}"
         );
