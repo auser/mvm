@@ -81,6 +81,148 @@ pub struct PolicyRef(pub String);
 #[serde(transparent)]
 pub struct FsPolicyRef(pub String);
 
+/// Purpose label bound into the signed plan at admission time.
+///
+/// This is intentionally separate from [`WorkloadId`]: many workloads
+/// can share the same security posture because they have the same
+/// purpose (`code:execute`, `agent:web-research`, `deploy:publish`,
+/// etc.). Resolvers use the intent to pick a concrete admission
+/// profile before the backend boots.
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize)]
+#[serde(transparent)]
+pub struct WorkloadIntent(pub String);
+
+/// Seccomp tier name as it appears in a signed `ExecutionPlan`.
+///
+/// The concrete filter lives in `mvm-security`; keeping this enum in
+/// `mvm-plan` avoids a dependency edge from the wire-contract crate
+/// into the enforcement crate while still making the selected tier a
+/// typed, auditable plan field.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum PlanSeccompTier {
+    Essential,
+    Minimal,
+    #[default]
+    Standard,
+    Network,
+    Unrestricted,
+}
+
+impl std::fmt::Display for PlanSeccompTier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Essential => write!(f, "essential"),
+            Self::Minimal => write!(f, "minimal"),
+            Self::Standard => write!(f, "standard"),
+            Self::Network => write!(f, "network"),
+            Self::Unrestricted => write!(f, "unrestricted"),
+        }
+    }
+}
+
+impl std::str::FromStr for PlanSeccompTier {
+    type Err = PlanSeccompTierParseError;
+
+    fn from_str(value: &str) -> Result<Self, Self::Err> {
+        match value {
+            "essential" => Ok(Self::Essential),
+            "minimal" => Ok(Self::Minimal),
+            "standard" => Ok(Self::Standard),
+            "network" => Ok(Self::Network),
+            "unrestricted" => Ok(Self::Unrestricted),
+            _ => Err(PlanSeccompTierParseError {
+                value: value.to_string(),
+            }),
+        }
+    }
+}
+
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+#[error(
+    "unknown seccomp tier {value:?} (expected: essential, minimal, standard, network, unrestricted)"
+)]
+pub struct PlanSeccompTierParseError {
+    pub value: String,
+}
+
+/// How a profile permits secrets to become visible to the workload.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SecretReleasePolicy {
+    /// No secrets may be released.
+    #[default]
+    None,
+    /// Secrets listed in `ExecutionPlan.secrets` may be released
+    /// after plan signature, validity, replay, and policy checks pass.
+    PlanBound,
+    /// Secrets require the plan checks plus the plan's attestation
+    /// requirement before release.
+    AttestationBound,
+}
+
+/// Event naming and required labels for plan-bound audit output.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AuditTaxonomy {
+    /// Prefix for events produced under this profile. Examples:
+    /// `execution.code`, `agent.web`, `deploy.release`.
+    pub event_prefix: String,
+    /// Labels that must be copied into audit output for this profile.
+    pub required_labels: Vec<String>,
+}
+
+/// Fully resolved admission controls for a signed plan.
+///
+/// This is the binding between a plan's declared purpose and the
+/// concrete enforcement surfaces the runtime must use. The separate
+/// top-level `network_policy`, `egress_policy`, `tool_policy`, and
+/// `secrets` fields remain for backwards-compatible consumers; this
+/// profile records why those refs were selected and which taxonomy
+/// audit should use.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct AdmissionProfile {
+    pub id: String,
+    pub intent: WorkloadIntent,
+    pub seccomp_tier: PlanSeccompTier,
+    pub network_policy: PolicyRef,
+    pub fs_policy: FsPolicyRef,
+    pub egress_policy: PolicyRef,
+    pub tool_policy: PolicyRef,
+    pub secret_release: SecretReleasePolicy,
+    pub audit: AuditTaxonomy,
+}
+
+impl AdmissionProfile {
+    /// Construct the local default profile used by legacy fixtures
+    /// and direct local boots. This records the selected seccomp tier
+    /// while leaving every policy ref at `local-default`.
+    pub fn local_default(intent: impl Into<String>, seccomp_tier: PlanSeccompTier) -> Self {
+        let intent = intent.into();
+        let policy = PolicyRef("local-default".to_string());
+        let fs_policy = FsPolicyRef("local-default".to_string());
+        Self {
+            id: format!("{intent}:{seccomp_tier}"),
+            intent: WorkloadIntent(intent.clone()),
+            seccomp_tier,
+            network_policy: policy.clone(),
+            fs_policy,
+            egress_policy: policy.clone(),
+            tool_policy: policy,
+            secret_release: SecretReleasePolicy::None,
+            audit: AuditTaxonomy {
+                event_prefix: intent.replace(':', "."),
+                required_labels: vec![
+                    "intent".to_string(),
+                    "admission_profile".to_string(),
+                    "seccomp_tier".to_string(),
+                ],
+            },
+        }
+    }
+}
+
 /// Workload variant — `Dev` is the development sandbox (carries the
 /// dev guest agent's RCE-by-design Exec handler, accepts looser
 /// policies), `Prod` is the production posture (no dev primitives,

@@ -38,9 +38,10 @@
 use anyhow::Result;
 use chrono::{Duration, Utc};
 use mvm_plan::{
-    ArtifactPolicy, AttestationMode, AttestationRequirement, DepsVolumeBinding, ExecutionPlan,
-    FsPolicyRef, KeyRotationSpec, Nonce, PlanId, PolicyRef, PostRunLifecycle, Resources,
-    RuntimeProfileRef, SCHEMA_VERSION, SignedImageRef, TenantId, TimeoutSpec, WorkloadId,
+    AdmissionProfile, ArtifactPolicy, AttestationMode, AttestationRequirement, AuditTaxonomy,
+    DepsVolumeBinding, ExecutionPlan, FsPolicyRef, KeyRotationSpec, Nonce, PlanId, PlanSeccompTier,
+    PolicyRef, PostRunLifecycle, Resources, RuntimeProfileRef, SCHEMA_VERSION, SecretReleasePolicy,
+    SignedImageRef, TenantId, TimeoutSpec, WorkloadId, WorkloadIntent,
 };
 use rand::RngCore;
 use std::collections::BTreeMap;
@@ -54,6 +55,14 @@ pub const DEFAULT_TENANT: &str = "local";
 /// component-slot set. Production deployments override via the
 /// supervisor's policy bundle.
 pub const DEFAULT_POLICY_REF: &str = "local-default";
+
+/// Default intent for direct `mvmctl up` boots. Higher-level callers
+/// can pass a more specific purpose such as `code:execute` or
+/// `agent:web-research` once their API has that context.
+pub const DEFAULT_INTENT: &str = "vm:boot";
+
+/// Default audit event prefix for direct VM boots.
+pub const DEFAULT_AUDIT_EVENT_PREFIX: &str = "vm.boot";
 
 /// Plan validity window from `now`. 10 minutes is long enough that
 /// boot + signature verification + state machine walk finishes well
@@ -80,6 +89,26 @@ pub struct SynthesisInput<'a> {
     pub image_name: &'a str,
     pub image_sha256: &'a str,
     pub image_cosign_bundle: Option<&'a str>,
+    /// Purpose this run is admitted for. `None` means
+    /// [`DEFAULT_INTENT`].
+    pub intent: Option<&'a str>,
+    /// Seccomp tier resolved by the caller before admission. This is
+    /// mirrored into `ExecutionPlan.admission_profile` so audit can
+    /// prove which filter tier the boot was bound to.
+    pub seccomp_tier: PlanSeccompTier,
+    /// Policy refs selected by the caller. `None` falls back to
+    /// [`DEFAULT_POLICY_REF`]. Keeping refs in the synthesis input
+    /// lets intent profiles bind to live policy bundles without a
+    /// later mutation step.
+    pub network_policy_ref: Option<&'a str>,
+    pub fs_policy_ref: Option<&'a str>,
+    pub egress_policy_ref: Option<&'a str>,
+    pub tool_policy_ref: Option<&'a str>,
+    /// Whether any secret can be released under this profile.
+    pub secret_release: SecretReleasePolicy,
+    /// Optional audit event prefix override. `None` derives from the
+    /// intent.
+    pub audit_event_prefix: Option<&'a str>,
     /// vCPU count.
     pub cpus: u32,
     /// Memory budget in MiB.
@@ -137,6 +166,24 @@ pub fn synthesize_plan(input: &SynthesisInput<'_>) -> Result<ExecutionPlan> {
             input.image_sha256.len()
         );
     }
+    let intent = input.intent.unwrap_or(DEFAULT_INTENT);
+    if intent.is_empty() {
+        anyhow::bail!("intent must not be empty");
+    }
+
+    let network_policy = policy_ref(input.network_policy_ref);
+    let fs_policy = fs_policy_ref(input.fs_policy_ref);
+    let egress_policy = policy_ref(input.egress_policy_ref);
+    let tool_policy = policy_ref(input.tool_policy_ref);
+    let admission_profile = admission_profile(
+        input,
+        intent,
+        &network_policy,
+        &fs_policy,
+        &egress_policy,
+        &tool_policy,
+    );
+    let audit_labels = audit_labels_for_profile(&admission_profile);
 
     let resources = Resources {
         cpus: input.cpus.max(1),
@@ -163,16 +210,17 @@ pub fn synthesize_plan(input: &SynthesisInput<'_>) -> Result<ExecutionPlan> {
         runtime_profile: RuntimeProfileRef(input.backend_name.to_string()),
         image,
         resources,
-        network_policy: PolicyRef(DEFAULT_POLICY_REF.to_string()),
-        fs_policy: FsPolicyRef(DEFAULT_POLICY_REF.to_string()),
+        admission_profile,
+        network_policy,
+        fs_policy,
         secrets: Vec::new(),
-        egress_policy: PolicyRef(DEFAULT_POLICY_REF.to_string()),
-        tool_policy: PolicyRef(DEFAULT_POLICY_REF.to_string()),
+        egress_policy,
+        tool_policy,
         artifact_policy: ArtifactPolicy {
             capture_paths: Vec::new(),
             retention_days: 0,
         },
-        audit_labels: BTreeMap::new(),
+        audit_labels,
         key_rotation: KeyRotationSpec { interval_days: 0 },
         attestation: AttestationRequirement {
             mode: AttestationMode::Noop,
@@ -204,6 +252,65 @@ fn fresh_nonce() -> Nonce {
     Nonce::from_bytes(bytes)
 }
 
+fn policy_ref(value: Option<&str>) -> PolicyRef {
+    PolicyRef(value.unwrap_or(DEFAULT_POLICY_REF).to_string())
+}
+
+fn fs_policy_ref(value: Option<&str>) -> FsPolicyRef {
+    FsPolicyRef(value.unwrap_or(DEFAULT_POLICY_REF).to_string())
+}
+
+fn admission_profile(
+    input: &SynthesisInput<'_>,
+    intent: &str,
+    network_policy: &PolicyRef,
+    fs_policy: &FsPolicyRef,
+    egress_policy: &PolicyRef,
+    tool_policy: &PolicyRef,
+) -> AdmissionProfile {
+    let profile_id = format!("{intent}:{}", input.seccomp_tier);
+    let event_prefix = input
+        .audit_event_prefix
+        .map(str::to_string)
+        .unwrap_or_else(|| event_prefix_for_intent(intent));
+    AdmissionProfile {
+        id: profile_id,
+        intent: WorkloadIntent(intent.to_string()),
+        seccomp_tier: input.seccomp_tier,
+        network_policy: network_policy.clone(),
+        fs_policy: fs_policy.clone(),
+        egress_policy: egress_policy.clone(),
+        tool_policy: tool_policy.clone(),
+        secret_release: input.secret_release,
+        audit: AuditTaxonomy {
+            event_prefix,
+            required_labels: vec![
+                "intent".to_string(),
+                "admission_profile".to_string(),
+                "seccomp_tier".to_string(),
+            ],
+        },
+    }
+}
+
+fn event_prefix_for_intent(intent: &str) -> String {
+    match intent {
+        DEFAULT_INTENT => DEFAULT_AUDIT_EVENT_PREFIX.to_string(),
+        "code:execute" => "execution.code".to_string(),
+        "agent:web-research" => "agent.web".to_string(),
+        "deploy:publish" => "deploy.release".to_string(),
+        other => other.replace(':', "."),
+    }
+}
+
+fn audit_labels_for_profile(profile: &AdmissionProfile) -> BTreeMap<String, String> {
+    BTreeMap::from([
+        ("intent".to_string(), profile.intent.0.clone()),
+        ("admission_profile".to_string(), profile.id.clone()),
+        ("seccomp_tier".to_string(), profile.seccomp_tier.to_string()),
+    ])
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -216,6 +323,14 @@ mod tests {
             image_name: "myimage",
             image_sha256: "deadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeefdeadbeef",
             image_cosign_bundle: None,
+            intent: None,
+            seccomp_tier: PlanSeccompTier::Standard,
+            network_policy_ref: None,
+            fs_policy_ref: None,
+            egress_policy_ref: None,
+            tool_policy_ref: None,
+            secret_release: SecretReleasePolicy::None,
+            audit_event_prefix: None,
             cpus: 2,
             mem_mib: 512,
             disk_mib: 0,
@@ -350,6 +465,64 @@ mod tests {
         assert_eq!(plan.fs_policy.0, DEFAULT_POLICY_REF);
         assert_eq!(plan.egress_policy.0, DEFAULT_POLICY_REF);
         assert_eq!(plan.tool_policy.0, DEFAULT_POLICY_REF);
+    }
+
+    #[test]
+    fn admission_profile_binds_default_intent_to_controls() {
+        let plan = synthesize_plan(&input("myvm")).unwrap();
+        assert_eq!(plan.admission_profile.intent.0, DEFAULT_INTENT);
+        assert_eq!(
+            plan.admission_profile.seccomp_tier,
+            PlanSeccompTier::Standard
+        );
+        assert_eq!(plan.admission_profile.network_policy, plan.network_policy);
+        assert_eq!(plan.admission_profile.fs_policy, plan.fs_policy);
+        assert_eq!(plan.admission_profile.egress_policy, plan.egress_policy);
+        assert_eq!(plan.admission_profile.tool_policy, plan.tool_policy);
+        assert_eq!(
+            plan.admission_profile.secret_release,
+            SecretReleasePolicy::None
+        );
+        assert_eq!(
+            plan.admission_profile.audit.event_prefix,
+            DEFAULT_AUDIT_EVENT_PREFIX
+        );
+        assert_eq!(plan.audit_labels["intent"], DEFAULT_INTENT);
+        assert_eq!(
+            plan.audit_labels["admission_profile"],
+            plan.admission_profile.id
+        );
+        assert_eq!(plan.audit_labels["seccomp_tier"], "standard");
+    }
+
+    #[test]
+    fn admission_profile_honors_intent_bound_overrides() {
+        let mut inp = input("myvm");
+        inp.intent = Some("agent:web-research");
+        inp.seccomp_tier = PlanSeccompTier::Network;
+        inp.network_policy_ref = Some("acme:web-agent");
+        inp.fs_policy_ref = Some("acme:web-agent");
+        inp.egress_policy_ref = Some("acme:web-agent");
+        inp.tool_policy_ref = Some("acme:web-agent");
+        inp.secret_release = SecretReleasePolicy::PlanBound;
+
+        let plan = synthesize_plan(&inp).unwrap();
+
+        assert_eq!(plan.admission_profile.intent.0, "agent:web-research");
+        assert_eq!(plan.admission_profile.id, "agent:web-research:network");
+        assert_eq!(
+            plan.admission_profile.seccomp_tier,
+            PlanSeccompTier::Network
+        );
+        assert_eq!(plan.network_policy.0, "acme:web-agent");
+        assert_eq!(plan.admission_profile.network_policy.0, "acme:web-agent");
+        assert_eq!(
+            plan.admission_profile.secret_release,
+            SecretReleasePolicy::PlanBound
+        );
+        assert_eq!(plan.admission_profile.audit.event_prefix, "agent.web");
+        assert_eq!(plan.audit_labels["intent"], "agent:web-research");
+        assert_eq!(plan.audit_labels["seccomp_tier"], "network");
     }
 
     #[test]

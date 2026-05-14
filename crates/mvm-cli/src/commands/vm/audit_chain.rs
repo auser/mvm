@@ -170,9 +170,9 @@ impl AuditEmitter {
 mod tests {
     use super::*;
     use mvm_plan::{
-        ArtifactPolicy, AttestationMode, AttestationRequirement, FsPolicyRef, KeyRotationSpec,
-        Nonce, PlanId, PolicyRef, PostRunLifecycle, Resources, RuntimeProfileRef, SCHEMA_VERSION,
-        SignedImageRef, TenantId, TimeoutSpec, WorkloadId,
+        AdmissionProfile, ArtifactPolicy, AttestationMode, AttestationRequirement, FsPolicyRef,
+        KeyRotationSpec, Nonce, PlanId, PlanSeccompTier, PolicyRef, PostRunLifecycle, Resources,
+        RuntimeProfileRef, SCHEMA_VERSION, SignedImageRef, TenantId, TimeoutSpec, WorkloadId,
     };
     use mvm_supervisor::verify_audit_chain;
     use rand::rngs::OsRng;
@@ -201,6 +201,10 @@ mod tests {
                     exec_secs: 0,
                 },
             },
+            admission_profile: AdmissionProfile::local_default(
+                "vm:boot",
+                PlanSeccompTier::Standard,
+            ),
             network_policy: PolicyRef("local-default".to_string()),
             fs_policy: FsPolicyRef("local-default".to_string()),
             secrets: Vec::new(),

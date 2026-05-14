@@ -162,9 +162,9 @@ mod tests {
     use super::*;
     use chrono::TimeZone;
     use mvm_plan::{
-        ArtifactPolicy, AttestationMode, AttestationRequirement, FsPolicyRef, KeyRotationSpec,
-        Nonce, PolicyRef, PostRunLifecycle, Resources, RuntimeProfileRef, SCHEMA_VERSION,
-        SignedImageRef, TimeoutSpec, WorkloadId,
+        AdmissionProfile, ArtifactPolicy, AttestationMode, AttestationRequirement, FsPolicyRef,
+        KeyRotationSpec, Nonce, PlanSeccompTier, PolicyRef, PostRunLifecycle, Resources,
+        RuntimeProfileRef, SCHEMA_VERSION, SignedImageRef, TimeoutSpec, WorkloadId,
     };
     use mvm_policy::{AuditPolicy, EgressPolicy, KeyPolicy, NetworkPolicy, PiiPolicy, ToolPolicy};
     use std::collections::BTreeMap;
@@ -191,6 +191,10 @@ mod tests {
                     exec_secs: 600,
                 },
             },
+            admission_profile: AdmissionProfile::local_default(
+                "vm:boot",
+                PlanSeccompTier::Standard,
+            ),
             network_policy: PolicyRef("n".to_string()),
             fs_policy: FsPolicyRef("f".to_string()),
             secrets: vec![],

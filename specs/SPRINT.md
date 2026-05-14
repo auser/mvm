@@ -40,6 +40,7 @@ Recent maintenance:
 - [x] Added an opt-in `runtime_boot_bench` live test for already-built runtime images, covering serial boots and three-way concurrent fan-out against a 200 ms per-VM budget.
 - [x] Source-checkout `mvmctl dev up` now refuses to download published prebuilts when the binary was built without `contributor-bootstrap`; it exits with the local-build feature hint instead, preserving the "dev reflects local flakes" invariant.
 - [x] Extended `runtime_boot_bench` with TOML config-file input, Apple Container backend defaults, configurable CPU/memory sizing, and Apple guest-agent readiness probing.
+- [x] Added intent-bound admission profiles to signed `ExecutionPlan` v4, binding intent, seccomp tier, policy refs, secret-release posture, and audit taxonomy without adding new sandbox execution capability.
 
 ## In-flight workstreams
 

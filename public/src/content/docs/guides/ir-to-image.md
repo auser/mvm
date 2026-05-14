@@ -534,11 +534,13 @@ The IR hash isn't decorative — it's load-bearing in the admission path.
 **`mvmctl up`** (`crates/mvm-cli/src/commands/vm/plan_admission.rs`):
 
 1. Resolves the workload → IR JSON → `ir_hash`.
-2. Calls `synthesize_plan(input)` (`plan_builder.rs`) to build a typed `ExecutionPlan` carrying the IR hash, image ref, resources, policy refs, validity window, and a fresh nonce.
+2. Calls `synthesize_plan(input)` (`plan_builder.rs`) to build a typed `ExecutionPlan` carrying the IR hash, image ref, resources, policy refs, an intent-bound admission profile, validity window, and a fresh nonce.
 3. Signs the plan with the host's Ed25519 keypair at `~/.mvm/keys/host-signer.ed25519` (mode 0600).
 4. Verifies through `mvm_plan::verify_plan`.
 5. Enforces validity window (G4) and nonce replay-store.
 6. Dispatches to the backend.
+
+The admission profile is the security-posture binding. It records the declared intent, selected seccomp tier, network/filesystem/egress/tool policy refs, secret-release posture, and audit taxonomy. It is deliberately not a new runtime engine: seccomp is still enforced by the guest manifest, network and tool policies are still enforced by their existing resolvers. The profile makes those choices signed and auditable.
 
 **Audit emissions** (`crates/mvm-supervisor/src/audit_recorder.rs`):
 
@@ -546,7 +548,7 @@ The IR hash isn't decorative — it's load-bearing in the admission path.
 - `plan.launched` — backend dispatch succeeded
 - `plan.failed` — admission rejected, with reason
 
-All three reference `(plan_id, plan_version)` and the IR hash. The log is hash-chained: entry N includes the hash of entry N-1. Tampering breaks `mvm_supervisor::verify_audit_chain`, which `mvmctl audit verify` surfaces as a nonzero exit.
+All three reference `(plan_id, plan_version)`, the IR hash, and admission labels such as `intent`, `admission_profile`, and `seccomp_tier`. The log is hash-chained: entry N includes the hash of entry N-1. Tampering breaks `mvm_supervisor::verify_audit_chain`, which `mvmctl audit verify` surfaces as a nonzero exit.
 
 The contract: **every workload mvm runs is launched from a signed ExecutionPlan that names a specific IR hash**. No IR hash, no launch.
 
