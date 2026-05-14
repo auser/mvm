@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Barrier};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
-use anyhow::{bail, Context, Result};
+use anyhow::{Context, Result, bail};
 use mvm_backend::backend::AnyBackend;
 use mvm_core::vm_backend::VmStartConfig;
 use mvm_guest::vsock::{GuestRequest, GuestResponse};
