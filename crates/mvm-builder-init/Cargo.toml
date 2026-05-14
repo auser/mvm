@@ -1,0 +1,32 @@
+[package]
+name = "mvm-builder-init"
+version.workspace = true
+edition.workspace = true
+description = "PID 1 for the libkrun builder VM — mounts /nix, runs /job/cmd.sh, powers off (Plan 72 W3)"
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+authors.workspace = true
+
+# Linux-only by design — this is the in-VM init for the libkrun
+# builder VM (Plan 72 W3). The crate compiles on macOS / Windows
+# but produces an inert binary (main() prints a hint and exits 1)
+# so workspace builds stay green on developer hosts. mkGuest
+# cross-compiles the real binary for `<arch>-unknown-linux-musl`
+# from a Linux nix-build environment.
+
+[[bin]]
+name = "mvm-builder-init"
+path = "src/main.rs"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# Linux mount/reboot syscalls. Kept Linux-only so non-Linux
+# workspace builds don't drag in the dep tree.
+nix = { version = "0.29", features = ["mount", "reboot"] }
+
+[lints]
+workspace = true
+
+# Static + tiny per Plan 72 §W3 size budget (≤ 1.5 MiB on
+# aarch64-linux). Release profile inherits from workspace; this
+# crate doesn't override.
