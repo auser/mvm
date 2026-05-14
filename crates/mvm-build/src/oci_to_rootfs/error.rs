@@ -89,6 +89,27 @@ pub enum OciUnpackError {
         reason: &'static str,
     },
 
+    /// `mke2fs` exited non-zero or could not be spawned. Plan 74
+    /// W1.3b — the host-side orchestrator that turns a staged
+    /// rootfs into an ext4 image file. Includes the upstream
+    /// stderr so the failure mode is debuggable without re-running
+    /// with `-v`.
+    #[error("mke2fs failed: {reason}")]
+    Mke2fsFailed { reason: String },
+
+    /// An operation that this crate exposes is not supported on
+    /// the current host. ext4 image materialization, for example,
+    /// requires Linux + `mke2fs`; on macOS the W1.5 CLI
+    /// orchestrator will run it inside the builder VM per
+    /// ADR-050. Callers that hit this variant on macOS should
+    /// route the operation through the builder VM rather than
+    /// reporting failure to the user.
+    #[error("host does not support {operation}: {reason}")]
+    HostUnsupported {
+        operation: &'static str,
+        reason: &'static str,
+    },
+
     /// Underlying `std::io` failure during file creation, write,
     /// or close.
     #[error("io error: {0}")]

@@ -26,6 +26,7 @@ exempt_paths:
   - "crates/mvm-build/src/oci_to_rootfs/**"
   - "crates/mvm-build/tests/oci_unpack_attacks.rs"
   - "crates/mvm-build/tests/oci_unpack_common/**"
+  - "crates/mvm-build/tests/oci_ext4_materialization.rs"
 ---
 
 # Claim 10 — OCI image provenance is recorded in the admission audit chain
