@@ -539,12 +539,15 @@ fn plist_env_string_value(plist: &str, key: &str) -> Option<String> {
 /// Replaces a stale symlink (the nix-darwin `linux-builder` legacy
 /// pointed `current` at a root-owned `/nix/store/…-mvm-dev` path)
 /// with a real, writable directory. `create_dir_all` is a no-op
-/// against an existing symlink, so without this the microsandbox
-/// bind-mount of `out_dir` lands on the read-only Nix store path
-/// and Apple Container fails with EACCES. The libkrun virtio-fs
-/// mount hits the same EACCES — same cleanup applies to both
-/// dispatch paths.
-#[cfg(feature = "contributor-bootstrap")]
+/// against an existing symlink, so without this the libkrun
+/// virtio-fs `/out` mount lands on the read-only Nix store path
+/// and Apple Container fails with EACCES.
+///
+/// `allow(dead_code)`: only reachable under the libkrun-dispatch
+/// branch of `ensure_dev_image`, which itself is gated on
+/// `backends-builder-vm-libkrun`. Default-features-off builds
+/// don't reach this helper.
+#[allow(dead_code)]
 fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
     if let Some(parent) = std::path::Path::new(out_dir).parent() {
         std::fs::create_dir_all(parent)
@@ -564,12 +567,14 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
 
 /// Resolve the dev image (kernel + rootfs) to absolute paths.
 ///
-/// In a source checkout: prefers the libkrun-backed builder VM
+/// In a source checkout: uses the libkrun-backed builder VM
 /// (Plan 72 W4/W5 — `LibkrunBuilderVm` runs `nix build` against the
 /// dev-shell flake from inside a microVM with a persistent 64 GiB
-/// `/nix` store). Falls back to direct microsandbox on hosts without
-/// libkrun (until that path also exceeds microsandbox's 4 GiB overlay
-/// for the rustc closure).
+/// `/nix` store). Libkrun isn't installed → loud error pointing at
+/// the install command; **no microsandbox fallback for the dev-shell
+/// image** (Plan 72 W5.C — the dev-shell rustc closure overflows
+/// microsandbox's 4 GiB overlay anyway, so a fallback that would
+/// just disk-out is worse than an actionable error).
 ///
 /// Outside a source checkout: falls back to the GitHub-release
 /// download of a pre-built image.
@@ -580,72 +585,68 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
 fn ensure_dev_image() -> Result<(String, String)> {
     let local_flake = find_dev_image_flake().ok();
 
-    // Plan 72 W5.B — source-checkout dispatch.
+    // Plan 72 W5.B + W5.C — source-checkout dispatch.
     //
-    // Two implementation paths live here during the W5 transition.
-    // Both require `contributor-bootstrap` because Stage 0 (the
-    // microsandbox bootstrap of the builder-vm rootfs from the W2 flake)
-    // is the only way a contributor host without pre-fetched release
-    // artifacts can populate `~/.cache/mvm/builder-vm/<arch>/`. The
-    // dispatch order is:
+    // libkrun is the only supported builder for the dev-shell flake.
+    // Plan 72 W5.C removed the legacy direct-microsandbox fallback
+    // because:
     //
-    //   1. libkrun-backed builder VM (W4 launcher; preferred):
-    //      `backends-builder-vm-libkrun` compiled in AND
-    //      `mvm_libkrun::is_available()` true AND
-    //      `find_builder_vm_flake()` succeeds. This is the only path
-    //      that fits the dev-shell rustc+cargo closure, which overflows
-    //      microsandbox's hardcoded 4 GiB overlay.
+    //   1. The dev-shell rustc + cargo closure overflows microsandbox's
+    //      hardcoded 4 GiB writable overlay (the load-bearing reason
+    //      ADR-046 / Plan 72 exists). A fallback that would fail with
+    //      "No space left on device" is worse than a clear install
+    //      hint.
     //
-    //   2. Direct microsandbox build of the dev-shell flake (legacy):
-    //      kept as the fallback for hosts without libkrun. Will fail
-    //      with `No space left on device` once the dev-shell closure
-    //      catches up to the overlay limit, but unblocks contributors
-    //      on libkrun-less hosts in the interim.
+    //   2. libkrun is now a documented prerequisite for the source-
+    //      checkout dev loop on macOS Apple Silicon / Linux KVM hosts.
+    //      `mvmctl doctor` reports its absence; `brew install libkrun`
+    //      (macOS) / distro package (Linux) is the install path.
     //
-    // Failures in path 1 are loud and refuse silent fallback to path 2,
-    // since the typical failure mode (libkrun runtime mismatch,
-    // builder-vm image cache missing) is a config error that hiding
-    // behind microsandbox would mask.
-    #[cfg(feature = "contributor-bootstrap")]
-    if let Some(flake_dir) = &local_flake {
+    // microsandbox is still used INSIDE `build_image_via_libkrun` for
+    // Stage 0 (building the small Layer 1 builder VM image from the
+    // in-repo W2 flake — a closure that fits the 4 GiB overlay). That
+    // path is gated by `contributor-bootstrap` and lives in
+    // `bootstrap_builder_vm_image`. It's not a runtime fallback.
+    //
+    // Failures are loud and refuse silent fallback to the prebuilt,
+    // since the typical failure mode (libkrun runtime mismatch, builder-
+    // vm image cache missing) is a config error that hiding behind the
+    // prebuilt would mask.
+    // Gate only on `backends-builder-vm-libkrun`: the libkrun dispatch
+    // works for contributors without `contributor-bootstrap` too, since
+    // Layer 1 (the builder-vm image) has a release-download path
+    // (`download_builder_vm_image`) that doesn't need microsandbox.
+    // Stage 0 microsandbox bootstrap is the *contributor* fast-path for
+    // editing the W2 flake, not a hard requirement.
+    #[cfg(feature = "backends-builder-vm-libkrun")]
+    if let Some(flake_dir) = &local_flake
+        && find_builder_vm_flake().is_ok()
+    {
         let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
         prepare_dev_image_out_dir(&out_dir)?;
 
-        #[cfg(feature = "backends-builder-vm-libkrun")]
-        if mvm_libkrun::is_available() && find_builder_vm_flake().is_ok() {
-            ui::info(&format!(
-                "Building dev image via libkrun builder VM (Plan 72 W5) from: {flake_dir}"
-            ));
-            match build_image_via_libkrun(&out_dir) {
-                Ok((kernel, rootfs)) => {
-                    ui::success(&format!("Dev image ready at {out_dir}."));
-                    return Ok((kernel, rootfs));
-                }
-                Err(e) => {
-                    anyhow::bail!(
-                        "libkrun builder VM build failed (source checkout: {flake_dir}).\n{e}\n\n\
-                         Refusing to fall back to the published prebuilt because it would mask\n\
-                         local rootfs changes, and refusing to fall back to microsandbox because\n\
-                         the dev-shell rustc closure overflows microsandbox's 4 GiB overlay\n\
-                         (the whole reason Plan 72 exists). To force the prebuilt anyway, move\n\
-                         or delete nix/images/builder/flake.nix so the source-checkout heuristic\n\
-                         stops matching."
-                    );
-                }
-            }
+        if !mvm_libkrun::is_available() {
+            anyhow::bail!(
+                "libkrun is required to build the dev image from source (Plan 72 W5.C).\n\
+                 {}\n\n\
+                 Once installed, retry `mvmctl dev up`. If you intend to use the published\n\
+                 prebuilt instead (no local builds), move or delete\n\
+                 nix/images/builder/flake.nix so the source-checkout heuristic stops matching.",
+                mvm_libkrun::install_hint(),
+            );
         }
 
         ui::info(&format!(
-            "Building dev image via microsandbox (legacy path; Plan 72 W5 prefers libkrun) from: {flake_dir}"
+            "Building dev image via libkrun builder VM (Plan 72 W5) from: {flake_dir}"
         ));
-        match build_image_via_microsandbox(flake_dir, &out_dir) {
+        match build_image_via_libkrun(&out_dir) {
             Ok((kernel, rootfs)) => {
                 ui::success(&format!("Dev image ready at {out_dir}."));
                 return Ok((kernel, rootfs));
             }
             Err(e) => {
                 anyhow::bail!(
-                    "Dev image build failed (source checkout: {flake_dir}).\n{e}\n\n\
+                    "libkrun builder VM build failed (source checkout: {flake_dir}).\n{e}\n\n\
                      Refusing to fall back to the published prebuilt because it would mask\n\
                      local rootfs changes. To force the prebuilt anyway, move or delete\n\
                      nix/images/builder/flake.nix so the source-checkout heuristic stops matching."
@@ -2104,10 +2105,11 @@ fn builder_vm_artifact_names(arch: &str) -> BuilderVmArtifactNames {
 ///   - confirmed `find_builder_vm_flake().is_ok()` (Layer 1 source is
 ///     present in the workspace),
 ///   - run [`prepare_dev_image_out_dir`] on `out_dir`.
-#[cfg(all(
-    feature = "contributor-bootstrap",
-    feature = "backends-builder-vm-libkrun"
-))]
+// Gated only on `backends-builder-vm-libkrun` after Plan 72 W5.C:
+// `bootstrap_builder_vm_image` handles the no-`contributor-bootstrap`
+// case via the release-artifact download path. Stage 0 microsandbox
+// is the contributor fast-path, not a hard requirement.
+#[cfg(feature = "backends-builder-vm-libkrun")]
 fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     use mvm_build::builder_vm::{BuilderJob, BuilderMounts, BuilderVm, host_system_linux};
     use mvm_build::libkrun_builder::LibkrunBuilderVm;
