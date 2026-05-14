@@ -145,6 +145,28 @@ Goal: regression coverage on every PR.
 - **W5.1** Extend `.github/workflows/ci.yml` with a `libkrun-macos-arm64` job that runs on `macos-latest` (which is Apple Silicon as of late 2025), installs libkrun via Homebrew, runs `cargo test -p mvm-libkrun -p mvm --test libkrun_smoke`. The smoke test boots `examples/minimal` and asserts the guest agent responds.
 - **W5.2** Once W3 lands, **the smoke test is the gate** — it'll catch regressions in libkrun's API, the Nix kernel cmdline, our wrapper code, and the codesigning path simultaneously.
 
+#### W5 progress (2026-05-13)
+
+The `libkrun-macos` lane shipped with a `dorny/paths-filter@v3` gate so the macOS runner (~10× per-minute cost vs ubuntu-latest, per ADR-038) only spins up the heavy steps when a PR touches:
+
+- `crates/mvm-libkrun/**`
+- `crates/mvm-backend/src/libkrun.rs`
+- `crates/mvm-backend/Cargo.toml`
+- `crates/mvm-providers/src/apple_container/**` (W2 codesigning gate)
+- `specs/plans/57-libkrun-spike.md`
+- `.github/workflows/ci.yml`
+
+Or on any push to `main` regardless of path, so post-merge drift is still surfaced.
+
+What the lane validates that the Linux lanes cannot:
+
+1. `bindgen` + `libclang` consume the Homebrew `libkrun.h` cleanly — the `libkrun-sys` feature builds and links against `libkrun.dylib`.
+2. The `mvm-libkrun-supervisor` binary compiles (`required-features = ["libkrun-sys"]`).
+3. `mvm_libkrun::sys::Context::*` round-trips against the real `libkrun.dylib` — the 8 unit tests in `mvm-libkrun` covering `create_ctx`, `set_log_level`, `set_vm_config`.
+4. `LibkrunBackend`'s spawn / PID-file / signal logic in `mvm-backend` builds + its 12 non-FFI tests pass (path resolver branches, status / list with no VMs, etc.).
+
+**Out of scope for W5** (folded into W4.3 instead): end-to-end VM boot. GitHub macOS runners don't expose `Hypervisor.framework` to user-mode processes, so `krun_start_enter` can't actually create a guest there. The lane catches everything *before* that boundary; full boot validation needs a self-hosted runner or a working minimal-rootfs harness, which is W4.3's job.
+
 ### W6 — Cross-platform expansion (1 sprint follow-up — out of scope here)
 
 Out of scope for plan 57 itself. Tracked as W6 so the path is named:
