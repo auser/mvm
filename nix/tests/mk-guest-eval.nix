@@ -88,12 +88,12 @@ in
   boot_budget_firecracker_is_300ms =
     (meta shellGuest).expectedBootMs == 300;
 
-  microsandbox_boot_budget_is_300ms =
+  libkrun_boot_budget_is_300ms =
     let
       msbGuest = mkGuest {
         name = "msb-budget";
         entrypoint.command = [ "/bin/x" ];
-        hypervisor = "microsandbox";
+        hypervisor = "libkrun";
       };
     in
     (meta msbGuest).expectedBootMs == 300;

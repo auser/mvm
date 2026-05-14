@@ -1,19 +1,19 @@
-# Plan 72 — Builder VM via libkrun (drop microsandbox from the build path)
+# Plan 72 — Builder VM via libkrun (drop libkrun from the build path)
 
 > Status: proposed
 > Owner: TBD
 > Started: —
 > Depends on: plan 57 (libkrun spike — boot + vsock + console viability)
-> Implements: ADR-046 (move the builder VM off microsandbox onto libkrun + firecracker)
-> Tracking: `mvm_build::builder_vm::MicrosandboxBuilderVm` → `LibkrunBuilderVm`; `mvmctl dev up` failure with `error: writing to file: No space left on device`
+> Implements: ADR-046 (move the builder VM off libkrun onto libkrun + firecracker)
+> Tracking: `mvm_build::builder_vm::LibkrunBuilderVm` → `LibkrunBuilderVm`; `mvmctl dev up` failure with `error: writing to file: No space left on device`
 
 ## Why
 
-`mvmctl dev up` on macOS goes through `mvm_cli::commands::env::apple_container::ensure_dev_image → build_image_via_microsandbox → MicrosandboxBuilderVm::run_build`. The Nix build closure for the dev image (rustc + ~480 cargo crate derivations from cache.nixos.org) overflows microsandbox's hardcoded 4 GiB writable overlay (`microsandbox-image-0.4.5/lib/ext4/mod.rs:25`). The library exposes no knob to widen it. Workarounds (bind-mount host `/nix`, named volumes, volume seeding) either shadow the OCI image's `/bin/sh` or require multi-pass dances that pay back none of the structural cost.
+`mvmctl dev up` on macOS goes through `mvm_cli::commands::env::apple_container::ensure_dev_image → build_image_via_libkrun → LibkrunBuilderVm::run_build`. The Nix build closure for the dev image (rustc + ~480 cargo crate derivations from cache.nixos.org) overflows libkrun's hardcoded 4 GiB writable overlay (`libkrun-image-0.4.5/lib/ext4/mod.rs:25`). The library exposes no knob to widen it. Workarounds (bind-mount host `/nix`, named volumes, volume seeding) either shadow the OCI image's `/bin/sh` or require multi-pass dances that pay back none of the structural cost.
 
-ADR-046 settled the strategy: replace `MicrosandboxBuilderVm` with `LibkrunBuilderVm` — direct libkrun (macOS) / firecracker (Linux), virtio-fs for the workspace + artifact mounts, virtio-blk for a persistent `/nix` store. This plan sequences that work into shippable phases, each with green-bar acceptance criteria, so the campaign can be merged incrementally without a single overwhelming PR.
+ADR-046 settled the strategy: replace `LibkrunBuilderVm` with `LibkrunBuilderVm` — direct libkrun (macOS) / firecracker (Linux), virtio-fs for the workspace + artifact mounts, virtio-blk for a persistent `/nix` store. This plan sequences that work into shippable phases, each with green-bar acceptance criteria, so the campaign can be merged incrementally without a single overwhelming PR.
 
-If plan 57 stalls, **W0 still ships standalone** — the three sandbox-correctness fixes (workspace-at-`/work`, `MVM_WORKSPACE_PATH`, `git config --global` before cd) are correct under any launcher and unblock dev-up for non-worktree checkouts on hosts with enough disk pressure to dodge the overlay limit. Vendoring microsandbox with a `upper_size_mib` knob is the named fallback for W1+.
+If plan 57 stalls, **W0 still ships standalone** — the three sandbox-correctness fixes (workspace-at-`/work`, `MVM_WORKSPACE_PATH`, `git config --global` before cd) are correct under any launcher and unblock dev-up for non-worktree checkouts on hosts with enough disk pressure to dodge the overlay limit. Vendoring libkrun with a `upper_size_mib` knob is the named fallback for W1+.
 
 ## Prerequisites
 
@@ -32,7 +32,7 @@ If plan 57 stalls, **W0 still ships standalone** — the three sandbox-correctne
 5. Exits 0 with no manual intervention.
 6. Cold cache: completes in <8 min on a sustained 100 Mb/s connection.
 7. Warm cache (`/nix` virtio-blk preserved from a prior run): rebuilds unchanged dev image in <30 s.
-8. `cargo metadata --features ''` shows no `microsandbox*` crate in the default-feature closure of `mvmctl`. `--features contributor-bootstrap` still compiles for the deprecation window.
+8. `cargo metadata --features ''` shows no `libkrun*` crate in the default-feature closure of `mvmctl`.
 9. CI passes the workspace + clippy + every plan-71-introduced live test on macOS aarch64 and Linux x86_64.
 
 When all nine hold, ADR-046 flips from Proposed to Accepted and the plan moves to `specs/backlog/`.
@@ -41,11 +41,11 @@ When all nine hold, ADR-046 flips from Proposed to Accepted and the plan moves t
 
 ## W0 — Sandbox-correctness fixes (independent; ship now)
 
-> These three changes are correct regardless of which launcher we use. They unblock `mvmctl dev up` on hosts that don't hit the overlay-size ceiling (linear `nix build` runs against the existing microsandbox path can complete on hosts with very large overlays, or when the upstream PR for `upper_size_mib` lands). They also become load-bearing for W3 once the libkrun path is wired.
+> These three changes are correct regardless of which launcher we use. They unblock `mvmctl dev up` on hosts that don't hit the overlay-size ceiling (linear `nix build` runs against the existing libkrun path can complete on hosts with very large overlays, or when the upstream PR for `upper_size_mib` lands). They also become load-bearing for W3 once the libkrun path is wired.
 
 ### W0.1 — Mount the workspace at `/work`, not the flake dir
 
-`crates/mvm-cli/src/commands/env/apple_container.rs::build_image_via_microsandbox` derives `workspace_root = flake_dir.parent().parent().parent()` and sets:
+`crates/mvm-cli/src/commands/env/apple_container.rs::build_image_via_libkrun` derives `workspace_root = flake_dir.parent().parent().parent()` and sets:
 
 - `BuilderMounts.flake_src = workspace_root`
 - `BuilderJob.flake_ref = format!("path:{}/{}", BUILDER_GUEST_WORK_DIR, flake_rel)` where `flake_rel = flake_src.strip_prefix(workspace_root)`
@@ -58,7 +58,7 @@ Drops the previous shape where only `nix/images/builder/` was mounted at `/work`
 
 The host-side build script in `crates/mvm-build/src/builder_vm.rs:543` adds `export MVM_WORKSPACE_PATH=/work` before `nix build`.
 
-Reason: `path:` URL semantics store-copy the flake dir; `../../..` resolves against the store path, not the host mount. Without the env var override, the workspace import lands outside the mount and trips on sandbox-internal files (`/.msb/agent.sock` on microsandbox, virtio-fs metadata files on libkrun).
+Reason: `path:` URL semantics store-copy the flake dir; `../../..` resolves against the store path, not the host mount. Without the env var override, the workspace import lands outside the mount and trips on sandbox-internal files (`/.msb/agent.sock` on libkrun, virtio-fs metadata files on libkrun).
 
 ### W0.3 — `git config --global` before `cd /work`
 
@@ -71,7 +71,7 @@ Same file, build_script. Reorder so `git config --global --add safe.directory '*
 ### W0 acceptance
 
 - `mvmctl dev up` on a non-worktree checkout (regular `.git` directory) completes the flake-evaluation phase. The 4 GiB overlay still bites for the actual build, but the error is now "disk full" not "/.msb/agent.sock has unsupported type" — confirming W0 fixes the path-resolution problem cleanly.
-- New live test `crates/mvm-build/tests/builder_vm_path_resolution.rs` asserts that `build_image_via_microsandbox` (with the microsandbox feature on) constructs a `BuilderJob` whose `flake_ref` starts with `path:/work/` and a `BuilderMounts` whose `flake_src` equals the workspace root.
+- New live test `crates/mvm-build/tests/builder_vm_path_resolution.rs` asserts that `build_image_via_libkrun` (with the libkrun feature on) constructs a `BuilderJob` whose `flake_ref` starts with `path:/work/` and a `BuilderMounts` whose `flake_src` equals the workspace root.
 
 ### W0 ships as
 
@@ -103,10 +103,10 @@ impl BuilderVm for LibkrunBuilderVm {
 
 `run_build` does, in order:
 
-1. Resolve the builder VM image (kernel + rootfs.ext4) — call `ensure_builder_vm_image()` (new in `mvm-cli`, mirroring `download_dev_image`). On macOS without a published prebuilt, fall back to the microsandbox path with a loud warning (deprecation window).
+1. Resolve the builder VM image (kernel + rootfs.ext4) — call `ensure_builder_vm_image()` (new in `mvm-cli`, mirroring `download_dev_image`). On macOS without a published prebuilt, fall back to the libkrun path with a loud warning (deprecation window).
 2. Allocate / locate the persistent `/nix` store image at `~/.cache/mvm/builder-vm/nix-store-<arch>.img` (sparse, default 64 GiB). First-build cost: format ext4; subsequent builds reuse.
 3. Stage the job dir at `~/.cache/mvm/builder-vm/jobs/<job-id>/`:
-   - `cmd.sh` — the build script (same body as today's `build_script` in `builder_vm.rs:543`, just without the microsandbox framing).
+   - `cmd.sh` — the build script (same body as today's `build_script` in `builder_vm.rs:543`, just without the libkrun framing).
    - `env` — KV env vars one-per-line.
    - `result` — empty; the guest writes here on completion.
 4. Launch via `mvm_libkrun::start_with_config(...)` with:
@@ -123,12 +123,12 @@ impl BuilderVm for LibkrunBuilderVm {
 
 ### Feature gate
 
-`backends-builder-vm-libkrun` (new). Default-off in this phase. `mvmctl` keeps using `contributor-bootstrap` by default until W5 flips the polarity.
+`backends-builder-vm-libkrun` (new). Default-off in this phase.
 
 ### W1 acceptance
 
 - `LibkrunBuilderVm` compiles against the plan-57 libkrun bindings with no `NotYetWired` returns from any path that this plan exercises.
-- Unit tests for `BuilderMounts` validation (paths exist, non-UTF-8 rejection, job-id collision) mirror the existing microsandbox suite.
+- Unit tests for `BuilderMounts` validation (paths exist, non-UTF-8 rejection, job-id collision) mirror the existing libkrun suite.
 - No call site switches over yet — pure scaffolding behind the new feature flag.
 
 ---
@@ -249,7 +249,7 @@ Air-gapped mode: `LibkrunBuilderVm::with_offline()` skips bringing up eth0 and s
 
 Plan 57's vsock spike covers this — host-side reader on a known port pulls stdout/stderr lines as they happen and prints them.
 
-`mvmctl` UI shows live build progress (every line nix emits about "building '/nix/store/..../foo.drv'") rather than the current microsandbox-path silence-then-dump.
+`mvmctl` UI shows live build progress (every line nix emits about "building '/nix/store/..../foo.drv'") rather than the current libkrun-path silence-then-dump.
 
 ### Console
 
@@ -276,8 +276,7 @@ Reshape `ensure_dev_image` to encode the two-layer artifact rule from ADR-046 §
 1. **In a source checkout** (`find_builder_vm_flake()` returns `Some`):
    - Hash `nix/images/builder-vm/flake.nix` + its lock to derive a cache key.
    - If `~/.cache/mvm/builder-vm/<hash>/` exists and is hash-valid → use it.
-   - Otherwise build it locally from the in-repo flake using Stage 0:
-     - **Stage 0** = microsandbox + `nixos/nix:2.24.10`, gated behind `--features contributor-bootstrap`. This is the *only* Stage 0 path; host Nix is never consulted even when installed (per CLAUDE.md §"Host Nix is never used by mvmctl"). The 4 GiB overlay limit applies but the builder VM rootfs closure fits — see W2 size budget. Bails with a "rebuild with `--features contributor-bootstrap`" hint when the feature was compiled out.
+  - Otherwise download the mvm-published prebuilt for the running `mvmctl` version; SHA-256 verify per ADR-002 §W5.1; cache it locally.
 2. **Outside a source checkout** (installed binary, no flake): download the mvm-published prebuilt for the running `mvmctl` version; SHA-256 verify per ADR-002 §W5.1; cache at `~/.cache/mvm/builder-vm/v<mvmctl-version>/`.
 
 **Layer 2 — the user's target image** (dev shell, or whatever `--flake` points at):
@@ -289,46 +288,37 @@ Reshape `ensure_dev_image` to encode the two-layer artifact rule from ADR-046 §
 ### Feature flag polarity
 
 - `backends-builder-vm-libkrun` becomes the new default — covers Layer 1 + Layer 2 on user-facing paths.
-- `contributor-bootstrap` is renamed `contributor-bootstrap` to make its scope explicit:
-  - Off by default.
-  - On, it adds **only** the Stage 0.b microsandbox launcher for building the in-repo `nix/images/builder-vm/flake.nix`. It is *not* a runtime backend, *not* selectable via `--hypervisor microsandbox`, and *not* called for user-facing builds.
-  - This rename happens in W5 — code that's left behind for end-user-facing fallback in earlier phases gets deleted here as part of the cutover. End users without libkrun get an install hint, not a microsandbox fallback.
+- The old libkrun bootstrap flag is removed. End users without libkrun get an install hint, not a libkrun fallback.
 
 ### Implementation notes for `ensure_dev_image`
 
 - `find_builder_vm_flake()` is new — sibling of `find_dev_image_flake()`. Returns `Ok(path)` when `<workspace_root>/nix/images/builder-vm/flake.nix` exists. The split mirrors the artifact-layer distinction: `nix/images/builder-vm/` is Layer 1, `nix/images/dev-shell/` (renamed from `nix/images/builder/`) is Layer 2.
 - The cache-key hash is `sha256(flake.nix + flake.lock)`. Any contributor edit to either invalidates and forces a rebuild — that's the "next `mvmctl dev up` reflects my edit" promise.
-- The `--features contributor-bootstrap` gate compiles out the microsandbox dep entirely for users. CI runs two job variants: default (no feature) covers the end-user path; `--features contributor-bootstrap` covers the contributor Stage 0 path.
+- Libkrun is absent from the dependency graph.
 
 ### W5 acceptance
 
 - All nine whole-plan acceptance criteria pass.
 - `cargo test --workspace` is green on macOS aarch64 + Linux x86_64 with default features.
-- `cargo test --workspace --features contributor-bootstrap` is green on the same matrix.
 - Live test `tests/dev_up_libkrun.rs` runs the full Layer 1 + Layer 2 source-checkout path end-to-end against a tiny test flake (≤ 5 derivations) on both platforms.
-- Live test `tests/dev_up_contributor_bootstrap.rs` exercises the `--features contributor-bootstrap` Stage 0 path. This test must explicitly verify that no host `nix` binary is invoked (e.g. by putting a poisoned `nix` shim at the front of `PATH` that exits non-zero and asserting the build still succeeds).
 - A contributor edit to `nix/images/builder-vm/flake.nix` (e.g. adding `htop` to `builderPackages`) shows up in the next `mvmctl dev up` without a release-pipeline round-trip.
 
 ---
 
-## W6 — Hygiene (not removal)
+## W6 — Hygiene
 
-W5's cutover already moves microsandbox behind `--features contributor-bootstrap` and deletes the end-user-facing fallback. W6 is hygiene that lands ≥ 8 weeks later, once W5 has shipped without contributor-reported regressions:
+W5's cutover deletes the libkrun fallback. W6 is hygiene that lands once W5 has shipped without contributor-reported regressions:
 
-- Audit the `contributor-bootstrap` dep closure — confirm only Stage 0.b code remains, no leakage of microsandbox types into other crates.
-- Move `crates/mvm-build/src/builder_vm.rs::MicrosandboxBuilderVm` into a dedicated `crates/mvm-build/src/contributor_bootstrap.rs` so the scope is grep-obvious. Same code, clearer name.
-- Move `mvm_cli::commands::env::apple_container::build_image_via_microsandbox` into a sibling `contributor_bootstrap_build.rs` for the same reason.
-- Update ADR-013 with a §"Superseded for the user-facing builder path by ADR-046" note. The contributor-bootstrap clause of ADR-013 stays in force.
-- Update `CLAUDE.md`'s build instructions: `cargo build` is the canonical path for users and for contributors with host Nix; `cargo build --features contributor-bootstrap` is the path for contributors on stock macOS modifying the builder VM image.
+- Update ADR-013 with a §"Superseded for the user-facing builder path by ADR-046" note.
+- Update `CLAUDE.md`'s build instructions: `cargo build` is the canonical path.
 
-### Removing microsandbox entirely (deferred)
+### Removing libkrun entirely
 
-If a thinner Stage 0 emerges (e.g. a hand-rolled libkrun + nixos/nix OCI extractor, or a checked-in pre-built stage-0 microVM image that's small enough to live in git LFS), the `contributor-bootstrap` feature can swap its backend without touching the user-facing path. That work is *not* part of plan 72. It's tracked as a follow-up; the goal of plan 72 is to get user-facing builds off microsandbox, not to eliminate microsandbox from every workflow.
+Libkrun is removed from the Cargo dependency graph and runtime/backend surface.
 
 ### W6 acceptance
 
-- `cargo metadata -p mvmctl` with default features shows no `microsandbox*` crate.
-- `cargo metadata -p mvmctl --features contributor-bootstrap` shows microsandbox only under the contributor-bootstrap-only crates.
+- `cargo metadata -p mvmctl` with default features shows no `libkrun*` crate.
 - Default `cargo build` bin size: `du -h target/release/mvmctl` drops by at least 8 MiB vs. pre-plan-71 baseline.
 - Release artifact `builder-checksums-sha256.txt` exists and is verified by `download_builder_vm_image`.
 
@@ -336,18 +326,17 @@ If a thinner Stage 0 emerges (e.g. a hand-rolled libkrun + nixos/nix OCI extract
 
 ## Non-goals
 
-- **Replacing microsandbox as a runtime backend.** ADR-013's runtime selection (Firecracker on Linux, libkrun on macOS via plan 57) stays as-is. microsandbox stays available as a runtime backend selectable via `--hypervisor microsandbox` during the deprecation window.
-- **Multi-platform Windows support.** Windows is out of scope for this plan; libkrun doesn't run there. The microsandbox builder path is the only one that ever could have worked on Windows, and even then via WSL2.
+- **Replacing libkrun as a runtime backend.** ADR-013's runtime selection (Firecracker on Linux, libkrun on macOS via plan 57) stays as-is. libkrun stays available as a runtime backend selectable via `--hypervisor libkrun` during the deprecation window.
+- **Multi-platform Windows support.** Windows is out of scope for this plan; libkrun doesn't run there. The libkrun builder path is the only one that ever could have worked on Windows, and even then via WSL2.
 - **Snapshotting the builder VM**. The builder is single-purpose and exit-on-completion. No reason to snapshot. If a contributor wants a long-lived dev VM they want `mvmctl dev shell` (different path, libkrun-backed via plan 57).
 - **Honoring host Nix when present.** Per CLAUDE.md §"Host Nix is never used by mvmctl", mvmctl does not consult any host Nix install in any code path. This is a *removal* of ADR-013's "host Nix remains an opt-in power-user path" clause — that clause is superseded for everything inside `mvmctl`. Contributors with `nix-darwin`'s `linux-builder` see exactly the same behavior as contributors without it. Determinism is the reason.
-- **Eliminating microsandbox from the contributor-bootstrap path.** Plan 72 demotes it to that scope; further reduction (vendoring a thinner OCI runner, shipping a stage-0 microVM in git LFS) is tracked as a follow-up. The minimum scope here is getting *user-facing builds* off microsandbox and giving contributors a from-source dev loop that doesn't depend on the release pipeline.
 - **Forcing contributors to download a prebuilt builder VM in a source checkout.** Source-checkout `mvmctl dev up` always runs `nix build` against the in-repo flakes for both Layer 1 (builder VM image) and Layer 2 (dev shell / user image). The mvm-published prebuilt is end-user infrastructure only — a contributor modifying `nix/images/builder-vm/flake.nix` must see their changes in the next invocation without any release-pipeline round-trip.
 
 ## Risks and mitigations
 
 | Risk | Mitigation |
 |---|---|
-| Plan 57 doesn't reach W1 acceptance before plan 72 W1 wants to start. | Vendoring fallback in ADR-046 §"Fallback / escape hatch" — fork microsandbox, add `upper_size_mib`, ship that as v0.15.x while plan 57 catches up. |
+| Plan 57 doesn't reach W1 acceptance before plan 72 W1 wants to start. | Vendoring fallback in ADR-046 §"Fallback / escape hatch" — fork libkrun, add `upper_size_mib`, ship that as v0.15.x while plan 57 catches up. |
 | The published builder VM image takes >1.2 GiB compressed and bandwidth-constrained users complain. | Audit the rootfs closure in W2; trim packages until budget is met. `du -h $out/rootfs.ext4` is a CI gate. |
 | Cold-cache `nix build` doesn't fit the <8 min budget. | Ship the builder VM image with a *bigger* seed `/nix/store` containing the most expensive paths (rustc closure, nixpkgs stdenv). Tradeoff: bigger image, faster cold-cache. Adjust in W2 based on measurement. |
 | Bind-mount `/nix-store → /nix` interacts badly with the rootfs's existing `/nix/store/...-bash` lookups during init. | Mount order: tmpfs `/tmp`, then bind `/nix-store → /nix`, *then* exec `/bin/sh` for `/job/cmd.sh`. By the time the shell runs, `/nix` resolves to the persistent store with the seed copied in. The init binary itself uses no `/nix` paths (it's statically linked). |
@@ -366,7 +355,7 @@ If a thinner Stage 0 emerges (e.g. a hand-rolled libkrun + nixos/nix OCI extract
 ## Sequencing summary
 
 ```
-W0 (correctness fixes, ships now, microsandbox stays the launcher)
+W0 (correctness fixes, ships now, libkrun stays the launcher)
    │
    ▼ (plan 57 lands W1–W3)
 W1 (LibkrunBuilderVm skeleton — gated, no callers)
@@ -381,10 +370,10 @@ W3 (mvm-builder-init — Rust binary baked into rootfs)
 W4 (Network + vsock + console plumbing)
    │
    ▼
-W5 (Cutover — libkrun for user-facing, microsandbox demoted to `contributor-bootstrap`)
+W5 (Cutover — libkrun for user-facing, libkrun removed)
    │
    ▼ (≥ 8 weeks; no regressions)
-W6 (Hygiene — segregate contributor-bootstrap code, doc the new build matrix)
+W6 (Hygiene — doc the new build matrix)
 ```
 
 W0 ships standalone. W1–W4 chain. W5 is the user-visible cutover. W6 is hygiene.

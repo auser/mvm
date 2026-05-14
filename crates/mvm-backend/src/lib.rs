@@ -55,3 +55,15 @@ pub use docker::DockerBackend;
 pub use libkrun::LibkrunBackend;
 pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
 pub use mock::MockBackend;
+
+/// Crate-wide test serialization for tests that mutate `HOME` or
+/// other process-global env vars. Re-exported from
+/// [`mvm_base::runtime_meta::HOME_TEST_LOCK`] so the
+/// alt-backend tests share the same mutex with `mvm` tests
+/// — without sharing one lock the modules race each other when
+/// their tests run on the same `cargo test` binary.
+///
+/// Tests import from `mvm_base` directly; keep this note near the
+/// module list so future process-global tests reuse the same lock.
+#[cfg(any())]
+pub(crate) use mvm_base::runtime_meta::HOME_TEST_LOCK;

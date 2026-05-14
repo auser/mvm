@@ -18,7 +18,7 @@
   # Earlier iterations of this flake had `mvm.url = "path:../.."` to
   # consume the parent `mvm` flake's `lib.<system>.mkGuest`. That
   # works fine on the host, but the xtask runs `nix build` inside a
-  # microsandbox sandbox where `/work` is a read-only bind-mount of
+  # libkrun sandbox where `/work` is a read-only bind-mount of
   # the host workspace. In that setup the path-input chain
   # (`mvm = path:../..`, parent's `mvm-workspace = path:..`) trips
   # nix's strict lock validation with "lock file contains unlocked
@@ -63,7 +63,7 @@
       # and store-copies the whole workspace on every evaluation —
       # slow on cold caches and wasteful even when warm.
       #
-      # When running inside the microsandbox builder VM, the flake is
+      # When running inside the libkrun builder VM, the flake is
       # fetched via `path:` URL which store-copies just the flake
       # subdir; `../../..` from that store location resolves outside
       # the workspace and would trip over sandbox-internal files like

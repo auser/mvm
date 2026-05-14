@@ -46,7 +46,7 @@
 //!   backend dispatch hermetic; `MVM_DIRECT_BOOT` skips the
 //!   build + template lookup. Together they let `mvmctl up` run
 //!   to completion on a CI runner with no KVM / Nix / Apple
-//!   Container / Docker / microsandbox)
+//!   Container / Docker / libkrun)
 //! - `mvmctl set-ttl <vm> <duration>` (after `up --hypervisor mock`)
 //!   → `VmTtlSet` (chains off the up-via-mock fixture; the verb
 //!   operates on the persistent name registry that `up` populates)
@@ -879,7 +879,7 @@ fn start_mock_vm_agent(sandbox: &AuditSandbox, name: &str) -> MockVmAgentFixture
 fn up_with_mock_backend_emits_vm_start_audit_entry() {
     // End-to-end test of `mvmctl up` against the in-memory
     // `MockBackend`. Pre-MockBackend this row needed a real
-    // Firecracker / Apple Container / Docker / microsandbox to
+    // Firecracker / Apple Container / Docker / libkrun to
     // exercise — none of which are hermetic on a CI runner. The
     // MockBackend substrate + the `MVM_DIRECT_BOOT` direct-boot
     // path (see `bring_up_mock_vm`) together close that gap.

@@ -3,7 +3,7 @@
 
   # ── Why this flake exists ────────────────────────────────────────────
   #
-  # Plan 72 (ADR-046) replaces the microsandbox-backed builder VM
+  # Plan 72 (ADR-046) replaces the libkrun-backed builder VM
   # (`nix/images/builder/`, which is actually the dev-shell image
   # despite the name) with a libkrun-direct launcher
   # (`LibkrunBuilderVm`, Plan 72 W1). This flake is the artifact

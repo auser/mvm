@@ -2,7 +2,7 @@
 name = "mvm-backend"
 version.workspace = true
 edition.workspace = true
-description = "VmBackend implementations for mvm — Apple Container, Cloud Hypervisor, Docker, libkrun, microsandbox"
+description = "VmBackend implementations for mvm — Apple Container, Cloud Hypervisor, Docker, libkrun"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -22,7 +22,6 @@ authors.workspace = true
 #   - cloud_hypervisor.rs  (Tier 1 KVM peer of Firecracker; opt-in)
 #   - docker.rs            (Tier 3 fallback)
 #   - libkrun.rs           (raw libkrun shim — Linux KVM / macOS HVF)
-#   - microsandbox.rs      (libkrun-backed sandbox; Phase 1 default)
 #
 # Stays in `mvm` (W8 will move):
 #   - firecracker.rs (Lima-era installer helpers)
@@ -60,11 +59,7 @@ tracing.workspace = true
 mvm-build.workspace = true
 
 [features]
-# Compatibility feature kept for older contributor commands. It no longer
-# enables the upstream Rust microsandbox crate because that crate vendors
-# SeaORM / SQLx database dependencies.
 default = []
-contributor-bootstrap = []
 
 [lints]
 workspace = true

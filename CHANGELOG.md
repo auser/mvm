@@ -85,12 +85,12 @@ ossified around Firecracker. v2 is a 13-crate workspace built around:
 
 - **`microvm.nix`** as the image-build substrate (deterministic,
   composable, declarative — replaces the hand-rolled rootfs init)
-- **microsandbox as the cross-platform default backend** (Linux/KVM
+- **libkrun as the cross-platform default backend** (Linux/KVM
   via libkrun, macOS via Hypervisor.framework, Windows pending)
 - **Firecracker preserved as Tier 1 on Linux+KVM** with explicit
   Cloud Hypervisor support for workloads that need VFIO/GPU/virtio-fs
 - **Lima removed entirely** — direct host execution on Linux; Apple
-  Container or microsandbox on macOS
+  Container or libkrun on macOS
 - **Busybox as PID 1** in guests (replaces NixOS+systemd; meets the
   ≤300 ms cold-boot p50 floor recorded in ADR-013)
 - **`ExecutionPlan`-shaped substrate** for the supervisor / audit /
@@ -104,7 +104,7 @@ ossified around Firecracker. v2 is a 13-crate workspace built around:
   `mvm-cli`, `mvm-mcp` (plus root `mvmctl` facade and `xtask`)
 - `AnyBackend` dispatch with `auto_select()` per ADR-013: Linux+KVM →
   Firecracker; macOS 26+ on Apple Silicon → Apple Container or
-  microsandbox; KVM-less Linux / older macOS / Intel → microsandbox;
+  libkrun; KVM-less Linux / older macOS / Intel → libkrun;
   Cloud Hypervisor opt-in for VFIO/GPU
 - `mkGuest` Nix function with three entrypoint forms (shell, command,
   services), build-time `accessible`/`sealed` mode inference, and
@@ -118,7 +118,7 @@ ossified around Firecracker. v2 is a 13-crate workspace built around:
 - `mvm-security::snapshot_crypto` (AES-256-GCM primitives) and
   `mvm-security::keystore` (`KeyProvider` trait + `EnvKeyProvider`)
   — Phase 2 substrate
-- `MicrosandboxBuilderVm` — Nix builds in a microsandbox sandbox on
+- `LibkrunBuilderVm` — Nix builds in a libkrun sandbox on
   macOS Intel / KVM-less Linux when host Nix isn't on `PATH`
 - `mvmctl invoke` (Sprint 45 W3) — production-safe call surface for
   function-entrypoint workloads; `mvmctl exec` remains dev-only
@@ -138,7 +138,7 @@ ossified around Firecracker. v2 is a 13-crate workspace built around:
 - **Lima is not used on macOS anymore.** v1's `mvmctl dev` booted a
   Lima VM; v2's `mvmctl dev` either uses Apple Container (macOS 26+
   Apple Silicon) or the host shell directly (Linux+KVM), and emits a
-  clear bail with a microsandbox-builder pointer on other hosts.
+  clear bail with a libkrun-builder pointer on other hosts.
 - **Image build substrate moved to `microvm.nix`.** v1's hand-rolled
   rootfs init paths are gone; users with custom `flake.nix` files
   need to migrate to `mkGuest` (the API is documented at
@@ -182,7 +182,7 @@ ossified around Firecracker. v2 is a 13-crate workspace built around:
 These are intentional deferrals for the rewrite's first cut. Each
 has a tracking pointer; none is silently broken.
 
-- **mvmd contract build** is blocked on the upstream `microsandbox
+- **mvmd contract build** is blocked on the upstream `libkrun
   0.4.5 ⊥ iroh-base 0.96.1 over sha2` conflict. Targeted package
   builds confirm every `mvmctl::*` path mvmd imports still resolves;
   end-to-end `cargo build --workspace` greens when the upstream

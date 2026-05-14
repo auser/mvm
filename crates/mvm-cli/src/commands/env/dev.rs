@@ -11,7 +11,7 @@
 //!   This is the W8.C path — replaces the W7-deleted Lima
 //!   `dev_up`/`dev_down`/`dev_status` helpers.
 //! - **macOS Intel / pre-26 / no-KVM Linux** → bails with a clear
-//!   reference to the W7.x.2 microsandbox-builder-VM follow-up,
+//!   reference to the W7.x.2 libkrun-builder-VM follow-up,
 //!   the only path that brings Firecracker to those hosts.
 
 use anyhow::Result;
@@ -36,7 +36,7 @@ enum DevBackend {
     /// Firecracker runs natively.
     LinuxKvm,
     /// Neither path is wired today — macOS Intel, macOS pre-26,
-    /// Linux without KVM, Windows. The microsandbox builder VM
+    /// Linux without KVM, Windows. The libkrun builder VM
     /// (W7.x.2) is the planned home for these.
     Unsupported,
 }
@@ -141,7 +141,7 @@ pub(in crate::commands) enum DevAction {
 
 /// Error shown on hosts where `mvmctl dev` can't run today — macOS
 /// Intel, macOS pre-26, Linux without KVM, Windows. Points the user
-/// at the W7.x.2 microsandbox-builder-VM follow-up so they have
+/// at the W7.x.2 libkrun-builder-VM follow-up so they have
 /// somewhere to look rather than an opaque "not implemented"
 /// message.
 fn bail_no_dev_backend() -> Result<()> {
@@ -149,7 +149,7 @@ fn bail_no_dev_backend() -> Result<()> {
         "`mvmctl dev` requires either:\n  \
            - macOS 26+ Apple Silicon (Apple Container dev VM), or\n  \
            - Linux with /dev/kvm (Firecracker runs natively on host).\n\
-         This host has neither. The microsandbox builder VM (W7.x.2 \
+         This host has neither. The libkrun builder VM (W7.x.2 \
          in specs/SPRINT.md) is the planned path for macOS Intel / \
          pre-26 / no-KVM Linux. Until that lands, run workloads \
          directly with `mvmctl up <flake>` using whichever backend \
@@ -264,7 +264,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                 ui::info(
                     "Dev environment: not configured on this host (Apple Container \
                      unavailable and /dev/kvm missing). See W7.x.2 in specs/SPRINT.md \
-                     for the planned microsandbox-builder-VM path.",
+                     for the planned libkrun-builder-VM path.",
                 );
                 Ok(())
             }

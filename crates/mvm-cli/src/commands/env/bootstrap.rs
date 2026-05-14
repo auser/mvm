@@ -31,7 +31,7 @@ pub(super) fn run_steps(production: bool) -> Result<()> {
         bootstrap::check_package_manager()?;
     }
 
-    // Plan-60 / ADR-013: dev mode is microsandbox/Apple-Container, not
+    // Plan-60 / ADR-013: dev mode is libkrun/Apple-Container, not
     // Lima — there's no Lima VM to provision here. The host-side
     // prerequisite hint (libkrun on macOS Intel) is the only legacy
     // bootstrap surface left; setup_steps below handles Firecracker

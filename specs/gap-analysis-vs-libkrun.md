@@ -1,20 +1,20 @@
-# Gap analysis: mvm vs. microsandbox
+# Gap analysis: mvm vs. libkrun
 
 **Date:** 2026-05-12
 **mvm version surveyed:** 0.14.0 (post v1→v2 cutover)
-**Comparator:** microsandbox (`docs.microsandbox.dev`, introduction + quickstart + CLI overview + sandbox overview)
+**Comparator:** libkrun (`docs.libkrun.dev`, introduction + quickstart + CLI overview + sandbox overview)
 
 ---
 
 ## Context
 
-The user pointed at microsandbox's "introduction" docs. Both projects build microVM-based sandboxes for code execution, but they're shaped for different audiences and the surface gap is wide enough that it's worth pinning down before either side commits to a roadmap. This doc captures: (1) what microsandbox sells and how, (2) where mvm already overlaps, (3) where mvm leads, (4) where mvm trails and what closing each gap would cost, (5) the strategic decisions that fall out of the comparison.
+The user pointed at libkrun's "introduction" docs. Both projects build microVM-based sandboxes for code execution, but they're shaped for different audiences and the surface gap is wide enough that it's worth pinning down before either side commits to a roadmap. This doc captures: (1) what libkrun sells and how, (2) where mvm already overlaps, (3) where mvm leads, (4) where mvm trails and what closing each gap would cost, (5) the strategic decisions that fall out of the comparison.
 
 Out of scope: mvmd (multi-tenant fleet) lives in a sibling repo and is not the same axis of comparison.
 
 ---
 
-## What microsandbox actually ships
+## What libkrun actually ships
 
 One-liner: **"every agent deserves its own computer"** — a local, daemonless microVM runtime that boots in <100ms, ingests OCI images, and exposes three first-class SDKs (Python/TS/Rust) with a tight builder API. The Python flow is roughly:
 
@@ -28,7 +28,7 @@ CLI is Docker-shaped: `msb run|start|stop|rm|ls|ps|inspect|logs|metrics` plus a 
 
 ## Capability matrix
 
-| Capability | microsandbox | mvm (0.14.0) | Status |
+| Capability | libkrun | mvm (0.14.0) | Status |
 |---|---|---|---|
 | Sub-100ms cold boot | Claimed | Not measured / not advertised | **Gap** |
 | Daemonless runtime | Yes (child of SDK process) | Mostly (CLI-spawned FC, optional supervisor) | Parity-ish |
@@ -36,7 +36,7 @@ CLI is Docker-shaped: `msb run|start|stop|rm|ls|ps|inspect|logs|metrics` plus a 
 | Nix-built reproducible rootfs | No | Yes (catalog, flakes, Mvmfile) | **Lead** |
 | Python SDK | Yes | Not in `crates/` today. Planned in plan 60 Phase 5 as `python/` (pyo3-bound). ~7-10 day estimate, not started. | **Gap (planned)** |
 | TypeScript SDK | Yes | Not in `crates/` today. Planned in plan 60 Phase 5 as `typescript/` (napi-rs). Not started. | **Gap (planned)** |
-| Rust SDK | Yes (`microsandbox` crate) | Not in `crates/` today. `mvm-sdk` existed in the previous iteration (`../mvm`) and as `mvmforge-sdk` in `../mvmforge`. Plan 60 Phase 5 ports it back as `crates/mvm-sdk/` + `mvm-sdk-macros` + `mvm-sdk-addon`. | **Gap (planned, port available)** |
+| Rust SDK | Yes (`libkrun` crate) | Not in `crates/` today. `mvm-sdk` existed in the previous iteration (`../mvm`) and as `mvmforge-sdk` in `../mvmforge`. Plan 60 Phase 5 ports it back as `crates/mvm-sdk/` + `mvm-sdk-macros` + `mvm-sdk-addon`. | **Gap (planned, port available)** |
 | Snapshots (capture writable layer, restart) | Yes (`msb snapshot create`) | Yes — instance pause/resume with HMAC + replay-store seal | **Lead** (stronger) |
 | Templates (pre-baked rootfs) | Implicit via image layers | Yes, first-class (`template build/list/...`) | **Lead** |
 | Volumes (named, persistent) | Yes (`volume create/ls/rm`) | virtio-fs mounts via `vm volume`, no named-volume CRUD | Partial |
@@ -48,7 +48,7 @@ CLI is Docker-shaped: `msb run|start|stop|rm|ls|ps|inspect|logs|metrics` plus a 
 | Signed execution plans | Not documented | Ed25519-signed `ExecutionPlan`, replay-protected | **Lead** |
 | dm-verity rootfs | Not documented | Yes (W3 shipped 2026-04-30) | **Lead** |
 | Project/init file | None | `mvm init` → `mvm.toml` + `flake.nix`; `up --manifest` | **Lead** |
-| Multi-backend hypervisor | libkrun only (under the hood) | Firecracker / Apple Container / libkrun / microsandbox / Cloud Hypervisor / microvm.nix / Docker fallback | **Lead** |
+| Multi-backend hypervisor | libkrun only (under the hood) | Firecracker / Apple Container / libkrun / libkrun / Cloud Hypervisor / microvm.nix / Docker fallback | **Lead** |
 | Live metrics | `msb metrics` | `ops metrics` | Parity |
 | Logs streaming | `msb logs -f` | `vm logs` | Parity |
 | `install` as system command | Yes | Not surfaced | Minor gap |
@@ -62,36 +62,36 @@ CLI is Docker-shaped: `msb run|start|stop|rm|ls|ps|inspect|logs|metrics` plus a 
 Two things deserve to be called out before the lead/gap sections, because the first survey of the codebase missed them:
 
 - **A round-trip OCI path exists.** `crates/mvm-backend/src/docker.rs:3-5`: "Runs Nix-built microVM images as Docker containers. Uses the OCI `image.tar.gz` produced by `mkGuest` (via `dockerTools.streamLayeredImage`), loaded with `docker load`. Falls back to `docker import` for raw ext4." This isn't upstream registry pull, but it does mean a Nix-built workload can be handed to a host that only has Docker. Worth documenting in `public/src/content/docs/` so users know it's there.
-- **The SDK design is fully specified, just not ported.** Plan 60 Phase 5 (`specs/plans/60-mvm-microsandbox-migration.md:1820-1824`) ports `mvm-sdk` back from `../mvmforge/crates/mvmforge-sdk/` and splits it into `mvm-sdk` + `mvm-sdk-macros` + `mvm-sdk-addon`. The Python/TS bindings sit on top of the same Rust core (lines 568-608: pyo3 for hot paths + pure-Python over JSON-RPC; napi-rs for hot paths + pure-TS otherwise). Phase 5 estimate is ~7-10 days for the Rust port alone. The previous iteration shipped this; the rewrite just hasn't carried it over yet.
+- **The SDK design is fully specified, just not ported.** Plan 60 Phase 5 (`specs/plans/60-mvm-libkrun-migration.md:1820-1824`) ports `mvm-sdk` back from `../mvmforge/crates/mvmforge-sdk/` and splits it into `mvm-sdk` + `mvm-sdk-macros` + `mvm-sdk-addon`. The Python/TS bindings sit on top of the same Rust core (lines 568-608: pyo3 for hot paths + pure-Python over JSON-RPC; napi-rs for hot paths + pure-TS otherwise). Phase 5 estimate is ~7-10 days for the Rust port alone. The previous iteration shipped this; the rewrite just hasn't carried it over yet.
 
 ---
 
 ## Where mvm clearly leads
 
-These are real, shipped advantages that microsandbox doesn't claim:
+These are real, shipped advantages that libkrun doesn't claim:
 
-1. **Provable, signed admission path.** Every workload routes through a typed `ExecutionPlan`, signed under a host Ed25519 key, replay-protected, and audited to a chain-signed JSONL log. CI proves these properties on every PR (claim 8 in the security model). microsandbox's docs make no equivalent claim.
-2. **Verified boot.** dm-verity sidecar + initramfs panics on tamper. Asserted in CI with a live-KVM tamper regression. microsandbox doesn't talk about rootfs integrity.
-3. **Reproducible Nix-built images.** Catalog + flakes + double-build CI lane. microsandbox's OCI-pull model inherits whatever the upstream image author shipped.
+1. **Provable, signed admission path.** Every workload routes through a typed `ExecutionPlan`, signed under a host Ed25519 key, replay-protected, and audited to a chain-signed JSONL log. CI proves these properties on every PR (claim 8 in the security model). libkrun's docs make no equivalent claim.
+2. **Verified boot.** dm-verity sidecar + initramfs panics on tamper. Asserted in CI with a live-KVM tamper regression. libkrun doesn't talk about rootfs integrity.
+3. **Reproducible Nix-built images.** Catalog + flakes + double-build CI lane. libkrun's OCI-pull model inherits whatever the upstream image author shipped.
 4. **Multi-hypervisor abstraction.** Seven backends behind a trait. Worth a roadmap line: it lets mvm meet workloads where they live (KVM datacenter, Apple Silicon laptop, Docker fallback) without a rewrite.
-5. **Template ergonomics.** Versioned, reusable, GC'd. microsandbox has implicit image-layer reuse but no first-class template object.
-6. **Snapshot durability semantics.** Instance snapshots are HMAC-sealed with a monotonic epoch and refuse downgrade replays. microsandbox snapshots are documented as artifacts but the integrity story isn't.
-7. **Project file.** `mvm.toml` + `mvmctl init` presets give a declarative, checked-in surface. microsandbox is imperative-only.
+5. **Template ergonomics.** Versioned, reusable, GC'd. libkrun has implicit image-layer reuse but no first-class template object.
+6. **Snapshot durability semantics.** Instance snapshots are HMAC-sealed with a monotonic epoch and refuse downgrade replays. libkrun snapshots are documented as artifacts but the integrity story isn't.
+7. **Project file.** `mvm.toml` + `mvmctl init` presets give a declarative, checked-in surface. libkrun is imperative-only.
 
 ---
 
-## Where microsandbox leads (the real gaps)
+## Where libkrun leads (the real gaps)
 
 Ranked by strategic weight, not effort:
 
 ### G1. No Python / TypeScript / Rust SDK shipped yet — biggest adoption gap
 
-microsandbox is fundamentally **SDK-shaped**: the install path is `pip install microsandbox` or `npm install microsandbox`, and three lines of code give you a running VM. mvm is **CLI-shaped**: you `mvmctl up --manifest ./mvm.toml --detach` and then shell out for everything else. The agent-framework audience (LangChain, LlamaIndex, Mastra, Vercel AI SDK) lives in Python and TypeScript and will not adopt a CLI-only tool.
+libkrun is fundamentally **SDK-shaped**: the install path is `pip install libkrun` or `npm install libkrun`, and three lines of code give you a running VM. mvm is **CLI-shaped**: you `mvmctl up --manifest ./mvm.toml --detach` and then shell out for everything else. The agent-framework audience (LangChain, LlamaIndex, Mastra, Vercel AI SDK) lives in Python and TypeScript and will not adopt a CLI-only tool.
 
 The good news: the design is already written. Plan 60 Phase 5 specs the full surface (`Sandbox.builder(...)`, `.commands.run(...)`, `.commands.run(..., background=True)`, etc.) and the previous iteration's `mvm-sdk` exists at `../mvmforge/crates/mvmforge-sdk/` ready to port. The bad news: it isn't in this repo's `crates/` and Phase 5 hasn't been started.
 
 - **Effort:** Phase 5 estimate ~7-10 days for the Rust SDK port + macros + addon. Python and TS bindings on top are mechanical once the Rust core exists (pyo3 / napi-rs wrapping).
-- **Decision needed:** Is "agent-framework adoption" a goal? If yes, this is the #1 investment and Phase 5 should jump the queue. If no, microsandbox keeps that audience.
+- **Decision needed:** Is "agent-framework adoption" a goal? If yes, this is the #1 investment and Phase 5 should jump the queue. If no, libkrun keeps that audience.
 
 ### G2. Upstream OCI ingest is missing (round-trip is present)
 
@@ -102,35 +102,35 @@ mvm can already round-trip a Nix-built image through OCI (`mkGuest` → `dockerT
 
 ### G3. No marketed cold-boot number
 
-microsandbox leads with "<100ms." mvm has no published number. Could be that mvm is already there (Firecracker + CoW clone is fast) — we just don't measure or advertise. Could be that template hydration + plan signing + audit append + supervisor admission stack up to noticeably more.
+libkrun leads with "<100ms." mvm has no published number. Could be that mvm is already there (Firecracker + CoW clone is fast) — we just don't measure or advertise. Could be that template hydration + plan signing + audit append + supervisor admission stack up to noticeably more.
 
 - **Effort:** Trivial to measure (a benchmark harness on a couple of canonical paths: `up` of a cold template, `up` from warm template, snapshot restore). Effort to *improve* depends on what the measurement shows.
 - **Decision needed:** Is sub-100ms a goal we're willing to hold the admission path to? If yes, plan-signing/audit-append latency becomes a constraint to design against.
 
 ### G4. Secret placeholders
 
-This is microsandbox's flashiest differentiator: the guest literally never receives the real value, and the host swaps placeholders on egress to allow-listed hosts. mvm has good secret *storage* (keystore + SecretBox + audit), but injection is plain env / mounted file. A compromised guest exfiltrates whatever it can read.
+This is libkrun's flashiest differentiator: the guest literally never receives the real value, and the host swaps placeholders on egress to allow-listed hosts. mvm has good secret *storage* (keystore + SecretBox + audit), but injection is plain env / mounted file. A compromised guest exfiltrates whatever it can read.
 
 - **Effort:** Large. Needs an egress proxy that terminates TLS (or at minimum knows the placeholder→secret map per allowed host), tight integration with the network policy layer, and a defensible threat model for what counts as "allowed host."
 - **Strategic note:** mvm's existing security claims (signed plans, verified boot, audit) are arguably stronger overall, but they don't reach this specific failure mode. Worth a deliberate decision: do we counter, or do we cede this lane?
 
 ### G5. Daemonless ergonomics for the SDK path
 
-microsandbox's "no daemon" pitch is really "the SDK *is* the runtime owner." mvm's `mvmctl up --detach` leaves a Firecracker process owned by no parent, which is fine for CLI use but awkward for SDK use (who reaps the VM when the Python process dies?). Pairs with G1.
+libkrun's "no daemon" pitch is really "the SDK *is* the runtime owner." mvm's `mvmctl up --detach` leaves a Firecracker process owned by no parent, which is fine for CLI use but awkward for SDK use (who reaps the VM when the Python process dies?). Pairs with G1.
 
 ### G6. Snapshot-spawned worker fan-out
 
-microsandbox markets a workflow: "snapshot the sandbox after `pip install`, then spawn N parallel workers from the snapshot." mvm has snapshots and templates but no documented worker-fan-out workflow. Mechanically possible; not a featured story.
+libkrun markets a workflow: "snapshot the sandbox after `pip install`, then spawn N parallel workers from the snapshot." mvm has snapshots and templates but no documented worker-fan-out workflow. Mechanically possible; not a featured story.
 
 ### G7. Programmable network layer
 
-Both are partial. microsandbox lists it "coming soon"; mvm has L3 allow-lists today, L7 stubbed (plan 34). Realistic parity, not a real gap — but worth tracking whose ships first.
+Both are partial. libkrun lists it "coming soon"; mvm has L3 allow-lists today, L7 stubbed (plan 34). Realistic parity, not a real gap — but worth tracking whose ships first.
 
 ---
 
 ## Strategic decisions this surfaces
 
-1. **Audience.** Is mvm chasing the agent-framework developer (Python/TS, "give me a sandbox in 3 lines") or the platform operator (Nix, signed plans, audit, fleet-via-mvmd)? Today the codebase is firmly operator-shaped. microsandbox is firmly developer-shaped. Picking both is possible but expensive (G1 alone is multi-quarter).
+1. **Audience.** Is mvm chasing the agent-framework developer (Python/TS, "give me a sandbox in 3 lines") or the platform operator (Nix, signed plans, audit, fleet-via-mvmd)? Today the codebase is firmly operator-shaped. libkrun is firmly developer-shaped. Picking both is possible but expensive (G1 alone is multi-quarter).
 2. **Reproducibility vs. ergonomics on rootfs.** Nix-first is a moat for the operator story (claim 7 reproducibility CI) and a wall for the developer story (G2). An OCI ingest path widens the funnel but bifurcates the security claims. Needs an ADR.
 3. **Threat model for secrets.** Either commit to a placeholder/swap design (G4) or document explicitly that mvm's posture is "guest sees the secret, but admission is auditable and the rootfs is verified." Today this isn't written down as a deliberate choice.
 4. **Boot-latency budget.** If we want to publish a number, the admission path becomes a hot path. Today plan signing + audit append is not optimized for the <100ms window.
@@ -164,5 +164,5 @@ This doc is descriptive, not executable. To check its claims:
 
 - mvm CLI surface: `cargo run -- --help` and `crates/mvm-cli/src/commands/mod.rs`.
 - Security claims: `CLAUDE.md` "Security model" section + `specs/adrs/002-microvm-security-posture.md` + `specs/adrs/041-signed-audited-execution-plans.md`.
-- microsandbox claims: `https://docs.microsandbox.dev/getting-started/introduction`, `/getting-started/quickstart`, `/cli/overview`, `/sandboxes/overview` (fetched 2026-05-12).
-- Backend inventory: `crates/mvm-backend/src/` (firecracker, apple_container, libkrun, microsandbox, cloud_hypervisor, docker, microvm_nix).
+- libkrun claims: `https://docs.libkrun.dev/getting-started/introduction`, `/getting-started/quickstart`, `/cli/overview`, `/sandboxes/overview` (fetched 2026-05-12).
+- Backend inventory: `crates/mvm-backend/src/` (firecracker, apple_container, libkrun, libkrun, cloud_hypervisor, docker, microvm_nix).

@@ -306,8 +306,7 @@ impl AnyBackend {
     /// Select the best backend for the current platform.
     ///
     /// Firecracker is the production target — it always wins when KVM
-    /// is available. When KVM is not available, selection continues down
-    /// the local backend ladder without the upstream microsandbox crate.
+    /// is available. Non-KVM hosts continue down the fallback ladder.
     ///
     /// Priority:
     /// 1. **Firecracker** (if `/dev/kvm` available — production Tier 1)
@@ -759,7 +758,11 @@ mod tests {
         // live VM, but we can check that the bail (if any) for a
         // missing VM does NOT claim the backend itself is unsupported
         // when the capability says it is.
-        let unsupported: &[&str] = &["libkrun", "qemu", "apple-container"];
+        let unsupported: &[&str] = &[
+            "libkrun",
+            "qemu", // → microvm-nix
+            "apple-container",
+        ];
         for &name in unsupported {
             let b = AnyBackend::from_hypervisor(name);
             assert!(

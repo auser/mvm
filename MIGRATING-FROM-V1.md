@@ -24,11 +24,11 @@ Every v1 commit URL, PR URL, and release tag URL
 |---|---|
 | `mvmctl up <flake>` + `mvmctl console <vm>` for a debug shell | `mvmctl up --dev <flake>` then `mvmctl console <vm>` |
 | `mvmctl up <flake>` in production / CI | unchanged on the surface; image is now sealed by default — `console` will refuse without `--force` |
-| `mvmctl dev` on macOS via Lima | `mvmctl dev` now uses Apple Container (macOS 26+ AS) or microsandbox; **Lima is gone** |
+| `mvmctl dev` on macOS via Lima | `mvmctl dev` now uses Apple Container (macOS 26+ AS) or libkrun; **Lima is gone** |
 | Hand-written `flake.nix` with custom rootfs init | Migrate to `mkGuest` (see `nix/lib/default.nix` and `nix/images/examples/`) |
 | `mvmctl template create/build/info` | Image building lives at `mvmctl build`; template manifest support lives at `mvmctl up --launch-plan` |
 | `mvmctl exec` for one-shot guest exec | Use `mvmctl invoke` for production; `mvmctl exec` stays dev-only |
-| Integration with mvmd (sibling repo) | mvmd's `cargo build --workspace` is currently blocked on an upstream dep conflict (`microsandbox 0.4.5 ⊥ iroh-base 0.96.1`); targeted package builds work; full build greens when upstream resolves |
+| Integration with mvmd (sibling repo) | mvmd's `cargo build --workspace` is currently blocked on an upstream dep conflict (`libkrun 0.4.5 ⊥ iroh-base 0.96.1`); targeted package builds work; full build greens when upstream resolves |
 
 ## Behavior changes that bite the most
 
@@ -66,7 +66,7 @@ The replacements:
 |---|---|
 | Linux + `/dev/kvm` | `mvmctl dev` runs directly on the host shell |
 | macOS 26+ on Apple Silicon | `mvmctl dev` uses Apple Container |
-| macOS 26+ Intel / older macOS / KVM-less Linux | `mvmctl dev` bails with a microsandbox-builder pointer; `mvmctl up <flake>` falls through to `MicrosandboxBuilderVm` for the build half |
+| macOS 26+ Intel / older macOS / KVM-less Linux | `mvmctl dev` bails with a libkrun-builder pointer; `mvmctl up <flake>` falls through to `LibkrunBuilderVm` for the build half |
 | Windows | first-class support pending (plan 53's WSL2 path) |
 
 If you had a Lima `mvm` VM provisioned by v1, you can delete it with
@@ -136,7 +136,7 @@ phase; "Lives in mvmforge / sibling repo" means it moved out of mvm.
 | Firecracker backend | `mvm-runtime/src/vm/firecracker.rs` | **Shipped** (`mvm-backend/src/firecracker.rs`) |
 | Apple Container backend | `mvm-apple-container` crate | **Shipped** (collapsed into `mvm-providers`) |
 | libkrun backend | `mvm-libkrun` crate | **Shipped** (collapsed into `mvm-providers`) |
-| Lima dev VM | `vm/lima.rs` | **Removed** (replaced by Apple Container / direct host / microsandbox-builder) |
+| Lima dev VM | `vm/lima.rs` | **Removed** (replaced by Apple Container / direct host / libkrun-builder) |
 | `mvmctl exec` | `commands/exec.rs` | **Shipped** dev-only + `mvmctl invoke` for prod (plan 41) |
 | dm-verity verified boot (claim 3) | `nix/lib/minimal-init/` | **Shipped** (`nix/packages/mvm-verity-init.nix`) |
 | HMAC-signed snapshots | n/a (new in v2) | **Shipped** (`mvm-security/src/snapshot_hmac.rs`) |

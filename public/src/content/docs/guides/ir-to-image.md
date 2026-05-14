@@ -253,7 +253,7 @@ The orchestrator picks a builder mode (`host` | `vsock` | `ssh` | `auto`) and di
 3. **Runs `nix build`.** With `--override-input mvm git+file://...?dir=nix` so the builder VM consumes the in-tree `nix/lib` you're editing, not a pinned release.
 4. **Extracts artifacts.** Copies `rootfs.ext4`, `vmlinux`, and `mvm-meta.json` back to the host artifact dir.
 
-The host never runs `nix` itself. Plan 72 is migrating the builder VM from microsandbox to libkrun (macOS) / Firecracker (Linux); the contract is unchanged.
+The host never runs `nix` itself. Plan 72 is migrating the builder VM from libkrun to libkrun (macOS) / Firecracker (Linux); the contract is unchanged.
 
 ### Caching and reuse
 

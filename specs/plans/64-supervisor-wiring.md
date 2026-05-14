@@ -272,7 +272,7 @@ hang.
   60 Phase 3 (where policy and key resolvers land).
 - `CLAUDE.md` "Security model" section grows: claim 8 (proposed) —
   *every workload runs from a signed, audited `ExecutionPlan`*.
-- `specs/plans/60-mvm-microsandbox-migration.md` Phase 6 marked
+- `specs/plans/60-mvm-libkrun-migration.md` Phase 6 marked
   shipped.
 
 **Exit tests** (these are integration-level):

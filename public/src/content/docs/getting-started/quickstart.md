@@ -17,12 +17,12 @@ This single command detects your platform and handles everything. **Builds run i
 3. Drops you into a dev shell
 
 **On macOS (Apple Silicon or Intel):**
-1. Selects microsandbox (libkrun on Hypervisor.framework)
+1. Selects libkrun (libkrun on Hypervisor.framework)
 2. Same builder microVM, hosted on libkrun
 3. Drops you into a dev shell
 
 **On Linux without KVM:**
-1. Falls back to microsandbox in software-emulation mode (slower; meant for CI / sandboxed CI runners)
+1. Falls back to libkrun in software-emulation mode (slower; meant for CI / sandboxed CI runners)
 2. Same builder-microVM flow
 
 **Docker fallback (any platform):**
@@ -32,7 +32,7 @@ This single command detects your platform and handles everything. **Builds run i
 Inside the dev shell your project directory is bind-mounted at `/work`. Exit with `exit` or `Ctrl+D` -- background services keep running.
 
 :::note
-Release binaries download the builder image (~200MB) and dev microVM image on first run. From a source checkout, `mvmctl dev up` builds from the in-repo flakes; source builds must enable `contributor-bootstrap` for that local builder path.
+Release binaries download the builder image (~200MB) and dev microVM image on first run. From a source checkout, `mvmctl dev up` builds from the in-repo flakes.
 :::
 
 ## 2. Day-to-Day Commands

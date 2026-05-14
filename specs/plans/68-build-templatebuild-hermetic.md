@@ -1,7 +1,7 @@
 # Plan 68 — Hermetic live coverage for `build → TemplateBuild`
 
 > `mvmctl build` runs `nix build` against a flake — either via host Nix
-> or `MicrosandboxBuilderVm`. Either way the live test needs a real
+> or `LibkrunBuilderVm`. Either way the live test needs a real
 > Nix install or a running builder VM, which isn't tractable on a
 > generic CI runner. Plan 68 adds a `MVM_BUILD_STUB_OUTDIR` env-var
 > escape hatch that bypasses the build and uses a caller-supplied
@@ -22,7 +22,7 @@ mvmctl build --flake . --profile minimal --role worker
   ├── resolve --flake to a flake ref
   ├── dev_build(env, flake_ref, profile, mode)
   │     ├── (host Nix path)        → nix build … --print-out-paths
-  │     └── (microsandbox path)    → spawn builder VM, copy artifacts
+  │     └── (libkrun path)    → spawn builder VM, copy artifacts
   ├── parse build output → DevBuildResult { rootfs_path, … }
   ├── (optional) register slot in manifest registry
   └── audit_emit!(TemplateBuild, vm: revision_hash, "flake_ref={…} profile={…}")
@@ -41,7 +41,7 @@ paths set it.
 
 ### Already in `origin/main`
 
-- `dev_build` orchestrator + the `MicrosandboxBuilderVm` /
+- `dev_build` orchestrator + the `LibkrunBuilderVm` /
   host-Nix branches.
 - `audit_emit!` in `build.rs` (verify path — confirm location).
 - `AuditSandbox` fixture.
@@ -58,7 +58,7 @@ paths set it.
 **Goal**: when set, `dev_build` skips invocation of Nix / the
 builder VM and treats the env-var value as the build output
 directory. The directory must contain at least `rootfs.ext4` and
-`vmlinux` (matching what `MicrosandboxBuilderVm` extracts).
+`vmlinux` (matching what `LibkrunBuilderVm` extracts).
 
 **Action**:
 
@@ -143,7 +143,7 @@ W1 → W2 in a single PR (~150 lines total).
 
 ## Non-goals
 
-- **Real Nix coverage.** The microsandbox-builder + host-Nix paths
+- **Real Nix coverage.** The libkrun-builder + host-Nix paths
   are tested by `tests/smoke_e2e_boot.rs`; plan 68 only handles the
   audit emit + the orchestrator's env-var escape.
 - **Multi-profile builds.** The test exercises one profile; coverage

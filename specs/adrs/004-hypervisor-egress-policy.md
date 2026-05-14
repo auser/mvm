@@ -140,7 +140,7 @@ is small but the IP-pin/iptables-update plumbing has corner cases
    the macOS host").** L3 already follows this:
    `apply_network_policy` calls `run_in_vm_visible` which dispatches
    through `shell::run_in_vm` on macOS (executing inside the
-   microsandbox-managed guest per ADR-013) and runs natively on
+   libkrun-managed guest per ADR-013) and runs natively on
    Linux. L7 + DNS-pinning when added must follow the same pattern.
 
 6. **Per-template default policy is an ergonomic follow-up.**

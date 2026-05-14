@@ -2,7 +2,7 @@
 //! `crates/mvm-libkrun/examples/libkrun-smoke.rs`: validates that
 //! cloud-hypervisor boots a Nix-built Linux kernel + ext4 rootfs on a
 //! Linux host. This is the gate the `vmm-bootcheck` CI lane consumes
-//! to prove the Linux side of the microsandbox-free artifact pipeline.
+//! to prove the Linux side of the libkrun-free artifact pipeline.
 //!
 //! Run (Linux host with KVM available + `cloud-hypervisor` on PATH —
 //! `just setup-cloud-hypervisor` covers the install):
@@ -16,7 +16,7 @@
 //! matching the in-repo dev-image layout. Override per-path with
 //! `MVM_CH_BOOTCHECK_KERNEL` / `MVM_CH_BOOTCHECK_ROOTFS`. The CI
 //! workflow builds the dev-image flake on the runner (host Nix, no
-//! microsandbox) and points the env vars at the freshly built files.
+//! libkrun) and points the env vars at the freshly built files.
 //!
 //! Exit codes:
 //!

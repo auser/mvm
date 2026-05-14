@@ -2,7 +2,7 @@
 title: "ADR-032: Hosted-cloud invariants — no lock-in, metering precision, compliance-ready"
 status: Proposed
 date: 2026-05-07
-related: ADR-002 (security posture), ADR-029 (compliance), plan 60-mvm-microsandbox-migration
+related: ADR-002 (security posture), ADR-029 (compliance), plan 60-mvm-libkrun-migration
 ---
 
 ## Status

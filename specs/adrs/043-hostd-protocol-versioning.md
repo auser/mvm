@@ -98,6 +98,6 @@ If a field name on any of these changes, the fixture-set must regenerate. The ti
 
 - `crates/mvm-core/src/protocol/protocol.rs` — `PROTOCOL_VERSION` constant + bump-policy docstring.
 - `crates/mvm-core/src/protocol/protocol.rs` — `HostdRequest` / `HostdResponse` definitions.
-- `specs/plans/60-mvm-microsandbox-migration.md` Phase 8 — the cornerstone this ADR enables.
+- `specs/plans/60-mvm-libkrun-migration.md` Phase 8 — the cornerstone this ADR enables.
 - ADR-002 §"Out of scope" — host-trust assumptions; the wire format trusts the peer above the socket-perms layer.
 - ADR-041 — signed audited ExecutionPlan; the mvm-hostd lift consumes the plan after Phase 8 ships.

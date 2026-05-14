@@ -2,7 +2,7 @@
 title: "ADR-039: Runtime overlay composition — transparent dev-rich vs prod-slim images"
 status: Proposed
 date: 2026-05-08
-related: ADR-002 (security posture), ADR-013 (microsandbox/libkrun pivot), plan 61-runtime-overlay-composition-and-billing
+related: ADR-002 (security posture), ADR-013 (libkrun/libkrun pivot), plan 61-runtime-overlay-composition-and-billing
 ---
 
 ## Status

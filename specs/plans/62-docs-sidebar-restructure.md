@@ -216,7 +216,7 @@ sidebar: [
     items: [
       { label: "Development Guide", slug: "contributing/development" },
       { label: "ADR-001: Multi-Backend VMs", slug: "contributing/adr/001-multi-backend" },
-      { label: "ADR-013: microsandbox + libkrun + microvm.nix", slug: "contributing/adr/013-microsandbox-pivot" },
+      { label: "ADR-013: libkrun + libkrun + microvm.nix", slug: "contributing/adr/013-libkrun-pivot" },
     ],
   },
 ],
@@ -267,7 +267,7 @@ The implementer is done when **all** of the following are true:
 ## Hand-off note for the parallel migration session
 
 This plan is intentionally orthogonal to plan 60
-(microsandbox/libkrun migration). The only file overlap risk is
+(libkrun/libkrun migration). The only file overlap risk is
 `public/astro.config.mjs`, which plan 60 does not touch. If plan 60
 adds new ADRs to `public/src/content/docs/contributing/adr/`, the
 Contributing section in this sidebar will need those entries appended —

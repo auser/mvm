@@ -252,7 +252,7 @@ pub fn reflink_or_copy(src: &Path, dst: &Path) -> io::Result<CloneStrategy>;
 
 **Goal**: Add libkrun as a 4th backend in `AnyBackend`. Adds Intel Mac support (Apple VZ doesn't), removes Lima from the macOS runtime hot path entirely (libkrun is library-style), and provides a Linux native option with TCB comparable to Firecracker.
 
-**Why libkrun specifically**: Only VMM in our consideration set that runs on Linux (KVM), macOS Apple Silicon (Hypervisor.framework), **and macOS Intel** (Hypervisor.framework). Library-style — links into our binary — so no separate VMM process. Used in production by Microsandbox. Apache-2.0. **Passes our fork test**: comparable TCB to Firecracker, no Firecracker-excluded features.
+**Why libkrun specifically**: Only VMM in our consideration set that runs on Linux (KVM), macOS Apple Silicon (Hypervisor.framework), **and macOS Intel** (Hypervisor.framework). Library-style — links into our binary — so no separate VMM process. Used in production by Libkrun. Apache-2.0. **Passes our fork test**: comparable TCB to Firecracker, no Firecracker-excluded features.
 
 **Files**:
 - `crates/mvm-libkrun/` (new crate)

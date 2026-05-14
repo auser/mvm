@@ -23,8 +23,7 @@ chrono.workspace = true
 # Plan 72 W1: optional libkrun FFI dep for the in-tree builder VM
 # launcher (`libkrun_builder::LibkrunBuilderVm`). Gated by
 # `backends-builder-vm-libkrun`; default-off until Plan 72 W5
-# cutover flips polarity. Independent of `contributor-bootstrap`
-# (microsandbox); both can coexist during the W5 transition.
+# cutover flips polarity.
 mvm-libkrun = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
@@ -39,11 +38,7 @@ which = "6"
 tempfile.workspace = true
 
 [features]
-# Compatibility feature kept for older contributor commands. It no longer
-# enables the upstream Rust microsandbox crate because that crate vendors
-# SeaORM / SQLx database dependencies.
 default = []
-contributor-bootstrap = []
 # Plan 72 W1: libkrun-direct builder VM launcher (default-off
 # scaffolding through W4; default-on after W5 cutover). Pulls
 # the `mvm-libkrun` FFI crate which itself gates the underlying

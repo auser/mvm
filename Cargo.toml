@@ -174,15 +174,10 @@ tree-sitter-typescript = "0.23.2"
 
 # Internal crates.
 #
-# DRIFT-001 (Plan 31 Track A): the four crates that participate in the
-# `contributor-bootstrap` feature chain declare `default-features = false`
-# at the workspace level. This is required because member crates can't
-# override `default-features` on a workspace-inherited dep — Cargo accepts
-# the override only when the workspace entry already has the field. The
-# member crates that want the feature active opt back in via the
-# `contributor-bootstrap` feature chain (see `crates/mvm-cli/Cargo.toml`
-# and the root `[features]` block below). Library consumers (e.g. mvmd)
-# do `mvmctl = { default-features = false }` and pick up the off-state.
+# Crates with optional default features declare `default-features = false`
+# here because member crates can't override that on a workspace-inherited
+# dependency unless the workspace entry already carries it. The root binary
+# opts back into user-facing defaults through its own `[features]` block.
 mvm-core = { path = "crates/mvm-core", version = "0.14.0" }
 mvm-guest = { path = "crates/mvm-guest", version = "0.14.0" }
 mvm-build = { path = "crates/mvm-build", version = "0.14.0", default-features = false }
@@ -240,9 +235,6 @@ path = "src/main.rs"
 [dependencies]
 mvm-core.workspace = true
 mvm-security.workspace = true
-# `default-features = false` keeps optional backend affordances out of the
-# lean default binary. The old Rust microsandbox dependency is intentionally
-# absent because it vendors SeaORM / SQLx database crates.
 mvm = { workspace = true, default-features = false }
 mvm-backend = { workspace = true, default-features = false }
 mvm-build = { workspace = true, default-features = false }
@@ -287,12 +279,6 @@ which.workspace = true
 # host, so a default-features binary works everywhere. Library consumers
 # (mvmd) that want a lean closure build with `default-features = false`.
 default = ["backends-builder-vm-libkrun"]
-contributor-bootstrap = [
-    "mvm/contributor-bootstrap",
-    "mvm-backend/contributor-bootstrap",
-    "mvm-build/contributor-bootstrap",
-    "mvm-cli/contributor-bootstrap",
-]
 # Plan 72 W1: libkrun-backed builder VM. Now default-on (W5.B cutover).
 # Forwards into both `mvm-build` (carries the `LibkrunBuilderVm` impl)
 # and `mvm-cli` (carries the `ensure_dev_image` dispatch swap).

@@ -1,15 +1,15 @@
 ---
-title: "ADR-013: Pivot to microsandbox + libkrun + microvm.nix"
-description: Architecture Decision Record for the cross-platform microVM pivot — microsandbox as the macOS/Windows execution path, Firecracker preferred on Linux, microvm.nix as the Nix foundation.
+title: "ADR-013: Pivot to libkrun + libkrun + microvm.nix"
+description: Architecture Decision Record for the cross-platform microVM pivot — libkrun as the macOS/Windows execution path, Firecracker preferred on Linux, microvm.nix as the Nix foundation.
 ---
 
 ## Status
 
-Proposed. Implementation tracked in [Plan 60](https://github.com/tinylabscom/mvm/blob/main/specs/plans/60-mvm-microsandbox-migration.md). Phase 0 + Phase 1 deliver the build/exec pivot; subsequent phases compose on top.
+Proposed. Implementation tracked in [Plan 60](https://github.com/tinylabscom/mvm/blob/main/specs/plans/60-mvm-libkrun-migration.md). Phase 0 + Phase 1 deliver the build/exec pivot; subsequent phases compose on top.
 
 ## Invariant — host does not need Nix
 
-`mvmctl` runs on a stock host. **Nix is not a prerequisite.** On first build, mvm bootstraps a small Linux builder microVM (microsandbox-backed), runs `nix build` inside it, and extracts the resulting rootfs to the host. The runtime path stays Nix-free; the builder path keeps Nix inside the sandbox where it belongs.
+`mvmctl` runs on a stock host. **Nix is not a prerequisite.** On first build, mvm bootstraps a small Linux builder microVM (libkrun-backed), runs `nix build` inside it, and extracts the resulting rootfs to the host. The runtime path stays Nix-free; the builder path keeps Nix inside the sandbox where it belongs.
 
 Host-side Nix is an opt-in power-user path:
 
@@ -17,7 +17,7 @@ Host-side Nix is an opt-in power-user path:
 - users with [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) already configured (mvm detects and uses it),
 - users with a remote `nix-daemon` URL.
 
-The full design is in [§"Linux builder via microsandbox (no Lima)"](#linux-builder-via-microsandbox-no-lima) below.
+The full design is in [§"Linux builder via libkrun (no Lima)"](#linux-builder-via-libkrun-no-lima) below.
 
 > **Current status (2026-05-08):** the bootstrap is in flight on the
 > `feat/micro` branch as part of W6.x. Until it lands, contributors
@@ -36,62 +36,62 @@ The previous iteration of mvm used Lima as the macOS dev-VM hop and Firecracker 
 
 Three coupled choices:
 
-1. **microsandbox** (Apache-2.0, libkrun-backed) becomes the **builder** and the **macOS/Windows execution path**. libkrun gives us native Hypervisor.framework on macOS and KVM on Linux without a wrapping Lima VM.
+1. **libkrun** (Apache-2.0, libkrun-backed) becomes the **builder** and the **macOS/Windows execution path**. libkrun gives us native Hypervisor.framework on macOS and KVM on Linux without a wrapping Lima VM.
 2. **Firecracker** stays as the preferred Linux production execution path because of its smaller attack surface, faster cold boot, and existing security work (jailer, dm-verity, seccomp tier).
 3. **microvm.nix** (MIT) becomes the Nix-flake foundation for microVM image generation. It abstracts Firecracker / Cloud Hypervisor / QEMU / crosvm / kvmtool / stratovirt as a NixOS module — adding a new backend later is a config change, not a kernel rewrite.
 
-**Lima is dropped entirely.** The macOS path is microsandbox-direct; no intermediate Linux VM.
+**Lima is dropped entirely.** The macOS path is libkrun-direct; no intermediate Linux VM.
 
 ### Backend selection ladder
 
 ```
 1. KVM available           → Firecracker (Linux production target)
-2. has_microsandbox()      → MicrosandboxBackend (macOS + non-KVM Linux)
+2. has_libkrun()      → LibkrunBackend (macOS + non-KVM Linux)
 3. macOS Container         → AppleContainerBackend (legacy; scheduled for removal)
 4. raw libkrun             → LibkrunBackend (legacy; scheduled for removal)
 5. Docker                  → DockerBackend (Tier 3 fallback; banner emitted)
 6. Firecracker via Lima    → legacy macOS fallback
 ```
 
-`mvmctl run --hypervisor microsandbox <flake>` always selects microsandbox explicitly regardless of the host's KVM status.
+`mvmctl run --hypervisor libkrun <flake>` always selects libkrun explicitly regardless of the host's KVM status.
 
-## Linux builder via microsandbox (no Lima)
+## Linux builder via libkrun (no Lima)
 
-macOS hosts can't `nix build` Linux derivations natively. The previous iteration solved that with a Lima VM as the Linux builder; this iteration drops Lima entirely. The replacement: **bootstrap a Linux builder inside microsandbox itself**.
+macOS hosts can't `nix build` Linux derivations natively. The previous iteration solved that with a Lima VM as the Linux builder; this iteration drops Lima entirely. The replacement: **bootstrap a Linux builder inside libkrun itself**.
 
 On a host without a Linux builder configured, `mvmctl build` does:
 
 1. Detects the gap — host has no Nix, or has Nix that can't build Linux derivations.
 2. Pulls a small, pinned Nix-bearing image — once, cached in `~/.cache/mvm/builder-image/`.
-3. Spawns a microsandbox sandbox from the image with the user's flake source bind-mounted as `/work`, the host's `/nix/store` shared in if present, and a sane PATH.
+3. Spawns a libkrun sandbox from the image with the user's flake source bind-mounted as `/work`, the host's `/nix/store` shared in if present, and a sane PATH.
 4. Runs `nix build .#default` inside the sandbox.
 5. Extracts the rootfs back to the host.
-6. Hands it to the runtime path (which uses microsandbox's `RootfsSource::DiskImage` per the OCI non-goal — the *runtime* never pulls OCI).
+6. Hands it to the runtime path (which uses libkrun's `RootfsSource::DiskImage` per the OCI non-goal — the *runtime* never pulls OCI).
 
 **Why this is consistent with the OCI non-goal.** The non-goal banned OCI from the **runtime/boot path** — where user workloads run, where reproducibility, offline-by-default, and no-registry-trust matter. The **builder** lives in a different trust zone: it has to fetch caches, talk to the network, and run arbitrary `nix build` derivations. Builder VMs and runtime VMs are governed by different policies; using OCI for the builder doesn't compromise the runtime's invariants.
 
 **Cache reuse.** When the host has a Nix install, its `/nix/store` is shared into the builder sandbox. Builds populate the host store; subsequent builds reuse the same cached derivations. This is the same trick `nix-darwin`'s `linux-builder` uses — the difference is mvm doesn't require the user to have configured `nix-darwin`.
 
-**Detection and fallback.** If the host already has a working Linux builder (`nix-darwin`'s `linux-builder`, or a remote `nix-daemon` URL), mvm detects it and uses it instead — the microsandbox-bootstrapped path is the *zero-config default*, not a forced override. Detection probes whether host Nix can realize a Linux derivation; success → host builds; failure → microsandbox bootstrap.
+**Detection and fallback.** If the host already has a working Linux builder (`nix-darwin`'s `linux-builder`, or a remote `nix-daemon` URL), mvm detects it and uses it instead — the libkrun-bootstrapped path is the *zero-config default*, not a forced override. Detection probes whether host Nix can realize a Linux derivation; success → host builds; failure → libkrun bootstrap.
 
-**This replaces every previous reference to "configure `nix-darwin`'s `linux-builder`" in the docs.** Users with an existing builder keep using it; everyone else gets the microsandbox-bootstrapped path with no host-side configuration.
+**This replaces every previous reference to "configure `nix-darwin`'s `linux-builder`" in the docs.** Users with an existing builder keep using it; everyone else gets the libkrun-bootstrapped path with no host-side configuration.
 
 ## Non-goal: OCI / container images
 
-**mvm is microVMs, not containers.** Even though microsandbox's API exposes both — `RootfsSource::Oci(reference)` for OCI image pulls and `RootfsSource::DiskImage { path, format, fstype }` for raw disk images — we deliberately use **only the `DiskImage` path**.
+**mvm is microVMs, not containers.** Even though libkrun's API exposes both — `RootfsSource::Oci(reference)` for OCI image pulls and `RootfsSource::DiskImage { path, format, fstype }` for raw disk images — we deliberately use **only the `DiskImage` path**.
 
 Why this is a stated invariant, not a default:
 
 1. **Architectural commitment.** The project's value prop is microVM isolation backed by Nix-built rootfs images. OCI brings registry pulls, layered images, image index resolution, and a different trust model — none of which we want in the trust boundary.
 2. **Reproducibility.** Nix-built rootfs images are byte-reproducible given the same flake inputs (gated in CI). OCI images resolve through a registry, can be re-tagged, and don't carry the same guarantees by construction.
 3. **Trust boundary minimalism.** Pulling from an OCI registry adds an external network dependency to the boot path. The microVM path is offline-by-default once the rootfs is built.
-4. **Runtime path consistency.** The bridge between our `.ext4` rootfs files and microsandbox's `.disk()` builder (a sibling `.raw` hard-link with explicit `fstype("ext4")`) keeps the disk path entirely host-local. No registry, no auth, no pull cache.
+4. **Runtime path consistency.** The bridge between our `.ext4` rootfs files and libkrun's `.disk()` builder (a sibling `.raw` hard-link with explicit `fstype("ext4")`) keeps the disk path entirely host-local. No registry, no auth, no pull cache.
 
 ## Consequences
 
 ### Positive
 
-- Single fewer hop on macOS (`host → microsandbox → guest`) — faster boot, cleaner UX.
+- Single fewer hop on macOS (`host → libkrun → guest`) — faster boot, cleaner UX.
 - microvm.nix gives multi-hypervisor portability for free.
 - Builder pipeline runs on every host class.
 - Reduced surface: no more Lima-specific code paths.
@@ -99,7 +99,7 @@ Why this is a stated invariant, not a default:
 ### Negative
 
 - Adds a third-party dep (microvm.nix) to the build trust boundary — pinned by hash and CI-audited (`xtask audit-flake`).
-- Some Linux-specific guarantees (dm-verity at boot, seccomp tier "strict") only hold on the Firecracker path. The microsandbox path uses image-hash-on-load + HMAC chain instead. Documented in the per-backend tier matrix in [ADR-002](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/002-microvm-security-posture.md).
+- Some Linux-specific guarantees (dm-verity at boot, seccomp tier "strict") only hold on the Firecracker path. The libkrun path uses image-hash-on-load + HMAC chain instead. Documented in the per-backend tier matrix in [ADR-002](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/002-microvm-security-posture.md).
 
 ### Fallback (named explicitly)
 
@@ -114,12 +114,12 @@ If a microvm.nix per-bump audit (`xtask audit-flake`) surfaces a security regres
 ## Threat model impact
 
 - **microvm.nix** as a third-party dep widens the supply-chain surface. Mitigated by hash-pinning in `flake.lock`, CI re-audit on every bump, and reproducibility double-build.
-- **microsandbox** is itself a third-party dep. Same mitigation.
-- The per-backend tier matrix from ADR-002 is updated: Firecracker tier remains "strict"; microsandbox tier is "standard" until parity work lands (post-Phase 6).
+- **libkrun** is itself a third-party dep. Same mitigation.
+- The per-backend tier matrix from ADR-002 is updated: Firecracker tier remains "strict"; libkrun tier is "standard" until parity work lands (post-Phase 6).
 
 ## Related
 
-- [Plan 60: mvm-microsandbox migration](https://github.com/tinylabscom/mvm/blob/main/specs/plans/60-mvm-microsandbox-migration.md) — full implementation roadmap
+- [Plan 60: mvm-libkrun migration](https://github.com/tinylabscom/mvm/blob/main/specs/plans/60-mvm-libkrun-migration.md) — full implementation roadmap
 - [ADR-002: microVM security posture](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/002-microvm-security-posture.md) — per-backend tier matrix
-- [ADR-014: VmBackend single trait](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/014-vmbackend-single-trait.md) — the trait surface microsandbox implements
+- [ADR-014: VmBackend single trait](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/014-vmbackend-single-trait.md) — the trait surface libkrun implements
 - [ADR-031: Cross-platform strategy](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/031-cross-platform-strategy.md) — Linux native, macOS native, Windows Tauri-only
