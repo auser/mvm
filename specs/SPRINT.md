@@ -1637,6 +1637,9 @@ Shipped:
   one `VM:/absolute/path` endpoint, a default 16 MiB cap, no overwrite unless
   `--force`, guest-side path-policy validation, and `VmFileCopy` audit without
   host paths or file contents.
+- `mvmctl cp --json` emits a redacted machine-readable copy summary with
+  direction, VM name, guest path, byte count, and effective copy options; host
+  paths and file contents are omitted.
 - CLI reference and parser tests cover the new command and profile surface.
 
 ### Sprint 52 success criteria

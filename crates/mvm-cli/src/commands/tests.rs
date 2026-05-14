@@ -21,9 +21,9 @@ use config::ConfigAction;
 use up::RunParams;
 
 use super::shared::{
-    clap_flake_ref, clap_port_spec, clap_vm_name, clap_volume_spec, env_vars_to_drive_file,
-    parse_port_spec, parse_port_specs, parse_volume_spec, ports_to_drive_file,
-    read_dir_to_drive_files, resolve_flake_ref, resolve_network_policy, VolumeSpec,
+    VolumeSpec, clap_flake_ref, clap_port_spec, clap_vm_name, clap_volume_spec,
+    env_vars_to_drive_file, parse_port_spec, parse_port_specs, parse_volume_spec,
+    ports_to_drive_file, read_dir_to_drive_files, resolve_flake_ref, resolve_network_policy,
 };
 
 #[test]
@@ -1521,12 +1521,26 @@ fn cp_host_to_guest_parses() {
             force,
             create_parents,
             max_bytes,
+            json,
         }) => {
             assert_eq!(source, "./host.txt");
             assert_eq!(destination, "vm1:/tmp/host.txt");
             assert!(force);
             assert!(create_parents);
             assert_eq!(max_bytes, 1024);
+            assert!(!json);
+        }
+        _ => panic!("Expected Cp command"),
+    }
+}
+
+#[test]
+fn cp_json_flag_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "cp", "--json", "./host.txt", "vm1:/tmp/host.txt"])
+        .expect("parse");
+    match cli.command {
+        Commands::Cp(cp::Args { json, .. }) => {
+            assert!(json);
         }
         _ => panic!("Expected Cp command"),
     }
@@ -1543,12 +1557,14 @@ fn cp_guest_to_host_defaults_parse() {
             force,
             create_parents,
             max_bytes,
+            json,
         }) => {
             assert_eq!(source, "vm1:/tmp/out.txt");
             assert_eq!(destination, "./out.txt");
             assert!(!force);
             assert!(!create_parents);
             assert_eq!(max_bytes, 16 * 1024 * 1024);
+            assert!(!json);
         }
         _ => panic!("Expected Cp command"),
     }

@@ -226,11 +226,15 @@ host registry records.
 | `mvmctl cp --force <src> <dst>` | Overwrite an existing destination |
 | `mvmctl cp --create-parents <src> <dst>` | Create destination parent directories |
 | `mvmctl cp --max-bytes <n> <src> <dst>` | Refuse copies larger than the byte cap. Default: 16 MiB |
+| `mvmctl cp --json <src> <dst>` | Print a machine-readable copy summary without host paths or file contents |
 
 Exactly one endpoint must use `VM:/absolute/path` form. Guest paths are
 validated by the guest agent's filesystem policy before any read or write. Host
 paths and file contents are not written to audit logs; successful copies emit
 `VmFileCopy` with direction, guest path, and byte count.
+`--json` follows the same redaction rule: the summary includes direction, VM
+name, guest path, copied byte count, and effective copy options, but not the
+host endpoint.
 
 `mvmctl exec` boots a fresh transient microVM, runs a single command, and tears it
 down on exit — like `cco` or `docker run --rm`, but with a Firecracker microVM
