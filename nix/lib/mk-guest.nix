@@ -390,6 +390,13 @@ let
     # exec it. Mode 0555 so the agent can't rewrite itself; ownership
     # is the build-time user (Nix sandbox has no root) — Phase 6 W2.2
     # binds /etc + /usr read-only at boot to make this load-bearing.
+    #
+    # mkdir before the cp: when `packages = []` the directory-creation
+    # block below is a no-op, so /usr/local/bin doesn't exist yet and
+    # the cp fails with "No such file or directory". That was the
+    # latent bug that broke release.yml's dev-image lane and the
+    # ch-linux bootcheck before this fix.
+    mkdir -p "$out/usr/local/bin"
     cp ${agentBinary} "$out/usr/local/bin/mvm-guest-agent"
     chmod 0555 "$out/usr/local/bin/mvm-guest-agent"
 
