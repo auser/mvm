@@ -34,6 +34,10 @@ plan 25 sequences the work into six independently-shippable workstreams.
 | MSRV             | 1.85                     |
 | Binary           | `mvmctl`                 |
 
+Recent maintenance:
+
+- [x] `mvmctl dev status` now reports the same Apple Container dev image paths that `dev up` boots (`~/.mvm/dev/current`, versioned prebuilts, or launchd-provided paths), instead of only checking the legacy cache location.
+
 ## In-flight workstreams
 
 ### W1 — Cheap defaults that are wrong today  ✅ shipped
