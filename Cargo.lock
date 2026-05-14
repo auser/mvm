@@ -4157,6 +4157,7 @@ dependencies = [
  "microsandbox",
  "mvm-core",
  "mvm-guest",
+ "mvm-libkrun",
  "serde",
  "serde_json",
  "sha2 0.10.9",
