@@ -384,3 +384,134 @@ jobs:
       - name: Clippy mvm-libkrun --features libkrun-sys --all-targets
         if: steps.filter.outputs.libkrun == 'true' || github.ref == 'refs/heads/main'
         run: cargo clippy -p mvm-libkrun --features libkrun-sys --all-targets -- -D warnings
+
+  # ── Lane: cloud-hypervisor (Linux x86_64, paths-gated) ──
+  #
+  # Companion to `libkrun-macos`: validates the Linux half of the
+  # cross-platform VMM matrix. ubuntu-latest exposes /dev/kvm (with
+  # a chmod widening for the runner user), so cloud-hypervisor can
+  # actually boot a guest — unlike libkrun-macos, which builds + tests
+  # but can't reach `krun_start_enter` because GitHub's macOS VMs
+  # don't allow nested HVF.
+  #
+  # What this lane proves:
+  #   - cloud-hypervisor boots a Nix-built Linux kernel + ext4 rootfs
+  #     on a real KVM host (Linux side of "is the VMM viable?").
+  #   - The dev-image flake at `nix/images/builder` builds via host
+  #     Nix on a fresh runner with NO microsandbox involvement —
+  #     proving the artifact pipeline doesn't need microsandbox.
+  #     Together with the libkrun-macos lane, the two-lane gate
+  #     covers the empirical premise behind retiring microsandbox.
+  #
+  # KernelBooted (kernel reaches boot diagnostics but rootfs/init
+  # fails) counts as PASS by default — the gate is "VMM viable",
+  # not "rootfs complete". Set MVM_CH_BOOTCHECK_STRICT=1 to flip.
+  #
+  # Security: only workflow-internal expressions used in `run:` blocks
+  # (`steps.filter.outputs.*`, `github.ref`, `github.workspace`,
+  # `hashFiles(...)`). No user-controlled inputs like pr-title or
+  # head_ref reach a shell.
+  ch-linux:
+    name: cloud-hypervisor (Linux x86_64)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect ch-touching paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            ch:
+              - 'crates/mvm-backend/src/cloud_hypervisor.rs'
+              - 'crates/mvm-backend/src/ch_runtime.rs'
+              - 'crates/mvm-backend/examples/ch-bootcheck.rs'
+              - 'crates/mvm-backend/Cargo.toml'
+              - 'nix/images/builder/**'
+              - 'nix/lib/**'
+              - 'specs/plans/57-libkrun-spike.md'
+              - 'specs/plans/72-builder-vm-via-libkrun.md'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Install Nix
+        if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Install cloud-hypervisor
+        if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
+        # Pin to a known release — auto-tracking `latest` is how this
+        # lane would surprise-break on an unrelated CH cut.
+        env:
+          CH_VERSION: v40.0
+        run: |
+          set -euo pipefail
+          curl -fL -o cloud-hypervisor \
+            "https://github.com/cloud-hypervisor/cloud-hypervisor/releases/download/${CH_VERSION}/cloud-hypervisor-static"
+          chmod +x cloud-hypervisor
+          sudo install -m 0755 cloud-hypervisor /usr/local/bin/cloud-hypervisor
+          cloud-hypervisor --version
+
+      - name: Grant /dev/kvm access for the job
+        if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
+        # ubuntu-latest's /dev/kvm is root:kvm 0660 by default and the
+        # runner user isn't in the kvm group, so CH would get EACCES
+        # from hv_vm_create. `sudo chmod 666` is the canonical GHA fix;
+        # the runner is ephemeral so the looser mode is confined to
+        # this job's VM lifetime.
+        run: |
+          set -euo pipefail
+          if [ ! -e /dev/kvm ]; then
+            echo "::error::/dev/kvm missing on this runner — cloud-hypervisor can't run." >&2
+            exit 1
+          fi
+          sudo chmod 666 /dev/kvm
+          ls -la /dev/kvm
+
+      - name: Cache cargo
+        if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-ch-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-ch-
+
+      - name: Build dev image via host Nix (no microsandbox)
+        if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
+        # Mirrors release.yml's dev-image job for x86_64 — this is the
+        # load-bearing existence proof that the artifact pipeline does
+        # not require microsandbox. Output gets staged at
+        # $GITHUB_WORKSPACE/ci-artifacts/{vmlinux, rootfs.ext4}; the
+        # next step points the bootcheck at those paths via env vars.
+        run: |
+          set -euo pipefail
+          nix build "./nix/images/builder#packages.x86_64-linux.default" \
+            --no-link --print-out-paths > /tmp/store-path.txt
+          STORE_PATH=$(head -1 /tmp/store-path.txt)
+          mkdir -p ci-artifacts
+          cp "$STORE_PATH/vmlinux"     ci-artifacts/vmlinux
+          cp "$STORE_PATH/rootfs.ext4" ci-artifacts/rootfs.ext4
+          ls -la ci-artifacts/
+
+      - name: Build ch-bootcheck example
+        if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
+        run: cargo build --example ch-bootcheck -p mvm-backend
+
+      - name: Run ch-bootcheck
+        if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
+        # Outcome legend (mirrored in the example's --help):
+        #   0  — PASS (VMM viable; kernel booted or reached userspace)
+        #   1  — strict-mode partial (gate not flipped here)
+        #   2  — FAIL (no kernel output, VMM rejected boot)
+        #   74 — cloud-hypervisor not on PATH (install step failed)
+        #   75 — artifacts missing (build-image step failed silently)
+        env:
+          MVM_CH_BOOTCHECK_KERNEL: ${{ github.workspace }}/ci-artifacts/vmlinux
+          MVM_CH_BOOTCHECK_ROOTFS: ${{ github.workspace }}/ci-artifacts/rootfs.ext4
+        run: cargo run --example ch-bootcheck -p mvm-backend
