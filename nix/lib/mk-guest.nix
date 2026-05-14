@@ -78,6 +78,15 @@ in
 , dev            ? null
 , uids           ? null   # { agent = <int>; entrypoint = <int>; } — see below
 , extraFiles     ? { }
+# Optional kernel package. When set, mkGuest copies its module
+# tree (`/lib/modules/<kver>/`) into the rootfs and `/init` runs
+# `modprobe vmw_vsock_virtio_transport` before forking the agent.
+# Required when the kernel ships AF_VSOCK as a module (the default
+# nixpkgs `linuxPackages.kernel` config). Without it,
+# `mvm-guest-agent`'s `socket(AF_VSOCK, …)` returns EAFNOSUPPORT and
+# every host-side surface (`mvmctl console`, `dev shell`, `build`)
+# goes dark on a guest booted from that kernel.
+, kernel         ? null
 }:
 let
   entrypointKind = classifyEntrypoint entrypoint;
@@ -206,6 +215,18 @@ let
     # mountpoints instead.
     /bin/busybox mount -t tmpfs -o mode=1777,nosuid,nodev tmpfs /tmp
     /bin/busybox mount -t tmpfs -o mode=0755,nosuid,nodev tmpfs /run
+
+    # Stage 2.25 — vsock kernel modules. Stock nixpkgs kernel ships
+    # AF_VSOCK as `=m`; without modprobe the agent's
+    # `socket(AF_VSOCK, …)` returns EAFNOSUPPORT. modprobe-ing
+    # `vmw_vsock_virtio_transport` pulls in `vsock` +
+    # `vmw_vsock_virtio_transport_common` via modules.dep. Silently
+    # skipped when `/lib/modules` is absent — e.g. on a future kernel
+    # that ships VSOCK=y, or when `mkGuest` was called without the
+    # `kernel` argument.
+    if [ -d /lib/modules ]; then
+      /bin/busybox modprobe vmw_vsock_virtio_transport 2>/dev/null || true
+    fi
 
     # Stage 2.5 — guest agent supervisor. Fork the agent into
     # the background under its own uid before we drop to the
@@ -399,6 +420,46 @@ let
     mkdir -p "$out/usr/local/bin"
     cp ${agentBinary} "$out/usr/local/bin/mvm-guest-agent"
     chmod 0555 "$out/usr/local/bin/mvm-guest-agent"
+
+    # Kernel modules. `/init` `modprobe`s vsock before forking the
+    # agent (default nixpkgs kernel ships AF_VSOCK as `=m`); without
+    # `/lib/modules/<kver>/` in the rootfs, modprobe has nothing to
+    # load and the agent fails to open AF_VSOCK.
+    #
+    # nixpkgs splits the aarch64-linux kernel into two derivations:
+    # `kernel` ships `Image` + `System.map` + `dtbs/` (no modules),
+    # while `kernel.modules` owns the `lib/modules/<kver>/` tree
+    # (built with `INSTALL_MOD_PATH=$out`). Probe `kernel.modules`
+    # first (modern nixpkgs), fall back to `kernel`'s own `$out` for
+    # single-output kernel packages microvm.nix wraps.
+    ${lib.optionalString (kernel != null) (
+      let
+        candidates =
+          (if kernel ? modules then [ kernel.modules ] else [ ])
+          ++ [ kernel ];
+        candidateRefs = lib.concatMapStringsSep " " (c: ''"${c}"'') candidates;
+      in ''
+        for cand in ${candidateRefs}; do
+          if [ -d "$cand/lib/modules" ]; then
+            shopt -s nullglob
+            kmod_dirs=("$cand"/lib/modules/*)
+            shopt -u nullglob
+            for src in "''${kmod_dirs[@]}"; do
+              kver=$(${pkgs.coreutils}/bin/basename "$src")
+              mkdir -p "$out/lib/modules/$kver"
+              cp -a --reflink=auto "$src/." "$out/lib/modules/$kver/"
+              # Drop build-machine `source`/`build` symlinks that
+              # point into host nix-store dev outputs the guest
+              # can't resolve. modprobe warns on every invocation
+              # otherwise; the guest never reads kernel headers.
+              rm -f "$out/lib/modules/$kver/source" \
+                    "$out/lib/modules/$kver/build"
+            done
+            break
+          fi
+        done
+      ''
+    )}
 
     # Extra user-supplied files.
     ${extraFilePopulation}

@@ -114,12 +114,19 @@
       mkBuilderImage = system:
         let
           pkgs = import nixpkgs { inherit system; };
+          # Stock nixpkgs kernel. Pass it to `mkGuest` so the rootfs
+          # ships its module tree (`/lib/modules/<kver>/`) and `/init`
+          # can `modprobe vmw_vsock_virtio_transport` before the agent
+          # forks. Without modules the agent fails to open AF_VSOCK
+          # (nixpkgs default config has VSOCK=m) and every host-side
+          # surface (`mvmctl console`, `dev shell`, `build`) goes dark.
+          kernelPkg = pkgs.linuxPackages.kernel;
           rootfs = (libFor { inherit system; }).mkGuest {
             name = "mvm-dev";
             entrypoint.shell = "/bin/sh";
             packages = builderPackages pkgs;
+            kernel = kernelPkg;
           };
-          kernelPkg = pkgs.linuxPackages.kernel;
           kernelFile =
             if pkgs.stdenv.hostPlatform.isAarch64
             then "Image"
