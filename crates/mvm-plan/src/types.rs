@@ -272,3 +272,89 @@ pub enum NonceParseError {
     #[error("nonce hex must be lowercase 0-9a-f, found {ch:?}")]
     NonHex { ch: char },
 }
+
+/// Pin from an `ExecutionPlan` to an application-dependencies volume.
+///
+/// Plan 73 Followup A / ADR-047 security claim 9. When a workload
+/// mounts a deps volume at `/app/.venv` (Python) or
+/// `/app/node_modules` (Node), the plan binds the on-disk volume's
+/// deterministic hashes here so the supervisor's admission gate can
+/// re-verify them before launch.
+///
+/// Two hashes are pinned:
+///
+/// 1. **`volume_hash`** — the canonical
+///    `sha256(content_sha256 || canonical(meta.json))` produced by
+///    `mvm_sdk::compile::deps_audit::seal_volume`. This is the value
+///    used as the volume directory name on disk
+///    (`~/.mvm/volumes/deps/<volume_hash>/`).
+/// 2. **`manifest_sha256`** — the SHA-256 of the canonical
+///    `meta.json` bytes. Pinned separately so an attacker who
+///    re-derives a volume hash for tampered content (which they
+///    can't, modulo a SHA-256 break) still fails the second check.
+///    Belt-and-suspenders against future hash-derivation changes.
+///
+/// Both are 64-character lowercase hex strings. The
+/// `TryFrom<String>` impl rejects shorter/longer/uppercase/non-hex
+/// inputs so a forged plan can't sneak a malformed pin past the
+/// envelope's `deny_unknown_fields` gate.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct DepsVolumeBinding {
+    /// Lowercase hex SHA-256, 64 chars. The volume directory name
+    /// on disk under `~/.mvm/volumes/deps/`.
+    #[serde(deserialize_with = "deserialize_sha256_hex")]
+    pub volume_hash: String,
+    /// Lowercase hex SHA-256, 64 chars. The hash of the canonical
+    /// `meta.json` bytes inside the volume.
+    #[serde(deserialize_with = "deserialize_sha256_hex")]
+    pub manifest_sha256: String,
+}
+
+impl DepsVolumeBinding {
+    /// Construct a binding. Returns `Err` if either hash is not
+    /// 64 lowercase hex characters.
+    pub fn new(
+        volume_hash: impl Into<String>,
+        manifest_sha256: impl Into<String>,
+    ) -> Result<Self, DepsVolumeBindingError> {
+        let volume_hash = validate_sha256_hex(volume_hash.into())?;
+        let manifest_sha256 = validate_sha256_hex(manifest_sha256.into())?;
+        Ok(Self {
+            volume_hash,
+            manifest_sha256,
+        })
+    }
+}
+
+/// Validation error for [`DepsVolumeBinding`] hash fields. Surfaces
+/// through the `TryFrom<String>` impl on each field so a malformed
+/// pin is rejected at serde deserialise time, before the supervisor
+/// inspects the plan.
+#[derive(Debug, thiserror::Error, PartialEq, Eq)]
+pub enum DepsVolumeBindingError {
+    #[error("deps-volume hash must be exactly 64 chars, got {len}")]
+    WrongLength { len: usize },
+    #[error("deps-volume hash must be lowercase 0-9a-f, found {ch:?}")]
+    NonHex { ch: char },
+}
+
+fn validate_sha256_hex(s: String) -> Result<String, DepsVolumeBindingError> {
+    if s.len() != 64 {
+        return Err(DepsVolumeBindingError::WrongLength { len: s.len() });
+    }
+    for c in s.chars() {
+        if !matches!(c, '0'..='9' | 'a'..='f') {
+            return Err(DepsVolumeBindingError::NonHex { ch: c });
+        }
+    }
+    Ok(s)
+}
+
+fn deserialize_sha256_hex<'de, D>(d: D) -> Result<String, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    let s = String::deserialize(d)?;
+    validate_sha256_hex(s).map_err(serde::de::Error::custom)
+}

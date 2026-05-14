@@ -12,6 +12,11 @@ authors.workspace = true
 mvm-core.workspace = true
 mvm-plan.workspace = true
 mvm-policy.workspace = true
+# Plan 73 Followup A — admission gate calls
+# `mvm_sdk::compile::deps_audit::verify_sealed_volume` to re-derive
+# the on-disk volume hash and compare it against the plan's pinned
+# `DepsVolumeBinding`. Security claim 9.
+mvm-sdk.workspace = true
 # `mvm` provides the `VmNameRegistry` the TTL reaper walks.
 # Heavy dep, but the supervisor's eventual job is to drive runtime
 # operations anyway, so we'd be importing it shortly regardless.
