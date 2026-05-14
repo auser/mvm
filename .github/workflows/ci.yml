@@ -295,3 +295,92 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+  # ── Lane: libkrun (macOS Apple Silicon, paths-gated) ──
+  # macos-latest is ~10x the per-minute cost of ubuntu-latest (ADR-038),
+  # so this lane is path-gated: it only spins up the heavy steps when a
+  # PR touches libkrun code or its direct consumers, or on pushes to
+  # main where the cost is worth catching post-merge drift.
+  #
+  # What it validates that the Linux lanes don't:
+  #   - bindgen + libclang against the Homebrew libkrun.h is wired
+  #     correctly (the `libkrun-sys` feature compiles + links).
+  #   - the `mvm-libkrun-supervisor` binary builds.
+  #   - the sys::Context::* FFI round-trips against the real
+  #     libkrun.dylib (8 wrapper unit tests in mvm-libkrun).
+  #   - LibkrunBackend's spawn / PID-file / signal logic compiles
+  #     and its non-FFI unit tests pass.
+  #
+  # End-to-end VM boot (plan 57 W4.3) is out of scope here - GitHub
+  # macOS runners don't expose Hypervisor.framework to user-mode
+  # processes, so `krun_start_enter` can't actually create a guest.
+  # The lane catches everything before that boundary.
+  libkrun-macos:
+    name: libkrun (macOS Apple Silicon)
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect libkrun-touching paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            libkrun:
+              - 'crates/mvm-libkrun/**'
+              - 'crates/mvm-backend/src/libkrun.rs'
+              - 'crates/mvm-backend/Cargo.toml'
+              - 'crates/mvm-providers/src/apple_container/**'
+              - 'specs/plans/57-libkrun-spike.md'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.libkrun == 'true' || github.ref == 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+
+      - name: Install libkrun
+        if: steps.filter.outputs.libkrun == 'true' || github.ref == 'refs/heads/main'
+        # `libkrun` ships from Sergio Lopez's `slp/krun` Homebrew tap
+        # (not core homebrew). The bottle puts `libkrun.h` +
+        # `libkrun.dylib` under `/opt/homebrew/{include,lib}` on Apple
+        # Silicon - exactly the layout `crates/mvm-libkrun/build.rs`
+        # probes for.
+        run: |
+          brew tap slp/krun
+          brew install libkrun
+
+      - name: Cache cargo
+        if: steps.filter.outputs.libkrun == 'true' || github.ref == 'refs/heads/main'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-libkrun-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-libkrun-
+
+      - name: Default-feature workspace build (no libkrun-sys)
+        if: steps.filter.outputs.libkrun == 'true' || github.ref == 'refs/heads/main'
+        # Sanity: the fallback path (no libkrun-sys) keeps compiling.
+        # Mirrors how every other workspace consumer that touches
+        # mvm-libkrun builds.
+        run: cargo build -p mvm-libkrun -p mvm-backend
+
+      - name: Build mvm-libkrun with libkrun-sys (lib + bin + examples)
+        if: steps.filter.outputs.libkrun == 'true' || github.ref == 'refs/heads/main'
+        run: cargo build -p mvm-libkrun --features libkrun-sys --all-targets
+
+      - name: Test mvm-libkrun with libkrun-sys
+        if: steps.filter.outputs.libkrun == 'true' || github.ref == 'refs/heads/main'
+        run: cargo test -p mvm-libkrun --features libkrun-sys
+
+      - name: Test mvm-backend (libkrun module)
+        if: steps.filter.outputs.libkrun == 'true' || github.ref == 'refs/heads/main'
+        run: cargo test -p mvm-backend libkrun
+
+      - name: Clippy mvm-libkrun --features libkrun-sys --all-targets
+        if: steps.filter.outputs.libkrun == 'true' || github.ref == 'refs/heads/main'
+        run: cargo clippy -p mvm-libkrun --features libkrun-sys --all-targets -- -D warnings
