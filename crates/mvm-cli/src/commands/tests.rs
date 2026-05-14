@@ -1469,13 +1469,19 @@ fn sandbox_gc_defaults_to_dry_run() {
     let cli = Cli::try_parse_from(["mvmctl", "sandbox", "gc"]).expect("parse");
     match cli.command {
         Commands::Sandbox(sandbox::Args {
-            action: sandbox::SandboxAction::Gc(sandbox::GcArgs { dry_run, apply }),
+            action:
+                sandbox::SandboxAction::Gc(sandbox::GcArgs {
+                    dry_run,
+                    apply,
+                    json,
+                }),
         }) => {
             assert!(
                 !dry_run,
                 "--dry-run flag is optional because dry-run is default"
             );
             assert!(!apply);
+            assert!(!json);
         }
         _ => panic!("Expected Sandbox gc command"),
     }
@@ -1486,10 +1492,29 @@ fn sandbox_gc_apply_parses() {
     let cli = Cli::try_parse_from(["mvmctl", "sandbox", "gc", "--apply"]).expect("parse");
     match cli.command {
         Commands::Sandbox(sandbox::Args {
-            action: sandbox::SandboxAction::Gc(sandbox::GcArgs { dry_run, apply }),
+            action:
+                sandbox::SandboxAction::Gc(sandbox::GcArgs {
+                    dry_run,
+                    apply,
+                    json,
+                }),
         }) => {
             assert!(!dry_run);
             assert!(apply);
+            assert!(!json);
+        }
+        _ => panic!("Expected Sandbox gc command"),
+    }
+}
+
+#[test]
+fn sandbox_gc_json_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "sandbox", "gc", "--json"]).expect("parse");
+    match cli.command {
+        Commands::Sandbox(sandbox::Args {
+            action: sandbox::SandboxAction::Gc(sandbox::GcArgs { json, .. }),
+        }) => {
+            assert!(json);
         }
         _ => panic!("Expected Sandbox gc command"),
     }

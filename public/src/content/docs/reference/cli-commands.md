@@ -212,10 +212,13 @@ paths.
 | `mvmctl sandbox gc` | Dry-run cleanup of stale sandbox name-registry entries for stopped or expired VMs |
 | `mvmctl sandbox gc --dry-run` | Explicit dry-run; reports candidates and does not mutate state |
 | `mvmctl sandbox gc --apply` | Remove stale stopped/expired registry entries and emit a `SandboxGc` audit entry |
+| `mvmctl sandbox gc --json` | Print a machine-readable GC summary with candidates, reasons, and removed count |
 
 `sandbox gc` never tears down a live VM. Entries that still appear as starting,
 running, or paused in a backend listing are skipped; cleanup only removes stale
 host registry records.
+`--json` does not change the safety mode: cleanup remains dry-run unless
+`--apply` is also passed.
 
 ## File Copy
 

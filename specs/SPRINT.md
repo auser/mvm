@@ -1633,6 +1633,9 @@ Shipped:
 - `mvmctl sandbox gc` adds a dry-run-by-default cleanup path for stale
   sandbox registry entries. `--apply` only removes stopped/expired entries
   that no backend reports as live and emits `SandboxGc`.
+- `mvmctl sandbox gc --json` emits the same candidate/removal decision as a
+  machine-readable summary and preserves dry-run-by-default behavior unless
+  `--apply` is supplied.
 - `mvmctl cp` copies one regular file across the host/VM boundary with exactly
   one `VM:/absolute/path` endpoint, a default 16 MiB cap, no overwrite unless
   `--force`, guest-side path-policy validation, and `VmFileCopy` audit without
