@@ -74,6 +74,17 @@ backends-microsandbox = [
 # compiled in. Plan 72 W5 flips this to `default` once the libkrun
 # boot lifecycle (plan 57 W3) ships.
 backends-builder-vm-libkrun = ["mvm-build/backends-builder-vm-libkrun"]
+# Plan 72 W5 Stage 0 — microsandbox-backed bootstrap for building the
+# in-repo `nix/images/builder-vm/flake.nix` on a contributor laptop
+# without host Nix. Pulls in `backends-microsandbox` for the
+# `MicrosandboxBuilderVm` impl. Plan 72 W5's cutover deletes the
+# end-user-facing microsandbox path and renames `backends-microsandbox`
+# → `contributor-bootstrap` for clarity; the forward here is the
+# bridge until that consolidation lands.
+contributor-bootstrap = [
+    "backends-microsandbox",
+    "backends-builder-vm-libkrun",
+]
 custom-dns = ["mvm-supervisor/custom-dns"]
 dev-watch = ["dep:notify", "dep:notify-debouncer-mini"]
 manifest-verify = [

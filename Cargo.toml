@@ -264,6 +264,11 @@ backends-builder-vm-libkrun = [
     "mvm-build/backends-builder-vm-libkrun",
     "mvm-cli/backends-builder-vm-libkrun",
 ]
+# Plan 72 W5 Stage 0 — microsandbox bootstrap for the in-repo
+# builder-vm flake. Contributors enable this when they edit
+# `nix/images/builder-vm/` and want their changes reflected in the
+# next `mvmctl dev up` without a release-pipeline round-trip.
+contributor-bootstrap = ["mvm-cli/contributor-bootstrap"]
 custom-dns = ["mvm-cli/custom-dns"]
 dev-watch = ["mvm-cli/dev-watch"]
 manifest-verify = [

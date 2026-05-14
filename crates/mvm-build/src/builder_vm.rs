@@ -627,6 +627,11 @@ cp -L "$src/rootfs.ext4" "$out/rootfs.ext4"
 [ -f "$src/initrd" ] && cp -L "$src/initrd" "$out/initrd"
 [ -f "$src/initrd.cpio.gz" ] && cp -L "$src/initrd.cpio.gz" "$out/initrd.cpio.gz"
 [ -f "$src/mvm-meta.json" ] && cp -L "$src/mvm-meta.json" "$out/mvm-meta.json"
+# Plan 72 W5 — builder-vm flake emits cmdline + manifest.json
+# alongside vmlinux + rootfs. Conditional copies so dev-image builds
+# (which don't produce these) stay unaffected.
+[ -f "$src/cmdline" ] && cp -L "$src/cmdline" "$out/cmdline"
+[ -f "$src/manifest.json" ] && cp -L "$src/manifest.json" "$out/manifest.json"
 chmod -R u+w "$out"
 "#,
         out = shell_quote_arg(BUILDER_GUEST_OUT_DIR),

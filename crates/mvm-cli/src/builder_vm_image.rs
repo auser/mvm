@@ -153,16 +153,41 @@ pub fn ensure_builder_vm_image() -> Result<BuilderVmImage> {
             {
                 return Ok(img);
             }
+
+            // Stage 0 bootstrap — populate the cache by running
+            // `nix build` inside a microsandbox VM. Only available when
+            // built with `--features contributor-bootstrap` since that
+            // pulls in the microsandbox dep closure (sqlx-sqlite,
+            // microsandbox-runtime, etc.) that the default mvmctl
+            // binary leaves out.
+            #[cfg(feature = "contributor-bootstrap")]
+            {
+                build_builder_vm_image_via_microsandbox(&flake_dir, &cache).with_context(|| {
+                    format!(
+                        "Stage 0 microsandbox build of builder-vm flake at {} → {}",
+                        flake_dir.display(),
+                        cache.display(),
+                    )
+                })?;
+                BuilderVmImage::load_from_dir(&cache).with_context(|| {
+                    format!(
+                        "loading freshly-built builder VM image from {}",
+                        cache.display()
+                    )
+                })
+            }
+
+            #[cfg(not(feature = "contributor-bootstrap"))]
             anyhow::bail!(
                 "Source-checkout cache miss for builder VM image at {cache_disp}\n\
-                 Build it locally with:\n\
+                 Rebuild mvmctl with `--features contributor-bootstrap` to \
+                 enable the Stage 0 microsandbox bootstrap that populates this \
+                 cache. Or build the image manually:\n\
                  \n  \
                  nix build path:{flake_disp}#packages.{arch}-linux.default --out-link {cache_disp}/result\n\
                  \n\
                  then copy `result/vmlinux`, `result/rootfs.ext4`, and \
-                 `result/cmdline` into {cache_disp}. The Stage-0 bootstrap \
-                 that does this automatically is plan 72 W5's \
-                 `--features contributor-bootstrap`.",
+                 `result/cmdline` into {cache_disp}.",
                 cache_disp = cache.display(),
                 flake_disp = flake_dir.display(),
                 arch = std::env::consts::ARCH,
@@ -190,6 +215,127 @@ pub fn ensure_builder_vm_image() -> Result<BuilderVmImage> {
             })
         }
     }
+}
+
+// ──────────────────── Stage 0 microsandbox bootstrap ──────────────
+
+/// Build the in-repo `nix/images/builder-vm/` flake inside a
+/// microsandbox VM running `nixos/nix:2.24.10` (the same OCI image
+/// the existing dev-image builder uses) and stash the artifacts under
+/// `dest_dir`. The flake emits vmlinux + rootfs.ext4 + cmdline +
+/// manifest.json; `MicrosandboxBuilderVm`'s copy_script extracts them
+/// back to `dest_dir` over the bind-mounted `/out`.
+///
+/// This is plan 72 W5's Stage 0 — the contributor-bootstrap path that
+/// lets a developer modify `nix/images/builder-vm/flake.nix` and see
+/// their change in the next `mvmctl dev up` without a release-pipeline
+/// round-trip (CLAUDE.md §"Source-checkout builds never depend on
+/// mvm-published artifacts").
+///
+/// Why microsandbox + `nixos/nix:2.24.10` rather than host Nix:
+/// CLAUDE.md §"Host Nix is never used by mvmctl" applies here too.
+/// Every Nix evaluation goes through a VM we launched; this is the
+/// only Stage 0 path. The 4 GiB microsandbox overlay limit (ADR-046
+/// §"Open questions") applies but the builder-vm rootfs closure
+/// fits — plan 72 W2 §"Image size budget" enforces ≤ 1.2 GiB
+/// uncompressed at flake-build time.
+#[cfg(feature = "contributor-bootstrap")]
+pub fn build_builder_vm_image_via_microsandbox(
+    flake_dir: &Path,
+    dest_dir: &Path,
+) -> Result<()> {
+    use mvm_build::builder_vm::{
+        BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, BuilderVm, MicrosandboxBuilderVm,
+        host_system_linux,
+    };
+
+    if !flake_dir.exists() {
+        anyhow::bail!("builder-vm flake dir does not exist: {}", flake_dir.display());
+    }
+    std::fs::create_dir_all(dest_dir).with_context(|| {
+        format!(
+            "creating destination cache dir {} for builder VM image",
+            dest_dir.display()
+        )
+    })?;
+
+    // The builder-vm flake at `<workspace>/nix/images/builder-vm/`
+    // uses `builtins.path { path = ../../..; }` to capture the
+    // workspace root (for mkGuest's `mvmSrc` + `Cargo.lock`). Mount
+    // the whole workspace at /work and point `flake_ref` at the
+    // subdir — same pattern as `build_image_via_microsandbox` in
+    // `commands/env/apple_container.rs`.
+    let workspace_root = flake_dir
+        .parent()
+        .and_then(Path::parent)
+        .and_then(Path::parent)
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "flake dir is not three levels deep in workspace: {}",
+                flake_dir.display()
+            )
+        })?
+        .to_path_buf();
+    let flake_rel = flake_dir.strip_prefix(&workspace_root).map_err(|_| {
+        anyhow::anyhow!(
+            "flake dir not under derived workspace root: {}",
+            flake_dir.display()
+        )
+    })?;
+    let flake_rel_str = flake_rel.to_str().ok_or_else(|| {
+        anyhow::anyhow!("flake subpath has non-UTF-8 bytes: {flake_rel:?}")
+    })?;
+    let guest_flake_ref = format!("path:{BUILDER_GUEST_WORK_DIR}/{flake_rel_str}");
+
+    // Bind /nix opportunistically on Linux hosts that already run
+    // native Nix — same rationale as the dev-image path. Skipped on
+    // macOS (Darwin-targeted closures + permission tangle).
+    let host_nix_store = if cfg!(target_os = "macos") {
+        None
+    } else {
+        let host_nix = PathBuf::from("/nix");
+        if host_nix.join("store").is_dir() {
+            Some(host_nix)
+        } else {
+            None
+        }
+    };
+
+    let job = BuilderJob {
+        flake_ref: guest_flake_ref,
+        attr_path: format!("packages.{}.default", host_system_linux()),
+    };
+    let mounts = BuilderMounts {
+        flake_src: workspace_root,
+        host_nix_store,
+        artifact_out: dest_dir.to_path_buf(),
+    };
+
+    MicrosandboxBuilderVm::default()
+        .run_build(&job, &mounts)
+        .map_err(|e| anyhow::anyhow!("Stage 0 microsandbox build failed: {e}"))?;
+
+    // MicrosandboxBuilderVm's copy_script handles vmlinux, rootfs.ext4,
+    // cmdline, and manifest.json (plan 72 W5 added cmdline + manifest
+    // to the copy list). Sanity-check the three files BuilderVmImage
+    // expects before returning.
+    for required in [
+        BuilderVmImage::KERNEL_FILENAME,
+        BuilderVmImage::ROOTFS_FILENAME,
+        BuilderVmImage::CMDLINE_FILENAME,
+    ] {
+        let p = dest_dir.join(required);
+        if !p.exists() {
+            anyhow::bail!(
+                "Stage 0 build completed but {} is missing from {}. \
+                 The builder-vm flake may have failed to emit it (check the \
+                 microsandbox build logs above) or the copy_script regressed.",
+                required,
+                dest_dir.display()
+            );
+        }
+    }
+    Ok(())
 }
 
 // ─────────────────── release download (ADR-002 §W5.1) ────────────
@@ -519,13 +665,18 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "backends-builder-vm-libkrun")]
+    #[cfg(all(
+        feature = "backends-builder-vm-libkrun",
+        not(feature = "contributor-bootstrap")
+    ))]
     #[test]
     fn ensure_builder_vm_image_signals_cache_miss_for_source_checkout() {
-        // The cache dir under the contributor's real $HOME may or may
-        // not be populated (depends on whether they've built locally
-        // before). Force it to miss by redirecting `mvm_cache_dir()`
-        // at a temp dir for the duration of this test.
+        // Without `contributor-bootstrap`, the source-checkout cache
+        // miss path errors with a hint telling the user to rebuild
+        // mvmctl with the feature on. The `contributor-bootstrap`
+        // variant of this test path is harder to unit-test (it
+        // genuinely attempts a microsandbox build) — coverage there
+        // lives in the planned live test `dev_up_contributor_bootstrap.rs`.
         //
         // We rely on `MVM_CACHE_DIR` env-var precedence in
         // `mvm_core::config::mvm_cache_dir()`. `std::env::set_var` is
@@ -548,6 +699,28 @@ mod tests {
         assert!(
             msg.contains("cache miss") || msg.contains("Cache miss"),
             "error should mention the cache miss: {msg}"
+        );
+        assert!(
+            msg.contains("contributor-bootstrap"),
+            "without the feature, error should point at it: {msg}"
+        );
+    }
+
+    #[cfg(feature = "contributor-bootstrap")]
+    #[test]
+    fn build_builder_vm_image_via_microsandbox_validates_flake_dir() {
+        // Negative path: the function should reject a non-existent
+        // flake dir before reaching the (expensive) microsandbox
+        // spawn step. The positive path requires a working sandbox
+        // and is exercised by the planned live test
+        // `dev_up_contributor_bootstrap.rs`.
+        let scratch = tempdir().unwrap();
+        let missing = scratch.path().join("does-not-exist");
+        let err = build_builder_vm_image_via_microsandbox(&missing, scratch.path()).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("does not exist"),
+            "should reject missing flake dir: {msg}"
         );
     }
 }
