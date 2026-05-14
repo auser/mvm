@@ -229,12 +229,11 @@ claim 3 silently.
   `image pull`-sourced templates. Audit chain (claim 8) still covers
   provenance.
 
-**Mitigation owner.** W1 lead picks A or B before code lands; the
-choice goes in the W1 ADR and the public status page row for
-oci-ingest names the verity posture. ADR-048 §"Non-goals" already
-forbids "bypassing verified artifact checks for developer
-ergonomics" — Option B is compatible with that *only if* the
-exclusion is explicit, not implicit.
+**Mitigation owner.** Resolved by [ADR-050](../adrs/050-oci-image-verity-posture.md):
+pull-time verity generation by default; `--no-verity` is
+dev-profile-only; production-profile admission rejects pulled
+templates without a verity sidecar. ADR-050 §Implementation Plan
+adds the concrete task list onto W1.
 
 ### R4 — Audit volume without backpressure (W2)
 
@@ -368,12 +367,13 @@ code into ad-hoc PR-review architecture. Worse: an (a)-style CA
 installation can land "temporarily" and never get reverted, expanding
 the trust footprint of every guest without an explicit decision.
 
-**Mitigation owner.** Pick the substitution mechanism before W2
-codes the proxy — it shapes the proxy. **R9 deserves its own ADR**;
-fold the decision in alongside W2's egress design. ADR-048 §"Non-
-goals" forbids "claiming secrets cannot leak for legacy env/file
-injection flows" — that posture is consistent with (b) being the
-default and (a) being an explicit, named opt-in.
+**Mitigation owner.** Resolved by [ADR-049](../adrs/049-secret-substitution-mechanism.md):
+default substitution is the vsock side-channel (b); (a)
+proxy-with-CA lands later behind `unsafe_guest_tls_inspection`
+for legacy workloads only; (c) host-side reconstruction is
+rejected. ADR-049 §Implementation Plan extends W3's task list
+with the vsock substitution service, per-language SDK runtime
+hooks, and hostile-guest tests.
 
 ### R10 — OCI layer unpack attack surface (W1)
 

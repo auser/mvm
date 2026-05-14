@@ -517,11 +517,14 @@ Quick map from workstream to load-bearing risks:
 | W5 perf    | R7 (publish every readiness boundary), R8 |
 | W6 storage | R4 (new audit kinds), R8 |
 
-**R9 is the single biggest gate** — pick the TLS substitution shape
-(proxy-with-CA / vsock side-channel / host-side reconstruction)
-before W2 codes the proxy. The decision shapes W2's proxy and W3's
-entire substitution architecture. Strongly recommend its own ADR
-before either workstream starts.
+**R3 and R9 are now decided** —
+[ADR-050](050-oci-image-verity-posture.md) picks pull-time verity
+generation for W1, and
+[ADR-049](049-secret-substitution-mechanism.md) picks the vsock
+side-channel for W3 (with proxy-with-CA available later as an
+explicit opt-in feature flag). Both ADRs ship with concrete task
+additions for their workstreams. The remaining top-level risks
+(R1, R2, R4-R8, R10-R12) stay open and reference the parent plan.
 
 ## Verification
 
