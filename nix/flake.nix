@@ -52,7 +52,7 @@
   #
   # The `minimal` configuration below is **internal** — it's the test
   # fixture our Rust smoke tests use to exercise the build/exec path
-  # (`tests/nix_flake_structure.rs`, `tests/smoke_microsandbox.rs`).
+  # (`tests/nix_flake_structure.rs`, `tests/smoke_libkrun.rs`).
   # It is NOT a starter template for user projects. Users should
   # write their own flake using `lib.mkGuest`; the minimal profile
   # exists so we can boot something in CI without depending on a
@@ -134,7 +134,7 @@
 
       # ── Internal: nixosConfigurations.minimal ────────────────────
       #
-      # Test fixture for our smoke tests (`tests/smoke_microsandbox.rs`,
+      # Test fixture for our smoke tests (`tests/smoke_libkrun.rs`,
       # `tests/nix_flake_structure.rs`). NOT a starter template —
       # users write their own flake. The `internal` namespace makes
       # the boundary unambiguous so CI lints can grep for it.

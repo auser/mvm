@@ -13,7 +13,7 @@ mvm currently builds Firecracker microVM images exclusively — NixOS system clo
 - Incremental: existing FC pipeline untouched, WASM is additive
 
 **Lessons from related projects:**
-- **[microsandbox](https://github.com/zerocore-ai/microsandbox):** Uses libkrun microVMs (not FC). Key pattern: Rust-native OCI handling via `oci-spec` crate for pulling/pushing images. Their `Rootfs` enum (`Native(PathBuf)` vs `Overlayfs(Vec<PathBuf>)`) is a clean model for our artifact type discrimination. Their `Sandboxfile` YAML config cleanly separates sandbox definitions from build definitions.
+- **[libkrun](https://github.com/zerocore-ai/libkrun):** Uses libkrun microVMs (not FC). Key pattern: Rust-native OCI handling via `oci-spec` crate for pulling/pushing images. Their `Rootfs` enum (`Native(PathBuf)` vs `Overlayfs(Vec<PathBuf>)`) is a clean model for our artifact type discrimination. Their `Sandboxfile` YAML config cleanly separates sandbox definitions from build definitions.
 - **[kata-containers](https://github.com/kata-containers/kata-containers):** Containers-in-VMs only (containerd shim). No WASM support — the WASM ecosystem uses separate projects: [runwasi](https://github.com/containerd/runwasi) (containerd WASM shim) and [containerd-wasm-shims](https://github.com/deislabs/containerd-wasm-shims).
 - **OCI format distinction:** WASM containers should use [OCI artifact media types](https://www.cncf.io/blog/2024/03/12/webassembly-on-kubernetes-from-containers-to-wasm-part-01/) (`application/vnd.wasm.content.layer.v1+wasm`) rather than wrapping `.wasm` in a traditional Docker image with rootfs layers. This is what runwasi/SpinKube expect.
 
@@ -199,7 +199,7 @@ mkWasmOci = name: wasmDrv:
 
 **Approach B: Rust-side OCI packaging using `oci-spec` crate**
 
-Add a small `oci.rs` module in `mvm-build` that constructs the OCI artifact tarball in Rust using the `oci-spec` crate (pattern borrowed from microsandbox). This gives us precise control over media types and is testable without Nix. The `.wasm` module from Nix is packaged into the correct OCI artifact format post-build.
+Add a small `oci.rs` module in `mvm-build` that constructs the OCI artifact tarball in Rust using the `oci-spec` crate (pattern borrowed from libkrun). This gives us precise control over media types and is testable without Nix. The `.wasm` module from Nix is packaged into the correct OCI artifact format post-build.
 
 Either way, the output is a tarball conforming to the OCI image layout spec with WASM-specific media types, pushable via `oras push` or `skopeo copy`.
 

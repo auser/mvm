@@ -4,15 +4,15 @@ use std::sync::OnceLock;
 /// The execution environment for running workloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
-    /// macOS — microsandbox (libkrun on Hypervisor.framework) per ADR-013
+    /// macOS — Apple Container on Apple Silicon/macOS 26+, or libkrun via Hypervisor.framework.
     MacOS,
     /// Native Linux with /dev/kvm available — run Firecracker directly
     LinuxNative,
-    /// Linux without /dev/kvm (not WSL) — microsandbox via libkrun, or Docker fallback
+    /// Linux without /dev/kvm (not WSL) — Docker fallback.
     LinuxNoKvm,
     /// WSL2 — may have KVM (Hyper-V nested virt), prefers Firecracker when available
     Wsl2,
-    /// Native Windows — microsandbox/WSL2 via mvm-studio Tauri shell (ADR-031)
+    /// Native Windows — WSL2 via mvm-studio Tauri shell (ADR-031)
     Windows,
 }
 
@@ -59,21 +59,6 @@ impl Platform {
         mvm_libkrun::is_available()
     }
 
-    /// Whether the bundled microsandbox runtime is usable on this
-    /// platform. microsandbox 0.4.5 vendors libkrunfw, so unlike
-    /// [`has_libkrun`](Self::has_libkrun) we don't need a separate
-    /// host-side install — every platform with hardware virtualization
-    /// support (KVM on Linux, Hypervisor.framework on macOS) can run
-    /// microsandbox out of the box. ADR-013 names microsandbox as the
-    /// preferred non-KVM cross-platform default.
-    ///
-    /// Windows is excluded for now — upstream microsandbox doesn't yet
-    /// ship a WHvPlatform path; ADR-031 documents the Tauri-only
-    /// stance for Windows users.
-    pub fn has_microsandbox(self) -> bool {
-        !matches!(self, Platform::Windows)
-    }
-
     /// Whether Cloud Hypervisor is installed on this host.
     ///
     /// CH is a peer of Firecracker at the Tier 1 microVM layer; it
@@ -116,8 +101,7 @@ impl Platform {
     /// On macOS this requires nix-daemon with a linux-builder configured.
     /// On native Linux this is always true if `nix` is on PATH.
     /// When true, `nix build` can run on the host directly. When false
-    /// on macOS, the microsandbox-as-Linux-builder fallback (ADR-013
-    /// §"Linux builder via microsandbox") handles cross-builds.
+    /// on macOS, the builder VM handles cross-builds.
     pub fn has_host_nix(self) -> bool {
         static HOST_NIX: OnceLock<bool> = OnceLock::new();
         *HOST_NIX.get_or_init(|| {
@@ -305,26 +289,6 @@ mod tests {
         if !matches!(plat, Platform::Windows) {
             assert_eq!(plat.has_libkrun(), mvm_libkrun::is_available());
         }
-    }
-
-    #[test]
-    fn test_has_microsandbox_excludes_windows() {
-        // Per ADR-031 + ADR-013, Windows is Tauri-only and
-        // microsandbox doesn't yet ship a WHvPlatform path. The
-        // detection must surface that explicitly so auto_select
-        // doesn't pick microsandbox on a Windows host.
-        assert!(!Platform::Windows.has_microsandbox());
-    }
-
-    #[test]
-    fn test_has_microsandbox_true_on_unix_class_platforms() {
-        // microsandbox vendors libkrunfw, so unlike has_libkrun() we
-        // don't depend on a host-side install. Every Unix-class
-        // platform is supported.
-        assert!(Platform::MacOS.has_microsandbox());
-        assert!(Platform::LinuxNative.has_microsandbox());
-        assert!(Platform::LinuxNoKvm.has_microsandbox());
-        assert!(Platform::Wsl2.has_microsandbox());
     }
 
     #[test]

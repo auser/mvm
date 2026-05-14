@@ -2,7 +2,7 @@
 title: "ADR-035: Feature flag taxonomy"
 status: Proposed
 date: 2026-05-07
-related: ADR-013 (microsandbox pivot), ADR-014 (VmBackend), ADR-031 (cross-platform), plan 60-mvm-microsandbox-migration
+related: ADR-013 (libkrun pivot), ADR-014 (VmBackend), ADR-031 (cross-platform), plan 60-mvm-libkrun-migration
 ---
 
 ## Status
@@ -26,7 +26,7 @@ This ADR establishes:
 ```toml
 # Backends (at least one must be enabled — CI checks)
 firecracker     = ["dep:vmm-firecracker-client"]   # Linux-only
-microsandbox    = ["dep:microsandbox"]             # cross-platform
+libkrun    = ["dep:libkrun"]             # cross-platform
 backend-cloud-hypervisor = []                      # post-Phase-10
 
 # Front-ends
@@ -72,7 +72,7 @@ dev             = []
 ### Naming conventions
 
 - Lowercase, kebab-case, terse but descriptive.
-- Backends: bare name (`firecracker`, `microsandbox`).
+- Backends: bare name (`firecracker`, `libkrun`).
 - Categories prefixed: `metrics-*`, `egress-*`, `attestation-*`, `gpu-*`.
 - Stub features for future work end with `-deferred` or are simply empty (`sev-snp = []`).
 - The `dev` flag has no prefix to make it unmissable.
@@ -80,7 +80,7 @@ dev             = []
 ### Default feature set
 
 ```toml
-default = ["firecracker", "microsandbox", "mcp", "metrics-prometheus", "luks"]
+default = ["firecracker", "libkrun", "mcp", "metrics-prometheus", "luks"]
 ```
 
 (`luks` is in default because Linux is the primary deploy target; on macOS/Windows the `luks` feature compiles to a no-op runtime stub.)
@@ -89,7 +89,7 @@ default = ["firecracker", "microsandbox", "mcp", "metrics-prometheus", "luks"]
 
 ```bash
 cargo build --release --no-default-features \
-  --features "firecracker,microsandbox,mcp,metrics-prometheus,luks,egress-l7-proxy,egress-firewall-nft,attestation-tpm2"
+  --features "firecracker,libkrun,mcp,metrics-prometheus,luks,egress-l7-proxy,egress-firewall-nft,attestation-tpm2"
 ```
 
 **`dev` is omitted, explicitly.** Production builds with `dev` enabled fail compile via a `#[cfg(all(feature = "dev", not(debug_assertions), not(test)))] compile_error!(...)` guard (Phase 0).
@@ -97,7 +97,7 @@ cargo build --release --no-default-features \
 ### CI matrix
 
 At minimum, three feature combinations are built per PR:
-1. **Minimal**: `--no-default-features --features "microsandbox"` (cross-platform sanity)
+1. **Minimal**: `--no-default-features --features "libkrun"` (cross-platform sanity)
 2. **Default**: `cargo build` (the developer's typical path)
 3. **Full prod**: the production incantation above (the deployer's path)
 
@@ -116,7 +116,7 @@ Failing any of the three blocks the PR.
 
 ## Alternatives considered
 
-- **One mega-feature**: rejected. Loses the ability to ship a slim `microsandbox`-only build.
+- **One mega-feature**: rejected. Loses the ability to ship a slim `libkrun`-only build.
 - **Per-crate features only**: rejected. Workspace-level features with `workspace.dependencies` propagation is the idiomatic Cargo pattern.
 - **Runtime config flags instead of compile-time**: rejected for `dev`. Compile-time exclusion is the only way to ensure dev paths can't be invoked in production.
 

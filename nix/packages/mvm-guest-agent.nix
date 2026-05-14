@@ -14,7 +14,7 @@
 # `rustPlatform.buildRustPackage` against the workspace at
 # `mvmSrc`. The crate is built with `--package mvm-guest --bins`
 # so the workspace's heavier consumers (mvm, mvm-backend,
-# microsandbox, etc.) don't enter the closure. Cargo still
+# libkrun, etc.) don't enter the closure. Cargo still
 # resolves and vendors the full workspace lockfile, but only the
 # selected crate's deps compile.
 #
@@ -55,7 +55,7 @@ pkgs.rustPlatform.buildRustPackage {
   cargoLock.lockFile = mvmSrc + "/Cargo.lock";
 
   # Restrict the build to the mvm-guest binaries. The workspace
-  # has heavier members (microsandbox via mvm-build, libkrun via
+  # has heavier members (libkrun via mvm-build, libkrun via
   # mvm-providers, etc.) that aren't in the guest closure.
   cargoBuildFlags = [
     "--package" "mvm-guest"

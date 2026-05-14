@@ -1130,7 +1130,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
     emit_security_banner_if_needed(effective_hypervisor);
 
     // Lima is gone (ADR-013); no upfront VM check needed. The
-    // microsandbox-as-Linux-builder follow-up (W6.x) will reintroduce
+    // libkrun-as-Linux-builder follow-up (W6.x) will reintroduce
     // a builder-availability gate at this point when it lands.
     let _metrics_server = if metrics_port > 0 {
         Some(crate::metrics_server::MetricsServer::start(metrics_port)?)

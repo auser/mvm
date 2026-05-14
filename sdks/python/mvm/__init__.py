@@ -14,7 +14,7 @@ by running ``mvm emit entry.py`` from the host, which honors ADR-0002's
 subprocess contract).
 
 Plan 60 Phase 5 Slice D1: the declarative DSL + ``@mvm.func`` decorator
-+ ``RemoteFunction`` invoke path are wired here. The microsandbox-shaped
++ ``RemoteFunction`` invoke path are wired here. The libkrun-shaped
 ``Sandbox.create()`` lifecycle wrapper and the fluent
 ``WorkloadBuilder`` are deferred to Slice D2.
 """

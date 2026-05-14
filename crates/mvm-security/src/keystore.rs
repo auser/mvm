@@ -14,10 +14,10 @@
 //!   Windows Credential Manager). Lives at service=`"mvm"`,
 //!   user=`<tenant_id>`. Plan 63 W3.
 //!
-//! [`default_provider`] auto-detects the best available impl for
-//! the current host without a tenant id: KeyringProvider if a
-//! backend is reachable, else FileKeyProvider if
-//! `/var/lib/mvm/keys/` exists, else EnvKeyProvider.
+//! [`default_provider`] auto-detects the providers available on the
+//! current host and tries them in strength order for each tenant:
+//! KeyringProvider if a backend is reachable, FileKeyProvider if
+//! `/var/lib/mvm/keys/` exists, then EnvKeyProvider for dev / CI.
 //!
 //! Returned keys wrap `SecretBox<Vec<u8>>` — guarantees zeroize-on-
 //! drop AND forbids accidental `Debug`/`Display` at compile time (you
@@ -211,10 +211,37 @@ impl KeyProvider for KeyringProvider {
     }
 }
 
-/// Auto-select the best available provider for the current host.
+/// Ordered fallback provider used by [`default_provider`].
+struct FallbackKeyProvider {
+    providers: Vec<Box<dyn KeyProvider>>,
+}
+
+impl FallbackKeyProvider {
+    fn new(providers: Vec<Box<dyn KeyProvider>>) -> Self {
+        Self { providers }
+    }
+}
+
+impl KeyProvider for FallbackKeyProvider {
+    fn get_data_key(&self, tenant_id: &str) -> Result<SecretBox<Vec<u8>>> {
+        let mut errors = Vec::new();
+        for provider in &self.providers {
+            match provider.get_data_key(tenant_id) {
+                Ok(key) => return Ok(key),
+                Err(err) => errors.push(err.to_string()),
+            }
+        }
+        Err(anyhow::anyhow!(
+            "no tenant data-encryption key found for {tenant_id}: {}",
+            errors.join(" | ")
+        ))
+    }
+}
+
+/// Auto-select the available providers for the current host.
 ///
-/// Order — biased toward stronger sources first; falls through on
-/// "the backend isn't reachable here":
+/// Order is biased toward stronger sources first and falls through
+/// per tenant when a stronger backend has no key configured:
 ///
 /// 1. [`KeyringProvider`] — if an OS-native keystore entry can be
 ///    constructed (macOS Keychain / Linux Secret Service /
@@ -222,17 +249,19 @@ impl KeyProvider for KeyringProvider {
 /// 2. [`FileKeyProvider`] — if [`DEFAULT_KEYS_DIR`] exists.
 /// 3. [`EnvKeyProvider`] — last resort; dev / CI only.
 ///
-/// The function never fails — it always returns *some* provider,
+/// The function never fails — it always returns a fallback provider,
 /// even if no key is actually configured for any tenant. Whether a
 /// specific tenant key exists is the question [`has_key`] answers.
 pub fn default_provider() -> Box<dyn KeyProvider> {
+    let mut providers: Vec<Box<dyn KeyProvider>> = Vec::new();
     if KeyringProvider::backend_reachable() {
-        return Box::new(KeyringProvider);
+        providers.push(Box::new(KeyringProvider));
     }
     if FileKeyProvider::keys_dir_present(Path::new(DEFAULT_KEYS_DIR)) {
-        return Box::new(FileKeyProvider::default());
+        providers.push(Box::new(FileKeyProvider::default()));
     }
-    Box::new(EnvKeyProvider)
+    providers.push(Box::new(EnvKeyProvider));
+    Box::new(FallbackKeyProvider::new(providers))
 }
 
 /// Returns true if [`default_provider`] can successfully resolve a
@@ -517,6 +546,18 @@ mod tests {
         // We don't assert *which* impl since that depends on the
         // host's keystore availability + filesystem layout.
         let _provider = default_provider();
+    }
+
+    #[test]
+    fn default_provider_falls_back_to_env_key_for_tenant() {
+        use secrecy::ExposeSecret;
+
+        let tenant = "mvm-test-env-fallback";
+        let var = "MVM_TENANT_KEY_MVM_TEST_ENV_FALLBACK";
+        unsafe { std::env::set_var(var, VALID_KEY_HEX) };
+        let key = default_provider().get_data_key(tenant).unwrap();
+        assert_eq!(key.expose_secret().len(), KEY_SIZE);
+        unsafe { std::env::remove_var(var) };
     }
 
     #[test]

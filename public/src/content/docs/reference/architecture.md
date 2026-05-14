@@ -102,7 +102,7 @@ Where Linux commands run. Defined in `mvm-core`:
 - `run_capture()` -- run and capture both stdout and stderr
 
 Implementations:
-- **`BuilderVmEnv`** -- delegates commands into the microsandbox/libkrun builder VM (macOS hosts)
+- **`BuilderVmEnv`** -- delegates commands into the libkrun/libkrun builder VM (macOS hosts)
 - **`NativeEnv`** -- runs commands directly (Linux with `/dev/kvm`)
 
 ### ShellEnvironment

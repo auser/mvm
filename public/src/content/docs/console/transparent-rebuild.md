@@ -37,7 +37,7 @@ Cross-references:
 - plan 60 §"Transparent install / rebuild" (Phase 7a)
 - plan 60 §"Snapshots — first-class feature"
 - plan 60 §"Long-running sessions"
-- ADR-013 (microsandbox/libkrun pivot — the warm builder design)
+- ADR-013 (libkrun/libkrun pivot — the warm builder design)
 -->
 
 > This page is a placeholder. Content is being written — see plan 62.

@@ -20,7 +20,7 @@
 //! `FileAuditSigner::sign_and_emit` is async because the trait is
 //! shared with the in-process supervisor path (plan-37 §22 Wave 3),
 //! but `mvmctl up` is synchronous. We build a single-threaded tokio
-//! runtime per emit (mirrors `mvm-backend::microsandbox::block_on`).
+//! runtime per emit (mirrors `mvm-backend::libkrun::block_on`).
 //! Audit emission is rare (3 entries per `mvmctl up` invocation), so
 //! the runtime-construction overhead is negligible compared to the VM
 //! boot itself.

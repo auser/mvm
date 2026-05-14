@@ -366,8 +366,8 @@ output (see [Building MicroVM Images](/guides/building-microvm-images)).
 Build resolution order on first use:
 
 1. **Builder microVM (default).** mvm bootstraps a small Linux builder
-   microVM (microsandbox-backed, see
-   [ADR-013 §"Linux builder via microsandbox"](/contributing/adr/013-microsandbox-pivot/)),
+   microVM (libkrun-backed, see
+   [ADR-013 §"Linux builder via libkrun"](/contributing/adr/013-libkrun-pivot/)),
    runs `nix build` inside it, and extracts the rootfs. No host-side
    Nix required.
 2. **Host-side Nix (auto-detected).** If the host already has a working

@@ -146,7 +146,7 @@ export default defineConfig({
           items: [
             { label: "Development Guide", slug: "contributing/development" },
             { label: "ADR-001: Multi-Backend VMs", slug: "contributing/adr/001-multi-backend" },
-            { label: "ADR-013: microsandbox + libkrun + microvm.nix", slug: "contributing/adr/013-microsandbox-pivot" },
+            { label: "ADR-013: libkrun + libkrun + microvm.nix", slug: "contributing/adr/013-libkrun-pivot" },
           ],
         },
       ],

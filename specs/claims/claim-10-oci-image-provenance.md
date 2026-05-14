@@ -78,8 +78,7 @@ team can use it freely.
 ## Cross-refs
 
 - ADR-002 §"Security model" — claims 1–8 (pre-plan-75) and 9 (deps).
-- ADR-049 — `mvm-oci` supersedes microsandbox; defines this claim
-  in its "Security implications" section.
-- Plan 75 W5 — implementation phase that ratifies the claim.
+- OCI provenance planning — defines this claim in its security
+  implications section.
 - CLAUDE.md §"Security model" — claim 10 line lands in CLAUDE.md
   when plan 75 W6 flips status to `Shipped`.

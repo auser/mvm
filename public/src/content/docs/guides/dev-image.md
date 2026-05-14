@@ -10,7 +10,7 @@ There are two paths:
 1. **Use the default dev image that ships with mvm** — zero config, run `mvmctl dev up` and you're in a shell. Good for "I just want a sandboxed Linux shell to poke around in." See [The default dev image](#the-default-dev-image) below.
 2. **Write your own dev image** — declare it in your project's flake using `mvm.lib.<system>.mkGuest`. Adds your packages, your services, your config. The mvm repository's internals stay untouched — you're a consumer of the library, not a fork. See [Writing your own dev image](#writing-your-own-dev-image) below.
 
-Per [ADR-013](/contributing/adr/013-microsandbox-pivot/), the dev/prod distinction is encoded in the entrypoint shape (`shell` → accessible, `command`/`services` → sealed). The same `mvm.lib.<system>.mkGuest` API serves both.
+Per [ADR-013](/contributing/adr/013-libkrun-pivot/), the dev/prod distinction is encoded in the entrypoint shape (`shell` → accessible, `command`/`services` → sealed). The same `mvm.lib.<system>.mkGuest` API serves both.
 
 ## Writing your own dev image
 
@@ -145,11 +145,11 @@ nix eval .#dev.passthru.mvm
 
 ### Cross-platform build notes
 
-mvm bootstraps a Linux builder microVM (microsandbox-backed) on first build and runs `nix build` inside it. You don't need Nix on your host. See [ADR-013 §"Linux builder via microsandbox"](/contributing/adr/013-microsandbox-pivot/).
+mvm bootstraps a Linux builder microVM (libkrun-backed) on first build and runs `nix build` inside it. You don't need Nix on your host. See [ADR-013 §"Linux builder via libkrun"](/contributing/adr/013-libkrun-pivot/).
 
 - **Linux** (with `/dev/kvm`): the builder microVM runs on Firecracker. If you've opted into host-side Nix and it can build Linux derivations, mvm uses it directly and skips the builder VM.
 - **macOS**: the builder microVM runs on libkrun via Hypervisor.framework. If you already have [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) configured, mvm detects and uses it instead.
-- **Windows**: via the Tauri-only path ([ADR-031](/contributing/adr/013-microsandbox-pivot/)); the WSL2-backed builder handles `nix build`.
+- **Windows**: via the Tauri-only path ([ADR-031](/contributing/adr/013-libkrun-pivot/)); the WSL2-backed builder handles `nix build`.
 
 ## Why this is structured this way
 

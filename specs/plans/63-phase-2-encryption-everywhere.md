@@ -47,7 +47,7 @@ in `origin/main`:
   `Zeroizing<Vec<u8>>` + `EnvKeyProvider` + `validate_shell_id` +
   `hex_decode` (Phase 2 prep, commit `a9386f8`).
 - `mvm-security::snapshot_hmac` ships HMAC-SHA256 over snapshot
-  artifacts (W4 from plan 41, already wired into the FC + microsandbox
+  artifacts (W4 from plan 41, already wired into the FC + libkrun
   start/restore paths).
 - `mvm-cli::commands::storage` ships `mvmctl volume create/ls/rm`,
   `mvmctl up --volume <name>:<path>`, `volume_registry`,

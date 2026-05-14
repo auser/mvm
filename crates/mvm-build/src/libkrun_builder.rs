@@ -2,7 +2,7 @@
 //!
 //! Plan 72 ADR-046 chose libkrun-direct (on macOS Apple Silicon /
 //! Intel) and Firecracker (on Linux) as the replacement for the
-//! microsandbox-backed builder VM. This module is the libkrun half;
+//! libkrun-backed builder VM. This module is the libkrun half;
 //! W1 → W4 of the migration shipped the launcher end-to-end.
 //!
 //! ## What `LibkrunBuilderVm` does
@@ -252,7 +252,7 @@ impl BuilderVm for LibkrunBuilderVm {
         //    `backends-builder-vm-libkrun` feature being compiled
         //    in doesn't imply the runtime library is installed.
         if !mvm_libkrun::is_available() {
-            return Err(BuilderVmError::MicrosandboxUnavailable(format!(
+            return Err(BuilderVmError::LibkrunUnavailable(format!(
                 "libkrun shared library not found on host. {}",
                 mvm_libkrun::install_hint()
             )));
@@ -774,7 +774,7 @@ fn resolve_supervisor_path() -> Result<PathBuf, BuilderVmError> {
         if path.is_file() {
             return Ok(path);
         }
-        return Err(BuilderVmError::MicrosandboxUnavailable(format!(
+        return Err(BuilderVmError::LibkrunUnavailable(format!(
             "MVM_LIBKRUN_SUPERVISOR_PATH points at {} which is not a file",
             path.display()
         )));
@@ -790,7 +790,7 @@ fn resolve_supervisor_path() -> Result<PathBuf, BuilderVmError> {
     if let Ok(path) = which::which("mvm-libkrun-supervisor") {
         return Ok(path);
     }
-    Err(BuilderVmError::MicrosandboxUnavailable(
+    Err(BuilderVmError::LibkrunUnavailable(
         "mvm-libkrun-supervisor binary not found. \
          Looked for: $MVM_LIBKRUN_SUPERVISOR_PATH, alongside the current exe, and on $PATH. \
          Install via `cargo install --path crates/mvm-libkrun --features libkrun-sys` \
@@ -824,10 +824,7 @@ fn spawn_supervisor_and_wait(
         .stderr(Stdio::inherit())
         .spawn()
         .map_err(|e| {
-            BuilderVmError::MicrosandboxUnavailable(format!(
-                "spawn {}: {e}",
-                supervisor_path.display()
-            ))
+            BuilderVmError::LibkrunUnavailable(format!("spawn {}: {e}", supervisor_path.display()))
         })?;
     child
         .stdin
@@ -1033,7 +1030,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                BuilderVmError::MicrosandboxUnavailable(_) | BuilderVmError::ExtractionFailed(_)
+                BuilderVmError::LibkrunUnavailable(_) | BuilderVmError::ExtractionFailed(_)
             ),
             "unexpected error variant: {err:?}"
         );
@@ -1174,9 +1171,9 @@ mod tests {
     fn run_build_surfaces_environment_gaps_on_clean_input() {
         // Good input + a sandbox host (CI runner, dev macOS without
         // the cache populated) hits one of these in order:
-        //   - libkrun shared library missing → MicrosandboxUnavailable
+        //   - libkrun shared library missing → LibkrunUnavailable
         //   - builder VM image cache empty   → ExtractionFailed
-        //   - mvm-libkrun-supervisor missing → MicrosandboxUnavailable
+        //   - mvm-libkrun-supervisor missing → LibkrunUnavailable
         // Any of those is a valid pre-Plan-72-W5 state. The cutover
         // (Plan 72 W5) wires the Stage 0 bootstrap that populates
         // the image cache; until then, this test pins the shape
@@ -1189,7 +1186,7 @@ mod tests {
         assert!(
             matches!(
                 err,
-                BuilderVmError::MicrosandboxUnavailable(_) | BuilderVmError::ExtractionFailed(_)
+                BuilderVmError::LibkrunUnavailable(_) | BuilderVmError::ExtractionFailed(_)
             ),
             "unexpected error variant: {err:?}"
         );
