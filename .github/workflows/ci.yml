@@ -227,6 +227,59 @@ jobs:
       - name: Build mvmctl + run MCP roundtrip smoke
         run: ./scripts/test-mcp-roundtrip.sh
 
+  # ── Lane: app-deps-audit (ADR-047 claim 9, Plan 73 Followup D) ────
+  # Exercises the ADR-047 application-dependency audit pipeline on
+  # every PR:
+  #   - `mvmctl compile examples/python/hello-app-with-deps/` —
+  #     validates the static decorator parser accepts
+  #     `dependencies=mvm.python_deps(...)` and emits launch.json with
+  #     the resolved deps block. No network, no VM.
+  #   - Hand-seal a fixture sealed-volume into a scratch deps-volumes
+  #     cache via the `mvm-app-deps-fixture-tool` example bin (which
+  #     calls into `mvm_sdk::compile::deps_audit::seal_volume` — the
+  #     same wire format the libkrun builder VM emits at install
+  #     time in Followup B.2).
+  #   - `mvmctl deps inspect <hash> --json` — verifies the inspect
+  #     pipeline parses the sidecars, refuses tampered volumes via
+  #     `verify_sealed_volume`, and surfaces a well-formed report.
+  #   - Negative path: a fixture with a HIGH-severity CVE finding is
+  #     gate-checked under `--prod` (must reject — claim 9 enforcement)
+  #     and `--dev` (must accept with warning — ADR-047 §"Lifecycle
+  #     gates" semantics).
+  #
+  # What it doesn't cover (named so future readers know the gap):
+  #   - Real `mvmctl build --deps` round-trip through the libkrun /
+  #     cloud-hypervisor builder VM. Needs Plan 72 W4/W5 cutover.
+  #   - Supervisor admission claim 9 enforcement against a real
+  #     `ExecutionPlan`. Needs a working microVM backend with
+  #     /dev/kvm; today's CI runners don't expose nested HVF on macOS.
+  # Both are documented as manual smoke in
+  # `examples/python/hello-app-with-deps/README.md`.
+  app-deps-audit:
+    name: app-deps-audit (ADR-047 claim 9 / Plan 73 Followup D)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install jq + libcap-ng (see test job for why)
+        run: sudo apt-get update && sudo apt-get install -y jq libcap-ng-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-app-deps-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-app-deps-
+
+      - name: Run app-deps-audit smoke
+        run: ./scripts/test-app-deps-ci-gate.sh
+
   # ── Lane: Nix flake check (Linux eval) ────────────────────────────
   # Catches eval-time bugs that only surface on Linux. The host-side
   # `nix flake check` was only ever exercised on the macOS runner;
