@@ -842,12 +842,12 @@ fn test_config_show_parses() {
 
 #[test]
 fn test_config_set_parses() {
-    let cli = Cli::try_parse_from(["mvmctl", "config", "set", "lima_cpus", "4"]).unwrap();
+    let cli = Cli::try_parse_from(["mvmctl", "config", "set", "dev_vm_cpus", "4"]).unwrap();
     match cli.command {
         Commands::Config(config::Args {
             action: ConfigAction::Set { key, value },
         }) => {
-            assert_eq!(key, "lima_cpus");
+            assert_eq!(key, "dev_vm_cpus");
             assert_eq!(value, "4");
         }
         _ => panic!("Expected Config Set command"),
@@ -855,23 +855,23 @@ fn test_config_set_parses() {
 }
 
 #[test]
-fn test_config_show_output_contains_lima_cpus() {
+fn test_config_show_output_contains_dev_vm_cpus() {
     let tmp = tempfile::tempdir().unwrap();
     let cfg = mvm_core::user_config::MvmConfig::default();
     mvm_core::user_config::save(&cfg, Some(tmp.path())).unwrap();
     let loaded = mvm_core::user_config::load(Some(tmp.path()));
     let text = toml::to_string_pretty(&loaded).unwrap();
-    assert!(text.contains("lima_cpus"));
+    assert!(text.contains("dev_vm_cpus"));
 }
 
 #[test]
 fn test_config_set_persists() {
     let tmp = tempfile::tempdir().unwrap();
     let mut cfg = mvm_core::user_config::load(Some(tmp.path()));
-    mvm_core::user_config::set_key(&mut cfg, "lima_cpus", "4").unwrap();
+    mvm_core::user_config::set_key(&mut cfg, "dev_vm_cpus", "4").unwrap();
     mvm_core::user_config::save(&cfg, Some(tmp.path())).unwrap();
     let reloaded = mvm_core::user_config::load(Some(tmp.path()));
-    assert_eq!(reloaded.lima_cpus, 4);
+    assert_eq!(reloaded.dev_vm_cpus, 4);
 }
 
 #[test]

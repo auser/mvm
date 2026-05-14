@@ -4,7 +4,7 @@ import { Button } from "../ui/button";
 const lines = [
   { text: "$ mvmctl dev", delay: 0 },
   { text: "  Detecting platform... macOS (Apple Silicon)", delay: 800, dim: true },
-  { text: "  Backend: firecracker (via Lima)", delay: 1400, dim: true },
+  { text: "  Backend: libkrun (Apple Hypervisor.framework)", delay: 1400, dim: true },
   { text: "  Ready.", delay: 2000, accent: true },
   { text: "", delay: 2400 },
   { text: "$ mvmctl build --flake .", delay: 2800 },

@@ -41,17 +41,16 @@ description: Complete command reference for mvmctl.
 
 | Command | Description |
 |---------|-------------|
-| `mvmctl bootstrap` | Full setup from scratch: Homebrew deps (macOS), Lima, Firecracker, kernel, rootfs (idempotent — safe to re-run) |
+| `mvmctl bootstrap` | Full setup from scratch: Homebrew deps (macOS), Firecracker, kernel, rootfs (idempotent — safe to re-run) |
 | `mvmctl bootstrap --production` | Production mode (skip Homebrew, assume Linux with apt) |
-| `mvmctl dev [up]` | Auto-bootstrap if needed, start dev VM, drop into shell. Uses Apple Container on macOS 26+, Lima otherwise. |
+| `mvmctl dev [up]` | Auto-bootstrap if needed, start dev VM, drop into shell. Uses Apple Container on macOS 26+; native KVM on Linux. |
 | `mvmctl dev up --project ~/dir` | Auto-bootstrap then cd into a project directory |
 | `mvmctl dev up --metrics-port PORT` | Bind a Prometheus metrics endpoint (0 = disabled) |
 | `mvmctl dev up --watch-config` | Reload ~/.mvm/config.toml automatically when it changes |
-| `mvmctl dev up --lima` | Force Lima backend even on macOS 26+ |
 | `mvmctl dev up --shell` (or `-s`) | Open an interactive shell after starting |
-| `mvmctl dev down` | Stop the Lima development VM |
+| `mvmctl dev down` | Stop the dev VM |
 | `mvmctl dev down --reset` | Also delete the cached dev image so the next `dev up` rebuilds from local source |
-| `mvmctl dev shell` | Open a shell in the running Lima VM |
+| `mvmctl dev shell` | Open a shell in the running dev VM |
 | `mvmctl dev shell --project ~/dir` | Open shell and cd into a project directory |
 | `mvmctl dev status` | Show dev environment backend, running state, and cached image paths |
 | `mvmctl dev rebuild` | Stop, clear cache, and rebuild + restart the dev VM |
@@ -128,7 +127,7 @@ description: Complete command reference for mvmctl.
 |---------|-------------|
 | `mvmctl config show` | Print current config as TOML |
 | `mvmctl config edit` | Open the config file in $EDITOR (falls back to nano) |
-| `mvmctl config set <key> <value>` | Set a single config key (e.g. `mvmctl config set lima_cpus 4`) |
+| `mvmctl config set <key> <value>` | Set a single config key (e.g. `mvmctl config set dev_vm_cpus 4`) |
 
 ## Audit
 
