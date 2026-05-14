@@ -118,7 +118,10 @@ pub enum VolumeError {
         artifact,
         volume.display()
     )]
-    ArtifactMissing { volume: PathBuf, artifact: &'static str },
+    ArtifactMissing {
+        volume: PathBuf,
+        artifact: &'static str,
+    },
 
     #[error("failed to read volume artifact `{}`: {source}", path.display())]
     Io {
@@ -215,11 +218,10 @@ pub fn verify_sealed_volume(volume_dir: &Path) -> Result<String, VolumeError> {
             artifact: FILE_MANIFEST,
         });
     }
-    let manifest_bytes =
-        std::fs::read(&manifest_path).map_err(|e| VolumeError::Io {
-            path: manifest_path.clone(),
-            source: e,
-        })?;
+    let manifest_bytes = std::fs::read(&manifest_path).map_err(|e| VolumeError::Io {
+        path: manifest_path.clone(),
+        source: e,
+    })?;
     let manifest: VolumeManifest =
         serde_json::from_slice(&manifest_bytes).map_err(|source| VolumeError::ManifestParse {
             volume: volume_dir.to_path_buf(),
@@ -622,4 +624,3 @@ mod tests {
         assert!(err.to_string().contains("future_field"));
     }
 }
-

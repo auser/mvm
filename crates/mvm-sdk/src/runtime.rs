@@ -173,8 +173,13 @@ pub fn resolve_base_image(template: &str) -> Result<Image, LowerError> {
 /// Closed, hand-curated list of known base-image templates. Exposed
 /// so `mvmctl doctor` / SDK error messages can render an actionable
 /// list when a user mistypes a template name.
-pub const KNOWN_BASE_IMAGES: &[&str] =
-    &["python-3.12", "python-3.13", "node-22", "node-lts", "minimal"];
+pub const KNOWN_BASE_IMAGES: &[&str] = &[
+    "python-3.12",
+    "python-3.13",
+    "node-22",
+    "node-lts",
+    "minimal",
+];
 
 // ────────────────────────────────────────────────────────────────────
 // Lowering — recording → Workload.
@@ -434,7 +439,10 @@ mod tests {
             HookCmd::Shell { line } => {
                 assert!(line.contains("base64 -d"), "got: {line}");
                 assert!(line.contains("/app/config.json"), "got: {line}");
-                assert!(line.contains(&b64(b"{\"hello\":\"world\"}\n")), "got: {line}");
+                assert!(
+                    line.contains(&b64(b"{\"hello\":\"world\"}\n")),
+                    "got: {line}"
+                );
                 assert!(line.contains("mkdir -p"), "got: {line}");
             }
             other => panic!("expected Shell hook, got {other:?}"),

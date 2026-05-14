@@ -1696,7 +1696,9 @@ fn test_compile_from_recording_parses() {
             ..
         }) => {
             assert_eq!(
-                from_recording.as_deref().map(|p| p.to_string_lossy().into_owned()),
+                from_recording
+                    .as_deref()
+                    .map(|p| p.to_string_lossy().into_owned()),
                 Some("/tmp/rec.json".to_string())
             );
             assert!(from_ir.is_none());
@@ -1729,8 +1731,8 @@ fn test_compile_from_recording_conflicts_with_from_ir() {
 
 #[test]
 fn test_compile_default_no_from_flags_leaves_them_none() {
-    let cli = Cli::try_parse_from(["mvmctl", "compile", "--from-ir", "/tmp/ir.json"])
-        .expect("parse");
+    let cli =
+        Cli::try_parse_from(["mvmctl", "compile", "--from-ir", "/tmp/ir.json"]).expect("parse");
     match cli.command {
         Commands::Compile(compile::Args {
             from_ir,
