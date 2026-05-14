@@ -194,6 +194,13 @@
         let
           pkgs = import nixpkgs { inherit system; };
           builderInit = mvmBuilderInitFor system;
+          # Stock nixpkgs kernel. Pass it to `mkGuest` so the rootfs
+          # ships its module tree (`/lib/modules/<kver>/`); the
+          # builder VM doesn't run the standard `/init` modprobe path
+          # (its cmdline pins `init=/sbin/mvm-builder-init`) but the
+          # modules sit alongside so `mvm-builder-init` or downstream
+          # tools can load them on demand.
+          kernelPkg = pkgs.linuxPackages.kernel;
           rootfs = (libFor { inherit system; }).mkGuest {
             name = "mvm-builder-vm";
             # mkGuest requires an entrypoint declaration. At runtime
@@ -206,8 +213,8 @@
               "/sbin/mvm-builder-init" =
                 "${builderInit}/bin/mvm-builder-init";
             };
+            kernel = kernelPkg;
           };
-          kernelPkg = pkgs.linuxPackages.kernel;
           kernelFile =
             if pkgs.stdenv.hostPlatform.isAarch64 then "Image" else "bzImage";
         in
