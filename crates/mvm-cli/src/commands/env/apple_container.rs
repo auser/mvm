@@ -1898,25 +1898,25 @@ fn find_builder_vm_flake() -> Result<String> {
 ///   image** with the large rustc closure.
 ///
 /// Source-checkout-only by design — `find_builder_vm_flake()`
-/// Two acquisition paths share one cache shape (matching the
-/// `LibkrunBuilderVm::run_build` `~/.cache/mvm/builder-vm/<arch>/`
-/// contract from `mvm-build/src/libkrun_builder.rs::ensure_builder_vm_image`):
+/// Two acquisition paths split on whether we have an in-repo flake:
 ///
-/// 1. **Contributor path** — when `contributor-bootstrap` is on and
-///    `find_builder_vm_flake()` returns Ok, Stage 0 microsandbox
-///    builds the W2 flake locally. This is what a contributor editing
-///    `nix/images/builder-vm/` wants: their edits show up on the very
-///    next `mvmctl dev up`, no release-pipeline round-trip.
+/// 1. **Contributor path (source checkout)** — when `contributor-bootstrap`
+///    is on and `find_builder_vm_flake()` returns Ok, Stage 0 microsandbox
+///    builds the W2 flake locally **on every invocation**. No cache hit
+///    fast path here — CLAUDE.md mandates that a contributor edit to
+///    `nix/images/builder-vm/flake.nix` must show up in the very next
+///    `mvmctl dev up`, and a cache-hit shortcut would mask local edits.
+///    Microsandbox's own internal caching (OCI image + Nix store paths)
+///    keeps the no-change rebuild fast, so this isn't expensive.
 ///
-/// 2. **End-user download path** — otherwise, fetch the per-arch
-///    artifacts the W2 release-workflow job publishes
-///    (`builder-vm-vmlinux-<arch>`, `builder-vm-rootfs-<arch>.ext4`,
-///    optional `builder-vm-<arch>.cmdline.txt` / `manifest.json`)
-///    from `releases/download/v<version>/`. SHA-256 verifies per
-///    ADR-002 §W5.1 via the published checksums file.
-///
-/// Cache hit (both `vmlinux` and `rootfs.ext4` already present) is the
-/// fast path on either branch — no work done.
+/// 2. **End-user download path (installed binary)** — when there's no
+///    in-repo flake, fetch the per-arch artifacts the W2 release-workflow
+///    job publishes (`builder-vm-vmlinux-<arch>`,
+///    `builder-vm-rootfs-<arch>.ext4`, optional sidecars) from
+///    `releases/download/v<version>/`. SHA-256 verifies per ADR-002 §W5.1.
+///    A cache hit here IS the fast path — there's no upstream source
+///    to be out of sync with; only the release tag matters and the
+///    cache dir is keyed on it.
 ///
 /// W5.B wired this into `ensure_dev_image`; Plan 72 W5's "Layer 1
 /// outside source checkout — download the published prebuilt"
@@ -1936,22 +1936,13 @@ fn bootstrap_builder_vm_image() -> Result<()> {
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
 
-    // Cache hit fast path. Skip the per-call rebuild/redownload cost
-    // when the artifacts the consumer reads (`vmlinux` + `rootfs.ext4`)
-    // already live in the per-arch cache dir. A future PR can wire
-    // `manifest.json` SHA verification here to turn this from "exists"
-    // into "hash-matches-the-current-release", but for now existence is
-    // sufficient — both producer paths populate the same files
-    // atomically.
-    let cached_kernel = format!("{out_dir}/vmlinux");
-    let cached_rootfs = format!("{out_dir}/rootfs.ext4");
-    if std::path::Path::new(&cached_kernel).is_file()
-        && std::path::Path::new(&cached_rootfs).is_file()
-    {
-        ui::info(&format!("Builder VM image already cached at {out_dir}."));
-        return Ok(());
-    }
-
+    // Source-checkout path: always rebuild from the in-repo flake.
+    // CLAUDE.md: "A contributor modifying `nix/images/builder-vm/flake.nix`
+    // must see their change in the very next `mvmctl dev up` with no
+    // release-pipeline round-trip." A cache-hit fast path would
+    // silently mask local edits — the per-call microsandbox build is
+    // the correctness gate. Microsandbox's own OCI + Nix-store caching
+    // keeps the no-change rebuild fast.
     #[cfg(feature = "contributor-bootstrap")]
     if let Ok(flake_dir) = find_builder_vm_flake() {
         ui::info(&format!(
@@ -1974,9 +1965,18 @@ fn bootstrap_builder_vm_image() -> Result<()> {
         };
     }
 
-    // No in-repo flake (installed binary) OR no contributor-bootstrap
-    // feature compiled in. Fall through to the release-artifact
-    // download path.
+    // Installed-binary path: no in-repo source to be out of sync with,
+    // so a cache hit IS the fast path. Only download when the cache
+    // is empty.
+    let cached_kernel = format!("{out_dir}/vmlinux");
+    let cached_rootfs = format!("{out_dir}/rootfs.ext4");
+    if std::path::Path::new(&cached_kernel).is_file()
+        && std::path::Path::new(&cached_rootfs).is_file()
+    {
+        ui::info(&format!("Builder VM image already cached at {out_dir}."));
+        return Ok(());
+    }
+
     ui::info(&format!(
         "Builder VM image not in cache; downloading published prebuilt for v{}...",
         env!("CARGO_PKG_VERSION")
