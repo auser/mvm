@@ -17,6 +17,7 @@ exempt_paths:
   - "CHANGELOG.md"
   - ".github/**"
   - "memory/**"
+  - "public/src/content/docs/contributing/adr/**"
 ---
 
 # Claim 10 — OCI image provenance is recorded in the admission audit chain
