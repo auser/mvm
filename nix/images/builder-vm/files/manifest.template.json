@@ -1,0 +1,10 @@
+{
+  "schema": "mvm.builder-vm/v1",
+  "system": "@SYSTEM@",
+  "kernelCmdline": "@KERNEL_CMDLINE@",
+  "initIsStub": @INIT_IS_STUB@,
+  "artifacts": {
+    "vmlinux":      { "sha256": "@VMLINUX_SHA@", "size": @VMLINUX_SIZE@ },
+    "rootfs.ext4":  { "sha256": "@ROOTFS_SHA@",  "size": @ROOTFS_SIZE@  }
+  }
+}
