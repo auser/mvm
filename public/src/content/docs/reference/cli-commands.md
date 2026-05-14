@@ -146,6 +146,8 @@ description: Complete command reference for mvmctl.
 | `mvmctl policy verify <tenant>:<workload>` | Parse the bundle and run admission validators for schema version, L4 rules, disabled egress inspectors, PII policy, and audit destinations |
 | `mvmctl policy explain <tenant>:<workload>` | Validate the bundle and print a human-readable admission posture summary |
 | `mvmctl policy explain <tenant>:<workload> --json` | Emit a redacted machine-readable admission summary with counts, defaults, enabled inspectors, and audit destination schemes. Raw artifact capture paths, audit destination URLs, and egress hostnames are omitted. |
+| `mvmctl policy lint <tenant>:<workload>` | Validate the bundle and fail if risky-but-admissible posture is found, such as plain HTTP egress, disabled inspectors, unsigned audit chains, broad L4 CIDRs, wildcard ports, or sensitive-looking artifact capture paths |
+| `mvmctl policy lint <tenant>:<workload> --json` | Emit a redacted machine-readable lint report. Raw artifact capture paths, audit destination URLs, and egress hostnames are omitted. |
 | `mvmctl policy update <tenant>:<workload> --from <path>` | Reserved for mvmd-signed policy updates; v0 refuses local mutation and exits with guidance |
 
 ## Flake Validation

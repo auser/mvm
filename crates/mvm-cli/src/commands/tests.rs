@@ -1236,6 +1236,20 @@ fn test_policy_explain_json_parses() {
     }
 }
 
+#[test]
+fn test_policy_lint_json_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "policy", "lint", "acme:web", "--json"]).unwrap();
+    match cli.command {
+        Commands::Policy(policy::Args {
+            action: PolicyAction::Lint { bundle, json },
+        }) => {
+            assert_eq!(bundle, "acme:web");
+            assert!(json);
+        }
+        other => panic!("Expected Policy Lint command, got {other:?}"),
+    }
+}
+
 // --- Network CLI tests ---
 
 #[test]
