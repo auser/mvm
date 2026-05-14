@@ -103,6 +103,7 @@ pub struct ResolvedSlots {
     pub tool_gate: Box<dyn ToolGate>,
     pub keystore: Box<dyn KeystoreReleaser>,
     pub artifacts: Box<dyn ArtifactCollector>,
+    pub audit: Option<mvm_policy::AuditPolicy>,
 }
 
 /// Errors `resolve_supervisor_components` can return.
@@ -406,6 +407,7 @@ fn noop_slots() -> ResolvedSlots {
         tool_gate: Box::new(NoopToolGate),
         keystore: Box::new(NoopKeystoreReleaser),
         artifacts: Box::new(NoopArtifactCollector),
+        audit: None,
     }
 }
 
@@ -518,6 +520,7 @@ fn slots_from_bundle(
         tool_gate: Box::new(tool_gate),
         keystore: Box::new(keystore),
         artifacts: Box::new(artifacts),
+        audit: Some(bundle.audit.clone()),
     })
 }
 
@@ -564,9 +567,9 @@ fn load_tenant_workload(
 mod tests {
     use super::*;
     use mvm_plan::{
-        ArtifactPolicy, AttestationMode, AttestationRequirement, KeyRotationSpec, Nonce, PlanId,
-        PostRunLifecycle, Resources, RuntimeProfileRef, SCHEMA_VERSION, SignedImageRef, TenantId,
-        TimeoutSpec, WorkloadId,
+        AdmissionProfile, ArtifactPolicy, AttestationMode, AttestationRequirement, KeyRotationSpec,
+        Nonce, PlanId, PlanSeccompTier, PostRunLifecycle, Resources, RuntimeProfileRef,
+        SCHEMA_VERSION, SignedImageRef, TenantId, TimeoutSpec, WorkloadId,
     };
     use std::collections::BTreeMap;
 
@@ -593,6 +596,10 @@ mod tests {
                     exec_secs: 0,
                 },
             },
+            admission_profile: AdmissionProfile::local_default(
+                "vm:boot",
+                PlanSeccompTier::Standard,
+            ),
             network_policy: PolicyRef(LOCAL_DEFAULT.to_string()),
             fs_policy: FsPolicyRef(LOCAL_DEFAULT.to_string()),
             secrets: Vec::new(),

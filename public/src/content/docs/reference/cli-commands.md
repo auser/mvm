@@ -24,7 +24,7 @@ description: Complete command reference for mvmctl.
 | `mvmctl up --watch` | Watch flake for changes and auto-rebuild + reboot |
 | `mvmctl up --network-preset <preset>` | Network egress policy: `unrestricted` (default), `none`, `registries`, `dev`, `agent` (LLM-inference + GitHub bundle — see [ADR-004](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/004-hypervisor-egress-policy.md)) |
 | `mvmctl up --network-allow host:port` | Allow egress to specific host:port (repeatable, mutually exclusive with preset) |
-| `mvmctl up --seccomp <tier>` | Seccomp profile: `essential`, `minimal`, `standard` (default), `network`, `unrestricted`. Default flipped from `unrestricted` → `standard` per ADR-002 §W1.1. |
+| `mvmctl up --seccomp <tier>` | Seccomp profile: `essential`, `minimal`, `standard` (default), `network`, `unrestricted`. The selected tier is enforced through the guest `seccomp.json` manifest and recorded in the signed admission profile for audit. |
 | `mvmctl up --secret KEY:host` | Bind a secret to a domain (repeatable; see [Config & Secrets](/guides/config-secrets/)) |
 | `mvmctl up --network <name>` | Named dev network to attach VM to (default: "default") |
 | `mvmctl down [name]` | Stop VMs by name, or all if omitted |
@@ -150,7 +150,12 @@ description: Complete command reference for mvmctl.
 | `mvmctl policy lint <tenant>:<workload> --json` | Emit a redacted machine-readable lint report. Raw artifact capture paths, audit destination URLs, and egress hostnames are omitted. |
 | `mvmctl policy diff <left-tenant>:<left-workload> <right-tenant>:<right-workload>` | Validate two bundles and print a redacted policy diff. The command exits non-zero only for invalid or missing bundles, not because differences exist. |
 | `mvmctl policy diff <left-tenant>:<left-workload> <right-tenant>:<right-workload> --json` | Emit a redacted machine-readable diff report. Raw artifact paths, audit destination URLs, egress hostnames, and CIDRs are replaced with stable fingerprints and safe summaries. |
+| `mvmctl policy export <tenant>:<workload>` | Validate the bundle and emit a redacted JSON support/review artifact. Raw artifact paths, audit destination URLs, egress hostnames, and CIDRs are replaced with stable fingerprints and safe summaries. |
+| `mvmctl policy export <tenant>:<workload> --format toml` | Emit the same redacted support/review artifact as TOML |
+| `mvmctl policy export <tenant>:<workload> --redaction raw --format json\|toml` | Validate and emit the original raw policy bundle shape. Use only when the recipient is allowed to see the policy contents. |
 | `mvmctl policy update <tenant>:<workload> --from <path>` | Reserved for mvmd-signed policy updates; v0 refuses local mutation and exits with guidance |
+
+When `mvmctl up` admits a signed plan for a workload with a policy bundle, `[audit].chain_signing = true` is required. The default local per-tenant chain remains active, and `file://...` entries in `[audit].stream_destinations` receive exact JSONL replica chains. Other destination schemes validate at the policy-shape layer but fail closed during admission until their transports are wired.
 
 ## Flake Validation
 

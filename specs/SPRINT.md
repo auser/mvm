@@ -41,6 +41,7 @@ Recent maintenance:
 - [x] Source-checkout `mvmctl dev up` now refuses to download published prebuilts when the local builder VM path is unavailable; it exits with a builder-image/libkrun hint instead, preserving the "dev reflects local flakes" invariant.
 - [x] Extended `runtime_boot_bench` with TOML config-file input, Apple Container backend defaults, configurable CPU/memory sizing, and Apple guest-agent readiness probing.
 - [x] Removed the microsandbox backend and contributor-bootstrap feature path from the Rust dependency graph; `mvmctl` now treats missing `nix` as a broken builder VM image, never as a host-Nix fallback.
+- [x] Added intent-bound admission profiles to signed `ExecutionPlan` v4, binding intent, seccomp tier, policy refs, secret-release posture, and audit taxonomy without adding new sandbox execution capability.
 
 ## In-flight workstreams
 
@@ -1071,6 +1072,7 @@ sweep (32 / 16 / 18).
 | 60 | Phase 4 scaffold — `tests/audit_total_coverage.rs` walks `mvm_cli::cli_command()` + asserts every top-level subcommand has an `AuditPosture` classification | `c036cea` |
 | 60 | Phase 4 scaffold — recursive per-subgroup coverage (13 subgroup tables, ~54 leaf classifications including third-level `manifest tag` + `manifest alias`) | `dabd955` |
 | 60 | Phase 4 follow-on — `validate_audit_policy_stream_destinations` fail-loud at admission on unknown URL schemes in `bundle.audit.stream_destinations` (`ResolveError::AuditPolicyInvalid`, `error_class = policy-audit-invalid`) | `c5c37f2` |
+| 60 | Phase 4 follow-on — `bundle.audit` now constructs the admission audit emitter: policy-bound admission requires `chain_signing = true`, keeps the default local per-tenant chain, and replicates exact JSONL chains to `file://...` stream destinations. `https://` / `unix://` transports remain fail-closed until implemented. | PR pending |
 | 60 | Phase 4 follow-on — `tests/audit_emissions_live.rs` first 3 live drive-and-assert tests (cache prune, cache prune --dry-run negative, network create) | `d852f5a` |
 | 60 | Phase 4 follow-on — 3 more live tests (network remove, manifest prune --orphans, secret put) | `3759af8` |
 | 60 | Phase 4 follow-on — 3 secret-cluster live tests (secret get/ls/rm); discovered + pinned the on-disk action-name decoupling (`ls` → `"list"`, `rm` → `"delete"`) | `b22feae` |
@@ -1122,7 +1124,7 @@ Reference: ADR-044 (`specs/adrs/044-audit-emit-macro.md`).
 | # | Plan / phase | Est. days | Notes |
 |---|---|---|---|
 | 1 | Plan 60 Phase 3 Slice C — smoltcp/TUN userspace-TCP consumer + host firewall (nft / pf / WFP) + DNS server endpoint + per-tenant netns lift | 8-12 | The remaining Phase 3 work after Slices A + B + four resolver follow-ons closed in batch 2. Turns `L4Gate::evaluate` decisions into accept/drop on per-VM TAPs; brings up the firewall additive layer; provisions the resolver guest VMs point `/etc/resolv.conf` at. Pairs with the mvm-hostd lift (#7 below). |
-| 2 | Plan 60 Phase 4 — persistent observability | 5-8 | Scaffold shipped in batch 2 (`tests/audit_total_coverage.rs` recursive coverage of all CLI subcommands at every depth). Remaining: Prometheus + OTLP metrics endpoint; promote `audit_total_coverage` `Emits` rows to live drive-and-assert tests as each command gains a hermetic fixture; wire `bundle.audit.{chain_signing, stream_destinations}` into `AuditEmitter` construction; structured logs; event bus on `tokio::sync::broadcast`. |
+| 2 | Plan 60 Phase 4 — persistent observability | 5-8 | Scaffold shipped in batch 2 (`tests/audit_total_coverage.rs` recursive coverage of all CLI subcommands at every depth). `bundle.audit.{chain_signing, stream_destinations}` is wired into admission `AuditEmitter` construction for signed file-chain replicas. Remaining: Prometheus + OTLP metrics endpoint; promote `audit_total_coverage` `Emits` rows to live drive-and-assert tests as each command gains a hermetic fixture; add non-file audit stream transports (`https://` / `unix://`); structured logs; event bus on `tokio::sync::broadcast`. |
 | 3 | Plan 60 Phase 5 — DX layer (Python SDK, manifests, mvm-studio handshake) | 7-10 | `python/mvm` wheels via pyo3; `cargo xtask gen-stubs` for typed APIs. Templates from `../mvm/templates/` rewritten on microvm.nix. |
 | 4 | Plan 60 Phase 7 — MCP server + host-mediated tools + sessions | 7-10 | PR #105 exposes `run`, `mvm.time_now`, `mvm.web_fetch`, `mvm.web_search`, `mvm.upload`, and `mvm.download`; CI smoke now asserts that MCP tool set and the secret audit live test pins `MVM_SECRET_STORE_BACKEND=file` for hermetic Linux runners. Remaining follow-up: snapshot/eval and tmux-style sessions. |
 | 5 | Plan 60 Phase 7a — install/rebuild/persistent overlay/tenant destroy | 10-12 | Encrypted persistent overlay (extends plan 45's volume work); rolling rootfs swap; `mvmctl tenant destroy` emits a destruction certificate. |
@@ -1660,6 +1662,10 @@ Shipped:
   emits a redacted change report for policy review before rollout. Raw artifact
   paths, audit destination URLs, egress hostnames, and CIDRs are replaced with
   stable fingerprints and safe summaries.
+- `mvmctl policy export <tenant>:<workload> [--format json|toml]` validates
+  the bundle and emits a redacted support/review artifact by default; raw
+  export requires explicit `--redaction raw` and preserves the original bundle
+  shape for trusted migration workflows.
 - CLI reference and parser tests cover the new command and profile surface.
 
 ### Sprint 52 success criteria

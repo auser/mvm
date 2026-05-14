@@ -331,9 +331,9 @@ mod tests {
     use super::*;
     use crate::audit::CapturingAuditSigner;
     use mvm_plan::{
-        ArtifactPolicy, AttestationMode, AttestationRequirement, FsPolicyRef, KeyRotationSpec,
-        Nonce, PolicyRef, PostRunLifecycle, Resources, RuntimeProfileRef, SCHEMA_VERSION,
-        SignedImageRef, TimeoutSpec, WorkloadId,
+        AdmissionProfile, ArtifactPolicy, AttestationMode, AttestationRequirement, FsPolicyRef,
+        KeyRotationSpec, Nonce, PlanSeccompTier, PolicyRef, PostRunLifecycle, Resources,
+        RuntimeProfileRef, SCHEMA_VERSION, SignedImageRef, TimeoutSpec, WorkloadId,
     };
 
     fn fixture_plan() -> ExecutionPlan {
@@ -359,6 +359,10 @@ mod tests {
                     exec_secs: 0,
                 },
             },
+            admission_profile: AdmissionProfile::local_default(
+                "vm:boot",
+                PlanSeccompTier::Standard,
+            ),
             network_policy: PolicyRef("local-default".to_string()),
             fs_policy: FsPolicyRef("local-default".to_string()),
             secrets: Vec::new(),
