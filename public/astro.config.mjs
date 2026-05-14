@@ -88,6 +88,7 @@ export default defineConfig({
           label: "Guides",
           items: [
             { label: "Writing Nix Flakes", slug: "guides/nix-flakes" },
+            { label: "From Workload IR to MicroVM Image", slug: "guides/ir-to-image" },
             { label: "Building MicroVM Images", slug: "guides/building-microvm-images" },
             { label: "Sandboxed Exec", slug: "guides/exec" },
             { label: "Config & Secrets", slug: "guides/config-secrets" },
