@@ -47,6 +47,42 @@ mod ctor;
 mod emit;
 mod error;
 
+/// Author-side machinery for composable attested addons. Ported from
+/// `mvmforge-addon`. Exposes `addon::{manifest, lockfile, validator,
+/// registry, archive, sbom, verify}` plus re-exports the consumer-side
+/// IR shapes (`AddonUse`, `AddonRef`, `AddonTier`, `ThreatTier`) for
+/// one-stop authoring.
+pub mod addon;
+
+/// Compile pipeline — Workload IR to staged build artifacts. Ported
+/// from `mvmforge/src/{archive,source,reachability,...}.rs`. Phase 2a
+/// exposes the source-bundling primitives (`archive_dir`,
+/// `copy_source`, `rehash`, `discover_python_reachable`,
+/// `discover_node_reachable`, `detect_language`); Phases 2b–2c add
+/// the rest. Phase 9 adds `deps_audit` — the sealed-volume primitives
+/// behind the application-dependency audit pipeline (ADR-047).
+pub mod compile;
+
+/// Static decorator parser — extracts `@mvm.app(...)` kwargs from a
+/// user's Python or TypeScript source file and lowers them to a
+/// `Workload` IR. Pure tree-sitter; never imports the user's code.
+/// Closed `mvm.*` helper allowlist; non-literal kwargs rejected.
+pub mod decorator;
+
+/// Deploy-bundle assembly + shipping (`mvmctl deploy`). Builds the
+/// single signed `.tar.gz` (compile output + embedded `mvmd-spec.json`)
+/// described in mvmd ADR-0020 and ships it via `MvmdClient::ship`.
+/// v1 ships the stub end of the contract; the real HTTP transport
+/// lands with mvmd Plan 48 Phase 1090.
+pub mod deploy;
+
+/// Runtime record-mode core — recording shape + lowering. SDK port
+/// Phase 7. The host SDKs (Python, TypeScript) build a
+/// `RuntimeRecording` from imperative `Sandbox` calls; this module
+/// lowers it into the same `Workload` IR the decorator path
+/// produces, so the flake renderer is shared.
+pub mod runtime;
+
 // Prelude — every previously-public item lives here so
 // `use mvm_sdk::*;` resolves identically across the split.
 pub use builder::{AppBuilder, WorkloadBuilder, app, workload};
@@ -60,6 +96,14 @@ pub use ctor::resources::resources;
 pub use ctor::source::{local_path, nix_derivation, oci_image};
 pub use emit::{emit, emit_json};
 pub use error::{BuildError, EmitError};
+
+// Phase 7a — runtime record-mode lowering. The CLI's
+// `mvmctl compile --from-recording` and the auto-exec path both
+// reach in through these re-exports.
+pub use runtime::{
+    KNOWN_BASE_IMAGES, LowerError, RecordedOp, RuntimeRecording, SandboxCreate, compile_recording,
+    resolve_base_image,
+};
 
 // IR type re-exports — public surface aliases consumed by downstream
 // fixtures (the corpus byte-identity gate from ADR-0015) and tests.

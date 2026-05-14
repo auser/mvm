@@ -240,6 +240,16 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("manifest", AuditPosture::DelegatesToSub(MANIFEST_SUB)),
     ("storage", AuditPosture::DelegatesToSub(STORAGE_SUB)),
     ("build", AuditPosture::Emits("TemplateBuild")),
+    // SDK port Phase 2c — renders a `Workload` IR to a flake +
+    // sidecars at the user-supplied --out path. Doesn't touch the
+    // audit chain. ReadOnly w.r.t. host state.
+    ("compile", AuditPosture::ReadOnly),
+    // SDK port Phase 8 (stub) — packs the compile output into a
+    // `.tar.gz` with `mvmd-spec.json` embedded and logs "would
+    // ship: …" via the stub `MvmdClient::ship`. The real HTTP
+    // transport (and any audit emission that comes with it) lands
+    // when mvmd Plan 48 Phase 1090 wires it; for now ReadOnly.
+    ("deploy", AuditPosture::ReadOnly),
     ("validate", AuditPosture::ReadOnly),
     ("catalog", AuditPosture::ReadOnly),
     // Operational surfaces.
