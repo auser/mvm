@@ -269,6 +269,13 @@ pub enum LocalAuditKind {
     /// inside another session verb) tore down an idle session.
     /// Detail: `session=<id>,idle_timeout_secs=<n>`.
     SessionReap,
+    // --- Plan 73 Followup C: deps-volume audit verbs ---
+    /// `mvmctl deps audit` re-ran the CVE scan against a cached deps
+    /// volume and resealed it. Detail carries the prior + new volume
+    /// hashes plus the count of high/critical CVE findings surfaced.
+    /// Emitted once per volume processed (so `--all` produces N
+    /// records, one per volume).
+    DepsAudit,
 }
 
 /// A single local audit log entry.

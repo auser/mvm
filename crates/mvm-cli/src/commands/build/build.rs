@@ -49,12 +49,30 @@ pub(in crate::commands) struct Args {
     /// Output structured JSON events instead of human-readable output
     #[arg(long)]
     pub json: bool,
+    /// Narrow the build to the application-dependency volume only.
+    /// Invalidates the cached deps volume(s) for any lockfile under
+    /// the project root, so the next install pipeline run starts
+    /// from a clean state. Useful for: someone bumped the lockfile
+    /// but didn't change other code; or someone manually deleted
+    /// `~/.mvm/volumes/deps/<hash>/` and wants the cache index
+    /// cleared to repopulate. Skips the rootfs `nix build`.
+    /// Plan 73 Followup C.
+    #[arg(long)]
+    pub deps: bool,
     /// Build-mode override flags (`--dev` / `--prod`). Default: `--prod`.
     #[command(flatten)]
     pub build_mode: super::super::shared::BuildModeFlags,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
+    // Plan 73 Followup C: `--deps` narrows the build to the deps
+    // volume only. We invalidate the cache index entries pointing at
+    // the project's lockfile and short-circuit before the rootfs
+    // build. The next install-pipeline run (`mvmctl build` without
+    // `--deps`, or `mvmctl up`) rebuilds the volume from scratch.
+    if args.deps {
+        return invalidate_deps_cache(&args);
+    }
     // Dispatch order:
     //   1. --flake <ref> → forced flake mode (no manifest discovery)
     //   2. --mvm-config <path> → explicit manifest mode
@@ -405,4 +423,172 @@ fn audit_build_error(mode: &str, source: &str, err: &anyhow::Error) {
         TemplateBuildError,
         "mode={mode} source={source} error={head}"
     );
+}
+
+/// Plan 73 Followup C — `mvmctl build --deps` implementation.
+///
+/// Narrows the build to the deps volume by invalidating the cache
+/// index entries pointing at lockfiles under the project root. The
+/// next install-pipeline run rebuilds the volume from scratch. We
+/// deliberately do NOT spawn the builder VM here — that's the
+/// install pipeline's job (Followup B.2), kicked off by the
+/// orchestrator on the next `mvmctl build` / `mvmctl up`.
+///
+/// Invalidation strategy: walk `<deps_volumes_dir>/index/`, read
+/// each `<lockfile_hash>` pointer's volume hash, and delete both
+/// the pointer + the volume directory if the volume's
+/// `meta.json.annotations.lockfile_sha256` matches the sha256 of a
+/// lockfile we can find at the project root. Lockfile names tried:
+/// `uv.lock`, `pnpm-lock.yaml`, `package-lock.json`, `npm-shrinkwrap.json`.
+///
+/// When no lockfile is found, we fall back to invalidating the
+/// entire cache index (the user's intent is "force rebuild"; we
+/// honor it bluntly rather than no-op).
+fn invalidate_deps_cache(args: &Args) -> Result<()> {
+    let project_root = resolve_project_root(args)?;
+    let cache_root = mvm_build::app_deps::resolve_cache_root(None);
+    let index_dir = cache_root.join("index");
+    if !index_dir.is_dir() {
+        ui::info(
+            "No deps cache index found; nothing to invalidate. The next \
+             `mvmctl build` will populate it on first install.",
+        );
+        return Ok(());
+    }
+
+    let lockfile_hashes = lockfile_sha256s_under(&project_root);
+    let mut invalidated: Vec<String> = Vec::new();
+
+    for entry in
+        std::fs::read_dir(&index_dir).with_context(|| format!("reading {}", index_dir.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let pointer = match std::fs::read_to_string(&path) {
+            Ok(s) => s.trim().to_string(),
+            Err(_) => continue,
+        };
+        if pointer.is_empty() {
+            continue;
+        }
+        let volume_dir = cache_root.join(&pointer);
+        // Decide whether to drop this entry. If we found lockfiles,
+        // match against their sha256s; if not, drop everything.
+        let matches = if lockfile_hashes.is_empty() {
+            true
+        } else {
+            volume_lockfile_sha256(&volume_dir)
+                .map(|s| lockfile_hashes.iter().any(|h| h == &s))
+                .unwrap_or(false)
+        };
+        if !matches {
+            continue;
+        }
+        // Remove the pointer and the volume directory (best-effort
+        // for the volume — a missing volume is a non-error here).
+        if let Err(e) = std::fs::remove_file(&path) {
+            ui::warn(&format!(
+                "could not remove index pointer {}: {e}",
+                path.display(),
+            ));
+            continue;
+        }
+        if volume_dir.is_dir()
+            && let Err(e) = std::fs::remove_dir_all(&volume_dir)
+        {
+            ui::warn(&format!(
+                "could not remove cached volume {}: {e}",
+                volume_dir.display()
+            ));
+        }
+        invalidated.push(pointer);
+    }
+
+    if invalidated.is_empty() {
+        ui::info(
+            "No matching deps cache entries to invalidate. Run `mvmctl build` \
+             without `--deps` to (re)populate the volume on next install.",
+        );
+    } else {
+        ui::success(&format!(
+            "Invalidated {} cached deps volume(s). The next install pipeline \
+             run will rebuild the volume from scratch.",
+            invalidated.len(),
+        ));
+    }
+    Ok(())
+}
+
+/// Best-effort project root resolver: honor `--mvm-config`, otherwise
+/// canonicalize the positional `path`, otherwise fall back to cwd.
+fn resolve_project_root(args: &Args) -> Result<std::path::PathBuf> {
+    if let Some(cfg) = &args.mvm_config {
+        let p = std::path::Path::new(cfg);
+        let canon = std::fs::canonicalize(p).with_context(|| format!("--mvm-config {cfg:?}"))?;
+        let root = if canon.is_file() {
+            canon.parent().map(std::path::Path::to_path_buf)
+        } else {
+            Some(canon)
+        }
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+        return Ok(root);
+    }
+    let p = std::path::Path::new(&args.path);
+    if p.exists() {
+        let canon = std::fs::canonicalize(p).unwrap_or_else(|_| p.to_path_buf());
+        let root = if canon.is_file() {
+            canon.parent().map(std::path::Path::to_path_buf)
+        } else {
+            Some(canon)
+        }
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+        return Ok(root);
+    }
+    Ok(std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")))
+}
+
+/// Scan the project root for known lockfile names and return their
+/// sha256s. The orchestrator (`mvm_build::app_deps`) keys the cache on
+/// the lockfile bytes' sha256 (mixed with language + gate tokens), so
+/// matching by raw sha256 catches every volume bound to one of these
+/// lockfiles regardless of language/gate.
+fn lockfile_sha256s_under(project_root: &std::path::Path) -> Vec<String> {
+    use sha2::{Digest, Sha256};
+    let candidates = [
+        "uv.lock",
+        "pnpm-lock.yaml",
+        "package-lock.json",
+        "npm-shrinkwrap.json",
+        "requirements.txt",
+        "Pipfile.lock",
+    ];
+    let mut out = Vec::new();
+    for name in &candidates {
+        let p = project_root.join(name);
+        let Ok(bytes) = std::fs::read(&p) else {
+            continue;
+        };
+        let mut h = Sha256::new();
+        h.update(&bytes);
+        let digest = h.finalize();
+        let hex: String = digest.iter().map(|b| format!("{b:02x}")).collect();
+        out.push(hex);
+    }
+    out
+}
+
+/// Read the volume's `meta.json.annotations.lockfile_sha256`. Returns
+/// `None` when the volume is missing, unreadable, or doesn't carry
+/// the annotation (older volumes won't).
+fn volume_lockfile_sha256(volume_dir: &std::path::Path) -> Option<String> {
+    let meta = volume_dir.join("meta.json");
+    let bytes = std::fs::read(meta).ok()?;
+    let v: serde_json::Value = serde_json::from_slice(&bytes).ok()?;
+    v.get("annotations")?
+        .get("lockfile_sha256")?
+        .as_str()
+        .map(str::to_string)
 }
