@@ -23,6 +23,9 @@
 //!   both bundles and compare a redacted policy snapshot. The diff
 //!   shows safe summaries and fingerprints rather than raw hostnames,
 //!   artifact paths, audit destinations, or CIDRs.
+//! - **`mvmctl policy export <tenant>:<workload>`** — validate and
+//!   emit a support/review artifact. Exports are redacted by default;
+//!   operators must ask explicitly for raw bundle output.
 //! - **`mvmctl policy update`** — stubbed; the production update
 //!   flow requires an mvmd-signed plan (plan 60 Phase 8 territory).
 //!   Errors with a clear pointer; no on-disk side effects.
@@ -37,7 +40,7 @@
 use std::{collections::BTreeSet, path::PathBuf};
 
 use anyhow::{Context, Result};
-use clap::{Args as ClapArgs, Subcommand};
+use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 use mvm_policy::toml_loader::{self, LoadError};
 use serde::Serialize;
 use sha2::{Digest, Sha256};
@@ -96,6 +99,17 @@ pub(in crate::commands) enum PolicyAction {
         #[arg(long)]
         json: bool,
     },
+    /// Validate and export a policy bundle for review or support.
+    Export {
+        /// `<tenant>:<workload>` identifier.
+        bundle: String,
+        /// Output format.
+        #[arg(long, value_enum, default_value = "json")]
+        format: PolicyExportFormat,
+        /// Redaction mode. Defaults to redacted; raw emits the full policy bundle.
+        #[arg(long, value_enum, default_value = "redacted")]
+        redaction: PolicyExportRedaction,
+    },
     /// Update is stubbed in v0 — production updates require an
     /// mvmd-signed plan. See plan 60 Phase 8.
     Update {
@@ -116,8 +130,25 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         PolicyAction::Explain { bundle, json } => cmd_explain(&base_dir, &bundle, json),
         PolicyAction::Lint { bundle, json } => cmd_lint(&base_dir, &bundle, json),
         PolicyAction::Diff { left, right, json } => cmd_diff(&base_dir, &left, &right, json),
+        PolicyAction::Export {
+            bundle,
+            format,
+            redaction,
+        } => cmd_export(&base_dir, &bundle, format, redaction),
         PolicyAction::Update { bundle, from } => cmd_update(&bundle, from.as_deref()),
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(in crate::commands) enum PolicyExportFormat {
+    Json,
+    Toml,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub(in crate::commands) enum PolicyExportRedaction {
+    Redacted,
+    Raw,
 }
 
 /// Resolve the host's `~/.mvm/policies/` base dir. Mirrors the
@@ -230,6 +261,25 @@ fn cmd_diff(
     Ok(())
 }
 
+fn cmd_export(
+    base_dir: &std::path::Path,
+    bundle_ref: &str,
+    format: PolicyExportFormat,
+    redaction: PolicyExportRedaction,
+) -> Result<()> {
+    let (tenant, workload) = parse_bundle_ref(bundle_ref)?;
+    let bundle = load_bundle(base_dir, bundle_ref, tenant, workload)?;
+    validate_bundle(&bundle)?;
+
+    match redaction {
+        PolicyExportRedaction::Raw => print_raw_export(&bundle, format),
+        PolicyExportRedaction::Redacted => {
+            let export = build_redacted_export(bundle_ref, tenant, workload, &bundle)?;
+            print_redacted_export(&export, format)
+        }
+    }
+}
+
 fn validate_bundle(bundle: &mvm_policy::PolicyBundle) -> Result<usize> {
     mvm_supervisor::LiveL4Gate::from_specs(&bundle.network.l4)
         .map_err(|e| anyhow::anyhow!("[[network.l4]] translation failed: {e}"))?;
@@ -240,6 +290,24 @@ fn validate_bundle(bundle: &mvm_policy::PolicyBundle) -> Result<usize> {
     let chain = mvm_supervisor::build_inspector_chain_with_pii(&bundle.egress, &bundle.pii, None)
         .map_err(|e| anyhow::anyhow!("[pii] validation failed: {e}"))?;
     Ok(chain.len())
+}
+
+fn build_redacted_export(
+    bundle_ref: &str,
+    tenant: &str,
+    workload: &str,
+    bundle: &mvm_policy::PolicyBundle,
+) -> Result<PolicyExportReport> {
+    validate_bundle(bundle)?;
+    Ok(PolicyExportReport {
+        schema_version: 1,
+        bundle_ref: bundle_ref.to_string(),
+        tenant: tenant.to_string(),
+        workload: workload.to_string(),
+        redaction: "redacted",
+        bundle: DiffBundleMeta::from_bundle(bundle),
+        policy: DiffSnapshot::from_bundle(bundle)?,
+    })
 }
 
 fn build_diff_report(
@@ -746,6 +814,48 @@ fn render_diff_human(report: &PolicyDiffReport) {
             println!("      after  = {}", compact_json(after));
         }
     }
+}
+
+fn print_raw_export(bundle: &mvm_policy::PolicyBundle, format: PolicyExportFormat) -> Result<()> {
+    match format {
+        PolicyExportFormat::Json => {
+            let json =
+                serde_json::to_string_pretty(bundle).context("serializing raw policy export")?;
+            println!("{json}");
+        }
+        PolicyExportFormat::Toml => {
+            let toml = toml::to_string_pretty(bundle).context("serializing raw policy export")?;
+            print!("{toml}");
+        }
+    }
+    Ok(())
+}
+
+fn print_redacted_export(export: &PolicyExportReport, format: PolicyExportFormat) -> Result<()> {
+    match format {
+        PolicyExportFormat::Json => {
+            let json = serde_json::to_string_pretty(export)
+                .context("serializing redacted policy export")?;
+            println!("{json}");
+        }
+        PolicyExportFormat::Toml => {
+            let toml =
+                toml::to_string_pretty(export).context("serializing redacted policy export")?;
+            print!("{toml}");
+        }
+    }
+    Ok(())
+}
+
+#[derive(Debug, Serialize)]
+struct PolicyExportReport {
+    schema_version: u32,
+    bundle_ref: String,
+    tenant: String,
+    workload: String,
+    redaction: &'static str,
+    bundle: DiffBundleMeta,
+    policy: DiffSnapshot,
 }
 
 fn diff_values(
@@ -1743,6 +1853,122 @@ port_hi  = 443
             .collect::<Vec<_>>()
             .join(" | ");
         assert!(chained.contains("right policy validation failed"));
+        assert!(chained.contains("translation failed"));
+    }
+
+    #[test]
+    fn cmd_export_accepts_redacted_json_and_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "web-worker", sensitive_bundle_toml());
+        cmd_export(
+            tmp.path(),
+            "acme:web-worker",
+            PolicyExportFormat::Json,
+            PolicyExportRedaction::Redacted,
+        )
+        .unwrap();
+        cmd_export(
+            tmp.path(),
+            "acme:web-worker",
+            PolicyExportFormat::Toml,
+            PolicyExportRedaction::Redacted,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn cmd_export_accepts_explicit_raw_json_and_toml() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "web-worker", minimal_bundle_toml());
+        cmd_export(
+            tmp.path(),
+            "acme:web-worker",
+            PolicyExportFormat::Json,
+            PolicyExportRedaction::Raw,
+        )
+        .unwrap();
+        cmd_export(
+            tmp.path(),
+            "acme:web-worker",
+            PolicyExportFormat::Toml,
+            PolicyExportRedaction::Raw,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn redacted_export_omits_raw_sensitive_values() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "web-worker", sensitive_bundle_toml());
+        let bundle = load_bundle(tmp.path(), "acme:web-worker", "acme", "web-worker").unwrap();
+        let export =
+            build_redacted_export("acme:web-worker", "acme", "web-worker", &bundle).unwrap();
+
+        let json = serde_json::to_string(&export).unwrap();
+        let toml = toml::to_string_pretty(&export).unwrap();
+        for serialized in [json, toml] {
+            assert!(serialized.contains("sha256:"));
+            assert!(!serialized.contains("/home/user/.ssh"));
+            assert!(!serialized.contains("customer-export"));
+            assert!(!serialized.contains("private-api.example.internal"));
+            assert!(!serialized.contains("audit.example.internal/tenant/acme"));
+            assert!(!serialized.contains("10.0.0.0/24"));
+        }
+    }
+
+    #[test]
+    fn raw_export_serializes_original_bundle_shape() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(tmp.path(), "acme", "web-worker", sensitive_bundle_toml());
+        let bundle = load_bundle(tmp.path(), "acme:web-worker", "acme", "web-worker").unwrap();
+
+        let json = serde_json::to_string(&bundle).unwrap();
+        let toml = toml::to_string_pretty(&bundle).unwrap();
+        assert!(json.contains("private-api.example.internal"));
+        assert!(json.contains("/home/user/.ssh"));
+        assert!(toml.contains("private-api.example.internal"));
+        assert!(toml.contains("/home/user/.ssh"));
+    }
+
+    #[test]
+    fn cmd_export_rejects_invalid_policy_before_exporting() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_bundle(
+            tmp.path(),
+            "acme",
+            "bad",
+            r#"
+schema_version = 1
+bundle_id      = "acme/bad"
+bundle_version = 1
+
+[network]
+[[network.l4]]
+proto    = "tcp"
+dst_cidr = "not-a-cidr"
+port_lo  = 443
+port_hi  = 443
+
+[egress]
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+"#,
+        );
+        let err = cmd_export(
+            tmp.path(),
+            "acme:bad",
+            PolicyExportFormat::Json,
+            PolicyExportRedaction::Redacted,
+        )
+        .unwrap_err();
+        let chained: String = err
+            .chain()
+            .map(|c| c.to_string())
+            .collect::<Vec<_>>()
+            .join(" | ");
         assert!(chained.contains("translation failed"));
     }
 

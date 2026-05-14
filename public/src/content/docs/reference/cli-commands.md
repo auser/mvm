@@ -150,6 +150,9 @@ description: Complete command reference for mvmctl.
 | `mvmctl policy lint <tenant>:<workload> --json` | Emit a redacted machine-readable lint report. Raw artifact capture paths, audit destination URLs, and egress hostnames are omitted. |
 | `mvmctl policy diff <left-tenant>:<left-workload> <right-tenant>:<right-workload>` | Validate two bundles and print a redacted policy diff. The command exits non-zero only for invalid or missing bundles, not because differences exist. |
 | `mvmctl policy diff <left-tenant>:<left-workload> <right-tenant>:<right-workload> --json` | Emit a redacted machine-readable diff report. Raw artifact paths, audit destination URLs, egress hostnames, and CIDRs are replaced with stable fingerprints and safe summaries. |
+| `mvmctl policy export <tenant>:<workload>` | Validate the bundle and emit a redacted JSON support/review artifact. Raw artifact paths, audit destination URLs, egress hostnames, and CIDRs are replaced with stable fingerprints and safe summaries. |
+| `mvmctl policy export <tenant>:<workload> --format toml` | Emit the same redacted support/review artifact as TOML |
+| `mvmctl policy export <tenant>:<workload> --redaction raw --format json\|toml` | Validate and emit the original raw policy bundle shape. Use only when the recipient is allowed to see the policy contents. |
 | `mvmctl policy update <tenant>:<workload> --from <path>` | Reserved for mvmd-signed policy updates; v0 refuses local mutation and exits with guidance |
 
 ## Flake Validation

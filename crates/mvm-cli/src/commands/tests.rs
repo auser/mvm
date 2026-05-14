@@ -1377,6 +1377,36 @@ fn test_policy_diff_json_parses() {
     }
 }
 
+#[test]
+fn test_policy_export_toml_raw_parses() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "policy",
+        "export",
+        "acme:web",
+        "--format",
+        "toml",
+        "--redaction",
+        "raw",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Policy(policy::Args {
+            action:
+                PolicyAction::Export {
+                    bundle,
+                    format,
+                    redaction,
+                },
+        }) => {
+            assert_eq!(bundle, "acme:web");
+            assert_eq!(format, policy::PolicyExportFormat::Toml);
+            assert_eq!(redaction, policy::PolicyExportRedaction::Raw);
+        }
+        other => panic!("Expected Policy Export command, got {other:?}"),
+    }
+}
+
 // --- Network CLI tests ---
 
 #[test]

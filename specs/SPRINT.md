@@ -1659,6 +1659,10 @@ Shipped:
   emits a redacted change report for policy review before rollout. Raw artifact
   paths, audit destination URLs, egress hostnames, and CIDRs are replaced with
   stable fingerprints and safe summaries.
+- `mvmctl policy export <tenant>:<workload> [--format json|toml]` validates
+  the bundle and emits a redacted support/review artifact by default; raw
+  export requires explicit `--redaction raw` and preserves the original bundle
+  shape for trusted migration workflows.
 - CLI reference and parser tests cover the new command and profile surface.
 
 ### Sprint 52 success criteria
