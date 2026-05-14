@@ -144,6 +144,8 @@ fn default_credential_ttl_hours() -> u32 {
 /// be added in a non-breaking minor release. Today only `Generated`
 /// is shipped; the registry rejects manifests that try to use any
 /// other variant at publish time.
+// allow(secret-debug): metadata-only enum with no credential payload; variants
+// describe how credentials are produced, not the credential value.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, JsonSchema)]
 #[serde(rename_all = "snake_case")]
 #[non_exhaustive]
