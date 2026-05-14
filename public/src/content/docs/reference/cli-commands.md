@@ -53,7 +53,7 @@ description: Complete command reference for mvmctl.
 | `mvmctl dev down --reset` | Also delete the cached dev image so the next `dev up` rebuilds from local source |
 | `mvmctl dev shell` | Open a shell in the running Lima VM |
 | `mvmctl dev shell --project ~/dir` | Open shell and cd into a project directory |
-| `mvmctl dev status` | Show dev environment status (Lima VM, Firecracker, Nix versions) |
+| `mvmctl dev status` | Show dev environment backend, running state, and cached image paths |
 | `mvmctl dev rebuild` | Stop, clear cache, and rebuild + restart the dev VM |
 | `mvmctl dev rebuild --shell` (or `-s`) | Open an interactive shell after rebuilding |
 | `mvmctl dev import-image <path>` | Side-load a pre-built dev image artifact into the cache (air-gapped install path; from plan 36 sealed builder image) |

@@ -459,26 +459,79 @@ pub(super) fn cmd_dev_apple_container_status() -> Result<()> {
         ui::info(&format!("  Kernel:  {}", stdout.trim()));
     }
 
-    // Show dev image info
-    let cache_dir = format!("{}/dev", mvm_core::config::mvm_cache_dir());
-    let kernel_path = format!("{cache_dir}/vmlinux");
-    let rootfs_path = format!("{cache_dir}/rootfs.ext4");
-    ui::info(&format!(
-        "  Image:   {}",
-        if std::path::Path::new(&rootfs_path).exists() {
-            "cached"
-        } else {
-            "not built"
+    if let Some(image) = resolve_dev_status_image() {
+        ui::info("  Image:   cached");
+        if let Some(kernel_path) = image.kernel_path {
+            ui::info(&format!("  Kernel:  {kernel_path}"));
         }
-    ));
-    if std::path::Path::new(&kernel_path).exists() {
-        ui::info(&format!("  Kernel:  {kernel_path}"));
-    }
-    if std::path::Path::new(&rootfs_path).exists() {
-        ui::info(&format!("  Rootfs:  {rootfs_path}"));
+        ui::info(&format!("  Rootfs:  {}", image.rootfs_path));
+    } else {
+        ui::info("  Image:   not built");
     }
 
     Ok(())
+}
+
+#[derive(Debug, Eq, PartialEq)]
+struct DevStatusImage {
+    kernel_path: Option<String>,
+    rootfs_path: String,
+}
+
+fn resolve_dev_status_image() -> Option<DevStatusImage> {
+    if let Some(image) = dev_launchd_image_paths()
+        && std::path::Path::new(&image.rootfs_path).exists()
+    {
+        return Some(image);
+    }
+
+    let version = env!("CARGO_PKG_VERSION");
+    for dir in [
+        format!("{}/dev/current", mvm_core::config::mvm_data_dir()),
+        format!(
+            "{}/dev/prebuilt/v{version}",
+            mvm_core::config::mvm_data_dir()
+        ),
+        format!("{}/dev", mvm_core::config::mvm_cache_dir()),
+    ] {
+        let rootfs_path = format!("{dir}/rootfs.ext4");
+        if !std::path::Path::new(&rootfs_path).exists() {
+            continue;
+        }
+        let kernel_path = format!("{dir}/vmlinux");
+        return Some(DevStatusImage {
+            kernel_path: std::path::Path::new(&kernel_path)
+                .exists()
+                .then_some(kernel_path),
+            rootfs_path,
+        });
+    }
+
+    None
+}
+
+fn dev_launchd_image_paths() -> Option<DevStatusImage> {
+    let plist = std::fs::read_to_string(dev_launchd_plist_path()).ok()?;
+    Some(DevStatusImage {
+        kernel_path: plist_env_string_value(&plist, "MVM_DEV_KERNEL"),
+        rootfs_path: plist_env_string_value(&plist, "MVM_DEV_ROOTFS")?,
+    })
+}
+
+fn plist_env_string_value(plist: &str, key: &str) -> Option<String> {
+    let expected_key = format!("<key>{key}</key>");
+    let mut lines = plist.lines().map(str::trim);
+    while let Some(line) = lines.next() {
+        if line != expected_key {
+            continue;
+        }
+        let value = lines.next()?.trim();
+        return value
+            .strip_prefix("<string>")?
+            .strip_suffix("</string>")
+            .map(str::to_string);
+    }
+    None
 }
 
 /// Resolve the dev image (kernel + rootfs) to absolute paths.
@@ -1841,6 +1894,194 @@ fn download_default_microvm_image(
 
     ui::success("Default microVM image downloaded, hash-verified, and cached.");
     Ok((kernel_path.to_string(), rootfs_path.to_string()))
+}
+
+#[cfg(test)]
+mod dev_status_image_tests {
+    use super::*;
+    use std::sync::Mutex;
+
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
+
+    struct EnvGuard {
+        home: Option<String>,
+        data_dir: Option<String>,
+        cache_dir: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn set(
+            home: &std::path::Path,
+            data_dir: &std::path::Path,
+            cache_dir: &std::path::Path,
+        ) -> Self {
+            let guard = Self {
+                home: std::env::var("HOME").ok(),
+                data_dir: std::env::var("MVM_DATA_DIR").ok(),
+                cache_dir: std::env::var("MVM_CACHE_DIR").ok(),
+            };
+            unsafe {
+                std::env::set_var("HOME", home);
+                std::env::set_var("MVM_DATA_DIR", data_dir);
+                std::env::set_var("MVM_CACHE_DIR", cache_dir);
+            }
+            guard
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match &self.home {
+                    Some(value) => std::env::set_var("HOME", value),
+                    None => std::env::remove_var("HOME"),
+                }
+                match &self.data_dir {
+                    Some(value) => std::env::set_var("MVM_DATA_DIR", value),
+                    None => std::env::remove_var("MVM_DATA_DIR"),
+                }
+                match &self.cache_dir {
+                    Some(value) => std::env::set_var("MVM_CACHE_DIR", value),
+                    None => std::env::remove_var("MVM_CACHE_DIR"),
+                }
+            }
+        }
+    }
+
+    fn touch(path: &std::path::Path) {
+        std::fs::create_dir_all(path.parent().expect("test path must have parent")).unwrap();
+        std::fs::write(path, b"test").unwrap();
+    }
+
+    #[test]
+    fn status_image_prefers_launchd_image_paths() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let home = tmp.path().join("home");
+        let data_dir = tmp.path().join("data");
+        let cache_dir = tmp.path().join("cache");
+        let _env = EnvGuard::set(&home, &data_dir, &cache_dir);
+
+        let launchd_kernel = tmp.path().join("daemon/vmlinux");
+        let launchd_rootfs = tmp.path().join("daemon/rootfs.ext4");
+        touch(&launchd_kernel);
+        touch(&launchd_rootfs);
+        touch(&data_dir.join("dev/current/vmlinux"));
+        touch(&data_dir.join("dev/current/rootfs.ext4"));
+
+        let plist_path = dev_launchd_plist_path();
+        std::fs::create_dir_all(plist_path.parent().unwrap()).unwrap();
+        std::fs::write(
+            plist_path,
+            format!(
+                r#"<plist version="1.0">
+<dict>
+    <key>EnvironmentVariables</key>
+    <dict>
+        <key>MVM_DEV_KERNEL</key>
+        <string>{}</string>
+        <key>MVM_DEV_ROOTFS</key>
+        <string>{}</string>
+    </dict>
+</dict>
+</plist>"#,
+                launchd_kernel.display(),
+                launchd_rootfs.display()
+            ),
+        )
+        .unwrap();
+
+        assert_eq!(
+            resolve_dev_status_image(),
+            Some(DevStatusImage {
+                kernel_path: Some(launchd_kernel.to_string_lossy().into_owned()),
+                rootfs_path: launchd_rootfs.to_string_lossy().into_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn status_image_reports_current_data_dir_image() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &tmp.path().join("data"),
+            &tmp.path().join("cache"),
+        );
+        let kernel = tmp.path().join("data/dev/current/vmlinux");
+        let rootfs = tmp.path().join("data/dev/current/rootfs.ext4");
+        touch(&kernel);
+        touch(&rootfs);
+
+        assert_eq!(
+            resolve_dev_status_image(),
+            Some(DevStatusImage {
+                kernel_path: Some(kernel.to_string_lossy().into_owned()),
+                rootfs_path: rootfs.to_string_lossy().into_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn status_image_reports_versioned_prebuilt_when_current_missing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &data_dir,
+            &tmp.path().join("cache"),
+        );
+        let dir = data_dir
+            .join("dev/prebuilt")
+            .join(format!("v{}", env!("CARGO_PKG_VERSION")));
+        let rootfs = dir.join("rootfs.ext4");
+        touch(&rootfs);
+
+        assert_eq!(
+            resolve_dev_status_image(),
+            Some(DevStatusImage {
+                kernel_path: None,
+                rootfs_path: rootfs.to_string_lossy().into_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn status_image_falls_back_to_legacy_cache_dir() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_dir = tmp.path().join("cache");
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &tmp.path().join("data"),
+            &cache_dir,
+        );
+        let rootfs = cache_dir.join("dev/rootfs.ext4");
+        touch(&rootfs);
+
+        assert_eq!(
+            resolve_dev_status_image(),
+            Some(DevStatusImage {
+                kernel_path: None,
+                rootfs_path: rootfs.to_string_lossy().into_owned(),
+            })
+        );
+    }
+
+    #[test]
+    fn status_image_is_none_when_no_rootfs_exists() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &tmp.path().join("data"),
+            &tmp.path().join("cache"),
+        );
+
+        assert_eq!(resolve_dev_status_image(), None);
+    }
 }
 
 #[cfg(test)]
