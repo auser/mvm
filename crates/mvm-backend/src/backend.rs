@@ -13,8 +13,6 @@ use crate::cloud_hypervisor::CloudHypervisorBackend;
 use crate::docker::DockerBackend;
 use crate::image::RuntimeVolume;
 use crate::libkrun::LibkrunBackend;
-#[cfg(feature = "contributor-bootstrap")]
-use crate::microsandbox::MicrosandboxBackend;
 use crate::microvm::{DriveFile, FlakeRunConfig};
 use crate::mock::MockBackend;
 use crate::{firecracker, microvm, microvm_nix};
@@ -251,11 +249,6 @@ pub enum AnyBackend {
     /// libkrun (plan 53 §"Plan E") — Linux KVM / macOS HVF, including
     /// macOS Intel where Apple Container is unavailable.
     Libkrun(LibkrunBackend),
-    /// microsandbox (plan 60 — ADR-013) — higher-level libkrun wrapper.
-    /// Linux still prefers Firecracker when KVM is available. Gated on
-    /// `contributor-bootstrap`, which lean default builds leave disabled.
-    #[cfg(feature = "contributor-bootstrap")]
-    Microsandbox(MicrosandboxBackend),
     /// Cloud Hypervisor — rust-vmm peer of Firecracker at Tier 1. Adds
     /// VFIO passthrough, virtio-gpu, virtio-fs, and larger guests
     /// beyond what FC supports. Opt-in via `--hypervisor cloud-hypervisor`;
@@ -297,8 +290,6 @@ impl AnyBackend {
             "apple-container" => Self::AppleContainer(AppleContainerBackend),
             "docker" => Self::Docker(DockerBackend),
             "libkrun" | "krun" => Self::Libkrun(LibkrunBackend),
-            #[cfg(feature = "contributor-bootstrap")]
-            "microsandbox" | "msb" => Self::Microsandbox(MicrosandboxBackend),
             "cloud-hypervisor" | "cloud_hypervisor" | "ch" | "clh" => {
                 Self::CloudHypervisor(CloudHypervisorBackend)
             }
@@ -315,16 +306,14 @@ impl AnyBackend {
     /// Select the best backend for the current platform.
     ///
     /// Firecracker is the production target — it always wins when KVM
-    /// is available. When `contributor-bootstrap` is enabled and KVM is
-    /// not available, microsandbox is the cross-platform Tier 2 choice.
-    /// Lean default builds skip it and continue down the fallback ladder.
+    /// is available. When KVM is not available, selection continues down
+    /// the local backend ladder without the upstream microsandbox crate.
     ///
     /// Priority:
     /// 1. **Firecracker** (if `/dev/kvm` available — production Tier 1)
-    /// 2. **microsandbox** (cross-platform Tier 2 — macOS + Linux no-KVM)
-    /// 3. Apple Container (macOS 26+ — kept for now; plan 60 schedules removal)
-    /// 4. raw libkrun (legacy ladder — eventual drop)
-    /// 5. Docker (Tier 3 fallback — banner emitted; not promoted)
+    /// 2. Apple Container (macOS 26+)
+    /// 3. raw libkrun
+    /// 4. Docker (Tier 3 fallback — banner emitted; not promoted)
     ///
     /// If none of the above match, the function returns Firecracker as
     /// the default — `start()` will then surface the host-side
@@ -341,35 +330,17 @@ impl AnyBackend {
             return Self::Firecracker(FirecrackerBackend);
         }
 
-        // 2. microsandbox — ADR-013 cross-platform backend. Vendors
-        //    libkrunfw so works on macOS arm64/x86_64 + Linux no-KVM
-        //    without a separate libkrun install. Sits above Apple
-        //    Container in the ladder because plan 60 schedules
-        //    AppleContainer removal in favor of microsandbox.
-        //    Gated on `contributor-bootstrap` — when off, this arm is
-        //    absent and the ladder falls through to Apple Container /
-        //    libkrun / Docker.
-        #[cfg(feature = "contributor-bootstrap")]
-        if plat.has_microsandbox() {
-            return Self::Microsandbox(MicrosandboxBackend);
-        }
-
-        // 3. macOS 26+ → Apple Virtualization.framework. Currently
-        //    unreachable because has_microsandbox() shadows it on every
-        //    macOS host; kept as a fallback for the (extremely narrow)
-        //    case where microsandbox is feature-gated out of a build.
+        // 2. macOS 26+ → Apple Virtualization.framework.
         if plat.has_apple_containers() {
             return Self::AppleContainer(AppleContainerBackend);
         }
 
-        // 4. libkrun installed → use the raw libkrun shim. Same notes
-        //    as #3 — usually shadowed by microsandbox; lives for the
-        //    feature-gate-out case.
+        // 3. libkrun installed → use the raw libkrun shim.
         if plat.has_libkrun() {
             return Self::Libkrun(LibkrunBackend);
         }
 
-        // 5. Docker available → universal Tier 3 fallback. The CLI emits
+        // 4. Docker available → universal Tier 3 fallback. The CLI emits
         //    a loud, suppressible banner when this path is taken (plan 53
         //    Plan B). Not preferred; only chosen when no microVM tier is
         //    available on this host.
@@ -391,8 +362,6 @@ impl AnyBackend {
             Self::AppleContainer(b) => b,
             Self::Docker(b) => b,
             Self::Libkrun(b) => b,
-            #[cfg(feature = "contributor-bootstrap")]
-            Self::Microsandbox(b) => b,
             Self::CloudHypervisor(b) => b,
             Self::Mock(b) => b,
         }
@@ -647,31 +616,6 @@ mod tests {
         assert!(p.layer_coverage.is_microvm());
     }
 
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn test_any_backend_from_hypervisor_microsandbox() {
-        // Plan 60 ADR-013 — explicit "microsandbox" routing. Both the
-        // long form and the short alias resolve to the same backend so
-        // CLI users can type either.
-        let long = AnyBackend::from_hypervisor("microsandbox");
-        let short = AnyBackend::from_hypervisor("msb");
-        assert_eq!(long.name(), "microsandbox");
-        assert_eq!(short.name(), "microsandbox");
-    }
-
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn test_microsandbox_via_any_backend_security_profile_tier_2() {
-        // The dispatch must surface the inner backend's full security
-        // profile — regression-guard against AnyBackend silently dropping
-        // a variant from `inner()` (the most common bug shape when adding
-        // a new arm to the enum).
-        let backend = AnyBackend::from_hypervisor("microsandbox");
-        let profile = backend.security_profile();
-        assert_eq!(profile.tier, "Tier 2");
-        assert!(profile.layer_coverage.is_microvm());
-    }
-
     #[test]
     fn test_any_backend_capabilities() {
         let backend = AnyBackend::default_backend();
@@ -748,50 +692,13 @@ mod tests {
         let backend = AnyBackend::auto_select();
         let name = backend.name();
         assert!(
-            // microsandbox is the new ADR-013 default for non-KVM hosts.
             // The full set of legitimate auto_select returns is:
             matches!(
                 name,
-                "firecracker" | "microsandbox" | "apple-container" | "libkrun" | "docker"
+                "firecracker" | "apple-container" | "libkrun" | "docker"
             ),
             "auto_select returned unexpected backend: {name}"
         );
-    }
-
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn test_auto_select_prefers_microsandbox_on_macos() {
-        // ADR-013 invariant: on macOS, microsandbox wins over Apple
-        // Container in auto_select. The test only runs on macOS hosts
-        // (the only platform where the precedence is observable —
-        // Linux+KVM picks Firecracker first, Linux without KVM has no
-        // Apple Container path to compete with).
-        if !cfg!(target_os = "macos") {
-            return;
-        }
-        let backend = AnyBackend::auto_select();
-        assert_eq!(
-            backend.name(),
-            "microsandbox",
-            "auto_select on macOS must prefer microsandbox over Apple Container per ADR-013"
-        );
-    }
-
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn test_auto_select_returns_microsandbox_when_microsandbox_available_and_no_kvm() {
-        // The contract: if has_microsandbox() && !has_kvm(), the
-        // result must be Microsandbox. Sanity-check the actual
-        // platform's claims (we don't synthesise platform values
-        // here because Platform is a runtime-detected enum).
-        let plat = mvm_core::platform::current();
-        if plat.has_microsandbox() && !plat.has_kvm() {
-            assert_eq!(
-                AnyBackend::auto_select().name(),
-                "microsandbox",
-                "non-KVM platform with microsandbox available must auto-select microsandbox"
-            );
-        }
     }
 
     // ------------------------------------------------------------------
@@ -824,15 +731,6 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn pause_resume_unsupported_on_microsandbox() {
-        assert_unsupported_pause_resume(
-            AnyBackend::from_hypervisor("microsandbox"),
-            "microsandbox",
-        );
-    }
-
     #[test]
     fn pause_resume_unsupported_on_libkrun() {
         assert_unsupported_pause_resume(AnyBackend::from_hypervisor("libkrun"), "libkrun");
@@ -861,16 +759,7 @@ mod tests {
         // live VM, but we can check that the bail (if any) for a
         // missing VM does NOT claim the backend itself is unsupported
         // when the capability says it is.
-        // `microsandbox` only participates when the backend is compiled
-        // in — when the feature is off `from_hypervisor("microsandbox")`
-        // falls through to Firecracker and the assertion would flip.
-        let unsupported: &[&str] = &[
-            #[cfg(feature = "contributor-bootstrap")]
-            "microsandbox",
-            "libkrun",
-            "qemu", // → microvm-nix
-            "apple-container",
-        ];
+        let unsupported: &[&str] = &["libkrun", "qemu", "apple-container"];
         for &name in unsupported {
             let b = AnyBackend::from_hypervisor(name);
             assert!(

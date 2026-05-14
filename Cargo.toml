@@ -75,12 +75,6 @@ too_many_arguments = "deny"
 # Async runtime
 tokio = { version = "1", features = ["full"] }
 
-# microsandbox (plan 60 ADR-013) — libkrun-backed, cross-platform
-# (Linux KVM, macOS Hypervisor.framework, Windows pending) sandbox
-# runtime. Phase 1 W2 wires it into the MicrosandboxBackend's
-# start/stop/exec lifecycle.
-microsandbox = "0.4.5"
-
 # Pattern matching
 aho-corasick = "1"
 regex = "1"
@@ -246,9 +240,9 @@ path = "src/main.rs"
 [dependencies]
 mvm-core.workspace = true
 mvm-security.workspace = true
-# `default-features = false` keeps the heavy microsandbox stack out of the
-# lean default binary. Operators who need the libkrun/microsandbox path opt in
-# with `--features contributor-bootstrap`.
+# `default-features = false` keeps optional backend affordances out of the
+# lean default binary. The old Rust microsandbox dependency is intentionally
+# absent because it vendors SeaORM / SQLx database crates.
 mvm = { workspace = true, default-features = false }
 mvm-backend = { workspace = true, default-features = false }
 mvm-build = { workspace = true, default-features = false }

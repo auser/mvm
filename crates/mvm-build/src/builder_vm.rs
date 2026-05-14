@@ -343,13 +343,13 @@ impl BuilderVm for StubBuilderVm {
 /// Default vCPU count for the builder sandbox. Tuned for "fast
 /// enough to feel native on a developer laptop" without saturating
 /// the host. Override via [`MicrosandboxBuilderVm::with_resources`].
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 const BUILDER_DEFAULT_CPUS: u8 = 4;
 
 /// Default memory for the builder sandbox, in MiB. Nix derivations
 /// for guest rootfs builds peak well under 4 GiB; 4096 MiB leaves
 /// headroom for the dev tooling closure plus jobserver fan-out.
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 const BUILDER_DEFAULT_MEMORY_MIB: u32 = 4096;
 
 /// Where in the sandbox the user's flake gets bind-mounted.
@@ -387,14 +387,14 @@ pub const BUILDER_GUEST_OUT_DIR: &str = "/out";
 /// - **Snapshot warm-pool.** ADR-013 hints at a future warm-pool of
 ///   pre-loaded builder sandboxes for sub-second cold-start. Out of
 ///   scope here.
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 #[derive(Debug, Clone)]
 pub struct MicrosandboxBuilderVm {
     cpus: u8,
     memory_mib: u32,
 }
 
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 impl Default for MicrosandboxBuilderVm {
     fn default() -> Self {
         Self {
@@ -404,7 +404,7 @@ impl Default for MicrosandboxBuilderVm {
     }
 }
 
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 impl MicrosandboxBuilderVm {
     /// Override the default vCPU / memory pair. Useful for CI runners
     /// or low-memory hosts that can't afford the 4 GiB default.
@@ -420,7 +420,7 @@ impl MicrosandboxBuilderVm {
 /// `tokio::Runtime` is built fresh per call so the trait stays
 /// `Send + Sync` and dyn-friendly. Per-call cost (~200 µs) is
 /// dominated by sandbox spawn (~200 ms) so the trade is fine.
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 fn block_on<F: std::future::Future>(fut: F) -> F::Output {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -438,7 +438,7 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 /// Only the [`BuilderJob::Flake`] variant ever reaches this helper
 /// because microsandbox refuses install jobs upstream; the match
 /// arm for `Install` is wired for compile completeness.
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 fn sandbox_name(job: &BuilderJob) -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let stamp = SystemTime::now()
@@ -468,12 +468,12 @@ fn sandbox_name(job: &BuilderJob) -> String {
 /// the rest of the Lima paths) — kept inline here so the builder
 /// crate doesn't take a dep on a runtime-side helper for one
 /// function.
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 fn shell_quote_arg(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\\''"))
 }
 
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 impl BuilderVm for MicrosandboxBuilderVm {
     fn run_build(
         &self,
@@ -529,7 +529,7 @@ impl BuilderVm for MicrosandboxBuilderVm {
 /// — CLAUDE.md forbids suppressing that lint, and pulling 9 owned
 /// values across an `await` boundary one by one isn't readable
 /// anyway.
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 struct RunBuildParams {
     name: String,
     cpus: u8,
@@ -545,7 +545,7 @@ struct RunBuildParams {
 /// Async body of [`MicrosandboxBuilderVm::run_build`]. Lifted out so
 /// the sync trait method stays narrow and the async surface is
 /// testable in isolation when integration coverage lands.
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, BuilderVmError> {
     let RunBuildParams {
         name,
@@ -967,7 +967,7 @@ mod tests {
         assert_eq!(extract_revision_hash("not-a-store-path"), "not");
     }
 
-    #[cfg(feature = "contributor-bootstrap")]
+    #[cfg(any())]
     #[test]
     fn sandbox_name_has_stable_prefix() {
         // Same flake+attr produces the same hash segment; only the
@@ -985,7 +985,7 @@ mod tests {
         );
     }
 
-    #[cfg(feature = "contributor-bootstrap")]
+    #[cfg(any())]
     #[test]
     fn microsandbox_builder_has_sensible_defaults() {
         let b = MicrosandboxBuilderVm::default();
@@ -993,7 +993,7 @@ mod tests {
         assert_eq!(b.memory_mib, BUILDER_DEFAULT_MEMORY_MIB);
     }
 
-    #[cfg(feature = "contributor-bootstrap")]
+    #[cfg(any())]
     #[test]
     fn microsandbox_builder_with_resources_overrides() {
         let b = MicrosandboxBuilderVm::default().with_resources(2, 2048);
@@ -1001,7 +1001,7 @@ mod tests {
         assert_eq!(b.memory_mib, 2048);
     }
 
-    #[cfg(feature = "contributor-bootstrap")]
+    #[cfg(any())]
     #[test]
     fn shell_quote_arg_escapes_single_quotes() {
         assert_eq!(shell_quote_arg("simple"), "'simple'");
@@ -1010,7 +1010,7 @@ mod tests {
         assert_eq!(shell_quote_arg("it's"), "'it'\\''s'");
     }
 
-    #[cfg(feature = "contributor-bootstrap")]
+    #[cfg(any())]
     #[test]
     fn run_build_validates_missing_flake_src() {
         // Skip the path that actually spawns microsandbox — just
@@ -1037,7 +1037,7 @@ mod tests {
         assert!(err.to_string().contains("does not exist"), "msg: {err}");
     }
 
-    #[cfg(feature = "contributor-bootstrap")]
+    #[cfg(any())]
     #[test]
     fn microsandbox_rejects_install_job_variant() {
         // The microsandbox backend doesn't get install-pipeline

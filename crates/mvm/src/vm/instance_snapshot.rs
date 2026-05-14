@@ -209,7 +209,7 @@ pub fn verify_and_resume<IO: SnapshotIO + ?Sized>(
 /// the resulting snapshot stays unencrypted, HMAC-only (Phase 1 /
 /// pre-W5 shape).
 fn encrypt_artifacts_if_keyed(dir: &Path) -> Result<()> {
-    let provider = keystore::default_provider();
+    let provider = snapshot_key_provider();
     let Ok(dek) = provider.get_data_key(SNAPSHOT_TENANT_ID) else {
         // No tenant DEK configured — leave artifacts unencrypted.
         // Operators who want at-rest encryption configure a key
@@ -248,7 +248,7 @@ fn encrypt_artifacts_if_keyed(dir: &Path) -> Result<()> {
 /// or v1-shape leftover); set `MVM_ALLOW_UNENCRYPTED_SNAPSHOT=1`
 /// to bypass during the one-time v1 → v2 migration.
 fn decrypt_artifacts_if_encrypted(dir: &Path) -> Result<()> {
-    let provider = keystore::default_provider();
+    let provider = snapshot_key_provider();
     let dek_opt = provider.get_data_key(SNAPSHOT_TENANT_ID).ok();
 
     for name in [VMSTATE_FILENAME, MEM_FILENAME] {
@@ -287,6 +287,16 @@ fn decrypt_artifacts_if_encrypted(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+#[cfg(not(test))]
+fn snapshot_key_provider() -> Box<dyn keystore::KeyProvider> {
+    keystore::default_provider()
+}
+
+#[cfg(test)]
+fn snapshot_key_provider() -> Box<dyn keystore::KeyProvider> {
+    Box::new(keystore::EnvKeyProvider)
 }
 
 /// Drop the on-disk snapshot files + sidecar + epoch counter for

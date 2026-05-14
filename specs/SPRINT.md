@@ -41,6 +41,7 @@ Recent maintenance:
 - [x] Source-checkout `mvmctl dev up` now refuses to download published prebuilts when the binary was built without `contributor-bootstrap`; it exits with the local-build feature hint instead, preserving the "dev reflects local flakes" invariant.
 - [x] Extended `runtime_boot_bench` with TOML config-file input, Apple Container backend defaults, configurable CPU/memory sizing, and Apple guest-agent readiness probing.
 - [x] Added intent-bound admission profiles to signed `ExecutionPlan` v4, binding intent, seccomp tier, policy refs, secret-release posture, and audit taxonomy without adding new sandbox execution capability.
+- [x] Removed the upstream Rust `microsandbox` dependency from the workspace because it pulled SeaORM / SQLx database crates; added `xtask check-forbidden-deps` + CI coverage to reject `sea-*` and `mysql` packages in `Cargo.lock`.
 
 ## In-flight workstreams
 
