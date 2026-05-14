@@ -11,6 +11,13 @@ authors.workspace = true
 [dependencies]
 mvm-core.workspace = true
 mvm-guest.workspace = true
+# Plan 73 Followup B.1 — `install_app_deps` reuses
+# `mvm_sdk::compile::deps_audit::{verify_sealed_volume, VolumeError}`
+# for cache-hit verification. The orchestrator owns the cache
+# probe + miss-path placeholder; the audit primitives stay in
+# `mvm-sdk` so the supervisor and the builder VM go through the
+# same types.
+mvm-sdk.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 # Optional — see the same dep in `mvm-backend/Cargo.toml` for the
