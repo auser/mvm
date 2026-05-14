@@ -15,6 +15,10 @@ members = [
     "crates/mvm-guest",
     "crates/mvm-cli",
     "crates/mvm-mcp",
+    # Plan 72 W3 — PID-1 for the libkrun builder VM. Linux-only at
+    # runtime; the crate compiles on macOS / Windows as an inert
+    # binary so workspace builds stay green for non-Linux contributors.
+    "crates/mvm-builder-init",
     # plan 60 Phase 5 — build-time SDK port from ../mvmforge.
     # mvm-ir is the canonical Workload IR; mvm-sdk is the builder
     # surface; mvm-sdk-macros is a placeholder for the proc-macro

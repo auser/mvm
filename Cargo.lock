@@ -4170,6 +4170,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-builder-init"
+version = "0.14.0"
+dependencies = [
+ "nix 0.29.0",
+]
+
+[[package]]
 name = "mvm-cli"
 version = "0.14.0"
 dependencies = [
