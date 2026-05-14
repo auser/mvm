@@ -9,9 +9,9 @@ Networking differs by backend:
 
 | Backend | Network Type | Guest IP | Host Access |
 |---------|-------------|----------|-------------|
-| Firecracker (Linux) | TAP device | 172.16.0.2/30 | Direct via TAP |
-| Firecracker (Lima) | TAP in Lima VM | 172.16.0.2/30 | Via Lima NAT |
+| Firecracker (Linux native) | TAP device | 172.16.0.2/30 | Direct via TAP |
 | Apple Container | vmnet | DHCP-assigned | Via vmnet bridge |
+| libkrun (macOS) | TSI (transparent socket impl) | host-loopback | Via per-port vsock listeners |
 | microvm.nix | TAP device | 172.16.0.2/30 | Direct via TAP |
 | Docker | Docker bridge | Docker-assigned | Via Docker port mapping |
 
@@ -20,12 +20,10 @@ Networking differs by backend:
 ```
 Firecracker microVM (172.16.0.2/30, eth0)
     | TAP interface (tap0)
-Lima VM (172.16.0.1/30, tap0)  --  iptables NAT  --  internet
-    | Lima virtualization
-Host (macOS / Linux)
+Linux host (172.16.0.1/30, tap0)  --  iptables NAT  --  internet
 ```
 
-The microVM has internet access via NAT through the Lima VM (or directly on native Linux). The TAP device connects the microVM to the host network namespace.
+On Linux with `/dev/kvm`, Firecracker boots directly on the host — no VM hop. The TAP device connects the microVM to the host network namespace and gets NAT'd to the internet. On macOS hosts, networking is backend-specific: Apple Container uses vmnet bridge mode; libkrun uses TSI (transparent socket impl) where outbound TCP/UDP appears as host-side socket calls.
 
 ## Port Forwarding
 
@@ -75,7 +73,7 @@ mvmctl up --flake . \
     --network-allow api.openai.com:443
 ```
 
-Network policies are enforced via iptables FORWARD rules on the bridge interface inside the Lima VM. DNS (port 53) is always allowed so domain resolution works. Rules are automatically cleaned up when the VM stops.
+Network policies are enforced via iptables FORWARD rules on the bridge interface (Firecracker backend on Linux). DNS (port 53) is always allowed so domain resolution works. Rules are automatically cleaned up when the VM stops. On macOS backends, policies are enforced at the host-side TSI/vmnet layer rather than via iptables.
 
 **Built-in presets:**
 

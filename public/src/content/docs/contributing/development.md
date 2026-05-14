@@ -6,7 +6,7 @@ description: Getting started as a contributor to mvm.
 ## Prerequisites
 
 - **Rust 1.85+** (Edition 2024) — install via [rustup](https://rustup.rs)
-- **macOS or Linux** — macOS for development via Lima, Linux for native `/dev/kvm`
+- **macOS or Linux** — macOS for development via Apple Container (26+) or libkrun (pre-26); Linux for native `/dev/kvm`
 - **Nix** (optional) — only needed for building microVM images
 
 Run the bootstrap script on a fresh machine:
@@ -24,7 +24,7 @@ just build
 # Run CLI
 just run -- --help
 
-# Dev mode (auto-bootstraps Lima + Firecracker)
+# Dev mode (auto-bootstraps the dev VM + Firecracker)
 just run -- dev
 
 # Release build (stripped, LTO)
@@ -80,18 +80,19 @@ just lint         # Both format check + clippy
 
 ### Multi-Backend
 
-mvmctl supports four backends: Firecracker (native Linux), Apple Container (macOS 26+), Docker (universal fallback), and microvm.nix (NixOS QEMU). The `VmBackend` trait in `mvm-core` abstracts the lifecycle; `AnyBackend` in `mvm-runtime` dispatches at runtime. Auto-selection priority: KVM → Apple Container → Docker → Lima + Firecracker.
+mvmctl supports five backends: Firecracker (native Linux), Apple Container (macOS 26+), libkrun (macOS Intel / pre-26 via Hypervisor.framework), Docker (universal fallback), and microvm.nix (NixOS QEMU). The `VmBackend` trait in `mvm-core` abstracts the lifecycle; `AnyBackend` in `mvm-runtime` dispatches at runtime. Auto-selection priority: KVM → Apple Container → libkrun → Docker.
 
 ### Host vs. VM
 
-All Linux operations (networking, Firecracker, cgroups) run inside the Lima VM on macOS <26:
+All Linux operations (networking, Firecracker, cgroups) run inside the builder VM on macOS:
 
 ```rust
-// This runs a bash script inside the Lima VM (or natively on Linux with KVM)
+// On Linux this runs directly on the host; on macOS it routes into the
+// libkrun-backed builder VM.
 mvm_runtime::shell::run_in_vm("ip link add br-tenant-1 type bridge")?;
 ```
 
-On native Linux, `run_in_vm` runs directly without Lima. On macOS 26+, the Apple Container backend handles VM lifecycle natively.
+On native Linux, `run_in_vm` executes directly on the host. On macOS, it delegates into the builder VM (Apple Container on 26+, libkrun on pre-26).
 
 ### Key Patterns
 
@@ -114,7 +115,7 @@ When adding fields to structs in serialized state:
 Beyond the standard build/test/lint cycle, mvmctl provides commands for managing the dev environment:
 
 ```bash
-# First-time setup (installs deps, creates Lima VM, default network)
+# First-time setup (installs deps, creates the dev VM, default network)
 just run -- init
 
 # Image catalog — browse and build images from Nix templates

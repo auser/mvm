@@ -11,15 +11,15 @@ mvmctl supports multiple VM backends and auto-selects the best one for your plat
 |---------|----------|-------------------|
 | Firecracker | Linux with `/dev/kvm` | 1st (preferred) |
 | Apple Container | macOS 26+ (Apple Silicon) | 2nd |
-| Docker | Any platform with Docker daemon | 3rd |
+| libkrun | macOS Intel / macOS pre-26 (Hypervisor.framework) | 3rd |
+| Docker | Any platform with Docker daemon | 4th (reduced isolation) |
 | microvm.nix | Linux (NixOS-native QEMU) | Via `--hypervisor qemu` |
-| Lima + Firecracker | macOS <26, Linux without KVM | 4th (legacy fallback) |
 
 ```
 Linux (KVM):    mvmctl up  -->  Firecracker microVM (direct)
 macOS 26+:      mvmctl up  -->  Apple Container (Virtualization.framework)
-Docker:         mvmctl up  -->  Docker container (universal fallback)
-macOS <26:      mvmctl up  -->  Lima VM (Ubuntu)  -->  Firecracker microVM
+macOS <26:      mvmctl up  -->  libkrun microVM (Hypervisor.framework)
+Docker:         mvmctl up  -->  Docker container (Tier 3 fallback)
 ```
 
 All backends consume the same Nix-built ext4 rootfs. Override auto-detection with `--hypervisor`:
@@ -34,12 +34,12 @@ mvmctl doctor   # check available backends
 
 ### Backend Capabilities
 
-| Capability | Firecracker | Apple Container | microvm.nix | Docker | Lima + FC |
-|------------|:-----------:|:---------------:|:-----------:|:------:|:---------:|
-| Snapshots | Yes | No | No | No | Yes |
-| Pause/resume | Yes | No | No | Yes | Yes |
-| vsock | Yes | Yes | Yes | No | Yes |
-| TAP networking | Yes | No (vmnet) | Yes | No | Yes |
+| Capability | Firecracker | Apple Container | libkrun | microvm.nix | Docker |
+|------------|:-----------:|:---------------:|:-------:|:-----------:|:------:|
+| Snapshots | Yes | No | No | No | No |
+| Pause/resume | Yes | No | No | No | Yes |
+| vsock | Yes | Yes | Yes | Yes | No |
+| TAP networking | Yes | No (vmnet) | TSI | Yes | No |
 | Port forwarding (`-p`) | Yes | Yes | Yes | Yes | Yes |
 | Detach mode (`-d`) | Yes | Yes | Yes | Yes | Yes |
 
@@ -85,8 +85,9 @@ VM lifecycle abstraction defined in `mvm-core`:
 - `capabilities()` -- pause/resume, snapshots, vsock, TAP networking
 
 Implementations:
-- **`FirecrackerBackend`** -- KVM microVMs via Firecracker (Linux native or via Lima)
+- **`FirecrackerBackend`** -- KVM microVMs via Firecracker (Linux native)
 - **`AppleContainerBackend`** -- Virtualization.framework (macOS 26+)
+- **`LibkrunBackend`** -- Hypervisor.framework via libkrun (macOS Intel / pre-26)
 - **`MicrovmNixBackend`** -- NixOS-native QEMU runner
 - **`DockerBackend`** -- Container-based fallback, universal platform support
 - **`AnyBackend`** -- enum dispatch, auto-selects at runtime
@@ -101,7 +102,7 @@ Where Linux commands run. Defined in `mvm-core`:
 - `run_capture()` -- run and capture both stdout and stderr
 
 Implementations:
-- **`LimaEnv`** -- delegates commands via `limactl shell mvm-builder` (macOS <26, or Linux without KVM)
+- **`BuilderVmEnv`** -- delegates commands into the microsandbox/libkrun builder VM (macOS hosts)
 - **`NativeEnv`** -- runs commands directly (Linux with `/dev/kvm`)
 
 ### ShellEnvironment
@@ -126,9 +127,9 @@ Extends `ShellEnvironment` for fleet orchestration:
 At startup, mvmctl detects the platform and selects the appropriate backend:
 
 1. **Linux with `/dev/kvm`** -- uses `FirecrackerBackend` directly via `NativeEnv`
-2. **macOS 26+** -- uses `AppleContainerBackend` for VM lifecycle; Nix builds still run in Lima
-3. **Docker available** -- uses `DockerBackend` as a universal fallback
-4. **macOS <26 / Linux without KVM** -- uses `FirecrackerBackend` via `LimaEnv`
+2. **macOS 26+** -- uses `AppleContainerBackend` for VM lifecycle; Nix builds run inside the builder VM
+3. **macOS Intel / pre-26** -- uses `LibkrunBackend` via `Hypervisor.framework`; Nix builds run inside the builder VM
+4. **No KVM / no Apple Container / no libkrun** -- falls back to `DockerBackend` (reduced isolation; see [Matryoshka model](/security/matryoshka))
 
 ```
 Host (macOS/Linux)
@@ -150,9 +151,9 @@ No initrd is needed -- the kernel boots directly into a busybox init script on t
 | Platform | Architecture | Backend |
 |----------|-------------|---------|
 | macOS 26+ | Apple Silicon (aarch64) | Apple Container (native) |
-| macOS <26 | Apple Silicon (aarch64) | Lima + Firecracker |
-| macOS <26 | Intel (x86_64) | Lima + Firecracker |
+| macOS pre-26 | Apple Silicon (aarch64) | libkrun (Hypervisor.framework) |
+| macOS pre-26 | Intel (x86_64) | libkrun (Hypervisor.framework) |
 | Linux with `/dev/kvm` | x86_64, aarch64 | Firecracker (native) |
-| Linux without `/dev/kvm` | x86_64, aarch64 | Docker or Lima + Firecracker |
+| Linux without `/dev/kvm` | x86_64, aarch64 | Docker (Tier 3 fallback) |
 | WSL2 | x86_64 | Docker (may have KVM) |
 | Any platform with Docker | x86_64, aarch64 | Docker (universal fallback) |

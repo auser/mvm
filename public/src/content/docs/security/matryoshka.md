@@ -78,7 +78,7 @@ ack_docker_tier = true
 
 - **Production / untrusted code** → Tier 1. Linux + KVM + Firecracker. No exceptions.
 - **macOS dev or CI on Apple Silicon** → Tier 2 (Apple Container or libkrun). Verified boot is the open item.
-- **macOS Intel or no-Lima Linux dev** → Tier 2 (libkrun).
+- **macOS Intel / pre-26 dev** → Tier 2 (libkrun).
 - **Anywhere else** → Tier 3 (Docker), with the banner caveats.
 
 `mvmctl doctor` reports your current tier on the running host.

@@ -52,7 +52,7 @@ cargo install --git https://github.com/tinylabscom/mvm mvmctl
 mvmctl bootstrap
 ```
 
-`mvmctl bootstrap` is idempotent. On a Linux host with `/dev/kvm` it skips the Lima install (Lima is only needed on macOS). It pulls the dev image, verifies the SHA-256 manifest (claim 6), and installs Firecracker.
+`mvmctl bootstrap` is idempotent. On a Linux host with `/dev/kvm` it installs Firecracker, pulls the dev image, and verifies the SHA-256 manifest (claim 6).
 
 ## Verify Tier 1 isolation
 
@@ -81,7 +81,6 @@ Rule of thumb:
 - 10 GiB — Nix store overhead (mvm bootstrap closure)
 - 5 GiB per Firecracker rootfs you keep around
 - 5–20 GiB per template snapshot
-- 5 GiB Lima VM (only on macOS hosts; not applicable here)
 
 For a CI runner that builds and runs a few microVMs, 50 GiB is comfortable. For a developer instance with many templates, 100 GiB.
 

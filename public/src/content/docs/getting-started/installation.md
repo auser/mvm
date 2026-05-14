@@ -48,7 +48,7 @@ mvmctl automatically detects your platform at startup and selects the best VM ba
 | Platform | Backend | What happens |
 |----------|---------|-------------|
 | **Linux with `/dev/kvm`** | Firecracker | Runs directly on KVM. Smallest attack surface, fastest cold boot. |
-| **macOS** (Apple Silicon / Intel) | microsandbox (libkrun) | Native Hypervisor.framework. No Lima, no Docker Desktop. |
+| **macOS** (Apple Silicon / Intel) | microsandbox (libkrun) | Native Hypervisor.framework. No Docker Desktop required. |
 | **Linux without `/dev/kvm`** | microsandbox | Software-emulation fallback (slower; meant for CI runners). |
 | **Docker available** | Docker | Tier 3 container fallback. Used only if no hypervisor backend works. |
 

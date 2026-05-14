@@ -5,7 +5,7 @@ description: Drive model, mount points, and filesystem layout inside microVMs.
 
 ## Drive Model
 
-Each microVM gets up to four virtio-block drives (on all backends -- Firecracker, Apple Container, microvm.nix, Docker, Lima + Firecracker):
+Each microVM gets up to four virtio-block drives (on all backends -- Firecracker, Apple Container, libkrun, microvm.nix, Docker):
 
 | Drive | Mount Point | Permissions | Purpose |
 |-------|-------------|-------------|---------|
@@ -89,7 +89,7 @@ mvmctl up --flake . --volume ./data:/data:1024
 
 ## Host-Side Layout
 
-On the host (or inside the Lima VM on macOS <26), mvm stores data at:
+On the host (on Linux) or inside the builder VM (on macOS), mvm stores data at:
 
 ```
 ~/.mvm/                  # MVM_DATA_DIR
