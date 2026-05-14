@@ -49,6 +49,7 @@ pub struct SignedEnvelope {
 pub struct FileAuditSigner {
     signing_key: SigningKey,
     audit_dir: PathBuf,
+    fixed_file: Option<PathBuf>,
     cursors: Mutex<HashMap<String, [u8; 32]>>,
 }
 
@@ -63,6 +64,30 @@ impl FileAuditSigner {
         Ok(Self {
             signing_key,
             audit_dir,
+            fixed_file: None,
+            cursors: Mutex::new(HashMap::new()),
+        })
+    }
+
+    /// Create a signer rooted at one exact JSONL file instead of a
+    /// per-tenant directory. This is used for policy
+    /// `file:///.../audit.jsonl` stream destinations where the
+    /// operator supplied a literal stream path.
+    pub fn open_file(
+        signing_key: SigningKey,
+        audit_file: impl Into<PathBuf>,
+    ) -> std::io::Result<Self> {
+        let audit_file = audit_file.into();
+        if let Some(parent) = audit_file.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        Ok(Self {
+            signing_key,
+            audit_dir: audit_file
+                .parent()
+                .map(Path::to_path_buf)
+                .unwrap_or_else(|| PathBuf::from(".")),
+            fixed_file: Some(audit_file),
             cursors: Mutex::new(HashMap::new()),
         })
     }
@@ -74,18 +99,19 @@ impl FileAuditSigner {
     }
 
     pub fn tenant_path(&self, tenant: &str) -> PathBuf {
-        self.audit_dir.join(format!("{tenant}.jsonl"))
+        self.fixed_file
+            .clone()
+            .unwrap_or_else(|| self.audit_dir.join(format!("{tenant}.jsonl")))
     }
 
     /// Re-seed the in-memory cursor from disk on first emit per tenant.
     /// Hashes the last on-disk line; returns `[0; 32]` (genesis) if no
     /// file exists or the file is empty.
-    fn restore_cursor(&self, tenant: &str) -> std::io::Result<[u8; 32]> {
-        let path = self.tenant_path(tenant);
+    fn restore_cursor(&self, path: &Path) -> std::io::Result<[u8; 32]> {
         if !path.exists() {
             return Ok([0u8; 32]);
         }
-        let content = std::fs::read_to_string(&path)?;
+        let content = std::fs::read_to_string(path)?;
         let last = content.lines().rfind(|l| !l.is_empty());
         match last {
             None => Ok([0u8; 32]),
@@ -98,16 +124,22 @@ impl FileAuditSigner {
 impl AuditSigner for FileAuditSigner {
     async fn sign_and_emit(&self, entry: &AuditEntry) -> Result<(), AuditError> {
         let tenant = entry.tenant.0.clone();
+        let path = self.tenant_path(&tenant);
+        let cursor_key = self
+            .fixed_file
+            .as_ref()
+            .map(|p| format!("file:{}", p.display()))
+            .unwrap_or_else(|| format!("tenant:{tenant}"));
 
         let prev_hash = {
             let mut cursors = self.cursors.lock().expect("cursors poisoned");
-            if let Some(h) = cursors.get(&tenant) {
+            if let Some(h) = cursors.get(&cursor_key) {
                 *h
             } else {
                 let h = self
-                    .restore_cursor(&tenant)
+                    .restore_cursor(&path)
                     .map_err(|e| AuditError::Io(e.to_string()))?;
-                cursors.insert(tenant.clone(), h);
+                cursors.insert(cursor_key.clone(), h);
                 h
             }
         };
@@ -125,7 +157,6 @@ impl AuditSigner for FileAuditSigner {
         let line = serde_json::to_string(&envelope).map_err(|e| AuditError::Io(e.to_string()))?;
         let new_hash = hash_line(line.as_bytes());
 
-        let path = self.tenant_path(&tenant);
         let mut file = OpenOptions::new()
             .create(true)
             .append(true)
@@ -136,7 +167,7 @@ impl AuditSigner for FileAuditSigner {
         self.cursors
             .lock()
             .expect("cursors poisoned")
-            .insert(tenant, new_hash);
+            .insert(cursor_key, new_hash);
         Ok(())
     }
 }
@@ -409,6 +440,29 @@ mod tests {
         let count_b = verify_audit_chain(&signer.tenant_path("tenant-b"), &vk).unwrap();
         assert_eq!(count_a, 2);
         assert_eq!(count_b, 1);
+    }
+
+    #[tokio::test]
+    async fn fixed_file_destination_writes_exact_path() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("custom-audit.jsonl");
+        let key = fresh_key();
+        let vk = key.verifying_key();
+        let signer = FileAuditSigner::open_file(key, &path).unwrap();
+
+        signer
+            .sign_and_emit(&make_entry("tenant-a", "e1"))
+            .await
+            .unwrap();
+        signer
+            .sign_and_emit(&make_entry("tenant-a", "e2"))
+            .await
+            .unwrap();
+
+        assert!(path.exists(), "fixed file destination must be literal");
+        assert_eq!(signer.tenant_path("tenant-a"), path);
+        let count = verify_audit_chain(&path, &vk).unwrap();
+        assert_eq!(count, 2);
     }
 
     #[tokio::test]

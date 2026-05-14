@@ -155,6 +155,8 @@ description: Complete command reference for mvmctl.
 | `mvmctl policy export <tenant>:<workload> --redaction raw --format json\|toml` | Validate and emit the original raw policy bundle shape. Use only when the recipient is allowed to see the policy contents. |
 | `mvmctl policy update <tenant>:<workload> --from <path>` | Reserved for mvmd-signed policy updates; v0 refuses local mutation and exits with guidance |
 
+When `mvmctl up` admits a signed plan for a workload with a policy bundle, `[audit].chain_signing = true` is required. The default local per-tenant chain remains active, and `file://...` entries in `[audit].stream_destinations` receive exact JSONL replica chains. Other destination schemes validate at the policy-shape layer but fail closed during admission until their transports are wired.
+
 ## Flake Validation
 
 | Command | Description |
