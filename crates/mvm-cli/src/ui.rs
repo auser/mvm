@@ -23,12 +23,20 @@ fn prefix() -> String {
 
 /// Print an informational message: [mvm] message
 pub fn info(msg: &str) {
-    println!("{} {}", prefix(), msg);
+    if mvm::ui::is_chrome_routed_to_stderr() {
+        eprintln!("{} {}", prefix(), msg);
+    } else {
+        println!("{} {}", prefix(), msg);
+    }
 }
 
 /// Print a success message: [mvm] message (in green)
 pub fn success(msg: &str) {
-    println!("{} {}", prefix(), msg.green());
+    if mvm::ui::is_chrome_routed_to_stderr() {
+        eprintln!("{} {}", prefix(), msg.green());
+    } else {
+        println!("{} {}", prefix(), msg.green());
+    }
 }
 
 /// Print an error message: [mvm] ERROR: message (in red)
@@ -38,17 +46,26 @@ pub fn error(msg: &str) {
 
 /// Print a warning message: [mvm] message (in yellow)
 pub fn warn(msg: &str) {
-    println!("{} {}", prefix(), msg.yellow());
+    if mvm::ui::is_chrome_routed_to_stderr() {
+        eprintln!("{} {}", prefix(), msg.yellow());
+    } else {
+        println!("{} {}", prefix(), msg.yellow());
+    }
 }
 
 /// Print a numbered step: [mvm] Step n/total: message
 pub fn step(n: u32, total: u32, msg: &str) {
-    println!(
+    let formatted = format!(
         "\n{} {} {}",
         prefix(),
         format!("Step {}/{}:", n, total).bold().yellow(),
         msg,
     );
+    if mvm::ui::is_chrome_routed_to_stderr() {
+        eprintln!("{formatted}");
+    } else {
+        println!("{formatted}");
+    }
 }
 
 // ---------------------------------------------------------------------------

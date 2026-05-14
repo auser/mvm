@@ -113,18 +113,23 @@ pub(in crate::commands) struct RunArgs {
     /// Path to an mvmforge launch document. Mutually exclusive with trailing argv.
     #[arg(long, value_name = "PATH", conflicts_with = "argv")]
     pub launch_plan: Option<String>,
-    /// SDK transport mode for `mvmctl run`. v1 wires only
-    /// `--mode plan` (synthesize an ExecutionPlan per Sandbox call
-    /// and route through `mvm_supervisor::admit_for_run`; no
-    /// microVM ever boots). `--mode live` is reserved for the
-    /// Followup H-live half (Plan 73); `--mode record` redirects
-    /// users to `mvmctl compile` (where record is the default).
+    /// SDK transport mode for `mvmctl run`.
+    ///
+    /// - `--mode plan` (Followup H-plan): synthesize an
+    ///   ExecutionPlan per Sandbox call and route through
+    ///   `mvm_supervisor::admit_for_run`; no microVM ever boots.
+    /// - `--mode live` (Followup H-live, Plan 73): spawn the user's
+    ///   script with `MVM_SDK_MODE=live` so the SDK shells each
+    ///   `Sandbox` operation to existing `mvmctl up` / `proc start` /
+    ///   `fs write` / `down` against a real microVM.
+    /// - `--mode record` redirects users to `mvmctl compile` (where
+    ///   record is the default mode).
+    ///
     /// When unset, the verb behaves as a transient-sandbox runner
     /// over the trailing argv — its pre-Followup-H semantics.
     #[arg(long = "mode", value_enum)]
     pub mode: Option<RunMode>,
-    /// Friendly alias for `--mode live`. Refused in v1 until the
-    /// Followup H-live half lands.
+    /// Friendly alias for `--mode live` (Plan 73 Followup H-live).
     #[arg(long = "dev", conflicts_with_all = ["prod", "mode"])]
     pub dev: bool,
     /// Friendly alias for `--mode record`. `mvmctl run --prod`
@@ -149,7 +154,8 @@ pub(in crate::commands) struct RunArgs {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
 pub(in crate::commands) enum RunMode {
     /// Live transport — Sandbox calls shell out to existing mvmctl
-    /// up/exec/down. Reserved for Followup H-live; refused in v1.
+    /// up / proc start / fs write / down against a real microVM.
+    /// Plan 73 Followup H-live.
     Live,
     /// Plan transport — synthesise one ExecutionPlan per Sandbox
     /// operation and route through `mvm_supervisor::admit_for_run`.
@@ -269,11 +275,7 @@ pub(in crate::commands) fn resolve_run_mode(args: &RunArgs) -> Result<Option<Run
         return Ok(Some(parse_env_run_mode(&env_mode)?));
     }
     if args.dev {
-        anyhow::bail!(
-            "`mvmctl run --dev` (alias for --mode live) is blocked — pairs with Followup H-live, \
-             which lands once Plan 72 W4/W5 are validated end to end. Use `--mode plan` for the \
-             admission dry-run, or `mvmctl compile` for the record path."
-        );
+        return Ok(Some(RunMode::Live));
     }
     if args.prod {
         anyhow::bail!(
@@ -284,10 +286,7 @@ pub(in crate::commands) fn resolve_run_mode(args: &RunArgs) -> Result<Option<Run
     }
     match args.mode {
         None => Ok(None),
-        Some(RunMode::Live) => anyhow::bail!(
-            "`mvmctl run --mode live` is blocked — pairs with Followup H-live, which lands once \
-             Plan 72 W4/W5 are validated end to end. Use `--mode plan` for the admission dry-run."
-        ),
+        Some(RunMode::Live) => Ok(Some(RunMode::Live)),
         Some(RunMode::Record) => anyhow::bail!(
             "`mvmctl run --mode record` is unsupported — `mvmctl compile` is the record-mode verb \
              (record is the default; pass the script as the positional entry)."
@@ -298,10 +297,7 @@ pub(in crate::commands) fn resolve_run_mode(args: &RunArgs) -> Result<Option<Run
 
 fn parse_env_run_mode(raw: &str) -> Result<RunMode> {
     match raw.trim().to_ascii_lowercase().as_str() {
-        "live" => anyhow::bail!(
-            "MVM_SDK_MODE=live is blocked on `mvmctl run` — pairs with Followup H-live (lands \
-             once Plan 72 W4/W5 are validated)."
-        ),
+        "live" => Ok(RunMode::Live),
         "plan" => Ok(RunMode::Plan),
         "record" => anyhow::bail!(
             "MVM_SDK_MODE=record on `mvmctl run` is unsupported — `mvmctl compile` is the \
@@ -716,13 +712,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_run_mode_bails_blocked_for_dev_alias() {
+    fn resolve_run_mode_returns_live_for_dev_alias() {
         let mut args = run_args(RunProfile::Standard);
         args.dev = true;
-        let err = resolve_run_mode(&args).expect_err("--dev must bail");
-        let msg = err.to_string();
-        assert!(msg.contains("Followup H-live"));
-        assert!(msg.contains("--mode plan"));
+        let mode = resolve_run_mode(&args)
+            .expect("--dev resolves to Some(Live) post-H-live")
+            .expect("must be Some(Live)");
+        assert_eq!(mode, RunMode::Live);
     }
 
     #[test]
@@ -735,12 +731,13 @@ mod tests {
     }
 
     #[test]
-    fn resolve_run_mode_bails_blocked_for_mode_live() {
+    fn resolve_run_mode_returns_live_for_mode_live() {
         let mut args = run_args(RunProfile::Standard);
         args.mode = Some(RunMode::Live);
-        let err = resolve_run_mode(&args).expect_err("--mode live must bail");
-        let msg = err.to_string();
-        assert!(msg.contains("Followup H-live"));
+        let mode = resolve_run_mode(&args)
+            .expect("--mode live resolves to Some(Live) post-H-live")
+            .expect("must be Some(Live)");
+        assert_eq!(mode, RunMode::Live);
     }
 
     #[test]

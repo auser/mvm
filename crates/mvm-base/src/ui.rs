@@ -20,6 +20,33 @@ pub fn is_verbose() -> bool {
     VERBOSE.load(Ordering::Relaxed)
 }
 
+/// When set, `info` / `success` / `warn` / `step` / `progress` route
+/// to stderr instead of stdout. Errors already go to stderr
+/// unconditionally. The toggle exists so verbs that emit a final
+/// structured-JSON envelope on stdout (`mvmctl up --up-json`,
+/// Followup H-live) can suppress chrome from the parsed channel
+/// without rewriting every call site.
+static CHROME_TO_STDERR: AtomicBool = AtomicBool::new(false);
+
+/// Route `[mvm]` chatter to stderr instead of stdout. Used by verbs
+/// that emit a machine-readable envelope on stdout. Idempotent; the
+/// flag is process-global, so callers reset it when they're done.
+pub fn set_chrome_to_stderr(on: bool) {
+    CHROME_TO_STDERR.store(on, Ordering::Relaxed);
+}
+
+/// Whether chrome is currently routed to stderr. Public so that
+/// the parallel `mvm-cli::ui` mirror module can honor the same
+/// flag without each crate maintaining its own atomic.
+pub fn is_chrome_routed_to_stderr() -> bool {
+    CHROME_TO_STDERR.load(Ordering::Relaxed)
+}
+
+/// Internal alias used by the in-module print helpers.
+fn chrome_to_stderr() -> bool {
+    is_chrome_routed_to_stderr()
+}
+
 // ---------------------------------------------------------------------------
 // Colored message helpers
 // ---------------------------------------------------------------------------
@@ -30,12 +57,20 @@ fn prefix() -> String {
 
 /// Print an informational message: [mvm] message
 pub fn info(msg: &str) {
-    println!("{} {}", prefix(), msg);
+    if chrome_to_stderr() {
+        eprintln!("{} {}", prefix(), msg);
+    } else {
+        println!("{} {}", prefix(), msg);
+    }
 }
 
 /// Print a success message: [mvm] message (in green)
 pub fn success(msg: &str) {
-    println!("{} {}", prefix(), msg.green());
+    if chrome_to_stderr() {
+        eprintln!("{} {}", prefix(), msg.green());
+    } else {
+        println!("{} {}", prefix(), msg.green());
+    }
 }
 
 /// Print an error message: [mvm] ERROR: message (in red).
@@ -45,17 +80,26 @@ pub fn error(msg: &str) {
 
 /// Print a warning message: [mvm] message (in yellow)
 pub fn warn(msg: &str) {
-    println!("{} {}", prefix(), msg.yellow());
+    if chrome_to_stderr() {
+        eprintln!("{} {}", prefix(), msg.yellow());
+    } else {
+        println!("{} {}", prefix(), msg.yellow());
+    }
 }
 
 /// Print a numbered step: [mvm] Step n/total: message
 pub fn step(n: u32, total: u32, msg: &str) {
-    println!(
+    let formatted = format!(
         "\n{} {} {}",
         prefix(),
         format!("Step {}/{}:", n, total).bold().yellow(),
         msg,
     );
+    if chrome_to_stderr() {
+        eprintln!("{formatted}");
+    } else {
+        println!("{formatted}");
+    }
 }
 
 /// Print a progress / chatter message that's only useful when
@@ -65,7 +109,11 @@ pub fn progress(msg: &str) {
     if !is_verbose() {
         return;
     }
-    println!("{} {}", prefix(), msg);
+    if chrome_to_stderr() {
+        eprintln!("{} {}", prefix(), msg);
+    } else {
+        println!("{} {}", prefix(), msg);
+    }
 }
 
 // ---------------------------------------------------------------------------

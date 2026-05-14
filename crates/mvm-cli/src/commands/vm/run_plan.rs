@@ -1,13 +1,22 @@
-//! `mvmctl run --mode plan` — SDK plan transport.
+//! `mvmctl run --mode plan|live` — SDK transports.
 //!
-//! Followup H plan half (Plan 73). The verb runs a Sandbox-shaped
-//! script with the SDK's `Sandbox` operations rerouted to
-//! synthesize one `ExecutionPlan` per call and route each through
-//! `mvm_supervisor::admit_for_run` for a dry-run admission check.
-//! **No microVM ever boots** — the value is that admission gates
-//! (signature, validity window, replay store, policy resolution)
-//! fire end-to-end without the cost of booting and tearing down a
-//! VM.
+//! Two transports share this module:
+//!
+//! - **plan** (Followup H-plan, already shipped): runs a
+//!   Sandbox-shaped script with the SDK in record mode, lowers the
+//!   captured recording, synthesises one `ExecutionPlan` per app
+//!   and routes each through `mvm_supervisor::admit_for_run` for a
+//!   dry-run admission check. **No microVM ever boots** — the value
+//!   is that admission gates (signature, validity window, replay
+//!   store, policy resolution) fire end-to-end without the cost of
+//!   booting and tearing down a VM.
+//! - **live** (Followup H-live, this module's other half): spawns
+//!   the user's script with `MVM_SDK_MODE=live` and
+//!   `MVM_CLI_BIN=<path-to-mvmctl>` so the SDK shells each
+//!   `Sandbox` operation to existing `mvmctl up` / `proc start` /
+//!   `fs write` / `down` against a real microVM. No plan
+//!   synthesis here — the SDK drives plan-64 admission once per
+//!   per-call shell via the wrapped verbs.
 //!
 //! ## How it works
 //!
@@ -58,20 +67,95 @@ use crate::commands::build::sandbox_record::{auto_exec_record_script, script_lan
 
 use super::exec::{RunArgs, RunMode};
 
-/// Dispatch an SDK-mode `mvmctl run` invocation. v1 only wires
-/// `RunMode::Plan`; the other variants are intercepted by
-/// `super::exec::resolve_run_mode` before reaching this entry.
+/// Dispatch an SDK-mode `mvmctl run` invocation. Plan and Live both
+/// reach this entry now (Followup H-plan + Followup H-live);
+/// `Record` is still refused at the `resolve_run_mode` layer.
 pub(in crate::commands) fn dispatch_sdk_mode(mode: RunMode, args: &RunArgs) -> Result<()> {
     match mode {
         RunMode::Plan => run_plan_mode(args),
-        // The exec module's resolve_run_mode already bails on these
-        // variants — keep the match exhaustive so a future addition
-        // raises a compile error here too.
-        RunMode::Live | RunMode::Record => unreachable!(
-            "exec::resolve_run_mode is expected to refuse {mode:?} before reaching run_plan; \
-             this is a logic bug — file an issue."
+        RunMode::Live => run_live_mode(args),
+        RunMode::Record => unreachable!(
+            "exec::resolve_run_mode refuses RunMode::Record before reaching dispatch; this is a \
+             logic bug — file an issue."
         ),
     }
+}
+
+/// Followup H-live (Plan 73): spawn the user's Sandbox-shaped
+/// script with `MVM_SDK_MODE=live` + the resolved `mvmctl`
+/// binary path on the env so the SDK shells each `Sandbox`
+/// operation to `mvmctl up` / `proc start` / `fs write` / `down`
+/// against a real microVM.
+///
+/// The wire shape — the env-var contract:
+///
+/// - `MVM_SDK_MODE=live` — branch in the SDK toggling the
+///   subprocess transport on.
+/// - `MVM_CLI_BIN=<absolute-path>` — the binary the SDK shells to.
+///   We pass our own absolute path (resolved via
+///   [`std::env::current_exe`]) so a `cargo run -- run --mode
+///   live` flow finds the same `mvmctl` it invoked through.
+/// - Inherited stdio + env — the SDK prints its own output;
+///   nothing is captured here.
+///
+/// Errors: the user's script exit code propagates verbatim. We
+/// surface a wrapped error only when the spawn itself fails (PATH
+/// resolution, missing interpreter, etc.).
+fn run_live_mode(args: &RunArgs) -> Result<()> {
+    let script = extract_script_arg(args)?;
+    let lang = script_language_from_path(&script).ok_or_else(|| {
+        anyhow::anyhow!(
+            "`mvmctl run --mode live` expected a `.py`, `.ts`, `.tsx`, `.js`, `.mjs`, `.cjs`, \
+             `.mts`, or `.cts` script path, got {}.",
+            script.display()
+        )
+    })?;
+
+    let interpreter = crate::commands::build::sandbox_record::resolve_interpreter(lang)?;
+    let mvmctl_bin = std::env::current_exe()
+        .context("resolving the running mvmctl binary path for MVM_CLI_BIN")?;
+
+    eprintln!(
+        "mvmctl run --mode live: spawning {} {} (MVM_CLI_BIN={})",
+        interpreter.display(),
+        script.display(),
+        mvmctl_bin.display(),
+    );
+
+    let mut cmd = std::process::Command::new(&interpreter);
+    // Deno's default sandbox refuses fs + subprocess; the SDK's
+    // live mode shells to `mvmctl`, so opt out explicitly. The
+    // same opt-out lives in `auto_exec_record_script`.
+    let basename = interpreter
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("");
+    if basename.starts_with("deno") {
+        cmd.arg("run").arg("--allow-all");
+    }
+    let status = cmd
+        .arg(&script)
+        .env("MVM_SDK_MODE", "live")
+        .env("MVM_CLI_BIN", &mvmctl_bin)
+        .status()
+        .with_context(|| {
+            format!(
+                "spawning {} to run live-mode script {}",
+                interpreter.display(),
+                script.display()
+            )
+        })?;
+
+    if !status.success() {
+        anyhow::bail!(
+            "live-mode script {} exited with {:?}; the SDK's subprocess transport reports each \
+             failed `mvmctl` shell in its own diagnostic. Re-run the script directly to see the \
+             unfiltered output.",
+            script.display(),
+            status.code(),
+        );
+    }
+    Ok(())
 }
 
 fn run_plan_mode(args: &RunArgs) -> Result<()> {
@@ -147,16 +231,16 @@ fn run_plan_mode(args: &RunArgs) -> Result<()> {
     Ok(())
 }
 
-/// Pull the script path off `args.argv`. Under `--mode plan` the
-/// argv slot carries a single positional: the script. Anything
-/// else is an error.
+/// Pull the script path off `args.argv`. Both `--mode plan` and
+/// `--mode live` consume the argv slot as a single positional:
+/// the script. Anything else is an error.
 fn extract_script_arg(args: &RunArgs) -> Result<PathBuf> {
     if !args.argv.is_empty() {
         if args.argv.len() > 1 {
             bail!(
-                "`mvmctl run --mode plan` expected exactly one positional (the script path); \
-                 got {} arguments: {:?}. Plan mode never boots a VM, so trailing argv beyond the \
-                 script is meaningless.",
+                "`mvmctl run --mode plan|live` expected exactly one positional (the script \
+                 path); got {} arguments: {:?}. Both SDK transport modes consume a single \
+                 script — trailing argv has no meaning here.",
                 args.argv.len(),
                 args.argv
             );
@@ -164,8 +248,8 @@ fn extract_script_arg(args: &RunArgs) -> Result<PathBuf> {
         return Ok(PathBuf::from(&args.argv[0]));
     }
     bail!(
-        "`mvmctl run --mode plan` requires a script path. Pass a `.py`, `.ts`, or `.js` script \
-         that builds a Sandbox: e.g. `mvmctl run --mode plan ./hello.py`."
+        "`mvmctl run --mode plan|live` requires a script path. Pass a `.py`, `.ts`, or `.js` \
+         script that builds a Sandbox: e.g. `mvmctl run --mode live ./hello.py`."
     )
 }
 

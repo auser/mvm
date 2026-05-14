@@ -137,14 +137,15 @@ describe("Sandbox.kill / dispose", () => {
 // ── modes ────────────────────────────────────────────────────────────
 
 describe("MVM_SDK_MODE", () => {
-  it("live mode throws until Plan 72 unblocks", () => {
+  it("live mode without MVM_CLI_BIN throws", () => {
     process.env.MVM_SDK_MODE = "live";
-    expect(() => mvm.Sandbox.create("python-3.12")).toThrow(/Plan 72/);
+    delete process.env.MVM_CLI_BIN;
+    expect(() => mvm.Sandbox.create("python-3.12")).toThrow(/MVM_CLI_BIN/);
   });
 
-  it("plan mode throws until Plan 72 unblocks", () => {
+  it("plan mode redirects to mvmctl run --mode plan", () => {
     process.env.MVM_SDK_MODE = "plan";
-    expect(() => mvm.Sandbox.create("python-3.12")).toThrow(/Plan 72/);
+    expect(() => mvm.Sandbox.create("python-3.12")).toThrow(/mvmctl run --mode plan/);
   });
 
   it("invalid mode throws with actionable message", () => {
@@ -238,7 +239,6 @@ describe("flushRecordingToOutPath", () => {
   // tmpdir helper out of the box. Cleanup runs in afterEach.
   const tmpFiles: string[] = [];
   const tmpFile = (): string => {
-    const fs = require("node:fs");
     const os = require("node:os");
     const path = require("node:path");
     const p = path.join(os.tmpdir(), `mvm-rec-${Date.now()}-${Math.random()}.json`);

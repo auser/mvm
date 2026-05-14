@@ -142,15 +142,20 @@ def test_context_manager_records_kill_on_exit() -> None:
 # ── modes ────────────────────────────────────────────────────────────
 
 
-def test_live_mode_raises_until_plan_71_unblocks() -> None:
+def test_live_mode_requires_mvm_cli_bin() -> None:
+    """Plan 73 Followup H-live — MVM_SDK_MODE=live without
+    MVM_CLI_BIN must fail with an actionable hint."""
     os.environ["MVM_SDK_MODE"] = "live"
-    with pytest.raises(mvm.SandboxModeError, match="Plan 72"):
+    os.environ.pop("MVM_CLI_BIN", None)
+    with pytest.raises(mvm.SandboxModeError, match="MVM_CLI_BIN"):
         mvm.Sandbox.create("python-3.12")
 
 
-def test_plan_mode_raises_until_plan_71_unblocks() -> None:
+def test_plan_mode_redirects_to_host_cli() -> None:
+    """Plan mode lives in the host CLI; the SDK should refuse with
+    a redirect message."""
     os.environ["MVM_SDK_MODE"] = "plan"
-    with pytest.raises(mvm.SandboxModeError, match="Plan 72"):
+    with pytest.raises(mvm.SandboxModeError, match="mvmctl run --mode plan"):
         mvm.Sandbox.create("python-3.12")
 
 

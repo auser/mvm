@@ -659,6 +659,25 @@ pub(in crate::commands) struct Args {
     /// (claim-8 preserved). ADR-047 claim 9.
     #[arg(long = "from-workload-ir", value_name = "PATH")]
     pub from_workload_ir: Option<std::path::PathBuf>,
+    /// Emit a one-line JSON envelope on stdout when the VM is up.
+    /// Routes the friendly `[mvm]` chrome to stderr so the SDK
+    /// live-mode transport (Plan 73 Followup H-live) can parse a
+    /// single JSON document instead of teaching the SDK to scrape
+    /// the human-formatted log.
+    ///
+    /// Envelope shape (schema_version=1):
+    ///
+    /// ```json
+    /// {"schema_version": 1, "vm_id": "myvm",
+    ///  "build_mode": "dev"|"prod"}
+    /// ```
+    ///
+    /// `build_mode` is read from the resolved template's
+    /// `TemplateRevision.build_mode` (defaulting to `prod`) and
+    /// is the load-bearing signal the SDK uses to enforce the
+    /// claim-4 dev-only `do_exec` rule client-side.
+    #[arg(long = "up-json")]
+    pub up_json: bool,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
@@ -771,6 +790,34 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         );
     }
 
+    // `--up-json` routes the friendly `[mvm]` chrome to stderr and
+    // suppresses the auto-watch / auto-forward loops that would
+    // otherwise block forever — the SDK live-mode transport (Plan 73
+    // Followup H-live) drives subsequent `proc start`/`fs write`/
+    // `down` calls from outside, so `mvmctl up` must return as soon
+    // as the VM is up. We also imply `--detach` for the Apple
+    // Container launchd path so the agent owns the VM lifecycle.
+    if args.up_json {
+        mvm::ui::set_chrome_to_stderr(true);
+        if args.watch {
+            anyhow::bail!(
+                "--up-json is incompatible with --watch (the JSON envelope is emitted once on first boot; watch reboots the VM repeatedly)."
+            );
+        }
+        if args.forward {
+            anyhow::bail!(
+                "--up-json is incompatible with --forward (--forward blocks until Ctrl+C; --up-json must return as soon as the VM is up)."
+            );
+        }
+    }
+
+    // Capture the effective up-json + name eagerly so we can emit
+    // the envelope on stdout after `cmd_run` returns. The friendly
+    // chrome is already routed to stderr above.
+    let up_json_resolved = args.up_json;
+    let user_supplied_name = args.name.clone();
+    let template_name_for_envelope = resolved_template_arg.clone();
+
     cmd_run(RunParams {
         flake_ref: args.flake.as_deref(),
         template_name: resolved_template_arg.as_deref(),
@@ -787,7 +834,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         metrics_port: args.metrics_port,
         watch_config: args.watch_config,
         watch: args.watch,
-        detach: args.detach,
+        detach: args.detach || args.up_json,
         network_policy,
         network_name: &args.network,
         seccomp_tier,
@@ -800,7 +847,56 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         bundle_pin: args.bundle_pin.as_deref(),
         build_mode,
         workload_ir_path: args.from_workload_ir.as_deref(),
-    })
+        up_json: args.up_json,
+    })?;
+
+    // Plan 73 Followup H-live: after a successful boot, emit a
+    // one-line JSON envelope on stdout. The SDK live-mode transport
+    // reads this envelope verbatim and threads `vm_id` + `build_mode`
+    // through to subsequent `proc start` / `fs write` / `down`
+    // shells. The friendly chrome already went to stderr above.
+    if up_json_resolved {
+        let vm_id = user_supplied_name
+            .or_else(|| std::env::var("MVM_REEXEC_NAME").ok())
+            .unwrap_or_default();
+        let build_mode_str = match template_name_for_envelope.as_deref() {
+            Some(t) => template_build_mode_for_envelope(t).unwrap_or("prod"),
+            None => match build_mode {
+                mvm_build::pipeline::BuildMode::Dev => "dev",
+                mvm_build::pipeline::BuildMode::Prod => "prod",
+            },
+        };
+        let envelope = serde_json::json!({
+            "schema_version": 1,
+            "vm_id": vm_id,
+            "build_mode": build_mode_str,
+        });
+        println!("{}", envelope);
+    }
+    Ok(())
+}
+
+/// Resolve a template's `TemplateRevision.build_mode` for the
+/// `--up-json` envelope. Returns `Some("dev")` / `Some("prod")` when
+/// the revision parses cleanly, `None` when the template isn't on
+/// disk (no spec to read, treat as prod downstream). Tolerates I/O
+/// errors by returning `None` — the envelope's `build_mode` is a
+/// hint, not a security boundary (the agent's `do_exec` strip is
+/// the load-bearing W4.3 gate per ADR-002 §W4.3). Live-mode SDK
+/// clients use it to reject `commands.start` against a prod
+/// template *before* any vsock round-trip; a missing / unreadable
+/// spec falls through to the agent's response (the agent still
+/// fails closed).
+fn template_build_mode_for_envelope(template_name: &str) -> Option<&'static str> {
+    // `template_load_current_revision` walks the same `current`
+    // symlink the boot path uses, so the resolution matches what the
+    // running VM was built from.
+    let revision =
+        mvm::vm::template::lifecycle::template_load_current_revision(template_name).ok()??;
+    match revision.build_mode.as_deref() {
+        Some("dev") => Some("dev"),
+        _ => Some("prod"),
+    }
 }
 
 pub(in crate::commands) struct RunParams<'a> {
@@ -845,6 +941,12 @@ pub(in crate::commands) struct RunParams<'a> {
     /// pins a `DepsVolumeBinding` into the synthesized plan.
     /// Plan 73 Followup B.3.
     pub(super) workload_ir_path: Option<&'a std::path::Path>,
+    /// When `true`, `cmd_run` emits a one-line JSON envelope on
+    /// stdout right before returning. Plan 73 Followup H-live: the
+    /// SDK live-mode transport parses this envelope to thread the
+    /// generated VM id + the template's `build_mode` through to
+    /// subsequent `proc start` / `fs write` / `down` calls.
+    pub(super) up_json: bool,
 }
 
 pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
@@ -877,6 +979,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         bundle_pin,
         build_mode,
         workload_ir_path,
+        up_json: _up_json,
     } = params;
     let _span =
         tracing::info_span!("cmd_run", name = ?name, cpus = ?cpus, memory_mib = ?memory).entered();
