@@ -86,6 +86,13 @@ mvm-guest.workspace = true
 # first run and re-spawns, same as `mvmctl up --hypervisor
 # apple-container` does.
 mvm-providers.workspace = true
+# Plan 72 W4 prerequisite: unit tests for `KrunContext`'s serde
+# shape (incl. the new `virtio_fs_mounts` field with `#[serde(default)]`
+# back-compat) exercise the JSON pipe shape the supervisor binary
+# carries. serde_json is already an optional regular dep behind
+# `libkrun-sys`; listing it again as a dev-dep makes the test build
+# independent of feature flags.
+serde_json = { workspace = true }
 
 # Plan 57 W3 — manual smoke binary that boots a Nix-built kernel +
 # ext4 rootfs via libkrun and blocks until the guest exits. Gated on
