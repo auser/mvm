@@ -562,6 +562,20 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
     Ok(())
 }
 
+#[cfg(not(feature = "contributor-bootstrap"))]
+fn source_checkout_requires_contributor_bootstrap(flake_dir: &str) -> anyhow::Error {
+    anyhow::anyhow!(
+        "Local dev-image flake found at {flake_dir}, but this mvmctl binary was built without \
+         the `contributor-bootstrap` feature.\n\n\
+         Refusing to download the published prebuilt because `mvmctl dev up` from a source \
+         checkout must reflect local flakes and rootfs changes.\n\n\
+         Re-run with:\n\
+           cargo run --features contributor-bootstrap -- dev up\n\n\
+         Or install a contributor binary with:\n\
+           cargo install --path . --features contributor-bootstrap"
+    )
+}
+
 /// Resolve the dev image (kernel + rootfs) to absolute paths.
 ///
 /// In a source checkout: prefers the libkrun-backed builder VM
@@ -579,6 +593,11 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
 /// rootfs changes.
 fn ensure_dev_image() -> Result<(String, String)> {
     let local_flake = find_dev_image_flake().ok();
+
+    #[cfg(not(feature = "contributor-bootstrap"))]
+    if let Some(flake_dir) = &local_flake {
+        return Err(source_checkout_requires_contributor_bootstrap(flake_dir));
+    }
 
     // Plan 72 W5.B — source-checkout dispatch.
     //
@@ -623,7 +642,7 @@ fn ensure_dev_image() -> Result<(String, String)> {
                 }
                 Err(e) => {
                     anyhow::bail!(
-                        "libkrun builder VM build failed (source checkout: {flake_dir}).\n{e}\n\n\
+                        "libkrun builder VM build failed (source checkout: {flake_dir}).\n{e:#}\n\n\
                          Refusing to fall back to the published prebuilt because it would mask\n\
                          local rootfs changes, and refusing to fall back to microsandbox because\n\
                          the dev-shell rustc closure overflows microsandbox's 4 GiB overlay\n\
@@ -645,7 +664,7 @@ fn ensure_dev_image() -> Result<(String, String)> {
             }
             Err(e) => {
                 anyhow::bail!(
-                    "Dev image build failed (source checkout: {flake_dir}).\n{e}\n\n\
+                    "Dev image build failed (source checkout: {flake_dir}).\n{e:#}\n\n\
                      Refusing to fall back to the published prebuilt because it would mask\n\
                      local rootfs changes. To force the prebuilt anyway, move or delete\n\
                      nix/images/builder/flake.nix so the source-checkout heuristic stops matching."
@@ -660,16 +679,7 @@ fn ensure_dev_image() -> Result<(String, String)> {
     // automatically invalidates older caches. We sweep older version
     // dirs on every miss so disk usage tracks the *current* version,
     // not the union of every version ever installed.
-    if local_flake.is_none() {
-        ui::info("No local dev-image flake found; downloading published prebuilt.");
-    } else {
-        // `contributor-bootstrap` is off — library-consumer build that
-        // never owns a dev VM. The only path forward is the prebuilt.
-        ui::info(
-            "Builder-VM backend compiled out (no `contributor-bootstrap` feature); \
-             downloading published prebuilt instead of local build.",
-        );
-    }
+    ui::info("No local dev-image flake found; downloading published prebuilt.");
     let version = env!("CARGO_PKG_VERSION");
     let prebuilt_root = format!("{}/dev/prebuilt", mvm_core::config::mvm_data_dir());
     let prebuilt_dir = format!("{prebuilt_root}/v{version}");
@@ -1945,7 +1955,7 @@ fn bootstrap_builder_vm_image() -> Result<()> {
                 Ok(())
             }
             Err(e) => Err(anyhow::anyhow!(
-                "Stage 0 microsandbox build of the builder-vm flake at {flake_dir} failed: {e}\n\
+                "Stage 0 microsandbox build of the builder-vm flake at {flake_dir} failed: {e:#}\n\
                  The builder-vm rootfs closure is meant to fit in microsandbox's 4 GiB overlay \
                  (no rustc, no cargo crates — see Plan 72 §W2). If it doesn't, the package list \
                  in nix/images/builder-vm/flake.nix needs trimming."
@@ -2514,6 +2524,21 @@ mod builder_vm_bootstrap_tests {
         assert!(
             std::path::Path::new(&path).join("flake.nix").is_file(),
             "flake.nix missing under {path}"
+        );
+    }
+
+    #[cfg(not(feature = "contributor-bootstrap"))]
+    #[test]
+    fn source_checkout_dev_image_errors_without_contributor_bootstrap() {
+        let err =
+            source_checkout_requires_contributor_bootstrap("/repo/nix/images/builder").to_string();
+        assert!(
+            err.contains("Refusing to download the published prebuilt"),
+            "error must make the no-download invariant explicit: {err}"
+        );
+        assert!(
+            err.contains("cargo run --features contributor-bootstrap -- dev up"),
+            "error should include the contributor rebuild command: {err}"
         );
     }
 
