@@ -1897,31 +1897,35 @@ fn find_builder_vm_flake() -> Result<String> {
 ///   image** with the large rustc closure.
 ///
 /// Source-checkout-only by design — `find_builder_vm_flake()`
-/// must succeed. Installed binaries take the download-prebuilt
-/// path (deferred to a Plan 72 W2 release-workflow follow-up).
+/// Two acquisition paths share one cache shape (matching the
+/// `LibkrunBuilderVm::run_build` `~/.cache/mvm/builder-vm/<arch>/`
+/// contract from `mvm-build/src/libkrun_builder.rs::ensure_builder_vm_image`):
 ///
-/// Requires the `contributor-bootstrap` feature for the
-/// microsandbox path. When the feature is off, returns a clear
-/// error pointing at the rebuild command.
+/// 1. **Contributor path** — when `contributor-bootstrap` is on and
+///    `find_builder_vm_flake()` returns Ok, Stage 0 microsandbox
+///    builds the W2 flake locally. This is what a contributor editing
+///    `nix/images/builder-vm/` wants: their edits show up on the very
+///    next `mvmctl dev up`, no release-pipeline round-trip.
 ///
-/// W5.B (this PR) wires this into `ensure_dev_image` — invoked
-/// during the libkrun dispatch path to populate the cache before
-/// `LibkrunBuilderVm::run_build` reads from it.
+/// 2. **End-user download path** — otherwise, fetch the per-arch
+///    artifacts the W2 release-workflow job publishes
+///    (`builder-vm-vmlinux-<arch>`, `builder-vm-rootfs-<arch>.ext4`,
+///    optional `builder-vm-<arch>.cmdline.txt` / `manifest.json`)
+///    from `releases/download/v<version>/`. SHA-256 verifies per
+///    ADR-002 §W5.1 via the published checksums file.
+///
+/// Cache hit (both `vmlinux` and `rootfs.ext4` already present) is the
+/// fast path on either branch — no work done.
+///
+/// W5.B wired this into `ensure_dev_image`; Plan 72 W5's "Layer 1
+/// outside source checkout — download the published prebuilt"
+/// follow-up landed here.
 ///
 /// `allow(dead_code)`: same justification as
-/// [`find_builder_vm_flake`] — only called when both
-/// `contributor-bootstrap` and `backends-builder-vm-libkrun` are on.
-/// The negative-path test below exercises the `cfg(not(contributor-
-/// bootstrap))` branch (which bails) and keeps the function from
-/// being silently broken in that configuration.
+/// [`find_builder_vm_flake`] — only called when
+/// `backends-builder-vm-libkrun` is on.
 #[allow(dead_code)]
 fn bootstrap_builder_vm_image() -> Result<()> {
-    let flake_dir = find_builder_vm_flake().with_context(|| {
-        "bootstrap requires a source checkout of mvm (the builder-vm flake is \
-         only present in-repo; for installed binaries the prebuilt download path \
-         from Plan 72's release-workflow follow-up will populate the cache instead)"
-    })?;
-
     let arch = if cfg!(target_arch = "aarch64") {
         "aarch64"
     } else {
@@ -1931,13 +1935,29 @@ fn bootstrap_builder_vm_image() -> Result<()> {
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
 
-    #[cfg(feature = "contributor-bootstrap")]
+    // Cache hit fast path. Skip the per-call rebuild/redownload cost
+    // when the artifacts the consumer reads (`vmlinux` + `rootfs.ext4`)
+    // already live in the per-arch cache dir. A future PR can wire
+    // `manifest.json` SHA verification here to turn this from "exists"
+    // into "hash-matches-the-current-release", but for now existence is
+    // sufficient — both producer paths populate the same files
+    // atomically.
+    let cached_kernel = format!("{out_dir}/vmlinux");
+    let cached_rootfs = format!("{out_dir}/rootfs.ext4");
+    if std::path::Path::new(&cached_kernel).is_file()
+        && std::path::Path::new(&cached_rootfs).is_file()
     {
+        ui::info(&format!("Builder VM image already cached at {out_dir}."));
+        return Ok(());
+    }
+
+    #[cfg(feature = "contributor-bootstrap")]
+    if let Ok(flake_dir) = find_builder_vm_flake() {
         ui::info(&format!(
             "Bootstrapping builder VM image via Stage 0 (microsandbox + nixos/nix:2.24.10) \
              from: {flake_dir}"
         ));
-        match build_image_via_microsandbox(&flake_dir, &out_dir) {
+        return match build_image_via_microsandbox(&flake_dir, &out_dir) {
             Ok((kernel, rootfs)) => {
                 ui::success(&format!(
                     "Builder VM image ready at {out_dir} (kernel={kernel}, rootfs={rootfs})."
@@ -1950,19 +1970,117 @@ fn bootstrap_builder_vm_image() -> Result<()> {
                  (no rustc, no cargo crates — see Plan 72 §W2). If it doesn't, the package list \
                  in nix/images/builder-vm/flake.nix needs trimming."
             )),
+        };
+    }
+
+    // No in-repo flake (installed binary) OR no contributor-bootstrap
+    // feature compiled in. Fall through to the release-artifact
+    // download path.
+    ui::info(&format!(
+        "Builder VM image not in cache; downloading published prebuilt for v{}...",
+        env!("CARGO_PKG_VERSION")
+    ));
+    download_builder_vm_image(arch, &out_dir).with_context(|| {
+        "downloading the builder VM image. The release-artifact path is the only \
+         option for installed-binary users without contributor-bootstrap; rebuild \
+         with `cargo install --path . --features contributor-bootstrap` to use the \
+         in-repo Stage 0 microsandbox path instead."
+    })?;
+    Ok(())
+}
+
+/// Download the per-arch Layer 1 builder VM artifacts published by the
+/// `builder-vm-image` release-workflow job into the local cache dir,
+/// SHA-256-verified per ADR-002 §W5.1.
+///
+/// Mirrors `download_dev_image_inner` for the dev-shell image, minus
+/// cosign signing (Plan 36 ADR-005 extends to builder-vm artifacts as
+/// a follow-up). The required artifacts are `vmlinux` + `rootfs.ext4`;
+/// `cmdline.txt` and `manifest.json` sidecars are best-effort
+/// downloads with a fallback at the `mvm-build` consumer
+/// (`ensure_builder_vm_image` uses the canonical Plan 72 §W2 cmdline
+/// when `cmdline.txt` is missing).
+#[allow(dead_code)]
+fn download_builder_vm_image(arch: &str, cache_dir: &str) -> Result<()> {
+    let version = env!("CARGO_PKG_VERSION");
+    let names = builder_vm_artifact_names(arch);
+    let base_url = format!("https://github.com/tinylabscom/mvm/releases/download/v{version}");
+    let kernel_url = format!("{base_url}/{}", names.kernel);
+    let rootfs_url = format!("{base_url}/{}", names.rootfs);
+    let cmdline_url = format!("{base_url}/{}", names.cmdline);
+    let manifest_url = format!("{base_url}/{}", names.manifest);
+    let checksums_url = format!("{base_url}/{}", names.checksums);
+
+    // Required artifacts only; sidecars get best-effort treatment
+    // below. `fetch_expected_hashes` enforces that the checksum file
+    // contains entries for everything in `wanted` before any download
+    // starts.
+    let expected = fetch_expected_hashes(&checksums_url, &[&names.kernel, &names.rootfs])?;
+
+    ui::info("  Fetching kernel...");
+    let kernel_path = format!("{cache_dir}/vmlinux");
+    download_file(&kernel_url, &kernel_path).map_err(|e| {
+        bump_verify_outcome("network");
+        e.context(format!(
+            "Failed to download builder VM kernel from {kernel_url}"
+        ))
+    })?;
+    verify_artifact_hash(&kernel_path, &names.kernel, expected.get(&names.kernel))?;
+
+    ui::info("  Fetching rootfs...");
+    let rootfs_path = format!("{cache_dir}/rootfs.ext4");
+    download_file(&rootfs_url, &rootfs_path).map_err(|e| {
+        bump_verify_outcome("network");
+        e.context(format!(
+            "Failed to download builder VM rootfs from {rootfs_url}"
+        ))
+    })?;
+    verify_artifact_hash(&rootfs_path, &names.rootfs, expected.get(&names.rootfs))?;
+
+    // Sidecars — best-effort. `cmdline.txt` has a documented fallback
+    // in `mvm-build::libkrun_builder::ensure_builder_vm_image`;
+    // `manifest.json` is informational. A 404 on either is fine; a
+    // hash mismatch when the file IS present is still a hard fail.
+    if let Some(expected_cmdline) = expected.get(&names.cmdline) {
+        let cmdline_path = format!("{cache_dir}/cmdline.txt");
+        if download_file(&cmdline_url, &cmdline_path).is_ok() {
+            verify_artifact_hash(&cmdline_path, &names.cmdline, Some(expected_cmdline))?;
+        }
+    }
+    if let Some(expected_manifest) = expected.get(&names.manifest) {
+        let manifest_path = format!("{cache_dir}/manifest.json");
+        if download_file(&manifest_url, &manifest_path).is_ok() {
+            verify_artifact_hash(&manifest_path, &names.manifest, Some(expected_manifest))?;
         }
     }
 
-    #[cfg(not(feature = "contributor-bootstrap"))]
-    {
-        let _ = flake_dir;
-        let _ = out_dir;
-        anyhow::bail!(
-            "Builder VM Stage 0 bootstrap requires the `contributor-bootstrap` feature. \
-             Rebuild with `cargo install --path . --features contributor-bootstrap` \
-             (source-checkout contributors) or wait for Plan 72's release-workflow \
-             follow-up that publishes the builder-vm prebuilt."
-        );
+    ui::success(&format!(
+        "Builder VM image downloaded, hash-verified, and cached at {cache_dir}."
+    ));
+    Ok(())
+}
+
+/// Per-arch artifact filenames the release workflow's
+/// `builder-vm-image` job uploads. Pure function — no I/O, no
+/// network — so the unit test can verify naming matches the
+/// release.yml side without touching the network.
+#[allow(dead_code)]
+struct BuilderVmArtifactNames {
+    kernel: String,
+    rootfs: String,
+    cmdline: String,
+    manifest: String,
+    checksums: String,
+}
+
+#[allow(dead_code)]
+fn builder_vm_artifact_names(arch: &str) -> BuilderVmArtifactNames {
+    BuilderVmArtifactNames {
+        kernel: format!("builder-vm-vmlinux-{arch}"),
+        rootfs: format!("builder-vm-rootfs-{arch}.ext4"),
+        cmdline: format!("builder-vm-{arch}.cmdline.txt"),
+        manifest: format!("builder-vm-{arch}.manifest.json"),
+        checksums: format!("builder-vm-{arch}-checksums-sha256.txt"),
     }
 }
 
@@ -2517,22 +2635,26 @@ mod builder_vm_bootstrap_tests {
         );
     }
 
-    /// When the `contributor-bootstrap` feature is OFF, Stage 0
-    /// has no driver and the bootstrap must error with the
-    /// rebuild hint rather than silently no-op.
-    #[cfg(not(feature = "contributor-bootstrap"))]
+    /// Per-arch artifact filenames must match what the release
+    /// workflow's `builder-vm-image` job uploads. Pure function —
+    /// asserts the contract between `builder_vm_artifact_names()`
+    /// (the consumer side that constructs download URLs) and the
+    /// `cp "$STORE_PATH/..." "staging/builder-vm-..."` lines in
+    /// `.github/workflows/release.yml` (the producer side).
     #[test]
-    fn bootstrap_builder_vm_image_errors_without_contributor_bootstrap() {
-        let err = bootstrap_builder_vm_image()
-            .expect_err("expected an error when contributor-bootstrap is off")
-            .to_string();
-        assert!(
-            err.contains("contributor-bootstrap"),
-            "error should mention the missing feature: {err}"
-        );
-        assert!(
-            err.contains("Rebuild") || err.contains("--features"),
-            "error should hint at the rebuild command: {err}"
-        );
+    fn builder_vm_artifact_names_match_release_workflow() {
+        let n = builder_vm_artifact_names("aarch64");
+        assert_eq!(n.kernel, "builder-vm-vmlinux-aarch64");
+        assert_eq!(n.rootfs, "builder-vm-rootfs-aarch64.ext4");
+        assert_eq!(n.cmdline, "builder-vm-aarch64.cmdline.txt");
+        assert_eq!(n.manifest, "builder-vm-aarch64.manifest.json");
+        assert_eq!(n.checksums, "builder-vm-aarch64-checksums-sha256.txt");
+
+        let n = builder_vm_artifact_names("x86_64");
+        assert_eq!(n.kernel, "builder-vm-vmlinux-x86_64");
+        assert_eq!(n.rootfs, "builder-vm-rootfs-x86_64.ext4");
+        assert_eq!(n.cmdline, "builder-vm-x86_64.cmdline.txt");
+        assert_eq!(n.manifest, "builder-vm-x86_64.manifest.json");
+        assert_eq!(n.checksums, "builder-vm-x86_64-checksums-sha256.txt");
     }
 }
