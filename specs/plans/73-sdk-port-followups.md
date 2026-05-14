@@ -167,15 +167,33 @@ because the v1 surface is functional without it.
 
 ## Followup G — Per-language base image registry beyond v1's closed list
 
+**Status: DESIGN LANDED on 2026-05-14; implementation phased as
+G.1–G.4 per ADR-048.**
+
 `mvm_sdk::runtime::resolve_base_image` ships a closed v1 list:
 `python-3.12`, `python-3.13`, `node-22`, `node-lts`, `minimal`.
 The plan's "Well-known base-image trust" consideration calls for
 a `mvmctl image push <template>` flow that lets users register
-their own base templates (cosign-signed). Out of scope for v1;
-tracked here as a followup once the trust model is settled.
+their own base templates (cosign-signed). The trust-model gap
+that previously blocked this followup is resolved by
+[ADR-048 — User-defined base image registry](../adrs/048-user-defined-base-image-registry.md),
+which proposes cosign-signing + an explicit
+`mvmctl image trust add` grant as the admission gate.
 
-**Blocked on:** trust-model design + a signing flow that doesn't
-exist yet.
+ADR-048 slices the implementation into four phases that each ship
+as a separate followup PR:
+
+- **G.1** — registry directory + `mvmctl image list`/`rm`. No
+  signing, no trust. Manifests parseable, not yet resolvable.
+- **G.2** — `mvmctl image trust add/ls/rm` + cosign verification.
+  `list --installed` annotates entries with trust state.
+- **G.3** — `mvmctl image push` + sealed-template upload, reusing
+  ADR-047's CVE/SBOM plumbing for the rootfs.
+- **G.4** — `resolve_base_image` extension + supervisor admission
+  binding; closes Followup G.
+
+Phasing detail, threat model, manifest schema, CLI surface, and
+non-goals all live in ADR-048.
 
 ## Followup H — Live + plan modes for `mvmctl run`
 
@@ -199,6 +217,8 @@ supervisor for record-mode-style plan synthesis (plan mode).
 
 ## Followup I — Cross-corpus parity drop
 
+**Status: CLOSED on 2026-05-14.**
+
 The original SDK port plan included a Phase-1-only
 `xtask cross-corpus-check` task that asserted IR fixtures from
 `../mvmforge/crates/mvmforge-ir/tests/` round-trip identically
@@ -213,11 +233,22 @@ fixture parity check can be reused. Until then this is closed.
 
 ## Followup J — `mvmforge` user migration guidance
 
+**Status: CLOSED on 2026-05-14 — baseline doc shipped in the SDK
+port; no external demand has surfaced.**
+
 The SDK port plan deliberately dropped back-compat: no
 `MVMFORGE_*` env-var aliases, no `mvmforge` Python re-export, no
-`@mv.func()` decorator alias. If any external users surface, a
-short migration note + an optional one-shot rename script could
-land here. Out of scope until that demand materializes.
+`@mv.func()` decorator alias. The migration doc that ships in
+`public/src/content/docs/guides/mvmforge-migration.md` covers the
+baseline rename cases (`MVMFORGE_*` env vars → `MVM_*`,
+`@mv.func()` → `@mvm.app()`, `import mvmforge` → `import mvm`,
+lockfile + cargo-dep renames) plus a "What if you're hitting
+issues" section pointing at the GitHub issue tracker. No external
+user has surfaced to date.
+
+If demand materializes, an optional one-shot rename script could
+land here — but until then the guide is the contract and this
+followup is closed.
 
 ## Plan 72 dependency chain
 
