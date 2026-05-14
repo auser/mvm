@@ -250,6 +250,17 @@ pub enum BuilderVmError {
     /// extraction-dir issue).
     #[error("extracting artifacts from builder sandbox: {0}")]
     ExtractionFailed(String),
+
+    /// The libkrun builder VM is scaffolded (Plan 72 W1) but the
+    /// actual VM launch hasn't shipped yet. Plan 72 W2–W4 fill this
+    /// in. Distinct from [`Self::NotYetImplemented`] (which is the
+    /// microsandbox path's pre-Sprint-50 sentinel) so callers can
+    /// match precisely on which side is incomplete.
+    #[error(
+        "libkrun builder VM launch is scaffolded but not implemented yet; \
+         see specs/plans/72-builder-vm-via-libkrun.md §W2-W4"
+    )]
+    LibkrunNotShipped,
 }
 
 /// Stub implementation. Every method returns
