@@ -21,6 +21,10 @@ chrono.workspace = true
 # unconditional so `mvm-base` and `pipeline::dev_build` keep compiling
 # either way.
 microsandbox = { workspace = true, optional = true }
+# Plan 72 W1 — libkrun-backed builder VM. Wired behind the
+# `backends-builder-vm-libkrun` feature so the dep stays out of the
+# default closure until plan 57 W3 makes the boot path operational.
+mvm-libkrun = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -37,6 +41,13 @@ tempfile.workspace = true
 # Heavy microsandbox support is opt-in for lean default builds.
 default = []
 backends-microsandbox = ["dep:microsandbox"]
+# Plan 72 W1 scaffolding. Default-off — plan 72 W5 flips this to
+# `default` once plan 57 W3 (libkrun boot validation) lands and
+# `ensure_builder_vm_image` (plan 72 W5) is wired. Today, enabling
+# the feature compiles the `LibkrunBuilderVm` shape but `run_build`
+# surfaces `BuilderVmError::LibkrunUnavailable` until the libkrun
+# crate's `start()` stops returning `NotYetWired`.
+backends-builder-vm-libkrun = ["dep:mvm-libkrun"]
 
 [lints]
 workspace = true

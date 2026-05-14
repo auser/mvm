@@ -245,6 +245,60 @@ jobs:
             staging/builder-image-${{ matrix.arch }}-checksums-sha256.txt
             staging/builder-image-${{ matrix.arch }}.manifest.json
 
+  # Plan 72 W2 / ADR-046: the Layer-1 "builder VM" image — the
+  # microVM that runs `nix build` against the user-facing Layer-2
+  # flakes (dev shell, user --flake, etc.). Distinct from the
+  # existing `builder-image` job above (which is the sealed/verity
+  # variant of the Layer-2 dev image consumed by mvmd). Built on
+  # the same matrix; uploads vmlinux + rootfs.ext4 + cmdline +
+  # manifest.json. `download_builder_vm_image` (plan 72 W5)
+  # consumes these.
+  builder-vm-image:
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build builder VM image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          SYSTEM="${ARCH}-linux"
+          nix build "./nix/images/builder-vm#packages.${SYSTEM}.default" \
+            --no-link --print-out-paths > /tmp/builder-vm-store-path.txt
+          STORE_PATH=$(head -1 /tmp/builder-vm-store-path.txt)
+          mkdir -p staging
+          cp "$STORE_PATH/vmlinux"       "staging/builder-vm-vmlinux-${ARCH}"
+          cp "$STORE_PATH/rootfs.ext4"   "staging/builder-vm-rootfs-${ARCH}.ext4"
+          cp "$STORE_PATH/cmdline"       "staging/builder-vm-cmdline-${ARCH}"
+          cp "$STORE_PATH/manifest.json" "staging/builder-vm-${ARCH}.manifest.json"
+          cd staging
+          sha256sum "builder-vm-vmlinux-${ARCH}" \
+                    "builder-vm-rootfs-${ARCH}.ext4" \
+                    "builder-vm-cmdline-${ARCH}" \
+                    "builder-vm-${ARCH}.manifest.json" \
+            > "builder-vm-${ARCH}-checksums-sha256.txt"
+
+      - name: Upload builder VM image artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: builder-vm-image-${{ matrix.arch }}
+          path: |
+            staging/builder-vm-vmlinux-${{ matrix.arch }}
+            staging/builder-vm-rootfs-${{ matrix.arch }}.ext4
+            staging/builder-vm-cmdline-${{ matrix.arch }}
+            staging/builder-vm-${{ matrix.arch }}.manifest.json
+            staging/builder-vm-${{ matrix.arch }}-checksums-sha256.txt
+
   default-microvm:
     # Build the bundled default microVM image used by `mvmctl exec` /
     # `mvmctl up` when no --flake or --template was given. Mirrors the
@@ -288,7 +342,7 @@ jobs:
             staging/default-microvm-${{ matrix.arch }}-checksums-sha256.txt
 
   release:
-    needs: [build, dev-image, builder-image, default-microvm]
+    needs: [build, dev-image, builder-image, builder-vm-image, default-microvm]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -385,6 +439,11 @@ jobs:
             artifacts/builder-image-*-checksums-sha256.txt \
             artifacts/builder-image-*.manifest.json \
             artifacts/builder-image-*.manifest.json.bundle \
+            artifacts/builder-vm-vmlinux-* \
+            artifacts/builder-vm-rootfs-* \
+            artifacts/builder-vm-cmdline-* \
+            artifacts/builder-vm-*.manifest.json \
+            artifacts/builder-vm-*-checksums-sha256.txt \
             artifacts/default-microvm-vmlinux-* \
             artifacts/default-microvm-rootfs-* \
             artifacts/default-microvm-*-checksums-sha256.txt \

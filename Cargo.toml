@@ -25,6 +25,10 @@ members = [
     # plan 60 Phase 5 Slice C — in-guest entrypoint runner for
     # function-call workloads, ported from mvmforge-runtime.
     "crates/mvm-runner",
+    # plan 72 W3 — PID 1 for the builder microVM. Linux-only at run
+    # time; compiles as a stub on macOS so `cargo build --workspace`
+    # on a contributor's Mac doesn't fail.
+    "crates/mvm-builder-init",
     "xtask",
 ]
 # cargo-fuzz crates have to be excluded from the main workspace because
@@ -252,6 +256,13 @@ backends-microsandbox = [
     "mvm-backend/backends-microsandbox",
     "mvm-build/backends-microsandbox",
     "mvm-cli/backends-microsandbox",
+]
+# Plan 72 W1 / W5 — opt-in libkrun-backed builder VM. Stays out of
+# the default feature set until plan 57 W3 (boot validation) lands
+# and plan 72 W5's cutover flips polarity.
+backends-builder-vm-libkrun = [
+    "mvm-build/backends-builder-vm-libkrun",
+    "mvm-cli/backends-builder-vm-libkrun",
 ]
 custom-dns = ["mvm-cli/custom-dns"]
 dev-watch = ["mvm-cli/dev-watch"]

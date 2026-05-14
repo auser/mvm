@@ -69,6 +69,11 @@ backends-microsandbox = [
     "mvm-build/backends-microsandbox",
     "mvm-backend/backends-microsandbox",
 ]
+# Plan 72 W1 / W5 scaffolding — forwards mvm-build's libkrun-builder
+# feature so `mvm_cli::builder_vm_image::ensure_builder_vm_image` is
+# compiled in. Plan 72 W5 flips this to `default` once the libkrun
+# boot lifecycle (plan 57 W3) ships.
+backends-builder-vm-libkrun = ["mvm-build/backends-builder-vm-libkrun"]
 custom-dns = ["mvm-supervisor/custom-dns"]
 dev-watch = ["dep:notify", "dep:notify-debouncer-mini"]
 manifest-verify = [

@@ -5,6 +5,13 @@ pub mod cache;
 pub mod firecracker;
 pub mod template_reuse;
 
+// Plan 72 W1 — `LibkrunBuilderVm` scaffolding behind
+// `backends-builder-vm-libkrun`. The module name `libkrun_builder`
+// disambiguates from `mvm-libkrun` (the FFI crate) so search-grep
+// for "libkrun_builder" lands on the trait impl, not the bindings.
+#[cfg(feature = "backends-builder-vm-libkrun")]
+pub mod libkrun_builder;
+
 pub mod nix;
 pub mod pipeline;
 

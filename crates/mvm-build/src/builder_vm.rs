@@ -237,6 +237,20 @@ pub enum BuilderVmError {
     #[error("microsandbox not available: {0}")]
     MicrosandboxUnavailable(String),
 
+    /// libkrun isn't installed, the `libkrun-sys` feature is off in
+    /// this build, or plan 57 W3 (libkrun boot validation) hasn't
+    /// landed yet. The message identifies which case applies.
+    #[error("libkrun-backed builder unavailable: {0}")]
+    LibkrunUnavailable(String),
+
+    /// The builder VM image (kernel + rootfs.ext4) couldn't be
+    /// resolved. Source-checkout path: the in-repo flake didn't build
+    /// or the cache miss couldn't be reconciled. Installed-binary
+    /// path: the release artifact download failed, was tampered, or
+    /// is missing entirely. The message names the specific failure.
+    #[error("builder VM image not available: {0}")]
+    BuilderImageMissing(String),
+
     /// OCI image pull failed (network, registry auth, digest
     /// mismatch). Wraps the underlying error.
     #[error("OCI image pull failed: {0}")]

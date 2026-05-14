@@ -4155,6 +4155,7 @@ dependencies = [
  "microsandbox",
  "mvm-core",
  "mvm-guest",
+ "mvm-libkrun",
  "serde",
  "serde_json",
  "sha2 0.10.9",
@@ -4164,6 +4165,13 @@ dependencies = [
  "toml",
  "tracing",
  "which 6.0.3",
+]
+
+[[package]]
+name = "mvm-builder-init"
+version = "0.14.0"
+dependencies = [
+ "libc",
 ]
 
 [[package]]
