@@ -1779,6 +1779,122 @@ fn find_dev_image_flake() -> Result<String> {
     anyhow::bail!("Dev image flake not found. Expected at nix/images/builder/flake.nix")
 }
 
+/// Plan 72 W5 sibling of [`find_dev_image_flake`] — locate the
+/// **builder VM** flake at `nix/images/builder-vm/flake.nix`.
+///
+/// Distinct from the dev-shell image flake at `nix/images/builder/`:
+/// the builder-vm flake produces a small (busybox + nix + tools)
+/// rootfs whose closure fits in microsandbox's 4 GiB overlay, so
+/// Stage 0 (`build_image_via_microsandbox`) can build it without
+/// hitting the disk-full ceiling that motivated the whole Plan 72
+/// migration. The dev-shell flake includes rustc + the workspace's
+/// cargo closure, which does not fit and is what
+/// `LibkrunBuilderVm` (Plan 72 W4) handles via virtio-blk-backed
+/// `/nix` instead.
+///
+/// `dead_code` allow: today the only non-test caller is
+/// [`bootstrap_builder_vm_image`], which itself isn't wired to
+/// `ensure_dev_image` yet (that's the W5.B dispatch swap). Once
+/// the swap lands, the lint clears naturally.
+#[allow(dead_code)]
+fn find_builder_vm_flake() -> Result<String> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    let workspace_root = std::path::Path::new(manifest_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Cannot find workspace root"))?;
+
+    let candidate = workspace_root.join("nix").join("images").join("builder-vm");
+    if candidate.join("flake.nix").exists() {
+        return Ok(candidate.to_str().unwrap_or(".").to_string());
+    }
+
+    anyhow::bail!(
+        "Builder VM flake not found. Expected at nix/images/builder-vm/flake.nix \
+         (Plan 72 W2 artifact)."
+    )
+}
+
+/// Plan 72 W5 — populate `~/.cache/mvm/builder-vm/<arch>/` with
+/// `vmlinux` + `rootfs.ext4` + `cmdline.txt` + `manifest.json`
+/// from the in-repo W2 flake, using Stage 0 (microsandbox +
+/// `nixos/nix:2.24.10`) as the bootstrap.
+///
+/// `LibkrunBuilderVm::run_build` reads from this cache; this
+/// function is what fills it. The two-layer artifact rule from
+/// ADR-046 in action:
+///
+/// - Layer 1 (this function): build the **builder VM image**
+///   via microsandbox (small closure, fits 4 GiB overlay).
+/// - Layer 2 (a future `ensure_dev_image` rework): use the
+///   Layer 1 image plus libkrun to build the **dev shell
+///   image** with the large rustc closure.
+///
+/// Source-checkout-only by design — `find_builder_vm_flake()`
+/// must succeed. Installed binaries take the download-prebuilt
+/// path (deferred to a Plan 72 W2 release-workflow follow-up).
+///
+/// Requires the `contributor-bootstrap` feature for the
+/// microsandbox path. When the feature is off, returns a clear
+/// error pointing at the rebuild command.
+///
+/// `dead_code` allow: W5.B (next PR) wires this into
+/// `ensure_dev_image` so source-checkout `mvmctl dev up` invokes
+/// it on cache miss. Today the function exists, has tests, and
+/// is callable directly — but no production code path reaches it,
+/// hence the lint silencing.
+#[allow(dead_code)]
+fn bootstrap_builder_vm_image() -> Result<()> {
+    let flake_dir = find_builder_vm_flake().with_context(|| {
+        "bootstrap requires a source checkout of mvm (the builder-vm flake is \
+         only present in-repo; for installed binaries the prebuilt download path \
+         from Plan 72's release-workflow follow-up will populate the cache instead)"
+    })?;
+
+    let arch = if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let out_dir = format!("{}/builder-vm/{arch}", mvm_core::config::mvm_cache_dir());
+    std::fs::create_dir_all(&out_dir)
+        .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
+
+    #[cfg(feature = "contributor-bootstrap")]
+    {
+        ui::info(&format!(
+            "Bootstrapping builder VM image via Stage 0 (microsandbox + nixos/nix:2.24.10) \
+             from: {flake_dir}"
+        ));
+        match build_image_via_microsandbox(&flake_dir, &out_dir) {
+            Ok((kernel, rootfs)) => {
+                ui::success(&format!(
+                    "Builder VM image ready at {out_dir} (kernel={kernel}, rootfs={rootfs})."
+                ));
+                Ok(())
+            }
+            Err(e) => Err(anyhow::anyhow!(
+                "Stage 0 microsandbox build of the builder-vm flake at {flake_dir} failed: {e}\n\
+                 The builder-vm rootfs closure is meant to fit in microsandbox's 4 GiB overlay \
+                 (no rustc, no cargo crates — see Plan 72 §W2). If it doesn't, the package list \
+                 in nix/images/builder-vm/flake.nix needs trimming."
+            )),
+        }
+    }
+
+    #[cfg(not(feature = "contributor-bootstrap"))]
+    {
+        let _ = flake_dir;
+        let _ = out_dir;
+        anyhow::bail!(
+            "Builder VM Stage 0 bootstrap requires the `contributor-bootstrap` feature. \
+             Rebuild with `cargo install --path . --features contributor-bootstrap` \
+             (source-checkout contributors) or wait for Plan 72's release-workflow \
+             follow-up that publishes the builder-vm prebuilt."
+        );
+    }
+}
+
 /// Locate the bundled `nix/images/default-tenant/` flake.
 ///
 /// This is the fallback used by image-taking commands (`mvmctl exec`,
@@ -2208,6 +2324,51 @@ mod hash_verify_tests {
         assert!(
             err.contains("did not include") && err.contains("dev-vmlinux-x86_64"),
             "expected missing-entry error, got: {err}"
+        );
+    }
+}
+
+#[cfg(test)]
+mod builder_vm_bootstrap_tests {
+    //! Plan 72 W5 — `find_builder_vm_flake` + `bootstrap_builder_vm_image`.
+    use super::*;
+
+    #[test]
+    fn find_builder_vm_flake_resolves_to_in_repo_path() {
+        // From a source checkout, the helper must find the W2
+        // flake at <workspace>/nix/images/builder-vm/flake.nix.
+        // `env!("CARGO_MANIFEST_DIR")` is baked at compile time
+        // and points at the workspace's mvm-cli crate dir, so
+        // this assertion is robust across `cargo test` and
+        // `cargo nextest`.
+        let path = find_builder_vm_flake().expect("expected builder-vm flake present in repo");
+        assert!(
+            path.ends_with("nix/images/builder-vm"),
+            "unexpected flake path: {path}"
+        );
+        // The flake file itself must be readable.
+        assert!(
+            std::path::Path::new(&path).join("flake.nix").is_file(),
+            "flake.nix missing under {path}"
+        );
+    }
+
+    /// When the `contributor-bootstrap` feature is OFF, Stage 0
+    /// has no driver and the bootstrap must error with the
+    /// rebuild hint rather than silently no-op.
+    #[cfg(not(feature = "contributor-bootstrap"))]
+    #[test]
+    fn bootstrap_builder_vm_image_errors_without_contributor_bootstrap() {
+        let err = bootstrap_builder_vm_image()
+            .expect_err("expected an error when contributor-bootstrap is off")
+            .to_string();
+        assert!(
+            err.contains("contributor-bootstrap"),
+            "error should mention the missing feature: {err}"
+        );
+        assert!(
+            err.contains("Rebuild") || err.contains("--features"),
+            "error should hint at the rebuild command: {err}"
         );
     }
 }

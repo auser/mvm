@@ -624,6 +624,11 @@ cp -L "$src/rootfs.ext4" "$out/rootfs.ext4"
 [ -f "$src/initrd" ] && cp -L "$src/initrd" "$out/initrd"
 [ -f "$src/initrd.cpio.gz" ] && cp -L "$src/initrd.cpio.gz" "$out/initrd.cpio.gz"
 [ -f "$src/mvm-meta.json" ] && cp -L "$src/mvm-meta.json" "$out/mvm-meta.json"
+# Plan 72 W2 outputs: builder-vm flake emits cmdline.txt +
+# manifest.json alongside vmlinux + rootfs.ext4. dev-shell flakes
+# don't, so the test is a no-op there.
+[ -f "$src/cmdline.txt" ] && cp -L "$src/cmdline.txt" "$out/cmdline.txt"
+[ -f "$src/manifest.json" ] && cp -L "$src/manifest.json" "$out/manifest.json"
 chmod -R u+w "$out"
 "#,
         out = shell_quote_arg(BUILDER_GUEST_OUT_DIR),
