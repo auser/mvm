@@ -1,38 +1,18 @@
-//! Per-process registry of `StartMode::Attached` sandboxes.
-//!
-//! W7 closes the gap that's been documented in
-//! [`microsandbox::start_with_mode`](crate::microsandbox) since
-//! W6.2: previously, `mode` was *intent metadata* — recorded in
-//! `~/.mvm/vms/<name>/mode.json` so subsequent calls knew the
-//! caller's expectation, but the host process didn't actually
-//! forward `Ctrl-C` (SIGINT) to the sandbox.
+//! Per-process registry of attached VM starts.
 //!
 //! This module owns the missing piece. Attached starts call
 //! [`register_attached`]; the CLI's top-level signal handler calls
 //! [`stop_all_attached`] to walk the registry and tear each
-//! sandbox down gracefully. `stop`/`detach`/`stop_all` deregister
+//! VM down gracefully. `stop`/`detach`/`stop_all` deregister
 //! through [`deregister`] so we never try to stop something that's
 //! already gone.
-//!
-//! ## Why this and not the `Sandbox` handle?
-//!
-//! microsandbox's `Sandbox` is async-bound and `!Send` across the
-//! `VmBackend` sync trait boundary. Keeping the handle live across
-//! `start_with_mode` → caller → SIGINT would force a `tokio::Runtime`
-//! that outlives every backend call, plus a `Mutex<HashMap<VmId,
-//! Sandbox>>` whose entries can't move between threads. The registry
-//! sidesteps that: we keep just the *name* and call
-//! [`microsandbox::Sandbox::get(name)`] from the signal handler,
-//! reusing the same async bridge (`block_on`) the rest of the
-//! backend does.
 //!
 //! ## What it does *not* do
 //!
 //! - It is not a process supervisor. If the parent process dies
 //!   uncleanly (SIGKILL, panic without unwinding), attached
-//!   sandboxes survive — microsandbox sandboxes always run as
-//!   detached child processes at the OS level. Cleanup in that
-//!   case is `mvmctl ps`/`mvmctl down` after restart.
+//!   VMs may survive. Cleanup in that case is `mvmctl ps`/`mvmctl
+//!   down` after restart.
 //! - It is not cross-process. The registry is per-`mvmctl`-process;
 //!   two concurrent `mvmctl up --attached` invocations don't see
 //!   each other's sandboxes.
@@ -41,14 +21,6 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
-// `VmBackend` + `VmId` are only used to call `MicrosandboxBackend::stop`
-// when the feature is on. Gated with the import to avoid an unused-import
-// warning on no-default-features builds.
-#[cfg(feature = "contributor-bootstrap")]
-use mvm_core::vm_backend::{VmBackend, VmId};
-
-#[cfg(feature = "contributor-bootstrap")]
-use crate::MicrosandboxBackend;
 
 /// Metadata kept for each attached sandbox. The map's key is the
 /// sandbox name, which is also the only thing the SIGINT handler
@@ -122,38 +94,17 @@ pub fn stop_all_attached() -> Vec<String> {
     if names.is_empty() {
         return names;
     }
-    #[cfg(feature = "contributor-bootstrap")]
-    {
-        let backend = MicrosandboxBackend;
-        for name in &names {
-            if let Err(e) = backend.stop(&VmId(name.clone())) {
-                tracing::warn!(
-                    sandbox = %name,
-                    error = %e,
-                    "ctrl-c: failed to stop attached sandbox; orphaned",
-                );
-            } else {
-                tracing::info!(sandbox = %name, "ctrl-c: stopped attached sandbox");
-            }
-            deregister(name);
-        }
-    }
-    #[cfg(not(feature = "contributor-bootstrap"))]
-    {
-        // Without the microsandbox backend, the registry is never
-        // populated by any internal code — but `register_attached` is
-        // a `pub fn` so an external caller could populate it anyway.
-        // Drain defensively so the registry doesn't grow unbounded.
-        for name in &names {
-            deregister(name);
-        }
+    // No in-tree backend currently registers here. Drain defensively so
+    // external callers cannot grow the registry unbounded.
+    for name in &names {
+        deregister(name);
     }
     names
 }
 
-/// Test-only helper that drains the registry without invoking the
-/// real `MicrosandboxBackend::stop`. Lets the unit tests assert
-/// `register/deregister` semantics without spawning sandboxes.
+/// Test-only helper that drains the registry without invoking backend
+/// stop logic. Lets the unit tests assert `register/deregister`
+/// semantics without spawning VMs.
 #[cfg(test)]
 pub(crate) fn drain_for_test() -> Vec<String> {
     let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
@@ -163,8 +114,7 @@ pub(crate) fn drain_for_test() -> Vec<String> {
 }
 
 /// Public no-op kept on the public surface so callers (`mvm-cli`'s
-/// SIGINT handler) can unconditionally call us regardless of whether
-/// the microsandbox feature ever spawned anything.
+/// SIGINT handler) can unconditionally call us.
 ///
 /// Equivalent to `let _ = stop_all_attached()`. Exists so the
 /// signal-handler call site doesn't need to discard the returned

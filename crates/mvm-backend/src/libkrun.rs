@@ -103,8 +103,7 @@ impl VmBackend for LibkrunBackend {
 
         // W6.2.1: thread the build-time sidecar into per-VM runtime
         // metadata so `mvmctl console` enforces the accessible/sealed
-        // gate on libkrun-launched VMs the same way as on the
-        // microsandbox/Firecracker paths.
+        // gate on libkrun-launched VMs the same way as on Firecracker.
         let rootfs = Path::new(&config.rootfs_path);
         mvm_base::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
 

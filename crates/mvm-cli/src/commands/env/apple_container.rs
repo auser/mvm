@@ -565,30 +565,13 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
     Ok(())
 }
 
-#[cfg(not(feature = "contributor-bootstrap"))]
-fn source_checkout_requires_contributor_bootstrap(flake_dir: &str) -> anyhow::Error {
-    anyhow::anyhow!(
-        "Local dev-image flake found at {flake_dir}, but this mvmctl binary was built without \
-         the `contributor-bootstrap` feature.\n\n\
-         Refusing to download the published prebuilt because `mvmctl dev up` from a source \
-         checkout must reflect local flakes and rootfs changes.\n\n\
-         Re-run with:\n\
-           cargo run --features contributor-bootstrap -- dev up\n\n\
-         Or install a contributor binary with:\n\
-           cargo install --path . --features contributor-bootstrap"
-    )
-}
-
 /// Resolve the dev image (kernel + rootfs) to absolute paths.
 ///
 /// In a source checkout: uses the libkrun-backed builder VM
 /// (Plan 72 W4/W5 — `LibkrunBuilderVm` runs `nix build` against the
 /// dev-shell flake from inside a microVM with a persistent 64 GiB
 /// `/nix` store). Libkrun isn't installed → loud error pointing at
-/// the install command; **no microsandbox fallback for the dev-shell
-/// image** (Plan 72 W5.C — the dev-shell rustc closure overflows
-/// microsandbox's 4 GiB overlay anyway, so a fallback that would
-/// just disk-out is worse than an actionable error).
+/// the install command.
 ///
 /// Outside a source checkout: falls back to the GitHub-release
 /// download of a pre-built image.
@@ -596,48 +579,20 @@ fn source_checkout_requires_contributor_bootstrap(flake_dir: &str) -> anyhow::Er
 /// Failures of the local build are surfaced loudly — never silently
 /// substituted with the prebuilt, since the prebuilt would mask local
 /// rootfs changes.
-fn ensure_dev_image() -> Result<(String, String)> {
-    let local_flake = find_dev_image_flake().ok();
-
-    #[cfg(not(feature = "contributor-bootstrap"))]
-    if let Some(flake_dir) = &local_flake {
-        return Err(source_checkout_requires_contributor_bootstrap(flake_dir));
-    }
-
+pub(super) fn ensure_dev_image() -> Result<(String, String)> {
     // Plan 72 W5.B + W5.C — source-checkout dispatch.
     //
     // libkrun is the only supported builder for the dev-shell flake.
-    // Plan 72 W5.C removed the legacy direct-microsandbox fallback
-    // because:
-    //
-    //   1. The dev-shell rustc + cargo closure overflows microsandbox's
-    //      hardcoded 4 GiB writable overlay (the load-bearing reason
-    //      ADR-046 / Plan 72 exists). A fallback that would fail with
-    //      "No space left on device" is worse than a clear install
-    //      hint.
-    //
-    //   2. libkrun is now a documented prerequisite for the source-
-    //      checkout dev loop on macOS Apple Silicon / Linux KVM hosts.
-    //      `mvmctl doctor` reports its absence; `brew install libkrun`
-    //      (macOS) / distro package (Linux) is the install path.
-    //
-    // microsandbox is still used INSIDE `build_image_via_libkrun` for
-    // Stage 0 (building the small Layer 1 builder VM image from the
-    // in-repo W2 flake — a closure that fits the 4 GiB overlay). That
-    // path is gated by `contributor-bootstrap` and lives in
-    // `bootstrap_builder_vm_image`. It's not a runtime fallback.
+    // Missing libkrun is surfaced as a configuration error with an
+    // install hint. mvmctl does not consult host Nix as a fallback.
     //
     // Failures are loud and refuse silent fallback to the prebuilt,
     // since the typical failure mode (libkrun runtime mismatch, builder-
     // vm image cache missing) is a config error that hiding behind the
     // prebuilt would mask.
-    // Gate the dispatch itself on `backends-builder-vm-libkrun`. The
-    // earlier `contributor-bootstrap` guard is intentionally stricter
-    // for source checkouts: contributors must build Layer 1 from the
-    // in-repo W2 flake instead of downloading the published builder-VM
-    // artifacts.
+    // Gate the dispatch itself on `backends-builder-vm-libkrun`.
     #[cfg(feature = "backends-builder-vm-libkrun")]
-    if let Some(flake_dir) = &local_flake
+    if let Some(flake_dir) = &find_dev_image_flake().ok()
         && find_builder_vm_flake().is_ok()
     {
         let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
@@ -782,7 +737,7 @@ fn ensure_dev_image() -> Result<(String, String)> {
 /// - `~/.mvm/dev/prebuilt/v*/{vmlinux,rootfs.ext4}` — previously
 ///   downloaded prebuilts for earlier versions.
 /// - `~/.mvm/dev/builds/<hash>/{vmlinux,rootfs.ext4}` — historical
-///   nix-darwin `linux-builder` outputs from the pre-microsandbox era.
+///   older local builder outputs.
 ///
 /// Returns the most-recently-modified pair so a user with a recent
 /// successful build/download keeps booting, with a short label
@@ -1719,122 +1674,19 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
     Ok(())
 }
 
-/// Build a microVM image (kernel + rootfs) by spawning the mvm-owned
-/// microsandbox builder VM and running `nix build` inside it.
-///
-/// `flake_dir` is bind-mounted into the builder as `/work`; the builder
-/// runs `nix build /work#packages.<linux_system>.default` and copies
-/// the resulting artifacts to `out_dir`. The host's `/nix/store` is
-/// bind-mounted opportunistically (when present) for cache reuse — its
-/// absence is fine, the builder will fetch from substituters.
-///
-/// ADR-013 §"Linux builder via microsandbox (no Lima)" — this replaces
-/// the previous host-nix + `nix-darwin` `linux-builder` path so mvm
-/// owns the builder VM end-to-end and the user needs no external Nix
-/// configuration on the host.
-#[cfg(feature = "contributor-bootstrap")]
-fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(String, String)> {
-    use mvm_build::builder_vm::{
-        BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, BuilderVm, MicrosandboxBuilderVm,
-        host_system_linux,
-    };
-
-    let flake_src = std::path::PathBuf::from(flake_dir);
-    if !flake_src.exists() {
-        anyhow::bail!("flake dir does not exist: {flake_dir}");
-    }
-
-    // The bundled flakes live at `<workspace>/nix/images/<name>/` and
-    // use `builtins.path { path = ../../..; }` to capture the workspace
-    // root (for `mkGuest` lib + `Cargo.lock`). To make that resolve
-    // correctly inside the sandbox, mount the whole workspace at /work
-    // and point `flake_ref` at the subdir. Mounting only the flake dir
-    // (the previous design) made `../../..` resolve to `/` of the
-    // sandbox, which tripped over `/.msb/agent.sock` and other
-    // microsandbox-internal files Nix can't import.
-    let workspace_root = flake_src
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .ok_or_else(|| {
-            anyhow::anyhow!("flake dir is not three levels deep in workspace: {flake_dir}")
-        })?
-        .to_path_buf();
-    let flake_rel = flake_src
-        .strip_prefix(&workspace_root)
-        .map_err(|_| anyhow::anyhow!("flake dir not under derived workspace root: {flake_dir}"))?;
-    // `path:` URL forces Nix's filesystem flake fetcher rather than the
-    // git fetcher. The git fetcher gets engaged automatically whenever
-    // the flake path sits under a `.git` directory (the workspace
-    // mount always does), and it fails on git worktrees — the
-    // worktree's `.git` is a file whose `gitdir:` redirect points
-    // outside the bind mount.
-    let guest_flake_ref = format!(
-        "path:{}/{}",
-        BUILDER_GUEST_WORK_DIR,
-        flake_rel
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("flake subpath has non-UTF-8 bytes: {flake_rel:?}"))?
-    );
-
-    // Bind-mount /nix opportunistically on Linux hosts that already
-    // run native Nix — the builder reuses already-realized store paths,
-    // and absence is fine because the in-sandbox store fetches from
-    // substituters. Skip the bind on macOS: a multi-user Nix install
-    // there leaves `/nix` owned by `root:wheel` (Apple Container's
-    // bind-mounter fails with EACCES), *and* the store contains
-    // Darwin-targeted closures that a Linux microVM can't execute
-    // anyway. The microsandbox builder is on the macOS path precisely
-    // because the host has no usable Linux Nix; reusing its Darwin
-    // store is wrong regardless of permissions.
-    let host_nix_store = if cfg!(target_os = "macos") {
-        None
-    } else {
-        let host_nix = std::path::PathBuf::from("/nix");
-        if host_nix.join("store").is_dir() {
-            Some(host_nix)
-        } else {
-            None
-        }
-    };
-
-    let job = BuilderJob::Flake {
-        flake_ref: guest_flake_ref,
-        attr_path: format!("packages.{}.default", host_system_linux()),
-    };
-    let mounts = BuilderMounts {
-        flake_src: workspace_root,
-        host_nix_store,
-        artifact_out: std::path::PathBuf::from(out_dir),
-    };
-
-    MicrosandboxBuilderVm::default()
-        .run_build(&job, &mounts)
-        .map_err(|e| anyhow::anyhow!("microsandbox builder VM: {e}"))?;
-
-    let kernel = format!("{out_dir}/vmlinux");
-    let rootfs = format!("{out_dir}/rootfs.ext4");
-    if !std::path::Path::new(&kernel).exists() {
-        anyhow::bail!("builder VM did not produce vmlinux at {kernel}");
-    }
-    if !std::path::Path::new(&rootfs).exists() {
-        anyhow::bail!("builder VM did not produce rootfs.ext4 at {rootfs}");
-    }
-    Ok((kernel, rootfs))
-}
-
 /// Find the dev-image Nix flake directory.
 ///
 /// Returns `Ok(path)` only when `nix/images/builder/flake.nix` is present —
 /// that flake is the only one whose `packages.<sys>.default` output
 /// produces the vmlinux + rootfs.ext4 + sidecar shape that
-/// `MicrosandboxBuilderVm::run_build` extracts from `/out`. The
+/// `LibkrunBuilderVm::run_build` extracts from `/out`. The
 /// parent `nix/flake.nix` exposes a library (`lib.mkGuest`) plus an
 /// `internal-minimal-runner` test fixture, neither of which match
 /// that contract — falling back to it earlier yielded a misleading
 /// "double-prefix attribute" `nix build` failure inside the
 /// sandbox. The bail signals `ensure_dev_image` to take the
 /// published-prebuilt download path (W5.1 — hash-verified).
+#[cfg(feature = "backends-builder-vm-libkrun")]
 fn find_dev_image_flake() -> Result<String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = std::path::Path::new(manifest_dir)
@@ -1854,14 +1706,10 @@ fn find_dev_image_flake() -> Result<String> {
 /// **builder VM** flake at `nix/images/builder-vm/flake.nix`.
 ///
 /// Distinct from the dev-shell image flake at `nix/images/builder/`:
-/// the builder-vm flake produces a small (busybox + nix + tools)
-/// rootfs whose closure fits in microsandbox's 4 GiB overlay, so
-/// Stage 0 (`build_image_via_microsandbox`) can build it without
-/// hitting the disk-full ceiling that motivated the whole Plan 72
-/// migration. The dev-shell flake includes rustc + the workspace's
-/// cargo closure, which does not fit and is what
-/// `LibkrunBuilderVm` (Plan 72 W4) handles via virtio-blk-backed
-/// `/nix` instead.
+/// the builder-vm flake produces the rootfs used as the libkrun
+/// builder image. The dev-shell flake includes rustc + the workspace's
+/// cargo closure and is built inside that libkrun VM with a
+/// virtio-blk-backed `/nix`.
 ///
 /// W5.B (this PR) wires this into `ensure_dev_image` as a precondition
 /// for the libkrun dispatch path — when it returns `Ok`, the host has
@@ -1869,9 +1717,7 @@ fn find_dev_image_flake() -> Result<String> {
 ///
 /// `allow(dead_code)`: the function is only called from the
 /// libkrun-dispatch path inside `ensure_dev_image`, which itself only
-/// compiles under `all(contributor-bootstrap, backends-builder-vm-libkrun)`.
-/// Default-features and contributor-bootstrap-only builds compile the
-/// function but never reach it; the lint silencing covers those.
+/// compiles when `backends-builder-vm-libkrun` is enabled.
 #[allow(dead_code)]
 fn find_builder_vm_flake() -> Result<String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -1893,39 +1739,16 @@ fn find_builder_vm_flake() -> Result<String> {
 
 /// Plan 72 W5 — populate `~/.cache/mvm/builder-vm/<arch>/` with
 /// `vmlinux` + `rootfs.ext4` + `cmdline.txt` + `manifest.json`
-/// from the in-repo W2 flake, using Stage 0 (microsandbox +
-/// `nixos/nix:2.24.10`) as the bootstrap.
+/// from the published release artifact cache.
 ///
 /// `LibkrunBuilderVm::run_build` reads from this cache; this
 /// function is what fills it. The two-layer artifact rule from
 /// ADR-046 in action:
 ///
-/// - Layer 1 (this function): build the **builder VM image**
-///   via microsandbox (small closure, fits 4 GiB overlay).
-/// - Layer 2 (a future `ensure_dev_image` rework): use the
-///   Layer 1 image plus libkrun to build the **dev shell
-///   image** with the large rustc closure.
-///
-/// Source-checkout-only by design — `find_builder_vm_flake()`
-/// Two acquisition paths split on whether we have an in-repo flake:
-///
-/// 1. **Contributor path (source checkout)** — when `contributor-bootstrap`
-///    is on and `find_builder_vm_flake()` returns Ok, Stage 0 microsandbox
-///    builds the W2 flake locally **on every invocation**. No cache hit
-///    fast path here — CLAUDE.md mandates that a contributor edit to
-///    `nix/images/builder-vm/flake.nix` must show up in the very next
-///    `mvmctl dev up`, and a cache-hit shortcut would mask local edits.
-///    Microsandbox's own internal caching (OCI image + Nix store paths)
-///    keeps the no-change rebuild fast, so this isn't expensive.
-///
-/// 2. **End-user download path (installed binary)** — when there's no
-///    in-repo flake, fetch the per-arch artifacts the W2 release-workflow
-///    job publishes (`builder-vm-vmlinux-<arch>`,
-///    `builder-vm-rootfs-<arch>.ext4`, optional sidecars) from
-///    `releases/download/v<version>/`. SHA-256 verifies per ADR-002 §W5.1.
-///    A cache hit here IS the fast path — there's no upstream source
-///    to be out of sync with; only the release tag matters and the
-///    cache dir is keyed on it.
+/// Fetches the per-arch artifacts the release workflow publishes
+/// (`builder-vm-vmlinux-<arch>`, `builder-vm-rootfs-<arch>.ext4`,
+/// optional sidecars) from `releases/download/v<version>/`. SHA-256
+/// verifies per ADR-002 §W5.1. A cache hit is the fast path.
 ///
 /// W5.B wired this into `ensure_dev_image`; Plan 72 W5's "Layer 1
 /// outside source checkout — download the published prebuilt"
@@ -1945,35 +1768,6 @@ fn bootstrap_builder_vm_image() -> Result<()> {
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
 
-    // Source-checkout path: always rebuild from the in-repo flake.
-    // CLAUDE.md: "A contributor modifying `nix/images/builder-vm/flake.nix`
-    // must see their change in the very next `mvmctl dev up` with no
-    // release-pipeline round-trip." A cache-hit fast path would
-    // silently mask local edits — the per-call microsandbox build is
-    // the correctness gate. Microsandbox's own OCI + Nix-store caching
-    // keeps the no-change rebuild fast.
-    #[cfg(feature = "contributor-bootstrap")]
-    if let Ok(flake_dir) = find_builder_vm_flake() {
-        ui::info(&format!(
-            "Bootstrapping builder VM image via Stage 0 (microsandbox + nixos/nix:2.24.10) \
-             from: {flake_dir}"
-        ));
-        return match build_image_via_microsandbox(&flake_dir, &out_dir) {
-            Ok((kernel, rootfs)) => {
-                ui::success(&format!(
-                    "Builder VM image ready at {out_dir} (kernel={kernel}, rootfs={rootfs})."
-                ));
-                Ok(())
-            }
-            Err(e) => Err(anyhow::anyhow!(
-                "Stage 0 microsandbox build of the builder-vm flake at {flake_dir} failed: {e:#}\n\
-                 The builder-vm rootfs closure is meant to fit in microsandbox's 4 GiB overlay \
-                 (no rustc, no cargo crates — see Plan 72 §W2). If it doesn't, the package list \
-                 in nix/images/builder-vm/flake.nix needs trimming."
-            )),
-        };
-    }
-
     // Installed-binary path: no in-repo source to be out of sync with,
     // so a cache hit IS the fast path. Only download when the cache
     // is empty.
@@ -1992,9 +1786,7 @@ fn bootstrap_builder_vm_image() -> Result<()> {
     ));
     download_builder_vm_image(arch, &out_dir).with_context(|| {
         "downloading the builder VM image. The release-artifact path is the only \
-         option for installed-binary users without contributor-bootstrap; rebuild \
-         with `cargo install --path . --features contributor-bootstrap` to use the \
-         in-repo Stage 0 microsandbox path instead."
+         supported builder-VM bootstrap path when no local cached image exists."
     })?;
     Ok(())
 }
@@ -2098,8 +1890,8 @@ fn builder_vm_artifact_names(arch: &str) -> BuilderVmArtifactNames {
 /// builder VM.
 ///
 /// Layer 1 (the builder VM image at `~/.cache/mvm/builder-vm/<arch>/`)
-/// is bootstrapped via [`bootstrap_builder_vm_image`] on cache miss
-/// (Stage 0 = microsandbox + nixos/nix:2.24.10). Layer 2 (the dev-shell
+/// is downloaded via [`bootstrap_builder_vm_image`] on cache miss.
+/// Layer 2 (the dev-shell
 /// image the user boots into via `mvmctl dev up`) is built by
 /// `LibkrunBuilderVm::run_build` against the in-repo
 /// `nix/images/builder/` flake, inside a libkrun guest that mounts the
@@ -2107,29 +1899,22 @@ fn builder_vm_artifact_names(arch: &str) -> BuilderVmArtifactNames {
 /// virtio-fs `/out` share.
 ///
 /// On success returns the host-side paths to the produced `vmlinux`
-/// and `rootfs.ext4` in `out_dir` (mirroring `build_image_via_microsandbox`).
+/// and `rootfs.ext4` in `out_dir`.
 ///
 /// Caller is expected to have:
 ///   - confirmed `mvm_libkrun::is_available()` true,
 ///   - confirmed `find_builder_vm_flake().is_ok()` (Layer 1 source is
 ///     present in the workspace),
 ///   - run [`prepare_dev_image_out_dir`] on `out_dir`.
-// Gated only on `backends-builder-vm-libkrun` after Plan 72 W5.C:
-// `bootstrap_builder_vm_image` handles the no-`contributor-bootstrap`
-// case via the release-artifact download path. Stage 0 microsandbox
-// is the contributor fast-path, not a hard requirement.
 #[cfg(feature = "backends-builder-vm-libkrun")]
 fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     use mvm_build::builder_vm::{BuilderJob, BuilderMounts, BuilderVm, host_system_linux};
     use mvm_build::libkrun_builder::LibkrunBuilderVm;
 
-    // Stage 0 — ensure Layer 1 (the builder VM image) is in
-    // `~/.cache/mvm/builder-vm/<arch>/`. Idempotent: first call builds
-    // it via microsandbox; subsequent calls find the cache populated
-    // and return immediately. Currently always pays the rebuild cost
-    // because microsandbox doesn't surface a content-hash check — a
-    // future PR can wire `manifest.json` SHA verification to make this
-    // a cheap cache hit.
+    // Ensure Layer 1 (the builder VM image) is in
+    // `~/.cache/mvm/builder-vm/<arch>/`. Idempotent: first call
+    // downloads and verifies it; subsequent calls find the cache
+    // populated and return immediately.
     bootstrap_builder_vm_image()
         .context("Stage 0 builder-VM image bootstrap (precondition for libkrun dispatch)")?;
 
@@ -2188,44 +1973,11 @@ fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     Ok((kernel, rootfs))
 }
 
-/// Locate the bundled `nix/images/default-tenant/` flake.
-///
-/// This is the fallback used by image-taking commands (`mvmctl exec`,
-/// `mvmctl up`) when neither `--flake` nor `--manifest` is supplied.
-/// (Was `nix/default-microvm/` before W7.3.) Only the builder-VM path
-/// in `ensure_default_microvm_image` consumes this helper; gating
-/// matches that single call site.
-#[cfg(feature = "contributor-bootstrap")]
-fn find_default_microvm_flake() -> Result<String> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = std::path::Path::new(manifest_dir)
-        .parent()
-        .and_then(|p| p.parent())
-        .ok_or_else(|| anyhow::anyhow!("Cannot find workspace root"))?;
-
-    let candidate = workspace_root
-        .join("nix")
-        .join("images")
-        .join("default-tenant");
-    if candidate.join("flake.nix").exists() {
-        return Ok(candidate.to_str().unwrap_or(".").to_string());
-    }
-    anyhow::bail!(
-        "Default microVM image flake not found. Expected at nix/images/default-tenant/flake.nix"
-    )
-}
-
 /// Ensure the bundled default microVM image (kernel + rootfs) is in the cache.
 ///
 /// Used by any image-taking command when no `--flake` or `--manifest` was
-/// supplied. Builds via the mvm-owned microsandbox builder VM on first
-/// use and caches under `~/.cache/mvm/default-microvm/`. Returns
-/// `(kernel_path, rootfs_path)`.
-///
-/// If the local build fails or no source flake is available (e.g. an
-/// installed-binary build with `contributor-bootstrap` compiled out),
-/// falls back to downloading a pre-built image from the matching
-/// GitHub release.
+/// supplied. Downloads a pre-built image from the matching GitHub release
+/// when the cache is empty. Returns `(kernel_path, rootfs_path)`.
 pub(crate) fn ensure_default_microvm_image() -> Result<(String, String)> {
     let cache_dir = format!("{}/default-microvm", mvm_core::config::mvm_cache_dir());
     std::fs::create_dir_all(&cache_dir)?;
@@ -2235,22 +1987,6 @@ pub(crate) fn ensure_default_microvm_image() -> Result<(String, String)> {
 
     if std::path::Path::new(&kernel_path).exists() && std::path::Path::new(&rootfs_path).exists() {
         return Ok((kernel_path, rootfs_path));
-    }
-
-    #[cfg(feature = "contributor-bootstrap")]
-    if let Ok(flake_dir) = find_default_microvm_flake() {
-        ui::info("Building default microVM image via microsandbox builder VM (first time only)...");
-        match build_image_via_microsandbox(&flake_dir, &cache_dir) {
-            Ok(_) => {
-                ui::success("Default microVM image built and cached.");
-                return Ok((kernel_path, rootfs_path));
-            }
-            Err(e) => {
-                ui::warn(&format!(
-                    "Local builder VM build failed ({e}); falling back to pre-built download."
-                ));
-            }
-        }
     }
 
     download_default_microvm_image(&kernel_path, &rootfs_path)
@@ -2643,21 +2379,6 @@ mod builder_vm_bootstrap_tests {
         assert!(
             std::path::Path::new(&path).join("flake.nix").is_file(),
             "flake.nix missing under {path}"
-        );
-    }
-
-    #[cfg(not(feature = "contributor-bootstrap"))]
-    #[test]
-    fn source_checkout_dev_image_errors_without_contributor_bootstrap() {
-        let err =
-            source_checkout_requires_contributor_bootstrap("/repo/nix/images/builder").to_string();
-        assert!(
-            err.contains("Refusing to download the published prebuilt"),
-            "error must make the no-download invariant explicit: {err}"
-        );
-        assert!(
-            err.contains("cargo run --features contributor-bootstrap -- dev up"),
-            "error should include the contributor rebuild command: {err}"
         );
     }
 

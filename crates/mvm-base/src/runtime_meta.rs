@@ -1,7 +1,7 @@
 //! Per-VM runtime metadata persisted to `~/.mvm/vms/<name>/mode.json`.
 //!
-//! Backend-agnostic. Today microsandbox is the only writer (intent recording
-//! for `StartMode::Attached`/`Detached`); the meta also carries the
+//! Backend-agnostic. Backends record `StartMode::Attached`/`Detached`
+//! intent here; the meta also carries the
 //! `accessible` flag that gates `mvmctl console` against sealed images.
 //!
 //! ## File shape
@@ -39,9 +39,8 @@ pub static HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 /// Runtime metadata persisted alongside a started VM.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct VmRuntimeMeta {
-    /// Caller's start-mode intent. Written by microsandbox's
-    /// `start_with_mode`; consumed by the W7 handle registry for
-    /// signal forwarding.
+    /// Caller's start-mode intent. Written by `start_with_mode`;
+    /// consumed by the W7 handle registry for signal forwarding.
     pub mode: StartModeKind,
 
     /// Whether `mvmctl console` may attach to this VM.

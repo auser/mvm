@@ -95,7 +95,7 @@ impl Drop for TapGuard {
 /// Ensure we have a Linux execution environment.
 ///
 /// Today this is always a no-op: native Linux runs Firecracker directly,
-/// macOS runs microsandbox, and the Lima fallback is gone (ADR-013).
+/// macOS uses Apple Container or libkrun, and the Lima fallback is gone.
 /// Kept as a function so callers stay well-formed; remove once every
 /// callsite is audited and the call itself can be dropped.
 fn require_linux_env() -> Result<()> {

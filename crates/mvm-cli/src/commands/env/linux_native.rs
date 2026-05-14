@@ -18,8 +18,8 @@
 //!
 //! Apple Container hosts use `super::apple_container` instead; macOS
 //! Intel / pre-26 / no-KVM-Linux hosts fall through to a "no dev
-//! backend" error in `super::dev::run` — those need the
-//! microsandbox builder VM (W7.x.2's deliverable).
+//! backend" error in `super::dev::run` until a libkrun dev path is
+//! wired for those host classes.
 
 use std::process::{Command, Stdio};
 

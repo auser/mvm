@@ -12,8 +12,6 @@
 //! - **Docker** (`docker::DockerBackend`) — Tier 3 fallback.
 //! - **libkrun** (`libkrun::LibkrunBackend`) — raw libkrun shim
 //!   (Linux KVM / macOS HVF).
-//! - **microsandbox** (`microsandbox::MicrosandboxBackend`) —
-//!   libkrun-backed sandbox; Phase 1 default.
 //! - **microvm.nix** (`microvm_nix::MicrovmNixBackend`) — Firecracker
 //!   via the upstream microvm.nix runner.
 //!
@@ -50,35 +48,10 @@ pub mod mock;
 pub mod mock_guest_agent;
 pub mod network;
 
-// `microsandbox` is the only self-contained backend integration that
-// can be feature-gated as a unit — the upstream crate pulls a sqlite
-// implementation that collides with library consumers (DRIFT-001).
-// One cfg at the module declaration gates the whole integration; the
-// few call-sites in `backend.rs` carry matching cfgs grouped by
-// function.
-#[cfg(feature = "contributor-bootstrap")]
-pub mod microsandbox;
-
 pub use apple_container::AppleContainerBackend;
 pub use backend::{AnyBackend, FirecrackerBackend, FirecrackerConfig};
 pub use cloud_hypervisor::CloudHypervisorBackend;
 pub use docker::DockerBackend;
 pub use libkrun::LibkrunBackend;
-#[cfg(feature = "contributor-bootstrap")]
-pub use microsandbox::MicrosandboxBackend;
 pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
 pub use mock::MockBackend;
-
-/// Crate-wide test serialization for tests that mutate `HOME` or
-/// other process-global env vars. Re-exported from
-/// [`mvm_base::runtime_meta::HOME_TEST_LOCK`] so the
-/// alt-backend tests share the same mutex with `mvm` tests
-/// — without sharing one lock the modules race each other when
-/// their tests run on the same `cargo test` binary.
-///
-/// Only the microsandbox tests reach the re-export through
-/// `crate::HOME_TEST_LOCK`; the `handle_registry` tests import
-/// from `mvm_base` directly. The cfg matches the only consumer so
-/// no-default-features builds stay warning-clean.
-#[cfg(all(test, feature = "contributor-bootstrap"))]
-pub(crate) use mvm_base::runtime_meta::HOME_TEST_LOCK;

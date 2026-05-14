@@ -77,13 +77,6 @@ jobs:
         with:
           components: rustfmt, clippy
 
-      - name: Install system build deps
-        # xtask transitively links libcap-ng via microsandbox →
-        # msb_krun_devices → capng. Lint runs `cargo run -p xtask`
-        # twice (adr-coverage + secret-types check), which requires
-        # the library to be present at link time.
-        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
-
       - name: Cache cargo
         uses: actions/cache@v5
         with:
@@ -135,20 +128,6 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Install system build deps
-        # `capng` (transitive via microsandbox → msb_krun_devices) links
-        # against system `libcap-ng`. Without `libcap-ng-dev` the linker
-        # fails with `unable to find library -lcap-ng`. Ubuntu's GH
-        # runner image ships the runtime library but not the -dev
-        # headers/symlinks that `cc` needs at link time.
-        #
-        # The secret-store live tests in tests/audit_emissions_live.rs
-        # pin `MVM_SECRET_STORE_BACKEND=file` in the sandbox, so no
-        # DBus / Secret Service is needed here.
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libcap-ng-dev
-
       - name: Cache cargo
         uses: actions/cache@v5
         with:
@@ -174,9 +153,6 @@ jobs:
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
-
-      - name: Install system build deps (see test job for why)
-        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -211,8 +187,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Install jq + libcap-ng (see test job for why)
-        run: sudo apt-get update && sudo apt-get install -y jq libcap-ng-dev
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -264,8 +240,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Install jq + libcap-ng (see test job for why)
-        run: sudo apt-get update && sudo apt-get install -y jq libcap-ng-dev
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -451,10 +427,10 @@ jobs:
   #   - cloud-hypervisor boots a Nix-built Linux kernel + ext4 rootfs
   #     on a real KVM host (Linux side of "is the VMM viable?").
   #   - The dev-image flake at `nix/images/builder` builds via host
-  #     Nix on a fresh runner with NO microsandbox involvement —
-  #     proving the artifact pipeline doesn't need microsandbox.
+  #     Nix on a fresh runner, proving the artifact pipeline is
+  #     independent of third-party runtime wrappers.
   #     Together with the libkrun-macos lane, the two-lane gate
-  #     covers the empirical premise behind retiring microsandbox.
+  #     covers the empirical premise behind the builder-VM path.
   #
   # KernelBooted (kernel reaches boot diagnostics but rootfs/init
   # fails) counts as PASS by default — the gate is "VMM viable",
@@ -535,11 +511,11 @@ jobs:
           key: ${{ runner.os }}-cargo-ch-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-ch-
 
-      - name: Build dev image via host Nix (no microsandbox)
+      - name: Build dev image via host Nix
         if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
         # Mirrors release.yml's dev-image job for x86_64 — this is the
-        # load-bearing existence proof that the artifact pipeline does
-        # not require microsandbox. Output gets staged at
+        # load-bearing existence proof that the artifact pipeline can
+        # be produced by CI directly. Output gets staged at
         # $GITHUB_WORKSPACE/ci-artifacts/{vmlinux, rootfs.ext4}; the
         # next step points the bootcheck at those paths via env vars.
         #

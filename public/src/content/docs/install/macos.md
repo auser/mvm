@@ -1,17 +1,17 @@
 ---
 title: "Install mvm on macOS"
-description: "mvm on macOS runs natively via microsandbox + libkrun on Hypervisor.framework. No Docker Desktop required. Apple Silicon (arm64) is the primary target; Intel Macs work too."
+description: "mvm on macOS runs natively via libkrun on Hypervisor.framework. No Docker Desktop or host-side Nix required."
 ---
 
-mvm on macOS can use **microsandbox** as the backend — a libkrun wrapper that boots microVMs on Apple's Hypervisor.framework. Source builds keep this dependency-heavy backend behind the `contributor-bootstrap` feature; release builds that include macOS microsandbox support are built with that feature enabled. The choice is recorded in [ADR-013](/contributing/adr/013-microsandbox-pivot/) and ADR-031.
+mvm on macOS uses **libkrun** to boot microVMs on Apple's Hypervisor.framework. Docker Desktop is not required, and mvm does not depend on host-side Nix for `mvmctl` runtime/build commands.
 
-Apple Silicon (M-series) is the primary target. Intel Macs (x86_64) work but the upstream microsandbox path on Intel is less exercised — file an issue if anything misbehaves.
+Apple Silicon (M-series) is the primary target. Intel Macs (x86_64) use the same libkrun path where supported.
 
 ## Prerequisites
 
-- macOS 13 (Ventura) or newer. macOS 12 might work but isn't tested; macOS 11 lacks the Hypervisor.framework features microsandbox needs.
+- macOS 13 (Ventura) or newer. macOS 12 might work but isn't tested; macOS 11 lacks the Hypervisor.framework features this path needs.
 
-You **do not need Nix on your Mac** when using a build that includes `contributor-bootstrap`. mvm bootstraps a small Linux builder microVM (microsandbox-backed) on first build, runs `nix build` inside it, and extracts the resulting rootfs back to the host. See [§"Linux builds on macOS"](#linux-builds-on-macos--zero-config-by-default) below for the design.
+You **do not need Nix on your Mac**. mvm runs `nix build` inside the project builder VM and extracts the resulting rootfs back to the host. If that builder VM image is missing or broken, `mvmctl` reports that directly; it does not fall back to host Nix.
 
 ## Install mvmctl
 
@@ -36,13 +36,6 @@ cargo build --release
 install -m 0755 target/release/mvmctl ~/.local/bin/mvmctl
 ```
 
-To include the microsandbox/libkrun backend in a source build:
-
-```bash
-cargo build --release --features contributor-bootstrap
-install -m 0755 target/release/mvmctl ~/.local/bin/mvmctl
-```
-
 ### From crates.io
 
 ```bash
@@ -53,13 +46,13 @@ cargo install mvmctl
 
 ## Linux builds on macOS — zero-config by default
 
-macOS Nix can't build Linux derivations natively, and most Mac users don't have Nix installed at all. mvm handles both cases **without requiring host-side configuration**: on first `mvmctl build`, mvm pulls a small Nix-bearing image, spawns a microsandbox sandbox from it, bind-mounts your project source, runs `nix build` inside, and extracts the resulting rootfs back to the host. See [ADR-013 §"Linux builder via microsandbox"](/contributing/adr/013-microsandbox-pivot/) for the design.
+macOS Nix can't build Linux derivations natively, and most Mac users don't have Nix installed at all. mvm handles both cases **without requiring host-side configuration**: on first `mvmctl build`, mvm resolves the project builder VM image, mounts your project source into it, runs `nix build` inside the VM, and extracts the resulting rootfs back to the host.
 
-If you already have a host-side Linux builder (e.g., [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary), or a remote `nix-daemon` URL), mvm detects it and uses it instead — the microsandbox-bootstrapped path is the zero-config *default*, not a forced override. When host-side Nix is present, its `/nix/store` is shared into the builder sandbox so cached derivations are reused across both modes.
+The builder VM is the execution boundary for Nix. Host-side Nix can still be useful for editor tooling or direct contributor workflows, but `mvmctl` does not probe `nix` on the host path when building or running microVMs.
 
 ### Optional: host-side Nix for power users
 
-Most users skip this section. You may want host-side Nix if you're contributing to mvm itself, want a shared `/nix/store` for your editor's build commands, or already run `nix-darwin` for unrelated reasons.
+Most users skip this section. You may want host-side Nix if you're contributing to mvm itself, want a shared `/nix/store` for your editor's build commands, or already run `nix-darwin` for unrelated reasons. This is not part of the `mvmctl` runtime path.
 
 [Determinate Nix](https://determinate.systems/posts/determinate-nix-installer) is the easiest path:
 
@@ -67,7 +60,7 @@ Most users skip this section. You may want host-side Nix if you're contributing 
 curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
 ```
 
-To turn that install into a working Linux builder, configure [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary). mvm's auto-detection will pick it up on the next build.
+If you configure [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary), use it for your own host-side commands; mvm's managed build path continues to run inside the project builder VM.
 
 ## Verify
 
@@ -75,7 +68,7 @@ To turn that install into a working Linux builder, configure [`nix-darwin`'s `li
 mvmctl doctor
 ```
 
-`doctor` reports the active backend; on a stock macOS host you should see `microsandbox` selected. Hypervisor.framework presence + libkrun availability are checked.
+`doctor` reports the active backend and checks Hypervisor.framework + libkrun availability.
 
 ## First microVM
 
@@ -85,21 +78,21 @@ mvmctl init
 mvmctl run
 ```
 
-`mvmctl init` scaffolds the project. On first `mvmctl run`, mvm bootstraps the builder microVM (one-time download), runs `nix build` inside it, and boots the resulting rootfs via microsandbox. Expected cold boot: ≤ 500ms (Hypervisor.framework adds ~100ms vs Linux/KVM); the first build pays a one-time builder-image fetch on top of that.
+`mvmctl init` scaffolds the project. On first `mvmctl run`, mvm resolves the builder microVM image, runs `nix build` inside it, and boots the resulting rootfs via libkrun. The first build may pay a one-time builder-image fetch on top of VM boot time.
 
 ## Troubleshooting
 
 **"Hypervisor.framework: entitlement missing"** — re-codesign the binary with the entitlement: `codesign --entitlements resources/mvmctl.entitlements -f -s - ~/.local/bin/mvmctl`. The release binary ships pre-signed; this only matters if you've stripped entitlements or built from source without the build script's signing step.
 
-**`nix build` fails with "a 'x86_64-linux' with features … is required"** — you've opted into host-side Nix and the macOS host can't build Linux derivations directly. The microsandbox builder bootstrap should pick this up automatically; if it didn't, the bootstrap couldn't start (check `mvmctl doctor` for libkrun + Hypervisor.framework status). As a workaround, configure [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) — mvm will detect and use it.
+**`nix build` fails with "a 'x86_64-linux' with features … is required"** — that is a host-side Nix error. The managed `mvmctl` build path should run inside the builder VM instead; check `mvmctl doctor` for libkrun + Hypervisor.framework status and rebuild/refetch the builder VM image if the builder-side `nix` is missing.
 
 **`mvmctl run` boots but `mvmctl console` fails to attach** — the `console` subcommand is only enabled for *accessible* images. If your `entrypoint.command = [ ... ]`, the build is *sealed* and console attach is rejected. Switch to `entrypoint.shell = "/bin/sh"` or pass `dev = true` in your `mkGuest` call. See [Building MicroVM Images](/guides/building-microvm-images).
 
-**"microsandbox backend unavailable"** — source builds omit microsandbox unless built with `--features contributor-bootstrap`. Rebuild with that feature if you need the libkrun-backed macOS path.
+**"builder VM is missing nix"** — the builder image is broken or stale. Rebuild/refetch the builder VM image; installing Nix on the macOS host is not the fix.
 
 ## Apple Silicon vs Intel notes
 
 - **Apple Silicon (M1/M2/M3/M4)** — Tier 2 microVM isolation via Hypervisor.framework + libkrun. Boot ~500ms cold, ~60ms snapshot-cloned. The supported path.
-- **Intel Macs** — Hypervisor.framework still works on x86_64 macOS, but the upstream microsandbox testing is sparser. Expect occasional rough edges; file issues with `mvmctl doctor` output attached.
+- **Intel Macs** — Hypervisor.framework works on x86_64 macOS where libkrun supports it. File issues with `mvmctl doctor` output attached.
 
-The Apple Container backend (macOS 26+ Virtualization framework) was previously a Tier 2 fallback in the auto-select ladder. It still exists in the codebase but microsandbox supersedes it on every macOS host that supports both — see ADR-013 §"Backend selection ladder" for the priority.
+The Apple Container backend (macOS 26+ Virtualization framework) still exists as a fallback; libkrun is the direct microVM and dev VM backend for mvm workloads on macOS.

@@ -71,7 +71,7 @@ pub struct SynthesisInput<'a> {
     pub vm_name: &'a str,
     /// Optional tenant override. `None` → `DEFAULT_TENANT`.
     pub tenant: Option<&'a str>,
-    /// Resolved runtime profile (`firecracker` / `microsandbox` /
+    /// Resolved runtime profile (`firecracker` / `libkrun` /
     /// `apple-container` / `cloud-hypervisor`).
     pub backend_name: &'a str,
     /// Image reference for `SignedImageRef`. `sha256` is the

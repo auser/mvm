@@ -1,26 +1,29 @@
 //! `mvmctl dev` — manage the development environment.
 //!
-//! Three host classes, three paths:
+//! Host classes and dev paths:
 //!
-//! - **macOS 26+ Apple Silicon** → `super::apple_container` boots a
-//!   dev VM via Apple Virtualization.framework and exposes a
-//!   PTY-over-vsock console.
+//! - **macOS with libkrun** → boots the dev VM via libkrun on
+//!   Hypervisor.framework and exposes a PTY-over-vsock console.
+//! - **macOS 26+ Apple Silicon without libkrun** →
+//!   `super::apple_container` boots a dev VM via Apple
+//!   Virtualization.framework and exposes a PTY-over-vsock console.
 //! - **Linux + KVM** → `super::linux_native` treats the host shell as
 //!   the dev environment, installs Firecracker + downloads kernel/
 //!   rootfs assets, and optionally spawns an interactive subshell.
 //!   This is the W8.C path — replaces the W7-deleted Lima
 //!   `dev_up`/`dev_down`/`dev_status` helpers.
-//! - **macOS Intel / pre-26 / no-KVM Linux** → bails with a clear
-//!   reference to the W7.x.2 microsandbox-builder-VM follow-up,
-//!   the only path that brings Firecracker to those hosts.
+//! - **no-KVM Linux / macOS without libkrun or Apple Container** →
+//!   bails with a clear unsupported-host message.
 
 use anyhow::Result;
 use clap::{Args as ClapArgs, Subcommand};
 
 use crate::ui;
 
+use mvm_backend::LibkrunBackend;
 use mvm_core::platform::{self, Platform};
 use mvm_core::user_config::MvmConfig;
+use mvm_core::vm_backend::{VmBackend, VmId, VmStartConfig, VmStatus};
 
 use super::super::vm::console;
 use super::Cli;
@@ -30,20 +33,23 @@ use super::linux_native;
 /// Which `mvmctl dev` backend the current host uses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DevBackend {
+    /// macOS with libkrun — Hypervisor.framework-backed dev VM.
+    Libkrun,
     /// macOS 26+ Apple Silicon — Apple Container dev VM.
     AppleContainer,
     /// Linux with `/dev/kvm` — host shell is the dev environment;
     /// Firecracker runs natively.
     LinuxKvm,
-    /// Neither path is wired today — macOS Intel, macOS pre-26,
-    /// Linux without KVM, Windows. The microsandbox builder VM
-    /// (W7.x.2) is the planned home for these.
+    /// Neither path is wired today — Linux without KVM, Windows, or
+    /// macOS without libkrun / Apple Container.
     Unsupported,
 }
 
 fn current_backend() -> DevBackend {
     let plat = platform::current();
-    if plat.has_apple_containers() {
+    if matches!(plat, Platform::MacOS) && plat.has_libkrun() {
+        DevBackend::Libkrun
+    } else if plat.has_apple_containers() {
         DevBackend::AppleContainer
     } else if plat.has_kvm() && matches!(plat, Platform::LinuxNative | Platform::Wsl2) {
         DevBackend::LinuxKvm
@@ -139,22 +145,69 @@ pub(in crate::commands) enum DevAction {
     },
 }
 
-/// Error shown on hosts where `mvmctl dev` can't run today — macOS
-/// Intel, macOS pre-26, Linux without KVM, Windows. Points the user
-/// at the W7.x.2 microsandbox-builder-VM follow-up so they have
-/// somewhere to look rather than an opaque "not implemented"
-/// message.
+/// Error shown on hosts where `mvmctl dev` can't run today.
 fn bail_no_dev_backend() -> Result<()> {
     anyhow::bail!(
         "`mvmctl dev` requires either:\n  \
+           - macOS with libkrun (Hypervisor.framework dev VM),\n  \
            - macOS 26+ Apple Silicon (Apple Container dev VM), or\n  \
            - Linux with /dev/kvm (Firecracker runs natively on host).\n\
-         This host has neither. The microsandbox builder VM (W7.x.2 \
-         in specs/SPRINT.md) is the planned path for macOS Intel / \
-         pre-26 / no-KVM Linux. Until that lands, run workloads \
+         This host has none of those. Run workloads \
          directly with `mvmctl up <flake>` using whichever backend \
          `mvmctl doctor` reports as available."
     );
+}
+
+fn cmd_dev_libkrun(cpus: u32, memory_gib: u32, open_shell: bool) -> Result<()> {
+    let backend = LibkrunBackend;
+    let id = VmId(apple_container::DEV_VM_NAME.to_string());
+
+    if matches!(backend.status(&id)?, VmStatus::Running) {
+        ui::success("libkrun dev VM already running.");
+        if open_shell {
+            console::console_interactive(apple_container::DEV_VM_NAME)?;
+        }
+        return Ok(());
+    }
+
+    ui::progress("Starting dev environment via libkrun...");
+    let (kernel, rootfs) = apple_container::ensure_dev_image()?;
+    let memory_mib = memory_gib.saturating_mul(1024);
+    let config = VmStartConfig {
+        name: apple_container::DEV_VM_NAME.to_string(),
+        rootfs_path: rootfs,
+        kernel_path: Some(kernel),
+        cpus,
+        memory_mib,
+        flake_ref: "mvm-dev".into(),
+        profile: Some("dev".into()),
+        ..Default::default()
+    };
+    backend.start(&config)?;
+    ui::success("Dev environment ready (libkrun).");
+    if open_shell {
+        console::console_interactive(apple_container::DEV_VM_NAME)?;
+    }
+    Ok(())
+}
+
+fn cmd_dev_libkrun_down() -> Result<()> {
+    LibkrunBackend.stop(&VmId(apple_container::DEV_VM_NAME.to_string()))
+}
+
+fn cmd_dev_libkrun_status() -> Result<()> {
+    let status = LibkrunBackend.status(&VmId(apple_container::DEV_VM_NAME.to_string()))?;
+    let state = match status {
+        VmStatus::Starting => "starting",
+        VmStatus::Running => "running",
+        VmStatus::Stopped => "stopped",
+        VmStatus::Paused => "paused",
+        VmStatus::Failed { .. } => "failed",
+    };
+    ui::info("Backend:  libkrun (Hypervisor.framework)");
+    ui::info(&format!("VM:       {}", apple_container::DEV_VM_NAME));
+    ui::info(&format!("Status:   {state}"));
+    Ok(())
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
@@ -186,6 +239,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             };
 
             match backend {
+                DevBackend::Libkrun => cmd_dev_libkrun(effective_cpus, effective_mem, shell),
                 DevBackend::AppleContainer => {
                     apple_container::cmd_dev_apple_container(effective_cpus, effective_mem, shell)
                 }
@@ -195,6 +249,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         }
         DevAction::Down { reset } => {
             let result = match backend {
+                DevBackend::Libkrun => cmd_dev_libkrun_down(),
                 DevBackend::AppleContainer => apple_container::cmd_dev_apple_container_down(),
                 DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_down(),
                 // Nothing to stop on unsupported hosts. The gc-root
@@ -240,6 +295,15 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             result
         }
         DevAction::Shell { project: _project } => match backend {
+            DevBackend::Libkrun => {
+                if !matches!(
+                    LibkrunBackend.status(&VmId(apple_container::DEV_VM_NAME.to_string()))?,
+                    VmStatus::Running
+                ) {
+                    anyhow::bail!("Dev VM is not running. Start it with: mvmctl dev up --shell");
+                }
+                console::console_interactive(apple_container::DEV_VM_NAME)
+            }
             DevBackend::AppleContainer => {
                 if !apple_container::is_apple_container_dev_running() {
                     anyhow::bail!("Dev VM is not running. Start it with: mvmctl dev up");
@@ -258,13 +322,13 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             DevBackend::Unsupported => bail_no_dev_backend(),
         },
         DevAction::Status => match backend {
+            DevBackend::Libkrun => cmd_dev_libkrun_status(),
             DevBackend::AppleContainer => apple_container::cmd_dev_apple_container_status(),
             DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_status(),
             DevBackend::Unsupported => {
                 ui::info(
-                    "Dev environment: not configured on this host (Apple Container \
-                     unavailable and /dev/kvm missing). See W7.x.2 in specs/SPRINT.md \
-                     for the planned microsandbox-builder-VM path.",
+                    "Dev environment: not configured on this host (libkrun / Apple Container \
+                     unavailable and /dev/kvm missing).",
                 );
                 Ok(())
             }
@@ -284,6 +348,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             // start over," so a stop failure here shouldn't block the
             // re-up).
             let _ = match backend {
+                DevBackend::Libkrun => cmd_dev_libkrun_down(),
                 DevBackend::AppleContainer => apple_container::cmd_dev_apple_container_down(),
                 DevBackend::LinuxKvm => linux_native::cmd_dev_linux_native_down(),
                 DevBackend::Unsupported => Ok(()),
@@ -301,6 +366,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                 memory
             };
             match backend {
+                DevBackend::Libkrun => cmd_dev_libkrun(effective_cpus, effective_mem, shell),
                 DevBackend::AppleContainer => {
                     apple_container::cmd_dev_apple_container(effective_cpus, effective_mem, shell)
                 }

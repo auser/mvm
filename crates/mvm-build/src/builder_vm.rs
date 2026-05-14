@@ -1,32 +1,17 @@
-//! Linux builder VM bootstrap (microsandbox-backed).
+//! Linux builder VM bootstrap contract.
 //!
-//! Implements the contract documented in ADR-013 §"Linux builder via
-//! microsandbox (no Lima)": on hosts that can't `nix build` Linux
-//! derivations natively (macOS without `nix-darwin`'s `linux-builder`,
-//! Windows-via-WSL2 without an in-WSL Nix install, Linux without host
-//! Nix), `mvmctl build` bootstraps a small Linux builder microVM from
-//! a pinned OCI image, runs `nix build` inside it, and extracts the
-//! resulting rootfs back to the host.
-//!
-//! ## Status
-//!
-//! **Scaffolding.** The contract types and the 6-step flow are
-//! locked; the actual bootstrap (OCI pull + sandbox spawn + bind-mount
-//! wiring + artifact extraction) lands in a follow-up wave. Today
-//! every method returns [`BuilderVmError::NotYetImplemented`] with a
-//! pointer to the ADR section. Callers can wire the dispatch and
-//! cover the error path in tests; the data-plane fills in
-//! incrementally.
+//! Shared contract types for builder-VM implementations. On hosts that
+//! can't `nix build` Linux derivations natively, `mvmctl build` uses a
+//! project-owned Linux builder microVM and extracts the resulting rootfs
+//! back to the host. The libkrun-backed implementation lives in
+//! `libkrun_builder`.
 //!
 //! ## Trust boundary
 //!
 //! The builder VM lives in a different trust zone than runtime VMs.
 //! It pulls from network, runs arbitrary Nix derivations, and bind-
-//! mounts the host's `/nix/store` for cache reuse. ADR-013's
-//! "non-goal: OCI" applies to the **runtime** path; OCI is
-//! deliberately *acceptable* for the builder. See
-//! ADR-013 §"Linux builder via microsandbox (no Lima)" for the
-//! rationale.
+//! mounts build state for cache reuse. ADR-013's "non-goal: OCI"
+//! applies to the **runtime** path.
 
 use std::path::{Path, PathBuf};
 
@@ -110,8 +95,7 @@ pub enum BuilderJob {
     ///
     /// **Today every backend errors with
     /// [`BuilderVmError::NotYetImplemented`] for this variant.**
-    /// Plan 73 Followup B.2 wires the libkrun backend; the
-    /// microsandbox backend never gets this variant.
+    /// Plan 73 Followup B.2 wires the libkrun backend.
     Install {
         /// Absolute host path to the install-spec JSON the builder
         /// VM reads at start-up. Followup B.2 defines the shape;
@@ -285,17 +269,15 @@ pub enum BuilderVmError {
     /// Bootstrap is not implemented yet. Returned by the stub impl
     /// until the follow-up wave fills in the data plane.
     #[error(
-        "microsandbox-as-Linux-builder bootstrap is in flight; \
-         see ADR-013 §\"Linux builder via microsandbox (no Lima)\" \
-         for the design and Sprint 50 for the schedule. \
-         For now, install host Nix (Determinate Nix or upstream) \
-         or configure `nix-darwin`'s `linux-builder`."
+        "builder VM bootstrap is in flight; use the libkrun builder \
+         path or fetch the published builder VM image. mvmctl does \
+         not use host Nix."
     )]
     NotYetImplemented,
 
-    /// Microsandbox isn't installed or isn't on PATH.
-    #[error("microsandbox not available: {0}")]
-    MicrosandboxUnavailable(String),
+    /// Builder backend or required helper binary is unavailable.
+    #[error("builder backend not available: {0}")]
+    BuilderUnavailable(String),
 
     /// OCI image pull failed (network, registry auth, digest
     /// mismatch). Wraps the underlying error.
@@ -315,7 +297,8 @@ pub enum BuilderVmError {
 /// Stub implementation. Every method returns
 /// [`BuilderVmError::NotYetImplemented`]. Kept around for tests that
 /// want a `BuilderVm` impl with deterministic error behavior;
-/// production code uses [`MicrosandboxBuilderVm`].
+/// production code uses concrete builder implementations such as
+/// `LibkrunBuilderVm`.
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubBuilderVm;
 
@@ -329,420 +312,6 @@ impl BuilderVm for StubBuilderVm {
     }
 }
 
-// =====================================================================
-// microsandbox-backed builder (feature `contributor-bootstrap`)
-//
-// Everything below until `extract_revision_hash` is the microsandbox
-// integration. Library consumers of the `mvmctl` facade can disable the
-// whole block via `default-features = false`; the upstream microsandbox
-// crate pulls sqlx-sqlite which collides with rusqlite-based DBs (see
-// DRIFT-001). The `cfg`-attributes below all reference the single
-// `contributor-bootstrap` feature flag.
-// =====================================================================
-
-/// Default vCPU count for the builder sandbox. Tuned for "fast
-/// enough to feel native on a developer laptop" without saturating
-/// the host. Override via [`MicrosandboxBuilderVm::with_resources`].
-#[cfg(feature = "contributor-bootstrap")]
-const BUILDER_DEFAULT_CPUS: u8 = 4;
-
-/// Default memory for the builder sandbox, in MiB. Nix derivations
-/// for guest rootfs builds peak well under 4 GiB; 4096 MiB leaves
-/// headroom for the dev tooling closure plus jobserver fan-out.
-#[cfg(feature = "contributor-bootstrap")]
-const BUILDER_DEFAULT_MEMORY_MIB: u32 = 4096;
-
-/// Where in the sandbox the user's flake gets bind-mounted.
-/// ADR-013 step 3.
-pub const BUILDER_GUEST_WORK_DIR: &str = "/work";
-/// Where in the sandbox the host's nix store gets bind-mounted
-/// (when [`BuilderMounts::host_nix_store`] is `Some`).
-pub const BUILDER_GUEST_NIX_DIR: &str = "/nix";
-/// Where in the sandbox artifacts get extracted.
-pub const BUILDER_GUEST_OUT_DIR: &str = "/out";
-
-/// Real builder. Pulls [`BUILDER_OCI_IMAGE`] on demand (microsandbox
-/// manages the local OCI cache), spawns a sandbox with the three
-/// bind-mounts from ADR-013 step 3, runs `nix build` inside via
-/// `sandbox.shell()`, and copies the resolved output store path to
-/// `/out` before tearing the sandbox down.
-///
-/// ## Lifecycle
-///
-/// `run_build` is a one-shot: each call creates a fresh sandbox and
-/// drops it on the way out. Two reasons:
-///   1. Builds are independent; reusing a long-lived sandbox would
-///      mean coordinating concurrent `mvmctl build` invocations,
-///      which the caller doesn't promise.
-///   2. The OCI image cache is shared across invocations (microsandbox
-///      owns it), so the per-call cost is just the sandbox spawn
-///      (~200 ms) — not a repeat pull.
-///
-/// ## What it doesn't do
-///
-/// - **Per-call image-digest verification.** [`BUILDER_OCI_DIGEST_SHA256`]
-///   is still empty; once the pin lands, this impl checks it after
-///   pull and fails closed on mismatch. Until then, the pinned
-///   `:2.24.10` tag is the contract.
-/// - **Snapshot warm-pool.** ADR-013 hints at a future warm-pool of
-///   pre-loaded builder sandboxes for sub-second cold-start. Out of
-///   scope here.
-#[cfg(feature = "contributor-bootstrap")]
-#[derive(Debug, Clone)]
-pub struct MicrosandboxBuilderVm {
-    cpus: u8,
-    memory_mib: u32,
-}
-
-#[cfg(feature = "contributor-bootstrap")]
-impl Default for MicrosandboxBuilderVm {
-    fn default() -> Self {
-        Self {
-            cpus: BUILDER_DEFAULT_CPUS,
-            memory_mib: BUILDER_DEFAULT_MEMORY_MIB,
-        }
-    }
-}
-
-#[cfg(feature = "contributor-bootstrap")]
-impl MicrosandboxBuilderVm {
-    /// Override the default vCPU / memory pair. Useful for CI runners
-    /// or low-memory hosts that can't afford the 4 GiB default.
-    pub fn with_resources(mut self, cpus: u8, memory_mib: u32) -> Self {
-        self.cpus = cpus;
-        self.memory_mib = memory_mib;
-        self
-    }
-}
-
-/// Bridge sync `BuilderVm` calls into microsandbox's async API.
-/// Same pattern as `mvm_backend::microsandbox::block_on` — the
-/// `tokio::Runtime` is built fresh per call so the trait stays
-/// `Send + Sync` and dyn-friendly. Per-call cost (~200 µs) is
-/// dominated by sandbox spawn (~200 ms) so the trade is fine.
-#[cfg(feature = "contributor-bootstrap")]
-fn block_on<F: std::future::Future>(fut: F) -> F::Output {
-    let rt = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()
-        .expect("failed to build single-threaded tokio runtime for builder VM bridge");
-    rt.block_on(fut)
-}
-
-/// Unique-per-build sandbox name derived from the job + a
-/// timestamp. Doesn't need to be cryptographically random —
-/// microsandbox uses it as a handle for `Sandbox::get` etc.,
-/// and the sandbox is torn down at the end of `run_build` so name
-/// collisions only matter for concurrent invocations.
-///
-/// Only the [`BuilderJob::Flake`] variant ever reaches this helper
-/// because microsandbox refuses install jobs upstream; the match
-/// arm for `Install` is wired for compile completeness.
-#[cfg(feature = "contributor-bootstrap")]
-fn sandbox_name(job: &BuilderJob) -> String {
-    use std::time::{SystemTime, UNIX_EPOCH};
-    let stamp = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_millis())
-        .unwrap_or(0);
-    let mut h = std::collections::hash_map::DefaultHasher::new();
-    use std::hash::{Hash, Hasher};
-    match job {
-        BuilderJob::Flake {
-            flake_ref,
-            attr_path,
-        } => {
-            flake_ref.hash(&mut h);
-            attr_path.hash(&mut h);
-        }
-        BuilderJob::Install { spec_path } => {
-            spec_path.hash(&mut h);
-        }
-    }
-    format!("mvm-builder-{:x}-{}", h.finish(), stamp)
-}
-
-/// Quote a single shell argument for safe interpolation into a
-/// bash `-c` script. Same shape as
-/// `mvm-base::shell::shell_escape` (deleted in W7 with
-/// the rest of the Lima paths) — kept inline here so the builder
-/// crate doesn't take a dep on a runtime-side helper for one
-/// function.
-#[cfg(feature = "contributor-bootstrap")]
-fn shell_quote_arg(input: &str) -> String {
-    format!("'{}'", input.replace('\'', "'\\''"))
-}
-
-#[cfg(feature = "contributor-bootstrap")]
-impl BuilderVm for MicrosandboxBuilderVm {
-    fn run_build(
-        &self,
-        job: &BuilderJob,
-        mounts: &BuilderMounts,
-    ) -> Result<BuilderArtifacts, BuilderVmError> {
-        // Microsandbox is contributor-bootstrap only and runs the
-        // nix-build path. The Install variant is reserved for Plan
-        // 73 Followup B.2 on the libkrun backend; surface the
-        // mismatch with NotYetImplemented rather than silently
-        // falling through.
-        let (flake_ref, attr_path) = match job {
-            BuilderJob::Flake {
-                flake_ref,
-                attr_path,
-            } => (flake_ref.clone(), attr_path.clone()),
-            BuilderJob::Install { .. } => return Err(BuilderVmError::NotYetImplemented),
-        };
-
-        // Validate caller-supplied paths early; microsandbox will
-        // also reject these but with less useful messages.
-        if !mounts.flake_src.exists() {
-            return Err(BuilderVmError::ExtractionFailed(format!(
-                "flake source path does not exist: {}",
-                mounts.flake_src.display()
-            )));
-        }
-        std::fs::create_dir_all(&mounts.artifact_out).map_err(|e| {
-            BuilderVmError::ExtractionFailed(format!(
-                "creating artifact output dir {}: {e}",
-                mounts.artifact_out.display()
-            ))
-        })?;
-
-        let params = RunBuildParams {
-            name: sandbox_name(job),
-            cpus: self.cpus,
-            memory_mib: self.memory_mib,
-            image: BUILDER_OCI_IMAGE.to_string(),
-            flake_src: mounts.flake_src.clone(),
-            host_nix_store: mounts.host_nix_store.clone(),
-            artifact_out: mounts.artifact_out.clone(),
-            flake_ref,
-            attr_path,
-        };
-
-        block_on(async move { run_build_async(params).await })
-    }
-}
-
-/// Parameter bundle for [`run_build_async`]. Carried as a struct so
-/// the async helper stays clippy-clean against `too_many_arguments`
-/// — CLAUDE.md forbids suppressing that lint, and pulling 9 owned
-/// values across an `await` boundary one by one isn't readable
-/// anyway.
-#[cfg(feature = "contributor-bootstrap")]
-struct RunBuildParams {
-    name: String,
-    cpus: u8,
-    memory_mib: u32,
-    image: String,
-    flake_src: PathBuf,
-    host_nix_store: Option<PathBuf>,
-    artifact_out: PathBuf,
-    flake_ref: String,
-    attr_path: String,
-}
-
-/// Async body of [`MicrosandboxBuilderVm::run_build`]. Lifted out so
-/// the sync trait method stays narrow and the async surface is
-/// testable in isolation when integration coverage lands.
-#[cfg(feature = "contributor-bootstrap")]
-async fn run_build_async(params: RunBuildParams) -> Result<BuilderArtifacts, BuilderVmError> {
-    let RunBuildParams {
-        name,
-        cpus,
-        memory_mib,
-        image,
-        flake_src,
-        host_nix_store,
-        artifact_out,
-        flake_ref,
-        attr_path,
-    } = params;
-
-    // 1. Spawn the sandbox.
-    //
-    // Force anonymous auth for `BUILDER_OCI_IMAGE` (public Docker Hub
-    // image). microsandbox's default `resolve_registry_auth` consults
-    // the host's Docker credential helper (`~/.docker/config.json` +
-    // osxkeychain on macOS) before falling through to anonymous, and a
-    // stale Docker Hub PAT in the keychain poisons the token exchange:
-    // `oci-client::_auth` returns `Err(AuthenticationFailure)`, which
-    // `get_auth_token` then silently swallows via `.ok()??` — the
-    // manifest request goes out unauthenticated, returns 401, and the
-    // surfaced error is the misleading "Not authorized: url
-    // …/manifests/2.24.10". A public builder image never needs creds,
-    // so bypassing the helper makes that failure mode impossible.
-    let mut builder = microsandbox::Sandbox::builder(&name)
-        .image(image)
-        .pull_policy(microsandbox::sandbox::PullPolicy::IfMissing)
-        .registry(|r| r.auth(microsandbox::RegistryAuth::Anonymous))
-        .cpus(cpus)
-        .memory(memory_mib)
-        .volume(BUILDER_GUEST_WORK_DIR, |m| {
-            m.bind(flake_src.as_path()).readonly()
-        })
-        .volume(BUILDER_GUEST_OUT_DIR, |m| m.bind(artifact_out.as_path()));
-    if let Some(store) = host_nix_store.as_ref() {
-        builder = builder.volume(BUILDER_GUEST_NIX_DIR, |m| m.bind(store.as_path()));
-    }
-
-    let sandbox = builder
-        .create_detached()
-        .await
-        .map_err(|e| BuilderVmError::MicrosandboxUnavailable(format!("create_detached: {e}")))?;
-
-    // 2. Run `nix build` inside. Use `--no-link` so we don't
-    //    accumulate result symlinks across builds; capture the
-    //    output store path via `--print-out-paths` so the extraction
-    //    step knows what to copy.
-    //
-    // `--no-write-lock-file --impure` is what unblocks builds inside
-    // the sandbox when the flake has path inputs (`path:..`-style):
-    //   - The bind-mounted `/work` is read-only, so any attempt to
-    //     write the lock fails with EROFS.
-    //   - Path inputs are "unlocked" by construction (no content hash
-    //     to verify against), so strict pure-mode rejects them with
-    //     "lock file contains unlocked input '{"path":"...","type":"path"}'".
-    //   - The lockfile is also nuked from `/work/<flake>` on the host
-    //     before this script runs (see the xtask), so there's nothing
-    //     stale to re-validate.
-    let build_script = format!(
-        r#"set -euo pipefail
-# Run `git config --global` BEFORE cd'ing into the workspace mount.
-# `safe.directory = *` neutralises the cross-uid check git 2.35+
-# enforces on bind-mounted repos — engaged by nix's git fetcher when
-# the flake path lives under a `.git` dir (`/work` does). `--global`
-# writes to /root inside the sandbox (fresh per spawn; never leaks
-# to the host), but git's *startup* still walks cwd upward looking
-# for a repo; in a git-worktree workspace the discovered `.git` is
-# a *file* whose `gitdir:` redirect points to a host path that
-# doesn't exist in the sandbox, so the discovery itself errors
-# "not a git repository" with exit 128 before `--global` is
-# processed. Running from `/` sidesteps the cwd scan entirely.
-git config --global --add safe.directory '*'
-cd {work}
-export NIX_CONFIG="experimental-features = nix-command flakes"
-# Tell the flake where the workspace lives in this sandbox. Without
-# this, the flake's relative path import resolves against the
-# store-copied flake dir (because `path:` URL semantics) and ends
-# up at `/`, tripping on sandbox-internal files like
-# `/.msb/agent.sock`. The flake reads this under `--impure`.
-export MVM_WORKSPACE_PATH={work}
-nix build {flake_ref}#{attr_path} --no-link --print-out-paths --no-write-lock-file --impure
-"#,
-        work = shell_quote_arg(BUILDER_GUEST_WORK_DIR),
-        flake_ref = flake_ref,
-        attr_path = attr_path,
-    );
-
-    let build_out = sandbox
-        .shell(build_script)
-        .await
-        .map_err(|e| BuilderVmError::NixBuildFailed(format!("sandbox.shell(nix build): {e}")))?;
-    if !build_out.status().success {
-        let stderr = build_out
-            .stderr()
-            .unwrap_or_else(|_| "<non-utf8 stderr>".to_string());
-        // Tear down before returning — best-effort.
-        let _ = sandbox.stop().await;
-        return Err(BuilderVmError::NixBuildFailed(format!(
-            "exit {} — stderr:\n{}",
-            build_out.status().code,
-            stderr
-        )));
-    }
-
-    let nix_output_path = build_out
-        .stdout()
-        .map_err(|e| BuilderVmError::ExtractionFailed(format!("stdout was non-UTF-8: {e}")))?
-        .lines()
-        .rev()
-        .find(|l| l.starts_with("/nix/store/"))
-        .ok_or_else(|| {
-            BuilderVmError::ExtractionFailed(
-                "nix build inside sandbox produced no /nix/store output path".into(),
-            )
-        })?
-        .trim()
-        .to_string();
-    let revision_hash = extract_revision_hash(&nix_output_path);
-
-    // 3. Copy artifacts from the in-sandbox store path to /out.
-    //    Mirrors `copy_dev_artifacts` in `pipeline::dev_build` so the
-    //    on-host layout matches what the runtime path expects.
-    let copy_script = format!(
-        r#"set -euo pipefail
-out={out}
-src={src}
-cp -L "$src/vmlinux" "$out/vmlinux" 2>/dev/null || true
-cp -L "$src/rootfs.ext4" "$out/rootfs.ext4"
-[ -f "$src/initrd" ] && cp -L "$src/initrd" "$out/initrd"
-[ -f "$src/initrd.cpio.gz" ] && cp -L "$src/initrd.cpio.gz" "$out/initrd.cpio.gz"
-[ -f "$src/mvm-meta.json" ] && cp -L "$src/mvm-meta.json" "$out/mvm-meta.json"
-# Plan 72 W2 outputs: builder-vm flake emits cmdline.txt +
-# manifest.json alongside vmlinux + rootfs.ext4. dev-shell flakes
-# don't, so the test is a no-op there.
-[ -f "$src/cmdline.txt" ] && cp -L "$src/cmdline.txt" "$out/cmdline.txt"
-[ -f "$src/manifest.json" ] && cp -L "$src/manifest.json" "$out/manifest.json"
-chmod -R u+w "$out"
-"#,
-        out = shell_quote_arg(BUILDER_GUEST_OUT_DIR),
-        src = shell_quote_arg(&nix_output_path),
-    );
-
-    let copy_out = sandbox
-        .shell(copy_script)
-        .await
-        .map_err(|e| BuilderVmError::ExtractionFailed(format!("sandbox.shell(cp): {e}")))?;
-    if !copy_out.status().success {
-        let stderr = copy_out
-            .stderr()
-            .unwrap_or_else(|_| "<non-utf8 stderr>".to_string());
-        let _ = sandbox.stop().await;
-        return Err(BuilderVmError::ExtractionFailed(format!(
-            "artifact copy failed (exit {}): {stderr}",
-            copy_out.status().code,
-        )));
-    }
-
-    // 4. Tear the sandbox down. Best-effort: a failure here doesn't
-    //    invalidate the artifacts that already landed in `out`. The
-    //    handle drops at function end either way, but explicit stop
-    //    frees the libkrun process slot now rather than at GC time.
-    if let Err(e) = sandbox.stop().await {
-        tracing::warn!(error = %e, "builder sandbox stop failed (artifacts intact)");
-    }
-
-    // 5. Resolve accessible flag from the sidecar that mkGuest
-    //    emits inside the store path. Mirrors what
-    //    `emit_sidecar_via_passthru_query` does on the host path —
-    //    the sidecar is already on the host filesystem thanks to
-    //    the bind-mount, so no separate query is needed.
-    let sidecar_path = ArtifactSidecar::path_in(&artifact_out);
-    let accessible = if sidecar_path.exists() {
-        ArtifactSidecar::read_from_dir(&artifact_out)
-            .ok()
-            .flatten()
-            .map(|s| s.accessible)
-    } else {
-        None
-    };
-
-    let rootfs_path = artifact_out.join("rootfs.ext4");
-    let kernel_path = {
-        let p = artifact_out.join("vmlinux");
-        if p.exists() { Some(p) } else { None }
-    };
-
-    Ok(BuilderArtifacts::Image {
-        rootfs_path,
-        kernel_path,
-        revision_hash,
-        lock_hash: None,
-        accessible,
-    })
-}
-
 /// Extract the 32-character store-path hash from a path like
 /// `/nix/store/<hash>-<name>`. Returns the empty string if the path
 /// shape is unexpected. Mirrors
@@ -750,10 +319,8 @@ chmod -R u+w "$out"
 /// two code paths produce the same artifact-dir name for identical
 /// derivations.
 ///
-/// Only `run_build_async` (gated on `contributor-bootstrap`) and the
-/// unit tests exercise this helper; the `#[allow(dead_code)]` keeps
-/// no-default-features library builds warning-clean without forcing
-/// a wider cfg expression.
+/// Unit tests exercise this helper; the `#[allow(dead_code)]` keeps
+/// library builds warning-clean without forcing a wider visibility.
 #[allow(dead_code)]
 fn extract_revision_hash(nix_output_path: &str) -> String {
     nix_output_path
@@ -910,7 +477,7 @@ mod tests {
     fn error_message_points_at_recovery_path() {
         let err = BuilderVmError::NotYetImplemented;
         let msg = err.to_string();
-        assert!(msg.contains("install host Nix") || msg.contains("nix-darwin"));
+        assert!(msg.contains("libkrun builder") && msg.contains("does not use host Nix"));
     }
 
     fn fixture_sidecar() -> ArtifactSidecar {
@@ -923,7 +490,7 @@ mod tests {
             expected_boot_ms: 300,
             agent_binary: "stub".to_string(),
             rootless_entrypoint: false,
-            hypervisor: "microsandbox".to_string(),
+            hypervisor: "libkrun".to_string(),
         }
     }
 
@@ -965,100 +532,6 @@ mod tests {
     fn extract_revision_hash_handles_malformed() {
         assert_eq!(extract_revision_hash(""), "");
         assert_eq!(extract_revision_hash("not-a-store-path"), "not");
-    }
-
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn sandbox_name_has_stable_prefix() {
-        // Same flake+attr produces the same hash segment; only the
-        // timestamp varies. Lets us assert the prefix without
-        // hard-coding the full name.
-        let job = BuilderJob::Flake {
-            flake_ref: "git+file:///work".to_string(),
-            attr_path: "packages.x86_64-linux.default".to_string(),
-        };
-        let name = sandbox_name(&job);
-        assert!(name.starts_with("mvm-builder-"), "got {name}");
-        assert!(
-            name.len() > "mvm-builder-".len() + 4,
-            "name must carry a discriminator: {name}"
-        );
-    }
-
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn microsandbox_builder_has_sensible_defaults() {
-        let b = MicrosandboxBuilderVm::default();
-        assert_eq!(b.cpus, BUILDER_DEFAULT_CPUS);
-        assert_eq!(b.memory_mib, BUILDER_DEFAULT_MEMORY_MIB);
-    }
-
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn microsandbox_builder_with_resources_overrides() {
-        let b = MicrosandboxBuilderVm::default().with_resources(2, 2048);
-        assert_eq!(b.cpus, 2);
-        assert_eq!(b.memory_mib, 2048);
-    }
-
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn shell_quote_arg_escapes_single_quotes() {
-        assert_eq!(shell_quote_arg("simple"), "'simple'");
-        assert_eq!(shell_quote_arg("with space"), "'with space'");
-        // Single quote inside: close, escaped quote, reopen.
-        assert_eq!(shell_quote_arg("it's"), "'it'\\''s'");
-    }
-
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn run_build_validates_missing_flake_src() {
-        // Skip the path that actually spawns microsandbox — just
-        // exercise the input validation. Caller supplied a
-        // nonexistent flake src; we expect a clear error before
-        // anything heavy fires.
-        let b = MicrosandboxBuilderVm::default();
-        let job = BuilderJob::Flake {
-            flake_ref: ".".to_string(),
-            attr_path: "packages.x86_64-linux.default".to_string(),
-        };
-        let mounts = BuilderMounts {
-            flake_src: PathBuf::from("/definitely/does/not/exist"),
-            host_nix_store: None,
-            artifact_out: PathBuf::from("/tmp/mvm-builder-test-out"),
-        };
-        let err = b
-            .run_build(&job, &mounts)
-            .expect_err("nonexistent flake should err");
-        assert!(
-            matches!(err, BuilderVmError::ExtractionFailed(_)),
-            "got {err:?}"
-        );
-        assert!(err.to_string().contains("does not exist"), "msg: {err}");
-    }
-
-    #[cfg(feature = "contributor-bootstrap")]
-    #[test]
-    fn microsandbox_rejects_install_job_variant() {
-        // The microsandbox backend doesn't get install-pipeline
-        // support (Plan 73 Followup B.2 wires libkrun only). Any
-        // Install job must fail fast with NotYetImplemented.
-        let b = MicrosandboxBuilderVm::default();
-        let job = BuilderJob::Install {
-            spec_path: PathBuf::from("/tmp/spec.json"),
-        };
-        let mounts = BuilderMounts {
-            flake_src: PathBuf::from("/tmp"),
-            host_nix_store: None,
-            artifact_out: PathBuf::from("/tmp/mvm-builder-install-test-out"),
-        };
-        let err = b
-            .run_build(&job, &mounts)
-            .expect_err("install variant must error on microsandbox");
-        assert!(
-            matches!(err, BuilderVmError::NotYetImplemented),
-            "got {err:?}"
-        );
     }
 
     #[test]

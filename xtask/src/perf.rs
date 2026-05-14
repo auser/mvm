@@ -7,11 +7,11 @@
 //!   every host (no KVM/Lima required). Closes the plan-60 Phase 9
 //!   line "rootfs < 20 MB for minimal template".
 //! - **`boot`** — statistical cold-boot benchmark. Boots a real
-//!   Firecracker / microsandbox VM `--runs N` times, computes
+//!   Firecracker / libkrun VM `--runs N` times, computes
 //!   p50/p95/max wall-clock, asserts thresholds. Linux + KVM
 //!   required; gated by `MVM_LIVE_SMOKE=1` + a rootfs path so a
 //!   bare macOS host skips cleanly. Closes the plan-60 Phase 9
-//!   line "cold-boot ≤ 500ms Firecracker / ≤ 1s microsandbox".
+//!   line "cold-boot ≤ 500ms Firecracker / ≤ 1s libkrun".
 //!
 //! The thresholds come from ADR-013 §"Per-backend boot budgets" +
 //! plan 60 §"Phase 9 perf gates"; they're pinned by tests in this
@@ -63,11 +63,11 @@ pub const ROOTFS_MAX_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
 /// ADR-013 floor is 300ms; Phase 9's strict gate is 500ms p50.
 pub const FIRECRACKER_BOOT_BUDGET: Duration = Duration::from_millis(500);
 
-/// Cold-boot wall-clock budget for the microsandbox / libkrun
-/// backend. Slower than Firecracker because libkrun's startup +
-/// the in-VM init script aren't as tight; the plan-60 spec sets
-/// 1s as the worst-case envelope.
-pub const MICROSANDBOX_BOOT_BUDGET: Duration = Duration::from_millis(1000);
+/// Cold-boot wall-clock budget for the libkrun backend. Slower
+/// than Firecracker because libkrun's startup + the in-VM init
+/// script aren't as tight; the plan-60 spec sets 1s as the
+/// worst-case envelope.
+pub const LIBKRUN_BOOT_BUDGET: Duration = Duration::from_millis(1000);
 
 /// Dispatch entry — called from `xtask/src/main.rs`.
 pub fn run(args: &[String]) -> Result<()> {
@@ -83,7 +83,7 @@ pub fn run(args: &[String]) -> Result<()> {
             eprintln!(
                 "  rootfs-size --rootfs <PATH>    Assert rootfs is ≤ {ROOTFS_MAX_BYTES} bytes"
             );
-            eprintln!("  boot --rootfs <PATH> [--runs N] [--backend firecracker|microsandbox]");
+            eprintln!("  boot --rootfs <PATH> [--runs N] [--backend firecracker|libkrun]");
             eprintln!(
                 "                                 Statistical cold-boot benchmark (Linux/KVM, MVM_LIVE_SMOKE=1)"
             );
@@ -145,11 +145,11 @@ pub fn all_budgets() -> Vec<PerfBudget> {
             description: "Firecracker cold-boot wall-clock (1 vCPU / 256 MiB)",
         },
         PerfBudget {
-            name: "microsandbox_cold_boot",
-            limit: MICROSANDBOX_BOOT_BUDGET.as_millis() as u64,
+            name: "libkrun_cold_boot",
+            limit: LIBKRUN_BOOT_BUDGET.as_millis() as u64,
             unit: "ms",
             source: "ADR-013 §\"Per-backend boot budgets\"",
-            description: "Microsandbox cold-boot wall-clock",
+            description: "libkrun cold-boot wall-clock",
         },
         PerfBudget {
             name: "default_response_body_cap",
@@ -335,14 +335,14 @@ fn boot_subcommand(args: &[String]) -> Result<()> {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Backend {
     Firecracker,
-    Microsandbox,
+    Libkrun,
 }
 
 impl Backend {
     fn budget(self) -> Duration {
         match self {
             Self::Firecracker => FIRECRACKER_BOOT_BUDGET,
-            Self::Microsandbox => MICROSANDBOX_BOOT_BUDGET,
+            Self::Libkrun => LIBKRUN_BOOT_BUDGET,
         }
     }
 }
@@ -385,9 +385,9 @@ fn parse_backend_arg(args: &[String]) -> Result<Backend> {
         if args[i] == "--backend" {
             return match args.get(i + 1).map(|s| s.as_str()) {
                 Some("firecracker") => Ok(Backend::Firecracker),
-                Some("microsandbox") => Ok(Backend::Microsandbox),
+                Some("libkrun") => Ok(Backend::Libkrun),
                 Some(other) => {
-                    bail!("unknown --backend {other:?}; expected firecracker or microsandbox")
+                    bail!("unknown --backend {other:?}; expected firecracker or libkrun")
                 }
                 None => bail!("--backend requires a value"),
             };
@@ -423,15 +423,15 @@ mod tests {
     }
 
     #[test]
-    fn microsandbox_boot_budget_is_1s() {
-        assert_eq!(MICROSANDBOX_BOOT_BUDGET, Duration::from_millis(1000));
+    fn libkrun_boot_budget_is_1s() {
+        assert_eq!(LIBKRUN_BOOT_BUDGET, Duration::from_millis(1000));
     }
 
     #[test]
-    fn budgets_obey_firecracker_below_microsandbox_order() {
+    fn budgets_obey_firecracker_below_libkrun_order() {
         // Firecracker is the faster path; if anyone flips this, the
         // ADR-013 tier ordering has drifted.
-        assert!(FIRECRACKER_BOOT_BUDGET < MICROSANDBOX_BOOT_BUDGET);
+        assert!(FIRECRACKER_BOOT_BUDGET < LIBKRUN_BOOT_BUDGET);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -529,9 +529,9 @@ mod tests {
     }
 
     #[test]
-    fn parse_backend_recognizes_microsandbox() {
-        let args = vec!["--backend".to_string(), "microsandbox".to_string()];
-        assert_eq!(parse_backend_arg(&args).unwrap(), Backend::Microsandbox);
+    fn parse_backend_recognizes_libkrun() {
+        let args = vec!["--backend".to_string(), "libkrun".to_string()];
+        assert_eq!(parse_backend_arg(&args).unwrap(), Backend::Libkrun);
     }
 
     #[test]
@@ -543,7 +543,7 @@ mod tests {
     #[test]
     fn backend_budgets_match_constants() {
         assert_eq!(Backend::Firecracker.budget(), FIRECRACKER_BOOT_BUDGET);
-        assert_eq!(Backend::Microsandbox.budget(), MICROSANDBOX_BOOT_BUDGET);
+        assert_eq!(Backend::Libkrun.budget(), LIBKRUN_BOOT_BUDGET);
     }
 
     // ──────────────────────────────────────────────────────────────
@@ -600,12 +600,12 @@ mod tests {
     }
 
     #[test]
-    fn all_budgets_pin_microsandbox_to_constant() {
+    fn all_budgets_pin_libkrun_to_constant() {
         let b = all_budgets()
             .into_iter()
-            .find(|b| b.name == "microsandbox_cold_boot")
-            .expect("microsandbox_cold_boot budget");
-        assert_eq!(b.limit, MICROSANDBOX_BOOT_BUDGET.as_millis() as u64);
+            .find(|b| b.name == "libkrun_cold_boot")
+            .expect("libkrun_cold_boot budget");
+        assert_eq!(b.limit, LIBKRUN_BOOT_BUDGET.as_millis() as u64);
     }
 
     #[test]

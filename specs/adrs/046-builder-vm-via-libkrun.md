@@ -91,13 +91,9 @@ Is this a source checkout?  (find_dev_image_flake() returns Some)
    │    Cache key = the flake's content hash, so any modification to
    │    nix/images/builder-vm/ invalidates and rebuilds automatically.
    │
-   │    Stage 0 (what runs `nix build` to produce the builder VM image):
-   │    microsandbox + nixos/nix:2.24.10, gated behind
-   │    --features contributor-bootstrap. The 4 GiB overlay limit
-   │    still applies to Stage 0 — but the *builder VM rootfs* closure
-   │    (busybox + nix + bash + coreutils + git + curl + mvm-builder-init,
-   │    no rustc, no user-flake deps) is small enough to fit. The
-   │    overflow we hit in 2026-05-13 is from building the *dev shell*
+   │    Stage 0 is removed. The source-checkout path uses the libkrun
+   │    builder VM, and host Nix is not consulted by mvmctl. The
+   │    overflow we hit in 2026-05-13 came from building the *dev shell*
    │    closure (rustc + ~480 cargo crates), which never runs in
    │    Stage 0. See W2 size budget.
    │
@@ -170,13 +166,13 @@ The persistent Nix store lives on a host-backed sparse virtio-blk image — size
 
 The whole point of having `nix/images/builder-vm/flake.nix` in the source tree is that contributors can change it and see results. A "first download a prebuilt, then use it" rule for source checkouts would make this loop fundamentally broken — every modification to the builder VM would require a release-and-download cycle before it could be tested. That's not a development environment; that's a binary distribution mechanism in disguise.
 
-The downside is that contributors need a Stage 0 (something that can run `nix build` to produce the local builder VM). Most contributors already have host Nix; for the few who don't, the `contributor-bootstrap` feature gates a microsandbox-backed fallback specifically for this case. That fallback only ever builds the *builder VM rootfs* — a small, fixed closure that fits in the 4 GiB overlay — so the microsandbox disk-full problem we're solving in user-facing builds doesn't apply.
+Earlier drafts kept a Stage 0 escape hatch for contributors without host Nix. That path is now rejected: `mvmctl` must not depend on host Nix and must not retain a microsandbox-backed bootstrap feature. Source-checkout builder work goes through the libkrun builder VM, and a broken builder image is reported as such.
 
 The mvm-published builder VM image exists for *end users* who installed mvmctl as a binary. Its purpose is to remove host Nix from the user's prerequisites. It is not part of the contributor toolchain.
 
 ### What we keep vs. drop from microsandbox
 
-| Concern | Today (microsandbox is the user-facing builder) | After plan 72 (libkrun is the user-facing builder; microsandbox demoted to Stage 0 contributor-bootstrap only) |
+| Concern | Before plan 72 | After plan 72 |
 |---|---|---|
 | Default `mvmctl dev up` runtime path | microsandbox | libkrun (macOS) / Firecracker (Linux) |
 | Builder VM disk size on the user-facing path | 4 GiB hardcoded | Configurable per-host (default 64 GiB sparse) |
@@ -186,16 +182,16 @@ The mvm-published builder VM image exists for *end users* who installed mvmctl a
 | Sandbox lifecycle on the user-facing path | `Sandbox::create_detached`, `.shell()`, `.stop()` | `mvm_libkrun::start_with_config` + power-off-from-guest |
 | Snapshot/named volumes/agent | Available, unused | Not implemented (unused features dropped) |
 | User-facing build-trust boundary | microsandbox + nixos/nix OCI image | Our own builder VM image (hash-verified per ADR-002 §W5.1) |
-| Stage 0 for contributors without host Nix | microsandbox + nixos/nix OCI image | **Kept**, gated behind `--features contributor-bootstrap`. Only used to build the builder VM image once; never runs user-facing builds. |
+| Stage 0 for contributors without host Nix | microsandbox + nixos/nix OCI image | Removed. No microsandbox or host-Nix fallback remains in mvmctl. |
 
 ### Trust-zone shift
 
 ADR-013 §"Linux builder via microsandbox" placed the user-facing builder behind a pinned third-party OCI image (`docker.io/nixos/nix:2.24.10`). Plan 72 replaces that **on the user-facing path** with an mvm-published builder VM image — kernel + rootfs.ext4 built on a Linux CI runner via `nix/images/builder-vm/flake.nix` (a slimmed split of the current `nix/images/builder/`), signed by the project's release key, and verified by the same SHA-256 manifest path used today for `download_dev_image` (`mvm_cli::commands::env::apple_container::download_dev_image`, ADR-002 §W5.1).
 
-The contributor Stage 0 path (`--features contributor-bootstrap`) continues to use `docker.io/nixos/nix:2.24.10` via microsandbox. The trust-zone implications are:
+The former contributor Stage 0 path has been removed. The trust-zone implications are:
 
 - **End users**: trust boundary is mvm's release pipeline + signing + hash manifest. Same as the dev image today.
-- **Contributors**: trust boundary is `nixos/nix:2.24.10` on Docker Hub for the one-time Stage 0 builder-VM-image build; from then on, the locally-built builder VM image is the trust root for every subsequent build the contributor runs. mvmctl does not consult any host Nix install (see CLAUDE.md §"Host Nix is never used by mvmctl"), so a contributor's `nix-darwin` setup or homebrew `nix` install never enters the trust boundary, even when present.
+- **Contributors**: trust boundary is the builder VM image path. mvmctl does not consult any host Nix install, so a contributor's `nix-darwin` setup or Homebrew `nix` install never enters the trust boundary, even when present.
 
 This is a *narrower* trust boundary than before:
 
@@ -212,7 +208,7 @@ The trade we're accepting: we now ship a kernel + rootfs as part of every mvm re
 
 - Builder disk capacity becomes a host-configurable per-build setting, not a library-internal constant.
 - Builder VM image is mvm-controlled — kernel cmdline, init, package set, release cadence.
-- The default `cargo build` no longer pulls in microsandbox's ~40 transitive crates. They move behind the opt-in `contributor-bootstrap` feature; only contributors who explicitly need the Stage 0 escape hatch pay the compile cost.
+- The default and all-feature `cargo build` no longer pull in microsandbox's transitive crates.
 - Consolidates user-facing VM launching: macOS execution (plan 57) and builder VM (plan 72) share the libkrun substrate. One C-library to track, one set of HVF/KVM bug patterns to learn.
 - virtio-fs / virtio-blk mount semantics are standard and well-documented — no overlay-vs-bind confusion.
 - The published builder image is the *same artifact* a user would download for `mvmctl run` against a minimal Linux microVM. The end-user-runtime story and the no-host-Nix-end-user-build story share a binary.
@@ -222,9 +218,9 @@ The trade we're accepting: we now ship a kernel + rootfs as part of every mvm re
 
 - Real implementation work — 2–3 sprints by the plan-71 estimate (W0 through W6).
 - Plan 72 W0–W2 depend on plan 57 (libkrun spike) reaching at least "boot a Nix-built kernel + ext4 rootfs on macOS Apple Silicon." If plan 57 stays in spike status, plan 72 W0–W2 stall; the vendoring fallback (fork microsandbox, expose `upper_size_mib`) is the named escape hatch.
-- During the transition, both paths exist behind feature flags. The migration adds a temporary `backends-builder-vm-libkrun` flag (default-on once W5 lands; `contributor-bootstrap` flips from user-facing default to contributor-bootstrap-only behind `--features contributor-bootstrap`).
+- During the transition, `backends-builder-vm-libkrun` carries the builder path and becomes default-on at cutover. No contributor bootstrap feature remains.
 - The published builder image is a new release artifact. The release pipeline grows two new `builder-vmlinux-{arch}` + `builder-rootfs-{arch}.ext4` outputs alongside the existing dev-image outputs.
-- Contributors without host Nix who modify `nix/images/builder-vm/flake.nix` pay the microsandbox-bootstrap cost (one-time per modification: ~3 min build of the builder VM rootfs closure inside the OCI Nix container). This is the load-bearing reason microsandbox isn't *fully* removed in W6 — without it, "develop the builder VM image on stock macOS without installing Nix" wouldn't have a path. The cost only hits the small contributor population that intersects (no host Nix) AND (modifying the builder VM itself); everyone else takes the host-Nix or use-the-cached-builder-VM path.
+- Contributors modifying `nix/images/builder-vm/flake.nix` must use the managed builder VM path. If that image is broken or missing, mvmctl reports the builder-image problem directly.
 
 ### Neutral
 

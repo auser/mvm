@@ -63,6 +63,11 @@ pub const SNAPSHOT_TENANT_ID: &str = "local";
 /// unencrypted snapshots when a tenant DEK is configured.
 pub const ALLOW_UNENCRYPTED_ENV: &str = "MVM_ALLOW_UNENCRYPTED_SNAPSHOT";
 
+/// Explicit env-var override for the local tenant's snapshot DEK.
+/// This must win over OS-keyring auto-detection so dev/CI and
+/// emergency-recovery workflows can pin the key deterministically.
+pub const SNAPSHOT_TENANT_KEY_ENV: &str = "MVM_TENANT_KEY_LOCAL";
+
 /// Filename of the persistent epoch counter inside an
 /// instance-snapshot dir. Hidden by default (`.epoch`) so a casual
 /// `ls` doesn't show it next to the bin files.
@@ -209,8 +214,7 @@ pub fn verify_and_resume<IO: SnapshotIO + ?Sized>(
 /// the resulting snapshot stays unencrypted, HMAC-only (Phase 1 /
 /// pre-W5 shape).
 fn encrypt_artifacts_if_keyed(dir: &Path) -> Result<()> {
-    let provider = keystore::default_provider();
-    let Ok(dek) = provider.get_data_key(SNAPSHOT_TENANT_ID) else {
+    let Some(dek) = snapshot_tenant_dek()? else {
         // No tenant DEK configured — leave artifacts unencrypted.
         // Operators who want at-rest encryption configure a key
         // via `mvmctl secret put` or the MVM_TENANT_KEY_LOCAL env
@@ -248,8 +252,7 @@ fn encrypt_artifacts_if_keyed(dir: &Path) -> Result<()> {
 /// or v1-shape leftover); set `MVM_ALLOW_UNENCRYPTED_SNAPSHOT=1`
 /// to bypass during the one-time v1 → v2 migration.
 fn decrypt_artifacts_if_encrypted(dir: &Path) -> Result<()> {
-    let provider = keystore::default_provider();
-    let dek_opt = provider.get_data_key(SNAPSHOT_TENANT_ID).ok();
+    let dek_opt = snapshot_tenant_dek()?;
 
     for name in [VMSTATE_FILENAME, MEM_FILENAME] {
         let p = dir.join(name);
@@ -287,6 +290,23 @@ fn decrypt_artifacts_if_encrypted(dir: &Path) -> Result<()> {
         }
     }
     Ok(())
+}
+
+fn snapshot_tenant_dek() -> Result<Option<secrecy::SecretBox<Vec<u8>>>> {
+    if std::env::var_os(SNAPSHOT_TENANT_KEY_ENV).is_some() {
+        return keystore::KeyProvider::get_data_key(&keystore::EnvKeyProvider, SNAPSHOT_TENANT_ID)
+            .map(Some)
+            .with_context(|| {
+                format!(
+                    "loading snapshot tenant DEK from {SNAPSHOT_TENANT_KEY_ENV} for tenant {SNAPSHOT_TENANT_ID}"
+                )
+            });
+    }
+
+    match keystore::default_provider().get_data_key(SNAPSHOT_TENANT_ID) {
+        Ok(dek) => Ok(Some(dek)),
+        Err(_) => Ok(None),
+    }
 }
 
 /// Drop the on-disk snapshot files + sidecar + epoch counter for

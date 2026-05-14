@@ -305,7 +305,7 @@ pub fn run() -> Result<()> {
             return;
         }
         eprintln!("\nInterrupted, cleaning up...");
-        // W7 handle registry: walk Attached-mode microsandbox VMs and
+        // W7 handle registry: walk Attached-mode VMs and
         // gracefully stop each. Best-effort; failures get logged. Runs
         // before the child-pid sweep so SIGTERM-on-children doesn't
         // race the sandbox's own teardown ordering.

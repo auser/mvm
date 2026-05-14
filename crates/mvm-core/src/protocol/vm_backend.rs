@@ -200,9 +200,10 @@ pub enum VmStatus {
 
 /// How the lifecycle of a freshly-started VM is bound to the caller.
 ///
-/// Modeled after microsandbox's `SpawnMode` (`Attached` vs `Detached`).
-/// The two are orthogonal to *what* the VM runs — they control *how
-/// long* it lives relative to the process that started it.
+/// Controls whether the VM lifecycle is bound to the calling
+/// process. The two modes are orthogonal to *what* the VM runs —
+/// they control *how long* it lives relative to the process that
+/// started it.
 ///
 /// ## `Attached` (interactive default)
 ///
@@ -545,9 +546,8 @@ pub trait VmBackend: Send + Sync {
 
     /// Convert an attached VM into a detached one without restarting it.
     ///
-    /// Mirrors microsandbox's `Sandbox::detach(self)` — disarms the
-    /// SIGTERM safety net so the caller can exit without taking the
-    /// VM down with it. After `detach`, `wait` is no longer
+    /// Disarms the SIGTERM safety net so the caller can exit without
+    /// taking the VM down with it. After `detach`, `wait` is no longer
     /// meaningful (you'd have to re-attach via `start_with_mode`
     /// against an existing name).
     ///

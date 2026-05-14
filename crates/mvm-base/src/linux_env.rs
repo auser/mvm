@@ -275,11 +275,10 @@ impl LinuxEnv for AppleContainerEnv {
 /// Apple Container hosts (macOS 26+) route through the dev VM's
 /// guest-agent vsock channel; everywhere else falls through to
 /// `bash -c` on the host. macOS Intel / pre-26 / no-KVM-Linux are
-/// expected to use the microsandbox-backed builder VM (W7.x.2
-/// follow-up) when one is present; absent that, scripts run against
-/// the bare host and any Linux-only tools they invoke fail loudly
-/// at runtime — the right shape, since pretending otherwise would
-/// silently produce broken artifacts.
+/// unsupported until a builder VM environment is wired for them;
+/// absent that, scripts run against the bare host and any Linux-only
+/// tools they invoke fail loudly at runtime — the right shape, since
+/// pretending otherwise would silently produce broken artifacts.
 pub fn create_linux_env() -> Box<dyn LinuxEnv> {
     let plat = platform::current();
 

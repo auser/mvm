@@ -1,10 +1,11 @@
 //! Backend-agnostic vsock connect dispatch.
 //!
-//! Hides the choice between Firecracker's UDS multiplexer and Apple
-//! Container's `VZVirtioSocketDevice` (or its mode-0700 proxy
-//! socket) behind one trait, so callers that just need "give me a
-//! connected stream to vsock port `P` on VM `V`" don't have to know
-//! which backend the VM is running under. Before this trait, every
+//! Hides the choice between Firecracker's UDS multiplexer, libkrun's
+//! per-port Unix sockets, and Apple Container's `VZVirtioSocketDevice`
+//! (or its mode-0700 proxy socket) behind one trait, so callers that
+//! just need "give me a connected stream to vsock port `P` on VM `V`"
+//! don't have to know which backend the VM is running under. Before
+//! this trait, every
 //! caller open-coded the same `if let Ok(stream) =
 //! mvm_providers::apple_container::vsock_connect(...) { ... } else { ... }`
 //! ladder; new backends or backend changes had to chase down every
@@ -18,6 +19,7 @@
 use anyhow::{Context, Result};
 use std::io::Write;
 use std::os::unix::net::UnixStream;
+use std::path::PathBuf;
 
 use mvm_backend::microvm;
 
@@ -66,6 +68,40 @@ impl VsockTransport for FirecrackerTransport {
     fn connect(&self, port: u32) -> Result<UnixStream> {
         let uds = mvm_guest::vsock::vsock_uds_path(&self.instance_dir);
         mvm_guest::vsock::connect_to_port(&uds, port, self.timeout_secs)
+    }
+}
+
+/// Connects through libkrun's per-port Unix socket.
+///
+/// `LibkrunBackend` starts each VM with `vsock_socket_dir` set to
+/// `~/.mvm/vms/<name>`, and mvm-libkrun exposes each registered vsock
+/// port as `<dir>/vsock-<port>.sock`.
+pub struct LibkrunTransport {
+    socket_dir: PathBuf,
+}
+
+impl LibkrunTransport {
+    pub fn new(socket_dir: impl Into<PathBuf>) -> Self {
+        Self {
+            socket_dir: socket_dir.into(),
+        }
+    }
+
+    pub fn for_vm(vm_name: &str) -> Self {
+        let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
+        Self::new(PathBuf::from(home).join(".mvm/vms").join(vm_name))
+    }
+
+    fn socket_path(&self, port: u32) -> PathBuf {
+        self.socket_dir.join(format!("vsock-{port}.sock"))
+    }
+}
+
+impl VsockTransport for LibkrunTransport {
+    fn connect(&self, port: u32) -> Result<UnixStream> {
+        let path = self.socket_path(port);
+        UnixStream::connect(&path)
+            .with_context(|| format!("Failed to connect to libkrun vsock at {}", path.display()))
     }
 }
 
@@ -129,8 +165,9 @@ impl VsockTransport for VsockProxyTransport {
 ///
 /// Probes Apple Container first by attempting a real connect to the
 /// agent control port — that's the cheapest probe that doesn't
-/// require the caller to know the backend ahead of time. Falls back
-/// to Firecracker by resolving the running VM's instance directory.
+/// require the caller to know the backend ahead of time. Then tries
+/// libkrun's per-port Unix socket, then Firecracker by resolving the
+/// running VM's instance directory.
 ///
 /// Note: the probe consumes one stream and immediately drops it;
 /// callers get a *fresh* stream from the returned transport's
@@ -141,6 +178,10 @@ pub fn for_vm(vm_name: &str) -> Result<Box<dyn VsockTransport>> {
         .is_ok()
     {
         return Ok(Box::new(AppleContainerTransport::new(vm_name)));
+    }
+    let libkrun = LibkrunTransport::for_vm(vm_name);
+    if libkrun.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
+        return Ok(Box::new(libkrun));
     }
     let fc = FirecrackerTransport::for_vm(vm_name)
         .with_context(|| format!("no vsock transport found for VM {:?}", vm_name))?;
@@ -183,6 +224,19 @@ mod tests {
         assert!(
             msg.contains("/tmp/no-such-instance"),
             "error didn't mention instance dir: {msg}"
+        );
+    }
+
+    #[test]
+    fn libkrun_transport_constructs_with_socket_dir() {
+        let t = LibkrunTransport::new("/tmp/no-such-libkrun-vm");
+        let err = t
+            .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
+            .expect_err("should fail to connect");
+        let msg = err.to_string();
+        assert!(
+            msg.contains("/tmp/no-such-libkrun-vm"),
+            "error didn't mention socket dir: {msg}"
         );
     }
 }

@@ -32,7 +32,7 @@ If plan 57 stalls, **W0 still ships standalone** — the three sandbox-correctne
 5. Exits 0 with no manual intervention.
 6. Cold cache: completes in <8 min on a sustained 100 Mb/s connection.
 7. Warm cache (`/nix` virtio-blk preserved from a prior run): rebuilds unchanged dev image in <30 s.
-8. `cargo metadata --features ''` shows no `microsandbox*` crate in the default-feature closure of `mvmctl`. `--features contributor-bootstrap` still compiles for the deprecation window.
+8. `cargo metadata --features ''` and `cargo metadata --all-features` show no `microsandbox*` crate in the `mvmctl` closure.
 9. CI passes the workspace + clippy + every plan-71-introduced live test on macOS aarch64 and Linux x86_64.
 
 When all nine hold, ADR-046 flips from Proposed to Accepted and the plan moves to `specs/backlog/`.
@@ -123,7 +123,7 @@ impl BuilderVm for LibkrunBuilderVm {
 
 ### Feature gate
 
-`backends-builder-vm-libkrun` (new). Default-off in this phase. `mvmctl` keeps using `contributor-bootstrap` by default until W5 flips the polarity.
+`backends-builder-vm-libkrun` (new). Default-on after cutover. There is no Stage 0/bootstrap fallback feature.
 
 ### W1 acceptance
 
@@ -276,8 +276,7 @@ Reshape `ensure_dev_image` to encode the two-layer artifact rule from ADR-046 §
 1. **In a source checkout** (`find_builder_vm_flake()` returns `Some`):
    - Hash `nix/images/builder-vm/flake.nix` + its lock to derive a cache key.
    - If `~/.cache/mvm/builder-vm/<hash>/` exists and is hash-valid → use it.
-   - Otherwise build it locally from the in-repo flake using Stage 0:
-     - **Stage 0** = microsandbox + `nixos/nix:2.24.10`, gated behind `--features contributor-bootstrap`. This is the *only* Stage 0 path; host Nix is never consulted even when installed (per CLAUDE.md §"Host Nix is never used by mvmctl"). The 4 GiB overlay limit applies but the builder VM rootfs closure fits — see W2 size budget. Bails with a "rebuild with `--features contributor-bootstrap`" hint when the feature was compiled out.
+   - Otherwise build it locally through `LibkrunBuilderVm`. Host Nix is never consulted even when installed.
 2. **Outside a source checkout** (installed binary, no flake): download the mvm-published prebuilt for the running `mvmctl` version; SHA-256 verify per ADR-002 §W5.1; cache at `~/.cache/mvm/builder-vm/v<mvmctl-version>/`.
 
 **Layer 2 — the user's target image** (dev shell, or whatever `--flake` points at):
@@ -289,46 +288,36 @@ Reshape `ensure_dev_image` to encode the two-layer artifact rule from ADR-046 §
 ### Feature flag polarity
 
 - `backends-builder-vm-libkrun` becomes the new default — covers Layer 1 + Layer 2 on user-facing paths.
-- `contributor-bootstrap` is renamed `contributor-bootstrap` to make its scope explicit:
-  - Off by default.
-  - On, it adds **only** the Stage 0.b microsandbox launcher for building the in-repo `nix/images/builder-vm/flake.nix`. It is *not* a runtime backend, *not* selectable via `--hypervisor microsandbox`, and *not* called for user-facing builds.
-  - This rename happens in W5 — code that's left behind for end-user-facing fallback in earlier phases gets deleted here as part of the cutover. End users without libkrun get an install hint, not a microsandbox fallback.
+- The Stage 0 escape hatch has been removed. There is no contributor bootstrap feature and no microsandbox-backed source-build path. End users without libkrun get an install hint, not a fallback.
 
 ### Implementation notes for `ensure_dev_image`
 
 - `find_builder_vm_flake()` is new — sibling of `find_dev_image_flake()`. Returns `Ok(path)` when `<workspace_root>/nix/images/builder-vm/flake.nix` exists. The split mirrors the artifact-layer distinction: `nix/images/builder-vm/` is Layer 1, `nix/images/dev-shell/` (renamed from `nix/images/builder/`) is Layer 2.
 - The cache-key hash is `sha256(flake.nix + flake.lock)`. Any contributor edit to either invalidates and forces a rebuild — that's the "next `mvmctl dev up` reflects my edit" promise.
-- The `--features contributor-bootstrap` gate compiles out the microsandbox dep entirely for users. CI runs two job variants: default (no feature) covers the end-user path; `--features contributor-bootstrap` covers the contributor Stage 0 path.
+- CI covers the default libkrun builder path. No microsandbox feature variant remains.
 
 ### W5 acceptance
 
 - All nine whole-plan acceptance criteria pass.
 - `cargo test --workspace` is green on macOS aarch64 + Linux x86_64 with default features.
-- `cargo test --workspace --features contributor-bootstrap` is green on the same matrix.
 - Live test `tests/dev_up_libkrun.rs` runs the full Layer 1 + Layer 2 source-checkout path end-to-end against a tiny test flake (≤ 5 derivations) on both platforms.
-- Live test `tests/dev_up_contributor_bootstrap.rs` exercises the `--features contributor-bootstrap` Stage 0 path. This test must explicitly verify that no host `nix` binary is invoked (e.g. by putting a poisoned `nix` shim at the front of `PATH` that exits non-zero and asserting the build still succeeds).
+- A poisoned host `nix` shim at the front of `PATH` does not affect source-checkout builds, because `nix` is invoked only inside the builder VM.
 - A contributor edit to `nix/images/builder-vm/flake.nix` (e.g. adding `htop` to `builderPackages`) shows up in the next `mvmctl dev up` without a release-pipeline round-trip.
 
 ---
 
-## W6 — Hygiene (not removal)
+## W6 — Hygiene
 
-W5's cutover already moves microsandbox behind `--features contributor-bootstrap` and deletes the end-user-facing fallback. W6 is hygiene that lands ≥ 8 weeks later, once W5 has shipped without contributor-reported regressions:
+W5's cutover removes microsandbox and the Stage 0 escape hatch. W6 is cleanup:
 
-- Audit the `contributor-bootstrap` dep closure — confirm only Stage 0.b code remains, no leakage of microsandbox types into other crates.
-- Move `crates/mvm-build/src/builder_vm.rs::MicrosandboxBuilderVm` into a dedicated `crates/mvm-build/src/contributor_bootstrap.rs` so the scope is grep-obvious. Same code, clearer name.
-- Move `mvm_cli::commands::env::apple_container::build_image_via_microsandbox` into a sibling `contributor_bootstrap_build.rs` for the same reason.
-- Update ADR-013 with a §"Superseded for the user-facing builder path by ADR-046" note. The contributor-bootstrap clause of ADR-013 stays in force.
-- Update `CLAUDE.md`'s build instructions: `cargo build` is the canonical path for users and for contributors with host Nix; `cargo build --features contributor-bootstrap` is the path for contributors on stock macOS modifying the builder VM image.
-
-### Removing microsandbox entirely (deferred)
-
-If a thinner Stage 0 emerges (e.g. a hand-rolled libkrun + nixos/nix OCI extractor, or a checked-in pre-built stage-0 microVM image that's small enough to live in git LFS), the `contributor-bootstrap` feature can swap its backend without touching the user-facing path. That work is *not* part of plan 72. It's tracked as a follow-up; the goal of plan 72 is to get user-facing builds off microsandbox, not to eliminate microsandbox from every workflow.
+- Audit the dependency graph — confirm no microsandbox types or crates remain in any feature closure.
+- Update ADR-013 with a §"Superseded for the builder path by ADR-046" note.
+- Update build instructions: `cargo build` is the canonical path. Source-checkout builder image work runs through the builder VM, not host Nix and not a Stage 0 fallback.
 
 ### W6 acceptance
 
 - `cargo metadata -p mvmctl` with default features shows no `microsandbox*` crate.
-- `cargo metadata -p mvmctl --features contributor-bootstrap` shows microsandbox only under the contributor-bootstrap-only crates.
+- `cargo metadata -p mvmctl --all-features` shows no `microsandbox*` crate.
 - Default `cargo build` bin size: `du -h target/release/mvmctl` drops by at least 8 MiB vs. pre-plan-71 baseline.
 - Release artifact `builder-checksums-sha256.txt` exists and is verified by `download_builder_vm_image`.
 
@@ -336,11 +325,9 @@ If a thinner Stage 0 emerges (e.g. a hand-rolled libkrun + nixos/nix OCI extract
 
 ## Non-goals
 
-- **Replacing microsandbox as a runtime backend.** ADR-013's runtime selection (Firecracker on Linux, libkrun on macOS via plan 57) stays as-is. microsandbox stays available as a runtime backend selectable via `--hypervisor microsandbox` during the deprecation window.
-- **Multi-platform Windows support.** Windows is out of scope for this plan; libkrun doesn't run there. The microsandbox builder path is the only one that ever could have worked on Windows, and even then via WSL2.
+- **Multi-platform Windows support.** Windows is out of scope for this plan; libkrun doesn't run there.
 - **Snapshotting the builder VM**. The builder is single-purpose and exit-on-completion. No reason to snapshot. If a contributor wants a long-lived dev VM they want `mvmctl dev shell` (different path, libkrun-backed via plan 57).
 - **Honoring host Nix when present.** Per CLAUDE.md §"Host Nix is never used by mvmctl", mvmctl does not consult any host Nix install in any code path. This is a *removal* of ADR-013's "host Nix remains an opt-in power-user path" clause — that clause is superseded for everything inside `mvmctl`. Contributors with `nix-darwin`'s `linux-builder` see exactly the same behavior as contributors without it. Determinism is the reason.
-- **Eliminating microsandbox from the contributor-bootstrap path.** Plan 72 demotes it to that scope; further reduction (vendoring a thinner OCI runner, shipping a stage-0 microVM in git LFS) is tracked as a follow-up. The minimum scope here is getting *user-facing builds* off microsandbox and giving contributors a from-source dev loop that doesn't depend on the release pipeline.
 - **Forcing contributors to download a prebuilt builder VM in a source checkout.** Source-checkout `mvmctl dev up` always runs `nix build` against the in-repo flakes for both Layer 1 (builder VM image) and Layer 2 (dev shell / user image). The mvm-published prebuilt is end-user infrastructure only — a contributor modifying `nix/images/builder-vm/flake.nix` must see their changes in the next invocation without any release-pipeline round-trip.
 
 ## Risks and mitigations
@@ -381,10 +368,10 @@ W3 (mvm-builder-init — Rust binary baked into rootfs)
 W4 (Network + vsock + console plumbing)
    │
    ▼
-W5 (Cutover — libkrun for user-facing, microsandbox demoted to `contributor-bootstrap`)
+W5 (Cutover — libkrun for user-facing, microsandbox removed)
    │
-   ▼ (≥ 8 weeks; no regressions)
-W6 (Hygiene — segregate contributor-bootstrap code, doc the new build matrix)
+   ▼
+W6 (Hygiene — audit dep graph, doc the new build matrix)
 ```
 
 W0 ships standalone. W1–W4 chain. W5 is the user-visible cutover. W6 is hygiene.

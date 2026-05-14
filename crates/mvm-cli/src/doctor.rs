@@ -100,8 +100,8 @@ pub fn run(json: bool) -> Result<()> {
     // probes return informational `Check`s and doctor exits 0 — the host
     // is not expected to own them. Routing still goes through `VM_NAME`,
     // which `shell::run_on_vm` maps to the platform's default LinuxEnv
-    // (Apple Container `mvm-dev` on macOS 26+; future microsandbox
-    // builder elsewhere).
+    // (Apple Container `mvm-dev` on macOS 26+; libkrun builder
+    // elsewhere).
     let vm_up = dev_vm_running();
     checks.push(if vm_up {
         nix_version_check()
@@ -263,7 +263,6 @@ fn collect_balloon_support() -> BTreeMap<String, bool> {
         "apple-container",
         "docker",
         "libkrun",
-        "microsandbox",
         "qemu",
     ];
     let mut out = BTreeMap::new();
@@ -498,7 +497,7 @@ fn kvm_check(plat: Platform, in_vm: bool) -> Check {
     }
 
     // macOS host: /dev/kvm doesn't exist anywhere in the stack — the
-    // backend is Apple Container / libkrun / microsandbox driven by
+    // backend is Apple Container / libkrun driven by
     // Hypervisor.framework. Plan-60 / ADR-013 retired Lima; reporting
     // KVM as missing on macOS is a pre-Plan-60 artifact.
     Check {

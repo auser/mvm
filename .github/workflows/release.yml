@@ -12,7 +12,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  MVMCTL_RELEASE_FEATURES: contributor-bootstrap,template-registry-s3,dev-watch,custom-dns,manifest-verify
+  MVMCTL_RELEASE_FEATURES: template-registry-s3,dev-watch,custom-dns,manifest-verify
 
 jobs:
   build:
@@ -43,12 +43,6 @@ jobs:
         run: |
           sudo apt-get update
           sudo apt-get install -y gcc-aarch64-linux-gnu
-
-      - name: Install microsandbox build deps (Linux)
-        if: matrix.os == 'ubuntu-latest'
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libcap-ng-dev
 
       - name: Set linker for aarch64-unknown-linux-gnu
         if: matrix.target == 'aarch64-unknown-linux-gnu'
@@ -292,8 +286,7 @@ jobs:
   # behalf of mvmctl. Plan 72 W2 ships the flake at
   # `nix/images/builder-vm/`; this job publishes the per-arch
   # artifacts so installed-binary users (no source checkout) can
-  # download them via `download_builder_vm_image` instead of
-  # bootstrapping via microsandbox.
+  # download them via `download_builder_vm_image`.
   #
   # Distinct from `builder-image` above — that's the sealed runtime
   # builder used by mvmd's pool-build pipeline; this is the

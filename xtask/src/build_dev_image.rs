@@ -3,24 +3,19 @@
 //! `nix/images/dev-prebuilt/<arch>/{vmlinux, rootfs.ext4,
 //! checksums-sha256.txt}`.
 //!
-//! ## Self-bootstrapping — no host Nix required
+//! ## Builder VM — no host Nix required
 //!
 //! The task does **not** shell out to a host `nix` binary. Instead it
-//! drives [`mvm_build::builder_vm::MicrosandboxBuilderVm`] — the same
-//! microsandbox-backed Linux builder that `mvmctl build` uses to build
-//! user microVM images. That sandbox spawns `docker.io/nixos/nix:2.24.10`
-//! via Apple Virtualization Framework / libkrun (macOS) or KVM (Linux),
-//! bind-mounts the workspace at `/work`, and runs `nix build` *inside*
-//! the sandbox. The host needs zero Nix install — `mvmctl` ships
-//! microsandbox in-binary and microsandbox pulls the public
-//! `nixos/nix:2.24.10` image once.
+//! drives [`mvm_build::libkrun_builder::LibkrunBuilderVm`], which
+//! bind-mounts the workspace at `/work`, boots the project builder VM,
+//! and runs `nix build` inside that VM. The host needs zero Nix install.
 //!
 //! Net effect: on a fresh macOS 26+ Apple Silicon host with nothing
 //! installed but `mvmctl`, `cargo xtask build-dev-image` produces a
 //! working dev VM image. After it runs once, the image lives in the
 //! vendored slot and `mvmctl dev up` boots from there at the highest-
 //! precedence layer of `ensure_dev_image`'s cascade — so subsequent
-//! starts don't even need microsandbox or network reachability.
+//! starts don't need network reachability.
 //!
 //! ## Contract
 //!
@@ -42,9 +37,8 @@
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
 
-use mvm_build::builder_vm::{
-    BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, BuilderVm, MicrosandboxBuilderVm,
-};
+use mvm_build::builder_vm::{BuilderJob, BuilderMounts, BuilderVm};
+use mvm_build::libkrun_builder::LibkrunBuilderVm;
 
 /// Parse `cargo xtask build-dev-image [--arch <arch>]` and dispatch.
 pub fn run(args: &[String], workspace: &Path) -> Result<()> {
@@ -71,9 +65,8 @@ pub fn run(args: &[String], workspace: &Path) -> Result<()> {
 const HELP_TEXT: &str = "\
 Usage: cargo xtask build-dev-image [--arch <arch>]
 
-Builds the dev VM image inside a microsandbox-managed Linux sandbox
-(via Apple Virtualization Framework / libkrun on macOS, KVM on Linux)
-and copies vmlinux + rootfs.ext4 + checksums into
+Builds the dev VM image inside the libkrun-backed builder VM and copies
+vmlinux + rootfs.ext4 + checksums into
 nix/images/dev-prebuilt/<arch>/. No host Nix install required.
 
 Args:
@@ -82,9 +75,8 @@ Args:
                   (aarch64-darwin → aarch64, x86_64-linux → x86_64, etc.).
 
 Prerequisites:
-  - macOS 26+ on Apple Silicon, or Linux with KVM.
-  - Network reachability to docker.io (first run pulls nixos/nix:2.24.10;
-    subsequent runs are cached).
+  - libkrun available on this host.
+  - A cached or downloadable builder VM image.
   - The flake at nix/images/builder/flake.nix exposes
     packages.<arch>-linux.default with vmlinux + rootfs.ext4 in $out.
 ";
@@ -138,53 +130,31 @@ fn build_and_install(workspace: &Path, arch: &str) -> Result<()> {
             .with_context(|| format!("removing stale {}", lock.display()))?;
     }
 
-    // The sandbox bind-mounts `workspace` at /work (read-only).
-    // microsandbox owns /out for artifact extraction. The flake_ref
-    // inside the sandbox is the absolute path to the builder flake
-    // under that mount — `path:..` resolves there to the parent
-    // mvm flake at /work/nix/, which in turn resolves its own
-    // `mvm-workspace = path:..` to /work/, where `Cargo.lock` lives.
+    // The builder VM bind-mounts `workspace` at /work and /out for
+    // artifact extraction. The flake_ref inside the VM is the absolute
+    // path to the builder flake under that mount.
     let artifact_out =
         tempfile::tempdir().context("creating tempdir for builder artifact extraction")?;
     let job = BuilderJob::Flake {
-        // Bare path — nix auto-detects /work as a git repo (the host
-        // workspace's `.git` is in the bind-mount) and uses the
-        // git+file fetcher. That gives us two things `path:` doesn't:
-        //   1. The flake resolves against the workspace root, so
-        //      `path:../..`-style relative inputs find their
-        //      neighbours (`path:` stages only the leaf subdir and
-        //      escapes the store with "outside of its parent's store
-        //      path").
-        //   2. `?dir=` works in older nix versions (the `path:`
-        //      variant errors "unsupported parameter 'dir'" on nix
-        //      2.24, which is what the builder image ships).
-        //
-        // `git config --global --add safe.directory '*'` inside the
-        // sandbox (set by run_build_async's build_script) is what
-        // makes the git fetcher work across the bind-mount's
-        // host-uid ownership; without it, git refuses with
-        // "repository '/work' is not owned by current user".
-        flake_ref: format!("git+file://{BUILDER_GUEST_WORK_DIR}?dir=nix/images/builder"),
+        flake_ref: "path:/work/nix/images/builder".to_string(),
         attr_path: format!("packages.{arch}-linux.default"),
     };
     let mounts = BuilderMounts {
         flake_src: workspace.to_path_buf(),
-        // Never bind the host /nix on macOS: it's root-owned and
-        // contains Darwin-targeted closures the Linux sandbox can't
-        // execute. See the same reasoning in
-        // `apple_container.rs::build_image_via_microsandbox`.
+        // The builder VM owns its `/nix` store; never bind the host
+        // store into the guest.
         host_nix_store: None,
         artifact_out: artifact_out.path().to_path_buf(),
     };
 
     println!(
-        "xtask build-dev-image: running mvm-build's MicrosandboxBuilderVm\n\
-         (no host Nix needed — `nixos/nix:2.24.10` runs inside the sandbox)"
+        "xtask build-dev-image: running mvm-build's LibkrunBuilderVm\n\
+         (no host Nix needed — nix runs inside the builder VM)"
     );
-    let builder = MicrosandboxBuilderVm::default();
+    let builder = LibkrunBuilderVm::default();
     let artifacts = builder
         .run_build(&job, &mounts)
-        .map_err(|e| anyhow::anyhow!("microsandbox builder failed: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("libkrun builder failed: {e}"))?;
 
     // Plan 73 Followup B.2.0: BuilderArtifacts is now an enum. The
     // xtask path always feeds a Flake job, so it always receives an
