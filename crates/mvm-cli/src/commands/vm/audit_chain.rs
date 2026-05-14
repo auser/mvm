@@ -60,7 +60,7 @@ pub fn audit_path_for_tenant(audit_dir: &Path, tenant: &str) -> PathBuf {
 /// key half (cloned from the host signer at construction); calls
 /// `tokio::runtime::Builder::new_current_thread()` per emit.
 pub struct AuditEmitter {
-    signer: FileAuditSigner,
+    signers: Vec<FileAuditSigner>,
 }
 
 impl AuditEmitter {
@@ -94,7 +94,47 @@ impl AuditEmitter {
         }
         let signer = FileAuditSigner::open(signing_key, audit_dir)
             .with_context(|| format!("opening FileAuditSigner at {}", audit_dir.display()))?;
-        Ok(Self { signer })
+        Ok(Self {
+            signers: vec![signer],
+        })
+    }
+
+    /// Construct an emitter from a parsed policy bundle's `[audit]`
+    /// section. The default local chain is always kept; `file://`
+    /// destinations add exact-file replicas. Network/unix
+    /// replication is intentionally fail-closed until those
+    /// transports are implemented.
+    pub fn with_policy(
+        signing_key: SigningKey,
+        audit_dir: &Path,
+        policy: &mvm_policy::AuditPolicy,
+    ) -> Result<Self> {
+        if !policy.chain_signing {
+            anyhow::bail!(
+                "policy audit.chain_signing=false is not supported for policy-bound admission"
+            );
+        }
+
+        let mut emitter = Self::with_dir(signing_key.clone(), audit_dir)?;
+        for destination in &policy.stream_destinations {
+            let Some(raw_path) = destination.strip_prefix("file://") else {
+                anyhow::bail!(
+                    "audit stream destination {destination:?} is not wired yet; \
+                     only file:// destinations are supported"
+                );
+            };
+            if raw_path.is_empty() {
+                anyhow::bail!("audit file:// destination must include an absolute path");
+            }
+            let path = PathBuf::from(raw_path);
+            if !path.is_absolute() {
+                anyhow::bail!("audit file:// destination must include an absolute path");
+            }
+            let signer = FileAuditSigner::open_file(signing_key.clone(), &path)
+                .with_context(|| format!("opening audit stream {}", path.display()))?;
+            emitter.signers.push(signer);
+        }
+        Ok(emitter)
     }
 
     /// Emit `plan.admitted` — fires immediately after `admit_for_run`
@@ -160,8 +200,10 @@ impl AuditEmitter {
             .enable_all()
             .build()
             .context("building tokio runtime for audit emit")?;
-        rt.block_on(self.signer.sign_and_emit(&entry))
-            .with_context(|| format!("signing-and-emitting audit event {event}"))?;
+        for signer in &self.signers {
+            rt.block_on(signer.sign_and_emit(&entry))
+                .with_context(|| format!("signing-and-emitting audit event {event}"))?;
+        }
         Ok(())
     }
 }
@@ -328,6 +370,73 @@ mod tests {
             let mode = std::fs::metadata(&target).unwrap().permissions().mode() & 0o777;
             assert_eq!(mode, 0o700, "audit dir must be tightened to 0700");
         }
+    }
+
+    #[test]
+    fn policy_file_destination_gets_a_replicated_chain() {
+        let dir = tempfile::tempdir().unwrap();
+        let replica = dir.path().join("replica.jsonl");
+        let key = SigningKey::generate(&mut OsRng);
+        let vk = key.verifying_key();
+        let policy = mvm_policy::AuditPolicy {
+            chain_signing: true,
+            stream_destinations: vec![format!("file://{}", replica.display())],
+        };
+        let emitter = AuditEmitter::with_policy(key, dir.path(), &policy).unwrap();
+        let plan = fixture_plan("local", "plan-P");
+
+        emitter.emit_admitted(&plan, "host:test").unwrap();
+
+        let default_path = dir.path().join("local.jsonl");
+        assert!(default_path.exists(), "default local chain remains active");
+        assert!(replica.exists(), "policy file stream must be written");
+        assert_eq!(verify_audit_chain(&default_path, &vk).unwrap(), 1);
+        assert_eq!(verify_audit_chain(&replica, &vk).unwrap(), 1);
+    }
+
+    #[test]
+    fn policy_requires_chain_signing() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let policy = mvm_policy::AuditPolicy {
+            chain_signing: false,
+            stream_destinations: Vec::new(),
+        };
+        let err = match AuditEmitter::with_policy(key, dir.path(), &policy) {
+            Ok(_) => panic!("chain_signing=false must be rejected"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("chain_signing"));
+    }
+
+    #[test]
+    fn policy_refuses_unwired_replication_schemes() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let policy = mvm_policy::AuditPolicy {
+            chain_signing: true,
+            stream_destinations: vec!["https://audit.example.com/ingest".to_string()],
+        };
+        let err = match AuditEmitter::with_policy(key, dir.path(), &policy) {
+            Ok(_) => panic!("unwired replication schemes must be rejected"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("not wired yet"));
+    }
+
+    #[test]
+    fn policy_refuses_relative_file_destinations() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let policy = mvm_policy::AuditPolicy {
+            chain_signing: true,
+            stream_destinations: vec!["file://relative/audit.jsonl".to_string()],
+        };
+        let err = match AuditEmitter::with_policy(key, dir.path(), &policy) {
+            Ok(_) => panic!("relative audit file destinations must be rejected"),
+            Err(err) => err,
+        };
+        assert!(format!("{err:#}").contains("absolute path"));
     }
 
     #[test]

@@ -14,7 +14,7 @@ use mvm_core::vm_backend::VmId;
 
 use super::super::env::apple_container::ensure_default_microvm_image;
 use super::Cli;
-use super::audit_chain::AuditEmitter;
+use super::audit_chain::{AuditEmitter, default_audit_dir};
 use super::forward::forward_ports;
 use super::host_signer::load_or_init_at;
 use super::plan_admission::{
@@ -274,11 +274,40 @@ fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<Admission
         None => super::host_signer::load_or_init(),
     }
     .context("loading host signer for audit emitter")?;
-    let emitter = match p.audit_dir {
-        Some(dir) => AuditEmitter::with_dir(signer.signing, dir),
-        None => AuditEmitter::new(signer.signing),
-    }
-    .context("opening audit chain emitter")?;
+
+    // Resolve policy before constructing the final emitter so
+    // `[audit]` can control chain-signing and stream replication for
+    // every success-path audit record. If policy resolution itself
+    // fails, fall back to the default local chain for the failure
+    // record so the rejection is still visible.
+    let resolved = match resolve_policy_for_admission(&admitted.plan, p.policy_dir) {
+        Ok(resolved) => resolved,
+        Err(err) => {
+            let fallback = build_default_audit_emitter(signer.signing, p.audit_dir)
+                .context("opening fallback audit chain emitter")?;
+            emit_policy_resolve_failure(&admitted.plan, &fallback, &err);
+            return Err(err);
+        }
+    };
+
+    let emitter = match build_policy_audit_emitter(
+        signer.signing.clone(),
+        p.audit_dir,
+        resolved.audit.as_ref(),
+    ) {
+        Ok(emitter) => emitter,
+        Err(err) => {
+            let err = err.context("opening audit chain emitter");
+            match build_default_audit_emitter(signer.signing, p.audit_dir) {
+                Ok(fallback) => emit_policy_audit_invalid(&admitted.plan, &fallback, &err),
+                Err(fallback_err) => tracing::warn!(
+                    error = %fallback_err,
+                    "audit emit_failed for policy-audit-invalid skipped; fallback emitter failed"
+                ),
+            }
+            return Err(err);
+        }
+    };
 
     if let Err(e) = emitter.emit_admitted(&admitted.plan, &admitted.signer_id) {
         tracing::warn!(error = %e, "audit emit_admitted failed (non-fatal)");
@@ -291,83 +320,128 @@ fn admit_plan_for_boot(p: AdmitPlanForBootParams<'_>) -> Result<Option<Admission
     // facing: it validates the policy refs against the on-disk
     // bundle so a missing file / typo / bad L4 CIDR fails the boot
     // loudly *now* instead of silently passing through with Noops.
-    // The audit emitter records either `plan.policy_resolved` on
-    // success or `plan.failed` on resolver error.
-    resolve_policy_for_admission(&admitted.plan, &emitter, p.policy_dir)?;
+    emit_policy_resolved(&admitted.plan, &emitter, resolved.slots_mode);
 
     Ok(Some(AdmissionContext { admitted, emitter }))
 }
 
-/// Run the W5 policy resolver against the admitted plan, emit the
-/// audit event reflecting the outcome, and return Err on any resolver
-/// failure so the caller can refuse the boot.
+#[derive(Debug)]
+struct PolicyAdmissionResolution {
+    slots_mode: &'static str,
+    audit: Option<mvm_policy::AuditPolicy>,
+}
+
+fn build_default_audit_emitter(
+    signing_key: ed25519_dalek::SigningKey,
+    audit_dir: Option<&std::path::Path>,
+) -> Result<AuditEmitter> {
+    match audit_dir {
+        Some(dir) => AuditEmitter::with_dir(signing_key, dir),
+        None => AuditEmitter::new(signing_key),
+    }
+}
+
+fn build_policy_audit_emitter(
+    signing_key: ed25519_dalek::SigningKey,
+    audit_dir: Option<&std::path::Path>,
+    policy: Option<&mvm_policy::AuditPolicy>,
+) -> Result<AuditEmitter> {
+    match policy {
+        Some(policy) => {
+            let dir = match audit_dir {
+                Some(dir) => dir.to_path_buf(),
+                None => default_audit_dir()?,
+            };
+            AuditEmitter::with_policy(signing_key, &dir, policy)
+        }
+        None => build_default_audit_emitter(signing_key, audit_dir),
+    }
+}
+
+/// Run the W5 policy resolver against the admitted plan and return the
+/// policy-derived audit configuration for emitter construction.
 ///
 /// `policy_dir` is the override for `~/.mvm/policies/`; production
 /// callers pass `None` and the resolver resolves it from `$HOME`.
 /// Tests inject a tempdir to stage / omit bundles deterministically.
 ///
-/// On resolver success: emits `plan.policy_resolved` with `slots_mode
-/// = "noop"` (all four refs are `LOCAL_DEFAULT`) or `"live"` (a
-/// `<tenant>:<workload>` bundle parsed cleanly). On resolver failure:
-/// emits `plan.failed` with `error_class = "policy-resolve"`, then
-/// returns the wrapped `anyhow::Error` for the caller to bail with.
 fn resolve_policy_for_admission(
     plan: &mvm_plan::ExecutionPlan,
-    emitter: &AuditEmitter,
     policy_dir: Option<&std::path::Path>,
-) -> Result<()> {
+) -> Result<PolicyAdmissionResolution> {
     let resolved = match policy_dir {
         Some(dir) => resolve_supervisor_components_with_dir(plan, dir),
         None => resolve_supervisor_components(plan),
     };
     match resolved {
-        Ok(_slots) => {
+        Ok(slots) => {
             // Drop the slots — no live consumer in mvmctl today. The
-            // construction itself is the validation. Audit the
-            // resolved-mode so operators can confirm via
-            // `mvmctl audit tail --chain` that the parsed bundle
-            // matches the one they staged.
+            // construction itself is the validation. Return the
+            // resolved-mode so the caller can audit it after the
+            // policy-derived emitter is constructed.
             let mode = if plan.network_policy.0 == LOCAL_DEFAULT {
                 "noop"
             } else {
                 "live"
             };
-            if let Err(e) = emitter.emit_policy_resolved(plan, mode) {
-                tracing::warn!(error = %e, "audit emit_policy_resolved failed (non-fatal)");
-            }
             tracing::info!(
                 plan_id = %plan.plan_id.0,
                 slots_mode = mode,
                 "policy refs resolved",
             );
-            Ok(())
+            Ok(PolicyAdmissionResolution {
+                slots_mode: mode,
+                audit: slots.audit,
+            })
         }
-        Err(rerr) => {
-            // Wrap as anyhow::Error so the existing error chain
-            // rendering (used by the CLI hint surface + audit
-            // emit_failed) picks up the resolver's Display impl.
-            let err = anyhow::Error::new(rerr).context("resolving plan policy refs");
-            let class = match err.downcast_ref::<ResolveError>() {
-                Some(ResolveError::BundleNotFound { .. }) => "policy-bundle-not-found",
-                Some(ResolveError::BundleParseFailed { .. }) => "policy-bundle-parse-failed",
-                Some(ResolveError::MixedRefs { .. }) => "policy-refs-mixed",
-                Some(ResolveError::Unrecognized { .. }) => "policy-ref-unrecognized",
-                Some(ResolveError::L4SpecInvalid { .. }) => "policy-l4-spec-invalid",
-                Some(ResolveError::EgressPolicyInvalid { .. }) => "policy-egress-invalid",
-                Some(ResolveError::PiiPolicyInvalid { .. }) => "policy-pii-invalid",
-                Some(ResolveError::AuditPolicyInvalid { .. }) => "policy-audit-invalid",
-                None => "policy-resolve",
-            };
-            // Best-effort audit; resolver-failure is the fatal path,
-            // audit emit success/failure doesn't change that.
-            if let Err(audit_err) = emitter.emit_failed(plan, class, &format!("{err:#}")) {
-                tracing::warn!(
-                    error = %audit_err,
-                    "audit emit_failed for policy-resolve failed (non-fatal)"
-                );
-            }
-            Err(err)
-        }
+        Err(rerr) => Err(anyhow::Error::new(rerr).context("resolving plan policy refs")),
+    }
+}
+
+fn emit_policy_resolved(
+    plan: &mvm_plan::ExecutionPlan,
+    emitter: &AuditEmitter,
+    slots_mode: &'static str,
+) {
+    if let Err(e) = emitter.emit_policy_resolved(plan, slots_mode) {
+        tracing::warn!(error = %e, "audit emit_policy_resolved failed (non-fatal)");
+    }
+}
+
+fn emit_policy_resolve_failure(
+    plan: &mvm_plan::ExecutionPlan,
+    emitter: &AuditEmitter,
+    err: &anyhow::Error,
+) {
+    let class = match err.downcast_ref::<ResolveError>() {
+        Some(ResolveError::BundleNotFound { .. }) => "policy-bundle-not-found",
+        Some(ResolveError::BundleParseFailed { .. }) => "policy-bundle-parse-failed",
+        Some(ResolveError::MixedRefs { .. }) => "policy-refs-mixed",
+        Some(ResolveError::Unrecognized { .. }) => "policy-ref-unrecognized",
+        Some(ResolveError::L4SpecInvalid { .. }) => "policy-l4-spec-invalid",
+        Some(ResolveError::EgressPolicyInvalid { .. }) => "policy-egress-invalid",
+        Some(ResolveError::PiiPolicyInvalid { .. }) => "policy-pii-invalid",
+        Some(ResolveError::AuditPolicyInvalid { .. }) => "policy-audit-invalid",
+        None => "policy-resolve",
+    };
+    if let Err(audit_err) = emitter.emit_failed(plan, class, &format!("{err:#}")) {
+        tracing::warn!(
+            error = %audit_err,
+            "audit emit_failed for policy-resolve failed (non-fatal)"
+        );
+    }
+}
+
+fn emit_policy_audit_invalid(
+    plan: &mvm_plan::ExecutionPlan,
+    emitter: &AuditEmitter,
+    err: &anyhow::Error,
+) {
+    if let Err(audit_err) = emitter.emit_failed(plan, "policy-audit-invalid", &format!("{err:#}")) {
+        tracing::warn!(
+            error = %audit_err,
+            "audit emit_failed for policy-audit-invalid failed (non-fatal)"
+        );
     }
 }
 
@@ -2286,6 +2360,7 @@ bundle_version = 1
 [artifact]
 [keys]
 [audit]
+chain_signing = true
 "#,
         )
         .unwrap();
@@ -2326,13 +2401,20 @@ bundle_version = 1
         plan.tool_policy = PolicyRef("acme:vm-live".to_string());
         plan.fs_policy = mvm_plan::FsPolicyRef("acme:vm-live".to_string());
 
-        // Wire an emitter against the test audit dir and drive the
-        // hook directly. This keeps the test hermetic and skips the
-        // rootfs / synthesis path.
-        let signer = load_or_init_at(keys_dir.path()).expect("signer");
-        let emitter = AuditEmitter::with_dir(signer.signing, audit_dir.path()).unwrap();
-        resolve_policy_for_admission(&plan, &emitter, Some(policy_dir.path()))
+        // Resolve policy, then construct the policy-derived emitter
+        // and emit the hook. This mirrors `admit_plan_for_boot`'s
+        // ordering: the `[audit]` section affects the success-path
+        // audit emitter.
+        let resolved = resolve_policy_for_admission(&plan, Some(policy_dir.path()))
             .expect("live bundle must resolve");
+        let signer = load_or_init_at(keys_dir.path()).expect("signer");
+        let emitter = build_policy_audit_emitter(
+            signer.signing,
+            Some(audit_dir.path()),
+            resolved.audit.as_ref(),
+        )
+        .unwrap();
+        emit_policy_resolved(&plan, &emitter, resolved.slots_mode);
 
         let audit_path = audit_dir.path().join("acme.jsonl");
         let content = std::fs::read_to_string(&audit_path).expect("audit file exists");
@@ -2340,6 +2422,181 @@ bundle_version = 1
             content.contains("\"slots_mode\":\"live\""),
             "audit chain must record slots_mode=live for tenant-scoped refs: {content}"
         );
+    }
+
+    #[test]
+    fn admission_uses_bundle_audit_file_destination() {
+        use mvm_plan::PolicyRef;
+        let keys_dir = tempfile::tempdir().unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
+        let policy_dir = tempfile::tempdir().unwrap();
+        let stream_dir = tempfile::tempdir().unwrap();
+        let stream_path = stream_dir.path().join("acme-audit.jsonl");
+        let tenant_dir = policy_dir.path().join("acme");
+        std::fs::create_dir_all(&tenant_dir).unwrap();
+        std::fs::write(
+            tenant_dir.join("vm-stream.toml"),
+            format!(
+                r#"
+schema_version = 1
+bundle_id      = "acme/vm-stream"
+bundle_version = 1
+
+[network]
+[egress]
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+chain_signing = true
+stream_destinations = ["file://{}"]
+"#,
+                stream_path.display()
+            ),
+        )
+        .unwrap();
+
+        let rootfs_dir = tempfile::tempdir().unwrap();
+        let rootfs = write_rootfs(rootfs_dir.path(), b"stream-payload");
+        let ledger = InMemoryNonceLedger::new();
+        let sha = mvm_security::image_verify::sha256_file(&rootfs).unwrap();
+        let mut plan = admit_for_run(
+            &SynthesisInput {
+                vm_name: "vm-stream",
+                tenant: Some("acme"),
+                backend_name: "firecracker",
+                image_name: "vm-stream",
+                image_sha256: &sha,
+                image_cosign_bundle: None,
+                cpus: 1,
+                mem_mib: 128,
+                disk_mib: 0,
+                boot_timeout_secs: 60,
+                exec_timeout_secs: 0,
+                destroy_on_exit: true,
+                bundle_pin: None,
+                deps_volume: None,
+            },
+            &SystemClock,
+            &ledger,
+            Some(keys_dir.path()),
+            None,
+        )
+        .expect("admit")
+        .plan;
+        plan.network_policy = PolicyRef("acme:vm-stream".to_string());
+        plan.egress_policy = PolicyRef("acme:vm-stream".to_string());
+        plan.tool_policy = PolicyRef("acme:vm-stream".to_string());
+        plan.fs_policy = mvm_plan::FsPolicyRef("acme:vm-stream".to_string());
+
+        let resolved = resolve_policy_for_admission(&plan, Some(policy_dir.path()))
+            .expect("stream bundle resolves");
+        let signer = load_or_init_at(keys_dir.path()).expect("signer");
+        let vk = signer.signing.verifying_key();
+        let emitter = build_policy_audit_emitter(
+            signer.signing,
+            Some(audit_dir.path()),
+            resolved.audit.as_ref(),
+        )
+        .unwrap();
+        emitter.emit_admitted(&plan, "host:test").unwrap();
+        emit_policy_resolved(&plan, &emitter, resolved.slots_mode);
+
+        let default_path = audit_dir.path().join("acme.jsonl");
+        let default_content = std::fs::read_to_string(&default_path).unwrap();
+        let stream_content = std::fs::read_to_string(&stream_path).unwrap();
+        assert!(default_content.contains("plan.admitted"));
+        assert!(stream_content.contains("plan.admitted"));
+        assert_eq!(
+            mvm_supervisor::verify_audit_chain(&default_path, &vk).unwrap(),
+            2
+        );
+        assert_eq!(
+            mvm_supervisor::verify_audit_chain(&stream_path, &vk).unwrap(),
+            2
+        );
+    }
+
+    #[test]
+    fn admission_audits_rejected_unsigned_policy_audit() {
+        use mvm_plan::PolicyRef;
+        let keys_dir = tempfile::tempdir().unwrap();
+        let audit_dir = tempfile::tempdir().unwrap();
+        let policy_dir = tempfile::tempdir().unwrap();
+        let tenant_dir = policy_dir.path().join("acme");
+        std::fs::create_dir_all(&tenant_dir).unwrap();
+        std::fs::write(
+            tenant_dir.join("vm-unsigned-audit.toml"),
+            r#"
+schema_version = 1
+bundle_id      = "acme/vm-unsigned-audit"
+bundle_version = 1
+
+[network]
+[egress]
+[pii]
+[tool]
+[artifact]
+[keys]
+[audit]
+chain_signing = false
+"#,
+        )
+        .unwrap();
+
+        let rootfs_dir = tempfile::tempdir().unwrap();
+        let rootfs = write_rootfs(rootfs_dir.path(), b"unsigned-audit-payload");
+        let ledger = InMemoryNonceLedger::new();
+        let sha = mvm_security::image_verify::sha256_file(&rootfs).unwrap();
+        let mut plan = admit_for_run(
+            &SynthesisInput {
+                vm_name: "vm-unsigned-audit",
+                tenant: Some("acme"),
+                backend_name: "firecracker",
+                image_name: "vm-unsigned-audit",
+                image_sha256: &sha,
+                image_cosign_bundle: None,
+                cpus: 1,
+                mem_mib: 128,
+                disk_mib: 0,
+                boot_timeout_secs: 60,
+                exec_timeout_secs: 0,
+                destroy_on_exit: true,
+                bundle_pin: None,
+                deps_volume: None,
+            },
+            &SystemClock,
+            &ledger,
+            Some(keys_dir.path()),
+            None,
+        )
+        .expect("admit")
+        .plan;
+        plan.network_policy = PolicyRef("acme:vm-unsigned-audit".to_string());
+        plan.egress_policy = PolicyRef("acme:vm-unsigned-audit".to_string());
+        plan.tool_policy = PolicyRef("acme:vm-unsigned-audit".to_string());
+        plan.fs_policy = mvm_plan::FsPolicyRef("acme:vm-unsigned-audit".to_string());
+
+        let resolved = resolve_policy_for_admission(&plan, Some(policy_dir.path()))
+            .expect("bundle shape still resolves");
+        let signer = load_or_init_at(keys_dir.path()).expect("signer");
+        let err = match build_policy_audit_emitter(
+            signer.signing.clone(),
+            Some(audit_dir.path()),
+            resolved.audit.as_ref(),
+        ) {
+            Ok(_) => panic!("chain_signing=false must reject admission audit construction"),
+            Err(err) => err.context("opening audit chain emitter"),
+        };
+        let fallback = build_default_audit_emitter(signer.signing, Some(audit_dir.path())).unwrap();
+        emit_policy_audit_invalid(&plan, &fallback, &err);
+
+        let audit_path = audit_dir.path().join("acme.jsonl");
+        let content = std::fs::read_to_string(&audit_path).expect("audit file exists");
+        assert!(content.contains("plan.failed"));
+        assert!(content.contains("policy-audit-invalid"));
+        assert!(content.contains("chain_signing"));
     }
 
     #[test]
@@ -2384,9 +2641,7 @@ bundle_version = 1
         plan.tool_policy = PolicyRef("acme:nope".to_string());
         plan.fs_policy = mvm_plan::FsPolicyRef("acme:nope".to_string());
 
-        let signer = load_or_init_at(keys_dir.path()).expect("signer");
-        let emitter = AuditEmitter::with_dir(signer.signing, audit_dir.path()).unwrap();
-        let err = resolve_policy_for_admission(&plan, &emitter, Some(policy_dir.path()))
+        let err = resolve_policy_for_admission(&plan, Some(policy_dir.path()))
             .expect_err("missing bundle must fail");
         let msg = format!("{err:#}");
         assert!(
@@ -2394,6 +2649,9 @@ bundle_version = 1
             "error must name the missing bundle: {msg}"
         );
 
+        let signer = load_or_init_at(keys_dir.path()).expect("signer");
+        let emitter = AuditEmitter::with_dir(signer.signing, audit_dir.path()).unwrap();
+        emit_policy_resolve_failure(&plan, &emitter, &err);
         let audit_path = audit_dir.path().join("acme.jsonl");
         let content = std::fs::read_to_string(&audit_path).expect("audit file exists");
         assert!(
@@ -2466,9 +2724,7 @@ disabled_inspectors = ["ssrf_guarrd"]
         plan.tool_policy = PolicyRef("acme:vm-typo".to_string());
         plan.fs_policy = mvm_plan::FsPolicyRef("acme:vm-typo".to_string());
 
-        let signer = load_or_init_at(keys_dir.path()).expect("signer");
-        let emitter = AuditEmitter::with_dir(signer.signing, audit_dir.path()).unwrap();
-        let err = resolve_policy_for_admission(&plan, &emitter, Some(policy_dir.path()))
+        let err = resolve_policy_for_admission(&plan, Some(policy_dir.path()))
             .expect_err("typo must fail");
         let msg = format!("{err:#}");
         assert!(
@@ -2476,6 +2732,9 @@ disabled_inspectors = ["ssrf_guarrd"]
             "error must name the typo: {msg}"
         );
 
+        let signer = load_or_init_at(keys_dir.path()).expect("signer");
+        let emitter = AuditEmitter::with_dir(signer.signing, audit_dir.path()).unwrap();
+        emit_policy_resolve_failure(&plan, &emitter, &err);
         let audit_path = audit_dir.path().join("acme.jsonl");
         let content = std::fs::read_to_string(&audit_path).expect("audit file exists");
         assert!(
@@ -2554,9 +2813,7 @@ port_hi  = 443
         plan.tool_policy = PolicyRef("acme:vm-bad".to_string());
         plan.fs_policy = mvm_plan::FsPolicyRef("acme:vm-bad".to_string());
 
-        let signer = load_or_init_at(keys_dir.path()).expect("signer");
-        let emitter = AuditEmitter::with_dir(signer.signing, audit_dir.path()).unwrap();
-        let err = resolve_policy_for_admission(&plan, &emitter, Some(policy_dir.path()))
+        let err = resolve_policy_for_admission(&plan, Some(policy_dir.path()))
             .expect_err("bad CIDR must fail");
         let msg = format!("{err:#}");
         assert!(
@@ -2564,6 +2821,9 @@ port_hi  = 443
             "error must name the bad CIDR: {msg}"
         );
 
+        let signer = load_or_init_at(keys_dir.path()).expect("signer");
+        let emitter = AuditEmitter::with_dir(signer.signing, audit_dir.path()).unwrap();
+        emit_policy_resolve_failure(&plan, &emitter, &err);
         let audit_path = audit_dir.path().join("acme.jsonl");
         let content = std::fs::read_to_string(&audit_path).expect("audit file exists");
         assert!(
