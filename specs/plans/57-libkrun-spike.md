@@ -138,6 +138,38 @@ libkrun is a library, not a daemon. `krun_start_enter` blocks the calling thread
 - **W4.2** Wire `LibkrunBackend::start()` to spawn the supervisor via `std::process::Command::new(supervisor_path())`, pipe the config JSON to stdin, and return. `LibkrunBackend::stop()` reads the PID file and signals (SIGTERM, optionally promoted via shutdown_eventfd). `list()` walks `~/.mvm/vms/*/libkrun.pid`. `stop_all()` iterates the same walk.
 - **W4.3** Add an integration test that spawns the supervisor on the W3 dev artifacts, connects a `UnixStream` to the bound vsock listener, and waits for libkrun to proxy a single byte. This is the missing W3.3 health-check that the spike couldn't run in-process.
 
+  #### W4.3 progress (2026-05-13)
+
+  Shipped scoped to **production stop-path validation** rather than the originally-stated vsock proxy byte. The pivot:
+
+  - A clean shutdown driven from inside the guest needs either `/sbin/poweroff` (absent from the dev rootfs at `~/.mvm/dev/current/`) or a tiny custom `init` that AF_VSOCK-binds and exits. Neither artifact exists yet.
+  - The path users actually hit — `mvmctl stop <vm>` → `LibkrunBackend::stop` → `SIGTERM` (then `SIGKILL` after 5s) — works against the broken dev init regardless: the supervisor process is signaled directly, libkrun's blocking thread dies with it, the kernel guest is torn down.
+
+  The new test in `crates/mvm-backend/tests/libkrun_lifecycle_e2e.rs`:
+
+  1. `#[ignore = "live libkrun boot — opt in via MVM_LIBKRUN_E2E=1"]` so cargo's default run skips it.
+  2. Self-asserts that `MVM_LIBKRUN_E2E=1` is set **and** `~/.mvm/dev/current/{vmlinux,rootfs.ext4}` both exist; panics with an actionable message otherwise.
+  3. Builds a `VmStartConfig`, calls `LibkrunBackend::start`, polls `status()` for `Running` (timeout 10s).
+  4. Calls `LibkrunBackend::stop`, polls `status()` for `Stopped` (timeout 10s).
+  5. Asserts the PID file is gone and `list()` no longer includes the VM.
+
+  Verified twice locally: 5.14s and 5.41s wall-time, fully green. The 5s floor is the SIGTERM-to-SIGKILL escalation in `LibkrunBackend::stop` — libkrun doesn't appear to install a SIGTERM handler that triggers a clean `krun_start_enter` return, so the production stop path always pays one SIGTERM timeout. Folding `krun_get_shutdown_eventfd` into the stop path would close that gap; tracked as a follow-up since it's an optimization, not a correctness gap.
+
+  **What W4.3 still doesn't validate** (deferred, no PR scoped yet):
+
+  - The host → libkrun → guest AF_VSOCK proxy byte. Needs a guest that AF_VSOCK-binds on `GUEST_AGENT_PORT`. The simplest path is a small static binary baked into a minimal test initramfs; the libkrun upstream has `init/init.c` as a template. Cross-compiling from macOS to aarch64-linux-musl is the friction, which is why this is a separate PR rather than the same one.
+
+  To run locally:
+
+  ```sh
+  cargo build -p mvm-libkrun --bin mvm-libkrun-supervisor --features libkrun-sys
+  MVM_LIBKRUN_E2E=1 \
+    MVM_LIBKRUN_SUPERVISOR_PATH=$(pwd)/target/debug/mvm-libkrun-supervisor \
+    cargo test -p mvm-backend --test libkrun_lifecycle_e2e -- --ignored --nocapture
+  ```
+
+  CI doesn't run this lane: GitHub macOS runners don't expose `Hypervisor.framework` to user processes, so `krun_start_enter` can't actually boot. The existing `libkrun-macos` lane (W5) is the build/test gate; this integration test is for local-dev validation and self-hosted-runner future expansion.
+
 ### W5 — CI lanes (0.5–1 day)
 
 Goal: regression coverage on every PR.
