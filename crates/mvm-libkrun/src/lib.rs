@@ -172,6 +172,33 @@ pub struct KrunDisk {
     pub read_only: bool,
 }
 
+/// A virtio-fs share: a host directory exported into the guest under
+/// a symbolic `tag` that the guest mounts via the `virtiofs` filesystem
+/// type. libkrun wraps the `virtiofsd` daemon internally — callers
+/// declare the share here and libkrun handles the daemon lifecycle.
+///
+/// Plan 72 W4 uses three of these per builder VM invocation:
+///
+/// - `tag = "work"`  → workspace bind (read-only at the guest mount)
+/// - `tag = "out"`   → artifact dir (read-write)
+/// - `tag = "job"`   → per-build job dir with `cmd.sh` / `env` / `result`
+///
+/// Read/write semantics at the guest are controlled by `mount` flags
+/// inside the guest (`mvm-builder-init` mounts each tag with the
+/// right flags); libkrun's `krun_add_virtiofs` does not currently
+/// expose a `readonly` toggle on the host side.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct KrunVirtioFs {
+    /// Symbolic identifier the guest references in `mount -t virtiofs
+    /// <tag> <target>`. ASCII letters / digits / dash / underscore;
+    /// libkrun passes it as a C string so interior NUL bytes are
+    /// rejected at [`start_enter`] time.
+    pub tag: String,
+    /// Host directory to export. Must exist before [`start_enter`]
+    /// runs (libkrun's daemon resolves it eagerly).
+    pub host_path: String,
+}
+
 /// Configuration for a libkrun guest VM.
 ///
 /// Pure data — no I/O until [`start`] / [`start_enter`] consume it.
@@ -192,6 +219,13 @@ pub struct KrunContext {
     /// dev-VM builder VM uses one entry for the Nix-store overlay
     /// disk (`MVM_NIX_STORE_DISK`).
     pub extra_disks: Vec<KrunDisk>,
+    /// virtio-fs shares the host exports into the guest. Plan 72
+    /// W4's builder VM declares three of these (`work` / `out` /
+    /// `job`); the runtime backend doesn't use any today.
+    /// libkrun manages the in-process `virtiofsd` daemon for each
+    /// entry. See [`KrunVirtioFs`] for the per-share contract.
+    #[serde(default)]
+    pub virtio_fs_mounts: Vec<KrunVirtioFs>,
     /// When `Some`, libkrun routes the guest's hvc0 console to this
     /// host path (a regular file, FIFO, or device). When `None`, the
     /// console writes inherit the calling process's stdout (the
@@ -231,6 +265,7 @@ impl KrunContext {
             kernel_cmdline: None,
             vsock_ports: Vec::new(),
             extra_disks: Vec::new(),
+            virtio_fs_mounts: Vec::new(),
             console_output_path: None,
             vsock_socket_dir: None,
         }
@@ -283,6 +318,17 @@ impl KrunContext {
             id: id.into(),
             path: path.into(),
             read_only,
+        });
+        self
+    }
+
+    /// Declare a virtio-fs share. The guest mounts it via
+    /// `mount -t virtiofs <tag> <target>`. Plan 72 W4's builder
+    /// VM uses this for `/work`, `/out`, `/job`.
+    pub fn add_virtio_fs(mut self, tag: impl Into<String>, host_path: impl Into<String>) -> Self {
+        self.virtio_fs_mounts.push(KrunVirtioFs {
+            tag: tag.into(),
+            host_path: host_path.into(),
         });
         self
     }
@@ -357,6 +403,12 @@ fn configure(ctx: &KrunContext) -> Result<sys::Context, Error> {
     krun.add_disk("root", Path::new(&ctx.rootfs_path), false)?;
     for disk in &ctx.extra_disks {
         krun.add_disk(&disk.id, Path::new(&disk.path), disk.read_only)?;
+    }
+    // virtio-fs shares (Plan 72 W4): each entry becomes a
+    // `mount -t virtiofs <tag>` target inside the guest. libkrun
+    // spawns one virtiofsd daemon per share internally.
+    for mount in &ctx.virtio_fs_mounts {
+        krun.add_virtiofs(&mount.tag, Path::new(&mount.host_path))?;
     }
     // libkrun's vsock model — refined by plan 57 W4 after a closer
     // read of `libkrun.h`:
@@ -615,6 +667,58 @@ mod tests {
         assert_ne!(a, b);
         assert!(a.file_name().unwrap().to_string_lossy().contains("5252"));
         assert!(b.file_name().unwrap().to_string_lossy().contains("5253"));
+    }
+
+    /// Plan 72 W4 needs three virtio-fs shares per builder VM
+    /// invocation (`work`, `out`, `job`). Builder method appends
+    /// in the order called; serde roundtrips preserve order.
+    #[test]
+    fn add_virtio_fs_appends_in_order() {
+        let ctx = KrunContext::new("vm-1", "/k", "/r")
+            .add_virtio_fs("work", "/host/workspace")
+            .add_virtio_fs("out", "/host/artifacts")
+            .add_virtio_fs("job", "/host/job-123");
+        assert_eq!(ctx.virtio_fs_mounts.len(), 3);
+        assert_eq!(ctx.virtio_fs_mounts[0].tag, "work");
+        assert_eq!(ctx.virtio_fs_mounts[0].host_path, "/host/workspace");
+        assert_eq!(ctx.virtio_fs_mounts[1].tag, "out");
+        assert_eq!(ctx.virtio_fs_mounts[2].tag, "job");
+    }
+
+    /// `virtio_fs_mounts` defaults to empty when deserializing a
+    /// `KrunContext` payload produced before this field existed
+    /// (`#[serde(default)]`). Backwards-compatible JSON for the
+    /// `SupervisorConfig` pipe.
+    #[test]
+    fn virtio_fs_mounts_deserializes_default_when_absent() {
+        let json = r#"{
+            "name": "vm-1",
+            "kernel_path": "/k",
+            "rootfs_path": "/r",
+            "vcpus": 1,
+            "ram_mib": 256,
+            "kernel_cmdline": null,
+            "vsock_ports": [],
+            "extra_disks": [],
+            "console_output_path": null,
+            "vsock_socket_dir": null
+        }"#;
+        let ctx: KrunContext = serde_json::from_str(json).unwrap();
+        assert!(ctx.virtio_fs_mounts.is_empty());
+    }
+
+    /// Roundtrip with virtio-fs entries populated — the JSON shape
+    /// the Plan 72 W4 supervisor pipe will carry.
+    #[test]
+    fn virtio_fs_mounts_roundtrip_through_json() {
+        let ctx = KrunContext::new("vm-1", "/k", "/r")
+            .add_virtio_fs("work", "/host/workspace")
+            .add_virtio_fs("out", "/host/artifacts");
+        let json = serde_json::to_string(&ctx).unwrap();
+        assert!(json.contains("\"virtio_fs_mounts\""));
+        let back: KrunContext = serde_json::from_str(&json).unwrap();
+        assert_eq!(back.virtio_fs_mounts.len(), 2);
+        assert_eq!(back.virtio_fs_mounts[1].host_path, "/host/artifacts");
     }
 
     #[test]
