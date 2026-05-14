@@ -3,7 +3,9 @@ title: Writing Nix Flakes
 description: Create custom Nix flakes that build microVM images for mvm.
 ---
 
-mvmctl uses Nix flakes to produce reproducible microVM images. Each build runs `nix build` inside the Linux build environment (a libkrun-backed builder VM on macOS, the host shell on Linux with `/dev/kvm`), producing a kernel and rootfs. The same rootfs works on all backends (Firecracker, Apple Container, libkrun).
+mvmctl uses Nix flakes to produce reproducible microVM images. You run `mvmctl build` from the host, and mvm runs Nix evaluation and `nix build` inside the Linux builder VM. The result is a kernel and rootfs that can boot on any supported runtime backend, including Firecracker, Apple Virtualization, and libkrun.
+
+You do not need to enter a dev shell to build a flake. The dev shell is only for manually debugging the Linux build environment. See [Builder VM](/guides/builder-vm/) for the full host-vs-builder model.
 
 ## Minimal Flake
 
@@ -258,11 +260,11 @@ All three helpers return the same shape: `{ package, service, healthCheck }`. Th
 
 When you run `mvmctl build --flake .`:
 
-1. The flake is copied into the Linux build environment (builder VM on macOS, native on Linux with `/dev/kvm`)
-2. `nix build` runs inside that environment
-3. The resulting closure is packed into the rootfs
-4. Kernel and rootfs artifacts are cached
-5. Subsequent builds with unchanged `flake.lock` reuse the cache
+1. The host CLI reads config and stages the selected flake/profile as a builder job.
+2. The builder VM runs Nix evaluation and `nix build` in Linux.
+3. The resulting closure is packed into the rootfs.
+4. Kernel and rootfs artifacts are copied back to the host cache.
+5. Runtime commands boot those already-built artifacts on the selected backend.
 
 The same rootfs works on all backends (Firecracker, Apple Container, microvm.nix, Docker).
 

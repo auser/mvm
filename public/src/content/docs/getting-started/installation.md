@@ -53,7 +53,7 @@ mvmctl automatically detects your platform at startup and selects the best VM ba
 | **Linux without `/dev/kvm`** | Docker | Tier 3 fallback when no microVM backend is available. |
 | **Docker available** | Docker | Tier 3 container fallback. Used only if no hypervisor backend works. |
 
-You don't need Nix on the host. On first build, mvm resolves a Linux builder microVM, runs `nix build` inside it, and extracts the rootfs back. Host-side Nix is not part of the managed `mvmctl` path.
+You don't need Nix on the host. On first build, mvm bootstraps or reuses a Linux builder VM, runs Nix evaluation and `nix build` inside it, and extracts the rootfs back. You run `mvmctl build` from the host; you do not need to enter a dev shell first. See [Builder VM](/guides/builder-vm/) for the full model.
 
 ### First-Time Setup
 

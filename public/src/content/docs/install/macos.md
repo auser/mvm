@@ -48,11 +48,13 @@ cargo install mvmctl
 
 ## Linux Builds On macOS
 
-macOS Nix can't build Linux derivations natively. mvm routes Linux builds through the project builder VM so the host does not need to build Linux artifacts directly.
+macOS Nix can't build Linux derivations natively, and most Mac users don't have Nix installed at all. mvm handles both cases **without requiring host-side configuration**: on `mvmctl build`, the host CLI stages the selected flake as a builder job, the Linux builder VM runs `nix build`, and mvm copies the resulting kernel/rootfs artifacts back to the host cache. See [Builder VM](/guides/builder-vm/) for the full control-plane flow.
 
-### Optional: Host-Side Nix For Contributors
+The builder VM is separate from the runtime VM. After the build completes, `mvmctl up --hypervisor apple-container` boots the already-built runtime image with Apple Virtualization. The build phase and boot phase can be benchmarked separately.
 
-Most users skip this section. You may want host-side Nix if you're contributing to mvm itself, want a shared `/nix/store` for your editor's build commands, or already run `nix-darwin` for unrelated reasons. This is not part of the `mvmctl` runtime path.
+### Optional: host-side Nix for power users
+
+Most users skip this section. You may want host-side Nix if you're contributing to mvm itself, want Nix for editor tooling, or already run `nix-darwin` for unrelated reasons. Host-side Nix is not required by `mvmctl build`; the builder VM remains the Linux build boundary for mvm images.
 
 [Determinate Nix](https://determinate.systems/posts/determinate-nix-installer) is the easiest path:
 
@@ -60,7 +62,7 @@ Most users skip this section. You may want host-side Nix if you're contributing 
 curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
 ```
 
-If you configure [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary), use it for your own host-side commands; mvm's managed build path continues to run inside the project builder VM.
+If you configure [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary), it can be useful for direct `nix build` commands that you run yourself. It is not required for `mvmctl build`.
 
 ## Verify
 
@@ -78,13 +80,13 @@ mvmctl init
 mvmctl run
 ```
 
-`mvmctl init` scaffolds the project. On first `mvmctl run`, mvm bootstraps the builder microVM if needed, runs `nix build` inside it, and boots the resulting rootfs.
+`mvmctl init` scaffolds the project. On first `mvmctl run`, mvm bootstraps the builder VM if needed, runs `nix build` inside it, and boots the resulting rootfs with the selected macOS runtime backend. Expected runtime cold boot is measured after the image is already built; the first build may also pay a one-time builder-image fetch.
 
 ## Troubleshooting
 
 **"Hypervisor.framework: entitlement missing"** — re-codesign the binary with the entitlement: `codesign --entitlements resources/mvmctl.entitlements -f -s - ~/.local/bin/mvmctl`. The release binary ships pre-signed; this only matters if you've stripped entitlements or built from source without the build script's signing step.
 
-**`nix build` fails with "a 'x86_64-linux' with features … is required"** — the macOS host is trying to build Linux derivations directly. Use the project builder VM path, or configure [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) for editor-side workflows.
+**`nix build` fails with "a 'x86_64-linux' with features … is required"** — that is a direct host-side Nix command failing because macOS cannot build Linux derivations by itself. Use `mvmctl build --flake .` so the Linux build runs inside the builder VM. If you intentionally want direct `nix build` on macOS, configure [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary).
 
 **`mvmctl run` boots but `mvmctl console` fails to attach** — the `console` subcommand is only enabled for *accessible* images. If your `entrypoint.command = [ ... ]`, the build is *sealed* and console attach is rejected. Switch to `entrypoint.shell = "/bin/sh"` or pass `dev = true` in your `mkGuest` call. See [Building MicroVM Images](/guides/building-microvm-images).
 

@@ -51,13 +51,22 @@ mvmctl build              # reads mvm.toml; builds the named flake target
 mvmctl run                # builds (if needed) + boots
 ```
 
-`mvmctl` selects the backend automatically (Firecracker on Linux+KVM, libkrun on macOS / Linux without KVM). Override with `--hypervisor libkrun` if you want to force the cross-platform path.
+`mvmctl build` is a host command. You run it from macOS or Linux, and mvm sends the Linux-only Nix work into the builder VM. You do not need to enter `mvmctl dev shell` first. The shell is for debugging the build environment manually, not a prerequisite for normal builds.
+
+`mvmctl` selects the runtime backend automatically when you boot the finished image. Use `--hypervisor` on runtime commands when you want to force a specific runtime backend:
+
+```sh
+mvmctl up --flake . --hypervisor apple-container
+mvmctl up --flake . --hypervisor firecracker
+```
 
 If you want to drive `nix build` directly without `mvmctl` in the loop:
 
 ```sh
 nix build .#default
 ```
+
+That direct Nix command is only for users who intentionally manage their own Nix environment. It bypasses mvm's builder VM orchestration and is not required for the normal workflow. See [Builder VM](/guides/builder-vm/) for the detailed build boundary.
 
 ## What `mkGuest` accepts
 
@@ -184,10 +193,10 @@ nix flake check --no-build
 
 ## Cross-platform notes
 
-mvm bootstraps a Linux builder microVM on first build (libkrun-backed; see [ADR-013 §"Linux builder via libkrun"](/contributing/adr/013-libkrun-pivot/)) and runs `nix build` inside it. You don't need host-side Nix.
+mvm runs Nix builds inside the project builder VM and copies the finished kernel/rootfs artifacts back to the host cache. You don't need host-side Nix, and you don't need to enter a dev shell before building.
 
-- **Linux**: the builder microVM runs on Firecracker against `/dev/kvm`. Firecracker is also the default runtime backend. If you've opted into host-side Nix and it can build Linux derivations, mvm uses it directly and skips the builder VM.
-- **macOS**: the builder microVM runs on libkrun via Hypervisor.framework. The resulting microVM is then booted on the same backend. If you already have [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) or a remote `nix-daemon` configured, mvm detects and uses it instead.
+- **Linux**: the builder VM provides the Linux build boundary and cache policy. Firecracker is the default runtime backend when `/dev/kvm` is available.
+- **macOS**: the host `mvmctl build` command orchestrates a Linux builder VM. The resulting runtime image can then boot with Apple Virtualization (`--hypervisor apple-container`) or another available macOS runtime backend.
 - **Windows**: Tauri-only (the `mvm-studio` desktop app packages a WSL2-backed builder + runtime). See [ADR-031](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/031-cross-platform-strategy.md).
 
 ## Rootless workloads

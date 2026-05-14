@@ -21,7 +21,7 @@ macOS:          mvmctl up  -->  libkrun microVM (Hypervisor.framework)
 Docker:         mvmctl up  -->  Docker container (Tier 3 fallback)
 ```
 
-All backends consume the same Nix-built ext4 rootfs. Override auto-detection with `--hypervisor`:
+All backends consume the same Nix-built ext4 rootfs. The rootfs is built through the builder VM first, then booted by the selected runtime backend. Override runtime auto-detection with `--hypervisor`:
 
 ```bash
 mvmctl up --flake . --hypervisor apple-container
@@ -101,8 +101,8 @@ Where Linux commands run. Defined in `mvm-core`:
 - `run_capture()` -- run and capture both stdout and stderr
 
 Implementations:
-- **`BuilderVmEnv`** -- delegates commands into the libkrun/libkrun builder VM (macOS hosts)
-- **`NativeEnv`** -- runs commands directly (Linux with `/dev/kvm`)
+- **`BuilderVmEnv`** -- delegates Linux-only build work into the project builder VM
+- **`NativeEnv`** -- runs Linux commands directly where the host itself is the Linux execution boundary
 
 ### ShellEnvironment
 
@@ -136,7 +136,7 @@ Extends `ShellEnvironment` for fleet orchestration:
 
 ## How It Works
 
-At startup, mvmctl detects the platform and selects the appropriate backend:
+At startup, mvmctl detects the platform and selects the appropriate runtime backend:
 
 1. **Native Linux with `/dev/kvm`** -- uses `FirecrackerBackend` for runtime VM lifecycle
 2. **macOS 26+ Apple Silicon** -- uses `AppleContainerBackend` for dev/runtime VM lifecycle; Nix builds run inside the libkrun-backed builder VM
@@ -154,12 +154,14 @@ Host (macOS Apple Silicon / native Linux KVM)
 
 ## Build Pipeline
 
-`mvmctl build` and `mvmctl template build` invoke `nix build` inside the Linux environment, producing:
+`mvmctl build` and `mvmctl template build` are host commands that stage a build job for the builder VM. The builder VM invokes `nix build` inside Linux, producing:
 
 - **vmlinux** -- Firecracker-compatible kernel
 - **rootfs.ext4** or **rootfs.squashfs** -- guest root filesystem
 
 No initrd is needed -- the kernel boots directly into a busybox init script on the rootfs.
+
+The builder VM is not the runtime VM. Runtime commands such as `mvmctl up`, `mvmctl run`, and boot benchmarks consume the finished artifacts from the host cache. See [Builder VM](/guides/builder-vm/) for the detailed control-plane flow.
 
 ## Platform Support
 
