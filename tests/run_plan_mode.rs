@@ -12,14 +12,13 @@
 //!
 //! 1. `mvmctl run --mode plan <script>` admits a clean recording
 //!    and exits zero. ADMITTED lines hit stdout.
-//! 2. `mvmctl run --dev <script>` bails with the "blocked, pairs
-//!    with Followup H-live" message and a nonzero exit.
-//! 3. `mvmctl run --prod <script>` redirects users to
+//! 2. `mvmctl run --prod <script>` redirects users to
 //!    `mvmctl compile` with a nonzero exit and a clear pointer.
-//! 4. `mvmctl run --mode plan` over a script that produces a
-//!    Workload with a too-short SHA (we force-feed one via
-//!    `MVM_SDK_OUT_PATH` pointed at a hand-built recording) is
-//!    rejected by admission with a nonzero exit.
+//! 3. `mvmctl run --mode plan` over a non-script path is rejected
+//!    with the language-extension hint.
+//!
+//! The `--dev` alias and `--mode live` happy paths are exercised
+//! in `tests/run_live_mode.rs` post-Followup-H-live.
 //!
 //! Skips when no `python3`/`python` is on PATH.
 
@@ -111,31 +110,6 @@ fn run_plan_mode_admits_clean_recording_and_exits_zero() {
 }
 
 #[test]
-fn run_dev_alias_is_blocked_with_followup_h_live_message() {
-    let tmp = TempDir::new().unwrap();
-    let script = tmp.path().join("hello.py");
-    std::fs::write(&script, "print('noop')\n").unwrap();
-
-    let home = TempDir::new().unwrap();
-    let output = mvmctl_run_plan_cmd(home.path())
-        .arg("run")
-        .arg("--dev")
-        .arg(&script)
-        .output()
-        .expect("spawn mvmctl run --dev");
-
-    assert!(
-        !output.status.success(),
-        "mvmctl run --dev must fail nonzero in v1"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Followup H-live") || stderr.contains("blocked"),
-        "expected --dev to bail with a 'pairs with Followup H-live' hint; stderr was:\n{stderr}"
-    );
-}
-
-#[test]
 fn run_prod_alias_redirects_to_mvmctl_compile() {
     let tmp = TempDir::new().unwrap();
     let script = tmp.path().join("hello.py");
@@ -157,32 +131,6 @@ fn run_prod_alias_redirects_to_mvmctl_compile() {
     assert!(
         stderr.contains("mvmctl compile"),
         "--prod must redirect users to `mvmctl compile`; stderr was:\n{stderr}"
-    );
-}
-
-#[test]
-fn run_mode_live_bails_blocked_on_followup_h_live() {
-    let tmp = TempDir::new().unwrap();
-    let script = tmp.path().join("hello.py");
-    std::fs::write(&script, "print('noop')\n").unwrap();
-
-    let home = TempDir::new().unwrap();
-    let output = mvmctl_run_plan_cmd(home.path())
-        .arg("run")
-        .arg("--mode")
-        .arg("live")
-        .arg(&script)
-        .output()
-        .expect("spawn mvmctl run --mode live");
-
-    assert!(
-        !output.status.success(),
-        "mvmctl run --mode live must fail in v1"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("Followup H-live") || stderr.contains("blocked"),
-        "expected --mode live to bail with a Followup H-live hint; stderr was:\n{stderr}"
     );
 }
 

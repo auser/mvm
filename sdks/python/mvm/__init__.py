@@ -64,8 +64,11 @@ from mvm._dsl import (
 )
 from mvm._sandbox import (
     DEFAULT_TTL_SECONDS,
+    MVM_CLI_BIN_ENV,
     RecordingNotActiveError,
     Sandbox,
+    SandboxDevOnly,
+    SandboxLiveError,
     SandboxModeError,
     current_recording_dict,
     emit_recording_json,
@@ -75,6 +78,7 @@ from mvm._session import current_session_id
 
 __all__ = [
     "DEFAULT_TTL_SECONDS",
+    "MVM_CLI_BIN_ENV",
     "SCHEMA_VERSION",
     "EmittingContextError",
     "MsgpackUnavailable",
@@ -85,6 +89,8 @@ __all__ = [
     "RemoteError",
     "RemoteFunction",
     "Sandbox",
+    "SandboxDevOnly",
+    "SandboxLiveError",
     "SandboxModeError",
     "SecretInArgError",
     "SecretInArgWarning",
