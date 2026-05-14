@@ -306,35 +306,18 @@ pub fn dev_build(
         });
     }
 
-    // W7.x.2 dispatch: if the `env` channel has `nix` on PATH, run
-    // the build there (host on Linux+host-Nix, Apple Container dev
-    // VM on macOS 26+, etc.). Otherwise spawn a microsandbox builder
-    // sandbox — the path that brings `mvmctl build` to macOS Intel /
-    // pre-26 / no-KVM Linux without host Nix.
+    // If the `env` channel has `nix` on PATH, run the build there
+    // (host on Linux+host-Nix, Apple Container dev VM on macOS 26+,
+    // etc.). Without Nix, fail closed; the old microsandbox fallback
+    // was removed because its Rust crate vendors SeaORM / SQLx.
     if !env_has_nix(env) {
-        #[cfg(feature = "contributor-bootstrap")]
-        {
-            env.log_info(
-                "No `nix` available through the current shell environment — \
-                 falling back to the microsandbox builder VM.",
-            );
-            return dev_build_via_microsandbox(env, flake_ref, profile, mode);
-        }
-        #[cfg(not(feature = "contributor-bootstrap"))]
-        {
-            // The microsandbox-backed builder is the only fallback for
-            // hosts without local `nix`; gating it out means there's no
-            // path to satisfy the build. Bail with a pointer to the two
-            // recoveries the user has from here (install host Nix, or
-            // rebuild with the feature on).
-            let _ = (env, flake_ref, profile, mode);
-            anyhow::bail!(
-                "No `nix` on PATH and the microsandbox builder backend was \
-                 compiled out (feature `contributor-bootstrap` disabled). \
-                 Install host Nix (Determinate Nix or upstream) or rebuild \
-                 with `--features contributor-bootstrap`."
-            );
-        }
+        let _ = (env, flake_ref, profile, mode);
+        anyhow::bail!(
+            "No `nix` on PATH and the microsandbox builder backend has been \
+             removed from this build to keep SeaORM / SQLx database crates out \
+             of the dependency graph. Install host Nix (Determinate Nix or \
+             upstream) or use the libkrun builder VM path."
+        );
     }
 
     // Honour the host-side GC sentinel before any new build work
@@ -577,7 +560,7 @@ fn env_has_nix(env: &dyn ShellEnvironment) -> bool {
 /// `dev_build` doesn't have to special-case `BuilderVmError`
 /// variants. The error messages already point at recovery paths
 /// (install host Nix, configure nix-darwin's `linux-builder`).
-#[cfg(feature = "contributor-bootstrap")]
+#[cfg(any())]
 fn dev_build_via_microsandbox(
     env: &dyn ShellEnvironment,
     flake_ref: &str,
@@ -1439,7 +1422,7 @@ mod tests {
         assert!(!env_has_nix(&env));
     }
 
-    #[cfg(feature = "contributor-bootstrap")]
+    #[cfg(any())]
     #[test]
     fn dev_build_falls_back_to_builder_vm_when_nix_missing() {
         // When `env_has_nix` returns false, `dev_build` routes through
@@ -1464,12 +1447,11 @@ mod tests {
         );
     }
 
-    #[cfg(not(feature = "contributor-bootstrap"))]
     #[test]
-    fn dev_build_bails_clearly_when_nix_missing_and_microsandbox_disabled() {
-        // Without `contributor-bootstrap`, `dev_build` has no fallback
-        // when host nix is unavailable. The bail must name the disabled
-        // feature so the user knows what knob to flip.
+    fn dev_build_bails_clearly_when_nix_missing_and_microsandbox_removed() {
+        // The upstream microsandbox Rust crate is intentionally absent
+        // from this workspace, so `dev_build` has no fallback when host
+        // nix is unavailable.
         let env = TestEnv::new();
         env.stub_stdout("nix --version", "");
         let result = dev_build(
@@ -1481,8 +1463,8 @@ mod tests {
         let err = result.expect_err("must bail when no nix and no fallback");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("contributor-bootstrap"),
-            "bail must name the feature: {msg}"
+            msg.contains("microsandbox builder backend has been removed"),
+            "bail must name the removed fallback: {msg}"
         );
     }
 

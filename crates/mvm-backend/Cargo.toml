@@ -48,13 +48,6 @@ anyhow.workspace = true
 # to current exe, fall back to PATH lookup).
 libc.workspace = true
 which.workspace = true
-# microsandbox pulls sqlx-sqlite -> libsqlite3-sys (links = "sqlite3"),
-# which collides with library consumers that already link sqlite via a
-# different libsqlite3-sys version (notably mvmd-gateway's rusqlite per
-# its ADR-0003). Gating the dep on `contributor-bootstrap` lets those
-# consumers skip the collision in lean builds. The backend remains available
-# via `--features contributor-bootstrap`.
-microsandbox = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
@@ -67,9 +60,11 @@ tracing.workspace = true
 mvm-build.workspace = true
 
 [features]
-# Heavy microsandbox support is opt-in for lean default builds.
+# Compatibility feature kept for older contributor commands. It no longer
+# enables the upstream Rust microsandbox crate because that crate vendors
+# SeaORM / SQLx database dependencies.
 default = []
-contributor-bootstrap = ["dep:microsandbox"]
+contributor-bootstrap = []
 
 [lints]
 workspace = true

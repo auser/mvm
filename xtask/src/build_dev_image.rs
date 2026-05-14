@@ -3,24 +3,11 @@
 //! `nix/images/dev-prebuilt/<arch>/{vmlinux, rootfs.ext4,
 //! checksums-sha256.txt}`.
 //!
-//! ## Self-bootstrapping — no host Nix required
+//! ## Status
 //!
-//! The task does **not** shell out to a host `nix` binary. Instead it
-//! drives [`mvm_build::builder_vm::MicrosandboxBuilderVm`] — the same
-//! microsandbox-backed Linux builder that `mvmctl build` uses to build
-//! user microVM images. That sandbox spawns `docker.io/nixos/nix:2.24.10`
-//! via Apple Virtualization Framework / libkrun (macOS) or KVM (Linux),
-//! bind-mounts the workspace at `/work`, and runs `nix build` *inside*
-//! the sandbox. The host needs zero Nix install — `mvmctl` ships
-//! microsandbox in-binary and microsandbox pulls the public
-//! `nixos/nix:2.24.10` image once.
-//!
-//! Net effect: on a fresh macOS 26+ Apple Silicon host with nothing
-//! installed but `mvmctl`, `cargo xtask build-dev-image` produces a
-//! working dev VM image. After it runs once, the image lives in the
-//! vendored slot and `mvmctl dev up` boots from there at the highest-
-//! precedence layer of `ensure_dev_image`'s cascade — so subsequent
-//! starts don't even need microsandbox or network reachability.
+//! The legacy implementation drove the upstream Rust microsandbox crate.
+//! That crate vendors SeaORM / SQLx database dependencies, so the path is
+//! intentionally disabled until the libkrun builder can own this xtask.
 //!
 //! ## Contract
 //!
@@ -39,12 +26,8 @@
 //! which is the highest-precedence path in `ensure_dev_image` for
 //! source-checkout users.
 
-use anyhow::{Context, Result};
-use std::path::{Path, PathBuf};
-
-use mvm_build::builder_vm::{
-    BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, BuilderVm, MicrosandboxBuilderVm,
-};
+use anyhow::Result;
+use std::path::Path;
 
 /// Parse `cargo xtask build-dev-image [--arch <arch>]` and dispatch.
 pub fn run(args: &[String], workspace: &Path) -> Result<()> {
@@ -71,10 +54,10 @@ pub fn run(args: &[String], workspace: &Path) -> Result<()> {
 const HELP_TEXT: &str = "\
 Usage: cargo xtask build-dev-image [--arch <arch>]
 
-Builds the dev VM image inside a microsandbox-managed Linux sandbox
-(via Apple Virtualization Framework / libkrun on macOS, KVM on Linux)
-and copies vmlinux + rootfs.ext4 + checksums into
-nix/images/dev-prebuilt/<arch>/. No host Nix install required.
+Builds the dev VM image into nix/images/dev-prebuilt/<arch>/.
+
+This path is currently disabled because its legacy microsandbox
+implementation pulled SeaORM / SQLx database crates into the workspace.
 
 Args:
   --arch <arch>   Target architecture (aarch64 or x86_64).
@@ -82,11 +65,7 @@ Args:
                   (aarch64-darwin → aarch64, x86_64-linux → x86_64, etc.).
 
 Prerequisites:
-  - macOS 26+ on Apple Silicon, or Linux with KVM.
-  - Network reachability to docker.io (first run pulls nixos/nix:2.24.10;
-    subsequent runs are cached).
-  - The flake at nix/images/builder/flake.nix exposes
-    packages.<arch>-linux.default with vmlinux + rootfs.ext4 in $out.
+  - A replacement libkrun-backed implementation.
 ";
 
 /// Map the host arch to the matching Linux-system identifier used by
@@ -108,182 +87,18 @@ fn validate_arch(arch: &str) -> Result<()> {
 }
 
 fn build_and_install(workspace: &Path, arch: &str) -> Result<()> {
-    let flake_nix = workspace
-        .join("nix")
-        .join("images")
-        .join("builder")
-        .join("flake.nix");
-    if !flake_nix.exists() {
-        anyhow::bail!(
-            "Builder flake not found at {}.\n\n\
-             The flake should be checked into the source tree at\n\
-             nix/images/builder/flake.nix and expose\n\
-             packages.<arch>-linux.default producing vmlinux + rootfs.ext4.",
-            flake_nix.display(),
-        );
-    }
-
-    // The builder runs `nix build` inside a read-only bind of the
-    // workspace, so a stale `flake.lock` with `path:..`-style entries
-    // is unrepresentable: nix can't write a new lock (EROFS) and the
-    // old one trips strict pure-mode validation. Pair this with the
-    // `--no-write-lock-file --impure` flags inside the builder
-    // (mvm-build/src/builder_vm.rs:run_build_async). Net: every xtask
-    // run re-evaluates inputs from scratch — fine for the bootstrap,
-    // and the kernel + nixpkgs revs are still pinned through the
-    // parent flake's lock at `nix/flake.lock`.
-    let lock = flake_nix.parent().unwrap().join("flake.lock");
-    if lock.exists() {
-        std::fs::remove_file(&lock)
-            .with_context(|| format!("removing stale {}", lock.display()))?;
-    }
-
-    // The sandbox bind-mounts `workspace` at /work (read-only).
-    // microsandbox owns /out for artifact extraction. The flake_ref
-    // inside the sandbox is the absolute path to the builder flake
-    // under that mount — `path:..` resolves there to the parent
-    // mvm flake at /work/nix/, which in turn resolves its own
-    // `mvm-workspace = path:..` to /work/, where `Cargo.lock` lives.
-    let artifact_out =
-        tempfile::tempdir().context("creating tempdir for builder artifact extraction")?;
-    let job = BuilderJob::Flake {
-        // Bare path — nix auto-detects /work as a git repo (the host
-        // workspace's `.git` is in the bind-mount) and uses the
-        // git+file fetcher. That gives us two things `path:` doesn't:
-        //   1. The flake resolves against the workspace root, so
-        //      `path:../..`-style relative inputs find their
-        //      neighbours (`path:` stages only the leaf subdir and
-        //      escapes the store with "outside of its parent's store
-        //      path").
-        //   2. `?dir=` works in older nix versions (the `path:`
-        //      variant errors "unsupported parameter 'dir'" on nix
-        //      2.24, which is what the builder image ships).
-        //
-        // `git config --global --add safe.directory '*'` inside the
-        // sandbox (set by run_build_async's build_script) is what
-        // makes the git fetcher work across the bind-mount's
-        // host-uid ownership; without it, git refuses with
-        // "repository '/work' is not owned by current user".
-        flake_ref: format!("git+file://{BUILDER_GUEST_WORK_DIR}?dir=nix/images/builder"),
-        attr_path: format!("packages.{arch}-linux.default"),
-    };
-    let mounts = BuilderMounts {
-        flake_src: workspace.to_path_buf(),
-        // Never bind the host /nix on macOS: it's root-owned and
-        // contains Darwin-targeted closures the Linux sandbox can't
-        // execute. See the same reasoning in
-        // `apple_container.rs::build_image_via_microsandbox`.
-        host_nix_store: None,
-        artifact_out: artifact_out.path().to_path_buf(),
-    };
-
-    println!(
-        "xtask build-dev-image: running mvm-build's MicrosandboxBuilderVm\n\
-         (no host Nix needed — `nixos/nix:2.24.10` runs inside the sandbox)"
-    );
-    let builder = MicrosandboxBuilderVm::default();
-    let artifacts = builder
-        .run_build(&job, &mounts)
-        .map_err(|e| anyhow::anyhow!("microsandbox builder failed: {e}"))?;
-
-    // Plan 73 Followup B.2.0: BuilderArtifacts is now an enum. The
-    // xtask path always feeds a Flake job, so it always receives an
-    // Image. Surface a future variant as an error rather than a
-    // silent path mismatch.
-    let (src_kernel, src_rootfs) = match artifacts {
-        mvm_build::builder_vm::BuilderArtifacts::Image {
-            kernel_path,
-            rootfs_path,
-            ..
-        } => {
-            let kernel = kernel_path.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "builder produced no vmlinux — the flake's \
-                     packages.{arch}-linux.default output must include `vmlinux` \
-                     in its $out directory"
-                )
-            })?;
-            if !rootfs_path.is_file() {
-                anyhow::bail!(
-                    "builder reported success but rootfs.ext4 is missing at {}",
-                    rootfs_path.display(),
-                );
-            }
-            (kernel, rootfs_path)
-        }
-        mvm_build::builder_vm::BuilderArtifacts::InstallVolume { .. } => {
-            anyhow::bail!(
-                "xtask build-dev-image expected a Flake build but the \
-                 builder returned an InstallVolume — unreachable until \
-                 Plan 73 Followup B.2"
-            );
-        }
-    };
-
-    let dest_dir = vendored_slot(workspace, arch);
-    std::fs::create_dir_all(&dest_dir)
-        .with_context(|| format!("creating vendored slot at {}", dest_dir.display()))?;
-    let dest_kernel = dest_dir.join("vmlinux");
-    let dest_rootfs = dest_dir.join("rootfs.ext4");
-    copy_with_mode(&src_kernel, &dest_kernel)?;
-    copy_with_mode(&src_rootfs, &dest_rootfs)?;
-    let checksums = format!(
-        "{}  vmlinux\n{}  rootfs.ext4\n",
-        sha256_hex(&dest_kernel)?,
-        sha256_hex(&dest_rootfs)?,
-    );
-    let checksums_path = dest_dir.join("checksums-sha256.txt");
-    std::fs::write(&checksums_path, checksums)
-        .with_context(|| format!("writing {}", checksums_path.display()))?;
-
-    println!("\nVendored dev image installed:");
-    println!("  {}", dest_kernel.display());
-    println!("  {}", dest_rootfs.display());
-    println!("  {}", checksums_path.display());
-    println!(
-        "\n`mvmctl dev up` from this checkout will now boot from the vendored\n\
-         slot at highest precedence — no GitHub release download needed."
-    );
-    Ok(())
-}
-
-/// Copy a file, then chmod the destination to 0644. Nix store files
-/// come back mode 0444; preserving that source mode would make a
-/// subsequent xtask re-run EACCES on overwrite.
-fn copy_with_mode(src: &Path, dest: &Path) -> Result<()> {
-    std::fs::copy(src, dest)
-        .with_context(|| format!("copying {} → {}", src.display(), dest.display()))?;
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(dest, std::fs::Permissions::from_mode(0o644))
-            .with_context(|| format!("chmod 0644 on {}", dest.display()))?;
-    }
-    Ok(())
-}
-
-fn sha256_hex(path: &Path) -> Result<String> {
-    use sha2::Digest;
-    use std::io::Read;
-    let mut f = std::fs::File::open(path)
-        .with_context(|| format!("opening {} for hashing", path.display()))?;
-    let mut hasher = sha2::Sha256::new();
-    let mut buf = [0u8; 64 * 1024];
-    loop {
-        let n = f
-            .read(&mut buf)
-            .with_context(|| format!("reading {} during hash", path.display()))?;
-        if n == 0 {
-            break;
-        }
-        hasher.update(&buf[..n]);
-    }
-    Ok(format!("{:x}", hasher.finalize()))
+    let _ = (workspace, arch);
+    anyhow::bail!(
+        "xtask build-dev-image is disabled until it is ported from the removed \
+         microsandbox builder to the libkrun builder; the old path pulled SeaORM \
+         / SQLx database crates"
+    )
 }
 
 /// Resolve the path the workspace was built from. Lifted out so tests
 /// can target a tempdir without setting `CARGO_MANIFEST_DIR`.
-pub fn vendored_slot(workspace: &Path, arch: &str) -> PathBuf {
+#[cfg(test)]
+pub fn vendored_slot(workspace: &Path, arch: &str) -> std::path::PathBuf {
     workspace
         .join("nix")
         .join("images")
@@ -328,8 +143,8 @@ mod tests {
         let err = build_and_install(tmp.path(), "aarch64").unwrap_err();
         let msg = format!("{err}");
         assert!(
-            msg.contains("Builder flake not found"),
-            "expected a clear flake-missing error, got: {msg}"
+            msg.contains("xtask build-dev-image is disabled"),
+            "expected a clear disabled-path error, got: {msg}"
         );
     }
 

@@ -1,8 +1,8 @@
 //! Per-process registry of `StartMode::Attached` sandboxes.
 //!
 //! W7 closes the gap that's been documented in
-//! [`microsandbox::start_with_mode`](crate::microsandbox) since
-//! W6.2: previously, `mode` was *intent metadata* — recorded in
+//! the legacy microsandbox path since W6.2: previously, `mode` was
+//! *intent metadata* — recorded in
 //! `~/.mvm/vms/<name>/mode.json` so subsequent calls knew the
 //! caller's expectation, but the host process didn't actually
 //! forward `Ctrl-C` (SIGINT) to the sandbox.
@@ -16,23 +16,19 @@
 //!
 //! ## Why this and not the `Sandbox` handle?
 //!
-//! microsandbox's `Sandbox` is async-bound and `!Send` across the
-//! `VmBackend` sync trait boundary. Keeping the handle live across
-//! `start_with_mode` → caller → SIGINT would force a `tokio::Runtime`
-//! that outlives every backend call, plus a `Mutex<HashMap<VmId,
-//! Sandbox>>` whose entries can't move between threads. The registry
-//! sidesteps that: we keep just the *name* and call
-//! [`microsandbox::Sandbox::get(name)`] from the signal handler,
-//! reusing the same async bridge (`block_on`) the rest of the
-//! backend does.
+//! the old microsandbox handle was async-bound and `!Send` across the
+//! `VmBackend` sync trait boundary. The registry sidestepped that by
+//! keeping just the sandbox name. The upstream microsandbox crate has
+//! since been removed from the dependency graph; this registry remains
+//! as a harmless drain point for callers compiled against the public
+//! signal-handler surface.
 //!
 //! ## What it does *not* do
 //!
 //! - It is not a process supervisor. If the parent process dies
 //!   uncleanly (SIGKILL, panic without unwinding), attached
-//!   sandboxes survive — microsandbox sandboxes always run as
-//!   detached child processes at the OS level. Cleanup in that
-//!   case is `mvmctl ps`/`mvmctl down` after restart.
+//!   sandboxes survive. Cleanup in that case is `mvmctl ps`/`mvmctl down`
+//!   after restart.
 //! - It is not cross-process. The registry is per-`mvmctl`-process;
 //!   two concurrent `mvmctl up --attached` invocations don't see
 //!   each other's sandboxes.
@@ -41,14 +37,6 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
 use anyhow::Result;
-// `VmBackend` + `VmId` are only used to call `MicrosandboxBackend::stop`
-// when the feature is on. Gated with the import to avoid an unused-import
-// warning on no-default-features builds.
-#[cfg(feature = "contributor-bootstrap")]
-use mvm_core::vm_backend::{VmBackend, VmId};
-
-#[cfg(feature = "contributor-bootstrap")]
-use crate::MicrosandboxBackend;
 
 /// Metadata kept for each attached sandbox. The map's key is the
 /// sandbox name, which is also the only thing the SIGINT handler
@@ -122,31 +110,11 @@ pub fn stop_all_attached() -> Vec<String> {
     if names.is_empty() {
         return names;
     }
-    #[cfg(feature = "contributor-bootstrap")]
-    {
-        let backend = MicrosandboxBackend;
-        for name in &names {
-            if let Err(e) = backend.stop(&VmId(name.clone())) {
-                tracing::warn!(
-                    sandbox = %name,
-                    error = %e,
-                    "ctrl-c: failed to stop attached sandbox; orphaned",
-                );
-            } else {
-                tracing::info!(sandbox = %name, "ctrl-c: stopped attached sandbox");
-            }
-            deregister(name);
-        }
-    }
-    #[cfg(not(feature = "contributor-bootstrap"))]
-    {
-        // Without the microsandbox backend, the registry is never
-        // populated by any internal code — but `register_attached` is
-        // a `pub fn` so an external caller could populate it anyway.
-        // Drain defensively so the registry doesn't grow unbounded.
-        for name in &names {
-            deregister(name);
-        }
+    // Without the upstream microsandbox backend, the registry is never
+    // populated by internal code. `register_attached` is still public, so
+    // drain defensively if an external caller populated it.
+    for name in &names {
+        deregister(name);
     }
     names
 }

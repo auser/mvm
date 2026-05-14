@@ -20,14 +20,6 @@ mvm-guest.workspace = true
 mvm-sdk.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
-# Optional — see the same dep in `mvm-backend/Cargo.toml` for the
-# sqlite-link-conflict rationale. `MicrosandboxBuilderVm` and its async
-# runner are the only consumers in this crate; both gate behind
-# `contributor-bootstrap`. The non-microsandbox helpers (`ArtifactSidecar`,
-# `emit_sidecar_via_passthru_query`, builder-dir constants) stay
-# unconditional so `mvm-base` and `pipeline::dev_build` keep compiling
-# either way.
-microsandbox = { workspace = true, optional = true }
 # Plan 72 W1: optional libkrun FFI dep for the in-tree builder VM
 # launcher (`libkrun_builder::LibkrunBuilderVm`). Gated by
 # `backends-builder-vm-libkrun`; default-off until Plan 72 W5
@@ -47,9 +39,11 @@ which = "6"
 tempfile.workspace = true
 
 [features]
-# Heavy microsandbox support is opt-in for lean default builds.
+# Compatibility feature kept for older contributor commands. It no longer
+# enables the upstream Rust microsandbox crate because that crate vendors
+# SeaORM / SQLx database dependencies.
 default = []
-contributor-bootstrap = ["dep:microsandbox"]
+contributor-bootstrap = []
 # Plan 72 W1: libkrun-direct builder VM launcher (default-off
 # scaffolding through W4; default-on after W5 cutover). Pulls
 # the `mvm-libkrun` FFI crate which itself gates the underlying

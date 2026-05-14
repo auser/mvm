@@ -1720,107 +1720,19 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
 }
 
 /// Build a microVM image (kernel + rootfs) by spawning the mvm-owned
-/// microsandbox builder VM and running `nix build` inside it.
+/// legacy Stage 0 builder path.
 ///
-/// `flake_dir` is bind-mounted into the builder as `/work`; the builder
-/// runs `nix build /work#packages.<linux_system>.default` and copies
-/// the resulting artifacts to `out_dir`. The host's `/nix/store` is
-/// bind-mounted opportunistically (when present) for cache reuse — its
-/// absence is fine, the builder will fetch from substituters.
-///
-/// ADR-013 §"Linux builder via microsandbox (no Lima)" — this replaces
-/// the previous host-nix + `nix-darwin` `linux-builder` path so mvm
-/// owns the builder VM end-to-end and the user needs no external Nix
-/// configuration on the host.
+/// The upstream Rust microsandbox crate is intentionally absent from
+/// this workspace because it vendors SeaORM / SQLx database crates.
+/// Keep this shim so older contributor feature flows fail with a direct
+/// explanation instead of silently falling back to a stale image.
 #[cfg(feature = "contributor-bootstrap")]
 fn build_image_via_microsandbox(flake_dir: &str, out_dir: &str) -> Result<(String, String)> {
-    use mvm_build::builder_vm::{
-        BUILDER_GUEST_WORK_DIR, BuilderJob, BuilderMounts, BuilderVm, MicrosandboxBuilderVm,
-        host_system_linux,
-    };
-
-    let flake_src = std::path::PathBuf::from(flake_dir);
-    if !flake_src.exists() {
-        anyhow::bail!("flake dir does not exist: {flake_dir}");
-    }
-
-    // The bundled flakes live at `<workspace>/nix/images/<name>/` and
-    // use `builtins.path { path = ../../..; }` to capture the workspace
-    // root (for `mkGuest` lib + `Cargo.lock`). To make that resolve
-    // correctly inside the sandbox, mount the whole workspace at /work
-    // and point `flake_ref` at the subdir. Mounting only the flake dir
-    // (the previous design) made `../../..` resolve to `/` of the
-    // sandbox, which tripped over `/.msb/agent.sock` and other
-    // microsandbox-internal files Nix can't import.
-    let workspace_root = flake_src
-        .parent()
-        .and_then(|p| p.parent())
-        .and_then(|p| p.parent())
-        .ok_or_else(|| {
-            anyhow::anyhow!("flake dir is not three levels deep in workspace: {flake_dir}")
-        })?
-        .to_path_buf();
-    let flake_rel = flake_src
-        .strip_prefix(&workspace_root)
-        .map_err(|_| anyhow::anyhow!("flake dir not under derived workspace root: {flake_dir}"))?;
-    // `path:` URL forces Nix's filesystem flake fetcher rather than the
-    // git fetcher. The git fetcher gets engaged automatically whenever
-    // the flake path sits under a `.git` directory (the workspace
-    // mount always does), and it fails on git worktrees — the
-    // worktree's `.git` is a file whose `gitdir:` redirect points
-    // outside the bind mount.
-    let guest_flake_ref = format!(
-        "path:{}/{}",
-        BUILDER_GUEST_WORK_DIR,
-        flake_rel
-            .to_str()
-            .ok_or_else(|| anyhow::anyhow!("flake subpath has non-UTF-8 bytes: {flake_rel:?}"))?
-    );
-
-    // Bind-mount /nix opportunistically on Linux hosts that already
-    // run native Nix — the builder reuses already-realized store paths,
-    // and absence is fine because the in-sandbox store fetches from
-    // substituters. Skip the bind on macOS: a multi-user Nix install
-    // there leaves `/nix` owned by `root:wheel` (Apple Container's
-    // bind-mounter fails with EACCES), *and* the store contains
-    // Darwin-targeted closures that a Linux microVM can't execute
-    // anyway. The microsandbox builder is on the macOS path precisely
-    // because the host has no usable Linux Nix; reusing its Darwin
-    // store is wrong regardless of permissions.
-    let host_nix_store = if cfg!(target_os = "macos") {
-        None
-    } else {
-        let host_nix = std::path::PathBuf::from("/nix");
-        if host_nix.join("store").is_dir() {
-            Some(host_nix)
-        } else {
-            None
-        }
-    };
-
-    let job = BuilderJob::Flake {
-        flake_ref: guest_flake_ref,
-        attr_path: format!("packages.{}.default", host_system_linux()),
-    };
-    let mounts = BuilderMounts {
-        flake_src: workspace_root,
-        host_nix_store,
-        artifact_out: std::path::PathBuf::from(out_dir),
-    };
-
-    MicrosandboxBuilderVm::default()
-        .run_build(&job, &mounts)
-        .map_err(|e| anyhow::anyhow!("microsandbox builder VM: {e}"))?;
-
-    let kernel = format!("{out_dir}/vmlinux");
-    let rootfs = format!("{out_dir}/rootfs.ext4");
-    if !std::path::Path::new(&kernel).exists() {
-        anyhow::bail!("builder VM did not produce vmlinux at {kernel}");
-    }
-    if !std::path::Path::new(&rootfs).exists() {
-        anyhow::bail!("builder VM did not produce rootfs.ext4 at {rootfs}");
-    }
-    Ok((kernel, rootfs))
+    let _ = (flake_dir, out_dir);
+    anyhow::bail!(
+        "the microsandbox builder path was removed because the upstream Rust crate \
+         pulls SeaORM / SQLx database crates into the dependency graph"
+    )
 }
 
 /// Find the dev-image Nix flake directory.
