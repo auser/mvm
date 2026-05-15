@@ -23,6 +23,16 @@ pub mod nix;
 /// builder VM per ADR-050).
 pub mod oci_to_rootfs;
 pub mod pipeline;
+/// Plan 74 W1.4b — host-side resolver for the mvm runtime
+/// overlay disk per ADR-051. Picks the right ext4 + verity
+/// sidecar + roothash for the running mvmctl version and host
+/// arch from `~/.cache/mvm/runtime-overlay/<version>/<arch>/`.
+/// The Nix flake that *produces* the artifact lands in a
+/// follow-up W1.4b PR; backend wiring (attaching the second
+/// drive + threading `mvm.runtime_roothash=` into the cmdline)
+/// lives in W1.4b.2; the `mkGuest` refactor that stops baking
+/// the agent into per-image closures is W1.4b.3.
+pub mod runtime_overlay;
 
 // Legacy re-exports — preserve `mvm_build::build::*`, `mvm_build::scripts::*`, etc.
 pub use nix::manifest as nix_manifest;
