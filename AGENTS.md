@@ -1,5 +1,13 @@
 # Agent Working Agreement
 
+## No prebuilt builder VM artifact, ever — until we cut a release
+
+The builder VM image (`~/.cache/mvm/builder-vm/<arch>/{vmlinux,rootfs.ext4}`) is **built locally** from `nix/images/builder-vm/flake.nix` on every contributor host. We do **not** publish a prebuilt builder VM artifact and **`mvmctl` does not download one when developing locally**. The contributor workflow is fully self-hosted: source checkout → local Stage 0 → local builder VM image → local dev image.
+
+This is a hard invariant. A `cargo run -- dev up` from a source checkout must never depend on a GitHub release artifact for the builder VM. Adding a `download_builder_vm_image` fallback to the contributor path is forbidden. The download path exists **only** for end users who installed `mvmctl` as a binary and have no in-repo source — and even that download path is a no-op until we explicitly cut a release that publishes the artifact. Until then, the download path is gated behind release-version detection; in development it must not be reached.
+
+Treat this the same way you would treat the "host Nix is never used" invariant: any code, doc, or test that violates it is wrong and must be removed.
+
 ## Builder VM Requirement
 
 All Nix builds/evals, Firecracker operations, `mvmctl` runtime commands (anything that boots, talks to, or manages microVMs), and Linux-specific syscalls MUST run inside the project builder VM, not a Lima VM. Do not use `limactl` for this repo. The builder VM is the current Linux execution boundary for Nix and microVM work.

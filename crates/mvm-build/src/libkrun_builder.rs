@@ -105,7 +105,7 @@ pub const GUEST_JOB_DIR: &str = "/job";
 /// `/out` virtio-fs mount, and tears the VM down. No persistent
 /// state on the struct; the `/nix`-store image lives on the host
 /// filesystem and survives across invocations.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct LibkrunBuilderVm {
     /// Guest vCPU count. See [`DEFAULT_VCPUS`].
     pub vcpus: u8,
@@ -114,6 +114,17 @@ pub struct LibkrunBuilderVm {
     /// Persistent `/nix`-store image size in MiB (sparse cap).
     /// See [`DEFAULT_NIX_STORE_MIB`].
     pub nix_store_mib: u32,
+    /// Optional caller-supplied bootstrap image. When set, `run_build`
+    /// boots from this kernel/rootfs/cmdline instead of looking up the
+    /// builder VM image in `~/.cache/mvm/builder-vm/<arch>/`. Used by
+    /// Stage 0 — when the builder VM image cache is empty on a source
+    /// checkout, the caller passes in the already-cached dev image so
+    /// the very same machinery (virtio-fs shares, job dir, `/nix` disk)
+    /// can run `nix build` of the builder VM flake. CLAUDE.md
+    /// invariant: contributor hosts never download a prebuilt builder
+    /// VM artifact, so this override is the only way out of the
+    /// chicken-and-egg at first run.
+    pub image_override: Option<BuilderVmImage>,
 }
 
 impl Default for LibkrunBuilderVm {
@@ -122,6 +133,7 @@ impl Default for LibkrunBuilderVm {
             vcpus: DEFAULT_VCPUS,
             memory_mib: DEFAULT_MEMORY_MIB,
             nix_store_mib: DEFAULT_NIX_STORE_MIB,
+            image_override: None,
         }
     }
 }
@@ -141,6 +153,15 @@ impl LibkrunBuilderVm {
     /// in one warm store.
     pub fn with_nix_store_mib(mut self, mib: u32) -> Self {
         self.nix_store_mib = mib;
+        self
+    }
+
+    /// Boot from a caller-supplied kernel/rootfs instead of
+    /// resolving the builder VM image from `~/.cache/mvm/builder-vm/`.
+    /// Stage 0 entry point — see the struct-level doc on
+    /// [`LibkrunBuilderVm::image_override`] for the contract.
+    pub fn with_image_override(mut self, image: BuilderVmImage) -> Self {
+        self.image_override = Some(image);
         self
     }
 
@@ -265,8 +286,14 @@ impl BuilderVm for LibkrunBuilderVm {
 
         // 4. Find or initialise the builder VM image (kernel +
         //    rootfs.ext4 + canonical cmdline) the W2 flake
-        //    produces.
-        let image = ensure_builder_vm_image()?;
+        //    produces. Stage 0 callers (bootstrap from the cached
+        //    dev image) pass an override here to short-circuit the
+        //    cache lookup that would fail on a fresh contributor
+        //    host with no builder VM image yet.
+        let image = match &self.image_override {
+            Some(image) => image.clone(),
+            None => ensure_builder_vm_image()?,
+        };
 
         // 5. Allocate / locate the persistent `/nix-store`
         //    virtio-blk image. First build on a host pays the
@@ -366,11 +393,25 @@ impl BuilderVm for LibkrunBuilderVm {
 // ─────────────────────────────────────────────────────────────────
 
 /// Resolved builder VM image — the W2 flake output the libkrun
-/// launcher boots into.
-struct BuilderVmImage {
-    kernel_path: PathBuf,
-    rootfs_path: PathBuf,
-    cmdline: String,
+/// launcher boots into, OR a caller-supplied bootstrap image used
+/// for Stage 0 (e.g. the cached dev image when bootstrapping the
+/// builder VM from a source checkout — see
+/// `apple_container::bootstrap_builder_vm_image_via_dev_image_stage0`).
+#[derive(Debug, Clone)]
+pub struct BuilderVmImage {
+    pub kernel_path: PathBuf,
+    pub rootfs_path: PathBuf,
+    pub cmdline: String,
+}
+
+impl BuilderVmImage {
+    pub fn new(kernel_path: PathBuf, rootfs_path: PathBuf, cmdline: String) -> Self {
+        Self {
+            kernel_path,
+            rootfs_path,
+            cmdline,
+        }
+    }
 }
 
 /// Parsed `/job/result` written by `mvm-builder-init` (Plan 72 W3).
