@@ -1907,6 +1907,17 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     use mvm_build::builder_vm::BuilderVm as _;
     use mvm_build::libkrun_builder::LibkrunBuilderVm;
 
+    // Plan 77 W2 — serialize concurrent Stage 0 invocations on the same
+    // host before any side effects. Two `mvmctl dev up` runs in parallel
+    // would race on the persistent `~/.cache/mvm/builder-vm/nix-store-<arch>.img`
+    // volume that libkrun mounts read-write inside the bootstrap VM;
+    // letting both proceed risks Nix-store corruption (and at minimum
+    // duplicates 10–30 minutes of work). The lock lives one directory
+    // above the per-arch cache so it serializes across arches too —
+    // overkill, but the contention cost is zero in practice (single
+    // contributor host) and the simpler invariant is worth it.
+    let _stage0_guard = acquire_stage0_lock(out_dir)?;
+
     let (kernel, rootfs, source_label) = find_local_fallback_image().ok_or_else(|| {
         anyhow::anyhow!(
             "source checkout builder VM cache is missing and no local dev image cache was found \
@@ -2004,6 +2015,40 @@ fn builder_vm_stage0_bootstrap_plan(
     );
 
     Ok((job, mounts, bootstrap_image))
+}
+
+/// Plan 77 W2 — RAII advisory lock at
+/// `~/.cache/mvm/builder-vm/stage0.lock` (one directory above the
+/// per-arch cache). `try_acquire` is non-blocking, so a concurrent
+/// invocation bails fast with a clear message instead of silently
+/// queuing for minutes behind a libkrun-builder VM that's already
+/// busy holding the shared `nix-store-<arch>.img` volume.
+///
+/// `out_dir` is the per-arch cache dir (e.g. `.../builder-vm/aarch64`);
+/// the lock anchor is its sibling `stage0` (so `FileLock::try_acquire`
+/// produces `stage0.lock`).
+#[cfg(any(feature = "builder-vm", test))]
+fn acquire_stage0_lock(out_dir: &str) -> Result<mvm_core::atomic_io::FileLock> {
+    use mvm_core::atomic_io::FileLock;
+
+    let parent = std::path::Path::new(out_dir).parent().ok_or_else(|| {
+        anyhow::anyhow!("builder VM cache path has no parent: {out_dir}")
+    })?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating builder-vm cache parent {}", parent.display()))?;
+    let lock_anchor = parent.join("stage0");
+
+    match FileLock::try_acquire(&lock_anchor) {
+        Ok(Some(guard)) => Ok(guard),
+        Ok(None) => anyhow::bail!(
+            "another `mvmctl dev up` (or any caller of Stage 0) is already bootstrapping the \
+             builder VM image on this host (lock held at {}.lock). Wait for it to finish, or — \
+             only if you are sure no other invocation is running, e.g. after a crash — delete the \
+             lock file and retry.",
+            lock_anchor.display()
+        ),
+        Err(e) => Err(e.context("acquiring Stage 0 advisory lock")),
+    }
 }
 
 #[cfg(any(feature = "builder-vm", test))]
@@ -2949,6 +2994,63 @@ mod builder_vm_bootstrap_tests {
     fn write_builder_vm_source_cache_metadata(dir: &std::path::Path, fingerprint: &str) {
         write_builder_vm_source_fingerprint(dir, fingerprint).expect("write fingerprint");
         write_builder_vm_artifact_digest_manifest(dir).expect("write artifact digest manifest");
+    }
+
+    /// Plan 77 W2 — `acquire_stage0_lock` is an advisory `flock(2)`
+    /// guard at `<cache_parent>/stage0.lock`. The first acquisition
+    /// succeeds; a second concurrent attempt while the first guard is
+    /// still in scope fails fast with a recognizable message; once the
+    /// first guard drops, the lock becomes available again.
+    #[test]
+    fn stage0_lock_refuses_concurrent_acquisition() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_dir = tmp.path().join("aarch64");
+        let out_dir_str = out_dir.to_str().expect("utf-8 out_dir");
+
+        let first =
+            acquire_stage0_lock(out_dir_str).expect("first acquisition should succeed");
+        // Lock file lives one directory above out_dir, named `stage0.lock`.
+        assert!(
+            tmp.path().join("stage0.lock").exists(),
+            "stage0.lock should be created on first acquisition"
+        );
+
+        let err = match acquire_stage0_lock(out_dir_str) {
+            Err(e) => e,
+            Ok(_) => panic!("second acquisition must refuse while first is held"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already bootstrapping the builder VM image"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("stage0.lock"),
+            "error should name the lock file path: {msg}"
+        );
+
+        drop(first);
+
+        // Now reachable again — guards must not leak past their scope.
+        let _second =
+            acquire_stage0_lock(out_dir_str).expect("acquisition should succeed after drop");
+    }
+
+    /// Lock setup must not fail when the parent cache directory does
+    /// not yet exist on disk (fresh contributor host). `acquire_stage0_lock`
+    /// is responsible for creating it.
+    #[test]
+    fn stage0_lock_creates_missing_cache_parent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("nested/builder-vm/aarch64");
+        let nested_str = nested.to_str().expect("utf-8 nested");
+
+        let _guard = acquire_stage0_lock(nested_str)
+            .expect("acquisition should create missing parent dir");
+        assert!(
+            tmp.path().join("nested/builder-vm/stage0.lock").exists(),
+            "lock file must be created at the constructed parent path"
+        );
     }
 
     #[test]
