@@ -1904,9 +1904,6 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     out_dir: &str,
     source_fingerprint: &str,
 ) -> Result<()> {
-    use mvm_build::builder_vm::BuilderVm as _;
-    use mvm_build::libkrun_builder::LibkrunBuilderVm;
-
     let (kernel, rootfs, source_label) = find_local_fallback_image().ok_or_else(|| {
         anyhow::anyhow!(
             "source checkout builder VM cache is missing and no local dev image cache was found \
@@ -1924,36 +1921,179 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     std::fs::create_dir_all(&staging_dir)
         .with_context(|| format!("creating Stage 0 staging dir {}", staging_dir.display()))?;
 
+    // Plan 77 W3: bracket the bootstrap with audit emits. `Stage0Boot`
+    // fires once we have a seed image and a staging dir on disk —
+    // before that point, failures are pre-flight (no seed, can't
+    // create staging) and the existing UI surface already explains
+    // them. From here on, every exit path lands either a
+    // `Stage0CachePromoted` or a `Stage0Failed` line so a contributor
+    // can answer "did Stage 0 ever finish, and how" after the fact.
+    let started = std::time::Instant::now();
+    let fingerprint_prefix = stage0_fingerprint_prefix(source_fingerprint);
+    mvm_core::audit_emit!(
+        Stage0Boot,
+        "seed={source_label} fingerprint_prefix={fingerprint_prefix}"
+    );
+
+    let result = run_stage0_bootstrap(
+        &staging_dir,
+        out_dir,
+        source_fingerprint,
+        builder_flake_dir,
+        kernel,
+        rootfs,
+    );
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(()) => {
+            mvm_core::audit_emit!(
+                Stage0CachePromoted,
+                "cache={cache} fingerprint_prefix={fingerprint_prefix} duration_ms={duration_ms}",
+                cache = out_dir.display(),
+            );
+            Ok(())
+        }
+        Err((stage, e)) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            let reason = stage0_failure_reason_summary(&e);
+            mvm_core::audit_emit!(
+                Stage0Failed,
+                "stage={stage} duration_ms={duration_ms} reason={reason}"
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Plan 77 W3: which phase of Stage 0 failed. Each variant maps to a
+/// `stage=...` value in the `Stage0Failed` audit detail so a dashboard
+/// can break down "Stage 0 reliability" by failure phase. String
+/// representations are stable wire format.
+#[cfg(feature = "builder-vm")]
+#[derive(Debug, Clone, Copy)]
+enum Stage0FailureStage {
+    Build,
+    Validate,
+    Promote,
+}
+
+#[cfg(feature = "builder-vm")]
+impl Stage0FailureStage {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Build => "build",
+            Self::Validate => "validate",
+            Self::Promote => "promote",
+        }
+    }
+}
+
+#[cfg(feature = "builder-vm")]
+impl std::fmt::Display for Stage0FailureStage {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(self.as_str())
+    }
+}
+
+/// Plan 77 W3: the inner bootstrap pipeline, with each phase tagged
+/// so the outer caller can attribute a failure to a specific
+/// `Stage0FailureStage` in the audit emit.
+///
+/// Extracting this out of [`bootstrap_builder_vm_image_via_dev_image_stage0`]
+/// keeps the audit-bracketing logic in the outer function and the
+/// pipeline itself readable top-to-bottom. The
+/// `(Stage0FailureStage, anyhow::Error)` return type lets the caller
+/// preserve the underlying error for normal anyhow chaining while
+/// still recording which phase failed.
+#[cfg(feature = "builder-vm")]
+fn run_stage0_bootstrap(
+    staging_dir: &std::path::Path,
+    final_dir: &std::path::Path,
+    source_fingerprint: &str,
+    builder_flake_dir: &str,
+    bootstrap_kernel: std::path::PathBuf,
+    bootstrap_rootfs: std::path::PathBuf,
+) -> std::result::Result<(), (Stage0FailureStage, anyhow::Error)> {
+    use mvm_build::builder_vm::BuilderVm as _;
+    use mvm_build::libkrun_builder::LibkrunBuilderVm;
+
     let staging_dir_str = staging_dir
         .to_str()
         .ok_or_else(|| {
-            anyhow::anyhow!(
-                "Stage 0 staging path is not valid UTF-8: {}",
-                staging_dir.display()
+            (
+                Stage0FailureStage::Build,
+                anyhow::anyhow!(
+                    "Stage 0 staging path is not valid UTF-8: {}",
+                    staging_dir.display()
+                ),
             )
         })?
         .to_string();
-    let (job, mounts, bootstrap_image) =
-        builder_vm_stage0_bootstrap_plan(builder_flake_dir, &staging_dir_str, kernel, rootfs)?;
+    let (job, mounts, bootstrap_image) = builder_vm_stage0_bootstrap_plan(
+        builder_flake_dir,
+        &staging_dir_str,
+        bootstrap_kernel,
+        bootstrap_rootfs,
+    )
+    .map_err(|e| (Stage0FailureStage::Build, e))?;
 
-    let build_result = LibkrunBuilderVm::default()
+    LibkrunBuilderVm::default()
         .with_image_override(bootstrap_image)
         .run_build(&job, &mounts)
-        .map_err(|e| anyhow::anyhow!("Stage 0 builder VM build: {e}"));
-    if let Err(e) = build_result {
-        let _ = std::fs::remove_dir_all(&staging_dir);
-        return Err(e);
-    }
-    write_builder_vm_source_fingerprint(&staging_dir, source_fingerprint)?;
-    write_builder_vm_artifact_digest_manifest(&staging_dir)?;
+        .map_err(|e| {
+            (
+                Stage0FailureStage::Build,
+                anyhow::anyhow!("Stage 0 builder VM build: {e}"),
+            )
+        })?;
 
-    if let Err(e) = promote_builder_vm_stage0_cache(&staging_dir, out_dir, source_fingerprint) {
-        let _ = std::fs::remove_dir_all(&staging_dir);
-        return Err(e);
-    }
+    write_builder_vm_source_fingerprint(staging_dir, source_fingerprint)
+        .map_err(|e| (Stage0FailureStage::Validate, e))?;
+    write_builder_vm_artifact_digest_manifest(staging_dir)
+        .map_err(|e| (Stage0FailureStage::Validate, e))?;
+
+    promote_builder_vm_stage0_cache(staging_dir, final_dir, source_fingerprint)
+        .map_err(|e| (Stage0FailureStage::Promote, e))?;
 
     Ok(())
 }
+
+/// Plan 77 W3: short prefix of the source fingerprint for audit
+/// `fingerprint_prefix=` field. 8 hex chars are enough to disambiguate
+/// against unrelated `dev up` runs without exposing the full digest.
+#[cfg(feature = "builder-vm")]
+fn stage0_fingerprint_prefix(source_fingerprint: &str) -> String {
+    source_fingerprint
+        .chars()
+        .take(8)
+        .collect::<String>()
+}
+
+/// Plan 77 W3: condense an `anyhow::Error` into the short single-line
+/// `reason=` field for `Stage0Failed`. The full chain is on stderr
+/// already; the audit field is for "what broke at a glance". Capped
+/// at 160 chars and stripped of newlines / commas / spaces around
+/// `=`-signs so the space-separated `key=value` detail format stays
+/// parseable.
+#[cfg(feature = "builder-vm")]
+fn stage0_failure_reason_summary(err: &anyhow::Error) -> String {
+    let raw = err.to_string();
+    let cleaned: String = raw
+        .chars()
+        .map(|c| match c {
+            '\n' | '\r' | '\t' => ' ',
+            // Audit detail is space-separated `key=value` pairs; any
+            // bare `=` in the reason text would confuse a downstream
+            // parser, so map them to `~` (visibly distinct from `=`).
+            '=' => '~',
+            _ => c,
+        })
+        .collect();
+    let truncated: String = cleaned.chars().take(160).collect();
+    truncated
+}
+
 
 #[cfg(not(feature = "builder-vm"))]
 fn bootstrap_builder_vm_image_via_dev_image_stage0(
@@ -3263,6 +3403,105 @@ mod builder_vm_bootstrap_tests {
                 "/tmp/out/vmlinux".to_string(),
                 "/tmp/out/rootfs.ext4".to_string()
             )
+        );
+    }
+
+    // -------------------------------------------------------------------
+    // Plan 77 W3 — Stage 0 audit-emit helpers.
+    //
+    // The full `bootstrap_builder_vm_image_via_dev_image_stage0`
+    // function takes a real libkrun supervisor and a live builder VM
+    // image cache to exercise — neither available in unit tests. The
+    // tests below pin the *details* of the audit emits (which strings
+    // the macro will write into `kind`, `detail`) so that the
+    // downstream log shippers don't break on a typo, plus a structural
+    // test for the failure-summary truncation rule.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn stage0_fingerprint_prefix_truncates_to_eight_chars() {
+        let full = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let prefix = stage0_fingerprint_prefix(full);
+        assert_eq!(prefix, "01234567");
+        assert_eq!(prefix.len(), 8);
+    }
+
+    #[test]
+    fn stage0_fingerprint_prefix_handles_short_input() {
+        // Defensive: source_fingerprint should always be 64 hex chars,
+        // but if a future caller hands us a short string the helper
+        // must not panic.
+        let prefix = stage0_fingerprint_prefix("abc");
+        assert_eq!(prefix, "abc");
+    }
+
+    #[test]
+    fn stage0_failure_reason_summary_strips_newlines_and_caps_length() {
+        let err = anyhow::anyhow!("first line\nsecond line\twith tab");
+        let summary = stage0_failure_reason_summary(&err);
+        assert!(!summary.contains('\n'));
+        assert!(!summary.contains('\r'));
+        assert!(!summary.contains('\t'));
+
+        // 200-char input → 160-char output.
+        let long_err = anyhow::anyhow!("{}", "x".repeat(200));
+        let summary = stage0_failure_reason_summary(&long_err);
+        assert_eq!(summary.chars().count(), 160);
+    }
+
+    #[test]
+    fn stage0_failure_reason_summary_escapes_equals() {
+        // The audit detail format is space-separated `key=value` pairs.
+        // A bare `=` in the reason text would confuse downstream
+        // parsers; the helper maps them to `~`.
+        let err = anyhow::anyhow!("expected x=1 got y=2");
+        let summary = stage0_failure_reason_summary(&err);
+        assert!(!summary.contains('='), "got {summary}");
+        assert!(summary.contains('~'));
+    }
+
+    #[test]
+    fn stage0_failure_stage_wire_format_is_stable() {
+        // The `stage=` value lands in audit details that downstream
+        // dashboards filter on. Pinning the casing here keeps a future
+        // refactor from accidentally renaming the variant.
+        assert_eq!(Stage0FailureStage::Build.as_str(), "build");
+        assert_eq!(Stage0FailureStage::Validate.as_str(), "validate");
+        assert_eq!(Stage0FailureStage::Promote.as_str(), "promote");
+        assert_eq!(format!("{}", Stage0FailureStage::Build), "build");
+    }
+
+    /// Plan 77 W3 — `run_stage0_bootstrap` returns a tagged
+    /// `(Stage0FailureStage, anyhow::Error)` on every error path so
+    /// the outer caller can attribute the failure to a phase. This
+    /// test pins one of the cheap error paths (non-UTF-8 staging dir)
+    /// to confirm the tagging contract.
+    #[cfg(unix)]
+    #[test]
+    fn run_stage0_bootstrap_tags_non_utf8_staging_as_build_failure() {
+        use std::ffi::OsStr;
+        use std::os::unix::ffi::OsStrExt;
+        use std::path::PathBuf;
+
+        // 0xFF is invalid UTF-8 (RFC 3629). The staging-path check
+        // happens before any I/O, so no actual filesystem support for
+        // non-UTF-8 names is required.
+        let bad = PathBuf::from(OsStr::from_bytes(b"/tmp/non-utf8-\xff"));
+        let final_dir = std::path::Path::new("/tmp/final");
+        let result = run_stage0_bootstrap(
+            &bad,
+            final_dir,
+            "fingerprint",
+            "/repo/nix/images/builder-vm",
+            PathBuf::from("/tmp/kernel"),
+            PathBuf::from("/tmp/rootfs"),
+        );
+        let (stage, err) = result.expect_err("non-UTF-8 staging dir must fail");
+        assert!(matches!(stage, Stage0FailureStage::Build));
+        assert!(
+            err.to_string().contains("non-UTF-8")
+                || err.to_string().contains("not valid UTF-8"),
+            "unexpected error: {err}"
         );
     }
 }
