@@ -4,6 +4,7 @@
 //! no behavior changes.
 
 use anyhow::{Context, Result};
+use serde::Serialize;
 use sha2::{Digest, Sha256};
 
 use mvm::vsock_transport::{VsockProxyTransport, VsockTransport};
@@ -484,6 +485,29 @@ pub(super) fn cmd_dev_apple_container_status() -> Result<()> {
     Ok(())
 }
 
+/// Inspect dev caches without booting, rebuilding, or exposing local
+/// artifact paths/digests.
+pub(super) fn cmd_dev_cache_inspect(json: bool) -> Result<()> {
+    let summary = resolve_dev_cache_inspect_summary();
+    if json {
+        println!("{}", dev_cache_inspect_json(&summary)?);
+        return Ok(());
+    }
+
+    ui::info("Dev cache:");
+    ui::info(&format!(
+        "  Dev image: {} (kernel: {}, rootfs: {})",
+        summary.dev_image.state, summary.dev_image.kernel, summary.dev_image.rootfs
+    ));
+    ui::info(&format!(
+        "  Builder:   {} cache {} (reason: {})",
+        summary.builder_cache.cache_kind,
+        summary.builder_cache.state.label(),
+        summary.builder_cache.reason_code
+    ));
+    Ok(())
+}
+
 #[derive(Debug, Eq, PartialEq)]
 struct DevStatusImage {
     kernel_path: Option<String>,
@@ -566,6 +590,83 @@ struct BuilderVmCacheStatusSummary {
     cache_kind: &'static str,
     state: BuilderVmCacheState,
     reason_code: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct DevImageCacheSummary {
+    state: &'static str,
+    kernel: &'static str,
+    rootfs: &'static str,
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct DevCacheInspectSummary {
+    dev_image: DevImageCacheSummary,
+    builder_cache: BuilderVmCacheStatusSummary,
+}
+
+#[derive(Debug, Serialize)]
+struct DevCacheInspectJson {
+    schema_version: u8,
+    dev_image: DevImageCacheJson,
+    builder_cache: BuilderVmCacheJson,
+}
+
+#[derive(Debug, Serialize)]
+struct DevImageCacheJson {
+    state: &'static str,
+    kernel: &'static str,
+    rootfs: &'static str,
+}
+
+#[derive(Debug, Serialize)]
+struct BuilderVmCacheJson {
+    kind: &'static str,
+    state: &'static str,
+    reason_code: &'static str,
+}
+
+fn resolve_dev_cache_inspect_summary() -> DevCacheInspectSummary {
+    DevCacheInspectSummary {
+        dev_image: dev_image_cache_summary(resolve_dev_status_image().as_ref()),
+        builder_cache: resolve_builder_vm_cache_status_summary(),
+    }
+}
+
+fn dev_image_cache_summary(image: Option<&DevStatusImage>) -> DevImageCacheSummary {
+    match image {
+        Some(image) => DevImageCacheSummary {
+            state: "cached",
+            kernel: if image.kernel_path.is_some() {
+                "present"
+            } else {
+                "missing"
+            },
+            rootfs: "present",
+        },
+        None => DevImageCacheSummary {
+            state: "missing",
+            kernel: "missing",
+            rootfs: "missing",
+        },
+    }
+}
+
+fn dev_cache_inspect_json(summary: &DevCacheInspectSummary) -> Result<String> {
+    let output = DevCacheInspectJson {
+        schema_version: 1,
+        dev_image: DevImageCacheJson {
+            state: summary.dev_image.state,
+            kernel: summary.dev_image.kernel,
+            rootfs: summary.dev_image.rootfs,
+        },
+        builder_cache: BuilderVmCacheJson {
+            kind: summary.builder_cache.cache_kind,
+            state: summary.builder_cache.state.label(),
+            reason_code: summary.builder_cache.reason_code,
+        },
+    };
+    serde_json::to_string_pretty(&output).context("serializing dev cache inspection JSON")
 }
 
 fn resolve_builder_vm_cache_status_summary() -> BuilderVmCacheStatusSummary {
@@ -3422,6 +3523,56 @@ mod dev_status_image_tests {
                 reason_code: "hit",
             }
         );
+    }
+
+    #[test]
+    fn dev_image_cache_summary_never_includes_paths() {
+        let image = DevStatusImage {
+            kernel_path: Some("/private/tmp/mvm/vmlinux".to_string()),
+            rootfs_path: "/private/tmp/mvm/rootfs.ext4".to_string(),
+        };
+
+        assert_eq!(
+            dev_image_cache_summary(Some(&image)),
+            DevImageCacheSummary {
+                state: "cached",
+                kernel: "present",
+                rootfs: "present",
+            }
+        );
+        assert_eq!(
+            dev_image_cache_summary(None),
+            DevImageCacheSummary {
+                state: "missing",
+                kernel: "missing",
+                rootfs: "missing",
+            }
+        );
+    }
+
+    #[test]
+    fn dev_cache_inspect_json_omits_paths_and_digests() {
+        let summary = DevCacheInspectSummary {
+            dev_image: DevImageCacheSummary {
+                state: "cached",
+                kernel: "present",
+                rootfs: "present",
+            },
+            builder_cache: BuilderVmCacheStatusSummary {
+                cache_kind: "source",
+                state: BuilderVmCacheState::Ready,
+                reason_code: "hit",
+            },
+        };
+
+        let json = dev_cache_inspect_json(&summary).expect("serialize JSON");
+        assert!(json.contains("\"schema_version\": 1"));
+        assert!(json.contains("\"builder_cache\""));
+        assert!(json.contains("\"reason_code\": \"hit\""));
+        assert!(!json.contains("/private/tmp"));
+        assert!(!json.contains("sha256"));
+        assert!(!json.contains("rootfs.ext4"));
+        assert!(!json.contains("vmlinux"));
     }
 }
 
