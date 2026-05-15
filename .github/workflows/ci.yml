@@ -198,9 +198,8 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-e2e-
 
       - name: Run E2E tests
-        # Keep this lane on non-microsandbox end-to-end smoke targets.
-        # The old `smoke_e2e_boot` target depended on the removed
-        # upstream microsandbox crate and was deleted with that backend.
+        # Keep this lane on end-to-end smoke targets that compile
+        # without live microVM host state.
         run: cargo test --test smoke_run_json_receipt --test runtime_boot_bench
 
   # Note: cargo-audit, cargo-deny, reproducibility, and prod-agent-no-exec
