@@ -473,6 +473,14 @@ pub(super) fn cmd_dev_apple_container_status() -> Result<()> {
         ui::info("  Image:   not built");
     }
 
+    let builder_cache = resolve_builder_vm_cache_status_summary();
+    ui::info(&format!(
+        "  Builder: {} cache {} (reason: {})",
+        builder_cache.cache_kind,
+        builder_cache.state.label(),
+        builder_cache.reason_code
+    ));
+
     Ok(())
 }
 
@@ -536,6 +544,81 @@ fn plist_env_string_value(plist: &str, key: &str) -> Option<String> {
             .map(str::to_string);
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BuilderVmCacheState {
+    Ready,
+    Stale,
+}
+
+impl BuilderVmCacheState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct BuilderVmCacheStatusSummary {
+    cache_kind: &'static str,
+    state: BuilderVmCacheState,
+    reason_code: &'static str,
+}
+
+fn resolve_builder_vm_cache_status_summary() -> BuilderVmCacheStatusSummary {
+    builder_vm_cache_status_summary(
+        find_builder_vm_flake(),
+        std::path::Path::new(&mvm_core::config::mvm_cache_dir()),
+        builder_vm_host_arch(),
+    )
+}
+
+fn builder_vm_cache_status_summary(
+    builder_flake: Result<String>,
+    cache_root: &std::path::Path,
+    arch: &str,
+) -> BuilderVmCacheStatusSummary {
+    let cache_dir = cache_root.join("builder-vm").join(arch);
+    let Ok(flake_dir) = builder_flake else {
+        return release_builder_vm_cache_status_summary(&cache_dir);
+    };
+    let Ok(fingerprint) = builder_vm_source_fingerprint(&flake_dir) else {
+        return BuilderVmCacheStatusSummary {
+            cache_kind: "source",
+            state: BuilderVmCacheState::Stale,
+            reason_code: "source_fingerprint_error",
+        };
+    };
+    let status = builder_vm_source_cache_status(&cache_dir, &fingerprint);
+    BuilderVmCacheStatusSummary {
+        cache_kind: "source",
+        state: if status.is_ready() {
+            BuilderVmCacheState::Ready
+        } else {
+            BuilderVmCacheState::Stale
+        },
+        reason_code: status.reason_code(),
+    }
+}
+
+fn release_builder_vm_cache_status_summary(
+    cache_dir: &std::path::Path,
+) -> BuilderVmCacheStatusSummary {
+    if validate_builder_vm_stage0_artifacts(cache_dir).is_ok() {
+        return BuilderVmCacheStatusSummary {
+            cache_kind: "release",
+            state: BuilderVmCacheState::Ready,
+            reason_code: "hit",
+        };
+    }
+    BuilderVmCacheStatusSummary {
+        cache_kind: "release",
+        state: BuilderVmCacheState::Stale,
+        reason_code: "missing_or_invalid_artifacts",
+    }
 }
 
 /// Prepare `~/.mvm/dev/current/` for a fresh dev-image build.
@@ -1818,11 +1901,7 @@ fn find_builder_vm_flake() -> Result<String> {
 /// `builder-vm` is on.
 #[allow(dead_code)]
 fn bootstrap_builder_vm_image() -> Result<()> {
-    let arch = if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "x86_64"
-    };
+    let arch = builder_vm_host_arch();
     let out_dir = format!("{}/builder-vm/{arch}", mvm_core::config::mvm_cache_dir());
     let out_dir_path = std::path::Path::new(&out_dir);
     let builder_flake = find_builder_vm_flake();
@@ -1865,6 +1944,14 @@ fn bootstrap_builder_vm_image() -> Result<()> {
         BuilderVmBootstrapAction::DownloadPublished => {
             perform_builder_vm_download_published(arch, &out_dir)
         }
+    }
+}
+
+fn builder_vm_host_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
     }
 }
 
@@ -2661,6 +2748,22 @@ mod dev_status_image_tests {
         std::fs::write(path, b"test").unwrap();
     }
 
+    fn write_valid_builder_cache_artifacts(dir: &std::path::Path) {
+        const EXT4_MAGIC_OFFSET: usize = 1024 + 56;
+        std::fs::create_dir_all(dir).expect("mkdir artifact dir");
+        std::fs::write(dir.join("vmlinux"), vec![0x7f; 1024 * 1024 + 1]).expect("write kernel");
+        let mut rootfs = vec![0u8; 4 * 1024 * 1024 + 1];
+        rootfs[EXT4_MAGIC_OFFSET] = 0x53;
+        rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
+        std::fs::write(dir.join("rootfs.ext4"), rootfs).expect("write rootfs");
+    }
+
+    fn write_builder_vm_flake(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).expect("mkdir flake dir");
+        std::fs::write(dir.join("flake.nix"), "{ outputs = _: {}; }").expect("write flake");
+        std::fs::write(dir.join("flake.lock"), "{\"nodes\":{}}").expect("write lock");
+    }
+
     #[test]
     fn status_image_prefers_launchd_image_paths() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -2789,6 +2892,92 @@ mod dev_status_image_tests {
         );
 
         assert_eq!(resolve_dev_status_image(), None);
+    }
+
+    #[test]
+    fn builder_cache_status_reports_source_cache_hit_without_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let flake = tmp.path().join("nix/images/builder-vm");
+        let cache_root = tmp.path().join("cache");
+        let cache = cache_root.join("builder-vm/testarch");
+        write_builder_vm_flake(&flake);
+        write_valid_builder_cache_artifacts(&cache);
+        let fingerprint = builder_vm_source_fingerprint(flake.to_str().unwrap()).unwrap();
+        write_builder_vm_source_fingerprint(&cache, &fingerprint).unwrap();
+        write_builder_vm_artifact_digest_manifest(&cache).unwrap();
+        write_builder_vm_source_cache_provenance(&cache, &fingerprint).unwrap();
+
+        assert_eq!(
+            builder_vm_cache_status_summary(
+                Ok(flake.to_string_lossy().into_owned()),
+                &cache_root,
+                "testarch"
+            ),
+            BuilderVmCacheStatusSummary {
+                cache_kind: "source",
+                state: BuilderVmCacheState::Ready,
+                reason_code: "hit",
+            }
+        );
+    }
+
+    #[test]
+    fn builder_cache_status_reports_source_provenance_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let flake = tmp.path().join("nix/images/builder-vm");
+        let cache_root = tmp.path().join("cache");
+        let cache = cache_root.join("builder-vm/testarch");
+        write_builder_vm_flake(&flake);
+        write_valid_builder_cache_artifacts(&cache);
+        let fingerprint = builder_vm_source_fingerprint(flake.to_str().unwrap()).unwrap();
+        write_builder_vm_source_fingerprint(&cache, &fingerprint).unwrap();
+        write_builder_vm_artifact_digest_manifest(&cache).unwrap();
+
+        assert_eq!(
+            builder_vm_cache_status_summary(
+                Ok(flake.to_string_lossy().into_owned()),
+                &cache_root,
+                "testarch"
+            ),
+            BuilderVmCacheStatusSummary {
+                cache_kind: "source",
+                state: BuilderVmCacheState::Stale,
+                reason_code: "missing_provenance",
+            }
+        );
+    }
+
+    #[test]
+    fn builder_cache_status_reports_release_cache_without_source_flake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("cache");
+
+        assert_eq!(
+            builder_vm_cache_status_summary(
+                Err(anyhow::anyhow!("missing source flake")),
+                &cache_root,
+                "testarch",
+            ),
+            BuilderVmCacheStatusSummary {
+                cache_kind: "release",
+                state: BuilderVmCacheState::Stale,
+                reason_code: "missing_or_invalid_artifacts",
+            }
+        );
+
+        write_valid_builder_cache_artifacts(&cache_root.join("builder-vm/testarch"));
+        assert_eq!(
+            builder_vm_cache_status_summary(
+                Err(anyhow::anyhow!("missing source flake")),
+                &cache_root,
+                "testarch",
+            ),
+            BuilderVmCacheStatusSummary {
+                cache_kind: "release",
+                state: BuilderVmCacheState::Ready,
+                reason_code: "hit",
+            }
+        );
     }
 }
 
