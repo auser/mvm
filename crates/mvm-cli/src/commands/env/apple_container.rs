@@ -1914,6 +1914,17 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     Ok(())
 }
 
+#[cfg(not(feature = "builder-vm"))]
+fn bootstrap_builder_vm_image_via_dev_image_stage0(
+    builder_flake_dir: &str,
+    _out_dir: &str,
+) -> Result<()> {
+    anyhow::bail!(
+        "cannot build builder VM image from source checkout at {builder_flake_dir}: \
+         mvm-cli was built without the `builder-vm` feature"
+    )
+}
+
 #[cfg(feature = "builder-vm")]
 fn builder_vm_stage0_bootstrap_plan(
     builder_flake_dir: &str,
