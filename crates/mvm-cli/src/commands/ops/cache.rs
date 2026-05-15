@@ -100,9 +100,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             // takes the Stage 0 advisory lock to avoid racing a live
             // bootstrap; if the lock is held it skips silently and we
             // proceed with the temp-file sweep.
-            match super::super::env::apple_container::sweep_orphaned_stage0_staging_dirs(
-                dry_run,
-            ) {
+            match super::super::env::apple_container::sweep_orphaned_stage0_staging_dirs(dry_run) {
                 Ok(super::super::env::apple_container::Stage0SweepOutcome::Swept {
                     removed: r,
                     freed_bytes,

@@ -2031,9 +2031,9 @@ fn builder_vm_stage0_bootstrap_plan(
 fn acquire_stage0_lock(out_dir: &str) -> Result<mvm_core::atomic_io::FileLock> {
     use mvm_core::atomic_io::FileLock;
 
-    let parent = std::path::Path::new(out_dir).parent().ok_or_else(|| {
-        anyhow::anyhow!("builder VM cache path has no parent: {out_dir}")
-    })?;
+    let parent = std::path::Path::new(out_dir)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("builder VM cache path has no parent: {out_dir}"))?;
     std::fs::create_dir_all(parent)
         .with_context(|| format!("creating builder-vm cache parent {}", parent.display()))?;
     let lock_anchor = parent.join("stage0");
@@ -3167,8 +3167,7 @@ mod builder_vm_bootstrap_tests {
         let out_dir = tmp.path().join("aarch64");
         let out_dir_str = out_dir.to_str().expect("utf-8 out_dir");
 
-        let first =
-            acquire_stage0_lock(out_dir_str).expect("first acquisition should succeed");
+        let first = acquire_stage0_lock(out_dir_str).expect("first acquisition should succeed");
         // Lock file lives one directory above out_dir, named `stage0.lock`.
         assert!(
             tmp.path().join("stage0.lock").exists(),
@@ -3205,8 +3204,8 @@ mod builder_vm_bootstrap_tests {
         let nested = tmp.path().join("nested/builder-vm/aarch64");
         let nested_str = nested.to_str().expect("utf-8 nested");
 
-        let _guard = acquire_stage0_lock(nested_str)
-            .expect("acquisition should create missing parent dir");
+        let _guard =
+            acquire_stage0_lock(nested_str).expect("acquisition should create missing parent dir");
         assert!(
             tmp.path().join("nested/builder-vm/stage0.lock").exists(),
             "lock file must be created at the constructed parent path"
@@ -3244,9 +3243,7 @@ mod builder_vm_bootstrap_tests {
         // Dotfile that isn't a staging dir.
         assert!(!is_orphan_stage0_staging_dir_name(".DS_Store"));
         // Unknown arch suffixes are conservative-deny.
-        assert!(!is_orphan_stage0_staging_dir_name(
-            ".riscv64.stage0-1-2"
-        ));
+        assert!(!is_orphan_stage0_staging_dir_name(".riscv64.stage0-1-2"));
         assert!(!is_orphan_stage0_staging_dir_name("riscv64-staging"));
     }
 
@@ -3289,9 +3286,7 @@ mod builder_vm_bootstrap_tests {
         assert!(live_cache.is_dir(), "dry-run must not touch the live cache");
 
         // Real run: orphan goes, siblings stay.
-        match sweep_orphaned_stage0_staging_dirs_at(&root, false)
-            .expect("sweep should succeed")
-        {
+        match sweep_orphaned_stage0_staging_dirs_at(&root, false).expect("sweep should succeed") {
             Stage0SweepOutcome::Swept {
                 removed,
                 freed_bytes,
@@ -3306,10 +3301,7 @@ mod builder_vm_bootstrap_tests {
             live_cache.join("rootfs.ext4").is_file(),
             "live cache must be untouched"
         );
-        assert!(
-            nix_store.is_file(),
-            "nix-store image must be untouched"
-        );
+        assert!(nix_store.is_file(), "nix-store image must be untouched");
     }
 
     /// Plan 77 W2 — when a live Stage 0 is in progress and holds the
