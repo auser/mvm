@@ -189,6 +189,7 @@ impl Commands {
             Commands::Trust(_) => "trust",
             Commands::Tenant(_) => "tenant",
             Commands::Deps(_) => "deps",
+            Commands::Overlay(_) => "overlay",
         }
     }
 }

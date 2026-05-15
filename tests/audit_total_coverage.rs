@@ -217,6 +217,26 @@ const DEPS_SUB: &[(&str, AuditPosture)] = &[
     ("audit", AuditPosture::Emits("DepsAudit")),
 ];
 
+// Plan 74 W1.4b.5 — `mvmctl overlay fetch` downloads + hash-verifies
+// + installs the per-arch runtime overlay (ADR-051). The fetch is a
+// pure cache-population operation: no host workload runs, no
+// in-guest agent is involved, and no admission decision happens.
+// Audit-wise it's `ReadOnly` because nothing it does is a
+// security-relevant decision; failures (digest mismatch, missing
+// manifest) are already surfaced by the `image_verify_*` counters
+// in `mvm-build`'s download path, which the global metrics
+// collector exposes. Treating `fetch` as `Emits` would require
+// inventing a new `LocalAuditKind::OverlayFetch` for an operation
+// whose security story is already covered by the SHA-256 manifest
+// + verity sealing — overkill for v1.
+const OVERLAY_SUB: &[(&str, AuditPosture)] = &[
+    ("fetch", AuditPosture::ReadOnly),
+    // `status` is pure cache introspection — opens four files
+    // and prints (or JSON-emits) their state. No mutation, no
+    // security decision, no admission gate.
+    ("status", AuditPosture::ReadOnly),
+];
+
 /// Every top-level `mvmctl` subcommand keyed by its clap name.
 ///
 /// Order matches the `Commands` enum in
@@ -293,6 +313,8 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("tenant", AuditPosture::DelegatesToSub(TENANT_SUB)),
     // Plan 73 Followup C — sealed deps-volume cache verbs.
     ("deps", AuditPosture::DelegatesToSub(DEPS_SUB)),
+    // Plan 74 W1.4b.5 — runtime overlay fetch (ADR-051).
+    ("overlay", AuditPosture::DelegatesToSub(OVERLAY_SUB)),
 ];
 
 // ──────────────────────────────────────────────────────────────────
