@@ -84,6 +84,13 @@ impl VmStartParams<'_> {
                 })
                 .collect(),
             runner_dir: None,
+            // Plan 74 W1.4b — runtime overlay wiring lives behind
+            // the `mvmctl run --runtime-overlay` opt-in surface,
+            // not this generic params struct. Leaving the three
+            // overlay fields at their `None` defaults keeps the
+            // boot path identical to pre-W1.4b for every caller
+            // that goes through `VmStartParams`.
+            ..Default::default()
         }
     }
 }

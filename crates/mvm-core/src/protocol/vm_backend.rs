@@ -44,6 +44,27 @@ pub struct VmStartConfig {
     /// 64-char lowercase-hex root hash from `rootfs.roothash`. Baked
     /// into the kernel cmdline as `dm-mod.create=`. ADR-002 §W3.2.
     pub roothash: Option<String>,
+    /// Plan 74 W1.4b — absolute path to the mvm runtime overlay
+    /// ext4 (ADR-051). When all three of
+    /// `runtime_overlay_path`, `runtime_overlay_verity_path`,
+    /// and `runtime_overlay_roothash` are `Some`, the backend
+    /// attaches the overlay as a second virtio-blk drive at
+    /// `/dev/vdc` and threads `mvm.runtime_roothash=<hex>` into
+    /// the kernel cmdline so `mvm-verity-init` (the W1.4b.3b.2
+    /// PID 1) sets up the second dm-verity target and
+    /// bind-mounts it at `/sysroot/mvm/runtime`. All three
+    /// `None` ⇒ legacy boot path (rootfs verity only).
+    pub runtime_overlay_path: Option<String>,
+    /// Plan 74 W1.4b — absolute path to the mvm runtime overlay
+    /// verity sidecar (ADR-051). Paired with
+    /// `runtime_overlay_path` + `runtime_overlay_roothash`; the
+    /// backend attaches it as the fourth virtio-blk drive at
+    /// `/dev/vdd`.
+    pub runtime_overlay_verity_path: Option<String>,
+    /// Plan 74 W1.4b — 64-char lowercase-hex root hash for the
+    /// runtime overlay (ADR-051). Baked into the kernel cmdline
+    /// as `mvm.runtime_roothash=<hex>`.
+    pub runtime_overlay_roothash: Option<String>,
     /// Nix store revision hash.
     pub revision_hash: String,
     /// Original flake reference (for display / status).
