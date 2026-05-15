@@ -26,6 +26,11 @@ uuid.workspace = true
 fs2.workspace = true
 regex = "1"
 tempfile.workspace = true
+# Plan 74 W2 — `mandatory_deny_ranges` parses a small set of
+# IPv4/IPv6 CIDRs (cloud metadata endpoint, link-local, CGNAT,
+# host loopback). Workspace-pinned (already used by
+# `mvm-supervisor::proxy::l4`).
+ipnet = { workspace = true }
 
 [lints]
 workspace = true

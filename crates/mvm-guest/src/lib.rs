@@ -7,6 +7,13 @@ pub mod entrypoint;
 pub mod fs_rpc;
 pub mod integrations;
 pub mod lifecycle_hooks;
+/// Plan 74 W2 — guest-side network defense. The `mvm-guest-netinit`
+/// binary calls into this module at boot to install kernel blackhole
+/// routes for `MANDATORY_DENY_RANGES` before any workload code runs.
+/// The module's types + install loop + tests build everywhere; the
+/// `RtnetlinkInstaller` (which talks to `AF_NETLINK`) is Linux-only
+/// and gated inside the module.
+pub mod netinit;
 pub mod probes;
 pub mod runtime_config;
 pub mod volume;
