@@ -166,6 +166,8 @@ const SNAPSHOT_SUB: &[(&str, AuditPosture)] = &[
 const ARTIFACT_SUB: &[(&str, AuditPosture)] = &[
     ("pack", AuditPosture::ReadOnly),
     ("verify", AuditPosture::ReadOnly),
+    // Plan 76 follow-up — read manifest without signature check.
+    ("inspect", AuditPosture::ReadOnly),
 ];
 
 // Sprint 52 W2 — bundle / trust subcommand tables.

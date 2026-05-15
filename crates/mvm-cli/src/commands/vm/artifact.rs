@@ -10,7 +10,8 @@ use anyhow::{Context, Result, bail};
 use clap::{Args as ClapArgs, Subcommand, ValueEnum};
 
 use mvm_build::packed_artifact::{
-    ArtifactProfile, PackInputs, SecurityPosture, pack as pack_artifact, verify as verify_artifact,
+    ArtifactProfile, PackInputs, SecurityPosture, inspect_unverified, pack as pack_artifact,
+    verify as verify_artifact,
 };
 use mvm_core::user_config::MvmConfig;
 
@@ -34,6 +35,13 @@ pub(in crate::commands) enum Cmd {
     /// Exits 0 on success, 65 (`EX_DATAERR`) on a verification
     /// failure. Does not extract payload bytes to disk.
     Verify(VerifyArgs),
+    /// Print a `.mvm` manifest's contents WITHOUT verifying the
+    /// signature. Useful for debugging ("what's in this file?") and
+    /// for tools that don't have the producer's verifying key —
+    /// e.g. surfacing a registry artifact's file list before the
+    /// operator decides whether to trust the producer. For trust
+    /// checks use `mvmctl artifact verify`.
+    Inspect(InspectArgs),
 }
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -87,6 +95,17 @@ pub(in crate::commands) struct PackArgs {
 }
 
 #[derive(ClapArgs, Debug, Clone)]
+pub(in crate::commands) struct InspectArgs {
+    /// Path to the `.mvm` artifact to inspect.
+    pub path: PathBuf,
+    /// Emit the parsed manifest as JSON. Default is a human
+    /// summary mirroring `mvmctl artifact verify` minus the
+    /// "verified" header.
+    #[arg(long)]
+    pub json: bool,
+}
+
+#[derive(ClapArgs, Debug, Clone)]
 pub(in crate::commands) struct VerifyArgs {
     /// Path to the `.mvm` artifact to verify.
     pub path: PathBuf,
@@ -122,7 +141,47 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     match args.command {
         Cmd::Pack(a) => run_pack(a),
         Cmd::Verify(a) => run_verify(a),
+        Cmd::Inspect(a) => run_inspect(a),
     }
+}
+
+fn run_inspect(args: InspectArgs) -> Result<()> {
+    let manifest = inspect_unverified(&args.path)
+        .with_context(|| format!("inspect {}", args.path.display()))?;
+    if args.json {
+        println!("{}", serde_json::to_string_pretty(&manifest)?);
+    } else {
+        // Lead with the "unverified" qualifier so an operator
+        // reading the output never mistakes inspect for verify.
+        crate::ui::info(&format!(
+            "{}: unverified manifest ({}, profile={:?}, {} files)",
+            args.path.display(),
+            manifest.target_arch,
+            manifest.security.profile,
+            manifest.files.len()
+        ));
+        if let Some(prov) = manifest.build_provenance.as_deref() {
+            println!("  build_provenance: {prov}");
+        }
+        println!("  security:");
+        println!(
+            "    verity_protected: {}",
+            manifest.security.verity_protected
+        );
+        println!("    requires_auth:    {}", manifest.security.requires_auth);
+        println!("    allows_volumes:   {}", manifest.security.allows_volumes);
+        println!("    allows_egress:    {}", manifest.security.allows_egress);
+        println!("  files:");
+        for entry in manifest.files.values() {
+            println!(
+                "    {:<32} {:>12} bytes  sha256:{}…",
+                entry.path,
+                entry.size_bytes,
+                &entry.sha256_hex[..16.min(entry.sha256_hex.len())]
+            );
+        }
+    }
+    Ok(())
 }
 
 fn run_pack(args: PackArgs) -> Result<()> {

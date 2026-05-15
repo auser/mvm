@@ -1327,6 +1327,19 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         let agent_ready = wait_for_guest_agent(&vm_name, 30);
         if agent_ready {
             record_vm_readiness(&vm_name, InstanceReadiness::AgentReady);
+            // Plan 74 W2 — agent ready means /init ran, which
+            // means `mvm-guest-netinit` produced its report.
+            // Parse the console log and emit
+            // `NetworkMandatoryDeny` audit records. Best-effort:
+            // a missing marker (older template) or unreadable
+            // log is fine, we just skip silently.
+            if let Err(e) = mvm_backend::netinit_audit::emit_for_vm(&vm_name) {
+                tracing::debug!(
+                    vm = %vm_name,
+                    error = %e,
+                    "netinit audit emit skipped (best-effort)"
+                );
+            }
             let timeout = std::time::Duration::from_secs(services_health_timeout_secs);
             super::readiness::wait_for_services_ready(&vm_name, timeout);
         } else {
@@ -1802,9 +1815,24 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         // --json` shows a useful wait reason for every VM.
         ui::info("Waiting for guest agent...");
         record_vm_readiness(&vm_name_owned, InstanceReadiness::AgentConnecting);
+        // (netinit audit emission below this site, after the
+        // wait_for_guest_agent call succeeds — see the matching
+        // FC path for the same wiring.)
         let agent_ready = wait_for_guest_agent(&vm_name_owned, 30);
         if agent_ready {
             record_vm_readiness(&vm_name_owned, InstanceReadiness::AgentReady);
+            // Plan 74 W2 — same audit-emit as the FC path. Apple
+            // Container backend captures the guest console to
+            // the same `<vm_dir>/console.log` convention; the
+            // emit_for_vm helper handles a missing log file by
+            // returning Ok(None).
+            if let Err(e) = mvm_backend::netinit_audit::emit_for_vm(&vm_name_owned) {
+                tracing::debug!(
+                    vm = %vm_name_owned,
+                    error = %e,
+                    "netinit audit emit skipped (best-effort)"
+                );
+            }
             let timeout = std::time::Duration::from_secs(services_health_timeout_secs);
             super::readiness::wait_for_services_ready(&vm_name_owned, timeout);
         } else {

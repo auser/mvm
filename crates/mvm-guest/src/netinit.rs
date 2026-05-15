@@ -56,6 +56,55 @@ use async_trait::async_trait;
 use ipnet::IpNet;
 use serde::{Deserialize, Serialize};
 
+/// Canonical line marker that the `mvm-guest-netinit` binary
+/// prefixes to its JSON output line. The host-side console
+/// scrape greps for this to extract the [`Report`] from the
+/// VM's console log (firecracker.log on FC, libkrun console
+/// output on libkrun). Keeping the marker as a public const here
+/// — not duplicated in both the binary and the host parser —
+/// means a future rename surfaces immediately as a compile
+/// failure on both sides.
+///
+/// The marker is deliberately distinctive: a sequence the
+/// kernel and busybox both stay away from. Underscores +
+/// uppercase + double-underscore framing puts it well outside
+/// any reasonable log message.
+pub const REPORT_MARKER: &str = "__MVM_NETINIT_REPORT__";
+
+/// Parse a console log buffer for the netinit report.
+///
+/// Scans `log` line-by-line for [`REPORT_MARKER`]; the *last*
+/// matching line wins (a workload might restart and re-run
+/// netinit, in which case the latest report reflects the live
+/// kernel route state). Returns `None` if no marker is present
+/// or every marker line carries unparseable JSON.
+///
+/// Pure function: no I/O, no allocation beyond the parsed
+/// `Report`. Tests construct synthetic console buffers; the
+/// live host-side caller reads the console log into a `String`
+/// and hands it here.
+pub fn parse_report_from_console(log: &str) -> Option<Report> {
+    let mut last: Option<Report> = None;
+    for line in log.lines() {
+        // The marker can appear anywhere on the line — the kernel
+        // sometimes prefixes timestamps or `[mvm-init]` tags. We
+        // match by substring and then take everything after the
+        // marker + one space.
+        if let Some(idx) = line.find(REPORT_MARKER) {
+            let json_start = idx + REPORT_MARKER.len();
+            let json = line[json_start..].trim_start();
+            // A malformed line is silently skipped rather than
+            // aborting the scan — partial console capture is a
+            // real failure mode and we'd rather emit nothing
+            // than wedge the host start path on garbage.
+            if let Ok(parsed) = serde_json::from_str::<Report>(json) {
+                last = Some(parsed);
+            }
+        }
+    }
+    last
+}
+
 /// What was installed for a single CIDR.
 ///
 /// `category` is owned `String` (not `&'static str`) so the
@@ -422,6 +471,103 @@ mod tests {
             .expect("at least one installed entry in clean run");
         assert!(first.get("cidr").is_some());
         assert!(first.get("category").is_some());
+    }
+
+    // ────────────────────────────────────────────────────────────
+    // Console-scrape parser tests
+    // ────────────────────────────────────────────────────────────
+
+    fn fake_report_json() -> String {
+        // A minimal Report shape — one installed, one failed,
+        // one skipped — that exercises every field path on the
+        // parser side.
+        r#"{"installed":[{"cidr":"169.254.169.254/32","category":"cloud-metadata"}],"failed":[{"cidr":"127.0.0.0/8","category":"loopback","reason":"forced"}],"skipped_ipv6":["::1/128"]}"#.to_string()
+    }
+
+    #[test]
+    fn parse_report_extracts_from_clean_line() {
+        let log = format!("__MVM_NETINIT_REPORT__ {}", fake_report_json());
+        let report = parse_report_from_console(&log).expect("parser must extract");
+        assert_eq!(report.installed.len(), 1);
+        assert_eq!(report.installed[0].category, "cloud-metadata");
+        assert_eq!(report.failed.len(), 1);
+        assert_eq!(report.skipped_ipv6.len(), 1);
+    }
+
+    #[test]
+    fn parse_report_ignores_unrelated_console_lines() {
+        let report_line = fake_report_json();
+        let log = format!(
+            "[    0.000000] Booting Linux...\n\
+             [    0.123456] random: crng init done\n\
+             [mvm-init] mounted /proc /sys /dev\n\
+             __MVM_NETINIT_REPORT__ {report_line}\n\
+             [mvm-agent] starting on vsock port 5252\n"
+        );
+        let report = parse_report_from_console(&log).expect("must find the one marker line");
+        assert_eq!(report.installed.len(), 1);
+    }
+
+    #[test]
+    fn parse_report_returns_none_when_no_marker() {
+        let log = "kernel boot ... busybox ... agent up ... no report here";
+        assert!(parse_report_from_console(log).is_none());
+    }
+
+    #[test]
+    fn parse_report_returns_none_when_marker_present_but_json_malformed() {
+        let log = "__MVM_NETINIT_REPORT__ {this is not json}";
+        assert!(parse_report_from_console(log).is_none());
+    }
+
+    #[test]
+    fn parse_report_returns_last_marker_when_multiple() {
+        // Multi-boot or restart scenario: two markers on the
+        // console, the LATER one reflects live state.
+        let log = format!(
+            "__MVM_NETINIT_REPORT__ {{\"installed\":[],\"failed\":[],\"skipped_ipv6\":[]}}\n\
+             other stuff\n\
+             __MVM_NETINIT_REPORT__ {}\n",
+            fake_report_json()
+        );
+        let report = parse_report_from_console(&log).expect("parser must extract last");
+        // The last marker is the one with cloud-metadata installed;
+        // a returned empty report would mean we kept the FIRST.
+        assert_eq!(report.installed.len(), 1);
+    }
+
+    #[test]
+    fn parse_report_handles_kernel_timestamp_prefix() {
+        // Kernel console output frequently prefixes lines with
+        // `[    1.234567]` timestamps. The marker should be
+        // findable mid-line, not only at start.
+        let log = format!(
+            "[    1.234567] __MVM_NETINIT_REPORT__ {}",
+            fake_report_json()
+        );
+        let report = parse_report_from_console(&log).expect("marker mid-line must parse");
+        assert_eq!(report.installed.len(), 1);
+    }
+
+    #[test]
+    fn report_marker_is_distinctive_enough() {
+        // Defensive: the marker must not appear in obvious
+        // kernel/busybox/agent log patterns. A future rename to
+        // something kernel-message-shaped would break console
+        // grep silently; pin the current value here so a refactor
+        // has to update the test.
+        assert_eq!(REPORT_MARKER, "__MVM_NETINIT_REPORT__");
+        for noise in [
+            "[    0.000000] Booting Linux",
+            "[mvm-init] mounted /proc",
+            "[mvm-agent] starting on vsock port 5252",
+            "kernel: AF_VSOCK ready",
+        ] {
+            assert!(
+                !noise.contains(REPORT_MARKER),
+                "marker collides with kernel/agent log: {noise}"
+            );
+        }
     }
 
     #[test]
