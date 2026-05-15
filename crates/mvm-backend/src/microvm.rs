@@ -118,6 +118,21 @@ pub fn resolve_running_vm_dir(name: &str) -> Result<String> {
     Ok(format!("{}/{}", abs_vms, name))
 }
 
+/// Resolve the path to the per-VM serial console log file.
+///
+/// Plan 74 W2 — the host-side netinit-audit emitter
+/// (`netinit_audit::emit_for_vm`) reads this file after the
+/// agent is ready and parses the netinit Report from the
+/// captured `__MVM_NETINIT_REPORT__` line. The path follows the
+/// existing convention (`<vm_dir>/console.log`); a backend
+/// that doesn't split console + hypervisor logs returns a
+/// path that may not exist, which the caller treats as
+/// "no netinit report available" rather than an error.
+pub fn vm_console_log_path(vm_name: &str) -> Result<std::path::PathBuf> {
+    let abs_dir = resolve_running_vm_dir(vm_name)?;
+    Ok(std::path::PathBuf::from(format!("{abs_dir}/console.log")))
+}
+
 /// Start the Firecracker daemon inside the Lima VM (background).
 #[instrument(skip_all)]
 fn start_firecracker_daemon(abs_dir: &str) -> Result<()> {
