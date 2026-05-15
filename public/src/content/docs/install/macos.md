@@ -1,15 +1,19 @@
 ---
 title: "Install mvm on macOS"
-description: "mvm on macOS uses native virtualization paths. No Docker Desktop required. Apple Silicon (arm64) is the primary target; Intel Macs work too."
+description: "mvm on macOS supports Apple Silicon through Hypervisor.framework-backed local builder/runtime paths. Intel Macs are not a supported local microVM host."
 ---
 
-mvm on macOS uses native virtualization paths documented in the backend matrix.
-Apple Silicon can use Apple Container on macOS 26+ or direct libkrun.
-Intel Macs use direct libkrun; Apple Container is not available there.
+mvm on macOS is supported on **Apple Silicon (M-series)**. The local builder/runtime path uses Apple's Hypervisor.framework via Apple Container and libkrun-backed components. No Docker Desktop is required for the supported path.
+
+Intel Macs are not a supported local microVM host. Use a Linux machine with `/dev/kvm` or a remote Linux builder/runtime if you need first-class isolation from Intel macOS.
 
 ## Prerequisites
 
-- macOS 13 (Ventura) or newer. macOS 12 might work but isn't tested.
+- Apple Silicon Mac.
+- macOS 26+ for the Apple Container dev VM path.
+- libkrun installed for libkrun-backed builder/runtime components.
+
+You **do not need Nix on your Mac**. You run `mvmctl build` from macOS, and mvm runs Nix evaluation and `nix build` inside the Linux builder VM, then extracts the resulting rootfs back to the host. See [§"Linux builds on macOS"](#linux-builds-on-macos--zero-config-by-default) below for the design.
 
 ## Install mvmctl
 
@@ -64,7 +68,7 @@ If you configure [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/sta
 mvmctl doctor
 ```
 
-`doctor` reports the active backend and relevant virtualization prerequisites.
+`doctor` reports the active backend and libkrun availability. On an Apple Silicon Mac with macOS 26+, the dev path uses Apple Container and source image builds use the libkrun-backed builder VM.
 
 ## First microVM
 
@@ -84,7 +88,15 @@ mvmctl run
 
 **`mvmctl run` boots but `mvmctl console` fails to attach** — the `console` subcommand is only enabled for *accessible* images. If your `entrypoint.command = [ ... ]`, the build is *sealed* and console attach is rejected. Switch to `entrypoint.shell = "/bin/sh"` or pass `dev = true` in your `mkGuest` call. See [Building MicroVM Images](/guides/building-microvm-images).
 
+**"libkrun shared library not found"** — install libkrun, then rerun the command. On Apple Silicon with Homebrew:
+
+```bash
+brew install libkrun
+```
+
 ## Apple Silicon vs Intel notes
 
-- **Apple Silicon (M1/M2/M3/M4)** — Apple Container on macOS 26+ when available; otherwise direct libkrun via Hypervisor.framework.
-- **Intel Macs** — direct libkrun via Hypervisor.framework. Install libkrun and verify with `mvmctl doctor`; Apple Container will not be selected.
+- **Apple Silicon (M1/M2/M3/M4 and newer)** — supported local path. Apple Container covers the dev VM, and libkrun backs builder/runtime components that need Hypervisor.framework directly.
+- **Intel Macs** — unsupported for the local microVM path. Run mvm on a Linux KVM host, or use future remote/Windows-style builder work when it lands.
+
+The Apple Container backend requires Apple Silicon and macOS 26+. libkrun is also treated as an Apple Silicon macOS path for mvm support purposes.

@@ -1,20 +1,23 @@
 //! `mvmctl dev` — manage the development environment.
 //!
-//! Host classes and dev paths:
+//! Supported local development hosts:
 //!
-//! - **macOS with libkrun** → boots the dev VM via libkrun on
-//!   Hypervisor.framework and exposes a PTY-over-vsock console.
+//! - **macOS Apple Silicon with libkrun** → boots the dev VM via
+//!   libkrun on Hypervisor.framework and exposes a PTY-over-vsock
+//!   console.
 //! - **macOS 26+ Apple Silicon without libkrun** →
 //!   `super::apple_container` boots a dev VM via Apple
 //!   Virtualization.framework and exposes a PTY-over-vsock console.
-//! - **Linux + KVM** → `super::linux_native` treats the host shell as
+//! - **native Linux + KVM** → `super::linux_native` treats the host shell as
 //!   the dev environment, installs Firecracker + downloads kernel/
 //!   rootfs assets, and optionally spawns an interactive subshell.
 //!   This is the W8.C path — replaces the W7-deleted Lima
 //!   `dev_up`/`dev_down`/`dev_status` helpers.
-//! - **macOS Intel / pre-26 / no-KVM Linux** → bails with a clear
-//!   reference to the W7.x.2 libkrun-builder-VM follow-up,
-//!   the only path that brings Firecracker to those hosts.
+//!
+//! macOS Intel, macOS pre-26, Linux without KVM, WSL2, and native
+//! Windows bail with a clear unsupported-platform message. WSL2 with
+//! nested KVM and a Hyper-V managed Linux builder are future backend
+//! projects, not supported local paths today.
 
 use anyhow::Result;
 use clap::{Args as ClapArgs, Subcommand};
@@ -38,12 +41,11 @@ enum DevBackend {
     Libkrun,
     /// macOS 26+ Apple Silicon — Apple Container dev VM.
     AppleContainer,
-    /// Linux with `/dev/kvm` — host shell is the dev environment;
+    /// Native Linux with `/dev/kvm` — host shell is the dev environment;
     /// Firecracker runs natively.
     LinuxKvm,
     /// Neither path is wired today — macOS Intel, macOS pre-26,
-    /// Linux without KVM, Windows. The libkrun builder VM
-    /// (W7.x.2) is the planned home for these.
+    /// Linux without KVM, WSL2, and native Windows.
     Unsupported,
 }
 
@@ -53,7 +55,7 @@ fn current_backend() -> DevBackend {
         DevBackend::Libkrun
     } else if plat.has_apple_containers() {
         DevBackend::AppleContainer
-    } else if plat.has_kvm() && matches!(plat, Platform::LinuxNative | Platform::Wsl2) {
+    } else if plat.has_kvm() && matches!(plat, Platform::LinuxNative) {
         DevBackend::LinuxKvm
     } else {
         DevBackend::Unsupported
@@ -147,22 +149,17 @@ pub(in crate::commands) enum DevAction {
     },
 }
 
-/// Error shown on hosts where `mvmctl dev` can't run today — macOS
-/// Intel, macOS pre-26, Linux without KVM, Windows. Points the user
-/// at the W7.x.2 libkrun-builder-VM follow-up so they have
-/// somewhere to look rather than an opaque "not implemented"
-/// message.
+/// Error shown on hosts where `mvmctl dev` can't run today.
 fn bail_no_dev_backend() -> Result<()> {
     anyhow::bail!(
         "`mvmctl dev` requires either:\n  \
-           - macOS with libkrun (Hypervisor.framework dev VM),\n  \
+           - macOS Apple Silicon with libkrun (Hypervisor.framework dev VM),\n  \
            - macOS 26+ Apple Silicon (Apple Container dev VM), or\n  \
-           - Linux with /dev/kvm (Firecracker runs natively on host).\n\
-         This host has neither. The libkrun builder VM (W7.x.2 \
-         in specs/SPRINT.md) is the planned path for macOS Intel / \
-         pre-26 / no-KVM Linux. Until that lands, run workloads \
-         directly with `mvmctl up <flake>` using whichever backend \
-         `mvmctl doctor` reports as available."
+           - native Linux with /dev/kvm (Firecracker runs on the host).\n\
+         This host has neither. WSL2 with nested KVM and a Hyper-V \
+         managed Linux builder are future backend work, not supported \
+         local dev paths today. Run on an M-series Mac or a Linux KVM \
+         host for the supported local workflow."
     );
 }
 
@@ -336,8 +333,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             DevBackend::Unsupported => {
                 ui::info(
                     "Dev environment: not configured on this host (Apple Container \
-                     unavailable and /dev/kvm missing). See W7.x.2 in specs/SPRINT.md \
-                     for the planned libkrun-builder-VM path.",
+                     unavailable and native /dev/kvm missing). WSL2 nested KVM and \
+                     Hyper-V managed Linux builders are future backend work.",
                 );
                 Ok(())
             }

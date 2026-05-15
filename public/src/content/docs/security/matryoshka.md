@@ -63,7 +63,7 @@ mvm runs on multiple backends. Not all backends carry all seven claims. The tier
 |---|---|---|---|---|---|---|
 | **Firecracker** (Linux + KVM) | ✅ | ✅ | ✅ | ✅ | ✅ | **Tier 1** — full ADR-002. All seven claims hold. |
 | **Apple Container** (macOS 26+ Apple Silicon) | ✅ | ✅ | ⚠️ | ✅ | ✅ | Tier 2 — claim 3 (verified boot) is partial. Other six claims hold. |
-| **libkrun** (Linux KVM, macOS HVF) | ✅ | ✅ | ⚠️ | ✅ | ✅ | Tier 2 — same as Apple Container. |
+| **libkrun** (Linux KVM, macOS Apple Silicon HVF) | ✅ | ✅ | ⚠️ | ✅ | ✅ | Tier 2 — same as Apple Container. |
 | **Docker** (any host with Docker) | ❌ | ❌ | ❌ | ✅ | ✅ | **Tier 3** — claims 1, 2, 3 do **not** hold. L1–L3 collapse to the host kernel. |
 | **microvm.nix** (QEMU + KVM) | ✅ | ⚠️ | ⚠️ | ✅ | ✅ | Tier 2 — QEMU's larger device model raises L2 audit cost. |
 
@@ -92,7 +92,7 @@ ack_docker_tier = true
 
 - **Production / untrusted code** → Tier 1. Linux + KVM + Firecracker. No exceptions.
 - **macOS dev or CI on Apple Silicon** → Tier 2 (Apple Container or libkrun). Verified boot is the open item.
-- **macOS Intel / pre-26 dev** → Tier 2 (libkrun).
+- **macOS Intel / native Windows / WSL2** → unsupported for local microVM isolation today. WSL2 nested KVM and Hyper-V managed Linux builder support are future backend work.
 - **Anywhere else** → Tier 3 (Docker), with the banner caveats.
 
 `mvmctl doctor` reports your current tier on the running host.

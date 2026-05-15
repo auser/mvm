@@ -10,8 +10,8 @@ mvmctl supports multiple VM backends and auto-selects the best one for your plat
 | Backend | Platform | Selection Priority |
 |---------|----------|-------------------|
 | Firecracker | Linux with `/dev/kvm` | 1st (preferred) |
-| libkrun | macOS Apple Silicon / Intel (Hypervisor.framework) | 2nd |
-| Apple Container | macOS 26+ (Apple Silicon) | 3rd fallback |
+| libkrun | macOS Apple Silicon (Hypervisor.framework) | 2nd |
+| Apple Container | macOS 26+ Apple Silicon | 3rd fallback |
 | Docker | Any platform with Docker daemon | 4th (reduced isolation) |
 | microvm.nix | Linux (NixOS-native QEMU) | Via `--hypervisor qemu` |
 
@@ -85,8 +85,8 @@ VM lifecycle abstraction defined in `mvm-core`:
 
 Implementations:
 - **`FirecrackerBackend`** -- KVM microVMs via Firecracker (Linux native)
-- **`LibkrunBackend`** -- Hypervisor.framework via libkrun (macOS Apple Silicon / Intel)
-- **`AppleContainerBackend`** -- Virtualization.framework fallback (macOS 26+)
+- **`AppleContainerBackend`** -- Virtualization.framework (macOS 26+ Apple Silicon)
+- **`LibkrunBackend`** -- libkrun-backed local VM support (Linux KVM, macOS Apple Silicon)
 - **`MicrovmNixBackend`** -- NixOS-native QEMU runner
 - **`DockerBackend`** -- Container-based fallback, universal platform support
 - **`AnyBackend`** -- enum dispatch, auto-selects at runtime
@@ -137,15 +137,18 @@ Extends `ShellEnvironment` for fleet orchestration:
 
 At startup, mvmctl detects the platform and selects the appropriate backend:
 
-1. **Linux with `/dev/kvm`** -- uses `FirecrackerBackend` directly via `NativeEnv`
-2. **macOS with libkrun** -- uses `LibkrunBackend` via `Hypervisor.framework`; Nix builds run inside the builder VM
-3. **macOS 26+ without libkrun** -- uses `AppleContainerBackend` as a fallback; Nix builds run inside the builder VM
-4. **No KVM / no Apple Container / no libkrun** -- falls back to `DockerBackend` (reduced isolation; see [Matryoshka model](/security/matryoshka))
+1. **Native Linux with `/dev/kvm`** -- uses `FirecrackerBackend` for runtime VM lifecycle
+2. **macOS 26+ Apple Silicon** -- uses `AppleContainerBackend` for dev/runtime VM lifecycle; Nix builds run inside the libkrun-backed builder VM
+3. **Other hosts** -- unsupported for local microVM isolation today; Docker is a Tier 3 convenience fallback only (see [Matryoshka model](/security/matryoshka))
+
+WSL2 nested KVM and a Hyper-V managed Linux builder are future backend work, not part of the supported local platform matrix.
 
 ```
-Host (macOS/Linux)
-  └── VM Backend (auto-selected)
-        └── Guest (your workload, headless, vsock only)
+Host (macOS Apple Silicon / native Linux KVM)
+  ├── Builder VM
+  │     └── nix eval / nix build / artifact extraction
+  └── Runtime backend (auto-selected)
+        └── Runtime guest (your workload, headless, vsock where supported)
 ```
 
 ## Build Pipeline
@@ -162,9 +165,9 @@ No initrd is needed -- the kernel boots directly into a busybox init script on t
 | Platform | Architecture | Backend |
 |----------|-------------|---------|
 | macOS | Apple Silicon (aarch64) | libkrun (Hypervisor.framework) |
-| macOS | Intel (x86_64) | libkrun (Hypervisor.framework) |
 | macOS 26+ without libkrun | Apple Silicon (aarch64) | Apple Container fallback |
 | Linux with `/dev/kvm` | x86_64, aarch64 | Firecracker (native) |
 | Linux without `/dev/kvm` | x86_64, aarch64 | Docker (Tier 3 fallback) |
-| WSL2 | x86_64 | Docker (may have KVM) |
+| macOS Intel | x86_64 | Unsupported for local microVMs |
+| WSL2 | x86_64 | Future/experimental backend work |
 | Any platform with Docker | x86_64, aarch64 | Docker (universal fallback) |

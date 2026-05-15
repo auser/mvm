@@ -448,9 +448,9 @@ fn platform_description(plat: Platform) -> String {
         Platform::LinuxNoKvm => "Linux without KVM".to_string(),
         Platform::Wsl2 => {
             if plat.has_kvm() {
-                "WSL2 (KVM available)".to_string()
+                "WSL2 (nested KVM present; experimental/unsupported)".to_string()
             } else {
-                "WSL2 (no KVM)".to_string()
+                "WSL2 (no nested KVM; unsupported)".to_string()
             }
         }
         Platform::Windows => "Windows".to_string(),
@@ -562,7 +562,7 @@ fn libkrun_check(plat: Platform) -> Check {
             name: "libkrun",
             category: "platform",
             ok: true,
-            info: "n/a (no Windows port — use WSL2)".to_string(),
+            info: "n/a (no native Windows port; WSL2 is future/experimental)".to_string(),
         };
     }
     if plat.has_libkrun() {

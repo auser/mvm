@@ -1,19 +1,19 @@
 ---
-title: "WSL2 walkthrough for mvm"
-description: "Step-by-step WSL2 setup for mvm with notes on nested virt, port forwarding, file sharing, and the bootstrap automation that's coming in Sprint 48."
+title: "WSL2 notes for mvm"
+description: "Experimental WSL2 notes for mvm. WSL2 nested KVM is future backend work, not a supported local host today."
 ---
 
-This page is the long-form companion to the [Windows install quickstart](/install/windows). It walks through the WSL2 setup choices that matter for mvm and documents a few quirks unique to running microVMs on Windows.
+This page captures WSL2 research notes for future Windows support. WSL2 is **not** a supported local microVM host today.
 
 ## Why WSL2 for mvm
 
-WSL2 is a real Linux kernel running under Hyper-V. From inside a WSL2 distro:
+WSL2 is a real Linux kernel running under Hyper-V, but mvm does not yet treat it as a supported backend. A future WSL2 path would require nested KVM to be present and tested in CI. From inside a capable WSL2 distro:
 
-- **`/dev/kvm` is available** (since Windows 10 21H2). Firecracker runs natively, giving you Tier 1 microVM isolation — the same as a native Linux host.
+- **`/dev/kvm` may be available** on some Windows 11/WSL2 combinations. When it is missing, mvm cannot run the Linux KVM path.
 - **Filesystem is real Linux ext4**. APFS-style copy-on-write isn't here yet (Sprint 47 Plan D ships APFS CoW for macOS Apple Container; WSL2's ext4 will fall back to byte-copy in `mvm-runtime::vm::cow::reflink_or_copy`), but everything functionally works.
 - **Networking is bridged** through Hyper-V's vmswitch. Port forwarding from Windows host to a WSL2 distro is automatic for `127.0.0.1` binds; mvm guests behind the WSL2 distro need an additional hop, covered below.
 
-The cost is one nested VM hop: workload runs inside Firecracker microVM → which runs inside WSL2 → which runs inside Hyper-V on the Windows host. The boot-time penalty is small (~150ms), the runtime penalty is in the noise.
+The cost is one nested VM hop: workload runs inside a microVM, inside WSL2, inside Hyper-V on the Windows host. We do not currently publish performance or support guarantees for that stack.
 
 ## Setup
 
@@ -74,19 +74,18 @@ Then `http://<that-ip>:8080` from Windows.
 
 If you need to read source from a Windows directory, do it explicitly with `cp` rather than running `cargo build` against a `/mnt/c/` path.
 
-## What's coming in Sprint 48
+## Future Backend Work
 
-[Plan I.4](https://github.com/tinylabscom/mvm/blob/main/specs/plans/53-cross-platform-roadmap.md) (WSL2 bootstrap automation) will turn the manual steps above into:
+Two Windows paths remain plausible future work:
 
-```powershell
-mvmctl bootstrap
-```
+- WSL2 experimental backend, gated on nested KVM and `/dev/kvm`.
+- Hyper-V managed Linux builder/backend VM, with its own lifecycle and trust model.
 
-— detect Windows + WSL2 status, offer to install if missing, install mvm into the chosen distro, set up shared `~/.mvm`. Until then, follow the [install quickstart](/install/windows).
+Neither path is part of the supported local platform matrix today.
 
 ## See also
 
 - [Install on Windows](/install/windows)
-- [Matryoshka model](/security/matryoshka) — what Tier 1 promises and why WSL2 carries it
+- [Matryoshka model](/security/matryoshka) — what each isolation tier promises
 - [Windows troubleshooting](/guides/windows-troubleshooting)
 - [WSL2 documentation](https://learn.microsoft.com/en-us/windows/wsl/)

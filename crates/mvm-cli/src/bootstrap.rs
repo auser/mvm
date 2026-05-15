@@ -112,8 +112,8 @@ pub fn check_homebrew() -> Result<()> {
 
 /// Print an informational hint about libkrun availability (plan 53
 /// §"Plan E"). libkrun is optional — when it's available, `mvmctl run`
-/// can use it as a Tier 2 backend on macOS Intel and macOS <26 (where
-/// Apple Container is unavailable). This function does *not* attempt
+/// can use it as a Tier 2 backend on supported libkrun hosts: Linux
+/// with KVM and macOS Apple Silicon. This function does *not* attempt
 /// to install libkrun automatically since it lives in the host's
 /// package manager (Homebrew on macOS, distro packages on Linux).
 ///
@@ -131,12 +131,11 @@ pub fn hint_libkrun_if_useful() {
         );
         return;
     }
-    // Only suggest the install on platforms where libkrun would
-    // materially improve the user experience — i.e. macOS without
-    // Apple Container.
-    if matches!(plat, Platform::MacOS) && !plat.has_apple_containers() {
+    // Only suggest the install on macOS Apple Silicon. libkrun does
+    // not give us a supported Intel Mac or native Windows path.
+    if matches!(plat, Platform::MacOS) && cfg!(target_arch = "aarch64") {
         ui::info(&format!(
-            "Tip: install libkrun for a Tier 2 microVM path on this Mac.\n  {}",
+            "Tip: install libkrun for the local builder/runtime path on this Apple Silicon Mac.\n  {}",
             mvm_libkrun::install_hint()
         ));
     }

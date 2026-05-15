@@ -1,48 +1,33 @@
 ---
 title: "Install mvm on Windows"
-description: "mvm runs on Windows via WSL2 with first-class Tier 1 microVM isolation. This page is the entry point for Windows users."
+description: "Windows is not a supported local microVM host today. WSL2 nested KVM and Hyper-V managed Linux builders are future backend work."
 ---
 
-mvm on Windows uses **WSL2** as its primary supported path. Inside a WSL2 distro you get the same Tier 1 microVM isolation as a Linux host (Firecracker + KVM). This is the recommended setup for any Windows user who wants real microVM workloads.
+mvm does **not** currently support native Windows as a local microVM host. The supported local hosts are:
 
-If WSL2 isn't an option for your environment, you can fall back to the Tier 3 Docker tier — but that's a container, not a microVM, and the security model collapses. See the [Matryoshka model](/security/matryoshka) for what each tier promises.
+- macOS Apple Silicon.
+- Native Linux with `/dev/kvm`.
 
-## Quickstart (WSL2 — recommended)
+WSL2 with nested KVM is a future/experimental backend candidate, not a support promise. A managed Linux builder VM on Hyper-V is also future work.
 
-You'll need: Windows 10 21H2+ or Windows 11 (any), with a CPU that supports virtualization (most modern Intel/AMD). Most laptops bought after 2018 qualify.
+## Current Windows Guidance
 
-1. **Enable WSL2** (one-time, requires admin):
-   ```powershell
-   wsl --install
-   ```
-   This installs WSL2 + the default Ubuntu distro and enables the Hyper-V components mvm needs. Reboot when prompted.
+Use one of these paths today:
 
-2. **Open the Ubuntu shell** (Start menu → "Ubuntu") and update:
-   ```bash
-   sudo apt-get update && sudo apt-get install -y curl git build-essential
-   ```
+- Run mvm on a Linux host with `/dev/kvm`.
+- Run mvm on an Apple Silicon Mac.
+- Use Docker only for non-security-sensitive experimentation, understanding that it is Tier 3 and not a microVM isolation boundary.
 
-3. **Install mvmctl**:
-   ```bash
-   cargo install --git https://github.com/tinylabscom/mvm mvmctl
-   ```
-   Or download a release binary from the [releases page](https://github.com/tinylabscom/mvm/releases).
+## Experimental: WSL2 With Nested KVM
 
-4. **First-time setup**:
-   ```bash
-   mvmctl bootstrap
-   ```
-   This pulls the dev image, verifies the SHA-256 manifest, and installs Firecracker. Idempotent — safe to re-run. You don't need Nix in your WSL2 distro: mvm bootstraps a builder microVM on first build and runs `nix build` inside it.
+Some WSL2 installations expose `/dev/kvm` through nested virtualization. If present, pieces of the Linux path may work, but this is not a supported backend yet. Before treating it as usable, verify inside the WSL2 distro:
 
-5. **Verify Tier 1 isolation**:
-   ```bash
-   mvmctl doctor
-   ```
-   Look for `Active backend: firecracker (KVM available)` and the all-✓ Security posture section.
+```bash
+test -c /dev/kvm && test -w /dev/kvm
+mvmctl doctor
+```
 
-You're done. From here, follow the [Quick Start](/getting-started/quickstart) — everything works the same as on a native Linux host because WSL2 *is* a Linux host as far as mvm is concerned.
-
-See the [WSL2 walkthrough](/guides/windows-wsl2) for detail on bootstrap automation, port forwarding from Windows to a guest, and a few WSL2-specific quirks.
+If either check fails, use a supported host. See the [WSL2 notes](/guides/windows-wsl2) for details and caveats.
 
 ### Optional: host-side Nix (in WSL2) for power users
 
@@ -57,7 +42,7 @@ When `mvmctl build` detects a working host-side Nix that can build Linux derivat
 
 ## Alternative: Tier 3 Docker fallback
 
-If WSL2 isn't an option (corporate IT lock-down, no nested virt, etc.), Docker Desktop on Windows can run mvm at Tier 3. **You give up microVM isolation** — see the [Matryoshka model](/security/matryoshka) — so this path is for *non-security-sensitive* workloads only.
+Docker Desktop on Windows can run mvm at Tier 3. **You give up microVM isolation** — see the [Matryoshka model](/security/matryoshka) — so this path is for *non-security-sensitive* workloads only.
 
 ```powershell
 # Inside a Docker Desktop linux container or WSL2 distro:
@@ -70,18 +55,17 @@ mvmctl run --hypervisor docker --flake .
 $env:MVM_ACK_DOCKER_TIER = "1"
 ```
 
-The Docker tier exists as a convenience, not a sandbox. If your workload involves untrusted code, AI-generated scripts, or anything you wouldn't run as your own user, switch to WSL2.
+The Docker tier exists as a convenience, not a sandbox. If your workload involves untrusted code, AI-generated scripts, or anything you wouldn't run as your own user, switch to a supported Apple Silicon or Linux KVM host.
 
 ## What about native Windows microVMs?
 
-There isn't a maintained native-Windows microVM stack we'd want to ship today. We considered Cloud Hypervisor + WHPX (the Hyper-V virtualization API) and rejected it for security-posture reasons — see [plan 53 §"Plan F"](https://github.com/tinylabscom/mvm/blob/main/specs/plans/54-cloud-hypervisor-deferred.md) and the [Matryoshka model](/security/matryoshka). The 2026 microVM ecosystem treats Windows as a *guest OS*, not a *host platform* for microVM tooling. WSL2 is the right answer.
+There isn't a maintained native-Windows microVM stack we support today. Hyper-V is the likely future Windows direction, but as a **managed Linux builder/backend VM**, not as part of the libkrun path.
 
-If you need a real native-Windows microVM tool, look at Docker Desktop's own sandbox feature (released Jan 2026) — it uses Hyper-V directly and is purpose-built for that. mvm complements rather than competes.
+That future backend needs its own lifecycle, filesystem, networking, and trust model. Until it lands, native Windows remains unsupported.
 
 ## Troubleshooting
 
-- **"WSL2 not available" on install** — make sure CPU virtualization is enabled in BIOS. On laptops this is often *Intel VT-x* / *AMD-V*. After enabling, run `wsl --install` again.
-- **`/dev/kvm` missing inside WSL2** — older Windows builds don't expose nested KVM. Update Windows to the latest 11 release; `wsl --update` after.
-- **`mvmctl doctor` reports "no KVM available"** — see the [No /dev/kvm available](/guides/troubleshooting#no-devkvm-available-cloud-vms-without-nested-virt) troubleshooting entry.
+- **`/dev/kvm` missing inside WSL2** — this is expected on many hosts. WSL2 nested KVM is experimental for mvm.
+- **`mvmctl doctor` reports "no KVM available"** — use a supported Linux KVM host or Apple Silicon Mac.
 
 See [Windows troubleshooting](/guides/windows-troubleshooting) for the full Windows-specific FAQ.

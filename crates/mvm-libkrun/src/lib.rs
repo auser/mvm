@@ -2,9 +2,9 @@
 //!
 //! libkrun is a library-style VMM: linked directly into the calling binary
 //! rather than spawned as a separate daemon. On Linux it uses KVM; on
-//! macOS it uses Hypervisor.framework. It is the only VMM mvm carries
-//! that runs on both macOS Apple Silicon **and** macOS Intel without
-//! Lima.
+//! macOS it uses Hypervisor.framework. mvm supports this path on Linux
+//! with KVM and macOS Apple Silicon; macOS Intel is intentionally not a
+//! supported local microVM host.
 //!
 //! # Build modes
 //!
@@ -136,7 +136,7 @@ pub fn install_paths() -> Vec<&'static str> {
     {
         vec![
             "/opt/homebrew/lib/libkrun.dylib", // Apple Silicon Homebrew
-            "/usr/local/lib/libkrun.dylib",    // Intel Homebrew + manual installs
+            "/usr/local/lib/libkrun.dylib",    // manual installs
         ]
     }
     #[cfg(target_os = "linux")]

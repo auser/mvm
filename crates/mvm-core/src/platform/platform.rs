@@ -4,15 +4,15 @@ use std::sync::OnceLock;
 /// The execution environment for running workloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
-    /// macOS — Apple Container on Apple Silicon/macOS 26+, or libkrun via Hypervisor.framework.
+    /// macOS — supported for local builder/runtime work only on Apple Silicon.
     MacOS,
     /// Native Linux with /dev/kvm available — run Firecracker directly
     LinuxNative,
-    /// Linux without /dev/kvm (not WSL) — Docker fallback.
+    /// Linux without /dev/kvm (not WSL) — no supported local microVM path.
     LinuxNoKvm,
-    /// WSL2 — may have KVM (Hyper-V nested virt), prefers Firecracker when available
+    /// WSL2 — future/experimental local path when nested KVM is present.
     Wsl2,
-    /// Native Windows — WSL2 via mvm-studio Tauri shell (ADR-031)
+    /// Native Windows — no local microVM path; Hyper-V builder is future work.
     Windows,
 }
 
@@ -28,7 +28,7 @@ impl Platform {
 
     /// Whether the microvm.nix runner can execute natively on this host.
     pub fn supports_native_runner(self) -> bool {
-        matches!(self, Platform::LinuxNative) || (matches!(self, Platform::Wsl2) && self.has_kvm())
+        matches!(self, Platform::LinuxNative)
     }
 
     /// Whether Apple Containers are available on this platform.
@@ -44,16 +44,22 @@ impl Platform {
     /// Whether libkrun is installed on this host.
     ///
     /// libkrun (plan 53 §"Plan E") is a library-style VMM that runs on
-    /// Linux KVM and macOS Hypervisor.framework — including macOS Intel
-    /// where Apple Container is unavailable. Detection is a filesystem
-    /// probe of standard install paths (Homebrew on macOS, distro
-    /// packages on Linux); it does *not* guarantee the library will
-    /// load cleanly or that we have the macOS hypervisor entitlement.
-    /// The Sprint 48 spike phase wires up the actual VM lifecycle on
-    /// top of this detection.
+    /// Linux KVM and macOS Hypervisor.framework on Apple Silicon.
+    /// macOS Intel and native Windows are intentionally unsupported.
+    /// WSL2 is treated as future/experimental even if nested KVM is
+    /// exposed. Detection is a filesystem probe of standard install
+    /// paths (Homebrew on macOS, distro packages on Linux); it does
+    /// *not* guarantee the library will load cleanly or that we have
+    /// the macOS hypervisor entitlement.
     pub fn has_libkrun(self) -> bool {
-        // Windows is unsupported regardless of any library being present.
-        if matches!(self, Platform::Windows) {
+        if matches!(
+            self,
+            Platform::Windows | Platform::Wsl2 | Platform::LinuxNoKvm
+        ) {
+            return false;
+        }
+        #[cfg(all(target_os = "macos", not(target_arch = "aarch64")))]
+        if matches!(self, Platform::MacOS) {
             return false;
         }
         mvm_libkrun::is_available()
@@ -98,10 +104,9 @@ impl Platform {
 
     /// Whether Nix is available on the host and can build Linux targets.
     ///
-    /// On macOS this requires nix-daemon with a linux-builder configured.
-    /// On native Linux this is always true if `nix` is on PATH.
-    /// When true, `nix build` can run on the host directly. When false
-    /// on macOS, the builder VM handles cross-builds.
+    /// Host-side Nix is no longer the normal mvm build boundary; the
+    /// project builder VM owns Nix eval/build work. This probe remains
+    /// for direct debug paths and legacy callers only.
     pub fn has_host_nix(self) -> bool {
         static HOST_NIX: OnceLock<bool> = OnceLock::new();
         *HOST_NIX.get_or_init(|| {
@@ -195,9 +200,9 @@ impl std::fmt::Display for Platform {
             Platform::LinuxNoKvm => write!(f, "Linux (no KVM)"),
             Platform::Wsl2 => {
                 if self.has_kvm() {
-                    write!(f, "WSL2 (KVM available)")
+                    write!(f, "WSL2 (nested KVM present; experimental)")
                 } else {
-                    write!(f, "WSL2")
+                    write!(f, "WSL2 (unsupported)")
                 }
             }
             Platform::Windows => write!(f, "Windows"),
@@ -263,6 +268,7 @@ mod tests {
         assert!(!Platform::MacOS.supports_native_runner());
         assert!(Platform::LinuxNative.supports_native_runner());
         assert!(!Platform::LinuxNoKvm.supports_native_runner());
+        assert!(!Platform::Wsl2.supports_native_runner());
         assert!(!Platform::Windows.supports_native_runner());
     }
 
@@ -283,11 +289,13 @@ mod tests {
 
     #[test]
     fn test_has_libkrun_consistent_with_libkrun_crate() {
-        // On non-Windows platforms, has_libkrun() agrees with the
-        // libkrun crate's authoritative is_available() probe.
+        // On supported libkrun platforms, has_libkrun() agrees with
+        // the libkrun crate's authoritative is_available() probe.
         let plat = current();
-        if !matches!(plat, Platform::Windows) {
+        if matches!(plat, Platform::LinuxNative | Platform::MacOS) {
             assert_eq!(plat.has_libkrun(), mvm_libkrun::is_available());
+        } else {
+            assert!(!plat.has_libkrun());
         }
     }
 

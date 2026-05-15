@@ -31,12 +31,9 @@ pub(super) fn run_steps(production: bool) -> Result<()> {
         bootstrap::check_package_manager()?;
     }
 
-    // Plan-60 / ADR-013: dev mode is libkrun/Apple-Container, not
-    // Lima — there's no Lima VM to provision here. The host-side
-    // prerequisite hint (libkrun on macOS Intel) is the only legacy
-    // bootstrap surface left; setup_steps below handles Firecracker
-    // assets via `run_in_vm`, which the W8 direct-launch rewrite will
-    // collapse into a host-only operation.
+    // Dev mode is libkrun/Apple-Container on Apple Silicon macOS or
+    // native Firecracker on Linux KVM. There is no Lima VM to provision
+    // here; setup_steps below handles the remaining assets.
     bootstrap::hint_libkrun_if_useful();
 
     // Default sizing for the builder VM; CLI-level overrides ride the
