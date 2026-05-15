@@ -1833,6 +1833,13 @@ fn bootstrap_builder_vm_image() -> Result<()> {
             ui::info(&format!("Builder VM image already cached at {out_dir}."));
             Ok(())
         }
+        BuilderVmBootstrapAction::BuildFromSource { flake_dir } => {
+            ui::info(&format!(
+                "Builder VM image not in cache; building locally from {flake_dir}..."
+            ));
+            bootstrap_builder_vm_image_via_dev_image_stage0(&flake_dir, &out_dir)
+                .context("building the source-checkout builder VM image")
+        }
         BuilderVmBootstrapAction::DownloadPublished => {
             ui::info(&format!(
                 "Builder VM image not in cache; downloading published prebuilt for v{}...",
@@ -1843,9 +1850,10 @@ fn bootstrap_builder_vm_image() -> Result<()> {
     }
 }
 
-#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+#[derive(Debug, Clone, Eq, PartialEq)]
 enum BuilderVmBootstrapAction {
     UseCached,
+    BuildFromSource { flake_dir: String },
     DownloadPublished,
 }
 
@@ -1858,14 +1866,102 @@ fn resolve_builder_vm_bootstrap_action(
     }
 
     match builder_flake {
-        Ok(flake_dir) => anyhow::bail!(
-            "builder VM image cache is missing, and this mvmctl was built from a source checkout \
-             with a local builder VM flake at {flake_dir}. Refusing to download a published \
-             builder VM prebuilt because it would mask local changes. Build the builder VM image \
-             from nix/images/builder-vm/flake.nix and populate ~/.cache/mvm/builder-vm/<arch>/{{vmlinux,rootfs.ext4}}."
-        ),
+        Ok(flake_dir) => Ok(BuilderVmBootstrapAction::BuildFromSource { flake_dir }),
         Err(_) => Ok(BuilderVmBootstrapAction::DownloadPublished),
     }
+}
+
+#[cfg(feature = "builder-vm")]
+const STAGE0_BOOTSTRAP_CMDLINE: &str =
+    "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-builder-init";
+
+#[cfg(feature = "builder-vm")]
+fn bootstrap_builder_vm_image_via_dev_image_stage0(
+    builder_flake_dir: &str,
+    out_dir: &str,
+) -> Result<()> {
+    use mvm_build::builder_vm::BuilderVm as _;
+    use mvm_build::libkrun_builder::LibkrunBuilderVm;
+
+    let (kernel, rootfs, source_label) = find_local_fallback_image().ok_or_else(|| {
+        anyhow::anyhow!(
+            "source checkout builder VM cache is missing and no local dev image cache was found \
+             under ~/.mvm/dev/prebuilt/v*/ or ~/.mvm/dev/builds/*/. Refusing to download a \
+             published builder VM prebuilt. Import or build a dev image that contains \
+             /sbin/mvm-builder-init, then retry `mvmctl dev up`."
+        )
+    })?;
+
+    ui::info(&format!(
+        "Using local dev image cache ({source_label}) as Stage 0 bootstrap image."
+    ));
+    let (job, mounts, bootstrap_image) =
+        builder_vm_stage0_bootstrap_plan(builder_flake_dir, out_dir, kernel, rootfs)?;
+
+    LibkrunBuilderVm::default()
+        .with_image_override(bootstrap_image)
+        .run_build(&job, &mounts)
+        .map_err(|e| anyhow::anyhow!("Stage 0 builder VM build: {e}"))?;
+
+    let kernel = format!("{out_dir}/vmlinux");
+    let rootfs = format!("{out_dir}/rootfs.ext4");
+    if !std::path::Path::new(&kernel).is_file() {
+        anyhow::bail!("Stage 0 builder VM build did not produce {kernel}");
+    }
+    if !std::path::Path::new(&rootfs).is_file() {
+        anyhow::bail!("Stage 0 builder VM build did not produce {rootfs}");
+    }
+    Ok(())
+}
+
+#[cfg(not(feature = "builder-vm"))]
+fn bootstrap_builder_vm_image_via_dev_image_stage0(
+    builder_flake_dir: &str,
+    _out_dir: &str,
+) -> Result<()> {
+    anyhow::bail!(
+        "cannot build builder VM image from source checkout at {builder_flake_dir}: \
+         mvm-cli was built without the `builder-vm` feature"
+    )
+}
+
+#[cfg(feature = "builder-vm")]
+fn builder_vm_stage0_bootstrap_plan(
+    builder_flake_dir: &str,
+    out_dir: &str,
+    bootstrap_kernel: std::path::PathBuf,
+    bootstrap_rootfs: std::path::PathBuf,
+) -> Result<(
+    mvm_build::builder_vm::BuilderJob,
+    mvm_build::builder_vm::BuilderMounts,
+    mvm_build::libkrun_builder::BuilderVmImage,
+)> {
+    use mvm_build::builder_vm::{BuilderJob, BuilderMounts, host_system_linux};
+    use mvm_build::libkrun_builder::BuilderVmImage;
+
+    let workspace_root = std::path::Path::new(builder_flake_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive workspace root from {builder_flake_dir}"))?
+        .to_path_buf();
+
+    let job = BuilderJob::Flake {
+        flake_ref: "path:/work/nix/images/builder-vm".to_string(),
+        attr_path: format!("packages.{}.default", host_system_linux()),
+    };
+    let mounts = BuilderMounts {
+        flake_src: workspace_root,
+        host_nix_store: None,
+        artifact_out: std::path::PathBuf::from(out_dir),
+    };
+    let bootstrap_image = BuilderVmImage::new(
+        bootstrap_kernel,
+        bootstrap_rootfs,
+        STAGE0_BOOTSTRAP_CMDLINE.to_string(),
+    );
+
+    Ok((job, mounts, bootstrap_image))
 }
 
 /// Download the per-arch Layer 1 builder VM artifacts published by the
@@ -2495,21 +2591,19 @@ mod builder_vm_bootstrap_tests {
     }
 
     #[test]
-    fn builder_vm_bootstrap_source_checkout_refuses_prebuilt_download_on_cache_miss() {
-        let err = resolve_builder_vm_bootstrap_action(
+    fn builder_vm_bootstrap_source_checkout_builds_from_source_on_cache_miss() {
+        let action = resolve_builder_vm_bootstrap_action(
             Ok("/repo/nix/images/builder-vm".to_string()),
             false,
         )
-        .expect_err("source checkout cache miss must not download a published prebuilt");
+        .expect("source checkout cache miss should route to local source build");
 
-        let msg = format!("{err:#}");
-        assert!(msg.contains("source checkout"), "{msg}");
-        assert!(
-            msg.contains("Refusing to download a published builder VM prebuilt"),
-            "{msg}"
+        assert_eq!(
+            action,
+            BuilderVmBootstrapAction::BuildFromSource {
+                flake_dir: "/repo/nix/images/builder-vm".to_string()
+            }
         );
-        assert!(msg.contains("nix/images/builder-vm/flake.nix"), "{msg}");
-        assert!(msg.contains("~/.cache/mvm/builder-vm/<arch>"), "{msg}");
     }
 
     #[test]
@@ -2519,6 +2613,47 @@ mod builder_vm_bootstrap_tests {
                 .expect("installed binaries may use published prebuilts");
 
         assert_eq!(action, BuilderVmBootstrapAction::DownloadPublished);
+    }
+
+    #[test]
+    fn builder_vm_stage0_bootstrap_plan_targets_builder_vm_flake() {
+        let (job, mounts, image) = builder_vm_stage0_bootstrap_plan(
+            "/repo/nix/images/builder-vm",
+            "/cache/builder-vm/aarch64",
+            std::path::PathBuf::from("/dev-cache/vmlinux"),
+            std::path::PathBuf::from("/dev-cache/rootfs.ext4"),
+        )
+        .expect("valid builder flake path should produce a plan");
+
+        match job {
+            mvm_build::builder_vm::BuilderJob::Flake {
+                flake_ref,
+                attr_path,
+            } => {
+                assert_eq!(flake_ref, "path:/work/nix/images/builder-vm");
+                assert!(
+                    attr_path == "packages.aarch64-linux.default"
+                        || attr_path == "packages.x86_64-linux.default",
+                    "unexpected attr path: {attr_path}"
+                );
+            }
+            other => panic!("unexpected stage0 job: {other:?}"),
+        }
+        assert_eq!(mounts.flake_src, std::path::PathBuf::from("/repo"));
+        assert!(mounts.host_nix_store.is_none());
+        assert_eq!(
+            mounts.artifact_out,
+            std::path::PathBuf::from("/cache/builder-vm/aarch64")
+        );
+        assert_eq!(
+            image.kernel_path,
+            std::path::PathBuf::from("/dev-cache/vmlinux")
+        );
+        assert_eq!(
+            image.rootfs_path,
+            std::path::PathBuf::from("/dev-cache/rootfs.ext4")
+        );
+        assert_eq!(image.cmdline, STAGE0_BOOTSTRAP_CMDLINE);
     }
 
     #[test]
