@@ -346,8 +346,71 @@ jobs:
             staging/builder-vm-${{ matrix.arch }}.manifest.json
             staging/builder-vm-${{ matrix.arch }}-checksums-sha256.txt
 
+  # Plan 74 W1.4b / ADR-051: the verity-sealed mvm runtime overlay
+  # disk. Attached as `/dev/vdc` at every microVM boot;
+  # `mvm-verity-init` mounts it at `/mvm/runtime` so the guest agent,
+  # seccomp shim, and per-language SDK runtime libraries live in a
+  # single mvm-controlled blob instead of being baked into every
+  # per-image rootfs. Built per-arch from `nix/images/runtime-overlay/`.
+  #
+  # The host-side `RuntimeOverlayResolver`
+  # (`crates/mvm-build/src/runtime_overlay.rs`) installs these into
+  # `~/.cache/mvm/runtime-overlay/<mvmctl-version>/<arch>/` under the
+  # canonical names (`overlay.ext4`, `overlay.verity`,
+  # `overlay.roothash`, `VERSION`); the release artifact names carry
+  # the arch suffix so the combined release-asset pool doesn't
+  # collide between aarch64 and x86_64.
+  runtime-overlay-image:
+    strategy:
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build runtime overlay image
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          SYSTEM="${ARCH}-linux"
+          nix build "./nix/images/runtime-overlay#packages.${SYSTEM}.default" \
+            --no-link --print-out-paths > /tmp/store-path.txt
+          STORE_PATH=$(head -1 /tmp/store-path.txt)
+          mkdir -p staging
+          # cp -L so `overlay.*` resolve through nix-store symlinks
+          # into the actual blobs; the artifact uploader doesn't
+          # follow symlinks.
+          cp -L "$STORE_PATH/overlay.ext4"     "staging/runtime-overlay-${ARCH}.ext4"
+          cp -L "$STORE_PATH/overlay.verity"   "staging/runtime-overlay-${ARCH}.verity"
+          cp -L "$STORE_PATH/overlay.roothash" "staging/runtime-overlay-${ARCH}.roothash"
+          cp -L "$STORE_PATH/VERSION"          "staging/runtime-overlay-${ARCH}.VERSION"
+          cd staging
+          sha256sum "runtime-overlay-${ARCH}.ext4" \
+                    "runtime-overlay-${ARCH}.verity" \
+                    "runtime-overlay-${ARCH}.roothash" \
+                    "runtime-overlay-${ARCH}.VERSION" \
+            > "runtime-overlay-${ARCH}-checksums-sha256.txt"
+
+      - name: Upload runtime overlay image artifacts
+        uses: actions/upload-artifact@v7
+        with:
+          name: runtime-overlay-image-${{ matrix.arch }}
+          path: |
+            staging/runtime-overlay-${{ matrix.arch }}.ext4
+            staging/runtime-overlay-${{ matrix.arch }}.verity
+            staging/runtime-overlay-${{ matrix.arch }}.roothash
+            staging/runtime-overlay-${{ matrix.arch }}.VERSION
+            staging/runtime-overlay-${{ matrix.arch }}-checksums-sha256.txt
+
   release:
-    needs: [build, dev-image, builder-image, builder-vm-image, default-microvm]
+    needs: [build, dev-image, builder-image, builder-vm-image, default-microvm, runtime-overlay-image]
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -452,6 +515,11 @@ jobs:
             artifacts/default-microvm-vmlinux-* \
             artifacts/default-microvm-rootfs-* \
             artifacts/default-microvm-*-checksums-sha256.txt \
+            artifacts/runtime-overlay-*.ext4 \
+            artifacts/runtime-overlay-*.verity \
+            artifacts/runtime-overlay-*.roothash \
+            artifacts/runtime-overlay-*.VERSION \
+            artifacts/runtime-overlay-*-checksums-sha256.txt \
             sbom.cdx.json \
             sbom.cdx.json.bundle
 
