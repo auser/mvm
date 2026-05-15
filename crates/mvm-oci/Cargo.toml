@@ -7,7 +7,7 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
-description = "OCI image distribution client for mvm — registry resolution, manifest fetch, digest verification. Layer fetch / unpack and rootfs materialization land in later plan 74 W1 PRs."
+description = "OCI image distribution client for mvm — registry resolution, manifest fetch, digest verification, layer fetch with streaming + size caps. Layer unpack to ext4 and rootfs materialization land in later plan 74 W1 PRs."
 
 [dependencies]
 async-trait = "0.1"
@@ -17,11 +17,17 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror = "1"
-tokio = { workspace = true, features = ["macros", "rt"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "time"] }
 url = "2"
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread", "test-util"] }
+tokio = { workspace = true, features = ["io-util", "macros", "rt", "rt-multi-thread", "test-util", "time"] }
+# Hermetic OCI registry fixture — wiremock spawns a real HTTP
+# server on a random localhost port. We point our client at it
+# with `ClientConfig { protocol: HttpsExcept(["127.0.0.1:N"]) }`
+# so the same fetcher exercises the same code paths it would
+# against ghcr.io / docker.io.
+wiremock = "0.6"
 
 [lints]
 workspace = true

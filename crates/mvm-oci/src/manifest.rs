@@ -4,7 +4,9 @@
 //! code consumes; [`OciManifestFetcher`] is the real implementation
 //! over `oci-client`. Splitting the trait from the impl lets test
 //! code substitute a fixture without standing up a registry — the
-//! hermetic in-process registry fixture lands in W1.2.
+//! hermetic in-process registry fixture in `tests/common.rs`
+//! exercises [`OciManifestFetcher`] directly via a wiremock-backed
+//! HTTP server on a random localhost port.
 //!
 //! Digest verification is always content-addressable: the SHA-256
 //! over the manifest bytes is compared against the digest the caller
@@ -12,9 +14,11 @@
 //! hard error; we never paper over it with a warning.
 
 use crate::OciError;
+use crate::layer::LayerDescriptor;
 use crate::reference::ImageReference;
 use async_trait::async_trait;
-use oci_client::client::{Client, ClientConfig};
+use oci_client::client::Client;
+pub use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::manifest::OciManifest;
 use oci_client::secrets::RegistryAuth;
 use sha2::{Digest, Sha256};
@@ -31,14 +35,42 @@ pub struct FetchedManifest {
     /// SHA-256 digest as `sha256:<lowercase-hex>`. Always verified
     /// against the bytes before this struct is constructed.
     pub digest: String,
-    /// Raw manifest bytes as received from the registry. Layer
-    /// fetch (W1.2) will parse these into typed layer descriptors.
+    /// Raw manifest bytes as received from the registry.
     pub bytes: Vec<u8>,
     /// `Content-Type` the registry advertised
     /// (e.g. `application/vnd.oci.image.manifest.v1+json`).
     /// Carried so the caller can distinguish OCI from Docker v2
     /// schemas without reparsing.
     pub media_type: String,
+}
+
+impl FetchedManifest {
+    /// Parse the manifest bytes and extract the layer descriptors
+    /// in order. For an image manifest (single platform) this
+    /// returns the layers verbatim; for an image index (multi-arch
+    /// manifest list) this returns an error because platform
+    /// selection is the caller's responsibility (lands in a later
+    /// W1 PR alongside `--platform` handling).
+    pub fn layers(&self) -> Result<Vec<LayerDescriptor>, OciError> {
+        let manifest: OciManifest = serde_json::from_slice(&self.bytes)
+            .map_err(|e| OciError::Registry(format!("parse manifest: {e}")))?;
+        match manifest {
+            OciManifest::Image(img) => Ok(img
+                .layers
+                .into_iter()
+                .map(|l| LayerDescriptor {
+                    digest: l.digest,
+                    size: l.size as u64,
+                    media_type: l.media_type,
+                })
+                .collect()),
+            OciManifest::ImageIndex(_) => Err(OciError::Registry(
+                "manifest is an image index — platform selection not yet implemented \
+                 (lands in a later W1 PR)"
+                    .to_string(),
+            )),
+        }
+    }
 }
 
 /// Contract for "fetch the manifest of this image and verify its
@@ -65,11 +97,48 @@ impl Default for OciManifestFetcher {
 
 impl OciManifestFetcher {
     pub fn new() -> Self {
+        Self::with_config(ClientConfig::default())
+    }
+
+    /// Construct a fetcher with a custom `ClientConfig`. Used by
+    /// tests to point at a wiremock server with
+    /// `protocol: ClientProtocol::HttpsExcept(vec![local_addr])`,
+    /// and by future production callers that need to thread proxy
+    /// or timeout settings through. The supplied config is passed
+    /// to `oci_client::Client::new` verbatim — no normalization.
+    pub fn with_config(config: ClientConfig) -> Self {
         Self {
-            client: Client::new(ClientConfig::default()),
+            client: Client::new(config),
         }
     }
+
+    /// Construct from a pre-built `oci_client::Client`. Useful when
+    /// a manifest fetcher and a layer fetcher share one client to
+    /// pool connections.
+    pub fn with_client(client: Client) -> Self {
+        Self { client }
+    }
+
+    /// Borrow the underlying client. Layer fetcher consumes this
+    /// so the two share a connection pool.
+    pub(crate) fn client(&self) -> &Client {
+        &self.client
+    }
 }
+
+/// The OCI media types we accept on a manifest fetch. Listed in
+/// the `Accept` header sent to the registry; the registry picks
+/// one and serves the matching manifest variant. Image manifest,
+/// Docker v2 (which most registries still serve by default), and
+/// the multi-arch index (which we surface as an error from
+/// [`FetchedManifest::layers`] until W1.3 grows platform
+/// selection).
+const ACCEPTED_MANIFEST_MEDIA: &[&str] = &[
+    "application/vnd.oci.image.manifest.v1+json",
+    "application/vnd.docker.distribution.manifest.v2+json",
+    "application/vnd.oci.image.index.v1+json",
+    "application/vnd.docker.distribution.manifest.list.v2+json",
+];
 
 #[async_trait]
 impl ManifestFetcher for OciManifestFetcher {
@@ -85,22 +154,27 @@ impl ManifestFetcher for OciManifestFetcher {
             .parse()
             .map_err(|e| OciError::InvalidReference(format!("{canonical}: {e}")))?;
 
-        let (manifest, digest) = self
+        // Fetch the *raw* wire bytes, not the parsed-then-
+        // re-serialized form. JSON re-serialization is not
+        // byte-stable (key ordering, whitespace, escape choices),
+        // so hashing the re-serialized form mis-computes the
+        // digest against what the registry advertised. The
+        // content digest is a property of the *wire* bytes;
+        // anything else is a bug.
+        let (bytes, advertised_digest) = self
             .client
-            .pull_manifest(&upstream_ref, &RegistryAuth::Anonymous)
+            .pull_manifest_raw(
+                &upstream_ref,
+                &RegistryAuth::Anonymous,
+                ACCEPTED_MANIFEST_MEDIA,
+            )
             .await
             .map_err(|e| OciError::Registry(e.to_string()))?;
 
-        // `pull_manifest` returns the digest the registry computed.
-        // We re-compute it from the serialized bytes and assert
-        // equality — fail closed if the registry's claim doesn't
-        // match the bytes. If the caller pinned a digest in the
-        // reference, that pin must equal the computed digest too.
-        let bytes = serialize_manifest(&manifest)?;
         let computed = format!("sha256:{}", hex::encode(Sha256::digest(&bytes)));
-        if computed != digest {
+        if computed != advertised_digest {
             return Err(OciError::DigestMismatch {
-                expected: digest,
+                expected: advertised_digest,
                 computed,
             });
         }
@@ -113,27 +187,26 @@ impl ManifestFetcher for OciManifestFetcher {
             }
         }
 
+        // Parse the bytes once more to classify the media type
+        // for the caller's downstream branching (image vs index).
+        // This parse is purely diagnostic; the *digest* check
+        // above is the load-bearing one.
+        let manifest: OciManifest = serde_json::from_slice(&bytes)
+            .map_err(|e| OciError::Registry(format!("parse manifest after digest verify: {e}")))?;
         let media_type = manifest_media_type(&manifest).to_string();
 
         Ok(FetchedManifest {
             reference: reference.clone(),
             digest: computed,
-            bytes,
+            // `pull_manifest_raw` hands back `bytes::Bytes`; the
+            // public `FetchedManifest::bytes` field is `Vec<u8>`
+            // so callers don't have to depend on the `bytes`
+            // crate. The `.to_vec()` is one copy, which is fine
+            // for manifest-sized payloads (single-digit KB).
+            bytes: bytes.to_vec(),
             media_type,
         })
     }
-}
-
-fn serialize_manifest(manifest: &OciManifest) -> Result<Vec<u8>, OciError> {
-    // `oci_client::manifest::OciManifest` round-trips through
-    // serde_json; this is the bytes we hash. Real registries serve
-    // the manifest as the exact bytes the publisher produced, so in
-    // practice we'd be hashing the wire bytes — but `oci_client`
-    // 0.16 deserializes before handing back, so we re-serialize
-    // here. The digest invariant still holds because the upstream
-    // crate computes its returned digest from the same path.
-    serde_json::to_vec(manifest)
-        .map_err(|e| OciError::Registry(format!("re-serialize manifest: {e}")))
 }
 
 fn manifest_media_type(manifest: &OciManifest) -> &'static str {

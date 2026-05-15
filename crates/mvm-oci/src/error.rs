@@ -42,4 +42,12 @@ pub enum OciError {
     /// credentials flow through this variant.
     #[error("registry error: {0}")]
     Registry(String),
+
+    /// A layer descriptor's declared size, or the streamed byte
+    /// count, exceeded the configured size cap. Plan 74 §Risks R10
+    /// — decompression-bomb / oversized-layer mitigation. The
+    /// `declared` value is the size the manifest claimed; `cap` is
+    /// the value configured on `LayerFetchOptions::max_size`.
+    #[error("layer size {declared} bytes exceeds cap of {cap} bytes")]
+    LayerTooLarge { declared: u64, cap: u64 },
 }

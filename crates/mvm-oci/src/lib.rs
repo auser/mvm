@@ -11,19 +11,27 @@
 //!   admission (plan 74 W1.6) rejects tag-pinned references.
 //! - **Manifest fetch.** The [`ManifestFetcher`] trait fronts the
 //!   actual registry call; [`OciManifestFetcher`] is the real impl
-//!   over [`oci_client`]. Test code can stand in a fixture
-//!   implementation without bringing up a registry.
+//!   over [`oci_client`]. Test code points the same impl at a
+//!   wiremock-backed registry on localhost
+//!   (see `tests/hermetic_registry.rs`).
 //! - **Digest verification.** Every fetched manifest's content digest
 //!   is verified before it leaves the fetcher.
 //!   [`verify_sha256_digest`] is the standalone primitive — algorithm
 //!   support is intentionally narrow (sha256 only in v1) so any
 //!   future expansion is an explicit, reviewed decision.
+//! - **Layer fetch.** [`OciLayerFetcher`] streams a single layer
+//!   from the registry into a caller-supplied `AsyncWrite`,
+//!   hashing as it goes, enforcing
+//!   [`LayerFetchOptions::max_size`] mid-stream (plan 74 §Risks
+//!   R10 mitigation), and retrying transient registry failures
+//!   with exponential backoff up to a bounded cap.
 //!
-//! Layer fetch, ext4 unpacking (plan 74 §Risks R10 attack surface),
-//! verity generation (ADR-050), template registration, and the
-//! `mvmctl image pull` CLI surface land in subsequent W1 PRs.
-//! Private-registry authentication (Bearer / `.docker/config.json`)
-//! is also a later PR — W1.1 ships anonymous-only by design so the
+//! Ext4 unpacking (plan 74 §Risks R10 attack surface — path
+//! traversal, hardlink escape, setuid handling), verity generation
+//! (ADR-050), template registration, and the `mvmctl image pull`
+//! CLI surface land in subsequent W1 PRs. Private-registry
+//! authentication (Bearer / `.docker/config.json`) is also a later
+//! PR — W1.1/W1.2 ship anonymous-only by design so the
 //! credential-as-secret handling can be reviewed in isolation against
 //! ADR-049's substitution machinery.
 //!
@@ -40,9 +48,14 @@
 #![forbid(unsafe_code)]
 
 pub mod error;
+pub mod layer;
 pub mod manifest;
 pub mod reference;
 
 pub use error::OciError;
-pub use manifest::{FetchedManifest, ManifestFetcher, OciManifestFetcher, verify_sha256_digest};
+pub use layer::{LayerDescriptor, LayerFetchOptions, OciLayerFetcher};
+pub use manifest::{
+    ClientConfig, ClientProtocol, FetchedManifest, ManifestFetcher, OciManifestFetcher,
+    verify_sha256_digest,
+};
 pub use reference::ImageReference;
