@@ -3,19 +3,11 @@
 //! `nix/images/dev-prebuilt/<arch>/{vmlinux, rootfs.ext4,
 //! checksums-sha256.txt}`.
 //!
-//! ## Builder VM — no host Nix required
+//! ## Build path
 //!
-//! The task does **not** shell out to a host `nix` binary. Instead it
-//! drives [`mvm_build::libkrun_builder::LibkrunBuilderVm`], which
-//! bind-mounts the workspace at `/work`, boots the project builder VM,
-//! and runs `nix build` inside that VM. The host needs zero Nix install.
-//!
-//! Net effect: on a fresh macOS 26+ Apple Silicon host with nothing
-//! installed but `mvmctl`, `cargo xtask build-dev-image` produces a
-//! working dev VM image. After it runs once, the image lives in the
-//! vendored slot and `mvmctl dev up` boots from there at the highest-
-//! precedence layer of `ensure_dev_image`'s cascade — so subsequent
-//! starts don't need network reachability.
+//! The task shells out to host `nix build` and vendors the resulting
+//! kernel/rootfs into the source checkout. On macOS, run it from the
+//! project builder VM or another configured Linux builder.
 //!
 //! ## Contract
 //!
@@ -36,9 +28,7 @@
 
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
-
-use mvm_build::builder_vm::{BuilderJob, BuilderMounts, BuilderVm};
-use mvm_build::libkrun_builder::LibkrunBuilderVm;
+use std::process::Command;
 
 /// Parse `cargo xtask build-dev-image [--arch <arch>]` and dispatch.
 pub fn run(args: &[String], workspace: &Path) -> Result<()> {
@@ -65,9 +55,8 @@ pub fn run(args: &[String], workspace: &Path) -> Result<()> {
 const HELP_TEXT: &str = "\
 Usage: cargo xtask build-dev-image [--arch <arch>]
 
-Builds the dev VM image inside the libkrun-backed builder VM and copies
-vmlinux + rootfs.ext4 + checksums into
-nix/images/dev-prebuilt/<arch>/. No host Nix install required.
+Builds the dev VM image with host nix and copies vmlinux + rootfs.ext4
++ checksums into nix/images/dev-prebuilt/<arch>/.
 
 Args:
   --arch <arch>   Target architecture (aarch64 or x86_64).
@@ -75,8 +64,7 @@ Args:
                   (aarch64-darwin → aarch64, x86_64-linux → x86_64, etc.).
 
 Prerequisites:
-  - libkrun available on this host.
-  - A cached or downloadable builder VM image.
+  - nix on PATH, running on Linux or through the project builder VM.
   - The flake at nix/images/builder/flake.nix exposes
     packages.<arch>-linux.default with vmlinux + rootfs.ext4 in $out.
 ";
@@ -115,80 +103,57 @@ fn build_and_install(workspace: &Path, arch: &str) -> Result<()> {
         );
     }
 
-    // The builder runs `nix build` inside a read-only bind of the
-    // workspace, so a stale `flake.lock` with `path:..`-style entries
-    // is unrepresentable: nix can't write a new lock (EROFS) and the
-    // old one trips strict pure-mode validation. Pair this with the
-    // `--no-write-lock-file --impure` flags inside the builder
-    // (mvm-build/src/builder_vm.rs:run_build_async). Net: every xtask
-    // run re-evaluates inputs from scratch — fine for the bootstrap,
-    // and the kernel + nixpkgs revs are still pinned through the
-    // parent flake's lock at `nix/flake.lock`.
+    // Avoid stale local locks when the builder flake uses path inputs.
     let lock = flake_nix.parent().unwrap().join("flake.lock");
     if lock.exists() {
         std::fs::remove_file(&lock)
             .with_context(|| format!("removing stale {}", lock.display()))?;
     }
 
-    // The builder VM bind-mounts `workspace` at /work and /out for
-    // artifact extraction. The flake_ref inside the VM is the absolute
-    // path to the builder flake under that mount.
-    let artifact_out =
-        tempfile::tempdir().context("creating tempdir for builder artifact extraction")?;
-    let job = BuilderJob::Flake {
-        flake_ref: "path:/work/nix/images/builder".to_string(),
-        attr_path: format!("packages.{arch}-linux.default"),
-    };
-    let mounts = BuilderMounts {
-        flake_src: workspace.to_path_buf(),
-        // The builder VM owns its `/nix` store; never bind the host
-        // store into the guest.
-        host_nix_store: None,
-        artifact_out: artifact_out.path().to_path_buf(),
-    };
-
-    println!(
-        "xtask build-dev-image: running mvm-build's LibkrunBuilderVm\n\
-         (no host Nix needed — nix runs inside the builder VM)"
-    );
-    let builder = LibkrunBuilderVm::default();
-    let artifacts = builder
-        .run_build(&job, &mounts)
-        .map_err(|e| anyhow::anyhow!("libkrun builder failed: {e}"))?;
-
-    // Plan 73 Followup B.2.0: BuilderArtifacts is now an enum. The
-    // xtask path always feeds a Flake job, so it always receives an
-    // Image. Surface a future variant as an error rather than a
-    // silent path mismatch.
-    let (src_kernel, src_rootfs) = match artifacts {
-        mvm_build::builder_vm::BuilderArtifacts::Image {
-            kernel_path,
-            rootfs_path,
-            ..
-        } => {
-            let kernel = kernel_path.ok_or_else(|| {
-                anyhow::anyhow!(
-                    "builder produced no vmlinux — the flake's \
-                     packages.{arch}-linux.default output must include `vmlinux` \
-                     in its $out directory"
-                )
-            })?;
-            if !rootfs_path.is_file() {
-                anyhow::bail!(
-                    "builder reported success but rootfs.ext4 is missing at {}",
-                    rootfs_path.display(),
-                );
-            }
-            (kernel, rootfs_path)
-        }
-        mvm_build::builder_vm::BuilderArtifacts::InstallVolume { .. } => {
-            anyhow::bail!(
-                "xtask build-dev-image expected a Flake build but the \
-                 builder returned an InstallVolume — unreachable until \
-                 Plan 73 Followup B.2"
-            );
-        }
-    };
+    println!("xtask build-dev-image: running nix build for {arch}-linux");
+    let output = Command::new("nix")
+        .arg("build")
+        .arg(format!(
+            "{}#packages.{arch}-linux.default",
+            flake_nix
+                .parent()
+                .expect("flake path has parent")
+                .to_string_lossy()
+        ))
+        .arg("--no-link")
+        .arg("--print-out-paths")
+        .arg("--no-write-lock-file")
+        .arg("--impure")
+        .output()
+        .context(
+            "running nix build; install Nix or run this xtask inside the project builder VM",
+        )?;
+    if !output.status.success() {
+        anyhow::bail!(
+            "nix build failed with status {}\nstdout:\n{}\nstderr:\n{}",
+            output.status,
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr),
+        );
+    }
+    let store_path = String::from_utf8(output.stdout)
+        .context("nix build output was not UTF-8")?
+        .lines()
+        .rev()
+        .find(|line| line.starts_with("/nix/store/"))
+        .map(PathBuf::from)
+        .ok_or_else(|| anyhow::anyhow!("nix build produced no /nix/store output path"))?;
+    let src_kernel = store_path.join("vmlinux");
+    let src_rootfs = store_path.join("rootfs.ext4");
+    if !src_kernel.is_file() {
+        anyhow::bail!("builder output missing vmlinux at {}", src_kernel.display());
+    }
+    if !src_rootfs.is_file() {
+        anyhow::bail!(
+            "builder output missing rootfs.ext4 at {}",
+            src_rootfs.display()
+        );
+    }
 
     let dest_dir = vendored_slot(workspace, arch);
     std::fs::create_dir_all(&dest_dir)

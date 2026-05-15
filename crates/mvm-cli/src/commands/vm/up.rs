@@ -1129,9 +1129,9 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
     // would inherit the same banner via their `security_profile()`.
     emit_security_banner_if_needed(effective_hypervisor);
 
-    // Lima is gone (ADR-013); no upfront VM check needed. Builder
-    // availability is checked at the build boundary, inside the
-    // builder VM path.
+    // Lima is gone (ADR-013); no upfront VM check needed. The
+    // libkrun-as-Linux-builder follow-up (W6.x) will reintroduce
+    // a builder-availability gate at this point when it lands.
     let _metrics_server = if metrics_port > 0 {
         Some(crate::metrics_server::MetricsServer::start(metrics_port)?)
     } else {

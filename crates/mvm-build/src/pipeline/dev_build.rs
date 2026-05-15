@@ -306,14 +306,14 @@ pub fn dev_build(
         });
     }
 
-    // The shell environment must already point at the builder VM.
-    // This probe intentionally runs through `env`, not the host shell;
-    // it catches a broken builder image before we start a longer build.
-    if !builder_env_has_nix(env) {
+    // If the `env` channel has `nix` on PATH, run the build there
+    // (host on Linux+host-Nix, Apple Container dev VM on macOS 26+,
+    // etc.). Hosts without nix must provision the builder VM path first.
+    if !env_has_nix(env) {
         let _ = (env, flake_ref, profile, mode);
         anyhow::bail!(
-            "No `nix` on PATH inside the builder VM. Rebuild or re-fetch \
-             the builder VM image; mvmctl does not use host Nix."
+            "No `nix` on PATH. Install host Nix (Determinate Nix or upstream) \
+             or start the project builder VM before running the dev build."
         );
     }
 
@@ -525,9 +525,9 @@ fn shell_quote(input: &str) -> String {
 /// True if `nix` is available inside the builder shell environment.
 ///
 /// `env.shell_exec_stdout("nix --version")` succeeds if and only if
-/// `nix` is on PATH inside the VM-backed channel. This must not be
-/// replaced with a host-side PATH probe; mvmctl does not use host Nix.
-fn builder_env_has_nix(env: &dyn ShellEnvironment) -> bool {
+/// `nix` is on PATH inside the channel — host on Linux+host-Nix,
+/// Apple Container dev VM on macOS 26+, etc.
+fn env_has_nix(env: &dyn ShellEnvironment) -> bool {
     env.shell_exec_stdout("nix --version 2>/dev/null | head -1")
         .map(|s| s.trim().starts_with("nix "))
         .unwrap_or(false)
@@ -875,11 +875,13 @@ mod tests {
                 exec_log: Mutex::new(Vec::new()),
                 logs: Mutex::new(Vec::new()),
             };
-            // `dev_build` reads `nix --version` through the builder-VM
-            // env as a sanity check. Default-stub the probe so tests
-            // exercise the normal in-VM build path. Individual tests can
-            // override with `stub_stdout("nix --version", "")` to
-            // exercise the broken-builder-image error.
+            // W7.x.2 dispatch probe: `dev_build` reads `nix --version`
+            // through the env to decide between the host path and the
+            // libkrun builder VM fallback. Every legacy test
+            // assumed the host path; default-stub the probe to keep
+            // them on it. Individual tests can override with
+            // `stub_stdout("nix --version", "")` to exercise the
+            // builder-VM path.
             env.stub_stdout("nix --version", "nix (Nix) 2.24.10\n");
             env
         }
@@ -1262,13 +1264,11 @@ mod tests {
             Some("minimal"),
             BuildMode::Dev,
         );
-        let err = result.expect_err("must bail when no nix and no fallback");
+        let err = result.expect_err("must bail when no nix is available");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("No `nix` on PATH")
-                && msg.contains("builder VM")
-                && msg.contains("does not use host Nix"),
-            "bail must point at the builder VM, not host Nix: {msg}"
+            msg.contains("No `nix` on PATH"),
+            "bail must name missing nix: {msg}"
         );
     }
 

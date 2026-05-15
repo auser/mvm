@@ -8,7 +8,7 @@ publish = false
 anyhow.workspace = true
 clap.workspace = true
 clap_mangen.workspace = true
-mvm-build = { workspace = true, features = ["backends-builder-vm-libkrun"] }
+mvm-build.workspace = true
 mvm-cli.workspace = true
 serde.workspace = true
 serde_json.workspace = true

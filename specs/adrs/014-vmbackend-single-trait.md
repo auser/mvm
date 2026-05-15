@@ -2,12 +2,12 @@
 title: "ADR-014: `VmBackend` single trait; backend-as-impl pattern"
 status: Proposed
 date: 2026-05-07
-related: ADR-013 (microsandbox pivot), plan 60-mvm-microsandbox-migration
+related: ADR-013 (libkrun pivot), plan 60-mvm-libkrun-migration
 ---
 
 ## Status
 
-Proposed. Implementation lands in Phase 0 (workspace reshape) and Phase 1 (Firecracker + microsandbox impls).
+Proposed. Implementation lands in Phase 0 (workspace reshape) and Phase 1 (Firecracker + libkrun impls).
 
 ## Context
 
@@ -30,12 +30,12 @@ Neither is acceptable.
 2. **Adopt `mvm_core::protocol::vm_backend::VmBackend` as the single backend trait** (port verbatim from `../mvm/crates/mvm-core/src/protocol/vm_backend.rs` in Phase 0).
 3. **Implementations live in their own modules**, not their own traits:
    - `mvm/src/vm/firecracker.rs` → `impl VmBackend for FirecrackerBackend`
-   - `mvm/src/vm/microsandbox.rs` → `impl VmBackend for MicrosandboxBackend`
+   - `mvm/src/vm/libkrun.rs` → `impl VmBackend for LibkrunBackend`
    - Future: `mvm/src/vm/cloud_hypervisor.rs` (post-Phase-10, gated by `backend-cloud-hypervisor` feature)
 4. **Build vs. execution split is preserved** via a separate (existing) abstraction: `mvm_core::build_env::{ShellEnvironment, BuildEnvironment}`. `mvm-build` consumes `BuildEnvironment`; this is an orthogonal concern from `VmBackend`.
 5. **Backend selection** is centralized in `mvm-cli/src/commands/mod.rs::pick_backend()`:
    - env override `MVM_BACKEND` (explicit)
-   - else: KVM available + Linux → Firecracker; macOS/Windows/no-KVM → microsandbox
+   - else: KVM available + Linux → Firecracker; macOS/Windows/no-KVM → libkrun
 6. **Plug-in registration** via `inventory` crate (post-Phase-10): new backends register at startup; core code stays closed for modification but open for extension.
 
 ## Consequences

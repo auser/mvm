@@ -76,6 +76,9 @@ jobs:
         with:
           components: rustfmt, clippy
 
+      - name: Install system build deps
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+
       - name: Cache cargo
         uses: actions/cache@v5
         with:
@@ -118,6 +121,9 @@ jobs:
       - name: No positional audit::emit / event-chain calls
         run: cargo run -p xtask -- check-audit-positional
 
+      - name: No forbidden dependency families
+        run: cargo run -p xtask -- check-forbidden-deps
+
       # Plan 75 W0 — user-facing repo text cannot use phrases
       # gated by a claim file in specs/claims/ whose status is
       # not Shipped. Prevents docs / README / CLI help from
@@ -139,6 +145,19 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
+      - name: Install system build deps
+        # `mvm-libkrun` links against system `libcap-ng`. Without
+        # `libcap-ng-dev` the linker fails with `unable to find library
+        # -lcap-ng`. Ubuntu's GH runner image ships the runtime library
+        # but not the -dev headers/symlinks that `cc` needs at link time.
+        #
+        # The secret-store live tests in tests/audit_emissions_live.rs
+        # pin `MVM_SECRET_STORE_BACKEND=file` in the sandbox, so no
+        # DBus / Secret Service is needed here.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libcap-ng-dev
+
       - name: Cache cargo
         uses: actions/cache@v5
         with:
@@ -154,6 +173,35 @@ jobs:
 
       - name: Run tests
         run: cargo test
+
+  e2e:
+    name: E2E Tests
+    runs-on: ubuntu-latest
+    needs: test
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system build deps (see test job for why)
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+
+      - name: Cache cargo
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-e2e-
+
+      - name: Run E2E tests
+        # Keep this lane on non-microsandbox end-to-end smoke targets.
+        # The old `smoke_e2e_boot` target depended on the removed
+        # upstream microsandbox crate and was deleted with that backend.
+        run: cargo test --test smoke_run_json_receipt --test runtime_boot_bench
 
   # Note: cargo-audit, cargo-deny, reproducibility, and prod-agent-no-exec
   # were duplicated here AND in security.yml. They now live only in

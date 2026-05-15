@@ -22,7 +22,8 @@ anyhow.workspace = true
 chrono.workspace = true
 # Plan 72 W1: optional libkrun FFI dep for the in-tree builder VM
 # launcher (`libkrun_builder::LibkrunBuilderVm`). Gated by
-# `backends-builder-vm-libkrun`; default-off for library consumers.
+# `backends-builder-vm-libkrun`; default-off until Plan 72 W5
+# cutover flips polarity.
 mvm-libkrun = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true

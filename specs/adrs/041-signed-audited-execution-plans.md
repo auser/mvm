@@ -2,7 +2,7 @@
 title: "ADR-041: Signed, audited `ExecutionPlan` — the contract behind every `mvmctl up`"
 status: Accepted
 date: 2026-05-11
-related: ADR-002 (microVM security posture); ADR-013 (microsandbox + libkrun pivot); plan 60 (microsandbox migration); plan 64 (supervisor wiring)
+related: ADR-002 (microVM security posture); ADR-013 (libkrun + libkrun pivot); plan 60 (libkrun migration); plan 64 (supervisor wiring)
 ---
 
 ## Status
@@ -76,7 +76,7 @@ Each `Ref`-typed field of `ExecutionPlan` is a placeholder that resolves to a co
 | `plan_version` | always `1` | mvmd revisions get monotonic versions | mvmd |
 | `tenant` | `--tenant` flag, default `"local"` | mvmd-issued `TenantId` (cryptographic, not name) | mvmd |
 | `workload` | VM name (post-validation) | image-baked workload manifest | mvm-build |
-| `runtime_profile` | backend name (`firecracker` / `microsandbox` / `apple-container`) | flake `passthru.mvm.profile` | mvm-build |
+| `runtime_profile` | backend name (`firecracker` / `libkrun` / `apple-container`) | flake `passthru.mvm.profile` | mvm-build |
 | `image` | `{ name: vm_name, sha256: <rootfs-hash>, cosign_bundle: None }` | `mvm-security::image_verify` signed-manifest path with cosign bundle | mvm-security |
 | `admission_profile` | intent-bound binding of `intent`, selected seccomp tier, policy refs, secret-release posture, and audit taxonomy; direct `mvmctl up` defaults to `intent = "vm:boot"` | mvmd / SDK intent resolver picks named profiles such as `code:execute`, `agent:web-research`, `deploy:publish`, then refuses inconsistent requested powers | mvm-plan + mvmd policy resolver |
 | `network_policy` / `fs_policy` / `egress_policy` / `tool_policy` | `"local-default"` → Noops, OR `"<tenant>:<workload>"` → loads `~/.mvm/policies/<tenant>/<workload>.toml` (still returns Noops; no live consumer yet) | real `EgressProxy` / `ToolGate` / `KeystoreReleaser` / `ArtifactCollector` impls reading the parsed bundle | plan 60 Phase 3 (proxies) + mvm-hostd lift |
@@ -161,7 +161,7 @@ The CLI surface intentionally stops short of `mvmctl plan create / sign / verify
 ## References
 
 - `specs/plans/64-supervisor-wiring.md` — full sprint plan for plan 64.
-- `specs/plans/60-mvm-microsandbox-migration.md` Phase 6 — the cornerstone this ADR documents the shipping of.
+- `specs/plans/60-mvm-libkrun-migration.md` Phase 6 — the cornerstone this ADR documents the shipping of.
 - ADR-002 (`specs/adrs/002-microvm-security-posture.md`) — the seven claims this ADR's claim 8 joins.
 - `crates/mvm-plan/src/` — `ExecutionPlan`, `SignedExecutionPlan`, `sign_plan`, `verify_plan`, `check_window`, `NonceStore`.
 - `crates/mvm-supervisor/src/audit.rs` + `audit_file.rs` — `AuditEntry`, `AuditSigner`, `FileAuditSigner`, `verify_audit_chain`.

@@ -135,7 +135,7 @@ Future provider names may include:
 
 ```text
 firecracker
-microsandbox
+libkrun
 apple-vz
 libkrun
 cloud-hypervisor
@@ -217,7 +217,7 @@ or:
 mvm vm create --provider linux --image ./guest.img
 ```
 
-The CLI must not expose backend-specific assumptions unless explicitly requested. For example, a user should not need to know whether the Linux provider is backed by Apple Virtualization.framework, Firecracker, microsandbox, libkrun, Incus, or another runtime unless they ask for implementation details.
+The CLI must not expose backend-specific assumptions unless explicitly requested. For example, a user should not need to know whether the Linux provider is backed by Apple Virtualization.framework, Firecracker, libkrun, libkrun, Incus, or another runtime unless they ask for implementation details.
 
 ## MLX Provider Contract
 

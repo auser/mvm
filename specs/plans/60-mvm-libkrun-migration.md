@@ -1,10 +1,10 @@
-# Plan: bring `mvm` to feature parity with `../mvm`, pivoted to microsandbox + libkrun, then rename to `mvm`
+# Plan: bring `mvm` to feature parity with `../mvm`, pivoted to libkrun + libkrun, then rename to `mvm`
 
 ## Context
 
 The repo at `/Users/auser/work/tinylabs/mvmco/mvm` is a hand-written 5-crate skeleton (~520 LOC, almost entirely stubs). The previous iteration at `/Users/auser/work/tinylabs/mvmco/mvm` is a mature 13-crate Lima+Firecracker stack (~40-50K LOC) with full security model, persistent storage, networking, observability, and an MCP server. The orchestrator at `/Users/auser/work/tinylabs/mvmco/mvmd` (10 crates, ~305K LOC) imports the `mvmctl` facade as a library — that's the contract we cannot break.
 
-The pivot in this iteration: **microsandbox (libkrun-backed) becomes the builder and the macOS/Windows execution path; Firecracker stays as the preferred Linux execution path**. The output of every build is a complete Nix-built microVM image with zero drift between machines. mvm is the library; mvmd is the orchestrator that consumes it.
+The pivot in this iteration: **libkrun (libkrun-backed) becomes the builder and the macOS/Windows execution path; Firecracker stays as the preferred Linux execution path**. The output of every build is a complete Nix-built microVM image with zero drift between machines. mvm is the library; mvmd is the orchestrator that consumes it.
 
 ### Product positioning — the workloads we must serve
 
@@ -82,7 +82,7 @@ The current hand-written skeleton (`mvm-backend::Backend<Sb,Ctx>`, `mvm-builder:
                                  │
        ┌─────────────────────────┼─────────────────────────┐
        ▼                         ▼                         ▼
-  microsandbox /            Firecracker                  vsock + L4/L7
+  libkrun /            Firecracker                  vsock + L4/L7
    libkrun (build         (preferred Linux            mediated network
     everywhere,                exec, jailer +          (default-deny;
     macOS/Win exec)            dm-verity rootfs)        per-tenant policy
@@ -95,9 +95,9 @@ The current hand-written skeleton (`mvm-backend::Backend<Sb,Ctx>`, `mvm-builder:
      - Optional: Xvfb+Xpra for computer-use templates
 ```
 
-**Single backend trait**: `mvm_core::vm_backend::VmBackend` (ported verbatim from `../mvm/crates/mvm-core/src/protocol/vm_backend.rs`). Implementations: `FirecrackerBackend` (Linux), `MicrosandboxBackend` (cross-platform; Linux/macOS confirmed; Windows pending verification — fall back to WSL2 if microsandbox doesn't support native Windows yet). The hand-written `Backend<Sb,Ctx>` and `BuilderBackend` traits are deleted.
+**Single backend trait**: `mvm_core::vm_backend::VmBackend` (ported verbatim from `../mvm/crates/mvm-core/src/protocol/vm_backend.rs`). Implementations: `FirecrackerBackend` (Linux), `LibkrunBackend` (cross-platform; Linux/macOS confirmed; Windows pending verification — fall back to WSL2 if libkrun doesn't support native Windows yet). The hand-written `Backend<Sb,Ctx>` and `BuilderBackend` traits are deleted.
 
-**Build vs. execution split** (kept as in the previous iteration): `ShellEnvironment` (base) and `BuildEnvironment` (extends) live in `mvm-core::build_env`. `mvm-build` consumes `BuildEnvironment`; `MicrosandboxBuildEnv` provides the impl that runs Nix inside a microsandbox box. mvmd's own `BuildEnvironment` impl in mvmd-runtime keeps working unchanged.
+**Build vs. execution split** (kept as in the previous iteration): `ShellEnvironment` (base) and `BuildEnvironment` (extends) live in `mvm-core::build_env`. `mvm-build` consumes `BuildEnvironment`; `LibkrunBuildEnv` provides the impl that runs Nix inside a libkrun box. mvmd's own `BuildEnvironment` impl in mvmd-runtime keeps working unchanged.
 
 **Builder microVM is a persistent, reused service**. It is *not* destroyed after each build — it is a per-tenant warm pool because:
 - The same builder regenerates artifacts when mvm itself upgrades.
@@ -124,8 +124,8 @@ mvm/                              (renamed from mvm/ at the end)
 │   ├── mvm-attestation/          (NEW — identity keys, runtime measurement, hardware attestation stubs)
 │   ├── mvm-plan/                 (A — copy verbatim, signed-state Ed25519 protocol)
 │   ├── mvm-policy/               (A — copy verbatim, policy bundle eval)
-│   ├── mvm-guest/                (B — copy + adapt console/exec for microsandbox)
-│   ├── mvm-build/                (C — rewrite around microsandbox, salvage nix/*)
+│   ├── mvm-guest/                (B — copy + adapt console/exec for libkrun)
+│   ├── mvm-build/                (C — rewrite around libkrun, salvage nix/*)
 │   ├── mvm/              (B — port lifecycle, swap Lima/FC-direct for VmBackend dispatch)
 │   ├── mvm-mcp/                  (B — copy + swap dispatcher to call VmBackend)
 │   ├── mvm-supervisor/           (A — copy verbatim, egress proxy + audit + redactor)
@@ -164,13 +164,13 @@ mvm/                              (renamed from mvm/ at the end)
     └── smoke_invoke.rs           (already present, gated by MVM_LIVE_SMOKE=1)
 ```
 
-Codes A/B/C: A = copy verbatim; B = adapt; C = rewrite. `mvm-libkrun` and `mvm-apple-container` from the previous iteration are **dropped** (microsandbox covers libkrun + macOS through one dependency).
+Codes A/B/C: A = copy verbatim; B = adapt; C = rewrite. `mvm-libkrun` and `mvm-apple-container` from the previous iteration are **dropped** (libkrun covers libkrun + macOS through one dependency).
 
 ## OSS crates we lean on (do not roll our own)
 
 | Concern | Crate | License | Why |
 |---|---|---|---|
-| Hypervisor (build + macOS/Windows exec) | `microsandbox = 0.4.5` | Apache-2.0 | Native libkrun wrapper; user's chosen pivot |
+| Hypervisor (build + macOS/Windows exec) | `libkrun = 0.4.5` | Apache-2.0 | Native libkrun wrapper; user's chosen pivot |
 | Hypervisor (Linux exec) | shell to `firecracker` binary; thin Rust JSON-API client | — | Upstream Firecracker is the canonical implementation |
 | Authenticated encryption (volumes, snapshots) | `aes-gcm` 0.10 + `chacha20poly1305` 0.10 (RustCrypto) | Apache-2.0/MIT | AEAD; constant-time; widely audited |
 | Disk-encryption tooling (LUKS) | shell to `cryptsetup`; thin Rust wrapper | — | LUKS2 is the standard; no Rust replacement is mature |
@@ -205,10 +205,10 @@ Everything we *don't* delegate is glue (≤200 LOC) or domain-specific protocol 
 ```toml
 # mvm root workspace
 [features]
-default = ["firecracker", "microsandbox", "mcp", "metrics-prometheus"]
+default = ["firecracker", "libkrun", "mcp", "metrics-prometheus"]
 # Backends (at least one must be enabled)
 firecracker     = ["dep:vmm-firecracker-client"]   # Linux-only
-microsandbox    = ["dep:microsandbox"]             # cross-platform
+libkrun    = ["dep:libkrun"]             # cross-platform
 # Front-ends
 mcp             = ["dep:rmcp", "mvm-mcp/server"]
 sdk             = ["dep:mvm-sdk"]
@@ -242,7 +242,7 @@ attestation-tdx      = ["tdx"]
 addons-registry = []                               # Loadable user-defined addons
 ```
 
-**Production builds use `--no-default-features --features "firecracker,microsandbox,mcp,metrics-prometheus,luks,egress-l7-proxy,egress-firewall-nft"`** — explicitly omitting `dev`. CI builds at least three feature combinations: minimal (no MCP, microsandbox-only), default, full-prod.
+**Production builds use `--no-default-features --features "firecracker,libkrun,mcp,metrics-prometheus,luks,egress-l7-proxy,egress-firewall-nft"`** — explicitly omitting `dev`. CI builds at least three feature combinations: minimal (no MCP, libkrun-only), default, full-prod.
 
 The `dev` feature gate matters because subcommands like `dev shell` open a PTY into a sandbox; this must be impossible to invoke in a customer-facing build.
 
@@ -260,7 +260,7 @@ Risk: microvm.nix is a third-party project. We pin a specific commit in `flake.l
 
 **Fallback (named explicitly):** if a microvm.nix audit surfaces a security regression we can't accept, fall back to the previous iteration's hand-rolled NixOS modules under `../mvm/nix/`. ADR-013 names this as a ready-to-execute escape hatch, not a vague intention. The cost: ~5K LOC of NixOS-module maintenance returns to our scope. The benefit: smaller trust boundary. We choose microvm.nix as the default *because* its trust boundary is acceptable today; if that changes, we revert.
 
-**Explicit non-goal: OCI images.** mvm is microVMs, not containers. Microsandbox's API exposes both `RootfsSource::Oci(reference)` and `RootfsSource::DiskImage { path, format, fstype }`; we use **only** the `DiskImage` path. The runtime never pulls from an OCI registry; the bridge from our Nix-built `.ext4` rootfs to microsandbox is a host-local `.raw` hard-link plus `fstype("ext4")`. ADR-013 §"Non-goal: OCI / container images" carries the full rationale (reproducibility, trust boundary, offline-by-default boot). Code review gate: any PR introducing `RootfsSource::Oci`, `RegistryAuth`, or OCI image references is reviewed against this invariant.
+**Explicit non-goal: OCI images.** mvm is microVMs, not containers. Libkrun's API exposes both `RootfsSource::Oci(reference)` and `RootfsSource::DiskImage { path, format, fstype }`; we use **only** the `DiskImage` path. The runtime never pulls from an OCI registry; the bridge from our Nix-built `.ext4` rootfs to libkrun is a host-local `.raw` hard-link plus `fstype("ext4")`. ADR-013 §"Non-goal: OCI / container images" carries the full rationale (reproducibility, trust boundary, offline-by-default boot). Code review gate: any PR introducing `RootfsSource::Oci`, `RegistryAuth`, or OCI image references is reviewed against this invariant.
 
 ## L4 + L7 egress proxy (default-deny + policy-gated)
 
@@ -457,7 +457,7 @@ Snapshot IDs are content-hashed; the same VM state captured twice produces the s
 
 ### Backend portability
 - **Firecracker**: native snapshot support (`firecracker --snapshot-create`/`--snapshot-restore`). Memory image is what FC produces, wrapped in our AEAD.
-- **microsandbox / libkrun**: pause + memory dump (libkrun exposes this via `krun_pause`/`krun_resume`); slightly more expensive than FC but works.
+- **libkrun / libkrun**: pause + memory dump (libkrun exposes this via `krun_pause`/`krun_resume`); slightly more expensive than FC but works.
 - **Cloud Hypervisor (future)**: native snapshot support via the CH API.
 
 The user-facing surface is identical; the backend differences are hidden behind `VmBackend::snapshot_create`/`snapshot_restore`.
@@ -496,7 +496,7 @@ mvmctl session timeout <vm> <session> --idle 24h
 
 Session state survives:
 - Network disconnects (you reattach)
-- `mvmctl down` then `up` (the VM is paused and restored — Firecracker snapshot, microsandbox sleep)
+- `mvmctl down` then `up` (the VM is paused and restored — Firecracker snapshot, libkrun sleep)
 - Host suspend/resume (snapshot taken at host suspend, restored at resume)
 
 Session state is wiped only on explicit `kill`, idle timeout, or VM destruction.
@@ -567,7 +567,7 @@ These live in `mvm-supervisor/src/tools/`. The MCP server (Phase 7) exposes the 
 
 ## SDK DX design — Rust + Python + TypeScript, three first-class SDKs
 
-Three SDKs, all first-class, all targeting **microsandbox-style runtime + sandbox-runtime API surface** + **Modal-style decorators**. Common Rust core protocol; language-specific surface idiomatic to each ecosystem.
+Three SDKs, all first-class, all targeting **libkrun-style runtime + sandbox-runtime API surface** + **Modal-style decorators**. Common Rust core protocol; language-specific surface idiomatic to each ecosystem.
 
 ### Architecture
 ```
@@ -837,9 +837,9 @@ let exec = sbx.run_code("x = 1 + 1; x").await?;
 println!("{}", exec.text);
 ```
 
-#### Microsandbox-flavored language-specific sandboxes (mirrors microsandbox)
+#### Libkrun-flavored language-specific sandboxes (mirrors libkrun)
 
-For folks coming from microsandbox, we ship typed shortcuts:
+For folks coming from libkrun, we ship typed shortcuts:
 
 **Python**:
 ```python
@@ -1087,9 +1087,9 @@ Each macro emits both runtime metadata (consumed by `mvmctl build`) and a stable
 
 **Tree-sitter integration** (Phase 5+): `mvm-tree-sitter` crate ships grammars for `mvm.toml`, our subset of Nix, and source files using the `mvm-sdk` macros. The future AI safety scanner walks these trees, flags risky configs (overly broad `egress_allow`, unencrypted volumes carrying PII tags, missing seccomp tier), and proposes patches.
 
-### Runtime DX (microsandbox-style, imperative)
+### Runtime DX (libkrun-style, imperative)
 
-When users want to spin up sandboxes from running code (think: an LLM agent invoking code execution), the SDK gives them a microsandbox-shaped API in line with the established sandbox-runtime category:
+When users want to spin up sandboxes from running code (think: an LLM agent invoking code execution), the SDK gives them a libkrun-shaped API in line with the established sandbox-runtime category:
 
 ```rust
 use mvm_sdk::runtime::Sandbox;
@@ -1107,7 +1107,7 @@ sb.snapshot("post-init").await?;
 sb.close().await?;
 ```
 
-The `Sandbox` is backend-agnostic: it dispatches to `VmBackend` underneath. Same API on Linux (Firecracker), macOS (microsandbox), Windows-via-Tauri (microsandbox+WSL2). MCP tools are thin wrappers over this surface.
+The `Sandbox` is backend-agnostic: it dispatches to `VmBackend` underneath. Same API on Linux (Firecracker), macOS (libkrun), Windows-via-Tauri (libkrun+WSL2). MCP tools are thin wrappers over this surface.
 
 `mvm-sdk` is split into `mvm-sdk-macros` (proc macros) + `mvm-sdk` (runtime + types) so users only pay the syn/quote build cost when they use definition-style.
 
@@ -1119,8 +1119,8 @@ Two distinct workload classes; the answer is different for each:
 
 ### Display GPU / 3D / Vulkan in-VM (covers `computer-use` and richer browsers)
 - **libkrun supports virtio-gpu with virgl/Venus** on Linux today; that gives the guest GL 4.x and Vulkan via the host's GPU, via the paravirtualized virtio-gpu device.
-- Microsandbox sits on libkrun, so the macOS path inherits this where libkrun does on macOS (libkrun on macOS uses Hypervisor.framework — virgl coverage there is more limited; verify in Phase 7b before committing).
-- Firecracker **deliberately does not support virtio-gpu** (minimal device set is a security feature). For graphical workloads on Linux, we'd run them under microsandbox/libkrun even on a host that has KVM.
+- Libkrun sits on libkrun, so the macOS path inherits this where libkrun does on macOS (libkrun on macOS uses Hypervisor.framework — virgl coverage there is more limited; verify in Phase 7b before committing).
+- Firecracker **deliberately does not support virtio-gpu** (minimal device set is a security feature). For graphical workloads on Linux, we'd run them under libkrun/libkrun even on a host that has KVM.
 - Feature flag: `gpu-virgl` enables guest-side virtio-gpu config + host-side virgl renderer setup. Off by default.
 - The `computer-use` template also works without GPU (Xvfb is software-rendered) — `gpu-virgl` is a perf upgrade for browser smoothness, not a requirement.
 
@@ -1134,8 +1134,8 @@ Two distinct workload classes; the answer is different for each:
 ### Decision matrix
 | Workload | Backend | Feature flag | Status |
 |---|---|---|---|
-| CPU-only agent / dev shell | Firecracker (Linux) or microsandbox (macOS/Windows) | (default) | Phase 1 |
-| In-VM 3D rendering (browser, GUI agent) | microsandbox (libkrun + virgl) | `gpu-virgl` | Phase 7b |
+| CPU-only agent / dev shell | Firecracker (Linux) or libkrun (macOS/Windows) | (default) | Phase 1 |
+| In-VM 3D rendering (browser, GUI agent) | libkrun (libkrun + virgl) | `gpu-virgl` | Phase 7b |
 | ML inference / training in-VM | Cloud Hypervisor + VFIO | `backend-cloud-hypervisor` + `gpu-passthrough` | Post Phase 10 |
 
 ## Performance obsession — "as fast as fucking possible"
@@ -1153,11 +1153,11 @@ Every environment, every layer. Concrete techniques, ranked by expected impact:
 9. **Pre-fetched substituters in builder VM**: keep `/nix/store` warm with the closures for our standard profiles; new builds typically hit cache.
 10. **Deferred audit-chain HMAC**: HMAC computation is cheap but allocations matter — buffer N entries, compute one HMAC over the batch, write atomically. Trade: short window where un-HMACed entries could be lost on crash; mitigated by fsync-frequency tuning.
 11. **`io_uring` on Linux for vsock + audit log writes** (via `tokio-uring` 0.5, MIT): submission queue avoids syscall overhead.
-12. **microsandbox boot path**: less control here (vendor library), but we can pre-create sandbox skeletons and reuse process spawn.
+12. **libkrun boot path**: less control here (vendor library), but we can pre-create sandbox skeletons and reuse process spawn.
 13. **Per-OS targets**:
     - Linux/Firecracker (snapshot-cloned): **≤ 30 ms** cold boot
     - Linux/Firecracker (cold): **≤ 500 ms**
-    - macOS/microsandbox: **≤ 1 s** (pending vendor improvements)
+    - macOS/libkrun: **≤ 1 s** (pending vendor improvements)
     - Windows/Tauri: best-effort, target ≤ 2 s on WSL2
 
 CI gate (`tests/perf.rs`, `MVM_PERF=1`): regression alerts fire on any p50 increase > 10%.
@@ -1334,7 +1334,7 @@ Beyond the layers already named, we also bake in:
 
 ### Security
 - **Hardware root of trust**: where TPM2 (Linux/Windows) or Secure Enclave (macOS) is present, store the tenant KEK there instead of in `keyring`. Crate: `tss-esapi` (Apache-2.0) for TPM2; macOS Secure Enclave via `security-framework` (MIT/Apache). Falls back to `keyring` where unavailable.
-- **`#![forbid(unsafe_code)]`** on every crate where possible. Where `unsafe` is unavoidable (FFI to microsandbox/libkrun, vsock ioctls), it lives in a single `unsafe-bridge` module per crate, reviewed by the `type-design-analyzer` agent.
+- **`#![forbid(unsafe_code)]`** on every crate where possible. Where `unsafe` is unavoidable (FFI to libkrun/libkrun, vsock ioctls), it lives in a single `unsafe-bridge` module per crate, reviewed by the `type-design-analyzer` agent.
 - **Continuous fuzzing in CI**: nightly job runs each fuzz target for 1h on the latest main. Crashes file an issue automatically; corpora are versioned in `crates/mvm-guest/fuzz/corpus/`.
 - **Two-person review on security paths**: `CODEOWNERS` requires review from a security-tagged reviewer for changes under `crates/mvm-security/`, `crates/mvm-supervisor/`, `crates/mvm-plan/`, `crates/mvm-policy/`, `crates/mvm/src/security/`.
 - **VM-level intrusion detection (feature-gated)**: optional guest-side `mvm-ids` daemon watches for syscall anomaly patterns (excessive `connect()` to new IPs, `ptrace` self-attach, suspicious `execve` chains). Reports via vsock; runs only when `ids` feature is on.
@@ -1350,7 +1350,7 @@ Beyond the layers already named, we also bake in:
 - **`miette`-powered error reporting** (Apache-2.0): codespan-style errors with line/col/source for `mvm.toml`, flake parse errors, policy validation. `mvmctl explain <code>` walks users through error codes (`cargo`-style).
 - **`mvmctl doctor --fix`**: auto-remediation for safe failures (chmod 0700 on data dirs, regenerate dev certs, prune stale temp files). Destructive remediation requires `--yes`.
 - **Hot-reload dev loop**: `mvmctl up --watch` watches the flake + manifest, rebuilds on change, applies a rolling restart with health-check gating.
-- **Embedded REPL** (`dev` feature only): `mvmctl repl` launches a Rhai sandbox inside a microsandbox for quick experimentation.
+- **Embedded REPL** (`dev` feature only): `mvmctl repl` launches a Rhai sandbox inside a libkrun for quick experimentation.
 - **First-class TypeScript + Python SDK stubs**: emitted via `cargo xtask gen-stubs` so mvm-studio's UI and any non-Rust user gets typed APIs.
 - **Telemetry opt-out, not opt-in**: anonymous telemetry only collects build durations and boot times, gated by an explicit `MVM_TELEMETRY=on` (off by default, opt-in only — DX matters but trust matters more).
 - **Default config sane out of the box**: `mvmctl init` produces a flake that boots a working VM without any further tweaks.
@@ -1434,7 +1434,7 @@ Every architecturally-significant decision in this plan **must** be reflected in
 |---|---|---|---|
 | 002 | microVM security posture (existing) | already shipped | KEEP |
 | 003-012 | existing ADRs from the previous iteration | various | KEEP — not touched |
-| 013 | Pivot to microsandbox + libkrun + microvm.nix; drop Lima | Phase 0 | NEW |
+| 013 | Pivot to libkrun + libkrun + microvm.nix; drop Lima | Phase 0 | NEW |
 | 014 | `VmBackend` single trait; backend-as-impl pattern | Phase 0 | NEW |
 | 015 | Persistent builder VM with warm pool per tenant | Phase 1 | NEW |
 | 016 | Two-layer rootfs + encrypted persistent overlay | Phase 2 + 7a | NEW |
@@ -1646,7 +1646,7 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 **Goal**: `cd ../mvmd && cargo build --workspace` is green against the new mvm. No microVMs work yet — but mvmd's compile gate stays unbroken, CI runs on Linux + macOS + Windows, and this plan + the active sprint are in the right places in the repo.
 
 **First action items (run before any code change)**:
-1. **Relocate this plan into the repo**: copy `/Users/auser/.claude/plans/context-ref-file-users-auser-work-tinyl-joyful-lemon.md` to `/Users/auser/work/tinylabs/mvmco/mvm/specs/plans/60-mvm-microsandbox-migration.md` (60 chosen to leave headroom above existing plans 0-40+; bump if collision). The repo copy becomes canonical from this point on.
+1. **Relocate this plan into the repo**: copy `/Users/auser/.claude/plans/context-ref-file-users-auser-work-tinyl-joyful-lemon.md` to `/Users/auser/work/tinylabs/mvmco/mvm/specs/plans/60-mvm-libkrun-migration.md` (60 chosen to leave headroom above existing plans 0-40+; bump if collision). The repo copy becomes canonical from this point on.
 2. **Archive current SPRINT**: `git mv specs/SPRINT.md specs/backlog/42-microvm-hardening.md` (or whatever sprint number reflects the current shipped state).
 3. **Open Sprint 43**: new `specs/SPRINT.md` titled "Sprint 43 — mvm migration: Phase 0 (foundation + facade)". Body links to plan 60 and lists Phase 0's exit-test checklist.
 4. **Stub the new ADRs** (008, 009, 022, 026, 027, 028, 030): one file each under `specs/adrs/`, frontmatter + Context section filled, Decision/Consequences left as TODO. The user authorized creating ADRs during this session.
@@ -1672,20 +1672,20 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 - All ported `mvm_core::*` / `mvm_storage::*` / `mvm_plan::*` / `mvm_policy::*` / `mvm_security::*` unit tests pass
 - `tests/cli.rs::test_help_exits_successfully` and `test_version_exits_successfully` pass (CLI binary stub returns help)
 - `xtask check-adr-coverage` returns clean for the Phase 0 diff
-- `specs/plans/60-mvm-microsandbox-migration.md` exists; `specs/SPRINT.md` references it
+- `specs/plans/60-mvm-libkrun-migration.md` exists; `specs/SPRINT.md` references it
 
 **Risk**: mvmd pins mvm via git on `branch = "main"`. The facade re-export shape MUST be preserved 1:1 — verify with a path-override build of mvmd before merging.
 
 ### Phase 1 — First tracer bullet: build → boot → exec hello-world (~10-14 days)
-**Goal**: `mvmctl build .` (microsandbox-driven Nix build using microvm.nix) → `mvmctl up --flake .` (Firecracker on Linux, microsandbox elsewhere) → `mvmctl console <name>` attaches to the guest. Builder microVM stays warm and is reused.
+**Goal**: `mvmctl build .` (libkrun-driven Nix build using microvm.nix) → `mvmctl up --flake .` (Firecracker on Linux, libkrun elsewhere) → `mvmctl console <name>` attaches to the guest. Builder microVM stays warm and is reused.
 
 **Action**:
 - **Adopt microvm.nix**: `nix/flake.nix` imports `microvm-nix/microvm.nix`, pinned by hash. Define `nix/profiles/{minimal,worker,builder}.nix` and `nix/lib/mkGuest.nix`. Drop the previous iteration's hand-rolled rootfs init paths in favour of microvm.nix's.
-- Stand up `mvm-build` with microsandbox driver. Salvage `nix/manifest.rs`, `nix/scripts.rs`, `artifacts.rs`, `cache.rs`, `template_reuse.rs` from `../mvm/crates/mvm-build/src/`. Replace `pipeline/firecracker.rs` + `pipeline/vsock_builder.rs` with `pipeline/microsandbox.rs` that drives a **persistent builder microVM** (one warm sandbox per tenant; LRU-evicted; never destroyed mid-session).
+- Stand up `mvm-build` with libkrun driver. Salvage `nix/manifest.rs`, `nix/scripts.rs`, `artifacts.rs`, `cache.rs`, `template_reuse.rs` from `../mvm/crates/mvm-build/src/`. Replace `pipeline/firecracker.rs` + `pipeline/vsock_builder.rs` with `pipeline/libkrun.rs` that drives a **persistent builder microVM** (one warm sandbox per tenant; LRU-evicted; never destroyed mid-session).
 - Builder VM's policy permits egress to configured Nix substituters; runtime VMs default-deny (firewall not yet up — comes in Phase 3 — Phase 1's runtime VMs simply have no NIC).
 - Build outputs go to `~/.mvm/artifacts/<sha256>/` (content-addressed); runtime VMs reference by hash.
-- Stand up `mvm/src/vm/backend.rs` exposing `BackendKind::{Firecracker, Microsandbox}`. Detection: `cfg!(target_os = "linux") && /dev/kvm exists` → Firecracker; otherwise Microsandbox.
-- Implement `MicrosandboxBackend: VmBackend` (replace the `todo!()` in the user's existing `SandboxBackend` with a real `boot()`/`teardown()` aligned to the trait). Verify Windows-on-microsandbox status; if missing, document WSL2 fallback in ADR.
+- Stand up `mvm/src/vm/backend.rs` exposing `BackendKind::{Firecracker, Libkrun}`. Detection: `cfg!(target_os = "linux") && /dev/kvm exists` → Firecracker; otherwise Libkrun.
+- Implement `LibkrunBackend: VmBackend` (replace the `todo!()` in the user's existing `SandboxBackend` with a real `boot()`/`teardown()` aligned to the trait). Verify Windows-on-libkrun status; if missing, document WSL2 fallback in ADR.
 - Port `FirecrackerBackend` from `../mvm/crates/mvm/src/vm/firecracker.rs`.
 - Port the guest-agent vsock console from `../mvm/crates/mvm-guest/src/{console.rs,vsock.rs}`. Vsock framing protocol stays in-house; the raw socket uses `tokio-vsock`.
 - Wire CLI commands `build`, `up`, `down`, `console`, `exec`, `builder ls/keep/evict` in `mvm-cli/src/commands/`.
@@ -1693,16 +1693,16 @@ If any check fails, the phase is **not done**; we don't move on. Half-finished w
 - Cross-platform: CI runs the build on Linux, macOS, Windows; the smoke test runs at minimum on Linux + macOS (Windows path may rely on WSL2 initially).
 
 **Exit tests** (post-reconciliation — see "Exit-test reality vs. plan" below):
-- Unit (mvm-build builder-VM contract): `crates/mvm-build/src/builder_vm.rs` covers the `BuilderVm` trait + `MicrosandboxBuilderVm` impl with 29 `#[test]` fns (sidecar round-trip, revision-hash extraction, sandbox naming, shell quoting, default resources, flake-src validation, the `host_can_build` pathfn, and the stub's recovery-path error envelope).
-- Unit (backend auto-select): `crates/mvm-backend/src/backend.rs::tests::test_auto_select_returns_valid_backend`, `test_auto_select_prefers_microsandbox_on_macos`, `test_auto_select_returns_microsandbox_when_microsandbox_available_and_no_kvm` — exercises ADR-013 priority across hosts. Firecracker-on-KVM is asserted indirectly via the "valid backend" set: the test enumerates the legitimate `auto_select()` returns and would fail if KVM hosts started returning something other than Firecracker.
-- Unit (microsandbox driver): `crates/mvm-backend/src/microsandbox.rs` tests cover the `.ext4 → .raw` alias bridge, `start_with_mode`, list/status/stop, log paths. Sandbox-side `start()` and `logs()` are exercised by the live arm of `tests/smoke_microsandbox.rs` (gated `MVM_LIVE_SMOKE=1`).
-- Smoke (live boot, KVM/HVF host required): `tests/smoke_e2e_boot.rs::boots_real_rootfs_within_tripwire_then_tears_down_clean` boots a real Nix-built rootfs through `MicrosandboxBackend::start_with_mode`, asserts presence in `list()`, measures cold-boot wall-clock against the 600 ms tripwire (2× the ADR-013 floor of 300 ms), and tears down clean. Gated on `MVM_LIVE_SMOKE=1` + `MVM_TEST_ROOTFS=/path/to/rootfs.ext4`. Replaces the originally-named `tests/smoke_invoke.rs::boot_and_exec_hello_world` — the `smoke_invoke.rs` namespace belongs to Sprint 45 (function-call entrypoints), not Phase 1 of this plan.
+- Unit (mvm-build builder-VM contract): `crates/mvm-build/src/builder_vm.rs` covers the `BuilderVm` trait + `LibkrunBuilderVm` impl with 29 `#[test]` fns (sidecar round-trip, revision-hash extraction, sandbox naming, shell quoting, default resources, flake-src validation, the `host_can_build` pathfn, and the stub's recovery-path error envelope).
+- Unit (backend auto-select): `crates/mvm-backend/src/backend.rs::tests::test_auto_select_returns_valid_backend`, `test_auto_select_prefers_libkrun_on_macos`, `test_auto_select_returns_libkrun_when_libkrun_available_and_no_kvm` — exercises ADR-013 priority across hosts. Firecracker-on-KVM is asserted indirectly via the "valid backend" set: the test enumerates the legitimate `auto_select()` returns and would fail if KVM hosts started returning something other than Firecracker.
+- Unit (libkrun driver): `crates/mvm-backend/src/libkrun.rs` tests cover the `.ext4 → .raw` alias bridge, `start_with_mode`, list/status/stop, log paths. Sandbox-side `start()` and `logs()` are exercised by the live arm of `tests/smoke_libkrun.rs` (gated `MVM_LIVE_SMOKE=1`).
+- Smoke (live boot, KVM/HVF host required): `tests/smoke_e2e_boot.rs::boots_real_rootfs_within_tripwire_then_tears_down_clean` boots a real Nix-built rootfs through `LibkrunBackend::start_with_mode`, asserts presence in `list()`, measures cold-boot wall-clock against the 600 ms tripwire (2× the ADR-013 floor of 300 ms), and tears down clean. Gated on `MVM_LIVE_SMOKE=1` + `MVM_TEST_ROOTFS=/path/to/rootfs.ext4`. Replaces the originally-named `tests/smoke_invoke.rs::boot_and_exec_hello_world` — the `smoke_invoke.rs` namespace belongs to Sprint 45 (function-call entrypoints), not Phase 1 of this plan.
 - CLI: `crates/mvm-cli/src/commands/tests.rs` carries 250 `#[test]` attrs across 122 functions, exercising help text, flag parsing, and structured-config dispatch for build/up/down/console/exec/builder. Exceeds the original "~25 of 91" target. Note: the root-level `tests/cli.rs` file plan 60 referenced was never wired up — `tests/cli.rs.spec` was 900 lines of dead scaffolding deleted in this commit.
 - Performance gate: deferred to Phase 9 (`xtask perf --runs 100`, statistical) per the `boot_tripwire_is_2x_the_adr_floor` test's documentation. The inline 600 ms tripwire in the smoke catches single-shot regressions today; the strict gate lands when we have a stable Linux/KVM runner. `xtask/src/bench.rs` is intentionally not built — its responsibility moved into `xtask perf` under Phase 9.
 
 **Exit-test reality vs. plan**: Phase 1 shipped under different test names than plan 60 originally listed. The intent of every named gate is preserved by an actually-existing test (or explicitly deferred to Phase 9 with a stand-in regression). The originally-named functions (`nix_build_produces_rootfs`, `warm_builder_reused_across_calls`, `auto_picks_firecracker_when_kvm_present`, `boot_and_teardown_round_trip`, `boot_and_exec_hello_world`, `builder_persists_across_two_builds`) never landed under those names; the bullet list above is the authoritative mapping.
 
-**Risk**: microsandbox 0.4.5 may not yet expose vsock PTY hooks compatible with our `mvm-guest::console`. Verify by reading microsandbox source first; fall back to microsandbox's own console if our framing doesn't fit.
+**Risk**: libkrun 0.4.5 may not yet expose vsock PTY hooks compatible with our `mvm-guest::console`. Verify by reading libkrun source first; fall back to libkrun's own console if our framing doesn't fit.
 
 ### Phase 2 — Encryption everywhere (volumes, snapshots, secrets) + key rotation (~7-10 days)
 
@@ -1782,7 +1782,7 @@ netns lift sequenced with mvm-hostd.
 **Goal**: A runtime VM cannot reach any external host unless its tenant policy explicitly allows it (per-protocol, per-port, per-CIDR or per-SNI). The builder VM is the one exception, gated by mvmd-signed policy. `mvmctl audit tail --vm <name>` shows every flow attempt.
 
 **Action**:
-- Port `mvm/src/vm/{network,bridge,instance/net}.rs`. Adapt: Lima is dropped, so all bridge code targets host directly (Linux) or microsandbox's TUN bindings (macOS / Windows).
+- Port `mvm/src/vm/{network,bridge,instance/net}.rs`. Adapt: Lima is dropped, so all bridge code targets host directly (Linux) or libkrun's TUN bindings (macOS / Windows).
 - **L4 proxy**: new `mvm-supervisor/src/proxy/l4.rs` (feature-gated `egress-l4-proxy`). Uses `smoltcp` for userspace TCP/UDP termination; `tun-rs` opens per-VM TAPs; per-tenant `(proto, dst_cidr, dst_port)` allowlist. Default action: drop + audit.
 - **L7 proxy**: new `mvm-supervisor/src/proxy/l7.rs` (feature-gated `egress-l7-proxy`, depends on L4). HTTPS SNI extraction; HTTP/1.1 + HTTP/2 via `hyper`; per-tenant SNI + path-prefix allowlist; optional MITM (only when tenant policy installs a CA into the guest).
 - **Firewall**: new `mvm-supervisor/src/firewall/{linux_nft,macos_pf,windows_wfp}.rs`. Linux uses `nftables-rs`; macOS shells out to `pfctl`; Windows shells out to `windivert`. All install default-deny on the runtime-VM TAP; only the proxy TUN endpoint is reachable. **The firewall is additive enforcement** — even if it's misconfigured, the proxy's allowlist still applies.
@@ -1818,11 +1818,11 @@ netns lift sequenced with mvm-hostd.
 **Risk**: cardinality blowup if labels include raw tenant IDs or VM IDs. Mitigation: tenant_hash (truncated SHA256) for tenant labels; vm_id labels limited to short-lived gauges that get reset on stop.
 
 ### Phase 5 — DX layer: mvm-sdk, manifests, templates, dev mode, doctor, init, mvm-studio handshake (~7-10 days)
-**Goal**: `mvmctl init my-app` scaffolds an `mvm.toml` + `flake.nix` (microvm.nix-based); `mvmctl dev up` opens a PTY shell into a microsandbox box; `mvmctl doctor` reports environment health; `mvmctl catalog ls` lists templates; `../mvm-studio` Tauri app can launch and drive a local mvmd that spawns mvm VMs.
+**Goal**: `mvmctl init my-app` scaffolds an `mvm.toml` + `flake.nix` (microvm.nix-based); `mvmctl dev up` opens a PTY shell into a libkrun box; `mvmctl doctor` reports environment health; `mvmctl catalog ls` lists templates; `../mvm-studio` Tauri app can launch and drive a local mvmd that spawns mvm VMs.
 
 **Action**:
 - Port `mvm-sdk` from `/Users/auser/work/tinylabs/mvmco/mvmforge/crates/mvmforge-sdk/` (single `lib.rs` today; small port). Split into `mvm-sdk-macros` (proc macros for `#[mvm::function]`, `#[mvm::image]`, `#[mvm::secret]`, `#[mvm::volume]`, `#[mvm::addon]`) + `mvm-sdk` (runtime + types) + `mvm-sdk-addon` (addon trait + registry).
-- Wire the microsandbox-style sandbox-runtime API: `Sandbox::builder().image(…).build()`, `.run_code()`, `.commands().run()`, `.files().read/write`, `.process().spawn()`, `.snapshot().save()`, `.kill()`.
+- Wire the libkrun-style sandbox-runtime API: `Sandbox::builder().image(…).build()`, `.run_code()`, `.commands().run()`, `.files().read/write`, `.process().spawn()`, `.snapshot().save()`, `.kill()`.
 - **Stand up Python SDK** (`python/mvm`): runtime (`Sandbox`, `AsyncSandbox`) + declarative (`App`, `Image`, `Secret`, `Volume`, `@app.function`, `@app.cls`, `@mvm.enter`, `@mvm.method`, `@app.web_endpoint`, `Cron`, `f.local()`/`f.remote()`). pyo3-built native extension for hot-path JSON-RPC; pure-Python for the rest. Wheels for Linux/macOS/Windows on Python 3.10+.
 - Type stubs: `cargo xtask gen-stubs` emits `python/mvm/_types.pyi` (Pydantic-derived) and `typescript/src/types.d.ts` (`ts-rs`-derived). CI fails if hand-edited stubs drift from generated.
 - Auth: SDK reads `MVM_TOKEN` env or `~/.mvm/token` for hosted-cloud auth; local dev uses Unix socket with no token.
@@ -1887,7 +1887,7 @@ already stable across the transition.
 - Fuzz: `cargo +nightly fuzz run fuzz_authenticated_frame -- -runs=20000` exits 0 in CI; same for `fuzz_guest_request`, `fuzz_authed_path`, `fuzz_entrypoint_event`
 - Integration: `test_up_with_strict_seccomp_blocks_disallowed_syscall`; `test_signed_plan_rejected_when_signature_invalid`; `test_dm_verity_panics_on_tampered_block` (live KVM only, gated by env); `test_attest_round_trip_with_image_change_detection`; `tests/redactor.rs::no_pii_reaches_disk` (drives a session that prints PII, asserts log files + audit + metric scrape are clean)
 
-**Risk**: dm-verity on the microsandbox path (libkrun rootfs) — may not support kernel-level verity attach. **Mitigation**: dm-verity stays Firecracker-only; microsandbox path uses image-hash-on-load + HMAC chain for integrity (documented in ADR). Attestation reports indicate which integrity tier they were measured under so verifiers can apply different trust policies.
+**Risk**: dm-verity on the libkrun path (libkrun rootfs) — may not support kernel-level verity attach. **Mitigation**: dm-verity stays Firecracker-only; libkrun path uses image-hash-on-load + HMAC chain for integrity (documented in ADR). Attestation reports indicate which integrity tier they were measured under so verifiers can apply different trust policies.
 
 ### Phase 7 — MCP server + host-mediated agent tools + sessions (~7-10 days)
 **Status (2026-05-11 — ✅ host-mediated tools shipped; sessions + host-suspend deferred to 7a/7b)**:
@@ -2003,7 +2003,7 @@ tools; persistent overlay supersedes `FsStagingArea`) and
 **Risk**: wire-format drift. The PROTOCOL_VERSION constant + a compat-matrix test is the safety net.
 
 ### Phase 9 — Hardening, performance gates, supply-chain (~7-10 days)
-**Goal**: `cargo deny check` + `cargo audit` clean; reproducibility double-build identical; **cold-boot ≤ 30 ms on Linux/Firecracker via snapshot pool** (≤ 500 ms cold path), ≤ 1 s on macOS/microsandbox; rootfs ≤ 20 MB for `minimal` template; SBOM emitted; PGO + MUSL release builds.
+**Goal**: `cargo deny check` + `cargo audit` clean; reproducibility double-build identical; **cold-boot ≤ 30 ms on Linux/Firecracker via snapshot pool** (≤ 500 ms cold path), ≤ 1 s on macOS/libkrun; rootfs ≤ 20 MB for `minimal` template; SBOM emitted; PGO + MUSL release builds.
 
 **Action**:
 - Land snapshot pool: `mvm/src/vm/snapshot_pool.rs` keeps per-template warm Firecracker snapshots; `up` clones from pool. (Phase 1 set up the path; Phase 9 measures and tunes pool size + eviction.)
@@ -2147,10 +2147,10 @@ Sequential: ~10-13 weeks for one engineer. Phases 2-5 can partially overlap (enc
 
 ## Open questions to confirm during execution
 
-1. **Windows path is Tauri-only** (confirmed): native Windows CLI is best-effort; the supported Windows surface is `mvm-studio`'s Tauri build packaging mvmd + mvm. Microsandbox/WSL2 fallback documented in `specs/runbooks/cross-platform-install.md` (Phase 5).
+1. **Windows path is Tauri-only** (confirmed): native Windows CLI is best-effort; the supported Windows surface is `mvm-studio`'s Tauri build packaging mvmd + mvm. Libkrun/WSL2 fallback documented in `specs/runbooks/cross-platform-install.md` (Phase 5).
 2. **microvm.nix licence + audit** (confirmed MIT). Pin a vetted commit; re-audit on every bump via `xtask audit-flake`.
 3. **`rmcp` SDK** (confirmed Apache-2.0, recently updated). Phase 7 verifies its server-side hooks match `../mvm/crates/mvm-mcp`'s dispatcher needs; fall back if shape doesn't fit.
-4. **Cold-boot targets**: Linux/Firecracker (snapshot-cloned) ≤ 30 ms, Linux/Firecracker (cold) ≤ 500 ms, macOS/microsandbox ≤ 1 s, Windows/Tauri-WSL2 ≤ 2 s. Snapshot-pool path lands in Phase 1, tightened in Phase 9.
+4. **Cold-boot targets**: Linux/Firecracker (snapshot-cloned) ≤ 30 ms, Linux/Firecracker (cold) ≤ 500 ms, macOS/libkrun ≤ 1 s, Windows/Tauri-WSL2 ≤ 2 s. Snapshot-pool path lands in Phase 1, tightened in Phase 9.
 5. **Confidential compute (`sev-snp`/`tdx`) feature flags** — reserve API surface in Phase 6, defer real implementation post-Phase-10 (user confirmed unsure).
 6. **TPM2 / Secure Enclave keystore wiring** — Phase 2 implements `keyring` baseline; TPM2/Secure Enclave landing later as a `Keystore` impl variant once the trait shape is stable. Hardware attestation (Phase 6 stubs) is the consumer for this.
 7. **GPU passthrough (Cloud Hypervisor + VFIO)** — defer to post-Phase-10. Confirm scope when the first ML/local-LLM customer asks.

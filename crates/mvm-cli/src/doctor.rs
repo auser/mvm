@@ -99,9 +99,7 @@ pub fn run(json: bool) -> Result<()> {
     // the dev VM, never the host. When the dev VM isn't running these
     // probes return informational `Check`s and doctor exits 0 — the host
     // is not expected to own them. Routing still goes through `VM_NAME`,
-    // which `shell::run_on_vm` maps to the platform's default LinuxEnv
-    // (Apple Container `mvm-dev` on macOS 26+; libkrun builder
-    // elsewhere).
+    // which `shell::run_on_vm` maps to the platform's default LinuxEnv.
     let vm_up = dev_vm_running();
     checks.push(if vm_up {
         nix_version_check()

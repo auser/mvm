@@ -2,7 +2,7 @@
 title: "ADR-038: CI execution policy — push runs CI; release runs everything else; githooks run tests on commit"
 status: Proposed
 date: 2026-05-07
-related: ADR-033 (code-quality enforcement), plan 60-mvm-microsandbox-migration
+related: ADR-033 (code-quality enforcement), plan 60-mvm-libkrun-migration
 ---
 
 ## Status

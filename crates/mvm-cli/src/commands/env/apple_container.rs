@@ -571,7 +571,10 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
 /// (Plan 72 W4/W5 — `LibkrunBuilderVm` runs `nix build` against the
 /// dev-shell flake from inside a microVM with a persistent 64 GiB
 /// `/nix` store). Libkrun isn't installed → loud error pointing at
-/// the install command.
+/// the install command; **no libkrun fallback for the dev-shell
+/// image** (Plan 72 W5.C — the dev-shell rustc closure overflows
+/// libkrun's 4 GiB overlay anyway, so a fallback that would
+/// just disk-out is worse than an actionable error).
 ///
 /// Outside a source checkout: falls back to the GitHub-release
 /// download of a pre-built image.
@@ -579,12 +582,25 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
 /// Failures of the local build are surfaced loudly — never silently
 /// substituted with the prebuilt, since the prebuilt would mask local
 /// rootfs changes.
-pub(super) fn ensure_dev_image() -> Result<(String, String)> {
+fn ensure_dev_image() -> Result<(String, String)> {
+    let local_flake = find_dev_image_flake().ok();
+
     // Plan 72 W5.B + W5.C — source-checkout dispatch.
     //
     // libkrun is the only supported builder for the dev-shell flake.
-    // Missing libkrun is surfaced as a configuration error with an
-    // install hint. mvmctl does not consult host Nix as a fallback.
+    // Plan 72 W5.C removed the legacy direct-libkrun fallback
+    // because:
+    //
+    //   1. The dev-shell rustc + cargo closure overflows libkrun's
+    //      hardcoded 4 GiB writable overlay (the load-bearing reason
+    //      ADR-046 / Plan 72 exists). A fallback that would fail with
+    //      "No space left on device" is worse than a clear install
+    //      hint.
+    //
+    //   2. libkrun is now a documented prerequisite for the source-
+    //      checkout dev loop on macOS Apple Silicon / Linux KVM hosts.
+    //      `mvmctl doctor` reports its absence; `brew install libkrun`
+    //      (macOS) / distro package (Linux) is the install path.
     //
     // Failures are loud and refuse silent fallback to the prebuilt,
     // since the typical failure mode (libkrun runtime mismatch, builder-
@@ -737,7 +753,7 @@ pub(super) fn ensure_dev_image() -> Result<(String, String)> {
 /// - `~/.mvm/dev/prebuilt/v*/{vmlinux,rootfs.ext4}` — previously
 ///   downloaded prebuilts for earlier versions.
 /// - `~/.mvm/dev/builds/<hash>/{vmlinux,rootfs.ext4}` — historical
-///   older local builder outputs.
+///   nix-darwin `linux-builder` outputs from the pre-libkrun era.
 ///
 /// Returns the most-recently-modified pair so a user with a recent
 /// successful build/download keeps booting, with a short label
@@ -1706,18 +1722,15 @@ fn find_dev_image_flake() -> Result<String> {
 /// **builder VM** flake at `nix/images/builder-vm/flake.nix`.
 ///
 /// Distinct from the dev-shell image flake at `nix/images/builder/`:
-/// the builder-vm flake produces the rootfs used as the libkrun
-/// builder image. The dev-shell flake includes rustc + the workspace's
-/// cargo closure and is built inside that libkrun VM with a
-/// virtio-blk-backed `/nix`.
+/// the builder-vm flake produces the small busybox+nix+tools rootfs
+/// that `LibkrunBuilderVm` uses for the source-checkout dev loop.
 ///
 /// W5.B (this PR) wires this into `ensure_dev_image` as a precondition
 /// for the libkrun dispatch path — when it returns `Ok`, the host has
 /// the Layer 1 builder-VM flake it needs to bootstrap.
 ///
 /// `allow(dead_code)`: the function is only called from the
-/// libkrun-dispatch path inside `ensure_dev_image`, which itself only
-/// compiles when `backends-builder-vm-libkrun` is enabled.
+/// libkrun-dispatch path inside `ensure_dev_image`.
 #[allow(dead_code)]
 fn find_builder_vm_flake() -> Result<String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
@@ -1739,16 +1752,27 @@ fn find_builder_vm_flake() -> Result<String> {
 
 /// Plan 72 W5 — populate `~/.cache/mvm/builder-vm/<arch>/` with
 /// `vmlinux` + `rootfs.ext4` + `cmdline.txt` + `manifest.json`
-/// from the published release artifact cache.
+/// from published release artifacts when the cache is empty.
 ///
 /// `LibkrunBuilderVm::run_build` reads from this cache; this
 /// function is what fills it. The two-layer artifact rule from
 /// ADR-046 in action:
 ///
-/// Fetches the per-arch artifacts the release workflow publishes
-/// (`builder-vm-vmlinux-<arch>`, `builder-vm-rootfs-<arch>.ext4`,
-/// optional sidecars) from `releases/download/v<version>/`. SHA-256
-/// verifies per ADR-002 §W5.1. A cache hit is the fast path.
+/// - Layer 1 (this function): ensure the **builder VM image** is
+///   available in the local cache.
+/// - Layer 2: use the Layer 1 image plus libkrun to build the
+///   **dev shell image** with the large rustc closure.
+///
+/// Source-checkout-only by design — `find_builder_vm_flake()`
+/// Two acquisition paths split on whether we have an in-repo flake:
+///
+/// Fetches the per-arch artifacts the W2 release-workflow
+///    job publishes (`builder-vm-vmlinux-<arch>`,
+///    `builder-vm-rootfs-<arch>.ext4`, optional sidecars) from
+///    `releases/download/v<version>/`. SHA-256 verifies per ADR-002 §W5.1.
+/// A cache hit is the fast path — there's no upstream source to be out
+/// of sync with; only the release tag matters and the cache dir is keyed
+/// on it.
 ///
 /// W5.B wired this into `ensure_dev_image`; Plan 72 W5's "Layer 1
 /// outside source checkout — download the published prebuilt"
@@ -1784,10 +1808,7 @@ fn bootstrap_builder_vm_image() -> Result<()> {
         "Builder VM image not in cache; downloading published prebuilt for v{}...",
         env!("CARGO_PKG_VERSION")
     ));
-    download_builder_vm_image(arch, &out_dir).with_context(|| {
-        "downloading the builder VM image. The release-artifact path is the only \
-         supported builder-VM bootstrap path when no local cached image exists."
-    })?;
+    download_builder_vm_image(arch, &out_dir).context("downloading the builder VM image")?;
     Ok(())
 }
 
@@ -1890,9 +1911,8 @@ fn builder_vm_artifact_names(arch: &str) -> BuilderVmArtifactNames {
 /// builder VM.
 ///
 /// Layer 1 (the builder VM image at `~/.cache/mvm/builder-vm/<arch>/`)
-/// is downloaded via [`bootstrap_builder_vm_image`] on cache miss.
-/// Layer 2 (the dev-shell
-/// image the user boots into via `mvmctl dev up`) is built by
+/// is fetched via [`bootstrap_builder_vm_image`] on cache miss. The
+/// dev-shell image the user boots into via `mvmctl dev up` is built by
 /// `LibkrunBuilderVm::run_build` against the in-repo
 /// `nix/images/builder/` flake, inside a libkrun guest that mounts the
 /// workspace at `/work` and writes its artifacts back through a
@@ -1906,15 +1926,14 @@ fn builder_vm_artifact_names(arch: &str) -> BuilderVmArtifactNames {
 ///   - confirmed `find_builder_vm_flake().is_ok()` (Layer 1 source is
 ///     present in the workspace),
 ///   - run [`prepare_dev_image_out_dir`] on `out_dir`.
+// Gated only on `backends-builder-vm-libkrun`.
 #[cfg(feature = "backends-builder-vm-libkrun")]
 fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     use mvm_build::builder_vm::{BuilderJob, BuilderMounts, BuilderVm, host_system_linux};
     use mvm_build::libkrun_builder::LibkrunBuilderVm;
 
     // Ensure Layer 1 (the builder VM image) is in
-    // `~/.cache/mvm/builder-vm/<arch>/`. Idempotent: first call
-    // downloads and verifies it; subsequent calls find the cache
-    // populated and return immediately.
+    // `~/.cache/mvm/builder-vm/<arch>/`.
     bootstrap_builder_vm_image()
         .context("Stage 0 builder-VM image bootstrap (precondition for libkrun dispatch)")?;
 
@@ -1976,8 +1995,10 @@ fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
 /// Ensure the bundled default microVM image (kernel + rootfs) is in the cache.
 ///
 /// Used by any image-taking command when no `--flake` or `--manifest` was
-/// supplied. Downloads a pre-built image from the matching GitHub release
-/// when the cache is empty. Returns `(kernel_path, rootfs_path)`.
+/// supplied. Returns `(kernel_path, rootfs_path)`.
+///
+/// Downloads a pre-built image from the matching GitHub release when
+/// the local cache is empty.
 pub(crate) fn ensure_default_microvm_image() -> Result<(String, String)> {
     let cache_dir = format!("{}/default-microvm", mvm_core::config::mvm_cache_dir());
     std::fs::create_dir_all(&cache_dir)?;

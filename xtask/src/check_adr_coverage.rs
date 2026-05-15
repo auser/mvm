@@ -35,8 +35,8 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 /// ADR file pattern: `NNN-slug.md` where NNN is 3+ digits.
-/// `specs/adrs/013-microsandbox-libkrun-microvm-nix-pivot.md` →
-/// `(13, "microsandbox-libkrun-microvm-nix-pivot")`.
+/// `specs/adrs/013-libkrun-libkrun-microvm-nix-pivot.md` →
+/// `(13, "libkrun-libkrun-microvm-nix-pivot")`.
 fn parse_adr_filename(name: &str) -> Option<(u32, String)> {
     let stem = name.strip_suffix(".md")?;
     let (num, rest) = stem.split_once('-')?;
@@ -323,8 +323,8 @@ mod tests {
             Some((2, "microvm-security-posture".to_string()))
         );
         assert_eq!(
-            parse_adr_filename("013-microsandbox-libkrun-microvm-nix-pivot.md"),
-            Some((13, "microsandbox-libkrun-microvm-nix-pivot".to_string()))
+            parse_adr_filename("013-libkrun-libkrun-microvm-nix-pivot.md"),
+            Some((13, "libkrun-libkrun-microvm-nix-pivot".to_string()))
         );
     }
 

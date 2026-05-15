@@ -214,7 +214,8 @@ pub fn verify_and_resume<IO: SnapshotIO + ?Sized>(
 /// the resulting snapshot stays unencrypted, HMAC-only (Phase 1 /
 /// pre-W5 shape).
 fn encrypt_artifacts_if_keyed(dir: &Path) -> Result<()> {
-    let Some(dek) = snapshot_tenant_dek()? else {
+    let provider = snapshot_key_provider();
+    let Ok(dek) = provider.get_data_key(SNAPSHOT_TENANT_ID) else {
         // No tenant DEK configured — leave artifacts unencrypted.
         // Operators who want at-rest encryption configure a key
         // via `mvmctl secret put` or the MVM_TENANT_KEY_LOCAL env
@@ -252,7 +253,8 @@ fn encrypt_artifacts_if_keyed(dir: &Path) -> Result<()> {
 /// or v1-shape leftover); set `MVM_ALLOW_UNENCRYPTED_SNAPSHOT=1`
 /// to bypass during the one-time v1 → v2 migration.
 fn decrypt_artifacts_if_encrypted(dir: &Path) -> Result<()> {
-    let dek_opt = snapshot_tenant_dek()?;
+    let provider = snapshot_key_provider();
+    let dek_opt = provider.get_data_key(SNAPSHOT_TENANT_ID).ok();
 
     for name in [VMSTATE_FILENAME, MEM_FILENAME] {
         let p = dir.join(name);
@@ -292,21 +294,14 @@ fn decrypt_artifacts_if_encrypted(dir: &Path) -> Result<()> {
     Ok(())
 }
 
-fn snapshot_tenant_dek() -> Result<Option<secrecy::SecretBox<Vec<u8>>>> {
-    if std::env::var_os(SNAPSHOT_TENANT_KEY_ENV).is_some() {
-        return keystore::KeyProvider::get_data_key(&keystore::EnvKeyProvider, SNAPSHOT_TENANT_ID)
-            .map(Some)
-            .with_context(|| {
-                format!(
-                    "loading snapshot tenant DEK from {SNAPSHOT_TENANT_KEY_ENV} for tenant {SNAPSHOT_TENANT_ID}"
-                )
-            });
-    }
+#[cfg(not(test))]
+fn snapshot_key_provider() -> Box<dyn keystore::KeyProvider> {
+    keystore::default_provider()
+}
 
-    match keystore::default_provider().get_data_key(SNAPSHOT_TENANT_ID) {
-        Ok(dek) => Ok(Some(dek)),
-        Err(_) => Ok(None),
-    }
+#[cfg(test)]
+fn snapshot_key_provider() -> Box<dyn keystore::KeyProvider> {
+    Box::new(keystore::EnvKeyProvider)
 }
 
 /// Drop the on-disk snapshot files + sidecar + epoch counter for

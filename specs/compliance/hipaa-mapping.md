@@ -1,6 +1,6 @@
 # HIPAA Security Rule — Mapping
 
-**Status:** STUB. Filled out in Phase 9 of `specs/plans/60-mvm-microsandbox-migration.md`.
+**Status:** STUB. Filled out in Phase 9 of `specs/plans/60-mvm-libkrun-migration.md`.
 **Last verified:** N/A (stub created 2026-05-07).
 **Owner:** mvm + mvmd platform team.
 **Scope:** the open-source `mvm` library + the hosted mvmd cloud (when launched and only after a Business Associate Agreement is signed).

@@ -48,8 +48,9 @@ mvmctl automatically detects your platform at startup and selects the best VM ba
 | Platform | Backend | What happens |
 |----------|---------|-------------|
 | **Linux with `/dev/kvm`** | Firecracker | Runs directly on KVM. Smallest attack surface, fastest cold boot. |
-| **macOS** (Apple Silicon / Intel) | libkrun | Native Hypervisor.framework. No Docker Desktop required. |
-| **Linux without `/dev/kvm`** | Docker fallback when available | Tier 3 fallback. Firecracker requires writable KVM. |
+| **macOS 26+ Apple Silicon** | Apple Container | Native Virtualization.framework. No Docker Desktop required. |
+| **macOS Apple Silicon / Intel** | libkrun | Direct Hypervisor.framework backend. Intel Macs use this path. |
+| **Linux without `/dev/kvm`** | Docker | Tier 3 fallback when no microVM backend is available. |
 | **Docker available** | Docker | Tier 3 container fallback. Used only if no hypervisor backend works. |
 
 You don't need Nix on the host. On first build, mvm resolves a Linux builder microVM, runs `nix build` inside it, and extracts the rootfs back. Host-side Nix is not part of the managed `mvmctl` path.
@@ -62,7 +63,7 @@ After installation, run the setup wizard:
 mvmctl init
 ```
 
-This walks through platform detection, dependency installation (Firecracker on Linux, libkrun on macOS), default network setup, and XDG directory creation. Use `--non-interactive` for scripted environments.
+This walks through platform detection, dependency installation (Firecracker on Linux, direct libkrun on macOS), default network setup, and XDG directory creation. Use `--non-interactive` for scripted environments.
 
 Running `mvmctl dev` or `mvmctl bootstrap` also handles setup automatically -- they detect your platform, select the backend, and stage the builder microVM image on first use.
 

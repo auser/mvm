@@ -63,10 +63,10 @@ pub const ROOTFS_MAX_BYTES: u64 = 20 * 1024 * 1024; // 20 MiB
 /// ADR-013 floor is 300ms; Phase 9's strict gate is 500ms p50.
 pub const FIRECRACKER_BOOT_BUDGET: Duration = Duration::from_millis(500);
 
-/// Cold-boot wall-clock budget for the libkrun backend. Slower
-/// than Firecracker because libkrun's startup + the in-VM init
-/// script aren't as tight; the plan-60 spec sets 1s as the
-/// worst-case envelope.
+/// Cold-boot wall-clock budget for the libkrun backend. Slower than
+/// Firecracker because libkrun's startup +
+/// the in-VM init script aren't as tight; the plan-60 spec sets
+/// 1s as the worst-case envelope.
 pub const LIBKRUN_BOOT_BUDGET: Duration = Duration::from_millis(1000);
 
 /// Dispatch entry — called from `xtask/src/main.rs`.
@@ -149,7 +149,7 @@ pub fn all_budgets() -> Vec<PerfBudget> {
             limit: LIBKRUN_BOOT_BUDGET.as_millis() as u64,
             unit: "ms",
             source: "ADR-013 §\"Per-backend boot budgets\"",
-            description: "libkrun cold-boot wall-clock",
+            description: "Libkrun cold-boot wall-clock",
         },
         PerfBudget {
             name: "default_response_body_cap",

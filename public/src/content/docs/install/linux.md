@@ -3,7 +3,7 @@ title: "Install mvm on Linux"
 description: "mvm on Linux is the Tier 1 production target — Firecracker + KVM, no virtualization wrapper, sub-200ms cold boot."
 ---
 
-Linux is mvm's Tier 1 target. The full security posture (verified boot, jailer, seccomp tier "strict") and the project's tightest boot-time budget (≤ 200ms cold on Firecracker; ≤ 30ms snapshot-cloned) hold here. Other platforms get the same API surface through the backend abstraction, but Linux is where mvm runs at full pace.
+Linux is mvm's Tier 1 target. The full security posture (verified boot, jailer, seccomp tier "strict") and the project's tightest boot-time budget (≤ 200ms cold on Firecracker; ≤ 30ms snapshot-cloned) hold here. Other platforms get the same API surface via [ADR-013](/contributing/adr/013-libkrun-pivot/), but Linux is where mvm runs at full pace.
 
 ## Prerequisites
 
@@ -18,7 +18,7 @@ You'll need:
   If `/dev/kvm` exists but is `root`-only, add yourself to the `kvm` group: `sudo usermod -aG kvm "$USER"` (re-login required).
 - **Rust 1.85+** if you build `mvmctl` from source.
 
-You **do not need Nix on your host**. mvm resolves the project builder VM on first build, runs `nix build` inside it, and extracts the resulting rootfs back to your host.
+You **do not need Nix on your host**. mvm bootstraps a small Linux builder microVM on first build, runs `nix build` inside it, and extracts the resulting rootfs back to your host. See [ADR-013 §"Linux builder via libkrun"](/contributing/adr/013-libkrun-pivot/) for the design.
 
 ## Install mvmctl
 
@@ -73,7 +73,7 @@ See [Building MicroVM Images](/guides/building-microvm-images) for the user-faci
 
 **"`/dev/kvm`: permission denied"** — your user isn't in the `kvm` group. `sudo usermod -aG kvm "$USER"` and start a new shell.
 
-**"`mvmctl run` does not select Firecracker even though I have KVM"** — check `mvmctl doctor` output. The auto-select ladder picks Firecracker only when `/dev/kvm` is writable; if it's `root`-only, fix the group membership above.
+**"`mvmctl run` falls back to libkrun even though I have KVM"** — check `mvmctl doctor` output. The auto-select ladder picks Firecracker only when `/dev/kvm` is writable; if it's `root`-only, libkrun wins as the cross-platform fallback. Same fix as above.
 
 **Nix build is slow** — first builds pull from `cache.nixos.org` and `cache.flakehub.com`. Subsequent builds hit the builder VM's `/nix/store`, which mvm keeps warm across runs.
 
@@ -102,7 +102,7 @@ Host-side Nix is for your own commands; `mvmctl build` uses the builder VM path.
 
 ## Distro-specific notes
 
-- **Ubuntu/Debian** — `apt install qemu-utils e2fsprogs` if you need `mkfs.ext4` for local image tests.
+- **Ubuntu/Debian** — `apt install qemu-utils e2fsprogs` if you need `mkfs.ext4` for the [smoke test](https://github.com/tinylabscom/mvm/blob/main/tests/smoke_libkrun.rs).
 - **Fedora/RHEL** — `dnf install e2fsprogs qemu-img`. Make sure SELinux isn't blocking `/dev/kvm` access (it usually isn't, but `audit2why` is your friend if it does).
 - **Arch** — `pacman -S e2fsprogs qemu-img`. Already lean.
 - **NixOS** — easiest path: `nix profile install github:tinylabscom/mvm`. KVM is enabled by default; `kvm` group membership is the only thing to verify.

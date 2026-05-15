@@ -4,11 +4,11 @@ use std::sync::OnceLock;
 /// The execution environment for running workloads.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Platform {
-    /// macOS — Apple Container on 26+, otherwise libkrun on Hypervisor.framework.
+    /// macOS — Apple Container on Apple Silicon/macOS 26+, or libkrun via Hypervisor.framework.
     MacOS,
     /// Native Linux with /dev/kvm available — run Firecracker directly
     LinuxNative,
-    /// Linux without /dev/kvm (not WSL) — libkrun if available, or Docker fallback
+    /// Linux without /dev/kvm (not WSL) — Docker fallback.
     LinuxNoKvm,
     /// WSL2 — may have KVM (Hyper-V nested virt), prefers Firecracker when available
     Wsl2,
@@ -93,6 +93,40 @@ impl Platform {
                 .output()
                 .map(|o| o.status.success())
                 .unwrap_or(false)
+        })
+    }
+
+    /// Whether Nix is available on the host and can build Linux targets.
+    ///
+    /// On macOS this requires nix-daemon with a linux-builder configured.
+    /// On native Linux this is always true if `nix` is on PATH.
+    /// When true, `nix build` can run on the host directly. When false
+    /// on macOS, the builder VM handles cross-builds.
+    pub fn has_host_nix(self) -> bool {
+        static HOST_NIX: OnceLock<bool> = OnceLock::new();
+        *HOST_NIX.get_or_init(|| {
+            // Try PATH first
+            if std::process::Command::new("nix")
+                .args(["--version"])
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .status()
+                .map(|s| s.success())
+                .unwrap_or(false)
+            {
+                return true;
+            }
+            // Check common Nix install locations (freshly installed Nix may
+            // not be on PATH if the shell profile hasn't been sourced yet)
+            for path in &[
+                "/nix/var/nix/profiles/default/bin/nix",
+                "/run/current-system/sw/bin/nix",
+            ] {
+                if Path::new(path).exists() {
+                    return true;
+                }
+            }
+            false
         })
     }
 

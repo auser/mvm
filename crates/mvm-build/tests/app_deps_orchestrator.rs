@@ -431,7 +431,7 @@ fn clone_builder_err(e: &BuilderVmError) -> BuilderVmError {
     match e {
         BuilderVmError::NixBuildFailed(s) => BuilderVmError::NixBuildFailed(s.clone()),
         BuilderVmError::ExtractionFailed(s) => BuilderVmError::ExtractionFailed(s.clone()),
-        BuilderVmError::BuilderUnavailable(s) => BuilderVmError::BuilderUnavailable(s.clone()),
+        BuilderVmError::LibkrunUnavailable(s) => BuilderVmError::LibkrunUnavailable(s.clone()),
         BuilderVmError::ImagePullFailed(s) => BuilderVmError::ImagePullFailed(s.clone()),
         BuilderVmError::NotYetImplemented => BuilderVmError::NotYetImplemented,
     }

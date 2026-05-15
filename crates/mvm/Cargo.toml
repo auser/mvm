@@ -14,8 +14,6 @@ mvm-core.workspace = true
 mvm-plan.workspace = true
 mvm-security.workspace = true
 mvm-guest.workspace = true
-# `default-features = false` keeps optional backend launchers out of lean
-# library builds unless requested.
 mvm-build = { workspace = true, default-features = false }
 mvm-backend = { workspace = true, default-features = false }
 mvm-base.workspace = true

@@ -21,8 +21,8 @@ pub fn check_package_manager() -> Result<()> {
 /// Check that a Linux package manager is available.
 ///
 /// Required for installing host-side prerequisites (Firecracker is
-/// fetched as a binary; libkrun comes from distro
-/// packages or `cargo install`). The check is informational —
+/// fetched as a binary; libkrun comes from distro packages or Homebrew).
+/// The check is informational —
 /// `mvmctl bootstrap` continues even if no manager is found, since
 /// users may have installed prerequisites by other means.
 fn check_linux_package_manager() -> Result<()> {

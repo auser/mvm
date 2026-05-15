@@ -31,7 +31,7 @@ required every state-changing CLI verb to have a live drive-and-assert
 test pinning its `LocalAuditKind` emit. Pinning the easy rows shipped
 in PRs #106 / #107 / #108 — 40 live tests at PR #108 close, covering
 every Emits row that doesn't need a running Firecracker / Apple
-Container / Docker / microsandbox / Nix builder / GitHub network.
+Container / Docker / libkrun / Nix builder / GitHub network.
 
 The remaining rows fall into six clusters by what they reach through:
 
@@ -40,7 +40,7 @@ The remaining rows fall into six clusters by what they reach through:
 | **Snapshot lifecycle** | `pause` / `resume` | `FirecrackerIO` socket + `pause_and_seal` / `verify_and_resume` | Talk directly to Firecracker UDS; bypass `AnyBackend.pause`/`resume` trait methods. Routing through the trait drops the snapshot semantics (vmstate + mem files) — substantive behavior change. |
 | **Guest agent commands** | `fs write/mkdir/rm/chmod`, `proc start/signal/kill/stdin` | Vsock connection to the in-guest `mvm-guest-agent` daemon | Per-VM vsock socket + agent protocol RPC. No mock layer for the vsock or the agent protocol exists. |
 | **VM-attached storage** | `volume mount` / `volume unmount` | `mvm_storage::virtio_fs::*` + per-VM Firecracker socket | Mount path validation runs against `MountPathPolicy`; the actual virtio-fs daemon attach is Firecracker-specific. |
-| **Nix build pipeline** | `build` → `TemplateBuild` | `mvm-build::pipeline::build` → host Nix or `MicrosandboxBuilderVm` | The whole chain runs `nix build` against a flake — needs a Nix install or a running builder VM. |
+| **Nix build pipeline** | `build` → `TemplateBuild` | `mvm-build::pipeline::build` → host Nix or `LibkrunBuilderVm` | The whole chain runs `nix build` against a flake — needs a Nix install or a running builder VM. |
 | **GitHub-driven self-update** | `update` → `UpdateInstall` | `reqwest` HTTPS to `github.com/auser/mvm/releases/latest` (now tinylabscom/mvm) | Reaches the public internet on every invocation. `--check` mode also hits GitHub. |
 | **System-path destruction** | `uninstall` positive | `sudo rm -rf /var/lib/mvm`, `sudo rm /usr/local/bin/mvmctl`, `microvm::stop()` | Sudo-gated absolute paths that on a developer's machine point at a real install. |
 

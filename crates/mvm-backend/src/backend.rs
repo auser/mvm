@@ -306,14 +306,12 @@ impl AnyBackend {
     /// Select the best backend for the current platform.
     ///
     /// Firecracker is the production target — it always wins when KVM
-    /// is available. Non-KVM hosts then use Apple Container where
-    /// available, raw libkrun when installed, and Docker only as the
-    /// loud Tier 3 fallback.
+    /// is available. Non-KVM hosts continue down the fallback ladder.
     ///
     /// Priority:
     /// 1. **Firecracker** (if `/dev/kvm` available — production Tier 1)
     /// 2. Apple Container (macOS 26+)
-    /// 3. raw libkrun (Linux KVM / macOS HVF)
+    /// 3. raw libkrun
     /// 4. Docker (Tier 3 fallback — banner emitted; not promoted)
     ///
     /// If none of the above match, the function returns Firecracker as
@@ -331,15 +329,14 @@ impl AnyBackend {
             return Self::Firecracker(FirecrackerBackend);
         }
 
-        // 2. libkrun installed → use the raw libkrun shim. This is
-        // the primary macOS microVM path on Apple Silicon and Intel.
-        if plat.has_libkrun() {
-            return Self::Libkrun(LibkrunBackend);
-        }
-
-        // 3. macOS 26+ → Apple Virtualization.framework fallback.
+        // 2. macOS 26+ → Apple Virtualization.framework.
         if plat.has_apple_containers() {
             return Self::AppleContainer(AppleContainerBackend);
+        }
+
+        // 3. libkrun installed → use the raw libkrun shim.
+        if plat.has_libkrun() {
+            return Self::Libkrun(LibkrunBackend);
         }
 
         // 4. Docker available → universal Tier 3 fallback. The CLI emits
@@ -761,7 +758,11 @@ mod tests {
         // live VM, but we can check that the bail (if any) for a
         // missing VM does NOT claim the backend itself is unsupported
         // when the capability says it is.
-        let unsupported: &[&str] = &["libkrun", "qemu", "apple-container"];
+        let unsupported: &[&str] = &[
+            "libkrun",
+            "qemu", // → microvm-nix
+            "apple-container",
+        ];
         for &name in unsupported {
             let b = AnyBackend::from_hypervisor(name);
             assert!(

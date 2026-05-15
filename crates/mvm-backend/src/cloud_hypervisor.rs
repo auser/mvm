@@ -333,7 +333,7 @@ impl VmBackend for CloudHypervisorBackend {
     fn guest_channel_info(&self, _id: &VmId) -> Result<GuestChannelInfo> {
         // CH exposes vsock natively; the guest agent listens on the
         // shared GUEST_AGENT_PORT (same contract as Firecracker /
-        // libkrun).
+        // libkrun / libkrun).
         Ok(GuestChannelInfo::Vsock {
             cid: 3,
             port: mvm_guest::vsock::GUEST_AGENT_PORT,

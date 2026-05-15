@@ -2,7 +2,7 @@
 title: "ADR-033: Code-quality enforcement — `forbid(unsafe_code)`, lint deny list, file-size cap, builder structs"
 status: Proposed
 date: 2026-05-07
-related: ADR-002 (security posture), plan 60-mvm-microsandbox-migration
+related: ADR-002 (security posture), plan 60-mvm-libkrun-migration
 ---
 
 ## Status
@@ -36,7 +36,7 @@ nursery = "warn"
 cargo = "warn"
 ```
 
-Crates that genuinely need `unsafe` (FFI to microsandbox/libkrun, vsock ioctls, `mlock`) flip `unsafe_code = "allow"` only at the **module** scope (`#![allow(unsafe_code)]` at the top of `unsafe-bridge.rs`), and the module's name + scope is reviewed by the type-design-analyzer agent.
+Crates that genuinely need `unsafe` (FFI to libkrun/libkrun, vsock ioctls, `mlock`) flip `unsafe_code = "allow"` only at the **module** scope (`#![allow(unsafe_code)]` at the top of `unsafe-bridge.rs`), and the module's name + scope is reviewed by the type-design-analyzer agent.
 
 ### File-size soft cap
 

@@ -1,17 +1,32 @@
-//! Linux builder VM bootstrap contract.
+//! Linux builder VM bootstrap (libkrun-backed).
 //!
-//! Shared contract types for builder-VM implementations. On hosts that
-//! can't `nix build` Linux derivations natively, `mvmctl build` uses a
-//! project-owned Linux builder microVM and extracts the resulting rootfs
-//! back to the host. The libkrun-backed implementation lives in
-//! `libkrun_builder`.
+//! Implements the contract documented in ADR-013 §"Linux builder via
+//! libkrun (no Lima)": on hosts that can't `nix build` Linux
+//! derivations natively (macOS without `nix-darwin`'s `linux-builder`,
+//! Windows-via-WSL2 without an in-WSL Nix install, Linux without host
+//! Nix), `mvmctl build` bootstraps a small Linux builder microVM from
+//! a pinned OCI image, runs `nix build` inside it, and extracts the
+//! resulting rootfs back to the host.
+//!
+//! ## Status
+//!
+//! **Scaffolding.** The contract types and the 6-step flow are
+//! locked; the actual bootstrap (OCI pull + sandbox spawn + bind-mount
+//! wiring + artifact extraction) lands in a follow-up wave. Today
+//! every method returns [`BuilderVmError::NotYetImplemented`] with a
+//! pointer to the ADR section. Callers can wire the dispatch and
+//! cover the error path in tests; the data-plane fills in
+//! incrementally.
 //!
 //! ## Trust boundary
 //!
 //! The builder VM lives in a different trust zone than runtime VMs.
 //! It pulls from network, runs arbitrary Nix derivations, and bind-
-//! mounts build state for cache reuse. ADR-013's "non-goal: OCI"
-//! applies to the **runtime** path.
+//! mounts the host's `/nix/store` for cache reuse. ADR-013's
+//! "non-goal: OCI" applies to the **runtime** path; OCI is
+//! deliberately *acceptable* for the builder. See
+//! ADR-013 §"Linux builder via libkrun (no Lima)" for the
+//! rationale.
 
 use std::path::{Path, PathBuf};
 
@@ -95,7 +110,8 @@ pub enum BuilderJob {
     ///
     /// **Today every backend errors with
     /// [`BuilderVmError::NotYetImplemented`] for this variant.**
-    /// Plan 73 Followup B.2 wires the libkrun backend.
+    /// Plan 73 Followup B.2 wires the libkrun backend; the
+    /// libkrun backend never gets this variant.
     Install {
         /// Absolute host path to the install-spec JSON the builder
         /// VM reads at start-up. Followup B.2 defines the shape;
@@ -269,15 +285,17 @@ pub enum BuilderVmError {
     /// Bootstrap is not implemented yet. Returned by the stub impl
     /// until the follow-up wave fills in the data plane.
     #[error(
-        "builder VM bootstrap is in flight; use the libkrun builder \
-         path or fetch the published builder VM image. mvmctl does \
-         not use host Nix."
+        "libkrun-as-Linux-builder bootstrap is in flight; \
+         see ADR-013 §\"Linux builder via libkrun (no Lima)\" \
+         for the design and Sprint 50 for the schedule. \
+         For now, install host Nix (Determinate Nix or upstream) \
+         or configure `nix-darwin`'s `linux-builder`."
     )]
     NotYetImplemented,
 
-    /// Builder backend or required helper binary is unavailable.
-    #[error("builder backend not available: {0}")]
-    BuilderUnavailable(String),
+    /// Libkrun isn't installed or isn't on PATH.
+    #[error("libkrun not available: {0}")]
+    LibkrunUnavailable(String),
 
     /// OCI image pull failed (network, registry auth, digest
     /// mismatch). Wraps the underlying error.
@@ -297,8 +315,7 @@ pub enum BuilderVmError {
 /// Stub implementation. Every method returns
 /// [`BuilderVmError::NotYetImplemented`]. Kept around for tests that
 /// want a `BuilderVm` impl with deterministic error behavior;
-/// production code uses concrete builder implementations such as
-/// `LibkrunBuilderVm`.
+/// production code uses [`LibkrunBuilderVm`].
 #[derive(Debug, Default, Clone, Copy)]
 pub struct StubBuilderVm;
 
@@ -310,25 +327,6 @@ impl BuilderVm for StubBuilderVm {
     ) -> Result<BuilderArtifacts, BuilderVmError> {
         Err(BuilderVmError::NotYetImplemented)
     }
-}
-
-/// Extract the 32-character store-path hash from a path like
-/// `/nix/store/<hash>-<name>`. Returns the empty string if the path
-/// shape is unexpected. Mirrors
-/// `pipeline::dev_build::extract_revision_hash`'s behavior so the
-/// two code paths produce the same artifact-dir name for identical
-/// derivations.
-///
-/// Unit tests exercise this helper; the `#[allow(dead_code)]` keeps
-/// library builds warning-clean without forcing a wider visibility.
-#[allow(dead_code)]
-fn extract_revision_hash(nix_output_path: &str) -> String {
-    nix_output_path
-        .trim_start_matches("/nix/store/")
-        .split('-')
-        .next()
-        .unwrap_or("")
-        .to_string()
 }
 
 /// Resolve the host architecture's matching Linux system for flake
@@ -520,18 +518,6 @@ mod tests {
             .expect("write malformed");
         let result = ArtifactSidecar::read_from_dir(tmp.path());
         assert!(result.is_err(), "malformed sidecar should error");
-    }
-
-    #[test]
-    fn extract_revision_hash_pulls_leading_segment() {
-        let h = extract_revision_hash("/nix/store/abc123def456-mvm-rootfs-1.0.0");
-        assert_eq!(h, "abc123def456");
-    }
-
-    #[test]
-    fn extract_revision_hash_handles_malformed() {
-        assert_eq!(extract_revision_hash(""), "");
-        assert_eq!(extract_revision_hash("not-a-store-path"), "not");
     }
 
     #[test]

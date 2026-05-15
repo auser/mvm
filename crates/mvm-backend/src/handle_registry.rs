@@ -1,9 +1,9 @@
-//! Per-process registry of attached VM starts.
+//! Per-process registry of attached runtime handles.
 //!
 //! This module owns the missing piece. Attached starts call
 //! [`register_attached`]; the CLI's top-level signal handler calls
 //! [`stop_all_attached`] to walk the registry and tear each
-//! VM down gracefully. `stop`/`detach`/`stop_all` deregister
+//! runtime down gracefully. `stop`/`detach`/`stop_all` deregister
 //! through [`deregister`] so we never try to stop something that's
 //! already gone.
 //!
@@ -11,8 +11,8 @@
 //!
 //! - It is not a process supervisor. If the parent process dies
 //!   uncleanly (SIGKILL, panic without unwinding), attached
-//!   VMs may survive. Cleanup in that case is `mvmctl ps`/`mvmctl
-//!   down` after restart.
+//!   runtimes may survive depending on their backend. Cleanup in
+//!   that case is `mvmctl ps`/`mvmctl down` after restart.
 //! - It is not cross-process. The registry is per-`mvmctl`-process;
 //!   two concurrent `mvmctl up --attached` invocations don't see
 //!   each other's sandboxes.
@@ -82,9 +82,9 @@ fn attached_names() -> Vec<String> {
     map.keys().cloned().collect()
 }
 
-/// Stop every attached-mode sandbox in the registry. Best-effort:
-/// errors stopping individual sandboxes are logged but don't block
-/// the rest. Always clears the registry, even on partial failure.
+/// Stop every attached-mode runtime in the registry. Today the registry
+/// has no backend-specific stop hook, so this defensively drains names
+/// to avoid unbounded growth.
 ///
 /// Called from the host SIGINT handler. Returns the names that
 /// were processed (whether or not the stop succeeded) so callers
@@ -94,17 +94,15 @@ pub fn stop_all_attached() -> Vec<String> {
     if names.is_empty() {
         return names;
     }
-    // No in-tree backend currently registers here. Drain defensively so
-    // external callers cannot grow the registry unbounded.
     for name in &names {
         deregister(name);
     }
     names
 }
 
-/// Test-only helper that drains the registry without invoking backend
-/// stop logic. Lets the unit tests assert `register/deregister`
-/// semantics without spawning VMs.
+/// Test-only helper that drains the registry without invoking the
+/// real `LibkrunBackend::stop`. Lets the unit tests assert
+/// `register/deregister` semantics without spawning sandboxes.
 #[cfg(test)]
 pub(crate) fn drain_for_test() -> Vec<String> {
     let mut map = registry().lock().unwrap_or_else(|e| e.into_inner());
@@ -114,7 +112,8 @@ pub(crate) fn drain_for_test() -> Vec<String> {
 }
 
 /// Public no-op kept on the public surface so callers (`mvm-cli`'s
-/// SIGINT handler) can unconditionally call us.
+/// SIGINT handler) can unconditionally call us regardless of whether
+/// the libkrun feature ever spawned anything.
 ///
 /// Equivalent to `let _ = stop_all_attached()`. Exists so the
 /// signal-handler call site doesn't need to discard the returned

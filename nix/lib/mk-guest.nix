@@ -99,7 +99,7 @@ let
   #
   # Real Rust binary built from the workspace at `mvmSrc` via
   # `nix/packages/mvm-guest-agent.nix`. Replaces the W6.1.1 sh-stub
-  # that previously lived inline here. The W7.x.2 microsandbox
+  # that previously lived inline here. The W7.x.2 libkrun
   # builder VM is what makes this buildable on hosts without native
   # Linux Nix.
   #
@@ -290,7 +290,7 @@ let
   # Built by `nix/packages/mvm-guest-agent.nix` from the workspace
   # source at `mvmSrc`. The W6.1.1 sh-stub that previously lived here
   # was a placeholder used while the cross-compile infrastructure
-  # was being staged; the W7.x.2 microsandbox builder VM made the
+  # was being staged; the W7.x.2 libkrun builder VM made the
   # real build host-Nix-free, which unblocked this swap.
   #
   # The binary is the same one the workspace's

@@ -365,12 +365,14 @@ output (see [Building MicroVM Images](/guides/building-microvm-images)).
 
 Build resolution order on first use:
 
-1. **Builder microVM (default).** mvm resolves the project builder
-   microVM, runs `nix build` inside it, and extracts the rootfs. No
-   host-side Nix required.
-2. **Host-side Nix (manual).** Host-side Nix remains useful for
-   contributor/editor workflows, but managed `mvmctl` builds run inside
-   the builder VM.
+1. **Builder microVM (default).** mvm bootstraps a small Linux builder
+   microVM (libkrun-backed, see
+   [ADR-013 §"Linux builder via libkrun"](/contributing/adr/013-libkrun-pivot/)),
+   runs `nix build` inside it, and extracts the rootfs. No host-side
+   Nix required.
+2. **Host-side Nix (auto-detected).** If the host already has a working
+   Nix that can build Linux derivations (Linux Nix, or `nix-darwin`'s
+   `linux-builder`, or a remote `nix-daemon` URL), mvm uses it directly
    and skips the builder microVM.
 3. **Prebuilt artifacts (offline).** If neither is available — for
    example, a fully-offline host without the builder image cached — mvm

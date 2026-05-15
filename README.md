@@ -1,8 +1,9 @@
 # mvm
 
 > **mvm** is a Rust CLI (`mvmctl`) for building and running microVMs from
-> Nix flakes. It targets Firecracker on Linux+KVM and microsandbox /
-> Apple Container on macOS, with a vsock-only guest contract.
+> Nix flakes. It targets Firecracker on Linux+KVM, Apple Container on
+> macOS 26+ Apple Silicon, and direct libkrun on macOS Apple Silicon
+> and Intel, with a vsock-only guest contract.
 >
 > **v0.14.0 is a rewrite.** v1's final tip is preserved as the `legacy/v1`
 > branch and the `v1-final` tag. See
@@ -17,8 +18,8 @@ Override with `--hypervisor`:
 | Backend | Host | Tier | Notes |
 |---|---|---|---|
 | [Firecracker](https://firecracker-microvm.github.io/) | Linux + `/dev/kvm`, WSL2 | 1 | Default on KVM hosts; snapshots, dm-verity, full security posture |
-| [microsandbox](https://github.com/microsandbox/microsandbox) (libkrun) | macOS (HVF), Linux without KVM | 2 | Cross-platform backend; enable with `--features contributor-bootstrap` when building from source |
 | [Apple Container](https://developer.apple.com/documentation/virtualization) | macOS 26+ Apple Silicon | 2 | Native Virtualization.framework |
+| [libkrun](https://github.com/containers/libkrun) | macOS Apple Silicon / Intel, Linux + KVM | 2 | Direct Hypervisor.framework/KVM backend; macOS Intel path |
 | [Cloud Hypervisor](https://www.cloudhypervisor.org/) | Linux + KVM | 1 (opt-in) | Wider device model than Firecracker — VFIO, virtio-fs, larger guests |
 
 All backends consume the same Nix-built ext4 rootfs produced by
@@ -34,9 +35,6 @@ curl -fsSL https://raw.githubusercontent.com/tinylabscom/mvm/main/install.sh | s
 git clone https://github.com/tinylabscom/mvm.git && cd mvm
 cargo build --release
 cp target/release/mvmctl ~/.local/bin/
-
-# Include the microsandbox/libkrun backend in a source build
-cargo build --release --features contributor-bootstrap
 
 # Via Cargo (after first crates.io release of 0.14.0)
 cargo install mvmctl
@@ -78,14 +76,12 @@ runtime enforcement of security claim 4 (CLAUDE.md "Security model").
 ```
 Layer 1: Host (Linux, macOS, Windows-via-WSL2 in progress)
   mvmctl runs natively. Direct host shell on Linux+KVM.
-  On macOS source builds, enable `contributor-bootstrap` to use
-  MicrosandboxBuilderVm when host Nix isn't present.
 
 Layer 2: VM backend (auto-selected per ADR-013)
   Firecracker  ─── KVM microVMs (Tier 1; default on Linux+KVM)
   Cloud Hypervisor ─ KVM, wider device model (Tier 1; opt-in)
-  microsandbox ──── libkrun (Tier 2; opt-in source-build feature)
   Apple Container ─ Virtualization.framework (macOS 26+ AS)
+  libkrun ─────── Hypervisor.framework / KVM (macOS AS + Intel, Linux)
 
 Layer 3: Guest
   Busybox PID 1 (built by mkGuest, ext4 rootfs)
@@ -107,10 +103,10 @@ Layer 3: Guest
 | **mvm-policy** | Tenant policy types (plan 60 Wave 1) |
 | **mvm-supervisor** | Supervisor process surface (plan 60 Wave 1, in progress) |
 | **mvm-providers** | FFI/SDK shim — Apple Container + libkrun + ... |
-| **mvm-backend** | Concrete `VmBackend` impls — Firecracker, microsandbox, CH, libkrun, Apple Container |
+| **mvm-backend** | Concrete `VmBackend` impls — Firecracker, CH, libkrun, Apple Container, Docker |
 | **mvm-base** | Shell, linux_env, runtime_meta, cow, snapshot_integrity substrate |
 | **mvm** | VM lifecycle, template management, runtime UI |
-| **mvm-build** | Nix builder pipeline + MicrosandboxBuilderVm |
+| **mvm-build** | Nix builder pipeline + builder VM support |
 | **mvm-guest** | Vsock protocol, guest agent binary, integration manifest |
 | **mvm-cli** | Clap CLI, bootstrap, doctor, command surface |
 | **mvm-mcp** | MCP (Model Context Protocol) sandbox server |
@@ -286,7 +282,7 @@ CPX/CX (shared CPU) don't.
 - [`CHANGELOG.md`](CHANGELOG.md) — release notes
 - [`MIGRATING-FROM-V1.md`](MIGRATING-FROM-V1.md) — v1→v2 upgrade guide + feature parity ledger
 - [`CLAUDE.md`](CLAUDE.md) — project conventions, security model
-- [`specs/plans/60-mvm-microsandbox-migration.md`](specs/plans/60-mvm-microsandbox-migration.md) — full migration plan (Phases 0–10)
+- [`specs/plans/60-mvm-libkrun-migration.md`](specs/plans/60-mvm-libkrun-migration.md) — full migration plan (Phases 0–10)
 - [`specs/SPRINT.md`](specs/SPRINT.md) — current sprint
 - [`public/src/content/docs/`](public/src/content/docs/) — docs site sources (rendered at <https://gomicrovm.com>)
 

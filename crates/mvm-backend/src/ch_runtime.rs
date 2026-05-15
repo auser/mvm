@@ -46,8 +46,9 @@
 //! pieces (JSON config builder, URL construction, state-file paths).
 //! The shell-out paths are reviewed against CH's published API but
 //! will surface real-world fitness issues on first live run.
-//! A real first run will refine details that pure-Rust review can't
-//! catch.
+//! Mirrors the W7.x.2 caveat that `LibkrunBuilderVm` shipped
+//! with — a real first run will refine details that pure-Rust
+//! review can't catch.
 
 use anyhow::{Context, Result};
 use mvm_base::shell::{run_in_vm, run_in_vm_stdout, run_in_vm_visible, shell_quote};

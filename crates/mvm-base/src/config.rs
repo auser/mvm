@@ -2,7 +2,8 @@ use serde::{Deserialize, Serialize};
 
 /// Builder VM name. Carried over from the W7.2 Lima rename
 /// (`mvm` → `mvm-builder`); ADR-013 / plan-60 retired Lima itself,
-/// but the name still tags the Linux builder VM. The bridge
+/// but the name still tags any future Linux builder VM (the
+/// libkrun-as-Linux-builder follow-up in W7.x.2). The bridge
 /// name `br-mvm`, log filter `RUST_LOG=mvm`, path `/var/lib/mvm/`,
 /// OCI label `mvm`, and Apple Container guest hostname `mvm-dev`
 /// are deliberately *not* this constant — they exist on every host

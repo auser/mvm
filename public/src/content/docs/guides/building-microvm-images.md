@@ -5,7 +5,7 @@ description: How to build mvm microVM images from your own project — the mvm r
 
 mvm is a **library**, not a project to fork. You keep your code, your `flake.nix`, and your `mvm.toml` in your own repository, and `mvmctl` builds your microVM image by running `nix build` against your flake. **You should never need to edit anything inside the mvm repository.**
 
-Under the hood, mvm wraps [microvm.nix](https://github.com/microvm-nix/microvm.nix) (MIT) — that's the NixOS module that abstracts Firecracker, Cloud Hypervisor, QEMU, crosvm, kvmtool, and stratovirt. The choice is recorded in [ADR-013](/contributing/adr/013-microsandbox-pivot/).
+Under the hood, mvm wraps [microvm.nix](https://github.com/microvm-nix/microvm.nix) (MIT) — that's the NixOS module that abstracts Firecracker, Cloud Hypervisor, QEMU, crosvm, kvmtool, and stratovirt. The choice is recorded in [ADR-013](/contributing/adr/013-libkrun-pivot/).
 
 ## The two files in your project
 
@@ -51,7 +51,7 @@ mvmctl build              # reads mvm.toml; builds the named flake target
 mvmctl run                # builds (if needed) + boots
 ```
 
-`mvmctl` selects the backend automatically (Firecracker on Linux+KVM, libkrun on macOS, then Apple Container as the macOS fallback). Override with `--hypervisor libkrun` if you want to force the libkrun path.
+`mvmctl` selects the backend automatically (Firecracker on Linux+KVM, libkrun on macOS / Linux without KVM). Override with `--hypervisor libkrun` if you want to force the cross-platform path.
 
 If you want to drive `nix build` directly without `mvmctl` in the loop:
 
@@ -95,7 +95,7 @@ entrypoint.services = {
 
 ## Attached vs detached — lifecycle of the running VM
 
-Independent of the sealed/accessible distinction, mvm exposes two **runtime lifecycle modes** modeled after microsandbox's `SpawnMode`:
+Independent of the sealed/accessible distinction, mvm exposes two **runtime lifecycle modes** modeled after libkrun's `SpawnMode`:
 
 | Mode | What it means | When to use |
 |---|---|---|
@@ -120,7 +120,7 @@ The lifecycle mode is **orthogonal** to the sealed/accessible distinction:
 | sealed + attached | Test harness running an entrypoint to completion, exit captured. |
 | sealed + detached | Production: `entrypoint.command`, runs forever until `mvmctl down`. |
 
-The trait surface lives at `mvm_core::vm_backend::{StartMode, VmBackend::start_with_mode, VmBackend::wait, VmBackend::detach}`. The microsandbox backend records `StartMode` intent at `~/.mvm/vms/<name>/mode.json`; `mvmctl status` surfaces it.
+The trait surface lives at `mvm_core::vm_backend::{StartMode, VmBackend::start_with_mode, VmBackend::wait, VmBackend::detach}`. The libkrun backend records `StartMode` intent at `~/.mvm/vms/<name>/mode.json`; `mvmctl status` surfaces it.
 
 ## Sealed vs accessible — the same flake works for both
 
@@ -156,20 +156,20 @@ The `mkGuest` library produces a **busybox-as-PID-1** rootfs (no NixOS, no syste
 |---|---|---|---|
 | Firecracker (Linux/KVM) | ≤ 300 ms | ≤ 30 ms | Default for typical workloads. |
 | Cloud Hypervisor (Linux/KVM) | ≤ 300 ms | ≤ 50 ms | Tier-1 peer of FC. Adds VFIO/GPU, virtio-gpu, virtio-fs, larger guests. Opt-in via `--hypervisor cloud-hypervisor`. |
-| microsandbox / libkrun (Linux/KVM) | ≤ 300 ms | ≤ 30 ms | Cross-platform default; libkrun-backed. |
-| microsandbox / libkrun (macOS HVF) | ≤ 300 ms | ≤ 60 ms | macOS path; HVF adds ~100ms over KVM. |
-| Apple Virtualization framework | ≤ 300 ms | ≤ 200 ms | Legacy ladder; superseded by microsandbox per ADR-013. |
+| libkrun / libkrun (Linux/KVM) | ≤ 300 ms | ≤ 30 ms | Cross-platform default; libkrun-backed. |
+| libkrun / libkrun (macOS HVF) | ≤ 300 ms | ≤ 60 ms | macOS path; HVF adds ~100ms over KVM. |
+| Apple Virtualization framework | ≤ 300 ms | ≤ 200 ms | Legacy ladder; superseded by libkrun per ADR-013. |
 
-The numbers are surfaced on every `mkGuest` derivation as `passthru.mvm.expectedBootMs` so you can `nix eval .#default.passthru.mvm.expectedBootMs` to confirm. Phase 9 enforces with `xtask perf --backend <name> --p50-ms 300 --runs 100`. See [ADR-013 §"Boot-time budget"](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/013-microsandbox-libkrun-microvm-nix-pivot.md) for rationale.
+The numbers are surfaced on every `mkGuest` derivation as `passthru.mvm.expectedBootMs` so you can `nix eval .#default.passthru.mvm.expectedBootMs` to confirm. Phase 9 enforces with `xtask perf --backend <name> --p50-ms 300 --runs 100`. See [ADR-013 §"Boot-time budget"](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/013-libkrun-libkrun-microvm-nix-pivot.md) for rationale.
 
-The floor is achievable because the rootfs uses **busybox-as-PID-1** with a custom `/init` (no NixOS, no systemd, no OpenRC). See [ADR-013](/contributing/adr/013-microsandbox-pivot/) for why this matters and the implementation breadcrumb.
+The floor is achievable because the rootfs uses **busybox-as-PID-1** with a custom `/init` (no NixOS, no systemd, no OpenRC). See [ADR-013](/contributing/adr/013-libkrun-pivot/) for why this matters and the implementation breadcrumb.
 
 ## What's inside the mvm repository (and why you don't touch it)
 
 The repository's `nix/` directory contains:
 
 - `nix/flake.nix` — exposes `lib.<system>.mkGuest` for your flake to consume.
-- `nix/profiles/minimal.nix` — an **internal** test fixture used by mvm's own Nix flake structure tests (`tests/nix_flake_structure.rs`). Not a starter template.
+- `nix/profiles/minimal.nix` — an **internal** test fixture used by mvm's own smoke tests (`tests/smoke_libkrun.rs`, `tests/nix_flake_structure.rs`). Not a starter template.
 
 The internal fixture lives under the `internal-` namespace in flake outputs (`nixosConfigurations.internal-minimal-…`, `packages.<system>.internal-minimal-runner`) so the boundary is mechanical: anything `internal-*` is for mvm developers, not for users.
 
@@ -184,7 +184,7 @@ nix flake check --no-build
 
 ## Cross-platform notes
 
-mvm bootstraps a Linux builder microVM on first build (microsandbox-backed; see [ADR-013 §"Linux builder via microsandbox"](/contributing/adr/013-microsandbox-pivot/)) and runs `nix build` inside it. You don't need host-side Nix.
+mvm bootstraps a Linux builder microVM on first build (libkrun-backed; see [ADR-013 §"Linux builder via libkrun"](/contributing/adr/013-libkrun-pivot/)) and runs `nix build` inside it. You don't need host-side Nix.
 
 - **Linux**: the builder microVM runs on Firecracker against `/dev/kvm`. Firecracker is also the default runtime backend. If you've opted into host-side Nix and it can build Linux derivations, mvm uses it directly and skips the builder VM.
 - **macOS**: the builder microVM runs on libkrun via Hypervisor.framework. The resulting microVM is then booted on the same backend. If you already have [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) or a remote `nix-daemon` configured, mvm detects and uses it instead.
@@ -235,4 +235,4 @@ The resolved values surface as `passthru.mvm.uids = { agent; entrypoint; }` and 
 
 ## Why no OCI
 
-mvm is microVMs, not containers. Even though the underlying microsandbox library exposes OCI image pulls (`RootfsSource::Oci`), mvm uses **only** the host-local disk-image path. The bridge between your Nix-built `.ext4` rootfs and the runtime is a sibling `.raw` hard-link with `fstype("ext4")` — no registry, no auth, no pull cache, fully offline-by-default once your rootfs is built. ADR-013 §"Non-goal: OCI / container images" carries the full rationale.
+mvm is microVMs, not containers. Even though the underlying libkrun library exposes OCI image pulls (`RootfsSource::Oci`), mvm uses **only** the host-local disk-image path. The bridge between your Nix-built `.ext4` rootfs and the runtime is a sibling `.raw` hard-link with `fstype("ext4")` — no registry, no auth, no pull cache, fully offline-by-default once your rootfs is built. ADR-013 §"Non-goal: OCI / container images" carries the full rationale.
