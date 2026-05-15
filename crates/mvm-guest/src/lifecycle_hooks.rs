@@ -290,11 +290,24 @@ mod tests {
         assert!(matches!(err, ReadinessError::ScriptMissing { .. }));
     }
 
+    // Grace period for the "fast script" tests below. Previously
+    // 2s, which sounds generous but doesn't survive concurrent
+    // workspace test load on macOS hosts — shell startup + fork +
+    // exec routinely exceeds 2s when ~80 test binaries run in
+    // parallel under `cargo test --workspace`, and the test then
+    // fails with `GraceExceeded` instead of the expected
+    // `expect("clean shutdown")`. 30s is well past anything a
+    // legitimate concurrent-load shell takes (typically <2s even
+    // under heavy load) while still bounding the test's worst
+    // case so a regression in the run-shutdown-hook path doesn't
+    // hang CI indefinitely.
+    const FAST_SCRIPT_GRACE: Duration = Duration::from_secs(30);
+
     #[test]
     fn run_shutdown_hook_succeeds_for_fast_script() {
         let tmp = tempfile::tempdir().unwrap();
         let s = write_script(tmp.path(), "stop.sh", "#!/bin/sh\nexit 0\n");
-        run_shutdown_hook(&s, Duration::from_secs(2), Duration::from_millis(50))
+        run_shutdown_hook(&s, FAST_SCRIPT_GRACE, Duration::from_millis(50))
             .expect("clean shutdown");
     }
 
@@ -302,8 +315,7 @@ mod tests {
     fn run_shutdown_hook_reports_non_zero_exit() {
         let tmp = tempfile::tempdir().unwrap();
         let s = write_script(tmp.path(), "stop.sh", "#!/bin/sh\nexit 7\n");
-        let err =
-            run_shutdown_hook(&s, Duration::from_secs(2), Duration::from_millis(50)).unwrap_err();
+        let err = run_shutdown_hook(&s, FAST_SCRIPT_GRACE, Duration::from_millis(50)).unwrap_err();
         match err {
             ShutdownError::NonZeroExit { code, .. } => assert_eq!(code, Some(7)),
             other => panic!("expected NonZeroExit, got {other:?}"),
