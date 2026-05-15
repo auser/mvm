@@ -36,6 +36,10 @@ description: Complete command reference for mvmctl.
 | `mvmctl logs <name> --hypervisor` | View Firecracker hypervisor logs |
 | `mvmctl diff <name>` | Show filesystem changes in a running VM (created/modified/deleted since boot) |
 | `mvmctl diff <name> --json` | Output filesystem diff as JSON |
+| `mvmctl wait <name> --for <component>` | Block until a guest readiness component is `Ready`, `Disabled`, or `Failed`. Targets: `control-plane`, `entrypoint`, `warm-pool`, `integrations`, `probes`, `all` (default). Exit codes: `0` ready, `65` (`EX_DATAERR`) failed, `75` (`EX_TEMPFAIL`) timeout. Plan 76 Phase 2. |
+| `mvmctl wait <name> --timeout <secs> --interval-ms <ms>` | Tune the deadline and poll cadence. Defaults: 60s / 250ms. |
+| `mvmctl boot-report <name>` | Print a single readiness snapshot + per-phase boot timings. Plan 76 Phase 4. |
+| `mvmctl boot-report <name> --json` | Same payload as JSON. |
 
 ## Environment Management
 

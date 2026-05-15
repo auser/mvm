@@ -25,5 +25,6 @@ pub(super) mod session;
 pub(super) mod set_ttl;
 pub(super) mod up;
 pub(super) mod volume;
+pub(super) mod wait;
 
 pub(super) use super::{Cli, shared};

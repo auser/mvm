@@ -113,9 +113,31 @@ A host queries the live state via the `ReadinessStatus` verb:
 | `failed` | Subsystem failed to initialize. Carries a short human-readable `message` (no secrets, no host paths the caller doesn't already know). For `entrypoint`, this maps to `RunEntrypoint` returning the existing `EntrypointInvalid`. |
 
 `BootTimingReport` exposes monotonic milliseconds since agent
-process start. Phase 4 fills in the remaining fields
-(`warm_pool_ready_ms`, `integrations_ready_ms`, `probes_ready_ms`);
-the four populated today are enough to surface cold-path regressions.
+process start. Phase 3 closed out the per-component `*_ready_ms`
+fields by stamping them on each first transition out of
+`Starting`. A cold-tier image with no warm pool / integrations /
+probes correctly reports `None` for those — the stamp only fires
+once a background init thread actually ran.
+
+### Host commands
+
+- `mvmctl wait <vm> --for <component> [--timeout <secs>]` —
+  Blocks until the named component reaches `Ready`, `Disabled`,
+  or `Failed`. Targets: `control-plane`, `entrypoint`,
+  `warm-pool`, `integrations`, `probes`, or `all` (the default).
+  Exit codes: `0` ready, `65` (`EX_DATAERR`) component failed
+  with message printed, `75` (`EX_TEMPFAIL`) deadline hit.
+  `Disabled` counts as `Ready` (intentionally — a cold-tier
+  image asking `--for warm-pool` must not spin forever).
+
+- `mvmctl boot-report <vm> [--json]` — Single round-trip; prints
+  the same `ReadinessReport` `mvmctl wait` polls, including the
+  per-phase timing table. Useful right after `mvmctl up` to
+  inspect cold-path latency.
+
+Both verbs require `GuestCapability::Readiness` from the
+protocol-hello prelude; the agent advertises it in
+`supported_capabilities()`.
 
 ## Health Checks
 

@@ -846,6 +846,10 @@ pub enum GuestCapability {
     Console,
     VolumeMount,
     UpdateIdleTimeout,
+    /// Plan 76 Phase 2 — `ReadinessStatus` returns
+    /// `GuestResponse::ReadinessStatusReport(ReadinessReport)`.
+    /// `mvmctl wait` / `mvmctl boot-report` require this capability.
+    Readiness,
 }
 
 /// Required remediation for a host/guest protocol mismatch.
@@ -878,6 +882,7 @@ pub fn supported_capabilities() -> Vec<GuestCapability> {
         GuestCapability::Console,
         GuestCapability::VolumeMount,
         GuestCapability::UpdateIdleTimeout,
+        GuestCapability::Readiness,
     ]
 }
 
