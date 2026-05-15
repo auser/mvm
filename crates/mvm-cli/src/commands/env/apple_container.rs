@@ -473,6 +473,14 @@ pub(super) fn cmd_dev_apple_container_status() -> Result<()> {
         ui::info("  Image:   not built");
     }
 
+    let builder_cache = resolve_builder_vm_cache_status_summary();
+    ui::info(&format!(
+        "  Builder: {} cache {} (reason: {})",
+        builder_cache.cache_kind,
+        builder_cache.state.label(),
+        builder_cache.reason_code
+    ));
+
     Ok(())
 }
 
@@ -536,6 +544,81 @@ fn plist_env_string_value(plist: &str, key: &str) -> Option<String> {
             .map(str::to_string);
     }
     None
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BuilderVmCacheState {
+    Ready,
+    Stale,
+}
+
+impl BuilderVmCacheState {
+    fn label(self) -> &'static str {
+        match self {
+            Self::Ready => "ready",
+            Self::Stale => "stale",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+struct BuilderVmCacheStatusSummary {
+    cache_kind: &'static str,
+    state: BuilderVmCacheState,
+    reason_code: &'static str,
+}
+
+fn resolve_builder_vm_cache_status_summary() -> BuilderVmCacheStatusSummary {
+    builder_vm_cache_status_summary(
+        find_builder_vm_flake(),
+        std::path::Path::new(&mvm_core::config::mvm_cache_dir()),
+        builder_vm_host_arch(),
+    )
+}
+
+fn builder_vm_cache_status_summary(
+    builder_flake: Result<String>,
+    cache_root: &std::path::Path,
+    arch: &str,
+) -> BuilderVmCacheStatusSummary {
+    let cache_dir = cache_root.join("builder-vm").join(arch);
+    let Ok(flake_dir) = builder_flake else {
+        return release_builder_vm_cache_status_summary(&cache_dir);
+    };
+    let Ok(fingerprint) = builder_vm_source_fingerprint(&flake_dir) else {
+        return BuilderVmCacheStatusSummary {
+            cache_kind: "source",
+            state: BuilderVmCacheState::Stale,
+            reason_code: "source_fingerprint_error",
+        };
+    };
+    let status = builder_vm_source_cache_status(&cache_dir, &fingerprint);
+    BuilderVmCacheStatusSummary {
+        cache_kind: "source",
+        state: if status.is_ready() {
+            BuilderVmCacheState::Ready
+        } else {
+            BuilderVmCacheState::Stale
+        },
+        reason_code: status.reason_code(),
+    }
+}
+
+fn release_builder_vm_cache_status_summary(
+    cache_dir: &std::path::Path,
+) -> BuilderVmCacheStatusSummary {
+    if validate_builder_vm_stage0_artifacts(cache_dir).is_ok() {
+        return BuilderVmCacheStatusSummary {
+            cache_kind: "release",
+            state: BuilderVmCacheState::Ready,
+            reason_code: "hit",
+        };
+    }
+    BuilderVmCacheStatusSummary {
+        cache_kind: "release",
+        state: BuilderVmCacheState::Stale,
+        reason_code: "missing_or_invalid_artifacts",
+    }
 }
 
 /// Prepare `~/.mvm/dev/current/` for a fresh dev-image build.
@@ -1835,11 +1918,7 @@ fn find_builder_vm_flake() -> Result<String> {
 /// `builder-vm` is on.
 #[allow(dead_code)]
 fn bootstrap_builder_vm_image() -> Result<()> {
-    let arch = if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "x86_64"
-    };
+    let arch = builder_vm_host_arch();
     let out_dir = format!("{}/builder-vm/{arch}", mvm_core::config::mvm_cache_dir());
     let out_dir_path = std::path::Path::new(&out_dir);
     let builder_flake = find_builder_vm_flake();
@@ -1882,6 +1961,14 @@ fn bootstrap_builder_vm_image() -> Result<()> {
         BuilderVmBootstrapAction::DownloadPublished => {
             perform_builder_vm_download_published(arch, &out_dir)
         }
+    }
+}
+
+fn builder_vm_host_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
     }
 }
 
@@ -1953,6 +2040,17 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
 ) -> Result<()> {
     use mvm_build::builder_vm::BuilderVm as _;
     use mvm_build::libkrun_builder::LibkrunBuilderVm;
+
+    // Plan 77 W2 — serialize concurrent Stage 0 invocations on the same
+    // host before any side effects. Two `mvmctl dev up` runs in parallel
+    // would race on the persistent `~/.cache/mvm/builder-vm/nix-store-<arch>.img`
+    // volume that libkrun mounts read-write inside the bootstrap VM;
+    // letting both proceed risks Nix-store corruption (and at minimum
+    // duplicates 10–30 minutes of work). The lock lives one directory
+    // above the per-arch cache so it serializes across arches too —
+    // overkill, but the contention cost is zero in practice (single
+    // contributor host) and the simpler invariant is worth it.
+    let _stage0_guard = acquire_stage0_lock(out_dir)?;
 
     let (kernel, rootfs, source_label) = find_local_fallback_image().ok_or_else(|| {
         anyhow::anyhow!(
@@ -2054,6 +2152,40 @@ fn builder_vm_stage0_bootstrap_plan(
     Ok((job, mounts, bootstrap_image))
 }
 
+/// Plan 77 W2 — RAII advisory lock at
+/// `~/.cache/mvm/builder-vm/stage0.lock` (one directory above the
+/// per-arch cache). `try_acquire` is non-blocking, so a concurrent
+/// invocation bails fast with a clear message instead of silently
+/// queuing for minutes behind a libkrun-builder VM that's already
+/// busy holding the shared `nix-store-<arch>.img` volume.
+///
+/// `out_dir` is the per-arch cache dir (e.g. `.../builder-vm/aarch64`);
+/// the lock anchor is its sibling `stage0` (so `FileLock::try_acquire`
+/// produces `stage0.lock`).
+#[cfg(any(feature = "builder-vm", test))]
+fn acquire_stage0_lock(out_dir: &str) -> Result<mvm_core::atomic_io::FileLock> {
+    use mvm_core::atomic_io::FileLock;
+
+    let parent = std::path::Path::new(out_dir)
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("builder VM cache path has no parent: {out_dir}"))?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating builder-vm cache parent {}", parent.display()))?;
+    let lock_anchor = parent.join("stage0");
+
+    match FileLock::try_acquire(&lock_anchor) {
+        Ok(Some(guard)) => Ok(guard),
+        Ok(None) => anyhow::bail!(
+            "another `mvmctl dev up` (or any caller of Stage 0) is already bootstrapping the \
+             builder VM image on this host (lock held at {}.lock). Wait for it to finish, or — \
+             only if you are sure no other invocation is running, e.g. after a crash — delete the \
+             lock file and retry.",
+            lock_anchor.display()
+        ),
+        Err(e) => Err(e.context("acquiring Stage 0 advisory lock")),
+    }
+}
+
 #[cfg(any(feature = "builder-vm", test))]
 fn unique_builder_vm_stage0_staging_dir(final_dir: &std::path::Path) -> Result<std::path::PathBuf> {
     let parent = final_dir.parent().ok_or_else(|| {
@@ -2087,6 +2219,166 @@ fn validate_builder_vm_stage0_artifacts(dir: &std::path::Path) -> Result<()> {
             dir.display()
         )
     })
+}
+
+/// Plan 77 W2 — outcome of [`sweep_orphaned_stage0_staging_dirs`]:
+/// either the sweep ran (with counts) or the Stage 0 advisory lock was
+/// already held so the sweep was skipped to avoid racing a live
+/// bootstrap. The pruner uses the variant to decide what to print.
+pub(in crate::commands) enum Stage0SweepOutcome {
+    Swept { removed: u64, freed_bytes: u64 },
+    SkippedLockHeld,
+}
+
+/// Plan 77 W2 — remove staging directories from a crashed Stage 0
+/// bootstrap. Only safe to run when no Stage 0 is currently in progress;
+/// the function tries the same advisory lock the live bootstrap uses
+/// and bails (returns `SkippedLockHeld`) on contention rather than
+/// racing it. Called from `mvmctl cache prune` so the cleanup ships
+/// with the existing "clean everything" verb.
+///
+/// "Orphan" means the staging dir was left behind by a crashed run;
+/// successful Stage 0 runs `rename(2)` the staging dir into the live
+/// cache, so any staging dir on disk is by definition orphaned. Format
+/// matches [`unique_builder_vm_stage0_staging_dir`]
+/// (`.<arch>.stage0-<pid>-<nonce>`); we also recognise the legacy
+/// `<arch>-staging[-...]` shape from pre-W1 builds on the same host.
+pub(in crate::commands) fn sweep_orphaned_stage0_staging_dirs(
+    dry_run: bool,
+) -> Result<Stage0SweepOutcome> {
+    let builder_vm_root =
+        std::path::PathBuf::from(mvm_core::config::mvm_cache_dir()).join("builder-vm");
+    sweep_orphaned_stage0_staging_dirs_at(&builder_vm_root, dry_run)
+}
+
+/// Inner form of [`sweep_orphaned_stage0_staging_dirs`] that takes an
+/// explicit root path. Exists so unit tests can exercise the sweep
+/// against a tempdir without mutating `MVM_CACHE_DIR` or any other
+/// process-wide env var.
+fn sweep_orphaned_stage0_staging_dirs_at(
+    builder_vm_root: &std::path::Path,
+    dry_run: bool,
+) -> Result<Stage0SweepOutcome> {
+    use mvm_core::atomic_io::FileLock;
+
+    if !builder_vm_root.is_dir() {
+        return Ok(Stage0SweepOutcome::Swept {
+            removed: 0,
+            freed_bytes: 0,
+        });
+    }
+
+    // Try the Stage 0 advisory lock. The lock anchor is shared with the
+    // live `acquire_stage0_lock` callsite — when a `dev up` is in
+    // progress, we want the pruner to skip the staging sweep rather
+    // than race it. RAII drop releases the lock when this function
+    // returns.
+    let lock_anchor = builder_vm_root.join("stage0");
+    let _guard = match FileLock::try_acquire(&lock_anchor) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return Ok(Stage0SweepOutcome::SkippedLockHeld),
+        Err(e) => {
+            // I/O failure on the lock path is rare (e.g. parent disappeared
+            // mid-prune). Treat it as "skip with a warning" rather than
+            // failing the whole prune verb — the staging sweep is a best-
+            // effort hygiene step.
+            tracing::warn!(err = %e, "could not acquire Stage 0 lock for sweep; skipping");
+            return Ok(Stage0SweepOutcome::SkippedLockHeld);
+        }
+    };
+
+    let mut removed = 0u64;
+    let mut freed_bytes = 0u64;
+    let entries = match std::fs::read_dir(builder_vm_root) {
+        Ok(e) => e,
+        Err(_) => {
+            return Ok(Stage0SweepOutcome::Swept {
+                removed,
+                freed_bytes,
+            });
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !is_orphan_stage0_staging_dir_name(&name) || !path.is_dir() {
+            continue;
+        }
+        let size = stage0_dir_size_bytes(&path);
+        if dry_run {
+            println!(
+                "Would remove orphan Stage 0 staging dir: {} ({} bytes)",
+                path.display(),
+                size,
+            );
+        } else if let Err(e) = std::fs::remove_dir_all(&path) {
+            tracing::warn!(path = %path.display(), err = %e, "could not remove orphan staging dir");
+            continue;
+        }
+        removed += 1;
+        freed_bytes += size;
+    }
+    Ok(Stage0SweepOutcome::Swept {
+        removed,
+        freed_bytes,
+    })
+}
+
+/// Predicate matching the staging-dir basenames left by Stage 0.
+/// Two shapes are recognised:
+/// - Current (W1+): `.<arch>.stage0-<pid>-<nonce>` (hidden, see
+///   [`unique_builder_vm_stage0_staging_dir`]).
+/// - Legacy (pre-W1): `<arch>-staging` or `<arch>-staging-<suffix>`
+///   left behind by earlier Stage 0 prototypes that were observed on
+///   contributor hosts; harmless when they exist but the pruner is
+///   the obvious place to clean them up.
+fn is_orphan_stage0_staging_dir_name(name: &str) -> bool {
+    let is_known_arch = |arch: &str| arch == "aarch64" || arch == "x86_64";
+
+    // Current hidden form.
+    if let Some(rest) = name.strip_prefix('.')
+        && let Some((arch, tail)) = rest.split_once('.')
+        && is_known_arch(arch)
+        && tail.starts_with("stage0-")
+    {
+        return true;
+    }
+    // Legacy `<arch>-staging` / `<arch>-staging-<suffix>`.
+    if let Some((arch, tail)) = name.split_once('-')
+        && is_known_arch(arch)
+        && (tail == "staging" || tail.starts_with("staging"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Total byte size of a directory tree. Best-effort — failures stat-ing
+/// individual entries are skipped silently because the caller only uses
+/// this for the "bytes freed" UI counter, never for correctness.
+fn stage0_dir_size_bytes(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(entry_path),
+                Ok(_) => {
+                    if let Ok(meta) = entry_path.metadata() {
+                        total = total.saturating_add(meta.len());
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    total
 }
 
 fn builder_vm_source_fingerprint(builder_flake_dir: &str) -> Result<String> {
@@ -2678,6 +2970,22 @@ mod dev_status_image_tests {
         std::fs::write(path, b"test").unwrap();
     }
 
+    fn write_valid_builder_cache_artifacts(dir: &std::path::Path) {
+        const EXT4_MAGIC_OFFSET: usize = 1024 + 56;
+        std::fs::create_dir_all(dir).expect("mkdir artifact dir");
+        std::fs::write(dir.join("vmlinux"), vec![0x7f; 1024 * 1024 + 1]).expect("write kernel");
+        let mut rootfs = vec![0u8; 4 * 1024 * 1024 + 1];
+        rootfs[EXT4_MAGIC_OFFSET] = 0x53;
+        rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
+        std::fs::write(dir.join("rootfs.ext4"), rootfs).expect("write rootfs");
+    }
+
+    fn write_builder_vm_flake(dir: &std::path::Path) {
+        std::fs::create_dir_all(dir).expect("mkdir flake dir");
+        std::fs::write(dir.join("flake.nix"), "{ outputs = _: {}; }").expect("write flake");
+        std::fs::write(dir.join("flake.lock"), "{\"nodes\":{}}").expect("write lock");
+    }
+
     #[test]
     fn status_image_prefers_launchd_image_paths() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -2891,6 +3199,92 @@ mod dev_status_image_tests {
         );
 
         assert!(find_local_fallback_image().is_none());
+    }
+
+    #[test]
+    fn builder_cache_status_reports_source_cache_hit_without_paths() {
+        let tmp = tempfile::tempdir().unwrap();
+        let flake = tmp.path().join("nix/images/builder-vm");
+        let cache_root = tmp.path().join("cache");
+        let cache = cache_root.join("builder-vm/testarch");
+        write_builder_vm_flake(&flake);
+        write_valid_builder_cache_artifacts(&cache);
+        let fingerprint = builder_vm_source_fingerprint(flake.to_str().unwrap()).unwrap();
+        write_builder_vm_source_fingerprint(&cache, &fingerprint).unwrap();
+        write_builder_vm_artifact_digest_manifest(&cache).unwrap();
+        write_builder_vm_source_cache_provenance(&cache, &fingerprint).unwrap();
+
+        assert_eq!(
+            builder_vm_cache_status_summary(
+                Ok(flake.to_string_lossy().into_owned()),
+                &cache_root,
+                "testarch"
+            ),
+            BuilderVmCacheStatusSummary {
+                cache_kind: "source",
+                state: BuilderVmCacheState::Ready,
+                reason_code: "hit",
+            }
+        );
+    }
+
+    #[test]
+    fn builder_cache_status_reports_source_provenance_drift() {
+        let tmp = tempfile::tempdir().unwrap();
+        let flake = tmp.path().join("nix/images/builder-vm");
+        let cache_root = tmp.path().join("cache");
+        let cache = cache_root.join("builder-vm/testarch");
+        write_builder_vm_flake(&flake);
+        write_valid_builder_cache_artifacts(&cache);
+        let fingerprint = builder_vm_source_fingerprint(flake.to_str().unwrap()).unwrap();
+        write_builder_vm_source_fingerprint(&cache, &fingerprint).unwrap();
+        write_builder_vm_artifact_digest_manifest(&cache).unwrap();
+
+        assert_eq!(
+            builder_vm_cache_status_summary(
+                Ok(flake.to_string_lossy().into_owned()),
+                &cache_root,
+                "testarch"
+            ),
+            BuilderVmCacheStatusSummary {
+                cache_kind: "source",
+                state: BuilderVmCacheState::Stale,
+                reason_code: "missing_provenance",
+            }
+        );
+    }
+
+    #[test]
+    fn builder_cache_status_reports_release_cache_without_source_flake() {
+        let tmp = tempfile::tempdir().unwrap();
+        let cache_root = tmp.path().join("cache");
+
+        assert_eq!(
+            builder_vm_cache_status_summary(
+                Err(anyhow::anyhow!("missing source flake")),
+                &cache_root,
+                "testarch",
+            ),
+            BuilderVmCacheStatusSummary {
+                cache_kind: "release",
+                state: BuilderVmCacheState::Stale,
+                reason_code: "missing_or_invalid_artifacts",
+            }
+        );
+
+        write_valid_builder_cache_artifacts(&cache_root.join("builder-vm/testarch"));
+        assert_eq!(
+            builder_vm_cache_status_summary(
+                Err(anyhow::anyhow!("missing source flake")),
+                &cache_root,
+                "testarch",
+            ),
+            BuilderVmCacheStatusSummary {
+                cache_kind: "release",
+                state: BuilderVmCacheState::Ready,
+                reason_code: "hit",
+            }
+        );
     }
 }
 
@@ -3203,6 +3597,211 @@ mod builder_vm_bootstrap_tests {
         write_builder_vm_source_fingerprint(dir, fingerprint).expect("write fingerprint");
         write_builder_vm_artifact_digest_manifest(dir).expect("write artifact digest manifest");
         write_builder_vm_source_cache_provenance(dir, fingerprint).expect("write provenance");
+    }
+
+    /// Plan 77 W2 — `acquire_stage0_lock` is an advisory `flock(2)`
+    /// guard at `<cache_parent>/stage0.lock`. The first acquisition
+    /// succeeds; a second concurrent attempt while the first guard is
+    /// still in scope fails fast with a recognizable message; once the
+    /// first guard drops, the lock becomes available again.
+    #[test]
+    fn stage0_lock_refuses_concurrent_acquisition() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let out_dir = tmp.path().join("aarch64");
+        let out_dir_str = out_dir.to_str().expect("utf-8 out_dir");
+
+        let first = acquire_stage0_lock(out_dir_str).expect("first acquisition should succeed");
+        // Lock file lives one directory above out_dir, named `stage0.lock`.
+        assert!(
+            tmp.path().join("stage0.lock").exists(),
+            "stage0.lock should be created on first acquisition"
+        );
+
+        let err = match acquire_stage0_lock(out_dir_str) {
+            Err(e) => e,
+            Ok(_) => panic!("second acquisition must refuse while first is held"),
+        };
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("already bootstrapping the builder VM image"),
+            "unexpected error: {msg}"
+        );
+        assert!(
+            msg.contains("stage0.lock"),
+            "error should name the lock file path: {msg}"
+        );
+
+        drop(first);
+
+        // Now reachable again — guards must not leak past their scope.
+        let _second =
+            acquire_stage0_lock(out_dir_str).expect("acquisition should succeed after drop");
+    }
+
+    /// Lock setup must not fail when the parent cache directory does
+    /// not yet exist on disk (fresh contributor host). `acquire_stage0_lock`
+    /// is responsible for creating it.
+    #[test]
+    fn stage0_lock_creates_missing_cache_parent() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let nested = tmp.path().join("nested/builder-vm/aarch64");
+        let nested_str = nested.to_str().expect("utf-8 nested");
+
+        let _guard =
+            acquire_stage0_lock(nested_str).expect("acquisition should create missing parent dir");
+        assert!(
+            tmp.path().join("nested/builder-vm/stage0.lock").exists(),
+            "lock file must be created at the constructed parent path"
+        );
+    }
+
+    /// Plan 77 W2 — name predicate must match both the current hidden
+    /// `.<arch>.stage0-<pid>-<nonce>` form and the legacy
+    /// `<arch>-staging[-...]` form, and reject everything else that
+    /// lives alongside under `~/.cache/mvm/builder-vm/` (live cache
+    /// dirs `aarch64/` / `x86_64/`, the `nix-store-<arch>.img` blob,
+    /// `jobs/`, `vms/`, `stage0.lock`, sundry dotfiles).
+    #[test]
+    fn is_orphan_stage0_staging_dir_name_matches_known_shapes() {
+        // Current hidden form (matches `unique_builder_vm_stage0_staging_dir`).
+        assert!(is_orphan_stage0_staging_dir_name(
+            ".aarch64.stage0-12345-1700000000000000000"
+        ));
+        assert!(is_orphan_stage0_staging_dir_name(
+            ".x86_64.stage0-99999-1700000000000000000"
+        ));
+        // Legacy plain form.
+        assert!(is_orphan_stage0_staging_dir_name("aarch64-staging"));
+        assert!(is_orphan_stage0_staging_dir_name("x86_64-staging-foo"));
+
+        // Negatives: everything that legitimately lives next to
+        // staging dirs must be left alone.
+        assert!(!is_orphan_stage0_staging_dir_name("aarch64"));
+        assert!(!is_orphan_stage0_staging_dir_name("x86_64"));
+        assert!(!is_orphan_stage0_staging_dir_name("jobs"));
+        assert!(!is_orphan_stage0_staging_dir_name("vms"));
+        assert!(!is_orphan_stage0_staging_dir_name("stage0.lock"));
+        assert!(!is_orphan_stage0_staging_dir_name("nix-store-aarch64.img"));
+        assert!(!is_orphan_stage0_staging_dir_name("nix-store-x86_64.img"));
+        // Dotfile that isn't a staging dir.
+        assert!(!is_orphan_stage0_staging_dir_name(".DS_Store"));
+        // Unknown arch suffixes are conservative-deny.
+        assert!(!is_orphan_stage0_staging_dir_name(".riscv64.stage0-1-2"));
+        assert!(!is_orphan_stage0_staging_dir_name("riscv64-staging"));
+    }
+
+    /// Plan 77 W2 — sweep removes a staging dir of the current form,
+    /// reports the byte count, leaves the live cache and unrelated
+    /// siblings intact, and the dry-run variant is purely observational
+    /// (no fs mutation).
+    #[test]
+    fn sweep_removes_orphan_staging_dir_and_leaves_siblings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+
+        // Build a representative layout under <root>.
+        let orphan = root.join(".aarch64.stage0-12345-1700000000000000000");
+        std::fs::create_dir_all(orphan.join("nested")).unwrap();
+        std::fs::write(orphan.join("a"), b"hello world").unwrap(); // 11 bytes
+        std::fs::write(orphan.join("nested/b"), vec![0u8; 7]).unwrap();
+
+        let live_cache = root.join("aarch64");
+        std::fs::create_dir_all(&live_cache).unwrap();
+        std::fs::write(live_cache.join("rootfs.ext4"), b"do-not-delete").unwrap();
+
+        let nix_store = root.join("nix-store-aarch64.img");
+        std::fs::write(&nix_store, b"sparse").unwrap();
+
+        // Dry-run: nothing should move.
+        match sweep_orphaned_stage0_staging_dirs_at(&root, true)
+            .expect("dry-run sweep should succeed")
+        {
+            Stage0SweepOutcome::Swept {
+                removed,
+                freed_bytes,
+            } => {
+                assert_eq!(removed, 1, "dry-run reports the orphan");
+                assert_eq!(freed_bytes, 18, "dry-run reports the orphan's byte total");
+            }
+            Stage0SweepOutcome::SkippedLockHeld => panic!("dry-run must not skip"),
+        }
+        assert!(orphan.is_dir(), "dry-run must not remove the orphan");
+        assert!(live_cache.is_dir(), "dry-run must not touch the live cache");
+
+        // Real run: orphan goes, siblings stay.
+        match sweep_orphaned_stage0_staging_dirs_at(&root, false).expect("sweep should succeed") {
+            Stage0SweepOutcome::Swept {
+                removed,
+                freed_bytes,
+            } => {
+                assert_eq!(removed, 1);
+                assert_eq!(freed_bytes, 18);
+            }
+            Stage0SweepOutcome::SkippedLockHeld => panic!("must not skip on uncontended lock"),
+        }
+        assert!(!orphan.exists(), "orphan must be removed");
+        assert!(
+            live_cache.join("rootfs.ext4").is_file(),
+            "live cache must be untouched"
+        );
+        assert!(nix_store.is_file(), "nix-store image must be untouched");
+    }
+
+    /// Plan 77 W2 — when a live Stage 0 is in progress and holds the
+    /// advisory lock, the sweep must skip rather than race the
+    /// staging dir the live run is about to promote.
+    #[test]
+    fn sweep_skips_when_stage0_lock_is_held() {
+        use mvm_core::atomic_io::FileLock;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Hold the lock as a "live" Stage 0 would.
+        let _live = FileLock::try_acquire(&root.join("stage0"))
+            .expect("first acquisition should not fail")
+            .expect("first acquisition should succeed");
+
+        // Stage an orphan to confirm the sweep would have something to do.
+        let orphan = root.join(".aarch64.stage0-12345-1700000000000000000");
+        std::fs::create_dir_all(&orphan).unwrap();
+
+        match sweep_orphaned_stage0_staging_dirs_at(&root, false)
+            .expect("sweep should succeed even when skipping")
+        {
+            Stage0SweepOutcome::SkippedLockHeld => {}
+            Stage0SweepOutcome::Swept { .. } => {
+                panic!("sweep must skip while the Stage 0 lock is held")
+            }
+        }
+        assert!(
+            orphan.is_dir(),
+            "skipped sweep must not touch the would-be orphan"
+        );
+    }
+
+    /// Plan 77 W2 — sweep on a non-existent root is a no-op. Exercises
+    /// the early-return for fresh hosts that have never run `dev up`.
+    #[test]
+    fn sweep_is_noop_when_root_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("never-existed");
+
+        match sweep_orphaned_stage0_staging_dirs_at(&missing, false)
+            .expect("sweep on missing root should succeed")
+        {
+            Stage0SweepOutcome::Swept {
+                removed,
+                freed_bytes,
+            } => {
+                assert_eq!(removed, 0);
+                assert_eq!(freed_bytes, 0);
+            }
+            Stage0SweepOutcome::SkippedLockHeld => {
+                panic!("missing root must not look like lock contention")
+            }
+        }
     }
 
     #[test]
