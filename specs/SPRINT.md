@@ -56,6 +56,7 @@ Recent maintenance:
 - [x] Hardened Stage 0 builder-cache promotion: local builder-image bootstraps now build into a hidden staging directory, validate kernel/rootfs artifacts, and promote into the live cache only after validation succeeds.
 - [x] Bound source-checkout builder-image cache reuse to a SHA-256 fingerprint of `nix/images/builder-vm/{flake.nix,flake.lock}`, so stale but structurally valid builder caches are rebuilt instead of masking local source changes.
 - [x] Added source-built builder-cache artifact digest metadata; source checkout cache hits now require the fingerprint and cached `vmlinux` / `rootfs.ext4` / optional `cmdline.txt` digests to match before reuse.
+- [x] Added safe source-checkout builder-cache diagnostics; verbose output now reports non-sensitive cache decision reason codes such as `hit`, `fingerprint_mismatch`, and `artifact_digest_mismatch`.
 
 ## In-flight workstreams
 
