@@ -773,6 +773,17 @@ pub(in crate::commands) struct Args {
     /// (claim-8 preserved). ADR-047 claim 9.
     #[arg(long = "from-workload-ir", value_name = "PATH")]
     pub from_workload_ir: Option<std::path::PathBuf>,
+    /// Plan 76 Phase 7 — explicit operator acknowledgement that the
+    /// selected backend's isolation tier is acceptable for this
+    /// launch. Without this flag, a non-Tier-1 backend (libkrun,
+    /// microvm.nix qemu, Apple Container, Docker) emits a warning
+    /// on every launch. A future `--prod` mode will *block* rather
+    /// than warn; today we surface the signal without changing
+    /// default behaviour. Plan 76 §"libkrun isolation is not
+    /// Firecracker isolation".
+    #[arg(long)]
+    pub accept_tier2_isolation: bool,
+
     /// Emit a one-line JSON envelope on stdout when the VM is up.
     /// Routes the friendly `[mvm]` chrome to stderr so the SDK
     /// live-mode transport (Plan 73 Followup H-live) can parse a
@@ -795,6 +806,24 @@ pub(in crate::commands) struct Args {
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
+    // Plan 76 Phase 7 — surface the backend's isolation tier
+    // when it isn't Tier 1, unless the operator explicitly
+    // acknowledged the downgrade. This is observational today;
+    // a future `--prod` mode will hard-fail instead.
+    {
+        let backend = mvm_backend::backend::AnyBackend::from_hypervisor(&args.hypervisor);
+        let tier = backend.tier();
+        if tier != mvm_backend::backend::BackendTier::Tier1 && !args.accept_tier2_isolation {
+            crate::ui::warn(&format!(
+                "backend '{}' is {} (not Tier 1). Pass --accept-tier2-isolation to suppress \
+                 this warning on production-like launches. See plan 76 §\"libkrun isolation \
+                 is not Firecracker isolation\".",
+                backend.name(),
+                tier.label()
+            ));
+        }
+    }
+
     let memory_mb = args
         .memory
         .as_ref()
