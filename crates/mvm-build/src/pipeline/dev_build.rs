@@ -479,8 +479,21 @@ fn dev_build_via_builder_vm(
     profile: Option<&str>,
     mode: BuildMode,
 ) -> Result<DevBuildResult> {
-    use crate::builder_vm::{BuilderJob, BuilderMounts, BuilderVm, host_system_linux};
-    use crate::libkrun_builder::{GUEST_WORK_DIR, LibkrunBuilderVm};
+    use crate::libkrun_builder::LibkrunBuilderVm;
+
+    dev_build_with_builder_vm(env, flake_ref, profile, mode, &LibkrunBuilderVm::default())
+}
+
+#[cfg(feature = "builder-vm")]
+fn dev_build_with_builder_vm<B: crate::builder_vm::BuilderVm>(
+    env: &dyn ShellEnvironment,
+    flake_ref: &str,
+    profile: Option<&str>,
+    mode: BuildMode,
+    builder: &B,
+) -> Result<DevBuildResult> {
+    use crate::builder_vm::{BuilderJob, BuilderMounts, host_system_linux};
+    use crate::libkrun_builder::GUEST_WORK_DIR;
 
     let system = host_system_linux();
     let attr_path = match profile {
@@ -501,7 +514,7 @@ fn dev_build_via_builder_vm(
         flake_ref: GUEST_WORK_DIR.to_string(),
         attr_path,
     };
-    let staging = format!("{}/.staging-{}", dev_builds_dir(), std::process::id());
+    let staging = unique_dev_staging_dir();
     std::fs::create_dir_all(&staging).with_context(|| format!("creating staging dir {staging}"))?;
 
     let mounts = BuilderMounts {
@@ -510,7 +523,7 @@ fn dev_build_via_builder_vm(
         artifact_out: std::path::PathBuf::from(&staging),
     };
 
-    let artifacts = LibkrunBuilderVm::default()
+    let artifacts = builder
         .run_build(&job, &mounts)
         .map_err(|e| anyhow::anyhow!("builder VM: {e}"))?;
     let revision_hash = match artifacts {
@@ -638,6 +651,20 @@ fn extract_revision_hash(nix_output_path: &str) -> String {
 #[cfg(any(test, feature = "builder-vm"))]
 fn dev_build_dir(revision_hash: &str) -> String {
     format!("{}/{}", dev_builds_dir(), revision_hash)
+}
+
+#[cfg(feature = "builder-vm")]
+fn unique_dev_staging_dir() -> String {
+    let nanos = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    format!(
+        "{}/.staging-{}-{}",
+        dev_builds_dir(),
+        std::process::id(),
+        nanos
+    )
 }
 
 #[cfg(test)]
@@ -1000,13 +1027,8 @@ mod tests {
                 exec_log: Mutex::new(Vec::new()),
                 logs: Mutex::new(Vec::new()),
             };
-            // W7.x.2 dispatch probe: `dev_build` reads `nix --version`
-            // through the env to decide between the host path and the
-            // libkrun builder VM fallback. Every legacy test
-            // assumed the host path; default-stub the probe to keep
-            // them on it. Individual tests can override with
-            // `stub_stdout("nix --version", "")` to exercise the
-            // builder-VM path.
+            // Legacy shell-path helper tests still probe for `nix`
+            // before exercising their mock Nix commands.
             env.stub_stdout("nix --version", "nix (Nix) 2.24.10\n");
             env
         }
@@ -1047,6 +1069,56 @@ mod tests {
 
         fn log_success(&self, msg: &str) {
             self.logs.lock().unwrap().push(format!("SUCCESS: {}", msg));
+        }
+    }
+
+    #[cfg(feature = "builder-vm")]
+    struct RecordingBuilderVm {
+        seen: Mutex<
+            Vec<(
+                crate::builder_vm::BuilderJob,
+                crate::builder_vm::BuilderMounts,
+            )>,
+        >,
+        revision_hash: String,
+    }
+
+    #[cfg(feature = "builder-vm")]
+    impl RecordingBuilderVm {
+        fn new(revision_hash: &str) -> Self {
+            Self {
+                seen: Mutex::new(Vec::new()),
+                revision_hash: revision_hash.to_string(),
+            }
+        }
+    }
+
+    #[cfg(feature = "builder-vm")]
+    impl crate::builder_vm::BuilderVm for RecordingBuilderVm {
+        fn run_build(
+            &self,
+            job: &crate::builder_vm::BuilderJob,
+            mounts: &crate::builder_vm::BuilderMounts,
+        ) -> Result<crate::builder_vm::BuilderArtifacts, crate::builder_vm::BuilderVmError>
+        {
+            self.seen
+                .lock()
+                .expect("recording builder mutex poisoned")
+                .push((job.clone(), mounts.clone()));
+            std::fs::create_dir_all(&mounts.artifact_out)
+                .map_err(|e| crate::builder_vm::BuilderVmError::ExtractionFailed(e.to_string()))?;
+            std::fs::write(mounts.artifact_out.join("vmlinux"), b"kernel")
+                .map_err(|e| crate::builder_vm::BuilderVmError::ExtractionFailed(e.to_string()))?;
+            std::fs::write(mounts.artifact_out.join("rootfs.ext4"), b"rootfs")
+                .map_err(|e| crate::builder_vm::BuilderVmError::ExtractionFailed(e.to_string()))?;
+
+            Ok(crate::builder_vm::BuilderArtifacts::Image {
+                rootfs_path: mounts.artifact_out.join("rootfs.ext4"),
+                kernel_path: Some(mounts.artifact_out.join("vmlinux")),
+                revision_hash: self.revision_hash.clone(),
+                lock_hash: Some("lockhash".to_string()),
+                accessible: Some(true),
+            })
         }
     }
 
@@ -1246,6 +1318,100 @@ mod tests {
         let exec_log = env.exec_log.lock().unwrap();
         let has_copy = exec_log.iter().any(|s| s.contains("cp -L"));
         assert!(has_copy, "Expected copy script in exec log");
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn builder_vm_dev_build_uses_vm_job_shape_without_host_nix() {
+        let env = TestEnv::new();
+        env.stub_stdout("initrd", "0");
+        env.stub_stdout("microvm-run", "no");
+        env.stub_stdout("stat -c%s", "6");
+        let revision_hash = format!("builderrev-success-{}", std::process::id());
+        let final_dir = dev_build_dir(&revision_hash);
+        let _ = std::fs::remove_dir_all(&final_dir);
+        let builder = RecordingBuilderVm::new(&revision_hash);
+        let result = dev_build_with_builder_vm(
+            &env,
+            "/tmp/source-flake",
+            Some("worker"),
+            BuildMode::Dev,
+            &builder,
+        )
+        .expect("builder VM dev build should succeed with fake builder");
+
+        assert_eq!(result.revision_hash, revision_hash);
+        assert_eq!(result.build_dir, final_dir);
+        assert!(std::path::Path::new(&result.vmlinux_path).is_file());
+        assert!(std::path::Path::new(&result.rootfs_path).is_file());
+
+        let seen = builder
+            .seen
+            .lock()
+            .expect("recording builder mutex poisoned");
+        assert_eq!(seen.len(), 1);
+        let (job, mounts) = &seen[0];
+        assert_eq!(
+            mounts.flake_src,
+            std::path::PathBuf::from("/tmp/source-flake")
+        );
+        assert!(mounts.host_nix_store.is_none());
+        let staging_name = mounts
+            .artifact_out
+            .file_name()
+            .and_then(|name| name.to_str())
+            .expect("staging dir should have a utf-8 basename");
+        assert!(
+            staging_name.starts_with(&format!(".staging-{}-", std::process::id())),
+            "staging dir should be unique per build: {}",
+            mounts.artifact_out.display()
+        );
+        assert_eq!(
+            job,
+            &crate::builder_vm::BuilderJob::Flake {
+                flake_ref: crate::libkrun_builder::GUEST_WORK_DIR.to_string(),
+                attr_path: format!(
+                    "packages.{}.tenant-worker",
+                    crate::builder_vm::host_system_linux()
+                ),
+            }
+        );
+
+        let exec_log = env.exec_log.lock().expect("exec log mutex poisoned");
+        assert!(
+            exec_log.iter().all(|entry| !entry.contains("nix ")),
+            "builder VM path must not probe or invoke host-side Nix: {exec_log:?}"
+        );
+        std::fs::remove_dir_all(&final_dir).expect("clean fake builder artifacts");
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn builder_vm_dev_build_fails_closed_when_builder_errors() {
+        let env = TestEnv::new();
+        let result = dev_build_with_builder_vm(
+            &env,
+            "/tmp/source-flake",
+            None,
+            BuildMode::Prod,
+            &crate::builder_vm::StubBuilderVm,
+        );
+
+        let err = result.expect_err("stub builder must fail closed");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("builder VM"),
+            "error should name the builder VM boundary: {msg}"
+        );
+        assert!(
+            !std::path::Path::new(&dev_build_dir("unknown")).exists(),
+            "failure must not synthesize a host-Nix artifact directory"
+        );
+        let exec_log = env.exec_log.lock().expect("exec log mutex poisoned");
+        assert!(
+            exec_log.iter().all(|entry| !entry.contains("nix ")),
+            "builder failure path must not fall back to host-side Nix: {exec_log:?}"
+        );
     }
 
     #[test]
