@@ -543,11 +543,9 @@ fn plist_env_string_value(plist: &str, key: &str) -> Option<String> {
 /// virtio-fs `/out` mount lands on the read-only Nix store path
 /// and Apple Container fails with EACCES.
 ///
-/// `allow(dead_code)`: only reachable under the libkrun-dispatch
-/// branch of `ensure_dev_image`, which itself is gated on
-/// `backends-builder-vm-libkrun`. Default-features-off builds
-/// don't reach this helper.
-#[allow(dead_code)]
+/// Only reachable under the libkrun-dispatch branch of `ensure_dev_image`,
+/// which itself is gated on `builder-vm`.
+#[cfg(feature = "builder-vm")]
 fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
     if let Some(parent) = std::path::Path::new(out_dir).parent() {
         std::fs::create_dir_all(parent)
@@ -604,8 +602,8 @@ pub(super) fn ensure_dev_image() -> Result<(String, String)> {
     // since the typical failure mode (libkrun runtime mismatch, builder-
     // vm image cache missing) is a config error that hiding behind the
     // prebuilt would mask.
-    // Gate the dispatch itself on `backends-builder-vm-libkrun`.
-    #[cfg(feature = "backends-builder-vm-libkrun")]
+    // Gate the dispatch itself on `builder-vm`.
+    #[cfg(feature = "builder-vm")]
     if let Some(flake_dir) = &find_dev_image_flake().ok()
         && find_builder_vm_flake().is_ok()
     {
@@ -1700,7 +1698,7 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
 /// "double-prefix attribute" `nix build` failure inside the
 /// sandbox. The bail signals `ensure_dev_image` to take the
 /// published-prebuilt download path (W5.1 — hash-verified).
-#[cfg(feature = "backends-builder-vm-libkrun")]
+#[cfg(feature = "builder-vm")]
 fn find_dev_image_flake() -> Result<String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = std::path::Path::new(manifest_dir)
@@ -1778,7 +1776,7 @@ fn find_builder_vm_flake() -> Result<String> {
 ///
 /// `allow(dead_code)`: same justification as
 /// [`find_builder_vm_flake`] — only called when
-/// `backends-builder-vm-libkrun` is on.
+/// `builder-vm` is on.
 #[allow(dead_code)]
 fn bootstrap_builder_vm_image() -> Result<()> {
     let arch = if cfg!(target_arch = "aarch64") {
@@ -1924,8 +1922,8 @@ fn builder_vm_artifact_names(arch: &str) -> BuilderVmArtifactNames {
 ///   - confirmed `find_builder_vm_flake().is_ok()` (Layer 1 source is
 ///     present in the workspace),
 ///   - run [`prepare_dev_image_out_dir`] on `out_dir`.
-// Gated only on `backends-builder-vm-libkrun`.
-#[cfg(feature = "backends-builder-vm-libkrun")]
+// Gated only on `builder-vm`.
+#[cfg(feature = "builder-vm")]
 fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     use mvm_build::builder_vm::{BuilderJob, BuilderMounts, BuilderVm, host_system_linux};
     use mvm_build::libkrun_builder::LibkrunBuilderVm;

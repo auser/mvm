@@ -2,13 +2,16 @@
 
 ## Project Overview
 
-Rust CLI for building and running Firecracker microVMs on macOS (via Lima) and Linux. Handles the full dev lifecycle: bootstrapping, Nix-based image builds, single-VM management, and reusable template creation.
+Rust CLI for building and running Firecracker microVMs on macOS and Linux. Handles the full dev lifecycle: bootstrapping, Nix-based image builds, single-VM management, and reusable template creation.
 
 Multi-tenant fleet orchestration (tenants, pools, instances, agents, coordinators) lives in the separate [mvmd](https://github.com/tinylabscom/mvmd) repository.
 
 ```
-macOS / Linux Host (this CLI) -> Lima VM (Ubuntu) -> Firecracker microVM (/dev/kvm)
+macOS Host (this CLI) -> libkrun Linux VM -> Firecracker microVM (/dev/kvm)
+Linux Host (this CLI) -> Firecracker microVM (/dev/kvm)
 ```
+
+Lima was the historical macOS host abstraction. It was removed on 2026-05-14 (Plan 72 W0–W6 + Plan 75 W0). libkrun is the default macOS backend; Apple Container is the macOS 26+ Apple Silicon backend; Firecracker is the Linux KVM path. There is no `--lima` flag and no Lima fallback.
 
 ## Architecture
 
@@ -19,7 +22,7 @@ macOS / Linux Host (this CLI) -> Lima VM (Ubuntu) -> Firecracker microVM (/dev/k
 - `mvm-core` -- pure types, IDs, config, protocol, signing, routing (NO runtime deps)
 - `mvm-guest` -- vsock protocol, integration manifest/state (OpenClaw)
 - `mvm-build` -- Nix builder pipeline (dev_build uses `ShellEnvironment` trait, pool_build uses `BuildEnvironment`)
-- `mvm` -- shell execution, Lima/Firecracker VM lifecycle, UI, template management
+- `mvm` -- shell execution, builder-VM / Firecracker VM lifecycle, UI, template management
 - `mvm-cli` -- Clap CLI, bootstrap, update, doctor, template commands
 
 Root package: `src/lib.rs` (facade re-exports `mvmctl::core`, `mvmctl::runtime`, `mvmctl::build`, `mvmctl::guest`) + `src/main.rs` (thin CLI entry -> `mvm_cli::run()`)
@@ -39,7 +42,7 @@ mvm-core (foundation, no mvm deps)
 
 mvm-core: `build_env.rs` (ShellEnvironment + BuildEnvironment traits), `pool.rs`, `instance.rs`, `tenant.rs`, `template.rs`, `naming.rs`, `signing.rs`, `routing.rs`, `protocol.rs`, `agent.rs`, `catalog.rs` (image catalog), `dev_network.rs` (named networks), `config.rs` (XDG directory functions)
 
-mvm: `shell.rs`, `config.rs`, `ui.rs`, `build_env.rs` (DevShellEnv impl), `vm/lima.rs`, `vm/firecracker.rs`, `vm/microvm.rs`, `vm/network.rs`, `vm/image.rs`, `vm/template/`
+mvm: `shell.rs`, `config.rs`, `ui.rs`, `build_env.rs` (DevShellEnv impl), `vm/microvm.rs`, `vm/bridge.rs`, `vm/overlay.rs`, `vm/instance/`, `vm/template/`. Hypervisor backends live in `mvm-backend/` (`libkrun.rs`, `firecracker.rs`, `apple_container.rs`, `docker.rs`) and `mvm-libkrun/`.
 
 mvm-build: `dev_build.rs` (local Nix builds via ShellEnvironment), `build.rs` (orchestrated builds via BuildEnvironment), `nix_manifest.rs`, `scripts.rs`
 
@@ -69,14 +72,14 @@ The `RuntimeBuildEnv` in mvm implements only `ShellEnvironment`. The full `Build
 
 ### Key Design Decisions
 
-- **Firecracker-only**: no Docker/containers. Builds run Nix inside the Lima VM.
-- **No SSH in microVMs, ever**: microVMs are headless workloads. No sshd, no SSH keys, no SSH users in any rootfs. Guest communication uses Firecracker vsock only. The dev environment is the Lima VM (`mvmctl dev` / `mvmctl dev shell`), not the microVM. See **Security model** below for the full posture.
-- **Dev mode**: `mvmctl dev` (or `mvmctl dev up`) auto-bootstraps then drops into a dev shell. On macOS 26+ Apple Silicon: boots an Apple Container with Nix + build tools via PTY-over-vsock console. On macOS <26 or Linux without KVM: uses Lima VM. Use `--lima` to force Lima fallback. `mvmctl dev down` stops it. `mvmctl dev shell` opens a shell. `mvmctl dev status` shows environment info. It does NOT start or SSH into a Firecracker microVM.
+- **Firecracker-only on Linux; libkrun/Apple Container on macOS**: no Docker/containers on the runtime path. Builds run Nix inside the builder VM (libkrun on macOS, Firecracker on Linux KVM).
+- **No SSH in microVMs, ever**: microVMs are headless workloads. No sshd, no SSH keys, no SSH users in any rootfs. Guest communication uses Firecracker vsock only. The dev environment is the builder VM (`mvmctl dev` / `mvmctl dev shell`), not the microVM. See **Security model** below for the full posture.
+- **Dev mode**: `mvmctl dev` (or `mvmctl dev up`) auto-bootstraps then drops into a dev shell. On macOS 26+ Apple Silicon: boots an Apple Container with Nix + build tools via PTY-over-vsock console. On other macOS: libkrun builder VM. On Linux with KVM: Firecracker directly. `mvmctl dev down` stops it. `mvmctl dev shell` opens a shell. `mvmctl dev status` shows environment info. It does NOT start or SSH into a Firecracker microVM.
 - **Headless microVMs**: `mvmctl start` and `mvmctl run` boot Firecracker as a daemon. Interactive access via `mvmctl console` (PTY-over-vsock, dev-mode only).
 - **Dev mode isolation**: `mvmctl start/stop/dev` use a completely separate code path from orchestration.
-- **Shell scripts inside run_in_vm**: complex ops are bash scripts passed to `limactl shell`. Deliberate -- they run inside the Linux VM.
+- **Shell scripts inside run_in_vm**: complex ops are bash scripts handed to the active `LinuxEnv` backend (libkrun / Apple Container / Firecracker). Deliberate — they run inside the Linux VM, not on the macOS/Linux host.
 - **Idempotent setup**: every step checks if already done before acting.
-- **Templates use dev_build path**: `mvmctl template build` runs `nix build` locally in the Lima VM (no ephemeral FC builder VMs).
+- **Templates use dev_build path**: `mvmctl template build` runs `nix build` locally inside the builder VM (no ephemeral FC builder VMs).
 - **mvm-core stays whole**: orchestration types (tenant, pool, instance, agent, protocol) remain in mvm-core even though they're only used by mvmd. This avoids a third shared-types crate and keeps the facade dependency simple.
 - **No `clippy::too_many_arguments`**: never suppress this lint. Refactor into smaller functions or a config/params struct.
 - **Source-checkout builds never depend on mvm-published artifacts**: when `mvmctl` is run from a source checkout of this repo (anywhere `find_dev_image_flake()` / `find_builder_vm_flake()` returns `Some`), every VM image is built locally from the in-repo flakes — both the builder VM image (`nix/images/builder-vm/`) and the user-facing image (`nix/images/dev-shell/`, user `--flake`, etc.). The mvm-published prebuilts on GitHub releases are end-user infrastructure only; they are never a prerequisite for any source-checkout workflow. A contributor modifying `nix/images/builder-vm/flake.nix` must see their change in the very next `mvmctl dev up` with no release-pipeline round-trip. See ADR-046 §"Two artifact layers, two acquisition paths" for the resolution rule and ADR-046 §"Why the contributor path doesn't download" for the rationale.
@@ -206,10 +209,10 @@ cargo build
 cargo run -- --help
 
 # Dev mode
-cargo run -- dev         # auto-bootstrap + drop into Lima shell (alias for dev up)
+cargo run -- dev         # auto-bootstrap + drop into builder-VM shell (alias for dev up)
 cargo run -- dev up      # same as above, explicit
-cargo run -- dev down    # stop the Lima dev VM
-cargo run -- dev shell   # open shell in running Lima VM
+cargo run -- dev down    # stop the builder VM
+cargo run -- dev shell   # open shell in running builder VM
 cargo run -- dev status  # show dev environment status
 
 # Build from Nix flake
@@ -247,8 +250,8 @@ cargo run -- cache prune             # clean stale temp files
 ```
 MicroVM (172.16.0.2, eth0)
     | TAP interface
-Lima VM (172.16.0.1, tap0) -- iptables NAT -- internet
-    | Lima virtualization
+Builder VM (172.16.0.1, tap0) -- iptables NAT -- internet
+    | libkrun (macOS) / Apple Container (macOS 26+) / direct (Linux KVM)
 macOS / Linux Host
 ```
 

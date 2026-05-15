@@ -40,6 +40,7 @@ use super::BuildMode;
 ///      production agent, surfacing the misconfiguration explicitly
 ///      rather than silently producing a non-functional `mvmctl exec`
 ///      image.
+#[cfg(test)]
 fn dev_override_flags(env: &dyn ShellEnvironment, mode: BuildMode) -> String {
     if !mode.injects_dev_override() {
         // Prod-shape build: produce sealed images with the prod
@@ -92,6 +93,7 @@ fn dev_builds_dir() -> String {
 /// because the data dir is the only path the dev VM and the host
 /// agree on (via the `datadir` VirtioFS share mounted at the same
 /// absolute path in both).
+#[cfg(test)]
 fn gc_sentinel_path() -> String {
     format!(
         "{}/dev/nix-store-needs-gc",
@@ -105,6 +107,7 @@ fn gc_sentinel_path() -> String {
 /// regardless of whether GC succeeded — leaving it in place would
 /// make every subsequent build re-trigger the GC, defeating the
 /// purpose of the threshold check.
+#[cfg(test)]
 fn run_gc_if_requested(env: &dyn ShellEnvironment) {
     let sentinel = gc_sentinel_path();
     let quoted = shell_quote(&sentinel);
@@ -306,9 +309,30 @@ pub fn dev_build(
         });
     }
 
-    // If the builder environment has `nix` on PATH, run the build
-    // there. mvmctl dev builds do not fall back to host Nix; missing
-    // nix here means the builder VM/image path is broken.
+    #[cfg(feature = "builder-vm")]
+    {
+        env.log_info("Building via the Linux builder VM; host-side Nix is not used.");
+        dev_build_via_builder_vm(env, flake_ref, profile, mode)
+    }
+
+    #[cfg(not(feature = "builder-vm"))]
+    {
+        let _ = (env, flake_ref, profile, mode);
+        anyhow::bail!(
+            "Builder VM support was compiled out (feature `builder-vm` disabled). \
+             Use the default mvmctl build or rebuild with `--features builder-vm` \
+             so Nix evaluation and image builds can run inside the project builder VM."
+        );
+    }
+}
+
+#[cfg(test)]
+fn dev_build_via_shell_env(
+    env: &dyn ShellEnvironment,
+    flake_ref: &str,
+    profile: Option<&str>,
+    mode: BuildMode,
+) -> Result<DevBuildResult> {
     if !builder_env_has_nix(env) {
         let _ = (env, flake_ref, profile, mode);
         anyhow::bail!(
@@ -447,12 +471,107 @@ pub fn dev_build(
     })
 }
 
+/// Build path that always runs Nix inside the project builder VM.
+#[cfg(feature = "builder-vm")]
+fn dev_build_via_builder_vm(
+    env: &dyn ShellEnvironment,
+    flake_ref: &str,
+    profile: Option<&str>,
+    mode: BuildMode,
+) -> Result<DevBuildResult> {
+    use crate::builder_vm::{BuilderJob, BuilderMounts, BuilderVm, host_system_linux};
+    use crate::libkrun_builder::{GUEST_WORK_DIR, LibkrunBuilderVm};
+
+    let system = host_system_linux();
+    let attr_path = match profile {
+        Some(p) if p != "default" => format!("packages.{system}.tenant-{p}"),
+        _ => format!("packages.{system}.default"),
+    };
+    let _ = mode;
+
+    let flake_src = std::path::PathBuf::from(if flake_ref == "." {
+        std::env::current_dir()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|_| ".".to_string())
+    } else {
+        flake_ref.to_string()
+    });
+
+    let job = BuilderJob::Flake {
+        flake_ref: GUEST_WORK_DIR.to_string(),
+        attr_path,
+    };
+    let staging = format!("{}/.staging-{}", dev_builds_dir(), std::process::id());
+    std::fs::create_dir_all(&staging).with_context(|| format!("creating staging dir {staging}"))?;
+
+    let mounts = BuilderMounts {
+        flake_src,
+        host_nix_store: None,
+        artifact_out: std::path::PathBuf::from(&staging),
+    };
+
+    let artifacts = LibkrunBuilderVm::default()
+        .run_build(&job, &mounts)
+        .map_err(|e| anyhow::anyhow!("builder VM: {e}"))?;
+    let revision_hash = match artifacts {
+        crate::builder_vm::BuilderArtifacts::Image { revision_hash, .. } => revision_hash,
+        crate::builder_vm::BuilderArtifacts::InstallVolume { .. } => {
+            anyhow::bail!("builder VM returned install-volume artifacts for a flake build");
+        }
+    };
+
+    let final_dir = dev_build_dir(&revision_hash);
+    if std::path::Path::new(&final_dir).exists() {
+        env.log_info(&format!(
+            "Cache hit on rev {revision_hash}; discarding staged build."
+        ));
+        let _ = std::fs::remove_dir_all(&staging);
+    } else if let Err(e) = std::fs::rename(&staging, &final_dir) {
+        std::fs::create_dir_all(&final_dir)
+            .with_context(|| format!("creating final build dir {final_dir}"))?;
+        for entry in
+            std::fs::read_dir(&staging).with_context(|| format!("reading staging dir {staging}"))?
+        {
+            let entry = entry?;
+            let dst = std::path::Path::new(&final_dir).join(entry.file_name());
+            std::fs::copy(entry.path(), &dst).with_context(|| {
+                format!("copying {} -> {}", entry.path().display(), dst.display())
+            })?;
+        }
+        let _ = std::fs::remove_dir_all(&staging);
+        tracing::debug!(error = %e, "rename failed; fell back to copy");
+    }
+
+    let build_dir = final_dir;
+    let vmlinux_path = format!("{build_dir}/vmlinux");
+    let rootfs_path = format!("{build_dir}/rootfs.ext4");
+    let initrd_path = detect_initrd(env, &build_dir);
+    let runner_dir = detect_runner(env, &build_dir);
+    let artifact_sizes = measure_artifact_sizes(env, &build_dir, initrd_path.is_some());
+
+    env.log_success(&format!(
+        "Builder VM build complete; artifacts at {build_dir}"
+    ));
+
+    Ok(DevBuildResult {
+        build_dir,
+        vmlinux_path,
+        initrd_path,
+        rootfs_path,
+        revision_hash,
+        cached: false,
+        runner_dir,
+        artifact_sizes,
+    })
+}
+
 /// Run the flake's `pre-build.sh` hook if it exists.
 ///
 /// Some templates install external software (e.g. via an upstream installer
 /// script) before the Nix build. If `<flake_ref>/pre-build.sh` exists and
 /// is executable, it is run with visible output. Returns `" --impure"` when
 /// the hook ran (so `nix build` can reference host paths), or `""` otherwise.
+#[cfg(test)]
 fn run_pre_build_hook(env: &dyn ShellEnvironment, flake_ref: &str) -> Result<&'static str> {
     let pre_build = format!("{}/pre-build.sh", flake_ref);
     let check = env
@@ -481,6 +600,7 @@ fn run_pre_build_hook(env: &dyn ShellEnvironment, flake_ref: &str) -> Result<&'s
 ///
 /// - `None` → builds the flake's `default` package (convention: `default = worker`).
 /// - `Some(profile)` → builds `packages.<system>.tenant-<profile>`.
+#[cfg(test)]
 fn resolve_dev_build_attribute(
     env: &dyn ShellEnvironment,
     flake_ref: &str,
@@ -505,6 +625,7 @@ fn resolve_dev_build_attribute(
 }
 
 /// Extract the Nix store hash from an output path like `/nix/store/<hash>-name`.
+#[cfg(test)]
 fn extract_revision_hash(nix_output_path: &str) -> String {
     nix_output_path
         .strip_prefix("/nix/store/")
@@ -514,15 +635,18 @@ fn extract_revision_hash(nix_output_path: &str) -> String {
 }
 
 /// Return the dev build directory for a given revision hash.
+#[cfg(any(test, feature = "builder-vm"))]
 fn dev_build_dir(revision_hash: &str) -> String {
     format!("{}/{}", dev_builds_dir(), revision_hash)
 }
 
+#[cfg(test)]
 fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\\''"))
 }
 
 /// True if `nix` is available inside the builder shell environment.
+#[cfg(test)]
 fn builder_env_has_nix(env: &dyn ShellEnvironment) -> bool {
     env.shell_exec_stdout("nix --version 2>/dev/null | head -1")
         .map(|s| s.trim().starts_with("nix "))
@@ -530,6 +654,7 @@ fn builder_env_has_nix(env: &dyn ShellEnvironment) -> bool {
 }
 
 /// Check whether cached artifacts exist for a revision hash.
+#[cfg(test)]
 fn check_cache(env: &dyn ShellEnvironment, revision_hash: &str) -> Result<bool> {
     let build_dir = dev_build_dir(revision_hash);
     let result = env.shell_exec_stdout(&format!(
@@ -540,6 +665,7 @@ fn check_cache(env: &dyn ShellEnvironment, revision_hash: &str) -> Result<bool> 
 }
 
 /// Copy kernel, initrd, and rootfs from a Nix store output to the dev build directory.
+#[cfg(test)]
 fn copy_dev_artifacts(
     env: &dyn ShellEnvironment,
     nix_output_path: &str,
@@ -599,6 +725,7 @@ fn copy_dev_artifacts(
 }
 
 /// Measure artifact file sizes in the build directory using `stat -c%s`.
+#[cfg(any(test, feature = "builder-vm"))]
 fn measure_artifact_sizes(
     env: &dyn ShellEnvironment,
     build_dir: &str,
@@ -628,6 +755,7 @@ fn measure_artifact_sizes(
 }
 
 /// Check whether an initrd exists in the build directory.
+#[cfg(any(test, feature = "builder-vm"))]
 fn detect_initrd(env: &dyn ShellEnvironment, build_dir: &str) -> Option<String> {
     let path = format!("{}/initrd", build_dir);
     let result = env
@@ -645,6 +773,7 @@ fn detect_initrd(env: &dyn ShellEnvironment, build_dir: &str) -> Option<String> 
 /// The root flake's `mkGuest` copies the runner to `$out/bin/microvm-run`
 /// when the microvm.nix runner is available. If found, returns the runner
 /// directory path (parent of `bin/`).
+#[cfg(any(test, feature = "builder-vm"))]
 fn detect_runner(env: &dyn ShellEnvironment, build_dir: &str) -> Option<String> {
     let runner_path = format!("{}/bin/microvm-run", build_dir);
     let result = env
@@ -1074,6 +1203,7 @@ mod tests {
     #[test]
     fn test_dev_build_cached() {
         let env = TestEnv::new();
+        env.stub_stdout("nix --version", "nix (Nix) 2.24.10");
 
         // nix build --no-link (visible) succeeds
         // nix build --print-out-paths returns the path
@@ -1085,7 +1215,8 @@ mod tests {
         env.stub_stdout("test -f", "yes");
 
         let result =
-            dev_build(&env, "/home/user/project", Some("minimal"), BuildMode::Dev).unwrap();
+            dev_build_via_shell_env(&env, "/home/user/project", Some("minimal"), BuildMode::Dev)
+                .unwrap();
 
         assert!(result.cached);
         assert_eq!(result.revision_hash, "abc123");
@@ -1098,12 +1229,14 @@ mod tests {
     #[test]
     fn test_dev_build_fresh() {
         let env = TestEnv::new();
+        env.stub_stdout("nix --version", "nix (Nix) 2.24.10");
 
         env.stub_stdout("--print-out-paths", "/nix/store/xyz789-tenant-minimal\n");
         // Cache miss
         env.stub_stdout("test -f", "no");
 
-        let result = dev_build(&env, "/tmp/flake", Some("minimal"), BuildMode::Dev).unwrap();
+        let result =
+            dev_build_via_shell_env(&env, "/tmp/flake", Some("minimal"), BuildMode::Dev).unwrap();
 
         assert!(!result.cached);
         assert_eq!(result.revision_hash, "xyz789");
@@ -1186,13 +1319,15 @@ mod tests {
     #[test]
     fn test_dev_build_with_pre_build_hook() {
         let env = TestEnv::new();
+        env.stub_stdout("nix --version", "nix (Nix) 2.24.10");
 
         // Pre-build hook exists.
         env.stub_stdout("test -f", "yes");
         // nix build output.
         env.stub_stdout("--print-out-paths", "/nix/store/abc123-tenant-minimal\n");
 
-        let result = dev_build(&env, "/tmp/flake", Some("minimal"), BuildMode::Dev).unwrap();
+        let result =
+            dev_build_via_shell_env(&env, "/tmp/flake", Some("minimal"), BuildMode::Dev).unwrap();
 
         // Verify --impure was added to nix build commands.
         let exec_log = env.exec_log.lock().unwrap();
@@ -1254,7 +1389,7 @@ mod tests {
     fn dev_build_bails_clearly_when_nix_missing() {
         let env = TestEnv::new();
         env.stub_stdout("nix --version", "");
-        let result = dev_build(
+        let result = dev_build_via_shell_env(
             &env,
             "/definitely/not/a/real/flake/dir",
             Some("minimal"),
@@ -1271,13 +1406,15 @@ mod tests {
     #[test]
     fn test_dev_build_includes_artifact_sizes() {
         let env = TestEnv::new();
+        env.stub_stdout("nix --version", "nix (Nix) 2.24.10");
 
         env.stub_stdout("--print-out-paths", "/nix/store/xyz789-tenant-minimal\n");
         env.stub_stdout("test -f", "no");
         // stat calls return sizes
         env.stub_stdout("stat -c%s", "99999");
 
-        let result = dev_build(&env, "/tmp/flake", Some("minimal"), BuildMode::Dev).unwrap();
+        let result =
+            dev_build_via_shell_env(&env, "/tmp/flake", Some("minimal"), BuildMode::Dev).unwrap();
         // Sizes should be populated (exact value depends on stub matching)
         assert!(result.artifact_sizes.vmlinux_bytes > 0 || result.artifact_sizes.rootfs_bytes > 0);
     }

@@ -304,13 +304,15 @@ mod linux {
     }
 
     fn setup_filesystems() -> Result<(), String> {
-        // Standard init filesystems. `MS_NOSUID | MS_NODEV` on
-        // /tmp matches the kernel default for tmpfs; the others
-        // use stock flags.
-        mount_fs("proc", "/proc", "proc")?;
-        mount_fs("sysfs", "/sys", "sysfs")?;
-        mount_fs("devtmpfs", "/dev", "devtmpfs")?;
-        mount_fs("tmpfs", "/tmp", "tmpfs")?;
+        // Standard init filesystems. libkrun's kernel mounts
+        // devtmpfs (and sometimes /proc /sys) before handing off to
+        // init, so EBUSY here means "already mounted by an earlier
+        // stage" — that's success for our purposes. Anything else
+        // is fatal.
+        mount_fs_idempotent("proc", "/proc", "proc")?;
+        mount_fs_idempotent("sysfs", "/sys", "sysfs")?;
+        mount_fs_idempotent("devtmpfs", "/dev", "devtmpfs")?;
+        mount_fs_idempotent("tmpfs", "/tmp", "tmpfs")?;
 
         std::fs::create_dir_all(NIX_STORE_MOUNT)
             .map_err(|e| format!("create {NIX_STORE_MOUNT}: {e}"))?;
@@ -320,8 +322,71 @@ mod linux {
         }
         mount_fs(NIX_STORE_DEV, NIX_STORE_MOUNT, "ext4")?;
 
+        // Seed the persistent `/nix-store` from the rootfs's baked-in
+        // `/nix/store` on first boot. A plain `MS_BIND` shadows the
+        // mount target — without seeding, bind-mounting an empty disk
+        // over `/nix` hides the Nix daemon binary the rootfs ships at
+        // `/nix/store/<hash>-nix/bin/nix`, so cmd.sh's `nix build`
+        // fails with exit 127 (command not found). Subsequent boots
+        // see a non-empty store and skip the copy, so the seed cost
+        // is paid once per builder-VM image generation.
+        let needs_seed = match std::fs::read_dir(NIX_STORE_MOUNT) {
+            Ok(entries) => {
+                let mut any_non_lf = false;
+                for entry in entries {
+                    if let Ok(entry) = entry
+                        && entry.file_name() != "lost+found"
+                    {
+                        any_non_lf = true;
+                        break;
+                    }
+                }
+                !any_non_lf
+            }
+            Err(_) => true,
+        };
+        if needs_seed {
+            eprintln!("mvm-builder-init: seeding {NIX_STORE_MOUNT} from {NIX_TARGET} (first boot)");
+            let status = Command::new("/bin/cp")
+                .args([
+                    "-aR",
+                    &format!("{NIX_TARGET}/."),
+                    &format!("{NIX_STORE_MOUNT}/"),
+                ])
+                .status()
+                .map_err(|e| format!("spawn cp: {e}"))?;
+            if !status.success() {
+                return Err(format!(
+                    "seeding {NIX_STORE_MOUNT} from {NIX_TARGET}: cp exit {:?}",
+                    status.code()
+                ));
+            }
+        }
+
         std::fs::create_dir_all(NIX_TARGET).map_err(|e| format!("create {NIX_TARGET}: {e}"))?;
         bind_mount(NIX_STORE_MOUNT, NIX_TARGET)?;
+
+        // Load FUSE + virtio-fs kernel modules before mounting the
+        // host-exported shares. Stock nixpkgs kernel ships these as
+        // `=m` (loadable modules); without modprobe, `mount -t
+        // virtiofs` bails with ENODEV. `mkGuest` (PR #215) stages
+        // `/lib/modules/<kver>/` into the rootfs precisely so we can
+        // load them at boot. Failure is non-fatal — the subsequent
+        // mount attempts will fail visibly if a module is genuinely
+        // missing rather than just not-yet-loaded.
+        for module in &["fuse", "virtiofs"] {
+            let status = Command::new("/bin/busybox")
+                .args(["modprobe", module])
+                .status();
+            match status {
+                Ok(s) if s.success() => {}
+                Ok(s) => eprintln!(
+                    "mvm-builder-init: modprobe {module} exited {} (continuing)",
+                    s.code().unwrap_or(-1)
+                ),
+                Err(e) => eprintln!("mvm-builder-init: spawn modprobe {module}: {e} (continuing)"),
+            }
+        }
 
         // virtio-fs shares declared by `LibkrunBuilderVm` (Plan 72
         // W4). Each entry is `(tag, target)` — the kernel routes
@@ -420,6 +485,24 @@ mod linux {
             None::<&str>,
         )
         .map_err(|e| format!("mount {source} -> {target} ({fstype}): {e}"))
+    }
+
+    /// `mount_fs` that treats EBUSY as success. libkrun's kernel
+    /// pre-mounts some of `/proc`, `/sys`, `/dev` depending on
+    /// cmdline + initramfs config; without this tolerance,
+    /// mvm-builder-init bails on its first such call instead of
+    /// reaching the user's cmd.sh.
+    fn mount_fs_idempotent(source: &str, target: &str, fstype: &str) -> Result<(), String> {
+        match mount_fs(source, target, fstype) {
+            Ok(()) => Ok(()),
+            Err(e) if e.contains("EBUSY") => {
+                eprintln!(
+                    "mvm-builder-init: {target} ({fstype}) already mounted (EBUSY) — continuing"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
     }
 
     fn bind_mount(source: &str, target: &str) -> Result<(), String> {

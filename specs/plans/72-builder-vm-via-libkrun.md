@@ -48,7 +48,7 @@ When all nine hold, ADR-046 flips from Proposed to Accepted and the plan moves t
 `crates/mvm-cli/src/commands/env/apple_container.rs::build_image_via_libkrun` derives `workspace_root = flake_dir.parent().parent().parent()` and sets:
 
 - `BuilderMounts.flake_src = workspace_root`
-- `BuilderJob.flake_ref = format!("path:{}/{}", BUILDER_GUEST_WORK_DIR, flake_rel)` where `flake_rel = flake_src.strip_prefix(workspace_root)`
+- `BuilderJob.flake_ref = format!("path:{}/{}", GUEST_WORK_DIR, flake_rel)` where `flake_rel = flake_src.strip_prefix(workspace_root)`
 
 Drops the previous shape where only `nix/images/builder/` was mounted at `/work` and `path = ../../..` in the flake resolved to `/` of the sandbox, hitting `/.msb/agent.sock` (or its libkrun equivalent — the sandbox internals will differ but `..` escaping the mount always hits *something*).
 
@@ -123,7 +123,7 @@ impl BuilderVm for LibkrunBuilderVm {
 
 ### Feature gate
 
-`backends-builder-vm-libkrun` (new). Default-off in this phase.
+`builder-vm` (new). Default-off in this phase.
 
 ### W1 acceptance
 
@@ -287,7 +287,7 @@ Reshape `ensure_dev_image` to encode the two-layer artifact rule from ADR-046 §
 
 ### Feature flag polarity
 
-- `backends-builder-vm-libkrun` becomes the new default — covers Layer 1 + Layer 2 on user-facing paths.
+- `builder-vm` becomes the new default — covers Layer 1 + Layer 2 on user-facing paths.
 - The old libkrun bootstrap flag is removed. End users without libkrun get an install hint, not a libkrun fallback.
 
 ### Implementation notes for `ensure_dev_image`

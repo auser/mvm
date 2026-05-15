@@ -284,7 +284,7 @@ pub enum InstallError {
 /// content/SBOM/fetch.log/CVE/result.json.
 ///
 /// Defining this as a trait — rather than wiring `LibkrunBuilderVm`
-/// directly — keeps the `backends-builder-vm-libkrun` feature gate
+/// directly — keeps the `builder-vm` feature gate
 /// pure: `install_app_deps` compiles + tests without dragging
 /// libkrun-sys onto every CI runner.
 pub trait InstallDriver {
@@ -585,7 +585,7 @@ fn json_string_escape(s: &str) -> String {
 /// Monotonic-with-pid scratch ID for the per-invocation
 /// `in-progress/<id>/` dir. Same pattern as
 /// `libkrun_builder::unique_job_id` — duplicated here so this
-/// module stays usable without the `backends-builder-vm-libkrun`
+/// module stays usable without the `builder-vm`
 /// feature gate.
 fn unique_scratch_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};

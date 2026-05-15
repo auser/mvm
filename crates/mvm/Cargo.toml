@@ -43,6 +43,10 @@ libc.workspace = true
 
 [features]
 default = []
+contributor-bootstrap = [
+    "mvm-build/contributor-bootstrap",
+    "mvm-backend/contributor-bootstrap",
+]
 manifest-verify = ["mvm-security/manifest-verify"]
 template-registry-s3 = ["dep:opendal"]
 

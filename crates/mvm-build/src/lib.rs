@@ -8,9 +8,9 @@ pub mod firecracker;
 pub mod template_reuse;
 
 /// Plan 72 W1 — libkrun-backed builder VM (gated by
-/// `backends-builder-vm-libkrun`). Currently scaffolding; the actual
+/// `builder-vm`). Currently scaffolding; the actual
 /// VM launch lands in Plan 72 W2–W4. See module-level docs.
-#[cfg(feature = "backends-builder-vm-libkrun")]
+#[cfg(feature = "builder-vm")]
 pub mod libkrun_builder;
 
 pub mod nix;

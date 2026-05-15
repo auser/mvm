@@ -60,6 +60,7 @@ mvm-build.workspace = true
 
 [features]
 default = []
+contributor-bootstrap = []
 
 [lints]
 workspace = true
