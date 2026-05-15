@@ -46,6 +46,7 @@ pub mod microvm;
 pub mod microvm_nix;
 pub mod mock;
 pub mod mock_guest_agent;
+pub mod netinit_audit;
 pub mod network;
 
 pub use apple_container::AppleContainerBackend;
