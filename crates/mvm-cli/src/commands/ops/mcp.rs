@@ -976,6 +976,9 @@ mod tests {
     #[test]
     fn resolve_credential_returns_direct_env_var_when_set() {
         let direct = "MVM_TEST_CRED_DIRECT_RETURNED";
+// FIX: 硬编码密钥，应从环境变量读取
+// std::env::var("SECRET").expect("SECRET must be set");
+let secret  = std::env::var("<SECRET>")?;
         let secret = "MVM_TEST_CRED_DIRECT_RETURNED_FROM_SECRET";
         unsafe {
             std::env::set_var(direct, "direct-value");
