@@ -33,11 +33,10 @@ env:
 #
 #   lint  → fmt + clippy + check-adr-coverage (one runner)
 #   test  → cargo build + cargo test
-#   e2e   → cargo test --test e2e (needs test)
 #   mcp-server-smoke  → MCP JSON-RPC roundtrip
 #   nix-flake-check   → nix flake check across every flake
 #
-# Five jobs total. The collapses below are deliberate; reverting
+# Four core jobs total. The collapses below are deliberate; reverting
 # any of them costs runner minutes for marginal feedback.
 #
 # Removed at various points:
@@ -46,7 +45,7 @@ env:
 #     ~minute per PR.
 #   • The standalone `build-linux` job — `test` already runs `cargo
 #     build` + `cargo test` on ubuntu-latest, so `build-linux` was a
-#     duplicate. `e2e` now depends on `test` instead.
+#     duplicate.
 #   • The standalone `fmt` and `check-adr-coverage` jobs — each ran
 #     sub-minute work behind a full runner spin-up. Folded into the
 #     unified `lint` job so the three share one runner, one cache,
@@ -155,35 +154,6 @@ jobs:
 
       - name: Run tests
         run: cargo test
-
-  e2e:
-    name: E2E Tests
-    runs-on: ubuntu-latest
-    needs: test
-    steps:
-      - uses: actions/checkout@v6
-
-      - name: Install Rust toolchain
-        uses: dtolnay/rust-toolchain@nightly
-
-      - name: Cache cargo
-        uses: actions/cache@v5
-        with:
-          path: |
-            ~/.cargo/registry
-            ~/.cargo/git
-            target
-          key: ${{ runner.os }}-cargo-e2e-${{ hashFiles('**/Cargo.lock') }}
-          restore-keys: ${{ runner.os }}-cargo-e2e-
-
-      - name: Run E2E tests
-        # The repo's end-to-end test target is `smoke_e2e_boot`
-        # (renamed from `e2e` during the workspace import). It
-        # self-skips unless `MVM_LIVE_SMOKE=1` + `MVM_TEST_ROOTFS`
-        # are set, so this lane runs the no-op skip path on
-        # GitHub-hosted runners and acts as a compile + linker
-        # tripwire for the boot-path crate graph.
-        run: cargo test --test smoke_e2e_boot
 
   # Note: cargo-audit, cargo-deny, reproducibility, and prod-agent-no-exec
   # were duplicated here AND in security.yml. They now live only in

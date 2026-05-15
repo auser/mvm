@@ -1,7 +1,7 @@
 # Internal test fixture — NOT a user-facing template.
 #
-# This profile exists so mvm's own smoke tests can boot something
-# (`tests/smoke_microsandbox.rs`, `tests/nix_flake_structure.rs`).
+# This profile exists so mvm's own Nix flake structure tests have a
+# minimal internal fixture (`tests/nix_flake_structure.rs`).
 # It is **not** a starter for user projects. User flakes use
 # `mvm.lib.<system>.mkGuest { … }` to declare a microVM image —
 # see `public/src/content/docs/guides/building-microvm-images.md`

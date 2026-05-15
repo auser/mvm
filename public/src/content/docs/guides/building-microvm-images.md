@@ -51,7 +51,7 @@ mvmctl build              # reads mvm.toml; builds the named flake target
 mvmctl run                # builds (if needed) + boots
 ```
 
-`mvmctl` selects the backend automatically (Firecracker on Linux+KVM, microsandbox on macOS / Linux without KVM). Override with `--hypervisor microsandbox` if you want to force the cross-platform path.
+`mvmctl` selects the backend automatically (Firecracker on Linux+KVM, libkrun on macOS, then Apple Container as the macOS fallback). Override with `--hypervisor libkrun` if you want to force the libkrun path.
 
 If you want to drive `nix build` directly without `mvmctl` in the loop:
 
@@ -169,7 +169,7 @@ The floor is achievable because the rootfs uses **busybox-as-PID-1** with a cust
 The repository's `nix/` directory contains:
 
 - `nix/flake.nix` — exposes `lib.<system>.mkGuest` for your flake to consume.
-- `nix/profiles/minimal.nix` — an **internal** test fixture used by mvm's own smoke tests (`tests/smoke_microsandbox.rs`, `tests/nix_flake_structure.rs`). Not a starter template.
+- `nix/profiles/minimal.nix` — an **internal** test fixture used by mvm's own Nix flake structure tests (`tests/nix_flake_structure.rs`). Not a starter template.
 
 The internal fixture lives under the `internal-` namespace in flake outputs (`nixosConfigurations.internal-minimal-…`, `packages.<system>.internal-minimal-runner`) so the boundary is mechanical: anything `internal-*` is for mvm developers, not for users.
 
