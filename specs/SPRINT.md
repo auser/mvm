@@ -54,6 +54,7 @@ Recent maintenance:
 - [x] Hardened builder-VM image bootstrap policy: source checkouts may reuse an existing local builder image cache, but cache misses now fail closed instead of downloading published builder-VM prebuilts that could mask local `nix/images/builder-vm/` changes.
 - [x] Added the Stage 0 local builder-image bootstrap path: dev images now carry `/sbin/mvm-builder-init`, `LibkrunBuilderVm` accepts an explicit bootstrap image override, and source-checkout builder-cache misses route to a local `nix/images/builder-vm/` build instead of a network artifact fetch.
 - [x] Hardened Stage 0 builder-cache promotion: local builder-image bootstraps now build into a hidden staging directory, validate kernel/rootfs artifacts, and promote into the live cache only after validation succeeds.
+- [x] Bound source-checkout builder-image cache reuse to a SHA-256 fingerprint of `nix/images/builder-vm/{flake.nix,flake.lock}`, so stale but structurally valid builder caches are rebuilt instead of masking local source changes.
 
 ## In-flight workstreams
 
