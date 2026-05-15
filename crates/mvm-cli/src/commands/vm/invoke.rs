@@ -459,6 +459,11 @@ fn exit_code_for(event: &mvm_guest::vsock::EntrypointEvent) -> i32 {
                 // pattern; SIGALRM is repurposed here as a stable
                 // "your session was reaped" signal SDKs can match on.
                 RunEntrypointError::SessionKilled => (142, "session killed"),
+                // Plan 76 Phase 2: transient — entrypoint validation
+                // still in flight. Exit 75 = `EX_TEMPFAIL` so wrapper
+                // scripts can branch on "retry safe" vs. the terminal
+                // failures above.
+                RunEntrypointError::NotReady => (75, "agent not ready"),
                 RunEntrypointError::InternalError => (1, "internal error"),
             };
             ui::warn(&format!("invoke: {label}: {message}"));

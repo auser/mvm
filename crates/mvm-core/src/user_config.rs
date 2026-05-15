@@ -39,8 +39,33 @@ pub struct MvmConfig {
     pub metrics_port: Option<u16>,
     /// URL for remote image catalog. None means use bundled catalog only.
     pub catalog_url: Option<String>,
+    /// Maximum wall-clock seconds `mvmctl up` waits for every guest
+    /// integration's readiness probe to flip to `Active` before giving
+    /// up and leaving `InstanceReadiness` at `ServicesStarting {
+    /// pending }` (ADR-050 §3 / plan 74 W2). VMs with no integrations
+    /// transition to `ServicesReady` immediately; this only matters
+    /// for VMs that declare `after_start.sh` health hooks.
+    ///
+    /// Default: 30 seconds. Override via the `MVM_SERVICES_HEALTH_TIMEOUT_SECS`
+    /// environment variable when ad-hoc tuning beats a config edit.
+    pub services_health_timeout_secs: u64,
     /// Security-related operator preferences (`[security]` section).
     pub security: SecurityConfig,
+}
+
+impl MvmConfig {
+    /// Resolve the effective services-health timeout, honoring an
+    /// `MVM_SERVICES_HEALTH_TIMEOUT_SECS` env-var override over the
+    /// config field. Env-var takes precedence so a single shell
+    /// session can stretch the wait without persisting a change.
+    pub fn effective_services_health_timeout_secs(&self) -> u64 {
+        if let Ok(raw) = std::env::var("MVM_SERVICES_HEALTH_TIMEOUT_SECS")
+            && let Ok(n) = raw.trim().parse::<u64>()
+        {
+            return n;
+        }
+        self.services_health_timeout_secs
+    }
 }
 
 impl Default for MvmConfig {
@@ -53,6 +78,7 @@ impl Default for MvmConfig {
             log_format: None,
             metrics_port: None,
             catalog_url: None,
+            services_health_timeout_secs: 30,
             security: SecurityConfig::default(),
         }
     }
@@ -210,6 +236,38 @@ mod tests {
         assert!(cfg.metrics_port.is_none());
         // Security defaults: ack_docker_tier off — banner emits unless suppressed.
         assert!(!cfg.security.ack_docker_tier);
+        // ADR-050 §3 / plan 74 W2 default: 30 s services-health wait.
+        assert_eq!(cfg.services_health_timeout_secs, 30);
+    }
+
+    #[test]
+    fn test_effective_services_health_timeout_honors_env_var_override() {
+        // Save + restore the env var so the test doesn't leak state.
+        let saved = std::env::var("MVM_SERVICES_HEALTH_TIMEOUT_SECS").ok();
+
+        // Clean slate: with no override, the config field wins.
+        // SAFETY: tests are serial in this module and we restore below.
+        unsafe { std::env::remove_var("MVM_SERVICES_HEALTH_TIMEOUT_SECS") };
+        let cfg = MvmConfig {
+            services_health_timeout_secs: 7,
+            ..MvmConfig::default()
+        };
+        assert_eq!(cfg.effective_services_health_timeout_secs(), 7);
+
+        // With a valid override, the env-var value wins.
+        unsafe { std::env::set_var("MVM_SERVICES_HEALTH_TIMEOUT_SECS", "120") };
+        assert_eq!(cfg.effective_services_health_timeout_secs(), 120);
+
+        // Garbage in the env var falls back to the config field
+        // rather than panicking — operator typos do not break boot.
+        unsafe { std::env::set_var("MVM_SERVICES_HEALTH_TIMEOUT_SECS", "not-a-number") };
+        assert_eq!(cfg.effective_services_health_timeout_secs(), 7);
+
+        // Restore the original env value.
+        match saved {
+            Some(v) => unsafe { std::env::set_var("MVM_SERVICES_HEALTH_TIMEOUT_SECS", v) },
+            None => unsafe { std::env::remove_var("MVM_SERVICES_HEALTH_TIMEOUT_SECS") },
+        }
     }
 
     #[test]

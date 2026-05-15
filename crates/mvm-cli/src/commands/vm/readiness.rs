@@ -8,7 +8,15 @@
 //! unregistered VMs degrade silently with a `tracing::warn` /
 //! `tracing::debug` rather than aborting the launch or shutdown.
 
+use std::time::{Duration, Instant};
+
+use mvm::vsock_transport::{self, VsockTransport};
 use mvm_core::domain::instance::InstanceReadiness;
+use mvm_guest::integrations::{IntegrationStateReport, IntegrationStatus};
+use mvm_guest::vsock::{
+    GUEST_AGENT_PORT, GuestCapability, GuestRequest, GuestResponse, negotiate_protocol,
+    send_request,
+};
 
 /// Persist a host-observed readiness milestone on the VM's registry
 /// entry. Best-effort:
@@ -51,5 +59,163 @@ pub(super) fn record_vm_readiness(vm_name: &str, readiness: InstanceReadiness) {
     }
     if let Err(e) = reg.save(&path) {
         tracing::warn!(err = %e, vm = vm_name, "failed to save VM name registry");
+    }
+}
+
+/// One snapshot of guest integration health observed by the host.
+/// Built from a single `GuestRequest::IntegrationStatus` round-trip so
+/// the host-side transitions are deterministic — there's no "partial
+/// view" where the snapshot has some services missing from the report.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ServicesHealthSnapshot {
+    /// Names of services whose status is anything other than
+    /// `IntegrationStatus::Active`. Sorted for stable readiness
+    /// payloads (the host then renders them into
+    /// `InstanceReadiness::ServicesStarting { pending }`).
+    pending: Vec<String>,
+}
+
+fn classify_services_snapshot(reports: &[IntegrationStateReport]) -> ServicesHealthSnapshot {
+    let mut pending: Vec<String> = reports
+        .iter()
+        .filter(|r| !matches!(r.status, IntegrationStatus::Active))
+        .map(|r| r.name.clone())
+        .collect();
+    pending.sort();
+    ServicesHealthSnapshot { pending }
+}
+
+/// Query guest integration status via the standard `mvm::vsock_transport`
+/// abstraction. Performs the ADR-050 / plan 74 W1 hello prelude on
+/// each connection so the agent dispatches the operational request.
+fn query_services_via_transport(vm_name: &str) -> anyhow::Result<Vec<IntegrationStateReport>> {
+    let transport: Box<dyn VsockTransport> = vsock_transport::for_vm(vm_name)?;
+    let mut stream = transport.connect(GUEST_AGENT_PORT)?;
+    let _ = negotiate_protocol(&mut stream, vec![GuestCapability::IntegrationStatus])?;
+    let resp = send_request(&mut stream, &GuestRequest::IntegrationStatus)?;
+    match resp {
+        GuestResponse::IntegrationStatusReport { integrations } => Ok(integrations),
+        GuestResponse::Error { message } => {
+            anyhow::bail!("guest integration status error: {message}")
+        }
+        other => anyhow::bail!("unexpected response to IntegrationStatus: {other:?}"),
+    }
+}
+
+/// Block until every guest integration reports `Active`, or `timeout`
+/// elapses. Updates the registry's readiness on every transition the
+/// host observes: each tick recomputes a `ServicesHealthSnapshot` and
+/// records either `InstanceReadiness::ServicesStarting { pending }` or
+/// `InstanceReadiness::ServicesReady`.
+///
+/// Best-effort:
+/// - Transport / RPC errors `tracing::debug` and retry on the next
+///   tick (a still-booting agent commonly fails the first few
+///   polls).
+/// - On timeout, the function returns leaving readiness at whatever
+///   the last successful poll observed — `mvmctl ls --json` then
+///   surfaces exactly which services blocked.
+/// - VMs with no integrations transition to `ServicesReady`
+///   immediately (the mock backend exercises this in
+///   `mvm_backend::mock_guest_agent::dispatch`).
+///
+/// # Future: `Degraded` (ADR-050 §3)
+///
+/// Detecting `Degraded { unhealthy }` requires polling *after*
+/// `ServicesReady`. Three follow-up paths are possible — see the
+/// "Plan: `Degraded` follow-up" section of the W2-services-health
+/// PR body. None of them are wired here; once `ServicesReady` fires,
+/// this function returns.
+pub(super) fn wait_for_services_ready(vm_name: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    let poll_interval = Duration::from_secs(1);
+    let mut last_snapshot: Option<ServicesHealthSnapshot> = None;
+
+    loop {
+        match query_services_via_transport(vm_name) {
+            Ok(reports) => {
+                let snapshot = classify_services_snapshot(&reports);
+                let readiness = if snapshot.pending.is_empty() {
+                    InstanceReadiness::ServicesReady
+                } else {
+                    InstanceReadiness::ServicesStarting {
+                        pending: snapshot.pending.clone(),
+                    }
+                };
+                // Only record when the snapshot changed, to avoid
+                // thrashing the registry file every tick when nothing
+                // moved. The first successful poll always records,
+                // since `last_snapshot` is `None`.
+                if last_snapshot.as_ref() != Some(&snapshot) {
+                    record_vm_readiness(vm_name, readiness);
+                    last_snapshot = Some(snapshot.clone());
+                }
+                if snapshot.pending.is_empty() {
+                    return;
+                }
+            }
+            Err(e) => {
+                tracing::debug!(
+                    err = %e,
+                    vm = vm_name,
+                    "services-ready poll failed; will retry"
+                );
+            }
+        }
+
+        if Instant::now() >= deadline {
+            tracing::debug!(
+                vm = vm_name,
+                "services-ready poll timed out; leaving readiness at last-known state"
+            );
+            return;
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use mvm_guest::integrations::IntegrationStateReport;
+
+    fn report(name: &str, status: IntegrationStatus) -> IntegrationStateReport {
+        IntegrationStateReport {
+            name: name.to_string(),
+            status,
+            last_checkpoint_at: None,
+            state_size_bytes: 0,
+            health: None,
+        }
+    }
+
+    #[test]
+    fn snapshot_empty_list_has_no_pending() {
+        let snap = classify_services_snapshot(&[]);
+        assert!(snap.pending.is_empty());
+    }
+
+    #[test]
+    fn snapshot_all_active_has_no_pending() {
+        let reports = vec![
+            report("postgres", IntegrationStatus::Active),
+            report("redis", IntegrationStatus::Active),
+        ];
+        let snap = classify_services_snapshot(&reports);
+        assert!(snap.pending.is_empty());
+    }
+
+    #[test]
+    fn snapshot_collects_non_active_into_pending_and_sorts() {
+        let reports = vec![
+            report("redis", IntegrationStatus::Active),
+            report("worker", IntegrationStatus::Starting),
+            report("postgres", IntegrationStatus::Pending),
+            report("queue", IntegrationStatus::Paused),
+            report("api", IntegrationStatus::Error("502".to_string())),
+        ];
+        let snap = classify_services_snapshot(&reports);
+        // Sorted alphabetically for stable readiness payloads.
+        assert_eq!(snap.pending, vec!["api", "postgres", "queue", "worker"]);
     }
 }

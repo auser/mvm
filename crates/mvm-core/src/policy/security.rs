@@ -65,6 +65,46 @@ pub struct SessionHelloAck {
 }
 
 // ============================================================================
+// Agent profile (plan 76 Phase 1)
+// ============================================================================
+
+/// Profile baked into an mvm guest image. Determines the set of vsock
+/// verbs the guest agent's dispatcher will accept; dev-only verbs
+/// (`Exec`, `ConsoleOpen`, `ProcStart`, `RunCode`, filesystem RPC,
+/// port forwarding) are rejected pre-handler when the image declares
+/// `SealedProd`.
+///
+/// **Source of truth.** The profile is declared by the image config
+/// — `/etc/mvm/security.json` on a sealed-prod image lives on a
+/// dm-verity rootfs (ADR-002 §W3), so the value cannot be widened at
+/// runtime: any modification breaks the verity hash and the kernel
+/// panics in `mvm-verity-init` before userspace. The loader treats
+/// absence of the policy file as an unprovisioned dev image
+/// (`SecurityPolicy::dev_defaults`).
+///
+/// **Builder uses a different protocol.** `mvm-builder-agent`'s wire
+/// type is `BuilderRequest`, not `GuestRequest`; the `Builder`
+/// profile is reserved for any future `GuestRequest` variant that
+/// only makes sense during a build. No current variant is
+/// `BuilderOnly`, so the value is wire-stable but unused for the
+/// tenant agent today.
+#[derive(Debug, Default, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum AgentProfile {
+    /// Hardened production guest. Only ADR-002 production-safe verbs
+    /// pass the dispatcher gate.
+    #[default]
+    SealedProd,
+    /// Development guest. Adds shell exec, process RPC, filesystem
+    /// RPC, console, port forwarding, and `RunCode`.
+    Dev,
+    /// Builder-VM agent. Reserved for `BuilderOnly`-classified verbs
+    /// when the builder protocol moves to `GuestRequest`; today the
+    /// builder agent speaks `BuilderRequest` exclusively.
+    Builder,
+}
+
+// ============================================================================
 // Security policy
 // ============================================================================
 
@@ -81,6 +121,12 @@ pub struct SecurityPolicy {
     /// Set to false only for dev/testing environments.
     #[serde(default = "default_true")]
     pub require_auth: bool,
+
+    /// Image profile (plan 76 Phase 1). Drives the agent's dispatcher
+    /// allowlist. Defaults to `SealedProd` for a serialized policy
+    /// that omits the field; `dev_defaults()` constructs with `Dev`.
+    #[serde(default)]
+    pub profile: AgentProfile,
 
     /// Access control toggles.
     #[serde(default)]
@@ -103,6 +149,7 @@ impl Default for SecurityPolicy {
     fn default() -> Self {
         Self {
             require_auth: true,
+            profile: AgentProfile::SealedProd,
             access: AccessPolicy::default(),
             rate_limits: RateLimitPolicy::default(),
             session: SessionPolicy::default(),
@@ -117,6 +164,7 @@ impl SecurityPolicy {
     pub fn dev_defaults() -> Self {
         Self {
             require_auth: false,
+            profile: AgentProfile::Dev,
             access: AccessPolicy {
                 console: true,
                 ..AccessPolicy::default()
@@ -469,6 +517,7 @@ mod tests {
         let policy = SecurityPolicy::default();
 
         assert!(policy.require_auth);
+        assert_eq!(policy.profile, AgentProfile::SealedProd);
         assert!(policy.access.filesystem);
         assert!(policy.access.network);
         assert!(policy.access.build);
@@ -477,6 +526,44 @@ mod tests {
         assert_eq!(policy.rate_limits.frames_per_minute, 3000);
         assert_eq!(policy.session.max_lifetime_secs, 0);
         assert_eq!(policy.session.max_tasks, 0);
+    }
+
+    #[test]
+    fn test_agent_profile_serde_kebab_case() {
+        // Wire format is kebab-case so a hand-written policy JSON can
+        // use the friendlier `"sealed-prod"` / `"dev"` / `"builder"`.
+        assert_eq!(
+            serde_json::to_string(&AgentProfile::SealedProd).unwrap(),
+            "\"sealed-prod\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentProfile::Dev).unwrap(),
+            "\"dev\""
+        );
+        assert_eq!(
+            serde_json::to_string(&AgentProfile::Builder).unwrap(),
+            "\"builder\""
+        );
+
+        let p: AgentProfile = serde_json::from_str("\"sealed-prod\"").unwrap();
+        assert_eq!(p, AgentProfile::SealedProd);
+    }
+
+    #[test]
+    fn test_security_policy_dev_defaults_carries_dev_profile() {
+        let policy = SecurityPolicy::dev_defaults();
+        assert_eq!(policy.profile, AgentProfile::Dev);
+        assert!(!policy.require_auth);
+        assert!(policy.access.console);
+    }
+
+    #[test]
+    fn test_security_policy_missing_profile_field_is_sealed_prod() {
+        // An older or hand-rolled policy file that omits `profile`
+        // must NOT silently widen to `Dev`. ADR-002 fail-closed.
+        let json = "{}";
+        let policy: SecurityPolicy = serde_json::from_str(json).unwrap();
+        assert_eq!(policy.profile, AgentProfile::SealedProd);
     }
 
     #[test]
@@ -511,6 +598,7 @@ mod tests {
     fn test_security_policy_full_roundtrip() {
         let policy = SecurityPolicy {
             require_auth: true,
+            profile: AgentProfile::SealedProd,
             access: AccessPolicy {
                 filesystem: false,
                 network: true,
@@ -538,6 +626,7 @@ mod tests {
         let parsed: SecurityPolicy = serde_json::from_str(&json).unwrap();
 
         assert!(parsed.require_auth);
+        assert_eq!(parsed.profile, AgentProfile::SealedProd);
         assert!(!parsed.access.filesystem);
         assert!(!parsed.access.build);
         assert_eq!(parsed.rate_limits.frames_per_second, 200);

@@ -27,6 +27,96 @@ The agent communicates using **length-prefixed JSON frames** over vsock (Firecra
 
 Request types: `ping`, `status`, `sleep-prep`, `wake`, and more.
 
+## Profile gate
+
+Every guest image declares an **agent profile** in its
+`/etc/mvm/security.json` (plan 76 Phase 1). The profile is the
+dispatcher-side allowlist for vsock verbs — dev-only requests
+sent to a sealed-prod agent are rejected before any handler runs:
+
+| Profile | Effective verb set | Used by |
+|---------|-------------------|---------|
+| `sealed-prod` (default) | Lifecycle, status, entrypoint, sleep/wake, volume mount/unmount, idle-timeout updates. The full ADR-002 production-safe surface. | Production images. The policy file lives on a dm-verity rootfs (ADR-002 §W3) so the profile cannot be widened at runtime. |
+| `dev` | `sealed-prod` plus shell `Exec`, process RPC, filesystem RPC, console PTY, port forwarding, and `RunCode`. | `mvmctl dev` images and any image built with `dev-shell` feature. |
+| `builder` | Reserved for builder-only verbs. The current builder agent speaks a separate `BuilderRequest` protocol, so this profile is wire-stable but unused for the tenant agent. | Future builder VM agent if/when its verbs land on the tenant wire. |
+
+Rejected requests return a typed `UnsupportedInProfile` response:
+
+```json
+{ "UnsupportedInProfile": { "profile": "sealed-prod", "verb": "Exec" } }
+```
+
+SDK callers can branch on capability without parsing message text —
+this is the protocol-layer analog of
+`ProcErrorKind::UnsupportedInProduction` for process RPC.
+
+The profile gate is **complementary** to the existing compile-time
+gate (`#[cfg(feature = "dev-shell")]` for `do_exec` / `do_run_code` /
+process RPC handlers per ADR-002 §W4.3, claim 4). The compile-time
+gate keeps the handler symbols *absent* from production binaries; the
+profile gate keeps the dispatcher *reachable but refusing* for dev
+verbs in sealed-prod. Both checks run on every request.
+
+## Readiness model
+
+Plan 76 Phase 2 binds the vsock control port **before** entrypoint
+validation and warm-process pool startup. Phase 3 extends the same
+pattern to integration / probe drop-in scans. The agent accepts
+`Ping` / `ReadinessStatus` / `EntrypointStatus` immediately, and
+`RunEntrypoint` returns a typed `RunEntrypointError::NotReady` until
+entrypoint validation completes.
+
+Background init threads in order of when they start:
+
+1. Entrypoint validation → warm-pool startup (serial inside one
+   thread because the pool depends on `VALIDATED_ENTRYPOINT`).
+2. Integration drop-in scan + health-loop spawn.
+3. Probe drop-in scan + probe-loop spawn.
+
+All three run in parallel after the accept loop is already serving
+control-plane traffic. A malformed drop-in cannot block bind or
+delay `Ping`; a slow `after_start.sh` only delays
+`warm_pool_ready_ms`, not the rest of the readiness report.
+
+A host queries the live state via the `ReadinessStatus` verb:
+
+```json
+{
+  "ReadinessStatusReport": {
+    "control_plane": "ready",
+    "entrypoint": "starting",
+    "warm_pool": "disabled",
+    "integrations": "ready",
+    "probes": "disabled",
+    "volumes": "disabled",
+    "profile": "sealed-prod",
+    "boot_millis": {
+      "agent_started_ms": 7,
+      "vsock_bound_ms": 7,
+      "first_accept_ms": 12,
+      "entrypoint_ready_ms": null,
+      "warm_pool_ready_ms": null,
+      "integrations_ready_ms": null,
+      "probes_ready_ms": null
+    }
+  }
+}
+```
+
+`ComponentState` values:
+
+| State | Meaning |
+|-------|---------|
+| `disabled` | Subsystem isn't configured for this image (no policy → no state machine to advance). Distinct from `ready` so the host can tell "image opted out" from "still warming". |
+| `starting` | Background init in progress. `RunEntrypoint` while `entrypoint = starting` returns `NotReady` — the host should poll readiness and retry. |
+| `ready` | Subsystem is up and accepting work. |
+| `failed` | Subsystem failed to initialize. Carries a short human-readable `message` (no secrets, no host paths the caller doesn't already know). For `entrypoint`, this maps to `RunEntrypoint` returning the existing `EntrypointInvalid`. |
+
+`BootTimingReport` exposes monotonic milliseconds since agent
+process start. Phase 4 fills in the remaining fields
+(`warm_pool_ready_ms`, `integrations_ready_ms`, `probes_ready_ms`);
+the four populated today are enough to surface cold-path regressions.
+
 ## Health Checks
 
 Health checks defined in `mkGuest`'s `healthChecks` parameter are automatically written to `/etc/mvm/integrations.d/` at build time:

@@ -957,6 +957,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         build_mode,
         workload_ir_path: args.from_workload_ir.as_deref(),
         up_json: args.up_json,
+        services_health_timeout_secs: cfg.effective_services_health_timeout_secs(),
     })?;
 
     // Plan 73 Followup H-live: after a successful boot, emit a
@@ -1058,6 +1059,15 @@ pub(in crate::commands) struct RunParams<'a> {
     /// generated VM id + the template's `build_mode` through to
     /// subsequent `proc start` / `fs write` / `down` calls.
     pub(super) up_json: bool,
+    /// Resolved services-health wait timeout for ADR-050 §3 / plan 74
+    /// W2 (`InstanceReadiness::ServicesStarting` →
+    /// `InstanceReadiness::ServicesReady`). Comes from
+    /// `MvmConfig::effective_services_health_timeout_secs()` so an
+    /// `MVM_SERVICES_HEALTH_TIMEOUT_SECS` env-var override or a
+    /// `services_health_timeout_secs = N` line in
+    /// `~/.mvm/config.toml` flow through without `cmd_run` itself
+    /// re-reading the config.
+    pub(super) services_health_timeout_secs: u64,
 }
 
 pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
@@ -1093,6 +1103,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         build_mode,
         workload_ir_path,
         up_json: _up_json,
+        services_health_timeout_secs,
     } = params;
     let _span =
         tracing::info_span!("cmd_run", name = ?name, cpus = ?cpus, memory_mib = ?memory).entered();
@@ -1265,25 +1276,40 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         // MVM_DIRECT_BOOT + `--hypervisor mock`.
         mvm_core::audit_emit!(VmStart, vm: &vm_name);
 
-        // Set up port forwarding from MVM_PORTS env var (via vsock)
-        if let Ok(ports_str) = std::env::var("MVM_PORTS")
+        // ADR-050 §3 / plan 74 W2 (services-health): wait for the
+        // guest agent unconditionally, then poll integration health.
+        // The wait was previously gated on `MVM_PORTS` because port
+        // forwarding was the only existing reason to block here. The
+        // gate moved off — every up now records `AgentConnecting` /
+        // `AgentReady` / `ServicesStarting` / `ServicesReady` so
+        // `mvmctl ls --json` shows a useful wait reason for every
+        // VM, not just port-forwarded ones.
+        ui::info("Waiting for guest agent...");
+        record_vm_readiness(&vm_name, InstanceReadiness::AgentConnecting);
+        let agent_ready = wait_for_guest_agent(&vm_name, 30);
+        if agent_ready {
+            record_vm_readiness(&vm_name, InstanceReadiness::AgentReady);
+            let timeout = std::time::Duration::from_secs(services_health_timeout_secs);
+            super::readiness::wait_for_services_ready(&vm_name, timeout);
+        } else {
+            ui::warn("Guest agent not reachable.");
+        }
+
+        // Set up port forwarding from MVM_PORTS env var (via vsock).
+        // Requires the agent — skip silently if the wait above gave
+        // up.
+        if agent_ready
+            && let Ok(ports_str) = std::env::var("MVM_PORTS")
             && !ports_str.is_empty()
         {
-            ui::info("Waiting for guest agent...");
-            record_vm_readiness(&vm_name, InstanceReadiness::AgentConnecting);
-            if wait_for_guest_agent(&vm_name, 30) {
-                record_vm_readiness(&vm_name, InstanceReadiness::AgentReady);
-                for spec in ports_str.split(',') {
-                    if let Some((host, guest)) = spec.split_once(':')
-                        && let (Ok(h), Ok(g)) = (host.parse::<u16>(), guest.parse::<u16>())
-                    {
-                        let _ = request_port_forward(&vm_name, g);
-                        mvm_providers::apple_container::start_port_proxy(&vm_name, h, g);
-                        ui::info(&format!("Forwarding localhost:{h} → guest tcp/{g} (vsock)"));
-                    }
+            for spec in ports_str.split(',') {
+                if let Some((host, guest)) = spec.split_once(':')
+                    && let (Ok(h), Ok(g)) = (host.parse::<u16>(), guest.parse::<u16>())
+                {
+                    let _ = request_port_forward(&vm_name, g);
+                    mvm_providers::apple_container::start_port_proxy(&vm_name, h, g);
+                    ui::info(&format!("Forwarding localhost:{h} → guest tcp/{g} (vsock)"));
                 }
-            } else {
-                ui::warn("Guest agent not reachable — port forwarding unavailable.");
             }
         }
 
@@ -1718,63 +1744,69 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
     // Apple Virtualization VMs live in-process — the process must stay alive.
     if effective_hypervisor == "apple-container" && !detach {
-        // Set up port forwarding via vsock (no guest IP needed).
-        // 1. Wait for guest agent to be ready on `GUEST_AGENT_PORT` (5252)
-        // 2. Tell the agent to start vsock→TCP forwarders for each port
-        // 3. Start host-side TCP→vsock proxies
-        if has_ports {
+        // ADR-050 §3 / plan 74 W2 (services-health): wait for the
+        // guest agent unconditionally (was previously gated on
+        // `has_ports`), then poll integration health. Every Apple
+        // Container up now records `AgentConnecting` / `AgentReady`
+        // / `ServicesStarting` / `ServicesReady`, so `mvmctl ls
+        // --json` shows a useful wait reason for every VM.
+        ui::info("Waiting for guest agent...");
+        record_vm_readiness(&vm_name_owned, InstanceReadiness::AgentConnecting);
+        let agent_ready = wait_for_guest_agent(&vm_name_owned, 30);
+        if agent_ready {
+            record_vm_readiness(&vm_name_owned, InstanceReadiness::AgentReady);
+            let timeout = std::time::Duration::from_secs(services_health_timeout_secs);
+            super::readiness::wait_for_services_ready(&vm_name_owned, timeout);
+        } else {
+            ui::warn("Guest agent not reachable.");
+        }
+
+        // Set up port forwarding via vsock (no guest IP needed) —
+        // requires the agent, so only when the wait above succeeded
+        // AND there are ports to forward.
+        if agent_ready && has_ports {
             let pm_list = parse_port_specs(ports).unwrap_or_default();
 
-            ui::info("Waiting for guest agent...");
-            record_vm_readiness(&vm_name_owned, InstanceReadiness::AgentConnecting);
-            let agent_ready = wait_for_guest_agent(&vm_name_owned, 30);
-            if !agent_ready {
-                ui::warn("Guest agent not reachable — port forwarding unavailable.");
-            } else {
-                record_vm_readiness(&vm_name_owned, InstanceReadiness::AgentReady);
-                // Tell guest agent to start vsock forwarders
-                for pm in &pm_list {
-                    match request_port_forward(&vm_name_owned, pm.guest) {
-                        Ok(vsock_port) => {
-                            ui::info(&format!(
-                                "Guest forwarding vsock:{vsock_port} → tcp/{}",
-                                pm.guest
-                            ));
-                        }
-                        Err(e) => {
-                            ui::warn(&format!(
-                                "Failed to set up guest forwarder for port {}: {e}",
-                                pm.guest
-                            ));
-                        }
+            // Tell guest agent to start vsock forwarders
+            for pm in &pm_list {
+                match request_port_forward(&vm_name_owned, pm.guest) {
+                    Ok(vsock_port) => {
+                        ui::info(&format!(
+                            "Guest forwarding vsock:{vsock_port} → tcp/{}",
+                            pm.guest
+                        ));
+                    }
+                    Err(e) => {
+                        ui::warn(&format!(
+                            "Failed to set up guest forwarder for port {}: {e}",
+                            pm.guest
+                        ));
                     }
                 }
-
-                // Start host-side proxies
-                for pm in &pm_list {
-                    mvm_providers::apple_container::start_port_proxy(
-                        &vm_name_owned,
-                        pm.host,
-                        pm.guest,
-                    );
-                    ui::info(&format!(
-                        "Forwarding localhost:{} → guest tcp/{} (vsock)",
-                        pm.host, pm.guest
-                    ));
-                }
-
-                // Persist port mappings so `ps` can display them
-                let ports_str: Vec<String> = pm_list
-                    .iter()
-                    .map(|p| format!("{}:{}", p.host, p.guest))
-                    .collect();
-                let ports_file = format!(
-                    "{}/.mvm/vms/{}/ports",
-                    std::env::var("HOME").unwrap_or_default(),
-                    vm_name_owned
-                );
-                let _ = std::fs::write(&ports_file, ports_str.join(","));
             }
+
+            // Start host-side proxies
+            for pm in &pm_list {
+                mvm_providers::apple_container::start_port_proxy(&vm_name_owned, pm.host, pm.guest);
+                ui::info(&format!(
+                    "Forwarding localhost:{} → guest tcp/{} (vsock)",
+                    pm.host, pm.guest
+                ));
+            }
+
+            // Persist port mappings so `ps` can display them
+            let ports_str: Vec<String> = pm_list
+                .iter()
+                .map(|p| format!("{}:{}", p.host, p.guest))
+                .collect();
+            let ports_file = format!(
+                "{}/.mvm/vms/{}/ports",
+                std::env::var("HOME").unwrap_or_default(),
+                vm_name_owned
+            );
+            let _ = std::fs::write(&ports_file, ports_str.join(","));
+        } else if !agent_ready && has_ports {
+            ui::warn("Port forwarding unavailable — guest agent not reachable.");
         }
 
         ui::info(&format!(
