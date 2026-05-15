@@ -1074,10 +1074,7 @@ mod tests {
             // on `kind == "stage0_boot"` etc., so the snake-case
             // mapping needs a pinned regression test.
             (LocalAuditKind::Stage0Boot, "stage0_boot"),
-            (
-                LocalAuditKind::Stage0CachePromoted,
-                "stage0_cache_promoted",
-            ),
+            (LocalAuditKind::Stage0CachePromoted, "stage0_cache_promoted"),
             (LocalAuditKind::Stage0Failed, "stage0_failed"),
         ];
         for (kind, expected) in kinds_and_strings {

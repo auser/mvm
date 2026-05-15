@@ -2064,10 +2064,7 @@ fn run_stage0_bootstrap(
 /// against unrelated `dev up` runs without exposing the full digest.
 #[cfg(feature = "builder-vm")]
 fn stage0_fingerprint_prefix(source_fingerprint: &str) -> String {
-    source_fingerprint
-        .chars()
-        .take(8)
-        .collect::<String>()
+    source_fingerprint.chars().take(8).collect::<String>()
 }
 
 /// Plan 77 W3: condense an `anyhow::Error` into the short single-line
@@ -2093,7 +2090,6 @@ fn stage0_failure_reason_summary(err: &anyhow::Error) -> String {
     let truncated: String = cleaned.chars().take(160).collect();
     truncated
 }
-
 
 #[cfg(not(feature = "builder-vm"))]
 fn bootstrap_builder_vm_image_via_dev_image_stage0(
@@ -3499,8 +3495,7 @@ mod builder_vm_bootstrap_tests {
         let (stage, err) = result.expect_err("non-UTF-8 staging dir must fail");
         assert!(matches!(stage, Stage0FailureStage::Build));
         assert!(
-            err.to_string().contains("non-UTF-8")
-                || err.to_string().contains("not valid UTF-8"),
+            err.to_string().contains("non-UTF-8") || err.to_string().contains("not valid UTF-8"),
             "unexpected error: {err}"
         );
     }
