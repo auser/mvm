@@ -52,8 +52,14 @@
   #   persistent `/nix` store) + util-linux (`mount`, `umount`,
   #   `losetup`).
   # - iproute2 (used by `udhcpc` and friends; small).
-  # - **No** `iptables` / `procps`-interactive / `less` per the
-  #   plan's slimming directive.
+  # - iptables — Plan 73 Followup B.2.y / ADR-047 defense-in-
+  #   depth: `mvm-builder-init` installs an OUTPUT-chain
+  #   default-deny + uid-owner ACCEPT for `mvm-egress-proxy`
+  #   (uid 1801), so a build step that ignores `HTTP_PROXY`
+  #   cannot reach upstream. See
+  #   `crates/mvm-builder-init/src/network.rs`.
+  # - **No** `procps`-interactive / `less` per the plan's
+  #   slimming directive.
   # - `mvm-builder-init` mounted at `/sbin/mvm-builder-init` via
   #   `extraFiles`. The kernel cmdline (`cmdline.txt` output)
   #   sets `init=/sbin/mvm-builder-init` so this becomes PID 1.
@@ -143,6 +149,10 @@
         curl
         jq
         iproute2
+        # iptables — installed at boot by mvm-builder-init's
+        # network::install_egress_lockdown (Plan 73 Followup
+        # B.2.y / ADR-047). FATAL if absent.
+        iptables
         e2fsprogs
         util-linux
         # Plan 73 Followup B.2 — app-deps install pipeline.

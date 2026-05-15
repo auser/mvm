@@ -75,6 +75,8 @@ mod install;
 #[allow(dead_code)]
 mod install_spec;
 #[allow(dead_code)]
+mod network;
+#[allow(dead_code)]
 mod proxy;
 
 fn main() -> ExitCode {
@@ -242,6 +244,28 @@ mod linux {
         // we don't abort the build for them.
         let _ = track_b.join();
         let _ = track_c.join();
+
+        // In-guest egress lockdown — Plan 73 Followup B.2.y /
+        // ADR-047 defense-in-depth. Installs iptables OUTPUT
+        // default-deny + proxy-uid-only ACCEPT so a build step
+        // that ignores HTTP_PROXY env vars cannot bypass
+        // `mvm-egress-proxy`. FATAL on failure — without these
+        // rules the builder VM's egress allowlist is unenforced
+        // and ADR-002's Claim 9 transitive trust onto the
+        // builder VM has no defense layer. (Note: this is
+        // installed even when `setup_network()` failed, because
+        // the rules don't depend on a working IP address —
+        // offline builds still need the policy in place in case
+        // a substituter URL is reached via cache rather than
+        // network.)
+        if let Err(e) = crate::network::install_egress_lockdown(
+            &crate::network::SystemIptables,
+            crate::network::PROXY_UID,
+        ) {
+            eprintln!("mvm-builder-init: egress lockdown FAILED (fatal): {e}");
+            write_result(2, &format!("egress lockdown failed: {e}"));
+            return power_off();
+        }
 
         // Plan 73 Followup B.2 dispatch: install jobs hand the init
         // binary a structured spec rather than a shell script. We

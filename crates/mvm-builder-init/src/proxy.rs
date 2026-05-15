@@ -34,6 +34,8 @@
 //! around the allowlist. Tracked as B.2.y in plan 73.
 
 use std::net::{SocketAddr, TcpStream};
+#[cfg(target_os = "linux")]
+use std::os::unix::process::CommandExt;
 use std::path::PathBuf;
 use std::process::{Child, Command, Stdio};
 use std::time::{Duration, Instant};
@@ -113,6 +115,14 @@ impl ProxyLifecycle for ChildProxyLifecycle {
         // informational, not contractually consumed.
         cmd.stdout(Stdio::null());
         cmd.stderr(Stdio::inherit());
+        // Drop to the dedicated low-priv uid that the in-VM
+        // iptables OUTPUT rule matches (Plan 73 Followup B.2.y).
+        // Without this the proxy inherits PID 1's uid (root) and
+        // the `--uid-owner` rule wouldn't match, so the lockdown
+        // would block the proxy too. Linux-only: macOS dev/test
+        // builds don't run the lockdown.
+        #[cfg(target_os = "linux")]
+        cmd.uid(crate::network::PROXY_UID);
         let child = cmd
             .spawn()
             .map_err(|e| format!("spawn `{}`: {e}", self.program.display()))?;
