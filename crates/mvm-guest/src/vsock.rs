@@ -788,11 +788,27 @@ pub enum ProcWaitEvent {
         kind: ProcErrorKind,
         message: String,
     },
+    /// A streaming resource is throttled (ADR-050 §5 / plan 74 W4).
+    /// **Non-terminal.** The agent emits this on the rising edge of
+    /// a backpressure condition — typically the host-side stdout/
+    /// stderr buffer crossing its high-water mark. The wait loop
+    /// continues; subsequent `Stdout` / `Stderr` / terminal events
+    /// signal that flow has resumed.
+    ///
+    /// `detail` is a bounded, redacted human-readable hint
+    /// (operator-facing). It **never** carries argv, env, stdin,
+    /// stdout, stderr, or filesystem paths — see ADR-050's payload
+    /// invariant.
+    Backpressure {
+        reason: mvm_core::domain::instance::BackpressureReason,
+        detail: String,
+    },
 }
 
 impl ProcWaitEvent {
     /// Returns true if this event terminates the response stream
-    /// for one `ProcWait` call.
+    /// for one `ProcWait` call. `Backpressure` is non-terminal —
+    /// the wait loop continues after the agent emits it.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -2679,6 +2695,46 @@ mod tests {
                 message: String::new(),
             }
             .is_terminal()
+        );
+        // ADR-050 §5 / plan 74 W4: `Backpressure` is non-terminal.
+        // The wait loop continues after the agent emits it.
+        assert!(
+            !ProcWaitEvent::Backpressure {
+                reason: mvm_core::domain::instance::BackpressureReason::OutputConsumerSlow,
+                detail: "captured output 12345 bytes ≥ 12288 byte high-water (cap 16384 bytes)"
+                    .to_string(),
+            }
+            .is_terminal()
+        );
+    }
+
+    /// ADR-050 §5 / plan 74 W4: the `Backpressure` variant
+    /// roundtrips through serde with its full nested shape and
+    /// `BackpressureReason` snake-case discriminant intact, and
+    /// rejects unknown fields like every other host↔guest type.
+    #[test]
+    fn test_proc_wait_event_backpressure_serde_roundtrip() {
+        let ev = ProcWaitEvent::Backpressure {
+            reason: mvm_core::domain::instance::BackpressureReason::OutputConsumerSlow,
+            detail: "captured output 12345 bytes ≥ 12288 byte high-water (cap 16384 bytes)"
+                .to_string(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let parsed: ProcWaitEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ev);
+        // The reason discriminant ships snake_case on the wire so
+        // CLI / Studio / MCP renderers can pattern-match on string
+        // form without taking a typed dependency on mvm-core.
+        assert!(
+            json.contains("\"output_consumer_slow\""),
+            "wire payload missing snake_case reason: {json}"
+        );
+
+        let smuggled =
+            r#"{"Backpressure":{"reason":"output_consumer_slow","detail":"x","extra":1}}"#;
+        assert!(
+            serde_json::from_str::<ProcWaitEvent>(smuggled).is_err(),
+            "Backpressure must reject unknown fields"
         );
     }
 
