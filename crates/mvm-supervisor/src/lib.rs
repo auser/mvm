@@ -88,6 +88,9 @@ pub use circuit_breaker::{
 pub use destination::DestinationPolicy;
 pub use egress::{EgressDecision, EgressError, EgressProxy, NoopEgressProxy};
 pub use event_bus::{DEFAULT_CAPACITY as EVENT_BUS_DEFAULT_CAPACITY, EventBus, LifecycleEvent};
+#[cfg(any(target_os = "linux", test))]
+pub use firewall::linux_nft::{CommandNftApplier, LinuxNftFirewall, NftApplier, NftError};
+pub use firewall::{FirewallEnforcer, FirewallError, FirewallSpec, NoopFirewallEnforcer};
 #[cfg(feature = "custom-dns")]
 pub use hickory_dns::HickoryDnsResolver;
 pub use injection_guard::{InjectionGuard, InjectionRule, RuleFamily};

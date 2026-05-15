@@ -583,6 +583,7 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
 /// substituted with the prebuilt, since the prebuilt would mask local
 /// rootfs changes.
 fn ensure_dev_image() -> Result<(String, String)> {
+    #[cfg(feature = "backends-builder-vm-libkrun")]
     let local_flake = find_dev_image_flake().ok();
 
     // Plan 72 W5.B + W5.C — source-checkout dispatch.
@@ -1702,6 +1703,7 @@ fn download_file(url: &str, dest: &str) -> Result<()> {
 /// "double-prefix attribute" `nix build` failure inside the
 /// sandbox. The bail signals `ensure_dev_image` to take the
 /// published-prebuilt download path (W5.1 — hash-verified).
+#[cfg(feature = "backends-builder-vm-libkrun")]
 fn find_dev_image_flake() -> Result<String> {
     let manifest_dir = env!("CARGO_MANIFEST_DIR");
     let workspace_root = std::path::Path::new(manifest_dir)
