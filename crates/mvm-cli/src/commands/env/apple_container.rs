@@ -1862,14 +1862,43 @@ fn bootstrap_builder_vm_image() -> Result<()> {
             .context("building the source-checkout builder VM image")
         }
         BuilderVmBootstrapAction::DownloadPublished => {
-            ui::info(&format!(
-                "Builder VM image not in cache; downloading published prebuilt for v{}...",
-                env!("CARGO_PKG_VERSION")
-            ));
-            std::fs::create_dir_all(&out_dir)
-                .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
-            download_builder_vm_image(arch, &out_dir).context("downloading the builder VM image")
+            perform_builder_vm_download_published(arch, &out_dir)
         }
+    }
+}
+
+/// Plan 77 W4: the only call site that can invoke the published-prebuilt
+/// download path. Gated behind `release-artifact-bootstrap`. Contributor
+/// builds (the default) hit the `cfg(not(...))` arm and bail structurally
+/// — even if the resolver routed here, the function refuses to touch the
+/// network. End-user-binary release builds opt in at compile time.
+///
+/// Extracted from [`bootstrap_builder_vm_image`] specifically so the
+/// fail-closed shape is unit-testable.
+fn perform_builder_vm_download_published(arch: &str, out_dir: &str) -> Result<()> {
+    #[cfg(feature = "release-artifact-bootstrap")]
+    {
+        ui::info(&format!(
+            "Builder VM image not in cache; downloading published prebuilt for v{}...",
+            env!("CARGO_PKG_VERSION")
+        ));
+        std::fs::create_dir_all(out_dir)
+            .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
+        download_builder_vm_image(arch, out_dir).context("downloading the builder VM image")
+    }
+    #[cfg(not(feature = "release-artifact-bootstrap"))]
+    {
+        let _ = (arch, out_dir);
+        anyhow::bail!(
+            "Builder VM image is missing and no in-repo builder VM flake \
+             was found. This `mvmctl` binary was built without the \
+             `release-artifact-bootstrap` feature, so it cannot pull a \
+             published prebuilt from GitHub releases (per Plan 77 W4 and \
+             the AGENTS.md / CLAUDE.md invariant). \
+             Run from a source checkout that has \
+             `nix/images/builder-vm/flake.nix`, or rebuild `mvmctl` with \
+             `--features release-artifact-bootstrap` (release-cut binaries only)."
+        );
     }
 }
 
@@ -2246,7 +2275,13 @@ fn promote_builder_vm_stage0_cache(
 /// downloads with a fallback at the `mvm-build` consumer
 /// (`ensure_builder_vm_image` uses the canonical Plan 72 §W2 cmdline
 /// when `cmdline.txt` is missing).
-#[allow(dead_code)]
+///
+/// Plan 77 W4: gated behind `release-artifact-bootstrap`. Contributor
+/// builds (default) never compile this in, so the "no flake + cache
+/// miss" branch in [`bootstrap_builder_vm_image`] has no escape hatch
+/// and surfaces a hard error. End-user-binary release builds opt in
+/// at compile time via `--features release-artifact-bootstrap`.
+#[cfg(feature = "release-artifact-bootstrap")]
 fn download_builder_vm_image(arch: &str, cache_dir: &str) -> Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let names = builder_vm_artifact_names(arch);
@@ -2309,8 +2344,9 @@ fn download_builder_vm_image(arch: &str, cache_dir: &str) -> Result<()> {
 /// Per-arch artifact filenames the release workflow's
 /// `builder-vm-image` job uploads. Pure function — no I/O, no
 /// network — so the unit test can verify naming matches the
-/// release.yml side without touching the network.
-#[allow(dead_code)]
+/// release.yml side without touching the network. Gated together
+/// with [`download_builder_vm_image`] (Plan 77 W4).
+#[cfg(any(feature = "release-artifact-bootstrap", test))]
 struct BuilderVmArtifactNames {
     kernel: String,
     rootfs: String,
@@ -2319,7 +2355,7 @@ struct BuilderVmArtifactNames {
     checksums: String,
 }
 
-#[allow(dead_code)]
+#[cfg(any(feature = "release-artifact-bootstrap", test))]
 fn builder_vm_artifact_names(arch: &str) -> BuilderVmArtifactNames {
     BuilderVmArtifactNames {
         kernel: format!("builder-vm-vmlinux-{arch}"),
@@ -2885,6 +2921,38 @@ mod builder_vm_bootstrap_tests {
                 .expect("installed binaries may use published prebuilts");
 
         assert_eq!(action, BuilderVmBootstrapAction::DownloadPublished);
+    }
+
+    /// Plan 77 W4: even when the resolver routes to `DownloadPublished`,
+    /// a contributor build (no `release-artifact-bootstrap` feature) must
+    /// refuse to invoke the download path and surface a clear structural
+    /// error. This locks the AGENTS.md / CLAUDE.md "no prebuilt builder
+    /// VM artifact" invariant into the type system rather than runtime
+    /// branch order. The companion sibling under
+    /// `#[cfg(feature = "release-artifact-bootstrap")]` would need a
+    /// network mock; we cover the structural-failure side here because
+    /// it's the one contributors hit.
+    #[cfg(not(feature = "release-artifact-bootstrap"))]
+    #[test]
+    fn perform_builder_vm_download_published_bails_without_feature() {
+        let err = perform_builder_vm_download_published("aarch64", "/tmp/mvm-w4-test-out")
+            .expect_err("download must refuse without release-artifact-bootstrap");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("release-artifact-bootstrap"),
+            "error must name the feature flag: {msg}"
+        );
+        assert!(
+            msg.contains("nix/images/builder-vm/flake.nix"),
+            "error must point at the source-checkout remediation: {msg}"
+        );
+        // Critically: the bail must happen before any directory creation.
+        // Otherwise a contributor running on a shared host could pollute
+        // `/tmp/...` even when the gate is "closed".
+        assert!(
+            !std::path::Path::new("/tmp/mvm-w4-test-out").exists(),
+            "structural failure must not touch the filesystem"
+        );
     }
 
     #[test]
