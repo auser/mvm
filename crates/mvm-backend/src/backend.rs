@@ -246,8 +246,7 @@ pub enum AnyBackend {
     MicrovmNix(MicrovmNixBackend),
     AppleContainer(AppleContainerBackend),
     Docker(DockerBackend),
-    /// libkrun (plan 53 §"Plan E") — Linux KVM / macOS HVF, including
-    /// macOS Intel where Apple Container is unavailable.
+    /// libkrun (plan 53 §"Plan E") — Linux KVM / macOS Apple Silicon HVF.
     Libkrun(LibkrunBackend),
     /// Cloud Hypervisor — rust-vmm peer of Firecracker at Tier 1. Adds
     /// VFIO passthrough, virtio-gpu, virtio-fs, and larger guests
@@ -309,7 +308,7 @@ impl AnyBackend {
     /// is available. Non-KVM hosts continue down the fallback ladder.
     ///
     /// Priority:
-    /// 1. **Firecracker** (if `/dev/kvm` available — production Tier 1)
+    /// 1. **Firecracker** (if native Linux `/dev/kvm` is available — production Tier 1)
     /// 2. Apple Container (macOS 26+)
     /// 3. raw libkrun
     /// 4. Docker (Tier 3 fallback — banner emitted; not promoted)
@@ -322,10 +321,9 @@ impl AnyBackend {
     pub fn auto_select() -> Self {
         let plat = mvm_core::platform::current();
 
-        // 1. KVM available → Firecracker directly (fastest — dev & production).
-        //    Linux production target + WSL2-with-KVM. macOS never reaches
-        //    here.
-        if plat.has_kvm() {
+        // 1. Native Linux KVM → Firecracker directly (fastest — dev & production).
+        //    WSL2 nested KVM is future/experimental and is not auto-selected today.
+        if plat.supports_native_runner() {
             return Self::Firecracker(FirecrackerBackend);
         }
 

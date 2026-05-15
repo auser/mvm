@@ -1,9 +1,11 @@
 ---
 title: "Windows troubleshooting"
-description: "Common Windows-specific issues with mvm: WSL2 setup, nested virt, port forwarding, BIOS, and Hyper-V interactions."
+description: "Windows-specific notes for mvm. Windows is not a supported local microVM host today; WSL2 nested KVM is future/experimental."
 ---
 
-This page is the Windows-specific FAQ. For Windows install steps see [Install on Windows](/install/windows); for the WSL2 walkthrough see [the WSL2 guide](/guides/windows-wsl2). General mvm troubleshooting (build issues, network issues, etc.) lives in [the main troubleshooting page](/guides/troubleshooting).
+This page is the Windows-specific FAQ and research note. For current Windows guidance see [Install on Windows](/install/windows); for WSL2 caveats see [the WSL2 notes](/guides/windows-wsl2). General mvm troubleshooting lives in [the main troubleshooting page](/guides/troubleshooting).
+
+Windows is not a supported local microVM host today. WSL2 nested KVM and a Hyper-V managed Linux builder are future backend work.
 
 ## Setup
 
@@ -33,7 +35,7 @@ If `wsl --update` returns "no update available" but the error persists, the kern
 
 ### `/dev/kvm` is missing
 
-mvm needs `/dev/kvm` inside the WSL2 distro for Tier 1 isolation. If it's missing:
+mvm's future WSL2 backend would need `/dev/kvm` inside the WSL2 distro. If it is missing, use a supported Linux KVM host or Apple Silicon Mac today. For experimentation:
 
 1. **Update WSL itself:**
    ```powershell
@@ -49,7 +51,7 @@ mvm needs `/dev/kvm` inside the WSL2 distro for Tier 1 isolation. If it's missin
 
 ### `mvmctl doctor` reports "KVM not available" even though `/dev/kvm` exists
 
-Permissions issue. Inside the WSL2 distro:
+This is still an unsupported configuration, but it is usually a permissions issue. Inside the WSL2 distro:
 
 ```bash
 ls -la /dev/kvm
@@ -68,7 +70,7 @@ If `kvm` group doesn't exist, `sudo groupadd kvm` then chown.
 
 ### `localhost:<port>` from Windows doesn't reach the mvm guest
 
-mvm forwards guest port → WSL2-loopback (`127.0.0.1`). Microsoft's automatic localhost forwarding usually picks that up, but several things can break it:
+If you are experimenting with WSL2, mvm forwards guest port → WSL2-loopback (`127.0.0.1`). Microsoft's automatic localhost forwarding usually picks that up, but several things can break it:
 
 - **Corporate VPNs** (Cisco AnyConnect, Palo Alto GlobalProtect) frequently kill WSL2's localhost mapping. Workaround: connect to the WSL2 distro's IP directly:
   ```bash

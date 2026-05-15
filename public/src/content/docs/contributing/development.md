@@ -80,19 +80,19 @@ just lint         # Both format check + clippy
 
 ### Multi-Backend
 
-mvmctl supports five backends: Firecracker (native Linux), Apple Container (macOS 26+), libkrun (macOS Intel / pre-26 via Hypervisor.framework), Docker (universal fallback), and microvm.nix (NixOS QEMU). The `VmBackend` trait in `mvm-core` abstracts the lifecycle; `AnyBackend` in `mvm-runtime` dispatches at runtime. Auto-selection priority: KVM → Apple Container → libkrun → Docker.
+mvmctl's supported local microVM hosts are native Linux with `/dev/kvm` and macOS Apple Silicon. Firecracker is the Linux baseline; Apple Container and libkrun-backed components cover Apple Silicon macOS. Docker remains a Tier 3 convenience fallback, not a microVM isolation boundary. WSL2 nested KVM and a Hyper-V managed Linux builder are future backend work.
 
 ### Host vs. VM
 
-All Linux operations (networking, Firecracker, cgroups) run inside the builder VM on macOS:
+All Linux build operations run inside the builder VM on macOS:
 
 ```rust
-// On Linux this runs directly on the host; on macOS it routes into the
-// libkrun-backed builder VM.
+// On Linux this runs directly on the host; on supported macOS hosts it
+// routes into the libkrun-backed builder VM.
 mvm_runtime::shell::run_in_vm("ip link add br-tenant-1 type bridge")?;
 ```
 
-On native Linux, `run_in_vm` executes directly on the host. On macOS, it delegates into the builder VM (Apple Container on 26+, libkrun on pre-26).
+On native Linux, `run_in_vm` executes directly on the host. On supported macOS Apple Silicon hosts, it delegates into the builder VM.
 
 ### Key Patterns
 

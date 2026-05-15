@@ -38,7 +38,7 @@ mvmctl update
 
 ## Prerequisites
 
-- **macOS** (Apple Silicon or Intel) or **Linux** (x86_64 or aarch64)
+- **macOS Apple Silicon** or **Linux with `/dev/kvm`** (x86_64 or aarch64)
 - [Homebrew](https://brew.sh/) (macOS only -- mvmctl will install it if missing)
 
 ### Backend Auto-Detection
@@ -49,7 +49,7 @@ mvmctl automatically detects your platform at startup and selects the best VM ba
 |----------|---------|-------------|
 | **Linux with `/dev/kvm`** | Firecracker | Runs directly on KVM. Smallest attack surface, fastest cold boot. |
 | **macOS 26+ Apple Silicon** | Apple Container | Native Virtualization.framework. No Docker Desktop required. |
-| **macOS Apple Silicon / Intel** | libkrun | Direct Hypervisor.framework backend. Intel Macs use this path. |
+| **macOS Apple Silicon** | libkrun | Direct Hypervisor.framework backend. |
 | **Linux without `/dev/kvm`** | Docker | Tier 3 fallback when no microVM backend is available. |
 | **Docker available** | Docker | Tier 3 container fallback. Used only if no hypervisor backend works. |
 

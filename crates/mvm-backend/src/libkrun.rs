@@ -1,7 +1,7 @@
 //! libkrun backend for mvm.
 //!
 //! Plan 53 §"Plan E" / Sprint 48: Tier 2 microVM backend that runs on
-//! Linux KVM, macOS Apple Silicon, and macOS Intel. The lifecycle
+//! Linux KVM and macOS Apple Silicon. The lifecycle
 //! delegates to a per-VM `mvm-libkrun-supervisor` subprocess (plan 57
 //! W4) rather than calling libkrun in-process: `krun_start_enter` calls
 //! `exit()` on the host process when the guest powers off, so any
@@ -375,7 +375,7 @@ impl VmBackend for LibkrunBackend {
                 "Hardware isolation via KVM (Linux) or Hypervisor.framework (macOS).",
                 "Comparable VMM TCB to Firecracker; passes plan 53 §\"fork test\".",
                 "Claim 3 (verified boot) is partial — dm-verity pipeline targets Firecracker today.",
-                "Runs on macOS Intel where Apple Container is unavailable.",
+                "Supported on Linux KVM and macOS Apple Silicon; macOS Intel is not a supported local host.",
             ],
         }
     }

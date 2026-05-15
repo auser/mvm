@@ -32,17 +32,18 @@ Use Firecracker as the primary production backend. Support multiple backends: Ap
 
 ## Backend Selection Order
 
-1. **KVM available** (Linux with `/dev/kvm`) -- Firecracker directly
+1. **KVM available** (native Linux with `/dev/kvm`) -- Firecracker directly
 2. **macOS 26+** (Apple Silicon) -- Apple Virtualization.framework
 3. **Docker running** -- Docker as container-based fallback
-4. **Other** (macOS <26 / Intel, Linux without KVM) -- libkrun via Hypervisor.framework, or Docker fallback (see ADR-013)
+4. **Other** (macOS Intel, Linux without KVM, native Windows, WSL2) -- unsupported for local microVM isolation today; Docker remains a Tier 3 convenience fallback only
 
 Override with `--hypervisor firecracker`, `--hypervisor apple-container`, `--hypervisor qemu`, or `--hypervisor docker`.
 
 ## Consequences
 
-- Requires Linux with `/dev/kvm` for native Firecracker, or macOS 26+ for Apple Container
-- macOS <26 / Intel falls back to libkrun via Hypervisor.framework; Docker is the final tier (see ADR-013 for the Lima retirement)
+- Requires native Linux with `/dev/kvm` for Firecracker, or macOS 26+ Apple Silicon for Apple Container
+- libkrun support is scoped to Linux KVM and macOS Apple Silicon; macOS Intel is not a supported local host
+- WSL2 nested KVM and Hyper-V managed Linux builders are future backend work, not current support
 - Guests must use a Linux kernel (no Windows/macOS guests)
 - No OCI image compatibility -- uses Nix flakes for image building instead
 - Snapshots only available on Firecracker backend

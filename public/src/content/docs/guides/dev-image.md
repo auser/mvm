@@ -147,9 +147,9 @@ nix eval .#dev.passthru.mvm
 
 mvm bootstraps a Linux builder microVM (libkrun-backed) on first build and runs `nix build` inside it. You don't need Nix on your host. See [ADR-013 §"Linux builder via libkrun"](/contributing/adr/013-libkrun-pivot/).
 
-- **Linux** (with `/dev/kvm`): the builder microVM runs on Firecracker. If you've opted into host-side Nix and it can build Linux derivations, mvm uses it directly and skips the builder VM.
-- **macOS**: the builder microVM runs on libkrun via Hypervisor.framework. If you already have [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) configured, mvm detects and uses it instead.
-- **Windows**: via the Tauri-only path ([ADR-031](/contributing/adr/013-libkrun-pivot/)); the WSL2-backed builder handles `nix build`.
+- **Linux** (native host with `/dev/kvm`): the builder VM owns image construction; Firecracker is the default runtime backend.
+- **macOS Apple Silicon**: the host `mvmctl build` command orchestrates the builder VM. The resulting dev image can then boot on the selected macOS runtime backend.
+- **Windows / WSL2**: future work. WSL2 nested KVM and a Hyper-V managed Linux builder are not supported local paths today.
 
 ## Why this is structured this way
 

@@ -5,7 +5,7 @@ description: Common issues and their solutions.
 
 ## Dev VM Issues
 
-The dev VM is the Linux environment mvmctl runs Nix builds in. On macOS 26+ it's an Apple Container; on macOS Intel / pre-26 it's libkrun via `Hypervisor.framework`; on Linux with `/dev/kvm` the host shell *is* the dev environment and no VM hop exists.
+The dev VM is the Linux environment mvmctl runs Nix builds in. On macOS Apple Silicon it uses Apple Container or libkrun via `Hypervisor.framework`; on Linux with `/dev/kvm` the host shell *is* the dev environment and no VM hop exists. macOS Intel, native Windows, and WSL2 are not supported local dev hosts today.
 
 ### "Dev VM is not running"
 
