@@ -7,6 +7,7 @@ use crate::ui;
 
 use mvm_backend::backend::AnyBackend;
 use mvm_backend::{image, microvm};
+use mvm_core::domain::instance::InstanceReadiness;
 use mvm_core::naming::{validate_flake_ref, validate_template_name, validate_vm_name};
 use mvm_core::user_config::MvmConfig;
 use mvm_core::util::parse_human_size;
@@ -55,6 +56,46 @@ impl mvm_plan::BundleResolver for InMemoryBundleResolver {
         _bundle_sha256: &str,
     ) -> std::result::Result<Vec<u8>, mvm_plan::BundleResolveError> {
         Ok(self.bytes.clone())
+    }
+}
+
+/// Persist a host-observed readiness milestone (ADR-050 §3 /
+/// plan 74 W2) on the VM's registry entry. Best-effort — readiness
+/// is observability, never gating, so registry I/O failures and
+/// unregistered VMs (e.g. the launchd direct-boot path that doesn't
+/// always register) degrade silently with a debug/warn log rather
+/// than aborting the launch.
+fn record_vm_readiness(vm_name: &str, readiness: InstanceReadiness) {
+    let path = mvm::vm::name_registry::registry_path();
+    let mut reg = match mvm::vm::name_registry::VmNameRegistry::load(&path) {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(
+                err = %e,
+                vm = vm_name,
+                "failed to load VM name registry for readiness update"
+            );
+            return;
+        }
+    };
+    let now = mvm_core::time::utc_now();
+    match reg.set_readiness(vm_name, readiness, &now) {
+        Ok(true) => {}
+        Ok(false) => {
+            // VM not in registry — common on direct-boot paths.
+            tracing::debug!(
+                vm = vm_name,
+                "no registry entry for readiness update; skipping"
+            );
+            return;
+        }
+        Err(e) => {
+            tracing::warn!(err = %e, vm = vm_name, "failed to set readiness");
+            return;
+        }
+    }
+    if let Err(e) = reg.save(&path) {
+        tracing::warn!(err = %e, vm = vm_name, "failed to save VM name registry");
     }
 }
 
@@ -1251,6 +1292,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             return Err(e);
         }
         emit_launched_if(&admission, effective_hypervisor);
+        record_vm_readiness(&vm_name, InstanceReadiness::LaunchAccepted);
 
         // Plan 37 §6 — match the main path's VmStart LocalAudit emit
         // (line ~1114). Without this the launchd-spawned direct-boot
@@ -1266,7 +1308,9 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             && !ports_str.is_empty()
         {
             ui::info("Waiting for guest agent...");
+            record_vm_readiness(&vm_name, InstanceReadiness::AgentConnecting);
             if wait_for_guest_agent(&vm_name, 30) {
+                record_vm_readiness(&vm_name, InstanceReadiness::AgentReady);
                 for spec in ports_str.split(',') {
                     if let Some((host, guest)) = spec.split_once(':')
                         && let (Ok(h), Ok(g)) = (host.parse::<u16>(), guest.parse::<u16>())
@@ -1705,6 +1749,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             return Err(e);
         }
         emit_launched_if(&admission_main, effective_hypervisor);
+        record_vm_readiness(&vm_name_owned, InstanceReadiness::LaunchAccepted);
     }
 
     mvm_core::audit_emit!(VmStart, vm: &vm_name_owned);
@@ -1719,10 +1764,12 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             let pm_list = parse_port_specs(ports).unwrap_or_default();
 
             ui::info("Waiting for guest agent...");
+            record_vm_readiness(&vm_name_owned, InstanceReadiness::AgentConnecting);
             let agent_ready = wait_for_guest_agent(&vm_name_owned, 30);
             if !agent_ready {
                 ui::warn("Guest agent not reachable — port forwarding unavailable.");
             } else {
+                record_vm_readiness(&vm_name_owned, InstanceReadiness::AgentReady);
                 // Tell guest agent to start vsock forwarders
                 for pm in &pm_list {
                     match request_port_forward(&vm_name_owned, pm.guest) {
@@ -1950,6 +1997,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
                 ));
             } else {
                 emit_launched_if(&watch_admission, effective_hypervisor);
+                record_vm_readiness(&vm_name_owned, InstanceReadiness::LaunchAccepted);
                 mvm_core::audit_emit!(VmStart, vm: &vm_name_owned);
                 ui::success(&format!("VM '{}' rebooted.", vm_name_owned));
             }

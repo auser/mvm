@@ -105,6 +105,11 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         // JSON output augments the backend `VmInfo` with the metadata
         // we just looked up, so SDK callers (Phase B1) get tags and
         // expiry without a second registry round-trip.
+        // ADR-050 §3 / plan 74 W2: `readiness` and
+        // `last_readiness_change_at` thread through here from the
+        // registry, populated by `mvmctl up`'s launch milestones.
+        // Legacy registry entries that pre-date W2 serialize as
+        // `null` for both fields.
         #[derive(serde::Serialize)]
         struct LsRow<'a> {
             #[serde(flatten)]
@@ -113,6 +118,8 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             expires_at: Option<&'a str>,
             auto_resume: bool,
             expired: bool,
+            readiness: Option<&'a mvm_core::domain::instance::InstanceReadiness>,
+            last_readiness_change_at: Option<&'a str>,
         }
         let empty_tags: std::collections::BTreeMap<String, String> = Default::default();
         let rows: Vec<LsRow<'_>> = all_vms
@@ -125,6 +132,9 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
                     expires_at: reg.and_then(|r| r.expires_at.as_deref()),
                     auto_resume: reg.map(|r| r.auto_resume).unwrap_or(true),
                     expired: reg.map(is_expired).unwrap_or(false),
+                    readiness: reg.and_then(|r| r.readiness.as_ref()),
+                    last_readiness_change_at: reg
+                        .and_then(|r| r.last_readiness_change_at.as_deref()),
                 }
             })
             .collect();
