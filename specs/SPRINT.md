@@ -1063,6 +1063,8 @@ sweep (32 / 16 / 18).
 |---|---|---|
 | 60 — libkrun migration | Phase 6 — `mvm_security::attestation` (`IdentityKey` lifecycle + signed report) + feature-gated `HwAttestationProvider` stubs (TPM2 / SEV-SNP / TDX) + `mvmctl attest {export, verify, status}` CLI | `d0ba736` |
 | 60 | Phase 3 Slice B — `mvm-policy::L4RuleSpec` + `mvm_supervisor::proxy::l4` (`L4Gate` trait, `LiveL4Gate::from_specs`) + `HickoryDnsResolver` + W5 resolver wires `slots.network` | `51581a8` |
+| 60 | Phase 3 Slice C scaffold — `FirewallEnforcer` contract + fail-closed `NoopFirewallEnforcer` + `LinuxNftFirewall` adapter, now wired into `Supervisor::launch` before backend dispatch with teardown on backend launch failure / `stop` | `509d2c1` |
+| 60 | Phase 3 Slice C follow-on — `FirewallSpec::from_vm_slot` derives VM identity/TAP from Firecracker runtime `VmSlot` metadata and supervisor launch validates specs before firewall install or backend dispatch | PR pending |
 | 60 | Phase 3 follow-on — `up.rs::admit_plan_for_boot` calls `resolve_supervisor_components`; typed audit-chain `error_class` per failure mode | `ac87e8d` |
 | 60 | Phase 3 follow-on — `slots_from_bundle` delegates to `build_inspector_chain`, picking up SsrfGuard / SecretsScanner / InjectionGuard / PiiRedactor + honoring `disabled_inspectors` | `bf8079a` |
 | 60 | Phase 3 follow-on — `LiveArtifactCollector::from_policy(&bundle.artifact)` (NotImplemented carries `capture_paths` count + retention) | `72f272f` |
