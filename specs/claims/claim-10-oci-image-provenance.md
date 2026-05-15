@@ -20,6 +20,9 @@ exempt_paths:
   - "public/src/content/docs/contributing/adr/**"
   - "public/src/content/docs/security/sandbox-parity-status.md"
   - "xtask/src/check_doc_claims.rs"
+  - "crates/mvm-oci/**"
+  - "Cargo.toml"
+  - "Cargo.lock"
 ---
 
 # Claim 10 — OCI image provenance is recorded in the admission audit chain
