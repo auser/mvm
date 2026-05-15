@@ -1831,7 +1831,14 @@ fn bootstrap_builder_vm_image() -> Result<()> {
         .map(|flake_dir| builder_vm_source_fingerprint(flake_dir))
         .transpose()?;
     let cache_ready = match source_fingerprint.as_deref() {
-        Some(fingerprint) => builder_vm_source_cache_ready(out_dir_path, fingerprint),
+        Some(fingerprint) => {
+            let status = builder_vm_source_cache_status(out_dir_path, fingerprint);
+            ui::progress(&format!(
+                "Builder VM source cache decision: {}",
+                status.reason_code()
+            ));
+            status.is_ready()
+        }
         None => validate_builder_vm_stage0_artifacts(out_dir_path).is_ok(),
     };
 
@@ -2057,12 +2064,71 @@ fn builder_vm_source_fingerprint(builder_flake_dir: &str) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn builder_vm_source_cache_ready(dir: &std::path::Path, expected_fingerprint: &str) -> bool {
-    validate_builder_vm_stage0_artifacts(dir).is_ok()
-        && builder_vm_source_fingerprint_matches(dir, expected_fingerprint)
-        && builder_vm_artifact_digest_manifest_matches(dir)
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BuilderVmSourceCacheStatus {
+    Hit,
+    MissingArtifact,
+    InvalidStage0Artifacts,
+    MissingFingerprint,
+    FingerprintMismatch,
+    MissingArtifactDigestManifest,
+    ArtifactDigestMismatch,
 }
 
+impl BuilderVmSourceCacheStatus {
+    fn is_ready(self) -> bool {
+        self == Self::Hit
+    }
+
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::MissingArtifact => "missing_artifact",
+            Self::InvalidStage0Artifacts => "invalid_stage0_artifacts",
+            Self::MissingFingerprint => "missing_fingerprint",
+            Self::FingerprintMismatch => "fingerprint_mismatch",
+            Self::MissingArtifactDigestManifest => "missing_artifact_digest_manifest",
+            Self::ArtifactDigestMismatch => "artifact_digest_mismatch",
+        }
+    }
+}
+
+fn builder_vm_source_cache_status(
+    dir: &std::path::Path,
+    expected_fingerprint: &str,
+) -> BuilderVmSourceCacheStatus {
+    if !dir.join("vmlinux").exists() || !dir.join("rootfs.ext4").exists() {
+        return BuilderVmSourceCacheStatus::MissingArtifact;
+    }
+    if validate_builder_vm_stage0_artifacts(dir).is_err() {
+        return BuilderVmSourceCacheStatus::InvalidStage0Artifacts;
+    }
+
+    let fingerprint_path = dir.join(BUILDER_VM_SOURCE_FINGERPRINT_FILE);
+    let Ok(actual_fingerprint) = std::fs::read_to_string(fingerprint_path) else {
+        return BuilderVmSourceCacheStatus::MissingFingerprint;
+    };
+    if actual_fingerprint.trim() != expected_fingerprint {
+        return BuilderVmSourceCacheStatus::FingerprintMismatch;
+    }
+
+    let digest_path = dir.join(BUILDER_VM_ARTIFACT_DIGEST_FILE);
+    if !digest_path.exists() {
+        return BuilderVmSourceCacheStatus::MissingArtifactDigestManifest;
+    }
+    if !builder_vm_artifact_digest_manifest_matches(dir) {
+        return BuilderVmSourceCacheStatus::ArtifactDigestMismatch;
+    }
+
+    BuilderVmSourceCacheStatus::Hit
+}
+
+#[cfg(any(feature = "builder-vm", test))]
+fn builder_vm_source_cache_ready(dir: &std::path::Path, expected_fingerprint: &str) -> bool {
+    builder_vm_source_cache_status(dir, expected_fingerprint).is_ready()
+}
+
+#[cfg(any(feature = "builder-vm", test))]
 fn builder_vm_source_fingerprint_matches(
     dir: &std::path::Path,
     expected_fingerprint: &str,
@@ -2991,6 +3057,62 @@ mod builder_vm_bootstrap_tests {
         );
         write_builder_vm_source_cache_metadata(&cache, "fingerprint");
         assert!(builder_vm_source_cache_ready(&cache, "fingerprint"));
+    }
+
+    #[test]
+    fn builder_vm_source_cache_status_reports_safe_reason_codes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("builder-vm").join("aarch64");
+
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "missing_artifact"
+        );
+
+        std::fs::create_dir_all(&cache).expect("mkdir cache");
+        std::fs::write(cache.join("vmlinux"), b"stub").expect("write stub kernel");
+        std::fs::write(cache.join("rootfs.ext4"), b"stub").expect("write stub rootfs");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "invalid_stage0_artifacts"
+        );
+
+        write_valid_builder_vm_artifacts(&cache);
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "missing_fingerprint"
+        );
+
+        write_builder_vm_source_fingerprint(&cache, "other").expect("write fingerprint");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "fingerprint_mismatch"
+        );
+
+        write_builder_vm_source_fingerprint(&cache, "fingerprint").expect("write fingerprint");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "missing_artifact_digest_manifest"
+        );
+
+        write_builder_vm_artifact_digest_manifest(&cache).expect("write digest manifest");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(cache.join("vmlinux"))
+            .expect("open kernel")
+            .write_all(b"tamper")
+            .expect("tamper kernel");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "artifact_digest_mismatch"
+        );
+
+        write_valid_builder_vm_artifacts(&cache);
+        write_builder_vm_source_cache_metadata(&cache, "fingerprint");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "hit"
+        );
     }
 
     #[test]
