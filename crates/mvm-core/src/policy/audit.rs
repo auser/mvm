@@ -276,6 +276,55 @@ pub enum LocalAuditKind {
     /// Emitted once per volume processed (so `--all` produces N
     /// records, one per volume).
     DepsAudit,
+
+    // --- Plan 74 W2: programmable network policy enforcement events ---
+    //
+    // Five new kinds wired into the L3 iptables / L4 substrate / DNS
+    // pin paths. State-only slice: variants ship here so emission
+    // sites land in their own focused PRs without re-bumping the
+    // audit schema each time. Wire format is stable (snake_case
+    // strings) per the enum's `rename_all` attribute.
+    //
+    // Detail-format conventions across the five (so a future
+    // dashboard parses uniformly):
+    //   - `proto=<tcp|udp>` always first when L4 protocol applies.
+    //   - `dst=<ip:port>` for the destination tuple, `ip` for an
+    //     IP-only event.
+    //   - additional key=value pairs comma-separated, no spaces.
+    //
+    /// L4 allow decision: a flow matched a policy rule and was
+    /// permitted. Plan 74 W2 §"Emit audit entries for every
+    /// allow/deny". Fired from `L4Policy::evaluate` and from the
+    /// iptables FORWARD accept path (when wired). Detail format:
+    ///   `proto=<tcp|udp>,dst=<ip:port>,rule=<host:port-or-cidr>`
+    NetworkPolicyAllow,
+    /// L4 deny decision: no allow rule matched. Distinct from
+    /// `NetworkMandatoryDeny` — that variant fires only for the
+    /// unconditional deny set; this one captures "policy didn't
+    /// permit" + "policy was empty" + similar negative outcomes.
+    /// Detail format:
+    ///   `proto=<tcp|udp>,dst=<ip:port>,reason=<no-allow|policy-empty>`
+    NetworkPolicyDeny,
+    /// Egress hit one of `MANDATORY_DENY_RANGES` (cloud metadata,
+    /// link-local, CGNAT, host loopback) — the unconditional deny
+    /// fired regardless of the user's allow-list. Surfaced as a
+    /// distinct kind because IMDS-style exfil attempts deserve a
+    /// dedicated alert channel separate from noisier policy
+    /// denials. Plan 74 W2 §item 4. Detail format:
+    ///   `proto=<tcp|udp>,dst=<ip:port>,category=<cloud-metadata|link-local|cgnat|loopback>`
+    NetworkMandatoryDeny,
+    /// Supervisor admission resolved a destination host to one or
+    /// more IPs and pinned them for the lifetime of the workload.
+    /// Plan 74 W2 item 1. Fires once per `(workload, destination)`
+    /// pair at admission, before the guest boots. Detail format:
+    ///   `dest=<host>,ips=<ip[,ip...]>,ttl_s=<n>`
+    DnsPinSet,
+    /// A guest request resolved (via the egress proxy or supervisor
+    /// resolver) to an IP that didn't match the admission-time pin.
+    /// Distinct from `NetworkPolicyDeny`: this is a TOCTOU /
+    /// rebinding signal, not a missing-allow signal. Detail format:
+    ///   `dest=<host>,pinned_ips=<ip[,ip...]>,observed_ip=<ip>`
+    DnsPinReject,
 }
 
 /// A single local audit log entry.
@@ -764,6 +813,101 @@ mod tests {
         for (kind, expected) in kinds_and_strings {
             let json = serde_json::to_string(&kind).unwrap();
             assert_eq!(json, format!("\"{expected}\""));
+        }
+    }
+
+    // =====================================================================
+    // Plan 74 W2 — network policy audit kinds (state-only slice)
+    // =====================================================================
+
+    /// Same shape as `b21_reserved_audit_kinds_serde_roundtrip`:
+    /// every new W2 variant must serde-roundtrip cleanly so emission
+    /// PRs can land independently without re-bumping the audit
+    /// schema each time.
+    #[test]
+    fn w2_network_audit_kinds_serde_roundtrip() {
+        let kinds = vec![
+            LocalAuditKind::NetworkPolicyAllow,
+            LocalAuditKind::NetworkPolicyDeny,
+            LocalAuditKind::NetworkMandatoryDeny,
+            LocalAuditKind::DnsPinSet,
+            LocalAuditKind::DnsPinReject,
+        ];
+        for kind in kinds {
+            let event = LocalAuditEvent::now(kind.clone(), None, None);
+            let json = serde_json::to_string(&event).unwrap();
+            let parsed: LocalAuditEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.kind, kind, "kind round-trip diverged: {kind:?}");
+        }
+    }
+
+    /// Wire-format pin for the W2 variants. Pinned so a future
+    /// rename surfaces as a failing test and forces a conscious
+    /// decision about old-log readability.
+    #[test]
+    fn w2_network_audit_kinds_use_snake_case_on_the_wire() {
+        let kinds_and_strings = vec![
+            (LocalAuditKind::NetworkPolicyAllow, "network_policy_allow"),
+            (LocalAuditKind::NetworkPolicyDeny, "network_policy_deny"),
+            (
+                LocalAuditKind::NetworkMandatoryDeny,
+                "network_mandatory_deny",
+            ),
+            (LocalAuditKind::DnsPinSet, "dns_pin_set"),
+            (LocalAuditKind::DnsPinReject, "dns_pin_reject"),
+        ];
+        for (kind, expected) in kinds_and_strings {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{expected}\""),
+                "W2 audit kind wire format drifted for {kind:?}"
+            );
+        }
+    }
+
+    /// The mandatory-deny variant is distinct from the
+    /// policy-deny variant. A future maintainer who tries to
+    /// collapse them into one kind fails this test and reads
+    /// the doc comment explaining why they're separate.
+    #[test]
+    fn w2_mandatory_deny_is_separate_from_policy_deny() {
+        // PartialEq + serialize both establish identity.
+        assert_ne!(
+            LocalAuditKind::NetworkMandatoryDeny,
+            LocalAuditKind::NetworkPolicyDeny
+        );
+        let mandatory = serde_json::to_string(&LocalAuditKind::NetworkMandatoryDeny).unwrap();
+        let policy = serde_json::to_string(&LocalAuditKind::NetworkPolicyDeny).unwrap();
+        assert_ne!(
+            mandatory, policy,
+            "mandatory and policy deny must serialize differently — IMDS-exfil \
+             alerts need a dedicated channel separate from noisier policy denials"
+        );
+    }
+
+    /// Each new variant must compose with the standard
+    /// `LocalAuditEvent` constructor. Catches a future
+    /// regression where a variant accidentally drops `Clone` or
+    /// stops being usable with the existing event shape.
+    #[test]
+    fn w2_network_audit_kinds_compose_with_event_constructor() {
+        let cases = [
+            LocalAuditKind::NetworkPolicyAllow,
+            LocalAuditKind::NetworkPolicyDeny,
+            LocalAuditKind::NetworkMandatoryDeny,
+            LocalAuditKind::DnsPinSet,
+            LocalAuditKind::DnsPinReject,
+        ];
+        for kind in cases {
+            let event = LocalAuditEvent::now(
+                kind.clone(),
+                Some("vm-test".to_string()),
+                Some("dst=1.2.3.4:443,proto=tcp".to_string()),
+            );
+            assert_eq!(event.kind, kind);
+            assert_eq!(event.vm_name.as_deref(), Some("vm-test"));
+            assert_eq!(event.detail.as_deref(), Some("dst=1.2.3.4:443,proto=tcp"));
         }
     }
 
