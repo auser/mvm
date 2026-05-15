@@ -11,19 +11,15 @@ Proposed. Implementation tracked in [Plan 60](https://github.com/tinylabscom/mvm
 
 `mvmctl` runs on a stock host. **Nix is not a prerequisite.** On first build, mvm bootstraps a small Linux builder microVM (libkrun-backed), runs `nix build` inside it, and extracts the resulting rootfs to the host. The runtime path stays Nix-free; the builder path keeps Nix inside the sandbox where it belongs.
 
-Host-side Nix is an opt-in power-user path:
+Host-side Nix is optional and only affects commands users run themselves:
 
-- contributors hacking on mvm itself who want a shared `/nix/store`,
-- users with [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) already configured (mvm detects and uses it),
-- users with a remote `nix-daemon` URL.
+- contributors hacking on mvm itself may want Nix for editor tooling or direct `nix build` debugging;
+- users with [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary) can use it for direct Nix commands;
+- users with a remote `nix-daemon` URL can use it outside mvm's normal build path.
 
 The full design is in [§"Linux builder via libkrun (no Lima)"](#linux-builder-via-libkrun-no-lima) below.
 
-> **Current status (2026-05-08):** the bootstrap is in flight on the
-> `feat/micro` branch as part of W6.x. Until it lands, contributors
-> building rootfs images still need host-side Nix (or `nix-darwin`'s
-> `linux-builder` on macOS). The docs describe the target user-facing
-> shape; the in-flight gap is a footnote, not the headline.
+The user-facing contract is documented in [Builder VM](/guides/builder-vm/): `mvmctl build` is a host command, while Nix evaluation and image construction happen inside the builder VM.
 
 ## Context
 
@@ -50,7 +46,6 @@ Three coupled choices:
 3. macOS Container         → AppleContainerBackend (legacy; scheduled for removal)
 4. raw libkrun             → LibkrunBackend (legacy; scheduled for removal)
 5. Docker                  → DockerBackend (Tier 3 fallback; banner emitted)
-6. Firecracker via Lima    → legacy macOS fallback
 ```
 
 `mvmctl run --hypervisor libkrun <flake>` always selects libkrun explicitly regardless of the host's KVM status.
@@ -59,22 +54,20 @@ Three coupled choices:
 
 macOS hosts can't `nix build` Linux derivations natively. The previous iteration solved that with a Lima VM as the Linux builder; this iteration drops Lima entirely. The replacement: **bootstrap a Linux builder inside libkrun itself**.
 
-On a host without a Linux builder configured, `mvmctl build` does:
+`mvmctl build` does:
 
-1. Detects the gap — host has no Nix, or has Nix that can't build Linux derivations.
-2. Pulls a small, pinned Nix-bearing image — once, cached in `~/.cache/mvm/builder-image/`.
-3. Spawns a libkrun sandbox from the image with the user's flake source bind-mounted as `/work`, the host's `/nix/store` shared in if present, and a sane PATH.
-4. Runs `nix build .#default` inside the sandbox.
-5. Extracts the rootfs back to the host.
-6. Hands it to the runtime path (which uses libkrun's `RootfsSource::DiskImage` per the OCI non-goal — the *runtime* never pulls OCI).
+1. Stages the user's flake source and selected profile as a builder job.
+2. Boots or reuses the pinned Linux builder image.
+3. Mounts the staged source, job metadata, cache volumes, and artifact output directory into the builder boundary.
+4. Runs `nix build .#default` or the selected profile inside the builder VM.
+5. Extracts the kernel/rootfs artifacts back to the host cache.
+6. Hands the finished artifacts to the runtime path (which uses libkrun's `RootfsSource::DiskImage` per the OCI non-goal — the *runtime* never pulls OCI).
 
 **Why this is consistent with the OCI non-goal.** The non-goal banned OCI from the **runtime/boot path** — where user workloads run, where reproducibility, offline-by-default, and no-registry-trust matter. The **builder** lives in a different trust zone: it has to fetch caches, talk to the network, and run arbitrary `nix build` derivations. Builder VMs and runtime VMs are governed by different policies; using OCI for the builder doesn't compromise the runtime's invariants.
 
-**Cache reuse.** When the host has a Nix install, its `/nix/store` is shared into the builder sandbox. Builds populate the host store; subsequent builds reuse the same cached derivations. This is the same trick `nix-darwin`'s `linux-builder` uses — the difference is mvm doesn't require the user to have configured `nix-darwin`.
+**Cache reuse.** The builder VM keeps a warm Nix store/cache across builds. Host-side Nix may still be useful for direct developer commands, but mvm image construction goes through the builder VM so the behavior is consistent across macOS, Linux, and WSL2.
 
-**Detection and fallback.** If the host already has a working Linux builder (`nix-darwin`'s `linux-builder`, or a remote `nix-daemon` URL), mvm detects it and uses it instead — the libkrun-bootstrapped path is the *zero-config default*, not a forced override. Detection probes whether host Nix can realize a Linux derivation; success → host builds; failure → libkrun bootstrap.
-
-**This replaces every previous reference to "configure `nix-darwin`'s `linux-builder`" in the docs.** Users with an existing builder keep using it; everyone else gets the libkrun-bootstrapped path with no host-side configuration.
+**This replaces every previous reference to "configure `nix-darwin`'s `linux-builder`" as a prerequisite for mvm builds.** Users can still configure one for their own direct Nix workflows; `mvmctl build` does not require it.
 
 ## Non-goal: OCI / container images
 

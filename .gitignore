@@ -36,3 +36,5 @@ nix/images/dev-prebuilt/
 # Worktree-local dev env (use .envrc.example as template)
 /.envrc
 /.mvm-test/
+.worktrees/
+graphify-out/

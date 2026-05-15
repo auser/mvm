@@ -18,7 +18,7 @@ You'll need:
   If `/dev/kvm` exists but is `root`-only, add yourself to the `kvm` group: `sudo usermod -aG kvm "$USER"` (re-login required).
 - **Rust 1.85+** if you build `mvmctl` from source.
 
-You **do not need Nix on your host**. mvm bootstraps a small Linux builder microVM on first build, runs `nix build` inside it, and extracts the resulting rootfs back to your host. See [ADR-013 §"Linux builder via libkrun"](/contributing/adr/013-libkrun-pivot/) for the design.
+You **do not need Nix on your host**. You run `mvmctl build` from the host, and mvm runs Nix evaluation and `nix build` through the project builder VM before extracting the resulting rootfs back to your host. See [Builder VM](/guides/builder-vm/) for the design.
 
 ## Install mvmctl
 
@@ -81,7 +81,7 @@ See [Building MicroVM Images](/guides/building-microvm-images) for the user-faci
 
 ## Optional: host-side Nix for power users
 
-mvm doesn't need Nix on the host — the builder microVM handles managed `nix build` invocations. You may still want host-side Nix if you're:
+mvm doesn't need Nix on the host — the builder VM handles mvm image builds. You may still want host-side Nix if you're:
 
 - contributing to mvm itself and want a shared `/nix/store` between your editor's build commands and mvm's,
 - already running a `nix-daemon` for other projects.
@@ -98,7 +98,7 @@ The upstream NixOS installer also works:
 sh <(curl -L https://nixos.org/nix/install) --daemon
 ```
 
-Host-side Nix is for your own commands; `mvmctl build` uses the builder VM path.
+Installing host-side Nix does not change the normal `mvmctl build` contract: the CLI remains the host control plane, and the builder VM remains the image build boundary.
 
 ## Distro-specific notes
 

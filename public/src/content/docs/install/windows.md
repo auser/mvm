@@ -38,7 +38,7 @@ sh <(curl -L https://nixos.org/nix/install) --daemon
 . /etc/profile.d/nix.sh
 ```
 
-When `mvmctl build` detects a working host-side Nix that can build Linux derivations, it uses it directly and skips the builder microVM.
+Installing host-side Nix is optional. The normal `mvmctl build` path still treats the CLI as the host control plane and the builder VM as the image build boundary. See [Builder VM](/guides/builder-vm/).
 
 ## Alternative: Tier 3 Docker fallback
 

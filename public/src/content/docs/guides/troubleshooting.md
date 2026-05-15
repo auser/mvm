@@ -3,9 +3,9 @@ title: Troubleshooting
 description: Common issues and their solutions.
 ---
 
-## Dev VM Issues
+## Builder VM and Dev Shell Issues
 
-The dev VM is the Linux environment mvmctl runs Nix builds in. On macOS Apple Silicon it uses Apple Container or libkrun via `Hypervisor.framework`; on Linux with `/dev/kvm` the host shell *is* the dev environment and no VM hop exists. macOS Intel, native Windows, and WSL2 are not supported local dev hosts today.
+The builder VM is the Linux environment mvmctl uses for Nix evaluation and image builds. You normally do not enter it yourself: `mvmctl build --flake .` is a host command that stages work for the builder VM and copies artifacts back to the host cache. `mvmctl dev shell` is only for manual debugging. See [Builder VM](/guides/builder-vm/) for the full model.
 
 ### "Dev VM is not running"
 
@@ -69,12 +69,12 @@ mvmctl up --manifest <template> --name <name>
 ### Nix build fails
 
 ```bash
-# Test the flake locally first
+# Re-run the normal host-orchestrated build.
+mvmctl build --flake .
+
+# If you need an interactive Linux debug environment:
 mvmctl dev shell
 nix build .#default
-
-# Check for errors in the flake
-nix flake check
 ```
 
 ### "Cache miss" rebuilds
@@ -105,11 +105,12 @@ error: No space left on device
 
 **Fix**:
 ```bash
-# Run garbage collection
-nix-collect-garbage -d
-
 # Check Nix store size (mvmctl doctor warns if >20 GiB)
 mvmctl doctor
+
+# For manual cleanup inside a debug shell:
+mvmctl dev shell
+nix-collect-garbage -d
 ```
 
 ### Hash mismatch (fixed-output derivation)
