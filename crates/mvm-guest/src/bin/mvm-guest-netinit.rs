@@ -24,12 +24,16 @@
 //!
 //! ## Output
 //!
-//! Single JSON line to stdout containing the [`Report`] from
-//! [`mvm_guest::netinit::install_mandatory_deny`]. The kernel
-//! console captures stdout; the host scrape (`firecracker.log`,
-//! libkrun console output) forwards the line so an operator can
-//! see what was installed without an in-VM tool. A future slice
-//! wires this into the agent's vsock-audit path.
+//! Single line to stdout: the marker
+//! [`mvm_guest::netinit::REPORT_MARKER`] (`__MVM_NETINIT_REPORT__`)
+//! followed by a space and the JSON-encoded [`Report`]. The
+//! kernel console captures stdout; the host scrape
+//! (`firecracker.log`, libkrun console output) greps for the
+//! marker and emits one `LocalAuditKind::NetworkMandatoryDeny`
+//! audit event per workload from the parsed Report. The marker
+//! exists so a noisy console (kernel boot messages, agent
+//! startup logs) doesn't bury the line — `grep
+//! '__MVM_NETINIT_REPORT__'` is the canonical extraction.
 //!
 //! ## Platform
 //!
@@ -56,12 +60,13 @@ async fn main() {
         }
     };
 
-    // Write the report as a single JSON line to stdout. Kept on
-    // one line so console scrape can read it without parsing
-    // multi-line JSON; the field set is stable per the type's
-    // serde shape.
+    // Write the report as a single line to stdout, prefixed with
+    // the canonical marker so the host-side console-scrape can
+    // grep for it. The marker + JSON shape is the contract every
+    // audit consumer parses; see `mvm_guest::netinit::REPORT_MARKER`
+    // for the load-bearing string.
     match serde_json::to_string(&report) {
-        Ok(json) => println!("{json}"),
+        Ok(json) => println!("{} {json}", mvm_guest::netinit::REPORT_MARKER),
         Err(e) => {
             // serializing a `Report` from our own types shouldn't
             // fail in practice; if it does the binary still needs

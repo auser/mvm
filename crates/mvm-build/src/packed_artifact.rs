@@ -275,6 +275,34 @@ pub fn pack(
     Ok(())
 }
 
+/// Inspect a `.mvm` artifact's manifest **without** verifying the
+/// signature. Useful for debugging ("what's in this file?") and for
+/// tools that don't have the producer's verifying key yet — e.g.
+/// a registry that wants to surface a `.mvm`'s file listing
+/// before the operator decides whether to trust the producer.
+///
+/// The returned manifest is parsed but its signature is NOT
+/// checked, payloads are NOT re-hashed, and SealedProd verity
+/// requirements are NOT enforced. Callers that need any of those
+/// must use [`verify`] instead. Format-version mismatch IS
+/// rejected — even an inspection should refuse a wire shape it
+/// can't safely parse.
+pub fn inspect_unverified(path: &Path) -> Result<Manifest, ArtifactError> {
+    let f = File::open(path).with_context(|| format!("open {}", path.display()))?;
+    let gz = GzDecoder::new(f);
+    let mut archive = Archive::new(gz);
+    let (manifest_bytes, _signature_bytes) = read_manifest_and_signature(&mut archive)?;
+    let manifest: Manifest =
+        serde_json::from_slice(&manifest_bytes).map_err(ArtifactError::from)?;
+    if manifest.format_version != MANIFEST_FORMAT_VERSION {
+        return Err(ArtifactError::UnknownFormatVersion {
+            got: manifest.format_version,
+            expected: MANIFEST_FORMAT_VERSION,
+        });
+    }
+    Ok(manifest)
+}
+
 /// Verify an existing `.mvm` artifact without extracting payload
 /// bytes to disk. Returns the parsed `Manifest` on success.
 pub fn verify(path: &Path, verifying_key: &VerifyingKey) -> Result<Manifest, ArtifactError> {
@@ -801,6 +829,105 @@ mod tests {
         rebuild_archive_without(&out, &[SIGNATURE_FILENAME]);
         let err = verify(&out, &key.verifying_key()).unwrap_err();
         assert!(matches!(err, ArtifactError::SignatureAbsent), "got {err:?}");
+    }
+
+    #[test]
+    fn inspect_unverified_returns_manifest_without_signature_check() {
+        // Two-different-keys scenario: producer signs the artifact,
+        // an inspector with the wrong key (or NO key at all) must
+        // still be able to read the manifest. This is the load-
+        // bearing distinction from `verify`.
+        let dir = tempfile::tempdir().unwrap();
+        let k = write_fixture(dir.path(), "vmlinux", b"k");
+        let r = write_fixture(dir.path(), "rootfs.ext4", b"r");
+        let c = write_fixture(dir.path(), "cmdline.txt", b"c");
+        let producer = test_keypair();
+        let attacker = test_keypair();
+        let out = dir.path().join("out.mvm");
+        pack(&dev_inputs(&k, &r, &c), &producer, &out).unwrap();
+
+        // Inspect with no key — manifest reads cleanly.
+        let mf = inspect_unverified(&out).unwrap();
+        assert_eq!(mf.format_version, MANIFEST_FORMAT_VERSION);
+        assert_eq!(mf.security.profile, ArtifactProfile::Dev);
+        assert!(mf.files.contains_key("kernel/vmlinux"));
+
+        // `verify` with the wrong key on the same file must still
+        // refuse — inspect's permissiveness doesn't bleed into
+        // verify's trust check.
+        let err = verify(&out, &attacker.verifying_key()).unwrap_err();
+        assert!(matches!(err, ArtifactError::SignatureMismatch));
+    }
+
+    #[test]
+    fn inspect_unverified_rejects_unknown_format_version() {
+        // Even an inspection must refuse a wire shape it can't
+        // safely parse — otherwise a future format-2 file would
+        // half-deserialise into a format-1 struct.
+        let dir = tempfile::tempdir().unwrap();
+        let k = write_fixture(dir.path(), "vmlinux", b"k");
+        let r = write_fixture(dir.path(), "rootfs.ext4", b"r");
+        let c = write_fixture(dir.path(), "cmdline.txt", b"c");
+        let key = test_keypair();
+        let out = dir.path().join("out.mvm");
+        pack(&dev_inputs(&k, &r, &c), &key, &out).unwrap();
+        rewrite_manifest_version(&out, 999);
+
+        let err = inspect_unverified(&out).unwrap_err();
+        assert!(matches!(
+            err,
+            ArtifactError::UnknownFormatVersion { got: 999, .. }
+        ));
+    }
+
+    #[test]
+    fn inspect_unverified_does_not_enforce_sealed_prod_verity() {
+        // `verify` refuses a SealedProd artifact missing verity
+        // sidecars; `inspect` is the diagnostic surface, so it
+        // must show the bad manifest contents instead of
+        // refusing — operators need to SEE what's wrong.
+        // We can't pack such an artifact via `pack` (which
+        // refuses), so build one by hand the same way the
+        // path-traversal test does.
+        let dir = tempfile::tempdir().unwrap();
+        let out = dir.path().join("bad-sealed.mvm");
+        let key = test_keypair();
+        let manifest = Manifest {
+            format_version: MANIFEST_FORMAT_VERSION,
+            mvm_version: "test".to_string(),
+            target_arch: "aarch64-linux".to_string(),
+            files: BTreeMap::new(),
+            build_provenance: None,
+            security: SecurityPosture {
+                profile: ArtifactProfile::SealedProd,
+                verity_protected: true,
+                requires_auth: true,
+                allows_volumes: false,
+                allows_egress: false,
+            },
+        };
+        let manifest_bytes = manifest.to_signing_bytes().unwrap();
+        let sig = key.sign(&manifest_bytes);
+
+        let buf = Vec::new();
+        let gz = GzEncoder::new(buf, Compression::default());
+        let mut tar = Builder::new(gz);
+        tar.mode(tar::HeaderMode::Deterministic);
+        append_bytes(&mut tar, MANIFEST_FILENAME, &manifest_bytes).unwrap();
+        append_bytes(&mut tar, SIGNATURE_FILENAME, &sig.to_bytes()).unwrap();
+        tar.finish().unwrap();
+        let gz_done = tar.into_inner().unwrap();
+        let bytes = gz_done.finish().unwrap();
+        fs::write(&out, bytes).unwrap();
+
+        // Inspect surfaces the (broken) sealed-prod manifest.
+        let mf = inspect_unverified(&out).unwrap();
+        assert_eq!(mf.security.profile, ArtifactProfile::SealedProd);
+
+        // Verify refuses (signature is fine, but the SealedProd
+        // verity gate fires).
+        let err = verify(&out, &key.verifying_key()).unwrap_err();
+        assert!(matches!(err, ArtifactError::SealedProdMissingVerity));
     }
 
     #[test]
