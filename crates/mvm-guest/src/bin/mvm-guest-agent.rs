@@ -376,21 +376,43 @@ impl AgentBootState {
         }
     }
 
+    /// Set the warm-pool component and stamp `warm_pool_ready_ms`
+    /// when the state first leaves `Starting` for a terminal value
+    /// (`Ready` / `Failed` / `Disabled`). Initial `Disabled` (the
+    /// `Default` value, set before any background thread runs) does
+    /// not stamp — we only count time once init actually starts.
     fn set_warm_pool(&self, state: ComponentState) {
         if let Ok(mut s) = self.inner.lock() {
+            let was_starting = matches!(s.warm_pool, ComponentState::Starting);
             s.warm_pool = state;
+            if was_starting && s.timing.warm_pool_ready_ms.is_none() {
+                s.timing.warm_pool_ready_ms = Some(self.elapsed_ms());
+            }
         }
     }
 
+    /// Set the integrations component. Stamps `integrations_ready_ms`
+    /// on the first transition out of `Starting`. See `set_warm_pool`
+    /// for the rationale on skipping initial-Disabled stamps.
     fn set_integrations(&self, state: ComponentState) {
         if let Ok(mut s) = self.inner.lock() {
+            let was_starting = matches!(s.integrations, ComponentState::Starting);
             s.integrations = state;
+            if was_starting && s.timing.integrations_ready_ms.is_none() {
+                s.timing.integrations_ready_ms = Some(self.elapsed_ms());
+            }
         }
     }
 
+    /// Set the probes component. Stamps `probes_ready_ms` on the
+    /// first transition out of `Starting`.
     fn set_probes(&self, state: ComponentState) {
         if let Ok(mut s) = self.inner.lock() {
+            let was_starting = matches!(s.probes, ComponentState::Starting);
             s.probes = state;
+            if was_starting && s.timing.probes_ready_ms.is_none() {
+                s.timing.probes_ready_ms = Some(self.elapsed_ms());
+            }
         }
     }
 
@@ -1556,6 +1578,71 @@ fn wait_for_after_start(pool: &Arc<WorkerPool>) {
     }
 }
 
+/// Scan `/etc/mvm/integrations.d/*.json`, populate
+/// `integration_state` with the discovered entries, and spawn the
+/// health-check loop iff at least one integration was loaded. Plan
+/// 76 Phase 3 — runs on its own background thread so a slow or
+/// malformed drop-in cannot delay the accept loop.
+///
+/// Transitions in `AgentBootState`:
+///   `Starting` → `Ready`    (≥ 1 integration loaded; health loop spawned)
+///   `Starting` → `Disabled` (no integrations declared)
+///
+/// `Failed` is not currently produced — `load_dropin_dir` is
+/// best-effort per-file (a malformed JSON file is skipped with a
+/// stderr log; the rest still load). That matches Phase 3's
+/// "malformed integration drop-in does not kill control-plane
+/// readiness" acceptance criterion.
+fn init_integrations(
+    boot_state: &Arc<AgentBootState>,
+    integration_state: &Arc<Mutex<IntegrationState>>,
+) {
+    boot_state.set_integrations(ComponentState::Starting);
+    let entries = integrations::load_dropin_dir(integrations::INTEGRATIONS_DROPIN_DIR);
+    let count = entries.len();
+    if let Ok(mut s) = integration_state.lock() {
+        s.integrations = entries
+            .into_iter()
+            .map(|e| IntegrationHealth {
+                entry: e,
+                last_result: None,
+            })
+            .collect();
+    }
+    if count > 0 {
+        boot_state.set_integrations(ComponentState::Ready);
+        let health_state = Arc::clone(integration_state);
+        std::thread::spawn(move || integration_health_loop(health_state));
+    } else {
+        boot_state.set_integrations(ComponentState::Disabled);
+    }
+}
+
+/// Scan `/etc/mvm/probes.d/*.json`, populate `probe_state` with the
+/// discovered entries, and spawn the probe loop iff at least one
+/// probe was loaded. Mirrors `init_integrations`. Plan 76 Phase 3.
+fn init_probes(boot_state: &Arc<AgentBootState>, probe_state: &Arc<Mutex<ProbeState>>) {
+    boot_state.set_probes(ComponentState::Starting);
+    let entries = probes::load_probe_dropin_dir(probes::PROBES_DROPIN_DIR);
+    let count = entries.len();
+    if let Ok(mut s) = probe_state.lock() {
+        s.probes = entries
+            .into_iter()
+            .map(|e| ProbeHealth {
+                entry: e,
+                last_result: None,
+            })
+            .collect();
+    }
+    if count > 0 {
+        boot_state.set_probes(ComponentState::Ready);
+        let health_state = Arc::clone(probe_state);
+        std::thread::spawn(move || probe_health_loop(health_state));
+    } else {
+        boot_state.set_probes(ComponentState::Disabled);
+    }
+}
+
 /// Generate a per-call TMPDIR path under /tmp. The mutex guarantees only
 /// one in-flight call per VM, so a name collision is exceedingly unlikely
 /// — but use pid + nanos anyway to survive any post-crash leftovers.
@@ -2694,59 +2781,36 @@ fn main() {
     HOT_SAMPLE_INTERVAL_SECS.store(cfg.sample_interval_secs, Ordering::Release);
     std::thread::spawn(move || monitoring_loop(monitor_state));
 
-    // Scan drop-in integrations and start health check thread.
-    // Plan 76 Phase 2: still synchronous here; Phase 3 moves the
-    // scan + health-loop spawn behind the accept loop. Reflect the
-    // synchronous-ready outcome into `AgentBootState` so
-    // `ReadinessStatus` reports it accurately today.
-    let entries = integrations::load_dropin_dir(integrations::INTEGRATIONS_DROPIN_DIR);
-    let integration_count = entries.len();
+    // Plan 76 Phase 3: defer integration drop-in scanning + health
+    // loop startup to a dedicated background thread. The scan
+    // itself is fast (single directory read), but moving it off the
+    // bind-to-accept critical path also means a malformed drop-in
+    // can't bubble a panic into the boot sequence.
     let integration_state = Arc::new(Mutex::new(IntegrationState {
-        integrations: entries
-            .into_iter()
-            .map(|e| IntegrationHealth {
-                entry: e,
-                last_result: None,
-            })
-            .collect(),
+        integrations: Vec::new(),
     }));
-    if integration_count > 0 {
-        boot_state.set_integrations(ComponentState::Ready);
-        let health_state = Arc::clone(&integration_state);
-        std::thread::spawn(move || integration_health_loop(health_state));
-    } else {
-        // `Disabled` is the AgentBootState default; the explicit set
-        // documents intent and survives future refactors that change
-        // the default.
-        boot_state.set_integrations(ComponentState::Disabled);
+    {
+        let bs = Arc::clone(&boot_state);
+        let s = Arc::clone(&integration_state);
+        std::thread::spawn(move || init_integrations(&bs, &s));
     }
 
-    // Scan drop-in probes and start probe execution thread.
-    let probe_entries = probes::load_probe_dropin_dir(probes::PROBES_DROPIN_DIR);
-    let probe_count = probe_entries.len();
+    // Same shape for the probe drop-in scan + loop. Plan 76 Phase 3.
     let probe_state = Arc::new(Mutex::new(ProbeState {
-        probes: probe_entries
-            .into_iter()
-            .map(|e| ProbeHealth {
-                entry: e,
-                last_result: None,
-            })
-            .collect(),
+        probes: Vec::new(),
     }));
-    if probe_count > 0 {
-        boot_state.set_probes(ComponentState::Ready);
-        let health_probe_state = Arc::clone(&probe_state);
-        std::thread::spawn(move || probe_health_loop(health_probe_state));
-    } else {
-        boot_state.set_probes(ComponentState::Disabled);
+    {
+        let bs = Arc::clone(&boot_state);
+        let s = Arc::clone(&probe_state);
+        std::thread::spawn(move || init_probes(&bs, &s));
     }
 
     // Port forwarders are started on-demand via StartPortForward requests
     // from the host (works with all backends, no config drive needed).
 
     eprintln!(
-        "mvm-guest-agent: listening on vsock port {} ({} integrations, {} probes)",
-        cfg.port, integration_count, probe_count
+        "mvm-guest-agent: listening on vsock port {} (entrypoint, warm pool, integrations, probes initializing in background)",
+        cfg.port
     );
 
     // Plan 43: when warm-process is active, real concurrency from
@@ -3371,5 +3435,93 @@ mod tests {
         assert_eq!(SHUTDOWN_HOOK_POLL, Duration::from_millis(200));
         assert_eq!(AFTER_START_HOOK, "/etc/mvm/hooks/after_start.sh");
         assert_eq!(BEFORE_STOP_HOOK, "/etc/mvm/hooks/before_stop.sh");
+    }
+
+    // ─── Plan 76 Phase 2 / Phase 3 — AgentBootState transitions ────
+
+    fn fresh_boot_state() -> AgentBootState {
+        AgentBootState::new(AgentProfile::SealedProd, std::time::Instant::now())
+    }
+
+    #[test]
+    fn boot_state_starts_with_starting_control_plane_and_entrypoint() {
+        let s = fresh_boot_state().snapshot();
+        assert_eq!(s.control_plane, ComponentState::Starting);
+        assert_eq!(s.entrypoint, ComponentState::Starting);
+        // Optional subsystems default to Disabled — they only flip
+        // to Starting when their background init thread actually runs.
+        assert_eq!(s.warm_pool, ComponentState::Disabled);
+        assert_eq!(s.integrations, ComponentState::Disabled);
+        assert_eq!(s.probes, ComponentState::Disabled);
+        assert_eq!(s.volumes, ComponentState::Disabled);
+    }
+
+    #[test]
+    fn mark_vsock_bound_flips_control_plane_to_ready_and_stamps_timing() {
+        let bs = fresh_boot_state();
+        bs.mark_vsock_bound();
+        let s = bs.snapshot();
+        assert_eq!(s.control_plane, ComponentState::Ready);
+        assert!(s.boot_millis.vsock_bound_ms.is_some());
+        assert!(s.boot_millis.agent_started_ms.is_some());
+    }
+
+    #[test]
+    fn set_entrypoint_ready_stamps_entrypoint_ready_ms_once() {
+        let bs = fresh_boot_state();
+        bs.set_entrypoint(ComponentState::Ready);
+        let t1 = bs.snapshot().boot_millis.entrypoint_ready_ms;
+        assert!(t1.is_some());
+        // A later transition (e.g. PostRestore reset) must not
+        // overwrite the original timing — readers polling for
+        // cold-path stats want the FIRST ready time, not the most
+        // recent.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        bs.set_entrypoint(ComponentState::Failed {
+            message: "synthetic".to_string(),
+        });
+        let t2 = bs.snapshot().boot_millis.entrypoint_ready_ms;
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn set_integrations_starting_then_ready_stamps_timing() {
+        let bs = fresh_boot_state();
+        // Phase 3 helpers go through Starting first; only that path
+        // should stamp the timing. A direct Disabled → Disabled
+        // transition must NOT stamp.
+        bs.set_integrations(ComponentState::Disabled);
+        assert!(bs.snapshot().boot_millis.integrations_ready_ms.is_none());
+
+        bs.set_integrations(ComponentState::Starting);
+        assert!(bs.snapshot().boot_millis.integrations_ready_ms.is_none());
+
+        bs.set_integrations(ComponentState::Ready);
+        assert!(bs.snapshot().boot_millis.integrations_ready_ms.is_some());
+    }
+
+    #[test]
+    fn set_integrations_starting_then_disabled_also_stamps() {
+        // Empty drop-in dir: the background thread enters Starting,
+        // scans, finds nothing, and flips to Disabled. That's still
+        // a meaningful "scan completed" event — stamp the time so
+        // a host can see cold-path latency includes the no-op scan.
+        let bs = fresh_boot_state();
+        bs.set_integrations(ComponentState::Starting);
+        bs.set_integrations(ComponentState::Disabled);
+        assert!(bs.snapshot().boot_millis.integrations_ready_ms.is_some());
+    }
+
+    #[test]
+    fn set_warm_pool_only_stamps_after_first_starting_transition() {
+        let bs = fresh_boot_state();
+        // Initial Disabled (Default) → Disabled (cold-tier image,
+        // no warm-pool config). No Starting in between → no stamp.
+        bs.set_warm_pool(ComponentState::Disabled);
+        assert!(bs.snapshot().boot_millis.warm_pool_ready_ms.is_none());
+
+        bs.set_warm_pool(ComponentState::Starting);
+        bs.set_warm_pool(ComponentState::Ready);
+        assert!(bs.snapshot().boot_millis.warm_pool_ready_ms.is_some());
     }
 }

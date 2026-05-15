@@ -60,11 +60,23 @@ verbs in sealed-prod. Both checks run on every request.
 ## Readiness model
 
 Plan 76 Phase 2 binds the vsock control port **before** entrypoint
-validation and warm-process pool startup. That keeps the host's
-`mvmctl up` from blocking on guest-side warmup — the agent accepts
+validation and warm-process pool startup. Phase 3 extends the same
+pattern to integration / probe drop-in scans. The agent accepts
 `Ping` / `ReadinessStatus` / `EntrypointStatus` immediately, and
 `RunEntrypoint` returns a typed `RunEntrypointError::NotReady` until
 entrypoint validation completes.
+
+Background init threads in order of when they start:
+
+1. Entrypoint validation → warm-pool startup (serial inside one
+   thread because the pool depends on `VALIDATED_ENTRYPOINT`).
+2. Integration drop-in scan + health-loop spawn.
+3. Probe drop-in scan + probe-loop spawn.
+
+All three run in parallel after the accept loop is already serving
+control-plane traffic. A malformed drop-in cannot block bind or
+delay `Ping`; a slow `after_start.sh` only delays
+`warm_pool_ready_ms`, not the rest of the readiness report.
 
 A host queries the live state via the `ReadinessStatus` verb:
 
