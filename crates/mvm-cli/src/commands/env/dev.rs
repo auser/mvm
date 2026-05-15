@@ -50,11 +50,24 @@ enum DevBackend {
 }
 
 fn current_backend() -> DevBackend {
+    // Selection order per CLAUDE.md §"Dev mode":
+    //   macOS 26+ Apple Silicon  → Apple Container (preferred)
+    //   older macOS with libkrun → Libkrun (legacy fallback)
+    //   Linux with KVM           → Firecracker / libkrun direct
+    //
+    // Apple Container wins over Libkrun on macOS even when both are
+    // available because it is the documented Stage 0 boundary AND
+    // the build boundary `RuntimeBuildEnv::shell_exec_visible`
+    // routes through (`AppleContainerEnv` in `mvm-base::linux_env`).
+    // Picking Libkrun-the-dev-backend while `LinuxEnv` is
+    // `AppleContainerEnv` leaves the dev VM under one runtime and
+    // the build boundary under another, neither one starting the
+    // other.
     let plat = platform::current();
-    if matches!(plat, Platform::MacOS) && plat.has_libkrun() {
-        DevBackend::Libkrun
-    } else if plat.has_apple_containers() {
+    if plat.has_apple_containers() {
         DevBackend::AppleContainer
+    } else if matches!(plat, Platform::MacOS) && plat.has_libkrun() {
+        DevBackend::Libkrun
     } else if plat.has_kvm() && matches!(plat, Platform::LinuxNative) {
         DevBackend::LinuxKvm
     } else {
