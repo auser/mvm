@@ -1,5 +1,5 @@
 {
-  description = "mvm runtime overlay disk — verity-sealed ext4 carrying the guest agent + seccomp shim + runner, mounted at /mvm/runtime in every microVM (ADR-051)";
+  description = "mvm runtime overlay disk — verity-sealed ext4 carrying the guest agent + seccomp shim + netinit + runner, mounted at /mvm/runtime in every microVM (ADR-051)";
 
   # ── Why this flake exists ─────────────────────────────────────────
   #
@@ -7,12 +7,14 @@
   # a second virtio-blk device that every mvm microVM attaches at
   # boot — Nix-built rootfs and OCI-pulled rootfs alike. The
   # overlay carries the in-VM binaries mvm controls (the guest
-  # agent, the per-service seccomp shim, the verity-initrd PID 1
-  # binary, the function-workload runner) plus a placeholder for
-  # the per-language SDK runtime libraries that ADR-049's vsock
-  # substitution depends on (the libraries themselves land in
-  # plan 74 W4; this flake reserves the directory layout today so
-  # the boot path is stable).
+  # agent, the per-service seccomp shim, the function-workload
+  # runner, and — plan 74 W2 — `mvm-guest-netinit` which installs
+  # kernel blackhole routes for `MANDATORY_DENY_RANGES` so OCI-
+  # imported workloads get Layer 1 network defense too) plus a
+  # placeholder for the per-language SDK runtime libraries that
+  # ADR-049's vsock substitution depends on (the libraries
+  # themselves land in plan 74 W4; this flake reserves the
+  # directory layout today so the boot path is stable).
   #
   # The flake produces, per supported system, a `$out/` containing:
   #
@@ -233,6 +235,7 @@
             mkdir -p "$staging"
             cp ${guest}/bin/mvm-guest-agent      "$staging/agent"
             cp ${guest}/bin/mvm-seccomp-apply    "$staging/seccomp-apply"
+            cp ${guest}/bin/mvm-guest-netinit    "$staging/netinit"
             cp ${runner}/bin/mvm-runner          "$staging/runner"
 
             # SDK runtime library placeholders. plan 74 W4 fills

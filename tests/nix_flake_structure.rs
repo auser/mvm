@@ -268,6 +268,34 @@ fn mk_guest_installs_netinit_at_boot() {
     );
 }
 
+/// Plan 74 W2 (deferred-list item) — the runtime overlay flake
+/// must stage `mvm-guest-netinit` at the canonical `/netinit`
+/// path inside the overlay so OCI-imported workloads get
+/// Layer 1 network defense too. The `mk-guest.nix` /init prefers
+/// `/mvm/runtime/netinit` over the baked-in copy; without this
+/// line, the prefer-overlay fallback falls through silently on
+/// OCI workloads (which don't have a baked-in copy at all).
+#[test]
+fn runtime_overlay_flake_stages_netinit_binary() {
+    let path = nix_dir()
+        .join("images")
+        .join("runtime-overlay")
+        .join("flake.nix");
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("nix/images/runtime-overlay/flake.nix must be present: {e}"));
+
+    assert!(
+        content.contains("cp ${guest}/bin/mvm-guest-netinit    \"$staging/netinit\""),
+        "runtime-overlay flake must stage `mvm-guest-netinit` at \
+         `/netinit` inside the overlay ext4. The W1.4b mkGuest \
+         /init resolution prefers `/mvm/runtime/netinit`; if the \
+         overlay doesn't stage the binary, OCI workloads silently \
+         fall through to the no-defense path. Pinned exact-string \
+         match (with the canonical column alignment) to catch a \
+         drop or rename in one regression-shaped commit."
+    );
+}
+
 #[test]
 fn flake_lock_pins_microvm_input_by_hash() {
     // The flake.lock must exist and pin the microvm.nix input by
