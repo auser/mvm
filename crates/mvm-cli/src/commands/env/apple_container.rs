@@ -4,6 +4,7 @@
 //! no behavior changes.
 
 use anyhow::{Context, Result};
+use sha2::{Digest, Sha256};
 
 use mvm::vsock_transport::{VsockProxyTransport, VsockTransport};
 
@@ -15,6 +16,7 @@ use crate::ui;
 // ============================================================================
 
 pub(super) const DEV_VM_NAME: &str = "mvm-dev";
+const BUILDER_VM_SOURCE_FINGERPRINT_FILE: &str = ".mvm-source.sha256";
 
 /// Check if the Apple Container dev VM is running *and* reachable
 /// cross-process via the vsock proxy socket.
@@ -1820,20 +1822,36 @@ fn bootstrap_builder_vm_image() -> Result<()> {
         "x86_64"
     };
     let out_dir = format!("{}/builder-vm/{arch}", mvm_core::config::mvm_cache_dir());
+    let out_dir_path = std::path::Path::new(&out_dir);
+    let builder_flake = find_builder_vm_flake();
+    let source_fingerprint = builder_flake
+        .as_ref()
+        .ok()
+        .map(|flake_dir| builder_vm_source_fingerprint(flake_dir))
+        .transpose()?;
+    let cache_ready = match source_fingerprint.as_deref() {
+        Some(fingerprint) => builder_vm_source_cache_ready(out_dir_path, fingerprint),
+        None => validate_builder_vm_stage0_artifacts(out_dir_path).is_ok(),
+    };
 
-    let cache_ready = validate_builder_vm_stage0_artifacts(std::path::Path::new(&out_dir)).is_ok();
-
-    match resolve_builder_vm_bootstrap_action(find_builder_vm_flake(), cache_ready)? {
+    match resolve_builder_vm_bootstrap_action(builder_flake, cache_ready)? {
         BuilderVmBootstrapAction::UseCached => {
             ui::info(&format!("Builder VM image already cached at {out_dir}."));
             Ok(())
         }
         BuilderVmBootstrapAction::BuildFromSource { flake_dir } => {
+            let source_fingerprint = source_fingerprint.ok_or_else(|| {
+                anyhow::anyhow!("builder VM source fingerprint was not computed for {flake_dir}")
+            })?;
             ui::info(&format!(
                 "Builder VM image not in cache; building locally from {flake_dir}..."
             ));
-            bootstrap_builder_vm_image_via_dev_image_stage0(&flake_dir, &out_dir)
-                .context("building the source-checkout builder VM image")
+            bootstrap_builder_vm_image_via_dev_image_stage0(
+                &flake_dir,
+                &out_dir,
+                &source_fingerprint,
+            )
+            .context("building the source-checkout builder VM image")
         }
         BuilderVmBootstrapAction::DownloadPublished => {
             ui::info(&format!(
@@ -1876,6 +1894,7 @@ const STAGE0_BOOTSTRAP_CMDLINE: &str =
 fn bootstrap_builder_vm_image_via_dev_image_stage0(
     builder_flake_dir: &str,
     out_dir: &str,
+    source_fingerprint: &str,
 ) -> Result<()> {
     use mvm_build::builder_vm::BuilderVm as _;
     use mvm_build::libkrun_builder::LibkrunBuilderVm;
@@ -1917,8 +1936,9 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
         let _ = std::fs::remove_dir_all(&staging_dir);
         return Err(e);
     }
+    write_builder_vm_source_fingerprint(&staging_dir, source_fingerprint)?;
 
-    if let Err(e) = promote_builder_vm_stage0_cache(&staging_dir, out_dir) {
+    if let Err(e) = promote_builder_vm_stage0_cache(&staging_dir, out_dir, source_fingerprint) {
         let _ = std::fs::remove_dir_all(&staging_dir);
         return Err(e);
     }
@@ -1930,6 +1950,7 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
 fn bootstrap_builder_vm_image_via_dev_image_stage0(
     builder_flake_dir: &str,
     _out_dir: &str,
+    _source_fingerprint: &str,
 ) -> Result<()> {
     anyhow::bail!(
         "cannot build builder VM image from source checkout at {builder_flake_dir}: \
@@ -2011,15 +2032,71 @@ fn validate_builder_vm_stage0_artifacts(dir: &std::path::Path) -> Result<()> {
     })
 }
 
+fn builder_vm_source_fingerprint(builder_flake_dir: &str) -> Result<String> {
+    let flake_dir = std::path::Path::new(builder_flake_dir);
+    let mut hasher = Sha256::new();
+    for name in ["flake.nix", "flake.lock"] {
+        let path = flake_dir.join(name);
+        if !path.exists() {
+            if name == "flake.nix" {
+                anyhow::bail!("builder VM source fingerprint missing {}", path.display());
+            }
+            continue;
+        }
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading builder VM source input {}", path.display()))?;
+        hasher.update(name.as_bytes());
+        hasher.update(b"\0");
+        hasher.update((bytes.len() as u64).to_le_bytes());
+        hasher.update(b"\0");
+        hasher.update(bytes);
+        hasher.update(b"\0");
+    }
+    Ok(format!("{:x}", hasher.finalize()))
+}
+
+fn builder_vm_source_cache_ready(dir: &std::path::Path, expected_fingerprint: &str) -> bool {
+    validate_builder_vm_stage0_artifacts(dir).is_ok()
+        && builder_vm_source_fingerprint_matches(dir, expected_fingerprint)
+}
+
+fn builder_vm_source_fingerprint_matches(
+    dir: &std::path::Path,
+    expected_fingerprint: &str,
+) -> bool {
+    std::fs::read_to_string(dir.join(BUILDER_VM_SOURCE_FINGERPRINT_FILE))
+        .map(|actual| actual.trim() == expected_fingerprint)
+        .unwrap_or(false)
+}
+
+#[cfg(any(feature = "builder-vm", test))]
+fn write_builder_vm_source_fingerprint(
+    dir: &std::path::Path,
+    source_fingerprint: &str,
+) -> Result<()> {
+    std::fs::write(
+        dir.join(BUILDER_VM_SOURCE_FINGERPRINT_FILE),
+        format!("{source_fingerprint}\n"),
+    )
+    .with_context(|| format!("writing builder VM source fingerprint in {}", dir.display()))
+}
+
 #[cfg(any(feature = "builder-vm", test))]
 fn promote_builder_vm_stage0_cache(
     staging_dir: &std::path::Path,
     final_dir: &std::path::Path,
+    source_fingerprint: &str,
 ) -> Result<()> {
     validate_builder_vm_stage0_artifacts(staging_dir)?;
+    if !builder_vm_source_fingerprint_matches(staging_dir, source_fingerprint) {
+        anyhow::bail!(
+            "Stage 0 builder VM staging dir {} is missing the expected source fingerprint",
+            staging_dir.display()
+        );
+    }
 
     if final_dir.exists() {
-        if validate_builder_vm_stage0_artifacts(final_dir).is_ok() {
+        if builder_vm_source_cache_ready(final_dir, source_fingerprint) {
             std::fs::remove_dir_all(staging_dir).with_context(|| {
                 format!(
                     "removing redundant Stage 0 staging dir {}",
@@ -2746,6 +2823,14 @@ mod builder_vm_bootstrap_tests {
         std::fs::write(dir.join("rootfs.ext4"), rootfs).expect("write rootfs");
     }
 
+    fn write_builder_vm_flake(dir: &std::path::Path, flake: &str, lock: Option<&str>) {
+        std::fs::create_dir_all(dir).expect("mkdir flake dir");
+        std::fs::write(dir.join("flake.nix"), flake).expect("write flake");
+        if let Some(lock) = lock {
+            std::fs::write(dir.join("flake.lock"), lock).expect("write lock");
+        }
+    }
+
     #[test]
     fn builder_vm_stage0_staging_dir_is_hidden_sibling() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2771,9 +2856,10 @@ mod builder_vm_bootstrap_tests {
         std::fs::create_dir_all(&staging).expect("mkdir staging");
         std::fs::write(staging.join("vmlinux"), b"stub").expect("write stub kernel");
         std::fs::write(staging.join("rootfs.ext4"), b"stub").expect("write stub rootfs");
+        write_builder_vm_source_fingerprint(&staging, "fingerprint").expect("write fingerprint");
         let final_dir = tmp.path().join("aarch64");
 
-        let err = promote_builder_vm_stage0_cache(&staging, &final_dir)
+        let err = promote_builder_vm_stage0_cache(&staging, &final_dir, "fingerprint")
             .expect_err("stub artifacts must not be promoted");
         let msg = format!("{err:#}");
         assert!(
@@ -2789,12 +2875,14 @@ mod builder_vm_bootstrap_tests {
         let staging = tmp.path().join(".aarch64.stage0-test");
         let final_dir = tmp.path().join("aarch64");
         write_valid_builder_vm_artifacts(&staging);
+        write_builder_vm_source_fingerprint(&staging, "fingerprint").expect("write fingerprint");
 
-        promote_builder_vm_stage0_cache(&staging, &final_dir)
+        promote_builder_vm_stage0_cache(&staging, &final_dir, "fingerprint")
             .expect("valid artifacts should promote");
 
         assert!(!staging.exists(), "staging dir should be moved away");
         validate_builder_vm_stage0_artifacts(&final_dir).expect("final cache should validate");
+        assert!(builder_vm_source_cache_ready(&final_dir, "fingerprint"));
     }
 
     #[test]
@@ -2803,14 +2891,69 @@ mod builder_vm_bootstrap_tests {
         let staging = tmp.path().join(".aarch64.stage0-test");
         let final_dir = tmp.path().join("aarch64");
         write_valid_builder_vm_artifacts(&staging);
+        write_builder_vm_source_fingerprint(&staging, "fingerprint").expect("write fingerprint");
         write_valid_builder_vm_artifacts(&final_dir);
+        write_builder_vm_source_fingerprint(&final_dir, "fingerprint").expect("write fingerprint");
 
-        promote_builder_vm_stage0_cache(&staging, &final_dir)
+        promote_builder_vm_stage0_cache(&staging, &final_dir, "fingerprint")
             .expect("existing valid cache should win the race");
 
         assert!(!staging.exists(), "redundant staging dir should be removed");
         validate_builder_vm_stage0_artifacts(&final_dir)
             .expect("existing cache should remain valid");
+    }
+
+    #[test]
+    fn builder_vm_source_fingerprint_changes_with_flake_inputs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let flake = tmp.path().join("nix/images/builder-vm");
+        write_builder_vm_flake(&flake, "{ outputs = _: {}; }", Some("{\"nodes\":{}}"));
+        let first = builder_vm_source_fingerprint(flake.to_str().unwrap()).expect("fingerprint");
+
+        write_builder_vm_flake(
+            &flake,
+            "{ outputs = _: { changed = true; }; }",
+            Some("{\"nodes\":{}}"),
+        );
+        let second = builder_vm_source_fingerprint(flake.to_str().unwrap()).expect("fingerprint");
+
+        assert_ne!(first, second);
+    }
+
+    #[test]
+    fn builder_vm_source_cache_requires_matching_fingerprint() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("builder-vm").join("aarch64");
+        write_valid_builder_vm_artifacts(&cache);
+
+        assert!(
+            !builder_vm_source_cache_ready(&cache, "fingerprint"),
+            "valid artifacts without a source marker must not satisfy source checkout cache"
+        );
+        write_builder_vm_source_fingerprint(&cache, "other").expect("write fingerprint");
+        assert!(
+            !builder_vm_source_cache_ready(&cache, "fingerprint"),
+            "stale source marker must not satisfy source checkout cache"
+        );
+        write_builder_vm_source_fingerprint(&cache, "fingerprint").expect("write fingerprint");
+        assert!(builder_vm_source_cache_ready(&cache, "fingerprint"));
+    }
+
+    #[test]
+    fn builder_vm_stage0_promotion_replaces_stale_valid_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let staging = tmp.path().join(".aarch64.stage0-test");
+        let final_dir = tmp.path().join("aarch64");
+        write_valid_builder_vm_artifacts(&staging);
+        write_builder_vm_source_fingerprint(&staging, "new").expect("write staging fingerprint");
+        write_valid_builder_vm_artifacts(&final_dir);
+        write_builder_vm_source_fingerprint(&final_dir, "old").expect("write old fingerprint");
+
+        promote_builder_vm_stage0_cache(&staging, &final_dir, "new")
+            .expect("stale valid cache should be replaced");
+
+        assert!(!staging.exists(), "staging dir should be moved away");
+        assert!(builder_vm_source_cache_ready(&final_dir, "new"));
     }
 
     #[test]
