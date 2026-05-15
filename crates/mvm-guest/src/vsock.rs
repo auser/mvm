@@ -50,6 +50,17 @@ pub const CONSOLE_PORT_BASE: u32 = 20000;
 /// Default connect/read timeout in seconds.
 pub const DEFAULT_TIMEOUT_SECS: u64 = 10;
 
+/// Current guest-agent control protocol version.
+///
+/// This is distinct from `PROTOCOL_VERSION_AUTHENTICATED`, which
+/// versions the signed envelope used by authenticated frame wrappers.
+/// `PROTOCOL_VERSION` versions the `GuestRequest` / `GuestResponse`
+/// control surface served by `mvm-guest-agent`.
+pub const PROTOCOL_VERSION: u32 = 1;
+
+/// Oldest guest-agent control protocol this host can speak.
+pub const MIN_SUPPORTED_PROTOCOL_VERSION: u32 = 1;
+
 /// Maximum response frame size (256 KiB).
 const MAX_FRAME_SIZE: usize = 256 * 1024;
 
@@ -74,6 +85,15 @@ const CONNECT_RETRY_DELAY_MS: u64 = 500;
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum GuestRequest {
+    /// Negotiate guest-agent protocol compatibility and capabilities
+    /// before dispatching capability-dependent requests. ADR-050 /
+    /// plan 74 W1.
+    ProtocolHello {
+        host_protocol_version: u32,
+        min_supported_version: u32,
+        host_version: String,
+        requested_capabilities: Vec<GuestCapability>,
+    },
     /// Query current worker status.
     WorkerStatus,
     /// Request sleep preparation. Guest should:
@@ -394,6 +414,20 @@ fn default_true() -> bool {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum GuestResponse {
+    /// Guest-agent protocol negotiation succeeded. ADR-050 / plan 74 W1.
+    ProtocolHelloAck {
+        agent_protocol_version: u32,
+        min_supported_version: u32,
+        agent_version: String,
+        capabilities: Vec<GuestCapability>,
+    },
+    /// Guest-agent protocol negotiation failed before dispatch.
+    ProtocolMismatch {
+        host_protocol_version: u32,
+        agent_protocol_version: u32,
+        required_action: ProtocolUpgradeAction,
+        message: String,
+    },
     /// Worker status with optional last-busy timestamp.
     WorkerStatus {
         status: String,
@@ -496,6 +530,108 @@ pub enum GuestResponse {
         previous_secs: u64,
         applied_secs: u64,
     },
+}
+
+/// Guest-agent control protocol capability. Closed enum so host and
+/// guest fail loudly on drift instead of accepting arbitrary strings.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum GuestCapability {
+    Ping,
+    IntegrationStatus,
+    EntrypointStatus,
+    RunEntrypoint,
+    FilesystemRpc,
+    ProcessRpc,
+    Console,
+    VolumeMount,
+    UpdateIdleTimeout,
+}
+
+/// Required remediation for a host/guest protocol mismatch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ProtocolUpgradeAction {
+    UpgradeHost,
+    RebuildGuest,
+    DowngradeHost,
+}
+
+/// Protocol negotiation result returned by [`negotiate_protocol`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProtocolNegotiation {
+    pub agent_protocol_version: u32,
+    pub min_supported_version: u32,
+    pub agent_version: String,
+    pub capabilities: Vec<GuestCapability>,
+}
+
+/// Capabilities served by this agent build.
+pub fn supported_capabilities() -> Vec<GuestCapability> {
+    vec![
+        GuestCapability::Ping,
+        GuestCapability::IntegrationStatus,
+        GuestCapability::EntrypointStatus,
+        GuestCapability::RunEntrypoint,
+        GuestCapability::FilesystemRpc,
+        GuestCapability::ProcessRpc,
+        GuestCapability::Console,
+        GuestCapability::VolumeMount,
+        GuestCapability::UpdateIdleTimeout,
+    ]
+}
+
+/// Return `true` when `[a_min, a_max]` overlaps `[b_min, b_max]`.
+fn protocol_ranges_overlap(a_min: u32, a_max: u32, b_min: u32, b_max: u32) -> bool {
+    a_min <= b_max && b_min <= a_max
+}
+
+/// Build the guest side response for a protocol hello request.
+pub fn protocol_hello_response(
+    host_protocol_version: u32,
+    host_min_supported_version: u32,
+    _host_version: &str,
+    requested_capabilities: &[GuestCapability],
+) -> GuestResponse {
+    if !protocol_ranges_overlap(
+        host_min_supported_version,
+        host_protocol_version,
+        MIN_SUPPORTED_PROTOCOL_VERSION,
+        PROTOCOL_VERSION,
+    ) {
+        let required_action = if host_protocol_version < MIN_SUPPORTED_PROTOCOL_VERSION {
+            ProtocolUpgradeAction::UpgradeHost
+        } else {
+            ProtocolUpgradeAction::RebuildGuest
+        };
+
+        return GuestResponse::ProtocolMismatch {
+            host_protocol_version,
+            agent_protocol_version: PROTOCOL_VERSION,
+            required_action,
+            message: format!(
+                "guest-agent protocol mismatch: host supports {}..={}, agent supports {}..={}",
+                host_min_supported_version,
+                host_protocol_version,
+                MIN_SUPPORTED_PROTOCOL_VERSION,
+                PROTOCOL_VERSION
+            ),
+        };
+    }
+
+    let supported = supported_capabilities();
+    let capabilities = requested_capabilities
+        .iter()
+        .copied()
+        .filter(|cap| supported.contains(cap))
+        .collect();
+
+    GuestResponse::ProtocolHelloAck {
+        agent_protocol_version: PROTOCOL_VERSION,
+        min_supported_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+        agent_version: env!("CARGO_PKG_VERSION").to_string(),
+        capabilities,
+    }
 }
 
 /// Result of a virtio-fs volume mount operation.
@@ -1440,6 +1576,75 @@ pub fn send_request(stream: &mut UnixStream, req: &GuestRequest) -> Result<Guest
     serde_json::from_slice(&buf).with_context(|| "Failed to deserialize response")
 }
 
+/// Negotiate guest-agent protocol version and capabilities on an
+/// already-connected control stream.
+///
+/// This helper is intentionally stream-level so it works with both the
+/// Firecracker UDS multiplexer path and Apple Container's direct vsock
+/// stream. Hard cutover (ADR-050 / plan 74 W1): every fresh session
+/// must call this before issuing any operational request, including a
+/// bare `Ping` reachability probe. Pre-hello guest agents receive
+/// `ProtocolMismatch` and the connection is closed; this helper
+/// surfaces that as an error so callers can prompt the user to
+/// rebuild their dev VM.
+pub fn negotiate_protocol(
+    stream: &mut UnixStream,
+    requested_capabilities: Vec<GuestCapability>,
+) -> Result<ProtocolNegotiation> {
+    let resp = send_request(
+        stream,
+        &GuestRequest::ProtocolHello {
+            host_protocol_version: PROTOCOL_VERSION,
+            min_supported_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+            host_version: env!("CARGO_PKG_VERSION").to_string(),
+            requested_capabilities,
+        },
+    )?;
+
+    match resp {
+        GuestResponse::ProtocolHelloAck {
+            agent_protocol_version,
+            min_supported_version,
+            agent_version,
+            capabilities,
+        } => Ok(ProtocolNegotiation {
+            agent_protocol_version,
+            min_supported_version,
+            agent_version,
+            capabilities,
+        }),
+        GuestResponse::ProtocolMismatch {
+            required_action,
+            message,
+            ..
+        } => bail!("guest-agent protocol mismatch ({required_action:?}): {message}"),
+        GuestResponse::Error { message } => {
+            bail!("guest-agent protocol negotiation error: {message}")
+        }
+        other => bail!("unexpected response to ProtocolHello: {other:?}"),
+    }
+}
+
+/// Negotiate the guest-agent protocol and fail if any mandatory
+/// capability is missing.
+pub fn require_capabilities(
+    stream: &mut UnixStream,
+    required_capabilities: &[GuestCapability],
+) -> Result<ProtocolNegotiation> {
+    let negotiated = negotiate_protocol(stream, required_capabilities.to_vec())?;
+    let missing: Vec<_> = required_capabilities
+        .iter()
+        .copied()
+        .filter(|cap| !negotiated.capabilities.contains(cap))
+        .collect();
+
+    if !missing.is_empty() {
+        bail!("guest-agent missing required capabilities: {missing:?}");
+    }
+
+    Ok(negotiated)
+}
+
 /// Send a `RunEntrypoint` request and consume the streaming
 /// `EntrypointEvent` response. ADR-007 / plan 41 W3.
 ///
@@ -1462,6 +1667,7 @@ pub fn send_run_entrypoint<F>(
 where
     F: FnMut(&EntrypointEvent),
 {
+    require_capabilities(stream, &[GuestCapability::RunEntrypoint])?;
     let req = GuestRequest::RunEntrypoint {
         stdin,
         timeout_secs,
@@ -1714,6 +1920,7 @@ pub fn send_proc_request(instance_dir: &str, req: GuestRequest) -> Result<ProcRe
             | GuestRequest::ProcKill { .. }
     ));
     let mut stream = connect(instance_dir, DEFAULT_TIMEOUT_SECS)?;
+    require_capabilities(&mut stream, &[GuestCapability::ProcessRpc])?;
     let resp = send_request(&mut stream, &req)?;
     match resp {
         GuestResponse::ProcResult(r) => Ok(r),
@@ -1734,6 +1941,7 @@ pub fn send_proc_wait<F: FnMut(&ProcWaitEvent)>(
     mut on_event: F,
 ) -> Result<ProcWaitEvent> {
     let mut stream = connect(instance_dir, DEFAULT_TIMEOUT_SECS)?;
+    require_capabilities(&mut stream, &[GuestCapability::ProcessRpc])?;
     let req = GuestRequest::ProcWait {
         pid_token: pid_token.to_string(),
         timeout_secs,
@@ -1772,6 +1980,7 @@ pub fn send_fs_request(instance_dir: &str, req: GuestRequest) -> Result<FsResult
             | GuestRequest::FsMove { .. }
     ));
     let mut stream = connect(instance_dir, DEFAULT_TIMEOUT_SECS)?;
+    require_capabilities(&mut stream, &[GuestCapability::FilesystemRpc])?;
     let resp = send_request(&mut stream, &req)?;
     match resp {
         GuestResponse::FsResult(r) => Ok(r),
@@ -1784,7 +1993,14 @@ pub fn send_fs_request(instance_dir: &str, req: GuestRequest) -> Result<FsResult
 ///
 /// Used by the Apple Container backend where the vsock connection is
 /// established via `VZVirtioSocketDevice` rather than a UDS path.
+///
+/// Performs the ADR-050 / plan 74 W1 hello prelude internally so
+/// callers don't have to. `StartPortForward` is not a capability-gated
+/// operation, so an empty capability list is requested — the hello
+/// alone satisfies the agent's "no operational request before hello"
+/// rule.
 pub fn start_port_forward_on(stream: &mut UnixStream, guest_port: u16) -> Result<u32> {
+    let _ = negotiate_protocol(stream, Vec::new())?;
     let resp = send_request(stream, &GuestRequest::StartPortForward { guest_port })?;
     match resp {
         GuestResponse::PortForwardStarted { vsock_port, .. } => Ok(vsock_port),
@@ -1806,6 +2022,12 @@ mod tests {
     #[test]
     fn test_guest_request_roundtrip() {
         let variants: Vec<GuestRequest> = vec![
+            GuestRequest::ProtocolHello {
+                host_protocol_version: PROTOCOL_VERSION,
+                min_supported_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+                host_version: "0.1.0".to_string(),
+                requested_capabilities: vec![GuestCapability::Ping, GuestCapability::RunEntrypoint],
+            },
             GuestRequest::WorkerStatus,
             GuestRequest::SleepPrep {
                 drain_timeout_secs: 30,
@@ -1929,6 +2151,18 @@ mod tests {
         use crate::integrations::{IntegrationStateReport, IntegrationStatus};
 
         let variants: Vec<GuestResponse> = vec![
+            GuestResponse::ProtocolHelloAck {
+                agent_protocol_version: PROTOCOL_VERSION,
+                min_supported_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+                agent_version: "0.1.0".to_string(),
+                capabilities: vec![GuestCapability::Ping],
+            },
+            GuestResponse::ProtocolMismatch {
+                host_protocol_version: 0,
+                agent_protocol_version: PROTOCOL_VERSION,
+                required_action: ProtocolUpgradeAction::UpgradeHost,
+                message: "host too old".to_string(),
+            },
             GuestResponse::WorkerStatus {
                 status: "idle".to_string(),
                 last_busy_at: Some("2025-01-01T00:00:00Z".to_string()),
@@ -2088,6 +2322,236 @@ mod tests {
             let json2 = serde_json::to_string(&parsed).unwrap();
             assert_eq!(json, json2);
         }
+    }
+
+    #[test]
+    fn test_protocol_hello_response_ack_filters_capabilities() {
+        let resp = protocol_hello_response(
+            PROTOCOL_VERSION,
+            MIN_SUPPORTED_PROTOCOL_VERSION,
+            "host-test",
+            &[GuestCapability::Ping, GuestCapability::RunEntrypoint],
+        );
+
+        match resp {
+            GuestResponse::ProtocolHelloAck {
+                agent_protocol_version,
+                min_supported_version,
+                capabilities,
+                ..
+            } => {
+                assert_eq!(agent_protocol_version, PROTOCOL_VERSION);
+                assert_eq!(min_supported_version, MIN_SUPPORTED_PROTOCOL_VERSION);
+                assert_eq!(
+                    capabilities,
+                    vec![GuestCapability::Ping, GuestCapability::RunEntrypoint]
+                );
+            }
+            other => panic!("expected ProtocolHelloAck, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_protocol_hello_response_upgrade_host_when_host_too_old() {
+        let resp = protocol_hello_response(0, 0, "host-test", &[GuestCapability::Ping]);
+
+        match resp {
+            GuestResponse::ProtocolMismatch {
+                host_protocol_version,
+                agent_protocol_version,
+                required_action,
+                message,
+            } => {
+                assert_eq!(host_protocol_version, 0);
+                assert_eq!(agent_protocol_version, PROTOCOL_VERSION);
+                assert_eq!(required_action, ProtocolUpgradeAction::UpgradeHost);
+                assert!(message.contains("protocol mismatch"));
+            }
+            other => panic!("expected ProtocolMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_protocol_hello_response_rebuild_guest_when_agent_too_old() {
+        let resp = protocol_hello_response(
+            PROTOCOL_VERSION + 10,
+            PROTOCOL_VERSION + 10,
+            "host-test",
+            &[GuestCapability::Ping],
+        );
+
+        match resp {
+            GuestResponse::ProtocolMismatch {
+                host_protocol_version,
+                agent_protocol_version,
+                required_action,
+                ..
+            } => {
+                assert_eq!(host_protocol_version, PROTOCOL_VERSION + 10);
+                assert_eq!(agent_protocol_version, PROTOCOL_VERSION);
+                assert_eq!(required_action, ProtocolUpgradeAction::RebuildGuest);
+            }
+            other => panic!("expected ProtocolMismatch, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn test_protocol_unknown_field_rejected() {
+        let req_json = r#"{"ProtocolHello":{"host_protocol_version":1,"min_supported_version":1,"host_version":"0.1.0","requested_capabilities":["ping"],"extra":true}}"#;
+        let req: Result<GuestRequest, _> = serde_json::from_str(req_json);
+        assert!(req.is_err(), "ProtocolHello extra field must reject");
+
+        let resp_json = r#"{"ProtocolHelloAck":{"agent_protocol_version":1,"min_supported_version":1,"agent_version":"0.1.0","capabilities":["ping"],"extra":true}}"#;
+        let resp: Result<GuestResponse, _> = serde_json::from_str(resp_json);
+        assert!(resp.is_err(), "ProtocolHelloAck extra field must reject");
+    }
+
+    #[test]
+    fn test_negotiate_protocol_round_trip_on_stream() {
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+
+        let guest_thread = std::thread::spawn(move || {
+            let req: GuestRequest = read_frame(&mut guest).unwrap();
+            match req {
+                GuestRequest::ProtocolHello {
+                    host_protocol_version,
+                    min_supported_version,
+                    host_version,
+                    requested_capabilities,
+                } => {
+                    let resp = protocol_hello_response(
+                        host_protocol_version,
+                        min_supported_version,
+                        &host_version,
+                        &requested_capabilities,
+                    );
+                    write_frame(&mut guest, &resp).unwrap();
+                }
+                other => panic!("expected ProtocolHello, got {other:?}"),
+            }
+        });
+
+        let negotiated = negotiate_protocol(
+            &mut host,
+            vec![GuestCapability::Ping, GuestCapability::FilesystemRpc],
+        )
+        .unwrap();
+
+        guest_thread.join().unwrap();
+        assert_eq!(negotiated.agent_protocol_version, PROTOCOL_VERSION);
+        assert_eq!(
+            negotiated.capabilities,
+            vec![GuestCapability::Ping, GuestCapability::FilesystemRpc]
+        );
+    }
+
+    #[test]
+    fn test_negotiate_protocol_mismatch_is_error() {
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+
+        let guest_thread = std::thread::spawn(move || {
+            let _req: GuestRequest = read_frame(&mut guest).unwrap();
+            write_frame(
+                &mut guest,
+                &GuestResponse::ProtocolMismatch {
+                    host_protocol_version: PROTOCOL_VERSION + 1,
+                    agent_protocol_version: PROTOCOL_VERSION,
+                    required_action: ProtocolUpgradeAction::RebuildGuest,
+                    message: "rebuild guest image".to_string(),
+                },
+            )
+            .unwrap();
+        });
+
+        let err = negotiate_protocol(&mut host, vec![GuestCapability::Ping]).unwrap_err();
+        guest_thread.join().unwrap();
+        assert!(err.to_string().contains("protocol mismatch"));
+        assert!(err.to_string().contains("rebuild guest image"));
+    }
+
+    #[test]
+    fn test_require_capabilities_accepts_present_capability() {
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+
+        let guest_thread = std::thread::spawn(move || {
+            let req: GuestRequest = read_frame(&mut guest).unwrap();
+            match req {
+                GuestRequest::ProtocolHello {
+                    host_protocol_version,
+                    min_supported_version,
+                    host_version,
+                    requested_capabilities,
+                } => {
+                    let resp = protocol_hello_response(
+                        host_protocol_version,
+                        min_supported_version,
+                        &host_version,
+                        &requested_capabilities,
+                    );
+                    write_frame(&mut guest, &resp).unwrap();
+                }
+                other => panic!("expected ProtocolHello, got {other:?}"),
+            }
+        });
+
+        let negotiated =
+            require_capabilities(&mut host, &[GuestCapability::FilesystemRpc]).unwrap();
+
+        guest_thread.join().unwrap();
+        assert_eq!(
+            negotiated.capabilities,
+            vec![GuestCapability::FilesystemRpc]
+        );
+    }
+
+    #[test]
+    fn test_require_capabilities_rejects_missing_capability() {
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+
+        let guest_thread = std::thread::spawn(move || {
+            let _req: GuestRequest = read_frame(&mut guest).unwrap();
+            write_frame(
+                &mut guest,
+                &GuestResponse::ProtocolHelloAck {
+                    agent_protocol_version: PROTOCOL_VERSION,
+                    min_supported_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+                    agent_version: "0.1.0".to_string(),
+                    capabilities: vec![GuestCapability::Ping],
+                },
+            )
+            .unwrap();
+        });
+
+        let err = require_capabilities(&mut host, &[GuestCapability::FilesystemRpc]).unwrap_err();
+
+        guest_thread.join().unwrap();
+        assert!(err.to_string().contains("missing required capabilities"));
+        assert!(err.to_string().contains("FilesystemRpc"));
+    }
+
+    #[test]
+    fn test_require_capabilities_surfaces_protocol_mismatch() {
+        let (mut host, mut guest) = UnixStream::pair().unwrap();
+
+        let guest_thread = std::thread::spawn(move || {
+            let _req: GuestRequest = read_frame(&mut guest).unwrap();
+            write_frame(
+                &mut guest,
+                &GuestResponse::ProtocolMismatch {
+                    host_protocol_version: PROTOCOL_VERSION + 1,
+                    agent_protocol_version: PROTOCOL_VERSION,
+                    required_action: ProtocolUpgradeAction::RebuildGuest,
+                    message: "guest image is stale".to_string(),
+                },
+            )
+            .unwrap();
+        });
+
+        let err = require_capabilities(&mut host, &[GuestCapability::FilesystemRpc]).unwrap_err();
+
+        guest_thread.join().unwrap();
+        assert!(err.to_string().contains("protocol mismatch"));
+        assert!(err.to_string().contains("guest image is stale"));
     }
 
     /// W4.1 + A1 regression: every new FS variant rejects unknown
@@ -3287,6 +3751,27 @@ mod tests {
         write_frame(stream, &GuestResponse::EntrypointEvent(event.clone())).unwrap();
     }
 
+    fn answer_run_entrypoint_protocol_hello(stream: &mut UnixStream) {
+        let req: GuestRequest = read_frame(stream).unwrap();
+        match req {
+            GuestRequest::ProtocolHello {
+                requested_capabilities,
+                ..
+            } => assert_eq!(requested_capabilities, vec![GuestCapability::RunEntrypoint]),
+            other => panic!("expected ProtocolHello, got {other:?}"),
+        }
+        write_frame(
+            stream,
+            &GuestResponse::ProtocolHelloAck {
+                agent_protocol_version: PROTOCOL_VERSION,
+                min_supported_version: MIN_SUPPORTED_PROTOCOL_VERSION,
+                agent_version: "test-agent".to_string(),
+                capabilities: vec![GuestCapability::RunEntrypoint],
+            },
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_send_run_entrypoint_collects_events_until_terminal() {
         let (mut host, mut guest) = UnixStream::pair().unwrap();
@@ -3297,6 +3782,7 @@ mod tests {
 
         // Guest side: read the request, emit Stdout, Stderr, Exit.
         let guest_handle = std::thread::spawn(move || {
+            answer_run_entrypoint_protocol_hello(&mut guest);
             let req: GuestRequest = read_frame(&mut guest).unwrap();
             assert!(matches!(
                 req,
@@ -3352,6 +3838,7 @@ mod tests {
         // The handler must observe the Stdout but stop reading after
         // Error.
         let guest_handle = std::thread::spawn(move || {
+            answer_run_entrypoint_protocol_hello(&mut guest);
             let _req: GuestRequest = read_frame(&mut guest).unwrap();
             write_event_frame(
                 &mut guest,
@@ -3408,6 +3895,7 @@ mod tests {
 
         // Guest writes a Pong instead of an EntrypointEvent.
         let guest_handle = std::thread::spawn(move || {
+            answer_run_entrypoint_protocol_hello(&mut guest);
             let _req: GuestRequest = read_frame(&mut guest).unwrap();
             write_frame(&mut guest, &GuestResponse::Pong).unwrap();
         });
@@ -3434,6 +3922,7 @@ mod tests {
         // This shouldn't normally happen for RunEntrypoint, but the
         // host-side consumer should map it to a clear Result error.
         let guest_handle = std::thread::spawn(move || {
+            answer_run_entrypoint_protocol_hello(&mut guest);
             let _req: GuestRequest = read_frame(&mut guest).unwrap();
             write_frame(
                 &mut guest,

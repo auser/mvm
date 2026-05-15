@@ -1700,11 +1700,63 @@ fn handle_client(
     // SAFETY: fd comes from accept and is a valid file descriptor owned by this function.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
 
-    let Some(req) = read_request(&mut file) else {
-        return;
+    // ADR-050 / plan 74 W1 (hard cutover): every operational request
+    // must be preceded by at least one successful protocol_hello in this
+    // session. A non-hello first request is treated as a protocol
+    // violation and rejected with `ProtocolMismatch`; we do not maintain
+    // a soft compatibility shim for pre-hello hosts.
+    let mut hello_seen = false;
+    let req = loop {
+        let Some(req) = read_request(&mut file) else {
+            return;
+        };
+
+        match req {
+            GuestRequest::ProtocolHello {
+                host_protocol_version,
+                min_supported_version,
+                host_version,
+                requested_capabilities,
+            } => {
+                let resp = mvm_guest::vsock::protocol_hello_response(
+                    host_protocol_version,
+                    min_supported_version,
+                    &host_version,
+                    &requested_capabilities,
+                );
+                if matches!(resp, GuestResponse::ProtocolHelloAck { .. }) {
+                    hello_seen = true;
+                }
+                write_response(&mut file, &resp);
+            }
+            other => {
+                if !hello_seen {
+                    let resp = GuestResponse::ProtocolMismatch {
+                        host_protocol_version: 0,
+                        agent_protocol_version: mvm_guest::vsock::PROTOCOL_VERSION,
+                        required_action:
+                            mvm_guest::vsock::ProtocolUpgradeAction::UpgradeHost,
+                        message:
+                            "guest agent requires protocol_hello before any other request"
+                                .to_string(),
+                    };
+                    write_response(&mut file, &resp);
+                    return;
+                }
+                break other;
+            }
+        }
     };
 
     let resp = match req {
+        // The hello-prelude loop above guarantees `req` is not a
+        // ProtocolHello, but keep an explicit, loud panic to catch
+        // future loop refactors that would silently let a hello fall
+        // through. Returning `Error` here would mask the bug.
+        GuestRequest::ProtocolHello { .. } => {
+            unreachable!("protocol hello reached operational dispatch")
+        }
+
         GuestRequest::Ping => GuestResponse::Pong,
 
         GuestRequest::WorkerStatus => {
@@ -2468,6 +2520,9 @@ fn main() {
 mod tests {
     use super::*;
     use mvm_guest::integrations::{IntegrationEntry, IntegrationHealthResult, IntegrationStatus};
+    use mvm_guest::vsock::{GuestCapability, read_frame, write_frame};
+    use std::os::fd::IntoRawFd;
+    use std::os::unix::net::UnixStream;
 
     // ─── Plan 44: signal handling unit tests ───────────────────────────
     //
@@ -2674,6 +2729,124 @@ mod tests {
             start.elapsed() < Duration::from_secs(1),
             "shutdown_subsystems with no pool should return quickly"
         );
+    }
+
+    #[test]
+    fn handle_client_accepts_protocol_hello_before_request() {
+        let (mut host, guest) = UnixStream::pair().expect("unix stream pair");
+        host.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        host.set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set write timeout");
+
+        let state = Arc::new(Mutex::new(AgentState::new()));
+        let integration_state = Arc::new(Mutex::new(IntegrationState {
+            integrations: vec![],
+        }));
+        let probe_state = Arc::new(Mutex::new(ProbeState { probes: vec![] }));
+        let boot_at = std::time::Instant::now();
+
+        let handle = std::thread::spawn(move || {
+            handle_client(
+                guest.into_raw_fd(),
+                &state,
+                &integration_state,
+                &probe_state,
+                boot_at,
+            );
+        });
+
+        write_frame(
+            &mut host,
+            &GuestRequest::ProtocolHello {
+                host_protocol_version: mvm_guest::vsock::PROTOCOL_VERSION,
+                min_supported_version: mvm_guest::vsock::MIN_SUPPORTED_PROTOCOL_VERSION,
+                host_version: "test-host".to_string(),
+                requested_capabilities: vec![GuestCapability::Ping],
+            },
+        )
+        .expect("write protocol hello");
+
+        let ack: GuestResponse = read_frame(&mut host).expect("read protocol ack");
+        assert!(matches!(
+            ack,
+            GuestResponse::ProtocolHelloAck {
+                capabilities,
+                ..
+            } if capabilities == vec![GuestCapability::Ping]
+        ));
+
+        write_frame(&mut host, &GuestRequest::Ping).expect("write ping");
+        let pong: GuestResponse = read_frame(&mut host).expect("read pong");
+        assert!(matches!(pong, GuestResponse::Pong));
+
+        handle.join().expect("handle_client thread");
+    }
+
+    /// ADR-050 / plan 74 W1 hard-cutover regression: an operational
+    /// request sent as the *first* request in a session (no prior
+    /// `ProtocolHello`) must be rejected with `ProtocolMismatch`
+    /// (`required_action: upgrade_host`) and the connection must be
+    /// closed without dispatching the underlying operation.
+    #[test]
+    fn handle_client_rejects_non_hello_first_request() {
+        let (mut host, guest) = UnixStream::pair().expect("unix stream pair");
+        host.set_read_timeout(Some(Duration::from_secs(5)))
+            .expect("set read timeout");
+        host.set_write_timeout(Some(Duration::from_secs(5)))
+            .expect("set write timeout");
+
+        let state = Arc::new(Mutex::new(AgentState::new()));
+        let integration_state = Arc::new(Mutex::new(IntegrationState {
+            integrations: vec![],
+        }));
+        let probe_state = Arc::new(Mutex::new(ProbeState { probes: vec![] }));
+        let boot_at = std::time::Instant::now();
+
+        let handle = std::thread::spawn(move || {
+            handle_client(
+                guest.into_raw_fd(),
+                &state,
+                &integration_state,
+                &probe_state,
+                boot_at,
+            );
+        });
+
+        // Bare `Ping` with no prior hello — the soft-cutover path used
+        // to let this through and answer `Pong`. Under hard cutover the
+        // agent must respond with `ProtocolMismatch` and close.
+        write_frame(&mut host, &GuestRequest::Ping).expect("write ping");
+        let resp: GuestResponse = read_frame(&mut host).expect("read mismatch");
+        match resp {
+            GuestResponse::ProtocolMismatch {
+                required_action,
+                agent_protocol_version,
+                ..
+            } => {
+                assert_eq!(
+                    required_action,
+                    mvm_guest::vsock::ProtocolUpgradeAction::UpgradeHost
+                );
+                assert_eq!(
+                    agent_protocol_version,
+                    mvm_guest::vsock::PROTOCOL_VERSION
+                );
+            }
+            other => panic!("expected ProtocolMismatch, got {other:?}"),
+        }
+
+        // After the mismatch the agent closed the connection: another
+        // read returns either an EOF/read error or no further bytes.
+        // We assert the read does not succeed with a fresh response —
+        // i.e. there is no second operational dispatch.
+        let trailing: anyhow::Result<GuestResponse> = read_frame(&mut host);
+        assert!(
+            trailing.is_err(),
+            "agent must close after ProtocolMismatch; got trailing {trailing:?}"
+        );
+
+        handle.join().expect("handle_client thread");
     }
 
     fn make_state(
