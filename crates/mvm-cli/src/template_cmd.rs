@@ -31,7 +31,40 @@ pub fn init(
     let selected_preset = resolve_scaffold_preset(preset, prompt);
     let dir = std::path::Path::new(base_dir).join(name);
     scaffold_template_files(&dir, name, &selected_preset, prompt)?;
+    // Plan 74 W5: every scaffold must end with a runnable sample
+    // command AND a cleanup hint so the user has a complete loop
+    // before they leave the init prompt. The renderer is split
+    // out for testability — `next_steps_lines` is pure.
+    for line in next_steps_lines(&dir, name) {
+        crate::ui::info(&line);
+    }
     Ok(())
+}
+
+/// Build the "Next steps" block printed after `mvmctl init`
+/// scaffolds a project. Returns a sequence of lines (no
+/// terminal `\n`); the caller pipes them through whichever
+/// renderer it uses. Pure — no I/O.
+///
+/// Plan 74 W5: pairs `mvmctl doctor --workflow cli-run` with the
+/// build/boot command and a cleanup pair (stop the VM + remove
+/// the scaffold) so first-use feedback names exactly one next
+/// action per phase.
+fn next_steps_lines(dir: &std::path::Path, name: &str) -> Vec<String> {
+    let dir_display = dir.display().to_string();
+    vec![
+        String::new(),
+        format!("Scaffolded {} at {}", name, dir_display),
+        String::new(),
+        "Next steps:".to_string(),
+        format!("  cd {dir_display}"),
+        "  mvmctl doctor --workflow cli-run    # preflight (audience-scoped)".to_string(),
+        "  mvmctl up --flake .                 # build + boot the VM".to_string(),
+        String::new(),
+        "Cleanup when you're done:".to_string(),
+        "  mvmctl down                         # stop running VMs".to_string(),
+        format!("  rm -rf {dir_display}                       # remove the scaffold"),
+    ]
 }
 
 // Plan 38 §4 (slice 7b): create_single, create_multi, list, info,
@@ -1005,7 +1038,7 @@ fn render_python_app_stub(port: u16, health_path: &str) -> String {
 mod tests {
     use super::{
         GeneratedTemplateSpec, ScaffoldFeature, build_openai_prompt_request,
-        generated_template_spec, infer_prompt_features, infer_prompt_preset,
+        generated_template_spec, infer_prompt_features, infer_prompt_preset, next_steps_lines,
         parse_openai_prompt_response, render_prompt_generated_flake, resolve_scaffold_preset,
         validate_openai_plan,
     };
@@ -1316,5 +1349,66 @@ mod tests {
         assert!(cfg.is_none());
 
         clear_llm_env();
+    }
+
+    // ---------------- next_steps_lines (plan 74 W5 slice 3) ----------------
+
+    #[test]
+    fn next_steps_lines_includes_doctor_workflow_preflight() {
+        let lines = next_steps_lines(std::path::Path::new("/tmp/my-app"), "my-app");
+        assert!(
+            lines
+                .iter()
+                .any(|l| l.contains("mvmctl doctor --workflow cli-run")),
+            "scaffold must point at the audience-scoped doctor preflight; got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn next_steps_lines_includes_runnable_sample_command() {
+        let lines = next_steps_lines(std::path::Path::new("/tmp/my-app"), "my-app");
+        assert!(
+            lines.iter().any(|l| l.contains("mvmctl up --flake .")),
+            "scaffold must include a ready-to-run sample command; got: {lines:?}"
+        );
+        // The cd command must point at the scaffold dir so the user
+        // doesn't have to re-derive the path.
+        assert!(
+            lines.iter().any(|l| l.contains("cd /tmp/my-app")),
+            "scaffold must `cd` into the new dir; got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn next_steps_lines_includes_cleanup_pair() {
+        let lines = next_steps_lines(std::path::Path::new("/tmp/my-app"), "my-app");
+        // Both halves of the cleanup pair (stop the VM AND remove the
+        // scaffold) must appear — plan 74 W5 asks for the full loop
+        // not just the build/boot half.
+        assert!(
+            lines.iter().any(|l| l.contains("mvmctl down")),
+            "scaffold must include a VM-stop cleanup hint; got: {lines:?}"
+        );
+        assert!(
+            lines.iter().any(|l| l.contains("rm -rf /tmp/my-app")),
+            "scaffold must include a directory-removal cleanup hint; got: {lines:?}"
+        );
+    }
+
+    #[test]
+    fn next_steps_lines_respects_dir_path_verbatim() {
+        // The path is interpolated into both the `cd` and `rm -rf`
+        // lines; relative paths and absolute paths must both round-trip
+        // without modification.
+        let abs = next_steps_lines(std::path::Path::new("/Users/me/projects/svc"), "svc");
+        assert!(abs.iter().any(|l| l.contains("cd /Users/me/projects/svc")));
+        assert!(
+            abs.iter()
+                .any(|l| l.contains("rm -rf /Users/me/projects/svc"))
+        );
+
+        let rel = next_steps_lines(std::path::Path::new("./svc"), "svc");
+        assert!(rel.iter().any(|l| l.contains("cd ./svc")));
+        assert!(rel.iter().any(|l| l.contains("rm -rf ./svc")));
     }
 }
