@@ -335,6 +335,11 @@ impl Supervisor {
                 return Err(SupervisorError::FirewallSpecMissing);
             }
         };
+        if let Err(e) = firewall_spec.validate() {
+            self.emit_audit_then_fail(&plan, "plan.rejected.firewall", &e.to_string())
+                .await?;
+            return Err(SupervisorError::from(e));
+        }
         if let Err(e) = self.firewall.install_default_deny(&firewall_spec) {
             self.emit_audit_then_fail(&plan, "plan.rejected.firewall", &e.to_string())
                 .await?;
@@ -1007,7 +1012,8 @@ mod tests {
     }
 
     fn sample_firewall_spec() -> FirewallSpec {
-        FirewallSpec::new("vm1", "mvmtap0", "mvmtun0")
+        FirewallSpec::from_vm_slot(&mvm_base::config::VmSlot::new("vm1", 0), "mvmtun0")
+            .expect("valid sample firewall spec")
     }
 
     fn sample_plan() -> ExecutionPlan {
@@ -1259,6 +1265,24 @@ mod tests {
         assert_eq!(s.state.current(), PlanState::Failed);
         assert!(backend.launches().is_empty());
         assert_eq!(firewall.installs(), vec![sample_firewall_spec()]);
+        assert!(firewall.teardowns().is_empty());
+    }
+
+    #[tokio::test]
+    async fn invalid_firewall_spec_blocks_before_install_and_backend_launch() {
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let firewall = Arc::new(MockFirewall::new());
+        let mut s = make_supervisor_with_firewall(backend.clone(), firewall.clone());
+        s.firewall_spec = Some(FirewallSpec::new("vm1", "tap; rm", "mvmtun0"));
+
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+
+        assert!(matches!(result, Err(SupervisorError::Firewall(_))));
+        assert_eq!(s.state.current(), PlanState::Failed);
+        assert!(backend.launches().is_empty());
+        assert!(firewall.installs().is_empty());
         assert!(firewall.teardowns().is_empty());
     }
 

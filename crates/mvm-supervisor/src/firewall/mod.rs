@@ -46,12 +46,38 @@ impl FirewallSpec {
             proxy_iface: proxy_iface.into(),
         }
     }
+
+    /// Derive firewall wiring from the Firecracker backend's runtime
+    /// slot metadata. `VmSlot` owns VM identity + TAP allocation; the
+    /// supervisor still supplies the proxy interface because that is
+    /// owned by the L4/L7 enforcement layer, not by the backend slot.
+    pub fn from_vm_slot(
+        slot: &mvm_base::config::VmSlot,
+        proxy_iface: impl Into<String>,
+    ) -> Result<Self, FirewallError> {
+        let spec = Self::new(&slot.name, &slot.tap_dev, proxy_iface);
+        spec.validate()?;
+        Ok(spec)
+    }
+
+    /// Validate identifiers before they reach platform-specific rule
+    /// formatters. This duplicates the nft-side guard intentionally:
+    /// supervisor wiring rejects unsafe runtime metadata before any
+    /// backend-specific script generation is attempted.
+    pub fn validate(&self) -> Result<(), FirewallError> {
+        validate_slug("vm_id", &self.vm_id)?;
+        validate_slug("tap_iface", &self.tap_iface)?;
+        validate_slug("proxy_iface", &self.proxy_iface)?;
+        Ok(())
+    }
 }
 
 #[derive(Debug, Error, PartialEq, Eq)]
 pub enum FirewallError {
     #[error("firewall enforcer not wired (Noop slot)")]
     NotWired,
+    #[error("invalid firewall spec field {field}: {value:?} (only [A-Za-z0-9_-] permitted)")]
+    InvalidSpec { field: &'static str, value: String },
     #[error("firewall backend failed: {0}")]
     Backend(String),
 }
@@ -79,6 +105,20 @@ impl FirewallEnforcer for NoopFirewallEnforcer {
     }
 }
 
+fn validate_slug(field: &'static str, value: &str) -> Result<(), FirewallError> {
+    if value.is_empty()
+        || !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return Err(FirewallError::InvalidSpec {
+            field,
+            value: value.to_string(),
+        });
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -89,6 +129,41 @@ mod tests {
         assert_eq!(spec.vm_id, "vm1");
         assert_eq!(spec.tap_iface, "mvmtap0");
         assert_eq!(spec.proxy_iface, "mvmtun0");
+    }
+
+    #[test]
+    fn firewall_spec_derives_from_vm_slot() {
+        let slot = mvm_base::config::VmSlot::new("worker-1", 7);
+        let spec = FirewallSpec::from_vm_slot(&slot, "mvmtun0").expect("valid slot");
+
+        assert_eq!(spec.vm_id, "worker-1");
+        assert_eq!(spec.tap_iface, "tap7");
+        assert_eq!(spec.proxy_iface, "mvmtun0");
+    }
+
+    #[test]
+    fn firewall_spec_from_vm_slot_rejects_unsafe_proxy_iface() {
+        let slot = mvm_base::config::VmSlot::new("worker-1", 7);
+        let err = FirewallSpec::from_vm_slot(&slot, "tun; rm").unwrap_err();
+
+        assert!(matches!(
+            err,
+            FirewallError::InvalidSpec {
+                field: "proxy_iface",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn firewall_spec_from_vm_slot_rejects_unsafe_vm_name() {
+        let slot = mvm_base::config::VmSlot::new("worker/1", 7);
+        let err = FirewallSpec::from_vm_slot(&slot, "mvmtun0").unwrap_err();
+
+        assert!(matches!(
+            err,
+            FirewallError::InvalidSpec { field: "vm_id", .. }
+        ));
     }
 
     #[test]
