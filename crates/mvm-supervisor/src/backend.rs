@@ -9,6 +9,7 @@
 //! `AnyBackend` enum behind this trait.
 
 use async_trait::async_trait;
+use mvm_base::config::VmSlot;
 use mvm_plan::{ExecutionPlan, PlanId};
 use thiserror::Error;
 
@@ -20,6 +21,9 @@ pub enum BackendError {
     #[error("backend launch failed: {0}")]
     LaunchFailed(String),
 
+    #[error("backend launch preparation failed: {0}")]
+    PrepareFailed(String),
+
     #[error("backend stop failed: {0}")]
     StopFailed(String),
 
@@ -27,11 +31,33 @@ pub enum BackendError {
     UnknownPlan { plan_id: PlanId },
 }
 
+/// Runtime metadata the backend owns before the supervisor installs
+/// host-side policy. The VM slot is the canonical source for VM
+/// identity and TAP allocation; callers must not synthesize those
+/// names separately.
+#[derive(Debug, Clone)]
+pub struct BackendLaunchSpec {
+    pub vm_slot: VmSlot,
+}
+
+impl BackendLaunchSpec {
+    pub fn new(vm_slot: VmSlot) -> Self {
+        Self { vm_slot }
+    }
+}
+
 /// Async because real backends drive Firecracker's HTTP API or
 /// Apple Container's vsock RPC, both of which the supervisor will
 /// eventually pump from a tokio runtime.
 #[async_trait]
 pub trait BackendLauncher: Send + Sync {
+    /// Reserve or derive runtime metadata needed before backend
+    /// launch. This must not start tenant code. The supervisor uses
+    /// the returned slot to install firewall policy before calling
+    /// [`BackendLauncher::launch`].
+    async fn prepare_launch(&self, plan: &ExecutionPlan)
+    -> Result<BackendLaunchSpec, BackendError>;
+
     /// Issue the start request. Returns when the backend has
     /// accepted the request — not necessarily when the guest is
     /// ready. The supervisor's state machine separately transitions
@@ -50,6 +76,13 @@ pub struct NoopBackendLauncher;
 
 #[async_trait]
 impl BackendLauncher for NoopBackendLauncher {
+    async fn prepare_launch(
+        &self,
+        _plan: &ExecutionPlan,
+    ) -> Result<BackendLaunchSpec, BackendError> {
+        Err(BackendError::NotWired)
+    }
+
     async fn launch(&self, _plan: &ExecutionPlan) -> Result<(), BackendError> {
         Err(BackendError::NotWired)
     }

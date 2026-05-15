@@ -127,6 +127,7 @@ Extends `ShellEnvironment` for fleet orchestration:
 `mvm-supervisor` owns the host-side policy slots used after plan admission:
 
 - `L4Gate` evaluates policy-bundle `[[network.l4]]` rows with default-deny semantics
+- `BackendLauncher::prepare_launch()` returns backend-owned runtime slot metadata before tenant launch, without starting tenant code
 - `FirewallSpec::from_vm_slot()` derives VM identity and TAP device from backend runtime `VmSlot` metadata, then validates identifiers before any platform rule generation
 - `FirewallEnforcer` installs per-VM default-deny host firewall rules before backend launch and tears them down on failed launch or stop
 - `LinuxNftFirewall` generates VM-scoped nftables tables that only allow TAP traffic to the supervisor proxy interface

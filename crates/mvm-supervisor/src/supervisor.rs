@@ -83,8 +83,8 @@ pub enum SupervisorError {
     #[error("firewall error: {0}")]
     Firewall(#[from] FirewallError),
 
-    #[error("firewall spec not configured")]
-    FirewallSpecMissing,
+    #[error("firewall proxy interface not configured")]
+    FirewallProxyIfaceMissing,
 
     #[error("egress proxy error: {0}")]
     Egress(String),
@@ -167,10 +167,11 @@ pub struct Supervisor {
     /// [`mvm_core::config::mvm_deps_volumes_dir`] at admit time;
     /// tests inject a tempdir.
     pub deps_volumes_root: Option<PathBuf>,
-    /// Per-supervisor firewall wiring for the next launched runtime
-    /// VM. The execution plan does not carry host interface names,
-    /// so the backend/supervisor builder supplies this out-of-band.
-    pub firewall_spec: Option<FirewallSpec>,
+    /// Supervisor-owned proxy interface for default-deny firewall
+    /// rules. VM identity and TAP allocation come from backend
+    /// launch preparation; this is the only network identifier the
+    /// supervisor still owns directly.
+    pub firewall_proxy_iface: Option<String>,
     /// VM-scoped firewall installs keyed by plan id. Used to tear
     /// down the same rules if backend launch fails or on normal stop.
     pub installed_firewalls: BTreeMap<PlanId, FirewallSpec>,
@@ -195,7 +196,7 @@ impl Default for Supervisor {
             nonce_store: Arc::new(Mutex::new(NonceStore::new())),
             circuit_breakers: None,
             deps_volumes_root: None,
-            firewall_spec: None,
+            firewall_proxy_iface: None,
             installed_firewalls: BTreeMap::new(),
         }
     }
@@ -319,20 +320,37 @@ impl Supervisor {
             SupervisorError::from(e)
         })?;
 
-        // Step 3: host firewall. This happens after the plan is
-        // verified/admitted but before backend dispatch. Missing or
-        // broken firewall wiring fails closed, so no VM can boot with
-        // silent unrestricted TAP egress.
-        let firewall_spec = match self.firewall_spec.clone() {
-            Some(spec) => spec,
+        // Step 3: derive backend runtime networking metadata, then
+        // install host firewall policy. Backend launch preparation
+        // must not start tenant code; it only returns the VM slot the
+        // backend will use. This keeps VM id + TAP allocation owned by
+        // the backend while preserving firewall-before-launch ordering.
+        let proxy_iface = match self.firewall_proxy_iface.clone() {
+            Some(proxy_iface) => proxy_iface,
             None => {
                 self.emit_audit_then_fail(
                     &plan,
                     "plan.rejected.firewall",
-                    "firewall spec not configured",
+                    "firewall proxy interface not configured",
                 )
                 .await?;
-                return Err(SupervisorError::FirewallSpecMissing);
+                return Err(SupervisorError::FirewallProxyIfaceMissing);
+            }
+        };
+        let launch_spec = match self.backend.prepare_launch(&plan).await {
+            Ok(spec) => spec,
+            Err(e) => {
+                self.emit_audit_then_fail(&plan, "plan.rejected.backend", &e.to_string())
+                    .await?;
+                return Err(SupervisorError::from(e));
+            }
+        };
+        let firewall_spec = match FirewallSpec::from_vm_slot(&launch_spec.vm_slot, proxy_iface) {
+            Ok(spec) => spec,
+            Err(e) => {
+                self.emit_audit_then_fail(&plan, "plan.rejected.firewall", &e.to_string())
+                    .await?;
+                return Err(SupervisorError::from(e));
             }
         };
         if let Err(e) = firewall_spec.validate() {
@@ -911,7 +929,7 @@ pub fn build_inspector_chain_with_pii(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::backend::BackendLauncher;
+    use crate::backend::{BackendLaunchSpec, BackendLauncher};
     use async_trait::async_trait;
     use chrono::{TimeZone, Utc};
     use ed25519_dalek::SigningKey;
@@ -923,8 +941,11 @@ mod tests {
     /// Test backend that records every call and lets the test pick
     /// success or failure per method.
     struct MockBackend {
+        prepare_calls: Mutex<Vec<PlanId>>,
         launch_calls: Mutex<Vec<PlanId>>,
         stop_calls: Mutex<Vec<PlanId>>,
+        slot: mvm_base::config::VmSlot,
+        prepare_should_fail: bool,
         launch_should_fail: bool,
         stop_should_fail: bool,
     }
@@ -932,11 +953,18 @@ mod tests {
     impl MockBackend {
         fn new() -> Self {
             Self {
+                prepare_calls: Mutex::new(Vec::new()),
                 launch_calls: Mutex::new(Vec::new()),
                 stop_calls: Mutex::new(Vec::new()),
+                slot: mvm_base::config::VmSlot::new("vm1", 0),
+                prepare_should_fail: false,
                 launch_should_fail: false,
                 stop_should_fail: false,
             }
+        }
+
+        fn prepares(&self) -> Vec<PlanId> {
+            self.prepare_calls.lock().unwrap().clone()
         }
 
         fn launches(&self) -> Vec<PlanId> {
@@ -950,6 +978,20 @@ mod tests {
 
     #[async_trait]
     impl BackendLauncher for MockBackend {
+        async fn prepare_launch(
+            &self,
+            plan: &ExecutionPlan,
+        ) -> Result<BackendLaunchSpec, BackendError> {
+            self.prepare_calls
+                .lock()
+                .unwrap()
+                .push(plan.plan_id.clone());
+            if self.prepare_should_fail {
+                return Err(BackendError::PrepareFailed("mock prepare".into()));
+            }
+            Ok(BackendLaunchSpec::new(self.slot.clone()))
+        }
+
         async fn launch(&self, plan: &ExecutionPlan) -> Result<(), BackendError> {
             self.launch_calls.lock().unwrap().push(plan.plan_id.clone());
             if self.launch_should_fail {
@@ -1105,7 +1147,7 @@ mod tests {
         let mut s = Supervisor::new();
         s.backend = b;
         s.firewall = Arc::new(MockFirewall::new());
-        s.firewall_spec = Some(sample_firewall_spec());
+        s.firewall_proxy_iface = Some("mvmtun0".to_string());
         // Default to a clock inside the sample plan's window so
         // happy-path tests don't depend on the wall clock.
         s.clock = fixed_clock_inside_window();
@@ -1125,7 +1167,7 @@ mod tests {
         let mut s = Supervisor::new();
         s.backend = b;
         s.firewall = Arc::new(MockFirewall::new());
-        s.firewall_spec = Some(sample_firewall_spec());
+        s.firewall_proxy_iface = Some("mvmtun0".to_string());
         s.clock = fixed_clock_inside_window();
         s.audit = audit.clone();
         (s, audit)
@@ -1151,6 +1193,7 @@ mod tests {
         s.launch(&signed, &[("test", &vk)]).await.unwrap();
 
         assert_eq!(s.state.current(), PlanState::Running);
+        assert_eq!(backend.prepares(), vec![plan.plan_id.clone()]);
         assert_eq!(backend.launches(), vec![plan.plan_id.clone()]);
         assert!(backend.stops().is_empty());
         assert_eq!(firewall.installs(), vec![sample_firewall_spec()]);
@@ -1234,19 +1277,61 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn default_supervisor_fails_closed_without_firewall_spec() {
+    async fn default_supervisor_fails_closed_without_firewall_proxy_iface() {
         let plan = sample_plan();
         let (signed, _sk, vk) = sign_sample(&plan);
         let mut s = Supervisor::new();
-        // No firewall spec — default launch fails closed before backend.
+        // No firewall proxy interface — default launch fails closed before backend.
         // Pin the clock inside the plan window so validity passes and
         // the test exercises the firewall-fails-closed path it's
         // supposed to.
         s.clock = fixed_clock_inside_window();
 
         let result = s.launch(&signed, &[("test", &vk)]).await;
-        assert!(matches!(result, Err(SupervisorError::FirewallSpecMissing)));
+        assert!(matches!(
+            result,
+            Err(SupervisorError::FirewallProxyIfaceMissing)
+        ));
         assert_eq!(s.state.current(), PlanState::Failed);
+    }
+
+    #[tokio::test]
+    async fn missing_firewall_proxy_iface_blocks_before_backend_prepare() {
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let mut s = make_supervisor_with_backend(backend.clone());
+        s.firewall_proxy_iface = None;
+
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+
+        assert!(matches!(
+            result,
+            Err(SupervisorError::FirewallProxyIfaceMissing)
+        ));
+        assert_eq!(s.state.current(), PlanState::Failed);
+        assert!(backend.prepares().is_empty());
+        assert!(backend.launches().is_empty());
+    }
+
+    #[tokio::test]
+    async fn backend_prepare_failure_blocks_firewall_install_and_backend_launch() {
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let mut backend = MockBackend::new();
+        backend.prepare_should_fail = true;
+        let backend = Arc::new(backend);
+        let firewall = Arc::new(MockFirewall::new());
+        let mut s = make_supervisor_with_firewall(backend.clone(), firewall.clone());
+
+        let result = s.launch(&signed, &[("test", &vk)]).await;
+
+        assert!(matches!(result, Err(SupervisorError::Backend(_))));
+        assert_eq!(s.state.current(), PlanState::Failed);
+        assert_eq!(backend.prepares(), vec![plan.plan_id.clone()]);
+        assert!(backend.launches().is_empty());
+        assert!(firewall.installs().is_empty());
+        assert!(firewall.teardowns().is_empty());
     }
 
     #[tokio::test]
@@ -1263,24 +1348,27 @@ mod tests {
 
         assert!(matches!(result, Err(SupervisorError::Firewall(_))));
         assert_eq!(s.state.current(), PlanState::Failed);
+        assert_eq!(backend.prepares(), vec![plan.plan_id.clone()]);
         assert!(backend.launches().is_empty());
         assert_eq!(firewall.installs(), vec![sample_firewall_spec()]);
         assert!(firewall.teardowns().is_empty());
     }
 
     #[tokio::test]
-    async fn invalid_firewall_spec_blocks_before_install_and_backend_launch() {
+    async fn invalid_backend_slot_blocks_before_install_and_backend_launch() {
         let plan = sample_plan();
         let (signed, _sk, vk) = sign_sample(&plan);
-        let backend = Arc::new(MockBackend::new());
+        let mut backend = MockBackend::new();
+        backend.slot = mvm_base::config::VmSlot::new("vm/1", 0);
+        let backend = Arc::new(backend);
         let firewall = Arc::new(MockFirewall::new());
         let mut s = make_supervisor_with_firewall(backend.clone(), firewall.clone());
-        s.firewall_spec = Some(FirewallSpec::new("vm1", "tap; rm", "mvmtun0"));
 
         let result = s.launch(&signed, &[("test", &vk)]).await;
 
         assert!(matches!(result, Err(SupervisorError::Firewall(_))));
         assert_eq!(s.state.current(), PlanState::Failed);
+        assert_eq!(backend.prepares(), vec![plan.plan_id.clone()]);
         assert!(backend.launches().is_empty());
         assert!(firewall.installs().is_empty());
         assert!(firewall.teardowns().is_empty());
