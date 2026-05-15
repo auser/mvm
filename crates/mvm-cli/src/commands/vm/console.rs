@@ -91,14 +91,14 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         // not covered by the closed `GuestCapability` enum, so request
         // no specific capability — the hello alone unblocks dispatch.
         let _ = mvm_guest::vsock::negotiate_protocol(&mut stream, Vec::new())?;
-        let resp = mvm_guest::vsock::send_request(
-            &mut stream,
-            &mvm_guest::vsock::GuestRequest::Exec {
-                command: cmd.to_string(),
-                stdin: None,
-                timeout_secs: Some(30),
-            },
-        )?;
+        let req = mvm_guest::vsock::GuestRequest::Exec {
+            command: cmd.to_string(),
+            stdin: None,
+            timeout_secs: Some(30),
+        };
+        // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+        super::shared::emit_vsock_rpc_audit(name, &req);
+        let resp = mvm_guest::vsock::send_request(&mut stream, &req)?;
         match resp {
             mvm_guest::vsock::GuestResponse::ExecResult {
                 exit_code,
@@ -147,10 +147,10 @@ pub(in crate::commands) fn console_interactive(name: &str) -> Result<()> {
         &mut stream,
         &[mvm_guest::vsock::GuestCapability::Console],
     )?;
-    let resp = mvm_guest::vsock::send_request(
-        &mut stream,
-        &mvm_guest::vsock::GuestRequest::ConsoleOpen { cols, rows },
-    )?;
+    let req = mvm_guest::vsock::GuestRequest::ConsoleOpen { cols, rows };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
+    let resp = mvm_guest::vsock::send_request(&mut stream, &req)?;
 
     let (session_id, data_port) = match resp {
         mvm_guest::vsock::GuestResponse::ConsoleOpened {

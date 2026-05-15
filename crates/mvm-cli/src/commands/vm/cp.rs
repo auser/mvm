@@ -271,6 +271,8 @@ fn guest_exists(vm: &str, path: &str) -> Result<bool> {
         path: path.to_string(),
         follow_symlinks: false,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(vm, &req);
     match mvm_guest::vsock::send_fs_request(&dir, req)? {
         FsResult::Stat(_) => Ok(true),
         FsResult::Error {
@@ -288,6 +290,8 @@ fn guest_stat(vm: &str, path: &str) -> Result<mvm_guest::vsock::FsStat> {
         path: path.to_string(),
         follow_symlinks: true,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(vm, &req);
     match unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)? {
         FsResult::Stat(stat) => Ok(stat),
         other => bail!("Unexpected FsResult variant for Stat: {:?}", other),

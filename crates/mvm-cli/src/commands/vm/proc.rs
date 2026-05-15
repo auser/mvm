@@ -173,6 +173,8 @@ fn cmd_start(name: &str, argv: &[String], envs: &[String], cwd: Option<&str>) ->
         stdin: vec![],
         timeout_secs: None,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
     let result = unwrap_proc(mvm_guest::vsock::send_proc_request(&dir, req)?)?;
     match result {
         ProcResult::Started { pid_token } => {
@@ -186,6 +188,8 @@ fn cmd_start(name: &str, argv: &[String], envs: &[String], cwd: Option<&str>) ->
 
 fn cmd_ls(name: &str, json: bool) -> Result<()> {
     let dir = instance_dir_for(name)?;
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &GuestRequest::ProcList);
     let result = unwrap_proc(mvm_guest::vsock::send_proc_request(
         &dir,
         GuestRequest::ProcList,
@@ -225,6 +229,8 @@ fn cmd_signal(name: &str, token: &str, signum: i32) -> Result<()> {
         pid_token: token.to_string(),
         signum,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
     let result = unwrap_proc(mvm_guest::vsock::send_proc_request(&dir, req)?)?;
     match result {
         ProcResult::Signaled => {
@@ -240,6 +246,8 @@ fn cmd_kill(name: &str, token: &str) -> Result<()> {
     let req = GuestRequest::ProcKill {
         pid_token: token.to_string(),
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
     let result = unwrap_proc(mvm_guest::vsock::send_proc_request(&dir, req)?)?;
     match result {
         ProcResult::Killed => {
@@ -265,6 +273,8 @@ fn cmd_stdin(name: &str, token: &str, content: Option<String>) -> Result<()> {
         pid_token: token.to_string(),
         bytes,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
     let result = unwrap_proc(mvm_guest::vsock::send_proc_request(&dir, req)?)?;
     match result {
         ProcResult::InputAccepted { bytes_accepted } => {
@@ -278,6 +288,18 @@ fn cmd_stdin(name: &str, token: &str, content: Option<String>) -> Result<()> {
 
 fn cmd_wait(name: &str, token: &str, timeout: Option<u64>) -> Result<()> {
     let dir = instance_dir_for(name)?;
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit. The
+    // `send_proc_wait` helper constructs the wire-format
+    // ProcWait internally; we synthesize an equivalent request
+    // here purely so the audit kind_name lines up with what the
+    // guest receives.
+    super::shared::emit_vsock_rpc_audit(
+        name,
+        &GuestRequest::ProcWait {
+            pid_token: token.to_string(),
+            timeout_secs: timeout,
+        },
+    );
     let mut stdout = std::io::stdout().lock();
     let mut stderr = std::io::stderr().lock();
     let terminal = mvm_guest::vsock::send_proc_wait(&dir, token, timeout, |ev| match ev {

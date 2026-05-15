@@ -193,6 +193,8 @@ fn cmd_read(name: &str, path: &str, offset: u64, length: u64) -> Result<()> {
         length,
         follow_symlinks: true,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
     let result = unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)?;
     match result {
         FsResult::Read { content, .. } => {
@@ -227,6 +229,8 @@ fn cmd_write(
         create_parents,
         follow_symlinks,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
     let result = unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)?;
     match result {
         FsResult::Write { bytes_written } => {
@@ -244,6 +248,8 @@ fn cmd_ls(name: &str, path: &str, json: bool) -> Result<()> {
         path: path.to_string(),
         follow_symlinks: true,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
     let result = unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)?;
     match result {
         FsResult::List { entries, truncated } => {
@@ -285,6 +291,8 @@ fn cmd_stat(name: &str, path: &str, follow_symlinks: bool, json: bool) -> Result
         path: path.to_string(),
         follow_symlinks,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
     let result = unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)?;
     match result {
         FsResult::Stat(s) => {
@@ -312,6 +320,8 @@ fn cmd_mkdir(name: &str, path: &str, mode: u32, parents: bool) -> Result<()> {
         mode,
         parents,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
     let result = unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)?;
     match result {
         FsResult::Mkdir => {
@@ -329,6 +339,8 @@ fn cmd_rm(name: &str, path: &str, recursive: bool) -> Result<()> {
         recursive,
         follow_symlinks: false,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
     let result = unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)?;
     match result {
         FsResult::Remove { entries_removed } => {
@@ -347,6 +359,8 @@ fn cmd_mv(name: &str, from: &str, to: &str) -> Result<()> {
         to: to.to_string(),
         follow_symlinks: false,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(name, &req);
     let result = unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)?;
     match result {
         FsResult::Move => {

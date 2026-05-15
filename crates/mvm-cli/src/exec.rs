@@ -957,14 +957,25 @@ fn send_request(
     // request no specific capability — the hello alone unblocks the
     // dispatch.
     let _ = mvm_guest::vsock::negotiate_protocol(&mut stream, Vec::new())?;
-    mvm_guest::vsock::send_request(
-        &mut stream,
-        &mvm_guest::vsock::GuestRequest::Exec {
-            command: command.to_string(),
-            stdin: None,
-            timeout_secs: Some(timeout_secs),
-        },
-    )
+    let request = mvm_guest::vsock::GuestRequest::Exec {
+        command: command.to_string(),
+        stdin: None,
+        timeout_secs: Some(timeout_secs),
+    };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit. exec.rs
+    // is a top-level module that can't reach the private
+    // `commands::shared` re-export, so inline the audit emit
+    // here. The detail format matches
+    // `commands::shared::vsock::emit_vsock_rpc_audit`:
+    // `scope=rpc,direction=in,kind=vsock,verb=<kebab-name>`.
+    let verb = request.kind_name();
+    mvm_core::audit_emit!(
+        NetworkPolicyAllow,
+        vm: vm_name,
+        "scope=rpc,direction=in,kind=vsock,verb={verb}",
+        verb = verb,
+    );
+    mvm_guest::vsock::send_request(&mut stream, &request)
 }
 
 #[cfg(test)]
