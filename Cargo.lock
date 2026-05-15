@@ -3019,6 +3019,7 @@ dependencies = [
  "base64 0.22.1",
  "chrono",
  "fs2",
+ "ipnet",
  "mvm-libkrun",
  "mvm-providers",
  "regex",
