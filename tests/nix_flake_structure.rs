@@ -228,6 +228,46 @@ fn mk_guest_carries_overlay_aware_contract() {
     );
 }
 
+/// Plan 74 W2 — `mkGuest` must bake `mvm-guest-netinit` into the
+/// rootfs AND invoke it from `/init` before forking the agent.
+/// Without this, the guest-side defense (kernel blackhole routes
+/// for `MANDATORY_DENY_RANGES`) never installs, leaving the
+/// macOS Apple Container path with no firewall at all. The
+/// source-grep here catches a regression that drops either the
+/// binary copy or the /init invocation before it reaches a live
+/// VM boot.
+#[test]
+fn mk_guest_installs_netinit_at_boot() {
+    let path = nix_dir().join("lib").join("mk-guest.nix");
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("nix/lib/mk-guest.nix must be present: {e}"));
+
+    assert!(
+        content.contains("mvmGuestNetinitBinary = \"${guestAgentPkg}/bin/mvm-guest-netinit\""),
+        "mk-guest.nix must reference the mvm-guest-netinit binary \
+         from the guest-agent derivation. Plan 74 W2 — guest-side \
+         network defense relies on this binary being baked into \
+         every mvm-built rootfs."
+    );
+
+    assert!(
+        content.contains("/usr/local/bin/mvm-guest-netinit"),
+        "mk-guest.nix /init must invoke the netinit binary at its \
+         canonical path. A drop here means the binary is built but \
+         never runs at boot, leaving the guest with no kernel-level \
+         defense against IMDS exfil."
+    );
+
+    assert!(
+        content.contains("/mvm/runtime/netinit"),
+        "mk-guest.nix /init must prefer the runtime-overlay path \
+         (`/mvm/runtime/netinit`) over the baked-in copy when the \
+         W1.4b overlay is mounted. Mirrors the agent-bin resolution \
+         pattern; preserves the host-bake fallback for backends \
+         that don't attach the overlay yet."
+    );
+}
+
 #[test]
 fn flake_lock_pins_microvm_input_by_hash() {
     // The flake.lock must exist and pin the microvm.nix input by

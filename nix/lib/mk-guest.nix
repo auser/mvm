@@ -228,6 +228,39 @@ let
       /bin/busybox modprobe vmw_vsock_virtio_transport 2>/dev/null || true
     fi
 
+    # Stage 2.45 — Plan 74 W2 — guest-side network defense.
+    # Install kernel blackhole routes for `MANDATORY_DENY_RANGES`
+    # (cloud metadata, link-local, CGNAT, host loopback) BEFORE
+    # any workload code runs. We're still uid 0 here — the agent
+    # fork below drops to uid 901, which doesn't have
+    # CAP_NET_ADMIN, so the install has to happen here. Mirrors
+    # the agent-bin resolution: prefer /mvm/runtime/netinit (from
+    # the W1.4b runtime overlay) over the baked-in copy in
+    # /usr/local/bin.
+    #
+    # Output of mvm-guest-netinit is a single JSON line that the
+    # kernel console captures; the host scrape (firecracker.log /
+    # libkrun console output) forwards it so an operator can see
+    # what was installed. A future slice wires the agent to
+    # forward the same JSON as a `NetworkMandatoryDeny` audit
+    # event over vsock.
+    #
+    # On netinit failure (exit nonzero) we DO NOT abort the boot
+    # — the host-side iptables defense (where it applies) is the
+    # primary layer, and a hard guest-side fail-closed would
+    # block any workload on a kernel without rtnetlink. Log the
+    # failure and continue; an operator who needs guest-side
+    # defense flagged the issue from the JSON line.
+    MVM_NETINIT_BIN=
+    if [ -x /mvm/runtime/netinit ]; then
+      MVM_NETINIT_BIN=/mvm/runtime/netinit
+    elif [ -x /usr/local/bin/mvm-guest-netinit ]; then
+      MVM_NETINIT_BIN=/usr/local/bin/mvm-guest-netinit
+    fi
+    if [ -n "$MVM_NETINIT_BIN" ]; then
+      "$MVM_NETINIT_BIN" || echo "mvm-init: netinit exited nonzero; continuing without guest-side defense"
+    fi
+
     # Stage 2.5 — guest agent supervisor. Fork the agent into
     # the background under its own uid before we drop to the
     # entrypoint. The agent is responsible for vsock RPC (host
@@ -349,6 +382,14 @@ let
   # directly — wired here as a passthru export so the initramfs
   # builder can reach it without duplicating the agent derivation.
   verityInitBinary = "${guestAgentPkg}/bin/mvm-verity-init";
+
+  # Plan 74 W2 — guest-side network defense. `mvm-guest-netinit`
+  # installs kernel blackhole routes for `MANDATORY_DENY_RANGES`
+  # (cloud metadata, link-local, CGNAT, host loopback) inside the
+  # guest at boot. Run as root from `/init` BEFORE the agent forks
+  # under setpriv — the routes must exist before any workload code
+  # can attempt egress.
+  mvmGuestNetinitBinary = "${guestAgentPkg}/bin/mvm-guest-netinit";
 
   # extraFiles — three accepted spec shapes per target path:
   #
@@ -523,6 +564,15 @@ let
     cp ${agentBinary} "$out/usr/local/bin/mvm-guest-agent"
     chmod 0555 "$out/usr/local/bin/mvm-guest-agent"
 
+    # Plan 74 W2 — guest-side network defense. Same mode as the
+    # agent (0555: read+exec, not writable). /init runs this as
+    # uid 0 BEFORE forking the agent under setpriv, so the routes
+    # exist before any workload code can attempt egress. The
+    # binary itself does not need elevated capabilities at run
+    # time beyond the CAP_NET_ADMIN that PID 1 already has.
+    cp ${mvmGuestNetinitBinary} "$out/usr/local/bin/mvm-guest-netinit"
+    chmod 0555 "$out/usr/local/bin/mvm-guest-netinit"
+
     # Kernel modules. `/init` `modprobe`s vsock before forking the
     # agent (default nixpkgs kernel ships AF_VSOCK as `=m`); without
     # `/lib/modules/<kver>/` in the rootfs, modprobe has nothing to
@@ -652,6 +702,6 @@ rootfsImage.overrideAttrs (old: {
     # downstream derivations (verity-initrd, per-service launch line
     # in `mkServiceBlock`) can reach `mvm-seccomp-apply` and
     # `mvm-verity-init` without re-running the cargo build.
-    inherit guestAgentPkg seccompApplyBinary verityInitBinary;
+    inherit guestAgentPkg seccompApplyBinary verityInitBinary mvmGuestNetinitBinary;
   };
 })
