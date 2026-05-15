@@ -10,25 +10,25 @@ use anyhow::Result;
 
 use mvm::vsock_transport::{AppleContainerTransport, VsockTransport};
 
-/// Wait for the guest agent to respond to a Ping over vsock.
-/// Returns true if the agent is reachable within `timeout_secs`.
+/// Wait for the guest agent to complete the ADR-050 / plan 74 W1
+/// protocol hello over vsock. Returns true once the agent has
+/// answered `ProtocolHelloAck` (with at least the `Ping` capability)
+/// within `timeout_secs`. A `ProtocolMismatch` answer, a transport
+/// error, or an unexpected response counts as "not ready yet" and the
+/// probe keeps polling until the deadline.
 pub fn wait_for_guest_agent(vm_id: &str, timeout_secs: u64) -> bool {
-    use std::io::{Read, Write};
     let deadline = std::time::Instant::now() + std::time::Duration::from_secs(timeout_secs);
-    let ping = serde_json::to_vec(&mvm_guest::vsock::GuestRequest::Ping).unwrap_or_default();
-    let len_bytes = (ping.len() as u32).to_be_bytes();
     let transport = AppleContainerTransport::new(vm_id);
 
     while std::time::Instant::now() < deadline {
         if let Ok(mut s) = transport.connect(mvm_guest::vsock::GUEST_AGENT_PORT)
-            && s.write_all(&len_bytes).is_ok()
-            && s.write_all(&ping).is_ok()
-            && s.flush().is_ok()
+            && mvm_guest::vsock::negotiate_protocol(
+                &mut s,
+                vec![mvm_guest::vsock::GuestCapability::Ping],
+            )
+            .is_ok()
         {
-            let mut resp_len = [0u8; 4];
-            if s.read_exact(&mut resp_len).is_ok() {
-                return true;
-            }
+            return true;
         }
         std::thread::sleep(std::time::Duration::from_millis(500));
     }

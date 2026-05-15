@@ -918,10 +918,19 @@ pub fn wait_for_agent(vm_name: &str, timeout_secs: u64) -> bool {
         // Re-pick the transport on each iteration: a Firecracker VM
         // that's still booting may not show up in
         // resolve_running_vm_dir until the daemon registers it.
+        // ADR-050 / plan 74 W1: "agent reachable" means it speaks the
+        // protocol, not just that the socket is open. We require a
+        // successful hello (with at least the `Ping` capability) before
+        // reporting ready, since under hard cutover a pre-hello agent
+        // would only answer `ProtocolMismatch` to the next request and
+        // that is *not* "reachable" from the caller's perspective.
         if let Ok(transport) = vsock_transport::for_vm(vm_name)
-            && transport
-                .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
-                .is_ok()
+            && let Ok(mut stream) = transport.connect(mvm_guest::vsock::GUEST_AGENT_PORT)
+            && mvm_guest::vsock::negotiate_protocol(
+                &mut stream,
+                vec![mvm_guest::vsock::GuestCapability::Ping],
+            )
+            .is_ok()
         {
             return true;
         }
@@ -937,6 +946,12 @@ fn send_request(
 ) -> Result<mvm_guest::vsock::GuestResponse> {
     let transport = vsock_transport::for_vm(vm_name)?;
     let mut stream = transport.connect(mvm_guest::vsock::GUEST_AGENT_PORT)?;
+    // ADR-050 / plan 74 W1: hard cutover requires every fresh session
+    // to hello before any operational request. `Exec` is a dev-shell
+    // request not covered by the closed `GuestCapability` enum, so
+    // request no specific capability — the hello alone unblocks the
+    // dispatch.
+    let _ = mvm_guest::vsock::negotiate_protocol(&mut stream, Vec::new())?;
     mvm_guest::vsock::send_request(
         &mut stream,
         &mvm_guest::vsock::GuestRequest::Exec {

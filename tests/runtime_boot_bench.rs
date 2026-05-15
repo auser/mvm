@@ -301,10 +301,26 @@ fn wait_for_apple_guest_agent(name: &str) -> Result<()> {
     while Instant::now() < deadline {
         match transport.connect(mvm_guest::vsock::GUEST_AGENT_PORT) {
             Ok(mut stream) => {
-                match mvm_guest::vsock::send_request(&mut stream, &GuestRequest::Ping) {
-                    Ok(GuestResponse::Pong) => return Ok(()),
-                    Ok(other) => {
-                        last_err = Some(anyhow::anyhow!("unexpected ping response: {other:?}"))
+                // ADR-050 / plan 74 W1: hard cutover requires hello
+                // before any operational request, so a raw `Ping`
+                // probe no longer works. Treat a successful hello
+                // negotiation (with the `Ping` capability acknowledged)
+                // as the readiness signal.
+                match mvm_guest::vsock::negotiate_protocol(
+                    &mut stream,
+                    vec![mvm_guest::vsock::GuestCapability::Ping],
+                ) {
+                    Ok(negotiated)
+                        if negotiated
+                            .capabilities
+                            .contains(&mvm_guest::vsock::GuestCapability::Ping) =>
+                    {
+                        return Ok(());
+                    }
+                    Ok(_) => {
+                        last_err = Some(anyhow::anyhow!(
+                            "guest agent did not advertise the Ping capability"
+                        ))
                     }
                     Err(e) => last_err = Some(e),
                 }

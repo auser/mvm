@@ -534,6 +534,10 @@ fn dispatch_update_idle_timeout(vm_name: &str, secs: u64) -> Result<(u64, u64)> 
     let mut stream = transport
         .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
         .with_context(|| format!("Connecting to guest agent on {vm_name:?}"))?;
+    mvm_guest::vsock::require_capabilities(
+        &mut stream,
+        &[mvm_guest::vsock::GuestCapability::UpdateIdleTimeout],
+    )?;
     let resp = mvm_guest::vsock::send_request(
         &mut stream,
         &mvm_guest::vsock::GuestRequest::UpdateIdleTimeout { secs },
@@ -712,6 +716,12 @@ fn dispatch_run_code(
     let mut stream = transport
         .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
         .with_context(|| format!("Connecting to guest agent on {:?}", record.vm_name))?;
+    // ADR-050 / plan 74 W1: hard cutover requires hello before any
+    // operational request. `RunCode` is a dev-shell request not
+    // covered by the closed `GuestCapability` enum, so request no
+    // specific capability — the hello alone unblocks dispatch.
+    let _ = mvm_guest::vsock::negotiate_protocol(&mut stream, Vec::new())
+        .with_context(|| format!("Negotiating guest agent protocol on {:?}", record.vm_name))?;
     let resp = mvm_guest::vsock::send_request(
         &mut stream,
         &mvm_guest::vsock::GuestRequest::RunCode { code, timeout_secs },

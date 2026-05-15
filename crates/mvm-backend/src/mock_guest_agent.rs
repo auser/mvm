@@ -47,6 +47,7 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use mvm_guest::vsock::{
     FsErrorKind, FsResult, GuestRequest, GuestResponse, ProcResult, ProcWaitEvent,
+    protocol_hello_response,
 };
 
 /// Maximum frame size accepted by the mock agent — matches the
@@ -202,29 +203,40 @@ fn handle_connection(mut stream: UnixStream, next_token: Arc<AtomicU64>) {
         return;
     }
 
-    // Read one length-prefixed JSON request.
-    let mut len_buf = [0u8; 4];
-    if stream.read_exact(&mut len_buf).is_err() {
-        return;
-    }
-    let frame_len = u32::from_be_bytes(len_buf) as usize;
-    if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
-        return;
-    }
-    let mut body = vec![0u8; frame_len];
-    if stream.read_exact(&mut body).is_err() {
-        return;
-    }
-    let req: GuestRequest = match serde_json::from_slice(&body) {
-        Ok(r) => r,
-        Err(_) => {
-            let _ = write_error(&mut stream, "mock: failed to deserialize GuestRequest");
+    // Read length-prefixed JSON requests until the client closes the
+    // stream or an error occurs. ADR-050 / plan 74 W1 (hard cutover)
+    // changed the host-side helpers so a single session can issue
+    // `ProtocolHello` then the operational request on the same
+    // connection — a one-shot mock would close after the hello and
+    // strand the follow-up request. The real agent
+    // (`handle_client` in `mvm-guest-agent`) also reads multiple
+    // frames per session, so this matches production semantics.
+    loop {
+        let mut len_buf = [0u8; 4];
+        if stream.read_exact(&mut len_buf).is_err() {
             return;
         }
-    };
+        let frame_len = u32::from_be_bytes(len_buf) as usize;
+        if frame_len == 0 || frame_len > MAX_FRAME_SIZE {
+            return;
+        }
+        let mut body = vec![0u8; frame_len];
+        if stream.read_exact(&mut body).is_err() {
+            return;
+        }
+        let req: GuestRequest = match serde_json::from_slice(&body) {
+            Ok(r) => r,
+            Err(_) => {
+                let _ = write_error(&mut stream, "mock: failed to deserialize GuestRequest");
+                return;
+            }
+        };
 
-    let resp = dispatch(req, &next_token);
-    let _ = write_frame(&mut stream, &resp);
+        let resp = dispatch(req, &next_token);
+        if write_frame(&mut stream, &resp).is_err() {
+            return;
+        }
+    }
 }
 
 fn parse_connect_line(line: &str) -> Option<u32> {
@@ -279,6 +291,24 @@ fn write_error(stream: &mut UnixStream, message: &str) -> Result<()> {
 /// in one place.
 fn dispatch(req: GuestRequest, next_token: &AtomicU64) -> GuestResponse {
     match req {
+        // ── Protocol negotiation (ADR-050 / plan 74 W1) ─────────────
+        // Hard cutover: every call site now hellos before the first
+        // operational request. The mock answers with whatever the
+        // real `protocol_hello_response` would produce so the host
+        // helpers (`negotiate_protocol` / `require_capabilities`) see
+        // the same ack shape they expect from a real agent.
+        GuestRequest::ProtocolHello {
+            host_protocol_version,
+            min_supported_version,
+            host_version,
+            requested_capabilities,
+        } => protocol_hello_response(
+            host_protocol_version,
+            min_supported_version,
+            &host_version,
+            &requested_capabilities,
+        ),
+
         // ── Filesystem verbs ────────────────────────────────────────
         GuestRequest::FsWrite { content, .. } => GuestResponse::FsResult(FsResult::Write {
             bytes_written: content.len() as u64,

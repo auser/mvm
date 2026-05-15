@@ -86,6 +86,11 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     if let Some(cmd) = command {
         let transport = pick_console_transport(name)?;
         let mut stream = transport.connect(mvm_guest::vsock::GUEST_AGENT_PORT)?;
+        // ADR-050 / plan 74 W1: hard cutover requires hello before any
+        // operational request. One-shot `Exec` is a dev-shell request
+        // not covered by the closed `GuestCapability` enum, so request
+        // no specific capability — the hello alone unblocks dispatch.
+        let _ = mvm_guest::vsock::negotiate_protocol(&mut stream, Vec::new())?;
         let resp = mvm_guest::vsock::send_request(
             &mut stream,
             &mvm_guest::vsock::GuestRequest::Exec {
@@ -138,6 +143,10 @@ pub(in crate::commands) fn console_interactive(name: &str) -> Result<()> {
     let transport = pick_console_transport(name)?;
 
     let mut stream = transport.connect(mvm_guest::vsock::GUEST_AGENT_PORT)?;
+    mvm_guest::vsock::require_capabilities(
+        &mut stream,
+        &[mvm_guest::vsock::GuestCapability::Console],
+    )?;
     let resp = mvm_guest::vsock::send_request(
         &mut stream,
         &mvm_guest::vsock::GuestRequest::ConsoleOpen { cols, rows },
@@ -238,6 +247,11 @@ fn setup_sigwinch_handler(
                 .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
                 .ok()
                 .and_then(|mut stream| {
+                    mvm_guest::vsock::require_capabilities(
+                        &mut stream,
+                        &[mvm_guest::vsock::GuestCapability::Console],
+                    )
+                    .ok()?;
                     mvm_guest::vsock::send_request(
                         &mut stream,
                         &mvm_guest::vsock::GuestRequest::ConsoleResize {
