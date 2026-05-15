@@ -155,15 +155,25 @@ let
   entrypointUid = resolvedUids.entrypoint;
 
   # Wrap a command-line in `setpriv` when the target uid is non-zero.
-  # busybox provides setpriv from util-linux applets; the flags here
-  # match ADR-002 W2.3 (--reuid + --regid + --no-new-privs) so the
-  # privilege drop is consistent with the planned Phase 6 hardening.
-  # uid==0 short-circuits to the bare command — no point setpriv-ing
-  # to root.
+  #
+  # **util-linux's setpriv, not busybox's.** `pkgsStatic.busybox`
+  # ships a stripped setpriv applet that only knows the bare
+  # `-d / --nnp / --inh-caps / --ambient-caps` flags — `--reuid`,
+  # `--regid`, and `--clear-groups` come from util-linux's full
+  # setpriv binary. Invoking `/bin/busybox setpriv --reuid=…`
+  # fails with `setpriv: unrecognized option: reuid=…`, killing
+  # /init at stage 2.5 before the guest agent ever forks. The
+  # Nix store path to util-linux's setpriv is baked in at build
+  # time and shipped in the rootfs's `/nix/store` closure.
+  #
+  # The flag set matches ADR-002 W2.3 (--reuid + --regid +
+  # --clear-groups + --no-new-privs). uid==0 short-circuits to
+  # the bare command — no point setpriv-ing to root.
   setprivWrap = uid: cmd:
     if uid == 0 then cmd
     else
-      "exec /bin/busybox setpriv --reuid=${toString uid} --regid=${toString uid} "
+      "exec ${pkgs.util-linux}/bin/setpriv "
+      + "--reuid=${toString uid} --regid=${toString uid} "
       + "--clear-groups --no-new-privs -- ${cmd}";
 
   rawEntrypointCmd =
@@ -285,7 +295,11 @@ let
       MVM_AGENT_BIN=/usr/local/bin/mvm-guest-agent
     fi
     if [ -n "$MVM_AGENT_BIN" ]; then
-      /bin/busybox setsid /bin/busybox setpriv \
+      # util-linux setpriv — busybox setpriv lacks --reuid /
+      # --regid / --clear-groups; see `setprivWrap` above for
+      # the full reasoning. Without this fix the agent never
+      # forks and vsock port 5252 stays unbound.
+      /bin/busybox setsid ${pkgs.util-linux}/bin/setpriv \
         --reuid=${toString agentUid} --regid=${toString agentUid} \
         --clear-groups --no-new-privs \
         -- "$MVM_AGENT_BIN" &
