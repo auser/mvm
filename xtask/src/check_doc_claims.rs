@@ -91,10 +91,7 @@ struct Finding {
 pub fn run(workspace: &Path) -> Result<()> {
     let docs_dir = workspace.join(DOCS_DIR);
     if !docs_dir.is_dir() {
-        bail!(
-            "expected docs dir at {}; got nothing",
-            docs_dir.display()
-        );
+        bail!("expected docs dir at {}; got nothing", docs_dir.display());
     }
 
     let patterns = compile_patterns()?;
@@ -105,8 +102,8 @@ pub fn run(workspace: &Path) -> Result<()> {
         if is_path_allowed(workspace, path) {
             return Ok(());
         }
-        let source = std::fs::read_to_string(path)
-            .with_context(|| format!("reading {}", path.display()))?;
+        let source =
+            std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
         findings.extend(lint_source(path, &source, &patterns));
         Ok(())
     })?;
@@ -166,9 +163,7 @@ fn is_path_allowed(workspace: &Path, path: &Path) -> bool {
 }
 
 fn visit_doc_files(dir: &Path, cb: &mut dyn FnMut(&Path) -> Result<()>) -> Result<()> {
-    for entry in
-        std::fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))?
-    {
+    for entry in std::fs::read_dir(dir).with_context(|| format!("reading dir {}", dir.display()))? {
         let entry = entry?;
         let path = entry.path();
         if path.is_dir() {
@@ -265,7 +260,10 @@ mod tests {
     fn clean_doc_is_clean() {
         let src = "# Heading\n\nNothing controversial here.\n";
         let findings = lint_source(Path::new("ok.md"), src, &patterns());
-        assert!(findings.is_empty(), "expected no findings, got {findings:?}");
+        assert!(
+            findings.is_empty(),
+            "expected no findings, got {findings:?}"
+        );
     }
 
     #[test]
@@ -282,7 +280,10 @@ mod tests {
         let src = "<!-- allow(doc-claim:cold-start): example only -->\n\
                    Boot time is <100ms today.\n";
         let findings = lint_source(Path::new("x.md"), src, &patterns());
-        assert!(findings.is_empty(), "opt-out should suppress; got {findings:?}");
+        assert!(
+            findings.is_empty(),
+            "opt-out should suppress; got {findings:?}"
+        );
     }
 
     #[test]
@@ -297,7 +298,10 @@ mod tests {
         let src = "<!-- claim:cold-start status:Shipped -->\n\
                    p95 fresh-boot is now <100ms.\n";
         let findings = lint_source(Path::new("x.md"), src, &patterns());
-        assert!(findings.is_empty(), "Shipped marker should unlock; got {findings:?}");
+        assert!(
+            findings.is_empty(),
+            "Shipped marker should unlock; got {findings:?}"
+        );
     }
 
     #[test]
@@ -336,7 +340,10 @@ mod tests {
     fn variant_spelling_catches_secret_phrases() {
         let cases = &[
             ("Secrets cannot leak.", "secret-non-leakage"),
-            ("The secret cannot leak from the guest.", "secret-non-leakage"),
+            (
+                "The secret cannot leak from the guest.",
+                "secret-non-leakage",
+            ),
             ("The value never enters the guest.", "secret-non-leakage"),
             ("Real secrets never enter the guest.", "secret-non-leakage"),
         ];
