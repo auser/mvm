@@ -512,6 +512,72 @@ pub fn is_mandatory_deny(ip: std::net::IpAddr) -> bool {
     mandatory_deny_ranges().iter().any(|net| net.contains(&ip))
 }
 
+/// Emit the iptables shell fragment that drops outbound from
+/// `guest_ip` on `bridge_dev` to every IPv4 entry in
+/// [`MANDATORY_DENY_RANGES`]. Always returns a non-empty
+/// script — the deny posture applies regardless of the user's
+/// [`NetworkPolicy`].
+///
+/// **Order matters.** The script uses `iptables -I FORWARD`,
+/// which inserts at chain position 1, so a rule emitted *later*
+/// in the script ends up *earlier* in the chain (and is checked
+/// first by the kernel). Callers run this script *after* a
+/// policy's [`NetworkPolicy::iptables_script`] output so the
+/// deny rules end up at the TOP of FORWARD — they fire before
+/// any per-policy allow rule. Without that ordering, a
+/// `--network-preset unrestricted` workload (no allow-list,
+/// nothing scoped to it in FORWARD today) would still hit the
+/// metadata endpoint.
+///
+/// IPv6 entries from the const are intentionally skipped here —
+/// today's bridge wiring is IPv4-only, so a v6 packet from the
+/// guest doesn't have a route to leave anyway. The v6
+/// enforcement lands when the bridge gains v6.
+pub fn mandatory_deny_iptables_script(bridge_dev: &str, guest_ip: &str) -> String {
+    let mut script = String::from(
+        "# Plan 74 W2 §item 4 — mandatory deny ranges (cloud metadata,\n\
+         # link-local, CGNAT, host loopback). These rules sit at the top\n\
+         # of FORWARD via `-I` so they're checked before any per-policy\n\
+         # allow rule — even an `unrestricted` workload cannot reach\n\
+         # 169.254.169.254 (AWS IMDS / GCP / Azure metadata).\n",
+    );
+    for net in mandatory_deny_ranges() {
+        if !net.network().is_ipv4() {
+            continue;
+        }
+        script.push_str(&format!(
+            "sudo iptables -I FORWARD -i {br} -s {ip} -d {cidr} -j DROP\n",
+            br = bridge_dev,
+            ip = guest_ip,
+            cidr = net,
+        ));
+    }
+    script
+}
+
+/// Cleanup counterpart of [`mandatory_deny_iptables_script`].
+/// `iptables -D` removes one matching rule; the
+/// `while … 2>/dev/null; do :; done` form drains *all* matching
+/// rules so a previously-leaked duplicate (from a prior crashed
+/// `apply_network_policy`) doesn't strand a deny rule on the
+/// chain. Mirrors the pattern used by
+/// [`NetworkPolicy::iptables_cleanup_script`].
+pub fn mandatory_deny_iptables_cleanup_script(bridge_dev: &str, guest_ip: &str) -> String {
+    let mut script = String::from("# Clean up mandatory-deny rules\n");
+    for net in mandatory_deny_ranges() {
+        if !net.network().is_ipv4() {
+            continue;
+        }
+        script.push_str(&format!(
+            "while sudo iptables -D FORWARD -i {br} -s {ip} -d {cidr} -j DROP 2>/dev/null; do :; done\n",
+            br = bridge_dev,
+            ip = guest_ip,
+            cidr = net,
+        ));
+    }
+    script
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1036,5 +1102,140 @@ mod tests {
              consequential single address and a maintainer scanning the \
              list should see it before anything else"
         );
+    }
+
+    // =====================================================================
+    // Plan 74 W2 — iptables wiring for mandatory deny ranges
+    // =====================================================================
+
+    /// The most consequential assertion: the rendered script
+    /// must DROP traffic destined for the cloud metadata
+    /// endpoint. If this fails, AWS IMDS / GCP / Azure metadata
+    /// is reachable from the guest — defeating the entire
+    /// purpose of this slice.
+    #[test]
+    fn mandatory_deny_iptables_script_drops_cloud_metadata() {
+        let script = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        assert!(
+            script.contains("-d 169.254.169.254/32 -j DROP"),
+            "script must drop cloud metadata endpoint; got: {script}"
+        );
+    }
+
+    #[test]
+    fn mandatory_deny_iptables_script_scopes_to_guest_source() {
+        let script = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        // Every line that adds a rule must be scoped to the
+        // guest's source IP — otherwise a sibling guest's
+        // traffic could be affected by cleanup of this one.
+        for line in script.lines().filter(|l| l.contains("iptables -I")) {
+            assert!(
+                line.contains("-s 172.16.0.2"),
+                "deny rule line must scope to the guest IP: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn mandatory_deny_iptables_script_uses_minus_i_for_top_of_chain() {
+        // `-I FORWARD` inserts at chain position 1 (top). A
+        // future PR that switches to `-A` would silently bury
+        // the deny rules below any pre-existing allow rules —
+        // catastrophic. Catch the regression at the unit level.
+        let script = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        for line in script.lines().filter(|l| l.contains("iptables")) {
+            assert!(
+                line.contains("-I FORWARD"),
+                "rule must use `-I FORWARD` (top-insert); got: {line}"
+            );
+            assert!(
+                !line.contains("-A FORWARD"),
+                "rule must NOT use `-A FORWARD` (would bury below allow rules): {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn mandatory_deny_iptables_script_skips_ipv6_entries() {
+        let script = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        // v6 enforcement lands when the bridge gains v6
+        // routing; until then the v6 deny rules belong in a
+        // future PR, not in this script.
+        assert!(
+            !script.contains("ip6tables"),
+            "ip6tables must not appear; v6 wiring is deferred. got: {script}"
+        );
+        assert!(
+            !script.contains("::1/128"),
+            "IPv6 entries must not appear in v4 script: {script}"
+        );
+        assert!(
+            !script.contains("fe80::"),
+            "IPv6 entries must not appear in v4 script: {script}"
+        );
+    }
+
+    #[test]
+    fn mandatory_deny_iptables_script_covers_every_ipv4_const_entry() {
+        let script = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        for raw in MANDATORY_DENY_RANGES {
+            let net: ipnet::IpNet = raw.parse().unwrap();
+            if !net.network().is_ipv4() {
+                continue;
+            }
+            assert!(
+                script.contains(&format!("-d {net} -j DROP")),
+                "expected a DROP for {net} but it's missing from script: {script}"
+            );
+        }
+    }
+
+    /// Apply emits a DROP per IPv4 entry; cleanup must emit a
+    /// matching `-D` for every one of them. Drift between the
+    /// two scripts strands stale rules on the bridge after a
+    /// VM teardown.
+    #[test]
+    fn mandatory_deny_cleanup_matches_apply_line_for_line() {
+        let apply = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        let cleanup = mandatory_deny_iptables_cleanup_script("br-mvm", "172.16.0.2");
+        // For every `-I` rule in apply, expect a `-D` rule in
+        // cleanup with the same `-d <cidr>` token.
+        let apply_cidrs: Vec<&str> = apply
+            .lines()
+            .filter(|l| l.contains("iptables -I"))
+            .filter_map(|l| l.split("-d ").nth(1))
+            .filter_map(|tail| tail.split(' ').next())
+            .collect();
+        let cleanup_cidrs: Vec<&str> = cleanup
+            .lines()
+            .filter(|l| l.contains("iptables -D"))
+            .filter_map(|l| l.split("-d ").nth(1))
+            .filter_map(|tail| tail.split(' ').next())
+            .collect();
+        assert_eq!(
+            apply_cidrs, cleanup_cidrs,
+            "apply and cleanup must reference identical CIDRs in identical order"
+        );
+        assert!(!apply_cidrs.is_empty(), "apply must emit at least one rule");
+    }
+
+    #[test]
+    fn mandatory_deny_cleanup_uses_drain_loop() {
+        let cleanup = mandatory_deny_iptables_cleanup_script("br-mvm", "172.16.0.2");
+        // A single `-D` removes exactly one matching rule. The
+        // `while … do :; done` form drains all matches so a
+        // leaked duplicate (from a prior crashed apply) doesn't
+        // strand a deny rule. Matches the pattern used by the
+        // pre-W2 cleanup script in `mvm-backend::network`.
+        for line in cleanup.lines().filter(|l| l.contains("iptables -D")) {
+            assert!(
+                line.starts_with("while sudo "),
+                "cleanup must use `while sudo … do :; done` drain loop: {line}"
+            );
+            assert!(
+                line.ends_with("done"),
+                "cleanup must close the `while … done` block: {line}"
+            );
+        }
     }
 }
