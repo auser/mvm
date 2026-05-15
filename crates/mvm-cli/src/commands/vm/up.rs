@@ -59,45 +59,7 @@ impl mvm_plan::BundleResolver for InMemoryBundleResolver {
     }
 }
 
-/// Persist a host-observed readiness milestone (ADR-050 §3 /
-/// plan 74 W2) on the VM's registry entry. Best-effort — readiness
-/// is observability, never gating, so registry I/O failures and
-/// unregistered VMs (e.g. the launchd direct-boot path that doesn't
-/// always register) degrade silently with a debug/warn log rather
-/// than aborting the launch.
-fn record_vm_readiness(vm_name: &str, readiness: InstanceReadiness) {
-    let path = mvm::vm::name_registry::registry_path();
-    let mut reg = match mvm::vm::name_registry::VmNameRegistry::load(&path) {
-        Ok(r) => r,
-        Err(e) => {
-            tracing::warn!(
-                err = %e,
-                vm = vm_name,
-                "failed to load VM name registry for readiness update"
-            );
-            return;
-        }
-    };
-    let now = mvm_core::time::utc_now();
-    match reg.set_readiness(vm_name, readiness, &now) {
-        Ok(true) => {}
-        Ok(false) => {
-            // VM not in registry — common on direct-boot paths.
-            tracing::debug!(
-                vm = vm_name,
-                "no registry entry for readiness update; skipping"
-            );
-            return;
-        }
-        Err(e) => {
-            tracing::warn!(err = %e, vm = vm_name, "failed to set readiness");
-            return;
-        }
-    }
-    if let Err(e) = reg.save(&path) {
-        tracing::warn!(err = %e, vm = vm_name, "failed to save VM name registry");
-    }
-}
+use super::readiness::record_vm_readiness;
 
 /// Build a `PlanArtifact` pin from a verified bundle archive.
 /// Pulls the 64-byte signature out of the `manifest.sig` entry,
