@@ -1075,6 +1075,7 @@ sweep (32 / 16 / 18).
 | 60 | Phase 4 scaffold — `tests/audit_total_coverage.rs` walks `mvm_cli::cli_command()` + asserts every top-level subcommand has an `AuditPosture` classification | `c036cea` |
 | 60 | Phase 4 scaffold — recursive per-subgroup coverage (13 subgroup tables, ~54 leaf classifications including third-level `manifest tag` + `manifest alias`) | `dabd955` |
 | 60 | Phase 4 follow-on — `validate_audit_policy_stream_destinations` fail-loud at admission on unknown URL schemes in `bundle.audit.stream_destinations` (`ResolveError::AuditPolicyInvalid`, `error_class = policy-audit-invalid`) | `c5c37f2` |
+| 60 | Phase 4 follow-on — `bundle.audit` now constructs the admission audit emitter: policy-bound admission requires `chain_signing = true`, keeps the default local per-tenant chain, and replicates exact JSONL chains to `file://...` stream destinations. `https://` / `unix://` transports remain fail-closed until implemented. | `27f2d68` |
 | 60 | Phase 4 follow-on — `tests/audit_emissions_live.rs` first 3 live drive-and-assert tests (cache prune, cache prune --dry-run negative, network create) | `d852f5a` |
 | 60 | Phase 4 follow-on — 3 more live tests (network remove, manifest prune --orphans, secret put) | `3759af8` |
 | 60 | Phase 4 follow-on — 3 secret-cluster live tests (secret get/ls/rm); discovered + pinned the on-disk action-name decoupling (`ls` → `"list"`, `rm` → `"delete"`) | `b22feae` |
