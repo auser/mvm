@@ -3183,6 +3183,7 @@ dependencies = [
  "ipnet",
  "libc",
  "mvm",
+ "mvm-backend",
  "mvm-base",
  "mvm-core",
  "mvm-plan",
