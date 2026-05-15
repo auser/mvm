@@ -1734,11 +1734,9 @@ fn handle_client(
                     let resp = GuestResponse::ProtocolMismatch {
                         host_protocol_version: 0,
                         agent_protocol_version: mvm_guest::vsock::PROTOCOL_VERSION,
-                        required_action:
-                            mvm_guest::vsock::ProtocolUpgradeAction::UpgradeHost,
-                        message:
-                            "guest agent requires protocol_hello before any other request"
-                                .to_string(),
+                        required_action: mvm_guest::vsock::ProtocolUpgradeAction::UpgradeHost,
+                        message: "guest agent requires protocol_hello before any other request"
+                            .to_string(),
                     };
                     write_response(&mut file, &resp);
                     return;
@@ -2828,10 +2826,7 @@ mod tests {
                     required_action,
                     mvm_guest::vsock::ProtocolUpgradeAction::UpgradeHost
                 );
-                assert_eq!(
-                    agent_protocol_version,
-                    mvm_guest::vsock::PROTOCOL_VERSION
-                );
+                assert_eq!(agent_protocol_version, mvm_guest::vsock::PROTOCOL_VERSION);
             }
             other => panic!("expected ProtocolMismatch, got {other:?}"),
         }
