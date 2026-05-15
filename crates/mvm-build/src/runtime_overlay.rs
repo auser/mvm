@@ -28,18 +28,33 @@
 //! versioned per ADR-002 §W4.1; a stale overlay paired with a
 //! newer host would silently misbehave).
 //!
-//! ## Out of scope
+//! ## Two ways to land an artifact in the cache
 //!
-//! - **Building** the overlay (`nix build`). W1.4b.2 lands the
-//!   Nix flake that produces these artifacts.
-//! - **Downloading** the overlay from a release. W1.4b.4 wires
-//!   the artifact-acquisition path (similar to how
-//!   `download_dev_image` works for the dev VM image).
-//! - **Attaching** the overlay to a microVM at boot. W1.4b.2 /
-//!   .3 land the backend + `mvm-verity-init` extensions.
+//! 1. **Build from the flake.** [`build_overlay_with_nix`]
+//!    shells out to `nix build` against
+//!    `<workspace>/nix/images/runtime-overlay/` (W1.4b.2's flake)
+//!    and returns paths into the nix store. Linux-only — `nix`
+//!    is unavailable on the macOS host per CLAUDE.md's "Host
+//!    Nix is never used by mvmctl" rule, so the function gates
+//!    on `target_os = "linux"`. The macOS path runs through the
+//!    libkrun builder VM (W1.4b.3b's wiring).
+//! 2. **Download from a release.** W1.4b.4 wires the
+//!    artifact-acquisition path (similar to how
+//!    `download_dev_image` works for the dev VM image).
 //!
-//! This module is pure file I/O + string parsing. Cross-
-//! platform; no `cfg(target_os)` gates.
+//! ## Out of scope (this PR)
+//!
+//! - **Attaching** the overlay to a microVM at boot. W1.4b.3b
+//!   lands the backend + `mvm-verity-init` extensions.
+//! - **Routing macOS calls** through the libkrun builder VM.
+//!   W1.4b.3b also wires this (same VM the builder-vm flake
+//!   runs in today).
+//! - **`mkGuest` refactor** to drop the agent / shim / runner
+//!   from per-image closures. W1.4b.3c.
+//!
+//! The resolver and the build-spec construction are pure file
+//! I/O + string parsing; only [`build_overlay_with_nix`] gates
+//! on Linux.
 
 use std::path::{Path, PathBuf};
 use thiserror::Error;
@@ -127,6 +142,23 @@ pub enum RuntimeOverlayError {
     /// unreadable.
     #[error("runtime overlay VERSION file invalid: {reason}")]
     InvalidVersionFile { reason: String },
+
+    /// `nix build` exited non-zero or couldn't be spawned. Plan
+    /// 74 W1.4b.3a — the orchestrator that drives `nix build`
+    /// against the runtime-overlay flake. Includes the upstream
+    /// stderr so failures are debuggable without re-running with
+    /// `--verbose`.
+    #[error("nix build failed: {reason}")]
+    NixBuildFailed { reason: String },
+
+    /// The runtime-overlay operation is unsupported on this
+    /// host. `nix build` runs Linux-only; macOS callers route
+    /// through the libkrun builder VM (W1.4b.3b's wiring).
+    #[error("host does not support {operation}: {reason}")]
+    HostUnsupported {
+        operation: &'static str,
+        reason: &'static str,
+    },
 
     /// Underlying io failure during a file read.
     #[error("io error: {0}")]
@@ -323,6 +355,203 @@ fn read_and_validate_roothash(path: &Path) -> Result<String, RuntimeOverlayError
         });
     }
     Ok(trimmed.to_string())
+}
+
+// =================================================================
+// Build orchestrator (W1.4b.3a)
+// =================================================================
+
+/// Spec for `nix build` of the runtime-overlay flake at
+/// `<workspace>/nix/images/runtime-overlay/`. Pure data; the
+/// actual invocation lives in [`build_overlay_with_nix`].
+///
+/// The spec exposes its argv + env separately so callers that
+/// drive `nix build` *inside* the libkrun builder VM (rather
+/// than on the host) can plumb the same shape through without
+/// reaching for an external command.
+#[derive(Debug, Clone)]
+pub struct OverlayBuildSpec {
+    /// Workspace root — the dir containing `nix/`, `crates/`,
+    /// `Cargo.toml`. The flake reads
+    /// `<workspace_root>/nix/images/runtime-overlay/flake.nix`.
+    pub workspace_root: PathBuf,
+    /// Which target arch to build for. Maps to the Nix
+    /// `system` attribute on the flake's `packages` output.
+    pub arch: Arch,
+    /// Where the resulting result-symlink should live. Typically
+    /// a tempdir or a staging location under
+    /// `~/.cache/mvm/runtime-overlay/<version>/<arch>/.work/` —
+    /// the install-to-cache step is the caller's responsibility.
+    pub out_link: PathBuf,
+    /// Override the `nix` binary location. Default `None` ⇒
+    /// resolved via `$PATH`. Tests use this to substitute a stub.
+    pub nix_binary: Option<PathBuf>,
+}
+
+impl OverlayBuildSpec {
+    /// Construct a spec for the given (workspace, arch, out_link).
+    pub fn new(workspace_root: PathBuf, arch: Arch, out_link: PathBuf) -> Self {
+        Self {
+            workspace_root,
+            arch,
+            out_link,
+            nix_binary: None,
+        }
+    }
+
+    /// Nix `system` attribute string corresponding to `self.arch`.
+    /// The runtime-overlay flake exposes outputs at
+    /// `packages.<system>.default` for these two systems.
+    pub fn system(&self) -> &'static str {
+        match self.arch {
+            Arch::Aarch64 => "aarch64-linux",
+            Arch::X86_64 => "x86_64-linux",
+        }
+    }
+
+    /// Absolute path to the flake directory (the dir containing
+    /// `flake.nix`). Nix's `path:` URI scheme consumes the dir,
+    /// not the `flake.nix` file.
+    pub fn flake_path(&self) -> PathBuf {
+        self.workspace_root
+            .join("nix")
+            .join("images")
+            .join("runtime-overlay")
+    }
+
+    /// The Nix flake reference used by `nix build`. Pinned to
+    /// the workspace-local path so we don't accidentally fetch
+    /// a published flake when building from source.
+    pub fn flake_reference(&self) -> String {
+        format!(
+            "path:{}#packages.{}.default",
+            self.flake_path().display(),
+            self.system()
+        )
+    }
+
+    /// `nix build` argv, ready to hand to `Command::new` plus
+    /// `.args(argv[1..])`. The orchestrator manages its own
+    /// symlink position via `--out-link <path>`.
+    pub fn argv(&self) -> Vec<String> {
+        let nix = self
+            .nix_binary
+            .as_deref()
+            .map(|p| p.display().to_string())
+            .unwrap_or_else(|| "nix".to_string());
+        vec![
+            nix,
+            "build".to_string(),
+            "--extra-experimental-features".to_string(),
+            "nix-command flakes".to_string(),
+            "--out-link".to_string(),
+            self.out_link.display().to_string(),
+            self.flake_reference(),
+        ]
+    }
+
+    /// Environment variables to thread through to `nix build`.
+    /// `MVM_WORKSPACE_PATH` is the override the flake reads when
+    /// running inside the libkrun-builder VM's sandbox where
+    /// `..` resolution against the store copy doesn't reach the
+    /// workspace — same mechanism the builder-vm flake uses.
+    pub fn env(&self) -> Vec<(String, String)> {
+        vec![(
+            "MVM_WORKSPACE_PATH".to_string(),
+            self.workspace_root.display().to_string(),
+        )]
+    }
+}
+
+/// Drive `nix build` from a spec. Linux-only at runtime —
+/// CLAUDE.md forbids host nix on macOS, and even if the binary
+/// is installed it can't cross-compile to `aarch64-linux` /
+/// `x86_64-linux` without a remote builder. Non-Linux callers
+/// get `HostUnsupported`; W1.4b.3b routes those calls through
+/// the libkrun builder VM.
+///
+/// On success the function:
+///
+/// 1. Verifies the four required files exist at
+///    `<out_link>/{overlay.ext4, overlay.verity, overlay.roothash,
+///    VERSION}`. The runtime-overlay flake's `runCommand`
+///    produces exactly these names.
+/// 2. Reads `VERSION` + `overlay.roothash` and validates them.
+/// 3. Returns a [`RuntimeOverlayArtifact`] pointing at the
+///    nix-store paths the result-symlink resolves to.
+pub fn build_overlay_with_nix(
+    spec: &OverlayBuildSpec,
+) -> Result<RuntimeOverlayArtifact, RuntimeOverlayError> {
+    #[cfg(target_os = "linux")]
+    {
+        run_nix_build(spec)?;
+        validate_built_artifact(spec)
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        // Suppress "unused" on non-Linux while keeping a single
+        // public signature across hosts.
+        let _ = spec;
+        Err(RuntimeOverlayError::HostUnsupported {
+            operation: "runtime-overlay nix build",
+            reason: "nix build runs Linux-only; non-Linux callers route through the libkrun builder VM (W1.4b.3b)",
+        })
+    }
+}
+
+#[cfg(target_os = "linux")]
+fn run_nix_build(spec: &OverlayBuildSpec) -> Result<(), RuntimeOverlayError> {
+    let argv = spec.argv();
+    let binary = argv.first().cloned().unwrap_or_else(|| "nix".to_string());
+    let mut cmd = std::process::Command::new(&binary);
+    cmd.args(&argv[1..]);
+    for (k, v) in spec.env() {
+        cmd.env(k, v);
+    }
+    let exec = cmd
+        .output()
+        .map_err(|e| RuntimeOverlayError::NixBuildFailed {
+            reason: format!("spawn `{binary}`: {e}"),
+        })?;
+    if !exec.status.success() {
+        let stderr = String::from_utf8_lossy(&exec.stderr).into_owned();
+        return Err(RuntimeOverlayError::NixBuildFailed {
+            reason: format!("exit {:?}; stderr={stderr}", exec.status.code()),
+        });
+    }
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+fn validate_built_artifact(
+    spec: &OverlayBuildSpec,
+) -> Result<RuntimeOverlayArtifact, RuntimeOverlayError> {
+    let dir = &spec.out_link;
+    let overlay_ext4 = dir.join("overlay.ext4");
+    let sidecar = dir.join("overlay.verity");
+    let roothash_file = dir.join("overlay.roothash");
+    let version_file = dir.join("VERSION");
+    for required in [&overlay_ext4, &sidecar, &roothash_file, &version_file] {
+        if !required.is_file() {
+            return Err(RuntimeOverlayError::ArtifactIncomplete {
+                artifact_dir: dir.to_path_buf(),
+                missing: required.clone(),
+                version: read_version_file(&version_file)
+                    .unwrap_or_else(|_| "<unreadable>".to_string()),
+                arch: spec.arch.to_string(),
+            });
+        }
+    }
+    let version = read_version_file(&version_file)?;
+    let roothash = read_and_validate_roothash(&roothash_file)?;
+    Ok(RuntimeOverlayArtifact {
+        overlay_ext4,
+        sidecar,
+        roothash_file,
+        roothash,
+        arch: spec.arch,
+        version,
+    })
 }
 
 #[cfg(test)]
@@ -617,5 +846,136 @@ mod tests {
         let artifact = resolver.resolve(Arch::X86_64).expect("resolve");
         assert_eq!(artifact.arch, Arch::X86_64);
         assert!(artifact.overlay_ext4.to_string_lossy().contains("x86_64"));
+    }
+
+    // =================================================================
+    // Build-spec tests (W1.4b.3a)
+    // =================================================================
+
+    #[test]
+    fn build_spec_system_maps_arch_to_nix_system_string() {
+        let spec = OverlayBuildSpec::new(
+            PathBuf::from("/workspace"),
+            Arch::Aarch64,
+            PathBuf::from("/tmp/result"),
+        );
+        assert_eq!(spec.system(), "aarch64-linux");
+
+        let spec = OverlayBuildSpec::new(
+            PathBuf::from("/workspace"),
+            Arch::X86_64,
+            PathBuf::from("/tmp/result"),
+        );
+        assert_eq!(spec.system(), "x86_64-linux");
+    }
+
+    #[test]
+    fn build_spec_flake_path_points_at_runtime_overlay_dir() {
+        let spec = OverlayBuildSpec::new(
+            PathBuf::from("/workspace"),
+            Arch::Aarch64,
+            PathBuf::from("/tmp/result"),
+        );
+        assert_eq!(
+            spec.flake_path(),
+            PathBuf::from("/workspace/nix/images/runtime-overlay")
+        );
+    }
+
+    #[test]
+    fn build_spec_flake_reference_pins_path_uri_and_system_default() {
+        let spec = OverlayBuildSpec::new(
+            PathBuf::from("/workspace"),
+            Arch::X86_64,
+            PathBuf::from("/tmp/result"),
+        );
+        // Pinned to the workspace-local path so we don't fetch
+        // a published flake on the rare host where nix is happy
+        // to resolve a bare attribute against `nixpkgs`.
+        assert_eq!(
+            spec.flake_reference(),
+            "path:/workspace/nix/images/runtime-overlay#packages.x86_64-linux.default"
+        );
+    }
+
+    #[test]
+    fn build_spec_argv_defaults_to_path_lookup_nix_and_includes_required_flags() {
+        let spec = OverlayBuildSpec::new(
+            PathBuf::from("/workspace"),
+            Arch::Aarch64,
+            PathBuf::from("/tmp/result"),
+        );
+        let argv = spec.argv();
+        // Default nix binary is `nix` (resolved via $PATH).
+        assert_eq!(argv[0], "nix");
+        assert_eq!(argv[1], "build");
+        // Experimental features enable nix-command + flakes
+        // without requiring a contributor's `~/.config/nix/nix.conf`.
+        let pair = argv
+            .windows(2)
+            .find(|w| w[0] == "--extra-experimental-features");
+        assert!(
+            pair.is_some(),
+            "argv must enable nix-command + flakes: {argv:?}"
+        );
+        assert_eq!(pair.unwrap()[1], "nix-command flakes");
+        // --out-link <path>
+        let out = argv.windows(2).find(|w| w[0] == "--out-link");
+        assert!(out.is_some(), "argv must specify --out-link: {argv:?}");
+        assert_eq!(out.unwrap()[1], "/tmp/result");
+        // Final positional is the flake reference.
+        assert_eq!(
+            argv.last().unwrap(),
+            "path:/workspace/nix/images/runtime-overlay#packages.aarch64-linux.default"
+        );
+    }
+
+    #[test]
+    fn build_spec_argv_respects_nix_binary_override() {
+        let spec = OverlayBuildSpec {
+            workspace_root: PathBuf::from("/workspace"),
+            arch: Arch::Aarch64,
+            out_link: PathBuf::from("/tmp/result"),
+            nix_binary: Some(PathBuf::from("/custom/nix-stub")),
+        };
+        let argv = spec.argv();
+        assert_eq!(argv[0], "/custom/nix-stub");
+    }
+
+    #[test]
+    fn build_spec_env_sets_workspace_path_for_sandbox_resolution() {
+        // `MVM_WORKSPACE_PATH` is the env override the
+        // runtime-overlay flake reads so the `..` resolution
+        // against a store copy lands at the right tree when nix
+        // runs inside the libkrun-builder VM sandbox.
+        let spec = OverlayBuildSpec::new(
+            PathBuf::from("/workspace"),
+            Arch::Aarch64,
+            PathBuf::from("/tmp/result"),
+        );
+        let env = spec.env();
+        assert_eq!(env.len(), 1);
+        assert_eq!(env[0].0, "MVM_WORKSPACE_PATH");
+        assert_eq!(env[0].1, "/workspace");
+    }
+
+    #[cfg(not(target_os = "linux"))]
+    #[test]
+    fn build_overlay_with_nix_returns_host_unsupported_on_non_linux() {
+        let spec = OverlayBuildSpec::new(
+            PathBuf::from("/workspace"),
+            Arch::Aarch64,
+            PathBuf::from("/tmp/result"),
+        );
+        let err = build_overlay_with_nix(&spec).unwrap_err();
+        match err {
+            RuntimeOverlayError::HostUnsupported { operation, .. } => {
+                assert!(
+                    operation.contains("runtime-overlay") || operation.contains("nix"),
+                    "expected runtime-overlay or nix in operation; got {operation:?}"
+                );
+            }
+            other => panic!("expected HostUnsupported, got {other:?}"),
+        }
     }
 }
