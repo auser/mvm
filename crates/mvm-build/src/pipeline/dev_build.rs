@@ -306,14 +306,14 @@ pub fn dev_build(
         });
     }
 
-    // If the `env` channel has `nix` on PATH, run the build there
-    // (host on Linux+host-Nix, Apple Container dev VM on macOS 26+,
-    // etc.). Hosts without nix must provision the builder VM path first.
-    if !env_has_nix(env) {
+    // If the builder environment has `nix` on PATH, run the build
+    // there. mvmctl dev builds do not fall back to host Nix; missing
+    // nix here means the builder VM/image path is broken.
+    if !builder_env_has_nix(env) {
         let _ = (env, flake_ref, profile, mode);
         anyhow::bail!(
-            "No `nix` on PATH. Install host Nix (Determinate Nix or upstream) \
-             or start the project builder VM before running the dev build."
+            "No `nix` on PATH inside the builder environment. Rebuild or restart \
+             the project builder VM before running the dev build."
         );
     }
 
@@ -523,11 +523,7 @@ fn shell_quote(input: &str) -> String {
 }
 
 /// True if `nix` is available inside the builder shell environment.
-///
-/// `env.shell_exec_stdout("nix --version")` succeeds if and only if
-/// `nix` is on PATH inside the channel — host on Linux+host-Nix,
-/// Apple Container dev VM on macOS 26+, etc.
-fn env_has_nix(env: &dyn ShellEnvironment) -> bool {
+fn builder_env_has_nix(env: &dyn ShellEnvironment) -> bool {
     env.shell_exec_stdout("nix --version 2>/dev/null | head -1")
         .map(|s| s.trim().starts_with("nix "))
         .unwrap_or(false)
@@ -1267,7 +1263,7 @@ mod tests {
         let err = result.expect_err("must bail when no nix is available");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("No `nix` on PATH"),
+            msg.contains("No `nix` on PATH inside the builder environment"),
             "bail must name missing nix: {msg}"
         );
     }

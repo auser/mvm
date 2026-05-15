@@ -582,9 +582,7 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
 /// Failures of the local build are surfaced loudly — never silently
 /// substituted with the prebuilt, since the prebuilt would mask local
 /// rootfs changes.
-fn ensure_dev_image() -> Result<(String, String)> {
-    let local_flake = find_dev_image_flake().ok();
-
+pub(super) fn ensure_dev_image() -> Result<(String, String)> {
     // Plan 72 W5.B + W5.C — source-checkout dispatch.
     //
     // libkrun is the only supported builder for the dev-shell flake.
