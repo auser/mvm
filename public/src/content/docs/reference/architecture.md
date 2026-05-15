@@ -128,6 +128,7 @@ Extends `ShellEnvironment` for fleet orchestration:
 - `L4Gate` evaluates policy-bundle `[[network.l4]]` rows with default-deny semantics
 - `BackendLauncher::prepare_launch()` returns backend-owned runtime slot metadata before tenant launch, without starting tenant code
 - `FirecrackerRunConfigLauncher` adapts a prebuilt Firecracker `FlakeRunConfig` into the supervisor backend slot, exposing its `VmSlot` during preparation and calling `run_from_build()` only after firewall install
+- `Supervisor::with_*` assembly methods wire backend, policy, audit, artifact, and firewall slots without bypassing the launch-time firewall validation gate
 - `FirewallSpec::from_vm_slot()` derives VM identity and TAP device from backend runtime `VmSlot` metadata, then validates identifiers before any platform rule generation
 - `FirewallEnforcer` installs per-VM default-deny host firewall rules before backend launch and tears them down on failed launch or stop
 - `LinuxNftFirewall` generates VM-scoped nftables tables that only allow TAP traffic to the supervisor proxy interface

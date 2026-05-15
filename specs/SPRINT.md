@@ -1071,6 +1071,7 @@ sweep (32 / 16 / 18).
 | 60 | Phase 3 Slice C follow-on — `FirewallSpec::from_vm_slot` derives VM identity/TAP from Firecracker runtime `VmSlot` metadata and supervisor launch validates specs before firewall install or backend dispatch | `d252f92` |
 | 60 | Phase 3 Slice C follow-on — `BackendLauncher::prepare_launch` returns runtime `VmSlot` metadata before tenant launch; `Supervisor::launch` now derives firewall specs from that backend slot plus the supervisor proxy interface | `ab4a792` |
 | 60 | Phase 3 Slice C follow-on — `FirecrackerRunConfigLauncher` adapts prebuilt Firecracker `FlakeRunConfig` into the supervisor `BackendLauncher` slot without starting tenant code during `prepare_launch` | `bd084f7` |
+| 60 | Phase 3 Slice C follow-on — `Supervisor::with_*` assembly methods wire backend, policy, audit, artifact, and firewall slots without public-field mutation while preserving launch-time firewall validation | `PR pending` |
 | 60 | Phase 3 follow-on — `up.rs::admit_plan_for_boot` calls `resolve_supervisor_components`; typed audit-chain `error_class` per failure mode | `ac87e8d` |
 | 60 | Phase 3 follow-on — `slots_from_bundle` delegates to `build_inspector_chain`, picking up SsrfGuard / SecretsScanner / InjectionGuard / PiiRedactor + honoring `disabled_inspectors` | `bf8079a` |
 | 60 | Phase 3 follow-on — `LiveArtifactCollector::from_policy(&bundle.artifact)` (NotImplemented carries `capture_paths` count + retention) | `72f272f` |

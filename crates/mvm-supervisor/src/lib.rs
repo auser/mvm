@@ -73,7 +73,10 @@ pub use audit_recorder::{
     EventCategory, Recorder, RecorderError, UNBOUND_IMAGE_NAME, UNBOUND_IMAGE_SHA256,
     UNBOUND_PLAN_ID,
 };
-pub use backend::{BackendError, BackendLauncher, NoopBackendLauncher};
+pub use backend::{
+    BackendError, BackendLaunchSpec, BackendLauncher, FirecrackerRunConfigLauncher,
+    NoopBackendLauncher,
+};
 #[cfg(target_os = "macos")]
 pub use balloon::VmPressureLevelSource;
 pub use balloon::{
