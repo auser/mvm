@@ -130,6 +130,10 @@ fn copy_host_to_guest(host: &Path, vm: &str, guest_path: &str, args: &Args) -> R
         create_parents: args.create_parents,
         follow_symlinks: false,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit. Emit
+    // before dispatch so a failure on the wire still leaves an
+    // audit trail of "host tried to write to this guest path".
+    super::shared::emit_vsock_rpc_audit(vm, &req);
     match unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)? {
         FsResult::Write { bytes_written } => {
             mvm_core::audit_emit!(
@@ -185,6 +189,8 @@ fn copy_guest_to_host(vm: &str, guest_path: &str, host: &Path, args: &Args) -> R
         length: stat.size,
         follow_symlinks: true,
     };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(vm, &req);
     match unwrap_fs(mvm_guest::vsock::send_fs_request(&dir, req)?)? {
         FsResult::Read { content, .. } => {
             if content.len() as u64 != stat.size {
