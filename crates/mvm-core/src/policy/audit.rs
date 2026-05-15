@@ -277,6 +277,48 @@ pub enum LocalAuditKind {
     /// records, one per volume).
     DepsAudit,
 
+    // --- Plan 77 W3: Stage 0 builder VM bootstrap lifecycle ---
+    //
+    // Three events bracket the per-host Stage 0 lifecycle so a
+    // contributor can answer "did `dev up` actually run Stage 0 last
+    // night, and how did it land?" after the fact. The rescued plan
+    // doc sketched a separate `~/.mvm/audit/stage0.jsonl` file; we
+    // emit into the shared local audit log instead because (a) every
+    // other contributor-side event already lands there, (b) the
+    // schema/macro/rotation already exists, and (c) operators filter
+    // by `kind` not by file. The `kind` strings (`stage0_boot`,
+    // `stage0_cache_promoted`, `stage0_failed`) are stable.
+    //
+    // Detail formats are space-separated key=value pairs to match
+    // every other call site (the macro can't emit JSON without a
+    // wider schema change). SHAs are intentionally omitted — hashing
+    // a 700 MiB rootfs on every `dev up` is too expensive for an
+    // audit event; the seed label + source fingerprint prefix are
+    // enough to correlate against the build cache.
+    //
+    /// Stage 0 entered the bootstrap path: seed image located, lock
+    /// acquired, build about to start. Detail format:
+    ///   `seed=<label> fingerprint_prefix=<8-hex-prefix>`
+    /// where `seed` is the find_local_fallback_image label
+    /// (`current`, `prebuilt/v0.14.0`, `builds/<hash>`, ...) and
+    /// `fingerprint_prefix` is the leading 8 hex chars of the
+    /// SHA-256 of `nix/images/builder-vm/{flake.nix,flake.lock}`.
+    Stage0Boot,
+    /// Stage 0 finished cleanly: the staging dir validated, was
+    /// renamed into the live cache, and `cache_ready` re-validates.
+    /// Detail format:
+    ///   `cache=<final_dir> fingerprint_prefix=<8-hex-prefix> duration_ms=<n>`
+    Stage0CachePromoted,
+    /// Stage 0 failed at any point after `Stage0Boot` was emitted.
+    /// Detail format:
+    ///   `stage=<build|validate|promote> duration_ms=<n> reason=<short-error-summary>`
+    /// `reason` is the top-level anyhow message, truncated to a
+    /// reasonable bound; the full chain is on stderr already. Pre-
+    /// `Stage0Boot` failures (lock contention, no seed image) are
+    /// not audited because they happen before the bootstrap really
+    /// started.
+    Stage0Failed,
+
     // --- Plan 74 W2: programmable network policy enforcement events ---
     //
     // Five new kinds wired into the L3 iptables / L4 substrate / DNS
@@ -986,6 +1028,10 @@ mod tests {
             LocalAuditKind::BundleGc,
             // OCI export follow-on.
             LocalAuditKind::ImageExportOci,
+            // Plan 77 W3 Stage 0 bootstrap lifecycle.
+            LocalAuditKind::Stage0Boot,
+            LocalAuditKind::Stage0CachePromoted,
+            LocalAuditKind::Stage0Failed,
         ];
         for kind in kinds {
             let json = serde_json::to_string(&kind).unwrap();
@@ -1023,6 +1069,13 @@ mod tests {
             (LocalAuditKind::BundleGc, "bundle_gc"),
             // OCI export follow-on.
             (LocalAuditKind::ImageExportOci, "image_export_oci"),
+            // Plan 77 W3 Stage 0 bootstrap lifecycle. Wire strings are
+            // load-bearing: downstream log shippers / dashboards filter
+            // on `kind == "stage0_boot"` etc., so the snake-case
+            // mapping needs a pinned regression test.
+            (LocalAuditKind::Stage0Boot, "stage0_boot"),
+            (LocalAuditKind::Stage0CachePromoted, "stage0_cache_promoted"),
+            (LocalAuditKind::Stage0Failed, "stage0_failed"),
         ];
         for (kind, expected) in kinds_and_strings {
             let json = serde_json::to_string(&kind).unwrap();
