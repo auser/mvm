@@ -139,6 +139,8 @@ The builder VM keeps build state warm so repeated builds avoid re-fetching the w
 
 The first build is allowed to be slower because it may bootstrap the builder image and populate the Nix store. Later builds should be dominated by changed inputs.
 
+When `mvmctl` is running from this source checkout, the builder image is local-build only. A populated `~/.cache/mvm/builder-vm/<arch>/` cache can be reused, but a cache miss fails with an actionable error instead of downloading a published builder image. This preserves the contributor invariant that edits under `nix/images/builder-vm/` are reflected by the next local build path and are never masked by release artifacts.
+
 ## Benchmarking Runtime Boot
 
 When measuring whether a prebuilt runtime image boots under a budget such as 200 ms, separate the phases:
