@@ -538,10 +538,10 @@ fn dispatch_update_idle_timeout(vm_name: &str, secs: u64) -> Result<(u64, u64)> 
         &mut stream,
         &[mvm_guest::vsock::GuestCapability::UpdateIdleTimeout],
     )?;
-    let resp = mvm_guest::vsock::send_request(
-        &mut stream,
-        &mvm_guest::vsock::GuestRequest::UpdateIdleTimeout { secs },
-    )?;
+    let req = mvm_guest::vsock::GuestRequest::UpdateIdleTimeout { secs };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(vm_name, &req);
+    let resp = mvm_guest::vsock::send_request(&mut stream, &req)?;
     match resp {
         mvm_guest::vsock::GuestResponse::UpdateIdleTimeoutAck {
             previous_secs,
@@ -722,10 +722,10 @@ fn dispatch_run_code(
     // specific capability — the hello alone unblocks dispatch.
     let _ = mvm_guest::vsock::negotiate_protocol(&mut stream, Vec::new())
         .with_context(|| format!("Negotiating guest agent protocol on {:?}", record.vm_name))?;
-    let resp = mvm_guest::vsock::send_request(
-        &mut stream,
-        &mvm_guest::vsock::GuestRequest::RunCode { code, timeout_secs },
-    )?;
+    let req = mvm_guest::vsock::GuestRequest::RunCode { code, timeout_secs };
+    // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+    super::shared::emit_vsock_rpc_audit(&record.vm_name, &req);
+    let resp = mvm_guest::vsock::send_request(&mut stream, &req)?;
     let (exit_code, stdout, stderr) = match resp {
         mvm_guest::vsock::GuestResponse::ExecResult {
             exit_code,

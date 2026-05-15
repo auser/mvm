@@ -2021,8 +2021,14 @@ fn fs_mv_emits_vm_fs_mutate_audit_entry() {
 }
 
 #[test]
-fn fs_ls_does_not_emit_audit_entry() {
-    // Read-only: `fs ls` doesn't mutate, so no LocalAudit emit.
+fn fs_ls_does_not_emit_mutation_audit_entry() {
+    // Read-only: `fs ls` doesn't mutate state — must not emit
+    // any *mutation-class* LocalAudit kind (`VmFsMutate`,
+    // `SlotRemove`, …). It *does* emit a
+    // `network_policy_allow` record per Plan 74 W2 / Plan 51
+    // W6 (every host→guest vsock RPC is audited regardless of
+    // whether the CLI verb is read-only); the two invariants
+    // are orthogonal.
     let sandbox = AuditSandbox::new();
     let _fixture = start_mock_vm_agent(&sandbox, "t-fsls");
 
@@ -2038,9 +2044,21 @@ fn fs_ls_does_not_emit_audit_entry() {
     );
 
     let log = read_audit_log(&sandbox.audit_log_path());
+    // No mutation-class records. The only audit entries
+    // allowed are the W2 vsock-RPC audit records.
+    assert_eq!(
+        count_entries_with_kind(&log, "vm_fs_mutate"),
+        0,
+        "read-only `mvmctl fs ls` must not write a mutation LocalAudit. Full log:\n{log}"
+    );
+    // Exactly one inbound vsock RPC audit (fs-list).
     assert!(
-        log.is_empty(),
-        "read-only `mvmctl fs ls` must not write to LocalAudit. Full log:\n{log}"
+        log.contains("\"kind\":\"network_policy_allow\""),
+        "fs ls must emit a network_policy_allow vsock-RPC record. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("verb=fs-list"),
+        "vsock-RPC audit detail must name verb=fs-list. Full log:\n{log}"
     );
 }
 
@@ -2164,8 +2182,12 @@ fn proc_stdin_emits_vm_proc_stdin_audit_entry() {
 }
 
 #[test]
-fn proc_ls_does_not_emit_audit_entry() {
-    // Read-only: `proc ls` doesn't mutate, so no LocalAudit emit.
+fn proc_ls_does_not_emit_mutation_audit_entry() {
+    // Read-only: `proc ls` doesn't mutate process state — must
+    // not emit any mutation-class LocalAudit kind. It *does*
+    // emit a `network_policy_allow` record per Plan 74 W2 /
+    // Plan 51 W6 (every host→guest vsock RPC is audited); the
+    // two invariants are orthogonal.
     let sandbox = AuditSandbox::new();
     let _fixture = start_mock_vm_agent(&sandbox, "t-pls");
 
@@ -2181,8 +2203,22 @@ fn proc_ls_does_not_emit_audit_entry() {
     );
 
     let log = read_audit_log(&sandbox.audit_log_path());
+    // No mutation-class records. ProcStart / ProcSignal / etc.
+    // emit those kinds; `proc ls` must NOT.
+    for mutating in ["vm_proc_start", "vm_proc_signal", "vm_proc_stdin", "kill"] {
+        assert_eq!(
+            count_entries_with_kind(&log, mutating),
+            0,
+            "read-only `mvmctl proc ls` must not write {mutating} LocalAudit. Full log:\n{log}"
+        );
+    }
+    // Exactly one inbound vsock RPC audit (proc-list).
     assert!(
-        log.is_empty(),
-        "read-only `mvmctl proc ls` must not write to LocalAudit. Full log:\n{log}"
+        log.contains("\"kind\":\"network_policy_allow\""),
+        "proc ls must emit a network_policy_allow vsock-RPC record. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("verb=proc-list"),
+        "vsock-RPC audit detail must name verb=proc-list. Full log:\n{log}"
     );
 }

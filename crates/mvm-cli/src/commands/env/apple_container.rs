@@ -446,17 +446,19 @@ pub(super) fn cmd_dev_apple_container_status() -> Result<()> {
             DEV_VM_NAME,
             mvm_guest::vsock::GUEST_AGENT_PORT,
         )
-        && let Ok(mvm_guest::vsock::GuestResponse::ExecResult { stdout, .. }) =
-            mvm_guest::vsock::send_request(
-                &mut stream,
-                &mvm_guest::vsock::GuestRequest::Exec {
-                    command: "uname -r".to_string(),
-                    stdin: None,
-                    timeout_secs: Some(5),
-                },
-            )
     {
-        ui::info(&format!("  Kernel:  {}", stdout.trim()));
+        let req = mvm_guest::vsock::GuestRequest::Exec {
+            command: "uname -r".to_string(),
+            stdin: None,
+            timeout_secs: Some(5),
+        };
+        // Plan 74 W2 / Plan 51 W6 — inbound vsock RPC audit.
+        super::super::shared::emit_vsock_rpc_audit(DEV_VM_NAME, &req);
+        if let Ok(mvm_guest::vsock::GuestResponse::ExecResult { stdout, .. }) =
+            mvm_guest::vsock::send_request(&mut stream, &req)
+        {
+            ui::info(&format!("  Kernel:  {}", stdout.trim()));
+        }
     }
 
     if let Some(image) = resolve_dev_status_image() {
