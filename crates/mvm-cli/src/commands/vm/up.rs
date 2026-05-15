@@ -61,6 +61,15 @@ impl mvm_plan::BundleResolver for InMemoryBundleResolver {
 
 use super::readiness::record_vm_readiness;
 
+/// Cadence at which the foreground `mvmctl up` Ctrl+C wait loop
+/// re-polls integration health to detect `Active` → `Error`
+/// regressions (ADR-050 §3 / plan 74 W2 "Degraded follow-up"). Set
+/// at 10 s — slow enough that the registry file isn't thrashed when
+/// services are stable, fast enough that an operator running
+/// `mvmctl ls --json` sees the new state within one breath of a
+/// service flipping unhealthy.
+const DEGRADED_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(10);
+
 /// Build a `PlanArtifact` pin from a verified bundle archive.
 /// Pulls the 64-byte signature out of the `manifest.sig` entry,
 /// hashes the archive for the bundle_sha256 field, and stamps the
@@ -1324,7 +1333,13 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
         ui::info(&format!("VM '{}' running. Press Ctrl+C to stop.", vm_name));
 
-        // Block until signaled
+        // Block until signaled. ADR-050 §3 / plan 74 W2 "Degraded
+        // follow-up": every ~10 s while the foreground wait is
+        // active, poll integration health and flip readiness to
+        // `Degraded { unhealthy }` when an `Active` service flips to
+        // `Error`. Recovers to `ServicesReady` automatically when the
+        // service comes back. The monitor dedupes; identical
+        // snapshots don't thrash the registry file.
         let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let pair2 = pair.clone();
         let _ = ctrlc::set_handler(move || {
@@ -1334,11 +1349,17 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         });
         let (lock, cvar) = &*pair;
         let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut monitor = super::readiness::ServicesHealthMonitor::new();
+        let mut next_health_poll = std::time::Instant::now() + DEGRADED_POLL_INTERVAL;
         while !*stopped {
             stopped = cvar
                 .wait_timeout(stopped, std::time::Duration::from_secs(1))
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
+            if !*stopped && std::time::Instant::now() >= next_health_poll {
+                let _ = monitor.observe_and_record(&vm_name);
+                next_health_poll = std::time::Instant::now() + DEGRADED_POLL_INTERVAL;
+            }
         }
         let _ = backend.stop(&mvm_core::vm_backend::VmId(vm_name));
         return Ok(());
@@ -1814,7 +1835,12 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             vm_name_owned
         ));
 
-        // Block until signaled (Ctrl+C or SIGTERM)
+        // Block until signaled (Ctrl+C or SIGTERM). ADR-050 §3 /
+        // plan 74 W2 "Degraded follow-up": same periodic
+        // integration-health poll as the direct-boot wait above —
+        // every ~10 s, watch for `Active` → `Error` regressions and
+        // flip readiness to `Degraded { unhealthy }`. The monitor
+        // dedupes; identical snapshots don't thrash the registry.
         let pair = std::sync::Arc::new((std::sync::Mutex::new(false), std::sync::Condvar::new()));
         let pair2 = pair.clone();
         let _ = ctrlc::set_handler(move || {
@@ -1825,11 +1851,17 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
         let (lock, cvar) = &*pair;
         let mut stopped = lock.lock().unwrap_or_else(|e| e.into_inner());
+        let mut monitor = super::readiness::ServicesHealthMonitor::new();
+        let mut next_health_poll = std::time::Instant::now() + DEGRADED_POLL_INTERVAL;
         while !*stopped {
             stopped = cvar
                 .wait_timeout(stopped, std::time::Duration::from_secs(1))
                 .unwrap_or_else(|e| e.into_inner())
                 .0;
+            if !*stopped && std::time::Instant::now() >= next_health_poll {
+                let _ = monitor.observe_and_record(&vm_name_owned);
+                next_health_poll = std::time::Instant::now() + DEGRADED_POLL_INTERVAL;
+            }
         }
 
         ui::info(&format!("Stopping VM '{}'...", vm_name_owned));
