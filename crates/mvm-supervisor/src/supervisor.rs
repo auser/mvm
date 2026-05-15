@@ -207,6 +207,68 @@ impl Supervisor {
         Self::default()
     }
 
+    /// Wire the backend launcher slot. The launcher owns backend
+    /// runtime metadata and must implement `prepare_launch()` without
+    /// starting tenant code; [`Supervisor::launch`] installs firewall
+    /// policy from that metadata before calling `launch()`.
+    pub fn with_backend_launcher(mut self, backend: Arc<dyn BackendLauncher>) -> Self {
+        self.backend = backend;
+        self
+    }
+
+    /// Wire a prebuilt egress proxy slot.
+    pub fn with_egress_proxy(mut self, egress: Arc<dyn EgressProxy>) -> Self {
+        self.egress = egress;
+        self
+    }
+
+    /// Wire a prebuilt tool gate slot.
+    pub fn with_tool_gate_slot(mut self, tool_gate: Arc<dyn ToolGate>) -> Self {
+        self.tool_gate = tool_gate;
+        self
+    }
+
+    /// Wire a prebuilt keystore releaser slot.
+    pub fn with_keystore_releaser(mut self, keystore: Arc<dyn KeystoreReleaser>) -> Self {
+        self.keystore = keystore;
+        self
+    }
+
+    /// Wire a prebuilt audit signer slot.
+    pub fn with_audit_signer(mut self, audit: Arc<dyn AuditSigner>) -> Self {
+        self.audit = audit;
+        self
+    }
+
+    /// Wire a prebuilt artifact collector slot.
+    pub fn with_artifact_collector(mut self, artifact: Arc<dyn ArtifactCollector>) -> Self {
+        self.artifact = artifact;
+        self
+    }
+
+    /// Wire the platform firewall enforcer slot. The default
+    /// [`NoopFirewallEnforcer`] fails closed until a real enforcer is
+    /// supplied.
+    pub fn with_firewall_enforcer(mut self, firewall: Arc<dyn FirewallEnforcer>) -> Self {
+        self.firewall = firewall;
+        self
+    }
+
+    /// Configure the supervisor-owned proxy interface that VM TAP
+    /// traffic is allowed to reach. Identifier validation still runs
+    /// inside [`Supervisor::launch`] before any firewall backend sees
+    /// the derived rule set.
+    pub fn with_firewall_proxy_iface(mut self, iface: impl Into<String>) -> Self {
+        self.firewall_proxy_iface = Some(iface.into());
+        self
+    }
+
+    /// Inject a clock, primarily for deterministic admission tests.
+    pub fn with_clock(mut self, clock: Arc<dyn Clock>) -> Self {
+        self.clock = clock;
+        self
+    }
+
     /// Drive a workload's launch lifecycle: verify the signed plan,
     /// walk the state machine, request the backend launch.
     ///
@@ -1144,17 +1206,16 @@ mod tests {
     }
 
     fn make_supervisor_with_backend(b: Arc<MockBackend>) -> Supervisor {
-        let mut s = Supervisor::new();
-        s.backend = b;
-        s.firewall = Arc::new(MockFirewall::new());
-        s.firewall_proxy_iface = Some("mvmtun0".to_string());
         // Default to a clock inside the sample plan's window so
-        // happy-path tests don't depend on the wall clock.
-        s.clock = fixed_clock_inside_window();
-        // Capture audit entries by default so tests can assert
-        // admission audit (B19) without each test re-wiring the slot.
-        s.audit = Arc::new(crate::audit::CapturingAuditSigner::new());
-        s
+        // happy-path tests don't depend on the wall clock. Capture
+        // audit entries by default so tests can assert admission
+        // audit (B19) without each test re-wiring the slot.
+        Supervisor::new()
+            .with_backend_launcher(b)
+            .with_firewall_enforcer(Arc::new(MockFirewall::new()))
+            .with_firewall_proxy_iface("mvmtun0")
+            .with_clock(fixed_clock_inside_window())
+            .with_audit_signer(Arc::new(crate::audit::CapturingAuditSigner::new()))
     }
 
     /// Like `make_supervisor_with_backend` but exposes the
@@ -1164,12 +1225,12 @@ mod tests {
         b: Arc<MockBackend>,
     ) -> (Supervisor, Arc<crate::audit::CapturingAuditSigner>) {
         let audit = Arc::new(crate::audit::CapturingAuditSigner::new());
-        let mut s = Supervisor::new();
-        s.backend = b;
-        s.firewall = Arc::new(MockFirewall::new());
-        s.firewall_proxy_iface = Some("mvmtun0".to_string());
-        s.clock = fixed_clock_inside_window();
-        s.audit = audit.clone();
+        let s = Supervisor::new()
+            .with_backend_launcher(b)
+            .with_firewall_enforcer(Arc::new(MockFirewall::new()))
+            .with_firewall_proxy_iface("mvmtun0")
+            .with_clock(fixed_clock_inside_window())
+            .with_audit_signer(audit.clone());
         (s, audit)
     }
 
@@ -1177,9 +1238,37 @@ mod tests {
         b: Arc<MockBackend>,
         firewall: Arc<MockFirewall>,
     ) -> Supervisor {
-        let mut s = make_supervisor_with_backend(b);
-        s.firewall = firewall;
-        s
+        make_supervisor_with_backend(b).with_firewall_enforcer(firewall)
+    }
+
+    #[tokio::test]
+    async fn builder_slots_launch_without_public_field_mutation() {
+        let plan = sample_plan();
+        let (signed, _sk, vk) = sign_sample(&plan);
+        let backend = Arc::new(MockBackend::new());
+        let firewall = Arc::new(MockFirewall::new());
+        let audit = Arc::new(crate::audit::CapturingAuditSigner::new());
+        let mut s = Supervisor::new()
+            .with_backend_launcher(backend.clone())
+            .with_firewall_enforcer(firewall.clone())
+            .with_firewall_proxy_iface("mvmtun0")
+            .with_clock(fixed_clock_inside_window())
+            .with_audit_signer(audit.clone());
+
+        s.launch(&signed, &[("test", &vk)]).await.unwrap();
+
+        assert_eq!(s.state.current(), PlanState::Running);
+        assert_eq!(backend.prepares(), vec![plan.plan_id.clone()]);
+        assert_eq!(backend.launches(), vec![plan.plan_id.clone()]);
+        assert_eq!(firewall.installs(), vec![sample_firewall_spec()]);
+        assert_eq!(
+            audit
+                .entries()
+                .iter()
+                .map(|e| e.event.as_str())
+                .collect::<Vec<_>>(),
+            vec!["plan.admitted", "plan.running"]
+        );
     }
 
     #[tokio::test]
