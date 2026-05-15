@@ -40,8 +40,12 @@ export default defineConfig({
       sidebar: [
         {
           label: "Getting Started",
+          // Order: shortest path to "it's running" first, deep
+          // background later (plan 74 W5 — "run your first thing
+          // before architecture / threat-model detail").
           items: [
             { label: "Installation", slug: "getting-started/installation" },
+            { label: "First-Use Happy Paths", slug: "getting-started/happy-paths" },
             { label: "Quick Start", slug: "getting-started/quickstart" },
             { label: "Your First MicroVM", slug: "getting-started/first-microvm" },
             { label: "Connect an LLM", slug: "getting-started/connect-an-llm" },
