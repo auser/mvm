@@ -9,6 +9,16 @@ homepage.workspace = true
 authors.workspace = true
 
 [dependencies]
+# Plan 74 W1.3 — OCI layer unpack to a staging rootfs. `tar` and
+# `flate2` are workspace deps already (used by `mvm-sdk`'s addon
+# tarball pipeline at the same pinned versions). `oci_to_rootfs`
+# in this crate stays plain-tar-on-Read; gzip and zstd decoding
+# happen at the caller's boundary (W1.5 CLI orchestrator) so the
+# unpacker can be exercised against in-memory fixtures without
+# pulling a decompressor in for each test.
+flate2.workspace = true
+tar.workspace = true
+
 mvm-core.workspace = true
 mvm-guest.workspace = true
 # Plan 73 Followup B.1 — `install_app_deps` reuses
