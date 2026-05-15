@@ -52,6 +52,7 @@ Recent maintenance:
 - [x] Added builder-VM smoke/failure unit coverage for `dev_build`: the test seam now accepts a fake `BuilderVm`, asserts the flake job and mount shape, proves the path does not probe or invoke host-side Nix, fails closed on builder errors, and gives each staging directory a per-build nonce to avoid same-process collisions.
 - [x] Added CLI-level source-checkout policy coverage for `ensure_dev_image`: source dev flakes now require the sibling builder-VM flake, missing libkrun fails before build dispatch, builder failures refuse published-prebuilt fallback, and the installed/prebuilt path remains available only when no source dev flake is detected.
 - [x] Hardened builder-VM image bootstrap policy: source checkouts may reuse an existing local builder image cache, but cache misses now fail closed instead of downloading published builder-VM prebuilts that could mask local `nix/images/builder-vm/` changes.
+- [x] Added the Stage 0 local builder-image bootstrap path: dev images now carry `/sbin/mvm-builder-init`, `LibkrunBuilderVm` accepts an explicit bootstrap image override, and source-checkout builder-cache misses route to a local `nix/images/builder-vm/` build instead of a network artifact fetch.
 
 ## In-flight workstreams
 
