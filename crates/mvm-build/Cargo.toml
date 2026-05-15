@@ -38,14 +38,15 @@ mvm-libkrun = { workspace = true, optional = true }
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
+# Plan 74 W1.4b.4 — `download_runtime_overlay` stages files into a
+# temp dir before atomic install into the cache. Promoted from a
+# dev-dep so lib code (not just tests) can reach it.
+tempfile.workspace = true
 thiserror = "1"
 tokio.workspace = true
 toml.workspace = true
 tracing.workspace = true
 which = "6"
-
-[dev-dependencies]
-tempfile.workspace = true
 
 [features]
 default = []
