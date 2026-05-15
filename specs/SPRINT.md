@@ -1632,6 +1632,11 @@ Shipped:
 - `mvmctl run --json` emits an unsigned machine-readable execution summary
   using the same redacted invocation/outcome shape as receipts. Guest stdout
   and stderr are not streamed in JSON mode; only hashes and byte counts appear.
+- `mvmctl run --dry-run` validates and explains the run plan without resolving
+  an image, building/downloading the default image, booting a VM, writing a
+  receipt, or executing the command. `--dry-run --json` emits the same redacted
+  preflight shape for machine callers, hashing manifest arguments, argv, env
+  values, host paths, and receipt paths.
 - Live smoke coverage for `mvmctl run --json --receipt` is gated behind
   `MVM_LIVE_SMOKE=1` and compares the public JSON summary to the signed
   receipt without allowing raw guest output into either artifact.

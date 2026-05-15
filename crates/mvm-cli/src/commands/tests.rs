@@ -1532,6 +1532,7 @@ fn run_default_profile_argv_only() {
             timeout,
             receipt,
             json,
+            dry_run,
             launch_plan,
             mode,
             dev,
@@ -1547,6 +1548,7 @@ fn run_default_profile_argv_only() {
             assert_eq!(timeout, 60);
             assert!(receipt.is_none(), "receipt should default to None");
             assert!(!json, "json should default to false");
+            assert!(!dry_run, "dry_run should default to false");
             assert!(launch_plan.is_none(), "launch_plan should default to None");
             assert!(mode.is_none(), "mode should default to None");
             assert!(!dev, "dev should default to false");
@@ -1610,6 +1612,25 @@ fn run_json_flag_parses() {
     let cli = Cli::try_parse_from(["mvmctl", "run", "--json", "--", "/bin/true"]).expect("parse");
     match cli.command {
         Commands::Run(exec::RunArgs { json, argv, .. }) => {
+            assert!(json);
+            assert_eq!(argv, vec!["/bin/true".to_string()]);
+        }
+        _ => panic!("Expected Run command"),
+    }
+}
+
+#[test]
+fn run_dry_run_json_flags_parse() {
+    let cli = Cli::try_parse_from(["mvmctl", "run", "--dry-run", "--json", "--", "/bin/true"])
+        .expect("parse");
+    match cli.command {
+        Commands::Run(exec::RunArgs {
+            dry_run,
+            json,
+            argv,
+            ..
+        }) => {
+            assert!(dry_run);
             assert!(json);
             assert_eq!(argv, vec!["/bin/true".to_string()]);
         }
