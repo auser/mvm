@@ -327,8 +327,7 @@ fn boot_subcommand(args: &[String]) -> Result<()> {
     // can scaffold.
     bail!(
         "live boot benchmark not yet implemented in xtask perf — \
-         use `tests/smoke_e2e_boot.rs` single-shot tripwire for now \
-         (run with MVM_LIVE_SMOKE=1 + MVM_TEST_ROOTFS=<path>)"
+         run backend-specific live boot validation from the builder VM"
     )
 }
 

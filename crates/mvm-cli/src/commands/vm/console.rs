@@ -7,7 +7,8 @@ use anyhow::{Context, Result};
 use clap::Args as ClapArgs;
 
 use mvm::vsock_transport::{
-    AppleContainerTransport, FirecrackerTransport, VsockProxyTransport, VsockTransport,
+    AppleContainerTransport, FirecrackerTransport, LibkrunTransport, VsockProxyTransport,
+    VsockTransport,
 };
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
@@ -20,7 +21,8 @@ use crate::ui;
 /// Pick the right vsock transport for `name`. Priority:
 /// 1. In-process Apple Container (zero-copy `VZVirtioSocketDevice` stream).
 /// 2. Dev-mode mode-0700 proxy socket (cross-process daemon dispatch).
-/// 3. Firecracker UDS multiplexer (fleet/production path).
+/// 3. libkrun per-port Unix socket.
+/// 4. Firecracker UDS multiplexer (fleet/production path).
 ///
 /// The Apple Container probe consumes one stream and drops it; the
 /// returned `Arc<dyn VsockTransport>` is then used for every real
@@ -35,6 +37,10 @@ fn pick_console_transport(name: &str) -> Result<Arc<dyn VsockTransport>> {
     let proxy = dev_vsock_proxy_path();
     if std::path::Path::new(&proxy).exists() {
         return Ok(Arc::new(VsockProxyTransport::new(proxy)));
+    }
+    let libkrun = LibkrunTransport::for_vm(name);
+    if libkrun.connect(mvm_guest::vsock::GUEST_AGENT_PORT).is_ok() {
+        return Ok(Arc::new(libkrun));
     }
     Ok(Arc::new(FirecrackerTransport::for_vm(name)?))
 }
@@ -118,8 +124,9 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
 
 /// Open an interactive PTY console to a running VM.
 ///
-/// Supports Firecracker (via UDS vsock), Apple Container (via direct vsock),
-/// and vsock proxy (via daemon Unix socket for cross-process access).
+/// Supports Firecracker (via UDS vsock), libkrun (via per-port Unix
+/// sockets), Apple Container (via direct vsock), and vsock proxy (via
+/// daemon Unix socket for cross-process access).
 pub(in crate::commands) fn console_interactive(name: &str) -> Result<()> {
     let (cols, rows) = get_terminal_size();
 

@@ -33,11 +33,10 @@ env:
 #
 #   lint  → fmt + clippy + check-adr-coverage (one runner)
 #   test  → cargo build + cargo test
-#   e2e   → cargo test --test e2e (needs test)
 #   mcp-server-smoke  → MCP JSON-RPC roundtrip
 #   nix-flake-check   → nix flake check across every flake
 #
-# Five jobs total. The collapses below are deliberate; reverting
+# Four core jobs total. The collapses below are deliberate; reverting
 # any of them costs runner minutes for marginal feedback.
 #
 # Removed at various points:
@@ -46,7 +45,7 @@ env:
 #     ~minute per PR.
 #   • The standalone `build-linux` job — `test` already runs `cargo
 #     build` + `cargo test` on ubuntu-latest, so `build-linux` was a
-#     duplicate. `e2e` now depends on `test` instead.
+#     duplicate.
 #   • The standalone `fmt` and `check-adr-coverage` jobs — each ran
 #     sub-minute work behind a full runner spin-up. Folded into the
 #     unified `lint` job so the three share one runner, one cache,
@@ -199,9 +198,8 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-e2e-
 
       - name: Run E2E tests
-        # Keep this lane on non-microsandbox end-to-end smoke targets.
-        # The old `smoke_e2e_boot` target depended on the removed
-        # upstream microsandbox crate and was deleted with that backend.
+        # Keep this lane on end-to-end smoke targets that compile
+        # without live microVM host state.
         run: cargo test --test smoke_run_json_receipt --test runtime_boot_bench
 
   # Note: cargo-audit, cargo-deny, reproducibility, and prod-agent-no-exec
@@ -218,8 +216,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Install jq + libcap-ng (see test job for why)
-        run: sudo apt-get update && sudo apt-get install -y jq libcap-ng-dev
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -271,8 +269,8 @@ jobs:
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Install jq + libcap-ng (see test job for why)
-        run: sudo apt-get update && sudo apt-get install -y jq libcap-ng-dev
+      - name: Install jq
+        run: sudo apt-get update && sudo apt-get install -y jq
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -458,10 +456,10 @@ jobs:
   #   - cloud-hypervisor boots a Nix-built Linux kernel + ext4 rootfs
   #     on a real KVM host (Linux side of "is the VMM viable?").
   #   - The dev-image flake at `nix/images/builder` builds via host
-  #     Nix on a fresh runner with NO microsandbox involvement —
-  #     proving the artifact pipeline doesn't need microsandbox.
+  #     Nix on a fresh runner, proving the artifact pipeline is
+  #     independent of third-party runtime wrappers.
   #     Together with the libkrun-macos lane, the two-lane gate
-  #     covers the empirical premise behind retiring microsandbox.
+  #     covers the empirical premise behind the builder-VM path.
   #
   # KernelBooted (kernel reaches boot diagnostics but rootfs/init
   # fails) counts as PASS by default — the gate is "VMM viable",
@@ -542,11 +540,11 @@ jobs:
           key: ${{ runner.os }}-cargo-ch-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-ch-
 
-      - name: Build dev image via host Nix (no microsandbox)
+      - name: Build dev image via host Nix
         if: steps.filter.outputs.ch == 'true' || github.ref == 'refs/heads/main'
         # Mirrors release.yml's dev-image job for x86_64 — this is the
-        # load-bearing existence proof that the artifact pipeline does
-        # not require microsandbox. Output gets staged at
+        # load-bearing existence proof that the artifact pipeline can
+        # be produced by CI directly. Output gets staged at
         # $GITHUB_WORKSPACE/ci-artifacts/{vmlinux, rootfs.ext4}; the
         # next step points the bootcheck at those paths via env vars.
         #

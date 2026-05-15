@@ -582,10 +582,7 @@ fn prepare_dev_image_out_dir(out_dir: &str) -> Result<()> {
 /// Failures of the local build are surfaced loudly — never silently
 /// substituted with the prebuilt, since the prebuilt would mask local
 /// rootfs changes.
-fn ensure_dev_image() -> Result<(String, String)> {
-    #[cfg(feature = "backends-builder-vm-libkrun")]
-    let local_flake = find_dev_image_flake().ok();
-
+pub(super) fn ensure_dev_image() -> Result<(String, String)> {
     // Plan 72 W5.B + W5.C — source-checkout dispatch.
     //
     // libkrun is the only supported builder for the dev-shell flake.
@@ -609,7 +606,7 @@ fn ensure_dev_image() -> Result<(String, String)> {
     // prebuilt would mask.
     // Gate the dispatch itself on `backends-builder-vm-libkrun`.
     #[cfg(feature = "backends-builder-vm-libkrun")]
-    if let Some(flake_dir) = &local_flake
+    if let Some(flake_dir) = &find_dev_image_flake().ok()
         && find_builder_vm_flake().is_ok()
     {
         let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());

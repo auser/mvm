@@ -2,9 +2,8 @@
 //!
 //! Implements the contract documented in ADR-013 §"Linux builder via
 //! libkrun (no Lima)": on hosts that can't `nix build` Linux
-//! derivations natively (macOS without `nix-darwin`'s `linux-builder`,
-//! Windows-via-WSL2 without an in-WSL Nix install, Linux without host
-//! Nix), `mvmctl build` bootstraps a small Linux builder microVM from
+//! derivations natively (macOS, Windows-via-WSL2, or Linux without the
+//! project builder boundary), `mvmctl build` bootstraps a small Linux builder microVM from
 //! a pinned OCI image, runs `nix build` inside it, and extracts the
 //! resulting rootfs back to the host.
 //!
@@ -286,10 +285,10 @@ pub enum BuilderVmError {
     /// until the follow-up wave fills in the data plane.
     #[error(
         "libkrun-as-Linux-builder bootstrap is in flight; \
+         the libkrun builder path does not use host Nix; \
          see ADR-013 §\"Linux builder via libkrun (no Lima)\" \
          for the design and Sprint 50 for the schedule. \
-         For now, install host Nix (Determinate Nix or upstream) \
-         or configure `nix-darwin`'s `linux-builder`."
+         Rebuild or restart the project builder VM before retrying."
     )]
     NotYetImplemented,
 
@@ -475,7 +474,7 @@ mod tests {
     fn error_message_points_at_recovery_path() {
         let err = BuilderVmError::NotYetImplemented;
         let msg = err.to_string();
-        assert!(msg.contains("install host Nix") || msg.contains("nix-darwin"));
+        assert!(msg.contains("libkrun builder") && msg.contains("does not use host Nix"));
     }
 
     fn fixture_sidecar() -> ArtifactSidecar {

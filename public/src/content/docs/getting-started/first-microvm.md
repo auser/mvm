@@ -11,8 +11,7 @@ mvmctl auto-selects the best backend for your platform:
 
 ```
 Linux (KVM):    mvmctl up  -->  Firecracker microVM (direct)
-macOS 26+:      mvmctl up  -->  Apple Container (Virtualization.framework)
-macOS <26:     mvmctl up  -->  libkrun microVM (Hypervisor.framework)
+macOS:          mvmctl up  -->  libkrun microVM (Hypervisor.framework)
 Docker:        mvmctl up  -->  Docker container (Tier 3 fallback)
 ```
 
@@ -25,7 +24,7 @@ Docker:        mvmctl up  -->  Docker container (Tier 3 fallback)
 MicroVMs are **headless workloads** with no SSH access -- they communicate via vsock only.
 
 :::note
-On Linux with `/dev/kvm`, the dev-VM layer is skipped entirely -- Firecracker runs directly. On macOS 26+, Apple Virtualization.framework is used. On macOS pre-26 (Intel or older Apple Silicon), libkrun runs microVMs via Hypervisor.framework. If none of those work, Docker serves as a Tier 3 fallback.
+On Linux with `/dev/kvm`, the dev-VM layer is skipped entirely -- Firecracker runs directly. On macOS, libkrun runs microVMs via Hypervisor.framework. If none of the microVM backends work, Docker serves as a Tier 3 fallback.
 :::
 
 ## Scaffold a project

@@ -48,7 +48,7 @@ macOS Nix can't build Linux derivations natively. mvm routes Linux builds throug
 
 ### Optional: Host-Side Nix For Contributors
 
-Most users skip this section. You may want host-side Nix if you're contributing to mvm itself, want a shared `/nix/store` for your editor's build commands, or already run `nix-darwin` for unrelated reasons.
+Most users skip this section. You may want host-side Nix if you're contributing to mvm itself, want a shared `/nix/store` for your editor's build commands, or already run `nix-darwin` for unrelated reasons. This is not part of the `mvmctl` runtime path.
 
 [Determinate Nix](https://determinate.systems/posts/determinate-nix-installer) is the easiest path:
 
@@ -56,7 +56,7 @@ Most users skip this section. You may want host-side Nix if you're contributing 
 curl --proto '=https' --tlsv1.2 -sSf -L https://install.determinate.systems/nix | sh -s -- install
 ```
 
-To turn that install into a working Linux builder, configure [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary). mvm's auto-detection will pick it up on the next build.
+If you configure [`nix-darwin`'s `linux-builder`](https://nix.dev/manual/nix/stable/installation/installing-binary), use it for your own host-side commands; mvm's managed build path continues to run inside the project builder VM.
 
 ## Verify
 

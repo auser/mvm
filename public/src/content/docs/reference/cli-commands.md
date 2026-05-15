@@ -43,7 +43,7 @@ description: Complete command reference for mvmctl.
 |---------|-------------|
 | `mvmctl bootstrap` | Full setup from scratch: Homebrew deps (macOS), Firecracker, kernel, rootfs (idempotent — safe to re-run) |
 | `mvmctl bootstrap --production` | Production mode (skip Homebrew, assume Linux with apt) |
-| `mvmctl dev [up]` | Auto-bootstrap if needed, start dev VM, drop into shell. Uses Apple Container on macOS 26+; native KVM on Linux. |
+| `mvmctl dev [up]` | Auto-bootstrap if needed, start dev VM, drop into shell. Uses libkrun on macOS; native KVM on Linux. |
 | `mvmctl dev up --project ~/dir` | Auto-bootstrap then cd into a project directory |
 | `mvmctl dev up --metrics-port PORT` | Bind a Prometheus metrics endpoint (0 = disabled) |
 | `mvmctl dev up --watch-config` | Reload ~/.mvm/config.toml automatically when it changes |

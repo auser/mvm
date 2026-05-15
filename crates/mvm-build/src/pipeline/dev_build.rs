@@ -260,7 +260,7 @@ fn cleanup_builds_in(builds_dir: &std::path::Path, keep: usize) -> Result<DevBui
     })
 }
 
-/// Build a microVM image from a Nix flake directly in the Lima VM.
+/// Build a microVM image from a Nix flake inside the configured builder VM.
 ///
 /// Runs `nix build` with visible output, then copies the resulting
 /// kernel and rootfs to a dev build directory keyed by Nix store hash.
@@ -306,14 +306,14 @@ pub fn dev_build(
         });
     }
 
-    // If the `env` channel has `nix` on PATH, run the build there
-    // (host on Linux+host-Nix, Apple Container dev VM on macOS 26+,
-    // etc.). Hosts without nix must provision the builder VM path first.
-    if !env_has_nix(env) {
+    // If the builder environment has `nix` on PATH, run the build
+    // there. mvmctl dev builds do not fall back to host Nix; missing
+    // nix here means the builder VM/image path is broken.
+    if !builder_env_has_nix(env) {
         let _ = (env, flake_ref, profile, mode);
         anyhow::bail!(
-            "No `nix` on PATH. Install host Nix (Determinate Nix or upstream) \
-             or start the project builder VM before running the dev build."
+            "No `nix` on PATH inside the builder environment. Rebuild or restart \
+             the project builder VM before running the dev build."
         );
     }
 
@@ -522,12 +522,8 @@ fn shell_quote(input: &str) -> String {
     format!("'{}'", input.replace('\'', "'\\''"))
 }
 
-/// True if `nix` is available through the given shell environment.
-///
-/// `env.shell_exec_stdout("nix --version")` succeeds if and only if
-/// `nix` is on PATH inside the channel — host on Linux+host-Nix,
-/// Apple Container dev VM on macOS 26+, etc.
-fn env_has_nix(env: &dyn ShellEnvironment) -> bool {
+/// True if `nix` is available inside the builder shell environment.
+fn builder_env_has_nix(env: &dyn ShellEnvironment) -> bool {
     env.shell_exec_stdout("nix --version 2>/dev/null | head -1")
         .map(|s| s.trim().starts_with("nix "))
         .unwrap_or(false)
@@ -1240,19 +1236,18 @@ mod tests {
     }
 
     #[test]
-    fn env_has_nix_returns_true_when_probe_stubbed() {
-        // Default TestEnv stubs `nix --version` to a success response.
+    fn builder_env_has_nix_returns_true_when_probe_stubbed() {
+        // Default TestEnv stubs the builder VM `nix --version` probe to a success response.
         let env = TestEnv::new();
-        assert!(env_has_nix(&env));
+        assert!(builder_env_has_nix(&env));
     }
 
     #[test]
-    fn env_has_nix_returns_false_when_probe_empty() {
-        // Override the default stub with an empty response, which is
-        // what a real host without nix returns.
+    fn builder_env_has_nix_returns_false_when_probe_empty() {
+        // Override the default stub with an empty response, which is what a broken builder VM would return.
         let env = TestEnv::new();
         env.stub_stdout("nix --version", "");
-        assert!(!env_has_nix(&env));
+        assert!(!builder_env_has_nix(&env));
     }
 
     #[test]
@@ -1268,7 +1263,7 @@ mod tests {
         let err = result.expect_err("must bail when no nix is available");
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("No `nix` on PATH"),
+            msg.contains("No `nix` on PATH inside the builder environment"),
             "bail must name missing nix: {msg}"
         );
     }

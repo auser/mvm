@@ -63,6 +63,11 @@ pub const SNAPSHOT_TENANT_ID: &str = "local";
 /// unencrypted snapshots when a tenant DEK is configured.
 pub const ALLOW_UNENCRYPTED_ENV: &str = "MVM_ALLOW_UNENCRYPTED_SNAPSHOT";
 
+/// Explicit env-var override for the local tenant's snapshot DEK.
+/// This must win over OS-keyring auto-detection so dev/CI and
+/// emergency-recovery workflows can pin the key deterministically.
+pub const SNAPSHOT_TENANT_KEY_ENV: &str = "MVM_TENANT_KEY_LOCAL";
+
 /// Filename of the persistent epoch counter inside an
 /// instance-snapshot dir. Hidden by default (`.epoch`) so a casual
 /// `ls` doesn't show it next to the bin files.

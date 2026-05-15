@@ -75,16 +75,15 @@ See [Building MicroVM Images](/guides/building-microvm-images) for the user-faci
 
 **"`mvmctl run` falls back to libkrun even though I have KVM"** — check `mvmctl doctor` output. The auto-select ladder picks Firecracker only when `/dev/kvm` is writable; if it's `root`-only, libkrun wins as the cross-platform fallback. Same fix as above.
 
-**Nix build is slow** — first builds pull from `cache.nixos.org` and `cache.flakehub.com`. Subsequent builds hit the builder VM's `/nix/store`, which mvm keeps warm across runs. If you've opted into host-side Nix (below), the host store is shared into the builder VM and reused across both modes.
+**Nix build is slow** — first builds pull from `cache.nixos.org` and `cache.flakehub.com`. Subsequent builds hit the builder VM's `/nix/store`, which mvm keeps warm across runs.
 
 **Firecracker errors with "TooManyOpenFiles"** — bump the open-files ulimit: `ulimit -n 4096`. mvm sets a sensible default but very-high-density runs need headroom.
 
 ## Optional: host-side Nix for power users
 
-mvm doesn't need Nix on the host — the builder microVM handles all `nix build` invocations. You may still want host-side Nix if you're:
+mvm doesn't need Nix on the host — the builder microVM handles managed `nix build` invocations. You may still want host-side Nix if you're:
 
 - contributing to mvm itself and want a shared `/nix/store` between your editor's build commands and mvm's,
-- on a fast box where shaving the builder VM's per-invocation overhead matters,
 - already running a `nix-daemon` for other projects.
 
 If you opt in, [Determinate Nix](https://determinate.systems/posts/determinate-nix-installer) is the easiest path:
@@ -99,7 +98,7 @@ The upstream NixOS installer also works:
 sh <(curl -L https://nixos.org/nix/install) --daemon
 ```
 
-When `mvmctl build` detects a working host-side Nix that can build Linux derivations, it uses it directly and skips the builder microVM. Otherwise it falls through to the bootstrapped path.
+Host-side Nix is for your own commands; `mvmctl build` uses the builder VM path.
 
 ## Distro-specific notes
 
