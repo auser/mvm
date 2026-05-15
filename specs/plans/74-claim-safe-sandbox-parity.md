@@ -1,36 +1,64 @@
 # Plan 74: Claim-safe sandbox parity
 
-**Status:** Proposed  
-**Date:** 2026-05-14  
-**ADR:** [`../adrs/048-claim-safe-sandbox-parity.md`](../adrs/048-claim-safe-sandbox-parity.md)  
+**Status:** In progress
+**Date:** 2026-05-14 (last status refresh: 2026-05-15)
+**ADR:** [`../adrs/048-claim-safe-sandbox-parity.md`](../adrs/048-claim-safe-sandbox-parity.md)
 **Goal:** make the seven target sandbox claims defensible for `mvm` without weakening the existing signed-plan, audit, verified-boot, and Nix-first security posture.
+
+## Status at 2026-05-15
+
+| Workstream | Status | Notes |
+|---|---|---|
+| **W0 — Claims hygiene + docs guardrails** | **Shipped** | xtask `check-doc-claims` lint + feature-status page + mvmforge cleanup all landed. |
+| **W1 — OCI image ingest** | **Mostly shipped** | mvm-oci crate, OCI unpack with R10 mitigations, ext4 materialization, verity sealing, *and* the full runtime overlay disk sub-arc (ADR-051) all shipped. **Remaining:** `mvmctl image pull/ls/rm` CLI, `mvmctl up --image`, mutable-tag policy hook, per-step OCI audit records. |
+| **W1.4b — Runtime overlay (sub-arc)** | **Shipped (Firecracker)** | 7-PR end-to-end stack landed: flake → resolver → orchestrator → install → verity-init mount → backend wiring → mkGuest target → release pipeline → host download → `mvmctl overlay` CLI → auto-fetch on `up`. libkrun + Apple Container overlay attachment **deferred** (both need their own verity story; tracked on mvm side under "drop baked-in agent"). |
+| **W2 — Programmable network policy** | **mvm side mostly shipped; mvmd side rolled out via Plan 51** | Layer 1 (guest-side defense via `mvm-guest-netinit` + audit emission), Layer 2 (host iptables mandatory-deny), audit-kind vocabulary, DnsPin types, and vsock-RPC inbound audit infrastructure (helper + ~18 call sites migrated) all shipped on mvm. **Remaining on mvm:** IPv6 mandatory-deny, iptables-LOG → nflog consumer for per-flow events, `overlayAware` admission gate, OCI overlay copy of netinit. **Layer 3 (DNS resolver) + Layer 4 (L7 proxy) + Layer 5 (VPC firewall):** owned by mvmd Plan 51, not mvm. |
+| **W3 — Secret placeholders** | **Not started** | Architecture exists in ADR-049 (TLS substitution mechanism). Implementation work hasn't begun. |
+| **W4 — SDK-owned lifecycle** | **Not started** | |
+| **W5 — Cold-start measurement** | **Not started** | |
+| **W6 — Extensible filesystem backends** | **Not started** | |
+
+## Sequencing recommendation for what's next
+
+The unblock-the-most-downstream-work order:
+
+1. **W1 remainder (`mvmctl image` CLI surface)** — small slice; OCI ingest is already shipped at the primitive level; missing only the user-facing verbs. Closes the `oci-ingest` claim per ADR-048.
+2. **W2 deferreds in any order** — IPv6 mandatory-deny, nflog consumer, `overlayAware` admission gate, OCI overlay netinit copy. Each is independent and small.
+3. **W5 (cold-start measurement)** — orthogonal to security work; unlocks the latency claims in ADR-048 once measurement methodology + CI gates land.
+4. **W3 (secret placeholders)** — large; depends on mvmd Plan 51 L7 proxy for the substitution path.
+5. **W4 (SDK lifecycle)** — depends on the lifecycle contract design being settled.
+6. **W6 (filesystem backends)** — substantial; lowest priority among the security claims.
+
+Cross-repo: mvmd Plan 51 W1-W7 owns the fleet-side enforcement (DNS resolver, L7 proxy, audit aggregation, inbound flow audit, VPC bridges). mvm's W2 deferreds are *additional* defense-in-depth that lands independently.
 
 ## Workstreams
 
-### W0 — Claims hygiene and docs guardrails
+### W0 — Claims hygiene and docs guardrails — **Shipped**
 
 **Goal:** stop overclaiming before runtime work lands.
 
-- [ ] Add a public feature-status table: Shipped, Preview, Planned, Not claimed.
-- [ ] Update Python SDK docs that still reference `mvmforge` instead of the current `mvm`/`mvmctl` surface.
-- [ ] Add a docs check that blocks phrases like "any OCI image", "secrets cannot leak", and "<100ms" unless the corresponding claim gate file is marked Shipped.
-- [ ] Update `specs/gap-analysis-vs-microsandbox.md` to include current SDK directories and mvmd ADR-0020.
+- [x] Add a public feature-status table: Shipped, Preview, Planned, Not claimed.
+- [x] Update Python SDK docs that still reference `mvmforge` instead of the current `mvm`/`mvmctl` surface.
+- [x] Add a docs check that blocks phrases like "any OCI image", "secrets cannot leak", and "<100ms" unless the corresponding claim gate file is marked Shipped.
+- [x] Update `specs/gap-analysis-vs-microsandbox.md` to include current SDK directories and mvmd ADR-0020.
 
 **Verification:**
 
 - Documentation-only test or xtask grep fails on gated claim phrases outside approved files.
 
-### W1 — OCI image ingest
+### W1 — OCI image ingest — **Mostly shipped**
 
 **Goal:** `mvmctl image pull <ref>` materializes OCI images into microVM artifacts.
 
-- [ ] Add `mvm-oci` or `mvm-build::oci` module for registry resolution, auth, manifest fetch, layer fetch, and digest verification.
-- [ ] Implement OCI layer unpack with whiteout, symlink, hardlink, ownership, permissions, xattr policy, env, entrypoint, workdir, and exposed-port extraction.
-- [ ] Materialize to ext4/rootfs artifact compatible with existing backend launch.
+- [x] Add `mvm-oci` or `mvm-build::oci` module for registry resolution, auth, manifest fetch, layer fetch, and digest verification. *(W1.1 + W1.2)*
+- [x] Implement OCI layer unpack with whiteout, symlink, hardlink, ownership, permissions, xattr policy, env, entrypoint, workdir, and exposed-port extraction. *(W1.3a with R10 attack-surface mitigations)*
+- [x] Materialize to ext4/rootfs artifact compatible with existing backend launch. *(W1.3b deterministic ext4)*
 - [ ] Register pulled artifacts as templates with requested ref, resolved digest, source registry, and cache scope metadata.
 - [ ] Add `mvmctl image pull`, `mvmctl image ls`, `mvmctl image rm`, and `mvmctl up --image`.
 - [ ] Add policy hooks for mutable-tag rejection in production profile.
 - [ ] Emit audit records for resolve, fetch, cache hit, materialize, verify, launch, and delete.
+
+**Sub-arc — W1.4b runtime overlay (ADR-051):** Shipped end-to-end on Firecracker. Flake → resolver → orchestrator → install_overlay_into_cache → mvm-verity-init runtime extension → Firecracker backend drive attachment → mkGuest overlay-aware rootfs → release pipeline artifact → host download_runtime_overlay → `mvmctl overlay {fetch,status}` → auto-fetch on `mvmctl up` cache miss. libkrun + Apple Container overlay attachment deferred to a follow-up (both need verity wiring on those backends first).
 
 **Tests:**
 
@@ -38,16 +66,23 @@
 - Integration test running `alpine` or a hermetic local registry fixture through `mvmctl up --image`.
 - Negative tests for mutable tag rejection under production policy and private cache isolation.
 
-### W2 — Programmable network policy
+### W2 — Programmable network policy — **mvm side mostly shipped; fleet side in mvmd Plan 51**
 
 **Goal:** ship the L7 path currently represented as plan/stub work.
 
-- [ ] Implement supervisor-owned DNS resolver with admission-time pinning.
-- [ ] Wire all guest egress through the trusted proxy for restricted policies.
-- [ ] Enforce HTTP Host and HTTPS CONNECT/SNI policy.
-- [ ] Block metadata endpoints and local control-plane ranges by default.
-- [ ] Add per-plan network policy objects with explicit defaults.
-- [ ] Emit audit entries for every allow/deny and DNS pin/reject event.
+- [~] Implement supervisor-owned DNS resolver with admission-time pinning. *(DnsPin + DnsPinRegistry types shipped — `mvm-core::policy::dns_pin`. The resolver implementation moves to mvmd Plan 51 W3 — supervisor lives there.)*
+- [ ] Wire all guest egress through the trusted proxy for restricted policies. *(L7 proxy is mvmd Plan 51 W4.)*
+- [ ] Enforce HTTP Host and HTTPS CONNECT/SNI policy. *(Part of mvmd Plan 51 W4.)*
+- [x] Block metadata endpoints and local control-plane ranges by default. *(`MANDATORY_DENY_RANGES` data + Linux-host iptables wiring on Layer 2 + `mvm-guest-netinit` kernel blackhole routes on Layer 1, with `NetworkMandatoryDeny` audit emission.)*
+- [x] Add per-plan network policy objects with explicit defaults. *(`NetworkPolicy`/`EgressMode`/`HostPort`/`NetworkPreset` types in `mvm-core::policy::network_policy`; default is deny-all.)*
+- [x] Emit audit entries for every allow/deny and DNS pin/reject event. *(5 `LocalAuditKind::Network*` + `DnsPin*` variants reserved; `NetworkMandatoryDeny` emission live for the netinit Layer 1 install; `NetworkPolicyAllow scope=rpc,direction=in,kind=vsock,verb=…` emission live across ~18 host→guest vsock call sites. `DnsPinSet` / `DnsPinReject` emission lands with the mvmd resolver + L7 proxy.)*
+
+**mvm-side W2 deferreds (small, independent):**
+
+- IPv6 mandatory-deny (when the guest bridge gains v6).
+- iptables `-j LOG` → nflog consumer for per-flow `NetworkMandatoryDeny` events (today's audit emit covers rule-install only, not per-flow drops).
+- `overlayAware` admission gate — refuse cached pre-W1.4b templates whose rootfs is missing the `/mvm/runtime` bind-mount target.
+- OCI overlay copy of `mvm-guest-netinit` so OCI-imported workloads also get Layer 1 defense (stacks on the W1.4b runtime overlay landing, which is shipped on Firecracker).
 
 **Tests:**
 
