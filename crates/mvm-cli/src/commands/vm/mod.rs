@@ -1,5 +1,6 @@
 //! VM lifecycle commands — start, stop, list, attach, exec.
 
+pub(super) mod artifact;
 pub(super) mod audit_chain;
 pub(super) mod console;
 pub(super) mod cp;

@@ -159,6 +159,15 @@ const SNAPSHOT_SUB: &[(&str, AuditPosture)] = &[
     ("rm", AuditPosture::Emits("SnapshotDelete")),
 ];
 
+// Plan 76 Phase 6 — `mvmctl artifact pack/verify`. Both are
+// disk-side operations: pack writes a new `.mvm` file but does
+// not touch host audit chain state; verify is a pure read. The
+// host signer's keypair is consulted (read-only) for both.
+const ARTIFACT_SUB: &[(&str, AuditPosture)] = &[
+    ("pack", AuditPosture::ReadOnly),
+    ("verify", AuditPosture::ReadOnly),
+];
+
 // Sprint 52 W2 — bundle / trust subcommand tables.
 //
 // `bundle export` writes a `.mvmpkg` archive to disk under the
@@ -298,6 +307,8 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     // mutate host or guest state.
     ("wait", AuditPosture::ReadOnly),
     ("boot-report", AuditPosture::ReadOnly),
+    // Plan 76 Phase 6 — portable signed `.mvm` artifacts.
+    ("artifact", AuditPosture::DelegatesToSub(ARTIFACT_SUB)),
 ];
 
 // ──────────────────────────────────────────────────────────────────
