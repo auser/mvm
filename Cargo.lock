@@ -2934,11 +2934,13 @@ version = "0.14.0"
 dependencies = [
  "anyhow",
  "chrono",
+ "ed25519-dalek",
  "flate2",
  "mvm-core",
  "mvm-guest",
  "mvm-libkrun",
  "mvm-sdk",
+ "rand 0.8.6",
  "serde",
  "serde_json",
  "sha2",

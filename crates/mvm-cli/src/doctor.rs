@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 
 use anyhow::Result;
+use clap::ValueEnum;
 use serde::Serialize;
 
 use crate::ui;
@@ -10,6 +11,77 @@ use mvm_backend::backend::AnyBackend;
 use mvm_core::config::fc_version;
 use mvm_core::platform::{self, Platform};
 use mvm_core::vm_backend::ClaimStatus;
+
+/// Audience-scoped filter for `mvmctl doctor` (plan 74 W5).
+///
+/// `--workflow <name>` narrows the report (and the exit-code
+/// blocking set) to checks whose `category` is relevant for the
+/// named workflow. Each workflow's mapping lives in
+/// [`DoctorWorkflow::relevant_categories`] — adding a new check
+/// category therefore implies a deliberate decision about which
+/// workflows it applies to.
+///
+/// The default (no `--workflow` flag) is unchanged from
+/// pre-plan-74: every check runs and every failure blocks. The
+/// flag is additive — operators relying on the existing behavior
+/// see no change.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, ValueEnum)]
+#[serde(rename_all = "kebab-case")]
+pub enum DoctorWorkflow {
+    /// CLI user running an existing command (`mvmctl run`,
+    /// `mvmctl up`, `mvmctl build`).
+    CliRun,
+    /// Python SDK consumer (`@mvm.app` decorator + `mvmctl
+    /// compile` / `up` / `invoke`).
+    PythonSdk,
+    /// TypeScript / Node SDK consumer.
+    TypescriptSdk,
+    /// Operator launching a prebuilt `.mvmpkg` bundle. No host
+    /// build tooling required.
+    BundleRun,
+    /// `mvmctl dev` flow — drops the operator into a builder-VM
+    /// shell. Builder tooling + platform capabilities only;
+    /// no host-side rust toolchain required.
+    DevShell,
+}
+
+impl DoctorWorkflow {
+    /// Check categories included for this workflow. A `Check`
+    /// whose `category` is in the returned slice counts as
+    /// "relevant" — irrelevant checks are dropped from both the
+    /// rendered report and the `all_ok` blocking decision.
+    pub fn relevant_categories(self) -> &'static [&'static str] {
+        match self {
+            // `cli-run` and the two SDK flows all rely on the full
+            // host + build tooling stack. The differentiator vs.
+            // "no flag" is mostly about the help surface and the
+            // intent telemetry; the category set is identical.
+            Self::CliRun | Self::PythonSdk | Self::TypescriptSdk => {
+                &["prerequisites", "tools", "platform", "security", "disk"]
+            }
+            // Prebuilt bundles do not require host rust or
+            // builder-VM tooling. Drop `prerequisites` and `tools`
+            // so a bundle-running operator isn't blocked by a
+            // missing `cargo` they don't need.
+            Self::BundleRun => &["platform", "security", "disk"],
+            // `mvmctl dev` is the bootstrap-time flow; the host
+            // doesn't need rustup/cargo for it (the dev VM owns
+            // the build toolchain). Drop `prerequisites`.
+            Self::DevShell => &["tools", "platform", "security", "disk"],
+        }
+    }
+
+    /// Stable kebab-case label for human + JSON rendering.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::CliRun => "cli-run",
+            Self::PythonSdk => "python-sdk",
+            Self::TypescriptSdk => "typescript-sdk",
+            Self::BundleRun => "bundle-run",
+            Self::DevShell => "dev-shell",
+        }
+    }
+}
 
 #[derive(Debug, Serialize)]
 struct Check {
@@ -75,6 +147,10 @@ struct SecurityPostureReport {
 
 #[derive(Debug, Serialize)]
 struct DoctorReport {
+    /// Workflow scope this report was filtered for, or `None` for
+    /// the default "all checks" mode (plan 74 W5).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    workflow: Option<&'static str>,
     checks: Vec<Check>,
     security_posture: SecurityPostureReport,
     /// Per-backend virtio-balloon capability surfaced by
@@ -86,7 +162,7 @@ struct DoctorReport {
     all_ok: bool,
 }
 
-pub fn run(json: bool) -> Result<()> {
+pub fn run(json: bool, workflow: Option<DoctorWorkflow>) -> Result<()> {
     // ── Prerequisites (user must install before bootstrap) ───────
     let mut checks = vec![
         check_cmd("rustup", "prerequisites", "rustup --version"),
@@ -173,9 +249,26 @@ pub fn run(json: bool) -> Result<()> {
     // ── Balloon capability per backend ────────────────────────────
     let balloon_support = collect_balloon_support();
 
+    // ── Workflow filter (plan 74 W5) ──────────────────────────────
+    // When `--workflow <name>` is set, drop checks whose category
+    // is not in the workflow's relevant set. The filter is applied
+    // before `all_ok` so an irrelevant failure (e.g. missing
+    // `cargo` for a `bundle-run` operator) no longer blocks.
+    let checks: Vec<Check> = match workflow {
+        Some(w) => {
+            let relevant = w.relevant_categories();
+            checks
+                .into_iter()
+                .filter(|c| relevant.contains(&c.category))
+                .collect()
+        }
+        None => checks,
+    };
+
     // ── Render ────────────────────────────────────────────────────
     let all_ok = checks.iter().all(|c| c.ok);
     let report = DoctorReport {
+        workflow: workflow.map(|w| w.as_str()),
         checks,
         security_posture,
         balloon_support,
@@ -218,6 +311,12 @@ pub fn run(json: bool) -> Result<()> {
 }
 
 fn render_text(report: &DoctorReport) {
+    if let Some(w) = report.workflow {
+        ui::info(&format!(
+            "Scoping checks to workflow: {} (use `mvmctl doctor` for the unfiltered report)",
+            w
+        ));
+    }
     let mut current_category = "";
     for c in &report.checks {
         if c.category != current_category {
@@ -1477,6 +1576,7 @@ mod tests {
     #[test]
     fn doctor_report_serializes_to_json() {
         let report = DoctorReport {
+            workflow: None,
             checks: vec![Check {
                 name: "test",
                 category: "tools",
@@ -1492,6 +1592,28 @@ mod tests {
         assert!(json.contains("\"all_ok\":true"));
         assert!(json.contains("\"security_posture\""));
         assert!(json.contains("\"tier\""));
+        // Plan 74 W5: default (no --workflow) omits the field
+        // entirely thanks to `#[serde(skip_serializing_if = …)]`.
+        assert!(
+            !json.contains("\"workflow\""),
+            "default report must not serialize the workflow field; got: {json}"
+        );
+    }
+
+    #[test]
+    fn doctor_report_serializes_workflow_when_set() {
+        let report = DoctorReport {
+            workflow: Some("bundle-run"),
+            checks: vec![],
+            security_posture: collect_security_posture(),
+            balloon_support: collect_balloon_support(),
+            all_ok: true,
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        assert!(
+            json.contains("\"workflow\":\"bundle-run\""),
+            "workflow-scoped report must serialize the field; got: {json}"
+        );
     }
 
     #[test]
@@ -1736,5 +1858,118 @@ mod tests {
              output for the claim find it; got: {}",
             c.info
         );
+    }
+
+    // ---------------- Workflow scoping (plan 74 W5) ----------------
+
+    #[test]
+    fn workflow_cli_run_includes_all_categories() {
+        let cats = DoctorWorkflow::CliRun.relevant_categories();
+        for expected in ["prerequisites", "tools", "platform", "security", "disk"] {
+            assert!(
+                cats.contains(&expected),
+                "cli-run missing category {expected}"
+            );
+        }
+    }
+
+    #[test]
+    fn workflow_python_and_typescript_sdk_match_cli_run() {
+        // The SDK flows share the host requirements with `cli-run` —
+        // both ultimately call `mvmctl up` / `mvmctl build` under the
+        // hood. If this assertion ever drifts, that's a deliberate
+        // workflow-specific check change that needs review.
+        assert_eq!(
+            DoctorWorkflow::CliRun.relevant_categories(),
+            DoctorWorkflow::PythonSdk.relevant_categories()
+        );
+        assert_eq!(
+            DoctorWorkflow::CliRun.relevant_categories(),
+            DoctorWorkflow::TypescriptSdk.relevant_categories()
+        );
+    }
+
+    #[test]
+    fn workflow_bundle_run_drops_prerequisites_and_tools() {
+        let cats = DoctorWorkflow::BundleRun.relevant_categories();
+        assert!(
+            !cats.contains(&"prerequisites"),
+            "bundle-run must not gate on host rust"
+        );
+        assert!(
+            !cats.contains(&"tools"),
+            "bundle-run must not gate on builder VM tools"
+        );
+        for required in ["platform", "security", "disk"] {
+            assert!(cats.contains(&required), "bundle-run needs {required}");
+        }
+    }
+
+    #[test]
+    fn workflow_dev_shell_drops_prerequisites_only() {
+        let cats = DoctorWorkflow::DevShell.relevant_categories();
+        assert!(
+            !cats.contains(&"prerequisites"),
+            "dev-shell must not gate on host rustup/cargo — the dev VM owns the toolchain"
+        );
+        // Dev shell DOES need builder-VM tools.
+        assert!(cats.contains(&"tools"));
+        assert!(cats.contains(&"platform"));
+    }
+
+    #[test]
+    fn workflow_as_str_kebab_case() {
+        assert_eq!(DoctorWorkflow::CliRun.as_str(), "cli-run");
+        assert_eq!(DoctorWorkflow::PythonSdk.as_str(), "python-sdk");
+        assert_eq!(DoctorWorkflow::TypescriptSdk.as_str(), "typescript-sdk");
+        assert_eq!(DoctorWorkflow::BundleRun.as_str(), "bundle-run");
+        assert_eq!(DoctorWorkflow::DevShell.as_str(), "dev-shell");
+    }
+
+    #[test]
+    fn workflow_serde_renders_kebab_case() {
+        // The `--workflow` flag and the JSON output need the same
+        // kebab-case string, so the `Serialize` derive must match
+        // the clap ValueEnum form. Pin both.
+        let json = serde_json::to_string(&DoctorWorkflow::BundleRun).unwrap();
+        assert_eq!(json, "\"bundle-run\"");
+        let json = serde_json::to_string(&DoctorWorkflow::DevShell).unwrap();
+        assert_eq!(json, "\"dev-shell\"");
+    }
+
+    /// Demonstrates the filter behavior: an irrelevant failed
+    /// check is dropped from the workflow-scoped report.
+    /// `BundleRun` skips `prerequisites`, so a failed `cargo`
+    /// check shouldn't appear in a bundle-run-scoped run.
+    #[test]
+    fn workflow_filter_drops_irrelevant_failed_checks() {
+        let all_checks = [
+            Check {
+                name: "cargo",
+                category: "prerequisites",
+                ok: false,
+                info: "missing".into(),
+            },
+            Check {
+                name: "platform",
+                category: "platform",
+                ok: true,
+                info: "macOS".into(),
+            },
+        ];
+
+        let workflow = DoctorWorkflow::BundleRun;
+        let relevant = workflow.relevant_categories();
+        let filtered: Vec<&Check> = all_checks
+            .iter()
+            .filter(|c| relevant.contains(&c.category))
+            .collect();
+
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0].name, "platform");
+        // The previously-failing `cargo` check is now invisible, so
+        // `all_ok` over the filtered set is `true`.
+        let all_ok_filtered = filtered.iter().all(|c| c.ok);
+        assert!(all_ok_filtered);
     }
 }

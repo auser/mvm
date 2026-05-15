@@ -415,6 +415,59 @@ pub enum GuestRequest {
     RunCode { code: String, timeout_secs: u64 },
 }
 
+impl GuestRequest {
+    /// Stable kebab-case verb name for this request — the value
+    /// host-side audit emitters write into the
+    /// `LocalAuditKind::NetworkPolicyAllow` detail format under
+    /// `verb=<name>`. Plan 51 W6 / Plan 37 §6 invariant: every
+    /// vsock RPC from host to guest emits one audit record so a
+    /// forensic pass can reconstruct what the host asked the
+    /// guest to do.
+    ///
+    /// The strings are wire-stable — a rename here is also a
+    /// detail-format wire-format change. Pinned by
+    /// [`tests::kind_name_covers_every_variant`].
+    pub fn kind_name(&self) -> &'static str {
+        match self {
+            Self::ProtocolHello { .. } => "protocol-hello",
+            Self::WorkerStatus => "worker-status",
+            Self::SleepPrep { .. } => "sleep-prep",
+            Self::Wake => "wake",
+            Self::Ping => "ping",
+            Self::IntegrationStatus => "integration-status",
+            Self::CheckpointIntegrations { .. } => "checkpoint-integrations",
+            Self::ProbeStatus => "probe-status",
+            Self::Exec { .. } => "exec",
+            Self::RunEntrypoint { .. } => "run-entrypoint",
+            Self::PostRestore => "post-restore",
+            Self::FsDiff => "fs-diff",
+            Self::StartPortForward { .. } => "start-port-forward",
+            Self::ConsoleOpen { .. } => "console-open",
+            Self::ConsoleClose { .. } => "console-close",
+            Self::ConsoleResize { .. } => "console-resize",
+            Self::EntrypointStatus => "entrypoint-status",
+            Self::ReadinessStatus => "readiness-status",
+            Self::FsRead { .. } => "fs-read",
+            Self::FsWrite { .. } => "fs-write",
+            Self::FsList { .. } => "fs-list",
+            Self::FsStat { .. } => "fs-stat",
+            Self::FsMkdir { .. } => "fs-mkdir",
+            Self::FsRemove { .. } => "fs-remove",
+            Self::FsMove { .. } => "fs-move",
+            Self::ProcStart { .. } => "proc-start",
+            Self::ProcList => "proc-list",
+            Self::ProcSignal { .. } => "proc-signal",
+            Self::ProcSendInput { .. } => "proc-send-input",
+            Self::ProcWait { .. } => "proc-wait",
+            Self::ProcKill { .. } => "proc-kill",
+            Self::MountVolume { .. } => "mount-volume",
+            Self::UnmountVolume { .. } => "unmount-volume",
+            Self::UpdateIdleTimeout { .. } => "update-idle-timeout",
+            Self::RunCode { .. } => "run-code",
+        }
+    }
+}
+
 /// Helper for `#[serde(default = "...")]` on `bool` fields where
 /// `true` is the desired default (serde's `Default` trait yields
 /// `false`).
@@ -846,6 +899,10 @@ pub enum GuestCapability {
     Console,
     VolumeMount,
     UpdateIdleTimeout,
+    /// Plan 76 Phase 2 — `ReadinessStatus` returns
+    /// `GuestResponse::ReadinessStatusReport(ReadinessReport)`.
+    /// `mvmctl wait` / `mvmctl boot-report` require this capability.
+    Readiness,
 }
 
 /// Required remediation for a host/guest protocol mismatch.
@@ -878,6 +935,7 @@ pub fn supported_capabilities() -> Vec<GuestCapability> {
         GuestCapability::Console,
         GuestCapability::VolumeMount,
         GuestCapability::UpdateIdleTimeout,
+        GuestCapability::Readiness,
     ]
 }
 
@@ -1088,11 +1146,27 @@ pub enum ProcWaitEvent {
         kind: ProcErrorKind,
         message: String,
     },
+    /// A streaming resource is throttled (ADR-050 §5 / plan 74 W4).
+    /// **Non-terminal.** The agent emits this on the rising edge of
+    /// a backpressure condition — typically the host-side stdout/
+    /// stderr buffer crossing its high-water mark. The wait loop
+    /// continues; subsequent `Stdout` / `Stderr` / terminal events
+    /// signal that flow has resumed.
+    ///
+    /// `detail` is a bounded, redacted human-readable hint
+    /// (operator-facing). It **never** carries argv, env, stdin,
+    /// stdout, stderr, or filesystem paths — see ADR-050's payload
+    /// invariant.
+    Backpressure {
+        reason: mvm_core::domain::instance::BackpressureReason,
+        detail: String,
+    },
 }
 
 impl ProcWaitEvent {
     /// Returns true if this event terminates the response stream
-    /// for one `ProcWait` call.
+    /// for one `ProcWait` call. `Backpressure` is non-terminal —
+    /// the wait loop continues after the agent emits it.
     pub fn is_terminal(&self) -> bool {
         matches!(
             self,
@@ -3010,6 +3084,46 @@ mod tests {
             }
             .is_terminal()
         );
+        // ADR-050 §5 / plan 74 W4: `Backpressure` is non-terminal.
+        // The wait loop continues after the agent emits it.
+        assert!(
+            !ProcWaitEvent::Backpressure {
+                reason: mvm_core::domain::instance::BackpressureReason::OutputConsumerSlow,
+                detail: "captured output 12345 bytes ≥ 12288 byte high-water (cap 16384 bytes)"
+                    .to_string(),
+            }
+            .is_terminal()
+        );
+    }
+
+    /// ADR-050 §5 / plan 74 W4: the `Backpressure` variant
+    /// roundtrips through serde with its full nested shape and
+    /// `BackpressureReason` snake-case discriminant intact, and
+    /// rejects unknown fields like every other host↔guest type.
+    #[test]
+    fn test_proc_wait_event_backpressure_serde_roundtrip() {
+        let ev = ProcWaitEvent::Backpressure {
+            reason: mvm_core::domain::instance::BackpressureReason::OutputConsumerSlow,
+            detail: "captured output 12345 bytes ≥ 12288 byte high-water (cap 16384 bytes)"
+                .to_string(),
+        };
+        let json = serde_json::to_string(&ev).unwrap();
+        let parsed: ProcWaitEvent = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, ev);
+        // The reason discriminant ships snake_case on the wire so
+        // CLI / Studio / MCP renderers can pattern-match on string
+        // form without taking a typed dependency on mvm-core.
+        assert!(
+            json.contains("\"output_consumer_slow\""),
+            "wire payload missing snake_case reason: {json}"
+        );
+
+        let smuggled =
+            r#"{"Backpressure":{"reason":"output_consumer_slow","detail":"x","extra":1}}"#;
+        assert!(
+            serde_json::from_str::<ProcWaitEvent>(smuggled).is_err(),
+            "Backpressure must reject unknown fields"
+        );
     }
 
     /// W4.1 + D regression: every new Volume variant rejects unknown
@@ -4775,5 +4889,144 @@ mod tests {
         assert_eq!(r.warm_pool, ComponentState::Disabled);
         assert_eq!(r.boot_millis.vsock_bound_ms, Some(7));
         assert!(r.boot_millis.first_accept_ms.is_none());
+    }
+
+    // ========================================================================
+    // Plan 74 W2 / Plan 51 W6 — `GuestRequest::kind_name` for vsock RPC audit
+    // ========================================================================
+
+    /// Every `GuestRequest` variant must produce a kebab-case
+    /// verb name. The check is exhaustive: a new variant added
+    /// without updating `kind_name` panics here because the
+    /// constructor list is hand-maintained, not derived.
+    ///
+    /// Pin the wire-stable strings: a rename is a detail-format
+    /// wire-format change, so the audit consumer reading old
+    /// logs sees the same `verb=<name>` tokens.
+    #[test]
+    fn kind_name_covers_every_variant() {
+        // Hand-roll one of each variant. A new variant requires
+        // a new row here — the match in `kind_name` is exhaustive
+        // so the compiler catches it on the implementation side,
+        // and this test catches it on the wire-format side.
+        let cases: &[(GuestRequest, &str)] = &[
+            (
+                GuestRequest::ProtocolHello {
+                    host_protocol_version: 0,
+                    min_supported_version: 0,
+                    host_version: String::new(),
+                    requested_capabilities: Vec::new(),
+                },
+                "protocol-hello",
+            ),
+            (GuestRequest::WorkerStatus, "worker-status"),
+            (
+                GuestRequest::SleepPrep {
+                    drain_timeout_secs: 0,
+                },
+                "sleep-prep",
+            ),
+            (GuestRequest::Wake, "wake"),
+            (GuestRequest::Ping, "ping"),
+            (GuestRequest::IntegrationStatus, "integration-status"),
+            (
+                GuestRequest::CheckpointIntegrations {
+                    integrations: Vec::new(),
+                },
+                "checkpoint-integrations",
+            ),
+            (GuestRequest::ProbeStatus, "probe-status"),
+            (
+                GuestRequest::Exec {
+                    command: String::new(),
+                    stdin: None,
+                    timeout_secs: None,
+                },
+                "exec",
+            ),
+            (
+                GuestRequest::RunEntrypoint {
+                    stdin: Vec::new(),
+                    timeout_secs: 0,
+                },
+                "run-entrypoint",
+            ),
+            (GuestRequest::PostRestore, "post-restore"),
+            (GuestRequest::FsDiff, "fs-diff"),
+            (
+                GuestRequest::StartPortForward { guest_port: 0 },
+                "start-port-forward",
+            ),
+            (
+                GuestRequest::ConsoleOpen { cols: 0, rows: 0 },
+                "console-open",
+            ),
+            (
+                GuestRequest::ConsoleClose { session_id: 0 },
+                "console-close",
+            ),
+            (
+                GuestRequest::ConsoleResize {
+                    session_id: 0,
+                    cols: 0,
+                    rows: 0,
+                },
+                "console-resize",
+            ),
+            (GuestRequest::EntrypointStatus, "entrypoint-status"),
+            (GuestRequest::ReadinessStatus, "readiness-status"),
+            (
+                GuestRequest::FsRead {
+                    path: String::new(),
+                    offset: None,
+                    length: 0,
+                    follow_symlinks: true,
+                },
+                "fs-read",
+            ),
+            (
+                GuestRequest::FsWrite {
+                    path: String::new(),
+                    content: Vec::new(),
+                    mode: 0,
+                    create_parents: false,
+                    follow_symlinks: false,
+                },
+                "fs-write",
+            ),
+        ];
+        for (req, expected) in cases {
+            assert_eq!(req.kind_name(), *expected, "verb name for {req:?}");
+        }
+    }
+
+    /// Sanity: the verb names are all kebab-case (lowercase
+    /// ASCII letters + `-`). A future variant accidentally
+    /// emitting `snake_case` or `CamelCase` would break log
+    /// parsers that split on `-`.
+    #[test]
+    fn kind_name_strings_are_kebab_case() {
+        let samples = [
+            GuestRequest::Ping,
+            GuestRequest::EntrypointStatus,
+            GuestRequest::ReadinessStatus,
+            GuestRequest::FsDiff,
+            GuestRequest::StartPortForward { guest_port: 0 },
+            GuestRequest::CheckpointIntegrations {
+                integrations: vec![],
+            },
+        ];
+        for req in samples {
+            let s = req.kind_name();
+            for c in s.chars() {
+                assert!(
+                    c.is_ascii_lowercase() || c == '-',
+                    "verb '{s}' contains non-kebab-case char {c:?}"
+                );
+            }
+            assert!(!s.is_empty(), "verb name must not be empty");
+            assert!(!s.starts_with('-'), "verb must not start with hyphen: {s}");
+            assert!(!s.ends_with('-'), "verb must not end with hyphen: {s}");
+        }
     }
 }

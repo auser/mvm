@@ -246,6 +246,21 @@ pub(in crate::commands) enum Commands {
     /// re-runs the CVE scan against the current pip-audit / pnpm
     /// audit feed and reseals the volume.
     Deps(deps::Args),
+    /// Block until a guest readiness component reaches a terminal
+    /// state. Plan 76 Phase 2. Defaults to `--for all` with a 60s
+    /// timeout. Exit codes: 0 ready, 65 (EX_DATAERR) component
+    /// failed, 75 (EX_TEMPFAIL) timeout.
+    Wait(vm::wait::WaitArgs),
+    /// Print a guest's structured readiness snapshot + per-phase
+    /// boot timings. Plan 76 Phase 4. Single round-trip; use
+    /// `mvmctl wait` to poll.
+    BootReport(vm::wait::BootReportArgs),
+    /// Pack + verify portable signed `.mvm` artifacts (Plan 76
+    /// Phase 6). `pack` writes a tar.gz with kernel + rootfs +
+    /// verity sidecars and signs a manifest hashing each payload.
+    /// `verify` checks the signature + every file hash without
+    /// extracting payloads to disk.
+    Artifact(vm::artifact::Args),
 }
 
 // ============================================================================
@@ -383,6 +398,9 @@ pub fn run() -> Result<()> {
         Commands::Trust(a) => trust::run(&cli, a, &cfg),
         Commands::Tenant(a) => ops::tenant::run(&cli, a, &cfg),
         Commands::Deps(a) => deps::run(&cli, a, &cfg),
+        Commands::Wait(a) => vm::wait::run_wait(&cli, a, &cfg),
+        Commands::BootReport(a) => vm::wait::run_boot_report(&cli, a, &cfg),
+        Commands::Artifact(a) => vm::artifact::run(&cli, a, &cfg),
     };
 
     cmd_audit::emit_cmd_outcome(cmd_recorder.as_ref(), verb, &result);

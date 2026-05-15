@@ -51,6 +51,14 @@ Recent maintenance:
 - [x] Aligned `dev_build` with the builder VM invariant by removing the host-Nix dispatch probe from the normal path; Nix builds now route through the libkrun builder VM when builder-VM support is compiled in.
 - [x] Added builder-VM smoke/failure unit coverage for `dev_build`: the test seam now accepts a fake `BuilderVm`, asserts the flake job and mount shape, proves the path does not probe or invoke host-side Nix, fails closed on builder errors, and gives each staging directory a per-build nonce to avoid same-process collisions.
 - [x] Added CLI-level source-checkout policy coverage for `ensure_dev_image`: source dev flakes now require the sibling builder-VM flake, missing libkrun fails before build dispatch, builder failures refuse published-prebuilt fallback, and the installed/prebuilt path remains available only when no source dev flake is detected.
+- [x] Hardened builder-VM image bootstrap policy: source checkouts may reuse an existing local builder image cache, but cache misses now fail closed instead of downloading published builder-VM prebuilts that could mask local `nix/images/builder-vm/` changes.
+- [x] Added the Stage 0 local builder-image bootstrap path: dev images now carry `/sbin/mvm-builder-init`, `LibkrunBuilderVm` accepts an explicit bootstrap image override, and source-checkout builder-cache misses route to a local `nix/images/builder-vm/` build instead of a network artifact fetch.
+- [x] Hardened Stage 0 builder-cache promotion: local builder-image bootstraps now build into a hidden staging directory, validate kernel/rootfs artifacts, and promote into the live cache only after validation succeeds.
+- [x] Bound source-checkout builder-image cache reuse to a SHA-256 fingerprint of `nix/images/builder-vm/{flake.nix,flake.lock}`, so stale but structurally valid builder caches are rebuilt instead of masking local source changes.
+- [x] Added source-built builder-cache artifact digest metadata; source checkout cache hits now require the fingerprint and cached `vmlinux` / `rootfs.ext4` / optional `cmdline.txt` digests to match before reuse.
+- [x] Added safe source-checkout builder-cache diagnostics; verbose output now reports non-sensitive cache decision reason codes such as `hit`, `fingerprint_mismatch`, and `artifact_digest_mismatch`.
+- [x] Added source-built builder-cache provenance metadata; source-checkout cache hits now require a non-sensitive provenance summary matching the source fingerprint and artifact filename set, with `missing_provenance` / `provenance_mismatch` diagnostics.
+- [x] Plan 77 W4: gated `download_builder_vm_image` and its helpers behind the off-by-default `release-artifact-bootstrap` feature so contributor builds cannot reach the published-prebuilt path at compile time, with `perform_builder_vm_download_published_bails_without_feature` locking the structural-failure shape into the test suite.
 
 ## In-flight workstreams
 

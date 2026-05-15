@@ -189,6 +189,9 @@ impl Commands {
             Commands::Trust(_) => "trust",
             Commands::Tenant(_) => "tenant",
             Commands::Deps(_) => "deps",
+            Commands::Wait(_) => "wait",
+            Commands::BootReport(_) => "boot-report",
+            Commands::Artifact(_) => "artifact",
         }
     }
 }

@@ -69,6 +69,8 @@ use std::process::ExitCode;
 // would flag them otherwise. Real dead code would still surface as
 // red because the tests would lose coverage.
 #[allow(dead_code)]
+mod boot_timings;
+#[allow(dead_code)]
 mod install;
 #[allow(dead_code)]
 mod install_spec;
@@ -98,6 +100,10 @@ fn main() -> ExitCode {
 mod linux {
     use std::path::Path;
     use std::process::{Command, ExitCode};
+    use std::sync::{Arc, Mutex};
+    use std::time::Instant;
+
+    use crate::boot_timings::BootTimings;
 
     /// Persistent Nix-store device — virtio-blk attached as
     /// `/dev/vdb` by `LibkrunBuilderVm` (Plan 72 W4 will wire
@@ -155,19 +161,87 @@ mod linux {
     pub fn run() -> ExitCode {
         eprintln!("mvm-builder-init: pid 1 starting");
 
-        if let Err(e) = setup_filesystems() {
-            eprintln!("mvm-builder-init: setup_filesystems failed: {e}");
-            write_result(2, &format!("setup_filesystems failed: {e}"));
+        // Plan 76 Phase 5: anchor the boot-timings clock as close
+        // to init entry as we can. The few ms of `eprintln!` +
+        // module dispatch above this point are constant across
+        // boots and uninteresting.
+        let anchor = Instant::now();
+        let (timings, _) = BootTimings::new(anchor);
+        let timings = Arc::new(Mutex::new(timings));
+
+        // Pseudofs mounts must complete before anything else —
+        // every subsequent phase needs /proc, /sys, /dev to be
+        // readable.
+        if let Err(e) = mount_pseudofs() {
+            eprintln!("mvm-builder-init: mount_pseudofs failed: {e}");
+            write_result(2, &format!("mount_pseudofs failed: {e}"));
+            stamp(&timings, |t| {
+                t.poweroff_start_ms = Some(BootTimings::ms_since(anchor))
+            });
+            write_boot_timings(&timings);
+            return power_off();
+        }
+        stamp(&timings, |t| {
+            t.pseudofs_ready_ms = Some(BootTimings::ms_since(anchor))
+        });
+
+        // Plan 76 Phase 5: three independent setup tracks fan out
+        // after pseudofs. They share no state with each other
+        // until join.
+        //
+        //   Track A (this thread): /dev/vdb format → mount → seed
+        //     → bind over /nix. Serial; each step depends on the
+        //     previous. Long pole on first-boot (the seed copy).
+        //   Track B: modprobe fuse + virtiofs → mount virtio-fs
+        //     shares. Independent of /nix work — the kernel
+        //     modules and the persistent-store ext4 don't share
+        //     resources.
+        //   Track C: udhcpc network setup. Independent of both.
+        //     Non-fatal: offline builds against the seed store
+        //     still work.
+        //
+        // Threads write into the same `Mutex<BootTimings>`;
+        // contention is a non-issue (a handful of writes per
+        // boot, none on the hot path).
+        let track_b = {
+            let timings = Arc::clone(&timings);
+            std::thread::spawn(move || setup_modules_and_virtiofs(&timings, anchor))
+        };
+        let track_c = {
+            let timings = Arc::clone(&timings);
+            std::thread::spawn(move || {
+                if let Err(e) = setup_network() {
+                    eprintln!("mvm-builder-init: setup_network warning (non-fatal): {e}");
+                    // Leave network_ready_ms = None — the JSON
+                    // signals "offline build" downstream.
+                    return;
+                }
+                stamp(&timings, |t| {
+                    t.network_ready_ms = Some(BootTimings::ms_since(anchor))
+                });
+            })
+        };
+
+        // Track A on the main thread.
+        if let Err(e) = setup_nix_store(&timings, anchor) {
+            eprintln!("mvm-builder-init: setup_nix_store failed: {e}");
+            // Drain the other tracks so their threads don't get
+            // orphaned across the reboot syscall.
+            let _ = track_b.join();
+            let _ = track_c.join();
+            write_result(2, &format!("setup_nix_store failed: {e}"));
+            stamp(&timings, |t| {
+                t.poweroff_start_ms = Some(BootTimings::ms_since(anchor))
+            });
+            write_boot_timings(&timings);
             return power_off();
         }
 
-        // Network failure is non-fatal — offline builds against
-        // the seed store still work for some derivations. The
-        // host-side supervisor logs the warning via the libkrun
-        // console.
-        if let Err(e) = setup_network() {
-            eprintln!("mvm-builder-init: setup_network warning (non-fatal): {e}");
-        }
+        // Wait for the fan-out tracks before dispatching the job.
+        // Failures on B/C are already logged inside the closures;
+        // we don't abort the build for them.
+        let _ = track_b.join();
+        let _ = track_c.join();
 
         // Plan 73 Followup B.2 dispatch: install jobs hand the init
         // binary a structured spec rather than a shell script. We
@@ -176,19 +250,74 @@ mod linux {
         let install_spec_path = format!("{JOB_DIR}/{INSTALL_SPEC_FILENAME}");
         if Path::new(&install_spec_path).exists() {
             eprintln!("mvm-builder-init: install spec detected, routing through install pipeline");
+            stamp(&timings, |t| {
+                t.job_start_ms = Some(BootTimings::ms_since(anchor))
+            });
             run_install_job(&install_spec_path);
+            stamp(&timings, |t| {
+                t.job_end_ms = Some(BootTimings::ms_since(anchor))
+            });
+            stamp(&timings, |t| {
+                t.poweroff_start_ms = Some(BootTimings::ms_since(anchor))
+            });
+            write_boot_timings(&timings);
             return power_off();
         }
 
         let cmd_path = format!("{JOB_DIR}/cmd.sh");
         if !Path::new(&cmd_path).exists() {
             write_result(2, &format!("missing {cmd_path}"));
+            stamp(&timings, |t| {
+                t.poweroff_start_ms = Some(BootTimings::ms_since(anchor))
+            });
+            write_boot_timings(&timings);
             return power_off();
         }
 
+        stamp(&timings, |t| {
+            t.job_start_ms = Some(BootTimings::ms_since(anchor))
+        });
         let (code, tail) = run_job(&cmd_path);
+        stamp(&timings, |t| {
+            t.job_end_ms = Some(BootTimings::ms_since(anchor))
+        });
         write_result(code, &tail);
+        stamp(&timings, |t| {
+            t.poweroff_start_ms = Some(BootTimings::ms_since(anchor))
+        });
+        write_boot_timings(&timings);
         power_off()
+    }
+
+    /// Convenience for `timings.lock().map(|mut t| f(&mut *t))`. A
+    /// poisoned mutex (a peer thread panicked mid-stamp) becomes a
+    /// no-op rather than escalating — these timings are
+    /// observability, never gating.
+    fn stamp<F: FnOnce(&mut BootTimings)>(timings: &Arc<Mutex<BootTimings>>, f: F) {
+        if let Ok(mut t) = timings.lock() {
+            f(&mut t);
+        }
+    }
+
+    /// Write the current `BootTimings` snapshot to
+    /// `/job/boot-timings.json` and mirror a one-line summary to
+    /// stderr. Best-effort: if `/job` is not mounted (virtio-fs
+    /// failed) the write fails silently; the stderr line still
+    /// reaches the host-side console capture.
+    fn write_boot_timings(timings: &Arc<Mutex<BootTimings>>) {
+        let snapshot = match timings.lock() {
+            Ok(t) => t.clone(),
+            Err(_) => {
+                eprintln!("mvm-builder-init: boot-timings mutex poisoned; skipping JSON write");
+                return;
+            }
+        };
+        let json = snapshot.to_json();
+        eprintln!("mvm-builder-init: boot-timings={json}");
+        let path = format!("{JOB_DIR}/boot-timings.json");
+        if let Err(e) = std::fs::write(&path, format!("{json}\n")) {
+            eprintln!("mvm-builder-init: failed to write {path}: {e}");
+        }
     }
 
     /// Drive the install pipeline against `/job/install_spec.json`.
@@ -303,7 +432,11 @@ mod linux {
         }
     }
 
-    fn setup_filesystems() -> Result<(), String> {
+    /// Plan 76 Phase 5: the first phase, on the critical path for
+    /// every other init step. /proc, /sys, /dev, /tmp must be
+    /// available before module loading, device probing, or virtio-fs
+    /// mounting; nothing else fans out concurrently with this.
+    fn mount_pseudofs() -> Result<(), String> {
         // Standard init filesystems. libkrun's kernel mounts
         // devtmpfs (and sometimes /proc /sys) before handing off to
         // init, so EBUSY here means "already mounted by an earlier
@@ -313,7 +446,14 @@ mod linux {
         mount_fs_idempotent("sysfs", "/sys", "sysfs")?;
         mount_fs_idempotent("devtmpfs", "/dev", "devtmpfs")?;
         mount_fs_idempotent("tmpfs", "/tmp", "tmpfs")?;
+        Ok(())
+    }
 
+    /// Plan 76 Phase 5: serial chain that gates job execution.
+    /// /dev/vdb format (first boot only) → mount → seed (first
+    /// boot only) → bind-mount over /nix. Each step depends on the
+    /// previous, so this stays single-threaded inside.
+    fn setup_nix_store(timings: &Arc<Mutex<BootTimings>>, anchor: Instant) -> Result<(), String> {
         std::fs::create_dir_all(NIX_STORE_MOUNT)
             .map_err(|e| format!("create {NIX_STORE_MOUNT}: {e}"))?;
         if !is_ext4_formatted(NIX_STORE_DEV)? {
@@ -321,6 +461,9 @@ mod linux {
             format_ext4(NIX_STORE_DEV)?;
         }
         mount_fs(NIX_STORE_DEV, NIX_STORE_MOUNT, "ext4")?;
+        stamp(timings, |t| {
+            t.nix_device_ready_ms = Some(BootTimings::ms_since(anchor))
+        });
 
         // Seed the persistent `/nix-store` from the rootfs's baked-in
         // `/nix/store` on first boot. A plain `MS_BIND` shadows the
@@ -361,11 +504,25 @@ mod linux {
                     status.code()
                 ));
             }
+            stamp(timings, |t| {
+                t.nix_seeded_ms = Some(BootTimings::ms_since(anchor))
+            });
         }
 
         std::fs::create_dir_all(NIX_TARGET).map_err(|e| format!("create {NIX_TARGET}: {e}"))?;
         bind_mount(NIX_STORE_MOUNT, NIX_TARGET)?;
+        stamp(timings, |t| {
+            t.nix_mounted_ms = Some(BootTimings::ms_since(anchor))
+        });
 
+        Ok(())
+    }
+
+    /// Plan 76 Phase 5: independent track that runs concurrently
+    /// with `setup_nix_store`. Loads the `fuse` + `virtiofs`
+    /// kernel modules (themselves fanned out across two threads),
+    /// then mounts the three virtio-fs shares.
+    fn setup_modules_and_virtiofs(timings: &Arc<Mutex<BootTimings>>, anchor: Instant) {
         // Load FUSE + virtio-fs kernel modules before mounting the
         // host-exported shares. Stock nixpkgs kernel ships these as
         // `=m` (loadable modules); without modprobe, `mount -t
@@ -374,19 +531,18 @@ mod linux {
         // load them at boot. Failure is non-fatal — the subsequent
         // mount attempts will fail visibly if a module is genuinely
         // missing rather than just not-yet-loaded.
-        for module in &["fuse", "virtiofs"] {
-            let status = Command::new("/bin/busybox")
-                .args(["modprobe", module])
-                .status();
-            match status {
-                Ok(s) if s.success() => {}
-                Ok(s) => eprintln!(
-                    "mvm-builder-init: modprobe {module} exited {} (continuing)",
-                    s.code().unwrap_or(-1)
-                ),
-                Err(e) => eprintln!("mvm-builder-init: spawn modprobe {module}: {e} (continuing)"),
-            }
-        }
+        //
+        // Plan 76 Phase 5: the two modprobes fan out across a pair
+        // of threads. modprobe is mostly I/O-bound (open + read the
+        // module file, run the insmod ioctl); running them
+        // concurrently halves the wall-clock cost on slower disks.
+        let fuse = std::thread::spawn(|| run_modprobe("fuse"));
+        let virtiofs = std::thread::spawn(|| run_modprobe("virtiofs"));
+        let _ = fuse.join();
+        let _ = virtiofs.join();
+        stamp(timings, |t| {
+            t.modules_ready_ms = Some(BootTimings::ms_since(anchor))
+        });
 
         // virtio-fs shares declared by `LibkrunBuilderVm` (Plan 72
         // W4). Each entry is `(tag, target)` — the kernel routes
@@ -402,8 +558,23 @@ mod linux {
                 eprintln!("mvm-builder-init: virtio-fs '{tag}' -> {target} failed: {e}");
             }
         }
+        stamp(timings, |t| {
+            t.virtiofs_ready_ms = Some(BootTimings::ms_since(anchor))
+        });
+    }
 
-        Ok(())
+    fn run_modprobe(module: &str) {
+        let status = Command::new("/bin/busybox")
+            .args(["modprobe", module])
+            .status();
+        match status {
+            Ok(s) if s.success() => {}
+            Ok(s) => eprintln!(
+                "mvm-builder-init: modprobe {module} exited {} (continuing)",
+                s.code().unwrap_or(-1)
+            ),
+            Err(e) => eprintln!("mvm-builder-init: spawn modprobe {module}: {e} (continuing)"),
+        }
     }
 
     fn setup_network() -> Result<(), String> {

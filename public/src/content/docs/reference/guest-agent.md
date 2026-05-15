@@ -27,6 +27,104 @@ The agent communicates using **length-prefixed JSON frames** over vsock (Firecra
 
 Request types: `ping`, `status`, `sleep-prep`, `wake`, and more.
 
+## Control plane and data plane
+
+Plan 74 / ADR-050 §4 splits the agent's wire surface into a
+**control plane** (small, single-frame, bounded requests/responses)
+and a **data plane** (streaming or chunked operations where the
+payload size is dominated by user content, not metadata). The
+distinction is load-bearing for the redaction invariant: data-plane
+payload bytes never appear in audit records, readiness messages,
+progress events, backpressure events, or receipts. The control
+plane is fully tracked in those surfaces; the data plane carries
+hashes and counts only.
+
+Every verb in the table below is also gated by an agent profile
+(see "Profile gate" below) — but the control-plane / data-plane
+split is **orthogonal**. `Exec` (dev-only) is a data-plane verb;
+`Ping` (always available) is control-plane.
+
+### Control-plane verbs
+
+Small bounded JSON in / small bounded JSON out. Maximum response
+frame size is `MAX_FRAME_SIZE = 256 KiB` (`crates/mvm-guest/src/vsock.rs`).
+No streaming. No payload bytes from user processes.
+
+| Verb | Response shape | Notes |
+|---|---|---|
+| `ProtocolHello` | `ProtocolHelloAck` / `ProtocolMismatch` | Required first request in every session (ADR-050 §1, hard cutover). |
+| `Ping` | `Pong` | Reachability probe. Requires `Ping` capability. |
+| `WorkerStatus` | `WorkerStatus { status, last_busy_at }` | Idle/busy sampled from `/proc/loadavg`. |
+| `ReadinessStatus` | `ReadinessStatusReport` | Component-level readiness (see "Readiness model" below). |
+| `IntegrationStatus` | `IntegrationStatusReport { integrations: Vec<…> }` | One per declared integration. Used by `mvmctl ls --json` readiness column (plan 74 W2). |
+| `EntrypointStatus` | `EntrypointStatusReport` | Validation result + warm-pool state. |
+| `ProbeStatus` | `ProbeStatusReport { probes: Vec<ProbeResult> }` | One per declared probe. |
+| `SleepPrep` / `Wake` / `PostRestore` / `CheckpointIntegrations` | Ack | Snapshot lifecycle handshakes. |
+| `UpdateIdleTimeout` | Ack with previous + new values | Adjusts the idle-eviction window. |
+| `MountVolume` / `UnmountVolume` | `MountVolumeResult` (closed enum) | Volume metadata only — no file contents. |
+| `StartPortForward` | `PortForwardStarted { vsock_port, … }` | Sets up a vsock→TCP forwarder. The data plane on that forwarder is byte-for-byte; the *control* plane that asks for it is one frame. |
+| `ProcStart` / `ProcSignal` / `ProcKill` / `ProcList` | `ProcResult` (closed enum) | Process control. `ProcStart` accepts an `argv` up to capped length but does not echo it back. |
+| `FsStat` / `FsList` / `FsMkdir` / `FsRemove` / `FsMove` | `FsResult` (closed enum) | Filesystem metadata. `FsList` truncates at `max_entries` and reports `truncated: true`. |
+| `ConsoleOpen` / `ConsoleClose` / `ConsoleResize` | Ack with vsock port | Allocates a PTY forwarder. The PTY itself runs on a different vsock port — that's the data plane. |
+
+### Data-plane verbs
+
+Streaming, chunked, or potentially-large bounded transfers. Each
+data-plane verb names its frame cap, chunk size, terminal event,
+and backpressure behavior below.
+
+| Verb | Flow | Frame cap | Chunk size | Terminal | Backpressure | Payload in audit? |
+|---|---|---|---|---|---|---|
+| `RunEntrypoint` | Single request → stream of `EntrypointEvent`s | `MAX_FRAME_SIZE` per event | Stdout/stderr drained per agent tick | `Exit { code }` / `Killed { signal }` / `TimedOut` / `Error` | None today (W4 wires the next slice). | No. Hash of stdout/stderr appears in receipts (plan 74 W6); raw bytes do not. |
+| `ProcWait` | Single request → stream of `ProcWaitEvent`s | `MAX_FRAME_SIZE` per event | Stdout/stderr drained per ~50 ms agent tick | `Exit` / `Killed` / `TimedOut` / `Error` | **`Backpressure { reason: OutputConsumerSlow, detail }`** — rising-edge at 75 % of `Caps::max_output_buffer` (16 MiB prod, plan 74 W4). Non-terminal; wait continues. | No. Output streams to the host live; nothing about chunk content goes to audit. |
+| `ProcSendInput` | Bounded request → ack | Request body capped at `Caps::max_stdin_per_call` (1 MiB prod) | Single-frame | `ProcResult::InputAccepted { bytes_accepted }` | Caller-driven — request body fails closed if it exceeds the cap (no implicit truncation). | No. `bytes_accepted` count only; never stdin bytes. |
+| `FsRead` | Single request → `FsResult::Read { content, total_size }` | `MAX_FRAME_SIZE` per response | The agent caps reads at `max_read_bytes` and reports `total_size` so callers detect short reads. Bigger files require multiple requests with offset/length. | Response itself is the terminal | None — bounded by frame cap. | No. `total_size` and offset/length appear in audit; `content` bytes do not. |
+| `FsWrite` | Bounded request → `FsResult::Write { bytes_written }` | Request body capped at the agent's write cap | Single-frame | Response itself is the terminal | Caller-driven — too-large bodies fail closed. | No. Byte count only. |
+| `Exec` / `RunCode` (dev-only) | Single request → `ExecResult { exit_code, stdout, stderr }` | Each captured stream capped by the dev caps; total response bounded by `MAX_FRAME_SIZE` | One-shot capture; no streaming | Response itself is the terminal | None — dev-only, not exercised in prod. | No. Hash of stdout/stderr can be receipted; raw bytes are not audited. |
+| Console PTY traffic | Bidirectional bytes over a dedicated vsock port (`ConsoleOpen` allocates it) | Per-frame cap defined by the console transport, not `MAX_FRAME_SIZE` | TTY-shaped reads | Caller closes (`ConsoleClose`) or PTY exits | None — interactive, not buffered. | No. Console bytes never enter audit. |
+| Port-forward TCP traffic | Bidirectional bytes over the vsock port returned by `StartPortForward` | None — raw TCP | TCP-shaped reads | TCP teardown | None — kernel TCP. | No. Forwarded bytes never enter audit. |
+| Builder output (builder VM only) | Streamed during `mvm-builder-init` builds | Frame cap on the builder vsock channel | Lines / records | Builder's terminal status | None today; builder egress events (plan 74 W8) will surface backpressure. | No. Build logs are stored next to the receipt; raw bytes never get into audit detail strings. |
+
+### Redaction invariant
+
+The following audit / readiness / progress / receipt surfaces are
+guaranteed by ADR-050 §4 / §5 to **never** contain data-plane
+payload bytes. The list is the authoritative one:
+
+- `~/.mvm/audit/<tenant>.jsonl` chain-signed entries.
+  Detail strings carry IDs, hashes, counts, and policy tags — not
+  argv values, env values, stdin, stdout, stderr, file contents,
+  or filesystem paths inside the guest.
+- `InstanceReadiness::ServicesStarting { pending }` /
+  `Degraded { unhealthy }` — both carry only **service names** (the
+  declared integration `name` field). Health-check command output
+  never appears.
+- `ProcWaitEvent::Backpressure { reason, detail }` — the `detail`
+  string is metadata only: byte counts, threshold, cap. Plan 74 W4
+  unit tests pin this.
+- `BackpressureReason::ServiceHealthPending { pending }` — service
+  names only.
+- Receipts written by `mvmctl run` / `mvmctl up` / `mvmctl build`
+  (plan 74 W6) store hashes and metadata. Raw stdout / stderr /
+  stdin / env / argv values are never written.
+- `mvmctl ls --json` rows — the `readiness` and
+  `last_readiness_change_at` fields render directly from the
+  registry; the registry only stores the closed enum + RFC 3339
+  timestamps.
+
+### Exit checks
+
+Plan 74 W3 calls out two contract checks that this section
+underwrites:
+
+1. **No code path advertises an unbounded single-frame response.**
+   Every entry above either names a frame cap or routes through a
+   streaming surface (`ProcWaitEvent` / `EntrypointEvent` / PTY /
+   raw TCP).
+2. **Docs explicitly state that payload bytes are not included in
+   audit or readiness messages.** The "Redaction invariant"
+   subsection is that statement.
+
 ## Profile gate
 
 Every guest image declares an **agent profile** in its
@@ -113,9 +211,31 @@ A host queries the live state via the `ReadinessStatus` verb:
 | `failed` | Subsystem failed to initialize. Carries a short human-readable `message` (no secrets, no host paths the caller doesn't already know). For `entrypoint`, this maps to `RunEntrypoint` returning the existing `EntrypointInvalid`. |
 
 `BootTimingReport` exposes monotonic milliseconds since agent
-process start. Phase 4 fills in the remaining fields
-(`warm_pool_ready_ms`, `integrations_ready_ms`, `probes_ready_ms`);
-the four populated today are enough to surface cold-path regressions.
+process start. Phase 3 closed out the per-component `*_ready_ms`
+fields by stamping them on each first transition out of
+`Starting`. A cold-tier image with no warm pool / integrations /
+probes correctly reports `None` for those — the stamp only fires
+once a background init thread actually ran.
+
+### Host commands
+
+- `mvmctl wait <vm> --for <component> [--timeout <secs>]` —
+  Blocks until the named component reaches `Ready`, `Disabled`,
+  or `Failed`. Targets: `control-plane`, `entrypoint`,
+  `warm-pool`, `integrations`, `probes`, or `all` (the default).
+  Exit codes: `0` ready, `65` (`EX_DATAERR`) component failed
+  with message printed, `75` (`EX_TEMPFAIL`) deadline hit.
+  `Disabled` counts as `Ready` (intentionally — a cold-tier
+  image asking `--for warm-pool` must not spin forever).
+
+- `mvmctl boot-report <vm> [--json]` — Single round-trip; prints
+  the same `ReadinessReport` `mvmctl wait` polls, including the
+  per-phase timing table. Useful right after `mvmctl up` to
+  inspect cold-path latency.
+
+Both verbs require `GuestCapability::Readiness` from the
+protocol-hello prelude; the agent advertises it in
+`supported_capabilities()`.
 
 ## Health Checks
 

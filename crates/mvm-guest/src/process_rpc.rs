@@ -20,6 +20,7 @@ use std::time::{Duration, Instant};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
 
+use mvm_core::domain::instance::BackpressureReason;
 use mvm_security::policy::{OsCanonicalizer, PathOp, PathPolicy};
 
 use crate::vsock::{ProcErrorKind, ProcInfo, ProcResult, ProcState, ProcWaitEvent};
@@ -467,6 +468,63 @@ fn drain_into_events(record: &ProcessRecord) -> Vec<ProcWaitEvent> {
     events
 }
 
+/// Rising-edge backpressure detection state held inside one
+/// `handle_proc_wait` call. Tracks which backpressure conditions
+/// have already been signaled this wait so the agent emits each
+/// reason at most once per crossing — avoiding event spam when the
+/// buffer hovers around its high-water mark.
+///
+/// Falling-edge clears the flag, so a buffer that fills → drains →
+/// fills again will emit `OutputConsumerSlow` twice. That matches
+/// the wait-reason renderer in `mvmctl proc wait`, which prints the
+/// reason once per rising edge.
+#[derive(Default)]
+struct BackpressureWatch {
+    output_consumer_slow: bool,
+}
+
+/// Threshold for `OutputConsumerSlow`: total captured stdout +
+/// stderr at or above 75 % of `caps.max_output_buffer`. Picked to
+/// give the host time to drain before the agent has to start
+/// dropping bytes, while not firing on every small bursty write.
+fn output_backpressure_threshold(caps: &Caps) -> usize {
+    caps.max_output_buffer.saturating_mul(3) / 4
+}
+
+/// Inspect the captured-output buffers and, on the rising edge of
+/// `total ≥ threshold`, return a `ProcWaitEvent::Backpressure`.
+/// Falling edge clears the watch flag so future rises emit again.
+///
+/// `detail` is a short metadata-only sentence (byte counts +
+/// threshold + cap) — never includes payload bytes, paths, argv,
+/// env, or stdin content (ADR-050 redaction invariant).
+fn check_output_backpressure(
+    record: &ProcessRecord,
+    caps: &Caps,
+    watch: &mut BackpressureWatch,
+) -> Option<ProcWaitEvent> {
+    let out_len = record.stdout_buf.lock().map(|b| b.len()).unwrap_or(0);
+    let err_len = record.stderr_buf.lock().map(|b| b.len()).unwrap_or(0);
+    let total = out_len.saturating_add(err_len);
+    let threshold = output_backpressure_threshold(caps);
+
+    if total >= threshold {
+        if !watch.output_consumer_slow {
+            watch.output_consumer_slow = true;
+            return Some(ProcWaitEvent::Backpressure {
+                reason: BackpressureReason::OutputConsumerSlow,
+                detail: format!(
+                    "captured output {} bytes ≥ {} byte high-water (cap {} bytes)",
+                    total, threshold, caps.max_output_buffer
+                ),
+            });
+        }
+    } else {
+        watch.output_consumer_slow = false;
+    }
+    None
+}
+
 /// Try to reap the child non-blocking. Returns `Some(terminal)` if
 /// the child has exited, `None` if it's still running.
 fn try_reap(record: &ProcessRecord, reap_grace: Duration) -> Option<TerminalState> {
@@ -538,8 +596,17 @@ pub fn handle_proc_wait<W: FnMut(ProcWaitEvent)>(
     }
 
     let deadline = timeout_secs.map(|s| Instant::now() + Duration::from_secs(s));
+    let mut bp_watch = BackpressureWatch::default();
 
     loop {
+        // ADR-050 §5 / plan 74 W4: emit `Backpressure` BEFORE draining
+        // so the host learns the buffer crossed its high-water mark
+        // before it sees the chunk that triggered the crossing. Rising
+        // edge only — `BackpressureWatch` suppresses repeat emissions
+        // while the condition persists.
+        if let Some(ev) = check_output_backpressure(&record, caps, &mut bp_watch) {
+            emit(ev);
+        }
         for ev in drain_into_events(&record) {
             emit(ev);
         }
@@ -840,6 +907,112 @@ mod tests {
         assert!(
             matches!(terminal, ProcWaitEvent::TimedOut),
             "expected TimedOut, got {terminal:?}"
+        );
+    }
+
+    // ---------------- Backpressure (ADR-050 §5 / plan 74 W4) ----------------
+    //
+    // Tests target `check_output_backpressure` directly. The unit
+    // doesn't need a real child process — it just needs a
+    // `ProcessRecord` whose stdout/stderr buffers carry enough bytes
+    // to cross the high-water mark. Building the record by hand
+    // sidesteps spawning a `/bin/yes`-style flood, which would be
+    // flaky inside CI.
+
+    fn make_record_with_output(stdout_bytes: usize, stderr_bytes: usize) -> ProcessRecord {
+        ProcessRecord {
+            argv0: "/bin/test".to_string(),
+            started_at: "2025-01-01T00:00:00Z".to_string(),
+            child: Mutex::new(None),
+            stdin: Mutex::new(None),
+            stdout_buf: Arc::new(Mutex::new(vec![0u8; stdout_bytes])),
+            stderr_buf: Arc::new(Mutex::new(vec![0u8; stderr_bytes])),
+            terminal: Mutex::new(None),
+            reap_after: Mutex::new(None),
+        }
+    }
+
+    #[test]
+    fn backpressure_threshold_at_three_quarters_of_cap() {
+        let caps = small_caps();
+        assert_eq!(caps.max_output_buffer, 4096);
+        assert_eq!(output_backpressure_threshold(&caps), 3072);
+    }
+
+    #[test]
+    fn backpressure_below_threshold_emits_nothing() {
+        let caps = small_caps();
+        let mut watch = BackpressureWatch::default();
+        let record = make_record_with_output(1024, 0);
+        assert!(check_output_backpressure(&record, &caps, &mut watch).is_none());
+        assert!(!watch.output_consumer_slow);
+    }
+
+    #[test]
+    fn backpressure_rising_edge_emits_output_consumer_slow_with_metadata_detail() {
+        let caps = small_caps();
+        let mut watch = BackpressureWatch::default();
+        // 2 KiB stdout + 2 KiB stderr = 4 KiB total ≥ 3 KiB threshold.
+        let record = make_record_with_output(2048, 2048);
+        let ev = check_output_backpressure(&record, &caps, &mut watch)
+            .expect("rising edge should emit Backpressure");
+        match ev {
+            ProcWaitEvent::Backpressure { reason, detail } => {
+                assert!(matches!(reason, BackpressureReason::OutputConsumerSlow));
+                // Detail is bounded metadata — byte counts only, no
+                // payload bytes / paths / argv / env / stdin content.
+                assert!(
+                    detail.contains("4096"),
+                    "detail missing byte count: {detail}"
+                );
+                assert!(
+                    detail.contains("3072"),
+                    "detail missing threshold: {detail}"
+                );
+                assert!(detail.contains("4096"), "detail missing cap: {detail}");
+            }
+            other => panic!("expected Backpressure, got {other:?}"),
+        }
+        assert!(watch.output_consumer_slow);
+    }
+
+    #[test]
+    fn backpressure_does_not_re_emit_while_condition_persists() {
+        let caps = small_caps();
+        let mut watch = BackpressureWatch::default();
+        let record = make_record_with_output(4000, 0);
+
+        let first = check_output_backpressure(&record, &caps, &mut watch);
+        assert!(first.is_some(), "rising edge should emit");
+
+        // Buffer still above threshold — agent must NOT keep spamming.
+        let second = check_output_backpressure(&record, &caps, &mut watch);
+        assert!(second.is_none(), "persistent backpressure must not re-emit");
+        assert!(watch.output_consumer_slow);
+    }
+
+    #[test]
+    fn backpressure_falling_edge_clears_watch_so_next_rise_re_emits() {
+        let caps = small_caps();
+        let mut watch = BackpressureWatch::default();
+
+        // Cross the threshold once.
+        let high = make_record_with_output(4000, 0);
+        assert!(check_output_backpressure(&high, &caps, &mut watch).is_some());
+
+        // Buffer drained: total < threshold.
+        let low = make_record_with_output(1024, 0);
+        assert!(check_output_backpressure(&low, &caps, &mut watch).is_none());
+        assert!(
+            !watch.output_consumer_slow,
+            "falling edge must clear the watch flag"
+        );
+
+        // Cross again: rising edge after a fall must re-emit.
+        let high_again = make_record_with_output(4000, 0);
+        assert!(
+            check_output_backpressure(&high_again, &caps, &mut watch).is_some(),
+            "rising edge after a fall must re-emit"
         );
     }
 }

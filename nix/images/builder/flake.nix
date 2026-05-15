@@ -111,9 +111,36 @@
         nix git gnumake curl jq iproute2 iptables e2fsprogs util-linux procps
       ];
 
+      # Stage 0 bootstrap support: source checkouts must not download
+      # a published builder-VM image. When the real builder-VM cache is
+      # empty, mvmctl can boot an already-cached dev image with
+      # `init=/sbin/mvm-builder-init` and ask it to build
+      # `nix/images/builder-vm`. That requires the dev image to carry
+      # the same PID-1 binary, even though normal `mvmctl dev up`
+      # boots via `/init`.
+      mvmBuilderInitFor = system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+        in
+        pkgs.rustPlatform.buildRustPackage {
+          pname = "mvm-builder-init";
+          version = "0.14.0";
+          src = workspace;
+          cargoLock = {
+            lockFile = workspace + "/Cargo.lock";
+          };
+          buildAndTestSubdir = "crates/mvm-builder-init";
+          doCheck = false;
+          meta = {
+            description = "PID-1 for local builder VM bootstrap";
+            mainProgram = "mvm-builder-init";
+          };
+        };
+
       mkBuilderImage = system:
         let
           pkgs = import nixpkgs { inherit system; };
+          builderInit = mvmBuilderInitFor system;
           # Stock nixpkgs kernel. Pass it to `mkGuest` so the rootfs
           # ships its module tree (`/lib/modules/<kver>/`) and `/init`
           # can `modprobe vmw_vsock_virtio_transport` before the agent
@@ -126,6 +153,10 @@
             entrypoint.shell = "/bin/sh";
             packages = builderPackages pkgs;
             kernel = kernelPkg;
+            extraFiles = {
+              "/sbin/mvm-builder-init" =
+                "${builderInit}/bin/mvm-builder-init";
+            };
           };
           kernelFile =
             if pkgs.stdenv.hostPlatform.isAarch64
