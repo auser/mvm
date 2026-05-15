@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mvm_core::security::AgentProfile;
 use mvm_guest::entrypoint::{
     CallCaps, CallOutcome, EntrypointPolicy, PayloadCapStream, ValidatedEntrypoint, execute,
 };
@@ -35,8 +36,8 @@ use mvm_guest::lifecycle_hooks::{self, ReadinessConfig};
 use mvm_guest::probes::{self, ProbeEntry, ProbeOutputFormat, ProbeResult};
 use mvm_guest::runtime_config::{self, ConcurrencyConfig};
 use mvm_guest::vsock::{
-    EntrypointEvent, FsChange, FsChangeKind, GUEST_AGENT_PORT, GuestRequest, GuestResponse,
-    RunEntrypointError,
+    BootTimingReport, ComponentState, EntrypointEvent, FsChange, FsChangeKind, GUEST_AGENT_PORT,
+    GuestRequest, GuestResponse, ReadinessReport, RunEntrypointError,
 };
 use mvm_guest::worker_pool::{DispatchError, DispatchOutcome, WorkerPool};
 use mvm_guest::worker_protocol::WorkerOutcome;
@@ -268,6 +269,198 @@ impl AgentState {
         Self {
             status: "idle".to_string(),
             last_busy_at: None,
+        }
+    }
+}
+
+// ============================================================================
+// Boot readiness state (plan 76 Phase 2)
+// ============================================================================
+
+/// Per-subsystem readiness, surfaced through `ReadinessStatus` and
+/// also consulted by `RunEntrypoint` so a host that races
+/// invocation ahead of warmup gets a typed `NotReady` rather than a
+/// permanent failure.
+///
+/// **State design.** A single `Mutex<BootStateInner>` instead of
+/// per-component atomics. Readers (`ReadinessStatus` handlers,
+/// `entrypoint_ready()` checks) are rare; writers fire at boot
+/// completion events. The lock holds for at most a few struct-field
+/// reads so contention is a non-issue. Per-component atomics
+/// (`AtomicU8` + side-channel for `Failed { message }`) would be
+/// more complex and earn nothing measurable.
+///
+/// **Why background init is still safe.** Per-handler invariants
+/// stay intact:
+///   - `RunEntrypoint` consults this state AND the existing
+///     `VALIDATED_ENTRYPOINT` `OnceLock` — `NotReady` while
+///     `Starting`, `EntrypointInvalid` once `VALIDATED_ENTRYPOINT`
+///     is set to `Err`.
+///   - Warm-process dispatch in the worker pool keeps its own
+///     ready flag (`WorkerPool::wait_for_ready`) — this state is
+///     observability, not the gate.
+struct AgentBootState {
+    inner: Mutex<BootStateInner>,
+    profile: AgentProfile,
+    boot_at: std::time::Instant,
+}
+
+#[derive(Default)]
+struct BootStateInner {
+    control_plane: ComponentState,
+    entrypoint: ComponentState,
+    warm_pool: ComponentState,
+    integrations: ComponentState,
+    probes: ComponentState,
+    volumes: ComponentState,
+    timing: BootTimingReport,
+}
+
+impl AgentBootState {
+    fn new(profile: AgentProfile, boot_at: std::time::Instant) -> Self {
+        Self {
+            inner: Mutex::new(BootStateInner {
+                // Two components start `Starting` rather than the
+                // `Default` `Disabled`: `control_plane` flips to
+                // `Ready` immediately after `bind+listen` in `main`
+                // (we're not running until then), and `entrypoint`
+                // is the boot dependency `RunEntrypoint` gates on.
+                // The remaining components keep `Disabled` from
+                // `Default` — the background init thread flips them
+                // to `Starting` when it sees config that requires
+                // them.
+                control_plane: ComponentState::Starting,
+                entrypoint: ComponentState::Starting,
+                ..Default::default()
+            }),
+            profile,
+            boot_at,
+        }
+    }
+
+    /// Milliseconds elapsed since `boot_at`. Always fits in `u64`
+    /// for any plausible agent lifetime; saturates on the absurd.
+    fn elapsed_ms(&self) -> u64 {
+        u64::try_from(self.boot_at.elapsed().as_millis()).unwrap_or(u64::MAX)
+    }
+
+    fn mark_vsock_bound(&self) {
+        if let Ok(mut s) = self.inner.lock() {
+            s.control_plane = ComponentState::Ready;
+            let ms = self.elapsed_ms();
+            s.timing.agent_started_ms.get_or_insert(ms);
+            s.timing.vsock_bound_ms.get_or_insert(ms);
+        }
+    }
+
+    /// Stamp the first-accept timing. Idempotent — only the first
+    /// caller wins, subsequent accept loops are no-ops.
+    fn mark_first_accept(&self) {
+        if let Ok(mut s) = self.inner.lock()
+            && s.timing.first_accept_ms.is_none()
+        {
+            s.timing.first_accept_ms = Some(self.elapsed_ms());
+        }
+    }
+
+    fn set_entrypoint(&self, state: ComponentState) {
+        if let Ok(mut s) = self.inner.lock() {
+            let became_terminal =
+                matches!(state, ComponentState::Ready | ComponentState::Failed { .. });
+            s.entrypoint = state;
+            if became_terminal && s.timing.entrypoint_ready_ms.is_none() {
+                s.timing.entrypoint_ready_ms = Some(self.elapsed_ms());
+            }
+        }
+    }
+
+    /// Set the warm-pool component and stamp `warm_pool_ready_ms`
+    /// when the state first leaves `Starting` for a terminal value
+    /// (`Ready` / `Failed` / `Disabled`). Initial `Disabled` (the
+    /// `Default` value, set before any background thread runs) does
+    /// not stamp — we only count time once init actually starts.
+    fn set_warm_pool(&self, state: ComponentState) {
+        if let Ok(mut s) = self.inner.lock() {
+            let was_starting = matches!(s.warm_pool, ComponentState::Starting);
+            s.warm_pool = state;
+            if was_starting && s.timing.warm_pool_ready_ms.is_none() {
+                s.timing.warm_pool_ready_ms = Some(self.elapsed_ms());
+            }
+        }
+    }
+
+    /// Set the integrations component. Stamps `integrations_ready_ms`
+    /// on the first transition out of `Starting`. See `set_warm_pool`
+    /// for the rationale on skipping initial-Disabled stamps.
+    fn set_integrations(&self, state: ComponentState) {
+        if let Ok(mut s) = self.inner.lock() {
+            let was_starting = matches!(s.integrations, ComponentState::Starting);
+            s.integrations = state;
+            if was_starting && s.timing.integrations_ready_ms.is_none() {
+                s.timing.integrations_ready_ms = Some(self.elapsed_ms());
+            }
+        }
+    }
+
+    /// Set the probes component. Stamps `probes_ready_ms` on the
+    /// first transition out of `Starting`.
+    fn set_probes(&self, state: ComponentState) {
+        if let Ok(mut s) = self.inner.lock() {
+            let was_starting = matches!(s.probes, ComponentState::Starting);
+            s.probes = state;
+            if was_starting && s.timing.probes_ready_ms.is_none() {
+                s.timing.probes_ready_ms = Some(self.elapsed_ms());
+            }
+        }
+    }
+
+    fn snapshot(&self) -> ReadinessReport {
+        let inner = self.inner.lock();
+        let (control_plane, entrypoint, warm_pool, integrations, probes, volumes, timing) =
+            match inner {
+                Ok(s) => (
+                    s.control_plane.clone(),
+                    s.entrypoint.clone(),
+                    s.warm_pool.clone(),
+                    s.integrations.clone(),
+                    s.probes.clone(),
+                    s.volumes.clone(),
+                    s.timing.clone(),
+                ),
+                // Poisoned lock means another thread panicked mid-update;
+                // surface that as a generic Failed rather than swallowing.
+                Err(_) => {
+                    let msg = "boot-state lock poisoned".to_string();
+                    (
+                        ComponentState::Failed {
+                            message: msg.clone(),
+                        },
+                        ComponentState::Failed {
+                            message: msg.clone(),
+                        },
+                        ComponentState::Failed {
+                            message: msg.clone(),
+                        },
+                        ComponentState::Failed {
+                            message: msg.clone(),
+                        },
+                        ComponentState::Failed {
+                            message: msg.clone(),
+                        },
+                        ComponentState::Failed { message: msg },
+                        BootTimingReport::default(),
+                    )
+                }
+            };
+        ReadinessReport {
+            control_plane,
+            entrypoint,
+            warm_pool,
+            integrations,
+            probes,
+            volumes,
+            profile: self.profile,
+            boot_millis: timing,
         }
     }
 }
@@ -1240,19 +1433,31 @@ fn run_before_stop_hook() {
 /// Validate `/etc/mvm/entrypoint` at agent boot. The result is stashed in
 /// `VALIDATED_ENTRYPOINT`. On failure, log a single line — the agent stays
 /// up; only `RunEntrypoint` requests fail with `EntrypointInvalid`.
-fn init_entrypoint_validation() {
+///
+/// Plan 76 Phase 2: also updates `AgentBootState.entrypoint` so
+/// `ReadinessStatus` reports `Ready` (or `Failed { message }`) and
+/// stamps `entrypoint_ready_ms` for cold-path timing.
+fn init_entrypoint_validation(boot_state: &Arc<AgentBootState>) {
     let result = EntrypointPolicy::production()
         .validate()
         .map_err(|e| e.to_string());
     match &result {
-        Ok(v) => eprintln!(
-            "mvm-guest-agent: entrypoint validated at {} (held open for fexecve)",
-            v.resolved.display()
-        ),
-        Err(msg) => eprintln!(
-            "mvm-guest-agent: entrypoint validation failed at boot: {msg}; \
-             RunEntrypoint requests will return EntrypointInvalid"
-        ),
+        Ok(v) => {
+            eprintln!(
+                "mvm-guest-agent: entrypoint validated at {} (held open for fexecve)",
+                v.resolved.display()
+            );
+            boot_state.set_entrypoint(ComponentState::Ready);
+        }
+        Err(msg) => {
+            eprintln!(
+                "mvm-guest-agent: entrypoint validation failed at boot: {msg}; \
+                 RunEntrypoint requests will return EntrypointInvalid"
+            );
+            boot_state.set_entrypoint(ComponentState::Failed {
+                message: msg.clone(),
+            });
+        }
     }
     let _ = VALIDATED_ENTRYPOINT.set(result);
 }
@@ -1268,49 +1473,72 @@ fn init_entrypoint_validation() {
 ///
 /// Missing `runtime.json` or absent `concurrency` → `Ok(None)`, the
 /// cold path stays in charge.
-fn init_warm_pool() {
+///
+/// Plan 76 Phase 2: runs in the boot-time background thread chained
+/// after `init_entrypoint_validation`. Updates
+/// `AgentBootState.warm_pool` (`Disabled` for cold-tier images,
+/// `Starting` → `Ready` for warm-pool, `Failed` on entrypoint
+/// dependency failure). Process-exit-on-bad-config is preserved —
+/// `runtime.json` is part of the immutable image and a malformed
+/// file is a build bug.
+fn init_warm_pool(boot_state: &Arc<AgentBootState>) {
     let result: Option<Arc<WorkerPool>> = match runtime_config::load() {
-        Ok(None) => None,
+        Ok(None) => {
+            boot_state.set_warm_pool(ComponentState::Disabled);
+            None
+        }
         Ok(Some(rc)) => match rc.concurrency {
-            None => None,
-            Some(ConcurrencyConfig::WarmProcess(wp)) => match VALIDATED_ENTRYPOINT.get() {
-                Some(Ok(entry)) => match entry.try_clone() {
-                    Ok(cloned) => match WorkerPool::start(wp, Arc::new(cloned), Vec::new()) {
-                        Ok(pool) => {
-                            // Plan 73 Followup E: run the baked
-                            // `after_start.sh` readiness probe before
-                            // letting traffic in. Pool starts in
-                            // `NotReady`; `wait_for_ready` flips it
-                            // on success, leaves it `NotReady` on
-                            // timeout/exec error so subsequent
-                            // dispatches fast-fail with `NotReady`
-                            // (host surface: Busy + "warming up"
-                            // message) rather than hitting an
-                            // unwarmed wrapper.
-                            wait_for_after_start(&pool);
-                            Some(pool)
-                        }
+            None => {
+                boot_state.set_warm_pool(ComponentState::Disabled);
+                None
+            }
+            Some(ConcurrencyConfig::WarmProcess(wp)) => {
+                boot_state.set_warm_pool(ComponentState::Starting);
+                match VALIDATED_ENTRYPOINT.get() {
+                    Some(Ok(entry)) => match entry.try_clone() {
+                        Ok(cloned) => match WorkerPool::start(wp, Arc::new(cloned), Vec::new()) {
+                            Ok(pool) => {
+                                // Plan 73 Followup E: run the baked
+                                // `after_start.sh` readiness probe before
+                                // letting traffic in. Pool starts in
+                                // `NotReady`; `wait_for_ready` flips it
+                                // on success, leaves it `NotReady` on
+                                // timeout/exec error so subsequent
+                                // dispatches fast-fail with `NotReady`
+                                // (host surface: Busy + "warming up"
+                                // message) rather than hitting an
+                                // unwarmed wrapper.
+                                wait_for_after_start(&pool);
+                                boot_state.set_warm_pool(ComponentState::Ready);
+                                Some(pool)
+                            }
+                            Err(e) => {
+                                eprintln!(
+                                    "mvm-guest-agent: warm-process pool start failed: {e}; refusing to boot"
+                                );
+                                std::process::exit(1);
+                            }
+                        },
                         Err(e) => {
                             eprintln!(
-                                "mvm-guest-agent: warm-process pool start failed: {e}; refusing to boot"
+                                "mvm-guest-agent: warm-process configured but entrypoint clone failed: {e}; refusing to boot"
                             );
                             std::process::exit(1);
                         }
                     },
-                    Err(e) => {
-                        eprintln!(
-                            "mvm-guest-agent: warm-process configured but entrypoint clone failed: {e}; refusing to boot"
-                        );
-                        std::process::exit(1);
+                    _ => {
+                        // Entrypoint validation failed; surface a
+                        // matching warm-pool failure rather than
+                        // process-exit. Plan 76 Phase 2: keep the
+                        // control plane up so `ReadinessStatus`
+                        // can report both failures together.
+                        boot_state.set_warm_pool(ComponentState::Failed {
+                            message: "entrypoint validation failed".to_string(),
+                        });
+                        None
                     }
-                },
-                _ => {
-                    eprintln!(
-                        "mvm-guest-agent: warm-process configured but entrypoint validation failed; refusing to boot"
-                    );
-                    std::process::exit(1);
                 }
-            },
+            }
         },
         Err(e) => {
             eprintln!("mvm-guest-agent: invalid /etc/mvm/runtime.json: {e}; refusing to boot");
@@ -1348,6 +1576,71 @@ fn wait_for_after_start(pool: &Arc<WorkerPool>) {
                  dispatches will surface NotReady until manual intervention"
             );
         }
+    }
+}
+
+/// Scan `/etc/mvm/integrations.d/*.json`, populate
+/// `integration_state` with the discovered entries, and spawn the
+/// health-check loop iff at least one integration was loaded. Plan
+/// 76 Phase 3 — runs on its own background thread so a slow or
+/// malformed drop-in cannot delay the accept loop.
+///
+/// Transitions in `AgentBootState`:
+///   `Starting` → `Ready`    (≥ 1 integration loaded; health loop spawned)
+///   `Starting` → `Disabled` (no integrations declared)
+///
+/// `Failed` is not currently produced — `load_dropin_dir` is
+/// best-effort per-file (a malformed JSON file is skipped with a
+/// stderr log; the rest still load). That matches Phase 3's
+/// "malformed integration drop-in does not kill control-plane
+/// readiness" acceptance criterion.
+fn init_integrations(
+    boot_state: &Arc<AgentBootState>,
+    integration_state: &Arc<Mutex<IntegrationState>>,
+) {
+    boot_state.set_integrations(ComponentState::Starting);
+    let entries = integrations::load_dropin_dir(integrations::INTEGRATIONS_DROPIN_DIR);
+    let count = entries.len();
+    if let Ok(mut s) = integration_state.lock() {
+        s.integrations = entries
+            .into_iter()
+            .map(|e| IntegrationHealth {
+                entry: e,
+                last_result: None,
+            })
+            .collect();
+    }
+    if count > 0 {
+        boot_state.set_integrations(ComponentState::Ready);
+        let health_state = Arc::clone(integration_state);
+        std::thread::spawn(move || integration_health_loop(health_state));
+    } else {
+        boot_state.set_integrations(ComponentState::Disabled);
+    }
+}
+
+/// Scan `/etc/mvm/probes.d/*.json`, populate `probe_state` with the
+/// discovered entries, and spawn the probe loop iff at least one
+/// probe was loaded. Mirrors `init_integrations`. Plan 76 Phase 3.
+fn init_probes(boot_state: &Arc<AgentBootState>, probe_state: &Arc<Mutex<ProbeState>>) {
+    boot_state.set_probes(ComponentState::Starting);
+    let entries = probes::load_probe_dropin_dir(probes::PROBES_DROPIN_DIR);
+    let count = entries.len();
+    if let Ok(mut s) = probe_state.lock() {
+        s.probes = entries
+            .into_iter()
+            .map(|e| ProbeHealth {
+                entry: e,
+                last_result: None,
+            })
+            .collect();
+    }
+    if count > 0 {
+        boot_state.set_probes(ComponentState::Ready);
+        let health_state = Arc::clone(probe_state);
+        std::thread::spawn(move || probe_health_loop(health_state));
+    } else {
+        boot_state.set_probes(ComponentState::Disabled);
     }
 }
 
@@ -1695,7 +1988,7 @@ fn handle_client(
     state: &Arc<Mutex<AgentState>>,
     integration_state: &Arc<Mutex<IntegrationState>>,
     probe_state: &Arc<Mutex<ProbeState>>,
-    boot_at: std::time::Instant,
+    boot_state: &Arc<AgentBootState>,
 ) {
     // SAFETY: fd comes from accept and is a valid file descriptor owned by this function.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -1745,6 +2038,27 @@ fn handle_client(
             }
         }
     };
+
+    let active_profile = boot_state.profile;
+    let boot_at = boot_state.boot_at;
+
+    // Plan 76 Phase 1: profile gate. Reject dev-only verbs in
+    // sealed-prod *before* the per-variant handler runs. The gate
+    // returns a typed `UnsupportedInProfile` response so an SDK
+    // can branch on capability without parsing message text — this
+    // sits at the protocol layer in addition to the per-handler
+    // policy checks (ADR-002 "Dispatcher allowlists are not enough
+    // by themselves") and the `#[cfg(feature = "dev-shell")]`
+    // compile-time symbol-absence gate for `do_exec` / `do_run_code`
+    // (ADR-002 §W4.3, claim 4).
+    if !req.allowed_in(active_profile) {
+        let resp = GuestResponse::UnsupportedInProfile {
+            profile: active_profile,
+            verb: req.verb_name().to_string(),
+        };
+        write_response(&mut file, &resp);
+        return;
+    }
 
     let resp = match req {
         // The hello-prelude loop above guarantees `req` is not a
@@ -1866,7 +2180,23 @@ fn handle_client(
         GuestRequest::RunEntrypoint {
             stdin,
             timeout_secs,
-        } => handle_run_entrypoint(&mut file, stdin, timeout_secs),
+        } => {
+            // Plan 76 Phase 2: distinguish "validation hasn't
+            // completed yet" (Starting → NotReady, transient) from
+            // "validation failed" (Failed → EntrypointInvalid,
+            // terminal). Snapshot once so the decision is consistent
+            // even if a concurrent background-thread update flips
+            // state mid-handler.
+            if matches!(boot_state.snapshot().entrypoint, ComponentState::Starting) {
+                GuestResponse::EntrypointEvent(EntrypointEvent::Error {
+                    kind: RunEntrypointError::NotReady,
+                    message: "entrypoint validation in progress; poll ReadinessStatus and retry"
+                        .to_string(),
+                })
+            } else {
+                handle_run_entrypoint(&mut file, stdin, timeout_secs)
+            }
+        }
 
         GuestRequest::FsDiff => {
             // Walk the overlay upper dir to find changes since boot.
@@ -1974,12 +2304,22 @@ fn handle_client(
                 path: None,
                 detail: Some(msg.clone()),
             },
+            // Plan 76 Phase 2: with background init, `None` means
+            // validation is still running, not "never ran".
             None => GuestResponse::EntrypointStatusReport {
                 ok: false,
                 path: None,
-                detail: Some("entrypoint validation never ran".to_string()),
+                detail: Some("entrypoint validation in progress".to_string()),
             },
         },
+
+        // Plan 76 Phase 2: structured readiness snapshot. Cheap —
+        // a single mutex lock + struct copy. Designed to be the
+        // verb a host polls during `mvmctl wait <vm> --for ...`
+        // without back-pressure on the rest of the agent.
+        GuestRequest::ReadinessStatus => {
+            GuestResponse::ReadinessStatusReport(boot_state.snapshot())
+        }
 
         // FS RPC verbs (W1 / A1). Production-safe surface backed
         // by `mvm_guest::fs_rpc::handle_with_defaults`: every path
@@ -2332,27 +2672,29 @@ fn run_port_forwarder(vsock_port: u32, tcp_port: u16) {
 fn main() {
     let cfg = parse_config();
 
+    // Plan 76 Phase 1: resolve the active vsock profile from the
+    // baked image config. The policy file lives on a dm-verity rootfs
+    // for sealed-prod images (ADR-002 §W3), so its `profile` field
+    // can't be widened at runtime — flipping it would break the
+    // verity hash and the kernel panics in `mvm-verity-init` before
+    // userspace. Absence of `/etc/mvm/security.json` is treated as an
+    // unprovisioned dev image (`SecurityPolicy::dev_defaults`).
+    let active_profile = mvm_guest::builder_agent::load_security_policy()
+        .ok()
+        .flatten()
+        .map(|p| p.profile)
+        .unwrap_or_else(|| mvm_core::security::SecurityPolicy::dev_defaults().profile);
+    eprintln!("mvm-guest-agent: profile={:?}", active_profile);
+
     eprintln!(
         "mvm-guest-agent: starting on vsock port {} (threshold={}, interval={}s)",
         cfg.port, cfg.busy_threshold, cfg.sample_interval_secs
     );
 
-    // ADR-007 / plan 41 W2: validate `/etc/mvm/entrypoint` once at boot.
-    // Failures are non-fatal — only `RunEntrypoint` requests degrade.
-    init_entrypoint_validation();
-
-    // Plan 43: stand up the warm-process worker pool if mvmforge's
-    // /etc/mvm/runtime.json opts in. Must run AFTER
-    // `init_entrypoint_validation` since the pool spawns workers
-    // from the validated FD. Fail-loud on a misconfigured runtime.json.
-    init_warm_pool();
-
-    // Plan 44: wire SIGTERM/SIGINT handlers so a manual `kill -TERM`
-    // (or future hot-reload / operator-driven shutdown) drains the
-    // warm-process pool cleanly before the process exits. On a
-    // typical microVM teardown the kernel goes away faster than
-    // userspace can run handlers; this matters mostly when an
-    // operator targets the agent specifically.
+    // Plan 76 Phase 2: install signal handlers BEFORE vsock bind +
+    // background init. Same handlers fire whether we're mid-warmup
+    // or steady-state; better to wire them up before any work that
+    // might want clean teardown.
     install_signal_handlers();
 
     // SAFETY: libc call, arguments are constant values.
@@ -2398,6 +2740,38 @@ fn main() {
     // Record boot time for startup grace period tracking.
     let boot_at = std::time::Instant::now();
 
+    // Plan 76 Phase 2: shared readiness state. Created AFTER vsock
+    // bind+listen so `mark_vsock_bound` stamps an accurate
+    // `vsock_bound_ms`. Cloned into every handler thread via
+    // `Arc::clone` — the inner Mutex serialises the few writes
+    // (`set_entrypoint`, `set_warm_pool`, …) without measurable
+    // contention because writes only fire at boot completion events.
+    let boot_state = Arc::new(AgentBootState::new(active_profile, boot_at));
+    boot_state.mark_vsock_bound();
+    eprintln!(
+        "mvm-guest-agent: control plane ready ({}ms)",
+        boot_state
+            .snapshot()
+            .boot_millis
+            .vsock_bound_ms
+            .unwrap_or(0)
+    );
+
+    // Plan 76 Phase 2: defer entrypoint validation + warm-pool
+    // startup to a background thread chained in dependency order
+    // (warm pool reads `VALIDATED_ENTRYPOINT.get()`, so the sequence
+    // must stay serial inside this one thread). The accept loop
+    // below begins serving `Ping` / `ReadinessStatus` /
+    // `EntrypointStatus` immediately; `RunEntrypoint` returns
+    // `NotReady` until the entrypoint flips to `Ready`.
+    {
+        let bs = Arc::clone(&boot_state);
+        std::thread::spawn(move || {
+            init_entrypoint_validation(&bs);
+            init_warm_pool(&bs);
+        });
+    }
+
     // Start background monitoring thread.
     let state = Arc::new(Mutex::new(AgentState::new()));
     let monitor_state = Arc::clone(&state);
@@ -2408,46 +2782,34 @@ fn main() {
     HOT_SAMPLE_INTERVAL_SECS.store(cfg.sample_interval_secs, Ordering::Release);
     std::thread::spawn(move || monitoring_loop(monitor_state));
 
-    // Scan drop-in integrations and start health check thread.
-    let entries = integrations::load_dropin_dir(integrations::INTEGRATIONS_DROPIN_DIR);
-    let integration_count = entries.len();
+    // Plan 76 Phase 3: defer integration drop-in scanning + health
+    // loop startup to a dedicated background thread. The scan
+    // itself is fast (single directory read), but moving it off the
+    // bind-to-accept critical path also means a malformed drop-in
+    // can't bubble a panic into the boot sequence.
     let integration_state = Arc::new(Mutex::new(IntegrationState {
-        integrations: entries
-            .into_iter()
-            .map(|e| IntegrationHealth {
-                entry: e,
-                last_result: None,
-            })
-            .collect(),
+        integrations: Vec::new(),
     }));
-    if integration_count > 0 {
-        let health_state = Arc::clone(&integration_state);
-        std::thread::spawn(move || integration_health_loop(health_state));
+    {
+        let bs = Arc::clone(&boot_state);
+        let s = Arc::clone(&integration_state);
+        std::thread::spawn(move || init_integrations(&bs, &s));
     }
 
-    // Scan drop-in probes and start probe execution thread.
-    let probe_entries = probes::load_probe_dropin_dir(probes::PROBES_DROPIN_DIR);
-    let probe_count = probe_entries.len();
-    let probe_state = Arc::new(Mutex::new(ProbeState {
-        probes: probe_entries
-            .into_iter()
-            .map(|e| ProbeHealth {
-                entry: e,
-                last_result: None,
-            })
-            .collect(),
-    }));
-    if probe_count > 0 {
-        let health_probe_state = Arc::clone(&probe_state);
-        std::thread::spawn(move || probe_health_loop(health_probe_state));
+    // Same shape for the probe drop-in scan + loop. Plan 76 Phase 3.
+    let probe_state = Arc::new(Mutex::new(ProbeState { probes: Vec::new() }));
+    {
+        let bs = Arc::clone(&boot_state);
+        let s = Arc::clone(&probe_state);
+        std::thread::spawn(move || init_probes(&bs, &s));
     }
 
     // Port forwarders are started on-demand via StartPortForward requests
     // from the host (works with all backends, no config drive needed).
 
     eprintln!(
-        "mvm-guest-agent: listening on vsock port {} ({} integrations, {} probes)",
-        cfg.port, integration_count, probe_count
+        "mvm-guest-agent: listening on vsock port {} (entrypoint, warm pool, integrations, probes initializing in background)",
+        cfg.port
     );
 
     // Plan 43: when warm-process is active, real concurrency from
@@ -2464,7 +2826,12 @@ fn main() {
     // returns < 0, which already triggers the bottom-of-loop check).
     // Once the flag flips, break out and drain via
     // `shutdown_subsystems`.
-    let warm_active = matches!(WARM_POOL.get(), Some(Some(_)));
+    // Plan 76 Phase 2: `warm_active` is now re-evaluated per
+    // iteration. The background init thread populates `WARM_POOL`
+    // some time after the accept loop starts, so a one-shot capture
+    // at loop entry would mis-classify all subsequent connections
+    // as cold-tier. `WARM_POOL.get()` is a relaxed atomic load —
+    // cheap enough to do per-accept.
     loop {
         if SHUTDOWN_REQUESTED.load(Ordering::Acquire) {
             break;
@@ -2493,15 +2860,20 @@ fn main() {
             // next iteration's compare_exchange.
             continue;
         }
+        // Plan 76 Phase 2: stamp first-accept timing once. Idempotent
+        // inside `AgentBootState` — subsequent calls are no-ops.
+        boot_state.mark_first_accept();
+        let warm_active = matches!(WARM_POOL.get(), Some(Some(_)));
         if warm_active {
             let state = Arc::clone(&state);
             let integration_state = Arc::clone(&integration_state);
             let probe_state = Arc::clone(&probe_state);
+            let bs = Arc::clone(&boot_state);
             std::thread::spawn(move || {
-                handle_client(cfd, &state, &integration_state, &probe_state, boot_at);
+                handle_client(cfd, &state, &integration_state, &probe_state, &bs);
             });
         } else {
-            handle_client(cfd, &state, &integration_state, &probe_state, boot_at);
+            handle_client(cfd, &state, &integration_state, &probe_state, &boot_state);
         }
     }
 
@@ -2742,7 +3114,14 @@ mod tests {
             integrations: vec![],
         }));
         let probe_state = Arc::new(Mutex::new(ProbeState { probes: vec![] }));
-        let boot_at = std::time::Instant::now();
+        // Plan 76 Phase 2: handle_client now takes `&Arc<AgentBootState>`
+        // (carrying profile + boot_at + readiness) instead of a bare
+        // boot_at + active_profile.
+        let boot_state = Arc::new(AgentBootState::new(
+            AgentProfile::Dev,
+            std::time::Instant::now(),
+        ));
+        boot_state.mark_vsock_bound();
 
         let handle = std::thread::spawn(move || {
             handle_client(
@@ -2750,7 +3129,7 @@ mod tests {
                 &state,
                 &integration_state,
                 &probe_state,
-                boot_at,
+                &boot_state,
             );
         });
 
@@ -2799,7 +3178,11 @@ mod tests {
             integrations: vec![],
         }));
         let probe_state = Arc::new(Mutex::new(ProbeState { probes: vec![] }));
-        let boot_at = std::time::Instant::now();
+        let boot_state = Arc::new(AgentBootState::new(
+            AgentProfile::Dev,
+            std::time::Instant::now(),
+        ));
+        boot_state.mark_vsock_bound();
 
         let handle = std::thread::spawn(move || {
             handle_client(
@@ -2807,7 +3190,7 @@ mod tests {
                 &state,
                 &integration_state,
                 &probe_state,
-                boot_at,
+                &boot_state,
             );
         });
 
@@ -3062,5 +3445,93 @@ mod tests {
         assert_eq!(SHUTDOWN_HOOK_POLL, Duration::from_millis(200));
         assert_eq!(AFTER_START_HOOK, "/etc/mvm/hooks/after_start.sh");
         assert_eq!(BEFORE_STOP_HOOK, "/etc/mvm/hooks/before_stop.sh");
+    }
+
+    // ─── Plan 76 Phase 2 / Phase 3 — AgentBootState transitions ────
+
+    fn fresh_boot_state() -> AgentBootState {
+        AgentBootState::new(AgentProfile::SealedProd, std::time::Instant::now())
+    }
+
+    #[test]
+    fn boot_state_starts_with_starting_control_plane_and_entrypoint() {
+        let s = fresh_boot_state().snapshot();
+        assert_eq!(s.control_plane, ComponentState::Starting);
+        assert_eq!(s.entrypoint, ComponentState::Starting);
+        // Optional subsystems default to Disabled — they only flip
+        // to Starting when their background init thread actually runs.
+        assert_eq!(s.warm_pool, ComponentState::Disabled);
+        assert_eq!(s.integrations, ComponentState::Disabled);
+        assert_eq!(s.probes, ComponentState::Disabled);
+        assert_eq!(s.volumes, ComponentState::Disabled);
+    }
+
+    #[test]
+    fn mark_vsock_bound_flips_control_plane_to_ready_and_stamps_timing() {
+        let bs = fresh_boot_state();
+        bs.mark_vsock_bound();
+        let s = bs.snapshot();
+        assert_eq!(s.control_plane, ComponentState::Ready);
+        assert!(s.boot_millis.vsock_bound_ms.is_some());
+        assert!(s.boot_millis.agent_started_ms.is_some());
+    }
+
+    #[test]
+    fn set_entrypoint_ready_stamps_entrypoint_ready_ms_once() {
+        let bs = fresh_boot_state();
+        bs.set_entrypoint(ComponentState::Ready);
+        let t1 = bs.snapshot().boot_millis.entrypoint_ready_ms;
+        assert!(t1.is_some());
+        // A later transition (e.g. PostRestore reset) must not
+        // overwrite the original timing — readers polling for
+        // cold-path stats want the FIRST ready time, not the most
+        // recent.
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        bs.set_entrypoint(ComponentState::Failed {
+            message: "synthetic".to_string(),
+        });
+        let t2 = bs.snapshot().boot_millis.entrypoint_ready_ms;
+        assert_eq!(t1, t2);
+    }
+
+    #[test]
+    fn set_integrations_starting_then_ready_stamps_timing() {
+        let bs = fresh_boot_state();
+        // Phase 3 helpers go through Starting first; only that path
+        // should stamp the timing. A direct Disabled → Disabled
+        // transition must NOT stamp.
+        bs.set_integrations(ComponentState::Disabled);
+        assert!(bs.snapshot().boot_millis.integrations_ready_ms.is_none());
+
+        bs.set_integrations(ComponentState::Starting);
+        assert!(bs.snapshot().boot_millis.integrations_ready_ms.is_none());
+
+        bs.set_integrations(ComponentState::Ready);
+        assert!(bs.snapshot().boot_millis.integrations_ready_ms.is_some());
+    }
+
+    #[test]
+    fn set_integrations_starting_then_disabled_also_stamps() {
+        // Empty drop-in dir: the background thread enters Starting,
+        // scans, finds nothing, and flips to Disabled. That's still
+        // a meaningful "scan completed" event — stamp the time so
+        // a host can see cold-path latency includes the no-op scan.
+        let bs = fresh_boot_state();
+        bs.set_integrations(ComponentState::Starting);
+        bs.set_integrations(ComponentState::Disabled);
+        assert!(bs.snapshot().boot_millis.integrations_ready_ms.is_some());
+    }
+
+    #[test]
+    fn set_warm_pool_only_stamps_after_first_starting_transition() {
+        let bs = fresh_boot_state();
+        // Initial Disabled (Default) → Disabled (cold-tier image,
+        // no warm-pool config). No Starting in between → no stamp.
+        bs.set_warm_pool(ComponentState::Disabled);
+        assert!(bs.snapshot().boot_millis.warm_pool_ready_ms.is_none());
+
+        bs.set_warm_pool(ComponentState::Starting);
+        bs.set_warm_pool(ComponentState::Ready);
+        assert!(bs.snapshot().boot_millis.warm_pool_ready_ms.is_some());
     }
 }

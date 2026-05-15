@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use mvm_core::security::{
-    AuthenticatedFrame, PROTOCOL_VERSION_AUTHENTICATED, SessionHello, SessionHelloAck,
+    AgentProfile, AuthenticatedFrame, PROTOCOL_VERSION_AUTHENTICATED, SessionHello, SessionHelloAck,
 };
 use mvm_core::signing::SignedPayload;
 use serde::{Deserialize, Serialize};
@@ -170,6 +170,22 @@ pub enum GuestRequest {
     /// can actually serve `RunEntrypoint`. ADR-007 / plan 41 W5.
     /// Prod-safe — reveals no secrets, takes no inputs.
     EntrypointStatus,
+
+    /// Query structured readiness across every guest subsystem
+    /// (control plane, entrypoint, warm pool, integrations, probes,
+    /// volumes) plus per-phase boot timings. Plan 76 Phase 2.
+    ///
+    /// Prod-safe — the response carries no secrets and reveals only
+    /// state the host already chose to provision (via image config /
+    /// drop-in files). Designed to be the verb that responds first
+    /// after vsock bind, so a host can begin streaming progress UX
+    /// before entrypoint validation or warm-pool warmup finish.
+    ///
+    /// Distinct from `EntrypointStatus` (which is entrypoint-only and
+    /// returns a flat `EntrypointStatusReport`): `ReadinessStatus`
+    /// reports the *full* boot phase set with `ComponentState` per
+    /// component, and is intended to be polled (`mvmctl wait`).
+    ReadinessStatus,
 
     // ========================================================================
     // Filesystem RPC (W1 / A1 of the filesystem-volumes plan).
@@ -406,6 +422,274 @@ fn default_true() -> bool {
     true
 }
 
+// ============================================================================
+// Readiness model (plan 76 Phase 2)
+// ============================================================================
+
+/// State of a single guest subsystem during boot.
+///
+/// `Disabled` is distinct from `Ready` — a missing optional subsystem
+/// (no integrations declared, no warm pool configured, no probes
+/// registered) reports `Disabled`, while a present-and-warmed
+/// subsystem reports `Ready`. This lets the host UX distinguish
+/// "the workload doesn't use X" from "X is still warming".
+///
+/// `Default` is `Disabled` — the most-conservative semantically
+/// correct value (= "this subsystem isn't configured"). Lets
+/// constructors of `ReadinessReport` use `..Default::default()` to
+/// elide subsystems they don't care about in tests / fixtures.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum ComponentState {
+    /// Subsystem is not configured for this image (no policy → no
+    /// state machine to advance). Wire-stable distinct from `Ready`.
+    #[default]
+    Disabled,
+    /// Subsystem is initializing in the background.
+    Starting,
+    /// Subsystem is up and accepting work.
+    Ready,
+    /// Subsystem failed to initialize. `message` is a short human-
+    /// readable reason; no secrets / paths beyond what the host
+    /// already knows.
+    Failed {
+        /// Short human-readable failure reason. Stable enough for an
+        /// operator to recognise, not a structured cause — pair with
+        /// stderr logs for diagnosis.
+        message: String,
+    },
+}
+
+/// Per-phase monotonic boot timings in milliseconds since the agent
+/// process started.
+///
+/// Plan 76 Phase 4 fills in the full per-phase set. Phase 2 wires
+/// `agent_started_ms`, `vsock_bound_ms`, `first_accept_ms`, and
+/// `entrypoint_ready_ms` so callers can already display the cold-path
+/// timing breakdown. Fields populated by Phase 4 (`warm_pool_ready_ms`,
+/// `integrations_ready_ms`, `probes_ready_ms`) stay `None` for now.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BootTimingReport {
+    /// Milliseconds from agent process start to vsock bind/listen.
+    /// Always present once the agent has bound — this number is the
+    /// dominant signal for early-readiness regressions.
+    pub agent_started_ms: Option<u64>,
+    /// Milliseconds from agent start to a successful `bind+listen`
+    /// pair on the control port. Same anchor as `agent_started_ms`
+    /// today; reserved for diverging if a future Phase 4 refactor
+    /// splits "process started" from "socket created".
+    pub vsock_bound_ms: Option<u64>,
+    /// Milliseconds from agent start to the first accepted host
+    /// connection. `None` until the first `accept()` returns.
+    pub first_accept_ms: Option<u64>,
+    /// Milliseconds from agent start to `entrypoint = Ready` (or
+    /// `Failed`). `None` while still `Starting`.
+    pub entrypoint_ready_ms: Option<u64>,
+    /// Filled in by Phase 4. `None` for now.
+    pub warm_pool_ready_ms: Option<u64>,
+    /// Filled in by Phase 4. `None` for now.
+    pub integrations_ready_ms: Option<u64>,
+    /// Filled in by Phase 4. `None` for now.
+    pub probes_ready_ms: Option<u64>,
+}
+
+/// Snapshot of agent readiness at the moment of a `ReadinessStatus`
+/// call.
+///
+/// Plan 76 Phase 2 §"Early control-plane readiness". Used by host
+/// callers (`mvmctl wait`, `mvmctl up --timings`, `mvmctl doctor`)
+/// to distinguish:
+///
+/// - "control plane is up, workload not yet warm" → invoke would
+///   block; the host can stream progress to the user
+/// - "entrypoint validation failed" → invoke would fail fast with
+///   a typed error; the host can surface the validation message
+/// - "optional subsystem failed" → invoke is still safe; the host
+///   surfaces a warning
+///
+/// `Default` composes the `Default` impls of each field — every
+/// component is `Disabled`, the profile is `SealedProd`, all
+/// timings are `None`. Tests and fixtures can construct partial
+/// reports with `..Default::default()`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessReport {
+    /// Vsock listener bound and accepting. Always `Ready` if the
+    /// agent could respond at all.
+    pub control_plane: ComponentState,
+    /// `/etc/mvm/entrypoint` validation result. Gates `RunEntrypoint`
+    /// — a request submitted while `Starting` returns
+    /// `RunEntrypointError::NotReady`.
+    pub entrypoint: ComponentState,
+    /// Warm-process pool readiness. `Disabled` for cold-tier images;
+    /// `Ready` once the `after_start.sh` probe passes.
+    pub warm_pool: ComponentState,
+    /// Drop-in integration scan + health loop. `Disabled` if no
+    /// `/etc/mvm/integrations.d/*.json` files present.
+    pub integrations: ComponentState,
+    /// Drop-in probe scan + probe loop. `Disabled` if no
+    /// `/etc/mvm/probes.d/*.json` files present.
+    pub probes: ComponentState,
+    /// Volume-mount state — wire-stable placeholder. `Disabled` in
+    /// v1 (mount/unmount are on-demand verbs, not boot state).
+    pub volumes: ComponentState,
+    /// Active agent profile. Same value the dispatcher uses for the
+    /// `allowed_in` gate.
+    pub profile: AgentProfile,
+    /// Per-phase monotonic timings.
+    pub boot_millis: BootTimingReport,
+}
+
+// ============================================================================
+// Profile classifier (plan 76 Phase 1)
+// ============================================================================
+
+/// Coarse profile-eligibility class for each `GuestRequest` variant.
+///
+/// Wire types are compiled into every agent build; this classifier
+/// is the dispatcher-side gate that rejects out-of-profile verbs
+/// *before* the per-variant handler runs. See ADR-002 §W4.3 for the
+/// complementary compile-time symbol-absence story (`do_exec`,
+/// `do_run_code`, process RPC handlers gated by `dev-shell`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RequestClass {
+    /// Allowed under `SealedProd` and `Dev` profiles. Includes the
+    /// lifecycle, entrypoint-status, sleep/wake, mount-volume, and
+    /// idle-timeout verbs. Sub-policies (mount path, idle timeout
+    /// scope) are enforced inside the handler.
+    ProdSafe,
+    /// Allowed only under `Dev`. Process RPC, filesystem RPC, console,
+    /// port forwarding, shell exec, code eval.
+    DevOnly,
+    /// Allowed only under `Builder`. No current `GuestRequest`
+    /// variant is `BuilderOnly`; the variant is reserved for forward
+    /// compatibility when builder-specific verbs land on the tenant
+    /// wire.
+    BuilderOnly,
+}
+
+impl GuestRequest {
+    /// Stable string name for the verb, used in audit logs and the
+    /// `UnsupportedInProfile` rejection response. Wire-stable —
+    /// renaming a verb is a breaking change.
+    pub fn verb_name(&self) -> &'static str {
+        match self {
+            GuestRequest::ProtocolHello { .. } => "ProtocolHello",
+            GuestRequest::WorkerStatus => "WorkerStatus",
+            GuestRequest::SleepPrep { .. } => "SleepPrep",
+            GuestRequest::Wake => "Wake",
+            GuestRequest::Ping => "Ping",
+            GuestRequest::IntegrationStatus => "IntegrationStatus",
+            GuestRequest::CheckpointIntegrations { .. } => "CheckpointIntegrations",
+            GuestRequest::ProbeStatus => "ProbeStatus",
+            GuestRequest::Exec { .. } => "Exec",
+            GuestRequest::RunEntrypoint { .. } => "RunEntrypoint",
+            GuestRequest::PostRestore => "PostRestore",
+            GuestRequest::FsDiff => "FsDiff",
+            GuestRequest::StartPortForward { .. } => "StartPortForward",
+            GuestRequest::ConsoleOpen { .. } => "ConsoleOpen",
+            GuestRequest::ConsoleClose { .. } => "ConsoleClose",
+            GuestRequest::ConsoleResize { .. } => "ConsoleResize",
+            GuestRequest::EntrypointStatus => "EntrypointStatus",
+            GuestRequest::ReadinessStatus => "ReadinessStatus",
+            GuestRequest::FsRead { .. } => "FsRead",
+            GuestRequest::FsWrite { .. } => "FsWrite",
+            GuestRequest::FsList { .. } => "FsList",
+            GuestRequest::FsStat { .. } => "FsStat",
+            GuestRequest::FsMkdir { .. } => "FsMkdir",
+            GuestRequest::FsRemove { .. } => "FsRemove",
+            GuestRequest::FsMove { .. } => "FsMove",
+            GuestRequest::ProcStart { .. } => "ProcStart",
+            GuestRequest::ProcList => "ProcList",
+            GuestRequest::ProcSignal { .. } => "ProcSignal",
+            GuestRequest::ProcSendInput { .. } => "ProcSendInput",
+            GuestRequest::ProcWait { .. } => "ProcWait",
+            GuestRequest::ProcKill { .. } => "ProcKill",
+            GuestRequest::MountVolume { .. } => "MountVolume",
+            GuestRequest::UnmountVolume { .. } => "UnmountVolume",
+            GuestRequest::UpdateIdleTimeout { .. } => "UpdateIdleTimeout",
+            GuestRequest::RunCode { .. } => "RunCode",
+        }
+    }
+
+    /// Profile class of this request. Exhaustive match — adding a new
+    /// `GuestRequest` variant fails to compile until it is classified.
+    pub fn class(&self) -> RequestClass {
+        match self {
+            // ProdSafe: handshake + lifecycle + status + entrypoint
+            // + sleep/wake + mount-volume + idle-timeout. Volume
+            // mounts are additionally constrained by
+            // `MountPathPolicy` inside the handler — the gate just
+            // lets the verb reach it. `ProtocolHello` MUST be
+            // prod-safe; it's the negotiation that runs before
+            // every other request and a sealed-prod agent that
+            // refuses it would never see another verb.
+            GuestRequest::ProtocolHello { .. }
+            | GuestRequest::WorkerStatus
+            | GuestRequest::SleepPrep { .. }
+            | GuestRequest::Wake
+            | GuestRequest::Ping
+            | GuestRequest::IntegrationStatus
+            | GuestRequest::CheckpointIntegrations { .. }
+            | GuestRequest::ProbeStatus
+            | GuestRequest::RunEntrypoint { .. }
+            | GuestRequest::PostRestore
+            | GuestRequest::EntrypointStatus
+            | GuestRequest::ReadinessStatus
+            | GuestRequest::MountVolume { .. }
+            | GuestRequest::UnmountVolume { .. }
+            | GuestRequest::UpdateIdleTimeout { .. } => RequestClass::ProdSafe,
+
+            // DevOnly: shell exec, process RPC, filesystem RPC,
+            // console, port forwarding, code eval, filesystem diff.
+            // Filesystem reads look benign but can leak secrets and
+            // mounted-volume contents (plan 76 "Read-only filesystem
+            // access can leak secrets"), so the entire filesystem
+            // RPC surface is DevOnly in v1.
+            GuestRequest::Exec { .. }
+            | GuestRequest::FsDiff
+            | GuestRequest::StartPortForward { .. }
+            | GuestRequest::ConsoleOpen { .. }
+            | GuestRequest::ConsoleClose { .. }
+            | GuestRequest::ConsoleResize { .. }
+            | GuestRequest::FsRead { .. }
+            | GuestRequest::FsWrite { .. }
+            | GuestRequest::FsList { .. }
+            | GuestRequest::FsStat { .. }
+            | GuestRequest::FsMkdir { .. }
+            | GuestRequest::FsRemove { .. }
+            | GuestRequest::FsMove { .. }
+            | GuestRequest::ProcStart { .. }
+            | GuestRequest::ProcList
+            | GuestRequest::ProcSignal { .. }
+            | GuestRequest::ProcSendInput { .. }
+            | GuestRequest::ProcWait { .. }
+            | GuestRequest::ProcKill { .. }
+            | GuestRequest::RunCode { .. } => RequestClass::DevOnly,
+        }
+    }
+
+    /// Whether this request is allowed under `profile`.
+    ///
+    /// Profile rules:
+    /// - `SealedProd` allows only `ProdSafe`.
+    /// - `Dev` allows `ProdSafe` and `DevOnly` (a superset).
+    /// - `Builder` allows only `BuilderOnly` — today the builder
+    ///   agent speaks `BuilderRequest`, so `GuestRequest` reaching
+    ///   a `Builder`-profile agent is a configuration error.
+    pub fn allowed_in(&self, profile: AgentProfile) -> bool {
+        matches!(
+            (self.class(), profile),
+            (
+                RequestClass::ProdSafe,
+                AgentProfile::SealedProd | AgentProfile::Dev
+            ) | (RequestClass::DevOnly, AgentProfile::Dev)
+                | (RequestClass::BuilderOnly, AgentProfile::Builder)
+        )
+    }
+}
+
 /// Response from guest vsock agent to host.
 ///
 /// Same `deny_unknown_fields` discipline as `GuestRequest` — a
@@ -444,6 +728,18 @@ pub enum GuestResponse {
     Pong,
     /// Error from guest agent.
     Error { message: String },
+    /// The dispatcher refused this verb because the active
+    /// `AgentProfile` does not allow it (plan 76 Phase 1). Distinct
+    /// from `Error { message }` so SDK callers can branch on
+    /// capability without parsing message text — analogous to
+    /// `ProcErrorKind::UnsupportedInProduction` for process RPC,
+    /// but at the protocol layer rather than per-handler.
+    UnsupportedInProfile {
+        /// Active profile on the agent that rejected the call.
+        profile: AgentProfile,
+        /// `verb_name()` of the rejected request. Wire-stable.
+        verb: String,
+    },
     /// Per-integration status report.
     IntegrationStatusReport {
         integrations: Vec<crate::integrations::IntegrationStateReport>,
@@ -500,6 +796,10 @@ pub enum GuestResponse {
         path: Option<String>,
         detail: Option<String>,
     },
+
+    /// Result of a `ReadinessStatus` query. Plan 76 Phase 2.
+    /// Snapshot of every component plus per-phase timings.
+    ReadinessStatusReport(ReadinessReport),
 
     /// Result of a filesystem RPC call. The single top-level variant
     /// keeps `GuestResponse` from sprawling — the `FsResult` sub-enum
@@ -1031,6 +1331,13 @@ pub enum RunEntrypointError {
     Busy,
     /// The wrapper process died unexpectedly (signal, OOM, etc.).
     WrapperCrashed,
+    /// Entrypoint validation has not yet completed. Plan 76 Phase 2:
+    /// the agent binds vsock early and validates entrypoint in the
+    /// background, so a host that races `RunEntrypoint` ahead of
+    /// `ReadinessStatus { entrypoint: Ready }` gets this back rather
+    /// than `EntrypointInvalid` (which would imply a permanent
+    /// failure). Hosts should poll readiness, not retry blindly.
+    NotReady,
     /// `/etc/mvm/entrypoint` is missing, fails validation
     /// (symlink crossing FS, wrong perms, off the verity
     /// partition), or otherwise can't be loaded. Reported per-call
@@ -2135,6 +2442,7 @@ mod tests {
                 code: "print('hello')".into(),
                 timeout_secs: 30,
             },
+            GuestRequest::ReadinessStatus,
         ];
 
         for req in &variants {
@@ -2176,6 +2484,28 @@ mod tests {
             GuestResponse::Error {
                 message: "oops".to_string(),
             },
+            GuestResponse::UnsupportedInProfile {
+                profile: AgentProfile::SealedProd,
+                verb: "Exec".to_string(),
+            },
+            GuestResponse::ReadinessStatusReport(ReadinessReport {
+                control_plane: ComponentState::Ready,
+                entrypoint: ComponentState::Starting,
+                warm_pool: ComponentState::Disabled,
+                integrations: ComponentState::Disabled,
+                probes: ComponentState::Disabled,
+                volumes: ComponentState::Disabled,
+                profile: AgentProfile::SealedProd,
+                boot_millis: BootTimingReport {
+                    agent_started_ms: Some(5),
+                    vsock_bound_ms: Some(5),
+                    first_accept_ms: Some(8),
+                    entrypoint_ready_ms: None,
+                    warm_pool_ready_ms: None,
+                    integrations_ready_ms: None,
+                    probes_ready_ms: None,
+                },
+            }),
             GuestResponse::IntegrationStatusReport {
                 integrations: vec![IntegrationStateReport {
                     name: "whatsapp".to_string(),
@@ -3978,5 +4308,472 @@ mod tests {
         // This is correct: we verify the guest controls the key it claims.
         let result = host_handle.join().unwrap();
         assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // Plan 76 Phase 1 — profile classifier
+    // ========================================================================
+
+    /// Every `GuestRequest` variant must classify as either `ProdSafe`
+    /// or `DevOnly` today. Compile-fail when a new variant is added
+    /// without being classified — the exhaustive match inside
+    /// `class()` guarantees that, and this test fails closed if the
+    /// variant ever lands in an unexpected class.
+    #[test]
+    fn test_request_class_coverage_matches_sealed_prod_allowlist() {
+        let prod_safe_verbs: &[&str] = &[
+            "ProtocolHello",
+            "WorkerStatus",
+            "SleepPrep",
+            "Wake",
+            "Ping",
+            "IntegrationStatus",
+            "CheckpointIntegrations",
+            "ProbeStatus",
+            "RunEntrypoint",
+            "PostRestore",
+            "EntrypointStatus",
+            "ReadinessStatus",
+            "MountVolume",
+            "UnmountVolume",
+            "UpdateIdleTimeout",
+        ];
+
+        // One representative `GuestRequest` value per variant. Used to
+        // exercise `class()` + `verb_name()` together.
+        let all: Vec<GuestRequest> = vec![
+            GuestRequest::ProtocolHello {
+                host_protocol_version: 1,
+                min_supported_version: 1,
+                host_version: "test".into(),
+                requested_capabilities: vec![],
+            },
+            GuestRequest::WorkerStatus,
+            GuestRequest::SleepPrep {
+                drain_timeout_secs: 0,
+            },
+            GuestRequest::Wake,
+            GuestRequest::Ping,
+            GuestRequest::IntegrationStatus,
+            GuestRequest::CheckpointIntegrations {
+                integrations: vec![],
+            },
+            GuestRequest::ProbeStatus,
+            GuestRequest::Exec {
+                command: "x".into(),
+                stdin: None,
+                timeout_secs: None,
+            },
+            GuestRequest::RunEntrypoint {
+                stdin: vec![],
+                timeout_secs: 1,
+            },
+            GuestRequest::PostRestore,
+            GuestRequest::FsDiff,
+            GuestRequest::StartPortForward { guest_port: 1 },
+            GuestRequest::ConsoleOpen { cols: 1, rows: 1 },
+            GuestRequest::ConsoleClose { session_id: 1 },
+            GuestRequest::ConsoleResize {
+                session_id: 1,
+                cols: 1,
+                rows: 1,
+            },
+            GuestRequest::EntrypointStatus,
+            GuestRequest::ReadinessStatus,
+            GuestRequest::FsRead {
+                path: "/x".into(),
+                offset: None,
+                length: 1,
+                follow_symlinks: true,
+            },
+            GuestRequest::FsWrite {
+                path: "/x".into(),
+                content: vec![],
+                mode: 0,
+                create_parents: false,
+                follow_symlinks: false,
+            },
+            GuestRequest::FsList {
+                path: "/x".into(),
+                follow_symlinks: true,
+            },
+            GuestRequest::FsStat {
+                path: "/x".into(),
+                follow_symlinks: true,
+            },
+            GuestRequest::FsMkdir {
+                path: "/x".into(),
+                mode: 0,
+                parents: false,
+            },
+            GuestRequest::FsRemove {
+                path: "/x".into(),
+                recursive: false,
+                follow_symlinks: false,
+            },
+            GuestRequest::FsMove {
+                from: "/x".into(),
+                to: "/y".into(),
+                follow_symlinks: false,
+            },
+            GuestRequest::ProcStart {
+                argv: vec!["/x".into()],
+                env: Default::default(),
+                cwd: None,
+                stdin: vec![],
+                timeout_secs: None,
+            },
+            GuestRequest::ProcList,
+            GuestRequest::ProcSignal {
+                pid_token: "t".into(),
+                signum: 15,
+            },
+            GuestRequest::ProcSendInput {
+                pid_token: "t".into(),
+                bytes: vec![],
+            },
+            GuestRequest::ProcWait {
+                pid_token: "t".into(),
+                timeout_secs: None,
+            },
+            GuestRequest::ProcKill {
+                pid_token: "t".into(),
+            },
+            GuestRequest::MountVolume {
+                volume_name: "v".into(),
+                guest_path: "/x".into(),
+                read_only: true,
+            },
+            GuestRequest::UnmountVolume {
+                guest_path: "/x".into(),
+                force: false,
+            },
+            GuestRequest::UpdateIdleTimeout { secs: 0 },
+            GuestRequest::RunCode {
+                code: "x".into(),
+                timeout_secs: 1,
+            },
+        ];
+
+        // Every variant has a stable verb_name; that name appears in
+        // exactly one of the two classification buckets.
+        for req in &all {
+            let name = req.verb_name();
+            let in_prod = prod_safe_verbs.contains(&name);
+            match req.class() {
+                RequestClass::ProdSafe => assert!(
+                    in_prod,
+                    "{name}: classified ProdSafe but missing from SealedProd allowlist"
+                ),
+                RequestClass::DevOnly => assert!(
+                    !in_prod,
+                    "{name}: classified DevOnly but present in SealedProd allowlist"
+                ),
+                RequestClass::BuilderOnly => {
+                    panic!("{name}: no GuestRequest variant should be BuilderOnly yet")
+                }
+            }
+        }
+
+        // The allowlist itself stays anchored: every prod-safe verb
+        // shows up in `all` above, so renaming a variant trips this
+        // assertion too.
+        let names: Vec<&'static str> = all.iter().map(|r| r.verb_name()).collect();
+        for v in prod_safe_verbs {
+            assert!(
+                names.contains(v),
+                "SealedProd verb {v} missing from coverage"
+            );
+        }
+    }
+
+    #[test]
+    fn test_sealed_prod_rejects_dev_only_verbs() {
+        let dev_only_samples = [
+            GuestRequest::Exec {
+                command: "x".into(),
+                stdin: None,
+                timeout_secs: None,
+            },
+            GuestRequest::ConsoleOpen { cols: 80, rows: 24 },
+            GuestRequest::ProcStart {
+                argv: vec!["/x".into()],
+                env: Default::default(),
+                cwd: None,
+                stdin: vec![],
+                timeout_secs: None,
+            },
+            GuestRequest::RunCode {
+                code: "print(1)".into(),
+                timeout_secs: 1,
+            },
+            GuestRequest::FsWrite {
+                path: "/x".into(),
+                content: vec![],
+                mode: 0,
+                create_parents: false,
+                follow_symlinks: false,
+            },
+            GuestRequest::FsRead {
+                path: "/x".into(),
+                offset: None,
+                length: 1,
+                follow_symlinks: true,
+            },
+            GuestRequest::StartPortForward { guest_port: 8080 },
+        ];
+
+        for req in &dev_only_samples {
+            assert!(
+                !req.allowed_in(AgentProfile::SealedProd),
+                "{} should be rejected in SealedProd",
+                req.verb_name()
+            );
+            assert!(
+                req.allowed_in(AgentProfile::Dev),
+                "{} should be allowed in Dev",
+                req.verb_name()
+            );
+            assert!(
+                !req.allowed_in(AgentProfile::Builder),
+                "{} should not be allowed in Builder",
+                req.verb_name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_sealed_prod_accepts_prod_safe_verbs() {
+        let prod_safe_samples = [
+            GuestRequest::Ping,
+            GuestRequest::WorkerStatus,
+            GuestRequest::EntrypointStatus,
+            GuestRequest::RunEntrypoint {
+                stdin: vec![],
+                timeout_secs: 60,
+            },
+            GuestRequest::SleepPrep {
+                drain_timeout_secs: 5,
+            },
+            GuestRequest::Wake,
+            GuestRequest::PostRestore,
+            GuestRequest::UpdateIdleTimeout { secs: 600 },
+            GuestRequest::MountVolume {
+                volume_name: "v".into(),
+                guest_path: "/data".into(),
+                read_only: true,
+            },
+            GuestRequest::UnmountVolume {
+                guest_path: "/data".into(),
+                force: false,
+            },
+        ];
+
+        for req in &prod_safe_samples {
+            assert!(
+                req.allowed_in(AgentProfile::SealedProd),
+                "{} should be allowed in SealedProd",
+                req.verb_name()
+            );
+            assert!(
+                req.allowed_in(AgentProfile::Dev),
+                "{} should be allowed in Dev (Dev ⊃ SealedProd)",
+                req.verb_name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_unsupported_in_profile_response_roundtrip() {
+        let resp = GuestResponse::UnsupportedInProfile {
+            profile: AgentProfile::SealedProd,
+            verb: "Exec".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        // kebab-case profile wire format keeps user-facing JSON tidy.
+        assert!(json.contains("\"sealed-prod\""), "got {json}");
+        assert!(json.contains("\"Exec\""), "got {json}");
+
+        let parsed: GuestResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            GuestResponse::UnsupportedInProfile { profile, verb } => {
+                assert_eq!(profile, AgentProfile::SealedProd);
+                assert_eq!(verb, "Exec");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
+    }
+
+    // ========================================================================
+    // Plan 76 Phase 2 — readiness model
+    // ========================================================================
+
+    #[test]
+    fn test_readiness_status_classifies_prod_safe() {
+        // `ReadinessStatus` must respond from sealed-prod images
+        // even before entrypoint validation completes — that's the
+        // whole point of the verb. If a future refactor downgrades
+        // it to DevOnly, this test fails loud.
+        let req = GuestRequest::ReadinessStatus;
+        assert_eq!(req.class(), RequestClass::ProdSafe);
+        assert!(req.allowed_in(AgentProfile::SealedProd));
+        assert!(req.allowed_in(AgentProfile::Dev));
+        assert!(!req.allowed_in(AgentProfile::Builder));
+        assert_eq!(req.verb_name(), "ReadinessStatus");
+    }
+
+    #[test]
+    fn test_component_state_wire_format_is_snake_case() {
+        // Wire format keeps JSON ergonomic for hand-written
+        // policies / mock fixtures.
+        assert_eq!(
+            serde_json::to_string(&ComponentState::Starting).unwrap(),
+            "\"starting\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentState::Ready).unwrap(),
+            "\"ready\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentState::Disabled).unwrap(),
+            "\"disabled\""
+        );
+        let failed_json = serde_json::to_string(&ComponentState::Failed {
+            message: "boom".into(),
+        })
+        .unwrap();
+        assert!(failed_json.contains("\"failed\""), "got {failed_json}");
+        assert!(failed_json.contains("\"boom\""), "got {failed_json}");
+
+        let parsed: ComponentState = serde_json::from_str(&failed_json).unwrap();
+        assert!(matches!(
+            parsed,
+            ComponentState::Failed { ref message } if message == "boom"
+        ));
+    }
+
+    #[test]
+    fn test_readiness_report_roundtrip_with_disabled_subsystems() {
+        // A cold-tier image's readiness snapshot mid-boot: control
+        // plane ready, entrypoint still validating, everything
+        // else `Disabled` (no warm pool, no integrations, no
+        // probes) by virtue of `Default`.
+        let report = ReadinessReport {
+            control_plane: ComponentState::Ready,
+            entrypoint: ComponentState::Starting,
+            boot_millis: BootTimingReport {
+                agent_started_ms: Some(3),
+                vsock_bound_ms: Some(3),
+                first_accept_ms: Some(7),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: ReadinessReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn test_readiness_report_rejects_unknown_fields() {
+        // ADR-002 §W4.1: every host↔guest type must deny unknown
+        // fields. Verify the outer report shape; ComponentState +
+        // BootTimingReport carry their own `deny_unknown_fields`.
+        let json = r#"{
+            "control_plane": "ready",
+            "entrypoint": "starting",
+            "warm_pool": "disabled",
+            "integrations": "disabled",
+            "probes": "disabled",
+            "volumes": "disabled",
+            "profile": "sealed-prod",
+            "boot_millis": {
+                "agent_started_ms": null,
+                "vsock_bound_ms": null,
+                "first_accept_ms": null,
+                "entrypoint_ready_ms": null,
+                "warm_pool_ready_ms": null,
+                "integrations_ready_ms": null,
+                "probes_ready_ms": null
+            },
+            "smuggled": 1
+        }"#;
+        let err = serde_json::from_str::<ReadinessReport>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected unknown-field rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_entrypoint_error_not_ready_roundtrip() {
+        // Plan 76 Phase 2: the typed variant returned when a host
+        // races `RunEntrypoint` ahead of `entrypoint=Ready`.
+        let err = RunEntrypointError::NotReady;
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(json, "\"NotReady\"");
+        let parsed: RunEntrypointError = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, err);
+    }
+
+    #[test]
+    fn test_boot_timing_report_default_is_all_none() {
+        // The skeleton ships with all-`None` so Phase 4 can fill
+        // the remaining fields without breaking the wire shape.
+        let t = BootTimingReport::default();
+        assert!(t.agent_started_ms.is_none());
+        assert!(t.vsock_bound_ms.is_none());
+        assert!(t.first_accept_ms.is_none());
+        assert!(t.entrypoint_ready_ms.is_none());
+        assert!(t.warm_pool_ready_ms.is_none());
+        assert!(t.integrations_ready_ms.is_none());
+        assert!(t.probes_ready_ms.is_none());
+    }
+
+    #[test]
+    fn test_component_state_default_is_disabled() {
+        // "Not configured" is the semantically conservative default.
+        // A subsystem we haven't heard anything about must NOT
+        // accidentally read as `Ready` — that would short-circuit a
+        // host's readiness gate.
+        assert_eq!(ComponentState::default(), ComponentState::Disabled);
+    }
+
+    #[test]
+    fn test_readiness_report_default_is_all_disabled_sealed_prod() {
+        // A bare `ReadinessReport::default()` is what an unconfigured
+        // sealed-prod agent would report. Tests / fixtures that only
+        // care about one or two components can use this + struct-
+        // update syntax instead of listing every field.
+        let r = ReadinessReport::default();
+        assert_eq!(r.control_plane, ComponentState::Disabled);
+        assert_eq!(r.entrypoint, ComponentState::Disabled);
+        assert_eq!(r.warm_pool, ComponentState::Disabled);
+        assert_eq!(r.integrations, ComponentState::Disabled);
+        assert_eq!(r.probes, ComponentState::Disabled);
+        assert_eq!(r.volumes, ComponentState::Disabled);
+        assert_eq!(r.profile, AgentProfile::SealedProd);
+        assert_eq!(r.boot_millis, BootTimingReport::default());
+    }
+
+    #[test]
+    fn test_readiness_report_default_struct_update_ergonomics() {
+        // Demonstrates the intended call-site shape: change one or
+        // two components, default the rest. If the type ever grows a
+        // field this test still compiles — that's the whole point.
+        let r = ReadinessReport {
+            control_plane: ComponentState::Ready,
+            entrypoint: ComponentState::Starting,
+            boot_millis: BootTimingReport {
+                vsock_bound_ms: Some(7),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(r.control_plane, ComponentState::Ready);
+        assert_eq!(r.entrypoint, ComponentState::Starting);
+        assert_eq!(r.warm_pool, ComponentState::Disabled);
+        assert_eq!(r.boot_millis.vsock_bound_ms, Some(7));
+        assert!(r.boot_millis.first_accept_ms.is_none());
     }
 }
