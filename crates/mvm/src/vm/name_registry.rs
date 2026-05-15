@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use mvm_core::domain::instance::InstanceReadiness;
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, HashMap};
 use std::path::{Path, PathBuf};
@@ -46,6 +47,18 @@ pub struct VmRegistration {
     /// W1 / A4.
     #[serde(default)]
     pub paused: bool,
+    /// Finer-grained host-observed readiness (ADR-050 §3 / plan 74
+    /// W2). Updated by `mvmctl up` as each launch milestone is
+    /// reached (`LaunchAccepted` → `AgentConnecting` → `AgentReady`,
+    /// with the rest of the taxonomy wiring in subsequent PRs).
+    /// `None` on legacy records and on VMs that haven't yet been
+    /// touched by a readiness-aware launch path.
+    #[serde(default)]
+    pub readiness: Option<InstanceReadiness>,
+    /// RFC 3339 timestamp of the last `readiness` change. Paired
+    /// with `readiness` — both are `Some` or both are `None`.
+    #[serde(default)]
+    pub last_readiness_change_at: Option<String>,
 }
 
 fn default_auto_resume() -> bool {
@@ -113,6 +126,8 @@ impl VmNameRegistry {
                 expires_at: params.expires_at,
                 auto_resume: params.auto_resume,
                 paused: false,
+                readiness: None,
+                last_readiness_change_at: None,
             },
         );
         Ok(())
@@ -139,6 +154,43 @@ impl VmNameRegistry {
         match self.vms.get_mut(name) {
             Some(reg) => {
                 reg.paused = paused;
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Record a host-observed readiness milestone (ADR-050 §3 /
+    /// plan 74 W2). Returns `Ok(true)` if updated, `Ok(false)` if
+    /// the name is unknown. Updates both `readiness` and
+    /// `last_readiness_change_at` atomically; callers pass the
+    /// timestamp explicitly so test fixtures stay deterministic.
+    pub fn set_readiness(
+        &mut self,
+        name: &str,
+        readiness: InstanceReadiness,
+        now_rfc3339: impl Into<String>,
+    ) -> Result<bool> {
+        match self.vms.get_mut(name) {
+            Some(reg) => {
+                reg.readiness = Some(readiness);
+                reg.last_readiness_change_at = Some(now_rfc3339.into());
+                Ok(true)
+            }
+            None => Ok(false),
+        }
+    }
+
+    /// Clear the readiness signal (record teardown / `mvmctl down`).
+    /// Returns `Ok(true)` if updated, `Ok(false)` if the name is
+    /// unknown. Both `readiness` and `last_readiness_change_at` reset
+    /// to `None` so a torn-down record never carries a stale
+    /// "ServicesReady" ghost.
+    pub fn clear_readiness(&mut self, name: &str) -> Result<bool> {
+        match self.vms.get_mut(name) {
+            Some(reg) => {
+                reg.readiness = None;
+                reg.last_readiness_change_at = None;
                 Ok(true)
             }
             None => Ok(false),
@@ -503,5 +555,106 @@ mod tests {
         assert!(r.tags.is_empty());
         assert!(r.expires_at.is_none());
         assert!(r.auto_resume);
+        // ADR-050 / plan 74 W2 readiness fields default cleanly on
+        // legacy records that pre-date the field. mvm-cli `ls --json`
+        // emits them as `null` on legacy rows.
+        assert_eq!(r.readiness, None);
+        assert_eq!(r.last_readiness_change_at, None);
+    }
+
+    // -------- Readiness milestones (ADR-050 §3 / plan 74 W2) --------
+
+    #[test]
+    fn set_readiness_returns_false_for_unknown_vm() {
+        let mut reg = VmNameRegistry::default();
+        assert!(
+            !reg.set_readiness(
+                "ghost",
+                InstanceReadiness::AgentReady,
+                "2025-01-01T00:00:00Z"
+            )
+            .unwrap()
+        );
+    }
+
+    #[test]
+    fn set_readiness_updates_both_fields_atomically() {
+        let mut reg = VmNameRegistry::default();
+        reg.register("vm1", "/tmp/vm1", "default", None, 0).unwrap();
+        assert_eq!(reg.lookup("vm1").unwrap().readiness, None);
+
+        assert!(
+            reg.set_readiness(
+                "vm1",
+                InstanceReadiness::LaunchAccepted,
+                "2025-01-01T00:00:00Z"
+            )
+            .unwrap()
+        );
+        let r = reg.lookup("vm1").unwrap();
+        assert_eq!(r.readiness, Some(InstanceReadiness::LaunchAccepted));
+        assert_eq!(
+            r.last_readiness_change_at.as_deref(),
+            Some("2025-01-01T00:00:00Z")
+        );
+
+        // Successive transitions overwrite both fields together.
+        assert!(
+            reg.set_readiness("vm1", InstanceReadiness::AgentReady, "2025-01-01T00:00:05Z")
+                .unwrap()
+        );
+        let r = reg.lookup("vm1").unwrap();
+        assert_eq!(r.readiness, Some(InstanceReadiness::AgentReady));
+        assert_eq!(
+            r.last_readiness_change_at.as_deref(),
+            Some("2025-01-01T00:00:05Z")
+        );
+    }
+
+    #[test]
+    fn clear_readiness_resets_both_fields() {
+        let mut reg = VmNameRegistry::default();
+        reg.register("vm1", "/tmp/vm1", "default", None, 0).unwrap();
+        reg.set_readiness("vm1", InstanceReadiness::AgentReady, "2025-01-01T00:00:00Z")
+            .unwrap();
+
+        assert!(reg.clear_readiness("vm1").unwrap());
+        let r = reg.lookup("vm1").unwrap();
+        assert_eq!(r.readiness, None);
+        assert_eq!(r.last_readiness_change_at, None);
+
+        // Clearing an unknown VM returns Ok(false), no error.
+        assert!(!reg.clear_readiness("ghost").unwrap());
+    }
+
+    #[test]
+    fn readiness_roundtrip_through_registry_save_load() {
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("vm-names.json");
+
+        let mut reg = VmNameRegistry::default();
+        reg.register("vm1", "/tmp/vm1", "default", None, 0).unwrap();
+        reg.set_readiness(
+            "vm1",
+            InstanceReadiness::ServicesStarting {
+                pending: vec!["postgres".to_string()],
+            },
+            "2025-01-01T00:00:00Z",
+        )
+        .unwrap();
+        reg.save(&path).unwrap();
+
+        let loaded = VmNameRegistry::load(&path).unwrap();
+        let r = loaded.lookup("vm1").unwrap();
+        assert_eq!(
+            r.readiness,
+            Some(InstanceReadiness::ServicesStarting {
+                pending: vec!["postgres".to_string()]
+            })
+        );
+        assert_eq!(
+            r.last_readiness_change_at.as_deref(),
+            Some("2025-01-01T00:00:00Z")
+        );
     }
 }
