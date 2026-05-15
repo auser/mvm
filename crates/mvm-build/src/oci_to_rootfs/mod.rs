@@ -14,7 +14,13 @@
 //! 4. Caller hands the descriptor to [`materialize_to_ext4`]
 //!    (Linux-only at runtime; W1.5 routes non-Linux through the
 //!    libkrun builder VM per ADR-050), which produces a
-//!    byte-deterministic ext4 image suitable for verity sealing.
+//!    byte-deterministic ext4 image.
+//! 5. Caller hands the [`MaterializedRootfs`] to
+//!    [`seal_with_verity`] (also Linux-only) to generate the
+//!    dm-verity sidecar + root hash that satisfies ADR-050. Two
+//!    runs against byte-identical ext4 input produce
+//!    byte-identical sidecars + the same root hash; this is the
+//!    invariant the per-digest verity cache depends on.
 //!
 //! Layers are assumed to arrive *decompressed*. The caller (W1.5
 //! CLI orchestrator) is responsible for piping fetched layer bytes
@@ -44,7 +50,12 @@ pub mod error;
 pub mod ext4;
 mod path_validation;
 mod unpack;
+pub mod verity;
 
 pub use error::OciUnpackError;
 pub use ext4::{MaterializedRootfs, Mke2fsOptions, estimate_image_size, materialize_to_ext4};
 pub use unpack::{ImageStaging, LayerStats, StagedRootfs, StagingOptions};
+pub use verity::{
+    MVM_VERITY_DATA_BLOCK_SIZE, MVM_VERITY_HASH_ALGORITHM, MVM_VERITY_HASH_BLOCK_SIZE,
+    MVM_VERITY_PINNED_SALT, VeritySealedRootfs, VeritysetupOptions, seal_with_verity,
+};

@@ -97,6 +97,14 @@ pub enum OciUnpackError {
     #[error("mke2fs failed: {reason}")]
     Mke2fsFailed { reason: String },
 
+    /// `veritysetup format` exited non-zero, could not be spawned,
+    /// or produced output that didn't include a parseable
+    /// `Root hash:` line. Plan 74 W1.4a — verity sidecar
+    /// generation per ADR-050. Includes the upstream stderr /
+    /// stdout when present so failures are debuggable.
+    #[error("veritysetup failed: {reason}")]
+    VeritysetupFailed { reason: String },
+
     /// An operation that this crate exposes is not supported on
     /// the current host. ext4 image materialization, for example,
     /// requires Linux + `mke2fs`; on macOS the W1.5 CLI
