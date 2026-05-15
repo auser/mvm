@@ -61,6 +61,7 @@ Recent maintenance:
 - [x] Plan 77 W2: serialized Stage 0 builder VM bootstraps via an `flock(2)` advisory lock at `~/.cache/mvm/builder-vm/stage0.lock` and folded orphan-staging-dir cleanup into `mvmctl cache prune` (with the same lock so the sweep cannot race a live bootstrap).
 - [x] Added source-built builder-cache provenance metadata; source-checkout cache hits now require a non-sensitive provenance summary matching the source fingerprint and artifact filename set, with `missing_provenance` / `provenance_mismatch` diagnostics.
 - [x] Added builder-cache readiness to `mvmctl dev status`; it reports source/release cache readiness and safe reason codes without rebuilding or printing local paths, raw artifact digests, or artifact contents.
+- [x] Added `mvmctl dev cache inspect` with `--json`; it reports sanitized dev-image presence plus source/release builder-cache readiness without rebuilding, booting, or printing local paths, raw artifact digests, or artifact contents.
 - [x] Plan 77 W4: gated `download_builder_vm_image` and its helpers behind the off-by-default `release-artifact-bootstrap` feature so contributor builds cannot reach the published-prebuilt path at compile time, with `perform_builder_vm_download_published_bails_without_feature` locking the structural-failure shape into the test suite.
 
 ## In-flight workstreams

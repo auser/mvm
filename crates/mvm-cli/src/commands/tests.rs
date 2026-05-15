@@ -10,7 +10,7 @@ use clap::Parser;
 use super::build::build;
 use super::build::compile;
 use super::catalog;
-use super::env::{cleanup, init, uninstall};
+use super::env::{cleanup, dev, init, uninstall};
 use super::ops::{audit, cache, config, metrics, policy};
 use super::vm::{console, cp, down, exec, forward, sandbox, up};
 
@@ -18,6 +18,7 @@ use audit::AuditAction;
 use cache::CacheAction;
 use catalog::CatalogAction;
 use config::ConfigAction;
+use dev::{DevAction, DevCacheAction};
 use policy::PolicyAction;
 use up::RunParams;
 
@@ -2006,6 +2007,34 @@ fn test_cache_prune_orphan_builds_flag() {
             assert!(orphan_builds);
         }
         _ => panic!("Expected Cache Prune command"),
+    }
+}
+
+#[test]
+fn test_dev_cache_inspect() {
+    let cli = Cli::try_parse_from(["mvmctl", "dev", "cache", "inspect"]).unwrap();
+    match cli.command {
+        Commands::Dev(dev::Args {
+            action:
+                Some(DevAction::Cache {
+                    action: DevCacheAction::Inspect { json },
+                }),
+        }) => assert!(!json),
+        _ => panic!("Expected Dev Cache Inspect command"),
+    }
+}
+
+#[test]
+fn test_dev_cache_inspect_json() {
+    let cli = Cli::try_parse_from(["mvmctl", "dev", "cache", "inspect", "--json"]).unwrap();
+    match cli.command {
+        Commands::Dev(dev::Args {
+            action:
+                Some(DevAction::Cache {
+                    action: DevCacheAction::Inspect { json },
+                }),
+        }) => assert!(json),
+        _ => panic!("Expected Dev Cache Inspect command"),
     }
 }
 

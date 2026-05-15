@@ -106,6 +106,11 @@ pub(in crate::commands) enum DevAction {
     },
     /// Show dev environment status.
     Status,
+    /// Inspect dev caches without rebuilding or booting.
+    Cache {
+        #[command(subcommand)]
+        action: DevCacheAction,
+    },
     /// Rebuild the dev environment (down + clear cache + up).
     Rebuild {
         /// Number of vCPUs for the dev VM (Apple Container).
@@ -146,6 +151,16 @@ pub(in crate::commands) enum DevAction {
         /// Path to the rootfs (`dev-rootfs-{arch}.ext4`).
         #[arg(long, value_name = "FILE")]
         rootfs: String,
+    },
+}
+
+#[derive(Subcommand, Debug, Clone)]
+pub(in crate::commands) enum DevCacheAction {
+    /// Show sanitized dev-cache readiness.
+    Inspect {
+        /// Emit structured JSON.
+        #[arg(long)]
+        json: bool,
     },
 }
 
@@ -339,6 +354,9 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                 Ok(())
             }
         },
+        DevAction::Cache {
+            action: DevCacheAction::Inspect { json },
+        } => apple_container::cmd_dev_cache_inspect(json),
         DevAction::ImportImage {
             manifest,
             bundle,
