@@ -234,13 +234,19 @@
           pkgs = import nixpkgs { inherit system; };
           builderInit = mvmBuilderInitFor system;
           egressProxy = mvmEgressProxyFor system;
-          # Stock nixpkgs kernel. Pass it to `mkGuest` so the rootfs
-          # ships its module tree (`/lib/modules/<kver>/`); the
-          # builder VM doesn't run the standard `/init` modprobe path
-          # (its cmdline pins `init=/sbin/mvm-builder-init`) but the
-          # modules sit alongside so `mvm-builder-init` or downstream
-          # tools can load them on demand.
-          kernelPkg = pkgs.linuxPackages.kernel;
+          # TSI-patched nixpkgs kernel. See ./kernel/default.nix for
+          # the patch series provenance and rebase procedure. Without
+          # these patches, libkrun's AF_INET-via-vsock TSI path has
+          # no guest-side support and the in-guest mvm-egress-proxy
+          # can't reach upstream.
+          #
+          # Pass it to `mkGuest` so the rootfs ships its module tree
+          # (`/lib/modules/<kver>/`); the builder VM doesn't run the
+          # standard `/init` modprobe path (its cmdline pins
+          # `init=/sbin/mvm-builder-init`) but the modules sit
+          # alongside so `mvm-builder-init` or downstream tools can
+          # load them on demand.
+          kernelPkg = import ./kernel { inherit pkgs; };
           rootfs = (libFor { inherit system; }).mkGuest {
             name = "mvm-builder-vm";
             # mkGuest requires an entrypoint declaration. At runtime
