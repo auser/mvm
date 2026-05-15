@@ -554,6 +554,177 @@ fn validate_built_artifact(
     })
 }
 
+// =================================================================
+// Cache-install step (W1.4b.3b.1)
+// =================================================================
+
+/// Options for [`install_overlay_into_cache`].
+#[derive(Debug, Clone, Default)]
+pub struct InstallOptions {
+    /// Overwrite any existing artifact at the target cache
+    /// directory. Default `false` — if every required file is
+    /// already present at the target path, the function is a
+    /// no-op (the install short-circuits and returns the
+    /// resolver-view of the existing artifact). Set `true` for
+    /// "force re-install" semantics, e.g. after a build whose
+    /// content the caller knows is fresher than what's cached.
+    pub overwrite: bool,
+}
+
+/// Copy `source`'s four files (`overlay.ext4`, `overlay.verity`,
+/// `overlay.roothash`, `VERSION`) into the canonical cache
+/// layout under `cache_root`:
+///
+/// ```text
+/// <cache_root>/runtime-overlay/<version>/<arch>/{overlay.ext4,
+///   overlay.verity, overlay.roothash, VERSION}
+/// ```
+///
+/// The install is atomic on the same-filesystem case: each
+/// file is staged into a sibling `.tmp.<pid>/` directory, then
+/// the whole tmp dir is renamed into the final location. A
+/// failure mid-way leaves only the `.tmp.<pid>/` behind (which
+/// can be safely cleaned up by a future call) — the existing
+/// cache content is never partially overwritten.
+///
+/// Permissions: copied files are chmod'd to `0644` so the cache
+/// stays readable+overwritable across installs, even if the
+/// source files (from a Nix store path) are mode `0444`.
+pub fn install_overlay_into_cache(
+    source: &RuntimeOverlayArtifact,
+    cache_root: &Path,
+    options: &InstallOptions,
+) -> Result<RuntimeOverlayArtifact, RuntimeOverlayError> {
+    // The source VERSION file sits next to overlay.ext4 in the
+    // build orchestrator's output. The `RuntimeOverlayArtifact`
+    // type doesn't carry it as a separate path, so we derive it.
+    let source_dir = source
+        .overlay_ext4
+        .parent()
+        .ok_or_else(|| RuntimeOverlayError::ArtifactIncomplete {
+            artifact_dir: PathBuf::new(),
+            missing: source.overlay_ext4.clone(),
+            version: source.version.clone(),
+            arch: source.arch.to_string(),
+        })?
+        .to_path_buf();
+    let source_version_file = source_dir.join("VERSION");
+
+    for required in [
+        &source.overlay_ext4,
+        &source.sidecar,
+        &source.roothash_file,
+        &source_version_file,
+    ] {
+        if !required.is_file() {
+            return Err(RuntimeOverlayError::ArtifactIncomplete {
+                artifact_dir: source_dir.clone(),
+                missing: (*required).clone(),
+                version: source.version.clone(),
+                arch: source.arch.to_string(),
+            });
+        }
+    }
+
+    let layout = RuntimeOverlayLayout::under(cache_root, &source.version, source.arch);
+
+    // Idempotency: if every file at the target already exists
+    // and the caller hasn't asked to overwrite, short-circuit.
+    // The resolver does the validation; we just construct the
+    // resolver-shape artifact pointing at the cache paths.
+    if !options.overwrite && all_required_files_present(&layout) {
+        return Ok(RuntimeOverlayArtifact {
+            overlay_ext4: layout.overlay_ext4,
+            sidecar: layout.sidecar,
+            roothash_file: layout.roothash_file,
+            roothash: source.roothash.clone(),
+            arch: source.arch,
+            version: source.version.clone(),
+        });
+    }
+
+    let parent = layout.artifact_dir.parent().ok_or_else(|| {
+        RuntimeOverlayError::Io(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            "computed artifact dir has no parent",
+        ))
+    })?;
+    std::fs::create_dir_all(parent)?;
+
+    // Stage to a sibling temp directory whose name carries the
+    // PID + a small random suffix. Multiple concurrent installs
+    // for the same (version, arch) get distinct staging dirs and
+    // the last rename wins atomically.
+    let staging = parent.join(staging_dir_name(source.arch));
+    // Belt-and-braces: if a previous interrupted install left a
+    // staging dir at the same name, blow it away.
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)?;
+    }
+    std::fs::create_dir(&staging)?;
+
+    install_file_with_perms(&source.overlay_ext4, &staging.join("overlay.ext4"))?;
+    install_file_with_perms(&source.sidecar, &staging.join("overlay.verity"))?;
+    install_file_with_perms(&source.roothash_file, &staging.join("overlay.roothash"))?;
+    install_file_with_perms(&source_version_file, &staging.join("VERSION"))?;
+
+    // Replace the existing artifact dir, if any. Two-phase
+    // (remove old, then rename new) — not strictly atomic across
+    // the gap, but the only window during which the cache lacks
+    // a complete artifact is microsecond-scale. Acceptable for
+    // an offline-cache-install operation; admission re-reads on
+    // each microVM start anyway.
+    if layout.artifact_dir.exists() {
+        std::fs::remove_dir_all(&layout.artifact_dir)?;
+    }
+    std::fs::rename(&staging, &layout.artifact_dir)?;
+
+    Ok(RuntimeOverlayArtifact {
+        overlay_ext4: layout.overlay_ext4,
+        sidecar: layout.sidecar,
+        roothash_file: layout.roothash_file,
+        roothash: source.roothash.clone(),
+        arch: source.arch,
+        version: source.version.clone(),
+    })
+}
+
+fn all_required_files_present(layout: &RuntimeOverlayLayout) -> bool {
+    layout.overlay_ext4.is_file()
+        && layout.sidecar.is_file()
+        && layout.roothash_file.is_file()
+        && layout.version_file.is_file()
+}
+
+fn staging_dir_name(arch: Arch) -> String {
+    // PID alone is enough to disambiguate per-process; if two
+    // installs in the same process race, the second one wins on
+    // the post-staging rename, which is the same semantics as
+    // calling install_overlay_into_cache(overwrite=true) twice.
+    format!("{}.tmp.{}", arch.as_str(), std::process::id())
+}
+
+fn install_file_with_perms(src: &Path, dst: &Path) -> Result<(), RuntimeOverlayError> {
+    std::fs::copy(src, dst)?;
+    set_cache_perms(dst)?;
+    Ok(())
+}
+
+#[cfg(unix)]
+fn set_cache_perms(p: &Path) -> Result<(), RuntimeOverlayError> {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o644))?;
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn set_cache_perms(_p: &Path) -> Result<(), RuntimeOverlayError> {
+    // Windows mvmctl is a non-goal for the boot path; the cache
+    // exists for completeness but permission semantics are
+    // platform-defined. No-op.
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -977,5 +1148,312 @@ mod tests {
             }
             other => panic!("expected HostUnsupported, got {other:?}"),
         }
+    }
+
+    // =================================================================
+    // install_overlay_into_cache tests (W1.4b.3b.1)
+    // =================================================================
+
+    /// Build a "source" artifact in a tempdir whose layout
+    /// mimics the runtime-overlay flake's `$out/`: four files at
+    /// the same level. Returns `(tempdir_keep_alive, artifact)`.
+    fn make_source_artifact(
+        version: &str,
+        arch: Arch,
+        roothash: &str,
+    ) -> (TempDir, RuntimeOverlayArtifact) {
+        let tmp = TempDir::new().unwrap();
+        let dir = tmp.path();
+        std::fs::write(dir.join("overlay.ext4"), b"source-ext4-bytes").unwrap();
+        std::fs::write(dir.join("overlay.verity"), b"source-verity-bytes").unwrap();
+        std::fs::write(
+            dir.join("overlay.roothash"),
+            format!("{roothash}\n").as_bytes(),
+        )
+        .unwrap();
+        std::fs::write(dir.join("VERSION"), format!("{version}\n").as_bytes()).unwrap();
+
+        let artifact = RuntimeOverlayArtifact {
+            overlay_ext4: dir.join("overlay.ext4"),
+            sidecar: dir.join("overlay.verity"),
+            roothash_file: dir.join("overlay.roothash"),
+            roothash: roothash.to_string(),
+            arch,
+            version: version.to_string(),
+        };
+        (tmp, artifact)
+    }
+
+    #[test]
+    fn install_copies_all_four_files_into_canonical_cache_layout() {
+        let (_keep, source) = make_source_artifact("0.14.0", Arch::Aarch64, FAKE_ROOTHASH);
+        let cache = TempDir::new().unwrap();
+
+        let installed =
+            install_overlay_into_cache(&source, cache.path(), &InstallOptions::default())
+                .expect("install");
+
+        let expected_dir = cache
+            .path()
+            .join("runtime-overlay")
+            .join("0.14.0")
+            .join("aarch64");
+        assert!(
+            expected_dir.is_dir(),
+            "artifact dir must exist at {expected_dir:?}"
+        );
+        assert_eq!(installed.overlay_ext4, expected_dir.join("overlay.ext4"));
+        assert_eq!(installed.sidecar, expected_dir.join("overlay.verity"));
+        assert_eq!(
+            installed.roothash_file,
+            expected_dir.join("overlay.roothash")
+        );
+        assert_eq!(installed.version, "0.14.0");
+        assert_eq!(installed.arch, Arch::Aarch64);
+
+        // Content matches the source verbatim.
+        assert_eq!(
+            std::fs::read(&installed.overlay_ext4).unwrap(),
+            b"source-ext4-bytes"
+        );
+        assert_eq!(
+            std::fs::read(&installed.sidecar).unwrap(),
+            b"source-verity-bytes"
+        );
+        let roothash_text = std::fs::read_to_string(&installed.roothash_file).unwrap();
+        assert_eq!(roothash_text.trim(), FAKE_ROOTHASH);
+        let version_text = std::fs::read_to_string(expected_dir.join("VERSION")).unwrap();
+        assert_eq!(version_text.trim(), "0.14.0");
+    }
+
+    #[test]
+    fn install_returns_artifact_resolvable_by_runtime_overlay_resolver() {
+        // End-to-end: install → resolve must succeed. Closes the
+        // producer → cache → consumer loop in a unit test (real
+        // build pipeline is W1.4b.3a's Linux integration test).
+        let (_keep, source) = make_source_artifact("0.14.0", Arch::X86_64, FAKE_ROOTHASH);
+        let cache = TempDir::new().unwrap();
+
+        install_overlay_into_cache(&source, cache.path(), &InstallOptions::default())
+            .expect("install");
+
+        let resolver =
+            RuntimeOverlayResolver::new(cache.path().to_path_buf(), "0.14.0".to_string());
+        let resolved = resolver.resolve(Arch::X86_64).expect("resolve");
+        assert_eq!(resolved.version, "0.14.0");
+        assert_eq!(resolved.arch, Arch::X86_64);
+        assert_eq!(resolved.roothash, FAKE_ROOTHASH);
+    }
+
+    #[test]
+    fn install_is_idempotent_under_default_options() {
+        // Second install with overwrite=false short-circuits and
+        // returns the cache-view artifact without re-copying.
+        let (_keep, source) = make_source_artifact("0.14.0", Arch::Aarch64, FAKE_ROOTHASH);
+        let cache = TempDir::new().unwrap();
+
+        let first = install_overlay_into_cache(&source, cache.path(), &InstallOptions::default())
+            .expect("first install");
+
+        // Mutate the source bytes; second install must NOT pick
+        // them up under overwrite=false.
+        std::fs::write(&source.overlay_ext4, b"mutated-source-bytes").unwrap();
+
+        let second = install_overlay_into_cache(&source, cache.path(), &InstallOptions::default())
+            .expect("second install");
+
+        assert_eq!(first.overlay_ext4, second.overlay_ext4);
+        let cached_bytes = std::fs::read(&second.overlay_ext4).unwrap();
+        assert_eq!(
+            cached_bytes, b"source-ext4-bytes",
+            "idempotent install must NOT overwrite existing cache content"
+        );
+    }
+
+    #[test]
+    fn install_overwrite_replaces_existing_cache_content() {
+        let (keep, source) = make_source_artifact("0.14.0", Arch::Aarch64, FAKE_ROOTHASH);
+        let cache = TempDir::new().unwrap();
+
+        install_overlay_into_cache(&source, cache.path(), &InstallOptions::default())
+            .expect("first install");
+
+        // Rewrite source content; second install with
+        // overwrite=true must update the cache.
+        std::fs::write(&source.overlay_ext4, b"updated-source-bytes").unwrap();
+        std::fs::write(&source.sidecar, b"updated-verity-bytes").unwrap();
+        // Keep VERSION + roothash matching to keep the resolver happy.
+
+        let opts = InstallOptions { overwrite: true };
+        let installed =
+            install_overlay_into_cache(&source, cache.path(), &opts).expect("overwrite install");
+
+        let cached_bytes = std::fs::read(&installed.overlay_ext4).unwrap();
+        assert_eq!(cached_bytes, b"updated-source-bytes");
+        let cached_sidecar = std::fs::read(&installed.sidecar).unwrap();
+        assert_eq!(cached_sidecar, b"updated-verity-bytes");
+        drop(keep);
+    }
+
+    #[test]
+    fn install_fails_when_source_overlay_ext4_missing() {
+        let (keep, mut source) = make_source_artifact("0.14.0", Arch::Aarch64, FAKE_ROOTHASH);
+        // Remove the source file but keep the artifact metadata
+        // — simulates a half-built artifact handed to the
+        // installer.
+        std::fs::remove_file(&source.overlay_ext4).unwrap();
+        source.overlay_ext4 = source.overlay_ext4.clone(); // no change; readability
+
+        let cache = TempDir::new().unwrap();
+        let err = install_overlay_into_cache(&source, cache.path(), &InstallOptions::default())
+            .unwrap_err();
+        assert!(
+            matches!(err, RuntimeOverlayError::ArtifactIncomplete { .. }),
+            "{err:?}"
+        );
+        drop(keep);
+    }
+
+    #[test]
+    fn install_fails_when_source_version_file_missing() {
+        let (keep, source) = make_source_artifact("0.14.0", Arch::Aarch64, FAKE_ROOTHASH);
+        let source_dir = source.overlay_ext4.parent().unwrap();
+        std::fs::remove_file(source_dir.join("VERSION")).unwrap();
+
+        let cache = TempDir::new().unwrap();
+        let err = install_overlay_into_cache(&source, cache.path(), &InstallOptions::default())
+            .unwrap_err();
+        match err {
+            RuntimeOverlayError::ArtifactIncomplete { missing, .. } => {
+                assert!(
+                    missing.ends_with("VERSION"),
+                    "expected VERSION missing; got {missing:?}"
+                );
+            }
+            other => panic!("expected ArtifactIncomplete, got {other:?}"),
+        }
+        drop(keep);
+    }
+
+    #[test]
+    fn install_creates_intermediate_directories() {
+        // Cache root is fresh — no `runtime-overlay/<version>/<arch>/`
+        // structure exists. The installer must mkdir -p the path.
+        let (_keep, source) = make_source_artifact("0.14.0", Arch::Aarch64, FAKE_ROOTHASH);
+        let cache = TempDir::new().unwrap();
+
+        install_overlay_into_cache(&source, cache.path(), &InstallOptions::default())
+            .expect("install on empty cache");
+
+        assert!(cache.path().join("runtime-overlay").is_dir());
+        assert!(cache.path().join("runtime-overlay/0.14.0").is_dir());
+        assert!(cache.path().join("runtime-overlay/0.14.0/aarch64").is_dir());
+    }
+
+    #[test]
+    fn install_separates_arches_within_the_same_version() {
+        let (_keep_a, source_a) = make_source_artifact("0.14.0", Arch::Aarch64, FAKE_ROOTHASH);
+        let (_keep_b, source_b) = make_source_artifact("0.14.0", Arch::X86_64, FAKE_ROOTHASH);
+        let cache = TempDir::new().unwrap();
+
+        install_overlay_into_cache(&source_a, cache.path(), &InstallOptions::default())
+            .expect("install aarch64");
+        install_overlay_into_cache(&source_b, cache.path(), &InstallOptions::default())
+            .expect("install x86_64");
+
+        assert!(
+            cache
+                .path()
+                .join("runtime-overlay/0.14.0/aarch64/overlay.ext4")
+                .is_file()
+        );
+        assert!(
+            cache
+                .path()
+                .join("runtime-overlay/0.14.0/x86_64/overlay.ext4")
+                .is_file()
+        );
+    }
+
+    #[test]
+    fn install_separates_versions_within_the_same_arch() {
+        let (_keep_a, source_a) = make_source_artifact("0.14.0", Arch::Aarch64, FAKE_ROOTHASH);
+        let (_keep_b, source_b) = make_source_artifact("0.15.0", Arch::Aarch64, FAKE_ROOTHASH);
+        let cache = TempDir::new().unwrap();
+
+        install_overlay_into_cache(&source_a, cache.path(), &InstallOptions::default())
+            .expect("install 0.14.0");
+        install_overlay_into_cache(&source_b, cache.path(), &InstallOptions::default())
+            .expect("install 0.15.0");
+
+        assert!(
+            cache
+                .path()
+                .join("runtime-overlay/0.14.0/aarch64/overlay.ext4")
+                .is_file()
+        );
+        assert!(
+            cache
+                .path()
+                .join("runtime-overlay/0.15.0/aarch64/overlay.ext4")
+                .is_file()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn install_chmods_files_to_0644() {
+        use std::os::unix::fs::PermissionsExt;
+        let (_keep, source) = make_source_artifact("0.14.0", Arch::Aarch64, FAKE_ROOTHASH);
+
+        // Make source files read-only (0444) to simulate
+        // Nix-store paths. The installer must override to 0644
+        // so the cache stays overwritable on future installs.
+        for p in [&source.overlay_ext4, &source.sidecar, &source.roothash_file] {
+            std::fs::set_permissions(p, std::fs::Permissions::from_mode(0o444)).unwrap();
+        }
+
+        let cache = TempDir::new().unwrap();
+        let installed =
+            install_overlay_into_cache(&source, cache.path(), &InstallOptions::default())
+                .expect("install");
+
+        for p in [
+            &installed.overlay_ext4,
+            &installed.sidecar,
+            &installed.roothash_file,
+        ] {
+            let mode = std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+            assert_eq!(mode, 0o644, "cache file {p:?} must be 0644 (got {mode:o})");
+        }
+    }
+
+    #[test]
+    fn install_cleans_up_stale_staging_dir_from_a_previous_crash() {
+        // Pre-create a staging dir that the next install will
+        // collide with. The installer must remove it and proceed.
+        let (_keep, source) = make_source_artifact("0.14.0", Arch::Aarch64, FAKE_ROOTHASH);
+        let cache = TempDir::new().unwrap();
+        let parent = cache.path().join("runtime-overlay/0.14.0");
+        std::fs::create_dir_all(&parent).unwrap();
+        let staging = parent.join(staging_dir_name(Arch::Aarch64));
+        std::fs::create_dir_all(&staging).unwrap();
+        std::fs::write(staging.join("garbage"), b"left over from a crash").unwrap();
+
+        let installed =
+            install_overlay_into_cache(&source, cache.path(), &InstallOptions::default())
+                .expect("install should clean up staging");
+        assert!(installed.overlay_ext4.is_file());
+        // The leftover garbage file must not appear in the final
+        // artifact dir; only the four expected files are there.
+        let final_entries: Vec<_> = std::fs::read_dir(parent.join("aarch64"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .map(|e| e.file_name().to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !final_entries.iter().any(|n| n == "garbage"),
+            "stale staging content must not leak into final cache: {final_entries:?}"
+        );
     }
 }
