@@ -575,6 +575,7 @@ impl GuestRequest {
     /// renaming a verb is a breaking change.
     pub fn verb_name(&self) -> &'static str {
         match self {
+            GuestRequest::ProtocolHello { .. } => "ProtocolHello",
             GuestRequest::WorkerStatus => "WorkerStatus",
             GuestRequest::SleepPrep { .. } => "SleepPrep",
             GuestRequest::Wake => "Wake",
@@ -616,11 +617,16 @@ impl GuestRequest {
     /// `GuestRequest` variant fails to compile until it is classified.
     pub fn class(&self) -> RequestClass {
         match self {
-            // ProdSafe: lifecycle + status + entrypoint + sleep/wake
-            // + mount-volume + idle-timeout. Volume mounts are
-            // additionally constrained by `MountPathPolicy` inside
-            // the handler — the gate just lets the verb reach it.
-            GuestRequest::WorkerStatus
+            // ProdSafe: handshake + lifecycle + status + entrypoint
+            // + sleep/wake + mount-volume + idle-timeout. Volume
+            // mounts are additionally constrained by
+            // `MountPathPolicy` inside the handler — the gate just
+            // lets the verb reach it. `ProtocolHello` MUST be
+            // prod-safe; it's the negotiation that runs before
+            // every other request and a sealed-prod agent that
+            // refuses it would never see another verb.
+            GuestRequest::ProtocolHello { .. }
+            | GuestRequest::WorkerStatus
             | GuestRequest::SleepPrep { .. }
             | GuestRequest::Wake
             | GuestRequest::Ping
@@ -675,8 +681,10 @@ impl GuestRequest {
     pub fn allowed_in(&self, profile: AgentProfile) -> bool {
         matches!(
             (self.class(), profile),
-            (RequestClass::ProdSafe, AgentProfile::SealedProd | AgentProfile::Dev)
-                | (RequestClass::DevOnly, AgentProfile::Dev)
+            (
+                RequestClass::ProdSafe,
+                AgentProfile::SealedProd | AgentProfile::Dev
+            ) | (RequestClass::DevOnly, AgentProfile::Dev)
                 | (RequestClass::BuilderOnly, AgentProfile::Builder)
         )
     }
@@ -4314,6 +4322,7 @@ mod tests {
     #[test]
     fn test_request_class_coverage_matches_sealed_prod_allowlist() {
         let prod_safe_verbs: &[&str] = &[
+            "ProtocolHello",
             "WorkerStatus",
             "SleepPrep",
             "Wake",
@@ -4333,6 +4342,12 @@ mod tests {
         // One representative `GuestRequest` value per variant. Used to
         // exercise `class()` + `verb_name()` together.
         let all: Vec<GuestRequest> = vec![
+            GuestRequest::ProtocolHello {
+                host_protocol_version: 1,
+                min_supported_version: 1,
+                host_version: "test".into(),
+                requested_capabilities: vec![],
+            },
             GuestRequest::WorkerStatus,
             GuestRequest::SleepPrep {
                 drain_timeout_secs: 0,
@@ -4465,7 +4480,10 @@ mod tests {
         // assertion too.
         let names: Vec<&'static str> = all.iter().map(|r| r.verb_name()).collect();
         for v in prod_safe_verbs {
-            assert!(names.contains(v), "SealedProd verb {v} missing from coverage");
+            assert!(
+                names.contains(v),
+                "SealedProd verb {v} missing from coverage"
+            );
         }
     }
 

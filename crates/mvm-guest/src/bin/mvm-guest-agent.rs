@@ -25,6 +25,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
+use mvm_core::security::AgentProfile;
 use mvm_guest::entrypoint::{
     CallCaps, CallOutcome, EntrypointPolicy, PayloadCapStream, ValidatedEntrypoint, execute,
 };
@@ -34,7 +35,6 @@ use mvm_guest::integrations::{
 use mvm_guest::lifecycle_hooks::{self, ReadinessConfig};
 use mvm_guest::probes::{self, ProbeEntry, ProbeOutputFormat, ProbeResult};
 use mvm_guest::runtime_config::{self, ConcurrencyConfig};
-use mvm_core::security::AgentProfile;
 use mvm_guest::vsock::{
     BootTimingReport, ComponentState, EntrypointEvent, FsChange, FsChangeKind, GUEST_AGENT_PORT,
     GuestRequest, GuestResponse, ReadinessReport, RunEntrypointError,
@@ -365,10 +365,8 @@ impl AgentBootState {
 
     fn set_entrypoint(&self, state: ComponentState) {
         if let Ok(mut s) = self.inner.lock() {
-            let became_terminal = matches!(
-                state,
-                ComponentState::Ready | ComponentState::Failed { .. }
-            );
+            let became_terminal =
+                matches!(state, ComponentState::Ready | ComponentState::Failed { .. });
             s.entrypoint = state;
             if became_terminal && s.timing.entrypoint_ready_ms.is_none() {
                 s.timing.entrypoint_ready_ms = Some(self.elapsed_ms());
@@ -418,39 +416,42 @@ impl AgentBootState {
 
     fn snapshot(&self) -> ReadinessReport {
         let inner = self.inner.lock();
-        let (
-            control_plane,
-            entrypoint,
-            warm_pool,
-            integrations,
-            probes,
-            volumes,
-            timing,
-        ) = match inner {
-            Ok(s) => (
-                s.control_plane.clone(),
-                s.entrypoint.clone(),
-                s.warm_pool.clone(),
-                s.integrations.clone(),
-                s.probes.clone(),
-                s.volumes.clone(),
-                s.timing.clone(),
-            ),
-            // Poisoned lock means another thread panicked mid-update;
-            // surface that as a generic Failed rather than swallowing.
-            Err(_) => {
-                let msg = "boot-state lock poisoned".to_string();
-                (
-                    ComponentState::Failed { message: msg.clone() },
-                    ComponentState::Failed { message: msg.clone() },
-                    ComponentState::Failed { message: msg.clone() },
-                    ComponentState::Failed { message: msg.clone() },
-                    ComponentState::Failed { message: msg.clone() },
-                    ComponentState::Failed { message: msg },
-                    BootTimingReport::default(),
-                )
-            }
-        };
+        let (control_plane, entrypoint, warm_pool, integrations, probes, volumes, timing) =
+            match inner {
+                Ok(s) => (
+                    s.control_plane.clone(),
+                    s.entrypoint.clone(),
+                    s.warm_pool.clone(),
+                    s.integrations.clone(),
+                    s.probes.clone(),
+                    s.volumes.clone(),
+                    s.timing.clone(),
+                ),
+                // Poisoned lock means another thread panicked mid-update;
+                // surface that as a generic Failed rather than swallowing.
+                Err(_) => {
+                    let msg = "boot-state lock poisoned".to_string();
+                    (
+                        ComponentState::Failed {
+                            message: msg.clone(),
+                        },
+                        ComponentState::Failed {
+                            message: msg.clone(),
+                        },
+                        ComponentState::Failed {
+                            message: msg.clone(),
+                        },
+                        ComponentState::Failed {
+                            message: msg.clone(),
+                        },
+                        ComponentState::Failed {
+                            message: msg.clone(),
+                        },
+                        ComponentState::Failed { message: msg },
+                        BootTimingReport::default(),
+                    )
+                }
+            };
         ReadinessReport {
             control_plane,
             entrypoint,
@@ -2186,15 +2187,11 @@ fn handle_client(
             // terminal). Snapshot once so the decision is consistent
             // even if a concurrent background-thread update flips
             // state mid-handler.
-            if matches!(
-                boot_state.snapshot().entrypoint,
-                ComponentState::Starting
-            ) {
+            if matches!(boot_state.snapshot().entrypoint, ComponentState::Starting) {
                 GuestResponse::EntrypointEvent(EntrypointEvent::Error {
                     kind: RunEntrypointError::NotReady,
-                    message:
-                        "entrypoint validation in progress; poll ReadinessStatus and retry"
-                            .to_string(),
+                    message: "entrypoint validation in progress; poll ReadinessStatus and retry"
+                        .to_string(),
                 })
             } else {
                 handle_run_entrypoint(&mut file, stdin, timeout_secs)
@@ -2753,7 +2750,11 @@ fn main() {
     boot_state.mark_vsock_bound();
     eprintln!(
         "mvm-guest-agent: control plane ready ({}ms)",
-        boot_state.snapshot().boot_millis.vsock_bound_ms.unwrap_or(0)
+        boot_state
+            .snapshot()
+            .boot_millis
+            .vsock_bound_ms
+            .unwrap_or(0)
     );
 
     // Plan 76 Phase 2: defer entrypoint validation + warm-pool
@@ -2796,9 +2797,7 @@ fn main() {
     }
 
     // Same shape for the probe drop-in scan + loop. Plan 76 Phase 3.
-    let probe_state = Arc::new(Mutex::new(ProbeState {
-        probes: Vec::new(),
-    }));
+    let probe_state = Arc::new(Mutex::new(ProbeState { probes: Vec::new() }));
     {
         let bs = Arc::clone(&boot_state);
         let s = Arc::clone(&probe_state);
@@ -3115,7 +3114,14 @@ mod tests {
             integrations: vec![],
         }));
         let probe_state = Arc::new(Mutex::new(ProbeState { probes: vec![] }));
-        let boot_at = std::time::Instant::now();
+        // Plan 76 Phase 2: handle_client now takes `&Arc<AgentBootState>`
+        // (carrying profile + boot_at + readiness) instead of a bare
+        // boot_at + active_profile.
+        let boot_state = Arc::new(AgentBootState::new(
+            AgentProfile::Dev,
+            std::time::Instant::now(),
+        ));
+        boot_state.mark_vsock_bound();
 
         let handle = std::thread::spawn(move || {
             handle_client(
@@ -3123,7 +3129,7 @@ mod tests {
                 &state,
                 &integration_state,
                 &probe_state,
-                boot_at,
+                &boot_state,
             );
         });
 
@@ -3172,7 +3178,11 @@ mod tests {
             integrations: vec![],
         }));
         let probe_state = Arc::new(Mutex::new(ProbeState { probes: vec![] }));
-        let boot_at = std::time::Instant::now();
+        let boot_state = Arc::new(AgentBootState::new(
+            AgentProfile::Dev,
+            std::time::Instant::now(),
+        ));
+        boot_state.mark_vsock_bound();
 
         let handle = std::thread::spawn(move || {
             handle_client(
@@ -3180,7 +3190,7 @@ mod tests {
                 &state,
                 &integration_state,
                 &probe_state,
-                boot_at,
+                &boot_state,
             );
         });
 
