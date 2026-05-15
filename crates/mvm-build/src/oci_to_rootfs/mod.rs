@@ -10,8 +10,11 @@
 //!    reserved-path collision, size caps, unsupported entry
 //!    types).
 //! 3. Caller calls `finalize` to release the staging directory and
-//!    get a [`StagedRootfs`] descriptor pointing at it. ext4
-//!    materialization (W1.3b) consumes that descriptor next.
+//!    get a [`StagedRootfs`] descriptor pointing at it.
+//! 4. Caller hands the descriptor to [`materialize_to_ext4`]
+//!    (Linux-only at runtime; W1.5 routes non-Linux through the
+//!    libkrun builder VM per ADR-050), which produces a
+//!    byte-deterministic ext4 image suitable for verity sealing.
 //!
 //! Layers are assumed to arrive *decompressed*. The caller (W1.5
 //! CLI orchestrator) is responsible for piping fetched layer bytes
@@ -38,8 +41,10 @@
 //! write landing in staging.
 
 pub mod error;
+pub mod ext4;
 mod path_validation;
 mod unpack;
 
 pub use error::OciUnpackError;
+pub use ext4::{MaterializedRootfs, Mke2fsOptions, estimate_image_size, materialize_to_ext4};
 pub use unpack::{ImageStaging, LayerStats, StagedRootfs, StagingOptions};
