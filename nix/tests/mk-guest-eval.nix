@@ -163,4 +163,18 @@ in
   agent_binary_is_real = (meta shellGuest).agentBinary == "real"
     && (meta commandGuest).agentBinary == "real"
     && (meta servicesGuest).agentBinary == "real";
+
+  # ── Plan 74 W1.4b (ADR-051) — runtime overlay awareness ───────
+  #
+  # Every image built by mkGuest must advertise that its rootfs
+  # carries the `/mvm/runtime` bind-mount target and that the
+  # init script prefers the overlay-provided agent. A future PR
+  # that drops the overlay-aware code path (e.g. reverting the
+  # /init agent-resolution block) flips this metadata to `false`
+  # before the boot regression surfaces, giving CI a tight signal
+  # for the load-bearing invariant.
+
+  overlay_aware_metadata_set_on_shell = (meta shellGuest).overlayAware == true;
+  overlay_aware_metadata_set_on_command = (meta commandGuest).overlayAware == true;
+  overlay_aware_metadata_set_on_services = (meta servicesGuest).overlayAware == true;
 }

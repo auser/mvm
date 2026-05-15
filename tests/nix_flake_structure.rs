@@ -180,6 +180,54 @@ fn mk_guest_eval_assertions_all_pass_when_nix_available() {
     );
 }
 
+/// Plan 74 W1.4b (ADR-051) — `mkGuest` must carry the overlay-
+/// aware contract in its rootfs + /init script. We can't easily
+/// build the rootfs without Nix on the host, but the source of
+/// truth is a single file we can scan for the three load-bearing
+/// signals. A regression that removes any of them surfaces as a
+/// failing test on every PR's `cargo test`, before the overlay
+/// boot regression is observable in a live VM.
+///
+/// What gets checked:
+/// 1. The rootfs tree creates `/mvm/runtime` (the bind-mount
+///    target). Without this, the verity-init bind-mount fails at
+///    boot and the agent never starts.
+/// 2. The /init script prefers `/mvm/runtime/agent` over the
+///    baked-in copy. Without this, the overlay-attached agent
+///    isn't used.
+/// 3. The mvmMeta passthru carries `overlayAware = true`. Without
+///    this, admission-time gates can't enforce overlay-aware
+///    rootfs as a precondition.
+#[test]
+fn mk_guest_carries_overlay_aware_contract() {
+    let path = nix_dir().join("lib").join("mk-guest.nix");
+    let content = fs::read_to_string(&path)
+        .unwrap_or_else(|e| panic!("nix/lib/mk-guest.nix must be present: {e}"));
+
+    assert!(
+        content.contains("mkdir -p \"$out/mvm/runtime\""),
+        "mk-guest.nix must create /mvm/runtime in the rootfs as the \
+         ADR-051 bind-mount target. Missing the `mkdir -p \"$out/mvm/runtime\"` \
+         line means the verity-init bind-mount target is missing and the \
+         agent never starts."
+    );
+
+    assert!(
+        content.contains("/mvm/runtime/agent"),
+        "mk-guest.nix /init must reference /mvm/runtime/agent (ADR-051). \
+         Without this resolution path the overlay-attached agent isn't \
+         exec'd and the rootfs falls back to the baked-in copy on every \
+         boot — defeating the W1.4b refactor."
+    );
+
+    assert!(
+        content.contains("overlayAware = true"),
+        "mk-guest.nix mvmMeta passthru must declare `overlayAware = true` \
+         (Plan 74 W1.4b / ADR-051). Admission-time gates read this to \
+         refuse boot of cached pre-W1.4b templates."
+    );
+}
+
 #[test]
 fn flake_lock_pins_microvm_input_by_hash() {
     // The flake.lock must exist and pin the microvm.nix input by

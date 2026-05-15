@@ -235,11 +235,27 @@ let
     # us but can't talk to us. We never block on it — if the agent
     # fails to start, the entrypoint still runs and the lack of
     # agent shows up in `mvmctl status`.
-    if [ -x /usr/local/bin/mvm-guest-agent ]; then
+    #
+    # Plan 74 W1.4b (ADR-051) — when the mvm runtime overlay is
+    # attached, `mvm-verity-init` bind-mounts it at /mvm/runtime
+    # before switch_root, so /mvm/runtime/agent is the canonical
+    # binary location. Prefer it over the baked-in copy at
+    # /usr/local/bin/mvm-guest-agent (which a future PR drops
+    # entirely once every backend attaches the overlay). Both
+    # paths are exec-tested so a half-attached overlay (directory
+    # present, agent missing) still falls through to the baked-in
+    # path rather than booting agent-less.
+    MVM_AGENT_BIN=
+    if [ -x /mvm/runtime/agent ]; then
+      MVM_AGENT_BIN=/mvm/runtime/agent
+    elif [ -x /usr/local/bin/mvm-guest-agent ]; then
+      MVM_AGENT_BIN=/usr/local/bin/mvm-guest-agent
+    fi
+    if [ -n "$MVM_AGENT_BIN" ]; then
       /bin/busybox setsid /bin/busybox setpriv \
         --reuid=${toString agentUid} --regid=${toString agentUid} \
         --clear-groups --no-new-privs \
-        -- /usr/local/bin/mvm-guest-agent &
+        -- "$MVM_AGENT_BIN" &
     fi
 
     # Stage 3 — hostname + console. /dev/console is what the
@@ -255,6 +271,27 @@ let
     # is the host-side gate).
     if [ -e /etc/mvm/variant ] && [ "$(/bin/busybox cat /etc/mvm/variant)" = "dev" ]; then
       exec </dev/console >/dev/console 2>&1
+    fi
+
+    # Stage 4.5 — Plan 74 W1.4b (ADR-051) — mvm runtime overlay env.
+    # When the overlay is mounted (verity boot path), surface its
+    # presence + SDK-library paths to the entrypoint via env
+    # variables. Per-language path vars (PYTHONPATH, NODE_PATH)
+    # are prepended so they take precedence over a user's existing
+    # value; an empty existing value leaves no trailing colon.
+    # Setting these unconditionally on the overlay-mounted path
+    # gives a stable contract for SDK addons (ADR-049 vsock hooks)
+    # without per-image opt-in. The dev/legacy path (no overlay)
+    # leaves the env untouched so existing flakes keep their
+    # current behaviour.
+    if [ -d /mvm/runtime ] && [ -e /mvm/runtime/VERSION ]; then
+      export MVM_RUNTIME_OVERLAY=1
+      if [ -d /mvm/runtime/sdk-py ]; then
+        export PYTHONPATH="/mvm/runtime/sdk-py''${PYTHONPATH:+:''${PYTHONPATH}}"
+      fi
+      if [ -d /mvm/runtime/sdk-ts ]; then
+        export NODE_PATH="/mvm/runtime/sdk-ts''${NODE_PATH:+:''${NODE_PATH}}"
+      fi
     fi
 
     # Source the entrypoint script. Rendered at build time so the
@@ -347,6 +384,20 @@ let
     mkdir -p "$out"/{bin,sbin,etc,proc,sys,dev,tmp,run,var,root,home,nix/store,etc/mvm}
     chmod 1777 "$out/tmp"
     chmod 0755 "$out/run"
+
+    # Plan 74 W1.4b — the mvm runtime overlay (ADR-051) is
+    # bind-mounted at /mvm/runtime by `mvm-verity-init` before
+    # switch_root. The directory must exist in the rootfs so the
+    # bind-mount has a target. Mode 0755 (owner root); the overlay
+    # itself is mounted read-only over it, so contents can't be
+    # written by the guest regardless. Outside the verity-boot
+    # path (dev-mode VMs that don't run `mvm-verity-init`) the
+    # directory is empty — /init below falls back to the baked-in
+    # agent. `/mvm/` is reserved (admission-time check in W1.4b.3d
+    # rejects OCI images that carry content under this path).
+    mkdir -p "$out/mvm/runtime"
+    chmod 0755 "$out/mvm"
+    chmod 0755 "$out/mvm/runtime"
 
     # busybox + applet symlinks. busybox --install -s would do this
     # at runtime; we pre-bake the links so the rootfs has no first-
@@ -520,6 +571,13 @@ let
     # W6.1.1 placeholder sh script. `mvmctl status` reads this;
     # production deployments should refuse to boot a "stub" image.
     agentBinary = "real";
+    # Plan 74 W1.4b (ADR-051) — the rootfs carries a `/mvm/runtime`
+    # bind-mount target and the /init script prefers the overlay
+    # agent at `/mvm/runtime/agent` over the baked-in
+    # `/usr/local/bin/mvm-guest-agent`. Admission-time gates can
+    # refuse to boot a workload whose rootfs is not overlay-aware
+    # (e.g. an old cached template predating W1.4b.3c).
+    overlayAware = true;
   };
 in
 rootfsImage.overrideAttrs (old: {
