@@ -18,6 +18,7 @@ use crate::ui;
 pub(super) const DEV_VM_NAME: &str = "mvm-dev";
 const BUILDER_VM_SOURCE_FINGERPRINT_FILE: &str = ".mvm-source.sha256";
 const BUILDER_VM_ARTIFACT_DIGEST_FILE: &str = ".mvm-artifacts.sha256";
+const BUILDER_VM_PROVENANCE_FILE: &str = ".mvm-provenance.json";
 
 /// Check if the Apple Container dev VM is running *and* reachable
 /// cross-process via the vsock proxy socket.
@@ -1946,6 +1947,7 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     }
     write_builder_vm_source_fingerprint(&staging_dir, source_fingerprint)?;
     write_builder_vm_artifact_digest_manifest(&staging_dir)?;
+    write_builder_vm_source_cache_provenance(&staging_dir, source_fingerprint)?;
 
     if let Err(e) = promote_builder_vm_stage0_cache(&staging_dir, out_dir, source_fingerprint) {
         let _ = std::fs::remove_dir_all(&staging_dir);
@@ -2073,6 +2075,8 @@ enum BuilderVmSourceCacheStatus {
     FingerprintMismatch,
     MissingArtifactDigestManifest,
     ArtifactDigestMismatch,
+    MissingProvenance,
+    ProvenanceMismatch,
 }
 
 impl BuilderVmSourceCacheStatus {
@@ -2089,6 +2093,8 @@ impl BuilderVmSourceCacheStatus {
             Self::FingerprintMismatch => "fingerprint_mismatch",
             Self::MissingArtifactDigestManifest => "missing_artifact_digest_manifest",
             Self::ArtifactDigestMismatch => "artifact_digest_mismatch",
+            Self::MissingProvenance => "missing_provenance",
+            Self::ProvenanceMismatch => "provenance_mismatch",
         }
     }
 }
@@ -2118,6 +2124,14 @@ fn builder_vm_source_cache_status(
     }
     if !builder_vm_artifact_digest_manifest_matches(dir) {
         return BuilderVmSourceCacheStatus::ArtifactDigestMismatch;
+    }
+
+    let provenance_path = dir.join(BUILDER_VM_PROVENANCE_FILE);
+    if !provenance_path.exists() {
+        return BuilderVmSourceCacheStatus::MissingProvenance;
+    }
+    if !builder_vm_source_cache_provenance_matches(dir, expected_fingerprint) {
+        return BuilderVmSourceCacheStatus::ProvenanceMismatch;
     }
 
     BuilderVmSourceCacheStatus::Hit
@@ -2184,6 +2198,69 @@ fn write_builder_vm_artifact_digest_manifest(dir: &std::path::Path) -> Result<()
         .with_context(|| format!("writing builder VM artifact digests in {}", dir.display()))
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct BuilderVmSourceCacheProvenance {
+    schema_version: u32,
+    source_kind: String,
+    source_fingerprint: String,
+    artifacts: Vec<String>,
+}
+
+fn builder_vm_source_cache_provenance(
+    dir: &std::path::Path,
+    source_fingerprint: &str,
+) -> Result<BuilderVmSourceCacheProvenance> {
+    Ok(BuilderVmSourceCacheProvenance {
+        schema_version: 1,
+        source_kind: "source_checkout_stage0".to_string(),
+        source_fingerprint: source_fingerprint.to_string(),
+        artifacts: builder_vm_artifact_names_present(dir)?,
+    })
+}
+
+fn builder_vm_artifact_names_present(dir: &std::path::Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for name in ["vmlinux", "rootfs.ext4", "cmdline.txt"] {
+        let path = dir.join(name);
+        if !path.exists() {
+            if name == "cmdline.txt" {
+                continue;
+            }
+            anyhow::bail!("builder VM provenance missing artifact {}", path.display());
+        }
+        names.push(name.to_string());
+    }
+    Ok(names)
+}
+
+fn builder_vm_source_cache_provenance_matches(
+    dir: &std::path::Path,
+    expected_fingerprint: &str,
+) -> bool {
+    let expected = match builder_vm_source_cache_provenance(dir, expected_fingerprint) {
+        Ok(expected) => expected,
+        Err(_) => return false,
+    };
+    std::fs::read_to_string(dir.join(BUILDER_VM_PROVENANCE_FILE))
+        .ok()
+        .and_then(|actual| serde_json::from_str::<BuilderVmSourceCacheProvenance>(&actual).ok())
+        .map(|actual| actual == expected)
+        .unwrap_or(false)
+}
+
+#[cfg(any(feature = "builder-vm", test))]
+fn write_builder_vm_source_cache_provenance(
+    dir: &std::path::Path,
+    source_fingerprint: &str,
+) -> Result<()> {
+    let provenance = builder_vm_source_cache_provenance(dir, source_fingerprint)?;
+    let json = serde_json::to_string_pretty(&provenance)
+        .context("serializing builder VM source cache provenance")?;
+    std::fs::write(dir.join(BUILDER_VM_PROVENANCE_FILE), format!("{json}\n"))
+        .with_context(|| format!("writing builder VM provenance in {}", dir.display()))
+}
+
 #[cfg(any(feature = "builder-vm", test))]
 fn promote_builder_vm_stage0_cache(
     staging_dir: &std::path::Path,
@@ -2200,6 +2277,12 @@ fn promote_builder_vm_stage0_cache(
     if !builder_vm_artifact_digest_manifest_matches(staging_dir) {
         anyhow::bail!(
             "Stage 0 builder VM staging dir {} is missing matching artifact digests",
+            staging_dir.display()
+        );
+    }
+    if !builder_vm_source_cache_provenance_matches(staging_dir, source_fingerprint) {
+        anyhow::bail!(
+            "Stage 0 builder VM staging dir {} is missing matching provenance metadata",
             staging_dir.display()
         );
     }
@@ -2949,6 +3032,7 @@ mod builder_vm_bootstrap_tests {
     fn write_builder_vm_source_cache_metadata(dir: &std::path::Path, fingerprint: &str) {
         write_builder_vm_source_fingerprint(dir, fingerprint).expect("write fingerprint");
         write_builder_vm_artifact_digest_manifest(dir).expect("write artifact digest manifest");
+        write_builder_vm_source_cache_provenance(dir, fingerprint).expect("write provenance");
     }
 
     #[test]
@@ -3096,6 +3180,24 @@ mod builder_vm_bootstrap_tests {
         );
 
         write_builder_vm_artifact_digest_manifest(&cache).expect("write digest manifest");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "missing_provenance"
+        );
+
+        write_builder_vm_source_cache_provenance(&cache, "other").expect("write provenance");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "provenance_mismatch"
+        );
+
+        write_builder_vm_source_cache_provenance(&cache, "fingerprint").expect("write provenance");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "hit"
+        );
+
+        write_builder_vm_artifact_digest_manifest(&cache).expect("rewrite digest manifest");
         std::fs::OpenOptions::new()
             .append(true)
             .open(cache.join("vmlinux"))
@@ -3112,6 +3214,58 @@ mod builder_vm_bootstrap_tests {
         assert_eq!(
             builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
             "hit"
+        );
+    }
+
+    #[test]
+    fn builder_vm_source_cache_provenance_omits_local_paths_and_artifact_digests() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("builder-vm").join("aarch64");
+        write_valid_builder_vm_artifacts(&cache);
+        write_builder_vm_source_cache_metadata(&cache, "fingerprint");
+
+        let json = std::fs::read_to_string(cache.join(BUILDER_VM_PROVENANCE_FILE))
+            .expect("read provenance");
+        assert!(json.contains("\"source_kind\": \"source_checkout_stage0\""));
+        assert!(json.contains("\"source_fingerprint\": \"fingerprint\""));
+        assert!(json.contains("\"vmlinux\""));
+        assert!(json.contains("\"rootfs.ext4\""));
+        assert!(
+            !json.contains(&cache.display().to_string()),
+            "provenance must not store local cache paths: {json}"
+        );
+        assert!(
+            !json.contains("sha256"),
+            "artifact digests belong in the separate digest manifest, not provenance: {json}"
+        );
+    }
+
+    #[test]
+    fn builder_vm_source_cache_rejects_tampered_provenance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("builder-vm").join("aarch64");
+        write_valid_builder_vm_artifacts(&cache);
+        write_builder_vm_source_cache_metadata(&cache, "fingerprint");
+
+        let tampered = serde_json::json!({
+            "schema_version": 1,
+            "source_kind": "source_checkout_stage0",
+            "source_fingerprint": "other",
+            "artifacts": ["vmlinux", "rootfs.ext4"]
+        });
+        std::fs::write(
+            cache.join(BUILDER_VM_PROVENANCE_FILE),
+            serde_json::to_string_pretty(&tampered).expect("json"),
+        )
+        .expect("write tampered provenance");
+
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "provenance_mismatch"
+        );
+        assert!(
+            !builder_vm_source_cache_ready(&cache, "fingerprint"),
+            "provenance drift must force a source-checkout rebuild"
         );
     }
 
