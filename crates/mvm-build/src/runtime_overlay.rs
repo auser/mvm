@@ -163,6 +163,36 @@ pub enum RuntimeOverlayError {
     /// Underlying io failure during a file read.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+
+    /// `curl` exited non-zero (or couldn't be spawned) while
+    /// fetching one of the release artifacts. Carries the URL
+    /// and the upstream stderr so a failed download is debuggable
+    /// without re-running with `--verbose`. Plan 74 W1.4b.4 —
+    /// the download path mirrors the existing
+    /// `download_builder_vm_image` shape (ADR-002 §W5.1).
+    #[error("download failed for {url}: {reason}")]
+    DownloadFailed { url: String, reason: String },
+
+    /// A downloaded artifact's sha256 didn't match the entry in
+    /// the per-release `checksums-sha256.txt`. The mismatched
+    /// file is removed before this error is returned so a
+    /// partial install can't be reused on retry.
+    #[error(
+        "checksum mismatch for {name}: \
+         expected sha256 {expected}, computed {actual}"
+    )]
+    ChecksumMismatch {
+        name: String,
+        expected: String,
+        actual: String,
+    },
+
+    /// The fetched `checksums-sha256.txt` file didn't carry an
+    /// entry for one of the artifacts we need. Refusing to
+    /// download an artifact whose checksum we can't pre-commit
+    /// is the W5.1 fail-closed contract.
+    #[error("checksum manifest at {checksums_url} did not list an entry for {name}")]
+    ChecksumMissing { name: String, checksums_url: String },
 }
 
 /// File-system layout for one resolved overlay artifact. The
@@ -722,6 +752,303 @@ fn set_cache_perms(_p: &Path) -> Result<(), RuntimeOverlayError> {
     // Windows mvmctl is a non-goal for the boot path; the cache
     // exists for completeness but permission semantics are
     // platform-defined. No-op.
+    Ok(())
+}
+
+// ============================================================================
+// Plan 74 W1.4b — download the published runtime overlay (consumer side)
+// ============================================================================
+
+/// Default GitHub Releases base URL the W1.4b release pipeline
+/// (`runtime-overlay-image` job in `.github/workflows/release.yml`)
+/// uploads to. Override via the `MVM_OVERLAY_BASE_URL` env var for
+/// hermetic tests or a private mirror — the env path doesn't accept
+/// the `v` prefix or trailing slash; we append `/v<version>` ourselves
+/// so the test can pin to a `file://...` fixture dir.
+const DEFAULT_RELEASE_BASE: &str = "https://github.com/tinylabscom/mvm/releases/download";
+
+/// Documented escape hatch from ADR-002 §W5.1 — bypass the SHA-256
+/// integrity check when an emergency rotation requires it. Never set
+/// in CI. Matches the env var name used by `download_dev_image` and
+/// `download_builder_vm_image` so the operator runbook covers all
+/// three.
+const SKIP_HASH_VERIFY_ENV: &str = "MVM_SKIP_HASH_VERIFY";
+
+/// Release-side artifact names for one arch. Mirrors the
+/// `runtime-overlay-image` job's staging step in release.yml. Pure
+/// data — keeps the unit test naming check decoupled from the
+/// download network path.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeOverlayArtifactNames {
+    pub ext4: String,
+    pub verity: String,
+    pub roothash: String,
+    pub version: String,
+    pub checksums: String,
+}
+
+impl RuntimeOverlayArtifactNames {
+    /// Compute the per-arch release filenames the GitHub Release
+    /// publishes. The `runtime-overlay-` prefix and arch suffix
+    /// scheme is what keeps aarch64 and x86_64 from colliding in
+    /// the combined release-asset pool — they get renamed back to
+    /// canonical names (`overlay.{ext4,verity,roothash}`,
+    /// `VERSION`) when installed into the cache.
+    pub fn for_arch(arch: Arch) -> Self {
+        let a = arch.as_str();
+        Self {
+            ext4: format!("runtime-overlay-{a}.ext4"),
+            verity: format!("runtime-overlay-{a}.verity"),
+            roothash: format!("runtime-overlay-{a}.roothash"),
+            version: format!("runtime-overlay-{a}.VERSION"),
+            checksums: format!("runtime-overlay-{a}-checksums-sha256.txt"),
+        }
+    }
+}
+
+/// Construct the per-version release base URL the four artifacts
+/// live under. Production-shape:
+/// `https://github.com/tinylabscom/mvm/releases/download/v<version>`.
+/// Honors `MVM_OVERLAY_BASE_URL` for tests + private mirrors —
+/// callers pass the *prefix*, this function appends `/v<version>`.
+pub fn release_base_url(version: &str) -> String {
+    let base =
+        std::env::var("MVM_OVERLAY_BASE_URL").unwrap_or_else(|_| DEFAULT_RELEASE_BASE.to_string());
+    format!("{}/v{version}", base.trim_end_matches('/'))
+}
+
+/// Download the runtime overlay for `version` + `arch` from the
+/// published GitHub Release, SHA-256-verify each artifact, and
+/// install into `cache_root` under the canonical layout
+/// `<cache_root>/runtime-overlay/<version>/<arch>/`.
+///
+/// Mirrors the W5.1 pattern of `download_dev_image` /
+/// `download_builder_vm_image`: fetch the checksums file first;
+/// reject downloads whose hash isn't pre-committed there; honor
+/// `MVM_SKIP_HASH_VERIFY=1` only as a documented emergency
+/// rotation escape (never set in CI).
+///
+/// Returns the installed `RuntimeOverlayArtifact` so the caller
+/// can hand it straight to the backend.
+pub fn download_runtime_overlay(
+    version: &str,
+    arch: Arch,
+    cache_root: &Path,
+) -> Result<RuntimeOverlayArtifact, RuntimeOverlayError> {
+    let names = RuntimeOverlayArtifactNames::for_arch(arch);
+    let base = release_base_url(version);
+    let checksums_url = format!("{base}/{}", names.checksums);
+
+    // Step 1: fetch the checksum manifest before touching the
+    // artifacts. ADR-002 §W5.1 — the manifest is the trust anchor
+    // even before signed manifests catch up; fetching it first
+    // means a missing manifest aborts before we waste bandwidth
+    // on the (potentially large) ext4.
+    let expected = fetch_expected_hashes(
+        &checksums_url,
+        &[&names.ext4, &names.verity, &names.roothash, &names.version],
+    )?;
+
+    // Step 2: download into a temp dir, naming files locally
+    // under their canonical names so `install_overlay_into_cache`
+    // (which expects `overlay.{ext4,verity,roothash}` + `VERSION`
+    // side-by-side) can consume the temp dir directly.
+    let tmp = tempfile::tempdir()?;
+    let stage = tmp.path();
+
+    let ext4_local = stage.join("overlay.ext4");
+    let verity_local = stage.join("overlay.verity");
+    let roothash_local = stage.join("overlay.roothash");
+    let version_local = stage.join("VERSION");
+
+    curl_download(&format!("{base}/{}", names.ext4), &ext4_local)?;
+    verify_file_sha256(&ext4_local, &names.ext4, expected.get(&names.ext4))?;
+
+    curl_download(&format!("{base}/{}", names.verity), &verity_local)?;
+    verify_file_sha256(&verity_local, &names.verity, expected.get(&names.verity))?;
+
+    curl_download(&format!("{base}/{}", names.roothash), &roothash_local)?;
+    verify_file_sha256(
+        &roothash_local,
+        &names.roothash,
+        expected.get(&names.roothash),
+    )?;
+
+    curl_download(&format!("{base}/{}", names.version), &version_local)?;
+    verify_file_sha256(&version_local, &names.version, expected.get(&names.version))?;
+
+    // Step 3: read the roothash text so the returned
+    // `RuntimeOverlayArtifact` carries the value the backend
+    // bakes into the kernel cmdline (`mvm.runtime_roothash=…`).
+    let roothash = parse_roothash_text(&roothash_local)?;
+
+    // Step 4: hand off to the existing atomic installer. It
+    // copies into a staging dir under `cache_root` and renames
+    // into the canonical artifact dir on success — so a
+    // mid-install crash leaves only a `.tmp.<pid>` behind, never
+    // a partially-overwritten cache entry.
+    let staged_artifact = RuntimeOverlayArtifact {
+        overlay_ext4: ext4_local,
+        sidecar: verity_local,
+        roothash_file: roothash_local,
+        roothash,
+        arch,
+        version: version.to_string(),
+    };
+    install_overlay_into_cache(
+        &staged_artifact,
+        cache_root,
+        &InstallOptions { overwrite: true },
+    )
+}
+
+/// HTTP GET the per-release `sha256sum`-format checksums file and
+/// return a `name -> hex-digest` map for the artifacts we need.
+/// Filenames that aren't in `wanted` are dropped; any name in
+/// `wanted` that's absent from the manifest is a hard failure.
+fn fetch_expected_hashes(
+    checksums_url: &str,
+    wanted: &[&str],
+) -> Result<std::collections::HashMap<String, String>, RuntimeOverlayError> {
+    let tmp = tempfile::NamedTempFile::new()?;
+    curl_download(checksums_url, tmp.path())?;
+    let body = std::fs::read_to_string(tmp.path())?;
+    let map = parse_checksums_manifest(&body);
+
+    for w in wanted {
+        if !map.contains_key(*w) {
+            return Err(RuntimeOverlayError::ChecksumMissing {
+                name: (*w).to_string(),
+                checksums_url: checksums_url.to_string(),
+            });
+        }
+    }
+    Ok(map)
+}
+
+/// Parse a `sha256sum`-format manifest (`<64-hex>  <name>`) into a
+/// map. Pure function so the unit test exercises every corner
+/// (CRLF, leading `*` for binary mode, blank lines) without
+/// network.
+fn parse_checksums_manifest(body: &str) -> std::collections::HashMap<String, String> {
+    let mut map = std::collections::HashMap::new();
+    for line in body.lines() {
+        let mut iter = line.splitn(2, char::is_whitespace);
+        let Some(hash) = iter.next() else { continue };
+        let Some(rest) = iter.next() else { continue };
+        let name = rest.trim().trim_start_matches('*').to_string();
+        if hash.len() == 64 && hash.chars().all(|c| c.is_ascii_hexdigit()) {
+            map.insert(name, hash.to_ascii_lowercase());
+        }
+    }
+    map
+}
+
+/// Stream `path` through SHA-256 and compare to `expected`. On
+/// mismatch, delete the file (so retry can't pick up tainted
+/// bytes) and return a `ChecksumMismatch`. Honors
+/// `MVM_SKIP_HASH_VERIFY=1` per ADR-002 §W5.1.
+fn verify_file_sha256(
+    path: &Path,
+    name: &str,
+    expected: Option<&String>,
+) -> Result<(), RuntimeOverlayError> {
+    if std::env::var_os(SKIP_HASH_VERIFY_ENV).is_some() {
+        tracing::warn!(
+            "{SKIP_HASH_VERIFY_ENV} set — skipping integrity check on {name}. \
+             ADR-002 §W5.1 documents this as an emergency-rotation escape hatch."
+        );
+        return Ok(());
+    }
+    let Some(expected) = expected else {
+        // `fetch_expected_hashes` already enforces presence —
+        // surface a clear internal-error message if a refactor
+        // ever decouples the two.
+        return Err(RuntimeOverlayError::ChecksumMissing {
+            name: name.to_string(),
+            checksums_url: "(internal: missing expected hash)".to_string(),
+        });
+    };
+
+    use sha2::{Digest, Sha256};
+    let mut file = std::fs::File::open(path)?;
+    let mut hasher = Sha256::new();
+    std::io::copy(&mut file, &mut hasher)?;
+    let actual = format!("{:x}", hasher.finalize());
+
+    if actual != *expected {
+        let _ = std::fs::remove_file(path);
+        return Err(RuntimeOverlayError::ChecksumMismatch {
+            name: name.to_string(),
+            expected: expected.clone(),
+            actual,
+        });
+    }
+    Ok(())
+}
+
+/// Shell out to `curl -fSL` to download `url` to `dest`. Mirrors
+/// the existing `download_file` helper in
+/// `mvm-cli::commands::env::apple_container` so operator
+/// expectations stay uniform across the three downloaders
+/// (dev image, builder VM image, runtime overlay).
+fn curl_download(url: &str, dest: &Path) -> Result<(), RuntimeOverlayError> {
+    let output = std::process::Command::new("curl")
+        .args(["-fSL", "--silent", "--show-error", "-o"])
+        .arg(dest)
+        .arg(url)
+        .output();
+
+    match output {
+        Ok(out) if out.status.success() => Ok(()),
+        Ok(out) => {
+            let _ = std::fs::remove_file(dest);
+            let stderr = String::from_utf8_lossy(&out.stderr).into_owned();
+            let code = out
+                .status
+                .code()
+                .map(|c| c.to_string())
+                .unwrap_or_else(|| "signal".to_string());
+            Err(RuntimeOverlayError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("curl exited {code}; stderr={stderr}"),
+            })
+        }
+        Err(e) => {
+            let _ = std::fs::remove_file(dest);
+            Err(RuntimeOverlayError::DownloadFailed {
+                url: url.to_string(),
+                reason: format!("spawn curl failed: {e}"),
+            })
+        }
+    }
+}
+
+/// Read the on-disk roothash text file and validate it parses to
+/// 64 lowercase hex chars. Reuses the same shape `read_roothash`
+/// uses (`resolve` path) so a downloaded roothash matches the
+/// resolver's contract bit-for-bit.
+fn parse_roothash_text(path: &Path) -> Result<String, RuntimeOverlayError> {
+    let raw = std::fs::read_to_string(path)?;
+    let trimmed = raw.trim().to_string();
+    validate_roothash_shape(&trimmed)?;
+    Ok(trimmed)
+}
+
+fn validate_roothash_shape(s: &str) -> Result<(), RuntimeOverlayError> {
+    if s.len() != 64 {
+        return Err(RuntimeOverlayError::InvalidRoothash {
+            reason: format!("expected 64 hex chars, got {}", s.len()),
+        });
+    }
+    if !s
+        .chars()
+        .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+    {
+        return Err(RuntimeOverlayError::InvalidRoothash {
+            reason: "non-lowercase-hex character in roothash".to_string(),
+        });
+    }
     Ok(())
 }
 
@@ -1455,5 +1782,377 @@ mod tests {
             !final_entries.iter().any(|n| n == "garbage"),
             "stale staging content must not leak into final cache: {final_entries:?}"
         );
+    }
+
+    // ====================================================================
+    // Plan 74 W1.4b.4 — download_runtime_overlay tests
+    // ====================================================================
+
+    /// Per-arch release filenames must match the names the
+    /// `runtime-overlay-image` job in `.github/workflows/release.yml`
+    /// stages. A drift here is silently catastrophic: the host would
+    /// 404 on every overlay fetch. Asserting the exact strings keeps
+    /// both sides honest.
+    #[test]
+    fn artifact_names_match_release_yml_naming_aarch64() {
+        let names = RuntimeOverlayArtifactNames::for_arch(Arch::Aarch64);
+        assert_eq!(names.ext4, "runtime-overlay-aarch64.ext4");
+        assert_eq!(names.verity, "runtime-overlay-aarch64.verity");
+        assert_eq!(names.roothash, "runtime-overlay-aarch64.roothash");
+        assert_eq!(names.version, "runtime-overlay-aarch64.VERSION");
+        assert_eq!(
+            names.checksums,
+            "runtime-overlay-aarch64-checksums-sha256.txt"
+        );
+    }
+
+    #[test]
+    fn artifact_names_match_release_yml_naming_x86_64() {
+        let names = RuntimeOverlayArtifactNames::for_arch(Arch::X86_64);
+        assert_eq!(names.ext4, "runtime-overlay-x86_64.ext4");
+        assert_eq!(names.verity, "runtime-overlay-x86_64.verity");
+        assert_eq!(names.roothash, "runtime-overlay-x86_64.roothash");
+        assert_eq!(names.version, "runtime-overlay-x86_64.VERSION");
+        assert_eq!(
+            names.checksums,
+            "runtime-overlay-x86_64-checksums-sha256.txt"
+        );
+    }
+
+    /// `release_base_url` honors `MVM_OVERLAY_BASE_URL`. Pinned via a
+    /// mutex so concurrent tests don't fight over the env var.
+    #[test]
+    fn release_base_url_honors_env_override() {
+        // SAFETY: tests in this module that touch env vars must run
+        // serially. The harness runs each #[test] in its own thread;
+        // setting an env in one test and unsetting in another can
+        // race. Use a process-local mutex to serialize.
+        let _g = env_test_mutex().lock().unwrap();
+        // SAFETY: env mutation is serialized by the mutex above;
+        // no other thread can observe the inconsistent state.
+        unsafe {
+            std::env::set_var("MVM_OVERLAY_BASE_URL", "https://mirror.example.com/mvm");
+        }
+        let url = release_base_url("9.9.9");
+        assert_eq!(url, "https://mirror.example.com/mvm/v9.9.9");
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_BASE_URL");
+        }
+    }
+
+    #[test]
+    fn release_base_url_falls_back_to_default_without_env() {
+        let _g = env_test_mutex().lock().unwrap();
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_BASE_URL");
+        }
+        let url = release_base_url("0.14.0");
+        assert_eq!(
+            url,
+            "https://github.com/tinylabscom/mvm/releases/download/v0.14.0"
+        );
+    }
+
+    #[test]
+    fn release_base_url_strips_trailing_slash_on_override() {
+        let _g = env_test_mutex().lock().unwrap();
+        unsafe {
+            std::env::set_var("MVM_OVERLAY_BASE_URL", "https://mirror.example.com/mvm/");
+        }
+        let url = release_base_url("9.9.9");
+        assert_eq!(url, "https://mirror.example.com/mvm/v9.9.9");
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_BASE_URL");
+        }
+    }
+
+    fn env_test_mutex() -> &'static std::sync::Mutex<()> {
+        static M: std::sync::OnceLock<std::sync::Mutex<()>> = std::sync::OnceLock::new();
+        M.get_or_init(|| std::sync::Mutex::new(()))
+    }
+
+    #[test]
+    fn parse_checksums_manifest_accepts_sha256sum_canonical() {
+        let body = "\
+0000000000000000000000000000000000000000000000000000000000000001  runtime-overlay-aarch64.ext4
+0000000000000000000000000000000000000000000000000000000000000002  runtime-overlay-aarch64.verity
+";
+        let map = parse_checksums_manifest(body);
+        assert_eq!(
+            map.get("runtime-overlay-aarch64.ext4").unwrap(),
+            "0000000000000000000000000000000000000000000000000000000000000001"
+        );
+        assert_eq!(
+            map.get("runtime-overlay-aarch64.verity").unwrap(),
+            "0000000000000000000000000000000000000000000000000000000000000002"
+        );
+    }
+
+    #[test]
+    fn parse_checksums_manifest_strips_binary_mode_star() {
+        // `sha256sum -b` emits `<hash> *<file>` for binary mode.
+        // Both modes must parse identically.
+        let body = "0000000000000000000000000000000000000000000000000000000000000003 *runtime-overlay-x86_64.ext4";
+        let map = parse_checksums_manifest(body);
+        assert_eq!(
+            map.get("runtime-overlay-x86_64.ext4").unwrap(),
+            "0000000000000000000000000000000000000000000000000000000000000003"
+        );
+    }
+
+    #[test]
+    fn parse_checksums_manifest_lowercases_hash() {
+        // Upstream `sha256sum` always emits lowercase; some
+        // third-party tools (and `Shasum.tx256` on Windows) emit
+        // upper. Normalize so the lookup matches.
+        let body = "ABCDEF0000000000000000000000000000000000000000000000000000000000  foo.ext4";
+        let map = parse_checksums_manifest(body);
+        assert_eq!(
+            map.get("foo.ext4").unwrap(),
+            "abcdef0000000000000000000000000000000000000000000000000000000000"
+        );
+    }
+
+    #[test]
+    fn parse_checksums_manifest_skips_garbage_lines() {
+        let body = "\
+# comment line
+not-a-hash  foo.ext4
+
+0000000000000000000000000000000000000000000000000000000000000004  ok.ext4
+short  bar.ext4
+";
+        let map = parse_checksums_manifest(body);
+        assert_eq!(map.len(), 1);
+        assert!(map.contains_key("ok.ext4"));
+    }
+
+    #[test]
+    fn validate_roothash_shape_accepts_canonical() {
+        validate_roothash_shape("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+            .expect("64 lowercase hex chars must validate");
+    }
+
+    #[test]
+    fn validate_roothash_shape_rejects_wrong_length() {
+        let err = validate_roothash_shape("abc").unwrap_err();
+        assert!(
+            matches!(err, RuntimeOverlayError::InvalidRoothash { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_roothash_shape_rejects_uppercase() {
+        let err = validate_roothash_shape(
+            "ABCDEF0000000000000000000000000000000000000000000000000000000000",
+        )
+        .unwrap_err();
+        assert!(
+            matches!(err, RuntimeOverlayError::InvalidRoothash { .. }),
+            "{err:?}"
+        );
+    }
+
+    /// End-to-end download flow against a `file://` fixture: stage
+    /// the four artifacts + a checksums file on disk under names
+    /// matching the release-pipeline layout, point
+    /// `MVM_OVERLAY_BASE_URL` at the fixture dir, and assert the
+    /// installer materializes everything correctly into the cache.
+    /// Exercises every code path except the actual GitHub network
+    /// hop — same wire format, same checksums verification, same
+    /// atomic install.
+    ///
+    /// `file://` URLs work with curl (`-fSL`) the same way HTTP
+    /// URLs do, so the test exercises the exact code path
+    /// production hits.
+    #[test]
+    fn download_runtime_overlay_end_to_end_against_file_url_fixture() {
+        // SAFETY: must serialize against other env-touching tests
+        // in this module.
+        let _g = env_test_mutex().lock().unwrap();
+
+        let upstream = TempDir::new().unwrap();
+        let release_dir = upstream.path().join("v9.9.9");
+        std::fs::create_dir_all(&release_dir).unwrap();
+
+        // Fixture bytes — the actual contents don't matter for the
+        // download path, only their sha256.
+        let ext4_bytes = b"fake-ext4-bytes";
+        let verity_bytes = b"fake-verity-sidecar";
+        let roothash_text = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n";
+        let version_text = "9.9.9\n";
+        write_fixture(&release_dir, "runtime-overlay-aarch64.ext4", ext4_bytes);
+        write_fixture(&release_dir, "runtime-overlay-aarch64.verity", verity_bytes);
+        write_fixture(
+            &release_dir,
+            "runtime-overlay-aarch64.roothash",
+            roothash_text.as_bytes(),
+        );
+        write_fixture(
+            &release_dir,
+            "runtime-overlay-aarch64.VERSION",
+            version_text.as_bytes(),
+        );
+
+        let checksums = format!(
+            "{}  runtime-overlay-aarch64.ext4\n\
+             {}  runtime-overlay-aarch64.verity\n\
+             {}  runtime-overlay-aarch64.roothash\n\
+             {}  runtime-overlay-aarch64.VERSION\n",
+            sha256_hex(ext4_bytes),
+            sha256_hex(verity_bytes),
+            sha256_hex(roothash_text.as_bytes()),
+            sha256_hex(version_text.as_bytes()),
+        );
+        write_fixture(
+            &release_dir,
+            "runtime-overlay-aarch64-checksums-sha256.txt",
+            checksums.as_bytes(),
+        );
+
+        let base_url = format!("file://{}", upstream.path().display());
+        unsafe {
+            std::env::set_var("MVM_OVERLAY_BASE_URL", &base_url);
+        }
+
+        let cache = TempDir::new().unwrap();
+        let result = download_runtime_overlay("9.9.9", Arch::Aarch64, cache.path());
+
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_BASE_URL");
+        }
+
+        let installed = result.expect("download + install must succeed against fixture");
+        assert_eq!(installed.arch, Arch::Aarch64);
+        assert_eq!(installed.version, "9.9.9");
+        assert_eq!(
+            installed.roothash,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+        assert!(installed.overlay_ext4.is_file());
+        assert!(installed.sidecar.is_file());
+        assert!(installed.roothash_file.is_file());
+        // Canonical names in the cache (no `runtime-overlay-` prefix).
+        let cache_dir = cache.path().join("runtime-overlay/9.9.9/aarch64");
+        assert!(cache_dir.join("overlay.ext4").is_file());
+        assert!(cache_dir.join("overlay.verity").is_file());
+        assert!(cache_dir.join("overlay.roothash").is_file());
+        assert!(cache_dir.join("VERSION").is_file());
+        assert_eq!(
+            std::fs::read(cache_dir.join("overlay.ext4")).unwrap(),
+            ext4_bytes
+        );
+    }
+
+    /// A tampered artifact whose sha doesn't match the manifest
+    /// must be rejected, the bad file deleted, and the cache left
+    /// unchanged. This is the W5.1 fail-closed contract.
+    #[test]
+    fn download_runtime_overlay_rejects_checksum_mismatch() {
+        let _g = env_test_mutex().lock().unwrap();
+
+        let upstream = TempDir::new().unwrap();
+        let release_dir = upstream.path().join("v9.9.9");
+        std::fs::create_dir_all(&release_dir).unwrap();
+
+        let real_bytes = b"the-real-ext4-bytes";
+        let tampered_bytes = b"tampered!";
+        // Manifest commits to `real_bytes`'s hash but the served
+        // ext4 file is the tampered version.
+        write_fixture(&release_dir, "runtime-overlay-aarch64.ext4", tampered_bytes);
+        write_fixture(&release_dir, "runtime-overlay-aarch64.verity", b"v");
+        write_fixture(
+            &release_dir,
+            "runtime-overlay-aarch64.roothash",
+            b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n",
+        );
+        write_fixture(&release_dir, "runtime-overlay-aarch64.VERSION", b"9.9.9\n");
+        let checksums = format!(
+            "{}  runtime-overlay-aarch64.ext4\n\
+             {}  runtime-overlay-aarch64.verity\n\
+             {}  runtime-overlay-aarch64.roothash\n\
+             {}  runtime-overlay-aarch64.VERSION\n",
+            sha256_hex(real_bytes),
+            sha256_hex(b"v"),
+            sha256_hex(b"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef\n"),
+            sha256_hex(b"9.9.9\n"),
+        );
+        write_fixture(
+            &release_dir,
+            "runtime-overlay-aarch64-checksums-sha256.txt",
+            checksums.as_bytes(),
+        );
+
+        let base_url = format!("file://{}", upstream.path().display());
+        unsafe {
+            std::env::set_var("MVM_OVERLAY_BASE_URL", &base_url);
+        }
+        let cache = TempDir::new().unwrap();
+        let result = download_runtime_overlay("9.9.9", Arch::Aarch64, cache.path());
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_BASE_URL");
+        }
+
+        let err = result.expect_err("tampered ext4 must reject");
+        match err {
+            RuntimeOverlayError::ChecksumMismatch { name, .. } => {
+                assert_eq!(name, "runtime-overlay-aarch64.ext4");
+            }
+            other => panic!("expected ChecksumMismatch, got {other:?}"),
+        }
+        // The cache must NOT have been populated.
+        assert!(!cache.path().join("runtime-overlay/9.9.9/aarch64").exists());
+    }
+
+    /// A checksums manifest missing one of the wanted entries
+    /// aborts before any artifact is fetched. ADR-002 §W5.1.
+    #[test]
+    fn download_runtime_overlay_rejects_missing_checksum_entry() {
+        let _g = env_test_mutex().lock().unwrap();
+
+        let upstream = TempDir::new().unwrap();
+        let release_dir = upstream.path().join("v9.9.9");
+        std::fs::create_dir_all(&release_dir).unwrap();
+        // Manifest only lists three of four required entries.
+        let checksums = "\
+0000000000000000000000000000000000000000000000000000000000000001  runtime-overlay-aarch64.ext4
+0000000000000000000000000000000000000000000000000000000000000002  runtime-overlay-aarch64.verity
+0000000000000000000000000000000000000000000000000000000000000003  runtime-overlay-aarch64.roothash
+";
+        write_fixture(
+            &release_dir,
+            "runtime-overlay-aarch64-checksums-sha256.txt",
+            checksums.as_bytes(),
+        );
+
+        let base_url = format!("file://{}", upstream.path().display());
+        unsafe {
+            std::env::set_var("MVM_OVERLAY_BASE_URL", &base_url);
+        }
+        let cache = TempDir::new().unwrap();
+        let result = download_runtime_overlay("9.9.9", Arch::Aarch64, cache.path());
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_BASE_URL");
+        }
+
+        let err = result.expect_err("missing VERSION entry must reject");
+        match err {
+            RuntimeOverlayError::ChecksumMissing { name, .. } => {
+                assert_eq!(name, "runtime-overlay-aarch64.VERSION");
+            }
+            other => panic!("expected ChecksumMissing, got {other:?}"),
+        }
+    }
+
+    fn write_fixture(dir: &Path, name: &str, bytes: &[u8]) {
+        std::fs::write(dir.join(name), bytes).expect("write fixture");
+    }
+
+    fn sha256_hex(bytes: &[u8]) -> String {
+        use sha2::{Digest, Sha256};
+        let mut h = Sha256::new();
+        h.update(bytes);
+        format!("{:x}", h.finalize())
     }
 }
