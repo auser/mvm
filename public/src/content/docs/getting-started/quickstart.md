@@ -3,6 +3,14 @@ title: Quick Start
 description: Get a microVM running in under 5 minutes.
 ---
 
+:::tip[Looking for the shortest path to "it's running"?]
+[First-Use Happy Paths](/getting-started/happy-paths/) lists a
+three-command sequence for each of mvm's five audiences (CLI user,
+Python SDK, TypeScript SDK, prebuilt bundle, `mvmctl dev`). Each
+path is paired with `mvmctl doctor --workflow <name>` so the
+preflight only flags blockers your audience actually has.
+:::
+
 ## 1. Launch the Dev Environment
 
 ```bash

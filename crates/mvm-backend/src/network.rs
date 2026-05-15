@@ -140,27 +140,48 @@ pub fn tap_destroy(slot: &VmSlot) -> Result<()> {
 // ============================================================================
 
 /// Apply iptables-based network policy for a VM slot.
-/// Must be called after `tap_create()`. No-op if the policy is unrestricted.
+///
+/// Must be called after `tap_create()`. Always installs the
+/// plan-74 W2 mandatory-deny rules (cloud metadata, link-local,
+/// CGNAT, loopback) regardless of policy — even an
+/// `unrestricted` workload cannot reach `169.254.169.254` after
+/// this runs. The per-policy script (if any) is appended first
+/// so the deny rules land at the TOP of FORWARD via `-I` and
+/// fire before any allow rule.
 pub fn apply_network_policy(
     slot: &VmSlot,
     policy: &mvm_core::network_policy::NetworkPolicy,
 ) -> Result<()> {
+    let mut combined = String::from("set -euo pipefail\n");
+
+    // Per-policy rules (allow-list, DROP, DNS, ESTABLISHED).
+    // Emitted FIRST so subsequent `-I` of the mandatory-deny
+    // rules pushes them under the deny set in chain order. None
+    // for unrestricted policies — that's fine; the deny rules
+    // still apply.
     if let Some(script) = policy.iptables_script(BRIDGE_DEV, &slot.guest_ip) {
-        ui::info(&format!(
-            "Applying network policy for VM '{}'...",
-            slot.name
-        ));
-        run_in_vm_visible(&format!("set -euo pipefail\n{}", script))
-    } else {
-        Ok(())
+        combined.push_str(&script);
     }
+
+    // Mandatory-deny rules. Emitted LAST so they land at the
+    // top of FORWARD (highest priority). Plan 74 W2 §item 4.
+    combined.push_str(&mvm_core::network_policy::mandatory_deny_iptables_script(
+        BRIDGE_DEV,
+        &slot.guest_ip,
+    ));
+
+    ui::info(&format!(
+        "Applying network policy for VM '{}'...",
+        slot.name
+    ));
+    run_in_vm_visible(&combined)
 }
 
 /// Remove all network policy iptables rules for a VM slot.
 /// Flushes any FORWARD rules matching this guest IP, regardless of what
 /// policy was originally applied. Safe to call even if no policy was set.
 pub fn cleanup_network_policy(slot: &VmSlot) -> Result<()> {
-    run_in_vm_visible(&format!(
+    let mut script = format!(
         "# Clean up all FORWARD rules for {ip}\n\
          while sudo iptables -D FORWARD -i {br} -s {ip} -j DROP 2>/dev/null; do :; done\n\
          while sudo iptables -D FORWARD -i {br} -s {ip} -m state --state ESTABLISHED,RELATED -j ACCEPT 2>/dev/null; do :; done\n\
@@ -169,5 +190,17 @@ pub fn cleanup_network_policy(slot: &VmSlot) -> Result<()> {
          while sudo iptables -D FORWARD -i {br} -s {ip} -p tcp -j ACCEPT 2>/dev/null; do :; done\n",
         br = BRIDGE_DEV,
         ip = slot.guest_ip,
-    ))
+    );
+
+    // Plan 74 W2 §item 4 — drain any mandatory-deny rules added
+    // by `apply_network_policy`. Symmetric with the apply path
+    // so a stop/start cycle doesn't accumulate stale entries.
+    script.push_str(
+        &mvm_core::network_policy::mandatory_deny_iptables_cleanup_script(
+            BRIDGE_DEV,
+            &slot.guest_ip,
+        ),
+    );
+
+    run_in_vm_visible(&script)
 }
