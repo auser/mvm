@@ -717,8 +717,8 @@ pub(super) fn ensure_dev_image() -> Result<(String, String)> {
                 Ok((kernel_path, rootfs_path))
             } else {
                 Err(download_err.context(
-                    "no local fallback found under ~/.mvm/dev/prebuilt/v*/ \
-                     or ~/.mvm/dev/builds/*/",
+                    "no local fallback found under ~/.mvm/dev/current/, \
+                     ~/.mvm/dev/prebuilt/v*/, or ~/.mvm/dev/builds/*/",
                 ))
             }
         }
@@ -785,8 +785,17 @@ fn ensure_source_checkout_dev_image(
 }
 
 /// Search for any locally-cached dev image as a fallback when the
-/// published-prebuilt download fails. Looks under:
+/// published-prebuilt download fails or as a Stage 0 seed when the
+/// builder VM cache is empty. Looks under, in order of precedence
+/// when mtimes tie:
 ///
+/// - `~/.mvm/dev/current/{vmlinux,rootfs.ext4}` — the canonical
+///   "live" dev image written by `build_image_via_libkrun` and read
+///   by `resolve_dev_status_image`. Present whenever `mvmctl dev up`
+///   has succeeded at least once on this host; survives a manual
+///   delete of `~/.cache/mvm/builder-vm/`. This is the load-bearing
+///   seed for Plan 77 Stage 0 — without it, a contributor who blew
+///   away the builder VM cache would have no path back.
 /// - `~/.mvm/dev/prebuilt/v*/{vmlinux,rootfs.ext4}` — previously
 ///   downloaded prebuilts for earlier versions.
 /// - `~/.mvm/dev/builds/<hash>/{vmlinux,rootfs.ext4}` — historical
@@ -794,12 +803,37 @@ fn ensure_source_checkout_dev_image(
 ///
 /// Returns the most-recently-modified pair so a user with a recent
 /// successful build/download keeps booting, with a short label
-/// (e.g. `v0.13.0` or `builds/abcdef…`) for the warning surface.
-/// `None` means nothing usable was found.
+/// (e.g. `current`, `prebuilt/v0.13.0`, or `builds/abcdef…`) for the
+/// warning surface. `None` means nothing usable was found.
 fn find_local_fallback_image() -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
     let dev_root = format!("{}/dev", mvm_core::config::mvm_data_dir());
 
     let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, String)> = Vec::new();
+    // Silently skip cache entries that look corrupt (stub bytes from
+    // a botched earlier copy, half-written downloads, stale symlinks
+    // from the legacy nix-darwin `current/` layout). The auto-discover
+    // path is best-effort — surfacing every bad candidate as a warning
+    // would spam the boot path; the cascade just falls through to a
+    // healthier candidate or to the next layer.
+    let mut consider = |dir: std::path::PathBuf, label: String| {
+        let kernel = dir.join("vmlinux");
+        let rootfs = dir.join("rootfs.ext4");
+        if !kernel.is_file() || !rootfs.is_file() {
+            return;
+        }
+        if validate_dev_image_artifacts(&kernel, &rootfs).is_err() {
+            return;
+        }
+        let mtime = std::fs::metadata(&rootfs)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        candidates.push((mtime, dir, label));
+    };
+
+    consider(
+        std::path::Path::new(&dev_root).join("current"),
+        "current".to_string(),
+    );
     for sub in ["prebuilt", "builds"] {
         let parent = std::path::Path::new(&dev_root).join(sub);
         let Ok(entries) = std::fs::read_dir(&parent) else {
@@ -810,25 +844,8 @@ fn find_local_fallback_image() -> Option<(std::path::PathBuf, std::path::PathBuf
             if !dir.is_dir() {
                 continue;
             }
-            let kernel = dir.join("vmlinux");
-            let rootfs = dir.join("rootfs.ext4");
-            if !kernel.is_file() || !rootfs.is_file() {
-                continue;
-            }
-            // Silently skip cache entries that look corrupt (stub
-            // bytes from a botched earlier copy, half-written
-            // downloads, etc.). The auto-discover path is best-effort
-            // — surfacing every bad candidate as a warning would
-            // spam the boot path; the cascade just falls through to
-            // a healthier candidate or to the next layer.
-            if validate_dev_image_artifacts(&kernel, &rootfs).is_err() {
-                continue;
-            }
-            let mtime = std::fs::metadata(&rootfs)
-                .and_then(|m| m.modified())
-                .unwrap_or(std::time::UNIX_EPOCH);
             let label = format!("{sub}/{}", entry.file_name().to_string_lossy());
-            candidates.push((mtime, dir, label));
+            consider(dir, label);
         }
     }
 
@@ -1903,9 +1920,9 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     let (kernel, rootfs, source_label) = find_local_fallback_image().ok_or_else(|| {
         anyhow::anyhow!(
             "source checkout builder VM cache is missing and no local dev image cache was found \
-             under ~/.mvm/dev/prebuilt/v*/ or ~/.mvm/dev/builds/*/. Refusing to download a \
-             published builder VM prebuilt. Import or build a dev image that contains \
-             /sbin/mvm-builder-init, then retry `mvmctl dev up`."
+             under ~/.mvm/dev/current/, ~/.mvm/dev/prebuilt/v*/, or ~/.mvm/dev/builds/*/. \
+             Refusing to download a published builder VM prebuilt. Import or build a dev image \
+             that contains /sbin/mvm-builder-init, then retry `mvmctl dev up`."
         )
     })?;
 
@@ -2604,6 +2621,91 @@ mod dev_status_image_tests {
         );
 
         assert_eq!(resolve_dev_status_image(), None);
+    }
+
+    /// Write a `(vmlinux, rootfs.ext4)` pair that satisfies
+    /// `validate_dev_image_artifacts` (size floor + ext4 magic).
+    fn write_valid_dev_image(dir: &std::path::Path) {
+        const EXT4_MAGIC_OFFSET: usize = 1024 + 56;
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("vmlinux"), vec![0x7f; 1024 * 1024 + 1]).unwrap();
+        let mut rootfs = vec![0u8; 4 * 1024 * 1024 + 1];
+        rootfs[EXT4_MAGIC_OFFSET] = 0x53;
+        rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
+        std::fs::write(dir.join("rootfs.ext4"), rootfs).unwrap();
+    }
+
+    /// Plan 77 W1 — `~/.mvm/dev/current/` is the load-bearing seed for
+    /// Stage 0 when the builder VM cache is empty but a dev image was
+    /// previously built on this host. Closes the gap where a contributor
+    /// who deleted `~/.cache/mvm/builder-vm/<arch>/` got a hard error
+    /// even though a valid seed was sitting at `dev/current/`.
+    #[test]
+    fn fallback_image_finds_dev_current() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &data_dir,
+            &tmp.path().join("cache"),
+        );
+
+        let current = data_dir.join("dev/current");
+        write_valid_dev_image(&current);
+
+        let (kernel, rootfs, label) =
+            find_local_fallback_image().expect("dev/current/ pair must be discovered");
+        assert_eq!(kernel, current.join("vmlinux"));
+        assert_eq!(rootfs, current.join("rootfs.ext4"));
+        assert_eq!(label, "current");
+    }
+
+    /// When multiple candidates exist, the most-recently-modified one
+    /// wins. Guards against a stale `prebuilt/` entry hiding a fresh
+    /// `current/` image (or vice versa).
+    #[test]
+    fn fallback_image_prefers_most_recent_candidate() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &data_dir,
+            &tmp.path().join("cache"),
+        );
+
+        let prebuilt = data_dir.join("dev/prebuilt/v0.0.1");
+        let current = data_dir.join("dev/current");
+        write_valid_dev_image(&prebuilt);
+        write_valid_dev_image(&current);
+        // Force `current/` to be strictly newer than `prebuilt/` —
+        // coarse-mtime filesystems (HFS+, some tmpfs) can otherwise
+        // collide two writes into the same second.
+        let later = std::time::SystemTime::now() + std::time::Duration::from_secs(2);
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(current.join("rootfs.ext4"))
+            .unwrap()
+            .set_modified(later)
+            .unwrap();
+
+        let (_, _, label) = find_local_fallback_image().expect("a candidate must be discovered");
+        assert_eq!(label, "current");
+    }
+
+    /// No candidates anywhere → `None`. Smoke-test for the empty case.
+    #[test]
+    fn fallback_image_is_none_when_no_pair_exists() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &tmp.path().join("data"),
+            &tmp.path().join("cache"),
+        );
+
+        assert!(find_local_fallback_image().is_none());
     }
 }
 
