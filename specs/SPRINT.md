@@ -57,6 +57,7 @@ Recent maintenance:
 - [x] Bound source-checkout builder-image cache reuse to a SHA-256 fingerprint of `nix/images/builder-vm/{flake.nix,flake.lock}`, so stale but structurally valid builder caches are rebuilt instead of masking local source changes.
 - [x] Added source-built builder-cache artifact digest metadata; source checkout cache hits now require the fingerprint and cached `vmlinux` / `rootfs.ext4` / optional `cmdline.txt` digests to match before reuse.
 - [x] Added safe source-checkout builder-cache diagnostics; verbose output now reports non-sensitive cache decision reason codes such as `hit`, `fingerprint_mismatch`, and `artifact_digest_mismatch`.
+- [x] Added source-built builder-cache provenance metadata; source-checkout cache hits now require a non-sensitive provenance summary matching the source fingerprint and artifact filename set, with `missing_provenance` / `provenance_mismatch` diagnostics.
 - [x] Plan 77 W4: gated `download_builder_vm_image` and its helpers behind the off-by-default `release-artifact-bootstrap` feature so contributor builds cannot reach the published-prebuilt path at compile time, with `perform_builder_vm_download_published_bails_without_feature` locking the structural-failure shape into the test suite.
 
 ## In-flight workstreams
