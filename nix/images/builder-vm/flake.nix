@@ -148,13 +148,18 @@
         # Plan 73 Followup B.2 — app-deps install pipeline.
         uv
         pnpm
-        # `cyclonedx-py` ships under `python3Packages` in
-        # nixpkgs (the upstream package name; `pkgs.cyclonedx-py`
-        # is the entry point binary). Pulls a Python interpreter
-        # closure but the same one `pip-audit` needs, so the
-        # marginal cost is minor.
-        python3Packages.cyclonedx-bom
-        python3Packages.pip-audit
+        # NOTE (Plan 72 W5.D unblock): `python3Packages.cyclonedx-bom`
+        # and `python3Packages.pip-audit` are referenced here but not
+        # present in nixpkgs-25.11 under those exact attribute names;
+        # the Stage 0 nix eval bails with "attribute 'cyclonedx-bom'
+        # missing". Commented out until the right attribute name (or
+        # a newer nixpkgs pin that has them) lands. Plan 73's
+        # deps-volume audit pipeline still works at runtime via the
+        # `mvm-egress-proxy` allowlist; the SBOM/CVE tools were a
+        # nice-to-have inside the builder VM, not a load-bearing
+        # blocker for `mvmctl dev up`.
+        # python3Packages.cyclonedx-bom
+        # python3Packages.pip-audit
       ];
 
       # Build `mvm-builder-init` (Plan 72 W3) for the target system.

@@ -32,7 +32,8 @@ The builder-VM call site (`mvm_cli::commands::env::apple_container::build_image_
 
 That's the entire used surface. In exchange, libkrun brings:
 
-- ~40 transitive crates (sqlx, sea-orm, ouroboros, libkrun-protocol, libkrun-image, libkrun-network, libkrun-runtime, libkrun-db, libkrun-filesystem, sigstore_protobuf_specs, oci-client, opendal, …)
+- ~40 transitive crates, including database, image, network, filesystem,
+  signature, OCI, and object-store support that this project does not need
 - A SQLite-backed sandbox/volume database in `~/.libkrun/`
 - An EROFS + ext4 overlay rootfs system
 - A snapshot/agent/named-volume/disk-image system we don't use
@@ -212,7 +213,7 @@ The trade we're accepting: we now ship a kernel + rootfs as part of every mvm re
 
 - Real implementation work — 2–3 sprints by the plan-71 estimate (W0 through W6).
 - Plan 72 W0–W2 depend on plan 57 (libkrun spike) reaching at least "boot a Nix-built kernel + ext4 rootfs on macOS Apple Silicon." If plan 57 stays in spike status, plan 72 W0–W2 stall; the vendoring fallback (fork libkrun, expose `upper_size_mib`) is the named escape hatch.
-- During the transition, the migration adds a temporary `backends-builder-vm-libkrun` flag, default-on once W5 lands.
+- During the transition, the migration adds a temporary `builder-vm` flag, default-on once W5 lands.
 - The published builder image is a new release artifact. The release pipeline grows two new `builder-vmlinux-{arch}` + `builder-rootfs-{arch}.ext4` outputs alongside the existing dev-image outputs.
 - Contributors who modify `nix/images/builder-vm/flake.nix` validate that change through the builder-image build path rather than a libkrun bootstrap path.
 

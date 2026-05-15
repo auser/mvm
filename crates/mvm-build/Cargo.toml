@@ -32,7 +32,7 @@ anyhow.workspace = true
 chrono.workspace = true
 # Plan 72 W1: optional libkrun FFI dep for the in-tree builder VM
 # launcher (`libkrun_builder::LibkrunBuilderVm`). Gated by
-# `backends-builder-vm-libkrun`; default-off until Plan 72 W5
+# `builder-vm`; default-off until Plan 72 W5
 # cutover flips polarity.
 mvm-libkrun = { workspace = true, optional = true }
 serde.workspace = true
@@ -49,11 +49,11 @@ tempfile.workspace = true
 
 [features]
 default = []
-# Plan 72 W1: libkrun-direct builder VM launcher (default-off
-# scaffolding through W4; default-on after W5 cutover). Pulls
-# the `mvm-libkrun` FFI crate which itself gates the underlying
+# Plan 72 W1: libkrun-direct builder VM launcher. Pulls the
+# `mvm-libkrun` FFI crate which itself gates the underlying
 # `libkrun-sys` bindings.
-backends-builder-vm-libkrun = ["dep:mvm-libkrun"]
+contributor-bootstrap = []
+builder-vm = ["dep:mvm-libkrun"]
 
 [lints]
 workspace = true

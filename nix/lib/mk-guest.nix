@@ -350,19 +350,51 @@ let
   # builder can reach it without duplicating the agent derivation.
   verityInitBinary = "${guestAgentPkg}/bin/mvm-verity-init";
 
-  # extraFiles — { "absolute/path" = { content; mode?; }; }
+  # extraFiles — three accepted spec shapes per target path:
+  #
+  #   { "absolute/path" = { content = "..."; mode? = "0644"; }; }
+  #     → write text content via `pkgs.writeText`. Default mode 0644.
+  #
+  #   { "absolute/path" = { source = "/nix/store/.../bin/foo"; mode? = "0755"; }; }
+  #     → copy an existing file (typically a built binary) from the
+  #       given store path. Default mode 0755 (executables dominate).
+  #
+  #   { "absolute/path" = "/nix/store/.../bin/foo"; }
+  #     → shorthand for `{ source = <that string>; }`.
+  #
+  # Binary-source variants exist so Plan 72's builder-vm flake can
+  # install `mvm-builder-init` at `/sbin/mvm-builder-init` without
+  # inlining its bytes as a string (`writeText` is text-only).
   extraFilePopulation = lib.concatMapStringsSep "\n"
     (path:
       let
-        spec = extraFiles.${path};
-        mode = spec.mode or "0644";
-        target = "$out${path}";
+        rawSpec = extraFiles.${path};
+        spec =
+          if builtins.isString rawSpec then { source = rawSpec; }
+          else rawSpec;
+        hasContent = spec ? content;
+        hasSource = spec ? source;
+        mode =
+          if spec ? mode then spec.mode
+          else if hasSource then "0755"
+          else "0644";
+        src =
+          if hasContent then
+            pkgs.writeText "extra-${builtins.hashString "sha256" path}" spec.content
+          else if hasSource then
+            spec.source
+          else
+            throw "mkGuest: extraFiles[${path}] must set either `content` (text) or `source` (file path)";
       in
+      # Path arrives from Nix-interpolated keys (no shell escaping
+      # needed); inline via `"$out${path}"` rather than via
+      # `lib.escapeShellArg` so the shell expands `$out` instead of
+      # treating it as a literal in single quotes.
       ''
-        mkdir -p "$(dirname ${lib.escapeShellArg target})"
+        mkdir -p "$out$(dirname ${lib.escapeShellArg path})"
         ${pkgs.coreutils}/bin/install -m ${mode} \
-          ${pkgs.writeText "extra-${builtins.hashString "sha256" path}" spec.content} \
-          ${lib.escapeShellArg target}
+          ${src} \
+          "$out${path}"
       ''
     )
     (lib.attrNames extraFiles);
@@ -380,8 +412,11 @@ let
     set -e
     mkdir -p "$out"
 
-    # Standard FHS dirs the kernel + init expect.
-    mkdir -p "$out"/{bin,sbin,etc,proc,sys,dev,tmp,run,var,root,home,nix/store,etc/mvm}
+    # Standard FHS dirs the kernel + init expect. `/nix-store`,
+    # `/job`, `/out`, `/work` are mount points the libkrun builder
+    # VM (Plan 72 W3) needs pre-created — rootfs boots `ro` so
+    # `mvm-builder-init` can't `mkdir` them at runtime.
+    mkdir -p "$out"/{bin,sbin,etc,proc,sys,dev,tmp,run,var,root,home,nix/store,nix-store,etc/mvm,job,out,work}
     chmod 1777 "$out/tmp"
     chmod 0755 "$out/run"
 
@@ -458,6 +493,22 @@ let
     fi
     chmod 0644 "$out/etc/group"
 
+    # Default /etc/resolv.conf and CA cert bundle — needed for any
+    # guest that talks to the network over TLS (most Nix flake
+    # fetches reach cache.nixos.org / api.github.com). Cloudflare +
+    # Google as the canonical no-infra-of-my-own DNS defaults; the
+    # cert bundle is the standard Mozilla one from `pkgs.cacert`.
+    cat > "$out/etc/resolv.conf" <<EOF
+    nameserver 1.1.1.1
+    nameserver 8.8.8.8
+    EOF
+    chmod 0644 "$out/etc/resolv.conf"
+
+    mkdir -p "$out/etc/ssl/certs"
+    cp ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt "$out/etc/ssl/certs/ca-bundle.crt"
+    ln -sf /etc/ssl/certs/ca-bundle.crt "$out/etc/ssl/certs/ca-certificates.crt"
+    chmod 0644 "$out/etc/ssl/certs/ca-bundle.crt"
+
     # mvm-guest-agent — installed under /usr/local/bin so /init can
     # exec it. Mode 0555 so the agent can't rewrite itself; ownership
     # is the build-time user (Nix sandbox has no root) — Phase 6 W2.2
@@ -515,17 +566,25 @@ let
     # Extra user-supplied files.
     ${extraFilePopulation}
 
-    # Closure of additional packages — copy each into /usr/local/bin
-    # by symlink so they're on PATH alongside the busybox applets.
+    # Closure of additional packages — symlink each binary into
+    # `/usr/local/bin` AND `/sbin` so the standard system-binary
+    # paths (`/sbin/mkfs.ext4`, `/sbin/udhcpc`, etc.) resolve.
+    # `mvm-builder-init` uses those paths verbatim and would
+    # ENOENT-fail without them (e.g. e2fsprogs ships mkfs.ext4 in
+    # the package's sbin subdir, not bin).
     mkdir -p "$out/usr/local/bin"
     ${lib.concatMapStringsSep "\n"
       (pkg: ''
-        if [ -d "${pkg}/bin" ]; then
-          for bin in "${pkg}"/bin/*; do
-            [ -e "$bin" ] || continue
-            ln -sf "$bin" "$out/usr/local/bin/$(basename "$bin")"
-          done
-        fi
+        for srcdir in bin sbin; do
+          if [ -d "${pkg}/$srcdir" ]; then
+            for binpath in "${pkg}/$srcdir"/*; do
+              [ -e "$binpath" ] || continue
+              name=$(basename "$binpath")
+              ln -sf "$binpath" "$out/usr/local/bin/$name"
+              ln -sf "$binpath" "$out/sbin/$name"
+            done
+          fi
+        done
       '')
       packages}
   '';

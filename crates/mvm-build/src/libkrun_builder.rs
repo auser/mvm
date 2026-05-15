@@ -41,7 +41,7 @@
 //!
 //! ## Feature gate
 //!
-//! Gated behind `backends-builder-vm-libkrun`. Default-off until
+//! Gated behind `builder-vm`. Default-off until
 //! Plan 72 W5.B / W5.C cutover flips `ensure_dev_image` to dispatch
 //! through `LibkrunBuilderVm`. Library consumers that don't need
 //! the libkrun builder build with `default-features = false`.
@@ -249,7 +249,7 @@ impl BuilderVm for LibkrunBuilderVm {
         self.validate_job(job)?;
 
         // 2. Refuse to proceed on a host without libkrun. The
-        //    `backends-builder-vm-libkrun` feature being compiled
+        //    `builder-vm` feature being compiled
         //    in doesn't imply the runtime library is installed.
         if !mvm_libkrun::is_available() {
             return Err(BuilderVmError::LibkrunUnavailable(format!(
@@ -297,6 +297,12 @@ impl BuilderVm for LibkrunBuilderVm {
             ))
         })?;
 
+        // Route the guest's serial console to a per-VM log file so
+        // failures of the in-VM cmd.sh / mvm-builder-init produce a
+        // readable transcript. Without this, libkrun discards the
+        // hvc0 output silently and "supervisor running, then exits 1"
+        // is the only observable signal.
+        let console_log = vm_state_dir.join("console.log");
         let krun = KrunContext::new(
             &vm_name,
             path_to_str(&image.kernel_path, "kernel_path")?,
@@ -304,6 +310,7 @@ impl BuilderVm for LibkrunBuilderVm {
         )
         .with_resources(self.vcpus, self.memory_mib)
         .with_cmdline(&image.cmdline)
+        .with_console_output(path_to_str(&console_log, "console_log")?)
         .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
         .add_disk(
             "nix-store",
@@ -567,8 +574,32 @@ set -eu
 FLAKE_REF='{flake_ref}'
 ATTR_PATH='{attr_path}'
 
+# Point HOME and Nix's cache/state dirs at the writable tmpfs (`/tmp`).
+# The rootfs is mounted `ro`, so nix tries `~/.cache/nix` and bails
+# with "creating directory '//.cache/nix': Read-only file system"
+# when HOME stays at the default `/`. /tmp is tmpfs, lives only for
+# this VM's lifetime — fine for a single-shot build.
+export HOME=/tmp
+export XDG_CACHE_HOME=/tmp/.cache
+export XDG_STATE_HOME=/tmp/.local/state
+mkdir -p /tmp/.cache /tmp/.local/state
+
+# CA certs for TLS to cache.nixos.org / api.github.com.
+export CURL_CA_BUNDLE=/etc/ssl/certs/ca-bundle.crt
+export NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
+export SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
+
 cd /work
-export NIX_CONFIG="experimental-features = nix-command flakes"
+# `experimental-features` enables nix-command + flakes. `sandbox =
+# false` + `build-users-group =` is mandatory inside the builder
+# VM: there are no `nixbld*` accounts in the rootfs and no kernel
+# user-ns isolation for build sandboxes, so every derivation would
+# otherwise fail with "the group 'nixbld' specified in
+# 'build-users-group' does not exist". The builder VM IS the
+# isolation boundary, so an in-guest sandbox is redundant.
+export NIX_CONFIG="experimental-features = nix-command flakes
+sandbox = false
+build-users-group ="
 # Plan 72 W0's flake convention: workspace-path env var so
 # flakes that reference the workspace root don't depend on
 # relative-path resolution against the store-copied flake dir.
