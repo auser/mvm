@@ -69,10 +69,7 @@ impl IptablesRunner for SystemIptables {
 /// because that partial state is more permissive than the
 /// pre-call baseline (no rules) and just leaving it in place
 /// would let unrestricted egress continue.
-pub fn install_egress_lockdown(
-    runner: &dyn IptablesRunner,
-    proxy_uid: u32,
-) -> Result<(), String> {
+pub fn install_egress_lockdown(runner: &dyn IptablesRunner, proxy_uid: u32) -> Result<(), String> {
     let uid_str = proxy_uid.to_string();
     runner.run(&["-A", "OUTPUT", "-o", "lo", "-j", "ACCEPT"])?;
     runner.run(&[
