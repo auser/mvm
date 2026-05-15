@@ -17,6 +17,7 @@ use crate::ui;
 
 pub(super) const DEV_VM_NAME: &str = "mvm-dev";
 const BUILDER_VM_SOURCE_FINGERPRINT_FILE: &str = ".mvm-source.sha256";
+const BUILDER_VM_ARTIFACT_DIGEST_FILE: &str = ".mvm-artifacts.sha256";
 
 /// Check if the Apple Container dev VM is running *and* reachable
 /// cross-process via the vsock proxy socket.
@@ -1937,6 +1938,7 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
         return Err(e);
     }
     write_builder_vm_source_fingerprint(&staging_dir, source_fingerprint)?;
+    write_builder_vm_artifact_digest_manifest(&staging_dir)?;
 
     if let Err(e) = promote_builder_vm_stage0_cache(&staging_dir, out_dir, source_fingerprint) {
         let _ = std::fs::remove_dir_all(&staging_dir);
@@ -2058,6 +2060,7 @@ fn builder_vm_source_fingerprint(builder_flake_dir: &str) -> Result<String> {
 fn builder_vm_source_cache_ready(dir: &std::path::Path, expected_fingerprint: &str) -> bool {
     validate_builder_vm_stage0_artifacts(dir).is_ok()
         && builder_vm_source_fingerprint_matches(dir, expected_fingerprint)
+        && builder_vm_artifact_digest_manifest_matches(dir)
 }
 
 fn builder_vm_source_fingerprint_matches(
@@ -2081,6 +2084,40 @@ fn write_builder_vm_source_fingerprint(
     .with_context(|| format!("writing builder VM source fingerprint in {}", dir.display()))
 }
 
+fn builder_vm_artifact_digest_manifest(dir: &std::path::Path) -> Result<String> {
+    let mut lines = Vec::new();
+    for name in ["vmlinux", "rootfs.ext4", "cmdline.txt"] {
+        let path = dir.join(name);
+        if !path.exists() {
+            if name == "cmdline.txt" {
+                continue;
+            }
+            anyhow::bail!("builder VM artifact digest missing {}", path.display());
+        }
+        let bytes = std::fs::read(&path)
+            .with_context(|| format!("reading builder VM artifact {}", path.display()))?;
+        lines.push(format!("{:x}  {name}", Sha256::digest(&bytes)));
+    }
+    Ok(format!("{}\n", lines.join("\n")))
+}
+
+fn builder_vm_artifact_digest_manifest_matches(dir: &std::path::Path) -> bool {
+    let expected = match builder_vm_artifact_digest_manifest(dir) {
+        Ok(expected) => expected,
+        Err(_) => return false,
+    };
+    std::fs::read_to_string(dir.join(BUILDER_VM_ARTIFACT_DIGEST_FILE))
+        .map(|actual| actual == expected)
+        .unwrap_or(false)
+}
+
+#[cfg(any(feature = "builder-vm", test))]
+fn write_builder_vm_artifact_digest_manifest(dir: &std::path::Path) -> Result<()> {
+    let manifest = builder_vm_artifact_digest_manifest(dir)?;
+    std::fs::write(dir.join(BUILDER_VM_ARTIFACT_DIGEST_FILE), manifest)
+        .with_context(|| format!("writing builder VM artifact digests in {}", dir.display()))
+}
+
 #[cfg(any(feature = "builder-vm", test))]
 fn promote_builder_vm_stage0_cache(
     staging_dir: &std::path::Path,
@@ -2091,6 +2128,12 @@ fn promote_builder_vm_stage0_cache(
     if !builder_vm_source_fingerprint_matches(staging_dir, source_fingerprint) {
         anyhow::bail!(
             "Stage 0 builder VM staging dir {} is missing the expected source fingerprint",
+            staging_dir.display()
+        );
+    }
+    if !builder_vm_artifact_digest_manifest_matches(staging_dir) {
+        anyhow::bail!(
+            "Stage 0 builder VM staging dir {} is missing matching artifact digests",
             staging_dir.display()
         );
     }
@@ -2117,7 +2160,12 @@ fn promote_builder_vm_stage0_cache(
             final_dir.display()
         )
     })?;
-    validate_builder_vm_stage0_artifacts(final_dir)?;
+    if !builder_vm_source_cache_ready(final_dir, source_fingerprint) {
+        anyhow::bail!(
+            "promoted Stage 0 builder VM cache {} failed source-cache validation",
+            final_dir.display()
+        );
+    }
     Ok(())
 }
 
@@ -2692,6 +2740,7 @@ mod builder_vm_bootstrap_tests {
     //! Plan 72 W5 — `find_builder_vm_flake` + `bootstrap_builder_vm_image`.
     use super::*;
     use std::cell::Cell;
+    use std::io::Write;
 
     #[test]
     fn find_builder_vm_flake_resolves_to_in_repo_path() {
@@ -2831,6 +2880,11 @@ mod builder_vm_bootstrap_tests {
         }
     }
 
+    fn write_builder_vm_source_cache_metadata(dir: &std::path::Path, fingerprint: &str) {
+        write_builder_vm_source_fingerprint(dir, fingerprint).expect("write fingerprint");
+        write_builder_vm_artifact_digest_manifest(dir).expect("write artifact digest manifest");
+    }
+
     #[test]
     fn builder_vm_stage0_staging_dir_is_hidden_sibling() {
         let tmp = tempfile::tempdir().expect("tempdir");
@@ -2856,7 +2910,7 @@ mod builder_vm_bootstrap_tests {
         std::fs::create_dir_all(&staging).expect("mkdir staging");
         std::fs::write(staging.join("vmlinux"), b"stub").expect("write stub kernel");
         std::fs::write(staging.join("rootfs.ext4"), b"stub").expect("write stub rootfs");
-        write_builder_vm_source_fingerprint(&staging, "fingerprint").expect("write fingerprint");
+        write_builder_vm_source_cache_metadata(&staging, "fingerprint");
         let final_dir = tmp.path().join("aarch64");
 
         let err = promote_builder_vm_stage0_cache(&staging, &final_dir, "fingerprint")
@@ -2875,7 +2929,7 @@ mod builder_vm_bootstrap_tests {
         let staging = tmp.path().join(".aarch64.stage0-test");
         let final_dir = tmp.path().join("aarch64");
         write_valid_builder_vm_artifacts(&staging);
-        write_builder_vm_source_fingerprint(&staging, "fingerprint").expect("write fingerprint");
+        write_builder_vm_source_cache_metadata(&staging, "fingerprint");
 
         promote_builder_vm_stage0_cache(&staging, &final_dir, "fingerprint")
             .expect("valid artifacts should promote");
@@ -2891,9 +2945,9 @@ mod builder_vm_bootstrap_tests {
         let staging = tmp.path().join(".aarch64.stage0-test");
         let final_dir = tmp.path().join("aarch64");
         write_valid_builder_vm_artifacts(&staging);
-        write_builder_vm_source_fingerprint(&staging, "fingerprint").expect("write fingerprint");
+        write_builder_vm_source_cache_metadata(&staging, "fingerprint");
         write_valid_builder_vm_artifacts(&final_dir);
-        write_builder_vm_source_fingerprint(&final_dir, "fingerprint").expect("write fingerprint");
+        write_builder_vm_source_cache_metadata(&final_dir, "fingerprint");
 
         promote_builder_vm_stage0_cache(&staging, &final_dir, "fingerprint")
             .expect("existing valid cache should win the race");
@@ -2930,13 +2984,33 @@ mod builder_vm_bootstrap_tests {
             !builder_vm_source_cache_ready(&cache, "fingerprint"),
             "valid artifacts without a source marker must not satisfy source checkout cache"
         );
-        write_builder_vm_source_fingerprint(&cache, "other").expect("write fingerprint");
+        write_builder_vm_source_cache_metadata(&cache, "other");
         assert!(
             !builder_vm_source_cache_ready(&cache, "fingerprint"),
             "stale source marker must not satisfy source checkout cache"
         );
-        write_builder_vm_source_fingerprint(&cache, "fingerprint").expect("write fingerprint");
+        write_builder_vm_source_cache_metadata(&cache, "fingerprint");
         assert!(builder_vm_source_cache_ready(&cache, "fingerprint"));
+    }
+
+    #[test]
+    fn builder_vm_source_cache_rejects_tampered_artifact_after_metadata() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("builder-vm").join("aarch64");
+        write_valid_builder_vm_artifacts(&cache);
+        write_builder_vm_source_cache_metadata(&cache, "fingerprint");
+
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(cache.join("vmlinux"))
+            .expect("open kernel")
+            .write_all(b"tamper")
+            .expect("tamper kernel");
+
+        assert!(
+            !builder_vm_source_cache_ready(&cache, "fingerprint"),
+            "artifact digest drift must force a source-checkout rebuild"
+        );
     }
 
     #[test]
@@ -2945,9 +3019,9 @@ mod builder_vm_bootstrap_tests {
         let staging = tmp.path().join(".aarch64.stage0-test");
         let final_dir = tmp.path().join("aarch64");
         write_valid_builder_vm_artifacts(&staging);
-        write_builder_vm_source_fingerprint(&staging, "new").expect("write staging fingerprint");
+        write_builder_vm_source_cache_metadata(&staging, "new");
         write_valid_builder_vm_artifacts(&final_dir);
-        write_builder_vm_source_fingerprint(&final_dir, "old").expect("write old fingerprint");
+        write_builder_vm_source_cache_metadata(&final_dir, "old");
 
         promote_builder_vm_stage0_cache(&staging, &final_dir, "new")
             .expect("stale valid cache should be replaced");

@@ -80,7 +80,7 @@ mvmctl init
 mvmctl run
 ```
 
-`mvmctl init` scaffolds the project. On first `mvmctl run`, mvm bootstraps the builder VM if needed, runs `nix build` inside it, and boots the resulting rootfs with the selected macOS runtime backend. Expected runtime cold boot is measured after the image is already built. When developing from this source checkout, the builder VM image is local-build only; the cache is reused only when its source fingerprint matches `nix/images/builder-vm/{flake.nix,flake.lock}`. Cache misses or fingerprint drift build from the local `nix/images/builder-vm/` flake using a local dev image as Stage 0, validate the staged artifacts, and only then promote them into the live cache. mvm will not download a published builder image to hide local flake changes.
+`mvmctl init` scaffolds the project. On first `mvmctl run`, mvm bootstraps the builder VM if needed, runs `nix build` inside it, and boots the resulting rootfs with the selected macOS runtime backend. Expected runtime cold boot is measured after the image is already built. When developing from this source checkout, the builder VM image is local-build only; the cache is reused only when its source fingerprint matches `nix/images/builder-vm/{flake.nix,flake.lock}` and its recorded artifact digests still match the cached files. Cache misses, fingerprint drift, or artifact drift build from the local `nix/images/builder-vm/` flake using a local dev image as Stage 0, validate the staged artifacts, and only then promote them into the live cache. mvm will not download a published builder image to hide local flake changes.
 
 ## Troubleshooting
 
