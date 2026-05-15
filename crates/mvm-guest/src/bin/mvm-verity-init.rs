@@ -13,9 +13,26 @@
 //!
 //! Cmdline contract (set by the host's start_vm path):
 //!
-//!   mvm.roothash=<64-hex>      required; the dm-verity root hash
-//!   mvm.data=<dev-path>        defaults to /dev/vda
-//!   mvm.hash=<dev-path>        defaults to /dev/vdb
+//!   mvm.roothash=<64-hex>          required; rootfs dm-verity root hash
+//!   mvm.data=<dev-path>            defaults to /dev/vda
+//!   mvm.hash=<dev-path>            defaults to /dev/vdb
+//!
+//!   mvm.runtime_roothash=<64-hex>  optional; mvm runtime overlay
+//!                                  dm-verity root hash (ADR-051,
+//!                                  plan 74 W1.4b.3b.2). When present
+//!                                  the init runs a second dm-verity
+//!                                  setup and bind-mounts the result
+//!                                  read-only at /sysroot/mvm/runtime.
+//!                                  Absent: legacy boot path — no
+//!                                  overlay attached, /mvm/runtime
+//!                                  empty in the guest. The backend
+//!                                  wiring (W1.4b.3b.3) starts threading
+//!                                  this arg through; existing Nix-built
+//!                                  images that haven't been refactored
+//!                                  for the overlay (W1.4b.3c) continue
+//!                                  to boot unchanged.
+//!   mvm.runtime_data=<dev-path>    defaults to /dev/vdc
+//!   mvm.runtime_hash=<dev-path>    defaults to /dev/vdd
 //!
 //! On any failure this binary panics — kernel re-init isn't safe from
 //! PID 1 in the initramfs, and panic'ing surfaces the failure on the
@@ -23,7 +40,9 @@
 //! back to the unverified rootfs.
 //!
 //! Linux-only. Builds as a stub on other platforms so the workspace
-//! still compiles on macOS.
+//! still compiles on macOS. Cmdline parsing lives in the cross-platform
+//! [`config`] submodule so the cmdline parser is unit-testable from
+//! macOS host builds.
 
 #![cfg_attr(not(target_os = "linux"), allow(dead_code))]
 
@@ -40,6 +59,235 @@ fn main() {
         let _ = std::fs::write("/dev/console", format!("mvm-verity-init: FATAL: {e}\n"));
         std::thread::sleep(std::time::Duration::from_millis(200));
         std::process::exit(1);
+    }
+}
+
+/// Cross-platform cmdline parsing. Lives outside the `linux`
+/// submodule so unit tests can exercise it on a macOS host
+/// without the Linux-only ioctl scaffolding compiling.
+mod config {
+    /// Validated dm-verity setup parameters parsed from
+    /// `/proc/cmdline`. Constructed by [`Self::parse`]; consumed
+    /// by the Linux init flow which builds the dm-mapper target
+    /// from these fields.
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct VeritySetupConfig {
+        /// Rootfs configuration. Always present (the legacy
+        /// `mvm.roothash=` arg is the only required cmdline
+        /// arg).
+        pub rootfs: VerityTargetConfig,
+        /// Runtime overlay configuration, if `mvm.runtime_roothash=`
+        /// was present. Absent: legacy boot, no overlay mount.
+        pub runtime: Option<VerityTargetConfig>,
+    }
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct VerityTargetConfig {
+        pub roothash: String,
+        pub data_dev: String,
+        pub hash_dev: String,
+    }
+
+    impl VeritySetupConfig {
+        /// Parse a kernel cmdline (the verbatim contents of
+        /// `/proc/cmdline`).
+        ///
+        /// Fails closed on:
+        /// - missing `mvm.roothash=`
+        /// - rootfs or runtime roothash that isn't 64 lowercase
+        ///   hex chars
+        pub fn parse(cmdline: &str) -> Result<Self, String> {
+            let mut rootfs_roothash: Option<String> = None;
+            let mut rootfs_data = "/dev/vda".to_string();
+            let mut rootfs_hash = "/dev/vdb".to_string();
+            let mut runtime_roothash: Option<String> = None;
+            let mut runtime_data = "/dev/vdc".to_string();
+            let mut runtime_hash = "/dev/vdd".to_string();
+
+            for tok in cmdline.split_whitespace() {
+                if let Some(v) = tok.strip_prefix("mvm.roothash=") {
+                    rootfs_roothash = Some(v.trim_matches('"').to_string());
+                } else if let Some(v) = tok.strip_prefix("mvm.data=") {
+                    rootfs_data = v.trim_matches('"').to_string();
+                } else if let Some(v) = tok.strip_prefix("mvm.hash=") {
+                    rootfs_hash = v.trim_matches('"').to_string();
+                } else if let Some(v) = tok.strip_prefix("mvm.runtime_roothash=") {
+                    runtime_roothash = Some(v.trim_matches('"').to_string());
+                } else if let Some(v) = tok.strip_prefix("mvm.runtime_data=") {
+                    runtime_data = v.trim_matches('"').to_string();
+                } else if let Some(v) = tok.strip_prefix("mvm.runtime_hash=") {
+                    runtime_hash = v.trim_matches('"').to_string();
+                }
+            }
+
+            let rootfs_roothash =
+                rootfs_roothash.ok_or_else(|| "no mvm.roothash= on kernel cmdline".to_string())?;
+            validate_roothash(&rootfs_roothash, "mvm.roothash")?;
+
+            let runtime = if let Some(rh) = runtime_roothash {
+                validate_roothash(&rh, "mvm.runtime_roothash")?;
+                Some(VerityTargetConfig {
+                    roothash: rh,
+                    data_dev: runtime_data,
+                    hash_dev: runtime_hash,
+                })
+            } else {
+                None
+            };
+
+            Ok(VeritySetupConfig {
+                rootfs: VerityTargetConfig {
+                    roothash: rootfs_roothash,
+                    data_dev: rootfs_data,
+                    hash_dev: rootfs_hash,
+                },
+                runtime,
+            })
+        }
+    }
+
+    fn validate_roothash(rh: &str, name: &str) -> Result<(), String> {
+        if rh.len() != 64
+            || !rh
+                .chars()
+                .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase())
+        {
+            return Err(format!(
+                "invalid {name}={rh:?} (expected 64 lowercase hex chars)"
+            ));
+        }
+        Ok(())
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        const FAKE_HASH: &str = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        const FAKE_HASH_2: &str =
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+
+        #[test]
+        fn parses_legacy_rootfs_only_cmdline() {
+            let cfg =
+                VeritySetupConfig::parse(&format!("foo=bar mvm.roothash={FAKE_HASH} baz=qux"))
+                    .expect("parse");
+            assert_eq!(cfg.rootfs.roothash, FAKE_HASH);
+            assert_eq!(cfg.rootfs.data_dev, "/dev/vda");
+            assert_eq!(cfg.rootfs.hash_dev, "/dev/vdb");
+            assert!(
+                cfg.runtime.is_none(),
+                "legacy cmdline must yield no runtime config; got {:?}",
+                cfg.runtime
+            );
+        }
+
+        #[test]
+        fn parses_runtime_overlay_cmdline() {
+            let cfg = VeritySetupConfig::parse(&format!(
+                "mvm.roothash={FAKE_HASH} mvm.runtime_roothash={FAKE_HASH_2}"
+            ))
+            .expect("parse");
+            assert_eq!(cfg.rootfs.roothash, FAKE_HASH);
+            let runtime = cfg.runtime.expect("runtime config present");
+            assert_eq!(runtime.roothash, FAKE_HASH_2);
+            assert_eq!(runtime.data_dev, "/dev/vdc");
+            assert_eq!(runtime.hash_dev, "/dev/vdd");
+        }
+
+        #[test]
+        fn parses_overridden_device_paths_for_both_targets() {
+            let cfg = VeritySetupConfig::parse(&format!(
+                "mvm.roothash={FAKE_HASH} mvm.data=/dev/sda1 mvm.hash=/dev/sda2 \
+                 mvm.runtime_roothash={FAKE_HASH_2} mvm.runtime_data=/dev/sda3 mvm.runtime_hash=/dev/sda4"
+            ))
+            .expect("parse");
+            assert_eq!(cfg.rootfs.data_dev, "/dev/sda1");
+            assert_eq!(cfg.rootfs.hash_dev, "/dev/sda2");
+            let runtime = cfg.runtime.unwrap();
+            assert_eq!(runtime.data_dev, "/dev/sda3");
+            assert_eq!(runtime.hash_dev, "/dev/sda4");
+        }
+
+        #[test]
+        fn rejects_missing_rootfs_roothash() {
+            let err = VeritySetupConfig::parse("foo=bar baz=qux").unwrap_err();
+            assert!(err.contains("mvm.roothash"), "{err}");
+        }
+
+        #[test]
+        fn rejects_short_rootfs_roothash() {
+            let err = VeritySetupConfig::parse("mvm.roothash=abc").unwrap_err();
+            assert!(err.contains("64"), "{err}");
+        }
+
+        #[test]
+        fn rejects_uppercase_rootfs_roothash() {
+            let upper = "ABCDEF0123456789".repeat(4);
+            let err = VeritySetupConfig::parse(&format!("mvm.roothash={upper}")).unwrap_err();
+            assert!(err.contains("lowercase"), "{err}");
+        }
+
+        #[test]
+        fn rejects_short_runtime_roothash() {
+            let err = VeritySetupConfig::parse(&format!(
+                "mvm.roothash={FAKE_HASH} mvm.runtime_roothash=abc"
+            ))
+            .unwrap_err();
+            assert!(err.contains("mvm.runtime_roothash"), "{err}");
+        }
+
+        #[test]
+        fn rejects_uppercase_runtime_roothash() {
+            let upper = "ABCDEF0123456789".repeat(4);
+            let err = VeritySetupConfig::parse(&format!(
+                "mvm.roothash={FAKE_HASH} mvm.runtime_roothash={upper}"
+            ))
+            .unwrap_err();
+            assert!(err.contains("lowercase"), "{err}");
+        }
+
+        #[test]
+        fn handles_quoted_values_for_legacy_rootfs() {
+            // The legacy code stripped `"` from values to handle
+            // quoted cmdline args. Keep that behaviour for both
+            // legacy and new args.
+            let cfg = VeritySetupConfig::parse(&format!(
+                "mvm.roothash=\"{FAKE_HASH}\" mvm.data=\"/dev/vda\""
+            ))
+            .expect("parse");
+            assert_eq!(cfg.rootfs.roothash, FAKE_HASH);
+            assert_eq!(cfg.rootfs.data_dev, "/dev/vda");
+        }
+
+        #[test]
+        fn handles_quoted_values_for_runtime_overlay() {
+            let cfg = VeritySetupConfig::parse(&format!(
+                "mvm.roothash={FAKE_HASH} mvm.runtime_roothash=\"{FAKE_HASH_2}\""
+            ))
+            .expect("parse");
+            assert_eq!(cfg.runtime.unwrap().roothash, FAKE_HASH_2);
+        }
+
+        #[test]
+        fn ignores_unrelated_kernel_args() {
+            // Cmdline carries lots of unrelated args
+            // (console=hvc0, init=…, etc.). Parser must not
+            // trip on them.
+            let cfg = VeritySetupConfig::parse(&format!(
+                "console=hvc0 root=/dev/vda ro init=/sbin/init \
+                 mvm.roothash={FAKE_HASH} mvm.runtime_roothash={FAKE_HASH_2} \
+                 random.trust_cpu=on"
+            ))
+            .expect("parse");
+            assert_eq!(cfg.rootfs.roothash, FAKE_HASH);
+            assert_eq!(cfg.runtime.unwrap().roothash, FAKE_HASH_2);
+        }
+
+        #[test]
+        fn handles_empty_cmdline() {
+            assert!(VeritySetupConfig::parse("").is_err());
+        }
     }
 }
 
@@ -149,32 +397,28 @@ mod linux {
         do_mount("devtmpfs", "/dev", "devtmpfs", 0, "")?;
 
         // ── 2. Parse /proc/cmdline for the verity parameters.
+        // Cross-platform parser lives in `crate::config`; this
+        // block just consumes its result.
         let cmdline =
             fs::read_to_string("/proc/cmdline").map_err(|e| format!("read /proc/cmdline: {e}"))?;
-        let mut roothash: Option<String> = None;
-        let mut data_dev = "/dev/vda".to_string();
-        let mut hash_dev = "/dev/vdb".to_string();
-        for tok in cmdline.split_whitespace() {
-            if let Some(v) = tok.strip_prefix("mvm.roothash=") {
-                roothash = Some(v.trim_matches('"').to_string());
-            } else if let Some(v) = tok.strip_prefix("mvm.data=") {
-                data_dev = v.trim_matches('"').to_string();
-            } else if let Some(v) = tok.strip_prefix("mvm.hash=") {
-                hash_dev = v.trim_matches('"').to_string();
-            }
-        }
-        let roothash = roothash.ok_or_else(|| "no mvm.roothash= on kernel cmdline".to_string())?;
-        if roothash.len() != 64 || !roothash.chars().all(|c| c.is_ascii_hexdigit()) {
-            return Err(format!(
-                "invalid mvm.roothash={roothash:?} (expected 64 hex chars)"
-            ));
-        }
+        let cfg = crate::config::VeritySetupConfig::parse(&cmdline)?;
+        let roothash = &cfg.rootfs.roothash;
+        let data_dev = &cfg.rootfs.data_dev;
+        let hash_dev = &cfg.rootfs.hash_dev;
         msg(&format!(
-            "mvm-verity-init: data={data_dev} hash={hash_dev} roothash={}…",
+            "mvm-verity-init: rootfs data={data_dev} hash={hash_dev} roothash={}…",
             &roothash[..12]
         ));
+        if let Some(rt) = cfg.runtime.as_ref() {
+            msg(&format!(
+                "mvm-verity-init: overlay data={} hash={} roothash={}…",
+                rt.data_dev,
+                rt.hash_dev,
+                &rt.roothash[..12]
+            ));
+        }
 
-        // ── 3. Compute the verity table line.
+        // ── 3. Compute the verity table line(s).
         //
         //   <start> <num-sectors> verity 1 <data-dev> <hash-dev>
         //          <data-block-size> <hash-block-size>
@@ -200,24 +444,6 @@ mod linux {
         // veritysetup flag would let us use 0, but keeping the
         // superblock is what makes `veritysetup verify` work against
         // the artifact (used by the runbook + CI).
-        const DATA_BLOCK_SIZE: u64 = 1024;
-        const HASH_BLOCK_SIZE: u64 = 4096;
-        let data_size = block_device_size(&data_dev)?;
-        if !data_size.is_multiple_of(DATA_BLOCK_SIZE) {
-            return Err(format!(
-                "data device size {data_size} not multiple of {DATA_BLOCK_SIZE}"
-            ));
-        }
-        let data_blocks = data_size / DATA_BLOCK_SIZE;
-        let num_sectors = data_blocks * (DATA_BLOCK_SIZE / 512);
-        let salt = "0".repeat(64);
-        let table_args = format!(
-            "1 {data_dev} {hash_dev} {DATA_BLOCK_SIZE} {HASH_BLOCK_SIZE} {data_blocks} 1 sha256 {roothash} {salt}"
-        );
-        msg(&format!(
-            "mvm-verity-init: verity table = {num_sectors} sectors, {data_blocks} data blocks"
-        ));
-
         // ── 4. Open /dev/mapper/control (auto-created by devtmpfs).
         let ctrl = fs::OpenOptions::new()
             .read(true)
@@ -236,58 +462,42 @@ mod linux {
             io.version[0], io.version[1], io.version[2]
         ));
 
-        // 4b. DM_DEV_CREATE — make /dev/mapper/root (no table yet).
-        let mut io = base_ioctl();
-        write_name(&mut io.name, "root");
-        unsafe {
-            do_ioctl(fd, iowr(DM_DEV_CREATE_CMD), &mut io)
-                .map_err(|e| format!("DM_DEV_CREATE: {e}"))?;
-        }
-        msg("mvm-verity-init: DM_DEV_CREATE ok");
-
-        // 4c. DM_TABLE_LOAD — push the verity target into the inactive table.
-        let payload = build_table_payload(num_sectors, "verity", &table_args)?;
-        let mut buf = vec![0u8; payload.len()];
-        buf.copy_from_slice(&payload);
-        // The struct lives at the head of the buffer; mutate via cast.
-        let header_ptr = buf.as_mut_ptr().cast::<DmIoctl>();
-        unsafe {
-            (*header_ptr).flags |= DM_READONLY_FLAG;
-            do_ioctl(fd, iowr(DM_TABLE_LOAD_CMD), header_ptr)
-                .map_err(|e| format!("DM_TABLE_LOAD: {e}"))?;
-        }
-        msg("mvm-verity-init: DM_TABLE_LOAD ok");
-
-        // 4d. DM_DEV_SUSPEND with flags=0 → resume = activate the loaded table.
-        // (DM_SUSPEND_FLAG bit 1 set means "suspend"; cleared means "resume".)
-        let mut io = base_ioctl();
-        write_name(&mut io.name, "root");
-        unsafe {
-            do_ioctl(fd, iowr(DM_DEV_SUSPEND_CMD), &mut io)
-                .map_err(|e| format!("DM_DEV_SUSPEND(resume): {e}"))?;
-        }
-        msg("mvm-verity-init: dm-verity device active");
+        // 4b-d. Set up the rootfs verity target (name="root").
+        setup_verity_target(fd, "root", data_dev, hash_dev, roothash)?;
 
         // ── 5. Mount /dev/mapper/root at /sysroot. The initramfs ships
         //    /sysroot as an empty mount target. Read-only — verity is
         //    incompatible with writes.
-        if !Path::new("/dev/mapper/root").exists() {
-            // /dev/mapper/<name> nodes are usually created by udev.
-            // In an initramfs without udev, the kernel's devtmpfs
-            // creates /dev/dm-N but not the /dev/mapper/<name> symlink.
-            // Fall back to /dev/dm-0 in that case — it's the same
-            // device, just a different name.
-            if !Path::new("/dev/dm-0").exists() {
-                return Err(
-                    "neither /dev/mapper/root nor /dev/dm-0 exists after DM_DEV_SUSPEND"
-                        .to_string(),
-                );
-            }
-            do_mount("/dev/dm-0", "/sysroot", "ext4", libc::MS_RDONLY, "")?;
-        } else {
-            do_mount("/dev/mapper/root", "/sysroot", "ext4", libc::MS_RDONLY, "")?;
-        }
+        let root_dm = resolved_dm_device("root", 0)?;
+        do_mount(&root_dm, "/sysroot", "ext4", libc::MS_RDONLY, "")?;
         msg("mvm-verity-init: /sysroot mounted (verity-protected)");
+
+        // ── 5b. Plan 74 W1.4b.3b.2 — mvm runtime overlay disk
+        //    (ADR-051). When the backend has threaded
+        //    `mvm.runtime_roothash=` through the cmdline, set
+        //    up the second dm-verity target and mount it RO at
+        //    /sysroot/mvm/runtime. The target path MUST exist
+        //    in the rootfs (W1.4b.3c's mkGuest refactor creates
+        //    it as an empty dir); a missing dir surfaces as a
+        //    mount-time EACCES that's actionable.
+        //
+        //    Absent `mvm.runtime_roothash=` → legacy boot path,
+        //    no overlay attached, /mvm/runtime stays empty in
+        //    the guest. Existing Nix-built images boot
+        //    unchanged through this branch until W1.4b.3b.3
+        //    starts populating the cmdline arg.
+        if let Some(rt) = cfg.runtime.as_ref() {
+            setup_verity_target(fd, "runtime", &rt.data_dev, &rt.hash_dev, &rt.roothash)?;
+            let runtime_dm = resolved_dm_device("runtime", 1)?;
+            do_mount(
+                &runtime_dm,
+                "/sysroot/mvm/runtime",
+                "ext4",
+                libc::MS_RDONLY,
+                "",
+            )?;
+            msg("mvm-verity-init: /sysroot/mvm/runtime mounted (verity-protected overlay)");
+        }
 
         // ── 6. Move /proc and /dev into /sysroot so the real init has
         //    them already, then switch_root to /sysroot/init.
@@ -345,11 +555,109 @@ mod linux {
         buf[n] = 0;
     }
 
+    /// Run the canonical four-ioctl sequence (DEV_CREATE → TABLE_LOAD →
+    /// DEV_SUSPEND-with-flags-cleared) to register and activate one
+    /// dm-verity target named `device_name` over `data_dev` + `hash_dev`
+    /// with the given `roothash`. After this returns, the kernel has
+    /// either `/dev/mapper/<name>` (when udev or a similar daemon is
+    /// around) or `/dev/dm-<index>` (initramfs without udev — see
+    /// [`resolved_dm_device`]).
+    ///
+    /// Parameters are pinned to the values the rest of the boot path
+    /// expects:
+    ///
+    /// - `data-block-size = 1024` — must match the ext4 block size
+    ///   (mke2fs's default for sub-512 MiB images, and what
+    ///   `Mke2fsOptions::default()` produces on the OCI path).
+    /// - `hash-block-size = 4096` — veritysetup default.
+    /// - `hash_start_block = 1` — the verity superblock occupies
+    ///   block 0 of the hash device; the Merkle tree starts at
+    ///   block 1.
+    /// - `algorithm = sha256`, `salt = 64 hex zeros` — match
+    ///   `mvm_build::oci_to_rootfs::verity::VeritysetupOptions::default()`.
+    fn setup_verity_target(
+        fd: i32,
+        device_name: &str,
+        data_dev: &str,
+        hash_dev: &str,
+        roothash: &str,
+    ) -> Result<(), String> {
+        const DATA_BLOCK_SIZE: u64 = 1024;
+        const HASH_BLOCK_SIZE: u64 = 4096;
+        let data_size = block_device_size(data_dev)?;
+        if !data_size.is_multiple_of(DATA_BLOCK_SIZE) {
+            return Err(format!(
+                "{device_name}: data device {data_dev} size {data_size} not multiple of {DATA_BLOCK_SIZE}"
+            ));
+        }
+        let data_blocks = data_size / DATA_BLOCK_SIZE;
+        let num_sectors = data_blocks * (DATA_BLOCK_SIZE / 512);
+        let salt = "0".repeat(64);
+        let table_args = format!(
+            "1 {data_dev} {hash_dev} {DATA_BLOCK_SIZE} {HASH_BLOCK_SIZE} {data_blocks} 1 sha256 {roothash} {salt}"
+        );
+        msg(&format!(
+            "mvm-verity-init: {device_name} verity table = {num_sectors} sectors, {data_blocks} data blocks"
+        ));
+
+        // DM_DEV_CREATE — register the device by name (no table yet).
+        let mut io = base_ioctl();
+        write_name(&mut io.name, device_name);
+        unsafe {
+            do_ioctl(fd, iowr(DM_DEV_CREATE_CMD), &mut io)
+                .map_err(|e| format!("DM_DEV_CREATE({device_name}): {e}"))?;
+        }
+        msg(&format!("mvm-verity-init: DM_DEV_CREATE({device_name}) ok"));
+
+        // DM_TABLE_LOAD — push the verity target into the inactive table.
+        let payload = build_table_payload(device_name, num_sectors, "verity", &table_args)?;
+        let mut buf = vec![0u8; payload.len()];
+        buf.copy_from_slice(&payload);
+        let header_ptr = buf.as_mut_ptr().cast::<DmIoctl>();
+        unsafe {
+            (*header_ptr).flags |= DM_READONLY_FLAG;
+            do_ioctl(fd, iowr(DM_TABLE_LOAD_CMD), header_ptr)
+                .map_err(|e| format!("DM_TABLE_LOAD({device_name}): {e}"))?;
+        }
+        msg(&format!("mvm-verity-init: DM_TABLE_LOAD({device_name}) ok"));
+
+        // DM_DEV_SUSPEND with flags=0 → resume = activate the loaded table.
+        let mut io = base_ioctl();
+        write_name(&mut io.name, device_name);
+        unsafe {
+            do_ioctl(fd, iowr(DM_DEV_SUSPEND_CMD), &mut io)
+                .map_err(|e| format!("DM_DEV_SUSPEND(resume, {device_name}): {e}"))?;
+        }
+        msg(&format!("mvm-verity-init: dm-verity {device_name} active"));
+        Ok(())
+    }
+
+    /// Resolve the device path for a freshly-created dm-verity
+    /// target named `name`. Prefer `/dev/mapper/<name>` (set up
+    /// by udev when available); fall back to `/dev/dm-<index>`
+    /// (which the kernel's devtmpfs creates regardless of
+    /// userspace daemons). `index` is the creation order — 0
+    /// for the rootfs target, 1 for the runtime overlay.
+    fn resolved_dm_device(name: &str, index: usize) -> Result<String, String> {
+        let mapper = format!("/dev/mapper/{name}");
+        if Path::new(&mapper).exists() {
+            return Ok(mapper);
+        }
+        let fallback = format!("/dev/dm-{index}");
+        if Path::new(&fallback).exists() {
+            return Ok(fallback);
+        }
+        Err(format!(
+            "neither {mapper} nor {fallback} exists after DM_DEV_SUSPEND"
+        ))
+    }
+
     /// Construct a DM_TABLE_LOAD payload: a `DmIoctl` header followed by a
     /// `DmTargetSpec` and the parameter string. Alignment to 8 bytes is
     /// required between successive `dm_target_spec`s; we have only one
     /// target so we pad once.
     fn build_table_payload(
+        device_name: &str,
         sectors: u64,
         target_type: &str,
         params: &str,
@@ -379,7 +687,7 @@ mod linux {
             dev: 0,
             name: {
                 let mut n = [0u8; DM_NAME_LEN];
-                write_name(&mut n, "root");
+                write_name(&mut n, device_name);
                 n
             },
             uuid: [0u8; DM_UUID_LEN],
