@@ -293,6 +293,11 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("tenant", AuditPosture::DelegatesToSub(TENANT_SUB)),
     // Plan 73 Followup C — sealed deps-volume cache verbs.
     ("deps", AuditPosture::DelegatesToSub(DEPS_SUB)),
+    // Plan 76 Phase 2 / Phase 4 — host-side readiness UX. Both
+    // verbs are pure vsock reads (`ReadinessStatus`) and never
+    // mutate host or guest state.
+    ("wait", AuditPosture::ReadOnly),
+    ("boot-report", AuditPosture::ReadOnly),
 ];
 
 // ──────────────────────────────────────────────────────────────────
