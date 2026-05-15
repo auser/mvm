@@ -574,6 +574,7 @@ fn run_inner(req: ExecRequest, capture: bool) -> Result<Either<i32, ExecOutput>>
         config_files: Vec::new(),
         secret_files: Vec::new(),
         runner_dir: None,
+        ..Default::default()
     };
 
     let booted = if use_snapshot {
@@ -672,6 +673,9 @@ fn restore_via_snapshot(
         rootfs_path: start_config.rootfs_path.clone(),
         verity_path: start_config.verity_path.clone(),
         roothash: start_config.roothash.clone(),
+        runtime_overlay_path: start_config.runtime_overlay_path.clone(),
+        runtime_overlay_verity_path: start_config.runtime_overlay_verity_path.clone(),
+        runtime_overlay_roothash: start_config.runtime_overlay_roothash.clone(),
         revision_hash: start_config.revision_hash.clone(),
         flake_ref: start_config.flake_ref.clone(),
         profile: start_config.profile.clone(),
@@ -830,6 +834,7 @@ pub fn boot_session_vm(
         config_files: vec![],
         secret_files: vec![],
         runner_dir: None,
+        ..Default::default()
     };
 
     let use_snapshot = snap_info.is_some() && backend.capabilities().snapshots;
