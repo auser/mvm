@@ -27,6 +27,36 @@ The agent communicates using **length-prefixed JSON frames** over vsock (Firecra
 
 Request types: `ping`, `status`, `sleep-prep`, `wake`, and more.
 
+## Profile gate
+
+Every guest image declares an **agent profile** in its
+`/etc/mvm/security.json` (plan 76 Phase 1). The profile is the
+dispatcher-side allowlist for vsock verbs — dev-only requests
+sent to a sealed-prod agent are rejected before any handler runs:
+
+| Profile | Effective verb set | Used by |
+|---------|-------------------|---------|
+| `sealed-prod` (default) | Lifecycle, status, entrypoint, sleep/wake, volume mount/unmount, idle-timeout updates. The full ADR-002 production-safe surface. | Production images. The policy file lives on a dm-verity rootfs (ADR-002 §W3) so the profile cannot be widened at runtime. |
+| `dev` | `sealed-prod` plus shell `Exec`, process RPC, filesystem RPC, console PTY, port forwarding, and `RunCode`. | `mvmctl dev` images and any image built with `dev-shell` feature. |
+| `builder` | Reserved for builder-only verbs. The current builder agent speaks a separate `BuilderRequest` protocol, so this profile is wire-stable but unused for the tenant agent. | Future builder VM agent if/when its verbs land on the tenant wire. |
+
+Rejected requests return a typed `UnsupportedInProfile` response:
+
+```json
+{ "UnsupportedInProfile": { "profile": "sealed-prod", "verb": "Exec" } }
+```
+
+SDK callers can branch on capability without parsing message text —
+this is the protocol-layer analog of
+`ProcErrorKind::UnsupportedInProduction` for process RPC.
+
+The profile gate is **complementary** to the existing compile-time
+gate (`#[cfg(feature = "dev-shell")]` for `do_exec` / `do_run_code` /
+process RPC handlers per ADR-002 §W4.3, claim 4). The compile-time
+gate keeps the handler symbols *absent* from production binaries; the
+profile gate keeps the dispatcher *reachable but refusing* for dev
+verbs in sealed-prod. Both checks run on every request.
+
 ## Health Checks
 
 Health checks defined in `mkGuest`'s `healthChecks` parameter are automatically written to `/etc/mvm/integrations.d/` at build time:

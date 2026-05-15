@@ -6,7 +6,7 @@ use std::time::Duration;
 use anyhow::{Context, Result, bail};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 use mvm_core::security::{
-    AuthenticatedFrame, PROTOCOL_VERSION_AUTHENTICATED, SessionHello, SessionHelloAck,
+    AgentProfile, AuthenticatedFrame, PROTOCOL_VERSION_AUTHENTICATED, SessionHello, SessionHelloAck,
 };
 use mvm_core::signing::SignedPayload;
 use serde::{Deserialize, Serialize};
@@ -406,6 +406,145 @@ fn default_true() -> bool {
     true
 }
 
+// ============================================================================
+// Profile classifier (plan 76 Phase 1)
+// ============================================================================
+
+/// Coarse profile-eligibility class for each `GuestRequest` variant.
+///
+/// Wire types are compiled into every agent build; this classifier
+/// is the dispatcher-side gate that rejects out-of-profile verbs
+/// *before* the per-variant handler runs. See ADR-002 §W4.3 for the
+/// complementary compile-time symbol-absence story (`do_exec`,
+/// `do_run_code`, process RPC handlers gated by `dev-shell`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum RequestClass {
+    /// Allowed under `SealedProd` and `Dev` profiles. Includes the
+    /// lifecycle, entrypoint-status, sleep/wake, mount-volume, and
+    /// idle-timeout verbs. Sub-policies (mount path, idle timeout
+    /// scope) are enforced inside the handler.
+    ProdSafe,
+    /// Allowed only under `Dev`. Process RPC, filesystem RPC, console,
+    /// port forwarding, shell exec, code eval.
+    DevOnly,
+    /// Allowed only under `Builder`. No current `GuestRequest`
+    /// variant is `BuilderOnly`; the variant is reserved for forward
+    /// compatibility when builder-specific verbs land on the tenant
+    /// wire.
+    BuilderOnly,
+}
+
+impl GuestRequest {
+    /// Stable string name for the verb, used in audit logs and the
+    /// `UnsupportedInProfile` rejection response. Wire-stable —
+    /// renaming a verb is a breaking change.
+    pub fn verb_name(&self) -> &'static str {
+        match self {
+            GuestRequest::WorkerStatus => "WorkerStatus",
+            GuestRequest::SleepPrep { .. } => "SleepPrep",
+            GuestRequest::Wake => "Wake",
+            GuestRequest::Ping => "Ping",
+            GuestRequest::IntegrationStatus => "IntegrationStatus",
+            GuestRequest::CheckpointIntegrations { .. } => "CheckpointIntegrations",
+            GuestRequest::ProbeStatus => "ProbeStatus",
+            GuestRequest::Exec { .. } => "Exec",
+            GuestRequest::RunEntrypoint { .. } => "RunEntrypoint",
+            GuestRequest::PostRestore => "PostRestore",
+            GuestRequest::FsDiff => "FsDiff",
+            GuestRequest::StartPortForward { .. } => "StartPortForward",
+            GuestRequest::ConsoleOpen { .. } => "ConsoleOpen",
+            GuestRequest::ConsoleClose { .. } => "ConsoleClose",
+            GuestRequest::ConsoleResize { .. } => "ConsoleResize",
+            GuestRequest::EntrypointStatus => "EntrypointStatus",
+            GuestRequest::FsRead { .. } => "FsRead",
+            GuestRequest::FsWrite { .. } => "FsWrite",
+            GuestRequest::FsList { .. } => "FsList",
+            GuestRequest::FsStat { .. } => "FsStat",
+            GuestRequest::FsMkdir { .. } => "FsMkdir",
+            GuestRequest::FsRemove { .. } => "FsRemove",
+            GuestRequest::FsMove { .. } => "FsMove",
+            GuestRequest::ProcStart { .. } => "ProcStart",
+            GuestRequest::ProcList => "ProcList",
+            GuestRequest::ProcSignal { .. } => "ProcSignal",
+            GuestRequest::ProcSendInput { .. } => "ProcSendInput",
+            GuestRequest::ProcWait { .. } => "ProcWait",
+            GuestRequest::ProcKill { .. } => "ProcKill",
+            GuestRequest::MountVolume { .. } => "MountVolume",
+            GuestRequest::UnmountVolume { .. } => "UnmountVolume",
+            GuestRequest::UpdateIdleTimeout { .. } => "UpdateIdleTimeout",
+            GuestRequest::RunCode { .. } => "RunCode",
+        }
+    }
+
+    /// Profile class of this request. Exhaustive match — adding a new
+    /// `GuestRequest` variant fails to compile until it is classified.
+    pub fn class(&self) -> RequestClass {
+        match self {
+            // ProdSafe: lifecycle + status + entrypoint + sleep/wake
+            // + mount-volume + idle-timeout. Volume mounts are
+            // additionally constrained by `MountPathPolicy` inside
+            // the handler — the gate just lets the verb reach it.
+            GuestRequest::WorkerStatus
+            | GuestRequest::SleepPrep { .. }
+            | GuestRequest::Wake
+            | GuestRequest::Ping
+            | GuestRequest::IntegrationStatus
+            | GuestRequest::CheckpointIntegrations { .. }
+            | GuestRequest::ProbeStatus
+            | GuestRequest::RunEntrypoint { .. }
+            | GuestRequest::PostRestore
+            | GuestRequest::EntrypointStatus
+            | GuestRequest::MountVolume { .. }
+            | GuestRequest::UnmountVolume { .. }
+            | GuestRequest::UpdateIdleTimeout { .. } => RequestClass::ProdSafe,
+
+            // DevOnly: shell exec, process RPC, filesystem RPC,
+            // console, port forwarding, code eval, filesystem diff.
+            // Filesystem reads look benign but can leak secrets and
+            // mounted-volume contents (plan 76 "Read-only filesystem
+            // access can leak secrets"), so the entire filesystem
+            // RPC surface is DevOnly in v1.
+            GuestRequest::Exec { .. }
+            | GuestRequest::FsDiff
+            | GuestRequest::StartPortForward { .. }
+            | GuestRequest::ConsoleOpen { .. }
+            | GuestRequest::ConsoleClose { .. }
+            | GuestRequest::ConsoleResize { .. }
+            | GuestRequest::FsRead { .. }
+            | GuestRequest::FsWrite { .. }
+            | GuestRequest::FsList { .. }
+            | GuestRequest::FsStat { .. }
+            | GuestRequest::FsMkdir { .. }
+            | GuestRequest::FsRemove { .. }
+            | GuestRequest::FsMove { .. }
+            | GuestRequest::ProcStart { .. }
+            | GuestRequest::ProcList
+            | GuestRequest::ProcSignal { .. }
+            | GuestRequest::ProcSendInput { .. }
+            | GuestRequest::ProcWait { .. }
+            | GuestRequest::ProcKill { .. }
+            | GuestRequest::RunCode { .. } => RequestClass::DevOnly,
+        }
+    }
+
+    /// Whether this request is allowed under `profile`.
+    ///
+    /// Profile rules:
+    /// - `SealedProd` allows only `ProdSafe`.
+    /// - `Dev` allows `ProdSafe` and `DevOnly` (a superset).
+    /// - `Builder` allows only `BuilderOnly` — today the builder
+    ///   agent speaks `BuilderRequest`, so `GuestRequest` reaching
+    ///   a `Builder`-profile agent is a configuration error.
+    pub fn allowed_in(&self, profile: AgentProfile) -> bool {
+        matches!(
+            (self.class(), profile),
+            (RequestClass::ProdSafe, AgentProfile::SealedProd | AgentProfile::Dev)
+                | (RequestClass::DevOnly, AgentProfile::Dev)
+                | (RequestClass::BuilderOnly, AgentProfile::Builder)
+        )
+    }
+}
+
 /// Response from guest vsock agent to host.
 ///
 /// Same `deny_unknown_fields` discipline as `GuestRequest` — a
@@ -444,6 +583,18 @@ pub enum GuestResponse {
     Pong,
     /// Error from guest agent.
     Error { message: String },
+    /// The dispatcher refused this verb because the active
+    /// `AgentProfile` does not allow it (plan 76 Phase 1). Distinct
+    /// from `Error { message }` so SDK callers can branch on
+    /// capability without parsing message text — analogous to
+    /// `ProcErrorKind::UnsupportedInProduction` for process RPC,
+    /// but at the protocol layer rather than per-handler.
+    UnsupportedInProfile {
+        /// Active profile on the agent that rejected the call.
+        profile: AgentProfile,
+        /// `verb_name()` of the rejected request. Wire-stable.
+        verb: String,
+    },
     /// Per-integration status report.
     IntegrationStatusReport {
         integrations: Vec<crate::integrations::IntegrationStateReport>,
@@ -2175,6 +2326,10 @@ mod tests {
             GuestResponse::Pong,
             GuestResponse::Error {
                 message: "oops".to_string(),
+            },
+            GuestResponse::UnsupportedInProfile {
+                profile: AgentProfile::SealedProd,
+                verb: "Exec".to_string(),
             },
             GuestResponse::IntegrationStatusReport {
                 integrations: vec![IntegrationStateReport {
@@ -3978,5 +4133,287 @@ mod tests {
         // This is correct: we verify the guest controls the key it claims.
         let result = host_handle.join().unwrap();
         assert!(result.is_ok());
+    }
+
+    // ========================================================================
+    // Plan 76 Phase 1 — profile classifier
+    // ========================================================================
+
+    /// Every `GuestRequest` variant must classify as either `ProdSafe`
+    /// or `DevOnly` today. Compile-fail when a new variant is added
+    /// without being classified — the exhaustive match inside
+    /// `class()` guarantees that, and this test fails closed if the
+    /// variant ever lands in an unexpected class.
+    #[test]
+    fn test_request_class_coverage_matches_sealed_prod_allowlist() {
+        let prod_safe_verbs: &[&str] = &[
+            "WorkerStatus",
+            "SleepPrep",
+            "Wake",
+            "Ping",
+            "IntegrationStatus",
+            "CheckpointIntegrations",
+            "ProbeStatus",
+            "RunEntrypoint",
+            "PostRestore",
+            "EntrypointStatus",
+            "MountVolume",
+            "UnmountVolume",
+            "UpdateIdleTimeout",
+        ];
+
+        // One representative `GuestRequest` value per variant. Used to
+        // exercise `class()` + `verb_name()` together.
+        let all: Vec<GuestRequest> = vec![
+            GuestRequest::WorkerStatus,
+            GuestRequest::SleepPrep {
+                drain_timeout_secs: 0,
+            },
+            GuestRequest::Wake,
+            GuestRequest::Ping,
+            GuestRequest::IntegrationStatus,
+            GuestRequest::CheckpointIntegrations {
+                integrations: vec![],
+            },
+            GuestRequest::ProbeStatus,
+            GuestRequest::Exec {
+                command: "x".into(),
+                stdin: None,
+                timeout_secs: None,
+            },
+            GuestRequest::RunEntrypoint {
+                stdin: vec![],
+                timeout_secs: 1,
+            },
+            GuestRequest::PostRestore,
+            GuestRequest::FsDiff,
+            GuestRequest::StartPortForward { guest_port: 1 },
+            GuestRequest::ConsoleOpen { cols: 1, rows: 1 },
+            GuestRequest::ConsoleClose { session_id: 1 },
+            GuestRequest::ConsoleResize {
+                session_id: 1,
+                cols: 1,
+                rows: 1,
+            },
+            GuestRequest::EntrypointStatus,
+            GuestRequest::FsRead {
+                path: "/x".into(),
+                offset: None,
+                length: 1,
+                follow_symlinks: true,
+            },
+            GuestRequest::FsWrite {
+                path: "/x".into(),
+                content: vec![],
+                mode: 0,
+                create_parents: false,
+                follow_symlinks: false,
+            },
+            GuestRequest::FsList {
+                path: "/x".into(),
+                follow_symlinks: true,
+            },
+            GuestRequest::FsStat {
+                path: "/x".into(),
+                follow_symlinks: true,
+            },
+            GuestRequest::FsMkdir {
+                path: "/x".into(),
+                mode: 0,
+                parents: false,
+            },
+            GuestRequest::FsRemove {
+                path: "/x".into(),
+                recursive: false,
+                follow_symlinks: false,
+            },
+            GuestRequest::FsMove {
+                from: "/x".into(),
+                to: "/y".into(),
+                follow_symlinks: false,
+            },
+            GuestRequest::ProcStart {
+                argv: vec!["/x".into()],
+                env: Default::default(),
+                cwd: None,
+                stdin: vec![],
+                timeout_secs: None,
+            },
+            GuestRequest::ProcList,
+            GuestRequest::ProcSignal {
+                pid_token: "t".into(),
+                signum: 15,
+            },
+            GuestRequest::ProcSendInput {
+                pid_token: "t".into(),
+                bytes: vec![],
+            },
+            GuestRequest::ProcWait {
+                pid_token: "t".into(),
+                timeout_secs: None,
+            },
+            GuestRequest::ProcKill {
+                pid_token: "t".into(),
+            },
+            GuestRequest::MountVolume {
+                volume_name: "v".into(),
+                guest_path: "/x".into(),
+                read_only: true,
+            },
+            GuestRequest::UnmountVolume {
+                guest_path: "/x".into(),
+                force: false,
+            },
+            GuestRequest::UpdateIdleTimeout { secs: 0 },
+            GuestRequest::RunCode {
+                code: "x".into(),
+                timeout_secs: 1,
+            },
+        ];
+
+        // Every variant has a stable verb_name; that name appears in
+        // exactly one of the two classification buckets.
+        for req in &all {
+            let name = req.verb_name();
+            let in_prod = prod_safe_verbs.contains(&name);
+            match req.class() {
+                RequestClass::ProdSafe => assert!(
+                    in_prod,
+                    "{name}: classified ProdSafe but missing from SealedProd allowlist"
+                ),
+                RequestClass::DevOnly => assert!(
+                    !in_prod,
+                    "{name}: classified DevOnly but present in SealedProd allowlist"
+                ),
+                RequestClass::BuilderOnly => {
+                    panic!("{name}: no GuestRequest variant should be BuilderOnly yet")
+                }
+            }
+        }
+
+        // The allowlist itself stays anchored: every prod-safe verb
+        // shows up in `all` above, so renaming a variant trips this
+        // assertion too.
+        let names: Vec<&'static str> = all.iter().map(|r| r.verb_name()).collect();
+        for v in prod_safe_verbs {
+            assert!(names.contains(v), "SealedProd verb {v} missing from coverage");
+        }
+    }
+
+    #[test]
+    fn test_sealed_prod_rejects_dev_only_verbs() {
+        let dev_only_samples = [
+            GuestRequest::Exec {
+                command: "x".into(),
+                stdin: None,
+                timeout_secs: None,
+            },
+            GuestRequest::ConsoleOpen { cols: 80, rows: 24 },
+            GuestRequest::ProcStart {
+                argv: vec!["/x".into()],
+                env: Default::default(),
+                cwd: None,
+                stdin: vec![],
+                timeout_secs: None,
+            },
+            GuestRequest::RunCode {
+                code: "print(1)".into(),
+                timeout_secs: 1,
+            },
+            GuestRequest::FsWrite {
+                path: "/x".into(),
+                content: vec![],
+                mode: 0,
+                create_parents: false,
+                follow_symlinks: false,
+            },
+            GuestRequest::FsRead {
+                path: "/x".into(),
+                offset: None,
+                length: 1,
+                follow_symlinks: true,
+            },
+            GuestRequest::StartPortForward { guest_port: 8080 },
+        ];
+
+        for req in &dev_only_samples {
+            assert!(
+                !req.allowed_in(AgentProfile::SealedProd),
+                "{} should be rejected in SealedProd",
+                req.verb_name()
+            );
+            assert!(
+                req.allowed_in(AgentProfile::Dev),
+                "{} should be allowed in Dev",
+                req.verb_name()
+            );
+            assert!(
+                !req.allowed_in(AgentProfile::Builder),
+                "{} should not be allowed in Builder",
+                req.verb_name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_sealed_prod_accepts_prod_safe_verbs() {
+        let prod_safe_samples = [
+            GuestRequest::Ping,
+            GuestRequest::WorkerStatus,
+            GuestRequest::EntrypointStatus,
+            GuestRequest::RunEntrypoint {
+                stdin: vec![],
+                timeout_secs: 60,
+            },
+            GuestRequest::SleepPrep {
+                drain_timeout_secs: 5,
+            },
+            GuestRequest::Wake,
+            GuestRequest::PostRestore,
+            GuestRequest::UpdateIdleTimeout { secs: 600 },
+            GuestRequest::MountVolume {
+                volume_name: "v".into(),
+                guest_path: "/data".into(),
+                read_only: true,
+            },
+            GuestRequest::UnmountVolume {
+                guest_path: "/data".into(),
+                force: false,
+            },
+        ];
+
+        for req in &prod_safe_samples {
+            assert!(
+                req.allowed_in(AgentProfile::SealedProd),
+                "{} should be allowed in SealedProd",
+                req.verb_name()
+            );
+            assert!(
+                req.allowed_in(AgentProfile::Dev),
+                "{} should be allowed in Dev (Dev ⊃ SealedProd)",
+                req.verb_name()
+            );
+        }
+    }
+
+    #[test]
+    fn test_unsupported_in_profile_response_roundtrip() {
+        let resp = GuestResponse::UnsupportedInProfile {
+            profile: AgentProfile::SealedProd,
+            verb: "Exec".into(),
+        };
+        let json = serde_json::to_string(&resp).unwrap();
+        // kebab-case profile wire format keeps user-facing JSON tidy.
+        assert!(json.contains("\"sealed-prod\""), "got {json}");
+        assert!(json.contains("\"Exec\""), "got {json}");
+
+        let parsed: GuestResponse = serde_json::from_str(&json).unwrap();
+        match parsed {
+            GuestResponse::UnsupportedInProfile { profile, verb } => {
+                assert_eq!(profile, AgentProfile::SealedProd);
+                assert_eq!(verb, "Exec");
+            }
+            other => panic!("unexpected variant: {other:?}"),
+        }
     }
 }

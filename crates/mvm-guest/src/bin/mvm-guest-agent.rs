@@ -34,6 +34,7 @@ use mvm_guest::integrations::{
 use mvm_guest::lifecycle_hooks::{self, ReadinessConfig};
 use mvm_guest::probes::{self, ProbeEntry, ProbeOutputFormat, ProbeResult};
 use mvm_guest::runtime_config::{self, ConcurrencyConfig};
+use mvm_core::security::AgentProfile;
 use mvm_guest::vsock::{
     EntrypointEvent, FsChange, FsChangeKind, GUEST_AGENT_PORT, GuestRequest, GuestResponse,
     RunEntrypointError,
@@ -1696,6 +1697,7 @@ fn handle_client(
     integration_state: &Arc<Mutex<IntegrationState>>,
     probe_state: &Arc<Mutex<ProbeState>>,
     boot_at: std::time::Instant,
+    active_profile: AgentProfile,
 ) {
     // SAFETY: fd comes from accept and is a valid file descriptor owned by this function.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
@@ -1745,6 +1747,24 @@ fn handle_client(
             }
         }
     };
+
+    // Plan 76 Phase 1: profile gate. Reject dev-only verbs in
+    // sealed-prod *before* the per-variant handler runs. The gate
+    // returns a typed `UnsupportedInProfile` response so an SDK
+    // can branch on capability without parsing message text — this
+    // sits at the protocol layer in addition to the per-handler
+    // policy checks (ADR-002 "Dispatcher allowlists are not enough
+    // by themselves") and the `#[cfg(feature = "dev-shell")]`
+    // compile-time symbol-absence gate for `do_exec` / `do_run_code`
+    // (ADR-002 §W4.3, claim 4).
+    if !req.allowed_in(active_profile) {
+        let resp = GuestResponse::UnsupportedInProfile {
+            profile: active_profile,
+            verb: req.verb_name().to_string(),
+        };
+        write_response(&mut file, &resp);
+        return;
+    }
 
     let resp = match req {
         // The hello-prelude loop above guarantees `req` is not a
@@ -2332,6 +2352,20 @@ fn run_port_forwarder(vsock_port: u32, tcp_port: u16) {
 fn main() {
     let cfg = parse_config();
 
+    // Plan 76 Phase 1: resolve the active vsock profile from the
+    // baked image config. The policy file lives on a dm-verity rootfs
+    // for sealed-prod images (ADR-002 §W3), so its `profile` field
+    // can't be widened at runtime — flipping it would break the
+    // verity hash and the kernel panics in `mvm-verity-init` before
+    // userspace. Absence of `/etc/mvm/security.json` is treated as an
+    // unprovisioned dev image (`SecurityPolicy::dev_defaults`).
+    let active_profile = mvm_guest::builder_agent::load_security_policy()
+        .ok()
+        .flatten()
+        .map(|p| p.profile)
+        .unwrap_or_else(|| mvm_core::security::SecurityPolicy::dev_defaults().profile);
+    eprintln!("mvm-guest-agent: profile={:?}", active_profile);
+
     eprintln!(
         "mvm-guest-agent: starting on vsock port {} (threshold={}, interval={}s)",
         cfg.port, cfg.busy_threshold, cfg.sample_interval_secs
@@ -2498,10 +2532,24 @@ fn main() {
             let integration_state = Arc::clone(&integration_state);
             let probe_state = Arc::clone(&probe_state);
             std::thread::spawn(move || {
-                handle_client(cfd, &state, &integration_state, &probe_state, boot_at);
+                handle_client(
+                    cfd,
+                    &state,
+                    &integration_state,
+                    &probe_state,
+                    boot_at,
+                    active_profile,
+                );
             });
         } else {
-            handle_client(cfd, &state, &integration_state, &probe_state, boot_at);
+            handle_client(
+                cfd,
+                &state,
+                &integration_state,
+                &probe_state,
+                boot_at,
+                active_profile,
+            );
         }
     }
 
