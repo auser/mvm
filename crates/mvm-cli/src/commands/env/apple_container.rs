@@ -1784,9 +1784,8 @@ fn find_builder_vm_flake() -> Result<String> {
     )
 }
 
-/// Plan 72 W5 — populate `~/.cache/mvm/builder-vm/<arch>/` with
-/// `vmlinux` + `rootfs.ext4` + `cmdline.txt` + `manifest.json`
-/// from published release artifacts when the cache is empty.
+/// Plan 72 W5 — ensure `~/.cache/mvm/builder-vm/<arch>/` contains
+/// `vmlinux` + `rootfs.ext4` before launching the libkrun builder.
 ///
 /// `LibkrunBuilderVm::run_build` reads from this cache; this
 /// function is what fills it. The two-layer artifact rule from
@@ -1797,16 +1796,14 @@ fn find_builder_vm_flake() -> Result<String> {
 /// - Layer 2: use the Layer 1 image plus libkrun to build the
 ///   **dev shell image** with the large rustc closure.
 ///
-/// Source-checkout-only by design — `find_builder_vm_flake()`
-/// Two acquisition paths split on whether we have an in-repo flake:
+/// Acquisition policy:
 ///
-/// Fetches the per-arch artifacts the W2 release-workflow
-///    job publishes (`builder-vm-vmlinux-<arch>`,
-///    `builder-vm-rootfs-<arch>.ext4`, optional sidecars) from
-///    `releases/download/v<version>/`. SHA-256 verifies per ADR-002 §W5.1.
-/// A cache hit is the fast path — there's no upstream source to be out
-/// of sync with; only the release tag matters and the cache dir is keyed
-/// on it.
+/// - Source checkout: a cache hit is allowed, but a cache miss fails
+///   closed. The builder VM image must come from the in-repo
+///   `nix/images/builder-vm/flake.nix` path; downloading a published
+///   artifact would hide local builder-image changes.
+/// - Installed binary: a cache hit is allowed; a cache miss may fetch
+///   the published artifact for the running release version.
 ///
 /// W5.B wired this into `ensure_dev_image`; Plan 72 W5's "Layer 1
 /// outside source checkout — download the published prebuilt"
@@ -1826,24 +1823,49 @@ fn bootstrap_builder_vm_image() -> Result<()> {
     std::fs::create_dir_all(&out_dir)
         .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
 
-    // Installed-binary path: no in-repo source to be out of sync with,
-    // so a cache hit IS the fast path. Only download when the cache
-    // is empty.
     let cached_kernel = format!("{out_dir}/vmlinux");
     let cached_rootfs = format!("{out_dir}/rootfs.ext4");
-    if std::path::Path::new(&cached_kernel).is_file()
-        && std::path::Path::new(&cached_rootfs).is_file()
-    {
-        ui::info(&format!("Builder VM image already cached at {out_dir}."));
-        return Ok(());
+    let cache_ready = std::path::Path::new(&cached_kernel).is_file()
+        && std::path::Path::new(&cached_rootfs).is_file();
+
+    match resolve_builder_vm_bootstrap_action(find_builder_vm_flake(), cache_ready)? {
+        BuilderVmBootstrapAction::UseCached => {
+            ui::info(&format!("Builder VM image already cached at {out_dir}."));
+            Ok(())
+        }
+        BuilderVmBootstrapAction::DownloadPublished => {
+            ui::info(&format!(
+                "Builder VM image not in cache; downloading published prebuilt for v{}...",
+                env!("CARGO_PKG_VERSION")
+            ));
+            download_builder_vm_image(arch, &out_dir).context("downloading the builder VM image")
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BuilderVmBootstrapAction {
+    UseCached,
+    DownloadPublished,
+}
+
+fn resolve_builder_vm_bootstrap_action(
+    builder_flake: Result<String>,
+    cache_ready: bool,
+) -> Result<BuilderVmBootstrapAction> {
+    if cache_ready {
+        return Ok(BuilderVmBootstrapAction::UseCached);
     }
 
-    ui::info(&format!(
-        "Builder VM image not in cache; downloading published prebuilt for v{}...",
-        env!("CARGO_PKG_VERSION")
-    ));
-    download_builder_vm_image(arch, &out_dir).context("downloading the builder VM image")?;
-    Ok(())
+    match builder_flake {
+        Ok(flake_dir) => anyhow::bail!(
+            "builder VM image cache is missing, and this mvmctl was built from a source checkout \
+             with a local builder VM flake at {flake_dir}. Refusing to download a published \
+             builder VM prebuilt because it would mask local changes. Build the builder VM image \
+             from nix/images/builder-vm/flake.nix and populate ~/.cache/mvm/builder-vm/<arch>/{{vmlinux,rootfs.ext4}}."
+        ),
+        Err(_) => Ok(BuilderVmBootstrapAction::DownloadPublished),
+    }
 }
 
 /// Download the per-arch Layer 1 builder VM artifacts published by the
@@ -2459,6 +2481,44 @@ mod builder_vm_bootstrap_tests {
         assert_eq!(n.cmdline, "builder-vm-x86_64.cmdline.txt");
         assert_eq!(n.manifest, "builder-vm-x86_64.manifest.json");
         assert_eq!(n.checksums, "builder-vm-x86_64-checksums-sha256.txt");
+    }
+
+    #[test]
+    fn builder_vm_bootstrap_uses_cache_even_in_source_checkout() {
+        let action = resolve_builder_vm_bootstrap_action(
+            Ok("/repo/nix/images/builder-vm".to_string()),
+            true,
+        )
+        .expect("cache hit should be usable in a source checkout");
+
+        assert_eq!(action, BuilderVmBootstrapAction::UseCached);
+    }
+
+    #[test]
+    fn builder_vm_bootstrap_source_checkout_refuses_prebuilt_download_on_cache_miss() {
+        let err = resolve_builder_vm_bootstrap_action(
+            Ok("/repo/nix/images/builder-vm".to_string()),
+            false,
+        )
+        .expect_err("source checkout cache miss must not download a published prebuilt");
+
+        let msg = format!("{err:#}");
+        assert!(msg.contains("source checkout"), "{msg}");
+        assert!(
+            msg.contains("Refusing to download a published builder VM prebuilt"),
+            "{msg}"
+        );
+        assert!(msg.contains("nix/images/builder-vm/flake.nix"), "{msg}");
+        assert!(msg.contains("~/.cache/mvm/builder-vm/<arch>"), "{msg}");
+    }
+
+    #[test]
+    fn builder_vm_bootstrap_installed_binary_may_download_on_cache_miss() {
+        let action =
+            resolve_builder_vm_bootstrap_action(Err(anyhow::anyhow!("no source flake")), false)
+                .expect("installed binaries may use published prebuilts");
+
+        assert_eq!(action, BuilderVmBootstrapAction::DownloadPublished);
     }
 
     #[test]
