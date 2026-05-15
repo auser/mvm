@@ -240,6 +240,48 @@ impl VmBackend for FirecrackerBackend {
     }
 }
 
+/// Isolation tier of a `VmBackend`. Plan 76 Phase 7.
+///
+/// Captures the host/guest boundary strength so the CLI can refuse
+/// to silently downgrade from a hardened production tier to a
+/// developer-ergonomics tier when an operator asked for a
+/// production-like launch.
+///
+/// **Tier 1** — Firecracker (with jailer + seccomp) and Cloud
+/// Hypervisor (rust-vmm peer at the same maturity). The hardened
+/// production posture: KVM-only, minimal device surface, audited
+/// codebase, ADR-002 §W1–§W5 claims hold against this tier.
+///
+/// **Tier 2** — libkrun. Fast, well-engineered, but its host/guest
+/// boundary is **not equivalent to Firecracker + jailer + seccomp**.
+/// Best for local dev on macOS Apple Silicon (HVF) and builder VMs.
+/// Plan 76 §"libkrun isolation is not Firecracker isolation": prod
+/// selection must require explicit operator acknowledgement.
+///
+/// **Tier 3** — Docker, microvm.nix runner, Mock. Fallback or
+/// test-only; `mvmctl up` emits a loud banner before using them.
+/// Apple Container sits at Tier 3 today as well: while VZ provides
+/// real virtualization, the security claims have not been audited
+/// against ADR-002.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum BackendTier {
+    Tier1,
+    Tier2,
+    Tier3,
+}
+
+impl BackendTier {
+    /// Short stable string for CLI / doctor output. Wire-stable —
+    /// scripts grepping `mvmctl doctor` rely on these names.
+    pub fn label(&self) -> &'static str {
+        match self {
+            BackendTier::Tier1 => "tier1-hardened",
+            BackendTier::Tier2 => "tier2-fast-local",
+            BackendTier::Tier3 => "tier3-fallback",
+        }
+    }
+}
+
 /// Backend-agnostic dispatch enum.
 ///
 /// Wraps concrete backends so CLI commands don't need to know which
@@ -352,6 +394,39 @@ impl AnyBackend {
         // then fails with the production-path error message rather than
         // silently picking a backend the caller didn't ask for.
         Self::Firecracker(FirecrackerBackend)
+    }
+
+    /// Plan 76 Phase 7 — isolation tier of this backend. Used by
+    /// `mvmctl up` to refuse silent Tier 2 downgrades on
+    /// production-like launches, and by `mvmctl doctor` to surface
+    /// what's actually running on the host.
+    ///
+    /// Classification mirrors each backend's existing
+    /// `BackendSecurityProfile.tier` (`crates/mvm-backend/src/*.rs::security_profile`),
+    /// the long-standing per-backend declaration consulted by
+    /// `mvmctl doctor --json::security_posture.tier`. A test below
+    /// asserts the two stay in sync; bumping one without the other
+    /// fails CI.
+    pub fn tier(&self) -> BackendTier {
+        match self {
+            // Tier 1: hardened production. Firecracker (with
+            // jailer + seccomp) and Cloud Hypervisor (peer at the
+            // same maturity).
+            Self::Firecracker(_) | Self::CloudHypervisor(_) => BackendTier::Tier1,
+
+            // Tier 2: fast local. libkrun's host/guest boundary
+            // is well-engineered but not equivalent to
+            // Firecracker + jailer + seccomp; plan 76 §"libkrun
+            // isolation is not Firecracker isolation". Apple
+            // Container (Virtualization.framework) and microvm.nix
+            // (qemu) also sit here per their existing
+            // `BackendSecurityProfile.tier` strings.
+            Self::Libkrun(_) | Self::AppleContainer(_) | Self::MicrovmNix(_) => BackendTier::Tier2,
+
+            // Tier 3: fallback / test. Docker is a userspace
+            // container fallback; Mock is in-memory test-only.
+            Self::Docker(_) | Self::Mock(_) => BackendTier::Tier3,
+        }
     }
 
     /// Dispatch helper — returns a `&dyn VmBackend` for the inner backend.
@@ -778,5 +853,73 @@ mod tests {
                 "{name}: capability flag must say pause_resume=true (matches the real impl)"
             );
         }
+    }
+
+    // Plan 76 Phase 7 — BackendTier coverage.
+
+    #[test]
+    fn tier_classification_locks_each_backend_variant() {
+        let cases: &[(&str, BackendTier)] = &[
+            ("firecracker", BackendTier::Tier1),
+            ("cloud-hypervisor", BackendTier::Tier1),
+            ("libkrun", BackendTier::Tier2),
+            ("apple-container", BackendTier::Tier2),
+            ("qemu", BackendTier::Tier2),
+            ("docker", BackendTier::Tier3),
+            ("mock", BackendTier::Tier3),
+        ];
+        for (name, expected) in cases {
+            let b = AnyBackend::from_hypervisor(name);
+            assert_eq!(b.tier(), *expected, "{name}: tier mismatch");
+        }
+    }
+
+    #[test]
+    fn tier_matches_existing_backend_security_profile_string() {
+        // The `BackendSecurityProfile.tier` field (consulted by
+        // `mvmctl doctor --json::security_posture.tier`) is the
+        // long-standing per-backend tier declaration. `AnyBackend::tier()`
+        // is the Plan 76 Phase 7 closed-enum view of the same fact.
+        // Bumping one without the other is a regression — keep them
+        // wired.
+        let names = [
+            "firecracker",
+            "cloud-hypervisor",
+            "libkrun",
+            "apple-container",
+            "qemu",
+            "docker",
+            "mock",
+        ];
+        for name in names {
+            let b = AnyBackend::from_hypervisor(name);
+            let enum_tier = b.tier();
+            let profile_tier = b.security_profile().tier;
+            // The profile tier is a `&'static str` like "Tier 1" or
+            // "Tier 3 (test-only)"; reduce to the leading "Tier N"
+            // prefix and assert it agrees with the enum.
+            let expected_prefix = match enum_tier {
+                BackendTier::Tier1 => "Tier 1",
+                BackendTier::Tier2 => "Tier 2",
+                BackendTier::Tier3 => "Tier 3",
+            };
+            assert!(
+                profile_tier.starts_with(expected_prefix),
+                "{name}: AnyBackend::tier() = {:?}; \
+                 BackendSecurityProfile.tier = {:?} — drift; \
+                 update one to match the other.",
+                enum_tier,
+                profile_tier
+            );
+        }
+    }
+
+    #[test]
+    fn tier_label_is_wire_stable() {
+        // `mvmctl doctor`'s text output and any downstream scripts
+        // grep these strings. A rename here is a wire change.
+        assert_eq!(BackendTier::Tier1.label(), "tier1-hardened");
+        assert_eq!(BackendTier::Tier2.label(), "tier2-fast-local");
+        assert_eq!(BackendTier::Tier3.label(), "tier3-fallback");
     }
 }
