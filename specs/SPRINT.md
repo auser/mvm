@@ -42,6 +42,8 @@ Recent maintenance:
 - [x] Extended `runtime_boot_bench` with TOML config-file input, Apple Container backend defaults, configurable CPU/memory sizing, and Apple guest-agent readiness probing.
 - [x] Removed the remaining third-party sandbox Cargo dependency and backend/builder compile paths; `Cargo.lock` no longer carries the transitive SeaORM/SQLx stack, including the MySQL driver.
 - [x] Preserved macOS cross-architecture support after the cleanup: Apple Container stays scoped to macOS 26+ Apple Silicon, while direct libkrun remains the macOS Apple Silicon + Intel path.
+- [x] Added ADR-048 and Plan 74 to turn the Microsandbox comparison into claim-gated `mvm` runtime work: docs hygiene, OCI ingest, programmable networking, secret placeholders, SDK-owned lifecycle, measured cold-starts, and filesystem backend contracts.
+- [ ] Plan 74 W0 (claims hygiene and docs guardrails) in flight — new public Sandbox parity status page (`security/sandbox-parity-status.md`), `cargo xtask check-doc-claims` lint covering `<100ms` / `any OCI image` / `secrets cannot leak` / variants, `mvmforge` cleanup in `guides/exec.md` and `reference/cli-commands.md`, gap-analysis updated for current `crates/mvm-sdk` layout and mvmd ADR-0020 handoff, and a new `specs/plans/74-w1-w6-attack-plan.md` sequencing sidecar that defers risk discussion to plan 74's `## Risks` section (R1-R12).
 
 ## In-flight workstreams
 
@@ -1691,6 +1693,39 @@ Shipped:
 5. *Backwards compatibility: every existing workspace test plus
    `cargo clippy --workspace --all-targets -- -D warnings` stays
    green throughout.*
+
+## Sprint 53 — Claim-safe sandbox parity (W0 in flight) [`plans/74-claim-safe-sandbox-parity.md`](plans/74-claim-safe-sandbox-parity.md) | [`adrs/048-claim-safe-sandbox-parity.md`](adrs/048-claim-safe-sandbox-parity.md) | [`plans/74-w1-w6-attack-plan.md`](plans/74-w1-w6-attack-plan.md)
+
+### W0 — Claims hygiene and docs guardrails  🟡 in flight
+
+Stops overclaiming before runtime work (W1-W6) lands. Ships a public
+"Sandbox parity status" page that classifies every claim
+(`claims-hygiene` / `oci-ingest` / `network-policy` /
+`secret-non-leakage` / `sdk-lifecycle` / `cold-start` /
+`filesystem-backends`) as Shipped / Preview / Planned / Not claimed;
+adds `cargo xtask check-doc-claims` to the `lint` CI job, which
+rejects gated marketing phrases (`<100ms` and variants, `any OCI
+image`, `arbitrary OCI image`, `secrets cannot leak`, `never enters
+the guest`) on public docs unless the file marks the relevant claim
+Shipped or carries an `<!-- allow(doc-claim:<id>): <reason> -->`
+opt-out; strips live `mvmforge` references from
+`guides/exec.md` and `reference/cli-commands.md` (the deliberate
+migration guide stays); updates `specs/gap-analysis-vs-microsandbox.md`
+for the current `crates/mvm-sdk` + `crates/mvm-sdk-macros` layout
+and the mvmd ADR-0020 cross-repo handoff; and lands plan 74's
+`## Risks` section (R1-R12, eight cross-cutting plus four
+architectural) plus the `74-w1-w6-attack-plan.md` sequencing
+sidecar so W1-W6 don't get re-planned mid-flight.
+
+### W1-W6 — Proposed
+
+OCI ingest, programmable network policy, secret placeholders,
+SDK-owned lifecycle, cold-start measurement, extensible filesystem
+backends. Sequencing, dependencies, and per-workstream attack plans
+in `plans/74-w1-w6-attack-plan.md`. Risk R9 (TLS substitution
+mechanism — proxy-with-CA vs vsock side-channel vs host-side
+reconstruction) is the single architectural gate; recommended to
+land its own ADR before W2 codes the proxy.
 
 ## Completed Sprints
 

@@ -6630,6 +6630,7 @@ dependencies = [
  "clap_mangen",
  "mvm-build",
  "mvm-cli",
+ "regex",
  "serde",
  "serde_json",
  "sha2",

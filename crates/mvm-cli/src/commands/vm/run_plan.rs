@@ -346,6 +346,7 @@ mod tests {
             mode: Some(RunMode::Plan),
             dev: false,
             prod: false,
+            dry_run: false,
             argv: Vec::new(),
         }
     }
