@@ -18,6 +18,7 @@ use crate::ui;
 pub(super) const DEV_VM_NAME: &str = "mvm-dev";
 const BUILDER_VM_SOURCE_FINGERPRINT_FILE: &str = ".mvm-source.sha256";
 const BUILDER_VM_ARTIFACT_DIGEST_FILE: &str = ".mvm-artifacts.sha256";
+const BUILDER_VM_PROVENANCE_FILE: &str = ".mvm-provenance.json";
 
 /// Check if the Apple Container dev VM is running *and* reachable
 /// cross-process via the vsock proxy socket.
@@ -1848,7 +1849,14 @@ fn bootstrap_builder_vm_image() -> Result<()> {
         .map(|flake_dir| builder_vm_source_fingerprint(flake_dir))
         .transpose()?;
     let cache_ready = match source_fingerprint.as_deref() {
-        Some(fingerprint) => builder_vm_source_cache_ready(out_dir_path, fingerprint),
+        Some(fingerprint) => {
+            let status = builder_vm_source_cache_status(out_dir_path, fingerprint);
+            ui::progress(&format!(
+                "Builder VM source cache decision: {}",
+                status.reason_code()
+            ));
+            status.is_ready()
+        }
         None => validate_builder_vm_stage0_artifacts(out_dir_path).is_ok(),
     };
 
@@ -1872,14 +1880,43 @@ fn bootstrap_builder_vm_image() -> Result<()> {
             .context("building the source-checkout builder VM image")
         }
         BuilderVmBootstrapAction::DownloadPublished => {
-            ui::info(&format!(
-                "Builder VM image not in cache; downloading published prebuilt for v{}...",
-                env!("CARGO_PKG_VERSION")
-            ));
-            std::fs::create_dir_all(&out_dir)
-                .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
-            download_builder_vm_image(arch, &out_dir).context("downloading the builder VM image")
+            perform_builder_vm_download_published(arch, &out_dir)
         }
+    }
+}
+
+/// Plan 77 W4: the only call site that can invoke the published-prebuilt
+/// download path. Gated behind `release-artifact-bootstrap`. Contributor
+/// builds (the default) hit the `cfg(not(...))` arm and bail structurally
+/// — even if the resolver routed here, the function refuses to touch the
+/// network. End-user-binary release builds opt in at compile time.
+///
+/// Extracted from [`bootstrap_builder_vm_image`] specifically so the
+/// fail-closed shape is unit-testable.
+fn perform_builder_vm_download_published(arch: &str, out_dir: &str) -> Result<()> {
+    #[cfg(feature = "release-artifact-bootstrap")]
+    {
+        ui::info(&format!(
+            "Builder VM image not in cache; downloading published prebuilt for v{}...",
+            env!("CARGO_PKG_VERSION")
+        ));
+        std::fs::create_dir_all(out_dir)
+            .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
+        download_builder_vm_image(arch, out_dir).context("downloading the builder VM image")
+    }
+    #[cfg(not(feature = "release-artifact-bootstrap"))]
+    {
+        let _ = (arch, out_dir);
+        anyhow::bail!(
+            "Builder VM image is missing and no in-repo builder VM flake \
+             was found. This `mvmctl` binary was built without the \
+             `release-artifact-bootstrap` feature, so it cannot pull a \
+             published prebuilt from GitHub releases (per Plan 77 W4 and \
+             the AGENTS.md / CLAUDE.md invariant). \
+             Run from a source checkout that has \
+             `nix/images/builder-vm/flake.nix`, or rebuild `mvmctl` with \
+             `--features release-artifact-bootstrap` (release-cut binaries only)."
+        );
     }
 }
 
@@ -1956,6 +1993,7 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     }
     write_builder_vm_source_fingerprint(&staging_dir, source_fingerprint)?;
     write_builder_vm_artifact_digest_manifest(&staging_dir)?;
+    write_builder_vm_source_cache_provenance(&staging_dir, source_fingerprint)?;
 
     if let Err(e) = promote_builder_vm_stage0_cache(&staging_dir, out_dir, source_fingerprint) {
         let _ = std::fs::remove_dir_all(&staging_dir);
@@ -2074,12 +2112,83 @@ fn builder_vm_source_fingerprint(builder_flake_dir: &str) -> Result<String> {
     Ok(format!("{:x}", hasher.finalize()))
 }
 
-fn builder_vm_source_cache_ready(dir: &std::path::Path, expected_fingerprint: &str) -> bool {
-    validate_builder_vm_stage0_artifacts(dir).is_ok()
-        && builder_vm_source_fingerprint_matches(dir, expected_fingerprint)
-        && builder_vm_artifact_digest_manifest_matches(dir)
+#[derive(Debug, Clone, Copy, Eq, PartialEq)]
+enum BuilderVmSourceCacheStatus {
+    Hit,
+    MissingArtifact,
+    InvalidStage0Artifacts,
+    MissingFingerprint,
+    FingerprintMismatch,
+    MissingArtifactDigestManifest,
+    ArtifactDigestMismatch,
+    MissingProvenance,
+    ProvenanceMismatch,
 }
 
+impl BuilderVmSourceCacheStatus {
+    fn is_ready(self) -> bool {
+        self == Self::Hit
+    }
+
+    fn reason_code(self) -> &'static str {
+        match self {
+            Self::Hit => "hit",
+            Self::MissingArtifact => "missing_artifact",
+            Self::InvalidStage0Artifacts => "invalid_stage0_artifacts",
+            Self::MissingFingerprint => "missing_fingerprint",
+            Self::FingerprintMismatch => "fingerprint_mismatch",
+            Self::MissingArtifactDigestManifest => "missing_artifact_digest_manifest",
+            Self::ArtifactDigestMismatch => "artifact_digest_mismatch",
+            Self::MissingProvenance => "missing_provenance",
+            Self::ProvenanceMismatch => "provenance_mismatch",
+        }
+    }
+}
+
+fn builder_vm_source_cache_status(
+    dir: &std::path::Path,
+    expected_fingerprint: &str,
+) -> BuilderVmSourceCacheStatus {
+    if !dir.join("vmlinux").exists() || !dir.join("rootfs.ext4").exists() {
+        return BuilderVmSourceCacheStatus::MissingArtifact;
+    }
+    if validate_builder_vm_stage0_artifacts(dir).is_err() {
+        return BuilderVmSourceCacheStatus::InvalidStage0Artifacts;
+    }
+
+    let fingerprint_path = dir.join(BUILDER_VM_SOURCE_FINGERPRINT_FILE);
+    let Ok(actual_fingerprint) = std::fs::read_to_string(fingerprint_path) else {
+        return BuilderVmSourceCacheStatus::MissingFingerprint;
+    };
+    if actual_fingerprint.trim() != expected_fingerprint {
+        return BuilderVmSourceCacheStatus::FingerprintMismatch;
+    }
+
+    let digest_path = dir.join(BUILDER_VM_ARTIFACT_DIGEST_FILE);
+    if !digest_path.exists() {
+        return BuilderVmSourceCacheStatus::MissingArtifactDigestManifest;
+    }
+    if !builder_vm_artifact_digest_manifest_matches(dir) {
+        return BuilderVmSourceCacheStatus::ArtifactDigestMismatch;
+    }
+
+    let provenance_path = dir.join(BUILDER_VM_PROVENANCE_FILE);
+    if !provenance_path.exists() {
+        return BuilderVmSourceCacheStatus::MissingProvenance;
+    }
+    if !builder_vm_source_cache_provenance_matches(dir, expected_fingerprint) {
+        return BuilderVmSourceCacheStatus::ProvenanceMismatch;
+    }
+
+    BuilderVmSourceCacheStatus::Hit
+}
+
+#[cfg(any(feature = "builder-vm", test))]
+fn builder_vm_source_cache_ready(dir: &std::path::Path, expected_fingerprint: &str) -> bool {
+    builder_vm_source_cache_status(dir, expected_fingerprint).is_ready()
+}
+
+#[cfg(any(feature = "builder-vm", test))]
 fn builder_vm_source_fingerprint_matches(
     dir: &std::path::Path,
     expected_fingerprint: &str,
@@ -2135,6 +2244,69 @@ fn write_builder_vm_artifact_digest_manifest(dir: &std::path::Path) -> Result<()
         .with_context(|| format!("writing builder VM artifact digests in {}", dir.display()))
 }
 
+#[derive(Debug, Clone, Eq, PartialEq, serde::Deserialize, serde::Serialize)]
+#[serde(deny_unknown_fields)]
+struct BuilderVmSourceCacheProvenance {
+    schema_version: u32,
+    source_kind: String,
+    source_fingerprint: String,
+    artifacts: Vec<String>,
+}
+
+fn builder_vm_source_cache_provenance(
+    dir: &std::path::Path,
+    source_fingerprint: &str,
+) -> Result<BuilderVmSourceCacheProvenance> {
+    Ok(BuilderVmSourceCacheProvenance {
+        schema_version: 1,
+        source_kind: "source_checkout_stage0".to_string(),
+        source_fingerprint: source_fingerprint.to_string(),
+        artifacts: builder_vm_artifact_names_present(dir)?,
+    })
+}
+
+fn builder_vm_artifact_names_present(dir: &std::path::Path) -> Result<Vec<String>> {
+    let mut names = Vec::new();
+    for name in ["vmlinux", "rootfs.ext4", "cmdline.txt"] {
+        let path = dir.join(name);
+        if !path.exists() {
+            if name == "cmdline.txt" {
+                continue;
+            }
+            anyhow::bail!("builder VM provenance missing artifact {}", path.display());
+        }
+        names.push(name.to_string());
+    }
+    Ok(names)
+}
+
+fn builder_vm_source_cache_provenance_matches(
+    dir: &std::path::Path,
+    expected_fingerprint: &str,
+) -> bool {
+    let expected = match builder_vm_source_cache_provenance(dir, expected_fingerprint) {
+        Ok(expected) => expected,
+        Err(_) => return false,
+    };
+    std::fs::read_to_string(dir.join(BUILDER_VM_PROVENANCE_FILE))
+        .ok()
+        .and_then(|actual| serde_json::from_str::<BuilderVmSourceCacheProvenance>(&actual).ok())
+        .map(|actual| actual == expected)
+        .unwrap_or(false)
+}
+
+#[cfg(any(feature = "builder-vm", test))]
+fn write_builder_vm_source_cache_provenance(
+    dir: &std::path::Path,
+    source_fingerprint: &str,
+) -> Result<()> {
+    let provenance = builder_vm_source_cache_provenance(dir, source_fingerprint)?;
+    let json = serde_json::to_string_pretty(&provenance)
+        .context("serializing builder VM source cache provenance")?;
+    std::fs::write(dir.join(BUILDER_VM_PROVENANCE_FILE), format!("{json}\n"))
+        .with_context(|| format!("writing builder VM provenance in {}", dir.display()))
+}
+
 #[cfg(any(feature = "builder-vm", test))]
 fn promote_builder_vm_stage0_cache(
     staging_dir: &std::path::Path,
@@ -2151,6 +2323,12 @@ fn promote_builder_vm_stage0_cache(
     if !builder_vm_artifact_digest_manifest_matches(staging_dir) {
         anyhow::bail!(
             "Stage 0 builder VM staging dir {} is missing matching artifact digests",
+            staging_dir.display()
+        );
+    }
+    if !builder_vm_source_cache_provenance_matches(staging_dir, source_fingerprint) {
+        anyhow::bail!(
+            "Stage 0 builder VM staging dir {} is missing matching provenance metadata",
             staging_dir.display()
         );
     }
@@ -2197,7 +2375,13 @@ fn promote_builder_vm_stage0_cache(
 /// downloads with a fallback at the `mvm-build` consumer
 /// (`ensure_builder_vm_image` uses the canonical Plan 72 §W2 cmdline
 /// when `cmdline.txt` is missing).
-#[allow(dead_code)]
+///
+/// Plan 77 W4: gated behind `release-artifact-bootstrap`. Contributor
+/// builds (default) never compile this in, so the "no flake + cache
+/// miss" branch in [`bootstrap_builder_vm_image`] has no escape hatch
+/// and surfaces a hard error. End-user-binary release builds opt in
+/// at compile time via `--features release-artifact-bootstrap`.
+#[cfg(feature = "release-artifact-bootstrap")]
 fn download_builder_vm_image(arch: &str, cache_dir: &str) -> Result<()> {
     let version = env!("CARGO_PKG_VERSION");
     let names = builder_vm_artifact_names(arch);
@@ -2260,8 +2444,9 @@ fn download_builder_vm_image(arch: &str, cache_dir: &str) -> Result<()> {
 /// Per-arch artifact filenames the release workflow's
 /// `builder-vm-image` job uploads. Pure function — no I/O, no
 /// network — so the unit test can verify naming matches the
-/// release.yml side without touching the network.
-#[allow(dead_code)]
+/// release.yml side without touching the network. Gated together
+/// with [`download_builder_vm_image`] (Plan 77 W4).
+#[cfg(any(feature = "release-artifact-bootstrap", test))]
 struct BuilderVmArtifactNames {
     kernel: String,
     rootfs: String,
@@ -2270,7 +2455,7 @@ struct BuilderVmArtifactNames {
     checksums: String,
 }
 
-#[allow(dead_code)]
+#[cfg(any(feature = "release-artifact-bootstrap", test))]
 fn builder_vm_artifact_names(arch: &str) -> BuilderVmArtifactNames {
     BuilderVmArtifactNames {
         kernel: format!("builder-vm-vmlinux-{arch}"),
@@ -2923,6 +3108,38 @@ mod builder_vm_bootstrap_tests {
         assert_eq!(action, BuilderVmBootstrapAction::DownloadPublished);
     }
 
+    /// Plan 77 W4: even when the resolver routes to `DownloadPublished`,
+    /// a contributor build (no `release-artifact-bootstrap` feature) must
+    /// refuse to invoke the download path and surface a clear structural
+    /// error. This locks the AGENTS.md / CLAUDE.md "no prebuilt builder
+    /// VM artifact" invariant into the type system rather than runtime
+    /// branch order. The companion sibling under
+    /// `#[cfg(feature = "release-artifact-bootstrap")]` would need a
+    /// network mock; we cover the structural-failure side here because
+    /// it's the one contributors hit.
+    #[cfg(not(feature = "release-artifact-bootstrap"))]
+    #[test]
+    fn perform_builder_vm_download_published_bails_without_feature() {
+        let err = perform_builder_vm_download_published("aarch64", "/tmp/mvm-w4-test-out")
+            .expect_err("download must refuse without release-artifact-bootstrap");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("release-artifact-bootstrap"),
+            "error must name the feature flag: {msg}"
+        );
+        assert!(
+            msg.contains("nix/images/builder-vm/flake.nix"),
+            "error must point at the source-checkout remediation: {msg}"
+        );
+        // Critically: the bail must happen before any directory creation.
+        // Otherwise a contributor running on a shared host could pollute
+        // `/tmp/...` even when the gate is "closed".
+        assert!(
+            !std::path::Path::new("/tmp/mvm-w4-test-out").exists(),
+            "structural failure must not touch the filesystem"
+        );
+    }
+
     #[test]
     fn builder_vm_stage0_bootstrap_plan_targets_builder_vm_flake() {
         let (job, mounts, image) = builder_vm_stage0_bootstrap_plan(
@@ -2985,6 +3202,7 @@ mod builder_vm_bootstrap_tests {
     fn write_builder_vm_source_cache_metadata(dir: &std::path::Path, fingerprint: &str) {
         write_builder_vm_source_fingerprint(dir, fingerprint).expect("write fingerprint");
         write_builder_vm_artifact_digest_manifest(dir).expect("write artifact digest manifest");
+        write_builder_vm_source_cache_provenance(dir, fingerprint).expect("write provenance");
     }
 
     #[test]
@@ -3093,6 +3311,132 @@ mod builder_vm_bootstrap_tests {
         );
         write_builder_vm_source_cache_metadata(&cache, "fingerprint");
         assert!(builder_vm_source_cache_ready(&cache, "fingerprint"));
+    }
+
+    #[test]
+    fn builder_vm_source_cache_status_reports_safe_reason_codes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("builder-vm").join("aarch64");
+
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "missing_artifact"
+        );
+
+        std::fs::create_dir_all(&cache).expect("mkdir cache");
+        std::fs::write(cache.join("vmlinux"), b"stub").expect("write stub kernel");
+        std::fs::write(cache.join("rootfs.ext4"), b"stub").expect("write stub rootfs");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "invalid_stage0_artifacts"
+        );
+
+        write_valid_builder_vm_artifacts(&cache);
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "missing_fingerprint"
+        );
+
+        write_builder_vm_source_fingerprint(&cache, "other").expect("write fingerprint");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "fingerprint_mismatch"
+        );
+
+        write_builder_vm_source_fingerprint(&cache, "fingerprint").expect("write fingerprint");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "missing_artifact_digest_manifest"
+        );
+
+        write_builder_vm_artifact_digest_manifest(&cache).expect("write digest manifest");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "missing_provenance"
+        );
+
+        write_builder_vm_source_cache_provenance(&cache, "other").expect("write provenance");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "provenance_mismatch"
+        );
+
+        write_builder_vm_source_cache_provenance(&cache, "fingerprint").expect("write provenance");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "hit"
+        );
+
+        write_builder_vm_artifact_digest_manifest(&cache).expect("rewrite digest manifest");
+        std::fs::OpenOptions::new()
+            .append(true)
+            .open(cache.join("vmlinux"))
+            .expect("open kernel")
+            .write_all(b"tamper")
+            .expect("tamper kernel");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "artifact_digest_mismatch"
+        );
+
+        write_valid_builder_vm_artifacts(&cache);
+        write_builder_vm_source_cache_metadata(&cache, "fingerprint");
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "hit"
+        );
+    }
+
+    #[test]
+    fn builder_vm_source_cache_provenance_omits_local_paths_and_artifact_digests() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("builder-vm").join("aarch64");
+        write_valid_builder_vm_artifacts(&cache);
+        write_builder_vm_source_cache_metadata(&cache, "fingerprint");
+
+        let json = std::fs::read_to_string(cache.join(BUILDER_VM_PROVENANCE_FILE))
+            .expect("read provenance");
+        assert!(json.contains("\"source_kind\": \"source_checkout_stage0\""));
+        assert!(json.contains("\"source_fingerprint\": \"fingerprint\""));
+        assert!(json.contains("\"vmlinux\""));
+        assert!(json.contains("\"rootfs.ext4\""));
+        assert!(
+            !json.contains(&cache.display().to_string()),
+            "provenance must not store local cache paths: {json}"
+        );
+        assert!(
+            !json.contains("sha256"),
+            "artifact digests belong in the separate digest manifest, not provenance: {json}"
+        );
+    }
+
+    #[test]
+    fn builder_vm_source_cache_rejects_tampered_provenance() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let cache = tmp.path().join("builder-vm").join("aarch64");
+        write_valid_builder_vm_artifacts(&cache);
+        write_builder_vm_source_cache_metadata(&cache, "fingerprint");
+
+        let tampered = serde_json::json!({
+            "schema_version": 1,
+            "source_kind": "source_checkout_stage0",
+            "source_fingerprint": "other",
+            "artifacts": ["vmlinux", "rootfs.ext4"]
+        });
+        std::fs::write(
+            cache.join(BUILDER_VM_PROVENANCE_FILE),
+            serde_json::to_string_pretty(&tampered).expect("json"),
+        )
+        .expect("write tampered provenance");
+
+        assert_eq!(
+            builder_vm_source_cache_status(&cache, "fingerprint").reason_code(),
+            "provenance_mismatch"
+        );
+        assert!(
+            !builder_vm_source_cache_ready(&cache, "fingerprint"),
+            "provenance drift must force a source-checkout rebuild"
+        );
     }
 
     #[test]

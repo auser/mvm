@@ -417,6 +417,167 @@ fn agent_rules() -> Vec<HostPort> {
     ]
 }
 
+// ============================================================================
+// Plan 74 W2 — Mandatory deny ranges (item #4)
+// ============================================================================
+
+/// CIDR ranges that mvm always denies as egress destinations,
+/// regardless of any user-supplied allow-list. Plan 74 W2 §"Block
+/// metadata endpoints and local control-plane ranges by default".
+///
+/// Categories represented:
+///
+/// - **Cloud metadata endpoint** (`169.254.169.254/32`): AWS IMDS,
+///   GCP, and Azure all serve instance metadata at this magic
+///   address. A microVM with unrestricted egress can read the
+///   host's IAM credentials by hitting this endpoint; default-
+///   denying it closes the most consequential single-line escape.
+/// - **Link-local IPv4** (`169.254.0.0/16`) and **link-local IPv6**
+///   (`fe80::/10`): the metadata endpoint plus other host-only
+///   services that should never be addressable from a guest. The
+///   IPv4 range is the superset of the metadata `/32` — listing
+///   both is intentional, so a single-line tamper has to remove
+///   two entries (defense in depth).
+/// - **CGNAT** (`100.64.0.0/10`): commonly the host's "shared
+///   provider" address space on cloud / mobile networks. Often
+///   reachable internal services live here.
+/// - **Host loopback** (`127.0.0.0/8`, `::1/128`): the host's own
+///   services. VM-level isolation should already make these
+///   unreachable; the rule is a belt-and-braces guard against a
+///   misconfigured bridge.
+///
+/// Deliberately **NOT** in the list:
+///
+/// - RFC1918 (`10.0.0.0/8`, `172.16.0.0/12`, `192.168.0.0/16`) —
+///   commonly legitimate (corporate VPN, home lab, k8s pod
+///   network). Operators who want them blocked can add their
+///   own deny rules; defaulting to deny would break too many
+///   real-world workloads.
+/// - Unspecified (`0.0.0.0/32`, `::/128`) — doesn't route.
+/// - Multicast (`224.0.0.0/4`, `ff00::/8`) — doesn't reach the
+///   public internet; out of scope for egress policy.
+/// - IPv6 ULA (`fc00::/7`) — analogous to RFC1918 above.
+///
+/// Future enforcers (iptables/nft on Linux, the L4Policy
+/// evaluator, the L7 egress proxy) should consult this list
+/// *before* the user's allow-list. The plan 74 W2 follow-up
+/// slice wires this into the iptables FORWARD setup; this PR
+/// ships the data model only.
+pub const MANDATORY_DENY_RANGES: &[&str] = &[
+    // Cloud metadata first — the most consequential entry. A
+    // future operator who edits this list should think twice
+    // before touching this line specifically.
+    "169.254.169.254/32",
+    "169.254.0.0/16",
+    "100.64.0.0/10",
+    "127.0.0.0/8",
+    "::1/128",
+    "fe80::/10",
+];
+
+/// Parse [`MANDATORY_DENY_RANGES`] into typed [`ipnet::IpNet`]s.
+/// Done at call time (no `lazy_static` / `OnceLock`) — the list
+/// is small (<10 entries) and parse cost is dominated by the
+/// `Vec` allocation. A malformed entry is a programmer bug, not
+/// a runtime failure; the [`mandatory_deny_ranges_const_parses`]
+/// test catches typos before they ship.
+///
+/// Note: panics if any entry fails to parse. The single test
+/// guards the const, so a panic here can only happen if a future
+/// edit slips both the const review and CI — caller doesn't need
+/// to handle the error path.
+pub fn mandatory_deny_ranges() -> Vec<ipnet::IpNet> {
+    MANDATORY_DENY_RANGES
+        .iter()
+        .map(|s| {
+            s.parse().unwrap_or_else(|_| {
+                panic!("MANDATORY_DENY_RANGES contains invalid CIDR {s:?} — fix the const")
+            })
+        })
+        .collect()
+}
+
+/// Returns `true` if `ip` falls within any of the mandatory
+/// deny ranges. The defense-in-depth check every egress
+/// enforcer (iptables setup, L4Policy::evaluate, the L7 proxy)
+/// should run *before* consulting the user's allow-list — a hit
+/// here means the destination is forbidden full stop, no matter
+/// how permissive the allow-list is.
+///
+/// Allocates a small `Vec` per call today; the call site is
+/// admission-path or per-flow, neither of which is hot enough to
+/// justify cached parsing. A perf-sensitive consumer can hoist
+/// [`mandatory_deny_ranges`] outside its loop.
+pub fn is_mandatory_deny(ip: std::net::IpAddr) -> bool {
+    mandatory_deny_ranges().iter().any(|net| net.contains(&ip))
+}
+
+/// Emit the iptables shell fragment that drops outbound from
+/// `guest_ip` on `bridge_dev` to every IPv4 entry in
+/// [`MANDATORY_DENY_RANGES`]. Always returns a non-empty
+/// script — the deny posture applies regardless of the user's
+/// [`NetworkPolicy`].
+///
+/// **Order matters.** The script uses `iptables -I FORWARD`,
+/// which inserts at chain position 1, so a rule emitted *later*
+/// in the script ends up *earlier* in the chain (and is checked
+/// first by the kernel). Callers run this script *after* a
+/// policy's [`NetworkPolicy::iptables_script`] output so the
+/// deny rules end up at the TOP of FORWARD — they fire before
+/// any per-policy allow rule. Without that ordering, a
+/// `--network-preset unrestricted` workload (no allow-list,
+/// nothing scoped to it in FORWARD today) would still hit the
+/// metadata endpoint.
+///
+/// IPv6 entries from the const are intentionally skipped here —
+/// today's bridge wiring is IPv4-only, so a v6 packet from the
+/// guest doesn't have a route to leave anyway. The v6
+/// enforcement lands when the bridge gains v6.
+pub fn mandatory_deny_iptables_script(bridge_dev: &str, guest_ip: &str) -> String {
+    let mut script = String::from(
+        "# Plan 74 W2 §item 4 — mandatory deny ranges (cloud metadata,\n\
+         # link-local, CGNAT, host loopback). These rules sit at the top\n\
+         # of FORWARD via `-I` so they're checked before any per-policy\n\
+         # allow rule — even an `unrestricted` workload cannot reach\n\
+         # 169.254.169.254 (AWS IMDS / GCP / Azure metadata).\n",
+    );
+    for net in mandatory_deny_ranges() {
+        if !net.network().is_ipv4() {
+            continue;
+        }
+        script.push_str(&format!(
+            "sudo iptables -I FORWARD -i {br} -s {ip} -d {cidr} -j DROP\n",
+            br = bridge_dev,
+            ip = guest_ip,
+            cidr = net,
+        ));
+    }
+    script
+}
+
+/// Cleanup counterpart of [`mandatory_deny_iptables_script`].
+/// `iptables -D` removes one matching rule; the
+/// `while … 2>/dev/null; do :; done` form drains *all* matching
+/// rules so a previously-leaked duplicate (from a prior crashed
+/// `apply_network_policy`) doesn't strand a deny rule on the
+/// chain. Mirrors the pattern used by
+/// [`NetworkPolicy::iptables_cleanup_script`].
+pub fn mandatory_deny_iptables_cleanup_script(bridge_dev: &str, guest_ip: &str) -> String {
+    let mut script = String::from("# Clean up mandatory-deny rules\n");
+    for net in mandatory_deny_ranges() {
+        if !net.network().is_ipv4() {
+            continue;
+        }
+        script.push_str(&format!(
+            "while sudo iptables -D FORWARD -i {br} -s {ip} -d {cidr} -j DROP 2>/dev/null; do :; done\n",
+            br = bridge_dev,
+            ip = guest_ip,
+            cidr = net,
+        ));
+    }
+    script
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -798,5 +959,283 @@ mod tests {
             NetworkPolicy::allow_list(vec![HostPort::new("example.com", 443)])
         );
         assert!(parsed_al.egress_mode().is_none());
+    }
+
+    // =====================================================================
+    // Plan 74 W2 — Mandatory deny ranges (item #4)
+    // =====================================================================
+
+    /// Every entry in [`MANDATORY_DENY_RANGES`] must parse cleanly.
+    /// A typo here panics every consumer at runtime — catch it at
+    /// build time instead.
+    #[test]
+    fn mandatory_deny_ranges_const_parses() {
+        // `mandatory_deny_ranges()` itself panics on a parse
+        // failure, so calling it inside the test surfaces a typo
+        // as a test failure rather than a release-time panic.
+        let nets = mandatory_deny_ranges();
+        assert_eq!(
+            nets.len(),
+            MANDATORY_DENY_RANGES.len(),
+            "every constant entry should produce one IpNet"
+        );
+    }
+
+    /// The cloud metadata endpoint is the highest-stakes single
+    /// IP in the list. Asserting it directly (not just via the
+    /// containing `/16`) keeps the test loud if a future edit
+    /// removes the specific `/32` entry.
+    #[test]
+    fn cloud_metadata_endpoint_is_denied() {
+        let metadata: std::net::IpAddr = "169.254.169.254".parse().unwrap();
+        assert!(
+            is_mandatory_deny(metadata),
+            "AWS/GCP/Azure IMDS at 169.254.169.254 must be in the default-deny set"
+        );
+    }
+
+    #[test]
+    fn link_local_ipv4_is_denied() {
+        // Other points within the /16 must also fall in the deny
+        // set (the metadata `/32` is a subset of this `/16`).
+        for addr in ["169.254.0.1", "169.254.42.42", "169.254.255.254"] {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(
+                is_mandatory_deny(ip),
+                "link-local IPv4 {addr} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn link_local_ipv6_is_denied() {
+        for addr in ["fe80::1", "fe80::abcd:ef12:3456:7890"] {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(
+                is_mandatory_deny(ip),
+                "link-local IPv6 {addr} must be denied"
+            );
+        }
+    }
+
+    #[test]
+    fn cgnat_range_is_denied() {
+        // 100.64.0.0/10 = 100.64.0.0 through 100.127.255.255.
+        for addr in ["100.64.0.1", "100.127.255.254"] {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(is_mandatory_deny(ip), "CGNAT {addr} must be denied");
+        }
+        // Just outside the CGNAT range must NOT be denied.
+        let outside: std::net::IpAddr = "100.63.255.255".parse().unwrap();
+        assert!(
+            !is_mandatory_deny(outside),
+            "100.63.255.255 is one below CGNAT and should NOT be denied"
+        );
+        let above: std::net::IpAddr = "100.128.0.0".parse().unwrap();
+        assert!(
+            !is_mandatory_deny(above),
+            "100.128.0.0 is one above CGNAT and should NOT be denied"
+        );
+    }
+
+    #[test]
+    fn host_loopback_v4_and_v6_are_denied() {
+        let v4: std::net::IpAddr = "127.0.0.1".parse().unwrap();
+        let v6: std::net::IpAddr = "::1".parse().unwrap();
+        assert!(is_mandatory_deny(v4), "127.0.0.1 must be denied");
+        assert!(is_mandatory_deny(v6), "::1 must be denied");
+        // Anywhere inside 127.0.0.0/8 must be denied too.
+        let nested: std::net::IpAddr = "127.42.99.7".parse().unwrap();
+        assert!(is_mandatory_deny(nested), "127.42.99.7 must be denied");
+    }
+
+    /// Legitimate public IPs must pass through cleanly so a
+    /// future regression that overzealously expands the deny
+    /// set (e.g. blocking all RFC1918) surfaces here.
+    #[test]
+    fn legitimate_public_ips_are_not_denied() {
+        let cases = [
+            "8.8.8.8",              // Google DNS
+            "1.1.1.1",              // Cloudflare DNS
+            "104.16.0.1",           // arbitrary Cloudflare anycast
+            "2001:4860:4860::8888", // Google DNS IPv6
+            "2606:4700:4700::1111", // Cloudflare DNS IPv6
+        ];
+        for addr in cases {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(
+                !is_mandatory_deny(ip),
+                "{addr} must NOT be denied (legitimate public dest)"
+            );
+        }
+    }
+
+    /// RFC1918 ranges are deliberately NOT in the default-deny
+    /// set — corporate VPNs, home labs, and k8s pod networks live
+    /// here and breaking them would be a UX regression. If a
+    /// future edit accidentally adds RFC1918 to the const, this
+    /// test fails loudly and the maintainer reads the comment
+    /// above MANDATORY_DENY_RANGES that says why.
+    #[test]
+    fn rfc1918_is_not_in_default_deny() {
+        let cases = ["10.0.0.1", "172.16.0.1", "192.168.1.1"];
+        for addr in cases {
+            let ip: std::net::IpAddr = addr.parse().unwrap();
+            assert!(
+                !is_mandatory_deny(ip),
+                "{addr} is RFC1918 — must NOT be in default-deny (legitimate corp/VPN use)"
+            );
+        }
+    }
+
+    /// The first entry in the list is the cloud metadata `/32`.
+    /// Pinning the order matters: a maintainer scanning the
+    /// const should hit the most consequential entry first and
+    /// think twice before removing it. If a future PR rearranges
+    /// the entries, this assertion forces a conscious decision
+    /// rather than a silent reordering.
+    #[test]
+    fn cloud_metadata_is_first_entry_in_const() {
+        assert_eq!(
+            MANDATORY_DENY_RANGES[0], "169.254.169.254/32",
+            "cloud metadata /32 should be the first entry — it's the most \
+             consequential single address and a maintainer scanning the \
+             list should see it before anything else"
+        );
+    }
+
+    // =====================================================================
+    // Plan 74 W2 — iptables wiring for mandatory deny ranges
+    // =====================================================================
+
+    /// The most consequential assertion: the rendered script
+    /// must DROP traffic destined for the cloud metadata
+    /// endpoint. If this fails, AWS IMDS / GCP / Azure metadata
+    /// is reachable from the guest — defeating the entire
+    /// purpose of this slice.
+    #[test]
+    fn mandatory_deny_iptables_script_drops_cloud_metadata() {
+        let script = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        assert!(
+            script.contains("-d 169.254.169.254/32 -j DROP"),
+            "script must drop cloud metadata endpoint; got: {script}"
+        );
+    }
+
+    #[test]
+    fn mandatory_deny_iptables_script_scopes_to_guest_source() {
+        let script = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        // Every line that adds a rule must be scoped to the
+        // guest's source IP — otherwise a sibling guest's
+        // traffic could be affected by cleanup of this one.
+        for line in script.lines().filter(|l| l.contains("iptables -I")) {
+            assert!(
+                line.contains("-s 172.16.0.2"),
+                "deny rule line must scope to the guest IP: {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn mandatory_deny_iptables_script_uses_minus_i_for_top_of_chain() {
+        // `-I FORWARD` inserts at chain position 1 (top). A
+        // future PR that switches to `-A` would silently bury
+        // the deny rules below any pre-existing allow rules —
+        // catastrophic. Catch the regression at the unit level.
+        let script = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        for line in script.lines().filter(|l| l.contains("iptables")) {
+            assert!(
+                line.contains("-I FORWARD"),
+                "rule must use `-I FORWARD` (top-insert); got: {line}"
+            );
+            assert!(
+                !line.contains("-A FORWARD"),
+                "rule must NOT use `-A FORWARD` (would bury below allow rules): {line}"
+            );
+        }
+    }
+
+    #[test]
+    fn mandatory_deny_iptables_script_skips_ipv6_entries() {
+        let script = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        // v6 enforcement lands when the bridge gains v6
+        // routing; until then the v6 deny rules belong in a
+        // future PR, not in this script.
+        assert!(
+            !script.contains("ip6tables"),
+            "ip6tables must not appear; v6 wiring is deferred. got: {script}"
+        );
+        assert!(
+            !script.contains("::1/128"),
+            "IPv6 entries must not appear in v4 script: {script}"
+        );
+        assert!(
+            !script.contains("fe80::"),
+            "IPv6 entries must not appear in v4 script: {script}"
+        );
+    }
+
+    #[test]
+    fn mandatory_deny_iptables_script_covers_every_ipv4_const_entry() {
+        let script = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        for raw in MANDATORY_DENY_RANGES {
+            let net: ipnet::IpNet = raw.parse().unwrap();
+            if !net.network().is_ipv4() {
+                continue;
+            }
+            assert!(
+                script.contains(&format!("-d {net} -j DROP")),
+                "expected a DROP for {net} but it's missing from script: {script}"
+            );
+        }
+    }
+
+    /// Apply emits a DROP per IPv4 entry; cleanup must emit a
+    /// matching `-D` for every one of them. Drift between the
+    /// two scripts strands stale rules on the bridge after a
+    /// VM teardown.
+    #[test]
+    fn mandatory_deny_cleanup_matches_apply_line_for_line() {
+        let apply = mandatory_deny_iptables_script("br-mvm", "172.16.0.2");
+        let cleanup = mandatory_deny_iptables_cleanup_script("br-mvm", "172.16.0.2");
+        // For every `-I` rule in apply, expect a `-D` rule in
+        // cleanup with the same `-d <cidr>` token.
+        let apply_cidrs: Vec<&str> = apply
+            .lines()
+            .filter(|l| l.contains("iptables -I"))
+            .filter_map(|l| l.split("-d ").nth(1))
+            .filter_map(|tail| tail.split(' ').next())
+            .collect();
+        let cleanup_cidrs: Vec<&str> = cleanup
+            .lines()
+            .filter(|l| l.contains("iptables -D"))
+            .filter_map(|l| l.split("-d ").nth(1))
+            .filter_map(|tail| tail.split(' ').next())
+            .collect();
+        assert_eq!(
+            apply_cidrs, cleanup_cidrs,
+            "apply and cleanup must reference identical CIDRs in identical order"
+        );
+        assert!(!apply_cidrs.is_empty(), "apply must emit at least one rule");
+    }
+
+    #[test]
+    fn mandatory_deny_cleanup_uses_drain_loop() {
+        let cleanup = mandatory_deny_iptables_cleanup_script("br-mvm", "172.16.0.2");
+        // A single `-D` removes exactly one matching rule. The
+        // `while … do :; done` form drains all matches so a
+        // leaked duplicate (from a prior crashed apply) doesn't
+        // strand a deny rule. Matches the pattern used by the
+        // pre-W2 cleanup script in `mvm-backend::network`.
+        for line in cleanup.lines().filter(|l| l.contains("iptables -D")) {
+            assert!(
+                line.starts_with("while sudo "),
+                "cleanup must use `while sudo … do :; done` drain loop: {line}"
+            );
+            assert!(
+                line.ends_with("done"),
+                "cleanup must close the `while … done` block: {line}"
+            );
+        }
     }
 }

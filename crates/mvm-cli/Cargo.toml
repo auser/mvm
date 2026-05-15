@@ -76,6 +76,14 @@ contributor-bootstrap = [
     "mvm-backend/contributor-bootstrap",
 ]
 builder-vm = ["mvm-build/builder-vm"]
+# Plan 77 W4: structural enforcement of the "no prebuilt builder VM artifact
+# until release" invariant (see AGENTS.md / CLAUDE.md). When off — the default
+# for every contributor build — `download_builder_vm_image` and its helpers
+# are entirely cfg'd out, so a cache miss with no in-repo flake hard-errors
+# at the source-checkout boundary rather than silently pulling a GitHub
+# release artifact. The feature is only intended to be enabled when cutting
+# an end-user-binary release that legitimately wants the download fallback.
+release-artifact-bootstrap = []
 custom-dns = ["mvm-supervisor/custom-dns"]
 dev-watch = ["dep:notify", "dep:notify-debouncer-mini"]
 manifest-verify = [

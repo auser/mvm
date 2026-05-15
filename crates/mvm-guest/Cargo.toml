@@ -34,6 +34,17 @@ path = "src/bin/mvm-seccomp-apply.rs"
 name = "mvm-verity-init"
 path = "src/bin/mvm-verity-init.rs"
 
+# Plan 74 W2 — guest-side network defense. Installs kernel blackhole
+# routes for `MANDATORY_DENY_RANGES` (cloud metadata, link-local,
+# CGNAT, host loopback) inside every microVM. Run as root from
+# `/init` BEFORE the agent is forked under setpriv, so the routes
+# exist before any workload code can attempt egress. Cross-platform
+# (Linux kernel routing is uniform across Firecracker, libkrun,
+# Apple Container).
+[[bin]]
+name = "mvm-guest-netinit"
+path = "src/bin/mvm-guest-netinit.rs"
+
 # Test-only probe used by `tests/seccomp_apply.rs` to verify that
 # tier allowlists actually deny what they claim (ADR-002 §W2.4). Not
 # selected by `nix/packages/mvm-guest-agent.nix`, so it never ships
@@ -71,15 +82,35 @@ serde_json.workspace = true
 # typed error variants (ReadinessError, ShutdownError).
 thiserror = "1"
 tracing.workspace = true
+# Plan 74 W2 — the `netinit` module's trait + types + install
+# loop + tests are cross-platform; only `RtnetlinkInstaller`
+# itself is Linux-only. Keeping async-trait + ipnet in the main
+# deps lets the tests run on macOS dev hosts too.
+async-trait.workspace = true
+ipnet.workspace = true
 
 # seccompiler builds Linux-only — guests are always Linux microVMs,
 # but the workspace also compiles on macOS for CLI development. Gate
 # the dep so `cargo check` on a Mac doesn't try to build it.
 [target.'cfg(target_os = "linux")'.dependencies]
 seccompiler = { workspace = true }
+# Plan 74 W2 — `mvm-guest-netinit` uses rtnetlink to install kernel
+# blackhole routes for `MANDATORY_DENY_RANGES`. Linux-only because
+# rtnetlink talks to AF_NETLINK which doesn't exist elsewhere. The
+# host-side mvmctl builds (which include this crate) skip these
+# deps on macOS; the binary itself is only relevant in the guest.
+rtnetlink = { workspace = true }
+tokio = { workspace = true }
+# netlink-packet-route is rtnetlink's wire-format types crate. The
+# RouteType::BlackHole enum the installer uses comes from here.
+netlink-packet-route = "0.19"
 
 [dev-dependencies]
 tempfile.workspace = true
+# Plan 74 W2 — `netinit` module's tests are async (the
+# `RouteInstaller` trait is async). tokio is workspace-shared so
+# the extra dev-dep doesn't pull anything new into the lock.
+tokio = { workspace = true }
 
 [lints]
 workspace = true
