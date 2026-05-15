@@ -1976,6 +1976,7 @@ fn builder_vm_stage0_bootstrap_plan(
     Ok((job, mounts, bootstrap_image))
 }
 
+#[cfg(any(feature = "builder-vm", test))]
 fn unique_builder_vm_stage0_staging_dir(final_dir: &std::path::Path) -> Result<std::path::PathBuf> {
     let parent = final_dir.parent().ok_or_else(|| {
         anyhow::anyhow!(
@@ -2010,6 +2011,7 @@ fn validate_builder_vm_stage0_artifacts(dir: &std::path::Path) -> Result<()> {
     })
 }
 
+#[cfg(any(feature = "builder-vm", test))]
 fn promote_builder_vm_stage0_cache(
     staging_dir: &std::path::Path,
     final_dir: &std::path::Path,
