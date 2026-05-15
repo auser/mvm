@@ -309,6 +309,15 @@ fn dispatch(req: GuestRequest, next_token: &AtomicU64) -> GuestResponse {
             &requested_capabilities,
         ),
 
+        // ── Integration status (ADR-050 §3 / plan 74 W2) ────────────
+        // Mock VMs have no integrations to report. Returning an empty
+        // list lets the host's services-ready poll transition straight
+        // to `ServicesReady` rather than timing out on a "verb not
+        // implemented" error from the catch-all arm below.
+        GuestRequest::IntegrationStatus => GuestResponse::IntegrationStatusReport {
+            integrations: Vec::new(),
+        },
+
         // ── Filesystem verbs ────────────────────────────────────────
         GuestRequest::FsWrite { content, .. } => GuestResponse::FsResult(FsResult::Write {
             bytes_written: content.len() as u64,
