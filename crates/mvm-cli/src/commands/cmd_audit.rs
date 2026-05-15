@@ -191,6 +191,7 @@ impl Commands {
             Commands::Deps(_) => "deps",
             Commands::Wait(_) => "wait",
             Commands::BootReport(_) => "boot-report",
+            Commands::Artifact(_) => "artifact",
         }
     }
 }

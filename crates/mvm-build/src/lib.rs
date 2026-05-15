@@ -5,6 +5,10 @@ pub mod backend;
 pub mod builder_vm;
 pub mod cache;
 pub mod firecracker;
+/// Plan 76 Phase 6 — portable signed `.mvm` artifacts. A tar.gz
+/// wrapper around kernel + rootfs + verity sidecars + cmdline,
+/// with an Ed25519-signed manifest that hashes every payload.
+pub mod packed_artifact;
 pub mod template_reuse;
 
 /// Plan 72 W1 — libkrun-backed builder VM (gated by
