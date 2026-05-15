@@ -902,6 +902,65 @@ pub fn download_runtime_overlay(
     )
 }
 
+/// Documented env var that disables the auto-fetch fallback in
+/// [`resolve_or_fetch_runtime_overlay`]. When set to anything
+/// non-empty, an `ArtifactIncomplete` or `VersionMismatch`
+/// surfaces as the raw resolver error instead of triggering a
+/// download. Useful for airgapped environments + CI runners
+/// where the operator wants to pre-populate the cache.
+const AUTOFETCH_DISABLE_ENV: &str = "MVM_OVERLAY_AUTOFETCH_OFF";
+
+/// Resolve the runtime overlay from the local cache, auto-
+/// fetching from the published GitHub Release if a cache miss
+/// shows up. Designed for the `mvmctl up` hot path so callers
+/// don't have to babysit "is the overlay cached for this
+/// mvmctl version + arch?".
+///
+/// Fetch fires on two outcomes:
+/// - [`RuntimeOverlayError::ArtifactIncomplete`] — at least one
+///   of the four files is missing.
+/// - [`RuntimeOverlayError::VersionMismatch`] — the cached
+///   `VERSION` file disagrees with `expected_version`. Stale
+///   overlay from an older mvmctl; refetch under the new tag.
+///
+/// Every other resolver error fails through (`InvalidRoothash`,
+/// `InvalidVersionFile`, `Io`). Those signal *something is
+/// already wrong* with what's on disk — silently overwriting on
+/// auto-fetch could hide tamper attempts.
+///
+/// Honors `MVM_OVERLAY_AUTOFETCH_OFF=1` for airgapped operators
+/// who want misses to surface verbatim instead of triggering
+/// network I/O.
+pub fn resolve_or_fetch_runtime_overlay(
+    cache_root: &Path,
+    version: &str,
+    arch: Arch,
+) -> Result<RuntimeOverlayArtifact, RuntimeOverlayError> {
+    let resolver = RuntimeOverlayResolver::new(cache_root.to_path_buf(), version.to_string());
+    match resolver.resolve(arch) {
+        Ok(artifact) => Ok(artifact),
+        Err(e @ RuntimeOverlayError::ArtifactIncomplete { .. })
+        | Err(e @ RuntimeOverlayError::VersionMismatch { .. }) => {
+            if autofetch_disabled() {
+                return Err(e);
+            }
+            tracing::info!(
+                "Runtime overlay not in cache (reason: {e}); fetching from \
+                 release for v{version} ({arch})..."
+            );
+            download_runtime_overlay(version, arch, cache_root)
+        }
+        Err(other) => Err(other),
+    }
+}
+
+fn autofetch_disabled() -> bool {
+    matches!(
+        std::env::var(AUTOFETCH_DISABLE_ENV).ok().as_deref(),
+        Some(v) if !v.is_empty()
+    )
+}
+
 /// HTTP GET the per-release `sha256sum`-format checksums file and
 /// return a `name -> hex-digest` map for the artifacts we need.
 /// Filenames that aren't in `wanted` are dropped; any name in
@@ -2154,5 +2213,208 @@ short  bar.ext4
         let mut h = Sha256::new();
         h.update(bytes);
         format!("{:x}", h.finalize())
+    }
+
+    // ====================================================================
+    // Plan 74 W1.4b.7 — resolve_or_fetch_runtime_overlay
+    // ====================================================================
+
+    /// Stage a valid four-file overlay under
+    /// `<cache>/runtime-overlay/<version>/<arch>/`. Mirrors the
+    /// helper used by the status tests in the CLI crate; copied
+    /// here so the autofetch tests stay self-contained.
+    fn stage_cache_artifact(cache_root: &Path, version: &str, arch: Arch) {
+        let dir = cache_root
+            .join("runtime-overlay")
+            .join(version)
+            .join(arch.as_str());
+        std::fs::create_dir_all(&dir).unwrap();
+        let roothash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::fs::write(dir.join("overlay.ext4"), b"fake-ext4").unwrap();
+        std::fs::write(dir.join("overlay.verity"), b"fake-verity").unwrap();
+        std::fs::write(dir.join("overlay.roothash"), format!("{roothash}\n")).unwrap();
+        std::fs::write(dir.join("VERSION"), format!("{version}\n")).unwrap();
+    }
+
+    /// Stage a fixture-shaped GitHub release dir under the
+    /// upstream tempdir + return the `file://` base URL the
+    /// auto-fetch test must pin via `MVM_OVERLAY_BASE_URL`.
+    fn stage_release_fixture(upstream: &TempDir, version: &str, arch: Arch) -> String {
+        let release_dir = upstream.path().join(format!("v{version}"));
+        std::fs::create_dir_all(&release_dir).unwrap();
+        let names = RuntimeOverlayArtifactNames::for_arch(arch);
+        let ext4 = b"fresh-ext4-from-release";
+        let verity = b"fresh-verity-from-release";
+        let roothash = "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789";
+        write_fixture(&release_dir, &names.ext4, ext4);
+        write_fixture(&release_dir, &names.verity, verity);
+        write_fixture(
+            &release_dir,
+            &names.roothash,
+            format!("{roothash}\n").as_bytes(),
+        );
+        write_fixture(
+            &release_dir,
+            &names.version,
+            format!("{version}\n").as_bytes(),
+        );
+        let checksums = format!(
+            "{}  {}\n{}  {}\n{}  {}\n{}  {}\n",
+            sha256_hex(ext4),
+            names.ext4,
+            sha256_hex(verity),
+            names.verity,
+            sha256_hex(format!("{roothash}\n").as_bytes()),
+            names.roothash,
+            sha256_hex(format!("{version}\n").as_bytes()),
+            names.version,
+        );
+        write_fixture(&release_dir, &names.checksums, checksums.as_bytes());
+        format!("file://{}", upstream.path().display())
+    }
+
+    #[test]
+    fn resolve_or_fetch_uses_cache_when_present() {
+        let _g = env_test_mutex().lock().unwrap();
+        // No `MVM_OVERLAY_BASE_URL` set — if a download fires
+        // with the default GitHub URL it would either succeed
+        // (network call we don't want in tests) or fail loudly.
+        // Either is the wrong outcome — the cache should serve.
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_BASE_URL");
+        }
+        let cache = TempDir::new().unwrap();
+        stage_cache_artifact(cache.path(), "9.9.9", Arch::Aarch64);
+        let artifact = resolve_or_fetch_runtime_overlay(cache.path(), "9.9.9", Arch::Aarch64)
+            .expect("cache hit must succeed");
+        assert_eq!(artifact.version, "9.9.9");
+        assert_eq!(artifact.arch, Arch::Aarch64);
+        // The cached fake roothash, not the release fixture one.
+        assert_eq!(
+            artifact.roothash,
+            "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn resolve_or_fetch_downloads_when_cache_missing() {
+        let _g = env_test_mutex().lock().unwrap();
+        let upstream = TempDir::new().unwrap();
+        let base_url = stage_release_fixture(&upstream, "9.9.9", Arch::Aarch64);
+        unsafe {
+            std::env::set_var("MVM_OVERLAY_BASE_URL", &base_url);
+        }
+        let cache = TempDir::new().unwrap();
+        // Cache is empty — auto-fetch should fire against the
+        // file:// fixture.
+        let artifact = resolve_or_fetch_runtime_overlay(cache.path(), "9.9.9", Arch::Aarch64);
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_BASE_URL");
+        }
+        let artifact = artifact.expect("auto-fetch must succeed against fixture");
+        // The roothash matches what the release fixture published,
+        // proving the download path fired (not the cache).
+        assert_eq!(
+            artifact.roothash,
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+        // Cache is now populated under canonical names.
+        let installed_dir = cache.path().join("runtime-overlay/9.9.9/aarch64");
+        assert!(installed_dir.join("overlay.ext4").is_file());
+    }
+
+    #[test]
+    fn resolve_or_fetch_downloads_when_cache_has_wrong_version() {
+        let _g = env_test_mutex().lock().unwrap();
+        let upstream = TempDir::new().unwrap();
+        let base_url = stage_release_fixture(&upstream, "9.9.9", Arch::Aarch64);
+        unsafe {
+            std::env::set_var("MVM_OVERLAY_BASE_URL", &base_url);
+        }
+        let cache = TempDir::new().unwrap();
+        // Stage an OLD version under the same path the resolver
+        // walks for 9.9.9, but write a mismatching VERSION
+        // file — that's what triggers VersionMismatch.
+        let dir = cache.path().join("runtime-overlay/9.9.9/aarch64");
+        std::fs::create_dir_all(&dir).unwrap();
+        let roothash = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        std::fs::write(dir.join("overlay.ext4"), b"stale-ext4").unwrap();
+        std::fs::write(dir.join("overlay.verity"), b"stale-verity").unwrap();
+        std::fs::write(dir.join("overlay.roothash"), format!("{roothash}\n")).unwrap();
+        std::fs::write(dir.join("VERSION"), b"0.13.0\n").unwrap();
+        let artifact = resolve_or_fetch_runtime_overlay(cache.path(), "9.9.9", Arch::Aarch64);
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_BASE_URL");
+        }
+        let artifact = artifact.expect("version mismatch must trigger fetch");
+        // Fresh release roothash, not the stale 0.13.0 one.
+        assert_eq!(
+            artifact.roothash,
+            "abcdef0123456789abcdef0123456789abcdef0123456789abcdef0123456789"
+        );
+    }
+
+    #[test]
+    fn resolve_or_fetch_disabled_via_env_surfaces_resolver_error() {
+        let _g = env_test_mutex().lock().unwrap();
+        // Disable auto-fetch; an empty cache should surface as
+        // `ArtifactIncomplete` rather than trigger a download.
+        unsafe {
+            std::env::set_var("MVM_OVERLAY_AUTOFETCH_OFF", "1");
+        }
+        let cache = TempDir::new().unwrap();
+        let err = resolve_or_fetch_runtime_overlay(cache.path(), "9.9.9", Arch::Aarch64);
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_AUTOFETCH_OFF");
+        }
+        let err = err.expect_err("must error when auto-fetch is disabled");
+        assert!(
+            matches!(err, RuntimeOverlayError::ArtifactIncomplete { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn resolve_or_fetch_passes_through_invalid_roothash_without_fetch() {
+        let _g = env_test_mutex().lock().unwrap();
+        // No `MVM_OVERLAY_BASE_URL` — if a download fires the
+        // test panics out via "DownloadFailed". The function
+        // must NOT fetch on a malformed roothash; that signals
+        // something is already wrong on disk.
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_BASE_URL");
+        }
+        let cache = TempDir::new().unwrap();
+        let dir = cache.path().join("runtime-overlay/9.9.9/aarch64");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("overlay.ext4"), b"x").unwrap();
+        std::fs::write(dir.join("overlay.verity"), b"x").unwrap();
+        std::fs::write(dir.join("overlay.roothash"), b"not-hex\n").unwrap();
+        std::fs::write(dir.join("VERSION"), b"9.9.9\n").unwrap();
+        let err = resolve_or_fetch_runtime_overlay(cache.path(), "9.9.9", Arch::Aarch64)
+            .expect_err("must surface InvalidRoothash, not auto-fetch over it");
+        assert!(
+            matches!(err, RuntimeOverlayError::InvalidRoothash { .. }),
+            "{err:?}"
+        );
+    }
+
+    #[test]
+    fn autofetch_disabled_recognizes_nonempty_string() {
+        let _g = env_test_mutex().lock().unwrap();
+        unsafe {
+            std::env::set_var("MVM_OVERLAY_AUTOFETCH_OFF", "1");
+        }
+        assert!(autofetch_disabled());
+        unsafe {
+            std::env::set_var("MVM_OVERLAY_AUTOFETCH_OFF", "");
+        }
+        // Empty string isn't disabled — matches the env-var
+        // convention used elsewhere in mvm.
+        assert!(!autofetch_disabled());
+        unsafe {
+            std::env::remove_var("MVM_OVERLAY_AUTOFETCH_OFF");
+        }
+        assert!(!autofetch_disabled());
     }
 }

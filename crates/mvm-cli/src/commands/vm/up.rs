@@ -32,6 +32,54 @@ use super::shared::{
     wait_for_guest_agent,
 };
 
+/// Plan 74 W1.4b.7 — when the rootfs boot is verity-protected,
+/// resolve (or auto-fetch) the runtime overlay artifact for the
+/// running mvmctl version + host arch and return the three
+/// values the backend gate needs to attach `/dev/vdc` + `/dev/vdd`
+/// and thread `mvm.runtime_roothash=…` into the cmdline.
+///
+/// Verity off ⇒ no overlay (verity-init is the only consumer of
+/// the overlay drives; attaching them with no init to mount them
+/// would just reserve virtio slots for nothing). All-three-None.
+///
+/// Verity on ⇒ try cache first; on miss or version-mismatch the
+/// underlying `resolve_or_fetch_runtime_overlay` downloads from
+/// the published GitHub Release. On *any* failure (network down,
+/// `MVM_OVERLAY_AUTOFETCH_OFF=1` set with an empty cache, malformed
+/// on-disk roothash) we log a warning and fall back to all-None.
+/// The legacy boot path (verity-only, no overlay) still works —
+/// the workload just won't see the overlay-provided SDK paths.
+/// An operator who *requires* the overlay should run
+/// `mvmctl overlay fetch` ahead of time or read the warning and
+/// retry.
+fn resolve_runtime_overlay_for_boot(
+    verity_path: Option<&str>,
+) -> (Option<String>, Option<String>, Option<String>) {
+    if verity_path.is_none() {
+        return (None, None, None);
+    }
+    let arch = mvm_build::runtime_overlay::Arch::host();
+    let version = env!("CARGO_PKG_VERSION");
+    let cache_root = std::path::PathBuf::from(mvm_core::config::mvm_cache_dir());
+    match mvm_build::runtime_overlay::resolve_or_fetch_runtime_overlay(&cache_root, version, arch) {
+        Ok(a) => (
+            Some(a.overlay_ext4.to_string_lossy().into_owned()),
+            Some(a.sidecar.to_string_lossy().into_owned()),
+            Some(a.roothash),
+        ),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "Runtime overlay unavailable — booting without /mvm/runtime. \
+                 SDK addons in the overlay won't be reachable from this workload. \
+                 Run `mvmctl overlay fetch` to populate the cache, or unset \
+                 MVM_OVERLAY_AUTOFETCH_OFF if the auto-fetch was disabled."
+            );
+            (None, None, None)
+        }
+    }
+}
+
 /// Inputs for [`admit_plan_for_boot`]. Grouped so the helper avoids
 /// the workspace `clippy::too_many_arguments = "deny"` ceiling and so
 /// future callers (W5 policy slots) can extend the shape without
@@ -1596,6 +1644,8 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         // restored VM boots through dm-verity when the template was
         // built with `verifiedBoot = true`. ADR-002 §W3.2.
         let (verity_path, roothash) = microvm::probe_verity_sidecar(&rootfs_path);
+        let (runtime_overlay_path, runtime_overlay_verity_path, runtime_overlay_roothash) =
+            resolve_runtime_overlay_for_boot(verity_path.as_deref());
         let run_config = microvm::FlakeRunConfig {
             name: vm_name,
             slot,
@@ -1604,9 +1654,9 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             rootfs_path,
             verity_path,
             roothash,
-            runtime_overlay_path: None,
-            runtime_overlay_verity_path: None,
-            runtime_overlay_roothash: None,
+            runtime_overlay_path,
+            runtime_overlay_verity_path,
+            runtime_overlay_roothash,
             revision_hash,
             flake_ref: source_flake,
             profile: source_profile,
@@ -1643,7 +1693,15 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         emit_launched_if(&admission_main, effective_hypervisor);
     } else {
         let (verity_path, roothash) = microvm::probe_verity_sidecar(&rootfs_path);
-        let start_config = VmStartParams {
+        // Plan 74 W1.4b.7 — when verity is on, resolve (or
+        // auto-fetch) the runtime overlay before constructing
+        // the start config. The triple is consumed by the
+        // Firecracker backend gate (W1.4b.3b.3a); if any value
+        // is `None` the backend falls back to the legacy
+        // verity-only boot.
+        let (runtime_overlay_path, runtime_overlay_verity_path, runtime_overlay_roothash) =
+            resolve_runtime_overlay_for_boot(verity_path.as_deref());
+        let mut start_config = VmStartParams {
             name: vm_name,
             rootfs_path,
             vmlinux_path,
@@ -1662,6 +1720,9 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             port_mappings: &port_mappings,
         }
         .into_start_config();
+        start_config.runtime_overlay_path = runtime_overlay_path;
+        start_config.runtime_overlay_verity_path = runtime_overlay_verity_path;
+        start_config.runtime_overlay_roothash = runtime_overlay_roothash;
 
         // Apple Container with -d: install a launchd agent instead of
         // starting the VM in this process. The agent runs as a proper
