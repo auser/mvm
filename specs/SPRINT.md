@@ -58,6 +58,8 @@ Recent maintenance:
 - [x] Added source-built builder-cache artifact digest metadata; source checkout cache hits now require the fingerprint and cached `vmlinux` / `rootfs.ext4` / optional `cmdline.txt` digests to match before reuse.
 - [x] Added safe source-checkout builder-cache diagnostics; verbose output now reports non-sensitive cache decision reason codes such as `hit`, `fingerprint_mismatch`, and `artifact_digest_mismatch`.
 - [x] Plan 77 W3: bracketed the Stage 0 builder VM bootstrap with three new `LocalAuditKind` events (`stage0_boot`, `stage0_cache_promoted`, `stage0_failed`) so a contributor can answer "did `dev up` actually run Stage 0, when, and how did it land" after the fact. Failure paths carry a `stage=<build|validate|promote>` tag and a sanitized one-line reason for downstream filtering.
+- [x] Added source-built builder-cache provenance metadata; source-checkout cache hits now require a non-sensitive provenance summary matching the source fingerprint and artifact filename set, with `missing_provenance` / `provenance_mismatch` diagnostics.
+- [x] Plan 77 W4: gated `download_builder_vm_image` and its helpers behind the off-by-default `release-artifact-bootstrap` feature so contributor builds cannot reach the published-prebuilt path at compile time, with `perform_builder_vm_download_published_bails_without_feature` locking the structural-failure shape into the test suite.
 
 ## In-flight workstreams
 
