@@ -1820,13 +1820,8 @@ fn bootstrap_builder_vm_image() -> Result<()> {
         "x86_64"
     };
     let out_dir = format!("{}/builder-vm/{arch}", mvm_core::config::mvm_cache_dir());
-    std::fs::create_dir_all(&out_dir)
-        .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
 
-    let cached_kernel = format!("{out_dir}/vmlinux");
-    let cached_rootfs = format!("{out_dir}/rootfs.ext4");
-    let cache_ready = std::path::Path::new(&cached_kernel).is_file()
-        && std::path::Path::new(&cached_rootfs).is_file();
+    let cache_ready = validate_builder_vm_stage0_artifacts(std::path::Path::new(&out_dir)).is_ok();
 
     match resolve_builder_vm_bootstrap_action(find_builder_vm_flake(), cache_ready)? {
         BuilderVmBootstrapAction::UseCached => {
@@ -1845,6 +1840,8 @@ fn bootstrap_builder_vm_image() -> Result<()> {
                 "Builder VM image not in cache; downloading published prebuilt for v{}...",
                 env!("CARGO_PKG_VERSION")
             ));
+            std::fs::create_dir_all(&out_dir)
+                .with_context(|| format!("creating builder-vm cache dir {out_dir}"))?;
             download_builder_vm_image(arch, &out_dir).context("downloading the builder VM image")
         }
     }
@@ -1895,22 +1892,37 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     ui::info(&format!(
         "Using local dev image cache ({source_label}) as Stage 0 bootstrap image."
     ));
-    let (job, mounts, bootstrap_image) =
-        builder_vm_stage0_bootstrap_plan(builder_flake_dir, out_dir, kernel, rootfs)?;
+    let out_dir = std::path::Path::new(out_dir);
+    let staging_dir = unique_builder_vm_stage0_staging_dir(out_dir)?;
+    std::fs::create_dir_all(&staging_dir)
+        .with_context(|| format!("creating Stage 0 staging dir {}", staging_dir.display()))?;
 
-    LibkrunBuilderVm::default()
+    let staging_dir_str = staging_dir
+        .to_str()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "Stage 0 staging path is not valid UTF-8: {}",
+                staging_dir.display()
+            )
+        })?
+        .to_string();
+    let (job, mounts, bootstrap_image) =
+        builder_vm_stage0_bootstrap_plan(builder_flake_dir, &staging_dir_str, kernel, rootfs)?;
+
+    let build_result = LibkrunBuilderVm::default()
         .with_image_override(bootstrap_image)
         .run_build(&job, &mounts)
-        .map_err(|e| anyhow::anyhow!("Stage 0 builder VM build: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("Stage 0 builder VM build: {e}"));
+    if let Err(e) = build_result {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(e);
+    }
 
-    let kernel = format!("{out_dir}/vmlinux");
-    let rootfs = format!("{out_dir}/rootfs.ext4");
-    if !std::path::Path::new(&kernel).is_file() {
-        anyhow::bail!("Stage 0 builder VM build did not produce {kernel}");
+    if let Err(e) = promote_builder_vm_stage0_cache(&staging_dir, out_dir) {
+        let _ = std::fs::remove_dir_all(&staging_dir);
+        return Err(e);
     }
-    if !std::path::Path::new(&rootfs).is_file() {
-        anyhow::bail!("Stage 0 builder VM build did not produce {rootfs}");
-    }
+
     Ok(())
 }
 
@@ -1962,6 +1974,74 @@ fn builder_vm_stage0_bootstrap_plan(
     );
 
     Ok((job, mounts, bootstrap_image))
+}
+
+#[cfg(any(feature = "builder-vm", test))]
+fn unique_builder_vm_stage0_staging_dir(final_dir: &std::path::Path) -> Result<std::path::PathBuf> {
+    let parent = final_dir.parent().ok_or_else(|| {
+        anyhow::anyhow!(
+            "builder VM cache path has no parent: {}",
+            final_dir.display()
+        )
+    })?;
+    let name = final_dir
+        .file_name()
+        .and_then(|s| s.to_str())
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "builder VM cache path has no UTF-8 basename: {}",
+                final_dir.display()
+            )
+        })?;
+    std::fs::create_dir_all(parent)
+        .with_context(|| format!("creating builder-vm cache parent {}", parent.display()))?;
+    let nonce = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_nanos())
+        .unwrap_or(0);
+    Ok(parent.join(format!(".{name}.stage0-{}-{nonce}", std::process::id())))
+}
+
+fn validate_builder_vm_stage0_artifacts(dir: &std::path::Path) -> Result<()> {
+    validate_dev_image_artifacts(dir.join("vmlinux"), dir.join("rootfs.ext4")).with_context(|| {
+        format!(
+            "validating Stage 0 builder VM artifacts in {}",
+            dir.display()
+        )
+    })
+}
+
+#[cfg(any(feature = "builder-vm", test))]
+fn promote_builder_vm_stage0_cache(
+    staging_dir: &std::path::Path,
+    final_dir: &std::path::Path,
+) -> Result<()> {
+    validate_builder_vm_stage0_artifacts(staging_dir)?;
+
+    if final_dir.exists() {
+        if validate_builder_vm_stage0_artifacts(final_dir).is_ok() {
+            std::fs::remove_dir_all(staging_dir).with_context(|| {
+                format!(
+                    "removing redundant Stage 0 staging dir {}",
+                    staging_dir.display()
+                )
+            })?;
+            return Ok(());
+        }
+        std::fs::remove_dir_all(final_dir).with_context(|| {
+            format!("removing partial builder VM cache {}", final_dir.display())
+        })?;
+    }
+
+    std::fs::rename(staging_dir, final_dir).with_context(|| {
+        format!(
+            "promoting Stage 0 builder VM cache {} to {}",
+            staging_dir.display(),
+            final_dir.display()
+        )
+    })?;
+    validate_builder_vm_stage0_artifacts(final_dir)?;
+    Ok(())
 }
 
 /// Download the per-arch Layer 1 builder VM artifacts published by the
@@ -2654,6 +2734,83 @@ mod builder_vm_bootstrap_tests {
             std::path::PathBuf::from("/dev-cache/rootfs.ext4")
         );
         assert_eq!(image.cmdline, STAGE0_BOOTSTRAP_CMDLINE);
+    }
+
+    fn write_valid_builder_vm_artifacts(dir: &std::path::Path) {
+        const EXT4_MAGIC_OFFSET: usize = 1024 + 56;
+        std::fs::create_dir_all(dir).expect("mkdir artifact dir");
+        std::fs::write(dir.join("vmlinux"), vec![0x7f; 1024 * 1024 + 1]).expect("write kernel");
+        let mut rootfs = vec![0u8; 4 * 1024 * 1024 + 1];
+        rootfs[EXT4_MAGIC_OFFSET] = 0x53;
+        rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
+        std::fs::write(dir.join("rootfs.ext4"), rootfs).expect("write rootfs");
+    }
+
+    #[test]
+    fn builder_vm_stage0_staging_dir_is_hidden_sibling() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let final_dir = tmp.path().join("builder-vm").join("aarch64");
+        let staging = unique_builder_vm_stage0_staging_dir(&final_dir)
+            .expect("valid final dir should produce staging dir");
+
+        assert_eq!(staging.parent(), final_dir.parent());
+        let name = staging
+            .file_name()
+            .and_then(|s| s.to_str())
+            .expect("staging basename should be utf-8");
+        assert!(
+            name.starts_with(".aarch64.stage0-"),
+            "unexpected staging dir name: {name}"
+        );
+    }
+
+    #[test]
+    fn builder_vm_stage0_promotion_rejects_invalid_artifacts_without_live_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let staging = tmp.path().join(".aarch64.stage0-test");
+        std::fs::create_dir_all(&staging).expect("mkdir staging");
+        std::fs::write(staging.join("vmlinux"), b"stub").expect("write stub kernel");
+        std::fs::write(staging.join("rootfs.ext4"), b"stub").expect("write stub rootfs");
+        let final_dir = tmp.path().join("aarch64");
+
+        let err = promote_builder_vm_stage0_cache(&staging, &final_dir)
+            .expect_err("stub artifacts must not be promoted");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("validating Stage 0 builder VM artifacts"),
+            "{msg}"
+        );
+        assert!(!final_dir.exists(), "invalid cache must not go live");
+    }
+
+    #[test]
+    fn builder_vm_stage0_promotion_validates_then_promotes() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let staging = tmp.path().join(".aarch64.stage0-test");
+        let final_dir = tmp.path().join("aarch64");
+        write_valid_builder_vm_artifacts(&staging);
+
+        promote_builder_vm_stage0_cache(&staging, &final_dir)
+            .expect("valid artifacts should promote");
+
+        assert!(!staging.exists(), "staging dir should be moved away");
+        validate_builder_vm_stage0_artifacts(&final_dir).expect("final cache should validate");
+    }
+
+    #[test]
+    fn builder_vm_stage0_promotion_keeps_existing_valid_cache() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let staging = tmp.path().join(".aarch64.stage0-test");
+        let final_dir = tmp.path().join("aarch64");
+        write_valid_builder_vm_artifacts(&staging);
+        write_valid_builder_vm_artifacts(&final_dir);
+
+        promote_builder_vm_stage0_cache(&staging, &final_dir)
+            .expect("existing valid cache should win the race");
+
+        assert!(!staging.exists(), "redundant staging dir should be removed");
+        validate_builder_vm_stage0_artifacts(&final_dir)
+            .expect("existing cache should remain valid");
     }
 
     #[test]

@@ -139,7 +139,7 @@ The builder VM keeps build state warm so repeated builds avoid re-fetching the w
 
 The first build is allowed to be slower because it may bootstrap the builder image and populate the Nix store. Later builds should be dominated by changed inputs.
 
-When `mvmctl` is running from this source checkout, the builder image is local-build only. A populated `~/.cache/mvm/builder-vm/<arch>/` cache can be reused. On cache miss, mvm uses a local dev image that contains `/sbin/mvm-builder-init` as a Stage 0 bootstrap image to build `nix/images/builder-vm/` into the cache. If no suitable local dev image exists, the command fails closed instead of downloading a published builder image. This preserves the contributor invariant that edits under `nix/images/builder-vm/` are reflected by the next local build path and are never masked by release artifacts.
+When `mvmctl` is running from this source checkout, the builder image is local-build only. A populated `~/.cache/mvm/builder-vm/<arch>/` cache can be reused. On cache miss, mvm uses a local dev image that contains `/sbin/mvm-builder-init` as a Stage 0 bootstrap image to build `nix/images/builder-vm/` into a hidden staging directory, validates the kernel and rootfs, then promotes the staged output into the live cache. If no suitable local dev image exists, the command fails closed instead of downloading a published builder image. This preserves the contributor invariant that edits under `nix/images/builder-vm/` are reflected by the next local build path and are never masked by release artifacts.
 
 ## Benchmarking Runtime Boot
 
