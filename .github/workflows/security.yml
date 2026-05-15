@@ -300,6 +300,89 @@ jobs:
           fi
           echo "ok: rootfs.{ext4,verity,roothash} present, roothash=${hash:0:12}…"
 
+  # ── Lane 6b: Sealed-prod rootfs has no SSH (plan 76 Phase 8) ──────
+  # Plan 76 §Phase 8 + ADR-002 §"No SSH inside microVMs". The vsock-
+  # only claim is enforced at runtime by the `mvm-guest-agent`
+  # dispatcher (Plan 76 Phase 1 + the `sealed-prod-allowlist` CI
+  # lane in `ci.yml`). This lane is the static counterpart: it
+  # mounts the production rootfs and refuses to merge if any SSH
+  # artifact is present.
+  #
+  # No untrusted GitHub event input flows into any step; all
+  # commands below are static literals.
+  #
+  # Out of scope for this lane (named on purpose):
+  #   - port 22 not listening — needs a live boot
+  #   - agent has no ambient capabilities — needs a live boot
+  #   - dev verbs rejected at runtime — already gated by
+  #     `ci.yml::sealed-prod-allowlist`
+  sealed-prod-no-ssh:
+    name: Sealed-prod rootfs has no SSH (plan 76 Phase 8)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Build default-tenant and assert no-SSH on rootfs
+        run: |
+          set -euo pipefail
+          nix build "./nix/images/default-tenant#packages.x86_64-linux.default" \
+            --no-link --print-out-paths > /tmp/store-path.txt
+          out=$(head -1 /tmp/store-path.txt)
+          rootfs="$out/rootfs.ext4"
+          if [ ! -f "$rootfs" ]; then
+            echo "::error::rootfs.ext4 missing in $out (rebuild verified-boot-artifacts lane)" >&2
+            exit 1
+          fi
+
+          # Mount the production rootfs read-only and grep for SSH
+          # artifacts. Read-only is load-bearing: any write would
+          # invalidate the dm-verity root hash, and we don't want a
+          # bug in this script to corrupt the artifact.
+          mnt=$(mktemp -d)
+          sudo mount -o ro,loop "$rootfs" "$mnt"
+          trap 'sudo umount "$mnt" || true; rmdir "$mnt" || true' EXIT
+
+          fail=0
+
+          # Any sshd binary on a likely production path. The list
+          # mirrors common nixpkgs install locations + the busybox
+          # multi-call binary path.
+          for p in \
+            "$mnt/usr/sbin/sshd" \
+            "$mnt/usr/bin/sshd" \
+            "$mnt/sbin/sshd" \
+            "$mnt/bin/sshd" \
+            "$mnt/run/current-system/sw/bin/sshd"
+          do
+            if [ -e "$p" ]; then
+              echo "::error::sshd binary present at ${p#$mnt}" >&2
+              fail=1
+            fi
+          done
+
+          # SSH host keys (private and public halves), if present,
+          # mean the image is ready to host SSH — a sealed-prod
+          # leak per ADR-002 §"No SSH inside microVMs".
+          if compgen -G "$mnt/etc/ssh/ssh_host_*" > /dev/null; then
+            echo "::error::SSH host keys present under /etc/ssh/" >&2
+            ls "$mnt/etc/ssh/" >&2 || true
+            fail=1
+          fi
+
+          if [ -e "$mnt/etc/ssh/sshd_config" ]; then
+            echo "::error::/etc/ssh/sshd_config present in sealed-prod rootfs" >&2
+            fail=1
+          fi
+
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::ADR-002 violated; sealed-prod images must not ship SSH artifacts." >&2
+            exit 1
+          fi
+          echo "ok: sealed-prod rootfs has no sshd / host keys / sshd_config"
+
   # ── Lane 7: Flake lockfile cleanliness (plan 36 §Layer 0) ──────────
   # Every flake.lock in the repo must be committed and in sync with
   # its flake.nix. A stale lock means the input closure recorded in a
