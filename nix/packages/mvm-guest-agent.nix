@@ -62,6 +62,10 @@ pkgs.rustPlatform.buildRustPackage {
     "--bin" "mvm-guest-agent"
     "--bin" "mvm-seccomp-apply"
     "--bin" "mvm-verity-init"
+    # Plan 74 W2 — guest-side network defense. Installs kernel
+    # blackhole routes for `MANDATORY_DENY_RANGES` at boot from
+    # `/init` (uid 0) before the main agent forks under setpriv.
+    "--bin" "mvm-guest-netinit"
   ] ++ lib.optionals withDevShell [
     "--features" "mvm-guest/dev-shell"
   ];
