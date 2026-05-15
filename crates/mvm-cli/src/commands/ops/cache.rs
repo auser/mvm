@@ -92,6 +92,35 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             // Prune: remove empty subdirectories and temp files
             let mut removed = 0u64;
             let mut freed = 0u64;
+
+            // Plan 77 W2: sweep orphaned Stage 0 staging dirs first.
+            // They live under `~/.cache/mvm/builder-vm/.<arch>.stage0-*`
+            // (or the legacy `<arch>-staging` shape) and are left
+            // behind by crashed `mvmctl dev up` invocations. The sweep
+            // takes the Stage 0 advisory lock to avoid racing a live
+            // bootstrap; if the lock is held it skips silently and we
+            // proceed with the temp-file sweep.
+            match super::super::env::apple_container::sweep_orphaned_stage0_staging_dirs(
+                dry_run,
+            ) {
+                Ok(super::super::env::apple_container::Stage0SweepOutcome::Swept {
+                    removed: r,
+                    freed_bytes,
+                }) => {
+                    removed += r;
+                    freed += freed_bytes;
+                }
+                Ok(super::super::env::apple_container::Stage0SweepOutcome::SkippedLockHeld) => {
+                    ui::info(
+                        "Stage 0 builder VM bootstrap appears to be running on this host; \
+                         skipping orphan staging cleanup.",
+                    );
+                }
+                Err(e) => {
+                    ui::warn(&format!("Stage 0 staging sweep failed: {e:#}"));
+                }
+            }
+
             for entry in walkdir(path)? {
                 let entry_path = entry.path();
                 // Remove temp files (mvm-lima-*, .tmp)

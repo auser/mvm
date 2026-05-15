@@ -2086,6 +2086,166 @@ fn validate_builder_vm_stage0_artifacts(dir: &std::path::Path) -> Result<()> {
     })
 }
 
+/// Plan 77 W2 — outcome of [`sweep_orphaned_stage0_staging_dirs`]:
+/// either the sweep ran (with counts) or the Stage 0 advisory lock was
+/// already held so the sweep was skipped to avoid racing a live
+/// bootstrap. The pruner uses the variant to decide what to print.
+pub(in crate::commands) enum Stage0SweepOutcome {
+    Swept { removed: u64, freed_bytes: u64 },
+    SkippedLockHeld,
+}
+
+/// Plan 77 W2 — remove staging directories from a crashed Stage 0
+/// bootstrap. Only safe to run when no Stage 0 is currently in progress;
+/// the function tries the same advisory lock the live bootstrap uses
+/// and bails (returns `SkippedLockHeld`) on contention rather than
+/// racing it. Called from `mvmctl cache prune` so the cleanup ships
+/// with the existing "clean everything" verb.
+///
+/// "Orphan" means the staging dir was left behind by a crashed run;
+/// successful Stage 0 runs `rename(2)` the staging dir into the live
+/// cache, so any staging dir on disk is by definition orphaned. Format
+/// matches [`unique_builder_vm_stage0_staging_dir`]
+/// (`.<arch>.stage0-<pid>-<nonce>`); we also recognise the legacy
+/// `<arch>-staging[-...]` shape from pre-W1 builds on the same host.
+pub(in crate::commands) fn sweep_orphaned_stage0_staging_dirs(
+    dry_run: bool,
+) -> Result<Stage0SweepOutcome> {
+    let builder_vm_root =
+        std::path::PathBuf::from(mvm_core::config::mvm_cache_dir()).join("builder-vm");
+    sweep_orphaned_stage0_staging_dirs_at(&builder_vm_root, dry_run)
+}
+
+/// Inner form of [`sweep_orphaned_stage0_staging_dirs`] that takes an
+/// explicit root path. Exists so unit tests can exercise the sweep
+/// against a tempdir without mutating `MVM_CACHE_DIR` or any other
+/// process-wide env var.
+fn sweep_orphaned_stage0_staging_dirs_at(
+    builder_vm_root: &std::path::Path,
+    dry_run: bool,
+) -> Result<Stage0SweepOutcome> {
+    use mvm_core::atomic_io::FileLock;
+
+    if !builder_vm_root.is_dir() {
+        return Ok(Stage0SweepOutcome::Swept {
+            removed: 0,
+            freed_bytes: 0,
+        });
+    }
+
+    // Try the Stage 0 advisory lock. The lock anchor is shared with the
+    // live `acquire_stage0_lock` callsite — when a `dev up` is in
+    // progress, we want the pruner to skip the staging sweep rather
+    // than race it. RAII drop releases the lock when this function
+    // returns.
+    let lock_anchor = builder_vm_root.join("stage0");
+    let _guard = match FileLock::try_acquire(&lock_anchor) {
+        Ok(Some(guard)) => guard,
+        Ok(None) => return Ok(Stage0SweepOutcome::SkippedLockHeld),
+        Err(e) => {
+            // I/O failure on the lock path is rare (e.g. parent disappeared
+            // mid-prune). Treat it as "skip with a warning" rather than
+            // failing the whole prune verb — the staging sweep is a best-
+            // effort hygiene step.
+            tracing::warn!(err = %e, "could not acquire Stage 0 lock for sweep; skipping");
+            return Ok(Stage0SweepOutcome::SkippedLockHeld);
+        }
+    };
+
+    let mut removed = 0u64;
+    let mut freed_bytes = 0u64;
+    let entries = match std::fs::read_dir(builder_vm_root) {
+        Ok(e) => e,
+        Err(_) => {
+            return Ok(Stage0SweepOutcome::Swept {
+                removed,
+                freed_bytes,
+            });
+        }
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        let Some(name) = entry.file_name().to_str().map(str::to_string) else {
+            continue;
+        };
+        if !is_orphan_stage0_staging_dir_name(&name) || !path.is_dir() {
+            continue;
+        }
+        let size = stage0_dir_size_bytes(&path);
+        if dry_run {
+            println!(
+                "Would remove orphan Stage 0 staging dir: {} ({} bytes)",
+                path.display(),
+                size,
+            );
+        } else if let Err(e) = std::fs::remove_dir_all(&path) {
+            tracing::warn!(path = %path.display(), err = %e, "could not remove orphan staging dir");
+            continue;
+        }
+        removed += 1;
+        freed_bytes += size;
+    }
+    Ok(Stage0SweepOutcome::Swept {
+        removed,
+        freed_bytes,
+    })
+}
+
+/// Predicate matching the staging-dir basenames left by Stage 0.
+/// Two shapes are recognised:
+/// - Current (W1+): `.<arch>.stage0-<pid>-<nonce>` (hidden, see
+///   [`unique_builder_vm_stage0_staging_dir`]).
+/// - Legacy (pre-W1): `<arch>-staging` or `<arch>-staging-<suffix>`
+///   left behind by earlier Stage 0 prototypes that were observed on
+///   contributor hosts; harmless when they exist but the pruner is
+///   the obvious place to clean them up.
+fn is_orphan_stage0_staging_dir_name(name: &str) -> bool {
+    let is_known_arch = |arch: &str| arch == "aarch64" || arch == "x86_64";
+
+    // Current hidden form.
+    if let Some(rest) = name.strip_prefix('.')
+        && let Some((arch, tail)) = rest.split_once('.')
+        && is_known_arch(arch)
+        && tail.starts_with("stage0-")
+    {
+        return true;
+    }
+    // Legacy `<arch>-staging` / `<arch>-staging-<suffix>`.
+    if let Some((arch, tail)) = name.split_once('-')
+        && is_known_arch(arch)
+        && (tail == "staging" || tail.starts_with("staging"))
+    {
+        return true;
+    }
+    false
+}
+
+/// Total byte size of a directory tree. Best-effort — failures stat-ing
+/// individual entries are skipped silently because the caller only uses
+/// this for the "bytes freed" UI counter, never for correctness.
+fn stage0_dir_size_bytes(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let mut stack = vec![path.to_path_buf()];
+    while let Some(dir) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let entry_path = entry.path();
+            match entry.file_type() {
+                Ok(ft) if ft.is_dir() => stack.push(entry_path),
+                Ok(_) => {
+                    if let Ok(meta) = entry_path.metadata() {
+                        total = total.saturating_add(meta.len());
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+    total
+}
+
 fn builder_vm_source_fingerprint(builder_flake_dir: &str) -> Result<String> {
     let flake_dir = std::path::Path::new(builder_flake_dir);
     let mut hasher = Sha256::new();
@@ -3051,6 +3211,162 @@ mod builder_vm_bootstrap_tests {
             tmp.path().join("nested/builder-vm/stage0.lock").exists(),
             "lock file must be created at the constructed parent path"
         );
+    }
+
+    /// Plan 77 W2 — name predicate must match both the current hidden
+    /// `.<arch>.stage0-<pid>-<nonce>` form and the legacy
+    /// `<arch>-staging[-...]` form, and reject everything else that
+    /// lives alongside under `~/.cache/mvm/builder-vm/` (live cache
+    /// dirs `aarch64/` / `x86_64/`, the `nix-store-<arch>.img` blob,
+    /// `jobs/`, `vms/`, `stage0.lock`, sundry dotfiles).
+    #[test]
+    fn is_orphan_stage0_staging_dir_name_matches_known_shapes() {
+        // Current hidden form (matches `unique_builder_vm_stage0_staging_dir`).
+        assert!(is_orphan_stage0_staging_dir_name(
+            ".aarch64.stage0-12345-1700000000000000000"
+        ));
+        assert!(is_orphan_stage0_staging_dir_name(
+            ".x86_64.stage0-99999-1700000000000000000"
+        ));
+        // Legacy plain form.
+        assert!(is_orphan_stage0_staging_dir_name("aarch64-staging"));
+        assert!(is_orphan_stage0_staging_dir_name("x86_64-staging-foo"));
+
+        // Negatives: everything that legitimately lives next to
+        // staging dirs must be left alone.
+        assert!(!is_orphan_stage0_staging_dir_name("aarch64"));
+        assert!(!is_orphan_stage0_staging_dir_name("x86_64"));
+        assert!(!is_orphan_stage0_staging_dir_name("jobs"));
+        assert!(!is_orphan_stage0_staging_dir_name("vms"));
+        assert!(!is_orphan_stage0_staging_dir_name("stage0.lock"));
+        assert!(!is_orphan_stage0_staging_dir_name("nix-store-aarch64.img"));
+        assert!(!is_orphan_stage0_staging_dir_name("nix-store-x86_64.img"));
+        // Dotfile that isn't a staging dir.
+        assert!(!is_orphan_stage0_staging_dir_name(".DS_Store"));
+        // Unknown arch suffixes are conservative-deny.
+        assert!(!is_orphan_stage0_staging_dir_name(
+            ".riscv64.stage0-1-2"
+        ));
+        assert!(!is_orphan_stage0_staging_dir_name("riscv64-staging"));
+    }
+
+    /// Plan 77 W2 — sweep removes a staging dir of the current form,
+    /// reports the byte count, leaves the live cache and unrelated
+    /// siblings intact, and the dry-run variant is purely observational
+    /// (no fs mutation).
+    #[test]
+    fn sweep_removes_orphan_staging_dir_and_leaves_siblings() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+
+        // Build a representative layout under <root>.
+        let orphan = root.join(".aarch64.stage0-12345-1700000000000000000");
+        std::fs::create_dir_all(orphan.join("nested")).unwrap();
+        std::fs::write(orphan.join("a"), b"hello world").unwrap(); // 11 bytes
+        std::fs::write(orphan.join("nested/b"), vec![0u8; 7]).unwrap();
+
+        let live_cache = root.join("aarch64");
+        std::fs::create_dir_all(&live_cache).unwrap();
+        std::fs::write(live_cache.join("rootfs.ext4"), b"do-not-delete").unwrap();
+
+        let nix_store = root.join("nix-store-aarch64.img");
+        std::fs::write(&nix_store, b"sparse").unwrap();
+
+        // Dry-run: nothing should move.
+        match sweep_orphaned_stage0_staging_dirs_at(&root, true)
+            .expect("dry-run sweep should succeed")
+        {
+            Stage0SweepOutcome::Swept {
+                removed,
+                freed_bytes,
+            } => {
+                assert_eq!(removed, 1, "dry-run reports the orphan");
+                assert_eq!(freed_bytes, 18, "dry-run reports the orphan's byte total");
+            }
+            Stage0SweepOutcome::SkippedLockHeld => panic!("dry-run must not skip"),
+        }
+        assert!(orphan.is_dir(), "dry-run must not remove the orphan");
+        assert!(live_cache.is_dir(), "dry-run must not touch the live cache");
+
+        // Real run: orphan goes, siblings stay.
+        match sweep_orphaned_stage0_staging_dirs_at(&root, false)
+            .expect("sweep should succeed")
+        {
+            Stage0SweepOutcome::Swept {
+                removed,
+                freed_bytes,
+            } => {
+                assert_eq!(removed, 1);
+                assert_eq!(freed_bytes, 18);
+            }
+            Stage0SweepOutcome::SkippedLockHeld => panic!("must not skip on uncontended lock"),
+        }
+        assert!(!orphan.exists(), "orphan must be removed");
+        assert!(
+            live_cache.join("rootfs.ext4").is_file(),
+            "live cache must be untouched"
+        );
+        assert!(
+            nix_store.is_file(),
+            "nix-store image must be untouched"
+        );
+    }
+
+    /// Plan 77 W2 — when a live Stage 0 is in progress and holds the
+    /// advisory lock, the sweep must skip rather than race the
+    /// staging dir the live run is about to promote.
+    #[test]
+    fn sweep_skips_when_stage0_lock_is_held() {
+        use mvm_core::atomic_io::FileLock;
+
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let root = tmp.path().to_path_buf();
+        std::fs::create_dir_all(&root).unwrap();
+
+        // Hold the lock as a "live" Stage 0 would.
+        let _live = FileLock::try_acquire(&root.join("stage0"))
+            .expect("first acquisition should not fail")
+            .expect("first acquisition should succeed");
+
+        // Stage an orphan to confirm the sweep would have something to do.
+        let orphan = root.join(".aarch64.stage0-12345-1700000000000000000");
+        std::fs::create_dir_all(&orphan).unwrap();
+
+        match sweep_orphaned_stage0_staging_dirs_at(&root, false)
+            .expect("sweep should succeed even when skipping")
+        {
+            Stage0SweepOutcome::SkippedLockHeld => {}
+            Stage0SweepOutcome::Swept { .. } => {
+                panic!("sweep must skip while the Stage 0 lock is held")
+            }
+        }
+        assert!(
+            orphan.is_dir(),
+            "skipped sweep must not touch the would-be orphan"
+        );
+    }
+
+    /// Plan 77 W2 — sweep on a non-existent root is a no-op. Exercises
+    /// the early-return for fresh hosts that have never run `dev up`.
+    #[test]
+    fn sweep_is_noop_when_root_missing() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let missing = tmp.path().join("never-existed");
+
+        match sweep_orphaned_stage0_staging_dirs_at(&missing, false)
+            .expect("sweep on missing root should succeed")
+        {
+            Stage0SweepOutcome::Swept {
+                removed,
+                freed_bytes,
+            } => {
+                assert_eq!(removed, 0);
+                assert_eq!(freed_bytes, 0);
+            }
+            Stage0SweepOutcome::SkippedLockHeld => {
+                panic!("missing root must not look like lock contention")
+            }
+        }
     }
 
     #[test]
