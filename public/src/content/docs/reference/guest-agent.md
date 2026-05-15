@@ -57,6 +57,54 @@ gate keeps the handler symbols *absent* from production binaries; the
 profile gate keeps the dispatcher *reachable but refusing* for dev
 verbs in sealed-prod. Both checks run on every request.
 
+## Readiness model
+
+Plan 76 Phase 2 binds the vsock control port **before** entrypoint
+validation and warm-process pool startup. That keeps the host's
+`mvmctl up` from blocking on guest-side warmup — the agent accepts
+`Ping` / `ReadinessStatus` / `EntrypointStatus` immediately, and
+`RunEntrypoint` returns a typed `RunEntrypointError::NotReady` until
+entrypoint validation completes.
+
+A host queries the live state via the `ReadinessStatus` verb:
+
+```json
+{
+  "ReadinessStatusReport": {
+    "control_plane": "ready",
+    "entrypoint": "starting",
+    "warm_pool": "disabled",
+    "integrations": "ready",
+    "probes": "disabled",
+    "volumes": "disabled",
+    "profile": "sealed-prod",
+    "boot_millis": {
+      "agent_started_ms": 7,
+      "vsock_bound_ms": 7,
+      "first_accept_ms": 12,
+      "entrypoint_ready_ms": null,
+      "warm_pool_ready_ms": null,
+      "integrations_ready_ms": null,
+      "probes_ready_ms": null
+    }
+  }
+}
+```
+
+`ComponentState` values:
+
+| State | Meaning |
+|-------|---------|
+| `disabled` | Subsystem isn't configured for this image (no policy → no state machine to advance). Distinct from `ready` so the host can tell "image opted out" from "still warming". |
+| `starting` | Background init in progress. `RunEntrypoint` while `entrypoint = starting` returns `NotReady` — the host should poll readiness and retry. |
+| `ready` | Subsystem is up and accepting work. |
+| `failed` | Subsystem failed to initialize. Carries a short human-readable `message` (no secrets, no host paths the caller doesn't already know). For `entrypoint`, this maps to `RunEntrypoint` returning the existing `EntrypointInvalid`. |
+
+`BootTimingReport` exposes monotonic milliseconds since agent
+process start. Phase 4 fills in the remaining fields
+(`warm_pool_ready_ms`, `integrations_ready_ms`, `probes_ready_ms`);
+the four populated today are enough to surface cold-path regressions.
+
 ## Health Checks
 
 Health checks defined in `mkGuest`'s `healthChecks` parameter are automatically written to `/etc/mvm/integrations.d/` at build time:

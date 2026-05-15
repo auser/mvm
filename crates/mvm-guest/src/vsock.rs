@@ -171,6 +171,22 @@ pub enum GuestRequest {
     /// Prod-safe — reveals no secrets, takes no inputs.
     EntrypointStatus,
 
+    /// Query structured readiness across every guest subsystem
+    /// (control plane, entrypoint, warm pool, integrations, probes,
+    /// volumes) plus per-phase boot timings. Plan 76 Phase 2.
+    ///
+    /// Prod-safe — the response carries no secrets and reveals only
+    /// state the host already chose to provision (via image config /
+    /// drop-in files). Designed to be the verb that responds first
+    /// after vsock bind, so a host can begin streaming progress UX
+    /// before entrypoint validation or warm-pool warmup finish.
+    ///
+    /// Distinct from `EntrypointStatus` (which is entrypoint-only and
+    /// returns a flat `EntrypointStatusReport`): `ReadinessStatus`
+    /// reports the *full* boot phase set with `ComponentState` per
+    /// component, and is intended to be polled (`mvmctl wait`).
+    ReadinessStatus,
+
     // ========================================================================
     // Filesystem RPC (W1 / A1 of the filesystem-volumes plan).
     //
@@ -407,6 +423,114 @@ fn default_true() -> bool {
 }
 
 // ============================================================================
+// Readiness model (plan 76 Phase 2)
+// ============================================================================
+
+/// State of a single guest subsystem during boot.
+///
+/// `Disabled` is distinct from `Ready` — a missing optional subsystem
+/// (no integrations declared, no warm pool configured, no probes
+/// registered) reports `Disabled`, while a present-and-warmed
+/// subsystem reports `Ready`. This lets the host UX distinguish
+/// "the workload doesn't use X" from "X is still warming".
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields, rename_all = "snake_case")]
+pub enum ComponentState {
+    /// Subsystem is not configured for this image (no policy → no
+    /// state machine to advance). Wire-stable distinct from `Ready`.
+    Disabled,
+    /// Subsystem is initializing in the background.
+    Starting,
+    /// Subsystem is up and accepting work.
+    Ready,
+    /// Subsystem failed to initialize. `message` is a short human-
+    /// readable reason; no secrets / paths beyond what the host
+    /// already knows.
+    Failed {
+        /// Short human-readable failure reason. Stable enough for an
+        /// operator to recognise, not a structured cause — pair with
+        /// stderr logs for diagnosis.
+        message: String,
+    },
+}
+
+/// Per-phase monotonic boot timings in milliseconds since the agent
+/// process started.
+///
+/// Plan 76 Phase 4 fills in the full per-phase set. Phase 2 wires
+/// `agent_started_ms`, `vsock_bound_ms`, `first_accept_ms`, and
+/// `entrypoint_ready_ms` so callers can already display the cold-path
+/// timing breakdown. Fields populated by Phase 4 (`warm_pool_ready_ms`,
+/// `integrations_ready_ms`, `probes_ready_ms`) stay `None` for now.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct BootTimingReport {
+    /// Milliseconds from agent process start to vsock bind/listen.
+    /// Always present once the agent has bound — this number is the
+    /// dominant signal for early-readiness regressions.
+    pub agent_started_ms: Option<u64>,
+    /// Milliseconds from agent start to a successful `bind+listen`
+    /// pair on the control port. Same anchor as `agent_started_ms`
+    /// today; reserved for diverging if a future Phase 4 refactor
+    /// splits "process started" from "socket created".
+    pub vsock_bound_ms: Option<u64>,
+    /// Milliseconds from agent start to the first accepted host
+    /// connection. `None` until the first `accept()` returns.
+    pub first_accept_ms: Option<u64>,
+    /// Milliseconds from agent start to `entrypoint = Ready` (or
+    /// `Failed`). `None` while still `Starting`.
+    pub entrypoint_ready_ms: Option<u64>,
+    /// Filled in by Phase 4. `None` for now.
+    pub warm_pool_ready_ms: Option<u64>,
+    /// Filled in by Phase 4. `None` for now.
+    pub integrations_ready_ms: Option<u64>,
+    /// Filled in by Phase 4. `None` for now.
+    pub probes_ready_ms: Option<u64>,
+}
+
+/// Snapshot of agent readiness at the moment of a `ReadinessStatus`
+/// call.
+///
+/// Plan 76 Phase 2 §"Early control-plane readiness". Used by host
+/// callers (`mvmctl wait`, `mvmctl up --timings`, `mvmctl doctor`)
+/// to distinguish:
+///
+/// - "control plane is up, workload not yet warm" → invoke would
+///   block; the host can stream progress to the user
+/// - "entrypoint validation failed" → invoke would fail fast with
+///   a typed error; the host can surface the validation message
+/// - "optional subsystem failed" → invoke is still safe; the host
+///   surfaces a warning
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct ReadinessReport {
+    /// Vsock listener bound and accepting. Always `Ready` if the
+    /// agent could respond at all.
+    pub control_plane: ComponentState,
+    /// `/etc/mvm/entrypoint` validation result. Gates `RunEntrypoint`
+    /// — a request submitted while `Starting` returns
+    /// `RunEntrypointError::NotReady`.
+    pub entrypoint: ComponentState,
+    /// Warm-process pool readiness. `Disabled` for cold-tier images;
+    /// `Ready` once the `after_start.sh` probe passes.
+    pub warm_pool: ComponentState,
+    /// Drop-in integration scan + health loop. `Disabled` if no
+    /// `/etc/mvm/integrations.d/*.json` files present.
+    pub integrations: ComponentState,
+    /// Drop-in probe scan + probe loop. `Disabled` if no
+    /// `/etc/mvm/probes.d/*.json` files present.
+    pub probes: ComponentState,
+    /// Volume-mount state — wire-stable placeholder. `Disabled` in
+    /// v1 (mount/unmount are on-demand verbs, not boot state).
+    pub volumes: ComponentState,
+    /// Active agent profile. Same value the dispatcher uses for the
+    /// `allowed_in` gate.
+    pub profile: AgentProfile,
+    /// Per-phase monotonic timings.
+    pub boot_millis: BootTimingReport,
+}
+
+// ============================================================================
 // Profile classifier (plan 76 Phase 1)
 // ============================================================================
 
@@ -456,6 +580,7 @@ impl GuestRequest {
             GuestRequest::ConsoleClose { .. } => "ConsoleClose",
             GuestRequest::ConsoleResize { .. } => "ConsoleResize",
             GuestRequest::EntrypointStatus => "EntrypointStatus",
+            GuestRequest::ReadinessStatus => "ReadinessStatus",
             GuestRequest::FsRead { .. } => "FsRead",
             GuestRequest::FsWrite { .. } => "FsWrite",
             GuestRequest::FsList { .. } => "FsList",
@@ -494,6 +619,7 @@ impl GuestRequest {
             | GuestRequest::RunEntrypoint { .. }
             | GuestRequest::PostRestore
             | GuestRequest::EntrypointStatus
+            | GuestRequest::ReadinessStatus
             | GuestRequest::MountVolume { .. }
             | GuestRequest::UnmountVolume { .. }
             | GuestRequest::UpdateIdleTimeout { .. } => RequestClass::ProdSafe,
@@ -651,6 +777,10 @@ pub enum GuestResponse {
         path: Option<String>,
         detail: Option<String>,
     },
+
+    /// Result of a `ReadinessStatus` query. Plan 76 Phase 2.
+    /// Snapshot of every component plus per-phase timings.
+    ReadinessStatusReport(ReadinessReport),
 
     /// Result of a filesystem RPC call. The single top-level variant
     /// keeps `GuestResponse` from sprawling — the `FsResult` sub-enum
@@ -1182,6 +1312,13 @@ pub enum RunEntrypointError {
     Busy,
     /// The wrapper process died unexpectedly (signal, OOM, etc.).
     WrapperCrashed,
+    /// Entrypoint validation has not yet completed. Plan 76 Phase 2:
+    /// the agent binds vsock early and validates entrypoint in the
+    /// background, so a host that races `RunEntrypoint` ahead of
+    /// `ReadinessStatus { entrypoint: Ready }` gets this back rather
+    /// than `EntrypointInvalid` (which would imply a permanent
+    /// failure). Hosts should poll readiness, not retry blindly.
+    NotReady,
     /// `/etc/mvm/entrypoint` is missing, fails validation
     /// (symlink crossing FS, wrong perms, off the verity
     /// partition), or otherwise can't be loaded. Reported per-call
@@ -2286,6 +2423,7 @@ mod tests {
                 code: "print('hello')".into(),
                 timeout_secs: 30,
             },
+            GuestRequest::ReadinessStatus,
         ];
 
         for req in &variants {
@@ -2331,6 +2469,24 @@ mod tests {
                 profile: AgentProfile::SealedProd,
                 verb: "Exec".to_string(),
             },
+            GuestResponse::ReadinessStatusReport(ReadinessReport {
+                control_plane: ComponentState::Ready,
+                entrypoint: ComponentState::Starting,
+                warm_pool: ComponentState::Disabled,
+                integrations: ComponentState::Disabled,
+                probes: ComponentState::Disabled,
+                volumes: ComponentState::Disabled,
+                profile: AgentProfile::SealedProd,
+                boot_millis: BootTimingReport {
+                    agent_started_ms: Some(5),
+                    vsock_bound_ms: Some(5),
+                    first_accept_ms: Some(8),
+                    entrypoint_ready_ms: None,
+                    warm_pool_ready_ms: None,
+                    integrations_ready_ms: None,
+                    probes_ready_ms: None,
+                },
+            }),
             GuestResponse::IntegrationStatusReport {
                 integrations: vec![IntegrationStateReport {
                     name: "whatsapp".to_string(),
@@ -4157,6 +4313,7 @@ mod tests {
             "RunEntrypoint",
             "PostRestore",
             "EntrypointStatus",
+            "ReadinessStatus",
             "MountVolume",
             "UnmountVolume",
             "UpdateIdleTimeout",
@@ -4196,6 +4353,7 @@ mod tests {
                 rows: 1,
             },
             GuestRequest::EntrypointStatus,
+            GuestRequest::ReadinessStatus,
             GuestRequest::FsRead {
                 path: "/x".into(),
                 offset: None,
@@ -4415,5 +4573,137 @@ mod tests {
             }
             other => panic!("unexpected variant: {other:?}"),
         }
+    }
+
+    // ========================================================================
+    // Plan 76 Phase 2 — readiness model
+    // ========================================================================
+
+    #[test]
+    fn test_readiness_status_classifies_prod_safe() {
+        // `ReadinessStatus` must respond from sealed-prod images
+        // even before entrypoint validation completes — that's the
+        // whole point of the verb. If a future refactor downgrades
+        // it to DevOnly, this test fails loud.
+        let req = GuestRequest::ReadinessStatus;
+        assert_eq!(req.class(), RequestClass::ProdSafe);
+        assert!(req.allowed_in(AgentProfile::SealedProd));
+        assert!(req.allowed_in(AgentProfile::Dev));
+        assert!(!req.allowed_in(AgentProfile::Builder));
+        assert_eq!(req.verb_name(), "ReadinessStatus");
+    }
+
+    #[test]
+    fn test_component_state_wire_format_is_snake_case() {
+        // Wire format keeps JSON ergonomic for hand-written
+        // policies / mock fixtures.
+        assert_eq!(
+            serde_json::to_string(&ComponentState::Starting).unwrap(),
+            "\"starting\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentState::Ready).unwrap(),
+            "\"ready\""
+        );
+        assert_eq!(
+            serde_json::to_string(&ComponentState::Disabled).unwrap(),
+            "\"disabled\""
+        );
+        let failed_json = serde_json::to_string(&ComponentState::Failed {
+            message: "boom".into(),
+        })
+        .unwrap();
+        assert!(failed_json.contains("\"failed\""), "got {failed_json}");
+        assert!(failed_json.contains("\"boom\""), "got {failed_json}");
+
+        let parsed: ComponentState = serde_json::from_str(&failed_json).unwrap();
+        assert!(matches!(
+            parsed,
+            ComponentState::Failed { ref message } if message == "boom"
+        ));
+    }
+
+    #[test]
+    fn test_readiness_report_roundtrip_with_disabled_subsystems() {
+        // A cold-tier image's readiness snapshot mid-boot: control
+        // plane ready, entrypoint still validating, everything
+        // else Disabled (no warm pool, no integrations, no probes).
+        let report = ReadinessReport {
+            control_plane: ComponentState::Ready,
+            entrypoint: ComponentState::Starting,
+            warm_pool: ComponentState::Disabled,
+            integrations: ComponentState::Disabled,
+            probes: ComponentState::Disabled,
+            volumes: ComponentState::Disabled,
+            profile: AgentProfile::SealedProd,
+            boot_millis: BootTimingReport {
+                agent_started_ms: Some(3),
+                vsock_bound_ms: Some(3),
+                first_accept_ms: Some(7),
+                entrypoint_ready_ms: None,
+                warm_pool_ready_ms: None,
+                integrations_ready_ms: None,
+                probes_ready_ms: None,
+            },
+        };
+        let json = serde_json::to_string(&report).unwrap();
+        let parsed: ReadinessReport = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, report);
+    }
+
+    #[test]
+    fn test_readiness_report_rejects_unknown_fields() {
+        // ADR-002 §W4.1: every host↔guest type must deny unknown
+        // fields. Verify the outer report shape; ComponentState +
+        // BootTimingReport carry their own `deny_unknown_fields`.
+        let json = r#"{
+            "control_plane": "ready",
+            "entrypoint": "starting",
+            "warm_pool": "disabled",
+            "integrations": "disabled",
+            "probes": "disabled",
+            "volumes": "disabled",
+            "profile": "sealed-prod",
+            "boot_millis": {
+                "agent_started_ms": null,
+                "vsock_bound_ms": null,
+                "first_accept_ms": null,
+                "entrypoint_ready_ms": null,
+                "warm_pool_ready_ms": null,
+                "integrations_ready_ms": null,
+                "probes_ready_ms": null
+            },
+            "smuggled": 1
+        }"#;
+        let err = serde_json::from_str::<ReadinessReport>(json).unwrap_err();
+        assert!(
+            err.to_string().contains("unknown field"),
+            "expected unknown-field rejection, got: {err}"
+        );
+    }
+
+    #[test]
+    fn test_run_entrypoint_error_not_ready_roundtrip() {
+        // Plan 76 Phase 2: the typed variant returned when a host
+        // races `RunEntrypoint` ahead of `entrypoint=Ready`.
+        let err = RunEntrypointError::NotReady;
+        let json = serde_json::to_string(&err).unwrap();
+        assert_eq!(json, "\"NotReady\"");
+        let parsed: RunEntrypointError = serde_json::from_str(&json).unwrap();
+        assert_eq!(parsed, err);
+    }
+
+    #[test]
+    fn test_boot_timing_report_default_is_all_none() {
+        // The skeleton ships with all-`None` so Phase 4 can fill
+        // the remaining fields without breaking the wire shape.
+        let t = BootTimingReport::default();
+        assert!(t.agent_started_ms.is_none());
+        assert!(t.vsock_bound_ms.is_none());
+        assert!(t.first_accept_ms.is_none());
+        assert!(t.entrypoint_ready_ms.is_none());
+        assert!(t.warm_pool_ready_ms.is_none());
+        assert!(t.integrations_ready_ms.is_none());
+        assert!(t.probes_ready_ms.is_none());
     }
 }
