@@ -305,6 +305,7 @@ struct AgentBootState {
     boot_at: std::time::Instant,
 }
 
+#[derive(Default)]
 struct BootStateInner {
     control_plane: ComponentState,
     entrypoint: ComponentState,
@@ -319,20 +320,18 @@ impl AgentBootState {
     fn new(profile: AgentProfile, boot_at: std::time::Instant) -> Self {
         Self {
             inner: Mutex::new(BootStateInner {
-                // control_plane flips to Ready immediately after
-                // `bind+listen` succeeds in `main`; until then we're
-                // not even running, so Starting is correct as the
-                // initial pre-bind value.
+                // Two components start `Starting` rather than the
+                // `Default` `Disabled`: `control_plane` flips to
+                // `Ready` immediately after `bind+listen` in `main`
+                // (we're not running until then), and `entrypoint`
+                // is the boot dependency `RunEntrypoint` gates on.
+                // The remaining components keep `Disabled` from
+                // `Default` — the background init thread flips them
+                // to `Starting` when it sees config that requires
+                // them.
                 control_plane: ComponentState::Starting,
                 entrypoint: ComponentState::Starting,
-                // Optional subsystems start `Disabled`. The
-                // background init thread flips them to `Starting`
-                // when it sees config that requires them.
-                warm_pool: ComponentState::Disabled,
-                integrations: ComponentState::Disabled,
-                probes: ComponentState::Disabled,
-                volumes: ComponentState::Disabled,
-                timing: BootTimingReport::default(),
+                ..Default::default()
             }),
             profile,
             boot_at,

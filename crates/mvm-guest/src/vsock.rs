@@ -433,11 +433,17 @@ fn default_true() -> bool {
 /// registered) reports `Disabled`, while a present-and-warmed
 /// subsystem reports `Ready`. This lets the host UX distinguish
 /// "the workload doesn't use X" from "X is still warming".
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Default` is `Disabled` — the most-conservative semantically
+/// correct value (= "this subsystem isn't configured"). Lets
+/// constructors of `ReadinessReport` use `..Default::default()` to
+/// elide subsystems they don't care about in tests / fixtures.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields, rename_all = "snake_case")]
 pub enum ComponentState {
     /// Subsystem is not configured for this image (no policy → no
     /// state machine to advance). Wire-stable distinct from `Ready`.
+    #[default]
     Disabled,
     /// Subsystem is initializing in the background.
     Starting,
@@ -501,7 +507,12 @@ pub struct BootTimingReport {
 ///   a typed error; the host can surface the validation message
 /// - "optional subsystem failed" → invoke is still safe; the host
 ///   surfaces a warning
-#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+///
+/// `Default` composes the `Default` impls of each field — every
+/// component is `Disabled`, the profile is `SealedProd`, all
+/// timings are `None`. Tests and fixtures can construct partial
+/// reports with `..Default::default()`.
+#[derive(Debug, Default, Clone, Serialize, Deserialize, PartialEq, Eq)]
 #[serde(deny_unknown_fields)]
 pub struct ReadinessReport {
     /// Vsock listener bound and accepting. Always `Ready` if the
@@ -4627,24 +4638,18 @@ mod tests {
     fn test_readiness_report_roundtrip_with_disabled_subsystems() {
         // A cold-tier image's readiness snapshot mid-boot: control
         // plane ready, entrypoint still validating, everything
-        // else Disabled (no warm pool, no integrations, no probes).
+        // else `Disabled` (no warm pool, no integrations, no
+        // probes) by virtue of `Default`.
         let report = ReadinessReport {
             control_plane: ComponentState::Ready,
             entrypoint: ComponentState::Starting,
-            warm_pool: ComponentState::Disabled,
-            integrations: ComponentState::Disabled,
-            probes: ComponentState::Disabled,
-            volumes: ComponentState::Disabled,
-            profile: AgentProfile::SealedProd,
             boot_millis: BootTimingReport {
                 agent_started_ms: Some(3),
                 vsock_bound_ms: Some(3),
                 first_accept_ms: Some(7),
-                entrypoint_ready_ms: None,
-                warm_pool_ready_ms: None,
-                integrations_ready_ms: None,
-                probes_ready_ms: None,
+                ..Default::default()
             },
+            ..Default::default()
         };
         let json = serde_json::to_string(&report).unwrap();
         let parsed: ReadinessReport = serde_json::from_str(&json).unwrap();
@@ -4705,5 +4710,52 @@ mod tests {
         assert!(t.warm_pool_ready_ms.is_none());
         assert!(t.integrations_ready_ms.is_none());
         assert!(t.probes_ready_ms.is_none());
+    }
+
+    #[test]
+    fn test_component_state_default_is_disabled() {
+        // "Not configured" is the semantically conservative default.
+        // A subsystem we haven't heard anything about must NOT
+        // accidentally read as `Ready` — that would short-circuit a
+        // host's readiness gate.
+        assert_eq!(ComponentState::default(), ComponentState::Disabled);
+    }
+
+    #[test]
+    fn test_readiness_report_default_is_all_disabled_sealed_prod() {
+        // A bare `ReadinessReport::default()` is what an unconfigured
+        // sealed-prod agent would report. Tests / fixtures that only
+        // care about one or two components can use this + struct-
+        // update syntax instead of listing every field.
+        let r = ReadinessReport::default();
+        assert_eq!(r.control_plane, ComponentState::Disabled);
+        assert_eq!(r.entrypoint, ComponentState::Disabled);
+        assert_eq!(r.warm_pool, ComponentState::Disabled);
+        assert_eq!(r.integrations, ComponentState::Disabled);
+        assert_eq!(r.probes, ComponentState::Disabled);
+        assert_eq!(r.volumes, ComponentState::Disabled);
+        assert_eq!(r.profile, AgentProfile::SealedProd);
+        assert_eq!(r.boot_millis, BootTimingReport::default());
+    }
+
+    #[test]
+    fn test_readiness_report_default_struct_update_ergonomics() {
+        // Demonstrates the intended call-site shape: change one or
+        // two components, default the rest. If the type ever grows a
+        // field this test still compiles — that's the whole point.
+        let r = ReadinessReport {
+            control_plane: ComponentState::Ready,
+            entrypoint: ComponentState::Starting,
+            boot_millis: BootTimingReport {
+                vsock_bound_ms: Some(7),
+                ..Default::default()
+            },
+            ..Default::default()
+        };
+        assert_eq!(r.control_plane, ComponentState::Ready);
+        assert_eq!(r.entrypoint, ComponentState::Starting);
+        assert_eq!(r.warm_pool, ComponentState::Disabled);
+        assert_eq!(r.boot_millis.vsock_bound_ms, Some(7));
+        assert!(r.boot_millis.first_accept_ms.is_none());
     }
 }
