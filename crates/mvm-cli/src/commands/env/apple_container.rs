@@ -604,40 +604,19 @@ pub(super) fn ensure_dev_image() -> Result<(String, String)> {
     // prebuilt would mask.
     // Gate the dispatch itself on `builder-vm`.
     #[cfg(feature = "builder-vm")]
-    if let Some(flake_dir) = &find_dev_image_flake().ok()
-        && find_builder_vm_flake().is_ok()
+    if let Some(flake_dir) =
+        resolve_source_checkout_dev_image(find_dev_image_flake(), find_builder_vm_flake())?
     {
         let out_dir = format!("{}/dev/current", mvm_core::config::mvm_data_dir());
         prepare_dev_image_out_dir(&out_dir)?;
 
-        if !mvm_libkrun::is_available() {
-            anyhow::bail!(
-                "libkrun is required to build the dev image from source (Plan 72 W5.C).\n\
-                 {}\n\n\
-                 Once installed, retry `mvmctl dev up`. If you intend to use the published\n\
-                 prebuilt instead (no local builds), move or delete\n\
-                 nix/images/builder/flake.nix so the source-checkout heuristic stops matching.",
-                mvm_libkrun::install_hint(),
-            );
-        }
-
-        ui::info(&format!(
-            "Building dev image via libkrun builder VM (Plan 72 W5) from: {flake_dir}"
-        ));
-        match build_image_via_libkrun(&out_dir) {
-            Ok((kernel, rootfs)) => {
-                ui::success(&format!("Dev image ready at {out_dir}."));
-                return Ok((kernel, rootfs));
-            }
-            Err(e) => {
-                anyhow::bail!(
-                    "libkrun builder VM build failed (source checkout: {flake_dir}).\n{e:#}\n\n\
-                     Refusing to fall back to the published prebuilt because it would mask\n\
-                     local rootfs changes. To force the prebuilt anyway, move or delete\n\
-                     nix/images/builder/flake.nix so the source-checkout heuristic stops matching."
-                );
-            }
-        }
+        return ensure_source_checkout_dev_image(
+            &flake_dir,
+            &out_dir,
+            mvm_libkrun::is_available(),
+            mvm_libkrun::install_hint(),
+            build_image_via_libkrun,
+        );
     }
 
     // No local source checkout — download the published prebuilt.
@@ -739,6 +718,65 @@ pub(super) fn ensure_dev_image() -> Result<(String, String)> {
                      or ~/.mvm/dev/builds/*/",
                 ))
             }
+        }
+    }
+}
+
+#[cfg(feature = "builder-vm")]
+fn resolve_source_checkout_dev_image(
+    dev_flake: Result<String>,
+    builder_flake: Result<String>,
+) -> Result<Option<String>> {
+    let dev_flake = match dev_flake {
+        Ok(path) => path,
+        Err(_) => return Ok(None),
+    };
+
+    builder_flake.with_context(|| {
+        format!(
+            "source checkout dev-image flake found at {dev_flake}, but the builder VM flake is missing. \
+             Refusing to download the published prebuilt because it would mask local rootfs changes; \
+             restore nix/images/builder-vm/flake.nix or move/delete nix/images/builder/flake.nix \
+             to opt into published prebuilts."
+        )
+    })?;
+
+    Ok(Some(dev_flake))
+}
+
+#[cfg(feature = "builder-vm")]
+fn ensure_source_checkout_dev_image(
+    flake_dir: &str,
+    out_dir: &str,
+    libkrun_available: bool,
+    install_hint: &str,
+    build_image: impl FnOnce(&str) -> Result<(String, String)>,
+) -> Result<(String, String)> {
+    if !libkrun_available {
+        anyhow::bail!(
+            "libkrun is required to build the dev image from source (Plan 72 W5.C).\n\
+             {install_hint}\n\n\
+             Once installed, retry `mvmctl dev up`. If you intend to use the published\n\
+             prebuilt instead (no local builds), move or delete\n\
+             nix/images/builder/flake.nix so the source-checkout heuristic stops matching.",
+        );
+    }
+
+    ui::info(&format!(
+        "Building dev image via libkrun builder VM (Plan 72 W5) from: {flake_dir}"
+    ));
+    match build_image(out_dir) {
+        Ok((kernel, rootfs)) => {
+            ui::success(&format!("Dev image ready at {out_dir}."));
+            Ok((kernel, rootfs))
+        }
+        Err(e) => {
+            anyhow::bail!(
+                "libkrun builder VM build failed (source checkout: {flake_dir}).\n{e:#}\n\n\
+                 Refusing to fall back to the published prebuilt because it would mask\n\
+                 local rootfs changes. To force the prebuilt anyway, move or delete\n\
+                 nix/images/builder/flake.nix so the source-checkout heuristic stops matching."
+            );
         }
     }
 }
@@ -2378,6 +2416,7 @@ mod hash_verify_tests {
 mod builder_vm_bootstrap_tests {
     //! Plan 72 W5 — `find_builder_vm_flake` + `bootstrap_builder_vm_image`.
     use super::*;
+    use std::cell::Cell;
 
     #[test]
     fn find_builder_vm_flake_resolves_to_in_repo_path() {
@@ -2420,5 +2459,119 @@ mod builder_vm_bootstrap_tests {
         assert_eq!(n.cmdline, "builder-vm-x86_64.cmdline.txt");
         assert_eq!(n.manifest, "builder-vm-x86_64.manifest.json");
         assert_eq!(n.checksums, "builder-vm-x86_64-checksums-sha256.txt");
+    }
+
+    #[test]
+    fn source_checkout_resolution_requires_builder_vm_flake() {
+        let err = resolve_source_checkout_dev_image(
+            Ok("/repo/nix/images/builder".to_string()),
+            Err(anyhow::anyhow!("missing builder-vm flake")),
+        )
+        .expect_err("source checkout without builder-vm flake must fail closed");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("builder VM flake is missing"), "{msg}");
+        assert!(
+            msg.contains("Refusing to download the published prebuilt"),
+            "{msg}"
+        );
+        assert!(msg.contains("nix/images/builder-vm/flake.nix"), "{msg}");
+    }
+
+    #[test]
+    fn source_checkout_resolution_absent_dev_flake_allows_prebuilt_path() {
+        let result = resolve_source_checkout_dev_image(
+            Err(anyhow::anyhow!("no dev flake")),
+            Err(anyhow::anyhow!("no builder-vm flake")),
+        )
+        .expect("missing dev flake means installed/prebuilt path may continue");
+        assert!(result.is_none());
+    }
+
+    #[test]
+    fn source_checkout_dev_image_refuses_missing_libkrun_before_building() {
+        let called = Cell::new(false);
+        let err = ensure_source_checkout_dev_image(
+            "/repo/nix/images/builder",
+            "/tmp/out",
+            false,
+            "install libkrun with your platform package manager",
+            |_| {
+                called.set(true);
+                Ok((
+                    "/tmp/out/vmlinux".to_string(),
+                    "/tmp/out/rootfs.ext4".to_string(),
+                ))
+            },
+        )
+        .expect_err("missing libkrun must fail before build dispatch");
+
+        assert!(!called.get(), "build callback must not run without libkrun");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("libkrun is required"), "{msg}");
+        assert!(msg.contains("install libkrun"), "{msg}");
+        assert!(
+            msg.contains("move or delete") && msg.contains("nix/images/builder/flake.nix"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn source_checkout_dev_image_refuses_prebuilt_fallback_on_builder_failure() {
+        let called = Cell::new(false);
+        let err = ensure_source_checkout_dev_image(
+            "/repo/nix/images/builder",
+            "/tmp/out",
+            true,
+            "unused",
+            |_| {
+                called.set(true);
+                anyhow::bail!("Stage 0 builder-VM image bootstrap failed")
+            },
+        )
+        .expect_err("builder failure must not fall back to downloads");
+
+        assert!(
+            called.get(),
+            "build callback should run when libkrun is present"
+        );
+        let msg = format!("{err:#}");
+        assert!(msg.contains("libkrun builder VM build failed"), "{msg}");
+        assert!(
+            msg.contains("Refusing to fall back to the published prebuilt"),
+            "{msg}"
+        );
+        assert!(
+            msg.contains("Stage 0 builder-VM image bootstrap failed"),
+            "{msg}"
+        );
+    }
+
+    #[test]
+    fn source_checkout_dev_image_returns_builder_outputs() {
+        let called = Cell::new(false);
+        let result = ensure_source_checkout_dev_image(
+            "/repo/nix/images/builder",
+            "/tmp/out",
+            true,
+            "unused",
+            |out_dir| {
+                called.set(true);
+                assert_eq!(out_dir, "/tmp/out");
+                Ok((
+                    format!("{out_dir}/vmlinux"),
+                    format!("{out_dir}/rootfs.ext4"),
+                ))
+            },
+        )
+        .expect("source checkout build should return builder outputs");
+
+        assert!(called.get(), "build callback should run");
+        assert_eq!(
+            result,
+            (
+                "/tmp/out/vmlinux".to_string(),
+                "/tmp/out/rootfs.ext4".to_string()
+            )
+        );
     }
 }

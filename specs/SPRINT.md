@@ -50,6 +50,7 @@ Recent maintenance:
 - [x] Documented the host-orchestrated builder VM flow across the website docs, clarifying that `mvmctl build` runs from the host while Nix evaluation/builds execute inside the builder VM and runtime boot benchmarks consume already-built artifacts.
 - [x] Aligned `dev_build` with the builder VM invariant by removing the host-Nix dispatch probe from the normal path; Nix builds now route through the libkrun builder VM when builder-VM support is compiled in.
 - [x] Added builder-VM smoke/failure unit coverage for `dev_build`: the test seam now accepts a fake `BuilderVm`, asserts the flake job and mount shape, proves the path does not probe or invoke host-side Nix, fails closed on builder errors, and gives each staging directory a per-build nonce to avoid same-process collisions.
+- [x] Added CLI-level source-checkout policy coverage for `ensure_dev_image`: source dev flakes now require the sibling builder-VM flake, missing libkrun fails before build dispatch, builder failures refuse published-prebuilt fallback, and the installed/prebuilt path remains available only when no source dev flake is detected.
 
 ## In-flight workstreams
 
