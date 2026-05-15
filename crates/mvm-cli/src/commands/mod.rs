@@ -6,6 +6,7 @@ mod deps;
 mod env;
 mod manifest;
 mod ops;
+mod overlay;
 mod shared;
 mod storage;
 mod trust;
@@ -246,6 +247,11 @@ pub(in crate::commands) enum Commands {
     /// re-runs the CVE scan against the current pip-audit / pnpm
     /// audit feed and reseals the volume.
     Deps(deps::Args),
+    /// Manage the mvm runtime overlay disk (ADR-051 / plan 74
+    /// W1.4b). Today: `fetch` downloads the per-arch overlay
+    /// from the GitHub Release and installs it under
+    /// `~/.cache/mvm/runtime-overlay/<version>/<arch>/`.
+    Overlay(overlay::Args),
 }
 
 // ============================================================================
@@ -383,6 +389,7 @@ pub fn run() -> Result<()> {
         Commands::Trust(a) => trust::run(&cli, a, &cfg),
         Commands::Tenant(a) => ops::tenant::run(&cli, a, &cfg),
         Commands::Deps(a) => deps::run(&cli, a, &cfg),
+        Commands::Overlay(a) => overlay::run(&cli, a, &cfg),
     };
 
     cmd_audit::emit_cmd_outcome(cmd_recorder.as_ref(), verb, &result);
