@@ -229,7 +229,13 @@ const DEPS_SUB: &[(&str, AuditPosture)] = &[
 // inventing a new `LocalAuditKind::OverlayFetch` for an operation
 // whose security story is already covered by the SHA-256 manifest
 // + verity sealing — overkill for v1.
-const OVERLAY_SUB: &[(&str, AuditPosture)] = &[("fetch", AuditPosture::ReadOnly)];
+const OVERLAY_SUB: &[(&str, AuditPosture)] = &[
+    ("fetch", AuditPosture::ReadOnly),
+    // `status` is pure cache introspection — opens four files
+    // and prints (or JSON-emits) their state. No mutation, no
+    // security decision, no admission gate.
+    ("status", AuditPosture::ReadOnly),
+];
 
 /// Every top-level `mvmctl` subcommand keyed by its clap name.
 ///
