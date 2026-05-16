@@ -163,6 +163,29 @@ mod linux {
     pub fn run() -> ExitCode {
         eprintln!("mvm-builder-init: pid 1 starting");
 
+        // Linux's `init` (PID 1) is invoked with an empty
+        // environment by the kernel — there is no default `PATH`,
+        // despite a long-standing comment in this file claiming
+        // otherwise. Without this, every bare-name `Command::new`
+        // (`iptables`, `udhcpc`, `mkfs.ext4` if it ever loses its
+        // absolute path, etc.) fails with `ENOENT` even when the
+        // binary is correctly symlinked at `/sbin/<name>` by
+        // mkGuest. Setting PATH explicitly here is the cheap fix
+        // that lets `SystemIptables::run` and friends resolve
+        // their binaries the way the comments already promised.
+        //
+        // `unsafe { set_var }` is required as of Rust 2024 edition
+        // (the function was marked unsafe for multi-threaded race
+        // concerns); we're single-threaded here at PID-1 entry, so
+        // the safety contract is trivially satisfied.
+        // SAFETY: single-threaded at PID 1 startup.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/sbin:/bin:/usr/sbin:/usr/bin",
+            );
+        }
+
         // Plan 76 Phase 5: anchor the boot-timings clock as close
         // to init entry as we can. The few ms of `eprintln!` +
         // module dispatch above this point are constant across
@@ -245,34 +268,38 @@ mod linux {
         let _ = track_b.join();
         let _ = track_c.join();
 
-        // In-guest egress lockdown — Plan 73 Followup B.2.y /
-        // ADR-047 defense-in-depth. Installs iptables OUTPUT
-        // default-deny + proxy-uid-only ACCEPT so a build step
-        // that ignores HTTP_PROXY env vars cannot bypass
-        // `mvm-egress-proxy`. FATAL on failure — without these
-        // rules the builder VM's egress allowlist is unenforced
-        // and ADR-002's Claim 9 transitive trust onto the
-        // builder VM has no defense layer. (Note: this is
-        // installed even when `setup_network()` failed, because
-        // the rules don't depend on a working IP address —
-        // offline builds still need the policy in place in case
-        // a substituter URL is reached via cache rather than
-        // network.)
-        if let Err(e) = crate::network::install_egress_lockdown(
-            &crate::network::SystemIptables,
-            crate::network::PROXY_UID,
-        ) {
-            eprintln!("mvm-builder-init: egress lockdown FAILED (fatal): {e}");
-            write_result(2, &format!("egress lockdown failed: {e}"));
-            return power_off();
-        }
-
         // Plan 73 Followup B.2 dispatch: install jobs hand the init
         // binary a structured spec rather than a shell script. We
         // probe for the spec first; if absent, fall through to the
         // existing cmd.sh flake-build flow.
+        //
+        // Plan 77 W7 — *only* install jobs need the in-guest egress
+        // lockdown (Plan 73 Followup B.2.y / ADR-047 defense-in-depth
+        // against an application installer that ignores HTTP_PROXY).
+        // For Stage 0 flake builds (e.g. `nix build` of the builder-VM
+        // image itself), the lockdown is actively harmful: the default-
+        // deny OUTPUT chain blocks every substituter fetch, including
+        // `cache.nixos.org`, which Stage 0 must reach to build *any*
+        // derivation that isn't already in `/nix-store`. Gating the
+        // lockdown on install-spec presence keeps the security posture
+        // in the install path where it matters and unblocks Stage 0's
+        // own bring-up.
         let install_spec_path = format!("{JOB_DIR}/{INSTALL_SPEC_FILENAME}");
         if Path::new(&install_spec_path).exists() {
+            // ADR-047 / Plan 73 Followup B.2.y — fatal-on-failure for
+            // install jobs. Without these rules the builder VM's
+            // egress allowlist is unenforced and ADR-002's Claim 9
+            // transitive trust onto the builder VM has no defense
+            // layer.
+            if let Err(e) = crate::network::install_egress_lockdown(
+                &crate::network::SystemIptables,
+                crate::network::PROXY_UID,
+            ) {
+                eprintln!("mvm-builder-init: egress lockdown FAILED (fatal): {e}");
+                write_result(2, &format!("egress lockdown failed: {e}"));
+                return power_off();
+            }
+
             eprintln!("mvm-builder-init: install spec detected, routing through install pipeline");
             stamp(&timings, |t| {
                 t.job_start_ms = Some(BootTimings::ms_since(anchor))
