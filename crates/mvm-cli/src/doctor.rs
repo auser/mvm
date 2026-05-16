@@ -237,6 +237,7 @@ pub fn run(json: bool, workflow: Option<DoctorWorkflow>) -> Result<()> {
     checks.push(security_data_dir_mode_check());
     checks.push(security_proxy_socket_mode_check());
     checks.push(security_dev_image_check());
+    checks.push(stage0_seed_status_check());
     checks.push(security_deny_config_check());
     checks.push(security_default_network_check());
     checks.push(security_network_policy_default_check());
@@ -1193,6 +1194,55 @@ fn security_proxy_socket_mode_check() -> Check {
             ok: true,
             info: "non-Unix host; mode check skipped".to_string(),
         }
+    }
+}
+
+/// Plan 77 W7 / Thread B — informational Stage 0 dev-image seed
+/// status. Reports whether *any* contract-valid seed exists across
+/// `~/.mvm/dev/{current,prebuilt,builds}/` plus the source-checkout
+/// vendored slot. Always `ok: true` so doctor's exit code doesn't
+/// regress for installed-binary users who legitimately rely on the
+/// release-pipeline download path instead of the source-checkout
+/// vendored slot; the message itself is the actionable surface.
+fn stage0_seed_status_check() -> Check {
+    let info: String;
+    #[cfg(feature = "builder-vm")]
+    {
+        let status = crate::commands::env::apple_container::stage0_seed_doctor_status();
+        info = if let Some(label) = status.usable_seed_label {
+            format!(
+                "usable seed: {label} (vendored slot {})",
+                if status.vendored_usable {
+                    "fresh"
+                } else if status.vendored_present {
+                    "stale"
+                } else {
+                    "absent"
+                }
+            )
+        } else if status.any_candidate {
+            format!(
+                "all candidate seeds lack /sbin/mvm-builder-init (refresh via \
+                 `cargo xtask build-dev-image --arch {}` on a host with Nix)",
+                status.arch
+            )
+        } else {
+            format!(
+                "no seed found — run `cargo xtask build-dev-image --arch {}` on a host with \
+                 Nix to seed the source-checkout vendored slot before `mvmctl dev up`",
+                status.arch
+            )
+        };
+    }
+    #[cfg(not(feature = "builder-vm"))]
+    {
+        info = "skipped (builder-vm feature disabled at build time)".to_string();
+    }
+    Check {
+        name: "Stage 0 dev-image seed (Plan 77 W7)",
+        category: "security",
+        ok: true,
+        info,
     }
 }
 
