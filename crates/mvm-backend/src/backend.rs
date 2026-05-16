@@ -128,6 +128,12 @@ impl VmBackend for FirecrackerBackend {
         // (build pipeline bug); a missing sidecar defaults to
         // accessible=true.
         let rootfs = std::path::Path::new(&config.rootfs_path);
+        // Plan 74 W2 / ADR-051 admission gate — refuse pre-W1.4b
+        // rootfs that lack the `/mvm/runtime` mount point. Runs
+        // before `microvm::run_from_build` so a refusal exits
+        // clean — no FC API socket, no VM dir half-populated.
+        let rootfs_dir = rootfs.parent().unwrap_or_else(|| std::path::Path::new("."));
+        mvm_build::builder_vm::admit_overlay_aware(rootfs_dir)?;
         mvm_base::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
         microvm::run_from_build(&fc_config.run_config)?;
         Ok(VmId(fc_config.run_config.name.clone()))
