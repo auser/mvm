@@ -20,7 +20,23 @@ pub(super) const DEV_VM_NAME: &str = "mvm-dev";
 const BUILDER_VM_SOURCE_FINGERPRINT_FILE: &str = ".mvm-source.sha256";
 const BUILDER_VM_ARTIFACT_DIGEST_FILE: &str = ".mvm-artifacts.sha256";
 const BUILDER_VM_PROVENANCE_FILE: &str = ".mvm-provenance.json";
-const BUILDER_INIT_PATH: &[u8] = b"/sbin/mvm-builder-init";
+/// Needle used by [`rootfs_contains_builder_init`] to byte-scan a
+/// rootfs.ext4 for the Stage 0 init binary. ext4 stores file names in
+/// directory entries — *not* the full path — so the full-path form
+/// `/sbin/mvm-builder-init` never appears contiguously in a rootfs image
+/// and a needle that included the directory prefix would reject every
+/// production rootfs. We match on the directory-entry name alone, which
+/// `nix/images/builder/flake.nix` plants verbatim via `extraFiles =
+/// { "/sbin/mvm-builder-init" = ...; }`. The filename appears in:
+///
+/// - the `/sbin/` directory's inode-table dirent (canonical hit), and
+/// - the `mvm-builder-init` Rust binary's own string table (where
+///   `clap` / `tracing` embed the program name).
+///
+/// Both are present in a fresh dev-image rootfs and absent in a
+/// pre-843ef18 stale one — a clean discriminator confirmed against
+/// real `nix-build`-produced rootfs.ext4 images.
+const BUILDER_INIT_PATH: &[u8] = b"mvm-builder-init";
 
 /// Check if the Apple Container dev VM is running *and* reachable
 /// cross-process via the vsock proxy socket.
@@ -1125,7 +1141,7 @@ fn vendored_dev_image_dir_for(workspace_root: &std::path::Path, arch: &str) -> s
 
 fn rootfs_contains_builder_init(rootfs: &std::path::Path) -> Result<bool> {
     file_contains_bytes(rootfs, BUILDER_INIT_PATH)
-        .with_context(|| format!("scanning {} for /sbin/mvm-builder-init", rootfs.display()))
+        .with_context(|| format!("scanning {} for mvm-builder-init dirent", rootfs.display()))
 }
 
 fn file_contains_bytes(path: &std::path::Path, needle: &[u8]) -> Result<bool> {
