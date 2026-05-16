@@ -917,13 +917,12 @@ fn spawn_supervisor_and_wait(
     // supervisor on detection. When `console_output_path` is None
     // (callers that opted out of console capture), behavior is
     // unchanged — plain wait, plain exit code.
-    let console_log = cfg
-        .krun
-        .console_output_path
-        .as_deref()
-        .map(PathBuf::from);
-    match wait_with_panic_detector(&mut child, console_log.as_deref(), DEFAULT_PANIC_POLL_INTERVAL)
-    {
+    let console_log = cfg.krun.console_output_path.as_deref().map(PathBuf::from);
+    match wait_with_panic_detector(
+        &mut child,
+        console_log.as_deref(),
+        DEFAULT_PANIC_POLL_INTERVAL,
+    ) {
         Ok(WaitOutcome::Clean(code)) => Ok(code),
         Ok(WaitOutcome::KernelPanic {
             panic_line,
@@ -1691,8 +1690,9 @@ mod tests {
             .stderr(Stdio::null())
             .spawn()
             .expect("spawn sh");
-        let outcome = wait_with_panic_detector(&mut child, Some(&console), Duration::from_millis(10))
-            .expect("ok");
+        let outcome =
+            wait_with_panic_detector(&mut child, Some(&console), Duration::from_millis(10))
+                .expect("ok");
         match outcome {
             WaitOutcome::Clean(0) => {}
             other => panic!("expected Clean(0), got {other:?}"),
@@ -1731,13 +1731,17 @@ mod tests {
         });
 
         let start = std::time::Instant::now();
-        let outcome = wait_with_panic_detector(&mut child, Some(&console), Duration::from_millis(10))
-            .expect("ok");
+        let outcome =
+            wait_with_panic_detector(&mut child, Some(&console), Duration::from_millis(10))
+                .expect("ok");
         let elapsed = start.elapsed();
         writer.join().expect("writer thread join");
 
         match outcome {
-            WaitOutcome::KernelPanic { panic_line, console_log_path } => {
+            WaitOutcome::KernelPanic {
+                panic_line,
+                console_log_path,
+            } => {
                 assert!(
                     panic_line.contains("Kernel panic - not syncing: test banner"),
                     "panic_line: {panic_line:?}"
@@ -1785,8 +1789,9 @@ mod tests {
             .expect("write console log fixture");
         });
 
-        let outcome = wait_with_panic_detector(&mut child, Some(&console), Duration::from_millis(10))
-            .expect("ok");
+        let outcome =
+            wait_with_panic_detector(&mut child, Some(&console), Duration::from_millis(10))
+                .expect("ok");
         writer.join().unwrap();
 
         match outcome {

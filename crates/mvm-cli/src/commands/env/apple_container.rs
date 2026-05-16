@@ -2256,34 +2256,52 @@ impl std::fmt::Display for SeedContractError {
                  image (`mvmctl dev import-image`) and retry `mvmctl dev up`.",
                 manifest_path.display()
             ),
-            Self::UnreadableManifest { manifest_path, source } => write!(
+            Self::UnreadableManifest {
+                manifest_path,
+                source,
+            } => write!(
                 f,
                 "Stage 0 seed manifest at {} could not be read: {source}. \
                  Check filesystem permissions on the dev image cache directory.",
                 manifest_path.display()
             ),
-            Self::MalformedJson { manifest_path, source } => write!(
+            Self::MalformedJson {
+                manifest_path,
+                source,
+            } => write!(
                 f,
                 "Stage 0 seed manifest at {} is not valid JSON: {source}. \
                  The dev-image flake emits this file; a malformed manifest indicates a corrupted \
                  cache. Remove the directory and retry `mvmctl dev up`.",
                 manifest_path.display()
             ),
-            Self::UnsupportedSchema { manifest_path, actual, supported } => write!(
+            Self::UnsupportedSchema {
+                manifest_path,
+                actual,
+                supported,
+            } => write!(
                 f,
                 "Stage 0 seed manifest at {} declares schema_version={actual}, but this `mvmctl` \
                  only understands schema_version <= {supported}. Upgrade `mvmctl` to a build that \
                  understands the newer manifest schema.",
                 manifest_path.display()
             ),
-            Self::WrongImageKind { manifest_path, actual, expected } => write!(
+            Self::WrongImageKind {
+                manifest_path,
+                actual,
+                expected,
+            } => write!(
                 f,
                 "Stage 0 seed manifest at {} declares image_kind={actual:?}, but a seed must be \
                  image_kind={expected:?}. The cache directory likely contains the wrong artifact \
                  (e.g. a builder-vm image copied into a dev-image slot).",
                 manifest_path.display()
             ),
-            Self::ContractStale { manifest_path, actual, required } => write!(
+            Self::ContractStale {
+                manifest_path,
+                actual,
+                required,
+            } => write!(
                 f,
                 "Stage 0 seed manifest at {} declares contract_version={actual}, but this \
                  `mvmctl` requires contract_version >= {required}. The dev image was built \
@@ -2291,7 +2309,11 @@ impl std::fmt::Display for SeedContractError {
                  rebuild`) or import a signed published image with `mvmctl dev import-image`.",
                 manifest_path.display()
             ),
-            Self::MissingInitPath { manifest_path, missing, present } => write!(
+            Self::MissingInitPath {
+                manifest_path,
+                missing,
+                present,
+            } => write!(
                 f,
                 "Stage 0 seed manifest at {} does not declare required init path {missing:?} \
                  (declared init_paths: {present:?}). The dev image was built without the \
@@ -2338,12 +2360,11 @@ fn validate_stage0_seed_contract(
         return Err(SeedContractError::MissingManifest { manifest_path });
     }
 
-    let bytes = std::fs::read(&manifest_path).map_err(|source| {
-        SeedContractError::UnreadableManifest {
+    let bytes =
+        std::fs::read(&manifest_path).map_err(|source| SeedContractError::UnreadableManifest {
             manifest_path: manifest_path.clone(),
             source,
-        }
-    })?;
+        })?;
 
     let manifest: Stage0SeedManifest =
         serde_json::from_slice(&bytes).map_err(|source| SeedContractError::MalformedJson {
@@ -4874,8 +4895,7 @@ mod builder_vm_bootstrap_tests {
     ) -> std::path::PathBuf {
         let rootfs = tmp.join("rootfs.ext4");
         std::fs::write(&rootfs, b"stub-rootfs-for-tests").expect("write rootfs stub");
-        std::fs::write(tmp.join("manifest.json"), manifest_json)
-            .expect("write manifest fixture");
+        std::fs::write(tmp.join("manifest.json"), manifest_json).expect("write manifest fixture");
         rootfs
     }
 
@@ -4915,8 +4935,7 @@ mod builder_vm_bootstrap_tests {
         let rootfs = tmp.path().join("rootfs.ext4");
         std::fs::write(&rootfs, b"stub").expect("write rootfs stub");
         // No manifest.json written.
-        let err = validate_stage0_seed_contract(&rootfs)
-            .expect_err("missing manifest must fail");
+        let err = validate_stage0_seed_contract(&rootfs).expect_err("missing manifest must fail");
         assert!(matches!(err, SeedContractError::MissingManifest { .. }));
         assert_eq!(err.audit_reason(), "seed_contract_missing_manifest");
         let msg = format!("{err}");
@@ -4930,8 +4949,7 @@ mod builder_vm_bootstrap_tests {
     fn validate_stage0_seed_contract_rejects_malformed_json() {
         let tmp = tempfile::tempdir().expect("tempdir");
         let rootfs = write_seed_manifest_fixture(tmp.path(), "{ not valid json");
-        let err = validate_stage0_seed_contract(&rootfs)
-            .expect_err("malformed json must fail");
+        let err = validate_stage0_seed_contract(&rootfs).expect_err("malformed json must fail");
         assert!(matches!(err, SeedContractError::MalformedJson { .. }));
         assert_eq!(err.audit_reason(), "seed_contract_malformed_json");
     }
@@ -4949,8 +4967,7 @@ mod builder_vm_bootstrap_tests {
             STAGE0_SUPPORTED_MANIFEST_SCHEMA + 1
         );
         let rootfs = write_seed_manifest_fixture(tmp.path(), &manifest);
-        let err = validate_stage0_seed_contract(&rootfs)
-            .expect_err("future schema must fail");
+        let err = validate_stage0_seed_contract(&rootfs).expect_err("future schema must fail");
         assert!(matches!(err, SeedContractError::UnsupportedSchema { .. }));
         assert_eq!(err.audit_reason(), "seed_contract_unsupported_schema");
     }
@@ -4965,8 +4982,7 @@ mod builder_vm_bootstrap_tests {
           "init_paths": ["/sbin/mvm-builder-init"]
         }"#;
         let rootfs = write_seed_manifest_fixture(tmp.path(), manifest);
-        let err = validate_stage0_seed_contract(&rootfs)
-            .expect_err("wrong image_kind must fail");
+        let err = validate_stage0_seed_contract(&rootfs).expect_err("wrong image_kind must fail");
         assert!(matches!(err, SeedContractError::WrongImageKind { .. }));
         assert_eq!(err.audit_reason(), "seed_contract_wrong_image_kind");
     }
@@ -4984,8 +5000,8 @@ mod builder_vm_bootstrap_tests {
             STAGE0_REQUIRED_CONTRACT_VERSION - 1
         );
         let rootfs = write_seed_manifest_fixture(tmp.path(), &manifest);
-        let err = validate_stage0_seed_contract(&rootfs)
-            .expect_err("stale contract_version must fail");
+        let err =
+            validate_stage0_seed_contract(&rootfs).expect_err("stale contract_version must fail");
         assert!(matches!(err, SeedContractError::ContractStale { .. }));
         assert_eq!(err.audit_reason(), "seed_contract_stale");
         let msg = format!("{err}");
@@ -5063,7 +5079,10 @@ mod builder_vm_bootstrap_tests {
             assert!(!r.contains('='), "audit_reason must not contain `=`: {r}");
             assert!(!r.contains(' '), "audit_reason must not contain space: {r}");
             assert!(!r.contains(','), "audit_reason must not contain `,`: {r}");
-            assert!(!r.contains('\n'), "audit_reason must not contain newline: {r}");
+            assert!(
+                !r.contains('\n'),
+                "audit_reason must not contain newline: {r}"
+            );
             assert!(
                 r.starts_with("seed_contract_"),
                 "audit_reason must namespace with seed_contract_: {r}"
