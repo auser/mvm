@@ -110,6 +110,25 @@
         mvmSrc = workspace;
       };
 
+      # ADR-050 / issue #223 — veritysetup sidecar bytes must not drift
+      # when nixpkgs revs. The OCI-pull path runs `veritysetup format`
+      # inside this builder VM, while the Nix-built baseline runs it in
+      # `nix/images/runtime-overlay/flake.nix`. Both flakes intentionally
+      # pin the same cryptsetup release + tarball hash, and both must be
+      # reviewed together on bump.
+      pinnedCryptsetupVersion = "2.8.6";
+      pinnedCryptsetupSrcHash = "sha256-gAQmX9mTiF0I97Yz2+BWhR3hohAwdhOk693HQ/zO/lo=";
+      pinnedCryptsetupFor = pkgs:
+        pkgs.cryptsetup.overrideAttrs (_old: {
+          version = pinnedCryptsetupVersion;
+          src = pkgs.fetchurl {
+            url =
+              "mirror://kernel/linux/utils/cryptsetup/v${pkgs.lib.versions.majorMinor pinnedCryptsetupVersion}/"
+              + "cryptsetup-${pinnedCryptsetupVersion}.tar.xz";
+            hash = pinnedCryptsetupSrcHash;
+          };
+        });
+
       # Per Plan 72 §W2 — narrower than the dev-shell image.
       # See module-level docs above for the rationale on each.
       #
@@ -155,6 +174,7 @@
         iptables
         e2fsprogs
         util-linux
+        (pinnedCryptsetupFor pkgs) # provides pinned veritysetup
         # Plan 73 Followup B.2 — app-deps install pipeline.
         uv
         pnpm

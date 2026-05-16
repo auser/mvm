@@ -296,6 +296,70 @@ fn runtime_overlay_flake_stages_netinit_binary() {
     );
 }
 
+/// ADR-050 / issue #223 — the OCI-pull verity path runs
+/// `veritysetup format` inside the builder VM, while the Nix-built
+/// runtime-overlay baseline runs it in the runtime-overlay flake.
+/// Both must use the same explicit cryptsetup release pin so a
+/// nixpkgs bump cannot silently change sidecar bytes. The live
+/// Linux integration test `seal_is_byte_deterministic_for_identical_rootfs_bytes`
+/// verifies byte-identical sidecars for fixed input bytes when
+/// `veritysetup` is present; this structural guard verifies the
+/// two Nix closures consume the same pinned toolchain.
+#[test]
+fn cryptsetup_pin_is_shared_by_builder_vm_and_runtime_overlay() {
+    let builder_path = nix_dir()
+        .join("images")
+        .join("builder-vm")
+        .join("flake.nix");
+    let runtime_path = nix_dir()
+        .join("images")
+        .join("runtime-overlay")
+        .join("flake.nix");
+    let builder = fs::read_to_string(&builder_path)
+        .unwrap_or_else(|e| panic!("nix/images/builder-vm/flake.nix must be present: {e}"));
+    let runtime = fs::read_to_string(&runtime_path)
+        .unwrap_or_else(|e| panic!("nix/images/runtime-overlay/flake.nix must be present: {e}"));
+
+    for (name, content) in [
+        ("builder-vm flake", builder.as_str()),
+        ("runtime-overlay flake", runtime.as_str()),
+    ] {
+        assert!(
+            content.contains("pinnedCryptsetupVersion = \"2.8.6\""),
+            "{name} must pin cryptsetup 2.8.6 explicitly for ADR-050 / #223"
+        );
+        assert!(
+            content.contains(
+                "pinnedCryptsetupSrcHash = \"sha256-gAQmX9mTiF0I97Yz2+BWhR3hohAwdhOk693HQ/zO/lo=\""
+            ),
+            "{name} must pin the cryptsetup 2.8.6 release tarball hash"
+        );
+        assert!(
+            content.contains("pinnedCryptsetupFor = pkgs:"),
+            "{name} must expose a pinned cryptsetup helper instead of using raw pkgs.cryptsetup"
+        );
+        assert!(
+            content.contains("pkgs.cryptsetup.overrideAttrs"),
+            "{name} must override cryptsetup source/version, not only document the desired version"
+        );
+        assert!(
+            content.contains("cryptsetup-${pinnedCryptsetupVersion}.tar.xz"),
+            "{name} must fetch the exact cryptsetup release tarball named by the pin"
+        );
+    }
+
+    assert!(
+        builder.contains("(pinnedCryptsetupFor pkgs) # provides pinned veritysetup"),
+        "builder VM packages must include the pinned cryptsetup package so OCI-pull \
+         verity generation runs the pinned veritysetup binary"
+    );
+    assert!(
+        runtime.contains("(pinnedCryptsetupFor pkgs) # provides pinned veritysetup"),
+        "runtime-overlay nativeBuildInputs must use the pinned cryptsetup package so \
+         the Nix-built verity baseline matches the builder VM"
+    );
+}
+
 #[test]
 fn flake_lock_pins_microvm_input_by_hash() {
     // The flake.lock must exist and pin the microvm.nix input by

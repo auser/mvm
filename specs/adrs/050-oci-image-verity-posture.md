@@ -174,10 +174,11 @@ Option B is on the spectrum of that.
 
 ## Open questions
 
-- **`veritysetup` versioning.** Sidecar format is stable across
-  recent `cryptsetup` releases, but pin the version in the
-  builder-VM flake to avoid silent regeneration drift across
-  builds.
+- **`veritysetup` versioning.** Resolved by #223: both
+  `nix/images/builder-vm/flake.nix` and
+  `nix/images/runtime-overlay/flake.nix` pin cryptsetup 2.8.6 by
+  release tarball hash so `veritysetup format` cannot drift
+  silently on nixpkgs bumps.
 - **Image-size DoS at pull time.** A malicious registry could
   serve a 100 GB manifest. Layer-size + total-rootfs caps belong
   in Plan 74 W1's R10 (OCI layer unpack attack surface)
