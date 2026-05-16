@@ -51,6 +51,13 @@ pub mod error;
 pub mod layer;
 pub mod manifest;
 pub mod reference;
+// Plan 85 Phase A — layer-to-tree unpacker. Public because callers
+// outside this crate (`mvm-build::rootfs::materialize_ext4` in Phase
+// B; `mvm-cli`'s `image run` verb in Phase D) need the
+// `UnpackOptions` / `UnpackReport` / `RefusalReason` surface to drive
+// the unpack and to surface refusals in audit-chain entries
+// (Phase E, claim 10).
+pub mod unpack;
 
 pub use error::OciError;
 pub use layer::{LayerDescriptor, LayerFetchOptions, OciLayerFetcher};
@@ -59,3 +66,6 @@ pub use manifest::{
     verify_sha256_digest,
 };
 pub use reference::ImageReference;
+pub use unpack::{
+    RefusalReason, RefusedEntry, UnpackError, UnpackOptions, UnpackReport, unpack_layer,
+};
