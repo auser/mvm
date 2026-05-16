@@ -199,6 +199,35 @@
             fi
 
             chmod 0644 $out/vmlinux $out/rootfs.ext4
+
+            # Plan 77 W5 — host-side preflight Stage 0 seed contract.
+            # `validate_stage0_seed_contract` in mvm-cli reads this
+            # before booting the dev image as a Stage 0 bootstrap and
+            # refuses to launch libkrun if the contract doesn't match.
+            # The sidecar is metadata, not a trust anchor — see Plan 77
+            # security consideration 13.
+            #
+            # schema_version: shape of this manifest itself.
+            # contract_version: bumped on any backward-incompatible
+            #   Stage 0 contract change (init binary moves, kernel
+            #   cmdline shape changes, expected mount points shift).
+            #   Bump in lockstep with the matching mvmctl-side minimum.
+            # init_paths: paths the host expects to find inside the
+            #   rootfs. mvmctl validates that this flake's extraFiles
+            #   declared each one; it does not peek inside the ext4.
+            # image_kind: "dev" disambiguates from the builder-vm
+            #   flake's manifest (image_kind would be "builder-vm"
+            #   there if it carried this field).
+            cat > $out/manifest.json <<MANIFEST
+            {
+              "schema_version": 1,
+              "contract_version": 2,
+              "image_kind": "dev",
+              "system": "${system}",
+              "init_paths": ["/sbin/mvm-builder-init"]
+            }
+            MANIFEST
+            chmod 0644 $out/manifest.json
           '';
     in
     {

@@ -329,6 +329,24 @@ pub enum BuilderVmError {
     /// extraction-dir issue).
     #[error("extracting artifacts from builder sandbox: {0}")]
     ExtractionFailed(String),
+
+    /// Plan 77 W6 — kernel-panic detected on the supervisor's console
+    /// log. `Child::wait()` would otherwise block forever (libkrun's
+    /// `krun_start_enter` doesn't notice a panicked guest), so a
+    /// host-side watcher kills the supervisor and surfaces the
+    /// captured banner line for diagnosis.
+    #[error(
+        "Stage 0 seed VM kernel-panicked during boot ({panic_line}); see {console_log_path} for the full kernel log"
+    )]
+    SeedKernelPanic {
+        /// First matched line of the kernel panic (the `Kernel panic -
+        /// not syncing: ...` banner). Captured verbatim minus the
+        /// trailing newline.
+        panic_line: String,
+        /// Host-side path to the supervisor's console log, where the
+        /// full pre- and post-panic kernel output is preserved.
+        console_log_path: String,
+    },
 }
 
 /// Stub implementation. Every method returns

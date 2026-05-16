@@ -1,6 +1,17 @@
 # Plan 77 — Stage 0 builder VM bootstrap via the cached dev image
 
-**Status:** W0 + load-bearing W1 shipped on `main`. W0's `LibkrunBuilderVm` refactor + invariant landed via commit chain ending at 843ef18 (W0 PR #280 was superseded by this same chain). W1's `bootstrap_builder_vm_image_via_dev_image_stage0` shipped in 843ef18 with hardening in 4bbb615 (atomic staging), a8f47e9 (no-feature cache helpers), 0aac0f2 (source-fingerprint binding), and 68ae7db (artifact-digest manifest). The W1 seed-image gap — `find_local_fallback_image` missing `~/.mvm/dev/current/` — was closed by PR #293. W2 (advisory lock), W3 (audit emit beyond what's already in the cache-promotion path), and W4 (gate the download path behind a feature flag) remain open.
+**Status:** W0 + load-bearing W1 shipped on `main`. W0's `LibkrunBuilderVm` refactor + invariant landed via commit chain ending at 843ef18 (W0 PR #280 was superseded by this same chain). W1's `bootstrap_builder_vm_image_via_dev_image_stage0` shipped in 843ef18 with hardening in 4bbb615 (atomic staging), a8f47e9 (no-feature cache helpers), 0aac0f2 (source-fingerprint binding), and 68ae7db (artifact-digest manifest). The W1 seed-image gap — `find_local_fallback_image` missing `~/.mvm/dev/current/` — was closed by PR #293. W2 (advisory lock), W3 (audit emit beyond what's already in the cache-promotion path), and W4 (gate the download path behind a feature flag) have shipped. W5 (preflight seed-contract check) + W6 (host-side kernel-panic detector) added 2026-05-15 after a reproducible kernel panic on a Stage 0 seed whose rootfs lacked `/sbin/mvm-builder-init` — see "Why W5 + W6 were added" below.
+
+## Why W5 + W6 were added
+
+On 2026-05-15 a contributor host hit `Kernel panic - not syncing: Requested init /sbin/mvm-builder-init failed (error -2)` at boot t=0.08s of the Stage 0 VM. Root cause: the seed dev image at `~/.mvm/dev/current/rootfs.ext4` was built before commit 843ef18 (2026-05-14), which is when the dev-image flake started shipping `mvm-builder-init` at `/sbin/`. Plan 77 W1's Stage 0 contract assumed every seed has that PID-1 binary; a stale seed silently violates the contract.
+
+Two failure modes compounded:
+
+1. **No preflight contract check.** `bootstrap_builder_vm_image_via_dev_image_stage0` launched libkrun against the contract-stale seed and only Stage0FailureStage::Validate could have caught it — but Validate runs *after* the build completes, and the build never did because the kernel panicked at PID 1.
+2. **No host-side panic detector.** The libkrun supervisor blocks in `krun_start_enter` until the VM cleanly exits. A kernel panic doesn't trigger a clean exit. The supervisor — and therefore `mvmctl dev up` — hangs indefinitely. Even Ctrl-C / SIGTERM doesn't reliably propagate (existing memory entry `reference_libkrun_gotchas.md`).
+
+W5 closes mode (1) by making the contract explicit and validated before any VM boot. W6 closes mode (2) so any *future* contract drift (or unrelated kernel bring-up failure) surfaces as a clear, prompt error instead of a 10-minute hang plus an orphaned `mvm-libkrun-supervisor` process holding 4 GiB and the stage0 advisory lock.
 
 ## Goal
 
@@ -85,6 +96,39 @@ Plan 77 is the pragmatic in-between: **boot the contributor's already-cached dev
 - Move `download_builder_vm_image` behind a `#[cfg(feature = "release-artifact-bootstrap")]` gate that is off by default and only on for end-user-binary release builds
 - Source-checkout flow can never reach the download path; failed Stage 0 is a hard error
 
+### W5 — preflight seed contract check
+Move the contract drift detection from "implicit, panics inside the VM" to "explicit, validated on the host before any libkrun boot."
+
+- `nix/images/builder/flake.nix` (the dev image flake — the source of every Stage 0 seed) emits `$out/manifest.json` next to `vmlinux` / `rootfs.ext4`. The sidecar carries:
+  - `schema_version: 1` — flake-side contract for the manifest's own shape.
+  - `contract_version: 2` — bumped each time the Stage 0 boot contract changes in a backward-incompatible way (e.g. init binary moves, kernel cmdline shape changes, expected mount points shift). `contract_version: 2` is the first published version, set to the value Plan 77 W5 requires.
+  - `init_paths: ["/sbin/mvm-builder-init"]` — the binaries Stage 0 needs to find inside the rootfs. The host-side validator confirms the dev-image flake added them via `extraFiles`; it doesn't peek inside the ext4 (no ext4 walker on the host, no mount on macOS).
+  - `image_kind: "dev"` — distinguishes the dev image manifest from the builder-vm manifest's shape (`name: "mvm-builder-vm"`); they're sister artifacts and a wrong-kind manifest must fail validation.
+  - `system: "<flake system tuple>"` — passthrough from the flake's `system` for diagnostics.
+- New `fn validate_stage0_seed_contract(seed_dir: &Path) -> Result<(), SeedContractError>` in `crates/mvm-cli/src/commands/env/apple_container.rs`.
+  - Reads `<seed_dir>/manifest.json`.
+  - Fails fast (no manifest, malformed JSON, wrong `image_kind`, `schema_version` too new for this binary, `contract_version` below the required minimum, missing required `init_paths`).
+  - Each error variant carries a structured `reason` suitable for `Stage0Failed.reason` and an end-user remediation string (e.g. "Stage 0 seed at <path> is contract-stale — rebuild the dev image with `mvmctl dev rebuild`, or import a signed published image with `mvmctl dev import-image`").
+- Wire into `bootstrap_builder_vm_image_via_dev_image_stage0`: call `validate_stage0_seed_contract(seed_dir)` immediately after `find_local_fallback_image` returns and before the staging directory is created. On failure, emit a `Stage0Failed` audit line with `stage=preflight reason=seed_contract_<variant>` and bail with the structured remediation message.
+
+The check is a pure host-side file read — no VM boot, no nix evaluation, no network — so the new failure path costs milliseconds and surfaces a precise, actionable error before any expensive work runs.
+
+### W6 — host-side kernel-panic detector in `spawn_supervisor_and_wait`
+Defense in depth so the next contract drift (or any kernel-bring-up failure that W5 doesn't catch) doesn't hang the host. Lives in `crates/mvm-build/src/libkrun_builder.rs::spawn_supervisor_and_wait` because that's the function that owns the supervisor child handle and knows the `console_output_path` from the `SupervisorConfig` it serializes.
+
+- Before spawning the child, capture `cfg.krun.console_output_path` (`Option<&str>`). When `None`, behavior is unchanged.
+- After spawning + before `child.wait()`, start a watcher thread via `std::thread::scope` (so it can't outlive the function and is guaranteed joined before return):
+  - Polls for the console-log file to appear (libkrun creates it on first hvc0 write — typically within 100 ms of spawn).
+  - Once it exists, opens it and reads forward through any newly-appended bytes every ~100 ms.
+  - Detection predicate matches the Linux kernel's stable panic banner: `Kernel panic - not syncing:` (a single substring match; the version-stable prefix has been unchanged in upstream `kernel/panic.c` for >a decade).
+  - On detection: store the first matching line in a `Mutex<Option<String>>`, call `child.kill()` (SIGKILL, which bypasses the SIGTERM-brittle handling documented in `reference_libkrun_gotchas.md`), then exit the watcher.
+  - Exits cleanly when `child.wait()` returns (the main thread sets a shared atomic flag the watcher checks each poll).
+- After `child.wait()` returns, inspect the panic-detector result:
+  - If the watcher captured a panic line, return `BuilderVmError::SeedKernelPanic { line, console_log_path }` regardless of exit code. The caller (`run_build` → Plan 77 W1's `run_stage0_bootstrap`) maps this to `Stage0FailureStage::Build` with a `reason=kernel_panic` tag.
+  - Otherwise, return the exit code as today.
+
+The watcher is opt-in via the `console_output_path` already being set — no new config surface. Latency from panic to host-visible failure is ≤ 500 ms in practice. The same path catches non-contract-drift panics (e.g. wrong kernel cmdline, missing virtio-blk module, `EXT4-fs: VFS: Can't find ext4 filesystem`) so future bring-up regressions surface promptly too.
+
 ## Security considerations
 
 The invariant in AGENTS.md / CLAUDE.md is the security spine of this plan. Each item below maps to a specific failure mode I considered before recommending this design.
@@ -144,6 +188,18 @@ A contributor with write access to `nix/images/builder-vm/flake.nix` can change 
 
 For an end-user-binary install (separate codepath from this plan), the source flakes don't exist on disk; the contributor-side flake-injection vector doesn't apply.
 
+### 13. W5 manifest is metadata, not a trust anchor
+The `manifest.json` sidecar declares what the dev image flake intended to ship, not what the rootfs actually contains. A malicious local flake could lie. That's accepted because Plan 77's overall trust boundary is unchanged (see consideration 12 and 1): a contributor with write access to `nix/images/builder/flake.nix` already controls what Stage 0 boots. W5 catches **honest drift** (stale cache, missed flake update, version skew with the host binary) — it's a UX + correctness check, not an integrity check.
+
+For signed end-user-binary release artifacts the dev-image manifest is already cosign-verified end-to-end via `mvmctl dev import-image` (ADR 005 / Plan 36). W5 adds nothing to that trust path and removes nothing from it; it only reads metadata the flake already emits.
+
+### 14. W6 watcher cannot escalate
+The kernel-panic watcher thread runs in the parent `mvmctl` process (or the test harness, in tests), reads a host-side file the supervisor writes to, and on detection calls `Child::kill()` on a process it spawned. It does not interact with the guest, has no vsock, and has no privilege beyond what the parent already has over its own child. The watcher's failure modes are bounded:
+
+- Watcher panics → scoped thread's panic propagates; `wait` is still called via the scope's join logic.
+- Watcher races with a clean exit → the atomic "child exited" flag is set, watcher's next poll exits its loop, no kill is issued.
+- Watcher false-positive on a non-panic line containing the banner literal → the seed is rejected and the contributor sees the captured line in the error. False positives are diagnosable from the console log; there's no silent fallback.
+
 ## Test strategy
 
 | Test | Layer | Gate |
@@ -157,6 +213,14 @@ For an end-user-binary install (separate codepath from this plan), the source fl
 | Integration: clean `~/.cache/mvm/builder-vm/` + present `~/.mvm/dev/current/` → `mvmctl dev up` succeeds | host | nightly on macOS + Linux KVM runners |
 | Integration: byte-equivalence of resulting `rootfs.ext4` between two consecutive Stage 0 runs on the same flake source | host | nightly |
 | Negative integration: forced exec timeout → VM torn down, cache unchanged | host | nightly |
+| Unit: `validate_stage0_seed_contract` rejects missing `manifest.json` | mvm-cli | every PR |
+| Unit: `validate_stage0_seed_contract` rejects manifest with `contract_version` below required | mvm-cli | every PR |
+| Unit: `validate_stage0_seed_contract` rejects manifest missing required `init_paths` entry | mvm-cli | every PR |
+| Unit: `validate_stage0_seed_contract` rejects wrong `image_kind` | mvm-cli | every PR |
+| Unit: `validate_stage0_seed_contract` accepts a well-formed manifest | mvm-cli | every PR |
+| Unit: panic detector kills a fake child within ≤ 500 ms when the test writes the banner line to a temp console log | mvm-build | every PR |
+| Unit: panic detector does not kill a fake child that exits cleanly without the banner | mvm-build | every PR |
+| Unit: panic detector tolerates a delayed console-log creation (file appears after spawn) | mvm-build | every PR |
 
 The unit-test layer keeps the PR-level signal high without needing a libkrun-capable CI runner for every iteration.
 
@@ -167,14 +231,16 @@ The unit-test layer keeps the PR-level signal high without needing a libkrun-cap
 - **W2** — host-side lock + atomic promotion.
 - **W3** — audit emit + the test matrix above.
 - **W4** — close the download path behind `#[cfg(feature = "release-artifact-bootstrap")]`.
+- **W5** — `manifest.json` sidecar emission + `validate_stage0_seed_contract` preflight. Hard error on contract drift before any VM boot.
+- **W6** — kernel-panic detector inside `spawn_supervisor_and_wait`. Defense in depth: future contract drift, bring-up regressions, or any in-VM panic surfaces in ≤ 500 ms on the host.
 
-W1 is the load-bearing slice. W2–W4 harden it.
+W1 is the load-bearing slice. W2–W4 harden it. W5 + W6 close the contract-drift hole that surfaced on 2026-05-15.
 
 ## Rollback
 
 W1's diff is contained to `crates/mvm-cli/src/commands/env/apple_container.rs` and the `LibkrunBuilderVm` refactor that W0 establishes. Reverting both leaves `mvmctl dev up` failing in the same way as today's main (the missing-cache + 404-download error), so no behavior regression from the current broken state.
 
-W2/W3/W4 are additive over W1.
+W2/W3/W4 are additive over W1. W5 and W6 are additive over W1–W4: reverting either one leaves the host with no preflight check and no panic detector respectively, restoring the failure mode that produced this plan's "Why W5 + W6 were added" section but not breaking any other path. The dev-image flake's new `manifest.json` is read-only metadata; older mvmctl binaries simply ignore the file. Older dev images without the manifest are detected by W5's "missing manifest" branch.
 
 ## Out of scope
 
