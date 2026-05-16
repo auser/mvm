@@ -1,4 +1,4 @@
-# ADR 050 - Guest Protocol Versioning, Runtime Readiness, and First-Use DX
+# ADR 053 - Guest Protocol Versioning, Runtime Readiness, and First-Use DX
 
 **Status**: Proposed
 **Date**: 2026-05-14
@@ -283,11 +283,11 @@ clear "rebuild your dev VM" hint when this fires.
 
 ## References
 
-- Plan 74 - `specs/plans/74-banger-runtime-lessons.md`
+- Plan 74 - `specs/plans/84-banger-runtime-lessons.md`
 - ADR-002 - `specs/adrs/002-microvm-security-posture.md`
 - ADR-007 - `specs/adrs/007-function-call-entrypoints.md`
 - ADR-046 - `specs/adrs/046-builder-vm-via-libkrun.md`
 - ADR-047 - `specs/adrs/047-app-deps-audit-pipeline.md`
-- Plan 41 - `specs/plans/41-function-entrypoints-design.md`
+- Plan 41 - `specs/plans/81-function-entrypoints-design.md`
 - Plan 52 - `specs/plans/52-fd3-control-channel-and-session-attach.md`
 - Plan 72 - `specs/plans/72-builder-vm-via-libkrun.md`

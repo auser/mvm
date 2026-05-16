@@ -1,9 +1,9 @@
-# Plan 74 - Banger runtime lessons for mvm
+# Plan 84 - Banger runtime lessons for mvm
 
 > Status: active
 > Owner: TBD
 > Started: -
-> Depends on: ADR-002, ADR-007, ADR-050, plan 41, plan 52, plan 64, plan 72
+> Depends on: ADR-002, ADR-007, ADR-053, plan 41, plan 52, plan 64, plan 72
 > Inputs: survey of `thaloco/banger` public GitLab mirror
 
 ## Why
@@ -132,7 +132,7 @@ small compatibility-preserving state-model slice.
 ### Action
 
 - New ADR:
-  `specs/adrs/050-guest-protocol-versioning-and-readiness.md`.
+  `specs/adrs/053-guest-protocol-versioning-and-readiness.md`.
 - Define:
   - protocol version bump policy;
   - capability negotiation rules;
@@ -326,8 +326,8 @@ feature work in a sibling worktree, git only from the main checkout
 with `git -C <worktree>`, cargo on the macOS host by default, and no
 Nix/microVM/mvmctl runtime commands outside the builder VM.
 
-Please continue Plan 74 from:
-specs/plans/74-banger-runtime-lessons.md
+Please continue Plan 84 from:
+specs/plans/84-banger-runtime-lessons.md
 
 Start W2: Runtime readiness state model. Keep the first slice scoped:
 add a serde-compatible `InstanceReadiness` model to persisted instance
@@ -339,7 +339,7 @@ expose readiness in `mvmctl status --json` and `mvmctl ls --json`.
 Do not implement `mvmctl explain` yet. Add focused tests for legacy
 JSON compatibility, readiness roundtrip, and health-to-readiness
 mapping. Run `cargo fmt`, targeted tests, and clippy for touched
-crates. Update specs/SPRINT.md and Plan 74 status when done.
+crates. Update specs/SPRINT.md and Plan 84 status when done.
 ```
 
 ---
@@ -701,7 +701,7 @@ accurate.
 
 The first PR should be W0 only:
 
-1. Add ADR-050.
+1. Add ADR-053.
 2. Add this plan cross-reference to the sprint spec.
 3. Do not change the wire yet.
 

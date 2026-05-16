@@ -418,7 +418,7 @@ End-to-end test matrix — must all pass before sprint closes:
 13. **Lockfile-cleanliness CI gate**: PR with stale `flake.lock` → CI red.
 14. **Tests**: `cargo test --workspace` clean. New tests in `mvm-security::image_verify` cover happy path, every `VerifyError` variant (mocked cert/issuer/expiry), revocation hit/miss, max-age boundary.
 15. **Clippy clean**: `cargo clippy --workspace --all-targets -- -D warnings`.
-16. **Live KVM smoke**: builder variant boots end-to-end on a real KVM host (folds into the existing `live-verity-boot` lane added in plan 35-sprint-44).
+16. **Live KVM smoke**: builder variant boots end-to-end on a real KVM host (folds into the existing `live-verity-boot` lane added in plan 78-sprint-44).
 
 ## Acceptance criteria
 

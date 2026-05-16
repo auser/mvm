@@ -36,7 +36,7 @@ plan 25 sequences the work into six independently-shippable workstreams.
 
 Recent maintenance:
 
-- [x] Added [`adrs/050-guest-protocol-versioning-and-readiness.md`](adrs/050-guest-protocol-versioning-and-readiness.md) and [`plans/74-banger-runtime-lessons.md`](plans/74-banger-runtime-lessons.md), a proposed follow-up workstream translating the useful parts of Banger's runtime design into mvm protocol versioning, readiness states, control/data-plane boundaries, backpressure reporting, explicit builder-mode policy, receipts, explainability, and first-use DX.
+- [x] Added [`adrs/053-guest-protocol-versioning-and-readiness.md`](adrs/053-guest-protocol-versioning-and-readiness.md) and [`plans/84-banger-runtime-lessons.md`](plans/84-banger-runtime-lessons.md), a proposed follow-up workstream translating the useful parts of Banger's runtime design into mvm protocol versioning, readiness states, control/data-plane boundaries, backpressure reporting, explicit builder-mode policy, receipts, explainability, and first-use DX.
 - [ ] Plan 74 W1 in progress (hard cutover, no Ping compat shim): `ProtocolHello` / `ProtocolHelloAck` / `ProtocolMismatch` wire types, closed `GuestCapability` enum, `negotiate_protocol` + `require_capabilities` helpers, and the guest-agent prelude that rejects any non-hello first request with `ProtocolMismatch { required_action: upgrade_host }`. FS RPC, process RPC, run-entrypoint, console, and idle-timeout call sites fail closed on missing capabilities. Pending in W1: volume mount/unmount call sites, fuzz target updates for the new variants, and the hard-cutover regression test.
 - [x] `mvmctl dev status` now reports the same Apple Container dev image paths that `dev up` boots (`~/.mvm/dev/current`, versioned prebuilts, or launchd-provided paths), instead of only checking the legacy cache location.
 - [x] Added an opt-in `runtime_boot_bench` live test for already-built runtime images, covering serial boots and three-way concurrent fan-out against a 200 ms per-VM budget.
@@ -45,7 +45,7 @@ Recent maintenance:
 - [x] Removed the remaining third-party sandbox Cargo dependency and backend/builder compile paths; `Cargo.lock` no longer carries the transitive SeaORM/SQLx stack, including the MySQL driver.
 - [x] Clarified the local platform policy after the cleanup: supported builder/runtime hosts are macOS Apple Silicon and native Linux with `/dev/kvm`; macOS Intel and native Windows are unsupported, while WSL2 nested KVM and a Hyper-V managed Linux builder remain future backend work.
 - [x] Added ADR-048 and Plan 74 to turn the Microsandbox comparison into claim-gated `mvm` runtime work: docs hygiene, OCI ingest, programmable networking, secret placeholders, SDK-owned lifecycle, measured cold-starts, and filesystem backend contracts.
-- [ ] Plan 74 W0 (claims hygiene and docs guardrails) in flight — new public Sandbox parity status page (`security/sandbox-parity-status.md`), `cargo xtask check-doc-claims` lint covering `<100ms` / `any OCI image` / `secrets cannot leak` / variants, `mvmforge` cleanup in `guides/exec.md` and `reference/cli-commands.md`, gap-analysis updated for current `crates/mvm-sdk` layout and mvmd ADR-0020 handoff, and a new `specs/plans/74-w1-w6-attack-plan.md` sequencing sidecar that defers risk discussion to plan 74's `## Risks` section (R1-R12).
+- [ ] Plan 74 W0 (claims hygiene and docs guardrails) in flight — new public Sandbox parity status page (`security/sandbox-parity-status.md`), `cargo xtask check-doc-claims` lint covering `<100ms` / `any OCI image` / `secrets cannot leak` / variants, `mvmforge` cleanup in `guides/exec.md` and `reference/cli-commands.md`, gap-analysis updated for current `crates/mvm-sdk` layout and mvmd ADR-0020 handoff, and a new `specs/plans/83-w1-w6-attack-plan.md` sequencing sidecar that defers risk discussion to plan 74's `## Risks` section (R1-R12).
 - [x] Added intent-bound admission profiles to signed `ExecutionPlan` v4, binding intent, seccomp tier, policy refs, secret-release posture, and audit taxonomy without adding new sandbox execution capability.
 - [x] Documented the host-orchestrated builder VM flow across the website docs, clarifying that `mvmctl build` runs from the host while Nix evaluation/builds execute inside the builder VM and runtime boot benchmarks consume already-built artifacts.
 - [x] Aligned `dev_build` with the builder VM invariant by removing the host-Nix dispatch probe from the normal path; Nix builds now route through the libkrun builder VM when builder-VM support is compiled in.
@@ -64,6 +64,7 @@ Recent maintenance:
 - [x] Added `mvmctl dev cache inspect` with `--json`; it reports sanitized dev-image presence plus source/release builder-cache readiness without rebuilding, booting, or printing local paths, raw artifact digests, or artifact contents.
 - [x] Plan 77 W4: gated `download_builder_vm_image` and its helpers behind the off-by-default `release-artifact-bootstrap` feature so contributor builds cannot reach the published-prebuilt path at compile time, with `perform_builder_vm_download_published_bails_without_feature` locking the structural-failure shape into the test suite.
 - [x] Hardened builder-VM reliability follow-ups from GitHub triage: Stage 0 seed selection now skips cached dev rootfs images that lack `/sbin/mvm-builder-init`, source-built builder VM artifacts must contain that init before promotion, cached builder images fail fast when `cmdline.txt` is missing, libkrun supervisor waits have a bounded `MVM_BUILDER_VM_TIMEOUT_SECS` escape hatch, and flake builds now carry the Nix store-path hash through `/job/store-path` for stable `revision_hash` reuse.
+- [x] Resolved spec-number collisions across `specs/plans/` and `specs/adrs/` by renumbering duplicate-prefixed files, updating references, and adding `cargo xtask check-spec-numbers` to CI so future duplicate Plan/ADR prefixes fail before merge.
 
 ## In-flight workstreams
 
@@ -516,7 +517,7 @@ Waves 4–6 are post-44 follow-ups; the sprint can close on Waves 0–3.
 
 Master plan: [`plans/41-function-call-entrypoints.md`](plans/41-function-call-entrypoints.md)
 (mvm side, six workstreams). Comprehensive design rationale + 16
-security mitigations: [`plans/41-function-entrypoints-design.md`](plans/41-function-entrypoints-design.md).
+security mitigations: [`plans/81-function-entrypoints-design.md`](plans/81-function-entrypoints-design.md).
 Architecture decision: [`adrs/007-function-call-entrypoints.md`](adrs/007-function-call-entrypoints.md).
 Cross-repo: decorationer (mvmforge) `specs/adrs/0009-function-entrypoints.md`,
 `specs/plans/0003-function-entrypoint-runtime.md`,
@@ -1716,7 +1717,7 @@ Shipped:
    `cargo clippy --workspace --all-targets -- -D warnings` stays
    green throughout.*
 
-## Sprint 53 — Claim-safe sandbox parity (W0 in flight) [`plans/74-claim-safe-sandbox-parity.md`](plans/74-claim-safe-sandbox-parity.md) | [`adrs/048-claim-safe-sandbox-parity.md`](adrs/048-claim-safe-sandbox-parity.md) | [`plans/74-w1-w6-attack-plan.md`](plans/74-w1-w6-attack-plan.md)
+## Sprint 53 — Claim-safe sandbox parity (W0 in flight) [`plans/74-claim-safe-sandbox-parity.md`](plans/74-claim-safe-sandbox-parity.md) | [`adrs/048-claim-safe-sandbox-parity.md`](adrs/048-claim-safe-sandbox-parity.md) | [`plans/83-w1-w6-attack-plan.md`](plans/83-w1-w6-attack-plan.md)
 
 ### W0 — Claims hygiene and docs guardrails  🟡 in flight
 
@@ -1736,7 +1737,7 @@ migration guide stays); updates `specs/gap-analysis-vs-microsandbox.md`
 for the current `crates/mvm-sdk` + `crates/mvm-sdk-macros` layout
 and the mvmd ADR-0020 cross-repo handoff; and lands plan 74's
 `## Risks` section (R1-R12, eight cross-cutting plus four
-architectural) plus the `74-w1-w6-attack-plan.md` sequencing
+architectural) plus the `83-w1-w6-attack-plan.md` sequencing
 sidecar so W1-W6 don't get re-planned mid-flight.
 
 ### W1-W6 — Proposed
@@ -1744,7 +1745,7 @@ sidecar so W1-W6 don't get re-planned mid-flight.
 OCI ingest, programmable network policy, secret placeholders,
 SDK-owned lifecycle, cold-start measurement, extensible filesystem
 backends. Sequencing, dependencies, and per-workstream attack plans
-in `plans/74-w1-w6-attack-plan.md`. Risk R9 (TLS substitution
+in `plans/83-w1-w6-attack-plan.md`. Risk R9 (TLS substitution
 mechanism — proxy-with-CA vs vsock side-channel vs host-side
 reconstruction) is the single architectural gate; recommended to
 land its own ADR before W2 codes the proxy.

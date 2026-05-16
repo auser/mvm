@@ -212,7 +212,7 @@ so audit bypasses stay visible in git blame.
 
 - [ADR-048: Claim-safe sandbox parity roadmap](https://github.com/tinylabscom/mvm/blob/main/specs/adrs/048-claim-safe-sandbox-parity.md)
 - [Plan 74: workstreams W0-W6](https://github.com/tinylabscom/mvm/blob/main/specs/plans/74-claim-safe-sandbox-parity.md)
-- [Plan 74 attack plan: sequencing for W1-W6](https://github.com/tinylabscom/mvm/blob/main/specs/plans/74-w1-w6-attack-plan.md)
+- [Plan 74 attack plan: sequencing for W1-W6](https://github.com/tinylabscom/mvm/blob/main/specs/plans/83-w1-w6-attack-plan.md)
 - [Seven CI-enforced security claims](/security/ci-claims/) — the
   existing operator-facing security guarantees this page does NOT
   duplicate.

@@ -1,4 +1,4 @@
-# Plan 74 — Attack plan for W1-W6
+# Plan 83 — Attack plan for Plan 74 W1-W6
 
 **Status:** Proposed
 **Date:** 2026-05-14
@@ -518,7 +518,7 @@ Quick map from workstream to load-bearing risks:
 | W6 storage | R4 (new audit kinds), R8 |
 
 **R3, R9, and R13 are now decided** —
-[ADR-050](050-oci-image-verity-posture.md) picks pull-time verity
+[ADR-050](../adrs/050-oci-image-verity-posture.md) picks pull-time verity
 generation for W1, [ADR-049](049-secret-substitution-mechanism.md)
 picks the vsock side-channel for W3 (with proxy-with-CA available
 later as an explicit opt-in feature flag), and

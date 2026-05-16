@@ -31,7 +31,7 @@ env:
 #
 # Per PR push the lanes are:
 #
-#   lint  → fmt + clippy + check-adr-coverage (one runner)
+#   lint  → fmt + clippy + xtask policy checks (one runner)
 #   test  → cargo build + cargo test
 #   mcp-server-smoke  → MCP JSON-RPC roundtrip
 #   nix-flake-check   → nix flake check across every flake
@@ -53,7 +53,7 @@ env:
 #     minutes per PR run.
 jobs:
   # ── Lane: lint ──
-  # Collapsed `fmt` + `clippy` + `check-adr-coverage` into one
+  # Collapsed `fmt` + `clippy` + xtask policy checks into one
   # runner. Each of the three was a separate job before, but each
   # ran sub-minute work behind a full runner spin-up + toolchain
   # install + cache restore (~1 minute of overhead per job). One
@@ -63,7 +63,8 @@ jobs:
   # Ordering inside the job:
   #   1. fmt   — sub-second; fail fast on whitespace drift
   #   2. clippy — bulk of the time; the lint we actually care about
-  #   3. check-adr-coverage — informational only; never gates merge
+  #   3. xtask policy checks — mostly hard gates; ADR coverage remains
+  #      informational only
   #      (per-step `continue-on-error: true`)
   lint:
     name: Lint (fmt + clippy + adr-coverage)
@@ -129,6 +130,9 @@ jobs:
 
       - name: No overclaiming (gated phrases from specs/claims/)
         run: cargo run -p xtask -- check-no-overclaim
+
+      - name: Unique spec numbers
+        run: cargo run -p xtask -- check-spec-numbers
 
   test:
     name: Test

@@ -117,7 +117,7 @@ impl std::fmt::Display for InstanceStatus {
 }
 
 // ============================================================================
-// Runtime readiness (ADR-050 / plan 74 W2)
+// Runtime readiness (ADR-053 / plan 74 W2)
 // ============================================================================
 //
 // `InstanceStatus` is the coarse lifecycle. `InstanceReadiness` is a
@@ -290,7 +290,7 @@ pub struct InstanceState {
     /// explicitly.
     #[serde(default = "default_auto_resume")]
     pub auto_resume: bool,
-    /// Finer-grained runtime readiness (ADR-050 / plan 74 W2),
+    /// Finer-grained runtime readiness (ADR-053 / plan 74 W2),
     /// composed alongside `status`. `None` on instances created
     /// before W2 — legacy state JSON keeps deserializing through
     /// `#[serde(default)]`.
@@ -517,7 +517,7 @@ mod tests {
         assert!(parsed.tags.is_empty());
         assert_eq!(parsed.expires_at, None);
         assert!(parsed.auto_resume);
-        // ADR-050 / plan 74 W2: readiness fields are absent on
+        // ADR-053 / plan 74 W2: readiness fields are absent on
         // legacy records and default to `None`. The host-side launch
         // path is what populates them on next start.
         assert_eq!(parsed.readiness, None);
@@ -533,7 +533,7 @@ mod tests {
 
     // ---------------- InstanceReadiness / BackpressureReason ----------------
     //
-    // ADR-050 / plan 74 W2. Lock the wire shape of every readiness
+    // ADR-053 / plan 74 W2. Lock the wire shape of every readiness
     // and backpressure variant — these become a JSON contract the
     // moment `mvmctl ls/status --json`, the SDK, and the supervisor
     // consume them, so a serde rename or variant tweak is a breaking

@@ -63,7 +63,7 @@ use super::readiness::record_vm_readiness;
 
 /// Cadence at which the foreground `mvmctl up` Ctrl+C wait loop
 /// re-polls integration health to detect `Active` → `Error`
-/// regressions (ADR-050 §3 / plan 74 W2 "Degraded follow-up"). Set
+/// regressions (ADR-053 §3 / plan 74 W2 "Degraded follow-up"). Set
 /// at 10 s — slow enough that the registry file isn't thrashed when
 /// services are stable, fast enough that an operator running
 /// `mvmctl ls --json` sees the new state within one breath of a
@@ -1097,7 +1097,7 @@ pub(in crate::commands) struct RunParams<'a> {
     /// generated VM id + the template's `build_mode` through to
     /// subsequent `proc start` / `fs write` / `down` calls.
     pub(super) up_json: bool,
-    /// Resolved services-health wait timeout for ADR-050 §3 / plan 74
+    /// Resolved services-health wait timeout for ADR-053 §3 / plan 74
     /// W2 (`InstanceReadiness::ServicesStarting` →
     /// `InstanceReadiness::ServicesReady`). Comes from
     /// `MvmConfig::effective_services_health_timeout_secs()` so an
@@ -1314,7 +1314,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
         // MVM_DIRECT_BOOT + `--hypervisor mock`.
         mvm_core::audit_emit!(VmStart, vm: &vm_name);
 
-        // ADR-050 §3 / plan 74 W2 (services-health): wait for the
+        // ADR-053 §3 / plan 74 W2 (services-health): wait for the
         // guest agent unconditionally, then poll integration health.
         // The wait was previously gated on `MVM_PORTS` because port
         // forwarding was the only existing reason to block here. The
@@ -1375,7 +1375,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
         ui::info(&format!("VM '{}' running. Press Ctrl+C to stop.", vm_name));
 
-        // Block until signaled. ADR-050 §3 / plan 74 W2 "Degraded
+        // Block until signaled. ADR-053 §3 / plan 74 W2 "Degraded
         // follow-up": every ~10 s while the foreground wait is
         // active, poll integration health and flip readiness to
         // `Degraded { unhealthy }` when an `Active` service flips to
@@ -1807,7 +1807,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
 
     // Apple Virtualization VMs live in-process — the process must stay alive.
     if effective_hypervisor == "apple-container" && !detach {
-        // ADR-050 §3 / plan 74 W2 (services-health): wait for the
+        // ADR-053 §3 / plan 74 W2 (services-health): wait for the
         // guest agent unconditionally (was previously gated on
         // `has_ports`), then poll integration health. Every Apple
         // Container up now records `AgentConnecting` / `AgentReady`
@@ -1892,7 +1892,7 @@ pub(super) fn cmd_run(params: RunParams<'_>) -> Result<()> {
             vm_name_owned
         ));
 
-        // Block until signaled (Ctrl+C or SIGTERM). ADR-050 §3 /
+        // Block until signaled (Ctrl+C or SIGTERM). ADR-053 §3 /
         // plan 74 W2 "Degraded follow-up": same periodic
         // integration-health poll as the direct-boot wait above —
         // every ~10 s, watch for `Active` → `Error` regressions and

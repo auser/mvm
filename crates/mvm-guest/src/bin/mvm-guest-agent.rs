@@ -1993,7 +1993,7 @@ fn handle_client(
     // SAFETY: fd comes from accept and is a valid file descriptor owned by this function.
     let mut file = unsafe { std::fs::File::from_raw_fd(fd) };
 
-    // ADR-050 / plan 74 W1 (hard cutover): every operational request
+    // ADR-053 / plan 74 W1 (hard cutover): every operational request
     // must be preceded by at least one successful protocol_hello in this
     // session. A non-hello first request is treated as a protocol
     // violation and rejected with `ProtocolMismatch`; we do not maintain
@@ -3160,7 +3160,7 @@ mod tests {
         handle.join().expect("handle_client thread");
     }
 
-    /// ADR-050 / plan 74 W1 hard-cutover regression: an operational
+    /// ADR-053 / plan 74 W1 hard-cutover regression: an operational
     /// request sent as the *first* request in a session (no prior
     /// `ProtocolHello`) must be rejected with `ProtocolMismatch`
     /// (`required_action: upgrade_host`) and the connection must be

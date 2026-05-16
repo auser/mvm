@@ -2,7 +2,7 @@
 //! inspector chain (Waves 2.1–2.5) into outbound HTTP traffic.
 //!
 //! Plan 37 §15 (Wave 2.6 / Phase 1). See
-//! `specs/plans/37-wave-2.6-l7-egress-proxy.md` for the full design.
+//! `specs/plans/79-wave-2.6-l7-egress-proxy.md` for the full design.
 //!
 //! ## Phase 1 scope (this module)
 //!
