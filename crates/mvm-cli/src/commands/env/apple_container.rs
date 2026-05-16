@@ -1291,10 +1291,11 @@ fn stage0_seed_doctor_status_at(
 ) -> Stage0SeedDoctorStatus {
     let any_candidate =
         find_local_fallback_image_with_workspace_root(workspace_root, |_| true).is_some();
-    let usable_seed_label = find_local_fallback_image_with_workspace_root(workspace_root, |rootfs| {
-        rootfs_contains_builder_init(rootfs).unwrap_or(false)
-    })
-    .map(|(_, _, label)| label);
+    let usable_seed_label =
+        find_local_fallback_image_with_workspace_root(workspace_root, |rootfs| {
+            rootfs_contains_builder_init(rootfs).unwrap_or(false)
+        })
+        .map(|(_, _, label)| label);
     let vendored_present = workspace_root.is_some_and(|root| {
         let dir = vendored_dev_image_dir_for(root, stage0_seed_arch());
         let kernel = dir.join("vmlinux");
@@ -1305,8 +1306,7 @@ fn stage0_seed_doctor_status_at(
     });
     let vendored_usable = vendored_present
         && workspace_root.is_some_and(|root| {
-            let rootfs = vendored_dev_image_dir_for(root, stage0_seed_arch())
-                .join("rootfs.ext4");
+            let rootfs = vendored_dev_image_dir_for(root, stage0_seed_arch()).join("rootfs.ext4");
             rootfs_contains_builder_init(&rootfs).unwrap_or(false)
         });
     Stage0SeedDoctorStatus {
@@ -4206,7 +4206,9 @@ mod dev_status_image_tests {
 
         // Empty workspace_root → still no candidate.
         let workspace = tmp.path().join("empty-workspace");
-        assert!(find_local_fallback_image_with_workspace_root(Some(&workspace), |_| true).is_none());
+        assert!(
+            find_local_fallback_image_with_workspace_root(Some(&workspace), |_| true).is_none()
+        );
     }
 
     #[cfg(feature = "builder-vm")]
@@ -4250,7 +4252,8 @@ mod dev_status_image_tests {
 
     #[cfg(feature = "builder-vm")]
     #[test]
-    fn stage0_seed_doctor_status_at_reports_present_but_unusable_when_vendored_lacks_builder_init() {
+    fn stage0_seed_doctor_status_at_reports_present_but_unusable_when_vendored_lacks_builder_init()
+    {
         let _lock = ENV_LOCK.lock().unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let _env = EnvGuard::set(
@@ -4330,7 +4333,10 @@ mod dev_status_image_tests {
         let (_, _, label) =
             find_local_fallback_image_with_workspace_root(Some(&workspace), |_| true)
                 .expect("at least one candidate");
-        assert_eq!(label, "current", "newer mtime wins among unfiltered candidates");
+        assert_eq!(
+            label, "current",
+            "newer mtime wins among unfiltered candidates"
+        );
     }
 }
 
