@@ -127,6 +127,10 @@ landed with regression tests; `cargo test --workspace` and
       `veritysetup format` with `--data-block-size=1024` and a pinned
       zero salt, emits `rootfs.{ext4,verity,roothash}`
       deterministically.
+      Follow-up #223 pins cryptsetup/veritysetup 2.8.6 by release
+      tarball hash in both the builder-VM OCI-pull path and the
+      Nix-built runtime-overlay baseline so nixpkgs bumps cannot
+      silently change sidecar bytes.
 - [x] **W3.2** Apple Container backend gained `VerityConfig` +
       `start_with_verity()`; opens the rootfs read-only, attaches
       the sidecar at `/dev/vdb`, attaches the verity initramfs via

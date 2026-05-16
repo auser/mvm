@@ -196,6 +196,24 @@
       overlayVerityHashAlgorithm = "sha256";
       overlayVerityHashBlockSize = 4096;
 
+      # ADR-050 / issue #223 — keep the Nix-built verity baseline on
+      # the exact same cryptsetup release as the builder VM's OCI-pull
+      # path. A nixpkgs bump must not silently change `veritysetup`
+      # output bytes; bump version + hash here and in
+      # `nix/images/builder-vm/flake.nix` together.
+      pinnedCryptsetupVersion = "2.8.6";
+      pinnedCryptsetupSrcHash = "sha256-gAQmX9mTiF0I97Yz2+BWhR3hohAwdhOk693HQ/zO/lo=";
+      pinnedCryptsetupFor = pkgs:
+        pkgs.cryptsetup.overrideAttrs (_old: {
+          version = pinnedCryptsetupVersion;
+          src = pkgs.fetchurl {
+            url =
+              "mirror://kernel/linux/utils/cryptsetup/v${pkgs.lib.versions.majorMinor pinnedCryptsetupVersion}/"
+              + "cryptsetup-${pinnedCryptsetupVersion}.tar.xz";
+            hash = pinnedCryptsetupSrcHash;
+          };
+        });
+
       # Target overlay size: 32 MiB. ADR-051 §"Open questions" pins
       # a hard cap of 32 MiB for the overlay budget; today's
       # contents fit in well under that, but using the cap as the
@@ -213,7 +231,7 @@
           {
             nativeBuildInputs = [
               pkgs.e2fsprogs
-              pkgs.cryptsetup # provides veritysetup
+              (pinnedCryptsetupFor pkgs) # provides pinned veritysetup
               pkgs.coreutils
             ];
             passthru = {
