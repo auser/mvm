@@ -29,7 +29,7 @@ Request types: `ping`, `status`, `sleep-prep`, `wake`, and more.
 
 ## Control plane and data plane
 
-Plan 74 / ADR-050 §4 splits the agent's wire surface into a
+Plan 74 / ADR-053 §4 splits the agent's wire surface into a
 **control plane** (small, single-frame, bounded requests/responses)
 and a **data plane** (streaming or chunked operations where the
 payload size is dominated by user content, not metadata). The
@@ -52,7 +52,7 @@ No streaming. No payload bytes from user processes.
 
 | Verb | Response shape | Notes |
 |---|---|---|
-| `ProtocolHello` | `ProtocolHelloAck` / `ProtocolMismatch` | Required first request in every session (ADR-050 §1, hard cutover). |
+| `ProtocolHello` | `ProtocolHelloAck` / `ProtocolMismatch` | Required first request in every session (ADR-053 §1, hard cutover). |
 | `Ping` | `Pong` | Reachability probe. Requires `Ping` capability. |
 | `WorkerStatus` | `WorkerStatus { status, last_busy_at }` | Idle/busy sampled from `/proc/loadavg`. |
 | `ReadinessStatus` | `ReadinessStatusReport` | Component-level readiness (see "Readiness model" below). |
@@ -88,7 +88,7 @@ and backpressure behavior below.
 ### Redaction invariant
 
 The following audit / readiness / progress / receipt surfaces are
-guaranteed by ADR-050 §4 / §5 to **never** contain data-plane
+guaranteed by ADR-053 §4 / §5 to **never** contain data-plane
 payload bytes. The list is the authoritative one:
 
 - `~/.mvm/audit/<tenant>.jsonl` chain-signed entries.

@@ -1151,7 +1151,7 @@ Plan approved 2026-05-04. Specs extracted:
 - `specs/adrs/007-function-call-entrypoints.md` (this repo)
 - `specs/plans/41-function-call-entrypoints.md` (this repo, impl
   tracker)
-- `specs/plans/41-function-entrypoints-design.md` (this file —
+- `specs/plans/81-function-entrypoints-design.md` (this file —
   comprehensive design rationale + 16 mitigations)
 - `/Users/auser/work/rust/mine/decorationer/specs/adrs/0009-function-entrypoints.md`
 - `/Users/auser/work/rust/mine/decorationer/specs/plans/0003-function-entrypoint-runtime.md`

@@ -215,7 +215,7 @@ because the v1 surface is functional without it.
 ## Followup G — Per-language base image registry beyond v1's closed list
 
 **Status: DESIGN LANDED on 2026-05-14; implementation phased as
-G.1–G.4 per ADR-048.**
+G.1–G.4 per ADR-052.**
 
 `mvm_sdk::runtime::resolve_base_image` ships a closed v1 list:
 `python-3.12`, `python-3.13`, `node-22`, `node-lts`, `minimal`.
@@ -223,11 +223,11 @@ The plan's "Well-known base-image trust" consideration calls for
 a `mvmctl image push <template>` flow that lets users register
 their own base templates (cosign-signed). The trust-model gap
 that previously blocked this followup is resolved by
-[ADR-048 — User-defined base image registry](../adrs/048-user-defined-base-image-registry.md),
+[ADR-052 — User-defined base image registry](../adrs/052-user-defined-base-image-registry.md),
 which proposes cosign-signing + an explicit
 `mvmctl image trust add` grant as the admission gate.
 
-ADR-048 slices the implementation into four phases that each ship
+ADR-052 slices the implementation into four phases that each ship
 as a separate followup PR:
 
 - **G.1** — registry directory + `mvmctl image list`/`rm`. No
@@ -240,7 +240,7 @@ as a separate followup PR:
   binding; closes Followup G.
 
 Phasing detail, threat model, manifest schema, CLI surface, and
-non-goals all live in ADR-048.
+non-goals all live in ADR-052.
 
 ## Followup H — Live + plan modes for `mvmctl run`
 

@@ -10,7 +10,7 @@ use anyhow::Result;
 
 use mvm::vsock_transport::{AppleContainerTransport, VsockTransport};
 
-/// Wait for the guest agent to complete the ADR-050 / plan 74 W1
+/// Wait for the guest agent to complete the ADR-053 / plan 74 W1
 /// protocol hello over vsock. Returns true once the agent has
 /// answered `ProtocolHelloAck` (with at least the `Ping` capability)
 /// within `timeout_secs`. A `ProtocolMismatch` answer, a transport

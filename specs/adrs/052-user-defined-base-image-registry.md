@@ -1,5 +1,5 @@
 ---
-title: "ADR-048: User-defined base image registry — cosign-signed templates beyond v1's closed list"
+title: "ADR-052: User-defined base image registry — cosign-signed templates beyond v1's closed list"
 status: Proposed
 date: 2026-05-14
 related: ADR-002 (microVM security posture); ADR-041 (signed audited ExecutionPlan); ADR-047 (app-deps audit pipeline); plan 73 Followup G

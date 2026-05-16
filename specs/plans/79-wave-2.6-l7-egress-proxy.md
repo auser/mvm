@@ -200,7 +200,7 @@ Wave 2.6.5 alongside MITM.
 - `crates/mvm-supervisor/src/l7_proxy.rs` — the proxy.
 - `crates/mvm-policy/src/policies.rs` — `EgressPolicy` extension fields.
 - `crates/mvm-supervisor/src/supervisor.rs` — `with_l7_egress` builder.
-- This file (`specs/plans/37-wave-2.6-l7-egress-proxy.md`).
+- This file (`specs/plans/79-wave-2.6-l7-egress-proxy.md`).
 - Test layers above.
 
 **Explicit non-goals for Phase 1:**

@@ -312,11 +312,11 @@ fn cmd_wait(name: &str, token: &str, timeout: Option<u64>) -> Result<()> {
             let _ = stderr.flush();
         }
         ProcWaitEvent::Backpressure { reason, detail } => {
-            // ADR-050 §5 / plan 74 W4: a streaming resource is
+            // ADR-053 §5 / plan 74 W4: a streaming resource is
             // throttled. Surface the typed reason + bounded detail
             // to stderr with a clearly-labeled prefix so the wait
             // continues without polluting the captured stdout the
-            // user is consuming. Per ADR-050, `detail` is
+            // user is consuming. Per ADR-053, `detail` is
             // metadata-only (byte counts, threshold, cap) —
             // payload bytes never appear here.
             let _ = writeln!(stderr, "[mvmctl-backpressure] {reason:?}: {detail}");

@@ -47,7 +47,7 @@ pub struct VmRegistration {
     /// W1 / A4.
     #[serde(default)]
     pub paused: bool,
-    /// Finer-grained host-observed readiness (ADR-050 §3 / plan 74
+    /// Finer-grained host-observed readiness (ADR-053 §3 / plan 74
     /// W2). Updated by `mvmctl up` as each launch milestone is
     /// reached (`LaunchAccepted` → `AgentConnecting` → `AgentReady`,
     /// with the rest of the taxonomy wiring in subsequent PRs).
@@ -160,7 +160,7 @@ impl VmNameRegistry {
         }
     }
 
-    /// Record a host-observed readiness milestone (ADR-050 §3 /
+    /// Record a host-observed readiness milestone (ADR-053 §3 /
     /// plan 74 W2). Returns `Ok(true)` if updated, `Ok(false)` if
     /// the name is unknown. Updates both `readiness` and
     /// `last_readiness_change_at` atomically; callers pass the
@@ -555,14 +555,14 @@ mod tests {
         assert!(r.tags.is_empty());
         assert!(r.expires_at.is_none());
         assert!(r.auto_resume);
-        // ADR-050 / plan 74 W2 readiness fields default cleanly on
+        // ADR-053 / plan 74 W2 readiness fields default cleanly on
         // legacy records that pre-date the field. mvm-cli `ls --json`
         // emits them as `null` on legacy rows.
         assert_eq!(r.readiness, None);
         assert_eq!(r.last_readiness_change_at, None);
     }
 
-    // -------- Readiness milestones (ADR-050 §3 / plan 74 W2) --------
+    // -------- Readiness milestones (ADR-053 §3 / plan 74 W2) --------
 
     #[test]
     fn set_readiness_returns_false_for_unknown_vm() {

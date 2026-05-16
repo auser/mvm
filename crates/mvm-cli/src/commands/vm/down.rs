@@ -26,7 +26,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     };
     match args.name.as_deref() {
         Some(n) => {
-            // ADR-050 §3 / plan 74 W2: persist the `Stopping`
+            // ADR-053 §3 / plan 74 W2: persist the `Stopping`
             // readiness milestone BEFORE the backend stop call so a
             // concurrent `mvmctl ls --json` running during the stop
             // window sees the in-flight state. On a successful stop

@@ -716,7 +716,7 @@ fn dispatch_run_code(
     let mut stream = transport
         .connect(mvm_guest::vsock::GUEST_AGENT_PORT)
         .with_context(|| format!("Connecting to guest agent on {:?}", record.vm_name))?;
-    // ADR-050 / plan 74 W1: hard cutover requires hello before any
+    // ADR-053 / plan 74 W1: hard cutover requires hello before any
     // operational request. `RunCode` is a dev-shell request not
     // covered by the closed `GuestCapability` enum, so request no
     // specific capability — the hello alone unblocks dispatch.

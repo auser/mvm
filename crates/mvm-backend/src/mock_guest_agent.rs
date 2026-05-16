@@ -204,7 +204,7 @@ fn handle_connection(mut stream: UnixStream, next_token: Arc<AtomicU64>) {
     }
 
     // Read length-prefixed JSON requests until the client closes the
-    // stream or an error occurs. ADR-050 / plan 74 W1 (hard cutover)
+    // stream or an error occurs. ADR-053 / plan 74 W1 (hard cutover)
     // changed the host-side helpers so a single session can issue
     // `ProtocolHello` then the operational request on the same
     // connection — a one-shot mock would close after the hello and
@@ -291,7 +291,7 @@ fn write_error(stream: &mut UnixStream, message: &str) -> Result<()> {
 /// in one place.
 fn dispatch(req: GuestRequest, next_token: &AtomicU64) -> GuestResponse {
     match req {
-        // ── Protocol negotiation (ADR-050 / plan 74 W1) ─────────────
+        // ── Protocol negotiation (ADR-053 / plan 74 W1) ─────────────
         // Hard cutover: every call site now hellos before the first
         // operational request. The mock answers with whatever the
         // real `protocol_hello_response` would produce so the host
@@ -309,7 +309,7 @@ fn dispatch(req: GuestRequest, next_token: &AtomicU64) -> GuestResponse {
             &requested_capabilities,
         ),
 
-        // ── Integration status (ADR-050 §3 / plan 74 W2) ────────────
+        // ── Integration status (ADR-053 §3 / plan 74 W2) ────────────
         // Mock VMs have no integrations to report. Returning an empty
         // list lets the host's services-ready poll transition straight
         // to `ServicesReady` rather than timing out on a "verb not

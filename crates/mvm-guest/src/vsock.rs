@@ -86,7 +86,7 @@ const CONNECT_RETRY_DELAY_MS: u64 = 500;
 #[serde(deny_unknown_fields)]
 pub enum GuestRequest {
     /// Negotiate guest-agent protocol compatibility and capabilities
-    /// before dispatching capability-dependent requests. ADR-050 /
+    /// before dispatching capability-dependent requests. ADR-053 /
     /// plan 74 W1.
     ProtocolHello {
         host_protocol_version: u32,
@@ -751,7 +751,7 @@ impl GuestRequest {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub enum GuestResponse {
-    /// Guest-agent protocol negotiation succeeded. ADR-050 / plan 74 W1.
+    /// Guest-agent protocol negotiation succeeded. ADR-053 / plan 74 W1.
     ProtocolHelloAck {
         agent_protocol_version: u32,
         min_supported_version: u32,
@@ -1146,7 +1146,7 @@ pub enum ProcWaitEvent {
         kind: ProcErrorKind,
         message: String,
     },
-    /// A streaming resource is throttled (ADR-050 §5 / plan 74 W4).
+    /// A streaming resource is throttled (ADR-053 §5 / plan 74 W4).
     /// **Non-terminal.** The agent emits this on the rising edge of
     /// a backpressure condition — typically the host-side stdout/
     /// stderr buffer crossing its high-water mark. The wait loop
@@ -1155,7 +1155,7 @@ pub enum ProcWaitEvent {
     ///
     /// `detail` is a bounded, redacted human-readable hint
     /// (operator-facing). It **never** carries argv, env, stdin,
-    /// stdout, stderr, or filesystem paths — see ADR-050's payload
+    /// stdout, stderr, or filesystem paths — see ADR-053's payload
     /// invariant.
     Backpressure {
         reason: mvm_core::domain::instance::BackpressureReason,
@@ -1962,7 +1962,7 @@ pub fn send_request(stream: &mut UnixStream, req: &GuestRequest) -> Result<Guest
 ///
 /// This helper is intentionally stream-level so it works with both the
 /// Firecracker UDS multiplexer path and Apple Container's direct vsock
-/// stream. Hard cutover (ADR-050 / plan 74 W1): every fresh session
+/// stream. Hard cutover (ADR-053 / plan 74 W1): every fresh session
 /// must call this before issuing any operational request, including a
 /// bare `Ping` reachability probe. Pre-hello guest agents receive
 /// `ProtocolMismatch` and the connection is closed; this helper
@@ -2375,7 +2375,7 @@ pub fn send_fs_request(instance_dir: &str, req: GuestRequest) -> Result<FsResult
 /// Used by the Apple Container backend where the vsock connection is
 /// established via `VZVirtioSocketDevice` rather than a UDS path.
 ///
-/// Performs the ADR-050 / plan 74 W1 hello prelude internally so
+/// Performs the ADR-053 / plan 74 W1 hello prelude internally so
 /// callers don't have to. `StartPortForward` is not a capability-gated
 /// operation, so an empty capability list is requested — the hello
 /// alone satisfies the agent's "no operational request before hello"
@@ -3084,7 +3084,7 @@ mod tests {
             }
             .is_terminal()
         );
-        // ADR-050 §5 / plan 74 W4: `Backpressure` is non-terminal.
+        // ADR-053 §5 / plan 74 W4: `Backpressure` is non-terminal.
         // The wait loop continues after the agent emits it.
         assert!(
             !ProcWaitEvent::Backpressure {
@@ -3096,7 +3096,7 @@ mod tests {
         );
     }
 
-    /// ADR-050 §5 / plan 74 W4: the `Backpressure` variant
+    /// ADR-053 §5 / plan 74 W4: the `Backpressure` variant
     /// roundtrips through serde with its full nested shape and
     /// `BackpressureReason` snake-case discriminant intact, and
     /// rejects unknown fields like every other host↔guest type.

@@ -60,7 +60,7 @@ use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use mvm_libkrun::{KrunContext, SupervisorConfig};
 use serde::Deserialize;
@@ -357,7 +357,7 @@ impl BuilderVm for LibkrunBuilderVm {
             vm_state_dir: path_to_str(&vm_state_dir, "vm_state_dir")?.to_string(),
             pid_file_name: Some("builder.pid".to_string()),
         };
-        let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg)?;
+        let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg, &vm_state_dir)?;
         if exit_code != 0 {
             return Err(BuilderVmError::NixBuildFailed(format!(
                 "supervisor exited with non-zero status ({exit_code}); \
@@ -463,20 +463,16 @@ fn ensure_builder_vm_image() -> Result<BuilderVmImage, BuilderVmError> {
         )));
     }
 
-    let cmdline = if cmdline_path.is_file() {
-        std::fs::read_to_string(&cmdline_path)
-            .map_err(|e| {
-                BuilderVmError::ExtractionFailed(format!("reading {}: {e}", cmdline_path.display()))
-            })?
-            .trim()
-            .to_string()
-    } else {
-        // Fallback — the cmdline the flake emits, verbatim from
-        // Plan 72 §W2. Missing cmdline.txt means an older image
-        // (pre-Plan 72 W2 finalisation); use the canonical
-        // default rather than refuse to boot.
-        "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-builder-init".to_string()
-    };
+    let cmdline = std::fs::read_to_string(&cmdline_path)
+        .map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "{} missing or unreadable ({e}). The builder VM cache is poisoned; delete {} and re-run `mvmctl dev up` to re-bootstrap.",
+                cmdline_path.display(),
+                arch_dir.display(),
+            ))
+        })?
+        .trim()
+        .to_string();
 
     Ok(BuilderVmImage {
         kernel_path,
@@ -651,6 +647,7 @@ if [ -z "$NIX_OUT" ]; then
     echo "nix build emitted no /nix/store output path" >&2
     exit 1
 fi
+printf '%s\n' "$NIX_OUT" > /job/store-path
 
 # Copy the artifacts the host expects into /out. We accept
 # either `vmlinux` (the canonical name our flakes use) or
@@ -724,17 +721,24 @@ fn finalize_flake_job(
     Ok(BuilderArtifacts::Image {
         rootfs_path,
         kernel_path,
-        // The Nix store path hash isn't trivially recoverable
-        // from inside the host here — `nix build` printed it
-        // to stdout inside the guest and the cmd.sh discards
-        // it after copy. Plan 72 W5 can plumb it through via
-        // a `/job/store-path` sidecar if cache-keying needs
-        // it; for now the artifact dir's own digest is the
-        // cache key the host carries.
-        revision_hash: job_id.to_string(),
+        revision_hash: read_revision_hash(job_dir).unwrap_or_else(|| job_id.to_string()),
         lock_hash: None,
         accessible: None,
     })
+}
+
+/// Read `/job/store-path` and extract the leading Nix store hash
+/// from `/nix/store/<hash>-<name>`. Older guest images may not
+/// write the sidecar; those callers fall back to the unique job id.
+fn read_revision_hash(job_dir: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(job_dir.join("store-path")).ok()?;
+    extract_nix_store_hash(body.trim()).map(str::to_string)
+}
+
+fn extract_nix_store_hash(store_path: &str) -> Option<&str> {
+    let name = store_path.strip_prefix("/nix/store/")?;
+    let (hash, _rest) = name.split_once('-')?;
+    if hash.is_empty() { None } else { Some(hash) }
 }
 
 /// Finalize an install job (Plan 73 Followup B.2): validate the
@@ -880,6 +884,7 @@ fn resolve_supervisor_path() -> Result<PathBuf, BuilderVmError> {
 fn spawn_supervisor_and_wait(
     supervisor_path: &Path,
     cfg: &SupervisorConfig,
+    vm_state_dir: &Path,
 ) -> Result<i32, BuilderVmError> {
     let json = serde_json::to_string(cfg).map_err(|e| {
         BuilderVmError::ExtractionFailed(format!("serialize SupervisorConfig: {e}"))
@@ -909,6 +914,7 @@ fn spawn_supervisor_and_wait(
             ))
         })?;
 
+    let timeout = builder_vm_timeout()?;
     // Plan 77 W6 — concurrent kernel-panic detector. The libkrun
     // supervisor blocks in `krun_start_enter` until the VM cleanly
     // exits; a kernel panic at PID 1 doesn't trigger a clean exit, so
@@ -918,10 +924,11 @@ fn spawn_supervisor_and_wait(
     // (callers that opted out of console capture), behavior is
     // unchanged — plain wait, plain exit code.
     let console_log = cfg.krun.console_output_path.as_deref().map(PathBuf::from);
-    match wait_with_panic_detector(
+    match wait_with_panic_detector_until(
         &mut child,
         console_log.as_deref(),
         DEFAULT_PANIC_POLL_INTERVAL,
+        Some(timeout),
     ) {
         Ok(WaitOutcome::Clean(code)) => Ok(code),
         Ok(WaitOutcome::KernelPanic {
@@ -931,6 +938,11 @@ fn spawn_supervisor_and_wait(
             panic_line,
             console_log_path,
         }),
+        Ok(WaitOutcome::Timeout) => Err(BuilderVmError::NixBuildFailed(format!(
+            "builder VM exceeded {} seconds wall-clock; killed. Console log at {}/console.log.",
+            timeout.as_secs(),
+            vm_state_dir.display(),
+        ))),
         Err(e) => Err(BuilderVmError::ExtractionFailed(format!(
             "wait on supervisor child: {e}"
         ))),
@@ -948,6 +960,7 @@ enum WaitOutcome {
         panic_line: String,
         console_log_path: String,
     },
+    Timeout,
 }
 
 /// Poll interval for the panic-detector watcher in production. Keeping
@@ -975,24 +988,32 @@ const DEFAULT_PANIC_POLL_INTERVAL: Duration = Duration::from_millis(100);
 /// main thread inside `exit()` — SIGKILL is the only reliable
 /// signal, which matches the gotcha documented in
 /// `reference_libkrun_gotchas.md`).
+#[cfg(test)]
 fn wait_with_panic_detector(
     child: &mut Child,
     console_log: Option<&Path>,
     poll_interval: Duration,
 ) -> std::io::Result<WaitOutcome> {
-    let Some(console_log) = console_log else {
-        let status = child.wait()?;
-        return Ok(WaitOutcome::Clean(status.code().unwrap_or(-1)));
-    };
+    wait_with_panic_detector_until(child, console_log, poll_interval, None)
+}
+
+fn wait_with_panic_detector_until(
+    child: &mut Child,
+    console_log: Option<&Path>,
+    poll_interval: Duration,
+    timeout: Option<Duration>,
+) -> std::io::Result<WaitOutcome> {
+    let deadline = timeout.map(|duration| Instant::now() + duration);
 
     let panic_line: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
     let stop = Arc::new(AtomicBool::new(false));
-
-    let watcher_panic = Arc::clone(&panic_line);
-    let watcher_stop = Arc::clone(&stop);
-    let watcher_path = console_log.to_path_buf();
-    let watcher = std::thread::spawn(move || {
-        panic_watcher(&watcher_path, &watcher_panic, &watcher_stop, poll_interval);
+    let watcher = console_log.map(|console_log| {
+        let watcher_panic = Arc::clone(&panic_line);
+        let watcher_stop = Arc::clone(&stop);
+        let watcher_path = console_log.to_path_buf();
+        std::thread::spawn(move || {
+            panic_watcher(&watcher_path, &watcher_panic, &watcher_stop, poll_interval);
+        })
     });
 
     let wait_result = loop {
@@ -1001,7 +1022,11 @@ fn wait_with_panic_detector(
             Ok(None) => {}
             Err(e) => break Err(e),
         }
-        if panic_line.lock().unwrap().is_some() {
+        if panic_line
+            .lock()
+            .expect("panic detector state lock poisoned")
+            .is_some()
+        {
             // Best-effort kill; the supervisor is wedged inside
             // libkrun's `start_enter` so SIGKILL is the only reliable
             // signal. If the kill itself fails (already exited, etc.),
@@ -1012,7 +1037,20 @@ fn wait_with_panic_detector(
                 Err(e) => break Err(e),
             }
         }
-        std::thread::sleep(poll_interval);
+        if deadline.is_some_and(|deadline| Instant::now() >= deadline) {
+            let _ = child.kill();
+            let _ = child.wait();
+            stop.store(true, Ordering::SeqCst);
+            if let Some(watcher) = watcher {
+                let _ = watcher.join();
+            }
+            return Ok(WaitOutcome::Timeout);
+        }
+        let sleep = deadline
+            .map(|deadline| deadline.saturating_duration_since(Instant::now()))
+            .map(|remaining| remaining.min(poll_interval))
+            .unwrap_or(poll_interval);
+        std::thread::sleep(sleep);
     };
 
     // Signal the watcher to exit and join it. Even on `Err` paths we
@@ -1020,14 +1058,22 @@ fn wait_with_panic_detector(
     // function with a live `&Path` to a tempdir the caller is about
     // to drop.
     stop.store(true, Ordering::SeqCst);
-    let _ = watcher.join();
+    if let Some(watcher) = watcher {
+        let _ = watcher.join();
+    }
 
     let status = wait_result?;
-    let captured = panic_line.lock().unwrap().take();
+    let captured = panic_line
+        .lock()
+        .expect("panic detector state lock poisoned")
+        .take();
     match captured {
         Some(line) => Ok(WaitOutcome::KernelPanic {
             panic_line: line,
-            console_log_path: console_log.display().to_string(),
+            console_log_path: console_log
+                .expect("panic line can only be captured when console log exists")
+                .display()
+                .to_string(),
         }),
         None => Ok(WaitOutcome::Clean(status.code().unwrap_or(-1))),
     }
@@ -1128,6 +1174,24 @@ fn find_panic_line_in(buf: &[u8]) -> Option<String> {
     Some(line)
 }
 
+fn builder_vm_timeout() -> Result<Duration, BuilderVmError> {
+    let Some(raw) = std::env::var_os("MVM_BUILDER_VM_TIMEOUT_SECS") else {
+        return Ok(Duration::from_secs(30 * 60));
+    };
+    let raw = raw.to_string_lossy();
+    let secs = raw.parse::<u64>().map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!(
+            "MVM_BUILDER_VM_TIMEOUT_SECS must be an integer number of seconds, got {raw:?}: {e}"
+        ))
+    })?;
+    if secs == 0 {
+        return Err(BuilderVmError::ExtractionFailed(
+            "MVM_BUILDER_VM_TIMEOUT_SECS must be greater than zero".to_string(),
+        ));
+    }
+    Ok(Duration::from_secs(secs))
+}
+
 /// Render a Path as a `&str` or surface a clear error if it
 /// contains non-UTF-8 bytes. libkrun's C API takes
 /// `*const c_char`; rejecting non-UTF-8 here pins the failure
@@ -1142,7 +1206,10 @@ fn path_to_str<'a>(p: &'a Path, field: &str) -> Result<&'a str, BuilderVmError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
     use tempfile::TempDir;
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn ok_mounts(scratch: &TempDir) -> BuilderMounts {
         let flake = scratch.path().join("flake");
@@ -1498,6 +1565,7 @@ mod tests {
         assert!(cmd.starts_with("#!/bin/sh"));
         assert!(cmd.contains("set -eu"));
         assert!(cmd.contains("cd /work"));
+        assert!(cmd.contains("printf '%s\\n' \"$NIX_OUT\" > /job/store-path"));
     }
 
     #[test]
@@ -1547,7 +1615,69 @@ mod tests {
     }
 
     #[test]
+    fn extract_nix_store_hash_parses_output_path() {
+        assert_eq!(
+            extract_nix_store_hash("/nix/store/abc123def4567890-tenant-rootfs"),
+            Some("abc123def4567890")
+        );
+        assert_eq!(extract_nix_store_hash("/tmp/not-store"), None);
+        assert_eq!(extract_nix_store_hash("/nix/store/-missing-hash"), None);
+    }
+
+    #[test]
+    fn finalize_flake_job_uses_store_path_hash_when_present() {
+        let scratch = TempDir::new().unwrap();
+        let job_dir = scratch.path().join("job");
+        let artifact_out = scratch.path().join("out");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::create_dir_all(&artifact_out).unwrap();
+        std::fs::write(
+            job_dir.join("result"),
+            r#"{"exit_code":0,"stderr_tail":""}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            job_dir.join("store-path"),
+            "/nix/store/deadbeefcafebabe-builder-vm\n",
+        )
+        .unwrap();
+        std::fs::write(artifact_out.join("rootfs.ext4"), b"rootfs").unwrap();
+
+        let artifacts = finalize_flake_job(&job_dir, &artifact_out, "fallback-job-id").unwrap();
+        match artifacts {
+            BuilderArtifacts::Image { revision_hash, .. } => {
+                assert_eq!(revision_hash, "deadbeefcafebabe");
+            }
+            other => panic!("wrong artifact variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_flake_job_falls_back_to_job_id_without_store_path() {
+        let scratch = TempDir::new().unwrap();
+        let job_dir = scratch.path().join("job");
+        let artifact_out = scratch.path().join("out");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::create_dir_all(&artifact_out).unwrap();
+        std::fs::write(
+            job_dir.join("result"),
+            r#"{"exit_code":0,"stderr_tail":""}"#,
+        )
+        .unwrap();
+        std::fs::write(artifact_out.join("rootfs.ext4"), b"rootfs").unwrap();
+
+        let artifacts = finalize_flake_job(&job_dir, &artifact_out, "fallback-job-id").unwrap();
+        match artifacts {
+            BuilderArtifacts::Image { revision_hash, .. } => {
+                assert_eq!(revision_hash, "fallback-job-id");
+            }
+            other => panic!("wrong artifact variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn ensure_nix_store_image_creates_sparse_file_once() {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Sparse file allocates the logical size but consumes
         // ~no disk blocks. `set_len` is what asks the FS to
         // record the size. Subsequent calls find the existing
@@ -1573,6 +1703,61 @@ mod tests {
             match old {
                 Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
                 None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_builder_vm_image_requires_cmdline_txt() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let scratch = TempDir::new().unwrap();
+        let old = std::env::var("XDG_CACHE_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", scratch.path());
+        }
+
+        let arch_dir = scratch
+            .path()
+            .join("mvm")
+            .join("builder-vm")
+            .join(host_arch_tag());
+        std::fs::create_dir_all(&arch_dir).unwrap();
+        std::fs::write(arch_dir.join("vmlinux"), b"kernel").unwrap();
+        std::fs::write(arch_dir.join("rootfs.ext4"), b"rootfs").unwrap();
+
+        let err = ensure_builder_vm_image().unwrap_err();
+        assert!(
+            format!("{err}").contains("cmdline.txt missing or unreadable"),
+            "got {err}"
+        );
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn builder_vm_timeout_defaults_and_rejects_zero() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let old = std::env::var("MVM_BUILDER_VM_TIMEOUT_SECS").ok();
+        unsafe {
+            std::env::remove_var("MVM_BUILDER_VM_TIMEOUT_SECS");
+        }
+        assert_eq!(builder_vm_timeout().unwrap(), Duration::from_secs(30 * 60));
+
+        unsafe {
+            std::env::set_var("MVM_BUILDER_VM_TIMEOUT_SECS", "0");
+        }
+        let err = builder_vm_timeout().unwrap_err();
+        assert!(format!("{err}").contains("greater than zero"), "got {err}");
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("MVM_BUILDER_VM_TIMEOUT_SECS", v),
+                None => std::env::remove_var("MVM_BUILDER_VM_TIMEOUT_SECS"),
             }
         }
     }
