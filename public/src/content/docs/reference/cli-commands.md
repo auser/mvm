@@ -466,6 +466,7 @@ All commands accept these global options:
 | `MVM_BUILDER_AGENT_BIN` | Override the path to the builder-agent binary baked into the builder VM image | Auto-detected from build closure |
 | `MVM_BUILDER_AGENT_PORT` | Vsock port the builder agent listens on | `54_321` |
 | `MVM_BUILDER_AUTHORIZED_KEY` | SSH public key authorized to drive the builder VM via SSH transport (vs vsock) | Unset |
+| `MVM_BUILDER_VM_TIMEOUT_SECS` | Wall-clock cap for one-shot libkrun builder VM runs before the supervisor is killed | `1800` |
 | `MVM_MCP_SESSION_IDLE` | MCP session idle timeout in seconds | `300` |
 | `MVM_MCP_SESSION_MAX` | MCP session maximum lifetime in seconds | `1800` |
 | `MVM_MCP_MAX_INFLIGHT` | Max concurrent in-flight `tools/call run` invocations | `8` |

@@ -63,6 +63,7 @@ Recent maintenance:
 - [x] Added builder-cache readiness to `mvmctl dev status`; it reports source/release cache readiness and safe reason codes without rebuilding or printing local paths, raw artifact digests, or artifact contents.
 - [x] Added `mvmctl dev cache inspect` with `--json`; it reports sanitized dev-image presence plus source/release builder-cache readiness without rebuilding, booting, or printing local paths, raw artifact digests, or artifact contents.
 - [x] Plan 77 W4: gated `download_builder_vm_image` and its helpers behind the off-by-default `release-artifact-bootstrap` feature so contributor builds cannot reach the published-prebuilt path at compile time, with `perform_builder_vm_download_published_bails_without_feature` locking the structural-failure shape into the test suite.
+- [x] Hardened builder-VM reliability follow-ups from GitHub triage: Stage 0 seed selection now skips cached dev rootfs images that lack `/sbin/mvm-builder-init`, source-built builder VM artifacts must contain that init before promotion, cached builder images fail fast when `cmdline.txt` is missing, libkrun supervisor waits have a bounded `MVM_BUILDER_VM_TIMEOUT_SECS` escape hatch, and flake builds now carry the Nix store-path hash through `/job/store-path` for stable `revision_hash` reuse.
 
 ## In-flight workstreams
 

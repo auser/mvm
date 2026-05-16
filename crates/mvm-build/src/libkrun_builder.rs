@@ -58,6 +58,7 @@
 use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
+use std::time::{Duration, Instant};
 
 use mvm_libkrun::{KrunContext, SupervisorConfig};
 use serde::Deserialize;
@@ -354,7 +355,7 @@ impl BuilderVm for LibkrunBuilderVm {
             vm_state_dir: path_to_str(&vm_state_dir, "vm_state_dir")?.to_string(),
             pid_file_name: Some("builder.pid".to_string()),
         };
-        let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg)?;
+        let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg, &vm_state_dir)?;
         if exit_code != 0 {
             return Err(BuilderVmError::NixBuildFailed(format!(
                 "supervisor exited with non-zero status ({exit_code}); \
@@ -460,20 +461,16 @@ fn ensure_builder_vm_image() -> Result<BuilderVmImage, BuilderVmError> {
         )));
     }
 
-    let cmdline = if cmdline_path.is_file() {
-        std::fs::read_to_string(&cmdline_path)
-            .map_err(|e| {
-                BuilderVmError::ExtractionFailed(format!("reading {}: {e}", cmdline_path.display()))
-            })?
-            .trim()
-            .to_string()
-    } else {
-        // Fallback — the cmdline the flake emits, verbatim from
-        // Plan 72 §W2. Missing cmdline.txt means an older image
-        // (pre-Plan 72 W2 finalisation); use the canonical
-        // default rather than refuse to boot.
-        "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-builder-init".to_string()
-    };
+    let cmdline = std::fs::read_to_string(&cmdline_path)
+        .map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "{} missing or unreadable ({e}). The builder VM cache is poisoned; delete {} and re-run `mvmctl dev up` to re-bootstrap.",
+                cmdline_path.display(),
+                arch_dir.display(),
+            ))
+        })?
+        .trim()
+        .to_string();
 
     Ok(BuilderVmImage {
         kernel_path,
@@ -648,6 +645,7 @@ if [ -z "$NIX_OUT" ]; then
     echo "nix build emitted no /nix/store output path" >&2
     exit 1
 fi
+printf '%s\n' "$NIX_OUT" > /job/store-path
 
 # Copy the artifacts the host expects into /out. We accept
 # either `vmlinux` (the canonical name our flakes use) or
@@ -721,17 +719,24 @@ fn finalize_flake_job(
     Ok(BuilderArtifacts::Image {
         rootfs_path,
         kernel_path,
-        // The Nix store path hash isn't trivially recoverable
-        // from inside the host here — `nix build` printed it
-        // to stdout inside the guest and the cmd.sh discards
-        // it after copy. Plan 72 W5 can plumb it through via
-        // a `/job/store-path` sidecar if cache-keying needs
-        // it; for now the artifact dir's own digest is the
-        // cache key the host carries.
-        revision_hash: job_id.to_string(),
+        revision_hash: read_revision_hash(job_dir).unwrap_or_else(|| job_id.to_string()),
         lock_hash: None,
         accessible: None,
     })
+}
+
+/// Read `/job/store-path` and extract the leading Nix store hash
+/// from `/nix/store/<hash>-<name>`. Older guest images may not
+/// write the sidecar; those callers fall back to the unique job id.
+fn read_revision_hash(job_dir: &Path) -> Option<String> {
+    let body = std::fs::read_to_string(job_dir.join("store-path")).ok()?;
+    extract_nix_store_hash(body.trim()).map(str::to_string)
+}
+
+fn extract_nix_store_hash(store_path: &str) -> Option<&str> {
+    let name = store_path.strip_prefix("/nix/store/")?;
+    let (hash, _rest) = name.split_once('-')?;
+    if hash.is_empty() { None } else { Some(hash) }
 }
 
 /// Finalize an install job (Plan 73 Followup B.2): validate the
@@ -877,6 +882,7 @@ fn resolve_supervisor_path() -> Result<PathBuf, BuilderVmError> {
 fn spawn_supervisor_and_wait(
     supervisor_path: &Path,
     cfg: &SupervisorConfig,
+    vm_state_dir: &Path,
 ) -> Result<i32, BuilderVmError> {
     let json = serde_json::to_string(cfg).map_err(|e| {
         BuilderVmError::ExtractionFailed(format!("serialize SupervisorConfig: {e}"))
@@ -906,10 +912,48 @@ fn spawn_supervisor_and_wait(
             ))
         })?;
 
-    let status = child
-        .wait()
-        .map_err(|e| BuilderVmError::ExtractionFailed(format!("wait on supervisor child: {e}")))?;
+    let timeout = builder_vm_timeout()?;
+    let deadline = Instant::now() + timeout;
+    let status = loop {
+        match child
+            .try_wait()
+            .map_err(|e| BuilderVmError::ExtractionFailed(format!("poll supervisor child: {e}")))?
+        {
+            Some(status) => break status,
+            None if Instant::now() >= deadline => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(BuilderVmError::NixBuildFailed(format!(
+                    "builder VM exceeded {} seconds wall-clock; killed. Console log at {}/console.log.",
+                    timeout.as_secs(),
+                    vm_state_dir.display(),
+                )));
+            }
+            None => {
+                let remaining = deadline.saturating_duration_since(Instant::now());
+                std::thread::sleep(remaining.min(Duration::from_secs(5)));
+            }
+        }
+    };
     Ok(status.code().unwrap_or(-1))
+}
+
+fn builder_vm_timeout() -> Result<Duration, BuilderVmError> {
+    let Some(raw) = std::env::var_os("MVM_BUILDER_VM_TIMEOUT_SECS") else {
+        return Ok(Duration::from_secs(30 * 60));
+    };
+    let raw = raw.to_string_lossy();
+    let secs = raw.parse::<u64>().map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!(
+            "MVM_BUILDER_VM_TIMEOUT_SECS must be an integer number of seconds, got {raw:?}: {e}"
+        ))
+    })?;
+    if secs == 0 {
+        return Err(BuilderVmError::ExtractionFailed(
+            "MVM_BUILDER_VM_TIMEOUT_SECS must be greater than zero".to_string(),
+        ));
+    }
+    Ok(Duration::from_secs(secs))
 }
 
 /// Render a Path as a `&str` or surface a clear error if it
@@ -926,7 +970,10 @@ fn path_to_str<'a>(p: &'a Path, field: &str) -> Result<&'a str, BuilderVmError> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{LazyLock, Mutex};
     use tempfile::TempDir;
+
+    static ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
 
     fn ok_mounts(scratch: &TempDir) -> BuilderMounts {
         let flake = scratch.path().join("flake");
@@ -1282,6 +1329,7 @@ mod tests {
         assert!(cmd.starts_with("#!/bin/sh"));
         assert!(cmd.contains("set -eu"));
         assert!(cmd.contains("cd /work"));
+        assert!(cmd.contains("printf '%s\\n' \"$NIX_OUT\" > /job/store-path"));
     }
 
     #[test]
@@ -1331,7 +1379,69 @@ mod tests {
     }
 
     #[test]
+    fn extract_nix_store_hash_parses_output_path() {
+        assert_eq!(
+            extract_nix_store_hash("/nix/store/abc123def4567890-tenant-rootfs"),
+            Some("abc123def4567890")
+        );
+        assert_eq!(extract_nix_store_hash("/tmp/not-store"), None);
+        assert_eq!(extract_nix_store_hash("/nix/store/-missing-hash"), None);
+    }
+
+    #[test]
+    fn finalize_flake_job_uses_store_path_hash_when_present() {
+        let scratch = TempDir::new().unwrap();
+        let job_dir = scratch.path().join("job");
+        let artifact_out = scratch.path().join("out");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::create_dir_all(&artifact_out).unwrap();
+        std::fs::write(
+            job_dir.join("result"),
+            r#"{"exit_code":0,"stderr_tail":""}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            job_dir.join("store-path"),
+            "/nix/store/deadbeefcafebabe-builder-vm\n",
+        )
+        .unwrap();
+        std::fs::write(artifact_out.join("rootfs.ext4"), b"rootfs").unwrap();
+
+        let artifacts = finalize_flake_job(&job_dir, &artifact_out, "fallback-job-id").unwrap();
+        match artifacts {
+            BuilderArtifacts::Image { revision_hash, .. } => {
+                assert_eq!(revision_hash, "deadbeefcafebabe");
+            }
+            other => panic!("wrong artifact variant: {other:?}"),
+        }
+    }
+
+    #[test]
+    fn finalize_flake_job_falls_back_to_job_id_without_store_path() {
+        let scratch = TempDir::new().unwrap();
+        let job_dir = scratch.path().join("job");
+        let artifact_out = scratch.path().join("out");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::create_dir_all(&artifact_out).unwrap();
+        std::fs::write(
+            job_dir.join("result"),
+            r#"{"exit_code":0,"stderr_tail":""}"#,
+        )
+        .unwrap();
+        std::fs::write(artifact_out.join("rootfs.ext4"), b"rootfs").unwrap();
+
+        let artifacts = finalize_flake_job(&job_dir, &artifact_out, "fallback-job-id").unwrap();
+        match artifacts {
+            BuilderArtifacts::Image { revision_hash, .. } => {
+                assert_eq!(revision_hash, "fallback-job-id");
+            }
+            other => panic!("wrong artifact variant: {other:?}"),
+        }
+    }
+
+    #[test]
     fn ensure_nix_store_image_creates_sparse_file_once() {
+        let _lock = ENV_LOCK.lock().unwrap();
         // Sparse file allocates the logical size but consumes
         // ~no disk blocks. `set_len` is what asks the FS to
         // record the size. Subsequent calls find the existing
@@ -1357,6 +1467,61 @@ mod tests {
             match old {
                 Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
                 None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn ensure_builder_vm_image_requires_cmdline_txt() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let scratch = TempDir::new().unwrap();
+        let old = std::env::var("XDG_CACHE_HOME").ok();
+        unsafe {
+            std::env::set_var("XDG_CACHE_HOME", scratch.path());
+        }
+
+        let arch_dir = scratch
+            .path()
+            .join("mvm")
+            .join("builder-vm")
+            .join(host_arch_tag());
+        std::fs::create_dir_all(&arch_dir).unwrap();
+        std::fs::write(arch_dir.join("vmlinux"), b"kernel").unwrap();
+        std::fs::write(arch_dir.join("rootfs.ext4"), b"rootfs").unwrap();
+
+        let err = ensure_builder_vm_image().unwrap_err();
+        assert!(
+            format!("{err}").contains("cmdline.txt missing or unreadable"),
+            "got {err}"
+        );
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
+                None => std::env::remove_var("XDG_CACHE_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn builder_vm_timeout_defaults_and_rejects_zero() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let old = std::env::var("MVM_BUILDER_VM_TIMEOUT_SECS").ok();
+        unsafe {
+            std::env::remove_var("MVM_BUILDER_VM_TIMEOUT_SECS");
+        }
+        assert_eq!(builder_vm_timeout().unwrap(), Duration::from_secs(30 * 60));
+
+        unsafe {
+            std::env::set_var("MVM_BUILDER_VM_TIMEOUT_SECS", "0");
+        }
+        let err = builder_vm_timeout().unwrap_err();
+        assert!(format!("{err}").contains("greater than zero"), "got {err}");
+
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var("MVM_BUILDER_VM_TIMEOUT_SECS", v),
+                None => std::env::remove_var("MVM_BUILDER_VM_TIMEOUT_SECS"),
             }
         }
     }
