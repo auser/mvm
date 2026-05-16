@@ -91,6 +91,17 @@ impl VmBackend for AppleContainerBackend {
             );
         }
 
+        // Plan 74 W2 / ADR-051 admission gate — refuse pre-W1.4b
+        // rootfs that lack the `/mvm/runtime` mount point. Runs
+        // before the CoW clone so a refusal exits clean (no
+        // per-instance disk written, no half-formed VM state).
+        // Sidecar lives next to the *source* rootfs.
+        let original_rootfs = std::path::Path::new(&config.rootfs_path);
+        let original_dir = original_rootfs
+            .parent()
+            .unwrap_or_else(|| std::path::Path::new("."));
+        mvm_build::builder_vm::admit_overlay_aware(original_dir)?;
+
         // Plan 53 Plan D: clone the rootfs to a per-instance path so
         // each running VM owns its disk image. Apple VZ refuses to
         // attach the same writable disk to two VMs concurrently; the
@@ -103,7 +114,6 @@ impl VmBackend for AppleContainerBackend {
         // per-instance clone is a CoW copy under a different name; the
         // sidecar lives next to the source). Populates the
         // accessible/sealed flag for `mvmctl console`'s gate.
-        let original_rootfs = std::path::Path::new(&config.rootfs_path);
         mvm_base::runtime_meta::record_from_rootfs(
             &config.name,
             StartMode::Detached,

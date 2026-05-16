@@ -209,6 +209,19 @@ pub struct ArtifactSidecar {
     pub rootless_entrypoint: bool,
     /// Active hypervisor declaration.
     pub hypervisor: String,
+    /// Plan 74 W2 / ADR-051 — whether the rootfs carries the
+    /// `/mvm/runtime` bind-mount target and a mkGuest `/init` that
+    /// prefers the overlay-resident agent/seccomp-apply/netinit.
+    ///
+    /// Set by mkGuest's `passthru.mvm.overlayAware = true` since
+    /// W1.4b.3c. Sidecars written *before* the field existed
+    /// deserialize as `false` (via `serde(default)`), which the
+    /// [`admit_overlay_aware`] gate refuses — pre-W1.4b cached
+    /// templates have no `/mvm/runtime` mount point, so attaching
+    /// the overlay disk to them would either fail or silently
+    /// degrade.
+    #[serde(default)]
+    pub overlay_aware: bool,
 }
 
 impl ArtifactSidecar {
@@ -229,6 +242,13 @@ impl ArtifactSidecar {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
         std::fs::write(&path, format!("{body}\n"))?;
         Ok(path)
+    }
+
+    /// Whether the rootfs is overlay-aware (carries `/mvm/runtime` +
+    /// uses mkGuest's overlay-preferring `/init`). Plan 74 W2
+    /// admission gate consults this; see [`admit_overlay_aware`].
+    pub fn is_overlay_aware(&self) -> bool {
+        self.overlay_aware
     }
 
     /// Read the sidecar from a directory. Returns `Ok(None)` if the
@@ -403,6 +423,52 @@ pub fn emit_sidecar_via_passthru_query(
     }
 }
 
+/// Plan 74 W2 / ADR-051 admission gate — refuse to start a VM whose
+/// rootfs is not overlay-aware.
+///
+/// Reads `mvm-meta.json` from `rootfs_dir` and inspects
+/// `overlay_aware`. The rootfs is overlay-aware when the sidecar
+/// exists and reports `overlay_aware: true`. Anything else fails:
+///
+/// - **Sidecar missing** → refuse. Either the build pipeline that
+///   produced the rootfs predates the sidecar emit (W6.2), or the
+///   sidecar was deleted out from under us. Either way, attaching
+///   a runtime overlay to an unknown rootfs is unsafe.
+/// - **Sidecar present, `overlay_aware: false`** → refuse. This is
+///   the pre-W1.4b cached-template case: the rootfs has no
+///   `/mvm/runtime` mount point, so the overlay disk has nowhere
+///   to land. mkGuest's `/init` would either fail or silently
+///   degrade to the baked-in agent path.
+/// - **Sidecar malformed** → propagate. Same posture as
+///   [`ArtifactSidecar::read_from_dir`].
+///
+/// The error message is wordy on purpose: an operator hitting this
+/// gate needs the recovery path (rebuild with current mkGuest, or
+/// drop the cached template) in one glance.
+pub fn admit_overlay_aware(rootfs_dir: &Path) -> Result<(), anyhow::Error> {
+    let sidecar = ArtifactSidecar::read_from_dir(rootfs_dir)?;
+    match sidecar {
+        None => Err(anyhow::anyhow!(
+            "refusing to start VM: rootfs at {} has no `mvm-meta.json` sidecar. \
+             The build pipeline that produced this rootfs predates the W6.2 \
+             sidecar emit, which means it also predates W1.4b runtime overlay \
+             (no `/mvm/runtime` mount point in the rootfs). Rebuild the image \
+             with current mkGuest, or drop the cached template.",
+            rootfs_dir.display()
+        )),
+        Some(s) if !s.is_overlay_aware() => Err(anyhow::anyhow!(
+            "refusing to start VM: rootfs at {} has `overlay_aware: false` \
+             in its `mvm-meta.json` sidecar. Pre-W1.4b cached templates have \
+             no `/mvm/runtime` mount point; attaching the runtime overlay disk \
+             to them would either fail or silently degrade to the baked-in \
+             agent. Rebuild the image with current mkGuest \
+             (`passthru.mvm.overlayAware = true`).",
+            rootfs_dir.display()
+        )),
+        Some(_) => Ok(()),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -488,6 +554,7 @@ mod tests {
             agent_binary: "stub".to_string(),
             rootless_entrypoint: false,
             hypervisor: "libkrun".to_string(),
+            overlay_aware: true,
         }
     }
 
@@ -517,6 +584,93 @@ mod tests {
             .expect("write malformed");
         let result = ArtifactSidecar::read_from_dir(tmp.path());
         assert!(result.is_err(), "malformed sidecar should error");
+    }
+
+    #[test]
+    fn sidecar_overlay_aware_round_trips_camel_case() {
+        // Field maps to `overlayAware` on disk (matches the
+        // `passthru.mvm.overlayAware` Nix key one-to-one) so a
+        // future `nix eval --json passthru.mvm` lands straight
+        // into the struct.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fixture_sidecar().write_to_dir(tmp.path()).expect("write");
+        let body = std::fs::read_to_string(tmp.path().join(SIDECAR_FILENAME)).expect("read raw");
+        assert!(body.contains("\"overlayAware\""), "got: {body}");
+        let read = ArtifactSidecar::read_from_dir(tmp.path())
+            .expect("read")
+            .expect("present");
+        assert!(read.is_overlay_aware());
+    }
+
+    #[test]
+    fn sidecar_missing_overlay_aware_field_deserializes_as_false() {
+        // Pre-W1.4b sidecars on disk don't carry `overlayAware`.
+        // `#[serde(default)]` must read them as `false` so the
+        // admission gate refuses them rather than silently
+        // boot-attempting a non-overlay-aware rootfs.
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let legacy_json = r#"{
+            "name": "legacy",
+            "accessible": true,
+            "sealed": false,
+            "entrypointKind": "shell",
+            "initSystem": "busybox",
+            "expectedBootMs": 300,
+            "agentBinary": "real",
+            "rootlessEntrypoint": false,
+            "hypervisor": "libkrun"
+        }"#;
+        std::fs::write(tmp.path().join(SIDECAR_FILENAME), legacy_json).expect("write legacy");
+        let read = ArtifactSidecar::read_from_dir(tmp.path())
+            .expect("legacy must parse")
+            .expect("present");
+        assert!(
+            !read.is_overlay_aware(),
+            "missing overlayAware field must default to false"
+        );
+    }
+
+    #[test]
+    fn admit_overlay_aware_accepts_w14b_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        fixture_sidecar().write_to_dir(tmp.path()).expect("write");
+        admit_overlay_aware(tmp.path()).expect("overlay_aware: true must admit");
+    }
+
+    #[test]
+    fn admit_overlay_aware_refuses_missing_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = admit_overlay_aware(tmp.path()).expect_err("missing sidecar must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("no `mvm-meta.json` sidecar"), "got: {msg}");
+        assert!(msg.contains("predates W1.4b"), "got: {msg}");
+    }
+
+    #[test]
+    fn admit_overlay_aware_refuses_pre_w14b_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        // Write a sidecar with overlay_aware=false (mirrors a
+        // pre-W1.4b cached template or a sidecar that lost the
+        // field).
+        let mut stale = fixture_sidecar();
+        stale.overlay_aware = false;
+        stale.write_to_dir(tmp.path()).expect("write stale");
+        let err = admit_overlay_aware(tmp.path()).expect_err("overlay_aware: false must refuse");
+        let msg = err.to_string();
+        assert!(msg.contains("overlay_aware: false"), "got: {msg}");
+        assert!(msg.contains("Rebuild the image"), "got: {msg}");
+    }
+
+    #[test]
+    fn admit_overlay_aware_propagates_malformed_sidecar() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        std::fs::write(tmp.path().join(SIDECAR_FILENAME), "{not valid json")
+            .expect("write malformed");
+        let err = admit_overlay_aware(tmp.path()).expect_err("malformed sidecar must error");
+        // Error chain bubbles up from `read_from_dir`'s parse error;
+        // we just assert it surfaces *some* parse-shaped message so
+        // an operator can debug without guessing.
+        assert!(format!("{err:#}").contains("parsing"), "got: {err:#}");
     }
 
     #[test]

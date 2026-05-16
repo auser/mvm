@@ -106,6 +106,12 @@ impl VmBackend for LibkrunBackend {
         // gate on libkrun-launched VMs the same way as on the
         // libkrun/Firecracker paths.
         let rootfs = Path::new(&config.rootfs_path);
+        // Plan 74 W2 / ADR-051 admission gate — refuse pre-W1.4b
+        // rootfs that lack the `/mvm/runtime` mount point. Fires
+        // before the supervisor spawn so a refusal leaves no PID
+        // file or krun handle behind.
+        let rootfs_dir = rootfs.parent().unwrap_or_else(|| Path::new("."));
+        mvm_build::builder_vm::admit_overlay_aware(rootfs_dir)?;
         mvm_base::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
 
         let vcpus = u8::try_from(config.cpus.clamp(1, u32::from(u8::MAX))).unwrap_or(u8::MAX);

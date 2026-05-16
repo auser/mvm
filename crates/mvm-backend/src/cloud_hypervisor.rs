@@ -127,6 +127,12 @@ impl VmBackend for CloudHypervisorBackend {
         // backends. Records `accessible` from the sidecar so
         // `mvmctl console` enforces the gate consistently.
         let rootfs = std::path::Path::new(&config.rootfs_path);
+        // Plan 74 W2 / ADR-051 admission gate — refuse pre-W1.4b
+        // rootfs that lack the `/mvm/runtime` mount point. Runs
+        // before any backend-side work so a refusal exits clean
+        // (no daemon started, no PID file left behind).
+        let rootfs_dir = rootfs.parent().unwrap_or_else(|| std::path::Path::new("."));
+        mvm_build::builder_vm::admit_overlay_aware(rootfs_dir)?;
         mvm_base::runtime_meta::record_from_rootfs(&config.name, StartMode::Detached, rootfs)?;
 
         // Spawn the daemon. Waits for the API socket.

@@ -300,6 +300,7 @@ mod tests {
             agent_binary: "real".to_string(),
             rootless_entrypoint: true,
             hypervisor: "firecracker".to_string(),
+            overlay_aware: true,
         };
         sidecar.write_to_dir(tmp.path()).expect("write sidecar");
         let meta = from_sidecar(StartMode::Detached, tmp.path()).expect("ok");
