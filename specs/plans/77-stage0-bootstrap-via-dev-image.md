@@ -113,6 +113,50 @@ Move the contract drift detection from "implicit, panics inside the VM" to "expl
 
 The check is a pure host-side file read — no VM boot, no nix evaluation, no network — so the new failure path costs milliseconds and surfaces a precise, actionable error before any expensive work runs.
 
+### W7 — Stage 0 reads the source-checkout vendored seed slot (the two-track design)
+
+W5 turns a hang into a clear error. W7 makes the error actionable: a fresh contributor on a source checkout has a *path forward* that doesn't depend on a teammate's `~/.mvm/dev/current/` or a release-pipeline round-trip.
+
+#### The two-track design
+
+Before W7 the source-checkout bootstrap had a chicken-and-egg gap: Stage 0 reads `find_local_fallback_image`, which only searches `~/.mvm/dev/{current,prebuilt,builds}/`. On a fresh contributor host all four are empty. The `nix/images/dev-prebuilt/<arch>/` vendored slot (which `cargo xtask build-dev-image` populates) was checked only by the *installed-binary* branch of `ensure_dev_image`, never by Stage 0 itself. So even with a freshly-`xtask`-built seed sitting in the source tree, source-checkout `mvmctl dev up` ignored it and bailed.
+
+W7 codifies the two-track design that CLAUDE.md's "source-checkout builds never depend on mvm-published artifacts" invariant already implied:
+
+- **Dev track** (contributor source checkout, every `mvmctl dev up`): build the builder VM and dev image from the in-tree flakes via libkrun. Stage 0 seeds from the vendored slot (or a previously-cached `~/.mvm/dev/current/`) — no published-artifact dependency. Edits to either flake show up on the next run.
+- **Release track** (installed-binary users): the release pipeline runs `cargo xtask build-dev-image` on a Linux Nix runner, signs the result, and publishes `dev-rootfs-*.ext4` + `builder-vm-*` to GitHub releases. Installed binaries download + cosign-verify them (existing ADR-005 / Plan 36 path).
+
+The one host-Nix step in the dev track is the contributor's **one-time bootstrap**: `cargo xtask build-dev-image --arch <arch>` populates the vendored slot from the contributor's in-tree flake. After that, mvmctl never touches host Nix again — Stage 0 uses the vendored slot as the seed, every subsequent `mvmctl dev up` rebuilds via libkrun, and every flake change shows up immediately.
+
+#### Code changes
+
+- **`find_local_fallback_image_with_workspace_root`** (new testable inner form in `crates/mvm-cli/src/commands/env/apple_container.rs`): replaces the open-coded enumeration in `find_local_fallback_image_with` with a body that takes an explicit `workspace_root` for the source-checkout vendored slot, so unit tests can substitute a tempdir without mocking `env!("CARGO_MANIFEST_DIR")`. The four locations enumerated are `~/.mvm/dev/current/`, `~/.mvm/dev/prebuilt/v*/`, `~/.mvm/dev/builds/*/`, and **`<workspace_root>/nix/images/dev-prebuilt/<arch>/`** (the W7 addition). Each candidate passes the existing `validate_dev_image_artifacts` size + ext4-magic sanity check; the closure-filter form continues to flow through to `find_local_stage0_bootstrap_image` for the `rootfs_contains_builder_init` byte-scan.
+- **`find_local_fallback_image_with`** (production wrapper): unchanged signature, now resolves the workspace_root via the new `workspace_root_for_vendored` helper and delegates to the `_with_workspace_root` form. Both `find_local_fallback_image` (line-891 installed-binary fallback caller) and `find_local_stage0_bootstrap_image` (the Stage 0 caller, filtering on `rootfs_contains_builder_init`) pick up the vendored slot for free.
+- **`workspace_root_for_vendored` + `stage0_seed_arch` + `vendored_dev_image_dir_for`** (new internal helpers): central path resolution for the vendored slot. `find_vendored_dev_image` (the line-858 caller that pre-dates W7) re-uses these instead of its previous open-coded layout, so the two callers can never drift.
+- **`bootstrap_builder_vm_image_via_dev_image_stage0`** (updated error path): when `find_local_stage0_bootstrap_image` returns `None`, the caller now emits a Thread-B "first-time setup" message that names the exact `cargo xtask build-dev-image --arch <arch>` to run, lists every checked location including the vendored slot, and points at the Plan 77 W7 two-track design. The audit emit distinguishes `Stage0Failed stage=preflight reason=seed_missing` (no candidate at all) from `reason=seed_missing_builder_init` (candidates exist but none contain `/sbin/mvm-builder-init`).
+- **`stage0_seed_doctor_status` + `Stage0SeedDoctorStatus`** (new, feature-gated, `pub(crate)`): `mvmctl doctor` consumes this to render the seed-landscape one-liner — `usable seed: <label> (vendored slot fresh/stale/absent)` on the happy path, or the corresponding remediation hint when no usable seed exists. Always `ok: true` (informational) so installed-binary users — who legitimately bootstrap via the release-pipeline download path, not the source-checkout vendored slot — don't see a spurious doctor failure.
+
+#### Reuse of upstream's `rootfs_contains_builder_init` byte-scan
+
+The Stage 0 seed-discovery filter was already PR-316 + upstream's `find_local_stage0_bootstrap_image` which closes over `rootfs_contains_builder_init` — a streaming byte-scan that checks whether the rootfs.ext4 contains the literal path `/sbin/mvm-builder-init`. W7 layers on top of that: the vendored slot is just one more candidate dir that goes through the same filter. A vendored slot whose rootfs was built before commit 843ef18 (which added the init binary to the dev-image flake) is detected and skipped the same way `~/.mvm/dev/current/` would be. The byte-scan is preferred over the W5 `manifest.json` sidecar check for selection because it inspects the actual rootfs rather than its declared metadata — W5's manifest stays as the post-pick sanity check (PR #316).
+
+#### Test surface
+
+| Test | Layer | Gate |
+|------|-------|------|
+| Unit: `find_local_fallback_image_with_workspace_root` picks up the vendored slot when it's the only candidate | mvm-cli | every PR |
+| Unit: `find_local_fallback_image_with_workspace_root` returns `None` when neither `~/.mvm/dev/` nor workspace_root has files | mvm-cli | every PR |
+| Unit: `find_local_fallback_image_with_workspace_root` picks the newer of vendored vs `current/` by mtime | mvm-cli | every PR |
+| Unit: `stage0_seed_doctor_status_at` reports `vendored_usable=true` when the rootfs contains `/sbin/mvm-builder-init` | mvm-cli | every PR |
+| Unit: `stage0_seed_doctor_status_at` reports `vendored_present=true, vendored_usable=false` when the rootfs is sanity-passing but lacks the init binary | mvm-cli | every PR |
+| Unit: `stage0_seed_doctor_status_at` reports all-`false` on a host with no candidates | mvm-cli | every PR |
+
+#### Out of scope for W7
+
+- Auto-running `cargo xtask build-dev-image` from inside `mvmctl dev up`. Keeping the host-Nix invocation as an explicit contributor-side step preserves the "mvmctl never uses host Nix at runtime" invariant in CLAUDE.md. The error message names the exact command; that's the user-visible affordance, not auto-execution.
+- A CI lane that exercises the full source-checkout bootstrap end-to-end (host Nix install → xtask → mvmctl dev up → microVM boots). That's Plan 77 W8 — separate, follow-up PR, prevents future contract drift from regressing into this trap.
+- macOS GitHub Actions E2E. No GitHub-hosted macOS-with-libkrun runner exists today; revisit when a self-hosted one is available.
+
 ### W6 — host-side kernel-panic detector in `spawn_supervisor_and_wait`
 Defense in depth so the next contract drift (or any kernel-bring-up failure that W5 doesn't catch) doesn't hang the host. Lives in `crates/mvm-build/src/libkrun_builder.rs::spawn_supervisor_and_wait` because that's the function that owns the supervisor child handle and knows the `console_output_path` from the `SupervisorConfig` it serializes.
 

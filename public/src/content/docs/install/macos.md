@@ -38,6 +38,19 @@ cargo build --release
 install -m 0755 target/release/mvmctl ~/.local/bin/mvmctl
 ```
 
+#### Contributor bootstrap (one-time)
+
+A source checkout has no pre-built dev image bytes shipped with it — that's deliberate (no Git-LFS dependency, no stale-binaries-in-tree). The source-checkout dev loop builds everything from the in-tree flakes; the **one-time** step that gets that loop started is `cargo xtask build-dev-image`, which uses host Nix to produce the seed image once.
+
+```bash
+# One time only: produce the source-checkout vendored dev-image seed.
+# Requires nix on PATH. Run this on Linux, or on macOS with linux-builder
+# (or any host that can `nix build` for aarch64-linux / x86_64-linux).
+cargo xtask build-dev-image --arch aarch64
+```
+
+After that, `mvmctl dev up` will rebuild the dev image from your local `nix/images/builder/flake.nix` via libkrun on every run — host Nix is never invoked again. Plan 77 W7 (`specs/plans/77-stage0-bootstrap-via-dev-image.md`) documents the two-track design (dev = source-build via libkrun; release = cosign-verified download for installed binaries) that lets this work.
+
 ### From crates.io
 
 ```bash

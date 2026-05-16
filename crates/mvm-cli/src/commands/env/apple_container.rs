@@ -1005,6 +1005,21 @@ fn find_local_stage0_bootstrap_image() -> Option<(std::path::PathBuf, std::path:
 fn find_local_fallback_image_with(
     accepts_rootfs: impl Fn(&std::path::Path) -> bool,
 ) -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
+    find_local_fallback_image_with_workspace_root(
+        workspace_root_for_vendored().as_deref(),
+        accepts_rootfs,
+    )
+}
+
+/// Plan 77 W7 — testable inner form of [`find_local_fallback_image_with`]
+/// that accepts an explicit `workspace_root` for the source-checkout
+/// vendored slot (`<workspace_root>/nix/images/dev-prebuilt/<arch>/`).
+/// Tests inject a tempdir; production callers use the no-arg wrapper
+/// which derives the workspace from `env!("CARGO_MANIFEST_DIR")`.
+fn find_local_fallback_image_with_workspace_root(
+    workspace_root: Option<&std::path::Path>,
+    accepts_rootfs: impl Fn(&std::path::Path) -> bool,
+) -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
     let dev_root = format!("{}/dev", mvm_core::config::mvm_data_dir());
 
     let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, String)> = Vec::new();
@@ -1051,9 +1066,61 @@ fn find_local_fallback_image_with(
         }
     }
 
+    // Plan 77 W7 — source-checkout vendored slot. `cargo xtask
+    // build-dev-image --arch <arch>` (the maintainer-side seeder)
+    // populates this directory using host Nix; it's gitignored, so
+    // a fresh `git clone` finds it empty. Once the contributor has
+    // run xtask once, every `mvmctl dev up` here picks the vendored
+    // slot up and rebuilds via libkrun without touching host Nix
+    // again. The vendored slot is also the only entry that can
+    // unblock Stage 0 when `~/.mvm/dev/current/` is missing or
+    // contract-stale — see the Plan 77 W7 section in
+    // `specs/plans/77-stage0-bootstrap-via-dev-image.md`.
+    if let Some(workspace_root) = workspace_root {
+        let dir = vendored_dev_image_dir_for(workspace_root, stage0_seed_arch());
+        if dir.is_dir() {
+            let label = format!("vendored {}", dir.display());
+            consider(dir, label);
+        }
+    }
+
     candidates.sort_by_key(|(mtime, ..)| *mtime);
     let (_, dir, label) = candidates.into_iter().next_back()?;
     Some((dir.join("vmlinux"), dir.join("rootfs.ext4"), label))
+}
+
+/// Plan 77 W7 — workspace root for source-checkout source-only paths.
+/// Returns `None` for installed binaries (`CARGO_MANIFEST_DIR` resolves
+/// into `~/.cargo/registry/` for `cargo install` builds and the parent
+/// chain doesn't include a workspace).
+fn workspace_root_for_vendored() -> Option<std::path::PathBuf> {
+    let manifest_dir = env!("CARGO_MANIFEST_DIR");
+    std::path::Path::new(manifest_dir)
+        .parent()?
+        .parent()
+        .map(|p| p.to_path_buf())
+}
+
+/// Architecture tag used for the source-checkout vendored slot
+/// subdirectory layout (`nix/images/dev-prebuilt/<arch>/`). Mirrors
+/// the matrix the release pipeline publishes under.
+fn stage0_seed_arch() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "aarch64"
+    } else {
+        "x86_64"
+    }
+}
+
+/// Plan 77 W7 — central path resolver for the vendored slot. Lifted
+/// out of [`find_vendored_dev_image`] so the W7 fallback enumeration
+/// can reuse it without re-deriving the layout.
+fn vendored_dev_image_dir_for(workspace_root: &std::path::Path, arch: &str) -> std::path::PathBuf {
+    workspace_root
+        .join("nix")
+        .join("images")
+        .join("dev-prebuilt")
+        .join(arch)
 }
 
 fn rootfs_contains_builder_init(rootfs: &std::path::Path) -> Result<bool> {
@@ -1173,18 +1240,8 @@ fn validate_dev_image_artifacts(
 /// `arch` mirrors the matrix used by `download_dev_image`: `aarch64`
 /// on Apple Silicon / aarch64-linux, `x86_64` everywhere else.
 fn find_vendored_dev_image() -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
-    let manifest_dir = env!("CARGO_MANIFEST_DIR");
-    let workspace_root = std::path::Path::new(manifest_dir).parent()?.parent()?;
-    let arch = if cfg!(target_arch = "aarch64") {
-        "aarch64"
-    } else {
-        "x86_64"
-    };
-    let dir = workspace_root
-        .join("nix")
-        .join("images")
-        .join("dev-prebuilt")
-        .join(arch);
+    let workspace_root = workspace_root_for_vendored()?;
+    let dir = vendored_dev_image_dir_for(&workspace_root, stage0_seed_arch());
     let kernel = dir.join("vmlinux");
     let rootfs = dir.join("rootfs.ext4");
     if !kernel.is_file() || !rootfs.is_file() {
@@ -1192,6 +1249,73 @@ fn find_vendored_dev_image() -> Option<(std::path::PathBuf, std::path::PathBuf, 
     }
     let label = format!("vendored {}", dir.display());
     Some((kernel, rootfs, label))
+}
+
+/// Plan 77 W7 / Thread B — informational summary of the Stage 0 seed
+/// landscape for `mvmctl doctor` to render. Always returns; the
+/// caller decides whether to surface a failure or just report.
+#[cfg(feature = "builder-vm")]
+pub(crate) struct Stage0SeedDoctorStatus {
+    /// Did any candidate (`~/.mvm/dev/current/`, prebuilt/v*, builds/*,
+    /// or the source-checkout vendored slot) yield a sanity-passing
+    /// `(vmlinux, rootfs.ext4)` pair? `false` is the fresh-host state.
+    pub(crate) any_candidate: bool,
+    /// Label of the most-recently-modified Stage 0 seed that also
+    /// contains `/sbin/mvm-builder-init` per [`rootfs_contains_builder_init`].
+    /// `None` when every candidate is contract-stale or missing.
+    pub(crate) usable_seed_label: Option<String>,
+    /// Whether the source-checkout vendored slot
+    /// (`<workspace>/nix/images/dev-prebuilt/<arch>/`) has a
+    /// sanity-passing pair. Note: doesn't imply
+    /// `/sbin/mvm-builder-init` presence — `vendored_usable` reflects
+    /// that.
+    pub(crate) vendored_present: bool,
+    /// Whether the vendored slot's rootfs contains the Stage 0 init
+    /// binary. `false` when the slot is absent or pre-Plan-77-W1.
+    pub(crate) vendored_usable: bool,
+    /// Architecture tag for the vendored slot we'd look at, used in
+    /// the doctor remediation hint.
+    pub(crate) arch: &'static str,
+}
+
+#[cfg(feature = "builder-vm")]
+pub(crate) fn stage0_seed_doctor_status() -> Stage0SeedDoctorStatus {
+    stage0_seed_doctor_status_at(workspace_root_for_vendored().as_deref())
+}
+
+/// Plan 77 W7 / Thread B — testable inner form of
+/// [`stage0_seed_doctor_status`]. Tests pass a tempdir workspace_root.
+#[cfg(feature = "builder-vm")]
+fn stage0_seed_doctor_status_at(
+    workspace_root: Option<&std::path::Path>,
+) -> Stage0SeedDoctorStatus {
+    let any_candidate =
+        find_local_fallback_image_with_workspace_root(workspace_root, |_| true).is_some();
+    let usable_seed_label = find_local_fallback_image_with_workspace_root(workspace_root, |rootfs| {
+        rootfs_contains_builder_init(rootfs).unwrap_or(false)
+    })
+    .map(|(_, _, label)| label);
+    let vendored_present = workspace_root.is_some_and(|root| {
+        let dir = vendored_dev_image_dir_for(root, stage0_seed_arch());
+        let kernel = dir.join("vmlinux");
+        let rootfs = dir.join("rootfs.ext4");
+        kernel.is_file()
+            && rootfs.is_file()
+            && validate_dev_image_artifacts(&kernel, &rootfs).is_ok()
+    });
+    let vendored_usable = vendored_present
+        && workspace_root.is_some_and(|root| {
+            let rootfs = vendored_dev_image_dir_for(root, stage0_seed_arch())
+                .join("rootfs.ext4");
+            rootfs_contains_builder_init(&rootfs).unwrap_or(false)
+        });
+    Stage0SeedDoctorStatus {
+        any_candidate,
+        usable_seed_label,
+        vendored_present,
+        vendored_usable,
+        arch: stage0_seed_arch(),
+    }
 }
 
 /// Drop every direct child of `prebuilt_root` except the one for the
@@ -2473,12 +2597,48 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     let _stage0_guard = acquire_stage0_lock(out_dir)?;
 
     let (kernel, rootfs, source_label) = find_local_stage0_bootstrap_image().ok_or_else(|| {
+        let arch = stage0_seed_arch();
+        let fingerprint_prefix = stage0_fingerprint_prefix(source_fingerprint);
+        // Plan 77 W7 — distinguish "no seed anywhere" from "seeds exist
+        // but none contain /sbin/mvm-builder-init" in the audit emit so
+        // dashboards can break the two failure modes apart. Both surface
+        // the same Thread-B remediation: run `cargo xtask
+        // build-dev-image --arch <arch>` to populate the vendored slot
+        // from this checkout's flake.
+        let any_candidate = find_local_fallback_image().is_some();
+        if any_candidate {
+            mvm_core::audit_emit!(
+                Stage0Failed,
+                "stage=preflight reason=seed_missing_builder_init fingerprint_prefix={fingerprint_prefix}"
+            );
+        } else {
+            mvm_core::audit_emit!(
+                Stage0Failed,
+                "stage=preflight reason=seed_missing fingerprint_prefix={fingerprint_prefix}"
+            );
+        }
         anyhow::anyhow!(
-            "source checkout builder VM cache is missing and no local dev image cache was found \
-             under ~/.mvm/dev/current/, ~/.mvm/dev/prebuilt/v*/, or ~/.mvm/dev/builds/*/ \
-             that contains /sbin/mvm-builder-init. \
-             Refusing to download a published builder VM prebuilt. Import or build a dev image \
-             that contains /sbin/mvm-builder-init, then retry `mvmctl dev up`."
+            "Stage 0 has no usable seed dev image on this host.\n\
+             \n\
+             Checked locations:\n\
+             \t~/.mvm/dev/current/                          (live dev image)\n\
+             \t~/.mvm/dev/prebuilt/v*/                      (downloaded prebuilts)\n\
+             \t~/.mvm/dev/builds/*/                         (historical builds)\n\
+             \tnix/images/dev-prebuilt/{arch}/   (source-checkout vendored slot — Plan 77 W7)\n\
+             \n\
+             None contained a `(vmlinux, rootfs.ext4)` pair carrying `/sbin/mvm-builder-init`. \
+             To seed the vendored slot from this checkout's `nix/images/builder/flake.nix`, \
+             run on a host with Nix installed:\n\
+             \n\
+             \tcargo xtask build-dev-image --arch {arch}\n\
+             \n\
+             Mvmctl itself never invokes host Nix at runtime; xtask is the one-time \
+             contributor bootstrap. After it succeeds, every `mvmctl dev up` in this \
+             checkout rebuilds from your local flakes via libkrun. See \
+             `specs/plans/77-stage0-bootstrap-via-dev-image.md` W7 for the two-track design \
+             (dev = source-build via libkrun, release = cosign-verified download). \
+             Refusing to download a published builder VM prebuilt — that path is reserved \
+             for installed-binary release users and would mask local flake changes."
         )
     })?;
 
@@ -3966,6 +4126,211 @@ mod dev_status_image_tests {
         assert!(!json.contains("sha256"));
         assert!(!json.contains("rootfs.ext4"));
         assert!(!json.contains("vmlinux"));
+    }
+
+    // ─────────────────────────────────────────────────────────────────
+    // Plan 77 W7 — source-checkout vendored slot in Stage 0 enumeration.
+    //
+    // Three properties under test:
+    //
+    // 1. `find_local_fallback_image_with_workspace_root` includes
+    //    `<workspace>/nix/images/dev-prebuilt/<arch>/` alongside
+    //    `~/.mvm/dev/*`.
+    // 2. The vendored slot picks up even on a clean host (no
+    //    `~/.mvm/dev/current/`).
+    // 3. The vendored slot's "Stage 0 ready?" status is what
+    //    `mvmctl doctor` would report.
+    //
+    // The `_at` form is what these tests call so each test can inject
+    // a tempdir workspace_root without mocking `env!("CARGO_MANIFEST_DIR")`.
+    // ─────────────────────────────────────────────────────────────────
+
+    /// Write a `(vmlinux, rootfs.ext4)` pair that passes
+    /// `validate_dev_image_artifacts` (size + ext4 magic) but
+    /// **without** the `BUILDER_INIT_PATH` bytes planted by the
+    /// module's main `write_valid_dev_image`. Used by W7 tests that
+    /// distinguish "vendored slot exists at all" from "vendored slot
+    /// is Stage-0-ready".
+    fn write_dev_image_without_builder_init(dir: &std::path::Path) {
+        const EXT4_MAGIC_OFFSET: usize = 1024 + 56;
+        std::fs::create_dir_all(dir).unwrap();
+        std::fs::write(dir.join("vmlinux"), vec![0x7f; 1024 * 1024 + 1]).unwrap();
+        let mut rootfs = vec![0u8; 4 * 1024 * 1024 + 1];
+        rootfs[EXT4_MAGIC_OFFSET] = 0x53;
+        rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
+        // Deliberately no BUILDER_INIT_PATH plant.
+        std::fs::write(dir.join("rootfs.ext4"), rootfs).unwrap();
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn find_local_fallback_image_at_picks_up_vendored_slot_alone() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &tmp.path().join("data"),
+            &tmp.path().join("cache"),
+        );
+
+        let workspace = tmp.path().join("workspace");
+        let vendored = workspace
+            .join("nix")
+            .join("images")
+            .join("dev-prebuilt")
+            .join(stage0_seed_arch());
+        write_valid_dev_image(&vendored);
+
+        let (_, _, label) =
+            find_local_fallback_image_with_workspace_root(Some(&workspace), |_| true)
+                .expect("vendored slot must be discovered");
+        assert!(
+            label.starts_with("vendored "),
+            "expected `vendored …` label, got {label:?}"
+        );
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn find_local_fallback_image_at_returns_none_when_neither_dev_dir_nor_workspace_has_files() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &tmp.path().join("data"),
+            &tmp.path().join("cache"),
+        );
+
+        // No `~/.mvm/dev/`, no workspace_root → no candidate.
+        assert!(find_local_fallback_image_with_workspace_root(None, |_| true).is_none());
+
+        // Empty workspace_root → still no candidate.
+        let workspace = tmp.path().join("empty-workspace");
+        assert!(find_local_fallback_image_with_workspace_root(Some(&workspace), |_| true).is_none());
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn stage0_seed_doctor_status_at_reports_usable_when_vendored_has_builder_init() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &tmp.path().join("data"),
+            &tmp.path().join("cache"),
+        );
+
+        let workspace = tmp.path().join("workspace");
+        let vendored = workspace
+            .join("nix")
+            .join("images")
+            .join("dev-prebuilt")
+            .join(stage0_seed_arch());
+        // `write_valid_dev_image` (defined earlier in this mod) plants
+        // BUILDER_INIT_PATH at the end of the rootfs, exactly the
+        // byte-scan target `rootfs_contains_builder_init` looks for.
+        write_valid_dev_image(&vendored);
+
+        let status = stage0_seed_doctor_status_at(Some(&workspace));
+        assert!(status.any_candidate, "vendored slot is a candidate");
+        assert!(status.vendored_present, "vendored slot present");
+        assert!(
+            status.vendored_usable,
+            "vendored rootfs contains /sbin/mvm-builder-init"
+        );
+        assert!(
+            status
+                .usable_seed_label
+                .as_deref()
+                .is_some_and(|l| l.starts_with("vendored ")),
+            "expected vendored label, got {:?}",
+            status.usable_seed_label
+        );
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn stage0_seed_doctor_status_at_reports_present_but_unusable_when_vendored_lacks_builder_init() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &tmp.path().join("data"),
+            &tmp.path().join("cache"),
+        );
+
+        let workspace = tmp.path().join("workspace");
+        let vendored = workspace
+            .join("nix")
+            .join("images")
+            .join("dev-prebuilt")
+            .join(stage0_seed_arch());
+        // No BUILDER_INIT_PATH planted — vendored slot exists per
+        // size + ext4-magic sanity, but `rootfs_contains_builder_init`
+        // byte-scan will miss → vendored_usable = false. This mirrors
+        // the actual fresh-host failure mode where xtask hasn't run
+        // post-843ef18 yet.
+        write_dev_image_without_builder_init(&vendored);
+
+        let status = stage0_seed_doctor_status_at(Some(&workspace));
+        assert!(status.any_candidate);
+        assert!(status.vendored_present);
+        assert!(
+            !status.vendored_usable,
+            "rootfs lacks /sbin/mvm-builder-init → not usable as Stage 0 seed"
+        );
+        assert!(
+            status.usable_seed_label.is_none(),
+            "no usable seed → no label"
+        );
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn stage0_seed_doctor_status_at_reports_no_candidates() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &tmp.path().join("data"),
+            &tmp.path().join("cache"),
+        );
+        let status = stage0_seed_doctor_status_at(None);
+        assert!(!status.any_candidate);
+        assert!(!status.vendored_present);
+        assert!(!status.vendored_usable);
+        assert!(status.usable_seed_label.is_none());
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn find_local_fallback_image_at_with_both_current_and_vendored_picks_newest() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &data_dir,
+            &tmp.path().join("cache"),
+        );
+
+        // Older: vendored
+        let workspace = tmp.path().join("workspace");
+        let vendored = workspace
+            .join("nix")
+            .join("images")
+            .join("dev-prebuilt")
+            .join(stage0_seed_arch());
+        write_valid_dev_image(&vendored);
+
+        // Newer: current/
+        let current = data_dir.join("dev").join("current");
+        write_valid_dev_image(&current);
+
+        let (_, _, label) =
+            find_local_fallback_image_with_workspace_root(Some(&workspace), |_| true)
+                .expect("at least one candidate");
+        assert_eq!(label, "current", "newer mtime wins among unfiltered candidates");
     }
 }
 

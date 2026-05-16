@@ -3,7 +3,7 @@ mod bundle;
 mod catalog;
 mod cmd_audit;
 mod deps;
-mod env;
+pub(crate) mod env;
 mod manifest;
 mod ops;
 mod shared;
