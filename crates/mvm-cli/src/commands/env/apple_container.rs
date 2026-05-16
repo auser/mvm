@@ -20,6 +20,7 @@ pub(super) const DEV_VM_NAME: &str = "mvm-dev";
 const BUILDER_VM_SOURCE_FINGERPRINT_FILE: &str = ".mvm-source.sha256";
 const BUILDER_VM_ARTIFACT_DIGEST_FILE: &str = ".mvm-artifacts.sha256";
 const BUILDER_VM_PROVENANCE_FILE: &str = ".mvm-provenance.json";
+const BUILDER_INIT_PATH: &[u8] = b"/sbin/mvm-builder-init";
 
 /// Check if the Apple Container dev VM is running *and* reachable
 /// cross-process via the vsock proxy socket.
@@ -993,6 +994,17 @@ fn ensure_source_checkout_dev_image(
 /// (e.g. `current`, `prebuilt/v0.13.0`, or `builds/abcdef…`) for the
 /// warning surface. `None` means nothing usable was found.
 fn find_local_fallback_image() -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
+    find_local_fallback_image_with(|_| true)
+}
+
+#[cfg(feature = "builder-vm")]
+fn find_local_stage0_bootstrap_image() -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
+    find_local_fallback_image_with(|rootfs| rootfs_contains_builder_init(rootfs).unwrap_or(false))
+}
+
+fn find_local_fallback_image_with(
+    accepts_rootfs: impl Fn(&std::path::Path) -> bool,
+) -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
     let dev_root = format!("{}/dev", mvm_core::config::mvm_data_dir());
 
     let mut candidates: Vec<(std::time::SystemTime, std::path::PathBuf, String)> = Vec::new();
@@ -1009,6 +1021,9 @@ fn find_local_fallback_image() -> Option<(std::path::PathBuf, std::path::PathBuf
             return;
         }
         if validate_dev_image_artifacts(&kernel, &rootfs).is_err() {
+            return;
+        }
+        if !accepts_rootfs(&rootfs) {
             return;
         }
         let mtime = std::fs::metadata(&rootfs)
@@ -1039,6 +1054,37 @@ fn find_local_fallback_image() -> Option<(std::path::PathBuf, std::path::PathBuf
     candidates.sort_by_key(|(mtime, ..)| *mtime);
     let (_, dir, label) = candidates.into_iter().next_back()?;
     Some((dir.join("vmlinux"), dir.join("rootfs.ext4"), label))
+}
+
+fn rootfs_contains_builder_init(rootfs: &std::path::Path) -> Result<bool> {
+    file_contains_bytes(rootfs, BUILDER_INIT_PATH)
+        .with_context(|| format!("scanning {} for /sbin/mvm-builder-init", rootfs.display()))
+}
+
+fn file_contains_bytes(path: &std::path::Path, needle: &[u8]) -> Result<bool> {
+    if needle.is_empty() {
+        return Ok(true);
+    }
+    let mut file =
+        std::fs::File::open(path).with_context(|| format!("opening {}", path.display()))?;
+    let mut carry = Vec::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = std::io::Read::read(&mut file, &mut buf)
+            .with_context(|| format!("reading {}", path.display()))?;
+        if n == 0 {
+            return Ok(false);
+        }
+        let mut window = Vec::with_capacity(carry.len() + n);
+        window.extend_from_slice(&carry);
+        window.extend_from_slice(&buf[..n]);
+        if window.windows(needle.len()).any(|w| w == needle) {
+            return Ok(true);
+        }
+        let keep = needle.len().saturating_sub(1).min(window.len());
+        carry.clear();
+        carry.extend_from_slice(&window[window.len() - keep..]);
+    }
 }
 
 /// Sanity-check that a `(vmlinux, rootfs.ext4)` pair looks like a real
@@ -2152,10 +2198,11 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     // contributor host) and the simpler invariant is worth it.
     let _stage0_guard = acquire_stage0_lock(out_dir)?;
 
-    let (kernel, rootfs, source_label) = find_local_fallback_image().ok_or_else(|| {
+    let (kernel, rootfs, source_label) = find_local_stage0_bootstrap_image().ok_or_else(|| {
         anyhow::anyhow!(
             "source checkout builder VM cache is missing and no local dev image cache was found \
-             under ~/.mvm/dev/current/, ~/.mvm/dev/prebuilt/v*/, or ~/.mvm/dev/builds/*/. \
+             under ~/.mvm/dev/current/, ~/.mvm/dev/prebuilt/v*/, or ~/.mvm/dev/builds/*/ \
+             that contains /sbin/mvm-builder-init. \
              Refusing to download a published builder VM prebuilt. Import or build a dev image \
              that contains /sbin/mvm-builder-init, then retry `mvmctl dev up`."
         )
@@ -2453,12 +2500,20 @@ fn unique_builder_vm_stage0_staging_dir(final_dir: &std::path::Path) -> Result<s
 }
 
 fn validate_builder_vm_stage0_artifacts(dir: &std::path::Path) -> Result<()> {
-    validate_dev_image_artifacts(dir.join("vmlinux"), dir.join("rootfs.ext4")).with_context(|| {
+    let rootfs = dir.join("rootfs.ext4");
+    validate_dev_image_artifacts(dir.join("vmlinux"), &rootfs).with_context(|| {
         format!(
             "validating Stage 0 builder VM artifacts in {}",
             dir.display()
         )
-    })
+    })?;
+    if !rootfs_contains_builder_init(&rootfs)? {
+        anyhow::bail!(
+            "Stage 0 builder VM artifact {} is missing /sbin/mvm-builder-init",
+            rootfs.display()
+        );
+    }
+    Ok(())
 }
 
 /// Plan 77 W2 — outcome of [`sweep_orphaned_stage0_staging_dirs`]:
@@ -3217,6 +3272,9 @@ mod dev_status_image_tests {
         let mut rootfs = vec![0u8; 4 * 1024 * 1024 + 1];
         rootfs[EXT4_MAGIC_OFFSET] = 0x53;
         rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
+        let init_offset = rootfs.len() - BUILDER_INIT_PATH.len() - 1;
+        rootfs[init_offset..init_offset + BUILDER_INIT_PATH.len()]
+            .copy_from_slice(BUILDER_INIT_PATH);
         std::fs::write(dir.join("rootfs.ext4"), rootfs).expect("write rootfs");
     }
 
@@ -3365,6 +3423,9 @@ mod dev_status_image_tests {
         let mut rootfs = vec![0u8; 4 * 1024 * 1024 + 1];
         rootfs[EXT4_MAGIC_OFFSET] = 0x53;
         rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
+        let init_offset = rootfs.len() - BUILDER_INIT_PATH.len() - 1;
+        rootfs[init_offset..init_offset + BUILDER_INIT_PATH.len()]
+            .copy_from_slice(BUILDER_INIT_PATH);
         std::fs::write(dir.join("rootfs.ext4"), rootfs).unwrap();
     }
 
@@ -3439,6 +3500,41 @@ mod dev_status_image_tests {
         );
 
         assert!(find_local_fallback_image().is_none());
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn stage0_fallback_skips_rootfs_missing_builder_init() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &data_dir,
+            &tmp.path().join("cache"),
+        );
+
+        let current = data_dir.join("dev/current");
+        write_valid_dev_image(&current);
+        let mut bad_rootfs = std::fs::read(current.join("rootfs.ext4")).unwrap();
+        for b in &mut bad_rootfs {
+            if *b != 0 {
+                *b = 0;
+            }
+        }
+        const EXT4_MAGIC_OFFSET: usize = 1024 + 56;
+        bad_rootfs[EXT4_MAGIC_OFFSET] = 0x53;
+        bad_rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
+        std::fs::write(current.join("rootfs.ext4"), bad_rootfs).unwrap();
+
+        let prebuilt = data_dir.join("dev/prebuilt/v0.0.2");
+        write_valid_dev_image(&prebuilt);
+
+        let (kernel, rootfs, label) =
+            find_local_stage0_bootstrap_image().expect("valid prebuilt seed should be selected");
+        assert_eq!(kernel, prebuilt.join("vmlinux"));
+        assert_eq!(rootfs, prebuilt.join("rootfs.ext4"));
+        assert_eq!(label, "prebuilt/v0.0.2");
     }
 
     #[test]
@@ -3872,6 +3968,9 @@ mod builder_vm_bootstrap_tests {
         let mut rootfs = vec![0u8; 4 * 1024 * 1024 + 1];
         rootfs[EXT4_MAGIC_OFFSET] = 0x53;
         rootfs[EXT4_MAGIC_OFFSET + 1] = 0xEF;
+        let init_offset = rootfs.len() - BUILDER_INIT_PATH.len() - 1;
+        rootfs[init_offset..init_offset + BUILDER_INIT_PATH.len()]
+            .copy_from_slice(BUILDER_INIT_PATH);
         std::fs::write(dir.join("rootfs.ext4"), rootfs).expect("write rootfs");
     }
 

@@ -42,7 +42,7 @@ pub struct MvmConfig {
     /// Maximum wall-clock seconds `mvmctl up` waits for every guest
     /// integration's readiness probe to flip to `Active` before giving
     /// up and leaving `InstanceReadiness` at `ServicesStarting {
-    /// pending }` (ADR-050 §3 / plan 74 W2). VMs with no integrations
+    /// pending }` (ADR-053 §3 / plan 74 W2). VMs with no integrations
     /// transition to `ServicesReady` immediately; this only matters
     /// for VMs that declare `after_start.sh` health hooks.
     ///
@@ -236,7 +236,7 @@ mod tests {
         assert!(cfg.metrics_port.is_none());
         // Security defaults: ack_docker_tier off — banner emits unless suppressed.
         assert!(!cfg.security.ack_docker_tier);
-        // ADR-050 §3 / plan 74 W2 default: 30 s services-health wait.
+        // ADR-053 §3 / plan 74 W2 default: 30 s services-health wait.
         assert_eq!(cfg.services_health_timeout_secs, 30);
     }
 

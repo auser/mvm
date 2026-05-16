@@ -8,6 +8,7 @@ mod check_doc_claims;
 mod check_forbidden_deps;
 mod check_no_display_on_secret_types;
 mod check_no_overclaim;
+mod check_spec_numbers;
 mod gen_stubs;
 mod perf;
 
@@ -42,6 +43,10 @@ fn main() -> Result<()> {
             let workspace = workspace_root();
             check_no_overclaim::run(&workspace)
         }
+        Some("check-spec-numbers") => {
+            let workspace = workspace_root();
+            check_spec_numbers::run(&workspace)
+        }
         Some("perf") => perf::run(&args[2..]),
         Some("build-dev-image") => {
             let workspace = workspace_root();
@@ -56,7 +61,7 @@ fn main() -> Result<()> {
             gen_stubs::check(&workspace)
         }
         Some(other) => anyhow::bail!(
-            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage, check-no-display-on-secret-types, check-audit-positional, check-doc-claims, check-forbidden-deps, check-no-overclaim, perf, build-dev-image, gen-stubs, check-stubs",
+            "Unknown xtask: {:?}. Available: gen-man, check-adr-coverage, check-no-display-on-secret-types, check-audit-positional, check-doc-claims, check-forbidden-deps, check-no-overclaim, check-spec-numbers, perf, build-dev-image, gen-stubs, check-stubs",
             other
         ),
         None => {
@@ -82,6 +87,9 @@ fn main() -> Result<()> {
             );
             eprintln!(
                 "  check-no-overclaim                      Plan 75 W0 lint: refuse gated phrases from specs/claims/ outside exempt paths"
+            );
+            eprintln!(
+                "  check-spec-numbers                     Reject duplicate numeric prefixes in specs/plans and specs/adrs"
             );
             eprintln!(
                 "  perf <subcommand>                       Plan 60 Phase 9 perf gates (rootfs-size, boot)"

@@ -429,7 +429,7 @@ This plan is currently at `/Users/auser/.claude/plans/dazzling-meandering-garden
    **Verify before pasting:** confirm `MVM_DATA_DIR` is actually consumed by `mvm_core::config::mvm_data_dir()` (grep for it). If the env var name differs, adjust the AGENTS.md text to match.
 
 1. **Move/copy** the contents to `specs/plans/38-manifest-driven-template-dx.md` (37 was claimed by the in-flight whitepaper-alignment plan during the planning conversation, so this plan landed at 38).
-2. **Update `specs/SPRINT.md`** — add a new "Sprint 44 — manifest-driven template DX" section (or append to the existing Sprint 44 draft if it's still relevant, replacing the stub at `specs/plans/35-sprint-44-draft.md`). Sprint section should include:
+2. **Update `specs/SPRINT.md`** — add a new "Sprint 44 — manifest-driven template DX" section (or append to the existing Sprint 44 draft if it's still relevant, replacing the stub at `specs/plans/78-sprint-44-draft.md`). Sprint section should include:
    - Pointer to `plans/38-manifest-driven-template-dx.md`.
    - Coordination tickets for mvmforge `compile` to emit `mvm.toml` and stop emitting `launch.json`.
    - Followup: deprecate `crates/mvm/src/vm/exec.rs` `launch.json` accommodations once mvmforge stops emitting it (cross-references existing follow-up [#5](https://github.com/tinylabscom/mvm/issues/5) which marked launch.json consumption as shipped).

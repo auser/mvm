@@ -1,4 +1,4 @@
-//! Shared host-side readiness milestone emission (ADR-050 §3 /
+//! Shared host-side readiness milestone emission (ADR-053 §3 /
 //! plan 74 W2).
 //!
 //! Every `mvmctl` subcommand that observes a VM-lifecycle milestone
@@ -86,7 +86,7 @@ fn classify_services_snapshot(reports: &[IntegrationStateReport]) -> ServicesHea
 }
 
 /// Query guest integration status via the standard `mvm::vsock_transport`
-/// abstraction. Performs the ADR-050 / plan 74 W1 hello prelude on
+/// abstraction. Performs the ADR-053 / plan 74 W1 hello prelude on
 /// each connection so the agent dispatches the operational request.
 fn query_services_via_transport(vm_name: &str) -> anyhow::Result<Vec<IntegrationStateReport>> {
     let transport: Box<dyn VsockTransport> = vsock_transport::for_vm(vm_name)?;
@@ -119,7 +119,7 @@ fn query_services_via_transport(vm_name: &str) -> anyhow::Result<Vec<Integration
 ///   immediately (the mock backend exercises this in
 ///   `mvm_backend::mock_guest_agent::dispatch`).
 ///
-/// # Future: `Degraded` (ADR-050 §3)
+/// # Future: `Degraded` (ADR-053 §3)
 ///
 /// Detecting `Degraded { unhealthy }` requires polling *after*
 /// `ServicesReady`. Three follow-up paths are possible — see the
@@ -174,7 +174,7 @@ pub(super) fn wait_for_services_ready(vm_name: &str, timeout: Duration) {
     }
 }
 
-/// Post-`ServicesReady` integration-health watcher (ADR-050 §3 /
+/// Post-`ServicesReady` integration-health watcher (ADR-053 §3 /
 /// plan 74 W2 → "Degraded follow-up"). The `mvmctl up` foreground
 /// Ctrl+C wait loop ticks this monitor every ~10 s so a service
 /// that flips `Active` → `Error` *after* boot transitions readiness
