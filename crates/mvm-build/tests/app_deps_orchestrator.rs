@@ -434,6 +434,13 @@ fn clone_builder_err(e: &BuilderVmError) -> BuilderVmError {
         BuilderVmError::LibkrunUnavailable(s) => BuilderVmError::LibkrunUnavailable(s.clone()),
         BuilderVmError::ImagePullFailed(s) => BuilderVmError::ImagePullFailed(s.clone()),
         BuilderVmError::NotYetImplemented => BuilderVmError::NotYetImplemented,
+        BuilderVmError::SeedKernelPanic {
+            panic_line,
+            console_log_path,
+        } => BuilderVmError::SeedKernelPanic {
+            panic_line: panic_line.clone(),
+            console_log_path: console_log_path.clone(),
+        },
     }
 }
 

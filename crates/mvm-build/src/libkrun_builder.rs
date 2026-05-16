@@ -55,9 +55,12 @@
 //! runs a one-shot `nix build`, while the runtime mounts the
 //! user's rootfs and runs the user's entrypoint.
 
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Stdio};
+use std::process::{Child, Command, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
+use std::time::Duration;
 
 use mvm_libkrun::{KrunContext, SupervisorConfig};
 use serde::Deserialize;
@@ -906,10 +909,224 @@ fn spawn_supervisor_and_wait(
             ))
         })?;
 
-    let status = child
-        .wait()
-        .map_err(|e| BuilderVmError::ExtractionFailed(format!("wait on supervisor child: {e}")))?;
-    Ok(status.code().unwrap_or(-1))
+    // Plan 77 W6 — concurrent kernel-panic detector. The libkrun
+    // supervisor blocks in `krun_start_enter` until the VM cleanly
+    // exits; a kernel panic at PID 1 doesn't trigger a clean exit, so
+    // a plain `child.wait()` would hang indefinitely. We tail the VM's
+    // console log for the kernel's stable panic banner and kill the
+    // supervisor on detection. When `console_output_path` is None
+    // (callers that opted out of console capture), behavior is
+    // unchanged — plain wait, plain exit code.
+    let console_log = cfg
+        .krun
+        .console_output_path
+        .as_deref()
+        .map(PathBuf::from);
+    match wait_with_panic_detector(&mut child, console_log.as_deref(), DEFAULT_PANIC_POLL_INTERVAL)
+    {
+        Ok(WaitOutcome::Clean(code)) => Ok(code),
+        Ok(WaitOutcome::KernelPanic {
+            panic_line,
+            console_log_path,
+        }) => Err(BuilderVmError::SeedKernelPanic {
+            panic_line,
+            console_log_path,
+        }),
+        Err(e) => Err(BuilderVmError::ExtractionFailed(format!(
+            "wait on supervisor child: {e}"
+        ))),
+    }
+}
+
+/// Plan 77 W6 — outcome of [`wait_with_panic_detector`]. `KernelPanic`
+/// short-circuits the normal exit-code path with the captured banner
+/// line so the caller can map it to [`BuilderVmError::SeedKernelPanic`]
+/// without a separate side channel.
+#[derive(Debug)]
+enum WaitOutcome {
+    Clean(i32),
+    KernelPanic {
+        panic_line: String,
+        console_log_path: String,
+    },
+}
+
+/// Poll interval for the panic-detector watcher in production. Keeping
+/// this short (100 ms) is what makes a panic surface in well under a
+/// second — the kernel's panic banner is written via printk well
+/// before the supervisor's blocking `start_enter` would have otherwise
+/// noticed anything wrong.
+const DEFAULT_PANIC_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Block on `child` while concurrently tailing `console_log` (if any)
+/// for the kernel's stable panic banner `Kernel panic - not syncing`.
+/// On detection, kill the child and return [`WaitOutcome::KernelPanic`]
+/// with the captured line. When `console_log` is `None`, falls back to
+/// a plain `child.wait`.
+///
+/// `poll_interval` is the watcher's sleep between log-tail polls;
+/// production calls pass [`DEFAULT_PANIC_POLL_INTERVAL`]. Tests pass a
+/// shorter interval (e.g. 10 ms) to keep wall-clock under control.
+///
+/// The watcher runs on its own thread. The main thread loops
+/// `Child::try_wait` so it can break out either on child exit or on
+/// the watcher signaling a panic. When the watcher signals a panic,
+/// the main thread calls `Child::kill` to unblock the libkrun
+/// supervisor (libkrun's `krun_start_enter` runs on the supervisor's
+/// main thread inside `exit()` — SIGKILL is the only reliable
+/// signal, which matches the gotcha documented in
+/// `reference_libkrun_gotchas.md`).
+fn wait_with_panic_detector(
+    child: &mut Child,
+    console_log: Option<&Path>,
+    poll_interval: Duration,
+) -> std::io::Result<WaitOutcome> {
+    let Some(console_log) = console_log else {
+        let status = child.wait()?;
+        return Ok(WaitOutcome::Clean(status.code().unwrap_or(-1)));
+    };
+
+    let panic_line: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    let stop = Arc::new(AtomicBool::new(false));
+
+    let watcher_panic = Arc::clone(&panic_line);
+    let watcher_stop = Arc::clone(&stop);
+    let watcher_path = console_log.to_path_buf();
+    let watcher = std::thread::spawn(move || {
+        panic_watcher(&watcher_path, &watcher_panic, &watcher_stop, poll_interval);
+    });
+
+    let wait_result = loop {
+        match child.try_wait() {
+            Ok(Some(status)) => break Ok(status),
+            Ok(None) => {}
+            Err(e) => break Err(e),
+        }
+        if panic_line.lock().unwrap().is_some() {
+            // Best-effort kill; the supervisor is wedged inside
+            // libkrun's `start_enter` so SIGKILL is the only reliable
+            // signal. If the kill itself fails (already exited, etc.),
+            // fall through to `wait` so we still reap the zombie.
+            let _ = child.kill();
+            match child.wait() {
+                Ok(status) => break Ok(status),
+                Err(e) => break Err(e),
+            }
+        }
+        std::thread::sleep(poll_interval);
+    };
+
+    // Signal the watcher to exit and join it. Even on `Err` paths we
+    // need the join — without it the spawned thread could outlive the
+    // function with a live `&Path` to a tempdir the caller is about
+    // to drop.
+    stop.store(true, Ordering::SeqCst);
+    let _ = watcher.join();
+
+    let status = wait_result?;
+    let captured = panic_line.lock().unwrap().take();
+    match captured {
+        Some(line) => Ok(WaitOutcome::KernelPanic {
+            panic_line: line,
+            console_log_path: console_log.display().to_string(),
+        }),
+        None => Ok(WaitOutcome::Clean(status.code().unwrap_or(-1))),
+    }
+}
+
+/// The kernel's panic banner. Stable in upstream `kernel/panic.c` for
+/// the last ~decade; substring match keeps us robust to colour codes,
+/// log-level prefixes, and trailing detail.
+const KERNEL_PANIC_BANNER: &str = "Kernel panic - not syncing";
+
+/// Maximum bytes of unmatched tail we keep buffered between polls.
+/// A panic line is short (~150 bytes) so 4 KiB is plenty of slack to
+/// handle a partial last line spanning multiple reads.
+const PANIC_WATCHER_BUFFER_CAP: usize = 4096;
+
+/// Tail `console_log` for the kernel panic banner. On match, stores
+/// the matching line into `panic_line` and returns. Polls every
+/// `poll_interval` until either a match is found or `stop` is set.
+///
+/// Two robustness details that matter:
+///
+/// 1. **The console log doesn't exist when we start.** libkrun creates
+///    the file on the first hvc0 byte the guest writes, ~100 ms after
+///    `start_enter`. The watcher retries the `File::open` on every
+///    poll until it succeeds — `console_log.exists()` is the cheap
+///    pre-check.
+///
+/// 2. **Reads can split a line across polls.** A panic banner that
+///    arrives at the same instant as the poll could be partially read
+///    on one tick and completed on the next. We buffer unmatched tail
+///    bytes (capped at [`PANIC_WATCHER_BUFFER_CAP`]) so the substring
+///    match across reads still succeeds.
+fn panic_watcher(
+    console_log: &Path,
+    panic_line: &Arc<Mutex<Option<String>>>,
+    stop: &Arc<AtomicBool>,
+    poll_interval: Duration,
+) {
+    let mut file: Option<std::fs::File> = None;
+    let mut buf: Vec<u8> = Vec::new();
+
+    while !stop.load(Ordering::SeqCst) {
+        if file.is_none() && console_log.exists() {
+            file = std::fs::File::open(console_log).ok();
+        }
+        if let Some(ref mut f) = file {
+            let mut chunk = Vec::new();
+            // Best-effort; an IO error here just defers detection to
+            // the next poll. The supervisor's eventual exit still
+            // unblocks the main thread.
+            if f.read_to_end(&mut chunk).is_ok() && !chunk.is_empty() {
+                buf.extend_from_slice(&chunk);
+                if let Some(line) = find_panic_line_in(&buf) {
+                    *panic_line.lock().unwrap() = Some(line);
+                    return;
+                }
+                // Trim buf to the last PANIC_WATCHER_BUFFER_CAP bytes
+                // so a multi-minute build's console output doesn't
+                // grow the watcher's memory without bound. The banner
+                // is much shorter than the cap so a truncated buffer
+                // never severs a pending match.
+                if buf.len() > PANIC_WATCHER_BUFFER_CAP {
+                    let start = buf.len() - PANIC_WATCHER_BUFFER_CAP;
+                    buf.drain(0..start);
+                }
+            }
+        }
+        std::thread::sleep(poll_interval);
+    }
+}
+
+/// Scan `buf` for the kernel panic banner. On match, return the
+/// containing line decoded as a UTF-8 string (lossy decoding — kernel
+/// log output is ASCII in practice but we don't want a stray non-UTF-8
+/// byte to silently drop the panic detection).
+fn find_panic_line_in(buf: &[u8]) -> Option<String> {
+    // Cheap pre-check before the lossy UTF-8 conversion.
+    let needle = KERNEL_PANIC_BANNER.as_bytes();
+    let idx = buf.windows(needle.len()).position(|w| w == needle)?;
+    // Walk back to the previous newline (or start of buffer) and
+    // forward to the next newline so the returned line is the full
+    // banner with its detail (the kernel writes
+    // `Kernel panic - not syncing: Requested init ... failed (error N).`
+    // on a single line).
+    let line_start = buf[..idx]
+        .iter()
+        .rposition(|&b| b == b'\n')
+        .map(|i| i + 1)
+        .unwrap_or(0);
+    let line_end = buf[idx..]
+        .iter()
+        .position(|&b| b == b'\n')
+        .map(|i| idx + i)
+        .unwrap_or(buf.len());
+    let line = String::from_utf8_lossy(&buf[line_start..line_end])
+        .trim_end_matches('\r')
+        .to_string();
+    Some(line)
 }
 
 /// Render a Path as a `&str` or surface a clear error if it
@@ -1381,5 +1598,218 @@ mod tests {
     fn with_nix_store_mib_overrides() {
         let vm = LibkrunBuilderVm::default().with_nix_store_mib(8192);
         assert_eq!(vm.nix_store_mib, 8192);
+    }
+
+    // ---------------------------------------------------------------
+    // Plan 77 W6 — kernel-panic detector.
+    //
+    // `find_panic_line_in` is a pure scanner — tested directly. The
+    // `wait_with_panic_detector` integration tests spawn `sleep` as a
+    // stand-in for the libkrun supervisor (writes nothing on its own
+    // to the console log, exits cleanly when killed or after its
+    // configured duration). Tests run on Unix only because `sleep`
+    // and `Child::kill` semantics are POSIX-specific.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn find_panic_line_in_returns_none_when_banner_absent() {
+        let buf = b"some boot log\nanother line\nfinal line\n";
+        assert_eq!(find_panic_line_in(buf), None);
+    }
+
+    #[test]
+    fn find_panic_line_in_extracts_full_line_when_banner_present() {
+        let buf = b"[ 0.05 ] EXT4-fs: mounted\n\
+                    [ 0.08 ] Kernel panic - not syncing: Requested init /sbin/foo failed (error -2).\n\
+                    [ 0.09 ] more output\n";
+        let line = find_panic_line_in(buf).expect("must match");
+        assert!(line.contains("Kernel panic - not syncing"));
+        assert!(line.contains("Requested init /sbin/foo failed"));
+        assert!(!line.contains('\n'));
+    }
+
+    #[test]
+    fn find_panic_line_in_handles_buffer_with_no_trailing_newline() {
+        // Watcher may read partial output where the panic line is at
+        // the end with no `\n` yet. The scanner still returns the
+        // whole bufferred line so the watcher can fire immediately
+        // instead of waiting for the next newline.
+        let buf = b"[ 0.05 ] booting\n[ 0.08 ] Kernel panic - not syncing: detail";
+        let line = find_panic_line_in(buf).expect("must match");
+        assert!(line.contains("Kernel panic - not syncing: detail"));
+    }
+
+    #[test]
+    fn find_panic_line_in_trims_trailing_carriage_return() {
+        // Some console drivers emit `\r\n`; the line should be the
+        // banner without the trailing `\r`.
+        let buf = b"[ 0.08 ] Kernel panic - not syncing: oops\r\nnext line\n";
+        let line = find_panic_line_in(buf).expect("must match");
+        assert!(!line.ends_with('\r'), "got {line:?}");
+        assert!(line.ends_with(": oops"));
+    }
+
+    #[test]
+    fn find_panic_line_in_returns_match_at_start_of_buffer() {
+        let buf = b"Kernel panic - not syncing: first thing\nsubsequent\n";
+        let line = find_panic_line_in(buf).expect("must match");
+        assert_eq!(line, "Kernel panic - not syncing: first thing");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_panic_detector_returns_clean_when_no_console_log() {
+        // No console log → falls back to plain wait; clean exit code
+        // is propagated as-is.
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 7"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        let outcome =
+            wait_with_panic_detector(&mut child, None, Duration::from_millis(10)).expect("ok");
+        match outcome {
+            WaitOutcome::Clean(7) => {}
+            other => panic!("expected Clean(7), got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_panic_detector_returns_clean_when_log_never_contains_banner() {
+        let scratch = TempDir::new().unwrap();
+        let console = scratch.path().join("console.log");
+        // Write a few benign lines — the watcher sees them, finds no
+        // banner, the child exits cleanly, outcome is Clean.
+        std::fs::write(&console, b"[ 0.01 ] boot\n[ 0.02 ] hello\n").unwrap();
+        let mut child = Command::new("sh")
+            .args(["-c", "exit 0"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+        let outcome = wait_with_panic_detector(&mut child, Some(&console), Duration::from_millis(10))
+            .expect("ok");
+        match outcome {
+            WaitOutcome::Clean(0) => {}
+            other => panic!("expected Clean(0), got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_panic_detector_kills_child_when_banner_appears() {
+        let scratch = TempDir::new().unwrap();
+        let console = scratch.path().join("console.log");
+
+        // Long-running child standing in for the wedged libkrun
+        // supervisor. Without panic detection this would block the
+        // wait for the full 30s; with detection we expect it to be
+        // killed within ~poll_interval of the banner write.
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+
+        // Writer thread: after a short delay, drop the banner into
+        // the console log. The watcher should pick it up on the next
+        // poll and signal the main thread to kill the sleep.
+        let console_writer = console.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(50));
+            std::fs::write(
+                &console_writer,
+                b"[ 0.01 ] booting\n[ 0.08 ] Kernel panic - not syncing: test banner\n",
+            )
+            .expect("write console log fixture");
+        });
+
+        let start = std::time::Instant::now();
+        let outcome = wait_with_panic_detector(&mut child, Some(&console), Duration::from_millis(10))
+            .expect("ok");
+        let elapsed = start.elapsed();
+        writer.join().expect("writer thread join");
+
+        match outcome {
+            WaitOutcome::KernelPanic { panic_line, console_log_path } => {
+                assert!(
+                    panic_line.contains("Kernel panic - not syncing: test banner"),
+                    "panic_line: {panic_line:?}"
+                );
+                assert_eq!(console_log_path, console.display().to_string());
+            }
+            other => panic!("expected KernelPanic, got {other:?}"),
+        }
+
+        // The full sleep is 30s; detection-and-kill must complete in
+        // a small fraction of that. 5s is generous slack for the
+        // slowest plausible CI runner. A regression that loses the
+        // kill (i.e. falls back to the wait blocking for 30s) blows
+        // this assertion well before it would hang the suite.
+        assert!(
+            elapsed < Duration::from_secs(5),
+            "panic detector did not kill the child promptly: {elapsed:?}"
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn wait_with_panic_detector_handles_late_console_log_creation() {
+        let scratch = TempDir::new().unwrap();
+        let console = scratch.path().join("console.log");
+        // No console.log on disk yet — the watcher must poll for it.
+        let mut child = Command::new("sh")
+            .args(["-c", "sleep 30"])
+            .stdin(Stdio::null())
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("spawn sh");
+
+        let console_writer = console.clone();
+        let writer = std::thread::spawn(move || {
+            // Sleep past several poll cycles so the watcher exercises
+            // its "file doesn't exist yet, retry" branch before the
+            // write lands.
+            std::thread::sleep(Duration::from_millis(200));
+            std::fs::write(
+                &console_writer,
+                b"Kernel panic - not syncing: delayed banner\n",
+            )
+            .expect("write console log fixture");
+        });
+
+        let outcome = wait_with_panic_detector(&mut child, Some(&console), Duration::from_millis(10))
+            .expect("ok");
+        writer.join().unwrap();
+
+        match outcome {
+            WaitOutcome::KernelPanic { panic_line, .. } => {
+                assert!(panic_line.contains("delayed banner"));
+            }
+            other => panic!("expected KernelPanic, got {other:?}"),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn seed_kernel_panic_error_display_mentions_panic_line_and_log_path() {
+        // Pin the error's Display output so callers (Stage 0 audit
+        // emit, user-facing UI) get a stable, parseable message
+        // shape.
+        let err = BuilderVmError::SeedKernelPanic {
+            panic_line: "Kernel panic - not syncing: example".to_string(),
+            console_log_path: "/tmp/example/console.log".to_string(),
+        };
+        let msg = format!("{err}");
+        assert!(msg.contains("Stage 0 seed VM kernel-panicked"), "{msg}");
+        assert!(msg.contains("Kernel panic - not syncing: example"), "{msg}");
+        assert!(msg.contains("/tmp/example/console.log"), "{msg}");
     }
 }
