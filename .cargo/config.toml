@@ -1,0 +1,16 @@
+# Cargo workspace config.
+#
+# `cargo xtask <subcommand>` should route to the in-workspace `xtask` crate
+# (`xtask/src/main.rs`) — not to the `cargo-xtask` placeholder some
+# contributors may have installed from crates.io, which only prints
+# "See https://github.com/matklad/cargo-xtask/" and exits. Without this
+# alias, every `cargo xtask build-dev-image …` invocation in the docs
+# (e.g. `public/src/content/docs/install/macos.md`,
+# `public/src/content/docs/contributing/development.md`, and Plan 77 W7's
+# error message in `bootstrap_builder_vm_image_via_dev_image_stage0`)
+# fails on any host that has the placeholder installed.
+#
+# Plan 77 W7.
+
+[alias]
+xtask = "run -p xtask --"
