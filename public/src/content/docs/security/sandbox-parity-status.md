@@ -69,10 +69,13 @@ coverage, and an integration test against a hermetic local registry.
 To move to Shipped: production profile rejects mutable tags, audit
 events fire for resolve, fetch, cache-hit, materialize, verify,
 launch, and delete; mvmd-side consumer is wired (mvmd ADR-0020
-cross-repo handoff).
+cross-repo handoff, tracked in
+[mvmd#153](https://github.com/tinylabscom/mvmd/issues/153)).
 
 Tracking work:
-[Plan 74 W1](https://github.com/tinylabscom/mvm/blob/main/specs/plans/74-claim-safe-sandbox-parity.md#w1--oci-image-ingest).
+[Plan 74 W1](https://github.com/tinylabscom/mvm/blob/main/specs/plans/74-claim-safe-sandbox-parity.md#w1--oci-image-ingest),
+[mvm#222](https://github.com/tinylabscom/mvm/issues/222),
+[mvmd#153](https://github.com/tinylabscom/mvmd/issues/153).
 
 ### `network-policy` — Planned
 
