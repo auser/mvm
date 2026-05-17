@@ -50,6 +50,10 @@ members = [
 # errors. ADR-002 §W4.2.
 exclude = [
     "crates/mvm-guest/fuzz",
+    # Plan 85 §R1 / Phase A.2 — layer-unpack fuzz harness. Same
+    # libfuzzer-sys linker-flag constraints as the mvm-guest fuzz
+    # crate; CI gate at `.github/workflows/ci.yml::oci-unpack-fuzz`.
+    "crates/mvm-oci/fuzz",
 ]
 resolver = "3"
 

@@ -626,3 +626,84 @@ jobs:
           MVM_CH_BOOTCHECK_KERNEL: ${{ github.workspace }}/ci-artifacts/vmlinux
           MVM_CH_BOOTCHECK_ROOTFS: ${{ github.workspace }}/ci-artifacts/rootfs.ext4
         run: cargo run --example ch-bootcheck -p mvm-backend
+
+  # ── Lane: oci-layer-unpack-fuzz (Plan 85 §R1, paths-gated) ──
+  #
+  # Cargo-fuzz harness for `mvm_oci::unpack::unpack_layer`. Wired
+  # in Plan 85 Phase A.2 — the first PR that ships a fuzz target
+  # under `crates/mvm-oci/fuzz/`. Subsequent Phase A sub-phases
+  # (A.3 hardlinks, A.4 xattrs, A.5 device nodes, A.6 setuid) add
+  # corpus entries here; the same harness covers them all because
+  # `unpack_layer` is the single ingress point.
+  #
+  # Budget per Plan 85 §R1 / §R4: 30 minutes when crates/mvm-oci
+  # changes, skipped otherwise. The 30-min figure is calibrated
+  # for libFuzzer's iteration rate against unpack-syscall cost
+  # (most inputs fail early at tar-header parsing, so iteration
+  # rate stays high in practice). The `|| github.ref` clause keeps
+  # post-merge coverage on main so a regression that snuck past
+  # path-gating shows up before the next mvm-oci PR.
+  #
+  # Daily long-form CIFuzz (separate workflow, Plan 85 §R4) is
+  # deferred to a follow-up plan-85 sub-PR.
+  #
+  # Security: every `run:` block here uses only workflow-internal
+  # expressions (`steps.filter.outputs.*`, `github.ref`,
+  # `github.run_id`, `hashFiles(...)`) — no user-controlled inputs
+  # like PR title, head_ref, or commit message reach the shell.
+  oci-unpack-fuzz:
+    name: oci-layer-unpack-fuzz (Plan 85 §R1)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect mvm-oci-touching paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            oci:
+              - 'crates/mvm-oci/**'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install cargo-fuzz
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        # `--locked` so a transitive bump in cargo-fuzz's deps can't
+        # silently change harness behavior between PR runs.
+        run: cargo install --locked cargo-fuzz
+
+      - name: Cache cargo
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            crates/mvm-oci/fuzz/target
+            crates/mvm-oci/fuzz/corpus
+          key: ${{ runner.os }}-cargo-oci-fuzz-${{ hashFiles('crates/mvm-oci/fuzz/Cargo.toml', 'crates/mvm-oci/src/unpack.rs') }}
+          restore-keys: ${{ runner.os }}-cargo-oci-fuzz-
+
+      - name: Fuzz unpack_layer (30-min budget)
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        working-directory: crates/mvm-oci
+        env:
+          # `cargo fuzz` needs nightly (-Z sanitizer flags). The
+          # repo-root rust-toolchain.toml pins stable; this env var
+          # bypasses the toolchain-file lookup for the duration of
+          # the step. Same pattern as security.yml's fuzz lane.
+          RUSTUP_TOOLCHAIN: nightly
+        run: cargo fuzz run unpack_layer -- -max_total_time=1800
+
+      - name: Upload corpus + artifacts on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: oci-fuzz-corpus-${{ github.run_id }}
+          path: |
+            crates/mvm-oci/fuzz/corpus/
+            crates/mvm-oci/fuzz/artifacts/
