@@ -7,10 +7,10 @@
 //! escape, hardlink-to-host, device-node planting, setuid surprise,
 //! xattr-based privilege carry).
 //!
-//! ## Scope of this sub-phase (A.1)
+//! ## Scope through sub-phase A.2
 //!
-//! Phase A.1 ships the base unpacker. The supported tar entry kinds
-//! are:
+//! The unpacker handles three tar entry kinds and two OCI-specific
+//! filename markers that ride inside regular-file tar entries:
 //!
 //! - **Regular files** — bytes streamed to a freshly-opened file at
 //!   `output_root/<entry-path>`. Mode is preserved from the tar
@@ -31,17 +31,28 @@
 //!   (the path the symlink *file itself* occupies) is under
 //!   `output_root`; targets that point outside are not unpack-time
 //!   errors.
+//! - **OCI whiteouts (A.2)** — regular-file tar entries (typeflag
+//!   `'0'`) whose *leaf filename* carries the OCI v1.1 whiteout
+//!   semantic. `.wh.<name>` removes the sibling `<name>` from the
+//!   assembled tree; `.wh..wh..opq` clears the parent directory's
+//!   prior-layer contents but preserves the directory itself. The
+//!   marker files themselves are **not** materialized. Both shapes
+//!   pass through every A.1 safety check on the marker's path
+//!   before the whiteout helper runs — including
+//!   [`RefusalReason::SymlinkInParent`], so a `.wh.passwd` under a
+//!   symlinked `etc/` refuses the same way a regular-file write
+//!   would. Targets that don't exist are no-ops (the OCI spec is
+//!   declarative; single-layer apply is idempotent).
 //!
 //! Every other entry kind — hardlinks (`tar::EntryType::Link`),
 //! character/block special files, FIFOs, named sockets, sparse files,
-//! tar-format whiteout markers (`.wh.*`), tar-format extended-attr
-//! pax headers, GNU long-name continuations — is **refused** by A.1
-//! with [`RefusalReason::UnsupportedEntryType`]. Later sub-phases
+//! tar-format extended-attr pax headers, GNU long-name
+//! continuations — is **refused** with
+//! [`RefusalReason::UnsupportedEntryType`]. Later sub-phases
 //! re-classify each refused category:
 //!
 //! | Sub-phase | What it adds |
 //! |---|---|
-//! | A.2 | OCI whiteouts (`.wh.<name>`, `.wh..wh..opq`) |
 //! | A.3 | Hardlinks within-layer; cross-layer hardlinks materialize as copy |
 //! | A.4 | xattrs (allow-listed: `user.*`, `security.capability`, `security.selinux`) |
 //! | A.5 | Device nodes (allow-listed to `/dev/{null,zero,random,urandom}` only) |
@@ -92,6 +103,17 @@ use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
 use std::path::{Component, Path, PathBuf};
 
+/// OCI v1.1 whiteout marker prefix. A regular-file tar entry whose
+/// **leaf filename** starts with this byte sequence is interpreted as
+/// a whiteout instruction, not a file to materialize.
+const WHITEOUT_PREFIX: &[u8] = b".wh.";
+
+/// OCI v1.1 opaque-directory whiteout marker — the full leaf
+/// filename (not a prefix). Distinct from `.wh.<name>` because it
+/// directs the unpacker to clear the **parent** directory's
+/// prior-layer contents rather than removing a sibling.
+const WHITEOUT_OPAQUE: &[u8] = b".wh..wh..opq";
+
 /// Caller-controlled knobs for [`unpack_layer`].
 ///
 /// Defaults are the production-safe ones; tests override individual
@@ -135,6 +157,18 @@ pub struct UnpackReport {
     pub dirs_created: u64,
     /// Symlinks written.
     pub symlinks_written: u64,
+    /// OCI `.wh.<name>` whiteout markers applied. A successful apply
+    /// removes the sibling target if it exists; if the target is
+    /// absent the apply is still counted because the marker was
+    /// consumed (single-layer apply is declarative — Plan 85
+    /// Phase A.2 footprint, OCI v1.1 §"Layer Filesystem Changeset").
+    pub whiteouts_applied: u64,
+    /// OCI `.wh..wh..opq` opaque-directory markers applied. A
+    /// successful apply clears the parent directory's prior-layer
+    /// contents (the directory itself is preserved). Counted even
+    /// when the parent is absent or empty, for the same declarative
+    /// reason as `whiteouts_applied`.
+    pub opaque_markers_applied: u64,
     /// Tar entries refused by policy, in the order they appeared in
     /// the stream. Each carries a [`RefusalReason`] so a downstream
     /// audit / debugging surface can render them.
@@ -363,17 +397,54 @@ pub fn unpack_layer<R: Read>(
             continue;
         }
 
-        // Phase A.1 dispatch: only three entry kinds are accepted.
-        // Everything else is refused — A.2 onwards narrows this.
+        // A.1+A.2 dispatch: regular files and directories and
+        // symlinks materialize; regular-file entries whose **leaf
+        // filename** matches the OCI whiteout pattern dispatch to
+        // the whiteout helpers instead of `write_regular_file`.
+        // Everything else refuses — A.3 onwards narrows this.
         let entry_type = entry.header().entry_type();
         match entry_type {
             tar::EntryType::Regular | tar::EntryType::Continuous => {
-                match write_regular_file(&mut entry, &target, options) {
-                    Ok(()) => report.files_written += 1,
-                    Err(refuse) => report.refused.push(RefusedEntry {
-                        raw_path: raw_path.clone(),
-                        reason: refuse,
-                    }),
+                match classify_whiteout(&raw_path) {
+                    WhiteoutKind::None => match write_regular_file(&mut entry, &target, options) {
+                        Ok(()) => report.files_written += 1,
+                        Err(refuse) => report.refused.push(RefusedEntry {
+                            raw_path: raw_path.clone(),
+                            reason: refuse,
+                        }),
+                    },
+                    WhiteoutKind::Opaque => {
+                        // Parent-of-marker is the directory we're
+                        // clearing. `target` already points at the
+                        // marker file, so we strip the marker leaf
+                        // to get the parent dir.
+                        let parent = target.parent().unwrap_or(output_root);
+                        match apply_opaque_whiteout(parent, output_root) {
+                            Ok(()) => report.opaque_markers_applied += 1,
+                            Err(refuse) => report.refused.push(RefusedEntry {
+                                raw_path: raw_path.clone(),
+                                reason: refuse,
+                            }),
+                        }
+                    }
+                    WhiteoutKind::Regular(name_suffix) => {
+                        // Sibling target = `<parent_of_marker>/<name_suffix>`.
+                        let parent = target.parent().unwrap_or(output_root);
+                        let sibling = parent.join(OsStr::from_bytes(name_suffix));
+                        match apply_regular_whiteout(&sibling, output_root) {
+                            Ok(()) => report.whiteouts_applied += 1,
+                            Err(refuse) => report.refused.push(RefusedEntry {
+                                raw_path: raw_path.clone(),
+                                reason: refuse,
+                            }),
+                        }
+                    }
+                    WhiteoutKind::Malformed => {
+                        report.refused.push(RefusedEntry {
+                            raw_path: raw_path.clone(),
+                            reason: RefusalReason::MalformedHeader,
+                        });
+                    }
                 }
             }
             tar::EntryType::Directory => match create_directory(&target) {
@@ -564,6 +635,121 @@ fn write_symlink(link_target_bytes: Option<&[u8]>, target: &Path) -> Result<(), 
         Ok(()) => Ok(()),
         Err(_) => Err(RefusalReason::MalformedHeader),
     }
+}
+
+/// Tells the dispatch loop whether a regular-file tar entry is
+/// actually an OCI whiteout marker and, if so, which kind.
+///
+/// Decided strictly from the **leaf filename**. The path's parent
+/// chain is irrelevant for classification (a directory named `.wh.X`
+/// is legitimate as an intermediate component); only the last
+/// segment carries the marker semantic.
+enum WhiteoutKind<'a> {
+    /// Not a whiteout — treat as a regular file write.
+    None,
+    /// `.wh..wh..opq` — clear parent dir's prior contents.
+    Opaque,
+    /// `.wh.<name>` — remove sibling. Inner slice is `<name>` (the
+    /// suffix after the four-byte `.wh.` prefix).
+    Regular(&'a [u8]),
+    /// `.wh.` exactly (empty suffix) — wire-format violation, refused.
+    Malformed,
+}
+
+fn classify_whiteout(raw_path: &[u8]) -> WhiteoutKind<'_> {
+    // Leaf filename = bytes after the last `/`. For root-level paths
+    // with no `/`, the whole path is the filename.
+    let leaf = match raw_path.iter().rposition(|b| *b == b'/') {
+        Some(idx) => &raw_path[idx + 1..],
+        None => raw_path,
+    };
+
+    if leaf == WHITEOUT_OPAQUE {
+        return WhiteoutKind::Opaque;
+    }
+    if !leaf.starts_with(WHITEOUT_PREFIX) {
+        return WhiteoutKind::None;
+    }
+    let suffix = &leaf[WHITEOUT_PREFIX.len()..];
+    if suffix.is_empty() {
+        return WhiteoutKind::Malformed;
+    }
+    WhiteoutKind::Regular(suffix)
+}
+
+/// Apply a `.wh.<name>` whiteout: remove the sibling file or
+/// directory tree at `target` if it exists. Single-layer apply is
+/// idempotent; an absent target is **not** a refusal.
+///
+/// `output_root` is passed so the caller's safety envelope continues
+/// to apply — we re-assert `target` lives under it before any
+/// filesystem mutation. The check is defense-in-depth: the entry's
+/// path already passed every A.1 safety check, and the sibling
+/// shares the same parent chain, so this branch should be
+/// unreachable for any non-malicious caller wiring.
+fn apply_regular_whiteout(target: &Path, output_root: &Path) -> Result<(), RefusalReason> {
+    if !target.starts_with(output_root) {
+        return Err(RefusalReason::JoinedPathEscape);
+    }
+
+    // `symlink_metadata` doesn't follow symlinks — important so a
+    // sibling symlink-to-elsewhere gets removed as a symlink rather
+    // than the unpacker dereferencing it and acting on whatever it
+    // points at. The corresponding `remove_file` call deletes the
+    // symlink, not its target.
+    match std::fs::symlink_metadata(target) {
+        Ok(meta) if meta.file_type().is_dir() => match std::fs::remove_dir_all(target) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(RefusalReason::MalformedHeader),
+        },
+        Ok(_) => match std::fs::remove_file(target) {
+            Ok(()) => Ok(()),
+            Err(_) => Err(RefusalReason::MalformedHeader),
+        },
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(_) => Err(RefusalReason::MalformedHeader),
+    }
+}
+
+/// Apply a `.wh..wh..opq` opaque whiteout: clear `target_dir`'s
+/// current contents, preserving the directory itself. Absent or
+/// non-directory targets are no-ops (single-layer apply is
+/// declarative; the caller doing multi-layer composition decides
+/// what "clear prior" means for its own state).
+///
+/// Same `output_root` defense-in-depth check as the regular
+/// whiteout: re-assert the target dir lives under root.
+fn apply_opaque_whiteout(target_dir: &Path, output_root: &Path) -> Result<(), RefusalReason> {
+    if !target_dir.starts_with(output_root) {
+        return Err(RefusalReason::JoinedPathEscape);
+    }
+
+    let read_dir = match std::fs::read_dir(target_dir) {
+        Ok(rd) => rd,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(_) => return Err(RefusalReason::MalformedHeader),
+    };
+
+    for child in read_dir {
+        let child = match child {
+            Ok(c) => c,
+            Err(_) => return Err(RefusalReason::MalformedHeader),
+        };
+        let child_path = child.path();
+        let file_type = match child.file_type() {
+            Ok(ft) => ft,
+            Err(_) => return Err(RefusalReason::MalformedHeader),
+        };
+        let removed = if file_type.is_dir() {
+            std::fs::remove_dir_all(&child_path)
+        } else {
+            std::fs::remove_file(&child_path)
+        };
+        if removed.is_err() {
+            return Err(RefusalReason::MalformedHeader);
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -942,5 +1128,249 @@ mod tests {
             assert!(!t.contains(','), "{r:?} -> {t:?}");
             assert!(!t.contains('\n'), "{r:?} -> {t:?}");
         }
+    }
+
+    // ── Phase A.2: OCI whiteout + opaque marker semantics ────────
+
+    #[test]
+    fn whiteout_removes_sibling_file_written_earlier_in_layer() {
+        // Within-layer ordering: the file is written first, then a
+        // sibling `.wh.<name>` marker removes it. The marker itself
+        // is not materialized. Multi-layer composition (Phase D
+        // territory) consumes whiteouts the same way.
+        let tar_bytes = build_tar(|b| {
+            add_dir(b, "etc/");
+            add_file(b, "etc/passwd", b"root:x:0:0::/root:/bin/sh\n");
+            add_file(b, "etc/.wh.passwd", b"");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.files_written, 1, "etc/passwd was written");
+        assert_eq!(report.whiteouts_applied, 1);
+        assert_eq!(report.opaque_markers_applied, 0);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert!(
+            !tmp.path().join("etc/passwd").exists(),
+            "whiteout should have removed etc/passwd"
+        );
+        assert!(
+            !tmp.path().join("etc/.wh.passwd").exists(),
+            "whiteout marker itself must not be materialized in the output tree"
+        );
+    }
+
+    #[test]
+    fn whiteout_with_absent_target_is_idempotent_noop() {
+        // OCI single-layer apply is declarative — a `.wh.<name>`
+        // whose target doesn't exist is still a successful apply
+        // (the marker has been consumed). Counter still increments.
+        let tar_bytes = build_tar(|b| {
+            add_dir(b, "etc/");
+            add_file(b, "etc/.wh.ghost", b"");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.whiteouts_applied, 1);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert!(!tmp.path().join("etc/.wh.ghost").exists());
+        assert!(!tmp.path().join("etc/ghost").exists());
+    }
+
+    #[test]
+    fn whiteout_removes_sibling_directory_recursively() {
+        // A whiteout on a directory takes the whole subtree out.
+        // remove_dir_all is the right primitive — we use
+        // symlink_metadata first so we don't accidentally walk a
+        // symlink-to-elsewhere as a directory.
+        let tar_bytes = build_tar(|b| {
+            add_dir(b, "etc/");
+            add_dir(b, "etc/sub/");
+            add_file(b, "etc/sub/a", b"one");
+            add_file(b, "etc/sub/b", b"two");
+            add_file(b, "etc/.wh.sub", b"");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.whiteouts_applied, 1);
+        assert!(!tmp.path().join("etc/sub").exists());
+        assert!(!tmp.path().join("etc/sub/a").exists());
+        assert!(!tmp.path().join("etc/sub/b").exists());
+        assert!(tmp.path().join("etc").is_dir(), "parent etc/ must remain");
+    }
+
+    #[test]
+    fn opaque_whiteout_clears_parent_contents_preserving_directory() {
+        // `.wh..wh..opq` clears the parent dir's prior-layer
+        // contents but keeps the dir itself. In a single-layer
+        // tar, "prior contents" means anything we already wrote
+        // for this layer below `etc/`.
+        let tar_bytes = build_tar(|b| {
+            add_dir(b, "etc/");
+            add_file(b, "etc/a", b"alpha");
+            add_file(b, "etc/b", b"beta");
+            add_dir(b, "etc/sub/");
+            add_file(b, "etc/sub/c", b"gamma");
+            add_file(b, "etc/.wh..wh..opq", b"");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.opaque_markers_applied, 1);
+        assert_eq!(report.whiteouts_applied, 0);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+
+        // The parent dir survives; its prior contents are gone.
+        assert!(tmp.path().join("etc").is_dir(), "etc/ must remain");
+        assert!(!tmp.path().join("etc/a").exists());
+        assert!(!tmp.path().join("etc/b").exists());
+        assert!(!tmp.path().join("etc/sub").exists());
+        // The opaque marker itself is not materialized.
+        assert!(!tmp.path().join("etc/.wh..wh..opq").exists());
+    }
+
+    #[test]
+    fn whiteout_under_symlinked_parent_refuses_like_a_regular_write() {
+        // CVE-class guard: a `.wh.passwd` under a symlinked `etc/`
+        // must refuse with SymlinkInParent, same as a regular-file
+        // write would. Otherwise a malicious layer could write
+        // `etc -> /tmp` then `etc/.wh.passwd` and trick the
+        // unpacker into removing `/tmp/passwd`.
+        let tar_bytes = build_tar(|b| {
+            add_symlink(b, "etc", "/tmp");
+            add_file(b, "etc/.wh.passwd", b"");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.symlinks_written, 1);
+        assert_eq!(report.whiteouts_applied, 0);
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(report.refused[0].reason, RefusalReason::SymlinkInParent);
+    }
+
+    #[test]
+    fn whiteout_with_traversal_in_path_refuses() {
+        // `.wh.foo` is a fine filename; `foo/../.wh.bar` is not — the
+        // traversal segment in the parent chain must refuse before
+        // the whiteout dispatch even runs.
+        let tar_bytes = handrolled_tar_with_path(b"foo/../.wh.bar", b'0');
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
+        assert_eq!(report.refused[0].reason, RefusalReason::TraversalSegment);
+        assert_eq!(report.whiteouts_applied, 0);
+    }
+
+    #[test]
+    fn malformed_whiteout_marker_with_empty_suffix_refused() {
+        // `.wh.` exactly (no suffix) is a wire-format violation per
+        // OCI v1.1 §"Layer Filesystem Changeset" — every whiteout
+        // either names a sibling (`.wh.<name>`) or is the magic
+        // opaque marker (`.wh..wh..opq`). The bare prefix is neither.
+        // Refused as MalformedHeader (not a security boundary; just
+        // an unrenderable marker).
+        let tar_bytes = build_tar(|b| {
+            add_dir(b, "etc/");
+            add_file(b, "etc/.wh.", b"");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.whiteouts_applied, 0);
+        assert_eq!(report.opaque_markers_applied, 0);
+        assert_eq!(report.refused.len(), 1);
+        assert_eq!(report.refused[0].reason, RefusalReason::MalformedHeader);
+    }
+
+    #[test]
+    fn filename_with_wh_substring_but_not_prefix_is_a_regular_file() {
+        // `foo.wh.bar` is a regular filename, not a whiteout. The
+        // classifier matches on the *leaf prefix*, not on a
+        // substring anywhere in the leaf — otherwise legitimate
+        // filenames would be silently dropped.
+        let tar_bytes = build_tar(|b| {
+            add_file(b, "foo.wh.bar", b"contents");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.whiteouts_applied, 0);
+        assert!(tmp.path().join("foo.wh.bar").is_file());
+    }
+
+    #[test]
+    fn intermediate_directory_named_wh_passes_through() {
+        // A *directory* component named `.wh.something` is not a
+        // marker — only the **leaf** filename of a regular-file
+        // entry carries the semantic. So `a/.wh.x/y` writes a real
+        // file at `a/.wh.x/y` with `.wh.x` materialized as a
+        // directory by `create_dir_all`.
+        let tar_bytes = build_tar(|b| {
+            add_file(b, "a/.wh.x/y", b"data");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.whiteouts_applied, 0);
+        assert!(tmp.path().join("a/.wh.x/y").is_file());
     }
 }
