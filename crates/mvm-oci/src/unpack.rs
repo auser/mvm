@@ -7,7 +7,7 @@
 //! escape, hardlink-to-host, device-node planting, setuid surprise,
 //! xattr-based privilege carry).
 //!
-//! ## Scope through sub-phase A.2
+//! ## Scope through sub-phase A.3
 //!
 //! The unpacker handles three tar entry kinds and two OCI-specific
 //! filename markers that ride inside regular-file tar entries:
@@ -45,11 +45,20 @@
 //!   symlinked `etc/` refuses the same way a regular-file write
 //!   would. Targets that don't exist are no-ops (the OCI spec is
 //!   declarative; single-layer apply is idempotent).
+//! - **Hardlinks (A.3)** — tar `LINK` entries are accepted only
+//!   when their link target resolves to an existing regular file
+//!   under `output_root`. If the target was written earlier in the
+//!   same layer, the entry is materialized as a real hardlink. If
+//!   the target exists only from lower/prior layer state, the entry
+//!   is materialized as a full copy so the current layer never
+//!   creates a new inode alias back into mutable lower-layer
+//!   pre-image state. A missing target refuses with
+//!   [`RefusalReason::HardlinkTargetMissing`] (CVE-2019-14271
+//!   mitigation).
 //!
-//! Every other entry kind — hardlinks (`tar::EntryType::Link`),
-//! character/block special files, FIFOs, named sockets, sparse files,
-//! tar-format extended-attr pax headers, GNU long-name
-//! continuations — is **refused** with
+//! Every other entry kind — character/block special files, FIFOs,
+//! named sockets, sparse files, tar-format extended-attr pax
+//! headers, GNU long-name continuations — is **refused** with
 //! [`RefusalReason::UnsupportedEntryType`]. Later sub-phases
 //! re-classify each refused category:
 //!
@@ -60,7 +69,7 @@
 //! | A.5 | Device nodes (allow-listed to `/dev/{null,zero,random,urandom}` only) |
 //! | A.6 | setuid/setgid bits, policy-controlled (refused under prod-no-cosign) |
 //!
-//! ## Safety properties enforced in A.1
+//! ## Safety properties enforced through A.3
 //!
 //! 1. **No path escapes `output_root`.** Three checks layer on top of
 //!    each other for defense in depth:
@@ -160,6 +169,15 @@ pub struct UnpackReport {
     pub dirs_created: u64,
     /// Symlinks written.
     pub symlinks_written: u64,
+    /// Hardlinks materialized as real hardlinks because the target
+    /// was written earlier in this same layer (Plan 85 Phase A.3).
+    pub hardlinks_written: u64,
+    /// Hardlink entries materialized as full file copies because
+    /// the target existed only in lower/prior layer state. This is
+    /// intentionally separate from `files_written` so callers can
+    /// audit hardlink semantics without conflating them with normal
+    /// file entries.
+    pub hardlink_copies_written: u64,
     /// OCI `.wh.<name>` whiteout markers applied. A successful apply
     /// removes the sibling target if it exists; if the target is
     /// absent the apply is still counted because the marker was
@@ -219,6 +237,12 @@ pub enum RefusalReason {
     /// A.3 adds hardlinks, etc.); A.1 refuses everything except
     /// regular files, directories, and in-root symlinks.
     UnsupportedEntryType,
+    /// A tar hardlink entry referenced a target that does not exist
+    /// in the already-assembled tree. Refusing missing targets is
+    /// the Plan 85 / CVE-2019-14271 guard: the unpacker never lets a
+    /// later path retroactively define what an earlier hardlink
+    /// points at.
+    HardlinkTargetMissing,
     /// Tar header was malformed (unreadable path bytes, etc.). We
     /// refuse the entry rather than failing the whole unpack — a
     /// single bad entry shouldn't poison a multi-thousand-entry
@@ -238,6 +262,7 @@ impl RefusalReason {
             Self::JoinedPathEscape => "joined_path_escape",
             Self::SymlinkInParent => "symlink_in_parent",
             Self::UnsupportedEntryType => "unsupported_entry_type",
+            Self::HardlinkTargetMissing => "hardlink_target_missing",
             Self::MalformedHeader => "malformed_header",
         }
     }
@@ -492,6 +517,29 @@ pub fn unpack_layer<R: Read>(
                     }),
                 }
             }
+            tar::EntryType::Link => {
+                let link_target = entry.link_name_bytes().map(|b| b.into_owned());
+                match materialize_hardlink(
+                    link_target.as_deref(),
+                    &target,
+                    output_root,
+                    options,
+                    &current_layer_paths,
+                ) {
+                    Ok(HardlinkAction::Linked) => {
+                        report.hardlinks_written += 1;
+                        current_layer_paths.insert(rel_path.clone());
+                    }
+                    Ok(HardlinkAction::Copied) => {
+                        report.hardlink_copies_written += 1;
+                        current_layer_paths.insert(rel_path.clone());
+                    }
+                    Err(refuse) => report.refused.push(RefusedEntry {
+                        raw_path: raw_path.clone(),
+                        reason: refuse,
+                    }),
+                }
+            }
             _ => {
                 report.refused.push(RefusedEntry {
                     raw_path,
@@ -659,6 +707,133 @@ fn write_symlink(link_target_bytes: Option<&[u8]>, target: &Path) -> Result<(), 
         Ok(()) => Ok(()),
         Err(_) => Err(RefusalReason::MalformedHeader),
     }
+}
+
+enum HardlinkAction {
+    Linked,
+    Copied,
+}
+
+/// Materialize a tar hardlink entry at `target`.
+///
+/// Plan 85 Phase A.3 deliberately distinguishes same-layer and
+/// cross-layer hardlinks. Same-layer targets become true hardlinks
+/// because both paths belong to the layer currently being applied.
+/// Lower-layer targets become full copies because aliasing a new
+/// current-layer path to prior-layer inode state would make later
+/// whiteout / mutation reasoning depend on host filesystem identity.
+fn materialize_hardlink(
+    link_target_bytes: Option<&[u8]>,
+    target: &Path,
+    output_root: &Path,
+    options: &UnpackOptions,
+    current_layer_paths: &HashSet<PathBuf>,
+) -> Result<HardlinkAction, RefusalReason> {
+    let target_rel = validate_hardlink_target(link_target_bytes, output_root, options)?;
+    let source = output_root.join(&target_rel);
+
+    if parent_chain_has_symlink(output_root, &target_rel) {
+        return Err(RefusalReason::SymlinkInParent);
+    }
+    if !source.starts_with(output_root) {
+        return Err(RefusalReason::JoinedPathEscape);
+    }
+
+    let source_meta = match std::fs::symlink_metadata(&source) {
+        Ok(meta) => meta,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return Err(RefusalReason::HardlinkTargetMissing);
+        }
+        Err(_) => return Err(RefusalReason::MalformedHeader),
+    };
+    if !source_meta.file_type().is_file() {
+        return Err(RefusalReason::MalformedHeader);
+    }
+
+    if let Some(parent) = target.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return Err(RefusalReason::MalformedHeader);
+        }
+    }
+
+    if current_layer_paths.contains(&target_rel) {
+        std::fs::hard_link(&source, target).map_err(|_| RefusalReason::MalformedHeader)?;
+        Ok(HardlinkAction::Linked)
+    } else {
+        copy_existing_regular_file(&source, target, options).map(|()| HardlinkAction::Copied)
+    }
+}
+
+fn validate_hardlink_target(
+    link_target_bytes: Option<&[u8]>,
+    output_root: &Path,
+    options: &UnpackOptions,
+) -> Result<PathBuf, RefusalReason> {
+    let raw = match link_target_bytes {
+        Some(b) if !b.is_empty() && !b.contains(&0) => b,
+        _ => return Err(RefusalReason::MalformedHeader),
+    };
+
+    if raw.first() == Some(&b'/') {
+        return Err(RefusalReason::AbsolutePath);
+    }
+    if raw.split(|b| *b == b'/').any(|seg| seg == b"..") {
+        return Err(RefusalReason::TraversalSegment);
+    }
+    if raw.len() > options.max_path_len {
+        return Err(RefusalReason::PathTooLong);
+    }
+
+    let rel = PathBuf::from(OsStr::from_bytes(raw));
+    let joined = output_root.join(&rel);
+    if !joined.starts_with(output_root) {
+        return Err(RefusalReason::JoinedPathEscape);
+    }
+    Ok(rel)
+}
+
+fn copy_existing_regular_file(
+    source: &Path,
+    target: &Path,
+    options: &UnpackOptions,
+) -> Result<(), RefusalReason> {
+    use std::fs::OpenOptions;
+    use std::io::Write;
+    use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
+
+    let source_mode = std::fs::symlink_metadata(source)
+        .map_err(|_| RefusalReason::MalformedHeader)?
+        .mode()
+        & 0o0777;
+
+    let mut source_file = OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW)
+        .open(source)
+        .map_err(|_| RefusalReason::MalformedHeader)?;
+
+    let mut target_opts = OpenOptions::new();
+    target_opts
+        .write(true)
+        .create_new(true)
+        .mode(source_mode)
+        .custom_flags(libc::O_NOFOLLOW);
+    let mut target_file = target_opts
+        .open(target)
+        .map_err(|_| RefusalReason::MalformedHeader)?;
+
+    std::io::copy(&mut source_file, &mut target_file)
+        .map_err(|_| RefusalReason::MalformedHeader)?;
+    target_file
+        .flush()
+        .map_err(|_| RefusalReason::MalformedHeader)?;
+
+    if options.strip_timestamps {
+        use std::time::SystemTime;
+        let _ = target_file.set_modified(SystemTime::UNIX_EPOCH);
+    }
+
+    Ok(())
 }
 
 /// Tells the dispatch loop whether a regular-file tar entry is
@@ -881,7 +1056,7 @@ mod tests {
         builder.append(&header, std::io::empty()).unwrap();
     }
 
-    /// Add a hardlink entry (refused in A.1; will be supported in A.3).
+    /// Add a hardlink entry.
     fn add_hardlink(builder: &mut tar::Builder<Cursor<Vec<u8>>>, path: &str, link_target: &str) {
         let mut header = tar::Header::new_gnu();
         header.set_path(path).unwrap();
@@ -1073,7 +1248,7 @@ mod tests {
     }
 
     #[test]
-    fn refuses_hardlink_in_phase_a1() {
+    fn hardlink_to_same_layer_target_materializes_as_hardlink() {
         let tar_bytes = build_tar(|b| {
             add_file(b, "real", b"data");
             add_hardlink(b, "alias", "real");
@@ -1087,15 +1262,20 @@ mod tests {
         )
         .expect("unpack ok");
 
-        // The regular file writes successfully; the hardlink is
-        // refused because Phase A.1 doesn't support `Link` entries.
         assert_eq!(report.files_written, 1);
-        assert_eq!(report.refused.len(), 1);
+        assert_eq!(report.hardlinks_written, 1);
+        assert_eq!(report.hardlink_copies_written, 0);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
         assert_eq!(
-            report.refused[0].reason,
-            RefusalReason::UnsupportedEntryType
+            std::fs::read_to_string(tmp.path().join("alias")).unwrap(),
+            "data"
         );
-        assert!(!tmp.path().join("alias").exists());
+
+        use std::os::unix::fs::MetadataExt;
+        let real = std::fs::metadata(tmp.path().join("real")).unwrap();
+        let alias = std::fs::metadata(tmp.path().join("alias")).unwrap();
+        assert_eq!(real.dev(), alias.dev());
+        assert_eq!(real.ino(), alias.ino());
     }
 
     #[test]
@@ -1197,6 +1377,7 @@ mod tests {
             RefusalReason::PathTooLong,
             RefusalReason::JoinedPathEscape,
             RefusalReason::SymlinkInParent,
+            RefusalReason::HardlinkTargetMissing,
             RefusalReason::UnsupportedEntryType,
             RefusalReason::MalformedHeader,
         ];
@@ -1496,5 +1677,132 @@ mod tests {
         assert_eq!(report.files_written, 1);
         assert_eq!(report.whiteouts_applied, 0);
         assert!(tmp.path().join("a/.wh.x/y").is_file());
+    }
+
+    // ── Phase A.3: hardlink semantics ────────────────────────────
+
+    #[test]
+    fn hardlink_to_lower_layer_target_materializes_as_copy() {
+        let tar_bytes = build_tar(|b| {
+            add_hardlink(b, "alias", "lower/real");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("lower")).unwrap();
+        std::fs::write(tmp.path().join("lower/real"), b"lower-data").unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.files_written, 0);
+        assert_eq!(report.hardlinks_written, 0);
+        assert_eq!(report.hardlink_copies_written, 1);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("alias")).unwrap(),
+            "lower-data"
+        );
+
+        use std::os::unix::fs::MetadataExt;
+        let real = std::fs::metadata(tmp.path().join("lower/real")).unwrap();
+        let alias = std::fs::metadata(tmp.path().join("alias")).unwrap();
+        assert_ne!(
+            real.ino(),
+            alias.ino(),
+            "cross-layer hardlink must be copied, not aliased"
+        );
+    }
+
+    #[test]
+    fn hardlink_to_absent_target_is_refused() {
+        let tar_bytes = build_tar(|b| {
+            add_hardlink(b, "alias", "missing");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.hardlinks_written, 0);
+        assert_eq!(report.hardlink_copies_written, 0);
+        assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
+        assert_eq!(
+            report.refused[0].reason,
+            RefusalReason::HardlinkTargetMissing
+        );
+        assert!(!tmp.path().join("alias").exists());
+    }
+
+    #[test]
+    fn hardlink_target_traversal_is_refused() {
+        let tar_bytes = build_tar(|b| {
+            add_file(b, "real", b"data");
+            add_hardlink(b, "alias", "../real");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
+        assert_eq!(report.refused[0].reason, RefusalReason::TraversalSegment);
+        assert!(!tmp.path().join("alias").exists());
+    }
+
+    #[test]
+    fn hardlink_under_symlinked_parent_refuses() {
+        let tar_bytes = build_tar(|b| {
+            add_file(b, "real", b"data");
+            add_symlink(b, "out", "/tmp");
+            add_hardlink(b, "out/alias", "real");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.symlinks_written, 1);
+        assert_eq!(report.hardlinks_written, 0);
+        assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
+        assert_eq!(report.refused[0].reason, RefusalReason::SymlinkInParent);
+    }
+
+    #[test]
+    fn hardlink_to_symlink_target_is_refused() {
+        let tar_bytes = build_tar(|b| {
+            add_symlink(b, "link", "real");
+            add_hardlink(b, "alias", "link");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.symlinks_written, 1);
+        assert_eq!(report.hardlinks_written, 0);
+        assert_eq!(report.hardlink_copies_written, 0);
+        assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
+        assert_eq!(report.refused[0].reason, RefusalReason::MalformedHeader);
     }
 }
