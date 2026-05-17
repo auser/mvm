@@ -36,7 +36,9 @@
 //!   semantic. `.wh.<name>` removes the sibling `<name>` from the
 //!   assembled tree; `.wh..wh..opq` clears the parent directory's
 //!   prior-layer contents but preserves the directory itself. The
-//!   marker files themselves are **not** materialized. Both shapes
+//!   marker files themselves are **not** materialized, and markers
+//!   apply only to prior/lower-layer state, never to entries from
+//!   the same layer. Both shapes
 //!   pass through every A.1 safety check on the marker's path
 //!   before the whiteout helper runs — including
 //!   [`RefusalReason::SymlinkInParent`], so a `.wh.passwd` under a
@@ -98,6 +100,7 @@
 //! covers OCI semantics). We expose a synchronous `unpack_layer` and
 //! expect async callers to wrap with `tokio::task::spawn_blocking`.
 
+use std::collections::HashSet;
 use std::ffi::OsStr;
 use std::io::Read;
 use std::os::unix::ffi::OsStrExt;
@@ -308,6 +311,7 @@ pub fn unpack_layer<R: Read>(
     archive.set_unpack_xattrs(false);
 
     let mut report = UnpackReport::default();
+    let mut current_layer_paths = HashSet::new();
 
     for entry_result in archive.entries()? {
         let mut entry = match entry_result {
@@ -407,7 +411,10 @@ pub fn unpack_layer<R: Read>(
             tar::EntryType::Regular | tar::EntryType::Continuous => {
                 match classify_whiteout(&raw_path) {
                     WhiteoutKind::None => match write_regular_file(&mut entry, &target, options) {
-                        Ok(()) => report.files_written += 1,
+                        Ok(()) => {
+                            report.files_written += 1;
+                            current_layer_paths.insert(rel_path.clone());
+                        }
                         Err(refuse) => report.refused.push(RefusedEntry {
                             raw_path: raw_path.clone(),
                             reason: refuse,
@@ -419,7 +426,13 @@ pub fn unpack_layer<R: Read>(
                         // marker file, so we strip the marker leaf
                         // to get the parent dir.
                         let parent = target.parent().unwrap_or(output_root);
-                        match apply_opaque_whiteout(parent, output_root) {
+                        let parent_rel = rel_path.parent().unwrap_or_else(|| Path::new(""));
+                        match apply_opaque_whiteout(
+                            parent,
+                            parent_rel,
+                            output_root,
+                            &current_layer_paths,
+                        ) {
                             Ok(()) => report.opaque_markers_applied += 1,
                             Err(refuse) => report.refused.push(RefusedEntry {
                                 raw_path: raw_path.clone(),
@@ -430,8 +443,15 @@ pub fn unpack_layer<R: Read>(
                     WhiteoutKind::Regular(name_suffix) => {
                         // Sibling target = `<parent_of_marker>/<name_suffix>`.
                         let parent = target.parent().unwrap_or(output_root);
+                        let parent_rel = rel_path.parent().unwrap_or_else(|| Path::new(""));
+                        let sibling_rel = parent_rel.join(OsStr::from_bytes(name_suffix));
                         let sibling = parent.join(OsStr::from_bytes(name_suffix));
-                        match apply_regular_whiteout(&sibling, output_root) {
+                        match apply_regular_whiteout(
+                            &sibling,
+                            &sibling_rel,
+                            output_root,
+                            &current_layer_paths,
+                        ) {
                             Ok(()) => report.whiteouts_applied += 1,
                             Err(refuse) => report.refused.push(RefusedEntry {
                                 raw_path: raw_path.clone(),
@@ -452,6 +472,7 @@ pub fn unpack_layer<R: Read>(
                     if created {
                         report.dirs_created += 1;
                     }
+                    current_layer_paths.insert(rel_path.clone());
                 }
                 Err(refuse) => report.refused.push(RefusedEntry {
                     raw_path: raw_path.clone(),
@@ -461,7 +482,10 @@ pub fn unpack_layer<R: Read>(
             tar::EntryType::Symlink => {
                 let link_target = entry.link_name_bytes().map(|b| b.into_owned());
                 match write_symlink(link_target.as_deref(), &target) {
-                    Ok(()) => report.symlinks_written += 1,
+                    Ok(()) => {
+                        report.symlinks_written += 1;
+                        current_layer_paths.insert(rel_path.clone());
+                    }
                     Err(refuse) => report.refused.push(RefusedEntry {
                         raw_path: raw_path.clone(),
                         reason: refuse,
@@ -678,8 +702,10 @@ fn classify_whiteout(raw_path: &[u8]) -> WhiteoutKind<'_> {
 }
 
 /// Apply a `.wh.<name>` whiteout: remove the sibling file or
-/// directory tree at `target` if it exists. Single-layer apply is
-/// idempotent; an absent target is **not** a refusal.
+/// directory tree at `target` if it exists, except for paths written
+/// by the layer currently being applied. OCI whiteouts apply to
+/// lower/parent layers only; same-layer entries survive regardless
+/// of marker ordering in the tar stream.
 ///
 /// `output_root` is passed so the caller's safety envelope continues
 /// to apply — we re-assert `target` lives under it before any
@@ -687,7 +713,12 @@ fn classify_whiteout(raw_path: &[u8]) -> WhiteoutKind<'_> {
 /// path already passed every A.1 safety check, and the sibling
 /// shares the same parent chain, so this branch should be
 /// unreachable for any non-malicious caller wiring.
-fn apply_regular_whiteout(target: &Path, output_root: &Path) -> Result<(), RefusalReason> {
+fn apply_regular_whiteout(
+    target: &Path,
+    target_rel: &Path,
+    output_root: &Path,
+    current_layer_paths: &HashSet<PathBuf>,
+) -> Result<(), RefusalReason> {
     if !target.starts_with(output_root) {
         return Err(RefusalReason::JoinedPathEscape);
     }
@@ -698,10 +729,10 @@ fn apply_regular_whiteout(target: &Path, output_root: &Path) -> Result<(), Refus
     // points at. The corresponding `remove_file` call deletes the
     // symlink, not its target.
     match std::fs::symlink_metadata(target) {
-        Ok(meta) if meta.file_type().is_dir() => match std::fs::remove_dir_all(target) {
-            Ok(()) => Ok(()),
-            Err(_) => Err(RefusalReason::MalformedHeader),
-        },
+        Ok(meta) if meta.file_type().is_dir() => {
+            remove_tree_except_current_layer(target, target_rel, current_layer_paths)
+        }
+        Ok(_) if current_layer_paths.contains(target_rel) => Ok(()),
         Ok(_) => match std::fs::remove_file(target) {
             Ok(()) => Ok(()),
             Err(_) => Err(RefusalReason::MalformedHeader),
@@ -712,18 +743,44 @@ fn apply_regular_whiteout(target: &Path, output_root: &Path) -> Result<(), Refus
 }
 
 /// Apply a `.wh..wh..opq` opaque whiteout: clear `target_dir`'s
-/// current contents, preserving the directory itself. Absent or
-/// non-directory targets are no-ops (single-layer apply is
-/// declarative; the caller doing multi-layer composition decides
-/// what "clear prior" means for its own state).
+/// lower-layer contents, preserving the directory itself and any
+/// same-layer entries below it. OCI says opaque markers are applied
+/// before sibling entries regardless of archive ordering; preserving
+/// same-layer paths gives that result without buffering the whole
+/// layer.
 ///
 /// Same `output_root` defense-in-depth check as the regular
 /// whiteout: re-assert the target dir lives under root.
-fn apply_opaque_whiteout(target_dir: &Path, output_root: &Path) -> Result<(), RefusalReason> {
+fn apply_opaque_whiteout(
+    target_dir: &Path,
+    target_rel: &Path,
+    output_root: &Path,
+    current_layer_paths: &HashSet<PathBuf>,
+) -> Result<(), RefusalReason> {
     if !target_dir.starts_with(output_root) {
         return Err(RefusalReason::JoinedPathEscape);
     }
 
+    remove_children_except_current_layer(target_dir, target_rel, current_layer_paths)
+}
+
+fn remove_tree_except_current_layer(
+    target: &Path,
+    target_rel: &Path,
+    current_layer_paths: &HashSet<PathBuf>,
+) -> Result<(), RefusalReason> {
+    if !has_current_layer_path_at_or_below(target_rel, current_layer_paths) {
+        return std::fs::remove_dir_all(target).map_err(|_| RefusalReason::MalformedHeader);
+    }
+
+    remove_children_except_current_layer(target, target_rel, current_layer_paths)
+}
+
+fn remove_children_except_current_layer(
+    target_dir: &Path,
+    target_rel: &Path,
+    current_layer_paths: &HashSet<PathBuf>,
+) -> Result<(), RefusalReason> {
     let read_dir = match std::fs::read_dir(target_dir) {
         Ok(rd) => rd,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(()),
@@ -736,10 +793,21 @@ fn apply_opaque_whiteout(target_dir: &Path, output_root: &Path) -> Result<(), Re
             Err(_) => return Err(RefusalReason::MalformedHeader),
         };
         let child_path = child.path();
+        let child_rel = target_rel.join(child.file_name());
         let file_type = match child.file_type() {
             Ok(ft) => ft,
             Err(_) => return Err(RefusalReason::MalformedHeader),
         };
+        if current_layer_paths.contains(&child_rel) {
+            if file_type.is_dir() {
+                remove_children_except_current_layer(&child_path, &child_rel, current_layer_paths)?;
+            }
+            continue;
+        }
+        if file_type.is_dir() && has_current_layer_path_below(&child_rel, current_layer_paths) {
+            remove_children_except_current_layer(&child_path, &child_rel, current_layer_paths)?;
+            continue;
+        }
         let removed = if file_type.is_dir() {
             std::fs::remove_dir_all(&child_path)
         } else {
@@ -750,6 +818,18 @@ fn apply_opaque_whiteout(target_dir: &Path, output_root: &Path) -> Result<(), Re
         }
     }
     Ok(())
+}
+
+fn has_current_layer_path_at_or_below(rel: &Path, current_layer_paths: &HashSet<PathBuf>) -> bool {
+    current_layer_paths
+        .iter()
+        .any(|written| written == rel || written.starts_with(rel))
+}
+
+fn has_current_layer_path_below(rel: &Path, current_layer_paths: &HashSet<PathBuf>) -> bool {
+    current_layer_paths
+        .iter()
+        .any(|written| written != rel && written.starts_with(rel))
 }
 
 #[cfg(test)]
@@ -1133,18 +1213,23 @@ mod tests {
     // ── Phase A.2: OCI whiteout + opaque marker semantics ────────
 
     #[test]
-    fn whiteout_removes_sibling_file_written_earlier_in_layer() {
-        // Within-layer ordering: the file is written first, then a
-        // sibling `.wh.<name>` marker removes it. The marker itself
-        // is not materialized. Multi-layer composition (Phase D
-        // territory) consumes whiteouts the same way.
+    fn whiteout_removes_prior_layer_sibling_file() {
+        // The output tree can already contain lower-layer state
+        // before this layer is applied. A sibling `.wh.<name>` marker
+        // removes that prior file. The marker itself is not
+        // materialized.
         let tar_bytes = build_tar(|b| {
             add_dir(b, "etc/");
-            add_file(b, "etc/passwd", b"root:x:0:0::/root:/bin/sh\n");
             add_file(b, "etc/.wh.passwd", b"");
         });
 
         let tmp = TempDir::new().unwrap();
+        std::fs::create_dir(tmp.path().join("etc")).unwrap();
+        std::fs::write(
+            tmp.path().join("etc/passwd"),
+            b"root:x:0:0::/root:/bin/sh\n",
+        )
+        .unwrap();
         let report = unpack_layer(
             Cursor::new(tar_bytes),
             tmp.path(),
@@ -1152,7 +1237,7 @@ mod tests {
         )
         .expect("unpack ok");
 
-        assert_eq!(report.files_written, 1, "etc/passwd was written");
+        assert_eq!(report.files_written, 0);
         assert_eq!(report.whiteouts_applied, 1);
         assert_eq!(report.opaque_markers_applied, 0);
         assert!(report.refused.is_empty(), "{:?}", report.refused);
@@ -1164,6 +1249,35 @@ mod tests {
             !tmp.path().join("etc/.wh.passwd").exists(),
             "whiteout marker itself must not be materialized in the output tree"
         );
+    }
+
+    #[test]
+    fn whiteout_does_not_hide_same_layer_file_when_marker_appears_later() {
+        // OCI whiteouts hide only lower-layer entries. Same-layer
+        // entries survive even if a tar stream places the whiteout
+        // marker after the file.
+        let tar_bytes = build_tar(|b| {
+            add_dir(b, "etc/");
+            add_file(b, "etc/passwd", b"new\n");
+            add_file(b, "etc/.wh.passwd", b"");
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.whiteouts_applied, 1);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("etc/passwd")).unwrap(),
+            "new\n"
+        );
+        assert!(!tmp.path().join("etc/.wh.passwd").exists());
     }
 
     #[test]
@@ -1192,19 +1306,19 @@ mod tests {
 
     #[test]
     fn whiteout_removes_sibling_directory_recursively() {
-        // A whiteout on a directory takes the whole subtree out.
-        // remove_dir_all is the right primitive — we use
-        // symlink_metadata first so we don't accidentally walk a
+        // A whiteout on a lower-layer directory takes that whole
+        // subtree out. remove_dir_all is the right primitive — we
+        // use symlink_metadata first so we don't accidentally walk a
         // symlink-to-elsewhere as a directory.
         let tar_bytes = build_tar(|b| {
             add_dir(b, "etc/");
-            add_dir(b, "etc/sub/");
-            add_file(b, "etc/sub/a", b"one");
-            add_file(b, "etc/sub/b", b"two");
             add_file(b, "etc/.wh.sub", b"");
         });
 
         let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("etc/sub")).unwrap();
+        std::fs::write(tmp.path().join("etc/sub/a"), b"one").unwrap();
+        std::fs::write(tmp.path().join("etc/sub/b"), b"two").unwrap();
         let report = unpack_layer(
             Cursor::new(tar_bytes),
             tmp.path(),
@@ -1222,19 +1336,21 @@ mod tests {
     #[test]
     fn opaque_whiteout_clears_parent_contents_preserving_directory() {
         // `.wh..wh..opq` clears the parent dir's prior-layer
-        // contents but keeps the dir itself. In a single-layer
-        // tar, "prior contents" means anything we already wrote
-        // for this layer below `etc/`.
+        // contents but keeps the dir itself. Entries from the
+        // current layer survive even when the marker appears later
+        // in the tar stream.
         let tar_bytes = build_tar(|b| {
             add_dir(b, "etc/");
             add_file(b, "etc/a", b"alpha");
-            add_file(b, "etc/b", b"beta");
             add_dir(b, "etc/sub/");
             add_file(b, "etc/sub/c", b"gamma");
             add_file(b, "etc/.wh..wh..opq", b"");
         });
 
         let tmp = TempDir::new().unwrap();
+        std::fs::create_dir_all(tmp.path().join("etc/sub")).unwrap();
+        std::fs::write(tmp.path().join("etc/old"), b"old").unwrap();
+        std::fs::write(tmp.path().join("etc/sub/old"), b"old").unwrap();
         let report = unpack_layer(
             Cursor::new(tar_bytes),
             tmp.path(),
@@ -1246,11 +1362,19 @@ mod tests {
         assert_eq!(report.whiteouts_applied, 0);
         assert!(report.refused.is_empty(), "{:?}", report.refused);
 
-        // The parent dir survives; its prior contents are gone.
+        // The parent dir survives; prior contents are gone, while
+        // current-layer entries remain.
         assert!(tmp.path().join("etc").is_dir(), "etc/ must remain");
-        assert!(!tmp.path().join("etc/a").exists());
-        assert!(!tmp.path().join("etc/b").exists());
-        assert!(!tmp.path().join("etc/sub").exists());
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("etc/a")).unwrap(),
+            "alpha"
+        );
+        assert_eq!(
+            std::fs::read_to_string(tmp.path().join("etc/sub/c")).unwrap(),
+            "gamma"
+        );
+        assert!(!tmp.path().join("etc/old").exists());
+        assert!(!tmp.path().join("etc/sub/old").exists());
         // The opaque marker itself is not materialized.
         assert!(!tmp.path().join("etc/.wh..wh..opq").exists());
     }
