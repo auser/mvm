@@ -35,7 +35,7 @@ pub enum SubstitutionError {
 }
 
 /// AWS credentials after placeholder substitution.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub struct AwsCredentials {
     pub access_key_id: String,
     pub secret_access_key: String,
@@ -199,12 +199,15 @@ mod tests {
     #[test]
     fn missing_handler_fails_closed() {
         clear_substitution_handlers().expect("clear handlers");
-        let err = aws_credentials_from_placeholders(
+        let result = aws_credentials_from_placeholders(
             "mvm-secret://aws/access-key",
             "mvm-secret://aws/secret-key",
             None,
-        )
-        .expect_err("missing aws handler must fail");
-        assert!(matches!(err, SubstitutionError::MissingHandler(name) if name == "aws"));
+        );
+        match result {
+            Err(SubstitutionError::MissingHandler(name)) => assert_eq!(name, "aws"),
+            Err(err) => panic!("expected missing aws handler, got {err}"),
+            Ok(_) => panic!("missing aws handler must fail"),
+        }
     }
 }
