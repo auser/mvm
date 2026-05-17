@@ -42,6 +42,7 @@ pub enum LocalAuditKind {
     KeyLookup,
     VolumeCreate,
     VolumeOpen,
+    VolumeLock,
     UpdateInstall,
     Uninstall,
     // --- DX features (Phase 2) ---
@@ -976,6 +977,7 @@ mod tests {
             LocalAuditKind::KeyLookup,
             LocalAuditKind::VolumeCreate,
             LocalAuditKind::VolumeOpen,
+            LocalAuditKind::VolumeLock,
             LocalAuditKind::UpdateInstall,
             LocalAuditKind::Uninstall,
             LocalAuditKind::NetworkCreate,

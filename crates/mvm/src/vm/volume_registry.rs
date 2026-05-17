@@ -16,6 +16,7 @@ use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use anyhow::{Context, Result};
+use mvm_core::domain::volume::WrappedKey;
 use serde::{Deserialize, Serialize};
 
 /// Maximum number of volume mounts per VM. Defends against
@@ -40,7 +41,38 @@ pub struct LocalVolumeEntry {
     pub volume_name: String,
     pub host_path: String,
     pub encrypted: bool,
+    #[serde(default)]
+    pub encryption: LocalVolumeEncryption,
     pub created_at: String,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(tag = "mode", rename_all = "kebab-case", deny_unknown_fields)]
+pub enum LocalVolumeEncryption {
+    /// Compatibility shape for ad-hoc / pre-existing managed
+    /// directories whose at-rest encryption comes from the host
+    /// filesystem or block device.
+    #[default]
+    HostBacked,
+    /// MVM owns the encryption lifecycle: `ciphertext_path` is the
+    /// encrypted archive at rest, `host_path` is only populated while
+    /// the volume is explicitly unlocked for a microVM mount.
+    MvmManaged(MvmManagedVolumeEncryption),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct MvmManagedVolumeEncryption {
+    pub state: LocalVolumeState,
+    pub ciphertext_path: String,
+    pub wrapped_key: WrappedKey,
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "kebab-case")]
+pub enum LocalVolumeState {
+    Locked,
+    Unlocked,
 }
 
 impl LocalVolumeCatalog {
@@ -87,12 +119,24 @@ impl LocalVolumeCatalog {
         if !entry.encrypted {
             anyhow::bail!("local volume {:?} must be encrypted", entry.volume_name);
         }
+        if let LocalVolumeEncryption::MvmManaged(enc) = &entry.encryption
+            && enc.ciphertext_path.is_empty()
+        {
+            anyhow::bail!(
+                "mvm-managed local volume {:?} must record ciphertext_path",
+                entry.volume_name
+            );
+        }
         self.volumes.insert(entry.volume_name.clone(), entry);
         Ok(())
     }
 
     pub fn get(&self, name: &str) -> Option<&LocalVolumeEntry> {
         self.volumes.get(name)
+    }
+
+    pub fn get_mut(&mut self, name: &str) -> Option<&mut LocalVolumeEntry> {
+        self.volumes.get_mut(name)
     }
 
     pub fn iter(&self) -> std::collections::btree_map::Iter<'_, String, LocalVolumeEntry> {
@@ -277,6 +321,25 @@ mod tests {
             volume_name: name.to_string(),
             host_path: format!("/encrypted/{name}"),
             encrypted: true,
+            encryption: LocalVolumeEncryption::HostBacked,
+            created_at: "2026-05-05T00:00:00Z".to_string(),
+        }
+    }
+
+    fn make_mvm_managed_entry(name: &str, state: LocalVolumeState) -> LocalVolumeEntry {
+        LocalVolumeEntry {
+            volume_name: name.to_string(),
+            host_path: format!("/plain/{name}"),
+            encrypted: true,
+            encryption: LocalVolumeEncryption::MvmManaged(MvmManagedVolumeEncryption {
+                state,
+                ciphertext_path: format!("/cipher/{name}.mvve"),
+                wrapped_key: WrappedKey {
+                    master_key_version: 1,
+                    wrapped: vec![1, 2, 3],
+                    algorithm: mvm_core::domain::volume::WrapAlgorithm::Aes256Gcm,
+                },
+            }),
             created_at: "2026-05-05T00:00:00Z".to_string(),
         }
     }
@@ -374,6 +437,41 @@ mod tests {
         e.encrypted = false;
         let err = c.add(e).unwrap_err();
         assert!(err.to_string().contains("must be encrypted"));
+    }
+
+    #[test]
+    fn local_volume_catalog_mvm_managed_roundtrip() {
+        let _g = DataDirGuard::new();
+        let mut c = LocalVolumeCatalog::default();
+        c.add(make_mvm_managed_entry("work", LocalVolumeState::Locked))
+            .unwrap();
+        c.save().unwrap();
+        let loaded = LocalVolumeCatalog::load().unwrap();
+        let entry = loaded.get("work").unwrap();
+        match &entry.encryption {
+            LocalVolumeEncryption::MvmManaged(enc) => {
+                assert_eq!(enc.state, LocalVolumeState::Locked);
+                assert_eq!(enc.ciphertext_path, "/cipher/work.mvve");
+            }
+            LocalVolumeEncryption::HostBacked => panic!("expected mvm-managed volume"),
+        }
+    }
+
+    #[test]
+    fn local_volume_catalog_defaults_missing_encryption_to_host_backed() {
+        let _g = DataDirGuard::new();
+        let path = LocalVolumeCatalog::path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(
+            &path,
+            r#"{"volumes":{"work":{"volume_name":"work","host_path":"/encrypted/work","encrypted":true,"created_at":"2026-05-05T00:00:00Z"}}}"#,
+        )
+        .unwrap();
+        let loaded = LocalVolumeCatalog::load().unwrap();
+        assert!(matches!(
+            loaded.get("work").unwrap().encryption,
+            LocalVolumeEncryption::HostBacked
+        ));
     }
 
     #[test]

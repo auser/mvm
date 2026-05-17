@@ -102,6 +102,8 @@ const CACHE_SUB: &[(&str, AuditPosture)] = &[
 
 const VOLUME_SUB: &[(&str, AuditPosture)] = &[
     ("create", AuditPosture::Emits("VolumeCreate")),
+    ("unlock", AuditPosture::Emits("VolumeOpen")),
+    ("lock", AuditPosture::Emits("VolumeLock")),
     ("catalog", AuditPosture::ReadOnly),
     ("mount", AuditPosture::Emits("VmVolumeAdd")),
     ("ls", AuditPosture::ReadOnly),
@@ -483,6 +485,8 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
         "Uninstall",
         "UpdateInstall",
         "VolumeCreate",
+        "VolumeLock",
+        "VolumeOpen",
         "VmFileCopy",
         "VmFsMutate",
         "VmProcSignal",

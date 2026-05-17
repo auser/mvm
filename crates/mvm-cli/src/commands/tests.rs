@@ -106,12 +106,60 @@ fn volume_create_parses_default_root() {
     let cli = Cli::try_parse_from(["mvmctl", "volume", "create", "work"]).unwrap();
     match cli.command {
         Commands::Volume(volume::Args {
-            command: volume::VolumeCmd::Create { volume, root },
+            command:
+                volume::VolumeCmd::Create {
+                    volume,
+                    root,
+                    host_backed,
+                },
         }) => {
             assert_eq!(volume, "work");
             assert_eq!(root, None);
+            assert!(!host_backed);
         }
         _ => panic!("Expected volume create command"),
+    }
+}
+
+#[test]
+fn volume_create_host_backed_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "volume", "create", "work", "--host-backed"]).unwrap();
+    match cli.command {
+        Commands::Volume(volume::Args {
+            command:
+                volume::VolumeCmd::Create {
+                    volume,
+                    root,
+                    host_backed,
+                },
+        }) => {
+            assert_eq!(volume, "work");
+            assert_eq!(root, None);
+            assert!(host_backed);
+        }
+        _ => panic!("Expected volume create command"),
+    }
+}
+
+#[test]
+fn volume_unlock_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "volume", "unlock", "work"]).unwrap();
+    match cli.command {
+        Commands::Volume(volume::Args {
+            command: volume::VolumeCmd::Unlock { volume },
+        }) => assert_eq!(volume, "work"),
+        _ => panic!("Expected volume unlock command"),
+    }
+}
+
+#[test]
+fn volume_lock_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "volume", "lock", "work"]).unwrap();
+    match cli.command {
+        Commands::Volume(volume::Args {
+            command: volume::VolumeCmd::Lock { volume },
+        }) => assert_eq!(volume, "work"),
+        _ => panic!("Expected volume lock command"),
     }
 }
 

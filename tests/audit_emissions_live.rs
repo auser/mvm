@@ -1636,6 +1636,67 @@ fn volume_create_emits_volume_create_audit_entry() {
 }
 
 #[test]
+fn volume_unlock_and_lock_emit_audit_entries() {
+    let sandbox = AuditSandbox::new();
+    let root = sandbox.home_path().join("mvm-volume-root");
+    std::fs::create_dir_all(&root).expect("mkdir volume root");
+
+    let create = sandbox
+        .mvmctl()
+        .args([
+            "volume",
+            "create",
+            "managed",
+            "--root",
+            root.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("spawn mvmctl volume create");
+    assert!(
+        create.status.success(),
+        "mvmctl volume create failed: stderr={}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let unlock = sandbox
+        .mvmctl()
+        .args(["volume", "unlock", "managed"])
+        .output()
+        .expect("spawn mvmctl volume unlock");
+    assert!(
+        unlock.status.success(),
+        "mvmctl volume unlock failed: stderr={}",
+        String::from_utf8_lossy(&unlock.stderr)
+    );
+    std::fs::write(
+        root.join("unlocked").join("managed").join("proof.txt"),
+        b"ok",
+    )
+    .expect("write unlocked volume proof");
+
+    let lock = sandbox
+        .mvmctl()
+        .args(["volume", "lock", "managed"])
+        .output()
+        .expect("spawn mvmctl volume lock");
+    assert!(
+        lock.status.success(),
+        "mvmctl volume lock failed: stderr={}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        count_entries_with_kind(&log, "volume_open") >= 1,
+        "expected volume_open entry. Full log:\n{log}"
+    );
+    assert!(
+        count_entries_with_kind(&log, "volume_lock") >= 1,
+        "expected volume_lock entry. Full log:\n{log}"
+    );
+}
+
+#[test]
 fn volume_unmount_emits_vm_volume_remove_audit_entry() {
     // Plan 67: mount-then-unmount round-trip. Both emits land in
     // the LocalAudit stream; this test pins the remove half.
