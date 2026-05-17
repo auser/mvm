@@ -7,7 +7,7 @@
 //! escape, hardlink-to-host, device-node planting, setuid surprise,
 //! xattr-based privilege carry).
 //!
-//! ## Scope through sub-phase A.3
+//! ## Scope through sub-phase A.4
 //!
 //! The unpacker handles three tar entry kinds and two OCI-specific
 //! filename markers that ride inside regular-file tar entries:
@@ -55,21 +55,25 @@
 //!   pre-image state. A missing target refuses with
 //!   [`RefusalReason::HardlinkTargetMissing`] (CVE-2019-14271
 //!   mitigation).
+//! - **Extended attributes (A.4)** — `SCHILY.xattr.*` pax records
+//!   are filtered through [`UnpackOptions::xattr_policy`]. The
+//!   production default preserves only `user.*`, `security.capability`,
+//!   and `security.selinux`; all other xattrs are dropped and reported
+//!   in [`UnpackReport::xattr_warnings`]. The tar crate's implicit
+//!   xattr unpacking remains disabled so every attribute passes through
+//!   this allow-list before touching the host filesystem.
 //!
 //! Every other entry kind — character/block special files, FIFOs,
-//! named sockets, sparse files, tar-format extended-attr pax
-//! headers, GNU long-name continuations — is **refused** with
-//! [`RefusalReason::UnsupportedEntryType`]. Later sub-phases
-//! re-classify each refused category:
+//! named sockets, sparse files, GNU long-name continuations — is
+//! **refused** with [`RefusalReason::UnsupportedEntryType`]. Later
+//! sub-phases re-classify each remaining refused category:
 //!
 //! | Sub-phase | What it adds |
 //! |---|---|
-//! | A.3 | Hardlinks within-layer; cross-layer hardlinks materialize as copy |
-//! | A.4 | xattrs (allow-listed: `user.*`, `security.capability`, `security.selinux`) |
 //! | A.5 | Device nodes (allow-listed to `/dev/{null,zero,random,urandom}` only) |
 //! | A.6 | setuid/setgid bits, policy-controlled (refused under prod-no-cosign) |
 //!
-//! ## Safety properties enforced through A.3
+//! ## Safety properties enforced through A.4
 //!
 //! 1. **No path escapes `output_root`.** Three checks layer on top of
 //!    each other for defense in depth:
@@ -126,6 +130,22 @@ const WHITEOUT_PREFIX: &[u8] = b".wh.";
 /// prior-layer contents rather than removing a sibling.
 const WHITEOUT_OPAQUE: &[u8] = b".wh..wh..opq";
 
+/// Pax key prefix used by OCI layer producers for extended
+/// attributes. The suffix after this prefix is the filesystem xattr
+/// name, e.g. `SCHILY.xattr.user.foo` -> `user.foo`.
+const PAX_XATTR_PREFIX: &[u8] = b"SCHILY.xattr.";
+
+/// How [`unpack_layer`] handles xattrs carried in pax headers.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XattrPolicy {
+    /// Preserve the Plan 85 allow-list and drop everything else with
+    /// a warning in [`UnpackReport::xattr_warnings`].
+    PreserveAllowlisted,
+    /// Drop every xattr with a warning. Useful for host filesystems
+    /// that cannot represent OCI xattrs safely.
+    DropAll,
+}
+
 /// Caller-controlled knobs for [`unpack_layer`].
 ///
 /// Defaults are the production-safe ones; tests override individual
@@ -146,6 +166,11 @@ pub struct UnpackOptions {
     /// uniformly strip timestamps so two pulls of the same layer
     /// produce byte-identical trees (Plan 85 §"R2 Reproducibility").
     pub strip_timestamps: bool,
+
+    /// Extended-attribute policy for `SCHILY.xattr.*` pax records.
+    /// Defaults to [`XattrPolicy::PreserveAllowlisted`], which keeps
+    /// only `user.*`, `security.capability`, and `security.selinux`.
+    pub xattr_policy: XattrPolicy,
 }
 
 impl Default for UnpackOptions {
@@ -153,6 +178,7 @@ impl Default for UnpackOptions {
         Self {
             max_path_len: 4096,
             strip_timestamps: true,
+            xattr_policy: XattrPolicy::PreserveAllowlisted,
         }
     }
 }
@@ -190,10 +216,48 @@ pub struct UnpackReport {
     /// when the parent is absent or empty, for the same declarative
     /// reason as `whiteouts_applied`.
     pub opaque_markers_applied: u64,
+    /// Allow-listed pax xattrs successfully written to the
+    /// materialized filesystem entry.
+    pub xattrs_written: u64,
+    /// Pax xattrs intentionally dropped by policy or because the
+    /// host filesystem rejected the write. Each drop also gets a
+    /// corresponding [`XattrWarning`] in `xattr_warnings`.
+    pub xattrs_dropped: u64,
+    /// Non-fatal xattr warnings, in stream order. Xattr drops do not
+    /// refuse the tar entry itself; the file/dir/link can still be
+    /// materialized while the unsafe or unsupported attribute is
+    /// omitted.
+    pub xattr_warnings: Vec<XattrWarning>,
     /// Tar entries refused by policy, in the order they appeared in
     /// the stream. Each carries a [`RefusalReason`] so a downstream
     /// audit / debugging surface can render them.
     pub refused: Vec<RefusedEntry>,
+}
+
+/// One xattr that was not preserved. Recorded as a warning instead
+/// of a refused entry because Plan 85 A.4 treats denied xattrs as
+/// non-fatal metadata drops.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct XattrWarning {
+    /// Path bytes from the tar header, verbatim.
+    pub raw_path: Vec<u8>,
+    /// Xattr name bytes, without the `SCHILY.xattr.` pax prefix.
+    pub name: Vec<u8>,
+    /// Why this xattr was dropped.
+    pub reason: XattrWarningReason,
+}
+
+/// Why an xattr was dropped.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum XattrWarningReason {
+    /// [`XattrPolicy::DropAll`] is active.
+    PolicyDropAll,
+    /// The xattr name is outside the Plan 85 allow-list.
+    NotAllowlisted,
+    /// The pax key did not contain a usable xattr name.
+    MalformedName,
+    /// The xattr passed policy but the host filesystem rejected it.
+    ApplyFailed,
 }
 
 /// One refused tar entry. The path is recorded as raw bytes (not as
@@ -431,6 +495,16 @@ pub fn unpack_layer<R: Read>(
         // filename** matches the OCI whiteout pattern dispatch to
         // the whiteout helpers instead of `write_regular_file`.
         // Everything else refuses — A.3 onwards narrows this.
+        let entry_xattrs = match collect_entry_xattrs(&mut entry, &raw_path, options, &mut report) {
+            Ok(attrs) => attrs,
+            Err(refuse) => {
+                report.refused.push(RefusedEntry {
+                    raw_path,
+                    reason: refuse,
+                });
+                continue;
+            }
+        };
         let entry_type = entry.header().entry_type();
         match entry_type {
             tar::EntryType::Regular | tar::EntryType::Continuous => {
@@ -438,6 +512,7 @@ pub fn unpack_layer<R: Read>(
                     WhiteoutKind::None => match write_regular_file(&mut entry, &target, options) {
                         Ok(()) => {
                             report.files_written += 1;
+                            apply_collected_xattrs(&target, &raw_path, entry_xattrs, &mut report);
                             current_layer_paths.insert(rel_path.clone());
                         }
                         Err(refuse) => report.refused.push(RefusedEntry {
@@ -497,6 +572,7 @@ pub fn unpack_layer<R: Read>(
                     if created {
                         report.dirs_created += 1;
                     }
+                    apply_collected_xattrs(&target, &raw_path, entry_xattrs, &mut report);
                     current_layer_paths.insert(rel_path.clone());
                 }
                 Err(refuse) => report.refused.push(RefusedEntry {
@@ -509,6 +585,7 @@ pub fn unpack_layer<R: Read>(
                 match write_symlink(link_target.as_deref(), &target) {
                     Ok(()) => {
                         report.symlinks_written += 1;
+                        apply_collected_xattrs(&target, &raw_path, entry_xattrs, &mut report);
                         current_layer_paths.insert(rel_path.clone());
                     }
                     Err(refuse) => report.refused.push(RefusedEntry {
@@ -528,10 +605,12 @@ pub fn unpack_layer<R: Read>(
                 ) {
                     Ok(HardlinkAction::Linked) => {
                         report.hardlinks_written += 1;
+                        apply_collected_xattrs(&target, &raw_path, entry_xattrs, &mut report);
                         current_layer_paths.insert(rel_path.clone());
                     }
                     Ok(HardlinkAction::Copied) => {
                         report.hardlink_copies_written += 1;
+                        apply_collected_xattrs(&target, &raw_path, entry_xattrs, &mut report);
                         current_layer_paths.insert(rel_path.clone());
                     }
                     Err(refuse) => report.refused.push(RefusedEntry {
@@ -550,6 +629,99 @@ pub fn unpack_layer<R: Read>(
     }
 
     Ok(report)
+}
+
+#[derive(Debug)]
+struct PendingXattr {
+    name: Vec<u8>,
+    value: Vec<u8>,
+}
+
+fn collect_entry_xattrs<R: Read>(
+    entry: &mut tar::Entry<R>,
+    raw_path: &[u8],
+    options: &UnpackOptions,
+    report: &mut UnpackReport,
+) -> Result<Vec<PendingXattr>, RefusalReason> {
+    let Some(pax_extensions) = entry
+        .pax_extensions()
+        .map_err(|_| RefusalReason::MalformedHeader)?
+    else {
+        return Ok(Vec::new());
+    };
+
+    let mut attrs = Vec::new();
+    for extension in pax_extensions {
+        let extension = extension.map_err(|_| RefusalReason::MalformedHeader)?;
+        let key = extension.key_bytes();
+        let Some(name) = key.strip_prefix(PAX_XATTR_PREFIX) else {
+            continue;
+        };
+
+        match classify_xattr_name(options.xattr_policy, name) {
+            Ok(()) => attrs.push(PendingXattr {
+                name: name.to_vec(),
+                value: extension.value_bytes().to_vec(),
+            }),
+            Err(reason) => record_xattr_warning(report, raw_path, name, reason),
+        }
+    }
+
+    Ok(attrs)
+}
+
+fn classify_xattr_name(policy: XattrPolicy, name: &[u8]) -> Result<(), XattrWarningReason> {
+    if name.is_empty() || name.contains(&0) {
+        return Err(XattrWarningReason::MalformedName);
+    }
+    if policy == XattrPolicy::DropAll {
+        return Err(XattrWarningReason::PolicyDropAll);
+    }
+    if is_allowlisted_xattr(name) {
+        Ok(())
+    } else {
+        Err(XattrWarningReason::NotAllowlisted)
+    }
+}
+
+fn is_allowlisted_xattr(name: &[u8]) -> bool {
+    name.starts_with(b"user.") || name == b"security.capability" || name == b"security.selinux"
+}
+
+fn apply_collected_xattrs(
+    target: &Path,
+    raw_path: &[u8],
+    attrs: Vec<PendingXattr>,
+    report: &mut UnpackReport,
+) {
+    for attr in attrs {
+        let name = OsStr::from_bytes(&attr.name);
+        match xattr::set(target, name, &attr.value) {
+            Ok(()) => report.xattrs_written += 1,
+            Err(_) => {
+                record_xattr_warning(
+                    report,
+                    raw_path,
+                    &attr.name,
+                    XattrWarningReason::ApplyFailed,
+                );
+            }
+        }
+    }
+}
+
+fn record_xattr_warning(
+    report: &mut UnpackReport,
+    raw_path: &[u8],
+    name: &[u8],
+    reason: XattrWarningReason,
+) {
+    report.xattrs_dropped += 1;
+    report.xattr_warnings.push(XattrWarning {
+        raw_path: raw_path.to_vec(),
+        name: name.to_vec(),
+        reason,
+    });
 }
 
 /// Walk each existing prefix of `output_root.join(rel)` and return
@@ -1033,6 +1205,19 @@ mod tests {
         builder.append(&header, body).unwrap();
     }
 
+    /// Add a regular file preceded by pax xattr records.
+    fn add_file_with_pax_xattrs(
+        builder: &mut tar::Builder<Cursor<Vec<u8>>>,
+        path: &str,
+        body: &[u8],
+        xattrs: &[(&str, &[u8])],
+    ) {
+        builder
+            .append_pax_extensions(xattrs.iter().copied())
+            .unwrap();
+        add_file(builder, path, body);
+    }
+
     /// Add a directory entry.
     fn add_dir(builder: &mut tar::Builder<Cursor<Vec<u8>>>, path: &str) {
         let mut header = tar::Header::new_gnu();
@@ -1389,6 +1574,138 @@ mod tests {
             assert!(!t.contains(','), "{r:?} -> {t:?}");
             assert!(!t.contains('\n'), "{r:?} -> {t:?}");
         }
+    }
+
+    // ── Phase A.4: allow-listed pax xattrs ───────────────────────
+
+    #[test]
+    fn xattr_policy_allowlist_accepts_only_plan85_names() {
+        assert_eq!(
+            classify_xattr_name(XattrPolicy::PreserveAllowlisted, b"user.mvm.test"),
+            Ok(())
+        );
+        assert_eq!(
+            classify_xattr_name(XattrPolicy::PreserveAllowlisted, b"security.capability"),
+            Ok(())
+        );
+        assert_eq!(
+            classify_xattr_name(XattrPolicy::PreserveAllowlisted, b"security.selinux"),
+            Ok(())
+        );
+        assert_eq!(
+            classify_xattr_name(XattrPolicy::PreserveAllowlisted, b"trusted.overlay.opaque"),
+            Err(XattrWarningReason::NotAllowlisted)
+        );
+        assert_eq!(
+            classify_xattr_name(XattrPolicy::DropAll, b"user.mvm.test"),
+            Err(XattrWarningReason::PolicyDropAll)
+        );
+        assert_eq!(
+            classify_xattr_name(XattrPolicy::PreserveAllowlisted, b""),
+            Err(XattrWarningReason::MalformedName)
+        );
+    }
+
+    #[test]
+    fn allowed_user_xattr_is_preserved_when_host_supports_xattrs() {
+        let probe = TempDir::new().unwrap();
+        let probe_file = probe.path().join("probe");
+        std::fs::write(&probe_file, b"probe").unwrap();
+        if xattr::set(&probe_file, "user.mvm.probe", b"1").is_err() {
+            eprintln!(
+                "skipping xattr preservation assertion: host filesystem rejected user.* xattrs"
+            );
+            return;
+        }
+
+        let tar_bytes = build_tar(|b| {
+            add_file_with_pax_xattrs(
+                b,
+                "bin/tool",
+                b"run\n",
+                &[("SCHILY.xattr.user.mvm.test", b"ok".as_slice())],
+            );
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.xattrs_written, 1);
+        assert_eq!(report.xattrs_dropped, 0);
+        assert!(
+            report.xattr_warnings.is_empty(),
+            "{:?}",
+            report.xattr_warnings
+        );
+        assert_eq!(
+            xattr::get(tmp.path().join("bin/tool"), "user.mvm.test").unwrap(),
+            Some(b"ok".to_vec())
+        );
+    }
+
+    #[test]
+    fn denied_xattr_is_dropped_with_warning() {
+        let tar_bytes = build_tar(|b| {
+            add_file_with_pax_xattrs(
+                b,
+                "bin/tool",
+                b"run\n",
+                &[("SCHILY.xattr.trusted.overlay.opaque", b"y".as_slice())],
+            );
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.xattrs_written, 0);
+        assert_eq!(report.xattrs_dropped, 1);
+        assert_eq!(report.xattr_warnings.len(), 1);
+        assert_eq!(report.xattr_warnings[0].raw_path, b"bin/tool");
+        assert_eq!(report.xattr_warnings[0].name, b"trusted.overlay.opaque");
+        assert_eq!(
+            report.xattr_warnings[0].reason,
+            XattrWarningReason::NotAllowlisted
+        );
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+    }
+
+    #[test]
+    fn drop_all_xattr_policy_drops_allowlisted_xattr() {
+        let tar_bytes = build_tar(|b| {
+            add_file_with_pax_xattrs(
+                b,
+                "bin/tool",
+                b"run\n",
+                &[("SCHILY.xattr.user.mvm.test", b"ok".as_slice())],
+            );
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let opts = UnpackOptions {
+            xattr_policy: XattrPolicy::DropAll,
+            ..UnpackOptions::default()
+        };
+        let report = unpack_layer(Cursor::new(tar_bytes), tmp.path(), &opts).expect("unpack ok");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.xattrs_written, 0);
+        assert_eq!(report.xattrs_dropped, 1);
+        assert_eq!(
+            report.xattr_warnings[0].reason,
+            XattrWarningReason::PolicyDropAll
+        );
     }
 
     // ── Phase A.2: OCI whiteout + opaque marker semantics ────────
