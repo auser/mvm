@@ -29,6 +29,27 @@ use super::shared::{
 };
 
 #[test]
+fn top_level_command_summaries_stay_short() {
+    let longest_allowed = 72;
+    let long_summaries = cli_command()
+        .get_subcommands()
+        .filter_map(|cmd| {
+            cmd.get_about().and_then(|about| {
+                let about = about.to_string();
+                (about.chars().count() > longest_allowed)
+                    .then(|| format!("{}: {about}", cmd.get_name()))
+            })
+        })
+        .collect::<Vec<_>>();
+
+    assert!(
+        long_summaries.is_empty(),
+        "top-level command summaries must be {longest_allowed} chars or shorter:\n{}",
+        long_summaries.join("\n")
+    );
+}
+
+#[test]
 fn test_cleanup_defaults() {
     let cli = Cli::try_parse_from(["mvmctl", "cleanup"]).unwrap();
     match cli.command {
