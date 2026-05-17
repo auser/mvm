@@ -256,7 +256,9 @@ pub fn unpack_layer<R: Read>(
     options: &UnpackOptions,
 ) -> Result<UnpackReport, UnpackError> {
     if !output_root.is_absolute() {
-        return Err(UnpackError::NonAbsoluteOutputRoot(output_root.to_path_buf()));
+        return Err(UnpackError::NonAbsoluteOutputRoot(
+            output_root.to_path_buf(),
+        ));
     }
     if !output_root.is_dir() {
         return Err(UnpackError::OutputRootNotADir(output_root.to_path_buf()));
@@ -312,9 +314,7 @@ pub fn unpack_layer<R: Read>(
         // Safety check 2 — traversal segments. Segment-by-segment
         // (never substring): `..foo` is a valid name; `../foo` is
         // not. Tar paths are slash-separated regardless of host OS.
-        let traversal = raw_path
-            .split(|b| *b == b'/')
-            .any(|seg| seg == b"..");
+        let traversal = raw_path.split(|b| *b == b'/').any(|seg| seg == b"..");
         if traversal {
             report.refused.push(RefusedEntry {
                 raw_path,
@@ -376,19 +376,17 @@ pub fn unpack_layer<R: Read>(
                     }),
                 }
             }
-            tar::EntryType::Directory => {
-                match create_directory(&target) {
-                    Ok(created) => {
-                        if created {
-                            report.dirs_created += 1;
-                        }
+            tar::EntryType::Directory => match create_directory(&target) {
+                Ok(created) => {
+                    if created {
+                        report.dirs_created += 1;
                     }
-                    Err(refuse) => report.refused.push(RefusedEntry {
-                        raw_path: raw_path.clone(),
-                        reason: refuse,
-                    }),
                 }
-            }
+                Err(refuse) => report.refused.push(RefusedEntry {
+                    raw_path: raw_path.clone(),
+                    reason: refuse,
+                }),
+            },
             tar::EntryType::Symlink => {
                 let link_target = entry.link_name_bytes().map(|b| b.into_owned());
                 match write_symlink(link_target.as_deref(), &target) {
@@ -447,7 +445,7 @@ fn parent_chain_has_symlink(output_root: &Path, rel: &Path) -> bool {
 
 /// Write a regular file from `entry` to `target`, with O_NOFOLLOW
 /// + zeroed timestamps (when `options.strip_timestamps`) + the tar
-/// header's mode bits masked to `0o7777`.
+///   header's mode bits masked to `0o7777`.
 ///
 /// Returns `Ok(())` on success, or a [`RefusalReason`] for caller-
 /// recorded per-entry failures. Hard I/O errors propagate via
@@ -478,11 +476,7 @@ fn write_regular_file<R: Read>(
 
     // Mode from the tar header. A.1 strips the high bits (setuid,
     // setgid, sticky) — those land in A.6 with policy control.
-    let mode_from_header = entry
-        .header()
-        .mode()
-        .unwrap_or(0o644)
-        & 0o0777;
+    let mode_from_header = entry.header().mode().unwrap_or(0o644) & 0o0777;
 
     let mut opts = OpenOptions::new();
     opts.write(true)
@@ -551,10 +545,7 @@ fn create_directory(target: &Path) -> Result<bool, RefusalReason> {
 /// - Link target bytes empty.
 /// - Link target bytes contain a NUL.
 /// - `symlink(2)` returns `EEXIST` (we don't overwrite).
-fn write_symlink(
-    link_target_bytes: Option<&[u8]>,
-    target: &Path,
-) -> Result<(), RefusalReason> {
+fn write_symlink(link_target_bytes: Option<&[u8]>, target: &Path) -> Result<(), RefusalReason> {
     use std::os::unix::fs::symlink;
 
     let link_target = match link_target_bytes {
@@ -808,8 +799,7 @@ mod tests {
             max_path_len: 32,
             ..UnpackOptions::default()
         };
-        let report = unpack_layer(Cursor::new(tar_bytes), tmp.path(), &opts)
-            .expect("unpack ok");
+        let report = unpack_layer(Cursor::new(tar_bytes), tmp.path(), &opts).expect("unpack ok");
 
         assert_eq!(report.files_written, 0);
         assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
@@ -866,10 +856,7 @@ mod tests {
         assert_eq!(report.symlinks_written, 1);
         assert_eq!(report.files_written, 0);
         assert_eq!(report.refused.len(), 1);
-        assert_eq!(
-            report.refused[0].reason,
-            RefusalReason::SymlinkInParent
-        );
+        assert_eq!(report.refused[0].reason, RefusalReason::SymlinkInParent);
         // Confirm we didn't actually write through the symlink.
         assert!(!std::path::Path::new("/tmp/escape").exists());
     }
@@ -926,14 +913,8 @@ mod tests {
 
         let m1 = std::fs::metadata(tmp1.path().join("a")).unwrap();
         let m2 = std::fs::metadata(tmp2.path().join("a")).unwrap();
-        assert_eq!(
-            m1.modified().unwrap(),
-            std::time::SystemTime::UNIX_EPOCH
-        );
-        assert_eq!(
-            m2.modified().unwrap(),
-            std::time::SystemTime::UNIX_EPOCH
-        );
+        assert_eq!(m1.modified().unwrap(), std::time::SystemTime::UNIX_EPOCH);
+        assert_eq!(m2.modified().unwrap(), std::time::SystemTime::UNIX_EPOCH);
         assert_eq!(m1.modified().unwrap(), m2.modified().unwrap());
     }
 
