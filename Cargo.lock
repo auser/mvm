@@ -3111,10 +3111,13 @@ version = "0.14.0"
 dependencies = [
  "async-trait",
  "hex",
+ "libc",
  "oci-client 0.16.1",
  "serde",
  "serde_json",
  "sha2",
+ "tar",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "url",
