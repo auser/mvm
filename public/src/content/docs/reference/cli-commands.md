@@ -364,6 +364,35 @@ snapshots return `os error 95` (EOPNOTSUPP); restore failures fall back
 to cold boot with a warning rather than aborting the exec. See the
 [Sandboxed Exec](/guides/exec/) guide for the full background.
 
+## Volumes
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl volume create <name>` | Create a managed local encrypted volume directory under `~/.mvm/volumes/local/<name>` |
+| `mvmctl volume create <name> --root <absolute-dir>` | Create the managed volume under a specific encrypted root |
+| `mvmctl volume catalog` | List managed local volumes |
+| `mvmctl volume catalog --json` | List managed local volumes as JSON |
+| `mvmctl volume mount <vm> --volume <name> --guest <absolute-path>` | Register a managed local virtio-fs volume mount for a VM. Read-only by default |
+| `mvmctl volume mount <vm> --volume <name> --host <absolute-dir> --guest <absolute-path>` | Register an ad-hoc encrypted host directory as a virtio-fs volume mount |
+| `mvmctl volume mount <vm> --volume <name> --host <absolute-dir> --guest <absolute-path> --rw` | Register the volume read-write |
+| `mvmctl volume ls <vm>` | List registered volume mounts |
+| `mvmctl volume ls <vm> --json` | List registered volume mounts as JSON |
+| `mvmctl volume unmount <vm> <guest-path>` | Remove a registered volume mount |
+
+Local volume contents are plaintext while mounted inside the guest, so normal
+guest file I/O works. The host-side backing directory must live on encrypted
+backing storage: a macOS volume that `diskutil` reports as encrypted, or a
+Linux filesystem whose backing device sits on dm-crypt/LUKS. `mvmctl volume
+mount` fails closed when mvm cannot confirm the exact `--host` directory is
+encrypted at rest. `mvmctl doctor` also reports root FDE status under
+`host FDE (volumes at-rest)`, but the mount command enforces the directory's
+own backing storage.
+
+For the managed path, `mvmctl volume create` creates the directory and records
+it in `~/.mvm/volumes/registry.json` only after proving the target root is
+encrypted. Later `volume mount` calls can omit `--host` and mount by logical
+volume name from that registry.
+
 ## Default microVM Image
 
 When an image-taking command is invoked without `--flake` or `--manifest`,

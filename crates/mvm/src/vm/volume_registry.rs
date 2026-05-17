@@ -12,14 +12,6 @@
 //! is the catalog the orchestrator hands to those tools and
 //! reads back from on subsequent calls.
 //!
-//! ## Per-host volume catalog
-//!
-//! Plan 45 also calls for a *per-host* volume catalog (`volume
-//! create <name>` + `~/.mvm/volumes/registry.json`). That's a
-//! separate primitive landing in a follow-up — this module
-//! handles only the per-VM mount catalog (the direct rename of
-//! the prior share registry).
-
 use std::collections::BTreeMap;
 use std::path::PathBuf;
 
@@ -32,6 +24,85 @@ use serde::{Deserialize, Serialize};
 /// per-VM devices already, but we cap earlier so callers see a
 /// clear error rather than virtio-fs's opaque ENOMEM).
 pub const MAX_VOLUME_MOUNTS_PER_VM: usize = 16;
+
+/// Per-host managed local volume catalog path:
+/// `~/.mvm/volumes/registry.json`.
+#[derive(Debug, Clone, Default, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalVolumeCatalog {
+    #[serde(default)]
+    pub volumes: BTreeMap<String, LocalVolumeEntry>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+pub struct LocalVolumeEntry {
+    pub volume_name: String,
+    pub host_path: String,
+    pub encrypted: bool,
+    pub created_at: String,
+}
+
+impl LocalVolumeCatalog {
+    pub fn path() -> PathBuf {
+        PathBuf::from(mvm_core::config::mvm_data_dir())
+            .join("volumes")
+            .join("registry.json")
+    }
+
+    pub fn load() -> Result<Self> {
+        let path = Self::path();
+        if !path.exists() {
+            return Ok(Self::default());
+        }
+        let raw =
+            std::fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
+        let parsed: Self =
+            serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+        Ok(parsed)
+    }
+
+    pub fn save(&self) -> Result<()> {
+        let path = Self::path();
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)
+                .with_context(|| format!("creating parent of {}", path.display()))?;
+        }
+        let json = serde_json::to_vec_pretty(self).context("serialize LocalVolumeCatalog")?;
+        mvm_core::util::atomic_io::atomic_write(&path, &json)
+            .with_context(|| format!("atomic_write {}", path.display()))?;
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o600))
+                .with_context(|| format!("chmod 0600 {}", path.display()))?;
+        }
+        Ok(())
+    }
+
+    pub fn add(&mut self, entry: LocalVolumeEntry) -> Result<()> {
+        if self.volumes.contains_key(&entry.volume_name) {
+            anyhow::bail!("local volume {:?} already exists", entry.volume_name);
+        }
+        if !entry.encrypted {
+            anyhow::bail!("local volume {:?} must be encrypted", entry.volume_name);
+        }
+        self.volumes.insert(entry.volume_name.clone(), entry);
+        Ok(())
+    }
+
+    pub fn get(&self, name: &str) -> Option<&LocalVolumeEntry> {
+        self.volumes.get(name)
+    }
+
+    pub fn iter(&self) -> std::collections::btree_map::Iter<'_, String, LocalVolumeEntry> {
+        self.volumes.iter()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.volumes.is_empty()
+    }
+}
 
 /// One attached virtio-fs volume mount.
 ///
@@ -201,6 +272,15 @@ mod tests {
         }
     }
 
+    fn make_local_entry(name: &str) -> LocalVolumeEntry {
+        LocalVolumeEntry {
+            volume_name: name.to_string(),
+            host_path: format!("/encrypted/{name}"),
+            encrypted: true,
+            created_at: "2026-05-05T00:00:00Z".to_string(),
+        }
+    }
+
     #[test]
     fn empty_registry_is_empty() {
         let r = VolumeMountRegistry::default();
@@ -266,6 +346,34 @@ mod tests {
             .mode()
             & 0o777;
         assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn local_volume_catalog_save_load_roundtrip() {
+        let _g = DataDirGuard::new();
+        let mut c = LocalVolumeCatalog::default();
+        c.add(make_local_entry("work")).unwrap();
+        c.save().unwrap();
+        let loaded = LocalVolumeCatalog::load().unwrap();
+        assert_eq!(loaded, c);
+        assert_eq!(loaded.get("work").unwrap().host_path, "/encrypted/work");
+    }
+
+    #[test]
+    fn local_volume_catalog_rejects_duplicates() {
+        let mut c = LocalVolumeCatalog::default();
+        c.add(make_local_entry("work")).unwrap();
+        let err = c.add(make_local_entry("work")).unwrap_err();
+        assert!(err.to_string().contains("already exists"));
+    }
+
+    #[test]
+    fn local_volume_catalog_rejects_unencrypted_entry() {
+        let mut c = LocalVolumeCatalog::default();
+        let mut e = make_local_entry("work");
+        e.encrypted = false;
+        let err = c.add(e).unwrap_err();
+        assert!(err.to_string().contains("must be encrypted"));
     }
 
     #[test]
