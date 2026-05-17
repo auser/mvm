@@ -2,21 +2,20 @@
 //! (Path C; renamed from the prior `share` subcommand without
 //! behavioural change).
 //!
-//! Today this lands the **registry-side** plumbing: registering an
-//! attached volume mount in `~/.mvm/instances/<vm>/volume_mounts.json`,
-//! rejecting mount paths that hit the deny-list, and listing /
-//! removing entries. The actual `virtiofsd`-on-host + Firecracker
-//! virtio-device-attach is a follow-up — the substrate routes
-//! through `mvm_security::policy::MountPathPolicy` and emits the
-//! same `MountVolume` / `UnmountVolume` vsock verbs the agent
-//! handler already serves.
+//! This command owns two registries:
+//! - managed local encrypted volumes in `~/.mvm/volumes/registry.json`
+//! - per-VM mounts in `~/.mvm/instances/<vm>/volume_mounts.json`
 //!
-//! ## Per-host volume catalog (`volume create`)
+//! The actual `virtiofsd`-on-host + Firecracker virtio-device-attach
+//! is a follow-up — the substrate routes through
+//! `mvm_security::policy::MountPathPolicy` and emits the same
+//! `MountVolume` / `UnmountVolume` vsock verbs the agent handler
+//! already serves.
 //!
-//! Plan 45 also calls for a per-host volume catalog (`mvmctl volume
-//! create <name>` against `~/.mvm/volumes/registry.json`). That's a
-//! separate primitive landing in a follow-up — this subcommand
-//! currently mirrors the prior `share` shape.
+//! Managed local volumes fail closed unless their host directory is
+//! backed by encrypted storage (macOS encrypted APFS/FileVault volume
+//! or Linux dm-crypt/LUKS chain). Ad-hoc `--host` mounts are still
+//! accepted only when the exact directory also passes that check.
 //!
 //! ## `--remote` mode (mvmd proxy)
 //!
@@ -30,7 +29,9 @@
 use anyhow::{Context, Result, bail};
 use clap::{Args as ClapArgs, Subcommand};
 
-use mvm::vm::volume_registry::{VolumeMountEntry, VolumeMountRegistry};
+use mvm::vm::volume_registry::{
+    LocalVolumeCatalog, LocalVolumeEntry, VolumeMountEntry, VolumeMountRegistry,
+};
 use mvm_core::naming::validate_vm_name;
 use mvm_core::user_config::MvmConfig;
 use mvm_security::policy::validate_mount_path;
@@ -46,6 +47,21 @@ pub(in crate::commands) struct Args {
 
 #[derive(Subcommand, Debug, Clone)]
 pub(in crate::commands) enum VolumeCmd {
+    /// Create a managed local volume directory on encrypted backing storage.
+    Create {
+        /// Logical volume name (used as the virtio-fs tag).
+        /// Must be lowercase alphanumeric + hyphens, ≤32 chars.
+        volume: String,
+        /// Encrypted root directory under which the volume directory
+        /// will be created. Defaults to ~/.mvm/volumes/local.
+        #[arg(long)]
+        root: Option<String>,
+    },
+    /// List managed local volumes.
+    Catalog {
+        #[arg(long)]
+        json: bool,
+    },
     /// Mount a virtio-fs volume into a VM.
     ///
     /// Per plan 45 §D5 (Path C): operations against provider-backed
@@ -60,9 +76,11 @@ pub(in crate::commands) enum VolumeCmd {
         /// Must be lowercase alphanumeric + hyphens, ≤32 chars.
         #[arg(long)]
         volume: String,
-        /// Absolute host directory exposed via virtio-fs.
+        /// Absolute host directory exposed via virtio-fs. Advanced
+        /// path: omitted for managed volumes created with
+        /// `mvmctl volume create`.
         #[arg(long)]
-        host: String,
+        host: Option<String>,
         /// Mount point inside the VM (must be under /mnt, /data,
         /// or /work; never under /etc, /usr, /lib, /proc, /nix,
         /// etc.)
@@ -102,6 +120,8 @@ pub(in crate::commands) enum VolumeCmd {
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
     match args.command {
+        VolumeCmd::Create { volume, root } => create(&volume, root.as_deref()),
+        VolumeCmd::Catalog { json } => catalog(json),
         VolumeCmd::Mount {
             name,
             volume,
@@ -113,7 +133,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             if remote {
                 return remote_stub("volume mount");
             }
-            mount(&name, &volume, &host, &guest, rw)
+            mount(&name, &volume, host.as_deref(), &guest, rw)
         }
         VolumeCmd::Ls { name, json, remote } => {
             if remote {
@@ -132,6 +152,12 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
             unmount(&name, &guest_path)
         }
     }
+}
+
+fn default_managed_volume_root() -> std::path::PathBuf {
+    std::path::PathBuf::from(mvm_core::config::mvm_data_dir())
+        .join("volumes")
+        .join("local")
 }
 
 fn remote_stub(op: &str) -> Result<()> {
@@ -160,19 +186,110 @@ fn validate_volume_name(name: &str) -> Result<()> {
     Ok(())
 }
 
-fn mount(vm_name: &str, volume_name: &str, host: &str, guest: &str, rw: bool) -> Result<()> {
+fn create(volume_name: &str, root: Option<&str>) -> Result<()> {
+    validate_volume_name(volume_name)
+        .with_context(|| format!("Invalid volume name: {:?}", volume_name))?;
+    let root = match root {
+        Some(root) => std::path::PathBuf::from(root),
+        None => default_managed_volume_root(),
+    };
+    if !root.is_absolute() {
+        bail!(
+            "managed volume root must be absolute, got {}",
+            root.display()
+        );
+    }
+    std::fs::create_dir_all(&root)
+        .with_context(|| format!("creating managed volume root {}", root.display()))?;
+    crate::doctor::require_local_volume_host_path_encrypted(&root)?;
+
+    let host_path = root.join(volume_name);
+    if host_path.exists() && !host_path.is_dir() {
+        bail!(
+            "managed volume path {} exists but is not a directory",
+            host_path.display()
+        );
+    }
+    std::fs::create_dir_all(&host_path)
+        .with_context(|| format!("creating managed volume {}", host_path.display()))?;
+    crate::doctor::require_local_volume_host_path_encrypted(&host_path)?;
+
+    let mut catalog = LocalVolumeCatalog::load()?;
+    catalog.add(LocalVolumeEntry {
+        volume_name: volume_name.to_string(),
+        host_path: host_path.to_string_lossy().into_owned(),
+        encrypted: true,
+        created_at: mvm_core::util::time::utc_now(),
+    })?;
+    catalog.save()?;
+    println!(
+        "created encrypted local volume {volume_name:?} at {}",
+        host_path.display()
+    );
+    mvm_core::audit_emit!(
+        VolumeCreate,
+        "volume={volume_name} host={} encrypted=true",
+        host_path.display()
+    );
+    Ok(())
+}
+
+fn catalog(json: bool) -> Result<()> {
+    let catalog = LocalVolumeCatalog::load()?;
+    if json {
+        let rows: Vec<&LocalVolumeEntry> = catalog.iter().map(|(_, v)| v).collect();
+        println!("{}", serde_json::to_string_pretty(&rows)?);
+        return Ok(());
+    }
+    if catalog.is_empty() {
+        println!("(no managed local volumes)");
+        return Ok(());
+    }
+    println!("{:<22} {:<10} HOST", "VOLUME", "ENCRYPTED");
+    for (_, e) in catalog.iter() {
+        println!("{:<22} {:<10} {}", e.volume_name, e.encrypted, e.host_path);
+    }
+    Ok(())
+}
+
+fn resolve_mount_host(volume_name: &str, host: Option<&str>) -> Result<String> {
+    if let Some(host) = host {
+        return Ok(host.to_string());
+    }
+    let catalog = LocalVolumeCatalog::load()?;
+    let entry = catalog.get(volume_name).with_context(|| {
+        format!(
+            "no managed local volume named {volume_name:?}; run `mvmctl volume create \
+             {volume_name}` or pass --host <encrypted-dir>"
+        )
+    })?;
+    if !entry.encrypted {
+        bail!("managed local volume {volume_name:?} is not marked encrypted");
+    }
+    Ok(entry.host_path.clone())
+}
+
+fn mount(
+    vm_name: &str,
+    volume_name: &str,
+    host: Option<&str>,
+    guest: &str,
+    rw: bool,
+) -> Result<()> {
     validate_vm_name(vm_name).with_context(|| format!("Invalid VM name: {:?}", vm_name))?;
     validate_volume_name(volume_name)
         .with_context(|| format!("Invalid volume name: {:?}", volume_name))?;
+    let host = resolve_mount_host(volume_name, host)?;
 
     // Host path must be absolute and exist on disk; otherwise
     // virtiofsd would fail later with a confusing message.
-    if !std::path::Path::new(host).is_absolute() {
+    if !std::path::Path::new(&host).is_absolute() {
         bail!("--host path must be absolute, got {:?}", host);
     }
-    if !std::path::Path::new(host).is_dir() {
+    if !std::path::Path::new(&host).is_dir() {
         bail!("--host path {:?} is not an existing directory", host);
     }
+    crate::doctor::require_local_volume_host_path_encrypted(std::path::Path::new(&host))?;
 
     // Validate the guest-side path against the mount policy
     // before we touch the registry — same check the agent runs.
@@ -182,7 +299,7 @@ fn mount(vm_name: &str, volume_name: &str, host: &str, guest: &str, rw: bool) ->
     let mut registry = VolumeMountRegistry::load(vm_name)?;
     registry.add(VolumeMountEntry {
         volume_name: volume_name.to_string(),
-        host_path: host.to_string(),
+        host_path: host.clone(),
         guest_path: canonical_guest.clone(),
         read_only: !rw,
         attached_at: mvm_core::util::time::utc_now(),
