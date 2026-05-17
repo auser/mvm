@@ -21,6 +21,7 @@ base64 = { workspace = true }
 # Addon module deps (SDK port Phase 1b).
 flate2 = { workspace = true }
 hex = { workspace = true }
+hmac = { workspace = true }
 schemars = "0.8"
 sha2 = { workspace = true }
 tar = { workspace = true }

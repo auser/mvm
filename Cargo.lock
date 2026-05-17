@@ -3190,6 +3190,7 @@ dependencies = [
  "flate2",
  "globset",
  "hex",
+ "hmac",
  "mvm-ir",
  "schemars 0.8.22",
  "serde",
