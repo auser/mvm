@@ -67,6 +67,7 @@ Recent maintenance:
 - [x] Resolved ADR-049's AWS SigV4 substitution open question: Python, TypeScript, and Rust SDK runtime surfaces now expose `register_substitution_handler(name, fn)` plus AWS credential-loading helpers so SigV4 signs resolved credentials instead of placeholders.
 - [x] Hardened builder-VM reliability follow-ups from GitHub triage: Stage 0 seed selection now skips cached dev rootfs images that lack `/sbin/mvm-builder-init`, source-built builder VM artifacts must contain that init before promotion, cached builder images fail fast when `cmdline.txt` is missing, libkrun supervisor waits have a bounded `MVM_BUILDER_VM_TIMEOUT_SECS` escape hatch, and flake builds now carry the Nix store-path hash through `/job/store-path` for stable `revision_hash` reuse.
 - [x] Resolved spec-number collisions across `specs/plans/` and `specs/adrs/` by renumbering duplicate-prefixed files, updating references, and adding `cargo xtask check-spec-numbers` to CI so future duplicate Plan/ADR prefixes fail before merge.
+- [x] Shortened top-level `mvmctl --help` command summaries and added a regression test keeping each summary to 72 characters or less.
 
 ## In-flight workstreams
 

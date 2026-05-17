@@ -46,7 +46,7 @@ pub(in crate::commands) struct Cli {
 pub(in crate::commands) enum Commands {
     /// Full environment setup from scratch
     Bootstrap(env::bootstrap::Args),
-    /// Manage the dev VM (up, down, shell, status). macOS uses Apple Container; Linux uses native KVM.
+    /// Manage the local dev VM
     Dev(env::dev::Args),
     /// Remove old dev-build artifacts and run Nix garbage collection
     Cleanup(env::cleanup::Args),
@@ -60,33 +60,17 @@ pub(in crate::commands) enum Commands {
     Update(env::update::Args),
     /// System diagnostics and dependency checks
     Doctor(env::doctor::Args),
-    /// Manage built manifest slots (list, info, remove). Plan 38 §4.
+    /// Manage built manifest slots
     Manifest(manifest::Args),
-    /// Inspect the dm-thin storage pool (info, gc). Plan 47 / ADR-008.
+    /// Inspect the dm-thin storage pool
     Storage(storage::Args),
     /// Build a microVM image from a Mvmfile.toml config or Nix flake
     Build(build::build::Args),
-    /// Render a Workload IR into `flake.nix` + `launch.json` + bundled
-    /// source (mvm-sdk compile pipeline).
-    ///
-    /// v1 accepts a pre-rendered IR JSON via `--from-ir <path>` or `-`
-    /// for stdin; the decorator-script (`@mvm.app`) and runtime-script
-    /// (`Sandbox`) entry forms land with SDK-port Phases 4 and 7
-    /// respectively. Output ending in `.tar.gz`/`.tgz` writes a
-    /// deterministic archive; otherwise a directory.
-    ///
-    /// Mode resolution: `--mode {live|plan|record}` is the explicit
-    /// form; `--prod` is the alias for `record` (the default for
-    /// compile); `--dev` is refused (use `mvmctl run` for live).
-    /// `MVM_SDK_MODE` env var overrides flags.
+    /// Compile Workload IR into build artifacts
     Compile(build::compile::Args),
-    /// Compile a workload and ship the resulting signed archive to
-    /// mvmd. v1 stub end: builds the single `.tar.gz` (compile output
-    /// plus an embedded `mvmd-spec.json` per mvmd ADR-0020) and logs
-    /// what the real HTTP client would `POST /v1/workloads`. The real
-    /// shipping path lands with mvmd Plan 48 Phase 1090.
+    /// Compile and prepare a workload for mvmd
     Deploy(build::deploy::Args),
-    /// Build and run a VM from a Nix flake, a manifest path, or the bundled default image.
+    /// Build and run a VM
     ///
     /// If neither `--flake` nor `--manifest` is supplied, the bundled
     /// `nix/images/default-tenant/` image is used (built via Nix on first use,
@@ -100,13 +84,13 @@ pub(in crate::commands) enum Commands {
     Metrics(ops::metrics::Args),
     /// Read or write global operator config (~/.mvm/config.toml)
     Config(ops::config::Args),
-    /// Remove the dev VM, Firecracker binary, and all mvm state (clean uninstall)
+    /// Remove local mvm state
     Uninstall(env::uninstall::Args),
     /// View the local audit log (~/.mvm/log/audit.jsonl)
     Audit(ops::audit::Args),
     /// Validate a Nix flake before building (runs `nix flake check`)
     Validate(build::validate::Args),
-    /// Show filesystem changes in a running VM (files created/modified/deleted since boot)
+    /// Show filesystem changes in a running VM
     Diff(vm::diff::Args),
     /// Manage named dev networks
     Network(ops::network::Args),
@@ -116,23 +100,9 @@ pub(in crate::commands) enum Commands {
     Console(vm::console::Args),
     /// Manage the XDG cache directory (~/.cache/mvm)
     Cache(ops::cache::Args),
-    /// Scaffold a project (`mvm.toml` + `flake.nix`). Use `mvmctl bootstrap` for first-time environment setup.
+    /// Scaffold a new project
     Init(env::init::Args),
-    /// Boot a fresh transient microVM, run one command, and tear down (dev-mode only).
-    ///
-    /// This is the secure happy path for one-shot sandboxed execution. It delegates
-    /// to the same cold VM machinery as `mvmctl exec`, but adds security profiles
-    /// before dispatch: `standard` by default, `restrictive` for no env or host
-    /// shares, `dev` for writable local shares, and `permissive` only with an
-    /// explicit acknowledgment environment variable.
-    ///
-    /// SDK transport modes (Plan 73 Followup H): pass `--mode plan <script>`
-    /// to run a Sandbox-shaped Python / TypeScript / JavaScript script with
-    /// each `Sandbox` operation routed through `mvm_supervisor::admit_for_run`
-    /// for a dry-run admission check. No microVM ever boots; useful for
-    /// validating admission gates without the cost of a VM boot. `--mode live`
-    /// (alias `--dev`) is reserved for Followup H-live; `--mode record`
-    /// redirects users to `mvmctl compile`.
+    /// Run one command in a transient microVM
     Run(vm::exec::RunArgs),
     /// Verify signed execution receipts emitted by `mvmctl run --receipt`.
     Receipt(vm::exec::ReceiptArgs),
@@ -140,126 +110,48 @@ pub(in crate::commands) enum Commands {
     Sandbox(vm::sandbox::Args),
     /// Copy one file between the host and a running VM.
     Cp(vm::cp::Args),
-    /// Boot a transient microVM, run a single command, and tear down (dev-mode only).
-    ///
-    /// Inspired by cco — same one-command UX, but with a Firecracker microVM as the sandbox.
-    /// Use `--add-dir host:guest[:mode]` to share a host directory (default `:ro`; pass `:rw`
-    /// to rsync writes back to the host on exit). Use `--` to separate the argv from
-    /// `mvmctl exec` flags. Alternatively, pass `--launch-plan ./launch.json` to invoke an
-    /// mvmforge-emitted entrypoint instead of an inline argv.
+    /// Run one dev command in a transient microVM
     Exec(vm::exec::Args),
-    /// Boot a microVM and call its baked entrypoint (production-safe).
-    ///
-    /// Distinct from `mvmctl exec` (dev-only, arbitrary shell). `invoke` dispatches the
-    /// `RunEntrypoint` vsock verb, which the guest agent serves only by spawning the
-    /// program named in `/etc/mvm/entrypoint`. No shell, no argv override, no env
-    /// injection beyond what the wrapper template defined at image build time. Stdin
-    /// from `--stdin <PATH>` (or `-` for mvmctl's own stdin); stdout/stderr stream back
-    /// to mvmctl's own streams. ADR-007 / plan 41.
+    /// Call a VM's baked entrypoint
     Invoke(vm::invoke::Args),
-    /// Manage the lifecycle of a long-running session — list, inspect, kill, set idle timeout.
-    ///
-    /// A session is one microVM the substrate keeps warm across multiple
-    /// `mvmctl invoke` calls. Phase 3 of the upstream-mvm coordination
-    /// (`specs/upstream-mvm-prompt.md` deliverable D); the SDK-facing
-    /// surface for `mvmforge`'s `Session` class.
+    /// Manage long-running VM sessions
     Session(vm::session::Args),
-    /// Speak Model Context Protocol — exposes mvmctl as a sandbox surface for LLM clients.
-    ///
-    /// Single parameterized `run` tool whose `env` parameter selects from `mvmctl template list`.
-    /// Each call boots a transient microVM, runs the supplied code, and tears down. Like
-    /// `mvmctl exec`, the dispatch path requires a dev-feature guest agent (ADR-002 §W4.3);
-    /// against a production guest the call returns "exec not available" gracefully. ADR-003
-    /// documents the threat model and design.
+    /// Expose mvmctl over Model Context Protocol
     Mcp(ops::mcp::Args),
-    /// Set or clear a sandbox's TTL. The supervisor reaper tears down
-    /// VMs whose `expires_at` has elapsed.
+    /// Set or clear a sandbox TTL
     #[command(name = "set-ttl")]
     SetTtl(vm::set_ttl::Args),
-    /// Filesystem RPC against a running VM (read/write/ls/stat/mkdir/rm/mv).
-    /// Production-safe — every path runs through the agent's
-    /// `mvm_security::policy::PathPolicy` deny-list and per-call
-    /// resource caps.
+    /// Run filesystem RPC against a VM
     Fs(vm::fs::Args),
-    /// Process control RPC against a running VM (start/ls/signal/kill/stdin/wait).
-    /// Dev-only — production guest agents strip the handler module
-    /// per ADR-002 §W4.3, returning `UnsupportedInProduction` for
-    /// every verb.
+    /// Run process-control RPC against a VM
     Proc(vm::proc::Args),
-    /// Quiesce a running VM, seal its memory image to
-    /// `~/.mvm/instances/<vm>/snapshot/`, and stop the VM.
-    /// Production-safe; HMAC + monotonic-epoch envelope refuses
-    /// replayed older state.
+    /// Pause and seal a running VM
     Pause(vm::pause::PauseArgs),
-    /// Verify a sealed snapshot and resume the VM. Refuses to
-    /// load a tampered or replayed snapshot.
+    /// Verify and resume a sealed snapshot
     Resume(vm::pause::ResumeArgs),
     /// Manage sealed instance snapshots (`ls`, `rm`).
     Snapshot(vm::pause::SnapshotArgs),
-    /// Manage virtio-fs volume mounts on a VM (`mount`, `ls`,
-    /// `unmount`). Plan 45 §D5 (Path C) — renamed from `share`.
-    /// Mount paths are validated by
-    /// `mvm_security::policy::MountPathPolicy` so a host can't
-    /// shadow verity-protected files. `--remote` proxies through
-    /// mvmd's REST API for provider-backed buckets.
+    /// Manage virtio-fs volume mounts
     Volume(vm::volume::Args),
-    /// Manage tenant secrets (put / get / ls / rm). Values are
-    /// stored in the OS-native keystore when reachable, else in
-    /// mode-0600 files under `~/.mvm/secrets/<tenant>/`. Every
-    /// put/get/delete/list emits an audit entry to
-    /// `~/.mvm/audit/secrets.jsonl` — values are never logged.
-    /// Plan 63 W4.
+    /// Manage tenant secrets
     Secret(ops::secret::Args),
-    /// Emit or verify a host attestation report (`export`, `verify`,
-    /// `status`). The report carries an Ed25519-signed body with the
-    /// boot measurement, identity public key, and an optional
-    /// hardware quote when a `attestation-{tpm2,sev-snp,tdx}` feature
-    /// is wired in. Plan 60 Phase 6.
+    /// Emit or verify host attestation reports
     Attest(ops::attest::Args),
-    /// Inspect a tenant policy bundle on disk (`show`, `verify`).
-    /// Operator-facing surface over the parsed-but-not-yet-enforced
-    /// bundles at `~/.mvm/policies/<tenant>/<workload>.toml`.
-    /// `mvmctl policy update` is stubbed in v0 — production updates
-    /// require an mvmd-signed plan (Phase 8). Plan 60 Phase 3 Slice D.
+    /// Inspect tenant policy bundles
     Policy(ops::policy::Args),
-    /// Seal a built template into a portable, signed `.mvmpkg`
-    /// archive — or verify one against the local trust store.
-    /// Sprint 52 W2 close-out. Bundles are content-addressed and
-    /// signed by the host signer; consumers verify via
-    /// `mvmctl trust`-managed publisher pubkeys.
+    /// Seal or verify portable VM bundles
     Bundle(bundle::Args),
-    /// Manage the bundle-publisher trust store at
-    /// `~/.mvm/trusted-publishers/`. `mvmctl bundle fetch` looks
-    /// pubkeys up via this store before verifying signatures.
+    /// Manage trusted bundle publishers
     Trust(trust::Args),
-    /// Tenant lifecycle: destroy a tenant's overlays + emit signed
-    /// destruction certificates. Plan 60 Phase 7a Slices A + D.
-    /// Hosted-cloud operators use this to satisfy the "provably
-    /// erased" deprovisioning contract.
+    /// Manage tenant lifecycle
     Tenant(ops::tenant::Args),
-    /// Inspect + re-audit cached application-dependency volumes.
-    /// Plan 73 Followup C. The deps cache lives at
-    /// `~/.mvm/volumes/deps/<volume_hash>/`; each volume seals four
-    /// audit artifacts (content + SBOM + fetch.log + cve.json) plus
-    /// a hash-chained manifest (`mvm_sdk::compile::deps_audit`).
-    /// `deps inspect` pretty-prints those artifacts; `deps audit`
-    /// re-runs the CVE scan against the current pip-audit / pnpm
-    /// audit feed and reseals the volume.
+    /// Inspect cached application dependencies
     Deps(deps::Args),
-    /// Block until a guest readiness component reaches a terminal
-    /// state. Plan 76 Phase 2. Defaults to `--for all` with a 60s
-    /// timeout. Exit codes: 0 ready, 65 (EX_DATAERR) component
-    /// failed, 75 (EX_TEMPFAIL) timeout.
+    /// Wait for guest readiness
     Wait(vm::wait::WaitArgs),
-    /// Print a guest's structured readiness snapshot + per-phase
-    /// boot timings. Plan 76 Phase 4. Single round-trip; use
-    /// `mvmctl wait` to poll.
+    /// Print guest readiness and boot timings
     BootReport(vm::wait::BootReportArgs),
-    /// Pack + verify portable signed `.mvm` artifacts (Plan 76
-    /// Phase 6). `pack` writes a tar.gz with kernel + rootfs +
-    /// verity sidecars and signs a manifest hashing each payload.
-    /// `verify` checks the signature + every file hash without
-    /// extracting payloads to disk.
+    /// Pack or verify signed `.mvm` artifacts
     Artifact(vm::artifact::Args),
 }
 
