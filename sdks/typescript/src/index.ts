@@ -80,6 +80,15 @@ export type {
   SandboxCreateOptions,
   SandboxCreateWire,
 } from "./_sandbox.js";
+export {
+  SubstitutionHandlerError,
+  aws_credentials_from_placeholders,
+  clear_substitution_handlers,
+  is_placeholder,
+  register_substitution_handler,
+  substitute,
+} from "./runtime.js";
+export type { AwsCredentials, SubstitutionHandler } from "./runtime.js";
 
 // ────────────────────────────────────────────────────────────────────
 // Module state

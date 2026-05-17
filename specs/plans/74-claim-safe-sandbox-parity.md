@@ -101,6 +101,7 @@ Cross-repo: mvmd Plan 51 W1-W7 owns the fleet-side enforcement (DNS resolver, L7
 - [ ] Update SDK/IR secret references to request placeholder mode by default.
 - [ ] Implement supervisor grant registry with revoke-on-stop/crash/timeout/parent-death.
 - [ ] Integrate substitution with the L7 egress proxy after destination policy passes.
+- [x] Define SDK credential-loading substitution handlers for SigV4-shaped auth: Python, TypeScript, and Rust expose `register_substitution_handler(name, fn)` plus built-in AWS credential helpers that resolve placeholders before request signing.
 - [ ] Add redaction wrappers for plan JSON, logs, audit, errors, route labels, and cache keys.
 - [ ] Keep legacy env/file injection behind an explicit `unsafe_guest_secret_materialization` flag.
 
@@ -111,6 +112,7 @@ Cross-repo: mvmd Plan 51 W1-W7 owns the fleet-side enforcement (DNS resolver, L7
 - Redirect to unapproved destination fails closed.
 - Wrong SNI and plaintext HTTP do not receive substitution.
 - Grant revokes after stop, crash, and parent death.
+- AWS S3 `ListBuckets`-shaped SigV4 signing computes the signature from resolved credentials, not placeholder strings.
 
 ### W4 — SDK-owned lifecycle
 

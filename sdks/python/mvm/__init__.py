@@ -75,6 +75,15 @@ from mvm._sandbox import (
     reset_recording,
 )
 from mvm._session import current_session_id
+from mvm._runtime import (
+    AwsCredentials,
+    SubstitutionHandlerError,
+    aws_credentials_from_placeholders,
+    clear_substitution_handlers,
+    constant_time_eq,
+    register_substitution_handler,
+    substitute,
+)
 
 __all__ = [
     "DEFAULT_TTL_SECONDS",
@@ -92,9 +101,11 @@ __all__ = [
     "SandboxDevOnly",
     "SandboxLiveError",
     "SandboxModeError",
+    "AwsCredentials",
     "SecretInArgError",
     "SecretInArgWarning",
     "Session",
+    "SubstitutionHandlerError",
     "WorkloadRef",
     "addon_use",
     "app",
@@ -110,6 +121,9 @@ __all__ = [
     "entrypoint",
     "entrypoint_function",
     "func",
+    "aws_credentials_from_placeholders",
+    "clear_substitution_handlers",
+    "constant_time_eq",
     "hook",
     "host_port",
     "literal",
@@ -123,9 +137,11 @@ __all__ = [
     "python_image",
     "reset",
     "reset_recording",
+    "register_substitution_handler",
     "resources",
     "secret",
     "session",
+    "substitute",
     "warm_process",
     "workload",
     "workload_ref",

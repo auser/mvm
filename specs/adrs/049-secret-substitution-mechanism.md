@@ -98,6 +98,30 @@ inject credentials in non-standard places (e.g. AWS SigV4, which
 signs the request body — the handler intercepts at signature time,
 not at header injection).
 
+### Credential-loading substitution handlers
+
+`register_substitution_handler(name, fn)` is the extension point
+for protocols whose authentication material is signed before the
+HTTP request middleware sees the final request. The handler receives
+the placeholder and returns materialized credential bytes through
+the same vsock-backed substitution service as the HTTP hooks. The
+language adapter must call the handler while the cloud SDK is
+loading credentials, before the SDK signs headers, query strings,
+or request bodies.
+
+Built-in AWS adapters resolve access key id, secret access key, and
+optional session token through the `aws` handler namespace, then
+hand the resolved values back to the native credential provider:
+
+- Python: `botocore.credentials.Credentials`.
+- TypeScript: `@aws-sdk/credential-providers` provider result.
+- Rust: `aws_config::SdkConfig` credential provider.
+
+SigV4 then runs unchanged with real credentials, so the guest does
+not need host-side signing and the upstream service receives a
+valid signature. Missing handlers fail closed before any outbound
+request is signed.
+
 ### Non-HTTP egress
 
 Out of scope for v1 substitution. SSH, raw TCP, DB protocols
@@ -192,11 +216,14 @@ complexity of just shipping (b) for everything.
 
 ## Open questions
 
-- **AWS SigV4-shaped auth.** SigV4 signs the request body after
-  building it. The substitution must happen *before* SigV4 signs.
-  The `mvm-sdk-runtime` AWS shim hooks `boto3`/`aws-sdk-js` at
-  credential-loading rather than at request-send. Coverage TBD
-  for the full AWS service surface.
+- **Resolved — AWS SigV4-shaped auth.** SigV4 signs the request
+  body after building it, so substitution happens through the
+  credential-loading handler contract above rather than at
+  request-send. The W3.4 SDK layer ships the `aws` handler
+  namespace in Python, TypeScript, and Rust and verifies S3
+  `ListBuckets`-shaped SigV4 signing sees resolved credentials
+  before the signature is computed. Tracked by
+  [mvm#224](https://github.com/tinylabscom/mvm/issues/224).
 - **WebSocket auth.** Most use a connect-time `Authorization`
   header that fits cleanly into the substitution model. Some use
   post-connect token messages; those need protocol-specific
@@ -221,6 +248,11 @@ W3 task additions on top of plan 74 as-written:
 - `mvm-sdk-runtime` TypeScript package with `fetch` polyfill +
   `axios` interceptor.
 - `mvm-sdk-runtime` Rust crate with `reqwest::Middleware` + `hyper::Service` shim.
+- Credential-loading substitution handlers:
+  `register_substitution_handler(name, fn)` in Python,
+  TypeScript, and Rust; built-in `aws` credential adapters for
+  SigV4-shaped auth; deterministic S3 `ListBuckets`-shaped
+  signing tests proving placeholders are resolved before signing.
 - Hostile-guest tests:
   - Raw socket bypass attempt → L4 policy denies + audits.
   - Substitution replay attempt (re-use signed credential on a
