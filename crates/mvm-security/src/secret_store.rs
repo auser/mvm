@@ -64,6 +64,7 @@ use crate::snapshot_crypto;
 /// `mvm_security::keystore::KEYRING_SERVICE` so per-tenant master
 /// keys (W3) and per-name tenant secrets (W4) don't collide.
 pub const KEYRING_SERVICE: &str = "mvm-secrets";
+const KEYRING_TARGET: &str = "mvm-tenant-secrets";
 
 /// Default base dir for [`FileSecretStore`]:
 /// `~/.mvm/secrets/`. Per-tenant subdir mode 0700, per-secret file
@@ -76,6 +77,7 @@ pub fn default_secrets_dir() -> Result<PathBuf> {
 const FILE_SECRET_MAGIC: &[u8] = b"MVMS1\0";
 const FILE_STORE_KEY_FILENAME: &str = ".secret-store.key";
 const FILE_STORE_KEYRING_SERVICE: &str = "mvm-secret-store";
+const FILE_STORE_KEYRING_TARGET: &str = "mvm-file-secret-store";
 const FILE_STORE_KEYRING_USER: &str = "file-backend-key";
 
 /// Multi-key tenant-scoped secret store. Separate from
@@ -274,8 +276,7 @@ fn keyring_user_for_base(base: &Path) -> String {
 }
 
 fn load_or_init_keyring_key(user: &str) -> Result<SecretBox<Vec<u8>>> {
-    let entry = keyring::Entry::new(FILE_STORE_KEYRING_SERVICE, user)
-        .context("opening file secret-store keyring entry")?;
+    let entry = file_store_keyring_entry(user)?;
     match entry.get_password() {
         Ok(hex) => {
             let key = hex_decode(&hex).context("decoding file secret-store key")?;
@@ -289,9 +290,28 @@ fn load_or_init_keyring_key(user: &str) -> Result<SecretBox<Vec<u8>>> {
             entry
                 .set_password(&encoded)
                 .context("writing file secret-store keyring entry")?;
+            let stored = entry
+                .get_password()
+                .context("verifying file secret-store keyring entry")?;
+            if stored != encoded {
+                anyhow::bail!("file secret-store keyring entry failed read-after-write check");
+            }
             Ok(SecretBox::new(Box::new(key.to_vec())))
         }
         Err(err) => Err(err).context("reading file secret-store keyring entry"),
+    }
+}
+
+fn file_store_keyring_entry(user: &str) -> Result<keyring::Entry> {
+    #[cfg(target_os = "macos")]
+    {
+        keyring::Entry::new_with_target(FILE_STORE_KEYRING_TARGET, FILE_STORE_KEYRING_SERVICE, user)
+            .context("opening macOS file secret-store keyring entry")
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        keyring::Entry::new(FILE_STORE_KEYRING_SERVICE, user)
+            .context("opening file secret-store keyring entry")
     }
 }
 
@@ -412,8 +432,16 @@ impl KeyringSecretStore {
             .with_context(|| format!("Invalid tenant for secret entry: {tenant:?}"))?;
         validate_shell_id(name).with_context(|| format!("Invalid secret name: {name:?}"))?;
         let user = format!("{tenant}:{name}");
-        keyring::Entry::new(KEYRING_SERVICE, &user)
-            .with_context(|| format!("opening keyring entry {KEYRING_SERVICE}:{user}"))
+        #[cfg(target_os = "macos")]
+        {
+            keyring::Entry::new_with_target(KEYRING_TARGET, KEYRING_SERVICE, &user)
+                .with_context(|| format!("opening macOS keyring entry {KEYRING_SERVICE}:{user}"))
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            keyring::Entry::new(KEYRING_SERVICE, &user)
+                .with_context(|| format!("opening keyring entry {KEYRING_SERVICE}:{user}"))
+        }
     }
 
     fn index_path(&self, tenant: &str) -> Result<PathBuf> {
@@ -475,6 +503,12 @@ impl SecretStore for KeyringSecretStore {
         entry
             .set_password(value.expose_secret())
             .with_context(|| format!("writing keyring entry for {tenant}:{name}"))?;
+        let stored = entry
+            .get_password()
+            .with_context(|| format!("verifying keyring entry for {tenant}:{name}"))?;
+        if stored != value.expose_secret().as_str() {
+            anyhow::bail!("keyring entry for {tenant}:{name} failed read-after-write check");
+        }
         // Update the index. Read-modify-write; if the entry write
         // succeeded but this fails the secret IS stored but won't
         // show up in `ls` until the next put — operators see this
@@ -512,6 +546,64 @@ impl SecretStore for KeyringSecretStore {
     }
 }
 
+/// Auto backend that prefers the OS keyring but keeps file-backed
+/// secrets visible. This avoids a split-brain operator experience
+/// when the keyring reachability probe changes across invocations
+/// or an older secret already exists in the file backend.
+#[derive(Default)]
+struct AutoSecretStore {
+    keyring: KeyringSecretStore,
+    file: FileSecretStore,
+}
+
+impl SecretStore for AutoSecretStore {
+    fn put(&self, tenant: &str, name: &str, value: &SecretBox<String>) -> Result<()> {
+        match self.keyring.put(tenant, name, value) {
+            Ok(()) if self.keyring.get(tenant, name).is_ok() => Ok(()),
+            Ok(()) | Err(_) => self.file.put(tenant, name, value),
+        }
+    }
+
+    fn get(&self, tenant: &str, name: &str) -> Result<SecretBox<String>> {
+        match self.keyring.get(tenant, name) {
+            Ok(value) => Ok(value),
+            Err(keyring_err) if is_missing_secret_error(&keyring_err) => {
+                self.file.get(tenant, name)
+            }
+            Err(keyring_err) => self.file.get(tenant, name).or(Err(keyring_err)),
+        }
+    }
+
+    fn delete(&self, tenant: &str, name: &str) -> Result<()> {
+        let keyring_result = self.keyring.delete(tenant, name);
+        let file_result = self.file.delete(tenant, name);
+        match (keyring_result, file_result) {
+            (Ok(()), _) | (_, Ok(())) => Ok(()),
+            (Err(keyring_err), Err(file_err)) if is_missing_secret_error(&keyring_err) => {
+                Err(file_err)
+            }
+            (Err(keyring_err), Err(_)) => Err(keyring_err),
+        }
+    }
+
+    fn list(&self, tenant: &str) -> Result<Vec<String>> {
+        let mut names = self.keyring.list(tenant).unwrap_or_default();
+        names.extend(self.file.list(tenant).unwrap_or_default());
+        names.sort();
+        names.dedup();
+        Ok(names)
+    }
+}
+
+fn is_missing_secret_error(err: &anyhow::Error) -> bool {
+    err.chain().any(|cause| {
+        cause
+            .downcast_ref::<keyring::Error>()
+            .is_some_and(|e| matches!(e, keyring::Error::NoEntry))
+            || cause.to_string().contains("no secret")
+    })
+}
+
 /// Env-var override for [`default_secret_store`]. Accepted values
 /// (case-insensitive): `file`, `keyring`, `auto`. Anything else is
 /// treated as `auto` with a `tracing::warn`. Documented in the
@@ -523,9 +615,11 @@ pub const BACKEND_ENV: &str = "MVM_SECRET_STORE_BACKEND";
 /// Auto-pick the best available SecretStore for the current host,
 /// honoring the [`BACKEND_ENV`] override.
 ///
-/// Order (when env is `auto` or unset): KeyringSecretStore if the
-/// OS keystore backend is reachable, else FileSecretStore. Mirrors
-/// [`crate::keystore::default_provider`].
+/// Order (when env is `auto` or unset): an aggregate store that
+/// prefers KeyringSecretStore but keeps FileSecretStore entries
+/// visible if the OS keystore backend is reachable, else
+/// FileSecretStore. Mirrors [`crate::keystore::default_provider`]
+/// while avoiding backend split-brain across CLI invocations.
 ///
 /// On a host whose keyring's `Entry::new` succeeds but `set_password`
 /// later fails (Linux runner with `libsecret` headers but no
@@ -551,7 +645,7 @@ pub fn default_secret_store() -> Box<dyn SecretStore> {
         _ => {}
     }
     if crate::keystore::KeyringProvider::backend_reachable() {
-        return Box::new(KeyringSecretStore::default());
+        return Box::new(AutoSecretStore::default());
     }
     Box::new(FileSecretStore::default())
 }
@@ -664,6 +758,30 @@ mod tests {
         let second = keyring_user_for_base(Path::new("/tmp/mvm-b/secrets"));
         assert_ne!(first, second);
         assert!(first.starts_with(FILE_STORE_KEYRING_USER));
+    }
+
+    #[test]
+    fn auto_store_reads_file_backed_secret_when_keyring_misses() {
+        let tmp = tempfile::tempdir().unwrap();
+        let file_dir = tmp.path().join("file");
+        let store = AutoSecretStore {
+            keyring: KeyringSecretStore::with_dir(tmp.path().join("index")),
+            file: FileSecretStore::with_dir(&file_dir),
+        };
+        store.file.put("acme", "k", &mk_value("v")).unwrap();
+        let got = store.get("acme", "k").unwrap();
+        assert_eq!(got.expose_secret(), "v");
+    }
+
+    #[test]
+    fn auto_store_lists_file_backed_secret_when_keyring_index_is_empty() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = AutoSecretStore {
+            keyring: KeyringSecretStore::with_dir(tmp.path().join("index")),
+            file: FileSecretStore::with_dir(tmp.path().join("file")),
+        };
+        store.file.put("acme", "k", &mk_value("v")).unwrap();
+        assert_eq!(store.list("acme").unwrap(), vec!["k"]);
     }
 
     #[test]

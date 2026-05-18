@@ -177,8 +177,10 @@ Secret values are write-only through the CLI after storage: `get` is a presence
 check and never emits the raw value. Replace a secret by running `secret put`
 again with the same name. Local secret storage is encrypted at rest: the OS
 keyring backend stores values in the platform keystore, and the file fallback
-stores AES-256-GCM encrypted records with mode-0600 files. Legacy plaintext
-file records are refused; replace them with `secret put`.
+stores AES-256-GCM encrypted records with mode-0600 files and a mode-0600 local
+store key. Auto backend mode keeps file-backed secrets visible when the OS
+keyring is reachable, so a backend probe change cannot hide an existing secret.
+Legacy plaintext file records are refused; replace them with `secret put`.
 
 ## Policy Contracts
 

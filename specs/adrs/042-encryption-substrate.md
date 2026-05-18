@@ -134,7 +134,7 @@ mvm-side `make_backend` returns `VolumeError::UnsupportedBackend` for `ObjectSto
 
 - **Tenant DEK can rotate without re-encrypting data.** `rewrap_dek` unwraps under the prior master, re-wraps under the new master, preserves the underlying DEK plaintext. Idempotent on retry after a crash.
 - **Snapshots are encrypted at rest** when a tenant DEK is configured, transparently — no new CLI surface required. Pre-W5 unencrypted snapshots keep working until the operator opts into the migration via `MVM_ALLOW_UNENCRYPTED_SNAPSHOT=1`.
-- **Tenant secrets have a real home.** `mvmctl secret put/get/ls/rm` works on every supported host; OS keyring when reachable, AES-256-GCM encrypted files mode 0600 otherwise. Values never appear in logs.
+- **Tenant secrets have a real home.** `mvmctl secret put/get/ls/rm` works on every supported host; OS keyring when reachable, AES-256-GCM encrypted files with a mode-0600 local store key otherwise. Auto mode keeps file-backed entries visible when the OS keyring is reachable, so backend probe changes do not hide existing secrets. Values never appear in logs.
 - **Compile-time guard against accidental secret logging.** `SecretBox<T>` makes `Debug`/`Display` a compile error; the xtask lint catches the few types whose name contains `Key|Secret|Password|Token` even when the wrap isn't explicit.
 - **Convergence rule keeps the surface small.** mvm provides primitives; mvmd composes them. The "where does AES-KWP live?" / "where is HKDF wired?" ambiguity that haunted Phase 1 is closed.
 
@@ -145,7 +145,7 @@ mvm-side `make_backend` returns `VolumeError::UnsupportedBackend` for `ObjectSto
 - **No cross-host secret replication.** Single-host posture only. mvmd's secret service handles fleet-wide distribution.
 - **`mvmctl key rotate` CLI is a future polish.** The W1 primitives (`rotate_master_key`, `migrate_wrapped_keys`) are callable but operator-driven rotation hasn't been wired through a user-facing verb yet.
 - **Migration escape exists.** Pre-W5 unencrypted snapshots can be resumed under a key-configured tenant via `MVM_ALLOW_UNENCRYPTED_SNAPSHOT=1`. This is a one-time bypass — the next pause encrypts. Documented for the v0.14 → v0.15 cut.
-- **File-store key custody is local-host only.** The file backend encrypts values at rest, using an OS-keyring-held store key when available and a mode-0600 local store key fallback for headless hosts. This is single-host protection, not cross-host replication or hardware-backed attestation.
+- **File-store key custody is local-host only.** The file backend encrypts values at rest with a mode-0600 local store key. This is single-host protection, not cross-host replication or hardware-backed attestation.
 
 ### Out of scope (named in plan 63's non-goals)
 
