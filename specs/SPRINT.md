@@ -75,6 +75,7 @@ Recent maintenance:
 - [x] Resolved spec-number collisions across `specs/plans/` and `specs/adrs/` by renumbering duplicate-prefixed files, updating references, and adding `cargo xtask check-spec-numbers` to CI so future duplicate Plan/ADR prefixes fail before merge.
 - [x] Shortened top-level `mvmctl --help` command summaries and added a regression test keeping each summary to 72 characters or less.
 - [x] Tightened the public `mvmctl` command surface around the local microVM substrate boundary: removed `deploy`, `policy`, and `tenant` from the Clap tree, deleted their unreachable command modules, and updated the CLI reference with the retained command families. Tenant lifecycle, tenant policy review/update, and deployment to the hosted control plane are now documented as `mvmd` responsibilities.
+- [x] GitHub #95 scaffold transplant: restored the ADR-0018 in-guest mesh DNS / vsock bridge contract and iroh-free workspace crates on top of current `main`, with zone-loader and peer-header/binding tests green as the implementation base.
 
 ## In-flight workstreams
 
