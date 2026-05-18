@@ -64,6 +64,7 @@ use crate::snapshot_crypto;
 /// `mvm_security::keystore::KEYRING_SERVICE` so per-tenant master
 /// keys (W3) and per-name tenant secrets (W4) don't collide.
 pub const KEYRING_SERVICE: &str = "mvm-secrets";
+#[cfg(target_os = "macos")]
 const KEYRING_TARGET: &str = "mvm-tenant-secrets";
 
 /// Default base dir for [`FileSecretStore`]:
@@ -77,6 +78,7 @@ pub fn default_secrets_dir() -> Result<PathBuf> {
 const FILE_SECRET_MAGIC: &[u8] = b"MVMS1\0";
 const FILE_STORE_KEY_FILENAME: &str = ".secret-store.key";
 const FILE_STORE_KEYRING_SERVICE: &str = "mvm-secret-store";
+#[cfg(target_os = "macos")]
 const FILE_STORE_KEYRING_TARGET: &str = "mvm-file-secret-store";
 const FILE_STORE_KEYRING_USER: &str = "file-backend-key";
 
