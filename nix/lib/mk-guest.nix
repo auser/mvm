@@ -590,7 +590,10 @@ let
     # Kernel modules. `/init` `modprobe`s vsock before forking the
     # agent (default nixpkgs kernel ships AF_VSOCK as `=m`); without
     # `/lib/modules/<kver>/` in the rootfs, modprobe has nothing to
-    # load and the agent fails to open AF_VSOCK.
+    # load and the agent fails to open AF_VSOCK. Copy only the vsock
+    # transport closure instead of the full kernel module tree; the
+    # full tree is hundreds of MB and #110's contract keeps rootfs
+    # growth below 10 MB.
     #
     # nixpkgs splits the aarch64-linux kernel into two derivations:
     # `kernel` ships `Image` + `System.map` + `dtbs/` (no modules),
@@ -610,16 +613,59 @@ let
             shopt -s nullglob
             kmod_dirs=("$cand"/lib/modules/*)
             shopt -u nullglob
+            copy_module_closure() {
+              local src="$1"
+              local dst="$2"
+              local module_name="$3"
+              local dep_line dep_path dep dep_base base
+
+              while IFS= read -r dep_line; do
+                dep_path="''${dep_line%%:*}"
+                base=$(${pkgs.coreutils}/bin/basename "$dep_path")
+                base="''${base%.xz}"
+                base="''${base%.zst}"
+                base="''${base%.gz}"
+                base="''${base%.ko}"
+                if [ "$base" = "$module_name" ]; then
+                  if [ ! -e "$dst/$dep_path" ]; then
+                    install -D -m 0644 "$src/$dep_path" "$dst/$dep_path"
+                  fi
+                  for dep in ''${dep_line#*:}; do
+                    if [ -n "$dep" ]; then
+                      dep_base=$(${pkgs.coreutils}/bin/basename "$dep")
+                      dep_base="''${dep_base%.xz}"
+                      dep_base="''${dep_base%.zst}"
+                      dep_base="''${dep_base%.gz}"
+                      dep_base="''${dep_base%.ko}"
+                      copy_module_closure "$src" "$dst" "$dep_base"
+                    fi
+                  done
+                  return 0
+                fi
+              done < "$src/modules.dep"
+
+              echo "mkGuest: required kernel module '$module_name' not found in $src/modules.dep" >&2
+              return 1
+            }
+
             for src in "''${kmod_dirs[@]}"; do
               kver=$(${pkgs.coreutils}/bin/basename "$src")
               mkdir -p "$out/lib/modules/$kver"
-              cp -a --reflink=auto "$src/." "$out/lib/modules/$kver/"
-              # Drop build-machine `source`/`build` symlinks that
-              # point into host nix-store dev outputs the guest
-              # can't resolve. modprobe warns on every invocation
-              # otherwise; the guest never reads kernel headers.
-              rm -f "$out/lib/modules/$kver/source" \
-                    "$out/lib/modules/$kver/build"
+
+              # Keep module metadata at the kver root. Busybox modprobe
+              # reads modules.dep for the named module and dependency
+              # paths; the other modules.* files are small enough to keep
+              # and preserve compatibility with kmod-style lookup.
+              shopt -s nullglob
+              for metadata in "$src"/modules.*; do
+                cp -a --reflink=auto "$metadata" "$out/lib/modules/$kver/"
+              done
+              shopt -u nullglob
+
+              copy_module_closure \
+                "$src" \
+                "$out/lib/modules/$kver" \
+                "vmw_vsock_virtio_transport"
             done
             break
           fi
