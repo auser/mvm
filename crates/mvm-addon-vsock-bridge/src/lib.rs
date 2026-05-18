@@ -24,9 +24,10 @@ use tokio::net::{TcpListener, TcpStream};
 /// `addon_loopback_bindings`.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LoopbackBinding {
-    /// Bare addon name (or alias) — matches the corresponding
-    /// `addon_dns_zone` hostname's prefix. E.g. `"db"` for the entry
-    /// whose zone hostname is `"db.addon.local"`.
+    /// Bare addon name or alias used by the host addon proxy. This is
+    /// intentionally independent from the DNS hostname so the guest can
+    /// resolve production-equivalent names such as `db.dev.internal`
+    /// while the bridge still routes by stable addon peer identity.
     pub peer: String,
     /// Loopback IP the bridge binds to listen on. Always in
     /// `127.0.0.0/8`; allocated from the local addon config.

@@ -1,9 +1,9 @@
-//! In-guest DNS resolver for local addon names under `*.addon.local`.
+//! In-guest DNS resolver for configured local addon hostnames.
 //!
 //! Thin wrapper over `hickory-dns`. Listens on `127.0.0.1:53` and
-//! `::1:53` only; authoritative for `*.addon.local`; forwards
-//! everything else upstream. Per-instance zone loaded from the
-//! config disk's `addon_dns_zone` (see
+//! `::1:53` only; authoritative only for exact hostnames configured
+//! in the per-instance zone; forwards everything else upstream. The
+//! zone is loaded from the config disk's `addon_dns_zone` (see
 //! `mvm/specs/contracts/local-addon-dns.md`).
 //!
 //! This crate intentionally contains no distributed mesh logic.
@@ -19,7 +19,7 @@ use std::path::Path;
 /// JSON array of these (see contract spec).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZoneRecord {
-    /// Fully-qualified hostname (e.g. `db.addon.local`).
+    /// Fully-qualified hostname (e.g. `db.dev.internal`).
     pub hostname: String,
     /// IPv4 address the resolver returns for `A` queries against
     /// `hostname`.
@@ -32,8 +32,8 @@ pub struct ZoneRecord {
 ///
 /// ```jsonc
 /// [
-///   {"hostname": "db.addon.local", "address": "10.255.0.1"},
-///   {"hostname": "cache.addon.local", "address": "10.255.0.2"}
+///   {"hostname": "db.dev.internal", "address": "10.255.0.1"},
+///   {"hostname": "cache.dev.internal", "address": "10.255.0.2"}
 /// ]
 /// ```
 pub fn load_zone(path: &Path) -> Result<Vec<ZoneRecord>> {
@@ -73,17 +73,18 @@ impl Zone {
     /// Returns the first matching record; the contract spec
     /// guarantees at most one entry per hostname per instance.
     pub fn lookup(&self, hostname: &str) -> Option<&ZoneRecord> {
+        let hostname = normalize_hostname(hostname);
         self.records
             .iter()
-            .find(|r| r.hostname.eq_ignore_ascii_case(hostname))
+            .find(|r| normalize_hostname(&r.hostname).eq_ignore_ascii_case(hostname))
     }
 
-    /// Whether the zone is authoritative for `hostname` — i.e. it
-    /// ends in `.addon.local`. The resolver uses this to decide
-    /// between answering authoritatively and forwarding upstream.
+    /// Whether the zone is authoritative for `hostname`. Authority
+    /// is intentionally limited to exact configured records so local
+    /// addon DNS can mirror production hostnames without hijacking a
+    /// whole domain or suffix.
     pub fn is_authoritative_for(&self, hostname: &str) -> bool {
-        let h = hostname.trim_end_matches('.');
-        h.ends_with(".addon.local") || h == "addon.local"
+        self.lookup(hostname).is_some()
     }
 
     /// Number of records currently loaded. Useful for "no-op when
@@ -99,6 +100,10 @@ impl Zone {
     }
 }
 
+fn normalize_hostname(hostname: &str) -> &str {
+    hostname.trim_end_matches('.')
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -111,14 +116,14 @@ mod tests {
         std::fs::write(
             &path,
             r#"[
-              {"hostname": "db.addon.local", "address": "10.255.0.1"},
-              {"hostname": "cache.addon.local", "address": "10.255.0.2"}
+              {"hostname": "db.dev.internal", "address": "10.255.0.1"},
+              {"hostname": "cache.dev.internal", "address": "10.255.0.2"}
             ]"#,
         )
         .unwrap();
         let records = load_zone(&path).unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].hostname, "db.addon.local");
+        assert_eq!(records[0].hostname, "db.dev.internal");
         assert_eq!(records[0].address, Ipv4Addr::new(10, 255, 0, 1));
     }
 
@@ -133,31 +138,33 @@ mod tests {
     #[test]
     fn zone_lookup_is_case_insensitive() {
         let zone = Zone::new(vec![ZoneRecord {
-            hostname: "db.addon.local".to_string(),
+            hostname: "db.dev.internal".to_string(),
             address: Ipv4Addr::new(10, 255, 0, 1),
         }]);
-        assert!(zone.lookup("db.addon.local").is_some());
-        assert!(zone.lookup("DB.ADDON.LOCAL").is_some());
-        assert!(zone.lookup("missing.addon.local").is_none());
+        assert!(zone.lookup("db.dev.internal").is_some());
+        assert!(zone.lookup("DB.DEV.INTERNAL").is_some());
+        assert!(zone.lookup("missing.dev.internal").is_none());
     }
 
     #[test]
-    fn is_authoritative_for_only_recognizes_addon_local() {
-        let zone = Zone::new(vec![]);
-        assert!(zone.is_authoritative_for("db.addon.local"));
-        assert!(zone.is_authoritative_for("db.addon.local."));
-        assert!(zone.is_authoritative_for("addon.local"));
+    fn is_authoritative_for_only_recognizes_configured_names() {
+        let zone = Zone::new(vec![ZoneRecord {
+            hostname: "db.dev.internal".to_string(),
+            address: Ipv4Addr::new(10, 255, 0, 1),
+        }]);
+        assert!(zone.is_authoritative_for("db.dev.internal"));
+        assert!(zone.is_authoritative_for("db.dev.internal."));
+        assert!(zone.is_authoritative_for("DB.DEV.INTERNAL"));
+        assert!(!zone.is_authoritative_for("cache.dev.internal"));
+        assert!(!zone.is_authoritative_for("dev.internal"));
         assert!(!zone.is_authoritative_for("example.com"));
-        assert!(!zone.is_authoritative_for("local"));
-        // Defensive: a hostname containing "addon.local" mid-string is
-        // NOT authoritative — only suffix match.
-        assert!(!zone.is_authoritative_for("evil.addon.local.attacker.com"));
+        assert!(!zone.is_authoritative_for("evil.db.dev.internal.attacker.com"));
     }
 
     #[test]
     fn zone_set_records_replaces_state() {
         let mut zone = Zone::new(vec![ZoneRecord {
-            hostname: "old.addon.local".to_string(),
+            hostname: "old.dev.internal".to_string(),
             address: Ipv4Addr::new(10, 255, 0, 1),
         }]);
         assert_eq!(zone.len(), 1);
