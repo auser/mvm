@@ -1,0 +1,19 @@
+{
+  "_comment": "External pins for the ur-seed Stage -1 bootstrap rootfs (Plan 86). Bump in lockstep with flake.nix nixPortablePin. Authoritative source: flake.nix; this file is a human-readable mirror so a code review can flag pin changes without reading Nix.",
+  "nix_portable": {
+    "version": "v012",
+    "upstream": "https://github.com/DavHau/nix-portable/releases/tag/v012",
+    "binaries": {
+      "aarch64-linux": {
+        "url": "https://github.com/DavHau/nix-portable/releases/download/v012/nix-portable-aarch64",
+        "sha256": "af41d8defdb9fa17ee361220ee05a0c758d3e6231384a3f969a314f9133744ea",
+        "size_bytes": 74671948
+      },
+      "x86_64-linux": {
+        "url": "https://github.com/DavHau/nix-portable/releases/download/v012/nix-portable-x86_64",
+        "sha256": "b409c55904c909ac3aeda3fb1253319f86a89ddd1ba31a5dec33d4a06414c72a",
+        "size_bytes": 68062412
+      }
+    }
+  }
+}

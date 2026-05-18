@@ -3101,6 +3101,8 @@ dependencies = [
  "colored",
  "ctrlc",
  "ed25519-dalek",
+ "flate2",
+ "hex",
  "indicatif",
  "inquire",
  "libc",
