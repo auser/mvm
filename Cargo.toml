@@ -31,6 +31,11 @@ members = [
     # Linux-only at runtime; same workspace-ergonomics rule as
     # mvm-builder-init.
     "crates/mvm-egress-proxy",
+    # Local addon developer experience: in-guest addon name resolution
+    # and loopback TCP to host-vsock bridge. Distributed service mesh,
+    # tenant policy, and cryptographic routing belong in mvmd.
+    "crates/mvm-addon-dns",
+    "crates/mvm-addon-vsock-bridge",
     # plan 60 Phase 5 — build-time SDK port from ../mvmforge.
     # mvm-ir is the canonical Workload IR; mvm-sdk is the builder
     # surface; mvm-sdk-macros is a placeholder for the proc-macro
@@ -155,6 +160,9 @@ async-trait = "0.1"
 
 # Pure-Rust DNS resolver, used only by the opt-in custom-dns feature.
 hickory-resolver = "0.24"
+# DNS server/protocol stack for the in-guest addon DNS resolver.
+hickory-server = "0.26"
+hickory-proto = "0.26"
 
 # Utilities
 anyhow = "1"
