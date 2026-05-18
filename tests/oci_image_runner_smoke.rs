@@ -28,7 +28,7 @@ const IMAGE_VAR: &str = "MVM_OCI_IMAGE_RUNNER_REF";
 const KERNEL_VAR: &str = "MVM_OCI_IMAGE_RUNNER_KERNEL";
 const SUPERVISOR_VAR: &str = "MVM_OCI_IMAGE_RUNNER_SUPERVISOR";
 const DEFAULT_IMAGE: &str = "docker.io/library/alpine:3.20";
-const MARKER: &str = "mvm-oci-smoke: hi";
+const MARKER: &str = "oci-smoke: hi";
 
 #[tokio::test(flavor = "multi_thread")]
 async fn alpine_pull_unpack_materialize_and_boots() {
@@ -193,7 +193,7 @@ fn boot_with_libkrun(
     console: &Path,
     state_dir: &Path,
 ) {
-    let vm_name = format!("mvm-oci-smoke-{}", std::process::id());
+    let vm_name = format!("oci-smoke-{}", std::process::id());
     let krun = KrunContext::new(
         &vm_name,
         kernel.to_string_lossy().into_owned(),
