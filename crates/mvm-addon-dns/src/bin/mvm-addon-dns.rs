@@ -1,7 +1,7 @@
 //! In-guest DNS resolver binary for local addons.
 //!
-//! Listens on `127.0.0.1:53` and `::1:53`, serves `*.addon.local`
-//! from a config-disk zone, forwards everything else upstream.
+//! Listens on `127.0.0.1:53` and `::1:53`, serves exact configured
+//! hostnames from a config-disk zone, forwards everything else upstream.
 //! SIGHUP reloads the zone without dropping in-flight queries.
 //!
 //! v1 implementation note: this binary is a scaffold today.

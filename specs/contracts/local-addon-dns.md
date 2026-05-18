@@ -5,11 +5,14 @@
 **Proposed.** This is an mvm-local developer experience primitive, not
 a distributed service mesh.
 
-The in-guest binaries make `db.addon.local:5432`-style addressing work
-for a microVM that declares local development addons such as databases,
-KV stores, queues, or object-store emulators:
+The in-guest binaries let a microVM keep using production-equivalent
+hostnames for local development addons such as databases, KV stores,
+queues, or object-store emulators. A workload can keep a DSN such as
+`postgres://user:pass@db.dev.internal:5432/app`; inside the microVM,
+the configured DNS override maps `db.dev.internal` to a loopback bridge,
+while production can resolve the same hostname normally.
 
-- **`mvm-addon-dns`** resolves configured `*.addon.local` names.
+- **`mvm-addon-dns`** resolves exact configured addon hostnames.
 - **`mvm-addon-vsock-bridge`** fronts configured loopback addresses and
   forwards accepted TCP connections to a local host addon proxy over
   vsock.
@@ -44,8 +47,8 @@ identity, cryptographic routing, or service authorization, it belongs in
 ## Data Path
 
 ```text
-consumer app connects to db.addon.local:5432
-  -> mvm-addon-dns resolves db.addon.local to a configured loopback IP
+consumer app connects to db.dev.internal:5432
+  -> mvm-addon-dns resolves db.dev.internal to a configured loopback IP
   -> mvm-addon-vsock-bridge accepts on that loopback IP and port
   -> bridge opens a vsock stream to the host addon proxy
   -> host addon proxy connects to the local addon process
@@ -60,8 +63,9 @@ Thin wrapper over `hickory-dns`.
 
 - **Listen scope:** `127.0.0.1:53` and `::1:53` only. Never listen on a
   public interface or TAP.
-- **Authority scope:** authoritative for `*.addon.local` only. Forward
-  all other queries to the guest's upstream resolver chain.
+- **Authority scope:** authoritative only for exact hostnames listed in
+  `addon_dns_zone`. Forward all other queries, including other names in
+  the same parent domain, to the guest's upstream resolver chain.
 - **Zone source:** load records from the config disk's
   `addon_dns_zone` array.
 - **Reload model:** SIGHUP reloads the zone without dropping in-flight
@@ -74,10 +78,17 @@ v1 zone shape:
 
 ```json
 [
-  {"hostname": "db.addon.local", "address": "127.0.255.1"},
-  {"hostname": "cache.addon.local", "address": "127.0.255.2"}
+  {"hostname": "db.dev.internal", "address": "127.0.255.1"},
+  {"hostname": "cache.dev.internal", "address": "127.0.255.2"}
 ]
 ```
+
+`*.addon.local` is acceptable for tests and examples, but it is not the
+user-facing contract. Production-equivalent hostnames are preferred so
+application code and connection strings do not need an mvm-specific
+branch. The resolver must not infer authority from suffixes or
+wildcards unless a future contract version adds an explicit field for
+that behavior.
 
 ## Crate: `mvm-addon-vsock-bridge`
 
@@ -131,8 +142,11 @@ binary into no-op mode.
 
 - Boot a VM with no declared local addons: both binaries are no-ops and
   existing networking is unchanged.
-- Boot a VM with a `db` addon: `dig db.addon.local @127.0.0.1` returns
+- Boot a VM with a `db` addon: `dig db.dev.internal @127.0.0.1` returns
   the configured loopback IP.
+- A sibling hostname that is not listed in `addon_dns_zone`, such as
+  `api.dev.internal`, is forwarded upstream instead of answered
+  authoritatively.
 - Connecting to the configured loopback IP and port opens a vsock stream
   to the host addon proxy with the expected v1 peer header.
 - Malformed zone and binding JSON fails closed with a parse error.

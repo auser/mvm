@@ -2,7 +2,7 @@
 name = "mvm-addon-dns"
 version.workspace = true
 edition.workspace = true
-description = "In-guest DNS resolver for local addon names under *.addon.local"
+description = "In-guest DNS resolver for configured local addon hostnames"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
