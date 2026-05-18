@@ -3113,6 +3113,7 @@ dependencies = [
  "hex",
  "libc",
  "oci-client 0.16.1",
+ "rustix 1.1.4",
  "serde",
  "serde_json",
  "sha2",
