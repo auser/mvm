@@ -4,6 +4,7 @@ mod catalog;
 mod cmd_audit;
 mod deps;
 mod env;
+mod image;
 mod manifest;
 mod ops;
 mod shared;
@@ -62,6 +63,8 @@ pub(in crate::commands) enum Commands {
     Doctor(env::doctor::Args),
     /// Manage built manifest slots
     Manifest(manifest::Args),
+    /// Inspect cached OCI images
+    Image(image::Args),
     /// Inspect the dm-thin storage pool
     Storage(storage::Args),
     /// Build a microVM image from a Mvmfile.toml config or Nix flake
@@ -244,6 +247,7 @@ pub fn run() -> Result<()> {
         Commands::Update(a) => env::update::run(&cli, a, &cfg),
         Commands::Doctor(a) => env::doctor::run(&cli, a, &cfg),
         Commands::Manifest(a) => manifest::run(&cli, a, &cfg),
+        Commands::Image(a) => image::run(&cli, a, &cfg),
         Commands::Storage(a) => storage::run(&cli, a, &cfg),
         Commands::Build(a) => build::build::run(&cli, a, &cfg),
         Commands::Compile(a) => build::compile::run(&cli, a, &cfg),

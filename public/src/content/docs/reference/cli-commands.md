@@ -219,7 +219,7 @@ admission until their transports are wired.
 
 ## Image Catalog
 
-> Plan 40 renamed the `mvmctl image *` namespace to `mvmctl catalog *` (a metadata-only browser) and folded "build from catalog" into `mvmctl init <DIR> --catalog <name>`.
+`mvmctl catalog *` is the metadata-only browser for bundled application entries. `mvmctl image *` is reserved for the local OCI image cache under `~/.cache/mvm/oci/`.
 
 | Command | Description |
 |---------|-------------|
@@ -227,6 +227,9 @@ admission until their transports are wired.
 | `mvmctl catalog search <query>` | Search entries by name, description, or tag |
 | `mvmctl catalog info <name>` | Show catalog entry details (JSON) |
 | `mvmctl init <DIR> --catalog <name>` | Scaffold a project from a catalog entry |
+| `mvmctl image ls [--registry <host>] [--json]` | List cached OCI images by reference, resolved digest, fetched timestamp, and size |
+| `mvmctl image inspect <ref-or-digest> [--json]` | Print cached OCI manifest/config metadata, layer digests, and any `mvm-claims.json` sidecar |
+| `mvmctl image rm <ref-or-digest>` | Remove a cached OCI image and garbage-collect unreferenced layer files |
 
 ## Console
 
