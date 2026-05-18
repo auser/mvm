@@ -10,15 +10,17 @@
 //!
 //! Every put/get/delete/list emits one JSON line to
 //! `~/.mvm/audit/secrets.jsonl` carrying
-//! `(timestamp, action, namespace, name, outcome, pid, error?)`.
-//! Values are never logged. The audit file is NOT chain-signed in
-//! v0 — that's plan 64's territory (plan-64 audit chain covers
-//! workload-admission events; secret events get their own stream).
+//! `(timestamp, action, namespace, name, outcome, pid,
+//! secret_visibility, storage_security, error?)`. Values are never
+//! logged. When the chain recorder is available, the same posture
+//! labels are emitted on the chain-signed `secret.*` event.
 //!
 //! ## Backend choice
 //!
 //! Goes through [`secret_store::default_secret_store`]:
-//! - `KeyringSecretStore` when the OS keystore is reachable.
+//! - Auto store when the OS keystore is reachable: writes prefer
+//!   `KeyringSecretStore`, while reads/lists/deletes keep
+//!   file-backed secrets visible.
 //! - `FileSecretStore` everywhere else (CI Linux, headless hosts).
 //!
 //! Tests inject `FileSecretStore::with_dir` via [`run_with_store`].
@@ -224,6 +226,8 @@ fn read_secret_from_stdin() -> Result<String> {
 // ============================================================================
 
 const AUDIT_FILENAME: &str = "secrets.jsonl";
+const SECRET_VISIBILITY_AUDIT_VALUE: &str = "write_only";
+const STORAGE_SECURITY_AUDIT_VALUE: &str = "encrypted_at_rest";
 
 /// Resolve `~/.mvm/audit/secrets.jsonl`. Falls back to a no-op log
 /// when `$HOME` is unset (CI sandboxes, daemons without a home dir)
@@ -326,6 +330,8 @@ impl AuditLog {
                 "name": name,
                 "outcome": outcome_str,
                 "pid": std::process::id(),
+                "secret_visibility": SECRET_VISIBILITY_AUDIT_VALUE,
+                "storage_security": STORAGE_SECURITY_AUDIT_VALUE,
                 "error": error,
             });
             let mut line = serde_json::to_vec(&entry).context("serialize audit entry")?;
@@ -380,6 +386,14 @@ fn emit_through_recorder(
         ("name".to_string(), name.to_string()),
         ("outcome".to_string(), outcome.to_string()),
         ("pid".to_string(), std::process::id().to_string()),
+        (
+            "secret_visibility".to_string(),
+            SECRET_VISIBILITY_AUDIT_VALUE.to_string(),
+        ),
+        (
+            "storage_security".to_string(),
+            STORAGE_SECURITY_AUDIT_VALUE.to_string(),
+        ),
     ];
     if let Some(err) = error {
         extras.push(("error".to_string(), err.to_string()));
@@ -433,6 +447,8 @@ mod tests {
         assert!(log.contains("\"tenant\":\"acme\""));
         assert!(log.contains("\"name\":\"api_token\""));
         assert!(log.contains("\"outcome\":\"ok\""));
+        assert!(log.contains("\"secret_visibility\":\"write_only\""));
+        assert!(log.contains("\"storage_security\":\"encrypted_at_rest\""));
     }
 
     #[test]
@@ -449,6 +465,8 @@ mod tests {
         assert!(!log.contains("\"plaintext\""));
         assert!(log.contains("\"outcome\":\"err\""));
         assert!(log.contains("\"error\":\"boom\""));
+        assert!(log.contains("\"secret_visibility\":\"write_only\""));
+        assert!(log.contains("\"storage_security\":\"encrypted_at_rest\""));
     }
 
     #[test]
@@ -628,6 +646,8 @@ mod tests {
         let log = read_audit(&audit);
         assert!(log.contains("\"action\":\"put\""), "got: {log}");
         assert!(log.contains("\"tenant\":\"acme\""));
+        assert!(log.contains("\"secret_visibility\":\"write_only\""));
+        assert!(log.contains("\"storage_security\":\"encrypted_at_rest\""));
 
         // Recorder (plan-60 Phase 4 stream) — entry carries the
         // canonical `secret.put` event name and per-action tenant
@@ -642,6 +662,14 @@ mod tests {
             Some(&"api_token".to_string())
         );
         assert_eq!(entries[0].labels.get("outcome"), Some(&"ok".to_string()));
+        assert_eq!(
+            entries[0].labels.get("secret_visibility"),
+            Some(&"write_only".to_string())
+        );
+        assert_eq!(
+            entries[0].labels.get("storage_security"),
+            Some(&"encrypted_at_rest".to_string())
+        );
         // category label is injected by the Recorder substrate.
         assert_eq!(
             entries[0].labels.get("category"),
@@ -663,6 +691,14 @@ mod tests {
         assert_eq!(entries[0].event, "secret.get");
         assert_eq!(entries[0].labels.get("outcome"), Some(&"err".to_string()));
         assert_eq!(entries[0].labels.get("error"), Some(&"boom".to_string()));
+        assert_eq!(
+            entries[0].labels.get("secret_visibility"),
+            Some(&"write_only".to_string())
+        );
+        assert_eq!(
+            entries[0].labels.get("storage_security"),
+            Some(&"encrypted_at_rest".to_string())
+        );
     }
 
     #[test]

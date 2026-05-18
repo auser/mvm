@@ -83,7 +83,8 @@ Recent maintenance:
 - [x] GitHub #95 bridge slice: `mvm-addon-vsock-bridge` now loads loopback bindings with explicit `tcp_port`, starts one TCP listener per loopback IP/port, dials the host addon proxy over vsock, writes the peer header before application bytes, and proxies bidirectionally with binding validation and regression coverage.
 - [x] Hardened `mvmctl secret`: `put` now prompts with hidden interactive input when no value source is supplied and still accepts stdin/file/inline sources, while `get` is now a presence check only and can never print the raw secret value. CLI docs and ADR-042 were updated to reflect the write-only-after-set contract.
 - [x] GitHub #109 bootstrap unblock: source-checkout builder-VM cache misses now prefer local Stage 0 dev images but can fall back to the signed/hash-verified published dev image as a seed only, while still refusing to download published builder-VM images so local `nix/images/builder-vm/` changes are built from source.
-- [x] Encrypted the file-backed local secret store at rest: `FileSecretStore` now writes only `MVMS1` AES-256-GCM records, refuses legacy plaintext records, keeps its store key in the OS keyring when reachable or a mode-0600 local fallback, keeps file-backed entries visible in auto backend mode, and tests no-plaintext-on-disk plus tamper rejection.
+- [x] Encrypted the file-backed local secret store at rest: `FileSecretStore` now writes only `MVMS1` AES-256-GCM records, refuses legacy plaintext records, keeps its local store key mode 0600, keeps file-backed entries visible in auto backend mode, and tests no-plaintext-on-disk plus tamper rejection.
+- [x] Stamped the secret audit contract into both audit sinks: JSONL and chain-signed `secret.*` events now carry `secret_visibility=write_only` and `storage_security=encrypted_at_rest` without exposing secret values.
 
 ## In-flight workstreams
 

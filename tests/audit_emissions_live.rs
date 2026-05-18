@@ -1884,6 +1884,14 @@ fn secret_put_emits_put_action_in_secret_audit_log() {
         log.contains("\"outcome\":\"ok\""),
         "audit entry must record outcome=ok on success. Full log:\n{log}"
     );
+    assert!(
+        log.contains("\"secret_visibility\":\"write_only\""),
+        "audit entry must record write-only secret posture. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("\"storage_security\":\"encrypted_at_rest\""),
+        "audit entry must record encrypted-at-rest storage posture. Full log:\n{log}"
+    );
 }
 
 #[test]
