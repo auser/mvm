@@ -12,7 +12,7 @@ use super::build::compile;
 use super::catalog;
 use super::env::{cleanup, dev, init, uninstall};
 use super::ops::{audit, cache, config, metrics};
-use super::vm::{console, cp, down, exec, forward, sandbox, up};
+use super::vm::{console, cp, down, exec, forward, sandbox, up, volume};
 
 use audit::AuditAction;
 use cache::CacheAction;
@@ -97,6 +97,115 @@ fn test_cleanup_verbose_flag() {
             assert!(verbose);
         }
         _ => panic!("Expected Cleanup command"),
+    }
+}
+
+#[test]
+fn volume_create_parses_default_root() {
+    let cli = Cli::try_parse_from(["mvmctl", "volume", "create", "work"]).unwrap();
+    match cli.command {
+        Commands::Volume(volume::Args {
+            command:
+                volume::VolumeCmd::Create {
+                    volume,
+                    root,
+                    host_backed,
+                },
+        }) => {
+            assert_eq!(volume, "work");
+            assert_eq!(root, None);
+            assert!(!host_backed);
+        }
+        _ => panic!("Expected volume create command"),
+    }
+}
+
+#[test]
+fn volume_create_host_backed_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "volume", "create", "work", "--host-backed"]).unwrap();
+    match cli.command {
+        Commands::Volume(volume::Args {
+            command:
+                volume::VolumeCmd::Create {
+                    volume,
+                    root,
+                    host_backed,
+                },
+        }) => {
+            assert_eq!(volume, "work");
+            assert_eq!(root, None);
+            assert!(host_backed);
+        }
+        _ => panic!("Expected volume create command"),
+    }
+}
+
+#[test]
+fn volume_unlock_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "volume", "unlock", "work"]).unwrap();
+    match cli.command {
+        Commands::Volume(volume::Args {
+            command: volume::VolumeCmd::Unlock { volume },
+        }) => assert_eq!(volume, "work"),
+        _ => panic!("Expected volume unlock command"),
+    }
+}
+
+#[test]
+fn volume_lock_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "volume", "lock", "work"]).unwrap();
+    match cli.command {
+        Commands::Volume(volume::Args {
+            command: volume::VolumeCmd::Lock { volume },
+        }) => assert_eq!(volume, "work"),
+        _ => panic!("Expected volume lock command"),
+    }
+}
+
+#[test]
+fn volume_catalog_json_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "volume", "catalog", "--json"]).unwrap();
+    match cli.command {
+        Commands::Volume(volume::Args {
+            command: volume::VolumeCmd::Catalog { json },
+        }) => assert!(json),
+        _ => panic!("Expected volume catalog command"),
+    }
+}
+
+#[test]
+fn volume_mount_managed_omits_host() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "volume",
+        "mount",
+        "vm-1",
+        "--volume",
+        "work",
+        "--guest",
+        "/mnt/work",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Volume(volume::Args {
+            command:
+                volume::VolumeCmd::Mount {
+                    name,
+                    volume,
+                    host,
+                    guest,
+                    rw,
+                    remote,
+                },
+        }) => {
+            assert_eq!(name, "vm-1");
+            assert_eq!(volume, "work");
+            assert_eq!(host, None);
+            assert_eq!(guest, "/mnt/work");
+            assert!(!rw);
+            assert!(!remote);
+        }
+        _ => panic!("Expected volume mount command"),
     }
 }
 

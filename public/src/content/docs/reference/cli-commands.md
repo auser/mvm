@@ -374,6 +374,37 @@ snapshots return `os error 95` (EOPNOTSUPP); restore failures fall back
 to cold boot with a warning rather than aborting the exec. See the
 [Sandboxed Exec](/guides/exec/) guide for the full background.
 
+## Volumes
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl volume create <name>` | Create a locked mvm-managed encrypted local volume archive |
+| `mvmctl volume create <name> --root <absolute-dir>` | Create the mvm-managed encrypted volume under a specific root |
+| `mvmctl volume create <name> --host-backed` | Create the previous host-backed managed directory, requiring encrypted backing storage |
+| `mvmctl volume unlock <name>` | Decrypt a managed volume into its plaintext mount directory |
+| `mvmctl volume lock <name>` | Seal a managed volume back into its encrypted archive and remove plaintext |
+| `mvmctl volume catalog` | List managed local volumes |
+| `mvmctl volume catalog --json` | List managed local volumes as JSON |
+| `mvmctl volume mount <vm> --volume <name> --guest <absolute-path>` | Register an unlocked managed local virtio-fs volume mount for a VM. Read-only by default |
+| `mvmctl volume mount <vm> --volume <name> --host <absolute-dir> --guest <absolute-path>` | Register an ad-hoc encrypted host directory as a virtio-fs volume mount |
+| `mvmctl volume mount <vm> --volume <name> --host <absolute-dir> --guest <absolute-path> --rw` | Register the volume read-write |
+| `mvmctl volume ls <vm>` | List registered volume mounts |
+| `mvmctl volume ls <vm> --json` | List registered volume mounts as JSON |
+| `mvmctl volume unmount <vm> <guest-path>` | Remove a registered volume mount |
+
+Managed local volumes are encrypted by mvm at rest. `volume create` writes a
+locked AES-256-GCM encrypted archive plus wrapped per-volume data key metadata
+in `~/.mvm/volumes/registry.json`; it does not leave a plaintext directory
+behind. `volume unlock` decrypts that archive into a private plaintext mount
+directory, `volume mount` refuses the volume while it is locked, and
+`volume lock` reseals the directory and removes plaintext after use.
+
+Ad-hoc `--host` mounts and `--host-backed` managed volumes keep the previous
+host-backed model: the exact host directory must live on encrypted backing
+storage, either a macOS volume that `diskutil` reports as encrypted or a Linux
+filesystem whose backing device sits on dm-crypt/LUKS. Those commands fail
+closed when mvm cannot confirm that backing storage.
+
 ## Default microVM Image
 
 When an image-taking command is invoked without `--flake` or `--manifest`,

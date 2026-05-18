@@ -1034,12 +1034,102 @@ fn security_audit_log_check() -> Check {
 /// `LocalVirtiofs` bucket creation when FDE is absent). That lives
 /// in mvmd Sprint 137 W6.
 fn security_host_fde_check() -> Check {
-    let detection = detect_host_fde();
+    let detection = detect_host_fde_status();
     Check {
         name: "host FDE (volumes at-rest)",
         category: "security",
         ok: true, // warn-only on dev box per plan 45 §D5
-        info: detection,
+        info: detection.info,
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct HostFdeStatus {
+    pub(crate) enabled: bool,
+    pub(crate) info: String,
+}
+
+impl HostFdeStatus {
+    fn enabled(info: impl Into<String>) -> Self {
+        Self {
+            enabled: true,
+            info: info.into(),
+        }
+    }
+
+    fn not_enabled(info: impl Into<String>) -> Self {
+        Self {
+            enabled: false,
+            info: info.into(),
+        }
+    }
+}
+
+/// Enforce encrypted backing for a LocalBackend volume mount.
+///
+/// Local virtio-fs volumes are plaintext while mounted in the guest, so the
+/// backing directory itself must live on an encrypted filesystem or encrypted
+/// device. Unknown detection fails closed here because mounting the volume is
+/// the point where mvm would otherwise expose sensitive local data without the
+/// documented at-rest guarantee.
+pub(crate) fn require_local_volume_host_path_encrypted(path: &std::path::Path) -> Result<()> {
+    let status = detect_host_path_encryption_status(path);
+    if status.enabled {
+        return Ok(());
+    }
+    anyhow::bail!(
+        "LocalBackend volume mounts require the mounted host directory to live \
+         on encrypted backing storage. {}",
+        status.info
+    )
+}
+
+pub(crate) fn detect_host_path_encryption_status(path: &std::path::Path) -> HostFdeStatus {
+    let plat = platform::current();
+    if matches!(plat, Platform::MacOS) {
+        match std::process::Command::new("diskutil")
+            .arg("info")
+            .arg(path)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let stdout = String::from_utf8_lossy(&out.stdout);
+                parse_macos_diskutil_encryption_status(path, &stdout)
+            }
+            _ => HostFdeStatus::not_enabled(format!(
+                "could not determine encryption state for {} (diskutil unavailable)",
+                path.display()
+            )),
+        }
+    } else if matches!(plat, Platform::LinuxNative | Platform::LinuxNoKvm) {
+        match std::process::Command::new("findmnt")
+            .args(["-no", "SOURCE", "-T"])
+            .arg(path)
+            .output()
+        {
+            Ok(out) if out.status.success() => {
+                let dev = String::from_utf8_lossy(&out.stdout).trim().to_string();
+                match std::process::Command::new("lsblk")
+                    .args(["-no", "TYPE", &dev])
+                    .output()
+                {
+                    Ok(types) if types.status.success() => {
+                        let s = String::from_utf8_lossy(&types.stdout);
+                        parse_linux_volume_backing_types(path, &dev, &s)
+                    }
+                    _ => HostFdeStatus::not_enabled(format!(
+                        "could not inspect block-device type chain for {} ({dev})",
+                        path.display()
+                    )),
+                }
+            }
+            _ => HostFdeStatus::not_enabled(format!(
+                "could not determine backing device for {} (findmnt unavailable)",
+                path.display()
+            )),
+        }
+    } else {
+        HostFdeStatus::not_enabled("unsupported platform for encrypted-volume detection")
     }
 }
 
@@ -1049,7 +1139,7 @@ fn security_host_fde_check() -> Check {
 /// Linux: `lsblk -no TYPE / 2>&1 | grep crypt` succeeds when the root
 /// FS sits on a dm-crypt mapping. Both checks fail closed (return
 /// "unknown") if the underlying tool is missing.
-fn detect_host_fde() -> String {
+pub(crate) fn detect_host_fde_status() -> HostFdeStatus {
     let plat = platform::current();
     if matches!(plat, Platform::MacOS) {
         match std::process::Command::new("fdesetup")
@@ -1058,24 +1148,13 @@ fn detect_host_fde() -> String {
         {
             Ok(out) if out.status.success() => {
                 let stdout = String::from_utf8_lossy(&out.stdout);
-                if stdout.contains("FileVault is On") {
-                    "FileVault enabled (recommended for LocalBackend volumes)".to_string()
-                } else {
-                    format!(
-                        "FileVault appears OFF — run `sudo fdesetup enable` before storing \
-                         sensitive data in LocalBackend volumes ({})",
-                        stdout.trim()
-                    )
-                }
+                parse_filevault_status(&stdout)
             }
-            Ok(_) | Err(_) => {
-                "could not determine FileVault state (fdesetup unavailable)".to_string()
-            }
+            Ok(_) | Err(_) => HostFdeStatus::not_enabled(
+                "could not determine FileVault state (fdesetup unavailable)",
+            ),
         }
     } else if matches!(plat, Platform::LinuxNative | Platform::LinuxNoKvm) {
-        // `lsblk -no TYPE -P` listing for root mountpoint. Cheap;
-        // `findmnt -no SOURCE /` resolves the device, then `lsblk -no
-        // TYPE` gives the device type chain. We accept either route.
         match std::process::Command::new("findmnt")
             .args(["-no", "SOURCE", "/"])
             .output()
@@ -1088,27 +1167,90 @@ fn detect_host_fde() -> String {
                 {
                     Ok(types) if types.status.success() => {
                         let s = String::from_utf8_lossy(&types.stdout);
-                        if s.lines().any(|l| l.trim() == "crypt") {
-                            format!(
-                                "root device {dev} sits on a dm-crypt mapping (LUKS \
-                                 enabled — recommended for LocalBackend volumes)"
-                            )
-                        } else {
-                            format!(
-                                "root device {dev} does NOT appear to be encrypted — \
-                                 enable LUKS on root before storing sensitive data in \
-                                 LocalBackend volumes"
-                            )
-                        }
+                        parse_linux_block_types(&dev, &s)
                     }
-                    _ => format!("could not inspect type chain for {dev}"),
+                    _ => HostFdeStatus::not_enabled(format!(
+                        "could not inspect type chain for {dev}"
+                    )),
                 }
             }
-            _ => "could not determine root device (findmnt unavailable)".to_string(),
+            _ => {
+                HostFdeStatus::not_enabled("could not determine root device (findmnt unavailable)")
+            }
         }
     } else {
-        "unsupported platform for FDE detection".to_string()
+        HostFdeStatus::not_enabled("unsupported platform for FDE detection")
     }
+}
+
+fn parse_filevault_status(stdout: &str) -> HostFdeStatus {
+    if stdout.contains("FileVault is On") {
+        HostFdeStatus::enabled("FileVault enabled (LocalBackend volumes encrypted at rest)")
+    } else {
+        HostFdeStatus::not_enabled(format!(
+            "FileVault appears OFF — run `sudo fdesetup enable` before storing \
+             sensitive data in LocalBackend volumes ({})",
+            stdout.trim()
+        ))
+    }
+}
+
+fn parse_linux_block_types(dev: &str, types: &str) -> HostFdeStatus {
+    if types.lines().any(|l| l.trim() == "crypt") {
+        HostFdeStatus::enabled(format!(
+            "root device {dev} sits on a dm-crypt mapping (LUKS enabled; \
+             LocalBackend volumes encrypted at rest)"
+        ))
+    } else {
+        HostFdeStatus::not_enabled(format!(
+            "root device {dev} does NOT appear to be encrypted — enable LUKS \
+             on root before storing sensitive data in LocalBackend volumes"
+        ))
+    }
+}
+
+fn parse_linux_volume_backing_types(
+    path: &std::path::Path,
+    dev: &str,
+    types: &str,
+) -> HostFdeStatus {
+    if types.lines().any(|l| l.trim() == "crypt") {
+        HostFdeStatus::enabled(format!(
+            "{} is backed by {dev}, which sits on a dm-crypt/LUKS mapping",
+            path.display()
+        ))
+    } else {
+        HostFdeStatus::not_enabled(format!(
+            "{} is backed by {dev}, which does NOT appear to sit on a \
+             dm-crypt/LUKS mapping",
+            path.display()
+        ))
+    }
+}
+
+fn parse_macos_diskutil_encryption_status(
+    path: &std::path::Path,
+    diskutil_output: &str,
+) -> HostFdeStatus {
+    for line in diskutil_output.lines() {
+        let Some((key, value)) = line.split_once(':') else {
+            continue;
+        };
+        let key = key.trim();
+        let value = value.trim().to_ascii_lowercase();
+        let encrypted = value.starts_with("yes") || value.starts_with("encrypted");
+        if matches!(key, "FileVault" | "Encrypted") && encrypted {
+            return HostFdeStatus::enabled(format!(
+                "{} is on a macOS volume reported as encrypted ({key}: {})",
+                path.display(),
+                value
+            ));
+        }
+    }
+    HostFdeStatus::not_enabled(format!(
+        "{} is not on a macOS volume reported as encrypted by diskutil",
+        path.display()
+    ))
 }
 
 /// `~/.mvm` should be mode 0700 (ADR-002 §W1.5). The XDG share directory
@@ -1857,6 +1999,117 @@ mod tests {
             "info should name claim 10 so operators searching the doctor \
              output for the claim find it; got: {}",
             c.info
+        );
+    }
+
+    #[test]
+    fn filevault_parser_accepts_on_status() {
+        let status = parse_filevault_status("FileVault is On.\n");
+        assert!(status.enabled, "expected enabled: {}", status.info);
+        assert!(
+            status.info.contains("encrypted at rest"),
+            "info should state the at-rest guarantee, got: {}",
+            status.info
+        );
+    }
+
+    #[test]
+    fn filevault_parser_rejects_off_status() {
+        let status = parse_filevault_status("FileVault is Off.\n");
+        assert!(!status.enabled, "expected disabled");
+        assert!(
+            status.info.contains("FileVault appears OFF"),
+            "expected FileVault remediation, got: {}",
+            status.info
+        );
+    }
+
+    #[test]
+    fn linux_fde_parser_accepts_crypt_in_device_chain() {
+        let status = parse_linux_block_types("/dev/mapper/cryptroot", "disk\npart\ncrypt\n");
+        assert!(status.enabled, "expected enabled: {}", status.info);
+        assert!(
+            status.info.contains("LUKS enabled"),
+            "expected LUKS marker, got: {}",
+            status.info
+        );
+    }
+
+    #[test]
+    fn linux_fde_parser_rejects_plain_device_chain() {
+        let status = parse_linux_block_types("/dev/nvme0n1p2", "disk\npart\n");
+        assert!(!status.enabled, "expected disabled");
+        assert!(
+            status.info.contains("does NOT appear to be encrypted"),
+            "expected LUKS remediation, got: {}",
+            status.info
+        );
+    }
+
+    #[test]
+    fn linux_volume_backing_parser_accepts_crypt_chain() {
+        let path = std::path::Path::new("/volumes/work");
+        let status =
+            parse_linux_volume_backing_types(path, "/dev/mapper/mvm-volume-work", "crypt\n");
+        assert!(status.enabled, "expected enabled: {}", status.info);
+        assert!(
+            status.info.contains("dm-crypt/LUKS"),
+            "expected dm-crypt marker, got: {}",
+            status.info
+        );
+    }
+
+    #[test]
+    fn linux_volume_backing_parser_rejects_plain_chain() {
+        let path = std::path::Path::new("/volumes/work");
+        let status = parse_linux_volume_backing_types(path, "/dev/sda2", "disk\npart\n");
+        assert!(!status.enabled, "expected disabled");
+        assert!(
+            status.info.contains("does NOT appear"),
+            "expected encrypted-backing refusal, got: {}",
+            status.info
+        );
+    }
+
+    #[test]
+    fn macos_diskutil_parser_accepts_filevault_volume() {
+        let path = std::path::Path::new("/Users/alice/volumes/work");
+        let status = parse_macos_diskutil_encryption_status(
+            path,
+            "Device Identifier: disk3s1\nFileVault: Yes (Unlocked)\n",
+        );
+        assert!(status.enabled, "expected enabled: {}", status.info);
+        assert!(
+            status.info.contains("reported as encrypted"),
+            "expected encrypted marker, got: {}",
+            status.info
+        );
+    }
+
+    #[test]
+    fn macos_diskutil_parser_accepts_encrypted_volume() {
+        let path = std::path::Path::new("/Volumes/secure-work");
+        let status = parse_macos_diskutil_encryption_status(
+            path,
+            "Device Identifier: disk4s1\nEncrypted: Yes\n",
+        );
+        assert!(status.enabled, "expected enabled: {}", status.info);
+    }
+
+    #[test]
+    fn macos_diskutil_parser_rejects_unencrypted_volume() {
+        let path = std::path::Path::new("/Volumes/plain");
+        let status = parse_macos_diskutil_encryption_status(
+            path,
+            "Device Identifier: disk4s1\nEncrypted: No\nFileVault: No\n",
+        );
+        assert!(!status.enabled, "expected disabled");
+        assert!(
+            status
+                .info
+                .contains("not on a macOS volume reported as encrypted"),
+            "expected encrypted-backing refusal, got: {}",
+            status.info
         );
     }
 

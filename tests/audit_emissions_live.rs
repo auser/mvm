@@ -75,6 +75,8 @@
 //!   entry (the `ATTEST` leaves are all ReadOnly)
 //! - `mvmctl session ls` / `volume ls <vm>` → **no** audit entry
 //!   (SESSION ls and VOLUME ls leaves are both ReadOnly)
+//! - `mvmctl volume create <name> --root <encrypted-dir>` →
+//!   `VolumeCreate`
 //! - `mvmctl volume mount <vm> ...` → `VmVolumeAdd` (Plan 67:
 //!   the verb operates purely on the host-side
 //!   `~/.mvm/instances/<vm>/volume_mounts.json` registry — no
@@ -214,6 +216,42 @@ impl AuditSandbox {
             // host-state dependency.
             .env("MVM_SECRET_STORE_BACKEND", "file");
         c
+    }
+
+    fn encrypted_volume_probe_path(&self) -> PathBuf {
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let bin = self.home_path().join("bin");
+            std::fs::create_dir_all(&bin).expect("mkdir fake probe bin");
+            let diskutil = bin.join("diskutil");
+            std::fs::write(
+                &diskutil,
+                "#!/bin/sh\nprintf 'Device Identifier: disk-test\\nEncrypted: Yes\\n'\n",
+            )
+            .expect("write fake diskutil");
+            std::fs::set_permissions(&diskutil, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake diskutil");
+
+            let findmnt = bin.join("findmnt");
+            std::fs::write(&findmnt, "#!/bin/sh\nprintf '/dev/mapper/mvm-test\\n'\n")
+                .expect("write fake findmnt");
+            std::fs::set_permissions(&findmnt, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake findmnt");
+
+            let lsblk = bin.join("lsblk");
+            std::fs::write(&lsblk, "#!/bin/sh\nprintf 'crypt\\n'\n").expect("write fake lsblk");
+            std::fs::set_permissions(&lsblk, std::fs::Permissions::from_mode(0o755))
+                .expect("chmod fake lsblk");
+
+            let existing = std::env::var("PATH").unwrap_or_default();
+            let sep = if existing.is_empty() { "" } else { ":" };
+            PathBuf::from(format!("{}{}{}", bin.display(), sep, existing))
+        }
+        #[cfg(not(unix))]
+        {
+            PathBuf::from(std::env::var("PATH").unwrap_or_default())
+        }
     }
 }
 
@@ -1520,9 +1558,11 @@ fn volume_mount_emits_vm_volume_add_audit_entry() {
     let sandbox = AuditSandbox::new();
     let host_share = sandbox.home_path().join("share");
     std::fs::create_dir_all(&host_share).expect("mkdir host share");
+    let probe_path = sandbox.encrypted_volume_probe_path();
 
     let output = sandbox
         .mvmctl()
+        .env("PATH", &probe_path)
         .args([
             "volume",
             "mount",
@@ -1559,15 +1599,115 @@ fn volume_mount_emits_vm_volume_add_audit_entry() {
 }
 
 #[test]
+fn volume_create_emits_volume_create_audit_entry() {
+    let sandbox = AuditSandbox::new();
+    let root = sandbox.home_path().join("encrypted-root");
+    std::fs::create_dir_all(&root).expect("mkdir encrypted root");
+    let probe_path = sandbox.encrypted_volume_probe_path();
+
+    let output = sandbox
+        .mvmctl()
+        .env("PATH", &probe_path)
+        .args([
+            "volume",
+            "create",
+            "managed",
+            "--root",
+            root.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("spawn mvmctl volume create");
+    assert!(
+        output.status.success(),
+        "mvmctl volume create failed: stderr={}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    let hits = count_entries_with_kind(&log, "volume_create");
+    assert!(
+        hits >= 1,
+        "expected ≥1 volume_create entry, got {hits}. Full log:\n{log}"
+    );
+    assert!(
+        log.contains("volume=managed"),
+        "volume_create detail must record volume=managed. Full log:\n{log}"
+    );
+}
+
+#[test]
+fn volume_unlock_and_lock_emit_audit_entries() {
+    let sandbox = AuditSandbox::new();
+    let root = sandbox.home_path().join("mvm-volume-root");
+    std::fs::create_dir_all(&root).expect("mkdir volume root");
+
+    let create = sandbox
+        .mvmctl()
+        .args([
+            "volume",
+            "create",
+            "managed",
+            "--root",
+            root.to_str().expect("utf-8 path"),
+        ])
+        .output()
+        .expect("spawn mvmctl volume create");
+    assert!(
+        create.status.success(),
+        "mvmctl volume create failed: stderr={}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let unlock = sandbox
+        .mvmctl()
+        .args(["volume", "unlock", "managed"])
+        .output()
+        .expect("spawn mvmctl volume unlock");
+    assert!(
+        unlock.status.success(),
+        "mvmctl volume unlock failed: stderr={}",
+        String::from_utf8_lossy(&unlock.stderr)
+    );
+    std::fs::write(
+        root.join("unlocked").join("managed").join("proof.txt"),
+        b"ok",
+    )
+    .expect("write unlocked volume proof");
+
+    let lock = sandbox
+        .mvmctl()
+        .args(["volume", "lock", "managed"])
+        .output()
+        .expect("spawn mvmctl volume lock");
+    assert!(
+        lock.status.success(),
+        "mvmctl volume lock failed: stderr={}",
+        String::from_utf8_lossy(&lock.stderr)
+    );
+
+    let log = read_audit_log(&sandbox.audit_log_path());
+    assert!(
+        count_entries_with_kind(&log, "volume_open") >= 1,
+        "expected volume_open entry. Full log:\n{log}"
+    );
+    assert!(
+        count_entries_with_kind(&log, "volume_lock") >= 1,
+        "expected volume_lock entry. Full log:\n{log}"
+    );
+}
+
+#[test]
 fn volume_unmount_emits_vm_volume_remove_audit_entry() {
     // Plan 67: mount-then-unmount round-trip. Both emits land in
     // the LocalAudit stream; this test pins the remove half.
     let sandbox = AuditSandbox::new();
     let host_share = sandbox.home_path().join("share");
     std::fs::create_dir_all(&host_share).expect("mkdir host share");
+    let probe_path = sandbox.encrypted_volume_probe_path();
 
     let mount = sandbox
         .mvmctl()
+        .env("PATH", &probe_path)
         .args([
             "volume",
             "mount",
