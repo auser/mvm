@@ -13,9 +13,11 @@
   #
   # The ur-seed is Stage -1: a minimal aarch64-linux rootfs that exists
   # only to run `nix build` against `nix/images/builder-vm/flake.nix`.
-  # It carries no Nix store of its own — `nix-portable` is the
-  # self-extracting Nix it uses to evaluate + build the builder-VM
-  # flake. virtio-fs shares carry the workspace in and the resulting
+  # It ships the same runtime package closure as the steady-state
+  # builder VM (real `nix`, `bash`, `iptables`, …) plus a
+  # TSI-patched kernel, so `mvm-builder-init`'s in-VM dispatch
+  # (`/job/cmd.sh` → `nix build path:/work#…`) runs unchanged.
+  # virtio-fs shares carry the workspace in and the resulting
   # vmlinux/rootfs out.
   #
   # ── Acquisition model (Plan 86 Shape C) ──────────────────────────────
@@ -41,12 +43,12 @@
   #
   # ── Components ───────────────────────────────────────────────────────
   #
-  # | Component               | Source                              |
-  # | ----------------------- | ----------------------------------- |
-  # | `mvm-builder-init.musl` | this workspace, pkgsStatic build    |
-  # | `busybox-static`        | `pkgs.pkgsStatic.busybox`           |
-  # | `nix-portable`          | pinned upstream release + sha256    |
-  # | kernel                  | libkrunfw-bundled (host-side)       |
+  # | Component               | Source                                |
+  # | ----------------------- | ------------------------------------- |
+  # | `mvm-builder-init.musl` | this workspace, pkgsStatic build      |
+  # | `busybox-static`        | `pkgs.pkgsStatic.busybox`             |
+  # | runtime closure         | mirrors `nix/images/builder-vm`'s pkgs|
+  # | kernel + modules        | `nix/images/builder-vm/kernel` (TSI)  |
   #
   # The rootfs is produced as ext4 (not initramfs) to reuse the
   # existing Stage 0 boot path in `mvm-build/src/libkrun_builder.rs`

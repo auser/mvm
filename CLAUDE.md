@@ -125,7 +125,10 @@ post-date the CLAUDE.md per-claim summary below.)
    fetches the per-arch `*-checksums-sha256.txt` manifest, streams
    the artifact through SHA-256, and rejects + deletes on mismatch
    (W5.1). `MVM_SKIP_HASH_VERIFY=1` is the documented emergency
-   escape; never set it in CI.
+   escape; never set it in CI. Extended by ADR-054 to cover the
+   Plan 86 ur-seed: `mvmctl dev fetch-ur-seed` /
+   `dev import-ur-seed` both verify a `.sha256` sidecar before
+   atomic-install into `~/.cache/mvm/ur-seed/<arch>/`.
 7. **Cargo deps are audited on every PR.** `deny.toml` + the `deny`
    and `audit` jobs in CI (W5.2). Reproducibility double-build
    (W5.3) catches non-determinism that could mask injection.
