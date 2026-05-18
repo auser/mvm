@@ -81,6 +81,7 @@ Recent maintenance:
 - [x] GitHub #95 scaffold retarget: narrowed the in-guest DNS / vsock bridge work to local addon developer plumbing (`mvm-addon-dns` + `mvm-addon-vsock-bridge`) and documented that distributed mesh, tenant policy, and cryptographic routing belong in `mvmd`; zone-loader and peer-header/binding tests remain the implementation base.
 - [x] GitHub #95 bridge slice: `mvm-addon-vsock-bridge` now loads loopback bindings with explicit `tcp_port`, starts one TCP listener per loopback IP/port, dials the host addon proxy over vsock, writes the peer header before application bytes, and proxies bidirectionally with binding validation and regression coverage.
 - [x] Hardened `mvmctl secret`: `put` now prompts with hidden interactive input when no value source is supplied and still accepts stdin/file/inline sources, while `get` is now a presence check only and can never print the raw secret value. CLI docs and ADR-042 were updated to reflect the write-only-after-set contract.
+- [x] GitHub #109 bootstrap unblock: source-checkout builder-VM cache misses now prefer local Stage 0 dev images but can fall back to the signed/hash-verified published dev image as a seed only, while still refusing to download published builder-VM images so local `nix/images/builder-vm/` changes are built from source.
 
 ## In-flight workstreams
 

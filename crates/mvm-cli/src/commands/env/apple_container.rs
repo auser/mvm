@@ -1002,6 +1002,56 @@ fn find_local_stage0_bootstrap_image() -> Option<(std::path::PathBuf, std::path:
     find_local_fallback_image_with(|rootfs| rootfs_contains_builder_init(rootfs).unwrap_or(false))
 }
 
+#[cfg(feature = "builder-vm")]
+fn find_or_download_stage0_bootstrap_image()
+-> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    find_or_download_stage0_bootstrap_image_with(download_published_stage0_bootstrap_image)
+}
+
+#[cfg(feature = "builder-vm")]
+fn find_or_download_stage0_bootstrap_image_with(
+    download_seed: impl FnOnce() -> Result<(std::path::PathBuf, std::path::PathBuf, String)>,
+) -> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    if let Some(seed) = find_local_stage0_bootstrap_image() {
+        return Ok(seed);
+    }
+
+    download_seed()
+}
+
+#[cfg(feature = "builder-vm")]
+fn download_published_stage0_bootstrap_image()
+-> Result<(std::path::PathBuf, std::path::PathBuf, String)> {
+    let version = env!("CARGO_PKG_VERSION");
+    let prebuilt_dir = std::path::PathBuf::from(mvm_core::config::mvm_data_dir())
+        .join("dev")
+        .join("prebuilt")
+        .join(format!("v{version}"));
+    std::fs::create_dir_all(&prebuilt_dir)
+        .with_context(|| format!("creating Stage 0 seed cache dir {}", prebuilt_dir.display()))?;
+
+    let kernel = prebuilt_dir.join("vmlinux");
+    let rootfs = prebuilt_dir.join("rootfs.ext4");
+    ui::warn(
+        "No local Stage 0 dev image contains /sbin/mvm-builder-init; \
+         downloading the verified published dev image as a bootstrap seed only. \
+         The builder VM image will still be built from this source checkout.",
+    );
+    download_dev_image(
+        kernel
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Stage 0 seed kernel path is not valid UTF-8"))?,
+        rootfs
+            .to_str()
+            .ok_or_else(|| anyhow::anyhow!("Stage 0 seed rootfs path is not valid UTF-8"))?,
+    )
+    .context("downloading verified published dev image for Stage 0 seed")?;
+
+    ensure_stage0_seed_manifest(&rootfs).context("validating downloaded Stage 0 seed image")?;
+
+    Ok((kernel, rootfs, format!("prebuilt/v{version}")))
+}
+
 fn find_local_fallback_image_with(
     accepts_rootfs: impl Fn(&std::path::Path) -> bool,
 ) -> Option<(std::path::PathBuf, std::path::PathBuf, String)> {
@@ -2456,6 +2506,43 @@ fn validate_stage0_seed_contract(
 }
 
 #[cfg(feature = "builder-vm")]
+fn ensure_stage0_seed_manifest(seed_rootfs: &std::path::Path) -> Result<()> {
+    if !rootfs_contains_builder_init(seed_rootfs)? {
+        anyhow::bail!(
+            "Stage 0 seed rootfs at {} does not contain /sbin/mvm-builder-init; \
+             this dev image cannot bootstrap the source-checkout builder VM cache.",
+            seed_rootfs.display()
+        );
+    }
+
+    let seed_dir = seed_rootfs
+        .parent()
+        .unwrap_or_else(|| std::path::Path::new("."));
+    let manifest_path = seed_dir.join("manifest.json");
+    if manifest_path.exists() {
+        return Ok(());
+    }
+
+    let system = if cfg!(target_arch = "aarch64") {
+        "aarch64-linux"
+    } else {
+        "x86_64-linux"
+    };
+    let manifest = serde_json::json!({
+        "schema_version": STAGE0_SUPPORTED_MANIFEST_SCHEMA,
+        "contract_version": STAGE0_REQUIRED_CONTRACT_VERSION,
+        "image_kind": STAGE0_EXPECTED_IMAGE_KIND,
+        "system": system,
+        "init_paths": STAGE0_REQUIRED_INIT_PATHS,
+    });
+    let body =
+        serde_json::to_string_pretty(&manifest).context("serializing Stage 0 seed manifest")?;
+    std::fs::write(&manifest_path, format!("{body}\n"))
+        .with_context(|| format!("writing Stage 0 seed manifest {}", manifest_path.display()))?;
+    Ok(())
+}
+
+#[cfg(feature = "builder-vm")]
 fn bootstrap_builder_vm_image_via_dev_image_stage0(
     builder_flake_dir: &str,
     out_dir: &str,
@@ -2472,15 +2559,15 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
     // contributor host) and the simpler invariant is worth it.
     let _stage0_guard = acquire_stage0_lock(out_dir)?;
 
-    let (kernel, rootfs, source_label) = find_local_stage0_bootstrap_image().ok_or_else(|| {
-        anyhow::anyhow!(
-            "source checkout builder VM cache is missing and no local dev image cache was found \
-             under ~/.mvm/dev/current/, ~/.mvm/dev/prebuilt/v*/, or ~/.mvm/dev/builds/*/ \
-             that contains /sbin/mvm-builder-init. \
-             Refusing to download a published builder VM prebuilt. Import or build a dev image \
-             that contains /sbin/mvm-builder-init, then retry `mvmctl dev up`."
-        )
-    })?;
+    let (kernel, rootfs, source_label) = find_or_download_stage0_bootstrap_image().context(
+        "source checkout builder VM cache is missing and no local Stage 0 dev image cache was found \
+         under ~/.mvm/dev/current/, ~/.mvm/dev/prebuilt/v*/, or ~/.mvm/dev/builds/*/ \
+         that contains /sbin/mvm-builder-init. Failed to acquire a verified published dev-image \
+         seed as the bootstrap fallback.",
+    )?;
+
+    ensure_stage0_seed_manifest(&rootfs)
+        .with_context(|| format!("preparing Stage 0 seed manifest for {source_label}"))?;
 
     // Plan 77 W5 — preflight seed contract check. Catches the
     // contract-stale dev-image-rootfs case (no `/sbin/mvm-builder-init`
@@ -3830,6 +3917,98 @@ mod dev_status_image_tests {
         assert_eq!(kernel, prebuilt.join("vmlinux"));
         assert_eq!(rootfs, prebuilt.join("rootfs.ext4"));
         assert_eq!(label, "prebuilt/v0.0.2");
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn stage0_seed_resolution_prefers_local_seed_without_downloading() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &data_dir,
+            &tmp.path().join("cache"),
+        );
+
+        let current = data_dir.join("dev/current");
+        write_valid_dev_image(&current);
+
+        let (kernel, rootfs, label) = find_or_download_stage0_bootstrap_image_with(|| {
+            panic!("valid local Stage 0 seed should avoid download")
+        })
+        .expect("local seed should resolve");
+
+        assert_eq!(kernel, current.join("vmlinux"));
+        assert_eq!(rootfs, current.join("rootfs.ext4"));
+        assert_eq!(label, "current");
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn stage0_seed_resolution_downloads_when_local_seed_missing() {
+        let _lock = ENV_LOCK.lock().unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let data_dir = tmp.path().join("data");
+        let _env = EnvGuard::set(
+            &tmp.path().join("home"),
+            &data_dir,
+            &tmp.path().join("cache"),
+        );
+
+        let downloaded = tmp.path().join("downloaded");
+        write_valid_dev_image(&downloaded);
+        let (kernel, rootfs, label) = find_or_download_stage0_bootstrap_image_with(|| {
+            Ok((
+                downloaded.join("vmlinux"),
+                downloaded.join("rootfs.ext4"),
+                "downloaded".to_string(),
+            ))
+        })
+        .expect("download fallback should resolve");
+
+        assert_eq!(kernel, downloaded.join("vmlinux"));
+        assert_eq!(rootfs, downloaded.join("rootfs.ext4"));
+        assert_eq!(label, "downloaded");
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn ensure_stage0_seed_manifest_writes_missing_sidecar() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_valid_dev_image(tmp.path());
+        let rootfs = tmp.path().join("rootfs.ext4");
+
+        ensure_stage0_seed_manifest(&rootfs).expect("valid seed should get a manifest");
+
+        let manifest = tmp.path().join("manifest.json");
+        assert!(manifest.is_file(), "manifest sidecar should be written");
+        validate_stage0_seed_contract(&rootfs).expect("written manifest should satisfy contract");
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn ensure_stage0_seed_manifest_rejects_rootfs_without_builder_init() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_valid_dev_image(tmp.path());
+        let rootfs = tmp.path().join("rootfs.ext4");
+        let mut bytes = std::fs::read(&rootfs).unwrap();
+        for b in &mut bytes {
+            if *b != 0 {
+                *b = 0;
+            }
+        }
+        const EXT4_MAGIC_OFFSET: usize = 1024 + 56;
+        bytes[EXT4_MAGIC_OFFSET] = 0x53;
+        bytes[EXT4_MAGIC_OFFSET + 1] = 0xEF;
+        std::fs::write(&rootfs, bytes).unwrap();
+
+        let err = ensure_stage0_seed_manifest(&rootfs)
+            .expect_err("seed without builder init must be rejected");
+        assert!(
+            format!("{err:#}").contains("/sbin/mvm-builder-init"),
+            "error should name missing Stage 0 init path: {err:#}"
+        );
     }
 
     #[test]
