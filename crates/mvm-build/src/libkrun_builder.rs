@@ -73,9 +73,11 @@ use crate::builder_vm::{BuilderArtifacts, BuilderJob, BuilderMounts, BuilderVm, 
 pub const DEFAULT_VCPUS: u8 = 4;
 
 /// Default RAM in MiB. Nix evaluation peaks around 2.5 GiB for the
-/// dev image's closure; 4 GiB leaves headroom for parallel
-/// derivation builds without swapping.
-pub const DEFAULT_MEMORY_MIB: u32 = 4096;
+/// dev image's closure, but in-VM nix builds compiling rustc + std +
+/// the 800-crate vendor tree (plus the kernel build for the builder
+/// VM image's TSI kernel) peak around 5-6 GiB. 8 GiB leaves headroom
+/// without OOM-killing the GCC link step. Plan 72 W5.D bullet 9.
+pub const DEFAULT_MEMORY_MIB: u32 = 8192;
 
 /// Default size of the persistent `/nix`-store virtio-blk image,
 /// in MiB. 64 GiB sparse — the file only consumes the bytes the
@@ -793,7 +795,9 @@ cd /work
 # isolation boundary, so an in-guest sandbox is redundant.
 export NIX_CONFIG="experimental-features = nix-command flakes
 sandbox = false
-build-users-group ="
+build-users-group =
+substituters = https://cache.nixos.org/
+trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 # Plan 72 W0's flake convention: workspace-path env var so
 # flakes that reference the workspace root don't depend on
 # relative-path resolution against the store-copied flake dir.
@@ -802,8 +806,23 @@ export MVM_WORKSPACE_PATH=/work
 # `--impure` is what unblocks builds inside the VM when the
 # flake has path inputs; `--no-write-lock-file` keeps the
 # read-only `/work` mount from tripping EROFS.
-NIX_OUT=$(nix build "${{FLAKE_REF}}#${{ATTR_PATH}}" \
-    --no-link --print-out-paths --no-write-lock-file --impure)
+# `--print-build-logs --keep-going` dumps every failing build's
+# stderr inline (default nix only prints the last 10 lines and
+# cascades up). We tee stderr to /job/nix-build.log so the host
+# can read the actual root cause when a deep dependency fails.
+set +e
+nix build "${{FLAKE_REF}}#${{ATTR_PATH}}" \
+    --no-link --print-out-paths --no-write-lock-file --impure \
+    --print-build-logs --keep-going \
+    > /job/nix-stdout.log 2> /job/nix-stderr.log
+NIX_RC=$?
+set -e
+NIX_OUT=$(cat /job/nix-stdout.log)
+if [ "$NIX_RC" -ne 0 ]; then
+    echo "nix build exited $NIX_RC; tail of stderr:" >&2
+    tail -200 /job/nix-stderr.log >&2
+    exit $NIX_RC
+fi
 
 if [ -z "$NIX_OUT" ]; then
     echo "nix build emitted no /nix/store output path" >&2

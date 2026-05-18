@@ -532,6 +532,14 @@ mod linux {
         // boot path; we replicate it here for the mvm-builder-init
         // path (Plan 86).
         mount_fs_idempotent("tmpfs", "/run", "tmpfs")?;
+        // `/dev/pts` is required by nix's build-sandbox setup: it
+        // calls `posix_openpt` which opens `/dev/ptmx`, and that
+        // requires devpts to be mounted at `/dev/pts`. Without it
+        // nix bails with `error: opening pseudoterminal master:
+        // No such file or directory`. The dev image flake's
+        // mkGuest /init mounts this; we replicate for Plan 86.
+        let _ = std::fs::create_dir_all("/dev/pts");
+        mount_fs_idempotent("devpts", "/dev/pts", "devpts")?;
         Ok(())
     }
 
