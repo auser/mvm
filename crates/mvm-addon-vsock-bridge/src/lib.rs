@@ -125,9 +125,7 @@ pub async fn run_bridge(bindings: Vec<LoopbackBinding>) -> std::io::Result<()> {
         tokio::spawn(accept_loop(listener, binding));
     }
 
-    std::future::pending::<()>().await;
-    #[allow(unreachable_code)]
-    Ok(())
+    std::future::pending::<std::io::Result<()>>().await
 }
 
 async fn accept_loop(listener: TcpListener, binding: LoopbackBinding) {

@@ -99,8 +99,8 @@ v1 binding shape:
 
 ```json
 [
-  {"peer": "db", "loopback_ip": "127.0.255.1", "vsock_port": 5253},
-  {"peer": "cache", "loopback_ip": "127.0.255.2", "vsock_port": 5254}
+  {"peer": "db", "loopback_ip": "127.0.255.1", "tcp_port": 5432, "vsock_port": 5253},
+  {"peer": "cache", "loopback_ip": "127.0.255.2", "tcp_port": 6379, "vsock_port": 5254}
 ]
 ```
 

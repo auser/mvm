@@ -5,17 +5,13 @@
 //! a vsock stream to the host addon proxy, writes the
 //! length-prefixed peer header, then proxies bytes both ways.
 //!
-//! v1 implementation note: scaffold today. The peer-header wire
-//! format and load_bindings primitive are functional + unit-tested
-//! (see `lib.rs`). The actual TCP listeners + vsock dial + bytes-
-//! proxy loop land as the implementation phase.
-
 use anyhow::{Context, Result};
-use mvm_addon_vsock_bridge::load_bindings;
+use mvm_addon_vsock_bridge::{load_bindings, run_bridge};
 use std::env;
 use std::path::PathBuf;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
     let bindings_path: PathBuf = env::var_os("MVM_ADDON_LOOPBACK_BINDINGS_PATH")
@@ -51,11 +47,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // Real listener wiring — TCP listener per binding, vsock dial via
-    // libc AF_VSOCK, bidirectional proxy loop with half-close
-    // semantics — lands as a follow-up. The peer-header encode/decode
-    // + binding loader in `lib.rs` are unit-tested and ready for that
-    // wire-up.
-    tracing::error!("bridge wire-up not yet implemented");
-    std::process::exit(1);
+    run_bridge(bindings)
+        .await
+        .context("addon vsock bridge failed")
 }
