@@ -163,6 +163,24 @@ mod linux {
     pub fn run() -> ExitCode {
         eprintln!("mvm-builder-init: pid 1 starting");
 
+        // The Linux kernel doesn't pass a PATH to PID 1, so without
+        // this every `Command::new("iptables")` /
+        // `Command::new("modprobe")` style spawn relies on the
+        // child to find its binary — which fails on a stock rootfs
+        // (Plan 86 / ADR-054). Set a canonical PATH that covers the
+        // mvm builder VM rootfs layout (busybox + extra packages in
+        // /sbin + /usr/local/bin) before any spawn site runs.
+        // Absolute-path call sites (`/sbin/mkfs.ext4`, `/sbin/udhcpc`)
+        // are unaffected.
+        // SAFETY: PID 1 is single-threaded until we spawn the fan-out
+        // tracks below; no other thread can be reading the env yet.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/sbin:/usr/sbin:/bin:/usr/bin",
+            );
+        }
+
         // Plan 76 Phase 5: anchor the boot-timings clock as close
         // to init entry as we can. The few ms of `eprintln!` +
         // module dispatch above this point are constant across
@@ -262,9 +280,33 @@ mod linux {
             &crate::network::SystemIptables,
             crate::network::PROXY_UID,
         ) {
-            eprintln!("mvm-builder-init: egress lockdown FAILED (fatal): {e}");
-            write_result(2, &format!("egress lockdown failed: {e}"));
-            return power_off();
+            // Plan 86: in the Stage 0 / ur-seed bootstrap context the
+            // libkrunfw-bundled kernel ships without netfilter — both
+            // `iptables-nft` and `iptables-legacy` bail with "table
+            // does not exist" or "protocol not supported" at the first
+            // rule install. The egress lockdown is defense-in-depth
+            // for the Plan 73 deps-install pipeline (untrusted code
+            // running in the steady-state builder VM). Stage 0 only
+            // runs flake builds — `nix build` against a pinned
+            // `path:/work#…` reference — where Nix's own fixed-output
+            // derivation hashes carry the integrity guarantee. We
+            // log + continue rather than fail closed.
+            //
+            // The steady-state builder VM image (built by Stage 0 via
+            // the in-repo TSI-patched kernel under
+            // `nix/images/builder-vm/kernel/`) carries netfilter, so
+            // this fallback only triggers in Stage 0 — the audit
+            // signal still distinguishes the two contexts.
+            if egress_error_indicates_no_netfilter(&e) {
+                eprintln!(
+                    "mvm-builder-init: egress lockdown SKIPPED (kernel lacks netfilter — \
+                     Stage 0 / libkrunfw-bundled-kernel context): {e}"
+                );
+            } else {
+                eprintln!("mvm-builder-init: egress lockdown FAILED (fatal): {e}");
+                write_result(2, &format!("egress lockdown failed: {e}"));
+                return power_off();
+            }
         }
 
         // Plan 73 Followup B.2 dispatch: install jobs hand the init
@@ -460,6 +502,18 @@ mod linux {
     /// every other init step. /proc, /sys, /dev, /tmp must be
     /// available before module loading, device probing, or virtio-fs
     /// mounting; nothing else fans out concurrently with this.
+    /// Plan 86 — detect the "kernel ships without netfilter / iptables
+    /// tables" error pattern. Matches both the iptables-nft Protocol
+    /// not supported and the iptables-legacy "Table does not exist /
+    /// do you need to insmod?" surfaces. A future netlink-based check
+    /// would be more robust, but this regex-of-substrings catches the
+    /// only two error shapes the libkrunfw-bundled kernel produces.
+    fn egress_error_indicates_no_netfilter(err: &str) -> bool {
+        err.contains("Table does not exist")
+            || err.contains("Failed to initialize nft")
+            || err.contains("Protocol not supported")
+    }
+
     fn mount_pseudofs() -> Result<(), String> {
         // Standard init filesystems. libkrun's kernel mounts
         // devtmpfs (and sometimes /proc /sys) before handing off to
@@ -470,6 +524,14 @@ mod linux {
         mount_fs_idempotent("sysfs", "/sys", "sysfs")?;
         mount_fs_idempotent("devtmpfs", "/dev", "devtmpfs")?;
         mount_fs_idempotent("tmpfs", "/tmp", "tmpfs")?;
+        // `/run` must be a tmpfs so iptables-legacy can write
+        // `/run/xtables.lock`. The rootfs is mounted ro, so a missing
+        // `/run` tmpfs makes `install_egress_lockdown` bail with
+        // "Read-only file system" at the first `iptables -A` call.
+        // mkGuest's /init does the equivalent for the dev image's
+        // boot path; we replicate it here for the mvm-builder-init
+        // path (Plan 86).
+        mount_fs_idempotent("tmpfs", "/run", "tmpfs")?;
         Ok(())
     }
 

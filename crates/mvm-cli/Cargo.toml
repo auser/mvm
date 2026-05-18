@@ -47,6 +47,8 @@ serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 tar = "0.4"
+flate2.workspace = true
+hex.workspace = true
 tempfile.workspace = true
 toml.workspace = true
 notify = { workspace = true, optional = true }
@@ -65,10 +67,8 @@ rand.workspace = true
 [features]
 # Plan 72 W5.B cutover: `builder-vm` is now default so `mvmctl dev up`
 # prefers the libkrun-backed builder VM with a persistent /nix store.
-# Library consumers that don't want the libkrun FFI in their closure build
-# with `default-features = false`. Runtime gating via
-# `mvm_libkrun::is_available()` still falls back cleanly when libkrun isn't
-# installed on the host.
+# Runtime gating via `mvm_libkrun::is_available()` still falls back cleanly
+# when libkrun isn't installed on the host.
 default = ["builder-vm"]
 contributor-bootstrap = [
     "mvm/contributor-bootstrap",
@@ -76,6 +76,13 @@ contributor-bootstrap = [
     "mvm-backend/contributor-bootstrap",
 ]
 builder-vm = ["mvm-build/builder-vm"]
+# Plan 86 / Plan 72 W5.D bullet 10: extract libkrunfw's bundled
+# TSI-patched kernel at runtime so Stage 0 boots a kernel where
+# libkrun's AF_INET-over-vsock (TSI) path actually works. The feature
+# is opt-in because normal CI and library consumers should not require
+# libkrun headers. Builds that run the native libkrun path can enable it
+# on hosts where libkrunfw is installed.
+libkrun-sys = ["mvm-libkrun/libkrun-sys"]
 # Plan 77 W4: structural enforcement of the "no prebuilt builder VM artifact
 # until release" invariant (see AGENTS.md / CLAUDE.md). When off — the default
 # for every contributor build — `download_builder_vm_image` and its helpers

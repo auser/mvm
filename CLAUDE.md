@@ -125,7 +125,10 @@ post-date the CLAUDE.md per-claim summary below.)
    fetches the per-arch `*-checksums-sha256.txt` manifest, streams
    the artifact through SHA-256, and rejects + deletes on mismatch
    (W5.1). `MVM_SKIP_HASH_VERIFY=1` is the documented emergency
-   escape; never set it in CI.
+   escape; never set it in CI. Extended by ADR-054 to cover the
+   Plan 86 ur-seed: `mvmctl dev fetch-ur-seed` /
+   `dev import-ur-seed` both verify a `.sha256` sidecar before
+   atomic-install into `~/.cache/mvm/ur-seed/<arch>/`.
 7. **Cargo deps are audited on every PR.** `deny.toml` + the `deny`
    and `audit` jobs in CI (W5.2). Reproducibility double-build
    (W5.3) catches non-determinism that could mask injection.
@@ -214,6 +217,12 @@ cargo run -- dev up      # same as above, explicit
 cargo run -- dev down    # stop the builder VM
 cargo run -- dev shell   # open shell in running builder VM
 cargo run -- dev status  # show dev environment status
+
+# Ur-seed Stage –1 bootstrap (Plan 86 / ADR-054). Required once on
+# a host with no contract-compliant dev image. `mvmctl dev up` NEVER
+# auto-fetches.
+cargo run -- dev fetch-ur-seed                       # release mirror
+cargo run -- dev import-ur-seed --from <tarball>     # air-gapped
 
 # Build from Nix flake
 cargo run -- build --flake . --profile minimal --role worker

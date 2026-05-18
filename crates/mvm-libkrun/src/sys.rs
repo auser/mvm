@@ -215,7 +215,111 @@ impl Drop for Context {
     }
 }
 
-/// Set libkrun's global log level. Wraps `krun_set_log_level`.
+// libkrunfw's bundled kernel — Plan 86 / Plan 72 W5.D bullet 10.
+//
+// libkrunfw ships a TSI-patched Linux kernel image inside its dynamic
+// library (`libkrunfw.5.dylib` on macOS, `libkrunfw.so.5` on Linux).
+// The symbol `krunfw_get_kernel` returns a pointer to those kernel
+// bytes plus the load + entry addresses libkrun expects when booting
+// against them.
+//
+// We extract the kernel exactly once per `mvmctl` process at runtime
+// and write it to a stable cache path, then hand that path to
+// libkrun's `KrunContext.kernel_path`. The bundled kernel is the
+// only kernel where libkrun's TSI mode (Transparent Socket
+// Impersonation — the AF_INET-over-vsock path) is known to work
+// correctly. Stock nixpkgs kernels lack the patches; our in-repo
+// port of the libkrunfw patches (nix/images/builder-vm/kernel/)
+// kernel-oops's on socket close against nixpkgs 6.12.87.
+//
+// The bundled-kernel approach matches libkrun's own documented
+// expectation: every libkrun-using consumer either uses this kernel
+// or accepts that AF_INET sockets won't work in the guest.
+#[link(name = "krunfw")]
+unsafe extern "C" {
+    fn krunfw_get_kernel(load_addr: *mut u64, entry_addr: *mut u64, size: *mut usize) -> *const u8;
+}
+
+/// Result of [`extract_bundled_kernel`]: a path to the kernel bytes on
+/// disk plus the load + entry addresses libkrun's `set_kernel` call
+/// will pair with that path.
+#[derive(Debug, Clone)]
+pub struct BundledKernel {
+    pub path: std::path::PathBuf,
+    pub load_addr: u64,
+    pub entry_addr: u64,
+    pub size: usize,
+}
+
+/// Extract the TSI-patched kernel bundled in `libkrunfw` and write it
+/// to `target_path`. Idempotent — if `target_path` already exists with
+/// the same byte length the call short-circuits and returns the cached
+/// load/entry addresses.
+///
+/// `target_path` SHOULD be a stable per-host location (e.g.
+/// `~/.cache/mvm/libkrunfw/vmlinux`) so subsequent invocations skip the
+/// copy. Errors propagate as [`Error::Init`] with a description of the
+/// failed step.
+pub fn extract_bundled_kernel(target_path: &Path) -> Result<BundledKernel, Error> {
+    let mut load_addr: u64 = 0;
+    let mut entry_addr: u64 = 0;
+    let mut size: usize = 0;
+
+    // SAFETY: `krunfw_get_kernel` returns a pointer into libkrunfw's
+    // own `.rodata` segment — valid for the lifetime of the process.
+    // The three output pointers we pass are all non-null and aligned.
+    // The returned slice is read-only.
+    let bytes_ptr = unsafe { krunfw_get_kernel(&mut load_addr, &mut entry_addr, &mut size) };
+
+    if bytes_ptr.is_null() || size == 0 {
+        return Err(Error::Io {
+            context: "krunfw_get_kernel returned null/zero — libkrunfw missing or version mismatch"
+                .to_string(),
+        });
+    }
+
+    // SAFETY: `bytes_ptr` is non-null and points to `size` initialised
+    // bytes inside libkrunfw's `.rodata` (lifetime = process). Treating
+    // the slice as read-only is correct.
+    let bytes = unsafe { std::slice::from_raw_parts(bytes_ptr, size) };
+
+    if let Some(parent) = target_path.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| Error::Io {
+            context: format!(
+                "creating libkrunfw kernel cache parent {}: {e}",
+                parent.display()
+            ),
+        })?;
+    }
+
+    let needs_write = match std::fs::metadata(target_path) {
+        Ok(meta) => meta.len() != size as u64,
+        Err(_) => true,
+    };
+    if needs_write {
+        // Write atomically — staging file + rename so a concurrent
+        // mvmctl process can't observe a torn write.
+        let staging = target_path.with_extension("staging");
+        std::fs::write(&staging, bytes).map_err(|e| Error::Io {
+            context: format!("writing libkrunfw kernel to {}: {e}", staging.display()),
+        })?;
+        std::fs::rename(&staging, target_path).map_err(|e| Error::Io {
+            context: format!(
+                "promoting {} -> {}: {e}",
+                staging.display(),
+                target_path.display()
+            ),
+        })?;
+    }
+
+    Ok(BundledKernel {
+        path: target_path.to_path_buf(),
+        load_addr,
+        entry_addr,
+        size,
+    })
+}
+
 pub fn set_log_level(level: LogLevel) -> Result<(), Error> {
     check(unsafe { bindings::krun_set_log_level(level.as_u32()) })
 }

@@ -15,6 +15,7 @@ pub(super) mod setup;
 pub(super) mod shell_init;
 pub(super) mod uninstall;
 pub(super) mod update;
+pub(super) mod ur_seed;
 
 // Re-export the top-level `Cli` so files inside this group can keep
 // using `super::Cli`.
