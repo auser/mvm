@@ -55,6 +55,7 @@ pub(in crate::commands) fn cache_dir(arch: &str) -> PathBuf {
 /// contract upgrade (W4 follow-up) which will read the manifest to
 /// pick the right init path per seed.
 #[derive(Debug, Clone)]
+#[cfg(feature = "builder-vm")]
 pub(in crate::commands) struct UrSeedCache {
     pub dir: PathBuf,
     pub rootfs: PathBuf,
@@ -68,6 +69,7 @@ pub(in crate::commands) struct UrSeedCache {
 /// Probe the on-disk cache. Returns `Some` only if every required
 /// entry exists and is non-empty. A partial cache (e.g. from a crashed
 /// extraction) returns `None` so the caller can re-install.
+#[cfg(feature = "builder-vm")]
 pub(in crate::commands) fn probe(arch: &str) -> Option<UrSeedCache> {
     let dir = cache_dir(arch);
     let rootfs = dir.join(ROOTFS_NAME);

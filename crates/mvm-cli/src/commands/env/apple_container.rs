@@ -2144,6 +2144,7 @@ fn bootstrap_builder_vm_image() -> Result<()> {
             Ok(())
         }
         BuilderVmBootstrapAction::BuildFromSource { flake_dir } => {
+            #[cfg(feature = "builder-vm")]
             let source_fingerprint = source_fingerprint.ok_or_else(|| {
                 anyhow::anyhow!("builder VM source fingerprint was not computed for {flake_dir}")
             })?;
@@ -2154,13 +2155,16 @@ fn bootstrap_builder_vm_image() -> Result<()> {
             // Plan 86: prefer a contract-compliant dev image as the
             // Stage 0 seed (existing Plan 77 W5 path). If none exists,
             // fall through to an ur-seed cache.
-            if find_local_stage0_bootstrap_image().is_some() {
-                return bootstrap_builder_vm_image_via_dev_image_stage0(
-                    &flake_dir,
-                    &out_dir,
-                    &source_fingerprint,
-                )
-                .context("building the source-checkout builder VM image");
+            #[cfg(feature = "builder-vm")]
+            {
+                if find_local_stage0_bootstrap_image().is_some() {
+                    return bootstrap_builder_vm_image_via_dev_image_stage0(
+                        &flake_dir,
+                        &out_dir,
+                        &source_fingerprint,
+                    )
+                    .context("building the source-checkout builder VM image");
+                }
             }
 
             #[cfg(feature = "builder-vm")]
@@ -2994,18 +2998,6 @@ fn stage0_failure_reason_summary(err: &anyhow::Error) -> String {
         .collect();
     let truncated: String = cleaned.chars().take(160).collect();
     truncated
-}
-
-#[cfg(not(feature = "builder-vm"))]
-fn bootstrap_builder_vm_image_via_dev_image_stage0(
-    builder_flake_dir: &str,
-    _out_dir: &str,
-    _source_fingerprint: &str,
-) -> Result<()> {
-    anyhow::bail!(
-        "cannot build builder VM image from source checkout at {builder_flake_dir}: \
-         mvm-cli was built without the `builder-vm` feature"
-    )
 }
 
 #[cfg(feature = "builder-vm")]
