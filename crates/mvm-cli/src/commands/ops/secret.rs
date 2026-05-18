@@ -2,10 +2,9 @@
 //!
 //! Local CRUD for secret namespaces. Values never appear in
 //! logs, error chains, or process listings — `put` accepts the
-//! value via flag, stdin, or file; `get` writes to stdout only when
-//! it's not a TTY (so a script using `$(mvmctl secret get …)`
-//! works but an interactive `mvmctl secret get foo` doesn't dump
-//! the value into the user's terminal).
+//! value via an interactive hidden prompt, stdin, flag, or file;
+//! `get` verifies that a secret exists but never prints the stored
+//! value.
 //!
 //! ## Audit
 //!
@@ -34,7 +33,7 @@ use clap::{Args as ClapArgs, Subcommand};
 use mvm_plan::TenantId;
 use mvm_security::secret_store::{self, SecretStore};
 use mvm_supervisor::{EventCategory, FileAuditSigner, Recorder};
-use secrecy::{ExposeSecret, SecretBox};
+use secrecy::SecretBox;
 
 use mvm_core::user_config::MvmConfig;
 
@@ -50,9 +49,11 @@ pub(in crate::commands) struct Args {
 
 #[derive(Subcommand, Debug, Clone)]
 pub(in crate::commands) enum SecretAction {
-    /// Store a local secret. Value source: `--value <V>` (inline,
-    /// shell-history risk), `--value -` (read from stdin), or
-    /// `--value-file <PATH>`. The value never appears in logs.
+    /// Store or replace a local secret. With no value source,
+    /// prompts interactively when stdin is a TTY or reads piped
+    /// stdin otherwise. Explicit sources remain available:
+    /// `--value <V>` (inline, shell-history risk), `--value -`
+    /// (read from stdin), or `--value-file <PATH>`.
     Put {
         /// Name to store the secret under (alphanumeric + `_-`).
         name: String,
@@ -68,17 +69,12 @@ pub(in crate::commands) enum SecretAction {
         value_file: Option<PathBuf>,
     },
 
-    /// Retrieve a local secret. Writes the raw value to stdout
-    /// (no trailing newline) only when stdout is not a TTY. Pass
-    /// `--force` to bypass the TTY guard.
+    /// Check whether a local secret exists. Never prints the raw
+    /// secret value.
     Get {
         name: String,
         #[arg(long, default_value = "local")]
         tenant: String,
-        /// Bypass the TTY guard. Use with care — surfaces the
-        /// value on the user's terminal.
-        #[arg(long)]
-        force: bool,
     },
 
     /// List secret names stored for a tenant.
@@ -111,11 +107,7 @@ pub(in crate::commands) fn run_with_store(store: &dyn SecretStore, args: Args) -
             value,
             value_file,
         } => cmd_put(store, &audit, tenant, name, value, value_file),
-        SecretAction::Get {
-            name,
-            tenant,
-            force,
-        } => cmd_get(store, &audit, tenant, name, force),
+        SecretAction::Get { name, tenant } => cmd_get(store, &audit, tenant, name),
         SecretAction::Ls { tenant } => cmd_ls(store, &audit, tenant),
         SecretAction::Rm { name, tenant } => cmd_rm(store, &audit, tenant, name),
     }
@@ -134,7 +126,7 @@ fn cmd_put(
     value_file: Option<PathBuf>,
 ) -> Result<()> {
     let result = (|| {
-        let raw = resolve_value(value, value_file)?;
+        let raw = resolve_value(value, value_file, &name)?;
         let secret = SecretBox::new(Box::new(raw));
         store.put(&tenant, &name, &secret)
     })();
@@ -144,31 +136,11 @@ fn cmd_put(
     Ok(())
 }
 
-fn cmd_get(
-    store: &dyn SecretStore,
-    audit: &AuditLog,
-    tenant: String,
-    name: String,
-    force: bool,
-) -> Result<()> {
-    if std::io::stdout().is_terminal() && !force {
-        let err: Result<()> = Err(anyhow::anyhow!(
-            "refusing to print secret to an interactive terminal; \
-             redirect stdout to a file/pipe or pass `--force`"
-        ));
-        audit.record("get", &tenant, &name, &err)?;
-        return err;
-    }
+fn cmd_get(store: &dyn SecretStore, audit: &AuditLog, tenant: String, name: String) -> Result<()> {
     let result = store.get(&tenant, &name);
     audit.record("get", &tenant, &name, &result.as_ref().map(|_| ()))?;
-    let value = result?;
-    // Stderr message names what's happening so a `$()` capture knows
-    // what came through. The actual value goes to stdout, raw, no
-    // trailing newline.
-    eprintln!("Wrote secret '{name}' for tenant '{tenant}' to stdout.");
-    std::io::stdout()
-        .write_all(value.expose_secret().as_bytes())
-        .context("writing secret to stdout")?;
+    result?;
+    println!("Secret '{name}' is set for tenant '{tenant}'.");
     Ok(())
 }
 
@@ -201,38 +173,50 @@ fn cmd_rm(store: &dyn SecretStore, audit: &AuditLog, tenant: String, name: Strin
 // Value resolution — flag / stdin / file
 // ============================================================================
 
-fn resolve_value(value: Option<String>, value_file: Option<PathBuf>) -> Result<String> {
+fn resolve_value(
+    value: Option<String>,
+    value_file: Option<PathBuf>,
+    secret_name: &str,
+) -> Result<String> {
     match (value, value_file) {
-        (Some(v), None) if v == "-" => {
-            let mut buf = String::new();
-            std::io::stdin()
-                .read_to_string(&mut buf)
-                .context("reading secret value from stdin")?;
-            // Strip a single trailing newline — `echo "x" | mvmctl
-            // secret put …` shouldn't include the LF in the stored
-            // value.
-            if buf.ends_with('\n') {
-                buf.pop();
-                if buf.ends_with('\r') {
-                    buf.pop();
-                }
-            }
-            Ok(buf)
-        }
+        (Some(v), None) if v == "-" => read_secret_from_stdin(),
         (Some(v), None) => Ok(v),
         (None, Some(path)) => std::fs::read_to_string(&path)
             .with_context(|| format!("reading secret value from {}", path.display())),
-        (None, None) => {
-            anyhow::bail!(
-                "no value source — pass --value <V>, --value - (stdin), or --value-file <PATH>"
-            )
-        }
+        (None, None) => read_secret_from_prompt_or_stdin(secret_name),
         (Some(_), Some(_)) => {
             // Clap should prevent this via conflicts_with, but
             // double-check at runtime in case the API drifts.
             anyhow::bail!("--value and --value-file are mutually exclusive")
         }
     }
+}
+
+fn read_secret_from_prompt_or_stdin(secret_name: &str) -> Result<String> {
+    if std::io::stdin().is_terminal() {
+        inquire::Password::new(&format!("Secret value for '{secret_name}'"))
+            .without_confirmation()
+            .prompt()
+            .context("reading secret value from interactive prompt")
+    } else {
+        read_secret_from_stdin()
+    }
+}
+
+fn read_secret_from_stdin() -> Result<String> {
+    let mut buf = String::new();
+    std::io::stdin()
+        .read_to_string(&mut buf)
+        .context("reading secret value from stdin")?;
+    // Strip a single trailing newline — `echo "x" | mvmctl
+    // secret put …` shouldn't include the LF in the stored value.
+    if buf.ends_with('\n') {
+        buf.pop();
+        if buf.ends_with('\r') {
+            buf.pop();
+        }
+    }
+    Ok(buf)
 }
 
 // ============================================================================
@@ -484,7 +468,7 @@ mod tests {
 
     #[test]
     fn resolve_value_inline_returns_value() {
-        let v = resolve_value(Some("hello".into()), None).unwrap();
+        let v = resolve_value(Some("hello".into()), None, "api_token").unwrap();
         assert_eq!(v, "hello");
     }
 
@@ -492,24 +476,31 @@ mod tests {
     fn resolve_value_file_reads_file_contents() {
         let tmp = tempfile::NamedTempFile::new().unwrap();
         std::fs::write(tmp.path(), b"from-file").unwrap();
-        let v = resolve_value(None, Some(tmp.path().to_path_buf())).unwrap();
+        let v = resolve_value(None, Some(tmp.path().to_path_buf()), "api_token").unwrap();
         assert_eq!(v, "from-file");
     }
 
     #[test]
-    fn resolve_value_missing_returns_clear_error() {
-        let err = resolve_value(None, None).unwrap_err();
-        assert!(err.to_string().contains("no value source"), "got: {err}");
+    fn resolve_value_rejects_inline_and_file_together() {
+        let tmp = tempfile::NamedTempFile::new().unwrap();
+        let err = resolve_value(
+            Some("inline".into()),
+            Some(tmp.path().to_path_buf()),
+            "api_token",
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("--value and --value-file are mutually exclusive"),
+            "got: {err}"
+        );
     }
 
     // ──────────────────────────────────────────────────────────────
     // Subcommand handlers — happy paths
     //
-    // We can't easily test `cmd_get` against the TTY guard from a
-    // unit test because stdout's terminal status is process-wide;
-    // the guard's correctness is exercised through manual QA and
-    // the predicates::cli integration tests in tests/cli.rs once
-    // those land.
+    // `cmd_get` is intentionally a presence check only: it verifies
+    // the entry exists but never exposes the raw value.
     // ──────────────────────────────────────────────────────────────
 
     #[test]
@@ -546,6 +537,29 @@ mod tests {
         .unwrap();
         cmd_rm(&store, &audit, "acme".into(), "k".into()).unwrap();
         assert!(store.list("acme").unwrap().is_empty());
+    }
+
+    #[test]
+    fn cmd_get_checks_presence_without_returning_secret() {
+        let tmp_store = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::with_dir(tmp_store.path());
+        let (_audit_dir, audit) = temp_audit();
+        cmd_put(
+            &store,
+            &audit,
+            "acme".into(),
+            "api_token".into(),
+            Some("secret-xyz".into()),
+            None,
+        )
+        .unwrap();
+        cmd_get(&store, &audit, "acme".into(), "api_token".into()).unwrap();
+        let log = read_audit(&audit);
+        assert!(log.contains("\"action\":\"get\""), "got: {log}");
+        assert!(
+            !log.contains("secret-xyz"),
+            "audit log must not contain the secret value: {log}"
+        );
     }
 
     #[test]

@@ -102,8 +102,8 @@ Chunked wire format (24-byte header + N chunks of nonce(12) + ciphertext_with_ta
 
 ### Operator-facing surface
 
-- `mvmctl secret put <name> --tenant <T> [--value V | --value - | --value-file PATH]` — stores a value. Inline / stdin / file. Overwrites silently. Never logs the value.
-- `mvmctl secret get <name> --tenant <T> [--force]` — emits the raw value to stdout (no trailing newline) **only when stdout is non-tty**. The TTY guard prevents shoulder-surfing during interactive use; scripts using `$(mvmctl secret get …)` work because the pipe makes stdout non-tty.
+- `mvmctl secret put <name> --tenant <T> [--value V | --value - | --value-file PATH]` — stores or replaces a value. With no explicit source, prompts with hidden terminal input when stdin is a TTY, or reads piped stdin otherwise. Inline / stdin / file remain supported. Never logs the value.
+- `mvmctl secret get <name> --tenant <T>` — verifies that the secret exists and prints only presence metadata. It never emits the raw value; secrets can be replaced with `put` but not viewed after storage.
 - `mvmctl secret ls --tenant <T>` — names only.
 - `mvmctl secret rm <name> --tenant <T>`.
 - Audit emissions for every CRUD operation appear at `~/.mvm/audit/secrets.jsonl` carrying `(timestamp, action, tenant, name, outcome, pid, error?)`. Values are never recorded.
