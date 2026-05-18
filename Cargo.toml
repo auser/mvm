@@ -212,6 +212,7 @@ mvm-guest = { path = "crates/mvm-guest", version = "0.14.0" }
 mvm-build = { path = "crates/mvm-build", version = "0.14.0", default-features = false }
 mvm = { path = "crates/mvm", version = "0.14.0", default-features = false }
 mvm-base = { path = "crates/mvm-base", version = "0.14.0" }
+mvm-oci = { path = "crates/mvm-oci", version = "0.14.0" }
 mvm-security = { path = "crates/mvm-security", version = "0.14.0" }
 mvm-storage = { path = "crates/mvm-storage", version = "0.14.0" }
 mvm-plan = { path = "crates/mvm-plan", version = "0.14.0" }
@@ -277,6 +278,9 @@ objc2-foundation = { version = "0.3", features = ["NSRunLoop", "NSDate", "NSAuto
 [dev-dependencies]
 assert_cmd.workspace = true
 chrono.workspace = true
+flate2.workspace = true
+mvm-libkrun.workspace = true
+mvm-oci.workspace = true
 # Plan 60 Phase 4 — `tests/audit_total_coverage.rs` walks the
 # `clap::Command` tree returned by `mvm_cli::commands::cli_command()`
 # to enforce that every subcommand has a declared audit posture.
