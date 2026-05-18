@@ -7,16 +7,17 @@
 //! escape, hardlink-to-host, device-node planting, setuid surprise,
 //! xattr-based privilege carry).
 //!
-//! ## Scope through sub-phase A.5
+//! ## Scope through sub-phase A.6
 //!
 //! The unpacker handles four tar entry kinds and two OCI-specific
 //! filename markers that ride inside regular-file tar entries:
 //!
 //! - **Regular files** — bytes streamed to a freshly-opened file at
 //!   `output_root/<entry-path>`. Mode is preserved from the tar
-//!   header, masked to `0o7777` (no sticky/setuid/setgid bits
-//!   pass-through in A.1 — those land in A.6 under explicit
-//!   policy control).
+//!   header, with setuid/setgid bits governed by
+//!   [`UnpackOptions::setid_policy`]. Sticky bits are still stripped;
+//!   they are not needed for rootfs executables and keeping the
+//!   preserved high-bit surface narrow makes audit review simpler.
 //! - **Directories** — created with `0o755`, regardless of the tar
 //!   header's mode bits. A non-canonical mode is recorded in the
 //!   [`UnpackReport`] for downstream auditing but does not change
@@ -67,17 +68,20 @@
 //!   `dev/random`, or `dev/urandom` with the Linux standard major/minor
 //!   numbers. Every other character or block device is refused with
 //!   [`RefusalReason::DeviceNodeRefused`].
+//! - **Setuid/setgid bits (A.6)** — regular-file mode bits `0o4000`
+//!   and `0o2000` are preserved by default with an audit annotation
+//!   in [`UnpackReport::setid_entries`]. Production callers that have
+//!   not verified the image with cosign set
+//!   [`SetidPolicy::RefuseUnsigned`], which refuses the file with
+//!   [`RefusalReason::SetuidUnsigned`]. Production callers with a valid
+//!   cosign verification set [`SetidPolicy::PreserveVerified`] so the
+//!   audit annotation records the signed-image posture.
 //!
 //! Every other entry kind — FIFOs, named sockets, sparse files, GNU
 //! long-name continuations — is
-//! **refused** with [`RefusalReason::UnsupportedEntryType`]. Later
-//! sub-phases re-classify each remaining refused category:
+//! **refused** with [`RefusalReason::UnsupportedEntryType`].
 //!
-//! | Sub-phase | What it adds |
-//! |---|---|
-//! | A.6 | setuid/setgid bits, policy-controlled (refused under prod-no-cosign) |
-//!
-//! ## Safety properties enforced through A.5
+//! ## Safety properties enforced through A.6
 //!
 //! 1. **No path escapes `output_root`.** Three checks layer on top of
 //!    each other for defense in depth:
@@ -139,6 +143,10 @@ const WHITEOUT_OPAQUE: &[u8] = b".wh..wh..opq";
 /// name, e.g. `SCHILY.xattr.user.foo` -> `user.foo`.
 const PAX_XATTR_PREFIX: &[u8] = b"SCHILY.xattr.";
 
+/// Tar mode bits for setuid and setgid. Sticky (`0o1000`) remains
+/// stripped because Plan 85 A.6 only grants setuid/setgid passthrough.
+const SETID_MODE_BITS: u32 = 0o6000;
+
 /// Plan 85 A.5 character-device allow-list, expressed as tar-relative
 /// paths plus Linux major/minor pairs.
 const ALLOWED_DEVICE_NODES: &[AllowedDeviceNode] = &[
@@ -172,10 +180,26 @@ pub enum XattrPolicy {
     DropAll,
 }
 
+/// How [`unpack_layer`] handles regular files whose tar mode contains
+/// setuid (`0o4000`) or setgid (`0o2000`) bits.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetidPolicy {
+    /// Preserve setuid/setgid bits and record each preserved entry as
+    /// a development-profile audit annotation.
+    PreserveDev,
+    /// Refuse setuid/setgid files because the caller is enforcing a
+    /// production profile without a verified cosign signature.
+    RefuseUnsigned,
+    /// Preserve setuid/setgid bits and record each preserved entry as
+    /// a cosign-verified production audit annotation.
+    PreserveVerified,
+}
+
 /// Caller-controlled knobs for [`unpack_layer`].
 ///
-/// Defaults are the production-safe ones; tests override individual
-/// fields without rebuilding the whole struct.
+/// Defaults match the Plan 85 local/dev unpack posture; production
+/// callers tighten individual fields (notably `setid_policy`) without
+/// rebuilding the whole struct.
 #[derive(Debug, Clone)]
 pub struct UnpackOptions {
     /// Refuse any tar entry whose path length (in bytes, post-
@@ -197,6 +221,13 @@ pub struct UnpackOptions {
     /// Defaults to [`XattrPolicy::PreserveAllowlisted`], which keeps
     /// only `user.*`, `security.capability`, and `security.selinux`.
     pub xattr_policy: XattrPolicy,
+
+    /// Setuid/setgid policy for regular-file tar mode bits. Defaults
+    /// to [`SetidPolicy::PreserveDev`]. Production callers that have
+    /// not verified the image with cosign must override this to
+    /// [`SetidPolicy::RefuseUnsigned`]; production callers with a
+    /// valid cosign result use [`SetidPolicy::PreserveVerified`].
+    pub setid_policy: SetidPolicy,
 }
 
 impl Default for UnpackOptions {
@@ -205,6 +236,7 @@ impl Default for UnpackOptions {
             max_path_len: 4096,
             strip_timestamps: true,
             xattr_policy: XattrPolicy::PreserveAllowlisted,
+            setid_policy: SetidPolicy::PreserveDev,
         }
     }
 }
@@ -247,6 +279,8 @@ pub struct UnpackReport {
     pub xattrs_written: u64,
     /// Allow-listed character device nodes materialized.
     pub device_nodes_written: u64,
+    /// Regular files whose setuid/setgid bits were preserved.
+    pub setid_entries_preserved: u64,
     /// Pax xattrs intentionally dropped by policy or because the
     /// host filesystem rejected the write. Each drop also gets a
     /// corresponding [`XattrWarning`] in `xattr_warnings`.
@@ -256,10 +290,28 @@ pub struct UnpackReport {
     /// materialized while the unsafe or unsupported attribute is
     /// omitted.
     pub xattr_warnings: Vec<XattrWarning>,
+    /// Setuid/setgid regular-file entries preserved by policy, in
+    /// stream order. This is the Phase A.6 audit annotation surface:
+    /// each record carries the raw path, preserved mode, and whether
+    /// the caller represented the image as cosign-verified.
+    pub setid_entries: Vec<SetidEntry>,
     /// Tar entries refused by policy, in the order they appeared in
     /// the stream. Each carries a [`RefusalReason`] so a downstream
     /// audit / debugging surface can render them.
     pub refused: Vec<RefusedEntry>,
+}
+
+/// One regular file whose setuid or setgid mode bit was preserved.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SetidEntry {
+    /// Path bytes from the tar header, verbatim.
+    pub raw_path: Vec<u8>,
+    /// Preserved mode bits after sticky-bit stripping. Includes the
+    /// normal `0o0777` permissions plus any preserved `0o6000` bits.
+    pub mode: u32,
+    /// `true` when preserved under [`SetidPolicy::PreserveVerified`].
+    /// `false` means the default development policy preserved it.
+    pub cosign_verified: bool,
 }
 
 /// One xattr that was not preserved. Recorded as a warning instead
@@ -340,6 +392,10 @@ pub enum RefusalReason {
     /// `dev/urandom` with their Linux standard major/minor pairs are
     /// materialized; everything else is refused closed.
     DeviceNodeRefused,
+    /// A regular file carried setuid or setgid bits while the caller
+    /// was enforcing production-without-cosign policy. Equivalent
+    /// operator-facing error code: `E_OCI_SETUID_UNSIGNED`.
+    SetuidUnsigned,
     /// Tar header was malformed (unreadable path bytes, etc.). We
     /// refuse the entry rather than failing the whole unpack — a
     /// single bad entry shouldn't poison a multi-thousand-entry
@@ -361,6 +417,7 @@ impl RefusalReason {
             Self::UnsupportedEntryType => "unsupported_entry_type",
             Self::HardlinkTargetMissing => "hardlink_target_missing",
             Self::DeviceNodeRefused => "device_node_refused",
+            Self::SetuidUnsigned => "E_OCI_SETUID_UNSIGNED",
             Self::MalformedHeader => "malformed_header",
         }
     }
@@ -543,7 +600,13 @@ pub fn unpack_layer<R: Read>(
         match entry_type {
             tar::EntryType::Regular | tar::EntryType::Continuous => {
                 match classify_whiteout(&raw_path) {
-                    WhiteoutKind::None => match write_regular_file(&mut entry, &target, options) {
+                    WhiteoutKind::None => match write_regular_file(
+                        &mut entry,
+                        &target,
+                        &raw_path,
+                        options,
+                        &mut report,
+                    ) {
                         Ok(()) => {
                             report.files_written += 1;
                             apply_collected_xattrs(&target, &raw_path, entry_xattrs, &mut report);
@@ -871,9 +934,9 @@ fn parent_chain_has_symlink(output_root: &Path, rel: &Path) -> bool {
     false
 }
 
-/// Write a regular file from `entry` to `target`, with O_NOFOLLOW
-/// + zeroed timestamps (when `options.strip_timestamps`) + the tar
-///   header's mode bits masked to `0o7777`.
+/// Write a regular file from `entry` to `target`, with O_NOFOLLOW,
+/// zeroed timestamps (when `options.strip_timestamps`), and setuid /
+/// setgid mode bits governed by [`UnpackOptions::setid_policy`].
 ///
 /// Returns `Ok(())` on success, or a [`RefusalReason`] for caller-
 /// recorded per-entry failures. Hard I/O errors propagate via
@@ -884,11 +947,13 @@ fn parent_chain_has_symlink(output_root: &Path, rel: &Path) -> bool {
 fn write_regular_file<R: Read>(
     entry: &mut tar::Entry<R>,
     target: &Path,
+    raw_path: &[u8],
     options: &UnpackOptions,
+    report: &mut UnpackReport,
 ) -> Result<(), RefusalReason> {
     use std::fs::OpenOptions;
     use std::io::Write;
-    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 
     // Ensure parent directories exist. We've already verified no
     // existing parent is a symlink (safety check 5 in
@@ -902,9 +967,8 @@ fn write_regular_file<R: Read>(
         }
     }
 
-    // Mode from the tar header. A.1 strips the high bits (setuid,
-    // setgid, sticky) — those land in A.6 with policy control.
-    let mode_from_header = entry.header().mode().unwrap_or(0o644) & 0o0777;
+    let mode_from_header =
+        classify_regular_file_mode(entry.header().mode().unwrap_or(0o644), options)?;
 
     let mut opts = OpenOptions::new();
     opts.write(true)
@@ -929,6 +993,18 @@ fn write_regular_file<R: Read>(
         return Err(RefusalReason::MalformedHeader);
     }
 
+    // `open(2)` honors umask, and some kernels clear setuid/setgid
+    // when file contents are modified. Apply the policy-classified
+    // permissions after all writes through the file descriptor so the
+    // on-disk result matches the tar mode without following paths.
+    if file
+        .set_permissions(std::fs::Permissions::from_mode(mode_from_header))
+        .is_err()
+    {
+        return Err(RefusalReason::MalformedHeader);
+    }
+    record_setid_entry(report, raw_path, mode_from_header, options.setid_policy);
+
     if options.strip_timestamps {
         // `utimensat(AT_FDCWD, target, {0, 0})` via the `filetime`
         // crate's std-only equivalent. We use `set_file_mtime` /
@@ -942,6 +1018,35 @@ fn write_regular_file<R: Read>(
     }
 
     Ok(())
+}
+
+fn classify_regular_file_mode(
+    raw_mode: u32,
+    options: &UnpackOptions,
+) -> Result<u32, RefusalReason> {
+    let low_mode = raw_mode & 0o0777;
+    let setid_bits = raw_mode & SETID_MODE_BITS;
+    if setid_bits == 0 {
+        return Ok(low_mode);
+    }
+
+    match options.setid_policy {
+        SetidPolicy::PreserveDev | SetidPolicy::PreserveVerified => Ok(low_mode | setid_bits),
+        SetidPolicy::RefuseUnsigned => Err(RefusalReason::SetuidUnsigned),
+    }
+}
+
+fn record_setid_entry(report: &mut UnpackReport, raw_path: &[u8], mode: u32, policy: SetidPolicy) {
+    if mode & SETID_MODE_BITS == 0 {
+        return;
+    }
+
+    report.setid_entries_preserved += 1;
+    report.setid_entries.push(SetidEntry {
+        raw_path: raw_path.to_vec(),
+        mode,
+        cosign_verified: policy == SetidPolicy::PreserveVerified,
+    });
 }
 
 /// Create a directory at `target`. Returns `Ok(true)` if a new
@@ -1309,10 +1414,20 @@ mod tests {
 
     /// Add a regular file with the given content + relative path.
     fn add_file(builder: &mut tar::Builder<Cursor<Vec<u8>>>, path: &str, body: &[u8]) {
+        add_file_with_mode(builder, path, body, 0o644);
+    }
+
+    /// Add a regular file with an explicit tar mode.
+    fn add_file_with_mode(
+        builder: &mut tar::Builder<Cursor<Vec<u8>>>,
+        path: &str,
+        body: &[u8],
+        mode: u32,
+    ) {
         let mut header = tar::Header::new_gnu();
         header.set_path(path).unwrap();
         header.set_size(body.len() as u64);
-        header.set_mode(0o644);
+        header.set_mode(mode);
         header.set_entry_type(tar::EntryType::Regular);
         header.set_cksum();
         builder.append(&header, body).unwrap();
@@ -1696,6 +1811,7 @@ mod tests {
             RefusalReason::SymlinkInParent,
             RefusalReason::HardlinkTargetMissing,
             RefusalReason::DeviceNodeRefused,
+            RefusalReason::SetuidUnsigned,
             RefusalReason::UnsupportedEntryType,
             RefusalReason::MalformedHeader,
         ];
@@ -1707,6 +1823,134 @@ mod tests {
             assert!(!t.contains(','), "{r:?} -> {t:?}");
             assert!(!t.contains('\n'), "{r:?} -> {t:?}");
         }
+    }
+
+    // ── Phase A.6: policy-controlled setuid/setgid bits ───────────
+
+    #[test]
+    fn default_setid_policy_preserves_setuid_file_with_audit_annotation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tar_bytes = build_tar(|b| {
+            add_file_with_mode(b, "usr/bin/helper", b"#!/bin/sh\n", 0o4755);
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.setid_entries_preserved, 1);
+        assert_eq!(report.setid_entries.len(), 1);
+        assert_eq!(report.setid_entries[0].raw_path, b"usr/bin/helper");
+        assert_eq!(report.setid_entries[0].mode, 0o4755);
+        assert!(!report.setid_entries[0].cosign_verified);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(
+            std::fs::symlink_metadata(tmp.path().join("usr/bin/helper"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o4755
+        );
+    }
+
+    #[test]
+    fn unsigned_production_setid_policy_refuses_setuid_file() {
+        let tar_bytes = build_tar(|b| {
+            add_file_with_mode(b, "usr/bin/helper", b"#!/bin/sh\n", 0o4755);
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let opts = UnpackOptions {
+            setid_policy: SetidPolicy::RefuseUnsigned,
+            ..UnpackOptions::default()
+        };
+        let report = unpack_layer(Cursor::new(tar_bytes), tmp.path(), &opts).expect("unpack ok");
+
+        assert_eq!(report.files_written, 0);
+        assert_eq!(report.setid_entries_preserved, 0);
+        assert!(report.setid_entries.is_empty());
+        assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
+        assert_eq!(report.refused[0].raw_path, b"usr/bin/helper");
+        assert_eq!(report.refused[0].reason, RefusalReason::SetuidUnsigned);
+        assert_eq!(
+            report.refused[0].reason.audit_tag(),
+            "E_OCI_SETUID_UNSIGNED"
+        );
+        assert!(!tmp.path().join("usr/bin/helper").exists());
+    }
+
+    #[test]
+    fn unsigned_production_setid_policy_refuses_setgid_file() {
+        let tar_bytes = build_tar(|b| {
+            add_file_with_mode(b, "usr/bin/group-helper", b"#!/bin/sh\n", 0o2755);
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let opts = UnpackOptions {
+            setid_policy: SetidPolicy::RefuseUnsigned,
+            ..UnpackOptions::default()
+        };
+        let report = unpack_layer(Cursor::new(tar_bytes), tmp.path(), &opts).expect("unpack ok");
+
+        assert_eq!(report.files_written, 0);
+        assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
+        assert_eq!(report.refused[0].reason, RefusalReason::SetuidUnsigned);
+        assert!(!tmp.path().join("usr/bin/group-helper").exists());
+    }
+
+    #[test]
+    fn verified_setid_policy_preserves_setgid_file_with_verified_annotation() {
+        use std::os::unix::fs::MetadataExt;
+
+        let tar_bytes = build_tar(|b| {
+            add_file_with_mode(b, "usr/bin/group-helper", b"#!/bin/sh\n", 0o2755);
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let opts = UnpackOptions {
+            setid_policy: SetidPolicy::PreserveVerified,
+            ..UnpackOptions::default()
+        };
+        let report = unpack_layer(Cursor::new(tar_bytes), tmp.path(), &opts).expect("unpack ok");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.setid_entries_preserved, 1);
+        assert_eq!(report.setid_entries[0].raw_path, b"usr/bin/group-helper");
+        assert_eq!(report.setid_entries[0].mode, 0o2755);
+        assert!(report.setid_entries[0].cosign_verified);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        assert_eq!(
+            std::fs::symlink_metadata(tmp.path().join("usr/bin/group-helper"))
+                .unwrap()
+                .mode()
+                & 0o7777,
+            0o2755
+        );
+    }
+
+    #[test]
+    fn unsigned_production_setid_policy_allows_regular_file_without_setid_bits() {
+        let tar_bytes = build_tar(|b| {
+            add_file_with_mode(b, "usr/bin/tool", b"#!/bin/sh\n", 0o755);
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let opts = UnpackOptions {
+            setid_policy: SetidPolicy::RefuseUnsigned,
+            ..UnpackOptions::default()
+        };
+        let report = unpack_layer(Cursor::new(tar_bytes), tmp.path(), &opts).expect("unpack ok");
+
+        assert_eq!(report.files_written, 1);
+        assert_eq!(report.setid_entries_preserved, 0);
+        assert!(report.setid_entries.is_empty());
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
     }
 
     // ── Phase A.4: allow-listed pax xattrs ───────────────────────
