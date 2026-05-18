@@ -79,6 +79,7 @@ Recent maintenance:
 - [x] Tightened the public `mvmctl` command surface around the local microVM substrate boundary: removed `deploy`, `policy`, and `tenant` from the Clap tree, deleted their unreachable command modules, and updated the CLI reference with the retained command families. Tenant lifecycle, tenant policy review/update, and deployment to the hosted control plane are now documented as `mvmd` responsibilities.
 - [x] GitHub #95 scaffold retarget: narrowed the in-guest DNS / vsock bridge work to local addon developer plumbing (`mvm-addon-dns` + `mvm-addon-vsock-bridge`) and documented that distributed mesh, tenant policy, and cryptographic routing belong in `mvmd`; zone-loader and peer-header/binding tests remain the implementation base.
 - [x] GitHub #95 bridge slice: `mvm-addon-vsock-bridge` now loads loopback bindings with explicit `tcp_port`, starts one TCP listener per loopback IP/port, dials the host addon proxy over vsock, writes the peer header before application bytes, and proxies bidirectionally with binding validation and regression coverage.
+- [x] Hardened `mvmctl secret`: `put` now prompts with hidden interactive input when no value source is supplied and still accepts stdin/file/inline sources, while `get` is now a presence check only and can never print the raw secret value. CLI docs and ADR-042 were updated to reflect the write-only-after-set contract.
 
 ## In-flight workstreams
 

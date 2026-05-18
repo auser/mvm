@@ -1888,23 +1888,15 @@ fn secret_put_emits_put_action_in_secret_audit_log() {
 
 #[test]
 fn secret_get_emits_get_action_in_secret_audit_log() {
-    // Put first, then get with `--force` to bypass the TTY guard
-    // (subprocess stdout is a pipe, not a TTY — the guard would
-    // otherwise refuse). Assert a `get` entry lands in the
+    // Put first, then verify presence. `secret get` never prints
+    // the raw value; it only asserts the entry exists and emits the
     // per-action audit JSONL.
     let sandbox = AuditSandbox::new();
     put_a_secret(&sandbox, "test-tenant", "api-key", "deadbeef");
 
     let output = sandbox
         .mvmctl()
-        .args([
-            "secret",
-            "get",
-            "api-key",
-            "--tenant",
-            "test-tenant",
-            "--force",
-        ])
+        .args(["secret", "get", "api-key", "--tenant", "test-tenant"])
         .output()
         .expect("spawn mvmctl get");
     assert!(

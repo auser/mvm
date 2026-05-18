@@ -11,7 +11,7 @@ use super::build::build;
 use super::build::compile;
 use super::catalog;
 use super::env::{cleanup, dev, init, uninstall};
-use super::ops::{audit, cache, config, metrics};
+use super::ops::{audit, cache, config, metrics, secret};
 use super::vm::{console, cp, down, exec, forward, sandbox, up, volume};
 
 use audit::AuditAction;
@@ -1545,6 +1545,40 @@ fn test_console_with_command() {
         }
         _ => panic!("Expected Console command"),
     }
+}
+
+// --- Secret CLI tests ---
+
+#[test]
+fn secret_put_without_value_source_parses_for_interactive_prompt() {
+    let cli = Cli::try_parse_from(["mvmctl", "secret", "put", "api-key"]).expect("parse");
+    match cli.command {
+        Commands::Secret(secret::Args {
+            action:
+                secret::SecretAction::Put {
+                    name,
+                    tenant,
+                    value,
+                    value_file,
+                },
+        }) => {
+            assert_eq!(name, "api-key");
+            assert_eq!(tenant, "local");
+            assert!(value.is_none());
+            assert!(value_file.is_none());
+        }
+        _ => panic!("Expected Secret put command"),
+    }
+}
+
+#[test]
+fn secret_get_rejects_force_flag() {
+    let err = Cli::try_parse_from(["mvmctl", "secret", "get", "api-key", "--force"])
+        .expect_err("secret get must not accept --force");
+    assert!(
+        err.to_string().contains("unexpected argument '--force'"),
+        "got: {err}"
+    );
 }
 
 // --- Exec CLI tests ---

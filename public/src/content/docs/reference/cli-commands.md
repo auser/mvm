@@ -160,6 +160,23 @@ The intentionally kept top-level command families are:
 | `mvmctl audit tail -n <N>` | Show the last N audit events |
 | `mvmctl audit tail -f` | Follow audit log output (poll until Ctrl-C) |
 
+## Local Secrets
+
+| Command | Description |
+|---------|-------------|
+| `mvmctl secret put <name>` | Store or replace a local secret using hidden interactive input when stdin is a terminal, or piped stdin otherwise |
+| `mvmctl secret put <name> --value -` | Store or replace a local secret from stdin |
+| `mvmctl secret put <name> --value-file <path>` | Store or replace a local secret from a file |
+| `mvmctl secret put <name> --value <value>` | Store or replace a local secret from an inline value. Avoid in interactive shells because the value may be saved in shell history |
+| `mvmctl secret get <name>` | Verify that a local secret exists without printing the value |
+| `mvmctl secret ls` | List stored secret names only |
+| `mvmctl secret rm <name>` | Remove a local secret |
+| `mvmctl secret <put|get|ls|rm> --tenant <tenant>` | Use a non-default local tenant namespace. Default: `local` |
+
+Secret values are write-only through the CLI after storage: `get` is a presence
+check and never emits the raw value. Replace a secret by running `secret put`
+again with the same name.
+
 ## Policy Contracts
 
 `mvmctl up` still synthesizes and admits signed execution plans with policy
