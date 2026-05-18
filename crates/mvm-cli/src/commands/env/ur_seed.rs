@@ -152,8 +152,8 @@ pub(in crate::commands) fn cmd_dev_import_ur_seed(
     let arch = arch_from_filename(from)
         .with_context(|| format!("could not infer arch from tarball name {from_path}"))?;
 
-    let tarball_bytes = std::fs::read(from)
-        .with_context(|| format!("reading tarball {}", from.display()))?;
+    let tarball_bytes =
+        std::fs::read(from).with_context(|| format!("reading tarball {}", from.display()))?;
     let sha256_text = std::fs::read_to_string(&sha256_path)
         .with_context(|| format!("reading sha256 sidecar {}", sha256_path.display()))?;
 
@@ -175,8 +175,8 @@ pub(in crate::commands) fn cmd_dev_import_ur_seed(
 /// Common install path used by both fetch and import: verify sha256,
 /// extract under a staging dir, atomic rename into the live cache.
 fn install_bytes(arch: &str, tarball: &[u8], expected_sha256_hex: &str) -> Result<()> {
-    let expected = parse_sha256_sidecar(expected_sha256_hex)
-        .context("parsing sha256 sidecar contents")?;
+    let expected =
+        parse_sha256_sidecar(expected_sha256_hex).context("parsing sha256 sidecar contents")?;
     let actual = Sha256::digest(tarball);
     if actual.as_slice() != expected.as_slice() {
         anyhow::bail!(
@@ -248,10 +248,7 @@ fn extract_tarball_strict(tarball_bytes: &[u8], target: &Path) -> Result<()> {
     for entry_res in archive.entries().context("opening tar entries")? {
         let mut entry = entry_res.context("reading tar entry header")?;
         let entry_type = entry.header().entry_type();
-        let path = entry
-            .path()
-            .context("reading tar entry path")?
-            .into_owned();
+        let path = entry.path().context("reading tar entry path")?.into_owned();
         if !entry_type.is_file() {
             // Skip directory entries (we create the target dir
             // ourselves); reject everything else.
@@ -373,8 +370,7 @@ fn parse_sha256_sidecar(text: &str) -> Result<[u8; 32]> {
         anyhow::bail!("sha256 sidecar must be a 64-character hex string; got {hex:?}");
     }
     let mut out = [0u8; 32];
-    hex::decode_to_slice(hex, &mut out)
-        .with_context(|| format!("decoding sha256 hex {hex:?}"))?;
+    hex::decode_to_slice(hex, &mut out).with_context(|| format!("decoding sha256 hex {hex:?}"))?;
     Ok(out)
 }
 
@@ -484,14 +480,21 @@ mod tests {
         ]);
         let target = tempfile::tempdir().unwrap();
         let err = extract_tarball_strict(&tarball, target.path()).unwrap_err();
-        assert!(err.to_string().contains("missing required entry"), "got: {err}");
+        assert!(
+            err.to_string().contains("missing required entry"),
+            "got: {err}"
+        );
     }
 
     /// Manually craft a tar header carrying a parent-traversal path —
     /// `tar::Header::set_path` refuses to set `../foo`, so we build the
     /// header directly via `unsafe { set_path_unchecked }`-equivalent
     /// by writing raw header bytes.
-    fn append_raw_path_entry(builder: &mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>, path: &str, data: &[u8]) {
+    fn append_raw_path_entry(
+        builder: &mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>,
+        path: &str,
+        data: &[u8],
+    ) {
         let mut header = tar::Header::new_gnu();
         header.set_size(data.len() as u64);
         header.set_mode(0o644);
@@ -530,8 +533,7 @@ mod tests {
         let target = tempfile::tempdir().unwrap();
         let err = extract_tarball_strict(&tarball, target.path()).unwrap_err();
         assert!(
-            err.to_string().contains("unsafe path")
-                || err.to_string().contains("unexpected entry"),
+            err.to_string().contains("unsafe path") || err.to_string().contains("unexpected entry"),
             "got: {err}"
         );
     }

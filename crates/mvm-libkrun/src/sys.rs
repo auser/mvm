@@ -238,11 +238,7 @@ impl Drop for Context {
 // or accepts that AF_INET sockets won't work in the guest.
 #[link(name = "krunfw")]
 unsafe extern "C" {
-    fn krunfw_get_kernel(
-        load_addr: *mut u64,
-        entry_addr: *mut u64,
-        size: *mut usize,
-    ) -> *const u8;
+    fn krunfw_get_kernel(load_addr: *mut u64, entry_addr: *mut u64, size: *mut usize) -> *const u8;
 }
 
 /// Result of [`extract_bundled_kernel`]: a path to the kernel bytes on
@@ -265,9 +261,7 @@ pub struct BundledKernel {
 /// `~/.cache/mvm/libkrunfw/vmlinux`) so subsequent invocations skip the
 /// copy. Errors propagate as [`Error::Init`] with a description of the
 /// failed step.
-pub fn extract_bundled_kernel(
-    target_path: &Path,
-) -> Result<BundledKernel, Error> {
+pub fn extract_bundled_kernel(target_path: &Path) -> Result<BundledKernel, Error> {
     let mut load_addr: u64 = 0;
     let mut entry_addr: u64 = 0;
     let mut size: usize = 0;
@@ -280,9 +274,8 @@ pub fn extract_bundled_kernel(
 
     if bytes_ptr.is_null() || size == 0 {
         return Err(Error::Io {
-            context:
-                "krunfw_get_kernel returned null/zero — libkrunfw missing or version mismatch"
-                    .to_string(),
+            context: "krunfw_get_kernel returned null/zero — libkrunfw missing or version mismatch"
+                .to_string(),
         });
     }
 
