@@ -179,6 +179,7 @@ which = "7"
 flate2 = "1"
 hex = "0.4"
 tar = "0.4"
+xattr = "1"
 tree-sitter = "0.26.8"
 tree-sitter-nix = "0.0.2"
 
