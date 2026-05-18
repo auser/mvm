@@ -44,6 +44,39 @@ pub struct FetchedManifest {
     pub media_type: String,
 }
 
+/// Linux platform selector for OCI image indexes / Docker manifest
+/// lists.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LinuxPlatform {
+    /// OCI architecture string (`amd64`, `arm64`, ...).
+    pub architecture: String,
+    /// Optional architecture variant (`v8` for linux/arm64/v8).
+    pub variant: Option<String>,
+}
+
+impl LinuxPlatform {
+    /// Platform matching the current host CPU while explicitly
+    /// targeting Linux guests.
+    pub fn for_current_arch() -> Self {
+        if cfg!(target_arch = "aarch64") {
+            Self {
+                architecture: "arm64".to_string(),
+                variant: Some("v8".to_string()),
+            }
+        } else if cfg!(target_arch = "x86_64") {
+            Self {
+                architecture: "amd64".to_string(),
+                variant: None,
+            }
+        } else {
+            Self {
+                architecture: std::env::consts::ARCH.to_string(),
+                variant: None,
+            }
+        }
+    }
+}
+
 impl FetchedManifest {
     /// Parse the manifest bytes and extract the layer descriptors
     /// in order. For an image manifest (single platform) this
@@ -123,6 +156,49 @@ impl OciManifestFetcher {
     /// so the two share a connection pool.
     pub(crate) fn client(&self) -> &Client {
         &self.client
+    }
+
+    /// Fetch a platform-specific Linux image manifest.
+    ///
+    /// If `reference` resolves directly to an image manifest, this
+    /// returns it unchanged. If it resolves to an image index, this
+    /// follows one descriptor matching `platform` and fetches that
+    /// manifest by digest, preserving byte-exact digest verification
+    /// for the returned bytes.
+    pub async fn fetch_linux_platform_manifest(
+        &self,
+        reference: &ImageReference,
+        platform: &LinuxPlatform,
+    ) -> Result<FetchedManifest, OciError> {
+        let fetched = self.fetch(reference).await?;
+        let manifest: OciManifest = serde_json::from_slice(&fetched.bytes)
+            .map_err(|e| OciError::Registry(format!("parse manifest: {e}")))?;
+        let OciManifest::ImageIndex(index) = manifest else {
+            return Ok(fetched);
+        };
+
+        let descriptor = index
+            .manifests
+            .iter()
+            .find(|entry| {
+                entry.platform.as_ref().is_some_and(|p| {
+                    p.os.to_string() == "linux"
+                        && p.architecture.to_string() == platform.architecture
+                        && p.variant.as_deref() == platform.variant.as_deref()
+                })
+            })
+            .ok_or_else(|| {
+                let wanted = match &platform.variant {
+                    Some(v) => format!("linux/{}/{}", platform.architecture, v),
+                    None => format!("linux/{}", platform.architecture),
+                };
+                OciError::Registry(format!("image index has no manifest for {wanted}"))
+            })?;
+
+        let mut by_digest = reference.clone();
+        by_digest.tag = None;
+        by_digest.digest = Some(descriptor.digest.clone());
+        self.fetch(&by_digest).await
     }
 }
 

@@ -62,8 +62,8 @@ pub mod unpack;
 pub use error::OciError;
 pub use layer::{LayerDescriptor, LayerFetchOptions, OciLayerFetcher};
 pub use manifest::{
-    ClientConfig, ClientProtocol, FetchedManifest, ManifestFetcher, OciManifestFetcher,
-    verify_sha256_digest,
+    ClientConfig, ClientProtocol, FetchedManifest, LinuxPlatform, ManifestFetcher,
+    OciManifestFetcher, verify_sha256_digest,
 };
 pub use reference::ImageReference;
 pub use unpack::{
