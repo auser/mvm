@@ -18,7 +18,7 @@ This document maps each technical safeguard from 45 CFR §164.312 (the HIPAA Sec
 - [ ] (TBD) Per-tenant signing key (mvm-plan)
 
 ### (a)(2)(i) — Emergency access procedure (Required)
-- [ ] (TBD) `mvmctl tenant destroy` (ADR-028) — emergency deprovisioning
+- [ ] (TBD) mvmd tenant deprovisioning backed by mvm overlay erasure certificates (ADR-028)
 - [ ] (TBD) Recovery key escrow (opt-in) — documented in plan 60
 
 ### (a)(2)(ii) — Automatic logoff (Addressable)

@@ -1,5 +1,4 @@
-//! `mvmctl deploy` — compile a Workload into a single signed archive
-//! and ship it to mvmd.
+//! Deploy-bundle assembly for mvmd-owned control-plane flows.
 //!
 //! v1 ships the stub end of the contract: build the archive, embed
 //! `mvmd-spec.json` per ADR-0020 (mvmd-side, see
@@ -118,9 +117,8 @@ pub struct LifecycleSpec {
     pub before_stop_hash: String,
 }
 
-/// The single artifact `mvmctl deploy` produces. The HTTP shipping
-/// stub takes this verbatim; the real client signs `sha256(<archive>)`
-/// and `POST`s the body.
+/// The single artifact mvmd receives for deployment. The HTTP shipping
+/// client signs `sha256(<archive>)` and `POST`s the body.
 #[derive(Debug, Clone)]
 pub struct DeployBundle {
     pub archive_path: PathBuf,

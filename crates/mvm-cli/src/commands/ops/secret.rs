@@ -1,6 +1,6 @@
 //! Plan 63 W4 — `mvmctl secret put/get/ls/rm` CLI surface.
 //!
-//! Operator-facing CRUD for tenant secrets. Values never appear in
+//! Local CRUD for secret namespaces. Values never appear in
 //! logs, error chains, or process listings — `put` accepts the
 //! value via flag, stdin, or file; `get` writes to stdout only when
 //! it's not a TTY (so a script using `$(mvmctl secret get …)`
@@ -11,7 +11,7 @@
 //!
 //! Every put/get/delete/list emits one JSON line to
 //! `~/.mvm/audit/secrets.jsonl` carrying
-//! `(timestamp, action, tenant, name, outcome, pid, error?)`.
+//! `(timestamp, action, namespace, name, outcome, pid, error?)`.
 //! Values are never logged. The audit file is NOT chain-signed in
 //! v0 — that's plan 64's territory (plan-64 audit chain covers
 //! workload-admission events; secret events get their own stream).
@@ -50,13 +50,13 @@ pub(in crate::commands) struct Args {
 
 #[derive(Subcommand, Debug, Clone)]
 pub(in crate::commands) enum SecretAction {
-    /// Store a tenant secret. Value source: `--value <V>` (inline,
+    /// Store a local secret. Value source: `--value <V>` (inline,
     /// shell-history risk), `--value -` (read from stdin), or
     /// `--value-file <PATH>`. The value never appears in logs.
     Put {
         /// Name to store the secret under (alphanumeric + `_-`).
         name: String,
-        /// Tenant whose namespace this secret lives in.
+        /// Local namespace for this secret. Fleet tenant secrets are managed by mvmd.
         #[arg(long, default_value = "local")]
         tenant: String,
         /// Inline value. Pass `-` to read from stdin (preferred
@@ -68,7 +68,7 @@ pub(in crate::commands) enum SecretAction {
         value_file: Option<PathBuf>,
     },
 
-    /// Retrieve a tenant secret. Writes the raw value to stdout
+    /// Retrieve a local secret. Writes the raw value to stdout
     /// (no trailing newline) only when stdout is not a TTY. Pass
     /// `--force` to bypass the TTY guard.
     Get {

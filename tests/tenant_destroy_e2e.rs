@@ -5,8 +5,8 @@
 //! 1. Build a per-tenant overlay tree with planted files
 //! 2. Destroy it via `OverlayManager::destroy_overlay`
 //! 3. Sign each receipt under an operator's host identity key
-//! 4. Serialize the array as JSON (the exact wire format
-//!    `mvmctl tenant destroy` writes to stdout)
+//! 4. Serialize the array as JSON (the overlay-erasure certificate
+//!    batch format)
 //! 5. Hand the JSON to `verify_destruction_receipt` (the same
 //!    function `mvmctl audit verify-cert` uses internally)
 //! 6. Assert: every cert verifies, the receipt fields match the
@@ -62,8 +62,7 @@ async fn operator_destroys_three_workloads_auditor_verifies_all_three() {
     let workloads = ["build-runner", "code-eval", "test-runner"];
     populate_tenant(&mgr, "acme", &workloads, 1024).await;
 
-    // Operator side — exactly the loop `mvmctl tenant destroy`
-    // runs.
+    // Operator side — exactly the overlay-erasure certificate loop.
     let overlays = mgr.list_overlays("acme").await.unwrap();
     assert_eq!(overlays.len(), 3);
     let mut certs: Vec<SignedDestructionReceipt> = Vec::new();

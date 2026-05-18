@@ -3,12 +3,11 @@
 //!
 //! The overlay is the workload's writable layer over the read-only
 //! verity'd rootfs (claim 3 of CLAUDE.md's security model). Phase
-//! 7a's goal is that `mvmctl install foo` rebuilds the rootfs and
-//! swaps it underneath an unchanged overlay — `/workspace` survives
-//! the upgrade — while `mvmctl tenant destroy` walks the overlay
-//! tree, wipes each file, and emits a signed destruction
-//! certificate so a hosted-cloud operator can prove they erased a
-//! tenant's data.
+//! 7a's goal is that rootfs rebuild/swap can happen underneath an
+//! unchanged overlay — `/workspace` survives the upgrade — while
+//! overlay-erasure tooling walks the overlay tree, wipes each file,
+//! and emits a signed destruction certificate so a hosted-cloud
+//! operator can prove they erased a tenant's data.
 //!
 //! ## What this slice ships
 //!
@@ -660,9 +659,9 @@ fn recursive_size(path: &Path) -> Result<u64, OverlayError> {
 }
 
 /// Walk a directory tree, overwriting every regular file with zero
-/// bytes (load-bearing for `mvmctl tenant destroy`'s "provably
-/// erased" guarantee), then unlink each. Removes empty directories
-/// on the way out, and finally removes the root.
+/// bytes (load-bearing for the overlay-erasure "provably erased"
+/// guarantee), then unlink each. Removes empty directories on the way
+/// out, and finally removes the root.
 ///
 /// Returns `(files_wiped, bytes_wiped)`.
 fn wipe_recursive(path: &Path) -> Result<(u64, u64), OverlayError> {

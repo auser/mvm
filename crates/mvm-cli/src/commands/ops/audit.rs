@@ -70,7 +70,7 @@ pub(in crate::commands) enum AuditAction {
         json: bool,
     },
     /// Verify a destruction certificate (or array of certificates)
-    /// produced by `mvmctl tenant destroy`. Designed for use by an
+    /// produced by overlay erasure tooling. Designed for use by an
     /// off-host auditor — the verifier needs only the certificate
     /// file + (optionally) the operator's host identity pubkey
     /// + (optionally) the operator's audit chain file.
@@ -85,8 +85,7 @@ pub(in crate::commands) enum AuditAction {
     VerifyCert {
         /// Path to the certificate file. Pass `-` to read from
         /// stdin. Accepts either a single `SignedDestructionReceipt`
-        /// object or a JSON array of them (the shape `mvmctl tenant
-        /// destroy` writes).
+        /// object or a JSON array of them.
         cert: String,
         /// Optional path to the operator's host identity pubkey.
         /// When supplied, each certificate's embedded signer_pubkey
@@ -182,9 +181,8 @@ fn verify_cert(
         std::fs::read_to_string(cert).with_context(|| format!("reading {cert}"))?
     };
 
-    // 2. Parse — accept both shapes (mvmctl tenant destroy emits
-    //    an array; the Rust API + runbook snippet show single
-    //    objects).
+    // 2. Parse — accept both shapes (batch tools emit an array; the
+    //    Rust API + runbook snippet show single objects).
     let certs: Vec<SignedDestructionReceipt> = if raw.trim_start().starts_with('[') {
         serde_json::from_str(&raw).context("decoding certificate array")?
     } else {
@@ -717,7 +715,7 @@ mod verify_cert_tests {
     // `lifecycle.tenant.destroyed` SignedEnvelope per planted
     // cert, then exercise the chain-axis logic. The SignedEnvelope
     // chain-signing happens via FileAuditSigner so the file's
-    // shape matches what `mvmctl tenant destroy` actually writes.
+    // shape matches the overlay erasure chain-anchor format.
     // ──────────────────────────────────────────────────────────────
 
     use mvm::vm::overlay::cert_fingerprint;

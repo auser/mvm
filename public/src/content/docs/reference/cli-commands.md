@@ -5,6 +5,23 @@ description: Complete command reference for mvmctl.
 
 ## VM Lifecycle
 
+`mvmctl` is the local microVM substrate CLI: it builds images, boots local
+microVMs, talks to guest agents over vsock, manages local artifacts, and exposes
+developer/SDK workflows. Fleet and tenant control-plane verbs live in `mvmd`.
+In particular, `mvmctl` does not expose `tenant`, `policy`, or `deploy`
+subcommands; tenant lifecycle, tenant policy authoring/review, and deployment to
+the hosted control plane are `mvmd` responsibilities.
+
+The intentionally kept top-level command families are:
+
+| Family | Commands |
+|--------|----------|
+| Environment | `bootstrap`, `dev`, `doctor`, `update`, `shell-init`, `cleanup`, `uninstall`, `config`, `cache` |
+| Build and run | `init`, `build`, `compile`, `validate`, `up`, `down`, `run`, `exec`, `invoke`, `ls`, `logs`, `forward`, `console`, `wait`, `boot-report` |
+| Guest RPC and lifecycle | `fs`, `proc`, `cp`, `diff`, `set-ttl`, `pause`, `resume`, `snapshot`, `session`, `sandbox`, `volume` |
+| Artifacts and trust | `manifest`, `bundle`, `trust`, `artifact`, `receipt`, `catalog`, `deps`, `storage` |
+| Local operations | `audit`, `attest`, `metrics`, `network`, `mcp`, `secret` |
+
 | Command | Description |
 |---------|-------------|
 | `mvmctl up --flake <ref>` | Build and run a VM from a Nix flake |
@@ -143,25 +160,18 @@ description: Complete command reference for mvmctl.
 | `mvmctl audit tail -n <N>` | Show the last N audit events |
 | `mvmctl audit tail -f` | Follow audit log output (poll until Ctrl-C) |
 
-## Policy
+## Policy Contracts
 
-| Command | Description |
-|---------|-------------|
-| `mvmctl policy show <tenant>:<workload>` | Load and print a policy bundle from `~/.mvm/policies/<tenant>/<workload>.toml` |
-| `mvmctl policy show <tenant>:<workload> --json` | Emit the canonical policy bundle JSON |
-| `mvmctl policy verify <tenant>:<workload>` | Parse the bundle and run admission validators for schema version, L4 rules, disabled egress inspectors, PII policy, and audit destinations |
-| `mvmctl policy explain <tenant>:<workload>` | Validate the bundle and print a human-readable admission posture summary |
-| `mvmctl policy explain <tenant>:<workload> --json` | Emit a redacted machine-readable admission summary with counts, defaults, enabled inspectors, and audit destination schemes. Raw artifact capture paths, audit destination URLs, and egress hostnames are omitted. |
-| `mvmctl policy lint <tenant>:<workload>` | Validate the bundle and fail if risky-but-admissible posture is found, such as plain HTTP egress, disabled inspectors, unsigned audit chains, broad L4 CIDRs, wildcard ports, or sensitive-looking artifact capture paths |
-| `mvmctl policy lint <tenant>:<workload> --json` | Emit a redacted machine-readable lint report. Raw artifact capture paths, audit destination URLs, and egress hostnames are omitted. |
-| `mvmctl policy diff <left-tenant>:<left-workload> <right-tenant>:<right-workload>` | Validate two bundles and print a redacted policy diff. The command exits non-zero only for invalid or missing bundles, not because differences exist. |
-| `mvmctl policy diff <left-tenant>:<left-workload> <right-tenant>:<right-workload> --json` | Emit a redacted machine-readable diff report. Raw artifact paths, audit destination URLs, egress hostnames, and CIDRs are replaced with stable fingerprints and safe summaries. |
-| `mvmctl policy export <tenant>:<workload>` | Validate the bundle and emit a redacted JSON support/review artifact. Raw artifact paths, audit destination URLs, egress hostnames, and CIDRs are replaced with stable fingerprints and safe summaries. |
-| `mvmctl policy export <tenant>:<workload> --format toml` | Emit the same redacted support/review artifact as TOML |
-| `mvmctl policy export <tenant>:<workload> --redaction raw --format json\|toml` | Validate and emit the original raw policy bundle shape. Use only when the recipient is allowed to see the policy contents. |
-| `mvmctl policy update <tenant>:<workload> --from <path>` | Reserved for mvmd-signed policy updates; v0 refuses local mutation and exits with guidance |
+`mvmctl up` still synthesizes and admits signed execution plans with policy
+references. The default local ref is `local-default`; tenant-scoped policy
+authoring, diffing, rollout, and review are exposed by `mvmd`, not by a public
+`mvmctl policy` command.
 
-When `mvmctl up` admits a signed plan for a workload with a policy bundle, `[audit].chain_signing = true` is required. The default local per-tenant chain remains active, and `file://...` entries in `[audit].stream_destinations` receive exact JSONL replica chains. Other destination schemes validate at the policy-shape layer but fail closed during admission until their transports are wired.
+When admission resolves a workload policy bundle, `[audit].chain_signing = true`
+is required. The default local chain remains active, and `file://...` entries in
+`[audit].stream_destinations` receive exact JSONL replica chains. Other
+destination schemes validate at the policy-shape layer but fail closed during
+admission until their transports are wired.
 
 ## Flake Validation
 
@@ -471,6 +481,6 @@ All commands accept these global options:
 | `MVM_MCP_SESSION_MAX` | MCP session maximum lifetime in seconds | `1800` |
 | `MVM_MCP_MAX_INFLIGHT` | Max concurrent in-flight `tools/call run` invocations | `8` |
 | `MVM_MCP_MEM_CEILING_MIB` | Per-call memory ceiling enforced before dispatching to a microVM | `8192` |
-| `MVM_TENANT_KEY_<ID>` | Per-tenant encryption key for the keystore (one var per tenant ID) | None |
+| `MVM_TENANT_KEY_<ID>` | Compatibility hook for tenant-scoped key material consumed by shared policy/keystore primitives. Fleet operators should configure tenant keys through `mvmd`. | None |
 | `MVM_SKIP_COSIGN_VERIFY` | Set to `1` to bypass cosign signature verification on prebuilt-image downloads. Documented escape hatch only; never set in CI or production. | Unset |
 | `MVM_SKIP_HASH_VERIFY` | Set to `1` to bypass SHA-256 verification on prebuilt-image downloads. Documented escape hatch only; never set in CI or production. | Unset |

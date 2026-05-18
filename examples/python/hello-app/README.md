@@ -22,15 +22,6 @@ mvmctl invoke hello-app --input name='ari'
 # expect: "hello ari"
 ```
 
-## Deploy
-
-```sh
-mvmctl deploy examples/python/hello-app/app.py --out /tmp/hello-app.tar.gz
-# v1 stub: "would ship: /tmp/hello-app.tar.gz → https://mvmd.local/v1"
-tar -tzf /tmp/hello-app.tar.gz
-# flake.nix  launch.json  mvmd-spec.json  src/app.py
-```
-
 ## What gets emitted
 
 `launch.json` carries the merged hooks per phase. With this file:

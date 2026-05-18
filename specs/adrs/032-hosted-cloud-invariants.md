@@ -40,7 +40,7 @@ In a self-hosted setup, attestation is good hygiene; in the hosted cloud, it's t
 Phase 9 ships `specs/compliance/{soc2-controls,pci-scope,hipaa-mapping,gdpr-mapping}.md`. Stubs are created in Phase 0. Each compliance control maps to a test or ADR ID. CI checks doc staleness via timestamp on the "last verified" field.
 
 ### I5. Customer-facing data destruction is provable
-`mvmctl tenant destroy` (Phase 7a) emits a destruction certificate signed by the host identity key. Customers ending service get cryptographic proof their data is gone. This is a hosted-cloud requirement we choose to bake into the open-source primitive so self-hosters get it too.
+`mvm` provides the overlay erasure primitive and destruction-certificate verifier; `mvmd` owns the customer-facing tenant lifecycle flow that invokes it. Certificates are signed by the host identity key so customers ending service get cryptographic proof their data was erased. This is a hosted-cloud requirement we choose to bake into the open-source substrate so self-hosters get it too.
 
 ## Consequences
 

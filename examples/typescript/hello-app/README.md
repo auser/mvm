@@ -13,11 +13,5 @@ mvmctl up hello-app
 mvmctl invoke hello-app --input name='ari'
 ```
 
-## Deploy
-
-```sh
-mvmctl deploy examples/typescript/hello-app/app.ts --out /tmp/hello-app.tar.gz
-```
-
 The decorator + bootscript hook behavior is identical to the Python
 example — see that README for what `launch.json` ends up containing.

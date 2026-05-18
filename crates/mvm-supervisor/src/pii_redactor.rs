@@ -246,8 +246,8 @@ impl PiiRedactor {
 
 /// Stable list of category names recognised by [`PiiRedactor::from_policy`].
 /// Matches `DEFAULT_RULES.iter().map(|r| r.name)` order. Public so
-/// callers (the W5 resolver, the operator-facing `mvmctl policy`
-/// inspector) can enumerate the valid names.
+/// callers (the W5 resolver and mvmd-facing policy tooling) can
+/// enumerate the valid names.
 pub const PII_CATEGORY_NAMES: &[&str] = &["email", "us_ssn", "credit_card", "e164_phone"];
 
 /// Errors from [`PiiRedactor::from_policy`]. Each variant names the

@@ -11,9 +11,6 @@ Two routes from this file produce the same Workload IR:
     `mvm.emit_json()` to disk for the same IR. This route runs the
     script and is useful for IDE introspection.
 
-`mvmctl deploy examples/python/hello-app/app.py` packs the artifact
-into a single signed `.tar.gz` with `mvmd-spec.json` embedded.
-
 `mvmctl invoke hello-app --input name='ari'` (after a full build +
 boot cycle) dispatches `greet(name="ari")` over the function-entrypoint
 protocol and returns the encoded string.

@@ -19,7 +19,7 @@ GDPR is largely operational (privacy notices, lawful basis, controller/processor
 
 ### Article 17 — Right to erasure ("right to be forgotten")
 
-- [ ] (TBD) `mvmctl tenant destroy` (ADR-028) emits a destruction certificate signed by the host identity key.
+- [ ] (TBD) mvmd tenant deprovisioning uses mvm overlay erasure certificates signed by the host identity key (ADR-028).
 - [ ] (TBD) LUKS keyslot revocation + zero-fill on volumes.
 - [ ] (TBD) Snapshot DEK destruction (cryptographic erasure).
 - [ ] (TBD) Per-tenant audit log entries retained as redacted-only or destroyed (configurable; legal-hold default keeps redacted forms).

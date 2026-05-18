@@ -48,7 +48,7 @@ mvm-build: `dev_build.rs` (local Nix builds via ShellEnvironment), `build.rs` (o
 
 mvm-guest: `vsock.rs`, `console.rs` (PTY-over-vsock), `integrations.rs`, `builder_agent.rs`
 
-mvm-cli: `commands.rs` (network, image, console, cache, init, security commands), `bootstrap.rs`, `template_cmd.rs`, `doctor.rs`, `update.rs`, `http.rs`, `logging.rs`, `ui.rs`
+mvm-cli: `commands/` (local microVM substrate commands: env, build/run, guest RPC, artifacts/trust, local ops). Tenant lifecycle, tenant policy authoring/review, and deploy-to-control-plane commands live in mvmd, not mvmctl.
 
 ### Trait Architecture
 

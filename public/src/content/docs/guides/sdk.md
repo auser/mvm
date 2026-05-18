@@ -102,11 +102,9 @@ Nix factory to bake into `/etc/mvm/hooks/<phase>.sh`.
 
 ## Deploy
 
-`mvmctl deploy <entry>` packs the compile output plus an embedded
-`mvmd-spec.json` (mvmd ADR-0020 wire shape) into a single signed
-`.tar.gz`. v1 ships a stub HTTP client that logs the bundle and exits
-0; the real `POST /v1/workloads` lands once mvmd Plan 48 Phase 1090
-is live.
+Deployment to the hosted control plane is an `mvmd` responsibility. Use
+`mvmctl compile` to produce local build artifacts; mvmd consumes the same SDK
+compile/deploy libraries when it packages and accepts workloads.
 
 ## TypeScript runner
 
