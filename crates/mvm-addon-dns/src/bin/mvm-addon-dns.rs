@@ -2,28 +2,28 @@
 //!
 //! Listens on `127.0.0.1:53` and `::1:53`, serves exact configured
 //! hostnames from a config-disk zone, forwards everything else upstream.
-//! SIGHUP reloads the zone without dropping in-flight queries.
-//!
-//! v1 implementation note: this binary is a scaffold today.
-//! Zone-loading and record matching are functional (see `lib.rs`
-//! tests). Wiring up the actual hickory-dns request handler +
-//! upstream-forwarding chain + SIGHUP loop lands as the issue's
-//! follow-up implementation.
 
 use anyhow::{Context, Result};
-use mvm_addon_dns::{Zone, load_zone};
+use mvm_addon_dns::{
+    DnsServerConfig, Zone, load_upstreams_from_resolv_conf, load_zone, run_udp_server,
+};
 use std::env;
+use std::net::SocketAddr;
 use std::path::PathBuf;
 
-fn main() -> Result<()> {
+#[tokio::main]
+async fn main() -> Result<()> {
     tracing_subscriber::fmt::init();
 
-    // The config disk mounts addon_dns_zone at a well-known path. v1
+    // The config disk mounts addon_dns_zone at a well-known path. The binary
     // accepts an env-var override for testability; the production
     // path is fixed by mvm's init scripts.
     let zone_path: PathBuf = env::var_os("MVM_ADDON_DNS_ZONE_PATH")
         .map(PathBuf::from)
         .unwrap_or_else(|| PathBuf::from("/run/mvm/addon_dns_zone.json"));
+    let upstream_resolv_path: PathBuf = env::var_os("MVM_ADDON_DNS_UPSTREAM_RESOLV_PATH")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("/run/mvm/upstream-resolv.conf"));
 
     let records = if zone_path.exists() {
         load_zone(&zone_path).with_context(|| {
@@ -52,10 +52,37 @@ fn main() -> Result<()> {
         }
     }
 
-    // Real resolver wiring — hickory-dns request handler bound to
-    // 127.0.0.1:53 + ::1:53 — lands as the implementation phase of
-    // a follow-up issue. The Zone and load_zone primitives in `lib.rs`
-    // are unit-tested and ready for that wire-up.
-    tracing::error!("resolver wire-up not yet implemented");
-    std::process::exit(1);
+    let mut config = DnsServerConfig::production_default();
+    if let Some(bind_addrs) = env::var_os("MVM_ADDON_DNS_BIND_ADDRS") {
+        config.bind_addrs = parse_socket_addr_list(&bind_addrs.to_string_lossy())
+            .context("failed to parse MVM_ADDON_DNS_BIND_ADDRS")?;
+    }
+    if let Some(upstream_addrs) = env::var_os("MVM_ADDON_DNS_UPSTREAM_ADDRS") {
+        config.upstream_addrs = parse_socket_addr_list(&upstream_addrs.to_string_lossy())
+            .context("failed to parse MVM_ADDON_DNS_UPSTREAM_ADDRS")?;
+    } else if upstream_resolv_path.exists() {
+        config.upstream_addrs = load_upstreams_from_resolv_conf(&upstream_resolv_path)
+            .with_context(|| {
+                format!(
+                    "failed to load addon DNS upstream resolvers from {}",
+                    upstream_resolv_path.display()
+                )
+            })?;
+    }
+
+    run_udp_server(zone, config)
+        .await
+        .context("addon DNS UDP server failed")
+}
+
+fn parse_socket_addr_list(value: &str) -> Result<Vec<SocketAddr>> {
+    value
+        .split(',')
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(|part| {
+            part.parse::<SocketAddr>()
+                .with_context(|| format!("invalid socket address {part:?}"))
+        })
+        .collect()
 }

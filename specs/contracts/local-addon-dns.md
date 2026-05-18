@@ -66,10 +66,18 @@ Thin wrapper over `hickory-dns`.
 - **Authority scope:** authoritative only for exact hostnames listed in
   `addon_dns_zone`. Forward all other queries, including other names in
   the same parent domain, to the guest's upstream resolver chain.
+- **Transport scope:** the initial server is UDP-only, which covers the
+  default libc resolver path and `dig` behavior. TCP fallback can be
+  added later without changing the trust boundary.
 - **Zone source:** load records from the config disk's
   `addon_dns_zone` array.
+- **Upstream source:** forwarders come from a pre-rewrite resolver
+  snapshot at `/run/mvm/upstream-resolv.conf` or the explicit
+  `MVM_ADDON_DNS_UPSTREAM_ADDRS` override. The server refuses upstreams
+  that point at its own listener.
 - **Reload model:** SIGHUP reloads the zone without dropping in-flight
-  queries.
+  queries. This remains follow-up work after the server surface is
+  proven.
 - **No-op mode:** an absent or empty zone file means the binary idles
   under supervision and opens no DNS service beyond what is explicitly
   wired.
