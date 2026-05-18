@@ -215,7 +215,6 @@ impl Drop for Context {
     }
 }
 
-/// Set libkrun's global log level. Wraps `krun_set_log_level`.
 // libkrunfw's bundled kernel — Plan 86 / Plan 72 W5.D bullet 10.
 //
 // libkrunfw ships a TSI-patched Linux kernel image inside its dynamic

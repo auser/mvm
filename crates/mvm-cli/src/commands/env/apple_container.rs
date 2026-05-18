@@ -2576,7 +2576,7 @@ fn ensure_stage0_seed_manifest(seed_rootfs: &std::path::Path) -> Result<()> {
     let manifest = serde_json::json!({
         "schema_version": STAGE0_SUPPORTED_MANIFEST_SCHEMA,
         "contract_version": STAGE0_REQUIRED_CONTRACT_VERSION,
-        "image_kind": STAGE0_EXPECTED_IMAGE_KIND,
+        "image_kind": STAGE0_ACCEPTED_IMAGE_KINDS[0],
         "system": system,
         "init_paths": STAGE0_REQUIRED_INIT_PATHS,
     });
