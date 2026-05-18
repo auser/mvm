@@ -61,6 +61,12 @@ jobs:
   #      so `mvmctl fs *` / `proc *` are hermetically testable against
   #      `MockBackend`. Tier-3 / test-only; never selected by
   #      `AnyBackend::auto_select`. Production callers can't reach it.
+  #   7. In-guest local addon plumbing
+  #      (`crates/mvm-addon-vsock-bridge/`). Binds loopback-only TCP
+  #      listeners inside the guest and forwards to the local host
+  #      addon proxy over vsock. This is per-VM developer substrate;
+  #      distributed service discovery, tenant policy, and
+  #      cryptographic routing remain mvmd-owned.
   #
   # The in-guest vsock agent in `mvm-guest` is also excluded — it
   # runs *inside* the microVM, not on the host.
@@ -109,6 +115,7 @@ jobs:
               --glob '!crates/mvm-cli/src/metrics_server.rs' \
               --glob '!crates/mvm-cli/src/template_cmd.rs' \
               --glob '!crates/mvm-backend/src/mock_guest_agent.rs' \
+              --glob '!crates/mvm-addon-vsock-bridge/**' \
               -e "$PATTERNS" \
               crates/ src/ \
               || true)

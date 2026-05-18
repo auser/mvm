@@ -1,8 +1,8 @@
 [package]
-name = "mvm-mesh-vsock-bridge"
+name = "mvm-addon-vsock-bridge"
 version.workspace = true
 edition.workspace = true
-description = "In-guest TCP↔vsock bridge for outbound mesh traffic. Iroh-free; capability tokens stay on the host (mvmd-agent)."
+description = "In-guest TCP↔vsock bridge for local addon traffic"
 license.workspace = true
 repository.workspace = true
 homepage.workspace = true
@@ -12,8 +12,8 @@ authors.workspace = true
 workspace = true
 
 [[bin]]
-name = "mvm-mesh-vsock-bridge"
-path = "src/bin/mvm-mesh-vsock-bridge.rs"
+name = "mvm-addon-vsock-bridge"
+path = "src/bin/mvm-addon-vsock-bridge.rs"
 
 [dependencies]
 mvm-core.workspace = true

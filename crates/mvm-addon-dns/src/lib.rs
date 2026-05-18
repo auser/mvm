@@ -1,14 +1,12 @@
-//! In-guest DNS resolver for `*.mesh.local` (ADR-0018 / ADR-0020).
+//! In-guest DNS resolver for local addon names under `*.addon.local`.
 //!
 //! Thin wrapper over `hickory-dns`. Listens on `127.0.0.1:53` and
-//! `::1:53` only; authoritative for `*.mesh.local`; forwards
+//! `::1:53` only; authoritative for `*.addon.local`; forwards
 //! everything else upstream. Per-instance zone loaded from the
-//! config disk's `mesh_dns_zone` (see
-//! `mvm/specs/contracts/in-guest-mesh-dns.md`).
+//! config disk's `addon_dns_zone` (see
+//! `mvm/specs/contracts/local-addon-dns.md`).
 //!
-//! The resolver is **iroh-free** by design — the cryptographic data
-//! plane lives on the host in mvmd (per ADR-0020 §Hard constraint).
-//! `cargo tree -p mvm-mesh-dns` MUST NOT include any `iroh*` crate.
+//! This crate intentionally contains no distributed mesh logic.
 
 #![warn(missing_docs)]
 
@@ -21,21 +19,21 @@ use std::path::Path;
 /// JSON array of these (see contract spec).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ZoneRecord {
-    /// Fully-qualified hostname (e.g. `db.mesh.local`).
+    /// Fully-qualified hostname (e.g. `db.addon.local`).
     pub hostname: String,
     /// IPv4 address the resolver returns for `A` queries against
     /// `hostname`.
     pub address: Ipv4Addr,
 }
 
-/// Parse the config disk's `mesh_dns_zone` JSON file into a list of
+/// Parse the config disk's `addon_dns_zone` JSON file into a list of
 /// records. The on-disk format is the JSON shape spec'd in
-/// `mvm/specs/contracts/in-guest-mesh-dns.md`:
+/// `mvm/specs/contracts/local-addon-dns.md`:
 ///
 /// ```jsonc
 /// [
-///   {"hostname": "db.mesh.local", "address": "10.255.0.1"},
-///   {"hostname": "cache.mesh.local", "address": "10.255.0.2"}
+///   {"hostname": "db.addon.local", "address": "10.255.0.1"},
+///   {"hostname": "cache.addon.local", "address": "10.255.0.2"}
 /// ]
 /// ```
 pub fn load_zone(path: &Path) -> Result<Vec<ZoneRecord>> {
@@ -81,11 +79,11 @@ impl Zone {
     }
 
     /// Whether the zone is authoritative for `hostname` — i.e. it
-    /// ends in `.mesh.local`. The resolver uses this to decide
+    /// ends in `.addon.local`. The resolver uses this to decide
     /// between answering authoritatively and forwarding upstream.
     pub fn is_authoritative_for(&self, hostname: &str) -> bool {
         let h = hostname.trim_end_matches('.');
-        h.ends_with(".mesh.local") || h == "mesh.local"
+        h.ends_with(".addon.local") || h == "addon.local"
     }
 
     /// Number of records currently loaded. Useful for "no-op when
@@ -113,14 +111,14 @@ mod tests {
         std::fs::write(
             &path,
             r#"[
-              {"hostname": "db.mesh.local", "address": "10.255.0.1"},
-              {"hostname": "cache.mesh.local", "address": "10.255.0.2"}
+              {"hostname": "db.addon.local", "address": "10.255.0.1"},
+              {"hostname": "cache.addon.local", "address": "10.255.0.2"}
             ]"#,
         )
         .unwrap();
         let records = load_zone(&path).unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(records[0].hostname, "db.mesh.local");
+        assert_eq!(records[0].hostname, "db.addon.local");
         assert_eq!(records[0].address, Ipv4Addr::new(10, 255, 0, 1));
     }
 
@@ -135,31 +133,31 @@ mod tests {
     #[test]
     fn zone_lookup_is_case_insensitive() {
         let zone = Zone::new(vec![ZoneRecord {
-            hostname: "db.mesh.local".to_string(),
+            hostname: "db.addon.local".to_string(),
             address: Ipv4Addr::new(10, 255, 0, 1),
         }]);
-        assert!(zone.lookup("db.mesh.local").is_some());
-        assert!(zone.lookup("DB.MESH.LOCAL").is_some());
-        assert!(zone.lookup("missing.mesh.local").is_none());
+        assert!(zone.lookup("db.addon.local").is_some());
+        assert!(zone.lookup("DB.ADDON.LOCAL").is_some());
+        assert!(zone.lookup("missing.addon.local").is_none());
     }
 
     #[test]
-    fn is_authoritative_for_only_recognizes_mesh_local() {
+    fn is_authoritative_for_only_recognizes_addon_local() {
         let zone = Zone::new(vec![]);
-        assert!(zone.is_authoritative_for("db.mesh.local"));
-        assert!(zone.is_authoritative_for("db.mesh.local."));
-        assert!(zone.is_authoritative_for("mesh.local"));
+        assert!(zone.is_authoritative_for("db.addon.local"));
+        assert!(zone.is_authoritative_for("db.addon.local."));
+        assert!(zone.is_authoritative_for("addon.local"));
         assert!(!zone.is_authoritative_for("example.com"));
         assert!(!zone.is_authoritative_for("local"));
-        // Defensive: a hostname containing "mesh.local" mid-string is
+        // Defensive: a hostname containing "addon.local" mid-string is
         // NOT authoritative — only suffix match.
-        assert!(!zone.is_authoritative_for("evil.mesh.local.attacker.com"));
+        assert!(!zone.is_authoritative_for("evil.addon.local.attacker.com"));
     }
 
     #[test]
     fn zone_set_records_replaces_state() {
         let mut zone = Zone::new(vec![ZoneRecord {
-            hostname: "old.mesh.local".to_string(),
+            hostname: "old.addon.local".to_string(),
             address: Ipv4Addr::new(10, 255, 0, 1),
         }]);
         assert_eq!(zone.len(), 1);
