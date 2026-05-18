@@ -451,6 +451,7 @@ mod tests {
             ("rootfs.ext4", b"rootfs-bytes"),
             ("manifest.json", b"{}"),
             ("cmdline.txt", b"console=hvc0"),
+            ("vmlinux", b"fake-kernel-bytes"),
         ]);
         let target = tempfile::tempdir().unwrap();
         extract_tarball_strict(&tarball, target.path()).unwrap();
@@ -465,6 +466,7 @@ mod tests {
             ("rootfs.ext4", b"x"),
             ("manifest.json", b"x"),
             ("cmdline.txt", b"x"),
+            ("vmlinux", b"x"),
             ("evil.sh", b"#!/bin/sh\n"),
         ]);
         let target = tempfile::tempdir().unwrap();
@@ -477,23 +479,60 @@ mod tests {
         let tarball = make_tarball(&[
             ("rootfs.ext4", b"x"),
             ("manifest.json", b"x"),
-            // cmdline.txt missing
+            ("cmdline.txt", b"x"),
+            // vmlinux missing
         ]);
         let target = tempfile::tempdir().unwrap();
         let err = extract_tarball_strict(&tarball, target.path()).unwrap_err();
         assert!(err.to_string().contains("missing required entry"), "got: {err}");
     }
 
+    /// Manually craft a tar header carrying a parent-traversal path —
+    /// `tar::Header::set_path` refuses to set `../foo`, so we build the
+    /// header directly via `unsafe { set_path_unchecked }`-equivalent
+    /// by writing raw header bytes.
+    fn append_raw_path_entry(builder: &mut tar::Builder<flate2::write::GzEncoder<Vec<u8>>>, path: &str, data: &[u8]) {
+        let mut header = tar::Header::new_gnu();
+        header.set_size(data.len() as u64);
+        header.set_mode(0o644);
+        header.set_entry_type(tar::EntryType::Regular);
+        // Force the path bytes into the header's name field without
+        // the safety check `set_path` performs.
+        let name_bytes = path.as_bytes();
+        let dst = header.as_old_mut().name.as_mut();
+        let n = name_bytes.len().min(dst.len());
+        dst[..n].copy_from_slice(&name_bytes[..n]);
+        header.set_cksum();
+        builder.append(&header, data).unwrap();
+    }
+
     #[test]
     fn extract_strict_rejects_path_traversal() {
-        let tarball = make_tarball(&[
-            ("rootfs.ext4", b"x"),
+        let buf = Vec::new();
+        let gz = flate2::write::GzEncoder::new(buf, flate2::Compression::default());
+        let mut tar = tar::Builder::new(gz);
+        for (name, data) in &[
+            ("rootfs.ext4", b"x" as &[u8]),
             ("manifest.json", b"x"),
             ("cmdline.txt", b"x"),
-            ("../escape.sh", b"x"),
-        ]);
+            ("vmlinux", b"x"),
+        ] {
+            let mut h = tar::Header::new_gnu();
+            h.set_path(name).unwrap();
+            h.set_size(data.len() as u64);
+            h.set_mode(0o644);
+            h.set_cksum();
+            tar.append(&h, *data).unwrap();
+        }
+        append_raw_path_entry(&mut tar, "../escape.sh", b"x");
+        let tarball = tar.into_inner().unwrap().finish().unwrap();
+
         let target = tempfile::tempdir().unwrap();
         let err = extract_tarball_strict(&tarball, target.path()).unwrap_err();
-        assert!(err.to_string().contains("unsafe path") || err.to_string().contains("unexpected entry"), "got: {err}");
+        assert!(
+            err.to_string().contains("unsafe path")
+                || err.to_string().contains("unexpected entry"),
+            "got: {err}"
+        );
     }
 }
