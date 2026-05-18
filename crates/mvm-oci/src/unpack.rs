@@ -7,9 +7,9 @@
 //! escape, hardlink-to-host, device-node planting, setuid surprise,
 //! xattr-based privilege carry).
 //!
-//! ## Scope through sub-phase A.4
+//! ## Scope through sub-phase A.5
 //!
-//! The unpacker handles three tar entry kinds and two OCI-specific
+//! The unpacker handles four tar entry kinds and two OCI-specific
 //! filename markers that ride inside regular-file tar entries:
 //!
 //! - **Regular files** — bytes streamed to a freshly-opened file at
@@ -62,18 +62,22 @@
 //!   in [`UnpackReport::xattr_warnings`]. The tar crate's implicit
 //!   xattr unpacking remains disabled so every attribute passes through
 //!   this allow-list before touching the host filesystem.
+//! - **Device nodes (A.5)** — tar character-device entries are
+//!   materialized only when they are exactly `dev/null`, `dev/zero`,
+//!   `dev/random`, or `dev/urandom` with the Linux standard major/minor
+//!   numbers. Every other character or block device is refused with
+//!   [`RefusalReason::DeviceNodeRefused`].
 //!
-//! Every other entry kind — character/block special files, FIFOs,
-//! named sockets, sparse files, GNU long-name continuations — is
+//! Every other entry kind — FIFOs, named sockets, sparse files, GNU
+//! long-name continuations — is
 //! **refused** with [`RefusalReason::UnsupportedEntryType`]. Later
 //! sub-phases re-classify each remaining refused category:
 //!
 //! | Sub-phase | What it adds |
 //! |---|---|
-//! | A.5 | Device nodes (allow-listed to `/dev/{null,zero,random,urandom}` only) |
 //! | A.6 | setuid/setgid bits, policy-controlled (refused under prod-no-cosign) |
 //!
-//! ## Safety properties enforced through A.4
+//! ## Safety properties enforced through A.5
 //!
 //! 1. **No path escapes `output_root`.** Three checks layer on top of
 //!    each other for defense in depth:
@@ -134,6 +138,28 @@ const WHITEOUT_OPAQUE: &[u8] = b".wh..wh..opq";
 /// attributes. The suffix after this prefix is the filesystem xattr
 /// name, e.g. `SCHILY.xattr.user.foo` -> `user.foo`.
 const PAX_XATTR_PREFIX: &[u8] = b"SCHILY.xattr.";
+
+/// Plan 85 A.5 character-device allow-list, expressed as tar-relative
+/// paths plus Linux major/minor pairs.
+const ALLOWED_DEVICE_NODES: &[AllowedDeviceNode] = &[
+    AllowedDeviceNode::new(b"dev/null", 1, 3),
+    AllowedDeviceNode::new(b"dev/zero", 1, 5),
+    AllowedDeviceNode::new(b"dev/random", 1, 8),
+    AllowedDeviceNode::new(b"dev/urandom", 1, 9),
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct AllowedDeviceNode {
+    path: &'static [u8],
+    major: u32,
+    minor: u32,
+}
+
+impl AllowedDeviceNode {
+    const fn new(path: &'static [u8], major: u32, minor: u32) -> Self {
+        Self { path, major, minor }
+    }
+}
 
 /// How [`unpack_layer`] handles xattrs carried in pax headers.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -219,6 +245,8 @@ pub struct UnpackReport {
     /// Allow-listed pax xattrs successfully written to the
     /// materialized filesystem entry.
     pub xattrs_written: u64,
+    /// Allow-listed character device nodes materialized.
+    pub device_nodes_written: u64,
     /// Pax xattrs intentionally dropped by policy or because the
     /// host filesystem rejected the write. Each drop also gets a
     /// corresponding [`XattrWarning`] in `xattr_warnings`.
@@ -307,6 +335,11 @@ pub enum RefusalReason {
     /// later path retroactively define what an earlier hardlink
     /// points at.
     HardlinkTargetMissing,
+    /// A character or block special file did not match the Plan 85
+    /// A.5 allow-list. Only `dev/null`, `dev/zero`, `dev/random`, and
+    /// `dev/urandom` with their Linux standard major/minor pairs are
+    /// materialized; everything else is refused closed.
+    DeviceNodeRefused,
     /// Tar header was malformed (unreadable path bytes, etc.). We
     /// refuse the entry rather than failing the whole unpack — a
     /// single bad entry shouldn't poison a multi-thousand-entry
@@ -327,6 +360,7 @@ impl RefusalReason {
             Self::SymlinkInParent => "symlink_in_parent",
             Self::UnsupportedEntryType => "unsupported_entry_type",
             Self::HardlinkTargetMissing => "hardlink_target_missing",
+            Self::DeviceNodeRefused => "device_node_refused",
             Self::MalformedHeader => "malformed_header",
         }
     }
@@ -619,6 +653,19 @@ pub fn unpack_layer<R: Read>(
                     }),
                 }
             }
+            tar::EntryType::Char | tar::EntryType::Block => {
+                match materialize_device_node(&entry, &target, &raw_path) {
+                    Ok(()) => {
+                        report.device_nodes_written += 1;
+                        apply_collected_xattrs(&target, &raw_path, entry_xattrs, &mut report);
+                        current_layer_paths.insert(rel_path.clone());
+                    }
+                    Err(refuse) => report.refused.push(RefusedEntry {
+                        raw_path: raw_path.clone(),
+                        reason: refuse,
+                    }),
+                }
+            }
             _ => {
                 report.refused.push(RefusedEntry {
                     raw_path,
@@ -682,6 +729,72 @@ fn classify_xattr_name(policy: XattrPolicy, name: &[u8]) -> Result<(), XattrWarn
     } else {
         Err(XattrWarningReason::NotAllowlisted)
     }
+}
+
+fn materialize_device_node<R: Read>(
+    entry: &tar::Entry<R>,
+    target: &Path,
+    raw_path: &[u8],
+) -> Result<(), RefusalReason> {
+    let major = entry
+        .header()
+        .device_major()
+        .map_err(|_| RefusalReason::MalformedHeader)?;
+    let minor = entry
+        .header()
+        .device_minor()
+        .map_err(|_| RefusalReason::MalformedHeader)?;
+    let allowed = classify_device_node(entry.header().entry_type(), raw_path, major, minor)?;
+
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent).map_err(|_| RefusalReason::MalformedHeader)?;
+    }
+
+    create_allowed_device_node(target, allowed)
+}
+
+fn classify_device_node(
+    entry_type: tar::EntryType,
+    raw_path: &[u8],
+    major: Option<u32>,
+    minor: Option<u32>,
+) -> Result<AllowedDeviceNode, RefusalReason> {
+    if entry_type != tar::EntryType::Char {
+        return Err(RefusalReason::DeviceNodeRefused);
+    }
+
+    let (Some(major), Some(minor)) = (major, minor) else {
+        return Err(RefusalReason::DeviceNodeRefused);
+    };
+
+    ALLOWED_DEVICE_NODES
+        .iter()
+        .copied()
+        .find(|allowed| {
+            allowed.path == raw_path && allowed.major == major && allowed.minor == minor
+        })
+        .ok_or(RefusalReason::DeviceNodeRefused)
+}
+
+#[cfg(target_os = "linux")]
+fn create_allowed_device_node(
+    target: &Path,
+    allowed: AllowedDeviceNode,
+) -> Result<(), RefusalReason> {
+    use rustix::fs::{CWD, FileType, Mode, makedev, mknodat};
+
+    let mode = Mode::from_raw_mode(0o666);
+    let dev = makedev(allowed.major, allowed.minor);
+    mknodat(CWD, target, FileType::CharacterDevice, mode, dev)
+        .map_err(|_| RefusalReason::MalformedHeader)
+}
+
+#[cfg(not(target_os = "linux"))]
+fn create_allowed_device_node(
+    _target: &Path,
+    _allowed: AllowedDeviceNode,
+) -> Result<(), RefusalReason> {
+    Err(RefusalReason::DeviceNodeRefused)
 }
 
 fn is_allowlisted_xattr(name: &[u8]) -> bool {
@@ -1253,6 +1366,25 @@ mod tests {
         builder.append(&header, std::io::empty()).unwrap();
     }
 
+    /// Add a character or block device entry.
+    fn add_device_node(
+        builder: &mut tar::Builder<Cursor<Vec<u8>>>,
+        path: &str,
+        entry_type: tar::EntryType,
+        major: u32,
+        minor: u32,
+    ) {
+        let mut header = tar::Header::new_gnu();
+        header.set_path(path).unwrap();
+        header.set_size(0);
+        header.set_mode(0o666);
+        header.set_entry_type(entry_type);
+        header.set_device_major(major).unwrap();
+        header.set_device_minor(minor).unwrap();
+        header.set_cksum();
+        builder.append(&header, std::io::empty()).unwrap();
+    }
+
     #[test]
     fn happy_path_writes_files_dirs_symlinks() {
         let tar_bytes = build_tar(|b| {
@@ -1563,6 +1695,7 @@ mod tests {
             RefusalReason::JoinedPathEscape,
             RefusalReason::SymlinkInParent,
             RefusalReason::HardlinkTargetMissing,
+            RefusalReason::DeviceNodeRefused,
             RefusalReason::UnsupportedEntryType,
             RefusalReason::MalformedHeader,
         ];
@@ -1706,6 +1839,137 @@ mod tests {
             report.xattr_warnings[0].reason,
             XattrWarningReason::PolicyDropAll
         );
+    }
+
+    // ── Phase A.5: allow-listed device nodes ───────────────────────
+
+    #[test]
+    fn device_node_allowlist_accepts_only_expected_char_devices() {
+        for allowed in ALLOWED_DEVICE_NODES {
+            assert_eq!(
+                classify_device_node(
+                    tar::EntryType::Char,
+                    allowed.path,
+                    Some(allowed.major),
+                    Some(allowed.minor),
+                ),
+                Ok(*allowed)
+            );
+        }
+
+        assert_eq!(
+            classify_device_node(tar::EntryType::Block, b"dev/null", Some(1), Some(3)),
+            Err(RefusalReason::DeviceNodeRefused)
+        );
+        assert_eq!(
+            classify_device_node(tar::EntryType::Char, b"dev/tty", Some(5), Some(0)),
+            Err(RefusalReason::DeviceNodeRefused)
+        );
+        assert_eq!(
+            classify_device_node(tar::EntryType::Char, b"dev/null", Some(1), Some(5)),
+            Err(RefusalReason::DeviceNodeRefused)
+        );
+        assert_eq!(
+            classify_device_node(tar::EntryType::Char, b"./dev/null", Some(1), Some(3)),
+            Err(RefusalReason::DeviceNodeRefused)
+        );
+        assert_eq!(
+            classify_device_node(tar::EntryType::Char, b"dev/null", None, Some(3)),
+            Err(RefusalReason::DeviceNodeRefused)
+        );
+    }
+
+    #[test]
+    fn disallowed_character_device_is_refused() {
+        let tar_bytes = build_tar(|b| {
+            add_device_node(b, "dev/tty", tar::EntryType::Char, 5, 0);
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.device_nodes_written, 0);
+        assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
+        assert_eq!(report.refused[0].reason, RefusalReason::DeviceNodeRefused);
+        assert!(!tmp.path().join("dev/tty").exists());
+    }
+
+    #[test]
+    fn block_device_is_refused_even_when_path_matches_allowlist() {
+        let tar_bytes = build_tar(|b| {
+            add_device_node(b, "dev/null", tar::EntryType::Block, 1, 3);
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.device_nodes_written, 0);
+        assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
+        assert_eq!(report.refused[0].reason, RefusalReason::DeviceNodeRefused);
+        assert!(!tmp.path().join("dev/null").exists());
+    }
+
+    #[test]
+    fn allowed_device_node_under_symlinked_parent_refuses() {
+        let tar_bytes = build_tar(|b| {
+            add_symlink(b, "dev", "/tmp");
+            add_device_node(b, "dev/null", tar::EntryType::Char, 1, 3);
+        });
+
+        let tmp = TempDir::new().unwrap();
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.symlinks_written, 1);
+        assert_eq!(report.device_nodes_written, 0);
+        assert_eq!(report.refused.len(), 1, "{:?}", report.refused);
+        assert_eq!(report.refused[0].reason, RefusalReason::SymlinkInParent);
+    }
+
+    #[cfg(target_os = "linux")]
+    #[test]
+    fn allowed_device_node_materializes_when_host_permits_mknod() {
+        use rustix::fs::{CWD, FileType, Mode, makedev, mknodat};
+        use std::os::unix::fs::FileTypeExt;
+
+        let tmp = TempDir::new().unwrap();
+        let probe = tmp.path().join("probe-null");
+        let mode = Mode::from_raw_mode(0o600);
+        let dev = makedev(1, 3);
+        if mknodat(CWD, &probe, FileType::CharacterDevice, mode, dev).is_err() {
+            eprintln!("skipping device-node materialization assertion: mknod not permitted");
+            return;
+        }
+        std::fs::remove_file(&probe).unwrap();
+
+        let tar_bytes = build_tar(|b| {
+            add_device_node(b, "dev/null", tar::EntryType::Char, 1, 3);
+        });
+        let report = unpack_layer(
+            Cursor::new(tar_bytes),
+            tmp.path(),
+            &UnpackOptions::default(),
+        )
+        .expect("unpack ok");
+
+        assert_eq!(report.device_nodes_written, 1);
+        assert!(report.refused.is_empty(), "{:?}", report.refused);
+        let meta = std::fs::symlink_metadata(tmp.path().join("dev/null")).unwrap();
+        assert!(meta.file_type().is_char_device());
     }
 
     // ── Phase A.2: OCI whiteout + opaque marker semantics ────────
