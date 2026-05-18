@@ -68,4 +68,4 @@ This document maps each SOC 2 Trust Services Criterion to the implementing artif
 ### Privacy (P)
 - [ ] (TBD) PII redaction (ADR-020)
 - [ ] (TBD) Opt-in telemetry only
-- [ ] (TBD) GDPR right-to-erasure (`mvmctl tenant destroy`)
+- [ ] (TBD) GDPR right-to-erasure via mvmd tenant deprovisioning and mvm overlay erasure certificates

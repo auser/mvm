@@ -5,8 +5,7 @@
 //! 1. The bundle's **base** sub-policies (always present).
 //! 2. The bundle's **tenant overlay** for that workload's tenant
 //!    (each field is `Option<T>` — `None` inherits from base).
-//! 3. **Emergency deny rules** distributed out of band by mvmd
-//!    (or applied locally via `mvmctl policy apply`).
+//! 3. **Emergency deny rules** distributed out of band by mvmd.
 //!
 //! These can disagree. Without explicit precedence, the merge
 //! result depends on which code path resolves first — exactly the

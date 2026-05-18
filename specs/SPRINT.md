@@ -73,6 +73,7 @@ Recent maintenance:
 - [x] Hardened builder-VM reliability follow-ups from GitHub triage: Stage 0 seed selection now skips cached dev rootfs images that lack `/sbin/mvm-builder-init`, source-built builder VM artifacts must contain that init before promotion, cached builder images fail fast when `cmdline.txt` is missing, libkrun supervisor waits have a bounded `MVM_BUILDER_VM_TIMEOUT_SECS` escape hatch, and flake builds now carry the Nix store-path hash through `/job/store-path` for stable `revision_hash` reuse.
 - [x] Resolved spec-number collisions across `specs/plans/` and `specs/adrs/` by renumbering duplicate-prefixed files, updating references, and adding `cargo xtask check-spec-numbers` to CI so future duplicate Plan/ADR prefixes fail before merge.
 - [x] Shortened top-level `mvmctl --help` command summaries and added a regression test keeping each summary to 72 characters or less.
+- [x] Tightened the public `mvmctl` command surface around the local microVM substrate boundary: removed `deploy`, `policy`, and `tenant` from the Clap tree, deleted their unreachable command modules, and updated the CLI reference with the retained command families. Tenant lifecycle, tenant policy review/update, and deployment to the hosted control plane are now documented as `mvmd` responsibilities.
 
 ## In-flight workstreams
 
@@ -1167,7 +1168,7 @@ Reference: ADR-044 (`specs/adrs/044-audit-emit-macro.md`).
 | 2 | Plan 60 Phase 4 — persistent observability | 5-8 | Scaffold shipped in batch 2 (`tests/audit_total_coverage.rs` recursive coverage of all CLI subcommands at every depth). Remaining: Prometheus + OTLP metrics endpoint; promote `audit_total_coverage` `Emits` rows to live drive-and-assert tests as each command gains a hermetic fixture; wire `bundle.audit.{chain_signing, stream_destinations}` into `AuditEmitter` construction; structured logs; event bus on `tokio::sync::broadcast`. |
 | 3 | Plan 60 Phase 5 — DX layer (Python SDK, manifests, mvm-studio handshake) | 7-10 | `python/mvm` wheels via pyo3; `cargo xtask gen-stubs` for typed APIs. Templates from `../mvm/templates/` rewritten on microvm.nix. |
 | 4 | Plan 60 Phase 7 — MCP server + host-mediated tools + sessions | 7-10 | PR #105 exposes `run`, `mvm.time_now`, `mvm.web_fetch`, `mvm.web_search`, `mvm.upload`, and `mvm.download`; CI smoke now asserts that MCP tool set and the secret audit live test pins `MVM_SECRET_STORE_BACKEND=file` for hermetic Linux runners. Remaining follow-up: snapshot/eval and tmux-style sessions. |
-| 5 | Plan 60 Phase 7a — install/rebuild/persistent overlay/tenant destroy | 10-12 | Encrypted persistent overlay (extends plan 45's volume work); rolling rootfs swap; `mvmctl tenant destroy` emits a destruction certificate. |
+| 5 | Plan 60 Phase 7a — install/rebuild/persistent overlay erasure | 10-12 | Encrypted persistent overlay (extends plan 45's volume work); rolling rootfs swap; overlay-erasure tooling emits destruction certificates. Tenant lifecycle UX belongs in mvmd. |
 | 6 | Plan 60 Phase 7b — built-in templates + TypeScript SDK | 5-7 | `ai-sandbox` / `safe-openclaw` / `computer-use` / `repl` templates with bundled policy bundles. `typescript/@mvm/sdk` napi-rs binding for hot paths. |
 | 7 | Plan 60 Phase 8 — mvmd integration contract verification | 3-5 | Port `mvm/src/hostd/{mod,server}.rs`; `PROTOCOL_VERSION` const; wire-format stability test. **Coordinated with parallel mvmd work** — see "Cross-repo coordination" below. The mvm-hostd supervisor lift this depends on is what makes every Live impl in `slots_from_bundle` (shipped batch 2) actually enforce. |
 | 8 | Plan 60 Phase 9 — perf + supply chain + SBOM | 7-10 | Cold-boot ≤500 ms Firecracker / ≤1 s libkrun; rootfs ≤20 MB; PGO + MUSL builds; cosign-keyless artifacts; RFC 3161 timestamping. |
@@ -1694,23 +1695,10 @@ Shipped:
 - `mvmctl cp --json` emits a redacted machine-readable copy summary with
   direction, VM name, guest path, byte count, and effective copy options; host
   paths and file contents are omitted.
-- `mvmctl policy explain <tenant>:<workload> [--json]` validates the same
-  policy bundle admission gates as the resolver and emits a redacted admission
-  posture summary; JSON omits raw artifact paths, audit destination URLs, and
-  egress hostnames.
-- `mvmctl policy lint <tenant>:<workload> [--json]` validates the bundle and
-  fails on risky-but-admissible posture such as plain HTTP egress, disabled
-  inspectors, unsigned audit chains, long/disabled key rotation, broad L4
-  CIDRs, wildcard ports, and sensitive-looking artifact capture paths. JSON is
-  redacted with the same no-raw-paths/URLs/hostnames rule as `policy explain`.
-- `mvmctl policy diff <left> <right> [--json]` validates both bundles and
-  emits a redacted change report for policy review before rollout. Raw artifact
-  paths, audit destination URLs, egress hostnames, and CIDRs are replaced with
-  stable fingerprints and safe summaries.
-- `mvmctl policy export <tenant>:<workload> [--format json|toml]` validates
-  the bundle and emits a redacted support/review artifact by default; raw
-  export requires explicit `--redaction raw` and preserves the original bundle
-  shape for trusted migration workflows.
+- The policy explain/lint/diff/export CLI surface was removed from `mvmctl`
+  during the CLI-boundary cleanup. The underlying policy bundle types and
+  admission resolver remain in `mvm`; tenant policy review and rollout UX live
+  in `mvmd`.
 - CLI reference and parser tests cover the new command and profile surface.
 
 ### Sprint 52 success criteria

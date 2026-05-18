@@ -68,8 +68,6 @@ pub(in crate::commands) enum Commands {
     Build(build::build::Args),
     /// Compile Workload IR into build artifacts
     Compile(build::compile::Args),
-    /// Compile and prepare a workload for mvmd
-    Deploy(build::deploy::Args),
     /// Build and run a VM
     ///
     /// If neither `--flake` nor `--manifest` is supplied, the bundled
@@ -133,18 +131,14 @@ pub(in crate::commands) enum Commands {
     Snapshot(vm::pause::SnapshotArgs),
     /// Manage virtio-fs volume mounts
     Volume(vm::volume::Args),
-    /// Manage tenant secrets
+    /// Manage local secret namespaces
     Secret(ops::secret::Args),
     /// Emit or verify host attestation reports
     Attest(ops::attest::Args),
-    /// Inspect tenant policy bundles
-    Policy(ops::policy::Args),
     /// Seal or verify portable VM bundles
     Bundle(bundle::Args),
     /// Manage trusted bundle publishers
     Trust(trust::Args),
-    /// Manage tenant lifecycle
-    Tenant(ops::tenant::Args),
     /// Inspect cached application dependencies
     Deps(deps::Args),
     /// Wait for guest readiness
@@ -253,7 +247,6 @@ pub fn run() -> Result<()> {
         Commands::Storage(a) => storage::run(&cli, a, &cfg),
         Commands::Build(a) => build::build::run(&cli, a, &cfg),
         Commands::Compile(a) => build::compile::run(&cli, a, &cfg),
-        Commands::Deploy(a) => build::deploy::run(&cli, a, &cfg),
         Commands::Up(a) => vm::up::run(&cli, a, &cfg),
         Commands::Down(a) => vm::down::run(&cli, a, &cfg),
         Commands::ShellInit(a) => env::shell_init::run(&cli, a, &cfg),
@@ -285,10 +278,8 @@ pub fn run() -> Result<()> {
         Commands::Volume(a) => vm::volume::run(&cli, a, &cfg),
         Commands::Secret(a) => ops::secret::run(&cli, a, &cfg),
         Commands::Attest(a) => ops::attest::run(&cli, a, &cfg),
-        Commands::Policy(a) => ops::policy::run(&cli, a, &cfg),
         Commands::Bundle(a) => bundle::run(&cli, a, &cfg),
         Commands::Trust(a) => trust::run(&cli, a, &cfg),
-        Commands::Tenant(a) => ops::tenant::run(&cli, a, &cfg),
         Commands::Deps(a) => deps::run(&cli, a, &cfg),
         Commands::Wait(a) => vm::wait::run_wait(&cli, a, &cfg),
         Commands::BootReport(a) => vm::wait::run_boot_report(&cli, a, &cfg),

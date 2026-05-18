@@ -118,42 +118,29 @@ mismatch). Treat as a security incident — the chain shouldn't
 break under normal operation, so a failure means either
 tampering or a regression in the chain-emit path.
 
-## Gate 5 — Destruction certificates round-trip
+## Gate 5 — Destruction certificate verifier round-trip
 
-The hosted-cloud tenant-destroy workflow (plan-60 Phase 7a) is
-the third-party-verifiable end of the substrate. The full
-operator→auditor pipeline is covered end-to-end by
-`tests/tenant_destroy_e2e.rs`, which `cargo test --workspace`
-in Gate 1 already exercised. The operator's *manual* gate is to
-confirm the three-axis verify path is healthy on a throwaway
-tenant before tagging:
+The hosted-cloud tenant deprovisioning workflow belongs to `mvmd`.
+`mvm` still owns the overlay erasure substrate and the independent
+certificate verifier. The end-to-end substrate path is covered by
+`tests/tenant_destroy_e2e.rs`, which `cargo test --workspace` in
+Gate 1 already exercised.
+
+The operator's manual gate for this repo is to verify a certificate
+bundle produced by the control plane or a fixture:
 
 ```bash
-# 1. Hand-stage a throwaway overlay tree under the standard
-#    overlay root. The tenant-destroy path treats any directory
-#    under <root>/<tenant>/<workload>/ as a workload overlay.
-$ TENANT=release-smoke-$(date +%s)
-$ mkdir -p ~/.mvm/overlays/$TENANT/smoke
-$ chmod 700 ~/.mvm/overlays/$TENANT
-$ printf "throwaway" > ~/.mvm/overlays/$TENANT/smoke/payload
-
-# 2. Destroy + capture the certificate.
-$ mvmctl tenant destroy --tenant $TENANT --confirm-deletion \
-      > /tmp/release-test-certs.json
-
-# 3. Verify all three axes:
 $ mvmctl audit verify-cert /tmp/release-test-certs.json \
       --pubkey ~/.mvm/keys/host-signer.pub \
       --chain ~/.mvm/audit/local.jsonl
 mvmctl audit verify-cert: 1 certificate(s) verified
-  ✓ release-smoke-…/smoke: 1 file(s), 9 byte(s) wiped at 2026-05-11T18:00:00Z [chain ✓]
+  ✓ release-smoke-.../smoke: 1 file(s), 9 byte(s) wiped at 2026-05-11T18:00:00Z [chain ✓]
 ```
 
-The `[chain ✓]` marker is the tripwire — it asserts the
-chain-emit path is still wiring `lifecycle.tenant.destroyed`
-events with the cert_fingerprint label. See
-`specs/runbooks/tenant-destroy.md` for the full three-axis
-documentation.
+The `[chain ✓]` marker is the tripwire: it asserts the chain path
+contains a matching destruction event with the `cert_fingerprint`
+label. See `specs/runbooks/overlay-erasure.md` for the full
+three-axis documentation.
 
 ## Gate 6 — Linux/KVM-only gates have passed in CI
 
@@ -191,7 +178,7 @@ descriptions point to the ADR section that motivates them.
 - **Hosted-cloud multi-host certificates.** Today the cert
   signs a single host's view of destruction. Multi-replica
   attestation is a roadmap item — track in
-  `specs/runbooks/tenant-destroy.md::Roadmap`.
+  `specs/runbooks/overlay-erasure.md`.
 
 ## Sign-off
 

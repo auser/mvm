@@ -27,7 +27,7 @@ require the libkrun builder VM to actually boot:
 | 7d    | `mvmctl compile --from-recording` | ✅ landed |
 | 7e    | Python auto-exec for Sandbox-shaped scripts | ✅ landed |
 | 7f    | Node + TypeScript auto-exec | ✅ landed |
-| 8 (stub) | `mvmctl deploy` — single archive + `mvmd-spec.json` + log-only client | ✅ landed |
+| 8 (stub) | SDK deployment package primitives for mvmd-owned rollout flows | ✅ landed; public `mvmctl deploy` later removed |
 | 8 followup | Examples (hello-app) + SDK guide + mvmforge-migration guide + tombstone | ✅ landed |
 | 9 (primitives) | `deps_audit` types + `seal_volume`/`verify_sealed_volume` + ADR-047 | ✅ landed |
 | 10a   | Addon-aware hook merger + launch.json hook emission | ✅ landed |

@@ -70,11 +70,10 @@ pub mod compile;
 /// Closed `mvm.*` helper allowlist; non-literal kwargs rejected.
 pub mod decorator;
 
-/// Deploy-bundle assembly + shipping (`mvmctl deploy`). Builds the
-/// single signed `.tar.gz` (compile output + embedded `mvmd-spec.json`)
-/// described in mvmd ADR-0020 and ships it via `MvmdClient::ship`.
-/// v1 ships the stub end of the contract; the real HTTP transport
-/// lands with mvmd Plan 48 Phase 1090.
+/// Deploy-bundle assembly + shipping for mvmd-owned control-plane flows.
+/// Builds the single signed `.tar.gz` (compile output + embedded
+/// `mvmd-spec.json`) described in mvmd ADR-0020 and ships it via
+/// `MvmdClient::ship`.
 pub mod deploy;
 
 /// Runtime record-mode core — recording shape + lowering. SDK port

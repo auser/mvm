@@ -123,19 +123,6 @@ const ATTEST_SUB: &[(&str, AuditPosture)] = &[
     ("status", AuditPosture::ReadOnly),
 ];
 
-const POLICY_SUB: &[(&str, AuditPosture)] = &[
-    ("show", AuditPosture::ReadOnly),
-    ("verify", AuditPosture::ReadOnly),
-    ("explain", AuditPosture::ReadOnly),
-    ("lint", AuditPosture::ReadOnly),
-    ("diff", AuditPosture::ReadOnly),
-    ("export", AuditPosture::ReadOnly),
-    // `policy update` is stubbed pending the mvmd-signed-plan flow
-    // (plan 60 Phase 8). Once it lands, this row flips to
-    // `Emits("PolicyApply")`.
-    ("update", AuditPosture::InteractiveOrControl),
-];
-
 const SESSION_SUB: &[(&str, AuditPosture)] = &[
     ("start", AuditPosture::Emits("SessionStart")),
     ("ls", AuditPosture::ReadOnly),
@@ -213,14 +200,6 @@ const TRUST_SUB: &[(&str, AuditPosture)] = &[
     ("remove", AuditPosture::Emits("TrustRemove")),
 ];
 
-// Plan 60 Phase 7a Slices A + D. `tenant destroy` writes signed
-// destruction certificates to stdout; the per-workload chain
-// emission (`lifecycle.tenant.destroyed`) lives in the plan-64
-// audit chain rather than the legacy LocalAuditKind stream, so
-// the row is `InteractiveOrControl` here. The signature/chain
-// integrity is exercised by `tests/tenant_destroy_e2e.rs`.
-const TENANT_SUB: &[(&str, AuditPosture)] = &[("destroy", AuditPosture::InteractiveOrControl)];
-
 // Plan 73 Followup C — sealed deps-volume cache. `deps inspect` is
 // read-only (pretty-prints meta.json + sidecars without mutating
 // the volume). `deps audit` re-runs the CVE scan, rewrites
@@ -280,12 +259,6 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     // sidecars at the user-supplied --out path. Doesn't touch the
     // audit chain. ReadOnly w.r.t. host state.
     ("compile", AuditPosture::ReadOnly),
-    // SDK port Phase 8 (stub) — packs the compile output into a
-    // `.tar.gz` with `mvmd-spec.json` embedded and logs "would
-    // ship: …" via the stub `MvmdClient::ship`. The real HTTP
-    // transport (and any audit emission that comes with it) lands
-    // when mvmd Plan 48 Phase 1090 wires it; for now ReadOnly.
-    ("deploy", AuditPosture::ReadOnly),
     ("validate", AuditPosture::ReadOnly),
     ("catalog", AuditPosture::ReadOnly),
     // Operational surfaces.
@@ -297,15 +270,9 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("mcp", AuditPosture::InteractiveOrControl),
     ("secret", AuditPosture::DelegatesToSub(SECRET_SUB)),
     ("attest", AuditPosture::DelegatesToSub(ATTEST_SUB)),
-    ("policy", AuditPosture::DelegatesToSub(POLICY_SUB)),
     // Sprint 52 W2 — bundles + trust store.
     ("bundle", AuditPosture::DelegatesToSub(BUNDLE_SUB)),
     ("trust", AuditPosture::DelegatesToSub(TRUST_SUB)),
-    // Plan 60 Phase 7a Slices A + D — destroys overlays + emits
-    // signed certificates. `tenant destroy` is the only leaf
-    // today; future Slice E adds `rebuild`, Slice 7b adds
-    // `install` / `uninstall`.
-    ("tenant", AuditPosture::DelegatesToSub(TENANT_SUB)),
     // Plan 73 Followup C — sealed deps-volume cache verbs.
     ("deps", AuditPosture::DelegatesToSub(DEPS_SUB)),
     // Plan 76 Phase 2 / Phase 4 — host-side readiness UX. Both

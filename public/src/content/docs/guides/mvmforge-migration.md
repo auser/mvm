@@ -40,8 +40,8 @@ surface.
   collapse the most common `image=` decoration into a single call.
 - Lifecycle hook kwargs on `@mvm.app(...)`: `before_build`,
   `before_start`, `after_start`, `before_stop`.
-- `mvmctl deploy` produces a single signed `.tar.gz` with embedded
-  `mvmd-spec.json` per mvmd ADR-0020.
+- Deployment packaging moved behind mvmd-owned control-plane flows. `mvmctl`
+  keeps the local compile/build/run surface.
 - The Rust-side compile pipeline is now a library (`mvm-sdk::compile`),
   so any consumer (mvmd, custom CI runners) can call into the same
   rendering primitives without going through `mvmctl`.
