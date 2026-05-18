@@ -9,6 +9,10 @@ pub mod firecracker;
 /// wrapper around kernel + rootfs + verity sidecars + cmdline,
 /// with an Ed25519-signed manifest that hashes every payload.
 pub mod packed_artifact;
+/// Plan 85 Phase B — OCI-unpacked tree to ext4 rootfs image.
+/// The host only allocates the sparse file; formatting and copying
+/// happen inside the existing builder VM.
+pub mod rootfs;
 pub mod template_reuse;
 
 /// Plan 72 W1 — libkrun-backed builder VM (gated by

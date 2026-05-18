@@ -128,6 +128,38 @@ pub struct LibkrunBuilderVm {
     pub image_override: Option<BuilderVmImage>,
 }
 
+/// Additional virtio-blk device passed to a one-shot builder shell
+/// job. Devices appear after the builder VM's persistent Nix-store
+/// disk; the first extra disk here is `/dev/vdc` in the guest.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuilderExtraDisk {
+    pub id: String,
+    pub path: PathBuf,
+    pub read_only: bool,
+}
+
+/// Generic builder-VM shell job.
+///
+/// This is intentionally narrower than [`BuilderJob`]: it is for
+/// in-tree infrastructure commands that need the Linux builder
+/// boundary but do not produce Nix build artifacts. Plan 85 Phase B
+/// uses it to run `mkfs.ext4` and copy an OCI-unpacked rootfs into a
+/// writable virtio-blk image.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuilderShellJob {
+    pub work_dir: PathBuf,
+    pub artifact_out: PathBuf,
+    pub script: String,
+    pub extra_disks: Vec<BuilderExtraDisk>,
+}
+
+/// Result metadata from a one-shot builder shell job.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuilderShellResult {
+    pub job_dir: PathBuf,
+    pub vm_state_dir: PathBuf,
+}
+
 impl Default for LibkrunBuilderVm {
     fn default() -> Self {
         Self {
@@ -162,6 +194,99 @@ impl LibkrunBuilderVm {
     pub fn with_image_override(mut self, image: BuilderVmImage) -> Self {
         self.image_override = Some(image);
         self
+    }
+
+    /// Run an in-tree shell script inside the existing builder VM
+    /// boundary. The script is staged as `/job/cmd.sh`; `/work`
+    /// points at [`BuilderShellJob::work_dir`], `/out` points at
+    /// [`BuilderShellJob::artifact_out`], and callers may attach
+    /// additional writable or read-only virtio-blk disks.
+    pub fn run_shell_script(
+        &self,
+        job: &BuilderShellJob,
+    ) -> Result<BuilderShellResult, BuilderVmError> {
+        self.validate_shell_job(job)?;
+
+        if !mvm_libkrun::is_available() {
+            return Err(BuilderVmError::LibkrunUnavailable(format!(
+                "libkrun shared library not found on host. {}",
+                mvm_libkrun::install_hint()
+            )));
+        }
+
+        let supervisor_path = resolve_supervisor_path()?;
+        let image = match &self.image_override {
+            Some(image) => image.clone(),
+            None => ensure_builder_vm_image()?,
+        };
+        let nix_store_img = ensure_nix_store_image(host_arch_tag(), u64::from(self.nix_store_mib))?;
+
+        let job_id = unique_job_id();
+        let job_dir = builder_vm_cache_dir().join("jobs").join(&job_id);
+        stage_shell_job_dir(&job_dir, &job.script)?;
+
+        let vm_name = format!("mvm-builder-vm-{job_id}");
+        let vm_state_dir = builder_vm_cache_dir().join("vms").join(&vm_name);
+        std::fs::create_dir_all(&vm_state_dir).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating builder VM state dir {}: {e}",
+                vm_state_dir.display()
+            ))
+        })?;
+        let console_log = vm_state_dir.join("console.log");
+
+        let mut krun = KrunContext::new(
+            &vm_name,
+            path_to_str(&image.kernel_path, "kernel_path")?,
+            path_to_str(&image.rootfs_path, "rootfs_path")?,
+        )
+        .with_resources(self.vcpus, self.memory_mib)
+        .with_cmdline(&image.cmdline)
+        .with_console_output(path_to_str(&console_log, "console_log")?)
+        .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
+        .add_disk(
+            "nix-store",
+            path_to_str(&nix_store_img, "nix_store_img")?,
+            false,
+        )
+        .add_virtio_fs("work", path_to_str(&job.work_dir, "work_dir")?)
+        .add_virtio_fs("out", path_to_str(&job.artifact_out, "artifact_out")?)
+        .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?);
+
+        for disk in &job.extra_disks {
+            krun = krun.add_disk(
+                disk.id.as_str(),
+                path_to_str(&disk.path, "extra_disk")?,
+                disk.read_only,
+            );
+        }
+
+        let cfg = SupervisorConfig {
+            krun,
+            vm_state_dir: path_to_str(&vm_state_dir, "vm_state_dir")?.to_string(),
+            pid_file_name: Some("builder.pid".to_string()),
+        };
+        let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg, &vm_state_dir)?;
+        if exit_code != 0 {
+            return Err(BuilderVmError::NixBuildFailed(format!(
+                "supervisor exited with non-zero status ({exit_code}); \
+                 guest stderr at {}",
+                vm_state_dir.display()
+            )));
+        }
+
+        let result = read_job_result(&job_dir)?;
+        if result.exit_code != 0 {
+            return Err(BuilderVmError::NixBuildFailed(format!(
+                "guest shell job exited {} — stderr tail:\n{}",
+                result.exit_code, result.stderr_tail
+            )));
+        }
+
+        Ok(BuilderShellResult {
+            job_dir,
+            vm_state_dir,
+        })
     }
 
     /// Validate caller-supplied mount paths early. Catches issues
@@ -242,6 +367,43 @@ impl LibkrunBuilderVm {
                     )));
                 }
             }
+        }
+        Ok(())
+    }
+
+    fn validate_shell_job(&self, job: &BuilderShellJob) -> Result<(), BuilderVmError> {
+        ensure_utf8_path(&job.work_dir, "work_dir")?;
+        ensure_utf8_path(&job.artifact_out, "artifact_out")?;
+        for disk in &job.extra_disks {
+            ensure_utf8_path(&disk.path, "extra_disk")?;
+            if disk.id.trim().is_empty() {
+                return Err(BuilderVmError::ExtractionFailed(
+                    "extra disk id is empty".to_string(),
+                ));
+            }
+            if !disk.path.is_file() {
+                return Err(BuilderVmError::ExtractionFailed(format!(
+                    "extra disk path does not exist or is not a file: {}",
+                    disk.path.display()
+                )));
+            }
+        }
+        if !job.work_dir.is_dir() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "shell job work_dir must be a directory: {}",
+                job.work_dir.display()
+            )));
+        }
+        std::fs::create_dir_all(&job.artifact_out).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating artifact_out {}: {e}",
+                job.artifact_out.display()
+            ))
+        })?;
+        if job.script.trim().is_empty() {
+            return Err(BuilderVmError::NixBuildFailed(
+                "builder shell script is empty".to_string(),
+            ));
         }
         Ok(())
     }
@@ -675,6 +837,17 @@ chmod 0644 /out/rootfs.ext4 2>/dev/null || true
 
     let cmd_path = job_dir.join("cmd.sh");
     std::fs::write(&cmd_path, body).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!("writing {}: {e}", cmd_path.display()))
+    })?;
+    Ok(())
+}
+
+fn stage_shell_job_dir(job_dir: &Path, script: &str) -> Result<(), BuilderVmError> {
+    std::fs::create_dir_all(job_dir).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!("creating job dir {}: {e}", job_dir.display()))
+    })?;
+    let cmd_path = job_dir.join("cmd.sh");
+    std::fs::write(&cmd_path, script).map_err(|e| {
         BuilderVmError::ExtractionFailed(format!("writing {}: {e}", cmd_path.display()))
     })?;
     Ok(())
