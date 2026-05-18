@@ -11,6 +11,7 @@ use super::build::build;
 use super::build::compile;
 use super::catalog;
 use super::env::{cleanup, dev, init, uninstall};
+use super::image;
 use super::ops::{audit, cache, config, metrics, secret};
 use super::vm::{console, cp, down, exec, forward, sandbox, up, volume};
 
@@ -19,6 +20,7 @@ use cache::CacheAction;
 use catalog::CatalogAction;
 use config::ConfigAction;
 use dev::{DevAction, DevCacheAction};
+use image::ImageAction;
 use up::RunParams;
 
 use super::shared::{
@@ -1001,9 +1003,50 @@ fn test_security_verb_is_unrecognized() {
 }
 
 #[test]
-fn test_image_verb_is_unrecognized() {
-    let result = Cli::try_parse_from(["mvmctl", "image", "list"]);
-    assert!(result.is_err(), "`image` was folded into `catalog`");
+fn test_image_ls_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "image", "ls", "--registry", "docker.io", "--json"])
+        .unwrap();
+    assert!(matches!(
+        cli.command,
+        Commands::Image(image::Args {
+            action: ImageAction::Ls {
+                registry: Some(ref registry),
+                json: true
+            },
+        }) if registry == "docker.io"
+    ));
+}
+
+#[test]
+fn test_image_inspect_parses() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "image",
+        "inspect",
+        "docker.io/library/alpine:3.20",
+        "--json",
+    ])
+    .unwrap();
+    assert!(matches!(
+        cli.command,
+        Commands::Image(image::Args {
+            action: ImageAction::Inspect {
+                ref reference,
+                json: true
+            },
+        }) if reference == "docker.io/library/alpine:3.20"
+    ));
+}
+
+#[test]
+fn test_image_rm_parses() {
+    let cli = Cli::try_parse_from(["mvmctl", "image", "rm", "sha256:abc"]).unwrap();
+    assert!(matches!(
+        cli.command,
+        Commands::Image(image::Args {
+            action: ImageAction::Rm { ref reference },
+        }) if reference == "sha256:abc"
+    ));
 }
 
 // -------------------------------------------------------------------------

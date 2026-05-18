@@ -149,6 +149,7 @@ impl Commands {
             Commands::Update(_) => "update",
             Commands::Doctor(_) => "doctor",
             Commands::Manifest(_) => "manifest",
+            Commands::Image(_) => "image",
             Commands::Storage(_) => "storage",
             Commands::Build(_) => "build",
             Commands::Compile(_) => "compile",

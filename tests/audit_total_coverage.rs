@@ -100,6 +100,12 @@ const CACHE_SUB: &[(&str, AuditPosture)] = &[
     ("prune", AuditPosture::Emits("CachePrune")),
 ];
 
+const IMAGE_SUB: &[(&str, AuditPosture)] = &[
+    ("ls", AuditPosture::ReadOnly),
+    ("inspect", AuditPosture::ReadOnly),
+    ("rm", AuditPosture::Emits("CachePrune")),
+];
+
 const VOLUME_SUB: &[(&str, AuditPosture)] = &[
     ("create", AuditPosture::Emits("VolumeCreate")),
     ("unlock", AuditPosture::Emits("VolumeOpen")),
@@ -261,6 +267,7 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("compile", AuditPosture::ReadOnly),
     ("validate", AuditPosture::ReadOnly),
     ("catalog", AuditPosture::ReadOnly),
+    ("image", AuditPosture::DelegatesToSub(IMAGE_SUB)),
     // Operational surfaces.
     ("metrics", AuditPosture::ReadOnly),
     ("config", AuditPosture::Emits("ConfigChange")),
