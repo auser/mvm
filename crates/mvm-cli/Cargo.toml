@@ -77,7 +77,14 @@ contributor-bootstrap = [
     "mvm-build/contributor-bootstrap",
     "mvm-backend/contributor-bootstrap",
 ]
-builder-vm = ["mvm-build/builder-vm"]
+builder-vm = ["mvm-build/builder-vm", "libkrun-sys"]
+# Plan 86 / Plan 72 W5.D bullet 10: extract libkrunfw's bundled
+# TSI-patched kernel at runtime so Stage 0 boots a kernel where
+# libkrun's AF_INET-over-vsock (TSI) path actually works. The feature
+# is implied by `builder-vm` because every builder-vm path on macOS
+# uses libkrun, which already requires libkrunfw to be installed —
+# linking the symbol is a strictly additive runtime capability.
+libkrun-sys = ["mvm-libkrun/libkrun-sys"]
 # Plan 77 W4: structural enforcement of the "no prebuilt builder VM artifact
 # until release" invariant (see AGENTS.md / CLAUDE.md). When off — the default
 # for every contributor build — `download_builder_vm_image` and its helpers

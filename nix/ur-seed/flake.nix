@@ -116,7 +116,13 @@
           curl
           jq
           iproute2
-          iptables
+          # iptables-legacy, not the nft-backed default. The
+          # libkrunfw-bundled kernel ships without CONFIG_NF_TABLES, so
+          # `iptables-nft` bails with "Failed to initialize nft: Protocol
+          # not supported" at the first `iptables -A` call. Legacy
+          # iptables works against the older kernel netfilter ABI which
+          # the bundled kernel DOES carry.
+          iptables-legacy
           e2fsprogs
           util-linux
         ];

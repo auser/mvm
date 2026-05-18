@@ -2820,16 +2820,29 @@ fn bootstrap_builder_vm_image_via_ur_seed_stage0(
         )));
     }
 
-    // Plan 86 v2: the ur-seed ships its own TSI-patched kernel, so
-    // we use it preferentially. Fall back to the cached builder-VM
-    // kernel or a local dev image kernel only if the ur-seed kernel
-    // is missing (defensive — should never happen with a current
-    // ur-seed tarball, but keeps the path open during transition).
-    let kernel = if ur_seed.kernel.is_file() {
-        ur_seed.kernel.clone()
-    } else {
-        find_kernel_for_ur_seed_bootstrap()
-            .context("locating a TSI-patched kernel for ur-seed Stage 0")?
+    // Plan 86 v3 / Plan 72 W5.D bullet 10: extract the TSI-patched
+    // kernel bundled in `libkrunfw` and use it. Our in-repo port of
+    // the libkrunfw patches (nix/images/builder-vm/kernel/) applies
+    // cleanly to nixpkgs 6.12.87 but kernel-oops's on socket close at
+    // runtime — the upstream patches are validated against the
+    // specific kernel revision libkrunfw ships, not arbitrary
+    // nixpkgs HEADs. Falling back to libkrunfw's own kernel is the
+    // robust path. We cache the extracted bytes under
+    // `~/.cache/mvm/libkrunfw/vmlinux-<libkrunfw_version>` so a
+    // subsequent libkrunfw upgrade invalidates the cache cleanly.
+    let kernel = match extract_libkrunfw_kernel() {
+        Ok(p) => p,
+        Err(err) => {
+            ui::warn(&format!(
+                "Could not extract libkrunfw's bundled kernel ({err}); falling back to ur-seed's own vmlinux."
+            ));
+            if ur_seed.kernel.is_file() {
+                ur_seed.kernel.clone()
+            } else {
+                find_kernel_for_ur_seed_bootstrap()
+                    .context("locating a TSI-patched kernel for ur-seed Stage 0")?
+            }
+        }
     };
 
     ui::info(&format!(
@@ -2882,6 +2895,33 @@ fn bootstrap_builder_vm_image_via_ur_seed_stage0(
             Err(e)
         }
     }
+}
+
+/// Extract libkrunfw's bundled TSI-patched kernel into the host cache
+/// and return the on-disk path. Only available when `libkrun-sys` is
+/// compiled in (the default on macOS + Linux libkrun hosts) — without
+/// that feature the FFI is dead code and the caller falls back.
+#[cfg(all(feature = "builder-vm", feature = "libkrun-sys"))]
+fn extract_libkrunfw_kernel() -> Result<std::path::PathBuf> {
+    let cache_dir =
+        std::path::PathBuf::from(format!("{}/libkrunfw", mvm_core::config::mvm_cache_dir()));
+    let target = cache_dir.join("vmlinux");
+    let bundled = mvm_libkrun::extract_bundled_kernel(&target)
+        .map_err(|e| anyhow::anyhow!("libkrunfw kernel extraction: {e}"))?;
+    ui::info(&format!(
+        "Extracted libkrunfw kernel ({} bytes) to {}",
+        bundled.size,
+        bundled.path.display()
+    ));
+    Ok(bundled.path)
+}
+
+#[cfg(all(feature = "builder-vm", not(feature = "libkrun-sys")))]
+fn extract_libkrunfw_kernel() -> Result<std::path::PathBuf> {
+    anyhow::bail!(
+        "libkrunfw kernel extraction requires the `libkrun-sys` feature; \
+         rebuild `mvmctl` with `--features libkrun-sys` on a host with libkrun installed."
+    )
 }
 
 /// Locate a TSI-patched kernel to pair with the ur-seed rootfs.
