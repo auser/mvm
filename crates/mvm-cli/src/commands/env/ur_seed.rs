@@ -21,9 +21,14 @@ use crate::ui;
 const ROOTFS_NAME: &str = "rootfs.ext4";
 const MANIFEST_NAME: &str = "manifest.json";
 const CMDLINE_NAME: &str = "cmdline.txt";
+const KERNEL_NAME: &str = "vmlinux";
 
 /// Required entries the contributor or release CI ships in the tarball.
-const REQUIRED_ENTRIES: &[&str] = &[ROOTFS_NAME, MANIFEST_NAME, CMDLINE_NAME];
+/// Plan 86 v2: the ur-seed ships its own TSI-patched vmlinux so Stage 0
+/// has a self-contained bootable env. Earlier versions deferred to the
+/// dev image's kernel, but that kernel lacks TSI patches and breaks
+/// DNS/network inside the libkrun guest (Plan 72 W5.D bullet 10).
+const REQUIRED_ENTRIES: &[&str] = &[ROOTFS_NAME, MANIFEST_NAME, CMDLINE_NAME, KERNEL_NAME];
 
 /// Host arch string used in cache paths + tarball names.
 pub(in crate::commands) fn host_arch() -> &'static str {
@@ -53,6 +58,7 @@ pub(in crate::commands) fn cache_dir(arch: &str) -> PathBuf {
 pub(in crate::commands) struct UrSeedCache {
     pub dir: PathBuf,
     pub rootfs: PathBuf,
+    pub kernel: PathBuf,
     #[allow(dead_code)]
     pub manifest: PathBuf,
     #[allow(dead_code)]
@@ -65,9 +71,10 @@ pub(in crate::commands) struct UrSeedCache {
 pub(in crate::commands) fn probe(arch: &str) -> Option<UrSeedCache> {
     let dir = cache_dir(arch);
     let rootfs = dir.join(ROOTFS_NAME);
+    let kernel = dir.join(KERNEL_NAME);
     let manifest = dir.join(MANIFEST_NAME);
     let cmdline = dir.join(CMDLINE_NAME);
-    for p in [&rootfs, &manifest, &cmdline] {
+    for p in [&rootfs, &kernel, &manifest, &cmdline] {
         match std::fs::metadata(p) {
             Ok(m) if m.is_file() && m.len() > 0 => {}
             _ => return None,
@@ -76,6 +83,7 @@ pub(in crate::commands) fn probe(arch: &str) -> Option<UrSeedCache> {
     Some(UrSeedCache {
         dir,
         rootfs,
+        kernel,
         manifest,
         cmdline,
     })

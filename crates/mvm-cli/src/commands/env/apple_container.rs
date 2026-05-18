@@ -2820,8 +2820,17 @@ fn bootstrap_builder_vm_image_via_ur_seed_stage0(
         )));
     }
 
-    let kernel = find_kernel_for_ur_seed_bootstrap()
-        .context("locating a TSI-patched kernel for ur-seed Stage 0")?;
+    // Plan 86 v2: the ur-seed ships its own TSI-patched kernel, so
+    // we use it preferentially. Fall back to the cached builder-VM
+    // kernel or a local dev image kernel only if the ur-seed kernel
+    // is missing (defensive — should never happen with a current
+    // ur-seed tarball, but keeps the path open during transition).
+    let kernel = if ur_seed.kernel.is_file() {
+        ur_seed.kernel.clone()
+    } else {
+        find_kernel_for_ur_seed_bootstrap()
+            .context("locating a TSI-patched kernel for ur-seed Stage 0")?
+    };
 
     ui::info(&format!(
         "Using ur-seed at {} + kernel at {} as Stage 0 seed.",

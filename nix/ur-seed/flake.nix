@@ -92,38 +92,32 @@
           && !(nixpkgs.lib.hasPrefix "result-" base);
       };
 
-      # nix-portable pin. Bump in lockstep with pins.json.
-      nixPortablePin = {
-        version = "v012";
-        urls = {
-          # Upstream releases are arch-suffixed binaries. We pin both
-          # so a single tarball build can produce either-arch output
-          # from either-arch CI runner.
-          "aarch64-linux" = {
-            url = "https://github.com/DavHau/nix-portable/releases/download/v012/nix-portable-aarch64";
-            sha256 = "af41d8defdb9fa17ee361220ee05a0c758d3e6231384a3f969a314f9133744ea";
-          };
-          "x86_64-linux" = {
-            url = "https://github.com/DavHau/nix-portable/releases/download/v012/nix-portable-x86_64";
-            sha256 = "b409c55904c909ac3aeda3fb1253319f86a89ddd1ba31a5dec33d4a06414c72a";
-          };
-        };
-      };
-
-      nixPortableFor =
-        system:
-        let
-          pkgs = import nixpkgs { inherit system; };
-          spec = nixPortablePin.urls.${system};
-        in
-        # Flat-hash fetch (file content sha256). `executable = true`
-        # would switch to NAR-based hashing — we want the pin to match
-        # the bytes one would get from `curl + sha256sum`, so the chmod
-        # happens in the buildCommand below instead.
-        pkgs.fetchurl {
-          url = spec.url;
-          sha256 = spec.sha256;
-        };
+      # Builder-VM runtime packages — mirrors the curated set in
+      # `nix/images/builder-vm/flake.nix` so the ur-seed has the same
+      # runtime shape as the steady-state builder VM. Includes real
+      # `nix` (not nix-portable), so cmd.sh's `nix build` works
+      # unchanged. The closure is large (~400 MiB rootfs) but
+      # produces a single-bootstrap path that doesn't need to grow
+      # piecemeal as new in-VM tools surface (bash, env, proot, …).
+      urSeedPackages =
+        pkgs: with pkgs; [
+          bashInteractive
+          coreutils
+          gnugrep
+          gnused
+          gawk
+          findutils
+          which
+          nix
+          git
+          gnumake
+          curl
+          jq
+          iproute2
+          iptables
+          e2fsprogs
+          util-linux
+        ];
 
       # mvm-builder-init, statically linked against musl. Embedded
       # in the ur-seed at /sbin/mvm-builder-init as PID 1.
@@ -241,18 +235,39 @@
           pkgs = import nixpkgs { inherit system; };
           builderInit = mvmBuilderInitStaticFor system;
           busybox = pkgs.pkgsStatic.busybox;
-          nixPortable = nixPortableFor system;
           urSeedInit = urSeedInitFor system;
 
-          # Stock nixpkgs kernel — matches the dev image flake's kernel
-          # (`nix/images/builder/flake.nix:150`) so an ur-seed booted
-          # with the dev image's vmlinux finds compatible
-          # `/lib/modules/<kver>/` entries. The TSI-patched builder VM
-          # kernel (`nix/images/builder-vm/kernel/`) doesn't change
-          # the version, only the patches — same module tree applies.
-          kernelPkg = pkgs.linuxPackages.kernel;
+          # TSI-patched kernel from nix/images/builder-vm/kernel/.
+          # libkrun routes AF_INET sockets through TSI (Transparent
+          # Socket Impersonation), which requires guest-side kernel
+          # patches that aren't upstream. The stock nixpkgs kernel —
+          # what the dev image flake ships today — makes `nix build`
+          # fail with "Could not resolve host" inside the guest
+          # (Plan 72 W5.D bullet 10).
+          #
+          # The ur-seed ships its own TSI kernel + matching module
+          # tree alongside the rootfs so Stage 0 has a self-contained
+          # bootable environment, independent of whatever kernel the
+          # contributor's dev image happens to ship.
+          kernelPkg = import (workspace + "/nix/images/builder-vm/kernel") { inherit pkgs; };
           kernelModules =
             if kernelPkg ? modules then kernelPkg.modules else kernelPkg;
+
+          # Full closure of runtime packages mirroring the steady-state
+          # builder VM. The closure is symlinked into /usr/local/bin
+          # and /sbin (Plan 72 W5.D bullets 4 + 5) so absolute-path
+          # call sites + PATH lookups both resolve.
+          packages = urSeedPackages pkgs;
+
+          # closureInfo materialises the complete /nix/store closure
+          # for the runtime packages as a derivation containing a
+          # `store-paths` file the build script can iterate over.
+          # This is the Nix-sandbox-friendly way to enumerate the
+          # transitive closure (the `nix-store --query --requisites`
+          # path needs daemon access which the sandbox forbids).
+          packagesClosure = pkgs.closureInfo {
+            rootPaths = packages;
+          };
 
           # Manifest mirrors the dev-image manifest shape so the
           # existing seed-contract validator can read either source
@@ -269,8 +284,7 @@
             image_kind = "ur-seed";
             init_paths = [ "/sbin/mvm-builder-init" "/sbin/ur-seed-init" ];
             origin = "ur-seed";
-            ur_seed_version = "0.1.0";
-            nix_portable_pin = nixPortablePin.version;
+            ur_seed_version = "0.2.0";
             system = system;
           });
 
@@ -338,19 +352,44 @@
             cp ${urSeedInit} $staging/sbin/ur-seed-init
             chmod +x $staging/sbin/ur-seed-init
 
-            # nix-portable + a `nix` wrapper so the existing Plan 77
-            # Stage 0 cmd.sh ("nix build path:/work#...") finds an
-            # invokable `nix` on PATH. nix-portable dispatches based
-            # on argv[0] when symlinked, but explicit wrappers are
-            # cheaper to reason about than version-dependent behavior.
-            cp ${nixPortable} $staging/usr/local/bin/nix-portable
-            chmod +x $staging/usr/local/bin/nix-portable
+            # Stage the full Nix closure for the runtime packages
+            # under /nix/store so dynamically-linked binaries resolve
+            # their dependencies. closureInfo's `store-paths` file
+            # enumerates the transitive closure inside the sandbox.
+            mkdir -p $staging/nix/store
+            while read -r dep; do
+              if [ ! -e "$staging$dep" ]; then
+                mkdir -p "$staging$(dirname "$dep")"
+                cp -aL "$dep" "$staging$dep"
+              fi
+            done < ${packagesClosure}/store-paths
 
-            cat > $staging/usr/local/bin/nix <<'WRAPPER'
-            #!/bin/sh
-            exec /usr/local/bin/nix-portable nix "$@"
-            WRAPPER
-            chmod +x $staging/usr/local/bin/nix
+            # Plan 72 W5.D bullet 4 + 5: symlink every root package's
+            # bin/* and sbin/* into BOTH /usr/local/bin and /sbin so
+            # both absolute-path call sites (`/sbin/mkfs.ext4`) and
+            # PATH lookups (`Command::new("iptables")`) resolve.
+            for pkg in ${pkgs.lib.concatStringsSep " " (map (p: ''"${p}"'') packages)}; do
+              for subdir in bin sbin; do
+                if [ -d "$pkg/$subdir" ]; then
+                  for bin in "$pkg/$subdir"/*; do
+                    [ -e "$bin" ] || continue
+                    name=$(basename "$bin")
+                    # Don't overwrite earlier package's binary if it
+                    # already exists — first-package-wins keeps the
+                    # symlink target stable.
+                    [ -e "$staging/usr/local/bin/$name" ] || \
+                      ln -sf "$bin" "$staging/usr/local/bin/$name"
+                    [ -e "$staging/sbin/$name" ] || \
+                      ln -sf "$bin" "$staging/sbin/$name"
+                  done
+                fi
+              done
+            done
+
+            # /usr/bin/env — many scripts (including nix's wrappers
+            # and shebang-driven helpers) use `#!/usr/bin/env <prog>`.
+            mkdir -p $staging/usr/bin
+            ln -sf /bin/busybox $staging/usr/bin/env
 
             # /etc minimal config (libc resolvers + nix-portable's
             # internal getpwuid work even before any real /etc setup).
@@ -377,15 +416,32 @@
               fi
             done
 
-            # rootfs.ext4 sized at 768 MiB — fits the kernel module
-            # tree (~200 MiB), nix-portable (~80 MiB), busybox (~1 MiB),
-            # plus working room for nix-portable's HOME extraction.
-            truncate -s 768M $out/rootfs.ext4
+            # rootfs.ext4 sized at 2 GiB — fits the runtime package
+            # closure (nix + bash + e2fsprogs + iptables + glibc =
+            # ~400 MiB), the kernel module tree (~200 MiB), busybox
+            # (~1 MiB), plus working room. Sparse-allocated, so the
+            # tarball stays compressed-small.
+            truncate -s 2G $out/rootfs.ext4
             mkfs.ext4 -F -d $staging -L mvm-ur-seed $out/rootfs.ext4
 
             # Out-of-band sidecars the host needs.
             cp ${manifestJson}      $out/manifest.json
             cp ${urSeedCmdlineFile} $out/cmdline.txt
+
+            # TSI-patched kernel — ship alongside the rootfs so Stage 0
+            # has a self-contained, libkrun-compatible boot pair.
+            kernelFile=
+            for cand in Image bzImage; do
+              if [ -f "${kernelPkg}/$cand" ]; then
+                kernelFile="${kernelPkg}/$cand"
+                break
+              fi
+            done
+            if [ -z "$kernelFile" ]; then
+              echo "kernel package ${kernelPkg} did not produce Image or bzImage" >&2
+              exit 1
+            fi
+            cp "$kernelFile" $out/vmlinux
 
             # Pack the artifact set into a single tarball for
             # `mvmctl dev fetch-ur-seed` / `import-ur-seed`.
@@ -393,6 +449,7 @@
             cp $out/rootfs.ext4    $out/tarball/
             cp $out/manifest.json  $out/tarball/
             cp $out/cmdline.txt    $out/tarball/
+            cp $out/vmlinux        $out/tarball/
             tar -C $out/tarball -czf $out/ur-seed-${system}.tar.gz .
 
             # Emit a sha256 sidecar — fetch-ur-seed verifies against it.

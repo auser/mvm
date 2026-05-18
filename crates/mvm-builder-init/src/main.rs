@@ -163,6 +163,24 @@ mod linux {
     pub fn run() -> ExitCode {
         eprintln!("mvm-builder-init: pid 1 starting");
 
+        // The Linux kernel doesn't pass a PATH to PID 1, so without
+        // this every `Command::new("iptables")` /
+        // `Command::new("modprobe")` style spawn relies on the
+        // child to find its binary — which fails on a stock rootfs
+        // (Plan 86 / ADR-054). Set a canonical PATH that covers the
+        // mvm builder VM rootfs layout (busybox + extra packages in
+        // /sbin + /usr/local/bin) before any spawn site runs.
+        // Absolute-path call sites (`/sbin/mkfs.ext4`, `/sbin/udhcpc`)
+        // are unaffected.
+        // SAFETY: PID 1 is single-threaded until we spawn the fan-out
+        // tracks below; no other thread can be reading the env yet.
+        unsafe {
+            std::env::set_var(
+                "PATH",
+                "/usr/local/sbin:/usr/local/bin:/sbin:/usr/sbin:/bin:/usr/bin",
+            );
+        }
+
         // Plan 76 Phase 5: anchor the boot-timings clock as close
         // to init entry as we can. The few ms of `eprintln!` +
         // module dispatch above this point are constant across
