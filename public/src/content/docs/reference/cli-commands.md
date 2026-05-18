@@ -181,6 +181,9 @@ stores AES-256-GCM encrypted records with mode-0600 files and a mode-0600 local
 store key. Auto backend mode keeps file-backed secrets visible when the OS
 keyring is reachable, so a backend probe change cannot hide an existing secret.
 Legacy plaintext file records are refused; replace them with `secret put`.
+Secret audit entries in `~/.mvm/audit/secrets.jsonl` record the operation
+metadata plus `secret_visibility: "write_only"` and
+`storage_security: "encrypted_at_rest"`; secret values are never logged.
 
 ## Policy Contracts
 
