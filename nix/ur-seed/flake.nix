@@ -125,6 +125,12 @@
           iptables-legacy
           e2fsprogs
           util-linux
+          # CA cert bundle — the Plan 72 cmd.sh script sets
+          # `CURL_CA_BUNDLE=/etc/ssl/certs/ca-bundle.crt` /
+          # `NIX_SSL_CERT_FILE=…` etc. so nix's curl can verify the
+          # cache.nixos.org TLS chain. Without `pkgs.cacert` shipped,
+          # nix bails with "Problem with the SSL CA cert".
+          cacert
         ];
 
       # mvm-builder-init, statically linked against musl. Embedded
@@ -398,6 +404,15 @@
             # and shebang-driven helpers) use `#!/usr/bin/env <prog>`.
             mkdir -p $staging/usr/bin
             ln -sf /bin/busybox $staging/usr/bin/env
+
+            # /etc/ssl/certs/ca-bundle.crt — the cmd.sh in
+            # `mvm-build::libkrun_builder` exports CURL_CA_BUNDLE /
+            # NIX_SSL_CERT_FILE / SSL_CERT_FILE pointing at this path.
+            # Symlink to the cacert store path so nix's curl can
+            # verify cache.nixos.org's TLS chain.
+            mkdir -p $staging/etc/ssl/certs
+            ln -sf ${pkgs.cacert}/etc/ssl/certs/ca-bundle.crt \
+                   $staging/etc/ssl/certs/ca-bundle.crt
 
             # /etc minimal config (libc resolvers + nix-portable's
             # internal getpwuid work even before any real /etc setup).
