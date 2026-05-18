@@ -10,7 +10,8 @@
 //!
 //! - [`FileSecretStore`] — primary; works on every supported host.
 //!   Each secret lives at `<base>/<tenant>/<name>` with mode 0600,
-//!   parent dirs mode 0700. Enumeration is a directory scan.
+//!   parent dirs mode 0700, and AES-256-GCM encrypted contents.
+//!   Enumeration is a directory scan.
 //! - [`KeyringSecretStore`] — used when the OS-native keystore is
 //!   reachable. Each secret lives at the keyring entry
 //!   `(service="mvm-secrets", user="<tenant>:<name>")`. An index
@@ -18,9 +19,11 @@
 //!   doesn't depend on backend-specific enumeration (the `keyring`
 //!   crate's enumeration is uneven across backends).
 //!
-//! [`default_secret_store`] auto-picks Keyring if reachable, else
-//! File. Set `MVM_SECRET_STORE_BACKEND=file` to pin the file
-//! backend (escape hatch for hosts where the keyring's
+//! [`default_secret_store`] auto-picks an aggregate backend when
+//! Keyring is reachable: writes prefer Keyring, while reads,
+//! listing, and deletion keep file-backed secrets visible. Set
+//! `MVM_SECRET_STORE_BACKEND=file` to pin the file backend
+//! (escape hatch for hosts where the keyring's
 //! reachability probe lies — Linux CI runners with `libsecret`
 //! headers but no live `secret-service` daemon are the canonical
 //! case).
@@ -32,7 +35,7 @@
 //! is the strongest at-rest protection available on a non-attested
 //! host. But CI Linux runners typically have no D-Bus session;
 //! `FileSecretStore` is the dependable fallback that works
-//! everywhere.
+//! everywhere, but values are still encrypted before touching disk.
 //!
 //! ## What this module does NOT do
 //!
@@ -40,22 +43,22 @@
 //!   `KeystoreReleaser` (plan-37 §12.2). This module is the
 //!   operator-facing CRUD surface; the supervisor pulls from it at
 //!   admission.
-//! - **Encrypt-at-rest for `FileSecretStore`.** v0 stores raw bytes
-//!   at mode 0600. Encryption layers on once the keyring is the
-//!   primary backend or operators opt into a master-key wrapping
-//!   scheme (W5-adjacent). Documented in ADR-039.
 //! - **Multi-host replication.** Single-host only; mvmd's secret
 //!   service handles fleets.
 
 use std::fs;
 use std::io::Write;
 use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result};
+use rand::RngCore;
 use secrecy::{ExposeSecret, SecretBox};
+use sha2::{Digest, Sha256};
+use zeroize::Zeroizing;
 
 use crate::keystore::validate_shell_id;
+use crate::snapshot_crypto;
 
 /// Service name for OS-native keyring entries. Distinct from
 /// `mvm_security::keystore::KEYRING_SERVICE` so per-tenant master
@@ -69,6 +72,11 @@ pub fn default_secrets_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("$HOME unset; cannot locate ~/.mvm/secrets/")?;
     Ok(PathBuf::from(home).join(".mvm").join("secrets"))
 }
+
+const FILE_SECRET_MAGIC: &[u8] = b"MVMS1\0";
+const FILE_STORE_KEY_FILENAME: &str = ".secret-store.key";
+const FILE_STORE_KEYRING_SERVICE: &str = "mvm-secret-store";
+const FILE_STORE_KEYRING_USER: &str = "file-backend-key";
 
 /// Multi-key tenant-scoped secret store. Separate from
 /// [`crate::keystore::KeyProvider`] (which is single-key, tenant-
@@ -102,11 +110,26 @@ pub trait SecretStore: Send + Sync {
 /// first write.
 pub struct FileSecretStore {
     base: PathBuf,
+    key_path: PathBuf,
+    keyring_user: String,
+    use_keyring_key: bool,
 }
 
 impl FileSecretStore {
     pub fn with_dir(base: impl Into<PathBuf>) -> Self {
-        Self { base: base.into() }
+        Self::with_dir_and_keyring(base, false)
+    }
+
+    fn with_dir_and_keyring(base: impl Into<PathBuf>, use_keyring_key: bool) -> Self {
+        let base = base.into();
+        let key_path = default_key_path_for_base(&base);
+        let keyring_user = keyring_user_for_base(&base);
+        Self {
+            base,
+            key_path,
+            keyring_user,
+            use_keyring_key,
+        }
     }
 
     fn tenant_dir(&self, tenant: &str) -> Result<PathBuf> {
@@ -129,6 +152,15 @@ impl FileSecretStore {
                 .with_context(|| format!("chmod 0700 {}", dir.display()))?;
         }
         Ok(dir)
+    }
+
+    fn load_or_init_key(&self) -> Result<SecretBox<Vec<u8>>> {
+        if self.use_keyring_key
+            && let Ok(key) = load_or_init_keyring_key(&self.keyring_user)
+        {
+            return Ok(key);
+        }
+        load_or_init_file_key(&self.key_path)
     }
 }
 
@@ -156,7 +188,11 @@ impl SecretStore for FileSecretStore {
                 .mode(0o600)
                 .open(&tmp)
                 .with_context(|| format!("creating {}", tmp.display()))?;
-            f.write_all(value.expose_secret().as_bytes())
+            let key = self.load_or_init_key()?;
+            let encoded =
+                encrypt_file_secret(value.expose_secret().as_bytes(), key.expose_secret())
+                    .context("encrypting secret for file store")?;
+            f.write_all(&encoded)
                 .with_context(|| format!("writing {}", tmp.display()))?;
             f.sync_all().ok();
         }
@@ -179,7 +215,10 @@ impl SecretStore for FileSecretStore {
         }
         let bytes =
             fs::read(&path).with_context(|| format!("reading secret {}", path.display()))?;
-        let s = String::from_utf8(bytes)
+        let key = self.load_or_init_key()?;
+        let plaintext = decrypt_file_secret(&bytes, key.expose_secret())
+            .with_context(|| format!("decrypting secret {}", path.display()))?;
+        let s = String::from_utf8(plaintext)
             .with_context(|| format!("secret {} is not valid UTF-8", path.display()))?;
         Ok(SecretBox::new(Box::new(s)))
     }
@@ -205,11 +244,147 @@ impl SecretStore for FileSecretStore {
             if name.ends_with(".tmp") {
                 continue;
             }
+            if name == FILE_STORE_KEY_FILENAME {
+                continue;
+            }
             names.push(name);
         }
         names.sort();
         Ok(names)
     }
+}
+
+fn default_key_path_for_base(base: &Path) -> PathBuf {
+    if base.file_name().is_some_and(|name| name == "secrets")
+        && let Some(parent) = base.parent()
+    {
+        return parent.join(FILE_STORE_KEY_FILENAME);
+    }
+    base.join(FILE_STORE_KEY_FILENAME)
+}
+
+fn keyring_user_for_base(base: &Path) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(base.as_os_str().as_encoded_bytes());
+    format!(
+        "{}:{}",
+        FILE_STORE_KEYRING_USER,
+        hex_encode(&hasher.finalize())
+    )
+}
+
+fn load_or_init_keyring_key(user: &str) -> Result<SecretBox<Vec<u8>>> {
+    let entry = keyring::Entry::new(FILE_STORE_KEYRING_SERVICE, user)
+        .context("opening file secret-store keyring entry")?;
+    match entry.get_password() {
+        Ok(hex) => {
+            let key = hex_decode(&hex).context("decoding file secret-store key")?;
+            validate_file_store_key_len(&key)?;
+            Ok(SecretBox::new(Box::new(key)))
+        }
+        Err(keyring::Error::NoEntry) => {
+            let mut key = Zeroizing::new(vec![0u8; snapshot_crypto::KEY_SIZE]);
+            rand::thread_rng().fill_bytes(&mut key);
+            let encoded = hex_encode(&key);
+            entry
+                .set_password(&encoded)
+                .context("writing file secret-store keyring entry")?;
+            Ok(SecretBox::new(Box::new(key.to_vec())))
+        }
+        Err(err) => Err(err).context("reading file secret-store keyring entry"),
+    }
+}
+
+fn load_or_init_file_key(path: &Path) -> Result<SecretBox<Vec<u8>>> {
+    match fs::metadata(path) {
+        Ok(meta) => {
+            let mode = meta.permissions().mode() & 0o777;
+            if mode != 0o600 {
+                anyhow::bail!(
+                    "secret-store key {} has mode 0{mode:o}; require 0600",
+                    path.display()
+                );
+            }
+            let key = fs::read(path)
+                .with_context(|| format!("reading secret-store key {}", path.display()))?;
+            validate_file_store_key_len(&key)?;
+            Ok(SecretBox::new(Box::new(key)))
+        }
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            if let Some(parent) = path.parent() {
+                fs::create_dir_all(parent)
+                    .with_context(|| format!("creating {}", parent.display()))?;
+                fs::set_permissions(parent, fs::Permissions::from_mode(0o700))
+                    .with_context(|| format!("chmod 0700 {}", parent.display()))?;
+            }
+            let mut key = Zeroizing::new(vec![0u8; snapshot_crypto::KEY_SIZE]);
+            rand::thread_rng().fill_bytes(&mut key);
+            {
+                let mut f = fs::OpenOptions::new()
+                    .write(true)
+                    .create_new(true)
+                    .mode(0o600)
+                    .open(path)
+                    .with_context(|| format!("creating secret-store key {}", path.display()))?;
+                f.write_all(&key)
+                    .with_context(|| format!("writing secret-store key {}", path.display()))?;
+                f.sync_all().ok();
+            }
+            Ok(SecretBox::new(Box::new(key.to_vec())))
+        }
+        Err(e) => Err(e).with_context(|| format!("stat secret-store key {}", path.display())),
+    }
+}
+
+fn validate_file_store_key_len(key: &[u8]) -> Result<()> {
+    if key.len() != snapshot_crypto::KEY_SIZE {
+        anyhow::bail!(
+            "secret-store key must be {} bytes, got {}",
+            snapshot_crypto::KEY_SIZE,
+            key.len()
+        );
+    }
+    Ok(())
+}
+
+fn encrypt_file_secret(plaintext: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    let ciphertext = snapshot_crypto::encrypt(plaintext, key)?;
+    let mut out = Vec::with_capacity(FILE_SECRET_MAGIC.len() + ciphertext.len());
+    out.extend_from_slice(FILE_SECRET_MAGIC);
+    out.extend_from_slice(&ciphertext);
+    Ok(out)
+}
+
+fn decrypt_file_secret(encoded: &[u8], key: &[u8]) -> Result<Vec<u8>> {
+    let ciphertext = encoded.strip_prefix(FILE_SECRET_MAGIC).ok_or_else(|| {
+        anyhow::anyhow!(
+            "legacy plaintext or unknown secret-store record; replace it with `mvmctl secret put`"
+        )
+    })?;
+    snapshot_crypto::decrypt(ciphertext, key)
+}
+
+fn hex_decode(hex: &str) -> Result<Vec<u8>> {
+    if !hex.len().is_multiple_of(2) {
+        anyhow::bail!("hex string has odd length: {}", hex.len());
+    }
+    let mut bytes = Vec::with_capacity(hex.len() / 2);
+    for chunk in hex.as_bytes().chunks(2) {
+        let s = std::str::from_utf8(chunk)?;
+        let byte = u8::from_str_radix(s, 16).with_context(|| format!("invalid hex byte: {s}"))?;
+        bytes.push(byte);
+    }
+    Ok(bytes)
+}
+
+fn hex_encode(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for &byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }
 
 /// OS-native keystore backend. Each secret entry lives at
@@ -358,7 +533,11 @@ pub const BACKEND_ENV: &str = "MVM_SECRET_STORE_BACKEND";
 /// pin the file backend up-front.
 pub fn default_secret_store() -> Box<dyn SecretStore> {
     match std::env::var(BACKEND_ENV).ok().as_deref() {
-        Some(v) if v.eq_ignore_ascii_case("file") => return Box::new(FileSecretStore::default()),
+        Some(v) if v.eq_ignore_ascii_case("file") => {
+            let base =
+                default_secrets_dir().unwrap_or_else(|_| PathBuf::from(".mvm").join("secrets"));
+            return Box::new(FileSecretStore::with_dir(base));
+        }
         Some(v) if v.eq_ignore_ascii_case("keyring") => {
             return Box::new(KeyringSecretStore::default());
         }
@@ -398,6 +577,93 @@ mod tests {
             .unwrap();
         let got = store.get("acme", "api_token").unwrap();
         assert_eq!(got.expose_secret(), "supersecret-xyz");
+    }
+
+    #[test]
+    fn file_put_stores_ciphertext_not_plaintext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::with_dir(tmp.path());
+        store
+            .put("acme", "api_token", &mk_value("supersecret-xyz"))
+            .unwrap();
+        let path = tmp.path().join("acme").join("api_token");
+        let raw = fs::read(path).unwrap();
+        assert!(raw.starts_with(FILE_SECRET_MAGIC));
+        assert!(
+            !String::from_utf8_lossy(&raw).contains("supersecret-xyz"),
+            "plaintext leaked into file-backed secret record"
+        );
+    }
+
+    #[test]
+    fn file_get_rejects_tampered_ciphertext() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::with_dir(tmp.path());
+        store.put("acme", "k", &mk_value("v")).unwrap();
+        let path = tmp.path().join("acme").join("k");
+        let mut raw = fs::read(&path).unwrap();
+        let last = raw.last_mut().expect("encrypted record is non-empty");
+        *last ^= 0xff;
+        fs::write(&path, raw).unwrap();
+        let err = store.get("acme", "k").unwrap_err();
+        assert!(err.to_string().contains("decrypting secret"), "got: {err}");
+    }
+
+    #[test]
+    fn file_get_rejects_legacy_plaintext_record() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::with_dir(tmp.path());
+        let dir = tmp.path().join("acme");
+        fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("k");
+        fs::write(&path, b"plaintext").unwrap();
+        fs::set_permissions(&path, fs::Permissions::from_mode(0o600)).unwrap();
+        let err = store.get("acme", "k").unwrap_err();
+        let err = format!("{err:#}");
+        assert!(
+            err.contains("legacy plaintext") || err.contains("unknown secret-store record"),
+            "got: {err}"
+        );
+    }
+
+    #[test]
+    fn file_store_key_is_created_at_0600() {
+        let tmp = tempfile::tempdir().unwrap();
+        let store = FileSecretStore::with_dir(tmp.path());
+        store.put("acme", "k", &mk_value("v")).unwrap();
+        let mode = fs::metadata(tmp.path().join(FILE_STORE_KEY_FILENAME))
+            .unwrap()
+            .permissions()
+            .mode()
+            & 0o777;
+        assert_eq!(mode, 0o600);
+    }
+
+    #[test]
+    fn file_store_key_with_loose_permissions_is_refused() {
+        let tmp = tempfile::tempdir().unwrap();
+        let key_path = tmp.path().join(FILE_STORE_KEY_FILENAME);
+        fs::write(&key_path, [0u8; snapshot_crypto::KEY_SIZE]).unwrap();
+        fs::set_permissions(&key_path, fs::Permissions::from_mode(0o644)).unwrap();
+        let store = FileSecretStore::with_dir(tmp.path());
+        let err = store.put("acme", "k", &mk_value("v")).unwrap_err();
+        assert!(err.to_string().contains("require 0600"), "got: {err}");
+    }
+
+    #[test]
+    fn file_store_key_hex_round_trips() {
+        let bytes = [0x00, 0x7f, 0x80, 0xff];
+        let encoded = hex_encode(&bytes);
+        assert_eq!(encoded, "007f80ff");
+        assert_eq!(hex_decode(&encoded).unwrap(), bytes);
+    }
+
+    #[test]
+    fn file_store_keyring_user_is_scoped_to_base_path() {
+        let first = keyring_user_for_base(Path::new("/tmp/mvm-a/secrets"));
+        let second = keyring_user_for_base(Path::new("/tmp/mvm-b/secrets"));
+        assert_ne!(first, second);
+        assert!(first.starts_with(FILE_STORE_KEYRING_USER));
     }
 
     #[test]

@@ -175,7 +175,10 @@ The intentionally kept top-level command families are:
 
 Secret values are write-only through the CLI after storage: `get` is a presence
 check and never emits the raw value. Replace a secret by running `secret put`
-again with the same name.
+again with the same name. Local secret storage is encrypted at rest: the OS
+keyring backend stores values in the platform keystore, and the file fallback
+stores AES-256-GCM encrypted records with mode-0600 files. Legacy plaintext
+file records are refused; replace them with `secret put`.
 
 ## Policy Contracts
 
