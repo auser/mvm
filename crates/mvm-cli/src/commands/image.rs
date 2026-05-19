@@ -1,11 +1,18 @@
-//! `mvmctl image` - inspect and prune the local OCI image cache.
+//! `mvmctl image` - pull, inspect, and prune the local OCI image cache.
 
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
+use std::io::Cursor;
 use std::path::{Component, Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use clap::{Args as ClapArgs, Subcommand};
+use flate2::read::GzDecoder;
+use mvm_build::rootfs::{MaterializeExt4Input, MaterializeExt4Options, materialize_ext4};
+use mvm_oci::{
+    ImageReference, LayerDescriptor, LayerFetchOptions, LinuxPlatform, OciLayerFetcher,
+    OciManifestFetcher, UnpackOptions, unpack_layer, verify_sha256_digest,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -25,6 +32,14 @@ pub(in crate::commands) struct Args {
 
 #[derive(Subcommand, Debug, Clone)]
 pub(in crate::commands) enum ImageAction {
+    /// Pull, unpack, and materialize an OCI image into the local cache
+    Pull {
+        /// OCI image reference
+        reference: String,
+        /// Production policy: require an immutable digest-pinned reference
+        #[arg(long)]
+        prod: bool,
+    },
     /// List cached OCI images
     Ls {
         /// Filter cached images by registry host
@@ -120,6 +135,27 @@ struct RemoveOutcome {
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
     let cache_root = oci_cache_root();
     match args.action {
+        ImageAction::Pull { reference, prod } => {
+            let image = pull_image(&cache_root, &reference, prod)?;
+            mvm_core::audit_emit!(
+                ImageFetch,
+                "source=image_pull reference={} digest={} prod={}",
+                image.reference,
+                image.resolved_digest,
+                prod
+            );
+            ui::success(&format!(
+                "Pulled {} -> {}",
+                image.reference, image.resolved_digest
+            ));
+            if let Some(rootfs_path) = image.rootfs_path {
+                ui::info(&format!(
+                    "Rootfs: {}",
+                    cache_root.join(rootfs_path).display()
+                ));
+            }
+            Ok(())
+        }
         ImageAction::Ls { registry, json } => {
             let rows = list_rows(&cache_root, registry.as_deref())?;
             if json {
@@ -160,6 +196,185 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
 
 fn oci_cache_root() -> PathBuf {
     PathBuf::from(mvm_core::config::mvm_cache_dir()).join("oci")
+}
+
+fn pull_image(cache_root: &Path, reference: &str, prod: bool) -> Result<CachedOciImage> {
+    let image_ref: ImageReference = reference.parse()?;
+    if prod && !image_ref.is_digest_pinned() {
+        bail!("mvmctl image pull --prod requires a digest-pinned reference");
+    }
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .context("build Tokio runtime for OCI pull")?;
+
+    let manifest_fetcher = OciManifestFetcher::new();
+    let manifest = runtime
+        .block_on(
+            manifest_fetcher
+                .fetch_linux_platform_manifest(&image_ref, &LinuxPlatform::for_current_arch()),
+        )
+        .context("fetch OCI image manifest")?;
+    let layers = manifest.layers().context("parse OCI image layers")?;
+    if layers.is_empty() {
+        bail!(
+            "OCI image manifest has no layers: {}",
+            image_ref.canonical()
+        );
+    }
+
+    let manifest_hex = sha256_hex(&manifest.digest)?;
+    let manifest_path = format!("manifests/{manifest_hex}.json");
+    write_cache_file(cache_root, &manifest_path, &manifest.bytes)?;
+
+    let config_path = write_config_blob(
+        cache_root,
+        &runtime,
+        &manifest_fetcher,
+        &image_ref,
+        &manifest.bytes,
+    )?;
+    let layer_fetcher =
+        OciLayerFetcher::from_manifest_fetcher(&manifest_fetcher, LayerFetchOptions::default());
+    let unpacked_root = cache_root.join("unpacked").join(&manifest_hex);
+    if unpacked_root.exists() {
+        fs::remove_dir_all(&unpacked_root)
+            .with_context(|| format!("remove stale unpacked root {}", unpacked_root.display()))?;
+    }
+    fs::create_dir_all(&unpacked_root)
+        .with_context(|| format!("create {}", unpacked_root.display()))?;
+
+    let mut cached_layers = Vec::with_capacity(layers.len());
+    for layer in &layers {
+        let compressed =
+            fetch_or_read_layer(cache_root, &runtime, &layer_fetcher, &image_ref, layer)
+                .with_context(|| format!("fetch layer {}", layer.digest))?;
+        unpack_layer_bytes(layer, &compressed, &unpacked_root)
+            .with_context(|| format!("unpack layer {}", layer.digest))?;
+        cached_layers.push(CachedOciLayer {
+            digest: layer.digest.clone(),
+            size_bytes: layer.size,
+            path: Some(layer_blob_path(&layer.digest)?),
+        });
+    }
+
+    let unpacked_size = unpacked_tree_size(&unpacked_root)
+        .with_context(|| format!("measure unpacked root {}", unpacked_root.display()))?;
+    let rootfs_path = format!("rootfs/{manifest_hex}/rootfs.ext4");
+    let rootfs_abs = cache_root.join(&rootfs_path);
+    materialize_ext4(
+        &MaterializeExt4Input::new(unpacked_root, rootfs_abs, unpacked_size),
+        &MaterializeExt4Options::default(),
+    )
+    .context("materialize OCI rootfs.ext4")?;
+
+    let mut index = load_index(cache_root)?;
+    let cached = CachedOciImage {
+        reference: image_ref.canonical(),
+        registry: image_ref.registry.clone(),
+        repository: image_ref.repository.clone(),
+        tag: image_ref.tag.clone(),
+        resolved_digest: manifest.digest.clone(),
+        fetched_at: chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Secs, true),
+        manifest_path,
+        config_path,
+        rootfs_path: Some(rootfs_path),
+        claims_path: None,
+        layers: cached_layers,
+    };
+    upsert_image(&mut index, cached.clone());
+    save_index(cache_root, &index)?;
+    Ok(cached)
+}
+
+fn write_config_blob(
+    cache_root: &Path,
+    runtime: &tokio::runtime::Runtime,
+    manifest_fetcher: &OciManifestFetcher,
+    image_ref: &ImageReference,
+    manifest_bytes: &[u8],
+) -> Result<Option<String>> {
+    let Some(config) = manifest_config_descriptor(manifest_bytes)? else {
+        return Ok(None);
+    };
+    let config_path = format!("configs/{}.json", sha256_hex(&config.digest)?);
+    if let Some(bytes) = read_verified_cache_file(cache_root, &config_path, &config.digest)?
+        && serde_json::from_slice::<Value>(&bytes).is_ok()
+    {
+        return Ok(Some(config_path));
+    }
+
+    let fetcher =
+        OciLayerFetcher::from_manifest_fetcher(manifest_fetcher, LayerFetchOptions::default());
+    let mut bytes = Vec::new();
+    runtime
+        .block_on(fetcher.fetch_layer(image_ref, &config, &mut bytes))
+        .context("fetch OCI image config blob")?;
+    write_cache_file(cache_root, &config_path, &bytes)?;
+    Ok(Some(config_path))
+}
+
+fn manifest_config_descriptor(manifest_bytes: &[u8]) -> Result<Option<LayerDescriptor>> {
+    let value: Value = serde_json::from_slice(manifest_bytes).context("parse manifest JSON")?;
+    let Some(config) = value.get("config").and_then(Value::as_object) else {
+        return Ok(None);
+    };
+    let digest = config
+        .get("digest")
+        .and_then(Value::as_str)
+        .context("manifest config missing digest")?
+        .to_string();
+    let media_type = config
+        .get("mediaType")
+        .and_then(Value::as_str)
+        .unwrap_or("application/vnd.oci.image.config.v1+json")
+        .to_string();
+    let size = config.get("size").and_then(Value::as_u64).unwrap_or(0);
+    Ok(Some(LayerDescriptor {
+        digest,
+        size,
+        media_type,
+    }))
+}
+
+fn fetch_or_read_layer(
+    cache_root: &Path,
+    runtime: &tokio::runtime::Runtime,
+    fetcher: &OciLayerFetcher,
+    image_ref: &ImageReference,
+    layer: &LayerDescriptor,
+) -> Result<Vec<u8>> {
+    let path = layer_blob_path(&layer.digest)?;
+    if let Some(bytes) = read_verified_cache_file(cache_root, &path, &layer.digest)? {
+        return Ok(bytes);
+    }
+    let mut bytes = Vec::new();
+    runtime.block_on(fetcher.fetch_layer(image_ref, layer, &mut bytes))?;
+    write_cache_file(cache_root, &path, &bytes)?;
+    Ok(bytes)
+}
+
+fn unpack_layer_bytes(layer: &LayerDescriptor, bytes: &[u8], unpacked_root: &Path) -> Result<()> {
+    let report = if is_gzip_layer(&layer.media_type) {
+        unpack_layer(
+            GzDecoder::new(Cursor::new(bytes)),
+            unpacked_root,
+            &UnpackOptions::default(),
+        )
+    } else {
+        unpack_layer(Cursor::new(bytes), unpacked_root, &UnpackOptions::default())
+    }?;
+    if !report.refused.is_empty() {
+        bail!("layer unpack refused entries: {:?}", report.refused);
+    }
+    Ok(())
+}
+
+fn is_gzip_layer(media_type: &str) -> bool {
+    media_type.ends_with("+gzip")
+        || media_type.ends_with(".gzip")
+        || media_type.contains("tar.gzip")
 }
 
 fn list_rows(cache_root: &Path, registry: Option<&str>) -> Result<Vec<ImageListRow>> {
@@ -267,6 +482,76 @@ fn save_index(cache_root: &Path, index: &OciCacheIndex) -> Result<()> {
     let path = cache_root.join(INDEX_FILE);
     let bytes = serde_json::to_vec_pretty(index).context("serialize OCI cache index")?;
     fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))
+}
+
+fn read_verified_cache_file(
+    cache_root: &Path,
+    relative: &str,
+    digest: &str,
+) -> Result<Option<Vec<u8>>> {
+    let path = safe_cache_path(cache_root, relative)?;
+    if !path.exists() {
+        return Ok(None);
+    }
+    let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
+    verify_sha256_digest(&bytes, digest)
+        .with_context(|| format!("verify cached blob {}", path.display()))?;
+    Ok(Some(bytes))
+}
+
+fn write_cache_file(cache_root: &Path, relative: &str, bytes: &[u8]) -> Result<()> {
+    let path = safe_cache_path(cache_root, relative)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).with_context(|| format!("create {}", parent.display()))?;
+    }
+    fs::write(&path, bytes).with_context(|| format!("write {}", path.display()))
+}
+
+fn layer_blob_path(digest: &str) -> Result<String> {
+    Ok(format!("blobs/sha256/{}", sha256_hex(digest)?))
+}
+
+fn sha256_hex(digest: &str) -> Result<String> {
+    let Some(hex) = digest.strip_prefix("sha256:") else {
+        bail!("unsupported digest algorithm in {digest:?}");
+    };
+    if hex.len() != 64
+        || !hex
+            .bytes()
+            .all(|b| b.is_ascii_hexdigit() && !b.is_ascii_uppercase())
+    {
+        bail!("malformed sha256 digest: {digest:?}");
+    }
+    Ok(hex.to_string())
+}
+
+fn unpacked_tree_size(root: &Path) -> Result<u64> {
+    let mut total = 0u64;
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(path) = stack.pop() {
+        let metadata = fs::symlink_metadata(&path)
+            .with_context(|| format!("stat unpacked path {}", path.display()))?;
+        if metadata.is_dir() {
+            for entry in fs::read_dir(&path).with_context(|| format!("read {}", path.display()))? {
+                stack.push(entry?.path());
+            }
+        } else if metadata.is_file() {
+            total = total.saturating_add(metadata.len());
+        }
+    }
+    Ok(total)
+}
+
+fn upsert_image(index: &mut OciCacheIndex, image: CachedOciImage) {
+    if let Some(existing) = index
+        .images
+        .iter_mut()
+        .find(|cached| cached.reference == image.reference)
+    {
+        *existing = image;
+    } else {
+        index.images.push(image);
+    }
 }
 
 fn find_image<'a>(index: &'a OciCacheIndex, reference: &str) -> Option<&'a CachedOciImage> {
@@ -525,6 +810,81 @@ mod tests {
         let path = cache_root.join(relative);
         fs::create_dir_all(path.parent().expect("relative has parent")).expect("create parent");
         fs::write(path, body).expect("write cache file");
+    }
+
+    #[test]
+    fn prod_pull_requires_digest_pin_before_network() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = pull_image(tmp.path(), "docker.io/library/alpine:3.20", true)
+            .expect_err("mutable prod pull must fail before registry access");
+        assert!(
+            err.to_string()
+                .contains("requires a digest-pinned reference"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn manifest_config_descriptor_extracts_config_blob() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let manifest = serde_json::json!({
+            "schemaVersion": 2,
+            "config": {
+                "mediaType": "application/vnd.oci.image.config.v1+json",
+                "digest": digest,
+                "size": 17,
+            },
+            "layers": [],
+        });
+        let descriptor =
+            manifest_config_descriptor(&serde_json::to_vec(&manifest).unwrap()).unwrap();
+        let descriptor = descriptor.expect("config descriptor");
+        assert_eq!(descriptor.digest, digest);
+        assert_eq!(descriptor.size, 17);
+    }
+
+    #[test]
+    fn upsert_replaces_existing_reference_entry() {
+        let mut index = OciCacheIndex {
+            schema_version: 1,
+            images: vec![sample_image(
+                "docker.io/library/alpine:3.20",
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+                "blobs/old",
+            )],
+        };
+        let replacement = sample_image(
+            "docker.io/library/alpine:3.20",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "blobs/new",
+        );
+
+        upsert_image(&mut index, replacement);
+
+        assert_eq!(index.images.len(), 1);
+        assert_eq!(index.images[0].layers[0].path.as_deref(), Some("blobs/new"));
+    }
+
+    #[test]
+    fn upsert_keeps_distinct_references_to_same_digest() {
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut index = OciCacheIndex {
+            schema_version: 1,
+            images: vec![sample_image(
+                "docker.io/library/alpine:3.20",
+                digest,
+                "blobs/shared",
+            )],
+        };
+        let second = sample_image(
+            &format!("docker.io/library/alpine@{digest}"),
+            digest,
+            "blobs/shared",
+        );
+
+        upsert_image(&mut index, second);
+
+        assert_eq!(index.images.len(), 2);
     }
 
     #[test]

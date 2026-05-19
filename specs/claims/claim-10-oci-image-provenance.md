@@ -23,11 +23,14 @@ exempt_paths:
   - "crates/mvm-oci/**"
   - "Cargo.toml"
   - "Cargo.lock"
+  - "crates/mvm-cli/Cargo.toml"
+  - "crates/mvm-cli/src/commands/image.rs"
   - "crates/mvm-build/src/oci_to_rootfs/**"
   - "crates/mvm-build/tests/oci_unpack_attacks.rs"
   - "crates/mvm-build/tests/oci_unpack_common/**"
   - "crates/mvm-build/tests/oci_ext4_materialization.rs"
   - "crates/mvm-build/tests/oci_verity_sealing.rs"
+  - "public/src/content/docs/reference/cli-commands.md"
   - "crates/mvm-libkrun/fuzz/rust-toolchain.toml"
 ---
 
