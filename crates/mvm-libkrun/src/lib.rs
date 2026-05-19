@@ -280,19 +280,22 @@ pub enum NetworkingMode {
     /// libkrun's built-in TSI backend (no virtio-net, no DHCP).
     #[default]
     Tsi,
-    /// virtio-net via passt. The host-side passt process is owned
-    /// by `mvm-libkrun::passt::PasstSupervisor`; this variant carries
-    /// the parent end of the socketpair libkrun consumes.
+    /// virtio-net via passt. The supervisor process (whichever links
+    /// `libkrun-sys`) spawns a passt child inside `run_supervisor`,
+    /// hands its socket fd to `krun_add_net_unixstream`, and reaps
+    /// passt when libkrun exits. mvmctl (and any other JSON-consuming
+    /// caller) just declares the intent here — the live fd never
+    /// survives JSON serialization, so we keep it out of this struct.
     Passt {
-        /// File descriptor for the unixstream socket libkrun reads
-        /// virtio-net frames from. Caller (typically
-        /// `PasstSupervisor::spawn`) owns the inverse half handed
-        /// to passt. libkrun takes ownership at `start_enter`.
-        socket_fd: i32,
         /// MAC address for the guest's eth0. 6 bytes; the first
         /// octet must have bit 0x02 set (locally-administered) to
         /// avoid colliding with real hardware allocations.
         mac: [u8; 6],
+        /// Host directory where the supervisor stages passt's log
+        /// file (`<scratch_dir>/passt.log`). Typically
+        /// `<vm_state_dir>` so the per-VM artifact set stays
+        /// co-located. The supervisor creates it if absent.
+        scratch_dir: String,
     },
 }
 
@@ -321,10 +324,14 @@ impl KrunContext {
         }
     }
 
-    /// Switch the guest to passt-backed virtio-net. The caller owns the
-    /// `PasstSupervisor` whose `socket_fd` is passed in here. Plan 87.
-    pub fn with_passt(mut self, socket_fd: i32, mac: [u8; 6]) -> Self {
-        self.networking = NetworkingMode::Passt { socket_fd, mac };
+    /// Switch the guest to passt-backed virtio-net. The supervisor
+    /// process owns the passt child; we just declare the intent and
+    /// the destination for passt's log file. Plan 87.
+    pub fn with_passt(mut self, mac: [u8; 6], scratch_dir: impl Into<String>) -> Self {
+        self.networking = NetworkingMode::Passt {
+            mac,
+            scratch_dir: scratch_dir.into(),
+        };
         self
     }
 
@@ -443,14 +450,60 @@ pub fn start(ctx: &KrunContext) -> Result<(), Error> {
 /// Apply every `KrunContext` field to a freshly-allocated libkrun
 /// configuration context. Shared between [`start`] (W1: configure +
 /// drop) and [`start_enter`] (W3: configure + boot).
+///
+/// Plan 87 split this into `configure_pre_net` (everything except
+/// networking) + a per-caller networking decision. `configure` itself
+/// is the TSI-only path used by the spike/smoke binaries; real
+/// consumers go through `run_supervisor`, which owns a passt child
+/// process for the libkrun lifetime via `configure_with_passt`.
 #[cfg(feature = "libkrun-sys")]
 fn configure(ctx: &KrunContext) -> Result<sys::Context, Error> {
+    let krun = configure_pre_net(ctx)?;
+    if matches!(ctx.networking, NetworkingMode::Passt { .. }) {
+        return Err(Error::Io {
+            context: "NetworkingMode::Passt requires the supervisor entry point; \
+                 call `run_supervisor` rather than `start` / `start_enter` directly"
+                .to_string(),
+        });
+    }
+    Ok(krun)
+}
+
+/// Plan 87 W1+W2 — configure() variant that owns a `PasstSupervisor`
+/// for the lifetime of the returned context. Used by [`run_supervisor`]
+/// when `NetworkingMode::Passt` is set. The handle Drop's after libkrun
+/// finishes consuming the fd and the guest exits.
+#[cfg(all(feature = "libkrun-sys", target_family = "unix"))]
+fn configure_with_passt(
+    ctx: &KrunContext,
+) -> Result<(sys::Context, Option<passt::PasstHandle>), Error> {
+    let krun = configure_pre_net(ctx)?;
+    let handle = match &ctx.networking {
+        NetworkingMode::Tsi => None,
+        NetworkingMode::Passt { mac, scratch_dir } => {
+            let handle =
+                passt::spawn(std::path::Path::new(scratch_dir)).map_err(|e| Error::Io {
+                    context: format!("spawning passt for NetworkingMode::Passt: {e}"),
+                })?;
+            krun.add_net_unixstream_fd(
+                handle.socket_fd(),
+                mac,
+                sys::PASST_NET_FEATURES,
+                /* flags = */ 0,
+            )?;
+            Some(handle)
+        }
+    };
+    Ok((krun, handle))
+}
+
+/// Plan 87 — every part of `configure` that doesn't touch the
+/// networking backend. Shared between the plain `configure` path
+/// (TSI-only) and `configure_with_passt`.
+#[cfg(feature = "libkrun-sys")]
+fn configure_pre_net(ctx: &KrunContext) -> Result<sys::Context, Error> {
     let krun = sys::Context::new()?;
     krun.set_vm_config(ctx.vcpus, ctx.ram_mib)?;
-    // ARM64 Linux kernels build as the "Image" format (a flat binary
-    // header + payload, not ELF). libkrun's `RAW` kernel format consumes
-    // them directly. x86_64 bzImage is also `RAW`. ELF-format kernels
-    // (rare outside test fixtures) would need `KernelFormat::Elf`.
     krun.set_kernel(
         Path::new(&ctx.kernel_path),
         sys::KernelFormat::Raw,
@@ -461,66 +514,15 @@ fn configure(ctx: &KrunContext) -> Result<sys::Context, Error> {
     for disk in &ctx.extra_disks {
         krun.add_disk(&disk.id, Path::new(&disk.path), disk.read_only)?;
     }
-    // virtio-fs shares (Plan 72 W4): each entry becomes a
-    // `mount -t virtiofs <tag>` target inside the guest. libkrun
-    // spawns one virtiofsd daemon per share internally.
     for mount in &ctx.virtio_fs_mounts {
         krun.add_virtiofs(&mount.tag, Path::new(&mount.host_path))?;
     }
-    // libkrun's vsock model — refined by plan 57 W4 after a closer
-    // read of `libkrun.h`:
-    //
-    // - TSI (Transparent Socket Impersonation) is auto-enabled when
-    //   no virtio-net device is added. The libkrun README is
-    //   explicit: "TSI for AF_INET and AF_INET6 is automatically
-    //   enabled when no network interface is added to the VM." We
-    //   never call `krun_add_net_*`, so TSI is always on, and the
-    //   virtio-vsock device exists implicitly.
-    //
-    // - `krun_add_vsock` is for *adding a second independent*
-    //   virtio-vsock device, and requires `krun_disable_implicit_vsock`
-    //   first. Because TSI already provides one, naively calling it
-    //   returns `-EEXIST` (verified on libkrun 1.17.4). Do not use
-    //   from mvm's path.
-    //
-    // - **Direction matters.** `krun_add_vsock_port` (no `_2`)
-    //   documents "port that the guest will connect to for IPC" —
-    //   guest is the client, host is the server, host binds the
-    //   listener. `krun_add_vsock_port2(..., listen=true)` flips
-    //   it: "guest expects connections to be initiated from host
-    //   side" — guest is the server, libkrun creates the unix
-    //   socket file as a listener, host processes connect as
-    //   clients. mvm's guest agent always *listens* on
-    //   `GUEST_AGENT_PORT`, so `listen=true` is the right mode for
-    //   every vsock port we register here. The W3.3 PR used
-    //   `add_vsock_port` (no `_2`); that was the wrong direction
-    //   but happened to boot because nothing in the guest actually
-    //   tried to use vsock. W4 corrects it.
     for &port in &ctx.vsock_ports {
         let socket = ctx.vsock_socket_path(port);
         krun.add_vsock_port2(port, &socket, /* listen = */ true)?;
     }
     if let Some(console_path) = &ctx.console_output_path {
         krun.set_console_output(Path::new(console_path))?;
-    }
-    // Plan 87 / ADR-055: networking backend dispatch. TSI is the
-    // default (auto-enabled when no virtio-net device is added);
-    // Passt adds a virtio-net device via krun_add_net_unixstream and
-    // implicitly disables TSI. The two are mutually exclusive at the
-    // libkrun layer.
-    match &ctx.networking {
-        NetworkingMode::Tsi => {
-            // Nothing to do — libkrun enables TSI implicitly when no
-            // virtio-net device is added.
-        }
-        NetworkingMode::Passt { socket_fd, mac } => {
-            krun.add_net_unixstream_fd(
-                *socket_fd,
-                mac,
-                sys::PASST_NET_FEATURES,
-                /* flags = */ 0,
-            )?;
-        }
     }
     Ok(krun)
 }
@@ -700,7 +702,22 @@ pub fn run_supervisor(cfg: &SupervisorConfig) -> Result<std::convert::Infallible
     std::fs::write(&pid_path, &pid).map_err(|e| Error::Io {
         context: format!("write pid file {}: {e}", pid_path.display()),
     })?;
-    start_enter(&cfg.krun)
+
+    if !is_available() {
+        return Err(Error::NotInstalled {
+            install_hint: install_hint(),
+        });
+    }
+
+    // Plan 87 W3: when NetworkingMode::Passt is set, the supervisor
+    // owns the passt child process. `_passt_handle` lives until the
+    // end of this function; libkrun's `start_enter` calls `exit()`
+    // on the success path, so the handle's Drop runs as part of
+    // process teardown when the guest powers off. On error paths
+    // the handle Drops normally and SIGTERMs passt before we return.
+    let (krun, _passt_handle) = configure_with_passt(&cfg.krun)?;
+    install_shutdown_handler(&krun)?;
+    krun.start_enter()
 }
 
 /// Non-FFI-feature stub so callers can reference the function name
