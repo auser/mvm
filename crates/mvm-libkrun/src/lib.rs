@@ -28,6 +28,13 @@ mod sys;
 #[cfg(feature = "libkrun-sys")]
 pub use sys::{BundledKernel, KernelFormat, LogLevel, extract_bundled_kernel, set_log_level};
 
+// Plan 87 / ADR-055 — passt-backed virtio-net. The supervisor owns the
+// passt child process and exposes the socket fd `KrunContext::Passt`
+// consumes. Only Linux / macOS — Windows has neither libkrun nor
+// passt. Tests are gated on a host-side passt install probe.
+#[cfg(target_family = "unix")]
+pub mod passt;
+
 /// Errors returned by this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -245,6 +252,48 @@ pub struct KrunContext {
     /// always set a stable per-VM dir under `~/.mvm/vms/<name>/`
     /// so cross-process clients can find it.
     pub vsock_socket_dir: Option<String>,
+    /// Plan 87 — networking backend for the guest. `Tsi` (default)
+    /// uses libkrun's built-in syscall-hijack TSI mode; `Passt`
+    /// attaches a virtio-net device backed by a unixstream socket
+    /// the caller has handed off to a passt child process. See
+    /// `NetworkingMode` for the trade-offs.
+    #[serde(default)]
+    pub networking: NetworkingMode,
+}
+
+/// Libkrun networking backend. Plan 87 / ADR-055.
+///
+/// `Tsi` is libkrun's default — AF_INET syscall hijacking, no
+/// virtio-net device in the guest, no DHCP. Works for trivial HTTP
+/// (single GET) but breaks on HTTP/2 multiplexing, HTTPS redirect
+/// chains, and nix's substituter probes. Kept as an opt-out for
+/// debugging and for runtime microVMs that legitimately don't need
+/// a network stack.
+///
+/// `Passt` configures a real virtio-net device wired through a
+/// unixstream socket to a host-side passt child process. The guest
+/// sees a normal eth0 + DHCP + DNS. This is the production-ready
+/// networking mode for Stage 0 and steady-state builder VMs.
+#[derive(Debug, Clone, Default, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NetworkingMode {
+    /// libkrun's built-in TSI backend (no virtio-net, no DHCP).
+    #[default]
+    Tsi,
+    /// virtio-net via passt. The host-side passt process is owned
+    /// by `mvm-libkrun::passt::PasstSupervisor`; this variant carries
+    /// the parent end of the socketpair libkrun consumes.
+    Passt {
+        /// File descriptor for the unixstream socket libkrun reads
+        /// virtio-net frames from. Caller (typically
+        /// `PasstSupervisor::spawn`) owns the inverse half handed
+        /// to passt. libkrun takes ownership at `start_enter`.
+        socket_fd: i32,
+        /// MAC address for the guest's eth0. 6 bytes; the first
+        /// octet must have bit 0x02 set (locally-administered) to
+        /// avoid colliding with real hardware allocations.
+        mac: [u8; 6],
+    },
 }
 
 impl KrunContext {
@@ -268,7 +317,15 @@ impl KrunContext {
             virtio_fs_mounts: Vec::new(),
             console_output_path: None,
             vsock_socket_dir: None,
+            networking: NetworkingMode::Tsi,
         }
+    }
+
+    /// Switch the guest to passt-backed virtio-net. The caller owns the
+    /// `PasstSupervisor` whose `socket_fd` is passed in here. Plan 87.
+    pub fn with_passt(mut self, socket_fd: i32, mac: [u8; 6]) -> Self {
+        self.networking = NetworkingMode::Passt { socket_fd, mac };
+        self
     }
 
     /// Resolve the host-side unix socket path libkrun should pair
@@ -445,6 +502,25 @@ fn configure(ctx: &KrunContext) -> Result<sys::Context, Error> {
     }
     if let Some(console_path) = &ctx.console_output_path {
         krun.set_console_output(Path::new(console_path))?;
+    }
+    // Plan 87 / ADR-055: networking backend dispatch. TSI is the
+    // default (auto-enabled when no virtio-net device is added);
+    // Passt adds a virtio-net device via krun_add_net_unixstream and
+    // implicitly disables TSI. The two are mutually exclusive at the
+    // libkrun layer.
+    match &ctx.networking {
+        NetworkingMode::Tsi => {
+            // Nothing to do — libkrun enables TSI implicitly when no
+            // virtio-net device is added.
+        }
+        NetworkingMode::Passt { socket_fd, mac } => {
+            krun.add_net_unixstream_fd(
+                *socket_fd,
+                mac,
+                sys::PASST_NET_FEATURES,
+                /* flags = */ 0,
+            )?;
+        }
     }
     Ok(krun)
 }

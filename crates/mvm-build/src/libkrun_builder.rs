@@ -1425,7 +1425,11 @@ mod tests {
     fn defaults_match_plan_72_w1() {
         let vm = LibkrunBuilderVm::default();
         assert_eq!(vm.vcpus, 4);
-        assert_eq!(vm.memory_mib, 4096);
+        // Plan 72 W5.D bullet 9 bumped this from 4 GiB to 8 GiB
+        // (in-VM nix builds peak ~5-6 GiB and OOM-kill the link step
+        // at the lower default). Hardcoded here so a regression that
+        // accidentally reverts the bump fails fast.
+        assert_eq!(vm.memory_mib, 8192);
         assert_eq!(vm.nix_store_mib, 65536);
     }
 
