@@ -214,6 +214,7 @@ pub fn run(json: bool, workflow: Option<DoctorWorkflow>) -> Result<()> {
     checks.push(kvm_check(plat, false));
     checks.push(apple_container_check(plat));
     checks.push(libkrun_check(plat));
+    checks.push(passt_check(plat));
     checks.push(docker_check(plat));
     checks.push(ts_runner_check());
 
@@ -647,6 +648,82 @@ fn docker_check(plat: Platform) -> Check {
             ok: true, // Not a failure — just unavailable
             info: "not available (install Docker Desktop or Docker Engine)".to_string(),
         }
+    }
+}
+
+/// `passt` host-side availability — Plan 87 W5. Probes `$PATH` for
+/// the passt binary; surfaces the version when present and the
+/// install hint when missing. `ok: true` regardless — passt is only
+/// strictly required when `MVM_NETWORKING=passt` (the default after
+/// Plan 87 PR3). The TSI fallback still works without it.
+///
+/// Skipped on Windows (no native libkrun port either; the whole
+/// libkrun + passt stack is macOS / Linux).
+#[cfg(target_family = "unix")]
+fn passt_check(plat: Platform) -> Check {
+    if plat.is_windows() {
+        return Check {
+            name: "passt",
+            category: "platform",
+            ok: true,
+            info: "n/a (no native Windows port)".to_string(),
+        };
+    }
+    match mvm_libkrun::passt::locate_passt() {
+        Some(path) => {
+            // Best-effort version probe — `passt --version` writes to
+            // stdout on Linux and macOS (Homebrew build). Failure is
+            // not fatal; we surface "available" without a version.
+            let version = std::process::Command::new(&path)
+                .arg("--version")
+                .output()
+                .ok()
+                .and_then(|out| {
+                    if out.status.success() {
+                        let s = String::from_utf8_lossy(&out.stdout)
+                            .lines()
+                            .next()
+                            .unwrap_or("")
+                            .trim()
+                            .to_string();
+                        if s.is_empty() { None } else { Some(s) }
+                    } else {
+                        None
+                    }
+                });
+            let info = match version {
+                Some(v) => format!("available — {v}"),
+                None => format!("available at {}", path.display()),
+            };
+            Check {
+                name: "passt",
+                category: "platform",
+                ok: true,
+                info,
+            }
+        }
+        None => Check {
+            name: "passt",
+            category: "platform",
+            ok: true, // Optional; only strictly needed for MVM_NETWORKING=passt.
+            info: format!(
+                "not available ({}) — required for the default `MVM_NETWORKING=passt` \
+                 libkrun networking path; set `MVM_NETWORKING=tsi` to opt back to \
+                 libkrun's built-in TSI mode while you install it",
+                mvm_libkrun::passt::install_hint()
+            ),
+        },
+    }
+}
+
+/// Windows stub — keeps the call site cfg-free.
+#[cfg(not(target_family = "unix"))]
+fn passt_check(_plat: Platform) -> Check {
+    Check {
+        name: "passt",
+        category: "platform",
+        ok: true,
+        info: "n/a (no Unix passt port on this OS)".to_string(),
     }
 }
 
