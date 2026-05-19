@@ -33,15 +33,31 @@
 
 use crate::boot_timings::BootTimings;
 
+/// The nil UUID used by the single-shot path when no incoming
+/// dispatch supplied a `job_id`. Persistent-dispatch callers
+/// (Plan 89 W3 part 3) echo back the request's id instead.
+pub(crate) const NIL_JOB_ID: &str = "00000000-0000-0000-0000-000000000000";
+
 /// Owned snapshot of the data needed to hand-roll a
 /// `BuilderResponse::Result` JSON frame. The producer (the linux
-/// module's `run` path) gathers these fields after `run_job`
-/// returns and before `power_off`.
+/// module's `run` path for single-shot, or the W3 dispatch loop)
+/// gathers these fields after the inner build returns.
 #[derive(Debug, Clone)]
 pub(crate) struct DispatchResponse {
+    /// UUID-string echoed from the incoming `BuilderRequest::Run`.
+    /// Single-shot callers pass [`NIL_JOB_ID`]; persistent
+    /// dispatch echoes the host-generated id from
+    /// `BuilderRequest::Run::job_id`.
+    pub job_id: String,
     pub exit_code: i32,
     pub stderr_tail: String,
-    pub boot_timings: BootTimings,
+    /// Cold-boot phase timings. `Some` on the first response a
+    /// persistent VM emits (matches the host-side
+    /// `BuilderResponse::Result::boot_timings: Option<...>`
+    /// semantics); `None` on subsequent dispatches in the same
+    /// session — there's no second cold boot to time. Single-shot
+    /// always passes `Some`.
+    pub boot_timings: Option<BootTimings>,
     pub build_ms: u64,
 }
 
@@ -52,21 +68,29 @@ impl DispatchResponse {
     /// variant's struct fields in declaration order).
     pub fn to_json(&self) -> String {
         let mut out = String::with_capacity(512);
-        out.push_str(
-            r#"{"kind":"result","job_id":"00000000-0000-0000-0000-000000000000","exit_code":"#,
-        );
+        out.push_str(r#"{"kind":"result","job_id":""#);
+        push_json_string(&mut out, &self.job_id);
+        out.push_str(r#"","exit_code":"#);
         out.push_str(&self.exit_code.to_string());
         out.push_str(r#","stderr_tail":""#);
         push_json_string(&mut out, &self.stderr_tail);
         out.push_str(r#"","boot_timings":"#);
-        // BootTimingsWire is shaped identically to BootTimings;
-        // BootTimings::to_json emits the exact wire we want.
-        out.push_str(&self.boot_timings.to_json());
+        match &self.boot_timings {
+            Some(bt) => out.push_str(&bt.to_json()),
+            None => out.push_str("null"),
+        }
         out.push_str(r#","job_timings":{"dispatch_ms":0,"build_ms":"#);
         out.push_str(&self.build_ms.to_string());
         out.push_str(r#","teardown_ms":0}}"#);
         out
     }
+}
+
+/// Plan 89 W3 part 3 — wire JSON for `BuilderResponse::Bye`,
+/// the dispatch loop's acknowledgement of `BuilderRequest::Shutdown`.
+/// Static body; no fields to escape.
+pub(crate) fn bye_json() -> &'static str {
+    r#"{"kind":"bye"}"#
 }
 
 /// JSON string-escape per RFC 8259 §7. Inlined rather than calling
@@ -114,9 +138,10 @@ mod tests {
     #[test]
     fn dispatch_response_emits_valid_json() {
         let resp = DispatchResponse {
+            job_id: NIL_JOB_ID.to_string(),
             exit_code: 0,
             stderr_tail: "warning: foo\nwarning: bar".to_string(),
-            boot_timings: sample_timings(),
+            boot_timings: Some(sample_timings()),
             build_ms: 8140,
         };
         let json = resp.to_json();
@@ -138,9 +163,10 @@ mod tests {
     #[test]
     fn dispatch_response_escapes_control_chars_in_stderr_tail() {
         let resp = DispatchResponse {
+            job_id: NIL_JOB_ID.to_string(),
             exit_code: 1,
             stderr_tail: "line1\n\"quoted\"\tand\\back\x01slash".to_string(),
-            boot_timings: sample_timings(),
+            boot_timings: Some(sample_timings()),
             build_ms: 0,
         };
         let json = resp.to_json();
@@ -155,14 +181,43 @@ mod tests {
     #[test]
     fn dispatch_response_handles_empty_stderr_tail() {
         let resp = DispatchResponse {
+            job_id: NIL_JOB_ID.to_string(),
             exit_code: 0,
             stderr_tail: String::new(),
-            boot_timings: sample_timings(),
+            boot_timings: Some(sample_timings()),
             build_ms: 100,
         };
         let json = resp.to_json();
         let parsed: serde_json::Value = serde_json::from_str(&json).expect("must parse");
         assert_eq!(parsed["stderr_tail"], "");
+    }
+
+    /// Plan 89 W3 part 3 — `boot_timings: None` produces a JSON
+    /// `null` rather than an object. Mirrors the persistent VM's
+    /// second-and-subsequent dispatches.
+    #[test]
+    fn dispatch_response_emits_null_boot_timings_when_none() {
+        let resp = DispatchResponse {
+            job_id: "01234567-89ab-cdef-0123-456789abcdef".to_string(),
+            exit_code: 0,
+            stderr_tail: String::new(),
+            boot_timings: None,
+            build_ms: 42,
+        };
+        let json = resp.to_json();
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("must parse");
+        assert_eq!(parsed["boot_timings"], serde_json::Value::Null);
+        assert_eq!(parsed["job_id"], "01234567-89ab-cdef-0123-456789abcdef");
+    }
+
+    #[test]
+    fn bye_json_matches_typed_builder_response_bye() {
+        let typed: mvm_build::builder_protocol::BuilderResponse =
+            serde_json::from_str(bye_json()).expect("parse");
+        assert!(matches!(
+            typed,
+            mvm_build::builder_protocol::BuilderResponse::Bye {}
+        ));
     }
 
     /// **The cross-validation test.** Hand-rolled JSON must
@@ -173,9 +228,10 @@ mod tests {
     #[test]
     fn dispatch_response_parses_as_typed_builder_response() {
         let resp = DispatchResponse {
+            job_id: NIL_JOB_ID.to_string(),
             exit_code: 7,
             stderr_tail: "uh oh".to_string(),
-            boot_timings: sample_timings(),
+            boot_timings: Some(sample_timings()),
             build_ms: 1234,
         };
         let json = resp.to_json();
