@@ -2,6 +2,10 @@ pub mod app_deps;
 pub mod app_deps_gate;
 pub mod artifacts;
 pub mod backend;
+/// Plan 89 W2 — vsock dispatch wire types for the persistent
+/// builder VM. Today this is types + tests only; the dispatch path
+/// itself wires in W2 PR 2 and the persistent-VM lifecycle in W3.
+pub mod builder_protocol;
 pub mod builder_vm;
 pub mod cache;
 pub mod firecracker;

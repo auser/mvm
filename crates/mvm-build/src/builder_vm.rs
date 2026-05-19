@@ -83,7 +83,13 @@ pub struct BuilderMounts {
 /// B.2 can land behavior changes against a stable shape, and today
 /// every backend errors with [`BuilderVmError::NotYetImplemented`]
 /// when it sees an `Install` job.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// `Serialize`/`Deserialize` + `#[serde(deny_unknown_fields)]` were
+/// added by Plan 89 W2 so `BuilderJob` can ride inside
+/// [`crate::builder_protocol::BuilderRequest::Run`] over the
+/// vsock-framed dispatch channel.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub enum BuilderJob {
     /// Build a Nix flake attribute. The flake attribute path is
     /// system-specific; callers map host architecture to the
