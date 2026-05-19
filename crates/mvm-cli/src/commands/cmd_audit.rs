@@ -190,6 +190,8 @@ impl Commands {
             Commands::Wait(_) => "wait",
             Commands::BootReport(_) => "boot-report",
             Commands::Artifact(_) => "artifact",
+            #[cfg(feature = "builder-vm")]
+            Commands::PersistentBuilder(_) => "persistent-builder",
         }
     }
 }

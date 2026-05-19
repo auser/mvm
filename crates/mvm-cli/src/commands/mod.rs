@@ -150,6 +150,13 @@ pub(in crate::commands) enum Commands {
     BootReport(vm::wait::BootReportArgs),
     /// Pack or verify signed `.mvm` artifacts
     Artifact(vm::artifact::Args),
+    /// Plan 89 W3 — manage the persistent builder VM (start /
+    /// submit / stop). Spawns a long-lived libkrun VM that
+    /// dispatches multiple builds over vsock, amortizing the
+    /// per-job boot fan-out. Gated on `builder-vm` (default on).
+    #[cfg(feature = "builder-vm")]
+    #[command(name = "persistent-builder")]
+    PersistentBuilder(build::persistent_builder::Args),
 }
 
 // ============================================================================
@@ -288,6 +295,8 @@ pub fn run() -> Result<()> {
         Commands::Wait(a) => vm::wait::run_wait(&cli, a, &cfg),
         Commands::BootReport(a) => vm::wait::run_boot_report(&cli, a, &cfg),
         Commands::Artifact(a) => vm::artifact::run(&cli, a, &cfg),
+        #[cfg(feature = "builder-vm")]
+        Commands::PersistentBuilder(a) => build::persistent_builder::run(&cli, a),
     };
 
     cmd_audit::emit_cmd_outcome(cmd_recorder.as_ref(), verb, &result);

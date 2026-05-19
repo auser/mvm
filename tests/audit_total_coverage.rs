@@ -262,6 +262,7 @@ const AUDIT_POSTURE: &[(&str, AuditPosture)] = &[
     ("manifest", AuditPosture::DelegatesToSub(MANIFEST_SUB)),
     ("storage", AuditPosture::DelegatesToSub(STORAGE_SUB)),
     ("build", AuditPosture::Emits("TemplateBuild")),
+    ("persistent-builder", AuditPosture::InteractiveOrControl),
     // SDK port Phase 2c — renders a `Workload` IR to a flake +
     // sidecars at the user-supplied --out path. Doesn't touch the
     // audit chain. ReadOnly w.r.t. host state.
