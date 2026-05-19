@@ -5,27 +5,26 @@
 //! share.
 //!
 //! Replaces the previous ur-seed flake + tarball + seed-contract
-//! pipeline. The "ur-seed" used to be a ~190 MiB tarball produced
-//! by `nix/ur-seed/flake.nix`, downloaded with sha256 verification
-//! into `~/.cache/mvm/ur-seed/`. Now the bootstrap surface is:
+//! pipeline. Bootstrap surface today:
 //!
 //! 1. **`init.sh`** (embedded via `include_str!`) — the PID-1
 //!    shell script. Lives at [`INIT_SCRIPT`].
-//! 2. **`busybox-aarch64-linux-musl`** static (~1 MiB) — bundles
-//!    every userspace tool the init script needs (sh, mount, ip,
-//!    udhcpc, cp, …). Downloaded once into [`stage0_cache_dir`].
-//! 3. **`nix-portable-aarch64-linux`** static (~50 MiB) — daemon-less
-//!    Nix runtime. Same cache dir.
+//! 2. **busybox-aarch64-linux-musl** static (~1.6 MiB) — vendored
+//!    in-tree as `stage0/busybox-aarch64-linux-musl`, embedded via
+//!    `include_bytes!` ([`BUSYBOX_AARCH64_BYTES`]). Provides sh,
+//!    mount, ip, udhcpc, cp, … under the busybox multi-call binary.
+//! 3. **nix-portable-aarch64-linux** static (~74 MiB) — daemon-less
+//!    Nix runtime. Downloaded once from DavHau/nix-portable's
+//!    upstream release into [`stage0_cache_dir`] with sha256
+//!    verification ([`NIX_PORTABLE_AARCH64`]).
 //!
-//! Both binaries are pinned by URL + SHA-256 in the
-//! [`BootstrapAsset`] table below. No flake, no manifest schema,
-//! no contract version, no `mvm-builder-init` baked into a
-//! release-frozen rootfs.
+//! No flake, no manifest schema, no contract version, no
+//! `mvm-builder-init` baked into a release-frozen rootfs.
 //!
-//! Per-run, [`build_initramfs`] walks the cache, the embedded
-//! init script, and a small set of directory stubs into a cpio
-//! newc archive (`crate::cpio`) that libkrun consumes via
-//! `KrunContext::new_initramfs`.
+//! Per-run, [`build_initramfs`] walks the cached nix-portable, the
+//! embedded busybox + init script, and a small set of directory
+//! stubs into a cpio newc archive (`crate::cpio`) that libkrun
+//! consumes via `KrunContext::new_initramfs`.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
@@ -53,35 +52,38 @@ pub struct BootstrapAsset {
     pub mode: u32,
 }
 
-/// busybox-static aarch64-linux-musl. Hosted at
-/// `tinylabscom/mvm-bootstrap` so the URL is stable across mvm
-/// releases. Build recipe: `pkgs.pkgsStatic.busybox` on
-/// `aarch64-linux`, then `strip --strip-all`. See
-/// `nix/bootstrap/busybox.nix` (added in a follow-up).
+/// busybox-static aarch64-linux-musl. Vendored in-tree (~1.6 MiB)
+/// because it's small enough that embedding the bytes directly into
+/// mvmctl is less pain than maintaining a separate fetch flow.
 ///
-/// The hash below is a placeholder until the first
-/// `mvm-bootstrap` release is cut. `prepare_assets` will
-/// surface a clear error when the placeholder doesn't match
-/// the upstream byte stream.
-pub const BUSYBOX_AARCH64: BootstrapAsset = BootstrapAsset {
-    cache_filename: "busybox",
-    url: "https://github.com/tinylabscom/mvm-bootstrap/releases/download/v0.1.0/busybox-aarch64-linux-musl",
-    sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
-    mode: 0o755,
-};
+/// Origin: `pkgs.pkgsStatic.busybox` on `aarch64-linux` from
+/// nixpkgs, then `strip --strip-all`. Extracted out of an existing
+/// ur-seed rootfs.ext4 for this initial vendor.
+pub const BUSYBOX_AARCH64_BYTES: &[u8] =
+    include_bytes!("stage0/busybox-aarch64-linux-musl");
+
+/// SHA-256 of [`BUSYBOX_AARCH64_BYTES`]. Verified at the bottom of
+/// this file so a tampered vendored binary fails the workspace
+/// test suite.
+pub const BUSYBOX_AARCH64_SHA256: &str =
+    "710d9568fb39d2450809551eb3517eda124398d21952993040284cbc386f0cc7";
 
 /// nix-portable aarch64-linux. Upstream release from
 /// `DavHau/nix-portable` — well-maintained, single static binary,
-/// runs Nix without a daemon or `/nix/store`.
+/// runs Nix without a daemon or `/nix/store`. ~74 MiB.
+///
+/// Downloaded once on first `mvmctl dev fetch-stage0` (or first
+/// `dev up`) into [`stage0_cache_dir`]. Too big to vendor.
 pub const NIX_PORTABLE_AARCH64: BootstrapAsset = BootstrapAsset {
     cache_filename: "nix-portable",
-    url: "https://github.com/DavHau/nix-portable/releases/download/v013/nix-portable-aarch64",
-    sha256_hex: "0000000000000000000000000000000000000000000000000000000000000000",
+    url: "https://github.com/DavHau/nix-portable/releases/download/v012/nix-portable-aarch64",
+    sha256_hex: "af41d8defdb9fa17ee361220ee05a0c758d3e6231384a3f969a314f9133744ea",
     mode: 0o755,
 };
 
-/// Every asset Stage 0 needs on aarch64-linux hosts.
-pub const ASSETS_AARCH64: &[&BootstrapAsset] = &[&BUSYBOX_AARCH64, &NIX_PORTABLE_AARCH64];
+/// Every downloadable asset Stage 0 needs on aarch64-linux hosts.
+/// busybox is vendored (not downloaded), so it's not in this list.
+pub const ASSETS_AARCH64: &[&BootstrapAsset] = &[&NIX_PORTABLE_AARCH64];
 
 /// `~/.cache/mvm/stage0/`. Materialized by [`prepare_assets`].
 pub fn stage0_cache_dir() -> PathBuf {
@@ -113,20 +115,15 @@ pub fn prepare_assets(assets: &[&BootstrapAsset]) -> Result<()> {
     Ok(())
 }
 
-/// Build the Stage 0 initramfs (cpio newc bytes) from the cached
-/// bootstrap assets + the embedded init script. The returned bytes
-/// can be written to a temp file and handed to libkrun via
-/// `KrunContext::new_initramfs`.
+/// Build the Stage 0 initramfs (cpio newc bytes) from the embedded
+/// busybox + the cached nix-portable + the embedded init script.
+/// The returned bytes can be written to a temp file and handed to
+/// libkrun via `KrunContext::new_initramfs`.
 ///
-/// `applet_names` is the list of busybox applet symlinks to
-/// pre-create under `/bin/`. The init script also runs
-/// `busybox --install -s /bin` at boot to be exhaustive, but
-/// having the basics (`sh`, `mount`, `ip`, `udhcpc`, `cp`,
-/// `mkdir`, `mountpoint`, `sync`, `poweroff`) as actual symlinks
-/// lets the kernel resolve `#!/bin/sh` before `/init` runs.
+/// Caller must have already run [`prepare_assets`] so nix-portable
+/// is present in the cache dir.
 pub fn build_initramfs() -> Result<Vec<u8>> {
     let dir = stage0_cache_dir();
-    let busybox = read_asset(&dir, &BUSYBOX_AARCH64)?;
     let nix_portable = read_asset(&dir, &NIX_PORTABLE_AARCH64)?;
 
     let mut arc = CpioArchive::new();
@@ -153,7 +150,7 @@ pub fn build_initramfs() -> Result<Vec<u8>> {
     arc.symlink("/sbin", "bin");
 
     arc.file("/init", Perm::FILE_755, INIT_SCRIPT.as_bytes());
-    arc.file("/bin/busybox", Perm(BUSYBOX_AARCH64.mode), busybox);
+    arc.file("/bin/busybox", Perm::FILE_755, BUSYBOX_AARCH64_BYTES.to_vec());
     arc.file(
         "/usr/local/bin/nix-portable",
         Perm(NIX_PORTABLE_AARCH64.mode),
@@ -314,10 +311,39 @@ mod tests {
     }
 
     #[test]
-    fn assets_table_covers_busybox_and_nix_portable() {
+    fn vendored_busybox_matches_pinned_sha256() {
+        let got = hex::encode(Sha256::digest(BUSYBOX_AARCH64_BYTES));
+        assert_eq!(
+            got, BUSYBOX_AARCH64_SHA256,
+            "vendored busybox bytes do not match the pinned sha256; \
+             someone tampered with `stage0/busybox-aarch64-linux-musl` or \
+             forgot to update BUSYBOX_AARCH64_SHA256"
+        );
+    }
+
+    #[test]
+    fn vendored_busybox_is_aarch64_elf() {
+        // Linux kernel ELF magic + ARM aarch64 machine code.
+        // ELF: 0x7f 'E' 'L' 'F'; e_machine for aarch64 is 0xB7 at
+        // offset 18 (little-endian).
+        assert!(BUSYBOX_AARCH64_BYTES.len() > 64, "busybox too small to be a real ELF");
+        assert_eq!(
+            &BUSYBOX_AARCH64_BYTES[0..4],
+            &[0x7f, b'E', b'L', b'F'],
+            "vendored busybox lacks ELF magic"
+        );
+        assert_eq!(
+            BUSYBOX_AARCH64_BYTES[18], 0xB7,
+            "vendored busybox e_machine is not EM_AARCH64 (0xB7)"
+        );
+    }
+
+    #[test]
+    fn downloadable_assets_table_covers_nix_portable() {
         let names: Vec<_> = ASSETS_AARCH64.iter().map(|a| a.cache_filename).collect();
-        assert!(names.contains(&"busybox"));
         assert!(names.contains(&"nix-portable"));
+        // busybox is vendored — it's NOT a downloadable asset.
+        assert!(!names.contains(&"busybox"));
     }
 
     #[test]
@@ -350,33 +376,24 @@ mod tests {
     }
 
     /// Smoke: building the initramfs against a temp cache dir with
-    /// stub binaries produces a valid cpio archive containing the
-    /// init script.
+    /// a stub nix-portable produces a valid cpio archive containing
+    /// the init script + the vendored busybox bytes + the stub
+    /// nix-portable.
     #[test]
     fn build_initramfs_against_stub_cache() {
         let dir = TempDir::new().unwrap();
-        // Place stub assets at the cache filenames the module expects.
-        std::fs::create_dir_all(dir.path()).unwrap();
-        std::fs::write(dir.path().join("busybox"), b"FAKE_BUSYBOX").unwrap();
-        std::fs::write(dir.path().join("nix-portable"), b"FAKE_NIX_PORTABLE").unwrap();
-
         // The module's `stage0_cache_dir()` reads from $HOME; swap.
         // SAFETY: this test mutates env vars but isn't expected to
         // race with the others in this module (none touch HOME).
         let saved = std::env::var_os("HOME");
         unsafe {
-            std::env::set_var("HOME", dir.path().parent().unwrap_or(dir.path()));
+            std::env::set_var("HOME", dir.path());
         }
-        // The path is `$HOME/.cache/mvm/stage0`; we need our stubs
-        // there. Move them.
+        // The path is `$HOME/.cache/mvm/stage0`; we need a stub
+        // nix-portable there. Vendored busybox doesn't need staging.
         let real_dir = stage0_cache_dir();
         std::fs::create_dir_all(&real_dir).unwrap();
-        std::fs::rename(dir.path().join("busybox"), real_dir.join("busybox")).unwrap();
-        std::fs::rename(
-            dir.path().join("nix-portable"),
-            real_dir.join("nix-portable"),
-        )
-        .unwrap();
+        std::fs::write(real_dir.join("nix-portable"), b"FAKE_NIX_PORTABLE").unwrap();
 
         let bytes = build_initramfs().expect("build_initramfs succeeds with stubs in place");
 
@@ -389,15 +406,19 @@ mod tests {
         }
 
         // The archive should contain the init script content + the
-        // stub asset bytes.
+        // vendored busybox ELF magic + the stub nix-portable bytes.
         let s = String::from_utf8_lossy(&bytes);
         assert!(s.contains("#!/bin/sh"), "init script content present");
-        assert!(s.contains("FAKE_BUSYBOX"), "stub busybox bytes present");
         assert!(
             s.contains("FAKE_NIX_PORTABLE"),
             "stub nix-portable bytes present"
         );
         assert!(s.contains("TRAILER!!!"), "cpio archive is well-terminated");
+        // Vendored busybox is binary, search for its ELF magic prefix.
+        assert!(
+            bytes.windows(4).any(|w| w == [0x7f, b'E', b'L', b'F']),
+            "vendored busybox ELF bytes present"
+        );
 
         // Cleanup our test cache dir.
         let _ = std::fs::remove_dir_all(real_dir);
