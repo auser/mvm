@@ -100,6 +100,21 @@ fn main() -> ExitCode {
     }
 }
 
+#[cfg(any(target_os = "linux", test))]
+fn virtiofs_tag_is_read_only(tag: &str) -> bool {
+    tag == "work"
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn virtiofs_tag_policy_keeps_only_workspace_read_only() {
+        assert!(super::virtiofs_tag_is_read_only("work"));
+        assert!(!super::virtiofs_tag_is_read_only("out"));
+        assert!(!super::virtiofs_tag_is_read_only("job"));
+    }
+}
+
 #[cfg(target_os = "linux")]
 mod linux {
     use std::path::Path;
@@ -134,8 +149,9 @@ mod linux {
     const JOB_DIR: &str = "/job";
 
     /// Workspace bind from the host — the in-repo flake the user
-    /// is building. Read-only from the guest's perspective (the
-    /// host mounts the workspace virtio-fs share read-only).
+    /// is building. Read-only from the guest's perspective: libkrun
+    /// exposes the virtio-fs share and this init mounts the `work`
+    /// tag with MS_RDONLY below.
     const WORK_DIR: &str = "/work";
 
     /// Artifact-extraction dir. The user's `cmd.sh` writes
@@ -848,19 +864,30 @@ mod linux {
         Ok(())
     }
 
+    fn virtiofs_mount_flags(tag: &str) -> nix::mount::MsFlags {
+        use nix::mount::MsFlags;
+        if crate::virtiofs_tag_is_read_only(tag) {
+            MsFlags::MS_RDONLY
+        } else {
+            MsFlags::empty()
+        }
+    }
+
     /// Mount a libkrun-exported virtio-fs share. `tag` is the
     /// symbolic identifier the host registered via
     /// `krun_add_virtiofs` (mvm-libkrun's `KrunVirtioFs.tag`);
     /// the kernel routes the mount through libkrun's
-    /// `virtiofsd` daemon. Creates the target dir if absent.
+    /// `virtiofsd` daemon. Creates the target dir if absent. The
+    /// workspace share is mounted read-only; `/out` and `/job` remain
+    /// writable so builds can emit artifacts and result metadata.
     fn mount_virtiofs(tag: &str, target: &str) -> Result<(), String> {
-        use nix::mount::{MsFlags, mount};
+        use nix::mount::mount;
         std::fs::create_dir_all(target).map_err(|e| format!("create {target}: {e}"))?;
         mount(
             Some(tag),
             target,
             Some("virtiofs"),
-            MsFlags::empty(),
+            virtiofs_mount_flags(tag),
             None::<&str>,
         )
         .map_err(|e| format!("mount virtiofs {tag} -> {target}: {e}"))
@@ -959,6 +986,15 @@ mod linux {
             // a CI test failure rather than a runtime mis-detection
             // that silently re-formats the persistent store.
             assert_eq!([0x53u8, 0xEFu8], 0xEF53u16.to_le_bytes());
+        }
+
+        #[test]
+        fn virtiofs_mount_flags_keep_workspace_read_only() {
+            use nix::mount::MsFlags;
+
+            assert!(virtiofs_mount_flags("work").contains(MsFlags::MS_RDONLY));
+            assert_eq!(virtiofs_mount_flags("out"), MsFlags::empty());
+            assert_eq!(virtiofs_mount_flags("job"), MsFlags::empty());
         }
     }
 }
