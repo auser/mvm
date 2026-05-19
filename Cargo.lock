@@ -3014,6 +3014,7 @@ dependencies = [
  "flate2",
  "fs2",
  "hex",
+ "libc",
  "mvm-core",
  "mvm-guest",
  "mvm-libkrun",

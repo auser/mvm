@@ -59,12 +59,31 @@ pub(in crate::commands) struct Args {
     /// Plan 73 Followup C.
     #[arg(long)]
     pub deps: bool,
+    /// Force single-shot builds even when a persistent-builder
+    /// session is active. Default behavior (Plan 89 W3): when
+    /// `mvmctl persistent-builder start` has been run and the
+    /// supervisor is alive, builds route through the persistent
+    /// VM, amortizing the per-job boot fan-out. This flag forces
+    /// the legacy single-shot path — useful for isolation /
+    /// debugging or when comparing timings.
+    #[arg(long)]
+    pub no_persistent_builder: bool,
     /// Build-mode override flags (`--dev` / `--prod`). Default: `--prod`.
     #[command(flatten)]
     pub build_mode: super::super::shared::BuildModeFlags,
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
+    // Plan 89 W3 part 7: `--no-persistent-builder` flips the
+    // env-var bridge that `mvm_build::pipeline::dev_build` reads.
+    // Set once at the top so every subsequent dispatch (flake /
+    // manifest / mvmfile) sees the same toggle. We deliberately
+    // leave the env var set for the process's lifetime — every
+    // codepath under `mvmctl build` should agree on the choice.
+    // SAFETY: called early, before any threads spawn.
+    if args.no_persistent_builder {
+        unsafe { std::env::set_var("MVM_NO_PERSISTENT_BUILDER", "1") };
+    }
     // Plan 73 Followup C: `--deps` narrows the build to the deps
     // volume only. We invalidate the cache index entries pointing at
     // the project's lockfile and short-circuit before the rootfs
