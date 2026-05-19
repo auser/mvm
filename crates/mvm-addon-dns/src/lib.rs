@@ -245,13 +245,13 @@ pub async fn handle_dns_packet(
     };
 
     if request.metadata.message_type != MessageType::Query || request.queries.len() != 1 {
-        return encode_response(error_response(&request, ResponseCode::FormErr)).ok();
+        return encode_response(error_response(&request, ResponseCode::FormErr, config)).ok();
     }
 
     let query = &request.queries[0];
     let query_name = query.name().to_ascii();
     if let Some(record) = zone.lookup(&query_name) {
-        return encode_response(local_response(&request, record)).ok();
+        return encode_response(local_response(&request, record, config)).ok();
     }
 
     forward_upstream(packet, config).await
@@ -269,17 +269,21 @@ fn encode_response(message: Message) -> Result<Vec<u8>, hickory_proto::ProtoErro
     Ok(out)
 }
 
-fn response_base(request: &Message) -> Message {
+fn response_base(request: &Message, recursion_available: bool) -> Message {
     let mut response = Message::response(request.metadata.id, request.metadata.op_code);
     response.metadata.recursion_desired = request.metadata.recursion_desired;
     response.metadata.checking_disabled = request.metadata.checking_disabled;
-    response.metadata.recursion_available = true;
+    response.metadata.recursion_available = recursion_available;
     response.add_queries(request.queries.clone());
     response
 }
 
-fn local_response(request: &Message, zone_record: &ZoneRecord) -> Message {
-    let mut response = response_base(request);
+fn local_response(
+    request: &Message,
+    zone_record: &ZoneRecord,
+    config: &DnsServerConfig,
+) -> Message {
+    let mut response = response_base(request, !config.upstream_addrs.is_empty());
     response.metadata.authoritative = true;
 
     let query = &request.queries[0];
@@ -295,8 +299,8 @@ fn local_response(request: &Message, zone_record: &ZoneRecord) -> Message {
     response
 }
 
-fn error_response(request: &Message, code: ResponseCode) -> Message {
-    let mut response = response_base(request);
+fn error_response(request: &Message, code: ResponseCode, config: &DnsServerConfig) -> Message {
+    let mut response = response_base(request, !config.upstream_addrs.is_empty());
     response.metadata.response_code = code;
     response
 }
@@ -310,7 +314,7 @@ async fn forward_upstream(packet: &[u8], config: &DnsServerConfig) -> Option<Vec
     }
 
     let request = decode_message(packet).ok()?;
-    encode_response(error_response(&request, ResponseCode::ServFail)).ok()
+    encode_response(error_response(&request, ResponseCode::ServFail, config)).ok()
 }
 
 async fn forward_to_upstream(
@@ -323,10 +327,23 @@ async fn forward_to_upstream(
         IpAddr::V6(_) => SocketAddr::from(([0, 0, 0, 0, 0, 0, 0, 0], 0)),
     };
     let socket = UdpSocket::bind(bind_addr).await?;
-    socket.send_to(packet, upstream).await?;
+    socket.connect(upstream).await?;
+    socket.send(packet).await?;
     let mut buf = vec![0u8; 1232];
-    let (len, _) = tokio::time::timeout(timeout, socket.recv_from(&mut buf)).await??;
+    let len = tokio::time::timeout(timeout, socket.recv(&mut buf)).await??;
     buf.truncate(len);
+    let request = decode_message(packet)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    let response = decode_message(&buf)
+        .map_err(|err| std::io::Error::new(std::io::ErrorKind::InvalidData, err))?;
+    if response.metadata.message_type != MessageType::Response
+        || response.metadata.id != request.metadata.id
+    {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidData,
+            "upstream DNS response did not match the forwarded query",
+        ));
+    }
     Ok(buf)
 }
 
@@ -494,7 +511,7 @@ mod tests {
             let mut buf = [0u8; 512];
             let (len, peer) = upstream.recv_from(&mut buf).await.unwrap();
             let request = decode_message(&buf[..len]).unwrap();
-            let mut response = response_base(&request);
+            let mut response = response_base(&request, true);
             response.add_answer(Record::from_rdata(
                 request.queries[0].name().clone(),
                 30,
@@ -527,6 +544,37 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn upstream_response_with_wrong_id_is_rejected() {
+        let upstream = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let upstream_addr = upstream.local_addr().unwrap();
+        let upstream_task = tokio::spawn(async move {
+            let mut buf = [0u8; 512];
+            let (len, peer) = upstream.recv_from(&mut buf).await.unwrap();
+            let request = decode_message(&buf[..len]).unwrap();
+            let mut response = response_base(&request, true);
+            response.metadata.id = request.metadata.id.wrapping_add(1);
+            let encoded = encode_response(response).unwrap();
+            upstream.send_to(&encoded, peer).await.unwrap();
+        });
+
+        let zone = Zone::new(vec![]);
+        let config = DnsServerConfig {
+            bind_addrs: vec!["127.0.0.1:5353".parse().unwrap()],
+            upstream_addrs: vec![upstream_addr],
+            upstream_timeout: Duration::from_millis(100),
+        };
+        let response =
+            handle_dns_packet(&query_packet("example.com.", RecordType::A), &zone, &config)
+                .await
+                .unwrap();
+        upstream_task.await.unwrap();
+        let message = decode_message(&response).unwrap();
+
+        assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
+        assert!(message.answers.is_empty());
+    }
+
+    #[tokio::test]
     async fn unconfigured_name_without_upstream_servfails() {
         let zone = Zone::new(vec![]);
         let config = test_config(vec![]);
@@ -536,6 +584,7 @@ mod tests {
                 .unwrap();
         let message = decode_message(&response).unwrap();
         assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
+        assert!(!message.metadata.recursion_available);
     }
 
     fn test_config(upstream_addrs: Vec<SocketAddr>) -> DnsServerConfig {
