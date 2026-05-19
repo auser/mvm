@@ -41,6 +41,15 @@ pub const PASST_NET_FEATURES: u32 = (1 << 0)   // NET_FEATURE_CSUM
     | (1 << 11)  // NET_FEATURE_HOST_TSO4
     | (1 << 14); // NET_FEATURE_HOST_UFO
 
+/// Plan 88 W5 fix: `NET_FLAG_VFKIT` from `libkrun.h`. libkrun rejects
+/// `krun_add_net_unixgram(c_path, ...)` with -EINVAL unless this flag
+/// is set, because the unixgram backend needs to know whether to
+/// emit the vfkit magic-byte handshake gvproxy expects on
+/// `-listen-vfkit`. Without the flag libkrun assumes raw frames and
+/// fails closed at config time — that's the rc -22 the W5 smoke
+/// surfaced.
+pub const NET_FLAG_VFKIT: u32 = 1 << 0;
+
 /// Kernel-format constants exposed to callers without leaking the
 /// bindgen-generated identifier names.
 #[derive(Debug, Clone, Copy)]

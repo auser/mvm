@@ -559,11 +559,17 @@ fn configure_with_gateway(ctx: &KrunContext) -> Result<(sys::Context, GatewayHan
                 gvproxy::spawn(std::path::Path::new(scratch_dir)).map_err(|e| Error::Io {
                     context: format!("spawning gvproxy for NetworkingMode::Gvproxy: {e}"),
                 })?;
+            // gvproxy speaks libkrun's "vfkit mode" framing on the
+            // unixgram socket. Without NET_FLAG_VFKIT in `flags`,
+            // libkrun rejects the call with -EINVAL at config time
+            // (see sys::NET_FLAG_VFKIT) — Plan 88 W5 smoke surfaced
+            // this as `supervisor failed: libkrun call failed with
+            // rc -22`.
             krun.add_net_unixgram_path(
                 handle.socket_path(),
                 mac,
                 sys::PASST_NET_FEATURES,
-                /* flags = */ 0,
+                sys::NET_FLAG_VFKIT,
             )?;
             GatewayHandle::Gvproxy(handle)
         }
