@@ -165,33 +165,13 @@ pub(in crate::commands) enum DevAction {
         #[arg(long, value_name = "FILE")]
         rootfs: String,
     },
-    /// Fetch the ur-seed Stage -1 bootstrap rootfs from the documented
-    /// mirror (Plan 86 / ADR-054). Required exactly once per host when
-    /// no contract-compliant dev image exists locally. `mvmctl dev up`
-    /// NEVER invokes this automatically.
-    FetchUrSeed {
-        /// Target arch (`aarch64` or `x86_64`). Defaults to the host arch.
-        #[arg(long, value_name = "ARCH")]
-        arch: Option<String>,
-        /// Override the upstream mirror (default: this `mvmctl`'s
-        /// release on GitHub).
-        #[arg(long, value_name = "URL")]
-        mirror: Option<String>,
-    },
-    /// Import a pre-built ur-seed tarball from a local file (air-gapped
-    /// or pre-release bootstrap). The tarball is the output of
-    /// `nix build .#default` in `nix/ur-seed/`. Verifies sha256
-    /// against the sidecar file before atomic install into the cache.
-    ImportUrSeed {
-        /// Path to the `ur-seed-<arch>.tar.gz` tarball.
-        #[arg(long, value_name = "FILE")]
-        from: String,
-        /// Path to the `ur-seed-<arch>.tar.gz.sha256` sidecar. If
-        /// omitted, the verifier looks for `<from>.sha256` next to
-        /// the tarball.
-        #[arg(long, value_name = "FILE")]
-        sha256: Option<String>,
-    },
+    /// Fetch the Stage 0 bootstrap binaries (nix-portable) into
+    /// `~/.cache/mvm/stage0/`. Required exactly once per host. The
+    /// other bootstrap binary (busybox) is embedded in the `mvmctl`
+    /// binary itself. `mvmctl dev up` invokes this automatically on
+    /// first run; running it manually pre-populates the cache for
+    /// air-gapped workflows.
+    FetchStage0,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -216,6 +196,18 @@ fn bail_no_dev_backend() -> Result<()> {
          local dev paths today. Run on an M-series Mac or a Linux KVM \
          host for the supported local workflow."
     );
+}
+
+fn cmd_dev_fetch_stage0() -> Result<()> {
+    use anyhow::Context;
+    ui::progress("Fetching Stage 0 bootstrap assets...");
+    mvm_build::stage0::prepare_assets(mvm_build::stage0::ASSETS_AARCH64)
+        .context("downloading Stage 0 bootstrap assets")?;
+    ui::success(&format!(
+        "Stage 0 assets ready at {}",
+        mvm_build::stage0::stage0_cache_dir().display()
+    ));
+    Ok(())
 }
 
 fn cmd_dev_libkrun(cpus: u32, memory_gib: u32, open_shell: bool) -> Result<()> {
@@ -403,12 +395,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             vmlinux,
             rootfs,
         } => apple_container::cmd_dev_import_image(&manifest, &bundle, &vmlinux, &rootfs),
-        DevAction::FetchUrSeed { arch, mirror } => {
-            super::ur_seed::cmd_dev_fetch_ur_seed(arch.as_deref(), mirror.as_deref())
-        }
-        DevAction::ImportUrSeed { from, sha256 } => {
-            super::ur_seed::cmd_dev_import_ur_seed(&from, sha256.as_deref())
-        }
+        DevAction::FetchStage0 => cmd_dev_fetch_stage0(),
         DevAction::Rebuild {
             cpus,
             memory,

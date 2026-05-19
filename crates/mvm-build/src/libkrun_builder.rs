@@ -360,28 +360,20 @@ impl LibkrunBuilderVm {
         })?;
         let console_log = vm_state_dir.join("console.log");
 
-        let mut krun = KrunContext::new(
-            &vm_name,
-            path_to_str(&image.kernel_path, "kernel_path")?,
-            path_to_str(&image.rootfs_path, "rootfs_path")?,
-        )
-        .with_resources(self.vcpus, self.memory_mib)
-        .with_cmdline(&image.cmdline)
-        .with_console_output(path_to_str(&console_log, "console_log")?)
-        .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
-        .add_disk(
-            "nix-store",
-            path_to_str(nix_store_lock.path(), "nix_store_img")?,
-            false,
-        )
-        .add_virtio_fs("work", path_to_str(&job.work_dir, "work_dir")?)
-        .add_virtio_fs("out", path_to_str(&job.artifact_out, "artifact_out")?)
-        .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?)
-        // Plan 89 W2 part 2: reserve the dispatch port so libkrun
-        // creates the host-side Unix socket
-        // (`<vm_state_dir>/vsock-21471.sock`). The actual receive
-        // path is wired in W2 part 3 alongside builder-init's send.
-        .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT);
+        let mut krun = krun_context_for_image(&vm_name, &image)?
+            .with_resources(self.vcpus, self.memory_mib)
+            .with_cmdline(&image.cmdline)
+            .with_console_output(path_to_str(&console_log, "console_log")?)
+            .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
+            .add_disk(
+                "nix-store",
+                path_to_str(nix_store_lock.path(), "nix_store_img")?,
+                false,
+            )
+            .add_virtio_fs("work", path_to_str(&job.work_dir, "work_dir")?)
+            .add_virtio_fs("out", path_to_str(&job.artifact_out, "artifact_out")?)
+            .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?)
+            .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT);
 
         for disk in &job.extra_disks {
             krun = krun.add_disk(
@@ -633,25 +625,20 @@ impl BuilderVm for LibkrunBuilderVm {
         // hvc0 output silently and "supervisor running, then exits 1"
         // is the only observable signal.
         let console_log = vm_state_dir.join("console.log");
-        let mut krun = KrunContext::new(
-            &vm_name,
-            path_to_str(&image.kernel_path, "kernel_path")?,
-            path_to_str(&image.rootfs_path, "rootfs_path")?,
-        )
-        .with_resources(self.vcpus, self.memory_mib)
-        .with_cmdline(&image.cmdline)
-        .with_console_output(path_to_str(&console_log, "console_log")?)
-        .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
-        .add_disk(
-            "nix-store",
-            path_to_str(nix_store_lock.path(), "nix_store_img")?,
-            false,
-        )
-        .add_virtio_fs("work", path_to_str(&mounts.flake_src, "flake_src")?)
-        .add_virtio_fs("out", path_to_str(&mounts.artifact_out, "artifact_out")?)
-        .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?)
-        // Plan 89 W2 part 2: same as the flake-build path above.
-        .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT);
+        let mut krun = krun_context_for_image(&vm_name, &image)?
+            .with_resources(self.vcpus, self.memory_mib)
+            .with_cmdline(&image.cmdline)
+            .with_console_output(path_to_str(&console_log, "console_log")?)
+            .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
+            .add_disk(
+                "nix-store",
+                path_to_str(nix_store_lock.path(), "nix_store_img")?,
+                false,
+            )
+            .add_virtio_fs("work", path_to_str(&mounts.flake_src, "flake_src")?)
+            .add_virtio_fs("out", path_to_str(&mounts.artifact_out, "artifact_out")?)
+            .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?)
+            .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT);
 
         krun = apply_networking_mode(krun, &vm_state_dir, self.image_override.is_some())?;
 
@@ -716,20 +703,69 @@ impl BuilderVm for LibkrunBuilderVm {
 
 /// Resolved builder VM image — either the W2 flake output the
 /// libkrun launcher boots into, or a caller-supplied Stage 0 image.
+///
+/// Either a rootfs ext4 disk (the normal steady-state builder VM
+/// path) or an initramfs (the Stage 0 bootstrap path). Setting
+/// both is a programming error; setting neither is rejected at
+/// `run_build` time.
 #[derive(Debug, Clone)]
 pub struct BuilderVmImage {
     pub kernel_path: PathBuf,
-    pub rootfs_path: PathBuf,
+    pub rootfs_path: Option<PathBuf>,
+    pub initramfs_path: Option<PathBuf>,
     pub cmdline: String,
 }
 
 impl BuilderVmImage {
+    /// Image that boots from a rootfs ext4 disk + the supervisor's
+    /// canonical `init=` cmdline.
     pub fn new(kernel_path: PathBuf, rootfs_path: PathBuf, cmdline: String) -> Self {
         Self {
             kernel_path,
-            rootfs_path,
+            rootfs_path: Some(rootfs_path),
+            initramfs_path: None,
             cmdline,
         }
+    }
+
+    /// Image that boots from an initramfs (no rootfs disk attached).
+    /// The kernel decompresses the cpio into a tmpfs and runs
+    /// `init=/init` from it.
+    pub fn new_initramfs(kernel_path: PathBuf, initramfs_path: PathBuf, cmdline: String) -> Self {
+        Self {
+            kernel_path,
+            rootfs_path: None,
+            initramfs_path: Some(initramfs_path),
+            cmdline,
+        }
+    }
+}
+
+/// Build the right `KrunContext` flavor for a [`BuilderVmImage`].
+/// Rootfs images go through `KrunContext::new`; initramfs images
+/// go through `KrunContext::new_initramfs`. Either-or; refuses to
+/// construct a context if neither field is set.
+fn krun_context_for_image(
+    vm_name: &str,
+    image: &BuilderVmImage,
+) -> Result<KrunContext, BuilderVmError> {
+    let kernel = path_to_str(&image.kernel_path, "kernel_path")?;
+    if let Some(initramfs) = &image.initramfs_path {
+        Ok(KrunContext::new_initramfs(
+            vm_name,
+            kernel,
+            path_to_str(initramfs, "initramfs_path")?,
+        ))
+    } else if let Some(rootfs) = &image.rootfs_path {
+        Ok(KrunContext::new(
+            vm_name,
+            kernel,
+            path_to_str(rootfs, "rootfs_path")?,
+        ))
+    } else {
+        Err(BuilderVmError::ExtractionFailed(
+            "BuilderVmImage has neither rootfs_path nor initramfs_path".to_string(),
+        ))
     }
 }
 
@@ -798,11 +834,7 @@ fn ensure_builder_vm_image() -> Result<BuilderVmImage, BuilderVmError> {
         .trim()
         .to_string();
 
-    Ok(BuilderVmImage {
-        kernel_path,
-        rootfs_path,
-        cmdline,
-    })
+    Ok(BuilderVmImage::new(kernel_path, rootfs_path, cmdline))
 }
 
 #[derive(Debug)]

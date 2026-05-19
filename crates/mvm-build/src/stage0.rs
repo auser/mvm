@@ -59,8 +59,7 @@ pub struct BootstrapAsset {
 /// Origin: `pkgs.pkgsStatic.busybox` on `aarch64-linux` from
 /// nixpkgs, then `strip --strip-all`. Extracted out of an existing
 /// ur-seed rootfs.ext4 for this initial vendor.
-pub const BUSYBOX_AARCH64_BYTES: &[u8] =
-    include_bytes!("stage0/busybox-aarch64-linux-musl");
+pub const BUSYBOX_AARCH64_BYTES: &[u8] = include_bytes!("stage0/busybox-aarch64-linux-musl");
 
 /// SHA-256 of [`BUSYBOX_AARCH64_BYTES`]. Verified at the bottom of
 /// this file so a tampered vendored binary fails the workspace
@@ -150,7 +149,11 @@ pub fn build_initramfs() -> Result<Vec<u8>> {
     arc.symlink("/sbin", "bin");
 
     arc.file("/init", Perm::FILE_755, INIT_SCRIPT.as_bytes());
-    arc.file("/bin/busybox", Perm::FILE_755, BUSYBOX_AARCH64_BYTES.to_vec());
+    arc.file(
+        "/bin/busybox",
+        Perm::FILE_755,
+        BUSYBOX_AARCH64_BYTES.to_vec(),
+    );
     arc.file(
         "/usr/local/bin/nix-portable",
         Perm(NIX_PORTABLE_AARCH64.mode),
@@ -326,7 +329,10 @@ mod tests {
         // Linux kernel ELF magic + ARM aarch64 machine code.
         // ELF: 0x7f 'E' 'L' 'F'; e_machine for aarch64 is 0xB7 at
         // offset 18 (little-endian).
-        assert!(BUSYBOX_AARCH64_BYTES.len() > 64, "busybox too small to be a real ELF");
+        assert!(
+            BUSYBOX_AARCH64_BYTES.len() > 64,
+            "busybox too small to be a real ELF"
+        );
         assert_eq!(
             &BUSYBOX_AARCH64_BYTES[0..4],
             &[0x7f, b'E', b'L', b'F'],
