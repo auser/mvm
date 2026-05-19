@@ -76,8 +76,11 @@ Thin wrapper over `hickory-dns`.
   `MVM_ADDON_DNS_UPSTREAM_ADDRS` override. The server refuses upstreams
   that point at its own listener.
 - **Reload model:** SIGHUP reloads the zone without dropping in-flight
-  queries. This remains follow-up work after the server surface is
-  proven.
+  queries. The supervisor parses the new zone before taking the write
+  lock; a missing or malformed file leaves the previous record set
+  untouched. An empty file matches the no-op semantics (zero records
+  loaded, every name forwarded upstream). UDP listeners are never
+  re-bound on reload, so concurrent datagrams are unaffected.
 - **No-op mode:** an absent or empty zone file means the binary idles
   under supervision and opens no DNS service beyond what is explicitly
   wired.
@@ -145,6 +148,39 @@ The header is encoded as `4-byte big-endian length || UTF-8 JSON`.
 
 Both fields are optional. Missing or empty fields put the corresponding
 binary into no-op mode.
+
+## Init wiring
+
+`mkGuest` bakes `mvm-addon-dns` into every rootfs at
+`/usr/local/bin/mvm-addon-dns`; the supervisor is started only when a
+zone file is present at boot, so guests without addons keep the
+build-time `/etc/resolv.conf` byte-for-byte.
+
+When a zone file is present at `/run/mvm/addon_dns_zone.json` (mounted
+from the config disk) or `/etc/mvm/addon_dns_zone.json` (baked via
+mkGuest `extraFiles`), `/init` performs the following bootstrap before
+forking any workload code:
+
+1. Copy the zone file into `/run/mvm/addon_dns_zone.json` so reloads
+   and runtime-only edits land on tmpfs, not the read-only rootfs.
+2. Snapshot the existing `/etc/resolv.conf` into
+   `/run/mvm/upstream-resolv.conf` — the supervisor reads this file to
+   seed its upstream forwarders. The snapshot must happen before any
+   resolv.conf rewrite to avoid self-recursion.
+3. Write `nameserver 127.0.0.1` + `nameserver ::1` into
+   `/run/mvm/resolv.conf` and bind-mount that file over
+   `/etc/resolv.conf`. The single-file bind survives the read-only
+   `/etc` bind that ADR-002 W2.2 will eventually land.
+4. Fork `/usr/local/bin/mvm-addon-dns` under `setpriv` to the agent
+   uid with `--inh-caps=+net_bind_service --ambient-caps=+net_bind_service`
+   so the supervisor can bind UDP/53 on loopback only. No other
+   privilege is granted; loopback-bind validation lives in the
+   supervisor itself.
+
+`mvm-addon-dns` installs a SIGHUP handler that reloads
+`/run/mvm/addon_dns_zone.json` against the live shared zone, so a
+config-disk refresh (or `kill -HUP $(pidof mvm-addon-dns)`) takes
+effect without re-binding sockets.
 
 ## Validation
 

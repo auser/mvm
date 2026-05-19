@@ -109,3 +109,30 @@ The same tier is also copied into the signed `ExecutionPlan` admission profile. 
 ## DNS
 
 The guest's `/etc/resolv.conf` is configured at build time to use the host's DNS resolver. Internet access works out of the box through the NAT chain (Firecracker), vmnet (Apple Container), or Docker bridge networking (Docker).
+
+### Local addon DNS (opt-in)
+
+When a guest declares one or more local development addons via the
+`addon_dns_zone` config-disk field (see
+`specs/contracts/local-addon-dns.md`), `/init` activates the baked
+in-guest resolver `mvm-addon-dns`:
+
+1. The pre-existing `/etc/resolv.conf` is snapshotted into
+   `/run/mvm/upstream-resolv.conf` so the resolver has an explicit
+   upstream chain. This must happen before the resolv.conf rewrite or
+   the resolver would recurse into itself.
+2. `/etc/resolv.conf` is bind-mounted from `/run/mvm/resolv.conf` and
+   set to `nameserver 127.0.0.1` + `nameserver ::1`.
+3. `mvm-addon-dns` is forked under `setpriv` to the agent uid with
+   only `CAP_NET_BIND_SERVICE` as an ambient capability (no other
+   privilege is granted). The supervisor itself rejects any non-loopback
+   bind address and refuses upstreams that point back at its own
+   listener.
+
+The resolver answers exact configured addon hostnames authoritatively
+and forwards every other name (including sibling names in the same
+parent domain) to the upstream snapshot. SIGHUP reloads the zone file
+without re-binding sockets; in-flight UDP queries are never dropped.
+
+Guests that declare no addons skip the entire bootstrap, so
+`/etc/resolv.conf` stays byte-for-byte the build-time default.
