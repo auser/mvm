@@ -775,20 +775,40 @@ mod linux {
                     (code, tail, ms)
                 }
             }
-            crate::builder_request::BuilderJob::Install { .. } => {
-                // Install pipeline dispatch in the persistent VM
-                // is W3 part 5 work — Plan 73's sealed-volume
-                // invariants need extra thought against the
-                // long-lived VM model. For W3 part 3, fail closed
-                // with a structured error so the host sees a real
-                // Result with a meaningful exit_code.
-                (
-                    3,
-                    "Install variant via persistent dispatch not yet wired \
-                     (Plan 89 W3 part 5)"
-                        .to_string(),
-                    0,
-                )
+            crate::builder_request::BuilderJob::Install { spec_path } => {
+                // Plan 89 W3 part 8: route Install dispatches
+                // through the existing single-shot pipeline with
+                // per-dispatch paths. The host (PersistentBuilderVm)
+                // stages `<session.job_dir>/<job_id>/install_spec.json`
+                // and passes `/job/<job_dir_relpath>/install_spec.json`
+                // as the wire `spec_path`. The output (result.json +
+                // sealed volume sidecars) lands in `/job/<job_id>/out`
+                // so the host reads them back via the same per-
+                // dispatch out_dir convention as the Flake path.
+                let out_dir = format!("{JOB_DIR}/{job_dir_relpath}/out");
+                let job_subdir = format!("{JOB_DIR}/{job_dir_relpath}");
+                let started = Instant::now();
+                run_install_job_at(&spec_path, &job_subdir, &out_dir);
+                let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                // The install pipeline writes its own typed result
+                // (result.json) — exit code on the wire is just a
+                // dispatch-level signal that the install ran. The
+                // host's PersistentBuilderVm reads result.json for
+                // the real outcome. We pass 0 if result.json was
+                // emitted at all; the host's parser will decode it
+                // and surface installer_exit_code.
+                let result_path = format!("{out_dir}/result.json");
+                let exit_code = if Path::new(&result_path).is_file() {
+                    0
+                } else {
+                    2
+                };
+                let tail = if exit_code == 0 {
+                    String::new()
+                } else {
+                    format!("install pipeline did not emit {result_path}")
+                };
+                (exit_code, tail, ms)
             }
         };
         let response = crate::dispatch_response::DispatchResponse {
@@ -867,6 +887,20 @@ mod linux {
     /// via the *presence* of result.json. Anything that prevents
     /// us from writing result.json gets logged + falls through.
     fn run_install_job(spec_path: &str) {
+        run_install_job_at(spec_path, JOB_DIR, OUT_DIR);
+    }
+
+    /// Plan 89 W3 part 8 — install dispatch with explicit
+    /// `job_dir` and `out_dir`. Single-shot uses the legacy
+    /// `JOB_DIR` / `OUT_DIR` constants; persistent dispatch
+    /// passes the per-dispatch `/job/<job_id>` paths so concurrent
+    /// dispatches don't clobber each other's outputs (V1 is
+    /// serialized so the clobber risk is theoretical, but the
+    /// per-dispatch layout removes the question entirely and
+    /// matches the persistent flake path's
+    /// `<session.job_dir>/<job_id>/out/` convention from W3
+    /// part 6/7).
+    fn run_install_job_at(spec_path: &str, job_dir: &str, out_dir: &str) {
         use crate::install::{
             InstallContext, InstallError, RESULT_FILENAME, SystemCommandRunner, run_install,
         };
@@ -877,7 +911,7 @@ mod linux {
             Ok(b) => b,
             Err(e) => {
                 eprintln!("mvm-builder-init: read {spec_path}: {e}");
-                write_install_failure(2, &format!("read install spec: {e}"));
+                write_install_failure_at(out_dir, 2, &format!("read install spec: {e}"));
                 return;
             }
         };
@@ -885,10 +919,22 @@ mod linux {
             Ok(s) => s,
             Err(e) => {
                 eprintln!("mvm-builder-init: parse {spec_path}: {e}");
-                write_install_failure(2, &format!("parse install spec: {e}"));
+                write_install_failure_at(out_dir, 2, &format!("parse install spec: {e}"));
                 return;
             }
         };
+
+        // Persistent dispatch may pass a per-dispatch out_dir that
+        // doesn't exist yet (the host pre-stages it, but defensive
+        // `create_dir_all` is cheap and saves us from a race where
+        // the host's mkdir hasn't reached the guest's view of the
+        // virtio-fs share yet).
+        if let Err(e) = std::fs::create_dir_all(out_dir) {
+            eprintln!("mvm-builder-init: create_dir_all {out_dir}: {e}");
+            // Fall through; write_install_failure_at will try to
+            // write into the dir and the host will see whatever
+            // partial state results.
+        }
 
         let runner = SystemCommandRunner;
         // Plan 73 Followup B.2.x: the production proxy lifecycle
@@ -899,8 +945,8 @@ mod linux {
         let mut proxy = ChildProxyLifecycle::default_binary();
         let ctx = InstallContext {
             spec: &spec,
-            job_dir: Path::new(JOB_DIR),
-            out_dir: Path::new(OUT_DIR),
+            job_dir: Path::new(job_dir),
+            out_dir: Path::new(out_dir),
             runner: &runner,
             extra_path: None,
             proxy: &mut proxy,
@@ -911,7 +957,8 @@ mod linux {
                 eprintln!(
                     "mvm-builder-init: installer `{program}` not on PATH — builder VM is missing required tools"
                 );
-                write_install_failure(
+                write_install_failure_at(
+                    out_dir,
                     127,
                     &format!("installer `{program}` not on PATH inside builder VM"),
                 );
@@ -919,19 +966,19 @@ mod linux {
             }
             Err(InstallError::Io(why)) => {
                 eprintln!("mvm-builder-init: install pipeline IO: {why}");
-                write_install_failure(2, &format!("install pipeline IO: {why}"));
+                write_install_failure_at(out_dir, 2, &format!("install pipeline IO: {why}"));
                 return;
             }
         };
 
-        // Write the typed report into /out — the host reads it
-        // from `artifact_out/result.json` post-power-off. Plan 73
+        // Write the typed report into out_dir — the host reads it
+        // from `<out_dir>/result.json` post-power-off. Plan 73
         // Followup B.2's contract: result.json lives next to the
         // four sealed-volume artifacts so a single virtio-fs
         // share carries everything the host needs. Hand-rolled
         // JSON via InstallReport::to_json so we don't pull
         // serde_json into the init binary's closure.
-        let path = format!("{OUT_DIR}/{RESULT_FILENAME}");
+        let path = format!("{out_dir}/{RESULT_FILENAME}");
         if let Err(e) = std::fs::write(&path, format!("{}\n", report.to_json())) {
             eprintln!("mvm-builder-init: failed to write {path}: {e}");
         }
@@ -943,6 +990,13 @@ mod linux {
     /// [`crate::install::InstallReport::to_json`] so the host's
     /// parser doesn't need a separate code path.
     fn write_install_failure(exit_code: i32, reason: &str) {
+        write_install_failure_at(OUT_DIR, exit_code, reason);
+    }
+
+    /// Plan 89 W3 part 8 — install-failure writer with explicit
+    /// `out_dir`. Single-shot uses `OUT_DIR`; persistent dispatch
+    /// passes the per-dispatch `/job/<job_id>/out`.
+    fn write_install_failure_at(out_dir: &str, exit_code: i32, reason: &str) {
         use crate::install::{
             CONTENT_SUBDIR, CVE_FILENAME, FETCH_LOG_FILENAME, RESULT_FILENAME, SBOM_FILENAME,
         };
@@ -952,13 +1006,13 @@ mod linux {
         // host's parser sees installer_exit_code != 0 and refuses
         // to seal the volume.
         let body = format!(
-            r#"{{"installer_exit_code":{exit_code},"sbom_emitted":false,"cve_emitted":false,"language":"unknown","gate":"unknown","content_path":"{OUT_DIR}/{CONTENT_SUBDIR}","sbom_path":"{OUT_DIR}/{SBOM_FILENAME}","fetch_log_path":"{OUT_DIR}/{FETCH_LOG_FILENAME}","cve_path":"{OUT_DIR}/{CVE_FILENAME}","failure_reason":"{escaped}"}}"#,
+            r#"{{"installer_exit_code":{exit_code},"sbom_emitted":false,"cve_emitted":false,"language":"unknown","gate":"unknown","content_path":"{out_dir}/{CONTENT_SUBDIR}","sbom_path":"{out_dir}/{SBOM_FILENAME}","fetch_log_path":"{out_dir}/{FETCH_LOG_FILENAME}","cve_path":"{out_dir}/{CVE_FILENAME}","failure_reason":"{escaped}"}}"#,
         );
-        let path = format!("{OUT_DIR}/{RESULT_FILENAME}");
-        // Best-effort: if /out isn't mounted (the install-spec
-        // dispatch ran before virtio-fs came up), at least try
-        // /job so the host has *somewhere* to pick up the failure
-        // signal.
+        let path = format!("{out_dir}/{RESULT_FILENAME}");
+        // Best-effort: if `out_dir` isn't writable (the install-spec
+        // dispatch ran before virtio-fs came up, or the persistent-
+        // dispatch out_dir doesn't exist yet), at least try /job so
+        // the host has *somewhere* to pick up the failure signal.
         if let Err(e) = std::fs::write(&path, format!("{body}\n")) {
             eprintln!("mvm-builder-init: failed to write {path}: {e}");
             let fallback = format!("{JOB_DIR}/{RESULT_FILENAME}");
