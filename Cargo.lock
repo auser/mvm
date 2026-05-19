@@ -3012,6 +3012,7 @@ dependencies = [
  "chrono",
  "ed25519-dalek",
  "flate2",
+ "fs2",
  "mvm-core",
  "mvm-guest",
  "mvm-libkrun",
