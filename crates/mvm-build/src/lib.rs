@@ -2,14 +2,13 @@ pub mod app_deps;
 pub mod app_deps_gate;
 pub mod artifacts;
 pub mod backend;
-pub mod cpio;
-pub mod stage0;
 /// Plan 89 W2 — vsock dispatch wire types for the persistent
 /// builder VM. Today this is types + tests only; the dispatch path
 /// itself wires in W2 PR 2 and the persistent-VM lifecycle in W3.
 pub mod builder_protocol;
 pub mod builder_vm;
 pub mod cache;
+pub mod cpio;
 pub mod firecracker;
 /// Plan 76 Phase 6 — portable signed `.mvm` artifacts. A tar.gz
 /// wrapper around kernel + rootfs + verity sidecars + cmdline,
@@ -24,6 +23,7 @@ pub mod persistent_builder;
 /// The host only allocates the sparse file; formatting and copying
 /// happen inside the existing builder VM.
 pub mod rootfs;
+pub mod stage0;
 pub mod template_reuse;
 
 /// Plan 72 W1 — libkrun-backed builder VM (gated by

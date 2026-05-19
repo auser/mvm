@@ -46,9 +46,19 @@ impl Perm {
 /// are always relative to the archive root).
 #[derive(Debug, Clone)]
 pub enum CpioEntry {
-    Dir { path: String, perm: Perm },
-    File { path: String, perm: Perm, data: Vec<u8> },
-    Symlink { path: String, target: String },
+    Dir {
+        path: String,
+        perm: Perm,
+    },
+    File {
+        path: String,
+        perm: Perm,
+        data: Vec<u8>,
+    },
+    Symlink {
+        path: String,
+        target: String,
+    },
 }
 
 impl CpioEntry {

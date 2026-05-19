@@ -85,8 +85,7 @@ pub const ASSETS_AARCH64: &[&BootstrapAsset] = &[&BUSYBOX_AARCH64, &NIX_PORTABLE
 
 /// `~/.cache/mvm/stage0/`. Materialized by [`prepare_assets`].
 pub fn stage0_cache_dir() -> PathBuf {
-    let home =
-        std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
+    let home = std::env::var_os("HOME").map_or_else(|| PathBuf::from("/tmp"), PathBuf::from);
     home.join(".cache").join("mvm").join("stage0")
 }
 
@@ -102,8 +101,7 @@ pub fn stage0_cache_dir() -> PathBuf {
 /// per-file sha256 check.
 pub fn prepare_assets(assets: &[&BootstrapAsset]) -> Result<()> {
     let dir = stage0_cache_dir();
-    std::fs::create_dir_all(&dir)
-        .with_context(|| format!("creating {}", dir.display()))?;
+    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
 
     for asset in assets {
         let target = dir.join(asset.cache_filename);
@@ -134,9 +132,20 @@ pub fn build_initramfs() -> Result<Vec<u8>> {
     let mut arc = CpioArchive::new();
     // Directory stubs the init script (and the kernel's early-boot
     // mounts) need to exist before mount(2) succeeds.
-    for d in &["/bin", "/dev", "/etc", "/out", "/proc", "/run", "/sys", "/tmp", "/usr",
-        "/usr/local", "/usr/local/bin", "/work"]
-    {
+    for d in &[
+        "/bin",
+        "/dev",
+        "/etc",
+        "/out",
+        "/proc",
+        "/run",
+        "/sys",
+        "/tmp",
+        "/usr",
+        "/usr/local",
+        "/usr/local/bin",
+        "/work",
+    ] {
         arc.dir(*d, Perm::DIR_755);
     }
     // /sbin is conventionally a symlink to /bin on busybox systems —
@@ -165,8 +174,20 @@ pub fn build_initramfs() -> Result<Vec<u8>> {
 /// busybox applets the init script invokes directly. Each one
 /// gets a /bin/<name> -> busybox symlink in the initramfs.
 const PRE_INSTALLED_APPLETS: &[&str] = &[
-    "sh", "mount", "umount", "mkdir", "mountpoint", "cp", "ip", "udhcpc", "sync",
-    "poweroff", "cat", "echo", "ls", "rm",
+    "sh",
+    "mount",
+    "umount",
+    "mkdir",
+    "mountpoint",
+    "cp",
+    "ip",
+    "udhcpc",
+    "sync",
+    "poweroff",
+    "cat",
+    "echo",
+    "ls",
+    "rm",
 ];
 
 fn read_asset(dir: &Path, asset: &BootstrapAsset) -> Result<Vec<u8>> {
@@ -214,7 +235,9 @@ fn fetch_to(target: &Path, asset: &BootstrapAsset) -> Result<()> {
         .with_context(|| format!("GET {}", asset.url))?
         .error_for_status()
         .with_context(|| format!("GET {} returned non-success status", asset.url))?;
-    let bytes = resp.bytes().with_context(|| format!("reading body from {}", asset.url))?;
+    let bytes = resp
+        .bytes()
+        .with_context(|| format!("reading body from {}", asset.url))?;
 
     let got_hex = hex::encode(Sha256::digest(&bytes));
     if !got_hex.eq_ignore_ascii_case(asset.sha256_hex) {
@@ -292,10 +315,7 @@ mod tests {
 
     #[test]
     fn assets_table_covers_busybox_and_nix_portable() {
-        let names: Vec<_> = ASSETS_AARCH64
-            .iter()
-            .map(|a| a.cache_filename)
-            .collect();
+        let names: Vec<_> = ASSETS_AARCH64.iter().map(|a| a.cache_filename).collect();
         assert!(names.contains(&"busybox"));
         assert!(names.contains(&"nix-portable"));
     }
@@ -351,11 +371,7 @@ mod tests {
         // there. Move them.
         let real_dir = stage0_cache_dir();
         std::fs::create_dir_all(&real_dir).unwrap();
-        std::fs::rename(
-            dir.path().join("busybox"),
-            real_dir.join("busybox"),
-        )
-        .unwrap();
+        std::fs::rename(dir.path().join("busybox"), real_dir.join("busybox")).unwrap();
         std::fs::rename(
             dir.path().join("nix-portable"),
             real_dir.join("nix-portable"),
