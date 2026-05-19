@@ -10,19 +10,26 @@
 //! [`mvm_core::security::AuthenticatedFrame`]) — no new key material
 //! is introduced.
 //!
-//! ## Scope of this module (W2 PR 1 of N)
+//! ## Scope of this module across PRs
 //!
-//! - **In:** wire types ([`BuilderRequest`], [`BuilderResponse`],
-//!   [`JobTimings`], [`BootTimingsWire`]), serde derives with
-//!   `#[serde(deny_unknown_fields)]`, unit tests for serde roundtrip
-//!   and unknown-field rejection.
-//! - **Out (deferred):** wiring `mvm-builder-init` to emit
-//!   [`BuilderResponse::Result`] on exit, wiring the host's
-//!   single-shot path (`LibkrunBuilderVm::run_build`) to read the
-//!   response over vsock instead of polling `<job_dir>/result`.
-//!   Those land in W2 PR 2 along with the integration tests
-//!   exercising the cold-boot VM exiting through the new code path.
-//!   W3 then adds the dispatch loop and persistent mode.
+//! - **W2 part 1 (shipped):** wire types ([`BuilderRequest`],
+//!   [`BuilderResponse`], [`JobTimings`], [`BootTimingsWire`]),
+//!   serde derives with `#[serde(deny_unknown_fields)]`, unit tests
+//!   for serde roundtrip and unknown-field rejection, fuzz target.
+//! - **W2 part 2 (this PR):** [`BUILDER_DISPATCH_PORT`] reserved on
+//!   the libkrun builder VM, host-side reader helpers
+//!   [`read_builder_response`] / [`read_builder_response_from_socket`]
+//!   with explicit no-response handling
+//!   ([`BuilderResponseRead::EmptyEof`] / [`BuilderResponseRead::Timeout`])
+//!   so the legacy file-based result path remains the fallback while
+//!   the guest-side send code is unwired.
+//! - **W2 part 3 (next):** modify `mvm-builder-init` to send
+//!   [`BuilderResponse::Result`] on exit, wire the host's
+//!   single-shot path (`LibkrunBuilderVm::run_build`) to call
+//!   [`read_builder_response_from_socket`] before falling back to
+//!   `<job_dir>/result`. That PR exercises the cold-boot VM exiting
+//!   through the new code path end-to-end.
+//! - **W3 (after):** dispatch loop and persistent mode.
 //!
 //! ## Frame size cap
 //!
@@ -222,6 +229,110 @@ pub struct BootTimingsWire {
     pub job_start_ms: Option<u64>,
     pub job_end_ms: Option<u64>,
     pub poweroff_start_ms: Option<u64>,
+}
+
+// ============================================================================
+// Host-side reader (W2 part 2)
+// ============================================================================
+
+/// Outcome of trying to read a [`BuilderResponse`] from a builder
+/// VM's vsock dispatch socket. Modelled explicitly because the
+/// "guest exited without sending anything" case is a normal,
+/// non-error outcome during the W2 part 2 → W2 part 3 transition
+/// (the guest-side send code isn't wired yet, and old cached dev
+/// images will continue not to send for some time after part 3
+/// lands).
+#[derive(Debug)]
+pub enum BuilderResponseRead {
+    /// A complete, well-formed response arrived.
+    Frame(BuilderResponse),
+    /// The connection was opened but the guest closed it without
+    /// sending any bytes (clean EOF). Callers should fall back to
+    /// the legacy file-based result path.
+    EmptyEof,
+    /// The read timed out before a full frame arrived. Callers
+    /// should treat this the same as `EmptyEof` for the W2 part 2
+    /// timeline (the legacy file path is the authoritative source);
+    /// once part 3 lands and the guest reliably sends, a timeout
+    /// becomes a real signal worth surfacing.
+    Timeout,
+}
+
+/// Connect to the libkrun-managed Unix socket for
+/// [`mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`] and read
+/// one framed [`BuilderResponse`] within `timeout`.
+///
+/// The framing reader reuses [`mvm_guest::vsock::read_frame`],
+/// which enforces the same 256 KiB pre-deserialize cap
+/// [`BuilderResponse`] inherits — see this module's header docs
+/// for the F8 amendment correction.
+///
+/// `socket_path` is `<vm_state_dir>/vsock-<BUILDER_DISPATCH_PORT>.sock`
+/// — the file libkrun creates when the krun context is configured
+/// via `add_vsock_port(BUILDER_DISPATCH_PORT)` (Plan 89 W2 part 2).
+pub fn read_builder_response_from_socket(
+    socket_path: &std::path::Path,
+    timeout: std::time::Duration,
+) -> std::io::Result<BuilderResponseRead> {
+    use std::os::unix::net::UnixStream;
+    let mut stream = UnixStream::connect(socket_path)?;
+    stream.set_read_timeout(Some(timeout))?;
+    Ok(read_builder_response(&mut stream))
+}
+
+/// Read one framed [`BuilderResponse`] from any `UnixStream`-like
+/// stream. Returns [`BuilderResponseRead::EmptyEof`] on clean EOF
+/// before any bytes arrive, [`BuilderResponseRead::Timeout`] on
+/// `WouldBlock`/`TimedOut`, and propagates other I/O or serde
+/// failures by reading them as Timeout-equivalent (the caller's
+/// fallback path is the same — we don't want a corrupted/partial
+/// frame to fail the whole build when the file-based path still
+/// has the authoritative answer).
+///
+/// Separated from [`read_builder_response_from_socket`] so unit
+/// tests can drive the wire with a `UnixStream::pair()` without
+/// going through libkrun. The two layers compose: the
+/// `from_socket` variant is `connect` + this.
+pub fn read_builder_response(stream: &mut std::os::unix::net::UnixStream) -> BuilderResponseRead {
+    match mvm_guest::vsock::read_frame::<BuilderResponse>(stream) {
+        Ok(resp) => BuilderResponseRead::Frame(resp),
+        Err(e) => {
+            // anyhow::Error chains the io::Error underneath when
+            // read_exact failed. Walk the chain to classify.
+            let src = e.source();
+            if let Some(io_err) = src.and_then(|s| s.downcast_ref::<std::io::Error>()) {
+                match io_err.kind() {
+                    std::io::ErrorKind::UnexpectedEof => {
+                        return BuilderResponseRead::EmptyEof;
+                    }
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut => {
+                        return BuilderResponseRead::Timeout;
+                    }
+                    _ => {}
+                }
+            }
+            // Default to Timeout so callers always have a fallback
+            // path. Logging the underlying error is the caller's
+            // responsibility.
+            BuilderResponseRead::Timeout
+        }
+    }
+}
+
+/// Write one framed [`BuilderResponse`] to a `UnixStream`. Mirror
+/// of [`read_builder_response`] — exists so unit tests of the
+/// reader can produce real wire bytes via the same framing
+/// `mvm-builder-init` will use in W2 part 3 (with the
+/// host-vs-builder-init split, the actual guest emit will hand-roll
+/// the JSON to keep builder-init's dep tree small). The pair-test
+/// using this writer + the reader is the regression we want to lock
+/// in now so the guest emit lands against a known-good host reader.
+pub fn write_builder_response(
+    stream: &mut std::os::unix::net::UnixStream,
+    response: &BuilderResponse,
+) -> std::io::Result<()> {
+    mvm_guest::vsock::write_frame(stream, response)
+        .map_err(|e| std::io::Error::other(e.to_string()))
 }
 
 #[cfg(test)]
@@ -444,6 +555,79 @@ mod tests {
         assert_eq!(parsed.init_start_ms, Some(0));
         assert_eq!(parsed.nix_seeded_ms, None);
         assert_eq!(parsed.poweroff_start_ms, Some(8410));
+    }
+
+    #[test]
+    fn read_builder_response_roundtrips_through_unix_stream_pair() {
+        // W2 part 2 host-side wire: when the guest sends a
+        // BuilderResponse over the dispatch socket, the host
+        // reader should decode it byte-for-byte. Pair of
+        // UnixStreams stands in for the libkrun-managed socket.
+        use std::os::unix::net::UnixStream;
+        let (mut a, mut b) = UnixStream::pair().expect("socketpair");
+        let response = sample_result();
+        write_builder_response(&mut a, &response).expect("write");
+        drop(a); // signal EOF after the single frame
+        let read = read_builder_response(&mut b);
+        match read {
+            BuilderResponseRead::Frame(got) => assert_eq!(got, response),
+            other => panic!("expected Frame, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_builder_response_returns_empty_eof_on_clean_close() {
+        // The W2 part 2 → W2 part 3 transition expects this: the
+        // host opens a vsock conn, but no guest send code is wired
+        // yet, so the conn closes without bytes. Reader must signal
+        // EmptyEof so the caller falls back to the legacy file
+        // path instead of failing the build.
+        use std::os::unix::net::UnixStream;
+        let (a, mut b) = UnixStream::pair().expect("socketpair");
+        drop(a);
+        match read_builder_response(&mut b) {
+            BuilderResponseRead::EmptyEof => {}
+            other => panic!("expected EmptyEof, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_builder_response_returns_timeout_when_peer_idle() {
+        // Reader's set_read_timeout(...) elapses without the peer
+        // writing anything. Classify as Timeout (not Err) so the
+        // caller's fallback path runs the same as EmptyEof.
+        use std::os::unix::net::UnixStream;
+        use std::time::Duration;
+        let (_a, mut b) = UnixStream::pair().expect("socketpair");
+        b.set_read_timeout(Some(Duration::from_millis(50)))
+            .expect("set_read_timeout");
+        match read_builder_response(&mut b) {
+            BuilderResponseRead::Timeout => {}
+            other => panic!("expected Timeout, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn read_builder_response_handles_streamed_chunks() {
+        // Guest writes a Result preceded by a StderrChunk over the
+        // same conn; the reader picks up the first frame. This
+        // documents that the reader reads ONE frame and stops —
+        // multi-frame streaming is a W3 concern (the persistent
+        // dispatch loop reads many).
+        use std::os::unix::net::UnixStream;
+        let (mut a, mut b) = UnixStream::pair().expect("socketpair");
+        let chunk = BuilderResponse::StderrChunk {
+            job_id: JobId(Uuid::nil()),
+            line: "[mvm] building".to_string(),
+        };
+        let final_result = sample_result();
+        write_builder_response(&mut a, &chunk).expect("chunk");
+        write_builder_response(&mut a, &final_result).expect("result");
+        drop(a);
+        match read_builder_response(&mut b) {
+            BuilderResponseRead::Frame(got) => assert_eq!(got, chunk),
+            other => panic!("expected first frame to be the chunk, got {other:?}"),
+        }
     }
 
     #[test]

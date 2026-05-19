@@ -348,7 +348,12 @@ impl LibkrunBuilderVm {
         )
         .add_virtio_fs("work", path_to_str(&job.work_dir, "work_dir")?)
         .add_virtio_fs("out", path_to_str(&job.artifact_out, "artifact_out")?)
-        .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?);
+        .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?)
+        // Plan 89 W2 part 2: reserve the dispatch port so libkrun
+        // creates the host-side Unix socket
+        // (`<vm_state_dir>/vsock-21471.sock`). The actual receive
+        // path is wired in W2 part 3 alongside builder-init's send.
+        .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT);
 
         for disk in &job.extra_disks {
             krun = krun.add_disk(
@@ -605,7 +610,9 @@ impl BuilderVm for LibkrunBuilderVm {
         )
         .add_virtio_fs("work", path_to_str(&mounts.flake_src, "flake_src")?)
         .add_virtio_fs("out", path_to_str(&mounts.artifact_out, "artifact_out")?)
-        .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?);
+        .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?)
+        // Plan 89 W2 part 2: same as the flake-build path above.
+        .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT);
 
         krun = apply_networking_mode(krun, &vm_state_dir)?;
 
