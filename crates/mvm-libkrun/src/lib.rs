@@ -35,6 +35,24 @@ pub use sys::{BundledKernel, KernelFormat, LogLevel, extract_bundled_kernel, set
 #[cfg(target_family = "unix")]
 pub mod passt;
 
+// Plan 88 / ADR-055 cross-platform amendment — gvproxy-backed
+// virtio-net. The macOS counterpart to passt; both modules share the
+// same shape (spawn child, hand its socket to libkrun, kill on Drop)
+// but gvproxy uses libkrun's `krun_add_net_unixgram` (path-based)
+// where passt uses `krun_add_net_unixstream` (fd-passed). Same unix
+// gate as passt — Windows has neither.
+#[cfg(target_family = "unix")]
+pub mod gvproxy;
+
+/// Cross-module env mutation serializer. Both `passt::tests` and
+/// `gvproxy::tests` mutate `$PATH` to verify their `NotInstalled`
+/// error paths; `cargo test`'s default parallelism would race them
+/// otherwise and leak the "set PATH to a tmp dir" state across the
+/// two tests, making one's spawn call see the other's modified env.
+#[cfg(test)]
+pub(crate) static TEST_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+    std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
 /// Errors returned by this crate.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Error {
@@ -297,6 +315,23 @@ pub enum NetworkingMode {
         /// co-located. The supervisor creates it if absent.
         scratch_dir: String,
     },
+    /// virtio-net via gvproxy — Plan 88. The supervisor spawns a
+    /// gvproxy child inside `run_supervisor`, points libkrun's
+    /// `krun_add_net_unixgram` at the listener socket gvproxy
+    /// creates, and reaps gvproxy on guest exit. Same model as
+    /// `Passt` but unixgram-flavored: libkrun connects to a path
+    /// on disk rather than receiving a pre-opened socket fd. This
+    /// is the canonical macOS backend (passt is Linux-only — see
+    /// ADR-055 §"Cross-platform backends").
+    Gvproxy {
+        /// MAC address for the guest's eth0. Same shape as the
+        /// `Passt` variant.
+        mac: [u8; 6],
+        /// Host directory where the supervisor stages gvproxy's
+        /// listener socket (`<scratch_dir>/gvproxy.sock`) + log
+        /// file (`<scratch_dir>/gvproxy.log`).
+        scratch_dir: String,
+    },
 }
 
 impl KrunContext {
@@ -322,6 +357,18 @@ impl KrunContext {
             vsock_socket_dir: None,
             networking: NetworkingMode::Tsi,
         }
+    }
+
+    /// Switch the guest to gvproxy-backed virtio-net. Same shape as
+    /// [`Self::with_passt`] but uses libkrun's unixgram backend; the
+    /// supervisor spawns gvproxy with `--listen-vfkit <socket>` and
+    /// hands the socket path to `krun_add_net_unixgram`. Plan 88.
+    pub fn with_gvproxy(mut self, mac: [u8; 6], scratch_dir: impl Into<String>) -> Self {
+        self.networking = NetworkingMode::Gvproxy {
+            mac,
+            scratch_dir: scratch_dir.into(),
+        };
+        self
     }
 
     /// Switch the guest to passt-backed virtio-net. The supervisor
@@ -459,27 +506,41 @@ pub fn start(ctx: &KrunContext) -> Result<(), Error> {
 #[cfg(feature = "libkrun-sys")]
 fn configure(ctx: &KrunContext) -> Result<sys::Context, Error> {
     let krun = configure_pre_net(ctx)?;
-    if matches!(ctx.networking, NetworkingMode::Passt { .. }) {
+    if !matches!(ctx.networking, NetworkingMode::Tsi) {
         return Err(Error::Io {
-            context: "NetworkingMode::Passt requires the supervisor entry point; \
-                 call `run_supervisor` rather than `start` / `start_enter` directly"
-                .to_string(),
+            context: format!(
+                "{:?} requires the supervisor entry point; call \
+                 `run_supervisor` rather than `start` / `start_enter` directly",
+                ctx.networking
+            ),
         });
     }
     Ok(krun)
 }
 
-/// Plan 87 W1+W2 — configure() variant that owns a `PasstSupervisor`
-/// for the lifetime of the returned context. Used by [`run_supervisor`]
-/// when `NetworkingMode::Passt` is set. The handle Drop's after libkrun
-/// finishes consuming the fd and the guest exits.
+/// Plan 88 — owning handle to whichever userspace network gateway
+/// the supervisor spawned for this guest. Lives for the libkrun
+/// process lifetime so the gateway is reaped when the guest exits.
 #[cfg(all(feature = "libkrun-sys", target_family = "unix"))]
-fn configure_with_passt(
-    ctx: &KrunContext,
-) -> Result<(sys::Context, Option<passt::PasstHandle>), Error> {
+pub enum GatewayHandle {
+    /// Not using a virtio-net backend — TSI is enabled implicitly.
+    None,
+    /// passt child (Linux).
+    Passt(passt::PasstHandle),
+    /// gvproxy child (macOS / cross-platform fallback).
+    Gvproxy(gvproxy::GvproxyHandle),
+}
+
+/// Plan 87 W1+W2 / Plan 88 W1+W2 — configure() variant that owns the
+/// network-gateway child process for the lifetime of the returned
+/// context. Used by [`run_supervisor`] when
+/// `NetworkingMode::{Passt, Gvproxy}` is set. The handle Drop's after
+/// libkrun finishes consuming the socket and the guest exits.
+#[cfg(all(feature = "libkrun-sys", target_family = "unix"))]
+fn configure_with_gateway(ctx: &KrunContext) -> Result<(sys::Context, GatewayHandle), Error> {
     let krun = configure_pre_net(ctx)?;
     let handle = match &ctx.networking {
-        NetworkingMode::Tsi => None,
+        NetworkingMode::Tsi => GatewayHandle::None,
         NetworkingMode::Passt { mac, scratch_dir } => {
             let handle =
                 passt::spawn(std::path::Path::new(scratch_dir)).map_err(|e| Error::Io {
@@ -491,7 +552,20 @@ fn configure_with_passt(
                 sys::PASST_NET_FEATURES,
                 /* flags = */ 0,
             )?;
-            Some(handle)
+            GatewayHandle::Passt(handle)
+        }
+        NetworkingMode::Gvproxy { mac, scratch_dir } => {
+            let handle =
+                gvproxy::spawn(std::path::Path::new(scratch_dir)).map_err(|e| Error::Io {
+                    context: format!("spawning gvproxy for NetworkingMode::Gvproxy: {e}"),
+                })?;
+            krun.add_net_unixgram_path(
+                handle.socket_path(),
+                mac,
+                sys::PASST_NET_FEATURES,
+                /* flags = */ 0,
+            )?;
+            GatewayHandle::Gvproxy(handle)
         }
     };
     Ok((krun, handle))
@@ -715,7 +789,7 @@ pub fn run_supervisor(cfg: &SupervisorConfig) -> Result<std::convert::Infallible
     // on the success path, so the handle's Drop runs as part of
     // process teardown when the guest powers off. On error paths
     // the handle Drops normally and SIGTERMs passt before we return.
-    let (krun, _passt_handle) = configure_with_passt(&cfg.krun)?;
+    let (krun, _gateway_handle) = configure_with_gateway(&cfg.krun)?;
     install_shutdown_handler(&krun)?;
     krun.start_enter()
 }

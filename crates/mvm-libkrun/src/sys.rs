@@ -238,6 +238,45 @@ impl Context {
         })
     }
 
+    /// Add a virtio-net device backed by a unixgram userspace network
+    /// proxy (Plan 88 W1 — gvproxy on macOS replacing passt). Mirror
+    /// of [`Self::add_net_unixstream_fd`] but uses libkrun's
+    /// `krun_add_net_unixgram` which takes a *path* to a listening
+    /// unix-domain socket rather than a pre-opened fd — gvproxy
+    /// creates the listener itself when invoked with
+    /// `--listen-vfkit <path>`, and libkrun's host-side code
+    /// connects to that path.
+    ///
+    /// `c_path` and `fd` are mutually exclusive in the C API; we
+    /// always take the path arm so the caller (typically
+    /// `mvm-libkrun::gvproxy::spawn`) owns the socket lifecycle.
+    /// Pass `socket_path` as the path the gvproxy child listens on.
+    ///
+    /// Calling this disables libkrun's TSI backend (same as the
+    /// unixstream wrapper). `features` should be
+    /// [`super::PASST_NET_FEATURES`] — the macro is named after
+    /// passt but `COMPAT_NET_FEATURES` in `libkrun.h:344` applies
+    /// to both passt and gvproxy (`krun_set_gvproxy_path` lists it).
+    pub fn add_net_unixgram_path(
+        &self,
+        socket_path: &Path,
+        mac: &[u8; 6],
+        features: u32,
+        flags: u32,
+    ) -> Result<(), Error> {
+        let path = cstring(socket_path)?;
+        check(unsafe {
+            bindings::krun_add_net_unixgram(
+                self.ctx_id,
+                path.as_ptr(),
+                /* fd = */ -1,
+                mac.as_ptr() as *mut u8,
+                features,
+                flags,
+            )
+        })
+    }
+
     /// Returns the shutdown eventfd. The caller is responsible for
     /// closing it (libkrun documents that the fd is owned by the
     /// caller once returned).

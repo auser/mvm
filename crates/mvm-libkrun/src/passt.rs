@@ -296,6 +296,7 @@ fn clear_cloexec(fd: RawFd) -> io::Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::TEST_ENV_LOCK as ENV_LOCK;
 
     #[test]
     fn install_hint_is_platform_specific() {
@@ -315,6 +316,7 @@ mod tests {
 
     #[test]
     fn spawn_without_passt_returns_not_installed() {
+        let _guard = ENV_LOCK.lock().unwrap();
         // Hide passt from PATH for this test by setting PATH to
         // an empty dir.
         let tmp = tempfile::tempdir().unwrap();
