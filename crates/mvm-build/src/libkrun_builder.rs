@@ -770,14 +770,15 @@ set -eu
 FLAKE_REF='{flake_ref}'
 ATTR_PATH='{attr_path}'
 
-# Point HOME and Nix's cache/state/temp dirs at the writable persistent
-# Nix disk, not `/tmp`. `/tmp` is a RAM-backed tmpfs and can fill during
-# flake evaluation; `/nix` is the persistent virtio-blk store image.
-export HOME=/nix/var/mvm-builder-home
-export XDG_CACHE_HOME="$HOME/.cache"
-export XDG_STATE_HOME="$HOME/.local/state"
-export TMPDIR="$HOME/tmp"
-mkdir -p "$XDG_CACHE_HOME" "$XDG_STATE_HOME" "$TMPDIR"
+# Point HOME and Nix's cache/state dirs at the writable tmpfs (`/tmp`).
+# The rootfs is mounted `ro`, so nix tries `~/.cache/nix` and bails
+# with "creating directory '//.cache/nix': Read-only file system"
+# when HOME stays at the default `/`. /tmp is tmpfs, lives only for
+# this VM's lifetime — fine for a single-shot build.
+export HOME=/tmp
+export XDG_CACHE_HOME=/tmp/.cache
+export XDG_STATE_HOME=/tmp/.local/state
+mkdir -p /tmp/.cache /tmp/.local/state
 
 # CA certs for TLS to cache.nixos.org / api.github.com.
 export CURL_CA_BUNDLE=/etc/ssl/certs/ca-bundle.crt
@@ -1756,9 +1757,6 @@ mod tests {
         assert!(cmd.starts_with("#!/bin/sh"));
         assert!(cmd.contains("set -eu"));
         assert!(cmd.contains("cd /work"));
-        assert!(cmd.contains("export HOME=/nix/var/mvm-builder-home"));
-        assert!(cmd.contains(r#"export XDG_CACHE_HOME="$HOME/.cache""#));
-        assert!(cmd.contains(r#"export TMPDIR="$HOME/tmp""#));
         assert!(cmd.contains("printf '%s\\n' \"$NIX_OUT\" > /job/store-path"));
     }
 
