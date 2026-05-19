@@ -311,7 +311,13 @@ which.workspace = true
 # libkrun isn't installed on the host, so a default-features binary works
 # everywhere. Library consumers (mvmd) that want a lean closure build with
 # `default-features = false`.
-default = ["builder-vm"]
+default = ["builder-vm", "libkrun-sys"]
+# Plan 86 / Plan 72 W5.D bullet 10: extract libkrunfw's bundled
+# TSI-patched kernel at runtime. Wired here on the root `mvmctl`
+# binary by default so the contributor `cargo run -- dev up` path
+# reaches `extract_bundled_kernel`. `mvm-cli` keeps it as an
+# opt-in library feature (library consumers don't link libkrunfw).
+libkrun-sys = ["mvm-cli/libkrun-sys"]
 contributor-bootstrap = [
     "mvm/contributor-bootstrap",
     "mvm-backend/contributor-bootstrap",
