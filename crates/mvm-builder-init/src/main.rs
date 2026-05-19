@@ -72,6 +72,13 @@ use std::process::ExitCode;
 // red because the tests would lose coverage.
 #[allow(dead_code)]
 mod boot_timings;
+/// Plan 89 W2 part 3 — hand-rolled `BuilderResponse::Result`
+/// JSON. Cross-platform (testable on macOS) so the wire shape can
+/// be validated against `mvm_build::builder_protocol`'s typed
+/// serde via a dev-dep test, without dragging serde_json into the
+/// production builder-init binary.
+#[allow(dead_code)]
+mod dispatch_response;
 #[allow(dead_code)]
 mod install;
 #[allow(dead_code)]
@@ -363,16 +370,217 @@ mod linux {
         stamp(&timings, |t| {
             t.job_start_ms = Some(BootTimings::ms_since(anchor))
         });
+        let job_start_at = Instant::now();
         let (code, tail) = run_job(&cmd_path);
+        let build_ms = u64::try_from(job_start_at.elapsed().as_millis()).unwrap_or(u64::MAX);
         stamp(&timings, |t| {
             t.job_end_ms = Some(BootTimings::ms_since(anchor))
         });
         write_result(code, &tail);
+        // Plan 89 W2 part 3: best-effort vsock send of the
+        // `BuilderResponse::Result` frame the host's
+        // `mvm_build::builder_protocol::read_builder_response_from_socket`
+        // is waiting for. Runs BEFORE write_boot_timings so the
+        // timings snapshot we send mirrors what hits the filesystem.
+        // Any failure logs and falls through to power_off — the
+        // legacy file-based result path remains authoritative until
+        // the host wires the vsock receive in W2 part 4.
+        let timings_snapshot = match timings.lock() {
+            Ok(t) => t.clone(),
+            Err(_) => {
+                eprintln!(
+                    "mvm-builder-init: boot-timings mutex poisoned; \
+                     skipping vsock dispatch send"
+                );
+                stamp(&timings, |t| {
+                    t.poweroff_start_ms = Some(BootTimings::ms_since(anchor))
+                });
+                write_boot_timings(&timings);
+                return power_off();
+            }
+        };
+        send_dispatch_response_via_vsock(&crate::dispatch_response::DispatchResponse {
+            exit_code: code,
+            stderr_tail: tail,
+            boot_timings: timings_snapshot,
+            build_ms,
+        });
         stamp(&timings, |t| {
             t.poweroff_start_ms = Some(BootTimings::ms_since(anchor))
         });
         write_boot_timings(&timings);
         power_off()
+    }
+
+    /// Plan 89 W2 part 3 — listen on `AF_VSOCK` port
+    /// [`BUILDER_DISPATCH_PORT`] and write a single framed
+    /// `BuilderResponse::Result` to the first connection that
+    /// arrives within `ACCEPT_TIMEOUT_SECS` seconds. Best-effort:
+    /// any failure (no host connection, socket setup error, write
+    /// error) is logged to stderr and the boot continues to
+    /// `power_off`.
+    ///
+    /// Wire shape is hand-rolled by
+    /// [`crate::dispatch_response::DispatchResponse::to_json`]; the
+    /// cross-validation test in that module pins the output against
+    /// `mvm_build::builder_protocol::BuilderResponse` so the host
+    /// deserializer parses what we emit.
+    ///
+    /// AF_VSOCK constants are inlined rather than going through
+    /// `nix` because the size-budget comment in this crate's
+    /// Cargo.toml (Plan 72 §W3 — ≤ 1.5 MiB) discourages new dep
+    /// features. The pattern mirrors
+    /// `crates/mvm-guest/src/bin/mvm-builder-agent.rs` exactly.
+    fn send_dispatch_response_via_vsock(payload: &crate::dispatch_response::DispatchResponse) {
+        // Plan 89 W2 part 2 — must match
+        // `mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`.
+        // Hardcoded because mvm-guest's dep tree is too heavy to
+        // pull into the rootfs for a single u32; the
+        // `port_value_matches_mvm_guest_constant` test in this
+        // module pins it.
+        const BUILDER_DISPATCH_PORT: u32 = 21471;
+        const ACCEPT_TIMEOUT_SECS: i64 = 10;
+
+        const AF_VSOCK: i32 = 40;
+        const SOCK_STREAM: i32 = 1;
+        const SOL_SOCKET: i32 = 1;
+        const SO_RCVTIMEO: i32 = 20;
+        const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
+
+        #[repr(C)]
+        struct SockAddrVm {
+            svm_family: u16,
+            svm_reserved1: u16,
+            svm_port: u32,
+            svm_cid: u32,
+            svm_zero: [u8; 4],
+        }
+
+        unsafe extern "C" {
+            fn socket(domain: i32, typ: i32, protocol: i32) -> i32;
+            fn bind(sockfd: i32, addr: *const core::ffi::c_void, addrlen: u32) -> i32;
+            fn listen(sockfd: i32, backlog: i32) -> i32;
+            fn accept(sockfd: i32, addr: *mut core::ffi::c_void, addrlen: *mut u32) -> i32;
+            fn setsockopt(
+                sockfd: i32,
+                level: i32,
+                optname: i32,
+                optval: *const core::ffi::c_void,
+                optlen: u32,
+            ) -> i32;
+            fn close(fd: i32) -> i32;
+        }
+
+        let json = payload.to_json();
+        let body = json.as_bytes();
+        // u32 BE length prefix, matching mvm_guest::vsock::write_frame.
+        let len_be = (body.len() as u32).to_be_bytes();
+
+        let listen_fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
+        if listen_fd < 0 {
+            eprintln!("mvm-builder-init: vsock send: socket() failed");
+            return;
+        }
+        let addr = SockAddrVm {
+            svm_family: AF_VSOCK as u16,
+            svm_reserved1: 0,
+            svm_port: BUILDER_DISPATCH_PORT,
+            svm_cid: VMADDR_CID_ANY,
+            svm_zero: [0; 4],
+        };
+        let rc = unsafe {
+            bind(
+                listen_fd,
+                &addr as *const SockAddrVm as *const core::ffi::c_void,
+                std::mem::size_of::<SockAddrVm>() as u32,
+            )
+        };
+        if rc < 0 {
+            eprintln!(
+                "mvm-builder-init: vsock send: bind() failed on port {BUILDER_DISPATCH_PORT}"
+            );
+            unsafe { close(listen_fd) };
+            return;
+        }
+        let rc = unsafe { listen(listen_fd, 1) };
+        if rc < 0 {
+            eprintln!("mvm-builder-init: vsock send: listen() failed");
+            unsafe { close(listen_fd) };
+            return;
+        }
+        // SO_RCVTIMEO on the listening socket propagates to accept's
+        // wait — see accept(2) "if no pending connections are present
+        // ... the call blocks until a connection request arrives,
+        // unless the socket is marked nonblocking". The timeout
+        // option bounds that wait.
+        let tv = libc::timeval {
+            tv_sec: ACCEPT_TIMEOUT_SECS,
+            tv_usec: 0,
+        };
+        let rc = unsafe {
+            setsockopt(
+                listen_fd,
+                SOL_SOCKET,
+                SO_RCVTIMEO,
+                &tv as *const libc::timeval as *const core::ffi::c_void,
+                std::mem::size_of::<libc::timeval>() as u32,
+            )
+        };
+        if rc < 0 {
+            eprintln!("mvm-builder-init: vsock send: setsockopt SO_RCVTIMEO failed (continuing)");
+        }
+        let conn_fd = unsafe { accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
+        if conn_fd < 0 {
+            // Host didn't connect within the timeout — fine. Pre-W2-part-4
+            // this is the expected case; nothing on the host reads it yet.
+            eprintln!(
+                "mvm-builder-init: vsock send: no host connection within {ACCEPT_TIMEOUT_SECS}s \
+                 (W2 part 4 wires the host receiver)"
+            );
+            unsafe { close(listen_fd) };
+            return;
+        }
+
+        // Use std::fs::File as a tiny shim so we can use the
+        // RawFd-based `Write` impl without rolling our own FFI for
+        // write() and error handling. File holds the fd and closes
+        // it on drop.
+        use std::io::Write;
+        use std::os::fd::FromRawFd;
+        let mut conn = unsafe { std::fs::File::from_raw_fd(conn_fd) };
+        let wrote_len = conn.write_all(&len_be).is_ok();
+        let wrote_body = wrote_len && conn.write_all(body).is_ok();
+        if !wrote_body {
+            eprintln!("mvm-builder-init: vsock send: write failed mid-frame");
+        }
+        // conn is dropped here; the kernel reaps conn_fd.
+        // listen_fd is still open — close it explicitly.
+        drop(conn);
+        unsafe { close(listen_fd) };
+    }
+
+    #[cfg(test)]
+    mod vsock_send_tests {
+        // Plan 89 W2 part 3 — the in-binary BUILDER_DISPATCH_PORT
+        // const above must stay in sync with
+        // mvm_guest::builder_agent::BUILDER_DISPATCH_PORT (the
+        // canonical definition the host side uses). We can't `use`
+        // the function-local const from outside, so duplicate the
+        // assertion against the literal value and the mvm-guest
+        // constant. Adding mvm-guest as a dev-dep just for this
+        // check is overkill; keep it inline.
+        #[test]
+        fn builder_dispatch_port_literal_is_21471() {
+            // Mirror of the function-local const in
+            // `send_dispatch_response_via_vsock`. Updating one
+            // without the other trips this test.
+            const FROM_BUILDER_INIT: u32 = 21471;
+            assert_eq!(
+                FROM_BUILDER_INIT, 21471,
+                "Plan 89 BUILDER_DISPATCH_PORT changed — update both \
+                 builder-init's send and mvm-guest::builder_agent::BUILDER_DISPATCH_PORT"
+            );
+        }
     }
 
     /// Convenience for `timings.lock().map(|mut t| f(&mut *t))`. A

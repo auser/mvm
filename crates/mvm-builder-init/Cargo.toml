@@ -33,6 +33,13 @@ libc.workspace = true
 # never see these — they live behind `cfg(test)` only.
 tempfile.workspace = true
 serde_json.workspace = true
+# Plan 89 W2 part 3 — the cross-validation test in
+# `dispatch_response::tests::dispatch_response_parses_as_typed_builder_response`
+# deserializes our hand-rolled JSON as
+# `mvm_build::builder_protocol::BuilderResponse` to pin the two
+# wire shapes together. Dev-only; doesn't pull mvm-build into the
+# production rootfs.
+mvm-build.workspace = true
 
 [lints]
 workspace = true
