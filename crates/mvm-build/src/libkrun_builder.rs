@@ -869,15 +869,22 @@ set -eu
 FLAKE_REF='{flake_ref}'
 ATTR_PATH='{attr_path}'
 
-# Point HOME and Nix's cache/state dirs at the writable tmpfs (`/tmp`).
-# The rootfs is mounted `ro`, so nix tries `~/.cache/nix` and bails
-# with "creating directory '//.cache/nix': Read-only file system"
-# when HOME stays at the default `/`. /tmp is tmpfs, lives only for
-# this VM's lifetime — fine for a single-shot build.
+# Point HOME at writable tmpfs (`/tmp`) to satisfy code paths that
+# write to `~/...` (the rootfs is mounted `ro`; nix would otherwise
+# bail with "creating directory '//.cache/nix': Read-only file
+# system"). XDG_CACHE_HOME lives on the persistent `/nix-store`
+# disk so Nix's eval-cache-v5, tarball-cache, and binary-cache-v6
+# survive across builds — cold flake eval is the long pole on
+# warm-store rebuilds, and these caches reclaim it. `/nix-store`
+# is the ext4 root for the persistent virtio-blk device; it sits
+# alongside the overlay upperdir (`/nix-store/upper`) at the
+# disk's top level, so writes here don't pollute the Nix store
+# namespace. XDG_STATE_HOME stays on tmpfs: it only holds profile
+# generations, which one-shot build VMs don't use.
 export HOME=/tmp
-export XDG_CACHE_HOME=/tmp/.cache
+export XDG_CACHE_HOME=/nix-store/.cache
 export XDG_STATE_HOME=/tmp/.local/state
-mkdir -p /tmp/.cache /tmp/.local/state
+mkdir -p /nix-store/.cache /tmp/.local/state
 
 # CA certs for TLS to cache.nixos.org / api.github.com.
 export CURL_CA_BUNDLE=/etc/ssl/certs/ca-bundle.crt
@@ -1917,6 +1924,7 @@ mod tests {
         assert!(cmd.contains("max-jobs = auto"));
         assert!(cmd.contains("cores = 0"));
         assert!(cmd.contains("auto-optimise-store = true"));
+        assert!(cmd.contains("XDG_CACHE_HOME=/nix-store/.cache"));
         assert!(cmd.contains("printf '%s\\n' \"$NIX_OUT\" > /job/store-path"));
     }
 
