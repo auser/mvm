@@ -481,7 +481,45 @@ fn dev_build_via_builder_vm(
 ) -> Result<DevBuildResult> {
     use crate::libkrun_builder::LibkrunBuilderVm;
 
+    // Plan 89 W3 part 7: when a persistent-builder session is
+    // alive AND the user hasn't opted out via
+    // `MVM_NO_PERSISTENT_BUILDER=1`, route through the persistent
+    // supervisor. Any error here (incl. supervisor crash mid-
+    // dispatch) falls back to single-shot silently with a warning
+    // — the single-shot path is the safety net.
+    if !persistent_dispatch_disabled()
+        && let Some(record) = crate::persistent_builder::read_active_session()
+    {
+        tracing::info!(
+            session_id = %record.session_id,
+            socket = %record.dispatch_socket_path.display(),
+            "Plan 89 W3: routing build through persistent supervisor"
+        );
+        let persistent = crate::persistent_builder::PersistentBuilderVm::new(record.clone());
+        match dev_build_with_builder_vm(env, flake_ref, profile, mode, &persistent) {
+            Ok(result) => return Ok(result),
+            Err(e) => {
+                tracing::warn!(
+                    error = %e,
+                    "persistent dispatch failed; falling back to single-shot builder VM"
+                );
+            }
+        }
+    }
+
     dev_build_with_builder_vm(env, flake_ref, profile, mode, &LibkrunBuilderVm::default())
+}
+
+/// Read `MVM_NO_PERSISTENT_BUILDER`. Any non-empty value disables
+/// persistent routing. The flag has CLI surface via `mvmctl build
+/// --no-persistent-builder`; this env-var check is the bridge so
+/// `dev_build`'s public signature doesn't need a new parameter
+/// threaded through every caller (mvmctl, test harnesses, mvmd).
+#[cfg(feature = "builder-vm")]
+fn persistent_dispatch_disabled() -> bool {
+    std::env::var_os("MVM_NO_PERSISTENT_BUILDER")
+        .map(|v| !v.is_empty())
+        .unwrap_or(false)
 }
 
 #[cfg(feature = "builder-vm")]

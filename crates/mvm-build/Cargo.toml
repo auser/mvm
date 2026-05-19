@@ -60,6 +60,11 @@ tracing.workspace = true
 # the persistent VM channel. Existing mvm-core / mvm-cli call sites
 # already pull in the same version.
 uuid.workspace = true
+# Plan 89 W3 part 7 — `persistent_builder::supervisor_alive`
+# pokes the recorded supervisor PID with `kill(pid, 0)` before
+# routing a build through the supervisor. Unix-only; gated with
+# `#[cfg(unix)]` at the call site.
+libc.workspace = true
 which = "6"
 
 [dev-dependencies]
