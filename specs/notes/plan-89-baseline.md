@@ -12,9 +12,16 @@ plan on this number exceeding ~500 ms on both platforms.
   place — the harness only appends; it doesn't rewrite the doc.
 
   To run:
-    ./scripts/plan-89-baseline.sh                 # default: 5 runs against nix/images/runtime-overlay
+    ./scripts/plan-89-baseline.sh                 # default: 5 runs against tests/fixtures/plan-89-baseline
     ./scripts/plan-89-baseline.sh --runs 10
-    ./scripts/plan-89-baseline.sh --flake ./nix/images/builder
+    ./scripts/plan-89-baseline.sh --flake ./my-flake
+
+  The default flake at tests/fixtures/plan-89-baseline is
+  intentionally a throw-on-eval flake — see its description for
+  rationale. The harness tolerates the inner `nix build` failing
+  because boot-timings.json is written BEFORE cmd.sh runs, so all
+  the boot fan-out phases the plan cares about
+  (init_start_ms → job_start_ms) are captured regardless.
 
   After both macOS and Linux runs are in, fill out §Decision below.
 -->
