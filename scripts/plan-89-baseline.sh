@@ -12,15 +12,28 @@
 # rest of Plan 89 is not worth shipping. Run this on both platforms
 # and check the summary in.
 #
+# Why the default flake is the W1 fixture, not a real image build:
+# `mvm-builder-init` writes boot-timings.json BEFORE exec'ing
+# cmd.sh — so the boot fan-out we want to measure
+# (init_start_ms → job_start_ms) is captured regardless of whether
+# the inner `nix build` succeeds. The fixture flake at
+# `tests/fixtures/plan-89-baseline/` deliberately throws at
+# evaluation time: it has no inputs, no network fetch, no nixpkgs
+# eval cost, and produces no artifacts. That isolates the
+# measurement to the builder VM boot dance — the actual thing Plan
+# 89 is debating amortizing. Point `--flake` at a real user flake
+# if you want to measure end-to-end wall-clock instead.
+#
 # Usage:
-#   ./scripts/plan-89-baseline.sh                       # 5 runs, default flake
+#   ./scripts/plan-89-baseline.sh                       # 5 runs, fixture flake
 #   ./scripts/plan-89-baseline.sh --runs 10
 #   ./scripts/plan-89-baseline.sh --flake ./my-flake
 #   ./scripts/plan-89-baseline.sh --out /tmp/baseline.md
 #
 # Prerequisites:
-#   - `mvmctl dev up` works on this host (ur-seed installed; libkrun
-#     on macOS or KVM on Linux; gvproxy/passt installed per platform).
+#   - `mvmctl dev up` works on this host (ur-seed installed and a
+#     local dev image staged; libkrun on macOS or KVM on Linux;
+#     gvproxy/passt installed per platform).
 #   - `jq` on PATH.
 #
 # Output: `specs/notes/plan-89-baseline.md` (default).
@@ -28,7 +41,7 @@
 set -euo pipefail
 
 RUNS=5
-FLAKE="nix/images/runtime-overlay"
+FLAKE="tests/fixtures/plan-89-baseline"
 OUT="specs/notes/plan-89-baseline.md"
 
 while [[ $# -gt 0 ]]; do
@@ -49,7 +62,6 @@ command -v mvmctl >/dev/null || { echo "missing mvmctl on PATH — run from repo
 
 JOBS_DIR="${HOME}/.cache/mvm/builder-vm/jobs"
 TMPDIR_RUN="$(mktemp -d)"
-trap 'rm -rf "${TMPDIR_RUN}"' EXIT
 
 OS="$(uname -s)"
 ARCH="$(uname -m)"
@@ -73,21 +85,42 @@ PHASES=(
   job_start_ms
 )
 
+# Snapshot existing job dirs so we can identify per-run dirs by
+# "appeared since BEFORE" rather than relying on mtime sort, which
+# breaks when the builder VM tears down a dir or several runs
+# complete inside a single mtime second.
+JOBS_BEFORE="$(mktemp)"
+trap 'rm -rf "${TMPDIR_RUN}" "${JOBS_BEFORE}"' EXIT
+ls -1 "${JOBS_DIR}" 2>/dev/null | sort >"${JOBS_BEFORE}" || true
+
 for i in $(seq 1 "${RUNS}"); do
   echo "--- run ${i}/${RUNS} ---" >&2
   BEFORE="$(date +%s)"
-  if ! mvmctl build --flake "${FLAKE}" >"${TMPDIR_RUN}/run-${i}.out" 2>&1; then
-    echo "run ${i} failed — log at ${TMPDIR_RUN}/run-${i}.out" >&2
-    echo "first 40 lines:" >&2
+  # We deliberately tolerate non-zero exit: with the W1 fixture flake
+  # the inner `nix build` is expected to fail (throw at eval), and
+  # boot-timings.json is written by builder-init BEFORE cmd.sh runs.
+  # The only "real failure" we care about is missing timings.
+  mvmctl build --flake "${FLAKE}" >"${TMPDIR_RUN}/run-${i}.out" 2>&1 || true
+  AFTER="$(date +%s)"
+  WALL=$(( AFTER - BEFORE ))
+  # Find the job dir this run created: the only entry in JOBS_DIR
+  # that wasn't there before the loop started.
+  JOBS_NOW="$(mktemp)"
+  ls -1 "${JOBS_DIR}" 2>/dev/null | sort >"${JOBS_NOW}" || true
+  NEW_JOB_NAME="$(comm -13 "${JOBS_BEFORE}" "${JOBS_NOW}" | tail -1)"
+  cp "${JOBS_NOW}" "${JOBS_BEFORE}"
+  rm -f "${JOBS_NOW}"
+  if [[ -z "${NEW_JOB_NAME}" ]]; then
+    echo "run ${i}: no new job dir appeared under ${JOBS_DIR}" >&2
+    echo "first 40 lines of build output:" >&2
     head -40 "${TMPDIR_RUN}/run-${i}.out" >&2
     exit 1
   fi
-  AFTER="$(date +%s)"
-  WALL=$(( AFTER - BEFORE ))
-  # Most recently modified job dir = this run's.
-  JOB_DIR="$(ls -1dt "${JOBS_DIR}"/* 2>/dev/null | head -1 || true)"
-  if [[ -z "${JOB_DIR}" || ! -f "${JOB_DIR}/boot-timings.json" ]]; then
-    echo "run ${i}: missing boot-timings.json — got JOB_DIR=${JOB_DIR}" >&2
+  JOB_DIR="${JOBS_DIR}/${NEW_JOB_NAME}"
+  if [[ ! -f "${JOB_DIR}/boot-timings.json" ]]; then
+    echo "run ${i}: ${JOB_DIR}/boot-timings.json missing — builder VM probably crashed before init wrote it" >&2
+    echo "first 40 lines of build output:" >&2
+    head -40 "${TMPDIR_RUN}/run-${i}.out" >&2
     exit 1
   fi
   cp "${JOB_DIR}/boot-timings.json" "${TMPDIR_RUN}/timings-${i}.json"
