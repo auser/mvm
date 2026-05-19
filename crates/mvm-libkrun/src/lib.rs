@@ -560,16 +560,19 @@ fn configure_with_gateway(ctx: &KrunContext) -> Result<(sys::Context, GatewayHan
                     context: format!("spawning gvproxy for NetworkingMode::Gvproxy: {e}"),
                 })?;
             // gvproxy speaks libkrun's "vfkit mode" framing on the
-            // unixgram socket. Without NET_FLAG_VFKIT in `flags`,
-            // libkrun rejects the call with -EINVAL at config time
-            // (see sys::NET_FLAG_VFKIT) — Plan 88 W5 smoke surfaced
-            // this as `supervisor failed: libkrun call failed with
-            // rc -22`.
+            // unixgram socket; NET_FLAG_VFKIT (see sys::NET_FLAG_VFKIT)
+            // is libkrun's required signal to emit the magic-byte
+            // handshake. NET_FLAG_DHCP_CLIENT (libkrun 1.18.0+) tells
+            // libkrun's net device to bring the interface up via its
+            // in-guest DHCP client against gvproxy's DHCP server, so
+            // the guest sees a fully-configured eth0 without needing
+            // an in-guest udhcpc race. libkrun's own
+            // `tests/test_cases/src/test_net/gvproxy.rs` uses both.
             krun.add_net_unixgram_path(
                 handle.socket_path(),
                 mac,
                 sys::PASST_NET_FEATURES,
-                sys::NET_FLAG_VFKIT,
+                sys::NET_FLAG_VFKIT | sys::NET_FLAG_DHCP_CLIENT,
             )?;
             GatewayHandle::Gvproxy(handle)
         }

@@ -50,6 +50,17 @@ pub const PASST_NET_FEATURES: u32 = (1 << 0)   // NET_FEATURE_CSUM
 /// surfaced.
 pub const NET_FLAG_VFKIT: u32 = 1 << 0;
 
+/// `NET_FLAG_DHCP_CLIENT` from `libkrun.h` (added in libkrun 1.18.0).
+/// Enables libkrun's in-guest DHCP client so the guest doesn't need
+/// to run `udhcpc`/`dhclient` itself — libkrun sees the DHCP-OFFER
+/// from gvproxy's built-in DHCP server, configures the interface,
+/// and the guest kernel hands the application a fully-configured
+/// `eth0`. libkrun's own gvproxy test
+/// (`tests/test_cases/src/test_net/gvproxy.rs`) passes
+/// `NET_FLAG_VFKIT | NET_FLAG_DHCP_CLIENT`; mirroring that here is
+/// what makes the macOS smoke succeed end-to-end on libkrun 1.18.0+.
+pub const NET_FLAG_DHCP_CLIENT: u32 = 1 << 1;
+
 /// Plan 88 W5 diagnostic: enable libkrun's internal logger. Wrapper
 /// for `krun_init_log` (libkrun.h). Targets a file descriptor
 /// (`target_fd = 2` → stderr) at the given level. `style` and
