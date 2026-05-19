@@ -72,6 +72,14 @@ use std::process::ExitCode;
 // red because the tests would lose coverage.
 #[allow(dead_code)]
 mod boot_timings;
+/// Plan 89 W3 part 2 — hand-rolled parser for the
+/// `BuilderRequest` wire shape the persistent builder VM's
+/// dispatch loop reads off vsock. Cross-platform; the W3 part 3
+/// Linux dispatch loop calls into it after reading the framed
+/// body. Tested against the host's serde-derived encoding so
+/// schema drift on either side is loud.
+#[allow(dead_code)]
+mod builder_request;
 /// Plan 89 W2 part 3 — hand-rolled `BuilderResponse::Result`
 /// JSON. Cross-platform (testable on macOS) so the wire shape can
 /// be validated against `mvm_build::builder_protocol`'s typed

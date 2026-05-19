@@ -40,6 +40,11 @@ serde_json.workspace = true
 # wire shapes together. Dev-only; doesn't pull mvm-build into the
 # production rootfs.
 mvm-build.workspace = true
+# Plan 89 W3 part 2 — same rationale: the cross-validation test in
+# `builder_request::tests::parses_what_mvm_build_serializes_with_serde`
+# constructs typed `mvm_build::builder_protocol::BuilderRequest`
+# values via `JobId(Uuid::nil())`. Dev-only.
+uuid.workspace = true
 
 [lints]
 workspace = true

@@ -3040,6 +3040,7 @@ dependencies = [
  "nix 0.29.0",
  "serde_json",
  "tempfile",
+ "uuid",
 ]
 
 [[package]]
