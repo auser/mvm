@@ -677,21 +677,23 @@ mod linux {
             }
         }
 
-        // Plan 88 W5: bring eth0 admin-up before udhcpc tries to
-        // broadcast. libkrun's virtio-net device registers eth0 in
-        // the IFF state the kernel boots it in (admin-down for ARM
-        // virt boards by default); without this, udhcpc's first
-        // `sendto()` returns ENETDOWN and the daemon spins on
-        // "Network is down, reopening socket" until the build times
-        // out. busybox `ip link set eth0 up` is the minimal fix.
-        // Failure is non-fatal: if `eth0` is missing entirely (TSI
-        // mode) udhcpc will error out on its own and we surface that.
-        if let Err(e) = Command::new("/sbin/ip")
-            .args(["link", "set", "eth0", "up"])
-            .status()
-        {
+        // busybox 1.36.x udhcpc binds a PF_PACKET raw socket to
+        // `eth0` and `sendto`s a DHCPDISCOVER. virtio-net's eth0
+        // post-probe state is administratively DOWN, so the first
+        // sendto returns ENETDOWN and udhcpc loops forever
+        // ("broadcasting discover" → "Network is down" → reopen
+        // socket). Older udhcpc versions auto-issued
+        // SIOCSIFFLAGS|IFF_UP; modern busybox expects the caller
+        // to. The `/etc/udhcpc/default.script` hook brings the
+        // link up via `ip link set ... up`, but it only fires
+        // after udhcpc gets a lease — which requires the link
+        // already be up. Chicken-and-egg, broken by doing the
+        // ioctl ourselves before spawning udhcpc.
+        if let Err(e) = bring_iface_up("eth0") {
             eprintln!(
-                "mvm-builder-init: ip link set eth0 up: {e} (continuing — udhcpc may still try)"
+                "mvm-builder-init: bring_iface_up eth0 failed: {e} \
+                 (continuing — udhcpc will surface a clearer error \
+                 if the link is genuinely absent)"
             );
         }
 
@@ -714,6 +716,85 @@ mod linux {
             return Err(format!("udhcpc exit {}", status.code().unwrap_or(-1)));
         }
         Ok(())
+    }
+
+    /// Encode a Linux interface name into the fixed-size `ifr_name`
+    /// byte array used by SIOCG/SIOCSIFFLAGS. Linux caps interface
+    /// names at `IFNAMSIZ` (16) bytes including the NUL terminator,
+    /// so the longest valid input is 15 bytes. Split out from
+    /// [`bring_iface_up`] so the bounds check is unit-testable
+    /// without making a real syscall.
+    fn encode_iface_name(iface: &str) -> Result<[libc::c_char; libc::IFNAMSIZ], String> {
+        let bytes = iface.as_bytes();
+        if bytes.len() >= libc::IFNAMSIZ {
+            return Err(format!(
+                "interface name '{iface}' is {} bytes; Linux IFNAMSIZ caps it at {}",
+                bytes.len(),
+                libc::IFNAMSIZ - 1,
+            ));
+        }
+        let mut buf = [0 as libc::c_char; libc::IFNAMSIZ];
+        for (i, &b) in bytes.iter().enumerate() {
+            buf[i] = b as libc::c_char;
+        }
+        Ok(buf)
+    }
+
+    /// Bring a network interface administratively up via
+    /// `ioctl(SIOCSIFFLAGS, IFF_UP)`. Equivalent to
+    /// `ip link set dev <iface> up`, but issued directly so we
+    /// don't pin a new path-dependency in the ur-seed rootfs and
+    /// the error message names the failing ioctl. Called before
+    /// `udhcpc` in [`setup_network`].
+    fn bring_iface_up(iface: &str) -> Result<(), String> {
+        let name = encode_iface_name(iface)?;
+
+        // SAFETY: socket(2) returns -1 on error (checked) or a
+        // valid fd. We close it on every return path below.
+        let sock = unsafe { libc::socket(libc::AF_INET, libc::SOCK_DGRAM, 0) };
+        if sock < 0 {
+            return Err(format!(
+                "socket(AF_INET, SOCK_DGRAM) for {iface}: {}",
+                std::io::Error::last_os_error()
+            ));
+        }
+
+        let result = (|| {
+            // SAFETY: `ifreq` is repr(C); zero-init + per-variant
+            // union assignment is the standard pattern. We read
+            // `ifru_flags` only after SIOCGIFFLAGS populated it.
+            let mut ifr: libc::ifreq = unsafe { std::mem::zeroed() };
+            ifr.ifr_name = name;
+
+            if unsafe { libc::ioctl(sock, libc::SIOCGIFFLAGS, &mut ifr) } < 0 {
+                return Err(format!(
+                    "SIOCGIFFLAGS {iface}: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            // SAFETY: SIOCGIFFLAGS just populated `ifru_flags`, so
+            // reading it is well-defined. Writing the OR'd value back
+            // through the same union variant is also well-defined per
+            // the Rust reference (all variants of `__c_anonymous_ifr_ifru`
+            // are `Copy`).
+            unsafe {
+                let flags = ifr.ifr_ifru.ifru_flags;
+                ifr.ifr_ifru.ifru_flags = flags | (libc::IFF_UP as libc::c_short);
+            }
+            if unsafe { libc::ioctl(sock, libc::SIOCSIFFLAGS, &ifr) } < 0 {
+                return Err(format!(
+                    "SIOCSIFFLAGS {iface} IFF_UP: {}",
+                    std::io::Error::last_os_error()
+                ));
+            }
+            Ok(())
+        })();
+
+        // SAFETY: sock is owned by this function until close.
+        unsafe {
+            libc::close(sock);
+        }
+        result
     }
 
     fn run_job(cmd_sh: &str) -> (i32, String) {
@@ -1013,6 +1094,36 @@ mod linux {
             assert!(virtiofs_mount_flags("work").contains(MsFlags::MS_RDONLY));
             assert_eq!(virtiofs_mount_flags("out"), MsFlags::empty());
             assert_eq!(virtiofs_mount_flags("job"), MsFlags::empty());
+        }
+
+        #[test]
+        fn encode_iface_name_eth0_pads_with_nul() {
+            let buf = encode_iface_name("eth0").expect("eth0 fits");
+            assert_eq!(buf[0] as u8, b'e');
+            assert_eq!(buf[1] as u8, b't');
+            assert_eq!(buf[2] as u8, b'h');
+            assert_eq!(buf[3] as u8, b'0');
+            assert_eq!(buf[4] as u8, 0, "remainder NUL-padded");
+            assert_eq!(buf[libc::IFNAMSIZ - 1] as u8, 0);
+        }
+
+        #[test]
+        fn encode_iface_name_max_length_succeeds() {
+            // 15 bytes + 1 NUL = exactly IFNAMSIZ.
+            let max = "a".repeat(libc::IFNAMSIZ - 1);
+            let buf = encode_iface_name(&max).expect("15-byte name fits");
+            for byte in buf.iter().take(libc::IFNAMSIZ - 1) {
+                assert_eq!(*byte as u8, b'a');
+            }
+            assert_eq!(buf[libc::IFNAMSIZ - 1] as u8, 0, "NUL terminator");
+        }
+
+        #[test]
+        fn encode_iface_name_too_long_errors() {
+            let over = "a".repeat(libc::IFNAMSIZ);
+            let err = encode_iface_name(&over).expect_err("IFNAMSIZ-byte name rejected");
+            assert!(err.contains("IFNAMSIZ"), "err mentions limit: {err}");
+            assert!(err.contains(&over), "err includes the offending name");
         }
     }
 }

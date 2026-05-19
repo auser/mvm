@@ -92,6 +92,19 @@ The release mirror is populated only when a release is explicitly
 cut. Until then, contributors with no prior mvm state use
 `import-ur-seed` against a manually-built tarball.
 
+**Corollary — no in-development republish.** A bug fix that lands
+in any binary baked into the ur-seed (`mvm-builder-init`, ur-seed
+init scripts, etc.) does NOT trigger an ur-seed release republish.
+Contributors who want the fix on their own host rebuild the ur-seed
+locally and `mvmctl dev import-ur-seed --from <tarball>` it; the
+release mirror moves on its own cadence, tied to a prod release
+cut. Same hermetic-build principle as ADR-046's contributor path:
+the published artifact has a trust/signature lifecycle that should
+not be churned by routine bug fixes, and the "is this artifact
+prod-blessed or dev-WIP?" line stays clean. PR descriptions and
+follow-up checklists for ur-seed-baked-binary fixes should reflect
+the local-rebuild path, not a release republish.
+
 ### Stage 0 fallback order
 
 `bootstrap_builder_vm_image_via_*_stage0` selection:
