@@ -33,9 +33,10 @@
 //!
 //! - Auto-start from `mvmctl dev up` (post-merge follow-up).
 //! - `mvmctl build` routing into the persistent supervisor when a
-//!   session is active (W3 part 6+).
-//! - Install variant dispatch (W3 part 6+).
-//! - Stderr streaming (W3 part 7).
+//!   session is active (W3 part 7+ — `submit` from W3 part 6
+//!   now produces real artifacts, so the routing target exists).
+//! - Install variant dispatch.
+//! - Stderr streaming.
 
 use std::path::PathBuf;
 use std::time::Duration;
@@ -247,12 +248,80 @@ fn run_submit(args: SubmitArgs) -> Result<()> {
                 flake_ref: args.flake.clone(),
                 attr_path: attr.clone(),
             },
-            job_dir_relpath,
+            job_dir_relpath.clone(),
         )
         .context("PersistentBuilderSupervisor::submit")?;
 
     print_outcome(&outcome);
+
+    if outcome.exit_code == 0 {
+        let artifact_dir = artifact_dir_for(&record.job_dir, &job_dir_relpath);
+        match summarize_artifacts(&artifact_dir) {
+            Ok(summary) => {
+                println!("artifact_dir: {}", artifact_dir.display());
+                println!(
+                    "vmlinux: {} ({} bytes)",
+                    summary.vmlinux.display(),
+                    summary.vmlinux_bytes
+                );
+                println!(
+                    "rootfs.ext4: {} ({} bytes)",
+                    summary.rootfs.display(),
+                    summary.rootfs_bytes
+                );
+                if let Some(manifest) = &summary.manifest {
+                    println!("manifest.json: {}", manifest.display());
+                }
+            }
+            Err(e) => {
+                eprintln!(
+                    "warning: dispatch succeeded but artifact dir at {} is incomplete: {e}",
+                    artifact_dir.display()
+                );
+            }
+        }
+    }
+
     Ok(())
+}
+
+/// On-disk summary of what `stage_flake_cmd_sh`'s cmd.sh
+/// produced. Both `vmlinux` and `rootfs.ext4` are required;
+/// `manifest.json` is an optional sidecar (some flakes emit it,
+/// some don't — see `nix/images/builder/flake.nix` for the
+/// shape).
+#[derive(Debug)]
+struct ArtifactSummary {
+    vmlinux: std::path::PathBuf,
+    vmlinux_bytes: u64,
+    rootfs: std::path::PathBuf,
+    rootfs_bytes: u64,
+    manifest: Option<std::path::PathBuf>,
+}
+
+fn summarize_artifacts(dir: &std::path::Path) -> Result<ArtifactSummary> {
+    if !dir.is_dir() {
+        bail!("missing artifact dir {}", dir.display());
+    }
+    let vmlinux = dir.join("vmlinux");
+    let vmlinux_meta =
+        std::fs::metadata(&vmlinux).with_context(|| format!("missing {}", vmlinux.display()))?;
+    let rootfs = dir.join("rootfs.ext4");
+    let rootfs_meta =
+        std::fs::metadata(&rootfs).with_context(|| format!("missing {}", rootfs.display()))?;
+    let manifest_path = dir.join("manifest.json");
+    let manifest = if manifest_path.is_file() {
+        Some(manifest_path)
+    } else {
+        None
+    };
+    Ok(ArtifactSummary {
+        vmlinux,
+        vmlinux_bytes: vmlinux_meta.len(),
+        rootfs,
+        rootfs_bytes: rootfs_meta.len(),
+        manifest,
+    })
 }
 
 fn run_stop() -> Result<()> {
@@ -316,21 +385,62 @@ fn run_status() -> Result<()> {
     Ok(())
 }
 
+/// Subdir name inside a dispatch's job dir where the cmd.sh
+/// copies `vmlinux` + `rootfs.ext4`. Mirrors mkGuest's output
+/// layout. The host reads from `<job_dir>/<job_id>/out/` after
+/// the dispatch completes.
+const ARTIFACT_SUBDIR: &str = "out";
+
 /// Stage a fresh cmd.sh under `<job_dir>/<uuid>/cmd.sh`, return
 /// the relative path the guest's dispatch loop resolves under
-/// `/job/`. Matches the shape `LibkrunBuilderVm::run_build`
-/// produces for the single-shot path so the guest's `run_job`
-/// helper accepts the input unchanged.
+/// `/job/`. The cmd.sh:
+///
+/// 1. Runs `nix build` against `<flake_ref>#<attr>` and prints
+///    the store path.
+/// 2. Copies the result's `vmlinux` and `rootfs.ext4` into
+///    `/job/<job_id>/<ARTIFACT_SUBDIR>/` so the host can read
+///    them back after the dispatch completes (the same dir is
+///    bound at `/out` in the guest — both views see identical
+///    bytes).
+///
+/// Matches the shape `LibkrunBuilderVm::run_build` produces for
+/// the single-shot path so the guest's `run_job` helper accepts
+/// the input unchanged.
 fn stage_flake_cmd_sh(job_dir: &std::path::Path, flake_ref: &str, attr: &str) -> Result<String> {
     let job_id = uuid::Uuid::new_v4().to_string();
     let sub = job_dir.join(&job_id);
-    std::fs::create_dir_all(&sub).with_context(|| format!("creating {}", sub.display()))?;
+    let artifact_dir = sub.join(ARTIFACT_SUBDIR);
+    std::fs::create_dir_all(&artifact_dir)
+        .with_context(|| format!("creating {}", artifact_dir.display()))?;
     let script = format!(
         "#!/bin/sh\n\
          set -eu\n\
-         exec nix --extra-experimental-features 'nix-command flakes' \\\n\
+         OUT_DIR='/job/{job_id}/{artifact_subdir}'\n\
+         mkdir -p \"$OUT_DIR\"\n\
+         STORE_PATH=$(nix --extra-experimental-features 'nix-command flakes' \\\n\
              build --no-link --print-out-paths \\\n\
-             {flake_ref}#{attr}\n",
+             {flake_ref}#{attr})\n\
+         echo \"store-path=$STORE_PATH\"\n\
+         # mkGuest layout: $STORE_PATH/{{vmlinux,rootfs.ext4}}.\n\
+         # Copy via `cp -L` so the host gets real bytes, not\n\
+         # store-path symlinks (those point into the in-guest\n\
+         # /nix/store and don't resolve on the host).\n\
+         if [ ! -f \"$STORE_PATH/vmlinux\" ]; then\n\
+             echo 'mvm-builder-init: nix output missing vmlinux' >&2\n\
+             exit 4\n\
+         fi\n\
+         if [ ! -f \"$STORE_PATH/rootfs.ext4\" ]; then\n\
+             echo 'mvm-builder-init: nix output missing rootfs.ext4' >&2\n\
+             exit 4\n\
+         fi\n\
+         cp -L \"$STORE_PATH/vmlinux\" \"$OUT_DIR/vmlinux\"\n\
+         cp -L \"$STORE_PATH/rootfs.ext4\" \"$OUT_DIR/rootfs.ext4\"\n\
+         # Manifest sidecar — copy if present, but don't fail\n\
+         # for flakes that don't emit it.\n\
+         if [ -f \"$STORE_PATH/manifest.json\" ]; then\n\
+             cp -L \"$STORE_PATH/manifest.json\" \"$OUT_DIR/manifest.json\"\n\
+         fi\n",
+        artifact_subdir = ARTIFACT_SUBDIR,
         flake_ref = shell_escape(flake_ref),
         attr = shell_escape(attr),
     );
@@ -342,6 +452,13 @@ fn stage_flake_cmd_sh(job_dir: &std::path::Path, flake_ref: &str, attr: &str) ->
         let _ = std::fs::set_permissions(&cmd_path, std::fs::Permissions::from_mode(0o755));
     }
     Ok(job_id)
+}
+
+/// Path on the host where the cmd.sh for `job_id` will have
+/// copied the build artifacts. Caller checks for the presence of
+/// `vmlinux` and `rootfs.ext4` after a successful dispatch.
+fn artifact_dir_for(job_dir: &std::path::Path, job_id: &str) -> std::path::PathBuf {
+    job_dir.join(job_id).join(ARTIFACT_SUBDIR)
 }
 
 /// Minimal POSIX-shell single-quote escape. Sufficient for the
@@ -483,6 +600,73 @@ mod tests {
         assert!(body.contains("'packages.aarch64-linux.default'"), "{body}");
         assert!(body.contains("nix"), "{body}");
         assert!(body.starts_with("#!/bin/sh"), "{body}");
+    }
+
+    #[test]
+    fn stage_flake_cmd_sh_creates_artifact_output_subdir() {
+        // Plan 89 W3 part 6: the cmd.sh dispatches `nix build`
+        // and then copies vmlinux + rootfs.ext4 to a per-dispatch
+        // out/ subdir. The host stages the empty subdir up-front
+        // so the cmd.sh's `mkdir -p` is a no-op on success path
+        // (and so the host can read from a known path without
+        // racing the guest's mkdir).
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let job_dir = scratch.path().to_path_buf();
+        let relpath = stage_flake_cmd_sh(&job_dir, "path:/work", "packages.aarch64-linux.default")
+            .expect("stage");
+        let artifact_dir = artifact_dir_for(&job_dir, &relpath);
+        assert!(
+            artifact_dir.is_dir(),
+            "expected pre-staged artifact dir at {}",
+            artifact_dir.display()
+        );
+        // The cmd.sh body must reference the same in-guest path
+        // (`/job/<relpath>/out`) so the bytes the guest writes are
+        // visible at the host's `artifact_dir_for` path.
+        let body = std::fs::read_to_string(job_dir.join(&relpath).join("cmd.sh")).expect("read");
+        let expected_guest_path = format!("/job/{relpath}/out");
+        assert!(
+            body.contains(&expected_guest_path),
+            "cmd.sh must write to {expected_guest_path}\n--- body ---\n{body}"
+        );
+        assert!(body.contains("vmlinux"), "{body}");
+        assert!(body.contains("rootfs.ext4"), "{body}");
+        // `cp -L` (not just `cp`) so the host gets real bytes,
+        // not store-path symlinks that don't resolve.
+        assert!(body.contains("cp -L"), "must use cp -L: {body}");
+    }
+
+    #[test]
+    fn summarize_artifacts_requires_vmlinux_and_rootfs() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let dir = scratch.path().join("out");
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(summarize_artifacts(&dir).is_err(), "empty dir must fail");
+
+        std::fs::write(dir.join("vmlinux"), b"fake-kernel").unwrap();
+        assert!(
+            summarize_artifacts(&dir).is_err(),
+            "missing rootfs must fail"
+        );
+
+        std::fs::write(dir.join("rootfs.ext4"), b"fake-rootfs").unwrap();
+        let summary = summarize_artifacts(&dir).expect("now complete");
+        assert_eq!(summary.vmlinux_bytes, 11);
+        assert_eq!(summary.rootfs_bytes, 11);
+        assert!(summary.manifest.is_none(), "no manifest staged");
+
+        std::fs::write(dir.join("manifest.json"), b"{}").unwrap();
+        let summary = summarize_artifacts(&dir).expect("with manifest");
+        assert!(summary.manifest.is_some());
+    }
+
+    #[test]
+    fn summarize_artifacts_rejects_missing_dir() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let dir = scratch.path().join("does-not-exist");
+        let err = summarize_artifacts(&dir).expect_err("missing dir");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("missing artifact dir"), "{msg}");
     }
 
     #[test]
