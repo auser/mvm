@@ -371,8 +371,15 @@ impl LibkrunBuilderVm {
             vm_state_dir: path_to_str(&vm_state_dir, "vm_state_dir")?.to_string(),
             pid_file_name: Some("builder.pid".to_string()),
         };
+        // Plan 89 W2 part 4: spawn the vsock response listener
+        // BEFORE the supervisor so it can connect as soon as libkrun
+        // creates the dispatch socket. Drained after the supervisor
+        // exits — see `log_vsock_response_outcome` for the
+        // cross-validation contract.
+        let vsock_rx = spawn_vsock_response_listener(&vm_state_dir);
         let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg, &vm_state_dir)?;
         if exit_code != 0 {
+            log_vsock_response_outcome(vsock_rx, None);
             return Err(BuilderVmError::NixBuildFailed(format!(
                 "supervisor exited with non-zero status ({exit_code}); \
                  guest stderr at {}",
@@ -381,6 +388,7 @@ impl LibkrunBuilderVm {
         }
 
         let result = read_job_result(&job_dir)?;
+        log_vsock_response_outcome(vsock_rx, Some(result.exit_code));
         if result.exit_code != 0 {
             return Err(BuilderVmError::NixBuildFailed(format!(
                 "guest shell job exited {} — stderr tail:\n{}",
@@ -631,14 +639,27 @@ impl BuilderVm for LibkrunBuilderVm {
             vm_state_dir: path_to_str(&vm_state_dir, "vm_state_dir")?.to_string(),
             pid_file_name: Some("builder.pid".to_string()),
         };
+        // Plan 89 W2 part 4: same dispatch-listener wiring as
+        // `run_shell_script`. Drained after the supervisor exits
+        // (or right before bailing on supervisor failure) so the
+        // background thread always gets a chance to log.
+        let vsock_rx = spawn_vsock_response_listener(&vm_state_dir);
         let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg, &vm_state_dir)?;
         if exit_code != 0 {
+            log_vsock_response_outcome(vsock_rx, None);
             return Err(BuilderVmError::NixBuildFailed(format!(
                 "supervisor exited with non-zero status ({exit_code}); \
                  guest stderr at {}",
                 vm_state_dir.display()
             )));
         }
+        // The flake / install finalize paths don't return a
+        // structured exit_code from the file before they branch on
+        // variant-specific shapes (Flake reads `/job/result`,
+        // Install reads `/out/result.json`). For W2 part 4 we log
+        // without the file cross-validation in this site to keep
+        // the change minimal; W3 wires per-variant cross-validation.
+        log_vsock_response_outcome(vsock_rx, None);
 
         // 9. Per-variant result parsing + artifact validation.
         //    Flake jobs read `<job_dir>/result` (legacy shape);
@@ -1321,6 +1342,135 @@ fn spawn_supervisor_and_wait(
         Err(e) => Err(BuilderVmError::ExtractionFailed(format!(
             "wait on supervisor child: {e}"
         ))),
+    }
+}
+
+/// Plan 89 W2 part 4 — spawn a background thread that reads the
+/// `BuilderResponse::Result` frame `mvm-builder-init` sends over
+/// AF_VSOCK port [`mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`]
+/// right before reboot (W2 part 3). Returns a `Receiver` the caller
+/// drains after the supervisor exits via [`log_vsock_response_outcome`].
+///
+/// The thread starts BEFORE the supervisor so it can connect as
+/// soon as libkrun creates `<vm_state_dir>/vsock-21471.sock` —
+/// before the guest's listener exists, `UnixStream::connect` would
+/// return `ENOENT`/`ECONNREFUSED`, hence the retry loop with a 60-second
+/// outer deadline. Once connected, the thread reads with a 10-second
+/// read deadline so an unresponsive guest doesn't leak the thread
+/// indefinitely.
+///
+/// Pre-W2-part-3 cached dev images won't send a response at all;
+/// the legacy `<job_dir>/result` file path remains authoritative
+/// for the build's exit code. This helper's job is purely
+/// observational: log what arrives, warn on mismatch against the
+/// file, never gate the build on the vsock outcome.
+#[cfg(feature = "builder-vm")]
+pub fn spawn_vsock_response_listener(
+    vm_state_dir: &Path,
+) -> std::sync::mpsc::Receiver<crate::builder_protocol::BuilderResponseRead> {
+    use std::os::unix::net::UnixStream;
+    use std::sync::mpsc;
+    use std::time::{Duration, Instant};
+
+    use crate::builder_protocol::{BuilderResponseRead, read_builder_response};
+
+    let (tx, rx) = mpsc::channel();
+    let socket_path = vm_state_dir.join(format!(
+        "vsock-{}.sock",
+        mvm_guest::builder_agent::BUILDER_DISPATCH_PORT
+    ));
+
+    std::thread::Builder::new()
+        .name("vsock-builder-response".to_string())
+        .spawn(move || {
+            let connect_deadline = Duration::from_secs(60);
+            let poll_interval = Duration::from_millis(100);
+            let read_timeout = Duration::from_secs(10);
+            let start = Instant::now();
+            let result = loop {
+                if start.elapsed() > connect_deadline {
+                    break BuilderResponseRead::Timeout;
+                }
+                match UnixStream::connect(&socket_path) {
+                    Ok(mut stream) => {
+                        let _ = stream.set_read_timeout(Some(read_timeout));
+                        break read_builder_response(&mut stream);
+                    }
+                    Err(_) => std::thread::sleep(poll_interval),
+                }
+            };
+            // The receiver may have been dropped already (caller hit
+            // its recv_timeout before the thread finished). That's
+            // fine — the response was observational anyway.
+            let _ = tx.send(result);
+        })
+        .expect("std::thread::Builder::spawn never fails on unix");
+
+    rx
+}
+
+/// Drain the listener from [`spawn_vsock_response_listener`] with a
+/// bounded wait and log the outcome. If `file_exit_code` is `Some`,
+/// cross-validate against the vsock-reported exit code and warn on
+/// mismatch (but never propagate as an error — the file is the
+/// authoritative source until W3 reverses the polarity).
+///
+/// The 5-second `recv_timeout` past supervisor exit is enough for
+/// the read-deadline-bounded thread to deliver any in-flight
+/// response; longer waits would hurt UX without buying meaningful
+/// signal.
+#[cfg(feature = "builder-vm")]
+pub fn log_vsock_response_outcome(
+    rx: std::sync::mpsc::Receiver<crate::builder_protocol::BuilderResponseRead>,
+    file_exit_code: Option<i32>,
+) {
+    use crate::builder_protocol::{BuilderResponse, BuilderResponseRead};
+
+    match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(BuilderResponseRead::Frame(BuilderResponse::Result {
+            exit_code,
+            job_timings,
+            boot_timings,
+            ..
+        })) => {
+            tracing::info!(
+                vsock_exit_code = exit_code,
+                build_ms = job_timings.build_ms,
+                boot_timings_present = boot_timings.is_some(),
+                "received BuilderResponse::Result via vsock dispatch channel (W2 part 3)"
+            );
+            if let Some(file_code) = file_exit_code
+                && file_code != exit_code
+            {
+                tracing::warn!(
+                    file_exit_code = file_code,
+                    vsock_exit_code = exit_code,
+                    "vsock dispatch and <job_dir>/result disagree on exit_code; \
+                     file value is authoritative pre-W3"
+                );
+            }
+        }
+        Ok(BuilderResponseRead::Frame(other)) => {
+            tracing::debug!(
+                ?other,
+                "vsock dispatch: non-Result frame ignored in single-shot"
+            );
+        }
+        Ok(BuilderResponseRead::EmptyEof) => {
+            tracing::debug!(
+                "vsock dispatch: guest closed without sending — \
+                 pre-W2-part-3 image, expected"
+            );
+        }
+        Ok(BuilderResponseRead::Timeout) => {
+            tracing::debug!("vsock dispatch: receive thread timed out");
+        }
+        Err(_) => {
+            tracing::debug!(
+                "vsock dispatch: no response within 5s of supervisor exit \
+                 (thread will self-terminate via read deadline)"
+            );
+        }
     }
 }
 
@@ -2464,4 +2614,15 @@ mod tests {
         assert!(msg.contains("Kernel panic - not syncing: example"), "{msg}");
         assert!(msg.contains("/tmp/example/console.log"), "{msg}");
     }
+
+    // ---------------------------------------------------------------
+    // Plan 89 W2 part 4 — vsock response listener
+    // ---------------------------------------------------------------
+    //
+    // Live in `crates/mvm-build/tests/vsock_response_listener.rs`
+    // (not here) so the server-binding pattern they need to simulate
+    // libkrun's host-side proxy doesn't trip the `architecture.yml`
+    // invariant grep against `crates/` source. The grep excludes
+    // `**/tests/**` by design — that's where mock-server patterns
+    // for test scaffolding belong.
 }
