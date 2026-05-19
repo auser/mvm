@@ -2668,6 +2668,7 @@ fn bootstrap_builder_vm_image_via_dev_image_stage0(
         builder_flake_dir,
         kernel,
         rootfs,
+        Stage0BootstrapOpts::default_image(),
     );
     let duration_ms = started.elapsed().as_millis() as u64;
 
@@ -2702,6 +2703,29 @@ enum Stage0FailureStage {
     Build,
     Validate,
     Promote,
+}
+
+#[cfg(feature = "builder-vm")]
+struct Stage0BootstrapOpts<'a> {
+    attr_name: &'a str,
+    output_kernel: Option<&'a std::path::Path>,
+}
+
+#[cfg(feature = "builder-vm")]
+impl<'a> Stage0BootstrapOpts<'a> {
+    fn default_image() -> Self {
+        Self {
+            attr_name: "default",
+            output_kernel: None,
+        }
+    }
+
+    fn rootfs_only(output_kernel: &'a std::path::Path) -> Self {
+        Self {
+            attr_name: "stage0-rootfs",
+            output_kernel: Some(output_kernel),
+        }
+    }
 }
 
 #[cfg(feature = "builder-vm")]
@@ -2740,6 +2764,7 @@ fn run_stage0_bootstrap(
     builder_flake_dir: &str,
     bootstrap_kernel: std::path::PathBuf,
     bootstrap_rootfs: std::path::PathBuf,
+    opts: Stage0BootstrapOpts<'_>,
 ) -> std::result::Result<(), (Stage0FailureStage, anyhow::Error)> {
     use mvm_build::builder_vm::BuilderVm as _;
     use mvm_build::libkrun_builder::LibkrunBuilderVm;
@@ -2761,6 +2786,7 @@ fn run_stage0_bootstrap(
         &staging_dir_str,
         bootstrap_kernel,
         bootstrap_rootfs,
+        opts.attr_name,
     )
     .map_err(|e| (Stage0FailureStage::Build, e))?;
 
@@ -2773,6 +2799,20 @@ fn run_stage0_bootstrap(
                 anyhow::anyhow!("Stage 0 builder VM build: {e}"),
             )
         })?;
+
+    if let Some(kernel) = opts.output_kernel {
+        let dst = staging_dir.join("vmlinux");
+        std::fs::copy(kernel, &dst).map_err(|e| {
+            (
+                Stage0FailureStage::Build,
+                anyhow::anyhow!(
+                    "copying Stage 0 output kernel {} -> {}: {e}",
+                    kernel.display(),
+                    dst.display()
+                ),
+            )
+        })?;
+    }
 
     write_builder_vm_source_fingerprint(staging_dir, source_fingerprint)
         .map_err(|e| (Stage0FailureStage::Validate, e))?;
@@ -2872,8 +2912,9 @@ fn bootstrap_builder_vm_image_via_ur_seed_stage0(
         out_dir_path,
         source_fingerprint,
         builder_flake_dir,
-        kernel,
+        kernel.clone(),
         ur_seed.rootfs.clone(),
+        Stage0BootstrapOpts::rootfs_only(&kernel),
     );
     let duration_ms = started.elapsed().as_millis() as u64;
 
@@ -3006,6 +3047,7 @@ fn builder_vm_stage0_bootstrap_plan(
     out_dir: &str,
     bootstrap_kernel: std::path::PathBuf,
     bootstrap_rootfs: std::path::PathBuf,
+    attr_name: &str,
 ) -> Result<(
     mvm_build::builder_vm::BuilderJob,
     mvm_build::builder_vm::BuilderMounts,
@@ -3023,7 +3065,7 @@ fn builder_vm_stage0_bootstrap_plan(
 
     let job = BuilderJob::Flake {
         flake_ref: "path:/work/nix/images/builder-vm".to_string(),
-        attr_path: format!("packages.{}.default", host_system_linux()),
+        attr_path: format!("packages.{}.{attr_name}", host_system_linux()),
     };
     let mounts = BuilderMounts {
         flake_src: workspace_root,
@@ -4619,6 +4661,7 @@ mod builder_vm_bootstrap_tests {
             "/cache/builder-vm/aarch64",
             std::path::PathBuf::from("/dev-cache/vmlinux"),
             std::path::PathBuf::from("/dev-cache/rootfs.ext4"),
+            "default",
         )
         .expect("valid builder flake path should produce a plan");
 
@@ -4651,6 +4694,29 @@ mod builder_vm_bootstrap_tests {
             std::path::PathBuf::from("/dev-cache/rootfs.ext4")
         );
         assert_eq!(image.cmdline, STAGE0_BOOTSTRAP_CMDLINE);
+    }
+
+    #[test]
+    fn builder_vm_stage0_bootstrap_plan_can_target_rootfs_only_attr() {
+        let (job, _mounts, _image) = builder_vm_stage0_bootstrap_plan(
+            "/repo/nix/images/builder-vm",
+            "/cache/builder-vm/aarch64",
+            std::path::PathBuf::from("/seed/vmlinux"),
+            std::path::PathBuf::from("/seed/rootfs.ext4"),
+            "stage0-rootfs",
+        )
+        .expect("valid builder flake path should produce a plan");
+
+        match job {
+            mvm_build::builder_vm::BuilderJob::Flake { attr_path, .. } => {
+                assert!(
+                    attr_path == "packages.aarch64-linux.stage0-rootfs"
+                        || attr_path == "packages.x86_64-linux.stage0-rootfs",
+                    "unexpected attr path: {attr_path}"
+                );
+            }
+            other => panic!("unexpected stage0 job: {other:?}"),
+        }
     }
 
     fn write_valid_builder_vm_artifacts(dir: &std::path::Path) {
@@ -5359,6 +5425,7 @@ mod builder_vm_bootstrap_tests {
             "/repo/nix/images/builder-vm",
             PathBuf::from("/tmp/kernel"),
             PathBuf::from("/tmp/rootfs"),
+            Stage0BootstrapOpts::default_image(),
         );
         let (stage, err) = result.expect_err("non-UTF-8 staging dir must fail");
         assert!(matches!(stage, Stage0FailureStage::Build));

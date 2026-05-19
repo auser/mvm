@@ -49,11 +49,11 @@ pub(in crate::commands) fn cache_dir(arch: &str) -> PathBuf {
 
 /// A populated ur-seed cache. All required files present + readable.
 ///
-/// `manifest` and `cmdline` paths are not consumed today — Stage 0 uses
-/// its own pinned cmdline (`STAGE0_BOOTSTRAP_CMDLINE`) and doesn't
-/// re-parse the manifest. They're kept on the struct for the seed
-/// contract upgrade (W4 follow-up) which will read the manifest to
-/// pick the right init path per seed.
+/// `manifest` and `cmdline` are kept on the struct for seed contract
+/// upgrades. The current Stage 0 path still boots through
+/// `mvm-builder-init` so it can use the standard `/job` result
+/// protocol, but it targets the ur-seed-specific rootfs-only builder
+/// output and supplies the final kernel from the host-side cache.
 #[derive(Debug, Clone)]
 #[cfg(feature = "builder-vm")]
 pub(in crate::commands) struct UrSeedCache {
