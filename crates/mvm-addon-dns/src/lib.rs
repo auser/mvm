@@ -641,7 +641,10 @@ mod tests {
             let guard = read_zone.read().await;
             guard.lookup("db.dev.internal").cloned()
         });
-        assert_eq!(reader.await.unwrap().unwrap().address, Ipv4Addr::new(127, 77, 0, 10));
+        assert_eq!(
+            reader.await.unwrap().unwrap().address,
+            Ipv4Addr::new(127, 77, 0, 10)
+        );
 
         // Rewrite the file with a new record set and reload.
         std::fs::write(

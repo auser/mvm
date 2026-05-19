@@ -50,10 +50,7 @@ async fn main() -> Result<()> {
     };
 
     let zone = shared_zone(Zone::new(records));
-    tracing::info!(
-        records = zone.read().await.len(),
-        "loaded addon DNS zone"
-    );
+    tracing::info!(records = zone.read().await.len(), "loaded addon DNS zone");
 
     let mut config = DnsServerConfig::production_default();
     if let Some(bind_addrs) = env::var_os("MVM_ADDON_DNS_BIND_ADDRS") {
