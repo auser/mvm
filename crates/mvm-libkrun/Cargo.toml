@@ -57,6 +57,11 @@ serde = { workspace = true }
 # dev-deps are excluded from cycle analysis.
 mvm-providers = { workspace = true, optional = true }
 serde_json = { workspace = true, optional = true }
+# Plan 87 W2 — `passt` module probes $PATH for the `passt` binary
+# before spawning it. `which` is already in the workspace dep tree
+# (mvm-cli/mvm-build); pulling it in here keeps the dep graph
+# uniform and avoids reinventing PATH search.
+which.workspace = true
 
 [build-dependencies]
 # `bindgen` is required only when the `libkrun-sys` feature is on; we
@@ -77,6 +82,8 @@ libkrun-sys = [
 ]
 
 [dev-dependencies]
+# Plan 87 W2 — passt supervisor tests stage scratch dirs.
+tempfile.workspace = true
 # The plan 57 W3 smoke example shares `GUEST_AGENT_PORT` with the
 # production vsock plumbing.
 mvm-guest.workspace = true

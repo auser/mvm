@@ -28,6 +28,19 @@ mod bindings {
     include!(concat!(env!("OUT_DIR"), "/libkrun_sys.rs"));
 }
 
+/// Plan 87: the `features` mask `krun_add_net_unixstream` expects for
+/// passt as the userspace network proxy. Mirrors the
+/// `COMPAT_NET_FEATURES` macro in libkrun.h:344 — a compound `|` of
+/// the NET_FEATURE_* constants that bindgen can't always fold into a
+/// single value. Re-deriving in Rust keeps the canonical mask close
+/// to the call site that uses it.
+pub const PASST_NET_FEATURES: u32 = (1 << 0)   // NET_FEATURE_CSUM
+    | (1 << 1)   // NET_FEATURE_GUEST_CSUM
+    | (1 << 7)   // NET_FEATURE_GUEST_TSO4
+    | (1 << 10)  // NET_FEATURE_GUEST_UFO
+    | (1 << 11)  // NET_FEATURE_HOST_TSO4
+    | (1 << 14); // NET_FEATURE_HOST_UFO
+
 /// Kernel-format constants exposed to callers without leaking the
 /// bindgen-generated identifier names.
 #[derive(Debug, Clone, Copy)]
@@ -178,6 +191,51 @@ impl Context {
     pub fn set_console_output(&self, host_path: &Path) -> Result<(), Error> {
         let path = cstring(host_path)?;
         check(unsafe { bindings::krun_set_console_output(self.ctx_id, path.as_ptr()) })
+    }
+
+    /// Add a virtio-net device backed by a unixstream userspace network
+    /// proxy (Plan 87 W1 — passt + virtio-net replacing TSI).
+    ///
+    /// `fd` is one end of an `AF_UNIX SOCK_STREAM` socketpair; the other
+    /// end is handed to the network proxy (passt) at spawn. libkrun
+    /// owns its half of the socket from this point — it must remain
+    /// open until `start_enter` is called, after which libkrun consumes
+    /// it.
+    ///
+    /// Calling this disables libkrun's default TSI backend (per
+    /// `libkrun.h:358`: "If no network interface is added, libkrun
+    /// will automatically enable the TSI backend"). Subsequent
+    /// `krun_set_port_map` calls return -ENOTSUP — passt manages port
+    /// forwarding via its own DHCP + NAT path.
+    ///
+    /// `mac` is a 6-byte hardware address. Pass [0xAE, 0xAD, 0xBE,
+    /// 0xEF, 0x00, 0x01] (locally-administered, unicast) for the
+    /// default mvm builder VM.
+    ///
+    /// `features` is the virtio-net feature mask; for passt the
+    /// canonical value is `COMPAT_NET_FEATURES` (definition mirrored
+    /// from `libkrun.h:344`).
+    pub fn add_net_unixstream_fd(
+        &self,
+        fd: i32,
+        mac: &[u8; 6],
+        features: u32,
+        flags: u32,
+    ) -> Result<(), Error> {
+        // libkrun's `krun_add_net_unixstream` takes `c_path` and `fd`
+        // as mutually-exclusive args (one is null/-1, the other is
+        // populated). We always take the fd path — the socketpair
+        // lives entirely in the parent process, no path on disk.
+        check(unsafe {
+            bindings::krun_add_net_unixstream(
+                self.ctx_id,
+                std::ptr::null(),
+                fd,
+                mac.as_ptr() as *mut u8,
+                features,
+                flags,
+            )
+        })
     }
 
     /// Returns the shutdown eventfd. The caller is responsible for

@@ -51,8 +51,14 @@ fn main() {
         .clang_arg(format!("-I{}", include_dir.display()))
         // Keep the generated surface small — only the symbols we wrap in
         // sys.rs plus the KRUN_* constants we need at the type level.
+        // Plan 87: also surface NET_FEATURE_*` + `COMPAT_NET_FEATURES`
+        // for the passt virtio-net backend (`krun_add_net_unixstream`'s
+        // `features` arg expects a bitwise-or of those).
         .allowlist_function("krun_.*")
         .allowlist_var("KRUN_.*")
+        .allowlist_var("NET_FEATURE_.*")
+        .allowlist_var("COMPAT_NET_FEATURES")
+        .allowlist_var("NET_FLAG_.*")
         .layout_tests(false)
         .generate_comments(false)
         .parse_callbacks(Box::new(bindgen::CargoCallbacks::new()))

@@ -3169,7 +3169,9 @@ dependencies = [
  "mvm-providers",
  "serde",
  "serde_json",
+ "tempfile",
  "tracing",
+ "which 7.0.3",
 ]
 
 [[package]]
