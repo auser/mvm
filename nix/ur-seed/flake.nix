@@ -322,6 +322,50 @@
           '';
           urSeedCmdlineFile = pkgs.writeText "cmdline.txt"
             "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/ur-seed-init";
+
+          # Plan 87 W4 — busybox udhcpc default script. When
+          # `udhcpc -s /etc/udhcpc/default.script` runs after passt
+          # hands out a DHCP lease, busybox calls this hook with the
+          # action ("deconfig" / "bound" / "renew") in $1 and the
+          # lease fields in env vars ($ip, $mask, $router, $dns, …).
+          # We:
+          #   * bring eth0 up with the leased IP + mask on "bound"/"renew"
+          #   * install the default route via $router
+          #   * write nameservers from $dns into /etc/resolv.conf
+          # /etc is on the read-only rootfs, but /etc/resolv.conf is a
+          # symlink (set up at boot) to /run/resolv.conf — /run is a
+          # tmpfs mvm-builder-init mounts. The dev image flake's
+          # equivalent script (`nix/lib/udhcpc-default.script`) follows
+          # the same shape.
+          udhcpcDefaultScript = pkgs.writeScript "udhcpc-default.script" ''
+            #!/bin/sh
+            set -eu
+            case "$1" in
+              deconfig)
+                ip link set "$interface" up || true
+                ip -4 addr flush dev "$interface" || true
+                ;;
+              renew|bound)
+                ip link set "$interface" up
+                ip -4 addr flush dev "$interface"
+                ip -4 addr add "$ip/$mask" dev "$interface"
+                if [ -n "''${router:-}" ]; then
+                  for r in $router; do
+                    ip -4 route add default via "$r" dev "$interface" || true
+                  done
+                fi
+                # /run is tmpfs (mounted by mvm-builder-init); /etc/resolv.conf
+                # is symlinked there by the rootfs build.
+                : > /run/resolv.conf
+                if [ -n "''${domain:-}" ]; then
+                  printf 'search %s\n' "$domain" >> /run/resolv.conf
+                fi
+                for ns in ''${dns:-}; do
+                  printf 'nameserver %s\n' "$ns" >> /run/resolv.conf
+                done
+                ;;
+            esac
+          '';
         in
         pkgs.runCommand "mvm-ur-seed-${system}"
           {
@@ -419,8 +463,24 @@
             cp ${passwdFile}   $staging/etc/passwd
             cp ${groupFile}    $staging/etc/group
             cp ${nsswitchFile} $staging/etc/nsswitch.conf
-            cp ${resolvFile}   $staging/etc/resolv.conf
             cp ${manifestJson} $staging/etc/mvm-ur-seed.json
+
+            # Plan 87 W4 — resolv.conf is a symlink into /run/resolv.conf
+            # (tmpfs, mounted by mvm-builder-init). Pre-create the symlink
+            # so udhcpc's hook script writes the right file from boot 1.
+            # The static fallback content (1.1.1.1 / 8.8.8.8) is staged
+            # at /etc/resolv.conf.fallback — Plan 87 W4's udhcpc hook
+            # uses it before the DHCP lease lands; the TSI fallback
+            # path also reads it.
+            ln -sf /run/resolv.conf $staging/etc/resolv.conf
+            cp ${resolvFile} $staging/etc/resolv.conf.fallback
+
+            # Plan 87 W4 — busybox udhcpc default hook. Installed
+            # under `/etc/udhcpc/default.script` so
+            # `udhcpc -s /etc/udhcpc/default.script` picks it up.
+            mkdir -p $staging/etc/udhcpc
+            cp ${udhcpcDefaultScript} $staging/etc/udhcpc/default.script
+            chmod +x $staging/etc/udhcpc/default.script
 
             # Kernel modules. mvm-builder-init runs
             # `modprobe virtiofs fuse` before mounting the host shares;

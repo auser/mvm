@@ -643,8 +643,37 @@ mod linux {
     }
 
     fn setup_network() -> Result<(), String> {
-        let status = Command::new("/sbin/udhcpc")
-            .args(["-i", "eth0", "-n", "-q"])
+        // Plan 87 W4: seed /run/resolv.conf from the fallback before
+        // udhcpc runs. /etc/resolv.conf is a symlink into /run, so
+        // libc resolvers have a usable nameserver list from boot 1
+        // even if DHCP fails (TSI mode, or passt mid-handoff).
+        // Failure here is non-fatal — the symlink might not exist
+        // on a guest built before Plan 87, in which case udhcpc's
+        // own write to /etc/resolv.conf (if -s is set) is the
+        // only path.
+        let fallback = std::path::Path::new("/etc/resolv.conf.fallback");
+        if fallback.is_file() {
+            if let Err(e) = std::fs::copy(fallback, "/run/resolv.conf") {
+                eprintln!(
+                    "mvm-builder-init: copy /etc/resolv.conf.fallback -> \
+                     /run/resolv.conf: {e} (continuing — udhcpc may fix it)"
+                );
+            }
+        }
+
+        // Plan 87 W4: when /etc/udhcpc/default.script exists (passt
+        // path / ur-seed-built rootfs), use it so the DHCP lease
+        // writes /run/resolv.conf with the leased DNS. Older rootfs
+        // builds without the script keep the legacy `-i eth0 -n -q`
+        // shape — udhcpc still sets the IP but resolv.conf stays at
+        // the fallback content.
+        let script = "/etc/udhcpc/default.script";
+        let mut cmd = Command::new("/sbin/udhcpc");
+        cmd.args(["-i", "eth0", "-n", "-q"]);
+        if std::path::Path::new(script).is_file() {
+            cmd.args(["-s", script]);
+        }
+        let status = cmd
             .status()
             .map_err(|e| format!("spawn /sbin/udhcpc: {e}"))?;
         if !status.success() {

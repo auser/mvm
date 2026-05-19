@@ -103,6 +103,50 @@ pub const GUEST_NIX_DIR: &str = "/nix";
 /// under this path (read-write virtio-fs). Plan 72 W4 wires this.
 pub const GUEST_JOB_DIR: &str = "/job";
 
+/// Plan 87 W3: caller-visible networking-backend preference. Read from
+/// the `MVM_NETWORKING` env var at every VM-launch site. Default
+/// stays Tsi for backward compat; PR3 in Plan 87 flips this once W4
+/// in-VM udhcpc wiring lands and CI installs the host-side deps.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NetworkingPreference {
+    /// libkrun's built-in TSI (no virtio-net, no DHCP). Default.
+    Tsi,
+    /// virtio-net via passt. Requires libkrun-sys + passt installed on
+    /// the host. The supervisor process spawns passt as a child.
+    Passt,
+}
+
+/// Read `MVM_NETWORKING` from the env. Accepts `tsi` and `passt`
+/// (case-insensitive); anything else falls back to the default and
+/// emits a debug log so a typo is visible without aborting.
+///
+/// Plan 87 W5 / PR3 flipped the default from `Tsi` to `Passt`. TSI is
+/// libkrun's experimental no-network-stack mode; it works for
+/// trivial HTTP but breaks on nix's substituter and source fetches
+/// (HTTP/2 multiplexing, HTTPS redirect chains, the offline-mode
+/// probe — see ADR-055 §"Context"). Passt-backed virtio-net is the
+/// production-ready path. Contributors can still opt back to TSI via
+/// `MVM_NETWORKING=tsi` for debugging.
+pub fn resolve_networking_mode() -> NetworkingPreference {
+    match std::env::var("MVM_NETWORKING")
+        .ok()
+        .as_deref()
+        .map(str::trim)
+        .map(str::to_ascii_lowercase)
+        .as_deref()
+    {
+        Some("tsi") => NetworkingPreference::Tsi,
+        Some("passt") | None | Some("") => NetworkingPreference::Passt,
+        Some(other) => {
+            tracing::warn!(
+                value = other,
+                "MVM_NETWORKING unrecognised; falling back to Passt (accepted: tsi, passt)"
+            );
+            NetworkingPreference::Passt
+        }
+    }
+}
+
 /// Libkrun-backed builder VM driver.
 ///
 /// Configuration only — `run_build` consumes it to spin a per-job
@@ -260,6 +304,20 @@ impl LibkrunBuilderVm {
                 disk.id.as_str(),
                 path_to_str(&disk.path, "extra_disk")?,
                 disk.read_only,
+            );
+        }
+
+        // Plan 87 W3: opt into passt-backed virtio-net when
+        // MVM_NETWORKING=passt. The supervisor spawns the passt child
+        // and logs to <vm_state_dir>/passt.log; libkrun's
+        // `krun_add_net_unixstream` consumes the fd. Without the env
+        // var (or with any other value) we stay on TSI for backward
+        // compat — Plan 87 PR3 flips the default once the W4 in-VM
+        // wiring lands and CI installs passt + libkrunfw.
+        if resolve_networking_mode() == NetworkingPreference::Passt {
+            krun = krun.with_passt(
+                mvm_libkrun::passt::DEFAULT_GUEST_MAC,
+                path_to_str(&vm_state_dir, "vm_state_dir")?,
             );
         }
 
@@ -492,7 +550,7 @@ impl BuilderVm for LibkrunBuilderVm {
         // hvc0 output silently and "supervisor running, then exits 1"
         // is the only observable signal.
         let console_log = vm_state_dir.join("console.log");
-        let krun = KrunContext::new(
+        let mut krun = KrunContext::new(
             &vm_name,
             path_to_str(&image.kernel_path, "kernel_path")?,
             path_to_str(&image.rootfs_path, "rootfs_path")?,
@@ -509,6 +567,18 @@ impl BuilderVm for LibkrunBuilderVm {
         .add_virtio_fs("work", path_to_str(&mounts.flake_src, "flake_src")?)
         .add_virtio_fs("out", path_to_str(&mounts.artifact_out, "artifact_out")?)
         .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?);
+
+        // Plan 87 W3: same env-var opt-in as the shell-job path. See
+        // `LibkrunBuilderVm::dispatch_shell_job` for the rationale —
+        // when `MVM_NETWORKING=passt` is set the supervisor spawns
+        // passt and libkrun consumes its socket fd. Default stays TSI
+        // until PR3 flips it.
+        if resolve_networking_mode() == NetworkingPreference::Passt {
+            krun = krun.with_passt(
+                mvm_libkrun::passt::DEFAULT_GUEST_MAC,
+                path_to_str(&vm_state_dir, "vm_state_dir")?,
+            );
+        }
 
         // 8. Drive the supervisor: pipe `SupervisorConfig` to
         //    stdin and **wait** for the child to exit. Unlike
@@ -796,6 +866,8 @@ cd /work
 export NIX_CONFIG="experimental-features = nix-command flakes
 sandbox = false
 build-users-group =
+max-jobs = auto
+cores = 0
 substituters = https://cache.nixos.org/
 trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 # Plan 72 W0's flake convention: workspace-path env var so
@@ -1439,6 +1511,36 @@ mod tests {
     }
 
     #[test]
+    fn resolve_networking_mode_parses_env() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: tests guarded by ENV_LOCK; env mutation in test
+        // process is fine when serialized.
+        unsafe {
+            // Plan 87 W5 / PR3: default is Passt; opt out via tsi.
+            std::env::remove_var("MVM_NETWORKING");
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
+
+            std::env::set_var("MVM_NETWORKING", "tsi");
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
+
+            std::env::set_var("MVM_NETWORKING", "TSI");
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
+
+            std::env::set_var("MVM_NETWORKING", " passt ");
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
+
+            std::env::set_var("MVM_NETWORKING", "");
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
+
+            std::env::set_var("MVM_NETWORKING", "gvproxy");
+            // Unknown value → fall back to the default (Passt) without panic.
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
+
+            std::env::remove_var("MVM_NETWORKING");
+        }
+    }
+
+    #[test]
     fn validate_mounts_rejects_missing_flake_src() {
         let scratch = TempDir::new().unwrap();
         let mounts = BuilderMounts {
@@ -1766,6 +1868,8 @@ mod tests {
         assert!(cmd.starts_with("#!/bin/sh"));
         assert!(cmd.contains("set -eu"));
         assert!(cmd.contains("cd /work"));
+        assert!(cmd.contains("max-jobs = auto"));
+        assert!(cmd.contains("cores = 0"));
         assert!(cmd.contains("printf '%s\\n' \"$NIX_OUT\" > /job/store-path"));
     }
 

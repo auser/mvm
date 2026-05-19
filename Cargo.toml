@@ -274,6 +274,16 @@ anyhow.workspace = true
 
 [target.'cfg(target_os = "macos")'.dependencies]
 objc2-foundation = { version = "0.3", features = ["NSRunLoop", "NSDate", "NSAutoreleasePool"] }
+# Plan 87 W5 — enable mvm-cli's `libkrun-sys` feature on macOS so the
+# `mvmctl` binary's `extract_bundled_kernel()` path is wired by
+# default (libkrun is the macOS hypervisor backend; libkrunfw ships
+# alongside via the same Homebrew tap). Linux CI / runtimes use
+# Firecracker, which doesn't need libkrun headers — the target-gated
+# dep keeps `cargo build` on Ubuntu working without `apt install
+# libkrun-dev` (which doesn't ship a libkrun-dev package today).
+# Cargo features can't be cfg-gated, but target-specific dep entries
+# can; Cargo unions the features across all matching target entries.
+mvm-cli = { workspace = true, default-features = false, features = ["libkrun-sys"] }
 
 [dev-dependencies]
 assert_cmd.workspace = true
