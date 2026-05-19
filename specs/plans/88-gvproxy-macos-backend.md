@@ -250,6 +250,55 @@ right binary per host:
 - Capture the timing for `specs/plans/87-passt-virtio-net.md` follow-up
   notes.
 
+**W6 — virtio-net fuzz target + security claim 5 extension (~1 day).**
+
+CLAUDE.md security claim 5 today reads "vsock framing is fuzzed" — it
+covers `GuestRequest` and `AuthenticatedFrame` through
+`crates/mvm-guest/fuzz/`. With Plan 87 + Plan 88 in flight, the
+**virtio-net** ring is a new untrusted-input boundary: every Ethernet
+frame the guest writes is parsed by libkrun's virtio-net device
+emulator and by the userspace gateway (passt or gvproxy). Neither is
+in the cargo-fuzz harness today.
+
+Threat: a malicious guest that crafts bad virtio descriptors or
+malformed Ethernet/IP frames could try to escape via a libkrun bug or
+crash/exploit the userspace gateway. Both processes run as the
+contributor's user (not root), but compromise is still a code-exec
+boundary we don't fuzz.
+
+- New `crates/mvm-libkrun/fuzz/fuzz_targets/fuzz_virtio_net_frame.rs`
+  cargo-fuzz target. Constructs a synthetic virtio descriptor + frame
+  payload from the fuzzer's input bytes, feeds it through a thin
+  in-process harness around libkrun's virtio-net path. Workspace
+  exclusion + Cargo manifest follow the `crates/mvm-guest/fuzz/` and
+  `crates/mvm-oci/fuzz/` precedent (libfuzzer-sys gated outside the
+  main workspace).
+- New `crates/mvm-libkrun/fuzz/fuzz_targets/fuzz_passt_frame.rs` +
+  `fuzz_gvproxy_frame.rs` peer targets that throw frames at the
+  gateway's stdin — both gateways read raw frames on the socket, so
+  the harness writes fuzzer input to the supervisor's socketpair end
+  and verifies the gateway doesn't crash or leak fds. Linux-only
+  (passt) / macOS-only (gvproxy) gated.
+- `.github/workflows/ci.yml` security lane gains a 5-minute PR run +
+  30-minute nightly cron for each new target, matching the existing
+  `cargo-fuzz` lanes for `fuzz_guest_request` /
+  `fuzz_authenticated_frame`.
+- CLAUDE.md security claim 5 updated:
+  > 5. **Vsock + virtio-net framing is fuzzed.** `cargo-fuzz` targets
+  > at `crates/mvm-guest/fuzz/` cover `GuestRequest` and
+  > `AuthenticatedFrame`; targets at `crates/mvm-libkrun/fuzz/`
+  > cover libkrun's virtio-net device emulator and both userspace
+  > gateways (`fuzz_virtio_net_frame`, `fuzz_passt_frame`,
+  > `fuzz_gvproxy_frame`). `#[serde(deny_unknown_fields)]` on every
+  > host↔guest type still applies (W4.1).
+
+  W6 also amends ADR-055 §"Security model" with a paragraph noting
+that virtio-net introduces fuzzed untrusted-input parsing and that
+Plan 73's `mvm-egress-proxy` is now load-bearing (was defense-in-depth
+under TSI — see the "What changes" entry of the threat-table). The
+ADR-002 claim-table in `specs/adrs/002-microvm-security-posture.md`
+gets a matching update.
+
 ## Non-goals
 
 - **socket_vmnet** support. socket_vmnet is the
@@ -280,6 +329,11 @@ right binary per host:
    surfaces the correct OS-specific install hint.
 5. Memory `reference_libkrun_gotchas.md` updated with the
    passt-Linux-only / gvproxy-macOS split.
+6. `fuzz_virtio_net_frame`, `fuzz_passt_frame`, and
+   `fuzz_gvproxy_frame` cargo-fuzz targets compile, run for ≥5
+   minutes in PR CI, and finish a 30-minute nightly run without
+   crashes. CLAUDE.md security claim 5 + ADR-002 claim table
+   reference all three targets.
 
 ## ADR-055 amendment
 
@@ -299,8 +353,10 @@ Append a §"Cross-platform backends — Plan 88 amendment":
 ## Order of operations
 
 W1 + W2 ship together (FFI + supervisor — small, mechanical,
-independently mergeable). W3 + W4 land next; W5 is the smoke gate
-before declaring Plan 88 closed.
+independently mergeable). W3 + W4 land next; W5 is the smoke gate.
+W6 (fuzz targets + security-claim 5 extension) can land in parallel
+with or after W5 — the fuzz harnesses don't depend on the dispatcher
+flip.
 
 Suggested PR sequence:
 
@@ -310,8 +366,12 @@ Suggested PR sequence:
   Flips macOS default from `Passt` (fail-closed) to `Gvproxy`
   (working). This is the user-visible fix.
 - **PR3 (W5):** smoke test results captured in
-  `specs/plans/87-passt-virtio-net.md`'s "Completion" section +
-  closes Plan 88.
+  `specs/plans/87-passt-virtio-net.md`'s "Completion" section.
+- **PR4 (W6):** virtio-net + gateway fuzz targets + CLAUDE.md
+  security-claim-5 extension + ADR-055 §"Security model" update.
+  Closes Plan 88.
 
 Each PR is independently revertible. PR2 is the load-bearing one for
-unsticking macOS contributors.
+unsticking macOS contributors. PR4 closes the security-fuzz gap Plan
+87 + Plan 88 opened (virtio-net is now a live untrusted-input
+boundary; the existing vsock fuzz targets don't cover it).

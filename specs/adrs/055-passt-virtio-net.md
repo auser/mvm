@@ -129,6 +129,56 @@ explicit shares") is unaffected: passt doesn't see the guest's
 filesystem, only its virtio-net frames. Claim 9 (deps-volume
 hash-lock + audit) is unaffected for the same reason.
 
+### New untrusted-input surfaces introduced by Plan 87 (Plan 88 W6 amendment)
+
+Moving from TSI to virtio-net opens three new host-side parsing
+boundaries that didn't exist under TSI's syscall-hijack model. All
+three run as the contributor's user (not root), so a successful
+exploit is a code-execution-as-user boundary — not a host-kernel
+boundary. None has filesystem visibility into the guest. But each is
+a new fuzzing target:
+
+1. **libkrun's virtio-net device emulator.** Parses virtio
+   descriptors the guest writes to the virtqueue. Same class of risk
+   QEMU / Firecracker / Cloud Hypervisor virtio implementations have
+   carried for years.
+2. **passt's frame parser** (Linux). C code dealing with raw
+   Ethernet/IP/TCP/UDP/ICMP frames the guest sends. Well-audited by
+   Red Hat security; not invulnerable.
+3. **gvproxy's frame parser** (macOS / cross-platform). Go code, so
+   memory-safety bugs are rare, but logic bugs in its DHCP server,
+   TCP state machine, and ICMP responder remain possible.
+
+Plan 88 W6 closes the fuzzing gap by adding `cargo-fuzz` targets at
+`crates/mvm-libkrun/fuzz/{fuzz_virtio_net_frame, fuzz_passt_frame,
+fuzz_gvproxy_frame}.rs`, wiring them into the CI security lane
+alongside the existing `fuzz_guest_request` and
+`fuzz_authenticated_frame`. CLAUDE.md security claim 5 ("vsock
+framing is fuzzed") is extended to "vsock + virtio-net framing is
+fuzzed."
+
+### `mvm-egress-proxy` becomes load-bearing
+
+ADR-055 v1 already noted this, but it's worth flagging again as part
+of the Plan 88 amendment:
+
+- Under TSI, AF_INET socket calls were hijacked at the syscall
+  layer. A workload couldn't bypass the egress allowlist because
+  there was no Linux network stack in the guest to bypass through.
+  `mvm-egress-proxy` (Plan 73 Followup B.2.x / ADR-047) was
+  defense-in-depth.
+- Under virtio-net (passt or gvproxy), the guest's real Linux
+  network stack is the path. A workload that ignores `HTTPS_PROXY`
+  / `HTTP_PROXY` env vars can open raw sockets directly to any
+  destination passt/gvproxy will forward to. The in-VM iptables
+  uid-owner rules `mvm-builder-init::install_egress_lockdown`
+  installs are the only thing preventing bypass.
+
+The policy layer (`mvm-egress-proxy` + iptables uid-owner) is
+unchanged; what changed is its load-bearing status. ADR-047's
+threat model still applies; production microVMs running untrusted
+workloads still need the egress proxy active.
+
 ## Cross-platform backends (Plan 88 amendment, 2026-05-19)
 
 ADR-055 v1 (above) assumed `passt` was cross-platform. End-to-end
