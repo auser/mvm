@@ -59,6 +59,10 @@ exclude = [
     # libfuzzer-sys linker-flag constraints as the mvm-guest fuzz
     # crate; CI gate at `.github/workflows/ci.yml::oci-unpack-fuzz`.
     "crates/mvm-oci/fuzz",
+    # Plan 88 W6 / ADR-055 §"New untrusted-input surfaces" —
+    # supervisor-config JSON fuzz harness. CI gate at
+    # `.github/workflows/security.yml::fuzz`.
+    "crates/mvm-libkrun/fuzz",
 ]
 resolver = "3"
 

@@ -134,10 +134,17 @@ post-date the CLAUDE.md per-claim summary below.)
    builds.** `prod-agent-no-exec` job in `.github/workflows/ci.yml`
    builds the agent without `dev-shell` and asserts the
    `mvm_guest_agent::do_exec` symbol is absent (W4.3).
-5. **Vsock framing is fuzzed.** `cargo-fuzz` targets at
-   `crates/mvm-guest/fuzz/` cover `GuestRequest` and
-   `AuthenticatedFrame` (W4.2). `#[serde(deny_unknown_fields)]` on
-   every host↔guest type ensures unexpected fields fail-closed (W4.1).
+5. **Vsock framing + supervisor-config JSON are fuzzed.** `cargo-fuzz`
+   targets at `crates/mvm-guest/fuzz/` cover `GuestRequest` and
+   `AuthenticatedFrame` (W4.2). Plan 88 W6 adds
+   `crates/mvm-libkrun/fuzz/fuzz_supervisor_config.rs` against the
+   host-side `SupervisorConfig` parser the `mvm-libkrun-supervisor`
+   binary reads on stdin. `#[serde(deny_unknown_fields)]` on every
+   host↔guest type ensures unexpected fields fail-closed (W4.1). The
+   virtio-net frame parsers that Plan 87/88 brought online live
+   inside libkrun (C), passt (C), and gvproxy (Go) — their fuzz
+   coverage belongs upstream and is tracked in ADR-055 §"New
+   untrusted-input surfaces".
 6. **Pre-built dev image is hash-verified.** `download_dev_image`
    fetches the per-arch `*-checksums-sha256.txt` manifest, streams
    the artifact through SHA-256, and rejects + deletes on mismatch

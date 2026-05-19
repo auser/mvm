@@ -235,6 +235,19 @@ jobs:
         # steps in vsock.rs.
         run: cargo fuzz run fuzz_authed_path -- -max_total_time="$DURATION"
 
+      - name: Fuzz SupervisorConfig (host-side)
+        working-directory: crates/mvm-libkrun
+        env:
+          DURATION: ${{ steps.duration.outputs.secs }}
+          RUSTUP_TOOLCHAIN: nightly
+        # Plan 88 W6 / ADR-055 §"New untrusted-input surfaces" — the
+        # `mvm-libkrun-supervisor` binary reads `SupervisorConfig`
+        # JSON on stdin before any libkrun call. This target asserts
+        # the deserializer never panics on adversarial bytes; same
+        # contract as `fuzz_guest_request` for the guest-side
+        # `GuestRequest` parser.
+        run: cargo fuzz run fuzz_supervisor_config -- -max_total_time="$DURATION"
+
       - name: Upload corpus on failure
         if: failure()
         uses: actions/upload-artifact@v7
@@ -243,6 +256,8 @@ jobs:
           path: |
             crates/mvm-guest/fuzz/corpus/
             crates/mvm-guest/fuzz/artifacts/
+            crates/mvm-libkrun/fuzz/corpus/
+            crates/mvm-libkrun/fuzz/artifacts/
 
   # ── Lane 5: Hash-verify regression ─────────────────────────────────
   # ADR-002 §W5.1 — the unit tests that exercise the
