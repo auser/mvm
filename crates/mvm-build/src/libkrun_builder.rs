@@ -117,8 +117,16 @@ pub enum NetworkingPreference {
 }
 
 /// Read `MVM_NETWORKING` from the env. Accepts `tsi` and `passt`
-/// (case-insensitive); anything else falls back to `Tsi` and emits a
-/// debug log so a typo is visible without aborting.
+/// (case-insensitive); anything else falls back to the default and
+/// emits a debug log so a typo is visible without aborting.
+///
+/// Plan 87 W5 / PR3 flipped the default from `Tsi` to `Passt`. TSI is
+/// libkrun's experimental no-network-stack mode; it works for
+/// trivial HTTP but breaks on nix's substituter and source fetches
+/// (HTTP/2 multiplexing, HTTPS redirect chains, the offline-mode
+/// probe — see ADR-055 §"Context"). Passt-backed virtio-net is the
+/// production-ready path. Contributors can still opt back to TSI via
+/// `MVM_NETWORKING=tsi` for debugging.
 pub fn resolve_networking_mode() -> NetworkingPreference {
     match std::env::var("MVM_NETWORKING")
         .ok()
@@ -127,14 +135,14 @@ pub fn resolve_networking_mode() -> NetworkingPreference {
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("passt") => NetworkingPreference::Passt,
-        Some("tsi") | None | Some("") => NetworkingPreference::Tsi,
+        Some("tsi") => NetworkingPreference::Tsi,
+        Some("passt") | None | Some("") => NetworkingPreference::Passt,
         Some(other) => {
             tracing::warn!(
                 value = other,
-                "MVM_NETWORKING unrecognised; falling back to TSI (accepted: tsi, passt)"
+                "MVM_NETWORKING unrecognised; falling back to Passt (accepted: tsi, passt)"
             );
-            NetworkingPreference::Tsi
+            NetworkingPreference::Passt
         }
     }
 }
@@ -1501,24 +1509,25 @@ mod tests {
         // SAFETY: tests guarded by ENV_LOCK; env mutation in test
         // process is fine when serialized.
         unsafe {
+            // Plan 87 W5 / PR3: default is Passt; opt out via tsi.
             std::env::remove_var("MVM_NETWORKING");
-            assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
-
-            std::env::set_var("MVM_NETWORKING", "passt");
             assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
 
-            std::env::set_var("MVM_NETWORKING", "PASST");
-            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
-
-            std::env::set_var("MVM_NETWORKING", " tsi ");
+            std::env::set_var("MVM_NETWORKING", "tsi");
             assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
+
+            std::env::set_var("MVM_NETWORKING", "TSI");
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
+
+            std::env::set_var("MVM_NETWORKING", " passt ");
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
 
             std::env::set_var("MVM_NETWORKING", "");
-            assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
 
             std::env::set_var("MVM_NETWORKING", "gvproxy");
-            // Unknown value → fall back to TSI without panic.
-            assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
+            // Unknown value → fall back to the default (Passt) without panic.
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
 
             std::env::remove_var("MVM_NETWORKING");
         }
