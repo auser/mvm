@@ -149,13 +149,31 @@ a new fuzzing target:
    memory-safety bugs are rare, but logic bugs in its DHCP server,
    TCP state machine, and ICMP responder remain possible.
 
-Plan 88 W6 closes the fuzzing gap by adding `cargo-fuzz` targets at
-`crates/mvm-libkrun/fuzz/{fuzz_virtio_net_frame, fuzz_passt_frame,
-fuzz_gvproxy_frame}.rs`, wiring them into the CI security lane
-alongside the existing `fuzz_guest_request` and
-`fuzz_authenticated_frame`. CLAUDE.md security claim 5 ("vsock
-framing is fuzzed") is extended to "vsock + virtio-net framing is
-fuzzed."
+Fuzz coverage by surface — only one of the three is genuine
+first-party Rust we can put under cargo-fuzz. The supervisor's JSON
+parser is the fourth boundary that the network-backend dispatch
+opened (the supervisor's pipe semantics didn't change vs TSI, but
+its config now carries `NetworkingMode::{Passt, Gvproxy}` variants
+the parser has to handle).
+
+| Surface | Where it lives | mvm's local fuzz coverage |
+| ------- | -------------- | ------------------------- |
+| `SupervisorConfig` JSON (stdin → `mvm-libkrun-supervisor`) | First-party Rust | **In tree.** Plan 88 W6 — `crates/mvm-libkrun/fuzz/fuzz_supervisor_config.rs`, wired into `security.yml::fuzz`. |
+| libkrun virtio-net device emulator | C, inside `libkrun.dylib` | **Upstream.** Fuzzing requires a running guest per iteration; mvm trusts the libkrun project's own fuzz harness. |
+| passt frame parser | C, external process | **Upstream.** Red-Hat-maintained; mvm runs passt as the contributor's user. |
+| gvproxy frame parser | Go, external process | **Upstream.** Memory-safety bugs are rare in Go; logic bugs in the DHCP / TCP / ICMP responder are tracked by the gvproxy project. |
+
+CLAUDE.md security claim 5 ("vsock framing is fuzzed") is extended
+to "vsock framing + supervisor-config JSON are fuzzed" — explicit
+about the in-tree / upstream split so a future reader doesn't take
+it as a stronger claim than the harness actually backs.
+
+A separate follow-up plan covers the aspirational external-process
+gateway-frame fuzz harness (persistent gvproxy/passt subprocess
+driven by a unix-socket fuzzer, plus a mocked libkrun virtqueue
+harness). That work is out of Plan 88's scope — multi-week effort
+with substantial dependency on upstream libkrun maintainers exposing
+sanitizer-friendly entry points.
 
 ### `mvm-egress-proxy` becomes load-bearing
 
