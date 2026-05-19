@@ -242,12 +242,6 @@ cargo run -- dev down    # stop the builder VM
 cargo run -- dev shell   # open shell in running builder VM
 cargo run -- dev status  # show dev environment status
 
-# Stage 0 bootstrap assets (busybox + nix-portable). Required once
-# on a host with no dev image cache. Downloads nix-portable from
-# DavHau/nix-portable upstream and caches under `~/.cache/mvm/stage0/`.
-# busybox is embedded in `mvmctl` itself, no fetch needed.
-cargo run -- dev fetch-stage0
-
 # Build from Nix flake
 cargo run -- build --flake . --profile minimal --role worker
 cargo run -- run --flake . --profile minimal --cpus 2 --memory 1024

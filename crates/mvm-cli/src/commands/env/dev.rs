@@ -165,13 +165,6 @@ pub(in crate::commands) enum DevAction {
         #[arg(long, value_name = "FILE")]
         rootfs: String,
     },
-    /// Fetch the Stage 0 bootstrap binaries (nix-portable) into
-    /// `~/.cache/mvm/stage0/`. Required exactly once per host. The
-    /// other bootstrap binary (busybox) is embedded in the `mvmctl`
-    /// binary itself. `mvmctl dev up` invokes this automatically on
-    /// first run; running it manually pre-populates the cache for
-    /// air-gapped workflows.
-    FetchStage0,
 }
 
 #[derive(Subcommand, Debug, Clone)]
@@ -196,18 +189,6 @@ fn bail_no_dev_backend() -> Result<()> {
          local dev paths today. Run on an M-series Mac or a Linux KVM \
          host for the supported local workflow."
     );
-}
-
-fn cmd_dev_fetch_stage0() -> Result<()> {
-    use anyhow::Context;
-    ui::progress("Fetching Stage 0 bootstrap assets...");
-    mvm_build::stage0::prepare_assets(mvm_build::stage0::ASSETS_AARCH64)
-        .context("downloading Stage 0 bootstrap assets")?;
-    ui::success(&format!(
-        "Stage 0 assets ready at {}",
-        mvm_build::stage0::stage0_cache_dir().display()
-    ));
-    Ok(())
 }
 
 fn cmd_dev_libkrun(cpus: u32, memory_gib: u32, open_shell: bool) -> Result<()> {
@@ -395,7 +376,6 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
             vmlinux,
             rootfs,
         } => apple_container::cmd_dev_import_image(&manifest, &bundle, &vmlinux, &rootfs),
-        DevAction::FetchStage0 => cmd_dev_fetch_stage0(),
         DevAction::Rebuild {
             cpus,
             memory,
