@@ -4572,7 +4572,7 @@ mod builder_vm_bootstrap_tests {
         );
         assert_eq!(
             image.rootfs_path,
-            std::path::PathBuf::from("/dev-cache/rootfs.ext4")
+            Some(std::path::PathBuf::from("/dev-cache/rootfs.ext4"))
         );
         assert_eq!(image.cmdline, STAGE0_BOOTSTRAP_CMDLINE);
     }
