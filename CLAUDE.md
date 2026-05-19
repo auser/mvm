@@ -13,6 +13,20 @@ Linux Host (this CLI) -> Firecracker microVM (/dev/kvm)
 
 Lima was the historical macOS host abstraction. It was removed on 2026-05-14 (Plan 72 W0–W6 + Plan 75 W0). libkrun is the default macOS backend; Apple Container is the macOS 26+ Apple Silicon backend; Firecracker is the Linux KVM path. There is no `--lima` flag and no Lima fallback.
 
+## Host dependencies (macOS)
+
+`mvmctl dev up` and the libkrun-backed builder VM need three Homebrew packages installed:
+
+```sh
+brew install libkrun libkrunfw passt
+```
+
+- `libkrun` — the in-process VMM. `mvm-libkrun-supervisor` links against it.
+- `libkrunfw` — bundles the TSI-patched Linux kernel libkrun's guests boot. Plan 86 / Plan 72 W5.D bullet 10 — `mvm-libkrun::extract_bundled_kernel()` pulls the kernel out of the dylib's `.rodata` at runtime.
+- `passt` — userspace network gateway providing virtio-net to the guest. Plan 87 / ADR-055 made this the default networking backend (`MVM_NETWORKING=passt`); `MVM_NETWORKING=tsi` opts back to libkrun's experimental TSI mode for debugging.
+
+`mvmctl doctor` probes all three and emits install hints for whichever are missing.
+
 ## Architecture
 
 ### Workspace Structure
