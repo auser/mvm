@@ -101,6 +101,7 @@ const CACHE_SUB: &[(&str, AuditPosture)] = &[
 ];
 
 const IMAGE_SUB: &[(&str, AuditPosture)] = &[
+    ("pull", AuditPosture::Emits("ImageFetch")),
     ("ls", AuditPosture::ReadOnly),
     ("inspect", AuditPosture::ReadOnly),
     ("rm", AuditPosture::Emits("CachePrune")),
@@ -469,6 +470,7 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
         "BundleGc",
         "BundleInstall",
         "ImageExportOci",
+        "ImageFetch",
         "TrustAdd",
         "TrustRemove",
         "VmStart",

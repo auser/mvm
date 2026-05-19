@@ -1537,6 +1537,41 @@ fn test_network_remove_help() {
 // --- Catalog CLI tests (plan 40 replaced `mvmctl image *`) ---
 
 #[test]
+fn test_image_pull_parses() {
+    let cli =
+        Cli::try_parse_from(["mvmctl", "image", "pull", "docker.io/library/alpine:3.20"]).unwrap();
+    match cli.command {
+        Commands::Image(image::Args {
+            action: ImageAction::Pull { reference, prod },
+        }) => {
+            assert_eq!(reference, "docker.io/library/alpine:3.20");
+            assert!(!prod);
+        }
+        _ => panic!("Expected Image Pull command"),
+    }
+}
+
+#[test]
+fn test_image_pull_prod_parses() {
+    let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let reference = format!("docker.io/library/alpine@{digest}");
+    let cli = Cli::try_parse_from(["mvmctl", "image", "pull", "--prod", &reference]).unwrap();
+    match cli.command {
+        Commands::Image(image::Args {
+            action:
+                ImageAction::Pull {
+                    reference: parsed,
+                    prod,
+                },
+        }) => {
+            assert_eq!(parsed, reference);
+            assert!(prod);
+        }
+        _ => panic!("Expected Image Pull command"),
+    }
+}
+
+#[test]
 fn test_catalog_list_parses() {
     let cli = Cli::try_parse_from(["mvmctl", "catalog", "list"]);
     assert!(cli.is_ok());

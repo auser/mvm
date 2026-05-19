@@ -227,6 +227,7 @@ admission until their transports are wired.
 | `mvmctl catalog search <query>` | Search entries by name, description, or tag |
 | `mvmctl catalog info <name>` | Show catalog entry details (JSON) |
 | `mvmctl init <DIR> --catalog <name>` | Scaffold a project from a catalog entry |
+| `mvmctl image pull <ref> [--prod]` | Pull an OCI image, unpack its layers, materialize a bootable `rootfs.ext4`, and record it in the local OCI cache. `--prod` requires a digest-pinned reference |
 | `mvmctl image ls [--registry <host>] [--json]` | List cached OCI images by reference, resolved digest, fetched timestamp, and size |
 | `mvmctl image inspect <ref-or-digest> [--json]` | Print cached OCI manifest/config metadata, layer digests, and any `mvm-claims.json` sidecar |
 | `mvmctl image rm <ref-or-digest>` | Remove a cached OCI image and garbage-collect unreferenced layer files |

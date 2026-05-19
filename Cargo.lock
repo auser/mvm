@@ -3066,6 +3066,7 @@ dependencies = [
  "mvm-ir",
  "mvm-libkrun",
  "mvm-mcp",
+ "mvm-oci",
  "mvm-plan",
  "mvm-policy",
  "mvm-providers",
