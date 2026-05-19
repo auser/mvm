@@ -725,6 +725,7 @@ mod linux {
                     job_dir_relpath,
                 } => {
                     let response = execute_dispatched_job(
+                        &mut conn,
                         job_id,
                         job,
                         &job_dir_relpath,
@@ -754,10 +755,18 @@ mod linux {
     }
 
     /// Run one dispatched job: locate cmd.sh under
-    /// `/job/<job_dir_relpath>/cmd.sh`, exec it, capture exit code
-    /// + stderr tail. Returns the wire JSON for
-    /// `BuilderResponse::Result` ready to frame and write back.
+    /// `/job/<job_dir_relpath>/cmd.sh`, exec it, stream every
+    /// stderr line back to `conn` as a `BuilderResponse::StderrChunk`
+    /// frame, capture the exit code + stderr tail. Returns the wire
+    /// JSON for the final `BuilderResponse::Result` ready to frame
+    /// and write back.
+    ///
+    /// `conn` is the same vsock connection the request arrived on;
+    /// streaming chunks and the terminal Result frame share it so
+    /// the host correlates everything by conn identity, not by job
+    /// id alone (Plan 89 W3 part 9).
     fn execute_dispatched_job(
+        conn: &mut std::fs::File,
         job_id: String,
         job: crate::builder_request::BuilderJob,
         job_dir_relpath: &str,
@@ -770,7 +779,18 @@ mod linux {
                     (2, format!("missing {cmd_path}"), 0)
                 } else {
                     let started = Instant::now();
-                    let (code, tail) = run_job(&cmd_path);
+                    let (code, tail) = run_job_streaming(&cmd_path, |line| {
+                        let frame = crate::dispatch_response::stderr_chunk_json(&job_id, line);
+                        if !write_frame(conn, frame.as_bytes()) {
+                            // Host probably closed the conn (e.g.
+                            // supervisor went away mid-build). Log
+                            // and keep draining stderr so the
+                            // build's exit code is still meaningful
+                            // — the terminal Result write will
+                            // fail loudly back in the dispatch loop.
+                            eprintln!("mvm-builder-init: dispatch loop: write StderrChunk failed");
+                        }
+                    });
                     let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     (code, tail, ms)
                 }
@@ -1302,22 +1322,69 @@ mod linux {
     }
 
     fn run_job(cmd_sh: &str) -> (i32, String) {
-        match Command::new("/bin/sh").args(["-eu", cmd_sh]).output() {
-            Ok(out) => {
-                let stderr = String::from_utf8_lossy(&out.stderr);
-                let tail = stderr
-                    .lines()
-                    .rev()
-                    .take(STDERR_TAIL_LINES)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                    .collect::<Vec<_>>()
-                    .join("\n");
-                (out.status.code().unwrap_or(-1), tail)
+        // Single-shot path: no streaming callback. The whole stderr
+        // tail still lands in `/job/result` and the host's
+        // file-based fallback parses it. Plan 89 W3 part 9 added
+        // the streaming variant for the persistent dispatch loop;
+        // this single-shot wrapper passes a no-op so the two code
+        // paths share their `Command`/`wait` logic.
+        run_job_streaming(cmd_sh, |_line| {})
+    }
+
+    /// Plan 89 W3 part 9 — same as [`run_job`] but invokes
+    /// `on_line` for each stderr line as it arrives. Used by the
+    /// persistent dispatch loop to frame each line as a
+    /// `BuilderResponse::StderrChunk` and write it to the active
+    /// vsock conn before the final `BuilderResponse::Result`. The
+    /// callback runs on this thread between line reads, so a slow
+    /// host can backpressure the build's stderr stream — the
+    /// host's vsock conn is the natural rate-limiter and we don't
+    /// need a separate buffer thread.
+    ///
+    /// The trailing `\n` is stripped from each line (the typed
+    /// `BuilderResponse::StderrChunk` docs commit to that).
+    /// `STDERR_TAIL_LINES` of trailing context is still buffered
+    /// for the final Result frame's `stderr_tail`, matching the
+    /// single-shot path's contract.
+    fn run_job_streaming<F: FnMut(&str)>(cmd_sh: &str, mut on_line: F) -> (i32, String) {
+        use std::collections::VecDeque;
+        use std::io::{BufRead, BufReader};
+        use std::process::Stdio;
+        let mut child = match Command::new("/bin/sh")
+            .args(["-eu", cmd_sh])
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::piped())
+            .spawn()
+        {
+            Ok(c) => c,
+            Err(e) => return (127, format!("spawn /bin/sh: {e}")),
+        };
+        let Some(stderr) = child.stderr.take() else {
+            // Stdio::piped() should always populate child.stderr;
+            // if it didn't, fall through to a non-streaming wait so
+            // we still return a real exit code.
+            let code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+            return (code, String::new());
+        };
+        let mut tail: VecDeque<String> = VecDeque::with_capacity(STDERR_TAIL_LINES);
+        for line in BufReader::new(stderr).lines() {
+            let line = match line {
+                Ok(l) => l,
+                // Treat a partial UTF-8 / I/O failure as end-of-stream
+                // — the child's exit code is still the authoritative
+                // signal. The tail we collected so far is still
+                // useful for the Result frame.
+                Err(_) => break,
+            };
+            on_line(&line);
+            if tail.len() == STDERR_TAIL_LINES {
+                tail.pop_front();
             }
-            Err(e) => (127, format!("spawn /bin/sh: {e}")),
+            tail.push_back(line);
         }
+        let exit_code = child.wait().ok().and_then(|s| s.code()).unwrap_or(-1);
+        let tail_joined = tail.into_iter().collect::<Vec<_>>().join("\n");
+        (exit_code, tail_joined)
     }
 
     /// Write `/job/result` as JSON. Hand-rolled rather than
@@ -1628,6 +1695,75 @@ mod linux {
             let err = encode_iface_name(&over).expect_err("IFNAMSIZ-byte name rejected");
             assert!(err.contains("IFNAMSIZ"), "err mentions limit: {err}");
             assert!(err.contains(&over), "err includes the offending name");
+        }
+
+        /// Plan 89 W3 part 9 — `run_job_streaming` calls the
+        /// per-line callback once per stderr line, in order, and
+        /// returns the same `(exit_code, tail)` shape as the
+        /// single-shot `run_job` for the success case.
+        #[test]
+        fn run_job_streaming_emits_each_line_in_order() {
+            // Write a cmd.sh that emits 3 stderr lines and exits 0.
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cmd_path = dir.path().join("cmd.sh");
+            std::fs::write(
+                &cmd_path,
+                "echo one >&2\necho two >&2\necho three >&2\nexit 0\n",
+            )
+            .expect("write cmd.sh");
+            use std::sync::Mutex;
+            let collected = Mutex::new(Vec::<String>::new());
+            let (code, tail) = run_job_streaming(cmd_path.to_str().unwrap(), |line| {
+                collected.lock().unwrap().push(line.to_string());
+            });
+            assert_eq!(code, 0);
+            let got = collected.into_inner().unwrap();
+            assert_eq!(got, vec!["one", "two", "three"]);
+            assert_eq!(tail, "one\ntwo\nthree");
+        }
+
+        /// Plan 89 W3 part 9 — non-zero exit still surfaces all
+        /// streamed lines and a tail bounded by `STDERR_TAIL_LINES`.
+        #[test]
+        fn run_job_streaming_caps_tail_to_stderr_tail_lines() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cmd_path = dir.path().join("cmd.sh");
+            // Emit more lines than STDERR_TAIL_LINES (=20) so we
+            // verify the buffer cap, not just streaming.
+            let total = STDERR_TAIL_LINES + 5;
+            let mut script = String::new();
+            for i in 1..=total {
+                script.push_str(&format!("echo line{i} >&2\n"));
+            }
+            script.push_str("exit 42\n");
+            std::fs::write(&cmd_path, script).expect("write cmd.sh");
+            use std::sync::Mutex;
+            let collected = Mutex::new(Vec::<String>::new());
+            let (code, tail) = run_job_streaming(cmd_path.to_str().unwrap(), |line| {
+                collected.lock().unwrap().push(line.to_string());
+            });
+            assert_eq!(code, 42);
+            // Callback saw every line.
+            assert_eq!(collected.lock().unwrap().len(), total);
+            // Tail kept only the last STDERR_TAIL_LINES.
+            let tail_lines: Vec<&str> = tail.lines().collect();
+            assert_eq!(tail_lines.len(), STDERR_TAIL_LINES);
+            assert_eq!(*tail_lines.first().unwrap(), "line6");
+            assert_eq!(*tail_lines.last().unwrap(), &format!("line{total}"));
+        }
+
+        /// Plan 89 W3 part 9 — single-shot `run_job` keeps its
+        /// pre-streaming semantics: returns the tail without any
+        /// per-line side effect (the streaming variant's callback
+        /// is `|_| {}`).
+        #[test]
+        fn run_job_matches_streaming_for_short_output() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cmd_path = dir.path().join("cmd.sh");
+            std::fs::write(&cmd_path, "echo hi >&2\nexit 0\n").expect("write cmd.sh");
+            let (code, tail) = run_job(cmd_path.to_str().unwrap());
+            assert_eq!(code, 0);
+            assert_eq!(tail, "hi");
         }
     }
 }
