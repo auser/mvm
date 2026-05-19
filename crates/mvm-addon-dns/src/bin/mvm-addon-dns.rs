@@ -2,14 +2,21 @@
 //!
 //! Listens on `127.0.0.1:53` and `::1:53`, serves exact configured
 //! hostnames from a config-disk zone, forwards everything else upstream.
+//!
+//! SIGHUP reloads `/run/mvm/addon_dns_zone.json` (or the env-overridden
+//! path) into the shared zone without re-binding sockets, so in-flight
+//! UDP queries are never dropped during a config-disk refresh. A reload
+//! that fails to read or parse leaves the previous zone in place.
 
 use anyhow::{Context, Result};
 use mvm_addon_dns::{
-    DnsServerConfig, Zone, load_upstreams_from_resolv_conf, load_zone, run_udp_server,
+    DnsServerConfig, SharedZone, Zone, load_upstreams_from_resolv_conf, load_zone,
+    reload_zone_from_path, run_udp_server, shared_zone,
 };
 use std::env;
 use std::net::SocketAddr;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+use tokio::signal::unix::{SignalKind, signal};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -30,27 +37,23 @@ async fn main() -> Result<()> {
             format!("failed to load addon DNS zone from {}", zone_path.display())
         })?
     } else {
-        // No-op mode: the consumer's launch.json declared no addons.
-        // Idle and let the supervisor's respawn loop manage us.
+        // No zone file at startup. The binary stays installed and idle
+        // so a SIGHUP after a later config-disk refresh can promote it
+        // into authoritative mode without a respawn. Mirrors the
+        // "always-install + no-op when zone empty" pattern declared in
+        // `specs/contracts/local-addon-dns.md`.
         tracing::info!(
             zone_path = %zone_path.display(),
-            "no zone file present; idling (no-op mode)"
+            "no zone file present; starting with empty zone"
         );
         vec![]
     };
 
-    let zone = Zone::new(records);
-    tracing::info!(records = zone.len(), "loaded addon DNS zone");
-
-    if zone.is_empty() {
-        // Idle in no-op mode. This matches the "always-install + no-op
-        // when zone empty" pattern declared in
-        // `specs/contracts/local-addon-dns.md` so `mkGuest` doesn't
-        // need a new distributed-mesh argument.
-        loop {
-            std::thread::park();
-        }
-    }
+    let zone = shared_zone(Zone::new(records));
+    tracing::info!(
+        records = zone.read().await.len(),
+        "loaded addon DNS zone"
+    );
 
     let mut config = DnsServerConfig::production_default();
     if let Some(bind_addrs) = env::var_os("MVM_ADDON_DNS_BIND_ADDRS") {
@@ -70,9 +73,52 @@ async fn main() -> Result<()> {
             })?;
     }
 
+    spawn_sighup_reloader(zone.clone(), zone_path.clone())?;
+
     run_udp_server(zone, config)
         .await
         .context("addon DNS UDP server failed")
+}
+
+fn spawn_sighup_reloader(zone: SharedZone, zone_path: PathBuf) -> Result<()> {
+    let mut sighup =
+        signal(SignalKind::hangup()).context("failed to install SIGHUP handler for zone reload")?;
+    tokio::spawn(async move {
+        while sighup.recv().await.is_some() {
+            reload_once(&zone, &zone_path).await;
+        }
+        tracing::warn!("SIGHUP stream ended; addon DNS reloads disabled");
+    });
+    Ok(())
+}
+
+async fn reload_once(zone: &SharedZone, zone_path: &Path) {
+    if !zone_path.exists() {
+        // Treat a missing file the same as the no-op contract: clear
+        // the in-memory zone so the supervisor can stop being
+        // authoritative without restarting the binary. Mirrors the
+        // "empty zone = forward everything upstream" semantics the
+        // server already implements.
+        let mut guard = zone.write().await;
+        guard.set_records(vec![]);
+        tracing::info!(
+            zone_path = %zone_path.display(),
+            "SIGHUP received; zone file absent — cleared in-memory records"
+        );
+        return;
+    }
+    match reload_zone_from_path(zone, zone_path).await {
+        Ok(count) => tracing::info!(
+            records = count,
+            zone_path = %zone_path.display(),
+            "addon DNS zone reloaded on SIGHUP"
+        ),
+        Err(err) => tracing::warn!(
+            error = %err,
+            zone_path = %zone_path.display(),
+            "addon DNS zone reload failed; keeping previous zone"
+        ),
+    }
 }
 
 fn parse_socket_addr_list(value: &str) -> Result<Vec<SocketAddr>> {

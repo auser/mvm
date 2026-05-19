@@ -19,8 +19,10 @@ use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, SocketAddr};
 use std::path::Path;
 use std::str::FromStr;
+use std::sync::Arc;
 use std::time::Duration;
 use tokio::net::UdpSocket;
+use tokio::sync::RwLock;
 
 /// One A-record entry the resolver serves. The config-disk zone is a
 /// JSON array of these (see contract spec).
@@ -90,6 +92,7 @@ pub fn load_upstreams_from_resolv_conf(path: &Path) -> Result<Vec<SocketAddr>> {
 /// In-process zone state. Owned by the resolver loop; refreshed on
 /// SIGHUP. Methods are intentionally read-only at this layer — zone
 /// updates flow through `load_zone` + `Zone::set_records`.
+#[derive(Debug, Clone)]
 pub struct Zone {
     records: Vec<ZoneRecord>,
 }
@@ -104,6 +107,13 @@ impl Zone {
     /// take a write lock if the resolver is reading concurrently.
     pub fn set_records(&mut self, records: Vec<ZoneRecord>) {
         self.records = records;
+    }
+
+    /// Borrow the current record list. Useful for callers that want
+    /// to snapshot the zone under a read lock without re-cloning per
+    /// query.
+    pub fn records(&self) -> &[ZoneRecord] {
+        &self.records
     }
 
     /// Look up an A record. Case-insensitive on the hostname.
@@ -135,6 +145,36 @@ impl Zone {
     pub fn is_empty(&self) -> bool {
         self.records.is_empty()
     }
+}
+
+/// Reload-friendly zone handle. Shared between the UDP serve loop and
+/// the SIGHUP reload task. Read-locked briefly while snapshotting per
+/// datagram so the lock never crosses an `.await` boundary; the write
+/// lock taken by [`reload_zone_from_path`] is held only long enough to
+/// swap the record list. In-flight queries observe either the old or
+/// new zone — never a partially updated zone.
+pub type SharedZone = Arc<RwLock<Zone>>;
+
+/// Wrap an existing [`Zone`] for use as a [`SharedZone`].
+pub fn shared_zone(zone: Zone) -> SharedZone {
+    Arc::new(RwLock::new(zone))
+}
+
+/// Reload a zone file from disk into a [`SharedZone`] without dropping
+/// in-flight queries.
+///
+/// The file is parsed up-front; the write lock on `zone` is acquired
+/// only after the new record list is constructed, so a malformed or
+/// missing file leaves the previous zone untouched. An empty file
+/// (the no-op contract) is honored and produces a zero-record zone.
+///
+/// Returns the number of records now loaded.
+pub async fn reload_zone_from_path(zone: &SharedZone, path: &Path) -> Result<usize> {
+    let records = load_zone(path)?;
+    let count = records.len();
+    let mut guard = zone.write().await;
+    guard.set_records(records);
+    Ok(count)
 }
 
 fn normalize_hostname(hostname: &str) -> &str {
@@ -196,16 +236,20 @@ impl DnsServerConfig {
     }
 }
 
-/// Serve DNS over UDP on the configured loopback addresses.
-pub async fn run_udp_server(zone: Zone, config: DnsServerConfig) -> std::io::Result<()> {
+/// Serve DNS over UDP on the configured loopback addresses, sharing
+/// a reload-aware zone handle with any concurrent SIGHUP task.
+pub async fn run_udp_server(zone: SharedZone, config: DnsServerConfig) -> std::io::Result<()> {
     config.validate()?;
-    let zone = std::sync::Arc::new(zone);
-    let config = std::sync::Arc::new(config);
+    let config = Arc::new(config);
 
+    let mut sockets = Vec::with_capacity(config.bind_addrs.len());
     for bind_addr in &config.bind_addrs {
-        let socket = UdpSocket::bind(bind_addr).await?;
-        let zone = std::sync::Arc::clone(&zone);
-        let config = std::sync::Arc::clone(&config);
+        sockets.push((UdpSocket::bind(bind_addr).await?, *bind_addr));
+    }
+
+    for (socket, bind_addr) in sockets {
+        let zone = Arc::clone(&zone);
+        let config = Arc::clone(&config);
         tracing::info!(%bind_addr, "addon DNS UDP listener started");
         tokio::spawn(async move {
             if let Err(err) = serve_udp_socket(socket, zone, config).await {
@@ -219,13 +263,18 @@ pub async fn run_udp_server(zone: Zone, config: DnsServerConfig) -> std::io::Res
 
 async fn serve_udp_socket(
     socket: UdpSocket,
-    zone: std::sync::Arc<Zone>,
-    config: std::sync::Arc<DnsServerConfig>,
+    zone: SharedZone,
+    config: Arc<DnsServerConfig>,
 ) -> std::io::Result<()> {
     let mut buf = vec![0u8; 1232];
     loop {
         let (len, peer) = socket.recv_from(&mut buf).await?;
-        let response = handle_dns_packet(&buf[..len], &zone, &config).await;
+        // Snapshot the zone under the read lock and release it before
+        // any `.await` on upstream forwarding. Zone records are tiny
+        // (hostname + IPv4) so this clone is cheap relative to the
+        // network round-trip we'd otherwise hold the lock across.
+        let snapshot = Zone::new(zone.read().await.records().to_vec());
+        let response = handle_dns_packet(&buf[..len], &snapshot, &config).await;
         if let Some(response) = response {
             let _ = socket.send_to(&response, peer).await;
         }
@@ -572,6 +621,210 @@ mod tests {
 
         assert_eq!(message.metadata.response_code, ResponseCode::ServFail);
         assert!(message.answers.is_empty());
+    }
+
+    #[tokio::test]
+    async fn reload_zone_from_path_swaps_records_without_dropping_state() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("zone.json");
+        std::fs::write(
+            &path,
+            r#"[{"hostname":"db.dev.internal","address":"127.77.0.10"}]"#,
+        )
+        .unwrap();
+        let zone = shared_zone(Zone::new(load_zone(&path).unwrap()));
+
+        // Concurrent readers must keep observing the old zone until
+        // the write lock is released — never a partial state.
+        let read_zone = Arc::clone(&zone);
+        let reader = tokio::spawn(async move {
+            let guard = read_zone.read().await;
+            guard.lookup("db.dev.internal").cloned()
+        });
+        assert_eq!(reader.await.unwrap().unwrap().address, Ipv4Addr::new(127, 77, 0, 10));
+
+        // Rewrite the file with a new record set and reload.
+        std::fs::write(
+            &path,
+            r#"[{"hostname":"cache.dev.internal","address":"127.77.0.20"}]"#,
+        )
+        .unwrap();
+        let count = reload_zone_from_path(&zone, &path).await.unwrap();
+        assert_eq!(count, 1);
+
+        let guard = zone.read().await;
+        assert!(guard.lookup("db.dev.internal").is_none());
+        assert_eq!(
+            guard.lookup("cache.dev.internal").unwrap().address,
+            Ipv4Addr::new(127, 77, 0, 20)
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_zone_from_path_keeps_previous_state_on_parse_error() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("zone.json");
+        std::fs::write(
+            &path,
+            r#"[{"hostname":"db.dev.internal","address":"127.77.0.10"}]"#,
+        )
+        .unwrap();
+        let zone = shared_zone(Zone::new(load_zone(&path).unwrap()));
+
+        std::fs::write(&path, "this is not valid json").unwrap();
+        let err = reload_zone_from_path(&zone, &path).await.unwrap_err();
+        // Error path leaves the previous record set in place.
+        assert!(format!("{err:#}").contains("could not parse zone file"));
+        let guard = zone.read().await;
+        assert_eq!(
+            guard.lookup("db.dev.internal").unwrap().address,
+            Ipv4Addr::new(127, 77, 0, 10)
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_zone_from_path_keeps_previous_state_on_missing_file() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("zone.json");
+        std::fs::write(
+            &path,
+            r#"[{"hostname":"db.dev.internal","address":"127.77.0.10"}]"#,
+        )
+        .unwrap();
+        let zone = shared_zone(Zone::new(load_zone(&path).unwrap()));
+
+        std::fs::remove_file(&path).unwrap();
+        let err = reload_zone_from_path(&zone, &path).await.unwrap_err();
+        assert!(format!("{err:#}").contains("could not read zone file"));
+        let guard = zone.read().await;
+        assert_eq!(
+            guard.lookup("db.dev.internal").unwrap().address,
+            Ipv4Addr::new(127, 77, 0, 10)
+        );
+    }
+
+    #[tokio::test]
+    async fn reload_zone_from_path_accepts_empty_file_as_no_op() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("zone.json");
+        std::fs::write(
+            &path,
+            r#"[{"hostname":"db.dev.internal","address":"127.77.0.10"}]"#,
+        )
+        .unwrap();
+        let zone = shared_zone(Zone::new(load_zone(&path).unwrap()));
+
+        std::fs::write(&path, "").unwrap();
+        let count = reload_zone_from_path(&zone, &path).await.unwrap();
+        assert_eq!(count, 0);
+        let guard = zone.read().await;
+        assert!(guard.is_empty());
+    }
+
+    #[tokio::test]
+    async fn running_server_observes_zone_reload_without_restart() {
+        // Bind a real UDP socket on an ephemeral loopback port and
+        // drive run_udp_server through its public API. The same
+        // listener must answer the second query authoritatively after
+        // a mid-run reload, proving no socket was torn down.
+        let server_socket = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        let server_addr = server_socket.local_addr().unwrap();
+        drop(server_socket);
+
+        let zone = shared_zone(Zone::new(vec![]));
+        let config = DnsServerConfig {
+            bind_addrs: vec![server_addr],
+            upstream_addrs: vec![],
+            upstream_timeout: Duration::from_millis(100),
+        };
+        let server_zone = Arc::clone(&zone);
+        let server = tokio::spawn(async move {
+            // run_udp_server never completes on its own — drive it in
+            // the background and abort after the assertions.
+            run_udp_server(server_zone, config).await
+        });
+
+        // Wait briefly for the listener to bind.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        let client = UdpSocket::bind("127.0.0.1:0").await.unwrap();
+        client.connect(server_addr).await.unwrap();
+
+        // Before reload: empty zone, no upstreams → SERVFAIL.
+        client
+            .send(&query_packet("db.dev.internal.", RecordType::A))
+            .await
+            .unwrap();
+        let mut buf = [0u8; 512];
+        let len = tokio::time::timeout(Duration::from_millis(500), client.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let pre = decode_message(&buf[..len]).unwrap();
+        assert_eq!(pre.metadata.response_code, ResponseCode::ServFail);
+
+        // Reload: populate the zone via the same handle the SIGHUP
+        // task would use in production.
+        {
+            let mut guard = zone.write().await;
+            guard.set_records(vec![ZoneRecord {
+                hostname: "db.dev.internal".to_string(),
+                address: Ipv4Addr::new(127, 77, 0, 42),
+            }]);
+        }
+
+        // After reload: same socket, new authoritative answer.
+        client
+            .send(&query_packet("db.dev.internal.", RecordType::A))
+            .await
+            .unwrap();
+        let len = tokio::time::timeout(Duration::from_millis(500), client.recv(&mut buf))
+            .await
+            .unwrap()
+            .unwrap();
+        let post = decode_message(&buf[..len]).unwrap();
+        assert_eq!(post.metadata.response_code, ResponseCode::NoError);
+        assert!(post.metadata.authoritative);
+        assert_eq!(
+            &post.answers[0].data,
+            &RData::A(A(Ipv4Addr::new(127, 77, 0, 42)))
+        );
+
+        server.abort();
+    }
+
+    #[test]
+    fn load_upstreams_from_resolv_conf_rejects_invalid_address() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("upstream-resolv.conf");
+        std::fs::write(&path, "nameserver not-an-address\n").unwrap();
+        let err = load_upstreams_from_resolv_conf(&path).unwrap_err();
+        assert!(format!("{err:#}").contains("invalid nameserver address"));
+    }
+
+    #[test]
+    fn load_upstreams_from_resolv_conf_skips_options_and_comments() {
+        let tmp = tempdir().unwrap();
+        let path = tmp.path().join("upstream-resolv.conf");
+        std::fs::write(
+            &path,
+            "# host-baked default\n\
+             options edns0 trust-ad\n\
+             search corp.example\n\
+             nameserver 192.0.2.53\n\
+             ; this is a different-style comment\n\
+             nameserver # inline comment swallows the address\n\
+             nameserver 198.51.100.53\n",
+        )
+        .unwrap();
+        let upstreams = load_upstreams_from_resolv_conf(&path).unwrap();
+        assert_eq!(
+            upstreams,
+            vec![
+                "192.0.2.53:53".parse::<SocketAddr>().unwrap(),
+                "198.51.100.53:53".parse::<SocketAddr>().unwrap(),
+            ]
+        );
     }
 
     #[tokio::test]

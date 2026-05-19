@@ -119,6 +119,16 @@ let
     withDevShell = isDev;
   };
 
+  # ── mvm-addon-dns — in-guest loopback DNS resolver ─────────────
+  #
+  # Always baked into the rootfs (the "always-install + no-op when
+  # zone empty" pattern from `specs/contracts/local-addon-dns.md`);
+  # /init activates it only when a zone file is present, so a guest
+  # without addons keeps its baked /etc/resolv.conf byte-for-byte.
+  addonDnsPkg = pkgs.callPackage ../packages/mvm-addon-dns.nix {
+    inherit mvmSrc;
+  };
+
   # ── Privilege model (uids) ─────────────────────────────────────
   #
   # PID 1 must be uid 0 (kernel requirement); everything we can
@@ -271,6 +281,72 @@ let
       "$MVM_NETINIT_BIN" || echo "mvm-init: netinit exited nonzero; continuing without guest-side defense"
     fi
 
+    # Stage 2.48 — local addon DNS bootstrap.
+    #
+    # The "always-install + no-op when zone empty" pattern from
+    # `specs/contracts/local-addon-dns.md`: the addon DNS binary is
+    # baked into every rootfs but only activated when a zone file
+    # was baked at /etc/mvm/addon_dns_zone.json (via mkGuest's
+    # `extraFiles`) or staged on the config-disk path before init
+    # runs. Guests without addons skip this block entirely, so
+    # /etc/resolv.conf stays byte-for-byte the build-time default.
+    #
+    # When activated, we:
+    #   1. Copy the zone file into /run/mvm so reloads (SIGHUP) and
+    #      runtime-only edits land on tmpfs, not in the read-only
+    #      rootfs.
+    #   2. Snapshot the existing /etc/resolv.conf into
+    #      /run/mvm/upstream-resolv.conf BEFORE rewriting it. The
+    #      addon DNS server reads this file to seed its upstream
+    #      forwarders; without the snapshot, the binary would either
+    #      have no upstream or (worse) recurse into itself once
+    #      resolv.conf points at 127.0.0.1.
+    #   3. Write a new resolv.conf into /run/mvm and bind-mount it
+    #      over /etc/resolv.conf. Single-file bind-mounts survive the
+    #      read-only /etc bind that ADR-002 W2.2 will eventually land
+    #      so this works on both dev and hardened images.
+    #   4. Fork mvm-addon-dns under setpriv to the agent uid with
+    #      CAP_NET_BIND_SERVICE preserved via ambient + inheritable
+    #      caps so it can bind UDP/53 on loopback only. The server
+    #      validates loopback + self-upstream constraints itself; we
+    #      do not pass any other privilege.
+    MVM_ADDON_DNS_ZONE_SRC=
+    if [ -r /run/mvm/addon_dns_zone.json ]; then
+      MVM_ADDON_DNS_ZONE_SRC=/run/mvm/addon_dns_zone.json
+    elif [ -r /etc/mvm/addon_dns_zone.json ]; then
+      MVM_ADDON_DNS_ZONE_SRC=/etc/mvm/addon_dns_zone.json
+    fi
+    if [ -n "$MVM_ADDON_DNS_ZONE_SRC" ] && [ -x /usr/local/bin/mvm-addon-dns ]; then
+      /bin/busybox mkdir -p /run/mvm
+      /bin/busybox chmod 0755 /run/mvm
+      if [ "$MVM_ADDON_DNS_ZONE_SRC" != /run/mvm/addon_dns_zone.json ]; then
+        /bin/busybox cp "$MVM_ADDON_DNS_ZONE_SRC" /run/mvm/addon_dns_zone.json
+      fi
+      /bin/busybox chmod 0644 /run/mvm/addon_dns_zone.json
+
+      # Snapshot the pre-rewrite resolver chain so addon-dns can
+      # forward non-configured names without recursing into itself.
+      if [ -r /etc/resolv.conf ]; then
+        /bin/busybox cp /etc/resolv.conf /run/mvm/upstream-resolv.conf
+      else
+        : > /run/mvm/upstream-resolv.conf
+      fi
+      /bin/busybox chmod 0644 /run/mvm/upstream-resolv.conf
+
+      # Build the new resolv.conf in /run (tmpfs, always writable)
+      # and bind-mount it over /etc/resolv.conf. The :: literal is
+      # written via printf so the heredoc body stays parameter-free.
+      printf 'nameserver 127.0.0.1\nnameserver ::1\n' > /run/mvm/resolv.conf
+      /bin/busybox chmod 0644 /run/mvm/resolv.conf
+      /bin/busybox mount --bind /run/mvm/resolv.conf /etc/resolv.conf
+
+      /bin/busybox setsid ${pkgs.util-linux}/bin/setpriv \
+        --reuid=${toString agentUid} --regid=${toString agentUid} \
+        --clear-groups --no-new-privs \
+        --inh-caps=+net_bind_service --ambient-caps=+net_bind_service \
+        -- /usr/local/bin/mvm-addon-dns &
+    fi
+
     # Stage 2.5 — guest agent supervisor. Fork the agent into
     # the background under its own uid before we drop to the
     # entrypoint. The agent is responsible for vsock RPC (host
@@ -404,6 +480,13 @@ let
   # under setpriv — the routes must exist before any workload code
   # can attempt egress.
   mvmGuestNetinitBinary = "${guestAgentPkg}/bin/mvm-guest-netinit";
+
+  # In-guest addon DNS resolver. Loopback-only UDP server that serves
+  # exact configured addon hostnames and forwards everything else to
+  # the pre-rewrite upstream resolver snapshot. Activated by /init
+  # only when a zone file is present so the no-addon path is
+  # unaffected. See `crates/mvm-addon-dns` for details.
+  mvmAddonDnsBinary = "${addonDnsPkg}/bin/mvm-addon-dns";
 
   # extraFiles — three accepted spec shapes per target path:
   #
@@ -587,6 +670,12 @@ let
     cp ${mvmGuestNetinitBinary} "$out/usr/local/bin/mvm-guest-netinit"
     chmod 0555 "$out/usr/local/bin/mvm-guest-netinit"
 
+    # In-guest addon DNS resolver. Baked into every rootfs so /init
+    # can spawn it without a build-time mkGuest flag; activation is
+    # gated at boot on the presence of a zone file (see initScript).
+    cp ${mvmAddonDnsBinary} "$out/usr/local/bin/mvm-addon-dns"
+    chmod 0555 "$out/usr/local/bin/mvm-addon-dns"
+
     # Kernel modules. `/init` `modprobe`s vsock before forking the
     # agent (default nixpkgs kernel ships AF_VSOCK as `=m`); without
     # `/lib/modules/<kver>/` in the rootfs, modprobe has nothing to
@@ -763,5 +852,6 @@ rootfsImage.overrideAttrs (old: {
     # in `mkServiceBlock`) can reach `mvm-seccomp-apply` and
     # `mvm-verity-init` without re-running the cargo build.
     inherit guestAgentPkg seccompApplyBinary verityInitBinary mvmGuestNetinitBinary;
+    inherit addonDnsPkg mvmAddonDnsBinary;
   };
 })
