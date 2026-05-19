@@ -20,6 +20,20 @@ pub enum BuilderRequest {
 /// Vsock port used by the builder agent.
 pub const BUILDER_AGENT_PORT: u32 = 21470;
 
+/// Vsock port used by Plan 89's persistent builder VM dispatch
+/// channel. Separate from [`BUILDER_AGENT_PORT`] (the legacy guest-
+/// listener used by [`BuilderRequest::Build`] / [`BuilderRequest::Ping`]
+/// above) because the Plan 89 wire (`mvm_build::builder_protocol`)
+/// is a different protocol with different semantics — the two
+/// channels coexist while the legacy path is in use elsewhere.
+///
+/// W2 part 2: this port is added to the libkrun builder VM's vsock
+/// config; the host opens the corresponding Unix-socket-proxy at
+/// `<vm_state_dir>/vsock-21471.sock` to receive
+/// [`mvm_build::builder_protocol::BuilderResponse`] frames from the
+/// guest. The guest-side send code lands in W2 part 3.
+pub const BUILDER_DISPATCH_PORT: u32 = 21471;
+
 /// Outgoing responses/log frames from the builder agent.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
 pub enum BuilderResponse {
