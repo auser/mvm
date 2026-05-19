@@ -214,7 +214,7 @@ pub fn run(json: bool, workflow: Option<DoctorWorkflow>) -> Result<()> {
     checks.push(kvm_check(plat, false));
     checks.push(apple_container_check(plat));
     checks.push(libkrun_check(plat));
-    checks.push(passt_check(plat));
+    checks.push(network_backend_check(plat));
     checks.push(docker_check(plat));
     checks.push(ts_runner_check());
 
@@ -651,29 +651,55 @@ fn docker_check(plat: Platform) -> Check {
     }
 }
 
-/// `passt` host-side availability — Plan 87 W5. Probes `$PATH` for
-/// the passt binary; surfaces the version when present and the
-/// install hint when missing. `ok: true` regardless — passt is only
-/// strictly required when `MVM_NETWORKING=passt` (the default after
-/// Plan 87 PR3). The TSI fallback still works without it.
+/// Userspace network-gateway host-side availability — Plan 87 W5 +
+/// Plan 88 W4. Probes `$PATH` for the gateway binary the host's
+/// libkrun build defaults to: `passt` on Linux, `gvproxy` on macOS
+/// (passt does not build on macOS — see ADR-055 §"Cross-platform
+/// backends"). Surfaces the version when present and the install
+/// hint when missing. `ok: true` regardless: TSI mode
+/// (`MVM_NETWORKING=tsi`) still works without either gateway.
 ///
 /// Skipped on Windows (no native libkrun port either; the whole
-/// libkrun + passt stack is macOS / Linux).
+/// libkrun + virtio-net stack is macOS / Linux).
 #[cfg(target_family = "unix")]
-fn passt_check(plat: Platform) -> Check {
+fn network_backend_check(plat: Platform) -> Check {
     if plat.is_windows() {
         return Check {
-            name: "passt",
+            name: "network-backend",
             category: "platform",
             ok: true,
             info: "n/a (no native Windows port)".to_string(),
         };
     }
-    match mvm_libkrun::passt::locate_passt() {
+    if cfg!(target_os = "macos") {
+        return gateway_check(
+            "gvproxy",
+            mvm_libkrun::gvproxy::locate_gvproxy(),
+            mvm_libkrun::gvproxy::install_hint(),
+        );
+    }
+    gateway_check(
+        "passt",
+        mvm_libkrun::passt::locate_passt(),
+        mvm_libkrun::passt::install_hint(),
+    )
+}
+
+/// Shared probe body for the per-OS userspace gateway. Returns a
+/// `Check` row with the version (when the binary supports
+/// `--version`) or the install hint (when missing). `ok: true`
+/// regardless — `MVM_NETWORKING=tsi` is a documented escape hatch.
+#[cfg(target_family = "unix")]
+fn gateway_check(
+    name: &'static str,
+    located: Option<std::path::PathBuf>,
+    install_hint: &str,
+) -> Check {
+    match located {
         Some(path) => {
-            // Best-effort version probe — `passt --version` writes to
-            // stdout on Linux and macOS (Homebrew build). Failure is
-            // not fatal; we surface "available" without a version.
+            // Best-effort version probe. passt prints to stdout;
+            // gvproxy 0.7+ recognises `--version` (older builds
+            // exit nonzero, which we silently fall through on).
             let version = std::process::Command::new(&path)
                 .arg("--version")
                 .output()
@@ -696,21 +722,20 @@ fn passt_check(plat: Platform) -> Check {
                 None => format!("available at {}", path.display()),
             };
             Check {
-                name: "passt",
+                name,
                 category: "platform",
                 ok: true,
                 info,
             }
         }
         None => Check {
-            name: "passt",
+            name,
             category: "platform",
-            ok: true, // Optional; only strictly needed for MVM_NETWORKING=passt.
+            ok: true, // Optional; only strictly needed for MVM_NETWORKING != tsi.
             info: format!(
-                "not available ({}) — required for the default `MVM_NETWORKING=passt` \
-                 libkrun networking path; set `MVM_NETWORKING=tsi` to opt back to \
-                 libkrun's built-in TSI mode while you install it",
-                mvm_libkrun::passt::install_hint()
+                "not available ({install_hint}) — required for the default \
+                 libkrun virtio-net path; set `MVM_NETWORKING=tsi` to opt back \
+                 to libkrun's built-in TSI mode while you install it"
             ),
         },
     }
@@ -718,12 +743,12 @@ fn passt_check(plat: Platform) -> Check {
 
 /// Windows stub — keeps the call site cfg-free.
 #[cfg(not(target_family = "unix"))]
-fn passt_check(_plat: Platform) -> Check {
+fn network_backend_check(_plat: Platform) -> Check {
     Check {
-        name: "passt",
+        name: "network-backend",
         category: "platform",
         ok: true,
-        info: "n/a (no Unix passt port on this OS)".to_string(),
+        info: "n/a (no Unix libkrun port on this OS)".to_string(),
     }
 }
 

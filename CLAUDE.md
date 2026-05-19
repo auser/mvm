@@ -18,14 +18,17 @@ Lima was the historical macOS host abstraction. It was removed on 2026-05-14 (Pl
 `mvmctl dev up` and the libkrun-backed builder VM need three Homebrew packages installed:
 
 ```sh
-brew install libkrun libkrunfw passt
+brew install slp/krun/libkrun slp/krun/libkrunfw slp/krun/gvproxy
 ```
 
 - `libkrun` — the in-process VMM. `mvm-libkrun-supervisor` links against it.
 - `libkrunfw` — bundles the TSI-patched Linux kernel libkrun's guests boot. Plan 86 / Plan 72 W5.D bullet 10 — `mvm-libkrun::extract_bundled_kernel()` pulls the kernel out of the dylib's `.rodata` at runtime.
-- `passt` — userspace network gateway providing virtio-net to the guest. Plan 87 / ADR-055 made this the default networking backend (`MVM_NETWORKING=passt`); `MVM_NETWORKING=tsi` opts back to libkrun's experimental TSI mode for debugging.
+- `gvproxy` — userspace virtio-net gateway. Plan 88 / ADR-055 §"Cross-platform backends" — passt is Linux-only, so macOS dispatches to gvproxy via libkrun's `krun_add_net_unixgram` path. `MVM_NETWORKING` unset → per-OS default (macOS=gvproxy, Linux=passt); `=tsi` opts back to libkrun's experimental no-network-stack mode for debugging.
 
-`mvmctl doctor` probes all three and emits install hints for whichever are missing.
+On Linux contributor hosts swap `gvproxy` for `passt` from the distro
+package manager (or build passt from source — see ADR-055 references).
+
+`mvmctl doctor` probes the right gateway per OS and emits install hints when missing.
 
 ## Architecture
 

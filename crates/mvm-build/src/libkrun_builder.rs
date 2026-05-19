@@ -103,30 +103,77 @@ pub const GUEST_NIX_DIR: &str = "/nix";
 /// under this path (read-write virtio-fs). Plan 72 W4 wires this.
 pub const GUEST_JOB_DIR: &str = "/job";
 
-/// Plan 87 W3: caller-visible networking-backend preference. Read from
-/// the `MVM_NETWORKING` env var at every VM-launch site. Default
-/// stays Tsi for backward compat; PR3 in Plan 87 flips this once W4
-/// in-VM udhcpc wiring lands and CI installs the host-side deps.
+/// Caller-visible networking-backend preference. Read from
+/// the `MVM_NETWORKING` env var at every VM-launch site.
+///
+/// Plan 87 introduced `Passt` (virtio-net via the userspace passt
+/// gateway). Plan 88 added `Gvproxy` for macOS, where passt does not
+/// build (`vmsplice`/namespace primitives are Linux-only — see
+/// ADR-055 §"Cross-platform backends").
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkingPreference {
-    /// libkrun's built-in TSI (no virtio-net, no DHCP). Default.
+    /// libkrun's built-in TSI (no virtio-net, no DHCP).
     Tsi,
-    /// virtio-net via passt. Requires libkrun-sys + passt installed on
-    /// the host. The supervisor process spawns passt as a child.
+    /// virtio-net via passt. Linux-only. Requires libkrun-sys + the
+    /// `passt` binary on `$PATH`. The supervisor process spawns
+    /// passt as a child and hands its fd to libkrun.
     Passt,
+    /// virtio-net via gvproxy. macOS default; works on Linux too.
+    /// Requires libkrun-sys + the `gvproxy` binary on `$PATH`. The
+    /// supervisor spawns gvproxy with `-listen-vfkit unixgram://…`
+    /// and libkrun connects to the listener path.
+    Gvproxy,
 }
 
-/// Read `MVM_NETWORKING` from the env. Accepts `tsi` and `passt`
-/// (case-insensitive); anything else falls back to the default and
-/// emits a debug log so a typo is visible without aborting.
+/// Apply the resolved [`NetworkingPreference`] to a [`KrunContext`].
+/// Dispatches `with_passt`, `with_gvproxy`, or leaves the context's
+/// default `Tsi` mode in place — keeping the two builder-VM call
+/// sites (shell-job + flake-build) in lockstep. Each gateway uses
+/// `<vm_state_dir>` for its log/socket scratch space.
+fn apply_networking_mode(
+    krun: KrunContext,
+    vm_state_dir: &std::path::Path,
+) -> Result<KrunContext, BuilderVmError> {
+    let scratch = path_to_str(vm_state_dir, "vm_state_dir")?;
+    Ok(match resolve_networking_mode() {
+        NetworkingPreference::Tsi => krun,
+        NetworkingPreference::Passt => {
+            krun.with_passt(mvm_libkrun::passt::DEFAULT_GUEST_MAC, scratch)
+        }
+        NetworkingPreference::Gvproxy => {
+            krun.with_gvproxy(mvm_libkrun::gvproxy::DEFAULT_GUEST_MAC, scratch)
+        }
+    })
+}
+
+/// Per-host-OS default networking backend.
 ///
-/// Plan 87 W5 / PR3 flipped the default from `Tsi` to `Passt`. TSI is
-/// libkrun's experimental no-network-stack mode; it works for
+/// macOS → [`Gvproxy`](NetworkingPreference::Gvproxy) because passt
+/// does not build there (the Homebrew formula refuses with "Linux is
+/// required for this software"); everything else (Linux today) →
+/// [`Passt`](NetworkingPreference::Passt). See ADR-055
+/// §"Cross-platform backends" for the rationale.
+pub fn default_networking_mode() -> NetworkingPreference {
+    if cfg!(target_os = "macos") {
+        NetworkingPreference::Gvproxy
+    } else {
+        NetworkingPreference::Passt
+    }
+}
+
+/// Read `MVM_NETWORKING` from the env. Accepts `tsi`, `passt`, and
+/// `gvproxy` (case-insensitive); anything else falls back to the
+/// per-OS default and emits a warning so a typo is visible without
+/// aborting.
+///
+/// Plan 87 W5 / PR3 flipped the default away from TSI; Plan 88
+/// added the per-OS dispatch (macOS → gvproxy, Linux → passt). TSI
+/// is libkrun's experimental no-network-stack mode; it works for
 /// trivial HTTP but breaks on nix's substituter and source fetches
 /// (HTTP/2 multiplexing, HTTPS redirect chains, the offline-mode
-/// probe — see ADR-055 §"Context"). Passt-backed virtio-net is the
-/// production-ready path. Contributors can still opt back to TSI via
-/// `MVM_NETWORKING=tsi` for debugging.
+/// probe — see ADR-055 §"Context"). Contributors can still opt back
+/// to TSI via `MVM_NETWORKING=tsi` for debugging, or pin a specific
+/// gateway across OS via `MVM_NETWORKING=passt` / `=gvproxy`.
 pub fn resolve_networking_mode() -> NetworkingPreference {
     match std::env::var("MVM_NETWORKING")
         .ok()
@@ -136,13 +183,17 @@ pub fn resolve_networking_mode() -> NetworkingPreference {
         .as_deref()
     {
         Some("tsi") => NetworkingPreference::Tsi,
-        Some("passt") | None | Some("") => NetworkingPreference::Passt,
+        Some("passt") => NetworkingPreference::Passt,
+        Some("gvproxy") => NetworkingPreference::Gvproxy,
+        None | Some("") => default_networking_mode(),
         Some(other) => {
+            let fallback = default_networking_mode();
             tracing::warn!(
                 value = other,
-                "MVM_NETWORKING unrecognised; falling back to Passt (accepted: tsi, passt)"
+                fallback = ?fallback,
+                "MVM_NETWORKING unrecognised; falling back to per-OS default (accepted: tsi, passt, gvproxy)"
             );
-            NetworkingPreference::Passt
+            fallback
         }
     }
 }
@@ -307,19 +358,7 @@ impl LibkrunBuilderVm {
             );
         }
 
-        // Plan 87 W3: opt into passt-backed virtio-net when
-        // MVM_NETWORKING=passt. The supervisor spawns the passt child
-        // and logs to <vm_state_dir>/passt.log; libkrun's
-        // `krun_add_net_unixstream` consumes the fd. Without the env
-        // var (or with any other value) we stay on TSI for backward
-        // compat — Plan 87 PR3 flips the default once the W4 in-VM
-        // wiring lands and CI installs passt + libkrunfw.
-        if resolve_networking_mode() == NetworkingPreference::Passt {
-            krun = krun.with_passt(
-                mvm_libkrun::passt::DEFAULT_GUEST_MAC,
-                path_to_str(&vm_state_dir, "vm_state_dir")?,
-            );
-        }
+        krun = apply_networking_mode(krun, &vm_state_dir)?;
 
         let cfg = SupervisorConfig {
             krun,
@@ -568,17 +607,7 @@ impl BuilderVm for LibkrunBuilderVm {
         .add_virtio_fs("out", path_to_str(&mounts.artifact_out, "artifact_out")?)
         .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?);
 
-        // Plan 87 W3: same env-var opt-in as the shell-job path. See
-        // `LibkrunBuilderVm::dispatch_shell_job` for the rationale —
-        // when `MVM_NETWORKING=passt` is set the supervisor spawns
-        // passt and libkrun consumes its socket fd. Default stays TSI
-        // until PR3 flips it.
-        if resolve_networking_mode() == NetworkingPreference::Passt {
-            krun = krun.with_passt(
-                mvm_libkrun::passt::DEFAULT_GUEST_MAC,
-                path_to_str(&vm_state_dir, "vm_state_dir")?,
-            );
-        }
+        krun = apply_networking_mode(krun, &vm_state_dir)?;
 
         // 8. Drive the supervisor: pipe `SupervisorConfig` to
         //    stdin and **wait** for the child to exit. Unlike
@@ -1516,9 +1545,9 @@ mod tests {
         // SAFETY: tests guarded by ENV_LOCK; env mutation in test
         // process is fine when serialized.
         unsafe {
-            // Plan 87 W5 / PR3: default is Passt; opt out via tsi.
+            // Plan 88: default is per-OS — macOS → Gvproxy, others → Passt.
             std::env::remove_var("MVM_NETWORKING");
-            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
+            assert_eq!(resolve_networking_mode(), default_networking_mode());
 
             std::env::set_var("MVM_NETWORKING", "tsi");
             assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
@@ -1529,15 +1558,31 @@ mod tests {
             std::env::set_var("MVM_NETWORKING", " passt ");
             assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
 
-            std::env::set_var("MVM_NETWORKING", "");
-            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
+            std::env::set_var("MVM_NETWORKING", "GVPROXY");
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Gvproxy);
 
-            std::env::set_var("MVM_NETWORKING", "gvproxy");
-            // Unknown value → fall back to the default (Passt) without panic.
-            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
+            std::env::set_var("MVM_NETWORKING", " gvproxy ");
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Gvproxy);
+
+            std::env::set_var("MVM_NETWORKING", "");
+            assert_eq!(resolve_networking_mode(), default_networking_mode());
+
+            // Unknown value falls back to the per-OS default without panic.
+            std::env::set_var("MVM_NETWORKING", "vmnet-helper");
+            assert_eq!(resolve_networking_mode(), default_networking_mode());
 
             std::env::remove_var("MVM_NETWORKING");
         }
+    }
+
+    #[test]
+    fn default_networking_mode_matches_host_os() {
+        let expected = if cfg!(target_os = "macos") {
+            NetworkingPreference::Gvproxy
+        } else {
+            NetworkingPreference::Passt
+        };
+        assert_eq!(default_networking_mode(), expected);
     }
 
     #[test]
