@@ -29,6 +29,14 @@ path = ".."
 [dependencies.mvm-core]
 path = "../../mvm-core"
 
+# Plan 89 W2 — `fuzz_builder_request` covers the
+# `BuilderRequest`/`BuilderResponse` payloads in
+# `mvm-build::builder_protocol`. mvm-build depends on mvm-guest, so
+# this is fine direction-wise; the fuzz crate is already detached
+# from the workspace (see [workspace] above).
+[dependencies.mvm-build]
+path = "../../mvm-build"
+
 # Forbid building these as bench/test/doc; they are libfuzzer harnesses
 # only, driven by `cargo fuzz run <name>`.
 [[bin]]
@@ -55,6 +63,14 @@ bench = false
 [[bin]]
 name = "fuzz_authed_path"
 path = "fuzz_targets/fuzz_authed_path.rs"
+test = false
+doc = false
+bench = false
+
+# Plan 89 W2 — persistent builder VM dispatch wire.
+[[bin]]
+name = "fuzz_builder_request"
+path = "fuzz_targets/fuzz_builder_request.rs"
 test = false
 doc = false
 bench = false

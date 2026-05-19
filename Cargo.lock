@@ -3027,6 +3027,7 @@ dependencies = [
  "tokio",
  "toml",
  "tracing",
+ "uuid",
  "which 6.0.3",
 ]
 
