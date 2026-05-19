@@ -250,54 +250,51 @@ right binary per host:
 - Capture the timing for `specs/plans/87-passt-virtio-net.md` follow-up
   notes.
 
-**W6 — virtio-net fuzz target + security claim 5 extension (~1 day).**
+**W6 — supervisor-config JSON fuzz target + security claim 5 extension (~½ day).**
 
 CLAUDE.md security claim 5 today reads "vsock framing is fuzzed" — it
 covers `GuestRequest` and `AuthenticatedFrame` through
-`crates/mvm-guest/fuzz/`. With Plan 87 + Plan 88 in flight, the
-**virtio-net** ring is a new untrusted-input boundary: every Ethernet
-frame the guest writes is parsed by libkrun's virtio-net device
-emulator and by the userspace gateway (passt or gvproxy). Neither is
-in the cargo-fuzz harness today.
+`crates/mvm-guest/fuzz/`. Plan 87 + Plan 88 open two new
+untrusted-input boundaries the host has to defend, but only one of
+them is genuine first-party Rust code we can put under cargo-fuzz:
 
-Threat: a malicious guest that crafts bad virtio descriptors or
-malformed Ethernet/IP frames could try to escape via a libkrun bug or
-crash/exploit the userspace gateway. Both processes run as the
-contributor's user (not root), but compromise is still a code-exec
-boundary we don't fuzz.
+| Surface | Language | Realistic cargo-fuzz target? |
+| ------- | -------- | ---------------------------- |
+| `SupervisorConfig` JSON read by `mvm-libkrun-supervisor` on stdin | Rust (serde_json + `KrunContext` / `NetworkingMode` derive) | **Yes.** Direct analog of `fuzz_guest_request`. |
+| libkrun's virtio-net device emulator | C, inside `libkrun.dylib` | No — needs a running guest per iteration; upstream-libkrun fuzz scope. |
+| passt frame parser | C, external process | No — same iteration-cost problem + foreign-process boundary. |
+| gvproxy frame parser | Go, external process | No — same constraints. Upstream-gvproxy fuzz scope. |
 
-- New `crates/mvm-libkrun/fuzz/fuzz_targets/fuzz_virtio_net_frame.rs`
-  cargo-fuzz target. Constructs a synthetic virtio descriptor + frame
-  payload from the fuzzer's input bytes, feeds it through a thin
-  in-process harness around libkrun's virtio-net path. Workspace
-  exclusion + Cargo manifest follow the `crates/mvm-guest/fuzz/` and
-  `crates/mvm-oci/fuzz/` precedent (libfuzzer-sys gated outside the
-  main workspace).
-- New `crates/mvm-libkrun/fuzz/fuzz_targets/fuzz_passt_frame.rs` +
-  `fuzz_gvproxy_frame.rs` peer targets that throw frames at the
-  gateway's stdin — both gateways read raw frames on the socket, so
-  the harness writes fuzzer input to the supervisor's socketpair end
-  and verifies the gateway doesn't crash or leak fds. Linux-only
-  (passt) / macOS-only (gvproxy) gated.
-- `.github/workflows/ci.yml` security lane gains a 5-minute PR run +
-  30-minute nightly cron for each new target, matching the existing
-  `cargo-fuzz` lanes for `fuzz_guest_request` /
-  `fuzz_authenticated_frame`.
-- CLAUDE.md security claim 5 updated:
-  > 5. **Vsock + virtio-net framing is fuzzed.** `cargo-fuzz` targets
-  > at `crates/mvm-guest/fuzz/` cover `GuestRequest` and
-  > `AuthenticatedFrame`; targets at `crates/mvm-libkrun/fuzz/`
-  > cover libkrun's virtio-net device emulator and both userspace
-  > gateways (`fuzz_virtio_net_frame`, `fuzz_passt_frame`,
-  > `fuzz_gvproxy_frame`). `#[serde(deny_unknown_fields)]` on every
-  > host↔guest type still applies (W4.1).
+W6 ships the one Rust target we can meaningfully maintain:
 
-  W6 also amends ADR-055 §"Security model" with a paragraph noting
-that virtio-net introduces fuzzed untrusted-input parsing and that
-Plan 73's `mvm-egress-proxy` is now load-bearing (was defense-in-depth
-under TSI — see the "What changes" entry of the threat-table). The
-ADR-002 claim-table in `specs/adrs/002-microvm-security-posture.md`
-gets a matching update.
+- New `crates/mvm-libkrun/fuzz/fuzz_targets/fuzz_supervisor_config.rs`
+  cargo-fuzz target — `serde_json::from_slice::<SupervisorConfig>(_)`.
+  Workspace exclusion + Cargo manifest follow the
+  `crates/mvm-guest/fuzz/` and `crates/mvm-oci/fuzz/` precedent
+  (libfuzzer-sys gated outside the main workspace).
+- `.github/workflows/security.yml::fuzz` gains a 5-min PR run +
+  30-min nightly cron for `fuzz_supervisor_config`, alongside the
+  existing `fuzz_guest_request` / `fuzz_authenticated_frame` /
+  `fuzz_authed_path` steps.
+- CLAUDE.md security claim 5 widened:
+  > 5. **Vsock framing + supervisor-config JSON are fuzzed.**
+  > `cargo-fuzz` targets at `crates/mvm-guest/fuzz/` cover
+  > `GuestRequest` and `AuthenticatedFrame`; Plan 88 W6 adds
+  > `crates/mvm-libkrun/fuzz/fuzz_supervisor_config.rs` against the
+  > host-side parser. The virtio-net frame parsers Plan 87/88 brought
+  > online live in upstream libkrun (C), passt (C), and gvproxy (Go) —
+  > their fuzz coverage belongs upstream and is tracked in ADR-055
+  > §"New untrusted-input surfaces".
+- ADR-055 §"New untrusted-input surfaces" gains a "Fuzz coverage by
+  surface" subsection making the upstream/in-tree split explicit.
+- ADR-002 claim 5 row in the table widens accordingly.
+
+The aspirational "fuzz the virtio-net + gateway frame parsers" work
+moves to a separate follow-up plan (see `specs/plans/` once it lands)
+covering: persistent gateway subprocess + unix-socket fuzz driver,
+mocked libkrun virtqueue harness, and the substantial dependency on
+upstream libkrun maintainers to land sanitizer-friendly entry points.
+That's a separate sprint of work and shouldn't gate this PR.
 
 ## Non-goals
 
@@ -329,11 +326,11 @@ gets a matching update.
    surfaces the correct OS-specific install hint.
 5. Memory `reference_libkrun_gotchas.md` updated with the
    passt-Linux-only / gvproxy-macOS split.
-6. `fuzz_virtio_net_frame`, `fuzz_passt_frame`, and
-   `fuzz_gvproxy_frame` cargo-fuzz targets compile, run for ≥5
-   minutes in PR CI, and finish a 30-minute nightly run without
-   crashes. CLAUDE.md security claim 5 + ADR-002 claim table
-   reference all three targets.
+6. `fuzz_supervisor_config` cargo-fuzz target compiles, runs for ≥5
+   minutes in PR CI, and finishes a 30-minute nightly run without
+   crashes. CLAUDE.md security claim 5 + ADR-002 claim 5 table row
+   reference it explicitly and note that the virtio-net frame
+   parsers (libkrun / passt / gvproxy) are upstream-fuzz scope.
 
 ## ADR-055 amendment
 
