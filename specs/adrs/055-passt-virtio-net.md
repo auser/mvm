@@ -1,6 +1,6 @@
 # ADR-055 — libkrun networking via passt + virtio-net
 
-**Status:** proposed 2026-05-18, implements Plan 87.
+**Status:** accepted 2026-05-19, implements Plan 87. Default flipped from TSI → Passt by Plan 87 W5 / PR3 (this PR).
 
 ## Context
 
