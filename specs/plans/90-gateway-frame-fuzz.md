@@ -1,7 +1,7 @@
-# Plan 89 — external-process gateway frame fuzz harness
+# Plan 90 — external-process gateway frame fuzz harness
 
-**Status:** drafted 2026-05-19, awaiting prioritization (no scheduled sprint).
-**Follows:** Plan 88 W6 (`specs/plans/88-gvproxy-macos-backend.md`) — Plan 88 W6 shipped the in-tree `fuzz_supervisor_config` target; Plan 89 covers the aspirational external-process frame fuzz harnesses that W6 deliberately scoped out.
+**Status:** drafted 2026-05-19, renumbered from 89 → 90 on 2026-05-19 to resolve a slot collision with Plan 89 (persistent builder VM), awaiting prioritization (no scheduled sprint).
+**Follows:** Plan 88 W6 (`specs/plans/88-gvproxy-macos-backend.md`) — Plan 88 W6 shipped the in-tree `fuzz_supervisor_config` target; Plan 90 covers the aspirational external-process frame fuzz harnesses that W6 deliberately scoped out.
 **Amends:** ADR-055 §"New untrusted-input surfaces" — fills in the upstream-fuzz-by-mvm slot.
 
 ## Problem
@@ -19,13 +19,13 @@ untrusted-input parsers online on the host side:
 
 CLAUDE.md security claim 5 (after Plan 88 W6: "vsock framing +
 supervisor-config JSON are fuzzed") explicitly leaves these three
-surfaces to upstream-project fuzz coverage. Plan 89 closes that gap
+surfaces to upstream-project fuzz coverage. Plan 90 closes that gap
 locally, so a regression in any of the three parsers is caught by
 **mvm's own** CI rather than only by upstream maintainers' harnesses.
 
 This is not on the critical path for shipping a working `dev up` —
 all three parsers are already shipped in stable upstream releases
-with their own fuzz coverage. Plan 89 is hardening, not unblocking.
+with their own fuzz coverage. Plan 90 is hardening, not unblocking.
 
 ## Why this is non-trivial
 
@@ -116,7 +116,7 @@ of W1+W2.
 ## Non-goals
 
 - **Replacing upstream fuzz coverage.** Each upstream project
-  maintains its own fuzz harness. Plan 89 is *additional* coverage
+  maintains its own fuzz harness. Plan 90 is *additional* coverage
   bound to mvm's CI and audit chain, not a substitute for upstream.
 - **Frame-mutation policies.** libFuzzer's mutator is sufficient;
   no custom byte-mutation strategy needed for v1.
@@ -163,7 +163,7 @@ higher-value workstream needs the time.
   the in-tree `fuzz_supervisor_config` target; W6 also scoped this
   follow-up explicitly).
 - ADR-055 — `specs/adrs/055-passt-virtio-net.md` §"New
-  untrusted-input surfaces" (coverage-by-surface table that Plan 89
+  untrusted-input surfaces" (coverage-by-surface table that Plan 90
   updates).
 - ADR-002 — `specs/adrs/002-microvm-security-posture.md` claim 5.
 - libkrun upstream — https://github.com/containers/libkrun (target
