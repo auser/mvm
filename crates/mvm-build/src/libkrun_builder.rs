@@ -863,11 +863,22 @@ cd /work
 # otherwise fail with "the group 'nixbld' specified in
 # 'build-users-group' does not exist". The builder VM IS the
 # isolation boundary, so an in-guest sandbox is redundant.
+#
+# `mvm.cachix.org` is our own substituter for the four derivations
+# cache.nixos.org doesn't host (the TSI/passt kernel +
+# `mvm-builder-init` / `mvm-egress-proxy` / `mvm-guest-agent`). The
+# `<USER_PROVISIONS_THIS>` placeholder is filled per Plan 89's
+# one-time setup. Active during Stage 0 (free egress); silently
+# unreachable during steady state (iptables OUTPUT default-deny per
+# ADR-047). `connect-timeout = 5` caps the steady-state retry wait
+# at 5s per cache-miss derivation instead of the default ~63s TCP
+# SYN-retry timeout.
 export NIX_CONFIG="experimental-features = nix-command flakes
 sandbox = false
 build-users-group =
-substituters = https://cache.nixos.org/
-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
+substituters = https://cache.nixos.org/ https://mvm.cachix.org
+trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY= mvm.cachix.org-1:<USER_PROVISIONS_THIS>
+connect-timeout = 5"
 # Plan 72 W0's flake convention: workspace-path env var so
 # flakes that reference the workspace root don't depend on
 # relative-path resolution against the store-copied flake dir.
@@ -1861,6 +1872,12 @@ mod tests {
         assert!(cmd.starts_with("#!/bin/sh"));
         assert!(cmd.contains("set -eu"));
         assert!(cmd.contains("cd /work"));
+        // Plan 89 — Cachix substituter, public-key placeholder, and a
+        // short connect-timeout so steady-state firewall drops don't
+        // stall cache-miss derivations.
+        assert!(cmd.contains("https://mvm.cachix.org"));
+        assert!(cmd.contains("mvm.cachix.org-1:<USER_PROVISIONS_THIS>"));
+        assert!(cmd.contains("connect-timeout = 5"));
         assert!(cmd.contains("printf '%s\\n' \"$NIX_OUT\" > /job/store-path"));
     }
 

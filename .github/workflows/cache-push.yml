@@ -1,0 +1,79 @@
+name: cache-push
+
+# Plan 89 — push the builder VM closure to Cachix on every `main`
+# merge so contributor `mvmctl dev up` and fresh CI runners can
+# substitute instead of source-building the four heavy derivations
+# (TSI/passt kernel + mvm-builder-init + mvm-egress-proxy +
+# mvm-guest-agent). Stage 0 has free egress and reads from the
+# cache; steady state cannot reach it (iptables OUTPUT default-deny
+# per ADR-047) and falls back to its warm local /nix.
+#
+# Requires the `CACHIX_AUTH_TOKEN` repo secret (Plan 89 one-time
+# user provisioning). Without the secret the job fails closed,
+# which is preferable to silently shipping unsigned closures.
+#
+# Security: this workflow consumes no PR/issue/comment fields and
+# nothing user-controlled. The only ${{ … }} interpolations are
+# matrix.arch (set by this file) and secrets.CACHIX_AUTH_TOKEN
+# (repo secret). Per the GitHub Actions injection hardening guide,
+# `matrix.arch` is forwarded through `env:` to a shell variable
+# rather than spliced into the run script.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      # Only re-push when the inputs that change the builder VM
+      # closure hash change. Doc-only / unrelated edits skip the
+      # job entirely.
+      - 'nix/images/builder-vm/**'
+      - 'crates/mvm-builder-init/**'
+      - 'crates/mvm-egress-proxy/**'
+      - 'crates/mvm-guest/**'
+      - 'Cargo.lock'
+      - '.github/workflows/cache-push.yml'
+  workflow_dispatch:
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  push-builder-vm:
+    strategy:
+      # Don't bail on the other arch if one fails — one half of a
+      # closure is better than none.
+      fail-fast: false
+      matrix:
+        include:
+          - arch: aarch64
+            runner: ubuntu-24.04-arm
+          - arch: x86_64
+            runner: ubuntu-latest
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Nix
+        uses: DeterminateSystems/nix-installer-action@main
+
+      - name: Setup Cachix
+        uses: cachix/cachix-action@v15
+        with:
+          name: mvm
+          authToken: ${{ secrets.CACHIX_AUTH_TOKEN }}
+          # cachix-action also wires `mvm.cachix.org` as a substituter
+          # for this job's nix evaluation, so subsequent main pushes
+          # only build what genuinely changed since the last push.
+
+      - name: Build + push builder VM closure
+        env:
+          ARCH: ${{ matrix.arch }}
+        run: |
+          SYSTEM="${ARCH}-linux"
+          # `--print-out-paths --no-link` is the same shape the
+          # release.yml `builder-vm-image` job uses; the cachix-action
+          # `pushFilter` watches the store and pushes the produced
+          # closure on success.
+          nix build "./nix/images/builder-vm#packages.${SYSTEM}.default" \
+            --no-link --print-out-paths
