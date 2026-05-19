@@ -93,6 +93,26 @@ pub(crate) fn bye_json() -> &'static str {
     r#"{"kind":"bye"}"#
 }
 
+/// Plan 89 W3 part 9 — wire JSON for `BuilderResponse::StderrChunk`,
+/// one frame per stderr line the dispatch loop streams back to the
+/// host while a build is running. Matches the serde-derived shape in
+/// `mvm_build::builder_protocol::BuilderResponse::StderrChunk`
+/// (`{"kind":"stderr_chunk","job_id":"...","line":"..."}`); the
+/// cross-validation test below pins it.
+///
+/// `line` must already have its trailing `\n` stripped — the host's
+/// `mvm_build::builder_protocol::BuilderResponse::StderrChunk` docs
+/// commit to that.
+pub(crate) fn stderr_chunk_json(job_id: &str, line: &str) -> String {
+    let mut out = String::with_capacity(64 + job_id.len() + line.len());
+    out.push_str(r#"{"kind":"stderr_chunk","job_id":""#);
+    push_json_string(&mut out, job_id);
+    out.push_str(r#"","line":""#);
+    push_json_string(&mut out, line);
+    out.push_str(r#""}"#);
+    out
+}
+
 /// JSON string-escape per RFC 8259 §7. Inlined rather than calling
 /// the existing `json_escape` in `main.rs` because that one is
 /// `#[cfg(target_os = "linux")]`-gated under the linux module —
@@ -218,6 +238,43 @@ mod tests {
             typed,
             mvm_build::builder_protocol::BuilderResponse::Bye {}
         ));
+    }
+
+    /// Plan 89 W3 part 9 — hand-rolled `StderrChunk` must
+    /// deserialize as the typed enum variant with the same field
+    /// values. Bumps either shape and this test breaks.
+    #[test]
+    fn stderr_chunk_json_matches_typed_builder_response() {
+        let job_id = "01234567-89ab-cdef-0123-456789abcdef";
+        let line = "[mvm] nix build: 12/47 derivations";
+        let json = stderr_chunk_json(job_id, line);
+        let typed: mvm_build::builder_protocol::BuilderResponse =
+            serde_json::from_str(&json).expect("must parse as typed BuilderResponse");
+        match typed {
+            mvm_build::builder_protocol::BuilderResponse::StderrChunk {
+                job_id: got_id,
+                line: got_line,
+            } => {
+                assert_eq!(got_id.to_string(), job_id);
+                assert_eq!(got_line, line);
+            }
+            other => panic!("expected StderrChunk variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn stderr_chunk_json_escapes_control_chars_in_line() {
+        let json = stderr_chunk_json(NIL_JOB_ID, "warn: \"q\"\tand\\back\x01slash");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("must parse");
+        assert_eq!(parsed["kind"], "stderr_chunk");
+        assert_eq!(parsed["line"], "warn: \"q\"\tand\\back\x01slash");
+    }
+
+    #[test]
+    fn stderr_chunk_json_handles_empty_line() {
+        let json = stderr_chunk_json(NIL_JOB_ID, "");
+        let parsed: serde_json::Value = serde_json::from_str(&json).expect("must parse");
+        assert_eq!(parsed["line"], "");
     }
 
     /// **The cross-validation test.** Hand-rolled JSON must
