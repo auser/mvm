@@ -259,25 +259,17 @@
       # - `init=/sbin/mvm-builder-init` — Plan 72 W3 binary as PID 1.
       builderCmdline = "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-builder-init";
 
-      mkBuilderVmImage = system:
+      mkBuilderVmRootfs =
+        system:
+        { includeKernelModules ? true }:
         let
           pkgs = import nixpkgs { inherit system; };
           builderInit = mvmBuilderInitFor system;
           egressProxy = mvmEgressProxyFor system;
-          # TSI-patched nixpkgs kernel. See ./kernel/default.nix for
-          # the patch series provenance and rebase procedure. Without
-          # these patches, libkrun's AF_INET-via-vsock TSI path has
-          # no guest-side support and the in-guest mvm-egress-proxy
-          # can't reach upstream.
-          #
-          # Pass it to `mkGuest` so the rootfs ships its module tree
-          # (`/lib/modules/<kver>/`); the builder VM doesn't run the
-          # standard `/init` modprobe path (its cmdline pins
-          # `init=/sbin/mvm-builder-init`) but the modules sit
-          # alongside so `mvm-builder-init` or downstream tools can
-          # load them on demand.
-          kernelPkg = import ./kernel { inherit pkgs; };
-          rootfs = (libFor { inherit system; }).mkGuest {
+          kernelPkg =
+            if includeKernelModules then import ./kernel { inherit pkgs; } else null;
+        in
+        (libFor { inherit system; }).mkGuest ({
             name = "mvm-builder-vm";
             # mkGuest requires an entrypoint declaration. At runtime
             # the kernel cmdline sets `init=/sbin/mvm-builder-init`,
@@ -298,8 +290,29 @@
               "/sbin/mvm-egress-proxy" =
                 "${egressProxy}/bin/mvm-egress-proxy";
             };
+          } // nixpkgs.lib.optionalAttrs includeKernelModules {
+            # TSI-patched nixpkgs kernel. See ./kernel/default.nix for
+            # the patch series provenance and rebase procedure. Without
+            # these patches, libkrun's AF_INET-via-vsock TSI path has
+            # no guest-side support and the in-guest mvm-egress-proxy
+            # can't reach upstream.
+            #
+            # Pass it to `mkGuest` so the rootfs ships its module tree
+            # (`/lib/modules/<kver>/`); the builder VM doesn't run the
+            # standard `/init` modprobe path (its cmdline pins
+            # `init=/sbin/mvm-builder-init`) but the modules sit
+            # alongside so `mvm-builder-init` or downstream tools can
+            # load them on demand.
             kernel = kernelPkg;
-          };
+          });
+
+      mkBuilderVmImage = system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          builderInit = mvmBuilderInitFor system;
+          egressProxy = mvmEgressProxyFor system;
+          kernelPkg = import ./kernel { inherit pkgs; };
+          rootfs = mkBuilderVmRootfs system { includeKernelModules = true; };
           kernelFile =
             if pkgs.stdenv.hostPlatform.isAarch64 then "Image" else "bzImage";
         in
@@ -366,10 +379,47 @@
             }
             MANIFEST
           '';
+
+      mkBuilderVmStage0Rootfs = system:
+        let
+          pkgs = import nixpkgs { inherit system; };
+          rootfs = mkBuilderVmRootfs system { includeKernelModules = false; };
+        in
+        pkgs.runCommand "mvm-builder-vm-stage0-rootfs-${system}" { } ''
+          mkdir -p $out
+
+          if [ -f ${rootfs} ]; then
+            cp ${rootfs} $out/rootfs.ext4
+          else
+            img=$(find ${rootfs} -maxdepth 1 -name '*.img' -o -name '*.ext4' | head -1)
+            if [ -z "$img" ]; then
+              echo "mkGuest output at ${rootfs} contains no .img or .ext4 file" >&2
+              ls -la ${rootfs} >&2
+              exit 1
+            fi
+            cp "$img" $out/rootfs.ext4
+          fi
+
+          chmod 0644 $out/rootfs.ext4
+          echo "${builderCmdline}" > $out/cmdline.txt
+
+          rootfs_sha=$(sha256sum $out/rootfs.ext4 | cut -d' ' -f1)
+          rootfs_size=$(stat -c%s $out/rootfs.ext4)
+          cat > $out/manifest.json <<MANIFEST
+          {
+            "name": "mvm-builder-vm-stage0-rootfs",
+            "system": "${system}",
+            "rootfs_ext4": { "sha256": "$rootfs_sha", "size": $rootfs_size },
+            "cmdline": "${builderCmdline}",
+            "stage0_rootfs_only": true
+          }
+          MANIFEST
+        '';
     in
     {
       packages = forAllSystems (system: {
         default = mkBuilderVmImage system;
+        stage0-rootfs = mkBuilderVmStage0Rootfs system;
       });
     };
 }

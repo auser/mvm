@@ -875,6 +875,9 @@ trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDS
 # relative-path resolution against the store-copied flake dir.
 export MVM_WORKSPACE_PATH=/work
 
+echo "mvm-builder-vm: filesystem space before nix build:" >&2
+df -h /nix /tmp >&2 || true
+
 # `--impure` is what unblocks builds inside the VM when the
 # flake has path inputs; `--no-write-lock-file` keeps the
 # read-only `/work` mount from tripping EROFS.
@@ -891,6 +894,8 @@ NIX_RC=$?
 set -e
 NIX_OUT=$(cat /job/nix-stdout.log)
 if [ "$NIX_RC" -ne 0 ]; then
+    echo "mvm-builder-vm: filesystem space after failed nix build:" >&2
+    df -h /nix /tmp >&2 || true
     echo "nix build exited $NIX_RC; tail of stderr:" >&2
     tail -200 /job/nix-stderr.log >&2
     exit $NIX_RC

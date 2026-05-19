@@ -13,9 +13,9 @@
 //!
 //! - One binary to audit; no `/bin/sh` -> `/usr/bin/sh` -> busybox
 //!   hop where each link is a separate Nix store path.
-//! - The mount syscalls (`MS_BIND` of `/nix-store` over `/nix`)
-//!   are direct rather than `/sbin/mount -o bind` wrappers, so we
-//!   get clear errors when something refuses.
+//! - The mount syscalls (overlay/bind mounting the persistent
+//!   `/nix-store` over `/nix`) are direct rather than `/sbin/mount`
+//!   wrappers, so we get clear errors when something refuses.
 //! - We can encode the `/job/result` JSON shape in one place
 //!   rather than escape-quoting it across `printf` invocations.
 //!
@@ -29,9 +29,11 @@
 //!   2. Probe `/dev/vdb` for an ext4 superblock; format with
 //!      `mkfs.ext4 -F` if blank (first boot on a fresh sparse
 //!      virtio-blk image).
-//!   3. Mount `/dev/vdb` at `/nix-store`, then bind-mount
-//!      `/nix-store` over `/nix` so reads see the rootfs seed
-//!      contents *and* persistent writes from prior builds.
+//!   3. Mount `/dev/vdb` at `/nix-store`, then mount `/nix` as an
+//!      overlay with the rootfs seed as lowerdir and `/nix-store`
+//!      as upper/work storage. This lets reads see the baked-in Nix
+//!      closure without copying it into the constrained persistent
+//!      disk before the first build.
 //!   4. Best-effort `udhcpc -i eth0 -n -q` — failure is
 //!      non-fatal (offline builds against the seed store still
 //!      work; Plan 72 W4's `LibkrunBuilderVm::with_offline()`
@@ -117,11 +119,13 @@ mod linux {
     /// shadowing the rootfs's seed during the format/mount
     /// dance.
     const NIX_STORE_MOUNT: &str = "/nix-store";
+    const NIX_OVERLAY_UPPER: &str = "/nix-store/upper";
+    const NIX_OVERLAY_WORK: &str = "/nix-store/work";
+    const NIX_OVERLAY_MERGED: &str = "/nix-merged";
 
     /// Final bind-mount target. The rootfs's `/nix/store` (seed
-    /// Nix paths needed by `/bin/sh`, `nix`, etc.) sits underneath
-    /// the bind; the kernel resolves lookups through the upper
-    /// view.
+    /// Nix paths needed by `/bin/sh`, `nix`, etc.) is the overlay
+    /// lowerdir; persistent writes land in [`NIX_OVERLAY_UPPER`].
     const NIX_TARGET: &str = "/nix";
 
     /// Per-job command staging dir (`/job/cmd.sh`, `/job/env`,
@@ -544,9 +548,10 @@ mod linux {
     }
 
     /// Plan 76 Phase 5: serial chain that gates job execution.
-    /// /dev/vdb format (first boot only) → mount → seed (first
-    /// boot only) → bind-mount over /nix. Each step depends on the
-    /// previous, so this stays single-threaded inside.
+    /// /dev/vdb format (first boot only) → mount → overlay-mount
+    /// rootfs `/nix` with persistent upper/work dirs → bind-mount
+    /// over /nix. Each step depends on the previous, so this stays
+    /// single-threaded inside.
     fn setup_nix_store(timings: &Arc<Mutex<BootTimings>>, anchor: Instant) -> Result<(), String> {
         std::fs::create_dir_all(NIX_STORE_MOUNT)
             .map_err(|e| format!("create {NIX_STORE_MOUNT}: {e}"))?;
@@ -559,52 +564,18 @@ mod linux {
             t.nix_device_ready_ms = Some(BootTimings::ms_since(anchor))
         });
 
-        // Seed the persistent `/nix-store` from the rootfs's baked-in
-        // `/nix/store` on first boot. A plain `MS_BIND` shadows the
-        // mount target — without seeding, bind-mounting an empty disk
-        // over `/nix` hides the Nix daemon binary the rootfs ships at
-        // `/nix/store/<hash>-nix/bin/nix`, so cmd.sh's `nix build`
-        // fails with exit 127 (command not found). Subsequent boots
-        // see a non-empty store and skip the copy, so the seed cost
-        // is paid once per builder-VM image generation.
-        let needs_seed = match std::fs::read_dir(NIX_STORE_MOUNT) {
-            Ok(entries) => {
-                let mut any_non_lf = false;
-                for entry in entries {
-                    if let Ok(entry) = entry
-                        && entry.file_name() != "lost+found"
-                    {
-                        any_non_lf = true;
-                        break;
-                    }
-                }
-                !any_non_lf
+        match mount_nix_overlay() {
+            Ok(()) => {}
+            Err(e) => {
+                eprintln!(
+                    "mvm-builder-init: overlay /nix setup failed ({e}); falling back to seed copy"
+                );
+                seed_nix_store(timings, anchor)?;
+                std::fs::create_dir_all(NIX_TARGET)
+                    .map_err(|e| format!("create {NIX_TARGET}: {e}"))?;
+                bind_mount(NIX_STORE_MOUNT, NIX_TARGET)?;
             }
-            Err(_) => true,
-        };
-        if needs_seed {
-            eprintln!("mvm-builder-init: seeding {NIX_STORE_MOUNT} from {NIX_TARGET} (first boot)");
-            let status = Command::new("/bin/cp")
-                .args([
-                    "-aR",
-                    &format!("{NIX_TARGET}/."),
-                    &format!("{NIX_STORE_MOUNT}/"),
-                ])
-                .status()
-                .map_err(|e| format!("spawn cp: {e}"))?;
-            if !status.success() {
-                return Err(format!(
-                    "seeding {NIX_STORE_MOUNT} from {NIX_TARGET}: cp exit {:?}",
-                    status.code()
-                ));
-            }
-            stamp(timings, |t| {
-                t.nix_seeded_ms = Some(BootTimings::ms_since(anchor))
-            });
         }
-
-        std::fs::create_dir_all(NIX_TARGET).map_err(|e| format!("create {NIX_TARGET}: {e}"))?;
-        bind_mount(NIX_STORE_MOUNT, NIX_TARGET)?;
         stamp(timings, |t| {
             t.nix_mounted_ms = Some(BootTimings::ms_since(anchor))
         });
@@ -809,6 +780,72 @@ mod linux {
             None::<&str>,
         )
         .map_err(|e| format!("bind {source} -> {target}: {e}"))
+    }
+
+    fn mount_nix_overlay() -> Result<(), String> {
+        use nix::mount::{MsFlags, mount};
+
+        std::fs::create_dir_all(NIX_OVERLAY_UPPER)
+            .map_err(|e| format!("create {NIX_OVERLAY_UPPER}: {e}"))?;
+        std::fs::create_dir_all(NIX_OVERLAY_WORK)
+            .map_err(|e| format!("create {NIX_OVERLAY_WORK}: {e}"))?;
+        std::fs::create_dir_all(NIX_OVERLAY_MERGED)
+            .map_err(|e| format!("create {NIX_OVERLAY_MERGED}: {e}"))?;
+
+        let data = format!(
+            "lowerdir={NIX_TARGET},upperdir={NIX_OVERLAY_UPPER},workdir={NIX_OVERLAY_WORK}"
+        );
+        mount(
+            Some("mvm-nix"),
+            NIX_OVERLAY_MERGED,
+            Some("overlay"),
+            MsFlags::empty(),
+            Some(data.as_str()),
+        )
+        .map_err(|e| format!("mount overlay {NIX_OVERLAY_MERGED}: {e}"))?;
+
+        bind_mount(NIX_OVERLAY_MERGED, NIX_TARGET)
+    }
+
+    fn seed_nix_store(timings: &Arc<Mutex<BootTimings>>, anchor: Instant) -> Result<(), String> {
+        let needs_seed = match std::fs::read_dir(NIX_STORE_MOUNT) {
+            Ok(entries) => {
+                let mut any_non_lf = false;
+                for entry in entries {
+                    if let Ok(entry) = entry
+                        && entry.file_name() != "lost+found"
+                    {
+                        any_non_lf = true;
+                        break;
+                    }
+                }
+                !any_non_lf
+            }
+            Err(_) => true,
+        };
+        if !needs_seed {
+            return Ok(());
+        }
+
+        eprintln!("mvm-builder-init: seeding {NIX_STORE_MOUNT} from {NIX_TARGET} (first boot)");
+        let status = Command::new("/bin/cp")
+            .args([
+                "-aR",
+                &format!("{NIX_TARGET}/."),
+                &format!("{NIX_STORE_MOUNT}/"),
+            ])
+            .status()
+            .map_err(|e| format!("spawn cp: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "seeding {NIX_STORE_MOUNT} from {NIX_TARGET}: cp exit {:?}",
+                status.code()
+            ));
+        }
+        stamp(timings, |t| {
+            t.nix_seeded_ms = Some(BootTimings::ms_since(anchor))
+        });
+        Ok(())
     }
 
     /// Mount a libkrun-exported virtio-fs share. `tag` is the
