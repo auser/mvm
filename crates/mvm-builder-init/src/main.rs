@@ -344,6 +344,39 @@ mod linux {
             }
         }
 
+        // Plan 89 W3 part 3 dispatch: if the host staged a
+        // `dispatch.sock.marker` in /job, this VM is persistent
+        // (host-side `LibkrunPersistentBuilderVm`, W3 part 4).
+        // Enter the dispatch loop instead of single-shot. Marker
+        // absent (the default) preserves the existing cmd.sh /
+        // install_spec flows exactly.
+        let dispatch_marker = format!("{JOB_DIR}/dispatch.sock.marker");
+        if Path::new(&dispatch_marker).exists() {
+            eprintln!("mvm-builder-init: dispatch marker detected, entering W3 dispatch loop");
+            stamp(&timings, |t| {
+                t.job_start_ms = Some(BootTimings::ms_since(anchor))
+            });
+            // Snapshot the cold-boot timings — the dispatch loop's
+            // first response carries this; subsequent responses
+            // see None (per Plan 89's BuilderResponse::Result
+            // semantics).
+            let cold_boot_timings = match timings.lock() {
+                Ok(t) => Some(t.clone()),
+                Err(_) => {
+                    eprintln!(
+                        "mvm-builder-init: dispatch: timings mutex poisoned, omitting boot_timings"
+                    );
+                    None
+                }
+            };
+            let _exit_code = run_dispatch_loop(cold_boot_timings);
+            stamp(&timings, |t| {
+                t.poweroff_start_ms = Some(BootTimings::ms_since(anchor))
+            });
+            write_boot_timings(&timings);
+            return power_off();
+        }
+
         // Plan 73 Followup B.2 dispatch: install jobs hand the init
         // binary a structured spec rather than a shell script. We
         // probe for the spec first; if absent, fall through to the
@@ -408,9 +441,13 @@ mod linux {
             }
         };
         send_dispatch_response_via_vsock(&crate::dispatch_response::DispatchResponse {
+            // Single-shot has no incoming request to correlate
+            // against; the nil UUID is the documented sentinel
+            // (see `dispatch_response::NIL_JOB_ID`).
+            job_id: crate::dispatch_response::NIL_JOB_ID.to_string(),
             exit_code: code,
             stderr_tail: tail,
-            boot_timings: timings_snapshot,
+            boot_timings: Some(timings_snapshot),
             build_ms,
         });
         stamp(&timings, |t| {
@@ -439,55 +476,69 @@ mod linux {
     /// Cargo.toml (Plan 72 §W3 — ≤ 1.5 MiB) discourages new dep
     /// features. The pattern mirrors
     /// `crates/mvm-guest/src/bin/mvm-builder-agent.rs` exactly.
-    fn send_dispatch_response_via_vsock(payload: &crate::dispatch_response::DispatchResponse) {
-        // Plan 89 W2 part 2 — must match
-        // `mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`.
-        // Hardcoded because mvm-guest's dep tree is too heavy to
-        // pull into the rootfs for a single u32; the
-        // `port_value_matches_mvm_guest_constant` test in this
-        // module pins it.
-        const BUILDER_DISPATCH_PORT: u32 = 21471;
-        const ACCEPT_TIMEOUT_SECS: i64 = 10;
+    // -----------------------------------------------------------
+    // Plan 89 W2 / W3 — AF_VSOCK helpers
+    // -----------------------------------------------------------
+    //
+    // Shared between W2 part 3's single-shot send and W3 part 3's
+    // dispatch loop. Inlined FFI rather than `nix` because the
+    // Plan 72 §W3 size budget discourages new dep features; the
+    // pattern mirrors `mvm-guest/src/bin/mvm-builder-agent.rs`.
 
-        const AF_VSOCK: i32 = 40;
-        const SOCK_STREAM: i32 = 1;
-        const SOL_SOCKET: i32 = 1;
-        const SO_RCVTIMEO: i32 = 20;
-        const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
+    /// Plan 89 W2 part 2 — must match
+    /// `mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`. Hardcoded
+    /// for size-budget reasons; the
+    /// `vsock_send_tests::builder_dispatch_port_literal_is_21471`
+    /// pinning test below catches divergence.
+    const BUILDER_DISPATCH_PORT: u32 = 21471;
+    const AF_VSOCK: i32 = 40;
+    const SOCK_STREAM: i32 = 1;
+    const SOL_SOCKET: i32 = 1;
+    const SO_RCVTIMEO: i32 = 20;
+    const VMADDR_CID_ANY: u32 = 0xFFFF_FFFF;
 
-        #[repr(C)]
-        struct SockAddrVm {
-            svm_family: u16,
-            svm_reserved1: u16,
-            svm_port: u32,
-            svm_cid: u32,
-            svm_zero: [u8; 4],
-        }
+    /// W3 part 3 cap on a single inbound `BuilderRequest` body.
+    /// Matches `mvm_guest::vsock::MAX_FRAME_SIZE` (256 KiB) — the
+    /// host's `read_frame` enforces the same bound on its side, so
+    /// a body above this size couldn't have been written by a
+    /// well-behaved supervisor anyway.
+    const MAX_DISPATCH_BODY_BYTES: u32 = 256 * 1024;
 
-        unsafe extern "C" {
-            fn socket(domain: i32, typ: i32, protocol: i32) -> i32;
-            fn bind(sockfd: i32, addr: *const core::ffi::c_void, addrlen: u32) -> i32;
-            fn listen(sockfd: i32, backlog: i32) -> i32;
-            fn accept(sockfd: i32, addr: *mut core::ffi::c_void, addrlen: *mut u32) -> i32;
-            fn setsockopt(
-                sockfd: i32,
-                level: i32,
-                optname: i32,
-                optval: *const core::ffi::c_void,
-                optlen: u32,
-            ) -> i32;
-            fn close(fd: i32) -> i32;
-        }
+    #[repr(C)]
+    struct SockAddrVm {
+        svm_family: u16,
+        svm_reserved1: u16,
+        svm_port: u32,
+        svm_cid: u32,
+        svm_zero: [u8; 4],
+    }
 
-        let json = payload.to_json();
-        let body = json.as_bytes();
-        // u32 BE length prefix, matching mvm_guest::vsock::write_frame.
-        let len_be = (body.len() as u32).to_be_bytes();
+    unsafe extern "C" {
+        fn socket(domain: i32, typ: i32, protocol: i32) -> i32;
+        fn bind(sockfd: i32, addr: *const core::ffi::c_void, addrlen: u32) -> i32;
+        fn listen(sockfd: i32, backlog: i32) -> i32;
+        fn accept(sockfd: i32, addr: *mut core::ffi::c_void, addrlen: *mut u32) -> i32;
+        fn setsockopt(
+            sockfd: i32,
+            level: i32,
+            optname: i32,
+            optval: *const core::ffi::c_void,
+            optlen: u32,
+        ) -> i32;
+        fn close(fd: i32) -> i32;
+    }
 
+    /// Open + bind + listen an AF_VSOCK socket on
+    /// [`BUILDER_DISPATCH_PORT`]. Returns the listening fd or
+    /// `None` on any setup failure (with stderr breadcrumb).
+    /// `accept_timeout_secs = Some(n)` applies `SO_RCVTIMEO` so
+    /// subsequent `accept()` calls bound the wait at `n`s; `None`
+    /// means accept blocks until a peer connects.
+    fn open_dispatch_listener_fd(accept_timeout_secs: Option<i64>) -> Option<i32> {
         let listen_fd = unsafe { socket(AF_VSOCK, SOCK_STREAM, 0) };
         if listen_fd < 0 {
-            eprintln!("mvm-builder-init: vsock send: socket() failed");
-            return;
+            eprintln!("mvm-builder-init: vsock: socket() failed");
+            return None;
         }
         let addr = SockAddrVm {
             svm_family: AF_VSOCK as u16,
@@ -504,67 +555,250 @@ mod linux {
             )
         };
         if rc < 0 {
-            eprintln!(
-                "mvm-builder-init: vsock send: bind() failed on port {BUILDER_DISPATCH_PORT}"
-            );
+            eprintln!("mvm-builder-init: vsock: bind() failed on port {BUILDER_DISPATCH_PORT}");
             unsafe { close(listen_fd) };
-            return;
+            return None;
         }
         let rc = unsafe { listen(listen_fd, 1) };
         if rc < 0 {
-            eprintln!("mvm-builder-init: vsock send: listen() failed");
+            eprintln!("mvm-builder-init: vsock: listen() failed");
             unsafe { close(listen_fd) };
-            return;
+            return None;
         }
-        // SO_RCVTIMEO on the listening socket propagates to accept's
-        // wait — see accept(2) "if no pending connections are present
-        // ... the call blocks until a connection request arrives,
-        // unless the socket is marked nonblocking". The timeout
-        // option bounds that wait.
-        let tv = libc::timeval {
-            tv_sec: ACCEPT_TIMEOUT_SECS,
-            tv_usec: 0,
-        };
-        let rc = unsafe {
-            setsockopt(
-                listen_fd,
-                SOL_SOCKET,
-                SO_RCVTIMEO,
-                &tv as *const libc::timeval as *const core::ffi::c_void,
-                std::mem::size_of::<libc::timeval>() as u32,
-            )
-        };
-        if rc < 0 {
-            eprintln!("mvm-builder-init: vsock send: setsockopt SO_RCVTIMEO failed (continuing)");
+        if let Some(secs) = accept_timeout_secs {
+            let tv = libc::timeval {
+                tv_sec: secs,
+                tv_usec: 0,
+            };
+            let rc = unsafe {
+                setsockopt(
+                    listen_fd,
+                    SOL_SOCKET,
+                    SO_RCVTIMEO,
+                    &tv as *const libc::timeval as *const core::ffi::c_void,
+                    std::mem::size_of::<libc::timeval>() as u32,
+                )
+            };
+            if rc < 0 {
+                eprintln!("mvm-builder-init: vsock: setsockopt SO_RCVTIMEO failed (continuing)");
+            }
         }
+        Some(listen_fd)
+    }
+
+    /// Accept one connection from `listen_fd`. Returns the
+    /// connection fd or `None` on accept failure (e.g.
+    /// `SO_RCVTIMEO` elapsed).
+    fn accept_one(listen_fd: i32) -> Option<i32> {
         let conn_fd = unsafe { accept(listen_fd, std::ptr::null_mut(), std::ptr::null_mut()) };
-        if conn_fd < 0 {
-            // Host didn't connect within the timeout — fine. Pre-W2-part-4
-            // this is the expected case; nothing on the host reads it yet.
+        if conn_fd < 0 { None } else { Some(conn_fd) }
+    }
+
+    /// Wrap an accepted vsock conn fd in a `std::fs::File` so we
+    /// can use blanket `Read`/`Write` impls without rolling our
+    /// own write()/read() FFI. Ownership of `conn_fd` transfers to
+    /// the returned File; it closes on drop.
+    fn adopt_conn_fd(conn_fd: i32) -> std::fs::File {
+        use std::os::fd::FromRawFd;
+        unsafe { std::fs::File::from_raw_fd(conn_fd) }
+    }
+
+    /// Write a length-prefixed (u32 BE) frame on an existing conn.
+    /// Mirrors `mvm_guest::vsock::write_frame`. Returns `true` on
+    /// successful full-frame write. Doesn't close — caller owns
+    /// the File and decides when to drop.
+    fn write_frame(conn: &mut std::fs::File, body: &[u8]) -> bool {
+        use std::io::Write;
+        let len_be = (body.len() as u32).to_be_bytes();
+        let wrote_len = conn.write_all(&len_be).is_ok();
+        wrote_len && conn.write_all(body).is_ok()
+    }
+
+    /// Read one length-prefixed (u32 BE) frame body from an
+    /// existing conn. Mirrors `mvm_guest::vsock::read_frame`'s
+    /// wire format. Returns `None` on any I/O / over-cap failure.
+    /// Body > `MAX_DISPATCH_BODY_BYTES` fails closed before
+    /// allocation. Doesn't close — caller owns the File.
+    fn read_frame(conn: &mut std::fs::File) -> Option<Vec<u8>> {
+        use std::io::Read;
+        let mut len_buf = [0u8; 4];
+        if conn.read_exact(&mut len_buf).is_err() {
+            return None;
+        }
+        let frame_len = u32::from_be_bytes(len_buf);
+        if frame_len > MAX_DISPATCH_BODY_BYTES {
+            eprintln!(
+                "mvm-builder-init: dispatch: frame too large ({frame_len} > \
+                 {MAX_DISPATCH_BODY_BYTES})"
+            );
+            return None;
+        }
+        let mut body = vec![0u8; frame_len as usize];
+        if conn.read_exact(&mut body).is_err() {
+            return None;
+        }
+        Some(body)
+    }
+
+    fn send_dispatch_response_via_vsock(payload: &crate::dispatch_response::DispatchResponse) {
+        const ACCEPT_TIMEOUT_SECS: i64 = 10;
+        let Some(listen_fd) = open_dispatch_listener_fd(Some(ACCEPT_TIMEOUT_SECS)) else {
+            return;
+        };
+        let Some(conn_fd) = accept_one(listen_fd) else {
             eprintln!(
                 "mvm-builder-init: vsock send: no host connection within {ACCEPT_TIMEOUT_SECS}s \
-                 (W2 part 4 wires the host receiver)"
+                 (single-shot path; W2 part 4 wired the host receiver)"
             );
             unsafe { close(listen_fd) };
             return;
-        }
-
-        // Use std::fs::File as a tiny shim so we can use the
-        // RawFd-based `Write` impl without rolling our own FFI for
-        // write() and error handling. File holds the fd and closes
-        // it on drop.
-        use std::io::Write;
-        use std::os::fd::FromRawFd;
-        let mut conn = unsafe { std::fs::File::from_raw_fd(conn_fd) };
-        let wrote_len = conn.write_all(&len_be).is_ok();
-        let wrote_body = wrote_len && conn.write_all(body).is_ok();
-        if !wrote_body {
+        };
+        let mut conn = adopt_conn_fd(conn_fd);
+        let json = payload.to_json();
+        if !write_frame(&mut conn, json.as_bytes()) {
             eprintln!("mvm-builder-init: vsock send: write failed mid-frame");
         }
-        // conn is dropped here; the kernel reaps conn_fd.
-        // listen_fd is still open — close it explicitly.
         drop(conn);
         unsafe { close(listen_fd) };
+    }
+
+    // -----------------------------------------------------------
+    // Plan 89 W3 part 3 — persistent-VM dispatch loop
+    // -----------------------------------------------------------
+
+    /// Plan 89 W3 part 3 — dispatch loop entry point. Called from
+    /// `run` when `/job/dispatch.sock.marker` is present (the host
+    /// stages the marker when spawning a long-lived
+    /// `LibkrunPersistentBuilderVm`, W3 part 4). Opens a long-lived
+    /// AF_VSOCK listener on [`BUILDER_DISPATCH_PORT`], reads one
+    /// `BuilderRequest` per accepted connection, dispatches the
+    /// inner job, writes back a `BuilderResponse::Result`, and
+    /// repeats until a `Shutdown` request triggers a clean exit.
+    ///
+    /// `cold_boot_timings` carries the BootTimings snapshot taken
+    /// at dispatch-loop entry. Per Plan 89 spec, only the
+    /// supervisor's *first* dispatch in a persistent VM session
+    /// gets a populated `boot_timings` field on the wire; subsequent
+    /// dispatches see `None`. The first dispatch in this loop
+    /// consumes the snapshot via `.take()`.
+    ///
+    /// Returns `0` on graceful `Shutdown`, non-zero on listener
+    /// setup failure (caller `power_off`s either way).
+    fn run_dispatch_loop(mut cold_boot_timings: Option<BootTimings>) -> i32 {
+        // No accept timeout — the dispatch loop is persistent and
+        // blocks waiting for the supervisor's next submit. The
+        // outer `mvmctl dev down` signals shutdown via a
+        // `BuilderRequest::Shutdown` frame on a fresh connection.
+        let Some(listen_fd) = open_dispatch_listener_fd(None) else {
+            eprintln!("mvm-builder-init: dispatch loop: listener setup failed");
+            return 1;
+        };
+        eprintln!("mvm-builder-init: dispatch loop ready on AF_VSOCK port {BUILDER_DISPATCH_PORT}");
+        loop {
+            let Some(conn_fd) = accept_one(listen_fd) else {
+                // accept() failed with no timeout configured —
+                // typically a kernel-level error (e.g. EMFILE). Log
+                // and continue; another accept will likely succeed.
+                eprintln!("mvm-builder-init: dispatch loop: accept failed (retrying)");
+                continue;
+            };
+            // One File owns the conn fd for both the read (request)
+            // and write (response). Dropped at iteration end which
+            // closes the socket — the host sees EOF and unblocks
+            // its mvm_guest::vsock::read_frame.
+            let mut conn = adopt_conn_fd(conn_fd);
+            let Some(body) = read_frame(&mut conn) else {
+                eprintln!("mvm-builder-init: dispatch loop: read failed on conn (ignoring)");
+                continue;
+            };
+            let request = match crate::builder_request::parse(&body) {
+                Ok(req) => req,
+                Err(e) => {
+                    eprintln!("mvm-builder-init: dispatch loop: parse failed: {e}");
+                    continue;
+                }
+            };
+            match request {
+                crate::builder_request::BuilderRequest::Run {
+                    job_id,
+                    job,
+                    job_dir_relpath,
+                } => {
+                    let response = execute_dispatched_job(
+                        job_id,
+                        job,
+                        &job_dir_relpath,
+                        cold_boot_timings.take(),
+                    );
+                    if !write_frame(&mut conn, response.as_bytes()) {
+                        eprintln!("mvm-builder-init: dispatch loop: write Result failed mid-frame");
+                    }
+                }
+                crate::builder_request::BuilderRequest::Shutdown => {
+                    eprintln!("mvm-builder-init: dispatch loop: shutdown requested");
+                    let bye = crate::dispatch_response::bye_json();
+                    if !write_frame(&mut conn, bye.as_bytes()) {
+                        eprintln!(
+                            "mvm-builder-init: dispatch loop: write Bye failed (continuing to shutdown)"
+                        );
+                    }
+                    drop(conn);
+                    break;
+                }
+            }
+            // Conn drops at end of iteration; the host's read on
+            // its end completes (either Frame or EmptyEof).
+        }
+        unsafe { close(listen_fd) };
+        0
+    }
+
+    /// Run one dispatched job: locate cmd.sh under
+    /// `/job/<job_dir_relpath>/cmd.sh`, exec it, capture exit code
+    /// + stderr tail. Returns the wire JSON for
+    /// `BuilderResponse::Result` ready to frame and write back.
+    fn execute_dispatched_job(
+        job_id: String,
+        job: crate::builder_request::BuilderJob,
+        job_dir_relpath: &str,
+        cold_boot_timings: Option<BootTimings>,
+    ) -> String {
+        let (exit_code, stderr_tail, build_ms) = match job {
+            crate::builder_request::BuilderJob::Flake { .. } => {
+                let cmd_path = format!("{JOB_DIR}/{job_dir_relpath}/cmd.sh");
+                if !Path::new(&cmd_path).exists() {
+                    (2, format!("missing {cmd_path}"), 0)
+                } else {
+                    let started = Instant::now();
+                    let (code, tail) = run_job(&cmd_path);
+                    let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    (code, tail, ms)
+                }
+            }
+            crate::builder_request::BuilderJob::Install { .. } => {
+                // Install pipeline dispatch in the persistent VM
+                // is W3 part 5 work — Plan 73's sealed-volume
+                // invariants need extra thought against the
+                // long-lived VM model. For W3 part 3, fail closed
+                // with a structured error so the host sees a real
+                // Result with a meaningful exit_code.
+                (
+                    3,
+                    "Install variant via persistent dispatch not yet wired \
+                     (Plan 89 W3 part 5)"
+                        .to_string(),
+                    0,
+                )
+            }
+        };
+        let response = crate::dispatch_response::DispatchResponse {
+            job_id,
+            exit_code,
+            stderr_tail,
+            boot_timings: cold_boot_timings,
+            build_ms,
+        };
+        response.to_json()
     }
 
     #[cfg(test)]
