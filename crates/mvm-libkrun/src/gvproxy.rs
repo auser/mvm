@@ -118,6 +118,28 @@ pub fn locate_gvproxy() -> Option<PathBuf> {
     which::which("gvproxy").ok()
 }
 
+/// Pick a TCP port for gvproxy's mandatory SSH-forward listener,
+/// derived deterministically from the per-VM scratch dir. gvproxy's
+/// `-ssh-port` arg is *mandatory* (default 2222) and gvproxy binds
+/// it on every start — so a host running more than one gvproxy
+/// fails the second-and-later instances with `bind: address already
+/// in use`. Plan 88 W5 surfaced this when the supervisor unit tests
+/// collided with a live `mvmctl dev up` gvproxy instance.
+///
+/// Range: 49152..=65535 (IANA dynamic / private ports). The mapping
+/// is deterministic on the dir path so a given VM's gvproxy always
+/// picks the same port (helps log/debug reproducibility); collisions
+/// across simultaneous VMs are improbable in practice but not
+/// impossible — if they happen, the second gvproxy still exits with
+/// a clear bind error and the caller's `EarlyExit` path reports it.
+fn ssh_port_for(scratch_dir: &Path) -> u16 {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    scratch_dir.hash(&mut hasher);
+    let dynamic_range: u32 = 65535 - 49152 + 1;
+    49152u16 + ((hasher.finish() as u32) % dynamic_range) as u16
+}
+
 /// Owning handle to a running gvproxy child process. `Drop` cleans up
 /// the child the same way [`crate::passt::PasstHandle::drop`] does:
 /// SIGTERM → grace period → SIGKILL → reap.
@@ -167,6 +189,15 @@ pub fn spawn(scratch_dir: &Path) -> Result<GvproxyHandle, GvproxyError> {
     //                          mode is the libkrun-compatible one.
     //   -log-file <path>     — diagnostic log; absent → stderr (lost
     //                          when we redirect to /dev/null).
+    //   -ssh-port <port>     — gvproxy always binds a TCP listener for
+    //                          guest-SSH forwarding (default 2222). On
+    //                          a host running more than one gvproxy
+    //                          (concurrent dev VMs, parallel tests,
+    //                          debugging cycles), instance N+1 fails
+    //                          to bind 2222 and exits immediately
+    //                          with `address already in use`. Derive
+    //                          a per-VM port from the scratch dir so
+    //                          concurrent instances don't collide.
     //   -debug               — verbose logging. Not set by default;
     //                          if a future MVM_GVPROXY_DEBUG=1 env
     //                          var trips this we'd flip it here.
@@ -180,11 +211,14 @@ pub fn spawn(scratch_dir: &Path) -> Result<GvproxyHandle, GvproxyError> {
         s.push(socket_path.as_os_str());
         s
     };
+    let ssh_port = ssh_port_for(scratch_dir);
     let mut cmd = Command::new(&gvproxy_bin);
     cmd.arg("-listen-vfkit")
         .arg(listen_url)
         .arg("-log-file")
         .arg(OsString::from(&log_path))
+        .arg("-ssh-port")
+        .arg(ssh_port.to_string())
         // Redirect stdout/stderr to /dev/null — gvproxy's `-log-file`
         // captures what we need and any spillover noise on stderr
         // pollutes the supervisor's own diagnostic stream.

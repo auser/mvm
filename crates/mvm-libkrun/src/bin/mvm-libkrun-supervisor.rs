@@ -45,7 +45,7 @@
 use std::io::Read;
 use std::process::ExitCode;
 
-use mvm_libkrun::{SupervisorConfig, run_supervisor};
+use mvm_libkrun::{LogLevel, SupervisorConfig, init_log, run_supervisor, set_log_level};
 
 fn main() -> ExitCode {
     // macOS Hypervisor.framework rejects any process without
@@ -54,6 +54,36 @@ fn main() -> ExitCode {
     // invocations are silent (`MVM_SIGNED=1`). Without this,
     // `krun_start_enter` fails at VM creation with rc -22.
     mvm_providers::apple_container::ensure_signed();
+
+    // Plan 88 W5 diagnostic: opt-in libkrun internal logger. Set
+    // `MVM_KRUN_LOG={off,error,warn,info,debug,trace}` to surface
+    // device-attach traces and virtio MMIO events that don't appear
+    // via `krun_set_log_level` alone. Tried `krun_init_log` first
+    // (full-featured); falls back to `krun_set_log_level` on older
+    // libkrun builds that don't export it. Failures are non-fatal —
+    // the supervisor still runs, just without verbose logging.
+    if let Ok(level) = std::env::var("MVM_KRUN_LOG") {
+        let parsed = match level.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(LogLevel::Off),
+            "error" => Some(LogLevel::Error),
+            "warn" => Some(LogLevel::Warn),
+            "info" => Some(LogLevel::Info),
+            "debug" => Some(LogLevel::Debug),
+            "trace" => Some(LogLevel::Trace),
+            _ => None,
+        };
+        if let Some(lvl) = parsed {
+            if let Err(e) = init_log(2, lvl, 0, 0) {
+                eprintln!(
+                    "mvm-libkrun-supervisor: krun_init_log failed ({e}); \
+                     falling back to set_log_level"
+                );
+                if let Err(e2) = set_log_level(lvl) {
+                    eprintln!("mvm-libkrun-supervisor: krun_set_log_level failed: {e2}");
+                }
+            }
+        }
+    }
 
     let mut json = String::new();
     if let Err(e) = std::io::stdin().read_to_string(&mut json) {

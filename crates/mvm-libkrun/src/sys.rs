@@ -50,6 +50,18 @@ pub const PASST_NET_FEATURES: u32 = (1 << 0)   // NET_FEATURE_CSUM
 /// surfaced.
 pub const NET_FLAG_VFKIT: u32 = 1 << 0;
 
+/// Plan 88 W5 diagnostic: enable libkrun's internal logger. Wrapper
+/// for `krun_init_log` (libkrun.h). Targets a file descriptor
+/// (`target_fd = 2` → stderr) at the given level. `style` and
+/// `options` follow the C signature; pass 0 / 0 unless you have a
+/// reason. Used by `mvm-libkrun-supervisor` when `MVM_KRUN_LOG` is
+/// set — surfaces device-attach traces (`mmio[net] set_irq_line`,
+/// `net::unixgram network proxy socket fd ...`) that don't appear
+/// via `krun_set_log_level` alone.
+pub fn init_log(target_fd: i32, level: LogLevel, style: u32, options: u32) -> Result<(), Error> {
+    check(unsafe { bindings::krun_init_log(target_fd, level.as_u32(), style, options) })
+}
+
 /// Kernel-format constants exposed to callers without leaking the
 /// bindgen-generated identifier names.
 #[derive(Debug, Clone, Copy)]

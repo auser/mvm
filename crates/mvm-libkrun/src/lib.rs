@@ -26,7 +26,7 @@ use std::path::Path;
 mod sys;
 
 #[cfg(feature = "libkrun-sys")]
-pub use sys::{BundledKernel, KernelFormat, LogLevel, extract_bundled_kernel, set_log_level};
+pub use sys::{BundledKernel, KernelFormat, LogLevel, extract_bundled_kernel, init_log, set_log_level};
 
 // Plan 87 / ADR-055 — passt-backed virtio-net. The supervisor owns the
 // passt child process and exposes the socket fd `KrunContext::Passt`
