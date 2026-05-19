@@ -796,6 +796,8 @@ cd /work
 export NIX_CONFIG="experimental-features = nix-command flakes
 sandbox = false
 build-users-group =
+max-jobs = auto
+cores = 0
 substituters = https://cache.nixos.org/
 trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
 # Plan 72 W0's flake convention: workspace-path env var so
@@ -1761,6 +1763,8 @@ mod tests {
         assert!(cmd.starts_with("#!/bin/sh"));
         assert!(cmd.contains("set -eu"));
         assert!(cmd.contains("cd /work"));
+        assert!(cmd.contains("max-jobs = auto"));
+        assert!(cmd.contains("cores = 0"));
         assert!(cmd.contains("printf '%s\\n' \"$NIX_OUT\" > /job/store-path"));
     }
 
