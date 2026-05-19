@@ -236,7 +236,17 @@ pub struct KrunVirtioFs {
 pub struct KrunContext {
     pub name: String,
     pub kernel_path: String,
-    pub rootfs_path: String,
+    /// Root ext4 image. `None` for initramfs-only boot (the kernel
+    /// decompresses [`Self::initramfs_path`] into a rootfs tmpfs and
+    /// runs `init=/init` from it; no `/dev/vda` is attached).
+    #[serde(default)]
+    pub rootfs_path: Option<String>,
+    /// Optional initial ramdisk. When `Some`, libkrun passes the
+    /// path to `krun_set_kernel`'s `c_initramfs` arg. Set this for
+    /// in-memory bootstrap boots; leave `None` for ext4-rootfs
+    /// boots.
+    #[serde(default)]
+    pub initramfs_path: Option<String>,
     pub vcpus: u8,
     pub ram_mib: u32,
     pub kernel_cmdline: Option<String>,
@@ -337,9 +347,7 @@ pub enum NetworkingMode {
 }
 
 impl KrunContext {
-    /// Construct a context for a guest. No I/O — this is pure
-    /// configuration. The actual VM creation happens in [`start`] or
-    /// [`start_enter`].
+    /// Construct a context that boots from a rootfs ext4 image.
     pub fn new(
         name: impl Into<String>,
         kernel_path: impl Into<String>,
@@ -348,7 +356,35 @@ impl KrunContext {
         Self {
             name: name.into(),
             kernel_path: kernel_path.into(),
-            rootfs_path: rootfs_path.into(),
+            rootfs_path: Some(rootfs_path.into()),
+            initramfs_path: None,
+            vcpus: 1,
+            ram_mib: 256,
+            kernel_cmdline: None,
+            vsock_ports: Vec::new(),
+            extra_disks: Vec::new(),
+            virtio_fs_mounts: Vec::new(),
+            console_output_path: None,
+            vsock_socket_dir: None,
+            networking: NetworkingMode::Tsi,
+        }
+    }
+
+    /// Construct a context that boots from an initramfs (no rootfs
+    /// disk attached). The kernel decompresses the initramfs into a
+    /// tmpfs rootfs and runs `init=` from it. Use this for the
+    /// bootstrap path that produces builder-VM images on a fresh
+    /// host.
+    pub fn new_initramfs(
+        name: impl Into<String>,
+        kernel_path: impl Into<String>,
+        initramfs_path: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kernel_path: kernel_path.into(),
+            rootfs_path: None,
+            initramfs_path: Some(initramfs_path.into()),
             vcpus: 1,
             ram_mib: 256,
             kernel_cmdline: None,
@@ -587,15 +623,24 @@ fn configure_with_gateway(ctx: &KrunContext) -> Result<(sys::Context, GatewayHan
 /// (TSI-only) and `configure_with_passt`.
 #[cfg(feature = "libkrun-sys")]
 fn configure_pre_net(ctx: &KrunContext) -> Result<sys::Context, Error> {
+    if ctx.rootfs_path.is_none() && ctx.initramfs_path.is_none() {
+        return Err(Error::Io {
+            context: "KrunContext needs either rootfs_path or initramfs_path; neither set"
+                .to_string(),
+        });
+    }
     let krun = sys::Context::new()?;
     krun.set_vm_config(ctx.vcpus, ctx.ram_mib)?;
+    let initramfs_path = ctx.initramfs_path.as_deref().map(Path::new);
     krun.set_kernel(
         Path::new(&ctx.kernel_path),
         sys::KernelFormat::Raw,
-        None,
+        initramfs_path,
         ctx.kernel_cmdline.as_deref(),
     )?;
-    krun.add_disk("root", Path::new(&ctx.rootfs_path), false)?;
+    if let Some(rootfs) = &ctx.rootfs_path {
+        krun.add_disk("root", Path::new(rootfs), false)?;
+    }
     for disk in &ctx.extra_disks {
         krun.add_disk(&disk.id, Path::new(&disk.path), disk.read_only)?;
     }

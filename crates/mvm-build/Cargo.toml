@@ -31,6 +31,8 @@ mvm-sdk.workspace = true
 anyhow.workspace = true
 chrono.workspace = true
 fs2.workspace = true
+hex.workspace = true
+reqwest = { workspace = true, default-features = false, features = ["blocking", "rustls-tls"] }
 # Plan 72 W1: optional libkrun FFI dep for the in-tree builder VM
 # launcher (`libkrun_builder::LibkrunBuilderVm`). Gated by
 # `builder-vm`; default-off until Plan 72 W5

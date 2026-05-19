@@ -242,12 +242,6 @@ cargo run -- dev down    # stop the builder VM
 cargo run -- dev shell   # open shell in running builder VM
 cargo run -- dev status  # show dev environment status
 
-# Ur-seed Stage –1 bootstrap (Plan 86 / ADR-054). Required once on
-# a host with no contract-compliant dev image. `mvmctl dev up` NEVER
-# auto-fetches.
-cargo run -- dev fetch-ur-seed                       # release mirror
-cargo run -- dev import-ur-seed --from <tarball>     # air-gapped
-
 # Build from Nix flake
 cargo run -- build --flake . --profile minimal --role worker
 cargo run -- run --flake . --profile minimal --cpus 2 --memory 1024

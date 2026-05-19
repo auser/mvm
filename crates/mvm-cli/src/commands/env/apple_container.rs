@@ -2169,29 +2169,22 @@ fn bootstrap_builder_vm_image() -> Result<()> {
 
             #[cfg(feature = "builder-vm")]
             {
-                if let Some(ur_seed) = super::ur_seed::probe(arch) {
-                    return bootstrap_builder_vm_image_via_ur_seed_stage0(
-                        &flake_dir,
-                        &out_dir,
-                        &source_fingerprint,
-                        ur_seed,
-                    )
-                    .context("building the source-checkout builder VM image via ur-seed");
-                }
+                bootstrap_builder_vm_image_via_initramfs_stage0(
+                    &flake_dir,
+                    &out_dir,
+                    &source_fingerprint,
+                )
+                .context("building the source-checkout builder VM image via initramfs Stage 0")
             }
 
-            anyhow::bail!(
-                "Stage 0 needs either a contract-compliant dev image \
-                 (in ~/.mvm/dev/{{current, prebuilt/v*, builds/*}} containing \
-                 /sbin/mvm-builder-init) or an ur-seed bootstrap rootfs \
-                 (in ~/.cache/mvm/ur-seed/{arch}/). Neither was found.\n\
-                 \n\
-                 Install the ur-seed once via:\n  \
-                   mvmctl dev fetch-ur-seed              # downloads from this release\n  \
-                   mvmctl dev import-ur-seed --from <tarball>   # air-gapped\n\
-                 \n\
-                 Then retry `mvmctl dev up`. See ADR-054 for context."
-            );
+            #[cfg(not(feature = "builder-vm"))]
+            {
+                let _ = (&flake_dir, &out_dir, &source_fingerprint, arch);
+                anyhow::bail!(
+                    "Stage 0 needs the `builder-vm` cargo feature to be enabled \
+                     for this `mvmctl` build."
+                )
+            }
         }
         BuilderVmBootstrapAction::DownloadPublished => {
             perform_builder_vm_download_published(arch, &out_dir)
@@ -2591,6 +2584,50 @@ fn ensure_stage0_seed_manifest(seed_rootfs: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
+/// Stage 0 bootstrap via an in-memory initramfs (busybox +
+/// nix-portable + a shell init script). Replaces the ur-seed
+/// flake + tarball path entirely.
+///
+/// The full wire-through (LibkrunBuilderVm running with the
+/// initramfs `BuilderVmImage` variant + a Stage-0-specific job
+/// flow that doesn't stage `/job/cmd.sh`) lands in the follow-up
+/// PR. For now this builds the cpio bytes (proves the
+/// infrastructure works) and surfaces a clear error pointing at
+/// the artifact + the dev-image fallback.
+#[cfg(feature = "builder-vm")]
+fn bootstrap_builder_vm_image_via_initramfs_stage0(
+    _builder_flake_dir: &str,
+    out_dir: &str,
+    _source_fingerprint: &str,
+) -> Result<()> {
+    let _stage0_guard = acquire_stage0_lock(out_dir)?;
+
+    mvm_build::stage0::prepare_assets(mvm_build::stage0::ASSETS_AARCH64)
+        .context("preparing Stage 0 bootstrap assets")?;
+
+    let initramfs_bytes =
+        mvm_build::stage0::build_initramfs().context("building Stage 0 initramfs cpio")?;
+
+    let cpio_path = mvm_build::stage0::stage0_cache_dir().join("initramfs.cpio");
+    std::fs::write(&cpio_path, &initramfs_bytes)
+        .with_context(|| format!("writing {}", cpio_path.display()))?;
+    ui::info(&format!(
+        "Stage 0 initramfs cpio staged at {} ({} bytes).",
+        cpio_path.display(),
+        initramfs_bytes.len()
+    ));
+
+    anyhow::bail!(
+        "Stage 0 needs either a contract-compliant dev image in \
+         ~/.mvm/dev/{{current, prebuilt/v*, builds/*}} OR the new \
+         initramfs Stage 0 dispatch (wired in a follow-up PR). The \
+         initramfs bytes are ready at {}; the dispatch path that \
+         hands them to libkrun via `LibkrunBuilderVm::run_stage0_initramfs` \
+         is the only remaining piece.",
+        cpio_path.display()
+    );
+}
+
 #[cfg(feature = "builder-vm")]
 fn bootstrap_builder_vm_image_via_dev_image_stage0(
     builder_flake_dir: &str,
@@ -2719,13 +2756,6 @@ impl<'a> Stage0BootstrapOpts<'a> {
             output_kernel: None,
         }
     }
-
-    fn rootfs_only(output_kernel: &'a std::path::Path) -> Self {
-        Self {
-            attr_name: "stage0-rootfs",
-            output_kernel: Some(output_kernel),
-        }
-    }
 }
 
 #[cfg(feature = "builder-vm")]
@@ -2827,126 +2857,16 @@ fn run_stage0_bootstrap(
     Ok(())
 }
 
-/// Plan 86 — Stage 0 bootstrap via the ur-seed (Stage -1) cache.
-///
-/// Mirrors [`bootstrap_builder_vm_image_via_dev_image_stage0`] but
-/// substitutes the ur-seed rootfs for the dev-image rootfs and resolves
-/// the kernel from whatever local source can supply one (cached
-/// builder-VM kernel from a prior build, or any local dev image's
-/// kernel — neither requires the seed contract on its rootfs, since
-/// we only consume the kernel).
-///
-/// The ur-seed rootfs carries `/sbin/mvm-builder-init` (statically
-/// linked against musl) and `/usr/local/bin/nix` (a wrapper around
-/// `nix-portable`), so the Plan 77 W1 `cmd.sh` (`nix build path:/work#…`)
-/// runs unchanged inside the seed.
-#[cfg(feature = "builder-vm")]
-fn bootstrap_builder_vm_image_via_ur_seed_stage0(
-    builder_flake_dir: &str,
-    out_dir: &str,
-    source_fingerprint: &str,
-    ur_seed: super::ur_seed::UrSeedCache,
-) -> Result<()> {
-    let _stage0_guard = acquire_stage0_lock(out_dir)?;
-
-    // Contract check — ur-seed is built with the seed contract in
-    // mind, but a tampered/half-written cache would fail here too.
-    if let Err(e) = validate_stage0_seed_contract(&ur_seed.rootfs) {
-        let reason = e.audit_reason();
-        let fingerprint_prefix = stage0_fingerprint_prefix(source_fingerprint);
-        mvm_core::audit_emit!(
-            Stage0Failed,
-            "stage=preflight reason={reason} seed=ur-seed fingerprint_prefix={fingerprint_prefix}"
-        );
-        return Err(anyhow::Error::from(e).context(format!(
-            "Stage 0 seed contract check failed for ur-seed rootfs at {}",
-            ur_seed.rootfs.display()
-        )));
-    }
-
-    // Plan 86 v3 / Plan 72 W5.D bullet 10: extract the TSI-patched
-    // kernel bundled in `libkrunfw` and use it. Our in-repo port of
-    // the libkrunfw patches (nix/images/builder-vm/kernel/) applies
-    // cleanly to nixpkgs 6.12.87 but kernel-oops's on socket close at
-    // runtime — the upstream patches are validated against the
-    // specific kernel revision libkrunfw ships, not arbitrary
-    // nixpkgs HEADs. Falling back to libkrunfw's own kernel is the
-    // robust path. We cache the extracted bytes under
-    // `~/.cache/mvm/libkrunfw/vmlinux-<libkrunfw_version>` so a
-    // subsequent libkrunfw upgrade invalidates the cache cleanly.
-    let kernel = match extract_libkrunfw_kernel() {
-        Ok(p) => p,
-        Err(err) => {
-            ui::warn(&format!(
-                "Could not extract libkrunfw's bundled kernel ({err}); falling back to ur-seed's own vmlinux."
-            ));
-            if ur_seed.kernel.is_file() {
-                ur_seed.kernel.clone()
-            } else {
-                find_kernel_for_ur_seed_bootstrap()
-                    .context("locating a TSI-patched kernel for ur-seed Stage 0")?
-            }
-        }
-    };
-
-    ui::info(&format!(
-        "Using ur-seed at {} + kernel at {} as Stage 0 seed.",
-        ur_seed.dir.display(),
-        kernel.display()
-    ));
-
-    let out_dir_path = std::path::Path::new(out_dir);
-    let staging_dir = unique_builder_vm_stage0_staging_dir(out_dir_path)?;
-    std::fs::create_dir_all(&staging_dir)
-        .with_context(|| format!("creating Stage 0 staging dir {}", staging_dir.display()))?;
-
-    let started = std::time::Instant::now();
-    let fingerprint_prefix = stage0_fingerprint_prefix(source_fingerprint);
-    mvm_core::audit_emit!(
-        Stage0Boot,
-        "seed=ur-seed fingerprint_prefix={fingerprint_prefix}"
-    );
-
-    let result = run_stage0_bootstrap(
-        &staging_dir,
-        out_dir_path,
-        source_fingerprint,
-        builder_flake_dir,
-        kernel.clone(),
-        ur_seed.rootfs.clone(),
-        Stage0BootstrapOpts::rootfs_only(&kernel),
-    );
-    let duration_ms = started.elapsed().as_millis() as u64;
-
-    match result {
-        Ok(()) => {
-            mvm_core::audit_emit!(
-                Stage0CachePromoted,
-                "seed=ur-seed duration_ms={duration_ms} fingerprint_prefix={fingerprint_prefix}"
-            );
-            ui::success(&format!(
-                "Built builder VM image at {cache} via ur-seed Stage 0.",
-                cache = out_dir_path.display(),
-            ));
-            Ok(())
-        }
-        Err((stage, e)) => {
-            let _ = std::fs::remove_dir_all(&staging_dir);
-            let reason = stage0_failure_reason_summary(&e);
-            mvm_core::audit_emit!(
-                Stage0Failed,
-                "stage={stage} seed=ur-seed duration_ms={duration_ms} reason={reason}"
-            );
-            Err(e)
-        }
-    }
-}
-
 /// Extract libkrunfw's bundled TSI-patched kernel into the host cache
 /// and return the on-disk path. Only available when `libkrun-sys` is
 /// compiled in (the default on macOS + Linux libkrun hosts) — without
 /// that feature the FFI is dead code and the caller falls back.
+///
+/// Currently unused on the main path; reserved for the follow-up
+/// PR that wires the initramfs Stage 0 dispatch (the initramfs
+/// path needs a kernel and libkrunfw is where we get it).
 #[cfg(all(feature = "builder-vm", feature = "libkrun-sys"))]
+#[allow(dead_code)]
 fn extract_libkrunfw_kernel() -> Result<std::path::PathBuf> {
     let cache_dir =
         std::path::PathBuf::from(format!("{}/libkrunfw", mvm_core::config::mvm_cache_dir()));
@@ -2962,50 +2882,11 @@ fn extract_libkrunfw_kernel() -> Result<std::path::PathBuf> {
 }
 
 #[cfg(all(feature = "builder-vm", not(feature = "libkrun-sys")))]
+#[allow(dead_code)]
 fn extract_libkrunfw_kernel() -> Result<std::path::PathBuf> {
     anyhow::bail!(
         "libkrunfw kernel extraction requires the `libkrun-sys` feature; \
          rebuild `mvmctl` with `--features libkrun-sys` on a host with libkrun installed."
-    )
-}
-
-/// Locate a TSI-patched kernel to pair with the ur-seed rootfs.
-///
-/// Tries, in order:
-/// 1. The cached builder-VM kernel at `~/.cache/mvm/builder-vm/<arch>/vmlinux`
-///    — survives a rootfs cache wipe and is the freshest TSI-patched
-///    kernel available on this host.
-/// 2. Any local dev image's kernel via [`find_local_fallback_image`]
-///    — the dev image flake ships the same TSI kernel package, so this
-///    is the load-bearing path for hosts that have never finished a
-///    builder VM build but did finish a dev image build at some point.
-/// 3. Fail with a message pointing at `mvmctl dev fetch-ur-seed --include-kernel`
-///    (a follow-up: ship the kernel inside the ur-seed tarball so
-///    contributors with no prior mvm state ever boot).
-#[cfg(feature = "builder-vm")]
-fn find_kernel_for_ur_seed_bootstrap() -> Result<std::path::PathBuf> {
-    let arch = builder_vm_host_arch();
-    let cached_builder_kernel = std::path::PathBuf::from(format!(
-        "{}/builder-vm/{arch}/vmlinux",
-        mvm_core::config::mvm_cache_dir()
-    ));
-    if cached_builder_kernel.is_file() {
-        return Ok(cached_builder_kernel);
-    }
-
-    if let Some((kernel, _rootfs, _label)) = find_local_fallback_image() {
-        return Ok(kernel);
-    }
-
-    anyhow::bail!(
-        "Ur-seed Stage 0 needs a TSI-patched kernel but none was found. \
-         Looked at ~/.cache/mvm/builder-vm/{arch}/vmlinux and any local \
-         dev image under ~/.mvm/dev/. On a host with no prior mvm \
-         artifacts, this is the gap: today the ur-seed ships only a \
-         rootfs (the kernel is large + TSI-patched + reused from any \
-         prior builder VM or dev image build). A future ur-seed \
-         tarball will include its own kernel. Until then, the recovery \
-         is to land any working dev image first."
     )
 }
 
