@@ -1304,16 +1304,17 @@ fn resolve_supervisor_path() -> Result<PathBuf, BuilderVmError> {
 /// per libkrun's `start_enter` semantics; non-zero if the
 /// supervisor errored before or during the guest run).
 ///
-/// Distinct from `mvm-backend::LibkrunBackend::start` which
-/// only waits for the PID file to appear and then returns —
-/// that consumer wants a long-lived background VM. The
-/// builder VM is a one-shot; the caller can't make progress
-/// until the build finishes.
-fn spawn_supervisor_and_wait(
+/// Plan 89 W3 part 4 — spawn the supervisor with the given
+/// `cfg` piped to its stdin, return the live `Child` *without*
+/// waiting on it. Persistent-VM callers
+/// ([`LibkrunPersistentBuilderVm::start`]) consume the child via
+/// [`PersistentVmHandle`]; the single-shot
+/// [`spawn_supervisor_and_wait`] calls this then runs the wait
+/// loop on top.
+fn spawn_supervisor_in_background(
     supervisor_path: &Path,
     cfg: &SupervisorConfig,
-    vm_state_dir: &Path,
-) -> Result<i32, BuilderVmError> {
+) -> Result<std::process::Child, BuilderVmError> {
     let json = serde_json::to_string(cfg).map_err(|e| {
         BuilderVmError::ExtractionFailed(format!("serialize SupervisorConfig: {e}"))
     })?;
@@ -1341,6 +1342,20 @@ fn spawn_supervisor_and_wait(
                 "writing SupervisorConfig to supervisor stdin: {e}"
             ))
         })?;
+    Ok(child)
+}
+
+/// Distinct from `mvm-backend::LibkrunBackend::start` which
+/// only waits for the PID file to appear and then returns —
+/// that consumer wants a long-lived background VM. The
+/// builder VM is a one-shot; the caller can't make progress
+/// until the build finishes.
+fn spawn_supervisor_and_wait(
+    supervisor_path: &Path,
+    cfg: &SupervisorConfig,
+    vm_state_dir: &Path,
+) -> Result<i32, BuilderVmError> {
+    let mut child = spawn_supervisor_in_background(supervisor_path, cfg)?;
 
     let timeout = builder_vm_timeout()?;
     // Plan 77 W6 — concurrent kernel-panic detector. The libkrun
@@ -1758,6 +1773,284 @@ fn path_to_str<'a>(p: &'a Path, field: &str) -> Result<&'a str, BuilderVmError> 
     p.to_str().ok_or_else(|| {
         BuilderVmError::ExtractionFailed(format!("{field} has non-UTF-8 bytes: {p:?}"))
     })
+}
+
+// ============================================================
+// Plan 89 W3 part 4 — LibkrunPersistentBuilderVm
+// ============================================================
+
+/// Filename of the marker the host stages under `<job_dir>/` to
+/// tell `mvm-builder-init` to enter its dispatch loop (W3 part 3)
+/// instead of running the single-shot `cmd.sh` / `install_spec`
+/// flow. Same key as the path the guest checks.
+pub const DISPATCH_SOCK_MARKER: &str = "dispatch.sock.marker";
+
+/// Plan 89 W3 part 4 — spawn the long-lived builder VM that
+/// `mvm-builder-init`'s W3 part 3 dispatch loop runs inside.
+///
+/// Mirrors the config surface of [`LibkrunBuilderVm`] but
+/// produces a different shape of dispatch: instead of running a
+/// single cmd.sh / install_spec and powering off, the guest
+/// detects `<job_dir>/<DISPATCH_SOCK_MARKER>` and enters the
+/// dispatch loop that reads `BuilderRequest` frames over
+/// AF_VSOCK port [`mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`].
+///
+/// The caller pairs this with a `PersistentBuilderSupervisor`
+/// (W3 part 1) constructed against
+/// [`PersistentVmHandle::dispatch_socket_path`].
+///
+/// ## What's *not* in this PR
+///
+/// - `mvmctl dev up` integration (W3 part 5) is what actually
+///   constructs one of these against the dev session's lifecycle.
+/// - Per-job namespace isolation inside the dispatch loop (W3
+///   part 8 — security amendments F2/F7).
+#[cfg(feature = "builder-vm")]
+#[derive(Debug, Clone)]
+pub struct LibkrunPersistentBuilderVm {
+    vcpus: u8,
+    memory_mib: u32,
+    nix_store_mib: u32,
+    image_override: Option<BuilderVmImage>,
+    /// Host directory bound at `/work` in the guest. Plan 89 §"Workspace
+    /// mount strategy" — bound at VM start, not per-dispatch.
+    workspace_root: PathBuf,
+}
+
+#[cfg(feature = "builder-vm")]
+impl LibkrunPersistentBuilderVm {
+    /// Construct a persistent builder VM rooted at `workspace_root`.
+    /// Defaults match [`LibkrunBuilderVm::default`] for vCPUs / RAM /
+    /// nix-store image size.
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            vcpus: DEFAULT_VCPUS,
+            memory_mib: DEFAULT_MEMORY_MIB,
+            nix_store_mib: DEFAULT_NIX_STORE_MIB,
+            image_override: None,
+            workspace_root: workspace_root.into(),
+        }
+    }
+
+    pub fn with_vcpus(mut self, vcpus: u8) -> Self {
+        self.vcpus = vcpus;
+        self
+    }
+
+    pub fn with_memory_mib(mut self, memory_mib: u32) -> Self {
+        self.memory_mib = memory_mib;
+        self
+    }
+
+    pub fn with_nix_store_mib(mut self, nix_store_mib: u32) -> Self {
+        self.nix_store_mib = nix_store_mib;
+        self
+    }
+
+    pub fn with_image_override(mut self, image: BuilderVmImage) -> Self {
+        self.image_override = Some(image);
+        self
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    /// Spawn the supervisor + libkrun VM in the background and
+    /// return a handle whose `dispatch_socket_path` the W3 part 1
+    /// supervisor connects to. The returned `Child` is alive
+    /// until either the guest dispatch loop processes a
+    /// `BuilderRequest::Shutdown` (clean exit) or the caller
+    /// invokes [`PersistentVmHandle::kill`].
+    pub fn start(&self) -> Result<PersistentVmHandle, BuilderVmError> {
+        if !mvm_libkrun::is_available() {
+            return Err(BuilderVmError::LibkrunUnavailable(format!(
+                "libkrun shared library not found on host. {}",
+                mvm_libkrun::install_hint()
+            )));
+        }
+
+        if !self.workspace_root.is_dir() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "workspace_root {} is not a directory",
+                self.workspace_root.display()
+            )));
+        }
+
+        let supervisor_path = resolve_supervisor_path()?;
+        let image = match &self.image_override {
+            Some(image) => image.clone(),
+            None => ensure_builder_vm_image()?,
+        };
+        // Acquire the cross-process flock on the nix-store image
+        // for the persistent VM's lifetime. Issue #371 mitigation:
+        // concurrent `mvmctl deps install` while a dev session's
+        // persistent VM is up would otherwise corrupt the shared
+        // ext4. Held inside the handle; released on drop / kill /
+        // wait_for_shutdown.
+        let nix_store_lock =
+            acquire_nix_store_image_lock(host_arch_tag(), u64::from(self.nix_store_mib))?;
+
+        let session_id = unique_job_id();
+        let job_dir = builder_vm_cache_dir().join("jobs").join(&session_id);
+        stage_persistent_job_dir(&job_dir)?;
+
+        let vm_name = format!("mvm-persistent-builder-vm-{session_id}");
+        let vm_state_dir = builder_vm_cache_dir().join("vms").join(&vm_name);
+        std::fs::create_dir_all(&vm_state_dir).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating persistent builder VM state dir {}: {e}",
+                vm_state_dir.display()
+            ))
+        })?;
+        let console_log = vm_state_dir.join("console.log");
+
+        let mut krun = krun_context_for_image(&vm_name, &image)?
+            .with_resources(self.vcpus, self.memory_mib)
+            .with_cmdline(&image.cmdline)
+            .with_console_output(path_to_str(&console_log, "console_log")?)
+            .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
+            .add_disk(
+                "nix-store",
+                path_to_str(nix_store_lock.path(), "nix_store_img")?,
+                false,
+            )
+            .add_virtio_fs("work", path_to_str(&self.workspace_root, "workspace_root")?)
+            .add_virtio_fs("out", path_to_str(&job_dir, "job_dir")?)
+            .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?)
+            .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT);
+
+        krun = apply_networking_mode(krun, &vm_state_dir)?;
+
+        let cfg = SupervisorConfig {
+            krun,
+            vm_state_dir: path_to_str(&vm_state_dir, "vm_state_dir")?.to_string(),
+            pid_file_name: Some("builder.pid".to_string()),
+        };
+
+        let child = spawn_supervisor_in_background(&supervisor_path, &cfg)?;
+
+        Ok(PersistentVmHandle {
+            vm_state_dir,
+            job_dir,
+            session_id,
+            supervisor: Some(child),
+            _nix_store_lock: nix_store_lock,
+        })
+    }
+}
+
+/// Stage `<job_dir>/<DISPATCH_SOCK_MARKER>` so the in-guest
+/// `mvm-builder-init` enters its W3 part 3 dispatch loop instead
+/// of the single-shot cmd.sh / install_spec flow. The marker
+/// body is intentionally empty — its mere existence is the
+/// signal.
+#[cfg(feature = "builder-vm")]
+fn stage_persistent_job_dir(job_dir: &Path) -> Result<(), BuilderVmError> {
+    std::fs::create_dir_all(job_dir).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!(
+            "creating persistent job dir {}: {e}",
+            job_dir.display()
+        ))
+    })?;
+    let marker_path = job_dir.join(DISPATCH_SOCK_MARKER);
+    std::fs::write(&marker_path, b"").map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!(
+            "staging dispatch marker {}: {e}",
+            marker_path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Handle to a live persistent builder VM. Owns the supervisor
+/// `Child` for its lifetime; dropping without calling
+/// [`Self::wait_for_shutdown`] or [`Self::kill`] leaks the
+/// supervisor process (and the VM behind it) — callers should
+/// always one of the two before dropping.
+#[cfg(feature = "builder-vm")]
+#[derive(Debug)]
+pub struct PersistentVmHandle {
+    vm_state_dir: PathBuf,
+    job_dir: PathBuf,
+    session_id: String,
+    /// `None` after [`Self::wait_for_shutdown`] consumes it.
+    supervisor: Option<std::process::Child>,
+    /// Held to keep the cross-process flock on the shared
+    /// nix-store image alive for the VM's lifetime. Drops
+    /// (releasing the lock) when the handle drops, after
+    /// `wait_for_shutdown`, or after `kill`. Underscore-prefixed
+    /// because the type is opaque to consumers — it exists for
+    /// its `Drop` side-effect.
+    _nix_store_lock: NixStoreImageLock,
+}
+
+#[cfg(feature = "builder-vm")]
+impl PersistentVmHandle {
+    /// Path libkrun uses for the per-VM state (vsock sockets,
+    /// console log, PID file). Pass this to
+    /// `dispatch_socket_path` when constructing the W3 part 1
+    /// `PersistentBuilderSupervisor`.
+    pub fn vm_state_dir(&self) -> &Path {
+        &self.vm_state_dir
+    }
+
+    /// Host-side path of the libkrun-managed Unix socket that
+    /// proxies to AF_VSOCK [`mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`]
+    /// inside the guest. The W3 part 1
+    /// `PersistentBuilderSupervisor::new` takes this directly.
+    pub fn dispatch_socket_path(&self) -> PathBuf {
+        self.vm_state_dir.join(format!(
+            "vsock-{}.sock",
+            mvm_guest::builder_agent::BUILDER_DISPATCH_PORT
+        ))
+    }
+
+    /// Per-VM job directory bound at `/job` inside the guest.
+    /// Hosts stage per-dispatch artifacts (`<job_dir_relpath>/cmd.sh`,
+    /// per-dispatch install specs, etc.) here before sending the
+    /// matching `BuilderRequest::Run`.
+    pub fn job_dir(&self) -> &Path {
+        &self.job_dir
+    }
+
+    /// Opaque session identifier — useful for logging /
+    /// observability. Stable for the VM's lifetime.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Block until the supervisor child exits. Normal way to
+    /// reach this is the supervisor sending `BuilderRequest::Shutdown`,
+    /// the guest dispatch loop processing it + replying `Bye`,
+    /// then `mvm-builder-init` calling `reboot(RB_POWER_OFF)`,
+    /// then libkrun's `krun_start_enter` returning, then the
+    /// supervisor exiting `main`. Consumes the child; subsequent
+    /// calls return [`BuilderVmError::ExtractionFailed`].
+    pub fn wait_for_shutdown(mut self) -> Result<i32, BuilderVmError> {
+        let mut child = self.supervisor.take().ok_or_else(|| {
+            BuilderVmError::ExtractionFailed(
+                "PersistentVmHandle::wait_for_shutdown called twice".to_string(),
+            )
+        })?;
+        let status = child.wait().map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!("waiting on persistent supervisor: {e}"))
+        })?;
+        Ok(status.code().unwrap_or(-1))
+    }
+
+    /// Forcibly terminate the supervisor child (SIGKILL via
+    /// `Child::kill`). The VM goes down hard; in-flight builds
+    /// are abandoned. Use only as a fallback after
+    /// [`Self::wait_for_shutdown`] hangs.
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        if let Some(child) = self.supervisor.as_mut() {
+            child.kill()?;
+            let _ = child.wait();
+            self.supervisor = None;
+        }
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -2645,6 +2938,98 @@ mod tests {
         assert!(msg.contains("Stage 0 seed VM kernel-panicked"), "{msg}");
         assert!(msg.contains("Kernel panic - not syncing: example"), "{msg}");
         assert!(msg.contains("/tmp/example/console.log"), "{msg}");
+    }
+
+    // -----------------------------------------------------------
+    // Plan 89 W3 part 4 — LibkrunPersistentBuilderVm
+    // -----------------------------------------------------------
+
+    #[test]
+    fn dispatch_sock_marker_constant_is_filename_only() {
+        // Must not contain `/`. The host joins it under <job_dir>;
+        // a slash would break the path concatenation contract the
+        // in-guest builder-init's marker probe assumes.
+        assert!(!DISPATCH_SOCK_MARKER.contains('/'));
+        assert!(!DISPATCH_SOCK_MARKER.is_empty());
+        assert_eq!(DISPATCH_SOCK_MARKER, "dispatch.sock.marker");
+    }
+
+    #[test]
+    fn stage_persistent_job_dir_creates_marker_in_fresh_dir() {
+        // Hermetic — no libkrun, no VM. Validates the host's
+        // side of the marker-file convention.
+        let scratch = TempDir::new().expect("tempdir");
+        let job_dir = scratch.path().join("job-dir");
+        stage_persistent_job_dir(&job_dir).expect("stage");
+        let marker = job_dir.join(DISPATCH_SOCK_MARKER);
+        assert!(
+            marker.is_file(),
+            "marker should exist at {}",
+            marker.display()
+        );
+        // Marker body is intentionally empty — its existence is
+        // the signal. If the body grows non-empty in the future
+        // the dispatch contract changes.
+        let body = std::fs::read(&marker).expect("read marker");
+        assert_eq!(body, b"");
+    }
+
+    #[test]
+    fn stage_persistent_job_dir_is_idempotent() {
+        // Re-staging into the same job dir must succeed (caller
+        // may retry after a transient supervisor failure).
+        let scratch = TempDir::new().expect("tempdir");
+        let job_dir = scratch.path().join("job-dir");
+        stage_persistent_job_dir(&job_dir).expect("stage 1");
+        stage_persistent_job_dir(&job_dir).expect("stage 2");
+        assert!(job_dir.join(DISPATCH_SOCK_MARKER).is_file());
+    }
+
+    #[test]
+    fn persistent_vm_config_defaults_track_libkrun_builder_vm() {
+        // Same vcpus / memory / nix-store defaults so users moving
+        // from single-shot to persistent don't see surprise
+        // resource shifts.
+        let vm = LibkrunPersistentBuilderVm::new(std::env::temp_dir());
+        assert_eq!(vm.vcpus, DEFAULT_VCPUS);
+        assert_eq!(vm.memory_mib, DEFAULT_MEMORY_MIB);
+        assert_eq!(vm.nix_store_mib, DEFAULT_NIX_STORE_MIB);
+    }
+
+    #[test]
+    fn persistent_vm_with_setters_override_defaults() {
+        let vm = LibkrunPersistentBuilderVm::new(std::env::temp_dir())
+            .with_vcpus(2)
+            .with_memory_mib(2048)
+            .with_nix_store_mib(8192);
+        assert_eq!(vm.vcpus, 2);
+        assert_eq!(vm.memory_mib, 2048);
+        assert_eq!(vm.nix_store_mib, 8192);
+    }
+
+    #[test]
+    fn persistent_vm_start_rejects_missing_workspace() {
+        // ExtractionFailed is the typed error variant for "host
+        // input doesn't satisfy the precondition". Caller will
+        // surface it directly.
+        let nonexistent = std::env::temp_dir().join(format!(
+            "no-such-workspace-{}",
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.as_nanos())
+                .unwrap_or(0)
+        ));
+        let vm = LibkrunPersistentBuilderVm::new(&nonexistent);
+        match vm.start() {
+            Err(BuilderVmError::ExtractionFailed(msg)) => {
+                assert!(msg.contains("workspace_root"), "msg: {msg}");
+                assert!(msg.contains("not a directory"), "msg: {msg}");
+            }
+            // libkrun may not be installed in CI; that's a
+            // different error variant and also acceptable.
+            Err(BuilderVmError::LibkrunUnavailable(_)) => {}
+            other => panic!("expected ExtractionFailed or LibkrunUnavailable, got {other:?}"),
+        }
     }
 
     // ---------------------------------------------------------------
