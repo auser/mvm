@@ -72,15 +72,15 @@ fn main() -> ExitCode {
             "trace" => Some(LogLevel::Trace),
             _ => None,
         };
-        if let Some(lvl) = parsed {
-            if let Err(e) = init_log(2, lvl, 0, 0) {
-                eprintln!(
-                    "mvm-libkrun-supervisor: krun_init_log failed ({e}); \
-                     falling back to set_log_level"
-                );
-                if let Err(e2) = set_log_level(lvl) {
-                    eprintln!("mvm-libkrun-supervisor: krun_set_log_level failed: {e2}");
-                }
+        if let Some(lvl) = parsed
+            && let Err(e) = init_log(2, lvl, 0, 0)
+        {
+            eprintln!(
+                "mvm-libkrun-supervisor: krun_init_log failed ({e}); \
+                 falling back to set_log_level"
+            );
+            if let Err(e2) = set_log_level(lvl) {
+                eprintln!("mvm-libkrun-supervisor: krun_set_log_level failed: {e2}");
             }
         }
     }

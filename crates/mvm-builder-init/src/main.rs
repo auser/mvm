@@ -674,7 +674,9 @@ mod linux {
             .args(["link", "set", "eth0", "up"])
             .status()
         {
-            eprintln!("mvm-builder-init: ip link set eth0 up: {e} (continuing — udhcpc may still try)");
+            eprintln!(
+                "mvm-builder-init: ip link set eth0 up: {e} (continuing — udhcpc may still try)"
+            );
         }
 
         // Plan 87 W4: when /etc/udhcpc/default.script exists (passt
