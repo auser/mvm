@@ -130,19 +130,12 @@ pub enum NetworkingPreference {
 /// default `Tsi` mode in place — keeping the two builder-VM call
 /// sites (shell-job + flake-build) in lockstep. Each gateway uses
 /// `<vm_state_dir>` for its log/socket scratch space.
-///
-/// `is_stage0` flags a Stage 0 (ur-seed) boot. Stage 0 defaults to
-/// TSI because its build is against the ur-seed's pre-staged closure
-/// (ADR-054 §"Ur-seed shape") and doesn't need real network — and
-/// avoiding real network sidesteps the release-frozen ur-seed's
-/// `mvm-builder-init` networking-stack surface (Plan 91 / ADR-056).
 fn apply_networking_mode(
     krun: KrunContext,
     vm_state_dir: &std::path::Path,
-    is_stage0: bool,
 ) -> Result<KrunContext, BuilderVmError> {
     let scratch = path_to_str(vm_state_dir, "vm_state_dir")?;
-    Ok(match resolve_networking_mode(is_stage0) {
+    Ok(match resolve_networking_mode() {
         NetworkingPreference::Tsi => krun,
         NetworkingPreference::Passt => {
             krun.with_passt(mvm_libkrun::passt::DEFAULT_GUEST_MAC, scratch)
@@ -153,28 +146,15 @@ fn apply_networking_mode(
     })
 }
 
-/// Default networking backend per launch context.
+/// Per-host-OS default networking backend.
 ///
-/// Steady-state builder VM (`is_stage0 = false`):
-/// - macOS → [`Gvproxy`](NetworkingPreference::Gvproxy) because passt
-///   doesn't build on macOS (the Homebrew formula refuses with "Linux
-///   is required for this software").
-/// - Other (Linux) → [`Passt`](NetworkingPreference::Passt).
-///
-/// See ADR-055 §"Cross-platform backends" for the rationale.
-///
-/// Stage 0 boot (`is_stage0 = true`, signalled by
-/// [`LibkrunBuilderVm::image_override`] being set):
-/// - [`Tsi`](NetworkingPreference::Tsi) on every host. Stage 0 builds
-///   the in-repo `nix/images/builder-vm/flake.nix` against the
-///   ur-seed's pre-staged closure (ADR-054 §"Ur-seed shape"), so it
-///   doesn't need substituter access. TSI sidesteps the release-frozen
-///   ur-seed's `mvm-builder-init` networking-stack surface — see
-///   Plan 91 / ADR-056 for the full rationale.
-pub fn default_networking_mode(is_stage0: bool) -> NetworkingPreference {
-    if is_stage0 {
-        NetworkingPreference::Tsi
-    } else if cfg!(target_os = "macos") {
+/// macOS → [`Gvproxy`](NetworkingPreference::Gvproxy) because passt
+/// does not build there (the Homebrew formula refuses with "Linux is
+/// required for this software"); everything else (Linux today) →
+/// [`Passt`](NetworkingPreference::Passt). See ADR-055
+/// §"Cross-platform backends" for the rationale.
+pub fn default_networking_mode() -> NetworkingPreference {
+    if cfg!(target_os = "macos") {
         NetworkingPreference::Gvproxy
     } else {
         NetworkingPreference::Passt
@@ -183,24 +163,18 @@ pub fn default_networking_mode(is_stage0: bool) -> NetworkingPreference {
 
 /// Read `MVM_NETWORKING` from the env. Accepts `tsi`, `passt`, and
 /// `gvproxy` (case-insensitive); anything else falls back to the
-/// per-context default and emits a warning so a typo is visible
-/// without aborting.
+/// per-OS default and emits a warning so a typo is visible without
+/// aborting.
 ///
-/// `is_stage0` selects the per-context default when the env var is
-/// unset (see [`default_networking_mode`]). The env var, when set,
-/// always wins — `MVM_NETWORKING=gvproxy` boots Stage 0 with gvproxy
-/// even though TSI is the Stage 0 default. Lets a contributor debug
-/// the steady-state networking path against the ur-seed image when
-/// needed.
-///
-/// Plan 87 W5 / PR3 flipped the steady-state default away from TSI;
-/// Plan 88 added the per-OS dispatch (macOS → gvproxy, Linux →
-/// passt). Plan 91 split Stage 0 back to TSI — TSI is libkrun's
-/// experimental no-network-stack mode that works for trivial HTTP
-/// but breaks on nix's substituter and source fetches (HTTP/2
-/// multiplexing, HTTPS redirect chains, the offline-mode probe — see
-/// ADR-055 §"Context"), and Stage 0 doesn't need those.
-pub fn resolve_networking_mode(is_stage0: bool) -> NetworkingPreference {
+/// Plan 87 W5 / PR3 flipped the default away from TSI; Plan 88
+/// added the per-OS dispatch (macOS → gvproxy, Linux → passt). TSI
+/// is libkrun's experimental no-network-stack mode; it works for
+/// trivial HTTP but breaks on nix's substituter and source fetches
+/// (HTTP/2 multiplexing, HTTPS redirect chains, the offline-mode
+/// probe — see ADR-055 §"Context"). Contributors can still opt back
+/// to TSI via `MVM_NETWORKING=tsi` for debugging, or pin a specific
+/// gateway across OS via `MVM_NETWORKING=passt` / `=gvproxy`.
+pub fn resolve_networking_mode() -> NetworkingPreference {
     match std::env::var("MVM_NETWORKING")
         .ok()
         .as_deref()
@@ -211,14 +185,13 @@ pub fn resolve_networking_mode(is_stage0: bool) -> NetworkingPreference {
         Some("tsi") => NetworkingPreference::Tsi,
         Some("passt") => NetworkingPreference::Passt,
         Some("gvproxy") => NetworkingPreference::Gvproxy,
-        None | Some("") => default_networking_mode(is_stage0),
+        None | Some("") => default_networking_mode(),
         Some(other) => {
-            let fallback = default_networking_mode(is_stage0);
+            let fallback = default_networking_mode();
             tracing::warn!(
                 value = other,
                 fallback = ?fallback,
-                is_stage0,
-                "MVM_NETWORKING unrecognised; falling back to per-context default (accepted: tsi, passt, gvproxy)"
+                "MVM_NETWORKING unrecognised; falling back to per-OS default (accepted: tsi, passt, gvproxy)"
             );
             fallback
         }
@@ -383,7 +356,7 @@ impl LibkrunBuilderVm {
             );
         }
 
-        krun = apply_networking_mode(krun, &vm_state_dir, self.image_override.is_some())?;
+        krun = apply_networking_mode(krun, &vm_state_dir)?;
 
         let cfg = SupervisorConfig {
             krun,
@@ -640,7 +613,7 @@ impl BuilderVm for LibkrunBuilderVm {
             .add_virtio_fs("job", path_to_str(&job_dir, "job_dir")?)
             .add_vsock_port(mvm_guest::builder_agent::BUILDER_DISPATCH_PORT);
 
-        krun = apply_networking_mode(krun, &vm_state_dir, self.image_override.is_some())?;
+        krun = apply_networking_mode(krun, &vm_state_dir)?;
 
         // 8. Drive the supervisor: pipe `SupervisorConfig` to
         //    stdin and **wait** for the child to exit. Unlike
@@ -1831,112 +1804,44 @@ mod tests {
         // SAFETY: tests guarded by ENV_LOCK; env mutation in test
         // process is fine when serialized.
         unsafe {
-            // Steady-state context (is_stage0 = false): default is
-            // per-OS — macOS → Gvproxy, others → Passt (Plan 88).
+            // Plan 88: default is per-OS — macOS → Gvproxy, others → Passt.
             std::env::remove_var("MVM_NETWORKING");
-            assert_eq!(
-                resolve_networking_mode(false),
-                default_networking_mode(false)
-            );
+            assert_eq!(resolve_networking_mode(), default_networking_mode());
 
             std::env::set_var("MVM_NETWORKING", "tsi");
-            assert_eq!(resolve_networking_mode(false), NetworkingPreference::Tsi);
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
 
             std::env::set_var("MVM_NETWORKING", "TSI");
-            assert_eq!(resolve_networking_mode(false), NetworkingPreference::Tsi);
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
 
             std::env::set_var("MVM_NETWORKING", " passt ");
-            assert_eq!(resolve_networking_mode(false), NetworkingPreference::Passt);
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
 
             std::env::set_var("MVM_NETWORKING", "GVPROXY");
-            assert_eq!(
-                resolve_networking_mode(false),
-                NetworkingPreference::Gvproxy
-            );
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Gvproxy);
 
             std::env::set_var("MVM_NETWORKING", " gvproxy ");
-            assert_eq!(
-                resolve_networking_mode(false),
-                NetworkingPreference::Gvproxy
-            );
+            assert_eq!(resolve_networking_mode(), NetworkingPreference::Gvproxy);
 
             std::env::set_var("MVM_NETWORKING", "");
-            assert_eq!(
-                resolve_networking_mode(false),
-                default_networking_mode(false)
-            );
+            assert_eq!(resolve_networking_mode(), default_networking_mode());
 
-            // Unknown value falls back to the per-context default without panic.
+            // Unknown value falls back to the per-OS default without panic.
             std::env::set_var("MVM_NETWORKING", "vmnet-helper");
-            assert_eq!(
-                resolve_networking_mode(false),
-                default_networking_mode(false)
-            );
+            assert_eq!(resolve_networking_mode(), default_networking_mode());
 
             std::env::remove_var("MVM_NETWORKING");
         }
     }
 
     #[test]
-    fn default_networking_mode_matches_host_os_for_steady_state() {
+    fn default_networking_mode_matches_host_os() {
         let expected = if cfg!(target_os = "macos") {
             NetworkingPreference::Gvproxy
         } else {
             NetworkingPreference::Passt
         };
-        assert_eq!(default_networking_mode(false), expected);
-    }
-
-    /// Plan 91 / ADR-056: Stage 0 defaults to TSI on every host —
-    /// the ur-seed's pre-staged closure means no substituter fetch
-    /// is needed, and TSI sidesteps the release-frozen ur-seed
-    /// `mvm-builder-init`'s networking-stack surface.
-    #[test]
-    fn default_networking_mode_stage0_is_tsi() {
-        assert_eq!(default_networking_mode(true), NetworkingPreference::Tsi);
-    }
-
-    /// Plan 91 / ADR-056: with `MVM_NETWORKING` unset, Stage 0
-    /// resolves to TSI (regardless of host OS). Steady-state still
-    /// honours the per-OS default.
-    #[test]
-    fn resolve_networking_mode_stage0_defaults_to_tsi() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: ENV_LOCK serializes env mutation.
-        unsafe {
-            std::env::remove_var("MVM_NETWORKING");
-            assert_eq!(resolve_networking_mode(true), NetworkingPreference::Tsi);
-            // Cross-check: same env state, but steady-state context
-            // still picks the per-OS gateway. Proves the only thing
-            // that flipped is the Stage 0 branch.
-            assert_eq!(
-                resolve_networking_mode(false),
-                default_networking_mode(false)
-            );
-        }
-    }
-
-    /// Plan 91 / ADR-056: `MVM_NETWORKING` always wins. A contributor
-    /// debugging the steady-state networking path against an
-    /// ur-seed-backed Stage 0 boot can set `MVM_NETWORKING=gvproxy`
-    /// and get the previous behaviour back.
-    #[test]
-    fn resolve_networking_mode_env_overrides_stage0_default() {
-        let _guard = ENV_LOCK.lock().unwrap();
-        // SAFETY: ENV_LOCK serializes env mutation.
-        unsafe {
-            std::env::set_var("MVM_NETWORKING", "gvproxy");
-            assert_eq!(resolve_networking_mode(true), NetworkingPreference::Gvproxy);
-
-            std::env::set_var("MVM_NETWORKING", "passt");
-            assert_eq!(resolve_networking_mode(true), NetworkingPreference::Passt);
-
-            // Explicit `tsi` keeps Stage 0 on TSI — same as the new default.
-            std::env::set_var("MVM_NETWORKING", "tsi");
-            assert_eq!(resolve_networking_mode(true), NetworkingPreference::Tsi);
-
-            std::env::remove_var("MVM_NETWORKING");
-        }
+        assert_eq!(default_networking_mode(), expected);
     }
 
     #[test]
