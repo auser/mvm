@@ -677,6 +677,24 @@ mod linux {
             }
         }
 
+        // Plan 88 W5: bring eth0 admin-up before udhcpc tries to
+        // broadcast. libkrun's virtio-net device registers eth0 in
+        // the IFF state the kernel boots it in (admin-down for ARM
+        // virt boards by default); without this, udhcpc's first
+        // `sendto()` returns ENETDOWN and the daemon spins on
+        // "Network is down, reopening socket" until the build times
+        // out. busybox `ip link set eth0 up` is the minimal fix.
+        // Failure is non-fatal: if `eth0` is missing entirely (TSI
+        // mode) udhcpc will error out on its own and we surface that.
+        if let Err(e) = Command::new("/sbin/ip")
+            .args(["link", "set", "eth0", "up"])
+            .status()
+        {
+            eprintln!(
+                "mvm-builder-init: ip link set eth0 up: {e} (continuing — udhcpc may still try)"
+            );
+        }
+
         // Plan 87 W4: when /etc/udhcpc/default.script exists (passt
         // path / ur-seed-built rootfs), use it so the DHCP lease
         // writes /run/resolv.conf with the leased DNS. Older rootfs
