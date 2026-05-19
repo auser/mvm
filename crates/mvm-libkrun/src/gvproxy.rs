@@ -219,11 +219,16 @@ pub fn spawn(scratch_dir: &Path) -> Result<GvproxyHandle, GvproxyError> {
         .arg(OsString::from(&log_path))
         .arg("-ssh-port")
         .arg(ssh_port.to_string())
-        // Redirect stdout/stderr to /dev/null — gvproxy's `-log-file`
-        // captures what we need and any spillover noise on stderr
-        // pollutes the supervisor's own diagnostic stream.
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null());
+        // Inherit stdout/stderr so gvproxy's startup-failure mode (e.g.
+        // "listen tcp 127.0.0.1:<port>: bind: address already in use" when
+        // another gvproxy still holds the SSH-forward port) is visible
+        // to the operator. `-log-file` only writes once gvproxy is past
+        // arg-parse and listener setup — pre-listen failures go to stderr
+        // only, so dropping them to /dev/null leaves the supervisor
+        // reporting a bare "exited before listener appeared" with no
+        // underlying reason.
+        .stdout(std::process::Stdio::inherit())
+        .stderr(std::process::Stdio::inherit());
 
     let mut child = cmd.spawn().map_err(GvproxyError::Spawn)?;
 
