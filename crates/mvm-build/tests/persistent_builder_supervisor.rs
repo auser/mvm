@@ -1,0 +1,266 @@
+//! Plan 89 W3 part 1 — integration tests for
+//! `PersistentBuilderSupervisor`.
+//!
+//! These live in `tests/` (not inline in `persistent_builder.rs::tests`)
+//! because they need server-binding patterns to simulate the
+//! guest's dispatch loop end of the libkrun-managed Unix socket.
+//! The architecture invariant grep in
+//! `.github/workflows/architecture.yml` scans `crates/*/src/`
+//! for server-binding patterns and deliberately excludes
+//! `**/tests/**` for mock scaffolding like this.
+
+use std::os::unix::net::UnixListener;
+use std::path::Path;
+use std::time::Duration;
+
+use mvm_build::builder_protocol::{
+    BootTimingsWire, BuilderRequest, BuilderResponse, JobId, JobTimings,
+};
+use mvm_build::builder_vm::BuilderJob;
+use mvm_build::persistent_builder::{
+    DispatchOutcome, PersistentBuilderError, PersistentBuilderSupervisor, dispatch_socket_path,
+};
+
+/// Spawn a fake guest dispatch loop on `socket_path`. The closure
+/// is invoked with each accepted connection and is responsible for
+/// reading any incoming `BuilderRequest`, writing responses, and
+/// dropping the stream. Returns the listener thread handle —
+/// callers `join` after asserting the supervisor outcome.
+fn spawn_fake_guest<F>(socket_path: &Path, handler: F) -> std::thread::JoinHandle<()>
+where
+    F: FnOnce(std::os::unix::net::UnixStream) + Send + 'static,
+{
+    let listener = UnixListener::bind(socket_path).expect("bind unix socket");
+    std::thread::spawn(move || {
+        let (conn, _) = listener.accept().expect("accept");
+        handler(conn);
+    })
+}
+
+fn sample_boot_timings() -> BootTimingsWire {
+    BootTimingsWire {
+        init_start_ms: Some(0),
+        pseudofs_ready_ms: Some(11),
+        nix_device_ready_ms: Some(15),
+        nix_seeded_ms: None,
+        nix_mounted_ms: Some(180),
+        modules_ready_ms: Some(25),
+        virtiofs_ready_ms: Some(35),
+        network_ready_ms: Some(190),
+        job_start_ms: Some(200),
+        job_end_ms: Some(1200),
+        poweroff_start_ms: Some(1210),
+    }
+}
+
+#[test]
+fn submit_round_trips_request_and_result_with_no_stderr_chunks() {
+    // Happy path: supervisor sends Run, guest immediately sends
+    // back Result with exit_code=0, no stderr stream.
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let socket = dispatch_socket_path(scratch.path());
+
+    let guest = spawn_fake_guest(&socket, |mut conn| {
+        let request: BuilderRequest =
+            mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        let job_id = match &request {
+            BuilderRequest::Run { job_id, .. } => *job_id,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        let response = BuilderResponse::Result {
+            job_id,
+            exit_code: 0,
+            stderr_tail: String::new(),
+            boot_timings: Some(Box::new(sample_boot_timings())),
+            job_timings: JobTimings {
+                dispatch_ms: 1,
+                build_ms: 1000,
+                teardown_ms: 5,
+            },
+        };
+        mvm_guest::vsock::write_frame(&mut conn, &response).expect("write response");
+    });
+
+    let supervisor =
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+
+    let outcome = supervisor
+        .submit(
+            BuilderJob::Flake {
+                flake_ref: "path:/work".to_string(),
+                attr_path: "packages.aarch64-linux.default".to_string(),
+            },
+            "00000000-0000-0000-0000-000000000000".to_string(),
+        )
+        .expect("submit");
+
+    guest.join().expect("guest");
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(outcome.stderr_chunks.len(), 0);
+    assert_eq!(outcome.job_timings.build_ms, 1000);
+    assert!(outcome.boot_timings.is_some());
+}
+
+#[test]
+fn submit_streams_stderr_chunks_then_collects_terminating_result() {
+    // Realistic path: guest streams several StderrChunk frames
+    // before the Result. Supervisor must accumulate them in
+    // `outcome.stderr_chunks` in order.
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let socket = dispatch_socket_path(scratch.path());
+
+    let guest = spawn_fake_guest(&socket, |mut conn| {
+        let request: BuilderRequest =
+            mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        let job_id = match &request {
+            BuilderRequest::Run { job_id, .. } => *job_id,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        for line in ["building", "building 2/3", "building 3/3"] {
+            mvm_guest::vsock::write_frame(
+                &mut conn,
+                &BuilderResponse::StderrChunk {
+                    job_id,
+                    line: line.to_string(),
+                },
+            )
+            .expect("write chunk");
+        }
+        let result = BuilderResponse::Result {
+            job_id,
+            exit_code: 0,
+            stderr_tail: "building 3/3".to_string(),
+            boot_timings: None,
+            job_timings: JobTimings {
+                dispatch_ms: 0,
+                build_ms: 50,
+                teardown_ms: 0,
+            },
+        };
+        mvm_guest::vsock::write_frame(&mut conn, &result).expect("write result");
+    });
+
+    let supervisor =
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+
+    let outcome = supervisor
+        .submit(
+            BuilderJob::Flake {
+                flake_ref: "path:/work".to_string(),
+                attr_path: "packages.aarch64-linux.default".to_string(),
+            },
+            "abc".to_string(),
+        )
+        .expect("submit");
+
+    guest.join().expect("guest");
+    assert_eq!(outcome.exit_code, 0);
+    assert_eq!(
+        outcome.stderr_chunks,
+        vec![
+            "building".to_string(),
+            "building 2/3".to_string(),
+            "building 3/3".to_string()
+        ]
+    );
+    assert!(outcome.boot_timings.is_none());
+}
+
+#[test]
+fn submit_returns_premature_eof_when_guest_closes_without_result() {
+    // Guest accepts the connection, reads the Run, then closes
+    // without sending Result. Common crash signature; supervisor
+    // surfaces PrematureEof so the caller can decide whether to
+    // retry or fall back.
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let socket = dispatch_socket_path(scratch.path());
+
+    let guest = spawn_fake_guest(&socket, |mut conn| {
+        let _: BuilderRequest = mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        // Drop conn -> EOF.
+    });
+
+    let supervisor =
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+
+    let err = supervisor
+        .submit(
+            BuilderJob::Flake {
+                flake_ref: "path:/work".to_string(),
+                attr_path: "packages.aarch64-linux.default".to_string(),
+            },
+            "abc".to_string(),
+        )
+        .expect_err("must error on premature EOF");
+
+    guest.join().expect("guest");
+    match err {
+        PersistentBuilderError::PrematureEof { chunks } => assert_eq!(chunks, 0),
+        other => panic!("expected PrematureEof, got {other:?}"),
+    }
+}
+
+#[test]
+fn submit_detects_job_id_mismatch_in_result() {
+    // Guest dispatch loop bug: response carries a different job_id
+    // than the request. Hard failure — supervisor must not silently
+    // accept the misattributed result.
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let socket = dispatch_socket_path(scratch.path());
+
+    let guest = spawn_fake_guest(&socket, |mut conn| {
+        let _: BuilderRequest = mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        let bogus = BuilderResponse::Result {
+            job_id: JobId::new(),
+            exit_code: 0,
+            stderr_tail: String::new(),
+            boot_timings: None,
+            job_timings: JobTimings::default(),
+        };
+        mvm_guest::vsock::write_frame(&mut conn, &bogus).expect("write bogus");
+    });
+
+    let supervisor =
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+
+    let err = supervisor
+        .submit(
+            BuilderJob::Flake {
+                flake_ref: "path:/work".to_string(),
+                attr_path: "packages.aarch64-linux.default".to_string(),
+            },
+            "abc".to_string(),
+        )
+        .expect_err("must reject job_id mismatch");
+
+    guest.join().expect("guest");
+    assert!(matches!(err, PersistentBuilderError::JobIdMismatch { .. }));
+}
+
+#[test]
+fn shutdown_writes_shutdown_request_and_consumes_bye() {
+    // Lifecycle path: caller invokes shutdown(); supervisor sends
+    // BuilderRequest::Shutdown; guest replies with Bye; supervisor
+    // returns cleanly.
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let socket = dispatch_socket_path(scratch.path());
+
+    let guest = spawn_fake_guest(&socket, |mut conn| {
+        let request: BuilderRequest =
+            mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        assert!(matches!(request, BuilderRequest::Shutdown {}));
+        mvm_guest::vsock::write_frame(&mut conn, &BuilderResponse::Bye {}).expect("write bye");
+    });
+
+    let supervisor =
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+
+    supervisor.shutdown().expect("shutdown");
+    guest.join().expect("guest");
+}
+
+// Suppress the unused-import warning when running under feature
+// gates that don't actually pull DispatchOutcome — keeps clippy
+// silent without `#[allow]`.
+#[allow(dead_code)]
+fn _force_use(_: DispatchOutcome) {}

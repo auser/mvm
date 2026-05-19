@@ -13,6 +13,11 @@ pub mod firecracker;
 /// wrapper around kernel + rootfs + verity sidecars + cmdline,
 /// with an Ed25519-signed manifest that hashes every payload.
 pub mod packed_artifact;
+/// Plan 89 W3 part 1 — host-side scaffold for the persistent
+/// builder VM's dispatch supervisor. Spawning the actual libkrun
+/// VM lives in W3 part 2 (`LibkrunPersistentBuilderVm`); this
+/// module owns the dispatch wire over the socket libkrun creates.
+pub mod persistent_builder;
 /// Plan 85 Phase B — OCI-unpacked tree to ext4 rootfs image.
 /// The host only allocates the sparse file; formatting and copying
 /// happen inside the existing builder VM.
