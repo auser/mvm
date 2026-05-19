@@ -552,12 +552,22 @@ impl crate::builder_vm::BuilderVm for PersistentBuilderVm {
     ) -> Result<crate::builder_vm::BuilderArtifacts, crate::builder_vm::BuilderVmError> {
         use crate::builder_vm::{BuilderArtifacts, BuilderJob, BuilderVmError};
 
+        // Plan 89 W3 part 8 — Install variant routes through the
+        // same dispatch wire but stages the install spec instead
+        // of a cmd.sh, and the guest's run_install_job_at writes
+        // sealed-volume sidecars (result.json + content/ + sbom +
+        // fetch.log + cve.json) into the per-dispatch out/ dir.
+        // Host reads them back via finalize_install_dispatch.
+        if let BuilderJob::Install { spec_path } = job {
+            return self.run_install_dispatch(spec_path, mounts);
+        }
+
         let (flake_ref, attr_path) = match job {
             BuilderJob::Flake {
                 flake_ref,
                 attr_path,
             } => (flake_ref.as_str(), attr_path.as_str()),
-            BuilderJob::Install { .. } => return Err(BuilderVmError::NotYetImplemented),
+            BuilderJob::Install { .. } => unreachable!("handled above"),
         };
 
         let job_id = stage_flake_dispatch_job(&self.session.job_dir, flake_ref, attr_path)
@@ -614,6 +624,121 @@ impl crate::builder_vm::BuilderVm for PersistentBuilderVm {
             accessible: None,
         })
     }
+}
+
+#[cfg(feature = "builder-vm")]
+impl PersistentBuilderVm {
+    /// Plan 89 W3 part 8 — `BuilderJob::Install` arm of
+    /// [`BuilderVm::run_build`]. Copies the host-side install spec
+    /// into a per-dispatch dir under `<session.job_dir>/<job_id>/`,
+    /// submits a `BuilderJob::Install` with the in-guest path, then
+    /// — on a clean dispatch — hands `mounts.artifact_out` to
+    /// `finalize_install_job` so the caller sees the same
+    /// `BuilderArtifacts::InstallVolume` shape the single-shot path
+    /// returns.
+    fn run_install_dispatch(
+        &self,
+        host_spec_path: &Path,
+        mounts: &crate::builder_vm::BuilderMounts,
+    ) -> Result<crate::builder_vm::BuilderArtifacts, crate::builder_vm::BuilderVmError> {
+        use crate::builder_vm::{BuilderArtifacts, BuilderJob, BuilderVmError};
+
+        let job_id =
+            stage_install_dispatch_job(&self.session.job_dir, host_spec_path).map_err(|e| {
+                BuilderVmError::ExtractionFailed(format!(
+                    "staging persistent install dispatch job: {e}"
+                ))
+            })?;
+
+        // The in-guest spec path the dispatch loop reads.
+        // `<JOB_DIR>/<job_id>/install_spec.json` where JOB_DIR=`/job`
+        // is the convention `mvm-builder-init`'s dispatch loop
+        // resolves against.
+        let in_guest_spec_path = PathBuf::from(format!("/job/{}/install_spec.json", job_id));
+
+        let supervisor = PersistentBuilderSupervisor::new(&self.session.dispatch_socket_path)
+            .with_frame_read_timeout(Duration::from_secs(60));
+        let outcome = supervisor
+            .submit(
+                BuilderJob::Install {
+                    spec_path: in_guest_spec_path,
+                },
+                job_id.clone(),
+            )
+            .map_err(|e| BuilderVmError::NixBuildFailed(format!("persistent dispatch: {e}")))?;
+        if outcome.exit_code != 0 {
+            return Err(BuilderVmError::NixBuildFailed(format!(
+                "persistent install dispatch exit {} — stderr tail:\n{}",
+                outcome.exit_code, outcome.stderr_tail
+            )));
+        }
+
+        // The guest wrote result.json + sealed-volume sidecars into
+        // <session.job_dir>/<job_id>/out/. Copy the whole dir into
+        // mounts.artifact_out so the downstream finalize_install_job
+        // (Plan 73 Followup B.2) reads from the canonical path the
+        // single-shot caller hands it.
+        let dispatch_out_dir = artifact_dir_for(&self.session.job_dir, &job_id);
+        std::fs::create_dir_all(&mounts.artifact_out).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating {}: {e}",
+                mounts.artifact_out.display()
+            ))
+        })?;
+        copy_dir_recursive(&dispatch_out_dir, &mounts.artifact_out).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "copying install artifacts {} → {}: {e}",
+                dispatch_out_dir.display(),
+                mounts.artifact_out.display()
+            ))
+        })?;
+
+        Ok(BuilderArtifacts::InstallVolume {
+            volume_dir: mounts.artifact_out.clone(),
+            result_json_path: mounts.artifact_out.join("result.json"),
+        })
+    }
+}
+
+/// Stage a per-dispatch install job under `<session_job_dir>/<job_id>/`:
+/// create the out/ subdir (mirror of [`stage_flake_dispatch_job`]'s
+/// convention) and copy the caller's install spec into
+/// `<job_id>/install_spec.json`. Returns the `job_id` the host passes
+/// as `BuilderRequest::Run::job_dir_relpath`.
+#[cfg(feature = "builder-vm")]
+fn stage_install_dispatch_job(
+    session_job_dir: &Path,
+    host_spec_path: &Path,
+) -> std::io::Result<String> {
+    let job_id = uuid::Uuid::new_v4().to_string();
+    let sub = session_job_dir.join(&job_id);
+    let artifact_dir = sub.join(ARTIFACT_SUBDIR);
+    std::fs::create_dir_all(&artifact_dir)?;
+    let dst_spec = sub.join("install_spec.json");
+    std::fs::copy(host_spec_path, &dst_spec)?;
+    Ok(job_id)
+}
+
+/// Cheap recursive copy. Used by the install dispatch to move the
+/// per-dispatch out/ contents into the caller's
+/// `mounts.artifact_out` so the downstream `finalize_install_job`
+/// (single-shot path) sees the same shape it would for a fresh-
+/// VM build. Doesn't try to be clever about symlinks — the install
+/// pipeline emits plain files + dirs.
+#[cfg(feature = "builder-vm")]
+fn copy_dir_recursive(src: &Path, dst: &Path) -> std::io::Result<()> {
+    std::fs::create_dir_all(dst)?;
+    for entry in std::fs::read_dir(src)? {
+        let entry = entry?;
+        let entry_dst = dst.join(entry.file_name());
+        let ty = entry.file_type()?;
+        if ty.is_dir() {
+            copy_dir_recursive(&entry.path(), &entry_dst)?;
+        } else if ty.is_file() {
+            std::fs::copy(entry.path(), &entry_dst)?;
+        }
+    }
+    Ok(())
 }
 
 #[cfg(test)]
@@ -782,5 +907,59 @@ mod tests {
         );
         assert_eq!(extract_nix_store_hash("/nix/store/-bad"), None);
         assert_eq!(extract_nix_store_hash("not-a-store-path"), None);
+    }
+
+    // -----------------------------------------------------------
+    // Plan 89 W3 part 8 — install dispatch helpers
+    // -----------------------------------------------------------
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn stage_install_dispatch_job_copies_spec_and_creates_out_dir() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let session_job_dir = scratch.path().join("session");
+        std::fs::create_dir_all(&session_job_dir).unwrap();
+
+        // Caller's host-side spec: pin the bytes so we can assert
+        // the copy is byte-identical.
+        let host_spec_path = scratch.path().join("source-spec.json");
+        let spec_body = br#"{"language":"python","lockfile_relative_path":"uv.lock","source_mount":"/work","gate":"prod"}"#;
+        std::fs::write(&host_spec_path, spec_body).unwrap();
+
+        let job_id = stage_install_dispatch_job(&session_job_dir, &host_spec_path).expect("stage");
+
+        let staged_spec = session_job_dir.join(&job_id).join("install_spec.json");
+        assert!(staged_spec.is_file(), "{}", staged_spec.display());
+        let staged_body = std::fs::read(&staged_spec).unwrap();
+        assert_eq!(&staged_body, spec_body);
+
+        let out_dir = artifact_dir_for(&session_job_dir, &job_id);
+        assert!(out_dir.is_dir(), "expected out/ at {}", out_dir.display());
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn copy_dir_recursive_copies_files_and_subdirs() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let src = scratch.path().join("src");
+        let dst = scratch.path().join("dst");
+        std::fs::create_dir_all(src.join("nested")).unwrap();
+        std::fs::write(src.join("a.txt"), b"alpha").unwrap();
+        std::fs::write(src.join("nested/b.txt"), b"beta").unwrap();
+
+        copy_dir_recursive(&src, &dst).expect("copy");
+
+        assert_eq!(std::fs::read(dst.join("a.txt")).unwrap(), b"alpha");
+        assert_eq!(std::fs::read(dst.join("nested/b.txt")).unwrap(), b"beta");
+    }
+
+    #[cfg(feature = "builder-vm")]
+    #[test]
+    fn copy_dir_recursive_rejects_missing_src() {
+        let scratch = tempfile::tempdir().expect("tempdir");
+        let src = scratch.path().join("does-not-exist");
+        let dst = scratch.path().join("dst");
+        let err = copy_dir_recursive(&src, &dst).expect_err("missing src");
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
     }
 }
