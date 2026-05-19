@@ -1,6 +1,6 @@
 # ADR-055 — libkrun networking via passt + virtio-net
 
-**Status:** accepted 2026-05-19, implements Plan 87. Default flipped from TSI → Passt by Plan 87 W5 / PR3 (this PR).
+**Status:** accepted 2026-05-19, implements Plan 87. Default flipped from TSI → Passt by Plan 87 W5 / PR3. **Amended 2026-05-19 by Plan 88** to add gvproxy as the macOS backend (passt is Linux-only — see §"Cross-platform backends" below).
 
 ## Context
 
@@ -129,12 +129,113 @@ explicit shares") is unaffected: passt doesn't see the guest's
 filesystem, only its virtio-net frames. Claim 9 (deps-volume
 hash-lock + audit) is unaffected for the same reason.
 
+### New untrusted-input surfaces introduced by Plan 87 (Plan 88 W6 amendment)
+
+Moving from TSI to virtio-net opens three new host-side parsing
+boundaries that didn't exist under TSI's syscall-hijack model. All
+three run as the contributor's user (not root), so a successful
+exploit is a code-execution-as-user boundary — not a host-kernel
+boundary. None has filesystem visibility into the guest. But each is
+a new fuzzing target:
+
+1. **libkrun's virtio-net device emulator.** Parses virtio
+   descriptors the guest writes to the virtqueue. Same class of risk
+   QEMU / Firecracker / Cloud Hypervisor virtio implementations have
+   carried for years.
+2. **passt's frame parser** (Linux). C code dealing with raw
+   Ethernet/IP/TCP/UDP/ICMP frames the guest sends. Well-audited by
+   Red Hat security; not invulnerable.
+3. **gvproxy's frame parser** (macOS / cross-platform). Go code, so
+   memory-safety bugs are rare, but logic bugs in its DHCP server,
+   TCP state machine, and ICMP responder remain possible.
+
+Plan 88 W6 closes the fuzzing gap by adding `cargo-fuzz` targets at
+`crates/mvm-libkrun/fuzz/{fuzz_virtio_net_frame, fuzz_passt_frame,
+fuzz_gvproxy_frame}.rs`, wiring them into the CI security lane
+alongside the existing `fuzz_guest_request` and
+`fuzz_authenticated_frame`. CLAUDE.md security claim 5 ("vsock
+framing is fuzzed") is extended to "vsock + virtio-net framing is
+fuzzed."
+
+### `mvm-egress-proxy` becomes load-bearing
+
+ADR-055 v1 already noted this, but it's worth flagging again as part
+of the Plan 88 amendment:
+
+- Under TSI, AF_INET socket calls were hijacked at the syscall
+  layer. A workload couldn't bypass the egress allowlist because
+  there was no Linux network stack in the guest to bypass through.
+  `mvm-egress-proxy` (Plan 73 Followup B.2.x / ADR-047) was
+  defense-in-depth.
+- Under virtio-net (passt or gvproxy), the guest's real Linux
+  network stack is the path. A workload that ignores `HTTPS_PROXY`
+  / `HTTP_PROXY` env vars can open raw sockets directly to any
+  destination passt/gvproxy will forward to. The in-VM iptables
+  uid-owner rules `mvm-builder-init::install_egress_lockdown`
+  installs are the only thing preventing bypass.
+
+The policy layer (`mvm-egress-proxy` + iptables uid-owner) is
+unchanged; what changed is its load-bearing status. ADR-047's
+threat model still applies; production microVMs running untrusted
+workloads still need the egress proxy active.
+
+## Cross-platform backends (Plan 88 amendment, 2026-05-19)
+
+ADR-055 v1 (above) assumed `passt` was cross-platform. End-to-end
+smoke after Plan 87 PR3 merged surfaced the gap:
+
+```
+$ brew install passt
+passt: Linux is required for this software.
+```
+
+`passt` uses Linux-specific syscalls (`vmsplice`, namespace
+primitives, `splice`) that have no macOS equivalents — the Homebrew
+formula refuses to build it. Since macOS is mvm's Tier 1
+contributor host, this fail-closes every fresh `dev up` on the
+platform the work was meant to fix.
+
+libkrun's C API anticipates the asymmetry: `libkrun.h` ships **two**
+virtio-net backend functions in parallel:
+
+| libkrun call                  | Userspace backend(s)              | Socket type | Cross-platform? |
+| ----------------------------- | --------------------------------- | ----------- | --------------- |
+| `krun_add_net_unixstream`     | `passt` (Linux), `socket_vmnet` (macOS) | unixstream | No, per-backend |
+| `krun_add_net_unixgram`       | `gvproxy`, `vmnet-helper`         | unixgram   | gvproxy: yes; vmnet-helper: macOS |
+
+The slp/krun Homebrew tap (`brew install slp/krun/{libkrun, libkrunfw,
+gvproxy}`) is the canonical macOS install path. gvproxy is the
+libkrun maintainers' documented macOS backend — same project that
+ships libkrun + libkrunfw.
+
+**Resolution (Plan 88):** mvm dispatches the network backend per OS:
+
+- Linux → `passt` via `krun_add_net_unixstream`
+- macOS → `gvproxy` via `krun_add_net_unixgram` (path-based listener
+  instead of fd-passed)
+
+`MVM_NETWORKING={tsi, passt, gvproxy}` remains the explicit override.
+Unset → the per-OS default. `passt` on macOS still fail-closes (the
+binary doesn't exist), but the user gets a clear error rather than a
+silent regression — `mvmctl doctor` flags the missing dep with the
+right install hint per platform.
+
+Both backends share the same threat model: a userspace process
+running as the contributor's user, no privileged sockets, no host-fs
+visibility into the guest. The libkrun-end of the virtio-net frame
+transport is identical at the guest kernel layer; only the host-side
+plumbing differs.
+
 ## References
 
 - Plan 87 — `specs/plans/87-passt-virtio-net.md`
+- Plan 88 — `specs/plans/88-gvproxy-macos-backend.md` (the
+  cross-platform amendment above)
 - Plan 86 — `specs/plans/86-ur-seed-stage0-bootstrap.md`
   (end-to-end smoke that exposed TSI's edge cases)
 - Plan 72 W5.D — the prior round of libkrun debugging notes
 - libkrun upstream: https://github.com/containers/libkrun
 - passt upstream: https://passt.top/
-- libkrun's `krun_set_passt_fd` API documented in `libkrun.h`
+- gvproxy upstream: https://github.com/containers/gvisor-tap-vsock
+- libkrun's `krun_add_net_unixstream` / `krun_add_net_unixgram`
+  APIs documented in `libkrun.h`
