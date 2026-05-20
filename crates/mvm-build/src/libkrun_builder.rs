@@ -1417,8 +1417,7 @@ fn spawn_supervisor_in_background(
     // overriding dyld's normal search order.
     #[cfg(target_os = "macos")]
     {
-        let mut fallback =
-            std::env::var("DYLD_FALLBACK_LIBRARY_PATH").unwrap_or_default();
+        let mut fallback = std::env::var("DYLD_FALLBACK_LIBRARY_PATH").unwrap_or_default();
         for path in ["/opt/homebrew/lib", "/usr/local/lib"] {
             if !fallback.split(':').any(|p| p == path) {
                 if !fallback.is_empty() {
