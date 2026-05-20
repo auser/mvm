@@ -83,13 +83,40 @@ let
     "NLS" "NLS_UTF8" "NLS_ASCII"
   ];
 
-  # Features tinyconfig leaves on (or that `make olddefconfig` would
-  # propagate in) and we explicitly do not want.
+  # Features `make defconfig` enables (or that `make olddefconfig` would
+  # propagate in) and we explicitly do not want. `make defconfig` for
+  # arm64 is the multi-platform vendor defconfig — it enables every
+  # SoC family upstream supports, so the disables list has to be
+  # aggressive to keep the build slim. Plan 95 §W3 — derive
+  # additions empirically from `nix build .#kernel-configfile`.
   disables = [
     "MODULES"        # everything built-in; no /lib/modules tree
     "MODULE_SIG"     # NOP without MODULES; explicit
     "IPV6"           # builder VM has no v6 path
+
+    # Userspace-visible classes we don't need.
     "DRM" "SOUND" "USB" "WIRELESS" "BT" "FB"
+
+    # Plan 95 §W3 — ARM64 SoC platform clusters. We boot only under
+    # libkrun (Apple Silicon virt) or Firecracker (Linux KVM virt) —
+    # never real SoC hardware. Disabling each parent symbol cascades
+    # to its PCIe host controllers, irqchip, clk, pinctrl, and SoC
+    # support drivers via `olddefconfig`. Leave `ARCH_VIRT` enabled.
+    "ARCH_ACTIONS" "ARCH_AGILEX5" "ARCH_ALPINE" "ARCH_APPLE"
+    "ARCH_BCM" "ARCH_BCM_IPROC" "ARCH_BCM2835" "ARCH_BCMBCA"
+    "ARCH_BERLIN" "ARCH_BRCMSTB" "ARCH_EXYNOS" "ARCH_HISI"
+    "ARCH_INTEL_SOCFPGA" "ARCH_K3" "ARCH_KEEMBAY" "ARCH_LAYERSCAPE"
+    "ARCH_LG1K" "ARCH_MEDIATEK" "ARCH_MESON" "ARCH_MMP"
+    "ARCH_MVEBU" "ARCH_NPCM" "ARCH_NXP" "ARCH_PENSANDO" "ARCH_QCOM"
+    "ARCH_REALTEK" "ARCH_RENESAS" "ARCH_ROCKCHIP" "ARCH_S32"
+    "ARCH_S5PV210" "ARCH_SEATTLE" "ARCH_SPRD" "ARCH_STM32"
+    "ARCH_SUNXI" "ARCH_SYNQUACER" "ARCH_TEGRA" "ARCH_TESLA_FSD"
+    "ARCH_THUNDER" "ARCH_THUNDER2" "ARCH_UNIPHIER" "ARCH_VEXPRESS"
+    "ARCH_VISCONTI" "ARCH_XGENE" "ARCH_ZYNQMP"
+
+    # Storage / device classes that have no virtio path.
+    "MTD" "PARPORT" "ATA" "SCSI" "INFINIBAND"
+    "STAGING" "MEDIA_SUPPORT"
   ];
 
   # `runCommandCC` (rather than `runCommand`) so the derivation runs
