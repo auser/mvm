@@ -251,6 +251,8 @@ dev-feature guest agent; production guests should use `mvmctl invoke`.
 |---------|-------------|
 | `mvmctl run -- <cmd>...` | Boot the bundled default microVM image, run `<cmd>`, exit |
 | `mvmctl run --manifest <name-or-path> -- <cmd>...` | Boot a registered manifest/template instead of the default |
+| `mvmctl run --image <ref> -- <cmd>...` | Pull or reuse a cached OCI image, boot its materialized `rootfs.ext4`, run `<cmd>`, exit |
+| `mvmctl run --image <ref> --prod -- <cmd>...` | Production OCI-image policy: require `<ref>` to be digest-pinned before pull or boot |
 | `mvmctl run --profile standard -- <cmd>` | Default profile: explicit env is allowed; host shares must be read-only |
 | `mvmctl run --profile restrictive -- <cmd>` | No env injection and no host directory shares |
 | `mvmctl run --profile dev --add-dir .:/work:rw -- <cmd>` | Dev profile: permits writable host shares for local iteration |

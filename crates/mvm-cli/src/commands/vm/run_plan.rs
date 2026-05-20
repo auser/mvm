@@ -334,6 +334,7 @@ mod tests {
     fn base_run_args() -> RunArgs {
         RunArgs {
             manifest: None,
+            image: None,
             cpus: 2,
             memory: "512M".to_string(),
             profile: RunProfile::Standard,

@@ -77,7 +77,7 @@ fn schema_version() -> u32 {
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
-struct CachedOciImage {
+pub(in crate::commands) struct CachedOciImage {
     reference: String,
     registry: String,
     repository: String,
@@ -93,6 +93,14 @@ struct CachedOciImage {
     claims_path: Option<String>,
     #[serde(default)]
     layers: Vec<CachedOciLayer>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(in crate::commands) struct ResolvedOciRunImage {
+    pub reference: String,
+    pub resolved_digest: String,
+    pub rootfs_path: PathBuf,
+    pub pulled: bool,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -194,8 +202,48 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     }
 }
 
-fn oci_cache_root() -> PathBuf {
+pub(in crate::commands) fn oci_cache_root() -> PathBuf {
     PathBuf::from(mvm_core::config::mvm_cache_dir()).join("oci")
+}
+
+pub(in crate::commands) fn resolve_or_pull_run_image(
+    cache_root: &Path,
+    reference: &str,
+    prod: bool,
+) -> Result<ResolvedOciRunImage> {
+    let image_ref: ImageReference = reference.parse()?;
+    if prod && !image_ref.is_digest_pinned() {
+        bail!("mvmctl run --image --prod requires a digest-pinned reference");
+    }
+    let canonical = image_ref.canonical();
+    let (image, pulled) = match load_index(cache_root)
+        .ok()
+        .and_then(|index| find_image(&index, &canonical).cloned())
+    {
+        Some(cached) if cached.rootfs_path.is_some() => (cached, false),
+        _ => (pull_image_ref(cache_root, image_ref)?, true),
+    };
+    let Some(rootfs_relative) = image.rootfs_path.as_deref() else {
+        bail!(
+            "cached OCI image {} has no materialized rootfs; run `mvmctl image pull {}` first",
+            image.reference,
+            image.reference
+        );
+    };
+    let rootfs_path = safe_cache_path(cache_root, rootfs_relative)?;
+    if !rootfs_path.is_file() {
+        bail!(
+            "cached OCI image {} rootfs is missing at {}",
+            image.reference,
+            rootfs_path.display()
+        );
+    }
+    Ok(ResolvedOciRunImage {
+        reference: image.reference,
+        resolved_digest: image.resolved_digest,
+        rootfs_path,
+        pulled,
+    })
 }
 
 fn pull_image(cache_root: &Path, reference: &str, prod: bool) -> Result<CachedOciImage> {
@@ -203,7 +251,10 @@ fn pull_image(cache_root: &Path, reference: &str, prod: bool) -> Result<CachedOc
     if prod && !image_ref.is_digest_pinned() {
         bail!("mvmctl image pull --prod requires a digest-pinned reference");
     }
+    pull_image_ref(cache_root, image_ref)
+}
 
+fn pull_image_ref(cache_root: &Path, image_ref: ImageReference) -> Result<CachedOciImage> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -822,6 +873,43 @@ mod tests {
                 .contains("requires a digest-pinned reference"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn prod_run_image_requires_digest_pin_before_network() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let err = resolve_or_pull_run_image(tmp.path(), "docker.io/library/alpine:3.20", true)
+            .expect_err("mutable prod run image must fail before registry access");
+        assert!(
+            err.to_string()
+                .contains("requires a digest-pinned reference"),
+            "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn resolve_run_image_uses_cached_rootfs() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let digest = "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let mut image = sample_image("docker.io/library/alpine:3.20", digest, "blobs/a");
+        image.rootfs_path = Some("rootfs/alpine/rootfs.ext4".to_string());
+        write_index(
+            tmp.path(),
+            &OciCacheIndex {
+                schema_version: 1,
+                images: vec![image],
+            },
+        );
+        write_file(tmp.path(), "rootfs/alpine/rootfs.ext4", b"rootfs");
+
+        let resolved =
+            resolve_or_pull_run_image(tmp.path(), "docker.io/library/alpine:3.20", false)
+                .expect("cached rootfs resolves");
+
+        assert_eq!(resolved.reference, "docker.io/library/alpine:3.20");
+        assert_eq!(resolved.resolved_digest, digest);
+        assert!(resolved.rootfs_path.ends_with("rootfs/alpine/rootfs.ext4"));
+        assert!(!resolved.pulled);
     }
 
     #[test]

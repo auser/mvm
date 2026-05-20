@@ -150,7 +150,7 @@ pub(in crate::commands) enum Commands {
     BootReport(vm::wait::BootReportArgs),
     /// Pack or verify signed `.mvm` artifacts
     Artifact(vm::artifact::Args),
-    /// Manage the persistent builder VM (start / submit / stop)
+    /// Manage the persistent builder VM
     #[cfg(feature = "builder-vm")]
     #[command(name = "persistent-builder")]
     PersistentBuilder(build::persistent_builder::Args),
