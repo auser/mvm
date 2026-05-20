@@ -92,7 +92,13 @@ let
     "DRM" "SOUND" "USB" "WIRELESS" "BT" "FB"
   ];
 
-  configfile = pkgs.runCommand "mvm-builder-vm-kernel-config" {
+  # `runCommandCC` (rather than `runCommand`) so the derivation runs
+  # under `stdenv` proper — gcc + binutils available on PATH for
+  # `scripts/basic/fixdep` and the rest of the kernel's host-side
+  # tooling. `runCommand` uses `stdenvNoCC` by default and would
+  # bail with `gcc: command not found` at the first `make tinyconfig`
+  # invocation.
+  configfile = pkgs.runCommandCC "mvm-builder-vm-kernel-config" {
     nativeBuildInputs = with pkgs; [
       gnumake bison flex bc perl pkg-config openssl
     ];
@@ -108,7 +114,23 @@ let
 
     export ARCH=${kernelArch}
 
-    make tinyconfig
+    # `scripts/config` ships with `#!/usr/bin/env bash` shebang.
+    # Nix sandbox has no `/usr/bin/env`. `patchShebangs` rewrites
+    # the shebang to the absolute path of the sandbox's bash.
+    patchShebangs scripts/
+
+    # Base on `defconfig` not `tinyconfig`. tinyconfig is "everything
+    # off except what the kernel literally cannot start without" —
+    # for arm64 it strips arch_timer, GIC, OF/devicetree, PL011
+    # serial, TTY, HVC_DRIVER, and the rest of the platform support
+    # libkrun's virtual hardware emits. Result: a kernel image that
+    # builds cleanly but emits zero bytes on hvc0 because nothing
+    # below the userspace stack is wired up.
+    #
+    # `defconfig` is the upstream arm64/x86_64 recommended starting
+    # point — boots on real hardware, builds in 3-5 min, and we
+    # carve it down via the `disables` list below.
+    make defconfig
 
     for s in $enableList; do
       ./scripts/config --enable "$s"
