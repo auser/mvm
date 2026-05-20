@@ -66,10 +66,14 @@ echo "stage0-init: building ${FLAKE_REF}" >&2
 # nix-portable runs nix without requiring a /nix/store or nix-daemon
 # on the guest. --no-write-lock-file lets us build against a
 # read-only workspace mount. --print-out-paths spits the result path
-# to stdout for us to copy from.
+# to stdout for us to copy from. --option connect-timeout 30 caps
+# substituter HTTP connect waits at 30s so an unreachable mirror
+# fails over fast instead of stalling the whole build behind the
+# OS-default TCP timeout (~75-120s).
 set +e
 nix-portable nix build "$FLAKE_REF" \
     --extra-experimental-features "nix-command flakes" \
+    --option connect-timeout 30 \
     --no-link --no-write-lock-file --impure \
     --print-out-paths --print-build-logs \
     > /tmp/store-path 2> /out/nix-stderr.log
