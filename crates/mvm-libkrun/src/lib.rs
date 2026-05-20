@@ -235,18 +235,33 @@ pub struct KrunVirtioFs {
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
 pub struct KrunContext {
     pub name: String,
-    pub kernel_path: String,
-    /// Root ext4 image. `None` for initramfs-only boot (the kernel
-    /// decompresses [`Self::initramfs_path`] into a rootfs tmpfs and
-    /// runs `init=/init` from it; no `/dev/vda` is attached).
+    /// Kernel image. `Some` for the kernel+rootfs and kernel+initramfs
+    /// paths. `None` when [`Self::root_dir`] is set — libkrun uses its
+    /// bundled TSI-patched kernel transparently in `set_root` mode.
+    #[serde(default)]
+    pub kernel_path: Option<String>,
+    /// Root ext4 image. `Some` together with [`Self::kernel_path`] for
+    /// the steady-state builder VM and runtime microVM path. Mutually
+    /// exclusive with `initramfs_path` and `root_dir`.
     #[serde(default)]
     pub rootfs_path: Option<String>,
     /// Optional initial ramdisk. When `Some`, libkrun passes the
-    /// path to `krun_set_kernel`'s `c_initramfs` arg. Set this for
-    /// in-memory bootstrap boots; leave `None` for ext4-rootfs
-    /// boots.
+    /// path to `krun_set_kernel`'s `c_initramfs` arg. Mutually
+    /// exclusive with `rootfs_path` and `root_dir`.
     #[serde(default)]
     pub initramfs_path: Option<String>,
+    /// Host directory libkrun mounts as the guest root over virtiofs
+    /// (via `krun_set_root`). Mutually exclusive with `kernel_path`,
+    /// `rootfs_path`, and `initramfs_path` — libkrun loads its
+    /// bundled kernel automatically in this mode. Pair with
+    /// [`Self::guest_entrypoint`] so libkrun knows what to run as
+    /// PID 1. Used by the Stage 0 bootstrap path.
+    #[serde(default)]
+    pub root_dir: Option<String>,
+    /// Guest PID 1 entrypoint, relative to [`Self::root_dir`]. Required
+    /// when `root_dir` is set; ignored otherwise.
+    #[serde(default)]
+    pub guest_entrypoint: Option<GuestEntrypoint>,
     pub vcpus: u8,
     pub ram_mib: u32,
     pub kernel_cmdline: Option<String>,
@@ -346,6 +361,24 @@ pub enum NetworkingMode {
     },
 }
 
+/// Guest PID 1 entrypoint passed to `krun_set_exec`. `path` is
+/// relative to [`KrunContext::root_dir`]. `argv[0]` is the entry
+/// name (libkrun appends the trailing NULL); leave empty for the
+/// "name = path, no other args" common case.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
+pub struct GuestEntrypoint {
+    /// Path to the guest PID 1 entrypoint, relative to `root_dir`.
+    pub path: String,
+    /// `argv` array. Empty defaults to `[basename(path)]` at FFI time.
+    #[serde(default)]
+    pub argv: Vec<String>,
+    /// Environment block. Empty by default — libkrun does not
+    /// propagate the host env, so callers must supply anything they
+    /// need (e.g. `PATH=/bin:/usr/local/bin`).
+    #[serde(default)]
+    pub envp: Vec<String>,
+}
+
 impl KrunContext {
     /// Construct a context that boots from a rootfs ext4 image.
     pub fn new(
@@ -355,9 +388,11 @@ impl KrunContext {
     ) -> Self {
         Self {
             name: name.into(),
-            kernel_path: kernel_path.into(),
+            kernel_path: Some(kernel_path.into()),
             rootfs_path: Some(rootfs_path.into()),
             initramfs_path: None,
+            root_dir: None,
+            guest_entrypoint: None,
             vcpus: 1,
             ram_mib: 256,
             kernel_cmdline: None,
@@ -372,9 +407,7 @@ impl KrunContext {
 
     /// Construct a context that boots from an initramfs (no rootfs
     /// disk attached). The kernel decompresses the initramfs into a
-    /// tmpfs rootfs and runs `init=` from it. Use this for the
-    /// bootstrap path that produces builder-VM images on a fresh
-    /// host.
+    /// tmpfs rootfs and runs `init=` from it.
     pub fn new_initramfs(
         name: impl Into<String>,
         kernel_path: impl Into<String>,
@@ -382,9 +415,11 @@ impl KrunContext {
     ) -> Self {
         Self {
             name: name.into(),
-            kernel_path: kernel_path.into(),
+            kernel_path: Some(kernel_path.into()),
             rootfs_path: None,
             initramfs_path: Some(initramfs_path.into()),
+            root_dir: None,
+            guest_entrypoint: None,
             vcpus: 1,
             ram_mib: 256,
             kernel_cmdline: None,
@@ -395,6 +430,68 @@ impl KrunContext {
             vsock_socket_dir: None,
             networking: NetworkingMode::Tsi,
         }
+    }
+
+    /// Construct a context that boots libkrun's bundled kernel against
+    /// a host directory mounted as the guest root via virtiofs. Used
+    /// by the Stage 0 bootstrap path — no host-built kernel or rootfs
+    /// image needed.
+    ///
+    /// `entry_path` is the guest PID 1, relative to `root_dir`. For
+    /// Stage 0 this is `/init` (a shell script the kernel's binfmt
+    /// loader resolves via the embedded busybox).
+    pub fn new_root_dir(
+        name: impl Into<String>,
+        root_dir: impl Into<String>,
+        entry_path: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kernel_path: None,
+            rootfs_path: None,
+            initramfs_path: None,
+            root_dir: Some(root_dir.into()),
+            guest_entrypoint: Some(GuestEntrypoint {
+                path: entry_path.into(),
+                argv: Vec::new(),
+                envp: Vec::new(),
+            }),
+            vcpus: 1,
+            ram_mib: 256,
+            kernel_cmdline: None,
+            vsock_ports: Vec::new(),
+            extra_disks: Vec::new(),
+            virtio_fs_mounts: Vec::new(),
+            console_output_path: None,
+            vsock_socket_dir: None,
+            networking: NetworkingMode::Tsi,
+        }
+    }
+
+    /// Set the guest entrypoint `argv` (libkrun's `krun_set_exec`
+    /// `argv` argument). Only meaningful when `root_dir` is set.
+    pub fn with_guest_argv<I, S>(mut self, argv: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        if let Some(entry) = self.guest_entrypoint.as_mut() {
+            entry.argv = argv.into_iter().map(Into::into).collect();
+        }
+        self
+    }
+
+    /// Set the guest entrypoint env block. Only meaningful when
+    /// `root_dir` is set.
+    pub fn with_guest_envp<I, S>(mut self, envp: I) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+    {
+        if let Some(entry) = self.guest_entrypoint.as_mut() {
+            entry.envp = envp.into_iter().map(Into::into).collect();
+        }
+        self
     }
 
     /// Switch the guest to gvproxy-backed virtio-net. Same shape as
@@ -623,24 +720,45 @@ fn configure_with_gateway(ctx: &KrunContext) -> Result<(sys::Context, GatewayHan
 /// (TSI-only) and `configure_with_passt`.
 #[cfg(feature = "libkrun-sys")]
 fn configure_pre_net(ctx: &KrunContext) -> Result<sys::Context, Error> {
-    if ctx.rootfs_path.is_none() && ctx.initramfs_path.is_none() {
-        return Err(Error::Io {
-            context: "KrunContext needs either rootfs_path or initramfs_path; neither set"
-                .to_string(),
-        });
-    }
+    validate_boot_config(ctx)?;
     let krun = sys::Context::new()?;
     krun.set_vm_config(ctx.vcpus, ctx.ram_mib)?;
-    let initramfs_path = ctx.initramfs_path.as_deref().map(Path::new);
-    krun.set_kernel(
-        Path::new(&ctx.kernel_path),
-        sys::KernelFormat::Raw,
-        initramfs_path,
-        ctx.kernel_cmdline.as_deref(),
-    )?;
-    if let Some(rootfs) = &ctx.rootfs_path {
-        krun.add_disk("root", Path::new(rootfs), false)?;
+
+    if let Some(root_dir) = &ctx.root_dir {
+        let entry = ctx.guest_entrypoint.as_ref().expect(
+            "validate_boot_config guarantees root_dir is paired with guest_entrypoint",
+        );
+        krun.set_root(Path::new(root_dir))?;
+        let argv_owned: Vec<&str> = if entry.argv.is_empty() {
+            // Default argv[0] to the entry name for libkrun's exec.
+            let basename = entry
+                .path
+                .rsplit('/')
+                .next()
+                .filter(|s| !s.is_empty())
+                .unwrap_or(entry.path.as_str());
+            vec![basename]
+        } else {
+            entry.argv.iter().map(String::as_str).collect()
+        };
+        let envp_owned: Vec<&str> = entry.envp.iter().map(String::as_str).collect();
+        krun.set_guest_entrypoint(Path::new(&entry.path), &argv_owned, &envp_owned)?;
+    } else {
+        let kernel_path = ctx.kernel_path.as_ref().expect(
+            "validate_boot_config guarantees kernel_path is set when root_dir is absent",
+        );
+        let initramfs_path = ctx.initramfs_path.as_deref().map(Path::new);
+        krun.set_kernel(
+            Path::new(kernel_path),
+            sys::KernelFormat::Raw,
+            initramfs_path,
+            ctx.kernel_cmdline.as_deref(),
+        )?;
+        if let Some(rootfs) = &ctx.rootfs_path {
+            krun.add_disk("root", Path::new(rootfs), false)?;
+        }
     }
+
     for disk in &ctx.extra_disks {
         krun.add_disk(&disk.id, Path::new(&disk.path), disk.read_only)?;
     }
@@ -655,6 +773,57 @@ fn configure_pre_net(ctx: &KrunContext) -> Result<sys::Context, Error> {
         krun.set_console_output(Path::new(console_path))?;
     }
     Ok(krun)
+}
+
+/// Validate that the boot fields on `ctx` describe exactly one of the
+/// supported shapes: (kernel + rootfs), (kernel + initramfs), or
+/// (root_dir + guest_entrypoint). Anything else is a programming
+/// error — we'd otherwise pass nonsense to libkrun and watch it
+/// fail late with an opaque rc.
+///
+/// Always-on so unit tests can exercise it without the `libkrun-sys`
+/// feature. `configure_pre_net` is the only non-test caller and is
+/// gated behind that feature, so the dead-code allow keeps the
+/// non-feature library build quiet.
+#[cfg_attr(not(feature = "libkrun-sys"), allow(dead_code))]
+fn validate_boot_config(ctx: &KrunContext) -> Result<(), Error> {
+    let has_kernel = ctx.kernel_path.is_some();
+    let has_rootfs = ctx.rootfs_path.is_some();
+    let has_initramfs = ctx.initramfs_path.is_some();
+    let has_root_dir = ctx.root_dir.is_some();
+    let has_entry = ctx.guest_entrypoint.is_some();
+
+    if has_root_dir {
+        if has_kernel || has_rootfs || has_initramfs {
+            return Err(Error::Io {
+                context: "KrunContext.root_dir is mutually exclusive with kernel_path, \
+                          rootfs_path, and initramfs_path"
+                    .to_string(),
+            });
+        }
+        if !has_entry {
+            return Err(Error::Io {
+                context: "KrunContext.root_dir requires guest_entrypoint to be set".to_string(),
+            });
+        }
+        return Ok(());
+    }
+
+    if !has_kernel {
+        return Err(Error::Io {
+            context: "KrunContext needs kernel_path (with rootfs_path or initramfs_path) or \
+                      root_dir; none set"
+                .to_string(),
+        });
+    }
+    if has_rootfs == has_initramfs {
+        return Err(Error::Io {
+            context: "KrunContext kernel mode requires exactly one of rootfs_path or \
+                      initramfs_path"
+                .to_string(),
+        });
+    }
+    Ok(())
 }
 
 #[cfg(feature = "libkrun-sys")]
@@ -907,6 +1076,113 @@ mod tests {
         assert_eq!(ctx.vcpus, 2);
         assert_eq!(ctx.ram_mib, 512);
         assert_eq!(ctx.vsock_ports, vec![5252]);
+        assert_eq!(ctx.kernel_path.as_deref(), Some("/path/vmlinux"));
+        assert!(ctx.root_dir.is_none());
+        assert!(ctx.guest_entrypoint.is_none());
+    }
+
+    #[test]
+    fn krun_context_new_root_dir_clears_kernel_fields() {
+        let ctx = KrunContext::new_root_dir("vm-1", "/host/root", "/init");
+        assert!(ctx.kernel_path.is_none());
+        assert!(ctx.rootfs_path.is_none());
+        assert!(ctx.initramfs_path.is_none());
+        assert_eq!(ctx.root_dir.as_deref(), Some("/host/root"));
+        let entry = ctx
+            .guest_entrypoint
+            .as_ref()
+            .expect("entrypoint set by constructor");
+        assert_eq!(entry.path, "/init");
+        assert!(entry.argv.is_empty());
+        assert!(entry.envp.is_empty());
+    }
+
+    #[test]
+    fn validate_boot_config_accepts_kernel_plus_rootfs() {
+        let ctx = KrunContext::new("vm", "/k", "/r");
+        validate_boot_config(&ctx).expect("kernel + rootfs is valid");
+    }
+
+    #[test]
+    fn validate_boot_config_accepts_kernel_plus_initramfs() {
+        let ctx = KrunContext::new_initramfs("vm", "/k", "/i");
+        validate_boot_config(&ctx).expect("kernel + initramfs is valid");
+    }
+
+    #[test]
+    fn validate_boot_config_accepts_root_dir_plus_entrypoint() {
+        let ctx = KrunContext::new_root_dir("vm", "/host/root", "/init");
+        validate_boot_config(&ctx).expect("root_dir + entrypoint is valid");
+    }
+
+    #[test]
+    fn validate_boot_config_rejects_root_dir_with_kernel() {
+        let mut ctx = KrunContext::new_root_dir("vm", "/host/root", "/init");
+        ctx.kernel_path = Some("/k".to_string());
+        let err = validate_boot_config(&ctx).expect_err("mixing root_dir + kernel must fail");
+        assert!(
+            matches!(err, Error::Io { ref context } if context.contains("root_dir is mutually exclusive")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_boot_config_rejects_root_dir_with_rootfs() {
+        let mut ctx = KrunContext::new_root_dir("vm", "/host/root", "/init");
+        ctx.rootfs_path = Some("/r".to_string());
+        validate_boot_config(&ctx).expect_err("mixing root_dir + rootfs must fail");
+    }
+
+    #[test]
+    fn validate_boot_config_rejects_root_dir_with_initramfs() {
+        let mut ctx = KrunContext::new_root_dir("vm", "/host/root", "/init");
+        ctx.initramfs_path = Some("/i".to_string());
+        validate_boot_config(&ctx).expect_err("mixing root_dir + initramfs must fail");
+    }
+
+    #[test]
+    fn validate_boot_config_rejects_root_dir_without_entrypoint() {
+        let mut ctx = KrunContext::new_root_dir("vm", "/host/root", "/init");
+        ctx.guest_entrypoint = None;
+        let err = validate_boot_config(&ctx)
+            .expect_err("root_dir without entrypoint must fail");
+        assert!(
+            matches!(err, Error::Io { ref context } if context.contains("guest_entrypoint")),
+            "got {err:?}"
+        );
+    }
+
+    #[test]
+    fn validate_boot_config_rejects_empty_context() {
+        let mut ctx = KrunContext::new("vm", "/k", "/r");
+        ctx.kernel_path = None;
+        ctx.rootfs_path = None;
+        validate_boot_config(&ctx).expect_err("no kernel, no root_dir → reject");
+    }
+
+    #[test]
+    fn validate_boot_config_rejects_kernel_with_both_rootfs_and_initramfs() {
+        let mut ctx = KrunContext::new("vm", "/k", "/r");
+        ctx.initramfs_path = Some("/i".to_string());
+        validate_boot_config(&ctx)
+            .expect_err("kernel + both rootfs and initramfs is ambiguous → reject");
+    }
+
+    #[test]
+    fn root_dir_context_roundtrips_through_json() {
+        let ctx = KrunContext::new_root_dir("vm-1", "/host/root", "/init")
+            .with_guest_argv(["init"])
+            .with_guest_envp(["PATH=/bin:/usr/local/bin"]);
+        let json = serde_json::to_string(&ctx).unwrap();
+        let back: KrunContext = serde_json::from_str(&json).unwrap();
+        assert!(back.kernel_path.is_none());
+        assert!(back.rootfs_path.is_none());
+        assert!(back.initramfs_path.is_none());
+        assert_eq!(back.root_dir.as_deref(), Some("/host/root"));
+        let entry = back.guest_entrypoint.expect("entrypoint deserialized");
+        assert_eq!(entry.path, "/init");
+        assert_eq!(entry.argv, vec!["init".to_string()]);
+        assert_eq!(entry.envp, vec!["PATH=/bin:/usr/local/bin".to_string()]);
     }
 
     /// Plan 57 W3.3: the per-VM `vsock_socket_dir` overrides the
