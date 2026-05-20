@@ -725,9 +725,10 @@ fn configure_pre_net(ctx: &KrunContext) -> Result<sys::Context, Error> {
     krun.set_vm_config(ctx.vcpus, ctx.ram_mib)?;
 
     if let Some(root_dir) = &ctx.root_dir {
-        let entry = ctx.guest_entrypoint.as_ref().expect(
-            "validate_boot_config guarantees root_dir is paired with guest_entrypoint",
-        );
+        let entry = ctx
+            .guest_entrypoint
+            .as_ref()
+            .expect("validate_boot_config guarantees root_dir is paired with guest_entrypoint");
         krun.set_root(Path::new(root_dir))?;
         let argv_owned: Vec<&str> = if entry.argv.is_empty() {
             // Default argv[0] to the entry name for libkrun's exec.
@@ -744,9 +745,10 @@ fn configure_pre_net(ctx: &KrunContext) -> Result<sys::Context, Error> {
         let envp_owned: Vec<&str> = entry.envp.iter().map(String::as_str).collect();
         krun.set_guest_entrypoint(Path::new(&entry.path), &argv_owned, &envp_owned)?;
     } else {
-        let kernel_path = ctx.kernel_path.as_ref().expect(
-            "validate_boot_config guarantees kernel_path is set when root_dir is absent",
-        );
+        let kernel_path = ctx
+            .kernel_path
+            .as_ref()
+            .expect("validate_boot_config guarantees kernel_path is set when root_dir is absent");
         let initramfs_path = ctx.initramfs_path.as_deref().map(Path::new);
         krun.set_kernel(
             Path::new(kernel_path),
@@ -1144,8 +1146,7 @@ mod tests {
     fn validate_boot_config_rejects_root_dir_without_entrypoint() {
         let mut ctx = KrunContext::new_root_dir("vm", "/host/root", "/init");
         ctx.guest_entrypoint = None;
-        let err = validate_boot_config(&ctx)
-            .expect_err("root_dir without entrypoint must fail");
+        let err = validate_boot_config(&ctx).expect_err("root_dir without entrypoint must fail");
         assert!(
             matches!(err, Error::Io { ref context } if context.contains("guest_entrypoint")),
             "got {err:?}"

@@ -2628,9 +2628,7 @@ fn bootstrap_builder_vm_image_via_root_dir_stage0(
         .parent()
         .and_then(|p| p.parent())
         .and_then(|p| p.parent())
-        .ok_or_else(|| {
-            anyhow::anyhow!("Cannot derive workspace root from {builder_flake_dir}")
-        })?
+        .ok_or_else(|| anyhow::anyhow!("Cannot derive workspace root from {builder_flake_dir}"))?
         .to_path_buf();
 
     let out_dir_path = std::path::Path::new(out_dir);
