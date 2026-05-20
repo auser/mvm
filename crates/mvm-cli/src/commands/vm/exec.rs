@@ -81,7 +81,7 @@ pub(in crate::commands) struct RunArgs {
     /// Pull or reuse a cached OCI image reference and boot its materialized rootfs.
     ///
     /// The image is resolved through the local OCI cache first. A cache miss
-    /// performs the same verified pull/materialization as `mvmctl image pull`.
+    /// performs the existing verified OCI pull and rootfs materialization path.
     #[arg(long, value_name = "REF")]
     pub image: Option<String>,
     /// vCPU cores (default: 2)
