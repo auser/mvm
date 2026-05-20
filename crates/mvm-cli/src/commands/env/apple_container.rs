@@ -2581,18 +2581,24 @@ fn ensure_stage0_seed_manifest(seed_rootfs: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Stage 0 bootstrap via libkrun's `krun_set_root` mode — hand a
-/// host directory containing busybox + nix-portable + an init
-/// script to libkrun, which mounts it as the guest root via
-/// virtiofs against libkrunfw's bundled TSI-patched kernel. The
-/// guest builds the in-repo `nix/images/builder-vm` flake against
-/// `/work` and writes the steady-state artifacts (`vmlinux`,
-/// `rootfs.ext4`, `cmdline.txt`) to `/out`, then powers off.
+/// Stage 0 bootstrap via libkrun's `krun_set_root` mode — extract
+/// Alpine Linux's official minirootfs (hash + PGP-verified against
+/// the embedded Alpine release key in mvm source) into a host
+/// directory, layer our `/init` on top, and hand the directory to
+/// libkrun. libkrun mounts it as the guest root via virtiofs
+/// against libkrunfw's bundled TSI-patched kernel. The init script
+/// runs `apk add nix`, builds the in-repo `nix/images/builder-vm`
+/// flake against `/work`, and writes the steady-state artifacts
+/// (`vmlinux`, `rootfs.ext4`, `cmdline.txt`) to `/out`, then
+/// powers off.
 ///
 /// Replaces the previous initramfs-cpio dispatch shape: libkrunfw's
 /// kernel ships with `CONFIG_BLK_DEV_INITRD=n`, so cpio initramfs
 /// cannot unpack. `set_root` mode is libkrun's intended container
-/// boot path and uses the same kernel without modification.
+/// boot path and uses the same kernel without modification. Plan 91
+/// further replaced the `nix-portable` bootstrap (which served a
+/// macOS Mach-O binary under the `aarch64` name upstream) with the
+/// Alpine path.
 #[cfg(feature = "builder-vm")]
 fn bootstrap_builder_vm_image_via_root_dir_stage0(
     builder_flake_dir: &str,
@@ -2603,12 +2609,13 @@ fn bootstrap_builder_vm_image_via_root_dir_stage0(
 
     let _stage0_guard = acquire_stage0_lock(out_dir)?;
 
-    mvm_build::stage0::prepare_assets(mvm_build::stage0::ASSETS_AARCH64)
-        .context("preparing Stage 0 bootstrap assets")?;
+    let stage0_assets = mvm_build::stage0::assets_for_host_arch();
+    mvm_build::stage0::prepare_assets(stage0_assets)
+        .context("preparing Stage 0 bootstrap assets (Alpine minirootfs + signature)")?;
 
-    // Materialize the guest root tree (busybox + nix-portable +
-    // /init + stubs) under a stable per-host location. libkrun mounts
-    // this directory as the guest root via virtiofs.
+    // Materialize the guest root tree (Alpine minirootfs + /init +
+    // stubs) under a stable per-host location. libkrun mounts this
+    // directory as the guest root via virtiofs.
     let root_dir = mvm_build::stage0::stage0_cache_dir().join("root");
     if root_dir.exists() {
         std::fs::remove_dir_all(&root_dir).with_context(|| {

@@ -1,33 +1,27 @@
 #!/bin/sh
 # PID 1 of the Stage 0 bootstrap VM.
 #
-# libkrun mounts a host directory (materialized by
-# `mvm_build::stage0::materialize_root_dir`) as the guest root over
-# virtiofs (`krun_set_root`) and boots libkrunfw's bundled
-# TSI-patched kernel transparently. The root dir carries busybox +
-# nix-portable + this script; `krun_set_exec` runs `/init` as PID 1.
+# libkrun mounts an Alpine Linux minirootfs (materialized by
+# `mvm_build::stage0::materialize_root_dir`) as the guest root
+# over virtiofs (`krun_set_root`) and boots libkrunfw's bundled
+# TSI-patched kernel transparently. The root dir is Alpine's
+# official minirootfs tarball (hash + PGP-verified against the
+# embedded Alpine release key in mvm source) with our `/init`
+# layered on top; `krun_set_exec` runs `/init` as PID 1.
 #
-# Job: build the in-repo `nix/images/builder-vm` flake into a
-# kernel + rootfs.ext4 and write them to the `/out` virtio-fs share.
-# When the host sees the artifacts land, it promotes them into the
-# steady-state builder-vm cache and we're done with Stage 0 for the
-# lifetime of this machine.
+# Job: install Nix from Alpine's signed package repos
+# (`apk add nix`), build the in-repo `nix/images/builder-vm`
+# flake into a kernel + rootfs.ext4, and write them to the
+# `/out` virtio-fs share. When the host sees the artifacts land,
+# it promotes them into the steady-state builder-vm cache and
+# we're done with Stage 0 for the lifetime of this machine.
 
 set -eu
 
-# busybox installs itself as every applet via this command. The
-# root dir has /bin/busybox as a real file and every other tool
-# (sh, mount, ip, udhcpc, …) as a symlink to it. `--install -s`
-# materializes those symlinks under /bin so PATH lookups resolve
-# without needing the host to pre-populate them.
-/bin/busybox --install -s /bin
-
-export PATH=/bin:/usr/local/bin
-
-# Standard pseudofs essentials. libkrun's container mode (set_root)
-# pre-mounts several of these in its in-VM init; gate each on
-# `mountpoint -q` so the script doesn't trip `set -eu` on a
-# benign EBUSY.
+# Standard pseudofs essentials. libkrun's container mode
+# (set_root) pre-mounts several of these in its in-VM init plumbing;
+# gate each on `mountpoint -q` so the script doesn't trip
+# `set -eu` on a benign EBUSY.
 mountpoint -q /proc || mount -t proc     proc     /proc
 mountpoint -q /sys  || mount -t sysfs    sysfs    /sys
 mountpoint -q /dev  || mount -t devtmpfs devtmpfs /dev || true
@@ -47,9 +41,15 @@ ip link set eth0 up
 # -q exits after lease, -i pins the interface.
 udhcpc -i eth0 -n -q || echo "stage0-init: udhcpc failed (offline; nix build will likely fail at substituter)" >&2
 
-# nix-portable wants HOME for its self-extraction cache.
-export HOME=/tmp/np-home
-mkdir -p "$HOME"
+# Alpine's minirootfs ships with an empty /etc/apk/repositories.
+# Point apk at the same Alpine branch the minirootfs came from.
+# (Bump `ALPINE_BRANCH` in `crates/mvm-build/src/stage0.rs` in
+# lockstep with the tarball pin; this constant must agree.)
+mkdir -p /etc/apk
+cat > /etc/apk/repositories <<'EOF'
+https://dl-cdn.alpinelinux.org/alpine/v3.22/main
+https://dl-cdn.alpinelinux.org/alpine/v3.22/community
+EOF
 
 # Virtio-fs shares from the host. In libkrun's set_root mode the
 # kernel exposes them as virtio devices but the in-VM init does
@@ -66,20 +66,52 @@ if ! mountpoint -q /out; then
   exit 65
 fi
 
+# Install Nix from Alpine's signed package repos. `apk-tools`
+# verifies the signed APKINDEX against /etc/apk/keys/ (the
+# Alpine release-signing keys shipped in the minirootfs) and
+# each package's signature before installation.
+echo "stage0-init: installing nix + dependencies via apk..." >&2
+set +e
+apk --no-progress update                              > /out/apk-update.log  2>&1
+APK_RC=$?
+if [ "$APK_RC" -ne 0 ]; then
+  echo "stage0-init: apk update exited $APK_RC (see /out/apk-update.log)" >&2
+  tail -40 /out/apk-update.log >&2 2>/dev/null || true
+  exit "$APK_RC"
+fi
+apk --no-progress add nix git ca-certificates xz      > /out/apk-add.log     2>&1
+APK_RC=$?
+set -e
+if [ "$APK_RC" -ne 0 ]; then
+  echo "stage0-init: apk add exited $APK_RC (see /out/apk-add.log)" >&2
+  tail -40 /out/apk-add.log >&2 2>/dev/null || true
+  exit "$APK_RC"
+fi
+
+# Nix needs $HOME for cache + lock state. Alpine's apk install of
+# nix creates /var/empty and similar but no HOME; set it
+# explicitly.
+export HOME=/root
+mkdir -p "$HOME"
+
+# Nix's `nix build` in single-user mode (no nix-daemon running)
+# wants /nix as writable. Alpine's nix package creates /nix/store
+# during postinstall; ensure it's writable here too.
+mkdir -p /nix/store /nix/var/nix
+
 ARCH="$(uname -m)"
 FLAKE_REF="path:/work/nix/images/builder-vm#packages.${ARCH}-linux.default"
 
 echo "stage0-init: building ${FLAKE_REF}" >&2
 
-# nix-portable runs nix without requiring a /nix/store or nix-daemon
-# on the guest. --no-write-lock-file lets us build against a
-# read-only workspace mount. --print-out-paths spits the result path
-# to stdout for us to copy from. --option connect-timeout 30 caps
-# substituter HTTP connect waits at 30s so an unreachable mirror
-# fails over fast instead of stalling the whole build behind the
-# OS-default TCP timeout (~75-120s).
+# --no-link / --no-write-lock-file lets us build against a
+# read-only workspace mount. --print-out-paths spits the result
+# path to stdout for us to copy from. --option connect-timeout 30
+# caps substituter HTTP connect waits at 30s so an unreachable
+# mirror fails over fast instead of stalling the whole build behind
+# the OS-default TCP timeout (~75-120s).
 set +e
-nix-portable nix build "$FLAKE_REF" \
+nix build "$FLAKE_REF" \
     --extra-experimental-features "nix-command flakes" \
     --option connect-timeout 30 \
     --no-link --no-write-lock-file --impure \
@@ -90,6 +122,9 @@ set -e
 
 if [ "$NIX_RC" -ne 0 ]; then
   echo "stage0-init: nix build exited $NIX_RC (see /out/nix-stderr.log)" >&2
+  echo "stage0-init: === nix-stderr.log tail (last 80 lines) ===" >&2
+  tail -80 /out/nix-stderr.log >&2 2>/dev/null || echo "stage0-init: (could not read /out/nix-stderr.log)" >&2
+  echo "stage0-init: === end nix-stderr.log ===" >&2
   exit "$NIX_RC"
 fi
 
