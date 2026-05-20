@@ -2,8 +2,11 @@
 
 A slim custom Linux 6.12 kernel tailored for the libkrun builder
 VM. Built via `pkgs.linuxManualConfig` from a `.config` generated
-by `make tinyconfig` + the `enables` / `disables` lists in
-[`default.nix`](./default.nix) + `make olddefconfig`.
+by `make defconfig` + the `enables` / `disables` lists in
+[`default.nix`](./default.nix) + `make olddefconfig`. (Plan 92
+landed `tinyconfig` first; `e663abf4` switched to `defconfig`
+because tinyconfig stripped arch_timer / GIC / OF — see the
+comment in `default.nix`.)
 
 Nothing is vendored under this directory. The source of truth is
 the `enables` / `disables` lists in `default.nix`.
@@ -49,9 +52,17 @@ re-enables it because another `=y` symbol depends on it, that
 parent symbol needs to come off too — disabling a leaf doesn't
 override a hard dependency.
 
-To introspect what `olddefconfig` produced: temporarily expose
-the `configfile` derivation from `default.nix` as a flake output
-and `nix build` it.
+To introspect what `olddefconfig` produced, build the
+`kernel-configfile` flake output (added in Plan 95 §W2):
+
+```sh
+nix build .#kernel-configfile -o /tmp/kconfig
+grep '=y$' /tmp/kconfig | sort > /tmp/kconfig.y.txt
+```
+
+The output is a regular `.config` text file — diffable across
+`disables` edits to confirm SoC platform clusters or other
+unwanted symbols are gone.
 
 ## Why no TSI patches
 

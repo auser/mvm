@@ -271,8 +271,6 @@
           pkgs = import nixpkgs { inherit system; };
           builderInit = mvmBuilderInitFor system;
           egressProxy = mvmEgressProxyFor system;
-          kernelPkg =
-            if includeKernelModules then import ./kernel { inherit pkgs; } else null;
         in
         (libFor { inherit system; }).mkGuest {
           name = "mvm-builder-vm";
@@ -415,11 +413,25 @@
           }
           MANIFEST
         '';
+      # Plan 95 W2 — expose the generated kernel `.config` as a
+      # standalone flake output so contributors can audit what
+      # `make defconfig + enables/disables + olddefconfig` actually
+      # produced without temporarily editing this flake. Build with:
+      #
+      #   nix build .#kernel-configfile -o /tmp/kconfig
+      #   grep '=y$' /tmp/kconfig | sort > /tmp/kconfig.y.txt
+      #
+      # The file is a regular `.config` text file — diffable across
+      # `disables` edits to confirm SoC platform clusters are gone.
+      mkKernelConfigfile = system:
+        let pkgs = import nixpkgs { inherit system; };
+        in (import ./kernel { inherit pkgs; }).passthru.configfile;
     in
     {
       packages = forAllSystems (system: {
         default = mkBuilderVmImage system;
         stage0-rootfs = mkBuilderVmStage0Rootfs system;
+        kernel-configfile = mkKernelConfigfile system;
       });
     };
 }
