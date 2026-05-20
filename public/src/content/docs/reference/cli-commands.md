@@ -246,6 +246,14 @@ certificate_identity = "https://github.com/acme/app/.github/workflows/release.ym
 certificate_oidc_issuer = "https://token.actions.githubusercontent.com"
 ```
 
+Private registry pulls use explicit mvm bearer-token environment variables only.
+For a single registry, set `MVM_OCI_BEARER_TOKEN_<HOST>` where `<HOST>` is the
+registry host uppercased with `.`, `-`, and `:` replaced by `_`
+(`ghcr.io` -> `MVM_OCI_BEARER_TOKEN_GHCR_IO`). `MVM_OCI_BEARER_TOKEN` is the
+global fallback. mvm does not read `~/.docker/config.json` or invoke Docker
+credential helpers, and audit entries record only the credential source name,
+never the token value.
+
 ## Console
 
 | Command | Description |
@@ -543,6 +551,8 @@ All commands accept these global options:
 | `MVM_TEMPLATE_NO_LOCAL_PROBE` | Set to `1` to skip the local-endpoint probe in `auto` mode (CI / sandboxed environments where loopback connects can hang) | Unset |
 | `MVM_PRODUCTION` | Enable production mode checks | `false` |
 | `MVM_OCI_POLICY` | OCI production policy TOML used by `mvmctl image pull --prod` and `mvmctl run --image --prod` | `$MVM_DATA_DIR/oci-policy.toml` |
+| `MVM_OCI_BEARER_TOKEN_<HOST>` | Bearer token for one OCI registry host (`ghcr.io` -> `MVM_OCI_BEARER_TOKEN_GHCR_IO`) | Unset |
+| `MVM_OCI_BEARER_TOKEN` | Global fallback bearer token for OCI registry pulls | Unset |
 | `RUST_LOG` | Logging level (e.g., `debug`, `mvm=trace`) | `info` |
 | `MVM_CACHE_DIR` | Override cache directory | `~/.cache/mvm` |
 | `MVM_CONFIG_DIR` | Override config directory | XDG default |
