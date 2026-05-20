@@ -76,8 +76,14 @@ pub(in crate::commands) enum RunProfile {
 pub(in crate::commands) struct RunArgs {
     /// Boot a pre-built manifest (path to `mvm.toml`, its directory, or a
     /// legacy slot name). If omitted, the bundled default microVM image is used.
-    #[arg(short = 'm', long)]
+    #[arg(short = 'm', long, conflicts_with = "image")]
     pub manifest: Option<String>,
+    /// Pull or reuse a cached OCI image reference and boot its materialized rootfs.
+    ///
+    /// The image is resolved through the local OCI cache first. A cache miss
+    /// performs the same verified pull/materialization as `mvmctl image pull`.
+    #[arg(long, value_name = "REF")]
+    pub image: Option<String>,
     /// vCPU cores (default: 2)
     #[arg(long, default_value = "2")]
     pub cpus: u32,
@@ -255,7 +261,9 @@ pub(in crate::commands) fn run_secure(cli: &Cli, args: RunArgs, cfg: &MvmConfig)
     if args.json || receipt_path.is_some() {
         let receipt_input = ReceiptInput::from_run_args(&args)?;
         let json_requested = args.json;
-        let req = build_exec_request(args.into_exec_args(), "`mvmctl run`")?;
+        let image = args.image.clone();
+        let prod = args.prod;
+        let req = build_exec_request(args.into_exec_args(), "`mvmctl run`", image, prod)?;
         let output = crate::exec::run_captured(req)?;
         if !json_requested && !output.stdout.is_empty() {
             print!("{}", output.stdout);
@@ -278,7 +286,9 @@ pub(in crate::commands) fn run_secure(cli: &Cli, args: RunArgs, cfg: &MvmConfig)
         }
         return Ok(());
     }
-    run(cli, args.into_exec_args(), cfg)
+    let image = args.image.clone();
+    let prod = args.prod;
+    run_run_args(cli, args.into_exec_args(), cfg, image, prod)
 }
 
 /// Resolve the `mvmctl run` transport mode from the explicit
@@ -298,6 +308,9 @@ pub(in crate::commands) fn resolve_run_mode(args: &RunArgs) -> Result<Option<Run
         return Ok(Some(RunMode::Live));
     }
     if args.prod {
+        if args.image.is_some() {
+            return Ok(None);
+        }
         anyhow::bail!(
             "`mvmctl run --prod` (alias for --mode record) redirects to `mvmctl compile`, where \
              record is the default mode. Re-run as `mvmctl compile <script>` (the trailing argv \
@@ -361,7 +374,7 @@ fn validate_run_profile(args: &RunArgs) -> Result<()> {
 }
 
 pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Result<()> {
-    let req = build_exec_request(args, "`mvmctl exec`")?;
+    let req = build_exec_request(args, "`mvmctl exec`", None, false)?;
     let exit_code = crate::exec::run(req)?;
     if exit_code != 0 {
         std::process::exit(exit_code);
@@ -369,7 +382,27 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     Ok(())
 }
 
-fn build_exec_request(args: Args, command_name: &str) -> Result<crate::exec::ExecRequest> {
+fn run_run_args(
+    _cli: &Cli,
+    args: Args,
+    _cfg: &MvmConfig,
+    image: Option<String>,
+    prod: bool,
+) -> Result<()> {
+    let req = build_exec_request(args, "`mvmctl run`", image, prod)?;
+    let exit_code = crate::exec::run(req)?;
+    if exit_code != 0 {
+        std::process::exit(exit_code);
+    }
+    Ok(())
+}
+
+fn build_exec_request(
+    args: Args,
+    command_name: &str,
+    image_ref: Option<String>,
+    prod: bool,
+) -> Result<crate::exec::ExecRequest> {
     let target = match (args.launch_plan.as_ref(), args.argv.is_empty()) {
         (Some(_), false) => {
             anyhow::bail!("--launch-plan and a trailing argv are mutually exclusive");
@@ -399,15 +432,43 @@ fn build_exec_request(args: Args, command_name: &str) -> Result<crate::exec::Exe
     // ImageSource::Template carries either a name (legacy) or a slot
     // hash (manifest), and the dispatched lifecycle helpers handle
     // both keys transparently.
-    let image = match args.manifest {
-        Some(arg) => {
+    let image = match (args.manifest, image_ref) {
+        (Some(_), Some(_)) => unreachable!("clap conflicts_with prevents --manifest + --image"),
+        (Some(arg), None) => {
             let resolved = match super::shared::resolve_manifest_arg(&arg)? {
                 super::shared::ManifestArgRef::Name(n) => n,
                 super::shared::ManifestArgRef::Slot { slot_hash } => slot_hash,
             };
             crate::exec::ImageSource::Template(resolved)
         }
-        None => {
+        (None, Some(reference)) => {
+            let cached = super::super::image::resolve_or_pull_run_image(
+                &super::super::image::oci_cache_root(),
+                &reference,
+                prod,
+            )?;
+            ui::info(&format!(
+                "Using OCI image {} ({})",
+                cached.reference, cached.resolved_digest
+            ));
+            if cached.pulled {
+                mvm_core::audit_emit!(
+                    ImageFetch,
+                    "source=run_image reference={} digest={} prod={}",
+                    cached.reference,
+                    cached.resolved_digest,
+                    prod
+                );
+            }
+            let (kernel_path, _default_rootfs_path) = ensure_default_microvm_image()?;
+            crate::exec::ImageSource::Prebuilt {
+                kernel_path,
+                rootfs_path: cached.rootfs_path.display().to_string(),
+                initrd_path: None,
+                label: format!("oci:{}", cached.resolved_digest),
+            }
+        }
+        (None, None) => {
             ui::info("No --manifest specified; using bundled default microVM image.");
             let (kernel_path, rootfs_path) = ensure_default_microvm_image()?;
             crate::exec::ImageSource::Prebuilt {
@@ -451,6 +512,7 @@ struct RunReceiptPayload {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ReceiptInput {
     manifest: Option<String>,
+    image: Option<String>,
     cpus: u32,
     memory: String,
     profile: String,
@@ -547,6 +609,7 @@ struct RunPreflightResources {
 enum RunPreflightImage {
     DefaultMicrovm,
     Manifest { argument_sha256: String },
+    Oci { reference_sha256: String },
 }
 
 impl RunJsonSummary {
@@ -577,10 +640,19 @@ impl RunPreflightSummary {
             crate::exec::AddDir::parse(spec)?;
         }
         let image = match args.manifest.as_ref() {
-            Some(manifest) => RunPreflightImage::Manifest {
+            Some(manifest) if args.image.is_none() => RunPreflightImage::Manifest {
                 argument_sha256: sha256_hex(manifest.as_bytes()),
             },
+            None if args.image.is_some() => RunPreflightImage::Oci {
+                reference_sha256: sha256_hex(
+                    args.image
+                        .as_deref()
+                        .expect("matched image presence")
+                        .as_bytes(),
+                ),
+            },
             None => RunPreflightImage::DefaultMicrovm,
+            Some(_) => unreachable!("clap conflicts_with prevents --manifest + --image"),
         };
         let mut notes = vec![
             "preflight only; no image was resolved, built, booted, or executed".to_string(),
@@ -632,6 +704,9 @@ fn print_run_preflight_human(summary: &RunPreflightSummary) {
         }
         RunPreflightImage::Manifest { argument_sha256 } => {
             println!("image: manifest/template argument sha256={argument_sha256} (not resolved)");
+        }
+        RunPreflightImage::Oci { reference_sha256 } => {
+            println!("image: OCI reference sha256={reference_sha256} (not resolved)");
         }
     }
     println!(
@@ -706,6 +781,7 @@ impl ReceiptInput {
 
         Ok(Self {
             manifest: args.manifest.clone(),
+            image: args.image.clone(),
             cpus: args.cpus,
             memory: args.memory.clone(),
             profile: args
@@ -867,6 +943,7 @@ mod tests {
     fn run_args(profile: RunProfile) -> RunArgs {
         RunArgs {
             manifest: None,
+            image: None,
             cpus: 2,
             memory: "512M".to_string(),
             profile,
@@ -916,6 +993,18 @@ mod tests {
         let err = resolve_run_mode(&args).expect_err("--prod must bail");
         let msg = err.to_string();
         assert!(msg.contains("mvmctl compile"));
+    }
+
+    #[test]
+    fn resolve_run_mode_leaves_image_prod_for_oci_policy() {
+        let mut args = run_args(RunProfile::Standard);
+        args.image = Some(
+            "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                .to_string(),
+        );
+        args.prod = true;
+        let mode = resolve_run_mode(&args).expect("image prod is not SDK mode");
+        assert!(mode.is_none());
     }
 
     #[test]

@@ -1694,6 +1694,7 @@ fn run_default_profile_argv_only() {
     match cli.command {
         Commands::Run(exec::RunArgs {
             manifest,
+            image,
             cpus,
             memory,
             profile,
@@ -1710,6 +1711,7 @@ fn run_default_profile_argv_only() {
             argv,
         }) => {
             assert!(manifest.is_none(), "manifest should default to None");
+            assert!(image.is_none(), "image should default to None");
             assert_eq!(cpus, 2);
             assert_eq!(memory, "512M");
             assert_eq!(profile, exec::RunProfile::Standard);
@@ -1727,6 +1729,78 @@ fn run_default_profile_argv_only() {
         }
         _ => panic!("Expected Run command"),
     }
+}
+
+#[test]
+fn run_image_flag_parses() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "run",
+        "--image",
+        "docker.io/library/alpine:3.20",
+        "--",
+        "/bin/sh",
+        "-c",
+        "echo hi",
+    ])
+    .expect("parse");
+    match cli.command {
+        Commands::Run(exec::RunArgs {
+            image, prod, argv, ..
+        }) => {
+            assert_eq!(image.as_deref(), Some("docker.io/library/alpine:3.20"));
+            assert!(!prod);
+            assert_eq!(
+                argv,
+                vec![
+                    "/bin/sh".to_string(),
+                    "-c".to_string(),
+                    "echo hi".to_string()
+                ]
+            );
+        }
+        _ => panic!("Expected Run command"),
+    }
+}
+
+#[test]
+fn run_image_prod_flag_parses_as_image_policy() {
+    let pinned = "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "run",
+        "--image",
+        pinned,
+        "--prod",
+        "--",
+        "/bin/true",
+    ])
+    .expect("parse");
+    match cli.command {
+        Commands::Run(exec::RunArgs {
+            image, prod, mode, ..
+        }) => {
+            assert_eq!(image.as_deref(), Some(pinned));
+            assert!(prod);
+            assert!(mode.is_none());
+        }
+        _ => panic!("Expected Run command"),
+    }
+}
+
+#[test]
+fn run_manifest_and_image_conflict() {
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "run",
+        "--manifest",
+        "hello",
+        "--image",
+        "docker.io/library/alpine:3.20",
+        "--",
+        "/bin/true",
+    ]);
+    assert!(cli.is_err());
 }
 
 #[test]
