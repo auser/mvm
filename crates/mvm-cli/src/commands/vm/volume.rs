@@ -204,10 +204,7 @@ fn ensure_private_dir(path: &Path) -> Result<()> {
 }
 
 fn remote_stub(op: &str) -> Result<()> {
-    bail!(
-        "{op} --remote not yet implemented; tracking in mvmd Sprint 137 W2 \
-         (companion to mvm Plan 45 §D5). Use the local volume registry for now."
-    )
+    bail!("{op} --remote not yet implemented. Use the local volume registry for now.")
 }
 
 fn validate_volume_name(name: &str) -> Result<()> {

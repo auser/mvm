@@ -493,7 +493,7 @@ fn dev_build_via_builder_vm(
         tracing::info!(
             session_id = %record.session_id,
             socket = %record.dispatch_socket_path.display(),
-            "Plan 89 W3: routing build through persistent supervisor"
+            "routing build through persistent supervisor"
         );
         let persistent = crate::persistent_builder::PersistentBuilderVm::new(record.clone());
         match dev_build_with_builder_vm(env, flake_ref, profile, mode, &persistent) {

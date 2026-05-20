@@ -75,29 +75,36 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
         ));
     }
 
-    // Step 3: Garbage-collect unreferenced Nix store paths inside the dev VM.
-    ui::info("Running nix-collect-garbage...");
-    match shell::run_in_vm_stdout("nix-collect-garbage -d 2>&1 | tail -3") {
-        Ok(output) => {
-            let trimmed = output.trim();
-            if !trimmed.is_empty() {
-                println!("{trimmed}");
-            }
-        }
-        Err(e) => {
-            // If GC fails (disk too full for daemon), try clearing the Nix
-            // user profile links and retrying once.
-            ui::warn(&format!("nix-collect-garbage failed: {e}"));
-            ui::info("Retrying after clearing Nix profile generations...");
-            let _ = shell::run_in_vm("rm -rf ~/.local/state/nix/profiles/* 2>/dev/null");
-            match shell::run_in_vm_stdout("nix-collect-garbage -d 2>&1 | tail -3") {
-                Ok(output) => {
-                    let trimmed = output.trim();
-                    if !trimmed.is_empty() {
-                        println!("{trimmed}");
-                    }
+    // Step 3: Garbage-collect unreferenced Nix store paths inside
+    // the dev VM. The Nix store lives in the VM, so this step is a
+    // no-op when the dev VM isn't running — surface it as info
+    // (not a warning) so cleanup doesn't look like it failed.
+    if disk_before.is_none() {
+        ui::info("Skipping nix-collect-garbage: dev VM is not running.");
+    } else {
+        ui::info("Running nix-collect-garbage...");
+        match shell::run_in_vm_stdout("nix-collect-garbage -d 2>&1 | tail -3") {
+            Ok(output) => {
+                let trimmed = output.trim();
+                if !trimmed.is_empty() {
+                    println!("{trimmed}");
                 }
-                Err(e2) => ui::warn(&format!("nix-collect-garbage retry failed: {e2}")),
+            }
+            Err(e) => {
+                // If GC fails (disk too full for daemon), try clearing the Nix
+                // user profile links and retrying once.
+                ui::warn(&format!("nix-collect-garbage failed: {e}"));
+                ui::info("Retrying after clearing Nix profile generations...");
+                let _ = shell::run_in_vm("rm -rf ~/.local/state/nix/profiles/* 2>/dev/null");
+                match shell::run_in_vm_stdout("nix-collect-garbage -d 2>&1 | tail -3") {
+                    Ok(output) => {
+                        let trimmed = output.trim();
+                        if !trimmed.is_empty() {
+                            println!("{trimmed}");
+                        }
+                    }
+                    Err(e2) => ui::warn(&format!("nix-collect-garbage retry failed: {e2}")),
+                }
             }
         }
     }

@@ -945,7 +945,7 @@ fn ensure_source_checkout_dev_image(
 ) -> Result<(String, String)> {
     if !libkrun_available {
         anyhow::bail!(
-            "libkrun is required to build the dev image from source (Plan 72 W5.C).\n\
+            "libkrun is required to build the dev image from source.\n\
              {install_hint}\n\n\
              Once installed, retry `mvmctl dev up`. If you intend to use the published\n\
              prebuilt instead (no local builds), move or delete\n\
@@ -954,7 +954,7 @@ fn ensure_source_checkout_dev_image(
     }
 
     ui::info(&format!(
-        "Building dev image via libkrun builder VM (Plan 72 W5) from: {flake_dir}"
+        "Building dev image via libkrun builder VM from: {flake_dir}"
     ));
     match build_image(out_dir) {
         Ok((kernel, rootfs)) => {
@@ -1427,9 +1427,9 @@ fn try_fetch_signed_manifest(
     download_file(&bundle_url, &bundle_path).map_err(|e| {
         bump_verify_outcome("network");
         e.context(format!(
-            "Failed to download cosign bundle from {bundle_url}. Plan 36 \
-             requires a manifest's signature to be present alongside the \
-             manifest body — refusing to trust an unsigned manifest."
+            "Failed to download cosign bundle from {bundle_url}. The release \
+             pipeline requires a manifest's signature to be present alongside \
+             the manifest body — refusing to trust an unsigned manifest."
         ))
     })?;
 
@@ -1447,7 +1447,7 @@ fn try_fetch_signed_manifest(
     let manifest = if std::env::var_os("MVM_SKIP_COSIGN_VERIFY").is_some() {
         tracing::warn!(
             "MVM_SKIP_COSIGN_VERIFY set — accepting unverified manifest body. \
-             Plan 36 documents this as an emergency-rotation escape hatch only."
+             This is an emergency-rotation escape hatch only."
         );
         image_verify::parse_manifest(&manifest_bytes)
             .map_err(|e| anyhow::anyhow!("manifest parse failed: {e}"))?
@@ -1587,8 +1587,7 @@ fn try_fetch_revocation_list() -> Result<Option<mvm_security::image_verify::Revo
                     Err(e) => {
                         ui::warn(&format!(
                             "Could not refresh revocation list ({e}) and no fresh cache \
-                             is available; proceeding without recall enforcement. \
-                             Plan 36 §Layer 4."
+                             is available; proceeding without recall enforcement."
                         ));
                         return Ok(None);
                     }
@@ -1651,7 +1650,7 @@ fn try_fetch_revocation_list() -> Result<Option<mvm_security::image_verify::Revo
     .map_err(|e| {
         anyhow::anyhow!(
             "Revocation list signature verification failed: {e}. Refusing to \
-             trust an unverified recall. Plan 36 §Layer 4."
+             trust an unverified recall."
         )
     })?;
     let list: image_verify::RevocationList =
@@ -1707,7 +1706,7 @@ pub fn cmd_dev_import_image(
     let manifest = if std::env::var_os("MVM_SKIP_COSIGN_VERIFY").is_some() {
         ui::warn(
             "MVM_SKIP_COSIGN_VERIFY set — accepting unverified manifest. \
-             Plan 36 documents this as an emergency-rotation escape only.",
+             This is an emergency-rotation escape only.",
         );
         image_verify::parse_manifest(&manifest_bytes)
             .map_err(|e| anyhow::anyhow!("manifest parse failed: {e}"))?
@@ -2081,10 +2080,7 @@ fn find_builder_vm_flake() -> Result<String> {
         return Ok(candidate.to_str().unwrap_or(".").to_string());
     }
 
-    anyhow::bail!(
-        "Builder VM flake not found. Expected at nix/images/builder-vm/flake.nix \
-         (Plan 72 W2 artifact)."
-    )
+    anyhow::bail!("Builder VM flake not found. Expected at nix/images/builder-vm/flake.nix.")
 }
 
 /// Plan 72 W5 — ensure `~/.cache/mvm/builder-vm/<arch>/` contains
@@ -2383,9 +2379,10 @@ impl std::fmt::Display for SeedContractError {
         match self {
             Self::MissingManifest { manifest_path } => write!(
                 f,
-                "Stage 0 seed is missing `manifest.json` at {} — likely built before Plan 77 W5. \
-                 Rebuild the dev image (e.g. `mvmctl dev rebuild`) or import a signed published \
-                 image (`mvmctl dev import-image`) and retry `mvmctl dev up`.",
+                "Stage 0 seed is missing `manifest.json` at {} — likely built before \
+                 the seed-contract requirement landed. Rebuild the dev image \
+                 (e.g. `mvmctl dev rebuild`) or import a signed published image \
+                 (`mvmctl dev import-image`) and retry `mvmctl dev up`.",
                 manifest_path.display()
             ),
             Self::UnreadableManifest {
@@ -2596,9 +2593,9 @@ fn ensure_stage0_seed_manifest(seed_rootfs: &std::path::Path) -> Result<()> {
 /// the artifact + the dev-image fallback.
 #[cfg(feature = "builder-vm")]
 fn bootstrap_builder_vm_image_via_initramfs_stage0(
-    _builder_flake_dir: &str,
+    builder_flake_dir: &str,
     out_dir: &str,
-    _source_fingerprint: &str,
+    source_fingerprint: &str,
 ) -> Result<()> {
     let _stage0_guard = acquire_stage0_lock(out_dir)?;
 
@@ -2617,13 +2614,25 @@ fn bootstrap_builder_vm_image_via_initramfs_stage0(
         initramfs_bytes.len()
     ));
 
+    // The initramfs bootstrap dispatch into libkrun needs
+    // `extract_bundled_kernel`, which lives behind the
+    // `libkrun-sys` Cargo feature and is only linked into the
+    // supervisor binary today (not into mvmctl). Until the
+    // supervisor exposes a kernel-extraction sub-command (or
+    // mvmctl is built with the `libkrun-sys` feature), the only
+    // way to get a Stage 0 seed onto a fresh source checkout is
+    // to import one.
+    let _ = (builder_flake_dir, out_dir, source_fingerprint);
     anyhow::bail!(
-        "Stage 0 needs either a contract-compliant dev image in \
-         ~/.mvm/dev/{{current, prebuilt/v*, builds/*}} OR the new \
-         initramfs Stage 0 dispatch (wired in a follow-up PR). The \
-         initramfs bytes are ready at {}; the dispatch path that \
-         hands them to libkrun via `LibkrunBuilderVm::run_stage0_initramfs` \
-         is the only remaining piece.",
+        "Stage 0 has no seed image to bootstrap from. The initramfs cpio is \
+         ready at {} but the host-side dispatch that would run it is not yet \
+         wired (needs `mvm-libkrun-supervisor` to expose bundled-kernel \
+         extraction). Workarounds:\n\
+         \n\
+         1. Import a previously-built dev image:\n\
+            `mvmctl dev import-image --kernel <vmlinux> --rootfs <rootfs.ext4>`\n\
+         2. Or move/delete `nix/images/builder/flake.nix` so the source-checkout \
+            heuristic stops matching and the published prebuilt is used.",
         cpio_path.display()
     );
 }
@@ -5384,7 +5393,7 @@ mod builder_vm_bootstrap_tests {
         assert_eq!(err.audit_reason(), "seed_contract_missing_manifest");
         let msg = format!("{err}");
         assert!(
-            msg.contains("missing `manifest.json`") && msg.contains("Plan 77 W5"),
+            msg.contains("missing `manifest.json`") && msg.contains("seed-contract requirement"),
             "remediation message must point the user at the fix: {msg}"
         );
     }

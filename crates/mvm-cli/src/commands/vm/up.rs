@@ -602,7 +602,7 @@ fn resolve_deps_volume_binding_with_cache(
     let install = mvm_build::app_deps::install_app_deps(&spec, None).map_err(|e| match e {
         mvm_build::app_deps::InstallError::DriverNotProvided { .. } => anyhow::anyhow!(
             "no cached deps volume for this lockfile; run `mvmctl deps build \
-                 --from-workload-ir {}` first (Plan 73 Followup C)",
+                 --from-workload-ir {}` first",
             ir_path.display()
         ),
         other => anyhow::Error::new(other),
