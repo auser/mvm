@@ -754,6 +754,68 @@ mod linux {
         0
     }
 
+    /// Plan 89 W3 part 10 — base dir for per-job scratch
+    /// (`/tmp/<job_id>/`). Lives under the rootfs's existing
+    /// tmpfs `/tmp`, which is wiped on every cold boot anyway —
+    /// per-job scratch only matters for the persistent VM where
+    /// jobs share a process namespace and tmpfs root.
+    const JOB_SCRATCH_BASE: &str = "/tmp";
+
+    /// Compute the path of a per-job scratch dir. Pure function so
+    /// tests can spin one up under a `tempfile::tempdir` without
+    /// touching the real `/tmp`.
+    fn job_scratch_path(base: &str, job_id: &str) -> String {
+        format!("{base}/{job_id}")
+    }
+
+    /// Plan 89 W3 part 10 — RAII wrapper that creates
+    /// `/tmp/<job_id>/` on construction and best-effort removes
+    /// it on Drop. Defers to `job_scratch_path` so tests can
+    /// substitute the base dir.
+    ///
+    /// Cleanup is "best effort" because the leftover scratch dir
+    /// is not security-load-bearing on its own — the persistent
+    /// VM also wipes `/tmp` on cold restart (it's tmpfs), and the
+    /// follow-up parts add `unshare --mount` so the bind-mounts
+    /// inside the scratch dir tear down with the mount namespace.
+    /// If `remove_dir_all` fails (e.g. orphan child still holds a
+    /// file open), log the error and continue — the next dispatch
+    /// gets a fresh `/tmp/<new_job_id>/` either way.
+    struct JobScratch {
+        path: String,
+    }
+
+    impl JobScratch {
+        /// Create the per-job scratch dir under `base` (typically
+        /// [`JOB_SCRATCH_BASE`]) with mode 0700.
+        fn create(base: &str, job_id: &str) -> std::io::Result<Self> {
+            use std::os::unix::fs::PermissionsExt;
+            let path = job_scratch_path(base, job_id);
+            std::fs::create_dir_all(&path)?;
+            // Tighten to 0700 even though the dispatch loop and
+            // the build subprocess both run as uid 0 today — the
+            // builder:builder uid-drop in a follow-up part will
+            // rely on the mode bit being set already.
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            Ok(Self { path })
+        }
+
+        fn path(&self) -> &str {
+            &self.path
+        }
+    }
+
+    impl Drop for JobScratch {
+        fn drop(&mut self) {
+            if let Err(e) = std::fs::remove_dir_all(&self.path) {
+                eprintln!(
+                    "mvm-builder-init: dispatch loop: failed to clean up {path}: {e}",
+                    path = self.path
+                );
+            }
+        }
+    }
+
     /// Run one dispatched job: locate cmd.sh under
     /// `/job/<job_dir_relpath>/cmd.sh`, exec it, stream every
     /// stderr line back to `conn` as a `BuilderResponse::StderrChunk`
@@ -778,8 +840,33 @@ mod linux {
                 if !Path::new(&cmd_path).exists() {
                     (2, format!("missing {cmd_path}"), 0)
                 } else {
+                    // Plan 89 W3 part 10 — per-job scratch dir
+                    // at `/tmp/<job_id>/`. Pointed at by TMPDIR so
+                    // every tool that honors it (mkstemp, nix
+                    // evaluator, Python tempfile) writes there
+                    // instead of the shared rootfs `/tmp`.
+                    // Cleaned up when `_scratch` goes out of scope
+                    // at the end of this match arm. On creation
+                    // failure (extremely rare — tmpfs full at
+                    // boot, perms surprise), fall through with no
+                    // TMPDIR override and surface the warning in
+                    // the stderr tail — the build is still
+                    // useful, just without per-job tempfile
+                    // isolation.
+                    let (scratch, tmpdir) = match JobScratch::create(JOB_SCRATCH_BASE, &job_id) {
+                        Ok(s) => {
+                            let path = s.path().to_string();
+                            (Some(s), Some(path))
+                        }
+                        Err(e) => {
+                            eprintln!(
+                                "mvm-builder-init: dispatch loop: failed to create scratch for {job_id}: {e}"
+                            );
+                            (None, None)
+                        }
+                    };
                     let started = Instant::now();
-                    let (code, tail) = run_job_streaming(&cmd_path, |line| {
+                    let (code, tail) = run_job_streaming(&cmd_path, tmpdir.as_deref(), |line| {
                         let frame = crate::dispatch_response::stderr_chunk_json(&job_id, line);
                         if !write_frame(conn, frame.as_bytes()) {
                             // Host probably closed the conn (e.g.
@@ -792,6 +879,11 @@ mod linux {
                         }
                     });
                     let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    // Hold `scratch` until after the build returns
+                    // so its `Drop` cleans up after the
+                    // subprocess. Explicit drop documents the
+                    // ordering for the reader.
+                    drop(scratch);
                     (code, tail, ms)
                 }
             }
@@ -1322,13 +1414,16 @@ mod linux {
     }
 
     fn run_job(cmd_sh: &str) -> (i32, String) {
-        // Single-shot path: no streaming callback. The whole stderr
-        // tail still lands in `/job/result` and the host's
-        // file-based fallback parses it. Plan 89 W3 part 9 added
-        // the streaming variant for the persistent dispatch loop;
-        // this single-shot wrapper passes a no-op so the two code
-        // paths share their `Command`/`wait` logic.
-        run_job_streaming(cmd_sh, |_line| {})
+        // Single-shot path: no streaming callback, no TMPDIR
+        // override (single-shot uses the rootfs's tmpfs `/tmp`
+        // directly — the VM is going to power-off, so per-job
+        // scratch isolation has no second job to protect). The
+        // whole stderr tail still lands in `/job/result` and the
+        // host's file-based fallback parses it. Plan 89 W3 part 9
+        // added the streaming variant for the persistent dispatch
+        // loop; this single-shot wrapper passes a no-op so the
+        // two code paths share their `Command`/`wait` logic.
+        run_job_streaming(cmd_sh, None, |_line| {})
     }
 
     /// Plan 89 W3 part 9 — same as [`run_job`] but invokes
@@ -1346,16 +1441,29 @@ mod linux {
     /// `STDERR_TAIL_LINES` of trailing context is still buffered
     /// for the final Result frame's `stderr_tail`, matching the
     /// single-shot path's contract.
-    fn run_job_streaming<F: FnMut(&str)>(cmd_sh: &str, mut on_line: F) -> (i32, String) {
+    fn run_job_streaming<F: FnMut(&str)>(
+        cmd_sh: &str,
+        tmpdir: Option<&str>,
+        mut on_line: F,
+    ) -> (i32, String) {
         use std::collections::VecDeque;
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
-        let mut child = match Command::new("/bin/sh")
-            .args(["-eu", cmd_sh])
+        let mut cmd = Command::new("/bin/sh");
+        cmd.args(["-eu", cmd_sh])
             .stdout(Stdio::inherit())
-            .stderr(Stdio::piped())
-            .spawn()
-        {
+            .stderr(Stdio::piped());
+        // Plan 89 W3 part 10 — point the dispatched build's
+        // tmpfile machinery at the per-job scratch dir so leftover
+        // tempfiles can't outlive the dispatch. Tools that honor
+        // TMPDIR (mkstemp, Python's `tempfile`, Nix's evaluator,
+        // `mktemp(1)`) write into `/tmp/<job_id>/` instead of the
+        // shared rootfs `/tmp`. Single-shot passes `None` —
+        // see [`run_job`].
+        if let Some(t) = tmpdir {
+            cmd.env("TMPDIR", t);
+        }
+        let mut child = match cmd.spawn() {
             Ok(c) => c,
             Err(e) => return (127, format!("spawn /bin/sh: {e}")),
         };
@@ -1713,7 +1821,7 @@ mod linux {
             .expect("write cmd.sh");
             use std::sync::Mutex;
             let collected = Mutex::new(Vec::<String>::new());
-            let (code, tail) = run_job_streaming(cmd_path.to_str().unwrap(), |line| {
+            let (code, tail) = run_job_streaming(cmd_path.to_str().unwrap(), None, |line| {
                 collected.lock().unwrap().push(line.to_string());
             });
             assert_eq!(code, 0);
@@ -1739,7 +1847,7 @@ mod linux {
             std::fs::write(&cmd_path, script).expect("write cmd.sh");
             use std::sync::Mutex;
             let collected = Mutex::new(Vec::<String>::new());
-            let (code, tail) = run_job_streaming(cmd_path.to_str().unwrap(), |line| {
+            let (code, tail) = run_job_streaming(cmd_path.to_str().unwrap(), None, |line| {
                 collected.lock().unwrap().push(line.to_string());
             });
             assert_eq!(code, 42);
@@ -1764,6 +1872,105 @@ mod linux {
             let (code, tail) = run_job(cmd_path.to_str().unwrap());
             assert_eq!(code, 0);
             assert_eq!(tail, "hi");
+        }
+
+        /// Plan 89 W3 part 10 — `JobScratch::create` builds
+        /// `<base>/<job_id>` with mode 0700 and `Drop` wipes it.
+        /// We parameterize on a tempdir base so the test doesn't
+        /// touch the host's real `/tmp`.
+        #[test]
+        fn job_scratch_creates_dir_and_removes_on_drop() {
+            use std::os::unix::fs::PermissionsExt;
+            let base = tempfile::tempdir().expect("tempdir");
+            let base_str = base.path().to_str().unwrap();
+            let job_id = "00000000-0000-0000-0000-000000000000";
+            let expected = base.path().join(job_id);
+            {
+                let scratch = JobScratch::create(base_str, job_id).expect("create scratch");
+                assert!(expected.is_dir(), "scratch dir created");
+                let mode = std::fs::metadata(&expected)
+                    .expect("stat")
+                    .permissions()
+                    .mode()
+                    & 0o777;
+                assert_eq!(mode, 0o700, "scratch dir tightened to 0700");
+                assert_eq!(scratch.path(), expected.to_str().unwrap());
+            }
+            assert!(!expected.exists(), "Drop removed scratch dir");
+        }
+
+        /// Plan 89 W3 part 10 — Drop still removes the dir even
+        /// if it has files inside (the build leaves tempfiles
+        /// behind). Catches the `remove_dir_all` vs `remove_dir`
+        /// difference.
+        #[test]
+        fn job_scratch_drop_clears_nonempty_dir() {
+            let base = tempfile::tempdir().expect("tempdir");
+            let base_str = base.path().to_str().unwrap();
+            let job_id = "deadbeef";
+            let expected = base.path().join(job_id);
+            {
+                let _scratch = JobScratch::create(base_str, job_id).expect("create scratch");
+                std::fs::write(expected.join("a.txt"), b"leak").expect("write a");
+                std::fs::create_dir(expected.join("sub")).expect("mkdir sub");
+                std::fs::write(expected.join("sub/b.txt"), b"leak").expect("write b");
+            }
+            assert!(!expected.exists(), "Drop wiped nested contents");
+        }
+
+        /// Plan 89 W3 part 10 — `run_job_streaming` honors the
+        /// TMPDIR override. cmd.sh echoes the var so we can
+        /// assert the build subprocess saw it.
+        #[test]
+        fn run_job_streaming_threads_tmpdir_through_to_subprocess() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cmd_path = dir.path().join("cmd.sh");
+            // The subprocess inherits TMPDIR from its environment;
+            // echo it back via stderr so the test sees it.
+            std::fs::write(&cmd_path, "echo \"tmpdir=$TMPDIR\" >&2\nexit 0\n")
+                .expect("write cmd.sh");
+            let (code, tail) =
+                run_job_streaming(cmd_path.to_str().unwrap(), Some("/scratch/abc"), |_| {});
+            assert_eq!(code, 0);
+            assert_eq!(tail, "tmpdir=/scratch/abc");
+        }
+
+        /// Plan 89 W3 part 10 — when `tmpdir` is `None` the
+        /// subprocess inherits whatever TMPDIR the dispatch loop
+        /// already had (typically unset inside PID 1). We assert
+        /// the env var is *not* explicitly forced to a value the
+        /// test process supplies via `Command::env`, so single-
+        /// shot keeps its pre-part-10 behavior.
+        #[test]
+        fn run_job_streaming_does_not_override_tmpdir_when_none() {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cmd_path = dir.path().join("cmd.sh");
+            std::fs::write(&cmd_path, "echo \"tmpdir=${TMPDIR-UNSET}\" >&2\nexit 0\n")
+                .expect("write cmd.sh");
+            // SAFETY: this test runs single-threaded in cargo
+            // test's default scheduler for this binary; we set the
+            // env var briefly to a known value and then assert the
+            // subprocess saw exactly that (not some `/scratch/...`
+            // override). Restoring afterward.
+            //
+            // The point of the assertion: with `tmpdir = None`,
+            // `run_job_streaming` doesn't call `.env("TMPDIR", _)`
+            // — it leaves the parent's env alone.
+            let prior = std::env::var("TMPDIR").ok();
+            unsafe {
+                std::env::set_var("TMPDIR", "/inherited-from-parent");
+            }
+            let (code, tail) = run_job_streaming(cmd_path.to_str().unwrap(), None, |_| {});
+            // Restore TMPDIR before the assert so a panic still
+            // leaves the parent env clean for other tests.
+            unsafe {
+                match prior {
+                    Some(v) => std::env::set_var("TMPDIR", v),
+                    None => std::env::remove_var("TMPDIR"),
+                }
+            }
+            assert_eq!(code, 0);
+            assert_eq!(tail, "tmpdir=/inherited-from-parent");
         }
     }
 }
