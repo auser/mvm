@@ -66,6 +66,27 @@ if ! mountpoint -q /out; then
   exit 65
 fi
 
+# libkrun's set_root mode backs the guest root with virtio-fs
+# from the host's macOS APFS, which is case-insensitive by
+# default. Several Nix derivations contain files that only differ
+# by case (e.g. the Linux kernel headers ship `xt_connmark.h` and
+# `xt_CONNMARK.h` in the same directory). Substitution from
+# cache.nixos.org fails with `creating file '...xt_CONNMARK.h':
+# File exists` on APFS — the second file collides with the first.
+#
+# Fix: mount tmpfs over /nix BEFORE `apk add nix` runs, so the
+# nix package's closure (and every subsequent `nix-build`
+# substitution) lives on case-sensitive in-memory storage.
+# Mounting after apk would leave the nix binary on APFS and
+# break the case-sensitive guarantee for substitutions.
+#
+# Size cap: 4 GiB. Sufficient for the builder VM closure (~600 MB
+# typical). Adjust if the closure grows. Memory budget is paid
+# from the libkrun guest's RAM allocation (set in
+# LibkrunBuilderVm::run_stage0).
+mount -t tmpfs -o size=4G,mode=0755 tmpfs /nix
+mkdir -p /nix/store /nix/var/nix /nix/var/log/nix
+
 # Install Nix from Alpine's signed package repos. `apk-tools`
 # verifies the signed APKINDEX against /etc/apk/keys/ (the
 # Alpine release-signing keys shipped in the minirootfs) and
@@ -93,11 +114,6 @@ fi
 # explicitly.
 export HOME=/root
 mkdir -p "$HOME"
-
-# Nix's `nix build` in single-user mode (no nix-daemon running)
-# wants /nix as writable. Alpine's nix package creates /nix/store
-# during postinstall; ensure it's writable here too.
-mkdir -p /nix/store /nix/var/nix
 
 # Tell `nix/images/builder-vm/flake.nix` where the workspace
 # root is, since the `path:` URL fetcher store-copies just the
