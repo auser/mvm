@@ -11,7 +11,7 @@ use flate2::read::GzDecoder;
 use mvm_build::rootfs::{MaterializeExt4Input, MaterializeExt4Options, materialize_ext4};
 use mvm_oci::{
     ImageReference, LayerDescriptor, LayerFetchOptions, LinuxPlatform, OciLayerFetcher,
-    OciManifestFetcher, UnpackOptions, unpack_layer, verify_sha256_digest,
+    OciManifestFetcher, RegistryAuthConfig, UnpackOptions, unpack_layer, verify_sha256_digest,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
@@ -102,6 +102,7 @@ pub(in crate::commands) struct ResolvedOciRunImage {
     pub rootfs_path: PathBuf,
     pub pulled: bool,
     pub provenance: OciProvenance,
+    pub auth_source: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -305,6 +306,60 @@ impl CosignVerifier for CosignCommandVerifier {
     }
 }
 
+#[derive(Debug, Clone)]
+struct OciRegistryAuthDecision {
+    auth: RegistryAuthConfig,
+    source: String,
+}
+
+fn registry_auth_for(image_ref: &ImageReference) -> Result<OciRegistryAuthDecision> {
+    registry_auth_from_lookup(image_ref, |name| std::env::var(name).ok())
+}
+
+fn registry_auth_from_lookup(
+    image_ref: &ImageReference,
+    mut lookup: impl FnMut(&str) -> Option<String>,
+) -> Result<OciRegistryAuthDecision> {
+    let registry_key = registry_env_key(&image_ref.registry)?;
+    let registry_var = format!("MVM_OCI_BEARER_TOKEN_{registry_key}");
+    if let Some(token) = nonempty_lookup(&registry_var, &mut lookup) {
+        return Ok(OciRegistryAuthDecision {
+            auth: RegistryAuthConfig::bearer(token),
+            source: format!("env:{registry_var}"),
+        });
+    }
+    if let Some(token) = nonempty_lookup("MVM_OCI_BEARER_TOKEN", &mut lookup) {
+        return Ok(OciRegistryAuthDecision {
+            auth: RegistryAuthConfig::bearer(token),
+            source: "env:MVM_OCI_BEARER_TOKEN".to_string(),
+        });
+    }
+    Ok(OciRegistryAuthDecision {
+        auth: RegistryAuthConfig::Anonymous,
+        source: "anonymous".to_string(),
+    })
+}
+
+fn nonempty_lookup(name: &str, lookup: &mut impl FnMut(&str) -> Option<String>) -> Option<String> {
+    lookup(name)
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+}
+
+fn registry_env_key(registry: &str) -> Result<String> {
+    let mut key = String::with_capacity(registry.len());
+    for ch in registry.chars() {
+        if ch.is_ascii_alphanumeric() {
+            key.push(ch.to_ascii_uppercase());
+        } else if matches!(ch, '.' | '-' | ':') {
+            key.push('_');
+        } else {
+            bail!("OCI registry host contains unsupported env-var character: {registry:?}");
+        }
+    }
+    Ok(key)
+}
+
 #[derive(Debug, Serialize, PartialEq, Eq)]
 struct ImageListRow {
     reference: String,
@@ -337,17 +392,18 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     let cache_root = oci_cache_root();
     match args.action {
         ImageAction::Pull { reference, prod } => {
-            let (image, trust) = pull_image_with_trust(&cache_root, &reference, prod)?;
+            let (image, trust, auth_source) = pull_image_with_trust(&cache_root, &reference, prod)?;
             let provenance = image.provenance("image_pull", &reference, &trust);
             mvm_core::audit_emit!(
                 ImageFetch,
-                "source=image_pull reference={} digest={} prod={} layers={} trust_policy={} verification_status={}",
+                "source=image_pull reference={} digest={} prod={} layers={} trust_policy={} verification_status={} auth_source={}",
                 image.reference,
                 image.resolved_digest,
                 prod,
                 provenance.layer_digests.len(),
                 provenance.trust_policy,
-                provenance.verification_status
+                provenance.verification_status,
+                auth_source
             );
             ui::success(&format!(
                 "Pulled {} -> {}",
@@ -413,14 +469,15 @@ pub(in crate::commands) fn resolve_or_pull_run_image(
         bail!("mvmctl run --image --prod requires a digest-pinned reference");
     }
     let canonical = image_ref.canonical();
-    let (image, pulled, trust_from_pull) = match load_index(cache_root)
+    let (image, pulled, trust_from_pull, auth_source_from_pull) = match load_index(cache_root)
         .ok()
         .and_then(|index| find_image(&index, &canonical).cloned())
     {
-        Some(cached) if cached.rootfs_path.is_some() => (cached, false, None),
+        Some(cached) if cached.rootfs_path.is_some() => (cached, false, None, None),
         _ => {
-            let (cached, trust) = pull_image_ref(cache_root, image_ref.clone(), reference, prod)?;
-            (cached, true, Some(trust))
+            let (cached, trust, auth_source) =
+                pull_image_ref(cache_root, image_ref.clone(), reference, prod)?;
+            (cached, true, Some(trust), Some(auth_source))
         }
     };
     let Some(rootfs_relative) = image.rootfs_path.as_deref() else {
@@ -448,6 +505,7 @@ pub(in crate::commands) fn resolve_or_pull_run_image(
         resolved_digest: image.resolved_digest,
         rootfs_path,
         pulled,
+        auth_source: auth_source_from_pull,
     })
 }
 
@@ -455,7 +513,7 @@ fn pull_image_with_trust(
     cache_root: &Path,
     reference: &str,
     prod: bool,
-) -> Result<(CachedOciImage, OciTrustDecision)> {
+) -> Result<(CachedOciImage, OciTrustDecision, String)> {
     let image_ref: ImageReference = reference.parse()?;
     if prod && !image_ref.is_digest_pinned() {
         bail!("mvmctl image pull --prod requires a digest-pinned reference");
@@ -598,7 +656,7 @@ fn pull_image_ref(
     image_ref: ImageReference,
     supplied_reference: &str,
     prod: bool,
-) -> Result<(CachedOciImage, OciTrustDecision)> {
+) -> Result<(CachedOciImage, OciTrustDecision, String)> {
     let prod_policy = if prod {
         let policy = load_oci_registry_policy()?;
         enforce_registry_allowlist(&image_ref, &policy)?;
@@ -607,12 +665,13 @@ fn pull_image_ref(
     } else {
         None
     };
+    let registry_auth = registry_auth_for(&image_ref)?;
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
         .context("build Tokio runtime for OCI pull")?;
 
-    let manifest_fetcher = OciManifestFetcher::new();
+    let manifest_fetcher = OciManifestFetcher::with_auth(registry_auth.auth);
     let manifest = runtime
         .block_on(
             manifest_fetcher
@@ -721,7 +780,7 @@ fn pull_image_ref(
     };
     upsert_image(&mut index, cached.clone());
     save_index(cache_root, &index)?;
-    Ok((cached, trust))
+    Ok((cached, trust, registry_auth.source))
 }
 
 fn write_config_blob(
@@ -1490,6 +1549,64 @@ require_signatures = false
         assert!(
             err.to_string().contains("cannot disable cosign signatures"),
             "unexpected error: {err}"
+        );
+    }
+
+    #[test]
+    fn registry_env_key_normalizes_registry_host() {
+        assert_eq!(registry_env_key("ghcr.io").expect("key"), "GHCR_IO");
+        assert_eq!(
+            registry_env_key("registry.example.test:5000").expect("key"),
+            "REGISTRY_EXAMPLE_TEST_5000"
+        );
+    }
+
+    #[test]
+    fn registry_auth_prefers_registry_specific_bearer_token() {
+        let image_ref: ImageReference = "ghcr.io/acme/app:latest".parse().expect("image ref");
+        let auth = registry_auth_from_lookup(&image_ref, |name| match name {
+            "MVM_OCI_BEARER_TOKEN_GHCR_IO" => Some("registry-token".to_string()),
+            "MVM_OCI_BEARER_TOKEN" => Some("global-token".to_string()),
+            _ => None,
+        })
+        .expect("auth resolution");
+
+        assert_eq!(auth.source, "env:MVM_OCI_BEARER_TOKEN_GHCR_IO");
+        assert!(auth.auth.is_authenticated());
+        assert_eq!(auth.auth.kind(), "bearer");
+    }
+
+    #[test]
+    fn registry_auth_falls_back_to_global_bearer_token() {
+        let image_ref: ImageReference = "ghcr.io/acme/app:latest".parse().expect("image ref");
+        let auth = registry_auth_from_lookup(&image_ref, |name| match name {
+            "MVM_OCI_BEARER_TOKEN" => Some("global-token".to_string()),
+            _ => None,
+        })
+        .expect("auth resolution");
+
+        assert_eq!(auth.source, "env:MVM_OCI_BEARER_TOKEN");
+        assert_eq!(auth.auth.kind(), "bearer");
+    }
+
+    #[test]
+    fn registry_auth_has_no_docker_config_dependency() {
+        let image_ref: ImageReference = "ghcr.io/acme/app:latest".parse().expect("image ref");
+        let requested = RefCell::new(Vec::new());
+        let auth = registry_auth_from_lookup(&image_ref, |name| {
+            requested.borrow_mut().push(name.to_string());
+            None
+        })
+        .expect("auth resolution");
+
+        assert_eq!(auth.source, "anonymous");
+        assert!(!auth.auth.is_authenticated());
+        assert_eq!(
+            requested.into_inner(),
+            vec![
+                "MVM_OCI_BEARER_TOKEN_GHCR_IO".to_string(),
+                "MVM_OCI_BEARER_TOKEN".to_string()
+            ]
         );
     }
 

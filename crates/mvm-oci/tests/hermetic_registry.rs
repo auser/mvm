@@ -10,7 +10,7 @@ mod common;
 use common::{HermeticRegistry, client_for, minimal_image_manifest};
 use mvm_oci::{
     LayerDescriptor, LayerFetchOptions, LinuxPlatform, ManifestFetcher, OciError, OciLayerFetcher,
-    OciManifestFetcher, verify_sha256_digest,
+    OciManifestFetcher, RegistryAuthConfig, verify_sha256_digest,
 };
 use sha2::Digest;
 use std::time::Duration;
@@ -40,6 +40,80 @@ async fn manifest_fetch_round_trip_against_hermetic_registry() {
         "got media_type {:?}",
         fetched.media_type
     );
+}
+
+#[tokio::test]
+async fn manifest_fetch_uses_explicit_bearer_auth() {
+    let reg = HermeticRegistry::start().await;
+    let layer_bytes = b"private-layer";
+    let (manifest_bytes, _layer_digest) = minimal_image_manifest(layer_bytes, LAYER_MEDIA);
+    let token = "fixture-token";
+
+    let manifest_digest = reg
+        .register_bearer_manifest_with_digest_path(
+            "private/app",
+            "v1",
+            MANIFEST_MEDIA,
+            &manifest_bytes,
+            token,
+        )
+        .await;
+
+    let fetcher = OciManifestFetcher::with_client_and_auth(
+        client_for(&reg),
+        RegistryAuthConfig::bearer(token),
+    );
+    let image = reg.image_ref("private/app", "v1");
+    let fetched = fetcher.fetch(&image).await.expect("manifest fetch");
+
+    assert_eq!(fetched.digest, manifest_digest);
+}
+
+#[tokio::test]
+async fn manifest_fetch_rejects_missing_bearer_auth() {
+    let reg = HermeticRegistry::start().await;
+    let layer_bytes = b"private-layer";
+    let (manifest_bytes, _layer_digest) = minimal_image_manifest(layer_bytes, LAYER_MEDIA);
+
+    reg.register_bearer_manifest_with_digest_path(
+        "private/app",
+        "v1",
+        MANIFEST_MEDIA,
+        &manifest_bytes,
+        "fixture-token",
+    )
+    .await;
+
+    let fetcher = OciManifestFetcher::with_client(client_for(&reg));
+    let image = reg.image_ref("private/app", "v1");
+    let err = fetcher.fetch(&image).await.unwrap_err();
+
+    assert!(matches!(err, OciError::Registry(_)));
+}
+
+#[tokio::test]
+async fn manifest_fetch_rejects_wrong_bearer_auth() {
+    let reg = HermeticRegistry::start().await;
+    let layer_bytes = b"private-layer";
+    let (manifest_bytes, _layer_digest) = minimal_image_manifest(layer_bytes, LAYER_MEDIA);
+
+    reg.register_bearer_manifest_with_digest_path(
+        "private/app",
+        "v1",
+        MANIFEST_MEDIA,
+        &manifest_bytes,
+        "fixture-token",
+    )
+    .await;
+
+    let fetcher = OciManifestFetcher::with_client_and_auth(
+        client_for(&reg),
+        RegistryAuthConfig::bearer("wrong-token"),
+    );
+    let image = reg.image_ref("private/app", "v1");
+    let err = fetcher.fetch(&image).await.unwrap_err();
+
+    assert!(matches!(err, OciError::Registry(_)));
 }
 
 #[tokio::test]
@@ -372,6 +446,45 @@ async fn layer_fetch_round_trip_manifest_to_layers_to_blob() {
         .expect("layer fetch");
     assert_eq!(n, layer_bytes_a.len() as u64);
     assert_eq!(sink, layer_bytes_a);
+}
+
+#[tokio::test]
+async fn layer_fetch_reuses_manifest_fetcher_bearer_auth() {
+    let reg = HermeticRegistry::start().await;
+    let token = "layer-token";
+    let layer_bytes = b"private-layer-bytes".to_vec();
+    let _layer_digest = reg
+        .register_bearer_blob("private/multi", LAYER_MEDIA, &layer_bytes, token)
+        .await;
+    let (manifest_bytes, expected_digest) = minimal_image_manifest(&layer_bytes, LAYER_MEDIA);
+    reg.register_bearer_manifest_with_digest_path(
+        "private/multi",
+        "v1",
+        MANIFEST_MEDIA,
+        &manifest_bytes,
+        token,
+    )
+    .await;
+
+    let manifest_fetcher = OciManifestFetcher::with_client_and_auth(
+        client_for(&reg),
+        RegistryAuthConfig::bearer(token),
+    );
+    let layer_fetcher =
+        OciLayerFetcher::from_manifest_fetcher(&manifest_fetcher, LayerFetchOptions::default());
+    let image = reg.image_ref("private/multi", "v1");
+
+    let fetched_manifest = manifest_fetcher.fetch(&image).await.expect("manifest");
+    let layers = fetched_manifest.layers().expect("parse layers");
+    assert_eq!(layers[0].digest, expected_digest);
+
+    let mut sink: Vec<u8> = Vec::new();
+    let n = layer_fetcher
+        .fetch_layer(&image, &layers[0], &mut sink)
+        .await
+        .expect("authenticated layer fetch");
+    assert_eq!(n, layer_bytes.len() as u64);
+    assert_eq!(sink, layer_bytes);
 }
 
 #[tokio::test]

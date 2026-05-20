@@ -21,7 +21,78 @@ use oci_client::client::Client;
 pub use oci_client::client::{ClientConfig, ClientProtocol};
 use oci_client::manifest::OciManifest;
 use oci_client::secrets::RegistryAuth;
+use secrecy::{ExposeSecret, SecretString};
 use sha2::{Digest, Sha256};
+
+/// Explicit registry authentication material for OCI pulls.
+///
+/// This deliberately does not read Docker credential helpers or
+/// `~/.docker/config.json`. Callers pass the credential source they
+/// trust, and this crate only forwards it to the OCI Distribution
+/// client for the current process.
+#[derive(Clone, Default)]
+pub enum RegistryAuthConfig {
+    #[default]
+    Anonymous,
+    Bearer {
+        token: SecretString,
+    },
+    Basic {
+        username: String,
+        password: SecretString,
+    },
+}
+
+impl std::fmt::Debug for RegistryAuthConfig {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Self::Anonymous => f.write_str("RegistryAuthConfig::Anonymous"),
+            Self::Bearer { .. } => f.write_str("RegistryAuthConfig::Bearer { token: REDACTED }"),
+            Self::Basic { username, .. } => f
+                .debug_struct("RegistryAuthConfig::Basic")
+                .field("username", username)
+                .field("password", &"REDACTED")
+                .finish(),
+        }
+    }
+}
+
+impl RegistryAuthConfig {
+    pub fn bearer(token: impl Into<String>) -> Self {
+        Self::Bearer {
+            token: SecretString::from(token.into()),
+        }
+    }
+
+    pub fn basic(username: impl Into<String>, password: impl Into<String>) -> Self {
+        Self::Basic {
+            username: username.into(),
+            password: SecretString::from(password.into()),
+        }
+    }
+
+    pub fn kind(&self) -> &'static str {
+        match self {
+            Self::Anonymous => "anonymous",
+            Self::Bearer { .. } => "bearer",
+            Self::Basic { .. } => "basic",
+        }
+    }
+
+    pub fn is_authenticated(&self) -> bool {
+        !matches!(self, Self::Anonymous)
+    }
+
+    pub(crate) fn to_registry_auth(&self) -> RegistryAuth {
+        match self {
+            Self::Anonymous => RegistryAuth::Anonymous,
+            Self::Bearer { token } => RegistryAuth::Bearer(token.expose_secret().to_string()),
+            Self::Basic { username, password } => {
+                RegistryAuth::Basic(username.clone(), password.expose_secret().to_string())
+            }
+        }
+    }
+}
 
 /// Result of a manifest fetch. Bytes are kept verbatim because
 /// digest verification is byte-exact — any normalization
@@ -120,6 +191,7 @@ pub trait ManifestFetcher: Send + Sync {
 /// `check-no-display-on-secret-types` lint.
 pub struct OciManifestFetcher {
     client: Client,
+    auth: RegistryAuthConfig,
 }
 
 impl Default for OciManifestFetcher {
@@ -142,6 +214,18 @@ impl OciManifestFetcher {
     pub fn with_config(config: ClientConfig) -> Self {
         Self {
             client: Client::new(config),
+            auth: RegistryAuthConfig::Anonymous,
+        }
+    }
+
+    pub fn with_auth(auth: RegistryAuthConfig) -> Self {
+        Self::with_config_and_auth(ClientConfig::default(), auth)
+    }
+
+    pub fn with_config_and_auth(config: ClientConfig, auth: RegistryAuthConfig) -> Self {
+        Self {
+            client: Client::new(config),
+            auth,
         }
     }
 
@@ -149,13 +233,24 @@ impl OciManifestFetcher {
     /// a manifest fetcher and a layer fetcher share one client to
     /// pool connections.
     pub fn with_client(client: Client) -> Self {
-        Self { client }
+        Self {
+            client,
+            auth: RegistryAuthConfig::Anonymous,
+        }
+    }
+
+    pub fn with_client_and_auth(client: Client, auth: RegistryAuthConfig) -> Self {
+        Self { client, auth }
     }
 
     /// Borrow the underlying client. Layer fetcher consumes this
     /// so the two share a connection pool.
     pub(crate) fn client(&self) -> &Client {
         &self.client
+    }
+
+    pub(crate) fn auth(&self) -> &RegistryAuthConfig {
+        &self.auth
     }
 
     /// Fetch a platform-specific Linux image manifest.
@@ -237,13 +332,10 @@ impl ManifestFetcher for OciManifestFetcher {
         // digest against what the registry advertised. The
         // content digest is a property of the *wire* bytes;
         // anything else is a bug.
+        let auth = self.auth.to_registry_auth();
         let (bytes, advertised_digest) = self
             .client
-            .pull_manifest_raw(
-                &upstream_ref,
-                &RegistryAuth::Anonymous,
-                ACCEPTED_MANIFEST_MEDIA,
-            )
+            .pull_manifest_raw(&upstream_ref, &auth, ACCEPTED_MANIFEST_MEDIA)
             .await
             .map_err(|e| OciError::Registry(e.to_string()))?;
 

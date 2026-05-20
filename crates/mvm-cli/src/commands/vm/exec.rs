@@ -457,15 +457,17 @@ fn build_exec_request(
             emit_oci_run_admission(&cached, args.cpus, u64::from(memory_mib), args.timeout)
                 .context("admitting OCI image provenance for mvmctl run --image")?;
             if cached.pulled {
+                let auth_source = cached.auth_source.as_deref().unwrap_or("unknown");
                 mvm_core::audit_emit!(
                     ImageFetch,
-                    "source=run_image reference={} digest={} prod={} layers={} trust_policy={} verification_status={}",
+                    "source=run_image reference={} digest={} prod={} layers={} trust_policy={} verification_status={} auth_source={}",
                     cached.reference,
                     cached.resolved_digest,
                     prod,
                     cached.provenance.layer_digests.len(),
                     cached.provenance.trust_policy,
-                    cached.provenance.verification_status
+                    cached.provenance.verification_status,
+                    auth_source
                 );
             }
             let (kernel_path, _default_rootfs_path) = ensure_default_microvm_image()?;

@@ -30,10 +30,9 @@
 //! traversal, hardlink escape, setuid handling), verity generation
 //! (ADR-050), template registration, and the `mvmctl image pull`
 //! CLI surface land in subsequent W1 PRs. Private-registry
-//! authentication (Bearer / `.docker/config.json`) is also a later
-//! PR — W1.1/W1.2 ship anonymous-only by design so the
-//! credential-as-secret handling can be reviewed in isolation against
-//! ADR-049's substitution machinery.
+//! authentication is explicit: callers pass bearer/basic credentials
+//! through [`RegistryAuthConfig`], and this crate deliberately does
+//! not read Docker credential helpers or `~/.docker/config.json`.
 //!
 //! Crate-level invariant: this crate **only** speaks the OCI
 //! distribution wire format. It does not touch the host filesystem,
@@ -63,7 +62,7 @@ pub use error::OciError;
 pub use layer::{LayerDescriptor, LayerFetchOptions, OciLayerFetcher};
 pub use manifest::{
     ClientConfig, ClientProtocol, FetchedManifest, LinuxPlatform, ManifestFetcher,
-    OciManifestFetcher, verify_sha256_digest,
+    OciManifestFetcher, RegistryAuthConfig, verify_sha256_digest,
 };
 pub use reference::ImageReference;
 pub use unpack::{
