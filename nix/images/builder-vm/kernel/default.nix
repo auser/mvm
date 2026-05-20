@@ -176,8 +176,14 @@ let
   '';
 
 in
+# `allowImportFromDerivation = false` keeps `nix flake check --no-build`
+# (CI lane "Nix flake check (Linux eval)") working: `--no-build` will
+# not realize the configfile derivation, and any IFD from linuxManualConfig
+# would then fail with `path '…-kernel-config.drv' is not valid`. We pass
+# `version`/`modDirVersion`/`src` explicitly from `pkgs.linux_6_12`, so
+# the configfile content isn't needed at eval time — only at build time.
 pkgs.linuxManualConfig {
   inherit (pkgs.linux_6_12) src version modDirVersion;
   inherit configfile;
-  allowImportFromDerivation = true;
+  allowImportFromDerivation = false;
 }
