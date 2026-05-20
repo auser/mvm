@@ -1791,7 +1791,7 @@ don't fall off.
 - ✅ [`plans/90-gateway-frame-fuzz.md`](plans/90-gateway-frame-fuzz.md) — fuzz coverage for the gateway frame parsers.
 - 🟡 [`plans/91-...`](plans/) — Alpine Stage 0 bootstrap (PR #417 open).
 - 🟡 [`plans/92-minimal-builder-vm-kernel.md`](plans/92-minimal-builder-vm-kernel.md) — slim custom kernel via `linuxManualConfig` + `tinyconfig` (committed locally on `worktree-plan-92-stock-kernel`; carried forward by Plan 95's PR).
-- 🟡 [`plans/95-builder-vm-kernel-slimming.md`](plans/95-builder-vm-kernel-slimming.md) — **Plan 92 followup.** Aggressive SoC/platform cluster disables + dead `microvm.nix` input drop. Lands as one PR carrying Plan 92's base commits forward.
+- 🟡 [`plans/95-builder-vm-kernel-slimming.md`](plans/95-builder-vm-kernel-slimming.md) — **Plan 92 followup.** Aggressive ARM64 SoC platform cluster disables (W3) + permanent `kernel-configfile` flake output for audit (W2). Lands as one PR carrying Plan 92's base commits forward. (W1 "drop microvm.nix input" was dropped post-survey — `nix/lib/` still requires it.)
 
 ### Sprint 54 success criteria
 
@@ -1803,7 +1803,8 @@ don't fall off.
 ### Non-goals
 
 - Kernel-warning surfacing UX (Plan 95 W4, deferred to follow-up issue).
-- microvm.nix adoption — explicitly rejected in Plan 95 (kernel scope) and Plan 92 §"Decision" (workload-build scope).
+- Dropping the `microvm.nix` flake input — locally unused in builder-vm but required by `nix/lib/default.nix` for the root flake's NixOS-module path; rework deferred (Plan 95 W1 was dropped post-survey).
+- microvm.nix as a *kernel* or *workload-build* base — explicitly rejected in Plan 95 §Problem and Plan 92 §Decision.
 
 ## Completed Sprints
 

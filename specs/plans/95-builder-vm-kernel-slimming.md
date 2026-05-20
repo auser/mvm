@@ -32,9 +32,21 @@ We will never see any of these — the builder VM boots under libkrun
 (Apple Silicon virt) or Firecracker (KVM virt), never on real SoC
 hardware.
 
-Separately, `nix/images/builder-vm/flake.nix:69-72` declares a
+~~Separately, `nix/images/builder-vm/flake.nix:69-72` declares a
 `microvm.nix` flake input that is **threaded through `libFor` but
-never used** by any builder-VM derivation. Dead dep.
+never used** by any builder-VM derivation. Dead dep.~~
+
+**Correction (2026-05-20, post-survey).** The earlier "dead dep"
+diagnosis was wrong. `microvm.nix` is *locally unused* by the
+builder-vm flake's own derivations, but `nix/lib/default.nix:6`,
+`nix/lib/mk-guest.nix:34`, and `nix/lib/mkFunctionWorkload.nix:35`
+take `microvm` as a required parameter (per ADR-013 — see
+`nix/lib/mk-guest.nix:29` and the root `nix/flake.nix:40-47`).
+The root flake actively uses `microvm.nixosModules.microvm` and
+`microvm.declaredRunner`. Dropping `microvm` from the builder-vm
+flake's `libFor` import would require restructuring `nix/lib/` to
+make the parameter optional, which is bigger than the win.
+Keep the input; W1 is dropped from this plan's scope.
 
 ## Decision
 
@@ -42,10 +54,7 @@ never used** by any builder-VM derivation. Dead dep.
    clusters and any other platform symbols `olddefconfig` is
    defaulting on. Source-of-truth list derived empirically from the
    actual `.config` `olddefconfig` produces — not guessed.
-2. **Drop the dead `microvm.nix` input** from
-   `nix/images/builder-vm/flake.nix`. Independent of the kernel work,
-   bundled in the same PR for hygiene.
-3. **Defer kernel-warning surfacing UX** to a follow-up issue — out
+2. **Defer kernel-warning surfacing UX** to a follow-up issue — out
    of scope for this plan.
 
 ### Why not microvm.nix
@@ -77,19 +86,16 @@ write if a user asks, not a dependency we import.
 `fd04817c` (slim custom builder-VM kernel via `linuxManualConfig`)
 and `e663abf4` (kernel build fix — `runCommandCC` + `patchShebangs`
 + `defconfig`) are the base this plan extends. They land in the
-same PR as W1-W3.
+same PR as W2-W3.
 
-### W1 — Drop dead `microvm.nix` flake input
+### ~~W1 — Drop dead `microvm.nix` flake input~~ (dropped)
 
-File: `nix/images/builder-vm/flake.nix`
-
-- Lines 69-72: remove the `microvm` input declaration.
-- Line 76: drop `microvm` from the `outputs` destructure.
-- Line 109: drop `inherit … microvm;` from `import (workspace +
-  "/nix/lib")`.
-- `nix/lib/default.nix`: drop the `microvm` parameter if no remaining
-  caller passes it. (Audit — the parent `flake.nix` may still pass it
-  to other images.)
+Dropped post-survey. See Correction in §Problem. `microvm` is a
+required parameter of `nix/lib/default.nix` and is actively used by
+the root `nix/flake.nix` (`microvm.nixosModules.microvm` + the
+declared runner) — not a dead dep. Removing it would require
+restructuring `nix/lib/` to make the parameter optional. Out of
+scope for kernel slimming.
 
 ### W2 — Expose `configfile` for verification baseline
 
