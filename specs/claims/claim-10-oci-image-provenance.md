@@ -1,6 +1,6 @@
 ---
 claim: 10-oci-image-provenance
-status: Preview
+status: Shipped
 gated_phrases:
   - "any OCI image"
   - "any container image"
@@ -58,7 +58,7 @@ chain signature.
 
 ## CI gate that ratifies the claim
 
-Plan 85 Phase E ships focused CLI unit coverage:
+Plan 85 Phase E/F ships focused CLI unit coverage:
 
 - Cached image resolution returns a provenance record with registry,
   repo, supplied ref, resolved digest, layer digest list, trust policy,
@@ -70,6 +70,10 @@ Plan 85 Phase E ships focused CLI unit coverage:
   emits `plan.admitted` followed by `plan.oci_provenance`.
 - `--prod` policy still refuses mutable references before pull or
   boot.
+- Production OCI policy parses registry allow-lists and trusted
+  cosign identities, rejects signature opt-outs, rejects denied
+  registries before verification, and rejects missing or invalid
+  signatures.
 
 ## Status transitions
 
@@ -78,8 +82,10 @@ Plan 85 Phase E ships focused CLI unit coverage:
   `mvmctl image pull` persists provenance metadata and
   `mvmctl run --image` emits a chain-signed `plan.oci_provenance`
   admission event. Cosign / registry policy remains tracked in #407.
-- **Plan 85 Phase F lands**: status flips to `Shipped` once cosign
-  verification and registry policy are wired.
+- **2026-05-20 / Plan 85 Phase F**: status flips to `Shipped` because
+  production OCI pulls and `run --image --prod` require a
+  digest-pinned reference, an OCI registry policy, and cosign
+  verification of the resolved digest before cache admission or boot.
 
 ## Why this claim needs a gate
 
