@@ -3237,6 +3237,151 @@ fn sweep_orphaned_stage0_staging_dirs_at(
     })
 }
 
+/// Plan 95 §FU-1 — outcome of [`reap_orphaned_vm_helpers`]. Counts
+/// orphaned helper PIDs that were signalled and per-VM cache dirs
+/// removed, plus the bytes freed by removing those dirs. Pruner-side
+/// caller uses this to print a clean one-line summary.
+pub(in crate::commands) struct ReapOutcome {
+    pub killed: u64,
+    pub removed_dirs: u64,
+    pub freed_bytes: u64,
+}
+
+/// Plan 95 §FU-1 — reap orphaned per-VM helpers left behind by killed
+/// `mvmctl dev up` runs.
+///
+/// mvmctl spawns `mvm-libkrun-supervisor`, which spawns `gvproxy`. If
+/// mvmctl exits abnormally (^C, SIGKILL, crash), supervisor + gvproxy
+/// are reparented to launchd PID 1 and outlive mvmctl indefinitely
+/// (Plan 95 doc §Follow-ups FU-2/FU-3 cover the "prevent" side; this
+/// is the "clean up after the fact" side — FU-1).
+///
+/// Walks each `~/.cache/mvm/builder-vm/vms/<id>/` dir and inspects its
+/// `{supervisor.pid, gvproxy.pid, stage0.pid}` sidecars. For each PID:
+/// - dead → ignore (it's already gone, the sidecar is just stale)
+/// - alive with a non-launchd parent → in-flight dev up; skip the
+///   whole dir (don't touch a live owner's state)
+/// - alive with launchd as parent → SIGTERM and count
+///
+/// Then if no helper in the dir had a live non-launchd parent, the
+/// dir itself is removed. This avoids the over-aggressive
+/// `rm -rf $vm/` of the prototype `/tmp/plan95/reap.sh`, which would
+/// have nuked a live dev up's state dir.
+pub(in crate::commands) fn reap_orphaned_vm_helpers(dry_run: bool) -> Result<ReapOutcome> {
+    let vms_root =
+        std::path::PathBuf::from(mvm_core::config::mvm_cache_dir()).join("builder-vm/vms");
+    reap_orphaned_vm_helpers_at(&vms_root, dry_run)
+}
+
+/// Inner form taking an explicit `vms_root`. Exists for tests against
+/// a tempdir without mutating `MVM_CACHE_DIR`.
+fn reap_orphaned_vm_helpers_at(vms_root: &std::path::Path, dry_run: bool) -> Result<ReapOutcome> {
+    let mut outcome = ReapOutcome {
+        killed: 0,
+        removed_dirs: 0,
+        freed_bytes: 0,
+    };
+    if !vms_root.is_dir() {
+        return Ok(outcome);
+    }
+
+    for entry in std::fs::read_dir(vms_root)?.flatten() {
+        let dir = entry.path();
+        if !dir.is_dir() {
+            continue;
+        }
+
+        let mut dir_has_live_owner = false;
+        let mut killed_in_dir = 0u64;
+
+        for sidecar in ["supervisor.pid", "gvproxy.pid", "stage0.pid"] {
+            let pid_file = dir.join(sidecar);
+            let Some(pid) = read_pid_file(&pid_file) else {
+                continue;
+            };
+            if !pid_is_alive(pid) {
+                continue;
+            }
+            if pid_parent(pid) != Some(1) {
+                dir_has_live_owner = true;
+                continue;
+            }
+            if !dry_run {
+                // SIGTERM; ignore the result — the next iteration of
+                // the pruner will catch anything that survived (e.g.
+                // a process that ignored TERM).
+                unsafe {
+                    libc::kill(pid, libc::SIGTERM);
+                }
+            }
+            killed_in_dir += 1;
+        }
+
+        outcome.killed += killed_in_dir;
+        if dir_has_live_owner {
+            continue;
+        }
+
+        let size = dir_size_bytes(&dir);
+        if !dry_run {
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+        outcome.removed_dirs += 1;
+        outcome.freed_bytes += size;
+    }
+
+    Ok(outcome)
+}
+
+fn read_pid_file(path: &std::path::Path) -> Option<i32> {
+    std::fs::read_to_string(path)
+        .ok()?
+        .trim()
+        .parse::<i32>()
+        .ok()
+        .filter(|&p| p > 1)
+}
+
+fn pid_is_alive(pid: i32) -> bool {
+    // Signal 0 = existence check, doesn't deliver a signal.
+    unsafe { libc::kill(pid, 0) == 0 }
+}
+
+/// Returns the parent PID, or `None` if the process is gone or its
+/// PPID can't be read. macOS has no `/proc`; the portable path is
+/// `ps -o ppid= -p <pid>`. Shelling out adds ~5 ms per call, which
+/// is acceptable for a pruner that runs a handful of times per
+/// session (and not on a hot path).
+fn pid_parent(pid: i32) -> Option<i32> {
+    let out = std::process::Command::new("ps")
+        .args(["-o", "ppid=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .parse::<i32>()
+        .ok()
+}
+
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let mut total = 0u64;
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return total;
+    };
+    for entry in entries.flatten() {
+        let p = entry.path();
+        if p.is_file() {
+            total += p.metadata().map(|m| m.len()).unwrap_or(0);
+        } else if p.is_dir() {
+            total += dir_size_bytes(&p);
+        }
+    }
+    total
+}
+
 /// Predicate matching the staging-dir basenames left by Stage 0.
 /// Two shapes are recognised:
 /// - Current (W1+): `.<arch>.stage0-<pid>-<nonce>` (hidden, see
@@ -4379,6 +4524,79 @@ mod dev_status_image_tests {
         assert!(!json.contains("sha256"));
         assert!(!json.contains("rootfs.ext4"));
         assert!(!json.contains("vmlinux"));
+    }
+}
+
+#[cfg(test)]
+mod reap_orphans_tests {
+    use super::*;
+
+    #[test]
+    fn missing_vms_root_is_empty_outcome() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vms_root = dir.path().join("does-not-exist");
+        let out = reap_orphaned_vm_helpers_at(&vms_root, false).expect("reap");
+        assert_eq!(out.killed, 0);
+        assert_eq!(out.removed_dirs, 0);
+        assert_eq!(out.freed_bytes, 0);
+    }
+
+    #[test]
+    fn dead_pids_get_their_dirs_swept() {
+        // A VM dir whose `supervisor.pid` references a long-dead PID
+        // (we use `1` and skip it via read_pid_file's `> 1` guard, so
+        // instead use a PID that's very unlikely to be alive). The
+        // reaper should remove the dir and count `removed_dirs += 1`
+        // without trying to kill anyone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vms_root = dir.path().join("vms");
+        let vm = vms_root.join("mvm-stage0-99999-1234567890");
+        std::fs::create_dir_all(&vm).expect("mkdir");
+        // pick a PID guaranteed not to exist: 2^31-2 (one less than i32::MAX,
+        // outside normal kernel allocation range on macOS/Linux)
+        std::fs::write(vm.join("supervisor.pid"), "2147483646\n").expect("write pid");
+        std::fs::write(vm.join("payload"), vec![0u8; 1024]).expect("write payload");
+
+        let out = reap_orphaned_vm_helpers_at(&vms_root, false).expect("reap");
+        assert_eq!(out.killed, 0, "no live PID, so nothing to kill");
+        assert_eq!(out.removed_dirs, 1, "dir should be removed");
+        assert!(out.freed_bytes >= 1024, "payload size counted");
+        assert!(!vm.exists(), "dir should be gone");
+    }
+
+    #[test]
+    fn live_owner_preserves_dir_in_dry_run_and_real() {
+        // A VM dir whose `supervisor.pid` references THIS test's PID.
+        // The test process's parent is cargo/test runner, not launchd
+        // PID 1, so `pid_parent != Some(1)` → reaper marks the dir as
+        // "has a live owner" and leaves it alone.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vms_root = dir.path().join("vms");
+        let vm = vms_root.join("mvm-stage0-pid-of-self");
+        std::fs::create_dir_all(&vm).expect("mkdir");
+        let my_pid = std::process::id() as i32;
+        std::fs::write(vm.join("supervisor.pid"), format!("{my_pid}\n")).expect("write pid");
+
+        let out = reap_orphaned_vm_helpers_at(&vms_root, false).expect("reap");
+        assert_eq!(out.killed, 0, "live owner should not be killed");
+        assert_eq!(out.removed_dirs, 0, "dir preserved while owner alive");
+        assert!(vm.exists(), "dir should still be on disk");
+    }
+
+    #[test]
+    fn dry_run_does_not_mutate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let vms_root = dir.path().join("vms");
+        let vm = vms_root.join("mvm-stage0-dryrun-test");
+        std::fs::create_dir_all(&vm).expect("mkdir");
+        std::fs::write(vm.join("supervisor.pid"), "2147483646\n").expect("write pid");
+        std::fs::write(vm.join("payload"), vec![0u8; 256]).expect("write payload");
+
+        let out = reap_orphaned_vm_helpers_at(&vms_root, true).expect("dry-run reap");
+        // Dry-run still *counts* what it would do, but doesn't mutate.
+        assert_eq!(out.removed_dirs, 1);
+        assert!(vm.exists(), "dry-run must not remove the dir");
+        assert!(vm.join("supervisor.pid").exists(), "pid file untouched");
     }
 }
 
