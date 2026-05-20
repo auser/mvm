@@ -43,6 +43,8 @@ use ed25519_dalek::SigningKey;
 use mvm_plan::ExecutionPlan;
 use mvm_supervisor::{AuditEntry, AuditSigner, FileAuditSigner};
 
+use crate::commands::image::OciProvenance;
+
 /// Resolve the default audit-chain directory: `~/.mvm/audit/`.
 pub fn default_audit_dir() -> Result<PathBuf> {
     let home = std::env::var_os("HOME").context("$HOME unset; cannot locate ~/.mvm/audit/")?;
@@ -174,6 +176,18 @@ impl AuditEmitter {
             "plan.policy_resolved",
             [("slots_mode".to_string(), slots_mode.to_string())],
         )
+    }
+
+    /// Emit `plan.oci_provenance` — binds an OCI image admission to
+    /// the same plan id as the launch decision. The labels are
+    /// intentionally digest-oriented; raw registry credentials and
+    /// Docker config state are never recorded.
+    pub fn emit_oci_provenance(
+        &self,
+        plan: &ExecutionPlan,
+        provenance: &OciProvenance,
+    ) -> Result<()> {
+        self.emit(plan, "plan.oci_provenance", provenance.audit_labels())
     }
 
     /// Emit `plan.failed` — fires on any error path between admission
@@ -311,6 +325,44 @@ mod tests {
 
         let count = verify_audit_chain(&dir.path().join("local.jsonl"), &vk).unwrap();
         assert_eq!(count, 2, "both entries must verify clean");
+    }
+
+    #[test]
+    fn oci_provenance_event_is_chain_signed_with_required_labels() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let vk = key.verifying_key();
+        let emitter = AuditEmitter::with_dir(key, dir.path()).unwrap();
+        let plan = fixture_plan("local", "plan-OCI");
+        let provenance = OciProvenance {
+            schema_version: 1,
+            source: "run_image".to_string(),
+            supplied_reference: "alpine:3.20".to_string(),
+            canonical_reference: "docker.io/library/alpine:3.20".to_string(),
+            registry: "docker.io".to_string(),
+            repository: "library/alpine".to_string(),
+            tag: Some("3.20".to_string()),
+            resolved_digest:
+                "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                    .to_string(),
+            layer_digests: vec![
+                "sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+                    .to_string(),
+            ],
+            trust_policy: "mutable-reference-resolved-to-digest".to_string(),
+            verification_status: "digest-verified-signature-not-configured".to_string(),
+        };
+
+        emitter.emit_oci_provenance(&plan, &provenance).unwrap();
+
+        let path = dir.path().join("local.jsonl");
+        let content = std::fs::read_to_string(&path).expect("audit file exists");
+        assert!(content.contains("plan.oci_provenance"));
+        assert!(content.contains("oci_registry"));
+        assert!(content.contains("docker.io"));
+        assert!(content.contains("oci_resolved_digest"));
+        assert!(content.contains("oci_layer_digests"));
+        assert_eq!(verify_audit_chain(&path, &vk).unwrap(), 1);
     }
 
     #[test]
