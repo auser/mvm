@@ -1775,6 +1775,36 @@ mechanism — proxy-with-CA vs vsock side-channel vs host-side
 reconstruction) is the single architectural gate; recommended to
 land its own ADR before W2 codes the proxy.
 
+## Sprint 54 — Builder-VM maturation (in flight, off-book tracking)
+
+Plans 87-95 cover the builder-VM evolution from TSI-patched stock
+kernel → slim custom kernel + passt/gvproxy networking + Alpine
+Stage 0. Most of this work landed via individual PRs without a
+dedicated sprint section; this entry exists so the in-flight pieces
+don't fall off.
+
+### Tracked plans
+
+- ✅ [`plans/87-passt-virtio-net.md`](plans/87-passt-virtio-net.md) — virtio-net via passt on Linux.
+- ✅ [`plans/88-gvproxy-macos-backend.md`](plans/88-gvproxy-macos-backend.md) — virtio-net via gvproxy on macOS.
+- ✅ [`plans/89-persistent-builder-vm.md`](plans/89-persistent-builder-vm.md) — persistent builder VM (multiple W3 PRs landed).
+- ✅ [`plans/90-gateway-frame-fuzz.md`](plans/90-gateway-frame-fuzz.md) — fuzz coverage for the gateway frame parsers.
+- 🟡 [`plans/91-...`](plans/) — Alpine Stage 0 bootstrap (PR #417 open).
+- 🟡 [`plans/92-minimal-builder-vm-kernel.md`](plans/92-minimal-builder-vm-kernel.md) — slim custom kernel via `linuxManualConfig` + `tinyconfig` (committed locally on `worktree-plan-92-stock-kernel`; carried forward by Plan 95's PR).
+- 🟡 [`plans/95-builder-vm-kernel-slimming.md`](plans/95-builder-vm-kernel-slimming.md) — **Plan 92 followup.** Aggressive SoC/platform cluster disables + dead `microvm.nix` input drop. Lands as one PR carrying Plan 92's base commits forward.
+
+### Sprint 54 success criteria
+
+- Plan 92's kernel switch is live on `main` (via Plan 95's bundled PR).
+- Plan 95's SoC cluster disables measurably shrink `vmlinux` (10-30% on aarch64).
+- `cargo run -- dev up` boots end-to-end on aarch64-darwin with the slim kernel.
+- Alpine Stage 0 (Plan 91) merged via PR #417.
+
+### Non-goals
+
+- Kernel-warning surfacing UX (Plan 95 W4, deferred to follow-up issue).
+- microvm.nix adoption — explicitly rejected in Plan 95 (kernel scope) and Plan 92 §"Decision" (workload-build scope).
+
 ## Completed Sprints
 
 - [01-foundation.md](sprints/01-foundation.md)
