@@ -199,6 +199,23 @@ warnings (see /job/nix-stderr.log)`. Gated behind `MVMCTL_VERBOSE`.
 - Plan 88 (`specs/plans/88-gvproxy-macos-backend.md`) — the macOS
   gvproxy backend reachable from inside the slim kernel via virtio-net.
 
+## Validation note — Stage 0 tmpfs cap
+
+During end-to-end `dev up` validation we hit `No space left on
+device` during the `rustc-wrapper-1.91.1` substitute, repeatedly,
+across 7 attempts. Initial diagnosis blamed VM RAM (bumped
+`DEFAULT_MEMORY_MIB` 8 → 16 GiB, no effect). The actual root cause:
+`crates/mvm-build/src/stage0/init.sh:87` hardcodes the `/nix`
+tmpfs cap at `size=4G`, sized for the original ~600 MB builder-VM
+closure. Stage 0 now also builds the kernel + the Rust binaries
+(`mvm-builder-init`, `mvm-egress-proxy`) so the working set is
+~10–13 GiB; the 4 GiB cap clips long before the VM RAM is
+exhausted. Bumping VM RAM without bumping the tmpfs cap is a no-op.
+
+The fix is one line in `init.sh` (`size=4G` → `size=14G`) plus the
+matching `DEFAULT_MEMORY_MIB` bump (8 → 16 GiB) so the VM has
+enough RAM to back the larger tmpfs. They're paired.
+
 ## Follow-ups (out of scope for this plan)
 
 Discovered while validating Plan 95 end-to-end:

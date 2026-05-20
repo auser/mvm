@@ -80,11 +80,17 @@ fi
 # Mounting after apk would leave the nix binary on APFS and
 # break the case-sensitive guarantee for substitutions.
 #
-# Size cap: 4 GiB. Sufficient for the builder VM closure (~600 MB
-# typical). Adjust if the closure grows. Memory budget is paid
-# from the libkrun guest's RAM allocation (set in
-# LibkrunBuilderVm::run_stage0).
-mount -t tmpfs -o size=4G,mode=0755 tmpfs /nix
+# Size cap: 14 GiB. The original 4 GiB assumed a ~600 MB closure
+# (builder-VM rootfs only). With Plan 95's slim-kernel + the Rust
+# binaries (`mvm-builder-init`, `mvm-egress-proxy`) building in the
+# same VM, the working set runs:
+#   kernel intermediates (~3 GiB) +
+#   rustc-wrapper substitute closure (~2 GiB) +
+#   Rust build artifacts (~5–8 GiB)
+# 14 GiB leaves headroom. Memory budget is paid from the libkrun
+# guest's RAM allocation (DEFAULT_MEMORY_MIB in
+# crates/mvm-build/src/libkrun_builder.rs) — keep that ≥ this cap.
+mount -t tmpfs -o size=14G,mode=0755 tmpfs /nix
 mkdir -p /nix/store /nix/var/nix /nix/var/log/nix
 
 # Install Nix from Alpine's signed package repos. `apk-tools`

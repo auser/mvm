@@ -72,12 +72,15 @@ use crate::builder_vm::{BuilderArtifacts, BuilderJob, BuilderMounts, BuilderVm, 
 /// sweet spot on M-series Macs without saturating the host.
 pub const DEFAULT_VCPUS: u8 = 4;
 
-/// Default RAM in MiB. Nix evaluation peaks around 2.5 GiB for the
-/// dev image's closure, but in-VM nix builds compiling rustc + std +
-/// the 800-crate vendor tree (plus the kernel build for the builder
-/// VM image's TSI kernel) peak around 5-6 GiB. 8 GiB leaves headroom
-/// without OOM-killing the GCC link step. Plan 72 W5.D bullet 9.
-pub const DEFAULT_MEMORY_MIB: u32 = 8192;
+/// Default RAM in MiB. Originally 8 GiB (Plan 72 W5.D bullet 9 —
+/// in-VM nix builds peak ~5-6 GiB). Plan 95 raised this to 16 GiB
+/// alongside bumping the Stage 0 `/nix` tmpfs `size=` cap in
+/// `stage0/init.sh` (4G → 14G): tmpfs is RAM-backed, so the cap
+/// can only be honored if the VM has at least that much RAM. The
+/// real bottleneck in dev-up validation was the tmpfs cap, not the
+/// VM RAM — bumping VM RAM alone is a no-op as long as the
+/// `size=` mount option clips earlier. Keep these two in lockstep.
+pub const DEFAULT_MEMORY_MIB: u32 = 16384;
 
 /// Default size of the persistent `/nix`-store virtio-blk image,
 /// in MiB. 64 GiB sparse — the file only consumes the bytes the
@@ -2186,11 +2189,12 @@ mod tests {
     fn defaults_match_plan_72_w1() {
         let vm = LibkrunBuilderVm::default();
         assert_eq!(vm.vcpus, 4);
-        // Plan 72 W5.D bullet 9 bumped this from 4 GiB to 8 GiB
-        // (in-VM nix builds peak ~5-6 GiB and OOM-kill the link step
-        // at the lower default). Hardcoded here so a regression that
-        // accidentally reverts the bump fails fast.
-        assert_eq!(vm.memory_mib, 8192);
+        // Plan 72 W5.D bullet 9: 4 → 8 GiB (in-VM nix builds peak
+        // ~5-6 GiB; OOM at lower default). Plan 95: 8 → 16 GiB
+        // alongside stage0/init.sh bumping the `/nix` tmpfs `size=`
+        // cap to 14G. Hardcoded so a regression on either side
+        // fails fast.
+        assert_eq!(vm.memory_mib, 16384);
         assert_eq!(vm.nix_store_mib, 65536);
     }
 
