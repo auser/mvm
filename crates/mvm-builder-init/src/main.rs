@@ -866,18 +866,27 @@ mod linux {
                         }
                     };
                     let started = Instant::now();
-                    let (code, tail) = run_job_streaming(&cmd_path, tmpdir.as_deref(), |line| {
-                        let frame = crate::dispatch_response::stderr_chunk_json(&job_id, line);
-                        if !write_frame(conn, frame.as_bytes()) {
-                            // Host probably closed the conn (e.g.
-                            // supervisor went away mid-build). Log
-                            // and keep draining stderr so the
-                            // build's exit code is still meaningful
-                            // — the terminal Result write will
-                            // fail loudly back in the dispatch loop.
-                            eprintln!("mvm-builder-init: dispatch loop: write StderrChunk failed");
-                        }
-                    });
+                    let (code, tail) = run_job_streaming(
+                        &cmd_path,
+                        tmpdir.as_deref(),
+                        Isolation::Unshared,
+                        |line| {
+                            let frame = crate::dispatch_response::stderr_chunk_json(&job_id, line);
+                            if !write_frame(conn, frame.as_bytes()) {
+                                // Host probably closed the conn
+                                // (e.g. supervisor went away
+                                // mid-build). Log and keep
+                                // draining stderr so the build's
+                                // exit code is still meaningful —
+                                // the terminal Result write will
+                                // fail loudly back in the
+                                // dispatch loop.
+                                eprintln!(
+                                    "mvm-builder-init: dispatch loop: write StderrChunk failed"
+                                );
+                            }
+                        },
+                    );
                     let ms = u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     // Hold `scratch` until after the build returns
                     // so its `Drop` cleans up after the
@@ -1417,13 +1426,43 @@ mod linux {
         // Single-shot path: no streaming callback, no TMPDIR
         // override (single-shot uses the rootfs's tmpfs `/tmp`
         // directly — the VM is going to power-off, so per-job
-        // scratch isolation has no second job to protect). The
+        // scratch isolation has no second job to protect), and no
+        // unshare wrapping (the VM tear-down already kills any
+        // orphan process and reclaims every IPC key + mount). The
         // whole stderr tail still lands in `/job/result` and the
         // host's file-based fallback parses it. Plan 89 W3 part 9
         // added the streaming variant for the persistent dispatch
         // loop; this single-shot wrapper passes a no-op so the
         // two code paths share their `Command`/`wait` logic.
-        run_job_streaming(cmd_sh, None, |_line| {})
+        run_job_streaming(cmd_sh, None, Isolation::Inherit, |_line| {})
+    }
+
+    /// Plan 89 W3 part 11 — how the build subprocess relates to
+    /// the dispatch loop's process / mount / IPC namespaces.
+    ///
+    /// - [`Isolation::Inherit`]: subprocess runs in the dispatch
+    ///   loop's namespaces. Used by single-shot (the whole VM
+    ///   tears down on exit anyway) and by tests that don't have
+    ///   `CAP_SYS_ADMIN` in their environment (e.g. CI Docker
+    ///   without `--privileged`).
+    /// - [`Isolation::Unshared`]: subprocess runs in fresh
+    ///   mount + pid + ipc namespaces via `unshare --mount --pid
+    ///   --ipc --fork`. The pid namespace turns orphan-cleanup
+    ///   into a single namespace-exit; the mount namespace lets
+    ///   future parts bind-mount `/dev/shm` etc. per-job without
+    ///   bleeding state into the shared rootfs; the IPC namespace
+    ///   prevents SysV/POSIX IPC keys leaking across jobs.
+    ///
+    /// Network namespace is intentionally *not* unshared — the
+    /// per-VM iptables baseline (Plan 73 Followup B.2.y) already
+    /// gates egress through the proxy, and the build needs the
+    /// proxy reachable. The follow-up part 12 re-applies that
+    /// baseline per dispatch, which closes the F7 finding without
+    /// breaking proxy access.
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    enum Isolation {
+        Inherit,
+        Unshared,
     }
 
     /// Plan 89 W3 part 9 — same as [`run_job`] but invokes
@@ -1444,15 +1483,33 @@ mod linux {
     fn run_job_streaming<F: FnMut(&str)>(
         cmd_sh: &str,
         tmpdir: Option<&str>,
+        isolation: Isolation,
         mut on_line: F,
     ) -> (i32, String) {
         use std::collections::VecDeque;
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
-        let mut cmd = Command::new("/bin/sh");
-        cmd.args(["-eu", cmd_sh])
-            .stdout(Stdio::inherit())
-            .stderr(Stdio::piped());
+        // Plan 89 W3 part 11 — switch between bare `/bin/sh -eu
+        // <cmd>` and `unshare --mount --pid --ipc --fork /bin/sh
+        // -eu <cmd>` based on the requested isolation. unshare
+        // lives in `util-linux`, which is in the builder VM's
+        // rootfs (`nix/images/builder-vm/flake.nix`, package list);
+        // PATH (`/sbin:/usr/sbin:/bin:/usr/bin`) finds it.
+        let mut cmd = match isolation {
+            Isolation::Inherit => {
+                let mut c = Command::new("/bin/sh");
+                c.args(["-eu", cmd_sh]);
+                c
+            }
+            Isolation::Unshared => {
+                let mut c = Command::new("unshare");
+                c.args([
+                    "--mount", "--pid", "--ipc", "--fork", "/bin/sh", "-eu", cmd_sh,
+                ]);
+                c
+            }
+        };
+        cmd.stdout(Stdio::inherit()).stderr(Stdio::piped());
         // Plan 89 W3 part 10 — point the dispatched build's
         // tmpfile machinery at the per-job scratch dir so leftover
         // tempfiles can't outlive the dispatch. Tools that honor
@@ -1465,7 +1522,13 @@ mod linux {
         }
         let mut child = match cmd.spawn() {
             Ok(c) => c,
-            Err(e) => return (127, format!("spawn /bin/sh: {e}")),
+            Err(e) => {
+                let binary = match isolation {
+                    Isolation::Inherit => "/bin/sh",
+                    Isolation::Unshared => "unshare",
+                };
+                return (127, format!("spawn {binary}: {e}"));
+            }
         };
         let Some(stderr) = child.stderr.take() else {
             // Stdio::piped() should always populate child.stderr;
@@ -1821,9 +1884,14 @@ mod linux {
             .expect("write cmd.sh");
             use std::sync::Mutex;
             let collected = Mutex::new(Vec::<String>::new());
-            let (code, tail) = run_job_streaming(cmd_path.to_str().unwrap(), None, |line| {
-                collected.lock().unwrap().push(line.to_string());
-            });
+            let (code, tail) = run_job_streaming(
+                cmd_path.to_str().unwrap(),
+                None,
+                Isolation::Inherit,
+                |line| {
+                    collected.lock().unwrap().push(line.to_string());
+                },
+            );
             assert_eq!(code, 0);
             let got = collected.into_inner().unwrap();
             assert_eq!(got, vec!["one", "two", "three"]);
@@ -1847,9 +1915,14 @@ mod linux {
             std::fs::write(&cmd_path, script).expect("write cmd.sh");
             use std::sync::Mutex;
             let collected = Mutex::new(Vec::<String>::new());
-            let (code, tail) = run_job_streaming(cmd_path.to_str().unwrap(), None, |line| {
-                collected.lock().unwrap().push(line.to_string());
-            });
+            let (code, tail) = run_job_streaming(
+                cmd_path.to_str().unwrap(),
+                None,
+                Isolation::Inherit,
+                |line| {
+                    collected.lock().unwrap().push(line.to_string());
+                },
+            );
             assert_eq!(code, 42);
             // Callback saw every line.
             assert_eq!(collected.lock().unwrap().len(), total);
@@ -1929,8 +2002,12 @@ mod linux {
             // echo it back via stderr so the test sees it.
             std::fs::write(&cmd_path, "echo \"tmpdir=$TMPDIR\" >&2\nexit 0\n")
                 .expect("write cmd.sh");
-            let (code, tail) =
-                run_job_streaming(cmd_path.to_str().unwrap(), Some("/scratch/abc"), |_| {});
+            let (code, tail) = run_job_streaming(
+                cmd_path.to_str().unwrap(),
+                Some("/scratch/abc"),
+                Isolation::Inherit,
+                |_| {},
+            );
             assert_eq!(code, 0);
             assert_eq!(tail, "tmpdir=/scratch/abc");
         }
@@ -1960,7 +2037,8 @@ mod linux {
             unsafe {
                 std::env::set_var("TMPDIR", "/inherited-from-parent");
             }
-            let (code, tail) = run_job_streaming(cmd_path.to_str().unwrap(), None, |_| {});
+            let (code, tail) =
+                run_job_streaming(cmd_path.to_str().unwrap(), None, Isolation::Inherit, |_| {});
             // Restore TMPDIR before the assert so a panic still
             // leaves the parent env clean for other tests.
             unsafe {
@@ -1971,6 +2049,66 @@ mod linux {
             }
             assert_eq!(code, 0);
             assert_eq!(tail, "tmpdir=/inherited-from-parent");
+        }
+
+        /// Plan 89 W3 part 11 — `Isolation::Unshared` mode wraps
+        /// the build subprocess in `unshare --mount --pid --ipc
+        /// --fork`. The cmd.sh reads `/proc/self/status` and
+        /// looks for `NSpid:` — under a fresh pid namespace, the
+        /// build sees PID 1 inside its own namespace (the second
+        /// `NSpid` column).
+        ///
+        /// Skipped if `unshare` isn't installed or if the test
+        /// runner lacks `CAP_SYS_ADMIN` (e.g. unprivileged Docker
+        /// CI). The Linux build-VM runs as PID 1 with full caps,
+        /// so the real dispatch path always succeeds; this test
+        /// exercises the wiring on whatever Linux host runs the
+        /// suite.
+        #[test]
+        fn run_job_streaming_unshared_runs_in_fresh_pid_namespace() {
+            use std::process::Stdio;
+            // Fast-path probe: if `unshare --pid --fork --mount
+            // --ipc true` fails on this host, skip — the test is
+            // exercising correctness of the wiring, not the host's
+            // capability set.
+            let probe = Command::new("unshare")
+                .args(["--mount", "--pid", "--ipc", "--fork", "true"])
+                .stdout(Stdio::null())
+                .stderr(Stdio::null())
+                .status();
+            let probe_ok = probe.map(|s| s.success()).unwrap_or(false);
+            if !probe_ok {
+                eprintln!(
+                    "skipping unshared test: host lacks unshare or CAP_SYS_ADMIN — \
+                     the Linux build-VM runs as PID 1 with full caps so the real \
+                     dispatch path is unaffected"
+                );
+                return;
+            }
+            let dir = tempfile::tempdir().expect("tempdir");
+            let cmd_path = dir.path().join("cmd.sh");
+            // The build's PID inside its own ns is the last
+            // column of `NSpid:`. Print it so the test can assert
+            // on it.
+            std::fs::write(
+                &cmd_path,
+                "awk '/^NSpid:/ {print \"inner_pid=\" $NF}' /proc/self/status >&2\nexit 0\n",
+            )
+            .expect("write cmd.sh");
+            let (code, tail) = run_job_streaming(
+                cmd_path.to_str().unwrap(),
+                None,
+                Isolation::Unshared,
+                |_| {},
+            );
+            assert_eq!(code, 0, "tail={tail}");
+            // `--pid --fork` puts the child in a fresh ns; the
+            // forked shell is PID 1 inside, the awk runs as a
+            // child of it (PID 2 inside).
+            assert!(
+                tail == "inner_pid=1" || tail == "inner_pid=2",
+                "unshare did not produce a fresh pid namespace; tail={tail}"
+            );
         }
     }
 }
