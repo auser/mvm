@@ -75,15 +75,9 @@ pub const DEFAULT_VCPUS: u8 = 4;
 /// Default RAM in MiB. Nix evaluation peaks around 2.5 GiB for the
 /// dev image's closure, but in-VM nix builds compiling rustc + std +
 /// the 800-crate vendor tree (plus the kernel build for the builder
-/// VM image's slim kernel) peak around 5-6 GiB. Plan 95 §FU-mem-bump
-/// raised this to 16 GiB after observing that the *Stage 0* path
-/// runs the same in-VM build with `/nix` on tmpfs — kernel
-/// intermediates + rustc substitute (~1.5 GiB) + mvm-builder-init
-/// Rust build artifacts can't co-exist in 8 GiB. The persistent
-/// builder VM has a virtio-blk `/nix-store` so this default
-/// over-allocates there; that's intentional headroom, not waste.
-/// Plan 72 W5.D bullet 9 originally bumped 4 → 8 GiB.
-pub const DEFAULT_MEMORY_MIB: u32 = 16384;
+/// VM image's TSI kernel) peak around 5-6 GiB. 8 GiB leaves headroom
+/// without OOM-killing the GCC link step. Plan 72 W5.D bullet 9.
+pub const DEFAULT_MEMORY_MIB: u32 = 8192;
 
 /// Default size of the persistent `/nix`-store virtio-blk image,
 /// in MiB. 64 GiB sparse — the file only consumes the bytes the
@@ -2194,12 +2188,9 @@ mod tests {
         assert_eq!(vm.vcpus, 4);
         // Plan 72 W5.D bullet 9 bumped this from 4 GiB to 8 GiB
         // (in-VM nix builds peak ~5-6 GiB and OOM-kill the link step
-        // at the lower default). Plan 95 §FU-mem-bump raised it again
-        // to 16 GiB after observing Stage 0 (which keeps /nix on
-        // tmpfs) ran out of disk during the kernel + rustc + Rust
-        // binary build flow. Hardcoded here so a regression that
+        // at the lower default). Hardcoded here so a regression that
         // accidentally reverts the bump fails fast.
-        assert_eq!(vm.memory_mib, 16384);
+        assert_eq!(vm.memory_mib, 8192);
         assert_eq!(vm.nix_store_mib, 65536);
     }
 
