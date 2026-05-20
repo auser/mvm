@@ -227,9 +227,9 @@ admission until their transports are wired.
 | `mvmctl catalog search <query>` | Search entries by name, description, or tag |
 | `mvmctl catalog info <name>` | Show catalog entry details (JSON) |
 | `mvmctl init <DIR> --catalog <name>` | Scaffold a project from a catalog entry |
-| `mvmctl image pull <ref> [--prod]` | Pull an OCI image, unpack its layers, materialize a bootable `rootfs.ext4`, and record it in the local OCI cache. `--prod` requires a digest-pinned reference |
+| `mvmctl image pull <ref> [--prod]` | Pull an OCI image, unpack its layers, materialize a bootable `rootfs.ext4`, and record it plus a provenance sidecar in the local OCI cache. `--prod` requires a digest-pinned reference |
 | `mvmctl image ls [--registry <host>] [--json]` | List cached OCI images by reference, resolved digest, fetched timestamp, and size |
-| `mvmctl image inspect <ref-or-digest> [--json]` | Print cached OCI manifest/config metadata, layer digests, and any `mvm-claims.json` sidecar |
+| `mvmctl image inspect <ref-or-digest> [--json]` | Print cached OCI manifest/config metadata, layer digests, and any claims/provenance sidecar |
 | `mvmctl image rm <ref-or-digest>` | Remove a cached OCI image and garbage-collect unreferenced layer files |
 
 ## Console
@@ -251,7 +251,7 @@ dev-feature guest agent; production guests should use `mvmctl invoke`.
 |---------|-------------|
 | `mvmctl run -- <cmd>...` | Boot the bundled default microVM image, run `<cmd>`, exit |
 | `mvmctl run --manifest <name-or-path> -- <cmd>...` | Boot a registered manifest/template instead of the default |
-| `mvmctl run --image <ref> -- <cmd>...` | Pull or reuse a cached OCI image, boot its materialized `rootfs.ext4`, run `<cmd>`, exit |
+| `mvmctl run --image <ref> -- <cmd>...` | Pull or reuse a cached OCI image, emit signed audit-chain provenance for the resolved image, boot its materialized `rootfs.ext4`, run `<cmd>`, exit |
 | `mvmctl run --image <ref> --prod -- <cmd>...` | Production OCI-image policy: require `<ref>` to be digest-pinned before pull or boot |
 | `mvmctl run --profile standard -- <cmd>` | Default profile: explicit env is allowed; host shares must be read-only |
 | `mvmctl run --profile restrictive -- <cmd>` | No env injection and no host directory shares |

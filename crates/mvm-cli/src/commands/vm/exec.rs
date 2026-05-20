@@ -13,7 +13,10 @@ use std::path::{Path, PathBuf};
 
 use super::super::env::apple_container::ensure_default_microvm_image;
 use super::Cli;
+use super::audit_chain::AuditEmitter;
 use super::host_signer::{PUBLIC_FILENAME, host_signer_id, load_or_init};
+use super::plan_admission::{InMemoryNonceLedger, SystemClock, admit_for_run};
+use super::plan_builder::SynthesisInput;
 use crate::ui;
 
 #[derive(ClapArgs, Debug, Clone)]
@@ -451,13 +454,18 @@ fn build_exec_request(
                 "Using OCI image {} ({})",
                 cached.reference, cached.resolved_digest
             ));
+            emit_oci_run_admission(&cached, args.cpus, u64::from(memory_mib), args.timeout)
+                .context("admitting OCI image provenance for mvmctl run --image")?;
             if cached.pulled {
                 mvm_core::audit_emit!(
                     ImageFetch,
-                    "source=run_image reference={} digest={} prod={}",
+                    "source=run_image reference={} digest={} prod={} layers={} trust_policy={} verification_status={}",
                     cached.reference,
                     cached.resolved_digest,
-                    prod
+                    prod,
+                    cached.provenance.layer_digests.len(),
+                    cached.provenance.trust_policy,
+                    cached.provenance.verification_status
                 );
             }
             let (kernel_path, _default_rootfs_path) = ensure_default_microvm_image()?;
@@ -492,6 +500,54 @@ fn build_exec_request(
         target,
         timeout_secs: args.timeout,
     })
+}
+
+fn emit_oci_run_admission(
+    image: &super::super::image::ResolvedOciRunImage,
+    cpus: u32,
+    mem_mib: u64,
+    timeout_secs: u64,
+) -> Result<()> {
+    let image_sha256 =
+        mvm_security::image_verify::sha256_file(&image.rootfs_path).with_context(|| {
+            format!(
+                "hashing OCI rootfs at {} for run --image admission",
+                image.rootfs_path.display()
+            )
+        })?;
+    let exec_timeout_secs = u32::try_from(timeout_secs).unwrap_or(u32::MAX);
+    let input = SynthesisInput {
+        vm_name: "run-oci",
+        tenant: None,
+        backend_name: "transient-run",
+        image_name: &image.provenance.canonical_reference,
+        image_sha256: &image_sha256,
+        image_cosign_bundle: None,
+        intent: Some("vm:run"),
+        seccomp_tier: mvm_plan::PlanSeccompTier::Standard,
+        network_policy_ref: None,
+        fs_policy_ref: None,
+        egress_policy_ref: None,
+        tool_policy_ref: None,
+        secret_release: mvm_plan::SecretReleasePolicy::None,
+        audit_event_prefix: None,
+        cpus,
+        mem_mib,
+        disk_mib: 0,
+        boot_timeout_secs: 60,
+        exec_timeout_secs,
+        destroy_on_exit: true,
+        bundle_pin: None,
+        deps_volume: None,
+    };
+    let ledger = InMemoryNonceLedger::new();
+    let admitted = admit_for_run(&input, &SystemClock, &ledger, None, None)?;
+    let signer = load_or_init().context("loading host signer for OCI provenance audit")?;
+    let emitter =
+        AuditEmitter::new(signer.signing).context("opening audit chain for OCI provenance")?;
+    emitter.emit_admitted(&admitted.plan, &admitted.signer_id)?;
+    emitter.emit_oci_provenance(&admitted.plan, &image.provenance)?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]

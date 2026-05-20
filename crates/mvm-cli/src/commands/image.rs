@@ -101,6 +101,22 @@ pub(in crate::commands) struct ResolvedOciRunImage {
     pub resolved_digest: String,
     pub rootfs_path: PathBuf,
     pub pulled: bool,
+    pub provenance: OciProvenance,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+pub(in crate::commands) struct OciProvenance {
+    pub schema_version: u32,
+    pub source: String,
+    pub supplied_reference: String,
+    pub canonical_reference: String,
+    pub registry: String,
+    pub repository: String,
+    pub tag: Option<String>,
+    pub resolved_digest: String,
+    pub layer_digests: Vec<String>,
+    pub trust_policy: String,
+    pub verification_status: String,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
@@ -110,6 +126,64 @@ struct CachedOciLayer {
     size_bytes: u64,
     #[serde(default)]
     path: Option<String>,
+}
+
+impl CachedOciImage {
+    pub(in crate::commands) fn provenance(
+        &self,
+        source: &str,
+        supplied_reference: &str,
+        prod: bool,
+    ) -> OciProvenance {
+        OciProvenance {
+            schema_version: 1,
+            source: source.to_string(),
+            supplied_reference: supplied_reference.to_string(),
+            canonical_reference: self.reference.clone(),
+            registry: self.registry.clone(),
+            repository: self.repository.clone(),
+            tag: self.tag.clone(),
+            resolved_digest: self.resolved_digest.clone(),
+            layer_digests: self
+                .layers
+                .iter()
+                .map(|layer| layer.digest.clone())
+                .collect(),
+            trust_policy: cached_trust_policy(&self.reference, prod).to_string(),
+            verification_status: verification_status().to_string(),
+        }
+    }
+}
+
+impl OciProvenance {
+    pub(in crate::commands) fn audit_labels(&self) -> Vec<(String, String)> {
+        vec![
+            ("oci_source".to_string(), self.source.clone()),
+            (
+                "oci_supplied_reference".to_string(),
+                self.supplied_reference.clone(),
+            ),
+            (
+                "oci_canonical_reference".to_string(),
+                self.canonical_reference.clone(),
+            ),
+            ("oci_registry".to_string(), self.registry.clone()),
+            ("oci_repository".to_string(), self.repository.clone()),
+            (
+                "oci_resolved_digest".to_string(),
+                self.resolved_digest.clone(),
+            ),
+            (
+                "oci_layer_digests".to_string(),
+                self.layer_digests.join(","),
+            ),
+            ("oci_trust_policy".to_string(), self.trust_policy.clone()),
+            (
+                "oci_verification_status".to_string(),
+                self.verification_status.clone(),
+            ),
+        ]
+    }
 }
 
 #[derive(Debug, Serialize, PartialEq, Eq)]
@@ -145,12 +219,16 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, _cfg: &MvmConfig) -> Resu
     match args.action {
         ImageAction::Pull { reference, prod } => {
             let image = pull_image(&cache_root, &reference, prod)?;
+            let provenance = image.provenance("image_pull", &reference, prod);
             mvm_core::audit_emit!(
                 ImageFetch,
-                "source=image_pull reference={} digest={} prod={}",
+                "source=image_pull reference={} digest={} prod={} layers={} trust_policy={} verification_status={}",
                 image.reference,
                 image.resolved_digest,
-                prod
+                prod,
+                provenance.layer_digests.len(),
+                provenance.trust_policy,
+                provenance.verification_status
             );
             ui::success(&format!(
                 "Pulled {} -> {}",
@@ -221,7 +299,10 @@ pub(in crate::commands) fn resolve_or_pull_run_image(
         .and_then(|index| find_image(&index, &canonical).cloned())
     {
         Some(cached) if cached.rootfs_path.is_some() => (cached, false),
-        _ => (pull_image_ref(cache_root, image_ref)?, true),
+        _ => (
+            pull_image_ref(cache_root, image_ref, reference, prod)?,
+            true,
+        ),
     };
     let Some(rootfs_relative) = image.rootfs_path.as_deref() else {
         bail!(
@@ -239,6 +320,7 @@ pub(in crate::commands) fn resolve_or_pull_run_image(
         );
     }
     Ok(ResolvedOciRunImage {
+        provenance: image.provenance("run_image", reference, prod),
         reference: image.reference,
         resolved_digest: image.resolved_digest,
         rootfs_path,
@@ -251,10 +333,35 @@ fn pull_image(cache_root: &Path, reference: &str, prod: bool) -> Result<CachedOc
     if prod && !image_ref.is_digest_pinned() {
         bail!("mvmctl image pull --prod requires a digest-pinned reference");
     }
-    pull_image_ref(cache_root, image_ref)
+    pull_image_ref(cache_root, image_ref, reference, prod)
 }
 
-fn pull_image_ref(cache_root: &Path, image_ref: ImageReference) -> Result<CachedOciImage> {
+fn trust_policy(image_ref: &ImageReference, prod: bool) -> &'static str {
+    if prod || image_ref.is_digest_pinned() {
+        "digest-pinned"
+    } else {
+        "mutable-reference-resolved-to-digest"
+    }
+}
+
+fn cached_trust_policy(reference: &str, prod: bool) -> &'static str {
+    if prod || reference.contains('@') {
+        "digest-pinned"
+    } else {
+        "mutable-reference-resolved-to-digest"
+    }
+}
+
+fn verification_status() -> &'static str {
+    "digest-verified-signature-not-configured"
+}
+
+fn pull_image_ref(
+    cache_root: &Path,
+    image_ref: ImageReference,
+    supplied_reference: &str,
+    prod: bool,
+) -> Result<CachedOciImage> {
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
         .build()
@@ -320,6 +427,29 @@ fn pull_image_ref(cache_root: &Path, image_ref: ImageReference) -> Result<Cached
     )
     .context("materialize OCI rootfs.ext4")?;
 
+    let provenance = OciProvenance {
+        schema_version: 1,
+        source: "image_pull".to_string(),
+        supplied_reference: supplied_reference.to_string(),
+        canonical_reference: image_ref.canonical(),
+        registry: image_ref.registry.clone(),
+        repository: image_ref.repository.clone(),
+        tag: image_ref.tag.clone(),
+        resolved_digest: manifest.digest.clone(),
+        layer_digests: cached_layers
+            .iter()
+            .map(|layer| layer.digest.clone())
+            .collect(),
+        trust_policy: trust_policy(&image_ref, prod).to_string(),
+        verification_status: verification_status().to_string(),
+    };
+    let claims_path = format!("claims/{}.provenance.json", manifest_hex);
+    write_cache_file(
+        cache_root,
+        &claims_path,
+        &serde_json::to_vec_pretty(&provenance).context("serialize OCI provenance")?,
+    )?;
+
     let mut index = load_index(cache_root)?;
     let cached = CachedOciImage {
         reference: image_ref.canonical(),
@@ -331,7 +461,7 @@ fn pull_image_ref(cache_root: &Path, image_ref: ImageReference) -> Result<Cached
         manifest_path,
         config_path,
         rootfs_path: Some(rootfs_path),
-        claims_path: None,
+        claims_path: Some(claims_path),
         layers: cached_layers,
     };
     upsert_image(&mut index, cached.clone());
@@ -910,6 +1040,45 @@ mod tests {
         assert_eq!(resolved.resolved_digest, digest);
         assert!(resolved.rootfs_path.ends_with("rootfs/alpine/rootfs.ext4"));
         assert!(!resolved.pulled);
+        assert_eq!(resolved.provenance.source, "run_image");
+        assert_eq!(
+            resolved.provenance.supplied_reference,
+            "docker.io/library/alpine:3.20"
+        );
+        assert_eq!(resolved.provenance.registry, "docker.io");
+        assert_eq!(
+            resolved.provenance.layer_digests,
+            vec!["sha256:layer".to_string()]
+        );
+    }
+
+    #[test]
+    fn provenance_labels_cover_claim_10_fields() {
+        let image = sample_image(
+            "docker.io/library/alpine@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+            "blobs/a",
+        );
+
+        let provenance = image.provenance("image_pull", "alpine@sha256:aaa", true);
+        let labels: BTreeMap<_, _> = provenance.audit_labels().into_iter().collect();
+
+        assert_eq!(provenance.registry, "docker.io");
+        assert_eq!(provenance.repository, "library/alpine");
+        assert_eq!(
+            provenance.resolved_digest,
+            "sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        );
+        assert_eq!(provenance.layer_digests, vec!["sha256:layer"]);
+        assert_eq!(provenance.trust_policy, "digest-pinned");
+        assert_eq!(
+            labels.get("oci_supplied_reference").map(String::as_str),
+            Some("alpine@sha256:aaa")
+        );
+        assert_eq!(
+            labels.get("oci_verification_status").map(String::as_str),
+            Some("digest-verified-signature-not-configured")
+        );
     }
 
     #[test]
