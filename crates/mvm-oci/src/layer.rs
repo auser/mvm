@@ -25,7 +25,7 @@
 //!   retry — those won't get better with more tries.
 
 use crate::OciError;
-use crate::manifest::OciManifestFetcher;
+use crate::manifest::{OciManifestFetcher, RegistryAuthConfig};
 use crate::reference::ImageReference;
 use oci_client::client::Client;
 use sha2::{Digest, Sha256};
@@ -93,6 +93,7 @@ impl Default for LayerFetchOptions {
 pub struct OciLayerFetcher {
     client: Client,
     options: LayerFetchOptions,
+    auth: RegistryAuthConfig,
 }
 
 impl Default for OciLayerFetcher {
@@ -110,6 +111,15 @@ impl OciLayerFetcher {
         Self {
             client: Client::new(Default::default()),
             options,
+            auth: RegistryAuthConfig::Anonymous,
+        }
+    }
+
+    pub fn with_options_and_auth(options: LayerFetchOptions, auth: RegistryAuthConfig) -> Self {
+        Self {
+            client: Client::new(Default::default()),
+            options,
+            auth,
         }
     }
 
@@ -123,13 +133,30 @@ impl OciLayerFetcher {
         Self {
             client: manifest_fetcher.client().clone(),
             options,
+            auth: manifest_fetcher.auth().clone(),
         }
     }
 
     /// Construct from a pre-built `oci_client::Client`. Tests use
     /// this to point at a wiremock-backed registry.
     pub fn with_client(client: Client, options: LayerFetchOptions) -> Self {
-        Self { client, options }
+        Self {
+            client,
+            options,
+            auth: RegistryAuthConfig::Anonymous,
+        }
+    }
+
+    pub fn with_client_and_auth(
+        client: Client,
+        options: LayerFetchOptions,
+        auth: RegistryAuthConfig,
+    ) -> Self {
+        Self {
+            client,
+            options,
+            auth,
+        }
     }
 
     /// Stream `layer` from `reference`'s registry into `writer`,
@@ -249,6 +276,10 @@ impl OciLayerFetcher {
         // which is implemented for `&str` (and for upstream's own
         // layer-descriptor struct), but not `&String`. Pass the
         // digest as a string slice explicitly.
+        let auth = self.auth.to_registry_auth();
+        self.client
+            .store_auth_if_needed(reference.resolve_registry(), &auth)
+            .await;
         self.client
             .pull_blob(reference, layer.digest.as_str(), &mut capped_writer)
             .await

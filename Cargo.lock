@@ -3202,6 +3202,7 @@ dependencies = [
  "libc",
  "oci-client 0.16.1",
  "rustix 1.1.4",
+ "secrecy",
  "serde",
  "serde_json",
  "sha2",

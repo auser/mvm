@@ -27,7 +27,7 @@ use sha2::{Digest, Sha256};
 use std::collections::HashMap;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU32, Ordering};
-use wiremock::matchers::{method, path, path_regex};
+use wiremock::matchers::{header, method, path, path_regex};
 use wiremock::{Mock, MockServer, Respond, ResponseTemplate};
 
 /// A running hermetic registry. Drop the value to tear it down.
@@ -127,6 +127,35 @@ impl HermeticRegistry {
         digest
     }
 
+    /// Serve a manifest only when the request includes the given
+    /// bearer token. Also registers the digest path with the same
+    /// auth requirement.
+    pub async fn register_bearer_manifest_with_digest_path(
+        &self,
+        repository: &str,
+        reference: &str,
+        media_type: &str,
+        bytes: &[u8],
+        token: &str,
+    ) -> String {
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
+        for manifest_ref in [reference, digest.as_str()] {
+            let path = format!("/v2/{repository}/manifests/{manifest_ref}");
+            Mock::given(method("GET"))
+                .and(wiremock::matchers::path(path))
+                .and(header("authorization", format!("Bearer {token}")))
+                .respond_with(
+                    ResponseTemplate::new(200)
+                        .insert_header("Content-Type", media_type)
+                        .insert_header("Docker-Content-Digest", digest.as_str())
+                        .set_body_bytes(bytes.to_vec()),
+                )
+                .mount(&self.server)
+                .await;
+        }
+        digest
+    }
+
     /// Serve `bytes` at `/v2/<repository>/blobs/<sha256-digest>`.
     /// Returns the digest the bytes hash to (caller can compare
     /// against the manifest's layer descriptor).
@@ -135,6 +164,30 @@ impl HermeticRegistry {
         let path = format!("/v2/{repository}/blobs/{digest}");
         Mock::given(method("GET"))
             .and(wiremock::matchers::path(path))
+            .respond_with(
+                ResponseTemplate::new(200)
+                    .insert_header("Content-Type", media_type)
+                    .set_body_bytes(bytes.to_vec()),
+            )
+            .mount(&self.server)
+            .await;
+        digest
+    }
+
+    /// Serve a blob only when the request includes the given bearer
+    /// token.
+    pub async fn register_bearer_blob(
+        &self,
+        repository: &str,
+        media_type: &str,
+        bytes: &[u8],
+        token: &str,
+    ) -> String {
+        let digest = format!("sha256:{}", hex::encode(Sha256::digest(bytes)));
+        let path = format!("/v2/{repository}/blobs/{digest}");
+        Mock::given(method("GET"))
+            .and(wiremock::matchers::path(path))
+            .and(header("authorization", format!("Bearer {token}")))
             .respond_with(
                 ResponseTemplate::new(200)
                     .insert_header("Content-Type", media_type)
