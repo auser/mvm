@@ -1,11 +1,11 @@
-//! Stage 0 bootstrap — builds an in-memory initramfs that boots
-//! against the libkrunfw kernel, runs `nix build` against the
+//! Stage 0 bootstrap — materializes a host directory tree that
+//! libkrun mounts as the guest root (via `krun_set_root`), boots
+//! against libkrunfw's bundled kernel, runs `nix build` against the
 //! in-repo `nix/images/builder-vm` flake, and emits the steady-state
 //! builder VM image (kernel + rootfs.ext4) on the `/out` virtio-fs
 //! share.
 //!
-//! Replaces the previous ur-seed flake + tarball + seed-contract
-//! pipeline. Bootstrap surface today:
+//! Bootstrap surface:
 //!
 //! 1. **`init.sh`** (embedded via `include_str!`) — the PID-1
 //!    shell script. Lives at [`INIT_SCRIPT`].
@@ -18,21 +18,17 @@
 //!    upstream release into [`stage0_cache_dir`] with sha256
 //!    verification ([`NIX_PORTABLE_AARCH64`]).
 //!
-//! No flake, no manifest schema, no contract version, no
-//! `mvm-builder-init` baked into a release-frozen rootfs.
-//!
-//! Per-run, [`build_initramfs`] walks the cached nix-portable, the
-//! embedded busybox + init script, and a small set of directory
-//! stubs into a cpio newc archive (`crate::cpio`) that libkrun
-//! consumes via `KrunContext::new_initramfs`.
+//! Per-run, [`materialize_root_dir`] writes those three assets plus
+//! a small set of directory stubs + busybox applet symlinks into a
+//! caller-supplied directory. The supervisor hands that directory
+//! to libkrun via `krun_set_root`; libkrun mounts it as the guest
+//! root over virtiofs and runs `/init` as PID 1.
 
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
 use sha2::{Digest, Sha256};
-
-use crate::cpio::{CpioArchive, Perm};
 
 /// PID-1 shell script. Compiled into the binary so a fresh `mvmctl`
 /// can always emit it without consulting the cache or the network.
@@ -48,7 +44,7 @@ pub struct BootstrapAsset {
     pub url: &'static str,
     /// SHA-256 of the byte stream at [`Self::url`]. Hex (64 chars).
     pub sha256_hex: &'static str,
-    /// File mode the asset gets on disk (and inside the initramfs).
+    /// File mode the asset gets on disk (and inside the root dir).
     pub mode: u32,
 }
 
@@ -57,8 +53,7 @@ pub struct BootstrapAsset {
 /// mvmctl is less pain than maintaining a separate fetch flow.
 ///
 /// Origin: `pkgs.pkgsStatic.busybox` on `aarch64-linux` from
-/// nixpkgs, then `strip --strip-all`. Extracted out of an existing
-/// ur-seed rootfs.ext4 for this initial vendor.
+/// nixpkgs, then `strip --strip-all`.
 pub const BUSYBOX_AARCH64_BYTES: &[u8] = include_bytes!("stage0/busybox-aarch64-linux-musl");
 
 /// SHA-256 of [`BUSYBOX_AARCH64_BYTES`]. Verified at the bottom of
@@ -71,8 +66,8 @@ pub const BUSYBOX_AARCH64_SHA256: &str =
 /// `DavHau/nix-portable` — well-maintained, single static binary,
 /// runs Nix without a daemon or `/nix/store`. ~74 MiB.
 ///
-/// Downloaded once on first `mvmctl dev fetch-stage0` (or first
-/// `dev up`) into [`stage0_cache_dir`]. Too big to vendor.
+/// Downloaded once on first `dev up` into [`stage0_cache_dir`].
+/// Too big to vendor.
 pub const NIX_PORTABLE_AARCH64: BootstrapAsset = BootstrapAsset {
     cache_filename: "nix-portable",
     url: "https://github.com/DavHau/nix-portable/releases/download/v012/nix-portable-aarch64",
@@ -114,94 +109,139 @@ pub fn prepare_assets(assets: &[&BootstrapAsset]) -> Result<()> {
     Ok(())
 }
 
-/// Build the Stage 0 initramfs (cpio newc bytes) from the embedded
+/// Directory stubs the init script (and the kernel's early-boot
+/// mounts) need to exist before `mount(2)` succeeds. Listed relative
+/// to the root, with no leading slash.
+const ROOT_DIR_STUBS: &[&str] = &[
+    "bin",
+    "dev",
+    "etc",
+    "out",
+    "proc",
+    "run",
+    "sys",
+    "tmp",
+    "usr",
+    "usr/local",
+    "usr/local/bin",
+    "work",
+];
+
+/// busybox applets the init script invokes directly. Each one
+/// gets a `bin/<name>` -> `busybox` symlink in the root dir.
+const PRE_INSTALLED_APPLETS: &[&str] = &[
+    "sh", "mount", "umount", "mkdir", "mountpoint", "cp", "ip", "udhcpc", "sync", "poweroff",
+    "cat", "echo", "ls", "rm",
+];
+
+/// Materialize a Stage 0 guest root at `dest` from the embedded
 /// busybox + the cached nix-portable + the embedded init script.
-/// The returned bytes can be written to a temp file and handed to
-/// libkrun via `KrunContext::new_initramfs`.
+/// The supervisor hands `dest` to libkrun via `krun_set_root`,
+/// which mounts it as the guest root over virtiofs.
+///
+/// Idempotent over a clean `dest`. Caller is responsible for making
+/// sure `dest` is empty (or doesn't exist) — the function creates
+/// the directory tree from scratch.
 ///
 /// Caller must have already run [`prepare_assets`] so nix-portable
 /// is present in the cache dir.
-pub fn build_initramfs() -> Result<Vec<u8>> {
-    let dir = stage0_cache_dir();
-    let nix_portable = read_asset(&dir, &NIX_PORTABLE_AARCH64)?;
-
-    let mut arc = CpioArchive::new();
-    // Directory stubs the init script (and the kernel's early-boot
-    // mounts) need to exist before mount(2) succeeds.
-    for d in &[
-        "/bin",
-        "/dev",
-        "/etc",
-        "/out",
-        "/proc",
-        "/run",
-        "/sys",
-        "/tmp",
-        "/usr",
-        "/usr/local",
-        "/usr/local/bin",
-        "/work",
-    ] {
-        arc.dir(*d, Perm::DIR_755);
-    }
-    // /sbin is conventionally a symlink to /bin on busybox systems —
-    // some applets (poweroff, udhcpc) are looked up under /sbin.
-    arc.symlink("/sbin", "bin");
-
-    arc.file("/init", Perm::FILE_755, INIT_SCRIPT.as_bytes());
-    arc.file(
-        "/bin/busybox",
-        Perm::FILE_755,
-        BUSYBOX_AARCH64_BYTES.to_vec(),
-    );
-    arc.file(
-        "/usr/local/bin/nix-portable",
-        Perm(NIX_PORTABLE_AARCH64.mode),
-        nix_portable,
-    );
-
-    // Pre-materialize the busybox applet symlinks /init relies on
-    // before `busybox --install -s` runs. The shebang `#!/bin/sh`
-    // needs `/bin/sh` resolvable the moment the kernel executes
-    // `/init`, which is before any line of /init has run.
-    for applet in PRE_INSTALLED_APPLETS {
-        arc.symlink(format!("/bin/{applet}"), "busybox");
+pub fn materialize_root_dir(dest: &Path) -> Result<()> {
+    let cache = stage0_cache_dir();
+    let nix_portable_src = cache.join(NIX_PORTABLE_AARCH64.cache_filename);
+    if !nix_portable_src.is_file() {
+        bail!(
+            "Stage 0 asset missing: {} (run `prepare_assets` first)",
+            nix_portable_src.display()
+        );
     }
 
-    arc.into_bytes().context("serializing Stage 0 cpio archive")
-}
+    std::fs::create_dir_all(dest)
+        .with_context(|| format!("creating Stage 0 root dir {}", dest.display()))?;
 
-/// busybox applets the init script invokes directly. Each one
-/// gets a /bin/<name> -> busybox symlink in the initramfs.
-const PRE_INSTALLED_APPLETS: &[&str] = &[
-    "sh",
-    "mount",
-    "umount",
-    "mkdir",
-    "mountpoint",
-    "cp",
-    "ip",
-    "udhcpc",
-    "sync",
-    "poweroff",
-    "cat",
-    "echo",
-    "ls",
-    "rm",
-];
+    for stub in ROOT_DIR_STUBS {
+        let p = dest.join(stub);
+        std::fs::create_dir_all(&p)
+            .with_context(|| format!("creating Stage 0 stub dir {}", p.display()))?;
+    }
 
-fn read_asset(dir: &Path, asset: &BootstrapAsset) -> Result<Vec<u8>> {
-    let path = dir.join(asset.cache_filename);
-    let mut f = std::fs::File::open(&path).with_context(|| {
+    // /sbin → bin (some applets like poweroff/udhcpc are looked up
+    // under /sbin by upstream conventions).
+    symlink_relative("bin", &dest.join("sbin"))?;
+
+    write_file_mode(&dest.join("init"), INIT_SCRIPT.as_bytes(), 0o755)
+        .context("writing Stage 0 /init")?;
+    write_file_mode(
+        &dest.join("bin").join("busybox"),
+        BUSYBOX_AARCH64_BYTES,
+        0o755,
+    )
+    .context("writing Stage 0 /bin/busybox")?;
+
+    // nix-portable is ~74 MiB; copy from cache rather than load it
+    // through a Vec<u8>.
+    let np_dst = dest.join("usr").join("local").join("bin").join("nix-portable");
+    std::fs::copy(&nix_portable_src, &np_dst).with_context(|| {
         format!(
-            "opening Stage 0 asset {} (run `mvmctl dev fetch-stage0` first)",
-            path.display(),
+            "copying {} -> {}",
+            nix_portable_src.display(),
+            np_dst.display()
         )
     })?;
-    let mut buf = Vec::new();
-    f.read_to_end(&mut buf)
-        .with_context(|| format!("reading {}", path.display()))?;
-    Ok(buf)
+    set_mode(&np_dst, NIX_PORTABLE_AARCH64.mode)?;
+
+    // Materialize busybox applet symlinks. The kernel's binfmt_script
+    // handler will need `bin/sh` resolvable the moment libkrun execs
+    // `/init`, before any line of /init has run.
+    for applet in PRE_INSTALLED_APPLETS {
+        symlink_relative("busybox", &dest.join("bin").join(applet))?;
+    }
+
+    Ok(())
+}
+
+fn write_file_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
+    let mut f = std::fs::File::create(path)
+        .with_context(|| format!("creating {}", path.display()))?;
+    f.write_all(bytes)
+        .with_context(|| format!("writing {}", path.display()))?;
+    set_mode(path, mode)?;
+    Ok(())
+}
+
+fn set_mode(path: &Path, mode: u32) -> Result<()> {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode))
+            .with_context(|| format!("chmod {} -> {:o}", path.display(), mode))?;
+    }
+    #[cfg(not(unix))]
+    {
+        let _ = (path, mode);
+    }
+    Ok(())
+}
+
+/// Create a symlink at `link` pointing at `target` (a relative path).
+/// Replaces an existing symlink at `link` if any.
+fn symlink_relative(target: &str, link: &Path) -> Result<()> {
+    if link.symlink_metadata().is_ok() {
+        std::fs::remove_file(link)
+            .with_context(|| format!("removing existing {}", link.display()))?;
+    }
+    #[cfg(unix)]
+    {
+        std::os::unix::fs::symlink(target, link)
+            .with_context(|| format!("symlink {} -> {target}", link.display()))?;
+    }
+    #[cfg(not(unix))]
+    {
+        bail!(
+            "Stage 0 root materialization requires a Unix host (symlink at {})",
+            link.display()
+        );
+    }
+    Ok(())
 }
 
 fn verify_sha256(path: &Path, expected_hex: &str) -> Result<bool> {
@@ -256,12 +296,7 @@ fn fetch_to(target: &Path, asset: &BootstrapAsset) -> Result<()> {
         out.write_all(&bytes)
             .with_context(|| format!("writing {}", staging.display()))?;
     }
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::PermissionsExt;
-        std::fs::set_permissions(&staging, std::fs::Permissions::from_mode(asset.mode))
-            .with_context(|| format!("chmod {} -> {:o}", staging.display(), asset.mode))?;
-    }
+    set_mode(&staging, asset.mode)?;
     std::fs::rename(&staging, target).with_context(|| {
         format!(
             "atomic-rename {} -> {}",
@@ -326,9 +361,6 @@ mod tests {
 
     #[test]
     fn vendored_busybox_is_aarch64_elf() {
-        // Linux kernel ELF magic + ARM aarch64 machine code.
-        // ELF: 0x7f 'E' 'L' 'F'; e_machine for aarch64 is 0xB7 at
-        // offset 18 (little-endian).
         assert!(
             BUSYBOX_AARCH64_BYTES.len() > 64,
             "busybox too small to be a real ELF"
@@ -348,7 +380,6 @@ mod tests {
     fn downloadable_assets_table_covers_nix_portable() {
         let names: Vec<_> = ASSETS_AARCH64.iter().map(|a| a.cache_filename).collect();
         assert!(names.contains(&"nix-portable"));
-        // busybox is vendored — it's NOT a downloadable asset.
         assert!(!names.contains(&"busybox"));
     }
 
@@ -381,12 +412,12 @@ mod tests {
         }
     }
 
-    /// Smoke: building the initramfs against a temp cache dir with
-    /// a stub nix-portable produces a valid cpio archive containing
-    /// the init script + the vendored busybox bytes + the stub
-    /// nix-portable.
+    /// Smoke: materializing the root dir against a temp cache dir
+    /// with a stub nix-portable produces a tree containing the init
+    /// script, the vendored busybox, the stub nix-portable, and the
+    /// busybox applet symlinks.
     #[test]
-    fn build_initramfs_against_stub_cache() {
+    fn materialize_root_dir_against_stub_cache() {
         let dir = TempDir::new().unwrap();
         // The module's `stage0_cache_dir()` reads from $HOME; swap.
         // SAFETY: this test mutates env vars but isn't expected to
@@ -395,13 +426,12 @@ mod tests {
         unsafe {
             std::env::set_var("HOME", dir.path());
         }
-        // The path is `$HOME/.cache/mvm/stage0`; we need a stub
-        // nix-portable there. Vendored busybox doesn't need staging.
-        let real_dir = stage0_cache_dir();
-        std::fs::create_dir_all(&real_dir).unwrap();
-        std::fs::write(real_dir.join("nix-portable"), b"FAKE_NIX_PORTABLE").unwrap();
+        let real_cache = stage0_cache_dir();
+        std::fs::create_dir_all(&real_cache).unwrap();
+        std::fs::write(real_cache.join("nix-portable"), b"FAKE_NIX_PORTABLE").unwrap();
 
-        let bytes = build_initramfs().expect("build_initramfs succeeds with stubs in place");
+        let root = dir.path().join("stage0-root");
+        materialize_root_dir(&root).expect("materialize succeeds with stubs in place");
 
         // Restore HOME.
         unsafe {
@@ -411,22 +441,88 @@ mod tests {
             }
         }
 
-        // The archive should contain the init script content + the
-        // vendored busybox ELF magic + the stub nix-portable bytes.
-        let s = String::from_utf8_lossy(&bytes);
-        assert!(s.contains("#!/bin/sh"), "init script content present");
+        // Expected layout.
+        assert!(root.join("init").is_file(), "/init present");
+        assert!(root.join("bin").join("busybox").is_file(), "busybox present");
         assert!(
-            s.contains("FAKE_NIX_PORTABLE"),
-            "stub nix-portable bytes present"
+            root.join("usr/local/bin/nix-portable").is_file(),
+            "nix-portable copied"
         );
-        assert!(s.contains("TRAILER!!!"), "cpio archive is well-terminated");
-        // Vendored busybox is binary, search for its ELF magic prefix.
+        for stub in ROOT_DIR_STUBS {
+            assert!(root.join(stub).is_dir(), "stub dir {stub} present");
+        }
+        // /sbin → bin symlink.
+        let sbin = root.join("sbin");
         assert!(
-            bytes.windows(4).any(|w| w == [0x7f, b'E', b'L', b'F']),
-            "vendored busybox ELF bytes present"
+            sbin.symlink_metadata().unwrap().file_type().is_symlink(),
+            "/sbin is a symlink"
+        );
+        assert_eq!(std::fs::read_link(&sbin).unwrap(), std::path::Path::new("bin"));
+        // Applet symlinks.
+        for applet in PRE_INSTALLED_APPLETS {
+            let p = root.join("bin").join(applet);
+            assert!(
+                p.symlink_metadata().unwrap().file_type().is_symlink(),
+                "/bin/{applet} is a symlink"
+            );
+            assert_eq!(std::fs::read_link(&p).unwrap(), std::path::Path::new("busybox"));
+        }
+
+        // Permissions: /init and /bin/busybox executable.
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let init_mode = std::fs::metadata(root.join("init")).unwrap().permissions().mode();
+            assert_eq!(init_mode & 0o777, 0o755, "/init mode 0755");
+            let bb_mode = std::fs::metadata(root.join("bin/busybox"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(bb_mode & 0o777, 0o755, "/bin/busybox mode 0755");
+            let np_mode = std::fs::metadata(root.join("usr/local/bin/nix-portable"))
+                .unwrap()
+                .permissions()
+                .mode();
+            assert_eq!(np_mode & 0o777, 0o755, "/usr/local/bin/nix-portable mode 0755");
+        }
+
+        // The script in /init is byte-identical to the embedded
+        // INIT_SCRIPT — guards against silent corruption.
+        let on_disk = std::fs::read_to_string(root.join("init")).unwrap();
+        assert_eq!(on_disk, INIT_SCRIPT);
+
+        let _ = std::fs::remove_dir_all(real_cache);
+    }
+
+    /// Materializing without first calling `prepare_assets` (nix-portable
+    /// missing from cache) is rejected with a clear error.
+    #[test]
+    fn materialize_root_dir_rejects_missing_nix_portable() {
+        let dir = TempDir::new().unwrap();
+        let saved = std::env::var_os("HOME");
+        unsafe {
+            std::env::set_var("HOME", dir.path());
+        }
+        let real_cache = stage0_cache_dir();
+        // Do NOT create nix-portable.
+        std::fs::create_dir_all(&real_cache).unwrap();
+
+        let root = dir.path().join("stage0-root");
+        let err = materialize_root_dir(&root).expect_err("missing asset should fail");
+
+        unsafe {
+            match saved {
+                Some(v) => std::env::set_var("HOME", v),
+                None => std::env::remove_var("HOME"),
+            }
+        }
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("nix-portable"),
+            "error names the missing asset: {msg}"
         );
 
-        // Cleanup our test cache dir.
-        let _ = std::fs::remove_dir_all(real_dir);
+        let _ = std::fs::remove_dir_all(real_cache);
     }
 }

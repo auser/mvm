@@ -2165,12 +2165,12 @@ fn bootstrap_builder_vm_image() -> Result<()> {
 
             #[cfg(feature = "builder-vm")]
             {
-                bootstrap_builder_vm_image_via_initramfs_stage0(
+                bootstrap_builder_vm_image_via_root_dir_stage0(
                     &flake_dir,
                     &out_dir,
                     &source_fingerprint,
                 )
-                .context("building the source-checkout builder VM image via initramfs Stage 0")
+                .context("building the source-checkout builder VM image via root-dir Stage 0")
             }
 
             #[cfg(not(feature = "builder-vm"))]
@@ -2581,60 +2581,128 @@ fn ensure_stage0_seed_manifest(seed_rootfs: &std::path::Path) -> Result<()> {
     Ok(())
 }
 
-/// Stage 0 bootstrap via an in-memory initramfs (busybox +
-/// nix-portable + a shell init script). Replaces the ur-seed
-/// flake + tarball path entirely.
+/// Stage 0 bootstrap via libkrun's `krun_set_root` mode — hand a
+/// host directory containing busybox + nix-portable + an init
+/// script to libkrun, which mounts it as the guest root via
+/// virtiofs against libkrunfw's bundled TSI-patched kernel. The
+/// guest builds the in-repo `nix/images/builder-vm` flake against
+/// `/work` and writes the steady-state artifacts (`vmlinux`,
+/// `rootfs.ext4`, `cmdline.txt`) to `/out`, then powers off.
 ///
-/// The full wire-through (LibkrunBuilderVm running with the
-/// initramfs `BuilderVmImage` variant + a Stage-0-specific job
-/// flow that doesn't stage `/job/cmd.sh`) lands in the follow-up
-/// PR. For now this builds the cpio bytes (proves the
-/// infrastructure works) and surfaces a clear error pointing at
-/// the artifact + the dev-image fallback.
+/// Replaces the previous initramfs-cpio dispatch shape: libkrunfw's
+/// kernel ships with `CONFIG_BLK_DEV_INITRD=n`, so cpio initramfs
+/// cannot unpack. `set_root` mode is libkrun's intended container
+/// boot path and uses the same kernel without modification.
 #[cfg(feature = "builder-vm")]
-fn bootstrap_builder_vm_image_via_initramfs_stage0(
+fn bootstrap_builder_vm_image_via_root_dir_stage0(
     builder_flake_dir: &str,
     out_dir: &str,
     source_fingerprint: &str,
 ) -> Result<()> {
+    use mvm_build::libkrun_builder::BuilderVmImage;
+
     let _stage0_guard = acquire_stage0_lock(out_dir)?;
 
     mvm_build::stage0::prepare_assets(mvm_build::stage0::ASSETS_AARCH64)
         .context("preparing Stage 0 bootstrap assets")?;
 
-    let initramfs_bytes =
-        mvm_build::stage0::build_initramfs().context("building Stage 0 initramfs cpio")?;
-
-    let cpio_path = mvm_build::stage0::stage0_cache_dir().join("initramfs.cpio");
-    std::fs::write(&cpio_path, &initramfs_bytes)
-        .with_context(|| format!("writing {}", cpio_path.display()))?;
+    // Materialize the guest root tree (busybox + nix-portable +
+    // /init + stubs) under a stable per-host location. libkrun mounts
+    // this directory as the guest root via virtiofs.
+    let root_dir = mvm_build::stage0::stage0_cache_dir().join("root");
+    if root_dir.exists() {
+        std::fs::remove_dir_all(&root_dir).with_context(|| {
+            format!("clearing previous Stage 0 root dir {}", root_dir.display())
+        })?;
+    }
+    mvm_build::stage0::materialize_root_dir(&root_dir)
+        .with_context(|| format!("materializing Stage 0 root at {}", root_dir.display()))?;
     ui::info(&format!(
-        "Stage 0 initramfs cpio staged at {} ({} bytes).",
-        cpio_path.display(),
-        initramfs_bytes.len()
+        "Stage 0 root dir materialized at {}.",
+        root_dir.display()
     ));
 
-    // The initramfs bootstrap dispatch into libkrun needs
-    // `extract_bundled_kernel`, which lives behind the
-    // `libkrun-sys` Cargo feature and is only linked into the
-    // supervisor binary today (not into mvmctl). Until the
-    // supervisor exposes a kernel-extraction sub-command (or
-    // mvmctl is built with the `libkrun-sys` feature), the only
-    // way to get a Stage 0 seed onto a fresh source checkout is
-    // to import one.
-    let _ = (builder_flake_dir, out_dir, source_fingerprint);
-    anyhow::bail!(
-        "Stage 0 has no seed image to bootstrap from. The initramfs cpio is \
-         ready at {} but the host-side dispatch that would run it is not yet \
-         wired (needs `mvm-libkrun-supervisor` to expose bundled-kernel \
-         extraction). Workarounds:\n\
-         \n\
-         1. Import a previously-built dev image:\n\
-            `mvmctl dev import-image --kernel <vmlinux> --rootfs <rootfs.ext4>`\n\
-         2. Or move/delete `nix/images/builder/flake.nix` so the source-checkout \
-            heuristic stops matching and the published prebuilt is used.",
-        cpio_path.display()
+    // Workspace root = three dirs above the flake.nix
+    // (nix/images/builder-vm/flake.nix → repo root).
+    let workspace_root = std::path::Path::new(builder_flake_dir)
+        .parent()
+        .and_then(|p| p.parent())
+        .and_then(|p| p.parent())
+        .ok_or_else(|| {
+            anyhow::anyhow!("Cannot derive workspace root from {builder_flake_dir}")
+        })?
+        .to_path_buf();
+
+    let out_dir_path = std::path::Path::new(out_dir);
+    let staging_dir = unique_builder_vm_stage0_staging_dir(out_dir_path)?;
+    std::fs::create_dir_all(&staging_dir)
+        .with_context(|| format!("creating Stage 0 staging dir {}", staging_dir.display()))?;
+
+    let started = std::time::Instant::now();
+    let fingerprint_prefix = stage0_fingerprint_prefix(source_fingerprint);
+    mvm_core::audit_emit!(
+        Stage0Boot,
+        "seed=root-dir fingerprint_prefix={fingerprint_prefix}"
     );
+
+    let image = BuilderVmImage::new_root_dir(root_dir.clone(), "/init");
+    let result = run_stage0_root_dir(&staging_dir, &workspace_root, image, source_fingerprint);
+    let duration_ms = started.elapsed().as_millis() as u64;
+
+    match result {
+        Ok(()) => {
+            promote_builder_vm_stage0_cache(&staging_dir, out_dir_path, source_fingerprint)
+                .context("promoting Stage 0 artifacts into the builder VM cache")?;
+            mvm_core::audit_emit!(
+                Stage0CachePromoted,
+                "cache={cache} fingerprint_prefix={fingerprint_prefix} duration_ms={duration_ms}",
+                cache = out_dir_path.display(),
+            );
+            Ok(())
+        }
+        Err((stage, e)) => {
+            let _ = std::fs::remove_dir_all(&staging_dir);
+            let reason = stage0_failure_reason_summary(&e);
+            mvm_core::audit_emit!(
+                Stage0Failed,
+                "stage={stage} duration_ms={duration_ms} reason={reason}"
+            );
+            Err(e)
+        }
+    }
+}
+
+/// Boot the Stage 0 VM with the supplied `RootDir` image, mounting
+/// `workspace_root` as `/work` and `staging_dir` as `/out`. On
+/// clean exit, write the cache-validation sidecars next to the
+/// emitted artifacts so the outer caller can promote them into the
+/// per-arch builder VM cache.
+#[cfg(feature = "builder-vm")]
+fn run_stage0_root_dir(
+    staging_dir: &std::path::Path,
+    workspace_root: &std::path::Path,
+    image: mvm_build::libkrun_builder::BuilderVmImage,
+    source_fingerprint: &str,
+) -> std::result::Result<(), (Stage0FailureStage, anyhow::Error)> {
+    use mvm_build::libkrun_builder::LibkrunBuilderVm;
+
+    LibkrunBuilderVm::default()
+        .run_stage0(image, workspace_root, staging_dir)
+        .map_err(|e| {
+            (
+                Stage0FailureStage::Build,
+                anyhow::anyhow!("Stage 0 root-dir build: {e}"),
+            )
+        })?;
+
+    write_builder_vm_source_fingerprint(staging_dir, source_fingerprint)
+        .map_err(|e| (Stage0FailureStage::Validate, e))?;
+    write_builder_vm_artifact_digest_manifest(staging_dir)
+        .map_err(|e| (Stage0FailureStage::Validate, e))?;
+    write_builder_vm_source_cache_provenance(staging_dir, source_fingerprint)
+        .map_err(|e| (Stage0FailureStage::Validate, e))?;
+
+    Ok(())
 }
 
 #[cfg(feature = "builder-vm")]
@@ -4575,15 +4643,21 @@ mod builder_vm_bootstrap_tests {
             mounts.artifact_out,
             std::path::PathBuf::from("/cache/builder-vm/aarch64")
         );
-        assert_eq!(
-            image.kernel_path,
-            std::path::PathBuf::from("/dev-cache/vmlinux")
-        );
-        assert_eq!(
-            image.rootfs_path,
-            Some(std::path::PathBuf::from("/dev-cache/rootfs.ext4"))
-        );
-        assert_eq!(image.cmdline, STAGE0_BOOTSTRAP_CMDLINE);
+        match image {
+            mvm_build::libkrun_builder::BuilderVmImage::Rootfs {
+                kernel_path,
+                rootfs_path,
+                cmdline,
+            } => {
+                assert_eq!(kernel_path, std::path::PathBuf::from("/dev-cache/vmlinux"));
+                assert_eq!(
+                    rootfs_path,
+                    std::path::PathBuf::from("/dev-cache/rootfs.ext4")
+                );
+                assert_eq!(cmdline, STAGE0_BOOTSTRAP_CMDLINE);
+            }
+            other => panic!("expected Rootfs variant, got {other:?}"),
+        }
     }
 
     #[test]

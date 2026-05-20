@@ -293,6 +293,84 @@ impl LibkrunBuilderVm {
         self
     }
 
+    /// Boot a Stage 0 bootstrap VM that runs a self-contained init
+    /// script — no `/job/cmd.sh` staging, no `/job/result` parsing,
+    /// no `/nix-store` virtio-blk. The guest is expected to be a
+    /// `BuilderVmImage::RootDir` whose `/init` reads `/work` and
+    /// writes the steady-state builder VM artifacts to `/out`, then
+    /// powers off cleanly.
+    ///
+    /// On success, the caller still needs to validate that the
+    /// expected artifacts (`vmlinux`, `rootfs.ext4`) landed in
+    /// `artifact_out`; this function only asserts that the
+    /// supervisor exited 0.
+    pub fn run_stage0(
+        &self,
+        image: BuilderVmImage,
+        workspace_dir: &std::path::Path,
+        artifact_out: &std::path::Path,
+    ) -> Result<(), BuilderVmError> {
+        ensure_utf8_path(workspace_dir, "workspace_dir")?;
+        ensure_utf8_path(artifact_out, "artifact_out")?;
+        if !workspace_dir.is_dir() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "Stage 0 workspace_dir must be an existing directory: {}",
+                workspace_dir.display()
+            )));
+        }
+        std::fs::create_dir_all(artifact_out).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating Stage 0 artifact_out {}: {e}",
+                artifact_out.display()
+            ))
+        })?;
+
+        if !mvm_libkrun::is_available() {
+            return Err(BuilderVmError::LibkrunUnavailable(format!(
+                "libkrun shared library not found on host. {}",
+                mvm_libkrun::install_hint()
+            )));
+        }
+
+        let supervisor_path = resolve_supervisor_path()?;
+
+        let job_id = unique_job_id();
+        let vm_name = format!("mvm-stage0-{job_id}");
+        let vm_state_dir = builder_vm_cache_dir().join("vms").join(&vm_name);
+        std::fs::create_dir_all(&vm_state_dir).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating Stage 0 VM state dir {}: {e}",
+                vm_state_dir.display()
+            ))
+        })?;
+        let console_log = vm_state_dir.join("console.log");
+
+        let mut krun = krun_context_for_image(&vm_name, &image)?
+            .with_resources(self.vcpus, self.memory_mib)
+            .with_console_output(path_to_str(&console_log, "console_log")?)
+            .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
+            .add_virtio_fs("work", path_to_str(workspace_dir, "workspace_dir")?)
+            .add_virtio_fs("out", path_to_str(artifact_out, "artifact_out")?);
+
+        krun = apply_networking_mode(krun, &vm_state_dir)?;
+
+        let cfg = SupervisorConfig {
+            krun,
+            vm_state_dir: path_to_str(&vm_state_dir, "vm_state_dir")?.to_string(),
+            pid_file_name: Some("stage0.pid".to_string()),
+        };
+
+        let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg, &vm_state_dir)?;
+        if exit_code != 0 {
+            return Err(BuilderVmError::NixBuildFailed(format!(
+                "Stage 0 supervisor exited with status {exit_code}; \
+                 console log at {}",
+                console_log.display()
+            )));
+        }
+        Ok(())
+    }
+
     /// Run an in-tree shell script inside the existing builder VM
     /// boundary. The script is staged as `/job/cmd.sh`; `/work`
     /// points at [`BuilderShellJob::work_dir`], `/out` points at
@@ -335,7 +413,6 @@ impl LibkrunBuilderVm {
 
         let mut krun = krun_context_for_image(&vm_name, &image)?
             .with_resources(self.vcpus, self.memory_mib)
-            .with_cmdline(&image.cmdline)
             .with_console_output(path_to_str(&console_log, "console_log")?)
             .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
             .add_disk(
@@ -600,7 +677,6 @@ impl BuilderVm for LibkrunBuilderVm {
         let console_log = vm_state_dir.join("console.log");
         let mut krun = krun_context_for_image(&vm_name, &image)?
             .with_resources(self.vcpus, self.memory_mib)
-            .with_cmdline(&image.cmdline)
             .with_console_output(path_to_str(&console_log, "console_log")?)
             .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
             .add_disk(
@@ -674,71 +750,79 @@ impl BuilderVm for LibkrunBuilderVm {
 // reads top-down.
 // ─────────────────────────────────────────────────────────────────
 
-/// Resolved builder VM image — either the W2 flake output the
-/// libkrun launcher boots into, or a caller-supplied Stage 0 image.
+/// Resolved builder VM image. One of two boot shapes:
 ///
-/// Either a rootfs ext4 disk (the normal steady-state builder VM
-/// path) or an initramfs (the Stage 0 bootstrap path). Setting
-/// both is a programming error; setting neither is rejected at
-/// `run_build` time.
+/// - **Rootfs**: kernel + rootfs.ext4 + cmdline. The steady-state
+///   builder VM path produced by the W2 flake.
+/// - **RootDir**: host directory + guest entrypoint. The Stage 0
+///   bootstrap path. libkrun's bundled kernel boots transparently;
+///   no host-built kernel involved.
 #[derive(Debug, Clone)]
-pub struct BuilderVmImage {
-    pub kernel_path: PathBuf,
-    pub rootfs_path: Option<PathBuf>,
-    pub initramfs_path: Option<PathBuf>,
-    pub cmdline: String,
+pub enum BuilderVmImage {
+    /// Steady-state builder VM image.
+    Rootfs {
+        kernel_path: PathBuf,
+        rootfs_path: PathBuf,
+        cmdline: String,
+    },
+    /// Host directory libkrun mounts as the guest root via virtiofs.
+    /// `entry_path` is the guest PID 1 (relative to `root_dir`).
+    RootDir {
+        root_dir: PathBuf,
+        entry_path: String,
+    },
 }
 
 impl BuilderVmImage {
     /// Image that boots from a rootfs ext4 disk + the supervisor's
     /// canonical `init=` cmdline.
     pub fn new(kernel_path: PathBuf, rootfs_path: PathBuf, cmdline: String) -> Self {
-        Self {
+        Self::Rootfs {
             kernel_path,
-            rootfs_path: Some(rootfs_path),
-            initramfs_path: None,
+            rootfs_path,
             cmdline,
         }
     }
 
-    /// Image that boots from an initramfs (no rootfs disk attached).
-    /// The kernel decompresses the cpio into a tmpfs and runs
-    /// `init=/init` from it.
-    pub fn new_initramfs(kernel_path: PathBuf, initramfs_path: PathBuf, cmdline: String) -> Self {
-        Self {
-            kernel_path,
-            rootfs_path: None,
-            initramfs_path: Some(initramfs_path),
-            cmdline,
+    /// Image that hands a host directory to libkrun as the guest
+    /// root via `krun_set_root`. libkrun's bundled kernel boots
+    /// transparently. `entry_path` is the guest PID 1, relative to
+    /// `root_dir`.
+    pub fn new_root_dir(root_dir: PathBuf, entry_path: impl Into<String>) -> Self {
+        Self::RootDir {
+            root_dir,
+            entry_path: entry_path.into(),
         }
     }
 }
 
-/// Build the right `KrunContext` flavor for a [`BuilderVmImage`].
-/// Rootfs images go through `KrunContext::new`; initramfs images
-/// go through `KrunContext::new_initramfs`. Either-or; refuses to
-/// construct a context if neither field is set.
+/// Build the right `KrunContext` flavor for a [`BuilderVmImage`],
+/// pre-populated with the variant's kernel cmdline (where applicable).
+/// `RootDir` images carry no cmdline — libkrun handles `set_root`
+/// mode without one.
 fn krun_context_for_image(
     vm_name: &str,
     image: &BuilderVmImage,
 ) -> Result<KrunContext, BuilderVmError> {
-    let kernel = path_to_str(&image.kernel_path, "kernel_path")?;
-    if let Some(initramfs) = &image.initramfs_path {
-        Ok(KrunContext::new_initramfs(
+    match image {
+        BuilderVmImage::Rootfs {
+            kernel_path,
+            rootfs_path,
+            cmdline,
+        } => Ok(KrunContext::new(
             vm_name,
-            kernel,
-            path_to_str(initramfs, "initramfs_path")?,
-        ))
-    } else if let Some(rootfs) = &image.rootfs_path {
-        Ok(KrunContext::new(
+            path_to_str(kernel_path, "kernel_path")?,
+            path_to_str(rootfs_path, "rootfs_path")?,
+        )
+        .with_cmdline(cmdline.as_str())),
+        BuilderVmImage::RootDir {
+            root_dir,
+            entry_path,
+        } => Ok(KrunContext::new_root_dir(
             vm_name,
-            kernel,
-            path_to_str(rootfs, "rootfs_path")?,
-        ))
-    } else {
-        Err(BuilderVmError::ExtractionFailed(
-            "BuilderVmImage has neither rootfs_path nor initramfs_path".to_string(),
-        ))
+            path_to_str(root_dir, "root_dir")?,
+            entry_path.as_str(),
+        )),
     }
 }
 
@@ -1318,14 +1402,36 @@ fn spawn_supervisor_in_background(
         BuilderVmError::ExtractionFailed(format!("serialize SupervisorConfig: {e}"))
     })?;
 
-    let mut child = Command::new(supervisor_path)
+    let mut command = Command::new(supervisor_path);
+    command
         .stdin(Stdio::piped())
         .stdout(Stdio::inherit())
-        .stderr(Stdio::inherit())
-        .spawn()
-        .map_err(|e| {
-            BuilderVmError::LibkrunUnavailable(format!("spawn {}: {e}", supervisor_path.display()))
-        })?;
+        .stderr(Stdio::inherit());
+    // libkrun dlopens `libkrunfw.5.dylib` by short name when its
+    // bundled-kernel path runs (e.g. `krun_set_root` mode without
+    // an explicit `set_kernel`). macOS dyld's default search list
+    // does not include /opt/homebrew/lib where Homebrew installs
+    // libkrunfw, so the dlopen fails with "Couldn't find or load"
+    // and the supervisor exits rc -2. Adding the Homebrew prefix
+    // to DYLD_FALLBACK_LIBRARY_PATH unblocks the lookup without
+    // overriding dyld's normal search order.
+    #[cfg(target_os = "macos")]
+    {
+        let mut fallback =
+            std::env::var("DYLD_FALLBACK_LIBRARY_PATH").unwrap_or_default();
+        for path in ["/opt/homebrew/lib", "/usr/local/lib"] {
+            if !fallback.split(':').any(|p| p == path) {
+                if !fallback.is_empty() {
+                    fallback.push(':');
+                }
+                fallback.push_str(path);
+            }
+        }
+        command.env("DYLD_FALLBACK_LIBRARY_PATH", fallback);
+    }
+    let mut child = command.spawn().map_err(|e| {
+        BuilderVmError::LibkrunUnavailable(format!("spawn {}: {e}", supervisor_path.display()))
+    })?;
     child
         .stdin
         .take()
@@ -1906,7 +2012,6 @@ impl LibkrunPersistentBuilderVm {
 
         let mut krun = krun_context_for_image(&vm_name, &image)?
             .with_resources(self.vcpus, self.memory_mib)
-            .with_cmdline(&image.cmdline)
             .with_console_output(path_to_str(&console_log, "console_log")?)
             .with_vsock_socket_dir(path_to_str(&vm_state_dir, "vm_state_dir")?)
             .add_disk(

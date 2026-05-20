@@ -153,6 +153,58 @@ impl Context {
         check(unsafe { bindings::krun_set_root_disk(self.ctx_id, path.as_ptr()) })
     }
 
+    /// Set a host directory as the guest's root, exported via
+    /// virtiofs. libkrun's bundled kernel boots transparently — no
+    /// `set_kernel` call is needed. Must be paired with
+    /// [`Self::set_guest_entrypoint`] so libkrun knows what to run
+    /// as PID 1.
+    ///
+    /// Mutually exclusive with `set_root_disk` and `set_kernel`. The
+    /// `KrunContext` layer in `lib.rs` enforces this at the type level;
+    /// here we just forward to the FFI.
+    pub fn set_root(&self, root_path: &Path) -> Result<(), Error> {
+        let path = cstring(root_path)?;
+        check(unsafe { bindings::krun_set_root(self.ctx_id, path.as_ptr()) })
+    }
+
+    /// Set the entrypoint libkrun launches inside the guest (wraps
+    /// `krun_set_exec`). `entry_path` is relative to the directory
+    /// set via [`Self::set_root`]. `argv` is passed verbatim (libkrun
+    /// appends the required trailing NULL); per libkrun.h, `argv[0]`
+    /// should be the entrypoint name. `envp` is the environment block;
+    /// pass an empty slice for "inherit nothing" (libkrun does not
+    /// propagate the host env).
+    pub fn set_guest_entrypoint(
+        &self,
+        entry_path: &Path,
+        argv: &[&str],
+        envp: &[&str],
+    ) -> Result<(), Error> {
+        let entry = cstring(entry_path)?;
+        let argv_owned: Vec<CString> = argv
+            .iter()
+            .map(|a| CString::new(*a).map_err(|_| Error::InvalidCString))
+            .collect::<Result<_, _>>()?;
+        let envp_owned: Vec<CString> = envp
+            .iter()
+            .map(|e| CString::new(*e).map_err(|_| Error::InvalidCString))
+            .collect::<Result<_, _>>()?;
+        let mut argv_ptrs: Vec<*const std::os::raw::c_char> =
+            argv_owned.iter().map(|c| c.as_ptr()).collect();
+        argv_ptrs.push(std::ptr::null());
+        let mut envp_ptrs: Vec<*const std::os::raw::c_char> =
+            envp_owned.iter().map(|c| c.as_ptr()).collect();
+        envp_ptrs.push(std::ptr::null());
+        check(unsafe {
+            bindings::krun_set_exec(
+                self.ctx_id,
+                entry.as_ptr(),
+                argv_ptrs.as_ptr(),
+                envp_ptrs.as_ptr(),
+            )
+        })
+    }
+
     pub fn set_kernel(
         &self,
         kernel_path: &Path,

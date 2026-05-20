@@ -8,7 +8,6 @@ pub mod backend;
 pub mod builder_protocol;
 pub mod builder_vm;
 pub mod cache;
-pub mod cpio;
 pub mod firecracker;
 /// Plan 76 Phase 6 — portable signed `.mvm` artifacts. A tar.gz
 /// wrapper around kernel + rootfs + verity sidecars + cmdline,
