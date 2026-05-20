@@ -138,6 +138,13 @@ pub enum LocalAuditKind {
     /// from `~/.cache/mvm`. Pure read-only `cache info` is not
     /// audited; the prune verb is, because it deletes host bytes.
     CachePrune,
+    /// `mvmctl cleanup` ran a host-side tier sweep
+    /// (`--cache` / `--state` / `--nuclear`). The detail field carries
+    /// the tier name, byte count freed, and number of top-level paths
+    /// removed. The in-VM-only default invocation continues to emit
+    /// `SlotPrune` for its `~/.mvm/dev/builds/` mutation; this kind is
+    /// only emitted when a host-side tier flag is set.
+    Cleanup,
     /// `mvmctl manifest rm` deleted a registry slot
     /// (`~/.mvm/templates/<slot_hash>/`). Optionally also deleted the
     /// source `mvm.toml` when `--manifest-file` is passed.

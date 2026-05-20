@@ -54,10 +54,26 @@ fn top_level_command_summaries_stay_short() {
 fn test_cleanup_defaults() {
     let cli = Cli::try_parse_from(["mvmctl", "cleanup"]).unwrap();
     match cli.command {
-        Commands::Cleanup(cleanup::Args { keep, all, verbose }) => {
+        Commands::Cleanup(cleanup::Args {
+            keep,
+            all,
+            verbose,
+            cache,
+            state,
+            nuclear,
+            dry_run,
+            yes,
+            force,
+        }) => {
             assert_eq!(keep, None);
             assert!(!all);
             assert!(!verbose);
+            assert!(!cache);
+            assert!(!state);
+            assert!(!nuclear);
+            assert!(!dry_run);
+            assert!(!yes);
+            assert!(!force);
         }
         _ => panic!("Expected Cleanup command"),
     }
@@ -67,10 +83,10 @@ fn test_cleanup_defaults() {
 fn test_cleanup_keep_flag() {
     let cli = Cli::try_parse_from(["mvmctl", "cleanup", "--keep", "9"]).unwrap();
     match cli.command {
-        Commands::Cleanup(cleanup::Args { keep, all, verbose }) => {
-            assert_eq!(keep, Some(9));
-            assert!(!all);
-            assert!(!verbose);
+        Commands::Cleanup(args) => {
+            assert_eq!(args.keep, Some(9));
+            assert!(!args.all);
+            assert!(!args.verbose);
         }
         _ => panic!("Expected Cleanup command"),
     }
@@ -80,10 +96,10 @@ fn test_cleanup_keep_flag() {
 fn test_cleanup_all_flag() {
     let cli = Cli::try_parse_from(["mvmctl", "cleanup", "--all"]).unwrap();
     match cli.command {
-        Commands::Cleanup(cleanup::Args { keep, all, verbose }) => {
-            assert_eq!(keep, None);
-            assert!(all);
-            assert!(!verbose);
+        Commands::Cleanup(args) => {
+            assert_eq!(args.keep, None);
+            assert!(args.all);
+            assert!(!args.verbose);
         }
         _ => panic!("Expected Cleanup command"),
     }
@@ -93,10 +109,74 @@ fn test_cleanup_all_flag() {
 fn test_cleanup_verbose_flag() {
     let cli = Cli::try_parse_from(["mvmctl", "cleanup", "--verbose"]).unwrap();
     match cli.command {
-        Commands::Cleanup(cleanup::Args { keep, all, verbose }) => {
-            assert_eq!(keep, None);
-            assert!(!all);
-            assert!(verbose);
+        Commands::Cleanup(args) => {
+            assert_eq!(args.keep, None);
+            assert!(!args.all);
+            assert!(args.verbose);
+        }
+        _ => panic!("Expected Cleanup command"),
+    }
+}
+
+#[test]
+fn test_cleanup_cache_tier_flag() {
+    let cli = Cli::try_parse_from(["mvmctl", "cleanup", "--cache"]).unwrap();
+    match cli.command {
+        Commands::Cleanup(args) => {
+            assert!(args.cache);
+            assert!(!args.state);
+            assert!(!args.nuclear);
+        }
+        _ => panic!("Expected Cleanup command"),
+    }
+}
+
+#[test]
+fn test_cleanup_state_tier_flag() {
+    let cli = Cli::try_parse_from(["mvmctl", "cleanup", "--state", "--yes"]).unwrap();
+    match cli.command {
+        Commands::Cleanup(args) => {
+            assert!(!args.cache);
+            assert!(args.state);
+            assert!(!args.nuclear);
+            assert!(args.yes);
+        }
+        _ => panic!("Expected Cleanup command"),
+    }
+}
+
+#[test]
+fn test_cleanup_nuclear_tier_flag() {
+    let cli = Cli::try_parse_from(["mvmctl", "cleanup", "--nuclear", "--dry-run"]).unwrap();
+    match cli.command {
+        Commands::Cleanup(args) => {
+            assert!(!args.cache);
+            assert!(!args.state);
+            assert!(args.nuclear);
+            assert!(args.dry_run);
+        }
+        _ => panic!("Expected Cleanup command"),
+    }
+}
+
+#[test]
+fn test_cleanup_tier_flags_are_mutually_exclusive() {
+    // ArgGroup("tier") forces at most one of --cache/--state/--nuclear.
+    let err = Cli::try_parse_from(["mvmctl", "cleanup", "--cache", "--state"]).unwrap_err();
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("cannot be used with") || msg.contains("conflict"),
+        "expected mutual-exclusion error, got: {msg}"
+    );
+}
+
+#[test]
+fn test_cleanup_force_flag() {
+    let cli = Cli::try_parse_from(["mvmctl", "cleanup", "--cache", "--force"]).unwrap();
+    match cli.command {
+        Commands::Cleanup(args) => {
+            assert!(args.cache);
+            assert!(args.force);
         }
         _ => panic!("Expected Cleanup command"),
     }
