@@ -99,6 +99,14 @@ mkdir -p "$HOME"
 # during postinstall; ensure it's writable here too.
 mkdir -p /nix/store /nix/var/nix
 
+# Tell `nix/images/builder-vm/flake.nix` where the workspace
+# root is, since the `path:` URL fetcher store-copies just the
+# flake subdir and the flake's `../../..` reference would
+# otherwise resolve against the store path (i.e. to filesystem
+# `/`, tripping over /dev/btrfs-control + friends). The flake
+# checks this env under `--impure` (already set below).
+export MVM_WORKSPACE_PATH=/work
+
 ARCH="$(uname -m)"
 FLAKE_REF="path:/work/nix/images/builder-vm#packages.${ARCH}-linux.default"
 
