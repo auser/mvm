@@ -1,11 +1,11 @@
 #!/bin/sh
 # PID 1 of the Stage 0 bootstrap VM.
 #
-# Boots inside a libkrunfw kernel against an in-memory initramfs
-# (built by `mvm_build::stage0::build_initramfs`). The initramfs
-# carries busybox + nix-portable + this script. There is no rootfs
-# ext4 disk: the kernel decompresses the initramfs to a tmpfs and
-# runs `/init` (this file) directly.
+# libkrun mounts a host directory (materialized by
+# `mvm_build::stage0::materialize_root_dir`) as the guest root over
+# virtiofs (`krun_set_root`) and boots libkrunfw's bundled
+# TSI-patched kernel transparently. The root dir carries busybox +
+# nix-portable + this script; `krun_set_exec` runs `/init` as PID 1.
 #
 # Job: build the in-repo `nix/images/builder-vm` flake into a
 # kernel + rootfs.ext4 and write them to the `/out` virtio-fs share.
@@ -16,7 +16,7 @@
 set -eu
 
 # busybox installs itself as every applet via this command. The
-# initramfs has /bin/busybox as a real file and every other tool
+# root dir has /bin/busybox as a real file and every other tool
 # (sh, mount, ip, udhcpc, …) as a symlink to it. `--install -s`
 # materializes those symlinks under /bin so PATH lookups resolve
 # without needing the host to pre-populate them.
