@@ -130,8 +130,20 @@ const ROOT_DIR_STUBS: &[&str] = &[
 /// busybox applets the init script invokes directly. Each one
 /// gets a `bin/<name>` -> `busybox` symlink in the root dir.
 const PRE_INSTALLED_APPLETS: &[&str] = &[
-    "sh", "mount", "umount", "mkdir", "mountpoint", "cp", "ip", "udhcpc", "sync", "poweroff",
-    "cat", "echo", "ls", "rm",
+    "sh",
+    "mount",
+    "umount",
+    "mkdir",
+    "mountpoint",
+    "cp",
+    "ip",
+    "udhcpc",
+    "sync",
+    "poweroff",
+    "cat",
+    "echo",
+    "ls",
+    "rm",
 ];
 
 /// Materialize a Stage 0 guest root at `dest` from the embedded
@@ -179,7 +191,11 @@ pub fn materialize_root_dir(dest: &Path) -> Result<()> {
 
     // nix-portable is ~74 MiB; copy from cache rather than load it
     // through a Vec<u8>.
-    let np_dst = dest.join("usr").join("local").join("bin").join("nix-portable");
+    let np_dst = dest
+        .join("usr")
+        .join("local")
+        .join("bin")
+        .join("nix-portable");
     std::fs::copy(&nix_portable_src, &np_dst).with_context(|| {
         format!(
             "copying {} -> {}",
@@ -200,8 +216,8 @@ pub fn materialize_root_dir(dest: &Path) -> Result<()> {
 }
 
 fn write_file_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let mut f = std::fs::File::create(path)
-        .with_context(|| format!("creating {}", path.display()))?;
+    let mut f =
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
     f.write_all(bytes)
         .with_context(|| format!("writing {}", path.display()))?;
     set_mode(path, mode)?;
@@ -443,7 +459,10 @@ mod tests {
 
         // Expected layout.
         assert!(root.join("init").is_file(), "/init present");
-        assert!(root.join("bin").join("busybox").is_file(), "busybox present");
+        assert!(
+            root.join("bin").join("busybox").is_file(),
+            "busybox present"
+        );
         assert!(
             root.join("usr/local/bin/nix-portable").is_file(),
             "nix-portable copied"
@@ -457,7 +476,10 @@ mod tests {
             sbin.symlink_metadata().unwrap().file_type().is_symlink(),
             "/sbin is a symlink"
         );
-        assert_eq!(std::fs::read_link(&sbin).unwrap(), std::path::Path::new("bin"));
+        assert_eq!(
+            std::fs::read_link(&sbin).unwrap(),
+            std::path::Path::new("bin")
+        );
         // Applet symlinks.
         for applet in PRE_INSTALLED_APPLETS {
             let p = root.join("bin").join(applet);
@@ -465,14 +487,20 @@ mod tests {
                 p.symlink_metadata().unwrap().file_type().is_symlink(),
                 "/bin/{applet} is a symlink"
             );
-            assert_eq!(std::fs::read_link(&p).unwrap(), std::path::Path::new("busybox"));
+            assert_eq!(
+                std::fs::read_link(&p).unwrap(),
+                std::path::Path::new("busybox")
+            );
         }
 
         // Permissions: /init and /bin/busybox executable.
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let init_mode = std::fs::metadata(root.join("init")).unwrap().permissions().mode();
+            let init_mode = std::fs::metadata(root.join("init"))
+                .unwrap()
+                .permissions()
+                .mode();
             assert_eq!(init_mode & 0o777, 0o755, "/init mode 0755");
             let bb_mode = std::fs::metadata(root.join("bin/busybox"))
                 .unwrap()
@@ -483,7 +511,11 @@ mod tests {
                 .unwrap()
                 .permissions()
                 .mode();
-            assert_eq!(np_mode & 0o777, 0o755, "/usr/local/bin/nix-portable mode 0755");
+            assert_eq!(
+                np_mode & 0o777,
+                0o755,
+                "/usr/local/bin/nix-portable mode 0755"
+            );
         }
 
         // The script in /init is byte-identical to the embedded
