@@ -787,16 +787,32 @@ mod linux {
 
     impl JobScratch {
         /// Create the per-job scratch dir under `base` (typically
-        /// [`JOB_SCRATCH_BASE`]) with mode 0700.
-        fn create(base: &str, job_id: &str) -> std::io::Result<Self> {
+        /// [`JOB_SCRATCH_BASE`]) with mode 0700. If `owner_uid` /
+        /// `owner_gid` are provided, `chown` the dir to them so a
+        /// downstream uid-drop (Plan 89 W3 part 13) can still
+        /// write into it. The dispatch loop passes `Some((902,
+        /// 902))` after part 13; tests pass `None` to keep their
+        /// own uid as the owner.
+        fn create(base: &str, job_id: &str, chown_to: Option<(u32, u32)>) -> std::io::Result<Self> {
             use std::os::unix::fs::PermissionsExt;
             let path = job_scratch_path(base, job_id);
             std::fs::create_dir_all(&path)?;
-            // Tighten to 0700 even though the dispatch loop and
-            // the build subprocess both run as uid 0 today — the
-            // builder:builder uid-drop in a follow-up part will
-            // rely on the mode bit being set already.
             std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o700))?;
+            if let Some((uid, gid)) = chown_to {
+                // SAFETY: chown is a fundamental POSIX syscall;
+                // we wrap the libc call in a small unsafe block
+                // because nix's `chown` would drag in an extra
+                // feature flag we don't have (the crate is
+                // already pulled with `mount`/`reboot`/`signal`
+                // only).
+                let c_path = std::ffi::CString::new(path.as_str()).map_err(|e| {
+                    std::io::Error::new(std::io::ErrorKind::InvalidInput, e.to_string())
+                })?;
+                let rc = unsafe { libc::chown(c_path.as_ptr(), uid, gid) };
+                if rc != 0 {
+                    return Err(std::io::Error::last_os_error());
+                }
+            }
             Ok(Self { path })
         }
 
@@ -875,7 +891,17 @@ mod linux {
                     // the stderr tail — the build is still
                     // useful, just without per-job tempfile
                     // isolation.
-                    let (scratch, tmpdir) = match JobScratch::create(JOB_SCRATCH_BASE, &job_id) {
+                    // Chown to the builder uid (Plan 89 W3 part
+                    // 13) so the dispatched cmd.sh — which runs
+                    // under `setpriv --reuid=BUILDER_UID
+                    // --regid=BUILDER_GID` via
+                    // `Isolation::Unshared` — can write into the
+                    // scratch dir.
+                    let (scratch, tmpdir) = match JobScratch::create(
+                        JOB_SCRATCH_BASE,
+                        &job_id,
+                        Some((BUILDER_UID, BUILDER_GID)),
+                    ) {
                         Ok(s) => {
                             let path = s.path().to_string();
                             (Some(s), Some(path))
@@ -1467,24 +1493,101 @@ mod linux {
     ///   tears down on exit anyway) and by tests that don't have
     ///   `CAP_SYS_ADMIN` in their environment (e.g. CI Docker
     ///   without `--privileged`).
-    /// - [`Isolation::Unshared`]: subprocess runs in fresh
-    ///   mount + pid + ipc namespaces via `unshare --mount --pid
-    ///   --ipc --fork`. The pid namespace turns orphan-cleanup
-    ///   into a single namespace-exit; the mount namespace lets
-    ///   future parts bind-mount `/dev/shm` etc. per-job without
-    ///   bleeding state into the shared rootfs; the IPC namespace
-    ///   prevents SysV/POSIX IPC keys leaking across jobs.
+    /// - [`Isolation::Unshared`]: subprocess runs in fresh mount
+    ///   + pid + ipc namespaces via `unshare --mount --pid --ipc
+    ///   --fork`, then drops to the unprivileged builder uid via
+    ///   `setpriv --reuid --regid --clear-groups` (Plan 89 W3
+    ///   part 13). The pid namespace turns orphan-cleanup into a
+    ///   single namespace-exit; the mount namespace lets future
+    ///   parts bind-mount `/dev/shm` etc. per-job without bleeding
+    ///   state into the shared rootfs; the IPC namespace prevents
+    ///   SysV/POSIX IPC keys leaking across jobs; the uid drop
+    ///   prevents a malicious build from remounting / killing
+    ///   outside its pid ns / loading a kernel module via the root
+    ///   privileges the dispatch loop has as PID 1.
     ///
     /// Network namespace is intentionally *not* unshared — the
     /// per-VM iptables baseline (Plan 73 Followup B.2.y) already
     /// gates egress through the proxy, and the build needs the
-    /// proxy reachable. The follow-up part 12 re-applies that
-    /// baseline per dispatch, which closes the F7 finding without
-    /// breaking proxy access.
+    /// proxy reachable. W3 part 12 re-applies that baseline per
+    /// dispatch, which closes the F7 finding without breaking
+    /// proxy access.
     #[derive(Debug, Clone, Copy, PartialEq, Eq)]
     enum Isolation {
         Inherit,
         Unshared,
+    }
+
+    /// Plan 89 W3 part 13 — unprivileged uid the dispatched build
+    /// runs as inside the persistent VM. Picked above the
+    /// `mvm-agent` (1900) / `mvm-worker` (1000) / `mvm-egress-
+    /// proxy` (1801) uids the rest of the rootfs reserves so the
+    /// builder identity doesn't collide with any existing service.
+    ///
+    /// No `/etc/passwd` entry: the build runs as a bare numeric
+    /// uid, and `setpriv --clear-groups` (below) means no NSS
+    /// lookup is needed for supplementary groups either. Tools
+    /// that try `getlogin()` / `getpwuid()` get `None`; the build
+    /// is expected to be a flake / install pipeline that doesn't
+    /// rely on its own username.
+    const BUILDER_UID: u32 = 902;
+    const BUILDER_GID: u32 = 902;
+
+    /// Plan 89 W3 part 13 — assemble the `Command` for one
+    /// dispatched job per the requested isolation. Split out from
+    /// [`run_job_streaming`] so the argv shape is testable
+    /// without spawning (the spawn integration test in
+    /// `run_job_streaming_unshared_runs_in_fresh_pid_namespace`
+    /// probes for unshare + CAP_SYS_ADMIN; this pure builder lets
+    /// tests pin the wire on every host).
+    fn build_isolated_command(cmd_sh: &str, isolation: Isolation) -> Command {
+        match isolation {
+            Isolation::Inherit => {
+                let mut c = Command::new("/bin/sh");
+                c.args(["-eu", cmd_sh]);
+                c
+            }
+            Isolation::Unshared => {
+                // Order matters: unshare runs first (still uid 0
+                // with `CAP_SYS_ADMIN` so the namespace setup
+                // works), then setpriv drops uid inside the new
+                // namespaces, then exec /bin/sh.
+                //
+                // `--clear-groups` strips supplementary groups
+                // entirely; the build doesn't belong to any. We
+                // intentionally do not use `--init-groups`
+                // because there is no `/etc/passwd` entry for
+                // the builder uid — initgroups(3) would fail the
+                // NSS lookup. Numeric `--reuid`/`--regid` work
+                // without NSS.
+                //
+                // `--bounding-set=-all` strips the entire
+                // capability bounding set (claim 1 — matches the
+                // existing `setpriv --bounding-set=-all
+                // --no-new-privs` pattern). After this, the
+                // build process cannot regain any caps even via
+                // setuid binaries.
+                let reuid = format!("--reuid={BUILDER_UID}");
+                let regid = format!("--regid={BUILDER_GID}");
+                let mut c = Command::new("unshare");
+                c.args([
+                    "--mount",
+                    "--pid",
+                    "--ipc",
+                    "--fork",
+                    "setpriv",
+                    &reuid,
+                    &regid,
+                    "--clear-groups",
+                    "--bounding-set=-all",
+                    "--no-new-privs",
+                    "/bin/sh",
+                    "-eu",
+                    cmd_sh,
+                ]);
+                c
+            }
+        }
     }
 
     /// Plan 89 W3 part 9 — same as [`run_job`] but invokes
@@ -1511,26 +1614,13 @@ mod linux {
         use std::collections::VecDeque;
         use std::io::{BufRead, BufReader};
         use std::process::Stdio;
-        // Plan 89 W3 part 11 — switch between bare `/bin/sh -eu
-        // <cmd>` and `unshare --mount --pid --ipc --fork /bin/sh
-        // -eu <cmd>` based on the requested isolation. unshare
-        // lives in `util-linux`, which is in the builder VM's
+        // Plan 89 W3 part 11/13 — switch between bare `/bin/sh
+        // -eu <cmd>` and the unshare+setpriv wrapped form via
+        // [`build_isolated_command`]. unshare + setpriv both
+        // live in `util-linux`, which is in the builder VM's
         // rootfs (`nix/images/builder-vm/flake.nix`, package list);
-        // PATH (`/sbin:/usr/sbin:/bin:/usr/bin`) finds it.
-        let mut cmd = match isolation {
-            Isolation::Inherit => {
-                let mut c = Command::new("/bin/sh");
-                c.args(["-eu", cmd_sh]);
-                c
-            }
-            Isolation::Unshared => {
-                let mut c = Command::new("unshare");
-                c.args([
-                    "--mount", "--pid", "--ipc", "--fork", "/bin/sh", "-eu", cmd_sh,
-                ]);
-                c
-            }
-        };
+        // PATH (`/sbin:/usr/sbin:/bin:/usr/bin`) finds them.
+        let mut cmd = build_isolated_command(cmd_sh, isolation);
         cmd.stdout(Stdio::inherit()).stderr(Stdio::piped());
         // Plan 89 W3 part 10 — point the dispatched build's
         // tmpfile machinery at the per-job scratch dir so leftover
@@ -1981,7 +2071,7 @@ mod linux {
             let job_id = "00000000-0000-0000-0000-000000000000";
             let expected = base.path().join(job_id);
             {
-                let scratch = JobScratch::create(base_str, job_id).expect("create scratch");
+                let scratch = JobScratch::create(base_str, job_id, None).expect("create scratch");
                 assert!(expected.is_dir(), "scratch dir created");
                 let mode = std::fs::metadata(&expected)
                     .expect("stat")
@@ -2005,7 +2095,7 @@ mod linux {
             let job_id = "deadbeef";
             let expected = base.path().join(job_id);
             {
-                let _scratch = JobScratch::create(base_str, job_id).expect("create scratch");
+                let _scratch = JobScratch::create(base_str, job_id, None).expect("create scratch");
                 std::fs::write(expected.join("a.txt"), b"leak").expect("write a");
                 std::fs::create_dir(expected.join("sub")).expect("mkdir sub");
                 std::fs::write(expected.join("sub/b.txt"), b"leak").expect("write b");
@@ -2114,7 +2204,13 @@ mod linux {
             // on it.
             std::fs::write(
                 &cmd_path,
-                "awk '/^NSpid:/ {print \"inner_pid=\" $NF}' /proc/self/status >&2\nexit 0\n",
+                // Print one line per fact so the assertions can
+                // match exact substrings rather than parse a
+                // pipe-separated record. Plan 89 W3 part 13
+                // added the uid check.
+                "awk '/^NSpid:/ {print \"inner_pid=\" $NF; next} \
+                       /^Uid:/ {print \"uid=\" $2; next}' \
+                       /proc/self/status >&2\nexit 0\n",
             )
             .expect("write cmd.sh");
             let (code, tail) = run_job_streaming(
@@ -2128,9 +2224,76 @@ mod linux {
             // forked shell is PID 1 inside, the awk runs as a
             // child of it (PID 2 inside).
             assert!(
-                tail == "inner_pid=1" || tail == "inner_pid=2",
+                tail.contains("inner_pid=1") || tail.contains("inner_pid=2"),
                 "unshare did not produce a fresh pid namespace; tail={tail}"
             );
+            // Plan 89 W3 part 13 — the setpriv layer drops the
+            // build to BUILDER_UID. The probe succeeded only if
+            // the runner has CAP_SETUID (which comes with
+            // CAP_SYS_ADMIN), so setpriv must succeed too.
+            assert!(
+                tail.contains(&format!("uid={BUILDER_UID}")),
+                "setpriv did not drop uid to {BUILDER_UID}; tail={tail}"
+            );
+        }
+
+        /// Plan 89 W3 part 13 — pure argv-shape test for the
+        /// wiring around `build_isolated_command`. Runs on every
+        /// host (no spawn, no caps required) so an accidental
+        /// reorder of unshare/setpriv flags trips here even when
+        /// the host can't actually run the chain.
+        #[test]
+        fn build_isolated_command_inherit_uses_plain_shell() {
+            use std::ffi::OsStr;
+            let cmd = build_isolated_command("/job/cmd.sh", Isolation::Inherit);
+            assert_eq!(cmd.get_program(), OsStr::new("/bin/sh"));
+            let args: Vec<&OsStr> = cmd.get_args().collect();
+            assert_eq!(args, vec![OsStr::new("-eu"), OsStr::new("/job/cmd.sh")]);
+        }
+
+        #[test]
+        fn build_isolated_command_unshared_wraps_in_unshare_then_setpriv() {
+            use std::ffi::OsStr;
+            let cmd = build_isolated_command("/job/cmd.sh", Isolation::Unshared);
+            assert_eq!(cmd.get_program(), OsStr::new("unshare"));
+            let args: Vec<String> = cmd
+                .get_args()
+                .map(|s| s.to_string_lossy().into_owned())
+                .collect();
+            // unshare flags first.
+            assert_eq!(&args[0..4], &["--mount", "--pid", "--ipc", "--fork"]);
+            // setpriv follows, with numeric uid/gid and explicit
+            // clear-groups / bounding-set / no-new-privs.
+            assert_eq!(args[4], "setpriv");
+            assert_eq!(args[5], format!("--reuid={BUILDER_UID}"));
+            assert_eq!(args[6], format!("--regid={BUILDER_GID}"));
+            assert_eq!(args[7], "--clear-groups");
+            assert_eq!(args[8], "--bounding-set=-all");
+            assert_eq!(args[9], "--no-new-privs");
+            // Then the shell + cmd.
+            assert_eq!(&args[10..], &["/bin/sh", "-eu", "/job/cmd.sh"]);
+        }
+
+        /// Plan 89 W3 part 13 — `JobScratch::create` accepts a
+        /// `chown_to` arg; passing the current uid/gid is a
+        /// no-op chown that any user can perform, so we can pin
+        /// the wiring without needing root in CI. The actual
+        /// drop-to-902 is exercised by the runtime path inside
+        /// the builder VM (PID 1 has the cap to chown to any
+        /// uid).
+        #[test]
+        fn job_scratch_chown_to_current_uid_succeeds() {
+            use std::os::unix::fs::MetadataExt;
+            let base = tempfile::tempdir().expect("tempdir");
+            let base_str = base.path().to_str().unwrap();
+            let job_id = "feedface";
+            let uid = unsafe { libc::getuid() };
+            let gid = unsafe { libc::getgid() };
+            let _scratch =
+                JobScratch::create(base_str, job_id, Some((uid, gid))).expect("chown to self");
+            let meta = std::fs::metadata(base.path().join(job_id)).expect("stat");
+            assert_eq!(meta.uid(), uid);
+            assert_eq!(meta.gid(), gid);
         }
     }
 }
