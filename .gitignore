@@ -42,4 +42,4 @@ nix/images/dev-prebuilt/
 /.mvm-test/
 .worktrees/
 graphify-out/
-/specs/scratch.md
+specs/scratch.md
