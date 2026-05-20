@@ -24,12 +24,15 @@ set -eu
 
 export PATH=/bin:/usr/local/bin
 
-# Standard pseudofs essentials.
-mount -t proc     proc     /proc
-mount -t sysfs    sysfs    /sys
-mount -t devtmpfs devtmpfs /dev || true
-mount -t tmpfs    -o mode=1777 tmpfs /tmp
-mount -t tmpfs    -o mode=0755 tmpfs /run
+# Standard pseudofs essentials. libkrun's container mode (set_root)
+# pre-mounts several of these in its in-VM init; gate each on
+# `mountpoint -q` so the script doesn't trip `set -eu` on a
+# benign EBUSY.
+mountpoint -q /proc || mount -t proc     proc     /proc
+mountpoint -q /sys  || mount -t sysfs    sysfs    /sys
+mountpoint -q /dev  || mount -t devtmpfs devtmpfs /dev || true
+mountpoint -q /tmp  || mount -t tmpfs    -o mode=1777 tmpfs /tmp
+mountpoint -q /run  || mount -t tmpfs    -o mode=0755 tmpfs /run
 
 # Bring eth0 up explicitly before udhcpc. busybox 1.36.x udhcpc
 # does not auto-up the interface — sendto returns ENETDOWN and
@@ -48,13 +51,18 @@ udhcpc -i eth0 -n -q || echo "stage0-init: udhcpc failed (offline; nix build wil
 export HOME=/tmp/np-home
 mkdir -p "$HOME"
 
-# Virtio-fs share carrying the workspace. Mounted by the host.
+# Virtio-fs shares from the host. In libkrun's set_root mode the
+# kernel exposes them as virtio devices but the in-VM init does
+# not mount them — the guest has to do it. Tags match the
+# `add_virtio_fs(tag, ...)` calls in `LibkrunBuilderVm::run_stage0`.
+mountpoint -q /work || mount -t virtiofs work /work
+mountpoint -q /out  || mount -t virtiofs out  /out
 if ! mountpoint -q /work; then
-  echo "stage0-init: /work is not a mountpoint; aborting." >&2
+  echo "stage0-init: /work mount failed; aborting." >&2
   exit 64
 fi
 if ! mountpoint -q /out; then
-  echo "stage0-init: /out is not a mountpoint; aborting." >&2
+  echo "stage0-init: /out mount failed; aborting." >&2
   exit 65
 fi
 
