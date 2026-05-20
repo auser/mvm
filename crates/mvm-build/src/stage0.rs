@@ -77,14 +77,12 @@ pub const ALPINE_BRANCH: &str = "v3.22";
 /// in [`ALPINE_RELEASE_KEY_FINGERPRINT`]; on verification we
 /// confirm the parsed key matches that fingerprint, so swapping
 /// the embedded bytes would fail-close too.
-pub const ALPINE_RELEASE_KEY_ASC: &[u8] =
-    include_bytes!("stage0/alpine-ncopa-release-key.asc");
+pub const ALPINE_RELEASE_KEY_ASC: &[u8] = include_bytes!("stage0/alpine-ncopa-release-key.asc");
 
 /// Expected fingerprint of [`ALPINE_RELEASE_KEY_ASC`]. RSA primary
 /// key, uppercase hex (40 chars, no spaces). Bump only when Alpine
 /// rotates the release-signing key — a multi-year cadence.
-pub const ALPINE_RELEASE_KEY_FINGERPRINT: &str =
-    "0482D84022F52DF1C4E7CD43293ACD0907D9495A";
+pub const ALPINE_RELEASE_KEY_FINGERPRINT: &str = "0482D84022F52DF1C4E7CD43293ACD0907D9495A";
 
 /// One downloadable bootstrap asset, pinned by upstream URL +
 /// SHA-256, optionally with a PGP detached-signature URL. The
@@ -235,10 +233,7 @@ pub fn prepare_assets_in(cache_dir: &Path, assets: &[&BootstrapAsset]) -> Result
                 let sig = std::fs::read(&sig_target)
                     .with_context(|| format!("reading cached {}", sig_target.display()))?;
                 verify_alpine_pgp_signature(&data, &sig).with_context(|| {
-                    format!(
-                        "verifying cached PGP signature for {}",
-                        target.display()
-                    )
+                    format!("verifying cached PGP signature for {}", target.display())
                 })?;
             }
             continue;
@@ -246,10 +241,9 @@ pub fn prepare_assets_in(cache_dir: &Path, assets: &[&BootstrapAsset]) -> Result
 
         fetch_to(&target, asset).with_context(|| format!("fetching {}", asset.url))?;
         if let Some(sig_url) = asset.signature_url {
-            fetch_signature(&sig_target, sig_url)
-                .with_context(|| format!("fetching {sig_url}"))?;
-            let data = std::fs::read(&target)
-                .with_context(|| format!("reading {}", target.display()))?;
+            fetch_signature(&sig_target, sig_url).with_context(|| format!("fetching {sig_url}"))?;
+            let data =
+                std::fs::read(&target).with_context(|| format!("reading {}", target.display()))?;
             let sig = std::fs::read(&sig_target)
                 .with_context(|| format!("reading {}", sig_target.display()))?;
             verify_alpine_pgp_signature(&data, &sig).with_context(|| {
@@ -320,10 +314,10 @@ pub fn materialize_root_dir_in(cache_dir: &Path, dest: &Path) -> Result<()> {
                 sig_path.display()
             );
         }
-        let data = std::fs::read(&tarball)
-            .with_context(|| format!("reading {}", tarball.display()))?;
-        let sig = std::fs::read(&sig_path)
-            .with_context(|| format!("reading {}", sig_path.display()))?;
+        let data =
+            std::fs::read(&tarball).with_context(|| format!("reading {}", tarball.display()))?;
+        let sig =
+            std::fs::read(&sig_path).with_context(|| format!("reading {}", sig_path.display()))?;
         verify_alpine_pgp_signature(&data, &sig).with_context(|| {
             format!(
                 "verifying PGP signature for {} before extraction",
@@ -395,8 +389,8 @@ fn verify_alpine_pgp_signature(data: &[u8], sig_armor: &[u8]) -> Result<()> {
 /// the calling host user; libkrun's virtio-fs proxy handles
 /// uid mapping at access time).
 fn extract_alpine_tarball(tarball: &Path, dest: &Path) -> Result<()> {
-    let f = std::fs::File::open(tarball)
-        .with_context(|| format!("opening {}", tarball.display()))?;
+    let f =
+        std::fs::File::open(tarball).with_context(|| format!("opening {}", tarball.display()))?;
     let gz = GzDecoder::new(f);
     let mut archive = Archive::new(gz);
     archive.set_preserve_permissions(true);
@@ -412,8 +406,8 @@ fn extract_alpine_tarball(tarball: &Path, dest: &Path) -> Result<()> {
 }
 
 fn write_file_mode(path: &Path, bytes: &[u8], mode: u32) -> Result<()> {
-    let mut f = std::fs::File::create(path)
-        .with_context(|| format!("creating {}", path.display()))?;
+    let mut f =
+        std::fs::File::create(path).with_context(|| format!("creating {}", path.display()))?;
     f.write_all(bytes)
         .with_context(|| format!("writing {}", path.display()))?;
     set_mode(path, mode)?;
@@ -690,9 +684,8 @@ mod tests {
     /// rejected with a clear error.
     #[test]
     fn verify_alpine_pgp_signature_rejects_garbage() {
-        let err = verify_alpine_pgp_signature(b"data", b"not a real signature").expect_err(
-            "garbage signature must fail",
-        );
+        let err = verify_alpine_pgp_signature(b"data", b"not a real signature")
+            .expect_err("garbage signature must fail");
         let msg = format!("{err:#}");
         assert!(
             msg.contains("detached signature") || msg.contains("Alpine") || msg.contains(".asc"),
@@ -710,8 +703,7 @@ mod tests {
         std::fs::create_dir_all(&cache).unwrap();
         let root = dir.path().join("stage0-root");
 
-        let err = materialize_root_dir_in(&cache, &root)
-            .expect_err("missing asset should fail");
+        let err = materialize_root_dir_in(&cache, &root).expect_err("missing asset should fail");
 
         let msg = format!("{err:#}");
         assert!(
@@ -741,8 +733,7 @@ mod tests {
         .unwrap();
 
         let root = dir.path().join("stage0-root");
-        let err = materialize_root_dir_in(&cache, &root)
-            .expect_err("tampered tarball should fail");
+        let err = materialize_root_dir_in(&cache, &root).expect_err("tampered tarball should fail");
 
         let msg = format!("{err:#}");
         assert!(
