@@ -834,6 +834,28 @@ mod linux {
         job_dir_relpath: &str,
         cold_boot_timings: Option<BootTimings>,
     ) -> String {
+        // Plan 89 W3 part 12 — flush + re-install the egress
+        // lockdown before every dispatch. A previous build that
+        // mutated iptables (whether via a CAP_NET_ADMIN leak or
+        // because we haven't shipped the cap drop yet) loses its
+        // changes here. Fail closed: if iptables is broken we
+        // refuse the dispatch — that's safer than running a
+        // build against a chain whose state we no longer trust.
+        if let Err(e) = crate::network::reapply_egress_lockdown(
+            &crate::network::SystemIptables,
+            crate::network::PROXY_UID,
+        ) {
+            eprintln!("mvm-builder-init: dispatch loop: iptables baseline re-apply failed: {e}");
+            let response = crate::dispatch_response::DispatchResponse {
+                job_id,
+                exit_code: 126,
+                stderr_tail: format!("iptables baseline re-apply failed: {e}"),
+                boot_timings: cold_boot_timings,
+                build_ms: 0,
+            };
+            return response.to_json();
+        }
+
         let (exit_code, stderr_tail, build_ms) = match job {
             crate::builder_request::BuilderJob::Flake { .. } => {
                 let cmd_path = format!("{JOB_DIR}/{job_dir_relpath}/cmd.sh");
