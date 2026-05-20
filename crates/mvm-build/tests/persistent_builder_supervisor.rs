@@ -18,7 +18,8 @@ use mvm_build::builder_protocol::{
 };
 use mvm_build::builder_vm::BuilderJob;
 use mvm_build::persistent_builder::{
-    DispatchOutcome, PersistentBuilderError, PersistentBuilderSupervisor, dispatch_socket_path,
+    BuilderAuditSink, DispatchOutcome, PersistentBuilderError, PersistentBuilderSupervisor,
+    dispatch_socket_path,
 };
 
 /// Spawn a fake guest dispatch loop on `socket_path`. The closure
@@ -264,3 +265,194 @@ fn shutdown_writes_shutdown_request_and_consumes_bye() {
 // silent without `#[allow]`.
 #[allow(dead_code)]
 fn _force_use(_: DispatchOutcome) {}
+
+/// Plan 89 W3 part 14 — recording fake for `BuilderAuditSink`.
+/// Captures every emit (kind + job_id + payload digest) so tests
+/// can assert on the exact pair the supervisor emitted around a
+/// dispatch round.
+#[derive(Debug, Default)]
+struct RecordingAuditSink {
+    events: std::sync::Mutex<Vec<RecordedAuditEvent>>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum RecordedAuditEvent {
+    Dispatched { job_id: JobId, relpath: String },
+    Completed { job_id: JobId, exit_code: i32 },
+    Failed { job_id: JobId, reason: String },
+}
+
+impl BuilderAuditSink for RecordingAuditSink {
+    fn dispatched(&self, job_id: JobId, _job: &BuilderJob, job_dir_relpath: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(RecordedAuditEvent::Dispatched {
+                job_id,
+                relpath: job_dir_relpath.to_string(),
+            });
+    }
+
+    fn completed(&self, job_id: JobId, exit_code: i32, _job_timings: JobTimings) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(RecordedAuditEvent::Completed { job_id, exit_code });
+    }
+
+    fn failed(&self, job_id: JobId, reason: &str) {
+        self.events
+            .lock()
+            .unwrap()
+            .push(RecordedAuditEvent::Failed {
+                job_id,
+                reason: reason.to_string(),
+            });
+    }
+}
+
+#[test]
+fn submit_with_audit_sink_emits_dispatched_then_completed_on_success() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let socket = dispatch_socket_path(scratch.path());
+
+    let guest = spawn_fake_guest(&socket, |mut conn| {
+        let request: BuilderRequest =
+            mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        let job_id = match &request {
+            BuilderRequest::Run { job_id, .. } => *job_id,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        let response = BuilderResponse::Result {
+            job_id,
+            exit_code: 0,
+            stderr_tail: String::new(),
+            boot_timings: None,
+            job_timings: JobTimings {
+                dispatch_ms: 2,
+                build_ms: 500,
+                teardown_ms: 3,
+            },
+        };
+        mvm_guest::vsock::write_frame(&mut conn, &response).expect("write response");
+    });
+
+    let sink = std::sync::Arc::new(RecordingAuditSink::default());
+    let supervisor = PersistentBuilderSupervisor::new(&socket)
+        .with_frame_read_timeout(Duration::from_secs(5))
+        .with_audit_sink(sink.clone());
+
+    let outcome = supervisor
+        .submit(
+            BuilderJob::Flake {
+                flake_ref: "path:/work".to_string(),
+                attr_path: "packages.aarch64-linux.default".to_string(),
+            },
+            "abc123".to_string(),
+        )
+        .expect("submit");
+    guest.join().expect("guest");
+
+    let events = sink.events.lock().unwrap();
+    assert_eq!(events.len(), 2, "dispatched + completed; got {events:?}");
+    match &events[0] {
+        RecordedAuditEvent::Dispatched { job_id, relpath } => {
+            assert_eq!(job_id, &outcome.job_id);
+            assert_eq!(relpath, "abc123");
+        }
+        other => panic!("expected Dispatched first, got {other:?}"),
+    }
+    match &events[1] {
+        RecordedAuditEvent::Completed { job_id, exit_code } => {
+            assert_eq!(job_id, &outcome.job_id);
+            assert_eq!(*exit_code, 0);
+        }
+        other => panic!("expected Completed second, got {other:?}"),
+    }
+}
+
+#[test]
+fn submit_with_audit_sink_emits_dispatched_then_failed_on_premature_eof() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let socket = dispatch_socket_path(scratch.path());
+
+    // Guest accepts and immediately closes — supervisor surfaces
+    // PrematureEof, audit sink should see dispatched + failed.
+    let guest = spawn_fake_guest(&socket, |mut conn| {
+        let _request: BuilderRequest =
+            mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        drop(conn);
+    });
+
+    let sink = std::sync::Arc::new(RecordingAuditSink::default());
+    let supervisor = PersistentBuilderSupervisor::new(&socket)
+        .with_frame_read_timeout(Duration::from_secs(2))
+        .with_audit_sink(sink.clone());
+
+    let err = supervisor
+        .submit(
+            BuilderJob::Flake {
+                flake_ref: "path:/work".to_string(),
+                attr_path: "x".to_string(),
+            },
+            "deadbeef".to_string(),
+        )
+        .expect_err("submit should fail");
+    guest.join().expect("guest");
+
+    assert!(matches!(err, PersistentBuilderError::PrematureEof { .. }));
+    let events = sink.events.lock().unwrap();
+    assert_eq!(events.len(), 2, "dispatched + failed; got {events:?}");
+    assert!(matches!(&events[0], RecordedAuditEvent::Dispatched { .. }));
+    match &events[1] {
+        RecordedAuditEvent::Failed { reason, .. } => {
+            assert!(
+                reason.contains("dispatch ended without Result") || reason.contains("PrematureEof"),
+                "reason should mention premature EOF; got {reason}"
+            );
+        }
+        other => panic!("expected Failed second, got {other:?}"),
+    }
+}
+
+#[test]
+fn submit_without_audit_sink_emits_nothing() {
+    let scratch = tempfile::tempdir().expect("tempdir");
+    let socket = dispatch_socket_path(scratch.path());
+
+    let guest = spawn_fake_guest(&socket, |mut conn| {
+        let request: BuilderRequest =
+            mvm_guest::vsock::read_frame(&mut conn).expect("read request");
+        let job_id = match &request {
+            BuilderRequest::Run { job_id, .. } => *job_id,
+            other => panic!("expected Run, got {other:?}"),
+        };
+        mvm_guest::vsock::write_frame(
+            &mut conn,
+            &BuilderResponse::Result {
+                job_id,
+                exit_code: 0,
+                stderr_tail: String::new(),
+                boot_timings: None,
+                job_timings: JobTimings::default(),
+            },
+        )
+        .expect("write response");
+    });
+
+    let supervisor =
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+    supervisor
+        .submit(
+            BuilderJob::Flake {
+                flake_ref: "path:/work".to_string(),
+                attr_path: "x".to_string(),
+            },
+            "no-sink".to_string(),
+        )
+        .expect("submit");
+    guest.join().expect("guest");
+    // No sink, no panic, no recorded events. The test passes if
+    // we get here cleanly — the supervisor's `Option<sink>`
+    // branches don't dereference None.
+}
