@@ -20,7 +20,18 @@ pub(super) const DEV_VM_NAME: &str = "mvm-dev";
 const BUILDER_VM_SOURCE_FINGERPRINT_FILE: &str = ".mvm-source.sha256";
 const BUILDER_VM_ARTIFACT_DIGEST_FILE: &str = ".mvm-artifacts.sha256";
 const BUILDER_VM_PROVENANCE_FILE: &str = ".mvm-provenance.json";
-const BUILDER_INIT_PATH: &[u8] = b"/sbin/mvm-builder-init";
+/// Heuristic needle for `rootfs_contains_builder_init`. We used to scan
+/// for the contiguous bytes `/sbin/mvm-builder-init`, but ext4 stores
+/// each path component as a separate dirent — `sbin` and
+/// `mvm-builder-init` are never adjacent in the raw image — so a
+/// freshly-built rootfs that *has* the binary at `/sbin/mvm-builder-init`
+/// would fail the check. The basename `mvm-builder-init` is what
+/// actually appears in the dirent (one of the file's `/etc/.../...`
+/// references is the embedded debug strings inside the Rust binary
+/// itself). The dev-prebuilt seed image case continues to work because
+/// the basename appears there too. False-positive risk is negligible:
+/// nothing else in the rootfs is named exactly `mvm-builder-init`.
+const BUILDER_INIT_PATH: &[u8] = b"mvm-builder-init";
 
 /// Check if the Apple Container dev VM is running *and* reachable
 /// cross-process via the vsock proxy socket.
