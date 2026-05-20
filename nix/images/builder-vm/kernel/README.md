@@ -1,74 +1,74 @@
-# Builder-VM kernel — TSI patch series
+# Builder-VM kernel
 
-The builder VM boots a stock nixpkgs Linux 6.12 kernel augmented
-with libkrunfw's TSI (Transparent Socket Impersonation) patches.
-Without these, libkrun's AF_INET-via-vsock egress path has no
-guest-side counterpart and the in-guest `mvm-egress-proxy` can't
-reach upstream.
+A slim custom Linux 6.12 kernel tailored for the libkrun builder
+VM. Built via `pkgs.linuxManualConfig` from a `.config` generated
+by `make tinyconfig` + the `enables` / `disables` lists in
+[`default.nix`](./default.nix) + `make olddefconfig`.
 
-Patches under `patches/` are vendored from
-`github.com/containers/libkrunfw`, dual-licensed
-LGPL-2.1-only AND GPL-2.0-only.
+Nothing is vendored under this directory. The source of truth is
+the `enables` / `disables` lists in `default.nix`.
 
-## Current pin
+## Why a slim, all-built-in kernel
 
-- **Upstream:** libkrunfw `v5.2.0`
-- **Upstream kernel target:** Linux 6.12.68
-- **Our kernel:** nixpkgs-25.11 `linuxPackages.kernel` (Linux 6.12.87)
-- **New Kconfig:** `CONFIG_TSI=y` (added by patch 0009; the rest
-  are code-only)
+Stock `pkgs.linuxPackages.kernel` ships hundreds of `=m` modules
+the builder VM never loads, and the things it *does* load are
+modules too (overlay, vsock, virtio-fs, iptables tables). Under
+that shape, `mvm-builder-init` has to:
 
-## Rebase procedure
+1. Ship a `/lib/modules/<kver>/` tree in the rootfs (closure-walked
+   by `mkGuest`).
+2. Modprobe each module at the right time (overlay before mount,
+   vsock before `socket()`, fuse + virtiofs before mount).
+3. Hope modprobe finds the module (silent failure modes on a
+   missing closure entry).
 
-Bumping libkrunfw or the kernel happens in three steps:
+That contract has multiple silent-failure surfaces and a closure-
+walking abstraction in `mk-guest.nix` that broke during Plan 92
+validation in five different ways.
 
-1. Identify the new patch set:
+Slim flips every feature we need to `=y` (built-in). modprobe
+becomes a no-op. No module tree to ship. The whole class of
+failure goes away. Plan 92 records the decision and tradeoffs.
 
-   ```bash
-   gh api 'repos/containers/libkrunfw/contents/patches?ref=vX.Y.Z' \
-     --jq '.[].name'
-   ```
+## Tradeoff: first-boot kernel compile
 
-2. Replace the contents of `patches/`:
+Because the config is novel, `cache.nixos.org` doesn't have a
+substitute. A contributor's first `dev up` compiles the kernel
+once (3-5 min on Apple Silicon, ~10 min on slower hosts). After
+that, the kernel's nix store hash is stable across runs and
+contributors share it within the local nix store.
 
-   ```bash
-   git clone --depth 1 --branch vX.Y.Z \
-     https://github.com/containers/libkrunfw.git /tmp/libkrunfw-vX.Y.Z
-   rm -f patches/*.patch
-   cp /tmp/libkrunfw-vX.Y.Z/patches/*.patch patches/
-   ```
+## Changing what's compiled in
 
-3. Verify patches still apply to the kernel nixpkgs ships in
-   `linuxPackages.kernel`. Download the kernel source matching
-   nixpkgs' pin (check `nix/flake.lock` → `nixpkgs.rev` →
-   `pkgs/os-specific/linux/kernel/kernels-org.json`), extract,
-   and run `patch -p1` sequentially:
+Add a feature: drop its short Kconfig symbol (without the
+`CONFIG_` prefix) into the `enables` list. `make olddefconfig`
+will pull in transitive dependencies on the next build.
 
-   ```bash
-   for p in patches/*.patch; do
-     patch -p1 --dry-run < "$p" || { echo "FAIL: $p"; break; }
-   done
-   ```
+Remove a feature: add it to `disables`. If `olddefconfig` later
+re-enables it because another `=y` symbol depends on it, that
+parent symbol needs to come off too — disabling a leaf doesn't
+override a hard dependency.
 
-   If any patch fails: either pin to a kernel version closer to
-   libkrunfw's target, or rebase the affected hunks manually
-   (preferred — keeps us on the LTS nixpkgs tracks).
+To introspect what `olddefconfig` produced: temporarily expose
+the `configfile` derivation from `default.nix` as a flake output
+and `nix build` it.
 
-4. Update `crates/mvm-libkrun/kernel-pins.toml` with the new
-   kernel-bytes SHA-256 (computed from the flake-emitted
-   `vmlinux`).
+## Why no TSI patches
 
-5. Bump the libkrunfw version pin in `crates/mvm-cli/src/doctor.rs`
-   so `mvmctl doctor` warns on host-version drift.
+Plan 87 / Plan 88 / ADR-055 moved builder-VM networking to passt
+(Linux) / gvproxy (macOS) via virtio-net. The TSI syscall-hijack
+path is no longer used in any builder VM. The vendored TSI patch
+series (22 files) was removed by Plan 92.
 
-## Why we vendor rather than depend on libkrunfw's bundled kernel
+## Maintenance contract
 
-Two reasons, documented in ADR-046 §"Builder VM kernel + vendored
-TSI patches":
+When the kernel needs a change:
 
-1. **We own the kernel.** CVE backports, hardening, custom modules,
-   and config changes happen on our timeline, not libkrunfw's.
-2. **Determinism.** Our kernel is built deterministically from a
-   flake input set we pin. The hash in `kernel-pins.toml` pins
-   *that* build, not a third-party binary that ships with whatever
-   host package manager produced.
+1. **Add a built-in feature.** Append the short Kconfig symbol to
+   `enables`. `make olddefconfig` handles transitive deps.
+2. **Remove a feature.** Append to `disables`. If `olddefconfig`
+   pulls it back in, the parent also needs to come off.
+3. **Bump the kernel version.** Edit the `pkgs.linux_6_12`
+   reference (or follow nixpkgs' rename if the LTS pin moves).
+   `make olddefconfig` reconciles dropped / renamed / added
+   symbols automatically.

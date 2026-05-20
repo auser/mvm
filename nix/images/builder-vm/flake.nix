@@ -259,9 +259,14 @@
       # - `init=/sbin/mvm-builder-init` — Plan 72 W3 binary as PID 1.
       builderCmdline = "console=hvc0 root=/dev/vda ro rootfstype=ext4 init=/sbin/mvm-builder-init";
 
+      # Rootfs builder. The custom kernel under `./kernel` is built
+      # `CONFIG_MODULES=n` (everything in-tree is `=y`), so the
+      # rootfs ships no `/lib/modules/<kver>/` tree and mkGuest's
+      # kernel arg goes unused — same rootfs whether we're producing
+      # the full builder-VM image or the Stage 0 seed.
+      # Plan 92 — `specs/plans/92-minimal-builder-vm-kernel.md`.
       mkBuilderVmRootfs =
         system:
-        { includeKernelModules ? true }:
         let
           pkgs = import nixpkgs { inherit system; };
           builderInit = mvmBuilderInitFor system;
@@ -269,50 +274,42 @@
           kernelPkg =
             if includeKernelModules then import ./kernel { inherit pkgs; } else null;
         in
-        (libFor { inherit system; }).mkGuest ({
-            name = "mvm-builder-vm";
-            # mkGuest requires an entrypoint declaration. At runtime
-            # the kernel cmdline sets `init=/sbin/mvm-builder-init`,
-            # so mkGuest's entrypoint is vestigial — but we still
-            # need to declare one to satisfy the type contract.
-            entrypoint.shell = "/bin/sh";
-            packages = builderPackages pkgs;
-            extraFiles = {
-              "/sbin/mvm-builder-init" =
-                "${builderInit}/bin/mvm-builder-init";
-              # Plan 73 Followup B.2.x — egress allowlist proxy.
-              # `mvm-builder-init::install::run_install` spawns
-              # this from PATH (kernel default PATH includes
-              # `/sbin`) before invoking `uv` / `pnpm`. The
-              # binary embeds the ADR-047 four-hostname list at
-              # compile time; no env-var override path on the
-              # production build.
-              "/sbin/mvm-egress-proxy" =
-                "${egressProxy}/bin/mvm-egress-proxy";
-            };
-          } // nixpkgs.lib.optionalAttrs includeKernelModules {
-            # TSI-patched nixpkgs kernel. See ./kernel/default.nix for
-            # the patch series provenance and rebase procedure. Without
-            # these patches, libkrun's AF_INET-via-vsock TSI path has
-            # no guest-side support and the in-guest mvm-egress-proxy
-            # can't reach upstream.
-            #
-            # Pass it to `mkGuest` so the rootfs ships its module tree
-            # (`/lib/modules/<kver>/`); the builder VM doesn't run the
-            # standard `/init` modprobe path (its cmdline pins
-            # `init=/sbin/mvm-builder-init`) but the modules sit
-            # alongside so `mvm-builder-init` or downstream tools can
-            # load them on demand.
-            kernel = kernelPkg;
-          });
+        (libFor { inherit system; }).mkGuest {
+          name = "mvm-builder-vm";
+          # mkGuest requires an entrypoint declaration. At runtime
+          # the kernel cmdline sets `init=/sbin/mvm-builder-init`,
+          # so mkGuest's entrypoint is vestigial — but we still
+          # need to declare one to satisfy the type contract.
+          entrypoint.shell = "/bin/sh";
+          packages = builderPackages pkgs;
+          extraFiles = {
+            "/sbin/mvm-builder-init" =
+              "${builderInit}/bin/mvm-builder-init";
+            # Plan 73 Followup B.2.x — egress allowlist proxy.
+            # `mvm-builder-init::install::run_install` spawns
+            # this from PATH (kernel default PATH includes
+            # `/sbin`) before invoking `uv` / `pnpm`. The
+            # binary embeds the ADR-047 four-hostname list at
+            # compile time; no env-var override path on the
+            # production build.
+            "/sbin/mvm-egress-proxy" =
+              "${egressProxy}/bin/mvm-egress-proxy";
+          };
+        };
 
       mkBuilderVmImage = system:
         let
           pkgs = import nixpkgs { inherit system; };
           builderInit = mvmBuilderInitFor system;
           egressProxy = mvmEgressProxyFor system;
+          # Slim custom kernel — see `./kernel/default.nix`.
+          # `pkgs.linuxManualConfig` over `make tinyconfig` + a
+          # narrow `enables` list. `CONFIG_MODULES=n` so the kernel
+          # has only what `mvm-builder-init` actually uses built-in
+          # — no driver modules tree to ship.
+          # Plan 92 — `specs/plans/92-minimal-builder-vm-kernel.md`.
           kernelPkg = import ./kernel { inherit pkgs; };
-          rootfs = mkBuilderVmRootfs system { includeKernelModules = true; };
+          rootfs = mkBuilderVmRootfs system;
           kernelFile =
             if pkgs.stdenv.hostPlatform.isAarch64 then "Image" else "bzImage";
         in
@@ -383,7 +380,10 @@
       mkBuilderVmStage0Rootfs = system:
         let
           pkgs = import nixpkgs { inherit system; };
-          rootfs = mkBuilderVmRootfs system { includeKernelModules = false; };
+          # Stage 0 boots under a different kernel than what nixpkgs
+          # ships, so omit the kernel + module tree to avoid
+          # misleading modprobe with a foreign kver.
+          rootfs = mkBuilderVmRootfs system;
         in
         pkgs.runCommand "mvm-builder-vm-stage0-rootfs-${system}" { } ''
           mkdir -p $out
