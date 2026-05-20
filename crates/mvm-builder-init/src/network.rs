@@ -86,6 +86,35 @@ pub fn install_egress_lockdown(runner: &dyn IptablesRunner, proxy_uid: u32) -> R
     Ok(())
 }
 
+/// Plan 89 W3 part 12 — re-install the egress lockdown from a
+/// known-good in-binary recipe.
+///
+/// `install_egress_lockdown` runs once at boot. In the persistent
+/// builder VM jobs share the kernel's iptables state across
+/// dispatches — a build that runs `iptables -I OUTPUT 1 -j
+/// ACCEPT` (or exploits a `CAP_NET_ADMIN` leak via the new mount
+/// namespace from `unshare --mount`) poisons every subsequent
+/// job. The persistent dispatch loop calls this between
+/// dispatches to reset the chain.
+///
+/// Implementation: flush the OUTPUT chain, then re-install the 3
+/// baseline rules. Cheap (~10 ms per the plan's estimate) and
+/// deterministic. The OUTPUT chain's *policy* survives `-F`, so
+/// the brief window between flush and rule re-install is fail-
+/// closed if the policy was DROP already; `install_egress_lockdown`
+/// re-asserts the policy to DROP regardless.
+///
+/// On any rule failure the chain is left in whatever partial
+/// state the failure produced. Callers should treat the error as
+/// a hard signal that iptables is broken and refuse to run the
+/// dispatched job — that's safer than letting a possibly-too-
+/// permissive chain reach the build. See the F7 entry in the
+/// Plan 89 security-scan findings table.
+pub fn reapply_egress_lockdown(runner: &dyn IptablesRunner, proxy_uid: u32) -> Result<(), String> {
+    runner.run(&["-F", "OUTPUT"])?;
+    install_egress_lockdown(runner, proxy_uid)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -185,5 +214,63 @@ mod tests {
         assert_ne!(PROXY_UID, 0);
         assert_ne!(PROXY_UID, 1000);
         assert_ne!(PROXY_UID, 1900);
+    }
+
+    /// Plan 89 W3 part 12 — re-apply emits one flush then the
+    /// three baseline rules, in that order. Catches the case
+    /// where someone reorders to install-then-flush (which would
+    /// wipe what they just installed).
+    #[test]
+    fn reapply_flushes_then_reinstalls() {
+        let runner = RecordingRunner::new();
+        reapply_egress_lockdown(&runner, 1801).expect("happy path");
+        let invocations = runner.invocations.borrow();
+        assert_eq!(invocations.len(), 4, "expected -F + 3 baseline rules");
+
+        // 1: flush OUTPUT chain.
+        assert!(invocations[0].iter().any(|a| a == "-F"));
+        assert!(invocations[0].iter().any(|a| a == "OUTPUT"));
+
+        // 2-4: identical to the install_egress_lockdown sequence
+        // — re-uses the same code path.
+        assert!(invocations[1].iter().any(|a| a == "-o"));
+        assert!(invocations[1].iter().any(|a| a == "lo"));
+        assert!(invocations[2].iter().any(|a| a == "--uid-owner"));
+        assert!(invocations[2].iter().any(|a| a == "1801"));
+        assert!(invocations[3].iter().any(|a| a == "-P"));
+        assert!(invocations[3].iter().any(|a| a == "DROP"));
+    }
+
+    /// Plan 89 W3 part 12 — a flush failure short-circuits before
+    /// the re-install runs. The caller is supposed to fail closed
+    /// on the returned Err; this test pins the "we don't continue
+    /// past flush" guarantee.
+    #[test]
+    fn reapply_stops_at_flush_failure() {
+        let runner = RecordingRunner::fail_at(0);
+        let result = reapply_egress_lockdown(&runner, 1801);
+        assert!(result.is_err());
+        assert_eq!(
+            runner.invocations.borrow().len(),
+            1,
+            "only the flush was attempted",
+        );
+    }
+
+    /// Plan 89 W3 part 12 — if any of the install rules fails
+    /// after the flush, the chain ends up in a partial state.
+    /// `reapply_egress_lockdown` surfaces the error so the
+    /// dispatch loop can refuse the next job. We pin the
+    /// invocation count so we know the partial state is exactly
+    /// "flushed + one rule installed" (rule 2 attempted, rule 3
+    /// not reached).
+    #[test]
+    fn reapply_stops_at_install_failure() {
+        // fail_at(2) skips invocation 0 (flush) and 1 (loopback
+        // accept), and fails invocation 2 (owner-match accept).
+        let runner = RecordingRunner::fail_at(2);
+        let result = reapply_egress_lockdown(&runner, 1801);
+        assert!(result.is_err());
+        assert_eq!(runner.invocations.borrow().len(), 3);
     }
 }
