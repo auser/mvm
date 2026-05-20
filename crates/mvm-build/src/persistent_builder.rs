@@ -40,7 +40,7 @@
 
 use std::os::unix::net::UnixStream;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use thiserror::Error;
@@ -49,6 +49,70 @@ use crate::builder_protocol::{
     BootTimingsWire, BuilderRequest, BuilderResponse, JobId, JobTimings,
 };
 use crate::builder_vm::BuilderJob;
+
+/// Plan 89 W3 part 14 — host-side hook the persistent dispatch
+/// supervisor calls at the boundaries of each dispatched job so a
+/// production adapter can extend the chain-signed audit log
+/// (`~/.mvm/audit/<tenant>.jsonl`) without `mvm-build` depending
+/// on `mvm-supervisor`.
+///
+/// Why a trait instead of a direct call to
+/// `mvm_supervisor::FileAuditSigner`:
+///
+/// - `mvm-build` sits below `mvm-supervisor` in the workspace
+///   dependency graph (the supervisor uses `mvm-build`'s
+///   `BuilderJob` shape, not the other way around). A direct
+///   call would invert the graph.
+/// - The persistent-builder dev verb (`mvmctl persistent-builder
+///   submit`) doesn't have a parent ExecutionPlan to bind to; it
+///   passes `None` and the supervisor skips the emit. The trait
+///   gives that opt-out a typed shape.
+/// - Tests want a recording fake. `RecordingBuilderAuditSink`
+///   below ships as a `#[cfg(any(test, feature = "test-fakes"))]`
+///   util.
+///
+/// The three methods correspond to the three event kinds Plan 89
+/// security-scan F5 calls out:
+///
+/// - [`Self::dispatched`] — fires after the supervisor writes
+///   the `BuilderRequest::Run` frame and before it starts
+///   collecting responses. Records the start of the
+///   `job_id`-tagged sub-chain.
+/// - [`Self::completed`] — fires after a successful
+///   `BuilderResponse::Result` (exit_code is whatever the build
+///   produced; non-zero exits are still "completed" from the
+///   dispatch supervisor's POV).
+/// - [`Self::failed`] — fires when the supervisor surfaces a
+///   [`PersistentBuilderError`] (PrematureEof, JobIdMismatch,
+///   SocketUnreachable, framing I/O). Distinct from a non-zero
+///   build exit code, which the host wraps in `completed`.
+///
+/// All three methods are best-effort from the supervisor's POV:
+/// the trait returns `()` rather than `Result` so an audit-emit
+/// failure can't fail-close the dispatch. The production adapter
+/// is expected to log emit failures itself (a corrupted audit
+/// chain is a separate alarm).
+pub trait BuilderAuditSink: Send + Sync {
+    /// `dispatched` fires after the request was written to the
+    /// guest, *before* reading the first response. The supervisor
+    /// passes the request's `job_id`, the `BuilderJob` (for hash
+    /// derivation), and `job_dir_relpath` so the entry can be
+    /// reproduced later from the audit row alone.
+    fn dispatched(&self, job_id: JobId, job: &BuilderJob, job_dir_relpath: &str);
+
+    /// `completed` fires after a terminating `Result` frame
+    /// arrived. `exit_code` is the build's process exit;
+    /// non-zero is still "completed" (the dispatch round
+    /// terminated normally).
+    fn completed(&self, job_id: JobId, exit_code: i32, job_timings: JobTimings);
+
+    /// `failed` fires when the dispatch round itself errored
+    /// (premature EOF, job-id mismatch, socket unreachable,
+    /// framing I/O). The error's `Display` is stable enough to
+    /// store in the entry; callers should *also* log the
+    /// underlying error with full chain.
+    fn failed(&self, job_id: JobId, reason: &str);
+}
 
 /// Default timeout for the entire dispatch round (write request +
 /// drain stderr stream + read terminating Result). Generous because
@@ -137,6 +201,13 @@ pub struct PersistentBuilderSupervisor {
     dispatch_mutex: Mutex<()>,
     frame_read_timeout: Duration,
     dispatch_timeout: Duration,
+    /// Plan 89 W3 part 14 — optional audit sink. `None` means
+    /// the supervisor doesn't emit chain entries (matches the
+    /// dev-only `mvmctl persistent-builder` verb, which doesn't
+    /// run under an ExecutionPlan). `Some(_)` means every
+    /// dispatch round emits `dispatched` then `completed` or
+    /// `failed`.
+    audit_sink: Option<Arc<dyn BuilderAuditSink>>,
 }
 
 impl PersistentBuilderSupervisor {
@@ -152,7 +223,19 @@ impl PersistentBuilderSupervisor {
             dispatch_mutex: Mutex::new(()),
             frame_read_timeout: DEFAULT_FRAME_READ_TIMEOUT,
             dispatch_timeout: DEFAULT_DISPATCH_TIMEOUT,
+            audit_sink: None,
         }
+    }
+
+    /// Plan 89 W3 part 14 — wire a [`BuilderAuditSink`] in so the
+    /// supervisor emits `builder.job.dispatched` /
+    /// `builder.job.completed` / `builder.job.failed` events on
+    /// the chain-signed audit log around each dispatch round.
+    /// `None` (the default) means no audit emission — used by
+    /// the dev-only `mvmctl persistent-builder` verb.
+    pub fn with_audit_sink(mut self, sink: Arc<dyn BuilderAuditSink>) -> Self {
+        self.audit_sink = Some(sink);
+        self
     }
 
     /// Override the per-frame read timeout. Useful for tests that
@@ -190,14 +273,45 @@ impl PersistentBuilderSupervisor {
             .map_err(|_| PersistentBuilderError::MutexPoisoned)?;
 
         let job_id = JobId::new();
+        // Snapshot the job + relpath for the audit emit before
+        // moving them into the BuilderRequest::Run variant; the
+        // dispatch loop then consumes the request.
+        let job_for_audit = job.clone();
+        let relpath_for_audit = job_dir_relpath.clone();
         let request = BuilderRequest::Run {
             job_id,
             job,
             job_dir_relpath,
         };
 
-        let outcome = self.dispatch(&request, job_id)?;
-        Ok(outcome)
+        // Plan 89 W3 part 14 — emit `dispatched` before the round
+        // begins. Reasons:
+        //
+        // 1. If the dispatch round itself errors, the host still
+        //    records that a job was attempted (and the matching
+        //    `failed` emit closes the pair).
+        // 2. The audit chain is append-only; we want the
+        //    `dispatched` row written before `completed`/`failed`
+        //    so a reader walking the chain in order sees the
+        //    natural lifecycle.
+        if let Some(sink) = &self.audit_sink {
+            sink.dispatched(job_id, &job_for_audit, &relpath_for_audit);
+        }
+
+        match self.dispatch(&request, job_id) {
+            Ok(outcome) => {
+                if let Some(sink) = &self.audit_sink {
+                    sink.completed(job_id, outcome.exit_code, outcome.job_timings);
+                }
+                Ok(outcome)
+            }
+            Err(e) => {
+                if let Some(sink) = &self.audit_sink {
+                    sink.failed(job_id, &e.to_string());
+                }
+                Err(e)
+            }
+        }
     }
 
     /// Send a [`BuilderRequest::Shutdown`] to the guest's dispatch
