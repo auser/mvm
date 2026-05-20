@@ -198,3 +198,60 @@ warnings (see /job/nix-stderr.log)`. Gated behind `MVMCTL_VERBOSE`.
   to exactly its expected output layout.
 - Plan 88 (`specs/plans/88-gvproxy-macos-backend.md`) — the macOS
   gvproxy backend reachable from inside the slim kernel via virtio-net.
+
+## Follow-ups (out of scope for this plan)
+
+Discovered while validating Plan 95 end-to-end:
+
+### FU-1 — `mvmctl cache prune --reap-orphans` (or `mvmctl doctor --fix`)
+
+**Problem.** mvmctl spawns `mvm-libkrun-supervisor`, which spawns
+`gvproxy`, which is a grandchild of mvmctl. When mvmctl exits
+abnormally (crash, ^C, SIGKILL) the supervisor + gvproxy are
+reparented to launchd PID 1 and outlive mvmctl indefinitely. Same
+for the `tail -F …console.log` watchers some flows spawn. A long
+session leaves ~10-20 orphans per day, plus their gigabyte-scale
+`~/.cache/mvm/builder-vm/vms/<id>/` directories. The existing
+`mvmctl cache prune` and `mvmctl dev down` do not reap them.
+
+**Proposed shape.** New verb (or `cache prune --reap-orphans` flag)
+that walks `~/.cache/mvm/builder-vm/vms/*/`, reads each
+`{supervisor.pid, gvproxy.pid, stage0.pid}` sidecar, and for each
+PID where (a) the process is alive AND (b) its parent is launchd
+(PID 1) AND (c) no live `mvmctl dev` claims that VM dir → `kill
+-TERM`, then `rm -rf` the dir. Idempotent. Respects the
+stage0.lock contract (per memory
+`[[project_stage0_audit_and_cache_prune_contract]]`).
+
+**Reference implementation.** `/tmp/plan95/reap.sh` from the Plan 95
+validation session has the algorithm correct except for an over-
+eager `rm -rf` on dirs whose PIDs are still alive. The Rust port
+should check liveness before deletion.
+
+### FU-2 — Process-group isolation in spawn path
+
+**Problem.** Even with FU-1, orphans only get cleaned at the next
+`cache prune`. Better: never produce them in the first place.
+
+**Proposed shape.** In `LibkrunBuilderVm::run_stage0` and
+`run_build` (and the steady-state supervisor spawn), wrap the
+`Command::spawn` with the `command-group` crate (or call
+`setpgid`/`setsid` directly) so supervisor and its children
+share a fresh process group. On mvmctl's `Drop` and signal
+handlers (SIGINT/SIGTERM), send `kill(-pgid, SIGTERM)` to drop
+the whole tree. Doesn't help on SIGKILL (Rust can't intercept
+that), but covers ^C and clean exit — the common case. FU-1
+remains the safety net for the crash case.
+
+### FU-3 (nice to have) — kqueue parent-death watchdog
+
+**Problem.** SIGKILL on mvmctl still strands children even with
+FU-2.
+
+**Proposed shape.** The supervisor binary registers a kqueue
+`EVFILT_PROC NOTE_EXIT` watcher on its parent's pid at startup
+(macOS equivalent of Linux `PR_SET_PDEATHSIG`). If the parent
+dies, the supervisor self-terminates and reaps its own gvproxy
+child. Provides the "no orphans ever, even on SIGKILL" guarantee.
+Heavier engineering (supervisor code change + test for the
+failure modes). Defer until FU-1+FU-2 prove insufficient.
