@@ -788,8 +788,7 @@ fn ensure_builder_vm_image() -> Result<BuilderVmImage, BuilderVmError> {
         return Err(BuilderVmError::ExtractionFailed(format!(
             "builder VM image not found at {}. \
              Populate the cache by running `nix build ./nix/images/builder-vm#packages.{}-linux.default` \
-             on a host with Nix and copying `result/{{vmlinux,rootfs.ext4,cmdline.txt}}` to {}/, \
-             or wait for Plan 72 W5 to wire the Stage 0 bootstrap.",
+             on a host with Nix and copying `result/{{vmlinux,rootfs.ext4,cmdline.txt}}` to {}/.",
             arch_dir.display(),
             host_arch_tag(),
             arch_dir.display(),
