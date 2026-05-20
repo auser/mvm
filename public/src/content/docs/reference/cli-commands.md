@@ -227,10 +227,24 @@ admission until their transports are wired.
 | `mvmctl catalog search <query>` | Search entries by name, description, or tag |
 | `mvmctl catalog info <name>` | Show catalog entry details (JSON) |
 | `mvmctl init <DIR> --catalog <name>` | Scaffold a project from a catalog entry |
-| `mvmctl image pull <ref> [--prod]` | Pull an OCI image, unpack its layers, materialize a bootable `rootfs.ext4`, and record it plus a provenance sidecar in the local OCI cache. `--prod` requires a digest-pinned reference |
+| `mvmctl image pull <ref> [--prod]` | Pull an OCI image, unpack its layers, materialize a bootable `rootfs.ext4`, and record it plus a provenance sidecar in the local OCI cache. `--prod` requires a digest-pinned reference, an OCI policy file, and cosign verification |
 | `mvmctl image ls [--registry <host>] [--json]` | List cached OCI images by reference, resolved digest, fetched timestamp, and size |
 | `mvmctl image inspect <ref-or-digest> [--json]` | Print cached OCI manifest/config metadata, layer digests, and any claims/provenance sidecar |
 | `mvmctl image rm <ref-or-digest>` | Remove a cached OCI image and garbage-collect unreferenced layer files |
+
+Production OCI policy reads `MVM_OCI_POLICY` when set, otherwise
+`$MVM_DATA_DIR/oci-policy.toml`. The policy allow-lists registries and trusted
+keyless cosign identities. Production mode always requires signatures and
+verifies the resolved digest form (`registry/repo@sha256:...`) before the image
+is cached or booted:
+
+```toml
+allowed_registries = ["ghcr.io"]
+
+[[cosign]]
+certificate_identity = "https://github.com/acme/app/.github/workflows/release.yml@refs/heads/main"
+certificate_oidc_issuer = "https://token.actions.githubusercontent.com"
+```
 
 ## Console
 
@@ -252,7 +266,7 @@ dev-feature guest agent; production guests should use `mvmctl invoke`.
 | `mvmctl run -- <cmd>...` | Boot the bundled default microVM image, run `<cmd>`, exit |
 | `mvmctl run --manifest <name-or-path> -- <cmd>...` | Boot a registered manifest/template instead of the default |
 | `mvmctl run --image <ref> -- <cmd>...` | Pull or reuse a cached OCI image, emit signed audit-chain provenance for the resolved image, boot its materialized `rootfs.ext4`, run `<cmd>`, exit |
-| `mvmctl run --image <ref> --prod -- <cmd>...` | Production OCI-image policy: require `<ref>` to be digest-pinned before pull or boot |
+| `mvmctl run --image <ref> --prod -- <cmd>...` | Production OCI-image policy: require `<ref>` to be digest-pinned and cosign-verified by the OCI policy before cache use or boot |
 | `mvmctl run --profile standard -- <cmd>` | Default profile: explicit env is allowed; host shares must be read-only |
 | `mvmctl run --profile restrictive -- <cmd>` | No env injection and no host directory shares |
 | `mvmctl run --profile dev --add-dir .:/work:rw -- <cmd>` | Dev profile: permits writable host shares for local iteration |
@@ -528,6 +542,7 @@ All commands accept these global options:
 | `MVM_TEMPLATE_LOCAL_PROBE_TARGETS` | Comma-separated base URLs to probe for a local OpenAI-compatible endpoint in `auto` mode (overrides defaults `http://127.0.0.1:11434` and `http://127.0.0.1:8080`) | Defaults |
 | `MVM_TEMPLATE_NO_LOCAL_PROBE` | Set to `1` to skip the local-endpoint probe in `auto` mode (CI / sandboxed environments where loopback connects can hang) | Unset |
 | `MVM_PRODUCTION` | Enable production mode checks | `false` |
+| `MVM_OCI_POLICY` | OCI production policy TOML used by `mvmctl image pull --prod` and `mvmctl run --image --prod` | `$MVM_DATA_DIR/oci-policy.toml` |
 | `RUST_LOG` | Logging level (e.g., `debug`, `mvm=trace`) | `info` |
 | `MVM_CACHE_DIR` | Override cache directory | `~/.cache/mvm` |
 | `MVM_CONFIG_DIR` | Override config directory | XDG default |
