@@ -335,10 +335,15 @@ mod linux {
         // `Command::new("modprobe")` style spawn relies on the
         // child to find its binary — which fails on a stock rootfs
         // (Plan 86 / ADR-054). Set a canonical PATH that covers the
-        // mvm builder VM rootfs layout (busybox + extra packages in
-        // /sbin + /usr/local/bin) before any spawn site runs.
-        // Absolute-path call sites (`/sbin/mkfs.ext4`, `/sbin/udhcpc`)
-        // are unaffected.
+        // mvm builder VM rootfs layout (busybox at `/bin/*` + extra
+        // packages at `/sbin/*` + `/usr/local/bin/*`) before any
+        // spawn site runs. Absolute-path call sites like
+        // `/sbin/mkfs.ext4` (e2fsprogs, lives at `/sbin/*` via the
+        // mkGuest packages symlink) and `/bin/udhcpc`,
+        // `/bin/busybox` (busybox applets, live at `/bin/*` via the
+        // mkGuest busybox install) are unaffected. Hardcoding
+        // `/sbin/udhcpc` would ENOENT — busybox only installs
+        // applets under `/bin/<applet>`.
         // SAFETY: PID 1 is single-threaded until we spawn the fan-out
         // tracks below; no other thread can be reading the env yet.
         unsafe {
@@ -1514,15 +1519,23 @@ mod linux {
         // builds without the script keep the legacy `-i eth0 -n -q`
         // shape — udhcpc still sets the IP but resolv.conf stays at
         // the fallback content.
+        //
+        // `/bin/udhcpc` — udhcpc is a busybox applet, and mkGuest
+        // installs busybox applet symlinks under `/bin/<applet>`,
+        // not `/sbin/`. (Plan 96 / PR #420 follow-up: prior
+        // `/sbin/udhcpc` hardcoding ENOENTed at every boot, which
+        // `setup_network` swallowed as non-fatal — leaving the
+        // builder VM with no DHCP-assigned IP and the inner nix
+        // build unable to reach `cache.nixos.org`.)
         let script = "/etc/udhcpc/default.script";
-        let mut cmd = Command::new("/sbin/udhcpc");
+        let mut cmd = Command::new("/bin/udhcpc");
         cmd.args(["-i", "eth0", "-n", "-q"]);
         if std::path::Path::new(script).is_file() {
             cmd.args(["-s", script]);
         }
         let status = cmd
             .status()
-            .map_err(|e| format!("spawn /sbin/udhcpc: {e}"))?;
+            .map_err(|e| format!("spawn /bin/udhcpc: {e}"))?;
         if !status.success() {
             return Err(format!("udhcpc exit {}", status.code().unwrap_or(-1)));
         }
