@@ -2306,10 +2306,12 @@ fn test_cache_prune_dry_run() {
                 CacheAction::Prune {
                     dry_run,
                     orphan_builds,
+                    reap_orphans,
                 },
         }) => {
             assert!(dry_run);
             assert!(!orphan_builds);
+            assert!(!reap_orphans);
         }
         _ => panic!("Expected Cache Prune command"),
     }
@@ -2324,10 +2326,66 @@ fn test_cache_prune_orphan_builds_flag() {
                 CacheAction::Prune {
                     dry_run,
                     orphan_builds,
+                    reap_orphans,
                 },
         }) => {
             assert!(!dry_run);
             assert!(orphan_builds);
+            assert!(!reap_orphans);
+        }
+        _ => panic!("Expected Cache Prune command"),
+    }
+}
+
+#[test]
+fn test_cache_prune_reap_orphans_flag() {
+    // Plan 95 §FU-1 — `--reap-orphans` sweeps orphaned
+    // mvm-libkrun-supervisor / gvproxy / console-tail processes
+    // left behind by killed `mvmctl dev up` runs, plus their
+    // per-VM cache dirs.
+    let cli = Cli::try_parse_from(["mvmctl", "cache", "prune", "--reap-orphans"]).unwrap();
+    match cli.command {
+        Commands::Cache(cache::Args {
+            action:
+                CacheAction::Prune {
+                    dry_run,
+                    orphan_builds,
+                    reap_orphans,
+                },
+        }) => {
+            assert!(!dry_run);
+            assert!(!orphan_builds);
+            assert!(reap_orphans);
+        }
+        _ => panic!("Expected Cache Prune command"),
+    }
+}
+
+#[test]
+fn test_cache_prune_combined_flags() {
+    // All three sweep flags should compose so users can do a single
+    // "clean everything" pass.
+    let cli = Cli::try_parse_from([
+        "mvmctl",
+        "cache",
+        "prune",
+        "--dry-run",
+        "--orphan-builds",
+        "--reap-orphans",
+    ])
+    .unwrap();
+    match cli.command {
+        Commands::Cache(cache::Args {
+            action:
+                CacheAction::Prune {
+                    dry_run,
+                    orphan_builds,
+                    reap_orphans,
+                },
+        }) => {
+            assert!(dry_run);
+            assert!(orphan_builds);
+            assert!(reap_orphans);
         }
         _ => panic!("Expected Cache Prune command"),
     }

@@ -1253,6 +1253,12 @@ mod linux {
             t.nix_device_ready_ms = Some(BootTimings::ms_since(anchor))
         });
 
+        // Plan 92: the slim custom kernel under
+        // `nix/images/builder-vm/kernel/` builds overlay, vsock,
+        // fuse, virtiofs, and the iptables tables as `=y`. No
+        // modprobe needed before `mount -t overlay` or `socket(AF_VSOCK)`
+        // — the kernel comes up with the subsystems registered.
+
         match mount_nix_overlay() {
             Ok(()) => {}
             Err(e) => {

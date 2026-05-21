@@ -1,41 +1,92 @@
-//! Stage 0 bootstrap — materializes a host directory tree that
-//! libkrun mounts as the guest root (via `krun_set_root`), boots
-//! against libkrunfw's bundled kernel, runs `nix build` against the
-//! in-repo `nix/images/builder-vm` flake, and emits the steady-state
-//! builder VM image (kernel + rootfs.ext4) on the `/out` virtio-fs
-//! share.
+//! Stage 0 bootstrap — materializes a host directory tree from
+//! Alpine Linux's official minirootfs tarball, layered with our
+//! `init.sh` and mountpoint stubs. libkrun mounts that directory
+//! as the guest root over virtiofs (`krun_set_root`), boots
+//! libkrunfw's bundled kernel, and runs our `init` (set via
+//! `krun_set_exec`). The init script uses Alpine's `apk-tools` to
+//! `apk add nix` from Alpine's signed package repos, then runs
+//! `nix build` against the in-repo `nix/images/builder-vm` flake,
+//! emitting kernel + rootfs.ext4 on the `/out` virtio-fs share.
 //!
 //! Bootstrap surface:
 //!
 //! 1. **`init.sh`** (embedded via `include_str!`) — the PID-1
-//!    shell script. Lives at [`INIT_SCRIPT`].
-//! 2. **busybox-aarch64-linux-musl** static (~1.6 MiB) — vendored
-//!    in-tree as `stage0/busybox-aarch64-linux-musl`, embedded via
-//!    `include_bytes!` ([`BUSYBOX_AARCH64_BYTES`]). Provides sh,
-//!    mount, ip, udhcpc, cp, … under the busybox multi-call binary.
-//! 3. **nix-portable-aarch64-linux** static (~74 MiB) — daemon-less
-//!    Nix runtime. Downloaded once from DavHau/nix-portable's
-//!    upstream release into [`stage0_cache_dir`] with sha256
-//!    verification ([`NIX_PORTABLE_AARCH64`]).
+//!    shell script the kernel-cmdline `init=/init` resolves to.
+//! 2. **Alpine minirootfs** (~4 MiB compressed) — fetched once from
+//!    Alpine's official mirror, SHA-256 verified, AND PGP-verified
+//!    against Alpine's release-signing key (Natanael Copa,
+//!    embedded as [`ALPINE_RELEASE_KEY_ASC`]). The tarball provides
+//!    busybox, `apk-tools`, libc, ca-certificates, and the standard
+//!    `/etc/apk/keys/` chain. See [`ALPINE_MINIROOTFS_AARCH64`] /
+//!    [`ALPINE_MINIROOTFS_X86_64`].
 //!
-//! Per-run, [`materialize_root_dir`] writes those three assets plus
-//! a small set of directory stubs + busybox applet symlinks into a
-//! caller-supplied directory. The supervisor hands that directory
-//! to libkrun via `krun_set_root`; libkrun mounts it as the guest
-//! root over virtiofs and runs `/init` as PID 1.
+//! Per-run, [`materialize_root_dir`] re-verifies the cached
+//! tarball (SHA-256 + PGP) and extracts it into a caller-supplied
+//! directory, then writes [`INIT_SCRIPT`] to `init` (mode 0755).
+//! The supervisor hands that directory to libkrun via
+//! `krun_set_root` and `krun_set_exec` with `argv[0] = "/init"`.
+//!
+//! # Trust model
+//!
+//! The Alpine tarball is hash-pinned in source AND PGP-verified
+//! against an embedded Alpine release-signing key. Both checks
+//! fail-closed:
+//!
+//! - SHA-256 catches tampering by anyone with cached-file write
+//!   access between fetch and extraction.
+//! - PGP catches a malicious upstream mirror that signs with the
+//!   wrong key (or doesn't sign at all). The expected key
+//!   fingerprint is also pinned in source as
+//!   [`ALPINE_RELEASE_KEY_FINGERPRINT`] — even if someone tampered
+//!   with [`ALPINE_RELEASE_KEY_ASC`], the fingerprint check would
+//!   fail the verification.
+//!
+//! Subsequent in-VM `apk add` calls inherit Alpine's own signature
+//! verification (signed APKINDEX + signed packages against keys
+//! shipped under `/etc/apk/keys/`).
 
-use std::io::{Read, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::{Context, Result, bail};
+use flate2::read::GzDecoder;
 use sha2::{Digest, Sha256};
+use tar::Archive;
 
 /// PID-1 shell script. Compiled into the binary so a fresh `mvmctl`
 /// can always emit it without consulting the cache or the network.
 pub const INIT_SCRIPT: &str = include_str!("stage0/init.sh");
 
+/// Alpine release version we pin to. Single source of truth for
+/// the URL builders below. Bump together with the per-arch
+/// SHA-256 pins.
+pub const ALPINE_VERSION: &str = "3.22.4";
+/// Major.minor of [`ALPINE_VERSION`]. Used to build the `apk`
+/// repository URLs the in-VM init writes to
+/// `/etc/apk/repositories`. Bump in lockstep with
+/// [`ALPINE_VERSION`].
+pub const ALPINE_BRANCH: &str = "v3.22";
+
+/// Alpine's release-signing PGP key (Natanael Copa,
+/// `ncopa@alpinelinux.org`). Source:
+/// `https://alpinelinux.org/keys/ncopa.asc`.
+///
+/// Vendored in-tree so a fresh `mvmctl dev up` doesn't need to
+/// fetch the key from the network (which would itself be an
+/// unverified channel). The expected fingerprint is also pinned
+/// in [`ALPINE_RELEASE_KEY_FINGERPRINT`]; on verification we
+/// confirm the parsed key matches that fingerprint, so swapping
+/// the embedded bytes would fail-close too.
+pub const ALPINE_RELEASE_KEY_ASC: &[u8] = include_bytes!("stage0/alpine-ncopa-release-key.asc");
+
+/// Expected fingerprint of [`ALPINE_RELEASE_KEY_ASC`]. RSA primary
+/// key, uppercase hex (40 chars, no spaces). Bump only when Alpine
+/// rotates the release-signing key — a multi-year cadence.
+pub const ALPINE_RELEASE_KEY_FINGERPRINT: &str = "0482D84022F52DF1C4E7CD43293ACD0907D9495A";
+
 /// One downloadable bootstrap asset, pinned by upstream URL +
-/// SHA-256. The cache key is [`Self::cache_filename`].
+/// SHA-256, optionally with a PGP detached-signature URL. The
+/// cache key is [`Self::cache_filename`].
 #[derive(Debug, Clone, Copy)]
 pub struct BootstrapAsset {
     /// Where the file lands inside [`stage0_cache_dir`].
@@ -44,40 +95,91 @@ pub struct BootstrapAsset {
     pub url: &'static str,
     /// SHA-256 of the byte stream at [`Self::url`]. Hex (64 chars).
     pub sha256_hex: &'static str,
+    /// Optional URL of an armored PGP detached signature
+    /// (`.asc`) over [`Self::url`]'s bytes. When `Some`, the
+    /// signature is fetched alongside the file, cached at
+    /// `<cache_filename>.asc`, and verified against
+    /// [`ALPINE_RELEASE_KEY_ASC`] on every fetch + every
+    /// re-materialize.
+    pub signature_url: Option<&'static str>,
     /// File mode the asset gets on disk (and inside the root dir).
     pub mode: u32,
 }
 
-/// busybox-static aarch64-linux-musl. Vendored in-tree (~1.6 MiB)
-/// because it's small enough that embedding the bytes directly into
-/// mvmctl is less pain than maintaining a separate fetch flow.
+/// Alpine minirootfs for aarch64-linux guests. Tarball + gzip,
+/// ~4 MiB. Includes busybox, apk-tools, libc, ca-certificates,
+/// and `/etc/apk/keys/` (Alpine's signing keys for `apk-tools`'s
+/// signature verification on subsequent `apk add` calls).
 ///
-/// Origin: `pkgs.pkgsStatic.busybox` on `aarch64-linux` from
-/// nixpkgs, then `strip --strip-all`.
-pub const BUSYBOX_AARCH64_BYTES: &[u8] = include_bytes!("stage0/busybox-aarch64-linux-musl");
-
-/// SHA-256 of [`BUSYBOX_AARCH64_BYTES`]. Verified at the bottom of
-/// this file so a tampered vendored binary fails the workspace
-/// test suite.
-pub const BUSYBOX_AARCH64_SHA256: &str =
-    "710d9568fb39d2450809551eb3517eda124398d21952993040284cbc386f0cc7";
-
-/// nix-portable aarch64-linux. Upstream release from
-/// `DavHau/nix-portable` — well-maintained, single static binary,
-/// runs Nix without a daemon or `/nix/store`. ~74 MiB.
-///
-/// Downloaded once on first `dev up` into [`stage0_cache_dir`].
-/// Too big to vendor.
-pub const NIX_PORTABLE_AARCH64: BootstrapAsset = BootstrapAsset {
-    cache_filename: "nix-portable",
-    url: "https://github.com/DavHau/nix-portable/releases/download/v012/nix-portable-aarch64",
-    sha256_hex: "af41d8defdb9fa17ee361220ee05a0c758d3e6231384a3f969a314f9133744ea",
-    mode: 0o755,
+/// Pinned in lockstep with [`ALPINE_VERSION`] above. Bump both
+/// constants together when refreshing.
+pub const ALPINE_MINIROOTFS_AARCH64: BootstrapAsset = BootstrapAsset {
+    cache_filename: "alpine-minirootfs-aarch64.tar.gz",
+    url: "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.4-aarch64.tar.gz",
+    sha256_hex: "fc11cf987b37b2e57969cea7e0b8df0777e572d41fe20731630c1e926a8a07a2",
+    signature_url: Some(
+        "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/aarch64/alpine-minirootfs-3.22.4-aarch64.tar.gz.asc",
+    ),
+    mode: 0o644,
 };
 
-/// Every downloadable asset Stage 0 needs on aarch64-linux hosts.
-/// busybox is vendored (not downloaded), so it's not in this list.
-pub const ASSETS_AARCH64: &[&BootstrapAsset] = &[&NIX_PORTABLE_AARCH64];
+/// Alpine minirootfs for x86_64-linux guests. Same shape as
+/// [`ALPINE_MINIROOTFS_AARCH64`]; used on Linux KVM hosts (the
+/// supported non-macOS path).
+pub const ALPINE_MINIROOTFS_X86_64: BootstrapAsset = BootstrapAsset {
+    cache_filename: "alpine-minirootfs-x86_64.tar.gz",
+    url: "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.4-x86_64.tar.gz",
+    sha256_hex: "0737c622ddefa7c91767ce8ab5dd4722f265cd580b21332ec5f22cfe54a84251",
+    signature_url: Some(
+        "https://dl-cdn.alpinelinux.org/alpine/v3.22/releases/x86_64/alpine-minirootfs-3.22.4-x86_64.tar.gz.asc",
+    ),
+    mode: 0o644,
+};
+
+/// Every downloadable asset Stage 0 needs on an aarch64-linux
+/// guest. (Host is macOS aarch64 in practice; the guest arch is
+/// what matters for the asset selection.)
+pub const ASSETS_AARCH64: &[&BootstrapAsset] = &[&ALPINE_MINIROOTFS_AARCH64];
+
+/// Every downloadable asset Stage 0 needs on an x86_64-linux
+/// guest. Linux KVM host path.
+pub const ASSETS_X86_64: &[&BootstrapAsset] = &[&ALPINE_MINIROOTFS_X86_64];
+
+/// Select the right asset table for the host's target arch. The
+/// macOS aarch64 host boots aarch64 Linux guests; the Linux x86_64
+/// host boots x86_64 Linux guests. Other host arches aren't
+/// supported and return an empty slice.
+pub fn assets_for_host_arch() -> &'static [&'static BootstrapAsset] {
+    #[cfg(target_arch = "aarch64")]
+    {
+        ASSETS_AARCH64
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        ASSETS_X86_64
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        &[]
+    }
+}
+
+/// Resolve the Alpine minirootfs asset that matches the host's
+/// target arch.
+pub fn alpine_minirootfs_for_host_arch() -> Option<&'static BootstrapAsset> {
+    #[cfg(target_arch = "aarch64")]
+    {
+        Some(&ALPINE_MINIROOTFS_AARCH64)
+    }
+    #[cfg(target_arch = "x86_64")]
+    {
+        Some(&ALPINE_MINIROOTFS_X86_64)
+    }
+    #[cfg(not(any(target_arch = "aarch64", target_arch = "x86_64")))]
+    {
+        None
+    }
+}
 
 /// `~/.cache/mvm/stage0/`. Materialized by [`prepare_assets`].
 pub fn stage0_cache_dir() -> PathBuf {
@@ -85,133 +187,221 @@ pub fn stage0_cache_dir() -> PathBuf {
     home.join(".cache").join("mvm").join("stage0")
 }
 
+/// Path on disk where the detached signature for `asset` is
+/// cached, relative to `cache_dir`. Mirrors `<cache_filename>.asc`
+/// next to the data.
+fn signature_cache_path_in(cache_dir: &Path, asset: &BootstrapAsset) -> PathBuf {
+    cache_dir.join(format!("{}.asc", asset.cache_filename))
+}
+
 /// Ensure every entry in `assets` is present in the cache dir
-/// with the matching SHA-256. Missing assets are fetched via
-/// `reqwest::blocking::get`; mismatched ones are re-fetched
-/// (the existing file is moved aside before the new one writes,
-/// so an interrupted download never leaves a half-trusted file
-/// in place).
+/// with the matching SHA-256 (and PGP signature when applicable).
+/// Missing assets are fetched via `reqwest::blocking::get`;
+/// mismatched ones are re-fetched (the existing file is moved
+/// aside before the new one writes, so an interrupted download
+/// never leaves a half-trusted file in place).
 ///
 /// Network access only happens on first run (or after a manual
 /// cache prune). Subsequent invocations short-circuit on the
 /// per-file sha256 check.
 pub fn prepare_assets(assets: &[&BootstrapAsset]) -> Result<()> {
-    let dir = stage0_cache_dir();
-    std::fs::create_dir_all(&dir).with_context(|| format!("creating {}", dir.display()))?;
+    prepare_assets_in(&stage0_cache_dir(), assets)
+}
+
+/// Like [`prepare_assets`] but takes the cache directory
+/// explicitly. Production callers go through [`prepare_assets`];
+/// tests use this to avoid mutating the `HOME` env var.
+pub fn prepare_assets_in(cache_dir: &Path, assets: &[&BootstrapAsset]) -> Result<()> {
+    std::fs::create_dir_all(cache_dir)
+        .with_context(|| format!("creating {}", cache_dir.display()))?;
 
     for asset in assets {
-        let target = dir.join(asset.cache_filename);
-        if target.is_file() && verify_sha256(&target, asset.sha256_hex)? {
+        let target = cache_dir.join(asset.cache_filename);
+        let sig_target = signature_cache_path_in(cache_dir, asset);
+
+        let cache_hit = target.is_file()
+            && verify_sha256(&target, asset.sha256_hex)?
+            && (asset.signature_url.is_none() || sig_target.is_file());
+
+        if cache_hit {
+            // Belt + suspenders: also re-verify the PGP signature
+            // on every prepare. A tampered cached file with the
+            // wrong signature fails here, not at extract time.
+            if asset.signature_url.is_some() {
+                let data = std::fs::read(&target)
+                    .with_context(|| format!("reading cached {}", target.display()))?;
+                let sig = std::fs::read(&sig_target)
+                    .with_context(|| format!("reading cached {}", sig_target.display()))?;
+                verify_alpine_pgp_signature(&data, &sig).with_context(|| {
+                    format!("verifying cached PGP signature for {}", target.display())
+                })?;
+            }
             continue;
         }
+
         fetch_to(&target, asset).with_context(|| format!("fetching {}", asset.url))?;
+        if let Some(sig_url) = asset.signature_url {
+            fetch_signature(&sig_target, sig_url).with_context(|| format!("fetching {sig_url}"))?;
+            let data =
+                std::fs::read(&target).with_context(|| format!("reading {}", target.display()))?;
+            let sig = std::fs::read(&sig_target)
+                .with_context(|| format!("reading {}", sig_target.display()))?;
+            verify_alpine_pgp_signature(&data, &sig).with_context(|| {
+                format!(
+                    "verifying PGP signature for {} against embedded Alpine key",
+                    target.display()
+                )
+            })?;
+        }
     }
     Ok(())
 }
 
-/// Directory stubs the init script (and the kernel's early-boot
-/// mounts) need to exist before `mount(2)` succeeds. Listed relative
-/// to the root, with no leading slash.
-const ROOT_DIR_STUBS: &[&str] = &[
-    "bin",
-    "dev",
-    "etc",
-    "out",
-    "proc",
-    "run",
-    "sys",
-    "tmp",
-    "usr",
-    "usr/local",
-    "usr/local/bin",
-    "work",
-];
-
-/// busybox applets the init script invokes directly. Each one
-/// gets a `bin/<name>` -> `busybox` symlink in the root dir.
-const PRE_INSTALLED_APPLETS: &[&str] = &[
-    "sh",
-    "mount",
-    "umount",
-    "mkdir",
-    "mountpoint",
-    "cp",
-    "ip",
-    "udhcpc",
-    "sync",
-    "poweroff",
-    "cat",
-    "echo",
-    "ls",
-    "rm",
-];
+/// Mountpoint stubs (extra to whatever Alpine ships) the in-VM
+/// init script needs before it can mount the virtio-fs shares.
+/// Alpine's minirootfs already includes /proc, /sys, /dev, /tmp,
+/// /run, /etc, /bin, /sbin, /usr, /var — we add /work and /out
+/// for the virtio-fs mounts and /nix because Nix expects it.
+const ROOT_DIR_EXTRA_STUBS: &[&str] = &["work", "out", "nix"];
 
 /// Materialize a Stage 0 guest root at `dest` from the embedded
-/// busybox + the cached nix-portable + the embedded init script.
-/// The supervisor hands `dest` to libkrun via `krun_set_root`,
-/// which mounts it as the guest root over virtiofs.
+/// init script and the cached Alpine minirootfs tarball. The
+/// supervisor hands `dest` to libkrun via `krun_set_root`, which
+/// mounts it as the guest root over virtiofs, and via
+/// `krun_set_exec` with `entry_path = "/init"`.
 ///
-/// Idempotent over a clean `dest`. Caller is responsible for making
-/// sure `dest` is empty (or doesn't exist) — the function creates
-/// the directory tree from scratch.
+/// Idempotent over a clean `dest`. Caller is responsible for
+/// making sure `dest` is empty (or doesn't exist) — the function
+/// creates the directory tree from scratch.
 ///
-/// Caller must have already run [`prepare_assets`] so nix-portable
-/// is present in the cache dir.
+/// Caller must have already run [`prepare_assets`] so the Alpine
+/// tarball + signature are present in the cache dir. This
+/// function re-verifies both before extraction (defense in depth
+/// against a tampered cache between fetch and extract).
 pub fn materialize_root_dir(dest: &Path) -> Result<()> {
-    let cache = stage0_cache_dir();
-    let nix_portable_src = cache.join(NIX_PORTABLE_AARCH64.cache_filename);
-    if !nix_portable_src.is_file() {
+    materialize_root_dir_in(&stage0_cache_dir(), dest)
+}
+
+/// Like [`materialize_root_dir`] but reads the cached Alpine
+/// tarball from `cache_dir` instead of [`stage0_cache_dir`]. Used
+/// by tests so they don't have to mutate `HOME`.
+pub fn materialize_root_dir_in(cache_dir: &Path, dest: &Path) -> Result<()> {
+    let asset = alpine_minirootfs_for_host_arch().ok_or_else(|| {
+        anyhow::anyhow!(
+            "Stage 0 has no Alpine minirootfs asset pinned for this host's target arch \
+             (expected aarch64 or x86_64)"
+        )
+    })?;
+    let tarball = cache_dir.join(asset.cache_filename);
+    if !tarball.is_file() {
         bail!(
             "Stage 0 asset missing: {} (run `prepare_assets` first)",
-            nix_portable_src.display()
+            tarball.display()
         );
+    }
+    if !verify_sha256(&tarball, asset.sha256_hex)? {
+        bail!(
+            "Stage 0 asset sha256 mismatch at {} — refusing to extract a tampered tarball. \
+             Delete it and re-run `prepare_assets`.",
+            tarball.display()
+        );
+    }
+    if asset.signature_url.is_some() {
+        let sig_path = signature_cache_path_in(cache_dir, asset);
+        if !sig_path.is_file() {
+            bail!(
+                "Stage 0 PGP signature missing: {} (run `prepare_assets` first)",
+                sig_path.display()
+            );
+        }
+        let data =
+            std::fs::read(&tarball).with_context(|| format!("reading {}", tarball.display()))?;
+        let sig =
+            std::fs::read(&sig_path).with_context(|| format!("reading {}", sig_path.display()))?;
+        verify_alpine_pgp_signature(&data, &sig).with_context(|| {
+            format!(
+                "verifying PGP signature for {} before extraction",
+                tarball.display()
+            )
+        })?;
     }
 
     std::fs::create_dir_all(dest)
         .with_context(|| format!("creating Stage 0 root dir {}", dest.display()))?;
 
-    for stub in ROOT_DIR_STUBS {
+    extract_alpine_tarball(&tarball, dest)
+        .with_context(|| format!("extracting {} into {}", tarball.display(), dest.display()))?;
+
+    for stub in ROOT_DIR_EXTRA_STUBS {
         let p = dest.join(stub);
         std::fs::create_dir_all(&p)
             .with_context(|| format!("creating Stage 0 stub dir {}", p.display()))?;
     }
 
-    // /sbin → bin (some applets like poweroff/udhcpc are looked up
-    // under /sbin by upstream conventions).
-    symlink_relative("bin", &dest.join("sbin"))?;
-
     write_file_mode(&dest.join("init"), INIT_SCRIPT.as_bytes(), 0o755)
         .context("writing Stage 0 /init")?;
-    write_file_mode(
-        &dest.join("bin").join("busybox"),
-        BUSYBOX_AARCH64_BYTES,
-        0o755,
-    )
-    .context("writing Stage 0 /bin/busybox")?;
 
-    // nix-portable is ~74 MiB; copy from cache rather than load it
-    // through a Vec<u8>.
-    let np_dst = dest
-        .join("usr")
-        .join("local")
-        .join("bin")
-        .join("nix-portable");
-    std::fs::copy(&nix_portable_src, &np_dst).with_context(|| {
-        format!(
-            "copying {} -> {}",
-            nix_portable_src.display(),
-            np_dst.display()
-        )
-    })?;
-    set_mode(&np_dst, NIX_PORTABLE_AARCH64.mode)?;
+    Ok(())
+}
 
-    // Materialize busybox applet symlinks. The kernel's binfmt_script
-    // handler will need `bin/sh` resolvable the moment libkrun execs
-    // `/init`, before any line of /init has run.
-    for applet in PRE_INSTALLED_APPLETS {
-        symlink_relative("busybox", &dest.join("bin").join(applet))?;
+/// Verify a detached OpenPGP signature over `data` against
+/// [`ALPINE_RELEASE_KEY_ASC`]. Returns `Ok(())` only when:
+///
+/// 1. The embedded key parses cleanly.
+/// 2. The signing key's primary fingerprint matches
+///    [`ALPINE_RELEASE_KEY_FINGERPRINT`].
+/// 3. The signature parses cleanly and verifies against `data`.
+///
+/// Any failure returns an `Err` that describes which step
+/// failed.
+fn verify_alpine_pgp_signature(data: &[u8], sig_armor: &[u8]) -> Result<()> {
+    use pgp::composed::{Deserializable, DetachedSignature, SignedPublicKey};
+    use pgp::types::KeyDetails;
+
+    let (key, _headers) = SignedPublicKey::from_armor_single(Cursor::new(ALPINE_RELEASE_KEY_ASC))
+        .context("parsing embedded Alpine release-signing key")?;
+
+    let got_fpr = format!("{:X}", key.fingerprint());
+    let want_fpr = ALPINE_RELEASE_KEY_FINGERPRINT.to_ascii_uppercase();
+    // Normalise: pgp may format with spaces; canonicalise by
+    // stripping non-hex characters.
+    let got_canonical: String = got_fpr.chars().filter(|c| c.is_ascii_hexdigit()).collect();
+    if got_canonical.to_ascii_uppercase() != want_fpr {
+        bail!(
+            "embedded Alpine release-signing key fingerprint {got_canonical} does not match the \
+             pinned fingerprint {want_fpr} — refusing to verify with the wrong key. This means \
+             `crates/mvm-build/src/stage0/alpine-ncopa-release-key.asc` and the \
+             `ALPINE_RELEASE_KEY_FINGERPRINT` constant have drifted."
+        );
     }
 
+    let (sig, _headers) = DetachedSignature::from_armor_single(Cursor::new(sig_armor))
+        .context("parsing detached signature .asc")?;
+
+    sig.verify(&key, data)
+        .context("Alpine tarball signature failed PGP verification against embedded release key")?;
+
+    Ok(())
+}
+
+/// Extract Alpine's tar.gz minirootfs into `dest`, preserving
+/// permissions but not ownership (everything ends up owned by
+/// the calling host user; libkrun's virtio-fs proxy handles
+/// uid mapping at access time).
+fn extract_alpine_tarball(tarball: &Path, dest: &Path) -> Result<()> {
+    let f =
+        std::fs::File::open(tarball).with_context(|| format!("opening {}", tarball.display()))?;
+    let gz = GzDecoder::new(f);
+    let mut archive = Archive::new(gz);
+    archive.set_preserve_permissions(true);
+    // Don't preserve ownership — the macOS host doesn't have the
+    // numeric uids/gids Alpine's tarball references. Files end up
+    // owned by the current user; libkrun + virtiofsd remap inside
+    // the guest.
+    archive.set_unpack_xattrs(false);
+    archive
+        .unpack(dest)
+        .with_context(|| format!("unpacking tarball into {}", dest.display()))?;
     Ok(())
 }
 
@@ -234,28 +424,6 @@ fn set_mode(path: &Path, mode: u32) -> Result<()> {
     #[cfg(not(unix))]
     {
         let _ = (path, mode);
-    }
-    Ok(())
-}
-
-/// Create a symlink at `link` pointing at `target` (a relative path).
-/// Replaces an existing symlink at `link` if any.
-fn symlink_relative(target: &str, link: &Path) -> Result<()> {
-    if link.symlink_metadata().is_ok() {
-        std::fs::remove_file(link)
-            .with_context(|| format!("removing existing {}", link.display()))?;
-    }
-    #[cfg(unix)]
-    {
-        std::os::unix::fs::symlink(target, link)
-            .with_context(|| format!("symlink {} -> {target}", link.display()))?;
-    }
-    #[cfg(not(unix))]
-    {
-        bail!(
-            "Stage 0 root materialization requires a Unix host (symlink at {})",
-            link.display()
-        );
     }
     Ok(())
 }
@@ -323,6 +491,49 @@ fn fetch_to(target: &Path, asset: &BootstrapAsset) -> Result<()> {
     Ok(())
 }
 
+/// Fetch a detached `.asc` signature. Same staging-dir + atomic
+/// rename pattern as [`fetch_to`]; no SHA-256 check because the
+/// signature derives its trust from the embedded PGP key, not from
+/// a pinned hash.
+fn fetch_signature(target: &Path, url: &str) -> Result<()> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| anyhow::anyhow!("target {} has no parent", target.display()))?;
+    let name = target
+        .file_name()
+        .ok_or_else(|| anyhow::anyhow!("target {} has no file name", target.display()))?;
+    let staging = parent.join(format!(
+        ".{}.staging.{}",
+        name.to_string_lossy(),
+        std::process::id()
+    ));
+
+    eprintln!("[mvm] downloading {url} -> {}", target.display());
+    let resp = reqwest::blocking::get(url)
+        .with_context(|| format!("GET {url}"))?
+        .error_for_status()
+        .with_context(|| format!("GET {url} returned non-success status"))?;
+    let bytes = resp
+        .bytes()
+        .with_context(|| format!("reading body from {url}"))?;
+
+    {
+        let mut out = std::fs::File::create(&staging)
+            .with_context(|| format!("creating staging file {}", staging.display()))?;
+        out.write_all(&bytes)
+            .with_context(|| format!("writing {}", staging.display()))?;
+    }
+    set_mode(&staging, 0o644)?;
+    std::fs::rename(&staging, target).with_context(|| {
+        format!(
+            "atomic-rename {} -> {}",
+            staging.display(),
+            target.display()
+        )
+    })?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -340,8 +551,8 @@ mod tests {
             "init script brings eth0 up explicitly (the udhcpc-ENETDOWN bug fix)"
         );
         assert!(
-            INIT_SCRIPT.contains("nix-portable"),
-            "init script invokes nix-portable"
+            INIT_SCRIPT.contains("apk"),
+            "init script invokes apk (Alpine package manager)"
         );
     }
 
@@ -365,55 +576,56 @@ mod tests {
     }
 
     #[test]
-    fn vendored_busybox_matches_pinned_sha256() {
-        let got = hex::encode(Sha256::digest(BUSYBOX_AARCH64_BYTES));
-        assert_eq!(
-            got, BUSYBOX_AARCH64_SHA256,
-            "vendored busybox bytes do not match the pinned sha256; \
-             someone tampered with `stage0/busybox-aarch64-linux-musl` or \
-             forgot to update BUSYBOX_AARCH64_SHA256"
-        );
+    fn alpine_assets_table_covers_both_supported_arches() {
+        assert_eq!(ASSETS_AARCH64.len(), 1);
+        assert_eq!(ASSETS_X86_64.len(), 1);
+        assert!(ASSETS_AARCH64[0].url.contains("aarch64"));
+        assert!(ASSETS_X86_64[0].url.contains("x86_64"));
+        assert!(ASSETS_AARCH64[0].url.starts_with("https://"));
+        assert!(ASSETS_X86_64[0].url.starts_with("https://"));
+        // Every asset has a PGP signature URL.
+        assert!(ASSETS_AARCH64[0].signature_url.is_some());
+        assert!(ASSETS_X86_64[0].signature_url.is_some());
     }
 
     #[test]
-    fn vendored_busybox_is_aarch64_elf() {
+    fn alpine_version_and_branch_match() {
+        // ALPINE_VERSION (e.g. "3.22.4") must share the major.minor
+        // with ALPINE_BRANCH (e.g. "v3.22"). The URL in each asset
+        // embeds the branch directory; init.sh writes the branch to
+        // /etc/apk/repositories. Drift between them is a footgun.
+        let trimmed_branch = ALPINE_BRANCH.trim_start_matches('v');
         assert!(
-            BUSYBOX_AARCH64_BYTES.len() > 64,
-            "busybox too small to be a real ELF"
+            ALPINE_VERSION.starts_with(&format!("{trimmed_branch}.")),
+            "ALPINE_VERSION {ALPINE_VERSION} does not match ALPINE_BRANCH {ALPINE_BRANCH}"
         );
-        assert_eq!(
-            &BUSYBOX_AARCH64_BYTES[0..4],
-            &[0x7f, b'E', b'L', b'F'],
-            "vendored busybox lacks ELF magic"
-        );
-        assert_eq!(
-            BUSYBOX_AARCH64_BYTES[18], 0xB7,
-            "vendored busybox e_machine is not EM_AARCH64 (0xB7)"
-        );
-    }
-
-    #[test]
-    fn downloadable_assets_table_covers_nix_portable() {
-        let names: Vec<_> = ASSETS_AARCH64.iter().map(|a| a.cache_filename).collect();
-        assert!(names.contains(&"nix-portable"));
-        assert!(!names.contains(&"busybox"));
-    }
-
-    #[test]
-    fn pinned_asset_urls_are_https() {
-        for asset in ASSETS_AARCH64 {
+        for asset in [&ALPINE_MINIROOTFS_AARCH64, &ALPINE_MINIROOTFS_X86_64] {
             assert!(
-                asset.url.starts_with("https://"),
-                "{} pins a non-https URL: {}",
-                asset.cache_filename,
+                asset.url.contains(&format!("/{ALPINE_BRANCH}/")),
+                "asset URL {} does not embed ALPINE_BRANCH {ALPINE_BRANCH}",
+                asset.url
+            );
+            assert!(
+                asset.url.contains(ALPINE_VERSION),
+                "asset URL {} does not embed ALPINE_VERSION {ALPINE_VERSION}",
+                asset.url
+            );
+            let sig_url = asset.signature_url.expect("sig url present");
+            assert!(
+                sig_url.ends_with(".asc"),
+                "signature URL {sig_url} should end with .asc"
+            );
+            assert!(
+                sig_url.starts_with(asset.url),
+                "signature URL {sig_url} should sit next to data URL {}",
                 asset.url
             );
         }
     }
 
     #[test]
-    fn pinned_asset_sha256_is_64_hex_chars() {
-        for asset in ASSETS_AARCH64 {
+    fn alpine_assets_sha256_pins_are_well_formed() {
+        for asset in [&ALPINE_MINIROOTFS_AARCH64, &ALPINE_MINIROOTFS_X86_64] {
             assert_eq!(
                 asset.sha256_hex.len(),
                 64,
@@ -428,133 +640,105 @@ mod tests {
         }
     }
 
-    /// Smoke: materializing the root dir against a temp cache dir
-    /// with a stub nix-portable produces a tree containing the init
-    /// script, the vendored busybox, the stub nix-portable, and the
-    /// busybox applet symlinks.
     #[test]
-    fn materialize_root_dir_against_stub_cache() {
-        let dir = TempDir::new().unwrap();
-        // The module's `stage0_cache_dir()` reads from $HOME; swap.
-        // SAFETY: this test mutates env vars but isn't expected to
-        // race with the others in this module (none touch HOME).
-        let saved = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
-        let real_cache = stage0_cache_dir();
-        std::fs::create_dir_all(&real_cache).unwrap();
-        std::fs::write(real_cache.join("nix-portable"), b"FAKE_NIX_PORTABLE").unwrap();
-
-        let root = dir.path().join("stage0-root");
-        materialize_root_dir(&root).expect("materialize succeeds with stubs in place");
-
-        // Restore HOME.
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
-
-        // Expected layout.
-        assert!(root.join("init").is_file(), "/init present");
-        assert!(
-            root.join("bin").join("busybox").is_file(),
-            "busybox present"
-        );
-        assert!(
-            root.join("usr/local/bin/nix-portable").is_file(),
-            "nix-portable copied"
-        );
-        for stub in ROOT_DIR_STUBS {
-            assert!(root.join(stub).is_dir(), "stub dir {stub} present");
-        }
-        // /sbin → bin symlink.
-        let sbin = root.join("sbin");
-        assert!(
-            sbin.symlink_metadata().unwrap().file_type().is_symlink(),
-            "/sbin is a symlink"
-        );
-        assert_eq!(
-            std::fs::read_link(&sbin).unwrap(),
-            std::path::Path::new("bin")
-        );
-        // Applet symlinks.
-        for applet in PRE_INSTALLED_APPLETS {
-            let p = root.join("bin").join(applet);
-            assert!(
-                p.symlink_metadata().unwrap().file_type().is_symlink(),
-                "/bin/{applet} is a symlink"
-            );
-            assert_eq!(
-                std::fs::read_link(&p).unwrap(),
-                std::path::Path::new("busybox")
-            );
-        }
-
-        // Permissions: /init and /bin/busybox executable.
-        #[cfg(unix)]
+    fn host_arch_dispatch_picks_one_asset() {
+        // The cfg-selected asset must match exactly one of the
+        // per-arch tables. We can't assert which one (depends on
+        // the test runner's arch) but we can assert it's not None.
+        #[cfg(any(target_arch = "aarch64", target_arch = "x86_64"))]
         {
-            use std::os::unix::fs::PermissionsExt;
-            let init_mode = std::fs::metadata(root.join("init"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(init_mode & 0o777, 0o755, "/init mode 0755");
-            let bb_mode = std::fs::metadata(root.join("bin/busybox"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(bb_mode & 0o777, 0o755, "/bin/busybox mode 0755");
-            let np_mode = std::fs::metadata(root.join("usr/local/bin/nix-portable"))
-                .unwrap()
-                .permissions()
-                .mode();
-            assert_eq!(
-                np_mode & 0o777,
-                0o755,
-                "/usr/local/bin/nix-portable mode 0755"
-            );
+            let picked = alpine_minirootfs_for_host_arch().expect("supported host arch");
+            assert!(!picked.url.is_empty());
+            assert_eq!(picked.sha256_hex.len(), 64);
         }
-
-        // The script in /init is byte-identical to the embedded
-        // INIT_SCRIPT — guards against silent corruption.
-        let on_disk = std::fs::read_to_string(root.join("init")).unwrap();
-        assert_eq!(on_disk, INIT_SCRIPT);
-
-        let _ = std::fs::remove_dir_all(real_cache);
     }
 
-    /// Materializing without first calling `prepare_assets` (nix-portable
-    /// missing from cache) is rejected with a clear error.
+    /// Embedded Alpine release-signing key is a non-empty armored
+    /// PGP public key, and its primary fingerprint matches
+    /// [`ALPINE_RELEASE_KEY_FINGERPRINT`].
     #[test]
-    fn materialize_root_dir_rejects_missing_nix_portable() {
+    fn embedded_alpine_key_parses_and_matches_pinned_fingerprint() {
+        use pgp::composed::{Deserializable, SignedPublicKey};
+        use pgp::types::KeyDetails;
+        assert!(!ALPINE_RELEASE_KEY_ASC.is_empty());
+        let armor_head = std::str::from_utf8(&ALPINE_RELEASE_KEY_ASC[..40]).unwrap();
+        assert!(
+            armor_head.contains("PGP PUBLIC KEY"),
+            "embedded key looks like armored PGP: {armor_head}"
+        );
+        let (key, _) =
+            SignedPublicKey::from_armor_single(std::io::Cursor::new(ALPINE_RELEASE_KEY_ASC))
+                .expect("parse Alpine release key");
+        let canonical: String = format!("{:X}", key.fingerprint())
+            .chars()
+            .filter(|c| c.is_ascii_hexdigit())
+            .collect();
+        assert_eq!(
+            canonical.to_ascii_uppercase(),
+            ALPINE_RELEASE_KEY_FINGERPRINT.to_ascii_uppercase(),
+            "embedded key fingerprint matches pin"
+        );
+    }
+
+    /// A garbage byte string passed to the PGP verifier is
+    /// rejected with a clear error.
+    #[test]
+    fn verify_alpine_pgp_signature_rejects_garbage() {
+        let err = verify_alpine_pgp_signature(b"data", b"not a real signature")
+            .expect_err("garbage signature must fail");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("detached signature") || msg.contains("Alpine") || msg.contains(".asc"),
+            "error mentions signature parsing: {msg}"
+        );
+    }
+
+    /// Materializing without first calling `prepare_assets` (Alpine
+    /// tarball missing from cache) is rejected with a clear error.
+    #[test]
+    fn materialize_root_dir_rejects_missing_tarball() {
         let dir = TempDir::new().unwrap();
-        let saved = std::env::var_os("HOME");
-        unsafe {
-            std::env::set_var("HOME", dir.path());
-        }
-        let real_cache = stage0_cache_dir();
-        // Do NOT create nix-portable.
-        std::fs::create_dir_all(&real_cache).unwrap();
-
+        // Empty cache dir (no tarball staged).
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
         let root = dir.path().join("stage0-root");
-        let err = materialize_root_dir(&root).expect_err("missing asset should fail");
 
-        unsafe {
-            match saved {
-                Some(v) => std::env::set_var("HOME", v),
-                None => std::env::remove_var("HOME"),
-            }
-        }
+        let err = materialize_root_dir_in(&cache, &root).expect_err("missing asset should fail");
 
         let msg = format!("{err:#}");
         assert!(
-            msg.contains("nix-portable"),
+            msg.contains("Stage 0 asset missing") || msg.contains("alpine-minirootfs"),
             "error names the missing asset: {msg}"
         );
+    }
 
-        let _ = std::fs::remove_dir_all(real_cache);
+    /// A tampered cached tarball (bytes don't match the pinned
+    /// sha256) is rejected before extraction.
+    #[test]
+    fn materialize_root_dir_rejects_tampered_tarball() {
+        let dir = TempDir::new().unwrap();
+        let cache = dir.path().join("cache");
+        std::fs::create_dir_all(&cache).unwrap();
+        // Write garbage under both expected filenames — sha256
+        // will not match the pinned hex for either arch.
+        std::fs::write(
+            cache.join("alpine-minirootfs-aarch64.tar.gz"),
+            b"not actually an alpine tarball",
+        )
+        .unwrap();
+        std::fs::write(
+            cache.join("alpine-minirootfs-x86_64.tar.gz"),
+            b"not actually an alpine tarball",
+        )
+        .unwrap();
+
+        let root = dir.path().join("stage0-root");
+        let err = materialize_root_dir_in(&cache, &root).expect_err("tampered tarball should fail");
+
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("sha256 mismatch") || msg.contains("tampered"),
+            "error names the tampering: {msg}"
+        );
     }
 }
