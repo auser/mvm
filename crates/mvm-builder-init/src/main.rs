@@ -120,13 +120,139 @@ fn virtiofs_tag_is_read_only(tag: &str) -> bool {
     tag == "work"
 }
 
+/// Bytes from the start of the ext4 superblock that the host-side
+/// geometry check reads. The high-32 bits of `s_blocks_count` live
+/// at superblock offset `0x150` (336), so 512 is the smallest
+/// power-of-two read covering every field the parser inspects.
+#[cfg(any(target_os = "linux", test))]
+const EXT4_SUPERBLOCK_READ: usize = 512;
+
+/// Parse the ext4 superblock buffer and return the total
+/// filesystem size in bytes the superblock asserts, or `None`
+/// when the buffer has no valid ext4 magic / a sanity-failing
+/// block size.
+///
+/// Layout (little-endian; offsets relative to the start of the
+/// superblock — itself at byte offset 1024 of the partition):
+/// - `0x04`  u32 `s_blocks_count_lo`  — low 32 bits of total block count
+/// - `0x18`  u32 `s_log_block_size`   — block size = `1024 << this`
+/// - `0x38`  u16 `s_magic`            — `0xEF53` for ext{2,3,4}
+/// - `0x150` u32 `s_blocks_count_hi`  — high 32 bits (64-bit feature; 0 otherwise)
+///
+/// Pure function so darwin `cargo test` exercises it without a
+/// Linux cross-compile; the file-IO and `BLKGETSIZE64` ioctl that
+/// feed it live inside the linux module.
+#[cfg(any(target_os = "linux", test))]
+fn parse_ext4_recorded_size_bytes(sb: &[u8]) -> Option<u64> {
+    if sb.len() < 0x150 + 4 {
+        return None;
+    }
+    // Magic at 0x38 — guard before trusting the other fields.
+    if sb[0x38] != 0x53 || sb[0x39] != 0xEF {
+        return None;
+    }
+    let blocks_lo = u32::from_le_bytes(sb[0x04..0x08].try_into().ok()?);
+    let log_block_size = u32::from_le_bytes(sb[0x18..0x1c].try_into().ok()?);
+    let blocks_hi = u32::from_le_bytes(sb[0x150..0x154].try_into().ok()?);
+    // Reject absurd block sizes — ext4 spec allows 1 KiB..64 KiB
+    // (log values 0..=6). Anything higher signals a malformed or
+    // stale superblock; treat as unformatted.
+    if log_block_size > 6 {
+        return None;
+    }
+    let block_size = 1024u64 << log_block_size;
+    let total_blocks = (u64::from(blocks_hi) << 32) | u64::from(blocks_lo);
+    total_blocks.checked_mul(block_size)
+}
+
 #[cfg(test)]
 mod tests {
+    use super::*;
+
     #[test]
     fn virtiofs_tag_policy_keeps_only_workspace_read_only() {
-        assert!(super::virtiofs_tag_is_read_only("work"));
-        assert!(!super::virtiofs_tag_is_read_only("out"));
-        assert!(!super::virtiofs_tag_is_read_only("job"));
+        assert!(virtiofs_tag_is_read_only("work"));
+        assert!(!virtiofs_tag_is_read_only("out"));
+        assert!(!virtiofs_tag_is_read_only("job"));
+    }
+
+    /// Build a synthetic ext4 superblock buffer (just the fields
+    /// `parse_ext4_recorded_size_bytes` reads).
+    fn synth_sb(blocks_lo: u32, blocks_hi: u32, log_block_size: u32) -> Vec<u8> {
+        let mut sb = vec![0u8; EXT4_SUPERBLOCK_READ];
+        sb[0x04..0x08].copy_from_slice(&blocks_lo.to_le_bytes());
+        sb[0x18..0x1c].copy_from_slice(&log_block_size.to_le_bytes());
+        sb[0x38] = 0x53;
+        sb[0x39] = 0xEF;
+        sb[0x150..0x154].copy_from_slice(&blocks_hi.to_le_bytes());
+        sb
+    }
+
+    #[test]
+    fn parse_ext4_size_rejects_buffer_without_magic() {
+        let sb = vec![0u8; EXT4_SUPERBLOCK_READ];
+        assert_eq!(parse_ext4_recorded_size_bytes(&sb), None);
+    }
+
+    #[test]
+    fn parse_ext4_size_rejects_short_buffer() {
+        let sb = vec![0u8; 64];
+        assert_eq!(parse_ext4_recorded_size_bytes(&sb), None);
+    }
+
+    #[test]
+    fn parse_ext4_size_computes_64gib_default_layout() {
+        // mkfs.ext4 default: 4 KiB blocks (log=2). A 64 GiB
+        // filesystem records 16_777_216 blocks.
+        let sb = synth_sb(16_777_216, 0, 2);
+        assert_eq!(
+            parse_ext4_recorded_size_bytes(&sb),
+            Some(64u64 * 1024 * 1024 * 1024),
+        );
+    }
+
+    #[test]
+    fn parse_ext4_size_handles_64bit_feature() {
+        // 20 TiB needs the high-32-bit block count (64bit feature).
+        // 20 TiB with 4 KiB blocks = 20 * 2^40 / 2^12 = 5 * 2^30
+        // blocks, which overflows u32 — `blocks_hi` carries the top bit.
+        let total_blocks: u64 = 5 * (1u64 << 30);
+        let blocks_lo = (total_blocks & 0xFFFF_FFFF) as u32;
+        let blocks_hi = (total_blocks >> 32) as u32;
+        let sb = synth_sb(blocks_lo, blocks_hi, 2);
+        assert_eq!(
+            parse_ext4_recorded_size_bytes(&sb),
+            Some(20u64 * 1024 * 1024 * 1024 * 1024),
+        );
+    }
+
+    #[test]
+    fn parse_ext4_size_rejects_absurd_block_size() {
+        // log=7 → 128 KiB blocks, which mkfs.ext4 never produces;
+        // signals a stale / corrupt superblock.
+        let sb = synth_sb(1024, 0, 7);
+        assert_eq!(parse_ext4_recorded_size_bytes(&sb), None);
+    }
+
+    /// Regression for the May 2026 `mvmctl dev up` failure: a
+    /// stale 64 GiB ext4 image got re-attached to a `/dev/vdb`
+    /// libkrun exposed as 64 GiB − 64 KiB. The kernel rejected
+    /// mount with `EINVAL: bad geometry: block count 16777216
+    /// exceeds size of device (16777200 blocks)`. The pre-mount
+    /// check in [`linux::nix_store_dev_needs_format`] compares
+    /// the recorded FS size against the device size and reformats
+    /// on mismatch; this test pins the underlying arithmetic so
+    /// the comparison `fs_bytes > device_bytes` does what the
+    /// kernel does.
+    #[test]
+    fn parse_ext4_size_reports_oversize_filesystem() {
+        let fs_bytes = parse_ext4_recorded_size_bytes(&synth_sb(16_777_216, 0, 2))
+            .expect("valid superblock");
+        let device_bytes = 16_777_200u64 * 4096; // 64 GiB - 64 KiB
+        assert!(
+            fs_bytes > device_bytes,
+            "recorded FS ({fs_bytes}) must exceed device ({device_bytes}) for the bug to reproduce"
+        );
     }
 }
 
@@ -1250,8 +1376,8 @@ mod linux {
     fn setup_nix_store(timings: &Arc<Mutex<BootTimings>>, anchor: Instant) -> Result<(), String> {
         std::fs::create_dir_all(NIX_STORE_MOUNT)
             .map_err(|e| format!("create {NIX_STORE_MOUNT}: {e}"))?;
-        if !is_ext4_formatted(NIX_STORE_DEV)? {
-            eprintln!("mvm-builder-init: formatting {NIX_STORE_DEV} (first boot)");
+        if let Some(reason) = nix_store_dev_needs_format(NIX_STORE_DEV)? {
+            eprintln!("mvm-builder-init: formatting {NIX_STORE_DEV} ({reason})");
             format_ext4(NIX_STORE_DEV)?;
         }
         mount_fs(NIX_STORE_DEV, NIX_STORE_MOUNT, "ext4")?;
@@ -1788,23 +1914,30 @@ mod linux {
         bind_mount(NIX_OVERLAY_MERGED, NIX_TARGET)
     }
 
-    fn seed_nix_store(timings: &Arc<Mutex<BootTimings>>, anchor: Instant) -> Result<(), String> {
-        let needs_seed = match std::fs::read_dir(NIX_STORE_MOUNT) {
-            Ok(entries) => {
-                let mut any_non_lf = false;
-                for entry in entries {
-                    if let Ok(entry) = entry
-                        && entry.file_name() != "lost+found"
-                    {
-                        any_non_lf = true;
-                        break;
-                    }
-                }
-                !any_non_lf
-            }
+    /// Returns true when the persistent Nix store at `path` has not
+    /// yet been seeded from the rootfs's `/nix`.
+    ///
+    /// The seeded marker is a non-empty `store/` subdirectory. mkGuest
+    /// always populates `/nix/store/HASH-*` in the rootfs, so any
+    /// successful seed leaves `store/` non-empty in `/nix-store`.
+    ///
+    /// The previous "any entry other than lost+found" heuristic
+    /// false-positived once [`mount_nix_overlay`] had pre-created
+    /// `upper/` and `work/` on a freshly-formatted volume: an
+    /// overlay-mount failure would route through `seed_nix_store`,
+    /// the seed would be skipped (upper/ and work/ counted as "not
+    /// lost+found"), and the subsequent bind-mount put an empty
+    /// `/nix-store` over `/nix` — every `/sbin/<pkg>` symlink
+    /// dangled and the first spawn failed with `ENOENT`.
+    fn nix_store_needs_seed(path: &Path) -> bool {
+        match std::fs::read_dir(path.join("store")) {
+            Ok(mut entries) => entries.next().is_none(),
             Err(_) => true,
-        };
-        if !needs_seed {
+        }
+    }
+
+    fn seed_nix_store(timings: &Arc<Mutex<BootTimings>>, anchor: Instant) -> Result<(), String> {
+        if !nix_store_needs_seed(Path::new(NIX_STORE_MOUNT)) {
             return Ok(());
         }
 
@@ -1858,24 +1991,81 @@ mod linux {
         .map_err(|e| format!("mount virtiofs {tag} -> {target}: {e}"))
     }
 
-    /// Probe the ext4 magic at offset 0x438 (the superblock's
-    /// `s_magic` field). Returns `Ok(false)` for a blank disk;
-    /// `Ok(true)` for a formatted one; `Err` only when the device
-    /// itself isn't readable (which is fatal — we couldn't mount
-    /// it anyway).
-    fn is_ext4_formatted(dev: &str) -> Result<bool, String> {
+    /// Offset of the ext4 primary superblock inside the partition
+    /// (`SUPERBLOCK_OFFSET` in fs/ext4/ext4.h).
+    const EXT4_SUPERBLOCK_OFFSET: u64 = 1024;
+
+    /// Decide whether `/dev/vdb` needs (re)formatting before
+    /// mounting. Returns `Some(reason)` on first boot (no ext4
+    /// magic) and on stale-geometry mismatches where the recorded
+    /// filesystem extends past the actual block-device end. Such
+    /// volumes mount with `EINVAL` in the kernel:
+    ///
+    /// ```text
+    /// EXT4-fs (vdb): bad geometry: block count <fs> exceeds
+    ///                 size of device (<dev> blocks)
+    /// ```
+    ///
+    /// Detected pre-mount so we can recover with `mkfs.ext4 -F`
+    /// rather than aborting before the build can run. The
+    /// `/nix-store` volume is a cache; reformatting loses nothing
+    /// that can't be rebuilt by the next nix build.
+    fn nix_store_dev_needs_format(dev: &str) -> Result<Option<String>, String> {
+        let sb = read_ext4_superblock(dev)?;
+        let Some(fs_bytes) = crate::parse_ext4_recorded_size_bytes(&sb) else {
+            return Ok(Some("no ext4 superblock".into()));
+        };
+        let dev_bytes = block_device_size_bytes(dev)?;
+        if fs_bytes > dev_bytes {
+            return Ok(Some(format!(
+                "ext4 records {fs_bytes} bytes but device exposes {dev_bytes} bytes"
+            )));
+        }
+        Ok(None)
+    }
+
+    /// Read the first [`crate::EXT4_SUPERBLOCK_READ`] bytes of the
+    /// superblock from `dev`. Returns a short buffer (truncated to
+    /// the actual byte count read) when the device is too small —
+    /// the parser treats short reads as "no ext4".
+    fn read_ext4_superblock(dev: &str) -> Result<Vec<u8>, String> {
         use std::fs::File;
         use std::io::{Read, Seek, SeekFrom};
         let mut f = File::open(dev).map_err(|e| format!("open {dev}: {e}"))?;
-        if f.seek(SeekFrom::Start(1080)).is_err() {
-            return Ok(false);
+        f.seek(SeekFrom::Start(EXT4_SUPERBLOCK_OFFSET))
+            .map_err(|e| format!("seek superblock on {dev}: {e}"))?;
+        let mut buf = vec![0u8; crate::EXT4_SUPERBLOCK_READ];
+        let mut read = 0;
+        while read < buf.len() {
+            match f.read(&mut buf[read..]) {
+                Ok(0) => break,
+                Ok(n) => read += n,
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("read superblock on {dev}: {e}")),
+            }
         }
-        let mut buf = [0u8; 2];
-        if f.read_exact(&mut buf).is_err() {
-            return Ok(false);
-        }
-        // ext4 magic: 0xEF53 stored little-endian.
-        Ok(buf == [0x53, 0xEF])
+        buf.truncate(read);
+        Ok(buf)
+    }
+
+    // BLKGETSIZE64 = _IOR(0x12, 114, size_t). `nix::ioctl_read!`
+    // generates the same `(2<<30) | (size_of::<u64>()<<16) | (0x12<<8) | 114`
+    // request value (`0x80081272` on 64-bit Linux) used by util-linux.
+    nix::ioctl_read!(blkgetsize64, 0x12, 114, u64);
+
+    /// Query a block device's size in bytes via `BLKGETSIZE64`.
+    /// Linux block devices only — regular files return EINVAL, which
+    /// is fine: `/nix-store-<arch>.img` is always attached as a
+    /// virtio-blk device inside the builder VM.
+    fn block_device_size_bytes(dev: &str) -> Result<u64, String> {
+        use std::os::unix::io::AsRawFd;
+        let f = std::fs::File::open(dev).map_err(|e| format!("open {dev}: {e}"))?;
+        let mut size: u64 = 0;
+        // SAFETY: `blkgetsize64` writes a single u64. `f` outlives the
+        // call; the fd is valid for the duration.
+        unsafe { blkgetsize64(f.as_raw_fd(), &mut size as *mut u64) }
+            .map_err(|e| format!("ioctl BLKGETSIZE64 on {dev}: {e}"))?;
+        Ok(size)
     }
 
     /// Return the device size in 4 KiB blocks via
@@ -2340,6 +2530,51 @@ mod linux {
             let meta = std::fs::metadata(base.path().join(job_id)).expect("stat");
             assert_eq!(meta.uid(), uid);
             assert_eq!(meta.gid(), gid);
+        }
+
+        #[test]
+        fn nix_store_needs_seed_when_path_missing() {
+            let base = tempfile::tempdir().expect("tempdir");
+            assert!(nix_store_needs_seed(&base.path().join("does-not-exist")));
+        }
+
+        #[test]
+        fn nix_store_needs_seed_when_store_dir_absent() {
+            let base = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(base.path().join("lost+found")).expect("create lost+found");
+            assert!(nix_store_needs_seed(base.path()));
+        }
+
+        /// Regression: `mount_nix_overlay` pre-creates `upper/` and
+        /// `work/` before attempting the overlay mount. If that mount
+        /// fails, the fallback path used to see the volume as "already
+        /// seeded" (any non-`lost+found` entry counted) and skip the
+        /// copy, leaving `/nix` empty after bind-mount. The corrected
+        /// check looks at `store/` instead, so overlay scaffolding
+        /// does not confuse the seeder.
+        #[test]
+        fn nix_store_needs_seed_when_only_overlay_scaffolding_present() {
+            let base = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(base.path().join("upper")).expect("create upper");
+            std::fs::create_dir(base.path().join("work")).expect("create work");
+            std::fs::create_dir(base.path().join("lost+found")).expect("create lost+found");
+            assert!(nix_store_needs_seed(base.path()));
+        }
+
+        #[test]
+        fn nix_store_needs_seed_when_store_dir_is_empty() {
+            let base = tempfile::tempdir().expect("tempdir");
+            std::fs::create_dir(base.path().join("store")).expect("create store");
+            assert!(nix_store_needs_seed(base.path()));
+        }
+
+        #[test]
+        fn nix_store_does_not_need_seed_when_store_has_entries() {
+            let base = tempfile::tempdir().expect("tempdir");
+            let store = base.path().join("store");
+            std::fs::create_dir(&store).expect("create store");
+            std::fs::create_dir(store.join("abc123-some-pkg")).expect("create closure path");
+            assert!(!nix_store_needs_seed(base.path()));
         }
     }
 }
