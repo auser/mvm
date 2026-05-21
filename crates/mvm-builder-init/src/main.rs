@@ -246,8 +246,8 @@ mod tests {
     /// kernel does.
     #[test]
     fn parse_ext4_size_reports_oversize_filesystem() {
-        let fs_bytes = parse_ext4_recorded_size_bytes(&synth_sb(16_777_216, 0, 2))
-            .expect("valid superblock");
+        let fs_bytes =
+            parse_ext4_recorded_size_bytes(&synth_sb(16_777_216, 0, 2)).expect("valid superblock");
         let device_bytes = 16_777_200u64 * 4096; // 64 GiB - 64 KiB
         assert!(
             fs_bytes > device_bytes,
