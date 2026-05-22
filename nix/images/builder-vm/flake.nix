@@ -281,6 +281,16 @@
         in
         (libFor { inherit system; }).mkGuest {
           name = "mvm-builder-vm";
+          # Skip the addon-dns bake. The builder VM's PID 1 is
+          # `mvm-builder-init` (set via `extraFiles` + the
+          # `init=/sbin/mvm-builder-init` kernel cmdline), so
+          # mkGuest's initScript-side addon-dns activation block
+          # never runs and the binary would just sit unused at
+          # /usr/local/bin/mvm-addon-dns. The win is in Stage 0:
+          # not building `mvm-addon-dns` removes a parallel rustc
+          # run that competed with the kernel compile and pushed
+          # the tmpfs-bound build into OOM territory.
+          bakeAddonDns = false;
           # mkGuest requires an entrypoint declaration. At runtime
           # the kernel cmdline sets `init=/sbin/mvm-builder-init`,
           # so mkGuest's entrypoint is vestigial — but we still
