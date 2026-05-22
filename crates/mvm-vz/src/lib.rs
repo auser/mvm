@@ -70,6 +70,73 @@ pub struct SupervisorConfig {
     /// pause/resume/balloon/snapshot verbs on `VzBackend` short-circuit.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub control_socket_path: Option<String>,
+    /// Plan 97 Phase E follow-up — supervisor startup mode.
+    /// Defaults to [`StartupMode::Boot`] (kernel + cmdline + start),
+    /// which preserves the original boot path. [`StartupMode::Restore`]
+    /// asks the supervisor to call
+    /// `VZVirtualMachine.restoreMachineState(from:)` instead of
+    /// `start`, then `resume()`. The boot loader on the VZ
+    /// configuration is omitted in restore mode (Apple's API rejects
+    /// a configured boot loader on restore).
+    #[serde(default, skip_serializing_if = "StartupMode::is_default")]
+    pub startup_mode: StartupMode,
+}
+
+/// How the supervisor brings the VM up.
+///
+/// Plan 97 Phase E §"RESTORE supervisor startup mode". The Swift
+/// supervisor branches on this tagged enum: [`Boot`] is the original
+/// kernel-and-cmdline path; [`Restore`] loads the VM state from a
+/// previously saved snapshot blob (macOS 14+).
+///
+/// Default is [`Boot`] so old JSON corpora without this field keep
+/// the original behaviour, which lets the Phase E fuzz corpus stay
+/// valid and lets every caller that doesn't care about restore
+/// (almost everyone) skip the field.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(tag = "kind", rename_all = "snake_case", deny_unknown_fields)]
+pub enum StartupMode {
+    /// Original direct-kernel boot — construct a `VZLinuxBootLoader`
+    /// from `kernel.path` / `kernel.cmdline` and call `start()`.
+    #[default]
+    Boot,
+    /// Restore from a previously saved Vz machine-state file. The
+    /// supervisor:
+    ///
+    /// 1. Constructs a [`VZVirtualMachineConfiguration`] from the
+    ///    same disks / cpu / memory / vsock / network / balloon
+    ///    fields a `Boot` mode would, **omitting** the boot loader.
+    /// 2. If `machine_id_path` is set and the sidecar exists, parses
+    ///    the file's bytes as a `VZGenericMachineIdentifier` and
+    ///    applies it to the platform configuration so the restored
+    ///    guest preserves its prior identity (systemd machine-id,
+    ///    boot-id continuity).
+    /// 3. Calls `restoreMachineState(from: snapshot_path)`. On
+    ///    success the VM is paused; the supervisor then calls
+    ///    `resume()` so it begins executing from the saved state.
+    ///
+    /// `snapshot_path` must be absolute (the Vz API does not honour
+    /// cwd). `machine_id_path` is optional; on miss the supervisor
+    /// falls back to a fresh `VZGenericMachineIdentifier()` which
+    /// boots correctly but loses guest-side identity continuity.
+    Restore {
+        /// Absolute path to the saved-state blob (produced by a prior
+        /// `SAVE` control-socket command on macOS 14+).
+        snapshot_path: String,
+        /// Optional absolute path to the matching machine-identifier
+        /// sidecar (`<snapshot_path>.machine-id`) written by SAVE.
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        machine_id_path: Option<String>,
+    },
+}
+
+impl StartupMode {
+    /// `true` when this is the default `Boot` variant. Used by
+    /// `skip_serializing_if` so the field is omitted from JSON for
+    /// every caller that isn't restoring.
+    pub fn is_default(&self) -> bool {
+        matches!(self, StartupMode::Boot)
+    }
 }
 
 impl SupervisorConfig {
@@ -324,6 +391,7 @@ mod tests {
             network: None,
             balloon: None,
             control_socket_path: None,
+            startup_mode: StartupMode::Boot,
         }
     }
 
@@ -350,6 +418,54 @@ mod tests {
         assert!(
             err.to_string().contains("rogue"),
             "error mentions the unknown field: {err}"
+        );
+    }
+
+    #[test]
+    fn startup_mode_defaults_to_boot_when_absent_in_json() {
+        // Backward-compat — pre-RESTORE corpora omit the field. The
+        // strict-keys decoder still accepts the JSON; the Rust side
+        // fills in Boot.
+        let mut value = serde_json::to_value(minimal_config()).unwrap();
+        value.as_object_mut().unwrap().remove("startup_mode");
+        let json = serde_json::to_string(&value).unwrap();
+        let back: SupervisorConfig = serde_json::from_str(&json).expect("decode without field");
+        assert!(matches!(back.startup_mode, StartupMode::Boot));
+    }
+
+    #[test]
+    fn startup_mode_restore_roundtrip_carries_paths() {
+        let mut cfg = minimal_config();
+        cfg.startup_mode = StartupMode::Restore {
+            snapshot_path: "/abs/path/snap.vzsnap".into(),
+            machine_id_path: Some("/abs/path/snap.vzsnap.machine-id".into()),
+        };
+        let json = cfg.to_json().expect("serialize");
+        let back: SupervisorConfig = serde_json::from_str(&json).expect("roundtrip parses");
+        match back.startup_mode {
+            StartupMode::Restore {
+                snapshot_path,
+                machine_id_path,
+            } => {
+                assert_eq!(snapshot_path, "/abs/path/snap.vzsnap");
+                assert_eq!(
+                    machine_id_path.as_deref(),
+                    Some("/abs/path/snap.vzsnap.machine-id")
+                );
+            }
+            _ => panic!("expected Restore variant, got {:?}", back.startup_mode),
+        }
+    }
+
+    #[test]
+    fn startup_mode_default_is_omitted_in_serialized_json() {
+        // skip_serializing_if keeps Boot out of the wire payload —
+        // existing fuzz corpora stay byte-identical.
+        let cfg = minimal_config();
+        let json = cfg.to_json().expect("serialize");
+        assert!(
+            !json.contains("startup_mode"),
+            "Boot default should not appear in JSON: {json}"
         );
     }
 

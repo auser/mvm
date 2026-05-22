@@ -31,11 +31,15 @@ struct SupervisorConfig: Decodable, StrictKeys {
     let network: NetworkConfig?
     let balloon: BalloonConfig?
     let controlSocketPath: String?
+    /// Plan 97 Phase E follow-up — supervisor startup mode. Defaults
+    /// to `.boot` when absent so existing Boot-only JSON callers
+    /// don't need to change.
+    let startupMode: StartupMode
 
     static let knownKeys: Set<String> = [
         "name", "vm_state_dir", "pid_file_name", "kernel", "resources",
         "disks", "virtio_fs", "vsock", "console_output_path", "network",
-        "balloon", "control_socket_path",
+        "balloon", "control_socket_path", "startup_mode",
     ]
 
     enum CodingKeys: String, CodingKey {
@@ -51,6 +55,7 @@ struct SupervisorConfig: Decodable, StrictKeys {
         case network
         case balloon
         case controlSocketPath = "control_socket_path"
+        case startupMode = "startup_mode"
     }
 
     init(from decoder: Decoder) throws {
@@ -68,11 +73,50 @@ struct SupervisorConfig: Decodable, StrictKeys {
         self.network = try c.decodeIfPresent(NetworkConfig.self, forKey: .network)
         self.balloon = try c.decodeIfPresent(BalloonConfig.self, forKey: .balloon)
         self.controlSocketPath = try c.decodeIfPresent(String.self, forKey: .controlSocketPath)
+        self.startupMode =
+            try c.decodeIfPresent(StartupMode.self, forKey: .startupMode) ?? .boot
     }
 
     var resolvedPidFile: URL {
         URL(fileURLWithPath: vmStateDir)
             .appendingPathComponent(pidFileName ?? "vz.pid")
+    }
+}
+
+/// Plan 97 Phase E — supervisor startup mode. Mirrors the Rust
+/// `mvm_vz::StartupMode` tagged enum: JSON looks like
+/// `{"kind":"boot"}` or
+/// `{"kind":"restore","snapshot_path":"/abs/path","machine_id_path":"..."}`.
+/// Strict-keys enforced; unknown keys cause a decode error.
+enum StartupMode: Decodable {
+    case boot
+    case restore(snapshotPath: String, machineIdPath: String?)
+
+    enum Kind: String, Decodable {
+        case boot
+        case restore
+    }
+
+    enum CodingKeys: String, CodingKey {
+        case kind
+        case snapshotPath = "snapshot_path"
+        case machineIdPath = "machine_id_path"
+    }
+
+    static let knownKeys: Set<String> = ["kind", "snapshot_path", "machine_id_path"]
+
+    init(from decoder: Decoder) throws {
+        try checkStrictKeys(decoder: decoder, knownKeys: Self.knownKeys)
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        let kind = try c.decode(Kind.self, forKey: .kind)
+        switch kind {
+        case .boot:
+            self = .boot
+        case .restore:
+            let snapshot = try c.decode(String.self, forKey: .snapshotPath)
+            let machineId = try c.decodeIfPresent(String.self, forKey: .machineIdPath)
+            self = .restore(snapshotPath: snapshot, machineIdPath: machineId)
+        }
     }
 }
 
