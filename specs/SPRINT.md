@@ -1789,8 +1789,9 @@ don't fall off.
 - ✅ [`plans/88-gvproxy-macos-backend.md`](plans/88-gvproxy-macos-backend.md) — virtio-net via gvproxy on macOS.
 - ✅ [`plans/89-persistent-builder-vm.md`](plans/89-persistent-builder-vm.md) — persistent builder VM (multiple W3 PRs landed).
 - ✅ [`plans/90-gateway-frame-fuzz.md`](plans/90-gateway-frame-fuzz.md) — fuzz coverage for the gateway frame parsers.
-- 🟡 [`plans/91-...`](plans/) — Alpine Stage 0 bootstrap (PR #417 open).
+- 🟡 [`plans/91-stage0-alpine-bootstrap.md`](plans/91-stage0-alpine-bootstrap.md) — Alpine Stage 0 bootstrap (PR #417 open).
 - 🟡 [`plans/92-minimal-builder-vm-kernel.md`](plans/92-minimal-builder-vm-kernel.md) — slim custom kernel via `linuxManualConfig` + `tinyconfig` (committed locally on `worktree-plan-92-stock-kernel`; carried forward by Plan 95's PR).
+- 📝 [`plans/93-fast-secure-dev-path-followups.md`](plans/93-fast-secure-dev-path-followups.md) — **post-Plan-91 follow-ups, planning only.** Phase 0 (PR-A): fingerprint correctness fix in `builder_vm_source_fingerprint` — a shipping security gap independent of Plan 91. Phase 1: fast Layer 2 dev cycles (lazy/split dev shell + cross-compile our crates on host + lazy in-VM nix fetch). Phase 2: sub-200 ms runtime microvm launch (kernel/initrd minimisation, agent-startup parallelism, warm-pool of pre-spawned libkrun supervisors). Phase 3: DX polish (`mvmctl doctor` enrichment, `cache info`, progress UI, public docs, CI reproducibility lane). Targets: sub-30 s warm `mvmctl dev up`, sub-200 ms cold microvm launch, no LONG dev cycles. Not yet started — saved to track direction.
 - 🟡 [`plans/95-builder-vm-kernel-slimming.md`](plans/95-builder-vm-kernel-slimming.md) — **Plan 92 followup.** Aggressive ARM64 SoC platform cluster disables (W3) + permanent `kernel-configfile` flake output for audit (W2). Lands as one PR carrying Plan 92's base commits forward. (W1 "drop microvm.nix input" was dropped post-survey — `nix/lib/` still requires it.)
 
 ### Sprint 54 success criteria
