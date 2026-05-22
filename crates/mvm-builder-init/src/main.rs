@@ -290,6 +290,22 @@ mod linux {
     /// lowerdir; persistent writes land in [`NIX_OVERLAY_UPPER`].
     const NIX_TARGET: &str = "/nix";
 
+    /// Standard nixpkgs path-registration manifest, emitted by
+    /// `nixos/lib/make-ext4-fs.nix` (which mkGuest uses). Lists
+    /// every store path baked into the rootfs along with its
+    /// SHA-256, size, and references — exactly the wire shape
+    /// `nix-store --load-db` consumes from stdin. Sits at the
+    /// rootfs root (not under `/nix/`) and is mounted read-only.
+    const NIX_PATH_REGISTRATION: &str = "/nix-path-registration";
+
+    /// Sentinel file inside the persistent `/nix-store` we touch
+    /// after [`load_seeded_nix_db`] runs, so subsequent boots can
+    /// skip the (idempotent but slow) re-registration. Lives next
+    /// to `/nix-store/store/` and `/nix-store/var/` — neither path
+    /// the standard Nix store inspects, so the marker is invisible
+    /// to nix-daemon.
+    const NIX_DB_LOADED_MARKER: &str = "/nix-store/.seed-db-loaded";
+
     /// Per-job command staging dir (`/job/cmd.sh`, `/job/env`,
     /// `/job/result`). Mounted via virtio-fs from the host
     /// (`LibkrunBuilderVm` declares the `job` tag — see Plan 72 W4).
@@ -1412,6 +1428,21 @@ mod linux {
             t.nix_mounted_ms = Some(BootTimings::ms_since(anchor))
         });
 
+        // PR #420 follow-up: load `/nix-path-registration` (the
+        // standard `make-ext4-fs.nix` manifest) into the persistent
+        // `/nix/var/nix/db` so the in-VM `nix build` knows the
+        // seeded closure is already valid. Without this, nix-daemon
+        // treats every seeded path as missing and re-substitutes
+        // from `cache.nixos.org` — the substituter then overwrites
+        // the on-disk path during the rename window, and concurrent
+        // build-hook workers `dlopen`ing libs from the same path
+        // hit ENOENT. Idempotent + non-fatal so a missing or
+        // unparseable manifest still boots — at most regresses to
+        // the pre-fix substituter race.
+        if let Err(e) = load_seeded_nix_db(timings, anchor) {
+            eprintln!("mvm-builder-init: load_seeded_nix_db warning (non-fatal): {e}");
+        }
+
         Ok(())
     }
 
@@ -1971,6 +2002,72 @@ mod linux {
         }
         stamp(timings, |t| {
             t.nix_seeded_ms = Some(BootTimings::ms_since(anchor))
+        });
+        Ok(())
+    }
+
+    /// Register the seeded store paths in the persistent
+    /// `/nix/var/nix/db` so nix-daemon doesn't treat them as
+    /// missing and re-substitute over the on-disk copies.
+    ///
+    /// Reads the standard nixpkgs manifest at
+    /// [`NIX_PATH_REGISTRATION`] (emitted by
+    /// `nixos/lib/make-ext4-fs.nix`) and pipes it to
+    /// `nix-store --load-db`. Marked done with a sentinel at
+    /// [`NIX_DB_LOADED_MARKER`] so subsequent boots skip the
+    /// (idempotent but ~100ms) re-registration.
+    ///
+    /// The need for this call surfaced as `libboost_url.so.1.87.0:
+    /// cannot open shared object file` during the in-VM dev-image
+    /// build: with no entries in the DB, every closure path the
+    /// build references gets re-fetched from `cache.nixos.org`,
+    /// overwriting the seeded path in place — and a concurrent
+    /// nix build-hook worker mid-`dlopen` of the same path's libs
+    /// hits ENOENT during the rename window. Loading the DB makes
+    /// the substituter skip the re-fetch entirely.
+    fn load_seeded_nix_db(
+        timings: &Arc<Mutex<BootTimings>>,
+        anchor: Instant,
+    ) -> Result<(), String> {
+        if Path::new(NIX_DB_LOADED_MARKER).exists() {
+            return Ok(());
+        }
+        if !Path::new(NIX_PATH_REGISTRATION).is_file() {
+            return Err(format!(
+                "{NIX_PATH_REGISTRATION} not present — rootfs predates the \
+                 make-ext4-fs.nix manifest convention; substituter race \
+                 will recur"
+            ));
+        }
+
+        eprintln!(
+            "mvm-builder-init: loading seeded paths into nix DB from {NIX_PATH_REGISTRATION}"
+        );
+        let manifest = std::fs::File::open(NIX_PATH_REGISTRATION)
+            .map_err(|e| format!("open {NIX_PATH_REGISTRATION}: {e}"))?;
+        let status = Command::new("/sbin/nix-store")
+            .arg("--load-db")
+            .stdin(manifest)
+            .status()
+            .map_err(|e| format!("spawn /sbin/nix-store --load-db: {e}"))?;
+        if !status.success() {
+            return Err(format!(
+                "nix-store --load-db exit {}",
+                status.code().unwrap_or(-1)
+            ));
+        }
+
+        // Best-effort sentinel so we skip on next boot. Failure is
+        // non-fatal — worst case we re-run the idempotent load.
+        if let Err(e) = std::fs::write(NIX_DB_LOADED_MARKER, b"") {
+            eprintln!(
+                "mvm-builder-init: could not write {NIX_DB_LOADED_MARKER}: {e} \
+                 (continuing — next boot will re-load the DB)"
+            );
+        }
+
+        stamp(timings, |t| {
+            t.nix_db_loaded_ms = Some(BootTimings::ms_since(anchor))
         });
         Ok(())
     }

@@ -47,6 +47,7 @@ fn spawn_vsock_response_listener_decodes_guest_response() {
             nix_device_ready_ms: Some(15),
             nix_seeded_ms: None,
             nix_mounted_ms: Some(180),
+            nix_db_loaded_ms: Some(185),
             modules_ready_ms: Some(25),
             virtiofs_ready_ms: Some(35),
             network_ready_ms: Some(190),
