@@ -1827,6 +1827,114 @@ Discovered while running `cargo test --workspace --all-features` to gate the dev
 2. `mvm-cli::commands::env::apple_container::dev_status_image_tests::builder_cache_status_reports_source_provenance_drift` — fixture panics with `builder VM source fingerprint missing /var/folders/.../Cargo.lock`. Caused by `155b561f` (PR #422) expanding the fingerprint to require a `Cargo.lock` in the workspace root, but this test fixture builds an isolated temp flake dir without one. Fix: stage an empty `Cargo.lock` (or copy the workspace one) into the fixture's temp workspace root before invoking the fingerprint code.
 3. `mvm-cli::commands::env::apple_container::dev_status_image_tests::builder_cache_status_reports_source_cache_hit_without_paths` — identical cause as (2).
 
+## Sprint 55 — `Virtualization.framework` backend (`vz`) — IN FLIGHT  [`plans/97-vz-backend.md`](plans/97-vz-backend.md)
+
+Adds a fourth macOS hypervisor backend (`vz`) parallel to libkrun and
+Apple Container, using Apple's `Virtualization.framework` directly via
+a small Swift supervisor binary. Collapses the nested
+`macOS → libkrun → Firecracker` workload-microVM pipeline into a
+single Vz-hosted Linux VM on macOS 13+, and adds Vz as a builder-VM
+option alongside libkrun. **Additive only** — libkrun stays the macOS
+default, Firecracker stays the Linux default and the production deploy
+default; Vz is opt-in via `MVM_BACKEND=vz` / `--backend vz`.
+
+### Why this sprint
+
+Apple's `Virtualization.framework` has supported Linux guests since
+macOS 11 and exposes virtio-blk / virtio-net / virtio-vsock /
+virtio-console / virtio-rng / virtio-fs natively — exactly the device
+classes our guests already drive. Today, workload microVMs on macOS
+nest Firecracker inside a libkrun-hosted Linux VM because Firecracker
+needs `/dev/kvm`. Vz can host Linux guests directly, so a Vz backend
+collapses the nesting on macOS, adds the macOS 11–25 / Intel coverage
+gap that Apple Container (macOS 26+ ASi) leaves unfilled, and gives us
+balloon + snapshot support on macOS 14+ without changing any guest-side
+code (vsock CID 3 / ports 5252, 10000+, 20000+ remain unchanged).
+
+### Workstream breakdown
+
+- [ ] **Phase A** — `mvm-vz-supervisor` Swift binary (smallest tracer).
+      Reads `SupervisorConfig` JSON on stdin, builds
+      `VZVirtualMachineConfiguration`, boots VM, forwards SIGTERM.
+      Acceptance: `vsock-connect 3:5252` succeeds against the
+      dev-shell image booted under Vz.
+- [ ] **Phase B** — `VzBackend` impl in `crates/mvm-backend/src/vz.rs`,
+      `BackendKind::Vz`, `MVM_BACKEND=vz` opt-in. `auto_select()`
+      **unchanged**. Acceptance:
+      `MVM_BACKEND=vz mvmctl run dev-shell` boots a workload microVM
+      directly on macOS without nested libkrun.
+- [ ] **Phase C** — Vz as a builder-VM backend; `MVM_BUILDER_BACKEND=vz`
+      produces byte-identical rootfs to libkrun-hosted equivalent.
+      Stage 0 audit + cache-prune contract participation.
+- [ ] **Phase D** — `specs/adrs/056-vz-backend.md` lands;
+      ADR-002 backend table updated with Vz row + claim coverage;
+      CI matrix wired for macOS 13.x / current / 26+ builds.
+- [ ] **Phase E** — Snapshot / save-restore on macOS 14+.
+      `mvmctl snapshot save / restore`. Snapshot file SHA-256
+      hash-pinned in the audit chain. `VmCapabilities::snapshots = true`
+      on macOS 14+.
+
+### Cross-cutting
+
+- [ ] Build / distribution / versioning (Swift toolchain in CI,
+      `Package.resolved` pinned, lockstep version with `mvmctl`,
+      source-checkout determinism — no prebuilt download).
+- [ ] Apache-2.0 + MIT dual license on the Swift package.
+- [ ] mvmd backend-enum addition follow-up (cross-repo).
+- [x] Tracking issue for the cataloged **future work — Windows host
+      via WHP** ([#428](https://github.com/tinylabscom/mvm/issues/428);
+      separate initiative, not in this sprint).
+
+### Security claims under Vz
+
+Full audit lives in [`plans/97-vz-backend.md` §"Can we still make all
+nine ADR-002 security claims?"](plans/97-vz-backend.md). Summary:
+seven of nine **inherit unchanged** from existing claim-machinery
+(guest-side / host-side / hypervisor-agnostic). Two require new work
+in this sprint:
+
+- **Claim 5** — Swift `JSONDecoder` strict struct with deny-unknown-fields
+  semantics; Rust-side fuzz target generates the corpus; equivalence
+  test asserts Swift and Rust reject the same inputs.
+- **Claim 8** — `VzBackend::start_with_mode` routes through
+  `mvm_supervisor::admit_for_run`; fail-closed test asserts bypass
+  refuses launch.
+- **Claim 7** *extends* an existing pipeline: Swift binary reproducibly
+  built, SPM `Package.resolved` pinned, no prebuilt download on the
+  contributor source-checkout path.
+
+Additional security items (kernel cmdline lockdown, resource-cap parity,
+console mode lockdown, VM identifier handling, supervisor as a security
+boundary, crash diagnostics, MDM detection) covered in Plan 97
+§"Security considerations" — checkboxes tracked in the plan file.
+
+### Sprint 55 success criteria
+
+- Phase A acceptance: `mvm-vz-supervisor` boots the dev-shell image
+  end-to-end with working vsock to the guest agent.
+- Phase B acceptance: `MVM_BACKEND=vz mvmctl run dev-shell` works on
+  macOS; ≥30% cold-boot wall-time win vs. nested libkrun→Firecracker.
+- Phase C acceptance: `MVM_BUILDER_BACKEND=vz mvmctl build` produces a
+  rootfs whose hash matches the libkrun-built equivalent.
+- ADR-056 landed; ADR-002 backend table updated.
+- Phase E (macOS 14+): `mvmctl snapshot save / restore` round-trips a
+  workload microVM.
+- `cargo test --workspace` + `cargo clippy --workspace -- -D warnings`
+  remain clean with both backends compiled in.
+- `mvmctl doctor` reports claims 1, 2, 3 green on a Vz-backed workload
+  microVM.
+
+### Non-goals (explicit)
+
+- Replacing libkrun as the macOS default.
+- Touching the Linux Firecracker path in any way — it remains the
+  default and the production deploy path.
+- Removing the nested Firecracker-in-libkrun path on macOS (it stays
+  available; Vz is parallel).
+- Vz on Linux (user-confirmed not wanted; Firecracker-direct is better
+  on every dimension that matters).
+- Live VM migration across hosts.
+
 ## Completed Sprints
 
 - [01-foundation.md](sprints/01-foundation.md)
