@@ -1878,9 +1878,50 @@ mod linux {
         Ok(buf == [0x53, 0xEF])
     }
 
+    /// Return the device size in 4 KiB blocks via
+    /// `/sys/class/block/<basename>/size` (which is the canonical
+    /// 512-byte sector count the kernel uses for mount). Used by
+    /// [`format_ext4`] to avoid mkfs.ext4's `BLKGETSIZE64`-rounding
+    /// mismatch under libkrun virtio-blk.
+    fn device_size_4k_blocks(dev: &str) -> Result<u64, String> {
+        let basename = std::path::Path::new(dev)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .ok_or_else(|| format!("device path {dev} has no basename"))?;
+        let sys_path = format!("/sys/class/block/{basename}/size");
+        let sectors_str = std::fs::read_to_string(&sys_path)
+            .map_err(|e| format!("read {sys_path}: {e}"))?;
+        let sectors: u64 = sectors_str
+            .trim()
+            .parse()
+            .map_err(|e| format!("parse {sys_path} = {sectors_str:?}: {e}"))?;
+        // 1 sector = 512 B, 1 4K block = 8 sectors. Floor-divide so
+        // we never claim more blocks than the device actually has.
+        Ok(sectors / 8)
+    }
+
     fn format_ext4(dev: &str) -> Result<(), String> {
+        // Pass an explicit block count instead of letting mkfs.ext4
+        // query the device size. libkrun's virtio-blk and mkfs.ext4
+        // disagree on the device's block count by exactly 16 4K blocks
+        // (64 KiB) — mkfs rounds UP from `BLKGETSIZE64` to a 64 KiB
+        // boundary; the kernel mount path uses the unrounded size.
+        // Without the explicit count, the freshly-mkfs'd filesystem
+        // claims `block count N+16 exceeds size of device (N blocks)`
+        // and the next `mount` fails with EINVAL. Querying the
+        // canonical size from `/sys/class/block/<dev>/size` (always
+        // matches what `mount` uses) and passing `mkfs.ext4 -b 4096
+        // <dev> <count>` short-circuits mkfs's rounding.
+        let blocks_4k = device_size_4k_blocks(dev)?;
         let status = Command::new("/sbin/mkfs.ext4")
-            .args(["-F", "-q", dev])
+            .args([
+                "-F",
+                "-q",
+                "-b",
+                "4096",
+                dev,
+                &blocks_4k.to_string(),
+            ])
             .status()
             .map_err(|e| format!("spawn /sbin/mkfs.ext4: {e}"))?;
         if !status.success() {
