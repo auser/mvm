@@ -177,6 +177,12 @@ fn parse_ext4_recorded_size_bytes(sb: &[u8]) -> Option<u64> {
 /// procfs mount point. The helper itself is cross-platform — symlink
 /// creation works on macOS too — so unit tests run on contributor Macs
 /// in addition to the production Linux build target.
+//
+// Production callers live under `#[cfg(target_os = "linux")]`
+// (`main.rs:1501`), and the unit tests live in `#[cfg(test)] mod tests`;
+// on macOS without `--test` the function would otherwise look dead.
+// Matches the sibling pattern at `parse_ext4_recorded_size_bytes` above.
+#[cfg(any(target_os = "linux", test))]
 pub(crate) fn setup_dev_fd_symlinks(dev_root: &std::path::Path) -> Result<(), String> {
     use std::os::unix::fs::symlink;
     for (link_name, target) in [
