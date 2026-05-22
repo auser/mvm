@@ -67,7 +67,10 @@ Phase B sub-tasks:
 - [ ] Phase B acceptance: `MVM_BACKEND=vz mvmctl run dev-shell` boots
       workload microVM directly on macOS without nested libkrun
 - [ ] Hypervisor.framework concurrent-VM cap probe + clear error class
-- [ ] `mvmctl doctor` Vz availability/entitlement/MDM-policy check
+- [x] `mvmctl doctor` Vz availability check (entitlement / MDM-policy
+      sub-probes pending — current check reports framework
+      availability + supervisor-binary presence across the
+      env-override / source-checkout / installed paths)
 
 Phase C sub-tasks:
 
