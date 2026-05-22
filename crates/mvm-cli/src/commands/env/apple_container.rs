@@ -3256,17 +3256,31 @@ pub(in crate::commands) struct ReapOutcome {
 /// (Plan 95 doc §Follow-ups FU-2/FU-3 cover the "prevent" side; this
 /// is the "clean up after the fact" side — FU-1).
 ///
-/// Walks each `~/.cache/mvm/builder-vm/vms/<id>/` dir and inspects its
-/// `{supervisor.pid, gvproxy.pid, stage0.pid}` sidecars. For each PID:
-/// - dead → ignore (it's already gone, the sidecar is just stale)
-/// - alive with a non-launchd parent → in-flight dev up; skip the
-///   whole dir (don't touch a live owner's state)
+/// Two scans per VM dir:
+///
+/// 1. **Sidecar PID scan.** Each dir carries a `{builder.pid,
+///    stage0.pid}` sidecar with the supervisor's PID. (Earlier
+///    versions of this function looked for the wrong names
+///    (`supervisor.pid`/`gvproxy.pid`); the actual sidecar names
+///    are `builder.pid` for steady-state and `stage0.pid` for
+///    Stage 0 — fixed after smoke-testing on accumulated state
+///    showed `0` PIDs killed despite live orphans.)
+/// 2. **Argv scan.** `gvproxy` is the supervisor's GRANDCHILD and
+///    writes no sidecar of its own — its argv references the VM
+///    dir's `gvproxy.sock`. The argv scan catches those grandchildren
+///    even after the supervisor is gone. Same for `tail -F` readers
+///    of `console.log`.
+///
+/// For each PID found by either scan:
+/// - dead → ignore
+/// - alive with a non-launchd parent → in-flight dev up; mark dir
+///   as "has a live owner", skip dir removal
 /// - alive with launchd as parent → SIGTERM and count
 ///
 /// Then if no helper in the dir had a live non-launchd parent, the
-/// dir itself is removed. This avoids the over-aggressive
-/// `rm -rf $vm/` of the prototype `/tmp/plan95/reap.sh`, which would
-/// have nuked a live dev up's state dir.
+/// dir is removed. This avoids the over-aggressive `rm -rf $vm/`
+/// of the prototype `/tmp/plan95/reap.sh`, which during validation
+/// nuked a live mvmctl's state dir.
 pub(in crate::commands) fn reap_orphaned_vm_helpers(dry_run: bool) -> Result<ReapOutcome> {
     let vms_root =
         std::path::PathBuf::from(mvm_core::config::mvm_cache_dir()).join("builder-vm/vms");
@@ -3293,28 +3307,56 @@ fn reap_orphaned_vm_helpers_at(vms_root: &std::path::Path, dry_run: bool) -> Res
 
         let mut dir_has_live_owner = false;
         let mut killed_in_dir = 0u64;
+        let mut seen_pids: std::collections::HashSet<i32> = std::collections::HashSet::new();
 
-        for sidecar in ["supervisor.pid", "gvproxy.pid", "stage0.pid"] {
+        // Scan 1 — sidecar files. Steady-state builder VMs write
+        // `builder.pid`; Stage 0 writes `stage0.pid`.
+        for sidecar in ["builder.pid", "stage0.pid"] {
             let pid_file = dir.join(sidecar);
             let Some(pid) = read_pid_file(&pid_file) else {
                 continue;
             };
-            if !pid_is_alive(pid) {
+            if !seen_pids.insert(pid) {
                 continue;
             }
-            if pid_parent(pid) != Some(1) {
-                dir_has_live_owner = true;
-                continue;
-            }
-            if !dry_run {
-                // SIGTERM; ignore the result — the next iteration of
-                // the pruner will catch anything that survived (e.g.
-                // a process that ignored TERM).
-                unsafe {
-                    libc::kill(pid, libc::SIGTERM);
+            match classify_pid(pid) {
+                PidClassification::Dead => {}
+                PidClassification::LiveOwned => dir_has_live_owner = true,
+                PidClassification::Orphan => {
+                    if !dry_run {
+                        unsafe {
+                            libc::kill(pid, libc::SIGTERM);
+                        }
+                    }
+                    killed_in_dir += 1;
                 }
             }
-            killed_in_dir += 1;
+        }
+
+        // Scan 2 — argv scan for grandchildren (gvproxy, tail -F …
+        // console.log). They don't write sidecars but their argv
+        // contains the VM dir basename (the `mvm-stage0-…` or
+        // `mvm-builder-vm-…` id), which is unique on this host.
+        let dir_basename = match dir.file_name().and_then(|s| s.to_str()) {
+            Some(s) => s.to_string(),
+            None => continue,
+        };
+        for pid in pids_referencing(&dir_basename) {
+            if !seen_pids.insert(pid) {
+                continue;
+            }
+            match classify_pid(pid) {
+                PidClassification::Dead => {}
+                PidClassification::LiveOwned => dir_has_live_owner = true,
+                PidClassification::Orphan => {
+                    if !dry_run {
+                        unsafe {
+                            libc::kill(pid, libc::SIGTERM);
+                        }
+                    }
+                    killed_in_dir += 1;
+                }
+            }
         }
 
         outcome.killed += killed_in_dir;
@@ -3331,6 +3373,44 @@ fn reap_orphaned_vm_helpers_at(vms_root: &std::path::Path, dry_run: bool) -> Res
     }
 
     Ok(outcome)
+}
+
+enum PidClassification {
+    Dead,
+    LiveOwned, // alive, parent is something other than launchd → in-flight
+    Orphan,    // alive, parent is launchd PID 1 → SIGTERM-able
+}
+
+fn classify_pid(pid: i32) -> PidClassification {
+    if !pid_is_alive(pid) {
+        return PidClassification::Dead;
+    }
+    match pid_parent(pid) {
+        Some(1) => PidClassification::Orphan,
+        _ => PidClassification::LiveOwned,
+    }
+}
+
+/// Find all PIDs whose argv contains `needle`. Used by the argv-scan
+/// pass to catch grandchildren (gvproxy, console-tail) that don't
+/// write a sidecar file. macOS has no `/proc`, so the portable path
+/// is `pgrep -f <needle>` — argv-substring match.
+fn pids_referencing(needle: &str) -> Vec<i32> {
+    let out = match std::process::Command::new("pgrep")
+        .args(["-f", needle])
+        .output()
+    {
+        Ok(o) => o,
+        Err(_) => return Vec::new(),
+    };
+    if !out.status.success() {
+        return Vec::new();
+    }
+    String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .filter_map(|s| s.trim().parse::<i32>().ok())
+        .filter(|&p| p > 1)
+        .collect()
 }
 
 fn read_pid_file(path: &std::path::Path) -> Option<i32> {
@@ -4543,7 +4623,7 @@ mod reap_orphans_tests {
 
     #[test]
     fn dead_pids_get_their_dirs_swept() {
-        // A VM dir whose `supervisor.pid` references a long-dead PID
+        // A VM dir whose `builder.pid` references a long-dead PID
         // (we use `1` and skip it via read_pid_file's `> 1` guard, so
         // instead use a PID that's very unlikely to be alive). The
         // reaper should remove the dir and count `removed_dirs += 1`
@@ -4554,7 +4634,7 @@ mod reap_orphans_tests {
         std::fs::create_dir_all(&vm).expect("mkdir");
         // pick a PID guaranteed not to exist: 2^31-2 (one less than i32::MAX,
         // outside normal kernel allocation range on macOS/Linux)
-        std::fs::write(vm.join("supervisor.pid"), "2147483646\n").expect("write pid");
+        std::fs::write(vm.join("builder.pid"), "2147483646\n").expect("write pid");
         std::fs::write(vm.join("payload"), vec![0u8; 1024]).expect("write payload");
 
         let out = reap_orphaned_vm_helpers_at(&vms_root, false).expect("reap");
@@ -4566,7 +4646,7 @@ mod reap_orphans_tests {
 
     #[test]
     fn live_owner_preserves_dir_in_dry_run_and_real() {
-        // A VM dir whose `supervisor.pid` references THIS test's PID.
+        // A VM dir whose `builder.pid` references THIS test's PID.
         // The test process's parent is cargo/test runner, not launchd
         // PID 1, so `pid_parent != Some(1)` → reaper marks the dir as
         // "has a live owner" and leaves it alone.
@@ -4575,7 +4655,7 @@ mod reap_orphans_tests {
         let vm = vms_root.join("mvm-stage0-pid-of-self");
         std::fs::create_dir_all(&vm).expect("mkdir");
         let my_pid = std::process::id() as i32;
-        std::fs::write(vm.join("supervisor.pid"), format!("{my_pid}\n")).expect("write pid");
+        std::fs::write(vm.join("builder.pid"), format!("{my_pid}\n")).expect("write pid");
 
         let out = reap_orphaned_vm_helpers_at(&vms_root, false).expect("reap");
         assert_eq!(out.killed, 0, "live owner should not be killed");
@@ -4589,14 +4669,14 @@ mod reap_orphans_tests {
         let vms_root = dir.path().join("vms");
         let vm = vms_root.join("mvm-stage0-dryrun-test");
         std::fs::create_dir_all(&vm).expect("mkdir");
-        std::fs::write(vm.join("supervisor.pid"), "2147483646\n").expect("write pid");
+        std::fs::write(vm.join("builder.pid"), "2147483646\n").expect("write pid");
         std::fs::write(vm.join("payload"), vec![0u8; 256]).expect("write payload");
 
         let out = reap_orphaned_vm_helpers_at(&vms_root, true).expect("dry-run reap");
         // Dry-run still *counts* what it would do, but doesn't mutate.
         assert_eq!(out.removed_dirs, 1);
         assert!(vm.exists(), "dry-run must not remove the dir");
-        assert!(vm.join("supervisor.pid").exists(), "pid file untouched");
+        assert!(vm.join("builder.pid").exists(), "pid file untouched");
     }
 }
 

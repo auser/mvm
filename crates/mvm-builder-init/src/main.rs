@@ -151,7 +151,13 @@ mod linux {
     const NIX_STORE_MOUNT: &str = "/nix-store";
     const NIX_OVERLAY_UPPER: &str = "/nix-store/upper";
     const NIX_OVERLAY_WORK: &str = "/nix-store/work";
-    const NIX_OVERLAY_MERGED: &str = "/nix-merged";
+    /// Plan 95 followup — was `/nix-merged` (rootfs root). The rootfs
+    /// boots `ro`, so `mkdir /nix-merged` failed with EROFS and the
+    /// overlay-mount fell back to seed-copy. `/run` is mounted tmpfs
+    /// by `mount_pseudofs` (mvmctl-init Stage 1), so `mkdir` there
+    /// always succeeds. The mount point is host-side scaffolding —
+    /// the visible mount is the bind-mount onto [`NIX_TARGET`] = `/nix`.
+    const NIX_OVERLAY_MERGED: &str = "/run/nix-merged";
 
     /// Final bind-mount target. The rootfs's `/nix/store` (seed
     /// Nix paths needed by `/bin/sh`, `nix`, etc.) is the overlay
