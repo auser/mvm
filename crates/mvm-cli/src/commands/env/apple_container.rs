@@ -4297,10 +4297,7 @@ mod dev_status_image_tests {
         std::fs::write(workspace_root.join("Cargo.lock"), "# stub Cargo.lock\n")
             .expect("write Cargo.lock");
         for crate_name in ["mvm-builder-init", "mvm-egress-proxy"] {
-            let src = workspace_root
-                .join("crates")
-                .join(crate_name)
-                .join("src");
+            let src = workspace_root.join("crates").join(crate_name).join("src");
             std::fs::create_dir_all(&src).expect("mkdir crate src");
             std::fs::write(
                 src.parent().unwrap().join("Cargo.toml"),
