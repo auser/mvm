@@ -97,6 +97,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
     private var vm: VZVirtualMachine?
     private var consoleFileHandle: FileHandle?
     private var vsockProxy: VsockProxy?
+    private var controlSocket: ControlSocket?
 
     // Set by VZ delegate callbacks; main thread reads after exitSignal.
     private var exitError: Error?
@@ -124,6 +125,11 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         // `~/.mvm/run/<vm_id>/vsock/` is the contract `mvmctl` reads.
         try startVsockProxyIfNeeded(on: vm)
 
+        // Plan 97 Phase E — bind the control socket so Rust-side
+        // pause/resume/balloon/snapshot verbs can dial in once the
+        // VM is running. Created mode 0700 (W1.2 contract).
+        try startControlSocketIfNeeded(on: vm)
+
         installSignalHandler()
 
         let startResult = DispatchSemaphore(value: 0)
@@ -146,6 +152,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
         exitSignal.wait()
         try? removePidFile()
         vsockProxy?.shutdown()
+        controlSocket?.shutdown()
 
         if let err = exitError {
             FileHandle.standardError.write(
@@ -287,6 +294,20 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
     }
 
     // MARK: - Vsock proxy
+
+    private func startControlSocketIfNeeded(on vm: VZVirtualMachine) throws {
+        guard let path = config.controlSocketPath else {
+            return
+        }
+        let cs = ControlSocket(
+            socketPath: path,
+            vm: vm,
+            memorySize: config.resources.memoryBytes,
+            queue: queue
+        )
+        try cs.start()
+        self.controlSocket = cs
+    }
 
     private func startVsockProxyIfNeeded(on vm: VZVirtualMachine) throws {
         guard let socketDevice = vm.socketDevices.first as? VZVirtioSocketDevice else {

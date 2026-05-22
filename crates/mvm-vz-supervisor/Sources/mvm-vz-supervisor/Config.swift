@@ -30,11 +30,12 @@ struct SupervisorConfig: Decodable, StrictKeys {
     let consoleOutputPath: String?
     let network: NetworkConfig?
     let balloon: BalloonConfig?
+    let controlSocketPath: String?
 
     static let knownKeys: Set<String> = [
         "name", "vm_state_dir", "pid_file_name", "kernel", "resources",
         "disks", "virtio_fs", "vsock", "console_output_path", "network",
-        "balloon",
+        "balloon", "control_socket_path",
     ]
 
     enum CodingKeys: String, CodingKey {
@@ -49,6 +50,7 @@ struct SupervisorConfig: Decodable, StrictKeys {
         case consoleOutputPath = "console_output_path"
         case network
         case balloon
+        case controlSocketPath = "control_socket_path"
     }
 
     init(from decoder: Decoder) throws {
@@ -65,6 +67,7 @@ struct SupervisorConfig: Decodable, StrictKeys {
         self.consoleOutputPath = try c.decodeIfPresent(String.self, forKey: .consoleOutputPath)
         self.network = try c.decodeIfPresent(NetworkConfig.self, forKey: .network)
         self.balloon = try c.decodeIfPresent(BalloonConfig.self, forKey: .balloon)
+        self.controlSocketPath = try c.decodeIfPresent(String.self, forKey: .controlSocketPath)
     }
 
     var resolvedPidFile: URL {

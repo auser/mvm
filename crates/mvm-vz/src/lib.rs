@@ -63,6 +63,13 @@ pub struct SupervisorConfig {
     /// the supervisor omits the balloon device entirely.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub balloon: Option<BalloonConfig>,
+    /// Plan 97 Phase E — unix-domain control socket the supervisor
+    /// binds (`SOCK_STREAM`, mode 0700) to accept PAUSE / RESUME /
+    /// BALLOON / SAVE / STATUS commands from the host. `None` opts
+    /// out — the supervisor runs without a control channel and
+    /// pause/resume/balloon/snapshot verbs on `VzBackend` short-circuit.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub control_socket_path: Option<String>,
 }
 
 impl SupervisorConfig {
@@ -316,6 +323,7 @@ mod tests {
             console_output_path: None,
             network: None,
             balloon: None,
+            control_socket_path: None,
         }
     }
 

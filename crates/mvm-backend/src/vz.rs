@@ -37,6 +37,7 @@ use mvm_core::vm_backend::{
     VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus,
 };
 
+use crate::vz_control;
 use mvm_base::ui;
 use mvm_vz as vz;
 use std::io::Write;
@@ -82,26 +83,22 @@ impl VmBackend for VzBackend {
 
     fn capabilities(&self) -> VmCapabilities {
         VmCapabilities {
-            // The supervisor's stdin-only IPC does not expose
-            // pause/resume verbs today; `pause`/`resume` below report
-            // accordingly. Capability flips to `true` in the slice
-            // that adds a control socket to the supervisor.
-            pause_resume: false,
-            // Snapshots are macOS-14-only and gated on the supervisor
-            // also exposing a control socket (load/save uses Vz's
-            // `saveMachineStateTo` / `restoreMachineStateFrom`).
-            // Both pieces land together in Phase E; this capability
-            // stays `false` until that lands.
-            snapshots: false,
+            // Plan 97 Phase E — supervisor exposes a control socket
+            // for PAUSE / RESUME / BALLOON / SAVE; the corresponding
+            // VmBackend verbs route through `vz_control::send_command`.
+            pause_resume: true,
+            // Snapshot save lands via SAVE on macOS 14+; restore is
+            // a follow-up that requires a different supervisor
+            // startup mode. Capability is keyed off the macOS major
+            // version so non-macOS / pre-14 hosts honestly report
+            // `false`.
+            snapshots: macos_supports_vz_snapshots(),
             vsock: true,
             tap_networking: false,
-            // `VZVirtioTraditionalMemoryBalloon` is configured by the
-            // Swift supervisor when `balloon.enabled = true`. Live
-            // adjustment via `balloon_set_target` requires the same
-            // control socket that pause/resume needs; capability is
-            // declared `false` until then to match the trait's
-            // capability ↔ behavior contract (vm_backend.rs:599-602).
-            balloon: false,
+            // `VZVirtioTraditionalMemoryBalloon` is wired by the Swift
+            // supervisor; live adjustment goes through the control
+            // socket's BALLOON verb.
+            balloon: true,
         }
     }
 
@@ -273,20 +270,33 @@ impl VmBackend for VzBackend {
         }
     }
 
-    fn pause(&self, _id: &VmId) -> Result<()> {
-        bail!(
-            "pause is not supported by the Vz backend yet \
-             (mvm-vz-supervisor exposes only stdin-driven start/stop; \
-             pause/resume require a control channel — Plan 97 follow-up)"
-        )
+    fn pause(&self, id: &VmId) -> Result<()> {
+        let sock = vz_control::control_socket_path(&vm_state_dir(&id.0));
+        vz_control::send_command(&sock, "PAUSE").map(|_| ())
     }
 
-    fn resume(&self, _id: &VmId) -> Result<()> {
-        bail!(
-            "resume is not supported by the Vz backend yet \
-             (mvm-vz-supervisor exposes only stdin-driven start/stop; \
-             pause/resume require a control channel — Plan 97 follow-up)"
-        )
+    fn resume(&self, id: &VmId) -> Result<()> {
+        let sock = vz_control::control_socket_path(&vm_state_dir(&id.0));
+        vz_control::send_command(&sock, "RESUME").map(|_| ())
+    }
+
+    fn balloon_set_target(&self, id: &VmId, target_inflate_mib: u32) -> Result<()> {
+        // Plan 97 Phase E + §"Memory balloon floor". The host-side
+        // floor enforcement (refuse to shrink the guest below a
+        // configured minimum) happens on the Rust side here — the
+        // supervisor's BALLOON verb is a pure setter. The plan's
+        // floor of 128 MiB is the conservative default; consumers
+        // that want a different floor pass it via VmStartConfig
+        // (follow-up: thread plan.memory_floor through).
+        const FLOOR_MIB: u32 = 128;
+        if target_inflate_mib > 0 && target_inflate_mib < FLOOR_MIB {
+            bail!(
+                "balloon_set_target {target_inflate_mib} MiB below floor {FLOOR_MIB} MiB; \
+                 raising the inflate target that low would push the guest under the floor"
+            );
+        }
+        let sock = vz_control::control_socket_path(&vm_state_dir(&id.0));
+        vz_control::send_command(&sock, &format!("BALLOON {target_inflate_mib}")).map(|_| ())
     }
 
     fn status(&self, id: &VmId) -> Result<VmStatus> {
@@ -408,11 +418,71 @@ impl VmBackend for VzBackend {
     }
 }
 
+impl VzBackend {
+    /// Plan 97 Phase E — snapshot save. Asks the supervisor to write
+    /// the running VM's state to `snapshot_path`, using Vz's
+    /// `saveMachineStateTo` API on macOS 14+. The supervisor returns
+    /// `ERR SAVE requires macOS 14+` on older hosts; this method
+    /// propagates the error verbatim.
+    ///
+    /// Not on the `VmBackend` trait yet — adding snapshot verbs there
+    /// would ripple across every backend. Callers reach this through
+    /// the concrete `VzBackend` type or by downcasting from
+    /// `AnyBackend::Vz(_)`.
+    pub fn snapshot_save(&self, id: &VmId, snapshot_path: &Path) -> Result<()> {
+        let abs = if snapshot_path.is_absolute() {
+            snapshot_path.to_path_buf()
+        } else {
+            bail!(
+                "snapshot_save requires an absolute path, got {}",
+                snapshot_path.display()
+            );
+        };
+        let sock = vz_control::control_socket_path(&vm_state_dir(&id.0));
+        vz_control::send_command(&sock, &format!("SAVE {}", abs.display())).map(|_| ())
+    }
+}
+
 // ─── helpers ───────────────────────────────────────────────────────
 
 fn vms_root() -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_else(|_| ".".to_string());
     PathBuf::from(home).join(".mvm/vms")
+}
+
+/// Plan 97 Phase E gate: snapshot save/restore lands in macOS 14
+/// (`VZVirtualMachine.saveMachineStateTo` / `restoreMachineStateFrom`).
+/// Reported as the *backend* capability rather than the live host's
+/// — false on non-macOS / pre-14 hosts so callers downgrade
+/// gracefully.
+fn macos_supports_vz_snapshots() -> bool {
+    if !matches!(
+        mvm_core::platform::current(),
+        mvm_core::platform::Platform::MacOS
+    ) {
+        return false;
+    }
+    #[cfg(target_os = "macos")]
+    {
+        macos_major_version() >= 14
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+#[cfg(target_os = "macos")]
+fn macos_major_version() -> u32 {
+    use std::process::Command;
+    Command::new("sw_vers")
+        .arg("-productVersion")
+        .output()
+        .ok()
+        .and_then(|o| String::from_utf8(o.stdout).ok())
+        .and_then(|v| v.trim().split('.').next().map(String::from))
+        .and_then(|major| major.parse::<u32>().ok())
+        .unwrap_or(0)
 }
 
 fn vm_state_dir(name: &str) -> PathBuf {
@@ -470,16 +540,19 @@ fn build_supervisor_config(
         // host-side gvproxy lifecycle the libkrun path already
         // performs for `MVM_NETWORKING=gvproxy`).
         network: None,
-        // Balloon device on the Swift side is independent of live
-        // adjustment; even with `capabilities().balloon == false`,
-        // attaching a balloon device early lets the supervisor
-        // expose it once the control channel lands. Default floor
-        // sized so the guest never falls below a working memory
-        // floor.
         balloon: Some(vz::BalloonConfig {
             enabled: true,
             floor_mib: 128,
         }),
+        // Plan 97 Phase E — bind the control socket so pause / resume /
+        // balloon adjustment / snapshot SAVE work via
+        // `<vm_state_dir>/control.sock`. `vz_control::control_socket_path`
+        // is the canonical path resolver both sides agree on.
+        control_socket_path: Some(
+            vz_control::control_socket_path(state_dir)
+                .to_string_lossy()
+                .into_owned(),
+        ),
     }
 }
 
@@ -579,34 +652,73 @@ mod tests {
     }
 
     #[test]
-    fn capabilities_match_plan_97_phase_b() {
+    fn capabilities_match_plan_97_phase_e() {
         let caps = VzBackend.capabilities();
         assert!(caps.vsock, "vsock always available");
         assert!(
             !caps.tap_networking,
             "Vz uses file-handle attachments via gvproxy"
         );
-        // pause_resume/balloon/snapshots are all gated on the
-        // supervisor exposing a control socket — declared `false`
-        // here so the trait's capability ↔ behavior contract
-        // (vm_backend.rs:599-602) holds. Flip when the control
-        // socket lands.
-        assert!(!caps.pause_resume);
-        assert!(!caps.balloon);
-        assert!(!caps.snapshots);
+        // Plan 97 Phase E — control socket exposes PAUSE / RESUME /
+        // BALLOON; the trait verbs route through it.
+        assert!(caps.pause_resume);
+        assert!(caps.balloon);
+        // snapshots is feature-detected on macOS 14+; on a
+        // contributor host below 14 it stays false.
+        let _ = caps.snapshots;
     }
 
     #[test]
-    fn pause_resume_bail_with_capability_honest_message() {
+    fn snapshot_save_requires_absolute_path() {
         let backend = VzBackend;
-        let id = VmId("smoke".into());
-        let err = backend.pause(&id).expect_err("pause should bail");
+        let id = VmId("any".into());
+        let err = backend
+            .snapshot_save(&id, Path::new("relative.snapshot"))
+            .expect_err("relative path refused");
         assert!(
-            err.to_string().contains("not supported"),
+            err.to_string().contains("absolute path"),
             "error explains why: {err}"
         );
-        let err = backend.resume(&id).expect_err("resume should bail");
-        assert!(err.to_string().contains("not supported"));
+    }
+
+    #[test]
+    fn pause_with_no_supervisor_surfaces_socket_path() {
+        // No supervisor is running for the test VM id; pause must
+        // surface an actionable error mentioning the missing socket
+        // path so operators know where to look.
+        let backend = VzBackend;
+        let id = VmId("definitely-not-running-1234567890".into());
+        let err = backend.pause(&id).expect_err("pause should error");
+        assert!(
+            err.to_string().contains("control.sock"),
+            "error mentions the socket: {err}"
+        );
+    }
+
+    #[test]
+    fn balloon_set_target_refuses_below_floor() {
+        // 0 (deflate fully) is allowed; any positive value below the
+        // 128 MiB floor must be rejected before the control-socket
+        // dial — Plan 97 §"Memory balloon floor".
+        let backend = VzBackend;
+        let id = VmId("any".into());
+        let err = backend
+            .balloon_set_target(&id, 64)
+            .expect_err("below-floor must error before connect");
+        assert!(
+            err.to_string().contains("floor"),
+            "error explains the floor: {err}"
+        );
+        // 0 must pass the floor check (still errors because there's
+        // no supervisor running, but with a connect error not a
+        // floor-violation error).
+        let err = backend
+            .balloon_set_target(&id, 0)
+            .expect_err("connect to missing socket still errors");
+        assert!(
+            !err.to_string().contains("floor"),
+            "0 should not trigger the floor check: {err}"
+        );
     }
 
     #[test]

@@ -52,6 +52,9 @@ pub mod network;
 // Currently a skeleton: trait surface + capabilities + security profile
 // + availability probe; lifecycle methods land in a follow-up slice.
 pub mod vz;
+// Plan 97 Phase E — Rust client for the Vz supervisor's control
+// socket (PAUSE / RESUME / BALLOON / SAVE). Used by VzBackend.
+pub mod vz_control;
 
 pub use apple_container::AppleContainerBackend;
 pub use backend::{AnyBackend, FirecrackerBackend, FirecrackerConfig};

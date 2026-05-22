@@ -1827,7 +1827,7 @@ Discovered while running `cargo test --workspace --all-features` to gate the dev
 2. `mvm-cli::commands::env::apple_container::dev_status_image_tests::builder_cache_status_reports_source_provenance_drift` — fixture panics with `builder VM source fingerprint missing /var/folders/.../Cargo.lock`. Caused by `155b561f` (PR #422) expanding the fingerprint to require a `Cargo.lock` in the workspace root, but this test fixture builds an isolated temp flake dir without one. Fix: stage an empty `Cargo.lock` (or copy the workspace one) into the fixture's temp workspace root before invoking the fingerprint code.
 3. `mvm-cli::commands::env::apple_container::dev_status_image_tests::builder_cache_status_reports_source_cache_hit_without_paths` — identical cause as (2).
 
-## Sprint 55 — `Virtualization.framework` backend (`vz`) — PHASES A/B/D SHIPPED, C+E PARKED  [`plans/97-vz-backend.md`](plans/97-vz-backend.md) | [`adrs/056-vz-backend.md`](adrs/056-vz-backend.md)
+## Sprint 55 — `Virtualization.framework` backend (`vz`) — PHASES A/B/D/E SHIPPED, C PARKED  [`plans/97-vz-backend.md`](plans/97-vz-backend.md) | [`adrs/056-vz-backend.md`](adrs/056-vz-backend.md)
 
 Adds a fourth macOS hypervisor backend (`vz`) parallel to libkrun and
 Apple Container, using Apple's `Virtualization.framework` directly via
@@ -1880,12 +1880,13 @@ code (vsock CID 3 / ports 5252, 10000+, 20000+ remain unchanged).
       backend table gained the Vz row. `.github/workflows/ci.yml::vz-macos`
       lane matrices the build over macos-13 + macos-latest with
       entitlement assertion + strict-decoder smoke.
-- 🅿️ **Phase E** — Snapshot save/restore on macOS 14+. **Parked as
-      a follow-up slice.** Needs a SOCK_DGRAM control channel between
-      Rust and the running Swift supervisor for PAUSE / RESUME /
-      SAVE / RESTORE verbs, command framing, audit-chain hashing of
-      snapshot files, and `VZGenericMachineIdentifier` persistence
-      across restore.
+- ✅ **Phase E (core)** — Supervisor control-socket IPC + pause /
+      resume / balloon / snapshot SAVE. `<vm_state_dir>/control.sock`
+      mode 0700; newline-framed protocol; Rust
+      `vz_control::send_command` + `VzBackend` verbs (pause / resume
+      / balloon_set_target / snapshot_save) wired through. RESTORE +
+      audit-chain hashing of snapshot files remain follow-ups (needs
+      CLI verb + different supervisor startup mode).
 
 ### Cross-cutting
 

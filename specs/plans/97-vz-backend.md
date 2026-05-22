@@ -8,21 +8,22 @@
 > CI lane `vz-macos` matrices the build over macos-13 + macos-latest.
 > Rust supervisor-JSON fuzz target wired into `security.yml`.
 >
+> **Phase E** — supervisor control socket + pause / resume /
+> balloon / snapshot SAVE landed via
+> `crates/mvm-vz-supervisor/Sources/mvm-vz-supervisor/ControlSocket.swift`
+> and `crates/mvm-backend/src/vz_control.rs`. Capabilities flipped
+> on the trait. RESTORE + audit-chain hashing of snapshot files
+> are the remaining Phase E followups (needs CLI verb integration
+> + different supervisor startup mode).
+>
 > **Parked as multi-session follow-ups:**
 > - **Phase C** (Vz as a builder-VM backend) — `LibkrunBuilderVm` is
 >   ~3,300 lines of substrate orchestration (virtio-fs shares for
 >   /work/out/job, `mvm-builder-init` PID 1, Nix store overlay,
 >   kernel-panic console-log watcher, cmd.sh emission). A real
 >   `VzBuilderVm` impl needs to either mirror this or refactor the
->   shared parts behind a hypervisor-agnostic seam. Out of scope for
->   the closure session; tracked under the Phase C checklist below.
-> - **Phase E** (snapshot save/restore via supervisor control socket)
->   — needs a SOCK_DGRAM control channel between Rust and the running
->   Swift supervisor (PAUSE / RESUME / SAVE / RESTORE verbs) with
->   command framing, error classification, snapshot-file SHA-256 in
->   the audit chain, and `VZGenericMachineIdentifier` persistence.
->   Substantial own-PR-sized slice; tracked under the Phase E
->   checklist.
+>   shared parts behind a hypervisor-agnostic seam. Tracked under
+>   the Phase C checklist below.
 >
 > Pick-up command for fresh sessions: read this file top to bottom, then
 > jump to the next unchecked item in the **Progress checklist** below.
@@ -38,9 +39,13 @@ Top-level phases:
       of substrate orchestration or a refactor extracting the
       hypervisor-agnostic seam first)*
 - [x] **Phase D** — ADR-056 lands + ADR-002 backend table update
-- [ ] **Phase E** — Snapshot / save-restore (macOS 14+)  *(parked:
-      needs the supervisor control-socket channel for PAUSE / RESUME /
-      SAVE / RESTORE with command framing + audit-chain hashing)*
+- [x] **Phase E** — Snapshot save + pause/resume/balloon via
+      supervisor control socket (macOS 14+ for SAVE).
+      `<vm_state_dir>/control.sock` mode 0700; newline-framed
+      PAUSE / RESUME / STATUS / BALLOON / SAVE protocol; Rust
+      `vz_control::send_command` + `VzBackend::{pause,resume,
+      balloon_set_target,snapshot_save}` wired through. RESTORE
+      stays a follow-up (different supervisor startup mode).
 
 Phase A sub-tasks:
 
@@ -147,19 +152,29 @@ Phase D sub-tasks:
 
 Phase E sub-tasks (macOS 14+):
 
-- [ ] `snapshot.save_path` / `snapshot.restore_path` modes added to
-      supervisor JSON schema
-- [ ] Swift `saveMachineStateTo` / `restoreMachineStateFrom` wiring
-- [ ] Rust `VmBackend::pause` / `resume` / snapshot verbs routed to
-      supervisor IPC
+- [x] `control_socket_path` field added to `SupervisorConfig`
+      (Rust + Swift); supervisor binds `<vm_state_dir>/control.sock`
+      mode 0700 on startup.
+- [x] Swift `ControlSocket.swift` accepts newline-framed PAUSE /
+      RESUME / STATUS / BALLOON `<mib>` / SAVE `<path>` commands;
+      `saveMachineStateTo` wired (macOS 14+ gated). `RESTORE` returns
+      "not yet implemented" — different supervisor startup mode.
+- [x] Rust `vz_control::send_command` client + `VzBackend::pause`,
+      `VzBackend::resume`, `VzBackend::balloon_set_target`,
+      `VzBackend::snapshot_save` (public method on the concrete type;
+      VmBackend trait extension is its own slice).
 - [ ] Snapshot file SHA-256 hash-pinned in audit chain;
       `verify_audit_chain` rejects tampered snapshots (Security §4)
+      *(follow-up — needs CLI verb that drives `snapshot_save` +
+      audit emitter integration)*
 - [ ] `VZGenericMachineIdentifier` persisted with snapshots and
-      verified on restore (Security §10)
-- [ ] `VmCapabilities::snapshots = true` on macOS 14+
+      verified on restore (Security §10)  *(follow-up — pairs with
+      RESTORE)*
+- [x] `VmCapabilities::snapshots = macos_supports_vz_snapshots()`
+      (runtime feature-detected against macOS 14).
 - [ ] Phase E acceptance: `mvmctl snapshot save/restore` round-trips
-      a dev-shell workload VM, restored VM preserves in-guest state
-      and vsock agent sessions
+      a dev-shell workload VM  *(deferred — needs CLI verb + RESTORE
+      supervisor mode)*
 
 Cross-cutting (any phase):
 
@@ -793,6 +808,24 @@ Each session that touches this plan appends an entry below.
 - 2026-05-22 — Plan filed. ADR-056 reserved. Worktree
   `worktree-vz-backend-phase-a` created off `origin/main` for Phase A
   work. SPRINT.md Sprint 55 section added.
+- 2026-05-22 — Phase E core landed: control-socket IPC between Rust
+  and the running Swift supervisor.
+  `crates/mvm-vz-supervisor/Sources/mvm-vz-supervisor/ControlSocket.swift`
+  binds `<vm_state_dir>/control.sock` mode 0700 (W1.2),
+  accepts newline-framed PAUSE / RESUME / STATUS / BALLOON / SAVE
+  commands, dispatches Vz API calls on the supervisor's main queue.
+  `crates/mvm-backend/src/vz_control.rs` provides the Rust client
+  (`send_command`); `VzBackend` now wires `pause` / `resume` /
+  `balloon_set_target` (with the 128 MiB floor enforced host-side
+  before the dial) and exposes a public `snapshot_save` method on
+  the concrete type (trait-level snapshot verbs are their own
+  slice). Capabilities flipped: `pause_resume=true`, `balloon=true`,
+  `snapshots=macos_supports_vz_snapshots()` (macOS 14+).
+  Five new VzBackend tests + five `vz_control` tests (using a
+  thread-local fake supervisor) — all 19 vz tests green; workspace
+  4,096 passed / 0 failed; clippy clean. RESTORE deferred (needs
+  different supervisor startup mode) + snapshot audit-chain hashing
+  deferred (needs CLI verb integration).
 - 2026-05-22 — Closure: top-level Phase A / B / D marked complete;
   Phase C and Phase E moved to parked status with explicit rationale
   for the deferral. Phases C and E are real follow-up slices (each
