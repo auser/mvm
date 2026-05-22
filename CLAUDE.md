@@ -216,9 +216,22 @@ sequence in `specs/plans/25-microvm-hardening.md`.
 No task is done without tests. Before marking any feature complete:
 
 ```bash
-cargo test --workspace              # all tests must pass
+cargo fmt --all -- --check           # workspace-wide fmt; --all matters
+cargo test --workspace               # all tests must pass
 cargo clippy --workspace -- -D warnings  # zero warnings
 ```
+
+**Always pass `--all` to `cargo fmt`.** Without it, fmt only checks the
+manifest crate (whichever one the manifest points at), silently missing
+drift in every other workspace member. CI runs `cargo fmt --all --
+--check`; if you only check the local crate, the merge will still fail.
+The pre-commit hook at `.githooks/pre-commit` auto-fixes with `cargo
+fmt --all` and re-stages — `just install-hooks` wires
+`core.hooksPath` to `.githooks/` so it fires on every commit.
+
+The Justfile recipes wrap this correctly: `just fmt-check`, `just
+clippy`, `just lint` (both), `just ci` (lint + test). Prefer those over
+raw cargo invocations.
 
 Every new module, type, or function needs test coverage:
 - Types: serde roundtrip, default values
