@@ -78,6 +78,17 @@ in
 , dev            ? null
 , uids           ? null   # { agent = <int>; entrypoint = <int>; } — see below
 , extraFiles     ? { }
+# Whether to bake the `mvm-addon-dns` binary into the rootfs at
+# `/usr/local/bin/mvm-addon-dns`. The default (`true`) matches the
+# "always install + no-op when zone empty" contract that workload
+# microVMs rely on (see `specs/contracts/local-addon-dns.md`).
+# Builder/utility VMs whose `/init` doesn't run mkGuest's addon-dns
+# activation block (e.g. `nix/images/builder-vm/`, which substitutes
+# `mvm-builder-init` as PID 1) should pass `bakeAddonDns = false` to
+# skip the Rust compile of `mvm-addon-dns` during their rootfs build
+# — a meaningful saving in Stage 0 where the build runs on tmpfs and
+# competes with the kernel compile for memory.
+, bakeAddonDns   ? true
 # Optional kernel package. When set, mkGuest copies its module
 # tree (`/lib/modules/<kver>/`) into the rootfs and `/init` runs
 # `modprobe vmw_vsock_virtio_transport` before forking the agent.
@@ -670,11 +681,19 @@ let
     cp ${mvmGuestNetinitBinary} "$out/usr/local/bin/mvm-guest-netinit"
     chmod 0555 "$out/usr/local/bin/mvm-guest-netinit"
 
-    # In-guest addon DNS resolver. Baked into every rootfs so /init
-    # can spawn it without a build-time mkGuest flag; activation is
-    # gated at boot on the presence of a zone file (see initScript).
-    cp ${mvmAddonDnsBinary} "$out/usr/local/bin/mvm-addon-dns"
-    chmod 0555 "$out/usr/local/bin/mvm-addon-dns"
+    # In-guest addon DNS resolver. Baked into every workload rootfs
+    # so /init can spawn it without a build-time mkGuest flag;
+    # activation is gated at boot on the presence of a zone file
+    # (see initScript). Gated on the `bakeAddonDns` arg so VMs whose
+    # `/init` doesn't run mkGuest's addon-dns activation block (e.g.
+    # `nix/images/builder-vm/`) can skip the Rust compile — the
+    # binary would never get invoked there, and on tmpfs-bound Stage
+    # 0 builds the parallel rustc run for it pushes the kernel
+    # compile into OOM territory.
+    ${if bakeAddonDns then ''
+      cp ${mvmAddonDnsBinary} "$out/usr/local/bin/mvm-addon-dns"
+      chmod 0555 "$out/usr/local/bin/mvm-addon-dns"
+    '' else ""}
 
     # Kernel modules. `/init` `modprobe`s vsock before forking the
     # agent (default nixpkgs kernel ships AF_VSOCK as `=m`); without
