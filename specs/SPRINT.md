@@ -1853,9 +1853,13 @@ code (vsock CID 3 / ports 5252, 10000+, 20000+ remain unchanged).
 
 ### Workstream breakdown
 
-- [ ] **Phase A** — `mvm-vz-supervisor` Swift binary (smallest tracer).
+- 🟡 **Phase A** — `mvm-vz-supervisor` Swift binary (smallest tracer).
       Reads `SupervisorConfig` JSON on stdin, builds
       `VZVirtualMachineConfiguration`, boots VM, forwards SIGTERM.
+      *Binary scaffolded, builds clean, error-path smoke tests green,
+      ad-hoc codesigned with `com.apple.security.virtualization`.
+      Remaining: full boot acceptance (gated on Phase B) + Rust fuzz
+      corpus (gated on the Phase B `mvm-vz` crate).*
       Acceptance: `vsock-connect 3:5252` succeeds against the
       dev-shell image booted under Vz.
 - [ ] **Phase B** — `VzBackend` impl in `crates/mvm-backend/src/vz.rs`,

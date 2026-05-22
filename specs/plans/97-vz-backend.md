@@ -1,6 +1,8 @@
 # Plan 97 — `Virtualization.framework` backend (`vz`)
 
-> **Status:** Phase A — not started. ADR-056 deferred until Phase D.
+> **Status:** Phase A — supervisor binary scaffolded and building;
+> end-to-end boot acceptance + Rust-side fuzz target are the remaining
+> Phase A items. ADR-056 deferred until Phase D.
 >
 > Pick-up command for fresh sessions: read this file top to bottom, then
 > jump to the next unchecked item in the **Progress checklist** below.
@@ -18,24 +20,29 @@ Top-level phases:
 Phase A sub-tasks:
 
 - [x] Worktree on `worktree-vz-backend-phase-a` set up off `origin/main`
-- [ ] `crates/mvm-vz-supervisor/Package.swift` Swift package skeleton
-- [ ] `Sources/mvm-vz-supervisor/Config.swift` — Codable mirror of
+- [x] `crates/mvm-vz-supervisor/Package.swift` Swift package skeleton
+- [x] `Sources/mvm-vz-supervisor/Config.swift` — Codable mirror of
       the libkrun supervisor JSON schema (`#[serde(deny_unknown_fields)]`
-      equivalent on the Swift side via strict `JSONDecoder`)
-- [ ] `Sources/mvm-vz-supervisor/Supervisor.swift` — VZ machine config
+      equivalent on the Swift side via strict `JSONDecoder` —
+      `StrictKeys` protocol + `checkStrictKeys` helper)
+- [x] `Sources/mvm-vz-supervisor/Supervisor.swift` — VZ machine config
       + start + SIGTERM forwarding
-- [ ] `Sources/mvm-vz-supervisor/VsockProxy.swift` — bidirectional
-      unix-socket ↔ vsock proxy under `~/.mvm/run/<vm_id>/vsock/`,
-      mode 0700
-- [ ] `Sources/mvm-vz-supervisor/NetworkSetup.swift` — gvproxy file
+- [x] `Sources/mvm-vz-supervisor/VsockProxy.swift` — bidirectional
+      unix-socket ↔ vsock proxy under `<socketDir>/vsock-<port>.sock`,
+      mode 0700, via POSIX `accept()` + `DispatchIO` splice
+- [x] `Sources/mvm-vz-supervisor/Network.swift` — gvproxy file
       handle attachment via `VZFileHandleNetworkDeviceAttachment`
-- [ ] Ad-hoc code-signing with `com.apple.security.virtualization`
-      entitlement
+      (SOCK_DGRAM unix connect to gvproxy's `--listen-vfkit` socket)
+- [x] Ad-hoc code-signing with `com.apple.security.virtualization`
+      entitlement (`Entitlements.plist` + `tools/build.sh`)
 - [ ] Phase A acceptance: `mvm-vz-supervisor < config.json` boots the
       dev-shell image and host-side `vsock-connect 3:5252` succeeds
+      *(deferred — needs Phase B's `VzBackend` to produce the JSON
+      against real artifact paths)*
 - [ ] Rust fuzz target `crates/mvm-vz/fuzz/fuzz_supervisor_config.rs`
       generating the corpus; Swift-side equivalence test reads the
       same corpus and asserts equivalent rejections (ADR-002 claim 5)
+      *(deferred — Rust `mvm-vz` crate is a Phase B item)*
 
 Phase B sub-tasks:
 
@@ -721,3 +728,14 @@ Each session that touches this plan appends an entry below.
 - 2026-05-22 — Plan filed. ADR-056 reserved. Worktree
   `worktree-vz-backend-phase-a` created off `origin/main` for Phase A
   work. SPRINT.md Sprint 55 section added.
+- 2026-05-22 — Phase A first slice landed: `crates/mvm-vz-supervisor/`
+  Swift package builds clean with macOS 13 deployment target. All five
+  source files in place (`main.swift`, `Config.swift`, `Supervisor.swift`,
+  `VsockProxy.swift`, `Network.swift`); strict deny-unknown-fields
+  decoder smoke-tested (rejects unknown field with exit 2, empty stdin
+  with documented message); ad-hoc codesigning helper `tools/build.sh`
+  injects `com.apple.security.virtualization` from `Entitlements.plist`
+  and `codesign -d --entitlements -` confirms it's on the binary.
+  Remaining Phase A: end-to-end boot acceptance (gated on Phase B's
+  Rust JSON producer) and the Rust-side fuzz corpus (gated on the
+  Phase B `mvm-vz` crate).
