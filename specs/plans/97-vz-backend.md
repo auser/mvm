@@ -34,10 +34,11 @@ Top-level phases:
 
 - [x] **Phase A** — `mvm-vz-supervisor` Swift binary
 - [x] **Phase B** — `VzBackend` impl in `crates/mvm-backend/src/vz.rs`
-- [ ] **Phase C** — Vz as a builder-VM backend  *(parked: needs a
-      `VzBuilderVm` impl mirroring `LibkrunBuilderVm`'s ~3,300 lines
-      of substrate orchestration or a refactor extracting the
-      hypervisor-agnostic seam first)*
+- 🟡 **Phase C** — Vz as a builder-VM backend. *Primitive landed
+      (`VzBackend::run_attached`); orchestration layer
+      (`VzBuilderVm` impl of `BuilderVm`) is its own slice gated on
+      either mirroring or refactoring `LibkrunBuilderVm`'s ~3,300
+      lines of substrate.*
 - [x] **Phase D** — ADR-056 lands + ADR-002 backend table update
 - [x] **Phase E** — Snapshot save + pause/resume/balloon via
       supervisor control socket (macOS 14+ for SAVE).
@@ -123,14 +124,26 @@ Phase B sub-tasks:
 
 Phase C sub-tasks:
 
-- [ ] `StartMode::BlockingWithIO` (or equivalent) added if not already
-      in the trait
+- [x] `VzBackend::run_attached(config) -> Result<VmExitStatus>` —
+      foreground supervisor spawn, inherits stdout/stderr, blocks
+      until guest exit, returns the supervisor's exit code as the
+      VM exit status. Plan 97 Phase C *primitive*; the builder
+      orchestration on top is its own slice (see below).
 - [ ] Builder runtime selection in `crates/mvm/src/vm/` branches on
-      `MVM_BUILDER_BACKEND=vz`
+      `MVM_BUILDER_BACKEND=vz`  *(follow-up: needs the orchestration
+      layer below)*
+- [ ] `VzBuilderVm` impl of `BuilderVm::run_build` — uses
+      `run_attached` + virtio-fs `/work`/`/out`/`/job` shares +
+      cmd.sh emission + artifact extraction. The shared logic
+      LibkrunBuilderVm carries (~3,300 lines) deserves a refactor
+      into a hypervisor-agnostic seam before the second impl lands;
+      mirroring it ad-hoc would double the code.
 - [ ] Stage 0 audit emit + cache-prune contract participation
       (`project_stage0_audit_and_cache_prune_contract` memory)
+      *(follow-up: pairs with the orchestration slice above)*
 - [ ] Phase C acceptance: `MVM_BUILDER_BACKEND=vz mvmctl build --flake
       .` produces byte-identical rootfs to libkrun-hosted equivalent
+      *(deferred — needs the orchestration slice above)*
 
 Phase D sub-tasks:
 
@@ -808,6 +821,15 @@ Each session that touches this plan appends an entry below.
 - 2026-05-22 — Plan filed. ADR-056 reserved. Worktree
   `worktree-vz-backend-phase-a` created off `origin/main` for Phase A
   work. SPRINT.md Sprint 55 section added.
+- 2026-05-22 — Phase C primitive landed: `VzBackend::run_attached`
+  spawns the supervisor in foreground (stdin piped for JSON,
+  stdout/stderr inherited), waits for it to exit, returns the
+  supervisor's exit code as a `VmExitStatus`. Foundation for a
+  future `VzBuilderVm` that wraps this primitive with the same
+  `BuilderJob` / `BuilderMounts` / virtio-fs orchestration
+  `LibkrunBuilderVm` carries; that orchestration layer is its own
+  follow-up slice (no point duplicating 3,300 lines without first
+  refactoring the shared seam out of `LibkrunBuilderVm`).
 - 2026-05-22 — Phase E core landed: control-socket IPC between Rust
   and the running Swift supervisor.
   `crates/mvm-vz-supervisor/Sources/mvm-vz-supervisor/ControlSocket.swift`

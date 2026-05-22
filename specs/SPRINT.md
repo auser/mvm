@@ -1827,7 +1827,7 @@ Discovered while running `cargo test --workspace --all-features` to gate the dev
 2. `mvm-cli::commands::env::apple_container::dev_status_image_tests::builder_cache_status_reports_source_provenance_drift` — fixture panics with `builder VM source fingerprint missing /var/folders/.../Cargo.lock`. Caused by `155b561f` (PR #422) expanding the fingerprint to require a `Cargo.lock` in the workspace root, but this test fixture builds an isolated temp flake dir without one. Fix: stage an empty `Cargo.lock` (or copy the workspace one) into the fixture's temp workspace root before invoking the fingerprint code.
 3. `mvm-cli::commands::env::apple_container::dev_status_image_tests::builder_cache_status_reports_source_cache_hit_without_paths` — identical cause as (2).
 
-## Sprint 55 — `Virtualization.framework` backend (`vz`) — PHASES A/B/D/E SHIPPED, C PARKED  [`plans/97-vz-backend.md`](plans/97-vz-backend.md) | [`adrs/056-vz-backend.md`](adrs/056-vz-backend.md)
+## Sprint 55 — `Virtualization.framework` backend (`vz`) — PHASES A/B/D/E SHIPPED, C PRIMITIVE LANDED  [`plans/97-vz-backend.md`](plans/97-vz-backend.md) | [`adrs/056-vz-backend.md`](adrs/056-vz-backend.md)
 
 Adds a fourth macOS hypervisor backend (`vz`) parallel to libkrun and
 Apple Container, using Apple's `Virtualization.framework` directly via
@@ -1868,14 +1868,14 @@ code (vsock CID 3 / ports 5252, 10000+, 20000+ remain unchanged).
       supervisor via `mvm-vz/build.rs`. Acceptance smoke (full boot
       to vsock 5252) deferred — gated on dev-shell artifacts; every
       backend bit is in place.
-- 🅿️ **Phase C** — Vz as a builder-VM backend. **Parked as a
-      follow-up slice.** Real `VzBuilderVm` impl needs to mirror
-      `LibkrunBuilderVm` (~3,300 lines of substrate orchestration:
-      virtio-fs `/work`/`/out`/`/job` shares, `mvm-builder-init`
-      PID 1, Nix store overlay, kernel-panic console-log watcher,
-      cmd.sh emission) or refactor the shared parts behind a
-      hypervisor-agnostic seam first. Comparable in size to
-      Phase B; deserves its own PR.
+- 🟡 **Phase C (primitive only)** — `VzBackend::run_attached`
+      foreground-supervisor primitive landed. The full builder-VM
+      orchestration (`VzBuilderVm` impl of `BuilderVm`) is a
+      follow-up slice gated on either mirroring `LibkrunBuilderVm`'s
+      ~3,300 lines of substrate (virtio-fs `/work`/`/out`/`/job`,
+      `mvm-builder-init` PID 1, Nix store overlay, kernel-panic
+      console-log watcher, cmd.sh emission) or refactoring the
+      shared parts behind a hypervisor-agnostic seam first.
 - ✅ **Phase D** — `specs/adrs/056-vz-backend.md` filed; ADR-002
       backend table gained the Vz row. `.github/workflows/ci.yml::vz-macos`
       lane matrices the build over macos-13 + macos-latest with

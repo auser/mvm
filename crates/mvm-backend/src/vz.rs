@@ -34,7 +34,7 @@
 use anyhow::{Result, anyhow, bail};
 use mvm_core::vm_backend::{
     BackendSecurityProfile, ClaimStatus, GuestChannelInfo, LayerCoverage, StartMode, VmBackend,
-    VmCapabilities, VmId, VmInfo, VmStartConfig, VmStatus,
+    VmCapabilities, VmExitStatus, VmId, VmInfo, VmStartConfig, VmStatus,
 };
 
 use crate::vz_control;
@@ -419,6 +419,85 @@ impl VmBackend for VzBackend {
 }
 
 impl VzBackend {
+    /// Plan 97 Phase C primitive — run a Linux guest under Vz
+    /// **attached to the calling process**: spawn the supervisor in
+    /// the foreground, pipe its JSON config on stdin, inherit
+    /// stdout/stderr so the guest's console output streams to the
+    /// terminal, and block until the supervisor exits. Returns the
+    /// supervisor's exit status translated into [`VmExitStatus`].
+    ///
+    /// Foundation for a future `VzBuilderVm` (Plan 97 §"Phase C"):
+    /// the builder VM wraps this primitive with virtio-fs
+    /// `/work`/`/out`/`/job` shares + `BuilderJob` orchestration +
+    /// artifact extraction. Those layers live in `mvm-build` and are
+    /// not part of this primitive.
+    ///
+    /// Unlike `start` (which detaches), `run_attached` is suitable for
+    /// one-shot workloads where the parent process owns the guest's
+    /// lifetime — CI batch jobs, `mvmctl exec`-style verbs, and the
+    /// builder-VM run loop. Stop semantics are SIGINT/SIGTERM to the
+    /// caller; the supervisor's signal handler forwards to
+    /// `VZVirtualMachine.requestStop()` (Plan 97 Phase A).
+    pub fn run_attached(&self, config: &VmStartConfig) -> Result<VmExitStatus> {
+        if !mvm_core::platform::current().has_vz() {
+            bail!(
+                "Apple Virtualization.framework is not available on this host. \
+                 Requires macOS 13 or later."
+            );
+        }
+        let kernel = config
+            .kernel_path
+            .as_deref()
+            .ok_or_else(|| anyhow!("Vz backend requires a kernel path"))?;
+        let supervisor_path = resolve_supervisor_path()?;
+        let state_dir = vm_state_dir(&config.name);
+        std::fs::create_dir_all(&state_dir)
+            .map_err(|e| anyhow!("create per-VM state dir {}: {e}", state_dir.display()))?;
+
+        let cfg = build_supervisor_config(config, kernel, &state_dir);
+        let pid_file = state_dir.join(PID_FILE_NAME);
+        let _ = std::fs::remove_file(&pid_file);
+
+        let json = cfg
+            .to_json()
+            .map_err(|e| anyhow!("serialize SupervisorConfig: {e}"))?;
+
+        ui::info(&format!(
+            "Running Vz VM '{}' attached (cpus={}, mem={}MiB) via {}...",
+            config.name,
+            config.cpus,
+            config.memory_mib,
+            supervisor_path.display(),
+        ));
+
+        let mut child = Command::new(&supervisor_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::inherit())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow!("spawn {}: {e}", supervisor_path.display()))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("supervisor stdin was not piped"))?
+            .write_all(json.as_bytes())
+            .map_err(|e| anyhow!("pipe SupervisorConfig to supervisor stdin: {e}"))?;
+
+        // Block until the supervisor exits. Its exit code is the
+        // guest's exit code per Plan 97 Phase A's `main.swift`
+        // contract (0 clean / 1 guest error / 2 config parse error
+        // / 3 supervisor startup error).
+        let status = child
+            .wait()
+            .map_err(|e| anyhow!("wait for supervisor: {e}"))?;
+        let _ = std::fs::remove_file(&pid_file);
+
+        Ok(VmExitStatus {
+            code: status.code(),
+            success: status.success(),
+        })
+    }
+
     /// Plan 97 Phase E — snapshot save. Asks the supervisor to write
     /// the running VM's state to `snapshot_path`, using Vz's
     /// `saveMachineStateTo` API on macOS 14+. The supervisor returns
@@ -666,6 +745,33 @@ mod tests {
         // snapshots is feature-detected on macOS 14+; on a
         // contributor host below 14 it stays false.
         let _ = caps.snapshots;
+    }
+
+    #[test]
+    fn run_attached_requires_kernel_path() {
+        // Phase C primitive — refuses without a kernel path. Real
+        // boot can't be exercised in a unit test (needs an actual
+        // dev-shell artifact), so the test catches the precondition
+        // path which is what consumers will hit first when wiring
+        // up a Vz-backed builder runner.
+        let backend = VzBackend;
+        let cfg = VmStartConfig {
+            name: "smoke-attached".into(),
+            cpus: 1,
+            memory_mib: 256,
+            ..Default::default()
+        };
+        let err = backend
+            .run_attached(&cfg)
+            .expect_err("missing kernel must error");
+        // On a contributor host without Vz, the platform gate fires
+        // first; on a macOS 13+ host, the kernel-path check fires.
+        // Either way, the error must be actionable.
+        let msg = err.to_string();
+        assert!(
+            msg.contains("kernel path") || msg.contains("not available"),
+            "error explains the precondition: {msg}"
+        );
     }
 
     #[test]
