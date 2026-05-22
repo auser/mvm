@@ -190,13 +190,16 @@ Defense-in-depth additions on top of the trait-level requirements:
   self-hosted runner; the **`vz-macos-26`** lane in
   `.github/workflows/ci.yml` is the placeholder, gated on
   `vars.MACOS_26_AVAILABLE`.
-- **Snapshot RESTORE** — Phase E shipped SAVE end-to-end (`mvmctl
-  snapshot save`, SHA-256 hash-pinned to the audit chain). RESTORE
-  needs a different supervisor startup mode: Apple's API restores
-  into a *blank* `VZVirtualMachine`, so the supervisor's stdin
-  contract has to accept "boot from saved-state blob" alongside
-  the existing "boot from kernel + cmdline" path. Tracked as the
-  next Phase E slice.
+- **Snapshot RESTORE live-host acceptance smoke** — Phase E shipped
+  both SAVE and RESTORE end-to-end with `mvmctl snapshot save/restore
+  <vm> --path <p>`, machine-identifier sidecar persistence
+  (`<snapshot_path>.machine-id`), SHA-256 hash-pinning, and
+  audit-chain match labelling (`verified` / `mismatch` /
+  `not_in_chain`). The residual is a live macOS 14+ runner that
+  actually boots a dev-shell VM, saves it, kills it, restores it,
+  and asserts the guest's `/proc/sys/kernel/random/boot_id` /
+  `machine-id` survives the round-trip. Pairs with the
+  `vz-macos-26` self-hosted runner work.
 - **`VzBuilderVm` orchestration** — Phase C primitive
   (`VzBackend::run_attached`) is in place. The full builder-VM
   impl needs the seam refactor sketched in
