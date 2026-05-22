@@ -39,10 +39,12 @@ Phase A sub-tasks:
       dev-shell image and host-side `vsock-connect 3:5252` succeeds
       *(deferred — needs Phase B's `VzBackend` to produce the JSON
       against real artifact paths)*
-- [ ] Rust fuzz target `crates/mvm-vz/fuzz/fuzz_supervisor_config.rs`
-      generating the corpus; Swift-side equivalence test reads the
-      same corpus and asserts equivalent rejections (ADR-002 claim 5)
-      *(deferred — Rust `mvm-vz` crate is a Phase B item)*
+- [x] Rust fuzz target `crates/mvm-vz/fuzz/fuzz_supervisor_config.rs`
+      driving `serde_json::from_slice::<SupervisorConfig>`; wired into
+      `.github/workflows/security.yml` alongside the libkrun
+      equivalent; corpus artifacts upload on failure. The full
+      Swift-side equivalence assertion is a follow-up that runs the
+      same corpus through the Swift decoder.
 
 Phase B sub-tasks:
 
@@ -766,6 +768,16 @@ Each session that touches this plan appends an entry below.
 - 2026-05-22 — Plan filed. ADR-056 reserved. Worktree
   `worktree-vz-backend-phase-a` created off `origin/main` for Phase A
   work. SPRINT.md Sprint 55 section added.
+- 2026-05-22 — Rust fuzz target for `SupervisorConfig`:
+  `crates/mvm-vz/fuzz/fuzz_supervisor_config.rs` exercises
+  `serde_json::from_slice::<SupervisorConfig>` (panic-free for any
+  input). Cargo workspace excludes the fuzz crate (libfuzzer-sys
+  linker constraints, mirrors mvm-libkrun/fuzz); nightly toolchain
+  pinned via `rust-toolchain.toml`. `.github/workflows/security.yml`
+  runs it alongside the libkrun supervisor target; corpus / artifacts
+  upload on failure. Foundation for the Swift-side equivalence test
+  (claim 5 follow-up: feed the corpus through `JSONDecoder` and assert
+  the two decoders reject the same inputs).
 - 2026-05-22 — Phase D closure: `specs/adrs/056-vz-backend.md` filed
   (rationale, Tier 2 reasoning, ADR-002 claim audit, alternatives,
   future work); ADR-002 backend table at
