@@ -28,6 +28,27 @@ mountpoint -q /dev  || mount -t devtmpfs devtmpfs /dev || true
 mountpoint -q /tmp  || mount -t tmpfs    -o mode=1777 tmpfs /tmp
 mountpoint -q /run  || mount -t tmpfs    -o mode=0755 tmpfs /run
 
+# `/dev/null` insurance. Observed (2026-05-21): some Stage 0 runs
+# under libkrun's set_root container mode reach userspace with
+# `/dev/random` + `/dev/urandom` present but `/dev/null` missing,
+# which then breaks every downstream `2>/dev/null` redirect — and
+# the init script's error handlers were exactly the consumers of
+# that pattern, so the actual nix-build failure got masked behind
+# "/init: line N: can't create /dev/null: nonexistent directory".
+# `mknod` with the standard major=1/minor=3 nodes /dev/null
+# explicitly; the `|| true` makes it a no-op when libkrun already
+# populated the node. Belt-and-suspenders — the error-handler
+# rewrite below also drops `2>/dev/null` so even a *failed* mknod
+# doesn't lose nix's actual stderr next time.
+[ -c /dev/null ] || { mknod /dev/null c 1 3 && chmod 0666 /dev/null; } || true
+
+# Console-visible /dev probe. Gives us evidence on every Stage 0
+# run about whether /dev/null was already there (the mknod was a
+# no-op) or absent (mknod created it / failed). Cheap; the
+# alternative is debugging the next masked failure blind.
+echo "stage0-init: /dev probe:" >&2
+ls -la /dev/null /dev/random /dev/urandom /dev/zero 2>&1 | sed 's/^/  /' >&2 || true
+
 # Bring eth0 up explicitly before udhcpc. busybox 1.36.x udhcpc
 # does not auto-up the interface — sendto returns ENETDOWN and
 # udhcpc loops forever. The libkrun virtio-net device is admin-DOWN
@@ -103,7 +124,13 @@ apk --no-progress update                              > /out/apk-update.log  2>&
 APK_RC=$?
 if [ "$APK_RC" -ne 0 ]; then
   echo "stage0-init: apk update exited $APK_RC (see /out/apk-update.log)" >&2
-  tail -40 /out/apk-update.log >&2 2>/dev/null || true
+  # `[ -r ]` test instead of the old `2>/dev/null` pattern: a
+  # missing `/dev/null` would itself make the redirect fail with
+  # "can't create /dev/null: nonexistent directory" and mask the
+  # real apk error. See the /dev/null insurance block at the top.
+  if [ -r /out/apk-update.log ]; then
+    tail -40 /out/apk-update.log >&2
+  fi
   exit "$APK_RC"
 fi
 apk --no-progress add nix git ca-certificates xz      > /out/apk-add.log     2>&1
@@ -111,7 +138,9 @@ APK_RC=$?
 set -e
 if [ "$APK_RC" -ne 0 ]; then
   echo "stage0-init: apk add exited $APK_RC (see /out/apk-add.log)" >&2
-  tail -40 /out/apk-add.log >&2 2>/dev/null || true
+  if [ -r /out/apk-add.log ]; then
+    tail -40 /out/apk-add.log >&2
+  fi
   exit "$APK_RC"
 fi
 
@@ -153,7 +182,16 @@ set -e
 if [ "$NIX_RC" -ne 0 ]; then
   echo "stage0-init: nix build exited $NIX_RC (see /out/nix-stderr.log)" >&2
   echo "stage0-init: === nix-stderr.log tail (last 80 lines) ===" >&2
-  tail -80 /out/nix-stderr.log >&2 2>/dev/null || echo "stage0-init: (could not read /out/nix-stderr.log)" >&2
+  # `[ -r ]` rather than the old `tail ... 2>/dev/null` so a missing
+  # `/dev/null` (observed at least once on libkrun set_root mode)
+  # doesn't mask the real nix error. The /dev/null insurance block
+  # at the top of this script is the primary fix; this is the
+  # belt-and-suspenders second layer.
+  if [ -r /out/nix-stderr.log ]; then
+    tail -80 /out/nix-stderr.log >&2
+  else
+    echo "stage0-init: (could not read /out/nix-stderr.log)" >&2
+  fi
   echo "stage0-init: === end nix-stderr.log ===" >&2
   exit "$NIX_RC"
 fi

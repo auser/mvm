@@ -556,6 +556,64 @@ mod tests {
         );
     }
 
+    /// Regression for the 2026-05-21 `mvmctl dev up` failure where
+    /// `nix build` exited 1 and the init's error handler then
+    /// printed `/init: line 156: can't create /dev/null: nonexistent
+    /// directory` — masking the real nix-build error because the
+    /// `tail … 2>/dev/null` redirect tried to open a missing
+    /// `/dev/null` in libkrun's set_root container mode.
+    ///
+    /// Two invariants this PR establishes:
+    ///   1. The script `mknod`s `/dev/null` early so subsequent
+    ///      `2>/dev/null` redirects in any other tool still work.
+    ///   2. The script's own error handlers never use `2>/dev/null`
+    ///      themselves — even if (1) fails for some other reason,
+    ///      the nix-build error reaches the console.
+    #[test]
+    fn init_script_protects_against_missing_dev_null() {
+        assert!(
+            INIT_SCRIPT.contains("mknod /dev/null c 1 3"),
+            "init script must mknod /dev/null with major=1 minor=3 to \
+             survive libkrun set_root quirks where /dev/null is absent"
+        );
+        assert!(
+            INIT_SCRIPT.contains("[ -c /dev/null ]"),
+            "init script must gate the mknod on `[ -c /dev/null ]` so \
+             a well-populated /dev doesn't trip the mknod"
+        );
+        // Comments (lines starting with `#` after optional leading
+        // whitespace) reference the bad pattern by name to explain
+        // why it's avoided. The test only cares about live code.
+        for (i, line) in INIT_SCRIPT.lines().enumerate() {
+            let trimmed = line.trim_start();
+            if trimmed.starts_with('#') || trimmed.is_empty() {
+                continue;
+            }
+            assert!(
+                !line.contains("2>/dev/null"),
+                "init script line {} uses `2>/dev/null` in live code:\n\
+                 \n  {}\n\n\
+                 That's the pattern that masked the real nix-build \
+                 failure when /dev/null was missing in libkrun \
+                 set_root mode — replace with an `[ -r FILE ]` guard.",
+                i + 1,
+                line
+            );
+        }
+    }
+
+    /// Catch a regression in the boot-time /dev probe — if it
+    /// disappears, the next debugging session loses its primary
+    /// diagnostic for /dev/null absence.
+    #[test]
+    fn init_script_logs_dev_probe_at_boot() {
+        assert!(
+            INIT_SCRIPT.contains("/dev probe:"),
+            "init script must log a /dev probe so we can see whether \
+             /dev/null was already there or had to be mknod'd"
+        );
+    }
+
     #[test]
     fn cache_dir_is_under_home() {
         let path = stage0_cache_dir();
