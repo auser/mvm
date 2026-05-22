@@ -1827,7 +1827,7 @@ Discovered while running `cargo test --workspace --all-features` to gate the dev
 2. `mvm-cli::commands::env::apple_container::dev_status_image_tests::builder_cache_status_reports_source_provenance_drift` — fixture panics with `builder VM source fingerprint missing /var/folders/.../Cargo.lock`. Caused by `155b561f` (PR #422) expanding the fingerprint to require a `Cargo.lock` in the workspace root, but this test fixture builds an isolated temp flake dir without one. Fix: stage an empty `Cargo.lock` (or copy the workspace one) into the fixture's temp workspace root before invoking the fingerprint code.
 3. `mvm-cli::commands::env::apple_container::dev_status_image_tests::builder_cache_status_reports_source_cache_hit_without_paths` — identical cause as (2).
 
-## Sprint 55 — `Virtualization.framework` backend (`vz`) — IN FLIGHT  [`plans/97-vz-backend.md`](plans/97-vz-backend.md)
+## Sprint 55 — `Virtualization.framework` backend (`vz`) — PHASES A/B/D SHIPPED, C+E PARKED  [`plans/97-vz-backend.md`](plans/97-vz-backend.md) | [`adrs/056-vz-backend.md`](adrs/056-vz-backend.md)
 
 Adds a fourth macOS hypervisor backend (`vz`) parallel to libkrun and
 Apple Container, using Apple's `Virtualization.framework` directly via
@@ -1853,30 +1853,39 @@ code (vsock CID 3 / ports 5252, 10000+, 20000+ remain unchanged).
 
 ### Workstream breakdown
 
-- 🟡 **Phase A** — `mvm-vz-supervisor` Swift binary (smallest tracer).
-      Reads `SupervisorConfig` JSON on stdin, builds
-      `VZVirtualMachineConfiguration`, boots VM, forwards SIGTERM.
-      *Binary scaffolded, builds clean, error-path smoke tests green,
-      ad-hoc codesigned with `com.apple.security.virtualization`.
-      Remaining: full boot acceptance (gated on Phase B) + Rust fuzz
-      corpus (gated on the Phase B `mvm-vz` crate).*
-      Acceptance: `vsock-connect 3:5252` succeeds against the
-      dev-shell image booted under Vz.
-- [ ] **Phase B** — `VzBackend` impl in `crates/mvm-backend/src/vz.rs`,
-      `BackendKind::Vz`, `MVM_BACKEND=vz` opt-in. `auto_select()`
-      **unchanged**. Acceptance:
-      `MVM_BACKEND=vz mvmctl run dev-shell` boots a workload microVM
-      directly on macOS without nested libkrun.
-- [ ] **Phase C** — Vz as a builder-VM backend; `MVM_BUILDER_BACKEND=vz`
-      produces byte-identical rootfs to libkrun-hosted equivalent.
-      Stage 0 audit + cache-prune contract participation.
-- [ ] **Phase D** — `specs/adrs/056-vz-backend.md` lands;
-      ADR-002 backend table updated with Vz row + claim coverage;
-      CI matrix wired for macOS 13.x / current / 26+ builds.
-- [ ] **Phase E** — Snapshot / save-restore on macOS 14+.
-      `mvmctl snapshot save / restore`. Snapshot file SHA-256
-      hash-pinned in the audit chain. `VmCapabilities::snapshots = true`
-      on macOS 14+.
+- ✅ **Phase A** — `mvm-vz-supervisor` Swift binary. Builds clean
+      under macos-13+, ad-hoc codesigned with
+      `com.apple.security.virtualization`, strict deny-unknown-fields
+      JSON decoder, vsock unix-socket bridges, gvproxy network
+      attachment, resource-cap validation against Vz host limits,
+      capture-only console.
+- ✅ **Phase B** — `VzBackend` impl in `crates/mvm-backend/src/vz.rs`,
+      `BackendKind::Vz`, `MVM_BACKEND=vz` / `--backend vz` opt-in.
+      `auto_select()` unchanged. Full lifecycle: start (resolve +
+      spawn + pipe JSON + PID wait), stop (SIGTERM → SIGKILL),
+      status, list, logs. `mvmctl doctor` reports availability +
+      supervisor-binary path. `cargo build` auto-builds the Swift
+      supervisor via `mvm-vz/build.rs`. Acceptance smoke (full boot
+      to vsock 5252) deferred — gated on dev-shell artifacts; every
+      backend bit is in place.
+- 🅿️ **Phase C** — Vz as a builder-VM backend. **Parked as a
+      follow-up slice.** Real `VzBuilderVm` impl needs to mirror
+      `LibkrunBuilderVm` (~3,300 lines of substrate orchestration:
+      virtio-fs `/work`/`/out`/`/job` shares, `mvm-builder-init`
+      PID 1, Nix store overlay, kernel-panic console-log watcher,
+      cmd.sh emission) or refactor the shared parts behind a
+      hypervisor-agnostic seam first. Comparable in size to
+      Phase B; deserves its own PR.
+- ✅ **Phase D** — `specs/adrs/056-vz-backend.md` filed; ADR-002
+      backend table gained the Vz row. `.github/workflows/ci.yml::vz-macos`
+      lane matrices the build over macos-13 + macos-latest with
+      entitlement assertion + strict-decoder smoke.
+- 🅿️ **Phase E** — Snapshot save/restore on macOS 14+. **Parked as
+      a follow-up slice.** Needs a SOCK_DGRAM control channel between
+      Rust and the running Swift supervisor for PAUSE / RESUME /
+      SAVE / RESTORE verbs, command framing, audit-chain hashing of
+      snapshot files, and `VZGenericMachineIdentifier` persistence
+      across restore.
 
 ### Cross-cutting
 

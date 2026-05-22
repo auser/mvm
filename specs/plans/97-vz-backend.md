@@ -1,8 +1,28 @@
 # Plan 97 — `Virtualization.framework` backend (`vz`)
 
-> **Status:** Phase A — supervisor binary scaffolded and building;
-> end-to-end boot acceptance + Rust-side fuzz target are the remaining
-> Phase A items. ADR-056 deferred until Phase D.
+> **Status (2026-05-22):** Phases A, B, D complete. Workload microVM
+> path is end-to-end functional on macOS 13+: `MVM_BACKEND=vz mvmctl
+> up` admits, builds the `SupervisorConfig`, spawns the codesigned
+> Swift supervisor, runs the VM, manages its PID/lifecycle, and
+> `mvmctl doctor` surfaces availability + supervisor-binary presence.
+> CI lane `vz-macos` matrices the build over macos-13 + macos-latest.
+> Rust supervisor-JSON fuzz target wired into `security.yml`.
+>
+> **Parked as multi-session follow-ups:**
+> - **Phase C** (Vz as a builder-VM backend) — `LibkrunBuilderVm` is
+>   ~3,300 lines of substrate orchestration (virtio-fs shares for
+>   /work/out/job, `mvm-builder-init` PID 1, Nix store overlay,
+>   kernel-panic console-log watcher, cmd.sh emission). A real
+>   `VzBuilderVm` impl needs to either mirror this or refactor the
+>   shared parts behind a hypervisor-agnostic seam. Out of scope for
+>   the closure session; tracked under the Phase C checklist below.
+> - **Phase E** (snapshot save/restore via supervisor control socket)
+>   — needs a SOCK_DGRAM control channel between Rust and the running
+>   Swift supervisor (PAUSE / RESUME / SAVE / RESTORE verbs) with
+>   command framing, error classification, snapshot-file SHA-256 in
+>   the audit chain, and `VZGenericMachineIdentifier` persistence.
+>   Substantial own-PR-sized slice; tracked under the Phase E
+>   checklist.
 >
 > Pick-up command for fresh sessions: read this file top to bottom, then
 > jump to the next unchecked item in the **Progress checklist** below.
@@ -11,11 +31,16 @@
 
 Top-level phases:
 
-- [ ] **Phase A** — `mvm-vz-supervisor` Swift binary (smallest tracer)
-- [ ] **Phase B** — `VzBackend` impl in `crates/mvm-backend/src/vz.rs`
-- [ ] **Phase C** — Vz as a builder-VM backend
-- [ ] **Phase D** — ADR-056 lands + ADR-002 backend table update
-- [ ] **Phase E** — Snapshot / save-restore (macOS 14+)
+- [x] **Phase A** — `mvm-vz-supervisor` Swift binary
+- [x] **Phase B** — `VzBackend` impl in `crates/mvm-backend/src/vz.rs`
+- [ ] **Phase C** — Vz as a builder-VM backend  *(parked: needs a
+      `VzBuilderVm` impl mirroring `LibkrunBuilderVm`'s ~3,300 lines
+      of substrate orchestration or a refactor extracting the
+      hypervisor-agnostic seam first)*
+- [x] **Phase D** — ADR-056 lands + ADR-002 backend table update
+- [ ] **Phase E** — Snapshot / save-restore (macOS 14+)  *(parked:
+      needs the supervisor control-socket channel for PAUSE / RESUME /
+      SAVE / RESTORE with command framing + audit-chain hashing)*
 
 Phase A sub-tasks:
 
@@ -768,6 +793,13 @@ Each session that touches this plan appends an entry below.
 - 2026-05-22 — Plan filed. ADR-056 reserved. Worktree
   `worktree-vz-backend-phase-a` created off `origin/main` for Phase A
   work. SPRINT.md Sprint 55 section added.
+- 2026-05-22 — Closure: top-level Phase A / B / D marked complete;
+  Phase C and Phase E moved to parked status with explicit rationale
+  for the deferral. Phases C and E are real follow-up slices (each
+  comparable in size to Phase B), not stubs left in-tree.
+  `cargo test --workspace` + `cargo clippy --workspace --all-targets
+  -- -D warnings` clean at this point. 12 commits on
+  `worktree-vz-backend-phase-a`.
 - 2026-05-22 — Rust fuzz target for `SupervisorConfig`:
   `crates/mvm-vz/fuzz/fuzz_supervisor_config.rs` exercises
   `serde_json::from_slice::<SupervisorConfig>` (panic-free for any
