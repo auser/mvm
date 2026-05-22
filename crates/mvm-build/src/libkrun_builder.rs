@@ -2423,11 +2423,22 @@ mod tests {
     #[test]
     fn run_build_surfaces_environment_gaps_for_install_variant() {
         // Plan 73 Followup B.2 wires the Install variant — passing
-        // input validation no longer trips NotYetImplemented. With
-        // a CI runner that doesn't carry libkrun + the supervisor
-        // binary, run_build now surfaces the same environment-gap
-        // shape as the Flake variant. Asserts the wiring proceeds
-        // past validation rather than short-circuiting.
+        // input validation no longer trips NotYetImplemented. Two
+        // host shapes can hit this code path:
+        //
+        // - CI runner without libkrun: `run_build` short-circuits at
+        //   the supervisor-binary lookup with `LibkrunUnavailable`
+        //   (or `ExtractionFailed` if an earlier I/O step fails).
+        // - Contributor host with libkrun installed via Homebrew (per
+        //   `CLAUDE.md` host-deps): the supervisor actually spawns
+        //   against the stub `{}` install spec, which the in-VM
+        //   pipeline rejects because the spec is missing required
+        //   fields (`language`, …) — surfacing as `NixBuildFailed`.
+        //
+        // Both outcomes prove the wiring proceeds past validation
+        // rather than short-circuiting on `NotYetImplemented`, which
+        // is what this test exists to guarantee. The test must NOT
+        // require a specific host environment.
         let scratch = TempDir::new().unwrap();
         let spec_path = scratch.path().join("spec.json");
         std::fs::write(&spec_path, b"{}").unwrap();
@@ -2436,9 +2447,15 @@ mod tests {
             .run_build(&BuilderJob::Install { spec_path }, &mounts)
             .unwrap_err();
         assert!(
+            !matches!(err, BuilderVmError::NotYetImplemented),
+            "Install variant must not short-circuit on NotYetImplemented: {err:?}"
+        );
+        assert!(
             matches!(
                 err,
-                BuilderVmError::LibkrunUnavailable(_) | BuilderVmError::ExtractionFailed(_)
+                BuilderVmError::LibkrunUnavailable(_)
+                    | BuilderVmError::ExtractionFailed(_)
+                    | BuilderVmError::NixBuildFailed(_)
             ),
             "unexpected error variant: {err:?}"
         );

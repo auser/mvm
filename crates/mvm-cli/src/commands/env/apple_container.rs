@@ -4281,6 +4281,33 @@ mod dev_status_image_tests {
         std::fs::write(dir.join("flake.lock"), "{\"nodes\":{}}").expect("write lock");
     }
 
+    /// Stage the workspace prerequisites that `builder_vm_source_fingerprint`
+    /// (post-PR #422) reads in addition to the flake dir itself:
+    /// `Cargo.lock` at the workspace root + stub `mvm-builder-init` and
+    /// `mvm-egress-proxy` crate dirs. Without this, any test that calls
+    /// the fingerprint helper against a fresh tempdir-rooted flake at
+    /// `<tmp>/nix/images/builder-vm` blows up with
+    /// `builder VM source fingerprint missing <tmp>/Cargo.lock`.
+    ///
+    /// Matches `builder_vm_bootstrap_tests::write_builder_vm_workspace`
+    /// in shape; lives here as well because the two test mods are
+    /// independent and we don't want to plumb a cross-mod helper just
+    /// for two callers.
+    fn write_builder_vm_workspace_prereqs(workspace_root: &std::path::Path) {
+        std::fs::write(workspace_root.join("Cargo.lock"), "# stub Cargo.lock\n")
+            .expect("write Cargo.lock");
+        for crate_name in ["mvm-builder-init", "mvm-egress-proxy"] {
+            let src = workspace_root.join("crates").join(crate_name).join("src");
+            std::fs::create_dir_all(&src).expect("mkdir crate src");
+            std::fs::write(
+                src.parent().unwrap().join("Cargo.toml"),
+                format!("[package]\nname = \"{crate_name}\"\nversion = \"0.0.0\"\n"),
+            )
+            .expect("write Cargo.toml");
+            std::fs::write(src.join("main.rs"), "fn main() {}\n").expect("write main.rs");
+        }
+    }
+
     #[test]
     fn status_image_prefers_launchd_image_paths() {
         let _lock = ENV_LOCK.lock().unwrap();
@@ -4633,6 +4660,7 @@ mod dev_status_image_tests {
         let cache_root = tmp.path().join("cache");
         let cache = cache_root.join("builder-vm/testarch");
         write_builder_vm_flake(&flake);
+        write_builder_vm_workspace_prereqs(tmp.path());
         write_valid_builder_cache_artifacts(&cache);
         let fingerprint = builder_vm_source_fingerprint(flake.to_str().unwrap()).unwrap();
         write_builder_vm_source_fingerprint(&cache, &fingerprint).unwrap();
@@ -4660,6 +4688,7 @@ mod dev_status_image_tests {
         let cache_root = tmp.path().join("cache");
         let cache = cache_root.join("builder-vm/testarch");
         write_builder_vm_flake(&flake);
+        write_builder_vm_workspace_prereqs(tmp.path());
         write_valid_builder_cache_artifacts(&cache);
         let fingerprint = builder_vm_source_fingerprint(flake.to_str().unwrap()).unwrap();
         write_builder_vm_source_fingerprint(&cache, &fingerprint).unwrap();
