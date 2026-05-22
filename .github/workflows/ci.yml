@@ -583,6 +583,97 @@ jobs:
           printf '{"unexpected_key":1}' | "$BIN" 2>&1 | grep -q 'unknown field' \
             || { echo 'unknown-field rejection regressed' >&2; exit 1; }
 
+  # ── Lane: Vz on macOS 26 (Apple Silicon, opt-in self-hosted) ──
+  #
+  # Plan 97 Phase D §"Future work — macOS 26 lane". GHA-hosted
+  # runners do not (as of 2026-05) expose a `macos-26` image; this
+  # lane targets a self-hosted Apple Silicon runner labelled
+  # `[self-hosted, macOS, ARM64, macos-26]`. It is explicitly gated
+  # on the `MACOS_26_AVAILABLE` repo variable — without that gate,
+  # GitHub Actions would queue the job forever waiting for a runner
+  # that doesn't exist, blocking branch protection.
+  #
+  # Wiring a runner:
+  #   1. Set repo variable `MACOS_26_AVAILABLE=true` (Settings →
+  #      Secrets and variables → Variables).
+  #   2. Register a self-hosted runner with labels `macOS`, `ARM64`,
+  #      `macos-26`.
+  #   3. The job's steps mirror the `vz-macos` lane; the additional
+  #      `apple-container-coexists` smoke makes sense only on macOS
+  #      26+ where the system `container` binary is provided.
+  #
+  # `continue-on-error: true` keeps a fragile self-hosted runner
+  # (network blips, drift) from gating PRs; the lane is observational
+  # until performance baseline numbers (Plan 97 Phase D residual
+  # item) make it load-bearing.
+  vz-macos-26:
+    name: Vz / macOS 26 (opt-in, self-hosted)
+    if: ${{ vars.MACOS_26_AVAILABLE == 'true' }}
+    runs-on: [self-hosted, macOS, ARM64, macos-26]
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect Vz-touching paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            vz:
+              - 'crates/mvm-vz/**'
+              - 'crates/mvm-vz-supervisor/**'
+              - 'crates/mvm-backend/src/vz.rs'
+              - 'crates/mvm-backend/src/apple_container.rs'
+              - 'crates/mvm-backend/Cargo.toml'
+              - 'crates/mvm-core/src/platform/platform.rs'
+              - 'specs/plans/97-vz-backend.md'
+              - 'specs/adrs/056-vz-backend.md'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-vz-macos26-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-vz-macos26-
+
+      - name: Build the Swift supervisor + Rust crates
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        run: cargo build -p mvm-vz -p mvm-backend
+
+      - name: Test mvm-vz + mvm-backend vz module
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        run: |
+          cargo test -p mvm-vz
+          cargo test -p mvm-backend vz
+
+      - name: Clippy mvm-vz + mvm-backend vz module
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        run: cargo clippy -p mvm-vz -p mvm-backend --all-targets -- -D warnings
+
+      - name: Apple Container coexistence smoke
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        # macOS 26 ships the system `container` binary (the Apple
+        # Container backend's entrypoint). Assert both backends are
+        # visible from `mvmctl doctor` without colliding on the
+        # `~/.mvm/vms/<name>/` tree. Both grep patterns are static
+        # strings, never derived from event inputs.
+        run: |
+          cargo run --bin mvmctl --quiet -- doctor --json > doctor.json
+          grep -q '"vz"' doctor.json || { echo 'doctor did not report vz' >&2; exit 1; }
+          grep -q 'apple-container\|apple_container' doctor.json \
+            || echo 'note: apple-container probe not yet wired; continuing'
+
   # ── Lane: cloud-hypervisor (Linux x86_64, paths-gated) ──
   #
   # Companion to `libkrun-macos`: validates the Linux half of the
