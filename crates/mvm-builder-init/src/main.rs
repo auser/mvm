@@ -1889,8 +1889,8 @@ mod linux {
             .and_then(|s| s.to_str())
             .ok_or_else(|| format!("device path {dev} has no basename"))?;
         let sys_path = format!("/sys/class/block/{basename}/size");
-        let sectors_str = std::fs::read_to_string(&sys_path)
-            .map_err(|e| format!("read {sys_path}: {e}"))?;
+        let sectors_str =
+            std::fs::read_to_string(&sys_path).map_err(|e| format!("read {sys_path}: {e}"))?;
         let sectors: u64 = sectors_str
             .trim()
             .parse()
@@ -1914,14 +1914,7 @@ mod linux {
         // <dev> <count>` short-circuits mkfs's rounding.
         let blocks_4k = device_size_4k_blocks(dev)?;
         let status = Command::new("/sbin/mkfs.ext4")
-            .args([
-                "-F",
-                "-q",
-                "-b",
-                "4096",
-                dev,
-                &blocks_4k.to_string(),
-            ])
+            .args(["-F", "-q", "-b", "4096", dev, &blocks_4k.to_string()])
             .status()
             .map_err(|e| format!("spawn /sbin/mkfs.ext4: {e}"))?;
         if !status.success() {
