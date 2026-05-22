@@ -46,10 +46,13 @@ Phase A sub-tasks:
 
 Phase B sub-tasks:
 
-- [ ] `crates/mvm-core/src/platform/platform.rs::has_vz()` detector
-- [ ] `crates/mvm-backend/src/vz.rs` — `VzBackend` impl of `VmBackend`
-- [ ] `BackendKind::Vz` in `crates/mvm-backend/src/backend.rs`
-- [ ] `MVM_BACKEND=vz` / `--backend vz` opt-in plumbed; `auto_select()`
+- [x] `crates/mvm-core/src/platform/platform.rs::has_vz()` detector
+- [🟡] `crates/mvm-backend/src/vz.rs` — `VzBackend` impl of `VmBackend`
+      *(skeleton landed: trait surface, capabilities, security profile,
+      install message, guest_channel_info; start/stop/status/list/logs
+      bail with NOT_YET_WIRED pending the supervisor-spawn slice)*
+- [x] `BackendKind::Vz` in `crates/mvm-backend/src/backend.rs`
+- [x] `MVM_BACKEND=vz` / `--backend vz` opt-in plumbed; `auto_select()`
       **unchanged**
 - [ ] Resource-cap parity check (vCPU / memory / disk size); fail-closed
       test asserts over-allocation refused (Security §8)
@@ -728,6 +731,20 @@ Each session that touches this plan appends an entry below.
 - 2026-05-22 — Plan filed. ADR-056 reserved. Worktree
   `worktree-vz-backend-phase-a` created off `origin/main` for Phase A
   work. SPRINT.md Sprint 55 section added.
+- 2026-05-22 — Phase B trait wiring landed:
+  `Platform::has_vz()` in `crates/mvm-core/src/platform/platform.rs`
+  (macOS-only, ≥13.0); `crates/mvm-backend/src/vz.rs` with `VzBackend`
+  implementing `VmBackend` (skeleton: name/capabilities/security
+  profile/install/guest_channel_info real, lifecycle methods bail with
+  NOT_YET_WIRED constant pending supervisor-spawn slice); `BackendKind::Vz`
+  added to `AnyBackend` enum + `inner()` dispatch + `from_hypervisor`
+  (aliases `vz` / `virtualization`) + `tier()`. `auto_select()`
+  **unchanged** per user constraint. Six new VzBackend unit tests + one
+  AnyBackend dispatch test (`test_any_backend_from_hypervisor_vz`) green;
+  `cargo test -p mvm-backend --lib` 148/148; workspace clippy clean.
+  Remaining Phase B: supervisor-spawn `start`, resource-cap parity,
+  cmdline allow-list, `admit_for_run` integration, console mode
+  lockdown, HVF concurrent-VM cap probe, doctor wiring.
 - 2026-05-22 — Phase B foundation landed: `crates/mvm-vz/` Rust
   crate with `SupervisorConfig` (+ nested) types whose JSON shape
   matches the Swift `Config.swift` schema byte-for-byte;

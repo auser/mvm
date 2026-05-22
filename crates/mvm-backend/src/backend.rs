@@ -15,6 +15,7 @@ use crate::image::RuntimeVolume;
 use crate::libkrun::LibkrunBackend;
 use crate::microvm::{DriveFile, FlakeRunConfig};
 use crate::mock::MockBackend;
+use crate::vz::VzBackend;
 use crate::{firecracker, microvm, microvm_nix};
 use mvm_base::config::{PortMapping, VMS_DIR};
 use mvm_base::shell::run_in_vm_stdout;
@@ -299,6 +300,12 @@ pub enum AnyBackend {
     Docker(DockerBackend),
     /// libkrun (plan 53 §"Plan E") — Linux KVM / macOS Apple Silicon HVF.
     Libkrun(LibkrunBackend),
+    /// Vz (Apple Virtualization.framework) — Plan 97 / ADR-056. Direct
+    /// host-level Vz integration on macOS 13+; collapses the nested
+    /// macOS → libkrun → Firecracker workload-microVM path. Opt-in via
+    /// `--backend vz` / `MVM_BACKEND=vz`; `auto_select` keeps libkrun
+    /// as the macOS default per Plan 97 §"Phase D".
+    Vz(VzBackend),
     /// Cloud Hypervisor — rust-vmm peer of Firecracker at Tier 1. Adds
     /// VFIO passthrough, virtio-gpu, virtio-fs, and larger guests
     /// beyond what FC supports. Opt-in via `--hypervisor cloud-hypervisor`;
@@ -340,6 +347,7 @@ impl AnyBackend {
             "apple-container" => Self::AppleContainer(AppleContainerBackend),
             "docker" => Self::Docker(DockerBackend),
             "libkrun" | "krun" => Self::Libkrun(LibkrunBackend),
+            "vz" | "virtualization" => Self::Vz(VzBackend),
             "cloud-hypervisor" | "cloud_hypervisor" | "ch" | "clh" => {
                 Self::CloudHypervisor(CloudHypervisorBackend)
             }
@@ -427,7 +435,9 @@ impl AnyBackend {
             // Container (Virtualization.framework) and microvm.nix
             // (qemu) also sit here per their existing
             // `BackendSecurityProfile.tier` strings.
-            Self::Libkrun(_) | Self::AppleContainer(_) | Self::MicrovmNix(_) => BackendTier::Tier2,
+            Self::Libkrun(_) | Self::AppleContainer(_) | Self::MicrovmNix(_) | Self::Vz(_) => {
+                BackendTier::Tier2
+            }
 
             // Tier 3: fallback / test. Docker is a userspace
             // container fallback; Mock is in-memory test-only.
@@ -443,6 +453,7 @@ impl AnyBackend {
             Self::AppleContainer(b) => b,
             Self::Docker(b) => b,
             Self::Libkrun(b) => b,
+            Self::Vz(b) => b,
             Self::CloudHypervisor(b) => b,
             Self::Mock(b) => b,
         }
@@ -613,6 +624,21 @@ mod tests {
         let profile = backend.security_profile();
         assert_eq!(profile.tier, "Tier 3");
         assert!(!profile.layer_coverage.is_microvm());
+    }
+
+    #[test]
+    fn test_any_backend_from_hypervisor_vz() {
+        // Plan 97 Phase B — `--backend vz` and the longer
+        // `--backend virtualization` both route to the new Vz backend.
+        // `auto_select()` itself stays unchanged on macOS (libkrun
+        // remains the default per the user's "don't replace libkrun"
+        // instruction).
+        for alias in ["vz", "virtualization"] {
+            let backend = AnyBackend::from_hypervisor(alias);
+            assert!(matches!(backend, AnyBackend::Vz(_)), "alias {alias}");
+            assert_eq!(backend.name(), "vz");
+            assert_eq!(backend.tier(), BackendTier::Tier2);
+        }
     }
 
     #[test]

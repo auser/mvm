@@ -239,6 +239,10 @@ mvm-providers = { path = "crates/mvm-providers", version = "0.14.0" }
 # stack. Default feature set is empty; consumers wanting real FFI
 # enable `libkrun-sys` on a host with libkrun installed.
 mvm-libkrun = { path = "crates/mvm-libkrun", version = "0.14.0" }
+# Plan 97 Phase B — type-safe interface to `mvm-vz-supervisor`. No FFI,
+# Linux-safe (compiles everywhere; `Platform::has_vz()` short-circuits
+# on non-macOS).
+mvm-vz = { path = "crates/mvm-vz", version = "0.14.0" }
 mvm-backend = { path = "crates/mvm-backend", version = "0.14.0", default-features = false }
 
 # Plan 73 Followup B.2.x — builder-VM egress allowlist proxy.

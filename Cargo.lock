@@ -3242,6 +3242,7 @@ dependencies = [
  "mvm-guest",
  "mvm-libkrun",
  "mvm-providers",
+ "mvm-vz",
  "serde",
  "serde_json",
  "sha2",
