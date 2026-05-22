@@ -22,7 +22,7 @@ path = "src/main.rs"
 [target.'cfg(target_os = "linux")'.dependencies]
 # Linux mount/reboot syscalls. Kept Linux-only so non-Linux
 # workspace builds don't drag in the dep tree.
-nix = { version = "0.29", features = ["mount", "reboot", "signal"] }
+nix = { version = "0.29", features = ["mount", "reboot", "signal", "ioctl"] }
 # libc for SIGTERM / SIGKILL when tearing the egress proxy down
 # after the installer exits. Linux-only same as nix above.
 libc.workspace = true

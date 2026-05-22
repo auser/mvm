@@ -223,6 +223,11 @@ pub struct BootTimingsWire {
     pub nix_device_ready_ms: Option<u64>,
     pub nix_seeded_ms: Option<u64>,
     pub nix_mounted_ms: Option<u64>,
+    /// Plan 96: `/nix-path-registration` loaded into
+    /// `/nix/var/nix/db` so the in-VM `nix build` skips
+    /// re-substituting seeded paths. `None` on subsequent boots
+    /// where the marker is present and registration is skipped.
+    pub nix_db_loaded_ms: Option<u64>,
     pub modules_ready_ms: Option<u64>,
     pub virtiofs_ready_ms: Option<u64>,
     pub network_ready_ms: Option<u64>,
@@ -372,6 +377,7 @@ mod tests {
                 nix_device_ready_ms: Some(18),
                 nix_seeded_ms: None,
                 nix_mounted_ms: Some(220),
+                nix_db_loaded_ms: Some(225),
                 modules_ready_ms: Some(35),
                 virtiofs_ready_ms: Some(48),
                 network_ready_ms: Some(250),
@@ -544,6 +550,7 @@ mod tests {
             \"nix_device_ready_ms\":18,\
             \"nix_seeded_ms\":null,\
             \"nix_mounted_ms\":220,\
+            \"nix_db_loaded_ms\":225,\
             \"modules_ready_ms\":35,\
             \"virtiofs_ready_ms\":48,\
             \"network_ready_ms\":250,\
@@ -554,6 +561,7 @@ mod tests {
             serde_json::from_str(init_json).expect("must parse builder-init JSON shape");
         assert_eq!(parsed.init_start_ms, Some(0));
         assert_eq!(parsed.nix_seeded_ms, None);
+        assert_eq!(parsed.nix_db_loaded_ms, Some(225));
         assert_eq!(parsed.poweroff_start_ms, Some(8410));
     }
 

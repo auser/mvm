@@ -52,6 +52,12 @@ pub(crate) struct BootTimings {
     pub nix_seeded_ms: Option<u64>,
     /// `/nix-store` bind-mounted over `/nix`.
     pub nix_mounted_ms: Option<u64>,
+    /// `/nix-path-registration` loaded into `/nix/var/nix/db` so
+    /// nix-daemon skips re-substituting the seeded closure. `None`
+    /// on subsequent boots where the sentinel
+    /// (`/nix-store/.seed-db-loaded`) is present and registration
+    /// is skipped.
+    pub nix_db_loaded_ms: Option<u64>,
     /// `fuse` + `virtiofs` kernel modules loaded.
     pub modules_ready_ms: Option<u64>,
     /// All virtio-fs shares (`job`, `out`, `work`) mounted.
@@ -105,6 +111,7 @@ impl BootTimings {
         );
         Self::push_field(&mut out, "nix_seeded_ms", self.nix_seeded_ms, false);
         Self::push_field(&mut out, "nix_mounted_ms", self.nix_mounted_ms, false);
+        Self::push_field(&mut out, "nix_db_loaded_ms", self.nix_db_loaded_ms, false);
         Self::push_field(&mut out, "modules_ready_ms", self.modules_ready_ms, false);
         Self::push_field(&mut out, "virtiofs_ready_ms", self.virtiofs_ready_ms, false);
         Self::push_field(&mut out, "network_ready_ms", self.network_ready_ms, false);
@@ -168,6 +175,7 @@ mod tests {
             nix_device_ready_ms: Some(18),
             nix_seeded_ms: None,
             nix_mounted_ms: Some(220),
+            nix_db_loaded_ms: Some(225),
             modules_ready_ms: Some(35),
             virtiofs_ready_ms: Some(48),
             network_ready_ms: Some(250),
@@ -186,6 +194,7 @@ mod tests {
              \"nix_device_ready_ms\":18,\
              \"nix_seeded_ms\":null,\
              \"nix_mounted_ms\":220,\
+             \"nix_db_loaded_ms\":225,\
              \"modules_ready_ms\":35,\
              \"virtiofs_ready_ms\":48,\
              \"network_ready_ms\":250,\
@@ -197,13 +206,15 @@ mod tests {
 
     #[test]
     fn to_json_emits_null_for_missing_phases() {
-        // Cold-tier second boot: no seed, no network (offline).
+        // Cold-tier second boot: no seed, no network (offline),
+        // DB already loaded on prior boot so skipped.
         let t = BootTimings {
             init_start_ms: Some(0),
             pseudofs_ready_ms: Some(7),
             nix_device_ready_ms: Some(11),
             nix_seeded_ms: None,
             nix_mounted_ms: Some(15),
+            nix_db_loaded_ms: None,
             modules_ready_ms: Some(22),
             virtiofs_ready_ms: Some(30),
             network_ready_ms: None,
@@ -213,6 +224,7 @@ mod tests {
         };
         let json = t.to_json();
         assert!(json.contains("\"nix_seeded_ms\":null"), "got {json}");
+        assert!(json.contains("\"nix_db_loaded_ms\":null"), "got {json}");
         assert!(json.contains("\"network_ready_ms\":null"), "got {json}");
     }
 
@@ -228,6 +240,7 @@ mod tests {
             nix_device_ready_ms: Some(18),
             nix_seeded_ms: None,
             nix_mounted_ms: Some(220),
+            nix_db_loaded_ms: Some(225),
             modules_ready_ms: Some(35),
             virtiofs_ready_ms: Some(48),
             network_ready_ms: Some(250),
