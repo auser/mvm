@@ -736,6 +736,19 @@ Each session that touches this plan appends an entry below.
 - 2026-05-22 — Plan filed. ADR-056 reserved. Worktree
   `worktree-vz-backend-phase-a` created off `origin/main` for Phase A
   work. SPRINT.md Sprint 55 section added.
+- 2026-05-22 — `mvmctl doctor` now reports Vz availability +
+  supervisor-binary presence (env / source-checkout / installed
+  paths). Two unit tests + live smoke against a macOS 26 / arm64
+  contributor host. Entitlement and MDM-policy sub-probes remain
+  follow-ups.
+- 2026-05-22 — `crates/mvm-vz/build.rs` auto-builds the Swift
+  supervisor during `cargo build` on macOS by invoking
+  `crates/mvm-vz-supervisor/tools/build.sh`. No-op on non-macOS
+  hosts and when Swift is unavailable; the warning path keeps
+  Linux contributors unblocked. End-to-end:
+  `cargo clean -p mvm-vz && cargo build -p mvm-vz` produces the
+  ad-hoc-signed supervisor at the source-checkout path the
+  resolver consults first. `MVM_VZ_SKIP_SUPERVISOR_BUILD` opts out.
 - 2026-05-22 — VzBackend lifecycle wired end-to-end: real
   `start`/`stop`/`status`/`list`/`logs`/`install` in
   `crates/mvm-backend/src/vz.rs`, mirroring `LibkrunBackend`'s

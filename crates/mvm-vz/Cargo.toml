@@ -7,6 +7,11 @@ license.workspace = true
 repository.workspace = true
 homepage.workspace = true
 authors.workspace = true
+# Plan 97 Phase B — invokes `crates/mvm-vz-supervisor/tools/build.sh`
+# on macOS so the Swift supervisor binary is in place after every
+# `cargo build`. No-op on non-macOS hosts and when the Swift toolchain
+# is unavailable; never fails the Rust build.
+build = "build.rs"
 
 # ── What this crate is ─────────────────────────────────────────────
 #
