@@ -25,6 +25,7 @@ enum SupervisorError: Error, CustomStringConvertible {
     case stopFailed(Error)
     case noVsockDevice
     case ioError(String, underlying: Error?)
+    case resourceCapExceeded(String)
 
     var description: String {
         switch self {
@@ -40,7 +41,52 @@ enum SupervisorError: Error, CustomStringConvertible {
             return "VM configured without a virtio-socket device"
         case .ioError(let what, let err):
             return "I/O failure (\(what))" + (err.map { ": \($0)" } ?? "")
+        case .resourceCapExceeded(let detail):
+            return "resource cap exceeded: \(detail)"
         }
+    }
+}
+
+/// Plan 97 Security §8 — refuse a config whose requested resources
+/// exceed what Vz advertises as the host-determined ceiling.
+///
+/// `VZVirtualMachineConfiguration.maximumAllowedCPUCount` and the
+/// `minimumAllowedMemorySize` / `maximumAllowedMemorySize` static
+/// properties reflect what the live host can grant; surfacing the
+/// specific error here is more actionable than letting
+/// `.validate()` reject with a generic message later.
+///
+/// This is defense-in-depth: the host-side `admit_for_run` cycle
+/// (Plan 97 / ADR-002 claim 8) is where untrusted callers are
+/// constrained against the admitted plan. The supervisor's check
+/// catches host-side bugs that would otherwise smuggle an
+/// over-allocated config through to Vz.
+private func validateRequestedResources(_ resources: ResourceConfig) throws {
+    let maxCpu = VZVirtualMachineConfiguration.maximumAllowedCPUCount
+    if resources.cpuCount > maxCpu {
+        throw SupervisorError.resourceCapExceeded(
+            "requested cpu_count=\(resources.cpuCount) exceeds host maximum \(maxCpu)"
+        )
+    }
+    if resources.cpuCount < 1 {
+        throw SupervisorError.resourceCapExceeded(
+            "requested cpu_count=\(resources.cpuCount) must be at least 1"
+        )
+    }
+    let minMem = VZVirtualMachineConfiguration.minimumAllowedMemorySize
+    let maxMem = VZVirtualMachineConfiguration.maximumAllowedMemorySize
+    let requested = resources.memoryBytes
+    if requested < minMem {
+        let minMib = minMem / (1024 * 1024)
+        throw SupervisorError.resourceCapExceeded(
+            "requested memory_mib=\(resources.memoryMib) (\(requested) bytes) below host minimum \(minMib) MiB"
+        )
+    }
+    if requested > maxMem {
+        let maxMib = maxMem / (1024 * 1024)
+        throw SupervisorError.resourceCapExceeded(
+            "requested memory_mib=\(resources.memoryMib) (\(requested) bytes) exceeds host maximum \(maxMib) MiB"
+        )
     }
 }
 
@@ -113,6 +159,17 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
     // MARK: - VZ configuration build
 
     private func buildVZConfiguration() throws -> VZVirtualMachineConfiguration {
+        // Plan 97 Security §8 — resource-cap parity. Validate the
+        // requested CPU and memory against the Vz framework's
+        // host-determined bounds *before* constructing the VM
+        // config, so an over-allocated request fails closed with a
+        // clear error rather than via `VZVirtualMachineConfiguration.validate()`'s
+        // less-specific message. The framework's
+        // `maximumAllowedCPUCount` / `min/maxAllowedMemorySize` are
+        // the authoritative ceiling — they depend on the live host,
+        // not on a hardcoded constant.
+        try validateRequestedResources(config.resources)
+
         let vzConfig = VZVirtualMachineConfiguration()
         vzConfig.cpuCount = config.resources.cpuCount
         vzConfig.memorySize = config.resources.memoryBytes

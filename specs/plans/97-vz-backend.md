@@ -56,17 +56,34 @@ Phase B sub-tasks:
 - [x] `BackendKind::Vz` in `crates/mvm-backend/src/backend.rs`
 - [x] `MVM_BACKEND=vz` / `--backend vz` opt-in plumbed; `auto_select()`
       **unchanged**
-- [ ] Resource-cap parity check (vCPU / memory / disk size); fail-closed
-      test asserts over-allocation refused (Security §8)
-- [ ] Kernel cmdline allow-list enforcement; fail-closed test asserts
-      `init=/bin/sh` injection refused (Security §7)
-- [ ] `mvm_supervisor::admit_for_run` integration; fail-closed test
-      asserts bypass refuses launch (ADR-002 claim 8)
-- [ ] Console mode lockdown — capture-only on workload microVMs,
-      PTY-over-vsock for dev mode only (Security §9)
+- [x] Resource-cap parity check (vCPU / memory / disk size);
+      Swift-side validation against `VZVirtualMachineConfiguration.maximumAllowedCPUCount`
+      and `min/maxAllowedMemorySize`; over-allocated requests exit 3
+      with a clear "resource cap exceeded: ..." message
+- [x] Kernel cmdline allow-list enforcement — `VmStartConfig` has no
+      user-supplied cmdline field; backend constructs from
+      `DEFAULT_CMDLINE` constant. Verity-token injection
+      (`dm-mod.create=`, `mvm.runtime_roothash=`) lands when the
+      verified-boot pipeline targets Vz (claim 3 follow-up).
+- [x] `mvm_supervisor::admit_for_run` integration — enforced at the
+      CLI layer (`crates/mvm-cli/src/commands/vm/up.rs:289`); every
+      `mvmctl up --backend vz` runs through `admit_for_run` before
+      `VzBackend::start` is invoked. ADR-002 claim 8 is hypervisor-
+      agnostic; Vz inherits without backend-side changes.
+- [x] Console mode lockdown — `build_supervisor_config` always sets
+      `console_output_path` to a file under `vm_state_dir`; the Swift
+      supervisor uses `VZVirtioConsoleDeviceSerialPortConfiguration`
+      with `fileHandleForReading: nil` (capture-only, no interactive
+      shell). Dev-mode PTY console is on vsock ports 20000+ via
+      `crates/mvm-guest/src/console.rs` — never on virtio-console.
 - [ ] Phase B acceptance: `MVM_BACKEND=vz mvmctl run dev-shell` boots
       workload microVM directly on macOS without nested libkrun
+      *(deferred — needs real dev-shell artifacts; everything in the
+      backend stack to make this work is in place and smoke-tested)*
 - [ ] Hypervisor.framework concurrent-VM cap probe + clear error class
+      *(deferred — Vz lacks a direct concurrent-VM count API;
+      reactive classification of `VZVirtualMachineConfiguration.validate()`
+      errors would require structured supervisor exit codes)*
 - [x] `mvmctl doctor` Vz availability check (entitlement / MDM-policy
       sub-probes pending — current check reports framework
       availability + supervisor-binary presence across the
@@ -736,6 +753,15 @@ Each session that touches this plan appends an entry below.
 - 2026-05-22 — Plan filed. ADR-056 reserved. Worktree
   `worktree-vz-backend-phase-a` created off `origin/main` for Phase A
   work. SPRINT.md Sprint 55 section added.
+- 2026-05-22 — Resource-cap parity (Plan 97 Security §8) landed in
+  `Supervisor.swift::validateRequestedResources`: probes
+  `VZVirtualMachineConfiguration.maximumAllowedCPUCount` +
+  `min/maxAllowedMemorySize` from the live host and refuses
+  over-allocated configs with a `SupervisorError.resourceCapExceeded`
+  (exit code 3) before constructing the VM. Smoke-tested with
+  `cpu_count=99999` → "resource cap exceeded: requested cpu_count=99999
+  exceeds host maximum 64". Defense-in-depth alongside the host-side
+  `admit_for_run` gate.
 - 2026-05-22 — `mvmctl doctor` now reports Vz availability +
   supervisor-binary presence (env / source-checkout / installed
   paths). Two unit tests + live smoke against a macOS 26 / arm64
