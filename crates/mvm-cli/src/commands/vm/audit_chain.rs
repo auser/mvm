@@ -190,6 +190,37 @@ impl AuditEmitter {
         self.emit(plan, "plan.oci_provenance", provenance.audit_labels())
     }
 
+    /// Emit `vm.snapshot_saved` — fires after the supervisor finishes
+    /// writing a snapshot file (Vz `saveMachineStateTo`). The SHA-256
+    /// of the resulting file is recorded as an extra label so the
+    /// audit chain pins the snapshot's bit-identical contents: a
+    /// later `mvmctl snapshot restore` that loads a tampered file is
+    /// detectable by re-hashing and comparing against the chain
+    /// entry. Plan 97 Phase E §"Snapshot file SHA-256 hash-pinned in
+    /// audit chain".
+    pub fn emit_vm_snapshot_saved(
+        &self,
+        plan: &ExecutionPlan,
+        snapshot_path: &std::path::Path,
+        sha256_hex: &str,
+        size_bytes: u64,
+        backend: &str,
+    ) -> Result<()> {
+        self.emit(
+            plan,
+            "vm.snapshot_saved",
+            [
+                (
+                    "snapshot_path".to_string(),
+                    snapshot_path.display().to_string(),
+                ),
+                ("snapshot_sha256".to_string(), sha256_hex.to_string()),
+                ("snapshot_size_bytes".to_string(), size_bytes.to_string()),
+                ("backend".to_string(), backend.to_string()),
+            ],
+        )
+    }
+
     /// Emit `plan.failed` — fires on any error path between admission
     /// and successful boot. `class` is a short tag (`backend-start`,
     /// `snapshot-restore`, etc.) the operator can grep for; `message`
@@ -411,6 +442,34 @@ mod tests {
         // And the single-entry chain still verifies.
         let count = verify_audit_chain(&dir.path().join("local.jsonl"), &vk).unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn vm_snapshot_saved_records_path_hash_and_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = SigningKey::generate(&mut OsRng);
+        let vk = key.verifying_key();
+        let emitter = AuditEmitter::with_dir(key, dir.path()).unwrap();
+        let plan = fixture_plan("local", "plan-S");
+
+        emitter
+            .emit_vm_snapshot_saved(
+                &plan,
+                std::path::Path::new("/tmp/vz/foo.vzsnap"),
+                "00112233445566778899aabbccddeeff00112233445566778899aabbccddeeff",
+                4096,
+                "vz",
+            )
+            .unwrap();
+
+        let path = dir.path().join("local.jsonl");
+        let content = std::fs::read_to_string(&path).expect("audit file exists");
+        assert!(content.contains("vm.snapshot_saved"));
+        assert!(content.contains("/tmp/vz/foo.vzsnap"));
+        assert!(content.contains("00112233445566778899aabbccddeeff"));
+        assert!(content.contains("4096"));
+        assert!(content.contains("\"vz\""));
+        assert_eq!(verify_audit_chain(&path, &vk).unwrap(), 1);
     }
 
     #[test]

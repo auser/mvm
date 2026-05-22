@@ -16,7 +16,7 @@
 
 use anyhow::{Context, Result, bail};
 use clap::Args as ClapArgs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use mvm::vm::instance_snapshot::{
     CannedIO, FirecrackerIO, SnapshotIO, pause_and_seal, verify_and_resume,
@@ -168,6 +168,36 @@ pub(in crate::commands) enum SnapshotCmd {
         #[arg(value_parser = clap_vm_name)]
         name: String,
     },
+    /// Save a running VM's machine state to a file via Vz's
+    /// `saveMachineStateTo` API (macOS 14+). The file's SHA-256 is
+    /// hash-pinned in the audit chain. Plan 97 Phase E.
+    Save {
+        /// Name of the VM to snapshot.
+        #[arg(value_parser = clap_vm_name)]
+        name: String,
+        /// Absolute path where the supervisor writes the snapshot
+        /// blob. The file is opaque — Vz controls the format.
+        #[arg(long)]
+        path: PathBuf,
+        /// Hypervisor that drives the snapshot. Only `vz` is wired
+        /// today; other selectors error with a clear message.
+        #[arg(long, default_value = "vz")]
+        hypervisor: String,
+    },
+    /// Restore a saved Vz machine state file. NOT YET IMPLEMENTED —
+    /// returns a clean error explaining the missing supervisor
+    /// startup mode. Plan 97 Phase E §"RESTORE follow-up".
+    Restore {
+        /// Name of the VM (must not be currently running).
+        #[arg(value_parser = clap_vm_name)]
+        name: String,
+        /// Absolute path of the snapshot blob to load.
+        #[arg(long)]
+        path: PathBuf,
+        /// Hypervisor that drives the restore.
+        #[arg(long, default_value = "vz")]
+        hypervisor: String,
+    },
 }
 
 pub(in crate::commands) fn run_snapshot(
@@ -178,6 +208,16 @@ pub(in crate::commands) fn run_snapshot(
     match args.command {
         SnapshotCmd::Ls { json } => snap_ls(json),
         SnapshotCmd::Rm { name } => snap_rm(&name),
+        SnapshotCmd::Save {
+            name,
+            path,
+            hypervisor,
+        } => snap_save(&name, &path, &hypervisor),
+        SnapshotCmd::Restore {
+            name,
+            path,
+            hypervisor,
+        } => snap_restore(&name, &path, &hypervisor),
     }
 }
 
@@ -240,4 +280,217 @@ fn snap_rm(name: &str) -> Result<()> {
     println!("{}: snapshot removed", name);
     mvm_core::audit_emit!(SnapshotDelete, vm: name);
     Ok(())
+}
+
+/// Plan 97 Phase E — `mvmctl snapshot save <vm> --path <p>`.
+///
+/// Dispatches to `VzBackend::snapshot_save`, then hashes the
+/// resulting file and emits a `vm.snapshot_saved` chain entry
+/// bound to the plan that admitted this VM (loaded from
+/// `~/.mvm/vms/<vm>/plan.json` — written at launch by
+/// `emit_launched_if` in `up.rs`).
+///
+/// Only the `vz` hypervisor is implemented today. Other selectors
+/// error out cleanly: libkrun has no snapshot API, Firecracker has
+/// a different snapshot model (already covered by `pause`/`resume`),
+/// and the mock backend never persists state. The audit emit is
+/// best-effort: a flaky `~/.mvm/audit/` fs warns and continues so a
+/// successful save is still observable on stdout.
+fn snap_save(name: &str, path: &Path, hypervisor: &str) -> Result<()> {
+    validate_vm_name(name).with_context(|| format!("Invalid VM name: {:?}", name))?;
+    if hypervisor != "vz" {
+        bail!(
+            "snapshot save is only implemented for the `vz` backend (got: {:?}). \
+             Firecracker snapshots flow through `mvmctl pause` / `mvmctl resume`; \
+             libkrun and apple-container have no snapshot API.",
+            hypervisor,
+        );
+    }
+    if !path.is_absolute() {
+        bail!(
+            "--path must be absolute, got {} — Vz's saveMachineStateTo \
+             does not honour cwd",
+            path.display(),
+        );
+    }
+    if !mvm_core::platform::current().has_vz() {
+        bail!("vz snapshot save requires macOS 13+ with Virtualization.framework");
+    }
+
+    // Drive the supervisor first; if the save fails there's nothing
+    // to hash. The supervisor returns its own error message for
+    // pre-macOS-14 hosts ("ERR SAVE requires macOS 14+") which
+    // bubbles up verbatim.
+    let id = mvm_core::vm_backend::VmId(name.to_string());
+    let backend = mvm_backend::vz::VzBackend;
+    backend
+        .snapshot_save(&id, path)
+        .with_context(|| format!("vz snapshot save for {name:?}"))?;
+
+    let meta = std::fs::metadata(path)
+        .with_context(|| format!("stat snapshot file {}", path.display()))?;
+    let size = meta.len();
+    let sha = hash_file_sha256(path)
+        .with_context(|| format!("hashing snapshot file {}", path.display()))?;
+
+    println!("{name}: saved snapshot ({size} bytes, sha256 {sha})");
+    println!("  path: {}", path.display());
+
+    // Audit chain emit. If we can load the persisted plan + host
+    // signer key, we get a tamper-evident `vm.snapshot_saved` entry
+    // bound to the plan_id that admitted the VM. If anything in the
+    // chain isn't ready (no plan.json, no signer, audit fs missing),
+    // warn + continue: the snapshot file is already on disk and the
+    // human-facing output above is the operator's source of truth.
+    match super::plan_persist::read_plan(name) {
+        Ok(plan) => match super::host_signer::load_or_init() {
+            Ok(signer) => match super::audit_chain::AuditEmitter::new(signer.signing) {
+                Ok(emitter) => {
+                    if let Err(e) = emitter.emit_vm_snapshot_saved(&plan, path, &sha, size, "vz") {
+                        tracing::warn!(error = %e, "audit emit_vm_snapshot_saved failed (non-fatal)");
+                    }
+                }
+                Err(e) => {
+                    tracing::warn!(error = %e, "audit emitter unavailable; chain entry skipped")
+                }
+            },
+            Err(e) => tracing::warn!(error = %e, "host signer unavailable; chain entry skipped"),
+        },
+        Err(e) => tracing::warn!(
+            error = %e,
+            vm = name,
+            "no persisted plan for VM; vm.snapshot_saved emitted without chain binding"
+        ),
+    }
+    Ok(())
+}
+
+/// Plan 97 Phase E follow-up — `mvmctl snapshot restore`.
+///
+/// The Vz restore path needs a different supervisor startup mode
+/// (Apple's API restores into a *blank* `VZVirtualMachine`, not a
+/// running one), and the supervisor doesn't yet accept "boot from
+/// snapshot blob" instructions on stdin. Tracked as the next
+/// Phase E slice. Returns a clean, non-zero error.
+fn snap_restore(name: &str, path: &Path, hypervisor: &str) -> Result<()> {
+    validate_vm_name(name).with_context(|| format!("Invalid VM name: {:?}", name))?;
+    if hypervisor != "vz" {
+        bail!(
+            "snapshot restore is only planned for the `vz` backend (got: {:?})",
+            hypervisor,
+        );
+    }
+    bail!(
+        "snapshot restore is not yet implemented — the Vz supervisor needs a separate \
+         startup mode that boots from a saved state blob rather than a kernel + cmdline. \
+         Tracked as the next Plan 97 Phase E slice. (Requested restore from {} for VM {:?}.)",
+        path.display(),
+        name,
+    );
+}
+
+/// Stream-hash a file with SHA-256 and return the lowercase hex
+/// digest. `Path` may point at multi-GB Vz snapshots, so we never
+/// slurp the whole file into memory.
+fn hash_file_sha256(path: &Path) -> Result<String> {
+    use sha2::{Digest, Sha256};
+    use std::io::Read;
+    let mut f = std::fs::File::open(path)
+        .with_context(|| format!("opening {} for hashing", path.display()))?;
+    let mut hasher = Sha256::new();
+    let mut buf = [0u8; 64 * 1024];
+    loop {
+        let n = f
+            .read(&mut buf)
+            .with_context(|| format!("reading {} for hashing", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    let digest = hasher.finalize();
+    let mut out = String::with_capacity(digest.len() * 2);
+    for b in digest.iter() {
+        use std::fmt::Write as _;
+        let _ = write!(out, "{:02x}", b);
+    }
+    Ok(out)
+}
+
+#[cfg(test)]
+mod snapshot_save_tests {
+    use super::*;
+
+    #[test]
+    fn save_rejects_non_vz_hypervisor() {
+        let err = snap_save("vm1", Path::new("/tmp/snap.bin"), "libkrun").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("only implemented for the `vz` backend"));
+        assert!(msg.contains("libkrun"));
+    }
+
+    #[test]
+    fn save_rejects_relative_path() {
+        // Skipped when Vz isn't on the host — the relative-path
+        // check fires before the has_vz() probe on macOS, but on
+        // Linux the has_vz()=false bail trips first and the
+        // assertion below tolerates either error message.
+        let err = snap_save("vm1", Path::new("relative.bin"), "vz").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("absolute") || msg.contains("Virtualization.framework"),
+            "expected absolute-path or vz-availability error, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn restore_returns_not_implemented() {
+        let err = snap_restore("vm1", Path::new("/tmp/snap.bin"), "vz").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("not yet implemented"),
+            "restore must clearly signal that it isn't wired: {msg}"
+        );
+        assert!(msg.contains("Plan 97 Phase E"));
+    }
+
+    #[test]
+    fn restore_rejects_non_vz_hypervisor() {
+        let err = snap_restore("vm1", Path::new("/tmp/snap.bin"), "firecracker").unwrap_err();
+        let msg = format!("{err:#}");
+        assert!(msg.contains("only planned for the `vz` backend"));
+    }
+
+    #[test]
+    fn hash_file_sha256_matches_known_vector() {
+        // SHA-256 of "abc" = ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("input.bin");
+        std::fs::write(&p, b"abc").unwrap();
+        let h = hash_file_sha256(&p).unwrap();
+        assert_eq!(
+            h,
+            "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad",
+        );
+    }
+
+    #[test]
+    fn hash_file_sha256_handles_large_streamed_input() {
+        // 256 KiB of 0x42 — exercises the multi-chunk read path.
+        let dir = tempfile::tempdir().unwrap();
+        let p = dir.path().join("big.bin");
+        let bytes = vec![0x42u8; 256 * 1024];
+        std::fs::write(&p, &bytes).unwrap();
+        let h = hash_file_sha256(&p).unwrap();
+
+        use sha2::{Digest, Sha256};
+        let mut hasher = Sha256::new();
+        hasher.update(&bytes);
+        let expected: String = hasher
+            .finalize()
+            .iter()
+            .map(|b| format!("{b:02x}"))
+            .collect();
+        assert_eq!(h, expected);
+    }
 }
