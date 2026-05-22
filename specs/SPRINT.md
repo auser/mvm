@@ -1806,6 +1806,26 @@ don't fall off.
 - Dropping the `microvm.nix` flake input — locally unused in builder-vm but required by `nix/lib/default.nix` for the root flake's NixOS-module path; rework deferred (Plan 95 W1 was dropped post-survey).
 - microvm.nix as a *kernel* or *workload-build* base — explicitly rejected in Plan 95 §Problem and Plan 92 §Decision.
 
+### 2026-05-21 → 2026-05-22 `mvmctl dev up` unblock stack (executor notes)
+
+PRs landed on `main` to walk Stage 0 → persistent builder VM → inner `nix build`:
+
+- ✅ #418 / #419 — early Stage 0 wiring (merged 2026-05-20).
+- ✅ #420 — Plan 96 dev-up followups, including `nix-store --load-db` of seeded /nix/store paths (`a6242604`).
+- ✅ #421 — ext4 geometry recovery + udhcpc path + dev-image flake lock pin.
+- ✅ #422 — builder-VM fingerprint expansion to cover `mvm-builder-init` / `mvm-egress-proxy` / `Cargo.lock` (`155b561f`).
+- ✅ #423 — `mkGuest` skips `addon-dns` bake for the builder VM (Stage 0 OOM mitigation).
+- 🟡 #424 (`worktree-stage0-error-handler`) — `mknod /dev/null` insurance + `/dev` probe at boot + error-handler hardening so the next Stage 0 nix-build failure surfaces its real stderr instead of `can't create /dev/null: nonexistent directory`. All checks green; ready to merge.
+- 🟡 `worktree-dev-fd-symlinks` (PR pending) — adds `/dev/fd → /proc/self/fd` (plus `std{in,out,err}`) at builder-VM boot and in `mkGuest /init`, surfaces `<job_dir>/nix-stderr.log` path + 4 KiB tail on `finalize_flake_job` failure, and prints job dir at dispatch. Closes the `mvm-guest-agent-0.14.0.drv` inner-build failure observed at the very last step of `mvmctl dev up` — every Rust derivation in the dev image's closure was tripping nixpkgs's `cargoInstallHook` line 27 process substitution on a missing `/dev/fd`. Full plan + diagnosis log in [`backlog/42-tracking.md`](backlog/42-tracking.md).
+
+### Carryover follow-ups (pre-existing test breakages on `main`)
+
+Discovered while running `cargo test --workspace --all-features` to gate the dev-fd-symlinks PR. All three reproduce on a freshly-stashed clean `main` checkout; none are caused by the dev-fd-symlinks diff. Each needs its own small follow-up PR.
+
+1. `mvm-build::libkrun_builder::tests::run_build_surfaces_environment_gaps_for_install_variant` — host-environment-dependent. On a macOS contributor host with libkrun installed via Homebrew (which `CLAUDE.md` recommends as the dev-deps install), the test runs the supervisor path past the gap-detection short-circuit and gets `BuilderVmError::NixBuildFailed("supervisor exited with non-zero status (1); ...")` instead of the asserted `LibkrunUnavailable | ExtractionFailed`. Test was written for CI runners that lack libkrun. Fix: gate on a "libkrun absent" probe in the test, or assert the post-spawn `NixBuildFailed` shape too.
+2. `mvm-cli::commands::env::apple_container::dev_status_image_tests::builder_cache_status_reports_source_provenance_drift` — fixture panics with `builder VM source fingerprint missing /var/folders/.../Cargo.lock`. Caused by `155b561f` (PR #422) expanding the fingerprint to require a `Cargo.lock` in the workspace root, but this test fixture builds an isolated temp flake dir without one. Fix: stage an empty `Cargo.lock` (or copy the workspace one) into the fixture's temp workspace root before invoking the fingerprint code.
+3. `mvm-cli::commands::env::apple_container::dev_status_image_tests::builder_cache_status_reports_source_cache_hit_without_paths` — identical cause as (2).
+
 ## Completed Sprints
 
 - [01-foundation.md](sprints/01-foundation.md)

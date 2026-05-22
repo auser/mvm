@@ -165,9 +165,110 @@ fn parse_ext4_recorded_size_bytes(sb: &[u8]) -> Option<u64> {
     total_blocks.checked_mul(block_size)
 }
 
+/// Create `/dev/fd → /proc/self/fd` and `/dev/std{in,out,err} →
+/// /proc/self/fd/{0,1,2}` under `dev_root`. Idempotent: any entry that
+/// already exists (file, symlink, or device node) is left untouched —
+/// we never replace whatever the kernel or a prior boot has put there.
+///
+/// `dev_root` is a parameter so this helper is testable under a
+/// `tempfile::tempdir()` without privilege. The targets are written as
+/// absolute `/proc/self/fd/...` strings on purpose: they're consumed
+/// by code running inside the guest Linux VM where `/proc` is the
+/// procfs mount point. The helper itself is cross-platform — symlink
+/// creation works on macOS too — so unit tests run on contributor Macs
+/// in addition to the production Linux build target.
+pub(crate) fn setup_dev_fd_symlinks(dev_root: &std::path::Path) -> Result<(), String> {
+    use std::os::unix::fs::symlink;
+    for (link_name, target) in [
+        ("fd", "/proc/self/fd"),
+        ("stdin", "/proc/self/fd/0"),
+        ("stdout", "/proc/self/fd/1"),
+        ("stderr", "/proc/self/fd/2"),
+    ] {
+        let link = dev_root.join(link_name);
+        // `Path::exists` follows symlinks; `symlink_metadata` does
+        // not. We want "is there anything at this path?", which is
+        // the symlink_metadata question — otherwise a dangling
+        // symlink left over from a prior boot would be treated as
+        // absent and we'd EEXIST on the symlink call.
+        if link.symlink_metadata().is_ok() {
+            continue;
+        }
+        symlink(target, &link)
+            .map_err(|e| format!("symlink {} -> {target}: {e}", link.display()))?;
+    }
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// `setup_dev_fd_symlinks` lays down all four conventional symlinks
+    /// in an empty /dev so bash process substitution (`< <(...)`)
+    /// finds `/dev/fd/N`. The targets are the `/proc/self/fd` family;
+    /// the symlink_metadata-based skip keeps the helper idempotent on
+    /// reboot. Cross-platform: runs on macOS and Linux.
+    #[test]
+    fn setup_dev_fd_symlinks_creates_all_four_in_empty_dir() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        setup_dev_fd_symlinks(dir.path()).expect("fresh dev_root succeeds");
+        for (name, expected) in [
+            ("fd", "/proc/self/fd"),
+            ("stdin", "/proc/self/fd/0"),
+            ("stdout", "/proc/self/fd/1"),
+            ("stderr", "/proc/self/fd/2"),
+        ] {
+            let link = dir.path().join(name);
+            let target = std::fs::read_link(&link)
+                .unwrap_or_else(|e| panic!("read_link {}: {e}", link.display()));
+            assert_eq!(
+                target.to_string_lossy(),
+                expected,
+                "{name} points at the right /proc/self/fd target"
+            );
+        }
+    }
+
+    /// Idempotency: a pre-existing entry — even a dangling symlink
+    /// left over from a prior boot — is preserved. We never clobber
+    /// what the kernel/initramfs/previous boot staged. Guards
+    /// against, e.g., a future devtmpfs variant that creates
+    /// `/dev/stdin` as a character device.
+    #[test]
+    fn setup_dev_fd_symlinks_is_idempotent_when_already_present() {
+        use std::os::unix::fs::symlink;
+        let dir = tempfile::tempdir().expect("tempdir");
+        symlink("/sentinel", dir.path().join("fd")).expect("pre-stage symlink");
+        setup_dev_fd_symlinks(dir.path()).expect("idempotent run succeeds");
+        assert_eq!(
+            std::fs::read_link(dir.path().join("fd"))
+                .expect("read_link fd")
+                .to_string_lossy(),
+            "/sentinel",
+            "sentinel preserved"
+        );
+        for name in ["stdin", "stdout", "stderr"] {
+            assert!(
+                dir.path().join(name).symlink_metadata().is_ok(),
+                "{name} created on a partially-staged /dev"
+            );
+        }
+    }
+
+    /// A non-existent `dev_root` surfaces as a clean error message
+    /// that names the path. The first failing symlink is enough —
+    /// we don't try to be smart about pre-checking the parent.
+    #[test]
+    fn setup_dev_fd_symlinks_errors_when_dev_root_missing() {
+        let bogus = std::path::PathBuf::from("/this/path/should/not/exist/mvm-dev-fd-test");
+        let err =
+            setup_dev_fd_symlinks(&bogus).expect_err("missing dev_root must error, not panic");
+        assert!(
+            err.contains("/this/path/should/not/exist"),
+            "error names the offending parent path: {err}"
+        );
+    }
 
     #[test]
     fn virtiofs_tag_policy_keeps_only_workspace_read_only() {
@@ -1386,6 +1487,18 @@ mod linux {
         // mkGuest /init mounts this; we replicate for Plan 86.
         let _ = std::fs::create_dir_all("/dev/pts");
         mount_fs_idempotent("devpts", "/dev/pts", "devpts")?;
+        // `/dev/fd → /proc/self/fd` is what bash process substitution
+        // (`< <(...)`, `mapfile -t x < <(...)`) needs to open the
+        // subshell's pipe FD at `/dev/fd/N`. devtmpfs creates device
+        // nodes but never these symlinks; udev/mdev/systemd-tmpfiles
+        // normally do, and we run none of them. Without /dev/fd
+        // nixpkgs's `cargo-install-hook.sh` line 27 fails with
+        // "/dev/fd/63: No such file or directory" and every Rust
+        // derivation in the dev-image closure dies at install time.
+        // `/dev/std{in,out,err}` are conventionally present as well;
+        // we install all four so future hooks that depend on them
+        // don't trip the same surprise.
+        crate::setup_dev_fd_symlinks(Path::new("/dev"))?;
         Ok(())
     }
 

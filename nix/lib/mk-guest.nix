@@ -241,6 +241,20 @@ let
     /bin/busybox mount -t sysfs    sysfs    /sys
     /bin/busybox mount -t devtmpfs devtmpfs /dev
 
+    # /dev/fd → /proc/self/fd is what bash process substitution
+    # (`< <(...)`, `mapfile -t x < <(...)`) needs to open the
+    # subshell's pipe FD at /dev/fd/N. devtmpfs creates device
+    # nodes but never these symlinks; udev/mdev/systemd-tmpfiles
+    # normally do, and we run none of them. Without /dev/fd a
+    # nixpkgs-style build hook fails with "/dev/fd/63: No such
+    # file or directory" — same gap is fixed in mvm-builder-init's
+    # mount_pseudofs(). The four lines are kept symmetric on both
+    # sides on purpose.
+    [ -e /dev/fd ]     || /bin/busybox ln -s /proc/self/fd   /dev/fd
+    [ -e /dev/stdin ]  || /bin/busybox ln -s /proc/self/fd/0 /dev/stdin
+    [ -e /dev/stdout ] || /bin/busybox ln -s /proc/self/fd/1 /dev/stdout
+    [ -e /dev/stderr ] || /bin/busybox ln -s /proc/self/fd/2 /dev/stderr
+
     # Stage 2 — runtime tmpfs. /tmp + /run are RAM so the rootfs
     # stays read-only-leaning; volumes (Phase 2) attach to fixed
     # mountpoints instead.
