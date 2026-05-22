@@ -47,10 +47,12 @@ Phase A sub-tasks:
 Phase B sub-tasks:
 
 - [x] `crates/mvm-core/src/platform/platform.rs::has_vz()` detector
-- [🟡] `crates/mvm-backend/src/vz.rs` — `VzBackend` impl of `VmBackend`
-      *(skeleton landed: trait surface, capabilities, security profile,
-      install message, guest_channel_info; start/stop/status/list/logs
-      bail with NOT_YET_WIRED pending the supervisor-spawn slice)*
+- [x] `crates/mvm-backend/src/vz.rs` — `VzBackend` impl of `VmBackend`
+      with real start/stop/status/list/logs/install via supervisor
+      subprocess + PID file (mirrors `LibkrunBackend`). `pause`/`resume`
+      bail with capability-honest messages because the supervisor
+      exposes only stdin-driven start/stop today; flips on when the
+      control-socket follow-up lands.
 - [x] `BackendKind::Vz` in `crates/mvm-backend/src/backend.rs`
 - [x] `MVM_BACKEND=vz` / `--backend vz` opt-in plumbed; `auto_select()`
       **unchanged**
@@ -731,6 +733,22 @@ Each session that touches this plan appends an entry below.
 - 2026-05-22 — Plan filed. ADR-056 reserved. Worktree
   `worktree-vz-backend-phase-a` created off `origin/main` for Phase A
   work. SPRINT.md Sprint 55 section added.
+- 2026-05-22 — VzBackend lifecycle wired end-to-end: real
+  `start`/`stop`/`status`/`list`/`logs`/`install` in
+  `crates/mvm-backend/src/vz.rs`, mirroring `LibkrunBackend`'s
+  PID-file lifecycle. `start` resolves the supervisor binary via
+  `MVM_VZ_SUPERVISOR_PATH` → adjacent-to-exe →
+  `crates/mvm-vz-supervisor/.build/<arch>/debug/` (source checkout)
+  → `~/.mvm/bin/mvm-vz-supervisor-<version>` (release-installed),
+  builds the `mvm_vz::SupervisorConfig` from `VmStartConfig`,
+  spawns the supervisor with JSON on stdin, waits up to 5 s for
+  the PID file. `stop` reads the PID, sends `SIGTERM`, escalates
+  to `SIGKILL` after 2 s. `pause`/`resume` bail with capability-
+  honest messages (supervisor exposes only stdin-driven start/stop
+  today — pause/resume + balloon adjustment + snapshots need a
+  control socket, follow-up). Eleven VzBackend tests green;
+  workspace clippy clean. Replaces the earlier stub-bail
+  implementations under the same NOT_YET_WIRED sentinel.
 - 2026-05-22 — Phase B trait wiring landed:
   `Platform::has_vz()` in `crates/mvm-core/src/platform/platform.rs`
   (macOS-only, ≥13.0); `crates/mvm-backend/src/vz.rs` with `VzBackend`
