@@ -3649,6 +3649,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "mvm-vz"
+version = "0.14.0"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "mvmctl"
 version = "0.14.0"
 dependencies = [

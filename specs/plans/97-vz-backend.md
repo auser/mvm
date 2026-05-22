@@ -728,6 +728,18 @@ Each session that touches this plan appends an entry below.
 - 2026-05-22 — Plan filed. ADR-056 reserved. Worktree
   `worktree-vz-backend-phase-a` created off `origin/main` for Phase A
   work. SPRINT.md Sprint 55 section added.
+- 2026-05-22 — Phase B foundation landed: `crates/mvm-vz/` Rust
+  crate with `SupervisorConfig` (+ nested) types whose JSON shape
+  matches the Swift `Config.swift` schema byte-for-byte;
+  `#[serde(deny_unknown_fields)]` on every struct mirrors the Swift
+  `StrictKeys` contract. Also includes `MacAddress::parse` with
+  locally-administered bit enforcement, and
+  `supervisor_binary_path` / `source_tree_binary_path` for the
+  release vs. source-checkout resolution split. Seven unit tests
+  green; `cargo check --workspace` clean; `clippy -- -D warnings`
+  clean. This is the "Add: crates/mvm-vz/ (optional)" entry from
+  Plan 97 §"Critical files"; the actual `VzBackend` impl that
+  consumes it is the next slice.
 - 2026-05-22 — Phase A first slice landed: `crates/mvm-vz-supervisor/`
   Swift package builds clean with macOS 13 deployment target. All five
   source files in place (`main.swift`, `Config.swift`, `Supervisor.swift`,

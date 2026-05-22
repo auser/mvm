@@ -8,6 +8,10 @@ members = [
     "crates/mvm-supervisor",
     "crates/mvm-providers",
     "crates/mvm-libkrun",
+    # Plan 97 Phase B — type-safe interface to the Swift
+    # `mvm-vz-supervisor` binary. Pure data + path resolution; no FFI,
+    # no Swift dep. Parallel role to `mvm-libkrun` for the Vz backend.
+    "crates/mvm-vz",
     "crates/mvm-backend",
     "crates/mvm-base",
     "crates/mvm",
