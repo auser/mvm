@@ -489,10 +489,25 @@ fn emit_policy_audit_invalid(
 /// when admission was skipped (`--no-supervisor`). Tolerates emission
 /// failure with a `tracing::warn` so a flaky audit fs can't block a
 /// VM that already booted.
+///
+/// Also persists the admitted plan into the VM state dir so
+/// out-of-process lifecycle verbs (e.g. `mvmctl snapshot save`) can
+/// rehydrate it and bind their audit events to the same plan_id.
+/// Plan persistence failure is non-fatal — the launch already
+/// succeeded; the cost is that lifecycle audit will be unbound on
+/// this VM until the next launch.
 pub(super) fn emit_launched_if(ctx: &Option<AdmissionContext>, backend: &str) {
     let Some(ctx) = ctx else { return };
     if let Err(e) = ctx.emitter.emit_launched(&ctx.admitted.plan, backend) {
         tracing::warn!(error = %e, "audit emit_launched failed (non-fatal)");
+    }
+    if let Err(e) =
+        super::plan_persist::write_plan(&ctx.admitted.plan.workload.0, &ctx.admitted.plan)
+    {
+        tracing::warn!(
+            error = %e,
+            "persisting admitted plan to ~/.mvm/vms/<vm>/plan.json failed (non-fatal)"
+        );
     }
 }
 
