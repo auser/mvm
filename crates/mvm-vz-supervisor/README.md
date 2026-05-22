@@ -59,7 +59,8 @@ claim 1's host-fs contract).
 
 ## License
 
-Apache-2.0 OR MIT, matching the Rust workspace.
+Apache-2.0, matching the workspace's top-level `LICENSE`. See
+[`../../LICENSE`](../../LICENSE) for the full text.
 
 ## See also
 

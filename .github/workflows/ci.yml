@@ -490,6 +490,99 @@ jobs:
         if: steps.filter.outputs.libkrun == 'true' || github.ref == 'refs/heads/main'
         run: cargo clippy -p mvm-libkrun --features libkrun-sys --all-targets -- -D warnings
 
+  # ── Lane: Vz / Virtualization.framework (macOS matrix, paths-gated) ──
+  # Plan 97 §"macOS minor-version compatibility matrix". Runs the
+  # Swift package build + Rust mvm-vz/mvm-backend test surface across
+  # the supported floor (macos-13) and the currently-shipping
+  # macos-latest. No untrusted inputs are interpolated into run:
+  # blocks — only matrix.runner, steps.filter.outputs.vz, runner.os.
+  vz-macos:
+    name: Vz / Virtualization.framework (${{ matrix.runner }})
+    strategy:
+      fail-fast: false
+      matrix:
+        runner:
+          - macos-13      # Plan 97 floor — full virtio surface lands here
+          - macos-latest  # current shipping; covers Apple Container coexistence
+    runs-on: ${{ matrix.runner }}
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect Vz-touching paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            vz:
+              - 'crates/mvm-vz/**'
+              - 'crates/mvm-vz-supervisor/**'
+              - 'crates/mvm-backend/src/vz.rs'
+              - 'crates/mvm-backend/Cargo.toml'
+              - 'crates/mvm-core/src/platform/platform.rs'
+              - 'specs/plans/97-vz-backend.md'
+              - 'specs/adrs/056-vz-backend.md'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@nightly
+        with:
+          components: clippy
+
+      - name: Cache cargo
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-vz-${{ matrix.runner }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-vz-${{ matrix.runner }}-
+
+      # mvm-vz's build.rs invokes
+      # crates/mvm-vz-supervisor/tools/build.sh (swift build + codesign).
+      # GHA macOS runners ship Xcode and a Swift toolchain by default.
+      - name: Build the Swift supervisor + Rust crates
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        run: cargo build -p mvm-vz -p mvm-backend
+
+      - name: Test mvm-vz (config + path resolution + MAC validation)
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        run: cargo test -p mvm-vz
+
+      - name: Test mvm-backend (Vz module)
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        run: cargo test -p mvm-backend vz
+
+      - name: Clippy mvm-vz + mvm-backend vz module
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        run: cargo clippy -p mvm-vz -p mvm-backend --all-targets -- -D warnings
+
+      - name: Verify supervisor binary has the virtualization entitlement
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        # Plan 97 Phase A — mvm-vz-supervisor must carry
+        # com.apple.security.virtualization after the build. Catches
+        # a regression in tools/build.sh codesigning.
+        run: |
+          ARCH="$(uname -m)"
+          BIN="crates/mvm-vz-supervisor/.build/${ARCH}-apple-macosx/debug/mvm-vz-supervisor"
+          test -x "$BIN" || { echo "supervisor binary missing at $BIN" >&2; exit 1; }
+          codesign -d --entitlements - "$BIN" 2>&1 | grep -q 'com.apple.security.virtualization' \
+            || { echo 'supervisor missing com.apple.security.virtualization entitlement' >&2; exit 1; }
+
+      - name: Smoke — empty stdin / unknown field rejection
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        # The supervisor's strict-keys decoder (ADR-002 claim 5
+        # foundation) must reject unknown fields with exit 2.
+        run: |
+          ARCH="$(uname -m)"
+          BIN="crates/mvm-vz-supervisor/.build/${ARCH}-apple-macosx/debug/mvm-vz-supervisor"
+          printf '' | "$BIN" 2>&1 | grep -q 'empty stdin' \
+            || { echo 'empty-stdin path did not produce the expected message' >&2; exit 1; }
+          printf '{"unexpected_key":1}' | "$BIN" 2>&1 | grep -q 'unknown field' \
+            || { echo 'unknown-field rejection regressed' >&2; exit 1; }
+
   # ── Lane: cloud-hypervisor (Linux x86_64, paths-gated) ──
   #
   # Companion to `libkrun-macos`: validates the Linux half of the

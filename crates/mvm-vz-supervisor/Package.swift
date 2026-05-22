@@ -14,7 +14,7 @@
 // Phase A only. Backend wiring (Phase B) and builder-VM mode (Phase C)
 // live elsewhere; this package owns the supervisor binary alone.
 //
-// License: Apache-2.0 OR MIT (matches the Rust workspace).
+// License: Apache-2.0 (matches the Rust workspace's top-level LICENSE).
 
 import PackageDescription
 

@@ -102,15 +102,21 @@ Phase C sub-tasks:
 
 Phase D sub-tasks:
 
-- [ ] `specs/adrs/056-vz-backend.md` — Why Vz, security tier (Tier 2
-      proposed), relationship to ADR-013 / ADR-055, ADR-002 backend
-      table update
+- [x] `specs/adrs/056-vz-backend.md` — Why Vz, security tier (Tier 2),
+      relationship to ADR-013 / ADR-055, ADR-002 backend table update,
+      alternatives considered, future work
 - [ ] Performance numbers from CI lane (cold-boot, idle memory, build
-      wall time) referenced in the ADR
-- [ ] ADR-002 backend table updated with Vz row and claim-coverage
-      markers
-- [ ] macOS minor-version compatibility matrix wired into CI (min 13.x,
-      current latest, one macOS-26+ build)
+      wall time) referenced in the ADR *(deferred — needs a CI lane
+      that can actually boot a VM; GHA-hosted macOS doesn't expose
+      Hypervisor.framework to user processes)*
+- [x] ADR-002 backend table updated with Vz row and claim-coverage
+      markers (Tier 2; L1–L5 covered; claim 3 partial)
+- [x] macOS minor-version compatibility matrix wired into CI —
+      `vz-macos` lane in `.github/workflows/ci.yml` runs on macos-13
+      (floor) + macos-latest (current); path-gated to vz-touching
+      files; asserts the supervisor binary carries the
+      `com.apple.security.virtualization` entitlement and the strict
+      decoder rejects unknown fields
 
 Phase E sub-tasks (macOS 14+):
 
@@ -130,11 +136,18 @@ Phase E sub-tasks (macOS 14+):
 
 Cross-cutting (any phase):
 
-- [ ] Build, distribution, versioning (Swift toolchain in CI,
-      `Package.resolved` pinned, distribution signing + notarization
-      runbook entry, lockstep version pinning with `mvmctl`,
-      source-checkout determinism)
-- [ ] License & Swift package conventions (Apache-2.0 + MIT dual)
+- [x] Build, distribution, versioning — Swift toolchain wired in
+      `.github/workflows/ci.yml::vz-macos`; `Package.resolved` no
+      longer gitignored; lockstep version pinning via the
+      `mvm-vz-supervisor-<CARGO_PKG_VERSION>` filename in
+      `crates/mvm-vz/src/lib.rs::supervisor_binary_path`;
+      source-checkout determinism via
+      `crates/mvm-vz/build.rs` (Plan 97 invariant). Distribution
+      signing + notarization runbook entry deferred — release-only
+      concern that pairs with the eventual `apple` lane work in CI.
+- [x] License & Swift package conventions — Apache-2.0, matches the
+      workspace's top-level `LICENSE`. Swift package's
+      `Package.swift` and `README.md` reference it.
 - [ ] mvmd integration follow-up (separate repo, separate PR)
 - [x] Tracking issue filed for **future work: Windows host via WHP** — [#428](https://github.com/tinylabscom/mvm/issues/428)
 
@@ -753,6 +766,18 @@ Each session that touches this plan appends an entry below.
 - 2026-05-22 — Plan filed. ADR-056 reserved. Worktree
   `worktree-vz-backend-phase-a` created off `origin/main` for Phase A
   work. SPRINT.md Sprint 55 section added.
+- 2026-05-22 — Phase D closure: `specs/adrs/056-vz-backend.md` filed
+  (rationale, Tier 2 reasoning, ADR-002 claim audit, alternatives,
+  future work); ADR-002 backend table at
+  `specs/adrs/002-microvm-security-posture.md` gained the Vz row;
+  `.github/workflows/ci.yml::vz-macos` lane runs the Swift supervisor
+  build + Rust mvm-vz / mvm-backend tests + clippy + entitlement
+  assertion + strict-decoder smoke on macos-13 and macos-latest;
+  Swift package's `.gitignore` no longer excludes `Package.resolved`
+  (Plan 97 cross-cutting); license documentation corrected to
+  Apache-2.0 (workspace's actual license) in Package.swift +
+  README. Performance numbers in the ADR stay TBD until a CI lane
+  with HVF user-mode access exists.
 - 2026-05-22 — Resource-cap parity (Plan 97 Security §8) landed in
   `Supervisor.swift::validateRequestedResources`: probes
   `VZVirtualMachineConfiguration.maximumAllowedCPUCount` +
