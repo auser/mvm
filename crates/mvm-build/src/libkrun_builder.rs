@@ -403,6 +403,17 @@ impl LibkrunBuilderVm {
         let job_id = unique_job_id();
         let job_dir = builder_vm_cache_dir().join("jobs").join(&job_id);
         stage_shell_job_dir(&job_dir, &job.script)?;
+        // Tell the operator up-front where the build's stderr will
+        // land. `/job` is a virtio-fs share into the VM; the guest's
+        // cmd.sh redirects `nix build` stderr into <job_dir>/nix-
+        // stderr.log, which is this exact path on the host. A
+        // contributor watching a long build can `tail -f` it without
+        // waiting for the failure-path formatter (finalize_flake_job)
+        // to surface the same path.
+        tracing::info!(
+            job_dir = %job_dir.display(),
+            "builder VM job dir staged (nix-stderr.log streams here as the build runs)"
+        );
 
         let vm_name = format!("mvm-builder-vm-{job_id}");
         let vm_state_dir = builder_vm_cache_dir().join("vms").join(&vm_name);
@@ -656,6 +667,12 @@ impl BuilderVm for LibkrunBuilderVm {
         let job_id = unique_job_id();
         let job_dir = builder_vm_cache_dir().join("jobs").join(&job_id);
         stage_job_dir(&job_dir, job)?;
+        // Same announcement as the single-shot path — see the
+        // identical block in `LibkrunBuilderVm::run_build`.
+        tracing::info!(
+            job_dir = %job_dir.display(),
+            "builder VM job dir staged (nix-stderr.log streams here as the build runs)"
+        );
 
         // 7. Build the `KrunContext` libkrun consumes. Three
         //    virtio-fs shares (work / out / job), one virtio-blk
@@ -1202,6 +1219,26 @@ fn shell_single_quote_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
+/// Read the last `max_bytes` of `path` into a `String`, replacing any
+/// invalid UTF-8 lossily. Returns `Err` if the file is missing or
+/// unreadable. Used by `finalize_flake_job` to surface the tail of
+/// `<job_dir>/nix-stderr.log` (the cmd.sh's nix-build stderr capture)
+/// in the failure path without loading a multi-hundred-KB log into
+/// memory.
+fn read_last_bytes_of(path: &Path, max_bytes: u64) -> std::io::Result<String> {
+    use std::io::{Seek, SeekFrom};
+    let mut file = std::fs::File::open(path)?;
+    let len = file.metadata()?.len();
+    let take = max_bytes.min(len);
+    // SeekFrom::End wants i64; max_bytes is bounded to a small constant
+    // at every call site (4 KiB today) so the cast is safe.
+    let offset = i64::try_from(take).unwrap_or(i64::MAX).saturating_neg();
+    file.seek(SeekFrom::End(offset))?;
+    let mut buf = Vec::with_capacity(take as usize);
+    file.read_to_end(&mut buf)?;
+    Ok(String::from_utf8_lossy(&buf).into_owned())
+}
+
 /// Finalize a flake build: read `<job_dir>/result`, validate the
 /// `rootfs.ext4` (and optional `vmlinux`) landed in
 /// `artifact_out`, return a [`BuilderArtifacts::Image`].
@@ -1212,9 +1249,26 @@ fn finalize_flake_job(
 ) -> Result<BuilderArtifacts, BuilderVmError> {
     let result = read_job_result(job_dir)?;
     if result.exit_code != 0 {
+        // The 20-line `stderr_tail` in `result` is from the OUTER
+        // cmd.sh (run_job captures cmd.sh's stderr into a 20-line
+        // ringbuffer). That ringbuffer typically only carries the
+        // "nix build exited N; tail of stderr:" preamble — not the
+        // real per-derivation failure. The actual nix-build stderr
+        // is at `<job_dir>/nix-stderr.log` (cmd.sh redirects there
+        // via `2> /job/nix-stderr.log`). Surface its tail so the
+        // operator doesn't have to know the convention.
+        let stderr_log = job_dir.join("nix-stderr.log");
+        let derivation_tail = read_last_bytes_of(&stderr_log, 4 * 1024)
+            .unwrap_or_else(|_| String::from("<nix-stderr.log not present on host>"));
         return Err(BuilderVmError::NixBuildFailed(format!(
-            "guest cmd.sh exited {} — stderr tail:\n{}",
-            result.exit_code, result.stderr_tail
+            "guest cmd.sh exited {} — full log: {}\n\
+             outer stderr tail (cmd.sh ringbuffer):\n{}\n\
+             derivation stderr tail (last 4 KiB of {}):\n{}",
+            result.exit_code,
+            stderr_log.display(),
+            result.stderr_tail,
+            stderr_log.display(),
+            derivation_tail,
         )));
     }
 
@@ -2684,6 +2738,126 @@ mod tests {
             }
             other => panic!("wrong artifact variant: {other:?}"),
         }
+    }
+
+    /// `read_last_bytes_of` returns the trailing `max_bytes` of a
+    /// file. When the file is larger than the cap, we get the *end*,
+    /// not the head — the use case is tailing nix-build stderr where
+    /// the cause-of-death is at the bottom.
+    #[test]
+    fn read_last_bytes_of_returns_trailing_window_when_file_exceeds_cap() {
+        let scratch = TempDir::new().unwrap();
+        let path = scratch.path().join("log");
+        let mut body = String::new();
+        for i in 0..2_000 {
+            body.push_str(&format!("line {i}\n"));
+        }
+        std::fs::write(&path, &body).unwrap();
+        let tail = read_last_bytes_of(&path, 200).unwrap();
+        assert!(tail.len() <= 200);
+        assert!(tail.contains("line 1999"), "tail contains the last line");
+        assert!(
+            !tail.contains("line 0\n"),
+            "tail does not include the head: {tail}"
+        );
+    }
+
+    /// Small file: the helper returns the whole file (capped at its
+    /// real length, not the requested max).
+    #[test]
+    fn read_last_bytes_of_returns_entire_file_when_smaller_than_cap() {
+        let scratch = TempDir::new().unwrap();
+        let path = scratch.path().join("log");
+        std::fs::write(&path, b"hello world").unwrap();
+        let tail = read_last_bytes_of(&path, 4096).unwrap();
+        assert_eq!(tail, "hello world");
+    }
+
+    /// Missing file surfaces as an `io::Error`; the caller in
+    /// `finalize_flake_job` swallows it into a `<not present>`
+    /// sentinel rather than failing the whole error format.
+    #[test]
+    fn read_last_bytes_of_errors_on_missing_file() {
+        let scratch = TempDir::new().unwrap();
+        let err = read_last_bytes_of(&scratch.path().join("missing"), 1024).unwrap_err();
+        assert_eq!(err.kind(), std::io::ErrorKind::NotFound);
+    }
+
+    /// The failure-path error message names the nix-stderr.log path
+    /// AND inlines its tail. This is the diagnostic-surface fix —
+    /// before the change, callers got the outer cmd.sh ringbuffer
+    /// only, with no hint where the real log lived.
+    #[test]
+    fn finalize_flake_job_failure_includes_nix_stderr_log_path_and_tail() {
+        let scratch = TempDir::new().unwrap();
+        let job_dir = scratch.path().join("job");
+        let artifact_out = scratch.path().join("out");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::create_dir_all(&artifact_out).unwrap();
+        std::fs::write(
+            job_dir.join("result"),
+            r#"{"exit_code":1,"stderr_tail":"outer-tail"}"#,
+        )
+        .unwrap();
+        // Sentinel string the helper must surface — proves we're
+        // reading from THIS file and not from the outer ringbuffer.
+        std::fs::write(
+            job_dir.join("nix-stderr.log"),
+            "/nix/store/.../cargo-install-hook.sh: line 27: /dev/fd/63: No such file or directory\n",
+        )
+        .unwrap();
+
+        let err = finalize_flake_job(&job_dir, &artifact_out, "job-id").unwrap_err();
+        let msg = match err {
+            BuilderVmError::NixBuildFailed(s) => s,
+            other => panic!("expected NixBuildFailed, got {other:?}"),
+        };
+        assert!(msg.contains("exited 1"), "names exit code: {msg}");
+        let log_path = job_dir.join("nix-stderr.log");
+        assert!(
+            msg.contains(&*log_path.to_string_lossy()),
+            "names the full log path: {msg}"
+        );
+        assert!(
+            msg.contains("/dev/fd/63: No such file or directory"),
+            "inlines the real derivation stderr tail: {msg}"
+        );
+        assert!(
+            msg.contains("outer-tail"),
+            "still includes the outer ringbuffer for context: {msg}"
+        );
+    }
+
+    /// Missing `nix-stderr.log` doesn't crash the formatter — we get
+    /// a clean sentinel instead of an `Err(...)` cascade. This
+    /// matters for very-early failures (e.g. cmd.sh exit before the
+    /// `2> /job/nix-stderr.log` redirect runs).
+    #[test]
+    fn finalize_flake_job_failure_handles_missing_nix_stderr_log_cleanly() {
+        let scratch = TempDir::new().unwrap();
+        let job_dir = scratch.path().join("job");
+        let artifact_out = scratch.path().join("out");
+        std::fs::create_dir_all(&job_dir).unwrap();
+        std::fs::create_dir_all(&artifact_out).unwrap();
+        std::fs::write(
+            job_dir.join("result"),
+            r#"{"exit_code":2,"stderr_tail":"no cmd.sh"}"#,
+        )
+        .unwrap();
+
+        let err = finalize_flake_job(&job_dir, &artifact_out, "job-id").unwrap_err();
+        let msg = match err {
+            BuilderVmError::NixBuildFailed(s) => s,
+            other => panic!("expected NixBuildFailed, got {other:?}"),
+        };
+        assert!(
+            msg.contains("<nix-stderr.log not present on host>"),
+            "sentinel surfaces in place of missing log: {msg}"
+        );
+        assert!(
+            msg.contains("no cmd.sh"),
+            "outer tail still surfaces: {msg}"
+        );
     }
 
     #[test]
