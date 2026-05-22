@@ -185,7 +185,26 @@ Defense-in-depth additions on top of the trait-level requirements:
   baseline" commits to a CI lane comparing cold-boot wall time,
   idle memory, and build wall time for Vz vs. libkrun-direct
   vs. nested libkrun→Firecracker. The CI lane lands with the
-  macOS test matrix.
+  macOS test matrix. GHA-hosted macOS does not expose
+  Hypervisor.framework to user processes, so this gates on a
+  self-hosted runner; the **`vz-macos-26`** lane in
+  `.github/workflows/ci.yml` is the placeholder, gated on
+  `vars.MACOS_26_AVAILABLE`.
+- **Snapshot RESTORE** — Phase E shipped SAVE end-to-end (`mvmctl
+  snapshot save`, SHA-256 hash-pinned to the audit chain). RESTORE
+  needs a different supervisor startup mode: Apple's API restores
+  into a *blank* `VZVirtualMachine`, so the supervisor's stdin
+  contract has to accept "boot from saved-state blob" alongside
+  the existing "boot from kernel + cmdline" path. Tracked as the
+  next Phase E slice.
+- **`VzBuilderVm` orchestration** — Phase C primitive
+  (`VzBackend::run_attached`) is in place. The full builder-VM
+  impl needs the seam refactor sketched in
+  `specs/plans/97-vz-backend.md` §"Phase C seam design": lift the
+  ~850 lines of hypervisor-agnostic orchestration from
+  `LibkrunBuilderVm` behind a new `VmBackendForBuilder` trait,
+  then `VzBuilderVm` reuses it with a Vz-side mount glue.
+  Estimate: ~400-line impl + ~200-line glue once the seam exists.
 - **mvmd `BackendKind::Vz` adoption.** Cross-repo. Tracked under
   Plan 97 §"mvmd integration".
 - **Windows host support via WHP.** Cataloged as a separate

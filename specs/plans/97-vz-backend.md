@@ -1,6 +1,6 @@
 # Plan 97 — `Virtualization.framework` backend (`vz`)
 
-> **Status (2026-05-22):** Phases A, B, D complete. Workload microVM
+> **Status (2026-05-22):** Phases A, B, D, E complete. Workload microVM
 > path is end-to-end functional on macOS 13+: `MVM_BACKEND=vz mvmctl
 > up` admits, builds the `SupervisorConfig`, spawns the codesigned
 > Swift supervisor, runs the VM, manages its PID/lifecycle, and
@@ -8,13 +8,26 @@
 > CI lane `vz-macos` matrices the build over macos-13 + macos-latest.
 > Rust supervisor-JSON fuzz target wired into `security.yml`.
 >
-> **Phase E** — supervisor control socket + pause / resume /
+> **Phase E (closed)** — supervisor control socket + pause / resume /
 > balloon / snapshot SAVE landed via
 > `crates/mvm-vz-supervisor/Sources/mvm-vz-supervisor/ControlSocket.swift`
 > and `crates/mvm-backend/src/vz_control.rs`. Capabilities flipped
-> on the trait. RESTORE + audit-chain hashing of snapshot files
-> are the remaining Phase E followups (needs CLI verb integration
-> + different supervisor startup mode).
+> on the trait. **`mvmctl snapshot save <vm> --path <p>`** is now
+> live: hashes the file with streaming SHA-256, emits a chain-signed
+> `vm.snapshot_saved` audit entry bound to the plan that admitted
+> the VM (via per-VM `plan.json` persistence — see
+> `crates/mvm-cli/src/commands/vm/plan_persist.rs`), and prints a
+> human-readable summary. `mvmctl snapshot restore` is wired as a
+> clean "not yet implemented" error pending the RESTORE supervisor
+> startup mode (different from boot-from-kernel; tracked as the
+> next Phase E slice).
+>
+> **CI macOS 26 lane** wired as `vz-macos-26` in
+> `.github/workflows/ci.yml`. Gated on `vars.MACOS_26_AVAILABLE` so
+> the job is inert until a self-hosted Apple Silicon runner is
+> registered with labels `[self-hosted, macOS, ARM64, macos-26]`.
+> `continue-on-error: true` keeps a flaky self-hosted runner from
+> gating PRs while the lane is observational.
 >
 > **Parked as multi-session follow-ups:**
 > - **Phase C** (Vz as a builder-VM backend) — `LibkrunBuilderVm` is
@@ -145,6 +158,70 @@ Phase C sub-tasks:
       .` produces byte-identical rootfs to libkrun-hosted equivalent
       *(deferred — needs the orchestration slice above)*
 
+### Phase C seam design (recommendation)
+
+Before a `VzBuilderVm` impl lands, the shared orchestration in
+`crates/mvm-libkrun/` should be lifted behind a thin
+`VmBackendForBuilder` trait so the second impl reuses logic instead
+of duplicating ~3,300 lines. Concretely:
+
+1. **New trait surface** (in `crates/mvm-core/src/protocol/vm_backend.rs`,
+   sibling to `VmBackend`):
+   ```rust
+   pub trait VmBackendForBuilder: Send + Sync {
+       fn run_with_attached_mounts(
+           &self,
+           config: &VmStartConfig,
+           mounts: &[(String /* tag */, PathBuf, bool /* ro */)], // virtio-fs
+           extra_disks: &[(String /* id */, PathBuf, bool /* ro */)], // virtio-blk
+           timeout: Duration,
+       ) -> Result<BuilderVmExitInfo>;
+       fn console_path(&self, id: &VmId) -> PathBuf;
+   }
+   ```
+   `BuilderVmExitInfo { exit_code, panic_line: Option<String> }` —
+   the panic-line is what the libkrun console-log watcher already
+   extracts (`crates/mvm-libkrun/src/lib.rs:1842-1908`).
+
+2. **Lift shareable concerns** out of `LibkrunBuilderVm` into a
+   `BuilderVmRuntime { backend: &dyn VmBackendForBuilder }` helper:
+   `cmd.sh` emission / shell-escape, `/work`/`/out`/`/job` layout,
+   panic-detector poll loop, `/job/result` parsing, Nix store image
+   lock (NixStoreImageLock guard), stderr-tail capture, build
+   failure formatting. Estimate ~850 of the current ~3,300 lines.
+
+3. **Keep libkrun-flavored** what's specific to that VMM:
+   `SupervisorConfig` JSON, `KrunContext` building, networking-mode
+   dispatch (`MVM_NETWORKING`), `extract_bundled_kernel`, the macOS
+   `DYLD_FALLBACK_LIBRARY_PATH` shim. These stay in
+   `LibkrunBackend`'s impl of the trait.
+
+4. **`VzBuilderVm` then writes only what's different**: a Vz
+   `SupervisorConfig` (which already exists for workload microVMs),
+   virtio-fs share attachment via the Swift supervisor's
+   `VZVirtioFileSystemDeviceConfiguration` (Plan 97 §"Volumes and
+   host-path mounts" — the supervisor already refuses unauthorized
+   shares; the builder mode whitelists `/work`/`/out`/`/job`), and
+   the same console-log path semantics. Estimate ~400 lines for the
+   impl plus ~200 lines of Vz-side mount glue.
+
+Load-bearing details the seam must preserve (from
+`crates/mvm-libkrun/src/lib.rs`):
+- The panic detector retries `File::open()` because the console log
+  is created ~100 ms after `start_enter` returns (lines 1842–1878).
+- Banner detection has to handle banners that span buffer boundaries
+  (lines 1820–1823, 1866–1874).
+- `NixStoreImageLock`'s `_file: std::fs::File` field is load-bearing
+  — dropping the lock releases the host-side file lock; the guard
+  must outlive the supervisor (lines 916–926).
+- `/job/result` JSON is the contract with `mvm-builder-init` (lines
+  1389–1410). The shared layer reads it; the backends supply mounts
+  but never touch the result file directly.
+
+This is the design recommendation; implementation is a separate
+slice. Not landing yet — the user signed off on a recommendation
+in this session; actual lift-and-shift waits for explicit go.
+
 Phase D sub-tasks:
 
 - [x] `specs/adrs/056-vz-backend.md` — Why Vz, security tier (Tier 2),
@@ -161,7 +238,12 @@ Phase D sub-tasks:
       (floor) + macos-latest (current); path-gated to vz-touching
       files; asserts the supervisor binary carries the
       `com.apple.security.virtualization` entitlement and the strict
-      decoder rejects unknown fields
+      decoder rejects unknown fields. The companion **`vz-macos-26`**
+      lane is registered in the same workflow, gated on the
+      `MACOS_26_AVAILABLE` repo variable; opt-in until a self-hosted
+      Apple Silicon runner labelled `[self-hosted, macOS, ARM64,
+      macos-26]` is registered (the GHA-hosted `macos-26` image is
+      not yet available as of 2026-05).
 
 Phase E sub-tasks (macOS 14+):
 
@@ -176,18 +258,27 @@ Phase E sub-tasks (macOS 14+):
       `VzBackend::resume`, `VzBackend::balloon_set_target`,
       `VzBackend::snapshot_save` (public method on the concrete type;
       VmBackend trait extension is its own slice).
-- [ ] Snapshot file SHA-256 hash-pinned in audit chain;
-      `verify_audit_chain` rejects tampered snapshots (Security §4)
-      *(follow-up — needs CLI verb that drives `snapshot_save` +
-      audit emitter integration)*
+- [x] Snapshot file SHA-256 hash-pinned in audit chain;
+      `verify_audit_chain` rejects tampered snapshots (Security §4).
+      `mvmctl snapshot save <vm> --path <p>` streams SHA-256 over
+      the saved blob, emits `vm.snapshot_saved` via
+      `AuditEmitter::emit_vm_snapshot_saved`, and binds the entry
+      to the plan persisted at `~/.mvm/vms/<vm>/plan.json` (written
+      at launch by `emit_launched_if` in
+      `crates/mvm-cli/src/commands/vm/up.rs`).
 - [ ] `VZGenericMachineIdentifier` persisted with snapshots and
       verified on restore (Security §10)  *(follow-up — pairs with
       RESTORE)*
 - [x] `VmCapabilities::snapshots = macos_supports_vz_snapshots()`
       (runtime feature-detected against macOS 14).
-- [ ] Phase E acceptance: `mvmctl snapshot save/restore` round-trips
-      a dev-shell workload VM  *(deferred — needs CLI verb + RESTORE
-      supervisor mode)*
+- 🟡 Phase E acceptance: `mvmctl snapshot save/restore` round-trips
+      a dev-shell workload VM. `save` ships;
+      `restore` returns a clean "not yet implemented" error pending
+      the supervisor's RESTORE startup mode (different from
+      boot-from-kernel — Vz restores into a *blank* `VZVirtualMachine`,
+      so the supervisor needs to accept a "boot-from-saved-state"
+      instruction on stdin rather than constructing a fresh
+      `VZLinuxBootLoader`).
 
 Cross-cutting (any phase):
 
