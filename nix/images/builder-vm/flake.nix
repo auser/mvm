@@ -157,6 +157,13 @@
       builderPackages = pkgs: with pkgs; [
         bashInteractive
         coreutils
+        # `pkgsStatic.busybox` for the lightweight utilities that
+        # mvm-builder-init spawns by absolute path — chiefly
+        # `/sbin/udhcpc` (busybox applet) for DHCP on the builder
+        # VM's eth0. Without busybox in `packages`, mkGuest's
+        # symlink loop (nix/lib/mk-guest.nix:770-788) skips it
+        # and `/sbin/udhcpc` doesn't exist → setup_network bails.
+        pkgsStatic.busybox
         gnugrep
         gnused
         gawk
