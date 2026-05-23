@@ -78,27 +78,56 @@ fn main() {
         build_script.display()
     );
 
-    let status = Command::new(&build_script)
+    // Capture stdout + stderr explicitly. The earlier `.status()`
+    // version inherited the parent's stderr, where cargo silently
+    // swallows everything that isn't prefixed `cargo:warning=`.
+    // When `swift build` fails, that meant the actual swift
+    // diagnostic vanished — the build.rs only saw the exit code
+    // and emitted a generic "see `tools/build.sh` manually" hint.
+    // CI hit this on macos-latest with no way to recover the
+    // underlying error from the captured log.
+    //
+    // Switching to `.output()` lets us re-emit every output line
+    // as a `cargo:warning=...` so the swift / codesign / shell
+    // error is visible in any cargo build log: interactive
+    // contributor, CI log, `cargo build --quiet`. Build still does
+    // not fail the cargo build on swift failure (see below).
+    let output = Command::new(&build_script)
         .arg(&profile)
         .current_dir(&supervisor_root)
-        .status();
+        .output();
 
-    match status {
-        Ok(s) if s.success() => {
+    match output {
+        Ok(out) if out.status.success() => {
             // tools/build.sh prints the signed binary path on stdout;
-            // surface that to cargo so it appears in build output.
+            // surface that + the success marker.
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                println!("cargo:warning=mvm-vz: swift stdout: {line}");
+            }
+            for line in String::from_utf8_lossy(&out.stderr).lines() {
+                println!("cargo:warning=mvm-vz: swift stderr: {line}");
+            }
             println!("cargo:warning=mvm-vz: Swift supervisor build OK");
         }
-        Ok(s) => {
-            // Non-zero exit: warn loudly but don't fail the build.
-            // The `VzBackend` resolver will refuse to start a VM
-            // when the binary is missing, with a clear actionable
-            // error pointing at `tools/build.sh`. A `cargo build`
-            // failure here would block contributors who don't intend
-            // to use the Vz backend at all.
+        Ok(out) => {
+            // Non-zero exit: surface every line of stdout + stderr
+            // so the swift / codesign / shell error is recoverable
+            // from the cargo log alone. Don't fail the cargo build —
+            // the `VzBackend` resolver refuses to start a VM when
+            // the binary is missing with a clear actionable error,
+            // and Linux contributors / macOS contributors without
+            // Xcode CLT can still build the workspace's Rust crates.
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                println!("cargo:warning=mvm-vz: swift stdout: {line}");
+            }
+            for line in String::from_utf8_lossy(&out.stderr).lines() {
+                println!("cargo:warning=mvm-vz: swift stderr: {line}");
+            }
             println!(
-                "cargo:warning=mvm-vz: Swift supervisor build exited with {s}; \
-                 run `crates/mvm-vz-supervisor/tools/build.sh` manually to diagnose"
+                "cargo:warning=mvm-vz: Swift supervisor build exited with {}; \
+                 see the swift stdout/stderr warnings above for the diagnostic, \
+                 or run `crates/mvm-vz-supervisor/tools/build.sh` manually to reproduce",
+                out.status,
             );
         }
         Err(e) => {
