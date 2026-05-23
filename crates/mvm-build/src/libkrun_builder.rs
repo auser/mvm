@@ -65,7 +65,10 @@ use std::time::{Duration, Instant};
 use mvm_libkrun::{KrunContext, SupervisorConfig};
 use serde::Deserialize;
 
-use crate::builder_vm::{BuilderArtifacts, BuilderJob, BuilderMounts, BuilderVm, BuilderVmError};
+use crate::builder_vm::{
+    BuilderArtifacts, BuilderJob, BuilderMounts, BuilderVm, BuilderVmDisk, BuilderVmError,
+    BuilderVmExitInfo, BuilderVmMount, BuilderVmRunConfig, VmBackendForBuilder,
+};
 
 /// Default vCPU count for the builder VM. Nix builds are
 /// embarrassingly parallel at the derivation level; 4 cores is the
@@ -761,6 +764,173 @@ impl BuilderVm for LibkrunBuilderVm {
         // `~/.cache/mvm/builder-vm/jobs/` past N days. No-op
         // until W6 picks the retention policy.
         Ok(())
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
+// LibkrunBuilderBackend — Plan 97 Phase C, first refactor slice.
+//
+// This is the hypervisor-agnostic seam's libkrun-flavored impl.
+// Wraps `spawn_supervisor_in_background` + `wait_with_panic_detector_until`
+// + the KrunContext-building pattern from `LibkrunBuilderVm::run_build`.
+// Today nothing in production uses it — `LibkrunBuilderVm::run_build`
+// stays as-is. The follow-up slice introduces a `BuilderVmRuntime`
+// helper that takes `&dyn VmBackendForBuilder` and migrates
+// `run_build` to use it; this struct is what plugs into that helper
+// for the libkrun backend.
+//
+// Lives in the same file as the private helpers it calls
+// (`resolve_supervisor_path`, `ensure_builder_vm_image`,
+// `krun_context_for_image`, `apply_networking_mode`, `path_to_str`,
+// `spawn_supervisor_in_background`, `wait_with_panic_detector_until`,
+// `WaitOutcome`, `DEFAULT_PANIC_POLL_INTERVAL`). Putting it here
+// avoids widening those helpers' visibility for a single new caller.
+// ─────────────────────────────────────────────────────────────────
+
+/// Plan 97 §"Phase C seam design" — libkrun-flavored impl of the
+/// hypervisor-agnostic [`VmBackendForBuilder`] primitive trait.
+///
+/// Holds the resolved supervisor binary path and the cached
+/// builder VM image (kernel + rootfs + cmdline). Construction
+/// eagerly resolves both so a missing prerequisite surfaces at
+/// `new()`-time rather than mid-build.
+///
+/// `LibkrunBuilderVm::run_build` does not yet use this — the
+/// follow-up slice (PR-B-2) introduces `BuilderVmRuntime` and
+/// flips the migration. Today it exists so PR-C (`VzBuilderVm`)
+/// has a worked example of how to wrap a hypervisor-specific
+/// supervisor behind the seam.
+pub struct LibkrunBuilderBackend {
+    supervisor_path: PathBuf,
+    image: BuilderVmImage,
+}
+
+impl LibkrunBuilderBackend {
+    /// Resolve the supervisor binary + builder VM image eagerly.
+    /// Surfaces "supervisor binary missing" / "builder image not
+    /// installed" at the call site rather than at first run.
+    pub fn new() -> Result<Self, BuilderVmError> {
+        let supervisor_path = resolve_supervisor_path()?;
+        let image = ensure_builder_vm_image()?;
+        Ok(Self {
+            supervisor_path,
+            image,
+        })
+    }
+
+    /// Test seam — caller supplies the supervisor path + image
+    /// directly so unit tests can construct a backend without
+    /// touching the host's libkrun install or the image cache.
+    /// Used by the construction test below; the future
+    /// `BuilderVmRuntime` test suite will reuse this pattern.
+    pub fn with_supervisor_and_image(supervisor_path: PathBuf, image: BuilderVmImage) -> Self {
+        Self {
+            supervisor_path,
+            image,
+        }
+    }
+}
+
+impl VmBackendForBuilder for LibkrunBuilderBackend {
+    fn run_attached_with_mounts(
+        &self,
+        config: &BuilderVmRunConfig,
+        mounts: &[BuilderVmMount],
+        extra_disks: &[BuilderVmDisk],
+        timeout: Duration,
+    ) -> Result<BuilderVmExitInfo, BuilderVmError> {
+        // Same refusal posture as run_build's step 2: a missing
+        // shared library is the most-common failure mode and an
+        // early surface keeps the supervisor spawn from producing
+        // a confusing rc -2.
+        if !mvm_libkrun::is_available() {
+            return Err(BuilderVmError::LibkrunUnavailable(format!(
+                "libkrun shared library not found on host. {}",
+                mvm_libkrun::install_hint()
+            )));
+        }
+
+        std::fs::create_dir_all(&config.vm_state_dir).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating builder VM state dir {}: {e}",
+                config.vm_state_dir.display()
+            ))
+        })?;
+
+        let console_log = self.console_log_path(&config.vm_state_dir);
+
+        // KrunContext construction — same shape as run_build's
+        // step 7, but parameterised on the trait's hypervisor-
+        // agnostic config. Builds top-down (resources first, then
+        // disks, then mounts, then vsock ports, then networking)
+        // because libkrun's builder methods consume `self` by value.
+        let mut krun = krun_context_for_image(&config.name, &self.image)?
+            .with_resources(config.vcpus, config.memory_mib)
+            .with_console_output(path_to_str(&console_log, "console_log")?)
+            .with_vsock_socket_dir(path_to_str(&config.vm_state_dir, "vm_state_dir")?);
+        for disk in extra_disks {
+            krun = krun.add_disk(
+                disk.id.clone(),
+                path_to_str(&disk.host_path, "extra_disk_path")?,
+                disk.read_only,
+            );
+        }
+        for mount in mounts {
+            // libkrun's add_virtio_fs takes only (tag, host_path) —
+            // every share is RW from the guest's perspective. The
+            // `BuilderVmMount::read_only` flag is currently ignored
+            // on this backend; Vz's impl will honour it via
+            // VZSharedDirectory's `readOnly:` parameter (Plan 97
+            // §"Host-path mounts").
+            krun = krun.add_virtio_fs(
+                mount.tag.clone(),
+                path_to_str(&mount.host_path, "mount_host_path")?,
+            );
+        }
+        for port in &config.vsock_ports {
+            krun = krun.add_vsock_port(*port);
+        }
+        krun = apply_networking_mode(krun, &config.vm_state_dir)?;
+
+        let cfg = SupervisorConfig {
+            krun,
+            vm_state_dir: path_to_str(&config.vm_state_dir, "vm_state_dir")?.to_string(),
+            pid_file_name: Some("builder.pid".to_string()),
+        };
+
+        let mut child = spawn_supervisor_in_background(&self.supervisor_path, &cfg)?;
+        // Same wait + panic-detection shape `spawn_supervisor_and_wait`
+        // uses, but we surface the panic line via the seam's exit
+        // info instead of an Err so the future BuilderVmRuntime
+        // helper can decide whether the job's expectations were
+        // met (Plan 77 W6 §"Concurrent panic detector").
+        match wait_with_panic_detector_until(
+            &mut child,
+            Some(&console_log),
+            DEFAULT_PANIC_POLL_INTERVAL,
+            Some(timeout),
+        ) {
+            Ok(WaitOutcome::Clean(code)) => Ok(BuilderVmExitInfo {
+                exit_code: Some(code),
+                panic_line: None,
+            }),
+            Ok(WaitOutcome::KernelPanic { panic_line, .. }) => Ok(BuilderVmExitInfo {
+                exit_code: None,
+                panic_line: Some(panic_line),
+            }),
+            Ok(WaitOutcome::Timeout) => Err(BuilderVmError::NixBuildFailed(format!(
+                "builder VM exceeded {} seconds wall-clock; killed. Console log at {}.",
+                timeout.as_secs(),
+                console_log.display(),
+            ))),
+            Err(e) => Err(BuilderVmError::ExtractionFailed(format!(
+                "wait on supervisor child: {e}"
+            ))),
+        }
+    }
+
+    fn console_log_path(&self, vm_state_dir: &Path) -> PathBuf {
+        vm_state_dir.join("console.log")
     }
 }
 
@@ -3340,4 +3510,49 @@ mod tests {
     // invariant grep against `crates/` source. The grep excludes
     // `**/tests/**` by design — that's where mock-server patterns
     // for test scaffolding belong.
+
+    // ---------------------------------------------------------------
+    // Plan 97 §"Phase C seam design" — LibkrunBuilderBackend impl
+    //
+    // Construction-shape tests only. Exercising `run_attached_with_mounts`
+    // requires libkrun + the builder image + an actual supervisor
+    // child, which is the integration-test surface; unit-level
+    // assertions cover the trait wiring + the `console_log_path`
+    // contract.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn libkrun_builder_backend_with_supervisor_and_image_stores_paths() {
+        let supervisor = PathBuf::from("/tmp/mvm-test-supervisor");
+        let image = BuilderVmImage::Rootfs {
+            kernel_path: PathBuf::from("/tmp/vmlinux"),
+            rootfs_path: PathBuf::from("/tmp/rootfs.ext4"),
+            cmdline: "console=hvc0".to_string(),
+        };
+        let backend = LibkrunBuilderBackend::with_supervisor_and_image(supervisor.clone(), image);
+        assert_eq!(backend.supervisor_path, supervisor);
+        match &backend.image {
+            BuilderVmImage::Rootfs { kernel_path, .. } => {
+                assert_eq!(kernel_path, &PathBuf::from("/tmp/vmlinux"));
+            }
+            other => panic!("expected Rootfs variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn libkrun_builder_backend_console_log_lives_under_vm_state_dir() {
+        let backend = LibkrunBuilderBackend::with_supervisor_and_image(
+            PathBuf::from("/tmp/supervisor"),
+            BuilderVmImage::Rootfs {
+                kernel_path: PathBuf::from("/tmp/k"),
+                rootfs_path: PathBuf::from("/tmp/r"),
+                cmdline: String::new(),
+            },
+        );
+        let dir = PathBuf::from("/tmp/state/builder-foo");
+        let log = backend.console_log_path(&dir);
+        assert_eq!(log, dir.join("console.log"));
+        // Trait-object safety: confirm the impl satisfies `&dyn ...`.
+        let _erased: &dyn VmBackendForBuilder = &backend;
+    }
 }
