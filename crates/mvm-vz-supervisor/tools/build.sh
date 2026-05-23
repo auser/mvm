@@ -32,7 +32,16 @@ case "$CONFIGURATION" in
         ;;
 esac
 
-swift build "${SWIFT_FLAGS[@]}"
+# bash 3.2 (the macOS system bash; what GitHub Actions runners
+# invoke for `shell: /bin/bash`) treats `"${EMPTY_ARRAY[@]}"` as an
+# unbound variable under `set -u`, so `swift build "${SWIFT_FLAGS[@]}"`
+# fails on the debug path where SWIFT_FLAGS=(). Contributor Macs on
+# Homebrew bash 5.x expand it cleanly to nothing.
+#
+# `${VAR[@]+"${VAR[@]}"}` is the canonical safe-empty-array idiom:
+# expand to the elements if set, or to nothing if unset/empty —
+# without globally weakening the script's `set -euo pipefail` posture.
+swift build ${SWIFT_FLAGS[@]+"${SWIFT_FLAGS[@]}"}
 
 ARCH="$(uname -m | sed 's/x86_64/x86_64/;s/arm64/arm64/')"
 BINARY="$PACKAGE_ROOT/.build/${ARCH}-apple-macosx/${CONFIGURATION}/mvm-vz-supervisor"
