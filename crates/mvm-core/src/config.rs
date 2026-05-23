@@ -280,6 +280,25 @@ pub fn is_production_mode() -> bool {
 mod tests {
     use super::*;
 
+    /// Tests in this module mutate process-global env vars
+    /// (`MVM_FC_VERSION`, `MVM_*_DIR`, `XDG_*_HOME`). cargo's default
+    /// parallel test runner produced races where one test's
+    /// `set_var` collided with another's `remove_var` mid-run; the
+    /// resulting assertion failures surfaced as flaky CI on
+    /// `cargo test --workspace`. Mirrors the
+    /// `mvm-base::runtime_meta::HOME_TEST_LOCK` pattern: every test
+    /// that reads or writes one of these env vars grabs the lock at
+    /// entry. Pure-logic tests (`normalize_*`) skip the lock and
+    /// continue to run in parallel.
+    ///
+    /// Poison recovery via `unwrap_or_else(|e| e.into_inner())` so
+    /// a panic in one env-mutating test doesn't cascade.
+    static ENV_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn env_lock() -> std::sync::MutexGuard<'static, ()> {
+        ENV_TEST_LOCK.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
     #[test]
     fn test_not_production_by_default() {
         let _ = is_production_mode();
@@ -287,7 +306,9 @@ mod tests {
 
     #[test]
     fn test_fc_version_default() {
+        let _g = env_lock();
         // Without runtime env override, should return the compiled-in default
+        unsafe { std::env::remove_var("MVM_FC_VERSION") };
         let v = fc_version();
         assert!(v.starts_with('v'), "FC version should start with 'v'");
         assert!(v.contains('.'), "FC version should contain a dot");
@@ -295,6 +316,8 @@ mod tests {
 
     #[test]
     fn test_fc_version_short() {
+        let _g = env_lock();
+        unsafe { std::env::remove_var("MVM_FC_VERSION") };
         let short = fc_version_short();
         assert!(short.starts_with('v'));
         // Should have exactly one dot (major.minor)
@@ -321,6 +344,7 @@ mod tests {
 
     #[test]
     fn normalize_minor_only() {
+        let _g = env_lock();
         let raw = "Firecracker v1.14";
         assert_eq!(normalize_fc_version(raw), "v1.14");
         // short should remain the same when no patch component
@@ -349,6 +373,7 @@ mod tests {
 
     #[test]
     fn test_mvm_cache_dir_env_override() {
+        let _g = env_lock();
         unsafe { std::env::set_var("MVM_CACHE_DIR", "/custom/cache") };
         assert_eq!(mvm_cache_dir(), "/custom/cache");
         unsafe { std::env::remove_var("MVM_CACHE_DIR") };
@@ -356,6 +381,7 @@ mod tests {
 
     #[test]
     fn test_mvm_cache_dir_xdg_override() {
+        let _g = env_lock();
         unsafe { std::env::remove_var("MVM_CACHE_DIR") };
         unsafe { std::env::set_var("XDG_CACHE_HOME", "/xdg/cache") };
         assert_eq!(mvm_cache_dir(), "/xdg/cache/mvm");
@@ -364,6 +390,7 @@ mod tests {
 
     #[test]
     fn test_mvm_cache_dir_default() {
+        let _g = env_lock();
         unsafe { std::env::remove_var("MVM_CACHE_DIR") };
         unsafe { std::env::remove_var("XDG_CACHE_HOME") };
         let dir = mvm_cache_dir();
@@ -372,6 +399,7 @@ mod tests {
 
     #[test]
     fn test_mvm_config_dir_env_override() {
+        let _g = env_lock();
         unsafe { std::env::set_var("MVM_CONFIG_DIR", "/custom/config") };
         assert_eq!(mvm_config_dir(), "/custom/config");
         unsafe { std::env::remove_var("MVM_CONFIG_DIR") };
@@ -379,6 +407,7 @@ mod tests {
 
     #[test]
     fn test_mvm_config_dir_default() {
+        let _g = env_lock();
         unsafe { std::env::remove_var("MVM_CONFIG_DIR") };
         unsafe { std::env::remove_var("XDG_CONFIG_HOME") };
         let dir = mvm_config_dir();
@@ -387,6 +416,7 @@ mod tests {
 
     #[test]
     fn test_mvm_state_dir_env_override() {
+        let _g = env_lock();
         unsafe { std::env::set_var("MVM_STATE_DIR", "/custom/state") };
         assert_eq!(mvm_state_dir(), "/custom/state");
         unsafe { std::env::remove_var("MVM_STATE_DIR") };
@@ -394,6 +424,7 @@ mod tests {
 
     #[test]
     fn test_mvm_state_dir_default() {
+        let _g = env_lock();
         unsafe { std::env::remove_var("MVM_STATE_DIR") };
         unsafe { std::env::remove_var("XDG_STATE_HOME") };
         let dir = mvm_state_dir();
@@ -402,6 +433,7 @@ mod tests {
 
     #[test]
     fn test_mvm_share_dir_env_override() {
+        let _g = env_lock();
         unsafe { std::env::set_var("MVM_SHARE_DIR", "/custom/share") };
         assert_eq!(mvm_share_dir(), "/custom/share");
         unsafe { std::env::remove_var("MVM_SHARE_DIR") };
@@ -409,6 +441,7 @@ mod tests {
 
     #[test]
     fn test_mvm_share_dir_default() {
+        let _g = env_lock();
         unsafe { std::env::remove_var("MVM_SHARE_DIR") };
         unsafe { std::env::remove_var("XDG_DATA_HOME") };
         let dir = mvm_share_dir();
@@ -417,6 +450,7 @@ mod tests {
 
     #[test]
     fn test_mvm_share_dir_xdg_override() {
+        let _g = env_lock();
         unsafe { std::env::remove_var("MVM_SHARE_DIR") };
         unsafe { std::env::set_var("XDG_DATA_HOME", "/xdg/data") };
         assert_eq!(mvm_share_dir(), "/xdg/data/mvm");
