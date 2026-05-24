@@ -33,6 +33,8 @@
 
 use std::path::Path;
 
+use serde::Deserialize;
+
 use crate::builder_vm::{BuilderJob, BuilderVmError, VmBackendForBuilder};
 
 /// Per-job dir filename mvm-builder-init detects to dispatch
@@ -255,6 +257,49 @@ pub fn shell_single_quote_escape(s: &str) -> String {
     s.replace('\'', "'\\''")
 }
 
+/// Parsed `<job_dir>/result` written by `mvm-builder-init` (Plan 72
+/// W3). Shape matches the JSON `mvm-builder-init::linux::write_result`
+/// emits. The guest PID 1 writes this on every code path that reaches
+/// `power_off`; the host-side helper reads it to learn the guest's
+/// exit code and the cmd.sh stderr-tail ringbuffer for diagnostics.
+///
+/// Hypervisor-agnostic: the file lives in the `/job` virtio-fs share,
+/// which both libkrun and Vz attach identically. Migrated from
+/// `libkrun_builder.rs` in Plan 97 Phase C (second migration after
+/// `stage_job_dir`).
+#[derive(Debug, Deserialize)]
+pub struct JobResult {
+    pub exit_code: i32,
+    #[serde(default)]
+    pub stderr_tail: String,
+}
+
+/// Read and parse `<job_dir>/result`. The guest's PID 1 writes this
+/// on every code path that reaches `power_off`; absence here means
+/// the VM crashed before `mvm-builder-init` could finalize.
+///
+/// Error mapping mirrors the original libkrun-side implementation:
+/// missing file → [`BuilderVmError::NixBuildFailed`] (it's almost
+/// always a guest crash mid-build); malformed JSON →
+/// [`BuilderVmError::ExtractionFailed`] (host couldn't extract the
+/// result, regardless of whether the build succeeded).
+pub fn read_job_result(job_dir: &Path) -> Result<JobResult, BuilderVmError> {
+    let path = job_dir.join("result");
+    let body = std::fs::read_to_string(&path).map_err(|e| {
+        BuilderVmError::NixBuildFailed(format!(
+            "guest did not write {}: {e} \
+             (the VM may have crashed before mvm-builder-init could finalize)",
+            path.display()
+        ))
+    })?;
+    serde_json::from_str::<JobResult>(&body).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!(
+            "parsing {} as JSON: {e}\nbody:\n{body}",
+            path.display()
+        ))
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -332,5 +377,51 @@ mod tests {
                 .load(std::sync::atomic::Ordering::SeqCst),
             0
         );
+    }
+
+    #[test]
+    fn read_job_result_parses_well_formed_json() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let job_dir = scratch.path().to_path_buf();
+        std::fs::write(
+            job_dir.join("result"),
+            r#"{"exit_code":0,"stderr_tail":"hello"}"#,
+        )
+        .unwrap();
+        let r = read_job_result(&job_dir).unwrap();
+        assert_eq!(r.exit_code, 0);
+        assert_eq!(r.stderr_tail, "hello");
+    }
+
+    #[test]
+    fn read_job_result_defaults_stderr_tail_when_absent() {
+        // `#[serde(default)]` on stderr_tail. A guest that
+        // exited before writing stderr_tail (rare, but possible
+        // under panic) still parses cleanly.
+        let scratch = tempfile::TempDir::new().unwrap();
+        let job_dir = scratch.path().to_path_buf();
+        std::fs::write(job_dir.join("result"), r#"{"exit_code":2}"#).unwrap();
+        let r = read_job_result(&job_dir).unwrap();
+        assert_eq!(r.exit_code, 2);
+        assert_eq!(r.stderr_tail, "");
+    }
+
+    #[test]
+    fn read_job_result_errors_when_missing() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let err = read_job_result(scratch.path()).unwrap_err();
+        assert!(matches!(err, BuilderVmError::NixBuildFailed(_)));
+    }
+
+    #[test]
+    fn read_job_result_errors_on_malformed_json() {
+        // New coverage relative to the libkrun-side tests: the
+        // ExtractionFailed arm wasn't exercised before. Pinning it
+        // here means a future change to the error mapping (e.g.
+        // collapsing both arms) breaks visibly.
+        let scratch = tempfile::TempDir::new().unwrap();
+        std::fs::write(scratch.path().join("result"), "{not valid json").unwrap();
+        let err = read_job_result(scratch.path()).unwrap_err();
+        assert!(matches!(err, BuilderVmError::ExtractionFailed(_)));
     }
 }
