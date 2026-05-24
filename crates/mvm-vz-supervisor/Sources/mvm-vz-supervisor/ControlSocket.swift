@@ -32,16 +32,29 @@ final class ControlSocket {
     /// because `VZVirtualMachine` doesn't expose `configuration` post-init;
     /// the supervisor holds the canonical value from the parsed config.
     private let memorySize: UInt64
+    /// The VM's platform machine identifier, captured at config-build
+    /// time. SAVE serializes its `dataRepresentation` into the
+    /// sidecar `<snapshot_path>.machine-id` so RESTORE can re-apply
+    /// the same identity to the new VM configuration (Plan 97
+    /// Security §10).
+    private let machineIdentifier: VZGenericMachineIdentifier?
     private let queue: DispatchQueue
     private var listenFd: Int32 = -1
     private var acceptSource: DispatchSourceRead?
     /// Accepted-client sources we hold so they're not deallocated mid-read.
     private var clientSources: [DispatchSourceRead] = []
 
-    init(socketPath: String, vm: VZVirtualMachine, memorySize: UInt64, queue: DispatchQueue) {
+    init(
+        socketPath: String,
+        vm: VZVirtualMachine,
+        memorySize: UInt64,
+        machineIdentifier: VZGenericMachineIdentifier?,
+        queue: DispatchQueue
+    ) {
         self.socketPath = socketPath
         self.vm = vm
         self.memorySize = memorySize
+        self.machineIdentifier = machineIdentifier
         self.queue = queue
     }
 
@@ -237,21 +250,53 @@ final class ControlSocket {
                 if arg.isEmpty {
                     return "ERR SAVE requires a path argument"
                 }
-                return synchronousVZCall { sema, result in
+                let result = synchronousVZCall { sema, result in
                     let url = URL(fileURLWithPath: arg)
                     self.vm.saveMachineStateTo(url: url) { error in
                         if let error { result.error = "\(error)" }
                         sema.signal()
                     }
                 }
+                // Best-effort: write `<arg>.machine-id` alongside the
+                // snapshot so RESTORE can re-apply the same machine
+                // identifier. On a snapshot-save failure we skip the
+                // sidecar (the snapshot blob may be partial). Sidecar
+                // write failure does not fail the SAVE — RESTORE can
+                // still proceed with a fresh identifier (machine-id
+                // continuity is lost but the VM boots).
+                if result == "OK", let id = self.machineIdentifier {
+                    let sidecarPath = arg + ".machine-id"
+                    do {
+                        try id.dataRepresentation.write(
+                            to: URL(fileURLWithPath: sidecarPath),
+                            options: [.atomic]
+                        )
+                        // Tighten mode to 0600 — the identifier is
+                        // small but binds to guest identity.
+                        try? FileManager.default.setAttributes(
+                            [.posixPermissions: NSNumber(value: 0o600)],
+                            ofItemAtPath: sidecarPath
+                        )
+                    } catch {
+                        FileHandle.standardError.write(
+                            Data(
+                                "mvm-vz-supervisor: SAVE machine-id sidecar write failed: \(error)\n"
+                                    .utf8))
+                    }
+                }
+                return result
             } else {
                 return "ERR SAVE requires macOS 14+ (saveMachineStateTo)"
             }
         case "RESTORE":
             // RESTORE is a different supervisor startup mode — it
-            // constructs a VM from a saved-state file instead of
-            // booting fresh. Deferred to its own follow-up slice.
-            return "ERR RESTORE not yet implemented (different supervisor startup mode)"
+            // boots a fresh supervisor process with
+            // `startup_mode: { kind: "restore", snapshot_path }` on
+            // stdin instead of going through the control socket.
+            // The control-socket RESTORE verb stays explicit so
+            // existing clients that hit it get a clear redirection.
+            return "ERR RESTORE is a supervisor startup mode, not a control-socket verb — "
+                + "spawn a new supervisor with startup_mode={kind:restore,...} on stdin"
         case "":
             return "ERR empty command"
         default:

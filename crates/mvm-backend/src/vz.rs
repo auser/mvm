@@ -58,6 +58,12 @@ pub struct VzBackend;
 /// the same `~/.mvm/vms/<name>/` tree if a host happens to use both.
 const PID_FILE_NAME: &str = "vz.pid";
 
+/// Persisted `SupervisorConfig` JSON. Written by `start` so
+/// `snapshot_restore` can replay the same shape with
+/// `startup_mode` flipped. Mode 0600 — same tier as the audit
+/// chain and the host signer.
+const SUPERVISOR_CONFIG_FILE_NAME: &str = "supervisor-config.json";
+
 /// How long [`VzBackend::start`] waits for the supervisor to write its
 /// PID file before killing the child and bailing. Matches the libkrun
 /// path's budget.
@@ -144,6 +150,25 @@ impl VmBackend for VzBackend {
         let json = cfg
             .to_json()
             .map_err(|e| anyhow!("serialize SupervisorConfig: {e}"))?;
+
+        // Persist the supervisor config alongside the PID file so
+        // `snapshot_restore` can replay the exact same shape with
+        // `startup_mode` flipped to Restore. The restore path needs
+        // disks, memory, cpu, vsock, network, etc. to match the
+        // saved state's configuration (Apple validates this on
+        // restoreMachineState). Without persistence we'd have to
+        // reconstruct from disparate sources at restore time.
+        // Best-effort write: a failure here logs a warn and
+        // continues — the launch still succeeds; only restore will
+        // fail with a clear "no supervisor-config.json" error.
+        let cfg_path = state_dir.join(SUPERVISOR_CONFIG_FILE_NAME);
+        if let Err(e) = persist_supervisor_config(&cfg_path, &json) {
+            tracing::warn!(
+                error = %e,
+                "persisting supervisor config to {} failed (non-fatal)",
+                cfg_path.display()
+            );
+        }
 
         ui::info(&format!(
             "Starting Vz VM '{}' (cpus={}, mem={}MiB) via {}...",
@@ -520,6 +545,172 @@ impl VzBackend {
         let sock = vz_control::control_socket_path(&vm_state_dir(&id.0));
         vz_control::send_command(&sock, &format!("SAVE {}", abs.display())).map(|_| ())
     }
+
+    /// Plan 97 Phase E — snapshot restore. Boots a new supervisor in
+    /// `StartupMode::Restore` so it calls
+    /// `VZVirtualMachine.restoreMachineState(from:)` + `resume()`
+    /// instead of `start()` (macOS 14+ only).
+    ///
+    /// Replays the `SupervisorConfig` that the original boot wrote
+    /// at `~/.mvm/vms/<vm>/supervisor-config.json`. Apple's restore
+    /// API requires the VZ configuration to match the saved state's,
+    /// so we use the exact same shape and only flip `startup_mode`.
+    ///
+    /// The VM must NOT already be running (the saved state and the
+    /// running state would race over disks). This method does not
+    /// check — callers should `mvmctl down <vm>` first.
+    ///
+    /// `machine_id_path` is the optional companion file SAVE wrote
+    /// at `<snapshot_path>.machine-id` so the restored guest gets
+    /// the same `VZGenericMachineIdentifier` (machine-id continuity).
+    pub fn snapshot_restore(
+        &self,
+        id: &VmId,
+        snapshot_path: &Path,
+        machine_id_path: Option<&Path>,
+    ) -> Result<VmId> {
+        if !snapshot_path.is_absolute() {
+            bail!(
+                "snapshot_restore requires an absolute snapshot path, got {}",
+                snapshot_path.display()
+            );
+        }
+        if !mvm_core::platform::current().has_vz() {
+            bail!(
+                "Apple Virtualization.framework is not available on this host. \
+                 Requires macOS 13 or later."
+            );
+        }
+
+        let state_dir = vm_state_dir(&id.0);
+        let cfg_path = state_dir.join(SUPERVISOR_CONFIG_FILE_NAME);
+        let cfg_bytes = std::fs::read(&cfg_path).map_err(|e| {
+            anyhow!(
+                "read persisted supervisor config {}: {e}. \
+                 The original `mvmctl up` did not persist its supervisor \
+                 config; restore needs the original shape to match the \
+                 saved state.",
+                cfg_path.display()
+            )
+        })?;
+        let mut cfg: vz::SupervisorConfig = serde_json::from_slice(&cfg_bytes)
+            .map_err(|e| anyhow!("parse {} as SupervisorConfig: {e}", cfg_path.display()))?;
+
+        // Flip to restore mode. Everything else (disks / vsock /
+        // network / balloon / machine cpu+memory) stays as it was
+        // at boot so Vz validates the configuration against the
+        // saved state successfully.
+        cfg.startup_mode = vz::StartupMode::Restore {
+            snapshot_path: snapshot_path.display().to_string(),
+            machine_id_path: machine_id_path.map(|p| p.display().to_string()),
+        };
+
+        let json = cfg
+            .to_json()
+            .map_err(|e| anyhow!("serialize SupervisorConfig for restore: {e}"))?;
+
+        let supervisor_path = resolve_supervisor_path()?;
+        let pid_file = state_dir.join(PID_FILE_NAME);
+        // The VM must not already be running; refuse if a live PID
+        // file exists. Stale PID files (process already exited) are
+        // tolerated and removed.
+        if let Some(pid) = read_pid(&pid_file)
+            && pid_alive(pid)
+        {
+            bail!(
+                "VM {:?} is still running (PID {pid}); stop it with `mvmctl down {}` before restoring",
+                id.0,
+                id.0,
+            );
+        }
+        let _ = std::fs::remove_file(&pid_file);
+        let console_log = state_dir.join("console.log");
+        let _ = std::fs::File::create(&console_log);
+
+        ui::info(&format!(
+            "Restoring Vz VM '{}' from {} via {}...",
+            id.0,
+            snapshot_path.display(),
+            supervisor_path.display(),
+        ));
+
+        let mut child = Command::new(&supervisor_path)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::null())
+            .stderr(Stdio::inherit())
+            .spawn()
+            .map_err(|e| anyhow!("spawn {}: {e}", supervisor_path.display()))?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| anyhow!("supervisor stdin was not piped"))?
+            .write_all(json.as_bytes())
+            .map_err(|e| anyhow!("pipe SupervisorConfig to supervisor stdin: {e}"))?;
+
+        let deadline = Instant::now() + PID_FILE_TIMEOUT;
+        loop {
+            if pid_file.exists() {
+                break;
+            }
+            if let Some(status) = child
+                .try_wait()
+                .map_err(|e| anyhow!("poll supervisor child: {e}"))?
+            {
+                bail!(
+                    "supervisor exited before writing PID file during restore (status: {status}). \
+                     Check stderr above; console log: {}",
+                    console_log.display()
+                );
+            }
+            if Instant::now() >= deadline {
+                let _ = child.kill();
+                bail!(
+                    "supervisor did not write {} within {:?} during restore; killed. Console log: {}",
+                    pid_file.display(),
+                    PID_FILE_TIMEOUT,
+                    console_log.display(),
+                );
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        ui::success(&format!(
+            "Vz VM '{}' restored (pid file: {}, console log: {}).",
+            id.0,
+            pid_file.display(),
+            console_log.display()
+        ));
+        Ok(VmId(id.0.clone()))
+    }
+}
+
+/// Write JSON to `path` mode 0600, atomically via a rename. Mirrors
+/// the pattern used by `plan_persist::write_plan` in mvm-cli.
+fn persist_supervisor_config(path: &Path, json: &str) -> Result<()> {
+    use std::fs::OpenOptions;
+    use std::io::Write as _;
+    use std::os::unix::fs::OpenOptionsExt;
+    use std::os::unix::fs::PermissionsExt;
+
+    let parent = path.parent().ok_or_else(|| anyhow!("path has no parent"))?;
+    let tmp = parent.join(format!("{}.tmp", SUPERVISOR_CONFIG_FILE_NAME));
+    {
+        let mut f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .mode(0o600)
+            .open(&tmp)
+            .map_err(|e| anyhow!("open {} for write: {e}", tmp.display()))?;
+        f.write_all(json.as_bytes())
+            .map_err(|e| anyhow!("write supervisor config: {e}"))?;
+        f.sync_all().ok();
+    }
+    std::fs::set_permissions(&tmp, std::fs::Permissions::from_mode(0o600))
+        .map_err(|e| anyhow!("tighten mode on {}: {e}", tmp.display()))?;
+    std::fs::rename(&tmp, path)
+        .map_err(|e| anyhow!("rename {} -> {}: {e}", tmp.display(), path.display()))?;
+    Ok(())
 }
 
 // ─── helpers ───────────────────────────────────────────────────────
@@ -632,6 +823,10 @@ fn build_supervisor_config(
                 .to_string_lossy()
                 .into_owned(),
         ),
+        // Boot mode by default — `build_supervisor_config` is the
+        // boot path; the restore path constructs its own config in
+        // `build_restore_supervisor_config` below.
+        startup_mode: vz::StartupMode::Boot,
     }
 }
 

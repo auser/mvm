@@ -98,6 +98,12 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
     private var consoleFileHandle: FileHandle?
     private var vsockProxy: VsockProxy?
     private var controlSocket: ControlSocket?
+    /// Reference to the platform machine identifier in use for this
+    /// VM. Held so the SAVE control-socket command can serialize the
+    /// identifier alongside the snapshot blob (Plan 97 Phase E §"VZ
+    /// generic machine identifier persistence"). Set during
+    /// buildVZConfiguration().
+    private var machineIdentifier: VZGenericMachineIdentifier?
 
     // Set by VZ delegate callbacks; main thread reads after exitSignal.
     private var exitError: Error?
@@ -132,17 +138,35 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
 
         installSignalHandler()
 
-        let startResult = DispatchSemaphore(value: 0)
-        var startError: Error?
-        queue.async {
-            vm.start { result in
-                if case .failure(let err) = result {
-                    startError = err
-                }
-                startResult.signal()
+        // Plan 97 Phase E — Boot vs Restore branch.
+        //
+        // Boot mode: call `start()` and rely on the VZLinuxBootLoader
+        // to bring the guest up from kernel + cmdline.
+        //
+        // Restore mode (macOS 14+): call `restoreMachineState(from:)`
+        // to recover the saved state, then `resume()` so the guest
+        // begins executing again. The two API calls run on the same
+        // Vz dispatch queue, serialized through their own
+        // DispatchSemaphores. If `restoreMachineState` fails (config
+        // mismatch, blob format error), the supervisor surfaces the
+        // error verbatim via the same SupervisorError.startFailed
+        // path Boot mode uses.
+        let startError: Error?
+        switch config.startupMode {
+        case .boot:
+            startError = bootStart(vm)
+        case .restore(let snapshotPath, _):
+            if #available(macOS 14.0, *) {
+                startError = restoreStart(vm, snapshotPath: snapshotPath)
+            } else {
+                try? removePidFile()
+                throw SupervisorError.startFailed(
+                    SupervisorError.configValidation(
+                        "RESTORE requires macOS 14+ (restoreMachineState)"
+                    )
+                )
             }
         }
-        startResult.wait()
         if let err = startError {
             try? removePidFile()
             throw SupervisorError.startFailed(err)
@@ -283,14 +307,108 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             ]
         }
 
-        // Generic machine identifier — fresh per launch (ephemeral).
-        // Plan 97 Security §10. Snapshot resume in Phase E will
-        // persist this; Phase A does not.
+        // Generic machine identifier. Plan 97 Security §10.
+        //
+        // - Boot mode: fresh identifier per launch (ephemeral) so each
+        //   start gets its own machine-id.
+        // - Restore mode: load from the `machine_id_path` sidecar
+        //   written by SAVE so the restored guest preserves its prior
+        //   identity (systemd machine-id, boot-id continuity).
+        //   Fall back to a fresh identifier if the sidecar is missing
+        //   or unreadable — restore still works, but identity
+        //   continuity is lost; SAVE always writes the sidecar so
+        //   this only fires for snapshots produced before this
+        //   feature existed or hand-moved without the sidecar.
         let platform = VZGenericPlatformConfiguration()
-        platform.machineIdentifier = VZGenericMachineIdentifier()
+        let identifier = makeMachineIdentifier(for: config.startupMode)
+        platform.machineIdentifier = identifier
+        self.machineIdentifier = identifier
         vzConfig.platform = platform
 
         return vzConfig
+    }
+
+    /// Resolve the `VZGenericMachineIdentifier` to apply to the
+    /// platform configuration for this startup. Boot mode always
+    /// returns a fresh identifier; Restore mode tries the sidecar.
+    private func makeMachineIdentifier(for mode: StartupMode) -> VZGenericMachineIdentifier {
+        switch mode {
+        case .boot:
+            return VZGenericMachineIdentifier()
+        case .restore(_, let machineIdPath):
+            guard let path = machineIdPath else {
+                FileHandle.standardError.write(
+                    Data(
+                        "mvm-vz-supervisor: no machine_id_path for restore; using fresh identifier (guest machine-id continuity lost)\n"
+                            .utf8))
+                return VZGenericMachineIdentifier()
+            }
+            guard let data = try? Data(contentsOf: URL(fileURLWithPath: path)),
+                let parsed = VZGenericMachineIdentifier(dataRepresentation: data)
+            else {
+                FileHandle.standardError.write(
+                    Data(
+                        "mvm-vz-supervisor: failed to read \(path); using fresh machine identifier\n"
+                            .utf8))
+                return VZGenericMachineIdentifier()
+            }
+            return parsed
+        }
+    }
+
+    // MARK: - Boot / Restore start paths
+
+    private func bootStart(_ vm: VZVirtualMachine) -> Error? {
+        let sem = DispatchSemaphore(value: 0)
+        var captured: Error?
+        queue.async {
+            vm.start { result in
+                if case .failure(let err) = result {
+                    captured = err
+                }
+                sem.signal()
+            }
+        }
+        sem.wait()
+        return captured
+    }
+
+    @available(macOS 14.0, *)
+    private func restoreStart(_ vm: VZVirtualMachine, snapshotPath: String) -> Error? {
+        // Two-step: restore the saved state, then resume execution.
+        // The restore call leaves the VM paused; resume() unsticks
+        // the vCPUs. We block on each step through its own semaphore
+        // so a failure in either reports back with the precise error
+        // string.
+        let url = URL(fileURLWithPath: snapshotPath)
+        let restoreSem = DispatchSemaphore(value: 0)
+        var restoreError: Error?
+        queue.async {
+            // NS_SWIFT_NAME maps the Objective-C
+            // `-restoreMachineStateFromURL:completionHandler:` to
+            // `restoreMachineStateFrom(url:completionHandler:)`, not
+            // `restoreMachineState(from:)`. See
+            // `VZVirtualMachine.h` in the macOS SDK headers.
+            vm.restoreMachineStateFrom(url: url) { err in
+                if let err { restoreError = err }
+                restoreSem.signal()
+            }
+        }
+        restoreSem.wait()
+        if let err = restoreError { return err }
+
+        let resumeSem = DispatchSemaphore(value: 0)
+        var resumeError: Error?
+        queue.async {
+            vm.resume { result in
+                if case .failure(let err) = result {
+                    resumeError = err
+                }
+                resumeSem.signal()
+            }
+        }
+        resumeSem.wait()
+        return resumeError
     }
 
     // MARK: - Vsock proxy
@@ -303,6 +421,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
             socketPath: path,
             vm: vm,
             memorySize: config.resources.memoryBytes,
+            machineIdentifier: machineIdentifier,
             queue: queue
         )
         try cs.start()

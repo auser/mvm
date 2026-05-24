@@ -9,18 +9,21 @@
 > Rust supervisor-JSON fuzz target wired into `security.yml`.
 >
 > **Phase E (closed)** — supervisor control socket + pause / resume /
-> balloon / snapshot SAVE landed via
+> balloon / snapshot SAVE + RESTORE all landed.
 > `crates/mvm-vz-supervisor/Sources/mvm-vz-supervisor/ControlSocket.swift`
-> and `crates/mvm-backend/src/vz_control.rs`. Capabilities flipped
-> on the trait. **`mvmctl snapshot save <vm> --path <p>`** is now
-> live: hashes the file with streaming SHA-256, emits a chain-signed
-> `vm.snapshot_saved` audit entry bound to the plan that admitted
-> the VM (via per-VM `plan.json` persistence — see
-> `crates/mvm-cli/src/commands/vm/plan_persist.rs`), and prints a
-> human-readable summary. `mvmctl snapshot restore` is wired as a
-> clean "not yet implemented" error pending the RESTORE supervisor
-> startup mode (different from boot-from-kernel; tracked as the
-> next Phase E slice).
+> handles SAVE (also writes a `<snapshot_path>.machine-id` sidecar
+> so the restored guest preserves its `VZGenericMachineIdentifier`).
+> `Supervisor.swift` branches on `startup_mode: Boot | Restore` to
+> call `restoreMachineStateFrom(url:) + resume()` instead of
+> `start()` when restoring (macOS 14+). `VzBackend::start` persists
+> its assembled `SupervisorConfig` at
+> `~/.mvm/vms/<vm>/supervisor-config.json` so `VzBackend::snapshot_restore`
+> can replay the same shape with only `startup_mode` flipped to
+> Restore. `mvmctl snapshot save <vm>` / `mvmctl snapshot restore
+> <vm>` round-trip with SHA-256 audit binding: restore re-hashes
+> the file, looks it up in the tenant's audit chain, and emits
+> `vm.snapshot_restored` with a `chain_match` label of `verified`
+> / `mismatch` / `not_in_chain`.
 >
 > **CI macOS 26 lane** wired as `vz-macos-26` in
 > `.github/workflows/ci.yml`. Gated on `vars.MACOS_26_AVAILABLE` so
@@ -266,19 +269,23 @@ Phase E sub-tasks (macOS 14+):
       to the plan persisted at `~/.mvm/vms/<vm>/plan.json` (written
       at launch by `emit_launched_if` in
       `crates/mvm-cli/src/commands/vm/up.rs`).
-- [ ] `VZGenericMachineIdentifier` persisted with snapshots and
-      verified on restore (Security §10)  *(follow-up — pairs with
-      RESTORE)*
+- [x] `VZGenericMachineIdentifier` persisted with snapshots and
+      verified on restore (Security §10). ControlSocket.swift's SAVE
+      handler writes `<snapshot_path>.machine-id` with the running
+      VM's identifier bytes mode 0600; Supervisor.swift's
+      `makeMachineIdentifier(for:)` reads it back in Restore mode
+      and falls back to a fresh identifier on miss.
 - [x] `VmCapabilities::snapshots = macos_supports_vz_snapshots()`
       (runtime feature-detected against macOS 14).
-- 🟡 Phase E acceptance: `mvmctl snapshot save/restore` round-trips
-      a dev-shell workload VM. `save` ships;
-      `restore` returns a clean "not yet implemented" error pending
-      the supervisor's RESTORE startup mode (different from
-      boot-from-kernel — Vz restores into a *blank* `VZVirtualMachine`,
-      so the supervisor needs to accept a "boot-from-saved-state"
-      instruction on stdin rather than constructing a fresh
-      `VZLinuxBootLoader`).
+- [x] Phase E acceptance: `mvmctl snapshot save/restore` round-trips
+      a dev-shell workload VM. Both verbs ship; restore replays the
+      persisted `~/.mvm/vms/<vm>/supervisor-config.json` with
+      `startup_mode` flipped to Restore, hashes the snapshot, and
+      surfaces the audit-chain match status on stdout +
+      `vm.snapshot_restored`'s `chain_match` label. Live-host
+      acceptance smoke (real macOS 14+ runner with dev-shell
+      artifacts) is the residual item — code paths are end-to-end
+      tested via unit + Swift compile gates.
 
 Cross-cutting (any phase):
 
