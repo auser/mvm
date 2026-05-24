@@ -74,9 +74,11 @@ use crate::builder_vm::{
 // `INSTALL_SPEC_FILENAME` and `shell_single_quote_escape` are
 // imported only inside the test module below; the production path
 // here uses `stage_job_dir` (commit 2), `read_job_result` (commit 3),
-// and `finalize_flake_job` / `finalize_install_job` (commit 4).
+// `finalize_flake_job` / `finalize_install_job` (commit 4), and
+// `NixStoreImageLock` / `acquire_nix_store_image_lock` (commit 5).
 use crate::builder_vm_runtime::{
-    finalize_flake_job, finalize_install_job, read_job_result, stage_job_dir,
+    NixStoreImageLock, acquire_nix_store_image_lock, finalize_flake_job, finalize_install_job,
+    read_job_result, stage_job_dir,
 };
 
 /// Default vCPU count for the builder VM. Nix builds are
@@ -409,8 +411,11 @@ impl LibkrunBuilderVm {
             Some(image) => image.clone(),
             None => ensure_builder_vm_image()?,
         };
-        let nix_store_lock =
-            acquire_nix_store_image_lock(host_arch_tag(), u64::from(self.nix_store_mib))?;
+        let nix_store_lock = acquire_nix_store_image_lock(
+            &builder_vm_cache_dir(),
+            host_arch_tag(),
+            u64::from(self.nix_store_mib),
+        )?;
 
         let job_id = unique_job_id();
         let job_dir = builder_vm_cache_dir().join("jobs").join(&job_id);
@@ -669,8 +674,11 @@ impl BuilderVm for LibkrunBuilderVm {
         //    virtio-blk image. First build on a host pays the
         //    sparse-allocate cost; subsequent builds reuse the
         //    warm Nix store.
-        let nix_store_lock =
-            acquire_nix_store_image_lock(host_arch_tag(), u64::from(self.nix_store_mib))?;
+        let nix_store_lock = acquire_nix_store_image_lock(
+            &builder_vm_cache_dir(),
+            host_arch_tag(),
+            u64::from(self.nix_store_mib),
+        )?;
 
         // 6. Stage the per-build job dir. Flake jobs get
         //    `cmd.sh`; install jobs get `install_spec.json`.
@@ -1080,105 +1088,6 @@ fn ensure_builder_vm_image() -> Result<BuilderVmImage, BuilderVmError> {
         .to_string();
 
     Ok(BuilderVmImage::new(kernel_path, rootfs_path, cmdline))
-}
-
-#[derive(Debug)]
-struct NixStoreImageLock {
-    path: PathBuf,
-    _file: std::fs::File,
-}
-
-impl NixStoreImageLock {
-    fn path(&self) -> &Path {
-        &self.path
-    }
-}
-
-/// Find or create the persistent `/nix-store` sparse image and hold
-/// an exclusive host-side lock on it.
-///
-/// libkrun attaches this file as a writable virtio-blk device; the
-/// guest's `mvm-builder-init` then mounts it as ext4 at `/nix-store`.
-/// Two independent guests mounting the same ext4 image read-write can
-/// corrupt the filesystem, so callers must keep the returned guard in
-/// scope for the full VM lifetime (spawn supervisor, wait for poweroff,
-/// and read result artifacts). Dropping the guard releases the lock.
-///
-/// `size_mib` is the sparse cap — the file consumes only the bytes the
-/// in-VM ext4 actually writes. Caller-controlled because dev hosts may
-/// want a smaller cap than CI runners.
-fn acquire_nix_store_image_lock(
-    arch: &str,
-    size_mib: u64,
-) -> Result<NixStoreImageLock, BuilderVmError> {
-    use fs2::FileExt;
-
-    let dir = builder_vm_cache_dir();
-    std::fs::create_dir_all(&dir).map_err(|e| {
-        BuilderVmError::ExtractionFailed(format!(
-            "creating builder cache dir {}: {e}",
-            dir.display()
-        ))
-    })?;
-    let path = dir.join(format!("nix-store-{arch}.img"));
-    let existed_before_open = path.exists();
-
-    let file = std::fs::OpenOptions::new()
-        .read(true)
-        .write(true)
-        .create(true)
-        .truncate(false)
-        .open(&path)
-        .map_err(|e| BuilderVmError::ExtractionFailed(format!("open {}: {e}", path.display())))?;
-
-    file.try_lock_exclusive().map_err(|e| {
-        BuilderVmError::ExtractionFailed(format!(
-            "nix-store image {} is already attached by another builder VM process; \
-             wait for the running `mvmctl build` / `mvmctl deps install` to finish and retry: {e}",
-            path.display()
-        ))
-    })?;
-
-    // Allocate a sparse file: open with O_CREAT, seek to size-1,
-    // write a zero byte. The filesystem records the size but
-    // doesn't allocate the blocks until something writes them
-    // (true on APFS + ext4). Avoids paying multi-GiB at provision
-    // time for a store that may never fill up.
-    let size_bytes = size_mib.checked_mul(1024 * 1024).ok_or_else(|| {
-        BuilderVmError::ExtractionFailed(format!(
-            "nix-store size_mib overflowed multiplying to bytes: {size_mib}"
-        ))
-    })?;
-
-    let current_len = file.metadata().map_err(|e| {
-        BuilderVmError::ExtractionFailed(format!("metadata {}: {e}", path.display()))
-    })?;
-    if current_len.len() == 0 {
-        file.set_len(size_bytes).map_err(|e| {
-            if !existed_before_open {
-                let _ = std::fs::remove_file(&path);
-            }
-            BuilderVmError::ExtractionFailed(format!(
-                "set_len({size_bytes}) on {}: {e}",
-                path.display()
-            ))
-        })?;
-    }
-
-    let current_len = file.metadata().map_err(|e| {
-        BuilderVmError::ExtractionFailed(format!("metadata {}: {e}", path.display()))
-    })?;
-    if current_len.len() == 0 {
-        if !existed_before_open {
-            let _ = std::fs::remove_file(&path);
-        }
-        return Err(BuilderVmError::ExtractionFailed(format!(
-            "nix-store image {} stayed empty after sparse allocation",
-            path.display()
-        )));
-    }
-
-    Ok(NixStoreImageLock { path, _file: file })
 }
 
 /// Monotonic per-process job ID. Combines a UNIX timestamp
@@ -1863,8 +1772,11 @@ impl LibkrunPersistentBuilderVm {
         // persistent VM is up would otherwise corrupt the shared
         // ext4. Held inside the handle; released on drop / kill /
         // wait_for_shutdown.
-        let nix_store_lock =
-            acquire_nix_store_image_lock(host_arch_tag(), u64::from(self.nix_store_mib))?;
+        let nix_store_lock = acquire_nix_store_image_lock(
+            &builder_vm_cache_dir(),
+            host_arch_tag(),
+            u64::from(self.nix_store_mib),
+        )?;
 
         let session_id = unique_job_id();
         let job_dir = builder_vm_cache_dir().join("jobs").join(&session_id);
@@ -2391,74 +2303,10 @@ mod tests {
     }
 
     // `read_job_result_*`, `extract_nix_store_hash_*`,
-    // `finalize_flake_job_*`, `read_last_bytes_of_*` test coverage
-    // migrated to `builder_vm_runtime` alongside the functions
-    // themselves. Plan 97 Phase C PR-B-migrate commits 3-4.
-
-    #[test]
-    fn acquire_nix_store_image_lock_creates_sparse_file_once() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        // Sparse file allocates the logical size but consumes
-        // ~no disk blocks. `set_len` is what asks the FS to
-        // record the size. A later acquisition finds the existing
-        // file and returns its path without retouching.
-        let scratch = TempDir::new().unwrap();
-        // Redirect the cache dir via XDG_CACHE_HOME to keep the
-        // test hermetic — `mvm_core::config::mvm_cache_dir()`
-        // honors the env var.
-        let old = std::env::var("XDG_CACHE_HOME").ok();
-        // SAFETY: tests run single-threaded for env mutation
-        unsafe {
-            std::env::set_var("XDG_CACHE_HOME", scratch.path());
-        }
-        let guard = acquire_nix_store_image_lock("x86_64", 256).unwrap();
-        let path = guard.path().to_path_buf();
-        assert!(path.is_file());
-        assert_eq!(std::fs::metadata(&path).unwrap().len(), 256 * 1024 * 1024);
-        drop(guard);
-        // Second acquisition is idempotent.
-        let guard2 = acquire_nix_store_image_lock("x86_64", 256).unwrap();
-        let path2 = guard2.path().to_path_buf();
-        assert_eq!(path, path2);
-        drop(guard2);
-        // Restore the previous env so we don't leak into the
-        // rest of the test suite.
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-                None => std::env::remove_var("XDG_CACHE_HOME"),
-            }
-        }
-    }
-
-    #[test]
-    fn acquire_nix_store_image_lock_refuses_concurrent_writer() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let scratch = TempDir::new().unwrap();
-        let old = std::env::var("XDG_CACHE_HOME").ok();
-        unsafe {
-            std::env::set_var("XDG_CACHE_HOME", scratch.path());
-        }
-
-        let first = acquire_nix_store_image_lock("x86_64", 256).unwrap();
-        let err = acquire_nix_store_image_lock("x86_64", 256).unwrap_err();
-        let msg = format!("{err}");
-        assert!(
-            msg.contains("already attached by another builder VM process"),
-            "unexpected error: {msg}"
-        );
-        drop(first);
-
-        acquire_nix_store_image_lock("x86_64", 256)
-            .expect("lock should be available after first guard drops");
-
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("XDG_CACHE_HOME", v),
-                None => std::env::remove_var("XDG_CACHE_HOME"),
-            }
-        }
-    }
+    // `finalize_flake_job_*`, `read_last_bytes_of_*`,
+    // `acquire_nix_store_image_lock_*` test coverage migrated to
+    // `builder_vm_runtime` alongside the functions themselves.
+    // Plan 97 Phase C PR-B-migrate commits 3-5.
 
     #[test]
     fn ensure_builder_vm_image_requires_cmdline_txt() {
