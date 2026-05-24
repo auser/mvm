@@ -3289,6 +3289,7 @@ dependencies = [
  "mvm-guest",
  "mvm-libkrun",
  "mvm-sdk",
+ "mvm-vz",
  "pgp",
  "rand 0.8.6",
  "reqwest 0.12.28",
