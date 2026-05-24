@@ -204,6 +204,18 @@ pub struct VirtioFsShare {
     pub tag: String,
     /// Host directory exported into the guest.
     pub host_path: String,
+    /// Whether the share is mounted read-only inside the guest.
+    /// The Swift supervisor threads this onto
+    /// `VZSharedDirectory(readOnly:)`, so a `true` here is enforced
+    /// by Vz itself — the guest can't remount it rw.
+    ///
+    /// Required (no default) so Plan 97 §"Volumes and host-path
+    /// mounts" admission decisions are explicit rather than
+    /// inheriting the per-language default. The builder VM mounts
+    /// `/work` and `/job` read-only and `/out` read-write; workload
+    /// microVMs default to no shares at all and so don't usually
+    /// touch this field.
+    pub read_only: bool,
 }
 
 #[derive(Debug, Clone, serde::Serialize, serde::Deserialize)]
@@ -492,6 +504,57 @@ mod tests {
     fn mac_string_roundtrips_lowercase() {
         let mac = MacAddress::parse("0A:BB:CC:DD:EE:FF").unwrap();
         assert_eq!(mac.to_string_lowercase(), "0a:bb:cc:dd:ee:ff");
+    }
+
+    #[test]
+    fn virtio_fs_share_read_only_roundtrips_through_json() {
+        // The Swift supervisor threads `read_only` onto
+        // `VZSharedDirectory(readOnly:)`, so the wire format must
+        // carry the field as `read_only` (snake_case) to match the
+        // strict-keys decoder in Config.swift.
+        let mut cfg = minimal_config();
+        cfg.virtio_fs = vec![
+            VirtioFsShare {
+                tag: "work".into(),
+                host_path: "/tmp/work".into(),
+                read_only: true,
+            },
+            VirtioFsShare {
+                tag: "out".into(),
+                host_path: "/tmp/out".into(),
+                read_only: false,
+            },
+        ];
+        let json = cfg.to_json().expect("serialize");
+        assert!(json.contains("\"read_only\":true"), "got: {json}");
+        assert!(json.contains("\"read_only\":false"), "got: {json}");
+        let back: SupervisorConfig = serde_json::from_str(&json).expect("roundtrip parses");
+        assert_eq!(back.virtio_fs.len(), 2);
+        assert!(back.virtio_fs[0].read_only);
+        assert!(!back.virtio_fs[1].read_only);
+    }
+
+    #[test]
+    fn virtio_fs_share_rejects_missing_read_only_field() {
+        // The Swift supervisor's StrictKeys decoder also requires
+        // the field. Mirror that on the Rust side so a stale JSON
+        // producer can't ship a share whose read-only-ness depends
+        // on whichever decoder runs first.
+        let json = r#"{"tag":"work","host_path":"/tmp/work"}"#;
+        let err =
+            serde_json::from_str::<VirtioFsShare>(json).expect_err("missing read_only must reject");
+        assert!(
+            err.to_string().contains("read_only"),
+            "error mentions the missing field: {err}"
+        );
+    }
+
+    #[test]
+    fn virtio_fs_share_rejects_unknown_field() {
+        let json = r#"{"tag":"work","host_path":"/tmp/work","read_only":true,"rogue":1}"#;
+        let err = serde_json::from_str::<VirtioFsShare>(json)
+            .expect_err("deny_unknown_fields must reject");
+        assert!(err.to_string().contains("rogue"), "got: {err}");
     }
 
     #[test]

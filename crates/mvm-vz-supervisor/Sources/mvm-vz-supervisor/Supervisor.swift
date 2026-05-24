@@ -252,7 +252,7 @@ final class Supervisor: NSObject, VZVirtualMachineDelegate {
                 let single = VZSingleDirectoryShare(
                     directory: VZSharedDirectory(
                         url: URL(fileURLWithPath: share.hostPath),
-                        readOnly: false
+                        readOnly: share.readOnly
                     )
                 )
                 let device = VZVirtioFileSystemDeviceConfiguration(tag: share.tag)
