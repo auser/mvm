@@ -69,13 +69,14 @@ use crate::builder_vm::{
     BuilderArtifacts, BuilderJob, BuilderMounts, BuilderVm, BuilderVmDisk, BuilderVmError,
     BuilderVmExitInfo, BuilderVmMount, BuilderVmRunConfig, VmBackendForBuilder,
 };
-// Plan 97 Phase C (PR-B-migrate commit 2) — these items previously
-// lived in this file; they migrated to `builder_vm_runtime` so the
-// future VzBuilderVm path can reuse the same staging logic without
-// duplicating ~150 lines. `INSTALL_SPEC_FILENAME` and
-// `shell_single_quote_escape` are imported only inside the test
-// module below; the production path here only needs `stage_job_dir`.
-use crate::builder_vm_runtime::stage_job_dir;
+// Plan 97 Phase C migration — these items previously lived in this
+// file; they migrated to `builder_vm_runtime` so the future
+// VzBuilderVm path can reuse the same logic without duplicating it.
+// `INSTALL_SPEC_FILENAME` and `shell_single_quote_escape` are
+// imported only inside the test module below; the production path
+// here uses `stage_job_dir` (PR-B-migrate commit 2) and
+// `read_job_result` (PR-B-migrate commit 3).
+use crate::builder_vm_runtime::{read_job_result, stage_job_dir};
 
 /// Default vCPU count for the builder VM. Nix builds are
 /// embarrassingly parallel at the derivation level; 4 cores is the
@@ -1023,16 +1024,6 @@ fn krun_context_for_image(
     }
 }
 
-/// Parsed `/job/result` written by `mvm-builder-init` (Plan 72 W3).
-/// Shape matches the JSON `mvm-builder-init::linux::write_result`
-/// emits.
-#[derive(Debug, Deserialize)]
-struct JobResult {
-    exit_code: i32,
-    #[serde(default)]
-    stderr_tail: String,
-}
-
 /// Host architecture tag used as a cache-key segment for
 /// per-arch builder VM images. `aarch64` on Apple Silicon /
 /// ARM Linux, `x86_64` everywhere else. Plan 72 W2's flake
@@ -1395,25 +1386,6 @@ struct InstallResultReport {
     /// host-side error message.
     #[serde(default)]
     failure_reason: Option<String>,
-}
-
-/// Read and parse `<job_dir>/result`. The guest's PID 1
-/// writes this on every code path that reaches `power_off`.
-fn read_job_result(job_dir: &Path) -> Result<JobResult, BuilderVmError> {
-    let path = job_dir.join("result");
-    let body = std::fs::read_to_string(&path).map_err(|e| {
-        BuilderVmError::NixBuildFailed(format!(
-            "guest did not write {}: {e} \
-             (the VM may have crashed before mvm-builder-init could finalize)",
-            path.display()
-        ))
-    })?;
-    serde_json::from_str::<JobResult>(&body).map_err(|e| {
-        BuilderVmError::ExtractionFailed(format!(
-            "parsing {} as JSON: {e}\nbody:\n{body}",
-            path.display()
-        ))
-    })
 }
 
 /// Locate the `mvm-libkrun-supervisor` binary. Mirrors the
@@ -2676,39 +2648,9 @@ mod tests {
         );
     }
 
-    #[test]
-    fn read_job_result_parses_well_formed_json() {
-        let scratch = TempDir::new().unwrap();
-        let job_dir = scratch.path().to_path_buf();
-        std::fs::write(
-            job_dir.join("result"),
-            r#"{"exit_code":0,"stderr_tail":"hello"}"#,
-        )
-        .unwrap();
-        let r = read_job_result(&job_dir).unwrap();
-        assert_eq!(r.exit_code, 0);
-        assert_eq!(r.stderr_tail, "hello");
-    }
-
-    #[test]
-    fn read_job_result_defaults_stderr_tail_when_absent() {
-        // `#[serde(default)]` on stderr_tail. A guest that
-        // exited before writing stderr_tail (rare, but possible
-        // under panic) still parses cleanly.
-        let scratch = TempDir::new().unwrap();
-        let job_dir = scratch.path().to_path_buf();
-        std::fs::write(job_dir.join("result"), r#"{"exit_code":2}"#).unwrap();
-        let r = read_job_result(&job_dir).unwrap();
-        assert_eq!(r.exit_code, 2);
-        assert_eq!(r.stderr_tail, "");
-    }
-
-    #[test]
-    fn read_job_result_errors_when_missing() {
-        let scratch = TempDir::new().unwrap();
-        let err = read_job_result(scratch.path()).unwrap_err();
-        assert!(matches!(err, BuilderVmError::NixBuildFailed(_)));
-    }
+    // `read_job_result_*` test coverage migrated to
+    // `builder_vm_runtime` alongside the function itself. Plan 97
+    // Phase C PR-B-migrate commit 3.
 
     #[test]
     fn extract_nix_store_hash_parses_output_path() {
