@@ -3242,6 +3242,7 @@ dependencies = [
  "mvm-guest",
  "mvm-libkrun",
  "mvm-providers",
+ "mvm-vz",
  "serde",
  "serde_json",
  "sha2",
@@ -3646,6 +3647,14 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+]
+
+[[package]]
+name = "mvm-vz"
+version = "0.14.0"
+dependencies = [
+ "serde",
+ "serde_json",
 ]
 
 [[package]]

@@ -372,6 +372,314 @@ impl BuilderVm for StubBuilderVm {
     }
 }
 
+// ============================================================================
+// VmBackendForBuilder — hypervisor-agnostic seam for the builder-VM helper.
+//
+// Plan 97 §"Phase C seam design". This trait is the smaller-than-VmBackend
+// surface that a future `BuilderVmRuntime` helper builds on top of:
+// today `LibkrunBuilderVm` does both the substrate orchestration (cmd.sh
+// emission, /job/result parsing, panic detection, NixStoreImageLock,
+// stderr-tail capture) and the hypervisor-specific spawn/wait. Lifting
+// the substrate out behind this trait lets a future `VzBuilderVm`
+// reuse ~850 lines of orchestration code with only a Vz-side mount
+// glue (~600 lines).
+//
+// This commit lands the trait + supporting types only — no impls yet.
+// Subsequent slices wire it for libkrun (port LibkrunBuilderVm) and
+// Vz (new VzBuilderVm).
+// ============================================================================
+
+/// Per-run configuration the builder helper passes to the underlying
+/// hypervisor. Hypervisor-agnostic — both libkrun and Vz consume it
+/// identically. Plan 97 Phase C seam design §1.
+///
+/// Resources (`vcpus`, `memory_mib`) are caller-supplied; the
+/// backend's resource-cap check enforces a host-side ceiling.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuilderVmRunConfig {
+    /// Human-readable VM name. Surfaces in logs + the per-VM state
+    /// dir. Must be a valid mvm VM name (see `mvm_core::naming`).
+    pub name: String,
+    /// Absolute host path to the uncompressed Linux kernel.
+    pub kernel_path: PathBuf,
+    /// Kernel command line. Backend impls thread it onto their
+    /// supervisor's boot loader unchanged.
+    pub kernel_cmdline: String,
+    /// Optional initrd path.
+    pub initrd_path: Option<PathBuf>,
+    /// vCPU count. The libkrun + Vz backends both refuse values
+    /// above their host-determined caps.
+    pub vcpus: u8,
+    /// Guest memory in MiB.
+    pub memory_mib: u32,
+    /// Vsock ports the host wants to dial. Each becomes a per-port
+    /// unix socket under `<vm_state_dir>/vsock/`.
+    pub vsock_ports: Vec<u32>,
+    /// Per-VM state directory. The backend creates it mode 0700 and
+    /// writes its `<backend>.pid`, `console.log`, and vsock socket
+    /// dir inside.
+    pub vm_state_dir: PathBuf,
+}
+
+/// virtio-fs share to attach for the builder run. Maps onto
+/// `libkrun_add_virtiofs` (libkrun) or
+/// `VZVirtioFileSystemDeviceConfiguration` (Vz).
+///
+/// Builder mode is the *only* path that attaches virtio-fs shares
+/// today; workload microVMs default to zero shares per Plan 97
+/// §"Host-path mounts" and refuse unauthorised shares.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuilderVmMount {
+    /// Symbolic mount tag the guest uses in `mount -t virtiofs <tag>
+    /// <target>`. Convention: `/work`, `/out`, `/job`.
+    pub tag: String,
+    /// Host directory exported into the guest.
+    pub host_path: PathBuf,
+    /// Whether the share is mounted read-only inside the guest.
+    pub read_only: bool,
+}
+
+/// Additional virtio-blk device beyond the rootfs (e.g. the
+/// persistent Nix store image at `/dev/vdb`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuilderVmDisk {
+    /// Stable identifier; surfaces in logs only.
+    pub id: String,
+    /// Host path to the raw disk image.
+    pub host_path: PathBuf,
+    /// Whether the device is read-only.
+    pub read_only: bool,
+}
+
+/// Outcome of a single builder-VM run from the perspective of the
+/// hypervisor-agnostic helper. The helper interprets this against
+/// the job's expectations (`exit_code == 0` + no panic = success).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BuilderVmExitInfo {
+    /// Guest exit code (Some when the supervisor cleanly returned a
+    /// status; None when the supervisor died before observing the
+    /// guest exit — kernel panic, SIGKILL, etc.).
+    pub exit_code: Option<i32>,
+    /// First matched line of a kernel-panic banner if the host-side
+    /// console-log watcher caught one. None on a clean run. Plan 77
+    /// W6's panic-detector contract — `Child::wait()` cannot detect
+    /// a panicked libkrun guest, so the watcher tails the console
+    /// log and kills the supervisor when it sees the banner.
+    pub panic_line: Option<String>,
+}
+
+/// Hypervisor-agnostic primitive that a `BuilderVmRuntime` helper
+/// builds on top of. Plan 97 §"Phase C seam design".
+///
+/// Both `LibkrunBuilderVm` (today, via the libkrun supervisor) and
+/// the future `VzBuilderVm` (via the `mvm-vz-supervisor`) implement
+/// this trait. The shared orchestration logic — cmd.sh emission,
+/// `/job/result` JSON parsing, `NixStoreImageLock`, kernel-panic
+/// detection on the console log, stderr-tail capture — lives in the
+/// helper and works against `&dyn VmBackendForBuilder` so it doesn't
+/// know which VMM is on the other end.
+///
+/// ## Design rationale
+///
+/// `VmBackend` (in `mvm-core::vm_backend`) is the *workload* runtime
+/// trait — single-shot `start` returning a `VmId`, async stop, etc.
+/// The builder path needs a different shape: foreground spawn, block
+/// until guest exits, return the exit info + panic line. Reusing
+/// `VmBackend` would either bloat its surface or shoehorn the
+/// builder semantics into ill-fitting methods. A dedicated trait
+/// keeps both clean.
+///
+/// ## Implementations (planned)
+///
+/// - `LibkrunBuilderBackend` — `mvm-build/src/libkrun_builder.rs`,
+///   wraps `spawn_supervisor_and_wait` + `wait_with_panic_detector`.
+///   Lands in the next slice (PR-B).
+/// - `VzBuilderBackend` — wraps `VzBackend::run_attached` with
+///   builder-side virtio-fs share configuration. Lands in PR-C.
+pub trait VmBackendForBuilder: Send + Sync {
+    /// Spawn the supervisor for a builder run, attach the given
+    /// virtio-fs shares + extra virtio-blk disks, and block until
+    /// the guest exits. Returns the exit info — exit code plus
+    /// optional panic line captured by the host-side console-log
+    /// watcher.
+    ///
+    /// The supervisor must be killed if `timeout` elapses. Callers
+    /// that want unbounded waits pass `Duration::MAX`.
+    fn run_attached_with_mounts(
+        &self,
+        config: &BuilderVmRunConfig,
+        mounts: &[BuilderVmMount],
+        extra_disks: &[BuilderVmDisk],
+        timeout: std::time::Duration,
+    ) -> Result<BuilderVmExitInfo, BuilderVmError>;
+
+    /// Host-side path of the supervisor's console capture file
+    /// inside `vm_state_dir`. The panic-detector watcher in the
+    /// helper tails this in real time. Returning a path that
+    /// doesn't yet exist is fine — the supervisor creates it ~100 ms
+    /// after spawn, and the watcher's poll loop retries
+    /// `File::open()` until the file appears (Plan 77 W6).
+    fn console_log_path(&self, vm_state_dir: &Path) -> PathBuf;
+}
+
+#[cfg(test)]
+mod vm_backend_for_builder_tests {
+    use super::*;
+    use std::sync::Mutex;
+    use std::time::Duration;
+
+    /// Recorded args from a single `run_attached_with_mounts` call.
+    /// Named so the mock's `invocations` Vec stays under the
+    /// clippy::type_complexity threshold.
+    type RecordedInvocation = (BuilderVmRunConfig, Vec<BuilderVmMount>, Vec<BuilderVmDisk>);
+
+    /// Test mock — records every `run_attached_with_mounts` call and
+    /// returns a programmable `BuilderVmExitInfo`. Exists in this
+    /// module rather than as a workspace-level fixture so the trait
+    /// is exercised at the point of definition. A future
+    /// `BuilderVmRuntime` test suite (PR-B) can move this into a
+    /// `pub(crate)` helper if reused.
+    #[derive(Default)]
+    struct MockBackend {
+        scripted_exit: Option<BuilderVmExitInfo>,
+        scripted_err: Option<BuilderVmError>,
+        invocations: Mutex<Vec<RecordedInvocation>>,
+    }
+
+    impl VmBackendForBuilder for MockBackend {
+        fn run_attached_with_mounts(
+            &self,
+            config: &BuilderVmRunConfig,
+            mounts: &[BuilderVmMount],
+            extra_disks: &[BuilderVmDisk],
+            _timeout: Duration,
+        ) -> Result<BuilderVmExitInfo, BuilderVmError> {
+            self.invocations.lock().unwrap().push((
+                config.clone(),
+                mounts.to_vec(),
+                extra_disks.to_vec(),
+            ));
+            if let Some(err) = &self.scripted_err {
+                // Errors don't have an obvious Clone, so reconstruct
+                // the specific cases the trait emits.
+                return Err(match err {
+                    BuilderVmError::NotYetImplemented => BuilderVmError::NotYetImplemented,
+                    BuilderVmError::SeedKernelPanic {
+                        panic_line,
+                        console_log_path,
+                    } => BuilderVmError::SeedKernelPanic {
+                        panic_line: panic_line.clone(),
+                        console_log_path: console_log_path.clone(),
+                    },
+                    other => BuilderVmError::ExtractionFailed(format!("mock: {other}")),
+                });
+            }
+            Ok(self.scripted_exit.clone().unwrap_or(BuilderVmExitInfo {
+                exit_code: Some(0),
+                panic_line: None,
+            }))
+        }
+
+        fn console_log_path(&self, vm_state_dir: &Path) -> PathBuf {
+            vm_state_dir.join("console.log")
+        }
+    }
+
+    fn fixture_config() -> BuilderVmRunConfig {
+        BuilderVmRunConfig {
+            name: "builder-test".to_string(),
+            kernel_path: PathBuf::from("/tmp/vmlinux"),
+            kernel_cmdline: "console=hvc0".to_string(),
+            initrd_path: None,
+            vcpus: 2,
+            memory_mib: 1024,
+            vsock_ports: vec![5252],
+            vm_state_dir: PathBuf::from("/tmp/mvm-test/builder-test"),
+        }
+    }
+
+    #[test]
+    fn run_attached_records_config_mounts_and_disks() {
+        let backend = MockBackend::default();
+        let cfg = fixture_config();
+        let mount = BuilderVmMount {
+            tag: "/work".to_string(),
+            host_path: PathBuf::from("/host/work"),
+            read_only: true,
+        };
+        let disk = BuilderVmDisk {
+            id: "nix-store".to_string(),
+            host_path: PathBuf::from("/host/nix-store.img"),
+            read_only: false,
+        };
+
+        let info = backend
+            .run_attached_with_mounts(
+                &cfg,
+                std::slice::from_ref(&mount),
+                std::slice::from_ref(&disk),
+                Duration::from_secs(1),
+            )
+            .expect("default mock returns clean exit");
+        assert_eq!(info.exit_code, Some(0));
+        assert!(info.panic_line.is_none());
+
+        let invocations = backend.invocations.lock().unwrap();
+        assert_eq!(invocations.len(), 1);
+        let (recorded_cfg, recorded_mounts, recorded_disks) = &invocations[0];
+        assert_eq!(recorded_cfg, &cfg);
+        assert_eq!(recorded_mounts.as_slice(), std::slice::from_ref(&mount));
+        assert_eq!(recorded_disks.as_slice(), std::slice::from_ref(&disk));
+    }
+
+    #[test]
+    fn console_log_path_lives_inside_state_dir() {
+        let backend = MockBackend::default();
+        let dir = PathBuf::from("/tmp/example/vms/foo");
+        let p = backend.console_log_path(&dir);
+        assert_eq!(p, dir.join("console.log"));
+    }
+
+    #[test]
+    fn exit_info_carries_panic_line() {
+        let backend = MockBackend {
+            scripted_exit: Some(BuilderVmExitInfo {
+                exit_code: None,
+                panic_line: Some("Kernel panic - not syncing: VFS: Unable to mount root fs".into()),
+            }),
+            ..Default::default()
+        };
+        let info = backend
+            .run_attached_with_mounts(&fixture_config(), &[], &[], Duration::from_secs(1))
+            .expect("panic surfaces through the exit info, not an Err");
+        assert_eq!(info.exit_code, None);
+        assert!(info.panic_line.as_deref().unwrap().contains("Kernel panic"));
+    }
+
+    #[test]
+    fn errors_propagate_through_the_trait() {
+        let backend = MockBackend {
+            scripted_err: Some(BuilderVmError::NotYetImplemented),
+            ..Default::default()
+        };
+        let err = backend
+            .run_attached_with_mounts(&fixture_config(), &[], &[], Duration::from_secs(1))
+            .expect_err("scripted error propagates");
+        assert!(matches!(err, BuilderVmError::NotYetImplemented));
+    }
+
+    #[test]
+    fn mock_works_through_dyn_trait_object() {
+        // The helper (PR-B) holds `&dyn VmBackendForBuilder`, so the
+        // trait must be object-safe. This compiles only if it is.
+        let backend: Box<dyn VmBackendForBuilder> = Box::new(MockBackend::default());
+        let info = backend
+            .run_attached_with_mounts(&fixture_config(), &[], &[], Duration::from_secs(1))
+            .unwrap();
+        assert_eq!(info.exit_code, Some(0));
+    }
+}
+
 /// Resolve the host architecture's matching Linux system for flake
 /// attribute construction. Mirrors `mvm-build/src/backend/host.rs`'s
 /// `resolve_build_attribute_host`'s system selection.

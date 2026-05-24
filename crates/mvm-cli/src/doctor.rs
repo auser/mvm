@@ -213,6 +213,7 @@ pub fn run(json: bool, workflow: Option<DoctorWorkflow>) -> Result<()> {
 
     checks.push(kvm_check(plat, false));
     checks.push(apple_container_check(plat));
+    checks.push(vz_check(plat));
     checks.push(libkrun_check(plat));
     checks.push(network_backend_check(plat));
     checks.push(docker_check(plat));
@@ -630,6 +631,122 @@ fn apple_container_check(plat: Platform) -> Check {
             ok: true, // Not a failure — just unavailable
             info: "not available (requires macOS 26+ on Apple Silicon)".to_string(),
         }
+    }
+}
+
+/// Apple Virtualization.framework probe. Plan 97 / ADR-056.
+///
+/// Vz is built into macOS 13+; nothing to install at the framework
+/// layer. The supervisor *binary* (`mvm-vz-supervisor`) is a separate
+/// concern — we probe its presence so operators don't hit a
+/// mid-`mvmctl up --backend vz` failure. Both paths the
+/// `VzBackend::resolve_supervisor_path` resolver consults are
+/// reported when relevant.
+fn vz_check(plat: Platform) -> Check {
+    if plat != Platform::MacOS {
+        return Check {
+            name: "Apple Virtualization.framework",
+            category: "platform",
+            ok: true,
+            info: "n/a (not macOS)".to_string(),
+        };
+    }
+    if !plat.has_vz() {
+        return Check {
+            name: "Apple Virtualization.framework",
+            category: "platform",
+            ok: true, // Not a failure — Vz is optional.
+            info: "not available (requires macOS 13+; macOS 11–12 fall back to libkrun)"
+                .to_string(),
+        };
+    }
+    // Vz framework available. Probe for the supervisor binary in the
+    // two locations the backend's resolver checks (source-checkout
+    // build output, release-installed `~/.mvm/bin/`). Surface either
+    // a found path or the build hint so the operator can act.
+    let supervisor_info = vz_supervisor_binary_info();
+    Check {
+        name: "Apple Virtualization.framework",
+        category: "platform",
+        ok: true,
+        info: format!("available (macOS 13+); {supervisor_info}"),
+    }
+}
+
+/// Locate the `mvm-vz-supervisor` binary using the same chain the
+/// `VzBackend` resolver applies, but presented as a doctor-friendly
+/// string rather than an error. Order:
+///
+/// 1. `MVM_VZ_SUPERVISOR_PATH` (explicit override)
+/// 2. Source-checkout `crates/mvm-vz-supervisor/.build/<arch>-apple-macosx/debug/`
+/// 3. Release-installed `~/.mvm/bin/mvm-vz-supervisor-<mvmctl-version>`
+fn vz_supervisor_binary_info() -> String {
+    if let Some(p) = std::env::var_os("MVM_VZ_SUPERVISOR_PATH") {
+        let path = std::path::PathBuf::from(p);
+        if path.is_file() {
+            return format!(
+                "supervisor at {} (via MVM_VZ_SUPERVISOR_PATH)",
+                path.display()
+            );
+        }
+        return format!(
+            "MVM_VZ_SUPERVISOR_PATH set to {} but the path is not a file",
+            path.display()
+        );
+    }
+    // Source-checkout path — workspace root is wherever `mvmctl`'s
+    // build manifest sits; we can't introspect that from a doctor
+    // function compiled into the binary, but we can probe the path
+    // relative to the workspace inferred from `current_exe` when
+    // the binary is running from `target/.../mvmctl`.
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(workspace_root) = workspace_root_from_target_layout(&exe)
+    {
+        let candidate = workspace_root
+            .join("crates/mvm-vz-supervisor/.build")
+            .join(arch_apple_macosx())
+            .join("debug")
+            .join("mvm-vz-supervisor");
+        if candidate.is_file() {
+            return format!(
+                "supervisor at {} (source-checkout build)",
+                candidate.display()
+            );
+        }
+    }
+    // Release-installed path under `~/.mvm/bin/`.
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = std::path::PathBuf::from(home)
+            .join(".mvm/bin")
+            .join(format!("mvm-vz-supervisor-{}", env!("CARGO_PKG_VERSION")));
+        if candidate.is_file() {
+            return format!("supervisor at {} (installed)", candidate.display());
+        }
+    }
+    "supervisor binary NOT FOUND — build via `crates/mvm-vz-supervisor/tools/build.sh` \
+     before `mvmctl up --backend vz`"
+        .to_string()
+}
+
+/// Walk up from `target/<profile>/<exe>` to the workspace root.
+/// Returns `None` when the exe is not running from a cargo target
+/// layout (e.g. `cargo install` placed it under `~/.cargo/bin/`),
+/// which is correct — in that case there is no source checkout to
+/// probe.
+fn workspace_root_from_target_layout(exe: &std::path::Path) -> Option<std::path::PathBuf> {
+    let parent = exe.parent()?; // target/<profile>
+    let target = parent.parent()?; // target
+    if target.file_name().and_then(|n| n.to_str()) != Some("target") {
+        return None;
+    }
+    target.parent().map(std::path::Path::to_path_buf)
+}
+
+fn arch_apple_macosx() -> &'static str {
+    if cfg!(target_arch = "aarch64") {
+        "arm64-apple-macosx"
+    } else {
+        "x86_64-apple-macosx"
     }
 }
 
@@ -1742,6 +1859,38 @@ mod tests {
         assert!(platform_description(Platform::MacOS).contains("macOS"));
         assert!(platform_description(Platform::LinuxNative).contains("KVM"));
         assert!(platform_description(Platform::LinuxNoKvm).contains("without KVM"));
+    }
+
+    #[test]
+    fn vz_check_is_na_on_non_macos() {
+        for plat in [
+            Platform::LinuxNative,
+            Platform::LinuxNoKvm,
+            Platform::Wsl2,
+            Platform::Windows,
+        ] {
+            let c = vz_check(plat);
+            assert!(c.ok, "non-macOS vz check must not fail: {c:?}");
+            assert!(
+                c.info.contains("n/a"),
+                "non-macOS vz check info should say n/a: {}",
+                c.info
+            );
+        }
+    }
+
+    #[test]
+    #[cfg(target_os = "macos")]
+    fn vz_check_macos_reports_availability() {
+        let c = vz_check(Platform::MacOS);
+        assert!(c.ok, "macOS vz check must not fail: {c:?}");
+        // Either "available" (macOS 13+) or "not available" (macOS 11–12)
+        // — the variant depends on the contributor host's version.
+        assert!(
+            c.info.contains("available") || c.info.contains("not available"),
+            "macOS vz check should mention availability: {}",
+            c.info
+        );
     }
 
     #[test]

@@ -7,6 +7,10 @@ pub mod backend;
 /// itself wires in W2 PR 2 and the persistent-VM lifecycle in W3.
 pub mod builder_protocol;
 pub mod builder_vm;
+/// Plan 97 §"Phase C seam design" — hypervisor-agnostic builder-VM
+/// orchestration helper that wraps a `VmBackendForBuilder`
+/// implementation (libkrun today, Vz in PR-C).
+pub mod builder_vm_runtime;
 pub mod cache;
 pub mod firecracker;
 /// Plan 76 Phase 6 — portable signed `.mvm` artifacts. A tar.gz

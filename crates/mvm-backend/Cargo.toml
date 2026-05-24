@@ -44,6 +44,9 @@ mvm-base.workspace = true
 mvm-build.workspace = true
 mvm-providers.workspace = true
 mvm-libkrun.workspace = true
+# Plan 97 Phase B — Vz backend foundation crate (SupervisorConfig types,
+# supervisor-binary path resolution). Pure data + helpers; no Swift dep.
+mvm-vz.workspace = true
 
 anyhow.workspace = true
 # `libc` for `kill(pid, 0)` liveness probes + SIGTERM/SIGKILL signaling

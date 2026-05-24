@@ -48,6 +48,13 @@ pub mod mock;
 pub mod mock_guest_agent;
 pub mod netinit_audit;
 pub mod network;
+// Plan 97 Phase B — Vz (Apple Virtualization.framework) backend.
+// Currently a skeleton: trait surface + capabilities + security profile
+// + availability probe; lifecycle methods land in a follow-up slice.
+pub mod vz;
+// Plan 97 Phase E — Rust client for the Vz supervisor's control
+// socket (PAUSE / RESUME / BALLOON / SAVE). Used by VzBackend.
+pub mod vz_control;
 
 pub use apple_container::AppleContainerBackend;
 pub use backend::{AnyBackend, FirecrackerBackend, FirecrackerConfig};
@@ -56,6 +63,7 @@ pub use docker::DockerBackend;
 pub use libkrun::LibkrunBackend;
 pub use microvm_nix::{MicrovmNixBackend, MicrovmNixConfig};
 pub use mock::MockBackend;
+pub use vz::VzBackend;
 
 /// Crate-wide test serialization for tests that mutate `HOME` or
 /// other process-global env vars. Re-exported from

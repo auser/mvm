@@ -155,6 +155,17 @@ const PROC_SUB: &[(&str, AuditPosture)] = &[
 const SNAPSHOT_SUB: &[(&str, AuditPosture)] = &[
     ("ls", AuditPosture::ReadOnly),
     ("rm", AuditPosture::Emits("SnapshotDelete")),
+    // Plan 97 Phase E — `mvmctl snapshot save <vm> --path <p>` drives
+    // `VzBackend::snapshot_save`, hashes the resulting blob, and emits
+    // a chain-signed `vm.snapshot_saved` entry bound to the VM's
+    // persisted plan (see `AuditEmitter::emit_vm_snapshot_saved`).
+    ("save", AuditPosture::Emits("vm.snapshot_saved")),
+    // Plan 97 Phase E follow-up — `restore` currently bails before
+    // the supervisor call ("not yet implemented" — the Vz restore
+    // path needs a separate startup mode that boots from a saved
+    // state blob). Posture reflects the planned `vm.snapshot_restored`
+    // emit once the supervisor RESTORE mode lands.
+    ("restore", AuditPosture::Emits("vm.snapshot_restored")),
 ];
 
 // Plan 76 Phase 6 — `mvmctl artifact pack/verify`. Both are
@@ -482,6 +493,14 @@ fn audit_posture_emits_entries_reference_known_audit_kinds() {
         // Plan-64 audit-chain events.
         "plan.admitted",
         "plan.launched",
+        // Plan 97 Phase E — vm-lifecycle chain events for the Vz
+        // backend's snapshot verbs. `vm.snapshot_saved` is emitted
+        // today by `AuditEmitter::emit_vm_snapshot_saved`;
+        // `vm.snapshot_restored` is the planned token for the
+        // forthcoming RESTORE supervisor mode (the verb currently
+        // bails before emit).
+        "vm.snapshot_saved",
+        "vm.snapshot_restored",
     ];
 
     let mut failures: Vec<(String, &'static str)> = Vec::new();
