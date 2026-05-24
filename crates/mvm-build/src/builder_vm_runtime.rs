@@ -32,10 +32,22 @@
 //! helper methods get their own unit tests.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::Deserialize;
 
 use crate::builder_vm::{BuilderArtifacts, BuilderJob, BuilderVmError, VmBackendForBuilder};
+
+/// Wall-clock timeout for a builder VM run when the operator hasn't
+/// overridden it. 30 minutes covers a cold-cache `nix build` of the
+/// project's heaviest derivations on a fresh CI runner without
+/// punishing fast machines.
+pub const DEFAULT_BUILDER_VM_TIMEOUT: Duration = Duration::from_secs(30 * 60);
+
+/// Env var the operator sets to override [`DEFAULT_BUILDER_VM_TIMEOUT`].
+/// Plain integer seconds; zero is rejected so a typo doesn't silently
+/// disable the safety net.
+pub const MVM_BUILDER_VM_TIMEOUT_SECS_ENV: &str = "MVM_BUILDER_VM_TIMEOUT_SECS";
 
 /// Per-job dir filename mvm-builder-init detects to dispatch
 /// through the application-dependency install pipeline (Plan 73
@@ -632,6 +644,37 @@ pub fn shell_job_exit_error(exit_code: i32, stderr_tail: &str) -> BuilderVmError
     ))
 }
 
+/// Resolve the wall-clock timeout for a single builder-VM run.
+/// Reads [`MVM_BUILDER_VM_TIMEOUT_SECS_ENV`] from the host env;
+/// returns [`DEFAULT_BUILDER_VM_TIMEOUT`] when unset.
+///
+/// Both backends (libkrun + Vz) thread the returned [`Duration`] into
+/// their per-VM-run timer so a stuck guest doesn't pin a Cargo job
+/// indefinitely. Migrated from `libkrun_builder.rs` in Plan 97 Phase C
+/// PR-B-migrate (sixth migration). The env var name is intentionally
+/// hypervisor-agnostic; the policy is the same on both paths.
+///
+/// Rejects zero so a typo (`MVM_BUILDER_VM_TIMEOUT_SECS=0`) doesn't
+/// silently disable the timeout. Operators that want "no limit" should
+/// pass a very large value.
+pub fn builder_vm_timeout() -> Result<Duration, BuilderVmError> {
+    let Some(raw) = std::env::var_os(MVM_BUILDER_VM_TIMEOUT_SECS_ENV) else {
+        return Ok(DEFAULT_BUILDER_VM_TIMEOUT);
+    };
+    let raw = raw.to_string_lossy();
+    let secs = raw.parse::<u64>().map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!(
+            "{MVM_BUILDER_VM_TIMEOUT_SECS_ENV} must be an integer number of seconds, got {raw:?}: {e}"
+        ))
+    })?;
+    if secs == 0 {
+        return Err(BuilderVmError::ExtractionFailed(format!(
+            "{MVM_BUILDER_VM_TIMEOUT_SECS_ENV} must be greater than zero"
+        )));
+    }
+    Ok(Duration::from_secs(secs))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1155,5 +1198,91 @@ mod tests {
         };
         assert!(msg.contains("exited 137"), "got: {msg}");
         assert!(msg.ends_with("stderr tail:\n"), "got: {msg}");
+    }
+
+    // -----------------------------------------------------------------
+    // builder_vm_timeout — Plan 97 Phase C PR-B-migrate (sixth and
+    // final pre-VzBuilderVm migration). Reads
+    // MVM_BUILDER_VM_TIMEOUT_SECS from the process env; mutation is
+    // serialised through TIMEOUT_ENV_LOCK so concurrent test threads
+    // don't observe each other's writes.
+    // -----------------------------------------------------------------
+
+    use std::sync::{LazyLock, Mutex};
+
+    static TIMEOUT_ENV_LOCK: LazyLock<Mutex<()>> = LazyLock::new(|| Mutex::new(()));
+
+    #[test]
+    fn builder_vm_timeout_defaults_when_unset() {
+        let _lock = TIMEOUT_ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os(MVM_BUILDER_VM_TIMEOUT_SECS_ENV);
+        // SAFETY: tests serialise env mutation via TIMEOUT_ENV_LOCK.
+        unsafe {
+            std::env::remove_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV);
+        }
+        assert_eq!(builder_vm_timeout().unwrap(), DEFAULT_BUILDER_VM_TIMEOUT);
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV, v),
+                None => std::env::remove_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn builder_vm_timeout_parses_positive_seconds() {
+        let _lock = TIMEOUT_ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os(MVM_BUILDER_VM_TIMEOUT_SECS_ENV);
+        unsafe {
+            std::env::set_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV, "120");
+        }
+        assert_eq!(
+            builder_vm_timeout().unwrap(),
+            std::time::Duration::from_secs(120)
+        );
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV, v),
+                None => std::env::remove_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn builder_vm_timeout_rejects_zero() {
+        let _lock = TIMEOUT_ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os(MVM_BUILDER_VM_TIMEOUT_SECS_ENV);
+        unsafe {
+            std::env::set_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV, "0");
+        }
+        let err = builder_vm_timeout().unwrap_err();
+        assert!(format!("{err}").contains("greater than zero"), "got {err}");
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV, v),
+                None => std::env::remove_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV),
+            }
+        }
+    }
+
+    #[test]
+    fn builder_vm_timeout_rejects_non_integer() {
+        let _lock = TIMEOUT_ENV_LOCK.lock().unwrap();
+        let old = std::env::var_os(MVM_BUILDER_VM_TIMEOUT_SECS_ENV);
+        unsafe {
+            std::env::set_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV, "not-an-integer");
+        }
+        let err = builder_vm_timeout().unwrap_err();
+        let msg = format!("{err}");
+        assert!(msg.contains("must be an integer"), "got: {msg}");
+        // The bad value surfaces in the message so the operator
+        // doesn't have to re-check their env to find the typo.
+        assert!(msg.contains("not-an-integer"), "got: {msg}");
+        unsafe {
+            match old {
+                Some(v) => std::env::set_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV, v),
+                None => std::env::remove_var(MVM_BUILDER_VM_TIMEOUT_SECS_ENV),
+            }
+        }
     }
 }
