@@ -76,10 +76,12 @@ use crate::builder_vm::{
 // here uses `stage_job_dir` (commit 2), `read_job_result` (commit 3),
 // `finalize_flake_job` / `finalize_install_job` (commit 4),
 // `NixStoreImageLock` / `acquire_nix_store_image_lock` (commit 5),
-// and `supervisor_exit_error` / `shell_job_exit_error` (commit 6).
+// `supervisor_exit_error` / `shell_job_exit_error` (commit 6), and
+// `builder_vm_timeout` (commit 7 — last pre-VzBuilderVm migration).
 use crate::builder_vm_runtime::{
-    NixStoreImageLock, acquire_nix_store_image_lock, finalize_flake_job, finalize_install_job,
-    read_job_result, shell_job_exit_error, stage_job_dir, supervisor_exit_error,
+    NixStoreImageLock, acquire_nix_store_image_lock, builder_vm_timeout, finalize_flake_job,
+    finalize_install_job, read_job_result, shell_job_exit_error, stage_job_dir,
+    supervisor_exit_error,
 };
 
 /// Default vCPU count for the builder VM. Nix builds are
@@ -1620,24 +1622,6 @@ fn find_panic_line_in(buf: &[u8]) -> Option<String> {
     Some(line)
 }
 
-fn builder_vm_timeout() -> Result<Duration, BuilderVmError> {
-    let Some(raw) = std::env::var_os("MVM_BUILDER_VM_TIMEOUT_SECS") else {
-        return Ok(Duration::from_secs(30 * 60));
-    };
-    let raw = raw.to_string_lossy();
-    let secs = raw.parse::<u64>().map_err(|e| {
-        BuilderVmError::ExtractionFailed(format!(
-            "MVM_BUILDER_VM_TIMEOUT_SECS must be an integer number of seconds, got {raw:?}: {e}"
-        ))
-    })?;
-    if secs == 0 {
-        return Err(BuilderVmError::ExtractionFailed(
-            "MVM_BUILDER_VM_TIMEOUT_SECS must be greater than zero".to_string(),
-        ));
-    }
-    Ok(Duration::from_secs(secs))
-}
-
 /// Render a Path as a `&str` or surface a clear error if it
 /// contains non-UTF-8 bytes. libkrun's C API takes
 /// `*const c_char`; rejecting non-UTF-8 here pins the failure
@@ -2330,28 +2314,8 @@ mod tests {
         }
     }
 
-    #[test]
-    fn builder_vm_timeout_defaults_and_rejects_zero() {
-        let _lock = ENV_LOCK.lock().unwrap();
-        let old = std::env::var("MVM_BUILDER_VM_TIMEOUT_SECS").ok();
-        unsafe {
-            std::env::remove_var("MVM_BUILDER_VM_TIMEOUT_SECS");
-        }
-        assert_eq!(builder_vm_timeout().unwrap(), Duration::from_secs(30 * 60));
-
-        unsafe {
-            std::env::set_var("MVM_BUILDER_VM_TIMEOUT_SECS", "0");
-        }
-        let err = builder_vm_timeout().unwrap_err();
-        assert!(format!("{err}").contains("greater than zero"), "got {err}");
-
-        unsafe {
-            match old {
-                Some(v) => std::env::set_var("MVM_BUILDER_VM_TIMEOUT_SECS", v),
-                None => std::env::remove_var("MVM_BUILDER_VM_TIMEOUT_SECS"),
-            }
-        }
-    }
+    // `builder_vm_timeout_*` tests migrated to `builder_vm_runtime`
+    // alongside the function. Plan 97 Phase C PR-B-migrate commit 7.
 
     #[test]
     fn unique_job_id_includes_pid_and_timestamp() {
