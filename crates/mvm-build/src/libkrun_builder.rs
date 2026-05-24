@@ -65,7 +65,17 @@ use std::time::{Duration, Instant};
 use mvm_libkrun::{KrunContext, SupervisorConfig};
 use serde::Deserialize;
 
-use crate::builder_vm::{BuilderArtifacts, BuilderJob, BuilderMounts, BuilderVm, BuilderVmError};
+use crate::builder_vm::{
+    BuilderArtifacts, BuilderJob, BuilderMounts, BuilderVm, BuilderVmDisk, BuilderVmError,
+    BuilderVmExitInfo, BuilderVmMount, BuilderVmRunConfig, VmBackendForBuilder,
+};
+// Plan 97 Phase C (PR-B-migrate commit 2) — these items previously
+// lived in this file; they migrated to `builder_vm_runtime` so the
+// future VzBuilderVm path can reuse the same staging logic without
+// duplicating ~150 lines. `INSTALL_SPEC_FILENAME` and
+// `shell_single_quote_escape` are imported only inside the test
+// module below; the production path here only needs `stage_job_dir`.
+use crate::builder_vm_runtime::stage_job_dir;
 
 /// Default vCPU count for the builder VM. Nix builds are
 /// embarrassingly parallel at the derivation level; 4 cores is the
@@ -765,6 +775,173 @@ impl BuilderVm for LibkrunBuilderVm {
 }
 
 // ─────────────────────────────────────────────────────────────────
+// LibkrunBuilderBackend — Plan 97 Phase C, first refactor slice.
+//
+// This is the hypervisor-agnostic seam's libkrun-flavored impl.
+// Wraps `spawn_supervisor_in_background` + `wait_with_panic_detector_until`
+// + the KrunContext-building pattern from `LibkrunBuilderVm::run_build`.
+// Today nothing in production uses it — `LibkrunBuilderVm::run_build`
+// stays as-is. The follow-up slice introduces a `BuilderVmRuntime`
+// helper that takes `&dyn VmBackendForBuilder` and migrates
+// `run_build` to use it; this struct is what plugs into that helper
+// for the libkrun backend.
+//
+// Lives in the same file as the private helpers it calls
+// (`resolve_supervisor_path`, `ensure_builder_vm_image`,
+// `krun_context_for_image`, `apply_networking_mode`, `path_to_str`,
+// `spawn_supervisor_in_background`, `wait_with_panic_detector_until`,
+// `WaitOutcome`, `DEFAULT_PANIC_POLL_INTERVAL`). Putting it here
+// avoids widening those helpers' visibility for a single new caller.
+// ─────────────────────────────────────────────────────────────────
+
+/// Plan 97 §"Phase C seam design" — libkrun-flavored impl of the
+/// hypervisor-agnostic [`VmBackendForBuilder`] primitive trait.
+///
+/// Holds the resolved supervisor binary path and the cached
+/// builder VM image (kernel + rootfs + cmdline). Construction
+/// eagerly resolves both so a missing prerequisite surfaces at
+/// `new()`-time rather than mid-build.
+///
+/// `LibkrunBuilderVm::run_build` does not yet use this — the
+/// follow-up slice (PR-B-2) introduces `BuilderVmRuntime` and
+/// flips the migration. Today it exists so PR-C (`VzBuilderVm`)
+/// has a worked example of how to wrap a hypervisor-specific
+/// supervisor behind the seam.
+pub struct LibkrunBuilderBackend {
+    supervisor_path: PathBuf,
+    image: BuilderVmImage,
+}
+
+impl LibkrunBuilderBackend {
+    /// Resolve the supervisor binary + builder VM image eagerly.
+    /// Surfaces "supervisor binary missing" / "builder image not
+    /// installed" at the call site rather than at first run.
+    pub fn new() -> Result<Self, BuilderVmError> {
+        let supervisor_path = resolve_supervisor_path()?;
+        let image = ensure_builder_vm_image()?;
+        Ok(Self {
+            supervisor_path,
+            image,
+        })
+    }
+
+    /// Test seam — caller supplies the supervisor path + image
+    /// directly so unit tests can construct a backend without
+    /// touching the host's libkrun install or the image cache.
+    /// Used by the construction test below; the future
+    /// `BuilderVmRuntime` test suite will reuse this pattern.
+    pub fn with_supervisor_and_image(supervisor_path: PathBuf, image: BuilderVmImage) -> Self {
+        Self {
+            supervisor_path,
+            image,
+        }
+    }
+}
+
+impl VmBackendForBuilder for LibkrunBuilderBackend {
+    fn run_attached_with_mounts(
+        &self,
+        config: &BuilderVmRunConfig,
+        mounts: &[BuilderVmMount],
+        extra_disks: &[BuilderVmDisk],
+        timeout: Duration,
+    ) -> Result<BuilderVmExitInfo, BuilderVmError> {
+        // Same refusal posture as run_build's step 2: a missing
+        // shared library is the most-common failure mode and an
+        // early surface keeps the supervisor spawn from producing
+        // a confusing rc -2.
+        if !mvm_libkrun::is_available() {
+            return Err(BuilderVmError::LibkrunUnavailable(format!(
+                "libkrun shared library not found on host. {}",
+                mvm_libkrun::install_hint()
+            )));
+        }
+
+        std::fs::create_dir_all(&config.vm_state_dir).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating builder VM state dir {}: {e}",
+                config.vm_state_dir.display()
+            ))
+        })?;
+
+        let console_log = self.console_log_path(&config.vm_state_dir);
+
+        // KrunContext construction — same shape as run_build's
+        // step 7, but parameterised on the trait's hypervisor-
+        // agnostic config. Builds top-down (resources first, then
+        // disks, then mounts, then vsock ports, then networking)
+        // because libkrun's builder methods consume `self` by value.
+        let mut krun = krun_context_for_image(&config.name, &self.image)?
+            .with_resources(config.vcpus, config.memory_mib)
+            .with_console_output(path_to_str(&console_log, "console_log")?)
+            .with_vsock_socket_dir(path_to_str(&config.vm_state_dir, "vm_state_dir")?);
+        for disk in extra_disks {
+            krun = krun.add_disk(
+                disk.id.clone(),
+                path_to_str(&disk.host_path, "extra_disk_path")?,
+                disk.read_only,
+            );
+        }
+        for mount in mounts {
+            // libkrun's add_virtio_fs takes only (tag, host_path) —
+            // every share is RW from the guest's perspective. The
+            // `BuilderVmMount::read_only` flag is currently ignored
+            // on this backend; Vz's impl will honour it via
+            // VZSharedDirectory's `readOnly:` parameter (Plan 97
+            // §"Host-path mounts").
+            krun = krun.add_virtio_fs(
+                mount.tag.clone(),
+                path_to_str(&mount.host_path, "mount_host_path")?,
+            );
+        }
+        for port in &config.vsock_ports {
+            krun = krun.add_vsock_port(*port);
+        }
+        krun = apply_networking_mode(krun, &config.vm_state_dir)?;
+
+        let cfg = SupervisorConfig {
+            krun,
+            vm_state_dir: path_to_str(&config.vm_state_dir, "vm_state_dir")?.to_string(),
+            pid_file_name: Some("builder.pid".to_string()),
+        };
+
+        let mut child = spawn_supervisor_in_background(&self.supervisor_path, &cfg)?;
+        // Same wait + panic-detection shape `spawn_supervisor_and_wait`
+        // uses, but we surface the panic line via the seam's exit
+        // info instead of an Err so the future BuilderVmRuntime
+        // helper can decide whether the job's expectations were
+        // met (Plan 77 W6 §"Concurrent panic detector").
+        match wait_with_panic_detector_until(
+            &mut child,
+            Some(&console_log),
+            DEFAULT_PANIC_POLL_INTERVAL,
+            Some(timeout),
+        ) {
+            Ok(WaitOutcome::Clean(code)) => Ok(BuilderVmExitInfo {
+                exit_code: Some(code),
+                panic_line: None,
+            }),
+            Ok(WaitOutcome::KernelPanic { panic_line, .. }) => Ok(BuilderVmExitInfo {
+                exit_code: None,
+                panic_line: Some(panic_line),
+            }),
+            Ok(WaitOutcome::Timeout) => Err(BuilderVmError::NixBuildFailed(format!(
+                "builder VM exceeded {} seconds wall-clock; killed. Console log at {}.",
+                timeout.as_secs(),
+                console_log.display(),
+            ))),
+            Err(e) => Err(BuilderVmError::ExtractionFailed(format!(
+                "wait on supervisor child: {e}"
+            ))),
+        }
+    }
+
+    fn console_log_path(&self, vm_state_dir: &Path) -> PathBuf {
+        vm_state_dir.join("console.log")
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────
 // Helpers — kept in one place at the bottom of the file rather
 // than scattered through `impl` blocks so the run_build pipeline
 // reads top-down.
@@ -1026,179 +1203,19 @@ fn unique_job_id() -> String {
     format!("{now:013}-{pid}")
 }
 
-/// Filename of the install-spec JSON the host stages for
-/// install jobs. Matches the constant `mvm-builder-init` checks
-/// for inside the VM — keep these in sync.
-pub(crate) const INSTALL_SPEC_FILENAME: &str = "install_spec.json";
+// `INSTALL_SPEC_FILENAME` moved to `crate::builder_vm_runtime` in
+// Plan 97 Phase C PR-B-migrate; the `use` at the top of this file
+// pulls it back in for the existing callers.
 
 /// Filename of the install report `mvm-builder-init` writes into
 /// `artifact_out/` after the install pipeline finishes. The host
 /// reads + parses this to decide whether the install succeeded.
 pub(crate) const INSTALL_RESULT_FILENAME: &str = "result.json";
 
-/// Stage the per-job dir for the given [`BuilderJob`].
-///
-/// - [`BuilderJob::Flake`]: writes `<job_dir>/cmd.sh` with the
-///   `nix build` script the guest's PID 1 dispatches via
-///   `/bin/sh -eu`.
-/// - [`BuilderJob::Install`]: copies the caller's install spec
-///   to `<job_dir>/install_spec.json`. `mvm-builder-init` probes
-///   for this filename first; when present it routes through the
-///   app-deps install pipeline (Plan 73 Followup B.2) instead of
-///   running `cmd.sh`.
-///
-/// The two modes are mutually exclusive — install jobs don't
-/// emit a `cmd.sh`, flake jobs don't emit an install spec.
-fn stage_job_dir(job_dir: &Path, job: &BuilderJob) -> Result<(), BuilderVmError> {
-    std::fs::create_dir_all(job_dir).map_err(|e| {
-        BuilderVmError::ExtractionFailed(format!("creating job dir {}: {e}", job_dir.display()))
-    })?;
-
-    let (flake_ref, attr_path) = match job {
-        BuilderJob::Flake {
-            flake_ref,
-            attr_path,
-        } => (flake_ref.as_str(), attr_path.as_str()),
-        BuilderJob::Install { spec_path } => {
-            // Copy the caller's spec into the per-job dir so the
-            // virtio-fs share carries it into the guest at
-            // `/job/install_spec.json`. `mvm-builder-init`
-            // (Plan 73 Followup B.2) detects that filename and
-            // dispatches through the install pipeline instead of
-            // running cmd.sh.
-            let dst = job_dir.join(INSTALL_SPEC_FILENAME);
-            std::fs::copy(spec_path, &dst).map_err(|e| {
-                BuilderVmError::ExtractionFailed(format!(
-                    "copying install spec {} -> {}: {e}",
-                    spec_path.display(),
-                    dst.display()
-                ))
-            })?;
-            return Ok(());
-        }
-    };
-
-    // Render the `cmd.sh` content. flake_ref and attr_path are
-    // user-controlled; emit them inside `'…'` quoted shell
-    // variables, escaping any embedded `'` with the standard
-    // `'\''` close-quote / escape / open-quote dance.
-    let body = format!(
-        r#"#!/bin/sh
-# mvm-builder-vm cmd.sh — emitted by LibkrunBuilderVm (Plan 72 W4).
-# Runs inside the libkrun builder VM under `/bin/sh -eu`. The
-# host wires /work (workspace), /out (artifact dir), /job (this
-# dir) as virtio-fs shares; /nix is a persistent virtio-blk
-# overlay handled by mvm-builder-init.
-set -eu
-
-FLAKE_REF='{flake_ref}'
-ATTR_PATH='{attr_path}'
-
-# Point HOME at writable tmpfs (`/tmp`) to satisfy code paths that
-# write to `~/...` (the rootfs is mounted `ro`; nix would otherwise
-# bail with "creating directory '//.cache/nix': Read-only file
-# system"). XDG_CACHE_HOME lives on the persistent `/nix-store`
-# disk so Nix's eval-cache-v5, tarball-cache, and binary-cache-v6
-# survive across builds — cold flake eval is the long pole on
-# warm-store rebuilds, and these caches reclaim it. `/nix-store`
-# is the ext4 root for the persistent virtio-blk device; it sits
-# alongside the overlay upperdir (`/nix-store/upper`) at the
-# disk's top level, so writes here don't pollute the Nix store
-# namespace. XDG_STATE_HOME stays on tmpfs: it only holds profile
-# generations, which one-shot build VMs don't use.
-export HOME=/tmp
-export XDG_CACHE_HOME=/nix-store/.cache
-export XDG_STATE_HOME=/tmp/.local/state
-mkdir -p /nix-store/.cache /tmp/.local/state
-
-# CA certs for TLS to cache.nixos.org / api.github.com.
-export CURL_CA_BUNDLE=/etc/ssl/certs/ca-bundle.crt
-export NIX_SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
-export SSL_CERT_FILE=/etc/ssl/certs/ca-bundle.crt
-
-cd /work
-# `experimental-features` enables nix-command + flakes. `sandbox =
-# false` + `build-users-group =` is mandatory inside the builder
-# VM: there are no `nixbld*` accounts in the rootfs and no kernel
-# user-ns isolation for build sandboxes, so every derivation would
-# otherwise fail with "the group 'nixbld' specified in
-# 'build-users-group' does not exist". The builder VM IS the
-# isolation boundary, so an in-guest sandbox is redundant.
-export NIX_CONFIG="experimental-features = nix-command flakes
-sandbox = false
-build-users-group =
-max-jobs = auto
-cores = 0
-auto-optimise-store = true
-substituters = https://cache.nixos.org/
-trusted-public-keys = cache.nixos.org-1:6NCHdD59X431o0gWypbMrAURkbJ16ZPMQFGspcDShjY="
-# Plan 72 W0's flake convention: workspace-path env var so
-# flakes that reference the workspace root don't depend on
-# relative-path resolution against the store-copied flake dir.
-export MVM_WORKSPACE_PATH=/work
-
-echo "mvm-builder-vm: filesystem space before nix build:" >&2
-df -h /nix /tmp >&2 || true
-
-# `--impure` is what unblocks builds inside the VM when the
-# flake has path inputs; `--no-write-lock-file` keeps the
-# read-only `/work` mount from tripping EROFS.
-# `--print-build-logs --keep-going` dumps every failing build's
-# stderr inline (default nix only prints the last 10 lines and
-# cascades up). We tee stderr to /job/nix-build.log so the host
-# can read the actual root cause when a deep dependency fails.
-set +e
-nix build "${{FLAKE_REF}}#${{ATTR_PATH}}" \
-    --no-link --print-out-paths --no-write-lock-file --impure \
-    --print-build-logs --keep-going \
-    > /job/nix-stdout.log 2> /job/nix-stderr.log
-NIX_RC=$?
-set -e
-NIX_OUT=$(cat /job/nix-stdout.log)
-if [ "$NIX_RC" -ne 0 ]; then
-    echo "mvm-builder-vm: filesystem space after failed nix build:" >&2
-    df -h /nix /tmp >&2 || true
-    echo "nix build exited $NIX_RC; tail of stderr:" >&2
-    tail -200 /job/nix-stderr.log >&2
-    exit $NIX_RC
-fi
-
-if [ -z "$NIX_OUT" ]; then
-    echo "nix build emitted no /nix/store output path" >&2
-    exit 1
-fi
-printf '%s\n' "$NIX_OUT" > /job/store-path
-
-# Copy the artifacts the host expects into /out. We accept
-# either `vmlinux` (the canonical name our flakes use) or
-# `Image` / `bzImage` (raw kernel format names) for
-# robustness across flake conventions.
-if   [ -f "$NIX_OUT/vmlinux" ]; then cp -L "$NIX_OUT/vmlinux" /out/vmlinux
-elif [ -f "$NIX_OUT/Image"   ]; then cp -L "$NIX_OUT/Image"   /out/vmlinux
-elif [ -f "$NIX_OUT/bzImage" ]; then cp -L "$NIX_OUT/bzImage" /out/vmlinux
-fi
-if [ -f "$NIX_OUT/rootfs.ext4" ]; then
-    cp -L "$NIX_OUT/rootfs.ext4" /out/rootfs.ext4
-else
-    echo "no rootfs.ext4 in nix build output at $NIX_OUT" >&2
-    exit 1
-fi
-
-# Permissions for the host-side reader. Ignore failures —
-# virtio-fs may map the uid such that chmod is a no-op.
-chmod 0644 /out/rootfs.ext4 2>/dev/null || true
-[ -f /out/vmlinux ] && chmod 0644 /out/vmlinux 2>/dev/null || true
-"#,
-        flake_ref = shell_single_quote_escape(flake_ref),
-        attr_path = shell_single_quote_escape(attr_path),
-    );
-
-    let cmd_path = job_dir.join("cmd.sh");
-    std::fs::write(&cmd_path, body).map_err(|e| {
-        BuilderVmError::ExtractionFailed(format!("writing {}: {e}", cmd_path.display()))
-    })?;
-    Ok(())
-}
+// `stage_job_dir` migrated to `crate::builder_vm_runtime` in Plan 97
+// Phase C PR-B-migrate commit 2. Both libkrun (here) and the
+// future VzBuilderVm path call the same helper, which produces the
+// virtio-fs-share-friendly cmd.sh / install_spec.json.
 
 fn stage_shell_job_dir(job_dir: &Path, script: &str) -> Result<(), BuilderVmError> {
     std::fs::create_dir_all(job_dir).map_err(|e| {
@@ -1211,13 +1228,9 @@ fn stage_shell_job_dir(job_dir: &Path, script: &str) -> Result<(), BuilderVmErro
     Ok(())
 }
 
-/// Escape a string for inclusion inside `'…'` single quotes
-/// in POSIX shell. The only character that can't appear inside
-/// single quotes is `'` itself; we close the quote, emit `\'`,
-/// then reopen. Standard sh-escape pattern.
-fn shell_single_quote_escape(s: &str) -> String {
-    s.replace('\'', "'\\''")
-}
+// `shell_single_quote_escape` migrated to
+// `crate::builder_vm_runtime` in Plan 97 Phase C PR-B-migrate
+// commit 2.
 
 /// Read the last `max_bytes` of `path` into a `String`, replacing any
 /// invalid UTF-8 lossily. Returns `Err` if the file is missing or
@@ -2216,6 +2229,7 @@ impl PersistentVmHandle {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::builder_vm_runtime::{INSTALL_SPEC_FILENAME, shell_single_quote_escape};
     use std::sync::{LazyLock, Mutex};
     use tempfile::TempDir;
 
@@ -3340,4 +3354,49 @@ mod tests {
     // invariant grep against `crates/` source. The grep excludes
     // `**/tests/**` by design — that's where mock-server patterns
     // for test scaffolding belong.
+
+    // ---------------------------------------------------------------
+    // Plan 97 §"Phase C seam design" — LibkrunBuilderBackend impl
+    //
+    // Construction-shape tests only. Exercising `run_attached_with_mounts`
+    // requires libkrun + the builder image + an actual supervisor
+    // child, which is the integration-test surface; unit-level
+    // assertions cover the trait wiring + the `console_log_path`
+    // contract.
+    // ---------------------------------------------------------------
+
+    #[test]
+    fn libkrun_builder_backend_with_supervisor_and_image_stores_paths() {
+        let supervisor = PathBuf::from("/tmp/mvm-test-supervisor");
+        let image = BuilderVmImage::Rootfs {
+            kernel_path: PathBuf::from("/tmp/vmlinux"),
+            rootfs_path: PathBuf::from("/tmp/rootfs.ext4"),
+            cmdline: "console=hvc0".to_string(),
+        };
+        let backend = LibkrunBuilderBackend::with_supervisor_and_image(supervisor.clone(), image);
+        assert_eq!(backend.supervisor_path, supervisor);
+        match &backend.image {
+            BuilderVmImage::Rootfs { kernel_path, .. } => {
+                assert_eq!(kernel_path, &PathBuf::from("/tmp/vmlinux"));
+            }
+            other => panic!("expected Rootfs variant, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn libkrun_builder_backend_console_log_lives_under_vm_state_dir() {
+        let backend = LibkrunBuilderBackend::with_supervisor_and_image(
+            PathBuf::from("/tmp/supervisor"),
+            BuilderVmImage::Rootfs {
+                kernel_path: PathBuf::from("/tmp/k"),
+                rootfs_path: PathBuf::from("/tmp/r"),
+                cmdline: String::new(),
+            },
+        );
+        let dir = PathBuf::from("/tmp/state/builder-foo");
+        let log = backend.console_log_path(&dir);
+        assert_eq!(log, dir.join("console.log"));
+        // Trait-object safety: confirm the impl satisfies `&dyn ...`.
+        let _erased: &dyn VmBackendForBuilder = &backend;
+    }
 }
