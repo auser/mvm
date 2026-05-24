@@ -196,12 +196,14 @@ struct DiskConfig: Decodable, StrictKeys {
 struct VirtioFsShare: Decodable, StrictKeys {
     let tag: String
     let hostPath: String
+    let readOnly: Bool
 
-    static let knownKeys: Set<String> = ["tag", "host_path"]
+    static let knownKeys: Set<String> = ["tag", "host_path", "read_only"]
 
     enum CodingKeys: String, CodingKey {
         case tag
         case hostPath = "host_path"
+        case readOnly = "read_only"
     }
 
     init(from decoder: Decoder) throws {
@@ -209,6 +211,7 @@ struct VirtioFsShare: Decodable, StrictKeys {
         let c = try decoder.container(keyedBy: CodingKeys.self)
         self.tag = try c.decode(String.self, forKey: .tag)
         self.hostPath = try c.decode(String.self, forKey: .hostPath)
+        self.readOnly = try c.decode(Bool.self, forKey: .readOnly)
     }
 }
 
