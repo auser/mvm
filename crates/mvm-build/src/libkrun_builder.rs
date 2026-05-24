@@ -74,11 +74,12 @@ use crate::builder_vm::{
 // `INSTALL_SPEC_FILENAME` and `shell_single_quote_escape` are
 // imported only inside the test module below; the production path
 // here uses `stage_job_dir` (commit 2), `read_job_result` (commit 3),
-// `finalize_flake_job` / `finalize_install_job` (commit 4), and
-// `NixStoreImageLock` / `acquire_nix_store_image_lock` (commit 5).
+// `finalize_flake_job` / `finalize_install_job` (commit 4),
+// `NixStoreImageLock` / `acquire_nix_store_image_lock` (commit 5),
+// and `supervisor_exit_error` / `shell_job_exit_error` (commit 6).
 use crate::builder_vm_runtime::{
     NixStoreImageLock, acquire_nix_store_image_lock, finalize_flake_job, finalize_install_job,
-    read_job_result, stage_job_dir,
+    read_job_result, shell_job_exit_error, stage_job_dir, supervisor_exit_error,
 };
 
 /// Default vCPU count for the builder VM. Nix builds are
@@ -480,20 +481,13 @@ impl LibkrunBuilderVm {
         let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg, &vm_state_dir)?;
         if exit_code != 0 {
             log_vsock_response_outcome(vsock_rx, None);
-            return Err(BuilderVmError::NixBuildFailed(format!(
-                "supervisor exited with non-zero status ({exit_code}); \
-                 guest stderr at {}",
-                vm_state_dir.display()
-            )));
+            return Err(supervisor_exit_error(exit_code, &vm_state_dir));
         }
 
         let result = read_job_result(&job_dir)?;
         log_vsock_response_outcome(vsock_rx, Some(result.exit_code));
         if result.exit_code != 0 {
-            return Err(BuilderVmError::NixBuildFailed(format!(
-                "guest shell job exited {} — stderr tail:\n{}",
-                result.exit_code, result.stderr_tail
-            )));
+            return Err(shell_job_exit_error(result.exit_code, &result.stderr_tail));
         }
 
         let result = BuilderShellResult {
@@ -750,11 +744,7 @@ impl BuilderVm for LibkrunBuilderVm {
         let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg, &vm_state_dir)?;
         if exit_code != 0 {
             log_vsock_response_outcome(vsock_rx, None);
-            return Err(BuilderVmError::NixBuildFailed(format!(
-                "supervisor exited with non-zero status ({exit_code}); \
-                 guest stderr at {}",
-                vm_state_dir.display()
-            )));
+            return Err(supervisor_exit_error(exit_code, &vm_state_dir));
         }
         // The flake / install finalize paths don't return a
         // structured exit_code from the file before they branch on

@@ -595,6 +595,43 @@ pub fn acquire_nix_store_image_lock(
     Ok(NixStoreImageLock { path, _file: file })
 }
 
+/// Format the [`BuilderVmError`] returned when the supervisor exited
+/// non-zero before the guest had a chance to write `/job/result`.
+/// Names `vm_state_dir` so the operator can grep the console log
+/// (`<vm_state_dir>/console.log`) for the guest's pre-shutdown stderr.
+///
+/// Hypervisor-agnostic: the message references the per-VM state
+/// directory, which both libkrun and Vz expose under the same name.
+/// Migrated from `libkrun_builder.rs` in Plan 97 Phase C PR-B-migrate
+/// (fifth migration after `NixStoreImageLock`). The libkrun path
+/// produced this exact error from two call sites; lifting it removes
+/// the drift risk if one site changes wording but not the other.
+pub fn supervisor_exit_error(exit_code: i32, vm_state_dir: &Path) -> BuilderVmError {
+    BuilderVmError::NixBuildFailed(format!(
+        "supervisor exited with non-zero status ({exit_code}); \
+         guest stderr at {}",
+        vm_state_dir.display()
+    ))
+}
+
+/// Format the [`BuilderVmError`] returned when the guest's cmd.sh
+/// exited non-zero. `stderr_tail` is the 20-line ringbuffer
+/// `mvm-builder-init` captured from cmd.sh's stderr (Plan 72 W3) —
+/// surfaced as-is so the operator sees the last few lines without
+/// having to read the `/job/result` JSON or chase the full log.
+///
+/// For full flake builds, prefer [`finalize_flake_job`] — it pairs
+/// the outer ringbuffer with the tail of `<job_dir>/nix-stderr.log`
+/// so the real per-derivation failure isn't hidden behind cmd.sh's
+/// "nix build exited N" preamble. This helper covers the shell-job
+/// path (e.g. `run_shell_script`), where there's no separate
+/// nix-stderr.log to surface.
+pub fn shell_job_exit_error(exit_code: i32, stderr_tail: &str) -> BuilderVmError {
+    BuilderVmError::NixBuildFailed(format!(
+        "guest shell job exited {exit_code} — stderr tail:\n{stderr_tail}"
+    ))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1068,5 +1105,55 @@ mod tests {
         let guard = acquire_nix_store_image_lock(&cache_dir, "x86_64", 16).unwrap();
         assert!(guard.path().is_file());
         assert!(cache_dir.is_dir());
+    }
+
+    // -----------------------------------------------------------------
+    // supervisor_exit_error + shell_job_exit_error — Plan 97 Phase C
+    // PR-B-migrate (fifth migration: stderr-tail capture / build failure
+    // formatting).
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn supervisor_exit_error_names_exit_code_and_state_dir() {
+        let err = supervisor_exit_error(42, Path::new("/tmp/vmstate/foo"));
+        let msg = match err {
+            BuilderVmError::NixBuildFailed(s) => s,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert!(msg.contains("non-zero status (42)"), "got: {msg}");
+        assert!(msg.contains("/tmp/vmstate/foo"), "got: {msg}");
+        assert!(msg.contains("guest stderr at"), "got: {msg}");
+    }
+
+    #[test]
+    fn shell_job_exit_error_inlines_stderr_tail() {
+        let err =
+            shell_job_exit_error(7, "warning: implicit declaration\nerror: missing semicolon");
+        let msg = match err {
+            BuilderVmError::NixBuildFailed(s) => s,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert!(msg.contains("exited 7"), "got: {msg}");
+        assert!(msg.contains("warning: implicit declaration"), "got: {msg}");
+        assert!(msg.contains("missing semicolon"), "got: {msg}");
+        // The tail appears on its own line — a newline between the
+        // header and the tail is the contract callers rely on when
+        // grepping logs.
+        assert!(msg.contains("stderr tail:\n"), "got: {msg}");
+    }
+
+    #[test]
+    fn shell_job_exit_error_handles_empty_tail() {
+        // mvm-builder-init writes an empty `stderr_tail` when cmd.sh
+        // failed before producing any stderr (e.g. SIGKILL via OOM).
+        // The error message should still be coherent — no trailing
+        // garbage, no panic on the format!.
+        let err = shell_job_exit_error(137, "");
+        let msg = match err {
+            BuilderVmError::NixBuildFailed(s) => s,
+            other => panic!("wrong variant: {other:?}"),
+        };
+        assert!(msg.contains("exited 137"), "got: {msg}");
+        assert!(msg.ends_with("stderr tail:\n"), "got: {msg}");
     }
 }
