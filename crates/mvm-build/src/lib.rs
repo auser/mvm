@@ -35,6 +35,14 @@ pub mod template_reuse;
 #[cfg(feature = "builder-vm")]
 pub mod libkrun_builder;
 
+/// Plan 97 Phase C — Vz-backed builder VM (gated by
+/// `builder-vm` for symmetry with `libkrun_builder`). Implements
+/// the second [`builder_vm::VmBackendForBuilder`] impl alongside
+/// `LibkrunBuilderBackend`; both feed the same hypervisor-agnostic
+/// `BuilderVmRuntime` orchestration on top.
+#[cfg(feature = "builder-vm")]
+pub mod vz_builder;
+
 pub mod nix;
 /// Plan 74 W1.3a — OCI layer unpack to a staging rootfs directory.
 /// Handles whiteouts, symlinks, hardlinks, ownership, permissions,
