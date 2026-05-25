@@ -394,6 +394,11 @@ jobs:
     name: Apple (release-only)
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
+    # The mvm-vz/build.rs Swift supervisor build is opt-in (see the
+    # comment at the top of crates/mvm-vz/build.rs). This lane is the
+    # release-tag macOS gate, so it must build the supervisor.
+    env:
+      MVM_VZ_BUILD_SUPERVISOR: "1"
     steps:
       - uses: actions/checkout@v6
 
@@ -518,6 +523,10 @@ jobs:
         runner:
           - macos-latest  # current shipping; covers Apple Container coexistence
     runs-on: ${{ matrix.runner }}
+    # The mvm-vz/build.rs Swift supervisor build is opt-in; this lane
+    # is the dedicated vz exercise so it must build the supervisor.
+    env:
+      MVM_VZ_BUILD_SUPERVISOR: "1"
     steps:
       - uses: actions/checkout@v6
 
@@ -624,6 +633,10 @@ jobs:
     if: ${{ vars.MACOS_26_AVAILABLE == 'true' }}
     runs-on: [self-hosted, macOS, ARM64, macos-26]
     continue-on-error: true
+    # The mvm-vz/build.rs Swift supervisor build is opt-in; this lane
+    # exercises vz on macOS 26 so it must build the supervisor.
+    env:
+      MVM_VZ_BUILD_SUPERVISOR: "1"
     steps:
       - uses: actions/checkout@v6
 

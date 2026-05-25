@@ -884,8 +884,9 @@ fn resolve_supervisor_path() -> Result<PathBuf> {
          $MVM_VZ_SUPERVISOR_PATH, alongside the current exe, \
          crates/mvm-vz-supervisor/.build/<arch>-apple-macosx/debug/mvm-vz-supervisor \
          (source-checkout), and ~/.mvm/bin/mvm-vz-supervisor-{} \
-         (release-installed). Build via \
-         `crates/mvm-vz-supervisor/tools/build.sh`.",
+         (release-installed). Run `MVM_VZ_BUILD_SUPERVISOR=1 cargo build \
+         -p mvm-vz` to build it via the mvm-vz build script, or invoke \
+         `crates/mvm-vz-supervisor/tools/build.sh` directly.",
         env!("CARGO_PKG_VERSION")
     );
 }
