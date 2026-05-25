@@ -623,7 +623,7 @@ impl LibkrunBuilderVm {
 /// Reject a path that isn't UTF-8 representable. Internal helper —
 /// the libkrun FFI requires CString-convertible paths and we want
 /// the failure pinned to the offending field with a useful name.
-fn ensure_utf8_path(p: &std::path::Path, field: &str) -> Result<(), BuilderVmError> {
+pub(crate) fn ensure_utf8_path(p: &std::path::Path, field: &str) -> Result<(), BuilderVmError> {
     p.to_str().ok_or_else(|| {
         BuilderVmError::ExtractionFailed(format!("{field} has non-UTF-8 bytes: {p:?}"))
     })?;
@@ -1029,7 +1029,7 @@ fn krun_context_for_image(
 /// per-arch builder VM images. `aarch64` on Apple Silicon /
 /// ARM Linux, `x86_64` everywhere else. Plan 72 W2's flake
 /// emits both per release.
-fn host_arch_tag() -> &'static str {
+pub(crate) fn host_arch_tag() -> &'static str {
     if cfg!(target_arch = "aarch64") {
         "aarch64"
     } else {
@@ -1041,7 +1041,7 @@ fn host_arch_tag() -> &'static str {
 /// `mvm_core::config::mvm_cache_dir()` to keep the per-arch
 /// subdirs in one place. Created lazily by callers — this
 /// function does not touch the filesystem.
-fn builder_vm_cache_dir() -> PathBuf {
+pub(crate) fn builder_vm_cache_dir() -> PathBuf {
     PathBuf::from(mvm_core::config::mvm_cache_dir()).join("builder-vm")
 }
 
@@ -1051,7 +1051,7 @@ fn builder_vm_cache_dir() -> PathBuf {
 /// files this loads. Plan 72 W5 cutover wires the build-or-
 /// download step that populates this cache; today it errors
 /// when missing with an actionable hint.
-fn ensure_builder_vm_image() -> Result<BuilderVmImage, BuilderVmError> {
+pub(crate) fn ensure_builder_vm_image() -> Result<BuilderVmImage, BuilderVmError> {
     let arch_dir = builder_vm_cache_dir().join(host_arch_tag());
     let kernel_path = arch_dir.join("vmlinux");
     let rootfs_path = arch_dir.join("rootfs.ext4");
@@ -1086,7 +1086,12 @@ fn ensure_builder_vm_image() -> Result<BuilderVmImage, BuilderVmError> {
 /// with the current PID so two concurrent invocations on one
 /// host don't clobber each other's job dirs even if they hit
 /// the same second.
-fn unique_job_id() -> String {
+///
+/// `pub(crate)` so the parallel `vz_builder::VzBuilderVm`
+/// driver can reuse the same per-job ID shape; the two backends
+/// share a cache root, so collisions on it would corrupt each
+/// other's job dirs.
+pub(crate) fn unique_job_id() -> String {
     use std::time::{SystemTime, UNIX_EPOCH};
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)

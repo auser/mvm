@@ -34,10 +34,17 @@ use std::thread;
 use std::time::Duration;
 
 use crate::builder_vm::{
-    BuilderVmDisk, BuilderVmError, BuilderVmExitInfo, BuilderVmMount, BuilderVmRunConfig,
-    VmBackendForBuilder,
+    BuilderArtifacts, BuilderJob, BuilderMounts, BuilderVm, BuilderVmDisk, BuilderVmError,
+    BuilderVmExitInfo, BuilderVmMount, BuilderVmRunConfig, VmBackendForBuilder,
 };
-use crate::libkrun_builder::BuilderVmImage;
+use crate::builder_vm_runtime::{
+    acquire_nix_store_image_lock, builder_vm_timeout, finalize_flake_job, finalize_install_job,
+    stage_job_dir, supervisor_exit_error,
+};
+use crate::libkrun_builder::{
+    BuilderVmImage, builder_vm_cache_dir, ensure_builder_vm_image, ensure_utf8_path, host_arch_tag,
+    unique_job_id,
+};
 
 /// Standard kernel cmdline the Vz supervisor pairs with the builder
 /// VM's rootfs. Matches `mvm_backend::vz::DEFAULT_CMDLINE`'s shape —
@@ -354,6 +361,489 @@ fn path_to_string(p: &Path, field: &str) -> Result<String, BuilderVmError> {
     })
 }
 
+// ─────────────────────────────────────────────────────────────────
+// VzBuilderVm — high-level driver, parallel to LibkrunBuilderVm.
+//
+// Wraps `VzBuilderBackend` (the seam impl) with the same
+// orchestration LibkrunBuilderVm performs: validate, acquire the
+// shared `/nix-store` virtio-blk image lock, stage the per-job dir,
+// dispatch through the seam, then finalize per job variant. The
+// shared bits (NixStoreImageLock, stage_job_dir, finalize_flake_job,
+// finalize_install_job, builder_vm_timeout, supervisor_exit_error)
+// all live in `builder_vm_runtime` from the Phase C PR-B migrations
+// (#434–#439); this driver is just the Vz-specific glue.
+// ─────────────────────────────────────────────────────────────────
+
+/// Default vCPU count for Vz builder VM runs. Same value as
+/// [`libkrun_builder::DEFAULT_VCPUS`] — nix builds parallelise at
+/// the derivation level, so 4 cores keeps a build saturated without
+/// pinning the host.
+pub const VZ_BUILDER_DEFAULT_VCPUS: u8 = crate::libkrun_builder::DEFAULT_VCPUS;
+
+/// Default guest RAM (MiB) for Vz builder VM runs. Same value as
+/// [`libkrun_builder::DEFAULT_MEMORY_MIB`] for parity with the
+/// libkrun path; the Stage 0 tmpfs cap inside the builder VM rootfs
+/// is what actually limits build memory, not the VM-level cap.
+pub const VZ_BUILDER_DEFAULT_MEMORY_MIB: u32 = crate::libkrun_builder::DEFAULT_MEMORY_MIB;
+
+/// Default persistent `/nix-store` sparse-image cap (MiB) for Vz
+/// builder VM runs. Same value as
+/// [`libkrun_builder::DEFAULT_NIX_STORE_MIB`] so swapping backends
+/// doesn't change the on-disk cache footprint.
+pub const VZ_BUILDER_DEFAULT_NIX_STORE_MIB: u32 = crate::libkrun_builder::DEFAULT_NIX_STORE_MIB;
+
+/// Vz parallel of [`libkrun_builder::LibkrunBuilderVm`]. Implements
+/// [`BuilderVm::run_build`] against the [`VzBuilderBackend`] seam,
+/// sharing every bit of substrate orchestration with the libkrun
+/// driver via the helpers migrated in PR-B (#434–#439).
+///
+/// Field shape mirrors `LibkrunBuilderVm` so a caller switching
+/// backends at the env-var level (Plan 97 §"Builder runtime
+/// selection") finds the same knobs. `supervisor_path_override`
+/// is Vz-only — useful in tests + the `MVM_VZ_SUPERVISOR_PATH`
+/// override path.
+#[derive(Debug, Clone, Default)]
+pub struct VzBuilderVm {
+    /// Guest vCPU count. See [`VZ_BUILDER_DEFAULT_VCPUS`].
+    pub vcpus: u8,
+    /// Guest RAM in MiB. See [`VZ_BUILDER_DEFAULT_MEMORY_MIB`].
+    pub memory_mib: u32,
+    /// Persistent `/nix-store` sparse cap. See
+    /// [`VZ_BUILDER_DEFAULT_NIX_STORE_MIB`].
+    pub nix_store_mib: u32,
+    /// Optional caller-supplied bootstrap image. When set,
+    /// [`Self::run_build`] boots from this kernel/rootfs/cmdline
+    /// instead of resolving the builder VM image from
+    /// `~/.cache/mvm/builder-vm/<arch>/`. Same shape as the libkrun
+    /// driver's [`libkrun_builder::LibkrunBuilderVm::image_override`].
+    pub image_override: Option<BuilderVmImage>,
+    /// Optional supervisor binary path override. When `None`,
+    /// [`resolve_vz_supervisor_path`] is consulted. Useful for tests
+    /// that inject a fake supervisor.
+    pub supervisor_path_override: Option<PathBuf>,
+}
+
+impl VzBuilderVm {
+    /// Construct with the canonical defaults.
+    pub fn new() -> Self {
+        Self {
+            vcpus: VZ_BUILDER_DEFAULT_VCPUS,
+            memory_mib: VZ_BUILDER_DEFAULT_MEMORY_MIB,
+            nix_store_mib: VZ_BUILDER_DEFAULT_NIX_STORE_MIB,
+            image_override: None,
+            supervisor_path_override: None,
+        }
+    }
+
+    /// Override the default vCPU / RAM pair.
+    pub fn with_resources(mut self, vcpus: u8, memory_mib: u32) -> Self {
+        self.vcpus = vcpus;
+        self.memory_mib = memory_mib;
+        self
+    }
+
+    /// Override the default `/nix-store` image cap.
+    pub fn with_nix_store_mib(mut self, mib: u32) -> Self {
+        self.nix_store_mib = mib;
+        self
+    }
+
+    /// Boot from a caller-supplied kernel/rootfs/cmdline instead of
+    /// resolving the builder VM image from
+    /// `~/.cache/mvm/builder-vm/<arch>/`. The Vz path only supports
+    /// [`BuilderVmImage::Rootfs`]; [`Self::run_build`] returns an
+    /// `ExtractionFailed` error if the override is a `RootDir`
+    /// variant (Vz has no `krun_set_root` analog).
+    pub fn with_image_override(mut self, image: BuilderVmImage) -> Self {
+        self.image_override = Some(image);
+        self
+    }
+
+    /// Override the supervisor binary path. Mostly for tests; the
+    /// production path uses [`resolve_vz_supervisor_path`].
+    pub fn with_supervisor_path_override(mut self, path: PathBuf) -> Self {
+        self.supervisor_path_override = Some(path);
+        self
+    }
+
+    /// Mirror of [`libkrun_builder::LibkrunBuilderVm::validate_mounts`].
+    /// Same shape — the validation is hypervisor-agnostic so we
+    /// reuse the wording but keep the function private so each
+    /// backend can evolve its own surface (e.g. Vz refusing a
+    /// `host_nix_store` field that we never consume).
+    fn validate_mounts(&self, mounts: &BuilderMounts) -> Result<(), BuilderVmError> {
+        ensure_utf8_path(&mounts.flake_src, "flake_src")?;
+        ensure_utf8_path(&mounts.artifact_out, "artifact_out")?;
+        if let Some(store) = &mounts.host_nix_store {
+            ensure_utf8_path(store, "host_nix_store")?;
+        }
+        if !mounts.flake_src.exists() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "flake source path does not exist: {}",
+                mounts.flake_src.display()
+            )));
+        }
+        if !mounts.flake_src.is_dir() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "flake source must be a directory: {}",
+                mounts.flake_src.display()
+            )));
+        }
+        std::fs::create_dir_all(&mounts.artifact_out).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating artifact_out {}: {e}",
+                mounts.artifact_out.display()
+            ))
+        })?;
+        Ok(())
+    }
+
+    /// Same shape as
+    /// [`libkrun_builder::LibkrunBuilderVm::validate_job`].
+    fn validate_job(&self, job: &BuilderJob) -> Result<(), BuilderVmError> {
+        match job {
+            BuilderJob::Flake {
+                flake_ref,
+                attr_path,
+            } => {
+                if flake_ref.trim().is_empty() {
+                    return Err(BuilderVmError::NixBuildFailed(
+                        "BuilderJob.flake_ref is empty".to_string(),
+                    ));
+                }
+                if attr_path.trim().is_empty() {
+                    return Err(BuilderVmError::NixBuildFailed(
+                        "BuilderJob.attr_path is empty".to_string(),
+                    ));
+                }
+            }
+            BuilderJob::Install { spec_path } => {
+                if !spec_path.is_file() {
+                    return Err(BuilderVmError::ExtractionFailed(format!(
+                        "BuilderJob::Install spec_path does not exist or is not a file: {}",
+                        spec_path.display()
+                    )));
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
+impl BuilderVm for VzBuilderVm {
+    fn run_build(
+        &self,
+        job: &BuilderJob,
+        mounts: &BuilderMounts,
+    ) -> Result<BuilderArtifacts, BuilderVmError> {
+        // 1. Caller-supplied input validation — same shape as
+        //    LibkrunBuilderVm. Surfacing this here keeps the error
+        //    pinned to the offending field rather than failing
+        //    inside the Vz supervisor.
+        self.validate_mounts(mounts)?;
+        self.validate_job(job)?;
+
+        // 2. Refuse on a host without Vz. The runtime detector
+        //    (`mvm_core::platform`) honestly reports `false` on
+        //    Linux / Windows / pre-macOS-13. The seam impl checks
+        //    this again, but we fail fast here for clearer errors.
+        if !mvm_core::platform::current().has_vz() {
+            return Err(BuilderVmError::ExtractionFailed(
+                "Apple Virtualization.framework is not available on this host. \
+                 Requires macOS 13 or later (Plan 97 §\"Minimum macOS version\")."
+                    .to_string(),
+            ));
+        }
+
+        // 3. Resolve the supervisor binary up front so a missing
+        //    binary surfaces here, not after kernel / image / lock
+        //    resolution does I/O.
+        let supervisor_path = match &self.supervisor_path_override {
+            Some(p) => p.clone(),
+            None => resolve_vz_supervisor_path()?,
+        };
+
+        // 4. Find or initialise the builder VM image. The Vz path
+        //    reuses the same image cache layout as libkrun — the
+        //    kernel + rootfs are hypervisor-agnostic (booted via
+        //    direct-kernel VZLinuxBootLoader / libkrun's KrunContext
+        //    respectively). Vz refuses [`BuilderVmImage::RootDir`]:
+        //    that variant boots via `krun_set_root` and has no Vz
+        //    analog.
+        let image = match &self.image_override {
+            Some(image) => image.clone(),
+            None => ensure_builder_vm_image()?,
+        };
+        if let BuilderVmImage::RootDir { .. } = image {
+            return Err(BuilderVmError::ExtractionFailed(
+                "VzBuilderVm requires a Rootfs builder image; RootDir is libkrun-specific \
+                 (krun_set_root has no Vz analog)"
+                    .to_string(),
+            ));
+        }
+
+        // 5. Allocate / locate the persistent `/nix-store` image,
+        //    holding the cross-process flock for the whole VM
+        //    lifetime. Shared cache layout with libkrun — both
+        //    backends key on the same `<cache>/nix-store-<arch>.img`
+        //    so a warm store survives across backend switches.
+        let nix_store_lock = acquire_nix_store_image_lock(
+            &builder_vm_cache_dir(),
+            host_arch_tag(),
+            u64::from(self.nix_store_mib),
+        )?;
+
+        // 6. Stage the per-build job dir under the shared cache
+        //    root. Same convention as the libkrun side; both
+        //    backends pass `/job` as a virtio-fs share so the
+        //    in-guest `mvm-builder-init` finds cmd.sh /
+        //    install_spec.json regardless of which hypervisor
+        //    booted it.
+        let job_id = unique_job_id();
+        let job_dir = builder_vm_cache_dir().join("jobs").join(&job_id);
+        stage_job_dir(&job_dir, job)?;
+        tracing::info!(
+            job_dir = %job_dir.display(),
+            "Vz builder VM job dir staged (nix-stderr.log streams here as the build runs)"
+        );
+
+        // 7. Per-VM state directory under the shared cache root.
+        //    Naming: `mvm-builder-vz-<job_id>` so concurrent
+        //    libkrun + Vz runs on the same host don't collide
+        //    (libkrun uses `mvm-builder-vm-<job_id>`).
+        let vm_name = format!("mvm-builder-vz-{job_id}");
+        let vm_state_dir = builder_vm_cache_dir().join("vms").join(&vm_name);
+        std::fs::create_dir_all(&vm_state_dir).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating Vz builder VM state dir {}: {e}",
+                vm_state_dir.display()
+            ))
+        })?;
+
+        // 8. Hand the resolved supervisor + image to the seam.
+        //    Construction enforces the Rootfs-only invariant a
+        //    second time (defense in depth — we already checked
+        //    above).
+        let backend = VzBuilderBackend::new_with_rootfs_image(supervisor_path, image.clone())?;
+
+        // 9. Build the hypervisor-agnostic run config. Kernel +
+        //    cmdline come from the resolved image; the seam impl
+        //    threads them onto the Swift supervisor's
+        //    `KernelConfig`. `vsock_ports` is empty for one-shot
+        //    flake / install jobs (the guest communicates results
+        //    via the `/job` virtio-fs share, not vsock); the
+        //    dispatch port (Plan 89 W2) is a persistent-VM concern
+        //    that lives on the long-lived `LibkrunPersistentBuilderVm`
+        //    path and doesn't apply here.
+        let (kernel_path, kernel_cmdline) = match &image {
+            BuilderVmImage::Rootfs {
+                kernel_path,
+                cmdline,
+                ..
+            } => (kernel_path.clone(), cmdline.clone()),
+            // Unreachable per the earlier check.
+            BuilderVmImage::RootDir { .. } => unreachable!(),
+        };
+        let run_config = BuilderVmRunConfig {
+            name: vm_name.clone(),
+            kernel_path,
+            kernel_cmdline,
+            initrd_path: None,
+            vcpus: self.vcpus,
+            memory_mib: self.memory_mib,
+            vsock_ports: Vec::new(),
+            vm_state_dir: vm_state_dir.clone(),
+        };
+
+        // 10. Mount layout matches what `mvm-builder-init` /
+        //     `cmd.sh` expect:
+        //     - `/work` (flake source) is read-only — the in-guest
+        //       script uses `--no-write-lock-file` to avoid EROFS.
+        //     - `/out` (artifacts) is read-write — kernel + rootfs
+        //       land here.
+        //     - `/job` is read-write — the guest writes
+        //       `nix-stderr.log`, `nix-stdout.log`, `result`, and
+        //       `store-path` here for the host-side finalize step.
+        let virtio_mounts = vec![
+            BuilderVmMount {
+                tag: "work".to_string(),
+                host_path: mounts.flake_src.clone(),
+                read_only: true,
+            },
+            BuilderVmMount {
+                tag: "out".to_string(),
+                host_path: mounts.artifact_out.clone(),
+                read_only: false,
+            },
+            BuilderVmMount {
+                tag: "job".to_string(),
+                host_path: job_dir.clone(),
+                read_only: false,
+            },
+        ];
+
+        // 11. The persistent `/nix-store` image rides as the second
+        //     virtio-blk device (the rootfs is the first). The
+        //     in-guest `mvm-builder-init` mounts it at `/nix-store`
+        //     before invoking cmd.sh.
+        let extra_disks = vec![BuilderVmDisk {
+            id: "nix-store".to_string(),
+            host_path: nix_store_lock.path().to_path_buf(),
+            read_only: false,
+        }];
+
+        // 12. Wall-clock timeout — same env-var-overridable budget
+        //     both backends share. The seam kills the supervisor on
+        //     timeout and surfaces the elapsed budget in the error.
+        let timeout = builder_vm_timeout()?;
+
+        // 13. Hand off to the seam. The backend spawns the
+        //     `mvm-vz-supervisor`, pipes the JSON config to stdin,
+        //     and blocks until the supervisor exits.
+        let exit_info =
+            backend.run_attached_with_mounts(&run_config, &virtio_mounts, &extra_disks, timeout)?;
+
+        // 14. Branch on the exit info. The Vz supervisor exits 0
+        //     for clean guest power-off, 1 for guest error, 2 for
+        //     config parse error, 3 for supervisor startup error
+        //     (per Plan 97 Phase A's `main.swift`). Anything
+        //     non-zero is fatal; the panic_line arm is defensive —
+        //     today the Vz seam never sets it because the supervisor
+        //     exits cleanly even on guest kernel panic, but if a
+        //     future iteration starts emitting it we want a clean
+        //     surface rather than the supervisor exit branch
+        //     swallowing the diagnostic.
+        if let Some(panic_line) = exit_info.panic_line {
+            return Err(BuilderVmError::SeedKernelPanic {
+                panic_line,
+                console_log_path: backend
+                    .console_log_path(&vm_state_dir)
+                    .display()
+                    .to_string(),
+            });
+        }
+        match exit_info.exit_code {
+            Some(0) => {}
+            Some(other) => {
+                return Err(supervisor_exit_error(other, &vm_state_dir));
+            }
+            None => {
+                return Err(BuilderVmError::NixBuildFailed(format!(
+                    "Vz supervisor exited without a status code. \
+                     Console log at {}.",
+                    backend.console_log_path(&vm_state_dir).display(),
+                )));
+            }
+        }
+
+        // 15. Per-variant finalize. `finalize_flake_job` reads
+        //     `<job_dir>/result` + validates rootfs / kernel landed
+        //     in `artifact_out`; `finalize_install_job` reads
+        //     `<artifact_out>/result.json` + validates the sealed
+        //     volume sidecars. Both functions live in
+        //     `builder_vm_runtime` (PRs #436/#437) so the Vz path
+        //     reuses the libkrun-equivalent finalize logic
+        //     verbatim.
+        let artifacts = match job {
+            BuilderJob::Flake { .. } => finalize_flake_job(&job_dir, &mounts.artifact_out, &job_id),
+            BuilderJob::Install { .. } => finalize_install_job(&mounts.artifact_out),
+        }?;
+
+        // 16. Drop the lock now that artifact reads are done so a
+        //     subsequent build on the same host can proceed.
+        drop(nix_store_lock);
+        Ok(artifacts)
+    }
+
+    fn cleanup(&self) -> Result<(), BuilderVmError> {
+        // Stateless cleanup today. Prune of stale job dirs lives in
+        // the shared `mvmctl cache prune` path, which already
+        // handles the libkrun + Vz convention together (both
+        // backends share `~/.cache/mvm/builder-vm/jobs/`).
+        Ok(())
+    }
+}
+
+/// Resolve the absolute path to the `mvm-vz-supervisor` binary.
+///
+/// Mirrors `mvm_backend::vz::resolve_supervisor_path` (which is
+/// private to that crate) in the four lookup sources it consults:
+///
+/// 1. `MVM_VZ_SUPERVISOR_PATH` — explicit override for tests +
+///    `cargo run` workflows. If set but pointing at a non-file,
+///    fails loudly so a typo doesn't fall through to the other
+///    sources.
+/// 2. A binary named `mvm-vz-supervisor` adjacent to the current
+///    exe — the layout produced by `cargo install` + Homebrew
+///    bottles that ship `mvmctl` alongside it.
+/// 3. The source-checkout build output via
+///    [`mvm_vz::source_tree_binary_path`] — CLAUDE.md "Source-checkout
+///    builds never depend on mvm-published artifacts".
+/// 4. The version-pinned release layout
+///    `~/.mvm/bin/mvm-vz-supervisor-<version>` via
+///    [`mvm_vz::supervisor_binary_path`].
+///
+/// Returned errors are
+/// `BuilderVmError::ExtractionFailed` rather than a Vz-specific
+/// variant; the supervisor-missing case is just an environment-gap
+/// the operator needs to install around, not a hypervisor failure
+/// per se.
+pub fn resolve_vz_supervisor_path() -> Result<PathBuf, BuilderVmError> {
+    if let Some(p) = std::env::var_os("MVM_VZ_SUPERVISOR_PATH") {
+        let path = PathBuf::from(p);
+        if path.is_file() {
+            return Ok(path);
+        }
+        return Err(BuilderVmError::ExtractionFailed(format!(
+            "MVM_VZ_SUPERVISOR_PATH points at {} which is not a file",
+            path.display()
+        )));
+    }
+    if let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let candidate = dir.join("mvm-vz-supervisor");
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    if let Some(workspace_root) = workspace_root_from_manifest_dir() {
+        let candidate = mvm_vz::source_tree_binary_path(&workspace_root);
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    if let Some(home) = std::env::var_os("HOME") {
+        let candidate = mvm_vz::supervisor_binary_path(Path::new(&home), env!("CARGO_PKG_VERSION"));
+        if candidate.is_file() {
+            return Ok(candidate);
+        }
+    }
+    Err(BuilderVmError::ExtractionFailed(format!(
+        "mvm-vz-supervisor binary not found. Looked for: \
+         $MVM_VZ_SUPERVISOR_PATH, alongside the current exe, \
+         crates/mvm-vz-supervisor/.build/<arch>-apple-macosx/debug/mvm-vz-supervisor \
+         (source-checkout), and ~/.mvm/bin/mvm-vz-supervisor-{} \
+         (release-installed). Build via \
+         `crates/mvm-vz-supervisor/tools/build.sh`.",
+        env!("CARGO_PKG_VERSION")
+    )))
+}
+
+/// Compute the workspace root from `CARGO_MANIFEST_DIR` so a
+/// `cargo run` from anywhere in the workspace can find the
+/// source-checkout supervisor. Returns `None` when the manifest
+/// isn't laid out as `<root>/crates/<name>/Cargo.toml` (e.g. a
+/// flattened build or a vendored layout).
+fn workspace_root_from_manifest_dir() -> Option<PathBuf> {
+    let manifest = std::env::var_os("CARGO_MANIFEST_DIR")?;
+    let manifest_dir = PathBuf::from(manifest);
+    // <root>/crates/mvm-build → two `..` is <root>.
+    let crates_dir = manifest_dir.parent()?;
+    let workspace_root = crates_dir.parent()?;
+    Some(workspace_root.to_path_buf())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -486,6 +976,267 @@ mod tests {
         assert!(cfg.virtio_fs[0].read_only);
         assert_eq!(cfg.virtio_fs[1].tag, "out");
         assert!(!cfg.virtio_fs[1].read_only);
+    }
+
+    // ─────────────────────────────────────────────────────────────
+    // VzBuilderVm driver tests — Plan 97 Phase C high-level driver
+    // ─────────────────────────────────────────────────────────────
+
+    #[test]
+    fn vz_builder_vm_defaults_match_libkrun_constants() {
+        // Cross-backend parity check: a contributor reading either
+        // driver's defaults sees the same VM shape. The constants
+        // are deliberately equal, not coincidentally equal.
+        let vm = VzBuilderVm::new();
+        assert_eq!(vm.vcpus, crate::libkrun_builder::DEFAULT_VCPUS);
+        assert_eq!(vm.memory_mib, crate::libkrun_builder::DEFAULT_MEMORY_MIB);
+        assert_eq!(
+            vm.nix_store_mib,
+            crate::libkrun_builder::DEFAULT_NIX_STORE_MIB
+        );
+        assert!(vm.image_override.is_none());
+        assert!(vm.supervisor_path_override.is_none());
+    }
+
+    #[test]
+    fn vz_builder_vm_builder_methods_chain() {
+        let custom = BuilderVmImage::Rootfs {
+            kernel_path: PathBuf::from("/tmp/k"),
+            rootfs_path: PathBuf::from("/tmp/r"),
+            cmdline: "console=hvc0".into(),
+        };
+        let vm = VzBuilderVm::new()
+            .with_resources(2, 1024)
+            .with_nix_store_mib(4096)
+            .with_image_override(custom.clone())
+            .with_supervisor_path_override(PathBuf::from("/tmp/fake-supervisor"));
+        assert_eq!(vm.vcpus, 2);
+        assert_eq!(vm.memory_mib, 1024);
+        assert_eq!(vm.nix_store_mib, 4096);
+        assert!(vm.image_override.is_some());
+        assert_eq!(
+            vm.supervisor_path_override.as_deref(),
+            Some(Path::new("/tmp/fake-supervisor"))
+        );
+    }
+
+    #[test]
+    fn vz_builder_vm_validate_mounts_rejects_missing_flake_src() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let mounts = BuilderMounts {
+            flake_src: scratch.path().join("does-not-exist"),
+            host_nix_store: None,
+            artifact_out: scratch.path().join("out"),
+        };
+        let err = VzBuilderVm::new().validate_mounts(&mounts).unwrap_err();
+        assert!(
+            matches!(err, BuilderVmError::ExtractionFailed(ref msg) if msg.contains("does not exist")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn vz_builder_vm_validate_mounts_rejects_flake_src_as_file() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let flake = scratch.path().join("flake-file");
+        std::fs::write(&flake, b"not a dir").unwrap();
+        let mounts = BuilderMounts {
+            flake_src: flake,
+            host_nix_store: None,
+            artifact_out: scratch.path().join("out"),
+        };
+        let err = VzBuilderVm::new().validate_mounts(&mounts).unwrap_err();
+        assert!(
+            matches!(err, BuilderVmError::ExtractionFailed(ref msg) if msg.contains("must be a directory")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn vz_builder_vm_validate_mounts_creates_artifact_out() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let flake = scratch.path().join("flake");
+        std::fs::create_dir(&flake).unwrap();
+        let artifact_out = scratch.path().join("nested").join("out");
+        let mounts = BuilderMounts {
+            flake_src: flake,
+            host_nix_store: None,
+            artifact_out: artifact_out.clone(),
+        };
+        VzBuilderVm::new().validate_mounts(&mounts).unwrap();
+        assert!(artifact_out.is_dir(), "artifact_out must be created");
+    }
+
+    #[test]
+    fn vz_builder_vm_validate_job_rejects_empty_flake_ref() {
+        let err = VzBuilderVm::new()
+            .validate_job(&BuilderJob::Flake {
+                flake_ref: "  ".into(),
+                attr_path: "x".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, BuilderVmError::NixBuildFailed(ref msg) if msg.contains("flake_ref")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn vz_builder_vm_validate_job_rejects_empty_attr_path() {
+        let err = VzBuilderVm::new()
+            .validate_job(&BuilderJob::Flake {
+                flake_ref: "path:/work".into(),
+                attr_path: "".into(),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, BuilderVmError::NixBuildFailed(ref msg) if msg.contains("attr_path")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn vz_builder_vm_validate_job_rejects_missing_install_spec() {
+        let scratch = tempfile::TempDir::new().unwrap();
+        let err = VzBuilderVm::new()
+            .validate_job(&BuilderJob::Install {
+                spec_path: scratch.path().join("missing-spec.json"),
+            })
+            .unwrap_err();
+        assert!(
+            matches!(err, BuilderVmError::ExtractionFailed(ref msg) if msg.contains("does not exist")),
+            "got: {err:?}"
+        );
+    }
+
+    #[test]
+    fn vz_builder_vm_run_build_refuses_root_dir_image_override() {
+        // The override path lets a caller hand us any BuilderVmImage
+        // variant; the run pipeline must refuse RootDir before any
+        // I/O happens since Vz has no krun_set_root analog.
+        //
+        // We can't reach the full pipeline on a Linux CI runner
+        // (`has_vz()` returns false), so this test runs the pipeline
+        // far enough to surface either the RootDir refusal (macOS)
+        // or the has_vz refusal (non-macOS) — either is a valid
+        // refusal. Pin both to guard against silent skips.
+        let scratch = tempfile::TempDir::new().unwrap();
+        let flake = scratch.path().join("flake");
+        std::fs::create_dir(&flake).unwrap();
+        let mounts = BuilderMounts {
+            flake_src: flake,
+            host_nix_store: None,
+            artifact_out: scratch.path().join("out"),
+        };
+        let job = BuilderJob::Flake {
+            flake_ref: "path:.".into(),
+            attr_path: "packages.x86_64-linux.default".into(),
+        };
+        let vm = VzBuilderVm::new()
+            .with_supervisor_path_override(PathBuf::from("/dev/null"))
+            .with_image_override(BuilderVmImage::RootDir {
+                root_dir: PathBuf::from("/tmp/root"),
+                entry_path: "/init".into(),
+            });
+        let err = vm.run_build(&job, &mounts).unwrap_err();
+        let msg = format!("{err}");
+        assert!(
+            msg.contains("Apple Virtualization.framework is not available")
+                || msg.contains("RootDir is libkrun-specific"),
+            "expected has_vz or RootDir refusal, got: {msg}"
+        );
+    }
+
+    #[test]
+    fn vz_builder_vm_run_build_surfaces_environment_gaps_on_clean_input() {
+        // Mirrors `libkrun_builder::tests::run_build_surfaces_environment_gaps_on_clean_input`
+        // shape. Clean inputs hit one of these in order:
+        //   - macOS / Vz unavailable     → ExtractionFailed
+        //   - supervisor binary missing  → ExtractionFailed
+        //   - builder image cache empty  → ExtractionFailed
+        //   - supervisor exits non-zero  → NixBuildFailed
+        //     (`supervisor_exit_error`; the libkrun builder image's
+        //      kernel won't direct-boot under Vz, so on a fully-
+        //      configured dev box we trip this branch instead)
+        // Any of those is a valid pre-Phase-C-cutover state.
+        let scratch = tempfile::TempDir::new().unwrap();
+        let flake = scratch.path().join("flake");
+        std::fs::create_dir(&flake).unwrap();
+        let mounts = BuilderMounts {
+            flake_src: flake,
+            host_nix_store: None,
+            artifact_out: scratch.path().join("out"),
+        };
+        let job = BuilderJob::Flake {
+            flake_ref: "path:.".into(),
+            attr_path: "packages.x86_64-linux.default".into(),
+        };
+        let err = VzBuilderVm::new().run_build(&job, &mounts).unwrap_err();
+        assert!(
+            matches!(
+                err,
+                BuilderVmError::ExtractionFailed(_) | BuilderVmError::NixBuildFailed(_)
+            ),
+            "unexpected error variant: {err:?}"
+        );
+    }
+
+    /// Process-wide lock for `MVM_VZ_SUPERVISOR_PATH` mutation. Same
+    /// pattern as the env-mutating tests in
+    /// `builder_backend_select` + `builder_vm_runtime`; without it
+    /// the two resolver tests race on the env var and one observes
+    /// the other's value.
+    static SUPERVISOR_ENV_LOCK: std::sync::LazyLock<std::sync::Mutex<()>> =
+        std::sync::LazyLock::new(|| std::sync::Mutex::new(()));
+
+    fn with_supervisor_env<F: FnOnce() -> R, R>(value: Option<&Path>, f: F) -> R {
+        let _guard = SUPERVISOR_ENV_LOCK.lock().unwrap();
+        let prev = std::env::var_os("MVM_VZ_SUPERVISOR_PATH");
+        // SAFETY: SUPERVISOR_ENV_LOCK serialises every test that
+        // mutates MVM_VZ_SUPERVISOR_PATH.
+        unsafe {
+            match value {
+                Some(v) => std::env::set_var("MVM_VZ_SUPERVISOR_PATH", v),
+                None => std::env::remove_var("MVM_VZ_SUPERVISOR_PATH"),
+            }
+        }
+        let result = f();
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("MVM_VZ_SUPERVISOR_PATH", v),
+                None => std::env::remove_var("MVM_VZ_SUPERVISOR_PATH"),
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn resolve_vz_supervisor_path_honors_env_override_when_present() {
+        // Hermetic: write a file to a TempDir, point the env at it,
+        // assert resolution finds it. Avoids touching the operator's
+        // real `~/.mvm/bin/` layout.
+        let scratch = tempfile::TempDir::new().unwrap();
+        let candidate = scratch.path().join("fake-vz-supervisor");
+        std::fs::write(&candidate, b"fake").unwrap();
+
+        with_supervisor_env(Some(&candidate), || {
+            let resolved = resolve_vz_supervisor_path().expect("env override must resolve");
+            assert_eq!(resolved, candidate);
+        });
+    }
+
+    #[test]
+    fn resolve_vz_supervisor_path_rejects_env_override_pointing_at_nonfile() {
+        // A typo in `MVM_VZ_SUPERVISOR_PATH` should fail loudly
+        // rather than fall through to PATH-style resolution and
+        // pick up an unintended binary.
+        let scratch = tempfile::TempDir::new().unwrap();
+        let bogus = scratch.path().join("nonexistent-supervisor");
+
+        with_supervisor_env(Some(&bogus), || {
+            let err = resolve_vz_supervisor_path().expect_err("missing file must reject");
+            assert!(format!("{err}").contains("not a file"), "got: {err:?}");
+        });
     }
 
     #[test]

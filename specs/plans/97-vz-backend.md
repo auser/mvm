@@ -145,21 +145,40 @@ Phase C sub-tasks:
       until guest exit, returns the supervisor's exit code as the
       VM exit status. Plan 97 Phase C *primitive*; the builder
       orchestration on top is its own slice (see below).
-- [ ] Builder runtime selection in `crates/mvm/src/vm/` branches on
-      `MVM_BUILDER_BACKEND=vz`  *(follow-up: needs the orchestration
-      layer below)*
-- [ ] `VzBuilderVm` impl of `BuilderVm::run_build` — uses
-      `run_attached` + virtio-fs `/work`/`/out`/`/job` shares +
-      cmd.sh emission + artifact extraction. The shared logic
-      LibkrunBuilderVm carries (~3,300 lines) deserves a refactor
-      into a hypervisor-agnostic seam before the second impl lands;
-      mirroring it ad-hoc would double the code.
+- [x] Builder runtime selection branches on `MVM_BUILDER_BACKEND=vz`
+      — `mvm_build::builder_backend_select::{resolve_choice,
+      resolve_builder_backend}` returns `Box<dyn BuilderVm>` and
+      `crates/mvm-cli/src/commands/env/apple_container.rs::build_image_via_libkrun`
+      is the dispatch site. Unrecognised values fall back to libkrun
+      with a `tracing::warn!`. (The plan originally pointed at
+      `crates/mvm/src/vm/`; the actual call site lives in
+      `mvm-cli/src/commands/env/`, so the helper lives in
+      `mvm-build` for parity with the trait and is referenced from
+      `mvm-cli`.)
+- [x] `VzBuilderVm` impl of `BuilderVm::run_build` —
+      `crates/mvm-build/src/vz_builder.rs`. Mirrors
+      `LibkrunBuilderVm::run_build` step-for-step against the seam:
+      validates mounts/job, acquires the shared `NixStoreImageLock`,
+      stages the per-job dir via `stage_job_dir`, builds the
+      `BuilderVmRunConfig` + mounts + extra-disks, dispatches
+      through `VzBuilderBackend::run_attached_with_mounts`, and
+      finalises with `finalize_flake_job` / `finalize_install_job`.
+      Every load-bearing concern lives in `builder_vm_runtime`
+      (Phase C PR-B migrations #434–#439) so the impl itself is
+      ~350 lines instead of doubling LibkrunBuilderVm. Cache layout
+      (`~/.cache/mvm/builder-vm/jobs/`, `vms/`) is shared with
+      libkrun; per-VM dirs differ only in the `mvm-builder-vz-`
+      prefix to avoid concurrent runs colliding.
 - [ ] Stage 0 audit emit + cache-prune contract participation
       (`project_stage0_audit_and_cache_prune_contract` memory)
       *(follow-up: pairs with the orchestration slice above)*
 - [ ] Phase C acceptance: `MVM_BUILDER_BACKEND=vz mvmctl build --flake
       .` produces byte-identical rootfs to libkrun-hosted equivalent
-      *(deferred — needs the orchestration slice above)*
+      *(deferred — needs a successful Vz-direct boot of the libkrun-
+      built builder VM image; the libkrun image's kernel currently
+      won't direct-boot via VZLinuxBootLoader, so a Vz-compatible
+      builder VM kernel needs to ship before this acceptance line
+      can flip green.)*
 
 ### Phase C seam design (recommendation)
 

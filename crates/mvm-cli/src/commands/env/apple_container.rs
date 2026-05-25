@@ -4072,8 +4072,8 @@ fn builder_vm_artifact_names(arch: &str) -> BuilderVmArtifactNames {
 // Gated only on `builder-vm`.
 #[cfg(feature = "builder-vm")]
 fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
-    use mvm_build::builder_vm::{BuilderJob, BuilderMounts, BuilderVm, host_system_linux};
-    use mvm_build::libkrun_builder::LibkrunBuilderVm;
+    use mvm_build::builder_backend_select::{resolve_builder_backend, resolve_choice};
+    use mvm_build::builder_vm::{BuilderJob, BuilderMounts, host_system_linux};
 
     // Ensure Layer 1 (the builder VM image) is in
     // `~/.cache/mvm/builder-vm/<arch>/`.
@@ -4117,9 +4117,15 @@ fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
         artifact_out: std::path::PathBuf::from(out_dir),
     };
 
-    LibkrunBuilderVm::default()
+    // Plan 97 Phase C: `MVM_BUILDER_BACKEND=vz` flips the dispatch
+    // to `VzBuilderVm` without touching the rest of the pipeline.
+    // The resolver defaults to libkrun when the env var is unset,
+    // preserving the historical behaviour for every existing caller.
+    let backend_name = resolve_choice().name();
+    let backend = resolve_builder_backend();
+    backend
         .run_build(&job, &mounts)
-        .map_err(|e| anyhow::anyhow!("libkrun builder VM: {e}"))?;
+        .map_err(|e| anyhow::anyhow!("{backend_name} builder VM: {e}"))?;
 
     // run_build wrote vmlinux + rootfs.ext4 into out_dir via the
     // virtio-fs `/out` mount; the same files mvm-cli is about to
@@ -4127,10 +4133,10 @@ fn build_image_via_libkrun(out_dir: &str) -> Result<(String, String)> {
     let kernel = format!("{out_dir}/vmlinux");
     let rootfs = format!("{out_dir}/rootfs.ext4");
     if !std::path::Path::new(&kernel).exists() {
-        anyhow::bail!("libkrun builder VM exited cleanly but did not produce {kernel}");
+        anyhow::bail!("{backend_name} builder VM exited cleanly but did not produce {kernel}");
     }
     if !std::path::Path::new(&rootfs).exists() {
-        anyhow::bail!("libkrun builder VM exited cleanly but did not produce {rootfs}");
+        anyhow::bail!("{backend_name} builder VM exited cleanly but did not produce {rootfs}");
     }
     Ok((kernel, rootfs))
 }
