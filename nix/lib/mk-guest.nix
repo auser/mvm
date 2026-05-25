@@ -774,6 +774,23 @@ let
                 "$src" \
                 "$out/lib/modules/$kver" \
                 "vmw_vsock_virtio_transport"
+              # Stage 0 (`bootstrap_builder_vm_image_via_dev_image_stage0`,
+              # Plan 77 W3) boots this rootfs and mounts `/work`, `/out`,
+              # `/job` as virtio-fs. nixpkgs ships `CONFIG_VIRTIO_FS=m`
+              # and `CONFIG_FUSE_FS=m`, so without the module closure
+              # `mount -t virtiofs` fails with ENODEV and the VM powers
+              # down before `mvm-builder-init` can finalize `/job/result`.
+              # #333 trimmed the closure to vsock-only because that's all
+              # the workload microVM path needed; Stage 0's reuse of this
+              # rootfs landed later and depends on virtio-fs.
+              copy_module_closure \
+                "$src" \
+                "$out/lib/modules/$kver" \
+                "virtiofs"
+              copy_module_closure \
+                "$src" \
+                "$out/lib/modules/$kver" \
+                "fuse"
             done
             break
           fi
