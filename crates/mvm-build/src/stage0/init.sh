@@ -169,10 +169,22 @@ echo "stage0-init: building ${FLAKE_REF}" >&2
 # caps substituter HTTP connect waits at 30s so an unreachable
 # mirror fails over fast instead of stalling the whole build behind
 # the OS-default TCP timeout (~75-120s).
+#
+# --max-jobs 1 caps derivation parallelism inside Stage 0. With
+# Alpine nix's default `max-jobs = auto`, four heavy derivations
+# (mvm-builder-init, mvm-egress-proxy, mvm-guest-agent, the slim
+# Linux kernel) run concurrently and the combined working set
+# exceeds the 16 GiB guest RAM / 14 GiB `/nix` tmpfs envelope —
+# SIGKILL at `HOSTCC scripts/basic/fixdep`. libkrun_builder.rs:92-99
+# records the peak-per-derivation observation (~5-6 GiB), which fits
+# one at a time but not in parallel. Per-derivation parallelism stays
+# at the default (cores = nproc) so the kernel compile still uses
+# all 4 vCPUs.
 set +e
 nix build "$FLAKE_REF" \
     --extra-experimental-features "nix-command flakes" \
     --option connect-timeout 30 \
+    --max-jobs 1 \
     --no-link --no-write-lock-file --impure \
     --print-out-paths --print-build-logs \
     > /tmp/store-path 2> /out/nix-stderr.log
