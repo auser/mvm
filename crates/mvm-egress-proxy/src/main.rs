@@ -146,7 +146,10 @@ mod linux {
     unsafe fn libc_sigaction(sig: libc::c_int, stop: &Arc<AtomicBool>) {
         let _ = STOP_FLAG.set(Arc::clone(stop));
         let mut sa: libc::sigaction = unsafe { std::mem::zeroed() };
-        sa.sa_sigaction = signal_handler as usize;
+        // Two-step cast (fn item → `*const ()` → `usize`) keeps rustc
+        // happy under `function-casts-as-integer` (warn-by-default in
+        // recent nightlies, hard error under workspace `-D warnings`).
+        sa.sa_sigaction = signal_handler as *const () as usize;
         unsafe { libc::sigaction(sig, &sa, std::ptr::null_mut()) };
     }
 }
