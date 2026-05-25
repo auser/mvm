@@ -664,35 +664,81 @@ fn vz_check(plat: Platform) -> Check {
     // two locations the backend's resolver checks (source-checkout
     // build output, release-installed `~/.mvm/bin/`). Surface either
     // a found path or the build hint so the operator can act.
-    let supervisor_info = vz_supervisor_binary_info();
+    let (supervisor_path, supervisor_info) = locate_vz_supervisor();
+
+    let Some(path) = supervisor_path else {
+        return Check {
+            name: "Apple Virtualization.framework",
+            category: "platform",
+            ok: true,
+            info: format!("available (macOS 13+); {supervisor_info}"),
+        };
+    };
+
+    // Sub-probes — Plan 97 §13: entitlement check + MDM-policy probe.
+    // Each surfaces a brief tag in the info string; `ok` drops to false
+    // if either probe affirmatively reports the supervisor cannot run.
+    let entitlement = vz_entitlement_probe(&path);
+    let runtime = vz_runtime_probe(&path);
+
+    let entitlement_tag = match entitlement {
+        Some(true) => "entitlement ✓",
+        Some(false) => "entitlement MISSING",
+        None => "entitlement ?",
+    };
+    let runtime_tag = match &runtime {
+        Some(r) if r.is_supported => "probe ✓",
+        Some(_) => "probe: VZ NOT SUPPORTED (MDM lockdown? unsupported hardware?)",
+        None => "probe ?",
+    };
+    let macos_tag = runtime
+        .as_ref()
+        .map(|r| format!(" on macOS {}", r.macos_version))
+        .unwrap_or_default();
+
+    // An entitlement that's verifiably MISSING or a probe that
+    // affirmatively says NOT SUPPORTED means the operator will hit a
+    // real failure on `mvmctl up --backend vz`. Surface as not-ok so
+    // doctor flags it. `?` (probe failed to run, codesign missing,
+    // etc.) leaves ok=true — we don't want a broken probe to mask the
+    // real "supervisor present, framework available" signal.
+    let probes_ok =
+        !matches!(entitlement, Some(false)) && !matches!(&runtime, Some(r) if !r.is_supported);
+
     Check {
         name: "Apple Virtualization.framework",
         category: "platform",
-        ok: true,
-        info: format!("available (macOS 13+); {supervisor_info}"),
+        ok: probes_ok,
+        info: format!(
+            "available (macOS 13+); {supervisor_info}; {entitlement_tag}; {runtime_tag}{macos_tag}"
+        ),
     }
 }
 
 /// Locate the `mvm-vz-supervisor` binary using the same chain the
-/// `VzBackend` resolver applies, but presented as a doctor-friendly
-/// string rather than an error. Order:
+/// `VzBackend` resolver applies. Returns `(path, label)`: `path` is
+/// `Some` when the binary was found (so sub-probes have something to
+/// inspect); `label` is the doctor-friendly description either way.
+/// Order:
 ///
 /// 1. `MVM_VZ_SUPERVISOR_PATH` (explicit override)
 /// 2. Source-checkout `crates/mvm-vz-supervisor/.build/<arch>-apple-macosx/debug/`
 /// 3. Release-installed `~/.mvm/bin/mvm-vz-supervisor-<mvmctl-version>`
-fn vz_supervisor_binary_info() -> String {
+fn locate_vz_supervisor() -> (Option<std::path::PathBuf>, String) {
     if let Some(p) = std::env::var_os("MVM_VZ_SUPERVISOR_PATH") {
         let path = std::path::PathBuf::from(p);
         if path.is_file() {
-            return format!(
+            let info = format!(
                 "supervisor at {} (via MVM_VZ_SUPERVISOR_PATH)",
                 path.display()
             );
+            return (Some(path), info);
         }
-        return format!(
+        let info = format!(
             "MVM_VZ_SUPERVISOR_PATH set to {} but the path is not a file",
             path.display()
         );
+        return (None, info);
     }
     // Source-checkout path — workspace root is wherever `mvmctl`'s
     // build manifest sits; we can't introspect that from a doctor
@@ -708,10 +754,11 @@ fn vz_supervisor_binary_info() -> String {
             .join("debug")
             .join("mvm-vz-supervisor");
         if candidate.is_file() {
-            return format!(
+            let info = format!(
                 "supervisor at {} (source-checkout build)",
                 candidate.display()
             );
+            return (Some(candidate), info);
         }
     }
     // Release-installed path under `~/.mvm/bin/`.
@@ -720,12 +767,92 @@ fn vz_supervisor_binary_info() -> String {
             .join(".mvm/bin")
             .join(format!("mvm-vz-supervisor-{}", env!("CARGO_PKG_VERSION")));
         if candidate.is_file() {
-            return format!("supervisor at {} (installed)", candidate.display());
+            let info = format!("supervisor at {} (installed)", candidate.display());
+            return (Some(candidate), info);
         }
     }
-    "supervisor binary NOT FOUND — build via `crates/mvm-vz-supervisor/tools/build.sh` \
-     before `mvmctl up --backend vz`"
-        .to_string()
+    (
+        None,
+        "supervisor binary NOT FOUND — build via `crates/mvm-vz-supervisor/tools/build.sh` \
+         before `mvmctl up --backend vz`"
+            .to_string(),
+    )
+}
+
+/// Probe whether the supervisor binary carries the
+/// `com.apple.security.virtualization` entitlement. Plan 97 §13.
+///
+/// Returns:
+/// - `Some(true)`  — the entitlement is present (binary will be
+///   permitted to use Virtualization.framework).
+/// - `Some(false)` — codesign ran successfully but the entitlement is
+///   absent from the binary. `mvmctl up --backend vz` will fail with
+///   an opaque framework error; rebuilding via `tools/build.sh` fixes
+///   it.
+/// - `None` — codesign couldn't be invoked (not on PATH, or the
+///   binary path is wrong). Surfaced as `entitlement ?` in doctor; not
+///   a hard failure because we can't distinguish "tooling unavailable"
+///   from "binary actually unsigned" without the tool itself.
+fn vz_entitlement_probe(supervisor_path: &std::path::Path) -> Option<bool> {
+    // `codesign --display --entitlements -:- <path>` writes the
+    // entitlement plist to stdout. `-:-` selects the XML plist format
+    // (the alternative is binary plist or unspecified, which varies
+    // across macOS versions). We grep for the entitlement key rather
+    // than parse the plist — the key is a long well-known identifier,
+    // false positives are vanishingly unlikely.
+    let output = std::process::Command::new("codesign")
+        .args(["--display", "--entitlements", "-:-", "--"])
+        .arg(supervisor_path)
+        .output()
+        .ok()?;
+    Some(entitlement_present_in_codesign_output(&output.stdout))
+}
+
+/// Pure helper for parsing `codesign --display --entitlements`
+/// output. Split out so unit tests can drive it with fixture bytes
+/// without invoking codesign.
+fn entitlement_present_in_codesign_output(stdout: &[u8]) -> bool {
+    // The entitlement key always appears as `<key>...</key>` in plist
+    // output; matching the raw key text avoids depending on a plist
+    // parser and works against both XML and (older) hybrid formats.
+    let needle = b"com.apple.security.virtualization";
+    stdout.windows(needle.len()).any(|w| w == needle)
+}
+
+/// Result of running the supervisor in `--probe` mode. Mirrors the
+/// JSON the Swift side emits.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+struct VzProbeResult {
+    is_supported: bool,
+    macos_version: String,
+}
+
+/// Run the supervisor with `--probe` to learn whether VZ is actually
+/// usable on this host (Plan 97 §13 MDM-policy detection). The Swift
+/// side calls `VZVirtualMachine.isSupported`, which returns false
+/// under MDM virtualization lockdown, on unsupported hardware, and on
+/// macOS <11.
+///
+/// Returns `None` when the supervisor itself failed to run (codesign
+/// rejection, arch mismatch, file-not-executable). Returns `Some(_)`
+/// when the probe ran to completion and emitted parseable JSON. A
+/// `None` here surfaces as `probe ?` — same posture as the
+/// entitlement probe: we don't infer worst-case from a broken tool.
+fn vz_runtime_probe(supervisor_path: &std::path::Path) -> Option<VzProbeResult> {
+    let output = std::process::Command::new(supervisor_path)
+        .arg("--probe")
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    parse_vz_probe_output(&output.stdout)
+}
+
+/// Pure parser for the `--probe` JSON payload. Separate so tests can
+/// drive it without invoking the supervisor.
+fn parse_vz_probe_output(stdout: &[u8]) -> Option<VzProbeResult> {
+    serde_json::from_slice::<VzProbeResult>(stdout).ok()
 }
 
 /// Walk up from `target/<profile>/<exe>` to the workspace root.
@@ -1883,14 +2010,90 @@ mod tests {
     #[cfg(target_os = "macos")]
     fn vz_check_macos_reports_availability() {
         let c = vz_check(Platform::MacOS);
-        assert!(c.ok, "macOS vz check must not fail: {c:?}");
         // Either "available" (macOS 13+) or "not available" (macOS 11–12)
         // — the variant depends on the contributor host's version.
+        // We deliberately do NOT assert `c.ok` here: under the Plan 97 §13
+        // sub-probes, `ok` flips to false when codesign reports a missing
+        // entitlement or the supervisor probe affirmatively says VZ is not
+        // supported. Both are legitimate signals for a real CI host where
+        // the supervisor binary was built without the entitlement step or
+        // where MDM blocks Vz. The new probe-specific tests below pin the
+        // per-probe behaviour against fixture input.
         assert!(
             c.info.contains("available") || c.info.contains("not available"),
             "macOS vz check should mention availability: {}",
             c.info
         );
+    }
+
+    #[test]
+    fn entitlement_probe_parses_xml_plist_with_entitlement() {
+        // Real `codesign --display --entitlements -:-` XML plist output
+        // shape captured from a build.sh-signed mvm-vz-supervisor.
+        let stdout = br#"<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.virtualization</key>
+    <true/>
+</dict>
+</plist>
+"#;
+        assert!(entitlement_present_in_codesign_output(stdout));
+    }
+
+    #[test]
+    fn entitlement_probe_parses_plist_without_entitlement() {
+        // A binary that codesign succeeds against but carries no entitlements
+        // (or carries a different set) — operator needs to rebuild via
+        // tools/build.sh.
+        let stdout = br#"<?xml version="1.0" encoding="UTF-8"?>
+<plist version="1.0">
+<dict>
+    <key>com.apple.security.app-sandbox</key>
+    <true/>
+</dict>
+</plist>
+"#;
+        assert!(!entitlement_present_in_codesign_output(stdout));
+    }
+
+    #[test]
+    fn entitlement_probe_handles_empty_output() {
+        // codesign on an unsigned binary may emit empty output (varies by
+        // macOS version). Treat as "no entitlement" rather than "tooling
+        // broken" — the doctor's None-path is reserved for "couldn't run
+        // codesign at all".
+        assert!(!entitlement_present_in_codesign_output(b""));
+    }
+
+    #[test]
+    fn vz_runtime_probe_parses_supported_payload() {
+        let stdout = br#"{"is_supported":true,"macos_version":"26.3.1"}
+"#;
+        let parsed = parse_vz_probe_output(stdout).expect("valid probe output");
+        assert!(parsed.is_supported);
+        assert_eq!(parsed.macos_version, "26.3.1");
+    }
+
+    #[test]
+    fn vz_runtime_probe_parses_unsupported_payload() {
+        // Coarse "MDM lockdown or unsupported hardware" signal — the doctor
+        // surfaces this as the "VZ NOT SUPPORTED" tag and flips ok to false.
+        let stdout = br#"{"is_supported":false,"macos_version":"13.0.0"}"#;
+        let parsed = parse_vz_probe_output(stdout).expect("valid probe output");
+        assert!(!parsed.is_supported);
+        assert_eq!(parsed.macos_version, "13.0.0");
+    }
+
+    #[test]
+    fn vz_runtime_probe_rejects_malformed_json() {
+        assert!(parse_vz_probe_output(b"{not json").is_none());
+        assert!(parse_vz_probe_output(b"").is_none());
+        // Missing required field — serde_json must reject rather than fill
+        // a default, otherwise a partially-broken probe would silently
+        // claim is_supported=false.
+        assert!(parse_vz_probe_output(br#"{"macos_version":"13.0.0"}"#).is_none());
     }
 
     #[test]
