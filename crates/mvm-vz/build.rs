@@ -73,25 +73,19 @@ fn main() {
     let profile = std::env::var("PROFILE").unwrap_or_else(|_| "debug".to_string());
     let build_script = supervisor_root.join("tools/build.sh");
 
-    println!(
-        "cargo:warning=mvm-vz: building Swift supervisor ({profile}) via {}",
-        build_script.display()
-    );
-
-    // Capture stdout + stderr explicitly. The earlier `.status()`
-    // version inherited the parent's stderr, where cargo silently
-    // swallows everything that isn't prefixed `cargo:warning=`.
-    // When `swift build` fails, that meant the actual swift
-    // diagnostic vanished — the build.rs only saw the exit code
-    // and emitted a generic "see `tools/build.sh` manually" hint.
-    // CI hit this on macos-latest with no way to recover the
-    // underlying error from the captured log.
+    // Capture stdout + stderr explicitly so the failure path below
+    // can re-emit them. The earlier `.status()` version inherited
+    // the parent's stderr, where cargo silently swallows everything
+    // that isn't prefixed `cargo:warning=` — when `swift build`
+    // failed, the actual swift diagnostic vanished and the build.rs
+    // only saw an exit code. CI hit this on macos-latest with no
+    // way to recover the underlying error from the captured log.
     //
-    // Switching to `.output()` lets us re-emit every output line
-    // as a `cargo:warning=...` so the swift / codesign / shell
-    // error is visible in any cargo build log: interactive
-    // contributor, CI log, `cargo build --quiet`. Build still does
-    // not fail the cargo build on swift failure (see below).
+    // The success path stays silent: every workspace build fires
+    // this script, so echoing the supervisor build progress as
+    // `cargo:warning=` lines polluted every interactive build with
+    // ~15 warning lines per cargo invocation. The binary's mtime
+    // moving is the real success signal.
     let output = Command::new(&build_script)
         .arg(&profile)
         .current_dir(&supervisor_root)
@@ -99,15 +93,7 @@ fn main() {
 
     match output {
         Ok(out) if out.status.success() => {
-            // tools/build.sh prints the signed binary path on stdout;
-            // surface that + the success marker.
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                println!("cargo:warning=mvm-vz: swift stdout: {line}");
-            }
-            for line in String::from_utf8_lossy(&out.stderr).lines() {
-                println!("cargo:warning=mvm-vz: swift stderr: {line}");
-            }
-            println!("cargo:warning=mvm-vz: Swift supervisor build OK");
+            // Silent on success — see the rationale block above.
         }
         Ok(out) => {
             // Non-zero exit: surface every line of stdout + stderr
