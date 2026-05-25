@@ -2213,15 +2213,24 @@ mod tests {
 
     #[test]
     fn run_build_surfaces_environment_gaps_on_clean_input() {
-        // Good input + a sandbox host (CI runner, dev macOS without
-        // the cache populated) hits one of these in order:
+        // Input passes `validate_mounts` + `validate_job` (the dir
+        // exists, the flake_ref/attr_path are well-shaped) but the
+        // *environment* is missing one of the things `run_build`
+        // needs to succeed. Which thing depends on host state, and
+        // each yields a typed error variant — this test pins the
+        // union so a regression that swaps in `Internal`/`Unknown`
+        // or panics outright fails fast:
         //   - libkrun shared library missing → LibkrunUnavailable
         //   - builder VM image cache empty   → ExtractionFailed
         //   - mvm-libkrun-supervisor missing → LibkrunUnavailable
-        // Any of those is a valid pre-Plan-72-W5 state. The cutover
-        // (Plan 72 W5) wires the Stage 0 bootstrap that populates
-        // the image cache; until then, this test pins the shape
-        // of what `mvmctl dev up` reports to operators.
+        //   - flake.nix missing inside the (empty) stub mount, on
+        //     a host where libkrun + cache + supervisor are all
+        //     present (post-Plan-72-W5 contributor host) →
+        //     NixBuildFailed
+        // All four are legitimate "environment gap" surfaces. The
+        // fourth is what `mvmctl dev up` reports to operators with
+        // a populated cache; the first three are what `mvmctl dev
+        // up` reports before the Stage 0 bootstrap completes.
         let scratch = TempDir::new().unwrap();
         let mounts = ok_mounts(&scratch);
         let err = LibkrunBuilderVm::default()
@@ -2230,7 +2239,9 @@ mod tests {
         assert!(
             matches!(
                 err,
-                BuilderVmError::LibkrunUnavailable(_) | BuilderVmError::ExtractionFailed(_)
+                BuilderVmError::LibkrunUnavailable(_)
+                    | BuilderVmError::ExtractionFailed(_)
+                    | BuilderVmError::NixBuildFailed(_)
             ),
             "unexpected error variant: {err:?}"
         );
