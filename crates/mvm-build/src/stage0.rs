@@ -614,6 +614,26 @@ mod tests {
         );
     }
 
+    /// Regression for the 2026-05-25 `mvmctl dev up` failure where
+    /// the Stage 0 nix build OOM-killed the slim Linux kernel
+    /// compile at `HOSTCC scripts/basic/fixdep`. With Alpine nix's
+    /// default `max-jobs = auto`, four heavy derivations
+    /// (mvm-builder-init, mvm-egress-proxy, mvm-guest-agent, linux)
+    /// ran concurrently and the combined working set exceeded the
+    /// 16 GiB guest RAM / 14 GiB `/nix` tmpfs envelope. Serializing
+    /// derivations with `--max-jobs 1` keeps peak memory under the
+    /// per-derivation ~5-6 GiB observation recorded in
+    /// `libkrun_builder.rs:92-99`.
+    #[test]
+    fn init_script_caps_nix_derivation_parallelism() {
+        assert!(
+            INIT_SCRIPT.contains("--max-jobs 1"),
+            "init script must serialize Stage 0 nix derivations \
+             (`--max-jobs 1`) so parallel kernel + Rust builds don't \
+             blow the guest RAM / /nix-tmpfs envelope"
+        );
+    }
+
     #[test]
     fn cache_dir_is_under_home() {
         let path = stage0_cache_dir();
