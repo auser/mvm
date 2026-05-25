@@ -21,7 +21,10 @@ tracing.workspace = true
 [dev-dependencies]
 serde_json.workspace = true
 tempfile.workspace = true
-tokio = { workspace = true, features = ["full"] }
+# The workspace tokio dep already enables "full"; declaring it again
+# here is redundant. Tests need macros + rt-multi-thread for
+# `#[tokio::test]` and that's already inherited.
+tokio = { workspace = true, features = ["macros", "rt", "rt-multi-thread"] }
 
 [lints]
 workspace = true
