@@ -43,6 +43,13 @@ pub mod libkrun_builder;
 #[cfg(feature = "builder-vm")]
 pub mod vz_builder;
 
+/// Plan 97 Phase C builder-runtime selection. `MVM_BUILDER_BACKEND`
+/// picks between `libkrun` (default) and `vz`; the caller receives
+/// a `Box<dyn BuilderVm>` so the dispatch site doesn't depend on
+/// which concrete driver the env-var resolved to.
+#[cfg(feature = "builder-vm")]
+pub mod builder_backend_select;
+
 pub mod nix;
 /// Plan 74 W1.3a — OCI layer unpack to a staging rootfs directory.
 /// Handles whiteouts, symlinks, hardlinks, ownership, permissions,
