@@ -33,13 +33,17 @@
 > gating PRs while the lane is observational.
 >
 > **Parked as multi-session follow-ups:**
-> - **Phase C** (Vz as a builder-VM backend) — `LibkrunBuilderVm` is
->   ~3,300 lines of substrate orchestration (virtio-fs shares for
->   /work/out/job, `mvm-builder-init` PID 1, Nix store overlay,
->   kernel-panic console-log watcher, cmd.sh emission). A real
->   `VzBuilderVm` impl needs to either mirror this or refactor the
->   shared parts behind a hypervisor-agnostic seam. Tracked under
->   the Phase C checklist below.
+> - **Phase C** (Vz as a builder-VM backend) — `VzBuilderVm` impl
+>   landed (`crates/mvm-build/src/vz_builder.rs`, commit 510cd968) on
+>   the shared `builder_vm_runtime` seam. Stage 0 audit + cache-prune
+>   contract participation is pinned by
+>   `reap_picks_up_orphaned_vz_builder_state_dir` (Plan 99 PR-1). The
+>   only remaining blocker on Phase C acceptance is the
+>   kernel-direct-boot path — the libkrun image's kernel won't boot
+>   under `VZLinuxBootLoader`. Plan 92's slim builder-VM kernel
+>   already includes everything Vz needs (`VIRTIO_PCI=y`, `PCI=y`,
+>   no TSI patches); landing plan 92 + a host-side Vz smoke flip
+>   Phase C green. Tracked under Plan 99 PR-2.
 >
 > Pick-up command for fresh sessions: read this file top to bottom, then
 > jump to the next unchecked item in the **Progress checklist** below.
@@ -169,9 +173,21 @@ Phase C sub-tasks:
       (`~/.cache/mvm/builder-vm/jobs/`, `vms/`) is shared with
       libkrun; per-VM dirs differ only in the `mvm-builder-vz-`
       prefix to avoid concurrent runs colliding.
-- [ ] Stage 0 audit emit + cache-prune contract participation
-      (`project_stage0_audit_and_cache_prune_contract` memory)
-      *(follow-up: pairs with the orchestration slice above)*
+- [x] Stage 0 audit emit + cache-prune contract participation
+      (`project_stage0_audit_and_cache_prune_contract` memory). Stage 0
+      itself runs upstream of `resolve_builder_backend()` (see
+      `crates/mvm-cli/src/commands/env/apple_container.rs:4080,4120-4128`),
+      so `Stage0Boot` / `Stage0CachePromoted` / `Stage0Failed` and the
+      `stage0.lock` already cover both backends. The orphan reaper's
+      dir traversal at `reap_orphaned_vm_helpers_at`
+      (`apple_container.rs:3292`) is prefix-agnostic and `VzBuilderVm`
+      writes the shared `builder.pid` sidecar
+      (`crates/mvm-build/src/vz_builder.rs:258`), so vz state dirs
+      under `~/.cache/mvm/builder-vm/vms/mvm-builder-vz-*` participate
+      automatically. Pinned by
+      `reap_picks_up_orphaned_vz_builder_state_dir` in
+      `apple_container.rs` so a future refactor can't silently break
+      it. Plan 99 PR-1.
 - [ ] Phase C acceptance: `MVM_BUILDER_BACKEND=vz mvmctl build --flake
       .` produces byte-identical rootfs to libkrun-hosted equivalent
       *(deferred — needs a successful Vz-direct boot of the libkrun-
