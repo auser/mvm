@@ -1949,6 +1949,47 @@ boundary, crash diagnostics, MDM detection) covered in Plan 97
   on every dimension that matters).
 - Live VM migration across hosts.
 
+## Sprint 56 — Symmetric trust boundary + claim 10 (proposed)  [`adrs/057-symmetric-builder-vm.md`](adrs/057-symmetric-builder-vm.md) | [`plans/100-symmetric-builder-vm-rollout.md`](plans/100-symmetric-builder-vm-rollout.md) | [`adrs/058-claim-10-bytes-leaving-trust-boundary.md`](adrs/058-claim-10-bytes-leaving-trust-boundary.md) | [`plans/101-in-guest-volume-encryption-and-gateway-audit.md`](plans/101-in-guest-volume-encryption-and-gateway-audit.md)
+
+### Why this sprint
+
+Two structural gaps in the current trust story:
+
+1. Linux host's userland is in the TCB; macOS host's isn't (asymmetric trust). The same `mvmctl` should give the same claim posture on both. See [ADR-057](adrs/057-symmetric-builder-vm.md).
+2. RW tenant volumes are plaintext while mounted; gateway traffic is unaudited. A compromised host can read tenant data and exfil silently — both invisible to the audit chain. Plan 63 / ADR-042 cover host-side snapshot crypto + secret store, but not the in-use mount surface. See [ADR-058](adrs/058-claim-10-bytes-leaving-trust-boundary.md).
+
+### W1 — Symmetric builder VM  🟡 proposed
+
+See [Plan 100](plans/100-symmetric-builder-vm-rollout.md). Lifts claim 1 ("no host-fs access from a guest") to true-on-both-OSes via identical builder-VM TCB. Retires the direct-Firecracker-on-Linux path.
+
+### W2 — Volume confidentiality (claim 10 leg 1)  🟡 proposed
+
+See [Plan 101 W1–W5](plans/101-in-guest-volume-encryption-and-gateway-audit.md). LUKS-in-guest + ExecutionPlan-delivered wrapped keys. Distinct from Plan 63's host-side snapshot crypto; this covers the in-use mount surface.
+
+### W3 — Audited gateway traffic (claim 10 leg 2)  🟡 proposed
+
+See [Plan 101 W6–W10](plans/101-in-guest-volume-encryption-and-gateway-audit.md). gvproxy + passt emit flow events into the audit chain. Sample-rate aggregation keeps audit volume sane.
+
+### W4 — Crypto attestability (claim 10 leg 3)  🟡 proposed
+
+See [Plan 101 W11–W14](plans/101-in-guest-volume-encryption-and-gateway-audit.md). Key fingerprints + `mvmctl doctor claim_10` row + docs. New `claim-10-audit-tamper` CI gate.
+
+### Sprint 56 success criteria
+
+- New `claim-10-audit-tamper` CI job gates every PR.
+- `mvmctl doctor` reports both claim 1 (symmetric TCB) and claim 10 (in-guest crypto + flow audit) as green.
+- Threat-model test (a host process attempting to read the volume backing file mid-workload) confirms ciphertext-at-rest.
+- Builder VM lifecycle is identical on macOS and Linux; direct-Firecracker code path retired.
+- ADR-002 claim list extends from 1–9 to 1–10; CLAUDE.md security model updated.
+
+### Non-goals (explicit)
+
+- TLS termination / L7 packet inspection.
+- Host filesystem encryption (FDE is user's concern).
+- Hardware-backed key attestation (still future).
+- Reintroducing Lima (removed 2026-05-14; symmetric posture achieved via `mvm-libkrun` on both hosts).
+- Per-byte network audit (Plan 101 W8 aggregates).
+
 ## Completed Sprints
 
 - [01-foundation.md](sprints/01-foundation.md)
