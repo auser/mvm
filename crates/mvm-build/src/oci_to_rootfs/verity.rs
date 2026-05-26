@@ -62,6 +62,16 @@ pub const MVM_VERITY_PINNED_SALT: &str =
 /// `mvm-verity-init.rs`'s expected algorithm.
 pub const MVM_VERITY_HASH_ALGORITHM: &str = "sha256";
 
+/// Pinned verity superblock UUID. Without `--uuid`, `veritysetup
+/// format` embeds a random UUID in the sidecar header, which makes
+/// two `seal_with_verity` runs against byte-identical inputs produce
+/// non-byte-identical sidecars (the root hash is still deterministic,
+/// but the per-digest verity cache compares sidecar bytes too).
+/// Pinning it preserves the ADR-050 invariant. The value is the same
+/// shape as `Mke2fsOptions::default().uuid` so the two artifacts read
+/// together coherently in diagnostics.
+pub const MVM_VERITY_PINNED_UUID: &str = "00000000-0000-0000-0000-000000000003";
+
 /// Knobs for [`seal_with_verity`]. Defaults are pinned to the
 /// values `mvm-verity-init` expects at boot; callers can
 /// override for tests or future ADRs but production paths should
@@ -80,6 +90,11 @@ pub struct VeritysetupOptions {
     pub salt: String,
     /// Hash algorithm. Default `sha256`.
     pub algorithm: String,
+    /// UUID embedded in the verity sidecar superblock. Default
+    /// is `MVM_VERITY_PINNED_UUID`; pinning it is what makes the
+    /// sidecar byte-deterministic across runs (veritysetup
+    /// generates a random UUID per call otherwise).
+    pub uuid: String,
     /// Override the `veritysetup` binary location. Default
     /// `None` → resolved via `$PATH`. Tests use this to
     /// substitute a stub.
@@ -93,6 +108,7 @@ impl Default for VeritysetupOptions {
             hash_block_size: MVM_VERITY_HASH_BLOCK_SIZE,
             salt: MVM_VERITY_PINNED_SALT.to_string(),
             algorithm: MVM_VERITY_HASH_ALGORITHM.to_string(),
+            uuid: MVM_VERITY_PINNED_UUID.to_string(),
             veritysetup_binary: None,
         }
     }
@@ -244,6 +260,7 @@ fn run_veritysetup_format(
         .arg(format!("--hash-block-size={}", options.hash_block_size))
         .arg(format!("--salt={}", options.salt))
         .arg(format!("--hash={}", options.algorithm))
+        .arg(format!("--uuid={}", options.uuid))
         .arg(rootfs)
         .arg(sidecar);
     let exec = cmd
@@ -324,6 +341,7 @@ mod tests {
         assert_eq!(o.hash_block_size, 4096);
         assert_eq!(o.salt, MVM_VERITY_PINNED_SALT);
         assert_eq!(o.algorithm, "sha256");
+        assert_eq!(o.uuid, MVM_VERITY_PINNED_UUID);
         // The constants themselves are the contract; restate
         // them so any future drift fires this test before the
         // kernel panics at boot.
@@ -332,6 +350,7 @@ mod tests {
         assert_eq!(MVM_VERITY_PINNED_SALT.len(), 64);
         assert!(MVM_VERITY_PINNED_SALT.bytes().all(|b| b == b'0'));
         assert_eq!(MVM_VERITY_HASH_ALGORITHM, "sha256");
+        assert_eq!(MVM_VERITY_PINNED_UUID.len(), 36);
     }
 
     #[test]
