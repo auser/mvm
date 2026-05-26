@@ -44,6 +44,10 @@ Add a CI-enforced security claim 10 to ADR-002: bytes leaving the trust boundary
 
 - [ ] **W14 — Performance validation.** Measure dm-crypt overhead on hot-path volume reads (random 4K reads, sequential 1M reads). Document threshold (target: <10% on random, <5% on sequential). Back out the leg or re-evaluate KDF/cipher choice if pathological.
 
+### Cross-leg
+
+- [ ] **W15 — Hypervisor guest-memory pinning.** Add `mlockall` to libkrun and Firecracker launch wrappers to prevent host swap of guest plaintext. Without this, claim 10 leg 1 (volume confidentiality) has a residual gap: if a host runs with swap enabled, plaintext volume contents currently resident in the guest page cache can land on host swap files. `mvmctl doctor` probe warns if host swap is active without memory locking. libkrun pins guest memory by default on macOS; Firecracker on Linux needs explicit `mlockall` at launch.
+
 ## Critical files
 
 - `crates/mvm-plan/src/plan.rs` (W2: ExecutionPlan schema)
@@ -51,10 +55,11 @@ Add a CI-enforced security claim 10 to ADR-002: bytes leaving the trust boundary
 - `crates/mvm-core/src/policy/audit.rs` (W7, W11: event-kind extensions)
 - `crates/mvm-supervisor/` (W3: key materialization; W6: gateway socket)
 - `crates/mvm-storage/` (W4: LUKS header sidecar)
-- `crates/mvm-libkrun/` (W6: passt wrapper)
+- `crates/mvm-libkrun/` (W6: passt wrapper; W15: mlockall on launch)
 - `crates/mvm-backend/src/vz.rs` (W6: gvproxy wrapper)
+- `crates/mvm-backend/src/firecracker.rs` (W15: mlockall on launch)
 - `crates/mvm-cli/src/commands/audit.rs` (W9: new subcommand)
-- `crates/mvm-cli/src/commands/doctor.rs` (W12: claim_10 row)
+- `crates/mvm-cli/src/commands/doctor.rs` (W12: claim_10 row; W15: host-swap probe)
 - `nix/images/builder-vm/` (W1: initramfs additions for `mvm-luks-init`)
 - `CLAUDE.md` (W13: claim 10 in security model)
 - `specs/adrs/002-microvm-security-posture.md` (W13: claim list extension)
@@ -76,3 +81,4 @@ Add a CI-enforced security claim 10 to ADR-002: bytes leaving the trust boundary
 - W10: CI lane green on the PR introducing the test; goes red if a developer breaks chain validation.
 - W12: `mvmctl doctor` reports `claim_10 ✓` on a clean install; reports `claim_10 ✗ (LUKS substrate missing)` if `mvm-luks-init` is removed from the builder VM image.
 - W14: benchmark numbers attached as a follow-up comment to this plan.
+- W15: `mvmctl doctor` reports `claim_10_no_swap_leak ✓` on a host with swap disabled or `mlockall` succeeded; reports `✗` (with actionable error) on a host where swap is active and memory locking failed.

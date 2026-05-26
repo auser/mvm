@@ -25,6 +25,9 @@ This ADR narrows ADR-002's "out of scope: a malicious host" carve-out. The new p
 
 Adversary capability assumed: read access to host filesystem and host network namespace. Not assumed: kernel module load, hypervisor hijack, signer key exfiltration (those are ADR-002's still-out-of-scope tier).
 
+**Adjacent surface — not addressed here, named so readers don't expect it:** inbound TLS termination is mvmd's concern, not mvm's. mvmd manages tenant certs at its multi-tenant edge and is the natural place to terminate inbound TLS. Workload-level TLS (the user's own HTTPS listener inside the microVM) stays encrypted end-to-end. This ADR's threat model is *outbound exfil from the workload*, not *inbound eavesdrop or auth* — different threat model, different ADR if/when it gets one.
+
+
 ## Decision
 
 Add claim 10 to ADR-002's CI-enforced security claims, in three legs.
@@ -47,10 +50,9 @@ Every key fingerprint, key rotation, and key-unwrap-failure event lands in the a
 
 ## Out of scope (named, like ADR-002)
 
-- **TLS termination / L7 packet inspection.** Different threat model (needs decryption, key material).
 - **Host filesystem encryption (FDE).** That's the user's concern — full-disk encryption protects host backups; this ADR protects per-volume at-rest exposure during active workload runs.
-- **Hardware-backed key attestation.** Post claim-10 future work.
-- **Per-byte traffic audit.** Aggregated flow_bytes only ([Plan 101](../plans/101-in-guest-volume-encryption-and-gateway-audit.md) W8).
+- **Per-byte traffic audit.** Aggregated `flow_bytes` only ([Plan 101](../plans/101-in-guest-volume-encryption-and-gateway-audit.md) W8).
+- **Audit metadata at rest.** The chain itself (5-tuples, byte counts, key fingerprints) is plaintext on host disk under `~/.mvm/audit/<tenant>.jsonl`. Tenant *data* is encrypted; tenant *behavior metadata* is not. Future claim 10.1 candidate; not in this sprint.
 
 ## Consequences
 
