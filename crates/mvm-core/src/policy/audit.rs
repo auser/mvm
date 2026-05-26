@@ -376,6 +376,54 @@ pub enum LocalAuditKind {
     /// rebinding signal, not a missing-allow signal. Detail format:
     ///   `dest=<host>,pinned_ips=<ip[,ip...]>,observed_ip=<ip>`
     DnsPinReject,
+
+    // --- Plan 101 W7: gateway-flow audit kinds (claim 10 leg 2) ---
+    //
+    // Four new kinds emitted by the gvproxy (macOS) / passt (Linux)
+    // control-socket wrapper. State-only slice: variants ship here so
+    // emission sites land in their own focused PRs without re-bumping
+    // the audit schema each time. Wire format is stable (snake_case
+    // strings) per the enum's `rename_all` attribute.
+    //
+    // Detail-format conventions (populated by Plan 101 W6 — emission
+    // PR; documented here so the names match the intended payload):
+    //   - `flow_id=<u64-hex>` is the join key across all four kinds
+    //     for a single flow's lifecycle.
+    //   - per-direction byte counters are `bytes_in` / `bytes_out` on
+    //     terminal events, `bytes_in_delta` / `bytes_out_delta` on
+    //     periodic `FlowBytes` aggregates.
+    //   - durations / windows are milliseconds / seconds, named
+    //     `*_ms` / `*_s` to match the rest of the audit log.
+    //
+    /// A new outbound flow opened through gvproxy/passt. Fired once
+    /// at flow setup with the 5-tuple and assigned `flow_id`; the
+    /// `flow_id` is the join key for subsequent `FlowBytes`,
+    /// `FlowClosed`, and `FlowPolicyDecision` entries on the same
+    /// flow. Detail format:
+    ///   `proto=<tcp|udp>,src=<ip:port>,dst=<ip:port>,flow_id=<hex>`
+    FlowOpened,
+    /// Flow closed (FIN/RST, idle timeout, or guest-side teardown).
+    /// Carries final per-direction byte counters and wall-clock
+    /// duration. One per flow lifecycle; pairs with the opening
+    /// `FlowOpened`. Detail format:
+    ///   `flow_id=<hex>,bytes_in=<n>,bytes_out=<n>,duration_ms=<n>`
+    FlowClosed,
+    /// Periodic aggregated byte counters for a long-lived flow.
+    /// Per-byte audit is too noisy; emission policy lives in Plan
+    /// 101 W8 (default: emit every 30s for flows still open beyond
+    /// the window). Counters are deltas since the previous
+    /// `FlowBytes` / `FlowOpened` entry on the same `flow_id`.
+    /// Detail format:
+    ///   `flow_id=<hex>,bytes_in_delta=<n>,bytes_out_delta=<n>,window_s=<n>`
+    FlowBytes,
+    /// The gateway evaluated a per-flow policy decision and emitted
+    /// the outcome. Distinct from `NetworkPolicyAllow` /
+    /// `NetworkPolicyDeny`: those are *admission-time* decisions
+    /// at flow setup; `FlowPolicyDecision` fires for runtime
+    /// re-evaluations on an already-open flow (e.g. rate-limit
+    /// trip, destination-pin recheck, L4 reauth). Detail format:
+    ///   `flow_id=<hex>,decision=<allow|deny>,rule=<rule-id>`
+    FlowPolicyDecision,
 }
 
 /// A single local audit log entry.
@@ -962,6 +1010,105 @@ mod tests {
         }
     }
 
+    // =====================================================================
+    // Plan 101 W7 — gateway-flow audit kinds (state-only slice)
+    // =====================================================================
+
+    /// Mirrors the W2 / B21 roundtrip pattern: every reserved W7
+    /// variant must serde-roundtrip cleanly so the W6 emission PRs
+    /// land independently without re-bumping the audit schema.
+    #[test]
+    fn w7_flow_audit_kinds_serde_roundtrip() {
+        let kinds = vec![
+            LocalAuditKind::FlowOpened,
+            LocalAuditKind::FlowClosed,
+            LocalAuditKind::FlowBytes,
+            LocalAuditKind::FlowPolicyDecision,
+        ];
+        for kind in kinds {
+            let event = LocalAuditEvent::now(kind.clone(), None, None);
+            let json = serde_json::to_string(&event).unwrap();
+            let parsed: LocalAuditEvent = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed.kind, kind, "kind round-trip diverged: {kind:?}");
+        }
+    }
+
+    /// Wire-format pin for the four W7 variants. A future rename
+    /// surfaces here as a failing test and forces a conscious
+    /// decision about old-log readability.
+    #[test]
+    fn w7_flow_audit_kinds_use_snake_case_on_the_wire() {
+        let kinds_and_strings = vec![
+            (LocalAuditKind::FlowOpened, "flow_opened"),
+            (LocalAuditKind::FlowClosed, "flow_closed"),
+            (LocalAuditKind::FlowBytes, "flow_bytes"),
+            (LocalAuditKind::FlowPolicyDecision, "flow_policy_decision"),
+        ];
+        for (kind, expected) in kinds_and_strings {
+            let json = serde_json::to_string(&kind).unwrap();
+            assert_eq!(
+                json,
+                format!("\"{expected}\""),
+                "W7 audit kind wire format drifted for {kind:?}"
+            );
+        }
+    }
+
+    /// `FlowPolicyDecision` is distinct from the W2 admission-time
+    /// `NetworkPolicyAllow` / `NetworkPolicyDeny` kinds. A future
+    /// maintainer who tries to collapse them fails this test and
+    /// reads the doc comment explaining why they are separate
+    /// (admission-time decisions vs runtime re-evaluations on an
+    /// already-open flow).
+    #[test]
+    fn w7_flow_policy_decision_is_separate_from_w2_network_policy() {
+        assert_ne!(
+            LocalAuditKind::FlowPolicyDecision,
+            LocalAuditKind::NetworkPolicyAllow
+        );
+        assert_ne!(
+            LocalAuditKind::FlowPolicyDecision,
+            LocalAuditKind::NetworkPolicyDeny
+        );
+        let flow = serde_json::to_string(&LocalAuditKind::FlowPolicyDecision).unwrap();
+        let allow = serde_json::to_string(&LocalAuditKind::NetworkPolicyAllow).unwrap();
+        let deny = serde_json::to_string(&LocalAuditKind::NetworkPolicyDeny).unwrap();
+        assert_ne!(
+            flow, allow,
+            "FlowPolicyDecision and NetworkPolicyAllow must serialize differently \
+             — admission-time decisions vs runtime re-evaluations are distinct \
+             auditing surfaces."
+        );
+        assert_ne!(flow, deny);
+    }
+
+    /// Each new W7 variant must compose with the standard
+    /// `LocalAuditEvent` constructor. Catches a future regression
+    /// where a variant accidentally drops `Clone` or stops being
+    /// usable with the existing event shape.
+    #[test]
+    fn w7_flow_audit_kinds_compose_with_event_constructor() {
+        let cases = [
+            LocalAuditKind::FlowOpened,
+            LocalAuditKind::FlowClosed,
+            LocalAuditKind::FlowBytes,
+            LocalAuditKind::FlowPolicyDecision,
+        ];
+        for kind in cases {
+            let event = LocalAuditEvent::now(
+                kind.clone(),
+                Some("vm-test".to_string()),
+                Some("flow_id=deadbeef,bytes_in=42,bytes_out=24".to_string()),
+            );
+            assert_eq!(event.kind, kind);
+            assert_eq!(event.vm_name.as_deref(), Some("vm-test"));
+            assert_eq!(
+                event.detail.as_deref(),
+                Some("flow_id=deadbeef,bytes_in=42,bytes_out=24")
+            );
+        }
+    }
+
     #[test]
     fn test_local_audit_event_serializes() {
         let event = LocalAuditEvent::now(
@@ -1042,6 +1189,11 @@ mod tests {
             LocalAuditKind::Stage0Boot,
             LocalAuditKind::Stage0CachePromoted,
             LocalAuditKind::Stage0Failed,
+            // Plan 101 W7 gateway-flow audit (claim 10 leg 2).
+            LocalAuditKind::FlowOpened,
+            LocalAuditKind::FlowClosed,
+            LocalAuditKind::FlowBytes,
+            LocalAuditKind::FlowPolicyDecision,
         ];
         for kind in kinds {
             let json = serde_json::to_string(&kind).unwrap();
