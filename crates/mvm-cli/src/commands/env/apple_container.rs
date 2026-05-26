@@ -3248,13 +3248,24 @@ pub(in crate::commands) struct ReapOutcome {
 }
 
 /// Plan 95 §FU-1 — reap orphaned per-VM helpers left behind by killed
-/// `mvmctl dev up` runs.
+/// `mvmctl dev up` runs. Covers both backends: libkrun (`mvm-libkrun-
+/// supervisor` + `gvproxy`) and Vz (`mvm-vz-supervisor`).
 ///
-/// mvmctl spawns `mvm-libkrun-supervisor`, which spawns `gvproxy`. If
-/// mvmctl exits abnormally (^C, SIGKILL, crash), supervisor + gvproxy
-/// are reparented to launchd PID 1 and outlive mvmctl indefinitely
-/// (Plan 95 doc §Follow-ups FU-2/FU-3 cover the "prevent" side; this
-/// is the "clean up after the fact" side — FU-1).
+/// mvmctl spawns the active backend's supervisor binary, which in turn
+/// spawns its networking helper (gvproxy for libkrun). If mvmctl exits
+/// abnormally (^C, SIGKILL, crash), supervisor + helpers are reparented
+/// to launchd PID 1 and outlive mvmctl indefinitely (Plan 95 doc
+/// §Follow-ups FU-2/FU-3 cover the "prevent" side; this is the "clean
+/// up after the fact" side — FU-1).
+///
+/// The dir traversal below is **prefix-agnostic**: it iterates every
+/// subdirectory of `~/.cache/mvm/builder-vm/vms/`, so both
+/// `mvm-builder-vm-<job_id>` (libkrun) and `mvm-builder-vz-<job_id>`
+/// (Vz) state dirs are picked up by the same loop, and the sidecar PID
+/// names (`builder.pid` / `stage0.pid`) are shared across backends. The
+/// `reap_picks_up_orphaned_vz_builder_state_dir` test pins this — a
+/// future refactor that narrows the traversal or renames the sidecar
+/// must update that test. See Plan 97 Phase C and Plan 99 PR-1.
 ///
 /// Two scans per VM dir:
 ///
@@ -5418,6 +5429,37 @@ mod builder_vm_bootstrap_tests {
                 panic!("missing root must not look like lock contention")
             }
         }
+    }
+
+    /// Plan 97 Phase C / Plan 99 PR-1 — pin that the orphan reaper
+    /// covers `mvm-builder-vz-<job_id>` dirs the same way it covers
+    /// `mvm-builder-vm-<job_id>`. The traversal in
+    /// `reap_orphaned_vm_helpers_at` is prefix-agnostic and
+    /// `VzBuilderVm` writes a `builder.pid` sidecar under the shared
+    /// `~/.cache/mvm/builder-vm/vms/` tree; this test guards against
+    /// a future refactor narrowing either invariant.
+    #[test]
+    fn reap_picks_up_orphaned_vz_builder_state_dir() {
+        let tmp = tempfile::tempdir().expect("tempdir");
+        let vms = tmp.path();
+        let vz_dir = vms.join("mvm-builder-vz-abc12345");
+        std::fs::create_dir_all(&vz_dir).unwrap();
+        // `i32::MAX` is guaranteed not to be a live process on any
+        // supported host — classify_pid → Dead, so the dir has no
+        // live owner and is eligible for removal.
+        std::fs::write(vz_dir.join("builder.pid"), format!("{}\n", i32::MAX)).unwrap();
+
+        let outcome =
+            reap_orphaned_vm_helpers_at(vms, /* dry_run = */ false).expect("reap should succeed");
+
+        assert_eq!(
+            outcome.removed_dirs, 1,
+            "vz builder state dir should be reaped"
+        );
+        assert!(
+            !vz_dir.exists(),
+            "vz builder state dir should be gone on disk"
+        );
     }
 
     #[test]
