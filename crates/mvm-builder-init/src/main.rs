@@ -1417,14 +1417,9 @@ mod linux {
     /// distinguish "guest crashed before running install" from
     /// "install ran and exited nonzero." The shape matches
     /// [`crate::install::InstallReport::to_json`] so the host's
-    /// parser doesn't need a separate code path.
-    fn write_install_failure(exit_code: i32, reason: &str) {
-        write_install_failure_at(OUT_DIR, exit_code, reason);
-    }
-
-    /// Plan 89 W3 part 8 — install-failure writer with explicit
-    /// `out_dir`. Single-shot uses `OUT_DIR`; persistent dispatch
-    /// passes the per-dispatch `/job/<job_id>/out`.
+    /// parser doesn't need a separate code path. Single-shot uses
+    /// `OUT_DIR`; persistent dispatch passes the per-dispatch
+    /// `/job/<job_id>/out` (Plan 89 W3 part 8).
     fn write_install_failure_at(out_dir: &str, exit_code: i32, reason: &str) {
         use crate::install::{
             CONTENT_SUBDIR, CVE_FILENAME, FETCH_LOG_FILENAME, RESULT_FILENAME, SBOM_FILENAME,
