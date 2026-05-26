@@ -490,10 +490,9 @@ jobs:
         if: steps.filter.outputs.libkrun == 'true' || github.ref == 'refs/heads/main'
         run: cargo clippy -p mvm-libkrun --features libkrun-sys --all-targets -- -D warnings
 
-  # ── Lane: Vz / Virtualization.framework (macOS matrix, paths-gated) ──
+  # ── Lane: Vz / Virtualization.framework (macOS, paths-gated) ──
   # Plan 97 §"macOS minor-version compatibility matrix". Runs the
-  # Swift package build + Rust mvm-vz/mvm-backend test surface across
-  # the supported floor (macos-13) and the currently-shipping
+  # Swift package build + Rust mvm-vz/mvm-backend test surface on
   # macos-latest. No untrusted inputs are interpolated into run:
   # blocks — only matrix.runner, steps.filter.outputs.vz, runner.os.
   vz-macos:
@@ -502,7 +501,6 @@ jobs:
       fail-fast: false
       matrix:
         runner:
-          - macos-13      # Plan 97 floor — full virtio surface lands here
           - macos-latest  # current shipping; covers Apple Container coexistence
     runs-on: ${{ matrix.runner }}
     steps:
