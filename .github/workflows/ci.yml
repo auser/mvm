@@ -171,11 +171,14 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-test-
 
-      # `cargo nextest` matches `just test` locally and parallelises
-      # tests across processes rather than threads, which materially
-      # cuts wall time on the ~200-test workspace. Falls back to
-      # `cargo test` if nextest install ever breaks — see the
-      # `test-cargo` recipe in the Justfile.
+      # `cargo nextest` parallelises tests across processes rather
+      # than threads, which materially cuts wall time even on the
+      # root-crate scope this lane runs. Scope intentionally matches
+      # main's `cargo test` (root facade only); a wider workspace
+      # gate is left to `just test` locally and to the per-crate CI
+      # lanes (libkrun, vz-macos, etc.). Falls back to `cargo test`
+      # if nextest install ever breaks — see the `test-cargo` recipe
+      # in the Justfile.
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -185,7 +188,7 @@ jobs:
         run: cargo build --all-targets
 
       - name: Run tests
-        run: cargo nextest run --workspace --all-targets
+        run: cargo nextest run
 
   e2e:
     name: E2E Tests
