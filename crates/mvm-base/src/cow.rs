@@ -109,10 +109,14 @@ fn is_unsupported(e: &io::Error) -> bool {
     // ENOTSUP and EOPNOTSUPP are the same value on macOS/Linux but
     // we check both names defensively. EXDEV indicates cross-device
     // (cross-volume) — APFS CoW requires same volume, btrfs/xfs FICLONE
-    // requires same filesystem instance.
+    // requires same filesystem instance. ENOTTY is what the kernel
+    // returns when the underlying filesystem doesn't implement the
+    // FICLONE ioctl at all — ext4 without reflink support (the
+    // default on stock Ubuntu, including the GitHub Actions Linux
+    // runner image) returns this rather than EOPNOTSUPP.
     matches!(
         e.raw_os_error(),
-        Some(libc::ENOTSUP) | Some(libc::EXDEV) | Some(libc::EINVAL)
+        Some(libc::ENOTSUP) | Some(libc::EXDEV) | Some(libc::EINVAL) | Some(libc::ENOTTY)
     )
 }
 
@@ -192,10 +196,12 @@ mod tests {
         let enotsup = io::Error::from_raw_os_error(libc::ENOTSUP);
         let exdev = io::Error::from_raw_os_error(libc::EXDEV);
         let einval = io::Error::from_raw_os_error(libc::EINVAL);
+        let enotty = io::Error::from_raw_os_error(libc::ENOTTY);
         let other = io::Error::from_raw_os_error(libc::EACCES);
         assert!(is_unsupported(&enotsup));
         assert!(is_unsupported(&exdev));
         assert!(is_unsupported(&einval));
+        assert!(is_unsupported(&enotty));
         assert!(!is_unsupported(&other));
     }
 
