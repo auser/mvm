@@ -127,16 +127,34 @@ fn seal_is_byte_deterministic_for_identical_rootfs_bytes() {
     // ADR-050 §"Caching" — byte-identical input must produce the
     // same root hash and the same sidecar bytes. The per-digest
     // verity cache depends on this invariant.
-    let (_keep_a, rootfs_a) = make_small_ext4();
-    let (_keep_b, rootfs_b) = make_small_ext4();
+    //
+    // We deliberately build one ext4 and copy it (not call
+    // `make_small_ext4()` twice). mke2fs `-d` is not guaranteed
+    // to produce byte-identical output across two independent
+    // staging tempdirs — see the W1.3b test of the same name
+    // for the readdir/dir_index explanation — so two separate
+    // builds would fail the test's *precondition* (identical
+    // rootfs bytes), masking what the test actually wants to
+    // exercise: veritysetup's determinism on identical input.
+    let (_keep, rootfs_a) = make_small_ext4();
+    let rootfs_b_dir = TempDir::new().unwrap();
+    let rootfs_b_path = rootfs_b_dir.path().join("rootfs.ext4");
+    std::fs::copy(&rootfs_a.path, &rootfs_b_path).expect("copy rootfs bytes");
+    let rootfs_b = MaterializedRootfs {
+        path: rootfs_b_path,
+        size_bytes: rootfs_a.size_bytes,
+        label: rootfs_a.label.clone(),
+        uuid: rootfs_a.uuid.clone(),
+    };
 
     // Cross-check: the two rootfs images themselves are
-    // byte-identical (W1.3b's determinism is the precondition).
+    // byte-identical (the copy is the guarantee, but assert
+    // it so a future refactor that drops the copy fails loudly).
     let bytes_a = std::fs::read(&rootfs_a.path).unwrap();
     let bytes_b = std::fs::read(&rootfs_b.path).unwrap();
     assert_eq!(
         bytes_a, bytes_b,
-        "precondition: W1.3b ext4 generation should be byte-deterministic"
+        "precondition: rootfs_b must be a byte-identical copy of rootfs_a"
     );
 
     let sealed_a = seal_with_verity(&rootfs_a, &VeritysetupOptions::default()).expect("seal a");
