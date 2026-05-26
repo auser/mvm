@@ -1966,9 +1966,24 @@ See [Plan 100](plans/100-symmetric-builder-vm-rollout.md). Lifts claim 1 ("no ho
 
 See [Plan 101 W1–W5](plans/101-in-guest-volume-encryption-and-gateway-audit.md). LUKS-in-guest + ExecutionPlan-delivered wrapped keys. Distinct from Plan 63's host-side snapshot crypto; this covers the in-use mount surface.
 
-### W3 — Audited gateway traffic (claim 10 leg 2)  🟡 proposed
+### W3 — Audited gateway traffic (claim 10 leg 2)  🟡 in progress
 
 See [Plan 101 W6–W10](plans/101-in-guest-volume-encryption-and-gateway-audit.md). gvproxy + passt emit flow events into the audit chain. Sample-rate aggregation keeps audit volume sane.
+
+Wave breakdown:
+
+- W6 — gateway audit substrate: in flight via [Plan 102](plans/102-gateway-audit-substrate-impl.md) (staged W6.A substrate plumbing → W6.B real flow extraction).
+- W7 — `LocalAuditKind` flow event schema: shipped (PR #450).
+- W8 — sample-rate / 30s aggregation + `NetworkAuditConfig`: not started, depends on W6.
+- W9 — `mvmctl audit traffic` CLI surface: not started, depends on W6/W7.
+- W10 — `claim-10-audit-tamper` CI gate: not started, depends on W6.
+
+Scope clarification: W6 covers **north-south** only (microVM ↔ internet through the per-VM gateway). The mvm topology multiplexes per-VM gvproxy/passt instances; inter-microVM traffic on the same host goes through the tenant bridge (`br-tenant-<id>`) and is **not** visible to gateway audit.
+
+Out of scope for this sprint:
+
+- East-west microVM ↔ microVM audit — proposed as a new wave (W11) needing a different capture mechanism (`tc mirred`, eBPF, or libpcap on the TAP). Not blocking W6.
+- Secret detection + egress obfuscation — proposed as Plan 103 (separate plan + ADR). Requires L7 visibility (TLS MITM or cooperating in-guest hook); needs its own brainstorm before any code.
 
 ### W4 — Crypto attestability (claim 10 leg 3)  🟡 proposed
 
