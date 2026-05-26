@@ -1128,22 +1128,7 @@ mod tests {
         }
     }
 
-    // Pre-existing test failure on Linux CI runners: the wrapper script
-    // exits with code 2 (apparent shell-redirection error) on Ubuntu's
-    // dash but passes on macOS's bsh. The other `test_execute_fd3_*`
-    // tests in this module use the same fd-3 plumbing and pass on the
-    // same runner, so fd-3 setup itself is correct; the most likely
-    // culprit is a quirk in dash's `printf` octal-escape handling for
-    // the `\015\0\0\0` length prefix when followed by a stderr `echo`.
-    // The branch that introduced these workspace-wide nextest runs
-    // (#447) didn't touch this code — the test simply never ran in
-    // CI before because main's `cargo test` omits `--workspace`. The
-    // production fd-3 path is exercised by the other passing tests in
-    // this module and by the live W3 verified-boot regression.
-    // TODO: re-enable when the dash-vs-bsh shell-script divergence is
-    // resolved (likely by switching to `printf "\x..."` or `dd`).
     #[test]
-    #[ignore = "pre-existing dash/bsh divergence; fd-3 path is covered by sibling tests"]
     fn test_execute_captures_fd3_control_record() {
         // Wrapper writes one framed record to fd 3 — header `{"kind":"ok"}`
         // (13 bytes) + empty payload — then exits 0. Asserts the record
