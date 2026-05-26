@@ -43,3 +43,9 @@ nix/images/dev-prebuilt/
 .worktrees/
 graphify-out/
 specs/scratch.md
+
+# Repo-tracked nextest config. Many contributors have `/.config`
+# blanket-ignored in their global gitignore; this negation re-includes
+# the in-repo nextest config so it doesn't have to be force-added.
+!.config/
+!.config/nextest.toml
