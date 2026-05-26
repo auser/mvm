@@ -26,7 +26,7 @@ Add a CI-enforced security claim 10 to ADR-002: bytes leaving the trust boundary
 
 - [ ] **W6 — Gateway audit substrate.** Wrap gvproxy (macOS) and passt (Linux) with a control-socket listener that streams flow events to `mvm-supervisor`. gvproxy wiring lands in the area already TODO'd at `crates/mvm-backend/src/vz.rs:809-811`; passt wiring extends the existing `PasstHandle` in `crates/mvm-libkrun/sys`. Socket path: `~/.mvm/audit/gateway-<instance>.sock` (mode 0700, supervisor-only).
 
-- [ ] **W7 — Audit event schema.** Extend `LocalAuditKind` in `crates/mvm-core/src/policy/audit.rs` with `flow_opened`, `flow_closed`, `flow_bytes`, `flow_policy_decision`. Each variant carries `{ instance_id, tenant_id, 5-tuple, bytes_sent, bytes_recv, started_at, ended_at }`. Hash-chain integrity preserved — new variants don't break existing `verify_audit_chain`.
+- [x] **W7 — Audit event schema.** Extend `LocalAuditKind` in `crates/mvm-core/src/policy/audit.rs` with `flow_opened`, `flow_closed`, `flow_bytes`, `flow_policy_decision`. Each variant carries `{ instance_id, tenant_id, 5-tuple, bytes_sent, bytes_recv, started_at, ended_at }`. Hash-chain integrity preserved — new variants don't break existing `verify_audit_chain`.
 
 - [ ] **W8 — Sample-rate / aggregation policy.** Per-byte audit is too noisy; emit aggregated `flow_bytes` on flow close + every 30s for long-lived flows. Configurable per tenant in the `NetworkAuditConfig` ExecutionPlan field. Default: 30s.
 
