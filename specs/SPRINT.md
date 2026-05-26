@@ -1888,6 +1888,26 @@ code (vsock CID 3 / ports 5252, 10000+, 20000+ remain unchanged).
       audit-chain hashing of snapshot files remain follow-ups (needs
       CLI verb + different supervisor startup mode).
 
+### Plan 98 — finishing slices  [`plans/98-vz-builder-vm.md`](plans/98-vz-builder-vm.md)
+
+Vz builder one-shot driver (Phase 97 Phase C) shipped env-var-only.
+Plan 98 closes the remaining gaps: auto-detect, `--builder` CLI flag,
+`mvmctl doctor` reporting, Vz **persistent** parity with libkrun's
+`mvmctl dev`, Install E2E on Vz, CI floor (`macos-latest` lane only —
+no macos-26 self-hosted runner required), and docs (CLAUDE.md +
+ADR-046 extension with security-claim-parity language). Plan 99 PR-1
+(#448) is the Stage 0 audit/cache contract this builds on.
+
+- [ ] **Phase 1** — Selection user-surface (auto-detect + `--builder` flag + doctor + §0.x gap fixes). Single non-draft PR.
+  - `--builder vz` with `dev up/rebuild/shell` errors clearly via the §2.C1 grace guard until Phase 2 Slice 2B lands the Vz persistent dev driver. `--builder vz` already works for `mvmctl build` and `mvmctl up --prod`.
+- [ ] **Phase 2** — Vz persistent driver + Install E2E + security parity. Decomposed into four slices for review-sized PRs:
+  - **Slice 2A** — `VzPersistentBuilderVm` driver scaffold (§2.1-2.4, §2.10, §2.S1, §2.C2). No `mvmctl dev` rewire yet; §2.C1 guard stays.
+  - **Slice 2B** — Cross-backend coexistence dispatch (§2.5, §2.8, §2.C3) + remove §2.C1 guard + §2.S11 env-var regression test.
+  - **Slice 2C** — Install E2E byte-equivalence + audit chain + security parity batch (§2.6, §2.7, §2.S2-2.S10 + §2.S13) + ADR-046/002/047 updates.
+  - **Slice 2D** — In-repo flake invariant integration test (§2.11) + final regression gate (§2.9).
+- [ ] **Phase 3** — CI floor on `macos-latest` Vz construction smoke + Linux libkrun auto-detect assertion. `uv pip install` round-trip deferred to §3.6.
+- [ ] **Phase 4** — Docs: CLAUDE.md, ADR-046 extension landed in Slice 2C, ADR-056/055/041/057 cross-references, SPRINT.md close-out.
+
 ### Cross-cutting
 
 - [ ] Build / distribution / versioning (Swift toolchain in CI,

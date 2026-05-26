@@ -2639,3 +2639,54 @@ fn test_compile_default_no_from_flags_leaves_them_none() {
         _ => panic!("Expected Compile command"),
     }
 }
+
+// ── Plan 98 — `--builder` global flag (Phase 1 §1.4 + §0.2) ──
+
+#[test]
+fn builder_flag_appears_in_help() {
+    // Renders the top-level clap Command's help via the same code
+    // path `mvmctl --help` exercises. Asserts the new global flag
+    // surfaces in `mvmctl --help` without spawning the binary.
+    let cmd = cli_command();
+    let help = cmd.clone().render_help().to_string();
+    assert!(
+        help.contains("--builder"),
+        "`--builder` flag not surfaced in `mvmctl --help`; help text was:\n{help}"
+    );
+    assert!(
+        help.contains("libkrun") && help.contains("vz"),
+        "`--builder` value choices missing from help; help text was:\n{help}"
+    );
+}
+
+#[test]
+fn builder_flag_accepts_libkrun() {
+    let cli = Cli::try_parse_from(["mvmctl", "--builder", "libkrun", "doctor"]).expect("parse");
+    assert_eq!(cli.builder.as_deref(), Some("libkrun"));
+}
+
+#[test]
+fn builder_flag_accepts_vz() {
+    let cli = Cli::try_parse_from(["mvmctl", "--builder", "vz", "doctor"]).expect("parse");
+    assert_eq!(cli.builder.as_deref(), Some("vz"));
+}
+
+#[test]
+fn builder_flag_rejects_unknown_value() {
+    // Clap's `value_parser = ["libkrun", "vz"]` should refuse
+    // anything outside that set. Catches typos like `=vmz` early
+    // rather than letting `MVM_BUILDER_BACKEND_ENV`'s
+    // warn-and-fall-through path eat them.
+    let err = Cli::try_parse_from(["mvmctl", "--builder", "bogus", "doctor"]).unwrap_err();
+    let msg = err.to_string();
+    assert!(
+        msg.contains("invalid value") || msg.contains("possible values") || msg.contains("bogus"),
+        "expected a clap value-parser error mentioning 'bogus', got: {msg}"
+    );
+}
+
+#[test]
+fn builder_flag_unset_by_default() {
+    let cli = Cli::try_parse_from(["mvmctl", "doctor"]).expect("parse");
+    assert_eq!(cli.builder, None);
+}

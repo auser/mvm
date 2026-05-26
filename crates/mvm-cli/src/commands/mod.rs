@@ -34,6 +34,13 @@ pub(in crate::commands) struct Cli {
     #[arg(long, global = true)]
     pub fc_version: Option<String>,
 
+    /// Override which hypervisor drives the builder VM
+    /// (Plan 98). Highest priority — beats `MVM_BUILDER_BACKEND`
+    /// env and the platform-default auto-detect (macOS 26+ Apple
+    /// Silicon → vz; everywhere else → libkrun).
+    #[arg(long, global = true, value_parser = ["libkrun", "vz"])]
+    pub builder: Option<String>,
+
     /// Show verbose `[mvm]` progress messages. Implied when `RUST_LOG` is set.
     #[arg(long, global = true, alias = "debug")]
     pub verbose: bool,
@@ -175,6 +182,17 @@ pub fn run() -> Result<()> {
     // SAFETY: called once at startup before any threads are spawned.
     if let Some(ref version) = cli.fc_version {
         unsafe { std::env::set_var("MVM_FC_VERSION", version) };
+    }
+
+    // Apply builder-backend override before any subcommand reads it.
+    // Plumbing the flag through every call site that consults
+    // `resolve_builder_backend()` would touch a lot of files for
+    // little value; setting the env here makes the existing env-var
+    // dispatch in `mvm_build::builder_backend_select` honour the
+    // flag transparently. Same single-threaded-startup invariant as
+    // the `fc_version` block above.
+    if let Some(ref backend) = cli.builder {
+        unsafe { std::env::set_var("MVM_BUILDER_BACKEND", backend) };
     }
 
     // Verbose `[mvm]` chatter: explicit flag, or any RUST_LOG set.
