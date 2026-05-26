@@ -100,7 +100,17 @@ authors = ["mvm contributors"]
 too_many_arguments = "deny"
 
 [workspace.dependencies]
-# Async runtime
+# Async runtime.
+#
+# `features = ["full"]` is convenient but pulls a lot of code into
+# every test binary's compile graph. A per-crate audit to narrow the
+# feature set is tracked as a follow-up — the union across the
+# workspace is roughly: io-util, macros, rt, rt-multi-thread, net,
+# time, sync, fs, signal, test-util. Switching to the narrowed set
+# requires touching every crate that today says `tokio.workspace =
+# true` with no explicit features (mvm-guest, mvm-addon-dns,
+# mvm-addon-vsock-bridge, the mvm crate) so it can't ride along
+# with a profile/CI tuning PR.
 tokio = { version = "1", features = ["full"] }
 
 # Pattern matching
@@ -375,3 +385,53 @@ opt-level = 3
 strip = true
 lto = true
 codegen-units = 1
+
+# Speed up `cargo test --workspace` by giving the test profile more
+# parallel codegen units and dropping debug info to line tables only.
+# Test binaries don't need full DWARF; we just need clean panic
+# backtraces, which `line-tables-only` preserves.
+#
+# `incremental = true` halves rebuild time for the inner-loop
+# (touch one file, re-run a focused test) without affecting cold
+# CI builds.
+[profile.test]
+opt-level = 0
+debug = "line-tables-only"
+incremental = true
+codegen-units = 256
+
+# Per-package optimisation overrides applied to the `dev` and `test`
+# profiles. Build scripts + proc-macros run during compilation, so a
+# tiny opt-level=3 build of these crates pays for itself many times
+# over across the workspace's compile graph. The list is the
+# well-known "speed dev/test builds" recipe — proc-macro engines
+# (syn, quote, proc-macro2), serde derive, sha2/ring/zeroize crypto
+# (used by many transitive callers), and the four tree-sitter
+# grammar crates the mvm-sdk pulls in unconditionally.
+[profile.dev.package."*"]
+opt-level = 0
+
+[profile.dev.package.syn]
+opt-level = 3
+[profile.dev.package.quote]
+opt-level = 3
+[profile.dev.package.proc-macro2]
+opt-level = 3
+[profile.dev.package.serde_derive]
+opt-level = 3
+[profile.dev.package.sha2]
+opt-level = 3
+[profile.dev.package.ring]
+opt-level = 3
+[profile.dev.package.zeroize]
+opt-level = 3
+[profile.dev.package.tree-sitter]
+opt-level = 3
+[profile.dev.package.tree-sitter-nix]
+opt-level = 3
+[profile.dev.package.tree-sitter-python]
+opt-level = 3
+[profile.dev.package.tree-sitter-javascript]
+opt-level = 3
+[profile.dev.package.tree-sitter-typescript]
+opt-level = 3

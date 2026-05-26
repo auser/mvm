@@ -84,7 +84,7 @@ fn submit_round_trips_request_and_result_with_no_stderr_chunks() {
     });
 
     let supervisor =
-        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(1));
 
     let outcome = supervisor
         .submit(
@@ -143,7 +143,7 @@ fn submit_streams_stderr_chunks_then_collects_terminating_result() {
     });
 
     let supervisor =
-        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(1));
 
     let outcome = supervisor
         .submit(
@@ -183,7 +183,7 @@ fn submit_returns_premature_eof_when_guest_closes_without_result() {
     });
 
     let supervisor =
-        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(1));
 
     let err = supervisor
         .submit(
@@ -223,7 +223,7 @@ fn submit_detects_job_id_mismatch_in_result() {
     });
 
     let supervisor =
-        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(1));
 
     let err = supervisor
         .submit(
@@ -255,7 +255,7 @@ fn shutdown_writes_shutdown_request_and_consumes_bye() {
     });
 
     let supervisor =
-        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(1));
 
     supervisor.shutdown().expect("shutdown");
     guest.join().expect("guest");
@@ -340,7 +340,7 @@ fn submit_with_audit_sink_emits_dispatched_then_completed_on_success() {
 
     let sink = std::sync::Arc::new(RecordingAuditSink::default());
     let supervisor = PersistentBuilderSupervisor::new(&socket)
-        .with_frame_read_timeout(Duration::from_secs(5))
+        .with_frame_read_timeout(Duration::from_secs(1))
         .with_audit_sink(sink.clone());
 
     let outcome = supervisor
@@ -442,7 +442,7 @@ fn submit_without_audit_sink_emits_nothing() {
     });
 
     let supervisor =
-        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(5));
+        PersistentBuilderSupervisor::new(&socket).with_frame_read_timeout(Duration::from_secs(1));
     supervisor
         .submit(
             BuilderJob::Flake {

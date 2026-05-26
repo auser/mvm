@@ -71,8 +71,8 @@ fn spawn_vsock_response_listener_decodes_guest_response() {
 
     let rx = spawn_vsock_response_listener(scratch.path());
     let received = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("response within 5s");
+        .recv_timeout(Duration::from_secs(1))
+        .expect("response within 1s");
     guest_thread.join().expect("guest thread");
 
     match received {
@@ -99,8 +99,8 @@ fn spawn_vsock_response_listener_yields_empty_eof_when_no_send() {
 
     let rx = spawn_vsock_response_listener(scratch.path());
     let received = rx
-        .recv_timeout(Duration::from_secs(5))
-        .expect("response within 5s");
+        .recv_timeout(Duration::from_secs(1))
+        .expect("response within 1s");
     guest_thread.join().expect("guest thread");
 
     match received {

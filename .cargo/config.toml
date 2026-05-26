@@ -1,0 +1,21 @@
+# Workspace-wide cargo defaults.
+#
+# Why this file exists:
+#   GNU `ld` on Linux is the single slowest step in a cold workspace
+#   build, especially for the ~30 test binaries `cargo nextest run
+#   --workspace` produces. Switching to `lld` typically cuts that
+#   link-step wall time by 30–50%. The CI Ubuntu runners ship `lld`
+#   by default; local Linux contributors install it via
+#   `apt install lld` (one-time).
+#
+#   macOS is left alone deliberately: Apple's system `ld` is already
+#   fast, and `lld`'s Mach-O backend is incomplete enough that swapping
+#   it in tends to introduce more pain than it saves. The
+#   `[profile.test]` + per-package opt-level tuning in the root
+#   Cargo.toml is what makes macOS faster.
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]
+
+[target.aarch64-unknown-linux-gnu]
+rustflags = ["-C", "link-arg=-fuse-ld=lld"]

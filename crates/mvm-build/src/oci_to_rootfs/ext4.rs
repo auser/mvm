@@ -193,14 +193,22 @@ fn run_mke2fs(
         .mke2fs_binary
         .as_deref()
         .unwrap_or_else(|| Path::new("mke2fs"));
+    // mke2fs's `-E` is last-wins, not accumulating — passing it twice
+    // silently drops the earlier value. Combine extended options into a
+    // single comma-separated `-E` so `hash_seed` actually takes effect
+    // (without this, mke2fs picks a fresh random hash seed each call,
+    // shifting the htree layout and breaking the byte-determinism the
+    // ADR-050 verity cache depends on).
     let mut cmd = std::process::Command::new(binary);
     cmd.env("SOURCE_DATE_EPOCH", options.source_date_epoch.to_string())
         .args(["-F"]) // overwrite the preallocated output file
         .args(["-t", "ext4"])
         .args(["-L", &options.label])
         .args(["-U", &options.uuid])
-        .args(["-E", &format!("hash_seed={}", options.hash_seed)])
-        .args(["-E", "no_copy_xattrs"])
+        .args([
+            "-E",
+            &format!("hash_seed={},no_copy_xattrs", options.hash_seed),
+        ])
         .args(["-b", &options.block_size.to_string()])
         .arg("-d")
         .arg(staged_root)

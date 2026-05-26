@@ -572,8 +572,43 @@ mod tests {
         assert_eq!(DEFAULT_TIMEOUT_SECS, 1800);
     }
 
+    /// Guard that injects a synthetic `MVM_BUILDER_AUTHORIZED_KEY` for
+    /// the duration of a test, then restores the prior value. Needed
+    /// because `ensure_builder_artifacts(_, require_ssh_keys=true)`
+    /// reads pubkeys from the host (`$HOME/.ssh/*.pub` +
+    /// `MVM_BUILDER_AUTHORIZED_KEY`) — CI runners have neither, so
+    /// without this the SSH-fan-out branch errors out before the
+    /// recorded-command assertions can run.
+    struct AuthorizedKeyGuard {
+        prev: Option<String>,
+    }
+    impl AuthorizedKeyGuard {
+        fn install() -> Self {
+            let prev = std::env::var("MVM_BUILDER_AUTHORIZED_KEY").ok();
+            // SAFETY: tests-only; the value is harmless and Drop restores prior state.
+            unsafe {
+                std::env::set_var(
+                    "MVM_BUILDER_AUTHORIZED_KEY",
+                    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAITESTKEYBUILDERVMARTIFACTS test@mvm",
+                );
+            }
+            Self { prev }
+        }
+    }
+    impl Drop for AuthorizedKeyGuard {
+        fn drop(&mut self) {
+            unsafe {
+                match self.prev.take() {
+                    Some(v) => std::env::set_var("MVM_BUILDER_AUTHORIZED_KEY", v),
+                    None => std::env::remove_var("MVM_BUILDER_AUTHORIZED_KEY"),
+                }
+            }
+        }
+    }
+
     #[test]
     fn test_ensure_builder_artifacts_skips_when_present() {
+        let _guard = AuthorizedKeyGuard::install();
         let env = FakeEnv::new(&["yes", "target/debug/mvm-builder-agent"]);
         crate::artifacts::ensure_builder_artifacts(&env, true).expect("should succeed");
         let cmds = env.cmds.lock().unwrap();
@@ -584,6 +619,7 @@ mod tests {
 
     #[test]
     fn test_ensure_builder_artifacts_downloads_when_missing() {
+        let _guard = AuthorizedKeyGuard::install();
         let env = FakeEnv::new(&["no", "target/debug/mvm-builder-agent"]);
         crate::artifacts::ensure_builder_artifacts(&env, true)
             .expect("download path should succeed");

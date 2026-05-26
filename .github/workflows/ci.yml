@@ -78,7 +78,9 @@ jobs:
           components: rustfmt, clippy
 
       - name: Install system build deps
-        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev
+        # `lld` is required by .cargo/config.toml's link-arg override
+        # for linux-gnu targets — see the comment in that file.
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev lld
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -149,12 +151,15 @@ jobs:
         # -lcap-ng`. Ubuntu's GH runner image ships the runtime library
         # but not the -dev headers/symlinks that `cc` needs at link time.
         #
+        # `lld` is required by .cargo/config.toml's link-arg override
+        # for linux-gnu targets — see the comment in that file.
+        #
         # The secret-store live tests in tests/audit_emissions_live.rs
         # pin `MVM_SECRET_STORE_BACKEND=file` in the sandbox, so no
         # DBus / Secret Service is needed here.
         run: |
           sudo apt-get update
-          sudo apt-get install -y libcap-ng-dev
+          sudo apt-get install -y libcap-ng-dev lld
 
       - name: Cache cargo
         uses: actions/cache@v5
@@ -166,11 +171,24 @@ jobs:
           key: ${{ runner.os }}-cargo-test-${{ hashFiles('**/Cargo.lock') }}
           restore-keys: ${{ runner.os }}-cargo-test-
 
+      # `cargo nextest` parallelises tests across processes rather
+      # than threads, which materially cuts wall time even on the
+      # root-crate scope this lane runs. Scope intentionally matches
+      # main's `cargo test` (root facade only); a wider workspace
+      # gate is left to `just test` locally and to the per-crate CI
+      # lanes (libkrun, vz-macos, etc.). Falls back to `cargo test`
+      # if nextest install ever breaks — see the `test-cargo` recipe
+      # in the Justfile.
+      - name: Install cargo-nextest
+        uses: taiki-e/install-action@v2
+        with:
+          tool: nextest
+
       - name: Build
         run: cargo build --all-targets
 
       - name: Run tests
-        run: cargo test
+        run: cargo nextest run
 
   e2e:
     name: E2E Tests
@@ -379,6 +397,11 @@ jobs:
     name: Apple (release-only)
     if: startsWith(github.ref, 'refs/tags/v')
     runs-on: macos-latest
+    # The mvm-vz/build.rs Swift supervisor build is opt-in (see the
+    # comment at the top of crates/mvm-vz/build.rs). This lane is the
+    # release-tag macOS gate, so it must build the supervisor.
+    env:
+      MVM_VZ_BUILD_SUPERVISOR: "1"
     steps:
       - uses: actions/checkout@v6
 
@@ -503,6 +526,10 @@ jobs:
         runner:
           - macos-latest  # current shipping; covers Apple Container coexistence
     runs-on: ${{ matrix.runner }}
+    # The mvm-vz/build.rs Swift supervisor build is opt-in; this lane
+    # is the dedicated vz exercise so it must build the supervisor.
+    env:
+      MVM_VZ_BUILD_SUPERVISOR: "1"
     steps:
       - uses: actions/checkout@v6
 
@@ -609,6 +636,10 @@ jobs:
     if: ${{ vars.MACOS_26_AVAILABLE == 'true' }}
     runs-on: [self-hosted, macOS, ARM64, macos-26]
     continue-on-error: true
+    # The mvm-vz/build.rs Swift supervisor build is opt-in; this lane
+    # exercises vz on macOS 26 so it must build the supervisor.
+    env:
+      MVM_VZ_BUILD_SUPERVISOR: "1"
     steps:
       - uses: actions/checkout@v6
 

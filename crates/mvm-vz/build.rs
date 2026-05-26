@@ -34,23 +34,38 @@ fn main() {
         supervisor_root.join("Entitlements.plist").display()
     );
 
-    // The `MVM_VZ_SKIP_SUPERVISOR_BUILD` escape hatch lets CI / users
-    // turn off the Swift build (e.g. when working only on the Rust
-    // side from a macOS contributor host without Xcode CLT installed).
-    // Off-by-default — the common case is to build everything.
-    println!("cargo:rerun-if-env-changed=MVM_VZ_SKIP_SUPERVISOR_BUILD");
-    if std::env::var_os("MVM_VZ_SKIP_SUPERVISOR_BUILD").is_some() {
-        println!(
-            "cargo:warning=mvm-vz: MVM_VZ_SKIP_SUPERVISOR_BUILD set; skipping Swift supervisor build"
-        );
-        return;
-    }
-
     // Only macOS can host the Vz backend; on every other target the
     // supervisor is irrelevant. Skip silently — the Rust side of this
     // crate (`SupervisorConfig` types, path helpers) still compiles
     // and gets used by `mvm-backend` for shape checks.
     if !cfg!(target_os = "macos") {
+        return;
+    }
+
+    // Opt-in default: skip the Swift supervisor build unless the
+    // caller asks for it. `swift build` on a cold cache costs 5–15s
+    // and most workspace commands (`cargo test --workspace`,
+    // `cargo build`) don't need the supervisor binary — only
+    // `mvmctl run --backend vz` and the `mvm-backend::vz` integration
+    // tests do. CI lanes that exercise vz (`vz-macos`, `apple`) set
+    // MVM_VZ_BUILD_SUPERVISOR=1.
+    //
+    // The legacy `MVM_VZ_SKIP_SUPERVISOR_BUILD` flag remains supported
+    // so external scripts or contributor shells that already set it
+    // don't silently flip to building. Either flag wins toward
+    // skipping: explicit skip overrides explicit build, and the
+    // common case is to skip.
+    println!("cargo:rerun-if-env-changed=MVM_VZ_BUILD_SUPERVISOR");
+    println!("cargo:rerun-if-env-changed=MVM_VZ_SKIP_SUPERVISOR_BUILD");
+    let skip_requested = std::env::var_os("MVM_VZ_SKIP_SUPERVISOR_BUILD").is_some();
+    let build_requested = std::env::var_os("MVM_VZ_BUILD_SUPERVISOR").is_some();
+    if skip_requested || !build_requested {
+        // Stay silent on the default-skip path; emitting cargo:warning
+        // here would pollute every workspace `cargo build` on macOS
+        // with a non-actionable line. The mvm-vz-supervisor binary's
+        // absence surfaces at runtime via the VzBackend resolver's
+        // actionable "supervisor binary missing" error, which already
+        // tells the user to set MVM_VZ_BUILD_SUPERVISOR=1 and rebuild.
         return;
     }
 
