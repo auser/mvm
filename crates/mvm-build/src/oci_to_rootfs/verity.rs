@@ -310,6 +310,7 @@ fn write_roothash_file(path: &Path, roothash: &str) -> Result<(), OciUnpackError
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[cfg(not(target_os = "linux"))]
     use tempfile::TempDir;
 
     fn defaults() -> VeritysetupOptions {
