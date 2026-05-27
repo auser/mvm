@@ -1983,7 +1983,7 @@ Scope clarification: W6 covers **north-south** only (microVM ↔ internet throug
 Out of scope for this sprint:
 
 - East-west microVM ↔ microVM audit — proposed as a new wave (W11) needing a different capture mechanism (`tc mirred`, eBPF, or libpcap on the TAP). Not blocking W6.
-- Secret detection + egress obfuscation — proposed as Plan 103 (separate plan + ADR). Requires L7 visibility (TLS MITM or cooperating in-guest hook); needs its own brainstorm before any code.
+- Secret detection + egress obfuscation — proposed as the host-logging follow-up plan (number TBD) (separate plan + ADR). Requires L7 visibility (TLS MITM or cooperating in-guest hook); needs its own brainstorm before any code.
 
 ### W4 — Crypto attestability (claim 10 leg 3)  🟡 proposed
 
@@ -2004,6 +2004,64 @@ See [Plan 101 W11–W14](plans/101-in-guest-volume-encryption-and-gateway-audit.
 - Hardware-backed key attestation (still future).
 - Reintroducing Lima (removed 2026-05-14; symmetric posture achieved via `mvm-libkrun` on both hosts).
 - Per-byte network audit (Plan 101 W8 aggregates).
+
+## Sprint 57 — Host services broker over vsock — PROPOSED  [`plans/104-host-services-broker.md`](plans/104-host-services-broker.md) | `adrs/059-host-services-broker.md` (TBD)
+
+### Why this sprint
+
+Today secrets reach microVMs by mounting a sealed ext4 drive at `/mnt/secrets` at boot; ADR-048 tags this `unsafe_guest_secret_materialization` and declines to claim non-leakage. ADR-049 already committed to a vsock side-channel for secret substitution but stubs it. This sprint generalizes ADR-049's mechanism into a **host services broker** with `host.secrets.v1` running in a **dedicated subprocess** (production-ready isolation per industry analogues — AWS STS, Vault, K8s SA tokens) — and ships `host.time.v1` + `host.cost.v1` in the in-process general broker to validate the substrate works for more than one service. The out-of-process handler substrate ships in v1 with secrets as its first consumer; future addon services reuse it without protocol change. Designed for **extensibility** — Cargo feature flags per service, versioned ServiceIds with parallel-version support, service composition across the process boundary, JSON wire format consistent with existing `GuestRequest` / `HostBoundRequest` channels.
+
+### Workstream breakdown
+
+- [ ] **W1 — Broker substrate + secrets-subprocess scaffolding** (envelope, registry, two vsock listeners per VM — port 5300 general + port 5301 secrets, `mvm-secrets-dispatcher` new crate, supervisor subprocess lifecycle, UDS proxy code path; no handlers yet)
+- [ ] **W2 — `ExecutionPlan.services` + admission wiring** (schema + registry assembly + `EventCategory::ServiceCall` + rate-limit/lifetime-quota/circuit-breaker)
+- [ ] **W3 — `host.time.v1`** (handler in general broker + `broker.v1/list_services` + delete `HostBoundRequest::QueryHostTime`)
+- [ ] **W4a — `host.cost.v1` workload-scope** (handler in general broker; no mvmd dep)
+- [ ] **W4b — `host.cost.v1` cross-tenant via mvmd** (depends on mvmd Plan 51 W1+W2+W3; mvmd-response validation)
+- [ ] **W5 — `host.secrets.v1` inside the secrets subprocess** (ADR-049 implementation; delete `KeystoreReleaser` stubs; inter-call memory hygiene; subprocess seccomp + setpriv + uid 902)
+- [ ] **W6 — Fuzz + CI** (`fuzz_service_call.rs`, `xtask check-handler-*` lints, cross-backend test matrix, subprocess crash isolation tests)
+- [ ] **W7 — ADR-049 §W3 SDK matrix** (Python + TS + Rust hook libraries; splittable per language)
+
+### Cross-repo dependency (mvmd)
+
+- [ ] mvmd **Plan 51** — host services cross-VM endpoints (`../mvmd/specs/plans/51-host-services-cross-vm-endpoints.md`)
+- [ ] mvmd **ADR-0022** — mvmd as cross-VM delegate (`../mvmd/specs/adrs/0022-mvmd-host-services-delegation.md`)
+
+mvmd Plan 51 W1+W2+W3 must land before mvm W4b opens; mvm W1–W4a + W5 + W6 + W7 have no mvmd dep and land in parallel.
+
+### Security claims under this sprint
+
+Two new claims proposed in ADR-059 (numbers TBD — Sprint 56 holds claim 10):
+- Every host-side service is bound to a signed `ExecutionPlan.services` entry, enforced before dispatch, audited via the chain.
+- No raw secret value crosses the broker channel; `host.secrets.v1` returns destination-bound, time-bound signed credentials only.
+
+### Sprint 57 success criteria
+
+- [ ] `ExecutionPlan.services` schema landed and signature-verified at admission (`SCHEMA_VERSION` bumped 4→5).
+- [ ] General broker listens on vsock 5300, dispatches `host.time.v1` / `host.cost.v1` / `broker.v1`.
+- [ ] `mvm-secrets-dispatcher` subprocess listens on vsock 5301, dispatches `host.secrets.v1` only; runs at uid 902 with seccomp `standard` + setpriv.
+- [ ] `host.secrets.v1` returns destination-bound signed credentials per ADR-049 with JCS-canonicalized signing; `KeystoreReleaser` stubs deleted.
+- [ ] Subprocess crash isolation verified: kill subprocess → supervisor survives, workload sees `Err(Unavailable)`; kill supervisor → subprocess exits cleanly via pdeathsig.
+- [ ] `HostBoundRequest::QueryHostTime` deleted; internal caller migrated to broker.
+- [ ] `fuzz_service_call.rs` ≥5min/PR in CI; `xtask check-handler-*` lints block orphans.
+- [ ] Cross-backend test matrix green on libkrun / Firecracker / Apple Container / vz; **both ports listen on all four backends** (vz requires new `VZVirtioSocketListener` Swift class).
+- [ ] mvmd Plan 51 endpoints live (iroh ALPN, signed catalog responses); mvm W4b green; cross-tenant authz refused; malformed-mvmd-response rejected.
+- [ ] ADR-049 §W3 SDK matrix complete in Python + TS + Rust; hostile-guest tests green; S25 placeholder-egress backstop in gvproxy/passt detects and drops `mvm-secret://` patterns.
+- [ ] Falsifiability: throwaway `host.dev.echo.v1` lands in one handler file (in-process) without touching envelope/registry/auth; out-of-process variant exercises the secrets-dispatcher substrate pattern.
+
+### Non-goals (explicit)
+
+- Streaming responses. `host.monitoring.v1` deferred.
+- Addon-provided handlers shipping in v1. v1 only ships the substrate; v2 ships actual addons.
+- The `unsafe_guest_tls_inspection` proxy-with-CA path from ADR-049. Separate plan.
+- Non-HTTP secret substitution. ADR-049 already declares out of scope.
+- Cross-tenant aggregation. `host.cost.v1::tenant` is single-tenant-scoped.
+
+### Follow-up (the host-logging follow-up plan (number TBD) — separate spec)
+
+- [ ] `host.logging.v1` — workload-emitted structured logs to tenant log sink (depends on mvmd Plan 51 W3).
+- [ ] `host.audit.v1` — workload-emitted chain-signed audit entries under `EventCategory::WorkloadAudit`.
+- [ ] ADR-060 — workload-audit semantics + chain rotation policy.
 
 ## Completed Sprints
 
