@@ -5,7 +5,7 @@
 
 ## Context
 
-Surveyed 8 crates (ai-jail, mino, agentkernel, arcbox-vm, wasm-sandbox, sandbox-runtime,
+Surveyed 8 crates (ai-jail, mino, an OCI-container sandbox, arcbox-vm, wasm-sandbox, sandbox-runtime,
 sandbox-rs, agent-sandbox) to identify patterns for hardening mvm as an AI agent execution
 platform. Four patterns selected for adoption.
 
@@ -16,7 +16,7 @@ platform. Four patterns selected for adoption.
 | Crate | Isolation | Key Pattern | Lines |
 |-------|-----------|-------------|-------|
 | **arcbox-vm** | Firecracker microVM | Three-tier isolation, Docker API compat, sub-50ms snapshot restore | 4.2k |
-| **agentkernel** | OCI container | MITM proxy secret injection ("Gondolin"), LLM cost tracking, HTTP API | 44k |
+| **OCI-container sandbox** | OCI container | MITM-proxy secret injection, LLM cost tracking, HTTP API | 44k |
 | **mino** | Podman container | Temp cloud creds, iptables egress filtering, lockfile-keyed caching | 15k |
 | **ai-jail** | Process (bwrap/seatbelt) | Seccomp + Landlock + dotfile layering, lockdown mode | 6k |
 | **sandbox-runtime** | Process (bwrap/seatbelt) | Domain allowlist proxy (HTTP + SOCKS5), Anthropic-derived | 3.6k |
@@ -143,7 +143,7 @@ All agent writes go to overlay. After VM stop, inspect the overlay for changes.
 
 ### Design
 
-MITM HTTPS proxy (agentkernel's "Gondolin" pattern) running inside Lima VM:
+MITM HTTPS proxy (TLS-terminating-proxy secret-injection pattern) running inside Lima VM:
 
 1. Proxy generates a CA, injects CA PEM into guest trust store at boot
 2. Guest sets `HTTP_PROXY`/`HTTPS_PROXY` env vars pointing to proxy
