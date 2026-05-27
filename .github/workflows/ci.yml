@@ -172,13 +172,13 @@ jobs:
           restore-keys: ${{ runner.os }}-cargo-test-
 
       # `cargo nextest` parallelises tests across processes rather
-      # than threads, which materially cuts wall time even on the
-      # root-crate scope this lane runs. Scope intentionally matches
-      # main's `cargo test` (root facade only); a wider workspace
-      # gate is left to `just test` locally and to the per-crate CI
-      # lanes (libkrun, vz-macos, etc.). Falls back to `cargo test`
-      # if nextest install ever breaks — see the `test-cargo` recipe
-      # in the Justfile.
+      # than threads, which materially cuts wall time. Scope spans the
+      # full workspace + all targets so integration-test-only failures
+      # (e.g. the `entrypoint::execute` shebang-vs-`/proc/self/fd`
+      # interaction that was once hidden by a root-crate-only nextest
+      # invocation) surface here, matching `just ci` locally. Falls
+      # back to `cargo test` if nextest install ever breaks — see the
+      # `test-cargo` recipe in the Justfile.
       - name: Install cargo-nextest
         uses: taiki-e/install-action@v2
         with:
@@ -188,7 +188,17 @@ jobs:
         run: cargo build --all-targets
 
       - name: Run tests
-        run: cargo nextest run
+        run: cargo nextest run --workspace --all-targets
+
+      # Plan 98 Phase 3 §3.4 — Linux auto-detect assertion. The
+      # `auto_detect_default_for(false)` arm covers macOS 13-25, Linux,
+      # and Windows; pinning it here ensures the Linux path keeps
+      # picking libkrun even after a future refactor of the predicate
+      # (a regression would be a Vz-on-Linux pick which can't run).
+      - name: Assert auto-detect on Linux picks libkrun
+        run: |
+          cargo test -p mvm-build --features builder-vm --lib \
+            builder_backend_select::tests::auto_detect_default_for_everything_else_picks_libkrun
 
   e2e:
     name: E2E Tests
@@ -543,9 +553,14 @@ jobs:
               - 'crates/mvm-vz-supervisor/**'
               - 'crates/mvm-backend/src/vz.rs'
               - 'crates/mvm-backend/Cargo.toml'
+              - 'crates/mvm-build/src/vz_builder.rs'
+              - 'crates/mvm-build/src/builder_backend_select.rs'
+              - 'crates/mvm-cli/src/commands/env/dev.rs'
               - 'crates/mvm-core/src/platform/platform.rs'
               - 'specs/plans/97-vz-backend.md'
+              - 'specs/plans/98-vz-builder-vm.md'
               - 'specs/adrs/056-vz-backend.md'
+              - 'specs/adrs/046-builder-vm-via-libkrun.md'
               - '.github/workflows/ci.yml'
 
       - name: Install Rust toolchain
@@ -580,9 +595,47 @@ jobs:
         if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
         run: cargo test -p mvm-backend vz
 
+      # Plan 98 Phase 3 §3.2 — Vz builder driver unit tests on macOS.
+      # `vz_builder` covers VzBuilderVm + VzPersistentBuilderVm config
+      # mapping (rootfs / disks / virtio-fs / vsock / startup_mode);
+      # `vz_persistent` covers the Slice 2A persistent path; the
+      # supervisor-config builder tests run hermetically on macos-latest
+      # so a regression in the persistent driver shows up here, not
+      # only inside a real boot (which only the macos-26 self-hosted
+      # lane can do today).
+      - name: Test mvm-build Vz driver (vz_builder + persistent)
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        run: cargo test -p mvm-build --features builder-vm vz_builder
+
+      # Plan 98 Phase 3 §3.2 — env-var path on macOS. Construction-only
+      # smoke that asserts `MVM_BUILDER_BACKEND=vz` flips
+      # `resolve_choice()` + that `resolve_builder_backend()` returns
+      # a Vz driver. Pure I/O-free; covers the override path the dev
+      # dispatch (Slice 2B) and `apple_container::build_image_via_libkrun`
+      # both consume.
+      - name: Test mvm-build selection layer with MVM_BUILDER_BACKEND=vz
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        env:
+          MVM_BUILDER_BACKEND: vz
+        run: cargo test -p mvm-build --features builder-vm builder_backend_select
+
       - name: Clippy mvm-vz + mvm-backend vz module
         if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
         run: cargo clippy -p mvm-vz -p mvm-backend --all-targets -- -D warnings
+
+      # Plan 98 Phase 3 §3.4 — assert auto-detect picks Vz on
+      # macos-latest **only** if the host actually reports macOS 26+
+      # Apple Silicon. macos-latest at the time Phase 3 lands is
+      # macos-15 (pre-26), so the assertion is the *opposite*:
+      # auto-detect on macos-latest should pick `Libkrun`, not Vz,
+      # confirming the auto-detect gate is correctly conservative
+      # (catches a regression where someone "fixes" macOS-26 by
+      # promoting Vz to default on any macOS).
+      - name: Assert auto-detect on macos-latest picks libkrun (pre-26)
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        run: |
+          cargo test -p mvm-build --features builder-vm --lib \
+            builder_backend_select::tests::auto_detect_default_for_everything_else_picks_libkrun
 
       - name: Verify supervisor binary has the virtualization entitlement
         if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
@@ -840,37 +893,125 @@ jobs:
           MVM_CH_BOOTCHECK_ROOTFS: ${{ github.workspace }}/ci-artifacts/rootfs.ext4
         run: cargo run --example ch-bootcheck -p mvm-backend
 
-  # ── Lane: oci-layer-unpack-fuzz (Plan 85 §R1, paths-gated) ──
+  # ── Plan 85 finalization: named, path-gated OCI gates ─────────────
   #
-  # Cargo-fuzz harness for `mvm_oci::unpack::unpack_layer`. Wired
-  # in Plan 85 Phase A.2 — the first PR that ships a fuzz target
-  # under `crates/mvm-oci/fuzz/`. Subsequent Phase A sub-phases
-  # (A.3 hardlinks, A.4 xattrs, A.5 device nodes, A.6 setuid) add
-  # corpus entries here; the same harness covers them all because
-  # `unpack_layer` is the single ingress point.
+  # Plan 85's acceptance criteria call out six named CI lanes (plus
+  # the OCI unpack_layer fuzz lane in security.yml). Each lane below
+  # re-runs a
+  # targeted slice of the workspace test suite so a regression in a
+  # specific OCI invariant shows up as a named red X on the PR check
+  # panel instead of a generic `Test` failure. The underlying tests
+  # are also covered by the wider `test` job above; the value of the
+  # named lanes is **visibility** — the gate name maps 1:1 to the
+  # acceptance criterion it ratifies.
   #
-  # Budget per Plan 85 §R1 / §R4: 30 minutes when crates/mvm-oci
-  # changes, skipped otherwise. The 30-min figure is calibrated
-  # for libFuzzer's iteration rate against unpack-syscall cost
-  # (most inputs fail early at tar-header parsing, so iteration
-  # rate stays high in practice). The `|| github.ref` clause keeps
-  # post-merge coverage on main so a regression that snuck past
-  # path-gating shows up before the next mvm-oci PR.
+  # Lanes share the same paths-filter so they run as a group when
+  # any of `crates/mvm-oci/**`, `crates/mvm-build/src/oci_to_rootfs/**`,
+  # `crates/mvm-build/tests/oci_*`, or `crates/mvm-cli/src/commands/image.rs`
+  # changes — or on every push to `main`.
   #
-  # Daily long-form CIFuzz (separate workflow, Plan 85 §R4) is
-  # deferred to a follow-up plan-85 sub-PR.
-  #
-  # Security: every `run:` block here uses only workflow-internal
-  # expressions (`steps.filter.outputs.*`, `github.ref`,
-  # `github.run_id`, `hashFiles(...)`) — no user-controlled inputs
-  # like PR title, head_ref, or commit message reach the shell.
-  oci-unpack-fuzz:
-    name: oci-layer-unpack-fuzz (Plan 85 §R1)
+  # The lanes deliberately stay lightweight (each runs a single
+  # `cargo test` filter) so the marginal CI cost is small. The
+  # heavy lifting (fuzz) is the lane above; these are spec
+  # ratifications.
+
+  oci-layer-unpack-adversarial:
+    name: oci-layer-unpack-adversarial (Plan 85 §AC4)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
 
-      - name: Detect mvm-oci-touching paths
+      - name: Detect OCI-touching paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            oci:
+              - 'crates/mvm-oci/**'
+              - 'crates/mvm-build/src/oci_to_rootfs/**'
+              - 'crates/mvm-build/tests/oci_unpack_attacks.rs'
+              - 'crates/mvm-build/tests/oci_unpack_common/**'
+              - 'crates/mvm-cli/src/commands/image.rs'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system build deps
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev lld
+
+      - name: Cache cargo
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-oci-adversarial-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-oci-adversarial-
+
+      - name: Adversarial fixture suite for layer unpack
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        # `oci_unpack_attacks` carries the documented-CVE corpus —
+        # path traversal, hardlink chains, device-node sneak-ins,
+        # symlink escapes, per-entry / per-layer size caps, null-byte
+        # injection. Plan 85 §R1.
+        run: cargo test --test oci_unpack_attacks -p mvm-build -- --include-ignored
+
+  oci-digest-mismatch-reject:
+    name: oci-digest-mismatch-reject (Plan 85 §AC4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect OCI-touching paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            oci:
+              - 'crates/mvm-oci/**'
+              - 'crates/mvm-build/src/oci_to_rootfs/**'
+              - 'crates/mvm-cli/src/commands/image.rs'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system build deps
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev lld
+
+      - name: Cache cargo
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-oci-digest-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-oci-digest-
+
+      - name: Layer + blob digest-mismatch rejection
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        # `hermetic_registry::layer_fetch_rejects_tampered_blob_*`
+        # exercises the streaming verifier against a deliberately
+        # tampered blob; sibling tests cover cap-exceeded and
+        # retry-exhaust paths.
+        run: cargo test --test hermetic_registry -p mvm-oci rejects
+
+  oci-malformed-manifest:
+    name: oci-malformed-manifest (Plan 85 §AC4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect OCI-touching paths
         id: filter
         uses: dorny/paths-filter@v3
         with:
@@ -883,11 +1024,9 @@ jobs:
         if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
         uses: dtolnay/rust-toolchain@nightly
 
-      - name: Install cargo-fuzz
+      - name: Install system build deps
         if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
-        # `--locked` so a transitive bump in cargo-fuzz's deps can't
-        # silently change harness behavior between PR runs.
-        run: cargo install --locked cargo-fuzz
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev lld
 
       - name: Cache cargo
         if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
@@ -896,27 +1035,167 @@ jobs:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
-            crates/mvm-oci/fuzz/target
-            crates/mvm-oci/fuzz/corpus
-          key: ${{ runner.os }}-cargo-oci-fuzz-${{ hashFiles('crates/mvm-oci/fuzz/Cargo.toml', 'crates/mvm-oci/src/unpack.rs') }}
-          restore-keys: ${{ runner.os }}-cargo-oci-fuzz-
+            target
+          key: ${{ runner.os }}-cargo-oci-manifest-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-oci-manifest-
 
-      - name: Fuzz unpack_layer (30-min budget)
+      - name: Malformed manifest / digest rejection
         if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
-        working-directory: crates/mvm-oci
-        env:
-          # `cargo fuzz` needs nightly (-Z sanitizer flags). The
-          # repo-root rust-toolchain.toml pins stable; this env var
-          # bypasses the toolchain-file lookup for the duration of
-          # the step. Same pattern as security.yml's fuzz lane.
-          RUSTUP_TOOLCHAIN: nightly
-        run: cargo fuzz run unpack_layer -- -max_total_time=1800
+        # Inline `manifest::tests` cover MalformedDigest paths
+        # (missing algorithm prefix, wrong hex length, wrong charset).
+        # Reference parser tests cover the same on the ref side.
+        # `--` separates cargo's own args from libtest filters; libtest
+        # accepts multiple positional filters as an OR. cargo test
+        # itself only takes one TESTNAME positional, so the `--` is
+        # what lets us filter for both modules in one run.
+        run: "cargo test -p mvm-oci -- manifest:: reference::"
 
-      - name: Upload corpus + artifacts on failure
-        if: failure()
-        uses: actions/upload-artifact@v7
+  oci-mutable-tag-prod-reject:
+    name: oci-mutable-tag-prod-reject (Plan 85 §AC2/AC4)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect OCI-touching paths
+        id: filter
+        uses: dorny/paths-filter@v3
         with:
-          name: oci-fuzz-corpus-${{ github.run_id }}
+          filters: |
+            oci:
+              - 'crates/mvm-oci/**'
+              - 'crates/mvm-cli/src/commands/image.rs'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system build deps
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev lld
+
+      - name: Cache cargo
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: actions/cache@v5
+        with:
           path: |
-            crates/mvm-oci/fuzz/corpus/
-            crates/mvm-oci/fuzz/artifacts/
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-oci-prod-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-oci-prod-
+
+      - name: --prod refuses mutable tags before network
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        # Plan 85 acceptance criterion 2: `--prod` on a mutable
+        # reference must refuse *before* any pull. Tests live in
+        # `crates/mvm-cli/src/commands/image.rs` and assert the
+        # error reaches the user before a network call is made.
+        # `--` is required because libtest takes multiple positional
+        # filters as an OR but cargo test itself only accepts one
+        # TESTNAME positional.
+        run: cargo test -p mvm-cli -- prod_pull_requires_digest_pin prod_run_image_requires_digest_pin
+
+  oci-reproducibility:
+    name: oci-reproducibility (Plan 85 §R2)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect OCI-touching paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            oci:
+              - 'crates/mvm-oci/**'
+              - 'crates/mvm-build/src/oci_to_rootfs/**'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system build deps
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        # `mke2fs` (from `e2fsprogs`, default-installed on
+        # ubuntu-latest) is required by the ext4 reproducibility
+        # assertion in `oci_ext4_materialization`.
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev lld e2fsprogs
+
+      - name: Cache cargo
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-oci-repro-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-oci-repro-
+
+      - name: Two-unpack reproducibility
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        # Unpack the same layer set into two clean staging dirs and
+        # assert byte-identical content modulo inode metadata.
+        run: cargo test -p mvm-oci reproducibility_two_unpacks_match_modulo_inode
+
+      - name: Byte-identical ext4 materialization
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        # ADR-051's per-version cache hinges on byte-identical ext4
+        # output across two materialize_to_ext4 runs over byte-
+        # identical input. Linux-gated via `#![cfg(target_os = "linux")]`
+        # at the top of the test module; on this lane (`ubuntu-latest`)
+        # it runs.
+        run: cargo test --test oci_ext4_materialization -p mvm-build materialize_is_byte_deterministic
+
+  oci-image-runner-smoke:
+    name: oci-image-runner-smoke (Plan 85 §Phase B)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Detect OCI-touching paths
+        id: filter
+        uses: dorny/paths-filter@v3
+        with:
+          filters: |
+            oci:
+              - 'crates/mvm-oci/**'
+              - 'crates/mvm-build/src/oci_to_rootfs/**'
+              - 'crates/mvm-build/tests/oci_ext4_materialization.rs'
+              - '.github/workflows/ci.yml'
+
+      - name: Install Rust toolchain
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: dtolnay/rust-toolchain@nightly
+
+      - name: Install system build deps
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        # `e2fsprogs` provides `mke2fs`; the test no-ops with a
+        # printed skip if `mke2fs` isn't on `$PATH`, so the install
+        # is what turns the lane from skip-only into a real gate.
+        run: sudo apt-get update && sudo apt-get install -y libcap-ng-dev lld e2fsprogs
+
+      - name: Cache cargo
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        uses: actions/cache@v5
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-oci-smoke-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-cargo-oci-smoke-
+
+      - name: Phase B ext4 materialization smoke
+        if: steps.filter.outputs.oci == 'true' || github.ref == 'refs/heads/main'
+        # Phase B smoke: unpack a small fixture layer set into a
+        # staging tree, materialize to ext4 via mke2fs -d, assert
+        # the resulting image is mountable + carries the expected
+        # contents. The full pull → unpack → materialize → boot
+        # round-trip against `docker.io/library/alpine:3.20@sha256:...`
+        # additionally requires libkrun/KVM, which github-hosted
+        # runners cannot provide (no nested KVM). The boot half is
+        # tracked separately in the self-hosted Vz/libkrun lanes.
+        run: cargo test --test oci_ext4_materialization -p mvm-build

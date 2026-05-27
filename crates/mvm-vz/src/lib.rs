@@ -240,6 +240,19 @@ pub enum NetworkConfig {
         /// Guest's eth0 MAC, formatted `AA:BB:CC:DD:EE:FF`. Validated
         /// against the locally-administered bit in [`MacAddress`].
         mac: String,
+        /// Path to the Rust supervisor's gateway-audit ingest socket
+        /// (`~/.mvm/audit/gateway-events-<vm>.sock`). The Vz Swift
+        /// bridge connects here (sending `MVM_VZ_BRIDGE_V1\n`
+        /// handshake first) and writes NDJSON `FlowEventWire`
+        /// entries for the Rust supervisor's signer task to drain
+        /// into the claim-8 chain.
+        ///
+        /// `None` keeps pre-W6.A configs parseable; the Vz Swift
+        /// bridge only emits when this is set. Plan 102 W6.A
+        /// commit 7 (full Swift implementation lands in W6.A.5
+        /// where it can be compile-verified on macOS).
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        events_ingest_socket_path: Option<String>,
     },
 }
 
@@ -567,11 +580,57 @@ mod tests {
         );
     }
 
+    /// Plan 102 W6.A commit 7 — `events_ingest_socket_path` is the
+    /// new field the Vz Swift bridge connects to when emitting
+    /// `FlowEventWire` NDJSON for the Rust supervisor's signer
+    /// task. Skipped on serialize when `None` so pre-W6.A JSON
+    /// stays clean; deserializes cleanly when present.
+    #[test]
+    fn gvproxy_events_ingest_socket_path_roundtrips_when_set() {
+        let cfg = NetworkConfig::Gvproxy {
+            socket_path: "/tmp/gv.sock".into(),
+            mac: "02:00:00:00:00:01".into(),
+            events_ingest_socket_path: Some("/tmp/mvm/audit/gateway-events-vm-a.sock".to_string()),
+        };
+        let json = serde_json::to_string(&cfg).unwrap();
+        assert!(
+            json.contains(
+                r#""events_ingest_socket_path":"/tmp/mvm/audit/gateway-events-vm-a.sock""#
+            ),
+            "json: {json}"
+        );
+        let parsed: NetworkConfig = serde_json::from_str(&json).unwrap();
+        match parsed {
+            NetworkConfig::Gvproxy {
+                events_ingest_socket_path: Some(p),
+                ..
+            } => assert_eq!(p, "/tmp/mvm/audit/gateway-events-vm-a.sock"),
+            other => panic!("expected Gvproxy with events_ingest_socket_path, got {other:?}"),
+        }
+    }
+
+    /// Backward-compat: pre-W6.A JSON without the new field still
+    /// parses cleanly (the bridge just doesn't emit until the
+    /// field is set).
+    #[test]
+    fn gvproxy_without_events_ingest_socket_path_parses() {
+        let json = r#"{"kind":"gvproxy","socket_path":"/tmp/gv.sock","mac":"02:00:00:00:00:01"}"#;
+        let parsed: NetworkConfig = serde_json::from_str(json).unwrap();
+        match parsed {
+            NetworkConfig::Gvproxy {
+                events_ingest_socket_path: None,
+                ..
+            } => {}
+            other => panic!("expected None events_ingest, got {other:?}"),
+        }
+    }
+
     #[test]
     fn network_serializes_with_kind_tag() {
         let cfg = NetworkConfig::Gvproxy {
             socket_path: "/tmp/gv.sock".into(),
             mac: "02:00:00:00:00:01".into(),
+            events_ingest_socket_path: None,
         };
         let json = serde_json::to_string(&cfg).unwrap();
         // Tagged enum format: {"kind":"gvproxy","socket_path":...,"mac":...}.

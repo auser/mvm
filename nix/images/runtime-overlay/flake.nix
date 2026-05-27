@@ -102,26 +102,14 @@
         in
         if envPath != "" then /. + envPath else ../../..;
 
-      workspace = builtins.path {
-        path = workspaceRoot;
-        name = "mvm-workspace";
-        filter =
-          path: _type:
-          let
-            base = baseNameOf path;
-          in
-          !(builtins.elem base [
-            "target"
-            ".git"
-            "result"
-            "node_modules"
-            ".direnv"
-            ".cargo"
-            ".claude"
-            ".worktrees"
-          ])
-          && !(nixpkgs.lib.hasPrefix "result-" base);
-      };
+      # Filter list lives at nix/lib/workspace-filter.nix so the three
+      # flakes that ingest the host workspace (this one, builder/,
+      # builder-vm/) stay aligned with .gitignore in one place.
+      workspace =
+        (import (workspaceRoot + "/nix/lib/workspace-filter.nix") {
+          inherit (nixpkgs) lib;
+        })
+        { inherit workspaceRoot; };
 
       # mvmctl semver pinned to match
       # `[workspace.package].version` in the root Cargo.toml. The

@@ -215,6 +215,7 @@ pub fn run(json: bool, workflow: Option<DoctorWorkflow>) -> Result<()> {
     checks.push(apple_container_check(plat));
     checks.push(vz_check(plat));
     checks.push(libkrun_check(plat));
+    checks.push(builder_backend_check(plat));
     checks.push(network_backend_check(plat));
     checks.push(docker_check(plat));
     checks.push(ts_runner_check());
@@ -899,9 +900,10 @@ fn docker_check(plat: Platform) -> Check {
 /// Plan 88 W4. Probes `$PATH` for the gateway binary the host's
 /// libkrun build defaults to: `passt` on Linux, `gvproxy` on macOS
 /// (passt does not build on macOS — see ADR-055 §"Cross-platform
-/// backends"). Surfaces the version when present and the install
-/// hint when missing. `ok: true` regardless: TSI mode
-/// (`MVM_NETWORKING=tsi`) still works without either gateway.
+/// backends"). Surfaces the version when present and emits a
+/// **failing** check when missing — Plan 102 W6.A removed TSI, so
+/// the host needs a gateway binary to run any libkrun-backed VM
+/// (no-bypass invariant, ADR-058).
 ///
 /// Skipped on Windows (no native libkrun port either; the whole
 /// libkrun + virtio-net stack is macOS / Linux).
@@ -931,8 +933,9 @@ fn network_backend_check(plat: Platform) -> Check {
 
 /// Shared probe body for the per-OS userspace gateway. Returns a
 /// `Check` row with the version (when the binary supports
-/// `--version`) or the install hint (when missing). `ok: true`
-/// regardless — `MVM_NETWORKING=tsi` is a documented escape hatch.
+/// `--version`) or the install hint (when missing). Missing now
+/// fails the check — Plan 102 W6.A removed the TSI escape hatch,
+/// so a libkrun host without a gateway can't boot any VM.
 #[cfg(target_family = "unix")]
 fn gateway_check(
     name: &'static str,
@@ -975,11 +978,11 @@ fn gateway_check(
         None => Check {
             name,
             category: "platform",
-            ok: true, // Optional; only strictly needed for MVM_NETWORKING != tsi.
+            ok: false, // Plan 102 W6.A: no TSI escape; gateway is mandatory.
             info: format!(
-                "not available ({install_hint}) — required for the default \
-                 libkrun virtio-net path; set `MVM_NETWORKING=tsi` to opt back \
-                 to libkrun's built-in TSI mode while you install it"
+                "not available ({install_hint}) — required for libkrun \
+                 virtio-net; TSI escape hatch was removed in Plan 102 W6.A \
+                 (claim-10 no-bypass invariant, ADR-058)"
             ),
         },
     }
@@ -1024,6 +1027,76 @@ fn libkrun_check(plat: Platform) -> Check {
             ok: true, // Optional; not a failure.
             info: format!("not available ({})", mvm_libkrun::install_hint()),
         }
+    }
+}
+
+/// Plan 98 — surface which builder-VM backend the selection layer
+/// resolves to on this host, plus the override source if any.
+///
+/// `mvm_build::builder_backend_select` enforces priority
+/// `--builder` flag > `MVM_BUILDER_BACKEND` env > platform default
+/// (macOS 26+ Apple Silicon → vz; everywhere else → libkrun). The
+/// flag is folded into the env at startup (`commands::run`), so by
+/// the time doctor runs every override is observable via env.
+///
+/// The check is informational — it never fails. A missing libkrun
+/// or Vz prereq is reported by the platform-level `libkrun_check`
+/// / `vz_check` already in the report; this check is about the
+/// *selection*, not the availability.
+#[cfg(feature = "builder-vm")]
+fn builder_backend_check(plat: Platform) -> Check {
+    use mvm_build::builder_backend_select::{
+        BuilderBackendChoice, MVM_BUILDER_BACKEND_ENV, auto_detect_default, resolve_env_override,
+    };
+
+    let env_override = resolve_env_override();
+    let auto = auto_detect_default();
+    let resolved = env_override.unwrap_or(auto);
+
+    // Best-effort: detect whether the override came from the
+    // `--builder` flag or the env var. The flag is folded into the
+    // env at startup, so we can't distinguish them after the fact;
+    // surface both possibilities so an operator reading the report
+    // knows where to look.
+    let source = match env_override {
+        Some(_) => format!("override via --builder / ${MVM_BUILDER_BACKEND_ENV}"),
+        None => format!("auto-detected (default: {})", auto.name()),
+    };
+
+    let availability = match resolved {
+        BuilderBackendChoice::Libkrun => {
+            if plat.has_libkrun() {
+                "libkrun available".to_string()
+            } else {
+                format!("libkrun NOT available ({})", mvm_libkrun::install_hint())
+            }
+        }
+        BuilderBackendChoice::Vz => {
+            if plat.has_vz() {
+                "Vz available".to_string()
+            } else {
+                "Vz NOT available (requires macOS 13+)".to_string()
+            }
+        }
+    };
+
+    Check {
+        name: "builder backend",
+        category: "platform",
+        ok: true,
+        info: format!("{} — {} — {}", resolved.name(), source, availability),
+    }
+}
+
+/// Stub when `builder-vm` feature is off (CLI built without the
+/// builder support — e.g. dependency-light packaging).
+#[cfg(not(feature = "builder-vm"))]
+fn builder_backend_check(_plat: Platform) -> Check {
+    Check {
+        name: "builder backend",
+        category: "platform",
+        ok: true,
+        info: "n/a (mvm-cli built without `builder-vm` feature)".to_string(),
     }
 }
 
@@ -2678,5 +2751,110 @@ mod tests {
         // `all_ok` over the filtered set is `true`.
         let all_ok_filtered = filtered.iter().all(|c| c.ok);
         assert!(all_ok_filtered);
+    }
+
+    // ── Plan 98 §0.3 — builder-backend check format on Linux ──
+    //
+    // The selection layer's `auto_detect_default()` queries the real
+    // host platform (not the `Platform` enum passed to the check). On
+    // Linux CI runners it always returns Libkrun. macOS contributor
+    // hosts get covered by the existing `vz_check_macos_reports_*`
+    // tests above; this Linux-only test pins the format of the new
+    // `builder backend` line so the doctor report stays readable for
+    // operators on the supported Linux path.
+    //
+    // The test serialises with itself by clearing `MVM_BUILDER_BACKEND`
+    // for the duration; other tests in this crate don't touch this
+    // env var so cross-test interference is bounded.
+    #[cfg(all(target_os = "linux", feature = "builder-vm"))]
+    #[test]
+    fn builder_backend_check_linux_reports_libkrun_auto_detected() {
+        // SAFETY: single-threaded test phase per crate; this env var
+        // isn't read elsewhere in this test binary.
+        let prev = std::env::var_os("MVM_BUILDER_BACKEND");
+        unsafe {
+            std::env::remove_var("MVM_BUILDER_BACKEND");
+        }
+
+        let c = builder_backend_check(Platform::LinuxNative);
+
+        // Restore before any assertion so a panic doesn't strand the
+        // env var.
+        unsafe {
+            if let Some(v) = prev {
+                std::env::set_var("MVM_BUILDER_BACKEND", v);
+            }
+        }
+
+        assert!(c.ok, "builder backend check must not fail informational");
+        assert_eq!(c.name, "builder backend");
+        assert_eq!(c.category, "platform");
+        // Format: `<backend> — <source> — <availability>`
+        assert!(
+            c.info.starts_with("libkrun — "),
+            "expected libkrun-resolved line; got: {}",
+            c.info
+        );
+        assert!(
+            c.info.contains("auto-detected"),
+            "expected `auto-detected` source label when env unset; got: {}",
+            c.info
+        );
+        assert!(
+            c.info.contains("libkrun available") || c.info.contains("libkrun NOT available"),
+            "expected per-VMM availability segment; got: {}",
+            c.info
+        );
+    }
+
+    #[cfg(all(target_os = "linux", feature = "builder-vm"))]
+    #[test]
+    fn builder_backend_check_linux_honors_env_override() {
+        let prev = std::env::var_os("MVM_BUILDER_BACKEND");
+        unsafe {
+            std::env::set_var("MVM_BUILDER_BACKEND", "vz");
+        }
+
+        let c = builder_backend_check(Platform::LinuxNative);
+
+        unsafe {
+            match prev {
+                Some(v) => std::env::set_var("MVM_BUILDER_BACKEND", v),
+                None => std::env::remove_var("MVM_BUILDER_BACKEND"),
+            }
+        }
+
+        assert!(c.ok);
+        // Env override flips the resolved backend even when
+        // `auto_detect_default()` would have picked libkrun.
+        assert!(
+            c.info.starts_with("vz — "),
+            "expected vz-resolved line under env override; got: {}",
+            c.info
+        );
+        assert!(
+            c.info.contains("override via"),
+            "expected `override via` source label; got: {}",
+            c.info
+        );
+        // On Linux Vz is never available; line must communicate that.
+        assert!(
+            c.info.contains("Vz NOT available"),
+            "expected `Vz NOT available` segment on Linux; got: {}",
+            c.info
+        );
+    }
+
+    #[cfg(not(feature = "builder-vm"))]
+    #[test]
+    fn builder_backend_check_stub_when_feature_off() {
+        let c = builder_backend_check(Platform::LinuxNative);
+        assert!(c.ok);
+        assert_eq!(c.name, "builder backend");
+        assert!(
+            c.info.contains("n/a"),
+            "stub should mention n/a; got: {}",
+            c.info
+        );
     }
 }

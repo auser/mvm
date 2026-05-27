@@ -36,6 +36,8 @@ plan 25 sequences the work into six independently-shippable workstreams.
 
 Recent maintenance:
 
+- [x] Fixed the Linux `passt` supervisor startup regression that was failing PR #460's `Test` lane: `mvm-libkrun::passt::spawn` no longer passes `--log-file` into private scratch dirs, and a regression test now asserts the generated passt argv omits that flag while preserving the pid-file path.
+- [x] Cleaned up Plan 98 Slice 2B after Slice 2A merged: the `mvmctl dev` Vz-routing change now rebases directly onto `main`, compiles in both `builder-vm` and `default-features = false` `mvm-cli` builds, removes the stale §2.C1 grace guard, and keeps `MVM_BUILDER_BACKEND=vz` / `--builder vz` selecting the Vz dev backend only when that backend is actually available.
 - [x] Enforced the Plan 45 local-volume encryption-at-rest boundary: `mvmctl volume create` now creates managed local volume directories only on encrypted backing storage, and `mvmctl volume mount` fails closed unless the resolved managed/ad-hoc host directory is backed by encrypted storage (encrypted macOS volume or Linux dm-crypt/LUKS chain), while mounted volumes remain normal plaintext filesystems inside the guest.
 - [x] Follow-up PR after the local-volume encryption gate: made encryption an mvm-owned per-volume property instead of only a host-backing precondition. `mvmctl volume create` now provisions a locked AES-256-GCM encrypted archive with wrapped per-volume key metadata, `volume unlock` is required before mount, `volume lock` reseals and removes plaintext, managed mounts refuse locked volumes, and security tests cover missing keys, tampered ciphertext, locked mount refusal, and clean unlock/lock round-trips.
 - [x] Added [`adrs/053-guest-protocol-versioning-and-readiness.md`](adrs/053-guest-protocol-versioning-and-readiness.md) and [`plans/84-banger-runtime-lessons.md`](plans/84-banger-runtime-lessons.md), a proposed follow-up workstream translating the useful parts of Banger's runtime design into mvm protocol versioning, readiness states, control/data-plane boundaries, backpressure reporting, explicit builder-mode policy, receipts, explainability, and first-use DX.
@@ -1888,6 +1890,25 @@ code (vsock CID 3 / ports 5252, 10000+, 20000+ remain unchanged).
       audit-chain hashing of snapshot files remain follow-ups (needs
       CLI verb + different supervisor startup mode).
 
+### Plan 98 — finishing slices  [`plans/98-vz-builder-vm.md`](plans/98-vz-builder-vm.md)
+
+Vz builder one-shot driver (Phase 97 Phase C) shipped env-var-only.
+Plan 98 closes the remaining gaps: auto-detect, `--builder` CLI flag,
+`mvmctl doctor` reporting, Vz **persistent** parity with libkrun's
+`mvmctl dev`, Install E2E on Vz, CI floor (`macos-latest` lane only —
+no macos-26 self-hosted runner required), and docs (CLAUDE.md +
+ADR-046 extension with security-claim-parity language). Plan 99 PR-1
+(#448) is the Stage 0 audit/cache contract this builds on.
+
+- [x] **Phase 1** — Selection user-surface (auto-detect + `--builder` flag + doctor + §0.x gap fixes). Shipped as [#455](https://github.com/tinylabscom/mvm/pull/455).
+- 🟡 **Phase 2** — Vz persistent driver + Install E2E + security parity. Decomposed into four slices for review-sized PRs:
+  - [x] **Slice 2A** — `VzPersistentBuilderVm` driver scaffold (§2.1-§2.3, §2.10, §2.C2). Shipped as [#460](https://github.com/tinylabscom/mvm/pull/460).
+  - [x] **Slice 2B** — `mvmctl dev` routes through Vz when builder backend resolves to Vz + remove §2.C1 grace guard + §2.S11 env-var regression test. Shipped as [#461](https://github.com/tinylabscom/mvm/pull/461). §2.5 cross-backend coexistence dispatch + §2.8 doctor running-VM indicator deferred to a small follow-up (the prefix isolation in Slice 2A is the foundation).
+  - 🟡 **Slice 2C** — Split into Slice 2C-ADRs (ADR text — [#465](https://github.com/tinylabscom/mvm/pull/465)) + the §2.S2-§2.S10 / §2.S13 security tests batch. ADR text shipped; security tests gated on macos-26 self-hosted hardware lane (§3.6) since they need real boots to validate.
+  - [x] **Slice 2D** — Hermetic source-grep guards on the §2.11 in-repo-flake invariant. Shipped as [#464](https://github.com/tinylabscom/mvm/pull/464). True-E2E "Vz boots the in-repo flake" needs macOS 13+ hardware and folds into §3.6.
+- [x] **Phase 3** — CI floor on `macos-latest` Vz construction smoke + Linux libkrun auto-detect assertion. Shipped as [#462](https://github.com/tinylabscom/mvm/pull/462). §3.6 (real `uv pip install` E2E under Vz on macos-26 self-hosted runner) stays deferred — gated on Plan 72 W4/W5 cutover same as the libkrun E2E Install round-trip.
+- 🟡 **Phase 4** — Docs: CLAUDE.md selection-policy section shipped as [#458](https://github.com/tinylabscom/mvm/pull/458) (§4.1); ADR-046 extension + ADR-056 cross-link shipped as [#465](https://github.com/tinylabscom/mvm/pull/465) (§4.2 + §4.2c partial). The remaining §4.2a (ADR-002 per-claim sub-notes), §4.2b (ADR-047 "Backend symmetry" sub-paragraph), and the ADR-055/041/057 one-line cross-references ship as a small prose follow-up. This SPRINT.md close-out is §4.3 itself.
+
 ### Cross-cutting
 
 - [ ] Build / distribution / versioning (Swift toolchain in CI,
@@ -1972,7 +1993,7 @@ See [Plan 101 W6–W10](plans/101-in-guest-volume-encryption-and-gateway-audit.m
 
 Wave breakdown:
 
-- W6 — gateway audit substrate: in flight via [Plan 102](plans/102-gateway-audit-substrate-impl.md) (staged W6.A substrate plumbing → W6.B real flow extraction).
+- W6 — gateway audit substrate: in flight via [Plan 102](plans/102-gateway-audit-substrate-impl.md) (design contract) + [Plan 103](plans/103-w6a-implementation-tracker.md) (W6.A implementation tracker). W6.A lands the no-bypass + observable + mediable substrate across all three backends (libkrun+passt, libkrun+gvproxy, Vz+gvproxy) as a 9-commit PR; W6.B real flow extraction follows.
 - W7 — `LocalAuditKind` flow event schema: shipped (PR #450).
 - W8 — sample-rate / 30s aggregation + `NetworkAuditConfig`: not started, depends on W6.
 - W9 — `mvmctl audit traffic` CLI surface: not started, depends on W6/W7.
@@ -1983,7 +2004,13 @@ Scope clarification: W6 covers **north-south** only (microVM ↔ internet throug
 Out of scope for this sprint:
 
 - East-west microVM ↔ microVM audit — proposed as a new wave (W11) needing a different capture mechanism (`tc mirred`, eBPF, or libpcap on the TAP). Not blocking W6.
-- Secret detection + egress obfuscation — proposed as the host-logging follow-up plan (number TBD) (separate plan + ADR). Requires L7 visibility (TLS MITM or cooperating in-guest hook); needs its own brainstorm before any code.
+- Secret detection + egress obfuscation — separate proposal track. Requires L7 visibility (TLS MITM or cooperating in-guest hook); needs its own brainstorm + ADR before any code.
+- Side-channel information leakage via flow timing — inherent to any flow audit; accepted in ADR-058 amendment landed via [Plan 103](plans/103-w6a-implementation-tracker.md).
+- Audit-metadata-at-rest encryption — the chain itself is plaintext on host disk under `~/.mvm/audit/<tenant>.jsonl`. Tenant *data* is encrypted (claim 10 leg 1); tenant *metadata* is not. Future claim 10.1 candidate; not this sprint.
+- Multi-user shared host with the same UID — same-UID local attacker can read the gateway subscriber socket; documented as accepted. Mode 0700 covers cross-UID; cross-UID-same-user is out of scope.
+- Per-byte content capture by default — coverage (every byte traverses the bridge) is structural; full pcap into the chain is opt-in for forensics (future `network_audit.mode = full_pcap`), not default. Aggregated `FlowBytes` lands in W8.
+- L7 URL inspection (path-level allowlist) — composes via `L7EgressProxy` Phase 2 (TLS MITM with workload-CA trust); substrate exists, finalization is a separate plan ([Plan 34 / ADR-006](adrs/006-name-constrained-egress-ca.md)).
+- DNS-over-HTTPS bypass mitigation — separate Plan 74 follow-up: mandatory-deny well-known DoH endpoints.
 
 ### W4 — Crypto attestability (claim 10 leg 3)  🟡 proposed
 
@@ -1999,11 +2026,14 @@ See [Plan 101 W11–W14](plans/101-in-guest-volume-encryption-and-gateway-audit.
 
 ### Non-goals (explicit)
 
-- TLS termination / L7 packet inspection.
+- TLS termination / L7 packet inspection in the gateway bridge (substrate composes via `L7EgressProxy` per [Plan 34 / ADR-006](adrs/006-name-constrained-egress-ca.md); not this sprint's work).
 - Host filesystem encryption (FDE is user's concern).
 - Hardware-backed key attestation (still future).
 - Reintroducing Lima (removed 2026-05-14; symmetric posture achieved via `mvm-libkrun` on both hosts).
-- Per-byte network audit (Plan 101 W8 aggregates).
+- Per-byte content capture by default — coverage is structural via the W6.A bridge ([Plan 103](plans/103-w6a-implementation-tracker.md)); capture is opt-in future mode.
+- Side-channel information leakage via flow timing (accepted in ADR-058 amendment).
+- Audit-metadata-at-rest encryption (future claim 10.1).
+- Cross-tenant network management (per-tenant gateway pool, egress quotas, tenant-level rollup) — mvmd cross-repo plan (`mvmd-network-manager`); flagged in [Plan 103](plans/103-w6a-implementation-tracker.md) `## Phase 6`, owned in mvmd.
 
 ## Sprint 57 — Host services broker over vsock — PROPOSED  [`plans/104-host-services-broker.md`](plans/104-host-services-broker.md) | `adrs/059-host-services-broker.md` (TBD)
 

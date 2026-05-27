@@ -64,6 +64,18 @@ path = "tests/bin/fake_runner.rs"
 test = false
 doctest = false
 
+# Test fixture for `entrypoint::execute` (plan 41 W2 / ADR-007). A real
+# ELF binary used in place of `#!/bin/sh` wrappers in the runner
+# integration tests so the production `/proc/self/fd/<n>` argv[0]
+# contract is exercised end-to-end on Linux. Behaviour is encoded in a
+# stdin header so `execute()`'s `env_clear()` + no-argv shape stays
+# identical to production. Not selected by the production guest closure.
+[[bin]]
+name = "mvm-entrypoint-test-wrapper"
+path = "tests/bin/entrypoint_test_wrapper.rs"
+test = false
+doctest = false
+
 [features]
 dev-shell = []
 

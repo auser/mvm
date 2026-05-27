@@ -38,12 +38,12 @@ use crate::builder_vm::{
     BuilderVmExitInfo, BuilderVmMount, BuilderVmRunConfig, VmBackendForBuilder,
 };
 use crate::builder_vm_runtime::{
-    acquire_nix_store_image_lock, builder_vm_timeout, finalize_flake_job, finalize_install_job,
-    stage_job_dir, supervisor_exit_error,
+    NixStoreImageLock, acquire_nix_store_image_lock, builder_vm_timeout, finalize_flake_job,
+    finalize_install_job, stage_job_dir, supervisor_exit_error,
 };
 use crate::libkrun_builder::{
-    BuilderVmImage, builder_vm_cache_dir, ensure_builder_vm_image, ensure_utf8_path, host_arch_tag,
-    unique_job_id,
+    BuilderVmImage, DISPATCH_SOCK_MARKER, builder_vm_cache_dir, ensure_builder_vm_image,
+    ensure_utf8_path, host_arch_tag, unique_job_id,
 };
 
 /// Standard kernel cmdline the Vz supervisor pairs with the builder
@@ -844,6 +844,455 @@ fn workspace_root_from_manifest_dir() -> Option<PathBuf> {
     Some(workspace_root.to_path_buf())
 }
 
+// ──────────────────────────────────────────────────────────────────
+// VzPersistentBuilderVm — Plan 98 Slice 2A.
+// ──────────────────────────────────────────────────────────────────
+//
+// Parallel of [`libkrun_builder::LibkrunPersistentBuilderVm`]. Same
+// dispatch-loop semantics (vsock-framed `BuilderRequest::Run` from the
+// host-side [`crate::persistent_builder::PersistentBuilderSupervisor`]
+// → in-guest `mvm-builder-init` runs cmd.sh / install_spec.json →
+// `BuilderResponse::Result` back over the same vsock), only the host
+// VMM differs. Locked decision §5 of Plan 98: keep the drivers
+// parallel rather than collapse them behind a trait — mirrors the
+// one-shot pattern shipped by Plan 97 Phase C.
+//
+// State-dir layout is shared with libkrun under
+// `~/.cache/mvm/builder-vm/vms/`, distinguished by name prefix
+// (`mvm-persistent-builder-vm-*` for libkrun, `mvm-persistent-builder-vz-*`
+// for Vz). The Stage 0 reaper is prefix-agnostic (Plan 99 PR-1) so
+// both backends participate in cleanup without code changes.
+
+/// Persistent-VM parallel of [`VzBuilderVm`]. Boots a long-lived
+/// builder guest and returns a handle pointing at the dispatch
+/// socket — used by `mvmctl dev up` to keep a warm-pool VM alive
+/// across multiple `mvmctl build` / `mvmctl up --prod` invocations.
+///
+/// The supervisor / vsock dispatch protocol is identical to libkrun's
+/// (Plan 89 W2 wire types; `crate::builder_protocol`); only the host
+/// VMM and supervisor binary differ.
+#[derive(Debug, Clone)]
+pub struct VzPersistentBuilderVm {
+    vcpus: u8,
+    memory_mib: u32,
+    nix_store_mib: u32,
+    image_override: Option<BuilderVmImage>,
+    supervisor_path_override: Option<PathBuf>,
+    /// Host directory bound at `/work` in the guest. Plan 89 §"Workspace
+    /// mount strategy" — bound at VM start, not per-dispatch.
+    workspace_root: PathBuf,
+}
+
+impl VzPersistentBuilderVm {
+    /// Construct a persistent Vz builder rooted at `workspace_root`.
+    /// Defaults match the one-shot [`VzBuilderVm`] (which itself
+    /// inherits libkrun's defaults) so resource ceilings stay
+    /// parallel across backends — see Plan 98 §2.10.
+    pub fn new(workspace_root: impl Into<PathBuf>) -> Self {
+        Self {
+            vcpus: VZ_BUILDER_DEFAULT_VCPUS,
+            memory_mib: VZ_BUILDER_DEFAULT_MEMORY_MIB,
+            nix_store_mib: VZ_BUILDER_DEFAULT_NIX_STORE_MIB,
+            image_override: None,
+            supervisor_path_override: None,
+            workspace_root: workspace_root.into(),
+        }
+    }
+
+    pub fn with_vcpus(mut self, vcpus: u8) -> Self {
+        self.vcpus = vcpus;
+        self
+    }
+
+    pub fn with_memory_mib(mut self, memory_mib: u32) -> Self {
+        self.memory_mib = memory_mib;
+        self
+    }
+
+    pub fn with_nix_store_mib(mut self, nix_store_mib: u32) -> Self {
+        self.nix_store_mib = nix_store_mib;
+        self
+    }
+
+    pub fn with_image_override(mut self, image: BuilderVmImage) -> Self {
+        self.image_override = Some(image);
+        self
+    }
+
+    pub fn with_supervisor_path_override(mut self, path: PathBuf) -> Self {
+        self.supervisor_path_override = Some(path);
+        self
+    }
+
+    pub fn workspace_root(&self) -> &Path {
+        &self.workspace_root
+    }
+
+    /// Spawn the `mvm-vz-supervisor` and Vz guest in the background.
+    /// Returns once the supervisor process is launched (the guest may
+    /// still be booting); the caller observes guest-side readiness
+    /// through the dispatch socket that
+    /// [`VzPersistentVmHandle::dispatch_socket_path`] points at.
+    ///
+    /// Layered like [`LibkrunPersistentBuilderVm::start`]:
+    /// pre-flight checks (Vz available, workspace dir exists,
+    /// supervisor binary resolvable) → image + nix-store lock
+    /// acquisition → state dir + job dir staging →
+    /// `mvm_vz::SupervisorConfig` build → `mvm-vz-supervisor` spawn.
+    /// The nix-store flock is held inside the returned handle for
+    /// the VM's lifetime so a concurrent `mvmctl up --prod` Install
+    /// dispatch on the same host can't corrupt the shared ext4
+    /// (Plan 89 §"Concurrent install gating").
+    pub fn start(&self) -> Result<VzPersistentVmHandle, BuilderVmError> {
+        if !mvm_core::platform::current().has_vz() {
+            return Err(BuilderVmError::ExtractionFailed(
+                "Apple Virtualization.framework is not available on this host. \
+                 Requires macOS 13 or later (Plan 97 §\"Minimum macOS version\")."
+                    .to_string(),
+            ));
+        }
+
+        if !self.workspace_root.is_dir() {
+            return Err(BuilderVmError::ExtractionFailed(format!(
+                "workspace_root {} is not a directory",
+                self.workspace_root.display()
+            )));
+        }
+
+        let supervisor_path = match &self.supervisor_path_override {
+            Some(p) => p.clone(),
+            None => resolve_vz_supervisor_path()?,
+        };
+
+        let image = match &self.image_override {
+            Some(image) => image.clone(),
+            None => ensure_builder_vm_image()?,
+        };
+        if let BuilderVmImage::RootDir { .. } = image {
+            return Err(BuilderVmError::ExtractionFailed(
+                "VzPersistentBuilderVm requires a Rootfs builder image; RootDir is libkrun-specific \
+                 (krun_set_root has no Vz analog)"
+                    .to_string(),
+            ));
+        }
+
+        // Acquire the cross-process flock on the nix-store image for
+        // the persistent VM's lifetime. Same key libkrun uses
+        // (`<cache>/nix-store-<arch>.img`) so a warm store survives
+        // across backend switches.
+        let nix_store_lock = acquire_nix_store_image_lock(
+            &builder_vm_cache_dir(),
+            host_arch_tag(),
+            u64::from(self.nix_store_mib),
+        )?;
+
+        let session_id = unique_job_id();
+        let job_dir = builder_vm_cache_dir().join("jobs").join(&session_id);
+        stage_persistent_vz_job_dir(&job_dir)?;
+
+        // §2.3: name-prefix isolation under the shared cache root.
+        // libkrun uses `mvm-persistent-builder-vm-{session}`; Vz uses
+        // `mvm-persistent-builder-vz-{session}`. The Stage 0 reaper
+        // (Plan 99 PR-1, `apple_container.rs:3292`) is prefix-agnostic
+        // so both participate in cleanup without code changes (§2.C2).
+        let vm_name = format!("mvm-persistent-builder-vz-{session_id}");
+        let vm_state_dir = builder_vm_cache_dir().join("vms").join(&vm_name);
+        std::fs::create_dir_all(&vm_state_dir).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "creating Vz persistent builder VM state dir {}: {e}",
+                vm_state_dir.display()
+            ))
+        })?;
+
+        let cfg = build_vz_persistent_supervisor_config(
+            &vm_name,
+            &vm_state_dir,
+            &image,
+            &self.workspace_root,
+            &job_dir,
+            nix_store_lock.path(),
+            self.vcpus,
+            self.memory_mib,
+        )?;
+
+        let child = spawn_vz_supervisor_in_background(&supervisor_path, &cfg)?;
+
+        Ok(VzPersistentVmHandle {
+            vm_state_dir,
+            job_dir,
+            session_id,
+            supervisor: Some(child),
+            _nix_store_lock: nix_store_lock,
+        })
+    }
+}
+
+/// Stage `<job_dir>/<DISPATCH_SOCK_MARKER>` so the in-guest
+/// `mvm-builder-init` enters the W3 part 3 dispatch loop instead of
+/// the single-shot cmd.sh / install_spec flow. The marker body is
+/// intentionally empty — its mere presence is the signal. Same shape
+/// libkrun's `stage_persistent_job_dir` uses (Plan 89 W3 part 2).
+fn stage_persistent_vz_job_dir(job_dir: &Path) -> Result<(), BuilderVmError> {
+    std::fs::create_dir_all(job_dir).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!(
+            "creating Vz persistent job dir {}: {e}",
+            job_dir.display()
+        ))
+    })?;
+    let marker_path = job_dir.join(DISPATCH_SOCK_MARKER);
+    std::fs::write(&marker_path, b"").map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!(
+            "staging Vz dispatch marker {}: {e}",
+            marker_path.display()
+        ))
+    })?;
+    Ok(())
+}
+
+/// Build a [`mvm_vz::SupervisorConfig`] for the persistent VM.
+/// Distinct from [`build_vz_supervisor_config`] because the
+/// persistent path doesn't come through the
+/// [`VmBackendForBuilder`] seam — `BuilderVmRunConfig` would force
+/// a one-shot mounts/disks shape that doesn't carry the dispatch
+/// port. Lifted out so unit tests can exercise the mapping without
+/// spawning a supervisor.
+#[allow(clippy::too_many_arguments)] // distinct lifetimes; refactor into a params struct is a follow-up
+fn build_vz_persistent_supervisor_config(
+    vm_name: &str,
+    vm_state_dir: &Path,
+    image: &BuilderVmImage,
+    workspace_root: &Path,
+    job_dir: &Path,
+    nix_store_img: &Path,
+    vcpus: u8,
+    memory_mib: u32,
+) -> Result<mvm_vz::SupervisorConfig, BuilderVmError> {
+    let BuilderVmImage::Rootfs {
+        kernel_path,
+        rootfs_path,
+        cmdline,
+    } = image
+    else {
+        return Err(BuilderVmError::ExtractionFailed(
+            "VzPersistentBuilderVm reached config-build with non-Rootfs image".to_string(),
+        ));
+    };
+
+    let kernel = path_to_string(kernel_path, "kernel_path")?;
+    let rootfs = path_to_string(rootfs_path, "rootfs_path")?;
+    let nix_store = path_to_string(nix_store_img, "nix_store_img")?;
+    let work = path_to_string(workspace_root, "workspace_root")?;
+    let job = path_to_string(job_dir, "job_dir")?;
+    let state_dir = path_to_string(vm_state_dir, "vm_state_dir")?;
+    let vsock_dir = vm_state_dir.join("vsock").to_string_lossy().into_owned();
+    let console_log = vm_state_dir
+        .join("console.log")
+        .to_string_lossy()
+        .into_owned();
+
+    let effective_cmdline = if cmdline.is_empty() {
+        DEFAULT_VZ_BUILDER_CMDLINE.to_string()
+    } else {
+        cmdline.clone()
+    };
+
+    Ok(mvm_vz::SupervisorConfig {
+        name: vm_name.to_string(),
+        vm_state_dir: state_dir,
+        pid_file_name: Some("builder.pid".to_string()),
+        kernel: mvm_vz::KernelConfig {
+            path: kernel,
+            cmdline: effective_cmdline,
+            initrd_path: None,
+        },
+        resources: mvm_vz::ResourceConfig {
+            cpu_count: u32::from(vcpus),
+            memory_mib: u64::from(memory_mib),
+        },
+        disks: vec![
+            mvm_vz::DiskConfig {
+                id: "rootfs".to_string(),
+                path: rootfs,
+                read_only: true,
+            },
+            // `/nix-store` rides as the second virtio-blk; the
+            // in-guest `mvm-builder-init` mounts it before invoking
+            // cmd.sh. Same layout libkrun uses.
+            mvm_vz::DiskConfig {
+                id: "nix-store".to_string(),
+                path: nix_store,
+                read_only: false,
+            },
+        ],
+        virtio_fs: vec![
+            // `/work` is the workspace bind. Bound at VM start (not
+            // per-dispatch) per Plan 89 §"Workspace mount strategy".
+            mvm_vz::VirtioFsShare {
+                tag: "work".to_string(),
+                host_path: work,
+                // Builder writes into the workspace under
+                // `result/` symlinks etc. Same RW posture libkrun
+                // exposes for the persistent path.
+                read_only: false,
+            },
+            // `/out` and `/job` both point at the per-VM job dir.
+            // The in-guest `mvm-builder-init` reads cmd.sh /
+            // install_spec.json from `/job`, writes artifacts to
+            // `/out`. Two shares (same host path) match libkrun's
+            // convention; the dispatch protocol assumes that
+            // shape.
+            mvm_vz::VirtioFsShare {
+                tag: "out".to_string(),
+                host_path: job.clone(),
+                read_only: false,
+            },
+            mvm_vz::VirtioFsShare {
+                tag: "job".to_string(),
+                host_path: job,
+                read_only: false,
+            },
+        ],
+        vsock: mvm_vz::VsockConfig {
+            ports: vec![mvm_guest::builder_agent::BUILDER_DISPATCH_PORT],
+            socket_dir: vsock_dir,
+        },
+        console_output_path: Some(console_log),
+        // Networking lands with Phase 2 Slice 2C (cross-backend
+        // Install parity test needs egress for `uv pip install`).
+        // For Slice 2A construction-only, no virtio-net.
+        network: None,
+        balloon: None,
+        control_socket_path: None,
+        startup_mode: mvm_vz::StartupMode::Boot,
+    })
+}
+
+/// Spawn `mvm-vz-supervisor` in the background with the
+/// `SupervisorConfig` JSON piped to its stdin. Same shape libkrun's
+/// `spawn_supervisor_in_background` uses for the persistent VM;
+/// returns the live `Child` so the caller can `wait()` or `kill()`.
+fn spawn_vz_supervisor_in_background(
+    supervisor_path: &Path,
+    cfg: &mvm_vz::SupervisorConfig,
+) -> Result<Child, BuilderVmError> {
+    let cfg_json = serde_json::to_string(cfg).map_err(|e| {
+        BuilderVmError::ExtractionFailed(format!("serialising Vz SupervisorConfig: {e}"))
+    })?;
+
+    let mut child = Command::new(supervisor_path)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::inherit())
+        .stderr(Stdio::inherit())
+        .spawn()
+        .map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "spawning mvm-vz-supervisor at {}: {e}",
+                supervisor_path.display()
+            ))
+        })?;
+
+    {
+        let stdin = child.stdin.as_mut().ok_or_else(|| {
+            BuilderVmError::ExtractionFailed(
+                "mvm-vz-supervisor child had no stdin handle".to_string(),
+            )
+        })?;
+        stdin.write_all(cfg_json.as_bytes()).map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!(
+                "writing SupervisorConfig JSON to mvm-vz-supervisor stdin: {e}"
+            ))
+        })?;
+    }
+    // Close stdin so the supervisor knows the config is complete.
+    drop(child.stdin.take());
+
+    Ok(child)
+}
+
+/// Handle to a live persistent Vz builder VM. Owns the supervisor
+/// `Child` for its lifetime; dropping without [`Self::wait_for_shutdown`]
+/// or [`Self::kill`] leaks the supervisor process. Same Drop posture
+/// as libkrun's `PersistentVmHandle` — callers always reach one of the
+/// two before dropping.
+#[derive(Debug)]
+pub struct VzPersistentVmHandle {
+    vm_state_dir: PathBuf,
+    job_dir: PathBuf,
+    session_id: String,
+    /// `None` after [`Self::wait_for_shutdown`] consumes it.
+    supervisor: Option<Child>,
+    /// Held to keep the cross-process flock on the shared nix-store
+    /// image alive for the VM's lifetime. Underscore-prefixed
+    /// because it's opaque to consumers — exists for its `Drop`
+    /// side-effect.
+    _nix_store_lock: NixStoreImageLock,
+}
+
+impl VzPersistentVmHandle {
+    /// Per-VM state directory under
+    /// `~/.cache/mvm/builder-vm/vms/mvm-persistent-builder-vz-<session>/`.
+    /// Hosts the vsock socket dir, console log, PID file.
+    pub fn vm_state_dir(&self) -> &Path {
+        &self.vm_state_dir
+    }
+
+    /// Host-side path of the Vz-supervisor-managed Unix socket that
+    /// proxies to AF_VSOCK
+    /// [`mvm_guest::builder_agent::BUILDER_DISPATCH_PORT`] inside the
+    /// guest. The W3 part 1 `PersistentBuilderSupervisor::new` takes
+    /// this directly.
+    pub fn dispatch_socket_path(&self) -> PathBuf {
+        self.vm_state_dir.join("vsock").join(format!(
+            "vsock-{}.sock",
+            mvm_guest::builder_agent::BUILDER_DISPATCH_PORT
+        ))
+    }
+
+    /// Per-VM job directory bound at `/job` (and `/out`) inside the
+    /// guest. Hosts stage per-dispatch artifacts here before
+    /// sending the matching `BuilderRequest::Run`.
+    pub fn job_dir(&self) -> &Path {
+        &self.job_dir
+    }
+
+    /// Opaque session identifier — useful for logging /
+    /// observability. Stable for the VM's lifetime.
+    pub fn session_id(&self) -> &str {
+        &self.session_id
+    }
+
+    /// Block until the supervisor child exits. Normal way to reach
+    /// this is the supervisor receiving `BuilderRequest::Shutdown`,
+    /// the guest dispatch loop processing it + replying `Bye`, then
+    /// `mvm-builder-init` calling `reboot(RB_POWER_OFF)`, then the
+    /// Vz supervisor exiting `main`. Consumes the child; subsequent
+    /// calls return [`BuilderVmError::ExtractionFailed`].
+    pub fn wait_for_shutdown(mut self) -> Result<i32, BuilderVmError> {
+        let mut child = self.supervisor.take().ok_or_else(|| {
+            BuilderVmError::ExtractionFailed(
+                "VzPersistentVmHandle::wait_for_shutdown called twice".to_string(),
+            )
+        })?;
+        let status = child.wait().map_err(|e| {
+            BuilderVmError::ExtractionFailed(format!("waiting on Vz persistent supervisor: {e}"))
+        })?;
+        Ok(status.code().unwrap_or(-1))
+    }
+
+    /// Forcibly terminate the supervisor child (SIGKILL via
+    /// `Child::kill`). The VM goes down hard; in-flight builds are
+    /// abandoned. Use only as a fallback after
+    /// [`Self::wait_for_shutdown`] hangs.
+    pub fn kill(&mut self) -> std::io::Result<()> {
+        if let Some(child) = self.supervisor.as_mut() {
+            child.kill()?;
+            let _ = child.wait();
+            self.supervisor = None;
+        }
+        Ok(())
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1259,5 +1708,221 @@ mod tests {
                 .expect_err("non-UTF-8 path must reject");
             assert!(format!("{err}").contains("not valid UTF-8"), "got: {err}");
         }
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // VzPersistentBuilderVm — Plan 98 Slice 2A.
+    // ──────────────────────────────────────────────────────────────
+
+    fn persistent_workspace() -> tempfile::TempDir {
+        tempfile::tempdir().expect("tempdir for persistent workspace")
+    }
+
+    #[test]
+    fn vz_persistent_defaults_match_vz_one_shot_constants() {
+        let scratch = persistent_workspace();
+        let vm = VzPersistentBuilderVm::new(scratch.path());
+        assert_eq!(vm.vcpus, VZ_BUILDER_DEFAULT_VCPUS);
+        assert_eq!(vm.memory_mib, VZ_BUILDER_DEFAULT_MEMORY_MIB);
+        assert_eq!(vm.nix_store_mib, VZ_BUILDER_DEFAULT_NIX_STORE_MIB);
+        assert!(vm.image_override.is_none());
+        assert!(vm.supervisor_path_override.is_none());
+        assert_eq!(vm.workspace_root(), scratch.path());
+    }
+
+    #[test]
+    fn vz_persistent_builder_methods_chain() {
+        let scratch = persistent_workspace();
+        let vm = VzPersistentBuilderVm::new(scratch.path())
+            .with_vcpus(2)
+            .with_memory_mib(2048)
+            .with_nix_store_mib(8192)
+            .with_supervisor_path_override(PathBuf::from("/tmp/supervisor"));
+        assert_eq!(vm.vcpus, 2);
+        assert_eq!(vm.memory_mib, 2048);
+        assert_eq!(vm.nix_store_mib, 8192);
+        assert_eq!(
+            vm.supervisor_path_override.as_deref(),
+            Some(Path::new("/tmp/supervisor"))
+        );
+    }
+
+    #[test]
+    fn stage_persistent_vz_job_dir_writes_dispatch_marker() {
+        let scratch = tempfile::tempdir().unwrap();
+        let job_dir = scratch.path().join("job-xyz");
+        stage_persistent_vz_job_dir(&job_dir).expect("staging succeeds");
+        assert!(job_dir.is_dir(), "job dir created");
+        let marker = job_dir.join(DISPATCH_SOCK_MARKER);
+        assert!(marker.is_file(), "dispatch marker file exists");
+        let body = std::fs::read(&marker).unwrap();
+        assert!(
+            body.is_empty(),
+            "marker body is intentionally empty — its existence is the signal"
+        );
+    }
+
+    #[test]
+    fn build_vz_persistent_supervisor_config_rejects_root_dir_image() {
+        let scratch = tempfile::tempdir().unwrap();
+        let vm_state_dir = scratch
+            .path()
+            .join("vms")
+            .join("mvm-persistent-builder-vz-abc");
+        let workspace = scratch.path().join("work");
+        let job_dir = scratch.path().join("job");
+        let nix_store = scratch.path().join("nix-store.img");
+        let err = build_vz_persistent_supervisor_config(
+            "mvm-persistent-builder-vz-abc",
+            &vm_state_dir,
+            &rundir_image(),
+            &workspace,
+            &job_dir,
+            &nix_store,
+            VZ_BUILDER_DEFAULT_VCPUS,
+            VZ_BUILDER_DEFAULT_MEMORY_MIB,
+        )
+        .expect_err("non-Rootfs image must reject");
+        assert!(format!("{err}").contains("non-Rootfs image"), "got: {err}");
+    }
+
+    #[test]
+    fn build_vz_persistent_supervisor_config_assembles_expected_shape() {
+        let scratch = tempfile::tempdir().unwrap();
+        let vm_name = "mvm-persistent-builder-vz-test";
+        let vm_state_dir = scratch.path().join("vms").join(vm_name);
+        let workspace = scratch.path().join("work");
+        let job_dir = scratch.path().join("job");
+        let nix_store = scratch.path().join("nix-store.img");
+        let cfg = build_vz_persistent_supervisor_config(
+            vm_name,
+            &vm_state_dir,
+            &rootfs_image(),
+            &workspace,
+            &job_dir,
+            &nix_store,
+            4,
+            8192,
+        )
+        .expect("config builds");
+
+        assert_eq!(cfg.name, vm_name);
+        assert_eq!(cfg.pid_file_name.as_deref(), Some("builder.pid"));
+        assert_eq!(cfg.resources.cpu_count, 4);
+        assert_eq!(cfg.resources.memory_mib, 8192);
+
+        // Two disks: rootfs RO + nix-store RW.
+        assert_eq!(cfg.disks.len(), 2);
+        assert_eq!(cfg.disks[0].id, "rootfs");
+        assert!(cfg.disks[0].read_only);
+        assert_eq!(cfg.disks[1].id, "nix-store");
+        assert!(!cfg.disks[1].read_only);
+
+        // Three virtio-fs shares: work (RW), out (RW), job (RW) —
+        // matches the libkrun convention the dispatch protocol
+        // assumes.
+        let tags: Vec<&str> = cfg.virtio_fs.iter().map(|m| m.tag.as_str()).collect();
+        assert_eq!(tags, vec!["work", "out", "job"]);
+        assert!(cfg.virtio_fs.iter().all(|m| !m.read_only));
+
+        // Vsock carries the dispatch port; socket dir lives under
+        // the per-VM state directory.
+        assert_eq!(
+            cfg.vsock.ports,
+            vec![mvm_guest::builder_agent::BUILDER_DISPATCH_PORT]
+        );
+        assert!(cfg.vsock.socket_dir.ends_with("vsock"));
+
+        // Network is None for Slice 2A — Slice 2C wires gvproxy.
+        assert!(cfg.network.is_none());
+        // Boot startup; persistent Vz doesn't restore from a saved
+        // snapshot (that's Phase E territory).
+        assert!(matches!(cfg.startup_mode, mvm_vz::StartupMode::Boot));
+    }
+
+    #[test]
+    fn build_vz_persistent_supervisor_config_falls_back_to_default_cmdline_when_image_cmdline_empty()
+     {
+        let scratch = tempfile::tempdir().unwrap();
+        let image = BuilderVmImage::Rootfs {
+            kernel_path: PathBuf::from("/tmp/vmlinux"),
+            rootfs_path: PathBuf::from("/tmp/rootfs.ext4"),
+            cmdline: String::new(),
+        };
+        let cfg = build_vz_persistent_supervisor_config(
+            "vm",
+            &scratch.path().join("state"),
+            &image,
+            &scratch.path().join("work"),
+            &scratch.path().join("job"),
+            &scratch.path().join("nix-store.img"),
+            2,
+            1024,
+        )
+        .expect("config builds");
+        assert_eq!(cfg.kernel.cmdline, DEFAULT_VZ_BUILDER_CMDLINE);
+    }
+
+    #[test]
+    fn build_vz_persistent_supervisor_config_console_path_under_state_dir() {
+        let scratch = tempfile::tempdir().unwrap();
+        let vm_state_dir = scratch
+            .path()
+            .join("vms")
+            .join("mvm-persistent-builder-vz-abc");
+        let cfg = build_vz_persistent_supervisor_config(
+            "mvm-persistent-builder-vz-abc",
+            &vm_state_dir,
+            &rootfs_image(),
+            &scratch.path().join("work"),
+            &scratch.path().join("job"),
+            &scratch.path().join("nix-store.img"),
+            2,
+            1024,
+        )
+        .expect("config builds");
+        let console = cfg.console_output_path.expect("console path set");
+        assert!(
+            console.starts_with(vm_state_dir.to_string_lossy().as_ref()),
+            "console must live under vm_state_dir; got {console}"
+        );
+        assert!(console.ends_with("console.log"));
+    }
+
+    #[test]
+    fn vz_persistent_supervisor_config_vsock_socket_dir_matches_handle_dispatch_path_shape() {
+        // The `VzPersistentVmHandle::dispatch_socket_path()` method
+        // and `build_vz_persistent_supervisor_config()`'s
+        // `vsock.socket_dir` must agree on layout — the supervisor
+        // creates sockets under `socket_dir`, the host-side dispatcher
+        // dials `dispatch_socket_path()`. A divergence here means a
+        // hung `mvmctl dev shell` in production. Assert the shape
+        // matches without constructing a fake handle (NixStoreImageLock
+        // has no public test constructor and a real lock acquires a
+        // file lock we don't want in unit tests).
+        let scratch = tempfile::tempdir().unwrap();
+        let vm_state_dir = scratch
+            .path()
+            .join("vms")
+            .join("mvm-persistent-builder-vz-test");
+        let cfg = build_vz_persistent_supervisor_config(
+            "mvm-persistent-builder-vz-test",
+            &vm_state_dir,
+            &rootfs_image(),
+            &scratch.path().join("work"),
+            &scratch.path().join("job"),
+            &scratch.path().join("nix-store.img"),
+            2,
+            1024,
+        )
+        .expect("config builds");
+        let socket_dir = std::path::Path::new(&cfg.vsock.socket_dir);
+        // The handle joins `vsock-<port>.sock` onto this dir; both
+        // sides agree the supervisor places sockets here.
+        assert_eq!(
+            socket_dir,
+            vm_state_dir.join("vsock"),
+            "vsock socket_dir must equal <vm_state_dir>/vsock for handle.dispatch_socket_path() to find the socket"
+        );
     }
 }

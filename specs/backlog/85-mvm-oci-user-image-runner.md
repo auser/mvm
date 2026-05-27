@@ -1,8 +1,19 @@
 # Plan 85 — mvm-oci as user-facing image-runner primitive
 
-> Status: proposed
+> Status: Shipped (2026-05-26)
 > Owner: TBD
 > Started: 2026-05-16
+> Completed: 2026-05-26 — Phases A.1–A.6, B, C, D, E, F, G all merged;
+> claim 10 added to CLAUDE.md §"Security model"; six named CI lanes
+> (`oci-layer-unpack-adversarial`, `oci-digest-mismatch-reject`,
+> `oci-malformed-manifest`, `oci-mutable-tag-prod-reject`,
+> `oci-reproducibility`, `oci-image-runner-smoke`) added to
+> `.github/workflows/ci.yml` alongside the pre-existing
+> `oci-layer-unpack-fuzz` lane. The full pull → unpack → materialize
+> → boot round-trip against `docker.io/library/alpine:3.20@sha256:...`
+> additionally requires libkrun/KVM, which github-hosted runners
+> cannot provide (no nested KVM); the boot half stays under the
+> self-hosted Vz/libkrun lanes.
 > Supersedes: Plan 75 (retired by commit `b02a5e8` on 2026-05-14, which deleted `specs/plans/75-oci-stage0-microsandbox-removal.md` and ADR-049 along with the broader microsandbox cleanup). Plan 85 keeps Plan 75's security envelope but **drops the Stage 0 entanglement** — Plan 77's vendored-seed path is the active Stage 0 design and Plan 85 does not propose to replace it.
 > Depends on: `mvm-oci` W1.1 + W1.2 (manifest fetch, digest verification, layer fetch w/ size cap + bounded retry) — already on `main`. Plan 72 (libkrun builder VM). Plan 77 (Stage 0 via vendored seed).
 > Does not supersede / does not change: Plan 77's vendored-seed Stage 0 path (CLAUDE.md "Source-checkout builds never depend on mvm-published artifacts" invariant stays load-bearing). ADR-046's two acquisition paths (source vs installed binary) stay intact.

@@ -122,6 +122,21 @@ critical findings.
 > the workload's audit chain. A tampered volume — content, SBOM,
 > fetch log, CVE result, or manifest — fails admission closed.
 
+### Backend symmetry (Plan 98)
+
+The Install pipeline above is backend-agnostic on the host side and
+entirely guest-side internal. The blanket `InstallDriver` impl over
+any `BuilderVm` (`crates/mvm-build/src/app_deps.rs:304-321`) means
+the same sealed volume — same `content/`, `sbom.cdx.json`,
+`fetch.log`, `cve.json`, hash-chained `meta.json` — flows out of
+both libkrun-driven and Vz-driven Install jobs. Cross-backend
+parity is enforced by Plan 98 §2.S2 (sealed volume content
+byte-equivalence on the same Install input) + §2.S10 (`meta.json`
+hash-chain backend-neutrality — identical content yields identical
+volume_hash regardless of which VMM booted the builder). Full
+backend-parity discussion lives in **ADR-046 §"Vz as a second
+builder backend (Plan 98)" → "Security claim parity"**.
+
 ## Status of the implementation
 
 | Component | State |

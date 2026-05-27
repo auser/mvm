@@ -423,6 +423,30 @@ pub fn execute(
         };
     }
 
+    // On Linux `spawn_path` references the validation fd by number via
+    // `/proc/self/fd/<n>`. `install_fd3_in_child` plants the
+    // control-channel pipe write end at fd 3 with `dup2(write_raw, 3)`
+    // in the post-fork pre-exec hook, which closes whatever sat at fd
+    // 3. If the validation fd is at fd 3 the dup2 silently destroys it
+    // and the kernel sees a pipe write end at /proc/self/fd/3, which
+    // it refuses with EACCES. Dup the validation fd above fd 3 first
+    // so the two channels can't collide. The guard keeps the dup
+    // alive across `cmd.spawn()` so the child inherits it.
+    #[cfg(target_os = "linux")]
+    let _spawn_fd_guard = match dup_above_fd3(&entrypoint.file) {
+        Ok(fd) => fd,
+        Err(e) => {
+            return CallOutcome::SpawnFailed {
+                message: format!("dup entrypoint fd above 3: {e}"),
+            };
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let program = {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", _spawn_fd_guard.as_raw_fd()))
+    };
+    #[cfg(not(target_os = "linux"))]
     let program = spawn_path(entrypoint);
 
     // RLIMIT_CORE=0 in the parent: child inherits, so a wrapper crash
@@ -652,6 +676,30 @@ pub(crate) fn set_no_core_dumps() {
     }
 }
 
+/// Duplicate `original`'s raw fd onto the lowest available fd >= 4.
+/// The returned `OwnedFd` must outlive `Command::spawn` so the child
+/// inherits the dup and the kernel can resolve
+/// `/proc/self/fd/<n>` against it at execve time.
+///
+/// `execute` uses this to hold the validation fd above the
+/// control-channel slot at fd 3 — see the comment in `execute` for
+/// the EACCES failure mode this avoids.
+#[cfg(target_os = "linux")]
+fn dup_above_fd3(original: &std::fs::File) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let raw = original.as_raw_fd();
+    // F_DUPFD_CLOEXEC: dup to lowest fd >= 4, with CLOEXEC set on the
+    // new fd. CLOEXEC is fine here: the kernel reads the ELF from
+    // this fd during the same `execve` syscall, before CLOEXEC fires.
+    // SAFETY: fcntl is async-signal-safe; arguments are validated.
+    let new_raw = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 4) };
+    if new_raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a positive raw fd; we own it.
+    Ok(unsafe { OwnedFd::from_raw_fd(new_raw) })
+}
+
 /// Resolve the path the parent passes to `Command::new`.
 ///
 /// On Linux, `/proc/self/fd/<n>` referencing the held-open validation
@@ -659,6 +707,11 @@ pub(crate) fn set_no_core_dumps() {
 /// platforms (macOS dev/test), fall back to the canonicalized path —
 /// production guests are always Linux so the fallback is for unit
 /// tests only.
+///
+/// Note: `execute` does its own `dup_above_fd3` rather than calling
+/// this directly, because the control-channel pipe at fd 3 collides
+/// with a validation fd at fd 3. `worker_pool::spawn_worker` does not
+/// install a fd-3 channel and so uses this function unchanged.
 pub(crate) fn spawn_path(entrypoint: &ValidatedEntrypoint) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
@@ -1034,307 +1087,5 @@ mod tests {
         assert_eq!(p.required_mode, 0o755);
         assert_eq!(p.required_uid, 0);
         assert_eq!(p.required_gid, 0);
-    }
-
-    // -------------------------------------------------------------------
-    // Runner tests — drive `execute` against shell scripts in a temp dir.
-    // These exercise the per-call lifecycle (spawn, drain, poll, kill)
-    // without any of the production policy constraints.
-    // -------------------------------------------------------------------
-
-    fn make_wrapper_script(content: &str) -> (tempfile::TempDir, ValidatedEntrypoint) {
-        let tmp = tempfile::tempdir().expect("tempdir");
-        let script = tmp.path().join("wrapper.sh");
-        let mut f = std::fs::File::create(&script).unwrap();
-        write!(f, "{}", content).unwrap();
-        let mut perms = std::fs::metadata(&script).unwrap().permissions();
-        perms.set_mode(0o755);
-        std::fs::set_permissions(&script, perms).unwrap();
-        let resolved = std::fs::canonicalize(&script).unwrap();
-        let file = std::fs::File::open(&resolved).unwrap();
-        let validated = ValidatedEntrypoint { resolved, file };
-        (tmp, validated)
-    }
-
-    fn caps_with_timeout(stdout_max: usize, stderr_max: usize) -> CallCaps {
-        CallCaps {
-            stdin_max: 1024 * 1024,
-            stdout_max,
-            stderr_max,
-            fd3_max: 1024 * 1024,
-            kill_grace_period: Duration::from_millis(500),
-            poll_interval: Duration::from_millis(20),
-        }
-    }
-
-    #[test]
-    fn test_execute_zero_exit_captures_stdout_stderr() {
-        let (tmp, entry) =
-            make_wrapper_script("#!/bin/sh\necho hello-out\necho hello-err 1>&2\nexit 0\n");
-        let outcome = execute(
-            &entry,
-            tmp.path(),
-            b"",
-            Duration::from_secs(5),
-            caps_with_timeout(1024, 1024),
-        );
-        match outcome {
-            CallOutcome::Exited {
-                code,
-                stdout,
-                stderr,
-                ..
-            } => {
-                assert_eq!(code, 0);
-                assert_eq!(stdout, b"hello-out\n");
-                assert_eq!(stderr, b"hello-err\n");
-            }
-            other => panic!("expected Exited(0), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_execute_nonzero_exit_preserved() {
-        let (tmp, entry) = make_wrapper_script("#!/bin/sh\nexit 7\n");
-        let outcome = execute(
-            &entry,
-            tmp.path(),
-            b"",
-            Duration::from_secs(5),
-            caps_with_timeout(1024, 1024),
-        );
-        match outcome {
-            CallOutcome::Exited { code, .. } => assert_eq!(code, 7),
-            other => panic!("expected Exited(7), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_execute_stdin_piped_to_wrapper() {
-        let (tmp, entry) = make_wrapper_script("#!/bin/sh\ncat\n");
-        let outcome = execute(
-            &entry,
-            tmp.path(),
-            b"echo this back",
-            Duration::from_secs(5),
-            caps_with_timeout(1024, 1024),
-        );
-        match outcome {
-            CallOutcome::Exited { code, stdout, .. } => {
-                assert_eq!(code, 0);
-                assert_eq!(stdout, b"echo this back");
-            }
-            other => panic!("expected Exited(0) with echoed stdin, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_execute_captures_fd3_control_record() {
-        // Wrapper writes one framed record to fd 3 — header `{"kind":"ok"}`
-        // (13 bytes) + empty payload — then exits 0. Asserts the record
-        // arrives back as a `ControlRecord` and is independent of stderr.
-        let script = "#!/bin/sh\n\
-                      printf '\\015\\0\\0\\0' >&3\n\
-                      printf '{\"kind\":\"ok\"}' >&3\n\
-                      printf '\\0\\0\\0\\0' >&3\n\
-                      echo hello-stderr 1>&2\n\
-                      exit 0\n";
-        let (tmp, entry) = make_wrapper_script(script);
-        let outcome = execute(
-            &entry,
-            tmp.path(),
-            b"",
-            Duration::from_secs(5),
-            caps_with_timeout(1024, 1024),
-        );
-        match outcome {
-            CallOutcome::Exited {
-                code,
-                stderr,
-                controls,
-                ..
-            } => {
-                assert_eq!(code, 0);
-                // stderr is unchanged user output (no envelope mixed in).
-                assert_eq!(stderr, b"hello-stderr\n");
-                assert_eq!(controls.len(), 1, "expected one control record");
-                assert_eq!(controls[0].header_json, "{\"kind\":\"ok\"}");
-                assert!(controls[0].payload.is_empty());
-            }
-            other => panic!("expected Exited(0) with control record, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_execute_fd3_emits_no_records_when_wrapper_silent() {
-        // Wrapper that doesn't touch fd 3 should produce zero control
-        // records — the drain reads to EOF and returns an empty Vec.
-        let (tmp, entry) = make_wrapper_script("#!/bin/sh\necho hi\nexit 0\n");
-        let outcome = execute(
-            &entry,
-            tmp.path(),
-            b"",
-            Duration::from_secs(5),
-            caps_with_timeout(1024, 1024),
-        );
-        match outcome {
-            CallOutcome::Exited { controls, .. } => {
-                assert!(
-                    controls.is_empty(),
-                    "expected zero control records, got {controls:?}"
-                );
-            }
-            other => panic!("expected Exited, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_execute_fd3_partial_frame_at_eof_is_dropped() {
-        // Wrapper writes a 4-byte length prefix then exits before
-        // emitting the rest of the header. Drain should see the
-        // partial frame, fail to read the body, and return zero
-        // records (rather than crashing or returning garbage).
-        let script = "#!/bin/sh\n\
-                      printf '\\012\\0\\0\\0' >&3\n\
-                      exit 0\n";
-        let (tmp, entry) = make_wrapper_script(script);
-        let outcome = execute(
-            &entry,
-            tmp.path(),
-            b"",
-            Duration::from_secs(5),
-            caps_with_timeout(1024, 1024),
-        );
-        match outcome {
-            CallOutcome::Exited { controls, .. } => assert!(controls.is_empty()),
-            other => panic!("expected Exited, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_execute_fd3_oversized_header_is_refused() {
-        // Wrapper writes a length prefix > 64 KiB. Drain should refuse
-        // and stop reading; subsequent valid frames are dropped too
-        // (because the corruption invalidates the stream offset).
-        let script = "#!/bin/sh\n\
-                      printf '\\0\\0\\002\\0' >&3\n\
-                      exit 0\n";
-        let (tmp, entry) = make_wrapper_script(script);
-        let outcome = execute(
-            &entry,
-            tmp.path(),
-            b"",
-            Duration::from_secs(5),
-            caps_with_timeout(1024, 1024),
-        );
-        match outcome {
-            CallOutcome::Exited { controls, .. } => assert!(controls.is_empty()),
-            other => panic!("expected Exited, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_execute_timeout_kills_wrapper() {
-        let (tmp, entry) = make_wrapper_script("#!/bin/sh\nsleep 10\n");
-        let started = Instant::now();
-        let outcome = execute(
-            &entry,
-            tmp.path(),
-            b"",
-            Duration::from_millis(200),
-            caps_with_timeout(1024, 1024),
-        );
-        let elapsed = started.elapsed();
-        match outcome {
-            CallOutcome::Timeout { .. } => {
-                // Bound: 200 ms timeout + 500 ms grace + slack. If it
-                // takes longer than 5 s the test is broken, not slow.
-                assert!(elapsed < Duration::from_secs(5), "timeout took {elapsed:?}");
-            }
-            other => panic!("expected Timeout, got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_execute_stdin_cap_rejects_before_spawn() {
-        // No script needed — the cap check runs before spawn. A
-        // missing-script ValidatedEntrypoint would fail the spawn,
-        // but we shouldn't even get there.
-        let (tmp, entry) = make_wrapper_script("#!/bin/sh\nexit 0\n");
-        let mut huge = Vec::with_capacity(2048);
-        huge.resize(2048, b'A');
-        let mut caps = caps_with_timeout(1024, 1024);
-        caps.stdin_max = 1024;
-        let outcome = execute(&entry, tmp.path(), &huge, Duration::from_secs(5), caps);
-        match outcome {
-            CallOutcome::PayloadCap {
-                stream: PayloadCapStream::Stdin,
-                stdout,
-                stderr,
-                ..
-            } => {
-                assert!(stdout.is_empty());
-                assert!(stderr.is_empty());
-            }
-            other => panic!("expected PayloadCap(Stdin), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_execute_stdout_cap_kills_wrapper() {
-        // Wrapper produces unbounded output; stdout_max is 1 KiB.
-        // Drain thread sets the breach flag; poll loop kills the
-        // wrapper. `exec yes` replaces the shell with `yes` so the
-        // pid we kill is the actual producer, not a forwarding shell.
-        let (tmp, entry) = make_wrapper_script("#!/bin/sh\nexec yes A\n");
-        let mut caps = caps_with_timeout(1024, 1024);
-        caps.poll_interval = Duration::from_millis(10);
-        let started = Instant::now();
-        let outcome = execute(&entry, tmp.path(), b"", Duration::from_secs(10), caps);
-        let elapsed = started.elapsed();
-        match outcome {
-            CallOutcome::PayloadCap {
-                stream: PayloadCapStream::Stdout,
-                stdout,
-                ..
-            } => {
-                assert_eq!(stdout.len(), 1024, "stdout truncated to cap");
-                assert!(elapsed < Duration::from_secs(2), "kill took {elapsed:?}");
-            }
-            other => panic!("expected PayloadCap(Stdout), got {other:?}"),
-        }
-    }
-
-    #[test]
-    fn test_execute_spawn_failed_when_program_missing() {
-        let tmp = tempfile::tempdir().unwrap();
-        let bogus = tmp.path().join("does-not-exist");
-        // Create a *file* so File::open succeeds during construction
-        // of ValidatedEntrypoint, then delete it so spawn fails.
-        std::fs::File::create(&bogus).unwrap();
-        let resolved = std::fs::canonicalize(&bogus).unwrap();
-        let file = std::fs::File::open(&resolved).unwrap();
-        std::fs::remove_file(&resolved).unwrap();
-        let entry = ValidatedEntrypoint { resolved, file };
-        let outcome = execute(
-            &entry,
-            tmp.path(),
-            b"",
-            Duration::from_secs(5),
-            caps_with_timeout(1024, 1024),
-        );
-        // Linux uses /proc/self/fd/<n> which still resolves through
-        // the held fd even after the path is unlinked, so spawn may
-        // succeed and then immediately fail with ENOEXEC. macOS uses
-        // the resolved path, which is gone, so spawn fails outright.
-        // Either way we expect spawn-failed or a non-success outcome.
-        match outcome {
-            CallOutcome::SpawnFailed { .. } => {}
-            CallOutcome::Exited { code, .. } if code != 0 => {}
-            CallOutcome::WrapperCrashed { .. } => {}
-            other => {
-                panic!("expected SpawnFailed / nonzero Exited / WrapperCrashed, got {other:?}")
-            }
-        }
     }
 }

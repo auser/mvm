@@ -123,6 +123,8 @@ Three event types today:
 
 Audit emission failures `tracing::warn` and continue — a flaky audit fs cannot block a VM that already booted. W6's follow-up tightens this to "audit failure fails the boot" once the chain is reliably reachable on every supported host.
 
+**Backend symmetry (Plan 98).** The `labels.backend` field accepts either `libkrun` or `vz` (and `firecracker` on Linux) — the chain itself is hypervisor-agnostic. `mvmctl up --prod` driven by `MVM_BUILDER_BACKEND=vz` emits the same `plan.admitted` / `plan.launched` / `plan.failed` sequence as the libkrun path, and `mvmctl audit verify` round-trips cleanly across both. Plan 98 §2.S3 ships the cross-backend audit-chain integrity test.
+
 ### Operator-facing surface
 
 - `mvmctl up` (existing, instrumented): every invocation admits + audits. `--no-supervisor` is a one-release escape hatch that prints a deprecation warning and skips both.

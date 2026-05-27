@@ -23,12 +23,33 @@ brew install slp/krun/libkrun slp/krun/libkrunfw slp/krun/gvproxy
 
 - `libkrun` — the in-process VMM. `mvm-libkrun-supervisor` links against it.
 - `libkrunfw` — bundles the TSI-patched Linux kernel libkrun's guests boot. Plan 86 / Plan 72 W5.D bullet 10 — `mvm-libkrun::extract_bundled_kernel()` pulls the kernel out of the dylib's `.rodata` at runtime.
-- `gvproxy` — userspace virtio-net gateway. Plan 88 / ADR-055 §"Cross-platform backends" — passt is Linux-only, so macOS dispatches to gvproxy via libkrun's `krun_add_net_unixgram` path. `MVM_NETWORKING` unset → per-OS default (macOS=gvproxy, Linux=passt); `=tsi` opts back to libkrun's experimental no-network-stack mode for debugging.
+- `gvproxy` — userspace virtio-net gateway. Plan 88 / ADR-055 §"Cross-platform backends" — passt is Linux-only, so macOS dispatches to gvproxy via libkrun's `krun_add_net_unixgram` path. `MVM_NETWORKING` unset → per-OS default (macOS=gvproxy, Linux=passt); only `passt` and `gvproxy` are accepted. Plan 102 W6.A removed the `tsi` mode (TSI bypassed virtio-net entirely, violating the claim-10 no-bypass invariant — see ADR-058).
 
 On Linux contributor hosts swap `gvproxy` for `passt` from the distro
 package manager (or build passt from source — see ADR-055 references).
 
 `mvmctl doctor` probes the right gateway per OS and emits install hints when missing.
+
+**macOS 26+ Apple Silicon** users can skip the `slp/krun/*` Homebrew trio when running with the Vz builder backend (the auto-detect default on that tier — see "Builder backend selection" below). Apple Virtualization.framework ships with the OS and needs no separate library install. The Homebrew trio is still required if you explicitly opt back into libkrun via `--builder libkrun` or `MVM_BUILDER_BACKEND=libkrun`.
+
+## Builder backend selection (Plan 98)
+
+The builder VM (the Linux guest that runs `nix build` inside `mvmctl build` / `mvmctl up` / `mvmctl dev`) picks between two host VMMs:
+
+- **libkrun** — third-party in-process VMM via the Homebrew trio above. Default on Linux + macOS 13-25. Works everywhere mvm runs.
+- **Vz** — Apple Virtualization.framework. Default on macOS 26+ Apple Silicon (mirrors the Apple Container runtime tier). macOS-only.
+
+Selection priority (highest first):
+
+1. `--builder <libkrun|vz>` global CLI flag.
+2. `MVM_BUILDER_BACKEND=libkrun|vz` env var (case-insensitive, whitespace-trimmed; unrecognised values log a warning and fall through to auto-detect).
+3. Auto-detect: macOS 26+ Apple Silicon → Vz; everywhere else → libkrun.
+
+`mvmctl doctor` reports the resolved choice on the `builder backend` line with format `<backend> — <source> — <availability>` so the override path is observable.
+
+Vz on macOS 13-25 is opt-in only via the flag/env override — auto-detect won't pick it because the deployment baseline is macOS 26+. The two backends produce byte-identical `BuilderArtifacts` (kernel + rootfs from the same `nix/images/builder-vm/` flake), so switching backends mid-development is supported.
+
+Persistent builder state dirs live under `~/.cache/mvm/builder-vm/vms/`, distinguished by name prefix (`mvm-persistent-builder-vm-*` for libkrun, `mvm-persistent-builder-vz-*` for Vz). The Stage 0 reaper (Plan 99 PR-1) is prefix-agnostic so both backends participate in `mvmctl cache prune` without code changes.
 
 ## Architecture
 
@@ -104,14 +125,16 @@ The `RuntimeBuildEnv` in mvm implements only `ShellEnvironment`. The full `Build
 
 ## Security model
 
-mvm makes nine CI-enforced security claims. Each one is backed by a
+mvm makes ten CI-enforced security claims. Each one is backed by a
 test or a workflow gate; ADR-002 (`specs/adrs/002-microvm-security-posture.md`)
 describes the threat model and `specs/plans/25-microvm-hardening.md`
 sequences the implementation. Claim 8 was added by plan 64
 (`specs/plans/64-supervisor-wiring.md`) — see ADR-041
 (`specs/adrs/041-signed-audited-execution-plans.md`). Claim 9 was added
 by Plan 73 Followup D (CI gate) — see ADR-047
-(`specs/adrs/047-app-deps-audit-pipeline.md`). (ADR-002's full claim
+(`specs/adrs/047-app-deps-audit-pipeline.md`). Claim 10 was added by
+Plan 85 Phase E + F (the user-facing OCI image runner) — see
+`specs/claims/claim-10-oci-image-provenance.md`. (ADR-002's full claim
 table also names two additional cross-cutting claims for signed bundles
 and default-deny network policy; those are tracked there because they
 post-date the CLAUDE.md per-claim summary below.)
@@ -192,6 +215,37 @@ post-date the CLAUDE.md per-claim summary below.)
    cloud-hypervisor builder VM) is still gated on Plan 72 W4/W5
    cutover; the CI lane exercises every code path that doesn't
    require a working microVM backend.
+10. **Every `mvmctl run --image <oci-ref>` admission records the OCI
+    image provenance in the chain-signed audit log.** Plan 85 Phase E
+    + F wire the user-facing OCI image runner to the same audit chain
+    that backs claim 8 — see `specs/claims/claim-10-oci-image-provenance.md`.
+    `mvmctl image pull` materializes the layer set in `mvm-oci`'s
+    allow-listed unpacker (`mvm_oci::unpack::unpack_layer`), formats an
+    ext4 rootfs in the builder VM (`mvm_build::oci_to_rootfs::
+    materialize_to_ext4`, never on the macOS host — ADR-050), and
+    persists provenance metadata (registry host, repo, supplied
+    reference, resolved manifest digest, layer digest list, trust
+    policy, cosign verdict). `mvmctl run --image` admits an
+    `ExecutionPlan` (claim 8 path) and then emits a
+    `plan.oci_provenance` entry via
+    `AuditEmitter::emit_oci_provenance`
+    (`crates/mvm-cli/src/commands/vm/audit_chain.rs`) carrying those
+    labels; `mvm_supervisor::verify_audit_chain` continues to detect
+    drift, surfaced via `mvmctl audit verify`. `--prod` refuses
+    mutable references before any network fetch
+    (`crates/mvm-cli/src/commands/image.rs::
+    prod_pull_requires_digest_pin_before_network` and
+    `prod_run_image_requires_digest_pin_before_network`), demands an
+    explicit registry policy, and requires cosign verification of the
+    resolved digest before cache admission or boot. The OCI
+    `unpack_layer` fuzz harness lives in
+    `.github/workflows/security.yml`'s `fuzz` job (release-tag pushes
+    + nightly cron + manual dispatch); the
+    `oci-layer-unpack-adversarial`, `oci-digest-mismatch-reject`,
+    `oci-malformed-manifest`, `oci-mutable-tag-prod-reject`,
+    `oci-reproducibility`, and `oci-image-runner-smoke` lanes in
+    `.github/workflows/ci.yml` gate every PR that touches the OCI
+    surface.
 
 The guest agent itself runs as uid 901 under setpriv (W4.5); the
 host-side vsock proxy socket is mode 0700 (W1.2), the proxy port

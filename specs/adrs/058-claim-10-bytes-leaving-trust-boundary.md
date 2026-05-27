@@ -44,6 +44,56 @@ gvproxy (macOS) and passt (Linux) are wrapped with a control-socket listener tha
 
 No L7 inspection. No TLS termination. Only connection metadata and byte counts.
 
+#### W6.A amendment (2026-05-26 — [Plan 102](../plans/102-gateway-audit-substrate-impl.md) / [Plan 103](../plans/103-w6a-implementation-tracker.md))
+
+**No-bypass invariant.** TSI mode is removed entirely
+(`NetworkingPreference::Tsi` deleted; `MVM_NETWORKING=tsi` rejected
+with a clear warning + per-OS fallback). Every libkrun-backed VM
+boots through `passt` (Linux) or `gvproxy` (macOS); every Vz-backed
+VM boots through `gvproxy` via `VZFileHandleNetworkDeviceAttachment`.
+No env-var, JSON-config field, or fallback lets a workload skip the
+auditable bridge. `mvmctl doctor` flips the gateway probe from
+`ok: true` (with a TSI escape note) to `ok: false` when the
+gateway binary is missing — there is no escape hatch left.
+
+**Coverage vs. capture.** W6.A commits to **coverage** — every byte
+that crosses the trust boundary traverses an auditable bridge.
+**Capture** (per-byte content into the chain) is opt-in via a future
+`network_audit.mode = full_pcap` field, not the default. Aggregated
+`FlowBytes` counters land in W8; full pcap is a forensic-only mode.
+
+**Mediable substrate.** The bridge exposes a `FlowPolicy` hook
+([`mvm_supervisor::gateway_bridge::FlowPolicy`]). W6.A ships the
+`AllowAll` default; Plan 74's enforcer plugs in later for L4
+decisions, and a future SNI inspector + Plan 34 Phase 2 (TLS MITM
+in `L7EgressProxy` with workload-CA trust) plug in for hostname /
+URL allowlist semantics — all without re-architecting the
+bridge. The forward-compat seam is `FlowDecisionCtx`'s optional
+`sni_hostname` / `url_path` fields.
+
+**Cross-process chain integrity.** `FileAuditSigner::sign_and_emit`
+now takes an `flock(LOCK_EX)` on the tenant chain file across the
+read-cursor / sign / append critical section. Without this, two
+`mvm-libkrun-supervisor` processes for the same tenant could both
+restore the same `prev_hash` and break `verify_audit_chain`. The
+flock is the precursor that made claim-10 per-VM emission safe.
+
+**Scope (W6 impl):** gateway egress only — **north-south** through
+passt/gvproxy. East-west microVM ↔ microVM lateral flows traverse
+the tenant bridge below the gateway and are out of W6 scope;
+deferred to W11 as a distinct capture plane. The same substrate
+covers all three backends (libkrun+passt, libkrun+gvproxy,
+Vz+gvproxy) through a single per-VM `signer_task`.
+
+**Cross-tenant isolation invariant.** The W6.A substrate
+introduces no cross-tenant coupling: per-VM gateway, per-tenant
+chain file (flock-serialized within tenant only), per-VM mpsc /
+broadcast (no shared queues), per-VM subscriber socket. The mvmd
+cross-repo `mvmd-network-manager` plan (`tinylabscom/mvmd/specs/plans/50-network-manager.md`)
+covers cross-tenant network management (per-tenant gateway pool,
+egress quotas, tenant-level audit rollup, cross-tenant traffic
+isolation) — out of mvm's scope by design.
+
 ### Leg 3 — Crypto state attestability
 
 Every key fingerprint, key rotation, and key-unwrap-failure event lands in the audit chain. `mvmctl audit verify` covers volume-key events alongside flow events alongside the existing plan events. A new CI lane `claim-10-audit-tamper` exercises tamper detection: emit a known sequence, byte-flip one entry, assert `mvmctl audit verify` exits non-zero.
@@ -51,8 +101,18 @@ Every key fingerprint, key rotation, and key-unwrap-failure event lands in the a
 ## Out of scope (named, like ADR-002)
 
 - **Host filesystem encryption (FDE).** That's the user's concern — full-disk encryption protects host backups; this ADR protects per-volume at-rest exposure during active workload runs.
-- **Per-byte traffic audit.** Aggregated `flow_bytes` only ([Plan 101](../plans/101-in-guest-volume-encryption-and-gateway-audit.md) W8).
+- **Per-byte traffic audit.** Aggregated `flow_bytes` only ([Plan 101](../plans/101-in-guest-volume-encryption-and-gateway-audit.md) W8); coverage of every byte through the bridge is structural (W6.A amendment above), capture is opt-in future mode.
 - **Audit metadata at rest.** The chain itself (5-tuples, byte counts, key fingerprints) is plaintext on host disk under `~/.mvm/audit/<tenant>.jsonl`. Tenant *data* is encrypted; tenant *behavior metadata* is not. Future claim 10.1 candidate; not in this sprint.
+
+### Added by W6.A amendment
+
+- **East-west microVM ↔ microVM lateral flows.** Different capture mechanism (`tc mirred` / eBPF / per-TAP libpcap), different policy surface. W11 candidate; named here so readers don't expect it from W6.
+- **L7 URL inspection (path-level allowlist).** Composes via `L7EgressProxy` Phase 2 (TLS MITM with workload-trusted host CA per [ADR-006](006-name-constrained-egress-ca.md)); substrate exists, not yet finalized. Separate plan from W6.
+- **DNS-over-HTTPS bypass mitigation.** Workloads using DoH (e.g., 1.1.1.1:443) hide queries inside encrypted HTTPS to a public resolver, evading admission-time DNS pinning. Separate Plan 74 follow-up: mandatory-deny well-known DoH endpoints.
+- **SNI hostname allowlist.** Cleartext SNI extraction from TLS ClientHello → `FlowPolicy::evaluate` with `sni_hostname` populated. Substrate seam exists in W6.A's `FlowDecisionCtx`; inspector implementation is a separate plan.
+- **Side-channel information leakage via flow timing.** Inherent to any flow audit; accepted.
+- **Multi-user shared host with same UID.** Same-UID local attacker can read the gateway subscriber socket. Mode 0700 mitigates cross-UID; cross-UID-same-user is documented as accepted (they can already read the chain file directly).
+- **Cross-tenant network management.** Per-tenant gateway pool, egress quotas, tenant-level rollup, cross-tenant traffic isolation — owned by mvmd via [`mvmd-network-manager`](https://github.com/tinylabscom/mvmd/blob/main/specs/plans/50-network-manager.md).
 
 ## Consequences
 
