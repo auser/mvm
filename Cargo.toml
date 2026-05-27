@@ -50,6 +50,14 @@ members = [
     # plan 60 Phase 5 Slice C — in-guest entrypoint runner for
     # function-call workloads, ported from mvmforge-runtime.
     "crates/mvm-runner",
+    # Plan 104 W1a — host services broker subprocess (one of four:
+    # mvm-broker, mvm-secrets-dispatcher, mvm-host-signer,
+    # mvm-audit-signer). W1a ships the dispatch-loop skeleton + UDS
+    # listener + config envelope for the general broker subprocess
+    # only; the other three plus the supervisor lifecycle / cosign-verify
+    # / cgroup setup / seccomp etc. land in W1b. ADR-061 / Plan 104
+    # §"Host-side: four-subprocess architecture".
+    "crates/mvm-broker",
     "xtask",
 ]
 # cargo-fuzz crates have to be excluded from the main workspace because
