@@ -2154,9 +2154,20 @@ Two structural gaps in the current trust story:
 1. Linux host's userland is in the TCB; macOS host's isn't (asymmetric trust). The same `mvmctl` should give the same claim posture on both. See [ADR-057](adrs/057-symmetric-builder-vm.md).
 2. RW tenant volumes are plaintext while mounted; gateway traffic is unaudited. A compromised host can read tenant data and exfil silently — both invisible to the audit chain. Plan 63 / ADR-042 cover host-side snapshot crypto + secret store, but not the in-use mount surface. See [ADR-058](adrs/058-claim-10-bytes-leaving-trust-boundary.md).
 
-### W1 — Symmetric builder VM  🟡 proposed
+### W1 — Symmetric builder VM  🟡 in flight  [`plans/105-plan-100-w1-linux-builder-vm.md`](plans/105-plan-100-w1-linux-builder-vm.md)
 
 See [Plan 100](plans/100-symmetric-builder-vm-rollout.md). Lifts claim 1 ("no host-fs access from a guest") to true-on-both-OSes via identical builder-VM TCB. Retires the direct-Firecracker-on-Linux path.
+
+Plan 100 W1 — implementation tracker (Plan 105). First slice: env-gated `MVM_LINUX_BUILDER_VM=1` dispatch + `has_nested_kvm()` predicate + `mvmctl doctor` `nested-kvm` line. Opt-in only; default unchanged. The default flip + direct-Firecracker retirement is W6.
+
+- [ ] **W0** — feasibility prototype (off-branch, throw-away): measure cold-start latency on a Linux + nested-KVM host. Numbers feed into the W1 PR body.
+- [ ] **W1** — `MVM_LINUX_BUILDER_VM` env-gate in `crates/mvm-build/src/builder_backend_select.rs` + `Platform::has_nested_kvm()` predicate + 5 hermetic unit tests. ~80 lines including tests.
+- [ ] **W3-doctor** — `mvmctl doctor` reports nested-KVM availability + extends the Plan 98 `builder backend` line with the `MVM_LINUX_BUILDER_VM` source. Small standalone PR after W1.
+- [ ] **W2** (deferred) — Linux Nix image build validation. Separate PR after W1 lands.
+- [ ] **W4** (deferred) — Nested-KVM CI lane in `ci.yml`. Pairs with W2.
+- [ ] **W5** (deferred) — Persistent-builder variant on Linux (mirrors Plan 98 Slice 2A's `VzPersistentBuilderVm` shape with libkrun-on-Linux backing).
+- [ ] **W6** (deferred) — Retire direct-Firecracker code path. Gated on W4 CI proof + Plan 101 Leg 1 (volume encryption) so the trust uplift lands at flip-time.
+- [ ] **W7/W8** (deferred) — ADR-001 update + ADR-002 Claim 1 rewording. Prose follow-ups.
 
 ### W2 — Volume confidentiality (claim 10 leg 1)  🟡 proposed
 
