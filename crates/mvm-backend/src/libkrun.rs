@@ -125,6 +125,16 @@ impl VmBackend for LibkrunBackend {
             krun,
             vm_state_dir: state_dir.to_string_lossy().into_owned(),
             pid_file_name: None,
+            // Plan 102 W6.A commit 6: audit-substrate fields. Set to
+            // None for now — backend orchestrator population
+            // (sourcing tenant_id from ExecutionPlan, gateway sockets
+            // from mvm_data_dir()) lands alongside the
+            // run_supervisor_with_bridge wire-up (commit 6.5 / 7).
+            tenant_id: None,
+            audit_dir: None,
+            gateway_audit_socket: None,
+            gateway_events_socket: None,
+            signing_key_path: None,
         };
         let pid_file = cfg.pid_file();
         // Remove any stale PID file from a previous crashed supervisor

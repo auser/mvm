@@ -1992,7 +1992,7 @@ See [Plan 101 W6–W10](plans/101-in-guest-volume-encryption-and-gateway-audit.m
 
 Wave breakdown:
 
-- W6 — gateway audit substrate: in flight via [Plan 102](plans/102-gateway-audit-substrate-impl.md) (staged W6.A substrate plumbing → W6.B real flow extraction).
+- W6 — gateway audit substrate: in flight via [Plan 102](plans/102-gateway-audit-substrate-impl.md) (design contract) + [Plan 103](plans/103-w6a-implementation-tracker.md) (W6.A implementation tracker). W6.A lands the no-bypass + observable + mediable substrate across all three backends (libkrun+passt, libkrun+gvproxy, Vz+gvproxy) as a 9-commit PR; W6.B real flow extraction follows.
 - W7 — `LocalAuditKind` flow event schema: shipped (PR #450).
 - W8 — sample-rate / 30s aggregation + `NetworkAuditConfig`: not started, depends on W6.
 - W9 — `mvmctl audit traffic` CLI surface: not started, depends on W6/W7.
@@ -2003,7 +2003,13 @@ Scope clarification: W6 covers **north-south** only (microVM ↔ internet throug
 Out of scope for this sprint:
 
 - East-west microVM ↔ microVM audit — proposed as a new wave (W11) needing a different capture mechanism (`tc mirred`, eBPF, or libpcap on the TAP). Not blocking W6.
-- Secret detection + egress obfuscation — proposed as Plan 103 (separate plan + ADR). Requires L7 visibility (TLS MITM or cooperating in-guest hook); needs its own brainstorm before any code.
+- Secret detection + egress obfuscation — separate proposal track. Requires L7 visibility (TLS MITM or cooperating in-guest hook); needs its own brainstorm + ADR before any code.
+- Side-channel information leakage via flow timing — inherent to any flow audit; accepted in ADR-058 amendment landed via [Plan 103](plans/103-w6a-implementation-tracker.md).
+- Audit-metadata-at-rest encryption — the chain itself is plaintext on host disk under `~/.mvm/audit/<tenant>.jsonl`. Tenant *data* is encrypted (claim 10 leg 1); tenant *metadata* is not. Future claim 10.1 candidate; not this sprint.
+- Multi-user shared host with the same UID — same-UID local attacker can read the gateway subscriber socket; documented as accepted. Mode 0700 covers cross-UID; cross-UID-same-user is out of scope.
+- Per-byte content capture by default — coverage (every byte traverses the bridge) is structural; full pcap into the chain is opt-in for forensics (future `network_audit.mode = full_pcap`), not default. Aggregated `FlowBytes` lands in W8.
+- L7 URL inspection (path-level allowlist) — composes via `L7EgressProxy` Phase 2 (TLS MITM with workload-CA trust); substrate exists, finalization is a separate plan ([Plan 34 / ADR-006](adrs/006-name-constrained-egress-ca.md)).
+- DNS-over-HTTPS bypass mitigation — separate Plan 74 follow-up: mandatory-deny well-known DoH endpoints.
 
 ### W4 — Crypto attestability (claim 10 leg 3)  🟡 proposed
 
@@ -2019,11 +2025,14 @@ See [Plan 101 W11–W14](plans/101-in-guest-volume-encryption-and-gateway-audit.
 
 ### Non-goals (explicit)
 
-- TLS termination / L7 packet inspection.
+- TLS termination / L7 packet inspection in the gateway bridge (substrate composes via `L7EgressProxy` per [Plan 34 / ADR-006](adrs/006-name-constrained-egress-ca.md); not this sprint's work).
 - Host filesystem encryption (FDE is user's concern).
 - Hardware-backed key attestation (still future).
 - Reintroducing Lima (removed 2026-05-14; symmetric posture achieved via `mvm-libkrun` on both hosts).
-- Per-byte network audit (Plan 101 W8 aggregates).
+- Per-byte content capture by default — coverage is structural via the W6.A bridge ([Plan 103](plans/103-w6a-implementation-tracker.md)); capture is opt-in future mode.
+- Side-channel information leakage via flow timing (accepted in ADR-058 amendment).
+- Audit-metadata-at-rest encryption (future claim 10.1).
+- Cross-tenant network management (per-tenant gateway pool, egress quotas, tenant-level rollup) — mvmd cross-repo plan (`mvmd-network-manager`); flagged in [Plan 103](plans/103-w6a-implementation-tracker.md) `## Phase 6`, owned in mvmd.
 
 ## Completed Sprints
 

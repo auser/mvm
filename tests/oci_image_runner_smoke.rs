@@ -207,6 +207,11 @@ fn boot_with_libkrun(
         krun,
         vm_state_dir: state_dir.to_string_lossy().into_owned(),
         pid_file_name: Some("oci-smoke.pid".to_string()),
+        tenant_id: None,
+        audit_dir: None,
+        gateway_audit_socket: None,
+        gateway_events_socket: None,
+        signing_key_path: None,
     };
     let json = serde_json::to_string(&cfg).expect("serialize supervisor config");
 

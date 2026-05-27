@@ -44,6 +44,17 @@ pub mod destination;
 pub mod egress;
 pub mod event_bus;
 pub mod firewall;
+// Plan 102 W6.A commit 4 — per-VM gateway flow-event subscriber sink.
+// Lives next to `event_bus` and `firewall` as a peer fan-out
+// substrate; the bridge in commit 5 emits each FlowEvent through
+// here in parallel with the signer mpsc.
+pub mod gateway_audit;
+// Plan 102 W6.A commit 5 — per-VM gateway audit bridge. Splices
+// guest virtio-net <-> host gateway (passt / gvproxy / Vz ingest),
+// emits FlowOpened/FlowClosed through a per-VM signer_task into the
+// claim-8 chain, broadcasts NDJSON to gateway_audit subscribers,
+// and exposes a `FlowPolicy` hook for Plan 74 / SNI / L7 inspectors.
+pub mod gateway_bridge;
 #[cfg(feature = "custom-dns")]
 pub mod hickory_dns;
 pub mod injection_guard;

@@ -85,6 +85,115 @@ impl AuditEntry {
             labels,
         }
     }
+
+    /// Construct a chain entry for a `FlowOpened` event ([Plan 102
+    /// W6.A](../../specs/plans/103-w6a-implementation-tracker.md) /
+    /// [ADR-058](../../specs/adrs/058-claim-10-bytes-leaving-trust-boundary.md)
+    /// claim 10 leg 2). The gateway bridge calls this on the first
+    /// byte per direction of a new flow.
+    pub fn flow_opened(
+        plan: &ExecutionPlan,
+        bundle: Option<&PolicyBundle>,
+        flow_id: &str,
+        direction: FlowDirection,
+    ) -> Self {
+        Self::for_plan(
+            plan,
+            bundle,
+            FLOW_OPENED_EVENT,
+            [
+                ("flow_id".to_string(), flow_id.to_string()),
+                ("direction".to_string(), direction.as_str().to_string()),
+            ],
+        )
+    }
+
+    /// Construct a chain entry for a `FlowClosed` event. Pairs with
+    /// [`Self::flow_opened`] on the same `flow_id`. `reason` carries
+    /// the close discriminator (EOF / bridge fault / policy drop /
+    /// shutdown).
+    pub fn flow_closed(
+        plan: &ExecutionPlan,
+        bundle: Option<&PolicyBundle>,
+        flow_id: &str,
+        direction: FlowDirection,
+        reason: FlowCloseReason,
+    ) -> Self {
+        Self::for_plan(
+            plan,
+            bundle,
+            FLOW_CLOSED_EVENT,
+            [
+                ("flow_id".to_string(), flow_id.to_string()),
+                ("direction".to_string(), direction.as_str().to_string()),
+                ("reason".to_string(), reason.as_str().to_string()),
+            ],
+        )
+    }
+}
+
+/// Canonical `event` string for a `FlowOpened` chain entry. Pinned
+/// so downstream parsers (mvmd tenant audit rollup, `mvmctl audit
+/// traffic`) can filter on a stable literal.
+pub const FLOW_OPENED_EVENT: &str = "gateway.flow_opened";
+
+/// Canonical `event` string for a `FlowClosed` chain entry.
+pub const FLOW_CLOSED_EVENT: &str = "gateway.flow_closed";
+
+/// Per-direction flow label for [`AuditEntry::flow_opened`] /
+/// [`AuditEntry::flow_closed`]. Egress = guest → internet,
+/// Ingress = internet → guest. North-south only — east-west
+/// microVM ↔ microVM lateral flows are out of W6 scope
+/// ([ADR-058](../../specs/adrs/058-claim-10-bytes-leaving-trust-boundary.md)
+/// out-of-scope list, deferred to W11).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowDirection {
+    Egress,
+    Ingress,
+}
+
+impl FlowDirection {
+    /// Stable wire string for label values. Matches the
+    /// `#[serde(rename_all = "snake_case")]` derive output;
+    /// pinned so downstream parsers don't drift.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FlowDirection::Egress => "egress",
+            FlowDirection::Ingress => "ingress",
+        }
+    }
+}
+
+/// Close discriminator for [`AuditEntry::flow_closed`]. Plan 102
+/// W6.A commit 3.
+///
+/// `Eof` is the steady-state happy path (TCP FIN, UDP timeout,
+/// DGRAM peer closed). `BridgeError` covers bridge-task panic
+/// catch / I/O error / drop guard. `PolicyDropped` is the
+/// `FlowPolicy` hook returning `FlowAction::Drop` — substrate
+/// for Plan 74 enforcement to plug in. `Shutdown` covers graceful
+/// supervisor teardown (Vz Swift bridge cancellation, libkrun
+/// `exit()`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum FlowCloseReason {
+    Eof,
+    BridgeError,
+    PolicyDropped,
+    Shutdown,
+}
+
+impl FlowCloseReason {
+    /// Stable wire string for label values.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            FlowCloseReason::Eof => "eof",
+            FlowCloseReason::BridgeError => "bridge_error",
+            FlowCloseReason::PolicyDropped => "policy_dropped",
+            FlowCloseReason::Shutdown => "shutdown",
+        }
+    }
 }
 
 #[derive(Debug, Error)]
@@ -302,6 +411,133 @@ mod tests {
             [("workflow".to_string(), "override".to_string())],
         );
         assert_eq!(entry.labels.get("workflow"), Some(&"override".to_string()));
+    }
+
+    // -----------------------------------------------------------------
+    // Plan 102 W6.A commit 3 — gateway flow event types + helpers.
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn flow_direction_wire_strings_pinned() {
+        // Downstream parsers (mvmd tenant audit rollup, mvmctl audit
+        // traffic) filter on these literals; a rename here would
+        // silently break them. Both serde and `as_str` must agree.
+        assert_eq!(FlowDirection::Egress.as_str(), "egress");
+        assert_eq!(FlowDirection::Ingress.as_str(), "ingress");
+        assert_eq!(
+            serde_json::to_string(&FlowDirection::Egress).unwrap(),
+            "\"egress\""
+        );
+        assert_eq!(
+            serde_json::to_string(&FlowDirection::Ingress).unwrap(),
+            "\"ingress\""
+        );
+    }
+
+    #[test]
+    fn flow_close_reason_wire_strings_pinned() {
+        // Same contract as flow_direction. Four reasons cover the
+        // close discriminators the bridge can emit in W6.A:
+        // Eof (steady-state), BridgeError (drop guard), PolicyDropped
+        // (FlowPolicy hook returns Drop), Shutdown (graceful teardown).
+        let cases = [
+            (FlowCloseReason::Eof, "eof"),
+            (FlowCloseReason::BridgeError, "bridge_error"),
+            (FlowCloseReason::PolicyDropped, "policy_dropped"),
+            (FlowCloseReason::Shutdown, "shutdown"),
+        ];
+        for (variant, expected) in cases {
+            assert_eq!(variant.as_str(), expected);
+            assert_eq!(
+                serde_json::to_string(&variant).unwrap(),
+                format!("\"{expected}\"")
+            );
+        }
+    }
+
+    #[test]
+    fn flow_direction_serde_roundtrip() {
+        for variant in [FlowDirection::Egress, FlowDirection::Ingress] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let parsed: FlowDirection = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn flow_close_reason_serde_roundtrip() {
+        for variant in [
+            FlowCloseReason::Eof,
+            FlowCloseReason::BridgeError,
+            FlowCloseReason::PolicyDropped,
+            FlowCloseReason::Shutdown,
+        ] {
+            let json = serde_json::to_string(&variant).unwrap();
+            let parsed: FlowCloseReason = serde_json::from_str(&json).unwrap();
+            assert_eq!(parsed, variant);
+        }
+    }
+
+    #[test]
+    fn flow_opened_helper_carries_canonical_event_and_labels() {
+        let plan = sample_plan();
+        let entry = AuditEntry::flow_opened(&plan, None, "f00ba4", FlowDirection::Egress);
+
+        assert_eq!(entry.event, FLOW_OPENED_EVENT);
+        assert_eq!(entry.event, "gateway.flow_opened");
+        assert_eq!(entry.labels.get("flow_id"), Some(&"f00ba4".to_string()));
+        assert_eq!(entry.labels.get("direction"), Some(&"egress".to_string()));
+        // Plan binding still in place — same shape as for_plan().
+        assert_eq!(entry.plan_id, plan.plan_id);
+        assert_eq!(entry.tenant, plan.tenant);
+    }
+
+    #[test]
+    fn flow_closed_helper_carries_canonical_event_and_labels() {
+        let plan = sample_plan();
+        let entry = AuditEntry::flow_closed(
+            &plan,
+            None,
+            "f00ba4",
+            FlowDirection::Ingress,
+            FlowCloseReason::Eof,
+        );
+
+        assert_eq!(entry.event, FLOW_CLOSED_EVENT);
+        assert_eq!(entry.event, "gateway.flow_closed");
+        assert_eq!(entry.labels.get("flow_id"), Some(&"f00ba4".to_string()));
+        assert_eq!(entry.labels.get("direction"), Some(&"ingress".to_string()));
+        assert_eq!(entry.labels.get("reason"), Some(&"eof".to_string()));
+    }
+
+    #[test]
+    fn flow_helpers_inherit_plan_audit_labels() {
+        // The bridge runs alongside the plan; the chain must carry
+        // the plan's audit_labels so a forensics pass can answer
+        // "what workload was this flow attributed to?" without
+        // dereferencing plan_id separately.
+        let plan = sample_plan(); // sample_plan adds workflow=etl-1.
+        let entry = AuditEntry::flow_opened(&plan, None, "f1", FlowDirection::Egress);
+        assert_eq!(entry.labels.get("workflow"), Some(&"etl-1".to_string()));
+    }
+
+    #[test]
+    fn flow_closed_reason_variants_distinguishable_on_wire() {
+        // The four reasons MUST serialize differently — collapsing
+        // any two would prevent downstream tooling from distinguishing
+        // a steady-state close from a policy drop or a bridge fault.
+        let plan = sample_plan();
+        let mut emitted = std::collections::BTreeSet::new();
+        for reason in [
+            FlowCloseReason::Eof,
+            FlowCloseReason::BridgeError,
+            FlowCloseReason::PolicyDropped,
+            FlowCloseReason::Shutdown,
+        ] {
+            let entry = AuditEntry::flow_closed(&plan, None, "f1", FlowDirection::Egress, reason);
+            emitted.insert(entry.labels.get("reason").cloned().unwrap());
+        }
+        assert_eq!(emitted.len(), 4, "all four reasons must be distinguishable");
     }
 
     #[test]
