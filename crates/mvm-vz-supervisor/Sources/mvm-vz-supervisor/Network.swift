@@ -268,6 +268,28 @@ final class BridgeWorker {
         worker.run()
     }
 
+    /// Plan 102 W6.A.5 — test seam. Returns the worker so the test
+    /// can `cancelForTesting` it explicitly; production callers use
+    /// `start` and let the supervisor process's exit() reap the
+    /// dispatch sources.
+    static func startForTesting(supFd: Int32, gvFd: Int32, ingest: FileHandle) -> BridgeWorker {
+        let worker = BridgeWorker(supFd: supFd, gvFd: gvFd, ingest: ingest)
+        liveLock.lock()
+        live.append(worker)
+        liveLock.unlock()
+        worker.run()
+        return worker
+    }
+
+    /// Plan 102 W6.A.5 — test seam. Cancels both dispatch sources,
+    /// which fires the cancel handler and emits paired flow_closed
+    /// lines for any direction that was opened. Idempotent (cancel
+    /// is a no-op on an already-cancelled source).
+    func cancelForTesting() {
+        supSource?.cancel()
+        gvSource?.cancel()
+    }
+
     private func run() {
         let queue = DispatchQueue(label: "mvm-vz-bridge", qos: .userInitiated)
         let supSource = DispatchSource.makeReadSource(fileDescriptor: supFd, queue: queue)
@@ -348,14 +370,14 @@ final class BridgeWorker {
 
     private func emitFlowOpened(direction: Direction) {
         let flowId = direction == .egress ? flowIdEgress : flowIdIngress
-        let line = #"{"kind":"flow_opened","flow_id":"\#(flowId)","direction":"\#(direction.rawValue)"}"# + "\n"
-        ingestWrite(line)
+        ingestWrite(formatFlowOpenedLine(flowId: flowId, direction: direction.rawValue))
     }
 
     private func emitFlowClosed(direction: Direction, reason: String) {
         let flowId = direction == .egress ? flowIdEgress : flowIdIngress
-        let line = #"{"kind":"flow_closed","flow_id":"\#(flowId)","direction":"\#(direction.rawValue)","reason":"\#(reason)"}"# + "\n"
-        ingestWrite(line)
+        ingestWrite(formatFlowClosedLine(
+            flowId: flowId, direction: direction.rawValue, reason: reason
+        ))
     }
 
     private func ingestWrite(_ line: String) {
@@ -378,6 +400,18 @@ private func bumpSocketBuffers(fd: Int32) throws {
     _ = withUnsafePointer(to: &bufSize) { ptr in
         Darwin.setsockopt(fd, SOL_SOCKET, SO_RCVBUF, ptr, bufLen)
     }
+}
+
+/// Plan 102 W6.A.5 — JSON line formatters used by `BridgeWorker`
+/// to write FlowEventWire entries to the ingest stream. Free
+/// functions so XCTests can pin the exact wire shape without
+/// reaching into BridgeWorker's private state.
+func formatFlowOpenedLine(flowId: String, direction: String) -> String {
+    #"{"kind":"flow_opened","flow_id":"\#(flowId)","direction":"\#(direction)"}"# + "\n"
+}
+
+func formatFlowClosedLine(flowId: String, direction: String, reason: String) -> String {
+    #"{"kind":"flow_closed","flow_id":"\#(flowId)","direction":"\#(direction)","reason":"\#(reason)"}"# + "\n"
 }
 
 /// `connect()` an AF_UNIX socket to `path`. Closes `fd` and throws
