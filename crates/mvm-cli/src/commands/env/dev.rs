@@ -243,7 +243,39 @@ fn cmd_dev_libkrun_status() -> Result<()> {
     Ok(())
 }
 
-pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
+/// Plan 98 §2.C1 grace-guard predicate. Returns `true` when the
+/// requested `dev` action should be refused because the user
+/// explicitly asked for Vz (via flag or env) but the persistent
+/// Vz `dev` driver is not yet implemented (Phase 2 work).
+///
+/// Pure on its inputs so it can be unit-tested hermetically
+/// without touching the real process env. Matching rules:
+///
+/// - `cli_builder == Some("vz")` (any case) → wants Vz.
+/// - `env == Some("vz")` after trim + lowercase → wants Vz.
+/// - The action is `Up` / `Rebuild` / `Shell` (the three verbs
+///   that boot or attach to the dev VM). `Down` / `Status` /
+///   `Cache` / `ImportImage` are not affected — `dev down` of a
+///   misconfigured state must still succeed.
+fn dev_action_blocked_by_vz_guard(
+    cli_builder: Option<&str>,
+    env: Option<&str>,
+    action: &DevAction,
+) -> bool {
+    let wants_vz = cli_builder
+        .map(|v| v.trim().eq_ignore_ascii_case("vz"))
+        .unwrap_or(false)
+        || env
+            .map(|v| v.trim().eq_ignore_ascii_case("vz"))
+            .unwrap_or(false);
+    wants_vz
+        && matches!(
+            action,
+            DevAction::Up { .. } | DevAction::Rebuild { .. } | DevAction::Shell { .. }
+        )
+}
+
+pub(in crate::commands) fn run(cli: &Cli, args: Args, cfg: &MvmConfig) -> Result<()> {
     let action = args.action.unwrap_or(DevAction::Up {
         cpus: 8,
         memory: 16,
@@ -252,6 +284,31 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
         watch_config: false,
         shell: false,
     });
+
+    // Plan 98 §2.C1 grace guard. `--builder vz` already routes the
+    // *builder* VM (Nix builds, `mvmctl up --prod` Install jobs)
+    // through Vz, but the *dev* VM (the long-lived shell environment
+    // `mvmctl dev` boots) still goes through `current_backend()` and
+    // doesn't yet know about Vz. Phase 2 adds `VzPersistentBuilderVm`
+    // and rewires this dispatch; until then, accepting Vz for
+    // `dev up/rebuild/shell` would silently boot libkrun against
+    // the user's intent. Fail loud instead.
+    //
+    // The check covers both the `--builder vz` flag and a bare
+    // `MVM_BUILDER_BACKEND=vz` env var (the env-var path bypasses
+    // `cli.builder` entirely; the flag-folds-into-env step in
+    // `commands::run` writes the env so this read picks up either
+    // override path).
+    let env_var = std::env::var("MVM_BUILDER_BACKEND").ok();
+    if dev_action_blocked_by_vz_guard(cli.builder.as_deref(), env_var.as_deref(), &action) {
+        anyhow::bail!(
+            "Vz builder backend with `dev up`/`dev rebuild`/`dev shell` is not yet supported \
+             (the Vz persistent dev VM lands in Plan 98 Phase 2). \
+             For now use `--builder libkrun` (or omit the flag / unset \
+             MVM_BUILDER_BACKEND) for `dev` commands. \
+             Vz already works for `mvmctl build` and `mvmctl up --prod`."
+        );
+    }
 
     let backend = current_backend();
     match action {
@@ -411,5 +468,130 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
                 DevBackend::Unsupported => bail_no_dev_backend(),
             }
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{DevAction, DevCacheAction, dev_action_blocked_by_vz_guard};
+
+    fn up() -> DevAction {
+        DevAction::Up {
+            cpus: 8,
+            memory: 16,
+            project: None,
+            metrics_port: 0,
+            watch_config: false,
+            shell: false,
+        }
+    }
+    fn down() -> DevAction {
+        DevAction::Down { reset: false }
+    }
+    fn shell() -> DevAction {
+        DevAction::Shell { project: None }
+    }
+    fn status() -> DevAction {
+        DevAction::Status
+    }
+    fn cache() -> DevAction {
+        DevAction::Cache {
+            action: DevCacheAction::Inspect { json: false },
+        }
+    }
+    fn rebuild() -> DevAction {
+        DevAction::Rebuild {
+            cpus: 8,
+            memory: 16,
+            shell: false,
+        }
+    }
+
+    // ── Flag path ──
+
+    #[test]
+    fn flag_vz_blocks_up() {
+        assert!(dev_action_blocked_by_vz_guard(Some("vz"), None, &up()));
+    }
+    #[test]
+    fn flag_vz_blocks_rebuild() {
+        assert!(dev_action_blocked_by_vz_guard(Some("vz"), None, &rebuild()));
+    }
+    #[test]
+    fn flag_vz_blocks_shell() {
+        assert!(dev_action_blocked_by_vz_guard(Some("vz"), None, &shell()));
+    }
+    #[test]
+    fn flag_libkrun_allows_up() {
+        assert!(!dev_action_blocked_by_vz_guard(
+            Some("libkrun"),
+            None,
+            &up()
+        ));
+    }
+    #[test]
+    fn flag_unset_allows_up() {
+        assert!(!dev_action_blocked_by_vz_guard(None, None, &up()));
+    }
+
+    // ── Env-var path (the §0.1 gap fix — the bug Phase 1 originally shipped with) ──
+
+    #[test]
+    fn env_vz_blocks_up_even_without_flag() {
+        assert!(dev_action_blocked_by_vz_guard(None, Some("vz"), &up()));
+    }
+    #[test]
+    fn env_vz_blocks_rebuild_even_without_flag() {
+        assert!(dev_action_blocked_by_vz_guard(None, Some("vz"), &rebuild()));
+    }
+    #[test]
+    fn env_vz_blocks_shell_even_without_flag() {
+        assert!(dev_action_blocked_by_vz_guard(None, Some("vz"), &shell()));
+    }
+    #[test]
+    fn env_vz_case_insensitive() {
+        assert!(dev_action_blocked_by_vz_guard(None, Some("VZ"), &up()));
+        assert!(dev_action_blocked_by_vz_guard(None, Some("Vz"), &up()));
+    }
+    #[test]
+    fn env_vz_whitespace_stripped() {
+        assert!(dev_action_blocked_by_vz_guard(None, Some("  vz  "), &up()));
+    }
+    #[test]
+    fn env_libkrun_allows_up() {
+        assert!(!dev_action_blocked_by_vz_guard(
+            None,
+            Some("libkrun"),
+            &up()
+        ));
+    }
+    #[test]
+    fn env_empty_allows_up() {
+        assert!(!dev_action_blocked_by_vz_guard(None, Some(""), &up()));
+    }
+    #[test]
+    fn env_unknown_value_allows_up() {
+        // Mirrors `resolve_env_override`'s warn-and-fall-through
+        // semantics: an unrecognised value isn't Vz, so the guard
+        // doesn't trip. Selection layer logs the warning separately.
+        assert!(!dev_action_blocked_by_vz_guard(None, Some("bogus"), &up()));
+    }
+
+    // ── Verbs that should never trip the guard ──
+
+    #[test]
+    fn vz_does_not_block_down() {
+        assert!(!dev_action_blocked_by_vz_guard(Some("vz"), None, &down()));
+        assert!(!dev_action_blocked_by_vz_guard(None, Some("vz"), &down()));
+    }
+    #[test]
+    fn vz_does_not_block_status() {
+        assert!(!dev_action_blocked_by_vz_guard(Some("vz"), None, &status()));
+        assert!(!dev_action_blocked_by_vz_guard(None, Some("vz"), &status()));
+    }
+    #[test]
+    fn vz_does_not_block_cache() {
+        assert!(!dev_action_blocked_by_vz_guard(Some("vz"), None, &cache()));
+        assert!(!dev_action_blocked_by_vz_guard(None, Some("vz"), &cache()));
     }
 }
