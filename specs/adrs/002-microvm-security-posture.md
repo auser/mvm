@@ -117,7 +117,9 @@ bundles) is Sprint 52 W2 — this commit catches the table up to
 both. Claim 11 (app-dep audit pipeline — claim 9 in
 `CLAUDE.md::Security model` because CLAUDE.md numbers from the core
 8 + the SDK-port follow-on) was added by ADR-047 / Plan 73
-Followups A + B.1/B.2/B.3 + C + D.
+Followups A + B.1/B.2/B.3 + C + D. Claims 12 and 13 (host services
+broker — binding-gated dispatch + no raw secret over broker channel)
+were added by Plan 104 / ADR-059.
 
 | # | Claim | Primary layer | Workstream | CI gate |
 |---|---|---|---|---|
@@ -132,6 +134,8 @@ Followups A + B.1/B.2/B.3 + C + D.
 | 9 | Every published bundle is content-addressed, key_id-pinned, and re-verified at fetch **and at admit time** | cross-cutting (supply chain + integrity) | Sprint 52 W2 + admit-time re-verify follow-on | `mvm_plan::bundle::read_and_verify_bundle` + `mvm_plan::bundle::verify_plan_bundle` rejection-ladder tests: unknown-key, tampered manifest, key_id mismatch, tampered artifact, missing artifact, unsafe path, schema bump, pin-archive sha256 drift, pin-signature drift; `mvmctl bundle fetch` round-trip + `admit_for_run` tests asserting refusal on pin-without-context and pin-archive mismatch |
 | 10 | No untrusted workload reaches the network unless explicitly admitted by policy | cross-cutting (data containment) | Sprint 52 W3 | `policy_default_is_deny_all` + `test_resolve_network_policy_default_is_deny_all`; `mvmctl up` emits an opt-in warning when the resolved policy is `unrestricted` (escape hatch is `MVM_ACK_UNRESTRICTED_NETWORK=1`) |
 | 11 | Every application-dep volume is hash-locked, attestation-checked, CVE-scanned, SBOM-enumerated, and bound to the workload's audit chain | cross-cutting (supply chain — app-layer deps) | ADR-047, Plan 73 Followups A + B.1/B.2/B.3 + C + D | `mvm_sdk::compile::deps_audit::{seal_volume, verify_sealed_volume}` tamper-detection unit tests; `mvm_build::app_deps_gate::apply_install_gate` prod/dev rejection tests; `app-deps-audit` CI lane in `ci.yml` (Followup D) — drives `mvmctl compile` on `examples/python/hello-app-with-deps/`, seals a clean + a HIGH-CVE fixture via `mvm-app-deps-fixture-tool`, asserts `mvmctl deps inspect --json` produces a well-formed report, asserts the prod gate refuses the HIGH-CVE fixture and the dev gate admits it, asserts a byte-flip on `cve.json` makes inspect refuse |
+| 12 | Every host-side service the broker exposes is bound to a signed `ExecutionPlan.services` binding, enforced before handler dispatch, and audited via the chain-signed log | cross-cutting (policy + audit) | Plan 104 W2, ADR-059 | `service_call_denied_when_unbound` + `service_call_denied_outside_profile` + `audit_chain_contains_service_call_entries` + `audit_chain_carries_no_payload_bytes` rejection-ladder tests; `xtask check-handler-adr-coverage` + `xtask check-handler-policy-schema` + `xtask check-handler-composition` lints; `fuzz_service_call.rs` lane (Plan 104 W6) |
+| 13 | No raw secret value crosses the broker channel; `host.secrets.v1` returns destination-bound, time-bound signed credentials only; raw secret bytes never leave the supervisor's address space | cross-cutting (data containment) | Plan 104 W5, ADR-049, ADR-059 | `host_secrets_v1_denied_outside_allowed_destinations` + `zeroize_drop_zeros_secret_bytes` + `handler_inter_call_memory_hygiene` + `host_secrets_v1_signed_payload_jcs_roundtrip` + `secrets_subprocess_cannot_reach_supervisor_memory` + `placeholder_in_outbound_request_dropped_and_audited` (S25 backstop) tests; ADR-049 hostile-guest matrix in W7 |
 
 L1 (host + hypervisor) has no claim of its own — the host is trusted
 by definition (see Threat model). L1 *enables* claim 3 (verified boot
@@ -177,6 +181,9 @@ only — the CI gate is the source of truth, not the framework code.
 | 8 | T1565 (Data Manipulation), T1574 (Hijack Execution Flow — policy substitution variant) | D3FEND: Authentication, Authorization · CREF: Substantiated Integrity (every launch traces back to a signed, validity-windowed plan) |
 | 9 | T1195.002 (Compromise Software Supply Chain — image variant), T1565.001 (Stored Data Manipulation) | D3FEND: Authentication, Executable Integrity · CREF: Substantiated Integrity (manifest-signed + per-artifact hash + key_id-pinned trust establishment) |
 | 10 | T1071 (Application Layer Protocol — data exfiltration channel), T1041 (Exfiltration Over C2 Channel) | D3FEND: Network Traffic Filtering, Outbound Traffic Filtering · CREF: Privilege Restriction (deny-all default; egress is an explicit opt-in) |
+| 11 | T1195.001 (Compromise Software Dependencies and Development Tools — app-layer variant), T1565.001 (Stored Data Manipulation — deps volume variant) | D3FEND: Software Composition Analysis, Executable Integrity · CREF: Substantiated Integrity (hash-locked + SBOM + attestation + CVE-scanned sealed volume bound to audit chain) |
+| 12 | T1574 (Hijack Execution Flow — capability-granting variant), T1078 (Valid Accounts — unauthorized service invocation) | D3FEND: Authorization · CREF: Substantiated Integrity (signed binding gate → enforced dispatch → chain-signed audit on every call) |
+| 13 | T1552 (Unsecured Credentials), T1071 (Application Layer Protocol — credential exfiltration variant) | D3FEND: Credential Hardening, Outbound Traffic Filtering · CREF: Privilege Restriction (destination-bound + time-bound signed credentials; raw secret bytes never leave the supervisor's address space; process-level isolation via the `mvm-secrets-dispatcher` subprocess) |
 
 The cold-state guarantee (per-workload fresh boot, no warm pools — see
 CLAUDE.md and the `mvmctl run` lifecycle) is not in the seven-claim
