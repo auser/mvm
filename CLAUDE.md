@@ -125,14 +125,16 @@ The `RuntimeBuildEnv` in mvm implements only `ShellEnvironment`. The full `Build
 
 ## Security model
 
-mvm makes nine CI-enforced security claims. Each one is backed by a
+mvm makes ten CI-enforced security claims. Each one is backed by a
 test or a workflow gate; ADR-002 (`specs/adrs/002-microvm-security-posture.md`)
 describes the threat model and `specs/plans/25-microvm-hardening.md`
 sequences the implementation. Claim 8 was added by plan 64
 (`specs/plans/64-supervisor-wiring.md`) — see ADR-041
 (`specs/adrs/041-signed-audited-execution-plans.md`). Claim 9 was added
 by Plan 73 Followup D (CI gate) — see ADR-047
-(`specs/adrs/047-app-deps-audit-pipeline.md`). (ADR-002's full claim
+(`specs/adrs/047-app-deps-audit-pipeline.md`). Claim 10 was added by
+Plan 85 Phase E + F (the user-facing OCI image runner) — see
+`specs/claims/claim-10-oci-image-provenance.md`. (ADR-002's full claim
 table also names two additional cross-cutting claims for signed bundles
 and default-deny network policy; those are tracked there because they
 post-date the CLAUDE.md per-claim summary below.)
@@ -213,6 +215,37 @@ post-date the CLAUDE.md per-claim summary below.)
    cloud-hypervisor builder VM) is still gated on Plan 72 W4/W5
    cutover; the CI lane exercises every code path that doesn't
    require a working microVM backend.
+10. **Every `mvmctl run --image <oci-ref>` admission records the OCI
+    image provenance in the chain-signed audit log.** Plan 85 Phase E
+    + F wire the user-facing OCI image runner to the same audit chain
+    that backs claim 8 — see `specs/claims/claim-10-oci-image-provenance.md`.
+    `mvmctl image pull` materializes the layer set in `mvm-oci`'s
+    allow-listed unpacker (`mvm_oci::unpack::unpack_layer`), formats an
+    ext4 rootfs in the builder VM (`mvm_build::oci_to_rootfs::
+    materialize_to_ext4`, never on the macOS host — ADR-050), and
+    persists provenance metadata (registry host, repo, supplied
+    reference, resolved manifest digest, layer digest list, trust
+    policy, cosign verdict). `mvmctl run --image` admits an
+    `ExecutionPlan` (claim 8 path) and then emits a
+    `plan.oci_provenance` entry via
+    `AuditEmitter::emit_oci_provenance`
+    (`crates/mvm-cli/src/commands/vm/audit_chain.rs`) carrying those
+    labels; `mvm_supervisor::verify_audit_chain` continues to detect
+    drift, surfaced via `mvmctl audit verify`. `--prod` refuses
+    mutable references before any network fetch
+    (`crates/mvm-cli/src/commands/image.rs::
+    prod_pull_requires_digest_pin_before_network` and
+    `prod_run_image_requires_digest_pin_before_network`), demands an
+    explicit registry policy, and requires cosign verification of the
+    resolved digest before cache admission or boot. The OCI
+    `unpack_layer` fuzz harness lives in
+    `.github/workflows/security.yml`'s `fuzz` job (release-tag pushes
+    + nightly cron + manual dispatch); the
+    `oci-layer-unpack-adversarial`, `oci-digest-mismatch-reject`,
+    `oci-malformed-manifest`, `oci-mutable-tag-prod-reject`,
+    `oci-reproducibility`, and `oci-image-runner-smoke` lanes in
+    `.github/workflows/ci.yml` gate every PR that touches the OCI
+    surface.
 
 The guest agent itself runs as uid 901 under setpriv (W4.5); the
 host-side vsock proxy socket is mode 0700 (W1.2), the proxy port
