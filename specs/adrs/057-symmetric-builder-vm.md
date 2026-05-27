@@ -42,8 +42,18 @@ The signing identity is established inside the builder VM on both hosts. The hos
 - Builder VM cold-start latency on Linux CI runners. Plan 100 W0 measures this against the current Firecracker-direct baseline.
 - Nested KVM availability on cloud Linux hosts. Some cloud hypervisors disable nested virt by default (or expose it via per-VM capabilities). Doctor probe + clear failure mode required.
 
+## Relationship to Plan 98 (Vz builder backend)
+
+Plan 98 ships a second builder-VMM impl (Apple Virtualization.framework / Vz) on macOS 26+ Apple Silicon, parallel to libkrun. That work is **complementary** to this ADR's symmetric-builder uplift:
+
+- **Plan 98** picks which host VMM runs the macOS builder VM (libkrun or Vz). It does not change which OSes have a builder VM at all.
+- **This ADR (Plan 100)** adds a builder VM to Linux too, so workload microVMs always run nested.
+
+Plan 98's macOS work narrows the asymmetric-trust gap *on macOS* (it stops requiring the third-party `slp/krun` Homebrew trio when Vz is the default), but Linux still runs Firecracker directly until Plan 100 W2 lands the nested libkrun-on-Linux path. The two efforts ship independently; their selection layers compose via `mvm_build::builder_backend_select::resolve_choice` (Plan 98 introduced) which already has a third arm reserved for future Linux-builder dispatch (Plan 100 W2 will populate it). Builder-backend parity discussion lives in **ADR-046 §"Vz as a second builder backend (Plan 98)"**.
+
 ## References
 
 - [ADR-001](001-firecracker-only.md) — Firecracker-only execution (needs update for nested model)
 - [ADR-002](002-microvm-security-posture.md) — microVM security posture (claim 1 reworded by Plan 100 W8)
+- [ADR-046](046-builder-vm-via-libkrun.md) — builder VM via libkrun + Plan 98 Vz extension
 - [Plan 100](../plans/100-symmetric-builder-vm-rollout.md) — implementation rollout
