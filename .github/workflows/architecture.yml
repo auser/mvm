@@ -51,7 +51,14 @@ jobs:
   #      (`crates/mvm-providers/src/apple_container/macos.rs`).
   #      Provider-specific guest-channel transport.
   #   4. Observability — Prometheus metrics endpoint
-  #      (`crates/mvm-cli/src/metrics_server.rs`). Scrape surface.
+  #      (`crates/mvm-cli/src/metrics_server.rs`) plus per-VM gateway
+  #      audit sockets in `crates/mvm-supervisor/src/gateway_bridge.rs`
+  #      and `crates/mvm-supervisor/src/gateway_audit.rs`. These are
+  #      VM-local telemetry substrate: a Rust ingest socket receives
+  #      NDJSON flow events from the Swift Vz bridge, and a sibling
+  #      UDS fan-out socket exposes the same signed-audit stream to
+  #      local subscribers (`nc -U`). They do not accept control-plane
+  #      commands or host multi-tenant orchestration state.
   #   5. Ephemeral port discovery — `TcpListener::bind("127.0.0.1:0")`
   #      in `crates/mvm-cli/src/template_cmd.rs`. Binds to find a free
   #      port; drops the listener immediately. Not a daemon.
@@ -147,6 +154,8 @@ jobs:
               --glob '!crates/mvm-egress-proxy/**' \
               --glob '!crates/mvm-providers/src/apple_container/**' \
               --glob '!crates/mvm-cli/src/metrics_server.rs' \
+              --glob '!crates/mvm-supervisor/src/gateway_bridge.rs' \
+              --glob '!crates/mvm-supervisor/src/gateway_audit.rs' \
               --glob '!crates/mvm-cli/src/template_cmd.rs' \
               --glob '!crates/mvm-backend/src/mock_guest_agent.rs' \
               --glob '!crates/mvm-addon-vsock-bridge/**' \
