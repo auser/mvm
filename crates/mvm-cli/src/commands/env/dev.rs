@@ -25,7 +25,6 @@ use clap::{Args as ClapArgs, Subcommand};
 use crate::ui;
 
 use mvm_backend::{LibkrunBackend, VzBackend};
-use mvm_build::builder_backend_select::BuilderBackendChoice;
 use mvm_core::platform::{self, Platform};
 use mvm_core::user_config::MvmConfig;
 use mvm_core::vm_backend::{VmBackend, VmId, VmStartConfig, VmStatus};
@@ -54,6 +53,22 @@ enum DevBackend {
     /// Neither path is wired today — macOS Intel, macOS pre-26,
     /// Linux without KVM, WSL2, and native Windows.
     Unsupported,
+}
+
+/// Which hypervisor currently owns the dev VM.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DevVmBackend {
+    Libkrun,
+    Vz,
+}
+
+impl DevVmBackend {
+    fn name(self) -> &'static str {
+        match self {
+            Self::Libkrun => "libkrun",
+            Self::Vz => "vz",
+        }
+    }
 }
 
 /// Pure platform-decision predicate. Lifted out of [`current_backend`]
@@ -266,10 +281,10 @@ fn bail_no_dev_backend() -> Result<()> {
 /// is currently running, otherwise `None`. Errors propagated — a
 /// status probe failure shouldn't be silently swallowed (it may
 /// mean the backend is wedged, which is its own kind of "running").
-fn other_backend_dev_vm_running(current: BuilderBackendChoice) -> Result<Option<&'static str>> {
+fn other_backend_dev_vm_running(current: DevVmBackend) -> Result<Option<&'static str>> {
     let id = VmId(apple_container::DEV_VM_NAME.to_string());
     match current {
-        BuilderBackendChoice::Libkrun => {
+        DevVmBackend::Libkrun => {
             if matches!(
                 VzBackend.status(&id)?,
                 VmStatus::Running | VmStatus::Starting
@@ -279,7 +294,7 @@ fn other_backend_dev_vm_running(current: BuilderBackendChoice) -> Result<Option<
                 Ok(None)
             }
         }
-        BuilderBackendChoice::Vz => {
+        DevVmBackend::Vz => {
             if matches!(
                 LibkrunBackend.status(&id)?,
                 VmStatus::Running | VmStatus::Starting
@@ -296,7 +311,7 @@ fn other_backend_dev_vm_running(current: BuilderBackendChoice) -> Result<Option<
 /// Lifted out for hermetic unit tests; the caller passes the
 /// probe result so the test doesn't need to spoof the live host.
 fn refuse_if_other_backend_running(
-    current: BuilderBackendChoice,
+    current: DevVmBackend,
     other_running: Option<&str>,
 ) -> Result<()> {
     if let Some(other) = other_running {
@@ -315,8 +330,8 @@ fn cmd_dev_libkrun(cpus: u32, memory_gib: u32, open_shell: bool) -> Result<()> {
     let id = VmId(apple_container::DEV_VM_NAME.to_string());
 
     // Plan 98 §2.5 — refuse cleanly if Vz is already running.
-    let other = other_backend_dev_vm_running(BuilderBackendChoice::Libkrun)?;
-    refuse_if_other_backend_running(BuilderBackendChoice::Libkrun, other)?;
+    let other = other_backend_dev_vm_running(DevVmBackend::Libkrun)?;
+    refuse_if_other_backend_running(DevVmBackend::Libkrun, other)?;
 
     if matches!(backend.status(&id)?, VmStatus::Running) {
         ui::success("libkrun dev VM already running.");
@@ -378,7 +393,7 @@ fn cmd_dev_libkrun_status() -> Result<()> {
     ui::info(&format!("VM:       {}", apple_container::DEV_VM_NAME));
     ui::info(&format!("Status:   {state}"));
     // Plan 98 §2.5 — surface the other backend's state too.
-    if let Ok(Some(other)) = other_backend_dev_vm_running(BuilderBackendChoice::Libkrun) {
+    if let Ok(Some(other)) = other_backend_dev_vm_running(DevVmBackend::Libkrun) {
         ui::warn(&format!(
             "Note: the {other} dev VM is also running. Run \
              `mvmctl --builder {other} dev down` before re-running \
@@ -401,8 +416,8 @@ fn cmd_dev_vz(cpus: u32, memory_gib: u32, open_shell: bool) -> Result<()> {
     let id = VmId(apple_container::DEV_VM_NAME.to_string());
 
     // Plan 98 §2.5 — refuse cleanly if libkrun is already running.
-    let other = other_backend_dev_vm_running(BuilderBackendChoice::Vz)?;
-    refuse_if_other_backend_running(BuilderBackendChoice::Vz, other)?;
+    let other = other_backend_dev_vm_running(DevVmBackend::Vz)?;
+    refuse_if_other_backend_running(DevVmBackend::Vz, other)?;
 
     if matches!(backend.status(&id)?, VmStatus::Running) {
         ui::success("Vz dev VM already running.");
@@ -459,7 +474,7 @@ fn cmd_dev_vz_status() -> Result<()> {
     ui::info(&format!("VM:       {}", apple_container::DEV_VM_NAME));
     ui::info(&format!("Status:   {state}"));
     // Plan 98 §2.5 — surface the other backend's state too.
-    if let Ok(Some(other)) = other_backend_dev_vm_running(BuilderBackendChoice::Vz) {
+    if let Ok(Some(other)) = other_backend_dev_vm_running(DevVmBackend::Vz) {
         ui::warn(&format!(
             "Note: the {other} dev VM is also running. Run \
              `mvmctl --builder {other} dev down` before re-running \
@@ -661,8 +676,7 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{DevBackend, refuse_if_other_backend_running, select_dev_backend};
-    use mvm_build::builder_backend_select::BuilderBackendChoice;
+    use super::{DevBackend, DevVmBackend, refuse_if_other_backend_running, select_dev_backend};
     use mvm_core::platform::Platform;
 
     // ──────────────────────────────────────────────────────────────
@@ -671,7 +685,7 @@ mod tests {
 
     #[test]
     fn libkrun_refuses_when_vz_already_running() {
-        let err = refuse_if_other_backend_running(BuilderBackendChoice::Libkrun, Some("vz"))
+        let err = refuse_if_other_backend_running(DevVmBackend::Libkrun, Some("vz"))
             .expect_err("must refuse when vz is running");
         let msg = format!("{err:#}");
         assert!(msg.contains("vz dev VM is already running"), "got: {msg}");
@@ -684,7 +698,7 @@ mod tests {
 
     #[test]
     fn vz_refuses_when_libkrun_already_running() {
-        let err = refuse_if_other_backend_running(BuilderBackendChoice::Vz, Some("libkrun"))
+        let err = refuse_if_other_backend_running(DevVmBackend::Vz, Some("libkrun"))
             .expect_err("must refuse when libkrun is running");
         let msg = format!("{err:#}");
         assert!(
@@ -701,8 +715,8 @@ mod tests {
     #[test]
     fn no_other_backend_running_permits_boot() {
         // Both directions when the other backend isn't up.
-        refuse_if_other_backend_running(BuilderBackendChoice::Libkrun, None).unwrap();
-        refuse_if_other_backend_running(BuilderBackendChoice::Vz, None).unwrap();
+        refuse_if_other_backend_running(DevVmBackend::Libkrun, None).unwrap();
+        refuse_if_other_backend_running(DevVmBackend::Vz, None).unwrap();
     }
 
     // ──────────────────────────────────────────────────────────────
