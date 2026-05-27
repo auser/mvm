@@ -208,6 +208,14 @@ Defense-in-depth additions on top of the trait-level requirements:
   `LibkrunBuilderVm` behind a new `VmBackendForBuilder` trait,
   then `VzBuilderVm` reuses it with a Vz-side mount glue.
   Estimate: ~400-line impl + ~200-line glue once the seam exists.
+
+  **Persistent builder variant (Plan 98 Slice 2A)** — ships
+  `VzPersistentBuilderVm` parallel to `LibkrunPersistentBuilderVm`,
+  reusing the same `mvm_vz::SupervisorConfig` surface this ADR
+  introduced. Full design — selection policy, state-dir prefix
+  isolation under `~/.cache/mvm/builder-vm/vms/`, and
+  security-claim parity across both backends — lives in ADR-046
+  §"Vz as a second builder backend (Plan 98)".
 - **mvmd `BackendKind::Vz` adoption.** Cross-repo. Tracked under
   Plan 97 §"mvmd integration".
 - **Windows host support via WHP.** Cataloged as a separate
