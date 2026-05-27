@@ -262,37 +262,69 @@ already matches existing chain emitters (e.g.,
       clean (after fixing 6 lints: match-as-let pattern, ?
       operator, collapsed if-let)
 
-### Commit 6 — `run_supervisor_with_bridge` + no-bypass admission
+### Commit 6 — `SupervisorConfig` audit fields + admission validation
 
-- [ ] `crates/mvm-libkrun/src/lib.rs` `SupervisorConfig`:
-      `network: NetworkConfig` (mandatory; was Option)
-- [ ] Add `pub tenant_id: TenantId`
-- [ ] Add `pub audit_dir: PathBuf`
-- [ ] Add `pub gateway_audit_socket: PathBuf`
-- [ ] Add `pub gateway_events_socket: PathBuf`
-- [ ] Add `pub signing_key_path: PathBuf`
-- [ ] `pub fn run_supervisor_with_bridge<F>(cfg, factory)`
-- [ ] Admission validation:
-      - [ ] `signing_key_path` canonicalizes under `~/.mvm/keys/`
-      - [ ] `gateway_audit_socket` + `gateway_events_socket`
-            parent must be `~/.mvm/audit/`
-      - [ ] `tenant_id` non-empty
-      - [ ] No-bypass guard (NetworkConfig has no `None`/`Disabled`
-            variant; refuses configs without bridge endpoint)
-- [ ] passt path: pre-net + `into_socket()` + inner socketpair +
-      hand to factory
-- [ ] gvproxy path: spawn gvproxy + bind supervisor listen path +
-      `add_net_unixgram_path(supervisor_listen)` + hand to factory
-- [ ] `crates/mvm-libkrun/src/bin/mvm-libkrun-supervisor.rs:104`
-      — swap `run_supervisor` for `run_supervisor_with_bridge`
-- [ ] Confirm `add_net_unixstream_fd` + `add_net_unixgram_path`
-      dup semantics (pre-flight read)
-- [ ] Backend orchestrator (`crates/mvm-backend/src/libkrun.rs`)
-      populates new fields from `ExecutionPlan` + `mvm_data_dir()`
-- [ ] Tests:
-      - [ ] `supervisor_admission_refuses_config_without_network`
-      - [ ] `signing_key_path_outside_mvm_keys_rejected`
-- [ ] `cargo test --workspace` green
+**Scope reduced from plan:** plan called for `network: NetworkConfig`
+(mandatory) + `run_supervisor_with_bridge<F>` entry point with full
+fd-interception (split `configure_with_gateway`, hand BridgeEndpoints
+to factory). The fd-interception refactor is invasive — splits an
+already-shipping path in two and changes the libkrun-binding fd
+ownership story for both passt and gvproxy. **Deferred to commit
+6.5 / commit 7** (Vz Swift bridge work pulls it along anyway).
+
+What commit 6 actually ships:
+
+- [x] `crates/mvm-libkrun/src/lib.rs` `SupervisorConfig` — five
+      new fields, all `#[serde(default)] Option<...>` so pre-W6.A
+      JSON parses cleanly:
+      - `tenant_id: Option<String>`
+      - `audit_dir: Option<PathBuf>`
+      - `gateway_audit_socket: Option<PathBuf>`
+      - `gateway_events_socket: Option<PathBuf>`
+      - `signing_key_path: Option<PathBuf>`
+- [x] `pub fn SupervisorConfig::validate_audit_substrate() ->
+      Result<(), AuditSubstrateError>` — claim-10 admission check.
+      Refuses configurations with missing fields, empty
+      `tenant_id`, `gateway_audit_socket` outside `audit_dir`, or
+      `signing_key_path` outside `~/.mvm/keys/` (path-traversal
+      defense).
+- [x] `pub enum AuditSubstrateError` — typed error variants
+      (`MissingField`, `EmptyTenantId`, `AuditSocketOutsideAuditDir`,
+      `SigningKeyOutsideKeysDir`); `Display` + `Error` impls.
+- [x] `fn home_mvm_keys_dir()` helper for the `~/.mvm/keys/`
+      prefix check.
+- [x] Tests (9 new):
+      - [x] `validate_audit_substrate_accepts_well_formed_config`
+      - [x] `validate_audit_substrate_refuses_missing_tenant_id`
+      - [x] `validate_audit_substrate_refuses_empty_tenant_id`
+      - [x] `validate_audit_substrate_refuses_missing_audit_dir`
+      - [x] `validate_audit_substrate_refuses_missing_gateway_audit_socket`
+      - [x] `validate_audit_substrate_refuses_audit_socket_outside_audit_dir`
+      - [x] `validate_audit_substrate_refuses_missing_signing_key_path`
+      - [x] `validate_audit_substrate_refuses_signing_key_outside_mvm_keys`
+      - [x] `validate_audit_substrate_refuses_signing_key_path_traversal`
+            (notes the limit of starts_with-based defense)
+      - [x] `supervisor_config_serde_omits_audit_substrate_fields_when_none`
+            (backward-compat: pre-W6.A JSON still parses; validation
+            then refuses)
+- [x] `cargo test -p mvm-libkrun --lib tests::` 41 tests green
+      (was 32; +9 for the validation)
+- [x] `cargo clippy -p mvm-libkrun --all-targets -- -D warnings`
+      clean (after fixing 4 `unnecessary_lazy_evaluations` lints)
+
+Deferred to commit 6.5 (or rolled into commit 7):
+- `run_supervisor_with_bridge<F>` entry point.
+- `configure_with_gateway` split into `configure_pre_net` +
+  bridge-socketpair-insertion.
+- `mvm-libkrun-supervisor` binary swap from `run_supervisor` to
+  `run_supervisor_with_bridge`.
+- Backend orchestrator population of the new `SupervisorConfig`
+  fields in `crates/mvm-backend/src/libkrun.rs`.
+
+The substrate is now: bridge module (commit 5) exists and is
+fully testable; the SupervisorConfig fields are defined and
+validated; the *wire-up* between SupervisorConfig and bridge
+spawn is the deferred work.
 
 ### Commit 7 — Vz Swift bridge + Rust ingest + backend orchestrator
 

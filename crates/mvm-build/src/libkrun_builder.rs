@@ -389,6 +389,11 @@ impl LibkrunBuilderVm {
             krun,
             vm_state_dir: path_to_str(&vm_state_dir, "vm_state_dir")?.to_string(),
             pid_file_name: Some("stage0.pid".to_string()),
+            tenant_id: None,
+            audit_dir: None,
+            gateway_audit_socket: None,
+            gateway_events_socket: None,
+            signing_key_path: None,
         };
 
         let exit_code = spawn_supervisor_and_wait(&supervisor_path, &cfg, &vm_state_dir)?;
@@ -484,6 +489,11 @@ impl LibkrunBuilderVm {
             krun,
             vm_state_dir: path_to_str(&vm_state_dir, "vm_state_dir")?.to_string(),
             pid_file_name: Some("builder.pid".to_string()),
+            tenant_id: None,
+            audit_dir: None,
+            gateway_audit_socket: None,
+            gateway_events_socket: None,
+            signing_key_path: None,
         };
         // Plan 89 W2 part 4: spawn the vsock response listener
         // BEFORE the supervisor so it can connect as soon as libkrun
@@ -748,6 +758,11 @@ impl BuilderVm for LibkrunBuilderVm {
             krun,
             vm_state_dir: path_to_str(&vm_state_dir, "vm_state_dir")?.to_string(),
             pid_file_name: Some("builder.pid".to_string()),
+            tenant_id: None,
+            audit_dir: None,
+            gateway_audit_socket: None,
+            gateway_events_socket: None,
+            signing_key_path: None,
         };
         // Plan 89 W2 part 4: same dispatch-listener wiring as
         // `run_shell_script`. Drained after the supervisor exits
@@ -916,6 +931,11 @@ impl VmBackendForBuilder for LibkrunBuilderBackend {
             krun,
             vm_state_dir: path_to_str(&config.vm_state_dir, "vm_state_dir")?.to_string(),
             pid_file_name: Some("builder.pid".to_string()),
+            tenant_id: None,
+            audit_dir: None,
+            gateway_audit_socket: None,
+            gateway_events_socket: None,
+            signing_key_path: None,
         };
 
         let mut child = spawn_supervisor_in_background(&self.supervisor_path, &cfg)?;
@@ -1802,6 +1822,11 @@ impl LibkrunPersistentBuilderVm {
             krun,
             vm_state_dir: path_to_str(&vm_state_dir, "vm_state_dir")?.to_string(),
             pid_file_name: Some("builder.pid".to_string()),
+            tenant_id: None,
+            audit_dir: None,
+            gateway_audit_socket: None,
+            gateway_events_socket: None,
+            signing_key_path: None,
         };
 
         let child = spawn_supervisor_in_background(&supervisor_path, &cfg)?;
