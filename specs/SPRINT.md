@@ -34,6 +34,181 @@ plan 25 sequences the work into six independently-shippable workstreams.
 | MSRV             | 1.85                     |
 | Binary           | `mvmctl`                 |
 
+## Dependency Reduction Roadmap (analysis checkpoint: 2026-05-26)
+
+**Objective:** reduce Rust dependency count, shrink binary/build
+surfaces, and remove high-risk/high-churn third-party crates where the
+project only uses a narrow slice of functionality.
+
+**Measured baseline (analysis only, before any reduction PRs):**
+
+- [ ] `Cargo.lock` package entries: `723`
+- [ ] `cargo tree -p mvmctl --edges normal,build,dev --prefix none | sort -u | wc -l`: `610`
+- [ ] `cargo tree -p mvm-cli --edges normal,build,dev --prefix none | sort -u | wc -l`: `537`
+- [ ] `cargo tree -p mvm-build --edges normal,build,dev --prefix none | sort -u | wc -l`: `416`
+
+**Scope note for the current live-test gating work:**
+
+- [ ] Be explicit in PR descriptions and follow-up sessions that moving
+      the 5 heavy live tests behind a `live-tests` feature is mainly a
+      compile-surface / accidental-execution / workflow win, not a raw
+      dep-graph-count win.
+- [ ] The crates referenced by those gated tests (`flate2`,
+      `mvm-libkrun`, `tempfile`, `which`, `mvm-oci`) are already pulled
+      by main code or other tests, so the lockfile / unique-node counts
+      should not be expected to drop materially from that change alone.
+- [ ] Treat the live-test gating work as enabling infrastructure for
+      future dependency reduction, not as the dependency-reduction
+      endpoint itself.
+
+### Track A — Immediate low-risk cuts
+
+- [ ] Replace root-test `httpmock` usage with an in-repo
+      `tokio::net::TcpListener` fixture.
+      Target surface: `tests/audit_emissions_live.rs` and any other
+      root tests using `httpmock`.
+      Expected impact: remove `httpmock`'s dev-only closure
+      (`~187` unique packages in isolation), including `async-std`,
+      `hyper 0.14`, `http 0.2`, and `base64 0.21`.
+
+- [ ] Replace `mvm-oci` test `wiremock` usage with the same in-repo
+      tokio-based fixture.
+      Target surface: `crates/mvm-oci/tests/`.
+      Expected impact: remove `wiremock`'s dev-only closure
+      (`~127` unique packages in isolation).
+
+- [ ] Unify `which` on one version workspace-wide.
+      Current state: `which 6.0.3` is pulled by `mvm-build`; `which 7.0.3`
+      is used elsewhere.
+      Expected impact: remove duplicate `which`/`rustix` lineage and
+      simplify lockfile churn.
+
+- [ ] Replace `names` with a local generator or deterministic fallback.
+      Current call site: `crates/mvm-cli/src/commands/vm/up.rs`.
+      Expected impact: small package-count win, trivial rewrite.
+
+- [ ] Evaluate replacing `inquire` prompts with stdio helpers.
+      Current call sites: `crates/mvm-base/src/ui.rs`,
+      `crates/mvm-cli/src/ui.rs`,
+      `crates/mvm-cli/src/commands/ops/secret.rs`.
+      Decision gate: accept simpler UX in exchange for lower dep count.
+
+- [ ] Evaluate replacing `indicatif` spinners with a local stderr
+      spinner or no spinner.
+      Current call sites: `crates/mvm-base/src/ui.rs`,
+      `crates/mvm-cli/src/ui.rs`.
+      Decision gate: accept simpler UX in exchange for lower dep count.
+
+### Track B — Feature trimming and duplicate-stack cleanup
+
+- [ ] Narrow `tokio` workspace features away from `features = ["full"]`.
+      Start with crates that inherit the workspace dep without
+      per-crate narrowing:
+      `crates/mvm/`, `crates/mvm-build/`, `crates/mvm-backend/`,
+      `crates/mvm-addon-dns/`, and the bare `tokio = { workspace = true }`
+      entries in `crates/mvm-guest/`.
+      Goal: reduce compile graph size, binary surface, and accidental
+      feature union.
+
+- [ ] Re-run `cargo tree --workspace --duplicates` after the tokio audit
+      and record the post-audit duplicate list in this section.
+
+- [ ] Keep feature-gated optional stacks off the default path unless
+      clearly justified.
+      Review items when touched:
+      `notify` / `notify-debouncer-mini`,
+      `opendal`,
+      `hickory-resolver`,
+      `sigstore`.
+
+### Track C — Medium-cost structural cuts
+
+- [ ] Remove `bindgen` from the normal `mvm-libkrun` build path by
+      checking in generated bindings or otherwise freezing the generated
+      Rust surface.
+      Current surface: `crates/mvm-libkrun/build.rs`.
+      Expected impact: remove a build-only closure (`~28` unique packages
+      in isolation) and `libclang` coupling during normal builds.
+
+- [ ] Evaluate replacing `hickory-proto` in `mvm-addon-dns` with a
+      minimal in-house DNS codec for the exact record types and packet
+      shapes the addon resolver supports.
+      Current surface: `crates/mvm-addon-dns/src/lib.rs`.
+      Expected impact: moderate package-count reduction (`~71` unique
+      packages in isolation).
+
+- [ ] Evaluate feature-gating schema/code-analysis stacks that are not
+      required for the default CLI/runtime path, especially `schemars`.
+      Current surface: `crates/mvm-ir/`, `crates/mvm-sdk/`.
+      Goal: keep schema emission available while reducing the default
+      build/test surface when those paths are not in use.
+
+- [ ] Keep `tree-sitter` as an intentional core dependency for source-
+      derived entrypoint and workload analysis.
+      Current surface:
+      `crates/mvm-sdk/src/compile/func_describe.rs`,
+      `crates/mvm-sdk/src/compile/reachability.rs`,
+      `crates/mvm-sdk/src/decorator/python.rs`,
+      `crates/mvm-sdk/src/decorator/typescript.rs`,
+      `crates/mvm-sdk/src/addon/validator.rs`.
+      Constraint: do not treat `tree-sitter` removal as a dependency-
+      reduction goal unless product scope changes and source-derived
+      entrypoint analysis is explicitly being removed.
+
+- [ ] If tree-sitter optimization is needed, limit it to packaging and
+      feature-boundary work:
+      per-language grammar gating, isolating non-default compile paths,
+      or moving optional analysis surfaces behind explicit features.
+
+### Track D — Strategic rewrites
+
+- [ ] Spike replacing `oci-client` inside `mvm-oci` with a minimal
+      internal registry client built on the existing workspace
+      `reqwest 0.12` stack.
+      Current surface:
+      `crates/mvm-oci/src/manifest.rs`,
+      `crates/mvm-oci/src/layer.rs`.
+      Scope limit for the spike:
+      manifest fetch, auth header wiring, image-index selection, blob
+      download, digest verification.
+      Expected impact: remove `oci-client`'s large closure
+      (`~222` unique packages in isolation) and eliminate the second
+      `reqwest 0.13` / `hyper` / `http` family from the workspace.
+
+- [ ] If the `oci-client` spike succeeds, land it before attempting the
+      PGP rewrite.
+
+- [ ] Rewrite the narrow Alpine detached-signature verifier in
+      `mvm-build` to remove the `pgp` crate.
+      Current surface:
+      `crates/mvm-build/src/stage0.rs::verify_alpine_pgp_signature`.
+      Scope limit:
+      armored public-key parse, fingerprint pinning, armored detached
+      signature parse, detached verification over the tarball bytes.
+      Expected impact: remove `pgp`'s large closure
+      (`~208` unique packages in isolation).
+
+### Track E — Zig evaluation gates
+
+- [ ] Do not introduce Zig for broad protocol-heavy replacements
+      (`oci-client`, `pgp`) without a written tradeoff note covering:
+      native toolchain cost, cross-platform CI complexity, auditability,
+      and whether the native dependency truly reduces overall risk.
+
+- [ ] If Zig is evaluated at all, constrain it to narrow ABI shims
+      or parser islands where the native surface is small and stable.
+      First plausible candidate: generated-FFI replacement work around
+      `bindgen`, not the OCI or PGP stacks.
+
+### Execution order
+
+- [ ] PR 1: remove `httpmock` / `wiremock`
+- [ ] PR 2: tokio feature audit
+- [ ] PR 3: small utility cleanup (`which`, `names`, optional UI deps)
+- [ ] PR 4: `oci-client` spike branch and go/no-go review
+- [ ] PR 5: land `oci-client` rewrite if approved
+- [ ] PR 6: `pgp` rewrite if still justified after the OCI work
+
 Recent maintenance:
 
 - [x] Fixed the Linux `passt` supervisor startup regression that was failing PR #460's `Test` lane: `mvm-libkrun::passt::spawn` no longer passes `--log-file` into private scratch dirs, and a regression test now asserts the generated passt argv omits that flag while preserving the pid-file path.
