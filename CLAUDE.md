@@ -30,6 +30,27 @@ package manager (or build passt from source — see ADR-055 references).
 
 `mvmctl doctor` probes the right gateway per OS and emits install hints when missing.
 
+**macOS 26+ Apple Silicon** users can skip the `slp/krun/*` Homebrew trio when running with the Vz builder backend (the auto-detect default on that tier — see "Builder backend selection" below). Apple Virtualization.framework ships with the OS and needs no separate library install. The Homebrew trio is still required if you explicitly opt back into libkrun via `--builder libkrun` or `MVM_BUILDER_BACKEND=libkrun`.
+
+## Builder backend selection (Plan 98)
+
+The builder VM (the Linux guest that runs `nix build` inside `mvmctl build` / `mvmctl up` / `mvmctl dev`) picks between two host VMMs:
+
+- **libkrun** — third-party in-process VMM via the Homebrew trio above. Default on Linux + macOS 13-25. Works everywhere mvm runs.
+- **Vz** — Apple Virtualization.framework. Default on macOS 26+ Apple Silicon (mirrors the Apple Container runtime tier). macOS-only.
+
+Selection priority (highest first):
+
+1. `--builder <libkrun|vz>` global CLI flag.
+2. `MVM_BUILDER_BACKEND=libkrun|vz` env var (case-insensitive, whitespace-trimmed; unrecognised values log a warning and fall through to auto-detect).
+3. Auto-detect: macOS 26+ Apple Silicon → Vz; everywhere else → libkrun.
+
+`mvmctl doctor` reports the resolved choice on the `builder backend` line with format `<backend> — <source> — <availability>` so the override path is observable.
+
+Vz on macOS 13-25 is opt-in only via the flag/env override — auto-detect won't pick it because the deployment baseline is macOS 26+. The two backends produce byte-identical `BuilderArtifacts` (kernel + rootfs from the same `nix/images/builder-vm/` flake), so switching backends mid-development is supported.
+
+Persistent builder state dirs live under `~/.cache/mvm/builder-vm/vms/`, distinguished by name prefix (`mvm-persistent-builder-vm-*` for libkrun, `mvm-persistent-builder-vz-*` for Vz). The Stage 0 reaper (Plan 99 PR-1) is prefix-agnostic so both backends participate in `mvmctl cache prune` without code changes.
+
 ## Architecture
 
 ### Workspace Structure
