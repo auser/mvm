@@ -25,6 +25,7 @@ use clap::{Args as ClapArgs, Subcommand};
 use crate::ui;
 
 use mvm_backend::{LibkrunBackend, VzBackend};
+use mvm_build::builder_backend_select::BuilderBackendChoice;
 use mvm_core::platform::{self, Platform};
 use mvm_core::user_config::MvmConfig;
 use mvm_core::vm_backend::{VmBackend, VmId, VmStartConfig, VmStatus};
@@ -245,9 +246,77 @@ fn bail_no_dev_backend() -> Result<()> {
     );
 }
 
+/// Plan 98 §2.5 — cross-backend coexistence helpers.
+///
+/// Both `LibkrunBackend` and `VzBackend` boot a runtime VM named
+/// `apple_container::DEV_VM_NAME` ("mvm-dev"). Their status probes
+/// only see their *own* state — VzBackend's `status("mvm-dev")`
+/// returns `Stopped` even if libkrun has a live VM by the same name.
+/// Without an explicit cross-check, switching backends without `dev
+/// down` would silently start a second dev VM under the new backend
+/// while the old one keeps running.
+///
+/// The helpers below probe both backends and let `cmd_dev_*` refuse
+/// the new boot when the other backend's dev VM is already alive.
+/// `dev status` reports both sides; `dev down` is best-effort over
+/// both so the user can switch backends cleanly without remembering
+/// which one is up.
+///
+/// Returns `Some("libkrun"|"vz")` when the *other* backend's dev VM
+/// is currently running, otherwise `None`. Errors propagated — a
+/// status probe failure shouldn't be silently swallowed (it may
+/// mean the backend is wedged, which is its own kind of "running").
+fn other_backend_dev_vm_running(current: BuilderBackendChoice) -> Result<Option<&'static str>> {
+    let id = VmId(apple_container::DEV_VM_NAME.to_string());
+    match current {
+        BuilderBackendChoice::Libkrun => {
+            if matches!(
+                VzBackend.status(&id)?,
+                VmStatus::Running | VmStatus::Starting
+            ) {
+                Ok(Some("vz"))
+            } else {
+                Ok(None)
+            }
+        }
+        BuilderBackendChoice::Vz => {
+            if matches!(
+                LibkrunBackend.status(&id)?,
+                VmStatus::Running | VmStatus::Starting
+            ) {
+                Ok(Some("libkrun"))
+            } else {
+                Ok(None)
+            }
+        }
+    }
+}
+
+/// Pure predicate — refuse the boot when the other backend is up.
+/// Lifted out for hermetic unit tests; the caller passes the
+/// probe result so the test doesn't need to spoof the live host.
+fn refuse_if_other_backend_running(
+    current: BuilderBackendChoice,
+    other_running: Option<&str>,
+) -> Result<()> {
+    if let Some(other) = other_running {
+        anyhow::bail!(
+            "The {other} dev VM is already running. Stop it first with `mvmctl --builder \
+             {other} dev down` (or just `mvmctl dev down` with the matching backend env), \
+             then re-run `mvmctl --builder {} dev up`.",
+            current.name(),
+        );
+    }
+    Ok(())
+}
+
 fn cmd_dev_libkrun(cpus: u32, memory_gib: u32, open_shell: bool) -> Result<()> {
     let backend = LibkrunBackend;
     let id = VmId(apple_container::DEV_VM_NAME.to_string());
+
+    // Plan 98 §2.5 — refuse cleanly if Vz is already running.
+    let other = other_backend_dev_vm_running(BuilderBackendChoice::Libkrun)?;
+    refuse_if_other_backend_running(BuilderBackendChoice::Libkrun, other)?;
 
     if matches!(backend.status(&id)?, VmStatus::Running) {
         ui::success("libkrun dev VM already running.");
@@ -278,12 +347,26 @@ fn cmd_dev_libkrun(cpus: u32, memory_gib: u32, open_shell: bool) -> Result<()> {
     Ok(())
 }
 
+/// Plan 98 §2.5 — `dev down` is best-effort over both backends so
+/// a user who switched backends without `dev down` first can still
+/// recover cleanly. The current-backend stop is the primary
+/// surface; the other-backend stop is best-effort (logged but not
+/// surfaced as a hard error).
 fn cmd_dev_libkrun_down() -> Result<()> {
-    LibkrunBackend.stop(&VmId(apple_container::DEV_VM_NAME.to_string()))
+    let id = VmId(apple_container::DEV_VM_NAME.to_string());
+    // Best-effort stop of the Vz side too (no-op if not running;
+    // status check + stop is cheap).
+    if let Ok(VmStatus::Running | VmStatus::Starting | VmStatus::Paused) = VzBackend.status(&id)
+        && let Err(e) = VzBackend.stop(&id)
+    {
+        tracing::warn!(error = %e, "best-effort Vz dev VM stop failed during libkrun dev down");
+    }
+    LibkrunBackend.stop(&id)
 }
 
 fn cmd_dev_libkrun_status() -> Result<()> {
-    let status = LibkrunBackend.status(&VmId(apple_container::DEV_VM_NAME.to_string()))?;
+    let id = VmId(apple_container::DEV_VM_NAME.to_string());
+    let status = LibkrunBackend.status(&id)?;
     let state = match status {
         VmStatus::Starting => "starting",
         VmStatus::Running => "running",
@@ -294,6 +377,15 @@ fn cmd_dev_libkrun_status() -> Result<()> {
     ui::info("Backend:  libkrun (Hypervisor.framework)");
     ui::info(&format!("VM:       {}", apple_container::DEV_VM_NAME));
     ui::info(&format!("Status:   {state}"));
+    // Plan 98 §2.5 — surface the other backend's state too.
+    if let Ok(Some(other)) = other_backend_dev_vm_running(BuilderBackendChoice::Libkrun) {
+        ui::warn(&format!(
+            "Note: the {other} dev VM is also running. Run \
+             `mvmctl --builder {other} dev down` before re-running \
+             `mvmctl --builder libkrun dev up` if you intend to switch \
+             backends."
+        ));
+    }
     Ok(())
 }
 
@@ -307,6 +399,10 @@ fn cmd_dev_libkrun_status() -> Result<()> {
 fn cmd_dev_vz(cpus: u32, memory_gib: u32, open_shell: bool) -> Result<()> {
     let backend = VzBackend;
     let id = VmId(apple_container::DEV_VM_NAME.to_string());
+
+    // Plan 98 §2.5 — refuse cleanly if libkrun is already running.
+    let other = other_backend_dev_vm_running(BuilderBackendChoice::Vz)?;
+    refuse_if_other_backend_running(BuilderBackendChoice::Vz, other)?;
 
     if matches!(backend.status(&id)?, VmStatus::Running) {
         ui::success("Vz dev VM already running.");
@@ -338,11 +434,20 @@ fn cmd_dev_vz(cpus: u32, memory_gib: u32, open_shell: bool) -> Result<()> {
 }
 
 fn cmd_dev_vz_down() -> Result<()> {
-    VzBackend.stop(&VmId(apple_container::DEV_VM_NAME.to_string()))
+    let id = VmId(apple_container::DEV_VM_NAME.to_string());
+    // Plan 98 §2.5 — best-effort stop of the libkrun side too.
+    if let Ok(VmStatus::Running | VmStatus::Starting | VmStatus::Paused) =
+        LibkrunBackend.status(&id)
+        && let Err(e) = LibkrunBackend.stop(&id)
+    {
+        tracing::warn!(error = %e, "best-effort libkrun dev VM stop failed during Vz dev down");
+    }
+    VzBackend.stop(&id)
 }
 
 fn cmd_dev_vz_status() -> Result<()> {
-    let status = VzBackend.status(&VmId(apple_container::DEV_VM_NAME.to_string()))?;
+    let id = VmId(apple_container::DEV_VM_NAME.to_string());
+    let status = VzBackend.status(&id)?;
     let state = match status {
         VmStatus::Starting => "starting",
         VmStatus::Running => "running",
@@ -353,6 +458,15 @@ fn cmd_dev_vz_status() -> Result<()> {
     ui::info("Backend:  Vz (Apple Virtualization.framework)");
     ui::info(&format!("VM:       {}", apple_container::DEV_VM_NAME));
     ui::info(&format!("Status:   {state}"));
+    // Plan 98 §2.5 — surface the other backend's state too.
+    if let Ok(Some(other)) = other_backend_dev_vm_running(BuilderBackendChoice::Vz) {
+        ui::warn(&format!(
+            "Note: the {other} dev VM is also running. Run \
+             `mvmctl --builder {other} dev down` before re-running \
+             `mvmctl --builder vz dev up` if you intend to switch \
+             backends."
+        ));
+    }
     Ok(())
 }
 
@@ -547,8 +661,55 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
 
 #[cfg(test)]
 mod tests {
-    use super::{DevBackend, select_dev_backend};
+    use super::{DevBackend, refuse_if_other_backend_running, select_dev_backend};
+    use mvm_build::builder_backend_select::BuilderBackendChoice;
     use mvm_core::platform::Platform;
+
+    // ──────────────────────────────────────────────────────────────
+    // Slice §2.5 — cross-backend coexistence dispatch.
+    // ──────────────────────────────────────────────────────────────
+
+    #[test]
+    fn libkrun_refuses_when_vz_already_running() {
+        let err = refuse_if_other_backend_running(BuilderBackendChoice::Libkrun, Some("vz"))
+            .expect_err("must refuse when vz is running");
+        let msg = format!("{err:#}");
+        assert!(msg.contains("vz dev VM is already running"), "got: {msg}");
+        assert!(msg.contains("mvmctl --builder vz dev down"), "got: {msg}");
+        assert!(
+            msg.contains("mvmctl --builder libkrun dev up"),
+            "got: {msg}"
+        );
+    }
+
+    #[test]
+    fn vz_refuses_when_libkrun_already_running() {
+        let err = refuse_if_other_backend_running(BuilderBackendChoice::Vz, Some("libkrun"))
+            .expect_err("must refuse when libkrun is running");
+        let msg = format!("{err:#}");
+        assert!(
+            msg.contains("libkrun dev VM is already running"),
+            "got: {msg}"
+        );
+        assert!(
+            msg.contains("mvmctl --builder libkrun dev down"),
+            "got: {msg}"
+        );
+        assert!(msg.contains("mvmctl --builder vz dev up"), "got: {msg}");
+    }
+
+    #[test]
+    fn no_other_backend_running_permits_boot() {
+        // Both directions when the other backend isn't up.
+        refuse_if_other_backend_running(BuilderBackendChoice::Libkrun, None).unwrap();
+        refuse_if_other_backend_running(BuilderBackendChoice::Vz, None).unwrap();
+    }
+
+    // ──────────────────────────────────────────────────────────────
+    // Slice 2B — `select_dev_backend` priority. Hermetic; injects
+    // platform + builder choice + per-capability bools so the
+    // dispatch is testable without touching the live host.
+    // ──────────────────────────────────────────────────────────────
 
     // ──────────────────────────────────────────────────────────────
     // Slice 2B — `select_dev_backend` priority. Hermetic; injects
