@@ -477,6 +477,13 @@ plans` per commit 8.
 
 ## Status
 
-🟡 in progress — Plan 103 tracker filed 2026-05-26.
-Implementation worktree at
-`.claude/worktrees/plan-101-w6a-substrate/`.
+🟢 **W6.A merged 2026-05-27** (PR #459 on `main` at `df950fd9`).
+
+🟡 **W6.A.5 substrate wire-up in flight (2026-05-27)** — 8 commits
+on `worktree-plan-102-w6a-5-wire-up` covering Phases 1–5 of the
+follow-up. See [Plan 102 §W6.A.5](102-gateway-audit-substrate-impl.md#w6a5--vz-swift-bridge--fd-interception-wire-up)
+for the per-item status. Producer activation (`Phase 3c`) and
+live smokes are scheduled for the next PR — until then the
+bridge factory branch is dormant at runtime (`cfg.tenant_id`
+stays `None` and every spawn takes the legacy `run_supervisor`
+path).
