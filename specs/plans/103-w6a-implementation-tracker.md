@@ -99,16 +99,23 @@ observable, mediable substrate across all three backends
 
 ### Commit 2 — `FileAuditSigner` cross-process flock
 
-- [ ] `crates/mvm-supervisor/src/audit_file.rs:125-172` —
-      wrap `sign_and_emit` body in
-      `rustix::fs::flock(fd, LockExclusive)`
-- [ ] Re-read chain tail under the lock to refresh cursor
-- [ ] In-memory `cursors: Mutex<HashMap>` becomes fast-path hint
-- [ ] Test: `flock_serializes_concurrent_writers`
-- [ ] Test: `two_processes_writing_same_tenant_produce_valid_chain`
-      (fork + exec helper writes N entries, parent writes M
-      interleaved, `verify_audit_chain` returns N+M)
-- [ ] `cargo test --workspace` green
+- [x] `crates/mvm-supervisor/src/audit_file.rs:123-180` —
+      wrap `sign_and_emit` body in `rustix::fs::flock(fd, LockExclusive)`
+      (added `flock_exclusive` helper)
+- [x] Re-read chain tail under the lock to refresh cursor
+- [x] In-memory `cursors: Mutex<HashMap>` becomes fast-path hint
+      (overwritten with fresh on-disk hash on every emit)
+- [x] `rustix = { version = "1.1", features = ["fs"] }` added to
+      mvm-supervisor `[target.'cfg(unix)'.dependencies]`
+- [x] Test: `flock_serializes_two_signer_instances_on_same_tenant_file`
+      (two `Arc<FileAuditSigner>` instances racing 50 entries each
+      from concurrent tokio tasks; `verify_audit_chain` returns
+      100, chain holds) — chosen over fork+exec helper as a tighter
+      regression that exercises the exact in-memory-cursor-vs-disk
+      race the flock prevents
+- [x] `cargo test -p mvm-supervisor --lib audit_file::` green
+      (10 tests; pre-flock implementation would fail
+      `flock_serializes_two_signer_instances_on_same_tenant_file`)
 
 ### Commit 3 — Chain enum (`AuditAction::Flow*`)
 

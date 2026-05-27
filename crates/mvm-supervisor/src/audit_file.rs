@@ -131,18 +131,35 @@ impl AuditSigner for FileAuditSigner {
             .map(|p| format!("file:{}", p.display()))
             .unwrap_or_else(|| format!("tenant:{tenant}"));
 
-        let prev_hash = {
+        // Plan 102 W6.A commit 2 — cross-process chain integrity.
+        //
+        // The in-memory `cursors` HashMap only serializes writers
+        // inside *this* process. Two `mvm-libkrun-supervisor`
+        // instances for the same tenant would otherwise both restore
+        // the same on-disk prev_hash, both append, and break the
+        // chain. Take an exclusive flock on the tenant file across
+        // the whole read-cursor / sign / append critical section.
+        //
+        // The in-memory cursor cache stays a fast-path hint;
+        // restoration under the lock is the source of truth.
+        let mut file = OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|e| AuditError::Io(e.to_string()))?;
+        flock_exclusive(&file).map_err(|e| AuditError::Io(e.to_string()))?;
+        // Lock is released on `file` drop at end of scope.
+
+        // Refresh the cursor under the lock — another process may
+        // have appended between our last in-memory snapshot and
+        // this call.
+        let prev_hash = self
+            .restore_cursor(&path)
+            .map_err(|e| AuditError::Io(e.to_string()))?;
+        {
             let mut cursors = self.cursors.lock().expect("cursors poisoned");
-            if let Some(h) = cursors.get(&cursor_key) {
-                *h
-            } else {
-                let h = self
-                    .restore_cursor(&path)
-                    .map_err(|e| AuditError::Io(e.to_string()))?;
-                cursors.insert(cursor_key.clone(), h);
-                h
-            }
-        };
+            cursors.insert(cursor_key.clone(), prev_hash);
+        }
 
         let entry_bytes = serde_json::to_vec(entry).map_err(|e| AuditError::Io(e.to_string()))?;
         let mut to_sign = entry_bytes;
@@ -157,11 +174,6 @@ impl AuditSigner for FileAuditSigner {
         let line = serde_json::to_string(&envelope).map_err(|e| AuditError::Io(e.to_string()))?;
         let new_hash = hash_line(line.as_bytes());
 
-        let mut file = OpenOptions::new()
-            .create(true)
-            .append(true)
-            .open(&path)
-            .map_err(|e| AuditError::Io(e.to_string()))?;
         writeln!(file, "{line}").map_err(|e| AuditError::Io(e.to_string()))?;
 
         self.cursors
@@ -169,7 +181,19 @@ impl AuditSigner for FileAuditSigner {
             .expect("cursors poisoned")
             .insert(cursor_key, new_hash);
         Ok(())
+        // `file` drop releases the flock here.
     }
+}
+
+/// Take an exclusive advisory lock on `file`. Blocks until acquired.
+/// Released when the OwnedFd backing `file` is dropped.
+///
+/// Plan 102 W6.A commit 2: cross-process chain integrity for the
+/// per-tenant audit chain.
+fn flock_exclusive(file: &std::fs::File) -> std::io::Result<()> {
+    use rustix::fs::{FlockOperation, flock};
+    use std::os::fd::AsFd;
+    flock(file.as_fd(), FlockOperation::LockExclusive).map_err(std::io::Error::from)
 }
 
 #[derive(Debug, Error)]
@@ -478,5 +502,58 @@ mod tests {
         let err = verify_audit_chain(&signer.tenant_path("tenant-a"), &other_vk)
             .expect_err("wrong key must fail");
         assert!(matches!(err, VerifyError::SignatureInvalid { line: 0 }));
+    }
+
+    /// Plan 102 W6.A commit 2 — cross-instance race regression.
+    ///
+    /// Simulates the "two `mvm-libkrun-supervisor` processes for the
+    /// same tenant" race by constructing two independent
+    /// `FileAuditSigner` instances pointed at the same audit dir,
+    /// sharing the same signing key (one per host), and interleaving
+    /// their writes from concurrent tokio tasks. Without the flock
+    /// precursor each instance's in-memory cursor cache would let
+    /// both append using the same stale `prev_hash`, breaking the
+    /// chain at verify time. With flock, every write re-reads the
+    /// chain tail under an exclusive lock — the chain stays valid.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn flock_serializes_two_signer_instances_on_same_tenant_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let key = fresh_key();
+        let vk = key.verifying_key();
+
+        // Two signer instances over the same dir — like two processes.
+        let signer_a = std::sync::Arc::new(FileAuditSigner::open(key.clone(), dir.path()).unwrap());
+        let signer_b = std::sync::Arc::new(FileAuditSigner::open(key, dir.path()).unwrap());
+
+        const N: usize = 50;
+        let a = signer_a.clone();
+        let task_a = tokio::spawn(async move {
+            for i in 0..N {
+                a.sign_and_emit(&make_entry("tenant-shared", &format!("a-{i}")))
+                    .await
+                    .unwrap();
+            }
+        });
+        let b = signer_b.clone();
+        let task_b = tokio::spawn(async move {
+            for i in 0..N {
+                b.sign_and_emit(&make_entry("tenant-shared", &format!("b-{i}")))
+                    .await
+                    .unwrap();
+            }
+        });
+        task_a.await.unwrap();
+        task_b.await.unwrap();
+
+        // Chain must verify cleanly: all 2 * N envelopes link
+        // correctly and every signature checks.
+        let path = signer_a.tenant_path("tenant-shared");
+        let count = verify_audit_chain(&path, &vk)
+            .expect("chain must verify under concurrent two-instance writers");
+        assert_eq!(
+            count,
+            2 * N,
+            "all entries must land — flock serializes writers, no drops"
+        );
     }
 }

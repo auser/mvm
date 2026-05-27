@@ -77,6 +77,14 @@ tracing.workspace = true
 # check.
 [target.'cfg(unix)'.dependencies]
 libc.workspace = true
+# Plan 102 W6.A commit 2 — `FileAuditSigner::sign_and_emit` now takes
+# an exclusive flock on the per-tenant chain file across the whole
+# read-cursor / sign / append critical section. Without it, two
+# `mvm-libkrun-supervisor` processes for the same tenant race the
+# in-memory cursor cache vs. the on-disk chain — both restore the same
+# prev_hash, both append, `verify_audit_chain` fails. rustix is already
+# in mvm-oci's deps (workspace dep); pulling it into mvm-supervisor.
+rustix = { version = "1.1", features = ["fs"] }
 
 [dev-dependencies]
 tempfile.workspace = true
