@@ -373,22 +373,34 @@ The Rust side is ready for the Swift connect: ingest socket +
 handshake + NDJSON drain all land in commit 5's
 `run_vz_ingest_bridge`; just needs the Swift writer to connect.
 
-### Commit 8 — ADR-058 + Plan 102 + ADR-055 + SPRINT.md amendments
+### Commit 8 — ADR-058 + Plan 102 amendments (ADR-055 + SPRINT.md done earlier)
 
-- [ ] `specs/adrs/058-claim-10-bytes-leaving-trust-boundary.md`
-      `### Leg 2` — append no-bypass invariant, coverage vs.
-      capture, mediable substrate, W6 scope clarification
-- [ ] `specs/adrs/058-...` `## Out of scope` — append 5 new
-      items (east-west, per-byte capture default, cross-tenant
-      mgmt, L7 URL inspection, DoH bypass)
-- [ ] `specs/adrs/055-passt-virtio-net.md` — drop §"TSI escape
-      hatch", replace with pointer to ADR-058 no-bypass invariant
-- [ ] `specs/plans/102-gateway-audit-substrate-impl.md` —
-      `### deferred follow-ups` becomes two subsections (W6.B
-      follow-ups + Adjacent new plans)
-- [ ] SPRINT.md Sprint 56 W3 status updated to reflect W6.A
-      impl in flight (Plan 103 reference already in commit 0;
-      this is the "shipped" flip when PR merges)
+- [x] `specs/adrs/058-claim-10-bytes-leaving-trust-boundary.md`
+      `### Leg 2` — appended "W6.A amendment" subsection with
+      no-bypass invariant, coverage vs. capture, mediable
+      substrate, cross-process chain integrity, scope
+      clarification, cross-tenant isolation invariant
+- [x] `specs/adrs/058-...` `## Out of scope` — appended 7 items
+      under "### Added by W6.A amendment":
+      - east-west lateral flows (W11)
+      - L7 URL inspection (Plan 34 Phase 2)
+      - DoH bypass (Plan 74 follow-up)
+      - SNI hostname allowlist (new plan)
+      - Side-channel via flow timing
+      - Multi-user shared host same UID
+      - Cross-tenant network management (mvmd plan 50)
+- [x] `specs/adrs/055-passt-virtio-net.md` — TSI escape hatch
+      removed (landed in commit 1's docs sweep)
+- [x] `specs/plans/102-gateway-audit-substrate-impl.md`
+      `## Deferred follow-ups` — three subsections:
+      - `### W6.A.5` (Vz Swift bridge + fd interception wire-up;
+        deferred from W6.A as the Swift code can't compile-verify
+        from this session)
+      - `### W6.B follow-ups` (real flow extraction items)
+      - `### Adjacent new plans` (SNI inspector, Plan 34 Phase 2,
+        DoH deny, gvproxy supply-chain, mvmd-network-manager)
+- [x] SPRINT.md Sprint 56 §W3 + §Non-goals updated in commit 0;
+      no further amendment needed in commit 8
 
 ### Commit 9 — PR description + open
 

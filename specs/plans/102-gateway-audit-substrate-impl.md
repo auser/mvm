@@ -169,4 +169,86 @@ cargo +nightly fuzz run fuzz_gateway_bridge -- -max_total_time=60
 here. Per project convention, deferred items live in the same plan
 doc as the slice that introduced them — not in PR descriptions.)
 
-- [ ] (placeholder — add real items as they emerge)
+W6.A implementation tracker: [Plan 103](103-w6a-implementation-tracker.md).
+
+### W6.A.5 — Vz Swift bridge + fd interception wire-up
+
+Deferred from W6.A because Swift requires macOS + Vz framework
+to compile-verify, and the Rust `configure_with_gateway` split
+(needed for libkrun fd interception) is invasive enough to want
+its own focused PR.
+
+- [ ] `crates/mvm-vz-supervisor/Sources/mvm-vz-supervisor/Network.swift`
+      — `makeGvproxyDevice` rewrite (socketpair + ingest connect
+      with `MVM_VZ_BRIDGE_V1\n` handshake + `Task.detached` splice
+      loops + NDJSON emit on first packet / shutdown)
+- [ ] Swift XCTest harness (5 tests: shuffles_datagrams,
+      emits_flow_opened, emits_flow_closed, handshake_sent_first,
+      reconnect)
+- [ ] `crates/mvm-backend/src/vz.rs:809-812` — populate `network`
+      with `NetworkConfig::Gvproxy { events_ingest_socket_path:
+      Some(...) }` sourced from `mvm_data_dir() + audit/`
+- [ ] `crates/mvm-backend/src/libkrun.rs` — populate `SupervisorConfig`
+      audit fields from `ExecutionPlan` (tenant_id) + `mvm_data_dir()`
+- [ ] Split `configure_with_gateway` into `configure_pre_net` +
+      bridge-socketpair-insertion in `crates/mvm-libkrun/src/lib.rs`
+- [ ] Add `pub fn run_supervisor_with_bridge<F>(cfg, factory)` in
+      mvm-libkrun, swap `mvm-libkrun-supervisor::main` from
+      `run_supervisor` to `run_supervisor_with_bridge`
+- [ ] Live smoke on all three backends (Linux+passt,
+      macOS+libkrun+gvproxy, macOS+Vz+gvproxy)
+
+### W6.B follow-ups (real flow extraction, next PR in this work stream)
+
+- [ ] Flow flooding DoS: per-instance rate cap (1000/sec) +
+      `FlowFlood` aggregation events for excess
+- [ ] Parser fault containment: `std::panic::catch_unwind` around
+      etherparse; emit `GatewayAuditFault` on panic and degrade
+      that flow to pass-through splice
+- [ ] Bounded flow table (4096 active flows / instance) with
+      oldest-idle eviction and `FlowEvicted` emission on overflow
+- [ ] Real per-direction byte counters in `FlowClosed` (from parsed
+      frame sizes, not stub counts)
+- [ ] Fuzz target `crates/mvm-libkrun/fuzz/fuzz_gateway_bridge.rs`
+      seeded from real Ethernet captures
+- [ ] Rust→Swift drop command channel for Vz mediation actuation
+      (per-flow drop directives from `FlowPolicy` evaluator to
+      Swift bridge)
+- [ ] Broadcast/ARP/DHCP noise distinguishing — emit `FrameOther`
+      for non-IP frames; drop from main per-flow event stream
+- [ ] Spurious vfkit-handshake `FlowOpened` on passt ingress —
+      passt's first inbound bytes are vfkit framing, not guest
+      traffic; parser-aware fix
+- [ ] `signer_task_sole_writer_under_concurrent_events` direct
+      regression test (currently covered end-to-end by passt
+      bridge test)
+- [ ] `bridge_panic_exits_process_nonzero` subprocess integration
+      test (W6.A's `catch_unwind` → `exit(1)` plumbing is in place
+      but not tested via subprocess)
+- [ ] `gateway_child_does_not_inherit_audit_socket_fds` CLOEXEC
+      regression test
+
+### Adjacent new plans (separate work streams)
+
+- [ ] Move gvproxy spawn helper out of mvm-libkrun (mvm-providers
+      or new mvm-gateways crate)
+- [ ] **SNI inspector in gateway bridge** — new plan. Hostname-
+      level allowlist without TLS MITM. Inspector extracts SNI
+      from TLS ClientHello cleartext, populates
+      `FlowDecisionCtx::sni_hostname`, lets a `FlowPolicy` impl
+      allow/deny by hostname.
+- [ ] **Plan 34 Phase 2: finalize TLS MITM in L7EgressProxy** —
+      reactivate existing plan. Workload-trusted host CA per
+      ADR-006; supervisor terminates TLS, inspects URL, decides,
+      re-encrypts. Enables URL-path allowlist
+      (`github.com/auser/mvm` vs `github.com/some-evil-repo`).
+- [ ] **Plan 74 follow-up: mandatory-deny well-known DoH
+      endpoints** (1.1.1.1:443, dns.google, etc.). Closes the
+      DoH-bypass gap in admission-time DNS pinning.
+- [ ] **gvproxy supply-chain hardening** — pin version+SHA in
+      `mvmctl doctor`; vendoring evaluation. cargo deny / cargo
+      audit don't cover Homebrew bottles.
+- [ ] **mvmd-network-manager** cross-repo plan filed in
+      `tinylabscom/mvmd/specs/plans/50-network-manager.md`
+      (per-tenant gateway pool, egress quotas, tenant-level audit
+      rollup, cross-tenant isolation policy).
