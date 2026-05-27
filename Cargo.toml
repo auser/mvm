@@ -102,16 +102,20 @@ too_many_arguments = "deny"
 [workspace.dependencies]
 # Async runtime.
 #
-# `features = ["full"]` is convenient but pulls a lot of code into
-# every test binary's compile graph. A per-crate audit to narrow the
-# feature set is tracked as a follow-up — the union across the
-# workspace is roughly: io-util, macros, rt, rt-multi-thread, net,
-# time, sync, fs, signal, test-util. Switching to the narrowed set
-# requires touching every crate that today says `tokio.workspace =
-# true` with no explicit features (mvm-guest, mvm-addon-dns,
-# mvm-addon-vsock-bridge, the mvm crate) so it can't ride along
-# with a profile/CI tuning PR.
-tokio = { version = "1", features = ["full"] }
+# Narrowed from `features = ["full"]` to the union actually used
+# across the workspace. Dropping `io-std` (no `tokio::io::std*`
+# consumers) and `parking_lot` (no consumers; `tokio::sync::Mutex`
+# uses its own primitives). `test-util` is dev-dep-only — the
+# crates that need it (`mvm-oci`, `mvm-supervisor`, root) add it
+# on their own `[dev-dependencies] tokio` line. `rt-multi-thread`
+# stays because the bare consumers `mvm-addon-dns`,
+# `mvm-addon-vsock-bridge`, and `mvm-guest-netinit` use
+# `#[tokio::main]`, which expands to the multi-threaded runtime
+# unless told otherwise.
+#
+# Per-crate consumers can extend with extra features as usual —
+# Cargo unions feature sets across the workspace.
+tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "process", "rt", "rt-multi-thread", "signal", "sync", "time"] }
 
 # Pattern matching
 aho-corasick = "1"
