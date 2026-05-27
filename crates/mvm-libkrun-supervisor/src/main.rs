@@ -15,6 +15,16 @@
 //! to a single supervisor; the parent `mvmctl` returns immediately
 //! after spawning and survives a guest's shutdown.
 //!
+//! ## Why this is its own crate
+//!
+//! Plan 102 W6.A.5 — the bin's bridge-factory branch needs to
+//! depend on `mvm-supervisor` (gateway audit substrate). Adding
+//! `mvm-supervisor` to `mvm-libkrun`'s deps would close the cycle
+//! `mvm-supervisor → mvm-backend → mvm-libkrun`. Splitting the bin
+//! into a leaf crate breaks the cycle cleanly. The binary name is
+//! preserved so `mvm-backend::libkrun::resolve_supervisor_path()`
+//! keeps resolving it.
+//!
 //! ## Usage (manual)
 //!
 //! ```sh

@@ -8,6 +8,12 @@ members = [
     "crates/mvm-supervisor",
     "crates/mvm-providers",
     "crates/mvm-libkrun",
+    # Plan 102 W6.A.5 — leaf bin crate that links mvm-libkrun + mvm-
+    # supervisor without closing the
+    # `mvm-supervisor → mvm-backend → mvm-libkrun` cycle. Produces the
+    # `mvm-libkrun-supervisor` binary that mvm-backend's spawner
+    # resolves at runtime.
+    "crates/mvm-libkrun-supervisor",
     # Plan 97 Phase B — type-safe interface to the Swift
     # `mvm-vz-supervisor` binary. Pure data + path resolution; no FFI,
     # no Swift dep. Parallel role to `mvm-libkrun` for the Vz backend.
