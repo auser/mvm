@@ -104,5 +104,5 @@ team can use it freely.
 - ADR-002 §"Security model" — claims 1–8 (pre-plan-75) and 9 (deps).
 - OCI provenance planning — defines this claim in its security
   implications section.
-- CLAUDE.md §"Security model" — claim 10 line lands in CLAUDE.md
-  when plan 75 W6 flips status to `Shipped`.
+- CLAUDE.md §"Security model" — claim 10 line landed when Plan 85
+  finalization flipped the plan status to `Shipped` (2026-05-26).
