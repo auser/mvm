@@ -61,7 +61,9 @@ exclude = [
     "crates/mvm-guest/fuzz",
     # Plan 85 §R1 / Phase A.2 — layer-unpack fuzz harness. Same
     # libfuzzer-sys linker-flag constraints as the mvm-guest fuzz
-    # crate; CI gate at `.github/workflows/ci.yml::oci-unpack-fuzz`.
+    # crate; CI gate at `.github/workflows/security.yml::fuzz` (the
+    # `Fuzz OCI unpack_layer` step). Release-tag + nightly + manual
+    # dispatch only; not run on per-PR pushes.
     "crates/mvm-oci/fuzz",
     # Plan 88 W6 / ADR-055 §"New untrusted-input surfaces" —
     # supervisor-config JSON fuzz harness. CI gate at

@@ -179,12 +179,14 @@ jobs:
           fi
           echo "ok: matching sha256 across two clean builds: $a"
 
-  # ── Lane 4: Frame-parser fuzzing (best-effort, time-boxed) ─────────
-  # ADR-002 §W4.2 — cargo-fuzz harnesses for GuestRequest and the
-  # authenticated-frame envelope. Run for 5 minutes per PR; the
-  # nightly cron extends to 30 minutes.
+  # ── Lane 4: Parser fuzzing (best-effort, time-boxed) ───────────────
+  # ADR-002 §W4.2 + Plan 85 §R1 — cargo-fuzz harnesses for
+  # GuestRequest, the authenticated-frame envelope, the libkrun/Vz
+  # SupervisorConfig parsers, and the OCI layer-unpack ingress.
+  # Run for 5 minutes per tag-push / dispatch; the nightly cron
+  # extends to 30 minutes.
   fuzz:
-    name: Fuzz — vsock frame parser (ADR-002 §W4.2)
+    name: Fuzz — parsers (vsock + OCI)
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v6
@@ -261,6 +263,21 @@ jobs:
         # Swift corpus equivalence assertion.
         run: cargo fuzz run fuzz_supervisor_config -- -max_total_time="$DURATION"
 
+      - name: Fuzz OCI unpack_layer
+        working-directory: crates/mvm-oci
+        env:
+          DURATION: ${{ steps.duration.outputs.secs }}
+          RUSTUP_TOOLCHAIN: nightly
+        # Plan 85 §R1 — `mvm_oci::unpack::unpack_layer` is the single
+        # ingress point for adversarial OCI layer tarballs (path
+        # traversal, hardlink chains, device-node sneak-ins, xattr
+        # privilege carry, setuid surprise). The Phase A.2 PR landed
+        # this harness; A.3 through A.6 added corpus entries. Moved
+        # here from ci.yml's per-PR lane (commit 304b5c9c+) so the
+        # 30-min budget only burns on release-tag pushes and the
+        # nightly cron, not on every mvm-oci PR.
+        run: cargo fuzz run unpack_layer -- -max_total_time="$DURATION"
+
       - name: Upload corpus on failure
         if: failure()
         uses: actions/upload-artifact@v7
@@ -273,6 +290,8 @@ jobs:
             crates/mvm-libkrun/fuzz/artifacts/
             crates/mvm-vz/fuzz/corpus/
             crates/mvm-vz/fuzz/artifacts/
+            crates/mvm-oci/fuzz/corpus/
+            crates/mvm-oci/fuzz/artifacts/
 
   # ── Lane 5: Hash-verify regression ─────────────────────────────────
   # ADR-002 §W5.1 — the unit tests that exercise the

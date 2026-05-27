@@ -216,13 +216,15 @@ post-date the CLAUDE.md per-claim summary below.)
     prod_pull_requires_digest_pin_before_network` and
     `prod_run_image_requires_digest_pin_before_network`), demands an
     explicit registry policy, and requires cosign verification of the
-    resolved digest before cache admission or boot. The
-    `oci-layer-unpack-fuzz` lane in `.github/workflows/ci.yml` fuzzes
-    `unpack_layer` for ≥30 minutes per PR that touches `crates/mvm-oci/**`;
-    the `oci-layer-unpack-adversarial`, `oci-digest-mismatch-reject`,
+    resolved digest before cache admission or boot. The OCI
+    `unpack_layer` fuzz harness lives in
+    `.github/workflows/security.yml`'s `fuzz` job (release-tag pushes
+    + nightly cron + manual dispatch); the
+    `oci-layer-unpack-adversarial`, `oci-digest-mismatch-reject`,
     `oci-malformed-manifest`, `oci-mutable-tag-prod-reject`,
-    `oci-reproducibility`, and `oci-image-runner-smoke` lanes gate
-    every PR that touches the OCI surface.
+    `oci-reproducibility`, and `oci-image-runner-smoke` lanes in
+    `.github/workflows/ci.yml` gate every PR that touches the OCI
+    surface.
 
 The guest agent itself runs as uid 901 under setpriv (W4.5); the
 host-side vsock proxy socket is mode 0700 (W1.2), the proxy port
