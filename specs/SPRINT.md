@@ -2039,25 +2039,29 @@ See [Plan 101 W11–W14](plans/101-in-guest-volume-encryption-and-gateway-audit.
 
 ### Why this sprint
 
-Today secrets reach microVMs by mounting a sealed ext4 drive at `/mnt/secrets` at boot; ADR-048 tags this `unsafe_guest_secret_materialization` and declines to claim non-leakage. ADR-049 already committed to a vsock side-channel for secret substitution but stubs it. This sprint generalizes ADR-049's mechanism into a **host services broker** with `host.secrets.v1` running in a **dedicated subprocess** (production-ready isolation per industry analogues — AWS STS, Vault, K8s SA tokens) — and ships `host.time.v1` + `host.cost.v1` in the in-process general broker to validate the substrate works for more than one service. The out-of-process handler substrate ships in v1 with secrets as its first consumer; future addon services reuse it without protocol change. Designed for **extensibility** — Cargo feature flags per service, versioned ServiceIds with parallel-version support, service composition across the process boundary, JSON wire format consistent with existing `GuestRequest` / `HostBoundRequest` channels.
+Today secrets reach microVMs by mounting a sealed ext4 drive at `/mnt/secrets` at boot; ADR-048 tags this `unsafe_guest_secret_materialization` and declines to claim non-leakage. ADR-049 already committed to a vsock side-channel for secret substitution but stubs it. This sprint generalizes ADR-049's mechanism into a **host services broker** built on a **four-subprocess architecture** (per Plan 104 §Hardening posture L1): `mvm-broker` (uid 903, general handlers), `mvm-secrets-dispatcher` (uid 902, `host.secrets.v1`), `mvm-host-signer` (uid 904, host-signer key isolation), and `mvm-audit-signer` (uid 905, sole audit-chain writer). Each subprocess runs under seccomp + setpriv + per-workload cgroup + namespace isolation. The supervisor becomes a pure launcher + admission controller + IPC router; the host signer key is never loaded into the supervisor's address space, and the audit chain-signing key is never loaded into anything but `mvm-audit-signer`. Designed for **highest-defensible security** — hardware-enclave host signer (W8, Apple SE + Linux TPM 2.0), per-binary cosign + TOCTOU-resistant exec + config-signing, per-spawn subprocess response keys, algorithm-identifier byte for crypto agility, audit-log encryption at rest with TPM-derived keys, Sigstore/in-toto supply-chain transparency, threat-model expanded to include software insider attacks. Cost: roughly 3–4 sprints of work where the original draft was 1.
 
 ### Workstream breakdown
 
-- [ ] **W1 — Broker substrate + secrets-subprocess scaffolding** (envelope, registry, two vsock listeners per VM — port 5300 general + port 5301 secrets, `mvm-secrets-dispatcher` new crate, supervisor subprocess lifecycle, UDS proxy code path; no handlers yet)
-- [ ] **W2 — `ExecutionPlan.services` + admission wiring** (schema + registry assembly + `EventCategory::ServiceCall` + rate-limit/lifetime-quota/circuit-breaker)
-- [ ] **W3 — `host.time.v1`** (handler in general broker + `broker.v1/list_services` + delete `HostBoundRequest::QueryHostTime`)
-- [ ] **W4a — `host.cost.v1` workload-scope** (handler in general broker; no mvmd dep)
-- [ ] **W4b — `host.cost.v1` cross-tenant via mvmd** (depends on mvmd Plan 51 W1+W2+W3; mvmd-response validation)
-- [ ] **W5 — `host.secrets.v1` inside the secrets subprocess** (ADR-049 implementation; delete `KeystoreReleaser` stubs; inter-call memory hygiene; subprocess seccomp + setpriv + uid 902)
-- [ ] **W6 — Fuzz + CI** (`fuzz_service_call.rs`, `xtask check-handler-*` lints, cross-backend test matrix, subprocess crash isolation tests)
+- [ ] **W1 — Four-subprocess infrastructure substrate** (envelope, registry, two vsock listeners per VM — port 5300 general + port 5301 secrets; four new crates: `mvm-broker`, `mvm-secrets-dispatcher`, `mvm-host-signer`, `mvm-audit-signer`; supervisor subprocess lifecycle for all four; UDS proxy code paths; cosign-verify + TOCTOU-resistant exec + config-signing per subprocess; per-workload cgroup + namespace isolation; resource caps; binary hardening; doctor host-posture checks; KSM/THP off; `fido_touch_required()` stub on `mvmctl up --prod`)
+- [ ] **W2 — `ExecutionPlan.services` + admission wiring + audit-signer wiring** (schema bump 4→5; registry assembly; `EventCategory::ServiceCall` routed through `mvm-audit-signer`; `O_APPEND` audit FD + dir-immutable; chain-head persistence; at-rest encryption; time-source integrity; rate-limit / lifetime-quota / circuit-breaker; session-key rotation; operator-action audit entries)
+- [ ] **W3 — `host.time.v1`** (handler in `mvm-broker` + `broker.v1/list_services` + delete `HostBoundRequest::QueryHostTime`)
+- [ ] **W4a — `host.cost.v1` workload-scope** (handler in `mvm-broker`; no mvmd dep)
+- [ ] **W4b — `host.cost.v1` cross-tenant via mvmd** (depends on mvmd Plan 52 W1+W2+W3; mvmd-response validation; tenant-level secret quotas; mvmd identity pinning)
+- [ ] **W5 — `host.secrets.v1` inside `mvm-secrets-dispatcher`** (ADR-049 implementation; per-spawn response signing; seccomp policy compliance tests; side-channel audit via dudect/CTGrind; latency floor; `KeystoreReleaser` stubs deleted)
+- [ ] **W6 — Fuzz + CI + mutation testing** (`fuzz_service_call.rs`, UDS-proxy fuzz, `xtask check-handler-*` + `xtask check-subprocess-fd-inheritance` lints, `cargo-mutants` lane, cross-backend test matrix, hostile-subprocess test per subprocess kind)
 - [ ] **W7 — ADR-049 §W3 SDK matrix** (Python + TS + Rust hook libraries; splittable per language)
+- [ ] **W8 — Hardware-enclave host signer** (Apple Secure Enclave on macOS + Linux TPM 2.0; algorithm-identifier byte enables P-256; `mvmctl host-key rotate` ceremony + TPM monotonic counter for rollback resistance; audit-encryption key migration to TPM/SE-derived master; software fallback retained with loud doctor downgrade)
+- [ ] **W9 — Supply chain + release hardening** (Sigstore/Rekor transparency log entries per subprocess release; in-toto attestations alongside SLSA; per-binary hermetic + reproducibility-double-build lane; CODEOWNERS + branch protection; `cargo-mutants` lane; crypto-crate pinning + `deny.toml` + RFC-8785 JCS conformance)
+- [ ] **W10 — Documentation + threat model** (`specs/threat-models/02-host-services-broker.md` STRIDE walk per service; `SECURITY.md` CVE response runbook; `docs/security/{audit-fields,deployment-modes}.md`; operator runbook; CLAUDE.md update)
+- [ ] **W11 — Operator FIDO ceremony full implementation** (may slip to Sprint 58 follow-on; Yubikey-touch on `mvmctl up --prod`; encrypted-USB fallback for non-FIDO hosts; doctor probes; `mvmctl host-key rotate` requires FIDO touch)
 
 ### Cross-repo dependency (mvmd)
 
-- [ ] mvmd **Plan 51** — host services cross-VM endpoints (`../mvmd/specs/plans/51-host-services-cross-vm-endpoints.md`)
-- [ ] mvmd **ADR-0022** — mvmd as cross-VM delegate (`../mvmd/specs/adrs/0022-mvmd-host-services-delegation.md`)
+- [ ] mvmd **Plan 52** — host services cross-VM endpoints (`../mvmd/specs/plans/52-host-services-cross-vm-endpoints.md`)
+- [ ] mvmd **ADR-0023** — mvmd as cross-VM delegate (`../mvmd/specs/adrs/0023-mvmd-host-services-delegation.md`)
 
-mvmd Plan 51 W1+W2+W3 must land before mvm W4b opens; mvm W1–W4a + W5 + W6 + W7 have no mvmd dep and land in parallel.
+mvmd Plan 52 W1+W2+W3 must land before mvm W4b opens; mvm W1–W4a + W5–W11 have no mvmd dep and land in parallel.
 
 ### Security claims under this sprint
 
@@ -2065,19 +2069,28 @@ Two new claims proposed in ADR-059 (numbers TBD — Sprint 56 holds claim 10):
 - Every host-side service is bound to a signed `ExecutionPlan.services` entry, enforced before dispatch, audited via the chain.
 - No raw secret value crosses the broker channel; `host.secrets.v1` returns destination-bound, time-bound signed credentials only.
 
+ADR-059 additionally documents the narrowing of ADR-002's "malicious host" out-of-scope clause: physical attacks (cold-boot, DMA, hardware tampering) remain out of scope, but *software* insider attacks (shell access to the host by an unauthorized operator) are newly in scope thanks to L1 process isolation + L2 hardware-enclave keys + L5 at-rest audit encryption.
+
 ### Sprint 57 success criteria
 
 - [ ] `ExecutionPlan.services` schema landed and signature-verified at admission (`SCHEMA_VERSION` bumped 4→5).
-- [ ] General broker listens on vsock 5300, dispatches `host.time.v1` / `host.cost.v1` / `broker.v1`.
-- [ ] `mvm-secrets-dispatcher` subprocess listens on vsock 5301, dispatches `host.secrets.v1` only; runs at uid 902 with seccomp `standard` + setpriv.
+- [ ] All four subprocesses (`mvm-broker`, `mvm-secrets-dispatcher`, `mvm-host-signer`, `mvm-audit-signer`) cosign-verified at spawn, configured via signed JSON config, running under per-arch seccomp + setpriv + per-workload cgroup + namespace isolation.
+- [ ] `mvm-broker` listens on vsock 5300; dispatches `host.time.v1` / `host.cost.v1` / `broker.v1`.
+- [ ] `mvm-secrets-dispatcher` listens on vsock 5301; dispatches `host.secrets.v1` only.
+- [ ] `mvm-host-signer` is the sole holder of the host signer key; supervisor signs plans via UDS RPC. HW-enclave path live on macOS SE + Linux TPM 2.0 (W8); software-fallback row in doctor.
+- [ ] `mvm-audit-signer` is the sole writer to `~/.mvm/audit/<tenant>.jsonl`; sole holder of the audit chain-signing key; `O_APPEND` FD + dir-immutable + chain-head persistence + at-rest AEAD encryption all enforced.
 - [ ] `host.secrets.v1` returns destination-bound signed credentials per ADR-049 with JCS-canonicalized signing; `KeystoreReleaser` stubs deleted.
-- [ ] Subprocess crash isolation verified: kill subprocess → supervisor survives, workload sees `Err(Unavailable)`; kill supervisor → subprocess exits cleanly via pdeathsig.
+- [ ] Subprocess crash isolation verified for each kind: kill any subprocess → supervisor survives, workload sees `Err(Unavailable)`; kill supervisor → all four subprocesses exit cleanly via pdeathsig/kqueue.
 - [ ] `HostBoundRequest::QueryHostTime` deleted; internal caller migrated to broker.
-- [ ] `fuzz_service_call.rs` ≥5min/PR in CI; `xtask check-handler-*` lints block orphans.
+- [ ] `fuzz_service_call.rs` ≥5min/PR in CI; UDS-proxy fuzz lane; `xtask check-handler-*` + `xtask check-subprocess-fd-inheritance` lints block orphans; `cargo-mutants` lane catches mutation escapes.
 - [ ] Cross-backend test matrix green on libkrun / Firecracker / Apple Container / vz; **both ports listen on all four backends** (vz requires new `VZVirtioSocketListener` Swift class).
-- [ ] mvmd Plan 51 endpoints live (iroh ALPN, signed catalog responses); mvm W4b green; cross-tenant authz refused; malformed-mvmd-response rejected.
+- [ ] Per-binary reproducibility-double-build lane green for all four subprocesses; Sigstore/Rekor entries present for the release artefacts; in-toto attestations alongside SLSA.
+- [ ] mvmd Plan 52 endpoints live (iroh ALPN, signed catalog responses); mvm W4b green; cross-tenant authz refused; malformed-mvmd-response rejected; tenant-level secret-quota enforced; mvmd identity pin enforced.
 - [ ] ADR-049 §W3 SDK matrix complete in Python + TS + Rust; hostile-guest tests green; S25 placeholder-egress backstop in gvproxy/passt detects and drops `mvm-secret://` patterns.
-- [ ] Falsifiability: throwaway `host.dev.echo.v1` lands in one handler file (in-process) without touching envelope/registry/auth; out-of-process variant exercises the secrets-dispatcher substrate pattern.
+- [ ] `mvmctl doctor` refuses admission on weak hosts (KASLR, KPTI, SMEP/SMAP, Spectre-v2, LSM, KSM, THP, etc.) and on known-affected vsock CVE versions; `--insecure-host` audits + warns.
+- [ ] `mvmctl up --prod` invokes `fido_touch_required()` stub (audits `operator.fido.unverified`); W11 full FIDO ceremony lands within the sprint or slips with explicit Sprint-58 ticket.
+- [ ] `specs/threat-models/02-host-services-broker.md` published; `SECURITY.md` CVE response runbook updated; CLAUDE.md security model updated to reference Plan 104 + new claim numbers.
+- [ ] Falsifiability: throwaway `host.dev.echo.v1` lands in one handler file (in-process in `mvm-broker`) without touching envelope/registry/auth; out-of-process variant exercises the subprocess substrate pattern.
 
 ### Non-goals (explicit)
 
