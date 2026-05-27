@@ -1071,7 +1071,11 @@ jobs:
         # Inline `manifest::tests` cover MalformedDigest paths
         # (missing algorithm prefix, wrong hex length, wrong charset).
         # Reference parser tests cover the same on the ref side.
-        run: "cargo test -p mvm-oci manifest:: reference::"
+        # `--` separates cargo's own args from libtest filters; libtest
+        # accepts multiple positional filters as an OR. cargo test
+        # itself only takes one TESTNAME positional, so the `--` is
+        # what lets us filter for both modules in one run.
+        run: "cargo test -p mvm-oci -- manifest:: reference::"
 
   oci-mutable-tag-prod-reject:
     name: oci-mutable-tag-prod-reject (Plan 85 §AC2/AC4)
@@ -1114,7 +1118,10 @@ jobs:
         # reference must refuse *before* any pull. Tests live in
         # `crates/mvm-cli/src/commands/image.rs` and assert the
         # error reaches the user before a network call is made.
-        run: cargo test -p mvm-cli prod_pull_requires_digest_pin prod_run_image_requires_digest_pin
+        # `--` is required because libtest takes multiple positional
+        # filters as an OR but cargo test itself only accepts one
+        # TESTNAME positional.
+        run: cargo test -p mvm-cli -- prod_pull_requires_digest_pin prod_run_image_requires_digest_pin
 
   oci-reproducibility:
     name: oci-reproducibility (Plan 85 §R2)
