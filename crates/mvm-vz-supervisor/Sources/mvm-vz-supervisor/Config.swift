@@ -239,7 +239,20 @@ struct VsockConfig: Decodable, StrictKeys {
 // MARK: - Network
 
 enum NetworkConfig: Decodable {
-    case gvproxy(socketPath: String, mac: MacAddress)
+    /// Plan 102 W6.A.5 — `eventsIngestSocketPath` is where the
+    /// supervisor's claim-10 audit bridge listens for NDJSON
+    /// `FlowEventWire` entries. `nil` means the Rust side did not
+    /// request a bridge (legacy / dev mode); the data-plane fd
+    /// goes straight from gvproxy to Vz with no FlowEvent
+    /// emission. When `Some`, `Network.makeAttachment` interposes
+    /// a socketpair between Vz and gvproxy and emits the
+    /// handshake + FlowOpened / FlowClosed lines down a stream
+    /// connection to that path.
+    case gvproxy(
+        socketPath: String,
+        mac: MacAddress,
+        eventsIngestSocketPath: String?
+    )
 
     enum Kind: String, Decodable {
         case gvproxy
@@ -249,9 +262,12 @@ enum NetworkConfig: Decodable {
         case kind
         case socketPath = "socket_path"
         case mac
+        case eventsIngestSocketPath = "events_ingest_socket_path"
     }
 
-    static let knownKeys: Set<String> = ["kind", "socket_path", "mac"]
+    static let knownKeys: Set<String> = [
+        "kind", "socket_path", "mac", "events_ingest_socket_path",
+    ]
 
     init(from decoder: Decoder) throws {
         // Reuse strict-keys helper via free function (enum can't
@@ -271,7 +287,14 @@ enum NetworkConfig: Decodable {
                     debugDescription: "invalid MAC address: \(macString)"
                 )
             }
-            self = .gvproxy(socketPath: socketPath, mac: mac)
+            let eventsIngest = try c.decodeIfPresent(
+                String.self, forKey: .eventsIngestSocketPath
+            )
+            self = .gvproxy(
+                socketPath: socketPath,
+                mac: mac,
+                eventsIngestSocketPath: eventsIngest
+            )
         }
     }
 }
