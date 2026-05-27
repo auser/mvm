@@ -1900,15 +1900,14 @@ no macos-26 self-hosted runner required), and docs (CLAUDE.md +
 ADR-046 extension with security-claim-parity language). Plan 99 PR-1
 (#448) is the Stage 0 audit/cache contract this builds on.
 
-- [ ] **Phase 1** — Selection user-surface (auto-detect + `--builder` flag + doctor + §0.x gap fixes). Single non-draft PR.
-  - `--builder vz` with `dev up/rebuild/shell` errors clearly via the §2.C1 grace guard until Phase 2 Slice 2B lands the Vz persistent dev driver. `--builder vz` already works for `mvmctl build` and `mvmctl up --prod`.
-- [ ] **Phase 2** — Vz persistent driver + Install E2E + security parity. Decomposed into four slices for review-sized PRs:
-  - **Slice 2A** — `VzPersistentBuilderVm` driver scaffold (§2.1-2.4, §2.10, §2.S1, §2.C2). No `mvmctl dev` rewire yet; §2.C1 guard stays.
-  - **Slice 2B** — Cross-backend coexistence dispatch (§2.5, §2.8, §2.C3) + remove §2.C1 guard + §2.S11 env-var regression test.
-  - **Slice 2C** — Install E2E byte-equivalence + audit chain + security parity batch (§2.6, §2.7, §2.S2-2.S10 + §2.S13) + ADR-046/002/047 updates.
-  - **Slice 2D** — In-repo flake invariant integration test (§2.11) + final regression gate (§2.9).
-- [ ] **Phase 3** — CI floor on `macos-latest` Vz construction smoke + Linux libkrun auto-detect assertion. `uv pip install` round-trip deferred to §3.6.
-- [ ] **Phase 4** — Docs: CLAUDE.md, ADR-046 extension landed in Slice 2C, ADR-056/055/041/057 cross-references, SPRINT.md close-out.
+- [x] **Phase 1** — Selection user-surface (auto-detect + `--builder` flag + doctor + §0.x gap fixes). Shipped as [#455](https://github.com/tinylabscom/mvm/pull/455).
+- 🟡 **Phase 2** — Vz persistent driver + Install E2E + security parity. Decomposed into four slices for review-sized PRs:
+  - [x] **Slice 2A** — `VzPersistentBuilderVm` driver scaffold (§2.1-§2.3, §2.10, §2.C2). Shipped as [#460](https://github.com/tinylabscom/mvm/pull/460).
+  - [x] **Slice 2B** — `mvmctl dev` routes through Vz when builder backend resolves to Vz + remove §2.C1 grace guard + §2.S11 env-var regression test. Shipped as [#461](https://github.com/tinylabscom/mvm/pull/461). §2.5 cross-backend coexistence dispatch + §2.8 doctor running-VM indicator deferred to a small follow-up (the prefix isolation in Slice 2A is the foundation).
+  - 🟡 **Slice 2C** — Split into Slice 2C-ADRs (ADR text — [#465](https://github.com/tinylabscom/mvm/pull/465)) + the §2.S2-§2.S10 / §2.S13 security tests batch. ADR text shipped; security tests gated on macos-26 self-hosted hardware lane (§3.6) since they need real boots to validate.
+  - [x] **Slice 2D** — Hermetic source-grep guards on the §2.11 in-repo-flake invariant. Shipped as [#464](https://github.com/tinylabscom/mvm/pull/464). True-E2E "Vz boots the in-repo flake" needs macOS 13+ hardware and folds into §3.6.
+- [x] **Phase 3** — CI floor on `macos-latest` Vz construction smoke + Linux libkrun auto-detect assertion. Shipped as [#462](https://github.com/tinylabscom/mvm/pull/462). §3.6 (real `uv pip install` E2E under Vz on macos-26 self-hosted runner) stays deferred — gated on Plan 72 W4/W5 cutover same as the libkrun E2E Install round-trip.
+- 🟡 **Phase 4** — Docs: CLAUDE.md selection-policy section shipped as [#458](https://github.com/tinylabscom/mvm/pull/458) (§4.1); ADR-046 extension + ADR-056 cross-link shipped as [#465](https://github.com/tinylabscom/mvm/pull/465) (§4.2 + §4.2c partial). The remaining §4.2a (ADR-002 per-claim sub-notes), §4.2b (ADR-047 "Backend symmetry" sub-paragraph), and the ADR-055/041/057 one-line cross-references ship as a small prose follow-up. This SPRINT.md close-out is §4.3 itself.
 
 ### Cross-cutting
 
