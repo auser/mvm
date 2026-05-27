@@ -117,17 +117,38 @@ observable, mediable substrate across all three backends
       (10 tests; pre-flock implementation would fail
       `flock_serializes_two_signer_instances_on_same_tenant_file`)
 
-### Commit 3 — Chain enum (`AuditAction::Flow*`)
+### Commit 3 — Flow event types + `AuditEntry` helpers
 
-- [ ] `crates/mvm-core/src/policy/audit.rs:679` —
-      add `AuditAction::FlowOpened { flow_id, direction }`
-- [ ] Add `AuditAction::FlowClosed { flow_id, direction, reason }`
-- [ ] Add `pub enum FlowDirection { Egress, Ingress }`
-- [ ] Add `pub enum FlowCloseReason { Eof, BridgeError,
-      PolicyDropped, Shutdown }`
-- [ ] Test: `flow_audit_actions_serde_roundtrip` (mirror
-      `test_all_audit_actions_serialize` at line 776)
-- [ ] `cargo test --workspace` green
+**Design adjustment:** the supervisor's chained `AuditEntry`
+(`mvm-supervisor/src/audit.rs:33`) uses `event: String` +
+`labels: BTreeMap` — not a typed `AuditAction` enum. The Plan
+102 spec's "add `AuditAction::Flow*`" landed in the **wrong
+enum** (`mvm-core::policy::audit::AuditAction` is the
+unrelated v1 fleet-orchestration enum). Right answer: extend
+the supervisor's `AuditEntry` with typed helpers + canonical
+event strings + structured field types. Free-form `event`
+already matches existing chain emitters (e.g.,
+`"plan.verified"`).
+
+- [x] `crates/mvm-supervisor/src/audit.rs` — add
+      `pub enum FlowDirection { Egress, Ingress }` with
+      `#[serde(rename_all = "snake_case")]` + `as_str()`
+- [x] Add `pub enum FlowCloseReason { Eof, BridgeError,
+      PolicyDropped, Shutdown }` with same wire shape
+- [x] Add `pub const FLOW_OPENED_EVENT: &str =
+      "gateway.flow_opened"` + `FLOW_CLOSED_EVENT =
+      "gateway.flow_closed"`
+- [x] Add `AuditEntry::flow_opened(plan, bundle, flow_id, direction)`
+      helper — wraps `for_plan` with canonical event +
+      `flow_id` + `direction` labels
+- [x] Add `AuditEntry::flow_closed(plan, bundle, flow_id,
+      direction, reason)` helper — adds `reason` label
+- [x] Tests: 8 new (flow_direction wire pin + serde
+      roundtrip; flow_close_reason wire pin + serde roundtrip;
+      both helper-construction shape tests; helpers inherit
+      plan audit_labels; reasons distinguishable on wire)
+- [x] `cargo test -p mvm-supervisor --lib audit::` green
+      (14 tests: 6 existing + 8 new)
 
 ### Commit 4 — `mvm-supervisor::gateway_audit` (subscriber sink)
 
