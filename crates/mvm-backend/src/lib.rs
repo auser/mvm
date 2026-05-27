@@ -40,6 +40,13 @@ pub mod cloud_hypervisor;
 pub mod docker;
 pub mod firecracker;
 pub mod handle_registry;
+// Plan 102 W6.A.5 — host-side gvproxy lifecycle for the Vz
+// backend. VzBackend is stateless and the Swift supervisor doesn't
+// spawn gvproxy itself, so the host process spawns gvproxy as a
+// detached child (PID sidecar file under the per-VM scratch dir).
+// Lifecycle: VzBackend::start spawns + writes PID; VzBackend::stop
+// reads PID + signals.
+pub mod host_gvproxy;
 pub mod image;
 pub mod libkrun;
 pub mod microvm;
