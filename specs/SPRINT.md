@@ -200,6 +200,8 @@ project only uses a narrow slice of functionality.
       First plausible candidate: generated-FFI replacement work around
       `bindgen`, not the OCI or PGP stacks.
 
+First concrete evaluation: [Plan 109 — Guest control-layer dep-reduction + encryption design](plans/109-zig-pid0-exploration.md) (Sprint 58).
+
 ### Execution order
 
 - [ ] PR 1: remove `httpmock` / `wiremock`
@@ -2299,6 +2301,66 @@ ADR-059 additionally documents the narrowing of ADR-002's "malicious host" out-o
 - [ ] `host.logging.v1` — workload-emitted structured logs to tenant log sink (depends on mvmd Plan 51 W3).
 - [ ] `host.audit.v1` — workload-emitted chain-signed audit entries under `EventCategory::WorkloadAudit`.
 - [ ] ADR-060 — workload-audit semantics + chain rotation policy.
+## Sprint 58 — Guest control-layer dep-reduction + encryption design (proposed)  [`plans/109-zig-pid0-exploration.md`](plans/109-zig-pid0-exploration.md)
+
+### Why this sprint
+Track E in Sprint 42 set the gates for Zig adoption. Sprint 58 is the first concrete evaluation using those gates, structured as a paired A/B between **Zig** and **lean Rust v2** prototypes of the same small binary (`mvm-guest-netinit`). Goal: *evidence*, not adoption. Produce two measured prototypes + a vsock encryption design doc + three foundational ADRs + a provider capability matrix + a threat-model delta. Outcome can be "Zig wins" (propose follow-on Zig plans), "lean Rust v2 wins" (propose a Rust-internal agent dep-reduction plan), or "neither prototype meaningfully wins" (shared workstreams still land).
+
+> **Renumbering note (2026-05-29):** Originally drafted as Sprint 57 + Plan 105; both slots were claimed concurrently on `main` (Sprint 57 by the host-services-broker work above; Plan 105 by `105-plan-100-w1-linux-builder-vm.md`). This sprint is now **Sprint 58** referencing **Plan 109**. Same content otherwise.
+
+Systems-design recommendation: **stay Rust, adopt lean Rust v2 as the agent's evolution path, treat the Zig prototype as a measurement check.** Reasoning lives in [Plan 109 §"Systems-design recommendation"](plans/109-zig-pid0-exploration.md#systems-design-recommendation-taken-position).
+
+Scope:
+- the **guest-side control-layer surface** (`mvm-guest-agent` and its sibling pid0-class binaries),
+- **not** the data plane (Plan 102 gateway audit, claim 9 sealed deps, claim 10 OCI provenance all stay untouched),
+- **not** any backend (libkrun, Firecracker, Apple VZ, Apple Container, Cloud Hypervisor all preserved).
+
+### W1 — Tradeoff note 🟡 proposed
+Symmetric analysis of Zig and lean-Rust v2 paths. `specs/research/agent-evolution-tradeoff-note.md`.
+
+### W2′ — Lean Rust v2 prototype: `mvm-guest-netinit` (primary track) 🟡 proposed
+Same binary rewritten with `polling` + `linux-raw-sys` + manual netlink (no tokio, no rtnetlink, no netlink-packet-route). Lives at `crates/mvm-guest-netinit-lean/`. Built first.
+
+### W2 — Zig prototype: `mvm-guest-netinit` (measurement check) 🟡 proposed
+Smallest pid0-class binary in Zig. Lives at `zig/mvm-guest-netinit/`. Built second to put a number on what Rust leaves on the table.
+
+### W3 — Vsock encryption design 🟡 proposed (paper only)
+Noise_NK + X25519 + ChaCha20-Poly1305 + SHA-256. Host pubkey via `mkGuest { hostPubkey = …; }`. Stream-level wrap. `specs/research/vsock-control-plane-encryption.md`. Implementation deferred to a follow-on plan. Lands regardless of which prototype wins.
+
+### W4 — Three new ADRs (drafts) 🟡 proposed
+- control-plane-vs-data-plane (promotes ADR-053 hint to a contract)
+- pid0-portability-boundary
+- boundary-language-policy (codifies Track E gates; framed so it stays useful even if the answer is "Rust everywhere for now")
+
+Lands regardless of which prototype wins.
+
+### W5 — Provider capability matrix 🟡 proposed
+`specs/reference/provider-capabilities.md` derived from `VmCapabilities` struct + `AnyBackend` variants. Lands regardless.
+
+### W6 — Threat-model delta + audit invariants 🟡 proposed
+Append §"Threats added" + §"Audit invariants under the agent-evolution exploration" sections to ADR-002. Lands regardless.
+
+### Sprint 58 success criteria
+- [ ] W1 tradeoff note committed (symmetric Zig + lean-Rust analysis)
+- [ ] W2 (Zig) prototype runs in libkrun guest on macOS-arm64 + Linux-x86_64 with parity to baseline Rust
+- [ ] W2′ (lean Rust v2) prototype runs with the same parity
+- [ ] Three-column measurement table populated (baseline Rust / lean Rust v2 / Zig)
+- [ ] W3 design doc committed with recommended protocol locked
+- [ ] W4 three ADR drafts committed as `proposed`
+- [ ] W5 capability matrix committed
+- [ ] W6 ADR-002 §Threats + §Audit invariants sections committed
+- [ ] `cargo test --workspace` green
+- [ ] All current backends still pass per-backend CI lanes
+- [ ] Outcome recommendation written (Zig wins / lean Rust v2 wins / neither)
+
+### Non-goals (explicit)
+- Rewriting `mvm-guest-agent` in any language (separate future plan)
+- Replacing any backend
+- Implementing vsock encryption (paper only)
+- Replacing `mvm-verity-init` or `mvm-builder-init` in any language
+- Egress secret detection (Plan 103 territory)
+- Touching Apple VZ Swift shims (ADR-056 / Plan 98 own that)
+- Renumbering existing claims or ADRs
 
 ## Completed Sprints
 
