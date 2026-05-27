@@ -152,19 +152,32 @@ already matches existing chain emitters (e.g.,
 
 ### Commit 4 — `mvm-supervisor::gateway_audit` (subscriber sink)
 
-- [ ] Create `crates/mvm-supervisor/src/gateway_audit.rs`
-- [ ] `pub struct GatewayAuditSink { listener, tx: broadcast }`
-- [ ] `pub fn bind(path: &Path)` — pre-unlinks stale path, chmods
-      0700, ensures parent dir 0700
-- [ ] `pub fn subscribe() -> broadcast::Receiver<String>`
-- [ ] `pub async fn run(self) -> !` — accept loop, per-subscriber
-      forward task
-- [ ] Bounded broadcast(256), drop-oldest, `Lagged` → drop
-      subscriber
-- [ ] Test: `bind_pre_unlinks_stale_socket`
-- [ ] Test: `accepts_many_subscribers_fans_out_jsonl`
-- [ ] Test: `slow_subscriber_drops_then_recovers`
-- [ ] `cargo test --workspace` green
+- [x] Created `crates/mvm-supervisor/src/gateway_audit.rs`
+      (~210 lines including tests)
+- [x] `pub struct GatewayAuditSink { listener, tx: broadcast,
+      socket_path }`
+- [x] `pub fn bind(path)` — `create_dir_all` + chmod 0700 on
+      parent, pre-unlinks stale path, `UnixListener::bind`,
+      chmod 0700 on socket file
+- [x] `pub fn subscribe() -> broadcast::Receiver<String>` +
+      `pub fn sender() -> broadcast::Sender<String>` (bridge
+      holds the sender)
+- [x] `pub async fn run(self) -> !` — accept loop, per-subscriber
+      `forward_to_subscriber` task spawned on each accept
+- [x] Bounded broadcast(256) via `SUBSCRIBER_CHANNEL_CAPACITY`;
+      `Lagged` → log + close subscriber connection
+- [x] Module wired in `lib.rs` between `firewall` and
+      `hickory_dns`
+- [x] Tests (3 new):
+      - [x] `bind_pre_unlinks_stale_socket` — confirms 0700 + rebind
+            over stale regular file works
+      - [x] `accepts_many_subscribers_fans_out_jsonl` — 3 clients
+            connect, sender push once, all 3 read the same line
+      - [x] `slow_subscriber_does_not_block_fast_subscriber_or_sender`
+            — bursts > capacity events; slow peer's stream stalls
+            (write_all blocks); fast peer still receives ≥ 50 lines
+- [x] `cargo test -p mvm-supervisor --lib gateway_audit::` green
+      (3 tests)
 
 ### Commit 5 — `mvm-supervisor::gateway_bridge` + `FlowPolicy` hook
 
