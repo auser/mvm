@@ -1,10 +1,26 @@
-//! Plan 57 W4 — one-libkrun-guest-per-process supervisor.
+//! Plan 57 W4 / Plan 102 W6.A.5 — one-libkrun-guest-per-process supervisor.
 //!
 //! Reads a [`SupervisorConfig`] JSON document on stdin, ad-hoc
 //! codesigns itself for `Hypervisor.framework` (macOS W2 gate),
 //! creates the per-VM state directory, writes its own PID, then
-//! calls [`run_supervisor`] which blocks in `krun_start_enter`
-//! until the guest powers off.
+//! either:
+//!
+//! 1. **Bridge path** (`cfg.tenant_id` is `Some`) — calls
+//!    [`run_supervisor_with_bridge`] with a factory that spawns the
+//!    per-VM gateway audit bridge (`mvm_supervisor::gateway_bridge::
+//!    spawn_bridge_thread`). Every guest network byte transits the
+//!    bridge, FlowOpened/FlowClosed entries chain-sign into
+//!    `~/.mvm/audit/<tenant>.jsonl`, and `nc -U
+//!    <gateway_audit_socket>` subscribers see the live NDJSON feed.
+//!    This is the claim-10 substrate path.
+//! 2. **Legacy path** (`cfg.tenant_id` is `None`) — falls back to
+//!    the pre-W6.A.5 [`run_supervisor`] which boots libkrun without
+//!    interposing a bridge. Used by Stage 0 builder VMs and any
+//!    other dev-mode call site that doesn't synthesize an
+//!    `ExecutionPlan`.
+//!
+//! Both paths block in `krun_start_enter` until the guest powers
+//! off, at which point libkrun calls `exit()` on the process.
 //!
 //! ## Why one process per VM
 //!
@@ -17,45 +33,31 @@
 //!
 //! ## Why this is its own crate
 //!
-//! Plan 102 W6.A.5 — the bin's bridge-factory branch needs to
-//! depend on `mvm-supervisor` (gateway audit substrate). Adding
+//! Plan 102 W6.A.5 — the bin's bridge-factory branch depends on
+//! `mvm-supervisor` (gateway audit substrate). Adding
 //! `mvm-supervisor` to `mvm-libkrun`'s deps would close the cycle
 //! `mvm-supervisor → mvm-backend → mvm-libkrun`. Splitting the bin
 //! into a leaf crate breaks the cycle cleanly. The binary name is
 //! preserved so `mvm-backend::libkrun::resolve_supervisor_path()`
 //! keeps resolving it.
-//!
-//! ## Usage (manual)
-//!
-//! ```sh
-//! cat <<EOF | mvm-libkrun-supervisor
-//! {
-//!   "krun": {
-//!     "name": "mvm-libkrun-smoke",
-//!     "kernel_path": "/Users/me/.mvm/dev/current/vmlinux",
-//!     "rootfs_path": "/Users/me/.mvm/dev/current/rootfs.ext4",
-//!     "vcpus": 1,
-//!     "ram_mib": 512,
-//!     "kernel_cmdline": "console=hvc0 root=/dev/vda rw init=/init",
-//!     "vsock_ports": [5252],
-//!     "extra_disks": [],
-//!     "console_output_path": "/tmp/mvm-libkrun-smoke.log",
-//!     "vsock_socket_dir": "/Users/me/.mvm/vms/mvm-libkrun-smoke"
-//!   },
-//!   "vm_state_dir": "/Users/me/.mvm/vms/mvm-libkrun-smoke",
-//!   "pid_file_name": null
-//! }
-//! EOF
-//! ```
-//!
-//! Production callers (`LibkrunBackend::start()` — plan 57 W4.2)
-//! produce the JSON programmatically and pipe it via
-//! `std::process::Command::stdin`.
 
 use std::io::Read;
 use std::process::ExitCode;
+use std::sync::Arc;
 
-use mvm_libkrun::{LogLevel, SupervisorConfig, init_log, run_supervisor, set_log_level};
+use anyhow::{Context, Result, anyhow};
+use ed25519_dalek::SigningKey;
+use mvm_libkrun::{
+    BridgeFds, LogLevel, SupervisorConfig, init_log, run_supervisor, run_supervisor_with_bridge,
+    set_log_level,
+};
+use mvm_plan::ExecutionPlan;
+use mvm_policy::PolicyBundle;
+use mvm_supervisor::audit::AuditSigner;
+use mvm_supervisor::audit_file::FileAuditSigner;
+use mvm_supervisor::gateway_bridge::{
+    AllowAll, BridgeConfig, BridgeEndpoints, spawn_bridge_thread,
+};
 
 fn main() -> ExitCode {
     // macOS Hypervisor.framework rejects any process without
@@ -109,12 +111,142 @@ fn main() -> ExitCode {
         }
     };
 
-    // run_supervisor returns Result<Infallible, _>; on success
-    // libkrun has already called exit() on this process.
-    match run_supervisor(&cfg) {
+    // Plan 102 W6.A.5 — route to the bridge path when the producer
+    // populated the audit substrate, otherwise fall back to the
+    // legacy direct-libkrun path (Stage 0 builder VMs, smoke tests,
+    // etc. that haven't synthesized an ExecutionPlan).
+    let outcome = if cfg.tenant_id.is_some() {
+        run_with_bridge(cfg)
+    } else {
+        run_legacy(&cfg)
+    };
+
+    match outcome {
+        // run_supervisor / run_supervisor_with_bridge return
+        // `Result<Infallible, _>`. On success libkrun has already
+        // called exit() on this process; we never get here.
         Err(e) => {
             eprintln!("supervisor failed: {e}");
             ExitCode::from(1)
         }
     }
+}
+
+/// Legacy boot path — direct libkrun with no gateway audit bridge.
+/// Returns `Result<Infallible, _>`, propagated up.
+fn run_legacy(cfg: &SupervisorConfig) -> Result<std::convert::Infallible> {
+    run_supervisor(cfg).map_err(|e| anyhow!("run_supervisor failed: {e}"))
+}
+
+/// Bridge boot path — sets up the per-VM gateway audit bridge
+/// before calling libkrun's `start_enter`. Synthesizes the bridge
+/// factory closure that converts `BridgeFds` (mvm-libkrun shape)
+/// into `BridgeEndpoints` (mvm-supervisor shape), builds
+/// `BridgeConfig` from the JSON-encoded plan + bundle and the
+/// chain-signing `FileAuditSigner`, then calls
+/// `spawn_bridge_thread`. The bridge thread runs concurrently with
+/// `krun_start_enter` and is reaped by `exit()` on guest shutdown.
+fn run_with_bridge(cfg: SupervisorConfig) -> Result<std::convert::Infallible> {
+    // Pre-extract the audit-substrate paths + plan/bundle. The
+    // factory closure needs them as owned values; the legacy
+    // `&SupervisorConfig` reference path doesn't fit because
+    // run_supervisor_with_bridge takes a `&SupervisorConfig` and
+    // the factory captures these owned by move.
+    let vm_name = cfg.krun.name.clone();
+    let tenant_id = cfg
+        .tenant_id
+        .clone()
+        .ok_or_else(|| anyhow!("run_with_bridge called without cfg.tenant_id"))?;
+    let audit_dir = cfg.audit_dir.clone().ok_or_else(|| {
+        anyhow!("cfg.audit_dir missing — validate_audit_substrate should have refused")
+    })?;
+    let audit_socket = cfg
+        .gateway_audit_socket
+        .clone()
+        .ok_or_else(|| anyhow!("cfg.gateway_audit_socket missing"))?;
+    let signing_key_path = cfg
+        .signing_key_path
+        .clone()
+        .ok_or_else(|| anyhow!("cfg.signing_key_path missing"))?;
+    let plan_value = cfg
+        .plan
+        .clone()
+        .ok_or_else(|| anyhow!("cfg.plan missing on bridge path"))?;
+    let bundle_value = cfg.bundle.clone();
+
+    // Deserialize the JSON-Value-carrier into typed values. The
+    // round-trip cost is trivial vs the bridge's IO budget.
+    let plan: ExecutionPlan =
+        serde_json::from_value(plan_value).context("decode cfg.plan into ExecutionPlan")?;
+    let bundle: Option<PolicyBundle> = match bundle_value {
+        Some(v) => Some(serde_json::from_value(v).context("decode cfg.bundle into PolicyBundle")?),
+        None => None,
+    };
+
+    // Load the host signer secret bytes. The file is mode 0600 and
+    // written by mvm-cli's `host_signer::load_or_init_at` at admit
+    // time; we re-read on each VM start. Path was already
+    // canonicalized under `~/.mvm/keys/` by
+    // `SupervisorConfig::validate_audit_substrate`.
+    let key_bytes = std::fs::read(&signing_key_path)
+        .with_context(|| format!("read signing key {}", signing_key_path.display()))?;
+    let key_array: [u8; 32] = key_bytes.as_slice().try_into().with_context(|| {
+        format!(
+            "signing key {} is {} bytes, expected 32",
+            signing_key_path.display(),
+            key_bytes.len()
+        )
+    })?;
+    let signing_key = SigningKey::from_bytes(&key_array);
+
+    // FileAuditSigner is what mvm-supervisor's chain emitter wraps.
+    // The cross-process flock (Plan 102 W6.A commit 2) serializes
+    // writes from concurrent VM supervisors for the same tenant.
+    let signer = FileAuditSigner::open(signing_key, &audit_dir)
+        .with_context(|| format!("open FileAuditSigner at {}", audit_dir.display()))?;
+    let signer: Arc<dyn AuditSigner> = Arc::new(signer);
+
+    // Sanity log so operators tailing the bin's stderr can see the
+    // bridge wired up.
+    tracing::info!(
+        vm = %vm_name,
+        tenant = %tenant_id,
+        audit_socket = %audit_socket.display(),
+        audit_dir = %audit_dir.display(),
+        "starting bridge-mode libkrun supervisor"
+    );
+
+    let bridge_cfg = BridgeConfig {
+        vm_name: vm_name.clone(),
+        plan: Arc::new(plan),
+        bundle: bundle.map(Arc::new),
+        audit_socket,
+        signer,
+        policy: Arc::new(AllowAll),
+    };
+
+    run_supervisor_with_bridge(&cfg, move |bridge_fds| {
+        let endpoints = match bridge_fds {
+            BridgeFds::Passt {
+                gateway_fd,
+                supervisor_fd,
+            } => BridgeEndpoints::Passt {
+                gateway_fd,
+                supervisor_fd,
+            },
+            BridgeFds::LibkrunGvproxy {
+                gvproxy_socket_path,
+                supervisor_listen_path,
+            } => BridgeEndpoints::LibkrunGvproxy {
+                gvproxy_socket_path,
+                supervisor_listen_path,
+            },
+        };
+        // Bridge thread JoinHandle is intentionally dropped — libkrun's
+        // exit() on guest shutdown reaps the thread without graceful
+        // join. The bridge's own `catch_unwind → exit(1)` provides the
+        // fail-closed signal for the claim-10 substrate.
+        let _join = spawn_bridge_thread(endpoints, bridge_cfg);
+    })
+    .map_err(|e| anyhow!("run_supervisor_with_bridge failed: {e}"))
 }
