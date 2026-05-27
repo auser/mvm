@@ -166,11 +166,15 @@ pub fn spawn(scratch_dir: &std::path::Path) -> Result<PasstHandle, PasstError> {
     let (parent_fd, child_fd) = make_socketpair()?;
 
     let log_path = scratch_dir.join("passt.log");
+    let pid_path = scratch_dir.join("passt.pid");
 
     // passt args:
     //   --fd <N>          — connect to libkrun via the socketpair
     //   --foreground      — stay attached so Drop's SIGTERM reaches it
-    //   --no-pid          — we don't need a pidfile; Child owns the pid
+    //   -P <path>         — older distro passt builds don't support
+    //                       `--no-pid`; a scratch-local pidfile is
+    //                       portable and harmless because `Child` still
+    //                       owns the actual process lifetime
     //   --log-file <path> — diagnostic log; failures are non-fatal
     //   --quiet           — drop the boot-time chatter (still logs to file)
     //   --mtu 65520       — match libkrun's COMPAT_NET_FEATURES MTU
@@ -178,7 +182,8 @@ pub fn spawn(scratch_dir: &std::path::Path) -> Result<PasstHandle, PasstError> {
     cmd.arg("--fd")
         .arg(child_fd.as_raw_fd().to_string())
         .arg("--foreground")
-        .arg("--no-pid")
+        .arg("-P")
+        .arg(OsString::from(&pid_path))
         .arg("--quiet")
         .arg("--mtu")
         .arg("65520")
