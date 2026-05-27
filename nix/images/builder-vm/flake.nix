@@ -84,26 +84,14 @@
         in
         if envPath != "" then /. + envPath else ../../..;
 
-      workspace = builtins.path {
-        path = workspaceRoot;
-        name = "mvm-workspace";
-        filter =
-          path: _type:
-          let
-            base = baseNameOf path;
-          in
-          !(builtins.elem base [
-            "target"
-            ".git"
-            "result"
-            "node_modules"
-            ".direnv"
-            ".cargo"
-            ".claude"
-            ".worktrees"
-          ])
-          && !(nixpkgs.lib.hasPrefix "result-" base);
-      };
+      # Filter list lives at nix/lib/workspace-filter.nix so the three
+      # flakes that ingest the host workspace (this one, builder/,
+      # runtime-overlay/) stay aligned with .gitignore in one place.
+      workspace =
+        (import (workspaceRoot + "/nix/lib/workspace-filter.nix") {
+          inherit (nixpkgs) lib;
+        })
+        { inherit workspaceRoot; };
 
       libFor = import (workspace + "/nix/lib") {
         inherit nixpkgs microvm;
@@ -170,7 +158,12 @@
         findutils
         which
         nix
-        git
+        # gitMinimal drops perl/sendmail/gui/manpages (~20 MB). git is
+        # only invoked here by nix's `github:` substituter/fetcher; the
+        # core porcelain that needs is intact in the minimal build.
+        # `mvm-builder-init` does not shell to git (grep -rn '"git"' in
+        # crates/mvm-builder-init/).
+        gitMinimal
         gnumake
         curl
         jq

@@ -190,6 +190,16 @@ jobs:
       - name: Run tests
         run: cargo nextest run --workspace --all-targets
 
+      # Plan 98 Phase 3 §3.4 — Linux auto-detect assertion. The
+      # `auto_detect_default_for(false)` arm covers macOS 13-25, Linux,
+      # and Windows; pinning it here ensures the Linux path keeps
+      # picking libkrun even after a future refactor of the predicate
+      # (a regression would be a Vz-on-Linux pick which can't run).
+      - name: Assert auto-detect on Linux picks libkrun
+        run: |
+          cargo test -p mvm-build --features builder-vm --lib \
+            builder_backend_select::tests::auto_detect_default_for_everything_else_picks_libkrun
+
   e2e:
     name: E2E Tests
     runs-on: ubuntu-latest
@@ -543,9 +553,14 @@ jobs:
               - 'crates/mvm-vz-supervisor/**'
               - 'crates/mvm-backend/src/vz.rs'
               - 'crates/mvm-backend/Cargo.toml'
+              - 'crates/mvm-build/src/vz_builder.rs'
+              - 'crates/mvm-build/src/builder_backend_select.rs'
+              - 'crates/mvm-cli/src/commands/env/dev.rs'
               - 'crates/mvm-core/src/platform/platform.rs'
               - 'specs/plans/97-vz-backend.md'
+              - 'specs/plans/98-vz-builder-vm.md'
               - 'specs/adrs/056-vz-backend.md'
+              - 'specs/adrs/046-builder-vm-via-libkrun.md'
               - '.github/workflows/ci.yml'
 
       - name: Install Rust toolchain
@@ -580,9 +595,47 @@ jobs:
         if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
         run: cargo test -p mvm-backend vz
 
+      # Plan 98 Phase 3 §3.2 — Vz builder driver unit tests on macOS.
+      # `vz_builder` covers VzBuilderVm + VzPersistentBuilderVm config
+      # mapping (rootfs / disks / virtio-fs / vsock / startup_mode);
+      # `vz_persistent` covers the Slice 2A persistent path; the
+      # supervisor-config builder tests run hermetically on macos-latest
+      # so a regression in the persistent driver shows up here, not
+      # only inside a real boot (which only the macos-26 self-hosted
+      # lane can do today).
+      - name: Test mvm-build Vz driver (vz_builder + persistent)
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        run: cargo test -p mvm-build --features builder-vm vz_builder
+
+      # Plan 98 Phase 3 §3.2 — env-var path on macOS. Construction-only
+      # smoke that asserts `MVM_BUILDER_BACKEND=vz` flips
+      # `resolve_choice()` + that `resolve_builder_backend()` returns
+      # a Vz driver. Pure I/O-free; covers the override path the dev
+      # dispatch (Slice 2B) and `apple_container::build_image_via_libkrun`
+      # both consume.
+      - name: Test mvm-build selection layer with MVM_BUILDER_BACKEND=vz
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        env:
+          MVM_BUILDER_BACKEND: vz
+        run: cargo test -p mvm-build --features builder-vm builder_backend_select
+
       - name: Clippy mvm-vz + mvm-backend vz module
         if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
         run: cargo clippy -p mvm-vz -p mvm-backend --all-targets -- -D warnings
+
+      # Plan 98 Phase 3 §3.4 — assert auto-detect picks Vz on
+      # macos-latest **only** if the host actually reports macOS 26+
+      # Apple Silicon. macos-latest at the time Phase 3 lands is
+      # macos-15 (pre-26), so the assertion is the *opposite*:
+      # auto-detect on macos-latest should pick `Libkrun`, not Vz,
+      # confirming the auto-detect gate is correctly conservative
+      # (catches a regression where someone "fixes" macOS-26 by
+      # promoting Vz to default on any macOS).
+      - name: Assert auto-detect on macos-latest picks libkrun (pre-26)
+        if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'
+        run: |
+          cargo test -p mvm-build --features builder-vm --lib \
+            builder_backend_select::tests::auto_detect_default_for_everything_else_picks_libkrun
 
       - name: Verify supervisor binary has the virtualization entitlement
         if: steps.filter.outputs.vz == 'true' || github.ref == 'refs/heads/main'

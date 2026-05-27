@@ -336,8 +336,8 @@ pub enum NetworkingMode {
         /// octet must have bit 0x02 set (locally-administered) to
         /// avoid colliding with real hardware allocations.
         mac: [u8; 6],
-        /// Host directory where the supervisor stages passt's log
-        /// file (`<scratch_dir>/passt.log`). Typically
+        /// Host directory where the supervisor stages passt's pid
+        /// file and any future scratch artifacts. Typically
         /// `<vm_state_dir>` so the per-VM artifact set stays
         /// co-located. The supervisor creates it if absent.
         scratch_dir: String,

@@ -238,6 +238,15 @@ binary doesn't exist), but the user gets a clear error rather than a
 silent regression — `mvmctl doctor` flags the missing dep with the
 right install hint per platform.
 
+**Vz backend (Plan 98).** The Apple Virtualization.framework builder
+also wires gvproxy on macOS — `mvm_vz::NetworkConfig::Gvproxy { socket_path, mac }`
+piped through `mvm-vz-supervisor`'s `Network.swift` attaches a
+`VZFileHandleNetworkDeviceAttachment` to the same gvproxy listener
+libkrun uses via `krun_add_net_unixgram`. The host-side gateway
+(gvproxy) is one process per dev session; the Vz and libkrun paths
+just attach to its socket differently. Full Plan 98 selection-policy
+context lives in **ADR-046 §"Vz as a second builder backend"**.
+
 Both backends share the same threat model: a userspace process
 running as the contributor's user, no privileged sockets, no host-fs
 visibility into the guest. The libkrun-end of the virtio-net frame

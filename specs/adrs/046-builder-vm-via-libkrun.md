@@ -235,3 +235,75 @@ The vendoring path is *not* the same as the libkrun path. It addresses one sympt
 2. **Network access in the builder VM**: `nix build` needs cache.nixos.org. Plan 72 W4 wires virtio-net + the host's DNS resolver. Confirms `--no-substituters` still works for the air-gapped contributor case.
 3. **First-build latency**: cold cache pulls ~2 GB of substitutes. virtio-blk-backed `/nix` persists across builds, so warm cache is fast. Plan 72 acceptance criterion: warm-cache rebuild of the unchanged dev image completes in <30 s.
 4. **GPU / SIMD acceleration for cryptography**: not needed for the builder path. Documented to avoid scope creep.
+
+## Vz as a second builder backend (Plan 98)
+
+> Added 2026-05-27 by Plan 98 — extends this ADR's scope from "the builder VM is libkrun" to "the builder VM is one of {libkrun, Vz}, picked by host platform."
+
+### Selection policy
+
+The builder backend is selected by a single resolver
+(`mvm_build::builder_backend_select::resolve_choice_with_override`)
+with the following priority:
+
+1. **CLI flag** `--builder <libkrun|vz>` — highest priority. Folded into `MVM_BUILDER_BACKEND` at startup by `mvm_cli::commands::run`.
+2. **Env var** `MVM_BUILDER_BACKEND` — case-insensitive, whitespace-trimmed; unrecognised values log `tracing::warn!` and fall through to auto-detect (no abort).
+3. **Auto-detect**:
+   - macOS 26+ Apple Silicon → **Vz**.
+   - Everywhere else (macOS 13-25, Linux, Windows) → **libkrun**.
+
+Vz on macOS 13-25 stays opt-in only via the override path. The auto-detect predicate is intentionally conservative — the deployment baseline is macOS 26+ Apple Silicon (mirrors the Apple Container runtime tier), so the older macOS minor versions stay on the libkrun path that's been hardened since 2026-05-14 (Lima removal). When Slice 2C eventually adds the entitlement / MDM probe (§2.S4), auto-detect refuses Vz when the entitlement check fails and falls through to libkrun rather than failing mid-build.
+
+### Parallel drivers, not a generic seam
+
+The Vz path ships as a **parallel** driver (`VzBuilderVm`, `VzPersistentBuilderVm`) alongside the libkrun driver (`LibkrunBuilderVm`, `LibkrunPersistentBuilderVm`), each implementing `BuilderVm` independently. Both drivers share the orchestration helpers extracted by Plan 97 Phase C (`stage_job_dir`, `JobResult`, `finalize_flake_job`, `finalize_install_job`, `NixStoreImageLock`, `builder_vm_timeout`, stderr-tail formatters) via `mvm_build::builder_vm_runtime`, but each driver owns its own `start()` / `run_build()` / handle.
+
+This was a deliberate choice over a single `BuilderVm`-generic-over-`Vmm`-trait abstraction. The two VMM impls have meaningfully different shapes:
+
+- libkrun is an in-process C library — the host process *is* the VMM. Panic detection is the host's responsibility because `krun_start_enter` blocks indefinitely on a panicked guest.
+- Vz is an out-of-process Swift supervisor — the host spawns `mvm-vz-supervisor` and waits on the child. Vz exits cleanly on guest panic; no console-log scanner is needed.
+
+A generic seam would have to either erase that difference (forcing libkrun to fake out-of-process semantics or Vz to fake in-process semantics) or split into two trait paths with awkward shared parts. Parallel drivers keep each path readable on its own merits and let the shared orchestration live where it belongs — in helper functions, not in trait erasure.
+
+### State-dir isolation + coexistence
+
+Both backends' persistent builder state dirs live under the same parent — `~/.cache/mvm/builder-vm/vms/` — distinguished by name prefix:
+
+- `mvm-persistent-builder-vm-<session>` for libkrun.
+- `mvm-persistent-builder-vz-<session>` for Vz.
+
+The Stage 0 reaper (Plan 99 PR-1, `crates/mvm-cli/src/commands/env/apple_container.rs::clean_orphan_state_dirs`) walks the parent and is prefix-agnostic — it picks up both backends' dirs without code changes. `mvmctl cache prune` honours running PIDs across both prefixes (§2.C2).
+
+Cross-backend `mvmctl dev` coexistence (`up` refuses cleanly when the *other* backend's persistent dir has a live PID; `down` enumerates both prefixes; `status` reports per-backend state) is Slice 2B follow-up work — the prefix isolation in this ADR is the foundation it builds on.
+
+### Resource ceilings
+
+Vz defaults match libkrun's `LibkrunBuilderVm::default` constants (`VZ_BUILDER_DEFAULT_VCPUS`, `VZ_BUILDER_DEFAULT_MEMORY_MIB`, `VZ_BUILDER_DEFAULT_NIX_STORE_MIB` cross-reference the libkrun consts directly so a future bump on either side flows through). Plan 72 W5.D RAM cap (4 → 8 → 16 GiB defaults, with the stage0/init.sh `/nix` tmpfs `size=` cap bumped alongside) applies to both backends identically.
+
+### Image source (ADR-046 §"Source-checkout builds never depend on mvm-published artifacts")
+
+Both backends resolve the builder VM image (`vmlinux` + `rootfs.ext4` + `cmdline.txt`) through `mvm_build::libkrun_builder::ensure_builder_vm_image()` — the single shared entry point. There is no Vz-specific image resolver, no "Vz pulls a prebuilt from GitHub releases" backdoor. The source-checkout contributor invariant from this ADR's earlier sections applies to the Vz path verbatim. Plan 98 §2.11 ships hermetic source-grep tests (`crates/mvm-build/tests/vz_builder_flake_invariant.rs`) that fail any future regression that adds a download path to `vz_builder.rs`.
+
+### Security claim parity
+
+The builder VM is the dev tier per `feedback_dev_vm_vs_prod_security_tiers.md`, *but* its Install arm (ADR-047, Claim 9) is the prod-grade path that produces the sealed deps volumes the runtime supervisor verifies. So the ADR-002 security claims that apply to the builder VM hold across **both** backends, with the same evidence:
+
+- **Claim 1** (no host-fs access beyond explicit shares). Both backends construct `VirtioFsShare`s for `/work` `/out` `/job` `/nix-store` only. §2.S8 ships a hermetic test asserting set-equality of `(host_path, guest_path, read_only)` triples between the two drivers for the same input.
+- **Claim 5** (vsock framing + supervisor-config JSON fuzzed). libkrun's `crates/mvm-libkrun/fuzz/fuzz_supervisor_config.rs` covers the libkrun supervisor's parser. Vz's `crates/mvm-vz/fuzz/` adds a parallel target against `mvm_vz::SupervisorConfig` — Slice 2C §2.S6. The host-side Vz control-socket parser (Phase E pause/resume/balloon/snapshot) is host-process-local with `0700` parent dir; ADR-002's host-trust assumption covers the residual surface (justified in the Slice 2C ADR-002 sub-note).
+- **Claim 7** (cargo deps audited). `crates/mvm-vz` participates in `deny` + `audit` like every other workspace member; Slice 2C §2.S5 confirms `deny.toml` scope.
+- **Claim 8** (signed/audited `ExecutionPlan`). `mvmctl up --prod` admission emits `plan.admitted` / `plan.launched` / `plan.failed` from the same `AuditEmitter` regardless of which builder backend resolved the Install. Slice 2C §2.S3 runs `mvmctl audit verify` after a Vz-driven `mvmctl up --prod` to assert chain cleanliness.
+- **Claim 9** (sealed deps volumes hash-locked + attestation-checked + CVE-scanned + SBOM-enumerated + audit-bound). Cross-backend byte-equivalence of the sealed volume contents (`content/` tree, `sbom.cdx.json`, `fetch.log`, `cve.json`) is asserted by Slice 2C §2.S2. Builder VM kernel + rootfs parity (the Install-arm prod-grade path) is §2.S9 — if divergence is unavoidable, the volume-byte-level equivalence still holds because both backends produce the same Nix store closure. `meta.json` backend-neutrality (§2.S10) is asserted by decoding a libkrun-sealed and a Vz-sealed Install on the same input and comparing byte-for-byte.
+
+The other ADR-002 claims (2, 3, 4, 6, 10) are guest-side or end-user-runtime concerns — they don't depend on which host VMM booted the builder, so the existing libkrun-side evidence applies unchanged.
+
+Per `feedback_adr_out_of_scope_discipline.md` this Security-claim-parity subsection lists ONLY items in the same threat model as the parent ADR-002 claim. Adjacent surfaces (Sprint 56 Claim 10 in-guest volume encryption, Plan 101 gateway audit) belong in their own ADRs and are not in scope here.
+
+### Cross-reference summary
+
+- **Plan 97** — Vz runtime backend (Phase A/B/D/E shipped, C parked → continued by Plan 98).
+- **Plan 98** — this extension's implementation plan.
+- **Plan 99 PR-1** — Stage 0 cache contract the prefix-agnostic reaper depends on.
+- **ADR-002** — security posture; per-claim sub-notes in Claims 1, 5, 7, 8, 9 point back here.
+- **ADR-047** — Claim 9 evidence pipeline; gains a one-paragraph "Backend symmetry" sub-section citing §2.S2 + §2.S10.
+- **ADR-056** — Vz runtime backend ADR; gains a "Persistent builder variant" pointer to this section.
+- **ADR-057** — Sprint 56 symmetric trust boundary; bidirectional cross-link (Vz builder narrows the asymmetric-trust gap on macOS that ADR-057 fully closes).

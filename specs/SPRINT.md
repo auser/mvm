@@ -211,6 +211,8 @@ project only uses a narrow slice of functionality.
 
 Recent maintenance:
 
+- [x] Fixed the Linux `passt` supervisor startup regression that was failing PR #460's `Test` lane: `mvm-libkrun::passt::spawn` no longer passes `--log-file` into private scratch dirs, and a regression test now asserts the generated passt argv omits that flag while preserving the pid-file path.
+- [x] Cleaned up Plan 98 Slice 2B after Slice 2A merged: the `mvmctl dev` Vz-routing change now rebases directly onto `main`, compiles in both `builder-vm` and `default-features = false` `mvm-cli` builds, removes the stale §2.C1 grace guard, and keeps `MVM_BUILDER_BACKEND=vz` / `--builder vz` selecting the Vz dev backend only when that backend is actually available.
 - [x] Enforced the Plan 45 local-volume encryption-at-rest boundary: `mvmctl volume create` now creates managed local volume directories only on encrypted backing storage, and `mvmctl volume mount` fails closed unless the resolved managed/ad-hoc host directory is backed by encrypted storage (encrypted macOS volume or Linux dm-crypt/LUKS chain), while mounted volumes remain normal plaintext filesystems inside the guest.
 - [x] Follow-up PR after the local-volume encryption gate: made encryption an mvm-owned per-volume property instead of only a host-backing precondition. `mvmctl volume create` now provisions a locked AES-256-GCM encrypted archive with wrapped per-volume key metadata, `volume unlock` is required before mount, `volume lock` reseals and removes plaintext, managed mounts refuse locked volumes, and security tests cover missing keys, tampered ciphertext, locked mount refusal, and clean unlock/lock round-trips.
 - [x] Added [`adrs/053-guest-protocol-versioning-and-readiness.md`](adrs/053-guest-protocol-versioning-and-readiness.md) and [`plans/84-banger-runtime-lessons.md`](plans/84-banger-runtime-lessons.md), a proposed follow-up workstream translating the useful parts of Banger's runtime design into mvm protocol versioning, readiness states, control/data-plane boundaries, backpressure reporting, explicit builder-mode policy, receipts, explainability, and first-use DX.
@@ -2073,15 +2075,14 @@ no macos-26 self-hosted runner required), and docs (CLAUDE.md +
 ADR-046 extension with security-claim-parity language). Plan 99 PR-1
 (#448) is the Stage 0 audit/cache contract this builds on.
 
-- [ ] **Phase 1** — Selection user-surface (auto-detect + `--builder` flag + doctor + §0.x gap fixes). Single non-draft PR.
-  - `--builder vz` with `dev up/rebuild/shell` errors clearly via the §2.C1 grace guard until Phase 2 Slice 2B lands the Vz persistent dev driver. `--builder vz` already works for `mvmctl build` and `mvmctl up --prod`.
-- [ ] **Phase 2** — Vz persistent driver + Install E2E + security parity. Decomposed into four slices for review-sized PRs:
-  - **Slice 2A** — `VzPersistentBuilderVm` driver scaffold (§2.1-2.4, §2.10, §2.S1, §2.C2). No `mvmctl dev` rewire yet; §2.C1 guard stays.
-  - **Slice 2B** — Cross-backend coexistence dispatch (§2.5, §2.8, §2.C3) + remove §2.C1 guard + §2.S11 env-var regression test.
-  - **Slice 2C** — Install E2E byte-equivalence + audit chain + security parity batch (§2.6, §2.7, §2.S2-2.S10 + §2.S13) + ADR-046/002/047 updates.
-  - **Slice 2D** — In-repo flake invariant integration test (§2.11) + final regression gate (§2.9).
-- [ ] **Phase 3** — CI floor on `macos-latest` Vz construction smoke + Linux libkrun auto-detect assertion. `uv pip install` round-trip deferred to §3.6.
-- [ ] **Phase 4** — Docs: CLAUDE.md, ADR-046 extension landed in Slice 2C, ADR-056/055/041/057 cross-references, SPRINT.md close-out.
+- [x] **Phase 1** — Selection user-surface (auto-detect + `--builder` flag + doctor + §0.x gap fixes). Shipped as [#455](https://github.com/tinylabscom/mvm/pull/455).
+- 🟡 **Phase 2** — Vz persistent driver + Install E2E + security parity. Decomposed into four slices for review-sized PRs:
+  - [x] **Slice 2A** — `VzPersistentBuilderVm` driver scaffold (§2.1-§2.3, §2.10, §2.C2). Shipped as [#460](https://github.com/tinylabscom/mvm/pull/460).
+  - [x] **Slice 2B** — `mvmctl dev` routes through Vz when builder backend resolves to Vz + remove §2.C1 grace guard + §2.S11 env-var regression test. Shipped as [#461](https://github.com/tinylabscom/mvm/pull/461). §2.5 cross-backend coexistence dispatch + §2.8 doctor running-VM indicator deferred to a small follow-up (the prefix isolation in Slice 2A is the foundation).
+  - 🟡 **Slice 2C** — Split into Slice 2C-ADRs (ADR text — [#465](https://github.com/tinylabscom/mvm/pull/465)) + the §2.S2-§2.S10 / §2.S13 security tests batch. ADR text shipped; security tests gated on macos-26 self-hosted hardware lane (§3.6) since they need real boots to validate.
+  - [x] **Slice 2D** — Hermetic source-grep guards on the §2.11 in-repo-flake invariant. Shipped as [#464](https://github.com/tinylabscom/mvm/pull/464). True-E2E "Vz boots the in-repo flake" needs macOS 13+ hardware and folds into §3.6.
+- [x] **Phase 3** — CI floor on `macos-latest` Vz construction smoke + Linux libkrun auto-detect assertion. Shipped as [#462](https://github.com/tinylabscom/mvm/pull/462). §3.6 (real `uv pip install` E2E under Vz on macos-26 self-hosted runner) stays deferred — gated on Plan 72 W4/W5 cutover same as the libkrun E2E Install round-trip.
+- 🟡 **Phase 4** — Docs: CLAUDE.md selection-policy section shipped as [#458](https://github.com/tinylabscom/mvm/pull/458) (§4.1); ADR-046 extension + ADR-056 cross-link shipped as [#465](https://github.com/tinylabscom/mvm/pull/465) (§4.2 + §4.2c partial). The remaining §4.2a (ADR-002 per-claim sub-notes), §4.2b (ADR-047 "Backend symmetry" sub-paragraph), and the ADR-055/041/057 one-line cross-references ship as a small prose follow-up. This SPRINT.md close-out is §4.3 itself.
 
 ### Cross-cutting
 
@@ -2208,6 +2209,64 @@ See [Plan 101 W11–W14](plans/101-in-guest-volume-encryption-and-gateway-audit.
 - Side-channel information leakage via flow timing (accepted in ADR-058 amendment).
 - Audit-metadata-at-rest encryption (future claim 10.1).
 - Cross-tenant network management (per-tenant gateway pool, egress quotas, tenant-level rollup) — mvmd cross-repo plan (`mvmd-network-manager`); flagged in [Plan 103](plans/103-w6a-implementation-tracker.md) `## Phase 6`, owned in mvmd.
+
+## Sprint 57 — Host services broker over vsock — PROPOSED  [`plans/104-host-services-broker.md`](plans/104-host-services-broker.md) | `adrs/059-host-services-broker.md` (TBD)
+
+### Why this sprint
+
+Today secrets reach microVMs by mounting a sealed ext4 drive at `/mnt/secrets` at boot; ADR-048 tags this `unsafe_guest_secret_materialization` and declines to claim non-leakage. ADR-049 already committed to a vsock side-channel for secret substitution but stubs it. This sprint generalizes ADR-049's mechanism into a **host services broker** with `host.secrets.v1` running in a **dedicated subprocess** (production-ready isolation per industry analogues — AWS STS, Vault, K8s SA tokens) — and ships `host.time.v1` + `host.cost.v1` in the in-process general broker to validate the substrate works for more than one service. The out-of-process handler substrate ships in v1 with secrets as its first consumer; future addon services reuse it without protocol change. Designed for **extensibility** — Cargo feature flags per service, versioned ServiceIds with parallel-version support, service composition across the process boundary, JSON wire format consistent with existing `GuestRequest` / `HostBoundRequest` channels.
+
+### Workstream breakdown
+
+- [ ] **W1 — Broker substrate + secrets-subprocess scaffolding** (envelope, registry, two vsock listeners per VM — port 5300 general + port 5301 secrets, `mvm-secrets-dispatcher` new crate, supervisor subprocess lifecycle, UDS proxy code path; no handlers yet)
+- [ ] **W2 — `ExecutionPlan.services` + admission wiring** (schema + registry assembly + `EventCategory::ServiceCall` + rate-limit/lifetime-quota/circuit-breaker)
+- [ ] **W3 — `host.time.v1`** (handler in general broker + `broker.v1/list_services` + delete `HostBoundRequest::QueryHostTime`)
+- [ ] **W4a — `host.cost.v1` workload-scope** (handler in general broker; no mvmd dep)
+- [ ] **W4b — `host.cost.v1` cross-tenant via mvmd** (depends on mvmd Plan 51 W1+W2+W3; mvmd-response validation)
+- [ ] **W5 — `host.secrets.v1` inside the secrets subprocess** (ADR-049 implementation; delete `KeystoreReleaser` stubs; inter-call memory hygiene; subprocess seccomp + setpriv + uid 902)
+- [ ] **W6 — Fuzz + CI** (`fuzz_service_call.rs`, `xtask check-handler-*` lints, cross-backend test matrix, subprocess crash isolation tests)
+- [ ] **W7 — ADR-049 §W3 SDK matrix** (Python + TS + Rust hook libraries; splittable per language)
+
+### Cross-repo dependency (mvmd)
+
+- [ ] mvmd **Plan 51** — host services cross-VM endpoints (`../mvmd/specs/plans/51-host-services-cross-vm-endpoints.md`)
+- [ ] mvmd **ADR-0022** — mvmd as cross-VM delegate (`../mvmd/specs/adrs/0022-mvmd-host-services-delegation.md`)
+
+mvmd Plan 51 W1+W2+W3 must land before mvm W4b opens; mvm W1–W4a + W5 + W6 + W7 have no mvmd dep and land in parallel.
+
+### Security claims under this sprint
+
+Two new claims proposed in ADR-059 (numbers TBD — Sprint 56 holds claim 10):
+- Every host-side service is bound to a signed `ExecutionPlan.services` entry, enforced before dispatch, audited via the chain.
+- No raw secret value crosses the broker channel; `host.secrets.v1` returns destination-bound, time-bound signed credentials only.
+
+### Sprint 57 success criteria
+
+- [ ] `ExecutionPlan.services` schema landed and signature-verified at admission (`SCHEMA_VERSION` bumped 4→5).
+- [ ] General broker listens on vsock 5300, dispatches `host.time.v1` / `host.cost.v1` / `broker.v1`.
+- [ ] `mvm-secrets-dispatcher` subprocess listens on vsock 5301, dispatches `host.secrets.v1` only; runs at uid 902 with seccomp `standard` + setpriv.
+- [ ] `host.secrets.v1` returns destination-bound signed credentials per ADR-049 with JCS-canonicalized signing; `KeystoreReleaser` stubs deleted.
+- [ ] Subprocess crash isolation verified: kill subprocess → supervisor survives, workload sees `Err(Unavailable)`; kill supervisor → subprocess exits cleanly via pdeathsig.
+- [ ] `HostBoundRequest::QueryHostTime` deleted; internal caller migrated to broker.
+- [ ] `fuzz_service_call.rs` ≥5min/PR in CI; `xtask check-handler-*` lints block orphans.
+- [ ] Cross-backend test matrix green on libkrun / Firecracker / Apple Container / vz; **both ports listen on all four backends** (vz requires new `VZVirtioSocketListener` Swift class).
+- [ ] mvmd Plan 51 endpoints live (iroh ALPN, signed catalog responses); mvm W4b green; cross-tenant authz refused; malformed-mvmd-response rejected.
+- [ ] ADR-049 §W3 SDK matrix complete in Python + TS + Rust; hostile-guest tests green; S25 placeholder-egress backstop in gvproxy/passt detects and drops `mvm-secret://` patterns.
+- [ ] Falsifiability: throwaway `host.dev.echo.v1` lands in one handler file (in-process) without touching envelope/registry/auth; out-of-process variant exercises the secrets-dispatcher substrate pattern.
+
+### Non-goals (explicit)
+
+- Streaming responses. `host.monitoring.v1` deferred.
+- Addon-provided handlers shipping in v1. v1 only ships the substrate; v2 ships actual addons.
+- The `unsafe_guest_tls_inspection` proxy-with-CA path from ADR-049. Separate plan.
+- Non-HTTP secret substitution. ADR-049 already declares out of scope.
+- Cross-tenant aggregation. `host.cost.v1::tenant` is single-tenant-scoped.
+
+### Follow-up (the host-logging follow-up plan (number TBD) — separate spec)
+
+- [ ] `host.logging.v1` — workload-emitted structured logs to tenant log sink (depends on mvmd Plan 51 W3).
+- [ ] `host.audit.v1` — workload-emitted chain-signed audit entries under `EventCategory::WorkloadAudit`.
+- [ ] ADR-060 — workload-audit semantics + chain rotation policy.
 
 ## Completed Sprints
 

@@ -145,8 +145,11 @@ impl PasstHandle {
 }
 
 /// Spawn a passt child process and return a handle to its
-/// socketpair fd. The child is wired to log to `scratch_dir/passt.log`
-/// (best effort — passt's `--log-file` is optional).
+/// socketpair fd. The child inherits the supervisor's stdio for
+/// diagnostics; we intentionally avoid `passt --log-file` because
+/// passt may drop privileges before opening it, which turns a
+/// private scratch dir into a hard startup failure on CI and
+/// multi-user hosts.
 ///
 /// The returned [`PasstHandle`] must outlive any libkrun
 /// configuration consuming `socket_fd()`. On Drop the child is
@@ -165,7 +168,6 @@ pub fn spawn(scratch_dir: &std::path::Path) -> Result<PasstHandle, PasstError> {
     // and returns 0; on failure it returns -1 and writes nothing.
     let (parent_fd, child_fd) = make_socketpair()?;
 
-    let log_path = scratch_dir.join("passt.log");
     let pid_path = scratch_dir.join("passt.pid");
 
     // passt args:
@@ -175,20 +177,14 @@ pub fn spawn(scratch_dir: &std::path::Path) -> Result<PasstHandle, PasstError> {
     //                       `--no-pid`; a scratch-local pidfile is
     //                       portable and harmless because `Child` still
     //                       owns the actual process lifetime
-    //   --log-file <path> — diagnostic log; failures are non-fatal
-    //   --quiet           — drop the boot-time chatter (still logs to file)
+    //   (no --log-file)   — passt may drop privileges before opening
+    //                       the path; keeping diagnostics on inherited
+    //                       stderr avoids turning a private scratch dir
+    //                       into a startup failure
+    //   --quiet           — drop the boot-time chatter on inherited stdio
     //   --mtu 65520       — match libkrun's COMPAT_NET_FEATURES MTU
     let mut cmd = Command::new(&passt_bin);
-    cmd.arg("--fd")
-        .arg(child_fd.as_raw_fd().to_string())
-        .arg("--foreground")
-        .arg("-P")
-        .arg(OsString::from(&pid_path))
-        .arg("--quiet")
-        .arg("--mtu")
-        .arg("65520")
-        .arg("--log-file")
-        .arg(OsString::from(&log_path));
+    cmd.args(passt_args(child_fd.as_raw_fd(), &pid_path));
 
     // The child needs `child_fd` to NOT have FD_CLOEXEC, otherwise
     // it disappears when the new image takes over. socketpair(2)
@@ -280,6 +276,19 @@ fn make_socketpair() -> Result<(OwnedFd, OwnedFd), PasstError> {
     Ok((parent, child))
 }
 
+fn passt_args(child_fd: RawFd, pid_path: &std::path::Path) -> Vec<OsString> {
+    vec![
+        OsString::from("--fd"),
+        OsString::from(child_fd.to_string()),
+        OsString::from("--foreground"),
+        OsString::from("-P"),
+        pid_path.as_os_str().to_os_string(),
+        OsString::from("--quiet"),
+        OsString::from("--mtu"),
+        OsString::from("65520"),
+    ]
+}
+
 fn clear_cloexec(fd: RawFd) -> io::Result<()> {
     // SAFETY: fcntl(F_GETFD)/F_SETFD on an owned fd is a standard
     // operation; both return -1 on error.
@@ -302,6 +311,7 @@ fn clear_cloexec(fd: RawFd) -> io::Result<()> {
 mod tests {
     use super::*;
     use crate::TEST_ENV_LOCK as ENV_LOCK;
+    use std::path::Path;
 
     #[test]
     fn install_hint_is_platform_specific() {
@@ -321,7 +331,9 @@ mod tests {
 
     #[test]
     fn spawn_without_passt_returns_not_installed() {
-        let _guard = ENV_LOCK.lock().unwrap();
+        let _guard = ENV_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Hide passt from PATH for this test by setting PATH to
         // an empty dir.
         let tmp = tempfile::tempdir().unwrap();
@@ -352,6 +364,23 @@ mod tests {
         assert_ne!(a.as_raw_fd(), b.as_raw_fd());
         assert!(a.as_raw_fd() >= 0);
         assert!(b.as_raw_fd() >= 0);
+    }
+
+    #[test]
+    fn passt_args_omit_log_file_flag() {
+        let args = passt_args(42, Path::new("/tmp/passt.pid"));
+        let args: Vec<String> = args
+            .into_iter()
+            .map(|arg| arg.to_string_lossy().into_owned())
+            .collect();
+        assert!(
+            !args.iter().any(|arg| arg == "--log-file"),
+            "passt args must not include --log-file: {args:?}"
+        );
+        assert!(
+            args.iter().any(|arg| arg == "-P"),
+            "passt args should keep the pid file path: {args:?}"
+        );
     }
 
     /// Spawn passt and immediately drop the handle. Verifies the

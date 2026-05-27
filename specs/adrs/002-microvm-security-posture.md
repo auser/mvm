@@ -138,6 +138,26 @@ by definition (see Threat model). L1 *enables* claim 3 (verified boot
 needs a hypervisor that respects the kernel cmdline). If the host is
 compromised, every layer falls; that case is explicitly out of scope.
 
+### Backend symmetry (Plan 98)
+
+Claims 1, 5, 7, 8, and 11 have **backend-symmetric evidence**: the
+gate holds under both the libkrun-backed builder VM and the
+Vz-backed builder VM (Plan 98). The libkrun-side evidence cited
+above is the canonical reference; the Vz-side parity claims hold
+with the same shape and are catalogued per-claim in **ADR-046 §"Vz
+as a second builder backend (Plan 98)" → "Security claim parity"**.
+Specifically:
+
+- **Claim 1** — VirtioFsShare set-equality test (Plan 98 §2.S8).
+- **Claim 5** — `crates/mvm-vz/fuzz/` parallels `crates/mvm-libkrun/fuzz/fuzz_supervisor_config.rs` (Plan 98 §2.S6).
+- **Claim 7** — `crates/mvm-vz` participates in `deny` + `audit` like every workspace member (Plan 98 §2.S5).
+- **Claim 8** — `mvmctl audit verify` after a Vz-driven `mvmctl up --prod` asserts chain cleanliness (Plan 98 §2.S3).
+- **Claim 11** — cross-backend byte-equivalence of sealed deps volume `(content/, sbom.cdx.json, fetch.log, cve.json)` (Plan 98 §2.S2) + `meta.json` backend-neutrality (Plan 98 §2.S10) + Install-arm kernel parity (Plan 98 §2.S9).
+
+Claims 2, 3, 4, 6, 9, 10 are guest-side or end-user-runtime concerns
+that don't depend on which host VMM booted the builder, so the
+existing libkrun-side evidence applies unchanged.
+
 ### Framework references
 
 Each claim is named here in MITRE vocabulary. Adversary technique = the

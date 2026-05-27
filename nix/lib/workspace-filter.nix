@@ -1,0 +1,50 @@
+# Single source of truth for filtering the host workspace tree into
+# the Nix store when building images. Used by:
+#
+#   nix/images/builder-vm/flake.nix
+#   nix/images/builder/flake.nix
+#   nix/images/runtime-overlay/flake.nix
+#
+# Maintenance: the excluded basenames here must stay aligned with the
+# root .gitignore. The two serve different purposes — .gitignore
+# honors path prefixes and negation; this filter matches basenames —
+# so they are not auto-derived. When you add a directory to
+# .gitignore that names something anywhere in the tree (a new build
+# artifact, a new tool's scratch dir), add its basename here too.
+
+{ lib }:
+
+{ workspaceRoot, name ? "mvm-workspace" }:
+builtins.path {
+  inherit name;
+  path = workspaceRoot;
+  filter =
+    path: _type:
+    let
+      base = baseNameOf path;
+    in
+    !(builtins.elem base [
+      # Build artifacts (Rust / Node / Astro / Nix outputs).
+      "target"
+      "result"
+      "node_modules"
+      ".direnv"
+      ".cargo"
+      "dist"
+      ".astro"
+      "dev-prebuilt"
+      # Test / generated outputs.
+      ".mvm-test"
+      "graphify-out"
+      ".ur-seed-result"
+      "nixos.qcow2"
+      # VCS / agent / worktree / tooling scratch.
+      ".git"
+      ".claude"
+      ".worktrees"
+      ".playwright-mcp"
+      # Secrets (host-side; the in-VM key path is ~/.mvm/keys).
+      "keys"
+    ])
+    && !(lib.hasPrefix "result-" base);
+}
