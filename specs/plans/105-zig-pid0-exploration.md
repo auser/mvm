@@ -3,7 +3,7 @@
 Status: proposed (exploration, not commitment)
 Created: 2026-05-27
 Owner: tbd
-Related: SPRINT.md Sprint 57, Sprint 42 Track E, ADR-002, ADR-053, ADR-055, ADR-058, Plan 25, Plan 64, Plan 102
+Related: SPRINT.md Sprint 57, Sprint 42 Track E, ADR-002, ADR-053, ADR-055, ADR-058, ADR-059, Plan 25, Plan 64, Plan 102, **Plan 104** (host services broker — adjacent vsock surface; see §"Process lineage" and W3)
 
 ## Why this plan
 
@@ -64,6 +64,22 @@ pid1 = init (NixOS minimal-init, from nix/lib/minimal-init/)
 ```
 
 The flake-defined workload is a **child of `mvm-guest-agent`**. The agent is both protocol dispatcher and process supervisor (fork/exec/wait/PTY + warm pool + integration probes). The netinit prototype dodges process-supervisor complexity entirely (one-shot, no children), which is exactly why it's the right calibration target.
+
+### Adjacent vsock surface (Plan 104 / ADR-059 context)
+
+The agent control channel (vsock `:5252`) is *not* the only vsock surface between guest and host. Plan 104 (host services broker, merged 2026-05-26) added two more ports, both using the same `AuthenticatedFrame` envelope:
+
+- **`:5300`** — general broker (host-side, in `mvm-supervisor` in-process): `host.time.v1`, `host.cost.v1`, observational/low-criticality services.
+- **`:5301`** — secrets channel (host-side, dedicated `mvm-secrets-dispatcher` subprocess, uid 902, separate address space): `host.secrets.v1` only.
+
+The broker is **host-side** — `mvm-secrets-dispatcher` is a host subprocess spawned by the supervisor, not a guest binary, so it's outside this plan's pid0 scope. But the wire surface matters for W3 and W4:
+
+- **W3 must cover all three ports.** Same host static Ed25519 pubkey; three independent Noise_NK sessions; the secrets channel (`:5301`) is the highest-stakes priority for any encryption rollout.
+- **W4 control-plane-vs-data-plane ADR must name the broker as part of the control plane.** Workload→host service calls (secrets, time, cost) carry audit-emitting RPCs and gate on signed `ExecutionPlan.services` bindings — control-plane traffic, not data plane (D3).
+- **D2 (Rust defines the conversation) extends to broker types**: `ServiceCall` / `ServiceResponse` envelopes stay Rust-canonical in `mvm-core` alongside `GuestRequest`/`GuestResponse`. Any Zig adoption inherits the same drift-protection constraint.
+- **I1 (audit chain) already spans the broker** — Plan 104 funnels all broker calls through the supervisor's `AuditEmitter`. This plan inherits the integration cleanly; nothing to design.
+
+See `specs/research/agent-evolution-tradeoff-note.md` §"Vsock surface — broader than the agent control channel" for the full table and integration analysis.
 
 ## Workstream W1 — Tradeoff note (Track E §"Zig evaluation gates" prerequisite)
 
@@ -147,15 +163,18 @@ Items 1, 2, 6 can independently rule out an implementation. The result table fee
 
 Deliverable: `specs/research/vsock-control-plane-encryption.md`. No code in this milestone.
 
+**Scope**: all three guest↔host vsock surfaces — `:5252` (agent control), `:5300` (broker general — `host.time.v1`, `host.cost.v1`), `:5301` (broker secrets — `host.secrets.v1`). Same `AuthenticatedFrame` envelope on all three; same host static Ed25519 pubkey authenticates all three; three independent Noise_NK sessions. **Priority implementation target for any follow-on plan: `:5301` first** — secrets carry the highest-stakes plaintext today (per Plan 104 the broker ships on plaintext `AuthenticatedFrame`, consistent with ADR-002's current out-of-scope-for-malicious-hypervisor posture; encrypting `:5301` is the most valuable upgrade).
+
 Recommended design (locked):
 - **Protocol**: Noise_NK
 - **DH**: X25519
 - **Cipher**: ChaCha20-Poly1305
 - **Hash**: SHA-256
 - **Host pubkey distribution**: bake into guest image via `mkGuest { hostPubkey = ./host-signer.ed25519.pub; }` flake parameter, read from `~/.mvm/keys/host-signer.ed25519.pub` at image build time
-- **Envelope**: stream-level wrap (post-handshake, every byte through `CipherState::write_message`); `AuthenticatedFrame` signing + sequence# remain intact under the cipher (I1)
+- **Envelope**: stream-level wrap (post-handshake, every byte through `CipherState::write_message`); `AuthenticatedFrame` signing + sequence# remain intact under the cipher (I1). Each port runs its own session; envelope layering is identical across all three.
 - **Rust impl pointer**: [`snow`](https://crates.io/crates/snow), small audited
 - **Zig impl strategy** (when/if): Noise_NK from scratch (~800 LoC); beats wrapping a C library
+- **Coordination point**: any change to `AuthenticatedFrame` in `crates/mvm-core/src/policy/security.rs` is a sync point with the Plan 104 broker work — W3 design must specify the wrap layer precisely so the two efforts can't drift. The secrets-work session driving broker implementation should treat the W3 doc as the encryption contract their future encrypted broker will inherit.
 
 Doc tasks:
 - [ ] Write Noise_NK design (full handshake state machine, key schedule, replay handling)
