@@ -2,7 +2,7 @@
 
 Companion ADR: `specs/adrs/059-host-services-broker.md`
 Follow-up plan (sketched at end): host-logging + workload-audit — plan number TBD (Plan 103 is contested by an egress-secret-detection proposal; re-verify before claiming a number)
-Cross-repo mvmd dependency: `../mvmd/specs/plans/51-host-services-cross-vm-endpoints.md` + `../mvmd/specs/adrs/0022-mvmd-host-services-delegation.md`
+Cross-repo mvmd dependency: `../mvmd/specs/plans/52-host-services-cross-vm-endpoints.md` + `../mvmd/specs/adrs/0023-mvmd-host-services-delegation.md`
 Tracking sprint: **Sprint 57** in `specs/SPRINT.md` (Sprint 56 = symmetric trust boundary + claim 10).
 
 > **Plan-numbering note (2026-05-26).** This plan was first drafted as Plan 97 / ADR-056, then 98 / 057, then Plan 98 / ADR-059, and finally **Plan 104 / ADR-059** because `98-vz-builder-vm.md` and `103-w6a-implementation-tracker.md` landed on `origin/main` mid-conversation (taking Plan 98 and Plan 103 respectively). Per the saved "spec numbering chaos" guidance, re-verify ALL numbers with `gh pr list` + `git fetch && git log --diff-filter=A -- specs/plans/104-*.md` *immediately* before opening the implementation PR. **Do not propose explicit Claim 10/11 numbers in ADR-059** — Sprint 56 holds Claim 10 already. Let ADR-059 assign claim numbers against ADR-002's live list at write time.
@@ -203,7 +203,7 @@ The out-of-process handler substrate has a **mandatory v1 consumer**: the secret
 
 ### A7 — Per-tenant service catalogs (mvmd)
 
-- mvmd Plan 51 exposes `GET /v1/host-services/tenant/{tenant_id}/catalog` returning the set of services this tenant is allowed to use. Different tenants can have different catalogs (a Free tenant might not see `host.cost.v1::tenant`; an Enterprise tenant might see `host.config.v1`).
+- mvmd Plan 52 exposes `GET /v1/host-services/tenant/{tenant_id}/catalog` returning the set of services this tenant is allowed to use. Different tenants can have different catalogs (a Free tenant might not see `host.cost.v1::tenant`; an Enterprise tenant might see `host.config.v1`).
 - At workload admission, the per-VM supervisor pulls the tenant catalog from mvmd-agent, intersects it with the workload's `ExecutionPlan.services` bindings, and refuses any binding not in the tenant's catalog. The intersection is signed and recorded in the audit chain at admission.
 
 ## Build sequence
@@ -247,7 +247,7 @@ Each wave is independently mergeable and leaves `cargo test --workspace && cargo
   - [ ] Verb `workload`; verb `tenant` returns `NotImplemented` until W4b
   - [ ] Tests: returns right shape, quota enforcement, denied in `BuilderOnly` profile, accumulator updates correctly under simulated CPU/RAM load
   - [ ] **Alternative if W4a's accumulator scope is too big:** defer the workload verb to W4b alongside cross-tenant and ship W4a as `NotImplemented` for *both* verbs. Decision: leave to implementer based on scope estimate at W4a start.
-- [ ] **W4b — `host.cost.v1` cross-tenant via mvmd** *(depends on mvmd Plan 51 W1+W2+W3)*
+- [ ] **W4b — `host.cost.v1` cross-tenant via mvmd** *(depends on mvmd Plan 52 W1+W2+W3)*
   - [ ] Add `MvmdClient` trait + real impl over mvmd-agent's iroh ALPN transport (new `AgentRequest` variants — NOT a new HTTP route, NOT raw QUIC+mTLS)
   - [ ] Test-mode in-process `MvmdClient`
   - [ ] mvmd response schema validation (refuse if mvmd returns unexpected fields/types — see §Security S15)
@@ -397,7 +397,7 @@ Each wave is independently mergeable and leaves `cargo test --workspace && cargo
 
 ## Decisions (resolving the earlier open questions)
 
-1. **Cross-VM in scope; mvm broker delegates to mvmd over iroh ALPN.** Per-VM data stays in the supervisor handler. Cross-VM data via mvmd-agent's existing iroh transport with new `AgentRequest` variants. mvmd-side work: Plan 51 + ADR-0022.
+1. **Cross-VM in scope; mvm broker delegates to mvmd over iroh ALPN.** Per-VM data stays in the supervisor handler. Cross-VM data via mvmd-agent's existing iroh transport with new `AgentRequest` variants. mvmd-side work: Plan 52 + ADR-0023.
 2. **Encoding: JSON via `serde_json`** (DECIDED 2026-05-26, T3). Switched from CBOR. v1 has no genuinely binary payload; SDK-matrix friction + `jq` debuggability + consistency with existing JSON channels (`GuestRequest`, `HostBoundRequest`) win. Signed payloads use JCS (RFC 8785) for canonical bytes.
 3. **`broker.v1/list_services` exposed.** Workloads enumerate bound services + verbs + deprecation flags at runtime.
 4. **`host.secrets.v1` runs in a dedicated subprocess** (DECIDED 2026-05-26, T4 — production-ready isolation). Separate binary `mvm-secrets-dispatcher` at uid 902, seccomp `standard`, setpriv; UDS-only access to the supervisor. Industry pattern (AWS STS, HashiCorp Vault, Kubernetes ServiceAccount token controllers).
@@ -466,7 +466,7 @@ The broker is a new attack surface. Five independent gates protect every call (�
 - Test: `audit_entry_enqueued_before_response_returned` — synthesize a call, observe enqueue order vs response; kill the supervisor mid-batch, restart, assert the chain contains the entry.
 
 **S23 — Tenant catalog must be mvmd-signed (BLOCKING).** Per §A7, the per-VM supervisor pulls the tenant catalog from mvmd-agent and intersects it with the workload's bindings. A compromised mvmd-agent (or a MITM in the iroh transport, even with mTLS) could return a wider catalog than the tenant is entitled to, and the supervisor would chain-sign the bogus intersection.
-- Mitigation: the catalog response carries an mvmd-fleet-credential-signed envelope (the same ADR-0022 §Trust model signature mvmd uses on tenant authorization). The supervisor verifies the signature against a pinned mvmd public key before trusting the catalog payload. Without this, ADR-0022's "tenant-scoped authz lives in mvmd" claim is weaker than advertised.
+- Mitigation: the catalog response carries an mvmd-fleet-credential-signed envelope (the same ADR-0023 §Trust model signature mvmd uses on tenant authorization). The supervisor verifies the signature against a pinned mvmd public key before trusting the catalog payload. Without this, ADR-0023's "tenant-scoped authz lives in mvmd" claim is weaker than advertised.
 - Test: `mvmd_unsigned_catalog_rejected` — fixture mvmd returns an unsigned (or wrong-key-signed) catalog; supervisor refuses admission with audit `service.catalog.signature_invalid`.
 
 **S24 — Privileged composition can leak secrets (BLOCKING).** §A5 allows a handler to invoke `host.secrets.v1` via `ServiceCallContext::invoke`. Claim Y covers raw-secret leakage *through* `host.secrets.v1`'s response, but a composing handler (e.g., `host.config.v1` fetching a credential to call mvmd) could inadvertently include the composed credential in its *own* outbound `ServiceResponse`. Bug-in-composer = secret-leak-via-composer.
@@ -482,7 +482,7 @@ The broker is a new attack surface. Five independent gates protect every call (�
 - Knob: `BROKER_SECRETS_LATENCY_FLOOR_MS=5`. Test: `host_secrets_v1_latency_floor_holds_warm_and_cold`.
 
 **S27 — Signed-plan revocation: no in-session invalidation when host signer key is rotated for cause.** S20 covers the cryptographic-independence case (rotation doesn't break in-flight sessions). S27 covers the *intentional* revocation case: operator rotates the key specifically because a plan was compromised; the workload is still running and the broker continues serving it.
-- Mitigation: new `mvmctl services revoke <workload>` operation (extends §C2 CLI) flushes the workload's broker session, emits `service.session.revoked { reason }` to the audit chain, and refuses further calls. Distinct from workload stop (which tears down the whole VM). Available via mvmd-agent for fleet operators (extends mvmd Plan 51 catalog endpoint with a revocation action).
+- Mitigation: new `mvmctl services revoke <workload>` operation (extends §C2 CLI) flushes the workload's broker session, emits `service.session.revoked { reason }` to the audit chain, and refuses further calls. Distinct from workload stop (which tears down the whole VM). Available via mvmd-agent for fleet operators (extends mvmd Plan 52 catalog endpoint with a revocation action).
 - Test: `service_session_revoked_refuses_further_calls`.
 
 **S28 — JSON canonical encoding for signed credential payloads.** Signed credentials returned by `host.secrets.v1` are JSON. JSON is not canonically encoded by default — key ordering, whitespace, and Unicode normalization can all vary. If the signed payload is re-serialized between sign and verify, the signature could fail (or, worse, a different encoding could pass).
@@ -513,11 +513,11 @@ Two new claims for the broker (numbers to be assigned in ADR-059 against ADR-002
 - Egress policy unchanged — broker is host↔guest only.
 - `prod-agent-no-exec` unchanged — no broker verb is code-execution-shaped.
 
-## mvmd-side extension — Plan 51 + ADR-0022 (drafts, to be written to mvmd repo on approval)
+## mvmd-side extension — Plan 52 + ADR-0023 (drafts, to be written to mvmd repo on approval)
 
-### `../mvmd/specs/plans/51-host-services-cross-vm-endpoints.md` (draft)
+### `../mvmd/specs/plans/52-host-services-cross-vm-endpoints.md` (draft)
 
-> **Plan 51 — Host services cross-VM endpoints**
+> **Plan 52 — Host services cross-VM endpoints**
 >
 > ### Context
 >
@@ -547,9 +547,9 @@ Two new claims for the broker (numbers to be assigned in ADR-059 against ADR-002
 > - **R1 — Latency.** Mitigation: agent-local TTL cache for hot keys.
 > - **R2 — mvmd-down.** Mitigation: 500ms timeout, `ServiceErrorCode::Unavailable` propagated to guest; never stale data.
 
-### `../mvmd/specs/adrs/0022-mvmd-host-services-delegation.md` (draft)
+### `../mvmd/specs/adrs/0023-mvmd-host-services-delegation.md` (draft)
 
-> **ADR-0022 — mvmd as the cross-VM delegate for the host services broker**
+> **ADR-0023 — mvmd as the cross-VM delegate for the host services broker**
 >
 > - Status: Proposed
 > - Date: 2026-05-26
@@ -591,13 +591,13 @@ Two new claims for the broker (numbers to be assigned in ADR-059 against ADR-002
 
 (Numbering note: this follow-up was originally drafted as Plan 99, then renumbered through 103 as vz-phase-c-completion, symmetric-builder-vm, in-guest-volume-encryption, and gateway-audit-substrate plans took 99–102. Plan 103 is currently contested by a separate "egress secret detection + obfuscation" proposal flagged 2026-05-26; re-check `gh pr list` + `ls specs/plans/` and pick the next free number when this follow-up actually lands.)
 
-**`host.logging.v1` — workload-emitted structured logs.** Verbs `emit`, `emit_batch` (≤100 records), `tail`. Per-record cap 8 KiB. Rate limit `BROKER_LOGGING_TOKENS_PER_SEC=200`. Audit chain records only `(service, verb, record_count, outcome)`. Cross-VM via mvmd Plan 51 W3 → tenant log sink. Workload-trusted content; opt-in regex redaction via `policy.redact`.
+**`host.logging.v1` — workload-emitted structured logs.** Verbs `emit`, `emit_batch` (≤100 records), `tail`. Per-record cap 8 KiB. Rate limit `BROKER_LOGGING_TOKENS_PER_SEC=200`. Audit chain records only `(service, verb, record_count, outcome)`. Cross-VM via mvmd Plan 52 W3 → tenant log sink. Workload-trusted content; opt-in regex redaction via `policy.redact`.
 
 **`host.audit.v1` — workload-emitted audit chain entries.** Verb `record(category, fields)`. Per-record cap 4 KiB, `BROKER_AUDIT_TOKENS_PER_SEC=20`. New `EventCategory::WorkloadAudit` (distinct from `ServiceCall`). `audit_durability() = PerCall`. Verifier distinguishes workload-asserted from host-asserted entries.
 
 **Companion ADR-060** — workload-audit semantics (workload-asserted vs host-asserted entries; verifier behavior; chain rotation policy — addresses S18).
 
-**Depends on:** Plan 104 W1+W2 + mvmd Plan 51 W3.
+**Depends on:** Plan 104 W1+W2 + mvmd Plan 52 W3.
 
 ## Additional considerations
 
@@ -681,7 +681,7 @@ Resolved by §"Host-side: two-process architecture" above. The general broker (p
 Resolved by §A4 rewrite above. The "speculative substrate with no v1 consumer" criticism dissolves — the v1 consumer of the out-of-process handler substrate IS the secrets dispatcher (T4). Every line of the UDS proxy code is exercised by the security-critical secrets path on every workload start. v2 third-party addons reuse the *same* substrate when they land: same wire envelope, same handler trait, same audit flow, same subprocess pattern. The substrate's design is informed by the secrets dispatcher's real requirements, not a hypothetical addon's. This pattern of "ship the abstraction along with its first real consumer, defer hypothetical consumers to v2" is the right discipline.
 
 **T6 — mvmd delegation is an architectural boundary, not a trust boundary.**
-ADR-0022's trust model has the supervisor signing the `X-MVM-Workload-Id` header. A compromised supervisor forges arbitrary workload-ids; mvmd accepts them. The "blast radius stays single-tenant" guarantee only holds *if* the supervisor is uncompromised, in which case there's no remaining isolation to preserve (the supervisor would also release its own tenant's secrets). The delegation buys clean separation of *correctness* concerns (mvmd owns aggregation), not a new trust boundary. **Updated:** the §Cross-VM delegation prose and mvmd ADR-0022 should be explicit that this is an architectural boundary, NOT a trust boundary. The trust boundary remains "supervisor and below are trusted."
+ADR-0023's trust model has the supervisor signing the `X-MVM-Workload-Id` header. A compromised supervisor forges arbitrary workload-ids; mvmd accepts them. The "blast radius stays single-tenant" guarantee only holds *if* the supervisor is uncompromised, in which case there's no remaining isolation to preserve (the supervisor would also release its own tenant's secrets). The delegation buys clean separation of *correctness* concerns (mvmd owns aggregation), not a new trust boundary. **Updated:** the §Cross-VM delegation prose and mvmd ADR-0023 should be explicit that this is an architectural boundary, NOT a trust boundary. The trust boundary remains "supervisor and below are trusted."
 
 **T7 — C7 (audit sync) was a wish; now pinned to three concrete constraints.**
 Resolved above in §C7 — the chain entry format must be (1) append-only canonical JSON (JCS, RFC 8785), (2) self-contained per entry, (3) expose `chain_head` via internal API. Plan 104 W2 must satisfy these contracts so the follow-up sync mechanism doesn't require rewriting the audit format.
@@ -700,8 +700,8 @@ Resolved above in §C7 — the chain entry format must be (1) append-only canoni
 - **R2 — Per-VM supervisor adds a vsock listener.** Fuzz surface (W6) + a few MB memory (negligible).
 - **R3 — `host.secrets.v1` is the most security-critical code shipped on the runtime path in months.** Dedicated security review of W5 before merge; W5 includes ADR-049's hostile-guest matrix; W6 fuzz target lands same PR window.
 - **R4 — Schema change to `ExecutionPlan` requires `SCHEMA_VERSION` bump 4→5.** `crates/mvm-plan/src/plan.rs:45` defines `SCHEMA_VERSION: u32 = 4` with explicit "older verifiers must fail closed on unknown schema versions." Adding `services: Vec<ServiceBinding>` is a v5 schema; old (v4) plans hard-fail at verification, not silently accept the new field as empty. This is consistent with the saved no-backcompat rule but the earlier R4 wording ("old plans verify") was misleading. Migration: any in-flight v4 plans must be re-synthesized + re-signed under v5 to keep running; per the no-backcompat rule, no shim.
-- **R5 — Plan numbering race (REVISED 2x).** Plan 98 was claimed by `98-vz-builder-vm.md` and Plan 103 by `103-w6a-implementation-tracker.md` mid-conversation; this plan moved to Plan 104. As of the final rename, **Plan 104 / ADR-059 / Sprint 57 / mvmd Plan 51 / mvmd ADR-0022 are free**. Sprint 55-derived work claims 97 and 98; Sprint 56 claims 99–102, 057, 058 in mvm and 50 in mvmd; Sprint 56 W6 follow-up claims 103. Re-verify all numbers immediately before opening the implementation PR; per saved guidance, do not renumber other sessions' work.
-- **R6 — Lockstep delivery between mvm W4b and mvmd Plan 51.** Land mvmd Plan 51 W1+W2+W3 *before* opening mvm W4b. W4b PR pins required mvmd commit. mvm W1–W4a + W5 + W6 + W7 have no mvmd dep.
+- **R5 — Plan numbering race (REVISED 3x).** Three numbering collisions hit this plan mid-conversation: (1) mvm `98-vz-builder-vm.md` took Plan 98, (2) mvm `103-w6a-implementation-tracker.md` took Plan 103, (3) mvmd `51-network-policy-enforcement-rollout.md` and `0022-network-policy-enforcement-architecture.md` took mvmd Plan 51 + ADR-0022 between mvm PR open and mvmd PR open. This plan finally settles at **mvm Plan 104 / ADR-059 / Sprint 57 + mvmd Plan 52 / ADR-0023**. Sprint 55-derived work claims mvm 97 and 98; Sprint 56 claims mvm 99–102, 057, 058 and mvmd 50; Sprint 56 W6 follow-up claims mvm 103; the network-policy-enforcement initiative claims mvmd 51 + 0022. Re-verify all numbers immediately before opening any implementation PR; per saved guidance, do not renumber other sessions' work.
+- **R6 — Lockstep delivery between mvm W4b and mvmd Plan 52.** Land mvmd Plan 52 W1+W2+W3 *before* opening mvm W4b. W4b PR pins required mvmd commit. mvm W1–W4a + W5 + W6 + W7 have no mvmd dep.
 - **R7 — JSON encoding crates.** `serde_json` for the wire envelope (already in-tree), `serde_jcs` (or equivalent) for canonical signing bytes (RFC 8785). Existing `cargo-deny` lane catches regressions. **No CBOR libraries needed** — ciborium dropped from the dependency closure when T3 settled on JSON.
 - **R8 — Cross-backend behavioral divergence.** Vsock semantics differ across libkrun, Firecracker, Apple Container, vz. Mitigation: W6 cross-backend test matrix; backend-specific shims rather than divergent behavior.
 - **R9 — Sprint 56 claim 10 collision.** Sprint 56 owns "claim 10" (bytes leaving trust boundary). Plan 104's broker claims must be assigned different numbers in ADR-059 against the live ADR-002 claim list at write time.
