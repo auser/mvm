@@ -995,6 +995,30 @@ pub struct SupervisorConfig {
     /// `~/.mvm/keys/` (no path-traversal) at admission.
     #[serde(default)]
     pub signing_key_path: Option<std::path::PathBuf>,
+
+    // --- Plan 102 W6.A.5: plan + bundle for bridge construction -----
+    //
+    // The bridge ([`mvm_supervisor::gateway_bridge::BridgeConfig`])
+    // needs `Arc<ExecutionPlan>` + `Option<Arc<PolicyBundle>>` to
+    // construct chained `AuditEntry`s. Carrying them as
+    // `Option<serde_json::Value>` (instead of the typed structs)
+    // avoids adding `mvm-plan` / `mvm-policy` to this crate's deps,
+    // which would close the `mvm-libkrun ← mvm-core ← mvm-plan`
+    // cycle. The leaf bin crate `mvm-libkrun-supervisor` can freely
+    // depend on both and deserializes the Values on the bridge side.
+    /// JSON-encoded [`mvm_plan::ExecutionPlan`] for this admission.
+    /// The bin deserializes into the typed value when building
+    /// `BridgeConfig.plan`. `None` ⇒ legacy non-bridge path
+    /// (`tenant_id` will also be `None` and
+    /// `validate_audit_substrate` will refuse).
+    #[serde(default)]
+    pub plan: Option<serde_json::Value>,
+    /// JSON-encoded [`mvm_policy::PolicyBundle`] for this admission.
+    /// Optional even when `plan` is set — workloads can run with
+    /// no bundle (matches the existing `Option<Arc<PolicyBundle>>`
+    /// in `BridgeConfig`).
+    #[serde(default)]
+    pub bundle: Option<serde_json::Value>,
 }
 
 impl SupervisorConfig {
@@ -1497,6 +1521,8 @@ mod tests {
                 "/tmp/mvm/audit/gateway-events-vm-a.sock",
             )),
             signing_key_path: Some(keys.join("host-signer.ed25519")),
+            plan: None,
+            bundle: None,
         }
     }
 
@@ -1615,6 +1641,8 @@ mod tests {
             gateway_audit_socket: None,
             gateway_events_socket: None,
             signing_key_path: None,
+            plan: None,
+            bundle: None,
         };
         let json = serde_json::to_string(&cfg_pre_w6a).unwrap();
         let parsed: SupervisorConfig =
@@ -1623,7 +1651,77 @@ mod tests {
         assert!(parsed.audit_dir.is_none());
         assert!(parsed.gateway_audit_socket.is_none());
         assert!(parsed.signing_key_path.is_none());
+        assert!(parsed.plan.is_none());
+        assert!(parsed.bundle.is_none());
         // But validate_audit_substrate must refuse it.
         assert!(parsed.validate_audit_substrate().is_err());
+    }
+
+    // Plan 102 W6.A.5 — `plan` + `bundle` fields on SupervisorConfig.
+    // Tests pin: (1) back-compat from JSON omitting both fields, (2)
+    // serde roundtrip with both fields populated, (3) the validate_*
+    // gate doesn't require them (validation covers paths only — the
+    // bridge factory consumes plan/bundle as soft data).
+
+    #[test]
+    fn supervisor_config_parses_pre_w6a5_json_missing_plan_and_bundle() {
+        // A pre-W6.A.5 caller would have omitted both new fields.
+        let json = r#"{
+            "krun": {
+                "name": "vm",
+                "kernel_path": "/k",
+                "rootfs_path": "/r",
+                "vcpus": 1,
+                "ram_mib": 256,
+                "kernel_cmdline": null,
+                "vsock_ports": [],
+                "extra_disks": [],
+                "console_output_path": null,
+                "vsock_socket_dir": null
+            },
+            "vm_state_dir": "/tmp/vms/vm",
+            "pid_file_name": null
+        }"#;
+        let parsed: SupervisorConfig =
+            serde_json::from_str(json).expect("pre-W6.A.5 JSON must still parse");
+        assert!(parsed.plan.is_none());
+        assert!(parsed.bundle.is_none());
+    }
+
+    #[test]
+    fn supervisor_config_roundtrips_with_plan_and_bundle_populated() {
+        let mut cfg = well_formed_supervisor_config();
+        // Stand-in JSON shapes — the bin crate is what decodes these
+        // into typed `ExecutionPlan` / `PolicyBundle`, so the
+        // mvm-libkrun layer only verifies the Values roundtrip.
+        cfg.plan = Some(serde_json::json!({
+            "tenant_id": "tenant-x",
+            "kind": "workload",
+            "version": 1
+        }));
+        cfg.bundle = Some(serde_json::json!({
+            "name": "default",
+            "version": 1,
+            "rules": []
+        }));
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let parsed: SupervisorConfig = serde_json::from_str(&json).expect("roundtrip");
+        assert_eq!(parsed.plan, cfg.plan);
+        assert_eq!(parsed.bundle, cfg.bundle);
+    }
+
+    #[test]
+    fn supervisor_config_plan_without_bundle_is_legal() {
+        let mut cfg = well_formed_supervisor_config();
+        cfg.plan = Some(serde_json::json!({ "kind": "workload" }));
+        cfg.bundle = None;
+        // No validation involvement — bridge factory tolerates the
+        // bundle being absent (matches `Option<Arc<PolicyBundle>>`
+        // in BridgeConfig). Confirm serde roundtrip preserves the
+        // shape without errors.
+        let json = serde_json::to_string(&cfg).expect("serialize");
+        let parsed: SupervisorConfig = serde_json::from_str(&json).expect("roundtrip");
+        assert!(parsed.plan.is_some());
+        assert!(parsed.bundle.is_none());
     }
 }

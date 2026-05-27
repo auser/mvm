@@ -41,6 +41,16 @@ tracing = "0.1"
 # itself. Compile cost is marginal; serde is already in nearly
 # every other workspace crate's dep graph.
 serde = { workspace = true }
+# Plan 102 W6.A.5 — `SupervisorConfig` carries the per-VM
+# ExecutionPlan + PolicyBundle as `Option<serde_json::Value>` so the
+# bin (`mvm-libkrun-supervisor`) can feed them into the bridge
+# factory without forcing mvm-libkrun to depend on mvm-plan / mvm-
+# policy (which would close the `mvm-libkrun ← mvm-core ← mvm-plan`
+# cycle). The bin crate, being a leaf, deserializes the Values into
+# typed `ExecutionPlan` / `PolicyBundle` since it can depend on
+# both. Always-on (not feature-gated) because `SupervisorConfig` is
+# always-on per the comment above.
+serde_json.workspace = true
 # We intentionally do NOT pull `mvm-guest` from regular deps: that
 # would close a cycle (mvm-core → mvm-libkrun → mvm-guest → mvm-core,
 # since mvm-core depends on mvm-libkrun for `Platform::has_libkrun`).

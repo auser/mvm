@@ -212,6 +212,8 @@ fn boot_with_libkrun(
         gateway_audit_socket: None,
         gateway_events_socket: None,
         signing_key_path: None,
+        plan: None,
+        bundle: None,
     };
     let json = serde_json::to_string(&cfg).expect("serialize supervisor config");
 
