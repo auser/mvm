@@ -25,7 +25,6 @@ use clap::{Args as ClapArgs, Subcommand};
 use crate::ui;
 
 use mvm_backend::{LibkrunBackend, VzBackend};
-use mvm_build::builder_backend_select::{BuilderBackendChoice, resolve_choice};
 use mvm_core::platform::{self, Platform};
 use mvm_core::user_config::MvmConfig;
 use mvm_core::vm_backend::{VmBackend, VmId, VmStartConfig, VmStatus};
@@ -63,12 +62,13 @@ enum DevBackend {
 /// source of truth.
 ///
 /// Selection order (Plan 98 Slice 2B):
-///   1. Builder-backend override = Vz **and** Vz is available on this
-///      host → `DevBackend::Vz`. This catches both the `--builder vz`
-///      flag (folded into the env at startup by `commands::run`) and
-///      the bare `MVM_BUILDER_BACKEND=vz` env-var path. Vz on macOS
-///      13-25 stays opt-in only — auto-detect won't pick it because
-///      the deployment baseline is macOS 26+.
+///   1. Builder-backend override prefers Vz **and** Vz is available
+///      on this host → `DevBackend::Vz`. This catches both the
+///      `--builder vz` flag (folded into the env at startup by
+///      `commands::run`) and the bare `MVM_BUILDER_BACKEND=vz`
+///      env-var path. Vz on macOS 13-25 stays opt-in only —
+///      auto-detect won't pick it because the deployment baseline is
+///      macOS 26+.
 ///   2. macOS 26+ Apple Silicon with Apple Containers → AppleContainer.
 ///   3. macOS with libkrun → Libkrun (legacy fallback).
 ///   4. Linux with KVM → LinuxKvm.
@@ -83,14 +83,14 @@ enum DevBackend {
 /// another, neither one starting the other.
 fn select_dev_backend(
     plat: Platform,
-    builder_choice: BuilderBackendChoice,
+    prefers_vz: bool,
     has_vz: bool,
     has_apple_containers: bool,
     has_libkrun: bool,
     has_kvm: bool,
 ) -> DevBackend {
     // 1. Builder override picked Vz AND Vz is actually usable.
-    if matches!(builder_choice, BuilderBackendChoice::Vz) && has_vz {
+    if prefers_vz && has_vz {
         return DevBackend::Vz;
     }
     // 2-5. Standard auto-detect tree.
@@ -105,11 +105,23 @@ fn select_dev_backend(
     }
 }
 
+#[cfg(feature = "builder-vm")]
+fn builder_prefers_vz() -> bool {
+    use mvm_build::builder_backend_select::{BuilderBackendChoice, resolve_choice};
+
+    matches!(resolve_choice(), BuilderBackendChoice::Vz)
+}
+
+#[cfg(not(feature = "builder-vm"))]
+fn builder_prefers_vz() -> bool {
+    false
+}
+
 fn current_backend() -> DevBackend {
     let plat = platform::current();
     select_dev_backend(
         plat,
-        resolve_choice(),
+        builder_prefers_vz(),
         plat.has_vz(),
         plat.has_apple_containers(),
         plat.has_libkrun(),
@@ -536,7 +548,6 @@ pub(in crate::commands) fn run(_cli: &Cli, args: Args, cfg: &MvmConfig) -> Resul
 #[cfg(test)]
 mod tests {
     use super::{DevBackend, select_dev_backend};
-    use mvm_build::builder_backend_select::BuilderBackendChoice;
     use mvm_core::platform::Platform;
 
     // ──────────────────────────────────────────────────────────────
@@ -555,7 +566,7 @@ mod tests {
         assert_eq!(
             select_dev_backend(
                 Platform::MacOS,
-                BuilderBackendChoice::Vz,
+                /* prefers_vz */ true,
                 /* has_vz */ true,
                 /* has_apple_containers */ false,
                 /* has_libkrun */ true,
@@ -571,14 +582,7 @@ mod tests {
         // user explicitly chose Vz. AC is rule 2; the Vz override is
         // rule 1, so the override should win even on macOS 26+.
         assert_eq!(
-            select_dev_backend(
-                Platform::MacOS,
-                BuilderBackendChoice::Vz,
-                true,
-                true,
-                true,
-                false,
-            ),
+            select_dev_backend(Platform::MacOS, true, true, true, true, false,),
             DevBackend::Vz,
         );
     }
@@ -592,7 +596,7 @@ mod tests {
         assert_eq!(
             select_dev_backend(
                 Platform::LinuxNative,
-                BuilderBackendChoice::Vz,
+                true,
                 /* has_vz */ false,
                 false,
                 false,
@@ -609,7 +613,7 @@ mod tests {
         assert_eq!(
             select_dev_backend(
                 Platform::MacOS,
-                BuilderBackendChoice::Libkrun,
+                /* prefers_vz */ false,
                 true,
                 true,
                 true,
@@ -625,7 +629,7 @@ mod tests {
         assert_eq!(
             select_dev_backend(
                 Platform::MacOS,
-                BuilderBackendChoice::Libkrun,
+                /* prefers_vz */ false,
                 true,
                 false,
                 true,
@@ -640,7 +644,7 @@ mod tests {
         assert_eq!(
             select_dev_backend(
                 Platform::LinuxNative,
-                BuilderBackendChoice::Libkrun,
+                /* prefers_vz */ false,
                 false,
                 false,
                 false,
@@ -657,7 +661,7 @@ mod tests {
         assert_eq!(
             select_dev_backend(
                 Platform::MacOS,
-                BuilderBackendChoice::Libkrun,
+                /* prefers_vz */ false,
                 false,
                 false,
                 false,
