@@ -441,6 +441,10 @@ fn clone_builder_err(e: &BuilderVmError) -> BuilderVmError {
             panic_line: panic_line.clone(),
             console_log_path: console_log_path.clone(),
         },
+        BuilderVmError::VmmUnavailable { requested, reason } => BuilderVmError::VmmUnavailable {
+            requested: requested.clone(),
+            reason: reason.clone(),
+        },
     }
 }
 

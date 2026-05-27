@@ -1,18 +1,30 @@
-# Plan 105 — Plan 100 W1: env-gated Linux builder VM dispatch
+# Plan 105 — Plan 100 W1 prep: env constant + nested-KVM readiness + doctor probe
 
-> **Status (2026-05-27):** unstarted. Implementation tracker for
-> `specs/plans/100-symmetric-builder-vm-rollout.md` §W1 (and a small
-> §W3 sub-slice — the `mvmctl doctor` `nested-kvm` line). Lands the
-> dispatch flip that lets Linux contributors opt into the
-> libkrun-builder-VM-on-Linux path Plan 100 ultimately makes the
-> default. Plan 100 itself stays the parent spec; this plan exists
-> only to track the implementation checkpoints for that first wave.
+> **Status (2026-05-27):** W1 preparatory slice ready for review.
+> Lands the env constant, readiness predicate, and `mvmctl doctor`
+> `nested-kvm` line so operators can validate their host ahead of
+> Plan 100 W6 (the actual dispatch flip — workload path nests through
+> a libkrun builder VM on Linux instead of running Firecracker
+> directly).
+>
+> **Scope clarification (2026-05-27):** Plan 100 W1 is described as a
+> dispatch flip to `resolve_builder_backend()`, but
+> `resolve_builder_backend()` is the *builder VM image build* path
+> (Nix-build-runner choice) — it already returns `LibkrunBuilderVm`
+> on Linux. The actual Plan 100 architectural change — making the
+> *workload* path nest through a libkrun host VM on Linux — touches
+> the runtime backend (`crates/mvm-backend/src/backend.rs`), not the
+> builder backend, and is properly Plan 100 W6's surface.
+>
+> Plan 105 (this slice) therefore lands the **preparatory plumbing**:
+> a canonical env constant, a readiness predicate that refuses cleanly
+> when the operator sets the env on a non-Linux host or without
+> nested KVM, and doctor visibility. Plan 100 W6 reads this same
+> predicate when it lands the dispatch flip — single source of truth
+> for the rollout signal.
 >
 > Picks up after Plan 98 (Vz builder backend on macOS) shipped end-
-> to-end. Plan 100 W1 is the natural next architectural slice: same
-> `mvm_build::builder_backend_select::resolve_choice` priority
-> resolver Plan 98 introduced, extended with an env-gated rollout
-> switch for the Linux side.
+> to-end.
 >
 > Pick-up command for fresh sessions: read this file top to bottom,
 > then jump to the next unchecked item.
@@ -74,66 +86,80 @@ not its own PR.
       acceptance bar. Record actual numbers and any host-tuning
       footnotes (huge pages, cgroup placement, etc.).
 
-### Phase W1 — backend dispatch change
+### Phase W1 — preparatory plumbing (env + readiness predicate)
 
-Single small PR. ~80 lines including hermetic unit tests.
+Single PR; ~370 lines including hermetic unit tests.
 
-- [ ] **W1.1** Add `Platform::has_nested_kvm() -> bool` to
+- [x] **W1.1** Add `Platform::has_nested_kvm() -> bool` to
       `crates/mvm-core/src/platform/platform.rs`. Linux-only probe of
-      `/sys/module/kvm_intel/parameters/nested` (must read `Y`) or
-      `/sys/module/kvm_amd/parameters/nested` (must read `1`). Hermetic
-      unit tests with mocked sysfs paths or pure-fn variant that takes
-      the path as an arg.
-- [ ] **W1.2** Add `MVM_LINUX_BUILDER_VM` env constant to
+      `/sys/module/kvm_intel/parameters/nested` (`Y`) or
+      `/sys/module/kvm_amd/parameters/nested` (`1`). Lifted out into
+      a `has_nested_kvm_at(intel_path, amd_path)` pure helper for
+      hermetic tests (six cases — Intel-Y, AMD-1, Intel-N, AMD-0,
+      both-missing, lowercase-y).
+- [x] **W1.2** Add `MVM_LINUX_BUILDER_VM_ENV` constant to
       `crates/mvm-build/src/builder_backend_select.rs`.
-- [ ] **W1.3** Extend `resolve_choice_with_override` (or add a sibling
-      `resolve_choice_with_linux_builder_override`) so that on Linux,
-      `MVM_LINUX_BUILDER_VM=1` resolves to `Libkrun` (which then routes
-      through `LibkrunBuilderVm::new` since `LibkrunBuilderVm` is
-      already cross-platform per `crates/mvm-build/src/libkrun_builder.rs:1688`).
-- [ ] **W1.4** When `MVM_LINUX_BUILDER_VM=1` is set on Linux but
-      `has_nested_kvm()` is false, return
-      `BuilderVmError::VmmUnavailable { requested: "linux-builder-vm",
-      reason: "<actionable hint about kvm-intel.nested / kvm-amd.nested>" }`.
-      Refuses with a clear error rather than silently falling through.
-- [ ] **W1.5** Hermetic unit tests (mirrors the Plan 98 Slice 2B
-      pattern):
-      - `linux_builder_vm_env_set_picks_libkrun_when_nested_kvm` —
-        injected `(Platform::LinuxNative, has_nested_kvm=true)`
-        resolves to libkrun.
-      - `linux_builder_vm_env_set_refuses_without_nested_kvm` —
-        injected `(Platform::LinuxNative, has_nested_kvm=false)`
-        returns the clean error.
-      - `linux_builder_vm_env_unset_unchanged` — the env-unset path
-        on Linux falls through to whatever the existing resolver did
-        (direct-Firecracker today).
-      - `linux_builder_vm_env_on_macos_is_noop` — Linux-only env gate
-        doesn't affect macOS dispatch.
-      - `flag_overrides_linux_builder_vm_env` — explicit
-        `--builder libkrun` flag still wins over the env.
-- [ ] **W1.6** `cargo test --workspace` + `just lint` green.
-- [ ] **W1.7** Open PR as non-draft (Plan 98 Phase 1 locked decision
-      #4 pattern). Title: `feat(mvm-build): Plan 100 W1 — env-gated
-      Linux builder VM dispatch`. Body includes the W0 cold-start
-      numbers as evidence the cold-start budget holds.
+- [x] **W1.3** Add `linux_builder_vm_requested()` predicate (live
+      runtime read) + `linux_builder_vm_requested_for(raw)` pure
+      predicate. Truthy values: `1`/`true`/`yes`/`on`,
+      case-insensitive, whitespace-trimmed. Anything else (including
+      `0`, `false`, `no`, `off`, empty, missing) is false. Plan 100
+      W6 reads this to decide whether the workload path nests.
+- [x] **W1.4** Add `linux_builder_vm_readiness_for(plat, has_nested_kvm)`
+      + `linux_builder_vm_readiness()` returning
+      `Result<(), BuilderVmError>`. Non-Linux platforms and Linux
+      without nested KVM return `BuilderVmError::VmmUnavailable
+      { requested: "linux-builder-vm", reason: "<actionable kernel-module hint>" }`.
+      New `BuilderVmError::VmmUnavailable { requested, reason }`
+      variant added to `crates/mvm-build/src/builder_vm.rs`.
+- [x] **W1.5** Hermetic unit tests (9 in `builder_backend_select::tests`):
+      - `linux_builder_vm_requested_truthy_values` — 8 truthy variants.
+      - `linux_builder_vm_requested_falsey_values` — 9 falsey variants.
+      - `linux_builder_vm_requested_none_is_false`.
+      - `linux_builder_vm_readiness_ok_when_linux_native_with_nested_kvm`.
+      - `linux_builder_vm_readiness_refuses_without_nested_kvm` —
+        asserts message mentions `MVM_LINUX_BUILDER_VM`, the
+        `kvm_intel`/`kvm_amd` module, and the `nested` parameter.
+      - `linux_builder_vm_readiness_refuses_on_macos`.
+      - `linux_builder_vm_readiness_refuses_on_wsl2`.
+      - `linux_builder_vm_readiness_refuses_on_linux_no_kvm`.
+      - `linux_builder_vm_env_constant_is_canonical`.
+- [x] **W1.6** `cargo test -p mvm-core platform` + `cargo test -p mvm-build
+      builder_backend_select` + `just lint` green.
+- [ ] **W1.7** PR opened as non-draft (Plan 98 Phase 1 locked decision
+      #4 pattern). Title: `feat(mvm-build): Plan 100 W1 prep —
+      MVM_LINUX_BUILDER_VM env + nested-KVM readiness + doctor probe`.
 
 ### Phase W3-doctor sub-slice — `mvmctl doctor` surfaces nested-KVM
 
-Small standalone follow-up PR; can land in parallel with W1 once W1's
-predicate exists.
+Bundled with W1 in the same PR — the doctor line consumes W1's
+predicate so shipping both in one review keeps the surface coherent.
 
-- [ ] **W3-D.1** Add a `nested-kvm` check function to
-      `crates/mvm-cli/src/doctor.rs` parallel to the existing `kvm`
-      line. `#[cfg(target_os = "linux")]` only; on macOS the check
-      reports `n/a (Linux-only — libkrun is the macOS default)`.
-- [ ] **W3-D.2** Extend the `builder backend` line (Plan 98 §1.5) to
-      mention `MVM_LINUX_BUILDER_VM` when set on Linux. Format:
-      `<backend> — <source> — <availability>` stays; source can now
-      be `env (MVM_LINUX_BUILDER_VM=1)` on Linux.
-- [ ] **W3-D.3** Hermetic unit tests for the `nested-kvm` Linux line
-      output, mirroring the existing `vz_check` test pattern.
-- [ ] **W3-D.4** `cargo test --workspace` + `just lint` green.
-- [ ] **W3-D.5** PR opened, review requested.
+- [x] **W3-D.1** Added `nested_kvm_check(plat)` to
+      `crates/mvm-cli/src/doctor.rs` parallel to `kvm_check`. Linux-
+      only — macOS / Windows / WSL2 / LinuxNoKvm get an `n/a
+      (Linux-only — …)` line. Linux-native branch reports one of four
+      states: env-set + ready ("Plan 100 W6 nesting ready"), env-set
+      + missing (hard error with kernel-module fix command), env-
+      unset + ready (informational), env-unset + missing
+      (informational — enable before opting in).
+- [x] **W3-D.2** Extended the `builder backend` line (Plan 98 §1.5)
+      to append `; $MVM_LINUX_BUILDER_VM=1 (Plan 100 W6 opt-in)` to
+      the source segment when the env is set. The env doesn't change
+      *which* backend wins (libkrun stays the Linux default); it
+      changes how the workload path will dispatch once Plan 100 W6
+      lands.
+- [x] **W3-D.3** Hermetic unit tests in `doctor::tests`:
+      - `nested_kvm_check_macos_reports_na`
+      - `nested_kvm_check_windows_reports_na`
+      - `nested_kvm_check_wsl2_reports_na`
+      - `nested_kvm_check_linux_native_reports_actionable_text`
+        (cfg-gated to `target_os = "linux"`).
+      - `builder_backend_check_linux_surfaces_linux_builder_vm_env`
+        (cfg-gated to Linux + `builder-vm` feature).
+- [x] **W3-D.4** `cargo test -p mvm-cli doctor::tests::nested_kvm` +
+      `just lint` green.
+- [ ] **W3-D.5** PR landed alongside W1 (bundled).
 
 ### Out of scope (deferred to Plan 100 W2-W6)
 
