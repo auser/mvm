@@ -326,35 +326,52 @@ fully testable; the SupervisorConfig fields are defined and
 validated; the *wire-up* between SupervisorConfig and bridge
 spawn is the deferred work.
 
-### Commit 7 — Vz Swift bridge + Rust ingest + backend orchestrator
+### Commit 7 — Vz `NetworkConfig::events_ingest_socket_path` field
 
-- [ ] `crates/mvm-vz/src/lib.rs` `NetworkConfig::Gvproxy` — add
-      `events_ingest_socket_path: PathBuf`
-- [ ] `crates/mvm-vz-supervisor/Sources/mvm-vz-supervisor/Network.swift`
-      `makeGvproxyDevice` rewrite:
-      - [ ] Open SOCK_DGRAM `socketpair`
-      - [ ] One half attached to Vz via
-            `VZFileHandleNetworkDeviceAttachment`
-      - [ ] Second SOCK_DGRAM `connect()`s to gvproxy `socketPath`
-      - [ ] SOCK_STREAM `connect()`s to `eventsIngestSocketPath`,
-            sends `MVM_VZ_BRIDGE_V1\n` handshake first
-      - [ ] `Task.detached` two shuffle loops with first-packet
-            FlowOpened emit + EOF/shutdown FlowClosed emit
-      - [ ] Task cancellation → final
-            `FlowClosed { reason: "shutdown" }`
-- [ ] `crates/mvm-backend/src/vz.rs:809-812` — populate
-      `network` with `NetworkConfig::Gvproxy { socket_path, mac,
-      events_ingest_socket_path }`
-- [ ] `spawn_gvproxy_for_vz` shim reusing
-      `mvm_libkrun::gvproxy::spawn`
-- [ ] Swift XCTest:
-      - [ ] `testGvproxyBridgeShufflesDatagrams`
-      - [ ] `testEmitsFlowOpenedOnFirstPacket`
-      - [ ] `testEmitsFlowClosedOnShutdown`
-      - [ ] `testIngestHandshakeSentFirst`
-      - [ ] `testIngestReconnect`
-- [ ] `cargo test --workspace` green
-- [ ] `swift test` (mvm-vz-supervisor) green
+**Scope reduced from plan:** plan called for full Swift bridge
+rewrite of `Network.swift` + vz.rs orchestrator population + Swift
+XCTest harness. The Swift portion can't be compile/test-verified
+from this session (requires macOS + Vz framework). **Deferred to
+W6.A.5** — a follow-up commit (or PR) where the Swift code can
+be developed against the real toolchain.
+
+What commit 7 actually ships:
+
+- [x] `crates/mvm-vz/src/lib.rs` `NetworkConfig::Gvproxy` — add
+      `events_ingest_socket_path: Option<String>` field,
+      `#[serde(default, skip_serializing_if = "Option::is_none")]`.
+      `None` means "bridge inactive" (pre-W6.A behavior); `Some(p)`
+      tells the Swift bridge where to connect for FlowEvent
+      emission.
+- [x] Tests (2 new):
+      - [x] `gvproxy_events_ingest_socket_path_roundtrips_when_set`
+            — JSON contains the field; deserializes to `Some(...)`
+      - [x] `gvproxy_without_events_ingest_socket_path_parses` —
+            pre-W6.A JSON (no field) deserializes to `None`
+- [x] `cargo test -p mvm-vz --lib` 15 tests green (was 13;
+      +2 for the new field)
+- [x] `cargo clippy -p mvm-vz --all-targets -- -D warnings` clean
+
+Deferred to W6.A.5 (Vz Swift implementation PR):
+
+- `crates/mvm-vz-supervisor/Sources/mvm-vz-supervisor/Network.swift`
+  `makeGvproxyDevice` rewrite (socketpair + bridge ingest connect
+  + handshake + splice loops + NDJSON emit).
+- `crates/mvm-backend/src/vz.rs:809-812` — populate `network`
+  with `NetworkConfig::Gvproxy { events_ingest_socket_path: Some(...) }`
+  sourced from `mvm_data_dir() + audit/`.
+- `spawn_gvproxy_for_vz` shim reusing
+  `mvm_libkrun::gvproxy::spawn`.
+- Swift XCTest harness:
+  - `testGvproxyBridgeShufflesDatagrams`
+  - `testEmitsFlowOpenedOnFirstPacket`
+  - `testEmitsFlowClosedOnShutdown`
+  - `testIngestHandshakeSentFirst`
+  - `testIngestReconnect`
+
+The Rust side is ready for the Swift connect: ingest socket +
+handshake + NDJSON drain all land in commit 5's
+`run_vz_ingest_bridge`; just needs the Swift writer to connect.
 
 ### Commit 8 — ADR-058 + Plan 102 + ADR-055 + SPRINT.md amendments
 
