@@ -423,6 +423,30 @@ pub fn execute(
         };
     }
 
+    // On Linux `spawn_path` references the validation fd by number via
+    // `/proc/self/fd/<n>`. `install_fd3_in_child` plants the
+    // control-channel pipe write end at fd 3 with `dup2(write_raw, 3)`
+    // in the post-fork pre-exec hook, which closes whatever sat at fd
+    // 3. If the validation fd is at fd 3 the dup2 silently destroys it
+    // and the kernel sees a pipe write end at /proc/self/fd/3, which
+    // it refuses with EACCES. Dup the validation fd above fd 3 first
+    // so the two channels can't collide. The guard keeps the dup
+    // alive across `cmd.spawn()` so the child inherits it.
+    #[cfg(target_os = "linux")]
+    let _spawn_fd_guard = match dup_above_fd3(&entrypoint.file) {
+        Ok(fd) => fd,
+        Err(e) => {
+            return CallOutcome::SpawnFailed {
+                message: format!("dup entrypoint fd above 3: {e}"),
+            };
+        }
+    };
+    #[cfg(target_os = "linux")]
+    let program = {
+        use std::os::fd::AsRawFd;
+        PathBuf::from(format!("/proc/self/fd/{}", _spawn_fd_guard.as_raw_fd()))
+    };
+    #[cfg(not(target_os = "linux"))]
     let program = spawn_path(entrypoint);
 
     // RLIMIT_CORE=0 in the parent: child inherits, so a wrapper crash
@@ -652,6 +676,30 @@ pub(crate) fn set_no_core_dumps() {
     }
 }
 
+/// Duplicate `original`'s raw fd onto the lowest available fd >= 4.
+/// The returned `OwnedFd` must outlive `Command::spawn` so the child
+/// inherits the dup and the kernel can resolve
+/// `/proc/self/fd/<n>` against it at execve time.
+///
+/// `execute` uses this to hold the validation fd above the
+/// control-channel slot at fd 3 — see the comment in `execute` for
+/// the EACCES failure mode this avoids.
+#[cfg(target_os = "linux")]
+fn dup_above_fd3(original: &std::fs::File) -> std::io::Result<std::os::fd::OwnedFd> {
+    use std::os::fd::{AsRawFd, FromRawFd, OwnedFd};
+    let raw = original.as_raw_fd();
+    // F_DUPFD_CLOEXEC: dup to lowest fd >= 4, with CLOEXEC set on the
+    // new fd. CLOEXEC is fine here: the kernel reads the ELF from
+    // this fd during the same `execve` syscall, before CLOEXEC fires.
+    // SAFETY: fcntl is async-signal-safe; arguments are validated.
+    let new_raw = unsafe { libc::fcntl(raw, libc::F_DUPFD_CLOEXEC, 4) };
+    if new_raw < 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    // SAFETY: fcntl returned a positive raw fd; we own it.
+    Ok(unsafe { OwnedFd::from_raw_fd(new_raw) })
+}
+
 /// Resolve the path the parent passes to `Command::new`.
 ///
 /// On Linux, `/proc/self/fd/<n>` referencing the held-open validation
@@ -659,6 +707,11 @@ pub(crate) fn set_no_core_dumps() {
 /// platforms (macOS dev/test), fall back to the canonicalized path —
 /// production guests are always Linux so the fallback is for unit
 /// tests only.
+///
+/// Note: `execute` does its own `dup_above_fd3` rather than calling
+/// this directly, because the control-channel pipe at fd 3 collides
+/// with a validation fd at fd 3. `worker_pool::spawn_worker` does not
+/// install a fd-3 channel and so uses this function unchanged.
 pub(crate) fn spawn_path(entrypoint: &ValidatedEntrypoint) -> PathBuf {
     #[cfg(target_os = "linux")]
     {
