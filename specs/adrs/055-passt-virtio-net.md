@@ -1,6 +1,6 @@
 # ADR-055 — libkrun networking via passt + virtio-net
 
-**Status:** accepted 2026-05-19, implements Plan 87. Default flipped from TSI → Passt by Plan 87 W5 / PR3. **Amended 2026-05-19 by Plan 88** to add gvproxy as the macOS backend (passt is Linux-only — see §"Cross-platform backends" below).
+**Status:** accepted 2026-05-19, implements Plan 87. Default flipped from TSI → Passt by Plan 87 W5 / PR3. **Amended 2026-05-19 by Plan 88** to add gvproxy as the macOS backend (passt is Linux-only — see §"Cross-platform backends" below). **Amended 2026-05-26 by [Plan 102 W6.A](../plans/102-gateway-audit-substrate-impl.md) / [ADR-058](058-claim-10-bytes-leaving-trust-boundary.md):** TSI removed entirely — it bypassed virtio-net (no host fd to splice), which violates the claim-10 no-bypass invariant. `MVM_NETWORKING=tsi` is no longer accepted; only `passt` and `gvproxy` resolve. The historical TSI context below is retained for archaeology.
 
 ## Context
 
@@ -60,8 +60,8 @@ Implementation lives in Plan 87:
   socketpair's with libkrun, spawns passt, owns its lifecycle.
 - `KrunContext::networking: NetworkingMode { Tsi, Passt {..} }`.
 - libkrun-backed VMs (builder-VM + dev-VM + runtime microVMs)
-  default to `Passt`; `Tsi` stays available behind an env var for
-  debugging.
+  default to `Passt`. (Plan 102 W6.A: `Tsi` removed entirely —
+  the env-var escape is gone. No-bypass invariant, ADR-058.)
 - `mvmctl doctor` probes for `passt` and emits an install hint when
   missing.
 
@@ -232,7 +232,7 @@ ships libkrun + libkrunfw.
 - macOS → `gvproxy` via `krun_add_net_unixgram` (path-based listener
   instead of fd-passed)
 
-`MVM_NETWORKING={tsi, passt, gvproxy}` remains the explicit override.
+`MVM_NETWORKING={passt, gvproxy}` remains the explicit override (Plan 102 W6.A removed `tsi`).
 Unset → the per-OS default. `passt` on macOS still fail-closes (the
 binary doesn't exist), but the user gets a clear error rather than a
 silent regression — `mvmctl doctor` flags the missing dep with the

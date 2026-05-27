@@ -73,23 +73,29 @@ observable, mediable substrate across all three backends
 
 ### Commit 1 — Kill TSI
 
-- [ ] `crates/mvm-build/src/libkrun_builder.rs:134-207` —
+- [x] `crates/mvm-build/src/libkrun_builder.rs:134-207` —
       remove `NetworkingPreference::Tsi` variant
-- [ ] Remove `=tsi` arm in `resolve_networking_mode`
-- [ ] Remove default-Tsi dispatch arm
-- [ ] `crates/mvm-cli/src/doctor.rs` — hard error if no gateway
-      binary locatable
-- [ ] Docs sweep:
-      - [ ] `CLAUDE.md` (TSI paragraph)
-      - [ ] `specs/adrs/055-passt-virtio-net.md` (§"TSI escape hatch")
-      - [ ] `specs/plans/72-builder-vm-via-libkrun.md`
-      - [ ] `specs/plans/76-secure-fast-boot-and-dx.md`
-      - [ ] `specs/plans/88-gvproxy-macos-backend.md`
-      - [ ] `specs/plans/97-vz-backend.md`
-- [ ] Delete tests touching `MVM_NETWORKING=tsi` (list in PR
-      description)
-- [ ] New test: `tsi_no_longer_resolvable` (parse `=tsi` → error)
-- [ ] `cargo test --workspace` green
+- [x] Remove `=tsi` arm in `resolve_networking_mode` (now warns
+      with a TSI-specific message + falls back to per-OS default)
+- [x] Remove default-Tsi dispatch arm in `apply_networking_mode`
+- [x] `crates/mvm-cli/src/doctor.rs` — gateway probe now `ok: false`
+      when missing (was `ok: true`); TSI escape language removed
+- [x] Docs sweep:
+      - [x] `CLAUDE.md` (TSI paragraph)
+      - [x] `specs/adrs/055-passt-virtio-net.md` (Status amended;
+            §"Decision" Tsi-env-var note removed;
+            `MVM_NETWORKING={tsi,…}` → `{passt,gvproxy}`)
+      - [ ] `specs/plans/72-builder-vm-via-libkrun.md` (deferred
+            to commit 8 amendments — historical plan, low impact)
+      - [ ] `specs/plans/76-secure-fast-boot-and-dx.md` (commit 8)
+      - [ ] `specs/plans/88-gvproxy-macos-backend.md` (commit 8)
+      - [ ] `specs/plans/97-vz-backend.md` (commit 8)
+- [x] Delete tests touching `MVM_NETWORKING=tsi` (two assertions
+      in `resolve_networking_mode_parses_env`)
+- [x] New test: `tsi_no_longer_resolvable` (five case variants of
+      `tsi` all fall back to per-OS default)
+- [x] `cargo test -p mvm-build` green (273 lib + 49 integration);
+      `cargo clippy -p mvm-build -p mvm-cli -- -D warnings` clean
 
 ### Commit 2 — `FileAuditSigner` cross-process flock
 

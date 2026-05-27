@@ -899,9 +899,10 @@ fn docker_check(plat: Platform) -> Check {
 /// Plan 88 W4. Probes `$PATH` for the gateway binary the host's
 /// libkrun build defaults to: `passt` on Linux, `gvproxy` on macOS
 /// (passt does not build on macOS — see ADR-055 §"Cross-platform
-/// backends"). Surfaces the version when present and the install
-/// hint when missing. `ok: true` regardless: TSI mode
-/// (`MVM_NETWORKING=tsi`) still works without either gateway.
+/// backends"). Surfaces the version when present and emits a
+/// **failing** check when missing — Plan 102 W6.A removed TSI, so
+/// the host needs a gateway binary to run any libkrun-backed VM
+/// (no-bypass invariant, ADR-058).
 ///
 /// Skipped on Windows (no native libkrun port either; the whole
 /// libkrun + virtio-net stack is macOS / Linux).
@@ -931,8 +932,9 @@ fn network_backend_check(plat: Platform) -> Check {
 
 /// Shared probe body for the per-OS userspace gateway. Returns a
 /// `Check` row with the version (when the binary supports
-/// `--version`) or the install hint (when missing). `ok: true`
-/// regardless — `MVM_NETWORKING=tsi` is a documented escape hatch.
+/// `--version`) or the install hint (when missing). Missing now
+/// fails the check — Plan 102 W6.A removed the TSI escape hatch,
+/// so a libkrun host without a gateway can't boot any VM.
 #[cfg(target_family = "unix")]
 fn gateway_check(
     name: &'static str,
@@ -975,11 +977,11 @@ fn gateway_check(
         None => Check {
             name,
             category: "platform",
-            ok: true, // Optional; only strictly needed for MVM_NETWORKING != tsi.
+            ok: false, // Plan 102 W6.A: no TSI escape; gateway is mandatory.
             info: format!(
-                "not available ({install_hint}) — required for the default \
-                 libkrun virtio-net path; set `MVM_NETWORKING=tsi` to opt back \
-                 to libkrun's built-in TSI mode while you install it"
+                "not available ({install_hint}) — required for libkrun \
+                 virtio-net; TSI escape hatch was removed in Plan 102 W6.A \
+                 (claim-10 no-bypass invariant, ADR-058)"
             ),
         },
     }

@@ -130,10 +130,14 @@ pub const GUEST_JOB_DIR: &str = "/job";
 /// gateway). Plan 88 added `Gvproxy` for macOS, where passt does not
 /// build (`vmsplice`/namespace primitives are Linux-only — see
 /// ADR-055 §"Cross-platform backends").
+///
+/// Plan 102 W6.A removed the historical `Tsi` variant — TSI
+/// bypasses virtio-net entirely, which violates the claim-10
+/// no-bypass invariant ([ADR-058](../../specs/adrs/058-claim-10-bytes-leaving-trust-boundary.md)).
+/// Every builder VM now gets a real virtio-net device through one
+/// of the two gateways.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum NetworkingPreference {
-    /// libkrun's built-in TSI (no virtio-net, no DHCP).
-    Tsi,
     /// virtio-net via passt. Linux-only. Requires libkrun-sys + the
     /// `passt` binary on `$PATH`. The supervisor process spawns
     /// passt as a child and hands its fd to libkrun.
@@ -146,17 +150,15 @@ pub enum NetworkingPreference {
 }
 
 /// Apply the resolved [`NetworkingPreference`] to a [`KrunContext`].
-/// Dispatches `with_passt`, `with_gvproxy`, or leaves the context's
-/// default `Tsi` mode in place — keeping the two builder-VM call
-/// sites (shell-job + flake-build) in lockstep. Each gateway uses
-/// `<vm_state_dir>` for its log/socket scratch space.
+/// Dispatches `with_passt` or `with_gvproxy`. Each gateway uses
+/// `<vm_state_dir>` for its log/socket scratch space. There is no
+/// no-gateway path — claim-10 no-bypass (Plan 102 W6.A).
 fn apply_networking_mode(
     krun: KrunContext,
     vm_state_dir: &std::path::Path,
 ) -> Result<KrunContext, BuilderVmError> {
     let scratch = path_to_str(vm_state_dir, "vm_state_dir")?;
     Ok(match resolve_networking_mode() {
-        NetworkingPreference::Tsi => krun,
         NetworkingPreference::Passt => {
             krun.with_passt(mvm_libkrun::passt::DEFAULT_GUEST_MAC, scratch)
         }
@@ -181,19 +183,20 @@ pub fn default_networking_mode() -> NetworkingPreference {
     }
 }
 
-/// Read `MVM_NETWORKING` from the env. Accepts `tsi`, `passt`, and
+/// Read `MVM_NETWORKING` from the env. Accepts `passt` and
 /// `gvproxy` (case-insensitive); anything else falls back to the
 /// per-OS default and emits a warning so a typo is visible without
 /// aborting.
 ///
 /// Plan 87 W5 / PR3 flipped the default away from TSI; Plan 88
-/// added the per-OS dispatch (macOS → gvproxy, Linux → passt). TSI
-/// is libkrun's experimental no-network-stack mode; it works for
-/// trivial HTTP but breaks on nix's substituter and source fetches
-/// (HTTP/2 multiplexing, HTTPS redirect chains, the offline-mode
-/// probe — see ADR-055 §"Context"). Contributors can still opt back
-/// to TSI via `MVM_NETWORKING=tsi` for debugging, or pin a specific
-/// gateway across OS via `MVM_NETWORKING=passt` / `=gvproxy`.
+/// added the per-OS dispatch (macOS → gvproxy, Linux → passt).
+/// Plan 102 W6.A removed TSI entirely — it bypassed virtio-net
+/// (no host fd to splice), which violates the claim-10 no-bypass
+/// invariant ([ADR-058](../../specs/adrs/058-claim-10-bytes-leaving-trust-boundary.md)).
+/// `MVM_NETWORKING=tsi` is no longer accepted; the value is
+/// treated as unknown and falls back to the per-OS gateway
+/// default with a warning. Pin a specific gateway across OS via
+/// `MVM_NETWORKING=passt` or `MVM_NETWORKING=gvproxy`.
 pub fn resolve_networking_mode() -> NetworkingPreference {
     match std::env::var("MVM_NETWORKING")
         .ok()
@@ -202,17 +205,25 @@ pub fn resolve_networking_mode() -> NetworkingPreference {
         .map(str::to_ascii_lowercase)
         .as_deref()
     {
-        Some("tsi") => NetworkingPreference::Tsi,
         Some("passt") => NetworkingPreference::Passt,
         Some("gvproxy") => NetworkingPreference::Gvproxy,
         None | Some("") => default_networking_mode(),
         Some(other) => {
             let fallback = default_networking_mode();
-            tracing::warn!(
-                value = other,
-                fallback = ?fallback,
-                "MVM_NETWORKING unrecognised; falling back to per-OS default (accepted: tsi, passt, gvproxy)"
-            );
+            if other == "tsi" {
+                tracing::warn!(
+                    fallback = ?fallback,
+                    "MVM_NETWORKING=tsi is no longer supported (Plan 102 W6.A: \
+                     TSI bypasses virtio-net, violates claim-10 no-bypass invariant); \
+                     falling back to per-OS default"
+                );
+            } else {
+                tracing::warn!(
+                    value = other,
+                    fallback = ?fallback,
+                    "MVM_NETWORKING unrecognised; falling back to per-OS default (accepted: passt, gvproxy)"
+                );
+            }
             fallback
         }
     }
@@ -1968,12 +1979,6 @@ mod tests {
             std::env::remove_var("MVM_NETWORKING");
             assert_eq!(resolve_networking_mode(), default_networking_mode());
 
-            std::env::set_var("MVM_NETWORKING", "tsi");
-            assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
-
-            std::env::set_var("MVM_NETWORKING", "TSI");
-            assert_eq!(resolve_networking_mode(), NetworkingPreference::Tsi);
-
             std::env::set_var("MVM_NETWORKING", " passt ");
             assert_eq!(resolve_networking_mode(), NetworkingPreference::Passt);
 
@@ -1990,6 +1995,28 @@ mod tests {
             std::env::set_var("MVM_NETWORKING", "vmnet-helper");
             assert_eq!(resolve_networking_mode(), default_networking_mode());
 
+            std::env::remove_var("MVM_NETWORKING");
+        }
+    }
+
+    #[test]
+    fn tsi_no_longer_resolvable() {
+        // Plan 102 W6.A removed TSI. `MVM_NETWORKING=tsi` (any case)
+        // must NOT resolve to a TSI mode — it falls back to the
+        // per-OS gateway default with a warning. This guards the
+        // claim-10 no-bypass invariant at the env-var surface.
+        let _guard = ENV_LOCK.lock().unwrap();
+        // SAFETY: ENV_LOCK serializes env mutation across tests.
+        unsafe {
+            for variant in ["tsi", "TSI", "Tsi", " tsi ", "tSi"] {
+                std::env::set_var("MVM_NETWORKING", variant);
+                assert_eq!(
+                    resolve_networking_mode(),
+                    default_networking_mode(),
+                    "MVM_NETWORKING={variant} must fall back to per-OS default \
+                     (TSI was removed in Plan 102 W6.A)"
+                );
+            }
             std::env::remove_var("MVM_NETWORKING");
         }
     }
