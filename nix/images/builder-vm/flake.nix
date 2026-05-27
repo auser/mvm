@@ -158,7 +158,12 @@
         findutils
         which
         nix
-        git
+        # gitMinimal drops perl/sendmail/gui/manpages (~20 MB). git is
+        # only invoked here by nix's `github:` substituter/fetcher; the
+        # core porcelain that needs is intact in the minimal build.
+        # `mvm-builder-init` does not shell to git (grep -rn '"git"' in
+        # crates/mvm-builder-init/).
+        gitMinimal
         gnumake
         curl
         jq
